@@ -62,6 +62,14 @@ the agent fabric, storage, search, notifications, and the cross-artifact referen
   write down why.
 - **Honesty about uncertainty.** Agents must be explicit about what they are unsure of,
   what they assumed, and what they deferred.
+- **Name your floors; the code wins over the docs.** Shipping a *floor* (a partial,
+  untested, or deferred version) is fine; a floor that **masquerades as done** is the
+  failure. If a thing is partial/untested/deferred, say so in writing and name its
+  follow-on — untested-but-named is acceptable, silent skipping is not. Running code is
+  the source of truth: when a doc and the code disagree, the code wins — fix the doc, then
+  proceed. Date every status/capability note (a claim that outlives its verification
+  misleads the next agent). Because our build is sequential agents reading each other's
+  notes, this honesty is load-bearing. (Folded in from `external-insights/01`; see §4.)
 
 ## 4. Technology — agents choose, Rust is the default
 
@@ -78,6 +86,20 @@ The **frontend/UX stack is likewise open** and decided per subsystem in the arch
 phases. Whatever the stack, a shared design language keeps the subsystems visually and
 interactionally coherent, and **design sketches precede frontend implementation** (see §3).
 
+### Canonical engineering doctrine — `external-insights/`
+
+The [`external-insights/`](external-insights/) folder is **canonical doctrine, alongside this
+VISION**. Where VISION says *what* we build and *why*, the doctrine says *how to build it well*
+and *how it tends to go wrong*, drawn from hard-won prior art for a platform of exactly Myelin's
+shape. **Treat every item as a default you follow unless you write down why not** — the same
+status as VISION; silence is not allowed. Read the relevant doc *before* the corresponding phase:
+`01-process-and-quality` before any build phase; `02-platform-substrate` before shared/subsystem
+architecture; `03-agent-native-fabric` before the agent fabric; `04-hard-problems` before
+committing any subsystem design; `05-ux-and-design` before any frontend design or build. Phase 2b
+([`planning/02b-doctrine-integration`](planning/02b-doctrine-integration)) folded this doctrine
+into the spine — its `decision-record.md` and `integration-directives.md` carry the binding,
+per-phase directives derived from it (e.g. ADR-16…ADR-20 and design-language §11).
+
 ## 5. The planning & build process
 
 Work proceeds in numbered phases under `planning/`. Each phase consumes the previous one
@@ -92,6 +114,12 @@ and is committed + pushed when done.
    and how subsystems interact as a whole. Not yet full implementation detail. This phase
    also establishes the **shared design language** (design principles, tokens,
    accessibility baseline, and the catalogue of views) so every frontend stays coherent.
+2b. `planning/02b-doctrine-integration` — **doctrine integration**: decide what from
+   `external-insights/` (the canonical engineering doctrine, §4) to integrate and how, and
+   route each item to the phase where it binds. Most of the doctrine *confirms* the Phase-2
+   spine; this phase folds in the real deltas without rework churn (appended ADRs, a
+   design-language section, binding per-phase directives). It **binds the rest of the
+   process** — downstream phases follow its `decision-record.md` + `integration-directives.md`.
 3. `planning/03-shared-systems-architecture` — detailed technical roadmap for the
    **shared** backend system(s) the subsystems depend on. Like Phase 4, this work must be
    grounded in the literature on algorithms and prior art (consensus, log-structured

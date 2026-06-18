@@ -716,6 +716,118 @@ Phase 4. ADR-02 notes "TS/React-class is the expected baseline but not mandated.
 
 ---
 
+## 8b. Day-one UX primitives (external-insights doc 05)
+
+> Appended in Phase 2b (doctrine integration) from
+> [`external-insights/05-ux-and-design.md`](../../external-insights/05-ux-and-design.md), treated as a
+> default-you-follow-unless-you-write-down-why (VISION §4). §1–§8 above hold these as *principles*;
+> this section pins the **concrete, day-one, testable mandates** they implied but didn't fix — the
+> specific bugs and correctness gates that turn a principle into something a CI check can fail on.
+> Build-discipline items route to Phase 5 (testing) and Phase 8 (execution) so they bind to a gate, not
+> just a paragraph. **Tag every rule below PROVEN (cite the standard) or HOUSE STYLE (taste)** so
+> "accessibility requires this" stays honest against "we prefer this" (mirrors the VISION/README
+> honesty rule).
+
+### 8b.1 Overlay primitives — build these first
+A shared, single set of overlay primitives (Dialog / Confirm / Popover / Dropdown / Tooltip / Toast),
+built **before any feature consumes them** (a Phase-6 sequencing prerequisite; the most expensive UX
+retrofit). Mandates:
+- **Portal-always to the document root** *(PROVEN — transformed/overflow-clipped ancestors otherwise
+  clip the overlay)*: the "create dialog renders inside the 240px sidebar" bug class is forbidden by
+  construction.
+- **One documented z-index scale** (chrome < popover < modal < toast) as a single token *(PROVEN)*;
+  per-component magic z-index numbers are banned.
+- **Centralised behaviour lives in the primitive, inherited free by every consumer** *(PROVEN —
+  WCAG/ARIA)*: focus-trap + return-focus, scroll-lock with scrollbar-width compensation, Escape +
+  backdrop dismiss, and correct ARIA. Consumers never re-implement these (sharpens §4).
+- **Single-purpose by shape** *(HOUSE STYLE)*: split overlays by shape (viewport-pinned popover /
+  inline-flow dropdown / externally-positioned grid) — "nine menus are three shapes"; don't force one
+  component to do all three. A design-review heuristic.
+
+### 8b.2 One editor render path
+- **Read and edit run the SAME inline parser** *(HOUSE STYLE → PROVEN via the gate below)*: a single
+  render path, not a viewer that diverges from the editor.
+- **`render(parse(md)) === md` round-trip over a corpus is a hard gate** *(PROVEN by the corpus)* —
+  Phase-5 CI gate; the correctness bar for TE-15 whatever concurrency engine Knowledge picks.
+- **Inline content is stored as a markdown-subset STRING**, not an inline-range JSON model *(HOUSE STYLE
+  with a structural reason)*: survives copy/paste, export, diff, and reference-extraction; needs no
+  server sanitisation pass; zero-migration through an editor rewrite. Reconciliation with ADR-05: **AST
+  for block structure, markdown-subset string for inline runs**, with `mention`/`artifact_ref`/`embed`
+  kept as **structured nodes** (never collapsed into the string) so reference-extraction stays reliable.
+- **Controlled `contenteditable`, not `<textarea>`** *(PROVEN — a textarea fundamentally cannot show
+  formatting as you type)*; the caret is a **char offset into the serialised markdown**, bridged to/from
+  the DOM. Browser variance (Enter/IME/paste) is the top Knowledge-P4 risk.
+- **Editor primitives ship + unit-test standalone before the integrated editor** *(HOUSE STYLE)*: the
+  serializer, the offset model, and the DOM-surgery for Enter-splits-block / caret-after-split are
+  independently tested. "Enter just inserts a newline" is the #1 "not a real editor" tell.
+
+### 8b.3 Measured-not-claimed tokens
+- **Measure contrast; never trust a stated ratio** *(PROVEN — WCAG AA)*: a Phase-5 measured-contrast
+  gate over the token table (a brand accent at ~2.8:1 fails AA).
+- **The focus token is NOT the identity token** *(PROVEN)*: the focus-ring / primary-button token may
+  need to **differ from the brand accent** because the accent can fail AA. An explicit token-derivation
+  rule on §3.2.
+- **Status never by colour alone** (glyph + label + position) *(PROVEN — colour-blind users)*; **no
+  saturated status fills** *(HOUSE STYLE)* — "the screen is not a traffic light." Sharpens §3.2/§4.
+- **Never set colour via inline style on an interactive element** *(PROVEN — inline style beats
+  `hover:`/`focus:` specificity)*: interactive colour comes from tokens/utility classes only; a Phase-8
+  lint enforces it.
+- **Hierarchy from weight & colour before size; spacing on a fixed ramp** *(HOUSE STYLE)*: large/heavy
+  type and off-ramp spacing (5/7/13px) are the amateur tell (sharpens §3.3/§3.4).
+- **Agents look like agents** *(HOUSE STYLE; legibility duty PROVEN via AI-Act §6)*: **no sparkle /
+  shimmer / magic-wand AI iconography**; **no emoji as UI** (an emoji can't inherit `currentColor` or be
+  re-themed). Sharpens §3.7/§6.1.
+
+### 8b.4 Layout-containment & mobile bug checklist
+Concrete net-new bug classes the shell and responsive sketches must design around *(all PROVEN bugs)*:
+- **Pin the shell to the viewport** (`100vh` / `overflow:hidden`); each region owns its own scroller; a
+  **flex child that scrolls needs `min-height:0`** + overscroll-contain — without `min-height:0` overflow
+  leaks up the tree and pushes the composer below the fold.
+- **`width:100%` is not a takeover**: a full-width mobile panel laid out *beside* a still-present main
+  column is clipped off-screen — collapse the other column at the breakpoint.
+- **Hover is not touch-reachable**: surface row actions by default or behind an explicit mobile
+  affordance (affects issue-list row actions, chat message hover actions, knowledge backlinks).
+- **Flip popovers when they'd go off-screen** (flip-above + max-height); **test against the REAL anchor**
+  (a picker under a bottom-pinned composer renders off-screen) — Phase-5/Phase-8.
+- **Mobile drawer pattern**: rail / secondary-nav → toggled overlays with backdrop + Escape +
+  route-change auto-close; **name the fixed-width assumptions before going responsive.**
+
+### 8b.5 Humanise machine strings at the backend
+**The #1 "feels unfinished" tell** (`"merge_request merged"`, raw ids, unrendered markdown) and the fix
+is *structural, not a frontend string map*: humanisation lives **at the source** — Notifications copy/
+templating + Reference-Graph display-name resolution (ADR-13) — paired with a routable `ArtifactRef`, so
+**every consumer and every agent-authored message** inherits it free. Binds to Phase 3 (Notifications +
+Refs); the frontend never owns a humanisation lookup. *(Highest-leverage non-editor delta.)*
+
+### 8b.6 Sharpenings folded into the principles
+- **Reversibility over confirmation** *(HOUSE STYLE)*: prefer an undo window + restorable history over
+  "are you sure?" — with the carve-out that irreversible/consequential + GDPR/agent-HITL actions still
+  confirm per §6.3.
+- **The system assembles context — and pre-fetches it** *(HOUSE STYLE)*: don't just link the next hop
+  (failing check → step → line), pre-fetch it; every notification carries "why it fired" (sharpens
+  §5.3/§5.8).
+- **Empty/loading/error specifics** *(HOUSE STYLE)*: loading shows **structure** (skeletons matching the
+  final layout, never a spinner on blank); error blames the **system** in one quiet line + a path, never
+  the user; a degraded surface **fails static** ("temporarily unavailable" for that surface only).
+  Sharpens §5.10.
+- **Hard latency budgets** *(HOUSE STYLE, measured in Phase 5)*: keyboard response < ~100ms; suppress
+  flash-of-spinner under ~1s; **pages render, they don't animate in.** Promotes §P2's soft aim to a
+  numeric Phase-5 performance gate.
+- **A live styleguide rendered from the product's REAL tokens, runnable with the stack down** *(HOUSE
+  STYLE)*: a Phase-6 deliverable on the design-system package so the reference can't drift from the app.
+
+### 8b.7 The frontend done-bar — the switch test
+A surface is **done only when, by driving the REAL UI in a browser, a team could move to it without
+hitting a wall the old tool didn't have** *(PROVEN by the drive-through)*. A "does this feel finished?"
+pass finds a dozen-plus issues a checklist misses. Binds as the **frontend definition-of-done** in
+Phase-5 testing strategy and Phase-8 execution discipline (the design analogue of process-doctrine §4
+"actually try it"). The full per-item routing is in
+[`02b-doctrine-integration/analysis/ux-design.md`](../02b-doctrine-integration/analysis/ux-design.md)
+and [`integration-directives.md`](../02b-doctrine-integration/integration-directives.md) (KN-*, T-7, T-8,
+NOTIF-1).
+
+---
+
 ## 9. Open questions carried forward
 
 Honest about uncertainty (VISION §3). The design language commits the *direction*; these resolve in
