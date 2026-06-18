@@ -52,6 +52,15 @@ and per-store engine choices are **deferred to Phase 3 (shared systems) and Phas
 | [ADR-12](#adr-12--gdpr-by-construction-the-personaldataholder-spine) | GDPR-by-construction: the PersonalDataHolder spine | DECIDED |
 | [ADR-13](#adr-13--the-three-glue-contracts-as-binding-platform-law) | The three glue contracts as binding platform law | DECIDED |
 | [ADR-14](#adr-14--primary-datastoretech-per-system-summary-table) | Primary datastore/tech per system (summary table) | DECIDED (directional) |
+| [ADR-16](#adr-16--backpressure--principal-aware-load-shedding-protected-human-lane) | Backpressure & principal-aware load-shedding (protected human lane) | DECIDED (Phase 2b) |
+| [ADR-17](#adr-17--fail-static-vs-fail-closed-for-availability) | Fail-static vs fail-closed for availability | DECIDED (Phase 2b) |
+| [ADR-18](#adr-18--backuprestore-verification-as-a-durability-gate) | Backup/restore-verification as a durability gate | DECIDED (Phase 2b) |
+| [ADR-19](#adr-19--the-event--signal--automation-rule--trigger-four-primitive-model) | Event / Signal / Automation-rule / Trigger four-primitive model | DECIDED (Phase 2b) |
+| [ADR-20](#adr-20--one-sandbox-for-ci--agents-resolves-te-31) | ONE sandbox for CI + agents (resolves TE-31) | DECIDED (Phase 2b) |
+
+> **Numbering note.** ADR-01…ADR-14 are the original Phase-2 spine; **ADR-16…ADR-20 were appended in
+> Phase 2b** (doctrine integration) for the genuine deltas from `external-insights/`. The
+> open-questions carry-forward (**ADR-15**) follows them, as it always closed the document.
 
 A running **open-questions carry-forward** table closes the document (§ADR-15).
 
@@ -905,6 +914,250 @@ per row.
 
 ---
 
+## ADR-16 — Backpressure & principal-aware load-shedding (protected human lane)
+
+**Status: DECIDED.** Appended in Phase 2b (doctrine integration) from
+[`external-insights/02-platform-substrate.md §5`](../../external-insights/02-platform-substrate.md).
+Generalises ADR-08.6 (agent load governance) to a platform-wide overload discipline. Resolves the
+sequencing/priority half of AG-5.
+
+### Context
+ADR-08.6 governs *agent* load (budgets, loop caps, per-tenant breakers), and ADR-11.5 pushes heavy
+work async — but Phase 2 never committed "every queue/pool is bounded" as a platform rule, nor a
+priority lane for interactive humans, nor a shed order. The dominant client of the platform is now a
+fleet of agents; under load, nothing protects the human experience first, and unbounded anything is a
+future cascade (doctrine §5).
+
+### Options
+1. Per-component ad-hoc limits — drifts, leaves unbounded queues, no global priority.
+2. Agent-only governance (status quo, ADR-08.6) — protects against agent runaway but not against an
+   agent surge degrading humans, and says nothing about substrate queues/pools.
+3. A platform-wide backpressure discipline with a principal-aware limiter, an explicit shed order, and
+   a shared resilient client. (Doctrine's settled answer.)
+
+### Decision
+1. **Every queue and pool is bounded; saturation fast-fails; statement timeouts and bounded prefetch
+   are the default.** Unbounded anything is forbidden.
+2. **A principal-aware limiter with a protected interactive-human lane** and the explicit shed order
+   **speculative → batch/CI → agent → human-last**. Agents and CI receive `429 + Retry-After`.
+3. **Our own clients (CLI, agent runtime, inter-service callers) MUST honour `Retry-After`** — a
+   client that ignores it turns shedding into a retry storm.
+4. **A shared resilient inter-service client** becomes a named substrate crate (`myelin-rpc`/
+   `myelin-client`, added to ADR-01's crate table): per-call timeout, circuit breaker,
+   bounded-concurrency bulkhead, jittered retry **for idempotent calls only**, and **never retry
+   through a tripped breaker**.
+
+### Rationale
+A protected human lane + ordered shedding is the only way "world-scale with a fleet of agents" stays
+usable for humans during a surge; bounded everything is the standard cascade-prevention discipline; a
+single resilient client is the one place to get timeout/breaker/bulkhead/retry correct for every caller
+(doctrine §5).
+
+### Consequences
+- The Bus, Id rate-limiting, and the shared client (Phase 3) carry the lane + shed order + bounded
+  templates; the `myelin-events` consumer template carries bounded prefetch + pool limits.
+- The **30× agent-surge drill** (human lane holds, agent lane sheds, other tenants unaffected) is a
+  required Phase-5 scenario.
+- The resilient client is an early Phase-6 platform-capability deliverable.
+
+### Deferred
+- **[OPEN → P3]** Concrete lane/limit mechanism, the `Retry-After` budget, per-tenant in-flight caps.
+- **[OPEN → P5]** The surge-drill thresholds.
+
+---
+
+## ADR-17 — Fail-static vs fail-closed for availability
+
+**Status: DECIDED.** Appended in Phase 2b from
+[`external-insights/02-platform-substrate.md §10`](../../external-insights/02-platform-substrate.md).
+Cross-references ADR-03 (authz semantics) and ADR-11 (blast radius). Does **not** alter ADR-03's
+fail-closed-for-correctness decision; it adds the orthogonal *availability* axis.
+
+### Context
+ADR-03 implies fail-closed (deny when unsure) for authorization correctness. But fail-closed is the
+*wrong availability default*: if every request fails closed on an Identity-dependency hiccup, one shared
+dependency takes the whole platform down — Identity becomes a single point of cascade. Phase 2 never
+distinguished the availability axis; the doctrine names this as the single highest blast-radius gap.
+
+### Options
+1. Fail-closed everywhere — correct for authz, catastrophic for availability (whole-platform cascade on
+   an Id hiccup).
+2. Fail-open on availability — keeps traffic flowing but is a security hole (serves access that may have
+   been revoked).
+3. **Fail-static**: serve a **bounded-staleness cached answer** on the availability axis while keeping
+   fail-closed on the correctness axis.
+
+### Decision
+Distinguish the two axes:
+- **Authorization correctness remains fail-closed** (deny when genuinely unsure) — ADR-03 unchanged.
+- **For availability, fail STATIC**: during an Id-dependency hiccup, Id serves a **bounded-staleness
+  cached answer** (e.g. "actor still active / coarse grants") so *already-authenticated* traffic keeps
+  working. The **staleness window is bounded by the deprovision/revocation SLA** and must contain the
+  short-lived agent-token TTL (ADR-08), so a revoked actor still falls inside the window.
+
+### Rationale
+This is the difference between "Id has a hiccup" being a brief degradation versus a total outage. The
+staleness ≤ revocation-SLA bound makes it a deliberate, written trade-off rather than a security
+regression (doctrine §10).
+
+### Consequences
+- Phase 3 (Id) builds the bounded-staleness cache and reconciles it with the consistency-token
+  ("zookie") strategy (ADR-03).
+- **The DPO ratifies the staleness bound** (it is the residual GDPR-revocation exposure window; relates
+  to GD-5/GD-14).
+- A Phase-5 drill asserts "Id hiccups, platform stays up for authenticated traffic." Interacts with the
+  liveness≠readiness rule (a dead *critical* dependency still sheds via readiness; fail-static keeps
+  *already-authenticated* traffic alive through a transient hiccup).
+
+### Deferred
+- **[OPEN → P3]** Cache shape, staleness mechanism, consistency-token interplay.
+- **[OPEN — DPO]** Ratification of the chosen staleness bound.
+
+---
+
+## ADR-18 — Backup/restore-verification as a durability gate
+
+**Status: DECIDED.** Appended in Phase 2b from
+[`external-insights/02-platform-substrate.md §11`](../../external-insights/02-platform-substrate.md).
+Extends ADR-12.1 (backups as a holder) with a durability *gate*. Resolves the verification half of
+GD-14.
+
+### Context
+ADR-12 lists backups as a `PersonalDataHolder` and mentions post-restore re-erasure, but never gates
+*restorability* or cross-tier consistency. "A backup that has never been restored is not a backup." A
+restore that resurrects a row pointing at a missing blob is silent corruption.
+
+### Options
+1. Backups + hope (status quo) — restorability is assumed, never proven; cross-seam consistency
+   unasserted.
+2. Manual periodic restore tests — better, but drifts and is not gated.
+3. **Automated restore-verification wired into CI**, asserting no loss and cross-seam integrity.
+
+### Decision
+1. **Continuous log archiving + periodic base backups** for a tight RPO.
+2. **Automated periodic restore-verification** that rebuilds and **asserts no loss**, wired into CI so
+   durability is gated continuously, not hoped for.
+3. **Cross-seam restore integrity**: OLTP rows ↔ object/blob ↔ search index ↔ event-log offsets must
+   restore to a **mutually consistent point**; the drill asserts row↔blob↔index↔offset integrity.
+
+### Rationale
+Restorability and cross-tier consistency are durability properties that only exist once a drill proves
+them; un-drilled, they are claims (doctrine §11; honesty rule).
+
+### Consequences
+- Phase 3 (Storage + GDPR/Audit) defines the cross-tier consistency point (interacts with post-restore
+  re-erasure, GD-14).
+- Phase 5 owns the restore-verification + cross-seam drill; Phase 8 wires it into CI as a gate.
+
+### Deferred
+- **[OPEN → P3]** The cross-tier consistency-point definition; RPO target.
+- **[OPEN → P5]** Drill mechanics and thresholds.
+
+---
+
+## ADR-19 — The Event / Signal / Automation-rule / Trigger four-primitive model
+
+**Status: DECIDED.** Appended in Phase 2b from
+[`external-insights/03-agent-native-fabric.md §2`](../../external-insights/03-agent-native-fabric.md).
+Addendum to ADR-04 (bus) and ADR-08.5 (trigger engine) — refines shared reactive vocabulary; does not
+change ADR-04's delivery semantics or ADR-08's one-engine decision.
+
+### Context
+Phase 2 collapsed reactive concepts into "event → `EventMatcher` → {subscription, automation, agent}"
+(ADR-04.5, ADR-08.5). The doctrine's richer split is strictly more precise and motivates the
+head-of-line-blocking fix (a consumer subscribed to the raw firehose silently stalls). There is also a
+**vocabulary collision**: our "Trigger" means the matcher→target *binding*, while the doctrine's
+"Trigger" is a narrower stateful per-person promise.
+
+### Options
+1. Keep the coarse collapse — leaves the firehose subscription trap unaddressed and overloads the word
+   "Trigger" with two meanings downstream.
+2. Adopt the four-primitive split and disambiguate the name now (cheap, before five subsystems hard-code
+   the coarse vocabulary).
+
+### Decision
+Refine the platform reactive vocabulary into four distinct primitives:
+1. **Event** — a fact ("X happened"), every state change, fired over the durable log via the outbox
+   (ADR-04.3).
+2. **Signal** — a **curated, deduplicated, severity-ranked subset of events** actors should actually
+   react to; the trigger substrate. *Consumers subscribe to Signals, not the raw Event firehose* (infra
+   indexers/refs-builders that genuinely need the firehose excepted).
+3. **Automation rule** — a *stateless, per-event reflex the project owns* ("when X, do Y"); it may
+   *invoke* a durable workflow (ADR-09) for the multi-step/HITL case, but a trivial reflex does not
+   become durable execution.
+4. **Trigger** — a *stateful promise a person owns* ("wait until condition C, then unblock this task"):
+   a small state machine **armed → resolved / stale / disarmed**, fires **once per arming**.
+
+**Rename to resolve the collision:** our existing "Trigger" binding object (matcher→target under a
+`run_as`/`RunBudget`/`DelegationPolicy`/`gates`, ADR-08.5) is renamed a **subscription/automation
+binding**; "Trigger" is reserved for the stateful per-person promise above.
+
+### Rationale
+The split is strictly richer than the collapse, the Signal tier is the upstream defence against the
+head-of-line-blocking gotcha (whitelist curated subjects, not `*`), and disambiguating "Trigger" now
+prevents two meanings calcifying across every downstream phase (doctrine §2, §6.1).
+
+### Consequences
+- Phase 3 (Event Bus / trigger engine) implements the tiers; the reactive/dispatch tier gets an
+  explicit, separately-reviewed design (not folded into the bus).
+- Phase 4 (Issues) surfaces the stateful Trigger ("unblock/remind me when…") UX.
+- Admin/automation UX copy adopts "a trigger is a promise the system keeps for you; an automation rule
+  is a reflex the project has."
+
+### Deferred
+- **[OPEN → P3]** Signal curation/dedup/severity-ranking mechanism; the Trigger state-machine store.
+
+---
+
+## ADR-20 — ONE sandbox for CI + agents (resolves TE-31)
+
+**Status: DECIDED.** Appended in Phase 2b from
+[`external-insights/03-agent-native-fabric.md §3`](../../external-insights/03-agent-native-fabric.md)
+(and §5.1 of `04-hard-problems.md`). **Resolves TE-31** (flagged `[OPEN → P4(CI)+P3]` in ADR-08
+§Consequences). Carries into TE-28 (CI isolation model).
+
+### Context
+ADR-08 flagged CI↔agent substrate unification as promising but undecided (TE-31): a CI job and an agent
+run have the same shape (event → sandboxed work → results+events). Both are *running untrusted code* —
+an agent running tool calls *is* untrusted code, and one sandbox escape is a cross-tenant catastrophe.
+
+### Options
+1. Two separate sandboxes (CI vs agent) — duplicate hardening, two attack surfaces to drill, the escape
+   property proven twice or not at all.
+2. **Unify** behind one job spec with a `kind` field and one hardened runner. (Doctrine's decision.)
+
+### Decision
+**UNIFY.** One isolation primitive, hardened once, fed by **a single runtime-agnostic job spec with a
+`kind` field (`ci | agent`)**. Default-to-beat = UNIFY; **Phase-4 CI must justify in writing if it
+diverges** (this inverts the prior "prove it's worth unifying" burden). The backend stays swappable
+behind the job spec.
+- **Isolation floor**: gVisor-class userspace-kernel **or** microVM; **plain shared-kernel containers
+  are rejected by default** for untrusted code.
+- **Named hardening profile**: no host network (egress default-deny, allowlist opt-in), read-only root +
+  tmpfs, all caps dropped, no-new-privileges, seccomp, images **pinned by digest (fail-closed on a
+  tag-without-digest)**, whole-guest kill on teardown, cgroup limits incl. `pids.max` + zero swap.
+- **Secrets by name only, resolved *inside* the boundary**, scoped to this job's references; never baked
+  into images; **never handed to the agent runtime to forward**.
+- **The sandbox-escape drill on a real kernel is the single hard gate before any run executes untrusted
+  customer code** (CI *or* agent) — an undrilled isolation property is a claim, not a fact.
+
+### Rationale
+Build the isolation primitive once and harden it once; a unified runner halves the attack surface and
+gives the escape drill one target to prove. The job-spec seam keeps the executor backend swappable
+(doctrine §3; §5.1).
+
+### Consequences
+- Phase 4 (CI) owns the runner + the TE-28 threat model; Phase 3 (Agent Fabric) feeds agent runs through
+  the same spec.
+- The escape drill is a Phase-5 scorecard item, a Phase-6 roadmap milestone, and a Phase-8 go/no-go.
+- The failure-injection harness (EI-01) reuses this sandbox substrate.
+
+### Deferred
+- **[OPEN → P4 (CI)]** Concrete executor backend (gVisor vs microVM vs other) under the spec; the job
+  spec schema; runner elasticity on EU infra (TE-29).
+
+---
+
 ## ADR-15 — Open-questions carry-forward (the working backlog)
 
 Phase 2 inherits the Phase-1 register (`open-questions-and-risks.md`) and carries it forward,
@@ -927,6 +1180,31 @@ vs **still open** vs **legal**:
 | Cell topology + tenancy/residency commitment | SC-2/SC-3 | ADR-11 (ratified) |
 | GDPR `PersonalDataHolder` spine carried intact | GD-3 et al. | ADR-12 |
 | Three glue contracts as binding law | TE-1 | ADR-01 + ADR-13 |
+
+### Resolved / sharpened by Phase 2b (doctrine integration)
+Phase 2b folded in `external-insights/`; these items are now resolved or pointed at a phase with a
+concrete default-to-beat. See [`02b-doctrine-integration/decision-record.md`](../02b-doctrine-integration/decision-record.md)
+and [`integration-directives.md`](../02b-doctrine-integration/integration-directives.md).
+
+| Item | Phase-1 ref | Resolved/sharpened in (Phase 2b) |
+|---|---|---|
+| CI ↔ agent substrate unification | TE-31 | **ADR-20** (UNIFY: one job spec, `kind ∈ {ci,agent}`) |
+| Refs own relations vs subsystems do | TE-7 | Directive REF-1 → P3 (Refs)/P4: backlinks = projections; lifecycle edges = typed table in the owning subsystem (source of truth) |
+| `Agent::handle` shape (single-call vs loop) | AG-3 | Directive AG-1 → P3: stateless `step(conversation)`; platform loop owns history |
+| Collab engine + transport ordering | TE-15/TE-16 | Directives KN-1/KN-2/KN-4 → P4/P6: resume-cursor transport → CAS floor → CRDT; markdown-subset inline string; round-trip gate |
+| Rollup/formula engine | TE-18 | Directive KN-3 → P4: read-time-only rollups (materialise only when measured too slow) |
+| CI metering unit | TE-32 | Directive CI-2 → P3/P4/Commercial: universal reserve/settle gate (no balance → no execution) |
+| Reindex-from-source as resilience primitive | TE-1/SC-1/SC-7 | Directives REF-4/SEARCH-1 → P3 + P5 reindex-from-cold drill |
+| Backup-window vs erasure SLA (verification half) | GD-14 | **ADR-18** (automated restore-verification + cross-seam integrity, CI-gated) |
+| Availability cascade on the Id hot path | (new, EI-02 §10) | **ADR-17** (fail-static, bounded-staleness; DPO ratifies the bound) |
+| Platform overload / human-priority lane | AG-5 (priority half) | **ADR-16** (backpressure + protected human lane + shed order) |
+| Reactive vocabulary precision | (new, EI-03 §2) | **ADR-19** (Event/Signal/Automation-rule/Trigger; "Trigger" disambiguated) |
+| Git-history erasure NOT solved by the spine | GD-1/GD-2 | Directive GD-1 → P3 named reconciliation deliverable + P4 Git data-model gate + Legal (pseudonymous-commit is a commit-time prerequisite) |
+
+> **Note on ADR-08.6:** Phase 2b generalises its per-run/agent/tenant budgets into a **universal
+> reserve/settle cost gate in front of every run, CI included** (directive CI-2 / decision D8); the
+> ADR-08.6 decision is unchanged, only widened in scope. Phase 2b also adds the loop guards
+> *self-guard* + *reference gate* to ADR-08.6's structural protection inventory (directive AG-6).
 
 ### Still open → Phase 3 (shared systems)
 Delegation/on-behalf-of algebra (AG-2); `Agent` vs `Service` kinds (AG-1); concrete authz tuple
