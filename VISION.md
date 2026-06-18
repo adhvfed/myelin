@@ -93,7 +93,9 @@ and is committed + pushed when done.
    also establishes the **shared design language** (design principles, tokens,
    accessibility baseline, and the catalogue of views) so every frontend stays coherent.
 3. `planning/03-shared-systems-architecture` — detailed technical roadmap for the
-   **shared** backend system(s) the subsystems depend on.
+   **shared** backend system(s) the subsystems depend on. Like Phase 4, this work must be
+   grounded in the literature on algorithms and prior art (consensus, log-structured
+   storage, pub/sub, indexing, distributed systems) with references cited.
 4. `planning/04-subsystem-architectures/<subsystem>/` — one agent per identified
    subsystem produces a detailed technical spec. Agents sketch in numbered folders
    before committing to a final design in an `architecture/` folder. **For any subsystem
@@ -101,10 +103,17 @@ and is committed + pushed when done.
    information architecture, key user flows, and wireframes/mockups of the primary screens
    (with empty/loading/error states) — produced and reviewed *before* the technical
    architecture is finalised.** Each subsystem agent also chooses its own languages, tools,
-   and database to best fit its needs (Rust default; justify any divergence). Subsystems
-   are sequenced when one strongly influences another (fully sequential is acceptable —
-   architecture comes before process). Changes required in shared systems are specified,
-   and the subsystem spec is written on those premises.
+   and database to best fit its needs (Rust default; justify any divergence). **Agents must
+   consult the literature on algorithms and prior art — academic papers, proven system
+   designs, data structures, and established protocols — and cite their references, so the
+   designs build on existing knowledge rather than reinventing it. Where a known algorithm,
+   paper, or battle-tested system design fits (e.g. CRDTs for collaborative editing, Merkle
+   structures and pack/delta storage for git, log-structured/consensus designs for the
+   event bus, inverted indexes for search), name it and explain the choice; where we
+   deliberately deviate from established practice, justify why.** Subsystems are sequenced
+   when one strongly influences another (fully sequential is acceptable — architecture
+   comes before process). Changes required in shared systems are specified, and the
+   subsystem spec is written on those premises.
 5. `planning/05-refined-shared-systems-architecture` — a reconciliation agent reviews all
    architectures as a whole, refines the shared systems, and **rewrites all of the `04`
    documents from scratch** with the necessary adjustments. Also specifies a **testing
