@@ -10,6 +10,32 @@
 //! **Contract-index:** row 2.3 — `outbox` table `(event_id UNIQUE, aggregate, seq, subject,
 //! envelope)`, `UNIQUE(aggregate, seq)` per-aggregate ordering. **P-S07 → global P-008.**
 //!
+//! ## Status (P-012 / EB-03, 2026-06-19) — per-aggregate ordering CORRECTNESS, reconciled in place
+//! EB-03 ("The transactional outbox table + the `OutboxTx::emit` same-tx API, per-aggregate
+//! ordering correctness") is the **event-bus ledger's framing of the SAME deliverable the
+//! substrate roadmap already shipped** (P-S07/P-008 here, P-S06/P-006 for the emit causality):
+//! the global run order interleaves the two roadmaps, so the outbox + emit surface is reached
+//! from both. Per the coherence rule (EI-01 §7: never define a type twice, never build a
+//! parallel second implementation), EB-03 **reconciles in place** — the frozen 2.3 table shape
+//! ([`OUTBOX_MIGRATION`]), the 2.2 [`OutboxTx`] emit surface, the same-tx co-commit, and the
+//! emit-iff-committed structure are UNCHANGED. What EB-03 ADDS / HARDENS:
+//! - **Per-aggregate `seq` is now allocated at COMMIT time, not emit time** (see
+//!   [`OutboxTransaction::commit`]). The substrate version allocated `seq` from `next_seq` at
+//!   emit time; an aborted transaction that had emitted would then have BURNED a seq value,
+//!   leaving a **gap** in the surviving committed sequence. EB-03's gate requires the
+//!   per-aggregate seq be "monotonic AND **gap-free** under concurrent emitters", and arch §3.2
+//!   requires it "reflect **true commit order**". Both are satisfied exactly by allocating at
+//!   commit under the store lock: an aborted transaction consumes no seq, and the order
+//!   transactions reach `commit` (true commit order) is the order seqs are assigned. This is a
+//!   correctness improvement to the shared mechanism, documented per EI-01 §1 — the seam shape
+//!   (the row columns, the `OutboxTx` trait, the depth signal) does NOT change.
+//! - **The EB-03 GATE artifact** `tests::eb03_per_aggregate_seq_is_monotonic_and_gap_free_under_concurrent_emitters`
+//!   (N threads race one hot aggregate → the committed seqs are exactly the contiguous set
+//!   `{0..N}`, no gap, no dup) + `tests::eb03_aborted_transaction_leaves_no_seq_gap`.
+//! - **FLOOR named:** proving this ordering AT PRODUCTION QPS under a hot-ref / hot-channel
+//!   burst (BUS-D9, contract 2.3's "production QPS" clause) is the **M5 follow-on EB-29**. EB-03
+//!   ships the correctness construction; EB-29 proves it under measured load.
+//!
 //! ## What this module ships (P-S07, the silent-data-loss floor — SUB-D1 / BUS-D4)
 //! - The `outbox` table **migration** ([`OUTBOX_MIGRATION`]) to the frozen 2.3 shape: the
 //!   forward-only DDL the migration runner (P-S15) applies. Expressed as a frozen DDL string
@@ -176,7 +202,11 @@ pub(crate) struct Inner {
     pub(crate) rows: HashMap<EventId, OutboxRow>,
     /// The order rows were committed (so the relay claims oldest-first, `(aggregate, seq)`).
     pub(crate) order: Vec<EventId>,
-    /// The next `seq` per aggregate (models the `UNIQUE(aggregate, seq)` monotonic counter).
+    /// The next committed `seq` per aggregate (models the `UNIQUE(aggregate, seq)` monotonic
+    /// counter). **Allocated at COMMIT time, not emit time** (EB-03): a `seq` is consumed only
+    /// when the transaction durably commits, so an aborted transaction leaves NO gap — the
+    /// committed sequence is `0, 1, 2, …` gap-free, and it reflects TRUE COMMIT ORDER (arch
+    /// §3.2), which is exactly what the per-aggregate ordering invariant requires.
     pub(crate) next_seq: HashMap<AggregateKey, u64>,
     /// Rows the relay gave up on (dead-lettered after bounded retries). Drained out of `rows`.
     pub(crate) dead_letters: Vec<OutboxRow>,
@@ -321,20 +351,45 @@ impl OutboxTransaction {
 
     /// Commit the transaction: every staged outbox row + the staged state change become durable
     /// **atomically**. After this, the rows are visible to the relay and counted in
-    /// `outbox_depth`. The per-aggregate `seq` was assigned at emit time under the store lock
-    /// (so two concurrent transactions on the same aggregate never collide on `seq`).
+    /// `outbox_depth`.
+    ///
+    /// **The per-aggregate `seq` is assigned HERE, at commit time, under the store lock**
+    /// (EB-03, per-aggregate ordering correctness). This is what makes the committed sequence
+    /// for each aggregate `0, 1, 2, …` **gap-free AND in true commit order** (arch §3.2):
+    /// - because the seq is consumed only when the transaction durably commits, an **aborted**
+    ///   transaction that emitted (and was dropped) consumes NO seq → **no gap**;
+    /// - because the whole commit (read-the-counter → assign → bump) runs while this thread
+    ///   holds the single store lock, two **concurrent** transactions committing to the same
+    ///   aggregate are serialized → distinct, monotonic, contiguous seqs → **no dup, no gap**;
+    /// - the order in which transactions reach `commit` (true commit order) is the order in
+    ///   which their seqs are assigned, so outbox order == state-change-commit order, which is
+    ///   the source-of-truth ordering the relay drains.
+    ///
+    /// In the real OLTP binding (P-007) this is the `INSERT … RETURNING` whose `seq` is
+    /// `COALESCE(MAX(seq)+1, 0)` for the aggregate inside the caller's transaction, protected by
+    /// the `UNIQUE(aggregate, seq)` constraint (a racing commit retries) — same observable
+    /// property. The in-memory store models exactly that under the store lock.
     pub fn commit(mut self) -> Result<()> {
         let mut inner = self.store.lock();
-        for row in self.staged_rows.drain(..) {
-            // The UNIQUE(event_id) constraint: a re-commit of the same id is a programming
-            // error (the minter is monotonic, so this cannot happen on the happy path) — reject
-            // loudly rather than silently overwrite (no silent data loss).
+        // First pass: every staged row's event_id must be unique (the UNIQUE(event_id)
+        // constraint) — reject the WHOLE commit loudly before mutating anything (atomicity: a
+        // partial commit would be silent data loss). The minter is monotonic so this cannot
+        // happen on the happy path; a collision is a programming error.
+        for row in &self.staged_rows {
             if inner.rows.contains_key(&row.event_id) {
                 return Err(OutboxError(format!(
                     "outbox UNIQUE(event_id) violation on {:?} — duplicate emit",
                     row.event_id
                 )));
             }
+        }
+        // Second pass: assign the per-aggregate commit-order seq and durably insert. Staged
+        // rows keep the emit order, so within one transaction the seqs are assigned in emit
+        // order; across transactions they are assigned in commit order (this lock).
+        for mut row in self.staged_rows.drain(..) {
+            let slot = inner.next_seq.entry(row.aggregate.clone()).or_insert(0);
+            row.seq = *slot;
+            *slot += 1;
             inner.order.push(row.event_id.clone());
             inner.rows.insert(row.event_id.clone(), row);
         }
@@ -368,15 +423,10 @@ impl OutboxTx for OutboxTransaction {
     fn emit(&mut self, draft: EventDraft, cause: Option<&EventEnvelope>) -> Result<EventId> {
         // Mint the stable ULID for this event (the broker-side dedup id).
         let id: EventId = self.minter.mint().into();
-        // Assign the per-aggregate seq under the store lock so concurrent transactions on the
-        // same aggregate get distinct, monotonic seqs (the UNIQUE(aggregate, seq) invariant).
-        let seq = {
-            let mut inner = self.store.lock();
-            let slot = inner.next_seq.entry(draft.aggregate.clone()).or_insert(0);
-            let s = *slot;
-            *slot += 1;
-            s
-        };
+        // The per-aggregate `seq` is NOT allocated here — it is assigned at COMMIT time (see
+        // `OutboxTransaction::commit`) so an aborted transaction consumes no seq and the
+        // committed sequence stays gap-free + in true commit order (EB-03). The staged row
+        // carries a placeholder `seq` that `commit` overwrites under the store lock.
         let aggregate = draft.aggregate.clone();
         let subject = draft.subject.clone();
         // Build the ambient context for the pure derivation (id + the transaction's base).
@@ -397,7 +447,8 @@ impl OutboxTx for OutboxTransaction {
         self.staged_rows.push(OutboxRow {
             event_id: id.clone(),
             aggregate,
-            seq,
+            // Placeholder; the real per-aggregate commit-order seq is stamped by `commit`.
+            seq: 0,
             subject,
             envelope,
             published_at: None,
@@ -515,8 +566,8 @@ mod tests {
     }
 
     /// `emit` derives causality through the trait (a caused event sets depth = parent+1 and
-    /// carries the root) AND assigns a monotonic per-aggregate seq. Proves the trait impl wires
-    /// `derive_envelope` and the ordering key together.
+    /// carries the root) AND, on commit, the rows carry a monotonic per-aggregate seq. Proves
+    /// the trait impl wires `derive_envelope` and the commit-time ordering key together.
     #[test]
     fn emit_derives_causality_and_assigns_monotonic_seq_per_aggregate() {
         let (store, minter) = store_and_minter();
@@ -535,10 +586,12 @@ mod tests {
         assert_eq!(child_env.causation_id, Some(root_id.clone()));
         assert_ne!(root_id, child_id);
 
-        // seqs are monotonic per aggregate (same aggregate → 0, 1).
-        assert_eq!(tx.staged_rows[0].seq, 0);
-        assert_eq!(tx.staged_rows[1].seq, 1);
-        assert_eq!(tx.staged_rows[0].aggregate, tx.staged_rows[1].aggregate);
+        // The seq is assigned at COMMIT (gap-free, true-commit-order). After commit the durable
+        // rows for the same aggregate carry monotonic seqs 0, 1 in emit order.
+        tx.commit().unwrap();
+        assert_eq!(store.row(&root_id).unwrap().seq, 0);
+        assert_eq!(store.row(&child_id).unwrap().seq, 1);
+        assert_eq!(store.row(&root_id).unwrap().aggregate, store.row(&child_id).unwrap().aggregate);
     }
 
     fn store_envelope(tx: &OutboxTransaction, i: usize) -> EventEnvelope {
@@ -546,18 +599,88 @@ mod tests {
     }
 
     /// Distinct aggregates get independent seq counters (each starts at 0) — the per-aggregate
-    /// ordering is per-aggregate, not global.
+    /// ordering is per-aggregate, not global. Asserted on the committed rows (seq is a
+    /// commit-time property).
     #[test]
     fn seq_is_independent_per_aggregate() {
         let (store, minter) = store_and_minter();
         let mut tx = store.begin(minter, ctx_base());
-        tx.emit(draft("issues.issue.created", "issue:A"), None).unwrap();
-        tx.emit(draft("issues.issue.created", "issue:B"), None).unwrap();
-        tx.emit(draft("issues.issue.updated", "issue:A"), None).unwrap();
+        let a0 = tx.emit(draft("issues.issue.created", "issue:A"), None).unwrap();
+        let b0 = tx.emit(draft("issues.issue.created", "issue:B"), None).unwrap();
+        let a1 = tx.emit(draft("issues.issue.updated", "issue:A"), None).unwrap();
+        tx.commit().unwrap();
         // A: 0, 1 ; B: 0
-        assert_eq!(tx.staged_rows[0].seq, 0); // A
-        assert_eq!(tx.staged_rows[1].seq, 0); // B
-        assert_eq!(tx.staged_rows[2].seq, 1); // A again
+        assert_eq!(store.row(&a0).unwrap().seq, 0); // A
+        assert_eq!(store.row(&b0).unwrap().seq, 0); // B
+        assert_eq!(store.row(&a1).unwrap().seq, 1); // A again
+    }
+
+    /// **EB-03 GATE — per-aggregate seq is monotonic + gap-free under CONCURRENT emitters to
+    /// the SAME aggregate (no gaps, no dups).** This is the per-aggregate ordering CORRECTNESS
+    /// the prompt ships (proving it AT PRODUCTION QPS under a hot-ref/hot-channel burst, BUS-D9,
+    /// is the M5 follow-on EB-29). N threads each open a transaction, emit one event to the one
+    /// shared hot aggregate, and commit; the committed seqs MUST be exactly the contiguous set
+    /// {0, 1, …, N-1} — every value present once (no gap), none repeated (no dup) — because the
+    /// commit-time allocation under the store lock serializes the racing commits.
+    #[test]
+    fn eb03_per_aggregate_seq_is_monotonic_and_gap_free_under_concurrent_emitters() {
+        use std::sync::Arc as StdArc;
+        let store = OutboxStore::new();
+        let minter: StdArc<dyn IdMinter> = StdArc::new(MonotonicMinter::new());
+        const N: u64 = 64;
+        let hot = "issue:HOT"; // the one hot aggregate every thread races on.
+
+        let mut handles = Vec::new();
+        for _ in 0..N {
+            let store = store.clone();
+            let minter = StdArc::clone(&minter);
+            handles.push(std::thread::spawn(move || {
+                let mut tx = store.begin(minter, ctx_base());
+                let id = tx.emit(draft("issues.issue.updated", hot), None).unwrap();
+                tx.commit().unwrap();
+                id
+            }));
+        }
+        let ids: Vec<EventId> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // Collect the committed seqs for the hot aggregate.
+        let mut seqs: Vec<u64> = ids.iter().map(|id| store.row(id).unwrap().seq).collect();
+        seqs.sort_unstable();
+        // Gap-free + no-dup: exactly the contiguous set {0, 1, …, N-1}.
+        let expected: Vec<u64> = (0..N).collect();
+        assert_eq!(seqs, expected, "concurrent emitters must yield contiguous, unique seqs");
+        assert_eq!(store.committed_count(), N as usize, "every committed event is present once");
+    }
+
+    /// **EB-03 — an ABORTED transaction consumes NO seq → the committed sequence stays gap-free.**
+    /// This is why the seq is allocated at COMMIT, not at emit: a transaction that emits to an
+    /// aggregate and is then dropped (abort / crash) must NOT burn a seq value, or the surviving
+    /// committed sequence would have a hole. Commit A (seq 0), abort B, commit C (must be seq 1,
+    /// not seq 2).
+    #[test]
+    fn eb03_aborted_transaction_leaves_no_seq_gap() {
+        let (store, minter) = store_and_minter();
+        let agg = "issue:GAPCHECK";
+
+        // A commits → seq 0.
+        let mut ta = store.begin(Arc::clone(&minter), ctx_base());
+        let a = ta.emit(draft("issues.issue.created", agg), None).unwrap();
+        ta.commit().unwrap();
+        assert_eq!(store.row(&a).unwrap().seq, 0);
+
+        // B emits to the SAME aggregate but is dropped WITHOUT commit (abort).
+        {
+            let mut tb = store.begin(Arc::clone(&minter), ctx_base());
+            tb.emit(draft("issues.issue.updated", agg), None).unwrap();
+            // tb dropped here — no commit, no seq consumed.
+        }
+
+        // C commits → must be seq 1 (the abort left no gap), not seq 2.
+        let mut tc = store.begin(Arc::clone(&minter), ctx_base());
+        let c = tc.emit(draft("issues.issue.updated", agg), None).unwrap();
+        tc.commit().unwrap();
+        assert_eq!(store.row(&c).unwrap().seq, 1, "abort must not burn a seq → gap-free");
+        assert_eq!(store.committed_count(), 2, "only the two committed events exist");
     }
 
     /// The minted id is a stable ULID stamped onto the envelope (the broker-side dedup key).
