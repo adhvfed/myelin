@@ -378,6 +378,18 @@ pub mod key_origin;
 pub mod kms;
 pub mod kms_failstatic;
 pub mod migration;
+// The OLAP read store FRAME — the holder + the CQRS-fed-by-the-bus contract shape (P-ST-17 /
+// P-104, contract 11.6 partial): a per-cell residency-pinned, idempotent-consumer-fed (dedup on
+// `event_id`) analytics read model, populated ONLY by replaying the durable event stream — live
+// (`OlapReadStore::apply`) or cold (`OlapReadStore::reindex_from_source`), NEVER by scanning OLTP
+// (the structural guard `oltp_scan_path_count == 0` — reindex-from-source is the ONLY rebuild path,
+// no "read OLTP into ClickHouse" backdoor). The OLAP store registers as a `PersonalDataHolder`
+// (`OlapStoreHolder`, crypto-shred erasure). FLOORS NAMED: the live bus feed (steady state) is
+// P-ST-18 (P-145); the C5 restriction-flag analytics-suppression gate lights up with Issues
+// analytics in M4 (P-ST-29) — the frame carries the flag; the worklog analytics-eligibility is
+// [OPEN → LEGAL] (OQ-H). See the module-level DEVIATION note (OLAP stays out of the frozen
+// residency M1 backup-able set because T4 is a derived, NOT-backed-up, reindex-from-source store).
+pub mod olap;
 pub mod oltp;
 pub mod reerase;
 // The reserve/settle cost gate mechanism + the durable per-tenant ledger (P-ST-16 / P-103,
@@ -456,6 +468,9 @@ pub use kms_failstatic::{
 pub use migration::{
     is_blocking_alter, is_destructive, HotTables, Migration, MigrationError, MigrationPhase,
     Migrations, OnlineMigrationRunner, PhaseProgress,
+};
+pub use olap::{
+    OlapApply, OlapDoc, OlapEvent, OlapFrameSignal, OlapIngestError, OlapReadStore, OlapStoreHolder,
 };
 pub use oltp::{OltpConfig, OltpError, OltpPool, PermitGuard};
 pub use reerase::{

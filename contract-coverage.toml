@@ -705,8 +705,28 @@ cdc = [
 [[contract]]
 row = "11.6"
 title = "OLAP read store"
-status = "deferred"
+status = "covered"
+# P-104 (P-ST-17): the OLAP read store FRAME — the holder + the CQRS-fed-by-the-bus contract SHAPE
+# (11.6 partial). `OlapReadStore` is a per-cell, residency-pinned, idempotent-consumer-fed (dedup on
+# `event_id`) analytics read model, populated ONLY by replaying the durable event STREAM — live
+# (`apply`, the shape the live bus feed P-ST-18 takes) or cold (`reindex_from_source`) — NEVER by
+# scanning OLTP. The no-OLTP-scan backdoor is BOTH a runtime guard (`oltp_scan_path_count == 0`, 0 by
+# construction — no code path increments it) AND a structural source assertion (the frame's
+# production source carries no `OltpPool`/`from_oltp`/OLTP-`SELECT` construct). Reindex-from-source is
+# the ONLY rebuild path (cold == live, shares the live `apply` projection). The OLAP store registers
+# as a `PersonalDataHolder` (`OlapStoreHolder`, crypto-shred erasure; restrict = the C5 suppression
+# seam). The CDC pair is the bus-fed CQRS feeder (`OlapBusFeeder`, the shape the live feed takes) over
+# `OlapEvent::from_envelope` + `apply` (cdc_11_6_olap_frame.rs).
+# Floors named: the LIVE bus feed (steady-state idempotent consumer off the durable stream +
+# `*.snapshot` replay) is P-ST-18 (global P-145), which COMPLETES this frame; the C5 restriction-flag
+# analytics-suppression gate (no analytics for a restricted subject; the `olap_restricted_subject_leak
+# == 0` drill) lights up with Issues analytics in M4 (P-ST-29) — the frame carries the flag + the
+# `is_restricted` read; worklog/productivity analytics-eligibility is [OPEN → LEGAL] (OQ-H). The real
+# ClickHouse-class columnar backend lands with the live feed (P-ST-18); the frame is an in-memory-
+# testable MODEL over the existing SourceLog/ReindexFromSource primitive + the frozen EventEnvelope,
+# so NO new db/object-store/cache/bus trait is touched and no new integration drill is owed.
 landing = "P-145"
+cdc = ["crates/myelin-storage/tests/cdc_11_6_olap_frame.rs"]
 
 [[contract]]
 row = "11.7"
