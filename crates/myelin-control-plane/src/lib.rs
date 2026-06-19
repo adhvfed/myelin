@@ -1,4 +1,9 @@
-//! # `myelin-control-plane` — the PII-free control-plane registry (CP-M1, P-CP-05 / P-080)
+//! # `myelin-control-plane` — the PII-free control-plane registry + routing (CP-M1)
+//!
+//! Built across the CP-M1 prompts: **P-CP-05 / P-080** (the registry tables + the HARD placement
+//! invariant) and **P-CP-06 / P-081** (`discover` — PII-free tenant-grain routing, off the hot path,
+//! client-cacheable fail-static). The remaining routing/attestation answers (`place` /
+//! `placement_of` / `residency_verify`) land in P-CP-07 / P-CP-08 / P-CP-09.
 //!
 //! **Owning architecture doc:**
 //! `planning/05-refined-shared-systems-architecture/tenancy-and-control-plane.md`
@@ -29,6 +34,19 @@
 //! 4. **The CP-D1 registry leg** ([`holder::assert_no_personal_columns`]) — the data-map over the
 //!    LIVE registry schema asserts 0 `is_personal=true` columns (the static lint leg is P-CP-04).
 //!
+//! ## What P-CP-06 / P-081 adds ([`discover`])
+//! 5. **`discover(slug | tenant_id) → RouteTuple`** ([`Registry::discover`] / [`discover::RouteTuple`]
+//!    `{cell_id, region, cell_endpoint, ttl_seconds}`) — PII-free routing keyed by the opaque id /
+//!    non-personal slug, **never an authz answer** (routing ≠ authorization). It reads
+//!    `tenant_placement` JOINed to `cell`.
+//! 6. **The client-cacheable, fail-static [`DiscoveryCache`]** — wraps [`myelin_substrate::FailStatic`]
+//!    (contract 1.10) so a client caches the route with the returned TTL and, on a control-plane
+//!    outage, serves the last-known-good route **fail-static for routing** (bounded-staleness) rather
+//!    than failing closed (the CP-D4 blast-radius win seed, P-CP-14).
+//! 7. **The `discovery_cache_hit` + `misroute_count` telemetry** ([`discover::DiscoverySignals`]) —
+//!    aggregate PII-free counters; `discovery_cache_hit` increments on a cache serve, `misroute_count`
+//!    on a `discover` that resolves to no route (the gateway's correction signal).
+//!
 //! ## DAG POSITION (a NAMED extension of the §2.9 eleven-crate library DAG)
 //! This is a **SERVICE crate** — a leaf consumer ABOVE the glue crates (it depends on
 //! `myelin-substrate`/`-tenancy`/`-gdpr`), exactly like `myelin-identity-service` /
@@ -41,11 +59,16 @@
 //!   multi-cell `CrossCellPointer` resolution is the **M5 floor, P-CP-19 / P-CP-20** (bridge
 //!   resolution live + the fan-out). The schema field is a `Vec<CellId>` (so the shape is frozen)
 //!   but every v1 placement carries exactly one member cell (its home), asserted in tests.
-//! - **The routing/attestation answers** (`discover`, `place`, `placement_of`, `residency_verify`)
-//!   are the **next prompts P-CP-06 / P-CP-07 / P-CP-08 / P-CP-09** — this prompt ships the
-//!   registry *schema* (the half of 12.3 those answers store in) + the invariant they write through,
-//!   NOT the answers themselves. The routing signals (`placement_count`/`provision_latency`/…)
-//!   land with `place`/`discover`.
+//! - **The remaining routing/attestation answers** (`place`, `placement_of`, `residency_verify`) are
+//!   the **next prompts P-CP-07 / P-CP-08 / P-CP-09**. `discover` is now LIVE (P-CP-06 / P-081); the
+//!   `place`/`placement_of` routing signals (`placement_count`/`provision_latency`/…) land with those.
+//! - **The GeoDNS/anycast discovery edge is `[OPEN → P4 (infra)]`** (architecture §7.3) — a latency
+//!   optimisation that fronts the PII-free discovery contract with a geo-routed edge. **v1 is
+//!   CP-lookup + client cache** ([`discover::DiscoveryCache`]); the edge is an infra follow-on, not a
+//!   band-gated engineering unit. The discovery *contract* ([`discover::RouteTuple`] + the client
+//!   cache + fail-static) is fully built and does not change shape when the edge lands.
+//! - **Repo-grain `discover` / `placement_of(repo)`** (C-1) is the M3 follow-on **P-CP-15**; this
+//!   crate's `discover` is **tenant-grain** only.
 //! - **The concrete Postgres execution** (the bounded pool + RLS the registry tables open through,
 //!   Storage **P-ST-01 / P-007**; the trigger DDL executed against the live pool, **P-S12**) is the
 //!   named Storage-driver floor — the invariant logic + the region-immutability discipline here are
@@ -55,10 +78,12 @@
 //!   readiness pass — is the next floor **P-CP-11**; here the `cell_provisioning` log records the
 //!   steps + the `CellStatus::Provisioning → Active` states exist, but the *gating* is P-CP-11.
 
+pub mod discover;
 pub mod holder;
 pub mod registry;
 pub mod schema;
 
+pub use discover::{DiscoverKey, DiscoveryCache, DiscoverySignals, RouteTuple};
 pub use holder::{
     assert_no_personal_columns, control_plane_data_map, ColumnClassification, ControlPlaneHolder,
     CONTROL_PLANE_STORE,
@@ -387,5 +412,83 @@ mod tests {
         assert_eq!(answer.member_cells.len(), 1); // v1 single-element floor.
         assert_eq!(answer.isolation_tier, IsolationKind::Pool);
         assert_eq!(answer.status, PlacementStatus::Active);
+    }
+
+    /// **CDC pair for 12.2 tenant-grain `discover` (provider + consumer).** The PROVIDER is this
+    /// crate's [`Registry::discover`] answering a [`RouteTuple`] from `tenant_placement` JOINed to
+    /// `cell`. The CONSUMER stands in for a **gateway / git-wire** caller (architecture §7.3): it
+    /// takes the route, encodes the cell endpoint into the URL it routes to, and — load-bearing —
+    /// can read ONLY the routing fields (`cell_id`/`region`/`cell_endpoint`/`ttl_seconds`), NEVER an
+    /// authz answer (there is no grant/principal/permission field on `RouteTuple`). If the route shape
+    /// drifts, the consumer stops compiling — the point of a glue-crate CDC.
+    #[test]
+    fn cdc_12_2_discover_tenant_grain_provider_consumer() {
+        use myelin_tenancy::{CellId, Region, TenantId};
+
+        /// A stand-in gateway / git-wire consumer: it routes a request to the discovered cell. It can
+        /// ONLY use the routing tuple — it has no way to obtain a grant from `discover` (routing ≠
+        /// authorization; the cell does its own fail-closed `check`).
+        struct GatewayRoute {
+            /// The endpoint the gateway connects the request to (e.g. the git remote host).
+            target_endpoint: String,
+            /// The region the gateway confirms the route stays inside (residency, §5.3).
+            pinned_region: String,
+            /// The TTL the gateway caches the route for (off the hot path, §8).
+            cache_ttl_secs: u64,
+        }
+        impl GatewayRoute {
+            /// Build the gateway's routing decision from a discovered [`RouteTuple`] (the read side).
+            fn from_route(route: &RouteTuple) -> GatewayRoute {
+                GatewayRoute {
+                    target_endpoint: route.cell_endpoint.clone(),
+                    pinned_region: route.region.as_str().to_string(),
+                    cache_ttl_secs: route.ttl_seconds,
+                }
+            }
+        }
+
+        // PROVIDER: a placed tenant in eu-west.
+        let mut registry = Registry::new();
+        registry.insert_cell(Cell {
+            cell_id: CellId::from_token("cell-w-1"),
+            region: Region::new("eu-west"),
+            status: CellStatus::Active,
+            isolation_kind: IsolationKind::Pool,
+            capacity: Capacity {
+                tenants_max: 1000,
+                write_qps_max: 5000,
+                storage_bytes_max: 1 << 40,
+            },
+            utilisation: 5,
+            version: 1,
+            endpoint: "cell.eu-west.myelin.eu".into(),
+        });
+        registry
+            .place_tenant(TenantPlacement {
+                tenant_id: TenantId::from_token("01J0ACME"),
+                region: Region::new("eu-west"),
+                home_cell: CellId::from_token("cell-w-1"),
+                isolation_tier: IsolationKind::Pool,
+                slug: "acme".into(),
+                status: PlacementStatus::Active,
+                member_cells: vec![CellId::from_token("cell-w-1")],
+            })
+            .expect("the single-region placement is admitted");
+
+        // PROVIDER answers `discover`; CONSUMER routes through the frozen tuple shape.
+        let route = registry
+            .discover(&DiscoverKey::TenantId(TenantId::from_token("01J0ACME")), 30)
+            .expect("the placed tenant resolves to a route");
+        let gw = GatewayRoute::from_route(&route);
+        assert_eq!(gw.target_endpoint, "cell.eu-west.myelin.eu");
+        assert_eq!(gw.pinned_region, "eu-west");
+        assert_eq!(gw.cache_ttl_secs, 30);
+
+        // The git-wire caller resolves the SAME route by the non-personal slug (the C-1 git-wire use,
+        // tenant-grain here; repo-grain is P-CP-15).
+        let by_slug = registry
+            .discover(&DiscoverKey::Slug("acme".into()), 30)
+            .expect("the slug resolves to a route");
+        assert_eq!(GatewayRoute::from_route(&by_slug).target_endpoint, "cell.eu-west.myelin.eu");
     }
 }
