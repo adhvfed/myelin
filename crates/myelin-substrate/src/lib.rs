@@ -46,11 +46,29 @@
 //! drill (`tests/drill_sub_d7_idor.rs`) + the CDC 1.2 pair (`tests/cdc_1_2_topology.rs`) are the
 //! dated green artifact: 60 spoofs rejected + audited, 0 served (`CrossTenantCount == 0`).
 //!
+//! ## Status (P-S14 → P-031, 2026-06-19) — liveness ≠ readiness on the metrics-health surface DONE
+//! The **liveness ≠ readiness** semantics (1.3, SUB-D9) are **implemented** in [`metrics_health`]:
+//! the lifecycle-opened [`metrics_health::MetricsHealthSurface`] exposes two INDEPENDENT probes —
+//! [`metrics_health::MetricsHealthSurface::liveness`] ("not wedged"; reads ONLY the process's own
+//! [`metrics_health::LivenessState`], structurally incapable of checking a dependency) and
+//! [`metrics_health::MetricsHealthSurface::readiness`] ("can serve correct traffic now"; a dead
+//! **critical** dependency → [`metrics_health::Readiness::NotReady`] + shed; startup =
+//! boot/migration incomplete → not-ready-not-killed). A severed critical dependency flips
+//! readiness and sheds while liveness stays `Up` (no restart-storm). `serve` opens it in the
+//! `Booting` state and [`metrics_health::MetricsHealthSurface::mark_started`]s it at the end of a
+//! successful boot. The SUB-D9 drill (`tests/drill_sub_d9_liveness_readiness.rs`) + the CDC 1.3
+//! pair (`tests/cdc_1_3_liveness_readiness.rs`) are the dated green artifact: a dead critical dep
+//! → `readiness` gauge `1 → 0`, `liveness_restart_count == 0` (no churn). The composition with
+//! **fail-static** (§8.3) is named: readiness handles the *sustained* outage, fail-static (P-S18)
+//! buys the *transient* hiccup.
+//!
 //! ## Floors named (deferred bodies → filling prompt)
-//! - **Liveness ≠ readiness** on the metrics-health surface (1.3, SUB-D9) → **P-S14**. `serve`
-//!   opens the metrics-health surface and exports the signal set; the readiness/liveness split
-//!   (a dead critical dependency reports *not ready*; liveness must NOT check dependencies) is
-//!   that prompt.
+//! - **The real `/livez` + `/readyz` HTTP handlers + the OTLP readiness/liveness gauge export**
+//!   on the real metrics-health listener land with the real transport wiring (P-S13/P-S14+). The
+//!   semantics (liveness ignores deps; readiness sheds on a dead critical dep; startup is
+//!   not-ready-not-killed) are COMPLETE now; the live `DependencyHealth` probe is fed by the
+//!   resilient client's breaker state (§6, P-S16) in production — here a [`metrics_health::HealthTable`]
+//!   fixture + the harness dependency-break injector drive it.
 //! - The real **gateway transport + mTLS/signed-internal-credential wire format + the durable
 //!   tamper-evident audit sink** for the IDOR records → the gateway/listener wiring (P-S14+) and
 //!   GDPR `P-GA-19`/`P-062` (the audit *consumer* reads the same PII-free
@@ -85,9 +103,14 @@
 use serde::{Deserialize, Serialize};
 
 pub mod crate_graph;
+pub mod metrics_health;
 pub mod serve;
 pub mod topology;
 
+pub use metrics_health::{
+    CriticalDependencies, CriticalDependency, DependencyHealth, HealthTable, Liveness,
+    LivenessState, MetricsHealthSurface, Readiness, ReadinessReport, Startup,
+};
 pub use serve::{
     boot, serve, AppSpec, ConsumerReg, HoldersSpec, InternalRpc, Migration, MigrationRunner,
     Migrations, OutboxSpec, PortOpener, PublicRoutes, ServeHandle, Surface, Telemetry,
@@ -199,6 +222,7 @@ mod tests {
             consumers: vec![],
             holders: HoldersSpec::Auto,
             outbox: OutboxSpec::default(),
+            critical: CriticalDependencies::default(),
         };
         assert_eq!(spec.name, "hello");
         assert_eq!(spec.holders, HoldersSpec::Auto);

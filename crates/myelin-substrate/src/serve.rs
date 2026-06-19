@@ -64,6 +64,7 @@
 //!   the in-memory models of the SQL `outbox` / `consumer_dedup` tables (P-S07/P-S08); the real
 //!   binding inside the caller's DB transaction lands when the driver does.
 
+use crate::metrics_health::{CriticalDependencies, HealthTable, MetricsHealthSurface};
 use crate::topology::PublicSurface;
 use crate::{Config, ServeError};
 use myelin_events::relay::{BusTransport, InProcessBus};
@@ -269,19 +270,45 @@ pub enum Surface {
 /// set is exported (§3.5). **Floor:** the real listeners + the OS-signal event loop land with the
 /// real transport (named in [`ServeHandle::signal_drain`]); the tenant-from-token + re-authorize
 /// SECURITY mechanism is complete now ([`crate::topology`]).
-#[derive(Default)]
 pub struct PortOpener {
     opened: Vec<Surface>,
     /// The live public surface the lifecycle opens — tenant-from-token + IDOR reject/audit (P-S13).
     public: PublicSurface,
+    /// The live metrics-health surface the lifecycle opens — liveness ≠ readiness (P-S14, SUB-D9).
+    /// Opened in the `Booting` startup state (not-ready-not-killed); `serve` marks it started at
+    /// the end of a successful boot. The `DependencyHealth` probe is a [`HealthTable`] on this
+    /// floor (the resilient client's breaker state feeds it in production, §6 P-S16).
+    metrics_health: MetricsHealthSurface<HealthTable>,
+    /// The shared probe handle behind the metrics-health surface, so the (future) resilient
+    /// client / a drill can mark a critical dependency down and watch readiness flip.
+    health: HealthTable,
+}
+
+impl Default for PortOpener {
+    fn default() -> Self {
+        let health = HealthTable::new();
+        PortOpener {
+            opened: Vec::new(),
+            public: PublicSurface::default(),
+            // No critical deps declared on the bare default (a service declares its set at boot,
+            // §4.3); `open_all` rebuilds with the service's declared critical set.
+            metrics_health: MetricsHealthSurface::new(CriticalDependencies::default(), health.clone()),
+            health,
+        }
+    }
 }
 
 impl PortOpener {
-    /// Open the three surfaces (public / internal / metrics-health, §4). Constructs the live
-    /// tenant-from-token [`PublicSurface`] (the public↔internal security boundary). The real
-    /// listeners + the standard middleware stack land with the real transport (P-S14+).
-    pub fn open_all(&mut self) {
+    /// Open the three surfaces (public / internal / metrics-health, §4) over the service's
+    /// declared critical-dependency set. Constructs the live tenant-from-token [`PublicSurface`]
+    /// (the public↔internal security boundary, P-S13) and the live liveness ≠ readiness
+    /// [`MetricsHealthSurface`] (P-S14, opened `Booting` = not-ready-not-killed; the lifecycle
+    /// marks it started after a successful boot). The real listeners + the standard middleware
+    /// stack land with the real transport (P-S14+).
+    pub fn open_all(&mut self, critical: CriticalDependencies) {
         self.public = PublicSurface::default();
+        self.health = HealthTable::new();
+        self.metrics_health = MetricsHealthSurface::new(critical, self.health.clone());
         self.opened = vec![Surface::Public, Surface::Internal, Surface::MetricsHealth];
     }
 
@@ -295,6 +322,25 @@ impl PortOpener {
     /// + audited as an IDOR, and `misroute_count` stays 0.
     pub fn public_surface(&self) -> &PublicSurface {
         &self.public
+    }
+
+    /// The live liveness ≠ readiness metrics-health surface opened in the lifecycle (P-S14,
+    /// SUB-D9). Liveness = "not wedged" (never checks a dependency); readiness = "can serve
+    /// correct traffic now" (a dead critical dependency → not-ready + shed); startup =
+    /// not-ready-not-killed until [`Self::mark_metrics_health_started`].
+    pub fn metrics_health(&self) -> &MetricsHealthSurface<HealthTable> {
+        &self.metrics_health
+    }
+
+    /// The shared dependency-health probe behind the metrics-health surface (so the resilient
+    /// client / a drill can mark a critical dependency down and watch readiness flip).
+    pub fn health_probe(&self) -> &HealthTable {
+        &self.health
+    }
+
+    /// Flip the metrics-health surface's startup gate to complete (boot + migrations succeeded).
+    pub fn mark_metrics_health_started(&self) {
+        self.metrics_health.mark_started();
     }
 }
 
@@ -382,6 +428,12 @@ pub struct AppSpec {
     pub holders: HoldersSpec,
     /// The outbox relay spec (§3.3 — relay started automatically, BUS-2).
     pub outbox: OutboxSpec,
+    /// The critical-dependency set the metrics-health surface's readiness probe reads (§4.3,
+    /// SUB-D9). A dead **critical** dependency reports not-ready + sheds; a non-critical one does
+    /// not flip readiness. Declared at boot (P-S14). The OLTP store is implicitly critical (a
+    /// service cannot serve correct traffic without its own DB); a service adds its other critical
+    /// downstreams (e.g. `identity`) here.
+    pub critical: CriticalDependencies,
 }
 
 impl AppSpec {
@@ -402,6 +454,7 @@ impl AppSpec {
             consumers: Vec::new(),
             holders: HoldersSpec::Auto,
             outbox: OutboxSpec::default(),
+            critical: CriticalDependencies::default(),
         }
     }
 }
@@ -485,6 +538,20 @@ impl ServeHandle {
         self.ports.public_surface()
     }
 
+    /// The live liveness ≠ readiness metrics-health surface opened in the lifecycle (§4.3, P-S14,
+    /// SUB-D9). After a successful boot the startup gate is `Complete`, so readiness is governed by
+    /// the critical-dependency health: a dead critical dependency reports not-ready + sheds, while
+    /// liveness stays `Up` (no restart-storm). `liveness_restart_count` is the SUB-D9 no-churn zero.
+    pub fn metrics_health(&self) -> &MetricsHealthSurface<HealthTable> {
+        self.ports.metrics_health()
+    }
+
+    /// The shared dependency-health probe behind the metrics-health surface (so a drill / the
+    /// resilient client can mark a critical dependency down and watch readiness flip, §4.3).
+    pub fn health_probe(&self) -> &HealthTable {
+        self.ports.health_probe()
+    }
+
     /// The producer side of the contract-1.8 telemetry signal set (§3.5). Re-observes the live
     /// signals first so a reader always sees the current truth.
     pub fn telemetry(&self) -> &Telemetry {
@@ -563,6 +630,7 @@ pub fn boot(spec: AppSpec) -> Result<ServeHandle, ServeError> {
         consumers,
         holders,
         outbox,
+        critical,
     } = spec;
 
     // (1) boot — validate config (§3.2, fail fast) + open the bounded OLTP pool (§3.3).
@@ -606,15 +674,25 @@ pub fn boot(spec: AppSpec) -> Result<ServeHandle, ServeError> {
     );
 
     // (6) ports — open the three surfaces (§4). The tenant-from-token public surface (SUB-D7) is
-    //     P-S13; liveness≠readiness on the metrics-health surface (SUB-D9) is P-S14. Here the
-    //     opener records the topology and the metrics-health surface hosts the §3.5 producer.
+    //     P-S13; liveness≠readiness on the metrics-health surface (SUB-D9, P-S14) is opened over
+    //     the service's declared critical set, in the `Booting` startup state (not-ready-not-killed
+    //     while boot is in flight, §4.3). The OLTP store is always critical (a service cannot serve
+    //     correct traffic without its own DB); the service's declared `critical` extends that.
+    let mut full_critical = vec!["oltp".to_string()];
+    full_critical.extend(critical.deps().iter().map(|d| d.0.clone()));
     let mut ports = PortOpener::default();
-    ports.open_all();
+    ports.open_all(CriticalDependencies::new(full_critical));
 
     // (3.5) telemetry — install the producer side of the contract-1.8 signal set on the
     //       metrics-health surface; observe the initial (zero) state.
     let telemetry = Telemetry::new();
     telemetry.observe(&outbox_store, &consumers);
+
+    // boot succeeded → flip the metrics-health startup gate to Complete (the instance is no longer
+    // not-ready *for the startup reason*; readiness is now governed purely by the critical-
+    // dependency health, §4.3). A failed boot returns Err ABOVE this point, so the gate is flipped
+    // only on a genuinely-complete boot — a half-booted instance never reads ready.
+    ports.mark_metrics_health_started();
 
     Ok(ServeHandle {
         name,
@@ -745,6 +823,7 @@ mod tests {
             consumers: vec![consumer],
             holders: AppSpec::auto(),
             outbox: OutboxSpec::new(outbox.clone(), InProcessBus::new()),
+            critical: CriticalDependencies::default(),
         };
 
         // (boot) — the lifecycle boots: pool open, migrations applied, holders registered, relay
@@ -830,6 +909,7 @@ mod tests {
             consumers: vec![consumer],
             holders: AppSpec::auto(),
             outbox: OutboxSpec::new(outbox.clone(), InProcessBus::new()),
+            critical: CriticalDependencies::default(),
         };
         let handle = boot(spec).expect("boot");
 
@@ -867,6 +947,7 @@ mod tests {
             consumers: vec![consumer],
             holders: AppSpec::auto(),
             outbox: OutboxSpec::new(outbox.clone(), InProcessBus::new()),
+            critical: CriticalDependencies::default(),
         };
         let handle = boot(spec).expect("boot");
 
@@ -895,6 +976,7 @@ mod tests {
             consumers: vec![],
             holders: AppSpec::auto(),
             outbox: OutboxSpec::default(),
+            critical: CriticalDependencies::default(),
         };
         match boot(spec) {
             Err(e) => assert!(e.0.contains("forward-only"), "the error names the forward-only rule"),
@@ -950,6 +1032,7 @@ mod tests {
             consumers: vec![ConsumerReg::new(consumer)],
             holders: AppSpec::auto(),
             outbox: OutboxSpec::new(outbox.clone(), InProcessBus::new()),
+            critical: CriticalDependencies::default(),
         };
         let handle = boot(spec).expect("boot");
 

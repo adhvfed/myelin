@@ -22,7 +22,7 @@ use myelin_events::{
 use myelin_harness::{Predicate, SignalName, SignalSource};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_substrate::serve::{boot, AppSpec, ConsumerReg, OutboxSpec, Surface};
-use myelin_substrate::{Config, InternalRpc, Migrations, PublicRoutes};
+use myelin_substrate::{Config, CriticalDependencies, InternalRpc, Migrations, PublicRoutes};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -96,6 +96,7 @@ fn cdc_1_1_hello_world_main_boots_emits_consumes_drains_and_emits_signals() {
         consumers: vec![ConsumerReg::new(consumer)],
         holders: AppSpec::auto(),
         outbox: OutboxSpec::new(outbox.clone(), InProcessBus::new()),
+        critical: CriticalDependencies::default(),
     };
 
     // boot the lifecycle (provider side).
