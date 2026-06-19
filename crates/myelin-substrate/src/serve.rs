@@ -64,6 +64,7 @@
 //!   the in-memory models of the SQL `outbox` / `consumer_dedup` tables (P-S07/P-S08); the real
 //!   binding inside the caller's DB transaction lands when the driver does.
 
+use crate::topology::PublicSurface;
 use crate::{Config, ServeError};
 use myelin_events::relay::{BusTransport, InProcessBus};
 use myelin_events::{
@@ -223,13 +224,17 @@ impl ConsumerReg {
     }
 }
 
-/// The public surface route set (architecture §4.1; contract 1.2). Opaque on this floor; the
-/// gateway-fronted, tenant-from-token topology (SUB-D7) lands in **P-S13**.
+/// The public surface route set (architecture §4.1; contract 1.2). The gateway-fronted,
+/// tenant-from-token topology (SUB-D7) is implemented in [`crate::topology::PublicSurface`]
+/// (P-S13); this is the per-service route-registration carrier `serve` opens it over. Opaque on
+/// this floor (a service registers no routes yet); the live tenant-from-token surface the
+/// lifecycle opens is on [`ServeHandle::public_surface`].
 #[derive(Clone, Debug, Default)]
 pub struct PublicRoutes(pub ());
 
-/// The internal RPC surface (architecture §4.2; contract 1.2). Opaque on this floor;
-/// re-authorize-every-call lands in **P-S13**.
+/// The internal RPC surface registration (architecture §4.2; contract 1.2). The trust-boundary,
+/// re-authorize-every-call surface is implemented in [`crate::topology::InternalSurface`] (P-S13);
+/// this is the per-service carrier `serve` opens it over. Opaque on this floor.
 #[derive(Clone, Debug, Default)]
 pub struct InternalRpc(pub ());
 
@@ -257,25 +262,39 @@ pub enum Surface {
     MetricsHealth,
 }
 
-/// The port-opening seam `serve` calls (the body — the real listeners + middleware stack —
-/// lands in **P-S13/P-S14**). Records the three surfaces opened so a test can assert the
-/// topology was opened in the lifecycle. The metrics-health surface is where the producer side
-/// of the contract-1.8 signal set is exported (§3.5).
+/// The port-opening seam `serve` calls. Opens the three surfaces (§4) and OWNS the live
+/// tenant-from-token [`PublicSurface`] (P-S13) — the security boundary, not just a recorded enum.
+/// Records which surfaces were opened so a test can assert the topology was opened in the
+/// lifecycle. The metrics-health surface is where the producer side of the contract-1.8 signal
+/// set is exported (§3.5). **Floor:** the real listeners + the OS-signal event loop land with the
+/// real transport (named in [`ServeHandle::signal_drain`]); the tenant-from-token + re-authorize
+/// SECURITY mechanism is complete now ([`crate::topology`]).
 #[derive(Default)]
 pub struct PortOpener {
     opened: Vec<Surface>,
+    /// The live public surface the lifecycle opens — tenant-from-token + IDOR reject/audit (P-S13).
+    public: PublicSurface,
 }
 
 impl PortOpener {
-    /// Open the three surfaces (public / internal / metrics-health, §4). On this floor this
-    /// records them; the real listeners + the standard middleware stack land at P-S13/P-S14.
+    /// Open the three surfaces (public / internal / metrics-health, §4). Constructs the live
+    /// tenant-from-token [`PublicSurface`] (the public↔internal security boundary). The real
+    /// listeners + the standard middleware stack land with the real transport (P-S14+).
     pub fn open_all(&mut self) {
+        self.public = PublicSurface::default();
         self.opened = vec![Surface::Public, Surface::Internal, Surface::MetricsHealth];
     }
 
     /// The surfaces opened (for the lifecycle assertion).
     pub fn opened(&self) -> &[Surface] {
         &self.opened
+    }
+
+    /// The live tenant-from-token public surface opened in the lifecycle (P-S13). The gateway
+    /// feeds requests through [`PublicSurface::resolve_tenant`]; a path≠token mismatch is rejected
+    /// + audited as an IDOR, and `misroute_count` stays 0.
+    pub fn public_surface(&self) -> &PublicSurface {
+        &self.public
     }
 }
 
@@ -456,6 +475,14 @@ impl ServeHandle {
     /// The three surfaces opened in the lifecycle (§4).
     pub fn surfaces(&self) -> &[Surface] {
         self.ports.opened()
+    }
+
+    /// The live tenant-from-token public surface opened in the lifecycle (§4.1, P-S13). The
+    /// gateway resolves the operating tenant for a public request through
+    /// [`PublicSurface::resolve_tenant`] — tenant from the verified token, never the URL path; a
+    /// mismatch is rejected + audited as a cross-tenant IDOR. `misroute_count` is the SUB-D7 zero.
+    pub fn public_surface(&self) -> &PublicSurface {
+        self.ports.public_surface()
     }
 
     /// The producer side of the contract-1.8 telemetry signal set (§3.5). Re-observes the live
