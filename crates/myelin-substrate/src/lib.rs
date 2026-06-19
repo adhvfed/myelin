@@ -113,6 +113,40 @@
 //! (bounded dispatch pool / causal-depth ceiling / shared-root tripwire / bounded predicate guard)
 //! land in **P-S20 (P-036)** — this module ships only the agent *lane* of the shed order.
 //!
+//! ## Status (P-S20 → P-036, 2026-06-19) — agent-load caps + the causal-loop guard (SUB-D8) DONE
+//! The **agent-generated-load caps + the causal-loop guard** (contract 1.11 agent slice / the AG-6
+//! loop-guard machinery) are **implemented** in [`agent_load`]:
+//! - **(a) the bounded dispatch pool** — [`agent_load::DispatchPool`] takes a fixed number of permits
+//!   and **drops over-cap reactions ([`agent_load::DispatchAdmission::Dropped`]), never forks** a new
+//!   worker (§7.4). The `dispatch_pool_drops` signal is exported.
+//! - **(b) the causal-depth ceiling** — [`agent_load::DepthCeiling`] reads [`myelin_events::EventEnvelope::depth`]
+//!   (§5.3, stamped correct-by-construction by `OutboxTx::emit`, P-S06): a reaction at/over the **hard
+//!   ceiling (`16`)** is **halted** ([`agent_load::DepthVerdict::Halt`]); at/over the **soft ceiling
+//!   (`12`)** it is admitted-but-flagged so a deepening loop is visible early. The ceilings are the v1
+//!   floor read from the thresholds file (P-S22 / P-038).
+//! - **(c) the shared-causal-root-within-a-window tripwire** — [`agent_load::SharedRootTripwire`]
+//!   reads [`myelin_events::EventEnvelope::correlation_id`] (the causal root, §5.3): too many reactions
+//!   off ONE root within the sliding window → **fire** ([`agent_load::TripwireVerdict::Fired`]) +
+//!   quarantine the root (the *wide-fan-out* guard a per-chain depth ceiling would miss). `tripwire_fired`
+//!   is exported.
+//! - **(d) the bounded predicate-evaluation guard** — [`agent_load::PredicateGuard`] caps the static
+//!   step count + the runtime evaluation time per predicate (§7.5), **rejecting a crafted over-cost
+//!   matcher** ([`agent_load::PredicateVerdict::OverBudget`]) before it can DoS the trigger engine.
+//!
+//! The four caps are wired into one consult, [`agent_load::AgentLoadGuard::admit`] (the call the Bus
+//! reactive/dispatch tier, EB-23/P-143, makes per delivered reaction): a halt at any cap returns
+//! WITHOUT taking a permit, so a stopped loop leaks no resources. The contract-1.8 producer slice
+//! (`causal_depth` histogram + `tripwire_fired` + `dispatch_pool_drops`) is exported via
+//! [`agent_load::AgentLoadGuard::signals`], mapping onto the harness's `SignalName::{CausalDepthFirings,
+//! DispatchPoolDrops}` set the SUB-D8 drill reads. The unit tests (`agent_load::tests`) + the CDC 1.11
+//! agent-slice pair (`tests/cdc_1_11_agent_load.rs`) + the SUB-D8 drill
+//! (`tests/drill_sub_d8_causal_loop.rs`, an adversarial agent→agent loop driven by the P-S03 injector,
+//! asserted by the P-S04 telemetry library) are the dated green artifact. **Floors named:** the ceiling
+//! NUMBERS (`12`/`16`) + the tripwire window/threshold are the v1 floor → the versioned thresholds file
+//! (**P-S22 / P-038**); the **full agent-loop proof re-runs in M2** with the agent fabric (**AG-P12 /
+//! P-224**, AG-D7; **P-FLOW-18 / P-214**); the **reserve/settle cost gate** (§7.4's third cap) is the
+//! durable-wallet body in **Storage M1 (P-ST-16) + Agent (AG-P14 / P-227)** — named here, not built.
+//!
 //! ## Floors named (deferred bodies → filling prompt)
 //! - The env-first `Config::from_env()` parse of the real `DATABASE_URL`/broker/KMS/region knobs
 //!   plus the concrete `tokio-postgres`/`sqlx` connection behind [`myelin_storage::OltpPool`] land
@@ -147,6 +181,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod agent_load;
 pub mod crate_graph;
 pub mod holders;
 pub mod metrics_health;
@@ -155,6 +190,11 @@ pub mod serve;
 pub mod shed;
 pub mod topology;
 
+pub use agent_load::{
+    count_by_root, AgentLoadGuard, AgentLoadSignals, BudgetBreach, DepthCeiling, DepthVerdict,
+    DispatchAdmission, DispatchPool, GuardOutcome, PredicateGuard, PredicateVerdict,
+    SharedRootTripwire, TripwireVerdict,
+};
 pub use holders::{HolderRegistration, HolderRegistry, StoreKind};
 pub use metrics_health::{
     CriticalDependencies, CriticalDependency, DependencyHealth, HealthTable, Liveness,
