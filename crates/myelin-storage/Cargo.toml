@@ -31,6 +31,13 @@ serde.workspace = true
 # self-describing content-address + the per-tenant fs key path.
 blake3.workspace = true
 hex.workspace = true
+# The three-level KMS hierarchy (P-ST-06 / 11.3): the L2 DEK working keys are AES-256-GCM
+# (storage.md §4). We use the vetted RustCrypto `aes-gcm` AEAD (NIST SP 800-38D) for the
+# real wrap/unwrap envelope crypto rather than hand-rolling it (EI-01 §7: one primitive
+# behind a narrow trait; "cite proven structures, do not hand-roll crypto"). The
+# `getrandom` feature gives us `aead::OsRng` for key + nonce generation. The self-hostable
+# engine seam (Vault-Transit-class) fronts this in-process software engine on this floor.
+aes-gcm = "0.10"
 
 # The failure-injection harness is TEST-SUPPORT only (the same posture as a service's
 # main.rs / the harness's own dev usage). The IDOR + pool-saturation DRILLS read the

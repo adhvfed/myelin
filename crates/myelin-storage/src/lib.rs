@@ -99,10 +99,34 @@
 //!   load on the RESTORED copy, lock-budget measured) is the M2 follow-on **P-ST-21 (global P-126)**
 //!   — it needs the restored copy restore-verify produces; here the runner exists + admits only the
 //!   online shape at unit scale. The mutation floor on the ordering gate is ≥ 80% (mandatory-core).
+//! - **The three-level KMS hierarchy + the fail-static posture (P-ST-06 / contract 11.3 — global
+//!   P-058)** is now IMPLEMENTED in [`kms`] + [`kms_failstatic`]: the [`kms::KmsEngine`] holds the
+//!   L0 cell root, the L1 per-(tenant,region) KEKs, and the L2 DEKs (AES-256-GCM, per-tenant for
+//!   bulk + per-subject for the individual-erasure classes), stored ONLY envelope-wrapped
+//!   ([`kms::WrappedDek`]). The frozen [`kms::PiiKeyRef`] (`kms://<tenant>/<dek-epoch>/<class>`)
+//!   travels with every ciphertext; [`kms::KmsEngine::rotate_kek`] is envelope re-wrap (O(keys),
+//!   not O(data), forward-only); [`kms::KmsEngine::destroy_kek`]/`destroy_dek` are the
+//!   crypto-shred levers (a destroyed key renders its DEKs unrecoverable and is EXCLUDED from
+//!   [`kms::KmsEngine::backup_snapshot`] — it stays dead across a restore, §7.5). The
+//!   [`kms_failstatic::KmsReadPath`] over the [`kms::KmsAdapter`] seam gives the STOR-D6
+//!   availability posture: a transient KMS outage → resolved-DEK reads survive a bounded TTL; a
+//!   sustained hard-down → not-ready + shed ([`kms_failstatic::KmsReadiness::NotReady`]); **0
+//!   fail-open** (no path returns a DEK without a fresh resolve or an in-budget cache). **Floors
+//!   named in [`kms`]:** the `KeyOrigin` trait (platform-managed | BYOK | HYOK + the
+//!   `can_derive_plaintext_index()=false` structural HYOK enforcement) is the SIBLING **P-ST-07
+//!   (global P-094)** that FRONTS this engine; the OLTP/blob ENCRYPTION wiring (classify-driven
+//!   key choice, the real per-blob content-key wrap) is **P-ST-08 (global P-095)**; the
+//!   per-content-class HYOK POLICY + the KMIP/external-key-store adapter + HYOK-as-Schrems-III
+//!   (GD-7) are `[OPEN → P6/LEGAL]` named follow-ons (mechanism ships; policy → counsel/DPO); the
+//!   HSM/Shamir-split L0 backing is the production-hardening follow-on (the SHAPE — root wraps
+//!   KEKs, never exported — is complete). The mutation floor on the wrap/unwrap/destroy +
+//!   fail-open-prevention path is ≥ 80% (mandatory-core).
 
 pub mod blob;
 pub mod coloc;
 pub mod holder;
+pub mod kms;
+pub mod kms_failstatic;
 pub mod migration;
 pub mod oltp;
 pub mod rls;
@@ -113,6 +137,13 @@ pub use blob::{
 };
 pub use coloc::{ColocError, ColocatedOltp, ColocatedTx, COLOCATED_OUTBOX_MIGRATION};
 pub use holder::{register_holder, BlobStoreHolder, OltpHolderRegistration, OltpStoreHolder};
+pub use kms::{
+    CellRoot, DekHandle, DekId, KeyClass, KekId, KmsAdapter, KmsEngine, KmsError, PiiKeyRef,
+    WrappedDek, KEY_LEN, NONCE_LEN,
+};
+pub use kms_failstatic::{
+    KmsFailStaticSignals, KmsReadError, KmsReadPath, KmsReadResult, KmsReadiness,
+};
 pub use migration::{
     is_blocking_alter, is_destructive, HotTables, Migration, MigrationError, MigrationPhase,
     Migrations, OnlineMigrationRunner, PhaseProgress,

@@ -572,8 +572,15 @@ cdc = ["crates/myelin-storage/tests/cdc_11_2_blobstore.rs"]
 [[contract]]
 row = "11.3"
 title = "KMS hierarchy + KeyOrigin trait"
-status = "deferred"
-landing = "P-094"
+status = "covered"
+# P-058 (P-ST-06): the three-level KMS HIERARCHY half — L0 cell root / L1 per-(tenant,region)
+# KEK / L2 DEKs (AES-256-GCM, per-tenant + per-subject), the frozen pii_key_ref
+# (kms://<tenant>/<dek-epoch>/<class>), rotation-as-envelope-re-wrap, crypto-shred, and the
+# STOR-D6 fail-static posture. The CDC pair is an encrypted-store caller wrapping/unwrapping
+# through the engine. The SECOND half of this row — the KeyOrigin trait
+# (can_derive_plaintext_index()=false structural HYOK enforcement) — is the sibling P-ST-07
+# (global P-094); it adds the index-builder consumer to this same row.
+cdc = ["crates/myelin-storage/tests/cdc_11_3_kms.rs"]
 
 [[contract]]
 row = "11.4"
