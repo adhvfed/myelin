@@ -72,7 +72,13 @@ status = "OPEN — LEGAL"          # L-1, DPO-ratified; the VALUE is absent unti
 owner = "DPO / Legal"
 # static_max_secs = <RATIFIED W>  # [OPEN — LEGAL] — intentionally absent (a loud error to read).
 static_max_default_secs = 300    # the engineering SEED the mechanism is drilled against (P-S18/P-S25).
-# The constraint that ships regardless and is enforced structurally in the constructor:
+# The LOWER bound of the constraint (§8.2): static_max ≥ agent-token TTL — the window must CONTAIN
+# the short-lived per-run agent token (ID-1 / GD-3 / ADR-17). The agent token's life == its run
+# life; 60s is the v1 seed floor (the FailStatic constructor rejects any static_max below it,
+# P-S18). The real per-run TTL is set by mint_run_token (Identity M1); this is the substrate-side
+# bound the constraint is enforced against in M0.
+agent_token_ttl_secs = 60
+# The constraint that ships regardless and is enforced structurally in the constructor (P-S18):
 constraint = "static_max <= revocation-SLA AND static_max >= agent-token-TTL"
 
 # ---------------------------------------------------------------------------------------------

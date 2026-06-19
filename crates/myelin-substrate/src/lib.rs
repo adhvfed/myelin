@@ -183,6 +183,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod agent_load;
 pub mod crate_graph;
+pub mod fail_static;
 pub mod holders;
 pub mod metrics_health;
 pub mod migrations;
@@ -195,6 +196,10 @@ pub use agent_load::{
     count_by_root, AgentLoadGuard, AgentLoadSignals, BudgetBreach, DepthCeiling, DepthVerdict,
     DispatchAdmission, DispatchPool, GuardOutcome, PredicateGuard, PredicateVerdict,
     SharedRootTripwire, TripwireVerdict,
+};
+pub use fail_static::{
+    Answer, Clock, FailStatic, FailStaticError, FailStaticSignals, StalenessBound, SystemClock,
+    TestClock,
 };
 pub use holders::{HolderRegistration, HolderRegistry, StoreKind};
 pub use metrics_health::{
@@ -247,62 +252,11 @@ impl core::fmt::Display for ServeError {
 
 impl std::error::Error for ServeError {}
 
-/// The fail-static answer (architecture §8; contract 1.10). Fail-static is the correct
-/// AVAILABILITY default on a transient dependency hiccup; we NEVER fail open (the static
-/// answer is coarse "actor still active / coarse grants", never an escalation of access).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Answer<T> {
-    /// served within `fresh_ttl`.
-    Fresh(T),
-    /// served stale + degraded marker, between `fresh_ttl` and `static_max`.
-    Static(T),
-    /// past `static_max` — fail closed (the staleness budget is exhausted; deny is now
-    /// correct).
-    Closed,
-}
-
-/// The bounded-staleness cache (architecture §8; contract 1.10; ADR-17). On a transient
-/// dependency hiccup, serve a bounded-staleness cached answer so already-authenticated
-/// traffic keeps working, rather than turning one shared dependency into a whole-platform
-/// cascade.
-///
-/// Units (frozen, §2.10): `fresh_ttl` / `static_max` are **seconds**. Constraint:
-/// `static_max ≤ revocation SLA` and `static_max ≥ agent-token TTL` (the window contains
-/// the short-lived agent token). **The VALUE of `static_max` is `[OPEN — LEGAL]`** — the
-/// DPO ratifies it (L-1); the mechanism + the constraint ship regardless.
-///
-/// **Floor:** `get`'s body is `todo!()`; the mechanism lands in **P-S18**, proven vs a
-/// real Identity hiccup in **P-S25** (SUB-D4).
-#[derive(Clone, Debug)]
-pub struct FailStatic<T> {
-    /// serve fresh within this (seconds).
-    pub fresh_ttl: Seconds,
-    /// serve STALE (degraded marker) up to here on a hiccup (seconds);
-    /// ≤ revocation SLA, ≥ agent-token TTL.
-    pub static_max: Seconds,
-    _marker: core::marker::PhantomData<T>,
-}
-
-impl<T> FailStatic<T> {
-    /// Construct with the two frozen-unit bounds (seconds). The `static_max` value is the
-    /// DPO-ratified legal floor; this constructor takes it as data, not a default.
-    pub fn new(fresh_ttl: Seconds, static_max: Seconds) -> Self {
-        Self {
-            fresh_ttl,
-            static_max,
-            _marker: core::marker::PhantomData,
-        }
-    }
-
-    /// On a hiccup: within `fresh_ttl` → `Fresh`; between → `Static` (degraded marker +
-    /// background-refresh, stale-while-revalidate); past `static_max` → `Closed`
-    /// (architecture §8; contract 1.10).
-    ///
-    /// **Floor:** body is `todo!()`; the mechanism lands in **P-S18**.
-    pub fn get<K>(&self, _key: K, _refresh: impl Fn() -> Result<T, ServeError>) -> Answer<T> {
-        todo!("the fail-static mechanism lands in P-S18; proven vs Identity in P-S25")
-    }
-}
+// The fail-static mechanism (`FailStatic<T>`, `Answer<T>`, the §8.2 constructor constraint, the
+// contract-1.8 signals) lives in [`fail_static`] (P-S18). It was a `todo!()`-bodied stub here in
+// the P-S01 skeleton; P-S18 implements the real bounded-staleness mechanism in its own module so
+// the mandatory-core mutation floor has a clean target, and re-exports it (see the `pub use
+// fail_static::{...}` above). The types are PROVEN against a real Identity hiccup in P-S25 (SUB-D4).
 
 #[cfg(test)]
 mod tests {
@@ -332,21 +286,22 @@ mod tests {
         let _f: fn(AppSpec) -> Result<(), ServeError> = serve;
     }
 
-    /// Compile-asserting test: the `FailStatic<T>` field shape + the `Answer<T>` ladder
-    /// are frozen (contract 1.10) — `fresh_ttl`/`static_max` in SECONDS, `get` returning
-    /// `Fresh | Static | Closed`. We construct it and read the units; the `get` body is
-    /// the P-S18 floor (not invoked).
+    /// Compile-asserting test: the `FailStatic<T>` re-export shape + the `Answer<T>` ladder are
+    /// frozen (contract 1.10) — `fresh_ttl()`/`static_max()` in SECONDS, the constrained constructor
+    /// enforces the §8.2 bound. The full boundary mechanism is drilled in [`fail_static::tests`];
+    /// this asserts the re-export surface is reachable from the crate root.
     #[test]
     fn fail_static_shape_and_units_are_frozen() {
-        // seconds (the frozen unit); the value is a placeholder — the real bound is
-        // DPO-ratified (L-1), not a default set here.
-        let fs: FailStatic<u8> = FailStatic::new(30, 300);
-        assert_eq!(fs.fresh_ttl, 30u64);
-        assert_eq!(fs.static_max, 300u64);
-        assert!(fs.static_max >= fs.fresh_ttl);
+        // seconds (the frozen unit); the value is the engineering seed — the real bound is
+        // DPO-ratified (L-1), not a default set here. The constructor enforces the §8.2 bound.
+        let bound = StalenessBound { revocation_sla_secs: 300, agent_token_ttl_secs: 60 };
+        let fs: FailStatic<u8> = FailStatic::try_new(30, 300, bound).expect("valid bound");
+        assert_eq!(fs.fresh_ttl(), 30u64);
+        assert_eq!(fs.static_max(), 300u64);
+        assert!(fs.static_max() >= fs.fresh_ttl());
         // the answer ladder exists with all three rungs (never fail-open).
         let a: Answer<u8> = Answer::Static(1);
-        assert!(matches!(a, Answer::Static(_)));
+        assert!(a.is_static());
         let _closed: Answer<u8> = Answer::Closed;
     }
 }
