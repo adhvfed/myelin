@@ -4,85 +4,324 @@
 //! `planning/05-refined-shared-systems-architecture/gdpr-and-audit.md` §2.1 (the schema-level
 //! `#[personal_data(category, role, basis, retention, erasure, subject_locator)]` classification
 //! — the five tags answer the five questions every rights pipeline asks; `subject_locator` makes
-//! `locate(subject)` structural). Contract-index row **10.2** ("`#[personal_data(...)]` classify
-//! derive — the `no-untagged-personal-data` lint").
+//! `locate(subject)` structural) + §2.2 (the GENERATED data map the derive emits into). Contract-
+//! index row **10.2** ("`#[personal_data(...)]` classify-derive — the `no-untagged-personal-data`
+//! lint").
 //!
-//! ## What this crate freezes NOW (P-GA-02 / P-050) — the DERIVE + helper ATTRIBUTE NAMES only
-//! This crate exports the **`#[derive(PersonalData)]`** classify-derive + its
-//! **`#[personal_data(...)]` field helper attribute** so that, the moment this prompt lands, every
-//! schema owner across the workspace can write
+//! ## P-GA-07 / P-107 — the macro BODY (was a no-op floor under P-GA-02 / P-050)
+//! The `#[derive(PersonalData)]` derive now has a real body. For a struct whose fields carry the
+//! `#[personal_data(...)]` helper it generates:
 //!
-//! ```ignore
-//! #[derive(PersonalData)]
-//! struct PrincipalRow {
-//!     id: PrincipalId,
-//!     #[personal_data(
-//!         category   = ContactInfo,
-//!         role       = TenantContent,
-//!         basis      = Contract,
-//!         retention  = TenantPolicy,
-//!         erasure    = CryptoShred(subject_dek),
-//!         subject_locator = "principal_id",
-//!     )]
-//!     email: EncryptedField<Email>,
-//! }
-//! ```
+//! 1. **An impl of `::myelin_gdpr::HasPersonalData`** exposing
+//!    `personal_data_fields() -> &'static [::myelin_gdpr::PersonalDataField]` — one **generated
+//!    registry entry** per tagged field (owning struct, field path, the five tag values + the
+//!    `subject_locator`, all captured as rendered token text). This is the **compile-time-collected
+//!    inventory the data-map generator (P-GA-09) walks** — the map, not a hand-written list, drives
+//!    erasure/RoPA/breach-scoping.
+//! 2. The **structural `subject_locator`** accessor (the default trait method over the slice) — a
+//!    holder's `locate(subject)` reads the subject-key column off a row through it (gdpr §2.1:
+//!    `subject_locator` makes `locate` structural).
+//! 3. **A compile-time rejection of an untagged PII field** — a field whose NAME is a PII
+//!    fingerprint (`email`, `display_name`, `phone`, …) that carries NO `#[personal_data(...)]` tag
+//!    is a hard `compile_error!`. This is the **type-system form of the `no-untagged-personal-data`
+//!    lint** — the floor the lint named landing in P-107 (`myelin-lints` §`scan_no_untagged_
+//!    personal_data`): the M0 source-scanner forces the tag for any struct ANYWHERE; this makes a
+//!    struct that DERIVES `PersonalData` additionally unable to COMPILE with an untagged PII field.
+//!    The two are belt-and-braces (a schema author can forget the derive — the scanner still
+//!    fires; a schema author who derives it cannot leave a PII field untagged — the macro fires).
 //!
-//! and **compile** — a `#[personal_data(...)]` field attribute is only legal as the INERT HELPER
-//! of a struct-level derive (Rust attribute macros cannot decorate individual fields; only derive
-//! helper attributes can). Without this proc-macro the helper is a hard compile error (`cannot
-//! find attribute`). Freezing the derive + helper names now (alongside the five-tag enum NAMES in
-//! `myelin-gdpr`, P-GA-02) is what lets the M1 stores compile against the classification surface
-//! before the macro BODY exists. The five-tag enum TYPES the helper arguments reference live in
-//! `myelin-gdpr` (this crate must export only macros).
+//! ## The captured-text reconciliation (EI-01 §1, code-wins-over-docs)
+//! The helper tags use **bare-identifier enum variants** (`category = ContactInfo`,
+//! `erasure = CryptoShred(subject_dek)`, `retention = Fixed(90d)`) — payloads like `subject_dek` /
+//! `ops_lia` / `90d` are bare tokens, not resolvable Rust consts. The macro runs BEFORE
+//! type-checking, so it cannot evaluate them. It therefore captures each tag's **rendered token
+//! text** into the registry entry (a `&'static str`); the typed five-tag enums
+//! (`myelin_gdpr::DataCategory` et al.) stay the surface a holder/orchestrator pattern-matches on,
+//! and P-GA-09 re-parses the strings into them. The derive stays hermetic (no path resolution, no
+//! const-eval) while emitting a COMPLETE entry. gdpr §2.1 shows only the field attribute; the
+//! struct-level `#[derive(PersonalData)]` it is an inert helper under is the form that COMPILES (a
+//! standalone field attribute macro does not exist in Rust) — this crate carries that reconciled
+//! shape, and the contract-index "classify derive" name (10.2) is honoured literally.
 //!
-//! **Reconciliation (EI-01 §1, code-wins-over-docs).** gdpr §2.1 shows only the FIELD attribute
-//! `#[personal_data(...)]`; it elides the struct-level `#[derive(PersonalData)]` the helper is
-//! inert under. The field-grain requirement makes the derive-with-helper form the one that
-//! COMPILES — a standalone field attribute macro does not exist in Rust. This crate carries that
-//! reconciled shape; the contract-index's "classify derive" name (10.2) is honoured literally
-//! (`PersonalData` IS a derive).
-//!
-//! ## Floor named (the body) → P-GA-04 (global P-055) / P-GA-07 (global P-107) — VISION §3
-//! **On THIS floor the attribute is a deliberate NO-OP**: it parses nothing and emits the
-//! annotated item back unchanged (it does not even validate the tag keys — that is the lint's
-//! job, P-GA-03, and the macro's job once it has a body). It therefore:
-//! - does NOT yet emit the **generated registry entry** (field path, owning store, the five tag
-//!   values, the `subject_locator` expression) into the compile-time inventory the data-map
-//!   generator (P-GA-09) walks — that emission is the **macro BODY**, the M1 deliverable
-//!   **P-GA-04** (the auto-registration hook) / **P-GA-07** (the classify-derive macro body +
-//!   the five-tag enum parsing). Its CDC pair lands there (contract-coverage 10.2 → `landing =
-//!   "P-107"`).
-//! - does NOT yet validate the five tag keys or the variant payloads — `category` / `role` /
-//!   `basis` / `retention` / `erasure` / `subject_locator` parsing is the P-GA-07 body.
-//!
-//! Because it is a pure pass-through, an arbitrary (even malformed) `#[personal_data(...)]`
-//! argument list compiles today; the M1 body tightens that into a validated, registry-emitting
-//! derive WITHOUT changing the attribute NAME frozen here (the consumers never re-write their
-//! tags). The `no-untagged-personal-data` lint (P-GA-03) is the independent ratchet that forces a
-//! field to CARRY the tag at all; this crate makes carrying it COMPILE.
+//! ## Floors named (what is STILL deferred) — VISION §3
+//! - The **typed re-parse** of the captured tag text into `DataCategory`/`LawfulBasis`/… and the
+//!   `Inventory`/`data_map()` walk over every holder is the **data-map generator (P-GA-09)** — this
+//!   prompt ships the per-struct registry EMISSION + the CDC's consumer stub; the generator that
+//!   UNIONS them is P-GA-09.
+//! - The **`SpecialCategory` → DPIA router** is **P-GA-08** (it consumes
+//!   `PersonalDataField::is_special_category`, emitted here).
+//! - The **worklog `Behavioural`/restricted-by-default extension** (OQ-H, `data_role_default`) lands
+//!   with Issues in **P-GA-31**; the macro accepts an unknown extra key (forward-compatible) so a
+//!   future tag does not need a macro change to compile.
 
 use proc_macro::TokenStream;
+use proc_macro2::TokenStream as TokenStream2;
+use quote::quote;
+use syn::{Data, DeriveInput, Fields, parse_macro_input};
 
-/// The **`#[derive(PersonalData)]`** classify-derive (contract 10.2; gdpr §2.1). Apply it to a
-/// struct whose fields carry personal data; tag each PII field with the `#[personal_data(...)]`
+/// The **`#[derive(PersonalData)]`** classify-derive (contract 10.2; gdpr §2.1 / §2.2). Apply it to
+/// a struct whose fields carry personal data; tag each PII field with the `#[personal_data(...)]`
 /// helper attribute it declares.
 ///
-/// **This is the FROZEN DERIVE NAME at a NO-OP floor (P-GA-02 / P-050).** It emits NOTHING (an
-/// empty `TokenStream`) — it neither reads the `#[personal_data(...)]` helper arguments nor emits
-/// the compile-time registry entry yet. Declaring `attributes(personal_data)` is what makes the
-/// field helper a legal INERT attribute (so a tagged field compiles). The body that walks the
-/// five tags and emits the registry entry the data map (P-GA-09) walks is the M1 deliverable
-/// **P-GA-04 / P-GA-07** (see the crate doc comment). Freezing the names now lets every M1 store
-/// apply the tags and compile against the classification surface before that body exists.
-///
-/// The contract-index (10.2) names this a "classify derive"; `PersonalData` IS a derive, and the
-/// `#[personal_data(...)]` field helper is the field-grain annotation §2.1 shows — the only Rust
-/// form in which a per-field tag compiles (a standalone field attribute macro does not exist).
+/// **P-GA-07 / P-107 — the BODY.** It emits an impl of `::myelin_gdpr::HasPersonalData` carrying a
+/// `&'static [PersonalDataField]` registry entry per tagged field (the compile-time inventory
+/// P-GA-09 walks) + the structural `subject_locator` accessor, and it **rejects an untagged PII
+/// field at compile time** (the type-system form of the `no-untagged-personal-data` lint). See the
+/// crate doc for the captured-text reconciliation + the named floors.
 #[proc_macro_derive(PersonalData, attributes(personal_data))]
-pub fn derive_personal_data(_item: TokenStream) -> TokenStream {
-    // NO-OP floor: a derive emits ADDITIONAL items; here it emits none, leaving the annotated
-    // struct (and its inert `#[personal_data(...)]` helpers) exactly as written. The
-    // registry-emitting body is P-GA-04 / P-GA-07.
-    TokenStream::new()
+pub fn derive_personal_data(item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as DeriveInput);
+    match expand(input) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// Field-name fingerprints that carry PII — the SAME set the `no-untagged-personal-data` source
+/// scanner (`myelin-lints`) uses, kept in sync by convention (both enforce contract 1.6 / gdpr
+/// §2.1). A field with one of these names that carries NO `#[personal_data(...)]` helper is the
+/// un-erasable-subject bug class; the derive refuses to expand it.
+const PII_FIELDS: &[&str] = &[
+    "email",
+    "name",
+    "phone",
+    "address",
+    "ip_addr",
+    "ip_address",
+    "full_name",
+    "given_name",
+    "family_name",
+    "display_name",
+    "dob",
+    "birth",
+    "ssn",
+    "passport",
+    "body",
+    "message_body",
+    "comment_text",
+];
+
+fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
+    let struct_name = &input.ident;
+    let struct_name_str = struct_name.to_string();
+    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
+
+    let fields = match &input.data {
+        Data::Struct(s) => match &s.fields {
+            Fields::Named(named) => &named.named,
+            // A tuple/unit struct carries no named PII column to classify — it gets an empty
+            // registry (the derive is uniform: every PersonalData type implements the trait).
+            _ => {
+                return Ok(empty_impl(
+                    struct_name,
+                    &impl_generics,
+                    &ty_generics,
+                    where_clause,
+                ));
+            }
+        },
+        // An enum/union is not a schema row; the derive only classifies struct fields.
+        _ => {
+            return Err(syn::Error::new_spanned(
+                struct_name,
+                "#[derive(PersonalData)] applies to a struct with named fields (a schema row); an \
+                 enum/union has no field to classify",
+            ));
+        }
+    };
+
+    let mut entries: Vec<TokenStream2> = Vec::new();
+    for field in fields {
+        let field_ident = field
+            .ident
+            .as_ref()
+            .expect("named field has an ident (Fields::Named)");
+        let field_name = field_ident.to_string();
+
+        let tag_attr = field
+            .attrs
+            .iter()
+            .find(|a| a.path().is_ident("personal_data"));
+
+        match tag_attr {
+            Some(attr) => {
+                let tags = parse_personal_data_tags(attr)?;
+                entries.push(registry_entry(&struct_name_str, &field_name, &tags));
+            }
+            None => {
+                // The type-system form of the no-untagged-personal-data lint: a PII-named field
+                // with no tag is a hard compile error (P-107, the floor the lint named).
+                if is_pii_field(&field_name) {
+                    return Err(syn::Error::new_spanned(
+                        field_ident,
+                        format!(
+                            "PII field `{field_name}` is not `#[personal_data(...)]`-tagged — a \
+                             personal-data field deriving PersonalData MUST carry the five-tag \
+                             classification (category/role/basis/retention/erasure/subject_locator; \
+                             gdpr §2.1). An untagged PII column is the un-erasable / un-mapped \
+                             subject bug class (ADR-12); tag it or it escapes the crypto-shred + \
+                             RoPA fan-out."
+                        ),
+                    ));
+                }
+                // A non-PII field with no tag is fine — it carries no personal data.
+            }
+        }
+    }
+
+    let n = entries.len();
+    Ok(quote! {
+        impl #impl_generics ::myelin_gdpr::HasPersonalData for #struct_name #ty_generics #where_clause {
+            fn personal_data_fields() -> &'static [::myelin_gdpr::PersonalDataField] {
+                // The generated registry — one entry per tagged field, all `&'static`. This is the
+                // compile-time inventory the data-map generator (P-GA-09) walks.
+                const FIELDS: [::myelin_gdpr::PersonalDataField; #n] = [ #( #entries ),* ];
+                &FIELDS
+            }
+        }
+    })
+}
+
+/// The empty-registry impl for a struct with no named PII fields (tuple/unit struct, or a named
+/// struct that happens to carry no tag) — the derive stays uniform.
+fn empty_impl(
+    struct_name: &syn::Ident,
+    impl_generics: &syn::ImplGenerics<'_>,
+    ty_generics: &syn::TypeGenerics<'_>,
+    where_clause: Option<&syn::WhereClause>,
+) -> TokenStream2 {
+    quote! {
+        impl #impl_generics ::myelin_gdpr::HasPersonalData for #struct_name #ty_generics #where_clause {
+            fn personal_data_fields() -> &'static [::myelin_gdpr::PersonalDataField] {
+                &[]
+            }
+        }
+    }
+}
+
+/// Whether a field name is a PII fingerprint (matched as the whole identifier).
+fn is_pii_field(name: &str) -> bool {
+    PII_FIELDS.contains(&name)
+}
+
+/// The five captured tag texts + the subject locator, all as `String` (rendered token text).
+struct ParsedTags {
+    category: String,
+    role: String,
+    basis: String,
+    retention: String,
+    erasure: String,
+    subject_locator: String,
+}
+
+/// Parse a `#[personal_data(category = .., role = .., basis = .., retention = .., erasure = ..,
+/// subject_locator = "..")]` helper into its six captured texts. Each value is captured as RENDERED
+/// TOKEN TEXT (see the crate doc): a bare ident/variant (`ContactInfo`), a call form
+/// (`CryptoShred(subject_dek)` / `Fixed(90d)`), or a string literal (`subject_locator = "id"`).
+///
+/// Tolerant by design — it does NOT type-check the variant names (that is the job of P-GA-09's
+/// typed re-parse and the five-tag enums); it only requires the five classification keys and the
+/// locator be PRESENT, so an incomplete tag is a loud compile error (a half-classified field is the
+/// bug class the registry must never carry). An unknown EXTRA key is accepted (forward-compat: the
+/// worklog `data_role_default` extension, P-GA-31, must compile without a macro change).
+fn parse_personal_data_tags(attr: &syn::Attribute) -> syn::Result<ParsedTags> {
+    let mut category: Option<String> = None;
+    let mut role: Option<String> = None;
+    let mut basis: Option<String> = None;
+    let mut retention: Option<String> = None;
+    let mut erasure: Option<String> = None;
+    let mut subject_locator: Option<String> = None;
+
+    // `parse_nested_meta` walks the `key = value` (or `key(value)`) list inside the parentheses.
+    attr.parse_nested_meta(|meta| {
+        let key = meta
+            .path
+            .get_ident()
+            .map(|i| i.to_string())
+            .ok_or_else(|| meta.error("each #[personal_data(...)] tag is a `key = value`"))?;
+
+        // Capture the value as rendered token text — but ONLY this value's tokens, not the rest of
+        // the helper list. `meta.value()` returns the stream positioned after `=`; a bare
+        // `value.parse::<TokenStream2>()` would greedily consume the FOLLOWING `, role = ...` too.
+        // We therefore consume value tokens up to the next top-level comma (or end), one
+        // token-tree at a time. The value is a string literal (the locator → its inner value), a
+        // bare variant (`ContactInfo`), or a call form (`CryptoShred(subject_dek)` / `Fixed(90d)` —
+        // NOT valid `syn::Expr` syntax, so we never parse it as one; we capture its TEXT).
+        let value = meta.value()?;
+        let text = if value.peek(syn::LitStr) {
+            let s: syn::LitStr = value.parse()?;
+            s.value()
+        } else {
+            let mut collected = TokenStream2::new();
+            while !value.is_empty() && !value.peek(syn::Token![,]) {
+                let tt: proc_macro2::TokenTree = value.parse()?;
+                collected.extend(std::iter::once(tt));
+            }
+            collected
+                .to_string()
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect::<String>()
+        };
+
+        match key.as_str() {
+            "category" => category = Some(text),
+            "role" => role = Some(text),
+            "basis" => basis = Some(text),
+            "retention" => retention = Some(text),
+            "erasure" => erasure = Some(text),
+            "subject_locator" => subject_locator = Some(text),
+            // Forward-compatible extra key (e.g. `data_role_default`, the OQ-H worklog extension,
+            // P-GA-31). Accepted + ignored by the macro body shipped here so a future tag compiles
+            // without a macro change; P-GA-31 / P-GA-09 give it meaning.
+            _ => {}
+        }
+        Ok(())
+    })?;
+
+    let require = |opt: Option<String>, key: &str| -> syn::Result<String> {
+        opt.ok_or_else(|| {
+            syn::Error::new_spanned(
+                attr,
+                format!(
+                    "#[personal_data(...)] is missing the `{key}` tag — the five-tag classification \
+                     (category/role/basis/retention/erasure) + subject_locator are ALL required \
+                     (gdpr §2.1); a half-classified field is the un-mapped-subject bug class"
+                ),
+            )
+        })
+    };
+
+    Ok(ParsedTags {
+        category: require(category, "category")?,
+        role: require(role, "role")?,
+        basis: require(basis, "basis")?,
+        retention: require(retention, "retention")?,
+        erasure: require(erasure, "erasure")?,
+        subject_locator: require(subject_locator, "subject_locator")?,
+    })
+}
+
+/// Emit one `::myelin_gdpr::PersonalDataField` const-expression for a tagged field.
+fn registry_entry(struct_name: &str, field_name: &str, tags: &ParsedTags) -> TokenStream2 {
+    let category = &tags.category;
+    let role = &tags.role;
+    let basis = &tags.basis;
+    let retention = &tags.retention;
+    let erasure = &tags.erasure;
+    let subject_locator = &tags.subject_locator;
+    quote! {
+        ::myelin_gdpr::PersonalDataField {
+            owning_struct: #struct_name,
+            field: #field_name,
+            tags: ::myelin_gdpr::PersonalDataTags {
+                category: #category,
+                role: #role,
+                basis: #basis,
+                retention: #retention,
+                erasure: #erasure,
+                subject_locator: #subject_locator,
+            },
+        }
+    }
 }

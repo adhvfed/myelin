@@ -447,10 +447,14 @@ pub fn no_host_exec() -> Lint {
 /// verdicts over the canonical form (`tests/gdpr_audit_lints.rs`). The lint is SHARPENED, never
 /// weakened (EI-01 §5).
 ///
-/// **Floor (named).** The type-system form — a `#[personal_data]` classify-derive macro that
-/// refuses to expand a schema with an untagged PII field — lands in **P-GA-07 / P-107**. This
-/// scanner is the M0 ratchet click. (The derive at the P-GA-02 / P-050 floor is a NO-OP, so the
-/// scanner — not the macro — is what FORCES the tag until P-107.)
+/// **Floor (FILLED by P-GA-07 / P-107).** The type-system form — a `#[derive(PersonalData)]`
+/// classify-derive that REFUSES TO EXPAND a schema with an untagged PII field (a hard
+/// `compile_error!`) — landed in P-107 (`myelin-gdpr-macros::derive_personal_data`, the
+/// `compile_fail` doc-test on `myelin_gdpr`). The two are now BELT-AND-BRACES: this SOURCE scanner
+/// forces the tag for ANY struct anywhere (a schema author can forget the derive); the macro
+/// additionally forbids an untagged PII field on a struct that DOES derive `PersonalData`. (Through
+/// the P-GA-02 / P-050 floor the derive was a NO-OP, so this scanner alone FORCED the tag; from
+/// P-107 the macro forces it too on a deriving struct.)
 pub const NO_UNTAGGED_PERSONAL_DATA: LintId = LintId("no-untagged-personal-data");
 
 fn scan_no_untagged_personal_data(src: &str) -> Vec<Violation> {

@@ -112,6 +112,14 @@ toml = "0.8"
 # self-describing content-address string + the fs key path.
 blake3 = "1"
 hex = "0.4"
+# The proc-macro toolchain for the `#[derive(PersonalData)]` classify-derive BODY (contract 10.2,
+# P-GA-07 / P-107): parse the tagged struct + its `#[personal_data(...)]` helper args (syn), emit
+# the generated registry entry + the structural `subject_locator` accessor (quote). `full` is not
+# needed — we parse a `DeriveInput` (a struct) and field attributes, not whole expressions; the
+# default `derive` + `parsing` + `proc-macro` features cover it. proc-macro2 carries the Span type.
+syn = { version = "2", default-features = false, features = ["derive", "parsing", "proc-macro", "printing", "extra-traits"] }
+quote = "1"
+proc-macro2 = "1"
 
 # ----------------------------------------------------------------------------------------------
 # REAL-BACKEND CLIENTS (Stage 1 / infra). Declared here once for a single pinned shape, but
