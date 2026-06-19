@@ -555,8 +555,11 @@ cdc = ["crates/myelin-storage/tests/cdc_11_1.rs"]
 [[contract]]
 row = "11.2"
 title = "BlobStore{put, get, head, delete}"
-status = "deferred"
-landing = "P-047"
+status = "covered"
+# P-047 (P-ST-03): the content-addressed BlobStore trait + fs-backed floor. The base trait +
+# fs floor ship here; the per-blob content-key WRAP is the named floor → P-ST-08 (P-095), the
+# object-store backing → P-ST-30 (P-636), the C3/C4/object-backed-pack additions → later prompts.
+cdc = ["crates/myelin-storage/tests/cdc_11_2_blobstore.rs"]
 
 [[contract]]
 row = "11.3"

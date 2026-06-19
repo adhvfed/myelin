@@ -90,6 +90,51 @@ impl PersonalDataHolder for OltpStoreHolder {
     }
 }
 
+/// The BlobStore (P-ST-03 / 11.2) AS a [`PersonalDataHolder`]. A T2 blob may carry personal
+/// data (repo contents, attachments, media); the store references content-addressed blobs and
+/// its erasure is **crypto-shred** (destroy the wrapping key), NOT `delete` (storage.md §3.2).
+/// On THIS floor the holder is **registered** to its frozen shape (the auto-registration hook
+/// fires, so "we forgot the blob store" is structurally impossible); the crypto-shred DSR
+/// bodies are the GDPR-M1 deliverable (the six-step crypto-shred algorithm is **P-ST-09**, and
+/// the real per-blob key wrap it shreds lands in **P-ST-08**).
+#[derive(Clone, Debug)]
+pub struct BlobStoreHolder {
+    /// The blob store this holder represents (the per-tenant blob keyspace name).
+    pub store: &'static str,
+}
+
+impl BlobStoreHolder {
+    /// The blob-store holder for a named store (e.g. `"git_pack_blobs"`, `"attachments"`).
+    pub fn new(store: &'static str) -> BlobStoreHolder {
+        BlobStoreHolder { store }
+    }
+
+    /// Fire the auto-registration hook for this blob store (contract 1.4), returning the
+    /// receipt the harness collects — the proof the blob store registered as a holder.
+    pub fn register(&self) -> OltpHolderRegistration {
+        register_holder(self.store)
+    }
+}
+
+impl PersonalDataHolder for BlobStoreHolder {
+    fn locate(&self, _subject: &Subject) -> DsrResult<LocatedData> {
+        Err(dsr_floor("blob locate"))
+    }
+    fn export(&self, _subject: &Subject) -> DsrResult<ExportBundle> {
+        Err(dsr_floor("blob export"))
+    }
+    fn rectify(&self, _subject: &Subject, _patch: LocatedData) -> DsrResult<()> {
+        Err(dsr_floor("blob rectify"))
+    }
+    fn restrict(&self, _subject: &Subject) -> DsrResult<()> {
+        Err(dsr_floor("blob restrict"))
+    }
+    // erase = crypto-shred (destroy the wrapping key), not delete (§3.2) — body is P-ST-09.
+    fn erase(&self, _subject: &Subject) -> DsrResult<()> {
+        Err(dsr_floor("blob erase (crypto-shred)"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,6 +161,23 @@ mod tests {
     fn store_holder_registers_itself() {
         let holder = OltpStoreHolder::new("worklog_oltp");
         assert_eq!(holder.register(), OltpHolderRegistration { store: "worklog_oltp" });
+    }
+
+    /// The BlobStore (P-ST-03) auto-registers as a holder — the blob-store half of "every
+    /// store is a holder" (§1.1). Its erasure is crypto-shred (body → P-ST-09).
+    #[test]
+    fn blob_store_registers_as_a_holder() {
+        let holder = BlobStoreHolder::new("git_pack_blobs");
+        assert_eq!(
+            holder.register(),
+            OltpHolderRegistration { store: "git_pack_blobs" }
+        );
+        let s = subject();
+        // The frozen shape compiles + the erase body is the named crypto-shred floor.
+        match holder.erase(&s) {
+            Err(DsrError(msg)) => assert!(msg.contains("crypto-shred")),
+            Ok(_) => panic!("blob erase must be the GDPR-M1 crypto-shred floor"),
+        }
     }
 
     /// The holder implements the frozen `PersonalDataHolder` shape; the DSR bodies are the

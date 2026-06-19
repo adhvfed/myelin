@@ -26,6 +26,11 @@ myelin-identity = { path = "../myelin-identity" }
 myelin-events = { path = "../myelin-events" }
 myelin-gdpr = { path = "../myelin-gdpr" }
 serde.workspace = true
+# BlobStore (P-ST-03 / 11.2): BLAKE3 hash-on-write + re-hash-on-read integrity (a cited proven
+# structure — VISION §4 / storage.md §11), `hex` renders the multihash digest into the
+# self-describing content-address + the per-tenant fs key path.
+blake3.workspace = true
+hex.workspace = true
 
 # The failure-injection harness is TEST-SUPPORT only (the same posture as a service's
 # main.rs / the harness's own dev usage). The IDOR + pool-saturation DRILLS read the
