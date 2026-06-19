@@ -199,9 +199,57 @@ impl Registry {
         Ok(())
     }
 
+    /// **Flip a cell's lifecycle status (the provisioning gate's `Provisioning → Active` transition,
+    /// P-CP-11).** `status` is a MUTABLE field (unlike `region`, which has no update path — §5.3 layer
+    /// 1); a cell legitimately transitions `Provisioning → Active` (it passed restore-verify +
+    /// readiness) and `Active → Draining` (decommission). This setter is the ONLY way the status
+    /// changes — the provisioning gate ([`crate::provision::ProvisioningGate`]) calls it ONLY after
+    /// both gating steps pass. Returns `true` iff the cell exists and was updated. The `region` is
+    /// untouched (it is immutable; this setter cannot reach it).
+    pub fn set_cell_status(&mut self, cell_id: &CellId, status: crate::schema::CellStatus) -> bool {
+        match self.cells.get_mut(cell_id.as_str()) {
+            Some(cell) => {
+                cell.status = status;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Flip a cell to `Active` (the provisioning gate's activation step — the cell passed
+    /// restore-verify + readiness). A convenience over [`Self::set_cell_status`] for the load-bearing
+    /// `Provisioning → Active` transition CP-D6 gates. Returns `true` iff the cell exists.
+    pub fn activate_cell(&mut self, cell_id: &CellId) -> bool {
+        self.set_cell_status(cell_id, crate::schema::CellStatus::Active)
+    }
+
     /// Look up a `tenant_placement` row by opaque `tenant_id`.
     pub fn placement(&self, tenant_id: &TenantId) -> Option<&TenantPlacement> {
         self.placements.get(tenant_id.as_str())
+    }
+
+    /// An iterator over the `tenant_placement` rows (the provisioning gate scans this to assert the
+    /// CP-D6 zero — 0 tenants on an unverified cell).
+    pub fn placements_iter(&self) -> impl Iterator<Item = &TenantPlacement> {
+        self.placements.values()
+    }
+
+    /// **Set a placement's lifecycle status (e.g. `Active → Offboarding` on tenant decommission,
+    /// P-CP-11).** The `status` is a mutable field of the PII-free routing record; `region` /
+    /// `tenant_id` are NOT reachable through this (region immutability, §5.3 layer 1). Returns `true`
+    /// iff the placement exists and was updated.
+    pub fn set_placement_status(
+        &mut self,
+        tenant_id: &TenantId,
+        status: crate::schema::PlacementStatus,
+    ) -> bool {
+        match self.placements.get_mut(tenant_id.as_str()) {
+            Some(p) => {
+                p.status = status;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Look up a `tenant_placement` row by its **non-personal routing slug** (the `discover(slug)`
