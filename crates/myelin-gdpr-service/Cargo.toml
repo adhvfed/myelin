@@ -1,0 +1,43 @@
+[package]
+name = "myelin-gdpr-service"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+# THE GDPR/Audit SERVICE crate (P-GA-19 → P-062): the tamper-evident audit log core — the
+# outbox-only audit CONSUMER + the per-tenant hash-chain + the Merkle leaves + the minimisation.
+#
+# DAG POSITION (a documented, NAMED extension of the §2.9 eleven-crate DAG, exactly like
+# `myelin-identity-service` and the leaf test-support crates). This is a SERVICE crate — it
+# is the GDPR/Audit subsystem's bootable home, the "every service `main.rs`" consumer the
+# contract-index row 1.1 names for GDPR/Audit. It sits ABOVE `myelin-events` as a leaf
+# consumer: it consumes the M0 outbox/EventEnvelope + the GDPR contract surface + the Identity
+# pseudonym grammar, and NOTHING in the production library DAG depends back on it. It is
+# therefore OUTSIDE the eleven-crate library DAG modelled by `crate_graph.rs`
+# (substrate_is_root() is preserved — a service is the graph's terminal consumer, not a node in
+# it). See the crate-level note in src/lib.rs.
+[dependencies]
+# The M0 bus substrate the audit consumer rides: the canonical EventEnvelope (2.1) the action
+# events arrive as, and the frozen EventHandler/HandleOutcome/SubjectPattern consumer template
+# (2.4) the audit consumer IS an instance of (written via the outbox only — the one sanctioned
+# emit path; the consumer is an infra subscription on it, contract 10.6 / 2.2 / EI-01 §5).
+myelin-events = { path = "../myelin-events" }
+# The (tenant, region) partition key the per-tenant hash-chain is keyed on (the audit Merkle
+# tree is in-cell, tenant-partitioned — gdpr §7.1). ArtifactRef is the references-not-payloads
+# subject form (a `subject` is an ArtifactRef, never a payload).
+myelin-tenancy = { path = "../myelin-tenancy" }
+# The Principal/PrincipalId/PrincipalKind the action's actor is minimised FROM: the audit
+# `actor` is the pseudonymous `<pseudonym>@<tenant>.noreply` form (contract 4.8) derived from
+# the verified principal's opaque, PII-free `principal_id`, never a name/email payload.
+myelin-identity = { path = "../myelin-identity" }
+# BLAKE3 hash-on-append: the hash-chain link `H(prev || leaf)` and the Merkle leaf
+# `H(canonical(entry))` are BLAKE3 digests rendered `blake3:<hex>` (the same multihash
+# convention the BlobStore content-address uses — one hash family, no hand-rolled crypto).
+blake3 = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

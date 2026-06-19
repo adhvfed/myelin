@@ -283,6 +283,19 @@ name = "myelin-gdpr-macros"
 version = "0.0.0"
 
 [[package]]
+name = "myelin-gdpr-service"
+version = "0.0.0"
+dependencies = [
+ "blake3",
+ "hex",
+ "myelin-events",
+ "myelin-identity",
+ "myelin-tenancy",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "myelin-harness"
 version = "0.0.0"
 dependencies = [
