@@ -74,6 +74,7 @@ pub mod machine_auth;
 pub mod mint;
 pub mod namespace;
 pub mod principal_store;
+pub mod pseudonym_store;
 pub mod read_replica;
 pub mod revocation;
 pub mod reverse_index;
@@ -119,6 +120,9 @@ pub use mint::{
 };
 pub use principal_store::{
     PrincipalError, PrincipalProfile, PrincipalRow, PrincipalStore, ProfileRef, S1_HOLDER, S1_TABLE,
+};
+pub use pseudonym_store::{
+    PseudonymError, PseudonymRow, PseudonymStore, S2_HOLDER, S2_TABLE,
 };
 pub use revocation::{
     RevocationEntry, RevocationStore, RevocationTelemetry, RevokedKind, RunTokenState,
@@ -195,6 +199,24 @@ fn identity_migrations() -> Migrations {
                  revoked_at TEXT NOT NULL, \
                  expires_at TEXT, \
                  PRIMARY KEY (tenant, region, kind, handle))",
+        ),
+        // The S2 pseudonym map (P-ID-19): (tenant, region)-partitioned, TIGHTEST RLS. Maps a
+        // subject's opaque `principal_id` to its per-tenant public `pseudonym` (the frozen
+        // `<pseudonym>@<tenant>.noreply` grammar). The PUBLIC pseudonym is a clear column (PII-free +
+        // erasure-surviving, EI-04 §1); the PII-sensitive real-identity LINK is NOT a clear column —
+        // it is sealed under the per-subject DEK (the store layer), referenced by `real_id_key_ref`.
+        // Destroying that one key is the subject's Art. 17 erasure (the crypto-shred lever, the
+        // P-ID-20 erase body). Forward-only.
+        Migration::plain(
+            "0103_s2_pseudonym_map",
+            "CREATE TABLE IF NOT EXISTS pseudonym_map (\
+                 tenant TEXT NOT NULL, \
+                 region TEXT NOT NULL, \
+                 principal_id TEXT NOT NULL, \
+                 pseudonym TEXT NOT NULL, \
+                 real_id_key_ref TEXT NOT NULL, \
+                 PRIMARY KEY (tenant, region, principal_id), \
+                 UNIQUE (tenant, region, pseudonym))",
         ),
     ])
 }
