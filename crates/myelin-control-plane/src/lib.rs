@@ -1,9 +1,10 @@
 //! # `myelin-control-plane` — the PII-free control-plane registry + routing (CP-M1)
 //!
 //! Built across the CP-M1 prompts: **P-CP-05 / P-080** (the registry tables + the HARD placement
-//! invariant) and **P-CP-06 / P-081** (`discover` — PII-free tenant-grain routing, off the hot path,
-//! client-cacheable fail-static). The remaining routing/attestation answers (`place` /
-//! `placement_of` / `residency_verify`) land in P-CP-07 / P-CP-08 / P-CP-09.
+//! invariant), **P-CP-06 / P-081** (`discover` — PII-free tenant-grain routing, off the hot path,
+//! client-cacheable fail-static), and **P-CP-07 / P-082** (`place(region, requested_tier)` +
+//! two-phase signup — PII born inside the cell; see [`place`]). The remaining routing/attestation
+//! answers (`placement_of` / `residency_verify`) land in P-CP-08 / P-CP-09.
 //!
 //! **Owning architecture doc:**
 //! `planning/05-refined-shared-systems-architecture/tenancy-and-control-plane.md`
@@ -59,9 +60,11 @@
 //!   multi-cell `CrossCellPointer` resolution is the **M5 floor, P-CP-19 / P-CP-20** (bridge
 //!   resolution live + the fan-out). The schema field is a `Vec<CellId>` (so the shape is frozen)
 //!   but every v1 placement carries exactly one member cell (its home), asserted in tests.
-//! - **The remaining routing/attestation answers** (`place`, `placement_of`, `residency_verify`) are
-//!   the **next prompts P-CP-07 / P-CP-08 / P-CP-09**. `discover` is now LIVE (P-CP-06 / P-081); the
-//!   `place`/`placement_of` routing signals (`placement_count`/`provision_latency`/…) land with those.
+//! - **The remaining routing/attestation answers** (`placement_of`, `residency_verify`) are the
+//!   **next prompts P-CP-08 / P-CP-09**. `discover` is LIVE (P-CP-06 / P-081); `place` + two-phase
+//!   signup is LIVE (P-CP-07 / P-082, [`place`]) — it emits the `placement_count` + `provision_latency`
+//!   routing signals ([`place::PlacementSignals`]); the `placement_of` answer + gateway misroute-reject
+//!   land in P-CP-08.
 //! - **The GeoDNS/anycast discovery edge is `[OPEN → P4 (infra)]`** (architecture §7.3) — a latency
 //!   optimisation that fronts the PII-free discovery contract with a geo-routed edge. **v1 is
 //!   CP-lookup + client cache** ([`discover::DiscoveryCache`]); the edge is an infra follow-on, not a
@@ -80,10 +83,14 @@
 
 pub mod discover;
 pub mod holder;
+pub mod place;
 pub mod registry;
 pub mod schema;
 
 pub use discover::{DiscoverKey, DiscoveryCache, DiscoverySignals, RouteTuple};
+pub use place::{
+    CounterMinter, PlaceError, PlacementAnswer, PlacementService, PlacementSignals, TokenMinter,
+};
 pub use holder::{
     assert_no_personal_columns, control_plane_data_map, ColumnClassification, ControlPlaneHolder,
     CONTROL_PLANE_STORE,
