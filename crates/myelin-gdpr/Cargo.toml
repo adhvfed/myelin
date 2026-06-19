@@ -17,5 +17,9 @@ publish = false
 myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-identity = { path = "../myelin-identity" }
 myelin-events = { path = "../myelin-events" }
+# The proc-macro half of the classify-derive (contract 10.2, P-GA-02). `myelin-gdpr` re-exports
+# its `#[personal_data]` attribute so a store writes `use myelin_gdpr::personal_data;` and the
+# five-tag enum TYPES (defined HERE) + the attribute (defined THERE) arrive together.
+myelin-gdpr-macros = { path = "../myelin-gdpr-macros" }
 serde.workspace = true
 serde_json.workspace = true

@@ -157,11 +157,16 @@ name = "myelin-gdpr"
 version = "0.0.0"
 dependencies = [
  "myelin-events",
+ "myelin-gdpr-macros",
  "myelin-identity",
  "myelin-tenancy",
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "myelin-gdpr-macros"
+version = "0.0.0"
 
 [[package]]
 name = "myelin-harness"

@@ -37,8 +37,12 @@
 //! - The `PersonalDataHolder` **bodies** (the real locate/export/rectify/restrict/erase over
 //!   each store's columns + crypto-shred) → **M1 P-GA-05** (the GDPR-owned holders + the
 //!   trait bodies); the upstream-store orchestration → P-GA-06.
-//! - The `#[personal_data(...)]` **classify-derive attribute names + the five-tag enum names**
-//!   → **M0 P-GA-02** (the macro BODY that emits the registry entry → M1 P-GA-04/P-GA-07).
+//! - The classify-derive names are FROZEN HERE (P-GA-02 / P-050): the [`PersonalData`] derive
+//!   (re-exported from `myelin-gdpr-macros` at a NO-OP floor), its inert `#[personal_data(...)]`
+//!   field-helper attribute, and the five tag enums [`DataCategory`], [`DataRole`] (the `role`
+//!   tag), [`LawfulBasis`], [`RetentionClass`], [`ErasureMethod`] — variant NAMES to the §2.1
+//!   shape. The macro BODY that emits the registry entry + validates/parses the tag variants is
+//!   the M1 floor: P-GA-04 (auto-registration hook) and P-GA-07 (classify-derive body).
 //! - The **`no-untagged-personal-data` lint** (the ratchet that forces a tag on every PII
 //!   field) → **M0 P-GA-03**.
 //! - The harness **auto-registration wiring** (contract 1.4) lives in `serve` (P-S12/P-S15)
@@ -60,6 +64,19 @@
 use myelin_identity::Principal;
 use myelin_tenancy::TenantId as TenancyTenantId;
 use serde::{Deserialize, Serialize};
+
+/// The `#[derive(PersonalData)]` classify-derive + its `#[personal_data(category, role, basis,
+/// retention, erasure, subject_locator)]` field helper attribute (contract 10.2; gdpr §2.1),
+/// re-exported from `myelin-gdpr-macros`.
+///
+/// A schema owner writes `use myelin_gdpr::PersonalData;`, derives it on the struct, and tags
+/// every personal-data field with `#[personal_data(...)]`; the helper arguments reference the five
+/// tag enums frozen in this crate ([`DataCategory`], [`DataRole`], [`LawfulBasis`],
+/// [`RetentionClass`], [`ErasureMethod`]). **Floor (P-GA-02 / P-050):** the derive is a NO-OP (it
+/// emits nothing; the helper is inert) — it freezes the NAMES; the body that emits the
+/// compile-time registry entry the data map (P-GA-09) walks is **M1 P-GA-04 / P-GA-07**. See the
+/// `myelin-gdpr-macros` crate doc for the no-op contract + the derive-with-helper reconciliation.
+pub use myelin_gdpr_macros::PersonalData;
 
 /// The canonical tenant partition key (re-exported from `myelin-tenancy`, the owning sink
 /// crate). The GDPR contract surface (gdpr §3.1) threads `tenant: TenantId` through the holder
@@ -127,6 +144,109 @@ impl DataRole {
             myelin_events::DataRole::Controller => DataRole::PlatformOperational,
         }
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════
+// The five-tag classification enum NAMES (contract 10.2; gdpr §2.1) — FROZEN here (P-GA-02 /
+// P-050) so every store compiles against the classification surface before the macro BODY exists.
+//
+// The `#[personal_data(category, role, basis, retention, erasure, subject_locator)]` attribute
+// (re-exported above from `myelin-gdpr-macros`) references these five enums:
+//   category  → DataCategory      role → DataRole (above)   basis → LawfulBasis
+//   retention → RetentionClass    erasure → ErasureMethod    subject_locator → a string expr
+//
+// FLOOR (named): the variant NAMES are frozen now to the §2.1 shape; the macro BODY that PARSES
+// these tags out of an attribute token-stream and EMITS the generated registry entry is M1
+// P-GA-04 / P-GA-07. The payload-carrying variants (`SpecialCategory(..)`, `LegitimateInterest`,
+// `Consent`, `Fixed`, `AuditCarveOut`, `CryptoShred`) carry the §2.1-named payloads now so the
+// variant SHAPE is stable; the full validation/parsing of those payloads lands with that body.
+// ════════════════════════════════════════════════════════════════════════════════════════════
+
+/// The `category` tag (gdpr §2.1): WHAT KIND of personal data the field carries. The category a
+/// rights pipeline keys on for breach-scoping (Arts. 33–34) and special-category routing (Art. 9
+/// → the DPIA gate, P-GA-08). Frozen to the §2.1 shape:
+/// `ContactInfo | Identifier | Content | Behavioural | SpecialCategory(...)`.
+///
+/// `SpecialCategory` is the mechanical flag that routes a field into the DPIA gate (gdpr §2.4,
+/// OQ-H) — the worklog/productivity-sensitivity case. Its payload (the Art. 9 special-category
+/// kind) is named now as a string ref; the typed special-category vocabulary lands with the
+/// macro body (P-GA-07) + the DPIA router (P-GA-08).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DataCategory {
+    /// contact details — email / phone / address (gdpr §2.1).
+    ContactInfo,
+    /// a direct or pseudonymous identifier — principal id, account handle (gdpr §2.1).
+    Identifier,
+    /// user-authored content — issue bodies, doc blocks, chat messages, commit text (gdpr §2.1).
+    Content,
+    /// behavioural / observational data — worklog, velocity, activity (gdpr §2.1, §2.4 OQ-H;
+    /// restricted-by-default in cross-individual processing).
+    Behavioural,
+    /// Art. 9 special-category data — routes into the DPIA gate (gdpr §2.3, P-GA-08). The
+    /// special-category kind reference; the typed vocabulary is P-GA-07.
+    SpecialCategory(String),
+}
+
+/// The `basis` tag (gdpr §2.1): the LAWFUL BASIS for processing the field (Art. 6 / Art. 9(2)).
+/// Frozen to the §2.1 shape:
+/// `Contract | LegitimateInterest(lia_ref) | Consent(consent_id) | LegalObligation`.
+///
+/// A `[TBD_LEGAL]` basis (gdpr §2.4) is a NAMED residual recorded against the field, never a
+/// blocker — counsel ratifies it; engineering carries the tag. The `lia_ref` / `consent_id`
+/// payloads are named now as string refs; they resolve into the LIA register / consent registry
+/// (G5, P-GA-23) with the macro body.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LawfulBasis {
+    /// Art. 6(1)(b) — performance of a contract (gdpr §2.1).
+    Contract,
+    /// Art. 6(1)(f) — legitimate interest; carries the LIA (legitimate-interest-assessment)
+    /// reference (gdpr §2.1). The `lia_ref` resolves into the LIA register with P-GA-07.
+    LegitimateInterest(String),
+    /// Art. 6(1)(a) — consent; carries the `consent_id` into the consent registry (G5, P-GA-23).
+    Consent(String),
+    /// Art. 6(1)(c) — compliance with a legal obligation (gdpr §2.1; e.g. the audit carve-out).
+    LegalObligation,
+}
+
+/// The `retention` tag (gdpr §2.1): HOW LONG the field may be retained (Art. 5(1)(e)). Frozen to
+/// the §2.1 shape: `TenantPolicy | Fixed(Duration) | UntilContractEnd | AuditCarveOut(Duration)`.
+///
+/// The retention ENGINE (tightest-policy-wins merge + legal-hold-aware suspend-don't-delete) is
+/// P-GA-22; this tag is the per-field INPUT it merges. `Fixed`/`AuditCarveOut` carry a
+/// [`core::time::Duration`] — the std type, no parallel duration newtype (EI-01 §7).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RetentionClass {
+    /// retained per the tenant's configured retention policy (gdpr §2.1, §5.1; tightest-wins).
+    TenantPolicy,
+    /// retained for a fixed duration, then crypto-shred-expired (gdpr §2.1).
+    Fixed(core::time::Duration),
+    /// retained until the tenant's contract ends, then offboarding-erased (gdpr §2.1, §4.4).
+    UntilContractEnd,
+    /// the audit-log retention carve-out (gdpr §6.4, GD-5) — a per-jurisdiction legal-retention
+    /// floor that suspends erasure for the held duration, then expires via audit-key shred.
+    AuditCarveOut(core::time::Duration),
+}
+
+/// The `erasure` tag (gdpr §2.1): the MECHANISM by which the field is erased on an Art. 17 right
+/// (erasure = purge / crypto-shred / pseudonymise, **never hide** — ADR-12.3). Frozen to the
+/// §2.1 shape: `Pseudonymise | CryptoShred(key_class) | PurgeReindex | CarveOut`.
+///
+/// This tag is what the erase fan-out (P-GA-06 canonical erase order) dispatches on per holder
+/// per field. `CryptoShred` carries the `key_class` (which key-hierarchy class to destroy —
+/// per-subject DEK | per-tenant KEK; Storage 11.3/11.4); named now as a string ref, resolved
+/// into the KMS hierarchy with the macro body + the holder bodies (P-GA-05).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ErasureMethod {
+    /// replace the subject's identifying values with a stable pseudonym (gdpr §2.1, §3.2).
+    Pseudonymise,
+    /// destroy the key whose ciphertext is the only copy — the ciphertext becomes unrecoverable
+    /// (gdpr §2.1, §3.2; the `key_class` names which key-hierarchy class to shred).
+    CryptoShred(String),
+    /// purge the rows and reindex-from-source the derived stores (gdpr §2.1; P-GA-24).
+    PurgeReindex,
+    /// the audit carve-out — suppress/restrict rather than purge, expiring via key shred at the
+    /// retention floor (gdpr §6.4, GD-5; the H16 audit carve-out, P-GA-19).
+    CarveOut,
 }
 
 /// The scope of an `erase` (gdpr §3.1 — `erase(subject_or_tenant: EraseScope)`; §4.4 — tenant
@@ -243,6 +363,55 @@ pub trait PersonalDataHolder {
     /// Art. 17 erasure — purge / crypto-shred / pseudonymise (never hide) over the scope
     /// (a single subject, or a whole tenant for offboarding).
     fn erase(&self, scope: EraseScope) -> Result<EraseReceipt>;
+}
+
+/// A **fixture store** that exercises the frozen P-GA-02 surface in real (compiled, non-test)
+/// crate source: it derives `#[derive(PersonalData)]`, tags a field with the `#[personal_data(...)]`
+/// helper, and references a variant of each of the five tag enums. Its purpose is the GATE — "a
+/// store can write `#[derive(PersonalData)]` + `#[personal_data(...)]` and reference each enum
+/// variant now; it will not compile correctly against drift later". It is also the GREEN witness
+/// the live `no-untagged-personal-data` lint (P-GA-03) scans: the PII-typed field below carries
+/// the tag, so the lint ADMITS it.
+///
+/// **Floor:** the derive is a no-op here (it emits nothing; the struct + helper are left as
+/// written); the registry-entry emission is P-GA-04 / P-GA-07. This is a fixture (a compile-surface
+/// witness), not a real holder — the real M1 stores carry their own tagged fields.
+pub mod classify_fixture {
+    use super::{
+        DataCategory, DataRole, ErasureMethod, LawfulBasis, PersonalData, RetentionClass,
+    };
+
+    /// A toy contact record proving the `#[derive(PersonalData)]` derive + the `#[personal_data(...)]`
+    /// helper + each of the five tag enums compile when applied/referenced by a store. The `email`
+    /// field is a PII-fingerprinted field name (the `no-untagged-personal-data` lint's `PII_FIELDS`
+    /// set) carrying the tag — so it is also the LIVE green fixture: tagged ⇒ admitted.
+    #[derive(PersonalData)]
+    pub struct ContactRecord {
+        /// a non-PII key — no tag needed.
+        pub id: u64,
+        /// a PII field, tagged with the full five-tag classification (the helper compiles). Kept
+        /// on ONE line so the `no-untagged-personal-data` scanner (which checks the immediately
+        /// preceding line for `#[personal_data`) admits it — the multi-line-attribute case is a
+        /// scanner refinement for P-GA-03/P-051, not weakened here.
+        #[personal_data(category = ContactInfo, role = TenantContent, basis = Contract, retention = TenantPolicy, erasure = CryptoShred(subject_dek), subject_locator = "id")]
+        pub email: String,
+    }
+
+    impl ContactRecord {
+        /// Construct a fixture record AND reference one variant of each of the five tag enums —
+        /// proving the variant NAMES are frozen + usable by a store today. The values are not
+        /// stored (the registry-emitting macro body is the P-GA-07 floor); referencing them is
+        /// the compile-surface gate.
+        pub fn new(id: u64, email: String) -> ContactRecord {
+            // Reference one variant of each of the five tag enums (the frozen NAMES).
+            let _category = DataCategory::ContactInfo;
+            let _role = DataRole::TenantContent;
+            let _basis = LawfulBasis::Contract;
+            let _retention = RetentionClass::TenantPolicy;
+            let _erasure = ErasureMethod::CryptoShred("subject_dek".into());
+            ContactRecord { id, email }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -369,5 +538,108 @@ mod tests {
         };
         let r_back: Receipt = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(r_back, r);
+    }
+
+    // ───────────────────────── P-GA-02 / P-050 — the classify surface ──────────────────────────
+
+    /// The `#[personal_data(...)]` field helper (under `#[derive(PersonalData)]`) parses its FIVE
+    /// TAG KEYS (`category` / `role` / `basis` / `retention` / `erasure` / `subject_locator`)
+    /// without erroring (contract 10.2; gdpr §2.1). At the NO-OP floor the derive emits nothing
+    /// and the helper is inert, so the proof is structural: a struct deriving `PersonalData` with
+    /// a field carrying the full six-key helper COMPILES (the helper is only legal under the
+    /// derive — without it this is a hard `cannot find attribute` error if the names were not
+    /// frozen + re-exported). The struct being constructable + its field readable proves the no-op
+    /// derive left the item unchanged.
+    #[test]
+    fn personal_data_attribute_parses_the_five_tag_keys() {
+        // Apply the derive + the helper with ALL five tag keys (+ subject_locator) — must compile.
+        #[derive(PersonalData)]
+        struct Tagged {
+            #[personal_data(
+                category = Identifier,
+                role = PlatformOperational,
+                basis = LegitimateInterest(ops_lia),
+                retention = Fixed(90d),
+                erasure = PurgeReindex,
+                subject_locator = "principal_id"
+            )]
+            principal_id: String,
+        }
+        // The no-op derive left the item unchanged: the field is present + readable.
+        let t = Tagged {
+            principal_id: "p-1".into(),
+        };
+        assert_eq!(t.principal_id, "p-1");
+
+        // The compiled, non-test fixture store (`classify_fixture`) also applies the attribute +
+        // references each enum variant — exercise it here to bind the gate to a real store shape.
+        let rec = classify_fixture::ContactRecord::new(7, "a@b.test".into());
+        assert_eq!(rec.id, 7);
+        assert_eq!(rec.email, "a@b.test");
+    }
+
+    /// Each of the FIVE TAG ENUMS exists with its §2.1 variant NAMES, and every variant
+    /// round-trips through serde (the tags live in the generated data map + RoPA, P-GA-09, so a
+    /// stable serde shape is part of the frozen contract). Constructing every variant by name is
+    /// the drift guard: if a §2.1 variant name changed, this fails to compile.
+    #[test]
+    fn five_tag_enum_names_and_variants_exist_and_round_trip() {
+        // category: ContactInfo | Identifier | Content | Behavioural | SpecialCategory(...)
+        let categories = [
+            DataCategory::ContactInfo,
+            DataCategory::Identifier,
+            DataCategory::Content,
+            DataCategory::Behavioural,
+            DataCategory::SpecialCategory("health".into()),
+        ];
+        // role: TenantContent | PlatformOperational (the `role` tag is DataRole, frozen in P-GA-01)
+        let roles = [DataRole::TenantContent, DataRole::PlatformOperational];
+        // basis: Contract | LegitimateInterest(lia_ref) | Consent(consent_id) | LegalObligation
+        let bases = [
+            LawfulBasis::Contract,
+            LawfulBasis::LegitimateInterest("lia-1".into()),
+            LawfulBasis::Consent("consent-1".into()),
+            LawfulBasis::LegalObligation,
+        ];
+        // retention: TenantPolicy | Fixed(Duration) | UntilContractEnd | AuditCarveOut(Duration)
+        let retentions = [
+            RetentionClass::TenantPolicy,
+            RetentionClass::Fixed(core::time::Duration::from_secs(86_400)),
+            RetentionClass::UntilContractEnd,
+            RetentionClass::AuditCarveOut(core::time::Duration::from_secs(86_400 * 365)),
+        ];
+        // erasure: Pseudonymise | CryptoShred(key_class) | PurgeReindex | CarveOut
+        let erasures = [
+            ErasureMethod::Pseudonymise,
+            ErasureMethod::CryptoShred("subject_dek".into()),
+            ErasureMethod::PurgeReindex,
+            ErasureMethod::CarveOut,
+        ];
+
+        fn round_trip<T>(values: &[T])
+        where
+            T: Serialize + for<'de> Deserialize<'de> + PartialEq + std::fmt::Debug,
+        {
+            for v in values {
+                let json = serde_json::to_string(v).unwrap();
+                let back: T = serde_json::from_str(&json).unwrap();
+                assert_eq!(&back, v, "tag enum variant must round-trip: {json}");
+            }
+        }
+        round_trip(&categories);
+        round_trip(&roles);
+        round_trip(&bases);
+        round_trip(&retentions);
+        round_trip(&erasures);
+
+        // Spot-check a frozen variant NAME serializes to its §2.1 spelling (drift tripwire).
+        assert_eq!(
+            serde_json::to_string(&DataCategory::ContactInfo).unwrap(),
+            "\"ContactInfo\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ErasureMethod::PurgeReindex).unwrap(),
+            "\"PurgeReindex\""
+        );
     }
 }

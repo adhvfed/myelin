@@ -19,6 +19,12 @@ members = [
     "crates/myelin-query",
     "crates/myelin-agent",
     "crates/myelin-gdpr",
+    # The proc-macro half of the GDPR classify-derive (contract 10.2; P-GA-02 → P-050). A
+    # `proc-macro = true` crate may export ONLY procedural macros, so the `#[personal_data]`
+    # attribute lives here while the five-tag enum TYPES it references live in `myelin-gdpr`,
+    # which re-exports the attribute. It is a leaf BELOW myelin-gdpr in the §2.9 DAG (no myelin
+    # deps); only myelin-gdpr depends on it.
+    "crates/myelin-gdpr-macros",
     "crates/myelin-client",
     # The storage SUBSTRATE crate (P-ST-01 → P-007): the OLTP tier client (harness pool +
     # (tenant, region) RLS guard), and — in later prompts — the KMS hierarchy + BlobStore
