@@ -1997,6 +1997,7 @@ dependencies = [
  "fred",
  "hex",
  "myelin-config",
+ "myelin-control-plane",
  "myelin-events",
  "myelin-gdpr",
  "myelin-harness",

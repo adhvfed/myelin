@@ -335,6 +335,34 @@
 //!   MECHANISM ships, the NUMBER → counsel); the real GDPR erasure-ledger binding (10.8) is **P-GA-15
 //!   (global P-115)**; the real `pg_restore` + cell-kill provisioning driver is the P-S12/P-S15 floor.
 //!   The mutation floor on the post-PIT-select + re-apply + 0-resurrected-assert path is mandatory-core.
+//! - **Residency pinning enforced end-to-end (STOR-D5) (P-ST-15 / contract 12.4 storage half + 12.1
+//!   — global P-102)** is now IMPLEMENTED in [`residency`]: it CLOSES the per-pool runtime
+//!   region-pin floor named in [`oltp`] + [`holder`]. (1) **The per-pool runtime region-pin:**
+//!   [`residency::RegionPinnedStore`] pins every store to its cell's [`myelin_tenancy::Region`]
+//!   (immutable — a region change is a NEW value); the M0 region-less-pool floor is closed. (2) **The
+//!   in-process residency WRITE boundary:** [`residency::RegionPinnedStore::admit_write`] REJECTS a
+//!   row whose region ≠ the store's pinned region ([`residency::ResidencyViolation::OutOfRegionWrite`])
+//!   — *no store ever writes outside its region*, so cross-region replication has no source (the unit
+//!   twin of the live-DB RLS `WITH CHECK` the STOR-D5 integration drill, P-096, proves against real
+//!   Postgres). (3) **Every store reports its region:** [`residency::StoreResidencyReport`] is the
+//!   per-store `(store_class, region)` report; (4) **the `myelin storage residency verify <tenant>`
+//!   admin path** ([`residency::StoreSet::residency_verify`] → [`residency::verify_region_pinning`])
+//!   gathers a report from EVERY M1 store class and FAILS LOUDLY on a cross-region store
+//!   ([`residency::ResidencyViolation::OutOfRegionStore`]) or a missing one
+//!   ([`residency::ResidencyViolation::MissingStoreReport`], fail-closed) — never a silent pass; on
+//!   PASS it emits the PII-free [`residency::RegionPinningAttestation`] whose
+//!   [`residency::ResidencyVerifySignal`] reads `cross_region_egress == 0` (the dated STOR-D5 green
+//!   artifact). Storage is UPSTREAM of the control plane in the crate DAG, so it OWNS the
+//!   report-producing side; the control plane's `residency_verify` (P-085) is the downstream CONSUMER
+//!   that signs the reports — the 12.4 CDC pair (`tests/cdc_12_4_storage_residency_report.rs`) proves
+//!   the two halves agree WITHOUT a shared report type (the DAG forbids a `myelin-storage ->
+//!   myelin-control-plane` edge; documented deviation, EI-01 §1). **Floors named in [`residency`]:**
+//!   the within-EU CDN edge set is **P-ST-23 (global P-254)**, the outbound push-mirror targets are
+//!   **P-ST-25 (global P-255)**, and the T3 firehose archive is **P-ST-20 (global P-147)** — all
+//!   EXTEND this same `residency_verify` with additional store-class variants (the aggregation and
+//!   fail-on-mismatch shape does not change). The mutation floor on the write-boundary region compare,
+//!   the out-of-region-report branch, and the missing-store fail-closed branch is mandatory-core
+//!   (≥ 80% — the region-pin enforcement carrying the token-region into the partition key).
 
 pub mod backup;
 pub mod blob;
@@ -352,6 +380,12 @@ pub mod kms_failstatic;
 pub mod migration;
 pub mod oltp;
 pub mod reerase;
+// Residency pinning enforced end-to-end (STOR-D5, P-ST-15 / P-102): the per-pool runtime region-pin
+// (closes the oltp/holder M0 floor), the in-process residency WRITE boundary, the per-store region
+// report, and the `myelin storage residency verify <tenant>` admin path. The control plane's
+// `residency_verify` (P-085) consumes the reports this produces (the 12.4 CDC; storage is upstream
+// of the control plane in the DAG, so it OWNS the report-producing side).
+pub mod residency;
 pub mod restore;
 pub mod restore_verify;
 pub mod rls;
@@ -420,6 +454,10 @@ pub use oltp::{OltpConfig, OltpError, OltpPool, PermitGuard};
 pub use reerase::{
     CellKillRestore, CellKillRtoReport, ErasureRecord, InMemoryPostPitLedger,
     PostRestoreErasureLedger, ReErasePass, ReErasedSubject, ReEraseReport, RtoGrain,
+};
+pub use residency::{
+    verify_region_pinning, RegionPinnedStore, RegionPinningAttestation, ResidencyStoreClass,
+    ResidencyVerifySignal, ResidencyViolation, StoreResidencyReport, StoreSet,
 };
 pub use restore::{
     restore_to_offset, restored_key_counts, BlobPresence, ReindexFromSource, RestoreError,

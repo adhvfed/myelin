@@ -27,10 +27,18 @@
 //! in P-ST-04 → P-020) requires every store/pool construction to pin a `Region`. This file is the
 //! **M0 region-less pool MODEL**: on this floor the pool layer is region-agnostic (the cell's
 //! region pins data OUT-OF-BAND — the per-query `(tenant, region)` `TenantScope` in [`crate::rls`]
-//! carries the region; a per-POOL runtime region-pin lands end-to-end in **P-ST-15 / P-102**,
-//! the STOR-D5 gate). The file-level lint waiver marker `@residency-cell-pinned:file` records this
-//! floor LOUDLY (EI-01 §4 — named, never a silent skip); the lint stays fully live on every
-//! caller/application file and fires on any UNMARKED region-less store open.
+//! carries the region). **The per-POOL runtime region-pin is now SHIPPED in [`crate::residency`]
+//! (P-ST-15 / P-102, the STOR-D5 gate):** [`crate::residency::RegionPinnedStore`] pins each store to
+//! its cell's `Region`, its [`crate::residency::RegionPinnedStore::admit_write`] is the in-process
+//! residency WRITE boundary (an out-of-region write is rejected — no store writes outside its
+//! region), and [`crate::residency::StoreSet::residency_verify`] is the
+//! `myelin storage residency verify <tenant>` admin path that proves region pinning (0 cross-region
+//! egress). This `OltpPool` MODEL stays region-agnostic at the permit-accounting layer (the region
+//! pin lives on the store/store-set seam, not the bounded-pool counter); when the concrete sqlx
+//! driver lands (P-S12) the pool is constructed inside a [`crate::residency::RegionPinnedStore`].
+//! The file-level lint waiver marker `@residency-cell-pinned:file` records this LOUDLY (EI-01 §4 —
+//! named, never a silent skip); the lint stays fully live on every caller/application file and fires
+//! on any UNMARKED region-less store open.
 
 /// The validated OLTP pool config (storage §3.1; contract 1.1 config). Read from the
 /// service's `AppSpec` config and **validated at boot** (fast-fail on a nonsensical
