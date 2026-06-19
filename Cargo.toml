@@ -10,6 +10,14 @@ members = [
     "crates/myelin-agent",
     "crates/myelin-gdpr",
     "crates/myelin-client",
+    # The storage SUBSTRATE crate (P-ST-01 → P-007): the OLTP tier client (harness pool +
+    # (tenant, region) RLS guard), and — in later prompts — the KMS hierarchy + BlobStore
+    # impls + backup/restore machinery. Sits below -gdpr/-client and ABOVE -substrate in
+    # the §2.9 root-last DAG (the harness depends on the tier client it wires). See the
+    # crate-level DEVIATION note in crates/myelin-storage/src/lib.rs (this node extends the
+    # §2.9 ten-crate DAG; the architecture §2.8 "no shared storage-API crate" is preserved
+    # because this is the harness-wired mechanism, not a cross-subsystem data-access crate).
+    "crates/myelin-storage",
     "crates/myelin-substrate",
     # Test-support failure-injection harness (P-S02..P-S04). NOT a node in the production
     # crate DAG (architecture §2.9) — it sits above myelin-substrate as a leaf consumer and
