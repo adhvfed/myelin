@@ -1,0 +1,17 @@
+[package]
+name = "myelin-events"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# myelin-events sits below identity in the DAG (architecture 00 §2.9):
+# tenancy → identity → events. It depends on tenancy (TenantId/Region/ArtifactRef) and
+# identity (Principal, for the envelope's Actor). It MUST NOT depend on -refs, -content,
+# -query, -agent, -gdpr, -client, or -substrate (those are downstream); such an edge
+# MUST NOT compile.
+[dependencies]
+myelin-tenancy = { path = "../myelin-tenancy" }
+myelin-identity = { path = "../myelin-identity" }
+serde.workspace = true
+serde_json.workspace = true

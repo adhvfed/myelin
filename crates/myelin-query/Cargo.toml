@@ -1,0 +1,16 @@
+[package]
+name = "myelin-query"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# myelin-query is in the mid-tier of the DAG (architecture 00 §2.9). It depends on
+# tenancy + identity + events (the `EventMatcher` predicate core shares the QueryAst, and
+# permission-aware queries compose with list_objects). It MUST NOT depend on -agent,
+# -gdpr, -client, or -substrate (downstream).
+[dependencies]
+myelin-tenancy = { path = "../myelin-tenancy" }
+myelin-identity = { path = "../myelin-identity" }
+myelin-events = { path = "../myelin-events" }
+serde.workspace = true

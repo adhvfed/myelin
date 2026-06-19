@@ -1,0 +1,14 @@
+[package]
+name = "myelin-agent"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# myelin-agent is below the events tier in the DAG (architecture 00 §2.9):
+# events (+ refs/content/query) → agent, gdpr. It depends on identity + events. It MUST
+# NOT depend on -client or -substrate (downstream); such an edge MUST NOT compile.
+[dependencies]
+myelin-identity = { path = "../myelin-identity" }
+myelin-events = { path = "../myelin-events" }
+serde.workspace = true

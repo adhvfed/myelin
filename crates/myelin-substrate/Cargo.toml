@@ -1,0 +1,24 @@
+[package]
+name = "myelin-substrate"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# myelin-substrate is the ROOT of the crate DAG, root-LAST (architecture 00 §2.9):
+# ... → client → substrate. It depends on ALL the glue crates and is depended on by
+# NONE of them (a service's main.rs is the only consumer). It is the harness home
+# (serve(AppSpec)) and the FailStatic<T> home, and it carries the crate-graph-acyclic
+# test (the build-layer realisation of the no-cross-sync-cycle lint, P-S10 ships the
+# real lint).
+[dependencies]
+myelin-tenancy = { path = "../myelin-tenancy" }
+myelin-identity = { path = "../myelin-identity" }
+myelin-events = { path = "../myelin-events" }
+myelin-refs = { path = "../myelin-refs" }
+myelin-content = { path = "../myelin-content" }
+myelin-query = { path = "../myelin-query" }
+myelin-agent = { path = "../myelin-agent" }
+myelin-gdpr = { path = "../myelin-gdpr" }
+myelin-client = { path = "../myelin-client" }
+serde.workspace = true
