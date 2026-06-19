@@ -437,14 +437,69 @@ pub fn no_cross_db() -> Lint {
 /// / `ALTER TABLE ... ALTER COLUMN` without the expand→backfill→contract idiom is the
 /// table-lock-under-load bug class.
 ///
-/// **Floor (named).** The hot-table half is partial here: the per-subsystem hot-table DECLARATION
-/// that `forward-only-migration` reads to know WHICH `ALTER`s are forbidden lands with the
-/// migration runner + the `AppSpec` hot-table mechanism in **P-S15 / P-032**. Until then this
-/// scanner enforces the table-INDEPENDENT half (no down migration; no obviously-blocking
-/// `ALTER ... NOT NULL` add) and tightens to the per-table rule when the declaration exists.
+/// **Hot-table tightening (P-S15 / P-032, §9.4).** A migration source declares its hot tables
+/// inline with a `-- @hot-table NAME` directive (the source-scan mirror of the `AppSpec`
+/// `HotTables` declaration the migration runner reads at boot, `myelin-substrate`). On a
+/// declared-hot table, a blocking change is rejected: the obviously-blocking forms (an
+/// `ADD … NOT NULL` without DEFAULT, an in-place `ALTER COLUMN`) AND a **non-concurrent
+/// `CREATE INDEX`** (which a cold table absorbs but a hot table cannot — it locks writes at QPS).
+/// A hot-table change must be expand→backfill→contract; the nullable-add expand step + a
+/// `CREATE INDEX CONCURRENTLY` stay admitted. On a non-declared (cold) table only the
+/// table-INDEPENDENT obviously-blocking `ADD … NOT NULL` (no DEFAULT) / in-place `ALTER COLUMN`
+/// fires (a cold table absorbs the brief index lock).
+///
+/// **Floor (named).** The full per-subsystem hot-table sets are measured-not-predicted (M1+);
+/// each subsystem declares its set (`@hot-table` in its migration source + `AppSpec::hot_tables`).
 pub const FORWARD_ONLY_MIGRATION: LintId = LintId("forward-only-migration");
 
+/// Parse the `-- @hot-table NAME` declarations out of a migration source (the source-scan mirror
+/// of the `AppSpec` hot-table declaration the runner reads, §9.4). Each directive flags one table
+/// hot for the per-table tightening below.
+fn declared_hot_tables(src: &str) -> std::collections::BTreeSet<String> {
+    let mut hot = std::collections::BTreeSet::new();
+    for raw in src.lines() {
+        let t = raw.trim();
+        // Accept `-- @hot-table NAME`, `@hot-table NAME`, `-- @hot-table: NAME`.
+        if let Some(rest) = t
+            .strip_prefix("-- @hot-table")
+            .or_else(|| t.strip_prefix("@hot-table"))
+        {
+            let name = rest.trim_start_matches([':', ' ']).split_whitespace().next();
+            if let Some(name) = name {
+                if !name.is_empty() {
+                    hot.insert(name.to_ascii_lowercase());
+                }
+            }
+        }
+    }
+    hot
+}
+
+/// Whether a DDL line is a blocking change (table-lock-under-load bug class). The
+/// table-INDEPENDENT half always fires: a blocking `ALTER` (ADD COLUMN … NOT NULL without
+/// DEFAULT, or in-place ALTER COLUMN). `hot` ADDS the per-hot-table half (§9.4): a non-concurrent
+/// `CREATE INDEX` — fine on a cold table, but on a hot table it locks writes at QPS and must be
+/// `CREATE INDEX CONCURRENTLY` (the expand step). A NULLABLE add (the legitimate expand step) is
+/// admitted on a hot table; it is the expand→backfill→contract path, not a blocking change.
+fn is_blocking_ddl(lower: &str, hot: bool) -> bool {
+    let alter_adds_not_null = lower.contains("alter table")
+        && lower.contains("add column")
+        && lower.contains("not null")
+        && !lower.contains("default");
+    let alter_column_inplace = lower.contains("alter table") && lower.contains("alter column");
+    if alter_adds_not_null || alter_column_inplace {
+        return true;
+    }
+    if hot {
+        let non_concurrent_index =
+            lower.contains("create index") && !lower.contains("concurrently");
+        return non_concurrent_index;
+    }
+    false
+}
+
 fn scan_forward_only_migration(src: &str) -> Vec<Violation> {
+    let hot_tables = declared_hot_tables(src);
     let mut out = Vec::new();
     for (line, code) in code_lines(src) {
         // Blank string-literal CONTENTS so a forbidden token held as DATA — e.g. the migration
@@ -470,23 +525,25 @@ fn scan_forward_only_migration(src: &str) -> Vec<Violation> {
                     .into(),
             });
         }
-        // (b) A blocking ALTER that adds a NOT NULL column or rewrites a column in place — the
-        // table-lock-under-load bug class. (The per-hot-table tightening lands in P-S15/P-032.)
-        let alter_adds_not_null = lower.contains("alter table")
-            && lower.contains("add column")
-            && lower.contains("not null")
-            && !lower.contains("default");
-        let alter_column_inplace =
-            lower.contains("alter table") && lower.contains("alter column");
-        if alter_adds_not_null || alter_column_inplace {
+        // (b) A blocking change. Whether this line targets a DECLARED-HOT table widens what
+        // counts as blocking (§9.4): on a hot table ANY ALTER / non-concurrent index is blocking.
+        let targets_hot = hot_tables.iter().any(|t| lower.contains(t.as_str()));
+        if is_blocking_ddl(&lower, targets_hot) {
+            let reason = if targets_hot {
+                "a blocking change (ALTER TABLE / non-concurrent CREATE INDEX) on a DECLARED-HOT \
+                 table (`@hot-table`, §9.4) takes a table lock at write QPS — a hot-table change \
+                 must be expand→backfill→contract (nullable add → throttled backfill → constrain), \
+                 never one blocking step (forward-only-migration/§9.4)."
+            } else {
+                "a blocking `ALTER TABLE` (ADD COLUMN ... NOT NULL without DEFAULT, or ALTER \
+                 COLUMN in place) takes a table lock — on a hot table this stalls writes; use the \
+                 expand→backfill→contract idiom (nullable add, backfill, then constrain) \
+                 (forward-only-migration/§9)."
+            };
             out.push(Violation {
                 lint: FORWARD_ONLY_MIGRATION,
                 line,
-                reason: "a blocking `ALTER TABLE` (ADD COLUMN ... NOT NULL without DEFAULT, or \
-                         ALTER COLUMN in place) takes a table lock — on a hot table this stalls \
-                         writes; use the expand→backfill→contract idiom (nullable add, backfill, \
-                         then constrain) (forward-only-migration/§9)."
-                    .into(),
+                reason: reason.into(),
             });
         }
     }
@@ -1360,6 +1417,45 @@ mod tests {
         assert!(!forward_only_migration().run(red_down).is_empty());
         assert!(!forward_only_migration().run(red_alter).is_empty());
         assert!(forward_only_migration().run(green).is_empty());
+    }
+
+    /// **The hot-table tightening (P-S15/P-032, §9.4).** Once a migration source declares a table
+    /// hot (`-- @hot-table NAME`), the lint reads that declaration and forbids a **non-concurrent
+    /// `CREATE INDEX`** on it (fine on a cold table, but at write QPS on a hot table it must be
+    /// `CONCURRENTLY`) — the per-hot-table half on TOP of the table-independent obviously-blocking
+    /// `ALTER` forms. The nullable-add expand step + a `CREATE INDEX CONCURRENTLY` stay admitted.
+    #[test]
+    fn forward_only_migration_tightens_to_per_hot_table_when_declared() {
+        // (1) A non-concurrent CREATE INDEX on a declared-HOT table is rejected; on a non-declared
+        //     (cold) table the same index is admitted (it absorbs the brief lock).
+        let hot_index = "-- @hot-table issue\nCREATE INDEX idx_issue_status ON issue (status);";
+        let cold_index = "CREATE INDEX idx_archive_status ON audit_archive (status);";
+        assert!(
+            !forward_only_migration().run(hot_index).is_empty(),
+            "a non-concurrent CREATE INDEX on a DECLARED-HOT table must be rejected (§9.4)"
+        );
+        assert!(
+            forward_only_migration().run(cold_index).is_empty(),
+            "the same non-concurrent index on a non-hot table is admitted"
+        );
+
+        // (2) CREATE INDEX CONCURRENTLY (the expand step) is admitted even on a hot table.
+        let hot_index_concurrent =
+            "-- @hot-table issue\nCREATE INDEX CONCURRENTLY idx_issue_status ON issue (status);";
+        assert!(forward_only_migration().run(hot_index_concurrent).is_empty());
+
+        // (3) The expand step (a NULLABLE add) is admitted even on a hot table.
+        let hot_expand = "-- @hot-table issue\nALTER TABLE issue ADD COLUMN priority INT;";
+        assert!(
+            forward_only_migration().run(hot_expand).is_empty(),
+            "the expand step (nullable add) is admitted on a hot table"
+        );
+
+        // (4) The obviously-blocking ALTER forms still fire on a hot table (the table-independent
+        //     half is preserved).
+        let hot_blocking_alter =
+            "-- @hot-table issue\nALTER TABLE issue ADD COLUMN body TEXT NOT NULL;";
+        assert!(!forward_only_migration().run(hot_blocking_alter).is_empty());
     }
 
     #[test]

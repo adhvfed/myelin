@@ -18,8 +18,8 @@
 use myelin_events::relay::InProcessBus;
 use myelin_substrate::serve::{boot, AppSpec, OutboxSpec, Surface};
 use myelin_substrate::{
-    AllowPrincipal, Config, CriticalDependencies, InjectedIdentity, InternalReject, InternalRpc,
-    InternalSurface, Migrations, PublicReject, PublicRoutes,
+    AllowPrincipal, Config, CriticalDependencies, HotTables, InjectedIdentity, InternalReject,
+    InternalRpc, InternalSurface, Migrations, PublicReject, PublicRoutes,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_tenancy::TenantId;
@@ -38,6 +38,7 @@ fn cdc_1_2_lifecycle_public_surface_is_tenant_from_token() {
         name: "svc",
         config: Config::default(),
         migrations: Migrations::default(),
+        hot_tables: HotTables::none(),
         public: PublicRoutes::default(),
         internal: InternalRpc::default(),
         consumers: vec![],

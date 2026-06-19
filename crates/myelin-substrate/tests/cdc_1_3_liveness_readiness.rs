@@ -16,7 +16,8 @@
 use myelin_events::relay::InProcessBus;
 use myelin_substrate::serve::{boot, AppSpec, OutboxSpec, Surface};
 use myelin_substrate::{
-    Config, CriticalDependencies, InternalRpc, Liveness, Migrations, PublicRoutes, Readiness,
+    Config, CriticalDependencies, HotTables, InternalRpc, Liveness, Migrations, PublicRoutes,
+    Readiness,
 };
 
 /// **CDC 1.3 — a booted instance is Ready, a severed critical dependency flips readiness (not
@@ -29,6 +30,7 @@ fn cdc_1_3_lifecycle_metrics_health_is_liveness_ne_readiness() {
         name: "svc",
         config: Config::default(),
         migrations: Migrations::default(),
+        hot_tables: HotTables::none(),
         public: PublicRoutes::default(),
         internal: InternalRpc::default(),
         consumers: vec![],
