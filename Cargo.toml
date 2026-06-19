@@ -50,6 +50,10 @@ members = [
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The versioned thresholds file (P-S22 / P-038) is a TOML config source every M0 drill reads
+# its quantified threshold from. `toml` (de)serializes it; preserve-order is irrelevant here
+# (the file is keyed, not positional), so the default feature set is enough.
+toml = "0.8"
 
 [workspace.package]
 edition = "2021"

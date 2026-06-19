@@ -26,6 +26,9 @@ myelin-client = { path = "../myelin-client" }
 # models Substrate → Storage (root-last); this manifest edge realises it.
 myelin-storage = { path = "../myelin-storage" }
 serde.workspace = true
+# The versioned thresholds file (P-S22 / P-038): the single TOML source of truth every M0
+# drill reads its quantified threshold from. `toml` (de)serializes it.
+toml.workspace = true
 
 [dev-dependencies]
 # Test-support ONLY: the hello-world serve test reads the contract-1.8 producer signals
