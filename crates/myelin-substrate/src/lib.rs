@@ -201,6 +201,7 @@ use serde::{Deserialize, Serialize};
 pub mod agent_load;
 pub mod crate_graph;
 pub mod fail_static;
+pub mod fail_static_authz;
 pub mod holder_registered;
 pub mod holders;
 pub mod metrics_health;
@@ -219,6 +220,9 @@ pub use agent_load::{
 pub use fail_static::{
     Answer, Clock, FailStatic, FailStaticError, FailStaticSignals, StalenessBound, SystemClock,
     TestClock,
+};
+pub use fail_static_authz::{
+    AuthzDecision, AuthzServed, CoarseAuthz, FailStaticAuthz, AUTHZ_FRESH_TTL_SECS,
 };
 pub use holder_registered::{
     assert_all_holders_registered, holder_registered, DeclaredStore, HolderViolation, StoreManifest,

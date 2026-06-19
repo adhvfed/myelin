@@ -27,7 +27,9 @@
 //! `≤ revocation-SLA ≥ agent-token-TTL` constraint ship in M0 REGARDLESS (here); the constraint is
 //! enforced structurally in the constructor ([`FailStatic::try_new`]). Fail-static is PROVEN against
 //! a real Identity hiccup in **M1 (P-S25, SUB-D4)** — this prompt builds + unit-drills the mechanism
-//! at its boundaries only (named, not skipped).
+//! at its boundaries only (named, not skipped). P-S25 (global P-087) lands the authz read-path
+//! wiring ([`crate::fail_static_authz::FailStaticAuthz`]) + the SUB-D4 chained-sequence drill
+//! against the P-S03 dependency-break injector.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -410,8 +412,10 @@ impl<T: Clone, C: Clock> FailStatic<T, C> {
             drop(cache);
             // stale-while-revalidate: trigger a single background refresh attempt. On this floor the
             // "background" refresh is best-effort + synchronous-but-result-discarded (the caller has
-            // already been handed the stale value); a real async refresh task lands with the runtime
-            // wiring in P-S25. We DO attempt it so a recovered upstream re-freshes the cache.
+            // already been handed the stale value); the P-S25 authz wiring rides this synchronous
+            // best-effort refresh, and a real ASYNC refresh task lands with the production runtime
+            // (a `tokio` task pool) when the service shells carry one. We DO attempt it so a
+            // recovered upstream re-freshes the cache.
             self.try_background_refresh(bucket, refresh);
             self.stale_count.fetch_add(1, Ordering::SeqCst);
             self.last_staleness_secs.store(age, Ordering::SeqCst);
