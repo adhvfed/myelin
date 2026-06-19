@@ -65,6 +65,7 @@
 
 pub mod authenticate;
 pub mod check_engine;
+pub mod delegation;
 pub mod expand;
 pub mod failstatic_cache;
 pub mod list_objects;
@@ -82,6 +83,10 @@ pub use authenticate::{
     StructuralVerifier, VerifiedAssertion,
 };
 pub use check_engine::{eval_caveat, CheckEngine, MAX_REWRITE_DEPTH};
+pub use delegation::{
+    authority_of, effective_policy_of, DelegationAlgebra, DelegationInput, IntersectionProof,
+    EFFECTIVE_GRANT_CARRIER,
+};
 pub use expand::Expand;
 pub use failstatic_cache::{
     CachedDecision, CacheTelemetry, CoarseGrant, FailStaticCache, Served, FRESH_TTL_SECS, S6_STORE,
@@ -610,6 +615,66 @@ impl StoreBackedCheck {
         self.namespace.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// **`delegation(agent, trigger_actor) → EffectivePolicy` (contract 4.5) — the LIVE
+    /// monotone-intersection algebra (P-ID-17).** Returns the composed `agent.policy ∩ delegation ∩
+    /// tenant.policy` (with the "you cannot delegate authority you do not have" re-check) so the
+    /// Agent Fabric's `EffectApi` (P-ID-23, M2) never re-implements the algebra. The policy SETS
+    /// (`input`) come from the caveat chains the agent's + the delegating human's credentials carry
+    /// (resolved by `authenticate`, P-ID-07) — the scope-less ABI [`IdentityService::delegation`]
+    /// cannot carry them, so the service surface wires THIS entry. The composition runs over the SAME
+    /// [`delegation::DelegationAlgebra`] (one primitive, no bespoke intersection path).
+    pub fn delegation_in(
+        &self,
+        agent: &Principal,
+        trigger_actor: &Principal,
+        input: &delegation::DelegationInput,
+    ) -> myelin_identity::EffectivePolicy {
+        delegation::DelegationAlgebra::new().delegation(agent, trigger_actor, input)
+    }
+
+    /// **The delegation algebra WITH the recorded [`delegation::IntersectionProof`] (the ID-D5 green
+    /// artifact).** Identical to [`StoreBackedCheck::delegation_in`] but returns the proof the drill
+    /// records (the four conjunct sets + the composed effective set + the verified monotone
+    /// post-condition) — the "prove it" observation (EI-01 §3).
+    pub fn delegation_proved_in(
+        &self,
+        agent: &Principal,
+        trigger_actor: &Principal,
+        input: &delegation::DelegationInput,
+    ) -> (myelin_identity::EffectivePolicy, delegation::IntersectionProof) {
+        delegation::DelegationAlgebra::new().delegation_proved(agent, trigger_actor, input)
+    }
+
+    /// **The four-conjunct delegation decision — the three policy sets AND the ordinary object
+    /// `check` run AS the agent principal (architecture §6, conjunct 4; P-ID-17).** Wires the
+    /// [`delegation::DelegationAlgebra`] over THIS slot's live [`CheckEngine`] (the SAME `check` the
+    /// platform calls), so an agent is confined to `agent ∩ delegation ∩ tenant` AND must hold the
+    /// object-level relation. Returns `Allow` only when both conjuncts pass (fail-closed otherwise).
+    /// This is the conjunct the Agent Fabric's `EffectApi` runs per effect at apply time (P-ID-23).
+    #[allow(clippy::too_many_arguments)]
+    pub fn delegation_with_check_in(
+        &self,
+        agent: &Principal,
+        trigger_actor: &Principal,
+        input: &delegation::DelegationInput,
+        scope: &myelin_storage::TenantScope,
+        required_grant: &str,
+        permission: &Permission,
+        object: &ArtifactRef,
+        at: &Consistency,
+    ) -> Decision {
+        delegation::DelegationAlgebra::with_check(self.engine.clone()).delegation_with_check(
+            agent,
+            trigger_actor,
+            input,
+            scope,
+            required_grant,
+            permission,
+            object,
+            at,
+        )
+    }
+
     /// **The scoped, LIVE `list_subjects` (P-ID-13) — the Zanzibar Expand served by S8 at density.**
     /// The verified `(tenant, region)` scope is carried explicitly (the ABI trait method cannot — it
     /// has no caller principal). The object's type is inferred from its id's `type:` prefix (the §7.3
@@ -781,12 +846,24 @@ impl IdentityService for StoreBackedCheck {
         ))
     }
 
+    /// 4.5 — the LIVE monotone-intersection delegation algebra (P-ID-17). The ABI trait method
+    /// carries only the two principals, NOT the policy SETS (the caveat chains their credentials
+    /// carry) the intersection composes over — so a scope-/policy-less ABI call cannot compute the
+    /// real effective policy and MUST NOT fabricate one (an empty or all-allow `EffectivePolicy`
+    /// would be a silent over- or under-grant). The scoped entry the service surface wires is
+    /// [`StoreBackedCheck::delegation_in`], which carries the [`delegation::DelegationInput`] (the
+    /// agent ceiling / delegation chain / tenant guardrails / the delegator's held set). The ABI
+    /// method errors loudly so a policy-less delegation is never silently served.
     fn delegation(
         &self,
         _agent: &Principal,
         _trigger_actor: &Principal,
     ) -> myelin_identity::Result<myelin_identity::EffectivePolicy> {
-        Err(AuthzError::NotYetImplemented("delegation → P-ID-17 (M1)"))
+        Err(AuthzError::NotYetImplemented(
+            "delegation (ABI, policy-less) → use StoreBackedCheck::delegation_in (P-ID-17); the \
+             monotone intersection needs the conjunct policy sets the credentials carry, which the \
+             scope-less ABI method cannot supply (never a fabricated EffectivePolicy)",
+        ))
     }
 
     fn write_tuples(
