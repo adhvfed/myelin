@@ -77,13 +77,16 @@
 //! durable broker cursor + the real `dlq.<tenant>.<subsystem>` subject is EB-04's / EB-05's
 //! refinement of this floor (named, not silently skipped).
 //!
-//! ## FLOOR — the upcaster runs BEFORE handle
-//! Per the architecture, the consumer runtime calls the `(type, from_ver) → to_ver` upcaster
-//! registry before `handle` so a handler always sees the current shape. That registry is
-//! **P-S09** (the next prompt). The [`Consumer`] exposes the pre-handle hook
-//! ([`Consumer::with_upcaster`]) the registry plugs into; until P-S09 lands it is the identity
-//! map (a `schema_ver` already at the current version passes through). Named, not silently
-//! assumed done.
+//! ## The upcaster runs BEFORE handle (P-S09 — contract 2.8)
+//! The consumer runtime calls the `(type, from_ver) → to_ver` upcaster registry
+//! ([`crate::upcast::UpcasterRegistry`], **P-S09**) BEFORE `handle` so a handler always sees the
+//! current `schema_ver` shape. The [`Consumer`] exposes the pre-handle hook
+//! ([`Consumer::with_upcaster`]) the registry's [`crate::upcast::UpcasterRegistry::into_hook`]
+//! plugs into. The hook is **fallible**: an unbridgeable version gap (a missing upcaster) is a
+//! loud [`HandleOutcome::NonRetryable`] → the message is dead-lettered (DLQ), NEVER silently
+//! dropped and NEVER handed to a handler at the wrong shape (rule 2 of contract 2.8). With no
+//! registry installed the hook is the identity map (no evolution declared → every event is
+//! already current).
 
 use crate::{DedupLedger, EventEnvelope, EventHandler, HandleOutcome, Reason, SubjectPattern};
 use std::collections::HashMap;
@@ -236,11 +239,14 @@ pub struct Message {
     pub envelope: EventEnvelope,
 }
 
-/// The pre-handle hook the upcaster registry (P-S09) plugs into: `(envelope) -> envelope`,
-/// applied before `handle` so a handler always sees the current `schema_ver` shape. Until P-S09
-/// lands it is the identity map ([`Consumer::with_upcaster`] is how P-S09 will install the real
-/// registry). Boxed so the registry can be swapped without changing the runtime.
-type Upcaster = Box<dyn Fn(EventEnvelope) -> EventEnvelope + Send + Sync>;
+/// The pre-handle hook the upcaster registry (P-S09, contract 2.8) plugs into:
+/// `(envelope) -> Result<envelope, Reason>`, applied before `handle` so a handler always sees the
+/// current `schema_ver` shape. It is **fallible**: a successful bridge yields the upcasted
+/// envelope; an unbridgeable version gap yields the [`Reason`] the runtime turns into a
+/// [`HandleOutcome::NonRetryable`] → dead-letter (rule 2 of 2.8: loud, never a silent pass).
+/// With no registry installed it is the identity map. Boxed so the registry can be swapped
+/// without changing the runtime ([`crate::upcast::UpcasterRegistry::into_hook`] produces it).
+type Upcaster = Box<dyn Fn(EventEnvelope) -> Result<EventEnvelope, Reason> + Send + Sync>;
 
 /// A dead-lettered message (rule 5): the envelope + the non-retryable reason it was poisoned for.
 /// Surfaced (the operator alert / `dlq.<tenant>.<subsystem>` subject is EB-04/EB-05's
@@ -277,17 +283,20 @@ impl<H: EventHandler> Consumer<H> {
             handler,
             subscription,
             dedup,
-            upcaster: Box::new(|e| e),
+            upcaster: Box::new(Ok),
             pending: Mutex::new(HashMap::new()),
             dead_letters: Mutex::new(Vec::new()),
         }
     }
 
     /// Install the pre-handle upcaster (P-S09 plugs the `(type, from_ver) → to_ver` registry in
-    /// here). The runtime applies it before `handle` so a handler always sees the current shape.
+    /// here, via [`crate::upcast::UpcasterRegistry::into_hook`]). The runtime applies it before
+    /// `handle` so a handler always sees the current shape. The hook is **fallible**: an
+    /// unbridgeable gap returns `Err(Reason)` → the runtime dead-letters the message
+    /// ([`HandleOutcome::NonRetryable`] / DLQ), never silently passing the wrong shape (2.8).
     pub fn with_upcaster(
         mut self,
-        upcaster: impl Fn(EventEnvelope) -> EventEnvelope + Send + Sync + 'static,
+        upcaster: impl Fn(EventEnvelope) -> Result<EventEnvelope, Reason> + Send + Sync + 'static,
     ) -> Self {
         self.upcaster = Box::new(upcaster);
         self
@@ -345,8 +354,20 @@ impl<H: EventHandler> Consumer<H> {
             return Delivered::DeadLettered(reason);
         }
 
-        // The upcaster (P-S09) runs BEFORE handle so the handler sees the current shape.
-        let envelope = (self.upcaster)(msg.envelope.clone());
+        // The upcaster (P-S09, contract 2.8) runs BEFORE handle so the handler sees the current
+        // `schema_ver` shape. It is FALLIBLE: an unbridgeable version gap (a missing upcaster) is
+        // a loud dead-letter (rule 2 of 2.8) — the message is term'd to the DLQ, NEVER silently
+        // dropped and NEVER handed to the handler at the wrong shape. The dedup ledger is NOT
+        // marked for a gap: the event was never handled, so a later redelivery (e.g. after the
+        // missing upcaster is deployed) can be processed — this is forward-only, not a tombstone.
+        let envelope = match (self.upcaster)(msg.envelope.clone()) {
+            Ok(env) => env,
+            Err(reason) => {
+                self.clear_pending(&msg.subject);
+                self.push_dead_letter(msg.envelope.clone(), reason.clone());
+                return Delivered::DeadLettered(reason);
+            }
+        };
         let event_id = envelope.event_id.clone();
 
         // Rule 1: idempotent on `event_id` via the (consumer, event_id) dedup ledger. A FRESH
@@ -778,9 +799,9 @@ mod tests {
 
     // --- The upcaster pre-handle hook (P-S09 floor) ---
 
-    /// The upcaster runs BEFORE handle (P-S09 plugs the registry here): a `with_upcaster` that
-    /// rewrites `schema_ver` 1 → 2 means the handler sees the upcasted shape. Until P-S09 the
-    /// default is the identity map.
+    /// The upcaster runs BEFORE handle (P-S09 plugs the registry here via `into_hook`): a
+    /// `with_upcaster` that rewrites `schema_ver` 1 → 2 means the handler sees the upcasted shape.
+    /// With no registry installed the default hook is the identity map.
     #[test]
     fn upcaster_runs_before_handle() {
         let seen_ver = Arc::new(AtomicU32::new(0));
@@ -803,14 +824,39 @@ mod tests {
             DedupLedger::new(),
         )
         .with_upcaster(|mut e| {
-            // model a v1 → v2 upcaster (the real registry is P-S09).
+            // model a v1 → v2 upcaster (the real registry is P-S09's UpcasterRegistry).
             if e.schema_ver == 1 {
                 e.schema_ver = 2;
             }
-            e
+            Ok(e)
         });
         c.deliver(&msg("01J-1", "myelin://acme/issues/issue/PROJ-1"));
         assert_eq!(seen_ver.load(Ordering::SeqCst), 2, "the handler saw the upcasted schema_ver");
+    }
+
+    /// **Contract 2.8 rule 2 through the runtime:** an UNBRIDGEABLE version gap (the upcaster hook
+    /// returns `Err`) is a LOUD dead-letter (DLQ), never a silent pass and never handed to the
+    /// handler at the wrong shape. The handler MUST NOT run; the message is surfaced on the
+    /// dead-letter list; the dedup ledger is NOT marked (a later redelivery, after the missing
+    /// upcaster ships, can still be processed — forward-only, not a tombstone).
+    #[test]
+    fn unbridgeable_gap_dead_letters_loudly_never_silently_passes() {
+        let h = done_handler();
+        let c = Consumer::new(h, sub("indexer", &["myelin://acme/issues/"]), DedupLedger::new())
+            .with_upcaster(|_e| Err(Reason("unbridgeable schema gap: no upcaster".into())));
+
+        let m = msg("01J-gap", "myelin://acme/issues/issue/PROJ-1");
+        let out = c.deliver(&m);
+
+        assert!(matches!(out, Delivered::DeadLettered(_)), "a gap dead-letters → DLQ");
+        assert_eq!(c.handler.runs.load(Ordering::SeqCst), 0, "the handler never saw the wrong shape");
+        assert_eq!(c.dead_letters().len(), 1, "the gap is surfaced, not silently dropped");
+        // The dedup ledger was NOT marked: re-delivering the SAME event after the upcaster ships
+        // is not deduplicated away. Prove it by re-installing an identity hook and re-delivering.
+        assert!(
+            c.dedup().mark_handled(c.name(), &EventId("01J-gap".into())),
+            "the gapped event_id is still FRESH — it was never marked handled"
+        );
     }
 
     /// An off-whitelist message routed to the consumer is surfaced as a dead-letter, never

@@ -150,6 +150,27 @@
 //! SUB-D2 in EB-05/P-009): the same `(consumer, event_id)` inserted twice yields one row and the
 //! handler runs once (the `ON CONFLICT DO NOTHING` property).
 //!
+//! ## Status (P-S09, 2026-06-19) — the schema-evolution upcaster registry (forward-only, 2.8)
+//! The `(type, from_ver) → to_ver` upcaster registry ([`upcast::UpcasterRegistry`]) is
+//! **implemented** (contract 2.8). It holds, per event type, the adjacent `v → v+1` PURE shape
+//! transforms and composes them into a forward-only chain ([`upcast::UpcasterRegistry::upcast`])
+//! that lifts an old envelope to the current `schema_ver` BEFORE `handle`. Three rules are
+//! encoded: forward-only one-step hops (a backwards/skipping/duplicate hop is rejected loudly at
+//! [`upcast::UpcasterRegistry::register`]); an unbridgeable gap is a loud
+//! [`upcast::UpcastError::UnbridgeableGap`] → the consumer dead-letters it
+//! ([`HandleOutcome::NonRetryable`] / DLQ), NEVER a silent drop and NEVER the wrong shape handed
+//! to a handler; the transforms are pure (deterministic, no side effects → reindex-from-source ==
+//! live). The consumer seam ([`consumer::Consumer::with_upcaster`]) is now **fallible**:
+//! [`upcast::UpcasterRegistry::into_hook`] installs the registry, and the runtime turns a gap into
+//! a dead-letter. The CDC + unit tests live in [`upcast`] (`tests`) and
+//! [`consumer`] (`unbridgeable_gap_dead_letters_loudly_never_silently_passes`).
+//!
+//! **Reconciliation (EI-01 §7):** EB-10 (P-046) is the event-bus framing of this SAME row-2.8
+//! deliverable (the run order interleaves the substrate + event-bus roadmaps); it reconciles in
+//! place against this module (the file it names — `upcast.rs` — is [`upcast`]) by adding the
+//! Bus-flavoured `v1→v2→v3`-chain / un-upcastable→DLQ / unknown-forward-field tests + the 2.8
+//! CDC pair — no second registry, no type re-definition.
+//!
 //! ## Floors named (stubbed bodies → filling prompt)
 //! - **The OLTP binding is modeled in-memory at M0.** There is no live database (the OLTP tier
 //!   client is **P-007 / P-ST-01**; the migration runner is **P-S15**). [`outbox::OUTBOX_MIGRATION`]
@@ -175,8 +196,9 @@
 //!   re-confirms SUB-D1 end-to-end through a consumer). The `consumer_dedup` ledger (2.5, the
 //!   effectively-once anchor) shipped with it and was given its named home in [`dedup`] by
 //!   **EB-06 / P-015** (the reconciliation Status block above). The upcaster registry (2.8) the
-//!   runtime calls before `handle` is **P-S09** — the [`consumer::Consumer::with_upcaster`] hook
-//!   is its install seam; identity map until then.
+//!   runtime calls before `handle` **shipped in P-S09** ([`upcast::UpcasterRegistry`]); the
+//!   [`consumer::Consumer::with_upcaster`] hook is its (now fallible) install seam, and an
+//!   unbridgeable gap dead-letters loudly. EB-10 (P-046) reconciles in place against [`upcast`].
 //! - `pii_key_ref`'s KMS hierarchy (the DEK epochs) is Storage M1 (11.3); P-001 ships
 //!   only the field + its format.
 //! - **The metrics-health PORT + the producer-side clock (P-014/EB-11).** [`telemetry`] ships
@@ -195,12 +217,14 @@ pub mod envelope;
 pub mod outbox;
 pub mod relay;
 pub mod telemetry;
+pub mod upcast;
 
 pub use consumer::{
     Consumer, ConsumerName, DeadLetter, Delivered, Message, PrefetchBound, SubscribeError,
     Subscription,
 };
 pub use dedup::{DedupLedger, CONSUMER_DEDUP_MIGRATION};
+pub use upcast::{RegisterError, UpcastError, UpcasterRegistry};
 pub use telemetry::{
     BusObservations, BusSignal, BusSignals, MetricLabel, MetricRecorder, MetricSample, MetricsSink,
 };
