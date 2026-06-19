@@ -1,0 +1,55 @@
+# Myelin INTEGRATION GATE — the committed band-boundary gate over the REAL backends (Stage 4).
+#
+# This is the ratchet for the testing-policy change: every DB / storage / cache / bus prompt ships
+# a REAL integration test, and the infra scorecard rows stay RED-until-proven. The gate brings the
+# dev data-layer stack up (Postgres / RustFS / Valkey / NATS JetStream), runs the workspace
+# `--features integration` suite, then the infra scorecard runner — which writes
+# testing/scorecards/infra.md and EXITS NON-ZERO on any missing or claimed-not-proven row.
+#
+# LOUD: the gate is `scripts/integration-test.sh`'s exit code (the suite's exit + the scorecard
+# binary's exit). There is deliberately NO `|| true` / `continue-on-error` — an uncommitted gate is
+# no gate (EI-01 §5). Prod is a CONFIG SWAP: the same suite runs against Scaleway (fr-par) Managed
+# PostgreSQL / Object Storage / Managed Redis + the NATS container by pointing the env at prod.
+#
+# The two genuine floors (real-kernel SANDBOX-ESCAPE on gVisor/microVM, and the WORLD-SCALE 30×
+# LOAD on real hardware) stay RED with their floor NAMED; their containerized smokes run here so
+# they are not zero-coverage. The DB-free CI (.github/workflows/ci.yml) stays green + DB-free —
+# this workflow is the ONLY one that needs a live stack + Docker-in-Docker.
+name: integration
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # The dev env-var contract the myelin-config layer points at (the docker-compose dev defaults).
+  DATABASE_URL: postgres://myelin_app:myelin_app_pw@localhost:5433/myelin
+  S3_ENDPOINT: http://localhost:9000
+  S3_REGION: fr-par
+  S3_ACCESS_KEY: myelin_dev_access
+  S3_SECRET_KEY: myelin_dev_secret
+  S3_BUCKET: myelin-dev
+  REDIS_URL: redis://localhost:6380
+  NATS_URL: nats://localhost:4222
+  MYELIN_REGION: fr-par
+
+jobs:
+  integration:
+    # The committed integration ratchet. The runner has Docker available; the script brings the
+    # stack up `--wait`, runs `cargo test --features integration`, then the infra scorecard binary.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: The integration gate — up --wait → cargo test --features integration → infra scorecard (loud, non-zero on any red row)
+        run: scripts/integration-test.sh --down
+      - name: Upload the dated infra scorecard artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: infra-scorecard
+          path: testing/scorecards/infra.md
+          if-no-files-found: warn
