@@ -13,7 +13,11 @@
 //! layer 4 (the gateway rejects a misroute), with **no cross-region query path for personal data**;
 //! see [`four_layer`]). The live store-layer twin (the Postgres RLS `WITH CHECK` on `region`) is
 //! proven against the dev stack in the storage `stor_d5_cross_region_egress` integration drill
-//! (CP-D3 + STOR-D5).
+//! (CP-D3 + STOR-D5)), and **P-CP-13 / P-097** (**self-host parity** — the degenerate one-cell
+//! control plane [`DegenerateControlPlane`] runs the IDENTICAL `discover`/`place`/`placement_of`/
+//! `residency_verify` + four-layer code path over a one-row registry; the `residency-pin` lint holds
+//! and CP-D3 runs green on the degenerate cell; `residency_verify` is green on the install's own data;
+//! managed-fleet-only features are N/A by definition, not a gap; see [`self_host`]).
 //!
 //! **Owning architecture doc:**
 //! `planning/05-refined-shared-systems-architecture/tenancy-and-control-plane.md`
@@ -136,6 +140,7 @@ pub mod provision;
 pub mod registry;
 pub mod residency_verify;
 pub mod schema;
+pub mod self_host;
 
 pub use discover::{DiscoverKey, DiscoveryCache, DiscoverySignals, RouteTuple};
 pub use four_layer::{
@@ -157,6 +162,7 @@ pub use holder::{
     CONTROL_PLANE_STORE,
 };
 pub use registry::{PlacementError, Registry};
+pub use self_host::DegenerateControlPlane;
 pub use residency_verify::{
     residency_verify, ResidencyAttestationSignal, ResidencyMismatch, ResidencySigningKey,
     ResidencyStoreClass, SignedAttestation, StoreRegionReport,
