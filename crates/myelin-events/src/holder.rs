@@ -54,8 +54,12 @@
 //!   STOR-D4). Here the live-store leg is proven (DEK destroyed → live payload unrecoverable +
 //!   tombstones present); the *.erased key is excluded from backups by `KmsEngine::backup_snapshot`
 //!   construction (storage §7.5) — re-confirmed against a real restored copy at M5.
-//! - **Post-restore re-erasure** (the erasure ledger so the key STAYS destroyed across a restore) is
-//!   the immediate follow-on **EB-16 (P-093)** — it re-applies THIS module's [`BusHolder::erase`].
+//! - **Post-restore re-erasure** (the erasure ledger so the key STAYS destroyed across a restore)
+//!   **SHIPPED in EB-16 (P-093)**: [`crate::reerase`] adds the Bus's PII-free non-shred-erasable
+//!   [`crate::reerase::BusErasureLedger`] (contract 10.8, CONSUMED) + [`BusHolder::re_erase_after_restore`],
+//!   which re-applies THIS module's [`BusHolder::erase`] over the ledger after a restore (proven: 0
+//!   resurrected keys post-restore). The cross-seam restore TRIGGER (Storage 11.5) is the floor
+//!   P-ST-14 (P-100) + the GDPR global-ledger adapter is P-GA-06 (P-106).
 //! - **The [OPEN — LEGAL] residual lawful-basis** (third-party PII a person typed into another's
 //!   content) is the ONE platform posture (10.9, X-7, `00-reconciliation §X-7`) — handled by the
 //!   GDPR/legal track, **not restated here**; the structural floor ships regardless.
@@ -282,7 +286,9 @@ pub struct EraseReceipt {
 pub struct BusHolder<S: InlinePiiShredder> {
     tenant: TenantId,
     region: Region,
-    shredder: S,
+    /// `pub(crate)` so the EB-16 [`crate::reerase`] post-restore re-erasure hook can probe key
+    /// liveness (`is_live`) through the SAME shred seam the live erase uses (cold == live, EI-01 §7).
+    pub(crate) shredder: S,
 }
 
 impl<S: InlinePiiShredder> BusHolder<S> {

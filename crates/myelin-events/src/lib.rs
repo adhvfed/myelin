@@ -239,9 +239,27 @@
 //! uses for the §10.2 `SignalName` enum and [`crosscell`] for `CrossCellPointer`. The H8 (event-bus)
 //! holder slot in the H1–H18 catalog (`myelin-substrate`, P-S27) is what this module resolves to.
 //! **FLOORS named:** the *reaches-backups* leg of BUS-D8 is the M5 follow-on **EB-29**; **post-restore
-//! re-erasure** (the key stays destroyed across a restore) is the immediate follow-on **EB-16 (P-093)**,
-//! which re-applies [`holder::BusHolder::erase`] (idempotent — proven here); the **[OPEN — LEGAL]**
-//! residual lawful-basis is the ONE platform posture (10.9, X-7), GDPR/legal track, NOT restated here.
+//! re-erasure** (the key stays destroyed across a restore) **SHIPPED in EB-16 (P-093)** — see the next
+//! Status block; the **[OPEN — LEGAL]** residual lawful-basis is the ONE platform posture (10.9, X-7),
+//! GDPR/legal track, NOT restated here.
+//!
+//! ## Status (P-093 / EB-16, 2026-06-19) — the erasure-ledger post-restore re-erasure hook
+//! EB-16 ships [`reerase`] — the hook that keeps an erased subject's inline-PII key DESTROYED across a
+//! backup restore (external-insights/04 §1; Bus §4.8 post-restore re-erasure fan-out). An append-only
+//! log lives in backups too, so a restore of a backup taken BEFORE an erase can resurrect a still-live
+//! DEK. The resolution (contract **10.8 CONSUMED** + **11.5** cross-seam, the SAME shape identity's
+//! `PseudonymErasureLedger`/`re_erase_after_restore` uses, cold == live): a PII-free,
+//! non-shred-erasable [`reerase::BusErasureLedger`] durably records which opaque subject was erased +
+//! which key refs were shredded; after a restore, [`holder::BusHolder::re_erase_after_restore`]
+//! replays it — re-running the IDENTICAL [`holder::BusHolder::erase`] crypto-shred (idempotent) over
+//! every ledger-listed subject — returning a [`reerase::ReErasureReceipt`] proving **0 resurrected**
+//! inline-PII keys post-restore. The Bus's leg of the **STOR-D1/D2** restore-verify cross-seam is
+//! green (`tests/drills_bus_d8_reerase_after_restore.rs`: 0 resurrected + nothing lost, bridged into
+//! the §10.2 harness assertion library); the 10.8 consumer-side CDC is
+//! `tests/cdc_10_8_bus_reerase.rs`. **FLOORS named:** row 10.8 stays `deferred` (landing P-115 — the
+//! GDPR provider mints/owns the global ledger; this ships the Bus's CONSUMER-SIDE participation); the
+//! cross-seam restore TRIGGER (Storage calling every holder's re-erase over the global ledger) is
+//! **P-ST-14 (P-100)** + **P-GA-06 (P-106)**. This completes B-M1 for the Bus.
 //!
 //! ## Floors named (stubbed bodies → filling prompt)
 //! - **The OLTP binding is modeled in-memory at M0.** There is no live database (the OLTP tier
@@ -296,6 +314,7 @@ pub mod holder;
 pub mod nats;
 pub mod outbox;
 pub mod partition;
+pub mod reerase;
 pub mod relay;
 pub mod residency;
 pub mod taxonomy;
@@ -346,6 +365,11 @@ pub use crosscell::{
 /// seam (real backing `myelin_storage::kms::KmsEngine::destroy_dek`, downstream — floor named in the
 /// [`holder`] module) and emitting `*.erased` tombstones through the outbox. FLOORS: the
 /// `impl gdpr::PersonalDataHolder` adapter is P-GA-06; the reaches-backups leg of BUS-D8 is EB-29.
+/// EB-16 (P-093): the erasure-ledger post-restore re-erasure hook (contract 10.8 CONSUMED, 11.5
+/// cross-seam). [`reerase::BusErasureLedger`] is the Bus's PII-free, non-shred-erasable slice of the
+/// erasure ledger; [`holder::BusHolder::re_erase_after_restore`] replays it after a restore so the
+/// key STAYS destroyed across a restore ([`reerase::ReErasureReceipt`] proves 0 resurrected).
+pub use reerase::{BusErasureLedger, ErasedSubject, ReErasureReceipt};
 pub use holder::{
     degrade_on_tombstone, BusEventLog, BusHolder, EraseReceipt, ExportedEvent, InMemoryShredder,
     InlinePiiShredder, LocateReport, LocatedEvent, ShredError, BUS_ERASED_TYPE, ERASED_EVENT_NAME,

@@ -603,6 +603,12 @@ landing = "P-153"
 row = "10.8"
 title = "erasure ledger"
 status = "deferred"
+# The erasure ledger (PII-free, non-shred-erasable) is OWNED by GDPR/Audit; the full provider+consumer
+# pair (GDPR mints + owns the GLOBAL ledger) lands at P-115 (GA-15) — the row stays `deferred` until then.
+# The Bus CONSUMES it: EB-16 / P-093 ships the Bus's consumer-side participation (its PII-free
+# BusErasureLedger slice + BusHolder::re_erase_after_restore so the key stays destroyed across a restore)
+# with its own consumer-side CDC + drill (crates/myelin-events/tests/cdc_10_8_bus_reerase.rs +
+# drills_bus_d8_reerase_after_restore.rs). The cross-seam restore TRIGGER is P-ST-14 (P-100).
 landing = "P-115"
 
 [[contract]]
