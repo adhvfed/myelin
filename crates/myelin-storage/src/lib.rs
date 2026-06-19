@@ -59,8 +59,14 @@
 //!   then** (the M1 STOR-D1 restore-verify gate enforces it). This is the plaintext-at-rest
 //!   floor the prompt requires recorded in writing — recorded HERE.
 //! - **The outbox CO-LOCATION** (the outbox table living in this OLTP DB + the
-//!   same-transaction co-commit) is the SIBLING prompt **P-ST-02** (global P-016). This
-//!   crate exposes the pool the outbox table will join; the co-commit body is P-ST-02.
+//!   same-transaction co-commit) — the SIBLING prompt **P-ST-02** (global P-016) — is now
+//!   IMPLEMENTED in [`coloc`]: [`ColocatedOltp`] owns the outbox in the same service DB
+//!   (its migration set carries [`coloc::COLOCATED_OUTBOX_MIGRATION`]) and [`ColocatedTx`]
+//!   co-commits a domain-state write and the outbox insert in one transaction (both commit /
+//!   both roll back). The per-aggregate `seq` it establishes is the §7.3 cross-seam cursor
+//!   restore consumes (forward dependency **P-ST-14**, global P-100). The outbox *mechanism*
+//!   (table DDL + `OutboxTx::emit` + the relay) is reused from `myelin-events` (P-008/P-012/
+//!   P-013), never re-defined — this prompt adds only the OLTP co-location binding.
 //! - **A real Postgres pool.** The substrate's `serve(AppSpec)` DB-pool body is itself a
 //!   `todo!()` floor (P-S12/P-S15). This crate's [`OltpPool`] is therefore a
 //!   backend-agnostic, in-memory-testable pool MODEL (bounded permits + statement-timeout
@@ -71,10 +77,12 @@
 //! - **`PersonalDataHolder` BODIES** (locate/export/rectify/restrict/erase) are the GDPR
 //!   M1 deliverable; here only the **registration hook fires** (1.4) — see [`holder`].
 
+pub mod coloc;
 pub mod holder;
 pub mod oltp;
 pub mod rls;
 
+pub use coloc::{ColocError, ColocatedOltp, ColocatedTx, COLOCATED_OUTBOX_MIGRATION};
 pub use holder::{register_holder, OltpHolderRegistration, OltpStoreHolder};
 pub use oltp::{OltpConfig, OltpError, OltpPool, PermitGuard};
 pub use rls::{RlsError, TenantQuery, TenantScope, TenantTable};
