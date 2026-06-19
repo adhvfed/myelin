@@ -52,6 +52,17 @@
 //! Bus-flavoured tests it owns (the `v1→v2→v3` chain at consume, the un-upcastable→DLQ assertion,
 //! the unknown-forward-added-field tolerance) and the provider+consumer CDC pair for 2.8 — no
 //! second registry, no type re-definition.
+//!
+//! **P-046 / EB-10 confirmation (2026-06-19).** Executed as a CONFIRM-in-place: the EB-10
+//! DELIVERABLE (`upcast.rs` — the `(type, from_ver) → to_ver` pure-fn registry, the
+//! expand→migrate→contract forward-only discipline, un-upcastable→DLQ-never-silently-dropped) and
+//! its TESTS (the `v1→v2→v3` consume-time chain → current shape, the un-upcastable→DLQ with 0
+//! silently dropped, the unknown-forward-added-field tolerance, the 2.8 provider+consumer CDC pair
+//! `tests/cdc_2_8_upcaster.rs`) were ALL already shipped by P-S09/P-029 and were verified green
+//! again under P-046 (registry unit tests + the `consumer::tests::unbridgeable_gap_dead_letters_…`
+//! runtime DLQ test + the CDC pair + the contract-coverage gate for row 2.8). Adding a second
+//! registry or a parallel test surface would violate EI-01 §7 (never duplicate a frozen type), so
+//! P-046 adds no net-new code beyond this confirmation note.
 
 use std::collections::HashMap;
 
