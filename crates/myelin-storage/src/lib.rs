@@ -86,10 +86,24 @@
 //!   [`blob::IdentityWrap`] floor → real DEK wrap at **P-ST-08 (P-095)**; the fs backing →
 //!   **object-store (MinIO/Ceph) at P-ST-30 (P-636)**; the BlobStore crypto-shred DSR body →
 //!   GDPR M1 (P-ST-09). The BlobStore registers as a holder via the [`holder`] seam.
+//! - **The [`migration::OnlineMigrationRunner`] (P-ST-05 / contract 1.5)** is now IMPLEMENTED in
+//!   [`migration`]: the forward-only ONLINE migration runner for the OLTP tier — it admits ONLY the
+//!   online shape (expand→backfill→contract), rejecting a **contract-before-backfill ordering** at
+//!   runtime (the P-ST-05 GATE) as well as a destructive `DROP`, a blocking `ALTER` on a declared-
+//!   hot table, and a `Plain` migration touching a hot table (a hot-table change MUST use the online
+//!   path). It RECONCILES with the substrate boot-time runner (P-S15/P-032 in `myelin-substrate`):
+//!   the substrate owns the forward-only refusal mechanism, this adds the ordering enforcement the
+//!   substrate runner lacks; the two share the contract-1.5 phase/hot-table vocabulary (re-stated,
+//!   not imported, because the crate DAG forbids a `myelin-storage → myelin-substrate` edge — see
+//!   the DEVIATION note above). **Floor named in [`migration`]:** STOR-D8 (online migration under
+//!   load on the RESTORED copy, lock-budget measured) is the M2 follow-on **P-ST-21 (global P-126)**
+//!   — it needs the restored copy restore-verify produces; here the runner exists + admits only the
+//!   online shape at unit scale. The mutation floor on the ordering gate is ≥ 80% (mandatory-core).
 
 pub mod blob;
 pub mod coloc;
 pub mod holder;
+pub mod migration;
 pub mod oltp;
 pub mod rls;
 
@@ -99,5 +113,9 @@ pub use blob::{
 };
 pub use coloc::{ColocError, ColocatedOltp, ColocatedTx, COLOCATED_OUTBOX_MIGRATION};
 pub use holder::{register_holder, BlobStoreHolder, OltpHolderRegistration, OltpStoreHolder};
+pub use migration::{
+    is_blocking_alter, is_destructive, HotTables, Migration, MigrationError, MigrationPhase,
+    Migrations, OnlineMigrationRunner, PhaseProgress,
+};
 pub use oltp::{OltpConfig, OltpError, OltpPool, PermitGuard};
 pub use rls::{RlsError, TenantQuery, TenantScope, TenantTable};
