@@ -21,6 +21,16 @@
 //! block unboundedly (an unbounded wait turns one slow query into a whole-pool stall, the
 //! cascade §1.1 forbids). The rejection is the `PoolSaturation` survival signal the
 //! bounded-pool drill reads.
+//!
+//! ## `residency-pin` lint — NAMED M0 FLOOR (`@residency-cell-pinned:file`)
+//! The `residency-pin` architecture lint (P-S11 → P-018, SHARPENED to the real OLTP constructor
+//! in P-ST-04 → P-020) requires every store/pool construction to pin a `Region`. This file is the
+//! **M0 region-less pool MODEL**: on this floor the pool layer is region-agnostic (the cell's
+//! region pins data OUT-OF-BAND — the per-query `(tenant, region)` `TenantScope` in [`crate::rls`]
+//! carries the region; a per-POOL runtime region-pin lands end-to-end in **P-ST-15 / P-102**,
+//! the STOR-D5 gate). The file-level lint waiver marker `@residency-cell-pinned:file` records this
+//! floor LOUDLY (EI-01 §4 — named, never a silent skip); the lint stays fully live on every
+//! caller/application file and fires on any UNMARKED region-less store open.
 
 /// The validated OLTP pool config (storage §3.1; contract 1.1 config). Read from the
 /// service's `AppSpec` config and **validated at boot** (fast-fail on a nonsensical

@@ -19,6 +19,15 @@
 //! implementation) this prompt does **NOT** re-define the outbox table, the emit trait, or
 //! the seq allocator — it **reuses** them in place.
 //!
+//! ## `residency-pin` lint — NAMED M0 FLOOR (`@residency-cell-pinned:file`)
+//! This module opens the co-located OLTP pool ([`ColocatedOltp::open`] → [`crate::oltp::OltpPool`]).
+//! The `residency-pin` lint (P-S11 → P-018, SHARPENED to the real OLTP constructors in
+//! P-ST-04 → P-020) requires a `Region` on every store construction. Like [`crate::oltp`] this is
+//! the **M0 region-less pool MODEL** — the cell's region pins data via the per-query
+//! `(tenant, region)` `TenantScope`; the per-POOL runtime region-pin lands end-to-end in
+//! **P-ST-15 / P-102** (STOR-D5). The file-level waiver marker `@residency-cell-pinned:file` records
+//! this floor LOUDLY (EI-01 §4 — named, never a silent skip).
+//!
 //! What P-ST-02 is genuinely about — and what is **new here** — is the **co-location**: the
 //! outbox table living in the **same OLTP service database** as the state change, so a single
 //! OLTP transaction carries *both* the domain state write *and* the outbox insert. That is the

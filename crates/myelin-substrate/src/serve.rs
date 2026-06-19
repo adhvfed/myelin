@@ -540,6 +540,10 @@ pub fn boot(spec: AppSpec) -> Result<ServeHandle, ServeError> {
 
     // (1) boot — validate config (§3.2, fail fast) + open the bounded OLTP pool (§3.3).
     let pool_config = oltp_config_from(&config)?;
+    // @residency-cell-pinned — NAMED M0 FLOOR (residency-pin lint, P-ST-04 → P-020): the boot pool
+    // is the M0 region-less pool MODEL; the cell's region pins data via the per-query
+    // `(tenant, region)` `TenantScope`. The per-POOL runtime region-pin lands end-to-end in
+    // P-ST-15 / P-102 (STOR-D5). Loud, named waiver (EI-01 §4), not a silent skip.
     let pool = OltpPool::open(pool_config)
         .map_err(|e| ServeError(format!("failed to open the OLTP pool at boot: {e}")))?;
 

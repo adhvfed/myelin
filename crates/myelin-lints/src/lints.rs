@@ -574,23 +574,45 @@ pub fn no_cross_sync_cycle() -> Lint {
 ///
 /// **Rule.** Every store/stream/index/cache declares a region; **no global pool**; outbound
 /// transfer is gated. **Fingerprint scanned:** a store/stream/index/cache CONSTRUCTION
-/// (`PgPool::connect(`, `OltpStore::open(`, `BlobStore::`, `IndexBackend::`, `CacheClient::new(`,
-/// a `Stream::` declaration) on a statement that does NOT also pin a `Region` (`Region`,
-/// `region:`, `.region(`, `.pinned_to(`, `ResidencyTag`). A global (region-less) pool is the
-/// data-leaves-its-region bug class.
+/// (`PgPool::connect(`, `OltpPool::open(`, `ColocatedOltp::open(`, `BlobStore::`, `IndexBackend::`,
+/// `CacheClient::new(`, a `Stream::` declaration) on a statement that does NOT also pin a `Region`
+/// (`Region`, `region:`, `.region(`, `.pinned_to(`, `ResidencyTag`). A global (region-less) pool is
+/// the data-leaves-its-region bug class.
 ///
 /// **Floor (named).** The store-construction surface is M1 (the OLTP client P-ST-01, BlobStore
 /// P-ST-03, the index backends). This scanner ships the gate now keyed to those constructor
 /// fingerprints; it tightens (adds each concrete constructor) as the stores land. The
 /// `residency-pin` STORAGE-half twin is also shipped in P-ST-04 / P-020 over the storage crate.
+///
+/// **P-ST-04 / P-020 sharpening (the Storage-relevant slice; coherence rule EI-01 §7).** The
+/// residency-pin lint was first shipped by the substrate prompt P-S11 → P-018 keyed to *hypothetical*
+/// store constructors (`OltpStore::open(`, `PgPool::connect(`). The OLTP tier client it constrains
+/// landed in P-ST-01 → P-007 (`myelin-storage`), whose REAL caller-facing store constructors are
+/// [`myelin_storage::OltpPool::open`] / [`myelin_storage::ColocatedOltp::open`]. Rather than
+/// duplicate a second residency scanner, P-ST-04 EXTENDS the in-place fingerprint set with those two
+/// real constructors (replacing the placeholder `OltpStore::open(`), so a caller opening the OLTP
+/// store WITHOUT pinning a `Region` on the same construction statement is rejected. The lint is
+/// SHARPENED (it now constrains the real surface), never weakened (EI-01 §5).
+///
+/// **Floor (named) — the runtime region-pin is M1.** Enforcing region-pinning end-to-end on the
+/// store *runtime* (the `(tenant, region)` pin flowing through every write so a cross-region write
+/// is impossible by construction, STOR-D5) is the M1 prompt **P-ST-15 / P-102**. On the M0 floor the
+/// `myelin-storage` pool MODEL is region-agnostic at the pool layer (region lives in the per-query
+/// `(tenant, region)` `TenantScope`); the storage crate's own internal pool wiring is therefore
+/// admitted today (see `tests/storage_lints.rs`, which proves the lint REJECTS a region-less *caller*
+/// open and ADMITS a region-pinned one). The fingerprint is live NOW so the moment a caller opens a
+/// store without a region, the gate fires.
 pub const RESIDENCY_PIN: LintId = LintId("residency-pin");
 
 fn scan_residency_pin(src: &str) -> Vec<Violation> {
-    // Store/stream/index/cache construction fingerprints that MUST pin a region.
+    // Store/stream/index/cache construction fingerprints that MUST pin a region. The OLTP entries
+    // are the REAL `myelin-storage` constructors (P-ST-01 → P-007; sharpened in P-ST-04 → P-020):
+    // a caller opening the OLTP store/pool must pin a `Region` on the same construction statement.
     const STORE_SITES: &[&str] = &[
         "PgPool::connect(",
         "PgPoolOptions::",
-        "OltpStore::open(",
+        "OltpPool::open(",       // the real OLTP pool constructor (myelin-storage, P-ST-01).
+        "ColocatedOltp::open(",  // the real co-located OLTP+outbox store constructor (P-ST-02).
         "BlobStore::open(",
         "IndexBackend::open(",
         "CacheClient::new(",
@@ -605,6 +627,25 @@ fn scan_residency_pin(src: &str) -> Vec<Violation> {
         "ResidencyTag",
         "residency",
     ];
+    // The P-ST-04 / P-020 NAMED-FLOOR waiver marker. A construction site flagged
+    // `@residency-cell-pinned` (in a trailing/adjacent comment) is admitted because the cell's
+    // region pins it OUT-OF-BAND on the M0 floor (the per-query `(tenant, region)` `TenantScope`
+    // carries the region; the per-pool runtime region-pin lands end-to-end in P-ST-15 / P-102,
+    // STOR-D5). This is a LOUD, REVIEWED, NAMED waiver in source (EI-01 §4 — named, never a silent
+    // skip), NOT a weakening: an UNMARKED region-less store open still fires. The marker lives in a
+    // COMMENT (stripped from `code`), so it is matched against the RAW line text, not the code line.
+    const WAIVER_MARKER: &str = "@residency-cell-pinned";
+    // A FILE-level waiver: a module whose docs carry `@residency-cell-pinned:file` declares the
+    // WHOLE file is the M0 region-less pool MODEL (the storage substrate P-ST-15 region-pins). This
+    // is the same file-marker discipline `flow-determinism` (`@workflow-body`) /
+    // `no-cross-sync-cycle` (`@identity-sink`) use — a loud, named, reviewed floor, not a silent
+    // skip. The lint stays fully live on every OTHER (caller/application) file.
+    const WAIVER_MARKER_FILE: &str = "@residency-cell-pinned:file";
+    if src.contains(WAIVER_MARKER_FILE) {
+        return Vec::new();
+    }
+    // Raw (comment-included) lines so the waiver marker — which lives in a comment — is visible.
+    let raw_lines: Vec<&str> = src.lines().collect();
     let mut out = Vec::new();
     for (line, code) in code_statements(src) {
         let is_store = STORE_SITES.iter().any(|s| code.contains(s));
@@ -612,7 +653,34 @@ fn scan_residency_pin(src: &str) -> Vec<Violation> {
             continue;
         }
         let is_pinned = REGION_BINDERS.iter().any(|b| code.contains(b));
-        if !is_pinned {
+        // A statement starts at `line` (1-based); the per-site waiver marker lives in the comment
+        // block IMMEDIATELY above the construction (or trailing on its line). Scan the raw text on
+        // the statement's start line and a small window of lines just above it (a contiguous run of
+        // comment lines — the conventional place for a reviewed, named waiver). The window stops at
+        // the first non-comment, non-blank line so a marker on an UNRELATED earlier statement does
+        // not leak its waiver downward.
+        const WAIVER_LOOKBACK: usize = 8;
+        let idx = line.saturating_sub(1);
+        let here = raw_lines.get(idx).is_some_and(|l| l.contains(WAIVER_MARKER));
+        let mut above = false;
+        let mut i = idx;
+        for _ in 0..WAIVER_LOOKBACK {
+            let Some(j) = i.checked_sub(1) else { break };
+            i = j;
+            let Some(raw) = raw_lines.get(i) else { break };
+            let t = raw.trim();
+            if t.contains(WAIVER_MARKER) {
+                above = true;
+                break;
+            }
+            // Stop at the first line that is neither blank nor a comment (the waiver must be in the
+            // comment block directly attached to THIS construction, not an earlier statement).
+            if !t.is_empty() && !t.starts_with("//") {
+                break;
+            }
+        }
+        let waived = here || above;
+        if !is_pinned && !waived {
             out.push(Violation {
                 lint: RESIDENCY_PIN,
                 line,

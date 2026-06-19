@@ -1,0 +1,7 @@
+-- RED fixture for `forward-only-migration` — the STORAGE-relevant slice (P-ST-04 / P-020). The
+-- lint MUST reject this. The two DDL statements below REWRITE a column in place and then drop the
+-- old column before any backfill: the destructive / contract-before-backfill bug class the storage
+-- migration runner (P-ST-05) admits ONLY as expand-then-backfill-then-contract. A destructive
+-- in-place rewrite on a hot table stalls writes under load (STOR-2, §9).
+ALTER TABLE principals ALTER COLUMN email TYPE TEXT;
+DROP COLUMN email_old;
