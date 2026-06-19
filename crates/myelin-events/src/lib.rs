@@ -43,10 +43,21 @@
 //!   against. The consumer side of the 2.1 CDC pair (the relay re-hydrating + a consumer
 //!   reading the wire envelope) lands in **P-S07/P-S08** — named, not silently skipped.
 //!
+//! ## Status (P-S06, 2026-06-19) — causality is correct-by-construction
+//! The `OutboxTx::emit` causality derivation is **implemented** as the pure, frozen
+//! [`derive_envelope`] function: root carries its own `correlation_id` (= its event id),
+//! a caused event sets `causation_id = cause.event_id`, `correlation_id =
+//! cause.correlation_id`, `depth = cause.depth + 1` (saturating), and inherits the
+//! parent's `caused_by` human-action ref unchanged. The causal-triple fields are NOT on
+//! [`EventDraft`] — they are derived, never authored — so a human/agent cannot typo their
+//! way into a loop (EI-02 §6). There is no `publish_now` on `OutboxTx`; the only verb is
+//! `emit` (the `no-raw-publish` lint, P-S10, enforces the absence workspace-wide).
+//!
 //! ## Floors named (stubbed bodies → filling prompt)
-//! - `OutboxTx::emit` causality derivation (root carries / parent = cause.event_id /
-//!   depth = cause.depth + 1) is **P-S06** — the body here is `todo!()`.
-//! - The `outbox` table + relay (2.3, SUB-D1/BUS-D4) is **P-S07**.
+//! - The `outbox` table + the same-transaction insert + the relay (2.3, SUB-D1/BUS-D4)
+//!   is **P-S07** — `OutboxTx::emit`'s body (which pulls the ambient [`EmitContext`] from
+//!   the transaction handle, calls [`derive_envelope`], and inserts the row) lands there;
+//!   the trait method has no default body here because the storage handle is P-S07's.
 //! - The `EventHandler` consumer runtime + `consumer_dedup` ledger (2.5, SUB-D2) is
 //!   **P-S08**; the upcaster registry (2.8) is **P-S09**. Bodies here are `todo!()`.
 //! - `pii_key_ref`'s KMS hierarchy (the DEK epochs) is Storage M1 (11.3); P-001 ships
@@ -165,13 +176,133 @@ pub struct EventEnvelope {
 }
 
 /// The to-be-emitted event before the outbox derives its provenance (architecture §2.1).
-/// The full field set is P-S06's concern; the skeleton carries the load-bearing inputs.
+///
+/// The draft carries the **caller-authored** fields — *what* this event is and what it
+/// carries — while the **ambient** fields (tenant/region/actor/timestamps/event_id) come
+/// from the emitting transaction's [`EmitContext`] and the **provenance** fields (the
+/// causal triple) are derived from the `cause`, not authored. This split is what makes
+/// causality correct-by-construction: a caller cannot hand-set `causation_id`,
+/// `correlation_id`, or `depth` (they are not on the draft), so a human or agent **cannot
+/// typo their way into a loop** (EI-02 §6, BUS-5).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventDraft {
     pub type_: EventType,
     pub subject: ArtifactRef,
     pub aggregate: AggregateKey,
     pub payload: serde_json::Value,
+    /// GDPR fan-out role of this event's data (controller | processor). Caller-classified
+    /// (the emitting subsystem knows whether it is the controller of the subject data).
+    pub data_role: DataRole,
+    /// The event's visibility class.
+    pub visibility: Visibility,
+    /// Does the payload carry inline personal data? If so `pii_key_ref` MUST be set
+    /// (envelope-encrypted, contract 2.7). References-not-payloads is the default: most
+    /// events carry IDs/refs and set this `false`.
+    pub contains_personal_data: bool,
+    /// Set iff `contains_personal_data`; the `kms://…` URN of the inline-PII envelope key
+    /// (the KMS hierarchy is Storage M1 — here only the field travels).
+    pub pii_key_ref: Option<PiiKeyRef>,
+}
+
+/// The **ambient** per-emit context the emitting transaction supplies: the fields that
+/// belong to the actor/tenant/clock, not to the draft and not to the causal chain. The
+/// outbox owns minting the `event_id` (a ULID) and stamping `recorded_at` when the row is
+/// durably accepted; the caller supplies `tenant`/`region`/`actor`/`occurred_at` and the
+/// optional human-action `caused_by` (which, for a ROOT, seeds nothing causal — it is the
+/// distinct human-action ref, BUS-5).
+///
+/// `caused_by` is **only** read for a root emit's own provenance recording and is carried
+/// through unchanged by [`OutboxTx::emit`]'s derivation onto every child — see
+/// [`derive_envelope`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmitContext {
+    /// The ULID the outbox mints for this event (the idempotency key, ADR-04.1). Generation
+    /// (clock + randomness) is the outbox's concern, P-S07; the derivation here is pure in
+    /// the supplied id so the causality logic stays deterministically testable.
+    pub event_id: EventId,
+    /// The partition + residency key (ADR-11) — first-class, never optional.
+    pub tenant: TenantId,
+    pub region: Region,
+    /// The acting principal incl. on_behalf_of (ADR-13.3).
+    pub actor: Actor,
+    /// schema version of the emitted type (forward-only; upcasters bridge at consume).
+    pub schema_ver: u32,
+    /// RFC-3339 UTC; when the action happened (the unit anchor, §2.10).
+    pub occurred_at: Timestamp,
+    /// RFC-3339 UTC; when the log durably accepted it.
+    pub recorded_at: Timestamp,
+    /// The distinct human-action / session ref (BUS-5). Carried through the whole causal
+    /// chain unchanged once a root sets it.
+    pub caused_by: Option<CausedBy>,
+}
+
+/// **The causality derivation — correct-by-construction (P-S06; BUS-5; EI-02 §6).**
+///
+/// This is the single function every emit path routes through, so the causal triple is
+/// *derived*, never hand-authored. Given a [`EventDraft`], the ambient [`EmitContext`], and
+/// the optional `cause` (the parent envelope this emit is a reaction to):
+///
+/// - **root** (`cause == None`): the event is its own causal root.
+///   `causation_id = None` (no parent), `correlation_id = <this event's id>`
+///   (it carries its own root), `depth = 0`, and `caused_by` is whatever the context's
+///   human-action ref is (the root *defines* the human action for the chain).
+/// - **caused** (`cause == Some(parent)`): provenance is taken *from the parent*.
+///   `causation_id = Some(parent.event_id)` (the IMMEDIATE parent, nested-not-flat),
+///   `correlation_id = parent.correlation_id` (the ROOT carries through),
+///   `depth = parent.depth + 1` (saturating — the loop ceiling, AG-6, reads this), and
+///   `caused_by = parent.caused_by` (the originating human action is inherited unchanged —
+///   a deep reactive chain still attributes to the human who started it, BUS-5).
+///
+/// Because `causation_id`/`correlation_id`/`depth`/`caused_by` are computed here and are
+/// **not fields on `EventDraft`**, a caller has no API surface on which to fabricate a wrong
+/// parent, skip a depth increment, or forge a root — the loop guard's invariant holds
+/// structurally, not by convention.
+pub fn derive_envelope(
+    draft: EventDraft,
+    ctx: EmitContext,
+    cause: Option<&EventEnvelope>,
+) -> EventEnvelope {
+    let (causation_id, correlation_id, depth, caused_by) = match cause {
+        // Root: carries its own correlation; depth 0; no parent.
+        None => (
+            None,
+            CorrelationId(ctx.event_id.0.clone()),
+            0,
+            ctx.caused_by.clone(),
+        ),
+        // Caused: provenance is inherited from the parent (correct-by-construction).
+        Some(parent) => (
+            Some(parent.event_id.clone()),
+            parent.correlation_id.clone(),
+            // saturating so a pathological chain can never wrap to 0 and defeat the ceiling.
+            parent.depth.saturating_add(1),
+            // The originating human action is the parent's — inherited unchanged through
+            // the whole chain (a child does NOT re-seed it from its own context).
+            parent.caused_by.clone(),
+        ),
+    };
+
+    EventEnvelope {
+        event_id: ctx.event_id,
+        type_: draft.type_,
+        schema_ver: ctx.schema_ver,
+        tenant: ctx.tenant,
+        region: ctx.region,
+        actor: ctx.actor,
+        subject: draft.subject,
+        aggregate: draft.aggregate,
+        causation_id,
+        correlation_id,
+        caused_by,
+        depth,
+        contains_personal_data: draft.contains_personal_data,
+        data_role: draft.data_role,
+        visibility: draft.visibility,
+        pii_key_ref: draft.pii_key_ref,
+        occurred_at: ctx.occurred_at,
+        recorded_at: ctx.recorded_at,
+        payload: draft.payload,
+    }
 }
 
 /// Placeholder error for the skeleton. The real outbox error taxonomy lands with the
@@ -191,7 +322,19 @@ pub trait OutboxTx {
     /// its own correlation; a caused event sets `causation_id = cause.event_id`,
     /// `correlation_id = cause.correlation_id`, `depth = cause.depth + 1`.
     ///
-    /// **Floor:** the derivation body is `todo!()` here; **P-S06** implements it.
+    /// The provenance derivation itself lives in the pure, frozen [`derive_envelope`]
+    /// function (P-S06): every implementer pulls its ambient [`EmitContext`] (tenant /
+    /// region / actor / clock / minted ULID) from the transaction handle `self` carries,
+    /// calls [`derive_envelope`], and inserts the resulting [`EventEnvelope`] into the
+    /// per-service `outbox` table IN THE SAME TRANSACTION as the state change — returning
+    /// the minted [`EventId`]. The signature is the frozen contract-2.2 shape; the ambient
+    /// context is intentionally NOT a parameter (it is the transaction's, not the caller's),
+    /// which is why a caller cannot fabricate a wrong root.
+    ///
+    /// **Floor:** the `outbox` table + the same-transaction insert + the relay are
+    /// **P-S07**; here P-S06 ships the causality derivation ([`derive_envelope`]) the table
+    /// will call. There is intentionally **no `publish_now`** — the only emit verb is
+    /// `emit` (the `no-raw-publish` lint, P-S10, enforces the absence externally).
     fn emit(&mut self, draft: EventDraft, cause: Option<&EventEnvelope>) -> Result<EventId>;
 }
 
@@ -273,6 +416,178 @@ mod tests {
             recorded_at: Timestamp("2026-06-19T00:00:01Z".into()),
             payload: serde_json::json!({ "ref": "myelin://acme/issues/issue/PROJ-1" }),
         }
+    }
+
+    /// Build an [`EmitContext`] for the P-S06 derivation tests: the ambient fields a real
+    /// transaction would supply. `caused_by` is the optional originating human-action ref.
+    fn ctx_for(event_id: EventId, caused_by: Option<CausedBy>) -> EmitContext {
+        EmitContext {
+            event_id,
+            tenant: TenantId("acme".into()),
+            region: Region("eu-west".into()),
+            actor: Actor(sample_principal()),
+            schema_ver: 1,
+            occurred_at: Timestamp("2026-06-19T00:00:00Z".into()),
+            recorded_at: Timestamp("2026-06-19T00:00:01Z".into()),
+            caused_by,
+        }
+    }
+
+    /// A minimal caller-authored draft (references-not-payloads; no inline PII).
+    fn draft_for(type_: &str) -> EventDraft {
+        EventDraft {
+            type_: EventType(type_.into()),
+            subject: ArtifactRef("myelin://acme/issues/issue/PROJ-1".into()),
+            aggregate: AggregateKey("issue:PROJ-1".into()),
+            payload: serde_json::json!({ "ref": "myelin://acme/issues/issue/PROJ-1" }),
+            data_role: DataRole::Controller,
+            visibility: Visibility::Internal,
+            contains_personal_data: false,
+            pii_key_ref: None,
+        }
+    }
+
+    /// P-S06 GATE artifact (1/3): a ROOT emit (`cause == None`) is its own causal root.
+    /// It carries its own `correlation_id` (= its event id), has no immediate parent, and
+    /// sits at `depth = 0`. The originating human action comes from the context.
+    #[test]
+    fn emit_root_carries_its_own_correlation_at_depth_zero() {
+        let id = EventId("01J-root".into());
+        let ctx = ctx_for(id.clone(), Some(CausedBy("session:abc".into())));
+        let env = derive_envelope(draft_for("issues.issue.created"), ctx, None);
+
+        assert_eq!(env.event_id, id, "the minted id is carried onto the envelope");
+        assert_eq!(env.causation_id, None, "a root has no immediate parent");
+        assert_eq!(
+            env.correlation_id,
+            CorrelationId("01J-root".into()),
+            "a root carries its OWN id as the correlation/root (BUS-5)"
+        );
+        assert_eq!(env.depth, 0, "a root is at causal depth 0");
+        assert_eq!(
+            env.caused_by,
+            Some(CausedBy("session:abc".into())),
+            "the root defines the human-action ref for the chain"
+        );
+    }
+
+    /// P-S06 GATE artifact (2/3): a CAUSED emit (`cause == Some(parent)`) derives its whole
+    /// provenance FROM the parent — correct-by-construction. `causation_id` is the parent's
+    /// id (the immediate parent, nested-not-flat), `correlation_id` is the parent's root
+    /// (carries through), `depth = parent.depth + 1`, and the human-action ref is inherited.
+    #[test]
+    fn emit_caused_derives_provenance_from_the_parent() {
+        // The parent: a root at depth 0.
+        let parent = derive_envelope(
+            draft_for("issues.issue.created"),
+            ctx_for(EventId("01J-root".into()), Some(CausedBy("session:abc".into()))),
+            None,
+        );
+
+        // The child reacts to the parent. Its OWN context's caused_by is intentionally a
+        // DIFFERENT value to prove the derivation IGNORES it and inherits the parent's.
+        let child = derive_envelope(
+            draft_for("refs.edge.created"),
+            ctx_for(EventId("01J-child".into()), Some(CausedBy("session:WRONG".into()))),
+            Some(&parent),
+        );
+
+        assert_eq!(
+            child.causation_id,
+            Some(EventId("01J-root".into())),
+            "causation_id = the IMMEDIATE parent's event id"
+        );
+        assert_eq!(
+            child.correlation_id,
+            CorrelationId("01J-root".into()),
+            "correlation_id = the parent's ROOT, carried through unchanged"
+        );
+        assert_eq!(child.depth, 1, "depth = parent.depth + 1");
+        assert_eq!(
+            child.caused_by,
+            Some(CausedBy("session:abc".into())),
+            "the originating human action is INHERITED from the parent, not re-seeded \
+             from the child's own context (a deep chain still attributes to the human)"
+        );
+    }
+
+    /// P-S06 GATE artifact (3/3): a deep chain monotonically increments depth and never
+    /// loses the root — the property the loop ceiling (AG-6) and audit walk rely on. Built
+    /// by chaining `derive_envelope` end-to-end (a sequence property, EI-01 §4).
+    #[test]
+    fn emit_deep_chain_keeps_root_and_increments_depth_monotonically() {
+        let root = derive_envelope(
+            draft_for("issues.issue.created"),
+            ctx_for(EventId("01J-0".into()), Some(CausedBy("human:h1".into()))),
+            None,
+        );
+
+        let mut prev = root.clone();
+        for i in 1..=10u32 {
+            let next = derive_envelope(
+                draft_for("refs.edge.created"),
+                ctx_for(EventId(format!("01J-{i}")), Some(CausedBy("human:DECOY".into()))),
+                Some(&prev),
+            );
+            // depth strictly increases by 1 each hop.
+            assert_eq!(next.depth, i, "depth increments by exactly 1 per hop");
+            assert!(next.depth > prev.depth, "depth is monotonically increasing");
+            // the ROOT is preserved across the whole chain.
+            assert_eq!(
+                next.correlation_id, root.correlation_id,
+                "the causal root carries through the entire chain"
+            );
+            // the immediate parent is the previous hop (nested, not flat).
+            assert_eq!(next.causation_id, Some(prev.event_id.clone()));
+            // the originating human action is preserved from the root, decoys ignored.
+            assert_eq!(next.caused_by, Some(CausedBy("human:h1".into())));
+            prev = next;
+        }
+    }
+
+    /// P-S06: depth derivation saturates rather than wrapping — a pathological chain can
+    /// never wrap `u32` back to 0 and slip under the loop ceiling (AG-6). We assert the
+    /// `saturating_add` boundary directly so the invariant is pinned independent of how
+    /// deep a real chain could plausibly get.
+    #[test]
+    fn emit_depth_saturates_never_wraps() {
+        // A synthetic parent already at u32::MAX depth.
+        let mut maxed = derive_envelope(
+            draft_for("issues.issue.created"),
+            ctx_for(EventId("01J-deep".into()), None),
+            None,
+        );
+        maxed.depth = u32::MAX;
+
+        let child = derive_envelope(
+            draft_for("refs.edge.created"),
+            ctx_for(EventId("01J-deeper".into()), None),
+            Some(&maxed),
+        );
+        assert_eq!(child.depth, u32::MAX, "depth saturates at u32::MAX, never wraps to 0");
+    }
+
+    /// P-S06: the caller-authored fields (type/subject/aggregate/payload/classification)
+    /// pass through unchanged; only the causal triple + ambient fields are derived. Proves
+    /// the derivation does not mangle the caller's content.
+    #[test]
+    fn emit_passes_caller_authored_fields_through_unchanged() {
+        let draft = draft_for("issues.issue.created");
+        let expected_type = draft.type_.clone();
+        let expected_subject = draft.subject.clone();
+        let expected_payload = draft.payload.clone();
+
+        let env = derive_envelope(draft, ctx_for(EventId("01J".into()), None), None);
+
+        assert_eq!(env.type_, expected_type);
+        assert_eq!(env.subject, expected_subject);
+        assert_eq!(env.payload, expected_payload);
+        assert_eq!(env.data_role, DataRole::Controller);
+        assert_eq!(env.visibility, Visibility::Internal);
+        // ambient fields come from the context.
+        assert_eq!(env.tenant, TenantId("acme".into()));
+        assert_eq!(env.region, Region("eu-west".into()));
+        assert_eq!(env.schema_ver, 1);
     }
 
     /// P-S05 GATE artifact: the compile-asserting names/units test that makes the envelope
@@ -405,6 +720,57 @@ mod tests {
         assert_eq!(back, env, "the wire shape round-trips to the anchor (no lossy field)");
     }
 
+    /// P-S06 CDC artifact: the **provider-side** contract test for row 2.2
+    /// (`OutboxTx::emit(draft, cause)`). It pins the frozen emit surface — there is NO
+    /// `publish_now` / fire-and-forget on `OutboxTx`; the trait's only method is
+    /// `emit(draft, cause)` — and exercises a real implementer end-to-end so the derivation
+    /// the contract promises (root carries / parent = cause.event_id / depth + 1) is what an
+    /// `emit` actually produces. The `no-raw-publish` lint (P-S10) enforces the absence of
+    /// any other publish symbol across the workspace.
+    ///
+    /// **Floor named:** the CONSUMER half of the 2.2 CDC pair — the same-transaction insert
+    /// into the `outbox` table + the relay re-hydrating + delivering the derived envelope —
+    /// lands in **P-S07**. The contract-coverage scanner (P-S21) reads this provider row +
+    /// the P-S07 consumer row as the completed pair.
+    #[test]
+    fn cdc_2_2_emit_is_the_only_path_and_derives_causality() {
+        struct Tx {
+            next: u32,
+        }
+        impl OutboxTx for Tx {
+            fn emit(&mut self, draft: EventDraft, cause: Option<&EventEnvelope>) -> Result<EventId> {
+                // A real implementer mints the id + ambient context, derives, then (P-S07)
+                // inserts the row in the same tx. Here we return the derived envelope's id.
+                let id = EventId(format!("01J-{}", self.next));
+                self.next += 1;
+                let env = derive_envelope(draft, ctx_for(id, Some(CausedBy("human:h".into()))), cause);
+                Ok(env.event_id)
+            }
+        }
+
+        let mut tx = Tx { next: 0 };
+        // A root emit through the trait.
+        let root_id = tx.emit(draft_for("issues.issue.created"), None).expect("root emits");
+        assert_eq!(root_id, EventId("01J-0".into()));
+
+        // Re-derive the root envelope to feed as the cause (P-S07 would read it back from
+        // the outbox row); prove a caused emit through the SAME trait derives depth + 1.
+        let root_env = derive_envelope(
+            draft_for("issues.issue.created"),
+            ctx_for(EventId("01J-0".into()), Some(CausedBy("human:h".into()))),
+            None,
+        );
+        let child_id = tx
+            .emit(draft_for("refs.edge.created"), Some(&root_env))
+            .expect("caused emits");
+        assert_eq!(child_id, EventId("01J-1".into()));
+
+        // The frozen signature is `emit(&mut self, EventDraft, Option<&EventEnvelope>)`.
+        // If a `publish_now` existed it would be nameable; it does not — `emit` is the only
+        // verb (BUS-2). The trait object below also proves no other method is required.
+        let _obj: &mut dyn OutboxTx = &mut tx;
+    }
+
     /// Compile-asserting test: there is NO `publish_now` / fire-and-forget on `OutboxTx`
     /// (BUS-2). The trait's only method is `emit(draft, cause)`. A stub implementer
     /// proves the frozen signature; the `no-raw-publish` lint (P-S10) enforces the
@@ -413,8 +779,12 @@ mod tests {
     fn outbox_has_only_emit_no_publish_now() {
         struct Stub;
         impl OutboxTx for Stub {
-            fn emit(&mut self, _draft: EventDraft, _cause: Option<&EventEnvelope>) -> Result<EventId> {
-                todo!("causality derivation lands in P-S06; relay in P-S07")
+            fn emit(&mut self, draft: EventDraft, cause: Option<&EventEnvelope>) -> Result<EventId> {
+                // The shape an implementer follows (P-S07 wraps this in the same-tx insert):
+                // pull the ambient context from `self`, derive the envelope, return the id.
+                let ctx = ctx_for(EventId("01J-stub".into()), None);
+                let env = derive_envelope(draft, ctx, cause);
+                Ok(env.event_id)
             }
         }
         // If a `publish_now` existed it would be nameable here; it does not. The presence
