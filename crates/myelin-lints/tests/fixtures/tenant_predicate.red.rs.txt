@@ -1,0 +1,9 @@
+// RED fixture for `tenant-predicate` — the lint MUST reject this.
+// A query-builder call that reads a tenant store with NO TenantId bound: the cross-tenant
+// IDOR bug class (F2). There is no `.with_tenant(...)`, no `TenantId` arg, no RLS guard.
+pub async fn list_principals(pool: &Pool) -> Vec<Principal> {
+    sqlx::query("SELECT id, email FROM principals")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}

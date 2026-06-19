@@ -81,6 +81,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "myelin-lints"
+version = "0.0.0"
+
+[[package]]
 name = "myelin-query"
 version = "0.0.0"
 dependencies = [

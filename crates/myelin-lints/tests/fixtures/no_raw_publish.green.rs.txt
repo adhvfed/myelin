@@ -1,0 +1,8 @@
+// GREEN fixture for `no-raw-publish` — the lint MUST admit this.
+// The event is emitted through OutboxTx::emit IN THE SAME TRANSACTION as the state change
+// (emit-iff-committed). The relay is the only component on the broker publish side.
+pub async fn handle(tx: &mut OutboxTx, draft: EventDraft, cause: Cause) -> Result<(), Error> {
+    tx.apply_state_change()?;
+    tx.emit(draft, cause)?;
+    tx.commit().await
+}

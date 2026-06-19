@@ -1,0 +1,6 @@
+// GREEN fixture for `no-host-exec` — the lint MUST admit this.
+// All execution goes through ToolHands::exec (the unified sandbox seam), so the four uniform
+// guarantees hold; there is no direct host-execution path.
+pub async fn run_user_script(hands: &ToolHands, spec: JobSpec) -> Result<ExecResult, ExecError> {
+    hands.exec(spec).await
+}

@@ -23,6 +23,13 @@ members = [
     # crate DAG (architecture §2.9) — it sits above myelin-substrate as a leaf consumer and
     # nothing depends on it. See crates/myelin-harness/Cargo.toml.
     "crates/myelin-harness",
+    # The architecture-lint ratchet (P-S10 → P-017: the four load-bearing lints;
+    # P-S11 → P-018 completes the twelve). NOT a node in the production crate DAG
+    # (architecture §2.9) — like myelin-harness it is a leaf test-support crate; NO
+    # production crate depends on it. It ships the §2.11 / contract-1.6 lints as
+    # cargo-level source-scanning checks (red + green fixtures) run as CI jobs over the
+    # workspace source + the fixture matrix. See crates/myelin-lints/Cargo.toml.
+    "crates/myelin-lints",
 ]
 
 # Workspace-wide dependency versions. Pinned once here so every glue crate shares
