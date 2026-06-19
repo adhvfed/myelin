@@ -82,8 +82,14 @@
 //!   `(tenant, region)` `TenantScope`; the per-pool runtime region-pin is the M1 follow-on
 //!   **P-ST-15 / P-102**, STOR-D5), recorded LOUDLY via the `@residency-cell-pinned` waiver marker.
 //!   Storage's twin fixtures + the CI-wiring proof live in `tests/storage_lints.rs`.
-//! - `control-plane-pii-free` — tightens when the `CrossCellPointer` frame + routing registry land
-//!   (**P-CP-02 / P-027**, **P-CP-05 / P-080**); Tenancy ships its own twin in **P-CP-04 / P-028**.
+//! - `control-plane-pii-free` — **SHARPENED in P-CP-04 / P-028** (Tenancy ownership): added the
+//!   DATA-MAP LEG — a control-plane field classified `is_personal=true` (tagged
+//!   `#[personal_data(...)]`, the generated data-map, contract 10.2) fires the lint regardless of
+//!   its NAME, realizing the canonical §4.3 rule "no control-plane registry column is
+//!   `is_personal=true`". The P-S11 name-fingerprint leg is kept as defence-in-depth. Tenancy's twin
+//!   fixtures over the real frozen `CrossCellPointer` frame (P-CP-02 / P-027) + the CI-wiring proof
+//!   live in `tests/tenancy_control_plane_lints.rs`. The live registry-schema CP-D1 drill is the M1
+//!   follow-on **P-CP-05 / P-080**.
 //! - `search-requires-acl-filter` — tightens to the type-system form when the permission-aware
 //!   query pipeline lands (**SRCH-P08 / P-171**); Search ships its own twin in **SRCH-P01 / P-021**.
 //! - `flow-determinism` — re-shipped against the real `WfCtx` in **P-FLOW-08 / P-200** when the

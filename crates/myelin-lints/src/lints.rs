@@ -844,17 +844,37 @@ pub fn residency_pin() -> Lint {
 
 /// `control-plane-pii-free` (§2.11; ADR-11, recon §OQ-I).
 ///
-/// **Rule.** The control plane (routing, cross-cell pointers) carries OPAQUE IDS ONLY — never a
-/// name/email/body. **Fingerprint scanned:** a control-plane struct (one marked
-/// `// @control-plane` or named `*Pointer`/`*Routing`/`*Placement`/`CrossCell*`/`*Directory`) with
-/// a PII-bearing field (`name`, `email`, `phone`, `address`, `body`, `display_name`, …). Only
-/// opaque ids (`TenantId`, `Region`, slugs, hashes) may cross the control plane.
+/// **Rule (canonical, refined-arch tenancy §4.3).** *No control-plane registry column is classified
+/// `is_personal=true` — run through the generated data-map.* The control plane (routing, cross-cell
+/// pointers, placement, directory) carries OPAQUE IDS ONLY (`TenantId`/`Region`/slug/hash) — never a
+/// name/email/body. PII is born inside the cell, never in the control plane (ADR-11.4; §3.3 "the
+/// control plane holds ZERO in-region personal data").
 ///
-/// **Floor (named).** The concrete control-plane types (the `CrossCellPointer` frame, the routing
-/// registry tables) land in Tenancy M0/M1 (**P-CP-02 / P-027, P-CP-05 / P-080**) with their own
-/// `control-plane-pii-free` twin lint (P-CP-04 / P-028). This substrate scanner ships the gate now
-/// keyed to the `@control-plane` marker + the naming fingerprint; it admits the (empty-of-target)
-/// workspace and rejects a PII field the moment a control-plane struct introduces one.
+/// **Two fingerprints scanned**, on a control-plane struct (one marked `// @control-plane` or named
+/// `*Pointer`/`*Routing`/`*Placement`/`CrossCell*`/`*Directory`):
+///   1. **the data-map leg (P-CP-04, the canonical rule):** ANY field classified
+///      `is_personal=true` — i.e. tagged with the GDPR `#[personal_data(...)]` classify-derive
+///      (contract 10.2, the generated data-map) — fires the lint, *regardless of the field name*.
+///      This is the authoritative leg: the data-map, not a name guess, is the source of truth for
+///      `is_personal`. A `#[personal_data]` tag does NOT make PII admissible on the control plane —
+///      it makes the leak *machine-detectable* (the same field would be erasable inside a cell, but
+///      the control plane must carry none).
+///   2. **the name-fingerprint leg (defence-in-depth, P-S11 substrate floor):** a PII-named field
+///      (`name`, `email`, `phone`, `address`, `body`, `display_name`, …) fires even when the author
+///      forgot the `#[personal_data]` tag (caught independently by `no-untagged-personal-data`).
+///
+/// **P-CP-04 frame guard.** The frozen `CrossCellPointer` frame (P-CP-02 / P-027) is `@control-plane`
+/// by name (`CrossCell*`); the lint asserts it carries no `is_personal=true` field — a fifth
+/// PII-bearing field added to the four-field frame fails the build (refined-arch §6.1).
+///
+/// **History (EI-01 §7 — sharpened in place, never duplicated).** P-S11 / P-018 shipped this gate
+/// keyed to the `@control-plane` marker + the naming fingerprint (the name-fingerprint leg).
+/// **P-CP-04 / P-028 (Tenancy ownership) SHARPENS it with the data-map leg** — the canonical
+/// `is_personal=true` classification — so a PII column escapes neither by name NOR by tag, and adds
+/// the Tenancy twin fixtures over the real `CrossCellPointer` frame (`tests/tenancy_control_plane_lints.rs`).
+/// The lint is sharpened, never weakened (EI-01 §5). The live registry-schema CP-D1 drill (the
+/// `cell`/`tenant_placement`/`cell_provisioning` tables asserted at 0 PII columns) is the M1
+/// follow-on **P-CP-05 / P-080**.
 pub const CONTROL_PLANE_PII_FREE: LintId = LintId("control-plane-pii-free");
 
 fn scan_control_plane_pii_free(src: &str) -> Vec<Violation> {
@@ -881,6 +901,11 @@ fn scan_control_plane_pii_free(src: &str) -> Vec<Violation> {
     let mut depth: i32 = 0;
     let mut in_cp_struct = false;
     let mut cp_struct_depth: i32 = 0;
+    // The data-map leg (P-CP-04): track whether the immediately-preceding non-blank code line was a
+    // `#[personal_data(...)]` classify-derive (contract 10.2). A control-plane field carrying that
+    // tag is classified `is_personal=true` and fires the lint REGARDLESS of its name — the data-map,
+    // not a name guess, is the authoritative `is_personal` signal (refined-arch tenancy §4.3).
+    let mut prev_was_personal_data = false;
     // Marker: the previous lines flagged this struct as control-plane (a `// @control-plane`
     // attribute line is stripped by code_lines, so we look at the RAW src for the marker on the
     // line just above the struct; simpler: a struct whose NAME matches the control-plane shapes,
@@ -907,7 +932,26 @@ fn scan_control_plane_pii_free(src: &str) -> Vec<Violation> {
         }
         if in_cp_struct && depth >= cp_struct_depth - 1 {
             if let Some(field_name) = field_identifier(trimmed) {
-                if PII_FIELDS.contains(&field_name) {
+                // Leg 1 — the data-map leg (P-CP-04, canonical): the field is classified
+                // `is_personal=true` (a `#[personal_data(...)]` tag on the line just above). Fires
+                // regardless of the field's name.
+                if prev_was_personal_data {
+                    out.push(Violation {
+                        lint: CONTROL_PLANE_PII_FREE,
+                        line: *line,
+                        reason: format!(
+                            "control-plane struct carries `is_personal=true` field `{field_name}` \
+                             (tagged `#[personal_data(...)]`, the generated data-map) — no \
+                             control-plane registry column may be classified `is_personal=true` \
+                             (refined-arch tenancy §4.3). The control plane carries OPAQUE IDS ONLY \
+                             (TenantId/Region/slug/hash); PII is born inside the cell, never here \
+                             (ADR-11.4/OQ-I). Tagging does NOT make PII admissible on the control \
+                             plane — it makes the leak machine-detectable."
+                        ),
+                    });
+                } else if PII_FIELDS.contains(&field_name) {
+                    // Leg 2 — the name-fingerprint leg (defence-in-depth): an untagged PII-named
+                    // field on the control plane (the author forgot the data-map tag too).
                     out.push(Violation {
                         lint: CONTROL_PLANE_PII_FREE,
                         line: *line,
@@ -920,6 +964,12 @@ fn scan_control_plane_pii_free(src: &str) -> Vec<Violation> {
                     });
                 }
             }
+        }
+        // Update the data-map flag for the NEXT field line (mirrors `scan_no_untagged_personal_data`):
+        // a `#[personal_data` attr line classifies the field on the line below it; blank lines are
+        // ignored so the tag still applies to the next real field.
+        if !trimmed.is_empty() {
+            prev_was_personal_data = trimmed.contains("#[personal_data");
         }
         let opens = code.matches('{').count() as i32;
         let closes = code.matches('}').count() as i32;
