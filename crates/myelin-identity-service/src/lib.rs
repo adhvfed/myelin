@@ -37,7 +37,10 @@
 //! ## Floors named (fail-closed stub now → the handler bodies in their own M1 prompts)
 //! Every authorization decision the shell makes is the fail-closed default **`Deny`** (ADR-03 —
 //! deny-when-genuinely-unsure). The contract bodies arrive in their own M1 prompts, each named:
-//! - `authenticate` (4.1) → P-ID-06 / P-ID-07.
+//! - `authenticate` (4.1) → P-ID-06 (the human/SSO half — LANDED:
+//!   [`authenticate::HumanSsoAuthenticator`] resolves OIDC/SAML/SCIM/passkey/SSH to the polymorphic
+//!   `Principal` over S1, tenant-from-credential, `auth_decision_latency` per request) /
+//!   P-ID-07 (the capability-token + machine-identity half — still a floor).
 //! - **`check` (4.2)** → **P-ID-09** — the depth-bounded Zanzibar userset-rewrite. Until then,
 //!   [`FailClosedCheck::check`] returns `Deny` for every input (fail-closed, never fail-open).
 //! - `list_objects` (4.3) → P-ID-11 / P-ID-12 — returns `NotYetImplemented` (a leak-free
@@ -51,9 +54,14 @@
 //! The readiness-gates-on-migrate-complete property is the harness's (P-S14); this shell declares
 //! Identity's migrations so the booting instance is **not-ready until they apply**.
 
+pub mod authenticate;
 pub mod principal_store;
 pub mod tuple_store;
 
+pub use authenticate::{
+    scheme, AuthTelemetry, CredentialVerifier, HumanSsoAuthenticator, IdorCounters,
+    StructuralVerifier, VerifiedAssertion,
+};
 pub use principal_store::{
     PrincipalError, PrincipalProfile, PrincipalRow, PrincipalStore, ProfileRef, S1_HOLDER, S1_TABLE,
 };

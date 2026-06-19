@@ -203,6 +203,12 @@ pub enum PrincipalError {
     /// The decrypted profile bytes were not valid UTF-8 / the frozen profile shape — a corrupt or
     /// wrong-key open, refused (never a wrong-key read silently coerced).
     CorruptProfile,
+    /// A credential link targeted a principal that does not exist in the verified `(tenant, region)`
+    /// partition — refused (a dangling SSO/SCIM link is never silently created).
+    UnknownPrincipal {
+        /// The opaque `principal_id` the rejected link pointed at.
+        principal_id: String,
+    },
 }
 
 impl core::fmt::Display for PrincipalError {
@@ -222,6 +228,11 @@ impl core::fmt::Display for PrincipalError {
                 f,
                 "principal profile decrypted to a non-conforming shape (a wrong-key/corrupt open \
                  — refused, never silently coerced)"
+            ),
+            PrincipalError::UnknownPrincipal { principal_id } => write!(
+                f,
+                "credential link rejected: principal `{principal_id}` does not exist in the verified \
+                 (tenant, region) partition (a dangling SSO/SCIM link is refused)"
             ),
         }
     }
@@ -247,6 +258,14 @@ struct Inner {
     /// crypto-shredded (the per-subject DEK destroyed) while the row's immutable `principal_id`
     /// attribution survives (the §X-7 split, made structural).
     profiles: HashMap<(String, String), HashMap<String, EncryptedProfile>>,
+    /// **The SSO/SCIM/credential link index (identity §2 "credentials, SSO/SCIM links").** Maps a
+    /// VERIFIED credential's `(scheme, subject_key)` to the opaque `principal_id` it resolves to,
+    /// WITHIN a `(tenant, region)` partition. This is the lookup `authenticate` (P-ID-06) keys on:
+    /// the IdP/credential is the trust root for the tenant (never the URL path), so the link is
+    /// stored under the verified-scope partition and a cross-tenant credential cannot resolve into
+    /// another tenant's directory. The outer map is the `(tenant, region)` partition; the inner map
+    /// is `"<scheme>\x1f<subject_key>"` → `principal_id`.
+    credential_links: HashMap<(String, String), HashMap<String, String>>,
 }
 
 /// **The S1 principal store (identity §2; contracts 11.1/11.3/12.1/10.1).** A cloneable handle over
@@ -492,6 +511,77 @@ impl PrincipalStore {
             .get(&Self::part_key(scope))
             .map(|p| p.values().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// **Link a VERIFIED credential `(scheme, subject_key)` to a principal within the verified
+    /// `(tenant, region)` scope (identity §2 "SSO/SCIM links"; the lookup `authenticate` keys on).**
+    ///
+    /// This is how a tenant's IdP directory (OIDC subject, SAML NameID, SCIM externalId, passkey
+    /// credential id, SSH key fingerprint) maps to the platform principal. The link is stored under
+    /// the VERIFIED scope's partition — a credential verified for tenant A is registered in A's
+    /// partition and can never resolve a principal in tenant B (the tenant comes from the verified
+    /// credential, never a path; the no-cross-tenant-query-path floor). Idempotent: re-linking the
+    /// same `(scheme, subject_key)` updates the target. The principal must already exist in the
+    /// scope ([`Self::put_principal`]); linking an unknown principal returns
+    /// [`PrincipalError::UnknownPrincipal`] (a dangling link is refused, never silently created).
+    pub fn link_credential(
+        &self,
+        scope: &TenantScope,
+        scheme: &str,
+        subject_key: &str,
+        principal_id: &PrincipalId,
+    ) -> Result<(), PrincipalError> {
+        let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S1_TABLE));
+        let part_key = Self::part_key(scope);
+        let mut inner = self.lock();
+        // Refuse a link to a principal that does not exist in THIS verified partition (defence in
+        // depth: a credential can only resolve to a principal in its own tenant directory).
+        let exists = inner
+            .partitions
+            .get(&part_key)
+            .is_some_and(|p| p.contains_key(&principal_id.0));
+        if !exists {
+            return Err(PrincipalError::UnknownPrincipal {
+                principal_id: principal_id.0.clone(),
+            });
+        }
+        inner
+            .credential_links
+            .entry(part_key)
+            .or_default()
+            .insert(Self::link_key(scheme, subject_key), principal_id.0.clone());
+        Ok(())
+    }
+
+    /// **Resolve a VERIFIED credential `(scheme, subject_key)` to its principal WITHIN the verified
+    /// `(tenant, region)` scope (the S1 lookup `authenticate` performs after verifying tenant).**
+    /// Returns the [`PrincipalRow`] the credential maps to, or `None` if no such link exists in the
+    /// verified partition. There is NO cross-partition lookup: a credential verified for one tenant
+    /// resolves only into that tenant's directory (the tenant-from-credential floor).
+    pub fn resolve_credential(
+        &self,
+        scope: &TenantScope,
+        scheme: &str,
+        subject_key: &str,
+    ) -> Option<PrincipalRow> {
+        let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S1_TABLE));
+        let part_key = Self::part_key(scope);
+        let inner = self.lock();
+        let principal_id = inner
+            .credential_links
+            .get(&part_key)
+            .and_then(|m| m.get(&Self::link_key(scheme, subject_key)))?
+            .clone();
+        inner
+            .partitions
+            .get(&part_key)
+            .and_then(|p| p.get(&principal_id).cloned())
+    }
+
+    /// The credential-link map key — `"<scheme>\x1f<subject_key>"`. The `\x1f` (ASCII unit
+    /// separator) cannot appear in a scheme/subject and so cannot be used to forge a colliding key.
+    fn link_key(scheme: &str, subject_key: &str) -> String {
+        format!("{scheme}\x1f{subject_key}")
     }
 
     /// The canonical at-rest byte form of a profile (the plaintext fed to the per-subject DEK seal).
