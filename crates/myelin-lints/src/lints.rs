@@ -602,6 +602,32 @@ pub fn no_cross_sync_cycle() -> Lint {
 /// admitted today (see `tests/storage_lints.rs`, which proves the lint REJECTS a region-less *caller*
 /// open and ADMITS a region-pinned one). The fingerprint is live NOW so the moment a caller opens a
 /// store without a region, the gate fires.
+///
+/// **P-CP-03 / P-026 sharpening — the WRITE-BOUNDARY (layer-3) half; coherence rule EI-01 §7.**
+/// `residency-pin` is one of the TWO lints Tenancy owns (contract-index 1.6); the substrate/storage
+/// prompts above built the STORE-OPEN half (a region-less pool is the data-leaves-its-region bug).
+/// The Tenancy ownership prompt P-CP-03 adds the genuinely-NEW second property the §4.3 rule names:
+/// *every write asserts `row.region == cell.region`*, with the cell's region **threaded by the
+/// harness**, never taken from a request field (refined-arch tenancy §4.3 / §5.3 layer 3 — the
+/// `residency-pin` write-boundary check). This is a DISTINCT bug fingerprint from a region-less
+/// store open: here the store IS region-bearing, but a write sets `row.region` from an
+/// **untrusted request field** (`req.region` / `request.region` / `payload.region` / `input.region`
+/// / `params.region`), so a forged request could land a row in the wrong region. Rather than
+/// duplicate a parallel scanner (EI-01 §7), the in-place scanner is EXTENDED: a write-boundary site
+/// (marked `// @residency-write`, the same loud, named marker discipline `@identity-sink` /
+/// `@workflow-body` use, so the check fires only where a region is actually being written) that
+/// derives the row region from a request field — and does NOT assert it against the harness-threaded
+/// cell region (`cell.region` / `cell_region` / `ctx.region` / `scope.region` / `self.region`) — is
+/// rejected as the cross-region-write bug class (CP-D3 lint leg). A write that pins the row region
+/// from the cell handle is admitted. The lint is SHARPENED (it now also guards the write boundary),
+/// never weakened (EI-01 §5).
+///
+/// **Floor (named) — the runtime CP-D3 drill is M1.** This is the *lint leg* (the compile-time
+/// rejection) only. The full RUNTIME CP-D3 drill — an actual `row.region != cell.region` write
+/// REJECTED at the live write boundary, plus the `residency_verify` attestation — lands once the
+/// write boundary exists in **P-CP-12 / P-096** (and Storage's store-layer enforcement P-ST-15 /
+/// P-102). The marker-keyed scanner ships the gate NOW so the bug-fingerprint is un-mergeable before
+/// the boundary code lands.
 pub const RESIDENCY_PIN: LintId = LintId("residency-pin");
 
 fn scan_residency_pin(src: &str) -> Vec<Violation> {
@@ -687,6 +713,119 @@ fn scan_residency_pin(src: &str) -> Vec<Violation> {
                 reason: "a store/stream/index/cache is constructed WITHOUT a pinned region — \
                          every store must declare its `Region` (no global pool); a region-less \
                          pool lets data leave its residency boundary (ADR-11/residency-pin)."
+                    .into(),
+            });
+        }
+    }
+    // ---- P-CP-03 / P-026: the WRITE-BOUNDARY (layer-3) half. -------------------------------------
+    // The §4.3 rule's second clause: every write asserts `row.region == cell.region`, with the cell
+    // region threaded by the HARNESS — never taken from a request field. This half is keyed to a
+    // `// @residency-write` marker (the loud, named marker discipline `@identity-sink`/`@workflow-body`
+    // use) so it fires ONLY where a region is actually being written, and admits the whole current
+    // workspace until the write boundary lands (P-CP-12 / P-096). Outside a write-boundary file there
+    // is nothing to add.
+    out.extend(scan_residency_write_boundary(src));
+    out
+}
+
+/// The write-boundary (layer-3) leg of `residency-pin` (P-CP-03 / P-026): inside a write-boundary
+/// site (a file/line marked `// @residency-write`), a write that sets the row's `region` from an
+/// untrusted REQUEST FIELD — rather than from the harness-threaded CELL region — is rejected. A
+/// region-mismatched write is the cross-region-write bug class (CP-D3 lint leg). This is a DISTINCT
+/// fingerprint from a region-less store open (the store-construction loop above): here the region is
+/// present but sourced from the wrong place.
+fn scan_residency_write_boundary(src: &str) -> Vec<Violation> {
+    // The marker that scopes this leg to actual write-boundary code (so ordinary code that reads a
+    // request's region for non-storage purposes is not flagged). Matched on RAW lines (it lives in a
+    // comment); a file-level marker arms the whole file, a per-line trailing marker arms one write.
+    const WRITE_MARKER: &str = "@residency-write";
+    if !src.contains(WRITE_MARKER) {
+        return Vec::new();
+    }
+    let file_armed = src.lines().any(|l| {
+        let t = l.trim_start();
+        // A module-doc (`//!`) or top-of-file marker arms the whole file.
+        t.starts_with("//!") && t.contains(WRITE_MARKER)
+    });
+    // A row-region ASSIGNMENT whose value is an UNTRUSTED request field. We match the assignment
+    // TARGET being a region (`region`) and the SOURCE being a request-shaped handle. Both sets are
+    // conservative substrings; the marker keeps the leg scoped so a false positive is loud and rare.
+    const REQUEST_SOURCES: &[&str] = &[
+        "req.region",
+        "request.region",
+        "payload.region",
+        "input.region",
+        "params.region",
+        "body.region",
+        "msg.region",
+    ];
+    // Tokens proving the row region is instead derived from / checked against the harness-threaded
+    // CELL region (the trusted source). A write that names ANY of these alongside the row region is
+    // pinning to the cell, not the request — admitted.
+    const CELL_REGION_SOURCES: &[&str] = &[
+        "cell.region",
+        "cell_region",
+        "ctx.region",
+        "scope.region",
+        "self.region",
+        "tenant_scope.region",
+        "CellRegion",
+        "harness.region",
+    ];
+    let raw_lines: Vec<&str> = src.lines().collect();
+    let mut out = Vec::new();
+    for (line, code) in code_statements(src) {
+        let from_request = REQUEST_SOURCES.iter().any(|s| code.contains(s));
+        if !from_request {
+            continue;
+        }
+        // Only fire if this statement actually writes a region (assigns/sets `region`) — a mere read
+        // of `req.region` into a non-region binding is not the write-boundary bug.
+        let writes_region = code.contains("region:")
+            || code.contains("region =")
+            || code.contains(".region(")
+            || code.contains("set_region(")
+            || code.contains("row.region");
+        if !writes_region {
+            continue;
+        }
+        // Admitted if the SAME write derives/asserts the region from the trusted cell handle.
+        let pinned_to_cell = CELL_REGION_SOURCES.iter().any(|c| code.contains(c));
+        // Per-line marker arming: a `@residency-write` in the statement's comment block (or the file
+        // marker) arms this site. Without the file marker, require a per-site marker so the leg never
+        // fires on an unmarked statement.
+        let idx = line.saturating_sub(1);
+        let site_armed = file_armed
+            || raw_lines.get(idx).is_some_and(|l| l.contains(WRITE_MARKER))
+            || {
+                // look just above for the marker in an attached comment block.
+                let mut armed = false;
+                let mut i = idx;
+                for _ in 0..6 {
+                    let Some(j) = i.checked_sub(1) else { break };
+                    i = j;
+                    let Some(raw) = raw_lines.get(i) else { break };
+                    let t = raw.trim();
+                    if t.contains(WRITE_MARKER) {
+                        armed = true;
+                        break;
+                    }
+                    if !t.is_empty() && !t.starts_with("//") {
+                        break;
+                    }
+                }
+                armed
+            };
+        if site_armed && !pinned_to_cell {
+            out.push(Violation {
+                lint: RESIDENCY_PIN,
+                line,
+                reason: "a write derives `row.region` from an UNTRUSTED request field instead of \
+                         asserting it against the harness-threaded CELL region — every write must \
+                         pin `row.region == cell.region` with the cell's region injected by the \
+                         harness (never a request field), or a forged request lands a row in the \
+                         wrong region (the cross-region-write bug class; CP-D3 lint leg, \
+                         residency-pin layer 3 — refined-arch tenancy §4.3/§5.3)."
                     .into(),
             });
         }
@@ -1189,6 +1328,61 @@ mod tests {
         let green = "let pool = PgPool::connect(url).region(Region::EuWest).await?;";
         assert!(!residency_pin().run(red).is_empty());
         assert!(residency_pin().run(green).is_empty());
+    }
+
+    #[test]
+    fn residency_pin_write_boundary_rejects_region_from_request_admits_region_from_cell() {
+        // P-CP-03 / P-026: the write-boundary (layer-3) leg. Inside a `@residency-write` site, a
+        // write that sets the row region from an UNTRUSTED request field is rejected; a write that
+        // pins it from the harness-threaded CELL region is admitted. The marker keeps the leg
+        // scoped (an UNMARKED region-from-request read does NOT fire — it is not a write boundary).
+        let red = "// @residency-write\nlet row = Row { region: req.region, tenant_id };";
+        let green =
+            "// @residency-write\nlet row = Row { region: cell.region, tenant_id }; // pinned to cell";
+        let unmarked = "let r = Row { region: req.region, tenant_id };"; // no write-boundary marker.
+        assert!(
+            !residency_pin().run(red).is_empty(),
+            "a write taking row.region from a request field must be rejected"
+        );
+        assert!(
+            residency_pin().run(green).is_empty(),
+            "a write pinning row.region to the cell region must be admitted"
+        );
+        assert!(
+            residency_pin().run(unmarked).is_empty(),
+            "an UNMARKED region-from-request statement is not a write boundary — must not fire"
+        );
+    }
+
+    #[test]
+    fn residency_pin_write_boundary_reads_cell_region_from_harness_not_request_field() {
+        // The TESTS-field assertion: the lint reads the cell `region` from the harness-threaded
+        // handle, NOT from a request field. A file-level `@residency-write` marker arms the whole
+        // write boundary; the cell-region source (`ctx.region`/`scope.region`/`cell.region`) is the
+        // trusted handle, a request field is the forgeable one.
+        let from_harness = "//! @residency-write\nfn write(ctx: &CellCtx, req: &Req) {\n    \
+                            store.insert(Row { region: ctx.region, data: req.data });\n}";
+        let from_request = "//! @residency-write\nfn write(ctx: &CellCtx, req: &Req) {\n    \
+                            store.insert(Row { region: req.region, data: req.data });\n}";
+        assert!(
+            residency_pin().run(from_harness).is_empty(),
+            "a row pinned to the harness-threaded cell region must be admitted"
+        );
+        assert!(
+            !residency_pin().run(from_request).is_empty(),
+            "a row whose region comes from a request field must be rejected"
+        );
+    }
+
+    #[test]
+    fn residency_pin_store_open_half_is_unchanged_by_the_write_boundary_leg() {
+        // Coherence regression (EI-01 §7): the P-CP-03 write-boundary leg is ADDITIVE — it does not
+        // alter the store-open half. A region-less pool still fires; a region-pinned pool still
+        // admits; neither carries the write marker, so the write leg stays silent on them.
+        let red = "let pool = PgPool::connect(url).await?;";
+        let green = "let pool = PgPool::connect(url).region(Region::EuWest).await?;";
+        assert!(!residency_pin().run(red).is_empty(), "region-less open still fires");
+        assert!(residency_pin().run(green).is_empty(), "region-pinned open still admits");
     }
 
     #[test]
