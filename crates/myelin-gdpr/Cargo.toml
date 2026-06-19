@@ -1,0 +1,15 @@
+[package]
+name = "myelin-gdpr"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# myelin-gdpr is below the events tier in the DAG (architecture 00 §2.9):
+# events (+ refs/content/query) → agent, gdpr. It depends on tenancy + identity (the
+# subject locator threads a Principal/TenantId). It MUST NOT depend on -client or
+# -substrate (downstream); such an edge MUST NOT compile.
+[dependencies]
+myelin-tenancy = { path = "../myelin-tenancy" }
+myelin-identity = { path = "../myelin-identity" }
+serde.workspace = true

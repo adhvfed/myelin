@@ -1,0 +1,16 @@
+[package]
+name = "myelin-client"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# myelin-client sits below the agent/gdpr tier in the DAG (architecture 00 §2.9):
+# agent, gdpr → client → substrate. It depends on identity (authz calls ride the
+# resilient client) and on the events tier; it MUST NOT depend on -substrate (which is
+# strictly downstream and depends on this crate). Such an edge MUST NOT compile.
+[dependencies]
+myelin-tenancy = { path = "../myelin-tenancy" }
+myelin-identity = { path = "../myelin-identity" }
+myelin-events = { path = "../myelin-events" }
+serde.workspace = true

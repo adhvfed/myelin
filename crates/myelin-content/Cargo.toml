@@ -1,0 +1,15 @@
+[package]
+name = "myelin-content"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# myelin-content is in the mid-tier of the DAG (architecture 00 §2.9). It depends on
+# tenancy + events (for ArtifactRef, which its inline `artifact_ref`/`embed` nodes
+# carry). It MUST NOT depend on -agent, -gdpr, -client, or -substrate (downstream).
+[dependencies]
+myelin-tenancy = { path = "../myelin-tenancy" }
+myelin-events = { path = "../myelin-events" }
+myelin-identity = { path = "../myelin-identity" }
+serde.workspace = true
