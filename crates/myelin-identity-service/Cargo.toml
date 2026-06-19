@@ -59,3 +59,9 @@ serde_json = { workspace = true }
 # lint (contract 1.6) is GREEN on S1 and the store compiles against the FROZEN tags (never drift).
 # The PersonalDataHolder trait id the S1 store registers under also lives here (10.1).
 myelin-gdpr = { path = "../myelin-gdpr" }
+
+[dev-dependencies]
+# P-ID-10 (P-068) ID-D3 drill: the failure-injection harness's telemetry-assertion library
+# (the contract-1.8 survival-signal set, incl. CrossTenantCount) the cross-tenant drill emits its
+# dated green artifact through. DEV-only — myelin-harness never enters the service production DAG.
+myelin-harness = { path = "../myelin-harness" }

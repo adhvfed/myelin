@@ -265,9 +265,9 @@ landing = "P-078"
 
 [[contract]]
 row = "4.9"
-title = "per-subsystem ReBAC namespace fragment"
-status = "deferred"
-landing = "P-068"
+title = "per-subsystem ReBAC namespace fragment (engine + admit-contract + core hierarchy)"
+status = "covered"
+cdc = ["crates/myelin-identity-service/tests/cdc_4_9_namespace_engine.rs"]
 
 [[contract]]
 row = "4.10"

@@ -66,6 +66,7 @@
 pub mod authenticate;
 pub mod check_engine;
 pub mod machine_auth;
+pub mod namespace;
 pub mod principal_store;
 pub mod tuple_store;
 
@@ -74,6 +75,10 @@ pub use authenticate::{
     StructuralVerifier, VerifiedAssertion,
 };
 pub use check_engine::{eval_caveat, CheckEngine, MAX_REWRITE_DEPTH};
+pub use namespace::{
+    core_hierarchy, AdmitReject, FragmentDef, NamespaceEngine, PermissionRule, Userset,
+    MAX_RULE_DEPTH,
+};
 // `StoreBackedCheck` is defined below in this module; re-exported at the crate root for callers.
 pub use machine_auth::{
     Authority, CapabilityAuthenticator, CapabilityToken, MachineKind, S7Denylist,
@@ -334,14 +339,44 @@ impl<S: IdentityService + Send + Sync> Authorizer for CheckAuthorizer<S> {
 #[derive(Clone)]
 pub struct StoreBackedCheck {
     engine: CheckEngine,
+    /// The compiled ReBAC namespace engine (P-ID-10) — the org/team/project core hierarchy + any
+    /// admitted subsystem fragments. `check` resolves a **compiled permission** (the four-operator
+    /// rewrite) through it; a name that is not a compiled permission falls through to a raw
+    /// relation check. Behind an `Arc` so the cloneable `check` handle shares one schema and
+    /// [`StoreBackedCheck::admit_fragment`] mutates it under a lock.
+    namespace: std::sync::Arc<std::sync::Mutex<NamespaceEngine>>,
 }
 
 impl StoreBackedCheck {
-    /// Wire the real `check` engine over the S3 [`TupleStore`].
+    /// Wire the real `check` engine over the S3 [`TupleStore`], with the **core org/team/project
+    /// hierarchy** pre-loaded into the namespace engine (the M3/M4 subsystem fragments are admitted
+    /// on top via [`StoreBackedCheck::admit_fragment`] / [`NamespaceEngine::admit`]).
     pub fn new(tuples: TupleStore) -> StoreBackedCheck {
         StoreBackedCheck {
             engine: CheckEngine::new(tuples),
+            namespace: std::sync::Arc::new(std::sync::Mutex::new(
+                NamespaceEngine::with_core_hierarchy(),
+            )),
         }
+    }
+
+    /// Admit a **rich** [`FragmentDef`] (carrying the permission rewrite structure) into the cell
+    /// schema — the path the M3/M4 fragment prompts (P-ID-24/26/27/29/30) use to declare a
+    /// subsystem's relations + permissions. The names-only ABI [`IdentityService::admit_fragment`]
+    /// is the contract-boundary validator; this is the build-time declaration the engine compiles.
+    pub fn admit_fragment_def(
+        &self,
+        frag: &FragmentDef,
+    ) -> myelin_identity::FragmentAdmit {
+        self.namespace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .admit(frag)
+    }
+
+    /// A read-only snapshot of the compiled namespace engine (for inspection / the explain path).
+    pub fn namespace(&self) -> NamespaceEngine {
+        self.namespace.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
@@ -362,13 +397,36 @@ impl IdentityService for StoreBackedCheck {
         caveat: Option<&CaveatContext>,
     ) -> myelin_identity::Result<Decision> {
         // tenant-from-token (ID-3): the scope is the SUBJECT's own verified (tenant, region), never
-        // a path. The relation the raw-tuple rewrite resolves IS the permission name on this floor
-        // (P-ID-10 compiles permissions → usersets over this same rewrite core).
+        // a path. The namespace engine (P-ID-10) resolves a COMPILED permission through the four
+        // userset operators; a name that is not a compiled permission falls through to a raw
+        // relation check (one primitive — both compose over the SAME depth-bounded rewrite core).
         let scope = myelin_storage::TenantScope::from_verified_token(subject, subject.region.clone());
-        let relation = myelin_identity::RelName(permission.0.clone());
-        Ok(self
-            .engine
-            .check(&scope, subject, &relation, object, at, caveat))
+
+        // A caveat is the field/transition ABAC rider evaluated AFTER the relation/permission
+        // grant holds (off the hot path, §8.6). The permission-aware namespace resolution is the
+        // grant; the raw `check` already threads the caveat. To keep ONE caveat evaluation seam we
+        // run the namespace grant first, then apply the caveat through the raw engine's literal
+        // evaluator only when a caveat is present.
+        let object_type = namespace::type_of_object_ref(object);
+        let granted = self.namespace.lock().unwrap_or_else(|e| e.into_inner()).permits(
+            &self.engine,
+            &scope,
+            subject,
+            &object_type,
+            &permission.0,
+            object,
+            at,
+        );
+        if !granted {
+            return Ok(Decision::Deny);
+        }
+        match caveat {
+            None => Ok(Decision::Allow),
+            // The caveat rides on top of the grant (the literal-only floor, P-ID-09; full QueryAst
+            // core P-ID-22). A satisfied caveat keeps Allow; a violated one Denies; a missing-
+            // context one is Conditional — never a silent Allow.
+            Some(cav) => Ok(check_engine::eval_caveat(cav)),
+        }
     }
 
     fn list_objects(
@@ -444,11 +502,22 @@ impl IdentityService for StoreBackedCheck {
         Err(AuthzError::NotYetImplemented("erase → P-ID-20 (M1)"))
     }
 
+    /// 4.9 — admit a subsystem's ReBAC namespace fragment into the cell schema. **LIVE (P-ID-10):**
+    /// the names-only ABI carrier is validated + admitted through the [`NamespaceEngine`] (the
+    /// org/team/project core hierarchy is pre-loaded; subsystem fragments compile on top). A
+    /// well-formed fragment returns `Admitted{fragment_id}`; a malformed one (undeclared relation,
+    /// id-minting, duplicate type/permission) returns `Rejected{reason}` — loudly, never silently
+    /// admitted. The RICH rewrite-carrying declaration the M3/M4 fragments use is
+    /// [`StoreBackedCheck::admit_fragment_def`] over a [`namespace::FragmentDef`].
     fn admit_fragment(
         &self,
-        _fragment: &myelin_identity::NamespaceFragment,
+        fragment: &myelin_identity::NamespaceFragment,
     ) -> myelin_identity::Result<myelin_identity::FragmentAdmit> {
-        Err(AuthzError::NotYetImplemented("admit_fragment → P-ID-10 (M1)"))
+        Ok(self
+            .namespace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .admit_abi(fragment))
     }
 }
 
