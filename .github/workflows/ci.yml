@@ -64,6 +64,28 @@ jobs:
       - name: The scorecard ratchet meta-test (dropping a row OR green-without-proof reds the gate)
         run: cargo test -p myelin-harness --test scorecard_ratchet
 
+  id-m1-scorecard:
+    # The Identity M1 → M2 EXIT-GATE scorecard (P-079 / P-ID-21) — the consolidated cross-tenant /
+    # fail-static / disabled-user go/no-go. LOUD: the gate is the `id-m1-scorecard` binary's exit
+    # code. It RE-RUNS (does not re-implement) every required M1 Id drill's proof command — ID-D3
+    # (cross-tenant 0), ID-D2 (fail-static), ID-D1 (disabled-in-5-min), ID-D4 (leak-free pre-filter
+    # incl. the S8 JOIN), ID-D7 (watermark), ID-D5 (delegation intersection), ID-D6 (token-crash),
+    # ID-D8 (restore) — plus the contract-coverage 4.1–4.11 re-affirm, records each as a dated green
+    # artifact, writes testing/scorecards/id-m1.md, and EXITS NON-ZERO if any row is missing or
+    # claimed-not-proven (the gate invariant: M2/the reactive layer does not run over a red M1 Id
+    # gate, master-sequencing §2 / EI-01 §2). There is deliberately NO `|| true` / `continue-on-
+    # error`. The M5-hardening floor (ID-D9 30× surge + multi-cell → P-ID-31/P-ID-35) is a named,
+    # visible deferral — Id is *correct* at M1, *hardened* at M5. The id_m1_scorecard_ratchet test
+    # proves dropping a drill OR flipping it green-without-proof reds the gate.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: The Id M1→M2 exit-gate scorecard (re-runs every M1 Id drill; non-zero on any red/missing row)
+        run: cargo run -p myelin-harness --bin id-m1-scorecard
+      - name: The Id-M1 scorecard ratchet meta-test (dropping a drill OR green-without-proof reds the gate)
+        run: cargo test -p myelin-harness --test id_m1_scorecard_ratchet
+
   build-test-clippy:
     runs-on: ubuntu-latest
     steps:
