@@ -5,6 +5,16 @@ members = [
     "crates/myelin-identity",
     "crates/myelin-events",
     "crates/myelin-refs",
+    # The myelin-search SERVICE crate skeleton (SRCH-P01 → P-021). Search owns NO contract
+    # crate (architecture §0/§1: it is overwhelmingly a CONSUMER — it composes myelin-query,
+    # myelin-identity, myelin-events, myelin-gdpr, myelin-content and holds only derived,
+    # reconstructible state). At M0 this crate carries ONLY the index-document NAME ANCHORS
+    # (the field/unit names aligned to the frozen EventEnvelope (2.1) + ArtifactRef (5.1), no
+    # mechanism) + the names/units drift test. The engine, the index backends, and the
+    # permission-aware query pipeline (the path the search-requires-acl-filter lint guards)
+    # land in M2 (SRCH-P03..SRCH-P16). It sits in the consumer tier of the §2.9 DAG: it
+    # depends on -tenancy/-events/-identity and MUST NOT be depended on by them.
+    "crates/myelin-search",
     "crates/myelin-content",
     "crates/myelin-query",
     "crates/myelin-agent",

@@ -105,6 +105,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "myelin-search"
+version = "0.0.0"
+dependencies = [
+ "myelin-events",
+ "myelin-identity",
+ "myelin-lints",
+ "myelin-tenancy",
+ "serde_json",
+]
+
+[[package]]
 name = "myelin-storage"
 version = "0.0.0"
 dependencies = [
