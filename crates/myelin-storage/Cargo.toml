@@ -101,3 +101,11 @@ serde_json.workspace = true
 # `rpo_max_mins` bound from the workspace-root `thresholds.toml` (the versioned source of
 # truth, P-038) — NEVER a hardcoded magic number (EI-01 §3). It never enters the runtime DAG.
 toml.workspace = true
+# myelin-control-plane is a DEV-dependency ONLY: the contract-12.4 CDC pair
+# (tests/cdc_12_4_storage_residency_report.rs, P-ST-15) proves Storage's per-store region REPORTS
+# (the provider) feed the control plane's `residency_verify` (the consumer) that signs the
+# no-global-pool attestation. The control plane already depends on myelin-storage (the normal
+# DAG edge); a dev-dependency back is the CDC consumer reaching DOWN to its provider's test — a
+# dev-only edge Cargo permits (it never enters the storage crate's production/runtime DAG, so no
+# build cycle). This is the SAME posture as the myelin-lints / myelin-harness dev-deps above.
+myelin-control-plane = { path = "../myelin-control-plane" }

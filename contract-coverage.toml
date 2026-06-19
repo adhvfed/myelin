@@ -743,8 +743,16 @@ landing = "P-084"
 [[contract]]
 row = "12.4"
 title = "residency_verify -> SignedAttestation"
-status = "deferred"
-landing = "P-085"
+# COVERED: the control plane (P-085) ships the aggregation+sign half + its in-crate CDC pair, and
+# Storage (P-ST-15 / P-102) ships the per-store region REPORTS (the provider) + the
+# `myelin storage residency verify <tenant>` admin path. The cross-crate CDC file below proves
+# Storage's reports (PROVIDER) feed the control plane's `residency_verify` (CONSUMER) that signs the
+# no-global-pool attestation — the two halves agree (green + the cross-region fail leg) WITHOUT a
+# shared report type (the DAG forbids a myelin-storage -> myelin-control-plane edge; documented
+# deviation, EI-01 §1). The CDN edge set + push-mirror targets EXTEND this same row in M3
+# (P-ST-23/P-254, P-ST-25/P-255) — the aggregation shape does not change.
+status = "covered"
+cdc = ["crates/myelin-storage/tests/cdc_12_4_storage_residency_report.rs"]
 
 [[contract]]
 row = "12.5"
