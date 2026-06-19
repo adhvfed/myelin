@@ -219,6 +219,52 @@ impl PgStore {
         Ok(())
     }
 
+    /// **The residency write-boundary probe (P-CP-12 / CP-D3 / STOR-D5 — layer 3 at the LIVE DB).**
+    /// Attempt to write a tuple whose **row `region` column** is `row_region` while the session
+    /// (the cell) is pinned to `self.region`. This is the cross-region-egress attempt the
+    /// four-layer enforcement (§5.3 layer 3) forbids: a write where `row.region ≠ cell.region`.
+    /// When `row_region != self.region` the DB's `WITH CHECK (region = current_setting(...))` RLS
+    /// policy **REJECTS** the INSERT — proving the residency write boundary is enforced by Postgres,
+    /// not by app code (an out-of-region write never lands; 0 cross-region rows are admitted). When
+    /// `row_region == self.region` the write is admitted (the green leg).
+    ///
+    /// This is a DELIBERATE out-of-region probe (the row region is decoupled from the session
+    /// region), so it lives behind an explicit, loudly-named method rather than in the normal
+    /// [`Self::put_tuple`] path (which always writes `self.region` — the cell's region the harness
+    /// threaded — so the production write path is structurally region-pinned). The drill calls this
+    /// to FORCE the boundary to fire (a gate that cannot go red is not a gate, EI-01 §3).
+    pub async fn put_tuple_in_region(
+        &self,
+        tenant: &str,
+        row_region: &str,
+        object_id: &str,
+        relation: &str,
+        subject: &str,
+    ) -> Result<(), PgError> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| PgError::Query(e.to_string()))?;
+        // The session (the cell) is pinned to self.region; the ROW carries row_region. When they
+        // differ, the RLS WITH CHECK predicate `region = current_setting('myelin.region')` fails
+        // and Postgres refuses the INSERT (a 42501 / row-violates-policy error).
+        self.set_session_scope(&mut conn, tenant).await?;
+        sqlx::query(
+            "INSERT INTO rebac_tuple (tenant_id, region, object_id, relation, subject) \
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+        )
+        .bind(tenant)
+        .bind(row_region)
+        .bind(object_id)
+        .bind(relation)
+        .bind(subject)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| PgError::Query(e.to_string()))?;
+        Ok(())
+    }
+
     /// The S8 reverse-index lookup the authz path uses: the objects where `subject` has
     /// `relation`, within the verified `(tenant, region)` partition (RLS-scoped). Ordered by
     /// `object_id` for a deterministic result.
@@ -336,15 +382,83 @@ impl PgStore {
         conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
         tenant: &str,
     ) -> Result<(), PgError> {
+        self.set_session_scope_in_region(conn, tenant, &self.region).await
+    }
+
+    /// Set the `(tenant, region)` session GUCs to an EXPLICIT region (a test-support seam for the
+    /// P-CP-12 / STOR-D5 cross-region-egress drill). The production path
+    /// ([`Self::set_session_scope`]) always pins `self.region` — the cell's region the harness
+    /// injected — so a production session is structurally in-region. This decoupled variant lets the
+    /// drill scope a session to a DIFFERENT region than the tenant's rows and PROVE the DB's RLS
+    /// `(tenant, region)` policy returns ZERO of them (cross-region read is impossible).
+    async fn set_session_scope_in_region(
+        &self,
+        conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+        tenant: &str,
+        region: &str,
+    ) -> Result<(), PgError> {
         // Set BOTH the tenant_id and region GUCs in ONE statement (one round trip) so the RLS
         // policy's `(tenant_id, region)` predicate is keyed before any tenant query runs.
         sqlx::query("SELECT set_config('myelin.tenant_id', $1, false), set_config('myelin.region', $2, false)")
             .bind(tenant)
-            .bind(&self.region)
+            .bind(region)
             .execute(&mut **conn)
             .await
             .map_err(|e| PgError::Query(e.to_string()))?;
         Ok(())
+    }
+
+    /// **A connection scoped to an EXPLICIT `(tenant, region)` (P-CP-12 / STOR-D5 drill seam).** Like
+    /// [`Self::scoped_conn`] but pins the session to `region` instead of the cell's `self.region`.
+    /// The drill uses this to read as a session in a region DIFFERENT from the tenant's rows and
+    /// prove the DB returns 0 of them (cross-region read impossible).
+    pub async fn scoped_conn_in_region(
+        &self,
+        acting_tenant: &str,
+        region: &str,
+    ) -> Result<sqlx::pool::PoolConnection<sqlx::Postgres>, PgError> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| PgError::Query(e.to_string()))?;
+        self.set_session_scope_in_region(&mut conn, acting_tenant, region).await?;
+        Ok(conn)
+    }
+
+    /// **The reverse-index lookup under an EXPLICIT region session (P-CP-12 / STOR-D5 drill seam).**
+    /// Like [`Self::reverse_index`] but scopes the session to `region`. When `region` differs from
+    /// the region the tenant's rows were written in, the DB's `(tenant, region)` RLS policy returns
+    /// ZERO rows — proving a cross-region read is impossible (0 cross-region PII egress).
+    pub async fn reverse_index_in_region(
+        &self,
+        tenant: &str,
+        region: &str,
+        subject: &str,
+        relation: &str,
+    ) -> Result<Vec<String>, PgError> {
+        use sqlx::Row;
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| PgError::Query(e.to_string()))?;
+        self.set_session_scope_in_region(&mut conn, tenant, region).await?;
+        self.authz_queries
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // The query threads the tenant predicate (defence in depth); the REGION is enforced by the
+        // RLS policy keyed on current_setting('myelin.region') — which we set to `region` above.
+        let rows = sqlx::query(
+            "SELECT object_id FROM rebac_tuple \
+             WHERE tenant_id = $1 AND subject = $2 AND relation = $3 ORDER BY object_id",
+        )
+        .bind(tenant)
+        .bind(subject)
+        .bind(relation)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| PgError::Query(e.to_string()))?;
+        Ok(rows.iter().map(|r| r.get::<String, _>("object_id")).collect())
     }
 
     // ---- Outbox + relay (the real FOR UPDATE SKIP LOCKED claim) -----------------------------
