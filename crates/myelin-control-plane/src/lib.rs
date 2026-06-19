@@ -6,7 +6,14 @@
 //! two-phase signup — PII born inside the cell; see [`place`]), and **P-CP-08 / P-084**
 //! (`placement_of(tenant_id)` — the routing answer + the gateway misroute-rejection, layer 4, CP-D2;
 //! see [`placement_of`]), and **P-CP-09 / P-085** (`residency_verify` — the no-global-pool signed
-//! attestation over the M1 store set; see [`residency_verify`]).
+//! attestation over the M1 store set; see [`residency_verify`]), and **P-CP-12 / P-096**
+//! (**the four-layer region-pinning enforced end-to-end** — the M1→M2 go/no-go: layers 1+2 (region
+//! immutable + the placement invariant) + layer 3 (the *runtime* `residency-pin` write boundary —
+//! every write asserts `row.region == cell.region`, the cell's region injected by the harness) +
+//! layer 4 (the gateway rejects a misroute), with **no cross-region query path for personal data**;
+//! see [`four_layer`]). The live store-layer twin (the Postgres RLS `WITH CHECK` on `region`) is
+//! proven against the dev stack in the storage `stor_d5_cross_region_egress` integration drill
+//! (CP-D3 + STOR-D5).
 //!
 //! **Owning architecture doc:**
 //! `planning/05-refined-shared-systems-architecture/tenancy-and-control-plane.md`
@@ -120,6 +127,7 @@
 //!   `cell_provisioning` log records each gating step.
 
 pub mod discover;
+pub mod four_layer;
 pub mod holder;
 pub mod isolation;
 pub mod place;
@@ -130,6 +138,9 @@ pub mod residency_verify;
 pub mod schema;
 
 pub use discover::{DiscoverKey, DiscoveryCache, DiscoverySignals, RouteTuple};
+pub use four_layer::{
+    CrossRegionPathError, FourLayerEnforcement, ResidencyWriteBoundary, ResidencyWriteRejected,
+};
 pub use isolation::{partition_key, IsolationTier, PartitionKey, PoolStore};
 pub use placement_of::{
     CellGateway, GatewayReject, Misroute, MisrouteAudit, MisrouteAuditRecord, PlacementOf,
