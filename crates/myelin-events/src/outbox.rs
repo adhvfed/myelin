@@ -275,6 +275,27 @@ impl OutboxStore {
         self.lock().dead_letters.len()
     }
 
+    /// The **`recorded_at` of the oldest still-unsent row** — the input to the contract-1.8
+    /// *outbox age* survival signal (§4.11 "outbox depth **+ age**"). Depth alone says "how
+    /// many are stuck"; age says "how LONG the oldest has been stuck" — a relay that is keeping
+    /// up holds a tiny depth AND a near-now age, while a wedged relay shows age climbing even at
+    /// constant depth. Returns `None` when the outbox is fully drained (no unsent row → no age).
+    ///
+    /// Rows are committed oldest-first into `order`, so the first unsent row in `order` is the
+    /// oldest unsent one; its envelope's `recorded_at` (RFC-3339 UTC, the frozen unit §2.10) is
+    /// the age anchor. The age-in-seconds is computed against a caller-supplied `now` in
+    /// [`crate::telemetry`] (M0 has no shared wall-clock until `serve`, P-S12 — named floor).
+    pub fn oldest_unsent_recorded_at(&self) -> Option<crate::Timestamp> {
+        let inner = self.lock();
+        inner.order.iter().find_map(|id| {
+            inner
+                .rows
+                .get(id)
+                .filter(|r| r.published_at.is_none())
+                .map(|r| r.envelope.recorded_at.clone())
+        })
+    }
+
     /// The total committed-row count (sent + unsent), for the no-ghost assertion (every
     /// committed event is delivered exactly once; an aborted transaction adds nothing here).
     pub fn committed_count(&self) -> usize {
