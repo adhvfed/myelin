@@ -140,6 +140,30 @@
 //!   **P-ST-13 (global P-061)**; the RTO / cell-kill half is **P-ST-14 (global P-100)**; the
 //!   cell-scale RPO re-confirm is **P-ST-30 (M5)**; the real WAL-shipping driver is the P-S12/P-S15
 //!   floor. The mutation floor on the crypto-shred-excluded-from-backup branch is mandatory-core.
+//! - **`restore(to_offset T)` to the cross-seam consistency point (P-ST-12 / contract 11.5 — global
+//!   P-060)** is now IMPLEMENTED in [`restore`]: [`restore::restore_to_offset`] lands every tier at
+//!   ONE consistent point T (the per-aggregate outbox `seq` / event-log offset, the §7.3 cross-seam
+//!   cursor [`coloc`] establishes): (1) PITR-restore OLTP to the rows whose `seq ≤ T` (reusing
+//!   [`backup::ContinuousArchiver::pitr_reachable`] for reachability; a row past T is dropped); (2)
+//!   verify every restored row's referenced [`blob::ContentHash`] is present in the restored object
+//!   tier — a referenced-but-MISSING hash is the hard [`restore::RestoreError::DanglingBlobRef`]
+//!   FAIL (the §7.3 silent-corruption case, the highest-bar silent-data-loss floor — it never
+//!   silently passes); (3) **reindex derived stores FROM SOURCE up to T** through the live consumer
+//!   replay ([`restore::ReindexFromSource`] — the ONLY rebuild path, never from a derived backup →
+//!   *derived == source by construction*, EI-04 §5; consumers resume at T); (4) restore tenant KEKs
+//!   EXCEPT any crypto-shredded since the backup (reusing [`kms::KmsEngine::backup_snapshot`], which
+//!   already excludes a destroyed key — §7.5, a shredded key stays dead across the restore). It
+//!   REUSES the backup machinery ([`backup`], P-059), the `seq` cursor ([`coloc`], P-016), the KMS
+//!   exclusion ([`kms`], P-058), the [`blob::ContentHash`] address (P-047), and the harness
+//!   cross-seam ASSERTION (`myelin_harness::restore::RestoredSnapshot::verify_cross_seam`, P-056,
+//!   driven from the STOR-D1 drill) — never re-defined. **Floors named in [`restore`]:** the
+//!   CI-wired restore-verify GATE (STOR-D1, the permanent gate) that DRIVES this restore is the
+//!   sibling **P-ST-13 (global P-061)**; the post-restore re-erasure (STOR-D3 — per-subject
+//!   re-erasure against the GDPR ledger) is **P-ST-14 (global P-100)**; this restore produces the
+//!   prod-scale RESTORED copy online migrations rehearse lock-time against — **P-ST-21 (global
+//!   P-126, STOR-D8)**; the real `pg_restore` + WAL-replay driver is the P-S12/P-S15 floor. The
+//!   mutation floor on the cross-seam-point + referenced-hash-presence logic is ≥ 85%
+//!   (mandatory-core — the silent-data-loss floor, the highest bar).
 
 pub mod backup;
 pub mod blob;
@@ -149,6 +173,7 @@ pub mod kms;
 pub mod kms_failstatic;
 pub mod migration;
 pub mod oltp;
+pub mod restore;
 pub mod rls;
 
 pub use backup::{
@@ -173,4 +198,8 @@ pub use migration::{
     Migrations, OnlineMigrationRunner, PhaseProgress,
 };
 pub use oltp::{OltpConfig, OltpError, OltpPool, PermitGuard};
+pub use restore::{
+    restore_to_offset, restored_key_counts, BlobPresence, ReindexFromSource, RestoreError,
+    RestoreReport, SourceEvent, SourceLog, WalRow,
+};
 pub use rls::{RlsError, TenantQuery, TenantScope, TenantTable};
