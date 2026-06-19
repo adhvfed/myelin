@@ -35,11 +35,29 @@
 //! finish in-flight, ack-then-exit; a clean drain leaves `outbox_depth == 0`). The hello-world
 //! boot test (boot → emit → consume → drain) + the CDC 1.1 pair are the dated green artifact.
 //!
+//! ## Status (P-S13 → P-030, 2026-06-19) — the three-surface topology + tenant-from-token is DONE
+//! The **tenant-from-token** mechanism (1.2, SUB-D7) is **implemented** in [`topology`]: the
+//! lifecycle-opened [`topology::PublicSurface`] derives the operating tenant from the verified
+//! token's `Principal`, NEVER from the URL path — a path-tenant ≠ token-tenant mismatch is
+//! REJECTED ([`topology::PublicReject::CrossTenantIdor`]) and AUDITED ([`topology::AuditSink`],
+//! PII-free) as a cross-tenant IDOR, and `misroute_count` stays 0. The internal RPC surface
+//! ([`topology::InternalSurface`]) re-authorizes every call through the [`topology::Authorizer`]
+//! seam (identity trusted, authorization re-run — "internal = safe" is not presumed). The SUB-D7
+//! drill (`tests/drill_sub_d7_idor.rs`) + the CDC 1.2 pair (`tests/cdc_1_2_topology.rs`) are the
+//! dated green artifact: 60 spoofs rejected + audited, 0 served (`CrossTenantCount == 0`).
+//!
 //! ## Floors named (deferred bodies → filling prompt)
-//! - The three-surface topology + **tenant-from-token** (1.2, SUB-D7) → **P-S13**; **liveness ≠
-//!   readiness** on the metrics-health surface (1.3, SUB-D9) → **P-S14**. `serve` opens three
-//!   named surfaces (the [`serve::PortOpener`] seam) and exports the signal set; the spoof
-//!   rejection + the readiness/liveness split are those prompts.
+//! - **Liveness ≠ readiness** on the metrics-health surface (1.3, SUB-D9) → **P-S14**. `serve`
+//!   opens the metrics-health surface and exports the signal set; the readiness/liveness split
+//!   (a dead critical dependency reports *not ready*; liveness must NOT check dependencies) is
+//!   that prompt.
+//! - The real **gateway transport + mTLS/signed-internal-credential wire format + the durable
+//!   tamper-evident audit sink** for the IDOR records → the gateway/listener wiring (P-S14+) and
+//!   GDPR `P-GA-19`/`P-062` (the audit *consumer* reads the same PII-free
+//!   [`topology::IdorAuditRecord`] shape). The substrate-side security property (tenant-from-token,
+//!   re-authorize-every-call, every IDOR audited) is complete now; the wire transport is named.
+//! - The [`topology::Authorizer`] body (the depth-bounded Zanzibar `check`/`list_objects`) is
+//!   Identity M1 (`P-ID-09`/`P-ID-11`). Here the trait is the re-authorize-every-call SEAM.
 //! - The forward-only **migration RUNNER + the exhaustive holder auto-registration** (1.4/1.5)
 //!   → **P-S15**. Here [`serve::MigrationRunner`] applies the embedded DDL in order at boot and
 //!   refuses a destructive migration; the env-first `Config::from_env()` parse of the real
@@ -68,10 +86,15 @@ use serde::{Deserialize, Serialize};
 
 pub mod crate_graph;
 pub mod serve;
+pub mod topology;
 
 pub use serve::{
     boot, serve, AppSpec, ConsumerReg, HoldersSpec, InternalRpc, Migration, MigrationRunner,
     Migrations, OutboxSpec, PortOpener, PublicRoutes, ServeHandle, Surface, Telemetry,
+};
+pub use topology::{
+    AllowPrincipal, AuditSink, Authorizer, DenyAll, IdorAuditRecord, InjectedIdentity,
+    InternalReject, InternalSurface, PublicReject, PublicSurface,
 };
 
 /// Seconds (frozen unit, architecture §2.10) — the fail-static window bounds.
