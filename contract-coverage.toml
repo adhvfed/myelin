@@ -650,8 +650,25 @@ cdc = ["crates/myelin-storage/tests/cdc_11_3_kms.rs"]
 [[contract]]
 row = "11.4"
 title = "crypto-shred + GD-4 granularity"
-status = "deferred"
-landing = "P-099"
+status = "covered"
+# P-095 (P-ST-08): the GD-4 classify-driven key-choice RULE half — `key_class_for` routes an
+# `erasure=subject` tag to a per-subject DEK and a bulk class to the tenant DEK (cdc_11_4_classify_
+# key_choice.rs).
+# P-099 (P-ST-09): the erase-ALGORITHM half — the crypto-shred `erase(subject, tenant)` six-step
+# mechanism (CryptoShredErase::erase: pseudonym-map shred → KMS.destroy(per_subject_DEK) → Search
+# purge+reindex → Refs tombstone → Bus erase → erasure receipt), idempotent (a re-erase is a no-op
+# success) and loud-on-partial-failure (the erasure is recorded only when every step succeeded). Step
+# 2 is owned in-crate (KmsEngine::destroy_dek); the cross-holder steps are seam traits the DSR
+# orchestrator wires. STOR-D4 (the per-subject-DEK-destroy half) is green: erase a subject → attempt
+# recovery from the backup snapshot → 0 recoverable (the key is destroyed + excluded from backup,
+# §7.5). The CDC pair is the DSR orchestrator wiring the five seams + calling erase
+# (cdc_11_4_erase_algorithm.rs). The GD-4 granularity + structural-floor completeness is the sibling
+# P-ST-10 (global P-101); the git crypto-shred reach is P-ST-24 (P-253); the cross-holder reach
+# completeness is P-ST-35 (M5); the post-restore re-erasure (STOR-D3) is P-ST-14 (P-100).
+cdc = [
+    "crates/myelin-storage/tests/cdc_11_4_classify_key_choice.rs",
+    "crates/myelin-storage/tests/cdc_11_4_erase_algorithm.rs",
+]
 
 [[contract]]
 row = "11.5"

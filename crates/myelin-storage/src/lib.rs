@@ -178,6 +178,34 @@
 //!   **M4 follow-on (P-ST-27)** (the per-subject class today covers free-text/profile/chat-body/
 //!   agent-memory). The mutation floor on the classify→key-choice routing + the
 //!   ciphertext-at-rest property is mandatory-core (≥ 80%).
+//! - **The crypto-shred `erase(subject, tenant)` six-step algorithm (P-ST-09 / contract 11.4 erase
+//!   half — global P-099)** is now IMPLEMENTED in [`erase`]: [`erase::CryptoShredErase::erase`] runs
+//!   the storage.md §5.2 algorithm in order — (1) pseudonym-map shred ([`erase::PseudonymShred`] →
+//!   Id 4.8 `IdentityService::erase`), (2) `KMS.destroy(per_subject_DEK(tenant, subject))` (the step
+//!   storage OWNS directly — [`kms::KmsEngine::destroy_dek`] on the subject's DEK, crypto-shredding
+//!   the free-text/chat/profile/agent-memory ciphertext **live AND in backups by construction**,
+//!   §7.5), (3) Search purge+reindex (the plaintext-derived EXCEPTION — [`erase::SearchPurge`]), (4)
+//!   Refs tombstone ([`erase::RefsTombstone`]), (5) Bus erase ([`erase::BusErase`]), (6) record the
+//!   erasure receipt to the audit/erasure-ledger holder ([`erase::ErasureLedgerSink`], 10.8). The
+//!   algorithm is **idempotent** (re-erasing an already-erased subject is a NO-OP success, not an
+//!   error — [`kms::KmsEngine::destroy_dek`] returns `false` on a second call, treated as success +
+//!   flagged `re_run`) and a partial failure is a LOUD [`erase::EraseError`] (the erasure is recorded
+//!   ONLY when every step succeeded — never "assume erased"). The cross-holder steps (1/3/4/5/6) are
+//!   trait SEAMS the DSR orchestrator wires (storage cannot depend on the consumer subsystems Search/
+//!   Refs without an upward DAG edge; Id/Bus/the-ledger are reached the same way for one uniform
+//!   seam set); step 2 is owned in-crate. The [`erase::ErasureReceipt`] is the dated STOR-D4 artifact
+//!   — `recoverable_in_backup == 0` is the `0 recoverable PII in any backup` gate reading (probed
+//!   from [`kms::KmsEngine::backup_snapshot`], which already excludes a destroyed key, §7.5), with the
+//!   `crypto_shred_lag_ms` telemetry. It REUSES the SAME P-058 [`kms::KmsEngine`] the encrypted
+//!   columns/blobs resolve DEKs through (never a parallel key store — so the destroy reaches exactly
+//!   the ciphertext those stores wrote) and the [`encryption::SubjectId`] vocabulary — never
+//!   re-defined. **Floors named in [`erase`]:** the GD-4 granularity + structural GDPR floor is the
+//!   sibling **P-ST-10 (global P-101)**; the git crypto-shred reach is **P-ST-24 (global P-253)**;
+//!   the cross-holder reach COMPLETENESS (the every-holder D-S5 drill) is **P-ST-35 (M5)**; the
+//!   post-restore RE-ERASURE (STOR-D3) is **P-ST-14 (global P-100)** (it replays the ledger this
+//!   records into); the real seam bindings land with their subsystems (Id P-ID-20, Search M2, Refs
+//!   M2, Bus P-092/P-093, ledger P-GA-15). The mutation floor on the six-step ordering + the
+//!   idempotent short-circuit + the 0-recoverable-in-backup verify is mandatory-core.
 //! - **Continuous WAL archiving + base backups + PITR (P-ST-11 / contract 11.5 — global P-059)**
 //!   is now IMPLEMENTED in [`backup`]: [`backup::ContinuousArchiver`] ships sealed WAL segments
 //!   off-host continuously (strictly forward, append-only) + takes periodic [`backup::BaseBackup`]s,
@@ -254,6 +282,7 @@
 pub mod backup;
 pub mod blob;
 pub mod encryption;
+pub mod erase;
 // The minimal cache seam (Stage 1 / infra — NEW). No cache trait existed before; this is the
 // one-line-swap Cache trait (in-memory floor + Valkey/Redis backing behind `integration`).
 pub mod cache;
@@ -302,6 +331,10 @@ pub use cache::{Cache, CacheError, InMemoryCache};
 pub use coloc::{ColocError, ColocatedOltp, ColocatedTx, COLOCATED_OUTBOX_MIGRATION};
 pub use encryption::{
     key_class_for, ColumnCryptor, DekContentWrap, EncryptedColumn, KeyChoiceError, SubjectId,
+};
+pub use erase::{
+    BusErase, CryptoShredErase, EpochMillis, EraseError, EraseHolders, ErasureLedgerSink,
+    ErasureReceipt, PseudonymShred, RefsTombstone, SearchPurge,
 };
 pub use holder::{register_holder, BlobStoreHolder, OltpHolderRegistration, OltpStoreHolder};
 pub use key_origin::{
