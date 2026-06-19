@@ -34,10 +34,16 @@
 //! `myelin-tenancy` (the sink) and **re-exported here** as `myelin_events::ArtifactRef`,
 //! preserving the frozen public path with no signature change.
 //!
+//! ## Status (dated; the code wins over the docs — VISION §3)
+//! - `EventEnvelope` is **FROZEN as THE names/units anchor (X-5) — P-S05, 2026-06-19.**
+//!   P-001 shipped the field list to the frozen shape; P-S05 freezes it as the anchor by
+//!   adding (a) the per-name/per-unit compile-assertion test (`surface_event_envelope_*`)
+//!   and (b) the **provider-side CDC envelope-shape contract test for contract 2.1**
+//!   (`cdc_2_1_*`) that pins the serialized wire shape every later contract reconciles
+//!   against. The consumer side of the 2.1 CDC pair (the relay re-hydrating + a consumer
+//!   reading the wire envelope) lands in **P-S07/P-S08** — named, not silently skipped.
+//!
 //! ## Floors named (stubbed bodies → filling prompt)
-//! - `EventEnvelope`'s *finalised* field freeze (the full §2.10 anchor with a compile
-//!   test on every name/unit) is **P-S05**. P-001 ships the field list to the frozen
-//!   shape as the skeleton; P-S05 freezes it as THE anchor with the names/units test.
 //! - `OutboxTx::emit` causality derivation (root carries / parent = cause.event_id /
 //!   depth = cause.depth + 1) is **P-S06** — the body here is `todo!()`.
 //! - The `outbox` table + relay (2.3, SUB-D1/BUS-D4) is **P-S07**.
@@ -114,8 +120,10 @@ pub struct Timestamp(pub String);
 /// this exact field list. `schema_ver` gates evolution (upcasters bridge forward-only,
 /// P-S09). References-not-payloads: `payload` carries IDs/`ArtifactRef`s, never PII bodies.
 ///
-/// Field order + names match the §2.10 frozen anchor; P-S05 adds the per-name/per-unit
-/// compile test that makes this THE anchor.
+/// Field order + names match the §2.10 frozen anchor. **Frozen as THE anchor by P-S05**
+/// (2026-06-19): the per-name/per-unit compile test + the provider-side CDC envelope-shape
+/// contract test (2.1) pin it. Any drift from a name/type/unit now fails to compile or
+/// fails the wire-shape CDC test.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventEnvelope {
     /// ULID; the idempotency key (ADR-04.1).
@@ -240,14 +248,11 @@ mod tests {
         }
     }
 
-    /// Compile-asserting test: the `EventEnvelope` field NAMES + UNITS match the §2.10
-    /// frozen anchor (contract 2.1). `occurred_at: Timestamp` (RFC-3339), `depth: u32`,
-    /// `pii_key_ref` present-as-Option of the kms:// shape, `payload: serde_json::Value`
-    /// (references-not-payloads). Drift from any name/type stops compilation. P-S05 adds
-    /// the per-unit assertions; this is the skeleton's field-shape floor.
-    #[test]
-    fn surface_event_envelope_field_shape_is_frozen() {
-        let env = EventEnvelope {
+    /// Build the canonical anchor envelope used by both the field-shape test and the
+    /// provider-side CDC contract test (one fixture, two assertions). Field-by-field this
+    /// is the §2.10 names/units anchor: every name spelled, every frozen unit exercised.
+    fn anchor_envelope() -> EventEnvelope {
+        EventEnvelope {
             event_id: EventId("01J0".into()),
             type_: EventType("issues.issue.created".into()),
             schema_ver: 1u32,
@@ -256,25 +261,148 @@ mod tests {
             actor: Actor(sample_principal()),
             subject: ArtifactRef("myelin://acme/issues/issue/PROJ-1".into()),
             aggregate: AggregateKey("issue:PROJ-1".into()),
-            causation_id: None,
+            causation_id: Some(EventId("01J-parent".into())),
             correlation_id: CorrelationId("root".into()),
-            caused_by: None,
-            depth: 0u32,
-            contains_personal_data: false,
+            caused_by: Some(CausedBy("session:abc".into())),
+            depth: 4u32,
+            contains_personal_data: true,
             data_role: DataRole::Controller,
             visibility: Visibility::Internal,
-            pii_key_ref: Some(PiiKeyRef("kms://acme/3/tenant".into())),
+            pii_key_ref: Some(PiiKeyRef("kms://acme/3/subject:u42".into())),
             occurred_at: Timestamp("2026-06-19T00:00:00Z".into()),
             recorded_at: Timestamp("2026-06-19T00:00:01Z".into()),
             payload: serde_json::json!({ "ref": "myelin://acme/issues/issue/PROJ-1" }),
-        };
-        // The depth + correlation/causation fields are the causal triple the loop guard
-        // reads (AG-6); assert they are present and integer-typed.
-        assert_eq!(env.depth, 0u32);
-        assert!(env.causation_id.is_none());
+        }
+    }
+
+    /// P-S05 GATE artifact: the compile-asserting names/units test that makes the envelope
+    /// THE X-5 anchor (contract 2.1; architecture §2.10). Every field NAME is spelled out
+    /// (a rename breaks the struct-literal at compile time) and every frozen UNIT is
+    /// asserted in its frozen form:
+    ///   - `occurred_at` / `recorded_at` are `Timestamp` = RFC-3339 UTC (`Z`-suffixed);
+    ///   - `depth: u32` (integer causal depth — the loop ceiling reads it, AG-6);
+    ///   - `schema_ver: u32` (integer; upcasters gate evolution forward-only);
+    ///   - `causation_id` (IMMEDIATE parent) + `correlation_id` (ROOT) — the nested triple;
+    ///   - `pii_key_ref` = `kms://<tenant>/<dek-epoch>/<class>`, class ∈ {tenant,subject:<id>,blob};
+    ///   - `payload: serde_json::Value` (references-not-payloads — IDs/refs, never a PII body).
+    ///
+    /// Drift from any name or unit stops this test compiling or failing — this is the freeze.
+    #[test]
+    fn surface_event_envelope_field_shape_is_frozen() {
+        let env = anchor_envelope();
+
+        // --- names + types (the struct literal above already pins every NAME) ---
+        // Re-read each by name so a future rename also breaks here, not only at construction.
+        let _: &EventId = &env.event_id;
+        let _: &EventType = &env.type_;
+        let _: &u32 = &env.schema_ver;
+        let _: &TenantId = &env.tenant;
+        let _: &Region = &env.region;
+        let _: &Actor = &env.actor;
+        let _: &ArtifactRef = &env.subject;
+        let _: &AggregateKey = &env.aggregate;
+        let _: &Option<EventId> = &env.causation_id;
+        let _: &CorrelationId = &env.correlation_id;
+        let _: &Option<CausedBy> = &env.caused_by;
+        let _: &u32 = &env.depth;
+        let _: &bool = &env.contains_personal_data;
+        let _: &DataRole = &env.data_role;
+        let _: &Visibility = &env.visibility;
+        let _: &Option<PiiKeyRef> = &env.pii_key_ref;
+        let _: &Timestamp = &env.occurred_at;
+        let _: &Timestamp = &env.recorded_at;
+        let _: &serde_json::Value = &env.payload;
+
+        // --- frozen units (§2.10) ---
+        // timestamps = RFC-3339 UTC: `T`-separated, `Z`-suffixed (UTC), parseable shape.
+        for ts in [&env.occurred_at.0, &env.recorded_at.0] {
+            assert!(ts.contains('T'), "timestamp must be RFC-3339 (date T time): {ts}");
+            assert!(ts.ends_with('Z'), "timestamp must be UTC (Z-suffixed): {ts}");
+        }
+        // depth is an integer causal depth (u32) — the loop ceiling (AG-6) reads it.
+        assert_eq!(env.depth, 4u32);
+        // the causal triple: immediate parent + root carry through (BUS-5, nested-not-flat).
+        assert_eq!(env.causation_id, Some(EventId("01J-parent".into())));
         assert_eq!(env.correlation_id, CorrelationId("root".into()));
-        // references-not-payloads: payload is a JSON value, not a typed PII body.
+        // pii_key_ref format: kms://<tenant>/<dek-epoch>/<class>, class ∈ {tenant,subject:<id>,blob}.
+        let pkr = &env.pii_key_ref.as_ref().expect("anchor sets pii_key_ref").0;
+        assert!(pkr.starts_with("kms://"), "pii_key_ref must be a kms:// URN: {pkr}");
+        let rest = pkr.strip_prefix("kms://").unwrap();
+        let parts: Vec<&str> = rest.splitn(3, '/').collect();
+        assert_eq!(parts.len(), 3, "kms://<tenant>/<dek-epoch>/<class>: {pkr}");
+        assert_eq!(parts[0], "acme", "tenant segment");
+        assert!(parts[1].parse::<u64>().is_ok(), "dek-epoch is an integer: {}", parts[1]);
+        let class = parts[2];
+        assert!(
+            class == "tenant"
+                || class == "blob"
+                || class.strip_prefix("subject:").is_some_and(|id| !id.is_empty()),
+            "class ∈ {{tenant, subject:<id>, blob}}: {class}"
+        );
+        // references-not-payloads: payload is a JSON value (IDs/refs), not a typed PII body.
         assert!(env.payload.is_object());
+    }
+
+    /// P-S05 CDC artifact: the **provider-side** envelope-shape contract test for 2.1.
+    /// The Bus is the provider of the 2.1 envelope; every emitter+consumer reconciles
+    /// against this wire shape (the X-5 anchor). This test pins the serialized JSON shape:
+    /// the exact set of top-level keys (a rename/add/drop is caught) and the frozen unit
+    /// renderings (timestamps as `Z`-suffixed strings, `depth`/`schema_ver` as integers,
+    /// `pii_key_ref` as the kms:// URN, `payload` as a nested object — references, not a
+    /// PII body). It round-trips to prove the shape is the contract.
+    ///
+    /// **Floor named:** the CONSUMER half of the 2.1 CDC pair — the relay re-hydrating the
+    /// stored envelope (P-S07) and a consumer reading it through the template (P-S08) —
+    /// lands in those prompts. The contract-coverage scanner (P-S21) reads this provider
+    /// row + the P-S07/P-S08 consumer rows as the completed pair.
+    #[test]
+    fn cdc_2_1_envelope_wire_shape_is_the_anchor() {
+        let env = anchor_envelope();
+        let json = serde_json::to_value(&env).expect("envelope serializes");
+        let obj = json.as_object().expect("envelope is a JSON object");
+
+        // The frozen top-level key set (the §2.10 names, in struct-field spelling). A drift
+        // — a dropped, added, or renamed field — changes this set and fails the contract.
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let mut expected = [
+            "event_id",
+            "type_",
+            "schema_ver",
+            "tenant",
+            "region",
+            "actor",
+            "subject",
+            "aggregate",
+            "causation_id",
+            "correlation_id",
+            "caused_by",
+            "depth",
+            "contains_personal_data",
+            "data_role",
+            "visibility",
+            "pii_key_ref",
+            "occurred_at",
+            "recorded_at",
+            "payload",
+        ];
+        expected.sort_unstable();
+        assert_eq!(keys, expected, "the 2.1 envelope wire key set is frozen (X-5 anchor)");
+
+        // Frozen unit renderings on the wire.
+        assert!(obj["schema_ver"].is_u64(), "schema_ver is an integer on the wire");
+        assert!(obj["depth"].is_u64(), "depth is an integer on the wire");
+        // timestamps are RFC-3339 UTC strings (Z-suffixed).
+        assert_eq!(obj["occurred_at"], serde_json::json!("2026-06-19T00:00:00Z"));
+        assert_eq!(obj["recorded_at"], serde_json::json!("2026-06-19T00:00:01Z"));
+        // pii_key_ref renders as the kms:// URN string (Option::Some).
+        assert_eq!(obj["pii_key_ref"], serde_json::json!("kms://acme/3/subject:u42"));
+        // payload is a nested object of references, never a flat PII body.
+        assert!(obj["payload"].is_object(), "payload carries references, not a PII body");
+
+        // The shape IS the contract: round-trip is lossless.
+        let back: EventEnvelope = serde_json::from_value(json).expect("envelope round-trips");
+        assert_eq!(back, env, "the wire shape round-trips to the anchor (no lossy field)");
     }
 
     /// Compile-asserting test: there is NO `publish_now` / fire-and-forget on `OutboxTx`
