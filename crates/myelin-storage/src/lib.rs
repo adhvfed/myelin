@@ -121,7 +121,27 @@
 //!   HSM/Shamir-split L0 backing is the production-hardening follow-on (the SHAPE — root wraps
 //!   KEKs, never exported — is complete). The mutation floor on the wrap/unwrap/destroy +
 //!   fail-open-prevention path is ≥ 80% (mandatory-core).
+//! - **Continuous WAL archiving + base backups + PITR (P-ST-11 / contract 11.5 — global P-059)**
+//!   is now IMPLEMENTED in [`backup`]: [`backup::ContinuousArchiver`] ships sealed WAL segments
+//!   off-host continuously (strictly forward, append-only) + takes periodic [`backup::BaseBackup`]s,
+//!   giving a PITR window (base + archived WAL tail) and MEASURING the live RPO
+//!   ([`backup::ContinuousArchiver::measure_rpo`] = committed − archived freshness) — the STOR-D2
+//!   number asserted ≤ the `rpo_max_mins` threshold (≤ 5 min). [`backup::StoreTier::is_backed_up`]
+//!   is the structural §7.1 rule (T1/T2/T3/T5 backed up; **T4 OLAP / T7 cache / derived indexes NOT
+//!   backed up — rebuilt from source**; a derived tier in a [`backup::BackupSet`] is a type error).
+//!   [`backup::ObjectTierBackup`] is the T2 versioned + in-region-replicated posture;
+//!   [`backup::LogTierSeal`] is the T3 "sealed segments are immutable T2 blobs + range index in T1"
+//!   binding; [`backup::BackupSet`] EXCLUDES crypto-shredded KMS keys (reusing
+//!   [`kms::KmsEngine::backup_snapshot`] — §7.5, a shredded key stays dead across a restore). It
+//!   REUSES the harness cross-seam assertion + the `RestoreRpoSecs` telemetry signal (P-056), the
+//!   `seq` cross-seam cursor ([`coloc`], P-016), and the KMS exclusion ([`kms`], P-058) — never
+//!   re-defined. **Floors named in [`backup`]:** the `restore(to_offset T)` + cross-seam rebuild is
+//!   the sibling **P-ST-12 (global P-060)**; the CI-wired restore-verify GATE (STOR-D1) is
+//!   **P-ST-13 (global P-061)**; the RTO / cell-kill half is **P-ST-14 (global P-100)**; the
+//!   cell-scale RPO re-confirm is **P-ST-30 (M5)**; the real WAL-shipping driver is the P-S12/P-S15
+//!   floor. The mutation floor on the crypto-shred-excluded-from-backup branch is mandatory-core.
 
+pub mod backup;
 pub mod blob;
 pub mod coloc;
 pub mod holder;
@@ -131,6 +151,10 @@ pub mod migration;
 pub mod oltp;
 pub mod rls;
 
+pub use backup::{
+    BackupError, BackupSet, BaseBackup, ContinuousArchiver, EpochSecs, LogTierSeal, ObjectTierBackup,
+    ObjectVersion, StoreTier, WalOffset, WalSegment,
+};
 pub use blob::{
     BlobError, BlobMeta, BlobStore, BlobTelemetry, ContentHash, ContentWrap, FsBlobStore,
     HashAlgo, IdentityWrap,
