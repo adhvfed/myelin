@@ -56,6 +56,9 @@ aws-credential-types = { workspace = true, optional = true }
 fred = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 myelin-config = { workspace = true, optional = true }
+# serde_json: the pg.rs outbox stores the EventEnvelope as JSONB (serialize on enqueue,
+# deserialize on relay). Pulled ONLY behind `integration` — it never enters the default DAG.
+serde_json = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -68,6 +71,11 @@ integration = [
     "dep:fred",
     "dep:tokio",
     "dep:myelin-config",
+    "dep:serde_json",
+    # The PgStore relay publishes through the events BusTransport, and the NATS bus impl lives
+    # behind the events `integration` feature; the storage smoke test for the outbox→bus drain
+    # needs it, so storage's integration feature turns on the events one transitively.
+    "myelin-events/integration",
 ]
 
 # The failure-injection harness is TEST-SUPPORT only (the same posture as a service's

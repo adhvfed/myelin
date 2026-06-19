@@ -46,6 +46,7 @@ fn workspace_root() -> PathBuf {
 /// for a NAMED, by-design reason (see the module docs). Loud: the list is in source, reviewed.
 const EXCLUDED_SUBSTRINGS: &[&str] = &[
     "myelin-events/src/relay.rs", // the one legitimate broker-publish component (by design).
+    "myelin-storage/src/pgrelay.rs", // the OLTP-co-located relay (Stage 2): same legitimate broker-publish role as relay.rs (BUS-2); outbox queries are relay-internal, not tenant-store.
     "myelin-harness/src/bin/sub-m0-scorecard.rs", // the SUB-M0 exit-gate runner: the one legitimate host-exec site (CI orchestration).
     "myelin-harness/src/bin/id-m1-scorecard.rs", // the Identity M1→M2 exit-gate runner (P-079): same legitimate host-exec site (CI orchestration).
     "myelin-lints/", // this crate: scanners + fixtures carry the tokens as data.

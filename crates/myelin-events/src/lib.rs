@@ -236,6 +236,12 @@
 pub mod consumer;
 pub mod dedup;
 pub mod envelope;
+// Stage 2 / infra: the REAL durable bus behind the BusTransport trait — NATS JetStream via
+// async-nats. Compiled ONLY under `--features integration` (it pulls the real async-nats +
+// tokio clients); the default build keeps the in-process relay::InProcessBus floor. It
+// implements the EXISTING relay::BusTransport trait, it does not fork it.
+#[cfg(feature = "integration")]
+pub mod nats;
 pub mod outbox;
 pub mod relay;
 pub mod taxonomy;

@@ -40,6 +40,15 @@ use std::process::ExitCode;
 /// `ToolHands::exec` lands in M2/CI.)
 const EXCLUDED_SUBSTRINGS: &[&str] = &[
     "myelin-events/src/relay.rs",
+    // The OLTP-co-located RELAY (Stage 2 / infra): `PgRelay::relay_once` drains the co-located
+    // outbox table and is the ONE legitimate broker-publish site for the OLTP service — exactly
+    // the role relay.rs plays for the in-process floor (BUS-2: the relay is the only
+    // broker-publish component). Its `bus.put(...)` forwards an ALREADY-committed outbox row
+    // (emit-iff-committed), not a fire-and-forget bypass; its outbox queries are relay-INTERNAL
+    // (the outbox is keyed by (aggregate, seq) and drained across aggregates), NOT tenant-store
+    // queries — the same posture as relay.rs. NAMED, LOUD exclusion (see the crate note in
+    // pgrelay.rs), never a silent skip; the tenant-store code in pg.rs stays fully linted.
+    "myelin-storage/src/pgrelay.rs",
     "myelin-harness/src/bin/sub-m0-scorecard.rs",
     "myelin-harness/src/bin/id-m1-scorecard.rs",
     "myelin-lints/",

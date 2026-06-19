@@ -26,10 +26,12 @@ serde_json.workspace = true
 async-nats = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 myelin-config = { workspace = true, optional = true }
+# StreamExt over the NATS JetStream pull-consumer batch (the nats.rs BusTransport backing).
+futures = { workspace = true, optional = true }
 
 [features]
 default = []
-integration = ["dep:async-nats", "dep:tokio", "dep:myelin-config"]
+integration = ["dep:async-nats", "dep:tokio", "dep:myelin-config", "dep:futures"]
 
 # TEST-SUPPORT ONLY (dev-dependency, P-S07). The SUB-D1 / BUS-D4 drill scenarios ride the
 # P-S03 scoped-reversible dependency-break injector (Dependency::Broker) + the P-S04

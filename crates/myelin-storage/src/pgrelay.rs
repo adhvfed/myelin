@@ -1,0 +1,134 @@
+//! `PgRelay` — the OLTP-co-located outbox table + the RELAY, backed by REAL Postgres.
+//!
+//! **Stage 2 / infra.** This is the storage-tier RELAY: it owns the co-located `outbox` table
+//! (the frozen [`myelin_events::OUTBOX_MIGRATION`], RUN not re-defined) and drains it to the
+//! [`BusTransport`](myelin_events::relay::BusTransport) with the real
+//! `SELECT … FOR UPDATE SKIP LOCKED` claim. It is the ONE legitimate broker-publish site for
+//! the OLTP service — exactly the role `myelin-events/src/relay.rs` plays for the in-process
+//! floor (BUS-2: the relay is the only component on the broker-publish side). Its `bus.put(...)`
+//! forwards an ALREADY-committed outbox row (emit-iff-committed), it is NOT a fire-and-forget
+//! bypass of `OutboxTx::emit`.
+//!
+//! Like `relay.rs`, this file is a NAMED, LOUD exclusion in the `no-raw-publish` scanner
+//! (`lint-gate.rs` + `tests/workspace_clean.rs`) — the relay is the sanctioned publisher,
+//! documented here, never a silent skip. The outbox queries here are relay-INTERNAL (the outbox
+//! is keyed by `(aggregate, seq)` and drained across aggregates by the relay), not tenant-store
+//! queries — so they correctly carry no per-row tenant predicate, the same as `relay.rs`.
+//!
+//! ## `residency-pin` lint — region pinned PER SESSION (`@residency-cell-pinned:file`)
+//! The relay opens its bounded sqlx pool region-agnostic (the same NAMED floor `oltp.rs` /
+//! `pg.rs` record); the per-POOL runtime region-pin is the STOR-D5 gate (P-ST-15 / P-102). The
+//! file-level waiver marker `@residency-cell-pinned:file` records this floor LOUDLY (EI-01 §4).
+
+use myelin_events::relay::{BusTransport, Delivery};
+use myelin_events::EventEnvelope;
+use sqlx::postgres::PgPool;
+use sqlx::Row;
+
+use crate::pg::PgError;
+
+/// The OLTP-co-located outbox + relay over a bounded sqlx `PgPool`. Cloneable (the pool is an
+/// `Arc`-backed handle). Shares the SAME pool as the [`crate::pg::PgStore`] in a real service
+/// (the outbox co-commits in the service DB); here it is constructed from a pool handle.
+#[derive(Clone)]
+pub struct PgRelay {
+    pool: PgPool,
+}
+
+impl PgRelay {
+    /// Wrap a pool as the OLTP relay (the outbox lives in the same OLTP DB the service writes).
+    pub fn new(pool: PgPool) -> PgRelay {
+        PgRelay { pool }
+    }
+
+    /// Insert an outbox row in the frozen `outbox` table shape: the envelope as JSONB,
+    /// `published_at` NULL (so the relay's unsent index claims it). `aggregate`/`seq` carry the
+    /// per-aggregate ordering key (`UNIQUE(aggregate, seq)`).
+    pub async fn enqueue(
+        &self,
+        aggregate: &str,
+        seq: i64,
+        envelope: &EventEnvelope,
+    ) -> Result<(), PgError> {
+        let payload = serde_json::to_value(envelope)
+            .map_err(|e| PgError::Query(format!("serialize envelope: {e}")))?;
+        sqlx::query(
+            "INSERT INTO outbox (event_id, aggregate, seq, subject, envelope) \
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (event_id) DO NOTHING",
+        )
+        .bind(&envelope.event_id.0)
+        .bind(aggregate)
+        .bind(seq)
+        .bind(&envelope.subject.0)
+        .bind(payload)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| PgError::Query(e.to_string()))?;
+        Ok(())
+    }
+
+    /// One relay drain pass against REAL Postgres: in ONE transaction, claim up to `batch`
+    /// unsent rows with `SELECT … FOR UPDATE SKIP LOCKED` (so a second relay worker SKIPs a
+    /// claimed row — no double-claim across replicas), publish each to `bus` (carrying the
+    /// stable `event_id` as the `Nats-Msg-Id` dedup id → 0 ghost), and mark the published rows
+    /// `published_at = now()`. Returns how many rows were published.
+    ///
+    /// Emit-iff-published: a row is marked sent only if its publish was Accepted/Deduplicated; a
+    /// publish failure aborts the transaction (the claim releases, the row stays unsent to
+    /// retry) — the 0-lost property the relay floor models.
+    pub async fn relay_once<B: BusTransport>(&self, bus: &B, batch: i64) -> Result<usize, PgError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| PgError::Query(e.to_string()))?;
+
+        let rows = sqlx::query(
+            "SELECT event_id, subject, envelope FROM outbox \
+             WHERE published_at IS NULL \
+             ORDER BY aggregate, seq \
+             FOR UPDATE SKIP LOCKED LIMIT $1",
+        )
+        .bind(batch)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| PgError::Query(e.to_string()))?;
+
+        let mut published = 0usize;
+        for row in &rows {
+            let event_id: String = row.get("event_id");
+            let payload: serde_json::Value = row.get("envelope");
+            let envelope: EventEnvelope = serde_json::from_value(payload)
+                .map_err(|e| PgError::Query(format!("deserialize envelope: {e}")))?;
+
+            // The relay's sanctioned broker publish (BUS-2): the row was already durably
+            // committed to the outbox; the relay forwards it with the stable event_id as the
+            // broker-side dedup id (0 ghost). A transport error aborts the whole tx → the claim
+            // releases, rows stay unsent.
+            match bus.put(&envelope.subject, &envelope, &envelope.event_id) {
+                Ok(Delivery::Accepted) | Ok(Delivery::Deduplicated) => {}
+                Err(e) => return Err(PgError::Publish(e.0)),
+            }
+
+            sqlx::query("UPDATE outbox SET published_at = now() WHERE event_id = $1")
+                .bind(&event_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| PgError::Query(e.to_string()))?;
+            published += 1;
+        }
+
+        tx.commit().await.map_err(|e| PgError::Query(e.to_string()))?;
+        Ok(published)
+    }
+
+    /// The count of unsent outbox rows (`published_at IS NULL`) — the `outbox_depth` signal, read
+    /// straight from the DB. 0 after a full drain.
+    pub async fn outbox_depth(&self) -> Result<i64, PgError> {
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM outbox WHERE published_at IS NULL")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| PgError::Query(e.to_string()))?;
+        Ok(n)
+    }
+}
