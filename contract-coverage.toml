@@ -570,11 +570,18 @@ title = "#[personal_data(...)] classify-derive"
 status = "covered"
 cdc = ["crates/myelin-gdpr/tests/cdc_10_2_classify_derive.rs"]
 
+# 10.3 — the data-map / RoPA GENERATOR ships its provider+consumer CDC pair NOW (P-GA-09 → P-109):
+# the PROVIDER is `data_map() → Inventory` (the generator walking the `#[personal_data]` registry +
+# the auto-registered holder set); the CONSUMER is the DSR-orchestrator resolve-scope-from-the-map
+# step that builds the per-holder erase checklist off the generated map (the P-GA-13 → P-111 body
+# extends this consumer; the pair below is a real provider+consumer seam). The CI data-map DIFF GATE
+# (commit the inventory; fail the build on a change) extends this at P-GA-10 → P-110; the per-store
+# content completeness floor is M5 P-GA-32 → P-505. So the row is `covered`.
 [[contract]]
 row = "10.3"
 title = "data_map() / ropa(tenant)"
-status = "deferred"
-landing = "P-109"
+status = "covered"
+cdc = ["crates/myelin-gdpr-service/tests/cdc_10_3_data_map.rs"]
 
 [[contract]]
 row = "10.4"
