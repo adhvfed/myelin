@@ -35,14 +35,16 @@
 //! prompt CLOSES the cardinality-cap floor. The SHAPE (Ids under the cap, Filter above) is frozen
 //! here; only the threshold is open. Named, not silently assumed final.
 //!
-//! ## Floors named (frozen now → bodies in a later prompt)
-//! - **The `Filter` SetExpr→SQL lowering is P-ID-12 (P-070).** This prompt returns the `Filter`
-//!   `SetExpr` shape; the consumer-composable lowering (InRelation/TupleSet → the `authz_visible`
-//!   JOIN; Union/Intersect/Difference → AND/OR/EXCEPT) lands there. Named.
-//! - **The watermark consistency path (wait / fall-back-to-check rather than serving stale) is
-//!   P-ID-12 (P-070).** The S8 watermark column + advance are shipped (`reverse_index`); the read-
-//!   side guard is P-ID-12. Named.
-//! - **The cardinality cap is finalised at scale in P-ID-31 (P-074).** Named above.
+//! ## Floors (P-ID-11 named these; P-ID-12 → P-070 CLOSES the first two)
+//! - **The `Filter` SetExpr→SQL lowering — CLOSED in P-ID-12 (P-070).** The
+//!   [`ListObjects::lower_filter`] / [`crate::lowering::lower`] path is the real consumer-composable
+//!   lowering (InRelation/TupleSet → the `authz_visible` JOIN; Union/Intersect/Difference →
+//!   AND/OR/EXCEPT). The `filter_set_expr` arm below produces the `SetExpr` the lowering consumes.
+//! - **The watermark consistency path (fall-back-to-check rather than serving stale) — CLOSED in
+//!   P-ID-12 (P-070).** [`ListObjects::list_objects_consistent`] +
+//!   [`crate::lowering::watermark_verdict`] apply the new-enemy guard.
+//! - **The cardinality cap is finalised at scale in P-ID-31 (P-074).** Still OPEN (the SHAPE is
+//!   frozen, the NUMBER is the measured tunable). Named above.
 
 use crate::check_engine::CheckEngine;
 use crate::namespace::NamespaceEngine;
@@ -269,10 +271,108 @@ impl ListObjects {
         }
     }
 
+    /// **Lower a returned `Filter` to the consumer-composable SQL + apply the S8 watermark
+    /// consistency path (P-ID-12; architecture §7.2/§7.4/§8.7).**
+    ///
+    /// Given the `set_expr` the [`ListObjects::list_objects`] `Filter` arm returned, lower it to the
+    /// `(sql_predicate, joins, params)` the consumer ANDs into its query (the no-N+1 JOIN against
+    /// `authz_visible`), then decide the consistency path:
+    /// - if the S8 watermark is **at-or-after** the scan's required revision (`at.at_least`) → the
+    ///   JOIN serves ([`crate::lowering::WatermarkVerdict::JoinServes`]); the consumer runs the
+    ///   lowered SQL against the (fresh-enough) reverse index;
+    /// - if the watermark is **behind** → fall back to per-row `check` rather than serving the stale
+    ///   grant (the new-enemy guard, ID-D7).
+    ///
+    /// Returns the [`crate::lowering::Lowered`] SQL **and** the
+    /// [`crate::lowering::WatermarkVerdict`] so the consumer knows whether to run the JOIN or take
+    /// the fall-back. This is the read-half of contract 4.10 that P-ID-08 floored — CLOSED here.
+    pub fn lower_filter(
+        &self,
+        scope: &TenantScope,
+        subject: &Principal,
+        set_expr: &SetExpr,
+        ty: &ObjectType,
+        at: &Consistency,
+    ) -> (crate::lowering::Lowered, crate::lowering::WatermarkVerdict) {
+        let via = via_column_for(ty);
+        let lowered = crate::lowering::lower(set_expr, subject, &via);
+        let verdict = crate::lowering::watermark_verdict(&self.index, scope, &lowered, at);
+        (lowered, verdict)
+    }
+
+    /// **The watermark-aware list (P-ID-12; ID-D4/ID-D7).** The whole-`list_objects` path that
+    /// applies the consistency guard end-to-end: it dispatches to `Ids`/`Filter` as
+    /// [`ListObjects::list_objects`] does, but when the result is a `Filter` whose S8 JOIN is BEHIND
+    /// the scan's required revision, it **falls back to per-row `check`** over the authoritative S3
+    /// store and returns the re-checked `Ids` (never a stale grant). When the watermark is fresh
+    /// enough, the `Filter` is returned for the consumer to push down (the fast path). The `Ids`
+    /// materialise path is already leak-free under staleness (each candidate is re-checked through
+    /// the authoritative engine at the snapshot), so it is returned as-is.
+    ///
+    /// This is the ID-D7 new-enemy guard realised: a just-revoked grant read with the post-revoke
+    /// zookie never survives — either the S8 watermark has caught up (and the JOIN reflects the
+    /// revoke) or the scan falls back to `check` (which reads the authoritative post-revoke S3).
+    pub fn list_objects_consistent(
+        &self,
+        scope: &TenantScope,
+        subject: &Principal,
+        permission: &Permission,
+        ty: &ObjectType,
+        at: &Consistency,
+    ) -> ListObjectsResult {
+        let result = self.list_objects(scope, subject, permission, ty, at);
+        match result {
+            // The Ids materialise path is already leak-free under staleness (every candidate is
+            // re-checked through the authoritative engine at the snapshot — a revoked grant is
+            // dropped). Return it as-is.
+            ListObjectsResult::Ids { .. } => result,
+            // The Filter push-down serves directly from S8 (no per-row re-check) — apply the
+            // watermark guard. If the watermark is behind the required revision, fall back to a
+            // per-row check over the authoritative store and return the re-checked Ids.
+            ListObjectsResult::Filter {
+                ref set_expr,
+                ref zookie,
+            } => {
+                let via = via_column_for(ty);
+                let lowered = crate::lowering::lower(set_expr, subject, &via);
+                let verdict = crate::lowering::watermark_verdict(&self.index, scope, &lowered, at);
+                if crate::lowering::is_fall_back(&verdict) {
+                    // The S8 JOIN would serve a stale grant — fall back to per-row check over the
+                    // authoritative S3 store at the required revision (the new-enemy guard, ID-D7).
+                    // The candidate set is S8's reverse-index candidates (possibly stale); each is
+                    // re-checked at the authoritative snapshot, so a revoked grant is dropped.
+                    let candidates: Vec<ObjectId> = self
+                        .candidate_objects(scope, subject, ty)
+                        .into_iter()
+                        .map(ObjectId)
+                        .collect();
+                    let allowed = crate::lowering::fall_back_to_check(
+                        &self.engine,
+                        &self.namespace,
+                        scope,
+                        subject,
+                        permission,
+                        ty,
+                        &candidates,
+                        at,
+                    );
+                    ListObjectsResult::Ids {
+                        ids: allowed,
+                        zookie: zookie.clone(),
+                    }
+                } else {
+                    // The watermark is fresh enough — the consumer may push down the Filter JOIN.
+                    result
+                }
+            }
+        }
+    }
+
     /// The read's consistency token — the S8 partition watermark (the revision the reverse index
-    /// reflects). On the floor we return the watermark the read is at-or-after; the wait/fall-back
-    /// guard for a scan needing a fresher revision than the watermark is P-ID-12. If the caller
-    /// pinned a non-empty `at_least` zookie, that is the floor the read reflects.
+    /// reflects). The wait/fall-back guard for a scan needing a fresher revision than the watermark
+    /// is the [`ListObjects::list_objects_consistent`] / [`ListObjects::lower_filter`] path
+    /// (P-ID-12). If the caller pinned a non-empty `at_least` zookie, that is the floor the read
+    /// reflects.
     fn read_zookie(&self, scope: &TenantScope, at: &Consistency) -> Zookie {
         let watermark = self.index.watermark(scope);
         // The returned zookie is the LATER of the caller's pinned floor and the index watermark

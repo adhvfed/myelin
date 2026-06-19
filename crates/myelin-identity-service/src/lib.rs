@@ -66,6 +66,7 @@
 pub mod authenticate;
 pub mod check_engine;
 pub mod list_objects;
+pub mod lowering;
 pub mod machine_auth;
 pub mod namespace;
 pub mod principal_store;
@@ -78,6 +79,10 @@ pub use authenticate::{
 };
 pub use check_engine::{eval_caveat, CheckEngine, MAX_REWRITE_DEPTH};
 pub use list_objects::{ListObjects, DEFAULT_IDS_CARDINALITY_CAP};
+pub use lowering::{
+    fall_back_to_check, is_fall_back, lower, watermark_verdict, AuthzJoin, BoundParam, Lowered,
+    WatermarkVerdict,
+};
 pub use reverse_index::{
     ReverseIndex, ReverseIndexConsumer, ReverseRow, S8_CONSUMER, S8_HOLDER, S8_TABLE,
 };
