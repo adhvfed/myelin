@@ -76,18 +76,31 @@ pub fn tenant_predicate() -> Lint {
     }
 }
 
-/// `no-raw-publish` (§2.11; BUS-2; F5).
+/// `no-raw-publish` (§2.11; BUS-2; F5; the Bus's owned slice of contract 1.6 — EB-07 → P-019).
 ///
 /// **Rule.** No bus publish outside `OutboxTx::emit`. There is NO fire-and-forget publish path:
 /// a direct broker publish (`broker.publish(`, `nats.publish(`, `producer.send(`, a
-/// `publish_now(` symbol, `bus.publish(`) is the lost-event / causality-break bug class. The ONLY
-/// admitted emit path is `OutboxTx::emit` / `.emit(` on the outbox transaction (the event lands
-/// in the same DB transaction as the state change; the relay is the only thing on the broker
-/// publish side).
+/// `publish_now(` symbol, `bus.publish(`) OR a direct call onto the `BusTransport` seam
+/// (`transport.put(`, `bus.put(`, `broker.put(` — the relay's broker-side publish, refined-arch
+/// §4.1 / §5.2) is the lost-event / causality-break bug class. The ONLY admitted emit path is
+/// `OutboxTx::emit` / `.emit(` on the outbox transaction (the event lands in the same DB
+/// transaction as the state change; the relay is the only thing on the broker publish side).
 ///
 /// **Note.** The relay crate ITSELF is the one legitimate broker-publish site (it drains the
-/// outbox). The workspace scan (`tests/workspace_clean.rs`) excludes `myelin-events/src/relay.rs`
-/// for exactly this reason — documented there, not silently skipped (EI-01 §4/§5).
+/// outbox, calling `BusTransport::put`). The workspace scan (`tests/workspace_clean.rs`) excludes
+/// `myelin-events/src/relay.rs` for exactly this reason — documented there, not silently skipped
+/// (EI-01 §4/§5).
+///
+/// **EB-07 reconciliation (P-019, coherence rule EI-01 §7).** The `no-raw-publish` lint, its
+/// engine, and its red/green fixtures were first shipped by the SUBSTRATE prompt P-S10 → P-017
+/// (the four load-bearing lints; the lint harness is shared substrate, EB-07 CONTRACTS field).
+/// EB-07 is the Bus's OWNED slice of the same contract-1.6 lint. Rather than duplicate a parallel
+/// scanner, this prompt EXTENDS the in-place scanner to also forbid a direct `BusTransport::put`
+/// call (`transport.put(` / `bus.put(` / `broker.put(`). That seam did not exist when P-017 ran;
+/// it landed in EB-04 → P-013 (the `BusTransport` trait + the relay's `transport.put(subject,
+/// envelope, dedup_id)` broker-publish), so the EB-07 red fixture — a write-path handler calling
+/// `transport.put(..)` directly — is a genuinely NEW bug-fingerprint the lint must reject. The
+/// lint is sharpened, never weakened (EI-01 §5).
 pub const NO_RAW_PUBLISH: LintId = LintId("no-raw-publish");
 
 fn scan_no_raw_publish(src: &str) -> Vec<Violation> {
@@ -96,12 +109,22 @@ fn scan_no_raw_publish(src: &str) -> Vec<Violation> {
     // identifier — e.g. a test FN named `outbox_has_only_emit_no_publish_now()` asserting the
     // symbol's ABSENCE — is NOT flagged. The bug class is the dotted CALL on a broker/producer
     // handle, not a free function that happens to contain the word.
+    //
+    // The last three are the `BusTransport::put` seam (EB-04 → P-013; refined-arch §4.1/§5.2): a
+    // direct `transport.put(` / `bus.put(` / `broker.put(` in a write path is the EB-07 red
+    // fingerprint. They are HANDLE-QUALIFIED (`transport.`/`bus.`/`broker.` prefix) — NOT a bare
+    // `.put(` — so an unrelated `.put(` (e.g. `BufMut::put` on a byte buffer) is NOT flagged; only
+    // a call onto a broker/transport handle is. The relay (the one legitimate caller) is excluded
+    // by path in `tests/workspace_clean.rs`, named not hidden.
     const RAW_PUBLISH_SITES: &[&str] = &[
         ".publish_now(",
         ".publish(",
         ".publish_event(",
         ".send_to_broker(",
         ".kafka_send(",
+        "transport.put(",
+        "bus.put(",
+        "broker.put(",
     ];
     let mut out = Vec::new();
     for (line, code) in code_lines(src) {
@@ -112,9 +135,10 @@ fn scan_no_raw_publish(src: &str) -> Vec<Violation> {
                     line,
                     reason: format!(
                         "raw bus publish `{site}` bypasses OutboxTx::emit — there is NO \
-                         fire-and-forget publish path; an event must be emitted in the SAME \
-                         transaction as the state change (the relay is the only broker-publish \
-                         component). Use `outbox_tx.emit(draft, cause)` (F5/BUS-2)."
+                         fire-and-forget publish path, and the `BusTransport::put` broker seam is \
+                         the relay's alone; an event must be emitted in the SAME transaction as \
+                         the state change (the relay is the only broker-publish component). Use \
+                         `outbox_tx.emit(draft, cause)` (F5/BUS-2)."
                     ),
                 });
             }
@@ -997,6 +1021,28 @@ mod tests {
         let green = "outbox_tx.emit(draft, cause)?;";
         assert!(!no_raw_publish().run(red).is_empty());
         assert!(no_raw_publish().run(green).is_empty());
+    }
+
+    #[test]
+    fn no_raw_publish_rejects_direct_bustransport_put_in_write_path() {
+        // EB-07 → P-019: the Bus's owned slice. A direct call onto the `BusTransport::put` broker
+        // seam (EB-04 → P-013) in a write path bypasses the outbox — the relay is its only caller.
+        let red = "self.transport.put(subject, envelope, event_id).await?;";
+        let red_bus = "bus.put(subject, envelope, event_id);";
+        let red_broker = "broker.put(subject, envelope, event_id);";
+        assert!(!no_raw_publish().run(red).is_empty(), "transport.put( must be rejected");
+        assert!(!no_raw_publish().run(red_bus).is_empty(), "bus.put( must be rejected");
+        assert!(!no_raw_publish().run(red_broker).is_empty(), "broker.put( must be rejected");
+    }
+
+    #[test]
+    fn no_raw_publish_admits_unrelated_put_calls() {
+        // The fingerprint is HANDLE-QUALIFIED (transport./bus./broker. prefix), so an unrelated
+        // `.put(` — e.g. a byte-buffer `BufMut::put`, a cache `.put(k, v)` — is NOT flagged.
+        let buf = "buf.put(&bytes[..]);";
+        let cache = "cache.put(key, value);";
+        assert!(no_raw_publish().run(buf).is_empty(), "BufMut::put must be admitted");
+        assert!(no_raw_publish().run(cache).is_empty(), "an unrelated cache.put must be admitted");
     }
 
     #[test]

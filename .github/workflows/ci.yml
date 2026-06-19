@@ -1,0 +1,44 @@
+# Myelin CI — the committed gates run on every push / PR.
+#
+# The `architecture-lints` job is the EB-07 → P-019 deliverable: the twelve architecture lints
+# (contract-index 1.6 / §2.11), including the Bus's owned `no-raw-publish` slice, wired in LOUD and
+# NEVER SWALLOWED. The gate is the `lint-gate` binary's exit code (no `... || true`, no `continue-
+# on-error`) plus the `myelin-lints` test suite (the fixture matrix + the CI-gate self-test that
+# proves a red fixture makes the gate exit non-zero). A violation fails the job; doctrine EI-01 §5
+# ("an uncommitted gate is no gate; make violations loud, never silently swallowed").
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  architecture-lints:
+    # The committed-lint ratchet (contract 1.6). LOUD: the gate is the binary exit code + the
+    # myelin-lints tests; there is deliberately NO `|| true` / `continue-on-error` anywhere.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: The twelve architecture lints over the workspace source (loud, non-zero on any violation)
+        run: cargo run -p myelin-lints --bin lint-gate
+      - name: The lint fixture matrix + the CI-gate self-test (red-fixture ⇒ non-zero exit)
+        run: cargo test -p myelin-lints
+
+  build-test-clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: build
+        run: cargo build --workspace --locked
+      - name: test
+        run: cargo test --workspace --locked
+      - name: clippy (warnings are errors)
+        run: cargo clippy --workspace --all-targets -- -D warnings
