@@ -123,7 +123,13 @@ pub struct FailStaticThreshold {
     /// The engineering seed the mechanism is drilled against (the largest value the constraint
     /// admits). NOT the ratified W — labelled a seed, not a default-to-beat.
     pub static_max_default_secs: u64,
-    /// The constraint that ships regardless and is enforced in the `FailStaticThreshold` constructor.
+    /// The LOWER bound of the staleness constraint (architecture §8.2): `static_max ≥ agent-token
+    /// TTL` — the window must CONTAIN the short-lived agent token (ID-1 / GD-3 / ADR-17), in
+    /// seconds. The `FailStatic` constructor (P-S18) rejects a `static_max` below this. The agent
+    /// token's life == its run life; this is the floor that keeps the window from being shorter than
+    /// the token it must outlive. Read by [`crate::StalenessBound::from_threshold`].
+    pub agent_token_ttl_secs: u64,
+    /// The constraint that ships regardless and is enforced in the `FailStatic` constructor (P-S18).
     pub constraint: String,
 }
 
@@ -351,6 +357,7 @@ mod tests {
             status = "OPEN — LEGAL"
             owner = "DPO / Legal"
             static_max_default_secs = 300
+            agent_token_ttl_secs = 60
             constraint = "x"
             [rpo_rto]
             rpo_max_mins = 5
@@ -375,6 +382,7 @@ mod tests {
             status = "OPEN — LEGAL"
             owner = "DPO / Legal"
             static_max_default_secs = 300
+            agent_token_ttl_secs = 60
             constraint = "x"
             [rpo_rto]
             rpo_max_mins = 5
@@ -418,6 +426,7 @@ mod tests {
             owner = "DPO / Legal"
             static_max_secs = 180
             static_max_default_secs = 300
+            agent_token_ttl_secs = 60
             constraint = "static_max <= revocation-SLA AND static_max >= agent-token-TTL"
             [rpo_rto]
             rpo_max_mins = 5

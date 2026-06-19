@@ -88,8 +88,8 @@ landing = "P-033"
 [[contract]]
 row = "1.10"
 title = "FailStatic<T> bounded-staleness cache"
-status = "deferred"
-landing = "P-040"
+status = "covered"
+cdc = ["crates/myelin-substrate/tests/cdc_1_10_fail_static.rs"]
 
 [[contract]]
 row = "1.11"
