@@ -302,6 +302,118 @@ fn eb08_write_path_leg_is_inert_without_the_marker() {
     );
 }
 
+// ================================================================================================
+// EB-09 → P-045: the Bus's OWNED slice of `tenant-predicate` — the SUBSCRIBE/STREAM-SCOPE leg.
+//
+// The P-S10 → P-017 form (the `tenant_predicate.{red,green}` matrix rows above) is the DATA-STORE
+// half (a query-builder call that is not tenant-bound). EB-09 is the Bus's owned slice of the SAME
+// contract-1.6 lint, keyed to the canonical stream rule (refined-arch event-bus §4.2 "whitelist
+// subjects, never `*`" + §7.1 "a stream is provisioned per (tenant, subsystem)" + §4.3 "scope is a
+// bounded selector, never `*`"): an UNSCOPED subscribe (no (tenant, subsystem) scope) or a WILDCARD
+// subscribe (`scope = *`, an `evt.>`/`*` wildcard subject, an "all streams" scope) is rejected; a
+// bounded (tenant, subsystem) StreamScope is admitted. These tests are the EB-09 red+green fixture
+// obligation — BOTH fixtures are the pass condition (a lint that only rejects, or only admits, is
+// not proven). The fixtures are scoped by the loud, named `// @bus-stream` marker, so they exercise
+// a genuinely NEW bug fingerprint the data-store leg does not catch.
+// ================================================================================================
+
+const EB09_RED: &str = "tenant_predicate.eb09.red.rs.txt";
+const EB09_GREEN: &str = "tenant_predicate.eb09.green.rs.txt";
+
+#[test]
+fn eb09_stream_scope_red_fixture_is_rejected() {
+    // The EB-09 red fixture (an unscoped, wildcard-subject `subscribe` in a `@bus-stream` consumer)
+    // MUST be rejected by `tenant-predicate`, fired by THAT lint.
+    let lint = tenant_predicate();
+    let violations = lint.run(&read_fixture(EB09_RED));
+    assert!(
+        !violations.is_empty(),
+        "tenant-predicate MUST reject the EB-09 stream-scope red fixture (the unscoped/wildcard \
+         subscribe), but found 0 violations"
+    );
+    assert!(
+        violations.iter().all(|v| v.lint == LintId("tenant-predicate")),
+        "every EB-09 red-fixture violation must carry the tenant-predicate id"
+    );
+}
+
+#[test]
+fn eb09_stream_scope_green_fixture_is_admitted() {
+    // The EB-09 green fixture (a bounded (tenant, subsystem) StreamScope subscribe) MUST be admitted
+    // — proving the lint does not over-reject (both fixtures are the EB-09 pass condition).
+    let lint = tenant_predicate();
+    let violations = lint.run(&read_fixture(EB09_GREEN));
+    assert!(
+        violations.is_empty(),
+        "tenant-predicate MUST admit the EB-09 stream-scope green fixture (the bounded \
+         (tenant, subsystem) StreamScope), but found: {violations:?}"
+    );
+}
+
+#[test]
+fn eb09_stream_scope_red_trips_exactly_its_own_lint() {
+    // Cross-lint isolation: the EB-09 red fixture must be caught by tenant-predicate and by NO OTHER
+    // of the twelve lints (so the whole-set CI gate rejects it for the right reason).
+    let red = read_fixture(EB09_RED);
+    let mut firing: Vec<LintId> = Vec::new();
+    for lint in all_twelve() {
+        if !lint.run(&red).is_empty() {
+            firing.push(lint.id);
+        }
+    }
+    assert_eq!(
+        firing,
+        vec![LintId("tenant-predicate")],
+        "the EB-09 stream-scope red fixture must trip exactly tenant-predicate, but tripped: {firing:?}"
+    );
+}
+
+#[test]
+fn eb09_stream_scope_green_is_admitted_by_the_full_twelve_set() {
+    // The set-level gate (the form CI runs): run() over ALL twelve lints is Err on the EB-09 red and
+    // Ok on the EB-09 green (no lint false-positives on the bounded-scope green).
+    let all = all_twelve();
+    assert!(
+        run(&all, &read_fixture(EB09_RED)).is_err(),
+        "the twelve-lint set must REJECT the EB-09 stream-scope red fixture"
+    );
+    assert!(
+        run(&all, &read_fixture(EB09_GREEN)).is_ok(),
+        "the twelve-lint set must ADMIT the EB-09 stream-scope green fixture (the bounded scope)"
+    );
+}
+
+#[test]
+fn eb09_stream_scope_leg_is_inert_without_the_marker() {
+    // The stream-scope leg is scoped by the loud, named `// @bus-stream` marker (EI-01 §4): an
+    // unscoped/wildcard subscribe OUTSIDE a marked bus-stream surface is NOT this leg's concern (it
+    // admits the whole current no-subscribe-surface-yet workspace until EB-05/EB-21 land). Strip the
+    // marker from the red fixture → the leg goes inert (0 violations from THIS leg). This proves the
+    // gate does not over-reach: it fires only where a bus subscribe surface is actually scanned.
+    let red = read_fixture(EB09_RED);
+    let unmarked = red.replace("@bus-stream", "(removed-marker)");
+    let lint = tenant_predicate();
+    assert!(
+        lint.run(&unmarked).is_empty(),
+        "the EB-09 stream-scope leg must be INERT on an unmarked source (no `@bus-stream`), so the \
+         lint admits the whole current workspace until the bus subscribe surface lands"
+    );
+}
+
+#[test]
+fn eb09_unscoped_subscribe_without_wildcard_is_rejected() {
+    // The unscoped-but-not-wildcard fingerprint: a subscribe with a concrete subject but NO
+    // (tenant, subsystem) scope token. Proves the leg's "missing scope" branch (not only the
+    // wildcard branch) fires — a bus subscribe must carry a (tenant, subsystem) scope (§7.1).
+    let src = "// @bus-stream\nfn run(bus: &Bus) { bus.subscribe(my_subject(), cursor); }\n";
+    let lint = tenant_predicate();
+    let violations = lint.run(src);
+    assert!(
+        violations.iter().any(|v| v.reason.contains("no (tenant, subsystem) scope")),
+        "an unscoped (non-wildcard) bus subscribe must trip the missing-scope branch, got: {violations:?}"
+    );
+}
+
 #[test]
 fn removing_any_lint_breaks_the_matrix() {
     // THE RATCHET REGRESSION TEST: if any one of the twelve lints is un-wired, that lint's red

@@ -1,0 +1,15 @@
+//! GREEN fixture for `tenant-predicate` — the EB-09 Bus-stream leg (P-045). The lint MUST admit
+//! this module (the leg is ARMED here — the `@bus-stream` marker makes the admission meaningful,
+//! not an inert pass). The consumer subscribes to a BOUNDED, per-(tenant, subsystem) stream: the
+//! `StreamScope` pins both the `TenantId` and the `Subsystem`, and the subject is the cell-local
+//! `evt.<tenant>.<subsystem>...` whitelist (never `*`) — refined-arch event-bus §7.1 + §4.2 gotcha 1.
+//! The subscription is scoped to exactly one tenant's one subsystem, so no cross-tenant frames leak.
+//! @bus-stream
+
+pub async fn start_consumer(bus: &Bus, tenant_id: TenantId) -> SubStream {
+    // OK: a bounded (tenant, subsystem) StreamScope — whitelisted, never `*`.
+    let scope = StreamScope::new(tenant_id, Subsystem::Issues);
+    bus.subscribe(scope.subject(), scope)
+        .await
+        .expect("subscribe")
+}
