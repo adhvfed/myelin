@@ -50,6 +50,12 @@ myelin-gdpr = { path = "../myelin-gdpr" }
 # (myelin-identity-service depends on it too). cargo build stays DB-free: the gate is modeled
 # (in-memory clean target), the real `pg_restore` driver is the named Storage floor P-S12/P-S15.
 myelin-storage = { path = "../myelin-storage" }
+# The `residency_verify` signed attestation (P-CP-09 / P-085, contract 12.4) MACs its canonical
+# PII-free body with a keyed BLAKE3 (the "signed" half) — the SAME `blake3:<hex>` multihash
+# convention the GDPR audit chain (P-GA-19) uses, extended with the keyed-MAC discriminator. No DB:
+# the attestation is a pure aggregation + sign, so `cargo build --workspace` stays DB-free.
+blake3 = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 # Principal/PrincipalId/PrincipalKind — used only to construct a `SubjectRef` in the DSR-surface
