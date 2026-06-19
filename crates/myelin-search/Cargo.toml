@@ -1,0 +1,35 @@
+[package]
+name = "myelin-search"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# myelin-search is a CONSUMER crate (architecture §0/§1): it owns no contract crate and
+# holds only derived, reconstructible state. At M0 (SRCH-P01 → P-021) it carries ONLY the
+# index-document NAME ANCHORS aligned to the frozen EventEnvelope (contract 2.1) + ArtifactRef
+# (contract 5.1) — no mechanism. It therefore depends on:
+#   - myelin-events   → the frozen EventEnvelope field list the index doc aligns to (the
+#                       names/units anchor the drift test reconciles against), which also
+#                       re-exports ArtifactRef / Region / TenantId / DataRole / Visibility /
+#                       PiiKeyRef.
+#   - myelin-tenancy  → the ArtifactRef value type (the doc_id key) + the (tenant, region)
+#                       partition key, named directly so the anchor module reads from the
+#                       definition site.
+# It MUST NOT be depended on by -tenancy/-events/-identity (it is downstream in the §2.9 DAG).
+# The engine + index backends + the permission-aware query pipeline (the path the
+# search-requires-acl-filter lint guards) are the M2 follow-on (SRCH-P03..SRCH-P16); they pull
+# in myelin-query / myelin-identity / myelin-gdpr / myelin-content then, not at this M0 floor.
+[dependencies]
+myelin-tenancy = { path = "../myelin-tenancy" }
+myelin-events = { path = "../myelin-events" }
+
+# TEST-ONLY. The names/units drift test constructs a canonical EventEnvelope (which embeds a
+# Principal from myelin-identity) to read the REAL frozen field names off a value, and confirms
+# the search-requires-acl-filter lint (its home is the shared myelin-lints ratchet crate; SRCH-P01
+# confirms it in place rather than duplicating it — EI-01 §7). Neither is a production dependency
+# of this M0 anchor crate; they are the harness the drift+lint proofs run against.
+[dev-dependencies]
+myelin-identity = { path = "../myelin-identity" }
+myelin-lints = { path = "../myelin-lints" }
+serde_json = { workspace = true }
