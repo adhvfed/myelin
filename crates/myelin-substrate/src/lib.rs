@@ -202,6 +202,7 @@ pub mod agent_load;
 pub mod crate_graph;
 pub mod fail_static;
 pub mod fail_static_authz;
+pub mod holder_catalog;
 pub mod holder_registered;
 pub mod holders;
 pub mod metrics_health;
@@ -223,6 +224,10 @@ pub use fail_static::{
 };
 pub use fail_static_authz::{
     AuthzDecision, AuthzServed, CoarseAuthz, FailStaticAuthz, AUTHZ_FRESH_TTL_SECS,
+};
+pub use holder_catalog::{
+    assert_holder_completeness, classify_store, holder_completeness, Holder, OrphanStore,
+    StoreClassifier, StoreHolder,
 };
 pub use holder_registered::{
     assert_all_holders_registered, holder_registered, DeclaredStore, HolderViolation, StoreManifest,
