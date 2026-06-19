@@ -1,0 +1,8 @@
+// RED fixture for `residency-pin` — the STORAGE-relevant slice (P-ST-04 / P-020). The lint MUST
+// reject this. A CALLER opens the real `myelin-storage` OLTP store WITHOUT pinning a `Region` and
+// WITHOUT the named-floor waiver marker — the data-leaves-its-region bug class (ADR-11). Every
+// caller-facing store open must pin its region (or carry the loud, reviewed `@residency-cell-pinned`
+// floor waiver). A bare region-less open in application code is the bug this lint makes un-mergeable.
+pub async fn open_tenant_store(config: OltpConfig, minter: Arc<dyn IdMinter>) -> ColocatedOltp {
+    ColocatedOltp::open(config, minter).unwrap()
+}

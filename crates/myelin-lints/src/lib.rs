@@ -70,10 +70,18 @@
 //! floor that tightens when the targeted surface lands:
 //! - `forward-only-migration` — the per-table hot-table half tightens when the hot-table
 //!   declaration + migration runner land (**P-S15 / P-032**); the table-independent half (no down
-//!   migration, no blocking `ALTER ... NOT NULL`) is enforced now.
+//!   migration, no blocking `ALTER ... NOT NULL`) is enforced now. **P-ST-04 / P-020** adds the
+//!   STORAGE-relevant red+green fixtures (the in-place-rewrite / contract-before-backfill bug shape
+//!   vs the online expand→backfill→contract shape) in `tests/storage_lints.rs`; the migration
+//!   RUNNER itself is **P-ST-05 / P-048**.
 //! - `residency-pin` — tightens (adds each concrete store constructor) as the OLTP/blob/index
-//!   stores land (**P-ST-01 / P-007**, **P-ST-03 / P-047**, …); Storage ships its own twin in
-//!   **P-ST-04 / P-020**.
+//!   stores land (**P-ST-01 / P-007**, **P-ST-03 / P-047**, …). **SHARPENED in P-ST-04 / P-020:**
+//!   the fingerprint set now constrains the REAL OLTP constructors
+//!   (`OltpPool::open(` / `ColocatedOltp::open(`); a region-less caller open is rejected. The M0
+//!   pool MODEL is region-less by named design (the cell region pins via the per-query
+//!   `(tenant, region)` `TenantScope`; the per-pool runtime region-pin is the M1 follow-on
+//!   **P-ST-15 / P-102**, STOR-D5), recorded LOUDLY via the `@residency-cell-pinned` waiver marker.
+//!   Storage's twin fixtures + the CI-wiring proof live in `tests/storage_lints.rs`.
 //! - `control-plane-pii-free` — tightens when the `CrossCellPointer` frame + routing registry land
 //!   (**P-CP-02 / P-027**, **P-CP-05 / P-080**); Tenancy ships its own twin in **P-CP-04 / P-028**.
 //! - `search-requires-acl-filter` — tightens to the type-system form when the permission-aware
