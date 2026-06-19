@@ -229,8 +229,13 @@ landing = "P-075"
 [[contract]]
 row = "4.6"
 title = "write_tuples -> zookie"
-status = "deferred"
-landing = "P-057"
+# COVERED by P-ID-08 / P-057: the S3 ReBAC tuple store + write_tuples atomic write → advanced
+# zookie → iam.tuple_written via the OUTBOX (the only emit path). The provider (write_tuples
+# emits + returns the zookie) + consumer (a role-compile caller stamps the returned zookie on the
+# object) CDC pair ships here. The 4.10 write-half (monotone-advancing zookie) rides this pair;
+# the 4.10 read-half (S8 watermark) is the named floor → P-070 (P-ID-12).
+status = "covered"
+cdc = ["crates/myelin-identity-service/tests/cdc_4_6_write_tuples.rs"]
 
 [[contract]]
 row = "4.7"
