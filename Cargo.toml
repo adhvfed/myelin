@@ -11,6 +11,10 @@ members = [
     "crates/myelin-gdpr",
     "crates/myelin-client",
     "crates/myelin-substrate",
+    # Test-support failure-injection harness (P-S02..P-S04). NOT a node in the production
+    # crate DAG (architecture §2.9) — it sits above myelin-substrate as a leaf consumer and
+    # nothing depends on it. See crates/myelin-harness/Cargo.toml.
+    "crates/myelin-harness",
 ]
 
 # Workspace-wide dependency versions. Pinned once here so every glue crate shares

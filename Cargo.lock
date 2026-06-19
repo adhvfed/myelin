@@ -63,6 +63,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "myelin-harness"
+version = "0.0.0"
+dependencies = [
+ "myelin-identity",
+ "myelin-tenancy",
+ "serde",
+]
+
+[[package]]
 name = "myelin-identity"
 version = "0.0.0"
 dependencies = [
