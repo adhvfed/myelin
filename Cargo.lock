@@ -296,6 +296,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "myelin-git"
+version = "0.0.0"
+dependencies = [
+ "myelin-gdpr",
+ "myelin-identity",
+ "myelin-tenancy",
+ "serde",
+]
+
+[[package]]
 name = "myelin-harness"
 version = "0.0.0"
 dependencies = [

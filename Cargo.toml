@@ -47,6 +47,16 @@ members = [
     # deps); only myelin-gdpr depends on it.
     "crates/myelin-gdpr-macros",
     "crates/myelin-client",
+    # The Git-hosting SUBSYSTEM crate (GIT-P3 → P-063). At M1 it carries ONLY the
+    # PersonalDataHolder H1 INTENT (architecture 00-overview §1.1, 03 §6) + the
+    # #[personal_data(...)] classification tags on the skeletal git schema (01 §4.3/§4.5) so the
+    # no-untagged-personal-data lint (contract 10.2 / 1.6) is green from the first migration
+    # (GIT-P8). It is a LEAF SUBSYSTEM consumer ABOVE the glue crates (depends on -gdpr/-tenancy/
+    # -identity) and is NOT a node in the eleven-crate library DAG modelled by
+    # myelin-substrate::crate_graph (like the service crates) — nothing in the production DAG
+    # depends back on it; substrate_is_root()/identity_is_sink() are preserved. The holder is
+    # OPENED + auto-registered by serve in GIT-P8 (M3-G1); no git feature ships at P-063.
+    "crates/myelin-git",
     # The storage SUBSTRATE crate (P-ST-01 → P-007): the OLTP tier client (harness pool +
     # (tenant, region) RLS guard), and — in later prompts — the KMS hierarchy + BlobStore
     # impls + backup/restore machinery. Sits below -gdpr/-client and ABOVE -substrate in

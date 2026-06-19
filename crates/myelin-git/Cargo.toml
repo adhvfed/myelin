@@ -1,0 +1,28 @@
+[package]
+name = "myelin-git"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# myelin-git is a SUBSYSTEM (producer) crate, NOT a node in the eleven-crate library DAG
+# modelled by `myelin-substrate::crate_graph` (architecture 00 §2.9). Like the service crates
+# (myelin-identity-service, myelin-gdpr-service) it is a LEAF CONSUMER above the shared glue
+# crates: it depends on the frozen contract surfaces (gdpr/PersonalDataHolder + the
+# #[personal_data] classify-derive, tenancy partition keys, identity Principal) and NOTHING in
+# the production library DAG depends back on it. `substrate_is_root()` / `identity_is_sink()`
+# in crate_graph.rs are preserved (a subsystem crate is the graph's terminal consumer).
+#
+# At GIT-P3 (P-063) this crate carries ONLY: the H1 holder-INTENT declaration + the
+# #[personal_data(...)] classification tags on the (still-skeletal) git schema types, so the
+# no-untagged-personal-data lint (contract 10.2 / 1.6) is GREEN from the first migration
+# (GIT-P8). No git FEATURE ships here — the holder is OPENED + auto-registered in GIT-P8 (M3-G1).
+[dependencies]
+# The GDPR contract surface (contract 10.1 PersonalDataHolder + contract 10.2 the
+# #[personal_data] classify-derive + the five tag enums). Consumed, not provided here.
+myelin-gdpr = { path = "../myelin-gdpr" }
+# The canonical (tenant, region) partition keys threaded through every git schema row.
+myelin-tenancy = { path = "../myelin-tenancy" }
+# Principal — the verified subject reference the holder's locate/erase key on (via SubjectRef).
+myelin-identity = { path = "../myelin-identity" }
+serde.workspace = true
