@@ -9,7 +9,7 @@
 //! Each lint below pairs with a red fixture (a sample it MUST reject) and a green fixture (a
 //! sample it MUST admit) in `tests/fixtures/` and is exercised by `tests/fixture_matrix.rs`.
 
-use crate::engine::{code_lines, code_statements, Lint, LintId, Violation};
+use crate::engine::{blank_string_literals, code_lines, code_statements, Lint, LintId, Violation};
 
 /// `tenant-predicate` (§2.11; EI-02 §1, ID-3; F2 the IDOR floor).
 ///
@@ -321,6 +321,642 @@ pub fn no_untagged_personal_data() -> Lint {
     }
 }
 
+// ============================================================================================
+// The remaining EIGHT architecture lints (the P-S11 → P-018 slice, completing the twelve).
+//
+// §2.11 / contract-index 1.6. Each is a hermetic source-scanner in the SAME style as the four
+// load-bearing lints above (CODE-only via `code_lines`/`code_statements`, typed LOUD
+// `Violation`s, no swallow path), each paired with a red + green fixture in `tests/fixtures/`.
+//
+// Several of these lints target code that does NOT exist yet (`search-requires-acl-filter`,
+// `flow-determinism`, `control-plane-pii-free`, `forward-only-migration` partly). Per the P-S11
+// DELIVERABLE we SHIP THE LINT + ITS FIXTURES NOW so the gate is live BEFORE the consumer ships,
+// and NAME each as a floor that tightens when the targeted code lands (see the per-lint
+// "Floor (named)" notes below). A lint over not-yet-written code is still a committed ratchet
+// click: it admits the whole current (empty-of-target) workspace and rejects the bug fingerprint
+// the moment the consumer introduces it.
+// ============================================================================================
+
+/// `no-cross-db` (§2.11; ADR-01).
+///
+/// **Rule.** A service crate must not depend on ANOTHER service's storage module. Each service
+/// owns its store and opens its own pool; the boundary between services is the frozen contract
+/// crate, never a shared data-access path (ADR-01 — the glue crates are the only cross-service
+/// coupling). **Fingerprint scanned:** a `use` / path reference into another subsystem's storage
+/// internals — `myelin_<other>::storage`, `myelin_<other>::store`, `myelin_<other>::db`,
+/// `crate::<...>` is fine (same crate), but reaching across to `myelin_identity::store::*` from,
+/// say, the Git crate is the cross-DB coupling bug class.
+///
+/// The scanner flags any `use myelin_*::{storage|store|db|schema|repo|pool}` path — a reach into
+/// a sibling service's data layer. (Depending on a sibling's *contract* surface — its public
+/// types, traits, event tokens — is allowed and is NOT a `::storage`/`::store` path.)
+pub const NO_CROSS_DB: LintId = LintId("no-cross-db");
+
+fn scan_no_cross_db(src: &str) -> Vec<Violation> {
+    // Sibling-storage-module path fingerprints. The leading `myelin_` (Rust crate ident form)
+    // means we are crossing a CRATE boundary; the `::storage`/`::store`/... segment means we are
+    // reaching into that crate's DATA layer (not its public contract surface).
+    const STORAGE_SEGMENTS: &[&str] = &[
+        "::storage::",
+        "::storage;",
+        "::store::",
+        "::store;",
+        "::db::",
+        "::db;",
+        "::schema::",
+        "::schema;",
+        "::repo::",
+        "::repo;",
+        "::pool::",
+        "::pool;",
+    ];
+    let mut out = Vec::new();
+    for (line, code) in code_lines(src) {
+        let trimmed = code.trim();
+        // Only `use` statements / path imports cross a crate boundary structurally.
+        if !trimmed.starts_with("use ") && !trimmed.contains("use myelin_") {
+            continue;
+        }
+        if !trimmed.contains("myelin_") {
+            continue;
+        }
+        if STORAGE_SEGMENTS.iter().any(|seg| trimmed.contains(seg)) {
+            out.push(Violation {
+                lint: NO_CROSS_DB,
+                line,
+                reason: "a service crate reaches into another service's storage module \
+                         (`myelin_<other>::storage|store|db|schema|repo|pool`) — services may \
+                         only couple over the frozen contract crate, never a shared data path; \
+                         each service owns its store and opens its own pool (ADR-01/no-cross-db)."
+                    .into(),
+            });
+        }
+    }
+    out
+}
+
+/// The [`Lint`] value for [`NO_CROSS_DB`].
+pub fn no_cross_db() -> Lint {
+    Lint {
+        id: NO_CROSS_DB,
+        rule: "a service crate must not depend on another service's storage module",
+        scan: scan_no_cross_db,
+    }
+}
+
+/// `forward-only-migration` (§2.11; STOR-2, §9).
+///
+/// **Rule.** No rollback migration file ("rollback" is a NEW forward migration, never a down
+/// migration); no blocking `ALTER` on a flagged-hot table. **Fingerprint scanned:** a down/rollback
+/// migration marker (`-- down`, `fn down(`, `.down.sql`, `DROP COLUMN`, a `down:` migration field)
+/// is the reversible-migration bug class; a bare blocking `ALTER TABLE ... ADD COLUMN ... NOT NULL`
+/// / `ALTER TABLE ... ALTER COLUMN` without the expand→backfill→contract idiom is the
+/// table-lock-under-load bug class.
+///
+/// **Floor (named).** The hot-table half is partial here: the per-subsystem hot-table DECLARATION
+/// that `forward-only-migration` reads to know WHICH `ALTER`s are forbidden lands with the
+/// migration runner + the `AppSpec` hot-table mechanism in **P-S15 / P-032**. Until then this
+/// scanner enforces the table-INDEPENDENT half (no down migration; no obviously-blocking
+/// `ALTER ... NOT NULL` add) and tightens to the per-table rule when the declaration exists.
+pub const FORWARD_ONLY_MIGRATION: LintId = LintId("forward-only-migration");
+
+fn scan_forward_only_migration(src: &str) -> Vec<Violation> {
+    let mut out = Vec::new();
+    for (line, code) in code_lines(src) {
+        // Blank string-literal CONTENTS so a forbidden token held as DATA — e.g. the migration
+        // runner's own guard `upper.contains("DROP COLUMN")` — is not mistaken for real DDL. The
+        // lint targets migration DDL, not Rust code that *checks for* the DDL pattern.
+        let code = blank_string_literals(&code);
+        let lower = code.to_ascii_lowercase();
+        let trimmed = lower.trim();
+        // (a) A down / rollback migration: reversibility is forbidden (forward-only).
+        let is_down = trimmed.starts_with("-- down")
+            || trimmed.starts_with("fn down(")
+            || trimmed.starts_with("pub fn down(")
+            || trimmed.contains(".down.sql")
+            || (trimmed.contains("down:") && lower.contains("migration"))
+            || trimmed.contains("drop column");
+        if is_down {
+            out.push(Violation {
+                lint: FORWARD_ONLY_MIGRATION,
+                line,
+                reason: "a down/rollback migration is forbidden — migrations are FORWARD-ONLY \
+                         (a rollback is a NEW forward migration, never a `down`/`DROP COLUMN`); \
+                         use expand→backfill→contract (STOR-2/§9)."
+                    .into(),
+            });
+        }
+        // (b) A blocking ALTER that adds a NOT NULL column or rewrites a column in place — the
+        // table-lock-under-load bug class. (The per-hot-table tightening lands in P-S15/P-032.)
+        let alter_adds_not_null = lower.contains("alter table")
+            && lower.contains("add column")
+            && lower.contains("not null")
+            && !lower.contains("default");
+        let alter_column_inplace =
+            lower.contains("alter table") && lower.contains("alter column");
+        if alter_adds_not_null || alter_column_inplace {
+            out.push(Violation {
+                lint: FORWARD_ONLY_MIGRATION,
+                line,
+                reason: "a blocking `ALTER TABLE` (ADD COLUMN ... NOT NULL without DEFAULT, or \
+                         ALTER COLUMN in place) takes a table lock — on a hot table this stalls \
+                         writes; use the expand→backfill→contract idiom (nullable add, backfill, \
+                         then constrain) (forward-only-migration/§9)."
+                    .into(),
+            });
+        }
+    }
+    out
+}
+
+/// The [`Lint`] value for [`FORWARD_ONLY_MIGRATION`].
+pub fn forward_only_migration() -> Lint {
+    Lint {
+        id: FORWARD_ONLY_MIGRATION,
+        rule: "no rollback migration file; no blocking ALTER on a flagged-hot table",
+        scan: scan_forward_only_migration,
+    }
+}
+
+/// `no-cross-sync-cycle` (§2.11; EI-02 §3).
+///
+/// **Rule.** The synchronous call graph is acyclic; **identity is a sink** (everyone may call
+/// Identity synchronously; Identity calls no one synchronously). If A calls B SYNCHRONOUSLY, then
+/// B must react to A only over the bus (never a sync call back). **Fingerprint scanned (the
+/// source-scanning twin of the build-layer `crate-graph-acyclic` test in `myelin-substrate`):** a
+/// SYNC outbound service client call FROM inside `myelin-identity` (`SyncClient`/`ServiceClient`/
+/// `.call_sync(`/`reqwest::`/`.get(`/`.post(` to another service) — Identity must not originate a
+/// synchronous cross-service call, or it is no longer a sink and a cycle becomes possible.
+///
+/// **Floor (named).** This is the structural-sink half (Identity originates no sync cross-service
+/// call). The full call-graph-acyclicity check across ALL service pairs rides the resilient
+/// inter-service client (`SyncClient`, P-S16 / P-033) + the per-edge sync-call registry; this
+/// scanner enforces the load-bearing sink invariant now and tightens when the client lands.
+pub const NO_CROSS_SYNC_CYCLE: LintId = LintId("no-cross-sync-cycle");
+
+fn scan_no_cross_sync_cycle(src: &str) -> Vec<Violation> {
+    // A synchronous OUTBOUND cross-service call fingerprint. From Identity these are forbidden
+    // (Identity is the sink). The reactive/bus path (`.emit(`, an EventHandler) is NOT a sync
+    // call and is always allowed.
+    const SYNC_OUTBOUND_SITES: &[&str] = &[
+        ".call_sync(",
+        ".sync_call(",
+        "SyncServiceClient",
+        ".rpc_call(",
+        "reqwest::Client",
+        ".send_request(",
+    ];
+    let mut out = Vec::new();
+    // This lint only fires INSIDE the identity crate (the sink). The workspace scan passes the
+    // file's crate via a marker the scanner detects: an identity source file carries the module
+    // path `myelin-identity` in its own header doc OR is scanned with the identity guard. Because
+    // the scanner is a pure fn of source text, we key off an in-source sink marker the identity
+    // crate's modules carry: a `//! IDENTITY-SINK` doc-line, OR the canonical crate self-reference
+    // `crate` within a file that also names itself identity. To stay hermetic and avoid coupling,
+    // the fixture marks the sink explicitly with `// @identity-sink`.
+    let is_identity_sink = src.contains("@identity-sink") || src.contains("IDENTITY-SINK");
+    if !is_identity_sink {
+        return out;
+    }
+    for (line, code) in code_lines(src) {
+        for site in SYNC_OUTBOUND_SITES {
+            if code.contains(site) {
+                out.push(Violation {
+                    lint: NO_CROSS_SYNC_CYCLE,
+                    line,
+                    reason: format!(
+                        "a synchronous outbound cross-service call `{site}` originates from \
+                         Identity — Identity is the SINK of the sync call graph (everyone may \
+                         call Identity synchronously; Identity calls no one synchronously). React \
+                         over the bus instead so the sync call graph stays acyclic (EI-02 §3)."
+                    ),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The [`Lint`] value for [`NO_CROSS_SYNC_CYCLE`].
+pub fn no_cross_sync_cycle() -> Lint {
+    Lint {
+        id: NO_CROSS_SYNC_CYCLE,
+        rule: "the sync call graph is acyclic; identity is a sink",
+        scan: scan_no_cross_sync_cycle,
+    }
+}
+
+/// `residency-pin` (§2.11; ADR-11, recon §10; index 10.5).
+///
+/// **Rule.** Every store/stream/index/cache declares a region; **no global pool**; outbound
+/// transfer is gated. **Fingerprint scanned:** a store/stream/index/cache CONSTRUCTION
+/// (`PgPool::connect(`, `OltpStore::open(`, `BlobStore::`, `IndexBackend::`, `CacheClient::new(`,
+/// a `Stream::` declaration) on a statement that does NOT also pin a `Region` (`Region`,
+/// `region:`, `.region(`, `.pinned_to(`, `ResidencyTag`). A global (region-less) pool is the
+/// data-leaves-its-region bug class.
+///
+/// **Floor (named).** The store-construction surface is M1 (the OLTP client P-ST-01, BlobStore
+/// P-ST-03, the index backends). This scanner ships the gate now keyed to those constructor
+/// fingerprints; it tightens (adds each concrete constructor) as the stores land. The
+/// `residency-pin` STORAGE-half twin is also shipped in P-ST-04 / P-020 over the storage crate.
+pub const RESIDENCY_PIN: LintId = LintId("residency-pin");
+
+fn scan_residency_pin(src: &str) -> Vec<Violation> {
+    // Store/stream/index/cache construction fingerprints that MUST pin a region.
+    const STORE_SITES: &[&str] = &[
+        "PgPool::connect(",
+        "PgPoolOptions::",
+        "OltpStore::open(",
+        "BlobStore::open(",
+        "IndexBackend::open(",
+        "CacheClient::new(",
+        "StreamStore::open(",
+    ];
+    // Tokens that prove a region/residency is pinned on the same statement.
+    const REGION_BINDERS: &[&str] = &[
+        "Region",
+        "region:",
+        ".region(",
+        ".pinned_to(",
+        "ResidencyTag",
+        "residency",
+    ];
+    let mut out = Vec::new();
+    for (line, code) in code_statements(src) {
+        let is_store = STORE_SITES.iter().any(|s| code.contains(s));
+        if !is_store {
+            continue;
+        }
+        let is_pinned = REGION_BINDERS.iter().any(|b| code.contains(b));
+        if !is_pinned {
+            out.push(Violation {
+                lint: RESIDENCY_PIN,
+                line,
+                reason: "a store/stream/index/cache is constructed WITHOUT a pinned region — \
+                         every store must declare its `Region` (no global pool); a region-less \
+                         pool lets data leave its residency boundary (ADR-11/residency-pin)."
+                    .into(),
+            });
+        }
+    }
+    out
+}
+
+/// The [`Lint`] value for [`RESIDENCY_PIN`].
+pub fn residency_pin() -> Lint {
+    Lint {
+        id: RESIDENCY_PIN,
+        rule: "every store/stream/index/cache declares a region; no global pool",
+        scan: scan_residency_pin,
+    }
+}
+
+/// `control-plane-pii-free` (§2.11; ADR-11, recon §OQ-I).
+///
+/// **Rule.** The control plane (routing, cross-cell pointers) carries OPAQUE IDS ONLY — never a
+/// name/email/body. **Fingerprint scanned:** a control-plane struct (one marked
+/// `// @control-plane` or named `*Pointer`/`*Routing`/`*Placement`/`CrossCell*`/`*Directory`) with
+/// a PII-bearing field (`name`, `email`, `phone`, `address`, `body`, `display_name`, …). Only
+/// opaque ids (`TenantId`, `Region`, slugs, hashes) may cross the control plane.
+///
+/// **Floor (named).** The concrete control-plane types (the `CrossCellPointer` frame, the routing
+/// registry tables) land in Tenancy M0/M1 (**P-CP-02 / P-027, P-CP-05 / P-080**) with their own
+/// `control-plane-pii-free` twin lint (P-CP-04 / P-028). This substrate scanner ships the gate now
+/// keyed to the `@control-plane` marker + the naming fingerprint; it admits the (empty-of-target)
+/// workspace and rejects a PII field the moment a control-plane struct introduces one.
+pub const CONTROL_PLANE_PII_FREE: LintId = LintId("control-plane-pii-free");
+
+fn scan_control_plane_pii_free(src: &str) -> Vec<Violation> {
+    // PII field-name fingerprints forbidden on a control-plane struct (a superset focused on the
+    // free-text / direct-identifier kinds the control plane must never carry).
+    const PII_FIELDS: &[&str] = &[
+        "name",
+        "email",
+        "phone",
+        "address",
+        "body",
+        "display_name",
+        "full_name",
+        "given_name",
+        "family_name",
+        "first_name",
+        "last_name",
+        "message",
+        "comment",
+        "title",
+    ];
+    let lines = code_lines(src);
+    let mut out = Vec::new();
+    let mut depth: i32 = 0;
+    let mut in_cp_struct = false;
+    let mut cp_struct_depth: i32 = 0;
+    // Marker: the previous lines flagged this struct as control-plane (a `// @control-plane`
+    // attribute line is stripped by code_lines, so we look at the RAW src for the marker on the
+    // line just above the struct; simpler: a struct whose NAME matches the control-plane shapes,
+    // OR any struct in a file that carries the `@control-plane` file marker).
+    let file_is_control_plane = src.contains("@control-plane");
+    const CP_NAME_FINGERPRINTS: &[&str] = &[
+        "Pointer",
+        "Routing",
+        "Placement",
+        "CrossCell",
+        "Directory",
+        "ControlPlane",
+    ];
+
+    for (line, code) in &lines {
+        let trimmed = code.trim();
+        let opens_struct = trimmed.starts_with("struct ")
+            || trimmed.starts_with("pub struct ")
+            || trimmed.contains(" struct ");
+        if opens_struct && code.contains('{') {
+            let named_cp = CP_NAME_FINGERPRINTS.iter().any(|n| trimmed.contains(n));
+            in_cp_struct = file_is_control_plane || named_cp;
+            cp_struct_depth = depth + 1;
+        }
+        if in_cp_struct && depth >= cp_struct_depth - 1 {
+            if let Some(field_name) = field_identifier(trimmed) {
+                if PII_FIELDS.contains(&field_name) {
+                    out.push(Violation {
+                        lint: CONTROL_PLANE_PII_FREE,
+                        line: *line,
+                        reason: format!(
+                            "control-plane struct carries PII field `{field_name}` — the control \
+                             plane (routing, cross-cell pointers, placement, directory) must carry \
+                             OPAQUE IDS ONLY (TenantId/Region/slug/hash), never a name/email/body. \
+                             PII is born inside the cell, never in the control plane (ADR-11/OQ-I)."
+                        ),
+                    });
+                }
+            }
+        }
+        let opens = code.matches('{').count() as i32;
+        let closes = code.matches('}').count() as i32;
+        depth += opens - closes;
+        if in_cp_struct && depth < cp_struct_depth - 1 {
+            in_cp_struct = false;
+        }
+    }
+    out
+}
+
+/// The [`Lint`] value for [`CONTROL_PLANE_PII_FREE`].
+pub fn control_plane_pii_free() -> Lint {
+    Lint {
+        id: CONTROL_PLANE_PII_FREE,
+        rule: "the control plane carries opaque ids only — never a name/email/body",
+        scan: scan_control_plane_pii_free,
+    }
+}
+
+/// `search-requires-acl-filter` (§2.11; ADR-03, recon §OQ-E).
+///
+/// **Rule.** Every search/list query conjoins the `list_objects` `Filter` BEFORE scoring —
+/// pre-filter, never post-filter. **Fingerprint scanned:** a search/list execution
+/// (`.search(`, `index.query(`, `IndexBackend::search`, `.list_objects_scored(`, a
+/// `SearchQuery::new(`) on a statement that does NOT also conjoin the ACL filter (`acl_filter`,
+/// `.with_acl(`, `Filter::`, `.conjoin_filter(`, `list_objects`, `permission_filter`). A search
+/// that scores first and filters after leaks the EXISTENCE/RANK of forbidden docs (the
+/// post-filter leak bug class).
+///
+/// **Floor (named).** The search/list query surface lands in Search M2 (**SRCH-P08 / P-171**, the
+/// permission-aware query pipeline). This scanner ships the gate now keyed to the search-call
+/// fingerprints; the Search subsystem also ships its OWN `search-requires-acl-filter` twin
+/// (SRCH-P01 / P-021). It tightens to the type-system form (a `Scored` result is unconstructable
+/// without a `Filter`) when the pipeline lands.
+pub const SEARCH_REQUIRES_ACL_FILTER: LintId = LintId("search-requires-acl-filter");
+
+fn scan_search_requires_acl_filter(src: &str) -> Vec<Violation> {
+    // Search/list execution fingerprints that MUST conjoin the ACL filter before scoring.
+    const SEARCH_SITES: &[&str] = &[
+        ".search(",
+        ".query_index(",
+        "IndexBackend::search",
+        ".list_objects_scored(",
+        "SearchQuery::execute",
+        ".rank(",
+    ];
+    // Tokens that prove the ACL filter is conjoined on the same statement.
+    const ACL_BINDERS: &[&str] = &[
+        "acl_filter",
+        ".with_acl(",
+        "Filter::",
+        ".conjoin_filter(",
+        "list_objects",
+        "permission_filter",
+        ".pre_filter(",
+    ];
+    let mut out = Vec::new();
+    for (line, code) in code_statements(src) {
+        let is_search = SEARCH_SITES.iter().any(|s| code.contains(s));
+        if !is_search {
+            continue;
+        }
+        let is_acl_bound = ACL_BINDERS.iter().any(|b| code.contains(b));
+        if !is_acl_bound {
+            out.push(Violation {
+                lint: SEARCH_REQUIRES_ACL_FILTER,
+                line,
+                reason: "a search/list query is executed WITHOUT conjoining the list_objects ACL \
+                         `Filter` before scoring — search must PRE-filter on permission, never \
+                         post-filter; scoring before filtering leaks the existence and rank of \
+                         forbidden documents (ADR-03/OQ-E)."
+                    .into(),
+            });
+        }
+    }
+    out
+}
+
+/// The [`Lint`] value for [`SEARCH_REQUIRES_ACL_FILTER`].
+pub fn search_requires_acl_filter() -> Lint {
+    Lint {
+        id: SEARCH_REQUIRES_ACL_FILTER,
+        rule: "every search/list query conjoins the list_objects Filter before scoring",
+        scan: scan_search_requires_acl_filter,
+    }
+}
+
+/// `no-llm-in-platform` (§2.11; ADR-08.2, VISION §3).
+///
+/// **Rule.** No LLM SDK / prompt / model name appears in PLATFORM code; the runtime is behind the
+/// `AgentRuntime` strategy seam. **Fingerprint scanned:** an LLM SDK import or a model-name literal
+/// (`openai`, `anthropic`, `@anthropic-ai`, a `claude-*`/`gpt-*` model id, `langchain`,
+/// `.chat_completion(`, `.completions.create(`, a `system_prompt`/`build_prompt` symbol). The agent
+/// BRAIN lives behind `AgentRuntime` (a strategy seam) so the platform never hard-codes a provider.
+///
+/// **Floor (named).** The `AgentRuntime` strategy seam ships in the agent crate (**AG-P1 / P-130**,
+/// which also declares this lint's agent-side twin). This substrate scanner ships the gate now so
+/// no LLM dependency can leak into platform code before the seam exists. It excludes the agent
+/// crate's OWN runtime-adapter module (the one place an SDK is legitimately referenced — named, not
+/// silent), which the workspace scan handles via the exclusion list.
+pub const NO_LLM_IN_PLATFORM: LintId = LintId("no-llm-in-platform");
+
+fn scan_no_llm_in_platform(src: &str) -> Vec<Violation> {
+    // LLM SDK / prompt / model-name fingerprints forbidden in platform code. These are matched as
+    // lowercase substrings of CODE (comments stripped) so a doc-comment naming the rule is not
+    // flagged; the agent runtime-adapter module is excluded at the workspace-scan level.
+    const LLM_SITES: &[&str] = &[
+        "openai",
+        "anthropic",
+        "langchain",
+        "llama_index",
+        ".chat_completion(",
+        ".completions.create(",
+        "system_prompt",
+        "build_prompt",
+        "model_name",
+        "claude-3",
+        "gpt-4",
+    ];
+    let mut out = Vec::new();
+    for (line, code) in code_lines(src) {
+        let lower = code.to_ascii_lowercase();
+        for site in LLM_SITES {
+            if lower.contains(site) {
+                out.push(Violation {
+                    lint: NO_LLM_IN_PLATFORM,
+                    line,
+                    reason: format!(
+                        "LLM SDK / prompt / model-name fingerprint `{site}` in platform code — no \
+                         LLM SDK, prompt, or model name may appear in platform code; the agent \
+                         brain lives behind the `AgentRuntime` strategy seam so the platform is \
+                         provider-agnostic (ADR-08.2/VISION §3)."
+                    ),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The [`Lint`] value for [`NO_LLM_IN_PLATFORM`].
+pub fn no_llm_in_platform() -> Lint {
+    Lint {
+        id: NO_LLM_IN_PLATFORM,
+        rule: "no LLM SDK / prompt / model name in platform code; runtime behind AgentRuntime",
+        scan: scan_no_llm_in_platform,
+    }
+}
+
+/// `flow-determinism` (§2.11; index 9.2, recon §OQ-F).
+///
+/// **Rule.** A `myelin-flow` workflow body uses ONLY the deterministic `WfCtx` surface; any
+/// non-determinism must be journaled through `WfCtx` (`ctx.now()`, `ctx.rand()`, `ctx.activity(`,
+/// `ctx.sleep_*`, `ctx.emit(`). **Fingerprint scanned:** a raw non-deterministic call inside a
+/// workflow body (`SystemTime::now(`, `Instant::now(`, `Utc::now(`, `rand::`, `thread_rng(`,
+/// `Uuid::new_v4(`, `tokio::time::sleep(`, a direct `reqwest::`/IO call) that bypasses `WfCtx`. A
+/// raw clock/rng read makes replay diverge (the non-deterministic-replay bug class).
+///
+/// **Floor (named).** The `WfCtx` surface + the `myelin-flow` crate land in Workflow M2
+/// (**P-FLOW-04 / P-199**), and the workflow-determinism lint's red+green fixtures are re-shipped
+/// against the REAL `WfCtx` in **P-FLOW-08 / P-200**. This substrate scanner ships the gate now,
+/// keyed to a `// @workflow-body` marker (so it only fires inside a workflow body, not in ordinary
+/// service code that legitimately reads the clock); it tightens to the real `WfCtx` type when the
+/// crate lands.
+pub const FLOW_DETERMINISM: LintId = LintId("flow-determinism");
+
+fn scan_flow_determinism(src: &str) -> Vec<Violation> {
+    // Raw non-deterministic calls forbidden inside a workflow body (they bypass WfCtx and make
+    // replay diverge).
+    const NONDET_SITES: &[&str] = &[
+        "SystemTime::now(",
+        "Instant::now(",
+        "Utc::now(",
+        "Local::now(",
+        "rand::",
+        "thread_rng(",
+        "Uuid::new_v4(",
+        "tokio::time::sleep(",
+        "std::thread::sleep(",
+    ];
+    let mut out = Vec::new();
+    // This lint only fires inside a WORKFLOW BODY (marked `// @workflow-body`); ordinary service
+    // code legitimately reads the clock. The marker keeps the scanner hermetic until the real
+    // `myelin-flow` crate + `WfCtx` type land (P-FLOW-04/P-199), at which point the lint keys off
+    // the workflow-fn signature instead.
+    let is_workflow_body = src.contains("@workflow-body") || src.contains("WORKFLOW-BODY");
+    if !is_workflow_body {
+        return out;
+    }
+    for (line, code) in code_lines(src) {
+        for site in NONDET_SITES {
+            if code.contains(site) {
+                out.push(Violation {
+                    lint: FLOW_DETERMINISM,
+                    line,
+                    reason: format!(
+                        "raw non-deterministic call `{site}` in a workflow body bypasses the \
+                         deterministic `WfCtx` surface — a workflow must read time/rand/IO only \
+                         through `ctx.now()`/`ctx.rand()`/`ctx.activity(..)` so replay is \
+                         deterministic; a raw clock/rng read makes replay diverge (index 9.2/OQ-F)."
+                    ),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The [`Lint`] value for [`FLOW_DETERMINISM`].
+pub fn flow_determinism() -> Lint {
+    Lint {
+        id: FLOW_DETERMINISM,
+        rule: "a myelin-flow workflow body uses only the deterministic WfCtx surface",
+        scan: scan_flow_determinism,
+    }
+}
+
+/// The remaining EIGHT lints (the P-S11 slice of the twelve), in §2.11 table order.
+pub fn remaining_eight() -> Vec<Lint> {
+    vec![
+        no_cross_db(),
+        forward_only_migration(),
+        no_cross_sync_cycle(),
+        residency_pin(),
+        control_plane_pii_free(),
+        search_requires_acl_filter(),
+        no_llm_in_platform(),
+        flow_determinism(),
+    ]
+}
+
+/// The stable ids of the remaining eight lints (for the matrix + the "exactly eight" regression).
+pub const REMAINING_EIGHT: [LintId; 8] = [
+    NO_CROSS_DB,
+    FORWARD_ONLY_MIGRATION,
+    NO_CROSS_SYNC_CYCLE,
+    RESIDENCY_PIN,
+    CONTROL_PLANE_PII_FREE,
+    SEARCH_REQUIRES_ACL_FILTER,
+    NO_LLM_IN_PLATFORM,
+    FLOW_DETERMINISM,
+];
+
+/// The full TWELVE architecture lints (P-S10's four + P-S11's eight), in §2.11 table order. This
+/// is the complete committed ratchet; the workspace scan and the fixture matrix both run it.
+pub fn all_twelve() -> Vec<Lint> {
+    let mut v = load_bearing_four();
+    v.extend(remaining_eight());
+    v
+}
+
+/// The stable ids of all twelve lints, in §2.11 table order.
+pub const ALL_TWELVE: [LintId; 12] = [
+    TENANT_PREDICATE,
+    NO_RAW_PUBLISH,
+    NO_HOST_EXEC,
+    NO_UNTAGGED_PERSONAL_DATA,
+    NO_CROSS_DB,
+    FORWARD_ONLY_MIGRATION,
+    NO_CROSS_SYNC_CYCLE,
+    RESIDENCY_PIN,
+    CONTROL_PLANE_PII_FREE,
+    SEARCH_REQUIRES_ACL_FILTER,
+    NO_LLM_IN_PLATFORM,
+    FLOW_DETERMINISM,
+];
+
 /// The four load-bearing lints (the P-S10 slice of the twelve), in §2.11 table order. The
 /// fixture matrix and the workspace scan both run this exact set so the gate is the same surface
 /// everywhere.
@@ -401,5 +1037,98 @@ mod tests {
         assert!(run(&load_bearing_four(), dirty).is_err());
         let clean = "let x = 1 + 1;";
         assert!(run(&load_bearing_four(), clean).is_ok());
+    }
+
+    // ---- the remaining eight (P-S11 → P-018) ----
+
+    #[test]
+    fn no_cross_db_rejects_sibling_storage_use_admits_contract_use() {
+        let red = "use myelin_identity::store::PrincipalStore;";
+        let green = "use myelin_identity::PrincipalId;"; // a sibling's CONTRACT surface is fine.
+        assert!(!no_cross_db().run(red).is_empty());
+        assert!(no_cross_db().run(green).is_empty());
+    }
+
+    #[test]
+    fn forward_only_migration_rejects_down_and_blocking_alter_admits_expand() {
+        let red_down = "fn down() { /* rollback */ }";
+        let red_alter = "ALTER TABLE principals ADD COLUMN email TEXT NOT NULL;";
+        let green = "ALTER TABLE principals ADD COLUMN email TEXT;"; // nullable add = expand.
+        assert!(!forward_only_migration().run(red_down).is_empty());
+        assert!(!forward_only_migration().run(red_alter).is_empty());
+        assert!(forward_only_migration().run(green).is_empty());
+    }
+
+    #[test]
+    fn no_cross_sync_cycle_rejects_identity_sync_call_admits_bus_reaction() {
+        let red = "// @identity-sink\nlet r = client.call_sync(req);";
+        let green = "// @identity-sink\nctx.emit(draft, cause)?;"; // reacting over the bus is fine.
+        let elsewhere = "let r = client.call_sync(req);"; // not in identity → not this lint.
+        assert!(!no_cross_sync_cycle().run(red).is_empty());
+        assert!(no_cross_sync_cycle().run(green).is_empty());
+        assert!(no_cross_sync_cycle().run(elsewhere).is_empty());
+    }
+
+    #[test]
+    fn residency_pin_rejects_global_pool_admits_pinned_pool() {
+        let red = "let pool = PgPool::connect(url).await?;";
+        let green = "let pool = PgPool::connect(url).region(Region::EuWest).await?;";
+        assert!(!residency_pin().run(red).is_empty());
+        assert!(residency_pin().run(green).is_empty());
+    }
+
+    #[test]
+    fn control_plane_pii_free_rejects_pii_field_admits_opaque_ids() {
+        let red = "pub struct CrossCellPointer {\n    pub email: String,\n}";
+        let green = "pub struct CrossCellPointer {\n    pub tenant_id: TenantId,\n    pub region: Region,\n}";
+        assert!(!control_plane_pii_free().run(red).is_empty());
+        assert!(control_plane_pii_free().run(green).is_empty());
+    }
+
+    #[test]
+    fn search_requires_acl_filter_rejects_unfiltered_search_admits_prefiltered() {
+        let red = "let hits = index.search(query).await?;";
+        let green = "let hits = index.search(query.with_acl(acl_filter)).await?;";
+        assert!(!search_requires_acl_filter().run(red).is_empty());
+        assert!(search_requires_acl_filter().run(green).is_empty());
+    }
+
+    #[test]
+    fn no_llm_in_platform_rejects_sdk_admits_runtime_seam() {
+        let red = "let client = openai::Client::new(key);";
+        let green = "let out = agent_runtime.run(plan).await?;"; // behind the AgentRuntime seam.
+        assert!(!no_llm_in_platform().run(red).is_empty());
+        assert!(no_llm_in_platform().run(green).is_empty());
+    }
+
+    #[test]
+    fn flow_determinism_rejects_raw_clock_in_workflow_admits_wfctx() {
+        let red = "// @workflow-body\nlet t = SystemTime::now();";
+        let green = "// @workflow-body\nlet t = ctx.now();";
+        let elsewhere = "let t = SystemTime::now();"; // not a workflow body → not this lint.
+        assert!(!flow_determinism().run(red).is_empty());
+        assert!(flow_determinism().run(green).is_empty());
+        assert!(flow_determinism().run(elsewhere).is_empty());
+    }
+
+    #[test]
+    fn remaining_eight_is_exactly_the_named_eight() {
+        let lints = remaining_eight();
+        assert_eq!(lints.len(), 8);
+        let ids: Vec<LintId> = lints.iter().map(|l| l.id).collect();
+        assert_eq!(ids, REMAINING_EIGHT.to_vec());
+    }
+
+    #[test]
+    fn all_twelve_is_the_four_plus_the_eight_in_order() {
+        let lints = all_twelve();
+        assert_eq!(lints.len(), 12, "the full ratchet is exactly twelve lints");
+        let ids: Vec<LintId> = lints.iter().map(|l| l.id).collect();
+        assert_eq!(ids, ALL_TWELVE.to_vec());
+        // No id is duplicated across the four + the eight.
+        let mut sorted: Vec<&str> = ids.iter().map(|i| i.0).collect();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 12, "all twelve lint ids must be distinct");
     }
 }

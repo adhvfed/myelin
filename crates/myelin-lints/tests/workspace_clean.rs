@@ -1,7 +1,8 @@
-//! The LIVE gate: run the four load-bearing lints over Myelin's OWN `crates/*/src` tree and
+//! The LIVE gate: run ALL TWELVE architecture lints over Myelin's OWN `crates/*/src` tree and
 //! fail the build on ANY violation. This is what makes the lints a committed gate, not just a
-//! fixture exercise — "an uncommitted gate is no gate" (EI-01 §5). The whole point of P-S10 is
-//! that the four bug-classes are impossible to MERGE, so the lints must run on real code.
+//! fixture exercise — "an uncommitted gate is no gate" (EI-01 §5). The whole point of the lint
+//! ratchet is that the twelve bug-classes are impossible to MERGE, so the lints must run on real
+//! code (P-S10 → P-017 shipped the four; P-S11 → P-018 completes the twelve).
 //!
 //! Documented, LOUD exclusions (never silent skips — EI-01 §4):
 //! - `myelin-events/src/relay.rs` — the relay is the ONE legitimate broker-publish component
@@ -11,9 +12,17 @@
 //!   contain the forbidden tokens as DATA (the strings the scanner looks for). Scanning the lint
 //!   crate would flag its own pattern lists. Excluded and named.
 //! - `**/tests/**` and `**/fixtures/**` — test fixtures deliberately contain red samples.
+//!
+//! The remaining-eight lints (P-S11) are designed to be MARKER-keyed where they target
+//! not-yet-existing code (`no-cross-sync-cycle` fires only inside an `@identity-sink` file;
+//! `flow-determinism` only inside an `@workflow-body`; `control-plane-pii-free` only on a
+//! control-plane-named/marked struct) — so they admit the whole current workspace and tighten the
+//! moment the consumer code lands. The token-fingerprint lints (`no-cross-db`, `residency-pin`,
+//! `search-requires-acl-filter`, `no-llm-in-platform`, `forward-only-migration`) admit the
+//! current substrate because no such call-site exists yet; if one is added it must be clean.
 
 use myelin_lints::engine::run;
-use myelin_lints::lints::load_bearing_four;
+use myelin_lints::lints::all_twelve;
 use std::path::{Path, PathBuf};
 
 fn workspace_root() -> PathBuf {
@@ -68,9 +77,9 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 #[test]
-fn the_four_lints_are_clean_over_the_workspace_source() {
+fn the_twelve_lints_are_clean_over_the_workspace_source() {
     let root = workspace_root();
-    let lints = load_bearing_four();
+    let lints = all_twelve();
     let mut all_violations = Vec::new();
     let mut scanned = 0usize;
 
@@ -96,7 +105,7 @@ fn the_four_lints_are_clean_over_the_workspace_source() {
 
     assert!(
         all_violations.is_empty(),
-        "the four load-bearing architecture lints found violations in workspace source \
+        "the twelve architecture lints found violations in workspace source \
          (loud, never swallowed — fix the code, do not weaken the lint):\n{}",
         all_violations.join("\n")
     );

@@ -1,0 +1,7 @@
+// GREEN fixture for `no-cross-sync-cycle` — the lint MUST admit this.
+// @identity-sink
+// Identity reacts to other services ONLY over the bus (an emit / an EventHandler), never a sync
+// call back. The sync call graph stays acyclic with Identity as the sink (EI-02 §3).
+pub async fn react_over_bus(tx: &mut OutboxTx, draft: EventDraft, cause: Cause) {
+    tx.emit(draft, cause).unwrap();
+}

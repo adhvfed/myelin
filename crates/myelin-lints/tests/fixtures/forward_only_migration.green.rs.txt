@@ -1,0 +1,5 @@
+-- GREEN fixture for `forward-only-migration` — the lint MUST admit this.
+-- The expand step of expand->backfill->contract: a NULLABLE column add takes no blocking lock,
+-- and there is no down migration (a rollback would be a NEW forward migration).
+ALTER TABLE principals ADD COLUMN email TEXT;
+CREATE INDEX CONCURRENTLY idx_principals_email ON principals (email);
