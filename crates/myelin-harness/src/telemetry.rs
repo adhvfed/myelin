@@ -114,12 +114,23 @@ pub enum SignalName {
     /// Firehose `resync_required` count (§10.2 row 9). The over-retention-gap signal — named,
     /// not silent. Scalar.
     ResyncRequiredCount,
+    /// Readiness — `1` = ready (can serve correct traffic now), `0` = not-ready (a critical
+    /// dependency is down, or boot/migration is incomplete → shed new traffic). The SUB-D9
+    /// survival signal (architecture §4.3; liveness ≠ readiness): a severed critical dependency
+    /// FLIPS this to `0` and the surface sheds; a healthy instance reads `1`. Scalar.
+    Readiness,
+    /// Liveness restart-churn — the count of liveness-triggered restarts. The SUB-D9 "no
+    /// restart-storm" signal: liveness = "not wedged" must NOT check dependencies, so a dead
+    /// critical dependency leaves this at its baseline (`0`) — only a genuinely wedged process
+    /// flips liveness (and restarts). The drill asserts `== 0` across a dependency outage
+    /// (readiness sheds; liveness does not churn). Scalar.
+    LivenessRestartCount,
 }
 
 impl SignalName {
     /// Every contract-1.8 signal name (for the "the library covers the §10.2 set" test —
     /// observability is part of the pass condition, so the set must be exhaustive).
-    pub const ALL: [SignalName; 16] = [
+    pub const ALL: [SignalName; 18] = [
         SignalName::RequestRate,
         SignalName::RequestErrors,
         SignalName::RequestDuration,
@@ -136,6 +147,8 @@ impl SignalName {
         SignalName::CrossTenantCount,
         SignalName::FirehoseFrameLag,
         SignalName::ResyncRequiredCount,
+        SignalName::Readiness,
+        SignalName::LivenessRestartCount,
     ];
 }
 
@@ -628,14 +641,14 @@ mod tests {
     /// these fails X-1) — every name is distinct and the set is the exhaustive ALL.
     #[test]
     fn covers_the_full_contract_1_8_signal_set() {
-        // 16 distinct names, matching the §10.2 table rows (RED ×3 + USE + lag + outbox +
+        // 18 distinct names, matching the §10.2 table rows (RED ×3 + USE + lag + outbox +
         // dead-letter + breaker + fail-static ×2 + shed + causal ×2 + cross-tenant +
-        // firehose ×2).
+        // firehose ×2 + readiness + liveness-restart — the §4.3 liveness≠readiness pair).
         let mut uniq = SignalName::ALL.to_vec();
         let n = uniq.len();
         uniq.sort();
         uniq.dedup();
         assert_eq!(uniq.len(), n, "every contract-1.8 signal name is distinct");
-        assert_eq!(n, 16, "the §10.2 set is covered exhaustively");
+        assert_eq!(n, 18, "the §10.2 set is covered exhaustively");
     }
 }
