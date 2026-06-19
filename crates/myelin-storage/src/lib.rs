@@ -76,13 +76,28 @@
 //!   complete and testable now and do not change shape when the driver lands.
 //! - **`PersonalDataHolder` BODIES** (locate/export/rectify/restrict/erase) are the GDPR
 //!   M1 deliverable; here only the **registration hook fires** (1.4) — see [`holder`].
+//! - **The [`blob::BlobStore`] (P-ST-03 / 11.2)** is now IMPLEMENTED in [`blob`]: the frozen
+//!   content-addressed `put/get/head/delete` trait + the fs-backed floor
+//!   ([`blob::FsBlobStore`]), with **BLAKE3 hash-on-write** (a self-describing multihash
+//!   prefix so SHA-256 coexists), **address-by-plaintext-hash within a per-tenant keyspace,
+//!   store ciphertext** (per-tenant dedup, no cross-tenant share), and **re-hash-on-read
+//!   integrity** (corrupt object → `blob_integrity_fail` + 0 silent serve, the STOR-D7
+//!   floor). Floors named in [`blob`]: the per-blob content-key WRAP is the
+//!   [`blob::IdentityWrap`] floor → real DEK wrap at **P-ST-08 (P-095)**; the fs backing →
+//!   **object-store (MinIO/Ceph) at P-ST-30 (P-636)**; the BlobStore crypto-shred DSR body →
+//!   GDPR M1 (P-ST-09). The BlobStore registers as a holder via the [`holder`] seam.
 
+pub mod blob;
 pub mod coloc;
 pub mod holder;
 pub mod oltp;
 pub mod rls;
 
+pub use blob::{
+    BlobError, BlobMeta, BlobStore, BlobTelemetry, ContentHash, ContentWrap, FsBlobStore,
+    HashAlgo, IdentityWrap,
+};
 pub use coloc::{ColocError, ColocatedOltp, ColocatedTx, COLOCATED_OUTBOX_MIGRATION};
-pub use holder::{register_holder, OltpHolderRegistration, OltpStoreHolder};
+pub use holder::{register_holder, BlobStoreHolder, OltpHolderRegistration, OltpStoreHolder};
 pub use oltp::{OltpConfig, OltpError, OltpPool, PermitGuard};
 pub use rls::{RlsError, TenantQuery, TenantScope, TenantTable};

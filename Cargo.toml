@@ -54,6 +54,12 @@ serde_json = "1"
 # its quantified threshold from. `toml` (de)serializes it; preserve-order is irrelevant here
 # (the file is keyed, not positional), so the default feature set is enough.
 toml = "0.8"
+# BLAKE3 is the content-address hash for the BlobStore (P-ST-03 / contract 11.2): hash-on-write,
+# re-hash-on-read integrity. A cited, proven structure (BLAKE3 2020; storage.md §11) — VISION §4
+# (cite proven structures, do not hand-roll a hash). `hex` renders the multihash digest into the
+# self-describing content-address string + the fs key path.
+blake3 = "1"
+hex = "0.4"
 
 [workspace.package]
 edition = "2021"
