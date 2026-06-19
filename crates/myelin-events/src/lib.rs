@@ -67,6 +67,22 @@
 //! exported ([`outbox::OutboxStore::outbox_depth`] / `dead_letter_count`). **This is a
 //! PERMANENT gate (re-run on every emit-path change).**
 //!
+//! ## Status (P-S08, 2026-06-19) — the idempotent consumer runtime + `consumer_dedup` (SUB-D2)
+//! The [`EventHandler`] template now has its **one runtime** ([`consumer::Consumer`]) that
+//! encodes the seven §5 rules so no consumer can skip one, plus the `consumer_dedup` ledger
+//! (contract 2.5, the effectively-once anchor). [`consumer::Subscription::bind`] REJECTS a `*`
+//! subscription at registration (rule 3, unconstructable wildcard); [`consumer::DedupLedger`]
+//! makes a redelivered `event_id` a no-op (rule 1, `(consumer, event_id)` PK); the runtime acks
+//! only on `Done` (rule 2 — a `Retry` is not acked → 0 lost), binds durable-by-name so a
+//! reconnect resumes (rule 4 — the **SUB-D2** 0-lost/0-dup-across-reconnect core re-uses the same
+//! ledger), dead-letters poison immediately (rule 5), bounds prefetch (rule 6), and exports
+//! `consumer_lag` (rule 7). **SUB-D2** (drop broker mid-stream → 0 lost across reconnect, slow
+//! subject does not head-of-line-block) and **SUB-D1 re-confirmed through a consumer** (the dedup
+//! ledger absorbs the relay redelivery → 0 dup) are drilled in
+//! `tests/drills_sub_d2_consumer.rs`. **This is a PERMANENT gate (re-run on every emit-path
+//! change).** The upcaster registry that runs before `handle` is **P-S09** — the pre-handle hook
+//! ([`consumer::Consumer::with_upcaster`]) is the seam it plugs into (identity map until then).
+//!
 //! ## Floors named (stubbed bodies → filling prompt)
 //! - **The OLTP binding is modeled in-memory at M0.** There is no live database (the OLTP tier
 //!   client is **P-007 / P-ST-01**; the migration runner is **P-S15**). [`outbox::OUTBOX_MIGRATION`]
@@ -82,15 +98,21 @@
 //!   `BusTransport` trait IS that seam; promoted only when volume is measured; named in EB-31).
 //! - **The ULID source** is the injected [`outbox::IdMinter`] ([`outbox::MonotonicMinter`] is
 //!   the deterministic floor); the real wall-clock+random ULID source wires at **P-S12**.
-//! - The `EventHandler` consumer runtime + `consumer_dedup` ledger (2.4/2.5, SUB-D2) is
-//!   **P-S08** (re-confirms SUB-D1 end-to-end through a consumer); the upcaster registry (2.8)
-//!   is **P-S09**.
+//! - The `EventHandler` consumer runtime + `consumer_dedup` ledger (2.4/2.5, SUB-D2) **shipped
+//!   in P-S08** (see [`consumer`]; re-confirms SUB-D1 end-to-end through a consumer). The
+//!   upcaster registry (2.8) the runtime calls before `handle` is **P-S09** — the
+//!   [`consumer::Consumer::with_upcaster`] hook is its install seam; identity map until then.
 //! - `pii_key_ref`'s KMS hierarchy (the DEK epochs) is Storage M1 (11.3); P-001 ships
 //!   only the field + its format.
 
+pub mod consumer;
 pub mod outbox;
 pub mod relay;
 
+pub use consumer::{
+    Consumer, ConsumerName, DeadLetter, DedupLedger, Delivered, Message, PrefetchBound,
+    SubscribeError, Subscription, CONSUMER_DEDUP_MIGRATION,
+};
 pub use outbox::{
     EmitContextBase, IdMinter, MonotonicMinter, OutboxRow, OutboxStore, OutboxTransaction, Ulid,
     OUTBOX_MIGRATION,
@@ -403,14 +425,15 @@ pub enum HandleOutcome {
 /// is a whitelist, **NEVER `*`** (an over-broad subscription head-of-line-blocks
 /// everything). `handle` is idempotent on `event_id` via the `consumer_dedup` ledger.
 ///
-/// **Floor:** the consumer runtime (the seven rules + the dedup ledger) is **P-S08**;
-/// the upcaster registry that runs before `handle` is **P-S09**. The trait shape is
-/// frozen here.
+/// The consumer runtime (the seven rules + the dedup ledger) is [`consumer::Consumer`]
+/// (**shipped in P-S08**); the upcaster registry that runs before `handle` is **P-S09**
+/// (the [`consumer::Consumer::with_upcaster`] hook). The trait shape is frozen here.
 pub trait EventHandler {
-    /// Whitelist — NEVER `*` (BUS-3, D7-i).
+    /// Whitelist — NEVER `*` (BUS-3, D7-i). [`consumer::Subscription::bind`] enforces the
+    /// `*`-rejection at registration so an over-broad subscription is unconstructable.
     fn subjects(&self) -> &'static [SubjectPattern];
     /// Idempotent on `event_id` (ADR-04.1). Body is the consumer's; the runtime around
-    /// it (dedup, ack-after-enqueue, bounded prefetch, lag metric) is P-S08.
+    /// it (dedup, ack-after-enqueue, bounded prefetch, lag metric) is [`consumer::Consumer`].
     fn handle(&self, ev: &EventEnvelope) -> HandleOutcome;
 }
 
