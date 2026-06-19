@@ -255,8 +255,21 @@ cdc = ["crates/myelin-identity-service/tests/cdc_4_4_list_subjects.rs"]
 [[contract]]
 row = "4.5"
 title = "delegation -> EffectivePolicy"
-status = "deferred"
-landing = "P-075"
+# COVERED by P-ID-17 / P-075: the monotone-intersection delegation algebra. `delegation(agent,
+# trigger_actor) → EffectivePolicy` composes `agent.policy ∩ delegation ∩ tenant.policy` as a
+# monotone set intersection over the macaroon/biscuit caveat sets (the SAME Authority::attenuate
+# primitive `authenticate` uses — one intersection primitive), with the "you cannot delegate
+# authority you do not have" re-check at mint (the delegation is first intersected with the trigger
+# actor's own held authority, so a delegator who LOST the right shrinks the agent's effective set —
+# the ID-D5 case). The provider (DelegationAlgebra via StoreBackedCheck::delegation_in, returning the
+# frozen EffectivePolicy + the recorded IntersectionProof) + consumer (an EffectApi-side caller that
+# applies a proposed effect iff its capability is inside the effective set) CDC pair ships here. The
+# fourth conjunct (the ordinary object check run AS the agent) is wired via delegation_with_check_in
+# over the live CheckEngine. ID-D5 (drill_id_d5_delegation) proves 0 effects escape the intersection
+# + emits the intersection proof. The M2 re-run against the live EffectApi is the named floor → P-134
+# (P-ID-23).
+status = "covered"
+cdc = ["crates/myelin-identity-service/tests/cdc_4_5_delegation.rs"]
 
 [[contract]]
 row = "4.6"
