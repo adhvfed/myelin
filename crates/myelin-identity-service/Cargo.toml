@@ -37,3 +37,19 @@ myelin-identity = { path = "../myelin-identity" }
 myelin-substrate = { path = "../myelin-substrate" }
 # TenantId / Region value types (for the Principal the internal-RPC authorizer threads).
 myelin-tenancy = { path = "../myelin-tenancy" }
+# P-ID-08 (P-057): the S3 ReBAC tuple store emits iam.tuple_written via the OUTBOX — the ONLY
+# emit path (the no-raw-publish lint forbids any other). The OutboxStore / OutboxTx::emit /
+# EventDraft / EmitContextBase carriers + the iam.tuple_written envelope construction live in
+# the events tier; the store buffers its delta + the event into ONE OutboxTransaction so the
+# tuple write and its event co-commit (emit-iff-committed). A service crate (a leaf consumer
+# ABOVE the events tier) may depend on it; nothing in the production library DAG depends back.
+myelin-events = { path = "../myelin-events" }
+# P-ID-08 (P-057): the S3 store is RLS-partitioned `(tenant, region)` with NO cross-tenant query
+# path — every store access is built through TenantScope/TenantQuery (the tenant-predicate floor),
+# and the store auto-registers as a PersonalDataHolder (the OltpStoreHolder seam). The OLTP tier
+# client (RLS guard + holder) lives in myelin-storage.
+myelin-storage = { path = "../myelin-storage" }
+# The iam.tuple_written event payload is references-not-payloads JSON (object#relation@subject
+# refs + the zookie watermark, never PII) built with `serde_json::json!`. The whole workspace
+# shares one serde_json::Value shape behind EventEnvelope.payload (workspace.dependencies).
+serde_json = { workspace = true }

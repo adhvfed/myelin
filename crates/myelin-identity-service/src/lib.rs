@@ -49,6 +49,12 @@
 //! The readiness-gates-on-migrate-complete property is the harness's (P-S14); this shell declares
 //! Identity's migrations so the booting instance is **not-ready until they apply**.
 
+pub mod tuple_store;
+
+pub use tuple_store::{
+    run_grant_expiry, StoredTuple, TupleStore, WriteError, S3_HOLDER, S3_TABLE,
+};
+
 use myelin_identity::{
     AuthzError, CaveatContext, Consistency, Decision, IdentityService, ListObjectsResult,
     ObjectType, Permission, Principal,
