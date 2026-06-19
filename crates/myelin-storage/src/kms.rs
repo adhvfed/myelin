@@ -342,6 +342,16 @@ pub struct DekHandle {
 }
 
 impl DekHandle {
+    /// Build a [`DekHandle`] directly from raw 256-bit key material. Used by the [`KeyOrigin`]
+    /// HYOK origin (and its customer-key-service test doubles), whose key plaintext arrives from the
+    /// customer's CALL-OUT (it is the customer's key, returned transiently by the customer service —
+    /// Myelin never holds it at rest). The material is NEVER exported back out of the handle.
+    ///
+    /// [`KeyOrigin`]: crate::key_origin::KeyOrigin
+    pub fn from_raw(bytes: [u8; KEY_LEN]) -> DekHandle {
+        DekHandle { key: RawKey(bytes) }
+    }
+
     /// Encrypt `plaintext` under this DEK (AES-256-GCM), returning `(nonce, ciphertext)`.
     pub fn seal(&self, plaintext: &[u8]) -> ([u8; NONCE_LEN], Vec<u8>) {
         let nonce = Aes256Gcm::generate_nonce(OsRng);
@@ -656,6 +666,46 @@ impl KmsEngine {
             .collect()
     }
 
+    /// Envelope-wrap raw DEK material under a tenant's KEK (the L1→L2 seal) — the primitive the
+    /// [`KeyOrigin`](crate::key_origin::KeyOrigin) platform/BYOK origins call to wrap a freshly
+    /// minted DEK. Ensures the tenant KEK exists first (so a wrap never fails on a not-yet-onboarded
+    /// tenant), then seals the bytes under it. The material is wrapped, never stored bare.
+    pub fn wrap_dek_material(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+        material: &[u8; KEY_LEN],
+    ) -> Result<WrappedDek, KmsError> {
+        let kek_id = KekId::new(tenant.clone(), region.clone());
+        self.ensure_kek(&kek_id);
+        self.wrap_dek(&kek_id, &RawKey(*material))
+    }
+
+    /// Unwrap a [`WrappedDek`] under a tenant's KEK into a usable [`DekHandle`] — the inverse of
+    /// [`Self::wrap_dek_material`], the primitive the platform/BYOK [`KeyOrigin`] origins call. A
+    /// destroyed KEK / non-authenticating envelope fails LOUDLY ([`KmsError`]) — never a
+    /// plaintext-without-key fall-through.
+    ///
+    /// [`KeyOrigin`]: crate::key_origin::KeyOrigin
+    pub fn unwrap_dek_material(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+        w: &WrappedDek,
+    ) -> Result<DekHandle, KmsError> {
+        let kek_id = KekId::new(tenant.clone(), region.clone());
+        let kek = self.open_kek(&kek_id)?;
+        let plain = kek
+            .cipher()
+            .decrypt(Nonce::from_slice(&w.nonce), w.wrapped.as_slice())
+            .map_err(|_| KmsError::UnwrapFailed(DekId::new(tenant.clone(), KeyClass::Tenant)))?;
+        if plain.len() != KEY_LEN {
+            return Err(KmsError::UnwrapFailed(DekId::new(tenant.clone(), KeyClass::Tenant)));
+        }
+        let mut bytes = [0u8; KEY_LEN];
+        bytes.copy_from_slice(&plain);
+        Ok(DekHandle { key: RawKey(bytes) })
+    }
 }
 
 impl Default for KmsEngine {

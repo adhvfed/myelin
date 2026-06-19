@@ -113,14 +113,43 @@
 //!   sustained hard-down → not-ready + shed ([`kms_failstatic::KmsReadiness::NotReady`]); **0
 //!   fail-open** (no path returns a DEK without a fresh resolve or an in-budget cache). **Floors
 //!   named in [`kms`]:** the `KeyOrigin` trait (platform-managed | BYOK | HYOK + the
-//!   `can_derive_plaintext_index()=false` structural HYOK enforcement) is the SIBLING **P-ST-07
-//!   (global P-094)** that FRONTS this engine; the OLTP/blob ENCRYPTION wiring (classify-driven
+//!   `can_derive_plaintext_index()=false` structural HYOK enforcement) — formerly the sibling
+//!   **P-ST-07 (global P-094)** — is now SHIPPED in [`key_origin`] and FRONTS this engine (it
+//!   calls [`kms::KmsEngine::wrap_dek_material`]/`unwrap_dek_material`); the OLTP/blob ENCRYPTION wiring (classify-driven
 //!   key choice, the real per-blob content-key wrap) is **P-ST-08 (global P-095)**; the
 //!   per-content-class HYOK POLICY + the KMIP/external-key-store adapter + HYOK-as-Schrems-III
 //!   (GD-7) are `[OPEN → P6/LEGAL]` named follow-ons (mechanism ships; policy → counsel/DPO); the
 //!   HSM/Shamir-split L0 backing is the production-hardening follow-on (the SHAPE — root wraps
 //!   KEKs, never exported — is complete). The mutation floor on the wrap/unwrap/destroy +
 //!   fail-open-prevention path is ≥ 80% (mandatory-core).
+//! - **The `KeyOrigin` trait + the structural HYOK enforcement (P-ST-07 / contract 11.3 — global
+//!   P-094)** is now IMPLEMENTED in [`key_origin`]: the [`key_origin::KeyOrigin`] trait
+//!   (`wrap`/`unwrap`/`can_derive_plaintext_index`/`destroy`, copied byte-exact from storage.md §6)
+//!   puts platform-managed | BYOK | HYOK behind ONE trait, FRONTING the P-058
+//!   [`kms::KmsEngine`] (via [`kms::KmsEngine::wrap_dek_material`]/`unwrap_dek_material`). The
+//!   three origins: [`key_origin::PlatformManaged`] (Myelin holds the key → full search/agents,
+//!   `can_derive_plaintext_index()=true`); [`key_origin::Byok`] (the customer's key wraps DEKs
+//!   under a customer-key path — same capability while the key is live, `=true`, plus the
+//!   instant-shred-by-revoke lever); [`key_origin::Hyok`] (the customer holds the key OUT of
+//!   Myelin's reach — `unwrap` is a CALL OUT via the [`key_origin::HyokKeyService`] seam that **may
+//!   DENY** ([`key_origin::KeyOriginError::HyokDenied`]), Myelin never holds the plaintext key, and
+//!   **`can_derive_plaintext_index()=FALSE` — the STRUCTURAL HYOK enforcement**). The
+//!   [`key_origin::IndexAdmission`] seam is the call shape Search/Agent consult before
+//!   building a plaintext-derived index ([`key_origin::IndexAdmission::for_origin`] → `SkipHyok` for
+//!   HYOK) — *you cannot index what you cannot decrypt*, enforced by code, not by review. The §6
+//!   per-class telemetry is [`key_origin::KeyOriginTelemetry`] (`can_derive_plaintext_index` per
+//!   origin). It REUSES the P-058 [`kms::WrappedDek`]/[`kms::DekHandle`]/[`kms::DekId`] (re-exported
+//!   as [`key_origin::KeyId`]) — NEVER a second key type (the §6 `Dek`/`KeyId` names bind to the
+//!   already-frozen engine types; documented deviation, EI-01 §1). **Floors named in
+//!   [`key_origin`]:** the per-content-class HYOK **POLICY** (which classes may be HYOK; the
+//!   cross-artifact-reference-spanning case), the KMIP / external-key-store **adapter** (the real
+//!   HYOK call-out — here an in-process customer-key-service stand-in proves the deny path), and
+//!   HYOK-as-a-Schrems-III mitigation (GD-7) are `[OPEN → P6/LEGAL]` named follow-ons (mechanism
+//!   ships; policy → counsel/DPO); the full Search/Agent skip drill **D-S10** lands WITH
+//!   Search/Agent (this prompt ships the mechanism + the scoped HYOK check + the IndexAdmission
+//!   seam they consult). The OLTP/blob ENCRYPTION wiring that drives origin selection per class is
+//!   the sibling **P-ST-08 (global P-095)**. The mutation floor on the
+//!   `can_derive_plaintext_index` branch + the HYOK deny path is mandatory-core (≥ 80%).
 //! - **Continuous WAL archiving + base backups + PITR (P-ST-11 / contract 11.5 — global P-059)**
 //!   is now IMPLEMENTED in [`backup`]: [`backup::ContinuousArchiver`] ships sealed WAL segments
 //!   off-host continuously (strictly forward, append-only) + takes periodic [`backup::BaseBackup`]s,
@@ -201,6 +230,7 @@ pub mod blob;
 pub mod cache;
 pub mod coloc;
 pub mod holder;
+pub mod key_origin;
 pub mod kms;
 pub mod kms_failstatic;
 pub mod migration;
@@ -242,6 +272,10 @@ pub use blob::{
 pub use cache::{Cache, CacheError, InMemoryCache};
 pub use coloc::{ColocError, ColocatedOltp, ColocatedTx, COLOCATED_OUTBOX_MIGRATION};
 pub use holder::{register_holder, BlobStoreHolder, OltpHolderRegistration, OltpStoreHolder};
+pub use key_origin::{
+    Byok, Dek, Hyok, HyokKeyService, HyokServiceDenied, IndexAdmission, KeyId, KeyOrigin,
+    KeyOriginError, KeyOriginKind, KeyOriginTelemetry, PlatformManaged,
+};
 pub use kms::{
     CellRoot, DekHandle, DekId, KeyClass, KekId, KmsAdapter, KmsEngine, KmsError, PiiKeyRef,
     WrappedDek, KEY_LEN, NONCE_LEN,
