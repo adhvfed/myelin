@@ -215,6 +215,34 @@
 //! frame is designed-not-built; the gate is structural (serde round-trip + the cell-agnostic
 //! compile assertion).
 //!
+//! ## Status (P-092 / EB-15, 2026-06-19) — the Bus as a `PersonalDataHolder` + inline-PII crypto-shred
+//! EB-15 ships [`holder`] — the Bus's instantiation of the ONE platform erasure posture (Bus §4.8 /
+//! X-7, by reference): the references-not-payloads + crypto-shred + tombstone triad. [`holder::BusHolder`]
+//! is the §5.7 `locate`/`erase`/`export` MECHANISM (contract **2.7 OWNED**) over the in-cell
+//! [`holder::BusEventLog`]: `erase(subject)` crypto-shreds the subject's RARE inline-PII DEK through
+//! the [`holder::InlinePiiShredder`] KMS seam (contract 11.4, CONSUMED) and emits `bus.event.erased`
+//! tombstones through the **outbox** (the only sanctioned emit path; there is no `publish_now`,
+//! BUS-2), returning an [`holder::EraseReceipt`] proving **0 recoverable** inline-PII in the live log;
+//! a live consumer degrades gracefully on a tombstone ([`holder::degrade_on_tombstone`] → `Done`,
+//! never blocks, never reads the now-unrecoverable payload). The **BUS-D8 live-store leg** is green
+//! (`tests/drills_bus_d8_crypto_shred.rs`: 0 recoverable inline-PII live + tombstones present +
+//! consumers degrade + nothing lost, bridged into the §10.2 harness assertion library); the 2.7 CDC
+//! pair is `tests/cdc_2_7_bus_holder.rs` (the coverage manifest flips 2.7 `deferred → covered`).
+//!
+//! **DEVIATION (EI-01 §1, documented):** the EB-15 prompt says "impl `PersonalDataHolder` for the
+//! EventBus", but that trait (10.1) is in `myelin-gdpr` and the real `KmsEngine` (11.3) is in
+//! `myelin-storage` — **both DOWNSTREAM of `myelin-events` in the frozen §2.9 DAG**. So `myelin-events`
+//! ships the holder MECHANISM to the exact §5.7 shape against a LOCAL crypto-shred seam
+//! ([`holder::InlinePiiShredder`]; in-memory floor [`holder::InMemoryShredder`]); the thin
+//! `impl gdpr::PersonalDataHolder for ...` adapter that wraps it + binds the live `KmsEngine` is the
+//! downstream **P-GA-06 (P-106)** (the named floor) — the same DAG-respecting pattern [`telemetry`]
+//! uses for the §10.2 `SignalName` enum and [`crosscell`] for `CrossCellPointer`. The H8 (event-bus)
+//! holder slot in the H1–H18 catalog (`myelin-substrate`, P-S27) is what this module resolves to.
+//! **FLOORS named:** the *reaches-backups* leg of BUS-D8 is the M5 follow-on **EB-29**; **post-restore
+//! re-erasure** (the key stays destroyed across a restore) is the immediate follow-on **EB-16 (P-093)**,
+//! which re-applies [`holder::BusHolder::erase`] (idempotent — proven here); the **[OPEN — LEGAL]**
+//! residual lawful-basis is the ONE platform posture (10.9, X-7), GDPR/legal track, NOT restated here.
+//!
 //! ## Floors named (stubbed bodies → filling prompt)
 //! - **The OLTP binding is modeled in-memory at M0.** There is no live database (the OLTP tier
 //!   client is **P-007 / P-ST-01**; the migration runner is **P-S15**). [`outbox::OUTBOX_MIGRATION`]
@@ -259,6 +287,7 @@ pub mod consumer;
 pub mod crosscell;
 pub mod dedup;
 pub mod envelope;
+pub mod holder;
 // Stage 2 / infra: the REAL durable bus behind the BusTransport trait — NATS JetStream via
 // async-nats. Compiled ONLY under `--features integration` (it pulls the real async-nats +
 // tokio clients); the default build keeps the in-process relay::InProcessBus floor. It
@@ -308,6 +337,18 @@ pub use residency::{
 pub use crosscell::{
     assert_cell_agnostic, pointer_correlation, ArtifactType, CellId, CrossCellPointer,
     OpaqueSubjectId,
+};
+
+/// The Bus as a `PersonalDataHolder` (contract 2.7 OWNED — the event-log half of erasure-vs-
+/// immutability) + the inline-PII crypto-shred to the KMS hierarchy (EB-15 / P-092). The §5.7
+/// `locate`/`erase`/`export` MECHANISM ([`holder::BusHolder`]) runs over the in-cell
+/// [`holder::BusEventLog`], destroying inline-PII DEKs through the [`holder::InlinePiiShredder`] KMS
+/// seam (real backing `myelin_storage::kms::KmsEngine::destroy_dek`, downstream — floor named in the
+/// [`holder`] module) and emitting `*.erased` tombstones through the outbox. FLOORS: the
+/// `impl gdpr::PersonalDataHolder` adapter is P-GA-06; the reaches-backups leg of BUS-D8 is EB-29.
+pub use holder::{
+    degrade_on_tombstone, BusEventLog, BusHolder, EraseReceipt, ExportedEvent, InMemoryShredder,
+    InlinePiiShredder, LocateReport, LocatedEvent, ShredError, BUS_ERASED_TYPE, ERASED_EVENT_NAME,
 };
 
 use serde::{Deserialize, Serialize};
