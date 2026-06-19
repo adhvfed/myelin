@@ -1,0 +1,19 @@
+[package]
+name = "myelin-gdpr-macros"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The proc-macro half of the GDPR classify-derive (contract 10.2). It exists as a SEPARATE
+# crate because Rust requires `proc-macro = true` crates to export ONLY procedural macros — the
+# five-tag ENUM TYPES (the names consumers reference) live in `myelin-gdpr` itself, and
+# `myelin-gdpr` re-exports the `#[personal_data]` attribute from here so a store writes
+# `use myelin_gdpr::personal_data;` and never depends on this crate directly.
+#
+# DAG position: this is a leaf BELOW `myelin-gdpr` (it has NO myelin dependencies — a no-op
+# attribute needs nothing but `proc_macro`). `myelin-gdpr` depends on it; nothing else does.
+[lib]
+proc-macro = true
+
+[dependencies]
