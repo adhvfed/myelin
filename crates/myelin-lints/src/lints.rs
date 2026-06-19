@@ -430,9 +430,27 @@ pub fn no_host_exec() -> Lint {
 /// subject bug class (it escapes the crypto-shred + RoPA fan-out). Only fields INSIDE a
 /// `struct ... {` body are considered (so a local `let email = ...` is not flagged).
 ///
+/// **P-GA-03 reconciliation (P-051, the GDPR-OWNED slice; coherence rule EI-01 §7).** The
+/// `no-untagged-personal-data` lint, its engine, and its red/green fixtures were FIRST shipped by
+/// the substrate prompt P-S10 → P-017 (the four load-bearing architecture lints — the lint harness
+/// is shared substrate, and contract-index 1.6 assigns this lint to GDPR). P-GA-03 is the GDPR
+/// owner's realization of the SAME contract-1.6 lint: it must enforce presence of the ACTUAL frozen
+/// `#[personal_data(...)]` attribute — the full SIX-TAG keyword form frozen in P-GA-02 / P-050
+/// (`category | role | basis | retention | erasure | subject_locator`; gdpr-and-audit §2.1). The
+/// P-017 floor only recognized the SINGLE-LINE attribute form (attribute on the line directly above
+/// the field); it FALSELY REJECTED the canonical MULTI-LINE tag (the closing `)]` is the line above
+/// the field, not the `#[personal_data(` opener) — every M1 store using the real tag would have
+/// failed the build. P-GA-03 SHARPENS the scanner to track the `#[personal_data(...)]` attribute's
+/// multi-line bracket span so the frozen shape is admitted, while an UNtagged PII field still fails
+/// (code-wins-over-docs, EI-01 §1 — a lint that rejects the contract's own frozen attribute is the
+/// bug). GDPR-owned red+green fixtures (`no_untagged_personal_data.gdpr.{red,green}`) prove both
+/// verdicts over the canonical form (`tests/gdpr_audit_lints.rs`). The lint is SHARPENED, never
+/// weakened (EI-01 §5).
+///
 /// **Floor (named).** The type-system form — a `#[personal_data]` classify-derive macro that
 /// refuses to expand a schema with an untagged PII field — lands in **P-GA-07 / P-107**. This
-/// scanner is the M0 ratchet click.
+/// scanner is the M0 ratchet click. (The derive at the P-GA-02 / P-050 floor is a NO-OP, so the
+/// scanner — not the macro — is what FORCES the tag until P-107.)
 pub const NO_UNTAGGED_PERSONAL_DATA: LintId = LintId("no-untagged-personal-data");
 
 fn scan_no_untagged_personal_data(src: &str) -> Vec<Violation> {
@@ -461,8 +479,32 @@ fn scan_no_untagged_personal_data(src: &str) -> Vec<Violation> {
     let mut depth: i32 = 0; // brace depth; >0 means we are inside SOME `{ }` body.
     let mut in_struct = false;
     let mut struct_brace_depth: i32 = 0;
-    // Track whether the immediately-preceding non-blank code line was a #[personal_data] attr.
-    let mut prev_was_personal_data = false;
+    // Whether the field about to be scanned is preceded by a `#[personal_data(...)]` attribute.
+    // This must survive the MULTI-LINE attribute form the §2.1 / P-GA-02 (P-050) frozen tag uses:
+    //
+    //     #[personal_data(
+    //         category = ContactInfo,
+    //         ...
+    //         subject_locator = "principal_id",
+    //     )]
+    //     email: EncryptedField<Email>,
+    //
+    // A naive "was the IMMEDIATELY-preceding line a `#[personal_data` line?" check (the original
+    // P-S10 / P-017 floor) FALSELY REJECTS this canonical shape: the line directly above the field
+    // is the attribute's closing `)]`, not the `#[personal_data(` opener, so the tag is missed and
+    // every store using the real frozen tag fails the build. The P-GA-03 owner (this prompt) is the
+    // one whose CANON docs name that exact multi-line attribute, so it fixes the scanner here
+    // (EI-01 §1, code-wins-over-docs: a lint that rejects the contract's own frozen attribute is the
+    // bug). We track the open `#[ ... ]` attribute bracket span: once `#[personal_data` opens, the
+    // field is treated as tagged until the attribute's brackets balance AND the next field line is
+    // consumed. The lint is SHARPENED (it now admits the real frozen shape) — never weakened: an
+    // UNtagged PII field still fails (the red fixtures prove it).
+    //
+    // `attr_open` = how many `[` of an in-flight `#[personal_data(...)]` attribute are still open
+    // (the attribute spans lines while this is > 0). `field_is_tagged` latches true the moment a
+    // `#[personal_data` attribute begins and stays true until the next struct FIELD is scanned.
+    let mut attr_bracket_depth: i32 = 0;
+    let mut field_is_tagged = false;
 
     for (line, code) in &lines {
         let trimmed = code.trim();
@@ -476,11 +518,31 @@ fn scan_no_untagged_personal_data(src: &str) -> Vec<Violation> {
             struct_brace_depth = depth + 1;
         }
 
+        // Open / continue a `#[personal_data(...)]` attribute span. The attribute may be single-line
+        // (`#[personal_data(contact)]`, brackets balance on this line) or multi-line (the §2.1 form,
+        // brackets stay open across the tag arguments). Once seen, the upcoming field is tagged.
+        if trimmed.contains("#[personal_data") {
+            field_is_tagged = true;
+            attr_bracket_depth = 0; // start counting THIS attribute's bracket span fresh.
+        }
+        // Track the attribute's `[`/`]` balance only while an attribute is in flight (latched by
+        // `field_is_tagged` with no field consumed yet) — so unrelated brackets elsewhere are
+        // ignored. A `#[derive(PersonalData)]` line uses `()` not `[ ... ]` args, so it never opens
+        // a span; only the `#[personal_data(...)]` helper does.
+        if field_is_tagged {
+            attr_bracket_depth +=
+                code.matches('[').count() as i32 - code.matches(']').count() as i32;
+        }
+
         // Check fields BEFORE updating brace depth so a field on the `struct X {` line is rare;
-        // fields are on their own lines inside the body.
+        // fields are on their own lines inside the body. A field is "tagged" iff a `#[personal_data]`
+        // attribute opened above it AND its bracket span has closed (`attr_bracket_depth <= 0`) by
+        // the time we reach the field line — i.e. the whole (possibly multi-line) attribute precedes
+        // the field, never bleeding into the field's own line.
         if in_struct && depth >= struct_brace_depth - 1 {
             if let Some(field_name) = field_identifier(trimmed) {
-                if PII_FIELDS.contains(&field_name) && !prev_was_personal_data {
+                let tagged = field_is_tagged && attr_bracket_depth <= 0;
+                if PII_FIELDS.contains(&field_name) && !tagged {
                     out.push(Violation {
                         lint: NO_UNTAGGED_PERSONAL_DATA,
                         line: *line,
@@ -492,6 +554,10 @@ fn scan_no_untagged_personal_data(src: &str) -> Vec<Violation> {
                         ),
                     });
                 }
+                // A struct FIELD line resets the tag latch: the attribute (if any) belonged to THIS
+                // field; the next field starts untagged unless it carries its own attribute.
+                field_is_tagged = false;
+                attr_bracket_depth = 0;
             }
         }
 
@@ -501,11 +567,6 @@ fn scan_no_untagged_personal_data(src: &str) -> Vec<Violation> {
         depth += opens - closes;
         if in_struct && depth < struct_brace_depth - 1 {
             in_struct = false;
-        }
-
-        // Update the "previous line was a #[personal_data] attr" flag (ignore blank lines).
-        if !trimmed.is_empty() {
-            prev_was_personal_data = trimmed.contains("#[personal_data");
         }
     }
     out
