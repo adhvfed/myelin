@@ -537,7 +537,10 @@ impl ServeHandle {
                 };
                 match c.deliver(&msg) {
                     Delivered::Acked | Delivered::Deduplicated => count += 1,
-                    Delivered::DeadLettered(_) | Delivered::Retried(_) => {}
+                    // Retried / DeadLettered / Throttled (per-tenant fairness, EB-05) are NOT a
+                    // completed terminal handle — they stay pending (lag, not loss) or were
+                    // surfaced; the next drain re-offers a Retried/Throttled message.
+                    Delivered::DeadLettered(_) | Delivered::Retried(_) | Delivered::Throttled(_) => {}
                 }
             }
             delivered.push((c.name(), count));

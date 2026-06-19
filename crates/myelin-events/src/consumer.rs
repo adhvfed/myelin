@@ -89,6 +89,7 @@
 //! already current).
 
 use crate::{DedupLedger, EventEnvelope, EventHandler, HandleOutcome, Reason, SubjectPattern};
+use myelin_tenancy::TenantId;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -131,6 +132,101 @@ impl Default for PrefetchBound {
     fn default() -> Self {
         PrefetchBound::DEFAULT
     }
+}
+
+/// **The per-tenant in-flight cap (rule 6, fairness / agent-surge — EB-05).** Bounds how many
+/// claimed-but-not-yet-acked messages ONE tenant may hold inside this consumer at once. Where
+/// [`PrefetchBound`] bounds the consumer GLOBALLY (a slow *subject* can't monopolise the loop),
+/// this bounds it PER TENANT (a single tenant's surge — the agent-generated-load case, §4.2 gotcha
+/// 6 — can't starve every other tenant's events behind it). `max_ack_pending` is the broker-level
+/// global ceiling; `per_tenant` is the fairness slice carved out of it.
+///
+/// The cap is **observable** ([`Consumer::tenant_inflight`]) so the contract-1.8
+/// `bus.per_tenant_inflight` signal ([`crate::BusSignal::PerTenantInflight`]) reads it, and a drill
+/// can assert one tenant's surge did not push a second tenant's events out (fairness held). A
+/// message that would exceed a tenant's cap is **deferred, not dropped** ([`Delivered::Throttled`]):
+/// it stays pending (lag, not loss) and is re-offered on the next drain once the tenant drains.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PerTenantInflight(u32);
+
+impl PerTenantInflight {
+    /// The floor default per-tenant in-flight cap (a fairness slice well under the global
+    /// `max_ack_pending`); EB-05 / later tuning may raise it per consumer.
+    pub const DEFAULT: PerTenantInflight = PerTenantInflight(16);
+
+    /// A cap of `n` in-flight messages per tenant, or `None` if `n == 0` (a zero cap would let
+    /// no tenant make progress — meaningless, rejected rather than silently treated as unbounded).
+    pub fn new(n: u32) -> Option<PerTenantInflight> {
+        if n == 0 {
+            None
+        } else {
+            Some(PerTenantInflight(n))
+        }
+    }
+
+    /// The numeric cap.
+    pub fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl Default for PerTenantInflight {
+    fn default() -> Self {
+        PerTenantInflight::DEFAULT
+    }
+}
+
+/// **The frozen consumer-registration spec (EB-05 — the one entry-point the whole platform binds
+/// through).** `consume(ConsumerSpec{ … }, handler)` is the single sanctioned way to stand up a
+/// consumer: it bundles the durable name + the `*`-free subject whitelist + the bounded prefetch
+/// (`max_ack_pending`) + the per-tenant in-flight fairness cap, and constructs the [`Consumer`]
+/// runtime with all seven rules wired. A subsystem never hand-rolls [`Subscription::bind`] +
+/// [`Consumer::new`]; it fills a `ConsumerSpec` and calls [`consume`]. This is "abstract at the
+/// first copy" (EI-01 §7): there will be dozens of consumers, and this spec is the one shape they
+/// all share — `*`-rejection, bind-by-name, prefetch, and the fairness cap cannot be skipped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsumerSpec {
+    /// The durable consumer name (rule 4: bind-by-name; re-bound identically on reconnect).
+    pub durable: ConsumerName,
+    /// The subject **whitelist** (rule 3: NEVER `*`). [`consume`] rejects a wildcard/empty subject
+    /// loudly at registration via [`Subscription::bind`].
+    pub subjects: Vec<String>,
+    /// The bounded prefetch (rule 6, global): the broker `max_ack_pending` — the max in-flight
+    /// (claimed-but-un-acked) messages across the whole consumer per drain.
+    pub max_ack_pending: PrefetchBound,
+    /// The per-tenant in-flight fairness cap (rule 6, per-tenant): the agent-surge guard so one
+    /// tenant cannot starve every other tenant's events.
+    pub per_tenant_inflight: PerTenantInflight,
+}
+
+impl ConsumerSpec {
+    /// A spec with the floor-default prefetch + per-tenant cap, naming the durable consumer and its
+    /// `*`-free subject whitelist (still validated at [`consume`] time — this is just the ergonomic
+    /// constructor for the common case).
+    pub fn new(durable: ConsumerName, subjects: &[&str]) -> ConsumerSpec {
+        ConsumerSpec {
+            durable,
+            subjects: subjects.iter().map(|s| (*s).to_string()).collect(),
+            max_ack_pending: PrefetchBound::DEFAULT,
+            per_tenant_inflight: PerTenantInflight::DEFAULT,
+        }
+    }
+}
+
+/// **The one sanctioned consumer entry-point (EB-05).** Validates the `ConsumerSpec` (rule 3:
+/// rejects a `*`/empty subject LOUDLY) and constructs the [`Consumer`] runtime bound to the durable
+/// name (rule 4), the bounded prefetch + per-tenant fairness cap (rule 6), sharing `dedup` (rule 1;
+/// a reconnect passes the SAME ledger so a redelivery is absorbed). Every later consumer (Signal
+/// engine, Search indexer, Notif router, the dispatch tier) is stood up through THIS function, not
+/// by hand-wiring the pieces.
+pub fn consume<H: EventHandler>(
+    spec: ConsumerSpec,
+    handler: H,
+    dedup: DedupLedger,
+) -> Result<Consumer<H>, SubscribeError> {
+    let subjects: Vec<&str> = spec.subjects.iter().map(|s| s.as_str()).collect();
+    let subscription = Subscription::bind(spec.durable, &subjects, spec.max_ack_pending)?;
+    Ok(Consumer::new(handler, subscription, dedup).with_per_tenant_inflight(spec.per_tenant_inflight))
 }
 
 /// Why a subscription was rejected at registration (rule 3: never `*`). A rejected subscription
@@ -228,6 +324,11 @@ pub enum Delivered {
     /// The handler returned `Retry`: the message was NOT acked (rule 2) — it stays pending and
     /// redelivers. Carries the backoff seconds the handler asked for.
     Retried(u64),
+    /// The message's tenant is already at its per-tenant in-flight cap (rule 6, fairness): the
+    /// message was DEFERRED, not handled and not dropped — it stays pending (lag, not loss) and is
+    /// re-offered on the next drain once the tenant drains. Carries the tenant that was throttled
+    /// so a drill can assert which tenant's surge was bounded (and that OTHER tenants flowed).
+    Throttled(TenantId),
 }
 
 /// A message the runtime is about to deliver: the durable subject + the canonical envelope.
@@ -272,6 +373,16 @@ pub struct Consumer<H: EventHandler> {
     pending: Mutex<HashMap<String, u64>>,
     /// Dead-lettered (poison) messages (rule 5), surfaced.
     dead_letters: Mutex<Vec<DeadLetter>>,
+    /// The per-tenant in-flight fairness cap (rule 6, EB-05). A tenant at its cap is throttled
+    /// (deferred, not dropped) so one tenant's surge cannot starve another's events.
+    per_tenant_cap: PerTenantInflight,
+    /// The set of DISTINCT outstanding (delivered-but-not-yet-terminal) `event_id`s PER TENANT
+    /// (rule 6). An event enters when it is first handled and stays while it `Retry`s (it is still
+    /// in-flight at the broker); it leaves on a terminal `Done`/`DeadLettered`. Keyed by distinct
+    /// event so a REDELIVERY of an already-outstanding event re-claims its existing slot rather
+    /// than consuming a second one (the real broker model). The per-tenant set size is what the
+    /// cap bounds and what the contract-1.8 `bus.per_tenant_inflight` signal reads.
+    tenant_inflight: Mutex<HashMap<TenantId, std::collections::HashSet<crate::EventId>>>,
 }
 
 impl<H: EventHandler> Consumer<H> {
@@ -286,7 +397,34 @@ impl<H: EventHandler> Consumer<H> {
             upcaster: Box::new(Ok),
             pending: Mutex::new(HashMap::new()),
             dead_letters: Mutex::new(Vec::new()),
+            per_tenant_cap: PerTenantInflight::DEFAULT,
+            tenant_inflight: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Set the per-tenant in-flight fairness cap (rule 6, EB-05). [`consume`] wires this from the
+    /// [`ConsumerSpec::per_tenant_inflight`]; the default is [`PerTenantInflight::DEFAULT`].
+    pub fn with_per_tenant_inflight(mut self, cap: PerTenantInflight) -> Self {
+        self.per_tenant_cap = cap;
+        self
+    }
+
+    /// The per-tenant in-flight fairness cap this consumer enforces (rule 6).
+    pub fn per_tenant_inflight_cap(&self) -> PerTenantInflight {
+        self.per_tenant_cap
+    }
+
+    /// The current in-flight (delivered-but-not-terminal, distinct-event) count for ONE tenant
+    /// (rule 6). The contract-1.8 `bus.per_tenant_inflight` survival signal reads this; a fairness
+    /// drill asserts it never exceeds the cap and that a throttled tenant's surge did not push
+    /// another tenant out.
+    pub fn tenant_inflight(&self, tenant: &TenantId) -> u32 {
+        self.tenant_inflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(tenant)
+            .map(|s| s.len() as u32)
+            .unwrap_or(0)
     }
 
     /// Install the pre-handle upcaster (P-S09 plugs the `(type, from_ver) → to_ver` registry in
@@ -343,6 +481,12 @@ impl<H: EventHandler> Consumer<H> {
     /// handler; then the terminal-outcome dispatch — rule 2 (ack only on `Done`), rule 5
     /// (`NonRetryable` → dead-letter immediately), and `Retry` (NOT acked → stays pending, lag
     /// rises). Returns what the runtime DID.
+    ///
+    /// **Rule 6, per-tenant fairness (EB-05):** before handling, if the message's tenant is already
+    /// at its [`PerTenantInflight`] cap, the message is THROTTLED ([`Delivered::Throttled`]) —
+    /// deferred, not dropped — so one tenant's surge cannot starve another tenant's events. A
+    /// `Retry` holds the tenant's in-flight slot (the work is still outstanding); a `Done` /
+    /// `Deduplicated` / `DeadLettered` releases it.
     pub fn deliver(&self, msg: &Message) -> Delivered {
         // Rule 3: the subject MUST be on this consumer's `*`-free whitelist. (A `Subscription`
         // cannot carry a `*`, so this is a real whitelist match — never over-broad.)
@@ -352,6 +496,23 @@ impl<H: EventHandler> Consumer<H> {
             let reason = Reason(format!("subject {} not on consumer whitelist", msg.subject));
             self.push_dead_letter(msg.envelope.clone(), reason.clone());
             return Delivered::DeadLettered(reason);
+        }
+
+        // Rule 6, per-tenant fairness (EB-05): if this tenant is already at its in-flight cap AND
+        // this is a NEW event (not the redelivery of an already-outstanding one), the message is
+        // THROTTLED — deferred (stays pending, lag rises), never dropped and never handed to the
+        // handler. This is the agent-surge guard: a single tenant flooding the consumer holds at
+        // most `per_tenant_cap` distinct in-flight events, so EVERY other tenant's events keep
+        // flowing. A redelivery of an event already in-flight re-claims its existing slot (the real
+        // broker model), so a retried event can always make progress. The check is BEFORE the dedup
+        // mark so a throttled message is fully re-offerable on the next drain (it was never handled).
+        let tenant = msg.envelope.tenant.clone();
+        let event_id = msg.envelope.event_id.clone();
+        if !self.tenant_has_inflight(&tenant, &event_id)
+            && self.tenant_inflight(&tenant) >= self.per_tenant_cap.get()
+        {
+            self.bump_pending(&msg.subject);
+            return Delivered::Throttled(tenant);
         }
 
         // The upcaster (P-S09, contract 2.8) runs BEFORE handle so the handler sees the current
@@ -368,7 +529,7 @@ impl<H: EventHandler> Consumer<H> {
                 return Delivered::DeadLettered(reason);
             }
         };
-        let event_id = envelope.event_id.clone();
+        debug_assert_eq!(envelope.event_id, event_id, "an upcaster never changes event_id");
 
         // Rule 1: idempotent on `event_id` via the (consumer, event_id) dedup ledger. A FRESH
         // pair runs the handler; a DUPLICATE (redelivery) SKIPs it and acks — 0 dup.
@@ -379,12 +540,20 @@ impl<H: EventHandler> Consumer<H> {
             return Delivered::Deduplicated;
         }
 
+        // Rule 6: this fresh message now occupies a per-tenant in-flight slot (the work is
+        // outstanding until a terminal ack). The slot is keyed by `event_id` so a redelivery of an
+        // already-outstanding event re-claims the SAME slot. It is released on Done/DeadLettered
+        // below; a Retry KEEPS it (the work is still pending) so a tenant whose events keep failing
+        // fills its cap and throttles, while other tenants flow.
+        self.bump_tenant_inflight(&tenant, &event_id);
+
         // Run the handler (the consumer's body). A reaction it emits calls
         // `OutboxTx::emit(draft, cause = Some(&envelope))` (§5.3) — provided by the caller's tx.
         match self.handler.handle(&envelope) {
             HandleOutcome::Done => {
                 // Rule 2: ack AFTER the handler succeeded — the cursor advances, lag clears.
                 self.clear_pending(&msg.subject);
+                self.clear_tenant_inflight(&tenant, &event_id);
                 Delivered::Acked
             }
             HandleOutcome::NonRetryable(reason) => {
@@ -394,13 +563,16 @@ impl<H: EventHandler> Consumer<H> {
                 // The dedup mark stays (this event_id is terminal for this consumer): a
                 // redelivery of a dead-lettered message is itself deduplicated, never re-poisons.
                 self.clear_pending(&msg.subject);
+                self.clear_tenant_inflight(&tenant, &event_id);
                 self.push_dead_letter(envelope, reason.clone());
                 Delivered::DeadLettered(reason)
             }
             HandleOutcome::Retry(backoff) => {
                 // NOT acked (rule 2): the message stays pending → it redelivers, and lag rises.
-                // The dedup mark must be REVERTED — a retry is NOT a completed handle, so a
-                // later redelivery must run the handler again (else a transient failure would be
+                // The per-tenant in-flight slot is KEPT (the work is still outstanding) — this is
+                // what makes a surging tenant whose events keep retrying eventually hit its cap and
+                // throttle. The dedup mark must be REVERTED — a retry is NOT a completed handle, so
+                // a later redelivery must run the handler again (else a transient failure would be
                 // permanently swallowed: silent data loss).
                 self.dedup_revert(&event_id);
                 self.bump_pending(&msg.subject);
@@ -444,6 +616,36 @@ impl<H: EventHandler> Consumer<H> {
     fn clear_pending(&self, subject: &str) {
         if let Some(p) = self.pending().get_mut(subject) {
             *p = p.saturating_sub(1);
+        }
+    }
+
+    /// Is `event_id` already in `tenant`'s outstanding (in-flight) set? A redelivery of an
+    /// outstanding event re-claims its slot rather than consuming a new one.
+    fn tenant_has_inflight(&self, tenant: &TenantId, event_id: &crate::EventId) -> bool {
+        self.tenant_inflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(tenant)
+            .map(|s| s.contains(event_id))
+            .unwrap_or(false)
+    }
+
+    fn bump_tenant_inflight(&self, tenant: &TenantId, event_id: &crate::EventId) {
+        self.tenant_inflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(tenant.clone())
+            .or_default()
+            .insert(event_id.clone());
+    }
+
+    fn clear_tenant_inflight(&self, tenant: &TenantId, event_id: &crate::EventId) {
+        let mut guard = self.tenant_inflight.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(set) = guard.get_mut(tenant) {
+            set.remove(event_id);
+            if set.is_empty() {
+                guard.remove(tenant);
+            }
         }
     }
 
@@ -868,5 +1070,158 @@ mod tests {
         assert!(matches!(c.deliver(&off), Delivered::DeadLettered(_)));
         assert_eq!(c.handler.runs.load(Ordering::SeqCst), 0, "the handler never ran for an off-whitelist subject");
         assert_eq!(c.dead_letters().len(), 1);
+    }
+
+    // --- EB-05: the `consume(ConsumerSpec{ … }, handler)` entry-point ---
+
+    /// `consume(ConsumerSpec, …)` is the one sanctioned entry-point: it validates the `*`-free
+    /// whitelist (rule 3), binds the durable name (rule 4), and wires the bounded prefetch +
+    /// per-tenant cap (rule 6). A wildcard subject is REJECTED at registration, exactly as the
+    /// hand-wired `Subscription::bind` path is — the spec cannot smuggle in an over-broad consumer.
+    #[test]
+    fn consume_entrypoint_validates_whitelist_and_wires_the_runtime() {
+        // a wildcard in the spec is rejected loudly.
+        let bad = ConsumerSpec::new(ConsumerName("indexer".into()), &["issues.*"]);
+        assert!(matches!(
+            consume(bad, done_handler(), DedupLedger::new()),
+            Err(SubscribeError::WildcardSubject(_))
+        ));
+
+        // a concrete whitelist is admitted and the runtime carries the spec's caps.
+        let spec = ConsumerSpec {
+            durable: ConsumerName("indexer".into()),
+            subjects: vec!["myelin://acme/issues/".into()],
+            max_ack_pending: PrefetchBound::new(8).unwrap(),
+            per_tenant_inflight: PerTenantInflight::new(4).unwrap(),
+        };
+        let c = consume(spec, done_handler(), DedupLedger::new()).unwrap();
+        assert_eq!(c.name(), &ConsumerName("indexer".into()));
+        assert_eq!(c.per_tenant_inflight_cap().get(), 4, "the per-tenant cap is wired from the spec");
+
+        // the wired consumer actually processes a whitelisted message.
+        assert_eq!(
+            c.deliver(&msg("01J-1", "myelin://acme/issues/issue/PROJ-1")),
+            Delivered::Acked
+        );
+    }
+
+    /// `PerTenantInflight::new(0)` is rejected (a zero cap lets no tenant progress); a positive cap
+    /// is admitted and read back; the default is 16.
+    #[test]
+    fn per_tenant_inflight_rejects_zero() {
+        assert_eq!(PerTenantInflight::new(0), None, "a zero per-tenant cap is meaningless, rejected");
+        assert_eq!(PerTenantInflight::new(4).unwrap().get(), 4);
+        assert_eq!(PerTenantInflight::DEFAULT.get(), 16);
+    }
+
+    // --- EB-05 rule 6: per-tenant in-flight fairness cap (the agent-surge guard) ---
+
+    /// **A surging tenant is bounded to its per-tenant in-flight cap; a second tenant is NOT
+    /// starved.** With a cap of 2, a tenant whose messages keep RETRYING fills its 2 in-flight
+    /// slots, and the 3rd is THROTTLED (deferred, not dropped). A DIFFERENT tenant's message still
+    /// ACKs — fairness held, the surge did not push the other tenant out.
+    #[test]
+    fn surging_tenant_is_throttled_at_its_cap_other_tenant_flows() {
+        // "surge" tenant always retries (its work stays outstanding → slots accumulate);
+        // every other tenant is Done immediately.
+        struct SurgeHandler;
+        impl EventHandler for SurgeHandler {
+            fn subjects(&self) -> &'static [SubjectPattern] {
+                SUBJECTS
+            }
+            fn handle(&self, ev: &EventEnvelope) -> HandleOutcome {
+                if ev.tenant.0 == "surge" {
+                    HandleOutcome::Retry(Backoff { seconds: 5 })
+                } else {
+                    HandleOutcome::Done
+                }
+            }
+        }
+        let spec = ConsumerSpec {
+            durable: ConsumerName("indexer".into()),
+            subjects: vec!["myelin://".into()],
+            max_ack_pending: PrefetchBound::DEFAULT,
+            per_tenant_inflight: PerTenantInflight::new(2).unwrap(),
+        };
+        let c = consume(spec, SurgeHandler, DedupLedger::new()).unwrap();
+
+        let surge = |id: &str| Message {
+            subject: "myelin://surge/issues/x".into(),
+            envelope: tenant_envelope(id, "myelin://surge/issues/x", "surge"),
+        };
+
+        // The surge tenant's first 2 retries occupy its 2 in-flight slots.
+        assert_eq!(c.deliver(&surge("01J-s1")), Delivered::Retried(5));
+        assert_eq!(c.deliver(&surge("01J-s2")), Delivered::Retried(5));
+        assert_eq!(c.tenant_inflight(&TenantId("surge".into())), 2, "the surge tenant holds its 2 slots");
+
+        // The 3rd surge message is THROTTLED (deferred, not dropped) — at cap.
+        assert_eq!(
+            c.deliver(&surge("01J-s3")),
+            Delivered::Throttled(TenantId("surge".into())),
+            "the surge tenant is bounded to its cap"
+        );
+        assert_eq!(c.tenant_inflight(&TenantId("surge".into())), 2, "still 2 — the throttled message took no slot");
+
+        // A DIFFERENT tenant's message still ACKs — the surge did NOT starve it (fairness).
+        let other = Message {
+            subject: "myelin://other/issues/y".into(),
+            envelope: tenant_envelope("01J-o1", "myelin://other/issues/y", "other"),
+        };
+        assert_eq!(c.deliver(&other), Delivered::Acked, "the other tenant is not starved by the surge");
+        assert_eq!(c.tenant_inflight(&TenantId("other".into())), 0, "the other tenant's Done released its slot");
+    }
+
+    /// A throttled message is DEFERRED, not lost: once the surging tenant's slots free (its work
+    /// finally completes), the previously-throttled message is re-offered and processed. 0 loss.
+    #[test]
+    fn throttled_message_is_re_offerable_after_the_tenant_drains() {
+        // First call per id retries; a re-delivery after the slot frees succeeds.
+        struct DrainHandler {
+            failed: Mutex<HashSet<String>>,
+        }
+        impl EventHandler for DrainHandler {
+            fn subjects(&self) -> &'static [SubjectPattern] {
+                SUBJECTS
+            }
+            fn handle(&self, ev: &EventEnvelope) -> HandleOutcome {
+                let mut f = self.failed.lock().unwrap();
+                if f.insert(ev.event_id.0.clone()) {
+                    HandleOutcome::Retry(Backoff { seconds: 1 })
+                } else {
+                    HandleOutcome::Done
+                }
+            }
+        }
+        let spec = ConsumerSpec {
+            durable: ConsumerName("indexer".into()),
+            subjects: vec!["myelin://surge/".into()],
+            max_ack_pending: PrefetchBound::DEFAULT,
+            per_tenant_inflight: PerTenantInflight::new(1).unwrap(),
+        };
+        let c = consume(spec, DrainHandler { failed: Mutex::new(HashSet::new()) }, DedupLedger::new()).unwrap();
+        let m = |id: &str| Message {
+            subject: "myelin://surge/x".into(),
+            envelope: tenant_envelope(id, "myelin://surge/x", "surge"),
+        };
+
+        // m1 retries (holds the single slot); m2 is throttled (cap 1).
+        assert_eq!(c.deliver(&m("01J-1")), Delivered::Retried(1));
+        assert_eq!(c.deliver(&m("01J-2")), Delivered::Throttled(TenantId("surge".into())));
+
+        // m1 redelivers and now succeeds → the slot frees.
+        assert_eq!(c.deliver(&m("01J-1")), Delivered::Acked);
+        assert_eq!(c.tenant_inflight(&TenantId("surge".into())), 0, "the slot freed");
+
+        // m2 is re-offered (it was deferred, never dropped): first retry, then it acks. 0 loss.
+        assert_eq!(c.deliver(&m("01J-2")), Delivered::Retried(1), "the previously-throttled message is re-offered");
+        assert_eq!(c.deliver(&m("01J-2")), Delivered::Acked, "and eventually processed — 0 loss");
+    }
+
+    /// Build an envelope for a given tenant (the per-tenant fairness tests key on `envelope.tenant`).
+    fn tenant_envelope(id: &str, subject: &str, tenant: &str) -> EventEnvelope {
+        let mut e = envelope(id, subject);
+        e.tenant = TenantId(tenant.into());
+        e
     }
 }
