@@ -98,11 +98,7 @@ mod tests {
 
     fn subject() -> Subject {
         Subject {
-            principal: Principal {
-                id: PrincipalId("p".into()),
-                kind: PrincipalKind::Human,
-                tenant: TenantId("acme".into()),
-            },
+            principal: Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId("acme".into())),
             tenant: TenantId("acme".into()),
         }
     }

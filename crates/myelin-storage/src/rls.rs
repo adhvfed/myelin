@@ -235,11 +235,7 @@ mod tests {
     use myelin_identity::{PrincipalId, PrincipalKind};
 
     fn principal(tenant: &str) -> Principal {
-        Principal {
-            id: PrincipalId("p".into()),
-            kind: PrincipalKind::Human,
-            tenant: TenantId(tenant.into()),
-        }
+        Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId(tenant.into()))
     }
 
     /// THE IDOR-floor test: a read whose **token-tenant ≠ path-tenant** resolves to the

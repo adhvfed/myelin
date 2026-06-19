@@ -177,11 +177,7 @@ mod tests {
             schema_ver: 1,
             tenant: TenantId("acme".into()),
             region: Region("eu-west".into()),
-            actor: Actor(Principal {
-                id: PrincipalId("p".into()),
-                kind: PrincipalKind::Human,
-                tenant: TenantId("acme".into()),
-            }),
+            actor: Actor(Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId("acme".into()))),
             subject: ArtifactRef("myelin://acme/issues/issue/ENG-1421".into()),
             aggregate: AggregateKey("issue:ENG-1421".into()),
             causation_id: None,

@@ -43,11 +43,7 @@ fn ctx() -> EmitContextBase {
     EmitContextBase {
         tenant: TenantId("acme".into()),
         region: Region("eu-west".into()),
-        actor: Actor(Principal {
-            id: PrincipalId("u1".into()),
-            kind: PrincipalKind::Human,
-            tenant: TenantId("acme".into()),
-        }),
+        actor: Actor(Principal::stub(PrincipalId("u1".into()), PrincipalKind::Human, TenantId("acme".into()))),
         schema_ver: 1,
         occurred_at: Timestamp("2026-06-19T00:00:00Z".into()),
         recorded_at: Timestamp("2026-06-19T00:00:01Z".into()),

@@ -63,11 +63,7 @@ impl IssuesService {
 fn cdc_11_1_consumer_opens_oltp_client_through_the_harness() {
     let issues = IssuesService::boot();
 
-    let token = Principal {
-        id: PrincipalId("u1".into()),
-        kind: PrincipalKind::Human,
-        tenant: TenantId("acme".into()),
-    };
+    let token = Principal::stub(PrincipalId("u1".into()), PrincipalKind::Human, TenantId("acme".into()));
     let sql = issues.read_issue(&token, Region("eu-west".into()));
 
     // The provider produced a tenant-scoped statement pinned to the verified token.

@@ -643,11 +643,7 @@ mod tests {
     use std::sync::atomic::AtomicU32;
 
     fn principal() -> Principal {
-        Principal {
-            id: PrincipalId("p".into()),
-            kind: PrincipalKind::Human,
-            tenant: TenantId("acme".into()),
-        }
+        Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId("acme".into()))
     }
 
     fn ctx_base() -> EmitContextBase {

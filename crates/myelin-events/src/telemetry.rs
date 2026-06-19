@@ -546,11 +546,7 @@ mod tests {
         let ctx = EmitContextBase {
             tenant: TenantId("acme".into()),
             region: Region("eu-west".into()),
-            actor: Actor(Principal {
-                id: PrincipalId("p".into()),
-                kind: PrincipalKind::Human,
-                tenant: TenantId("acme".into()),
-            }),
+            actor: Actor(Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId("acme".into()))),
             schema_ver: 1,
             occurred_at: Timestamp("2026-06-19T00:00:00Z".into()),
             // the row's recorded_at — the age is measured against `now` below.

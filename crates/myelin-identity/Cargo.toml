@@ -13,3 +13,10 @@ publish = false
 [dependencies]
 myelin-tenancy = { path = "../myelin-tenancy" }
 serde.workspace = true
+
+# serde_json is test-only: the SetExpr / CaveatContext / Principal round-trip "names are
+# the wire contract" drift tests (P-ID-01 TESTS) serialize the frozen shapes. It is NOT a
+# runtime dep of the contract surface (the carrier types are serde-derived; no JSON at the
+# ABI boundary), so it stays out of [dependencies] and cannot widen the sink's prod graph.
+[dev-dependencies]
+serde_json.workspace = true

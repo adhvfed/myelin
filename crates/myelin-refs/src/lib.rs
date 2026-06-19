@@ -94,10 +94,6 @@ mod tests {
         }
         let r = ArtifactRef("myelin://acme/issues/issue/PROJ-1".into());
         assert_eq!(Stub::format(&r), "myelin://acme/issues/issue/PROJ-1");
-        let _viewer = Principal {
-            id: PrincipalId("p".into()),
-            kind: PrincipalKind::Human,
-            tenant: TenantId("acme".into()),
-        };
+        let _viewer = Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId("acme".into()));
     }
 }
