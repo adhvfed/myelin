@@ -47,3 +47,13 @@ blake3 = { workspace = true }
 hex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# The auto-registration substrate the data-map generator (P-GA-09) walks: `HolderRegistration`
+# (the registry's record of every store the harness opened, contract 1.4) + the exhaustive
+# H1–H18 `Holder` catalog (gdpr §3.2). The generator joins these against the `#[personal_data]`
+# registry (from `myelin-gdpr`) so the map enumerates EVERY registered holder + EVERY tagged
+# field — a holder in the registry but absent from the map is a coverage failure (GA-D1's
+# "0 holders missed" is a property of the generated map). This crate already sits ABOVE
+# `myelin-substrate` in the §2.9-extension service tier (exactly like `myelin-identity-service`
+# and `myelin-control-plane`, which both depend on `myelin-substrate`); substrate depends only
+# on the `myelin-gdpr` CONTRACT crate (not the service), so there is no cycle.
+myelin-substrate = { path = "../myelin-substrate" }

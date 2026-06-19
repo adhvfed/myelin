@@ -92,13 +92,34 @@
 //! `holders::tests::gdpr_service_has_no_cross_store_read_import`). The upstream-store orchestration
 //! (H6/H8/H9/H10/H14/H15 + the canonical erase order) is **P-GA-06 → P-106**; GA-D1 (0 holders
 //! missed, the whole map) is the **M5 gate P-GA-32 → P-505**.
+//!
+//! ## P-GA-09 (→ P-109) — the data-map / RoPA generator (contract 10.3)
+//! [`datamap`] ships the **generated data map** (`data_map() → Inventory`) + the **RoPA projection**
+//! (`ropa(tenant) → ProcessingActivities`). The generator WALKS the compile-time `#[personal_data]`
+//! registry (from `myelin-gdpr`'s classify-derive, P-107) + the runtime auto-registered holder set
+//! (the [`myelin_substrate::HolderRegistration`]s, P-S15 / P-GA-04, classified into the exhaustive
+//! H1–H18 [`myelin_substrate::Holder`]) and GENERATES the machine-readable inventory: every PII
+//! field, its owning holder, the five tags, the subject_locator, the residency region, the DPIA
+//! marker. *The map, not a hand-written list, drives erasure* — GA-D1's "0 holders missed" is a
+//! property of the generated map ([`datamap::Inventory::coverage_gaps`] surfaces a holder in the
+//! registry but absent from the map; the entry count equals [`datamap::tagged_field_count`]).
+//! **Floors named:** the CI data-map **DIFF GATE** (commit the inventory; a build that changes it
+//! fails CI with the diff surfaced until a DPO reviews) → **P-GA-10 → P-110** (this crate ships the
+//! generation + the deterministic [`datamap::Inventory::fingerprint`] the diff compares); the
+//! per-store content **completeness** floor → **M5 P-GA-32 → P-505**; the **RoPA legal text** is
+//! **`[OPEN — LEGAL]`** (the GENERATION ships here; the DPO ratifies the characterisation).
 
 pub mod audit;
+pub mod datamap;
 pub mod holders;
 pub mod orchestration;
 
 pub use audit::{
     AuditConsumer, AuditEntry, AuditLog, Minimised, Outcome, AUDIT_APPEND_LAG,
+};
+pub use datamap::{
+    data_map, ropa, ropa_for_tenant, tagged_field_count, HolderSchema, Inventory, InventoryEntry,
+    ProcessingActivities, ProcessingActivity, DATA_MAP_ENTRY_COUNT, DATA_MAP_HOLDER_COUNT,
 };
 pub use holders::{
     gdpr_owned_holder_ids, AuditCarveOutHolder, CryptoShredKms, GdprOwnStoreHolder,

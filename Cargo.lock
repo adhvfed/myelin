@@ -1908,6 +1908,7 @@ dependencies = [
  "myelin-events",
  "myelin-gdpr",
  "myelin-identity",
+ "myelin-substrate",
  "myelin-tenancy",
  "serde",
  "serde_json",
