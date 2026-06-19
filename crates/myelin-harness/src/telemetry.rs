@@ -125,12 +125,33 @@ pub enum SignalName {
     /// flips liveness (and restarts). The drill asserts `== 0` across a dependency outage
     /// (readiness sheds; liveness does not churn). Scalar.
     LivenessRestartCount,
+    /// **Restore cross-seam mismatch count** — the number of inconsistencies found across the
+    /// four restore seams (OLTP rows ↔ blob ↔ search index ↔ event-log offsets) after a
+    /// rebuild-from-backups (§11 D-6 / SUB-D6 / STOR-D1; contract 11.5). A rebuild that lands at
+    /// ONE consistent cross-seam point reads `0` here — a row pointing at a missing blob, an
+    /// index doc whose OLTP row vanished, or a row beyond the restored offset each increments
+    /// this. The restore-verify drill asserts `== 0` (the silent-data-loss floor: 0 loss, one
+    /// consistent point). The single most-load-bearing restore zero. Scalar.
+    RestoreCrossSeamMismatch,
+    /// **Restore RPO** — the recovery-POINT achieved by a rebuild-from-backups, in SECONDS: how
+    /// much committed data the restore lost off the tail (the gap between the last durably-backed
+    /// offset and the crash point; §11 D-6 / STOR-D2; contract 11.5). The drill asserts it is
+    /// `<= rpo_max_mins * 60` (default-to-beat: ≤ 5 min = 300 s — read from the thresholds file,
+    /// never hardcoded). Scalar.
+    RestoreRpoSecs,
+    /// **Restore RTO** — the recovery-TIME a rebuild-from-backups took, in SECONDS: wall-clock
+    /// from "begin restore" to "restored copy at a consistent cross-seam point, ready to serve"
+    /// (§11 D-6 / STOR-D2; contract 11.5). The drill asserts the per-tenant bound
+    /// `<= rto_tenant_max_mins * 60` (≤ 1 h) and the per-cell bound `<= rto_cell_max_mins * 60`
+    /// (≤ 4 h) — both read from the thresholds file. Labelled by `{grain}` (`tenant` / `cell`) so
+    /// the per-tenant and per-cell objectives are read independently.
+    RestoreRtoSecs,
 }
 
 impl SignalName {
     /// Every contract-1.8 signal name (for the "the library covers the §10.2 set" test —
     /// observability is part of the pass condition, so the set must be exhaustive).
-    pub const ALL: [SignalName; 18] = [
+    pub const ALL: [SignalName; 21] = [
         SignalName::RequestRate,
         SignalName::RequestErrors,
         SignalName::RequestDuration,
@@ -149,6 +170,9 @@ impl SignalName {
         SignalName::ResyncRequiredCount,
         SignalName::Readiness,
         SignalName::LivenessRestartCount,
+        SignalName::RestoreCrossSeamMismatch,
+        SignalName::RestoreRpoSecs,
+        SignalName::RestoreRtoSecs,
     ];
 }
 
@@ -641,14 +665,15 @@ mod tests {
     /// these fails X-1) — every name is distinct and the set is the exhaustive ALL.
     #[test]
     fn covers_the_full_contract_1_8_signal_set() {
-        // 18 distinct names, matching the §10.2 table rows (RED ×3 + USE + lag + outbox +
+        // 21 distinct names, matching the §10.2 table rows (RED ×3 + USE + lag + outbox +
         // dead-letter + breaker + fail-static ×2 + shed + causal ×2 + cross-tenant +
-        // firehose ×2 + readiness + liveness-restart — the §4.3 liveness≠readiness pair).
+        // firehose ×2 + readiness + liveness-restart — the §4.3 liveness≠readiness pair) PLUS
+        // the §11 D-6 / SUB-D6 restore-verify triplet (cross-seam-mismatch + RPO + RTO, P-S26).
         let mut uniq = SignalName::ALL.to_vec();
         let n = uniq.len();
         uniq.sort();
         uniq.dedup();
         assert_eq!(uniq.len(), n, "every contract-1.8 signal name is distinct");
-        assert_eq!(n, 18, "the §10.2 set is covered exhaustively");
+        assert_eq!(n, 21, "the §10.2 set + the restore-verify triplet is covered exhaustively");
     }
 }

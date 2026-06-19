@@ -62,6 +62,24 @@
 //! load (P-S02), read one telemetry assertion that reads green (P-S04) — committed as a test
 //! emitting a dated PASS row (`drills.rs` `harness_self_test_*`).
 //!
+//! ## What P-S26 ships (this prompt → global P-056)
+//! The **restore-verify cross-seam half** ([`restore`]) — the substrate's half of the
+//! SUB-D6 / STOR-D1 / STOR-D2 silent-data-loss floor (architecture §11 D-6; contract 11.5).
+//! Storage owns the WAL+PITR rebuild and the CI-wired `restore-verify` job (its M1 follow-ons
+//! P-059/P-060/P-061); this prompt ships the **failure-injection + telemetry-assertion machinery**
+//! that makes the gate PROVABLE: [`restore::RestoredSnapshot::verify_cross_seam`] — the cross-seam
+//! consistency assertion over the four seams (OLTP rows ↔ blob ↔ search index ↔ event-log offsets)
+//! that REJECTS an inconsistent rebuild (a row → missing blob, an orphan index doc, a past-offset
+//! row), and [`restore::RestoreOutcome`] — the MEASURED RPO/RTO carried onto the
+//! [`telemetry::SignalSource`] via the three new restore signals
+//! ([`telemetry::SignalName::RestoreCrossSeamMismatch`] / `RestoreRpoSecs` / `RestoreRtoSecs`), so
+//! the drill asserts 0 loss + RPO ≤ 5 min + RTO ≤ 1 h/tenant ≤ 4 h/cell (thresholds read from the
+//! thresholds file, never hardcoded). The drill scenario + the CDC pair (provider = Storage
+//! restore; consumer = this assertion) + the SCHED/smoke variants live in
+//! `myelin-substrate/tests/drill_sub_d6_restore_verify.rs`. **SUB-D6 / STOR-D1 / STOR-D2 are a
+//! PERMANENT gate** (re-run on every store-touching change; M2 does NOT start over a red STOR-D1);
+//! the cell-scale re-confirm is the M5 follow-on **P-S35**.
+//!
 //! ## Floors named (deferred + filling prompt)
 //! - **The telemetry PRODUCER side lands at P-S12/P-S13.** This prompt ships the *consumer*
 //!   side: an in-memory [`telemetry::SignalSource`] the rig populates in tests. A real service
@@ -95,11 +113,16 @@
 pub mod dependency_break;
 pub mod drills;
 pub mod load_generator;
+pub mod restore;
 pub mod scorecard;
 pub mod telemetry;
 
 pub use dependency_break::{BreakOutcome, Dependency, DependencyBreaker, Scope};
 pub use drills::{DrillContext, DrillRegistry, DrillResult, DrillScenario};
+pub use restore::{
+    BlobAddr, CrossSeamMismatch, CrossSeamReport, IndexDoc, Offset, OltpRow, RestoreOutcome,
+    RestoredSnapshot, RestoredSnapshotBuilder, RtoGrain,
+};
 pub use scorecard::{Band, GateRow, RowResult, RowVerdict, Scorecard};
 pub use load_generator::{
     LoadGenerator, LoadPrincipalKind, Multiplier, PrincipalMix, Request, RunClass, Sink,
