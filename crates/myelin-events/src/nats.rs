@@ -116,19 +116,34 @@ impl NatsJetStreamBus {
         format!("{}_pull", self.stream_name)
     }
 
-    /// Map a subject ref onto a concrete JetStream subject under the stream's root. The relay's
-    /// `subject` is an opaque [`ArtifactRef`] string; we slot it under `subject_root` so the
-    /// stream's `<root>.>` filter captures it (and so a smoke run's subjects are namespaced).
-    fn subject_for(&self, subject: &ArtifactRef) -> String {
-        // NATS subject tokens are dot-delimited; a ref may contain characters NATS dislikes, so
-        // we hash-free sanitize to a single token (the dedup id, not the subject, is what
-        // carries identity — the subject only needs to be a stable, filter-matched token).
-        let token: String = subject
-            .0
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .collect();
-        format!("{}.{}", self.subject_root, token)
+    /// Map an event onto a concrete JetStream subject under the stream's root. EB-12: the routing +
+    /// ordering key is now the §2.2 STRUCTURED subject
+    /// `evt.<tenant>.<subsystem>.<aggregate_type>.<aggregate_id>.<event_name>` ([`StreamSubject`]),
+    /// derived from the envelope — so the broker subject encodes the `(tenant, subsystem)` routing
+    /// split (the blast-radius unit) and the per-aggregate ordering partition, not an opaque token.
+    /// We keep the transport's `subject_root` as the stream-capture + consume-filter namespace and
+    /// slot the structured subject beneath it: `<subject_root>.evt.<tenant>.…`. So the stream's
+    /// `<root>.>` filter still captures every event and a `consume(subject_root)` still matches,
+    /// while the subject carries the real §2.2 key.
+    ///
+    /// If the envelope cannot yield a structured subject (a malformed `type_`/`aggregate` — caught
+    /// LOUD upstream by the taxonomy + outbox, never silently here), we fall back to the prior
+    /// sanitised opaque token under the same root so delivery is never dropped (lag, not loss) and
+    /// the reason is observable via the returned subject shape.
+    fn subject_for(&self, subject: &ArtifactRef, envelope: &EventEnvelope) -> String {
+        match crate::partition::StreamSubject::of(envelope) {
+            Ok(s) => format!("{}.{}", self.subject_root, s.to_subject()),
+            Err(_) => {
+                // Defensive fallback: a single sanitised token under the root (the dedup id, not
+                // the subject, carries identity — the subject only needs to be stably filtered).
+                let token: String = subject
+                    .0
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                    .collect();
+                format!("{}._malformed.{}", self.subject_root, token)
+            }
+        }
     }
 
     fn block<F: std::future::Future>(&self, fut: F) -> F::Output {
@@ -143,7 +158,7 @@ impl BusTransport for NatsJetStreamBus {
         envelope: &EventEnvelope,
         dedup_id: &EventId,
     ) -> Result<Delivery, TransportError> {
-        let nats_subject = self.subject_for(subject);
+        let nats_subject = self.subject_for(subject, envelope);
         let body = serde_json::to_vec(envelope)
             .map_err(|e| TransportError(format!("serialize envelope: {e}")))?;
 

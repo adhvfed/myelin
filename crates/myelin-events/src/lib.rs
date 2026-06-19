@@ -243,6 +243,7 @@ pub mod envelope;
 #[cfg(feature = "integration")]
 pub mod nats;
 pub mod outbox;
+pub mod partition;
 pub mod relay;
 pub mod taxonomy;
 pub mod telemetry;
@@ -268,6 +269,9 @@ pub use outbox::{
 pub use relay::{
     dlq_subject, BusTransport, DeadLetterAlert, Delivery, DrainReport, InProcessBus, Relay,
     TransportError, MAX_PUBLISH_ATTEMPTS,
+};
+pub use partition::{
+    stream_name_for, PartitionKey, StreamSubject, SubjectError, SUBJECT_ROOT,
 };
 
 use serde::{Deserialize, Serialize};
