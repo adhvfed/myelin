@@ -164,6 +164,35 @@
 //!   P-126, STOR-D8)**; the real `pg_restore` + WAL-replay driver is the P-S12/P-S15 floor. The
 //!   mutation floor on the cross-seam-point + referenced-hash-presence logic is ≥ 85%
 //!   (mandatory-core — the silent-data-loss floor, the highest bar).
+//! - **THE HEADLINE: the CI-wired restore-verify GATE (STOR-D1, the permanent gate — P-ST-13 / global
+//!   P-061)** is now IMPLEMENTED in [`restore_verify`]: [`restore_verify::RestoreVerifyGate`] spins a
+//!   clean target, drives `restore(to_offset T)` ([`restore`], P-060), and runs the three storage.md
+//!   §7.4 assertions — (1) **no loss / checksum parity** (every restored row's referenced object is
+//!   present AND its bytes re-hash to its BLAKE3 [`blob::ContentHash`] address; a present-but-corrupt
+//!   object is the [`restore_verify::GateFailure::ChecksumMismatch`] the bare presence check misses,
+//!   and a row → missing blob is the restore's hard §7.3 FAIL surfaced as
+//!   [`restore_verify::GateFailure::RestoreFailed`]); (2) **cross-seam / one consistent point** (the
+//!   harness `verify_cross_seam` assertion — the SAME SUB-D6 one, P-056 — reports 0 mismatches:
+//!   derived == source-replay, no orphan, no past-offset); (3) **erasure held** (a tenant
+//!   crypto-shredded BEFORE the backup stays erased — its KEK is excluded from the restored set, §7.5;
+//!   a resurrected erased subject is [`restore_verify::GateFailure::ErasureResurrected`]). On PASS it
+//!   emits a dated [`restore_verify::GreenArtifact`] with the MEASURED numbers; on RED a typed
+//!   [`restore_verify::GateFailure`]. The verdict [`restore_verify::GateVerdict`] is `#[must_use]`
+//!   (a dropped RED is a compile-flagged swallow) and the CI entrypoint
+//!   [`restore_verify::RestoreVerifyGate::run_or_fail_ci`] turns a red into a process-failing `Err`
+//!   (loud-never-swallowed, EI-01 §5 — no `|| true`). It REUSES [`restore`] (P-060), the harness
+//!   cross-seam assertion (P-056), [`blob::ContentHash`] (P-047), and the KMS crypto-shred exclusion
+//!   ([`kms`], P-058) — never re-defined; it ADDS the checksum-parity + erasure-held legs the bare
+//!   restore lacks + the loud-never-swallowed CI gate. **This is one of the two permanent gates
+//!   (master §4): it re-runs on every store-touching change, forever.** **Floors named in
+//!   [`restore_verify`]:** post-restore RE-ERASURE (STOR-D3, per-subject re-erasure against the GDPR
+//!   erasure ledger 10.8) + the cell-kill RTO half (STOR-D2) are the sibling **P-ST-14 (global
+//!   P-100)** (this gate holds the erasure-BEFORE-the-backup invariant + exposes the
+//!   [`restore_verify::ErasureLedger`] seam P-100 drives); the prod-scale restored copy for
+//!   online-migration-under-load is **P-ST-21 (global P-126, STOR-D8)**; the real CI-runner wiring is
+//!   M2+ (the gate runs as a `cargo test` drill until then); the real `pg_restore` driver is the
+//!   P-S12/P-S15 floor. The mutation floor on the no-loss-assertion + the fail-CI-on-red branch is ≥
+//!   85% (mandatory-core — the silent-data-loss floor, the highest bar).
 
 pub mod backup;
 pub mod blob;
@@ -174,6 +203,7 @@ pub mod kms_failstatic;
 pub mod migration;
 pub mod oltp;
 pub mod restore;
+pub mod restore_verify;
 pub mod rls;
 
 pub use backup::{
@@ -201,5 +231,9 @@ pub use oltp::{OltpConfig, OltpError, OltpPool, PermitGuard};
 pub use restore::{
     restore_to_offset, restored_key_counts, BlobPresence, ReindexFromSource, RestoreError,
     RestoreReport, SourceEvent, SourceLog, WalRow,
+};
+pub use restore_verify::{
+    ErasureLedger, GateFailure, GateInputs, GateVerdict, GreenArtifact, RestoreTarget,
+    RestoreVerifyGate, RestoredObject,
 };
 pub use rls::{RlsError, TenantQuery, TenantScope, TenantTable};
