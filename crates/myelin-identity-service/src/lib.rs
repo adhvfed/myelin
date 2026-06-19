@@ -42,15 +42,21 @@
 //!   [`FailClosedCheck::check`] returns `Deny` for every input (fail-closed, never fail-open).
 //! - `list_objects` (4.3) → P-ID-11 / P-ID-12 — returns `NotYetImplemented` (a leak-free
 //!   pre-filter that does not yet exist must not return a permissive set; it errors loudly).
-//! - the S1 principal store (the `authenticate` backing) → P-ID-05.
+//! - the S1 principal store (the `authenticate` backing) → P-ID-05 (LANDED:
+//!   [`principal_store::PrincipalStore`] — RLS-partitioned, per-subject-DEK-encrypted, PII-tagged,
+//!   holder-registered; `authenticate` over it is still P-ID-06/07).
 //! - the S3 tuple store + `write_tuples` (4.6) → P-ID-08.
 //! - the ReBAC engine + the core hierarchy (4.9) → P-ID-10.
 //!
 //! The readiness-gates-on-migrate-complete property is the harness's (P-S14); this shell declares
 //! Identity's migrations so the booting instance is **not-ready until they apply**.
 
+pub mod principal_store;
 pub mod tuple_store;
 
+pub use principal_store::{
+    PrincipalError, PrincipalProfile, PrincipalRow, PrincipalStore, ProfileRef, S1_HOLDER, S1_TABLE,
+};
 pub use tuple_store::{
     run_grant_expiry, StoredTuple, TupleStore, WriteError, S3_HOLDER, S3_TABLE,
 };
@@ -78,14 +84,36 @@ pub const SERVICE_NAME: &str = "identity";
 /// is that migrations EXIST so the booting instance is **not-ready until they apply** (the gate the
 /// shell proves).
 ///
-/// **Floor:** the real S1/S3 table DDL (RLS, per-tenant DEK columns, the `(tenant,region)`
-/// partition) is P-ID-05 / P-ID-08; this is the forward-only schema-marker migration the shell
-/// boots over so the readiness gate is exercised now.
+/// **Floor:** the real S3 table DDL is P-ID-08; the S1 principal table is declared here (P-ID-05).
+/// Migration `0101` creates the `(tenant, region)`-partitioned, RLS-scoped S1 principal table
+/// (architecture §2; contracts 11.1/12.1) — the row model + the in-memory store the
+/// [`principal_store`] module ships maps to it (the live OLTP binding lands with the driver,
+/// P-S15). The PII columns (email/display_name) are NOT in this skeletal DDL; they live encrypted
+/// under the per-subject DEK ([`principal_store::PrincipalProfile`], 11.3/11.4) — the DDL holds the
+/// `profile_ref` (the erasable handle), keeping the §X-7 split structural. Forward-only.
 fn identity_migrations() -> Migrations {
-    Migrations::of([Migration::plain(
-        "0100_identity_schema_marker",
-        "CREATE TABLE IF NOT EXISTS identity_schema_marker (applied_at TEXT)",
-    )])
+    Migrations::of([
+        Migration::plain(
+            "0100_identity_schema_marker",
+            "CREATE TABLE IF NOT EXISTS identity_schema_marker (applied_at TEXT)",
+        ),
+        // The S1 principal table (P-ID-05): (tenant, region)-partitioned, RLS-scoped. The opaque
+        // `principal_id` (immutable attribution) is separate from the erasable `profile_ref` (the
+        // §X-7 split). Profile PII is encrypted under the per-subject DEK (the store layer), so it
+        // is NOT a clear column here — `profile_ref` points at the per-subject key. Forward-only.
+        Migration::plain(
+            "0101_s1_principal",
+            "CREATE TABLE IF NOT EXISTS principal (\
+                 tenant TEXT NOT NULL, \
+                 region TEXT NOT NULL, \
+                 principal_id TEXT NOT NULL, \
+                 kind TEXT NOT NULL, \
+                 profile_ref TEXT, \
+                 data_role TEXT NOT NULL, \
+                 status TEXT NOT NULL, \
+                 PRIMARY KEY (tenant, region, principal_id))",
+        ),
+    ])
 }
 
 /// The fail-closed `check` / `list_objects` slot the internal-RPC surface re-authorizes against
