@@ -24,105 +24,80 @@
 //! depends on nothing above tenancy). This is the build-layer realisation of the
 //! `no-cross-sync-cycle` lint; P-S10 ships the real source-scanning lint.
 //!
-//! ## Floors named (stubbed bodies → filling prompt)
-//! All bodies are `todo!()`. The harness lifecycle lands across the M0 substrate prompts:
-//! - `serve` boot→migrate→relay→consumers→ports→drain (1.1) → **P-S12**; the three-surface
-//!   topology + tenant-from-token (1.2, SUB-D7) → **P-S13**; liveness ≠ readiness (1.3,
-//!   SUB-D9) → **P-S14**; the migration runner + holder auto-registration (1.4/1.5) →
-//!   **P-S15**.
-//! - `FailStatic<T>::get` (1.10) → **P-S18** (the mechanism) and **P-S25** (proven vs a
-//!   real Identity hiccup, SUB-D4). The `static_max` VALUE is `[OPEN — LEGAL]` (DPO
-//!   ratifies, L-1) — the mechanism + the `≤ revocation-SLA ≥ agent-token-TTL` constraint
-//!   ship regardless; the number is a named legal floor.
-//! - The failure-injection harness (load generator / dependency-break injector /
-//!   telemetry-assertion library) is **P-S02–P-S04** in a separate `myelin-harness`
-//!   crate. The twelve architecture lints are **P-S10/P-S11**.
+//! ## Status (P-S12 → P-010, 2026-06-19) — the `serve(AppSpec)` lifecycle is IMPLEMENTED
+//! The boot → migrate → outbox relay → consumers → three ports → graceful drain lifecycle
+//! (contract 1.1) is **implemented** in [`serve`]: `serve(AppSpec)` boots (validates config
+//! fail-fast §3.2, opens the bounded OLTP pool §3.3), runs the forward-only migrations at boot
+//! (rejecting a destructive `DROP`), auto-registers every opened store as a `PersonalDataHolder`
+//! (§3.4), starts the outbox relay (P-S07) + the idempotent consumers (P-S08), opens the three
+//! surfaces, exports the producer side of the contract-1.8 telemetry signal set (§3.5,
+//! `outbox_depth`/`dead_letter_count`/`consumer_lag`), serves, then graceful-drains (stop intake,
+//! finish in-flight, ack-then-exit; a clean drain leaves `outbox_depth == 0`). The hello-world
+//! boot test (boot → emit → consume → drain) + the CDC 1.1 pair are the dated green artifact.
 //!
-//! ## GATE FLOOR (named explicitly, per the prompt)
-//! P-001 ships the **skeleton only** — there is **no quantified runtime drill** at this
-//! prompt (it ships types/traits, not behaviour). The green artifact is a clean
-//! `cargo build --workspace` + `cargo test --workspace` log plus the
-//! `crate-graph-acyclic` test. The runtime survival drills (SUB-D1..D10) are greened by
-//! the later prompts named above.
+//! ## Floors named (deferred bodies → filling prompt)
+//! - The three-surface topology + **tenant-from-token** (1.2, SUB-D7) → **P-S13**; **liveness ≠
+//!   readiness** on the metrics-health surface (1.3, SUB-D9) → **P-S14**. `serve` opens three
+//!   named surfaces (the [`serve::PortOpener`] seam) and exports the signal set; the spoof
+//!   rejection + the readiness/liveness split are those prompts.
+//! - The forward-only **migration RUNNER + the exhaustive holder auto-registration** (1.4/1.5)
+//!   → **P-S15**. Here [`serve::MigrationRunner`] applies the embedded DDL in order at boot and
+//!   refuses a destructive migration; the env-first `Config::from_env()` parse of the real
+//!   `DATABASE_URL`/broker/KMS/region knobs + the expand→backfill→contract online runner + the
+//!   H1–H18 holder confirmation (**P-S27**) land there. The concrete `tokio-postgres`/`sqlx`
+//!   connection behind [`myelin_storage::OltpPool`] lands with the driver (P-S15); the
+//!   bounded-pool + fast-fail semantics are complete now.
+//! - The real **OpenTelemetry meter/tracer/logger + the OTLP export + the causality+tenant
+//!   trace-context middleware** (§3.5) and the **`SIGTERM`/`SIGINT` → drain** OS trigger →
+//!   **P-S13/P-S14**. Here the producer is a typed in-process meter ([`serve::Telemetry`])
+//!   exporting the SAME contract-1.8 `SignalName`s the harness reads, and the drain is the
+//!   deterministic [`serve::ServeHandle::signal_drain`] trigger.
+//! - `FailStatic<T>::get` (1.10) → **P-S18** (the mechanism) and **P-S25** (proven vs a real
+//!   Identity hiccup, SUB-D4). The `static_max` VALUE is `[OPEN — LEGAL]` (DPO ratifies, L-1) —
+//!   the mechanism + the `≤ revocation-SLA ≥ agent-token-TTL` constraint ship regardless; the
+//!   number is a named legal floor.
+//! - The failure-injection harness (load generator / dependency-break injector /
+//!   telemetry-assertion library) is **P-S02–P-S04** in a separate `myelin-harness` crate. The
+//!   twelve architecture lints are **P-S10/P-S11**.
+//! - **Mutation floor (cargo-mutants ≥ 75% on the lifecycle module, [`serve`]).** cargo-mutants
+//!   is the M6 dogfood CI gate (**P-S37**); it is not run in this prompt's environment. The
+//!   lifecycle is covered by unit + CDC tests that chain boot → emit → consume → drain
+//!   end-to-end (a sequence property, EI-01 §4); the mutation run is named as the M6 gate.
 
 use serde::{Deserialize, Serialize};
 
 pub mod crate_graph;
+pub mod serve;
+
+pub use serve::{
+    boot, serve, AppSpec, ConsumerReg, HoldersSpec, InternalRpc, Migration, MigrationRunner,
+    Migrations, OutboxSpec, PortOpener, PublicRoutes, ServeHandle, Surface, Telemetry,
+};
 
 /// Seconds (frozen unit, architecture §2.10) — the fail-static window bounds.
 pub type Seconds = u64;
 
-/// The validated, env-first service config (architecture §3.2; contract 1.1). Opaque in
-/// the skeleton; `Config::from_env()` + boot-time validation land in P-S12.
+/// The validated, env-first service config (architecture §3.2; contract 1.1). Opaque
+/// string-backed on this floor; the env-first `Config::from_env()` parse of the real
+/// `DATABASE_URL`/broker/KMS/region knobs lands with the driver (**P-S15**). `serve`
+/// validates it at boot (fail fast, §3.2) — see [`serve::boot`]. A config of `"BAD_POOL"`
+/// models the boot-time validation-failure path the §3.2 fail-fast test exercises.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config(pub String);
 
-/// The forward-only embedded migration set (architecture §3.1, §9; contract 1.5). Opaque
-/// in the skeleton; the runner lands in P-S15.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Migrations(pub Vec<String>);
-
-/// The public surface route set (architecture §4.1; contract 1.2). Opaque in the
-/// skeleton; the gateway-fronted, tenant-from-token topology lands in P-S13.
-#[derive(Clone, Debug, Default)]
-pub struct PublicRoutes(pub ());
-
-/// The internal RPC surface (architecture §4.2; contract 1.2). Opaque in the skeleton;
-/// re-authorize-every-call lands in P-S13.
-#[derive(Clone, Debug, Default)]
-pub struct InternalRpc(pub ());
-
-/// A registered event consumer (architecture §5; contract 2.4). Opaque handle in the
-/// skeleton; the consumer runtime lands in P-S08 and is wired by `serve` in P-S12.
-#[derive(Clone, Debug, Default)]
-pub struct ConsumerReg(pub ());
-
-/// How the harness registers `PersonalDataHolder`s (architecture §3.4; contract 1.4).
-/// `Auto` means every store the harness opens is auto-registered (GD-3). Wired in
-/// P-S12/P-S15.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum HoldersSpec {
-    /// every opened store auto-registered (the §3.1 `AppSpec::auto`).
-    #[default]
-    Auto,
-}
-
-/// The outbox relay spec (architecture §3.3; contract 2.3). `Default` = relay started
-/// automatically. The relay lands in P-S07; `serve` starts it in P-S12.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct OutboxSpec(pub ());
-
-/// The one spec a service's `main.rs` supplies (architecture §3.1; contract 1.1). The
-/// harness owns the lifecycle around it: boot → migrate → relay → consumers → three
-/// ports → graceful drain.
-#[derive(Clone, Debug, Default)]
-pub struct AppSpec {
-    pub name: &'static str,
-    pub config: Config,
-    pub migrations: Migrations,
-    pub public: PublicRoutes,
-    pub internal: InternalRpc,
-    pub consumers: Vec<ConsumerReg>,
-    pub holders: HoldersSpec,
-    pub outbox: OutboxSpec,
-}
-
-/// Placeholder error for the skeleton (failed boot / failed migrate). Real taxonomy lands
-/// with P-S12.
+/// The error type for the boot/serve lifecycle (a failed boot / failed migrate / incomplete
+/// drain). A loud, typed value — a failed boot returns non-zero (architecture §3.1), never a
+/// silent success.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServeError(pub String);
 
-/// The ONE call (architecture §3.1; contract 1.1). Blocks, owning the lifecycle: boot →
-/// migrate → start outbox relay → start consumers → open the three ports → serve until
-/// signalled → graceful drain (stop intake, finish in-flight, ack-then-exit). Non-zero on
-/// failed boot.
-///
-/// **Floor:** body is `todo!()`; the lifecycle lands in **P-S12** (drain), **P-S13**
-/// (three ports + tenant-from-token, SUB-D7), **P-S14** (liveness ≠ readiness, SUB-D9),
-/// **P-S15** (migration runner + holder auto-registration).
-pub fn serve(_spec: AppSpec) -> Result<(), ServeError> {
-    todo!("the serve lifecycle lands across P-S12..P-S15")
+impl core::fmt::Display for ServeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
+
+impl std::error::Error for ServeError {}
 
 /// The fail-static answer (architecture §8; contract 1.10). Fail-static is the correct
 /// AVAILABILITY default on a transient dependency hiccup; we NEVER fail open (the static
@@ -187,9 +162,9 @@ mod tests {
 
     /// Compile-asserting test: the `serve(AppSpec)` + `AppSpec{...}` field shape is frozen
     /// (contract 1.1, architecture §3.1) — the eight fields `name, config, migrations,
-    /// public, internal, consumers, holders, outbox`. We construct an `AppSpec` (proving
-    /// the field names) and take a fn pointer to `serve` (proving its signature) without
-    /// invoking its `todo!()` body.
+    /// public, internal, consumers, holders, outbox`. We construct an `AppSpec` (proving the
+    /// field names) and take a fn pointer to `serve` (proving its signature). The lifecycle
+    /// behaviour itself is exercised by the `serve::tests` + the CDC 1.1 integration test.
     #[test]
     fn serve_and_appspec_shape_is_frozen() {
         let spec = AppSpec {
