@@ -211,8 +211,16 @@ cdc = [
 [[contract]]
 row = "4.2"
 title = "check (per-action gate, fail-closed)"
-status = "deferred"
-landing = "P-067"
+# COVERED by P-ID-09 / P-067: the depth-bounded Zanzibar userset-rewrite `check` engine
+# (crates/myelin-identity-service/src/check_engine.rs) — memoised-per-request, fail-closed on
+# genuine uncertainty, evaluated at the zookie snapshot, over the raw S3 tuples (direct grants +
+# tuple-to-userset inheritance). The `CaveatContext` rider is the literal-only floor (a
+# missing-context caveat → Conditional, never a silent Allow). The provider (the check engine via
+# StoreBackedCheck) + consumer (a write-path caller gating an action) CDC pair ships here. Floors:
+# the compiled-permission namespace engine → P-068 (P-ID-10); the full QueryAst caveat core → P-133
+# (P-ID-22); the fail-static cache + zookie-bypass → P-073 (P-ID-15).
+status = "covered"
+cdc = ["crates/myelin-identity-service/tests/cdc_4_2_check.rs"]
 
 [[contract]]
 row = "4.3"

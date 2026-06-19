@@ -46,8 +46,12 @@
 //!   repo ceiling + the self-hosted-runner one-tenant `SelfHosted` scope (C6), the DPoP-binding
 //!   requirement for long-lived PATs, and the S7-denylist + TTL revocation consult — S7 store body
 //!   → P-ID-14).
-//! - **`check` (4.2)** → **P-ID-09** — the depth-bounded Zanzibar userset-rewrite. Until then,
-//!   [`FailClosedCheck::check`] returns `Deny` for every input (fail-closed, never fail-open).
+//! - **`check` (4.2)** → **P-ID-09 — LANDED:** [`check_engine::CheckEngine`] is the depth-bounded,
+//!   memoised-per-request, fail-closed, zookie-snapshot Zanzibar userset-rewrite over the raw S3
+//!   tuples (direct grants + tuple-to-userset inheritance), with the literal-only `CaveatContext`
+//!   rider (full `QueryAst` core → P-ID-22). The shell's [`FailClosedCheck::check`] remains the
+//!   **no-store** default (a shell with no tuple store wired still denies, fail-closed); a service
+//!   instance with the S3 store wired runs the real engine behind the SAME [`CheckAuthorizer`] seam.
 //! - `list_objects` (4.3) → P-ID-11 / P-ID-12 — returns `NotYetImplemented` (a leak-free
 //!   pre-filter that does not yet exist must not return a permissive set; it errors loudly).
 //! - the S1 principal store (the `authenticate` backing) → P-ID-05 (LANDED:
@@ -60,6 +64,7 @@
 //! Identity's migrations so the booting instance is **not-ready until they apply**.
 
 pub mod authenticate;
+pub mod check_engine;
 pub mod machine_auth;
 pub mod principal_store;
 pub mod tuple_store;
@@ -68,6 +73,8 @@ pub use authenticate::{
     scheme, AuthTelemetry, CredentialVerifier, HumanSsoAuthenticator, IdorCounters,
     StructuralVerifier, VerifiedAssertion,
 };
+pub use check_engine::{eval_caveat, CheckEngine, MAX_REWRITE_DEPTH};
+// `StoreBackedCheck` is defined below in this module; re-exported at the crate root for callers.
 pub use machine_auth::{
     Authority, CapabilityAuthenticator, CapabilityToken, MachineKind, S7Denylist,
     StructuralTokenVerifier, TokenVerifier,
@@ -313,6 +320,138 @@ impl<S: IdentityService + Send + Sync> Authorizer for CheckAuthorizer<S> {
     }
 }
 
+/// The store-backed `check` slot (P-ID-09): an [`IdentityService`] whose `check` runs the real
+/// depth-bounded Zanzibar [`CheckEngine`] over the S3 tuple store, behind the **same**
+/// [`IdentityService`] surface the shell's [`FailClosedCheck`] occupied (EI-01 §7 — one primitive,
+/// no bespoke check path: the real engine swaps in behind the exact seam, the surface wiring is
+/// unchanged). The other ten methods stay the named-floor stubs (their bodies are their own M1
+/// prompts); only `check` is wired live here.
+///
+/// The `(tenant, region)` scope the engine reads under is derived from the **subject's own**
+/// verified `tenant`/`region` (tenant-from-token, never a path — ID-3); the `permission` is mapped
+/// to the relation name the raw-tuple rewrite resolves (the compiled-permission namespace engine is
+/// P-ID-10, which composes its operators over this same rewrite core).
+#[derive(Clone)]
+pub struct StoreBackedCheck {
+    engine: CheckEngine,
+}
+
+impl StoreBackedCheck {
+    /// Wire the real `check` engine over the S3 [`TupleStore`].
+    pub fn new(tuples: TupleStore) -> StoreBackedCheck {
+        StoreBackedCheck {
+            engine: CheckEngine::new(tuples),
+        }
+    }
+}
+
+impl IdentityService for StoreBackedCheck {
+    fn authenticate(&self, _credential: &myelin_identity::Credential) -> myelin_identity::Result<Principal> {
+        Err(AuthzError::NotYetImplemented("authenticate → P-ID-06/07 (M1)"))
+    }
+
+    /// 4.2 — the LIVE depth-bounded Zanzibar `check` (P-ID-09). The scope is the subject's verified
+    /// `(tenant, region)` (tenant-from-token). The engine is fail-closed: any uncertainty (malformed
+    /// ref, depth exhaustion, suspended subject) is `Deny`/`Conditional`, never `Allow`.
+    fn check(
+        &self,
+        subject: &Principal,
+        permission: &Permission,
+        object: &ArtifactRef,
+        at: &Consistency,
+        caveat: Option<&CaveatContext>,
+    ) -> myelin_identity::Result<Decision> {
+        // tenant-from-token (ID-3): the scope is the SUBJECT's own verified (tenant, region), never
+        // a path. The relation the raw-tuple rewrite resolves IS the permission name on this floor
+        // (P-ID-10 compiles permissions → usersets over this same rewrite core).
+        let scope = myelin_storage::TenantScope::from_verified_token(subject, subject.region.clone());
+        let relation = myelin_identity::RelName(permission.0.clone());
+        Ok(self
+            .engine
+            .check(&scope, subject, &relation, object, at, caveat))
+    }
+
+    fn list_objects(
+        &self,
+        _subject: &Principal,
+        _permission: &Permission,
+        _ty: &ObjectType,
+        _at: &Consistency,
+    ) -> myelin_identity::Result<ListObjectsResult> {
+        Err(AuthzError::NotYetImplemented("list_objects → P-ID-11/12 (M1)"))
+    }
+
+    fn list_subjects(
+        &self,
+        _object: &myelin_identity::ObjectId,
+        _permission: &Permission,
+        _at: &Consistency,
+    ) -> myelin_identity::Result<myelin_identity::SubjectTree> {
+        Err(AuthzError::NotYetImplemented("list_subjects → P-ID-13 (M1)"))
+    }
+
+    fn explain(
+        &self,
+        _subject: &Principal,
+        _permission: &Permission,
+        _object: &myelin_identity::ObjectId,
+        _at: &Consistency,
+    ) -> myelin_identity::Result<myelin_identity::RewriteTrace> {
+        Err(AuthzError::NotYetImplemented("explain → P-ID-13 (M1)"))
+    }
+
+    fn delegation(
+        &self,
+        _agent: &Principal,
+        _trigger_actor: &Principal,
+    ) -> myelin_identity::Result<myelin_identity::EffectivePolicy> {
+        Err(AuthzError::NotYetImplemented("delegation → P-ID-17 (M1)"))
+    }
+
+    fn write_tuples(
+        &self,
+        _deltas: &[myelin_identity::TupleDelta],
+        _precondition: Option<&myelin_identity::Precondition>,
+    ) -> myelin_identity::Result<myelin_identity::Zookie> {
+        // The write path is TupleStore::write_tuples (P-ID-08), which carries the (tenant, region)
+        // scope + actor the ABI trait method does not; this slot is not the write entrypoint.
+        Err(AuthzError::NotYetImplemented("write_tuples → TupleStore::write_tuples (P-ID-08)"))
+    }
+
+    fn mint_run_token(
+        &self,
+        _agent_id: &myelin_identity::PrincipalId,
+        _run_id: &myelin_identity::RunId,
+        _delegation_caveats: &myelin_identity::DelegationCaveats,
+        _ttl: &myelin_identity::FailStaticBound,
+    ) -> myelin_identity::Result<myelin_identity::RunToken> {
+        Err(AuthzError::NotYetImplemented("mint_run_token → P-ID-16 (M1)"))
+    }
+
+    fn revoke(&self, _target: &myelin_identity::RevokeTarget) -> myelin_identity::Result<()> {
+        Err(AuthzError::NotYetImplemented("revoke → P-ID-14 (M1)"))
+    }
+
+    fn resolve_pseudonym(
+        &self,
+        _subject: &myelin_identity::PrincipalId,
+        _tenant: &myelin_tenancy::TenantId,
+    ) -> myelin_identity::Result<String> {
+        Err(AuthzError::NotYetImplemented("resolve_pseudonym → P-ID-19 (M1)"))
+    }
+
+    fn erase(&self, _subject: &myelin_identity::PrincipalId) -> myelin_identity::Result<()> {
+        Err(AuthzError::NotYetImplemented("erase → P-ID-20 (M1)"))
+    }
+
+    fn admit_fragment(
+        &self,
+        _fragment: &myelin_identity::NamespaceFragment,
+    ) -> myelin_identity::Result<myelin_identity::FragmentAdmit> {
+        Err(AuthzError::NotYetImplemented("admit_fragment → P-ID-10 (M1)"))
+    }
+}
+
 /// Assemble the Identity service [`AppSpec`] (architecture 00 §3.1; contract 1.1) the harness
 /// wires. The eight-field spec declares Identity's migrations (so readiness gates on
 /// migrate-complete) and the in-process outbox/holder defaults; the harness opens the three ports
@@ -479,6 +618,74 @@ mod tests {
         assert!(
             matches!(r, Err(myelin_substrate::InternalReject::Unauthorized { .. })),
             "the internal-RPC call is re-authorized against the fail-closed check and denied"
+        );
+    }
+
+    /// **The real depth-bounded `check` engine (P-ID-09) plugs into the SAME `CheckAuthorizer`
+    /// seam (EI-01 §7 — one primitive).** A granted relation re-authorizes to `true`; an un-granted
+    /// one fails closed to `false` — through the identical internal-RPC re-authorization path the
+    /// shell's fail-closed stub occupied. The surface wiring is unchanged; only the inner
+    /// `IdentityService` swapped from `FailClosedCheck` to `StoreBackedCheck`.
+    #[test]
+    fn real_check_engine_swaps_in_behind_the_same_authorizer_seam() {
+        use myelin_events::{OutboxStore, Timestamp};
+        use myelin_identity::{ObjectId, RelName, RelationTuple, TupleDelta};
+        use myelin_storage::TenantScope;
+
+        // alice's verified principal (tenant acme, region eu-west).
+        let alice = Principal::stub(
+            PrincipalId("p:alice".into()),
+            PrincipalKind::Human,
+            TenantId("acme".into()),
+        );
+        let scope = TenantScope::from_verified_token(&alice, alice.region.clone());
+
+        // Seed a grant: `issues.read#@p:alice` on the action-object the authorizer builds. The
+        // CheckAuthorizer builds object `myelin://acme/identity/action/issues.read` → object id
+        // `issues.read`; grant alice the `issues.read` relation on that object.
+        let store = TupleStore::new(OutboxStore::new());
+        let admin = Principal::stub(
+            PrincipalId("p-admin".into()),
+            PrincipalKind::Human,
+            TenantId("acme".into()),
+        );
+        store
+            .write_tuples(
+                &scope,
+                &admin,
+                &[TupleDelta::Add(RelationTuple {
+                    object: ObjectId("issues.read".into()),
+                    relation: RelName("issues.read".into()),
+                    subject: PrincipalId("p:alice".into()),
+                    caveat: None,
+                })],
+                None,
+                None,
+                Timestamp("2026-06-19T00:00:00Z".into()),
+            )
+            .expect("grant");
+
+        // The SAME CheckAuthorizer seam, now backed by the real engine.
+        let surface = myelin_substrate::InternalSurface::new(CheckAuthorizer::new(
+            StoreBackedCheck::new(store.clone()),
+        ));
+        // alice with the grant → authorized (Allow flows back through the seam).
+        assert!(
+            surface.handle(&alice, "issues.read").is_ok(),
+            "the real engine allows the granted relation through the SAME authorizer seam"
+        );
+        // bob without a grant → fail-closed (denied) through the identical seam.
+        let bob = Principal::stub(
+            PrincipalId("p:bob".into()),
+            PrincipalKind::Human,
+            TenantId("acme".into()),
+        );
+        assert!(
+            matches!(
+                surface.handle(&bob, "issues.read"),
+                Err(myelin_substrate::InternalReject::Unauthorized { .. })
+            ),
+            "an un-granted subject is denied through the same seam (fail-closed)"
         );
     }
 
