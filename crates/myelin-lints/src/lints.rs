@@ -23,7 +23,221 @@ use crate::engine::{blank_string_literals, code_lines, code_statements, Lint, Li
 /// **Floor (named).** The type-system form — a query-builder type that is unconstructable
 /// without a `TenantId` so a tenant-less query fails to COMPILE — lands with the Identity/Storage
 /// M1 query-builder. This scanner is the M0 ratchet click that keeps the gate live until then.
+///
+/// **EB-09 reconciliation (P-045, the Bus's OWNED slice; coherence rule EI-01 §7).** The
+/// `tenant-predicate` lint, its engine, and its query-builder red/green fixtures were first shipped
+/// by the SUBSTRATE prompt P-S10 → P-017 (the four load-bearing architecture lints; the lint
+/// harness is shared substrate). That P-017 form is the DATA-STORE half: it fires on a
+/// query-builder call (`sqlx::query`, `.from(`, …) that is not tenant-bound — the cross-tenant IDOR
+/// bug class. EB-09 is the Bus's OWNED slice of the SAME contract-1.6 lint, and its CANON docs name
+/// the STREAM/CONSUMER surface: refined-arch event-bus §4.2 (the "whitelist subjects, **never**
+/// `*`" rule — gotcha 1) + §7.1 (a stream is provisioned **per (tenant, subsystem)**, subject
+/// `evt.<tenant>.<subsystem>...`) + §4.3 (`scope` is a bounded selector, **never** `*`; the
+/// transport rejects an unbounded/over-broad scope). This is a genuinely DISTINCT bug fingerprint
+/// from the data-store leg: here the construct is a `subscribe` / `consume` / stream provision, and
+/// the bug is an UNSCOPED subscription (no `(tenant, subsystem)` scope) or a WILDCARD scope
+/// (`scope = *`, a `>`/`.*` wildcard subject) — an over-broad subscription that crosses the
+/// tenant/subsystem boundary (the firehose head-of-line stall + cross-tenant frame leak). Rather
+/// than duplicate a parallel scanner (EI-01 §7), the in-place scanner is EXTENDED with this second
+/// leg — keyed to a loud, named `// @bus-stream` marker (the same marker discipline `@identity-sink`
+/// / `@write-path` / `@residency-write` use) so it fires ONLY where a bus subscribe/stream surface
+/// is being scanned, and admits the whole current workspace until the consume/subscribe surface
+/// (EB-05 / P-043, the firehose subscription protocol EB-21 / P-141) is wired live. The lint is
+/// SHARPENED (it now also guards the stream subscribe boundary), never weakened (EI-01 §5). Together
+/// with EB-07 (no-raw-publish) + EB-08 (no-cross-sync-cycle) this completes the Bus's THREE of the
+/// twelve-lint M0 gate.
+///
+/// **Floor (named) — the type-system / transport-enforced form is later-band.** This is the *lint
+/// leg* (the compile-time rejection of the unscoped/wildcard subscribe fingerprint) only. The
+/// transport-enforced form — `subscribe(stream, scope, …)` whose `scope` type cannot represent `*`
+/// so an unbounded subscription is impossible by construction, and the server-side reject of an
+/// over-broad scope (§4.3) — lands with the resume-cursor subscription protocol (EB-21 / P-141) and
+/// the partitioned-per-(tenant, region) streams (EB-12 / P-089). The marker-keyed scanner ships the
+/// gate NOW so the unscoped/`*` subscribe bug fingerprint is un-mergeable before that surface exists.
 pub const TENANT_PREDICATE: LintId = LintId("tenant-predicate");
+
+/// A bus SUBSCRIBE / CONSUME / stream-provision fingerprint — the construct the EB-09 leg requires
+/// to carry a `(tenant, subsystem)` scope. A subscription over the durable bus or the firehose
+/// (`subscribe(...)` / `resume(...)` / `.consume(` / a `Consumer`/`Stream` provision) MUST bind a
+/// bounded `(tenant, subsystem)` scope (refined-arch event-bus §4.2 gotcha 1 + §7.1 + §4.3).
+const BUS_STREAM_SITES: &[&str] = &[
+    ".subscribe(",
+    "subscribe(",
+    ".resume(",
+    "resume(",
+    ".consume(",
+    "provision_stream(",
+    "Consumer::bind(",
+    "durable_consumer(",
+];
+
+/// Tokens that prove a bus subscribe/stream carries a BOUNDED `(tenant, subsystem)` scope (so it is
+/// admitted). The §7.1 subject grammar (`evt.<tenant>.<subsystem>...`), a `StreamScope` /
+/// `(tenant, subsystem)` scope value, or the explicit binders the consumer template threads.
+const BUS_SCOPE_BINDERS: &[&str] = &[
+    "StreamScope",
+    "TenantId",
+    "tenant_id",
+    "subsystem",
+    "Subsystem",
+    "scoped_stream",
+    "Scope::Tenant",
+    // A bound `scope` value threaded into the subscribe argument list (the idiomatic shape: a
+    // `StreamScope` is constructed in a prior statement and passed in). Matched as argument tokens
+    // (`, scope`, `(scope`, `scope)`, `scope,`) so the BARE identifier `scope` only counts when it
+    // is actually a call argument, never a stray substring (`scoped`, `descope`).
+    ", scope",
+    "(scope",
+    "scope)",
+    "scope,",
+    ".scope(",
+];
+
+/// A WILDCARD / unbounded scope on a bus subscribe — rejected EVEN IF a scope token is present,
+/// because `*` (or a `>` / `.*` wildcard subject, or an explicit "all streams" scope) is the
+/// over-broad subscription the §4.2 "whitelist subjects, never `*`" rule + the §4.3 "scope is a
+/// bounded selector, never `*`" rule forbid. Matched against the BLANKED-string form so the bare
+/// glyphs (`= *`, `Scope::All`) are seen, plus the wildcard-subject string literals.
+const BUS_WILDCARD_SCOPES: &[&str] = &[
+    "Scope::All",
+    "Scope::Star",
+    "Scope::Wildcard",
+    "scope: None",
+    "scope = *",
+    "scope=*",
+    ".scope(*)",
+    "AllStreams",
+];
+
+/// The wildcard-SUBJECT string-literal fingerprints (a subscribe whose subject is itself a
+/// wildcard: NATS `>` / `*` tokens, or an `evt.*` over-broad subject). These are matched against the
+/// RAW line (string contents intact), since the wildcard lives INSIDE the subject string literal.
+const BUS_WILDCARD_SUBJECTS: &[&str] = &[
+    "\"evt.>\"",
+    "\"evt.*\"",
+    "\".>\"",
+    "\"*\"",
+    "\">\"",
+    "\"evt.*.*\"",
+];
+
+/// The EB-09 leg of `tenant-predicate` (P-045, the Bus's owned slice). Inside a bus-subscribe site
+/// (a file/line marked `// @bus-stream`), a subscribe/consume/stream-provision that does NOT bind a
+/// `(tenant, subsystem)` scope — OR that binds a WILDCARD / unbounded scope (`scope = *`, a `>`/`.*`
+/// wildcard subject, an explicit "all streams" scope) — is rejected. A stream is provisioned per
+/// `(tenant, subsystem)` (refined-arch event-bus §7.1, subject `evt.<tenant>.<subsystem>...`); the
+/// firehose `scope` is a bounded selector, never `*` (§4.3); whitelist subjects, never `*` (§4.2
+/// gotcha 1). This is a DISTINCT fingerprint from the data-store query leg: the originator is the
+/// bus subscribe surface, scoped by the `@bus-stream` marker so the whole current workspace (no live
+/// subscribe surface yet — EB-05 / P-043, EB-21 / P-141) is admitted until those paths land.
+fn scan_tenant_predicate_bus_streams(src: &str) -> Vec<Violation> {
+    const STREAM_MARKER: &str = "@bus-stream";
+    if !src.contains(STREAM_MARKER) {
+        return Vec::new();
+    }
+    // A module-doc (`//!`) or top-of-file marker arms the whole file; otherwise each offending
+    // statement needs the marker on its own line or in the attached comment block (per-line arming),
+    // so the leg never fires on an unmarked statement (same discipline as the EB-08 write-path leg).
+    let raw_lines: Vec<&str> = src.lines().collect();
+    let file_armed = raw_lines.iter().any(|l| {
+        let t = l.trim_start();
+        t.starts_with("//!") && t.contains(STREAM_MARKER)
+    });
+    let mut out = Vec::new();
+    for (line, code) in code_statements(src) {
+        let Some(site) = BUS_STREAM_SITES.iter().find(|s| code.contains(**s)) else {
+            continue;
+        };
+        if !is_marker_armed(&raw_lines, line, file_armed, STREAM_MARKER) {
+            continue;
+        }
+        // A wildcard subject lives INSIDE a string literal, so test the RAW statement text (the
+        // string contents are blanked in `code` by neither helper here — `code_statements` keeps
+        // literals — but the wildcard glyphs are most robustly found on the raw source statement).
+        let raw_stmt = raw_statement_text(&raw_lines, line);
+        let blanked = blank_string_literals(&code);
+        let has_wildcard_scope = BUS_WILDCARD_SCOPES.iter().any(|w| {
+            // `= *` / `Scope::All` etc. are CODE, not string data — test the blanked form.
+            blanked.contains(*w) || code.contains(*w)
+        });
+        let has_wildcard_subject =
+            BUS_WILDCARD_SUBJECTS.iter().any(|w| raw_stmt.contains(*w));
+        let is_scoped = BUS_SCOPE_BINDERS.iter().any(|b| code.contains(b));
+        if has_wildcard_scope || has_wildcard_subject {
+            out.push(Violation {
+                lint: TENANT_PREDICATE,
+                line,
+                reason: format!(
+                    "a bus subscribe/stream `{site}` uses a WILDCARD / unbounded scope — `scope` is \
+                     a bounded selector, NEVER `*` (refined-arch event-bus §4.3); whitelist \
+                     subjects, never `*` (§4.2 gotcha 1). An over-broad subscription crosses the \
+                     (tenant, subsystem) boundary (cross-tenant frame leak + the firehose \
+                     head-of-line stall). Scope the subscription to a bounded `(tenant, subsystem)` \
+                     stream (subject `evt.<tenant>.<subsystem>...`, §7.1)."
+                ),
+            });
+        } else if !is_scoped {
+            out.push(Violation {
+                lint: TENANT_PREDICATE,
+                line,
+                reason: format!(
+                    "a bus subscribe/stream `{site}` has no (tenant, subsystem) scope — a stream is \
+                     provisioned PER (tenant, subsystem) (refined-arch event-bus §7.1, subject \
+                     `evt.<tenant>.<subsystem>...`); an unscoped subscription is the cross-tenant \
+                     frame-leak bug class (the Bus's slice of tenant-predicate, contract 1.6). Thread \
+                     a bounded `StreamScope`/`(TenantId, Subsystem)` scope on the subscribe."
+                ),
+            });
+        }
+    }
+    out
+}
+
+/// Per-line marker arming shared by the marker-keyed leg: the marker on the statement's start line,
+/// in the attached comment block directly above it (stops at the first non-comment, non-blank line
+/// so a marker on an unrelated earlier statement does not leak its arming downward), or file-level.
+fn is_marker_armed(raw_lines: &[&str], line: usize, file_armed: bool, marker: &str) -> bool {
+    if file_armed {
+        return true;
+    }
+    let idx = line.saturating_sub(1);
+    if raw_lines.get(idx).is_some_and(|l| l.contains(marker)) {
+        return true;
+    }
+    let mut i = idx;
+    for _ in 0..6 {
+        let Some(j) = i.checked_sub(1) else { break };
+        i = j;
+        let Some(raw) = raw_lines.get(i) else { break };
+        let t = raw.trim();
+        if t.contains(marker) {
+            return true;
+        }
+        if !t.is_empty() && !t.starts_with("//") {
+            break;
+        }
+    }
+    false
+}
+
+/// The RAW source text of the statement that STARTS at `line` (1-based), joined across its
+/// continuation lines up to the next statement terminator, with string literals INTACT — so a
+/// wildcard subject inside a string literal (`subscribe("evt.>", …)`) is visible. The structural
+/// boundary mirrors [`engine::code_statements`] (`;` / `{` / `}`), but keeps the original bytes.
+fn raw_statement_text(raw_lines: &[&str], line: usize) -> String {
+    let mut out = String::new();
+    let start = line.saturating_sub(1);
+    for raw in raw_lines.iter().skip(start) {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(raw.trim());
+        if raw.contains(';') || raw.contains('{') || raw.contains('}') {
+            break;
+        }
+    }
+    out
+}
 
 fn scan_tenant_predicate(src: &str) -> Vec<Violation> {
     // The query-builder fingerprints that MUST be tenant-bound.
@@ -64,6 +278,9 @@ fn scan_tenant_predicate(src: &str) -> Vec<Violation> {
             });
         }
     }
+    // ---- The EB-09 leg: the Bus's OWNED slice — the subscribe/stream (tenant, subsystem) scope
+    // check (P-045). Inert unless a `// @bus-stream` marker arms it; SHARPENED, never weakened. ----
+    out.extend(scan_tenant_predicate_bus_streams(src));
     out
 }
 
@@ -673,30 +890,9 @@ fn scan_cross_sync_in_write_path(src: &str) -> Vec<Violation> {
         let Some(site) = SYNC_OUTBOUND_SITES.iter().find(|s| code.contains(**s)) else {
             continue;
         };
-        // Per-line arming: the marker on the statement's start line, or in the attached comment
-        // block directly above it (stops at the first non-comment, non-blank line so a marker on an
-        // unrelated earlier statement does not leak its arming downward).
-        let idx = line.saturating_sub(1);
-        let site_armed = file_armed
-            || raw_lines.get(idx).is_some_and(|l| l.contains(WRITE_MARKER))
-            || {
-                let mut armed = false;
-                let mut i = idx;
-                for _ in 0..6 {
-                    let Some(j) = i.checked_sub(1) else { break };
-                    i = j;
-                    let Some(raw) = raw_lines.get(i) else { break };
-                    let t = raw.trim();
-                    if t.contains(WRITE_MARKER) {
-                        armed = true;
-                        break;
-                    }
-                    if !t.is_empty() && !t.starts_with("//") {
-                        break;
-                    }
-                }
-                armed
-            };
+        // Per-line arming: the marker on the statement's start line, in the attached comment block
+        // directly above it, or file-level (shared with the EB-09 leg via `is_marker_armed`).
+        let site_armed = is_marker_armed(&raw_lines, line, file_armed, WRITE_MARKER);
         if site_armed {
             out.push(Violation {
                 lint: NO_CROSS_SYNC_CYCLE,

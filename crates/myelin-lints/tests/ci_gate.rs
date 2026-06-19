@@ -67,6 +67,26 @@ fn ci_gate_passes_on_the_eb08_write_path_green_fixture() {
 }
 
 #[test]
+fn ci_gate_fails_loudly_on_the_eb09_stream_scope_red_fixture() {
+    // EB-09 → P-045 (the Bus's owned slice of tenant-predicate, the subscribe/stream-scope leg): the
+    // red fixture (an unscoped, wildcard-subject `subscribe` in a `@bus-stream` consumer) MUST make
+    // the gate exit NON-ZERO. The exit code IS the gate, so it cannot be `|| true`-swallowed
+    // (EI-01 §5). This is the dated green proof that the EB-09 leg is wired into CI loud-never-swallowed.
+    let red = fixtures_dir().join("tenant_predicate.eb09.red.rs.txt");
+    let code = run_gate_over(&red);
+    assert_ne!(code, 0, "lint-gate MUST exit non-zero on the EB-09 stream-scope red fixture");
+}
+
+#[test]
+fn ci_gate_passes_on_the_eb09_stream_scope_green_fixture() {
+    // The EB-09 green fixture (a bounded (tenant, subsystem) StreamScope subscribe): the gate MUST
+    // exit zero — proving the lint does not over-reject (both fixtures are the EB-09 pass condition).
+    let green = fixtures_dir().join("tenant_predicate.eb09.green.rs.txt");
+    let code = run_gate_over(&green);
+    assert_eq!(code, 0, "lint-gate MUST exit zero on the EB-09 stream-scope green fixture");
+}
+
+#[test]
 fn ci_gate_is_clean_over_the_real_workspace() {
     // Belt-and-braces: the gate run with no args (the workspace `crates/*/src` tree, exclusions
     // honoured) exits zero — the live CI job is green on real code, not just fixtures.
