@@ -95,10 +95,12 @@
 pub mod dependency_break;
 pub mod drills;
 pub mod load_generator;
+pub mod scorecard;
 pub mod telemetry;
 
 pub use dependency_break::{BreakOutcome, Dependency, DependencyBreaker, Scope};
 pub use drills::{DrillContext, DrillRegistry, DrillResult, DrillScenario};
+pub use scorecard::{Band, GateRow, RowResult, RowVerdict, Scorecard};
 pub use load_generator::{
     LoadGenerator, LoadPrincipalKind, Multiplier, PrincipalMix, Request, RunClass, Sink,
     StormProfile, Surface,

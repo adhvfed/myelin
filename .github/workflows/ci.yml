@@ -45,6 +45,25 @@ jobs:
       - name: The scanner self-test (red manifest fixture ⇒ non-zero exit; green ⇒ zero)
         run: cargo test -p myelin-lints --test contract_coverage_gate
 
+  sub-m0-scorecard:
+    # The M0 EXIT-GATE scorecard (P-S24 → P-039) — the consolidated band-boundary gate. LOUD:
+    # the gate is the `sub-m0-scorecard` binary's exit code. It runs EVERY required SUB-M0 row's
+    # proof command (the per-feature drills SUB-D1/D2/BUS-D4/D5/D7/D8/D9 + the twelve lints + the
+    # contract-coverage scanner + the harness self-test), records each as a dated green artifact,
+    # writes testing/scorecards/sub-m0.md, and EXITS NON-ZERO if any row is missing or claimed-
+    # not-proven (the gate invariant: no later band runs over a red M0, master-sequencing §2 /
+    # EI-01 §2). There is deliberately NO `|| true` / `continue-on-error`. The permanent gates
+    # SUB-D1/D2/BUS-D4 re-run forever — a regression on any of them halts the run. The
+    # scorecard_ratchet test proves dropping a row OR flipping it green-without-proof reds the gate.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: The SUB-M0 exit-gate scorecard (runs every required drill; non-zero on any red/missing row)
+        run: cargo run -p myelin-harness --bin sub-m0-scorecard
+      - name: The scorecard ratchet meta-test (dropping a row OR green-without-proof reds the gate)
+        run: cargo test -p myelin-harness --test scorecard_ratchet
+
   build-test-clippy:
     runs-on: ubuntu-latest
     steps:
