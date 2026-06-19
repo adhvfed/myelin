@@ -150,6 +150,34 @@
 //!   seam they consult). The OLTP/blob ENCRYPTION wiring that drives origin selection per class is
 //!   the sibling **P-ST-08 (global P-095)**. The mutation floor on the
 //!   `can_derive_plaintext_index` branch + the HYOK deny path is mandatory-core (≥ 80%).
+//! - **OLTP + blob envelope encryption wired + classify-driven key choice (P-ST-08 / contracts
+//!   11.1 + 11.2 + 11.4 — global P-095)** is now IMPLEMENTED in [`encryption`]: it CLOSES the two
+//!   floors named upstream. (1) The **plaintext-at-rest floor P-ST-01 named** is closed by
+//!   [`encryption::ColumnCryptor`] — a personal-data column written through
+//!   [`encryption::ColumnCryptor::encrypt`] is sealed under the classify-chosen DEK and stored as a
+//!   ciphertext-only [`encryption::EncryptedColumn`] ([`encryption::ColumnCryptor::plaintext_at_rest_count`]
+//!   is the `plaintext_at_rest_count == 0` telemetry the GATE asserts for tagged columns). (2) The
+//!   **content-key-wrap floor P-ST-03 named** is closed by [`encryption::DekContentWrap`] — a real
+//!   [`blob::ContentWrap`] that seals blob bytes under the tenant/per-subject DEK, REPLACING the
+//!   [`blob::IdentityWrap`] plaintext floor (a localised swap; the content address stays
+//!   plaintext-derived so nothing moves). (3) The **GD-4 classify-driven key choice (11.4)** is
+//!   [`encryption::key_class_for`]: a field tagged `personal-data, erasure=subject`
+//!   (`CryptoShred("subject_dek")`) is auto-wired to a per-subject DEK ([`kms::KeyClass::Subject`]),
+//!   a bulk class (`Pseudonymise`/`PurgeReindex`/`CarveOut`/`CryptoShred("tenant_dek")`) to the
+//!   per-tenant DEK ([`kms::KeyClass::Tenant`]) — *data whose erasure unit is the individual is
+//!   keyed per-subject; data whose erasure is satisfied by pseudonymisation/tombstoning is keyed
+//!   per-tenant* (§5.1). A subject-class tag with no subject is a LOUD
+//!   [`encryption::KeyChoiceError::SubjectClassMissingSubject`] — **never a silent tenant-key
+//!   downgrade** (which would lose the GD-4 individual-erasure lever). It REUSES the P-058
+//!   [`kms::KmsEngine`] (the SAME engine rotation/crypto-shred reach — never a parallel key store),
+//!   the [`kms::KeyClass`] vocabulary (the GDPR `CryptoShred(key_class)` tag and the KMS class speak
+//!   one vocabulary), the [`blob::ContentWrap`] seam (P-047), and contract 10.2's
+//!   [`myelin_gdpr::ErasureMethod`] tag (P-050) — never re-defined. The erase ALGORITHM that
+//!   DESTROYS the chosen key is the sibling **P-ST-09 (global P-099)**. **Floor named in
+//!   [`encryption`]:** the CI inline-PII log-segment per-subject DEK extension (C1) is the named
+//!   **M4 follow-on (P-ST-27)** (the per-subject class today covers free-text/profile/chat-body/
+//!   agent-memory). The mutation floor on the classify→key-choice routing + the
+//!   ciphertext-at-rest property is mandatory-core (≥ 80%).
 //! - **Continuous WAL archiving + base backups + PITR (P-ST-11 / contract 11.5 — global P-059)**
 //!   is now IMPLEMENTED in [`backup`]: [`backup::ContinuousArchiver`] ships sealed WAL segments
 //!   off-host continuously (strictly forward, append-only) + takes periodic [`backup::BaseBackup`]s,
@@ -225,6 +253,7 @@
 
 pub mod backup;
 pub mod blob;
+pub mod encryption;
 // The minimal cache seam (Stage 1 / infra — NEW). No cache trait existed before; this is the
 // one-line-swap Cache trait (in-memory floor + Valkey/Redis backing behind `integration`).
 pub mod cache;
@@ -271,6 +300,9 @@ pub use blob::{
 };
 pub use cache::{Cache, CacheError, InMemoryCache};
 pub use coloc::{ColocError, ColocatedOltp, ColocatedTx, COLOCATED_OUTBOX_MIGRATION};
+pub use encryption::{
+    key_class_for, ColumnCryptor, DekContentWrap, EncryptedColumn, KeyChoiceError, SubjectId,
+};
 pub use holder::{register_holder, BlobStoreHolder, OltpHolderRegistration, OltpStoreHolder};
 pub use key_origin::{
     Byok, Dek, Hyok, HyokKeyService, HyokServiceDenied, IndexAdmission, KeyId, KeyOrigin,
