@@ -597,10 +597,18 @@ status = "covered"
 # T2-blobs log tier, the structural "T4/T7/derived-indexes NOT backed up — rebuilt from source"
 # assertion, and the crypto-shredded-key-excluded-from-backup rule (§7.5). The CDC pair is the ops
 # backup caller (archive WAL tail → base backup → snapshot the backed-up tiers at the cross-seam
-# offset → read the measured RPO). The OTHER halves of this row complete it: the `restore(to_offset
-# T)` + cross-seam rebuild is the sibling P-ST-12 (global P-060); the CI-wired restore-verify GATE
-# (STOR-D1) is P-ST-13 (global P-061) — both add their restore-caller CDC pair to this same row.
-cdc = ["crates/myelin-storage/tests/cdc_11_5_backup.rs"]
+# offset → read the measured RPO).
+# P-060 (P-ST-12): the RESTORE + cross-seam half — restore(to_offset T) lands every tier at ONE
+# consistent point (PITR to the seq ≤ T cursor, referenced-ContentHash-presence verification with a
+# hard FAIL on a missing hash = the §7.3 silent-corruption case, reindex-from-source derived rebuild
+# = derived == source by construction, and KEK restore-except-crypto-shredded = §7.5). Its CDC pair
+# is the restore-verify gate's restore caller (cdc_11_5_restore.rs). The REMAINING half completes it:
+# the CI-wired restore-verify GATE (STOR-D1, the permanent gate) is P-ST-13 (global P-061) — it adds
+# its CI-gate caller CDC pair to this same row.
+cdc = [
+    "crates/myelin-storage/tests/cdc_11_5_backup.rs",
+    "crates/myelin-storage/tests/cdc_11_5_restore.rs",
+]
 
 [[contract]]
 row = "11.6"
