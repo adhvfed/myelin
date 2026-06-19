@@ -524,6 +524,89 @@ impl RestoreVerifyGate {
         })
     }
 
+    /// **Run the gate AND the mandatory post-restore re-erasure pass (§7.5 — P-100).** This is the
+    /// post-PIT-aware entrypoint: it runs the three §7.4 assertions ([`Self::run`]) AND THEN re-applies
+    /// every erasure the `post_pit_ledger` records as completed AFTER the restore's PIT (the set the
+    /// restore could resurrect), asserting **0 resurrected subjects** ([`GateFailure::ErasureResurrected`]
+    /// if one survives). Wiring re-erasure into the gate is the §7.5 requirement: *every restore
+    /// re-erases by construction*.
+    ///
+    /// The before-the-backup leg ([`Self::run`]'s erasure-held check) keeps a PRE-T crypto-shred dead
+    /// (exclude-from-backup, P-058/P-061); this pass re-applies every POST-T erasure. Together a
+    /// restore never resurrects an erased subject, whenever the erasure happened.
+    ///
+    /// `post_pit_ledger` is the §7.5 / 10.8 erasure ledger keyed by completion offset; `holders` are
+    /// the cross-holder re-erasure seams (re-purge Search / re-tombstone Refs / re-emit `*.erased`);
+    /// `now` is the caller-supplied clock. Returns [`GateVerdict::Green`] only when BOTH the three
+    /// §7.4 assertions AND the re-erasure pass (0 resurrected) pass.
+    ///
+    /// The re-erasure pass mutates the restored copy's KMS engine (it re-destroys resurrected DEKs);
+    /// it borrows the SAME `inputs.kms` the restore restored the KEKs into.
+    pub fn run_with_reerase(
+        &self,
+        inputs: &GateInputs<'_>,
+        post_pit_ledger: &dyn crate::reerase::PostRestoreErasureLedger,
+        holders: &crate::erase::EraseHolders<'_>,
+        region: myelin_tenancy::Region,
+        now: crate::erase::EpochMillis,
+    ) -> GateVerdict {
+        // (1) The three §7.4 assertions (no-loss / cross-seam / before-the-backup erasure-held). A red
+        // here short-circuits — never run re-erasure over a broken restore.
+        let base = self.run(inputs);
+        let mut artifact = match base {
+            GateVerdict::Green(a) => a,
+            red @ GateVerdict::Red(_) => return red,
+        };
+
+        // (2) Drive the restore once more to obtain the report the re-erasure pass runs against (the
+        // §7.4 run consumed its report; the restore is deterministic + idempotent so this lands the
+        // same point). The presence oracle is rebuilt from the same objects.
+        let presence = build_presence(inputs.objects);
+        let report = match restore_to_offset(
+            inputs.archiver,
+            inputs.target,
+            inputs.rows,
+            &presence,
+            inputs.source,
+            inputs.kms,
+        ) {
+            Ok(report) => report,
+            Err(e) => return GateVerdict::Red(GateFailure::RestoreFailed(e)),
+        };
+
+        // (3) The mandatory post-restore re-erasure pass (§7.5): re-apply every post-PIT erasure +
+        // assert 0 resurrected. A re-applied step failing is a loud restore-failed (an incomplete
+        // re-erasure is never swallowed).
+        let pass = crate::reerase::ReErasePass::new(inputs.kms, region);
+        let reerase = match pass.run(&report, post_pit_ledger, holders, now) {
+            Ok(r) => r,
+            // A re-erasure step failure surfaces as a cross-seam-class gate failure (the restore did
+            // not reach a clean, fully-re-erased point). Loud, never swallowed.
+            Err(e) => {
+                return GateVerdict::Red(GateFailure::CrossSeamMismatch {
+                    count: 1,
+                    detail: format!("post-restore re-erasure step failed: {e}"),
+                })
+            }
+        };
+
+        if !reerase.is_green() {
+            // A subject erased AFTER the backup was RESURRECTED by the restore and the pass could not
+            // re-kill it — the gravest failure. Name the first still-resurrected subject's tenant.
+            let tenant = reerase
+                .re_erased
+                .iter()
+                .find(|s| s.was_resurrected_before_reapply)
+                .map(|s| s.tenant.clone())
+                .unwrap_or_else(|| TenantId("<unknown>".into()));
+            return GateVerdict::Red(GateFailure::ErasureResurrected { tenant });
+        }
+
+        // The re-erasure pass passed: fold its measured numbers into the artifact (resurrected == 0).
+        artifact.resurrected_subjects = reerase.resurrected_count;
+        GateVerdict::Green(artifact)
+    }
+
     /// **The loud-never-swallowed CI entrypoint (EI-01 §5).** Run the gate and turn a RED verdict into
     /// a process-failing `Err(GateFailure)` — so a CI invocation `gate.run_or_fail_ci(&inputs)?`
     /// FAILS CI on a red restore, with NO `|| true`, no `.ok()`, no swallow. On GREEN it returns the

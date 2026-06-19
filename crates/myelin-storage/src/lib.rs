@@ -278,6 +278,33 @@
 //!   M2+ (the gate runs as a `cargo test` drill until then); the real `pg_restore` driver is the
 //!   P-S12/P-S15 floor. The mutation floor on the no-loss-assertion + the fail-CI-on-red branch is ≥
 //!   85% (mandatory-core — the silent-data-loss floor, the highest bar).
+//! - **Post-restore re-erasure (STOR-D3) + the cell-kill RTO drill (STOR-D2) (P-ST-14 / contract 11.5
+//!   — global P-100)** is now IMPLEMENTED in [`reerase`]: it COMPLETES the headline. (1) **Post-restore
+//!   re-erasure (§7.5 / GD-14):** [`reerase::ReErasePass::run`] re-applies every erasure the
+//!   [`reerase::PostRestoreErasureLedger`] (10.8) records as completed AFTER the restore's PIT T — the
+//!   set the restore could RESURRECT (a subject erased at offset `> T` still has a live pre-erasure DEK
+//!   in the backup, which the before-the-backup gate leg P-061 does NOT cover). For each it RE-RUNS the
+//!   P-099 [`erase::CryptoShredErase`] six-step algorithm (re-destroy the per-subject DEK + re-purge
+//!   Search + re-tombstone Refs + re-emit `*.erased`) and asserts **0 resurrected subjects**
+//!   ([`reerase::ReEraseReport::resurrected_count`] == 0). It is idempotent (the re-applied erase is
+//!   itself a no-op success, P-099). **It is wired into the restore-verify gate**
+//!   ([`restore_verify::RestoreVerifyGate::run_with_reerase`]) so every restore re-erases by
+//!   construction — a resurrected post-T-erased subject FAILs the gate
+//!   ([`restore_verify::GateFailure::ErasureResurrected`]). (2) **The cell-kill RTO drill (STOR-D2 RTO
+//!   half, §7.1):** [`reerase::CellKillRestore`] models the begin-restore → consistent-ready wall-clock
+//!   per grain ([`reerase::RtoGrain::Tenant`]/`Cell`); the drill asserts the measured RTO ≤ the
+//!   `rpo_rto.rto_tenant_max_mins` (≤ 1 h) / `rto_cell_max_mins` (≤ 4 h) bound from the versioned
+//!   `thresholds.toml` (never hardcoded), emitting onto the harness `RestoreRtoSecs{grain}` signal. It
+//!   REUSES the P-099 [`erase::CryptoShredErase`] algorithm + its [`erase::EraseHolders`] seams, the
+//!   [`restore::RestoreReport`] (P-060), the restore-verify gate + its before-the-backup
+//!   [`restore_verify::ErasureLedger`] seam (P-061), the KMS crypto-shred exclusion ([`kms`], P-058),
+//!   and the harness RTO model (P-056) — never re-defined; the NEW surface is the post-PIT ledger seam,
+//!   the re-erasure pass, and the cell-kill RTO model. **Floors named in [`reerase`]:** the RTO numbers
+//!   (≤ 1 h-tenant / ≤ 4 h-cell) are defaults-to-beat re-confirmed at cell scale in **P-ST-30 (M5)**;
+//!   the §7.6 backup-window-vs-erasure-SLA residual number is `[OPEN → LEGAL]` (DPO-ratified — the
+//!   MECHANISM ships, the NUMBER → counsel); the real GDPR erasure-ledger binding (10.8) is **P-GA-15
+//!   (global P-115)**; the real `pg_restore` + cell-kill provisioning driver is the P-S12/P-S15 floor.
+//!   The mutation floor on the post-PIT-select + re-apply + 0-resurrected-assert path is mandatory-core.
 
 pub mod backup;
 pub mod blob;
@@ -293,6 +320,7 @@ pub mod kms;
 pub mod kms_failstatic;
 pub mod migration;
 pub mod oltp;
+pub mod reerase;
 pub mod restore;
 pub mod restore_verify;
 pub mod rls;
@@ -353,6 +381,10 @@ pub use migration::{
     Migrations, OnlineMigrationRunner, PhaseProgress,
 };
 pub use oltp::{OltpConfig, OltpError, OltpPool, PermitGuard};
+pub use reerase::{
+    CellKillRestore, CellKillRtoReport, ErasureRecord, InMemoryPostPitLedger,
+    PostRestoreErasureLedger, ReErasePass, ReErasedSubject, ReEraseReport, RtoGrain,
+};
 pub use restore::{
     restore_to_offset, restored_key_counts, BlobPresence, ReindexFromSource, RestoreError,
     RestoreReport, SourceEvent, SourceLog, WalRow,
