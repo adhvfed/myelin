@@ -72,6 +72,7 @@ pub mod lowering;
 pub mod machine_auth;
 pub mod namespace;
 pub mod principal_store;
+pub mod read_replica;
 pub mod revocation;
 pub mod reverse_index;
 pub mod tuple_store;
@@ -86,6 +87,10 @@ pub use failstatic_cache::{
     CachedDecision, CacheTelemetry, CoarseGrant, FailStaticCache, Served, FRESH_TTL_SECS, S6_STORE,
 };
 pub use list_objects::{ListObjects, DEFAULT_IDS_CARDINALITY_CAP};
+pub use read_replica::{
+    AuthzReadReplica, ReadRoute, ReplicaRow, ReplicaTelemetry, ReplicaWriteRejected, S5_HOLDER,
+    S5_TABLE,
+};
 pub use lowering::{
     fall_back_to_check, is_fall_back, lower, watermark_verdict, AuthzJoin, BoundParam, Lowered,
     WatermarkVerdict,
@@ -397,6 +402,15 @@ pub struct StoreBackedCheck {
     /// calls `check` denies). Cloneable + shared so every surface holding a `check` handle reads the
     /// SAME denylist (one revocation oracle, EI-01 §7 — no bespoke per-surface revocation path).
     revocations: revocation::RevocationStore,
+    /// **S5, the authz read-replica (P-ID-16) — the ID-4 first scaling move.** A read-only,
+    /// stale-tolerant replica of the OLTP-tier authz read path: a default-consistency
+    /// (`BoundedStale`) hot-path read is routed to S5 (relieving the primary), while a zookie-stamped
+    /// (`Strong`) read BYPASSES S5 to this engine's primary `check`/`list_objects` (read-your-writes /
+    /// the new-enemy guard). Cloneable + shared so a live service wires the SAME replica the
+    /// replication feed populates ([`StoreBackedCheck::read_replica`]). The routing decision is
+    /// [`StoreBackedCheck::route_read`]; the replica is fed by the primary's replication stream
+    /// ([`read_replica::AuthzReadReplica::replicate`]).
+    read_replica: read_replica::AuthzReadReplica,
 }
 
 impl StoreBackedCheck {
@@ -422,6 +436,7 @@ impl StoreBackedCheck {
                 NamespaceEngine::with_core_hierarchy(),
             )),
             revocations: revocation::RevocationStore::new(),
+            read_replica: read_replica::AuthzReadReplica::new(),
         }
     }
 
@@ -464,6 +479,27 @@ impl StoreBackedCheck {
     /// bus consumer over the SAME index).
     pub fn index(&self) -> &ReverseIndex {
         &self.index
+    }
+
+    /// **The shared S5 authz read-replica (P-ID-16) this slot routes default-consistency reads to.**
+    /// A live service wires the SAME replica the primary's replication stream populates (via
+    /// [`read_replica::AuthzReadReplica::replicate`]); the routing decision is
+    /// [`StoreBackedCheck::route_read`].
+    pub fn read_replica(&self) -> &read_replica::AuthzReadReplica {
+        &self.read_replica
+    }
+
+    /// **The S5 consistency gate on the live read path (P-ID-16) — route a read to S5 or the primary.**
+    /// A `BoundedStale` (default-consistency) read routes to the stale-tolerant replica (the scaling
+    /// win: the high-QPS hot-path read comes off S5, relieving the primary `check`/`list_objects`); a
+    /// `Strong` (zookie-stamped) read BYPASSES S5 to this engine's primary read (read-your-writes /
+    /// the new-enemy guard — S5 is never read on a `Strong` request). This is the SAME zookie-bypass
+    /// split S6 (P-ID-15) and S8's watermark path (P-ID-12) enforce, here for the replica. The caller
+    /// reads S5 ([`read_replica::AuthzReadReplica::read`]) on [`read_replica::ReadRoute::Replica`] and
+    /// runs the authoritative primary [`StoreBackedCheck::check`]/[`StoreBackedCheck::list_objects`] on
+    /// [`read_replica::ReadRoute::Primary`] — one primitive, no bespoke replica read path.
+    pub fn route_read(&self, at: &Consistency) -> read_replica::ReadRoute {
+        self.read_replica.route(at)
     }
 
     /// **Build the S6 fail-static availability cache (P-ID-15) in front of THIS `check` engine.** The
@@ -1053,6 +1089,46 @@ mod tests {
             ),
             "an un-granted subject is denied through the same seam (fail-closed)"
         );
+    }
+
+    /// **S5 (P-ID-16) is wired to the live read path: a default-consistency read routes to the
+    /// replica, a zookie-stamped read bypasses it to the primary.** The `StoreBackedCheck`'s shared S5
+    /// is the SAME replica the primary's replication stream populates; the consistency gate on the
+    /// live read path (`route_read`) is the load-bearing scaling decision (the ID-4 first scaling
+    /// move). 0 writes to S5 (the replica is read-only) and a strong read never consults the replica.
+    #[test]
+    fn s5_routes_default_consistency_reads_and_bypasses_strong_reads() {
+        use myelin_events::OutboxStore;
+        use myelin_storage::TenantScope;
+
+        let store = TupleStore::new(OutboxStore::new());
+        let slot = StoreBackedCheck::new(store);
+        let acme = TenantScope::from_verified_token(&principal(), principal().region.clone());
+
+        // The primary replicates a coarse authz read row into S5 (S5 follows the primary).
+        slot.read_replica()
+            .replicate(&acme, "add", read_replica::ReplicaRow { key: "p:alice".into(), value: "active".into() }, 5);
+
+        // A default-consistency read routes to S5 (the scaling win) and the row is served off it.
+        let stale = Consistency {
+            at_least: myelin_identity::Zookie(String::new()),
+            mode: myelin_identity::ConsistencyMode::BoundedStale,
+        };
+        assert!(slot.route_read(&stale).is_replica(), "a default-consistency read is served from S5");
+        assert!(
+            slot.read_replica().read(&acme, "p:alice").is_some(),
+            "the replicated row is served off the stale-tolerant replica"
+        );
+
+        // A zookie-stamped read BYPASSES S5 to the primary (read-your-writes / new-enemy guard).
+        let strong = Consistency {
+            at_least: myelin_identity::Zookie("zk-00000000000000000005".into()),
+            mode: myelin_identity::ConsistencyMode::Strong,
+        };
+        assert!(slot.route_read(&strong).is_primary(), "a zookie-stamped read bypasses S5 to the primary");
+
+        // 0 writes to S5: the replica is read-only (the only mutator is replication from the primary).
+        assert!(slot.read_replica().reject_write().is_err(), "S5 is read-only (a write attempt errors)");
     }
 
     /// `list_objects` errors loudly (NotYetImplemented) — a non-existent leak-free pre-filter must
