@@ -153,8 +153,8 @@ cdc = ["crates/myelin-events/tests/cdc_2_8_upcaster.rs"]
 [[contract]]
 row = "2.9"
 title = "event taxonomy + token table"
-status = "deferred"
-landing = "P-042"
+status = "covered"
+cdc = ["crates/myelin-events/tests/cdc_2_9_taxonomy.rs"]
 
 # ──────────────── §3 Signals, Automations, Triggers & the firehose (Bus) ────────────────────────
 
