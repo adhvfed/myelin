@@ -178,6 +178,23 @@
 //!   is the M6 dogfood CI gate (**P-S37**); it is not run in this prompt's environment. The
 //!   lifecycle is covered by unit + CDC tests that chain boot → emit → consume → drain
 //!   end-to-end (a sequence property, EI-01 §4); the mutation run is named as the M6 gate.
+//!
+//! ## Status (P-S23 → P-041, 2026-06-19) — the shared overlay/state primitives DONE (contract)
+//! The **shared overlay/state primitives** (the design-system bug-class floor, SUB-M0 item 5) are
+//! shipped in [`overlay`] as the **stack-agnostic CONTRACT + invariants**, because Myelin has no
+//! chosen frontend stack at M0 (the P-S23 prompt's explicit "if the frontend stack is not yet
+//! chosen, ship the primitive CONTRACT" branch). The three EI-01 §4 recurring bug-classes are each
+//! foreclosed as a TESTED structural guarantee, not prose: (1) **off-screen-picker** →
+//! [`overlay::place_overlay`] returns a rect ALWAYS contained by the viewport (flip-then-clamp);
+//! (2) **clipped-dialog** (+ the "control unreachable on a phone" sibling) →
+//! [`overlay::center_dialog`] shrinks-to-fit rather than clipping + [`overlay::reachable_within`];
+//! (3) **focus-leak** → [`overlay::FocusTrap`] is a closed cyclic ring focus can never escape. The
+//! invariant unit tests (`overlay::tests`, incl. the exhaustive on-screen sweep + the mixed-key
+//! focus-never-leaks sequence) are the dated green artifact. **Floor named:** the **rendering
+//! binding** (mapping these rects + this focus order onto the chosen frontend toolkit's real
+//! layout/portal/focus APIs) lands with the **first frontend-bearing subsystem (M3+)** — the
+//! design-system pass (**GIT-P7 / P-233** and the Knowledge/Issues design-system passes). Every
+//! frontend feature from M3 on builds on THESE primitives (EI-01 §7: abstract once, here).
 
 use serde::{Deserialize, Serialize};
 
@@ -187,6 +204,7 @@ pub mod fail_static;
 pub mod holders;
 pub mod metrics_health;
 pub mod migrations;
+pub mod overlay;
 pub mod serve;
 pub mod shed;
 pub mod thresholds;
@@ -209,6 +227,10 @@ pub use metrics_health::{
 pub use migrations::{
     is_blocking_alter, is_destructive, HotTables, Migration, MigrationPhase, MigrationRunner,
     Migrations,
+};
+pub use overlay::{
+    center_dialog, place_overlay, reachable_within, FocusId, FocusMove, FocusTrap, Placement, Px,
+    Rect, Side,
 };
 pub use serve::{
     boot, serve, AppSpec, ConsumerReg, HoldersSpec, InternalRpc, OutboxSpec, PortOpener,
