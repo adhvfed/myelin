@@ -40,8 +40,23 @@ myelin-tenancy = { path = "../myelin-tenancy" }
 # (contract 1.4) so the harness's one-door discipline covers it, even though its DSR surface is a
 # tenant-record-only holder (no in-region PII).
 myelin-gdpr = { path = "../myelin-gdpr" }
+# The storage SUBSTRATE crate (P-ST-01..P-061). Cell-provisioning gating (P-CP-11 / P-083) CONSUMES
+# two storage contracts: 11.5 — the restore-verify gate (`RestoreVerifyGate`/`GateInputs`/
+# `GateVerdict`) as the cell-READINESS gate (a cell does not go `Active` until its backup is proven
+# whole), and 11.3 — `KmsEngine::destroy_kek` (the tenant-decommission crypto-shred lever). This is a
+# CDC-consumer edge (contract 11.5/11.3), NOT a re-implementation — there is ONE durability gate in the
+# platform (coherence, EI-01 §7). `myelin-storage` is the harness-wired storage substrate (a documented
+# §2.9 DAG extension, below gdpr); a SERVICE crate consuming it is established precedent
+# (myelin-identity-service depends on it too). cargo build stays DB-free: the gate is modeled
+# (in-memory clean target), the real `pg_restore` driver is the named Storage floor P-S12/P-S15.
+myelin-storage = { path = "../myelin-storage" }
 
 [dev-dependencies]
 # Principal/PrincipalId/PrincipalKind — used only to construct a `SubjectRef` in the DSR-surface
 # test (the control-plane holder's surface is empty by construction). DEV-only.
 myelin-identity = { path = "../myelin-identity" }
+# The drill harness (SignalSource/SignalName/Predicate) — the CP-D6 drill emits its dated green
+# artifact through the SAME telemetry the other drills use (observability is part of the pass, EI-01
+# §3). DEV-only — myelin-harness never enters the service production DAG (a test-support crate above
+# the substrate).
+myelin-harness = { path = "../myelin-harness" }

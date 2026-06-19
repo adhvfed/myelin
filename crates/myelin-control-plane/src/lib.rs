@@ -77,17 +77,27 @@
 //!   named Storage-driver floor — the invariant logic + the region-immutability discipline here are
 //!   real + tested now and do not change shape when the driver lands (mirrors how
 //!   `myelin-storage`'s migration runner validates in code while the DDL executes through the pool).
-//! - **Cell-provisioning gating (CP-D6)** — a cell does not go `Active` until restore-verify +
-//!   readiness pass — is the next floor **P-CP-11**; here the `cell_provisioning` log records the
-//!   steps + the `CellStatus::Provisioning → Active` states exist, but the *gating* is P-CP-11.
+//! - **Cell-provisioning gating (CP-D6) is LIVE (P-CP-11 / P-083, [`provision`]).** A cell does not
+//!   go `Active` until it passes **restore-verify** (the storage [`myelin_storage::RestoreVerifyGate`],
+//!   contract 11.5) **+ readiness** (the cell's [`myelin_substrate::MetricsHealthSurface`]); a failing
+//!   cell stays `Provisioning` (0 traffic — the place path filters on `Active`). Tenant decommission
+//!   crypto-shreds the tenant KEK ([`myelin_storage::KmsEngine::destroy_kek`], 11.3). **FLOOR:**
+//!   provisioning is a SCRIPTED procedure on this M1 floor; the durable-workflow promotion (the same
+//!   gating under `myelin-flow`'s `DurableExecutor`, 9.1, M2) is **P-CP-22**'s re-confirmation. The
+//!   `cell_provisioning` log records each gating step.
 
 pub mod discover;
 pub mod holder;
 pub mod place;
+pub mod provision;
 pub mod registry;
 pub mod schema;
 
 pub use discover::{DiscoverKey, DiscoveryCache, DiscoverySignals, RouteTuple};
+pub use provision::{
+    ProvisionFailure, ProvisionVerdict, ProvisioningGate, ProvisioningSignals, STEP_ACTIVATE,
+    STEP_READINESS, STEP_RESTORE_VERIFY,
+};
 pub use place::{
     CounterMinter, PlaceError, PlacementAnswer, PlacementService, PlacementSignals, TokenMinter,
 };
