@@ -49,14 +49,23 @@ use serde::{Deserialize, Serialize};
 /// site is `myelin-tenancy` (the DAG sink) — see the crate-level DAG-deviation note.
 pub use myelin_tenancy::ArtifactRef;
 
+/// Re-export of the `CorrelationId` value type so `myelin_events::CorrelationId` (and
+/// `envelope::CorrelationId`) stays the frozen path (the envelope's causal-root field, 2.1).
+/// As of P-CP-02 (P-027) the definition site is `myelin-tenancy` (the DAG sink): the SAME
+/// `CorrelationId` is also the `correlation_id` field of the frozen `CrossCellPointer` frame
+/// (contract 12.6, §6.1), which is owned in tenancy. To keep exactly ONE `CorrelationId`
+/// platform-wide (EI-01 §7 coherence — never a second definition), the type is defined in the
+/// sink and re-exported here unchanged (same derive set, no `Ord`). Mirrors the `ArtifactRef`
+/// DAG-deviation: `myelin-tenancy` is below `myelin-events`, so the shared type must live below.
+pub use myelin_tenancy::CorrelationId;
+
 /// The event idempotency key — a ULID (architecture §2.1; ADR-04.1). String-backed in
 /// the skeleton; the ULID newtype + ordering invariants land with the outbox (P-S07).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct EventId(pub String);
 
-/// The causal-root id (architecture §2.1; BUS-5). Carries through a whole causal chain.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct CorrelationId(pub String);
+// `CorrelationId` is defined in `myelin-tenancy` (the DAG sink) and re-exported above — it is
+// shared with the `CrossCellPointer` frame (contract 12.6). See the re-export note.
 
 /// The distinct human-action / session ref (architecture §2.1; BUS-5 `caused_by`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
