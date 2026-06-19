@@ -80,6 +80,13 @@ static_max_default_secs = 300    # the engineering SEED the mechanism is drilled
 agent_token_ttl_secs = 60
 # The constraint that ships regardless and is enforced structurally in the constructor (P-S18):
 constraint = "static_max <= revocation-SLA AND static_max >= agent-token-TTL"
+# CONSUMERS (confirmed in place — never re-defined): the W bound is consumed by Identity's S6
+# fail-static availability cache (P-ID-15 / P-073, `failstatic_cache::FailStaticCache`), which reads
+# this row + the `[revocation]` SLA and constructs `FailStatic<CoarseGrant>` against them (so a
+# `static_max > revocation-SLA` window cannot be built). The ID-D2 drill asserts authenticated
+# traffic survives a hiccup on the coarse grant + a just-revoked subject is denied through S6;
+# `staleness_age ≤ static_max ≤ revocation-SLA` is the green-artifact bound. The DPO ratification of
+# the *number* W stays the `[OPEN — LEGAL]` L-1 follow-on (parallel legal — the floor does not wait).
 
 # ---------------------------------------------------------------------------------------------
 # [rpo_rto] — the durability objectives the restore-verify gate (STOR-D1/D2, SUB-D6) asserts.

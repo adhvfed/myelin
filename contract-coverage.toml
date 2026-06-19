@@ -290,14 +290,23 @@ cdc = ["crates/myelin-identity-service/tests/cdc_4_9_namespace_engine.rs"]
 [[contract]]
 row = "4.10"
 title = "Consistency / zookie semantics"
-status = "deferred"
-landing = "P-073"
+# COVERED by P-ID-15 / P-073: the zookie-bypass-S6 half (a `Strong`/zookie-stamped read BYPASSES
+# the fail-static cache and is fail-closed-or-wait; a default-consistency `BoundedStale` read is
+# served static during a hiccup). The read-your-writes / S8-watermark half rides the 4.6 write-half
+# pair + P-070 (P-ID-12); this row's fail-static-bypass consumer+provider pair ships in the 4.11 CDC.
+status = "covered"
+cdc = ["crates/myelin-identity-service/tests/cdc_4_11_fail_static.rs"]
 
 [[contract]]
 row = "4.11"
 title = "FailStatic bound (Id usage)"
-status = "deferred"
-landing = "P-073"
+# COVERED by P-ID-15 / P-073: S6 (the fail-static availability cache) + the structural bound
+# `static_max ≤ revocation-SLA ≥ agent-token-TTL` (W = 5 min default-to-beat, `[OPEN — LEGAL]` L-1).
+# PROVIDER = Identity's S6 (`failstatic_cache::FailStaticCache` over the M0 `FailStatic<T>`);
+# CONSUMER = a critical-dep caller wrapping `check` in the `ResilientClient` (1.9) + S6 (1.10),
+# surviving a transient Id hiccup on the coarse grant. The number W stays the L-1 legal follow-on.
+status = "covered"
+cdc = ["crates/myelin-identity-service/tests/cdc_4_11_fail_static.rs"]
 
 # ──────────────── §5 ArtifactRef, refs & projection (myelin-refs) + Git<->CI check seam ─────────
 
