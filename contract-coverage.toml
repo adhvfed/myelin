@@ -567,8 +567,8 @@ cdc = ["crates/myelin-gdpr-service/tests/cdc_10_1_holder_bodies.rs"]
 [[contract]]
 row = "10.2"
 title = "#[personal_data(...)] classify-derive"
-status = "deferred"
-landing = "P-107"
+status = "covered"
+cdc = ["crates/myelin-gdpr/tests/cdc_10_2_classify_derive.rs"]
 
 [[contract]]
 row = "10.3"

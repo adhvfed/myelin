@@ -1893,6 +1893,11 @@ dependencies = [
 [[package]]
 name = "myelin-gdpr-macros"
 version = "0.0.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "myelin-gdpr-service"

@@ -61,6 +61,13 @@
 //! type). The lone external consumer of the old shape (`myelin-storage`'s holder hook) is
 //! reconciled to the new shape in the same change (one whole-workspace contract PR).
 
+// The `#[derive(PersonalData)]` macro (P-GA-07) generates code that names the absolute path
+// `::myelin_gdpr::HasPersonalData` / `::myelin_gdpr::PersonalDataField` (so a CONSUMER crate
+// resolves it through its `myelin-gdpr` dependency). For the derive to also work on THIS crate's
+// own types (the `classify_fixture` + the in-crate tests), the crate must be able to name itself
+// by that path — `extern crate self as myelin_gdpr` makes `::myelin_gdpr` a valid self-reference.
+extern crate self as myelin_gdpr;
+
 use myelin_identity::Principal;
 use myelin_tenancy::TenantId as TenancyTenantId;
 use serde::{Deserialize, Serialize};
@@ -72,11 +79,28 @@ use serde::{Deserialize, Serialize};
 /// A schema owner writes `use myelin_gdpr::PersonalData;`, derives it on the struct, and tags
 /// every personal-data field with `#[personal_data(...)]`; the helper arguments reference the five
 /// tag enums frozen in this crate ([`DataCategory`], [`DataRole`], [`LawfulBasis`],
-/// [`RetentionClass`], [`ErasureMethod`]). **Floor (P-GA-02 / P-050):** the derive is a NO-OP (it
-/// emits nothing; the helper is inert) — it freezes the NAMES; the body that emits the
-/// compile-time registry entry the data map (P-GA-09) walks is **M1 P-GA-04 / P-GA-07**. See the
-/// `myelin-gdpr-macros` crate doc for the no-op contract + the derive-with-helper reconciliation.
+/// [`RetentionClass`], [`ErasureMethod`]).
+///
+/// **P-GA-07 / P-107 — the macro BODY.** The derive is no longer a no-op: it now
+/// 1. **emits a generated registry entry** per tagged field — a `&'static [`[`PersonalDataField`]`]`
+///    (field path, owning store, the five tag values, the `subject_locator` expression) reachable
+///    via the generated [`HasPersonalData::personal_data_fields`] impl — the compile-time inventory
+///    the data-map generator (P-GA-09) walks;
+/// 2. makes **`subject_locator` structural** — it generates [`HasPersonalData::subject_locator`],
+///    the accessor a holder's `locate(subject)` uses to read the subject-key column off a row;
+/// 3. **rejects an untagged PII field at compile time** — a field whose name is a PII fingerprint
+///    (`email`, `display_name`, …) that carries no `#[personal_data(...)]` tag is a hard
+///    `compile_error!` (the type-system form of the `no-untagged-personal-data` lint, the floor the
+///    lint named landing in P-107).
+///
+/// See the `myelin-gdpr-macros` crate doc for the parsing grammar + the
+/// `::myelin_gdpr::__registry::*` path the generated code resolves through this crate.
 pub use myelin_gdpr_macros::PersonalData;
+
+pub mod __registry;
+pub use __registry::{
+    ErasureKeyClass, HasPersonalData, PersonalDataField, PersonalDataTags, SpecialCategoryFlag,
+};
 
 /// The canonical tenant partition key (re-exported from `myelin-tenancy`, the owning sink
 /// crate). The GDPR contract surface (gdpr §3.1) threads `tenant: TenantId` through the holder
@@ -734,4 +758,178 @@ mod tests {
             "\"PurgeReindex\""
         );
     }
+
+    // ───────────────────── P-GA-07 / P-107 — the classify-derive macro BODY ─────────────────────
+
+    /// The derive EMITS a complete generated registry entry for each of the five tag axes (gdpr
+    /// §2.2; the compile-time inventory the data-map generator P-GA-09 walks). One struct exercises
+    /// every category / role / basis / retention / erasure variant FORM across its fields; the
+    /// derive captures each tag's text into a [`PersonalDataField`] and the impl exposes them as a
+    /// `&'static` slice. This is the registry-emission proof + the mutation-core path (the
+    /// tag-parsing + registry-emission body): if the macro dropped or mis-captured a tag, a field's
+    /// entry would be wrong here.
+    #[test]
+    fn derive_emits_a_complete_registry_entry_for_every_tag_form() {
+        #[derive(PersonalData)]
+        #[allow(dead_code)]
+        struct EveryTag {
+            // category=ContactInfo, role=TenantContent, basis=Contract, retention=TenantPolicy,
+            // erasure=Pseudonymise (a bare variant on every axis + a literal locator).
+            #[personal_data(
+                category = ContactInfo,
+                role = TenantContent,
+                basis = Contract,
+                retention = TenantPolicy,
+                erasure = Pseudonymise,
+                subject_locator = "principal_id"
+            )]
+            contact: String,
+            // category=SpecialCategory(health) (a CALL-form category — the DPIA route),
+            // basis=Consent(c-1), retention=Fixed(90d) (a NON-Rust-expr payload `90d`),
+            // erasure=CryptoShred(subject_dek) (the GD-4 key class).
+            #[personal_data(
+                category = SpecialCategory(health),
+                role = PlatformOperational,
+                basis = Consent(c-1),
+                retention = Fixed(90d),
+                erasure = CryptoShred(subject_dek),
+                subject_locator = "subject_ref"
+            )]
+            sensitive: String,
+            // basis=LegitimateInterest(ops_lia) (a bare-ident payload), retention=UntilContractEnd,
+            // erasure=PurgeReindex (the derived-store rebuild method).
+            #[personal_data(
+                category = Identifier,
+                role = TenantContent,
+                basis = LegitimateInterest(ops_lia),
+                retention = UntilContractEnd,
+                erasure = PurgeReindex,
+                subject_locator = "id"
+            )]
+            handle: String,
+            // A non-PII untagged field is fine — it carries no personal data, so no entry.
+            row_version: u64,
+        }
+
+        let fields = EveryTag::personal_data_fields();
+        assert_eq!(fields.len(), 3, "one entry per TAGGED field, the non-PII field has none");
+
+        // The owning struct + field path is captured on every entry.
+        assert!(fields.iter().all(|f| f.owning_struct == "EveryTag"));
+        let by_field: std::collections::HashMap<&str, &PersonalDataField> =
+            fields.iter().map(|f| (f.field, f)).collect();
+
+        // Field 1 — every-bare-variant form, captured verbatim.
+        let contact = by_field["contact"];
+        assert_eq!(contact.tags.category, "ContactInfo");
+        assert_eq!(contact.tags.role, "TenantContent");
+        assert_eq!(contact.tags.basis, "Contract");
+        assert_eq!(contact.tags.retention, "TenantPolicy");
+        assert_eq!(contact.tags.erasure, "Pseudonymise");
+        // subject_locator is the LITERAL'S INNER VALUE (the column name a holder reads).
+        assert_eq!(contact.tags.subject_locator, "principal_id");
+
+        // Field 2 — call-form payloads captured as whitespace-free text; the routing extractors work.
+        let sensitive = by_field["sensitive"];
+        assert_eq!(sensitive.tags.category, "SpecialCategory(health)");
+        assert_eq!(sensitive.tags.basis, "Consent(c-1)");
+        assert_eq!(sensitive.tags.retention, "Fixed(90d)"); // `90d` is NOT a Rust expr — captured as text.
+        assert_eq!(sensitive.tags.erasure, "CryptoShred(subject_dek)");
+        // The GD-4 key choice + the DPIA route are structural off the captured text.
+        assert_eq!(sensitive.erasure_key_class(), Some(ErasureKeyClass::SubjectDek));
+        assert_eq!(
+            sensitive.is_special_category(),
+            Some(SpecialCategoryFlag { kind: "health" })
+        );
+
+        // Field 3 — a bare-ident payload (`LegitimateInterest(ops_lia)`) captured intact.
+        let handle = by_field["handle"];
+        assert_eq!(handle.tags.basis, "LegitimateInterest(ops_lia)");
+        assert_eq!(handle.tags.erasure, "PurgeReindex");
+        assert_eq!(handle.erasure_key_class(), None); // PurgeReindex names no key class.
+        assert_eq!(handle.is_special_category(), None);
+    }
+
+    /// `subject_locator` is STRUCTURAL (gdpr §2.1): the derive generates the accessor a holder's
+    /// `locate(subject)` uses to find the subject-key column off a row. The accessor resolves a
+    /// tagged field's locator and returns `None` for an unknown/untagged field.
+    #[test]
+    fn subject_locator_accessor_is_structural() {
+        // The real S1-shaped fixture (`classify_fixture::ContactRecord`) carries `email` tagged
+        // with `subject_locator = "id"`.
+        use classify_fixture::ContactRecord;
+        assert_eq!(ContactRecord::subject_locator("email"), Some("id"));
+        // An untagged / unknown field resolves to no locator.
+        assert_eq!(ContactRecord::subject_locator("id"), None);
+        assert_eq!(ContactRecord::subject_locator("does_not_exist"), None);
+        // The registry over the fixture has exactly the one tagged field.
+        let fields = ContactRecord::personal_data_fields();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].field, "email");
+        assert_eq!(fields[0].tags.erasure, "CryptoShred(subject_dek)");
+    }
+
+    /// A struct with NO tagged field still implements `HasPersonalData` with an empty registry —
+    /// the derive is UNIFORM (every `PersonalData` type is walkable by P-GA-09; an empty entry set
+    /// is the truthful "this struct carries no PII" answer, not a missing impl). Covers both the
+    /// named-struct-no-tags path AND the tuple/unit-struct path (which the macro routes through its
+    /// own `empty_impl` — both MUST yield a real, callable `HasPersonalData` impl, never a no-op).
+    #[test]
+    fn derive_is_uniform_empty_registry_for_a_pii_free_struct() {
+        // Named struct, no tagged fields → the main path with an empty entry set.
+        #[derive(PersonalData)]
+        #[allow(dead_code)]
+        struct NoPii {
+            id: u64,
+            region: String,
+        }
+        // The impl EXISTS and is callable (if the derive emitted nothing, this would not compile).
+        assert!(NoPii::personal_data_fields().is_empty());
+        assert_eq!(NoPii::subject_locator("id"), None);
+
+        // Tuple struct → the macro's `empty_impl` path. It too MUST yield a real impl (the derive
+        // is uniform); a no-op there would fail to resolve `personal_data_fields` and not compile.
+        #[derive(PersonalData)]
+        #[allow(dead_code)]
+        struct TupleRow(u64, String);
+        assert!(TupleRow::personal_data_fields().is_empty());
+        assert_eq!(TupleRow::subject_locator("0"), None);
+
+        // Unit struct → also the `empty_impl` path.
+        #[derive(PersonalData)]
+        struct UnitRow;
+        assert!(UnitRow::personal_data_fields().is_empty());
+    }
 }
+
+/// **The type-system form of the `no-untagged-personal-data` lint** (P-GA-07 / P-107 — the floor
+/// `myelin-lints` named landing here). A struct that DERIVES `PersonalData` with a PII-named field
+/// (`email`) carrying NO `#[personal_data(...)]` tag is a HARD COMPILE ERROR — the un-erasable /
+/// un-mapped subject bug class cannot compile. This `compile_fail` doc-test is the RED fixture
+/// (the macro fires); the GREEN fixture is every M1 store + `classify_fixture::ContactRecord`
+/// (which compile, the tag present). The two together are the derive-face of GA-D5.
+///
+/// ```compile_fail
+/// use myelin_gdpr::PersonalData;
+/// // An `email` field deriving PersonalData with NO `#[personal_data(...)]` tag must FAIL to
+/// // compile — the macro refuses to expand an untagged PII column.
+/// #[derive(PersonalData)]
+/// struct Leaky {
+///     email: String,
+/// }
+/// ```
+///
+/// The contrasting GREEN form compiles (the same field, tagged):
+/// ```
+/// use myelin_gdpr::PersonalData;
+/// #[derive(PersonalData)]
+/// struct Tagged {
+///     #[personal_data(
+///         category = ContactInfo, role = TenantContent, basis = Contract,
+///         retention = TenantPolicy, erasure = CryptoShred(subject_dek),
+///         subject_locator = "id",
+///     )]
+///     email: String,
+/// }
+/// ```
+pub mod untagged_pii_rejection_doc {}
