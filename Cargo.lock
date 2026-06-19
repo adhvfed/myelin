@@ -328,6 +328,7 @@ name = "myelin-identity-service"
 version = "0.0.0"
 dependencies = [
  "myelin-events",
+ "myelin-gdpr",
  "myelin-identity",
  "myelin-storage",
  "myelin-substrate",

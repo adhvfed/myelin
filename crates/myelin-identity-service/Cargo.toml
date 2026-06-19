@@ -53,3 +53,9 @@ myelin-storage = { path = "../myelin-storage" }
 # refs + the zookie watermark, never PII) built with `serde_json::json!`. The whole workspace
 # shares one serde_json::Value shape behind EventEnvelope.payload (workspace.dependencies).
 serde_json = { workspace = true }
+# P-ID-05 (P-064): the S1 principal store tags every PII column with the frozen
+# `#[personal_data(...)]` attribute (contract 10.2) referencing the five-tag classification enums
+# (DataCategory/DataRole/LawfulBasis/RetentionClass/ErasureMethod) so the no-untagged-personal-data
+# lint (contract 1.6) is GREEN on S1 and the store compiles against the FROZEN tags (never drift).
+# The PersonalDataHolder trait id the S1 store registers under also lives here (10.1).
+myelin-gdpr = { path = "../myelin-gdpr" }
