@@ -53,15 +53,51 @@
 //! way into a loop (EI-02 §6). There is no `publish_now` on `OutboxTx`; the only verb is
 //! `emit` (the `no-raw-publish` lint, P-S10, enforces the absence workspace-wide).
 //!
+//! ## Status (P-S07, 2026-06-19) — the `outbox` table + the relay (SUB-D1 / BUS-D4)
+//! The `outbox` table (contract 2.3) + the same-transaction co-commit + the relay are
+//! **implemented** (see [`outbox`] + [`relay`]). [`OutboxTx::emit`] now has a concrete
+//! implementer ([`outbox::OutboxTransaction`]) that mints the stable ULID, derives via
+//! [`derive_envelope`], assigns the per-aggregate `seq`, and BUFFERS the row into the open
+//! transaction — durable iff the transaction commits ([`outbox::OutboxTransaction::commit`]),
+//! published nowhere if it is dropped (emit-iff-committed, **BUS-D4**, structural). The
+//! [`relay::Relay`] claims unsent rows with the `FOR UPDATE SKIP LOCKED` discipline, publishes
+//! via [`relay::BusTransport`] with `dedup_id = event_id` (the stable broker-side dedup → 0
+//! ghost), marks sent, and dead-letters after [`relay::MAX_PUBLISH_ATTEMPTS`]; a killed relay
+//! re-claims the unsent rows → 0 lost (**SUB-D1**). `outbox_depth` + the dead-letter count are
+//! exported ([`outbox::OutboxStore::outbox_depth`] / `dead_letter_count`). **This is a
+//! PERMANENT gate (re-run on every emit-path change).**
+//!
 //! ## Floors named (stubbed bodies → filling prompt)
-//! - The `outbox` table + the same-transaction insert + the relay (2.3, SUB-D1/BUS-D4)
-//!   is **P-S07** — `OutboxTx::emit`'s body (which pulls the ambient [`EmitContext`] from
-//!   the transaction handle, calls [`derive_envelope`], and inserts the row) lands there;
-//!   the trait method has no default body here because the storage handle is P-S07's.
-//! - The `EventHandler` consumer runtime + `consumer_dedup` ledger (2.5, SUB-D2) is
-//!   **P-S08**; the upcaster registry (2.8) is **P-S09**. Bodies here are `todo!()`.
+//! - **The OLTP binding is modeled in-memory at M0.** There is no live database (the OLTP tier
+//!   client is **P-007 / P-ST-01**; the migration runner is **P-S15**). [`outbox::OUTBOX_MIGRATION`]
+//!   is the frozen 2.3 DDL the runner will apply; [`outbox::OutboxStore`] models exactly its
+//!   semantics until then. The real `SELECT … FOR UPDATE SKIP LOCKED` + `INSERT` against the
+//!   Storage pool lands when the OLTP client is wired (P-007 + `serve` P-S12). See the
+//!   DEVIATION note in [`outbox`].
+//! - **The real `BusTransport` adapter is the Bus's M0 deliverable (EB-04 → P-013).** This
+//!   prompt ships the trait + an in-process fake ([`relay::InProcessBus`]); EB-04 builds the
+//!   JetStream-class reference impl on the SAME `put/consume/ack/purge` shape (+ the 24h GC,
+//!   the `dlq.<tenant>.<subsystem>` subject, the dead-letter Signal alert).
+//! - **The single-region event log → column-store seam** is the post-M5 follow-on (the
+//!   `BusTransport` trait IS that seam; promoted only when volume is measured; named in EB-31).
+//! - **The ULID source** is the injected [`outbox::IdMinter`] ([`outbox::MonotonicMinter`] is
+//!   the deterministic floor); the real wall-clock+random ULID source wires at **P-S12**.
+//! - The `EventHandler` consumer runtime + `consumer_dedup` ledger (2.4/2.5, SUB-D2) is
+//!   **P-S08** (re-confirms SUB-D1 end-to-end through a consumer); the upcaster registry (2.8)
+//!   is **P-S09**.
 //! - `pii_key_ref`'s KMS hierarchy (the DEK epochs) is Storage M1 (11.3); P-001 ships
 //!   only the field + its format.
+
+pub mod outbox;
+pub mod relay;
+
+pub use outbox::{
+    EmitContextBase, IdMinter, MonotonicMinter, OutboxRow, OutboxStore, OutboxTransaction, Ulid,
+    OUTBOX_MIGRATION,
+};
+pub use relay::{
+    BusTransport, Delivery, DrainReport, InProcessBus, Relay, TransportError, MAX_PUBLISH_ATTEMPTS,
+};
 
 use myelin_identity::Principal;
 use myelin_tenancy::{Region, TenantId};

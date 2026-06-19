@@ -15,3 +15,15 @@ myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-identity = { path = "../myelin-identity" }
 serde.workspace = true
 serde_json.workspace = true
+
+# TEST-SUPPORT ONLY (dev-dependency, P-S07). The SUB-D1 / BUS-D4 drill scenarios ride the
+# P-S03 scoped-reversible dependency-break injector (Dependency::Broker) + the P-S04
+# telemetry-assertion library (outbox_depth / dead_letter_count signals), exactly as the
+# prompt's TESTS field requires. This is a DEV-dependency, never a normal one: myelin-harness
+# is the leaf TEST-SUPPORT crate (it depends on -identity + -tenancy, both BELOW events), and
+# nothing in the production crate DAG (architecture §2.9) depends on it. A dev-only edge
+# events → harness pulls test machinery into the test build only and forms NO production
+# cycle (harness does not depend on events). The crate-graph-acyclic model (myelin-substrate)
+# continues to model the production crates only.
+[dev-dependencies]
+myelin-harness = { path = "../myelin-harness" }

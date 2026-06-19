@@ -47,6 +47,7 @@ dependencies = [
 name = "myelin-events"
 version = "0.0.0"
 dependencies = [
+ "myelin-harness",
  "myelin-identity",
  "myelin-tenancy",
  "serde",
