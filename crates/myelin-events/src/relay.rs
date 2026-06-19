@@ -37,6 +37,31 @@
 //!   drain `outbox_depth → 0`. The drill ([`crate::outbox`] depth signal + the broker's
 //!   delivered-set) reads these.
 //!
+//! ## Status (P-013 / EB-04, 2026-06-19) — the relay refinements, reconciled in place
+//! EB-04 ("The FOR UPDATE SKIP LOCKED relay + the `BusTransport` trait, no-ghost/no-loss
+//! delivery") is the **event-bus ledger's framing of the SAME deliverable the substrate roadmap
+//! already shipped** (P-S07 / P-008 above): the global run order interleaves the two roadmaps,
+//! so the relay + the `BusTransport` seam are reached from both. Per the coherence rule (EI-01
+//! §7: never define a type twice, never build a parallel second implementation), EB-04
+//! **reconciles in place** — the [`Relay`], the [`BusTransport`] trait (`put/consume/ack/purge`),
+//! the `FOR UPDATE SKIP LOCKED` claim, the stable-`event_id` broker dedup (`Nats-Msg-Id`), the
+//! bounded retry → dead-letter, and the SUB-D1 / BUS-D4 drills are UNCHANGED. What EB-04 ADDS
+//! are the three refinements P-S07's `lib.rs` floor named as owed to EB-04 (arch §4.1's full
+//! relay sentence):
+//! - **The `dlq.<tenant>.<subsystem>` dead-letter subject + the dead-letter Signal alert**
+//!   ([`DeadLetterAlert`], [`Relay::dead_letter_alerts`]): when a row exhausts the retry bound
+//!   the relay now records a structured alert carrying the `dlq.<tenant>.<subsystem>` subject
+//!   (arch §4.1: "dead-letter to `dlq.<tenant>.<subsystem>` after N attempts with a Signal
+//!   alert"). A dead-letter is **never silent** — it is surfaced both in `dead_letter_count`
+//!   (the contract-1.8 signal) AND as an explicit operator alert.
+//! - **The 24h published-row GC** ([`Relay::gc_published`], [`OutboxStore::gc_published_before`]):
+//!   a row marked `published_at` is retained for the dedup/audit window and reaped after 24h
+//!   (arch §4.1: "GC published rows after 24h"). GC removes ONLY sent rows — it can never reap
+//!   an unsent row (0 lost is preserved by construction).
+//! - The EB-04 dated GATE artifact re-confirming SUB-D1 / BUS-D4 still read **0 ghost / 0 lost**
+//!   AFTER these refinements (`tests::eb04_*`) + the `BusTransport` put/consume CDC conformance
+//!   pair (`tests::cdc_bustransport_put_consume_conformance`).
+//!
 //! ## DEVIATION / FLOOR — modeled claim, not a real `SELECT … FOR UPDATE SKIP LOCKED`
 //! There is no live OLTP DB in M0 (P-007 / the `serve` pool P-S12). The relay's claim is
 //! modeled as an **atomic claim over the in-memory [`crate::outbox::OutboxStore`]**: a claimed
@@ -44,12 +69,16 @@
 //! property — no double-claim across replicas), and the claim is released on a failed attempt
 //! so the row is retried. The real SQL `SELECT … FOR UPDATE SKIP LOCKED` against the Storage
 //! pool lands when the OLTP tier client is wired (P-007 + `serve` P-S12); the relay's
-//! algorithm + the drilled property do not change. The 24h published-row GC + the
-//! `dlq.<tenant>.<subsystem>` subject naming + the Signal alert on dead-letter are EB-04's
-//! refinement of this floor (named, not silently skipped).
+//! algorithm + the drilled property do not change. **GC time model (EI-01 §1, written down):**
+//! M0 has no shared wall-clock (it is initialised in `serve`, P-S12), so [`Relay::gc_published`]
+//! takes the cutoff `published_before` (an RFC-3339 UTC `Timestamp`) from the caller and reaps
+//! rows whose `published_at < cutoff` by lexical comparison — valid because `Z`-suffixed RFC-3339
+//! UTC strings sort in time order (the same modeled-floor discipline the rest of the crate uses).
+//! The real GC sweep computes `cutoff = now() − 24h` from the `serve` clock; the algorithm + the
+//! "only-sent-rows-reaped" property do not change.
 
 use crate::outbox::{OutboxRow, OutboxStore};
-use crate::{ArtifactRef, EventEnvelope, EventId, Timestamp};
+use crate::{ArtifactRef, EventEnvelope, EventId, TenantId, Timestamp};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -258,6 +287,46 @@ impl BusTransport for Box<dyn BusTransport> {
 /// retry — never an unbounded retry-storm). EB-04 may tune this; the floor default is 5.
 pub const MAX_PUBLISH_ATTEMPTS: u32 = 5;
 
+/// The dead-letter alert the relay raises when a row exhausts [`MAX_PUBLISH_ATTEMPTS`] (EB-04,
+/// arch §4.1: "dead-letter to `dlq.<tenant>.<subsystem>` after N attempts with a Signal alert").
+/// A dead-letter is **never silent**: it is surfaced both as the `dead_letter_count` survival
+/// signal (contract 1.8) and as one of these explicit operator alerts, carrying the routing
+/// subject + the offending `event_id` so an operator can find and re-drive the row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeadLetterAlert {
+    /// The `dlq.<tenant>.<subsystem>` subject the dead row is routed to (see [`dlq_subject`]).
+    pub dlq_subject: String,
+    /// The dead-lettered event (the stable id — the operator's handle to the quarantined row).
+    pub event_id: EventId,
+    /// The tenant the row belonged to (the residency/partition key — alerts stay tenant-scoped).
+    pub tenant: TenantId,
+    /// The owning subsystem (the first dotted segment of the event `type`) — the DLQ stream key.
+    pub subsystem: String,
+    /// How many publish attempts were exhausted before the row was quarantined (== the bound).
+    pub attempts: u32,
+}
+
+/// The dead-letter subject for a tenant + subsystem (arch §4.1; the `dlq.<tenant>.<subsystem>`
+/// routing key the relay dead-letters a poison row to after the retry bound). Subsystem is the
+/// FIRST dotted segment of the event `type` (`<subsystem>.<artifact>.<event>`, §6.1) — e.g. an
+/// `issues.issue.created` row dead-letters to `dlq.acme.issues`.
+pub fn dlq_subject(tenant: &TenantId, subsystem: &str) -> String {
+    format!("dlq.{}.{}", tenant.0, subsystem)
+}
+
+/// The owning subsystem token of an event (the first dotted segment of its `type`, §6.1). An
+/// empty / malformed type yields `"unknown"` so a dead-letter is still routable (never dropped).
+fn subsystem_of(envelope: &EventEnvelope) -> String {
+    envelope
+        .type_
+        .0
+        .split('.')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
 /// The result of one relay drain pass.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct DrainReport {
@@ -281,6 +350,11 @@ pub struct Relay<T: BusTransport> {
     /// The `published_at` stamp source (a function so it is deterministic in tests; the real
     /// clock is wired at `serve` P-S12).
     clock: Box<dyn Fn() -> Timestamp + Send + Sync>,
+    /// The dead-letter alerts raised this relay's lifetime (EB-04). Each exhausted-retry row
+    /// pushes a [`DeadLetterAlert`] here (the `dlq.<tenant>.<subsystem>` Signal alert, arch §4.1)
+    /// — read by [`dead_letter_alerts`](Self::dead_letter_alerts) so an operator/drill sees that
+    /// a poison row was SURFACED, never silently dropped.
+    dead_letter_alerts: Arc<Mutex<Vec<DeadLetterAlert>>>,
 }
 
 impl<T: BusTransport> Relay<T> {
@@ -294,12 +368,34 @@ impl<T: BusTransport> Relay<T> {
             store,
             transport,
             clock: Box::new(clock),
+            dead_letter_alerts: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     /// The transport this relay publishes to (so a drill can sever/heal the in-process broker).
     pub fn transport(&self) -> &T {
         &self.transport
+    }
+
+    /// The dead-letter alerts this relay has raised (EB-04). A non-empty result means a poison
+    /// row exhausted the retry bound and was SURFACED (routed to `dlq.<tenant>.<subsystem>` +
+    /// alerted) — never silently lost. The `dead_letter_count` survival signal counts the same
+    /// rows; this carries the operator-facing routing detail.
+    pub fn dead_letter_alerts(&self) -> Vec<DeadLetterAlert> {
+        self.dead_letter_alerts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// **GC published rows older than `published_before` (EB-04, arch §4.1: "GC published rows
+    /// after 24h").** Reaps every row that has been published and whose `published_at` is
+    /// strictly before the cutoff (an RFC-3339 UTC `Timestamp`; the real sweep passes
+    /// `now() − 24h`). Returns the number of rows reaped. **0-lost invariant preserved:** GC only
+    /// ever removes rows that were already delivered (`published_at` is set) — it can never reap
+    /// an unsent row, so it cannot lose a not-yet-delivered event.
+    pub fn gc_published(&self, published_before: &Timestamp) -> usize {
+        self.store.gc_published_before(published_before)
     }
 
     /// **Drain pass: claim → publish → mark sent / dead-letter.** Claims every currently-unsent,
@@ -333,6 +429,19 @@ impl<T: BusTransport> Relay<T> {
                     let attempts = self.store.fail_attempt(&row.event_id);
                     if attempts >= MAX_PUBLISH_ATTEMPTS {
                         self.store.dead_letter(&row.event_id);
+                        // EB-04: route the poison row to dlq.<tenant>.<subsystem> + raise the
+                        // operator Signal alert — a dead-letter is SURFACED, never silent.
+                        let subsystem = subsystem_of(&row.envelope);
+                        self.dead_letter_alerts
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(DeadLetterAlert {
+                                dlq_subject: dlq_subject(&row.envelope.tenant, &subsystem),
+                                event_id: row.event_id.clone(),
+                                tenant: row.envelope.tenant.clone(),
+                                subsystem,
+                                attempts,
+                            });
                         report.dead_lettered += 1;
                     } else {
                         report.failed += 1;
@@ -417,9 +526,9 @@ impl OutboxStore {
     }
 
     /// Dead-letter a row (exhausted the retry bound): move it out of the live set into the
-    /// dead-letter list (the operator alert + the `dlq.<tenant>.<subsystem>` subject is EB-04's
-    /// refinement). It is no longer in `outbox_depth` (it is not lost — it is quarantined,
-    /// visibly, in `dead_letter_count`).
+    /// dead-letter list. The operator alert + the `dlq.<tenant>.<subsystem>` subject is raised by
+    /// the relay ([`Relay::drain_once`], EB-04). It is no longer in `outbox_depth` (it is not
+    /// lost — it is quarantined, visibly, in `dead_letter_count`).
     pub(crate) fn dead_letter(&self, id: &EventId) {
         let mut inner = self.lock_inner();
         if let Some(row) = inner.rows.remove(id) {
@@ -427,6 +536,28 @@ impl OutboxStore {
             inner.dead_letters.push(row);
         }
         inner.claimed.remove(id);
+    }
+
+    /// **GC published rows older than `cutoff` (EB-04, arch §4.1: "GC published rows after 24h").**
+    /// Removes every row whose `published_at` is set AND strictly lexically before `cutoff` (an
+    /// RFC-3339 UTC `Z`-suffixed `Timestamp` sorts in time order). Returns the count reaped.
+    ///
+    /// **0-lost preserved by construction:** the filter requires `published_at.is_some()`, so an
+    /// **unsent** row (`published_at IS NULL`, the rows `outbox_depth` counts) is NEVER reaped —
+    /// GC can only ever free already-delivered rows from the dedup/audit retention window.
+    pub(crate) fn gc_published_before(&self, cutoff: &Timestamp) -> usize {
+        let mut inner = self.lock_inner();
+        let reap: Vec<EventId> = inner
+            .rows
+            .values()
+            .filter(|r| r.published_at.as_ref().is_some_and(|p| p.0 < cutoff.0))
+            .map(|r| r.event_id.clone())
+            .collect();
+        for id in &reap {
+            inner.rows.remove(id);
+            inner.order.retain(|x| x != id);
+        }
+        reap.len()
     }
 }
 
@@ -833,5 +964,173 @@ mod tests {
 
         // ack is part of the frozen shape.
         bus.ack("indexer", &ids[1]);
+    }
+
+    // ===================================================================================
+    // EB-04 (P-013) — the relay refinements P-S07 floor-named as owed here: the
+    // dlq.<tenant>.<subsystem> dead-letter Signal alert, the 24h published-row GC, and the
+    // BusTransport put/consume CDC conformance pair + the SUB-D1/BUS-D4 re-confirm gate.
+    // ===================================================================================
+
+    /// `dlq_subject` builds the arch §4.1 routing key `dlq.<tenant>.<subsystem>` and
+    /// `subsystem_of` reads the FIRST dotted segment of the event `type` (§6.1). An
+    /// `issues.issue.created` row for tenant `acme` routes to `dlq.acme.issues`.
+    #[test]
+    fn eb04_dlq_subject_is_tenant_and_subsystem() {
+        assert_eq!(dlq_subject(&TenantId("acme".into()), "issues"), "dlq.acme.issues");
+        // subsystem is the first dotted segment of the type; a malformed/empty type is routable.
+        let store = OutboxStore::new();
+        let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
+        let ids = commit_n(&store, minter, 1, "issue:PROJ-1");
+        let row = store.row(&ids[0]).unwrap();
+        assert_eq!(subsystem_of(&row.envelope), "issues", "type 'issues.issue.eN' → 'issues'");
+    }
+
+    /// **EB-04 — a poison row that exhausts the retry bound is dead-lettered AND raises a
+    /// `dlq.<tenant>.<subsystem>` Signal alert (surfaced, never silent).** The broker is
+    /// permanently severed; after [`MAX_PUBLISH_ATTEMPTS`] the row dead-letters, `dead_letter_count`
+    /// counts it (contract-1.8 signal), AND the relay records a [`DeadLetterAlert`] carrying the
+    /// `dlq.acme.issues` subject + the offending event_id — the two surfacing paths arch §4.1
+    /// requires.
+    #[test]
+    fn eb04_dead_letter_raises_dlq_alert_surfaced_not_silent() {
+        let store = OutboxStore::new();
+        let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
+        let ids = commit_n(&store, minter, 1, "issue:PROJ-1");
+
+        let bus = InProcessBus::new();
+        bus.sever(); // broker permanently down for this row.
+        let relay = Relay::new(store.clone(), bus, clock);
+
+        // no alert before the bound is hit.
+        for _ in 0..(MAX_PUBLISH_ATTEMPTS - 1) {
+            relay.drain_once();
+        }
+        assert!(relay.dead_letter_alerts().is_empty(), "no alert before the retry bound");
+        // the bound-th pass dead-letters AND alerts.
+        relay.drain_once();
+
+        assert_eq!(store.dead_letter_count(), 1, "the row is dead-lettered (count signal)");
+        let alerts = relay.dead_letter_alerts();
+        assert_eq!(alerts.len(), 1, "exactly one dead-letter Signal alert raised");
+        assert_eq!(alerts[0].dlq_subject, "dlq.acme.issues", "routed to dlq.<tenant>.<subsystem>");
+        assert_eq!(alerts[0].event_id, ids[0], "the alert carries the offending event_id");
+        assert_eq!(alerts[0].tenant, TenantId("acme".into()));
+        assert_eq!(alerts[0].subsystem, "issues");
+        assert_eq!(alerts[0].attempts, MAX_PUBLISH_ATTEMPTS, "the bound was exhausted");
+    }
+
+    /// **EB-04 — the 24h published-row GC reaps only SENT rows past the cutoff; it can never reap
+    /// an unsent row (0 lost preserved).** Three rows: two published (one before the cutoff, one
+    /// after), one left unsent. GC with the cutoff reaps ONLY the old published row — the recent
+    /// published row and the unsent row both survive.
+    #[test]
+    fn eb04_gc_reaps_only_old_published_rows_never_unsent() {
+        let store = OutboxStore::new();
+        let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
+        let ids = commit_n(&store, minter, 3, "issue:PROJ-1");
+
+        // Mark row 0 published "long ago", row 1 published "just now"; leave row 2 unsent.
+        store.mark_published(&ids[0], Timestamp("2026-06-17T00:00:00Z".into())); // > 24h old
+        store.mark_published(&ids[1], Timestamp("2026-06-19T11:59:00Z".into())); // recent
+        assert_eq!(store.outbox_depth(), 1, "row 2 is still unsent");
+
+        // GC cutoff = now − 24h = 2026-06-18T12:00:00Z. Row 0 (06-17) is older → reaped; row 1
+        // (06-19) is newer → kept; row 2 is unsent → NEVER reaped.
+        let relay = Relay::new(store.clone(), InProcessBus::new(), clock);
+        let reaped = relay.gc_published(&Timestamp("2026-06-18T12:00:00Z".into()));
+
+        assert_eq!(reaped, 1, "only the >24h-old published row is GC'd");
+        assert!(store.row(&ids[0]).is_none(), "the old published row was reaped");
+        assert!(store.row(&ids[1]).is_some(), "the recent published row is retained");
+        assert!(store.row(&ids[2]).is_some(), "the UNSENT row is NEVER reaped (0 lost)");
+        assert_eq!(store.outbox_depth(), 1, "GC did not touch the unsent set");
+    }
+
+    /// **EB-04 — GC over a fully-drained outbox with an old cutoff frees the whole retention
+    /// window; an unsent outbox under any cutoff loses nothing.** Pins that GC's `published_at
+    /// IS NOT NULL` guard is load-bearing: a severed outbox (every row unsent) is untouched by GC.
+    #[test]
+    fn eb04_gc_never_reaps_a_severed_outbox() {
+        let store = OutboxStore::new();
+        let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
+        commit_n(&store, minter, 4, "issue:PROJ-1");
+        // nothing published — every row is unsent.
+        let relay = Relay::new(store.clone(), InProcessBus::new(), clock);
+        // even with a cutoff in the far future, no unsent row is reaped (0 lost).
+        let reaped = relay.gc_published(&Timestamp("2099-01-01T00:00:00Z".into()));
+        assert_eq!(reaped, 0, "an unsent outbox loses nothing to GC");
+        assert_eq!(store.outbox_depth(), 4, "all four rows still parked + deliverable");
+    }
+
+    /// **EB-04 — the BusTransport put/consume CDC conformance pair.** The frozen seam contract:
+    /// a `put(subject, envelope, dedup_id)` is observable by a `consume(subject_prefix)` that
+    /// returns the SAME wire envelope, in publish order, exactly once per distinct `dedup_id`
+    /// (the `Nats-Msg-Id = event_id` broker dedup). This is the conformance any BusTransport impl
+    /// (the in-process fake here; EB-04's JetStream-class adapter later) MUST satisfy — the
+    /// provider (put) + consumer (consume) pair the contract-coverage scanner reads.
+    #[test]
+    fn cdc_bustransport_put_consume_conformance() {
+        let store = OutboxStore::new();
+        let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
+        let ids = commit_n(&store, minter, 2, "issue:PROJ-1");
+        let r0 = store.row(&ids[0]).unwrap();
+        let r1 = store.row(&ids[1]).unwrap();
+
+        let bus = InProcessBus::new();
+        // PROVIDER side: put two distinct events, then re-put the first (a redelivery).
+        assert_eq!(bus.put(&r0.subject, &r0.envelope, &r0.event_id).unwrap(), Delivery::Accepted);
+        assert_eq!(bus.put(&r1.subject, &r1.envelope, &r1.event_id).unwrap(), Delivery::Accepted);
+        assert_eq!(
+            bus.put(&r0.subject, &r0.envelope, &r0.event_id).unwrap(),
+            Delivery::Deduplicated,
+            "the same dedup_id is suppressed (Nats-Msg-Id broker dedup → 0 ghost)"
+        );
+
+        // CONSUMER side: consume returns exactly the put envelopes, in publish order, once each.
+        let consumed = bus.consume("myelin://acme/issues/issue/");
+        assert_eq!(consumed.len(), 2, "exactly two distinct events delivered (dedup suppressed the 3rd put)");
+        assert_eq!(consumed[0], r0.envelope, "consumer sees the provider's wire envelope #0");
+        assert_eq!(consumed[1], r1.envelope, "consumer sees the provider's wire envelope #1, in order");
+    }
+
+    /// **EB-04 dated GATE re-confirm — SUB-D1 / BUS-D4 stay 0 ghost / 0 lost AFTER the relay
+    /// refinements (DLQ alert + GC) land.** Kill between commit and publish, heal, drain → every
+    /// committed event delivered exactly once; THEN run GC over the now-published rows → still
+    /// exactly the committed set delivered, depth 0, 0 dead-letters. Proves the EB-04 additions
+    /// did not regress the silent-data-loss floor.
+    #[test]
+    fn eb04_sub_d1_bus_d4_reconfirm_zero_ghost_zero_lost_after_refinements() {
+        let store = OutboxStore::new();
+        let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
+        let ids = commit_n(&store, minter, 5, "issue:PROJ-1");
+        let committed: HashSet<EventId> = ids.iter().cloned().collect();
+
+        let bus = InProcessBus::new();
+        let relay = Relay::new(store.clone(), bus.clone(), clock);
+
+        // kill between commit and publish (SUB-D1 / BUS-D4 fault): severed → 0 delivered, 0 lost.
+        bus.sever();
+        relay.drain_to_empty();
+        assert_eq!(store.outbox_depth(), 5, "0 lost while severed (events parked)");
+        assert_eq!(bus.delivered_count(), 0, "0 ghost while severed");
+        assert!(relay.dead_letter_alerts().is_empty(), "no premature dead-letter");
+
+        // heal + drain: exactly-once delivery (0 ghost, 0 lost), depth → 0.
+        bus.heal();
+        relay.drain_to_empty();
+        assert_eq!(store.outbox_depth(), 0, "outbox-depth drains (SUB-D1)");
+        assert_eq!(store.dead_letter_count(), 0, "0 dead-letters on the no-loss path");
+        assert_eq!(bus.delivered_count(), 5, "exactly-once: 5 committed → 5 delivered");
+        assert_eq!(bus.delivered_ids(), committed, "delivered set == committed set (0 ghost/0 lost)");
+
+        // EB-04 GC runs over the published rows: the delivered set is unchanged (GC frees the
+        // retention window, never an undelivered event).
+        let reaped = relay.gc_published(&Timestamp("2099-01-01T00:00:00Z".into()));
+        assert_eq!(reaped, 5, "all 5 published rows aged out of the 24h window");
+        assert_eq!(store.outbox_depth(), 0, "still 0 unsent after GC");
+        assert_eq!(bus.delivered_count(), 5, "GC did not lose or duplicate any delivery");
+        assert_eq!(bus.delivered_ids(), committed, "delivered set STILL == committed set after GC");
+        println!("[2026-06-19] PASS  gate=EB-04  SUB-D1/BUS-D4 reconfirm  ghost=0 lost=0  (after DLQ-alert + 24h-GC refinements)");
     }
 }
