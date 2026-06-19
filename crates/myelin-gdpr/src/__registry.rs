@@ -61,8 +61,10 @@ impl PersonalDataField {
     }
 
     /// Whether this field is `category = SpecialCategory(...)` (Art. 9) — the mechanical flag that
-    /// routes the field into the DPIA gate (gdpr §2.3; the router is P-GA-08). Carries the
-    /// special-category kind reference when present.
+    /// routes the field into the DPIA gate (gdpr §2.3). The *router* on top of this flag is
+    /// [`crate::dpia`] (P-GA-08): it mints a `DpiaMarker` into the inventory and records a
+    /// newly-appeared marker as DPIA-required. Carries the special-category kind reference when
+    /// present.
     pub fn is_special_category(&self) -> Option<SpecialCategoryFlag> {
         SpecialCategoryFlag::from_category_tag(self.tags.category)
     }

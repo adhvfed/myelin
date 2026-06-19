@@ -102,6 +102,14 @@ pub use __registry::{
     ErasureKeyClass, HasPersonalData, PersonalDataField, PersonalDataTags, SpecialCategoryFlag,
 };
 
+/// The `SpecialCategory` → DPIA router (contract 10.2; gdpr §2.3) — P-GA-08 / P-108. The
+/// special-category *detection* is P-107 ([`SpecialCategoryFlag`]); this module is the *routing*
+/// layer: it mints a [`dpia::DpiaMarker`] into the generated inventory per special-category field
+/// and the [`dpia::DpiaRouter`] records a newly-appeared marker as a DPIA-required change the
+/// data-map diff gate (P-GA-10) surfaces to a DPO (surfaced, not auto-decided).
+pub mod dpia;
+pub use dpia::{dpia_markers, dpia_markers_of, DpiaMarker, DpiaRouter, DpiaVerdict};
+
 /// The canonical tenant partition key (re-exported from `myelin-tenancy`, the owning sink
 /// crate). The GDPR contract surface (gdpr §3.1) threads `tenant: TenantId` through the holder
 /// ops; it is the **same** type the whole platform partitions on — re-exported, never
