@@ -48,7 +48,32 @@
 //! traffic, this injector severs a dependency, and the telemetry-assertion library (P-S04)
 //! reads that the system survived.
 //!
+//! ## What P-S04 ships (this prompt)
+//! The **telemetry-assertion library** ([`telemetry`]) — a typed reader over the contract-1.8
+//! survival-signal set ([`telemetry::SignalName`], architecture §10.2) with
+//! [`telemetry::SignalSource::assert_signal`] returning a typed
+//! [`telemetry::Assertion`] (green/red/rejected) that is **never** a swallowed pass: a red
+//! cannot be `|| true`-ed away (`#[must_use]` + the loud
+//! [`telemetry::Assertion::expect_green`]), and an inverted/vacuous assertion is **rejected**,
+//! not green (EI-01 §3). The **every-incident-adds-a-drill loop** ([`drills::DrillRegistry`])
+//! — [`drills::DrillRegistry::register_drill`] joins a reproducing [`drills::DrillScenario`]
+//! that [`drills::DrillRegistry::run_all`] re-runs forever (EI-01 §3/§5). The **harness
+//! self-test** (the SUB-M0 exit unit-of-proof) — inject one fault (P-S03), drive one unit of
+//! load (P-S02), read one telemetry assertion that reads green (P-S04) — committed as a test
+//! emitting a dated PASS row (`drills.rs` `harness_self_test_*`).
+//!
 //! ## Floors named (deferred + filling prompt)
+//! - **The telemetry PRODUCER side lands at P-S12/P-S13.** This prompt ships the *consumer*
+//!   side: an in-memory [`telemetry::SignalSource`] the rig populates in tests. A real service
+//!   exporting the §10.2 set on its metrics-health port (OpenTelemetry, architecture §3.5/§10)
+//!   lands inside the `serve` lifecycle at **P-S12/P-S13** and populates the SAME
+//!   [`telemetry::SignalName`]s — the assertion surface does not change.
+//! - **The self-test asserts at the M0 floor.** It models the SUB-D2-shaped "zero events lost
+//!   across a broker outage" property against the injector + in-memory signals (no relay
+//!   exists yet). The real assertion-backed drills the registry hosts are re-pointed at their
+//!   live fault-points at the owning prompts: SUB-D1/D2 at **P-S07/P-S08** (the relay +
+//!   consumer), SUB-D4 at **P-S25** (fail-static), SUB-D5 at **P-S17** (downstream breaker),
+//!   SUB-D7 at **P-S13** (cross-tenant IDOR). The inject → load → assert SHAPE is frozen here.
 //! - **Storm-profile parameters are v1 defaults.** The tuned per-surface shed-budget
 //!   numbers are the M5 surge / connection-storm follow-on (**P-S32 / P-S33**;
 //!   architecture §7.6 names them as floors tuned by the drills, not claimed-final). Here
@@ -68,10 +93,16 @@
 //!   real three-port `serve` instance lands once `serve` exists (**P-S12 / P-S13**).
 
 pub mod dependency_break;
+pub mod drills;
 pub mod load_generator;
+pub mod telemetry;
 
 pub use dependency_break::{BreakOutcome, Dependency, DependencyBreaker, Scope};
+pub use drills::{DrillContext, DrillRegistry, DrillResult, DrillScenario};
 pub use load_generator::{
     LoadGenerator, LoadPrincipalKind, Multiplier, PrincipalMix, Request, RunClass, Sink,
     StormProfile, Surface,
+};
+pub use telemetry::{
+    AssertedSignal, Assertion, Label, Predicate, RejectReason, SignalName, SignalSource,
 };
