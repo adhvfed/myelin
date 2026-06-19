@@ -732,8 +732,12 @@ landing = "P-086"
 [[contract]]
 row = "12.6"
 title = "cross-cell PII-free pointer bridge"
-status = "deferred"
-landing = "P-091"
+status = "covered"
+# Frame AUTHORITY is myelin-tenancy (the §2.9 DAG sink, P-CP-02/P-027); EB-14/P-091 pins it from
+# the Bus side (re-export on the frozen myelin_events::* path, EI-01 §7 — no second definition) and
+# ships the Bus-side serde-conformance CDC pair. The frame is designed-not-built; the cell-local
+# resolution BUILD is the M5 follow-on EB-25.
+cdc = ["crates/myelin-events/tests/cdc_12_6_crosscell.rs"]
 
 # ──────────────── §13 The shared crates' refined shapes (myelin-content, myelin-query) ──────────
 

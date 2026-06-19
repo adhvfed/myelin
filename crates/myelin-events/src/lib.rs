@@ -193,6 +193,28 @@
 //! `iam.*` family Identity already ships (`myelin-identity::iam_events`) is Identity's OWN §11.2
 //! token set (distinct from the §6.4 `identity.*` Bus seed); both obey this grammar.
 //!
+//! ## Status (P-091 / EB-14, 2026-06-19) — the cross-cell bridge FRAME pinned from the Bus side
+//! EB-14 ("Pin the cross-cell bridge FRAME — `CrossCellPointer`, designed-not-built") is the
+//! **event-bus ledger's framing of contract 12.6**, the SAME frozen frame the Tenancy ledger
+//! already shipped at **P-CP-02 / P-027** (`myelin_tenancy::CrossCellPointer` + its three
+//! supporting value types). Per the coherence rule (EI-01 §7: never define a type twice, never a
+//! parallel second implementation), EB-14 **reconciles in place** — the frame's AUTHORITY is
+//! `myelin-tenancy` (the §2.9 DAG SINK; the frame's `correlation_id` is the SAME `CorrelationId`
+//! the envelope carries, which by the DAG-deviation lives in the sink). So [`crosscell`] does NOT
+//! re-define `CrossCellPointer` / `OpaqueSubjectId` / `ArtifactType` / `CellId`: it **re-exports
+//! the tenancy authority** on the frozen Bus path (`myelin_events::CrossCellPointer`, …) so the
+//! Bus's §5 contract surfaces compile against the ONE frozen frame. What EB-14 ADDS is the Bus-side
+//! GATE the prompt names: (a) the serde round-trip through the Bus's own re-export path
+//! ([`crosscell::tests::eb14_frame_serde_round_trips_through_the_bus_path`] — exactly the four §6.1
+//! fields, `type` wire-name pinned), (b) the compile-time **cell-agnostic** assertion
+//! ([`crosscell::assert_cell_agnostic`]) that the §5 surfaces take the OPAQUE subject, never a
+//! cell-bound row, and (c) the Bus-side 12.6 CDC serde-conformance pair. **FLOOR named (EI-01 §1):**
+//! single-home-cell propagation is v1; the cross-cell PII-free bridge BUILD (per-viewer cell-local
+//! resolution, the residency proof that no PII crosses, multi-cell fan-out) is the **M5 follow-on
+//! EB-25** (whose drills GA-D8 / CP-D7 / CP-D8 are owed THEN). No catalogue drill greens here — the
+//! frame is designed-not-built; the gate is structural (serde round-trip + the cell-agnostic
+//! compile assertion).
+//!
 //! ## Floors named (stubbed bodies → filling prompt)
 //! - **The OLTP binding is modeled in-memory at M0.** There is no live database (the OLTP tier
 //!   client is **P-007 / P-ST-01**; the migration runner is **P-S15**). [`outbox::OUTBOX_MIGRATION`]
@@ -234,6 +256,7 @@
 //!   it is `0` — no tripwire has fired).
 
 pub mod consumer;
+pub mod crosscell;
 pub mod dedup;
 pub mod envelope;
 // Stage 2 / infra: the REAL durable bus behind the BusTransport trait — NATS JetStream via
@@ -276,6 +299,15 @@ pub use partition::{
 };
 pub use residency::{
     BusRegionReport, BusResidencySignal, BusStreamResidency, ResidencyError,
+};
+/// The cross-cell bridge FRAME (contract 12.6, EB-14 / P-091), PINNED from the Bus side. The four
+/// frozen frame types are re-exported on the frozen `myelin_events::*` path; their definition site
+/// is `myelin-tenancy` (the §2.9 DAG sink) — EB-14 reconciles in place (EI-01 §7), it does NOT
+/// re-define them. `assert_cell_agnostic` is the compile-time gate that the Bus's §5 surfaces take
+/// the opaque subject, never a cell-bound row. FLOOR: the cross-cell BUILD is EB-25 (M5).
+pub use crosscell::{
+    assert_cell_agnostic, pointer_correlation, ArtifactType, CellId, CrossCellPointer,
+    OpaqueSubjectId,
 };
 
 use serde::{Deserialize, Serialize};
