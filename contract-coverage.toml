@@ -552,11 +552,17 @@ landing = "P-201"
 
 # ──────────────── §10 GDPR / Audit / PersonalDataHolder (myelin-gdpr) ───────────────────────────
 
+# 10.1 — the SIGNATURE was frozen at P-GA-01 (`myelin-gdpr`); the BODIES + the GDPR-owned holder
+# impls (H18 GDPR's own stores G1–G7 + H16 the audit carve-out) land at P-GA-05 → P-105, which
+# ships the provider+consumer CDC pair NOW (the GDPR-owned holder responding + the DSR-orchestrator
+# fanning out via `dyn PersonalDataHolder`). The upstream-store orchestration (H6/H8/…) extends
+# this at P-GA-06 → P-106; it is not a missing pair (the pair below is a real provider+consumer
+# seam), so the row is `covered`.
 [[contract]]
 row = "10.1"
 title = "PersonalDataHolder{locate, export, rectify, restrict, erase}"
-status = "deferred"
-landing = "P-105"
+status = "covered"
+cdc = ["crates/myelin-gdpr-service/tests/cdc_10_1_holder_bodies.rs"]
 
 [[contract]]
 row = "10.2"

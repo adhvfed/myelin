@@ -271,13 +271,69 @@ pub enum EraseScope {
 /// the receipt is constructed + carries its content-address; the **hash-link / Merkle seal**
 /// into the tamper-evident audit log is **P-GA-20**. References-not-payloads: the receipt
 /// names the op + a content-address, never PII bodies.
+///
+/// **P-GA-05 (the bodies):** [`Receipt::content_addressed`] builds the `content_hash` as a
+/// **BLAKE3 digest over a canonical, PII-free receipt body** (op + holder + subject/tenant ids +
+/// outcome + the destroyed key epoch + timestamp). The digest is rendered `blake3:<hex>` — the
+/// ONE multihash convention the BlobStore content-address and the audit Merkle leaf also use, so
+/// a receipt is verifiable + content-addressed, never hand-rolled. `key_epoch_destroyed` records
+/// **which key epoch a crypto-shred destroyed** (the GD-4 erasure lever's audit trail — the prompt
+/// requirement "every holder op returns a receipt recording the destroyed key epoch"); it is
+/// `None` for a non-shredding op (locate/export/rectify/restrict) and `Some(epoch)` for an erase
+/// that destroyed a key. `#[serde(default)]` keeps the frozen P-GA-01 wire shape stable (an old
+/// `{operation, content_hash}` receipt round-trips to `key_epoch_destroyed: None`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Receipt {
     /// The holder operation this receipt attests (e.g. `"locate"`, `"erase"`).
     pub operation: String,
     /// The content-address of the receipt body (the audit-log hash-link; the Merkle seal is
-    /// P-GA-20). A `blake3:<hex>` digest in the M1 bodies; opaque on this skeleton floor.
+    /// P-GA-20). A `blake3:<hex>` digest in the M1 bodies; opaque on the skeleton floor.
     pub content_hash: String,
+    /// The key epoch a crypto-shred destroyed (the GD-4 lever's audit trail). `None` for a
+    /// non-shredding op; `Some(epoch)` when an erase destroyed a key. Folded INTO the
+    /// content-addressed body so a receipt cannot claim a destroyed epoch it did not address.
+    #[serde(default)]
+    pub key_epoch_destroyed: Option<u64>,
+}
+
+impl Receipt {
+    /// Build a **content-addressed** receipt: hash a canonical, PII-free body
+    /// (`operation ∥ holder ∥ subject ∥ tenant ∥ outcome ∥ key_epoch_destroyed ∥ at_ms`) with
+    /// BLAKE3 and render `blake3:<hex>` (gdpr §3.1 — each op returns a receipt; §6 — hash-linked
+    /// into the audit log; the Merkle seal is P-GA-20). The body carries only **opaque ids**
+    /// (the pseudonymous subject id / the tenant token) — never PII — so the receipt itself is
+    /// safe to seal into the tamper-evident log.
+    ///
+    /// Deterministic: the SAME (op, holder, subject, tenant, outcome, epoch, at) always yields the
+    /// SAME content hash — so an **idempotent re-erase returns the identical receipt** (the prompt
+    /// requirement). The `at` for an idempotent re-run is the FIRST erase's timestamp (the holder
+    /// re-affirms the original completion), keeping the content-address stable across re-runs.
+    pub fn content_addressed(
+        operation: &str,
+        holder: &str,
+        subject: &str,
+        tenant: &str,
+        outcome: &str,
+        key_epoch_destroyed: Option<u64>,
+        at_ms: u64,
+    ) -> Receipt {
+        // The canonical body — field-tagged + `∥`-joined so two different field sets can never
+        // collide into the same digest (a fixed separator, not raw concatenation).
+        let body = format!(
+            "op={operation}\u{1f}holder={holder}\u{1f}subject={subject}\u{1f}tenant={tenant}\
+             \u{1f}outcome={outcome}\u{1f}key_epoch={}\u{1f}at={at_ms}",
+            match key_epoch_destroyed {
+                Some(e) => e.to_string(),
+                None => "none".to_string(),
+            }
+        );
+        let digest = blake3::hash(body.as_bytes());
+        Receipt {
+            operation: operation.to_string(),
+            content_hash: format!("blake3:{}", hex::encode(digest.as_bytes())),
+            key_epoch_destroyed,
+        }
+    }
 }
 
 /// The result of `locate` (gdpr §3.1 — Art. 15 access: where a subject's data lives within one
@@ -535,9 +591,45 @@ mod tests {
         let r = Receipt {
             operation: "erase".into(),
             content_hash: "blake3:deadbeef".into(),
+            key_epoch_destroyed: Some(3),
         };
         let r_back: Receipt = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(r_back, r);
+
+        // A legacy `{operation, content_hash}` receipt (no key_epoch_destroyed) round-trips to
+        // `None` — `#[serde(default)]` keeps the frozen P-GA-01 wire shape stable.
+        let legacy: Receipt =
+            serde_json::from_str(r#"{"operation":"locate","content_hash":"blake3:00"}"#).unwrap();
+        assert_eq!(legacy.key_epoch_destroyed, None);
+    }
+
+    /// P-GA-05 — the content-addressed receipt machinery (gdpr §3.1, §6): a holder op's receipt
+    /// is a BLAKE3 `blake3:<hex>` digest over a canonical PII-free body recording the destroyed
+    /// key epoch, and it is **deterministic** (an idempotent re-erase returns the IDENTICAL
+    /// receipt — the prompt requirement). A different field flips the address.
+    #[test]
+    fn content_addressed_receipt_is_deterministic_and_records_the_key_epoch() {
+        let r1 = Receipt::content_addressed(
+            "erase", "oltp:dsr_request", "u-1", "acme", "crypto_shred", Some(7), 1_000,
+        );
+        let r2 = Receipt::content_addressed(
+            "erase", "oltp:dsr_request", "u-1", "acme", "crypto_shred", Some(7), 1_000,
+        );
+        // Deterministic: same inputs → same content-address (so a re-erase returns the same receipt).
+        assert_eq!(r1, r2);
+        assert!(r1.content_hash.starts_with("blake3:"));
+        assert_eq!(r1.key_epoch_destroyed, Some(7), "the destroyed key epoch is recorded");
+        // A different destroyed epoch is a DIFFERENT receipt (the epoch is folded into the address).
+        let r3 = Receipt::content_addressed(
+            "erase", "oltp:dsr_request", "u-1", "acme", "crypto_shred", Some(8), 1_000,
+        );
+        assert_ne!(r1.content_hash, r3.content_hash);
+        // A non-shredding op records no epoch.
+        let loc = Receipt::content_addressed(
+            "locate", "oltp:dsr_request", "u-1", "acme", "located", None, 5,
+        );
+        assert_eq!(loc.key_epoch_destroyed, None);
+        assert_ne!(loc.content_hash, r1.content_hash);
     }
 
     // ───────────────────────── P-GA-02 / P-050 — the classify surface ──────────────────────────

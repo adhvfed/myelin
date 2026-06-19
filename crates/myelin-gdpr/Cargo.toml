@@ -23,3 +23,8 @@ myelin-events = { path = "../myelin-events" }
 myelin-gdpr-macros = { path = "../myelin-gdpr-macros" }
 serde.workspace = true
 serde_json.workspace = true
+# BLAKE3 content-addresses the holder-op Receipt (P-GA-05): `content_hash = blake3:<hex>` over the
+# canonical receipt body. ONE hash family across the platform (the same multihash convention the
+# BlobStore content-address and the audit Merkle leaf use — no hand-rolled crypto, VISION §4).
+blake3.workspace = true
+hex.workspace = true
