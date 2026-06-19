@@ -267,8 +267,11 @@ landing = "P-073"
 [[contract]]
 row = "5.1"
 title = "ArtifactRef"
-status = "deferred"
-landing = "P-052"
+# COVERED by REF-P1 / P-052: the value-type half of 5.1 (parse/format + the frozen #sub grammar).
+# The resolve half (5.2/5.7 tombstone ladder) is a separate row; this row's parse/format pair ships
+# its provider+consumer CDC here.
+status = "covered"
+cdc = ["crates/myelin-refs/tests/cdc_5_1_artifactref.rs"]
 
 [[contract]]
 row = "5.2"
