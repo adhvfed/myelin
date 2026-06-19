@@ -130,6 +130,26 @@
 //! in-flight) are the Bus's contribution UNDER the §10.2 rows ("depth **+ age**", "consumer lag
 //! … oldest-un-acked **age**", "per-tenant **in-flight**"); the self-test bridges the two.
 //!
+//! ## Status (P-015 / EB-06, 2026-06-19) — the `consumer_dedup` ledger gets its named home
+//! EB-06 ("The consumer_dedup ledger, the effectively-once anchor") is the **event-bus ledger's
+//! framing of the row-2.5 deliverable P-009 / P-S08 already shipped** (the substrate roadmap
+//! reached the consumer template — which DEPENDS on the ledger — first; the event-bus roadmap
+//! reaches the ledger as its own EB-06 unit). Per the coherence rule (EI-01 §7: never define a
+//! type twice, never build a parallel second implementation), EB-06 **reconciles in place**: the
+//! [`DedupLedger`] + the frozen 2.5 DDL [`CONSUMER_DEDUP_MIGRATION`] were MOVED verbatim out of
+//! [`consumer`] into [`dedup`] (the EB-06-named file home) with **no name/type/unit/semantics
+//! change**, and are re-exported here so every frozen public path (`myelin_events::DedupLedger`,
+//! `::CONSUMER_DEDUP_MIGRATION`) is unchanged; [`consumer::Consumer`] keeps calling exactly the
+//! same `mark_handled`/`revert` API (rule 1). What EB-06 ADDS is (a) the named-deliverable file
+//! home for the effectively-once anchor and (b) the **standalone 2.5 CDC pair** + the focused unit
+//! tests (idempotent re-delivery proven: one effect on double-delivery; the per-consumer PK
+//! proven: two consumers record the same event independently). The provider+consumer CDC pair for
+//! 2.5 is `tests/cdc_2_5_consumer_dedup.rs`; the combined end-to-end 2.4/2.5 relay→consumer pair
+//! (`tests/drills_sub_d2_consumer.rs::cdc_2_4_2_5_*`) stays as the integration pair. The gate is
+//! structural (no standalone catalogue drill — the dedup property is greened transitively by
+//! SUB-D2 in EB-05/P-009): the same `(consumer, event_id)` inserted twice yields one row and the
+//! handler runs once (the `ON CONFLICT DO NOTHING` property).
+//!
 //! ## Floors named (stubbed bodies → filling prompt)
 //! - **The OLTP binding is modeled in-memory at M0.** There is no live database (the OLTP tier
 //!   client is **P-007 / P-ST-01**; the migration runner is **P-S15**). [`outbox::OUTBOX_MIGRATION`]
@@ -151,10 +171,12 @@
 //!   `BusTransport` trait IS that seam; promoted only when volume is measured; named in EB-31).
 //! - **The ULID source** is the injected [`outbox::IdMinter`] ([`outbox::MonotonicMinter`] is
 //!   the deterministic floor); the real wall-clock+random ULID source wires at **P-S12**.
-//! - The `EventHandler` consumer runtime + `consumer_dedup` ledger (2.4/2.5, SUB-D2) **shipped
-//!   in P-S08** (see [`consumer`]; re-confirms SUB-D1 end-to-end through a consumer). The
-//!   upcaster registry (2.8) the runtime calls before `handle` is **P-S09** — the
-//!   [`consumer::Consumer::with_upcaster`] hook is its install seam; identity map until then.
+//! - The `EventHandler` consumer runtime (2.4, SUB-D2) **shipped in P-S08** (see [`consumer`];
+//!   re-confirms SUB-D1 end-to-end through a consumer). The `consumer_dedup` ledger (2.5, the
+//!   effectively-once anchor) shipped with it and was given its named home in [`dedup`] by
+//!   **EB-06 / P-015** (the reconciliation Status block above). The upcaster registry (2.8) the
+//!   runtime calls before `handle` is **P-S09** — the [`consumer::Consumer::with_upcaster`] hook
+//!   is its install seam; identity map until then.
 //! - `pii_key_ref`'s KMS hierarchy (the DEK epochs) is Storage M1 (11.3); P-001 ships
 //!   only the field + its format.
 //! - **The metrics-health PORT + the producer-side clock (P-014/EB-11).** [`telemetry`] ships
@@ -168,15 +190,17 @@
 //!   it is `0` — no tripwire has fired).
 
 pub mod consumer;
+pub mod dedup;
 pub mod envelope;
 pub mod outbox;
 pub mod relay;
 pub mod telemetry;
 
 pub use consumer::{
-    Consumer, ConsumerName, DeadLetter, DedupLedger, Delivered, Message, PrefetchBound,
-    SubscribeError, Subscription, CONSUMER_DEDUP_MIGRATION,
+    Consumer, ConsumerName, DeadLetter, Delivered, Message, PrefetchBound, SubscribeError,
+    Subscription,
 };
+pub use dedup::{DedupLedger, CONSUMER_DEDUP_MIGRATION};
 pub use telemetry::{
     BusObservations, BusSignal, BusSignals, MetricLabel, MetricRecorder, MetricSample, MetricsSink,
 };

@@ -1,13 +1,15 @@
-//! # The idempotent event-consumer runtime + the `consumer_dedup` ledger (SUB-D2)
+//! # The idempotent event-consumer runtime (SUB-D2)
 //!
 //! **Owning architecture doc:**
 //! `planning/05-refined-shared-systems-architecture/00-platform-substrate.md` §5 (the
 //! event-consumer template + the **seven encoded rules**) and §5.3 (causality through the
 //! consumer — `emit(draft, cause = Some(incoming))`).
 //!
-//! **Contract-index:** rows 2.4 (`EventHandler` template + `HandleOutcome`) and 2.5
-//! (`consumer_dedup` ledger `(consumer, event_id)` PK). **P-S08 → global P-009.** This is the
-//! consumer half of the **silent-data-loss floor** (SUB-D2): a **PERMANENT gate**, re-run on
+//! **Contract-index:** row 2.4 (`EventHandler` template + `HandleOutcome`). The `consumer_dedup`
+//! ledger (row 2.5, the effectively-once anchor this runtime's rule 1 keys on) is **EB-06 /
+//! P-015**'s named deliverable — it lives in [`crate::dedup`] ([`crate::DedupLedger`] +
+//! [`crate::CONSUMER_DEDUP_MIGRATION`]); this runtime calls it. **P-S08 → global P-009.** This is
+//! the consumer half of the **silent-data-loss floor** (SUB-D2): a **PERMANENT gate**, re-run on
 //! every emit-path change.
 //!
 //! ## What this module ships (the one template the whole platform is built from)
@@ -15,8 +17,9 @@
 //! [`crate`]) is wrapped by ONE runtime, [`Consumer`], so the seven correctness rules cannot be
 //! skipped per-consumer:
 //!
-//! 1. **Idempotent on `event_id`** via the per-consumer [`DedupLedger`] (`(consumer, event_id)`
-//!    PK, contract 2.5) — at-least-once delivery + an idempotent handler ≈ effectively-once.
+//! 1. **Idempotent on `event_id`** via the per-consumer [`crate::DedupLedger`] (`(consumer,
+//!    event_id)` PK, contract 2.5, EB-06) — at-least-once delivery + an idempotent handler ≈
+//!    effectively-once.
 //!    A redelivered `event_id` is a no-op: the runtime SKIPs the handler and acks
 //!    ([`Consumer::deliver`] → [`Delivered::Deduplicated`]). Myelin does **not** chase true
 //!    exactly-once.
@@ -63,11 +66,9 @@
 //!
 //! ## DEVIATION / FLOOR — the in-memory ledger models the SQL `consumer_dedup` table
 //! There is **no live OLTP DB in M0** (the OLTP tier client is **P-007 / P-ST-01**; the
-//! migration runner is **P-S15**). So the `consumer_dedup` ledger is modeled as an **in-memory
-//! [`DedupLedger`]** whose semantics are byte-for-byte the 2.5 contract: `(consumer, event_id)`
-//! is the PK (a second insert of the same pair is the no-op idempotency check), per-consumer so
-//! two consumers of the same event each process it once. The frozen DDL
-//! ([`CONSUMER_DEDUP_MIGRATION`]) is the shape the runner applies. **Floor:** the real
+//! migration runner is **P-S15**). So the `consumer_dedup` ledger ([`crate::DedupLedger`],
+//! EB-06) is modeled in-memory with byte-for-byte the 2.5 semantics; its frozen DDL
+//! ([`crate::CONSUMER_DEDUP_MIGRATION`]) is the shape the runner applies. **Floor:** the real
 //! `INSERT … ON CONFLICT DO NOTHING` against the Storage pool, executed in the SAME transaction
 //! as the handler's state write (so the dedup mark and the side effect commit together — the
 //! atomicity that makes idempotency real, not best-effort), lands when the OLTP client is wired
@@ -84,29 +85,9 @@
 //! map (a `schema_ver` already at the current version passes through). Named, not silently
 //! assumed done.
 
-use crate::{EventEnvelope, EventHandler, HandleOutcome, Reason, SubjectPattern};
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
-
-/// The frozen forward-only DDL for the `consumer_dedup` ledger (contract 2.5). This is the
-/// shape the migration runner (P-S15) applies when the OLTP tier client (P-007) is wired; the
-/// in-memory [`DedupLedger`] models exactly these semantics until then.
-///
-/// - `(consumer, event_id)` is the **PRIMARY KEY** — the idempotency key is per-consumer, so
-///   two distinct consumers of the same event each process it exactly once, and a redelivery to
-///   the SAME consumer is suppressed (`ON CONFLICT DO NOTHING`);
-/// - `recorded_at` is when the consumer durably marked the event handled (read in the SAME
-///   transaction as the handler's state write — the atomicity floor named in the module docs).
-///
-/// **Forward-only** (the `forward-only-migration` lint, P-S11): this is an `expand` migration
-/// (it only adds the table); there is no destructive down-migration.
-pub const CONSUMER_DEDUP_MIGRATION: &str = "\
-CREATE TABLE IF NOT EXISTS consumer_dedup (
-    consumer    TEXT        NOT NULL,
-    event_id    TEXT        NOT NULL,
-    recorded_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT consumer_dedup_pk PRIMARY KEY (consumer, event_id)
-);";
+use crate::{DedupLedger, EventEnvelope, EventHandler, HandleOutcome, Reason, SubjectPattern};
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 /// The stable, durable consumer name (rule 4: bind-by-name). Two `Consumer`s with the SAME name
 /// share the SAME dedup ledger key-space + cursor — a reconnect re-binds this name rather than
@@ -227,53 +208,6 @@ fn is_wildcard_subject(s: &str) -> bool {
     // `*` or `>` (the NATS subject wildcards) is over-broad — this covers a bare `*`/`>` (a
     // single segment), an interior `issues.*.created`, and a trailing greedy `issues.>`.
     s.is_empty() || s.split('.').any(|seg| seg == "*" || seg == ">")
-}
-
-/// The per-consumer `consumer_dedup` ledger (contract 2.5, the in-memory model). `(consumer,
-/// event_id)` is the PK: [`DedupLedger::mark_handled`] records the pair and returns whether it
-/// was FRESH (newly inserted) or a DUPLICATE (already present — the idempotency no-op). A
-/// cloneable handle over shared state so a reconnected `Consumer` re-bound by the same name
-/// re-uses the SAME ledger (rule 4) and the redelivery is absorbed.
-#[derive(Clone, Default)]
-pub struct DedupLedger {
-    inner: Arc<Mutex<HashSet<(ConsumerName, crate::EventId)>>>,
-}
-
-impl DedupLedger {
-    /// A fresh, empty ledger.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Record `(consumer, event_id)` and report whether it was FRESH. This is the `INSERT …
-    /// ON CONFLICT DO NOTHING` model: a fresh pair returns `true` (the handler should run); a
-    /// pair already present returns `false` (a redelivery — the handler is SKIPped, the message
-    /// is acked, 0 dup). The PK is the pair, so the SAME event delivered to two DIFFERENT
-    /// consumers is fresh for each.
-    pub fn mark_handled(&self, consumer: &ConsumerName, event_id: &crate::EventId) -> bool {
-        let mut set = self.lock();
-        set.insert((consumer.clone(), event_id.clone()))
-    }
-
-    /// Has `(consumer, event_id)` already been handled? (Read-only check; `mark_handled` is the
-    /// transactional one.)
-    pub fn is_handled(&self, consumer: &ConsumerName, event_id: &crate::EventId) -> bool {
-        self.lock().contains(&(consumer.clone(), event_id.clone()))
-    }
-
-    /// How many `(consumer, event_id)` pairs the ledger holds (for tests / a depth read).
-    pub fn len(&self) -> usize {
-        self.lock().len()
-    }
-
-    /// Whether the ledger is empty.
-    pub fn is_empty(&self) -> bool {
-        self.lock().is_empty()
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashSet<(ConsumerName, crate::EventId)>> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
-    }
 }
 
 /// The outcome of the runtime delivering ONE message to a handler (distinct from the handler's
@@ -493,12 +427,12 @@ impl<H: EventHandler> Consumer<H> {
     }
 
     /// Revert a dedup mark (a `Retry` is not a completed handle — the pair must be removed so a
-    /// redelivery re-runs the handler). Crate-internal mechanic; the real `consumer_dedup` is
-    /// written in the SAME transaction as the handler's state write (P-007/P-S12), so a rolled-
-    /// back handler rolls back its dedup mark for free — this models that atomicity.
+    /// redelivery re-runs the handler). Delegates to [`DedupLedger::revert`]; the real
+    /// `consumer_dedup` row is written in the SAME transaction as the handler's state write
+    /// (P-007/P-S12), so a rolled-back handler rolls back its dedup mark for free — this models
+    /// that atomicity.
     fn dedup_revert(&self, event_id: &crate::EventId) {
-        let mut set = self.dedup.lock();
-        set.remove(&(self.name().clone(), event_id.clone()));
+        self.dedup.revert(self.name(), event_id);
     }
 }
 
@@ -511,7 +445,9 @@ mod tests {
     };
     use myelin_identity::{Principal, PrincipalId, PrincipalKind};
     use myelin_tenancy::{Region, TenantId};
+    use std::collections::HashSet;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
 
     fn principal() -> Principal {
         Principal {
@@ -840,19 +776,9 @@ mod tests {
         assert_eq!(c.handler.runs.load(Ordering::SeqCst), 2, "the handler ran exactly twice");
     }
 
-    // --- The migration shape (contract 2.5) ---
-
-    /// The `consumer_dedup` migration is the frozen 2.5 shape: the `(consumer, event_id)` PK +
-    /// the columns are present; forward-only (no destructive DROP).
-    #[test]
-    fn migration_is_the_frozen_2_5_shape() {
-        assert!(CONSUMER_DEDUP_MIGRATION.contains("CREATE TABLE IF NOT EXISTS consumer_dedup"));
-        assert!(CONSUMER_DEDUP_MIGRATION.contains("PRIMARY KEY (consumer, event_id)"));
-        for col in ["consumer", "event_id", "recorded_at"] {
-            assert!(CONSUMER_DEDUP_MIGRATION.contains(col), "missing column {col}");
-        }
-        assert!(!CONSUMER_DEDUP_MIGRATION.contains("DROP TABLE"), "forward-only: no destructive down");
-    }
+    // --- The dedup ledger (contract 2.5) lives in `crate::dedup` (EB-06) — see its tests there
+    //     for the migration shape + the per-consumer idempotency proofs; here we exercise the
+    //     ledger only THROUGH the runtime (rules 1 + 4 above). ---
 
     // --- The upcaster pre-handle hook (P-S09 floor) ---
 
