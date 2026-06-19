@@ -528,11 +528,16 @@ title = "retention / consent / sub-processor / legal-hold"
 status = "deferred"
 landing = "P-150"
 
+# 10.6 — the CONSTRUCTION half (the outbox-only audit consumer + the per-tenant hash-chain +
+# the Merkle leaves + the minimisation) ships its provider+consumer CDC pair NOW (P-GA-19 →
+# P-062). The PROOFS half (inclusion/consistency/signed-tree-head + independent-witness anchoring
+# + DSR-receipt seal + the H16 carve-out body) EXTENDS this construction at P-GA-20 → P-119; it
+# is not a missing pair (the pair below is a real provider+consumer seam), so the row is `covered`.
 [[contract]]
 row = "10.6"
 title = "tamper-evident audit log"
-status = "deferred"
-landing = "P-119"
+status = "covered"
+cdc = ["crates/myelin-gdpr-service/tests/cdc_10_6_audit_log.rs"]
 
 [[contract]]
 row = "10.7"

@@ -30,6 +30,16 @@ members = [
     "crates/myelin-query",
     "crates/myelin-agent",
     "crates/myelin-gdpr",
+    # The GDPR/Audit SERVICE crate (P-GA-19 → P-062): the tamper-evident audit log core — the
+    # outbox-only audit CONSUMER + the per-tenant hash-chain + the Merkle leaves + the
+    # minimisation (contract 10.6, the construction half; the proofs/STH/witness are P-119). Like
+    # myelin-identity-service it is a SERVICE crate — a LEAF consumer ABOVE myelin-events /
+    # -identity / -tenancy; it consumes the frozen bus + identity + tenancy surfaces and NOTHING
+    # in the production library DAG depends back on it (substrate_is_root() in crate_graph.rs is
+    # preserved — a service is the graph's terminal consumer, OUTSIDE the eleven-crate library
+    # DAG). The DSR orchestrator + the GDPR-owned holders come to live here in M1
+    # (P-GA-05/-06/-11). See the crate-level note in crates/myelin-gdpr-service/src/lib.rs.
+    "crates/myelin-gdpr-service",
     # The proc-macro half of the GDPR classify-derive (contract 10.2; P-GA-02 → P-050). A
     # `proc-macro = true` crate may export ONLY procedural macros, so the `#[personal_data]`
     # attribute lives here while the five-tag enum TYPES it references live in `myelin-gdpr`,
