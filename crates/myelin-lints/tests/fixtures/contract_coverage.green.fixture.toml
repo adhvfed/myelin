@@ -1,0 +1,12 @@
+# GREEN fixture: 1.1 covered by a real pair file; 4.3 deferred with a landing prompt.
+[[contract]]
+row = "1.1"
+title = "serve"
+status = "covered"
+cdc = ["crates/myelin-lints/tests/fixtures/cdc_pair.green.rs.txt"]
+
+[[contract]]
+row = "4.3"
+title = "list_objects"
+status = "deferred"
+landing = "P-070"

@@ -1,0 +1,13 @@
+# RED fixture: 1.1 CLAIMS coverage via a file that does not exist (a falsely-claimed pair);
+# 4.3 is deferred but names NO landing prompt (an un-named floor). The scanner MUST reject loudly.
+[[contract]]
+row = "1.1"
+title = "serve"
+status = "covered"
+cdc = ["crates/myelin-lints/tests/fixtures/this_file_does_not_exist.rs.txt"]
+
+[[contract]]
+row = "4.3"
+title = "list_objects"
+status = "deferred"
+landing = ""

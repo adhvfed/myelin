@@ -100,9 +100,31 @@
 //!   `myelin-substrate`); this crate ships the source-scanning form (the Identity-sink invariant).
 //!
 //! The lints are never weakened — only sharpened — as each consumer lands (EI-01 §5).
+//!
+//! ## The contract-coverage scanner — the META-gate (P-S21 → P-037) — see [`coverage`]
+//! Sibling to the twelve lints: where a lint catches a bug-class in code, the
+//! [`coverage`] scanner catches the bug-class one level up — a cross-system CONTRACT that ships
+//! without its provider+consumer CDC test pair. It reconciles the frozen contract-index against the
+//! workspace-root `contract-coverage.toml` manifest and FAILS LOUDLY (the `contract-coverage` bin's
+//! exit code) on any falsely-claimed or silently-dropped row. **DEVIATION (EI-01 §1,
+//! coherence-over-slavish-plan-following):** the P-S21 DELIVERABLE offers "a CI tool in
+//! `myelin-substrate` OR a workspace `xtask`". It is placed HERE in `myelin-lints` instead, because
+//! `myelin-lints` is already the established committed-gate SOURCE-SCANNER LEAF (it sits OUTSIDE the
+//! production crate DAG, architecture §2.9; nothing depends on it). Putting a repo-scanning build
+//! tool into `myelin-substrate` — the production ROOT crate every service's `main` links — would
+//! pull Markdown/TOML-scanning build machinery into the shipped binary surface. The scanner is the
+//! conceptual sibling of the `lint-gate` binary (both are the EI-01 §5 ratchet), so it lives beside
+//! it. The deliverable's INTENT (a committed, loud, CI-wired meta-gate) is met exactly; only the
+//! host crate differs, and it differs toward the more coherent home.
 
+pub mod coverage;
 pub mod engine;
 pub mod lints;
+
+pub use coverage::{
+    parse_contract_index_rows, parse_manifest, scan, Coverage, CoverageError, ManifestEntry,
+    PairEvidence, RowId, ScanReport,
+};
 
 pub use engine::{Lint, LintId, Violation};
 pub use lints::{

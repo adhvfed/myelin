@@ -29,6 +29,22 @@ jobs:
       - name: The lint fixture matrix + the CI-gate self-test (red-fixture ⇒ non-zero exit)
         run: cargo test -p myelin-lints
 
+  contract-coverage:
+    # The contract-coverage META-GATE (P-S21 → P-037). LOUD: the gate is the binary exit code —
+    # it FAILS the workspace if any contract-index row claims a CDC pair it does not have, drops a
+    # row silently, or defers a row without naming its landing prompt. There is deliberately NO
+    # `|| true` / `continue-on-error`. Doctrine EI-01 §5 ("a contract violation dropped silently is
+    # a multi-day misdiagnosis"). This is the meta-gate every later prompt's DEFINITION OF DONE
+    # leans on (the contract-coverage scanner passes).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: The contract-coverage scanner over the contract-index + manifest (loud, non-zero on any falsely-claimed row)
+        run: cargo run -p myelin-lints --bin contract-coverage
+      - name: The scanner self-test (red manifest fixture ⇒ non-zero exit; green ⇒ zero)
+        run: cargo test -p myelin-lints --test contract_coverage_gate
+
   build-test-clippy:
     runs-on: ubuntu-latest
     steps:
