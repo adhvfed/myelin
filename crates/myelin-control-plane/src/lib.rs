@@ -96,6 +96,20 @@
 //!   named Storage-driver floor — the invariant logic + the region-immutability discipline here are
 //!   real + tested now and do not change shape when the driver lands (mirrors how
 //!   `myelin-storage`'s migration runner validates in code while the DDL executes through the pool).
+//! - **The isolation-tier contract (12.5) is LIVE (P-CP-10 / P-086, [`isolation`]).**
+//!   [`isolation::IsolationTier`] enumerates the frozen `logical|schema|db|cell` mechanism set;
+//!   the **Pool tier ([`isolation::IsolationTier::Logical`]) is the v1 floor** (shared cell,
+//!   logical/RLS isolation — the `residency-pin` + the OLTP RLS guard it). The partition key
+//!   `(tenant, region)` is **identical at every tier** ([`isolation::partition_key`] /
+//!   [`isolation::PartitionKey`]): a store opens at the Pool tier ([`isolation::PoolStore`]) with
+//!   the SAME key Bridge/Dedicated would use. **FLOOR:** the Pool tier is the only v1-provisioned
+//!   tier; **Bridge** (DB-per-tenant) + **Dedicated** (cell-per-tenant) are **declared in the
+//!   contract but provisioned ON DEMAND** (enterprise / public-sector onboarding) — the partition-key
+//!   contract is identical across all three, so a promotion is a provisioning concern, not a
+//!   redesign (the higher-tier provisioning rides the gate path P-CP-11 + the Bridge-tier per-tenant
+//!   DB/index `[OPEN → P6 (Search/Storage)]` residual). The Pool tier's cross-tenant-read correctness
+//!   is the floor proven by CP-D2 (P-CP-08) + the four-layer enforcement (P-CP-12) — this prompt
+//!   confirms the partition key is tier-invariant.
 //! - **Cell-provisioning gating (CP-D6) is LIVE (P-CP-11 / P-083, [`provision`]).** A cell does not
 //!   go `Active` until it passes **restore-verify** (the storage [`myelin_storage::RestoreVerifyGate`],
 //!   contract 11.5) **+ readiness** (the cell's [`myelin_substrate::MetricsHealthSurface`]); a failing
@@ -107,6 +121,7 @@
 
 pub mod discover;
 pub mod holder;
+pub mod isolation;
 pub mod place;
 pub mod placement_of;
 pub mod provision;
@@ -115,6 +130,7 @@ pub mod residency_verify;
 pub mod schema;
 
 pub use discover::{DiscoverKey, DiscoveryCache, DiscoverySignals, RouteTuple};
+pub use isolation::{partition_key, IsolationTier, PartitionKey, PoolStore};
 pub use placement_of::{
     CellGateway, GatewayReject, Misroute, MisrouteAudit, MisrouteAuditRecord, PlacementOf,
 };
