@@ -245,6 +245,7 @@ pub mod nats;
 pub mod outbox;
 pub mod partition;
 pub mod relay;
+pub mod residency;
 pub mod taxonomy;
 pub mod telemetry;
 pub mod upcast;
@@ -272,6 +273,9 @@ pub use relay::{
 };
 pub use partition::{
     stream_name_for, PartitionKey, StreamSubject, SubjectError, SUBJECT_ROOT,
+};
+pub use residency::{
+    BusRegionReport, BusResidencySignal, BusStreamResidency, ResidencyError,
 };
 
 use serde::{Deserialize, Serialize};
