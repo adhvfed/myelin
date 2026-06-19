@@ -1,0 +1,47 @@
+[package]
+name = "myelin-control-plane"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+# THE Tenancy control-plane SERVICE crate (P-CP-05 → global P-080): the three PII-free
+# control-plane registry tables (`cell` / `tenant_placement` / `cell_provisioning`) + the per-cell
+# `local_tenant` directory + the HARD placement invariant (multi-cell single-region by
+# construction). This is the FIRST `myelin-control-plane` prompt; the routing/attestation surfaces
+# (`discover`/`place`/`placement_of`/`residency_verify`) land in P-CP-06..P-CP-09.
+#
+# DAG POSITION (a documented, NAMED extension of the §2.9 eleven-crate library DAG, exactly like
+# `myelin-identity-service`, `myelin-gdpr-service`, and `myelin-git`). This is a SERVICE crate — a
+# LEAF consumer ABOVE the glue crates: it depends on the harness (serve/AppSpec + holder
+# auto-registration), the partition-key types (myelin-tenancy), and the GDPR holder/classify
+# surface (myelin-gdpr). The registry tables open through the OLTP tier client's bounded pool + RLS
+# (Storage P-ST-01) once the driver lands — a named floor, NOT a compile-time dep at this band.
+# NOTHING in the production library DAG depends back on it, so it is OUTSIDE the eleven-crate
+# library graph modelled by
+# `myelin_substrate::crate_graph` (substrate_is_root() is preserved — a service is the graph's
+# terminal consumer). See the crate-level note in src/lib.rs.
+[dependencies]
+# The harness: serve(AppSpec) (boot → migrate → relay → consumers → ports → drain) + the holder
+# auto-registration registry (HolderRegistry/StoreKind/StoreManifest) the registry stores open
+# through, and the forward-only Migrations the registry schema is applied by (region/cell_id are
+# injected by the harness — architecture §11). The service is an AppSpec this wires, not a
+# hand-rolled lifecycle.
+myelin-substrate = { path = "../myelin-substrate" }
+# TenantId / Region / ResidencyTag / CellId — the (tenant, region) partition key the registry
+# stores (contract 12.1; the immutable Region the placement invariant pins).
+myelin-tenancy = { path = "../myelin-tenancy" }
+# The PersonalDataHolder trait + the five-tag classify enums + the #[personal_data] derive the
+# registry would carry IF it held PII (it does not — every column is opaque; the
+# control-plane-pii-free lint guards that). The control-plane store auto-registers as a holder
+# (contract 1.4) so the harness's one-door discipline covers it, even though its DSR surface is a
+# tenant-record-only holder (no in-region PII).
+myelin-gdpr = { path = "../myelin-gdpr" }
+
+[dev-dependencies]
+# Principal/PrincipalId/PrincipalKind — used only to construct a `SubjectRef` in the DSR-surface
+# test (the control-plane holder's surface is empty by construction). DEV-only.
+myelin-identity = { path = "../myelin-identity" }

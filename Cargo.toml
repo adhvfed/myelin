@@ -65,6 +65,14 @@ members = [
     # §2.9 ten-crate DAG; the architecture §2.8 "no shared storage-API crate" is preserved
     # because this is the harness-wired mechanism, not a cross-subsystem data-access crate).
     "crates/myelin-storage",
+    # The Tenancy control-plane SERVICE crate (P-CP-05 → P-080): the three PII-free registry
+    # tables (`cell` / `tenant_placement` / `cell_provisioning`) + the per-cell `local_tenant`
+    # directory + the HARD placement invariant (multi-cell single-region by construction). Like
+    # the other service/subsystem crates it is a LEAF consumer ABOVE the glue crates (depends on
+    # -substrate/-tenancy/-gdpr) and is NOT a node in the eleven-crate library DAG modelled by
+    # crate_graph.rs — nothing in the production DAG depends back on it; substrate_is_root() is
+    # preserved. See the crate-level note in crates/myelin-control-plane/src/lib.rs.
+    "crates/myelin-control-plane",
     "crates/myelin-substrate",
     # Test-support failure-injection harness (P-S02..P-S04). NOT a node in the production
     # crate DAG (architecture §2.9) — it sits above myelin-substrate as a leaf consumer and
