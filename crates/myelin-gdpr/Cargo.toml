@@ -7,9 +7,15 @@ publish = false
 
 # myelin-gdpr is below the events tier in the DAG (architecture 00 §2.9):
 # events (+ refs/content/query) → agent, gdpr. It depends on tenancy + identity (the
-# subject locator threads a Principal/TenantId). It MUST NOT depend on -client or
-# -substrate (downstream); such an edge MUST NOT compile.
+# subject locator threads a Principal/TenantId) AND on events (P-GA-01: the `data_role`
+# enum anchors to the frozen 2.1 `EventEnvelope.data_role` field — `myelin_events::DataRole`
+# — so the GDPR `tenant-content | platform-operational` role-tag can never drift from the
+# envelope's `controller | processor`; the edge gdpr → events is acyclic, events depends only
+# on tenancy + identity). It MUST NOT depend on -client or -substrate (downstream); such an
+# edge MUST NOT compile.
 [dependencies]
 myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-identity = { path = "../myelin-identity" }
+myelin-events = { path = "../myelin-events" }
 serde.workspace = true
+serde_json.workspace = true

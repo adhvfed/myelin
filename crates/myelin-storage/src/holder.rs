@@ -14,7 +14,8 @@
 //! `serve`'s, P-S12/P-S15 — this is the hook it calls).
 
 use myelin_gdpr::{
-    DsrError, ExportBundle, LocatedData, PersonalDataHolder, Result as DsrResult, Subject,
+    DsrError, EraseReceipt, EraseScope, LocateReport, Patch, PersonalDataHolder, PortableBundle,
+    RectifyReceipt, Result as DsrResult, RestrictReceipt, SubjectRef, TenantId,
 };
 
 /// The typed receipt that an OLTP store was registered as a [`PersonalDataHolder`] — proof
@@ -73,19 +74,19 @@ fn dsr_floor(method: &str) -> DsrError {
 }
 
 impl PersonalDataHolder for OltpStoreHolder {
-    fn locate(&self, _subject: &Subject) -> DsrResult<LocatedData> {
+    fn locate(&self, _subject: &SubjectRef, _tenant: TenantId) -> DsrResult<LocateReport> {
         Err(dsr_floor("locate"))
     }
-    fn export(&self, _subject: &Subject) -> DsrResult<ExportBundle> {
+    fn export(&self, _subject: &SubjectRef, _tenant: TenantId) -> DsrResult<PortableBundle> {
         Err(dsr_floor("export"))
     }
-    fn rectify(&self, _subject: &Subject, _patch: LocatedData) -> DsrResult<()> {
+    fn rectify(&self, _subject: &SubjectRef, _patch: Patch) -> DsrResult<RectifyReceipt> {
         Err(dsr_floor("rectify"))
     }
-    fn restrict(&self, _subject: &Subject) -> DsrResult<()> {
+    fn restrict(&self, _subject: &SubjectRef, _on: bool) -> DsrResult<RestrictReceipt> {
         Err(dsr_floor("restrict"))
     }
-    fn erase(&self, _subject: &Subject) -> DsrResult<()> {
+    fn erase(&self, _scope: EraseScope) -> DsrResult<EraseReceipt> {
         Err(dsr_floor("erase"))
     }
 }
@@ -117,20 +118,20 @@ impl BlobStoreHolder {
 }
 
 impl PersonalDataHolder for BlobStoreHolder {
-    fn locate(&self, _subject: &Subject) -> DsrResult<LocatedData> {
+    fn locate(&self, _subject: &SubjectRef, _tenant: TenantId) -> DsrResult<LocateReport> {
         Err(dsr_floor("blob locate"))
     }
-    fn export(&self, _subject: &Subject) -> DsrResult<ExportBundle> {
+    fn export(&self, _subject: &SubjectRef, _tenant: TenantId) -> DsrResult<PortableBundle> {
         Err(dsr_floor("blob export"))
     }
-    fn rectify(&self, _subject: &Subject, _patch: LocatedData) -> DsrResult<()> {
+    fn rectify(&self, _subject: &SubjectRef, _patch: Patch) -> DsrResult<RectifyReceipt> {
         Err(dsr_floor("blob rectify"))
     }
-    fn restrict(&self, _subject: &Subject) -> DsrResult<()> {
+    fn restrict(&self, _subject: &SubjectRef, _on: bool) -> DsrResult<RestrictReceipt> {
         Err(dsr_floor("blob restrict"))
     }
     // erase = crypto-shred (destroy the wrapping key), not delete (§3.2) — body is P-ST-09.
-    fn erase(&self, _subject: &Subject) -> DsrResult<()> {
+    fn erase(&self, _scope: EraseScope) -> DsrResult<EraseReceipt> {
         Err(dsr_floor("blob erase (crypto-shred)"))
     }
 }
@@ -139,13 +140,17 @@ impl PersonalDataHolder for BlobStoreHolder {
 mod tests {
     use super::*;
     use myelin_identity::{Principal, PrincipalId, PrincipalKind};
-    use myelin_tenancy::TenantId;
 
-    fn subject() -> Subject {
-        Subject {
-            principal: Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId("acme".into())),
-            tenant: TenantId("acme".into()),
-        }
+    fn subject() -> SubjectRef {
+        SubjectRef::new(Principal::stub(
+            PrincipalId("p".into()),
+            PrincipalKind::Human,
+            TenantId::from_token("acme"),
+        ))
+    }
+
+    fn tenant() -> TenantId {
+        TenantId::from_token("acme")
     }
 
     /// The auto-registration hook fires and produces a receipt naming the store — the
@@ -172,9 +177,14 @@ mod tests {
             holder.register(),
             OltpHolderRegistration { store: "git_pack_blobs" }
         );
-        let s = subject();
+        let _s = subject();
         // The frozen shape compiles + the erase body is the named crypto-shred floor.
-        match holder.erase(&s) {
+        // erase now takes an EraseScope (gdpr §3.1) — a single subject within a tenant.
+        let scope = EraseScope::Subject {
+            subject: subject(),
+            tenant: tenant(),
+        };
+        match holder.erase(scope) {
             Err(DsrError(msg)) => assert!(msg.contains("crypto-shred")),
             Ok(_) => panic!("blob erase must be the GDPR-M1 crypto-shred floor"),
         }
@@ -187,11 +197,15 @@ mod tests {
     fn dsr_bodies_are_the_named_gdpr_m1_floor() {
         let holder = OltpStoreHolder::new("issue_oltp");
         let s = subject();
-        assert!(holder.locate(&s).is_err());
-        assert!(holder.erase(&s).is_err());
+        assert!(holder.locate(&s, tenant()).is_err());
+        assert!(holder
+            .erase(EraseScope::Tenant(tenant()))
+            .is_err());
         // the floor marker names where the real body lands.
-        match holder.export(&s) {
-            Err(DsrError(msg)) => assert!(msg.contains("GDPR M1"), "floor must name its follow-on: {msg}"),
+        match holder.export(&s, tenant()) {
+            Err(DsrError(msg)) => {
+                assert!(msg.contains("GDPR M1"), "floor must name its follow-on: {msg}")
+            }
             Ok(_) => panic!("export body must be the GDPR-M1 floor on P-ST-01"),
         }
     }
