@@ -243,8 +243,8 @@ pub mod telemetry;
 pub mod upcast;
 
 pub use consumer::{
-    Consumer, ConsumerName, DeadLetter, Delivered, Message, PrefetchBound, SubscribeError,
-    Subscription,
+    consume, Consumer, ConsumerName, ConsumerSpec, DeadLetter, Delivered, Message,
+    PerTenantInflight, PrefetchBound, SubscribeError, Subscription,
 };
 pub use dedup::{DedupLedger, CONSUMER_DEDUP_MIGRATION};
 pub use taxonomy::{
