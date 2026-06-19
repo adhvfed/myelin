@@ -1,0 +1,7 @@
+// RED fixture for `no-host-exec` — the lint MUST reject this.
+// A raw host execution that bypasses the unified sandbox (ToolHands::exec): the
+// privilege-escape bug class (X-6). Platform code shells out to the host kernel directly,
+// so none of the four uniform sandbox guarantees apply.
+pub fn run_user_script(script: &str) -> std::io::Result<std::process::Output> {
+    std::process::Command::new("sh").arg("-c").arg(script).output()
+}

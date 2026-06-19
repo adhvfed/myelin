@@ -1,0 +1,8 @@
+// RED fixture for `no-raw-publish` — the lint MUST reject this.
+// A fire-and-forget direct broker publish that bypasses the outbox: the lost-event /
+// causality-break bug class (F5). The event is NOT in the same transaction as the state
+// change; if the process dies after the DB commit, the event is lost.
+pub async fn handle(state: &mut State, broker: &Broker, e: Envelope) {
+    state.apply(&e);
+    broker.publish_now(&e).await;
+}
