@@ -104,6 +104,32 @@
 //! change).** The upcaster registry that runs before `handle` is **P-S09** — the pre-handle hook
 //! ([`consumer::Consumer::with_upcaster`]) is the seam it plugs into (identity map until then).
 //!
+//! ## Status (P-014 / EB-11, 2026-06-19) — the Bus survival signals on the metrics-health port
+//! [`telemetry`] is the **Bus's provider side of contract 1.8 (§4.11)**: it reads the Bus's live
+//! counters (outbox depth + age, the relay's published / dead-letter counts) and folds in the
+//! producer-fed [`telemetry::BusObservations`] (consumer lag, dedup hit-rate, per-tenant
+//! in-flight, causal-depth max, shared-root-tripwire firings) into the seven §4.11 survival
+//! signals, then [`telemetry::BusSignals::emit_to`] writes each as a [`telemetry::MetricSample`]
+//! — **with the right name + unit** ([`telemetry::BusSignal`]) — onto the metrics-health port
+//! seam [`telemetry::MetricsSink`]. These ARE the assertions the §8 Bus drills read; EB-11 wires
+//! them so every later Bus drill has a signal to assert against. The **harness self-test** the
+//! M0→M1 exit gate requires (inject a producer-kill fault → read the outbox-depth + dedup
+//! telemetry assertion) is `tests/drills_eb11_telemetry_self_test.rs`: it snapshots the Bus
+//! after a `Dependency::Broker` kill, emits to a [`telemetry::MetricRecorder`], and maps the
+//! recorded samples into the harness `SignalSource` to assert `outbox_depth`/`dedup` green
+//! (loud, never swallowed). **With EB-01..EB-11 the M0→M1 exit gate is fully green.**
+//!
+//! DEVIATION (EI-01 §1, documented): the contract-1.8 ASSERTION library (`SignalName` /
+//! `SignalSource` / `Predicate` / `Assertion`) already shipped in `myelin-harness` (P-S04) and
+//! is the FROZEN §10.2 16-name enum. `myelin-events` cannot depend on the harness in production
+//! (it is a dev-dependency-only leaf TEST-SUPPORT crate; an `events → harness` production edge
+//! would invert the §2.9 DAG). So [`telemetry`] owns the Bus's *emit* vocabulary as plain
+//! `&'static str` name+unit constants whose names line up 1:1 with the harness `SignalName`,
+//! rather than re-defining or widening that frozen enum (the harness's exhaustive-`ALL` test
+//! stays at 16). The Bus-finer signals (outbox age, publish latency, dedup hit-rate, per-tenant
+//! in-flight) are the Bus's contribution UNDER the §10.2 rows ("depth **+ age**", "consumer lag
+//! … oldest-un-acked **age**", "per-tenant **in-flight**"); the self-test bridges the two.
+//!
 //! ## Floors named (stubbed bodies → filling prompt)
 //! - **The OLTP binding is modeled in-memory at M0.** There is no live database (the OLTP tier
 //!   client is **P-007 / P-ST-01**; the migration runner is **P-S15**). [`outbox::OUTBOX_MIGRATION`]
@@ -131,15 +157,28 @@
 //!   [`consumer::Consumer::with_upcaster`] hook is its install seam; identity map until then.
 //! - `pii_key_ref`'s KMS hierarchy (the DEK epochs) is Storage M1 (11.3); P-001 ships
 //!   only the field + its format.
+//! - **The metrics-health PORT + the producer-side clock (P-014/EB-11).** [`telemetry`] ships
+//!   the *emit* surface ([`telemetry::MetricsSink`] + the in-memory [`telemetry::MetricRecorder`])
+//!   and the snapshot that drives it; the OpenTelemetry exporter on the real §3.5 metrics-health
+//!   port + the monotonic clock that feeds outbox-age / publish-latency wire at **`serve`,
+//!   P-S12/P-S13**. The signal NAMES + UNITS this module emits are the ones that port exports.
+//!   The dispatch-tier **shared-root tripwire COUNTER** that feeds
+//!   [`telemetry::BusObservations::shared_root_tripwire_firings`] is **EB-23 (P-143)**; here the
+//!   signal name/unit + the snapshot seam are frozen so EB-23 only feeds the count (until then
+//!   it is `0` — no tripwire has fired).
 
 pub mod consumer;
 pub mod envelope;
 pub mod outbox;
 pub mod relay;
+pub mod telemetry;
 
 pub use consumer::{
     Consumer, ConsumerName, DeadLetter, DedupLedger, Delivered, Message, PrefetchBound,
     SubscribeError, Subscription, CONSUMER_DEDUP_MIGRATION,
+};
+pub use telemetry::{
+    BusObservations, BusSignal, BusSignals, MetricLabel, MetricRecorder, MetricSample, MetricsSink,
 };
 pub use outbox::{
     EmitContextBase, IdMinter, MonotonicMinter, OutboxRow, OutboxStore, OutboxTransaction, Ulid,
