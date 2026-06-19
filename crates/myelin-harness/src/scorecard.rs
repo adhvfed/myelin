@@ -92,6 +92,18 @@ pub enum Band {
     /// fail-static / disabled-user go/no-go that re-runs (does not re-implement) the eight M1
     /// Id drills ID-D1..ID-D8. The reactive shared layer (M2) is not started over a red row.
     M1Identity,
+    /// The **infra integration gate** (Stage 4) — the band-boundary gate over the REAL backends
+    /// (Postgres / RustFS / Valkey / NATS JetStream). It aggregates the four retrofitted
+    /// silent-data-loss / authz-leak drills run `--features integration` against the live
+    /// docker-compose stack (outbox-no-loss, restore-verify, RLS-isolation, ReBAC-no-leak), plus
+    /// the CONTAINERIZED SMOKES of the two genuine floors (the hardened-container sandbox smoke
+    /// and the 10× containerized load smoke). Every integration row is **RED-until-proven**: its
+    /// proof command is a `cargo test --features integration` that FAILS without the live stack,
+    /// so the gate cannot read green from a DB-free run. The two genuine floors (real-kernel
+    /// SANDBOX-ESCAPE on gVisor/microVM, and the WORLD-SCALE 30× LOAD on real hardware) stay RED
+    /// with their floor NAMED — their containerized smokes are not the full gate, only the
+    /// not-zero-coverage proof under Docker.
+    Infra,
 }
 
 impl fmt::Display for Band {
@@ -99,6 +111,7 @@ impl fmt::Display for Band {
         match self {
             Band::M0 => write!(f, "M0"),
             Band::M1Identity => write!(f, "M1→M2 (Identity)"),
+            Band::Infra => write!(f, "Infra (integration)"),
         }
     }
 }
@@ -112,6 +125,7 @@ impl Band {
         match self {
             Band::M0 => required_rows(),
             Band::M1Identity => id_m1_required_rows(),
+            Band::Infra => infra_required_rows(),
         }
     }
 }
@@ -134,6 +148,14 @@ pub struct GateRow {
     pub proof_command: &'static [&'static str],
     /// `true` iff this is a PERMANENT gate that re-runs forever (SUB-D1 / SUB-D2 / BUS-D4).
     pub permanent: bool,
+    /// `Some(floor)` iff this row's proof command is a CONTAINERIZED SMOKE that does **not**
+    /// close a genuine floor — it is not-zero-coverage, but the full gate needs more than Docker.
+    /// The string NAMES the genuine floor honestly (e.g. the real-kernel gVisor/microVM sandbox,
+    /// or the world-scale 30× load on real hardware) so the deferral is visible, never invisible
+    /// (EI-01 §1). A floor-smoke row can be PROVEN (its smoke runs green under Docker) while the
+    /// rendered artifact still prints the named floor as an open, dated deferral. `None` for the
+    /// four full integration drills, whose `--features integration` proof IS the whole gate.
+    pub floor: Option<&'static str>,
 }
 
 /// The FROZEN required-row set for the SUB-M0 exit gate (substrate roadmap §5). This is the
@@ -157,6 +179,7 @@ pub fn required_rows() -> Vec<GateRow> {
                 "drills_sub_d1_bus_d4",
             ],
             permanent: true,
+            floor: None,
         },
         GateRow {
             id: "SUB-D2",
@@ -169,6 +192,7 @@ pub fn required_rows() -> Vec<GateRow> {
                 "drills_sub_d2_consumer",
             ],
             permanent: true,
+            floor: None,
         },
         GateRow {
             id: "BUS-D4",
@@ -182,6 +206,7 @@ pub fn required_rows() -> Vec<GateRow> {
                 "sub_d1_bus_d4_coloc_drill",
             ],
             permanent: true,
+            floor: None,
         },
         GateRow {
             id: "SUB-D5",
@@ -194,6 +219,7 @@ pub fn required_rows() -> Vec<GateRow> {
                 "sub_d5_retry_storm",
             ],
             permanent: false,
+            floor: None,
         },
         GateRow {
             id: "SUB-D7",
@@ -206,6 +232,7 @@ pub fn required_rows() -> Vec<GateRow> {
                 "drill_sub_d7_idor",
             ],
             permanent: false,
+            floor: None,
         },
         GateRow {
             id: "SUB-D8",
@@ -218,6 +245,7 @@ pub fn required_rows() -> Vec<GateRow> {
                 "drill_sub_d8_causal_loop",
             ],
             permanent: false,
+            floor: None,
         },
         GateRow {
             id: "SUB-D9",
@@ -230,6 +258,7 @@ pub fn required_rows() -> Vec<GateRow> {
                 "drill_sub_d9_liveness_readiness",
             ],
             permanent: false,
+            floor: None,
         },
         GateRow {
             id: "lints",
@@ -238,18 +267,21 @@ pub fn required_rows() -> Vec<GateRow> {
             // violation) — the same gate the architecture-lints CI job runs.
             proof_command: &["run", "-p", "myelin-lints", "--bin", "lint-gate"],
             permanent: false,
+            floor: None,
         },
         GateRow {
             id: "lint-fixtures",
             title: "the lint fixture matrix + the CI-gate self-test (red fixture ⇒ non-zero)",
             proof_command: &["test", "-p", "myelin-lints"],
             permanent: false,
+            floor: None,
         },
         GateRow {
             id: "contract-coverage",
             title: "the contract-coverage scanner — no falsely-claimed/dropped/un-named row",
             proof_command: &["run", "-p", "myelin-lints", "--bin", "contract-coverage"],
             permanent: false,
+            floor: None,
         },
         GateRow {
             id: "harness-self-test",
@@ -261,6 +293,7 @@ pub fn required_rows() -> Vec<GateRow> {
                 "drills::tests::harness_self_test",
             ],
             permanent: false,
+            floor: None,
         },
     ]
 }
@@ -299,6 +332,7 @@ pub fn id_m1_required_rows() -> Vec<GateRow> {
             title,
             proof_command: id_drill_argv(target),
             permanent: false,
+            floor: None,
         }
     }
     vec![
@@ -347,6 +381,7 @@ pub fn id_m1_required_rows() -> Vec<GateRow> {
             title: "the contract-coverage scanner re-affirms the 4.1–4.11 CDC pairs are all present (the coverage gate)",
             proof_command: &["run", "-p", "myelin-lints", "--bin", "contract-coverage"],
             permanent: false,
+            floor: None,
         },
     ]
 }
@@ -383,6 +418,136 @@ fn id_drill_argv(target: &'static str) -> &'static [&'static str] {
         ],
         other => panic!("unknown Id-M1 drill target `{other}` — the proof-command table is frozen"),
     }
+}
+
+/// The FROZEN required-row set for the **infra integration gate** (Stage 4 — the
+/// band-boundary integration gate over the REAL backends). This is the build-layer realisation
+/// of the testing-policy change: every DB / storage / cache / bus prompt ships a REAL
+/// integration test, and the scorecard row stays **RED-until-proven** — it can only read PASS
+/// once its `--features integration` test emits a dated green artifact against the live stack
+/// (no DB-free run can flip it green; the proof command FAILS without Docker).
+///
+/// Six rows:
+/// - **STOR-D-OUTBOX** — outbox-no-loss under crash (real PG + real NATS JetStream). FULL gate.
+/// - **STOR-D-RESTORE** — restore-verify cross-seam (real PG ⟷ real RustFS ⟷ bus offset). FULL.
+/// - **STOR-D-RLS** — (tenant, region) RLS isolation, DB-enforced via the NOBYPASSRLS app role.
+/// - **ID-D-REBAC** — ReBAC check/list_objects no-leak / no-N+1 (real PG tuple store). FULL.
+/// - **SANDBOX-SMOKE** — the CONTAINERIZED hardened-container sandbox smoke (egress-deny +
+///   read-only-root + dropped caps). Its `floor` NAMES the genuine deferral: the real-kernel
+///   SANDBOX-ESCAPE gate (gVisor / microVM) needs a real isolation kernel, not Docker.
+/// - **LOAD-10X-SMOKE** — the 10× CONTAINERIZED load smoke (myelin-harness LoadGenerator driving
+///   the live PG + NATS stack). Its `floor` NAMES the genuine deferral: the WORLD-SCALE 30×
+///   load drill needs real hardware, not a single dev box.
+///
+/// The four FULL drills carry `floor: None` — their integration proof IS the whole gate. The two
+/// SMOKE rows carry `floor: Some(..)`: they can be PROVEN (the smoke runs green under Docker)
+/// while the rendered artifact STILL prints their named floor as an open, dated deferral, so the
+/// two true floors are never silently claimed closed (EI-01 §1).
+pub fn infra_required_rows() -> Vec<GateRow> {
+    vec![
+        GateRow {
+            id: "STOR-D-OUTBOX",
+            title: "outbox no-loss under crash → 0 lost / 0 ghost (real PG + real NATS JetStream)",
+            proof_command: &[
+                "test",
+                "-p",
+                "myelin-storage",
+                "--features",
+                "integration",
+                "--test",
+                "stage3_drills",
+                "drill1_outbox_no_loss_under_crash",
+            ],
+            permanent: true,
+            floor: None,
+        },
+        GateRow {
+            id: "STOR-D-RESTORE",
+            title: "restore-verify cross-seam → rows⟷blobs⟷bus-offset consistent (real PG + real RustFS)",
+            proof_command: &[
+                "test",
+                "-p",
+                "myelin-storage",
+                "--features",
+                "integration",
+                "--test",
+                "stage3_drills",
+                "drill2_restore_verify_cross_seam",
+            ],
+            permanent: true,
+            floor: None,
+        },
+        GateRow {
+            id: "STOR-D-RLS",
+            title: "(tenant, region) RLS isolation → cross-tenant leak = 0 (DB-enforced, NOBYPASSRLS role)",
+            proof_command: &[
+                "test",
+                "-p",
+                "myelin-storage",
+                "--features",
+                "integration",
+                "--test",
+                "stage3_drills",
+                "drill3_tenant_region_rls_isolation",
+            ],
+            permanent: false,
+            floor: None,
+        },
+        GateRow {
+            id: "ID-D-REBAC",
+            title: "ReBAC check/list_objects no-leak / no-N+1 → visible set exact, 1 reverse-index query (real PG tuples)",
+            proof_command: &[
+                "test",
+                "-p",
+                "myelin-storage",
+                "--features",
+                "integration",
+                "--test",
+                "stage3_drills",
+                "drill4_rebac_check_list_objects_no_leak_no_n_plus_1",
+            ],
+            permanent: false,
+            floor: None,
+        },
+        GateRow {
+            id: "SANDBOX-SMOKE",
+            title: "hardened-container sandbox smoke → egress-deny + read-only-root + dropped caps asserted",
+            proof_command: &[
+                "test",
+                "-p",
+                "myelin-storage",
+                "--features",
+                "integration",
+                "--test",
+                "stage4_floor_smokes",
+                "sandbox_escape_containerized_smoke",
+            ],
+            permanent: false,
+            floor: Some(
+                "the real-kernel SANDBOX-ESCAPE gate needs a real isolation kernel \
+                 (gVisor / Firecracker microVM), not a Docker container — RED until run on one",
+            ),
+        },
+        GateRow {
+            id: "LOAD-10X-SMOKE",
+            title: "10× containerized load smoke → myelin-harness LoadGenerator at 10× against the live PG+NATS stack survives",
+            proof_command: &[
+                "test",
+                "-p",
+                "myelin-storage",
+                "--features",
+                "integration",
+                "--test",
+                "stage4_floor_smokes",
+                "load_10x_containerized_smoke",
+            ],
+            permanent: false,
+            floor: Some(
+                "the WORLD-SCALE 30× LOAD drill needs real hardware (a multi-node cluster), \
+                 not a single dev box — RED until run on real hardware",
+            ),
+        },
+    ]
 }
 
 /// The verdict of one recorded scorecard row. A `Pass` is only constructible WITH a non-empty
@@ -522,6 +687,10 @@ impl Scorecard {
                 "ID-D1/D2/D3/D4/D5/D6/D7/D8 + the 4.1–4.11 contract-coverage re-affirm",
                 "M2",
             ),
+            Band::Infra => (
+                "STOR-D-OUTBOX/RESTORE/RLS + ID-D-REBAC (--features integration) + 2 floor smokes",
+                "the next band",
+            ),
         };
         let mut out = String::new();
         out.push_str(&format!(
@@ -548,7 +717,13 @@ impl Scorecard {
         out.push_str("|---|---|---|---|---|---|\n");
         for gr in &rows {
             let recorded = self.rows.iter().find(|r| r.id == gr.id);
-            let perm = if gr.permanent { "re-run-forever" } else { "—" };
+            let perm = if gr.floor.is_some() {
+                "smoke (floor open)"
+            } else if gr.permanent {
+                "re-run-forever"
+            } else {
+                "—"
+            };
             match recorded {
                 Some(r) => match &r.verdict {
                     RowVerdict::Pass { proof } => out.push_str(&format!(
@@ -580,6 +755,30 @@ impl Scorecard {
                  invisible (EI-01 §1). ID-D8 rides the permanent restore-verify gate (STOR-D1/D2, \
                  Storage-owned P-061/P-100), which re-runs on every store-touching change.\n",
             ),
+            Band::Infra => {
+                out.push_str(
+                    "**Red-until-proven (the testing-policy ratchet).** Every integration row above is \
+                     proven ONLY by its `cargo test --features integration` against the LIVE \
+                     docker-compose stack (Postgres / RustFS / Valkey / NATS JetStream). A DB-free run \
+                     cannot flip any row green — the proof command FAILS without the stack. Run via \
+                     `scripts/integration-test.sh` (brings the stack up `--wait`, runs the suite). The \
+                     four full drills (STOR-D-OUTBOX/RESTORE/RLS, ID-D-REBAC) ARE the whole gate.\n\n",
+                );
+                out.push_str("**The two genuine floors (NAMED, still open — their smokes are not the full gate):**\n");
+                for gr in self.band.required_rows().iter().filter(|r| r.floor.is_some()) {
+                    if let Some(floor) = gr.floor {
+                        out.push_str(&format!("- **{}** — {}\n", gr.id, floor));
+                    }
+                }
+                out.push_str(
+                    "\nThe smokes give each floor not-zero-coverage NOW (a hardened-container smoke: \
+                     egress-deny + read-only-root + dropped caps; a 10× containerized load smoke via \
+                     myelin-harness against the live stack). The full real-kernel SANDBOX-ESCAPE gate \
+                     (gVisor / microVM) and the WORLD-SCALE 30× LOAD drill (real hardware) stay RED \
+                     until run on the real substrate — the deferral is visible, never invisible \
+                     (EI-01 §1).\n",
+                );
+            }
         }
         out
     }
@@ -793,5 +992,108 @@ mod tests {
         assert_ne!(m0, id);
         assert!(m0.contains(&"SUB-D1"));
         assert!(id.contains(&"ID-D3"));
+    }
+
+    // ---- Infra integration gate (Stage 4) ----
+
+    /// The Infra required row set is EXACTLY the four retrofitted integration drills + the two
+    /// floor smokes (frozen at 6 rows). The frozen-row ratchet asserts a future edit cannot
+    /// silently shrink the proof set.
+    #[test]
+    fn infra_required_rows_cover_the_four_drills_plus_two_floor_smokes() {
+        let ids: Vec<&str> = infra_required_rows().iter().map(|r| r.id).collect();
+        for must in [
+            "STOR-D-OUTBOX",
+            "STOR-D-RESTORE",
+            "STOR-D-RLS",
+            "ID-D-REBAC",
+            "SANDBOX-SMOKE",
+            "LOAD-10X-SMOKE",
+        ] {
+            assert!(ids.contains(&must), "Infra gate is missing required row {must}");
+        }
+        assert_eq!(ids.len(), 6, "the Infra row set is frozen at 4 drills + 2 floor smokes = 6 rows");
+        assert_eq!(
+            Band::Infra.required_rows().iter().map(|r| r.id).collect::<Vec<_>>(),
+            ids
+        );
+    }
+
+    /// Every Infra integration row's proof command carries `--features integration` — the
+    /// red-until-proven mechanism. A DB-free run cannot flip it green because the integration
+    /// feature (and the live stack it needs) is required to even compile + run the drill.
+    #[test]
+    fn infra_proof_commands_are_features_integration() {
+        for row in infra_required_rows() {
+            assert!(
+                row.proof_command.contains(&"--features") && row.proof_command.contains(&"integration"),
+                "{} must run --features integration (red-until-proven), got {:?}",
+                row.id,
+                row.proof_command
+            );
+        }
+    }
+
+    /// EXACTLY the two floor smokes carry a `floor` note (the genuine deferrals named honestly);
+    /// the four full integration drills carry `floor: None` — their integration proof IS the
+    /// whole gate.
+    #[test]
+    fn infra_only_the_two_floor_smokes_name_a_floor() {
+        let floored: Vec<&str> = infra_required_rows()
+            .into_iter()
+            .filter(|r| r.floor.is_some())
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(floored, vec!["SANDBOX-SMOKE", "LOAD-10X-SMOKE"]);
+    }
+
+    /// A fully-proven Infra scorecard reads GREEN, yet the rendered artifact STILL prints the two
+    /// genuine floors as open, named deferrals (a proven smoke never silently claims its floor
+    /// closed — EI-01 §1).
+    #[test]
+    fn infra_all_rows_proven_is_green_but_floors_stay_named() {
+        let mut card = Scorecard::new(Band::Infra);
+        for r in infra_required_rows() {
+            card.record(RowResult::pass(r.id, format!("[2026-06-19] PASS {}", r.id), "2026-06-19"));
+        }
+        assert!(card.is_green(), "every Infra row proven ⇒ green");
+        let md = card.render_markdown("2026-06-19");
+        assert!(md.contains("SANDBOX-ESCAPE"), "the gVisor/microVM floor must stay named");
+        assert!(md.contains("WORLD-SCALE 30×"), "the real-hardware load floor must stay named");
+        assert!(md.contains("red-until-proven") || md.contains("Red-until-proven"));
+    }
+
+    /// THE RATCHET on the Infra set: dropping ANY single integration row reds the gate (you
+    /// cannot claim the data layer proven over a missing drill).
+    #[test]
+    fn infra_dropping_any_row_reds_the_gate() {
+        for dropped in infra_required_rows() {
+            let mut card = Scorecard::new(Band::Infra);
+            for r in infra_required_rows().into_iter().filter(|r| r.id != dropped.id) {
+                card.record(RowResult::pass(r.id, "[2026-06-19] PASS", "2026-06-19"));
+            }
+            assert_eq!(card.missing_required(), vec![dropped.id]);
+            assert!(!card.is_green(), "dropping {} must RED the Infra gate", dropped.id);
+        }
+    }
+
+    /// THE RATCHET on the Infra set: an unproven (Docker-down) drill is a dated claimed-not-proven
+    /// row — the gate reads RED, never softened (EI-01 §3). This is the red-until-proven contract.
+    #[test]
+    fn infra_unproven_drill_reds_the_gate() {
+        let mut card = Scorecard::new(Band::Infra);
+        for r in infra_required_rows() {
+            if r.id == "STOR-D-OUTBOX" {
+                card.record(RowResult::claimed_not_proven(
+                    r.id,
+                    "the live stack was not up — `cargo test --features integration` failed (red-until-proven)",
+                    "2026-06-19",
+                ));
+            } else {
+                card.record(RowResult::pass(r.id, "[2026-06-19] PASS", "2026-06-19"));
+            }
+        }
+        assert!(!card.is_green(), "an unproven integration drill blocks the infra gate");
+        assert_eq!(card.not_proven().len(), 1);
     }
 }

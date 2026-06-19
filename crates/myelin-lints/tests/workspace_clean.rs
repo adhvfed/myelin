@@ -12,8 +12,9 @@
 //!   contain the forbidden tokens as DATA (the strings the scanner looks for). Scanning the lint
 //!   crate would flag its own pattern lists. Excluded and named.
 //! - `**/tests/**` and `**/fixtures/**` — test fixtures deliberately contain red samples.
-//! - `myelin-harness/src/bin/{sub-m0,id-m1}-scorecard.rs` — the band-boundary exit-gate runners
-//!   (the SUB-M0 runner, P-S24 → P-039; the Identity M1→M2 runner, P-ID-21 → P-079):
+//! - `myelin-harness/src/bin/{sub-m0,id-m1,infra}-scorecard.rs` — the band-boundary exit-gate
+//!   runners (the SUB-M0 runner, P-S24 → P-039; the Identity M1→M2 runner, P-ID-21 → P-079; the
+//!   infra integration runner, Stage 4):
 //!   CI/test-support ORCHESTRATION tooling in the leaf test-support crate `myelin-harness` (NOT a
 //!   production-DAG node, §2.9). They spawn `cargo test`/`cargo run` for each per-feature drill —
 //!   the one legitimate host-exec site, exactly analogous to the relay's one broker-publish site.
@@ -49,6 +50,7 @@ const EXCLUDED_SUBSTRINGS: &[&str] = &[
     "myelin-storage/src/pgrelay.rs", // the OLTP-co-located relay (Stage 2): same legitimate broker-publish role as relay.rs (BUS-2); outbox queries are relay-internal, not tenant-store.
     "myelin-harness/src/bin/sub-m0-scorecard.rs", // the SUB-M0 exit-gate runner: the one legitimate host-exec site (CI orchestration).
     "myelin-harness/src/bin/id-m1-scorecard.rs", // the Identity M1→M2 exit-gate runner (P-079): same legitimate host-exec site (CI orchestration).
+    "myelin-harness/src/bin/infra-scorecard.rs", // the infra integration exit-gate runner (Stage 4): same legitimate host-exec site (spawns `cargo test --features integration` per drill).
     "myelin-lints/", // this crate: scanners + fixtures carry the tokens as data.
     "/tests/",       // test fixtures deliberately contain red samples.
     "/fixtures/",

@@ -1,6 +1,6 @@
 # M0 exit-gate scorecard (SUB-D1/D2/BUS-D4/D5/D7/D8/D9 + 12 lints + harness self-test)
 
-> Generated: 2026-06-19. The build-layer realisation of the master M0→M1 gate invariant (master-sequencing §2/§4, EI-01 §2): no later-band prompt runs over a red earlier gate. Each row is a dated green artifact read off the per-feature drill (this scorecard WIRES the drills, it does not re-implement them). A single RED row blocks M1 and is recorded honestly as claimed-not-proven, never edited green (EI-01 §3 / roadmap §5).
+> Generated: 2026-06-19. The build-layer realisation of the master band gate invariant (master-sequencing §2/§4, EI-01 §2): no later-band prompt runs over a red earlier gate. Each row is a dated green artifact read off the per-feature drill (this scorecard WIRES the drills, it does not re-implement them). A single RED row blocks M1 and is recorded honestly as claimed-not-proven, never edited green (EI-01 §3 / roadmap §5).
 
 **Gate verdict: GREEN — M1 may start**
 

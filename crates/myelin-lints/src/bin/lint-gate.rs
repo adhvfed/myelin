@@ -29,7 +29,8 @@ use std::process::ExitCode;
 ///
 /// The `myelin-harness/src/bin/*-scorecard.rs` band-boundary exit-gate RUNNERS (the SUB-M0 runner
 /// `sub-m0-scorecard.rs`, P-S24 → P-039; the Identity M1→M2 runner `id-m1-scorecard.rs`, P-ID-21 →
-/// P-079) are CI/test-support ORCHESTRATION tooling (the leaf test-support crate `myelin-harness`,
+/// P-079; the infra integration runner `infra-scorecard.rs`, Stage 4) are CI/test-support
+/// ORCHESTRATION tooling (the leaf test-support crate `myelin-harness`,
 /// NOT a node in the production DAG, architecture §2.9) whose whole job is to spawn `cargo
 /// test`/`cargo run` for each per-feature drill and aggregate the result. Their
 /// `Command::new(env!("CARGO"))` is the one legitimate host-exec site, exactly analogous to the
@@ -51,6 +52,11 @@ const EXCLUDED_SUBSTRINGS: &[&str] = &[
     "myelin-storage/src/pgrelay.rs",
     "myelin-harness/src/bin/sub-m0-scorecard.rs",
     "myelin-harness/src/bin/id-m1-scorecard.rs",
+    // The infra integration exit-gate runner (Stage 4): same posture as the two runners above —
+    // its `Command::new(env!("CARGO"))` spawns `cargo test --features integration` per drill, the
+    // one legitimate host-exec site for a CI/test-support orchestration binary. NAMED, LOUD
+    // exclusion of a single tool file; the lint stays fully live on every production crate.
+    "myelin-harness/src/bin/infra-scorecard.rs",
     "myelin-lints/",
     "/tests/",
     "/fixtures/",
