@@ -69,7 +69,7 @@
 //! - `list_subjects` / `explain` (4.4) → P-ID-13 (M1).
 //! - `delegation` (4.5) → P-ID-17 (M1).
 //! - `write_tuples` / zookie + the outbox emit path (4.6) → P-ID-08 (M1).
-//! - `mint_run_token` / `revoke` (4.7) → P-ID-16 / P-ID-14 (M1).
+//! - `mint_run_token` / `revoke` (4.7) → P-ID-18 / P-ID-14 (M1).
 //! - `resolve_pseudonym` / `erase` (4.8) → P-ID-19 / P-ID-20 (M1).
 //! - the ReBAC namespace-fragment `admit` (4.9) → the engine P-ID-10 (M1) + the five
 //!   fragments (P-ID-24/26/27/29/30, closed by P-ID-30).
@@ -477,8 +477,8 @@ pub struct EffectivePolicy {
 pub struct DelegationCaveats(pub Vec<String>);
 
 /// A per-run attenuated capability token (contract 4.7) — life == run life, self-hosted
-/// scope, re-mintable mid-workflow on resume (C6/C9). The PASETO/biscuit envelope lands in
-/// P-ID-16 (M1); the carrier is frozen here.
+/// scope, re-mintable mid-workflow on resume (C6/C9). The mint (`mint_run_token`) lands in
+/// P-ID-18 (M1); the carrier is frozen here.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunToken {
     /// The opaque bearer material.
@@ -634,7 +634,7 @@ pub trait IdentityService {
     ) -> Result<Zookie>;
 
     /// 4.7 — a per-run attenuated token (life == run life; self-hosted scope; re-mintable
-    /// mid-workflow on resume, C6/C9). Body → P-ID-16 (M1).
+    /// mid-workflow on resume, C6/C9). Body → P-ID-18 (M1).
     fn mint_run_token(
         &self,
         agent_id: &PrincipalId,
@@ -855,7 +855,7 @@ mod tests {
                 _d: &DelegationCaveats,
                 _ttl: &FailStaticBound,
             ) -> Result<RunToken> {
-                Err(AuthzError::NotYetImplemented("mint_run_token → P-ID-16 (M1)"))
+                Err(AuthzError::NotYetImplemented("mint_run_token → P-ID-18 (M1)"))
             }
             fn revoke(&self, _t: &RevokeTarget) -> Result<()> {
                 Err(AuthzError::NotYetImplemented("revoke → P-ID-14 (M1)"))

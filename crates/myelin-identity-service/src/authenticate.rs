@@ -510,7 +510,7 @@ impl IdentityService for HumanSsoAuthenticator {
         _delegation_caveats: &DelegationCaveats,
         _ttl: &FailStaticBound,
     ) -> myelin_identity::Result<RunToken> {
-        Err(AuthzError::NotYetImplemented("mint_run_token → P-ID-16 (M1)"))
+        Err(AuthzError::NotYetImplemented("mint_run_token → P-ID-18 (M1)"))
     }
 
     fn revoke(&self, _target: &RevokeTarget) -> myelin_identity::Result<()> {
