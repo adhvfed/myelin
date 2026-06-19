@@ -1,0 +1,10 @@
+// RED fixture for `no-cross-db` — the lint MUST reject this.
+// A service crate reaches into ANOTHER service's storage module: the cross-DB coupling bug
+// class (ADR-01). Services may only couple over the frozen contract crate, never a shared data
+// path; here the Git crate imports Identity's internal store.
+use myelin_identity::store::PrincipalStore;
+use myelin_identity::db::ConnectionPool;
+
+pub fn read_principals_directly(store: &PrincipalStore) {
+    let _ = store;
+}

@@ -1,0 +1,6 @@
+// GREEN fixture for `search-requires-acl-filter` — the lint MUST admit this.
+// The ACL Filter is conjoined BEFORE scoring (pre-filter) — only documents the viewer may see
+// reach the scorer, so existence and rank never leak (ADR-03, OQ-E).
+pub async fn search_prefiltered(index: &Index, query: Query, acl_filter: Filter) -> Vec<Hit> {
+    index.search(query.with_acl(acl_filter)).await.unwrap()
+}

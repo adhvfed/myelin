@@ -1,0 +1,12 @@
+// RED fixture for `control-plane-pii-free` — the lint MUST reject this.
+// A control-plane frame (a cross-cell pointer) carries PII: the control plane must carry OPAQUE
+// IDS ONLY (ADR-11, OQ-I). PII is born inside the cell, never here. The fields ARE
+// #[personal_data]-tagged (so `no-untagged-personal-data` is satisfied — this fixture isolates
+// the control-plane rule): tagging does NOT make PII admissible in the control plane.
+pub struct CrossCellPointer {
+    pub tenant_id: TenantId,
+    #[personal_data(contact)]
+    pub email: String,
+    #[personal_data(identity)]
+    pub display_name: String,
+}

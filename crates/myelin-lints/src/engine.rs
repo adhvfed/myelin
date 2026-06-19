@@ -121,6 +121,30 @@ pub fn strip_block_comments(src: &str) -> String {
     out
 }
 
+/// Replace the CONTENTS of every double-quoted string literal on a line with spaces (keeping the
+/// surrounding quotes + the line length), so a forbidden token that appears as string DATA — e.g.
+/// the migration runner's OWN guard `upper.contains("DROP COLUMN")`, or a SQL-DDL fragment a
+/// scanner-checker holds as a literal — is not mistaken for the real construct. This is the
+/// string-literal analogue of [`strip_line_comment`]: a lint that targets DDL/code (not the
+/// string data that mentions it) scans the blanked form. Conservative: it does not track escaped
+/// quotes inside a literal (acceptable for our conventionally-formatted source; a false result
+/// fails loudly and is fixed, never silently swallowed — EI-01 §5).
+pub fn blank_string_literals(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut in_str = false;
+    for c in line.chars() {
+        if c == '"' {
+            in_str = !in_str;
+            out.push('"');
+        } else if in_str {
+            out.push(' ');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Iterate the CODE lines of a source unit (block comments stripped, then line comments
 /// stripped), yielding `(1-based line number, code-only text)`. The shared front-end every lint
 /// scanner uses so all four agree on "what is code".
@@ -214,6 +238,17 @@ mod tests {
         // a comment that NAMES the forbidden token must NOT trip the lint.
         let src = "let bar = 1; // this line mentions foo in prose";
         assert!(run(&[ban_foo()], src).is_ok());
+    }
+
+    #[test]
+    fn string_literal_contents_are_blanked_but_quotes_and_length_survive() {
+        // a forbidden token held as DATA (a guard checking for the pattern) is blanked out, so a
+        // lint targeting the real construct does not trip on the check that forbids it.
+        let line = r#"if upper.contains("DROP COLUMN") { reject(); }"#;
+        let blanked = blank_string_literals(line);
+        assert!(!blanked.contains("DROP COLUMN"), "literal contents must be blanked");
+        assert!(blanked.contains("upper.contains("), "code outside the literal survives");
+        assert_eq!(blanked.len(), line.len(), "length (and so column offsets) is preserved");
     }
 
     #[test]
