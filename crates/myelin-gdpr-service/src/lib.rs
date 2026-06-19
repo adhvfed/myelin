@@ -108,9 +108,27 @@
 //! generation + the deterministic [`datamap::Inventory::fingerprint`] the diff compares); the
 //! per-store content **completeness** floor → **M5 P-GA-32 → P-505**; the **RoPA legal text** is
 //! **`[OPEN — LEGAL]`** (the GENERATION ships here; the DPO ratifies the characterisation).
+//!
+//! ## P-GA-10 (→ P-110) — the CI data-map DIFF GATE + the DPIA-route on reclassification (contract 10.3)
+//! [`diffgate`] ships the **CI data-map diff gate** — the committed inventory ([`diffgate::CommittedBaseline`])
+//! is the DPO-reviewed baseline; a build regenerates the inventory and [`diffgate::check_against_baseline`]
+//! compares it: an UNCHANGED map passes ([`diffgate::GateVerdict::Unchanged`]); a CHANGED one (a new PII
+//! field, a reclassification, a holder added/removed) FAILS ([`diffgate::GateVerdict::Changed`]) with the
+//! structured [`diffgate::DataMapDiff`] surfaced — *until a DPO reviews and re-seals the baseline*. A
+//! newly-appeared `SpecialCategory` flow additionally routes into the **DPIA gate** (the
+//! [`diffgate::DataMapDiff::dpia_verdicts`] the [`myelin_gdpr::DpiaRouter`] from P-108 drives — *surfaced for
+//! a DPO, never auto-decided*). This is GA-D5's data-map-diff face; the companion `no-untagged-personal-data`
+//! lint (P-GA-03) is the COMPILE-time half (an untagged PII field never reaches the map). **Floors named:**
+//! the map's content **completeness** grows per store as holders ship → **M5 P-GA-32 → P-505** (the gate
+//! surfaces each new holder's fields as an additive diff a DPO reviews); the **CI pipeline wiring** (the
+//! committed baseline file + the build step that fails the pipeline on a red verdict) lands with the
+//! `serve(AppSpec)` boot that assembles the full registered-holder set (the gate LOGIC is complete + tested
+//! here — the pipeline invocation is one call to [`diffgate::check_against_baseline`] over the boot's holder
+//! set).
 
 pub mod audit;
 pub mod datamap;
+pub mod diffgate;
 pub mod holders;
 pub mod orchestration;
 
@@ -120,6 +138,10 @@ pub use audit::{
 pub use datamap::{
     data_map, ropa, ropa_for_tenant, tagged_field_count, HolderSchema, Inventory, InventoryEntry,
     ProcessingActivities, ProcessingActivity, DATA_MAP_ENTRY_COUNT, DATA_MAP_HOLDER_COUNT,
+};
+pub use diffgate::{
+    check_against_baseline, diff, CommittedBaseline, DataMapDiff, GateVerdict, Reclassification,
+    COMMITTED_BASELINE_FINGERPRINT,
 };
 pub use holders::{
     gdpr_owned_holder_ids, AuditCarveOutHolder, CryptoShredKms, GdprOwnStoreHolder,
