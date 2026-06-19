@@ -109,6 +109,13 @@ impl std::error::Error for PgError {}
 pub struct PgStore {
     pool: PgPool,
     region: String,
+    /// A round-trip counter incremented once per authz query the ReBAC store issues
+    /// ([`check_tuple`](PgStore::check_tuple) / [`list_objects`](PgStore::list_objects) /
+    /// [`reverse_index`](PgStore::reverse_index)). It is the instrument the stage-3
+    /// ReBAC-NO-LEAK/NO-N+1 drill reads to PROVE `list_objects` is ONE reverse-index query for the
+    /// whole visible set — not one `check` per candidate object (the N+1 anti-pattern). Shared
+    /// across clones (an `Arc`) so a cloned handle observes the same count.
+    authz_queries: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl PgStore {
@@ -127,7 +134,16 @@ impl PgStore {
         Ok(PgStore {
             pool,
             region: region.to_string(),
+            authz_queries: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
+    }
+
+    /// The number of authz round-trips this store has issued (the N+1 instrument; see
+    /// [`authz_queries`](PgStore#structfield.authz_queries)). The stage-3 ReBAC drill snapshots
+    /// this before `list_objects` and asserts the delta is exactly 1 (one reverse-index query for
+    /// the whole visible set — no per-candidate `check` fan-out).
+    pub fn authz_query_count(&self) -> u64 {
+        self.authz_queries.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The underlying bounded pool (for the OLTP-reachability smoke check).
@@ -222,6 +238,8 @@ impl PgStore {
         // query threads an explicit `tenant_id` predicate (the tenant-predicate IDOR floor — a
         // tenant-store query must carry the tenant predicate in the query itself, not rely on
         // RLS alone). The tenant is the VERIFIED arg, never a URL path.
+        self.authz_queries
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let rows = sqlx::query(
             "SELECT object_id FROM rebac_tuple \
              WHERE tenant_id = $1 AND subject = $2 AND relation = $3 ORDER BY object_id",
@@ -233,6 +251,81 @@ impl PgStore {
         .await
         .map_err(|e| PgError::Query(e.to_string()))?;
         Ok(rows.iter().map(|r| r.get::<String, _>("object_id")).collect())
+    }
+
+    /// **check (contract 4.2) — the per-action fail-closed gate, one tuple existence query.**
+    /// Returns `true` iff the `⟨object#relation@subject⟩` edge exists in the verified
+    /// `(tenant, region)` partition. ONE query — never a candidate fan-out. Fail-closed by
+    /// construction: an absent edge (or a DB hiccup, which propagates as `Err`) is a DENY, never a
+    /// silent allow. Used by the stage-3 ReBAC drill to assert allow/deny correctness.
+    pub async fn check_tuple(
+        &self,
+        tenant: &str,
+        object_id: &str,
+        relation: &str,
+        subject: &str,
+    ) -> Result<bool, PgError> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| PgError::Query(e.to_string()))?;
+        self.set_session_scope(&mut conn, tenant).await?;
+        self.authz_queries
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM rebac_tuple \
+             WHERE tenant_id = $1 AND object_id = $2 AND relation = $3 AND subject = $4)",
+        )
+        .bind(tenant)
+        .bind(object_id)
+        .bind(relation)
+        .bind(subject)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|e| PgError::Query(e.to_string()))?;
+        Ok(exists)
+    }
+
+    /// **list_objects (contract 4.3) — the leak-free pre-filter, ONE reverse-index query.**
+    /// Returns EXACTLY the set of objects the `subject` may access under `relation`, in the
+    /// verified `(tenant, region)` partition — the S8 reverse-index access path
+    /// ([`reverse_index`](PgStore::reverse_index)) `list_objects` lowers to (the `InRelation` /
+    /// `TupleSet` JOIN). The leak-free property is structural: the server computes the visible set
+    /// from the tuple store and returns ONLY it — an unauthorized object is never a candidate the
+    /// caller post-filters (no leak). The NO-N+1 property is structural: this is ONE query for the
+    /// WHOLE set, NOT one [`check_tuple`](PgStore::check_tuple) per candidate object — the stage-3
+    /// drill snapshots [`authz_query_count`](PgStore::authz_query_count) around this call and
+    /// asserts the delta is exactly 1.
+    pub async fn list_objects(
+        &self,
+        tenant: &str,
+        subject: &str,
+        relation: &str,
+    ) -> Result<Vec<String>, PgError> {
+        // list_objects IS the S8 reverse-index lookup (one query). Delegating keeps the single
+        // access path single — there is deliberately no second, candidate-iterating code path.
+        self.reverse_index(tenant, subject, relation).await
+    }
+
+    /// **RLS-scoped connection (stage-3 (TENANT,REGION)-RLS-ISOLATION drill).** Acquire a pooled
+    /// connection and set its session `(tenant, region)` scope to `acting_tenant`, then hand it
+    /// back so the caller can run reads under THAT scope. The RLS-isolation drill uses this to run
+    /// a deliberately tenant-predicate-LESS `SELECT *` and prove the DB's FORCE-RLS policy — not
+    /// app code — filters out every other tenant's rows. The unscoped probe query itself lives in
+    /// the test (under `/tests/`, the home for deliberate red/probe samples) so `pg.rs` keeps every
+    /// tenant-store query tenant-bound (the `tenant-predicate` IDOR lint stays fully live here).
+    pub async fn scoped_conn(
+        &self,
+        acting_tenant: &str,
+    ) -> Result<sqlx::pool::PoolConnection<sqlx::Postgres>, PgError> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| PgError::Query(e.to_string()))?;
+        self.set_session_scope(&mut conn, acting_tenant).await?;
+        Ok(conn)
     }
 
     /// Set the per-session `(tenant, region)` GUCs the RLS policy keys on. The tenant is the
