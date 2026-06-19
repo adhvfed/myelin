@@ -12,11 +12,12 @@
 //!   contain the forbidden tokens as DATA (the strings the scanner looks for). Scanning the lint
 //!   crate would flag its own pattern lists. Excluded and named.
 //! - `**/tests/**` and `**/fixtures/**` — test fixtures deliberately contain red samples.
-//! - `myelin-harness/src/bin/sub-m0-scorecard.rs` — the SUB-M0 exit-gate runner (P-S24 → P-039):
+//! - `myelin-harness/src/bin/{sub-m0,id-m1}-scorecard.rs` — the band-boundary exit-gate runners
+//!   (the SUB-M0 runner, P-S24 → P-039; the Identity M1→M2 runner, P-ID-21 → P-079):
 //!   CI/test-support ORCHESTRATION tooling in the leaf test-support crate `myelin-harness` (NOT a
-//!   production-DAG node, §2.9). It spawns `cargo test`/`cargo run` for each per-feature drill —
+//!   production-DAG node, §2.9). They spawn `cargo test`/`cargo run` for each per-feature drill —
 //!   the one legitimate host-exec site, exactly analogous to the relay's one broker-publish site.
-//!   It is never on a user/agent request path, so the `no-host-exec` sandbox-escape rule (which
+//!   They are never on a user/agent request path, so the `no-host-exec` sandbox-escape rule (which
 //!   guards PLATFORM code) does not apply. Named + LOUD, the lint stays fully live on every
 //!   production crate; NOT weakened.
 //!
@@ -46,6 +47,7 @@ fn workspace_root() -> PathBuf {
 const EXCLUDED_SUBSTRINGS: &[&str] = &[
     "myelin-events/src/relay.rs", // the one legitimate broker-publish component (by design).
     "myelin-harness/src/bin/sub-m0-scorecard.rs", // the SUB-M0 exit-gate runner: the one legitimate host-exec site (CI orchestration).
+    "myelin-harness/src/bin/id-m1-scorecard.rs", // the Identity M1→M2 exit-gate runner (P-079): same legitimate host-exec site (CI orchestration).
     "myelin-lints/", // this crate: scanners + fixtures carry the tokens as data.
     "/tests/",       // test fixtures deliberately contain red samples.
     "/fixtures/",

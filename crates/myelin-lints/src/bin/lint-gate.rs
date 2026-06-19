@@ -27,18 +27,21 @@ use std::process::ExitCode;
 /// EI-01 §4). The relay is the one legitimate broker-publish site; the lint crate carries the
 /// forbidden tokens as scanner data; test/fixture trees deliberately hold red samples.
 ///
-/// `myelin-harness/src/bin/sub-m0-scorecard.rs` (P-S24 → P-039) is the SUB-M0 exit-gate runner:
-/// CI/test-support ORCHESTRATION tooling (the leaf test-support crate `myelin-harness`, NOT a
-/// node in the production DAG, architecture §2.9) whose whole job is to spawn `cargo test`/`cargo
-/// run` for each per-feature drill and aggregate the result. Its `Command::new(env!("CARGO"))`
-/// is the one legitimate host-exec site, exactly analogous to the relay's one legitimate
-/// broker-publish site: it is developer/CI tooling, never reachable on a user/agent request path,
-/// so the `no-host-exec` sandbox-escape rule (which guards PLATFORM code) does not apply. This is
-/// a NAMED, LOUD exclusion of a single tool file — the lint stays fully live on every production
-/// crate; it is NOT weakened. (The production execution seam `ToolHands::exec` lands in M2/CI.)
+/// The `myelin-harness/src/bin/*-scorecard.rs` band-boundary exit-gate RUNNERS (the SUB-M0 runner
+/// `sub-m0-scorecard.rs`, P-S24 → P-039; the Identity M1→M2 runner `id-m1-scorecard.rs`, P-ID-21 →
+/// P-079) are CI/test-support ORCHESTRATION tooling (the leaf test-support crate `myelin-harness`,
+/// NOT a node in the production DAG, architecture §2.9) whose whole job is to spawn `cargo
+/// test`/`cargo run` for each per-feature drill and aggregate the result. Their
+/// `Command::new(env!("CARGO"))` is the one legitimate host-exec site, exactly analogous to the
+/// relay's one legitimate broker-publish site: it is developer/CI tooling, never reachable on a
+/// user/agent request path, so the `no-host-exec` sandbox-escape rule (which guards PLATFORM code)
+/// does not apply. These are NAMED, LOUD exclusions of single tool files — the lint stays fully
+/// live on every production crate; it is NOT weakened. (The production execution seam
+/// `ToolHands::exec` lands in M2/CI.)
 const EXCLUDED_SUBSTRINGS: &[&str] = &[
     "myelin-events/src/relay.rs",
     "myelin-harness/src/bin/sub-m0-scorecard.rs",
+    "myelin-harness/src/bin/id-m1-scorecard.rs",
     "myelin-lints/",
     "/tests/",
     "/fixtures/",

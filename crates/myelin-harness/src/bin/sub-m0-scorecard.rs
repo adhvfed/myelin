@@ -15,7 +15,7 @@
 //! Usage: `cargo run -p myelin-harness --bin sub-m0-scorecard`. CI runs it as the
 //! `sub-m0-scorecard` job.
 
-use myelin_harness::scorecard::{required_rows, Band, RowResult, Scorecard};
+use myelin_harness::scorecard::{required_rows, today_iso, Band, RowResult, Scorecard};
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
@@ -102,33 +102,4 @@ fn scorecard_path() -> PathBuf {
         .unwrap_or(&crate_dir)
         .to_path_buf();
     root.join("testing").join("scorecards").join("sub-m0.md")
-}
-
-/// Today's date as ISO-8601 `YYYY-MM-DD`, derived from the system clock with no external time
-/// crate (the harness keeps its dep set tiny). Computed via the civil-from-days algorithm.
-fn today_iso() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let days = (secs / 86_400) as i64;
-    let (y, m, d) = civil_from_days(days);
-    format!("{y:04}-{m:02}-{d:02}")
-}
-
-/// Howard Hinnant's days→civil-date algorithm (proleptic Gregorian). `days` is days since the
-/// Unix epoch (1970-01-01). Returns (year, month, day).
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32; // [1, 12]
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
 }
