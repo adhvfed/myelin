@@ -1,0 +1,8 @@
+// GREEN fixture for `residency-pin` — the IDENTITY-relevant slice (P-ID-03 / P-024).
+// The lint MUST admit this. The Identity S1 principal store is opened with its `Region` PINNED on
+// the same construction statement — no global pool; every authz read stays inside its residency
+// boundary, so there is no cross-region Id read path (ADR-11; refined-arch §1). This is the
+// region-pinned Id store open the lint admits.
+pub async fn open_principal_store(config: OltpConfig, region: Region) -> ColocatedOltp {
+    ColocatedOltp::open(config.region(region)).unwrap()
+}
