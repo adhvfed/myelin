@@ -95,6 +95,7 @@
 
 pub mod audit;
 pub mod holders;
+pub mod orchestration;
 
 pub use audit::{
     AuditConsumer, AuditEntry, AuditLog, Minimised, Outcome, AUDIT_APPEND_LAG,
@@ -102,4 +103,9 @@ pub use audit::{
 pub use holders::{
     gdpr_owned_holder_ids, AuditCarveOutHolder, CryptoShredKms, GdprOwnStoreHolder,
     InMemoryShredKms, ShredKeyClass, ShredKeyHandle, AUDIT_CARVE_OUT_STORE, GDPR_OWN_STORE,
+};
+pub use orchestration::{
+    canonical_phase_of, holder_ids, CanonicalErasePhase, EraseChecklist, HolderReceipt,
+    RegisteredHolder, SeamHolder, UpstreamHolderOrchestrator, CRYPTO_SHRED_LAG,
+    ERASURE_FANOUT_COVERAGE,
 };
