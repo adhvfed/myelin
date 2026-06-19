@@ -206,6 +206,102 @@ fn each_red_fixture_trips_exactly_its_own_lint() {
     }
 }
 
+// ================================================================================================
+// EB-08 → P-044: the Bus's OWNED slice of `no-cross-sync-cycle` — the WRITE-PATH leg.
+//
+// The P-S11 → P-018 form (the matrix rows above) is the Identity-sink half (the `@identity-sink`
+// fixtures). EB-08 is the Bus's owned slice of the SAME contract-1.6 lint, keyed to the broader
+// canonical rule (refined-arch event-bus §7.1 + 00-reconciliation §X-1): a SYNCHRONOUS
+// cross-subsystem call in a WRITE PATH (the "is it green?" sync call) is rejected; reading the local
+// projection / reacting over the bus is admitted. These tests are the EB-08 red+green fixture
+// obligation — BOTH fixtures are the pass condition (a lint that only rejects, or only admits, is
+// not proven). The fixtures are scoped by the loud, named `// @write-path` marker, so they exercise
+// a genuinely NEW bug fingerprint the Identity-sink leg does not catch.
+// ================================================================================================
+
+const EB08_RED: &str = "no_cross_sync_cycle.eb08.red.rs.txt";
+const EB08_GREEN: &str = "no_cross_sync_cycle.eb08.green.rs.txt";
+
+#[test]
+fn eb08_write_path_red_fixture_is_rejected() {
+    // The EB-08 red fixture (a sync `call_sync` cross-subsystem RPC in an `@write-path` merge-gate)
+    // MUST be rejected by `no-cross-sync-cycle`, fired by THAT lint.
+    let lint = no_cross_sync_cycle();
+    let violations = lint.run(&read_fixture(EB08_RED));
+    assert!(
+        !violations.is_empty(),
+        "no-cross-sync-cycle MUST reject the EB-08 write-path red fixture (the \"is it green?\" \
+         sync call), but found 0 violations"
+    );
+    assert!(
+        violations.iter().all(|v| v.lint == LintId("no-cross-sync-cycle")),
+        "every EB-08 red-fixture violation must carry the no-cross-sync-cycle id"
+    );
+}
+
+#[test]
+fn eb08_write_path_green_fixture_is_admitted() {
+    // The EB-08 green fixture (the merge gate reads its OWN cell-local projection, no sync RPC) MUST
+    // be admitted — proving the lint does not over-reject (both fixtures are the EB-08 pass cond.).
+    let lint = no_cross_sync_cycle();
+    let violations = lint.run(&read_fixture(EB08_GREEN));
+    assert!(
+        violations.is_empty(),
+        "no-cross-sync-cycle MUST admit the EB-08 write-path green fixture (the projection read), \
+         but found: {violations:?}"
+    );
+}
+
+#[test]
+fn eb08_write_path_red_trips_exactly_its_own_lint() {
+    // Cross-lint isolation: the EB-08 write-path red fixture must be caught by no-cross-sync-cycle
+    // and by NO OTHER of the twelve lints (so the whole-set CI gate rejects it for the right reason).
+    let red = read_fixture(EB08_RED);
+    let mut firing: Vec<LintId> = Vec::new();
+    for lint in all_twelve() {
+        if !lint.run(&red).is_empty() {
+            firing.push(lint.id);
+        }
+    }
+    assert_eq!(
+        firing,
+        vec![LintId("no-cross-sync-cycle")],
+        "the EB-08 write-path red fixture must trip exactly no-cross-sync-cycle, but tripped: {firing:?}"
+    );
+}
+
+#[test]
+fn eb08_write_path_green_is_admitted_by_the_full_twelve_set() {
+    // The set-level gate (the form CI runs): run() over ALL twelve lints is Err on the EB-08 red and
+    // Ok on the EB-08 green (no lint false-positives on the projection-read green).
+    let all = all_twelve();
+    assert!(
+        run(&all, &read_fixture(EB08_RED)).is_err(),
+        "the twelve-lint set must REJECT the EB-08 write-path red fixture"
+    );
+    assert!(
+        run(&all, &read_fixture(EB08_GREEN)).is_ok(),
+        "the twelve-lint set must ADMIT the EB-08 write-path green fixture (the projection read)"
+    );
+}
+
+#[test]
+fn eb08_write_path_leg_is_inert_without_the_marker() {
+    // The write-path leg is scoped by the loud, named `// @write-path` marker (EI-01 §4): a sync
+    // cross-subsystem call OUTSIDE a marked write path is NOT this lint's concern (it admits the
+    // whole current no-write-path-yet workspace until the producer write paths land). Strip the
+    // marker from the red fixture → the leg goes inert (0 violations). This proves the gate does not
+    // over-reach: it fires only where a write path is actually being scanned.
+    let red = read_fixture(EB08_RED);
+    let unmarked = red.replace("@write-path", "(removed-marker)");
+    let lint = no_cross_sync_cycle();
+    assert!(
+        lint.run(&unmarked).is_empty(),
+        "the EB-08 write-path leg must be INERT on an unmarked source (no `@write-path`), so the \
+         lint admits the whole current workspace until producer write paths land"
+    );
+}
+
 #[test]
 fn removing_any_lint_breaks_the_matrix() {
     // THE RATCHET REGRESSION TEST: if any one of the twelve lints is un-wired, that lint's red

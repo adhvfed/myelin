@@ -1,0 +1,11 @@
+// RED fixture for `no-cross-sync-cycle` — the EB-08 write-path leg (P-044). The lint MUST reject
+// this. A subsystem (here Git's merge-gate write path) SYNCHRONOUSLY calls another subsystem (CI)
+// inside a write path to ask "is it green?" — the bus is cell-local; heavy cross-system work is
+// async OFF the bus, never synchronous in the write path (refined-arch event-bus §7.1). CI emits,
+// Git reads its OWN projection; Git never synchronously calls CI (00-reconciliation §X-1).
+// @write-path
+pub async fn evaluate_merge_gate(ci: &SyncServiceClient, commit_oid: &str) -> bool {
+    // BUG: a synchronous cross-subsystem RPC asking CI "is it green" in the merge-gate write path.
+    let result = ci.call_sync(check_is_green_request(commit_oid));
+    result.is_green()
+}
