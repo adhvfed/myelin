@@ -1,0 +1,40 @@
+// GREEN fixture for `no-untagged-personal-data` — the GDPR-OWNED slice (P-GA-03 / P-051).
+// The lint MUST admit this. This is the deliberate confirmation that the lint admits the ACTUAL
+// FROZEN `#[personal_data(...)]` attribute shape — the full SIX-TAG keyword form frozen in
+// P-GA-02 / P-050 (gdpr-and-audit §2.1: `category | role | basis | retention | erasure |
+// subject_locator`), not merely the short single-arg floor form the substrate fixtures use. Every
+// PII-bearing field carries the canonical multi-line tag, so the generated data-map / RoPA (Art. 30)
+// and the crypto-shred / pseudonymise erasure fan-out (Art. 17) reach it. Non-PII columns
+// (`subject_ref`, `tenant`, `region`) need no tag — they are opaque references.
+pub struct ConsentRow {
+    pub subject_ref: SubjectRef,
+    #[personal_data(
+        category = ContactInfo,
+        role = TenantContent,
+        basis = Contract,
+        retention = TenantPolicy,
+        erasure = CryptoShred(subject_dek),
+        subject_locator = "subject_ref",
+    )]
+    pub email: EncryptedField<Email>,
+    #[personal_data(
+        category = Identifier,
+        role = PlatformOperational,
+        basis = LegalObligation,
+        retention = AuditCarveOut(Duration::days(2555)),
+        erasure = Pseudonymise,
+        subject_locator = "subject_ref",
+    )]
+    pub full_name: EncryptedField<FullName>,
+    #[personal_data(
+        category = ContactInfo,
+        role = TenantContent,
+        basis = Consent(consent_id),
+        retention = UntilContractEnd,
+        erasure = CryptoShred(subject_dek),
+        subject_locator = "subject_ref",
+    )]
+    pub phone: EncryptedField<Phone>,
+    pub tenant: TenantId,
+    pub region: Region,
+}
