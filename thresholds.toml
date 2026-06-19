@@ -116,6 +116,16 @@ hard = 16
 [authz_index]
 ids_cardinality_cap = 1000      # the Ids↔Filter switch point (P-ID-31 finalises the measured value).
 reverse_index_lag_slo_ms = 1000 # the freshness SLO seed (P-ID-12 read-fallback reads it; P-ID-31 finalises).
+# `list_subjects(object, permission)` (the Zanzibar Expand at density, contract 4.4 / C8) served by
+# the SAME S8 reverse index: the read-fanout case (a 50k-member channel `list_subjects(channel,
+# watcher)`) must return within this budget so Notif's ambient-unread fanout does not degrade. The
+# SHAPE (an S8-served expand, NOT a bespoke per-member scan) is FROZEN here; the NUMBER is the
+# default-to-beat seed measured against SYNTHETIC density now (P-ID-13 / P-071) and re-measured
+# against a REAL watchable subsystem (the `watcher` relation P-ID-23, Chat channels M4) — those
+# prompts close the real-density floor. Keyed on contract 4.4. The `list_subjects` body asserts the
+# 50k-member synthetic expand finishes well under this ceiling.
+list_subjects_density_members = 50000 # the pinned density (a 50k-member channel, C8).
+list_subjects_density_budget_ms = 250 # the 50k-density expand budget seed (P-ID-23/M4 re-measure at real density).
 
 # ---------------------------------------------------------------------------------------------
 # [[shed_budgets]] — the per-surface shed-budget v1 FLOORS (contract 1.11, architecture §7.6).
