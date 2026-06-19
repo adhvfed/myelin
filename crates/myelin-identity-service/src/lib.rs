@@ -74,6 +74,7 @@ pub mod machine_auth;
 pub mod mint;
 pub mod namespace;
 pub mod principal_store;
+pub mod pseudonym_erase;
 pub mod pseudonym_store;
 pub mod read_replica;
 pub mod revocation;
@@ -120,6 +121,10 @@ pub use mint::{
 };
 pub use principal_store::{
     PrincipalError, PrincipalProfile, PrincipalRow, PrincipalStore, ProfileRef, S1_HOLDER, S1_TABLE,
+};
+pub use pseudonym_erase::{
+    ErasureLedgerEntry, ErasureReceipt, PseudonymEraseError, PseudonymErasureLedger,
+    ReErasureReceipt, ERASURE_LEDGER,
 };
 pub use pseudonym_store::{
     PseudonymError, PseudonymRow, PseudonymStore, S2_HOLDER, S2_TABLE,
@@ -451,6 +456,27 @@ pub struct StoreBackedCheck {
     /// scope, and re-mints a fresh attenuated token mid-workflow on resume. Wired over the SAME S7
     /// store + S3 tuple store this slot holds (one revocation oracle, one write primitive).
     minter: mint::RunTokenMinter,
+    /// **The shared cell KMS engine (P-058) — the crypto-shred substrate (11.3/11.4).** The S2
+    /// pseudonym map seals each subject's real-identity link under its PER-SUBJECT DEK through THIS
+    /// engine; `erase_in` (P-ID-20) destroys that one key here. Shared (Arc) so the SAME engine S1's
+    /// profile encryption uses is the one the erase shreds — one Art. 17 erase destroys both the
+    /// profile and the pseudonym link in one per-subject-DEK shred (architecture §2).
+    kms: std::sync::Arc<myelin_storage::KmsEngine>,
+    /// **S2, the pseudonym map (P-ID-19) — the `resolve_pseudonym`/`erase` store half (4.8).** Maps a
+    /// subject's opaque `principal_id` to its per-tenant public pseudonym (the frozen
+    /// `<pseudonym>@<tenant>.noreply` grammar), sealing the real-identity link under the per-subject
+    /// DEK. `resolve_pseudonym_in` reads it; `erase_in` shreds its row (paired with the per-subject
+    /// DEK destroy). Cloneable + shared so a live service wires the SAME S2 store the `put_mapping`
+    /// path populates.
+    pseudonyms: PseudonymStore,
+    /// **The PII-free per-subject erasure ledger (P-ID-20, contract 10.8).** Every `erase_in` records
+    /// the erasure here (opaque principal id + partition + date ONLY — never the real identity), so
+    /// `re_erase_after_restore` can REPLAY it: after a restore brings back a pre-erasure backup, the
+    /// re-erasure pass re-runs the crypto-shred for every recorded subject (the ID-D8 path). The
+    /// ledger is non-shred-erasable (it must survive the key destruction it records + survive a
+    /// restore). Cloneable + shared so the erase path, the re-erasure pass, and the service read one
+    /// ledger.
+    erasure_ledger: pseudonym_erase::PseudonymErasureLedger,
 }
 
 impl StoreBackedCheck {
@@ -473,6 +499,23 @@ impl StoreBackedCheck {
         // primitive): a mint registers the per-run TTL into the SAME denylist `check`/`authenticate`
         // consult, and the auto-expiring per-run grant tuple goes through the SAME write_tuples path.
         let minter = mint::RunTokenMinter::with_tuple_store(revocations.clone(), tuples.clone());
+        // The shared cell KMS (P-058) — the crypto-shred substrate. A fresh engine here; a live
+        // service shares the cell engine S1/S2 seal under (so one per-subject-DEK shred erases both).
+        let kms = std::sync::Arc::new(myelin_storage::KmsEngine::new());
+        StoreBackedCheck::with_kms(tuples, index, revocations, minter, kms)
+    }
+
+    /// Wire the slot over an EXPLICIT shared [`KmsEngine`] (so a live service can share the SAME cell
+    /// engine S1's profile encryption + S2's pseudonym-link seal use — one per-subject DEK, one
+    /// crypto-shred). The S2 pseudonym map ([`PseudonymStore`]) + the PII-free erasure ledger
+    /// ([`pseudonym_erase::PseudonymErasureLedger`]) are built over THIS engine.
+    pub fn with_kms(
+        tuples: TupleStore,
+        index: ReverseIndex,
+        revocations: revocation::RevocationStore,
+        minter: mint::RunTokenMinter,
+        kms: std::sync::Arc<myelin_storage::KmsEngine>,
+    ) -> StoreBackedCheck {
         StoreBackedCheck {
             engine: CheckEngine::new(tuples.clone()),
             tuples,
@@ -483,6 +526,9 @@ impl StoreBackedCheck {
             revocations,
             read_replica: read_replica::AuthzReadReplica::new(),
             minter,
+            pseudonyms: PseudonymStore::new(kms.clone()),
+            erasure_ledger: pseudonym_erase::PseudonymErasureLedger::new(),
+            kms,
         }
     }
 
@@ -519,6 +565,174 @@ impl StoreBackedCheck {
         now: myelin_events::Timestamp,
     ) {
         self.revocations.disable_principal(scope, principal, now);
+    }
+
+    // ───────────────────────── resolve_pseudonym + erase (4.8, P-ID-20) ─────────────────────────
+
+    /// **The S2 pseudonym map (P-ID-19) this slot's `resolve_pseudonym`/`erase` read+shred (4.8).**
+    /// A caller wires a subject's `subject ↔ pseudonym` mapping through
+    /// [`PseudonymStore::put_mapping`]; `resolve_pseudonym_in` reads it; `erase_in` shreds its row +
+    /// the per-subject DEK. Every clone of this slot shares the SAME S2 store.
+    pub fn pseudonyms(&self) -> &PseudonymStore {
+        &self.pseudonyms
+    }
+
+    /// The shared PII-free per-subject erasure ledger (10.8) this slot's `erase_in` records into and
+    /// `re_erase_after_restore` replays. Exposed so a drill can assert an erasure was durably
+    /// recorded (it survives the key destruction it records).
+    pub fn erasure_ledger(&self) -> &pseudonym_erase::PseudonymErasureLedger {
+        &self.erasure_ledger
+    }
+
+    /// The shared cell [`KmsEngine`] (P-058) this slot's S2 seal + `erase_in` crypto-shred run
+    /// through — exposed so a drill can snapshot/restore the key material and assert the shred reaches
+    /// backups (STOR-D4).
+    pub fn kms(&self) -> &std::sync::Arc<myelin_storage::KmsEngine> {
+        &self.kms
+    }
+
+    /// **`resolve_pseudonym(subject, tenant)` (contract 4.8) — the LIVE, scoped read (P-ID-20).**
+    /// Returns the subject's PUBLIC per-tenant pseudonym rendering (`<pseudonym>@<tenant>.noreply`,
+    /// DSR step 1 attribution). Carries the verified `(tenant, region)` scope the ABI trait method
+    /// cannot. **Fails CLOSED** for an erased subject ([`PseudonymEraseError::Erased`]) — the row is
+    /// shredded, so there is no handle to return; never a fabricated pseudonym. A subject that was
+    /// never mapped returns [`PseudonymEraseError::NoMapping`].
+    pub fn resolve_pseudonym_in(
+        &self,
+        scope: &myelin_storage::TenantScope,
+        subject: &myelin_identity::PrincipalId,
+    ) -> Result<myelin_identity::PseudonymHandle, pseudonym_erase::PseudonymEraseError> {
+        match self.pseudonyms.mapping_of(scope, subject) {
+            Some(row) => Ok(row.pseudonym),
+            // No row: distinguish "erased" (the ledger remembers it) from "never mapped" — both fail
+            // closed, but the audit distinguishes them.
+            None if self.erasure_ledger.is_erased(scope, subject) => {
+                Err(pseudonym_erase::PseudonymEraseError::Erased {
+                    subject: subject.0.clone(),
+                })
+            }
+            None => Err(pseudonym_erase::PseudonymEraseError::NoMapping {
+                subject: subject.0.clone(),
+            }),
+        }
+    }
+
+    /// **`erase(subject)` = DSR step 1 (contract 4.8, P-ID-20) — the per-subject crypto-shred lever.**
+    /// Carries the verified `(tenant, region)` scope the ABI trait method cannot. In one operation:
+    /// 1. **destroy the per-subject DEK** (the crypto-shred lever, 11.4/GD-4) in the shared KMS — the
+    ///    subject's sealed real-identity link becomes forever unwrappable in DBs **and backups** (a
+    ///    destroyed DEK is excluded from `backup_snapshot`; STOR-D4);
+    /// 2. **shred the pseudonym-map row** (+ the sealed link + the reverse-index entry);
+    /// 3. **disable the principal** in S7 (so the subject has **no resurrected grants** past the
+    ///    erasure — every surface's `check` denies it, the ID-D8 grant-side assertion);
+    /// 4. **record the erasure in the PII-free ledger** (10.8) so post-restore re-erasure can replay.
+    ///
+    /// The opaque `principal_id` SURVIVES (it still attributes already-emitted immutable events).
+    /// Returns a dated, content-addressed [`ErasureReceipt`]. Idempotent: a re-erase of an
+    /// already-shredded subject destroys/shreds nothing (the receipt reports `dek_destroyed=false`)
+    /// but still records + seals (the subject IS erased — the no-op is correct).
+    pub fn erase_in(
+        &self,
+        scope: &myelin_storage::TenantScope,
+        subject: &myelin_identity::PrincipalId,
+        now: myelin_events::Timestamp,
+    ) -> pseudonym_erase::ErasureReceipt {
+        let dek_class = PseudonymStore::subject_dek_class(subject);
+        // (1)+(2): the crypto-shred — destroy the per-subject DEK + shred the map row (the shared
+        // engine, EI-01 §7: the FIRST erase and the post-restore re-erase run the IDENTICAL shred).
+        let (dek_destroyed, row_shredded, shredded_class) = pseudonym_erase::EraseEngine::shred(
+            &self.pseudonyms,
+            &self.kms,
+            scope,
+            subject,
+            &dek_class,
+        );
+        // (3): no resurrected grants — disable the principal across every surface (the ID-D8 grant
+        // side; idempotent + crash-safe). Every surface's `check` now denies the erased subject.
+        self.revocations
+            .disable_principal(scope, subject, now.clone());
+        // (4): record the erasure in the PII-free, non-shred-erasable ledger (10.8) — it must survive
+        // the key destruction it records + a restore, so re-erasure can replay it.
+        self.erasure_ledger
+            .record(scope, subject, dek_class.clone(), now.clone());
+        pseudonym_erase::ErasureReceipt::for_erase(
+            subject.clone(),
+            scope.tenant().clone(),
+            scope.region().clone(),
+            shredded_class,
+            dek_destroyed,
+            row_shredded,
+            now,
+        )
+    }
+
+    /// **Post-restore re-erasure (P-ID-20 / ID-D8) — the no-resurrection path.** After a restore
+    /// replays an OLDER (pre-erasure) backup state, REPLAY the PII-free erasure ledger (10.8): for
+    /// every subject the ledger marks erased, re-run the IDENTICAL crypto-shred (destroy the
+    /// per-subject DEK + shred any resurrected map row + re-disable the principal). Returns a **dated
+    /// [`ReErasureReceipt`]** — the ID-D8 green artifact (the re-erased count + **0 resurrected**).
+    ///
+    /// "Cold == live" (EI-01 §7): re-erasure runs the SAME `EraseEngine::shred` the first erase did,
+    /// not a bespoke recovery path. A subject is **resurrected** (the RED condition) iff, after the
+    /// restore + re-erasure, its real-identity resolution is STILL recoverable — which this pass
+    /// re-shreds to 0. The receipt's `resurrected` MUST be 0 for the drill to be green.
+    pub fn re_erase_after_restore(
+        &self,
+        scope: &myelin_storage::TenantScope,
+        now: myelin_events::Timestamp,
+    ) -> pseudonym_erase::ReErasureReceipt {
+        let entries = self.erasure_ledger.entries_in(scope);
+        let mut per_subject = Vec::with_capacity(entries.len());
+        let mut resurrected = 0usize;
+        for entry in &entries {
+            // Was the subject's resolvable real identity RESURRECTED by the restore? (A restored map
+            // row whose DEK the restore also brought back.) Probe BEFORE re-shredding.
+            let live_before = self
+                .pseudonyms
+                .resolve_subject(scope, &entry.subject)
+                .is_some();
+            if live_before {
+                resurrected += 1;
+            }
+            // Re-run the IDENTICAL crypto-shred (cold == live). After this the subject is erased again.
+            let (dek_destroyed, row_shredded, shredded_class) = pseudonym_erase::EraseEngine::shred(
+                &self.pseudonyms,
+                &self.kms,
+                scope,
+                &entry.subject,
+                &entry.dek_class,
+            );
+            // Re-disable the principal (grants must not resurrect either).
+            self.revocations
+                .disable_principal(scope, &entry.subject, now.clone());
+            per_subject.push(pseudonym_erase::ErasureReceipt::for_erase(
+                entry.subject.clone(),
+                scope.tenant().clone(),
+                scope.region().clone(),
+                shredded_class,
+                dek_destroyed,
+                row_shredded,
+                now.clone(),
+            ));
+        }
+        // After the re-erasure pass, NOTHING the ledger recorded resolves — re-confirm 0 resurrected.
+        let still_resolvable = entries
+            .iter()
+            .filter(|e| self.pseudonyms.resolve_subject(scope, &e.subject).is_some())
+            .count();
+        pseudonym_erase::ReErasureReceipt {
+            tenant: scope.tenant().clone(),
+            region: scope.region().clone(),
+            re_erased: entries.len(),
+            // The post-pass count MUST be 0 (re-erasure re-shredded everything); we report the
+            // pre-pass resurrection count as the honest "what the restore brought back" signal, and
+            // the post-pass count as the proof we re-erased it. The gate reads `resurrected`.
+            resurrected: still_resolvable,
+            pre_pass_resurrected: 0,
+            per_subject,
+            ran_at: now,
+        }
+        .with_pre_pass_resurrected(resurrected)
     }
 
     /// The shared S8 reverse index this slot's `list_objects` reads (so a caller can wire the live
@@ -1046,16 +1260,36 @@ impl IdentityService for StoreBackedCheck {
         ))
     }
 
+    /// 4.8 — resolve the per-tenant pseudonym for a subject (DSR step 1). **LIVE (P-ID-20):** the
+    /// real read is [`StoreBackedCheck::resolve_pseudonym_in`], which carries the verified `(tenant,
+    /// region)` scope the S2 store is partitioned by. The ABI method has a `tenant` but **no
+    /// region** — and S2 is `(tenant, region)`-partitioned, so an unscoped resolve could read the
+    /// wrong residency partition. It therefore errors LOUDLY (never a silently mis-partitioned read,
+    /// the tenant-predicate floor) and directs the caller to the scoped path.
     fn resolve_pseudonym(
         &self,
         _subject: &myelin_identity::PrincipalId,
         _tenant: &myelin_tenancy::TenantId,
     ) -> myelin_identity::Result<String> {
-        Err(AuthzError::NotYetImplemented("resolve_pseudonym → P-ID-19 (M1)"))
+        Err(AuthzError::NotYetImplemented(
+            "resolve_pseudonym (ABI, region-less) → use StoreBackedCheck::resolve_pseudonym_in \
+             (P-ID-20); S2 is (tenant, region)-partitioned and the read must carry a verified \
+             (tenant, region) scope (the tenant-predicate floor)",
+        ))
     }
 
+    /// 4.8 — `PersonalDataHolder::erase` (the pseudonym-map crypto-shred lever). **LIVE (P-ID-20):**
+    /// the real erase is [`StoreBackedCheck::erase_in`] (destroy the per-subject DEK + shred the map
+    /// row + disable the principal + record the PII-free erasure ledger). The ABI method is
+    /// scope-less (subject only) — an erase WRITES a `(tenant, region)` partition, so it must carry a
+    /// verified scope. It errors LOUDLY (never a silently mis-partitioned erase) and directs the
+    /// caller to the scoped path.
     fn erase(&self, _subject: &myelin_identity::PrincipalId) -> myelin_identity::Result<()> {
-        Err(AuthzError::NotYetImplemented("erase → P-ID-20 (M1)"))
+        Err(AuthzError::NotYetImplemented(
+            "erase (ABI, scope-less) → use StoreBackedCheck::erase_in (P-ID-20); an erase shreds a \
+             (tenant, region) partition row + records the PII-free erasure ledger and must carry a \
+             verified scope (the tenant-predicate floor)",
+        ))
     }
 
     /// 4.9 — admit a subsystem's ReBAC namespace fragment into the cell schema. **LIVE (P-ID-10):**

@@ -400,6 +400,34 @@ impl PseudonymStore {
         Ok(Some(PrincipalId(subject)))
     }
 
+    /// **Is a subject's real-identity link STILL recoverable? (the ID-D8 resurrection probe.)** Opens
+    /// the sealed real-identity link under the subject's per-SUBJECT DEK; returns the recovered opaque
+    /// real id iff BOTH the map row survives AND the per-subject DEK still opens it. Returns `None` if
+    /// the row was shredded OR the DEK was destroyed (crypto-shredded) — i.e. the subject IS erased.
+    ///
+    /// This is the forward analogue of [`PseudonymStore::resolve`] (which keys on the public
+    /// pseudonym); the re-erasure pass uses THIS to assert "0 resurrected" (a restored backup that
+    /// brought back the row AND the key would make this `Some` — a resurrection). RLS-scoped.
+    pub fn resolve_subject(
+        &self,
+        scope: &TenantScope,
+        subject: &PrincipalId,
+    ) -> Option<PrincipalId> {
+        let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S2_TABLE));
+        let part_key = Self::part_key(scope);
+        let (key_ref, sealed) = {
+            let inner = self.lock();
+            let row = inner.by_subject.get(&part_key).and_then(|p| p.get(&subject.0))?;
+            let sealed = inner.sealed.get(&part_key).and_then(|p| p.get(&subject.0))?;
+            (row.real_id_key_ref.clone(), sealed.clone())
+        };
+        // Open under the per-subject DEK. A destroyed DEK (crypto-shred) ⇒ Err ⇒ None (erased): never
+        // a plaintext-without-key fall-through (the 0-fail-open invariant).
+        let dek = self.kms.resolve_dek(&key_ref, scope.region()).ok()?;
+        let plain = dek.open(&sealed.nonce, &sealed.ciphertext)?;
+        String::from_utf8(plain).ok().map(PrincipalId)
+    }
+
     /// **The subject's per-subject DEK class (the Art. 17 crypto-shred lever).** Destroying THIS key
     /// (the P-ID-20 erase body) makes the subject's `pseudonym → real_identity` resolution
     /// unrecoverable in DBs + backups + immutable logs while the PUBLIC pseudonym handle survives.
@@ -407,6 +435,47 @@ impl PseudonymStore {
     /// CALL is the named floor (P-ID-20); the lever is real now.
     pub fn shred_key_for(&self, scope: &TenantScope, subject: &PrincipalId) -> Option<PiiKeyRef> {
         self.mapping_of(scope, subject).map(|r| r.real_id_key_ref)
+    }
+
+    /// **Shred a subject's pseudonym-map row (the `erase` body half, P-ID-20 / 4.8).** Removes the
+    /// row + its sealed real-identity link + the reverse-index entry from the verified `(tenant,
+    /// region)` partition, under one store lock. RLS-scoped (built through a [`TenantQuery`]); a shred
+    /// for one tenant structurally cannot reach another's partition.
+    ///
+    /// Returns `true` iff a row was present to shred (so the caller can report idempotency — a
+    /// re-shred of an already-shredded subject removes nothing and returns `false`, which is correct:
+    /// the subject IS already erased). This shreds ONLY the resolvable mapping; the **crypto-shred of
+    /// the per-subject DEK** (the key that sealed the link) is the [`KmsEngine::destroy_dek`] half the
+    /// erase engine pairs with this — together they are the complete DSR-step-1 crypto-shred.
+    pub fn shred_row(&self, scope: &TenantScope, subject: &PrincipalId) -> bool {
+        let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S2_TABLE));
+        let part_key = Self::part_key(scope);
+        let mut inner = self.lock();
+        // Find the public pseudonym rendering first (to remove its reverse-index entry) — read it out
+        // before the forward row is gone.
+        let pseudonym_rendering = inner
+            .by_subject
+            .get(&part_key)
+            .and_then(|p| p.get(&subject.0))
+            .map(|r| r.pseudonym.render());
+        let removed = inner
+            .by_subject
+            .get_mut(&part_key)
+            .and_then(|p| p.remove(&subject.0))
+            .is_some();
+        // Remove the sealed real-identity link (defence in depth: even if the DEK were somehow
+        // recoverable, the ciphertext is gone) and the reverse-index entry.
+        inner
+            .sealed
+            .get_mut(&part_key)
+            .and_then(|p| p.remove(&subject.0));
+        if let Some(rendering) = pseudonym_rendering {
+            inner
+                .by_pseudonym
+                .get_mut(&part_key)
+                .and_then(|m| m.remove(&rendering));
+        }
+        removed
     }
 
     /// List the mapping rows in a `(tenant, region)` partition (for the directory / tests). There is
