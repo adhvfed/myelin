@@ -29,12 +29,24 @@
 //! only — adding `myelin-harness` to a production crate's `[dependencies]` would pull
 //! test-support into the substrate DAG and is forbidden.
 //!
-//! ## What P-S02 ships (this prompt)
+//! ## What P-S02 ships
 //! The **1×/10×/30× load generator** ([`load_generator`]): a driver that issues traffic at
 //! a configurable [`Multiplier`] with a configurable [`PrincipalMix`] across the five
 //! [`LoadPrincipalKind`]s (human / agent / service / CI / external-MCP) and the four named
 //! [`StormProfile`]s. The generator targets an abstract [`Sink`] (an in-memory request
 //! handler in tests; later drills point it at a real `serve` instance).
+//!
+//! ## What P-S03 ships (this prompt)
+//! The **scoped-reversible dependency-break injector** ([`dependency_break`]): the T-3 seam
+//! every later drill rides to force ONE [`Dependency`] to fail for ONE [`Scope`] without
+//! taking the rig down. [`DependencyBreaker::break_dependency`] /
+//! [`DependencyBreaker::restore_dependency`] are **reversible** (a broken dep restores to a
+//! fully working state), **scoped** (a break touches only its named dependency + scope —
+//! never an unrelated dependency or another tenant/cell), and **idempotent** (a
+//! double-break / double-restore is a no-op, observably via [`BreakOutcome::NoChange`]). It
+//! is the failure-injection half of the unit-of-proof: the load generator (P-S02) drives
+//! traffic, this injector severs a dependency, and the telemetry-assertion library (P-S04)
+//! reads that the system survived.
 //!
 //! ## Floors named (deferred + filling prompt)
 //! - **Storm-profile parameters are v1 defaults.** The tuned per-surface shed-budget
@@ -43,16 +55,22 @@
 //!   each profile carries a v1 default shape so the generator selects the right surface
 //!   behaviour; the *numbers* tighten at M5.
 //! - **No runtime survival drill yet.** The telemetry-assertion library (the thing a drill
-//!   asserts against) lands in **P-S04**; the scoped-reversible dependency-break injector
-//!   lands in **P-S03**. This prompt's gate is the generator's OWN correctness (it hits the
-//!   configured multiplier within ±tolerance and the configured principal mix). The
-//!   real-`serve` sink + the assertion-backed survival drills (SUB-D3 / F6) ride **P-S04**
-//!   and the M5 surge family (**P-S32**).
+//!   asserts against) lands in **P-S04**; this prompt's gate is the injector's OWN
+//!   reversibility + scoping + idempotence, and the generator's OWN correctness. The
+//!   assertion-backed survival drills the injector drives are wired at the prompts that own
+//!   each fault-point: SUB-D2 at **P-S07/P-S08** (sever the broker), SUB-D4 at **P-S25**
+//!   (hard-down Identity / fail-static), SUB-D5 at **P-S16/P-S17** (trip a downstream).
+//! - **Consult seam, not a real process-killer.** The injector models a break as shared
+//!   queryable state ([`DependencyBreaker::is_broken`]); the real fault-points that consult
+//!   it (the relay's publish, `AuthzClient::check`, a downstream RPC) do not exist until
+//!   **P-S07 / P-S12 / P-S13 / P-S16** — each wires its fault-point to this consult then.
 //! - **Abstract sink only.** The generator drives an in-memory [`Sink`]; pointing it at a
 //!   real three-port `serve` instance lands once `serve` exists (**P-S12 / P-S13**).
 
+pub mod dependency_break;
 pub mod load_generator;
 
+pub use dependency_break::{BreakOutcome, Dependency, DependencyBreaker, Scope};
 pub use load_generator::{
     LoadGenerator, LoadPrincipalKind, Multiplier, PrincipalMix, Request, RunClass, Sink,
     StormProfile, Surface,
