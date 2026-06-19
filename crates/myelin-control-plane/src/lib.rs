@@ -5,7 +5,8 @@
 //! client-cacheable fail-static), and **P-CP-07 / P-082** (`place(region, requested_tier)` +
 //! two-phase signup — PII born inside the cell; see [`place`]), and **P-CP-08 / P-084**
 //! (`placement_of(tenant_id)` — the routing answer + the gateway misroute-rejection, layer 4, CP-D2;
-//! see [`placement_of`]). The remaining attestation answer (`residency_verify`) lands in P-CP-09.
+//! see [`placement_of`]), and **P-CP-09 / P-085** (`residency_verify` — the no-global-pool signed
+//! attestation over the M1 store set; see [`residency_verify`]).
 //!
 //! **Owning architecture doc:**
 //! `planning/05-refined-shared-systems-architecture/tenancy-and-control-plane.md`
@@ -74,6 +75,15 @@
 //!   gateway accepts a request IFF the tenant's `home_cell` is THIS cell; the multi-cell resolution
 //!   path (a member cell serving a slice, the `CrossCellPointer` bridge) goes live in **M5
 //!   (P-CP-19 / P-CP-20)**.
+//! - **`residency_verify` over the M1 store set is LIVE (P-CP-09 / P-085, [`residency_verify`]).**
+//!   [`residency_verify::residency_verify`] aggregates every M1 store's region report
+//!   (OLTP/blob/index/KMS) into a signed, PII-free [`residency_verify::SignedAttestation`]
+//!   (`every_store_region == tenant.region`); a store reporting a wrong region — or a silently-absent
+//!   store — makes the attestation **FAIL** (not a silent pass). **NAMED PARTIAL:** the store set is
+//!   the **M1 stores only**; the **CI runner pool + log/artifact/cache coverage is the M4 follow-on
+//!   P-CP-17** (it extends this SAME `residency_verify` over the CI surfaces). The CP-D3 write-boundary
+//!   runtime drill + STOR-D5 cross-region egress ride the four-layer enforcement (P-CP-12), against
+//!   the live stack.
 //! - **The GeoDNS/anycast discovery edge is `[OPEN → P4 (infra)]`** (architecture §7.3) — a latency
 //!   optimisation that fronts the PII-free discovery contract with a geo-routed edge. **v1 is
 //!   CP-lookup + client cache** ([`discover::DiscoveryCache`]); the edge is an infra follow-on, not a
@@ -101,6 +111,7 @@ pub mod place;
 pub mod placement_of;
 pub mod provision;
 pub mod registry;
+pub mod residency_verify;
 pub mod schema;
 
 pub use discover::{DiscoverKey, DiscoveryCache, DiscoverySignals, RouteTuple};
@@ -119,6 +130,10 @@ pub use holder::{
     CONTROL_PLANE_STORE,
 };
 pub use registry::{PlacementError, Registry};
+pub use residency_verify::{
+    residency_verify, ResidencyAttestationSignal, ResidencyMismatch, ResidencySigningKey,
+    ResidencyStoreClass, SignedAttestation, StoreRegionReport,
+};
 pub use schema::{
     Capacity, Cell, CellProvisioning, CellStatus, IsolationKind, LocalTenant, PlacementStatus,
     ProvisioningOutcome, TenantPlacement,
