@@ -51,11 +51,7 @@ mod tests {
     /// producers). The full taxonomy is Knowledge's (13.1).
     #[test]
     fn three_load_bearing_inline_nodes_exist() {
-        let m = InlineNode::Mention(Principal {
-            id: PrincipalId("p".into()),
-            kind: PrincipalKind::Human,
-            tenant: TenantId("acme".into()),
-        });
+        let m = InlineNode::Mention(Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId("acme".into())));
         let a = InlineNode::ArtifactRefNode(ArtifactRef("myelin://acme/issues/issue/PROJ-1".into()));
         let e = InlineNode::Embed(ArtifactRef("myelin://acme/knowledge/page/42".into()));
         assert!(matches!(m, InlineNode::Mention(_)));

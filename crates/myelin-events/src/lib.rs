@@ -314,11 +314,7 @@ mod tests {
     use myelin_tenancy::{Region, TenantId};
 
     fn sample_principal() -> Principal {
-        Principal {
-            id: PrincipalId("p".into()),
-            kind: PrincipalKind::Human,
-            tenant: TenantId("acme".into()),
-        }
+        Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId("acme".into()))
     }
 
     /// Build an [`EmitContext`] for the emit-surface CDC tests: the ambient fields a real

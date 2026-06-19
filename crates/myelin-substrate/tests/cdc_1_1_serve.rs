@@ -46,11 +46,7 @@ fn ctx_base() -> EmitContextBase {
     EmitContextBase {
         tenant: myelin_tenancy::TenantId("acme".into()),
         region: myelin_tenancy::Region("eu-west".into()),
-        actor: Actor(Principal {
-            id: PrincipalId("p".into()),
-            kind: PrincipalKind::Human,
-            tenant: myelin_tenancy::TenantId("acme".into()),
-        }),
+        actor: Actor(Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, myelin_tenancy::TenantId("acme".into()))),
         schema_ver: 1,
         occurred_at: Timestamp("2026-06-19T00:00:00Z".into()),
         recorded_at: Timestamp("2026-06-19T00:00:01Z".into()),

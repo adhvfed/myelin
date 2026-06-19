@@ -40,11 +40,7 @@ fn ctx_base() -> EmitContextBase {
     EmitContextBase {
         tenant: TenantId("acme".into()),
         region: Region("eu-west".into()),
-        actor: Actor(Principal {
-            id: PrincipalId("p".into()),
-            kind: PrincipalKind::Human,
-            tenant: TenantId("acme".into()),
-        }),
+        actor: Actor(Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId("acme".into()))),
         schema_ver: 1,
         occurred_at: Timestamp("2026-06-19T00:00:00Z".into()),
         recorded_at: Timestamp("2026-06-19T00:00:01Z".into()),
@@ -279,11 +275,7 @@ fn envelope(id: &str, subject: &str) -> EventEnvelope {
         schema_ver: 1,
         tenant: TenantId("acme".into()),
         region: Region("eu-west".into()),
-        actor: Actor(Principal {
-            id: PrincipalId("p".into()),
-            kind: PrincipalKind::Human,
-            tenant: TenantId("acme".into()),
-        }),
+        actor: Actor(Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId("acme".into()))),
         subject: ArtifactRef(subject.into()),
         aggregate: AggregateKey("a:1".into()),
         causation_id: None,

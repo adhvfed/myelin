@@ -298,11 +298,7 @@ mod tests {
     use myelin_identity::{PrincipalId, PrincipalKind};
 
     fn sample_principal() -> Principal {
-        Principal {
-            id: PrincipalId("p".into()),
-            kind: PrincipalKind::Human,
-            tenant: TenantId("acme".into()),
-        }
+        Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId("acme".into()))
     }
 
     /// Build the canonical anchor envelope used by the field-shape test, the provider-side

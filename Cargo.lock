@@ -78,6 +78,7 @@ version = "0.0.0"
 dependencies = [
  "myelin-tenancy",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
