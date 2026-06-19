@@ -141,8 +141,8 @@ landing = "P-142"
 [[contract]]
 row = "2.7"
 title = "crypto-shred / tombstone on the log"
-status = "deferred"
-landing = "P-092"
+status = "covered"
+cdc = ["crates/myelin-events/tests/cdc_2_7_bus_holder.rs"]
 
 [[contract]]
 row = "2.8"
