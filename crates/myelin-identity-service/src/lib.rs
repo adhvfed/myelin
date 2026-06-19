@@ -55,7 +55,7 @@ use myelin_identity::{
 };
 use myelin_substrate::{
     boot, AppSpec, Authorizer, Config, CriticalDependencies, InternalRpc, Migration, Migrations,
-    PublicRoutes, ServeError, ServeHandle,
+    PublicRoutes, ServeError, ServeHandle, StoreManifest,
 };
 use myelin_tenancy::ArtifactRef;
 
@@ -287,6 +287,7 @@ pub fn identity_app_spec(config: Config) -> AppSpec {
         // Every opened store auto-registers as a PersonalDataHolder (§3.4, GD-3) — the S1/S3 store
         // holders land with those stores (P-ID-05/P-ID-08); the OLTP store registers at boot.
         holders: AppSpec::auto(),
+        stores: StoreManifest::new(),
         outbox: myelin_substrate::OutboxSpec::default(),
         // Identity is the dependency root — it declares no critical downstream of its own (§1).
         critical: CriticalDependencies::default(),

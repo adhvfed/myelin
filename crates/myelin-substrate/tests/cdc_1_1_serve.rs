@@ -24,7 +24,7 @@ use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_substrate::serve::{boot, AppSpec, ConsumerReg, OutboxSpec, Surface};
 use myelin_substrate::{
     Config, CriticalDependencies, HolderRegistration, HotTables, InternalRpc, Migrations,
-    PublicRoutes, StoreKind,
+    PublicRoutes, StoreKind, StoreManifest,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -99,6 +99,7 @@ fn cdc_1_1_hello_world_main_boots_emits_consumes_drains_and_emits_signals() {
         internal: InternalRpc::default(),
         consumers: vec![ConsumerReg::new(consumer)],
         holders: AppSpec::auto(),
+        stores: StoreManifest::new(),
         outbox: OutboxSpec::new(outbox.clone(), InProcessBus::new()),
         critical: CriticalDependencies::default(),
     };

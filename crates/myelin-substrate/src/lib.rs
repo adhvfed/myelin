@@ -201,6 +201,7 @@ use serde::{Deserialize, Serialize};
 pub mod agent_load;
 pub mod crate_graph;
 pub mod fail_static;
+pub mod holder_registered;
 pub mod holders;
 pub mod metrics_health;
 pub mod migrations;
@@ -218,6 +219,9 @@ pub use agent_load::{
 pub use fail_static::{
     Answer, Clock, FailStatic, FailStaticError, FailStaticSignals, StalenessBound, SystemClock,
     TestClock,
+};
+pub use holder_registered::{
+    assert_all_holders_registered, holder_registered, DeclaredStore, HolderViolation, StoreManifest,
 };
 pub use holders::{HolderRegistration, HolderRegistry, StoreKind};
 pub use metrics_health::{
@@ -300,6 +304,7 @@ mod tests {
             internal: InternalRpc::default(),
             consumers: vec![],
             holders: HoldersSpec::Auto,
+            stores: StoreManifest::new(),
             outbox: OutboxSpec::default(),
             critical: CriticalDependencies::default(),
         };
