@@ -198,6 +198,16 @@ impl Registry {
         self.placements.get(tenant_id.as_str())
     }
 
+    /// Look up a `tenant_placement` row by its **non-personal routing slug** (the `discover(slug)`
+    /// path, architecture §7.3). The slug is a changeable, PII-free label (`acme`), screened to carry
+    /// no personal data (the slug-PII screening is the `[OPEN — LEGAL]` residual named in P-CP-12). On
+    /// this in-process floor the lookup is a scan; the live registry indexes `slug` (the driver floor,
+    /// P-ST-01). Returns the first placement whose slug matches (slugs are unique per registry — the
+    /// live schema's `UNIQUE(slug)` constraint enforces it; here the scan returns the first match).
+    pub fn placement_by_slug(&self, slug: &str) -> Option<&TenantPlacement> {
+        self.placements.values().find(|p| p.slug == slug)
+    }
+
     /// The number of placed tenants.
     pub fn placement_count(&self) -> usize {
         self.placements.len()
