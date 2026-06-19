@@ -144,6 +144,12 @@ impl Registry {
         self.cells.len()
     }
 
+    /// An iterator over the `cell` inventory rows (the assignment algorithm scans this — P-CP-07's
+    /// `assign_cell` filters region-first → tier-second → capacity-third over it).
+    pub fn cells_iter(&self) -> impl Iterator<Item = &Cell> {
+        self.cells.values()
+    }
+
     /// **`place_tenant` — the placement invariant trigger, in code (architecture §5.1).** Writes a
     /// `tenant_placement` row IFF every cell in `{home_cell} ∪ member_cells` is in the tenant's
     /// (immutable) region. A cross-region member cell is rejected with [`PlacementError`] — the
