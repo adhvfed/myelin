@@ -20,8 +20,9 @@ use myelin_events::relay::InProcessBus;
 use myelin_events::OutboxStore;
 use myelin_substrate::serve::{boot, AppSpec, OutboxSpec};
 use myelin_substrate::{
-    is_blocking_alter, is_destructive, Config, CriticalDependencies, HolderRegistration, HotTables,
-    InternalRpc, Migration, MigrationPhase, MigrationRunner, Migrations, PublicRoutes, StoreKind,
+    assert_all_holders_registered, holder_registered, is_blocking_alter, is_destructive, Config,
+    CriticalDependencies, DeclaredStore, HolderRegistration, HolderRegistry, HotTables, InternalRpc,
+    Migration, MigrationPhase, MigrationRunner, Migrations, PublicRoutes, StoreKind, StoreManifest,
 };
 
 fn spec(name: &'static str, migrations: Migrations, hot_tables: HotTables) -> AppSpec {
@@ -34,6 +35,7 @@ fn spec(name: &'static str, migrations: Migrations, hot_tables: HotTables) -> Ap
         internal: InternalRpc::default(),
         consumers: vec![],
         holders: AppSpec::auto(),
+        stores: StoreManifest::new(),
         outbox: OutboxSpec::new(OutboxStore::new(), InProcessBus::new()),
         critical: CriticalDependencies::default(),
     }
@@ -156,4 +158,82 @@ fn cdc_1_5_shared_ddl_classifiers() {
 
     // a fresh runner has applied nothing.
     assert!(MigrationRunner::new().applied().is_empty());
+}
+
+// ═══════════════════ CDC 1.4 — the `holder-registered` ARCHITECTURE TEST (P-GA-04) ═══════════════════
+//
+// The enforcement half of contract 1.4: a store opened OUTSIDE the harness FAILS the
+// `holder-registered` architecture test; a harness-opened store PASSES (gdpr §3.1). The two
+// fixtures below ARE the test (DELIVERABLE/TESTS of P-GA-04 → global P-055).
+
+/// **CDC 1.4 (provider side — the harness) — a harness-opened service PASSES the architecture
+/// test.** A service declares its OLTP store + a blob prefix; `boot` opens BOTH through the one
+/// door, so both auto-register and `ServeHandle::holder_registered()` is `Ok`. This is the
+/// CONFORMING fixture: opening through the harness IS registering.
+#[test]
+fn cdc_1_4_arch_test_harness_opened_service_passes() {
+    let mut s = spec("svc", Migrations::default(), HotTables::none());
+    s.stores = StoreManifest::of([DeclaredStore::new(StoreKind::Blob, "svc_blobs")]);
+    let handle = boot(s).expect("boot");
+
+    // every declared store (OLTP implicit + the blob prefix) auto-registered → no violation.
+    assert_eq!(
+        handle.holder_registered(),
+        Ok(()),
+        "a harness-opened service passes the holder-registered architecture test"
+    );
+    assert!(handle.holder_registry().is_registered(StoreKind::Oltp, "svc"));
+    assert!(handle.holder_registry().is_registered(StoreKind::Blob, "svc_blobs"));
+    // the manifest the test joins against names exactly the declared stores.
+    assert!(handle.store_manifest().holder_ids().contains("oltp:svc"));
+    assert!(handle.store_manifest().holder_ids().contains("blob:svc_blobs"));
+}
+
+/// **CDC 1.4 (consumer side — a store opened OUTSIDE the harness) — the architecture test FAILS
+/// (captured-expected).** A service's data map declares a store, but the store was opened OUTSIDE
+/// the harness's one door — the registry never saw it. The `holder-registered` architecture test
+/// returns a violation naming the store + WHY: a store that escaped registration would also
+/// escape the DSR fan-out, so it is a build failure (the holder list cannot drift below the data
+/// map, gdpr §3.1). This is the VIOLATING fixture.
+#[test]
+fn cdc_1_4_arch_test_store_opened_outside_the_harness_fails() {
+    // The data map says the service owns this store…
+    let manifest = StoreManifest::of([DeclaredStore::new(StoreKind::Oltp, "rogue_oltp")]);
+    // …but it was opened OUTSIDE the harness — the registry was never told (no HolderRegistry::open).
+    let registry = HolderRegistry::new();
+
+    let violations = holder_registered(&manifest, &registry);
+    assert_eq!(violations.len(), 1, "the store opened outside the harness is the violation");
+    assert_eq!(violations[0].store, DeclaredStore::new(StoreKind::Oltp, "rogue_oltp"));
+
+    // the CI gate surfaces it as an Err — the captured-expected failure (EI-01 §5: a committed gate).
+    let err = assert_all_holders_registered(&manifest, &registry)
+        .expect_err("a store opened outside the harness MUST fail the architecture test");
+    let msg = err[0].message();
+    assert!(msg.contains("rogue_oltp"), "names the offending store: {msg}");
+    assert!(msg.contains("OUTSIDE the harness"), "names WHY it failed: {msg}");
+}
+
+/// **CDC 1.4 — 100% of harness-opened stores auto-register (the quantified gate).** Every store
+/// kind §3.4 names, declared in a manifest and opened through the registry's one door, registers —
+/// so the architecture test is `Ok` over all four. The quantified threshold the GATE names: 100%
+/// of harness-opened stores register; a store outside the harness is a build failure.
+#[test]
+fn cdc_1_4_arch_test_one_hundred_percent_of_harness_opened_stores_register() {
+    let manifest = StoreManifest::of([
+        DeclaredStore::new(StoreKind::Oltp, "svc_oltp"),
+        DeclaredStore::new(StoreKind::Blob, "svc_blobs"),
+        DeclaredStore::new(StoreKind::Cache, "svc_cache"),
+        DeclaredStore::new(StoreKind::SearchIndex, "svc_index"),
+    ]);
+    // The harness opens EVERY declared store through the one door.
+    let mut registry = HolderRegistry::new();
+    for s in manifest.stores() {
+        registry.open(s.kind, s.name);
+    }
+    assert_eq!(
+        assert_all_holders_registered(&manifest, &registry),
+        Ok(()),
+        "100% of harness-opened stores auto-register — no store escapes the holder fan-out"
+    );
 }

@@ -17,7 +17,7 @@ use myelin_events::relay::InProcessBus;
 use myelin_substrate::serve::{boot, AppSpec, OutboxSpec, Surface};
 use myelin_substrate::{
     Config, CriticalDependencies, HotTables, InternalRpc, Liveness, Migrations, PublicRoutes,
-    Readiness,
+    Readiness, StoreManifest,
 };
 
 /// **CDC 1.3 — a booted instance is Ready, a severed critical dependency flips readiness (not
@@ -35,6 +35,7 @@ fn cdc_1_3_lifecycle_metrics_health_is_liveness_ne_readiness() {
         internal: InternalRpc::default(),
         consumers: vec![],
         holders: AppSpec::auto(),
+        stores: StoreManifest::new(),
         outbox: OutboxSpec::new(myelin_events::OutboxStore::new(), InProcessBus::new()),
         // the service declares `identity` a critical dependency (it cannot serve correct traffic
         // without authz); the OLTP store is implicitly critical too (added by the lifecycle).

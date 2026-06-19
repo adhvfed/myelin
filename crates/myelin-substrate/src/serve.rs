@@ -64,6 +64,9 @@
 //!   the in-memory models of the SQL `outbox` / `consumer_dedup` tables (P-S07/P-S08); the real
 //!   binding inside the caller's DB transaction lands when the driver does.
 
+use crate::holder_registered::{
+    assert_all_holders_registered, HolderViolation, StoreManifest,
+};
 use crate::holders::{HolderRegistration, HolderRegistry, StoreKind};
 use crate::metrics_health::{CriticalDependencies, HealthTable, MetricsHealthSurface};
 use crate::migrations::{HotTables, Migration, MigrationRunner, Migrations};
@@ -375,6 +378,14 @@ pub struct AppSpec {
     pub consumers: Vec<ConsumerReg>,
     /// Holder registration policy (§3.4 — every opened store auto-registered, GD-3).
     pub holders: HoldersSpec,
+    /// The set of stores the service declares it owns beyond the implicit OLTP store (§3.4;
+    /// contract 1.4). The harness opens (and therefore auto-registers) **every** declared store
+    /// through the one door, so the `holder-registered` architecture test (P-GA-04) is green by
+    /// construction for a harness-opened service. A store a service constructs OUTSIDE this
+    /// manifest/boot path never registers — that is the violation the architecture test catches.
+    /// Defaults to the implicit OLTP store only ([`StoreManifest::new`]); a service that owns a
+    /// blob prefix / cache namespace / search index declares them here.
+    pub stores: StoreManifest,
     /// The outbox relay spec (§3.3 — relay started automatically, BUS-2).
     pub outbox: OutboxSpec,
     /// The critical-dependency set the metrics-health surface's readiness probe reads (§4.3,
@@ -403,6 +414,7 @@ impl AppSpec {
             internal: InternalRpc::default(),
             consumers: Vec::new(),
             holders: HoldersSpec::Auto,
+            stores: StoreManifest::new(),
             outbox: OutboxSpec::default(),
             critical: CriticalDependencies::default(),
         }
@@ -443,6 +455,9 @@ pub struct ServeHandle {
     relay: Relay<RelayTransport>,
     consumers: Vec<ConsumerReg>,
     holders: HolderRegistry,
+    /// The full store manifest (implicit OLTP + the service's declared stores) the
+    /// `holder-registered` architecture test joins against [`Self::holder_registry`].
+    manifest: StoreManifest,
     ports: PortOpener,
     telemetry: Telemetry,
     /// Set once a drain has been requested (the graceful-drain trigger). After this, intake is
@@ -481,6 +496,25 @@ impl ServeHandle {
     /// architecture test can assert no store escaped registration, §3.4 / contract 1.4).
     pub fn holder_registry(&self) -> &HolderRegistry {
         &self.holders
+    }
+
+    /// The store manifest (implicit OLTP + the service's declared stores) the
+    /// `holder-registered` architecture test joins against the registry (§3.4 / contract 1.4).
+    pub fn store_manifest(&self) -> &StoreManifest {
+        &self.manifest
+    }
+
+    /// **The `holder-registered` architecture test for this booted service (P-GA-04, contract
+    /// 1.4).** Asserts every store the service declares it owns was auto-registered through the
+    /// harness's one door — `Ok(())` for a harness-opened service (every declared store went
+    /// through boot's [`HolderRegistry::open`]), or `Err(violations)` naming any store that
+    /// escaped registration (opened outside the harness). Because [`boot`] opens every declared
+    /// store, a service booted through the harness is green by construction; the violating
+    /// fixture is a manifest checked against a registry that did NOT open one of its stores
+    /// (the store-opened-outside-the-harness case). This is the structural realization of "the
+    /// holder list cannot drift below the data map" (gdpr §3.1).
+    pub fn holder_registered(&self) -> Result<(), Vec<HolderViolation>> {
+        assert_all_holders_registered(&self.manifest, &self.holders)
     }
 
     /// The three surfaces opened in the lifecycle (§4).
@@ -591,6 +625,7 @@ pub fn boot(spec: AppSpec) -> Result<ServeHandle, ServeError> {
         internal: _internal,
         consumers,
         holders,
+        stores,
         outbox,
         critical,
     } = spec;
@@ -630,6 +665,23 @@ pub fn boot(spec: AppSpec) -> Result<ServeHandle, ServeError> {
     let oltp_holder = OltpStoreHolder::new(name);
     let _oltp_receipt = oltp_holder.register();
     holder_registry.open(StoreKind::Oltp, name);
+    // Every OTHER store the service declares (a blob prefix / cache namespace / search index) is
+    // opened through the SAME one door — so it auto-registers (§3.4, GD-3). Because boot opens
+    // every declared store, the `holder-registered` architecture test (P-GA-04,
+    // [`ServeHandle::holder_registered`]) is green by construction for a harness-opened service;
+    // a store constructed OUTSIDE this path never registers, which the architecture test catches.
+    for store in stores.stores() {
+        holder_registry.open(store.kind, store.name);
+    }
+    // The full manifest the architecture test joins against the registry. The implicit OLTP store
+    // is always part of it (every service has one); the service's declared stores extend it.
+    let mut full_manifest = StoreManifest::of([crate::holder_registered::DeclaredStore::new(
+        StoreKind::Oltp,
+        name,
+    )]);
+    for store in stores.stores() {
+        full_manifest.declare(store.kind, store.name);
+    }
 
     // (3) relay — start the outbox relay automatically (§3.3, BUS-2). The relay's `published_at`
     //     clock is the boot clock; the real wall-clock source lands with the driver (P-S15).
@@ -668,6 +720,7 @@ pub fn boot(spec: AppSpec) -> Result<ServeHandle, ServeError> {
         relay,
         consumers,
         holders: holder_registry,
+        manifest: full_manifest,
         ports,
         telemetry,
         draining: Arc::new(AtomicBool::new(false)),
@@ -790,6 +843,7 @@ mod tests {
             internal: InternalRpc::default(),
             consumers: vec![consumer],
             holders: AppSpec::auto(),
+            stores: StoreManifest::new(),
             outbox: OutboxSpec::new(outbox.clone(), InProcessBus::new()),
             critical: CriticalDependencies::default(),
         };
@@ -885,6 +939,7 @@ mod tests {
             internal: InternalRpc::default(),
             consumers: vec![consumer],
             holders: AppSpec::auto(),
+            stores: StoreManifest::new(),
             outbox: OutboxSpec::new(outbox.clone(), InProcessBus::new()),
             critical: CriticalDependencies::default(),
         };
@@ -924,6 +979,7 @@ mod tests {
             internal: InternalRpc::default(),
             consumers: vec![consumer],
             holders: AppSpec::auto(),
+            stores: StoreManifest::new(),
             outbox: OutboxSpec::new(outbox.clone(), InProcessBus::new()),
             critical: CriticalDependencies::default(),
         };
@@ -954,6 +1010,7 @@ mod tests {
             internal: InternalRpc::default(),
             consumers: vec![],
             holders: AppSpec::auto(),
+            stores: StoreManifest::new(),
             outbox: OutboxSpec::default(),
             critical: CriticalDependencies::default(),
         };
@@ -1011,6 +1068,7 @@ mod tests {
             internal: InternalRpc::default(),
             consumers: vec![ConsumerReg::new(consumer)],
             holders: AppSpec::auto(),
+            stores: StoreManifest::new(),
             outbox: OutboxSpec::new(outbox.clone(), InProcessBus::new()),
             critical: CriticalDependencies::default(),
         };
