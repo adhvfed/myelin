@@ -711,8 +711,23 @@ landing = "P-145"
 [[contract]]
 row = "11.7"
 title = "reserve/settle cost gate"
-status = "deferred"
-landing = "P-103"
+status = "covered"
+# P-103 (P-ST-16): the reserve/settle cost gate MECHANISM + the durable per-tenant ledger
+# (Storage owns the ledger correctness; the gate policy is Agent's §5.4, the wallet balance is
+# Commercial's). `CostLedger::reserve` debits an integer-minor-units amount against the supplied
+# wallet balance and REFUSES on no-balance (no balance → no run); `settle` records exactly ONE
+# cost event per metered unit with the wholesale ≠ markup split recorded DISTINCTLY (idempotent —
+# a double-settle never double-charges); the reserve is the billing cap; `cancel_unstarted` is the
+# ONLY teardown and is structurally barred from an InFlight reservation (NEVER interrupt in-flight —
+# the inflight_interrupt_count is 0 by construction, no code path increments it). All arithmetic is
+# checked integer minor-units (a float cost is unrepresentable). The synthetic-run drill emits a
+# green ReserveSettleSignal (cost_events_per_unit == 1, inflight_interrupt_count == 0). The CDC pair
+# is an agent/CI run-dispatcher fronting every run with the gate (cdc_11_7_reserve_settle.rs).
+# Floors named: the gate FRONTS agent runs in M2 → P-ST-19 (global P-146); it fronts CI runs in M4
+# (a CI-subsystem consumer); the real Postgres-backed durable ledger lands with the OLTP driver
+# (P-S12) — the arithmetic + invariants are complete + testable now over the same OLTP tier whose
+# real backend (PgStore) is already proven by the infra-stage integration drills.
+cdc = ["crates/myelin-storage/tests/cdc_11_7_reserve_settle.rs"]
 
 [[contract]]
 row = "11.8"

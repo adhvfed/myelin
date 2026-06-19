@@ -380,6 +380,13 @@ pub mod kms_failstatic;
 pub mod migration;
 pub mod oltp;
 pub mod reerase;
+// The reserve/settle cost gate mechanism + the durable per-tenant ledger (P-ST-16 / P-103,
+// contract 11.7): reserve-at-dispatch (no balance → no run), settle-on-completion (one cost
+// event per metered unit, wholesale ≠ markup recorded distinctly), NEVER interrupt in-flight
+// (the counter is 0 by construction — no code path increments it), integer minor-units (a
+// float cost is unrepresentable). Storage owns the durable ledger correctness; the gate
+// FRONTS agent runs in M2 (P-ST-19 / P-146) and CI runs in M4 (named floors).
+pub mod reserve_settle;
 // Residency pinning enforced end-to-end (STOR-D5, P-ST-15 / P-102): the per-pool runtime region-pin
 // (closes the oltp/holder M0 floor), the in-process residency WRITE boundary, the per-store region
 // report, and the `myelin storage residency verify <tenant>` admin path. The control plane's
@@ -454,6 +461,10 @@ pub use oltp::{OltpConfig, OltpError, OltpPool, PermitGuard};
 pub use reerase::{
     CellKillRestore, CellKillRtoReport, ErasureRecord, InMemoryPostPitLedger,
     PostRestoreErasureLedger, ReErasePass, ReErasedSubject, ReEraseReport, RtoGrain,
+};
+pub use reserve_settle::{
+    CostEvent, CostLedger, MeteredUnit, MinorUnits, Reservation, ReservationState,
+    ReserveError, ReserveSettleSignal, RunId, SettleError, SettleOutcome,
 };
 pub use residency::{
     verify_region_pinning, RegionPinnedStore, RegionPinningAttestation, ResidencyStoreClass,
