@@ -104,7 +104,12 @@ impl Crate {
             Crate::Query => &[Crate::Tenancy, Crate::Identity, Crate::Events],
             // The agent/gdpr tier (below events).
             Crate::Agent => &[Crate::Identity, Crate::Events],
-            Crate::Gdpr => &[Crate::Tenancy, Crate::Identity],
+            // gdpr depends on events too (P-GA-01 / P-049): the `data_role` GDPR role-tag
+            // anchors to the frozen 2.1 `EventEnvelope.data_role` field (`myelin_events::
+            // DataRole`), so the tenant-content|platform-operational ↔ processor|controller
+            // mapping is compiled, not hoped. The edge gdpr → events is acyclic (events
+            // depends only on tenancy + identity). Mirrors crates/myelin-gdpr/Cargo.toml.
+            Crate::Gdpr => &[Crate::Tenancy, Crate::Identity, Crate::Events],
             // The client tier (below agent/gdpr).
             Crate::Client => &[Crate::Tenancy, Crate::Identity, Crate::Events],
             // The storage-substrate tier (below gdpr): the OLTP tier client + (tenant,
