@@ -188,6 +188,7 @@ pub mod metrics_health;
 pub mod migrations;
 pub mod serve;
 pub mod shed;
+pub mod thresholds;
 pub mod topology;
 
 pub use agent_load::{
@@ -211,6 +212,10 @@ pub use serve::{
 pub use shed::{
     BoundedQueue, RunClass, RunClassHeader, ShedBudgetTable, ShedDecision, ShedLane,
     Surface as ShedSurface, SurfaceBudget,
+};
+pub use thresholds::{
+    ClaimedNotProven, DepthCeilings, FailStaticThreshold, Revocation, RpoRto, ShedBudgetRow, Surge,
+    ThresholdError, Thresholds, THRESHOLDS_FILENAME,
 };
 pub use topology::{
     AllowPrincipal, AuditSink, Authorizer, DenyAll, IdorAuditRecord, InjectedIdentity,

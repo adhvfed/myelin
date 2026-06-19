@@ -1,0 +1,148 @@
+# =============================================================================================
+# thresholds.toml — THE versioned thresholds file (P-S22 / P-038, master band M0)
+# =============================================================================================
+#
+# The single, versioned source of truth for every Q32 "default-to-beat": the quantified
+# threshold every M0 drill reads its number from. NO drill hardcodes a magic number — it reads
+# its threshold from here (loaded by `myelin_substrate::thresholds`). A missing threshold is a
+# LOUD error (the loader fails), never a silent default.
+#
+# CANON:
+#   - external-insights/01-process-and-quality-doctrine.md §3 — "prove it or it isn't real":
+#     gates resolve to quantified thresholds; NEVER weaken a threshold or invert an assertion to
+#     make a check pass. A red gate is *information* and becomes a "claimed, not proven" row IN
+#     THIS FILE (see [[claimed_not_proven]] below) — never edited green.
+#   - planning/05-refined-shared-systems-architecture/00-platform-substrate.md §10.2 (the
+#     telemetry signal set the thresholds key on) + §8.2 (the fail-static value W `[OPEN — LEGAL]`).
+#   - planning/06-roadmaps/shared/00-platform-substrate.md §2 SUB-M0 item 5 (the Q32 defaults) +
+#     §5 (the green-artifact / thresholds-file discipline) + §6 (the honesty register).
+#
+# DISCIPLINE (the thresholds-file rule, roadmap §5 / EI-01 §3): a milestone is done only when its
+# drill emits a dated green artifact reading green. A drill that fails does NOT get its threshold
+# softened; it is recorded as a [[claimed_not_proven]] row with a date and an owner, and stays
+# there until the deliverable is genuinely repaired. A threshold here is edited only by re-running
+# the drill that measures it (e.g. the M5 surge tunes the shed-budget numbers — never edited green
+# without the drill).
+#
+# UNITS are frozen by the EventEnvelope names/units anchor (§2.10): durations in SECONDS (suffix
+# `_secs`) or MINUTES (suffix `_mins`) as named; multipliers are bare integers; ceilings are
+# integer causal depths.
+# =============================================================================================
+
+version = 1
+# The date this file's current row set was last asserted against its drills (ISO-8601). Bump
+# (with a [[claimed_not_proven]] or a drill-dated note) on every threshold change.
+as_of = "2026-06-19"
+
+# ---------------------------------------------------------------------------------------------
+# [revocation] — N, the deprovision / revocation SLA (the disabled-user blast-radius bound).
+# Roadmap §2 item 5: "N = 5 min revocation". This is the ceiling the fail-static window must sit
+# under (static_max ≤ revocation_sla), and the bound ID-D1/SUB-D4 assert a revoked actor is denied
+# within. Keyed on contract 1.10 / 4.11.
+# ---------------------------------------------------------------------------------------------
+[revocation]
+sla_mins = 5
+
+# ---------------------------------------------------------------------------------------------
+# [surge] — the load-multiplier the harness drives the surge family at (SUB-D3, the F6 family).
+# Roadmap §2 item 5: "30× surge". The 1×/10×/30× load generator (P-S02) reads its top multiplier
+# here; SUB-D3 asserts the human lane holds, the agent lane sheds, cross-tenant impact is 0 at this
+# multiplier. Keyed on contract 1.11.
+# ---------------------------------------------------------------------------------------------
+[surge]
+multiplier = 30
+
+# ---------------------------------------------------------------------------------------------
+# [fail_static] — W, the bounded-staleness window for FailStatic<T> (contract 1.10 / 4.11).
+#
+# The MECHANISM and the constraint `static_max ≤ revocation-SLA` AND `static_max ≥ agent-token-TTL`
+# (architecture §8.2) ship in M0 REGARDLESS and are enforced in the FailStatic constructor (P-S18).
+# The VALUE W is `[OPEN — LEGAL]` — a DPO-ratified call (L-1, the one substrate-owned legal flag,
+# roadmap §6): it is the residual GDPR-revocation exposure window, handed to counsel, NOT an
+# engineering default set silently.
+#
+# Until the DPO ratifies, `static_max_secs` is ABSENT (commented out). The loader exposes W as an
+# `Open` variant carrying its constraint; reading W as a concrete number is a LOUD error until the
+# legal flag clears. `static_max_default_secs` is the engineering *seed* the mechanism is drilled
+# against (== revocation_sla = 5 min = 300 s, the largest value the constraint admits) — it is NOT
+# the ratified W and is labelled as a seed, not a default-to-beat.
+# ---------------------------------------------------------------------------------------------
+[fail_static]
+status = "OPEN — LEGAL"          # L-1, DPO-ratified; the VALUE is absent until counsel clears it.
+owner = "DPO / Legal"
+# static_max_secs = <RATIFIED W>  # [OPEN — LEGAL] — intentionally absent (a loud error to read).
+static_max_default_secs = 300    # the engineering SEED the mechanism is drilled against (P-S18/P-S25).
+# The constraint that ships regardless and is enforced structurally in the constructor:
+constraint = "static_max <= revocation-SLA AND static_max >= agent-token-TTL"
+
+# ---------------------------------------------------------------------------------------------
+# [rpo_rto] — the durability objectives the restore-verify gate (STOR-D1/D2, SUB-D6) asserts.
+# Roadmap §2 item 5: "RPO ≤ 5 min, RTO ≤ 1h/tenant ≤ 4h/cell". These are PROVEN in M1 (the
+# substrate supplies the injection/assertion half; the value lives here from M0 so the M1 drill
+# reads it). Keyed on contract 11.5.
+# ---------------------------------------------------------------------------------------------
+[rpo_rto]
+rpo_max_mins = 5             # recovery-point objective: at most 5 minutes of data may be lost.
+rto_tenant_max_mins = 60     # recovery-time objective, per tenant: ≤ 1 hour.
+rto_cell_max_mins = 240      # recovery-time objective, per cell: ≤ 4 hours.
+
+# ---------------------------------------------------------------------------------------------
+# [depth_ceilings] — the causal-depth ceilings the agent-loop guard halts a loop at (SUB-D8).
+# Roadmap §2 item 5: "depth ceilings 12/16". The soft ceiling flags a deepening loop early; the
+# hard ceiling structurally halts it (reads EventEnvelope.depth). These ARE the seed constants in
+# `agent_load::DepthCeiling::{V1_SOFT, V1_HARD}` — this file is now their single source of truth.
+# Keyed on contract 1.11.
+# ---------------------------------------------------------------------------------------------
+[depth_ceilings]
+soft = 12
+hard = 16
+
+# ---------------------------------------------------------------------------------------------
+# [[shed_budgets]] — the per-surface shed-budget v1 FLOORS (contract 1.11, architecture §7.6).
+#
+# NAMED FLOOR: these are the M0 v1 floor numbers. The floor DISCIPLINE (bounded + reserved human
+# lane + shed order: speculative → batch/CI → agent → human-last) is the unchanged M0 contract; the
+# NUMBERS are tuned to measured values by the SUB-D3 surge + the connection-storm drill in M5
+# (P-S33), written back here as a dated update — never edited green without the drill. They mirror
+# `shed::ShedBudgetTable::v1_floor()` (the seed table); this file is their source of truth.
+# `surface` matches the `shed::Surface` enum variant name.
+# ---------------------------------------------------------------------------------------------
+[[shed_budgets]]
+surface = "CiDispatch"        # CI is the batch lane (§7.6: n/a human reservation) — CI + agent share the wallet.
+per_tenant_in_flight_cap = 64
+human_lane_reservation = 0
+retry_after_secs = 5
+
+[[shed_budgets]]
+surface = "CollabOpStream"    # a fraction reserved for active editors (the human lane).
+per_tenant_in_flight_cap = 128
+human_lane_reservation = 32
+retry_after_secs = 2
+
+[[shed_budgets]]
+surface = "ConnectionTier"    # reserved connection slots for interactive humans.
+per_tenant_in_flight_cap = 256
+human_lane_reservation = 64
+retry_after_secs = 3
+
+[[shed_budgets]]
+surface = "AgentMention"      # humans never queue behind agent runs (a reserved human fraction).
+per_tenant_in_flight_cap = 96
+human_lane_reservation = 24
+retry_after_secs = 10
+
+[[shed_budgets]]
+surface = "HttpIntake"        # the generic public surface (§7.1): every surface reserves a human fraction.
+per_tenant_in_flight_cap = 200
+human_lane_reservation = 50
+retry_after_secs = 5
+
+# ---------------------------------------------------------------------------------------------
+# [[claimed_not_proven]] — the scorecard (EI-01 §3, roadmap §5). A drill that comes back RED is
+# recorded HERE as a dated row with an owner and the follow-on, and is NEVER edited green: the
+# threshold it gates stays unchanged; the row stays until the deliverable is genuinely repaired
+# and the drill reads green at the un-weakened threshold. An EMPTY list means every shipped M0
+# drill is green-at-threshold (the honest state at this commit).
+# Each row: { gate, threshold_key, date, owner, note }.
+# ---------------------------------------------------------------------------------------------
+# (none — every shipped M0 drill is green at its threshold as of `as_of`.)
