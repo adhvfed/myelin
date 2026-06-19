@@ -26,6 +26,12 @@ path = "src/lib.rs"
 # (2.4) the audit consumer IS an instance of (written via the outbox only — the one sanctioned
 # emit path; the consumer is an infra subscription on it, contract 10.6 / 2.2 / EI-01 §5).
 myelin-events = { path = "../myelin-events" }
+# The GDPR contract surface (10.1): the `PersonalDataHolder` trait + the DSR core types
+# (`SubjectRef` / `EraseScope` / `Receipt` / the per-op reports) the GDPR-owned holders (H18/H16)
+# implement to their frozen shape (P-GA-05). gdpr-service is a LEAF service consumer ABOVE the
+# `myelin-gdpr` contract crate — it implements the trait the crate freezes; nothing in the
+# production library DAG depends back on the service.
+myelin-gdpr = { path = "../myelin-gdpr" }
 # The (tenant, region) partition key the per-tenant hash-chain is keyed on (the audit Merkle
 # tree is in-cell, tenant-partitioned — gdpr §7.1). ArtifactRef is the references-not-payloads
 # subject form (a `subject` is an ArtifactRef, never a payload).

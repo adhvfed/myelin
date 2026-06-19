@@ -77,12 +77,29 @@
 //! ABOVE `myelin-events` / `myelin-identity` / `myelin-tenancy`: it depends on the frozen bus +
 //! identity + tenancy surfaces and NOTHING in the production library DAG depends back on it
 //! (`crate_graph.rs`'s `substrate_is_root()` is preserved — a service is the graph's terminal
-//! consumer, not a node in the eleven-crate library graph). The DSR orchestrator + the GDPR-owned
-//! holders (the rest of contract cluster 10) come to live here in M1 (P-GA-05/-06/-11); this
-//! prompt seeds the crate with the audit-log core.
+//! consumer, not a node in the eleven-crate library graph). The DSR orchestrator + the rest of the
+//! GDPR-owned holders (contract cluster 10) come to live here across M1 (P-GA-06/-11); P-GA-19
+//! seeded the crate with the audit-log core.
+//!
+//! ## P-GA-05 (→ P-105) — the `PersonalDataHolder` trait bodies + the GDPR-owned holders
+//! [`holders`] ships the **bodies** of the frozen contract-10.1 `PersonalDataHolder` trait, and the
+//! GDPR-owned holder impls: **H18** ([`holders::GdprOwnStoreHolder`], GDPR's own G1–G7 registers —
+//! `erase` crypto-shreds the per-tenant/-subject DEK, 0 recoverable after) and **H16** the audit
+//! carve-out ([`holders::AuditCarveOutHolder`] — `erase` retains the minimised pseudonym record,
+//! NEVER rewrites the chain, expires via audit-key crypto-shred). The crypto-shred MECHANISM is
+//! reached through the [`holders::CryptoShredKms`] **seam** (Storage owns the `KmsEngine`; the
+//! no-cross-store-read law forbids a `myelin-storage` import — asserted by
+//! `holders::tests::gdpr_service_has_no_cross_store_read_import`). The upstream-store orchestration
+//! (H6/H8/H9/H10/H14/H15 + the canonical erase order) is **P-GA-06 → P-106**; GA-D1 (0 holders
+//! missed, the whole map) is the **M5 gate P-GA-32 → P-505**.
 
 pub mod audit;
+pub mod holders;
 
 pub use audit::{
     AuditConsumer, AuditEntry, AuditLog, Minimised, Outcome, AUDIT_APPEND_LAG,
+};
+pub use holders::{
+    gdpr_owned_holder_ids, AuditCarveOutHolder, CryptoShredKms, GdprOwnStoreHolder,
+    InMemoryShredKms, ShredKeyClass, ShredKeyHandle, AUDIT_CARVE_OUT_STORE, GDPR_OWN_STORE,
 };

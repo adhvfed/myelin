@@ -1880,6 +1880,8 @@ dependencies = [
 name = "myelin-gdpr"
 version = "0.0.0"
 dependencies = [
+ "blake3",
+ "hex",
  "myelin-events",
  "myelin-gdpr-macros",
  "myelin-identity",
@@ -1899,6 +1901,7 @@ dependencies = [
  "blake3",
  "hex",
  "myelin-events",
+ "myelin-gdpr",
  "myelin-identity",
  "myelin-tenancy",
  "serde",

@@ -29,6 +29,8 @@ fn empty_receipt(operation: &str) -> Receipt {
         operation: operation.to_string(),
         // No personal data → no content body to address; a stable PII-free marker.
         content_hash: "control-plane:no-personal-data".to_string(),
+        // No crypto-shred happens here (the control plane holds zero PII), so no key epoch destroyed.
+        key_epoch_destroyed: None,
     }
 }
 
