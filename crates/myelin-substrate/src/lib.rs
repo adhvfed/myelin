@@ -76,13 +76,35 @@
 //!   re-authorize-every-call, every IDOR audited) is complete now; the wire transport is named.
 //! - The [`topology::Authorizer`] body (the depth-bounded Zanzibar `check`/`list_objects`) is
 //!   Identity M1 (`P-ID-09`/`P-ID-11`). Here the trait is the re-authorize-every-call SEAM.
-//! - The forward-only **migration RUNNER + the exhaustive holder auto-registration** (1.4/1.5)
-//!   → **P-S15**. Here [`serve::MigrationRunner`] applies the embedded DDL in order at boot and
-//!   refuses a destructive migration; the env-first `Config::from_env()` parse of the real
-//!   `DATABASE_URL`/broker/KMS/region knobs + the expand→backfill→contract online runner + the
-//!   H1–H18 holder confirmation (**P-S27**) land there. The concrete `tokio-postgres`/`sqlx`
-//!   connection behind [`myelin_storage::OltpPool`] lands with the driver (P-S15); the
-//!   bounded-pool + fast-fail semantics are complete now.
+//! ## Status (P-S15 → P-032, 2026-06-19) — holder auto-registration + the forward-only runner DONE
+//! The **`PersonalDataHolder` auto-registration mechanism** (1.4) is **implemented** in
+//! [`holders`]: every store the harness opens — OLTP / blob / cache / search index
+//! ([`holders::StoreKind`]) — is registered through the one door, [`holders::HolderRegistry::open`]
+//! (opening IS registering, so "we forgot a store" is structurally impossible, §3.4 / GD-3). The
+//! **forward-only online migration runner** (1.5) is **implemented** in [`migrations`]:
+//! [`migrations::MigrationRunner`] applies the embedded DDL in order at boot and REFUSES a
+//! destructive (`DROP`) migration AND a blocking `ALTER` on a declared-**hot** table (§9.1/§9.4),
+//! carrying the expand→backfill→contract [`migrations::MigrationPhase`] on each migration. The
+//! **hot-table declaration mechanism** ([`migrations::HotTables`], the `AppSpec::hot_tables` field)
+//! is the §9.4 frozen contract both the runner (at boot) and the `forward-only-migration` lint
+//! (P-S11, at source-scan) read. The holder-registration + runner + lint tests are the dated green
+//! artifact.
+//!
+//! ## Floors named (deferred bodies → filling prompt)
+//! - The env-first `Config::from_env()` parse of the real `DATABASE_URL`/broker/KMS/region knobs
+//!   plus the concrete `tokio-postgres`/`sqlx` connection behind [`myelin_storage::OltpPool`] land
+//!   with the driver; the bounded-pool + fast-fail semantics are complete now.
+//! - The **exhaustive H1–H18 holder confirmation** against the REAL Identity/Storage/GDPR holder
+//!   set is **P-S27**; here the MECHANISM auto-registers every opened store. The blob / cache /
+//!   search-index holders' concrete `PersonalDataHolder` DSR bodies land with their backends
+//!   (Storage M1 blob, Search M2); the OLTP holder's DSR bodies are the GDPR M1 floor (P-ST-01).
+//! - **SUB-D10 (online migration under load)** — expand→backfill→contract on a restored
+//!   production-scale copy under load, with no blocking lock beyond budget, plus the lock-time
+//!   measurement against a restore (§9.2) — proves at **M5 (P-S34)**. The runner, the phase model,
+//!   the hot-table declaration, and the destructive/blocking refusals are complete + testable at
+//!   boot scale now.
+//! - The per-subsystem hot-table FLAGS are **measured-not-predicted** (M1+); each high-write
+//!   subsystem declares its set in its `AppSpec` as it lands (the §9.4 seed set is named).
 //! - The real **OpenTelemetry meter/tracer/logger + the OTLP export + the causality+tenant
 //!   trace-context middleware** (§3.5) and the **`SIGTERM`/`SIGINT` → drain** OS trigger →
 //!   **P-S13/P-S14**. Here the producer is a typed in-process meter ([`serve::Telemetry`])
@@ -103,17 +125,24 @@
 use serde::{Deserialize, Serialize};
 
 pub mod crate_graph;
+pub mod holders;
 pub mod metrics_health;
+pub mod migrations;
 pub mod serve;
 pub mod topology;
 
+pub use holders::{HolderRegistration, HolderRegistry, StoreKind};
 pub use metrics_health::{
     CriticalDependencies, CriticalDependency, DependencyHealth, HealthTable, Liveness,
     LivenessState, MetricsHealthSurface, Readiness, ReadinessReport, Startup,
 };
+pub use migrations::{
+    is_blocking_alter, is_destructive, HotTables, Migration, MigrationPhase, MigrationRunner,
+    Migrations,
+};
 pub use serve::{
-    boot, serve, AppSpec, ConsumerReg, HoldersSpec, InternalRpc, Migration, MigrationRunner,
-    Migrations, OutboxSpec, PortOpener, PublicRoutes, ServeHandle, Surface, Telemetry,
+    boot, serve, AppSpec, ConsumerReg, HoldersSpec, InternalRpc, OutboxSpec, PortOpener,
+    PublicRoutes, ServeHandle, Surface, Telemetry,
 };
 pub use topology::{
     AllowPrincipal, AuditSink, Authorizer, DenyAll, IdorAuditRecord, InjectedIdentity,
@@ -217,6 +246,7 @@ mod tests {
             name: "hello",
             config: Config::default(),
             migrations: Migrations::default(),
+            hot_tables: HotTables::none(),
             public: PublicRoutes::default(),
             internal: InternalRpc::default(),
             consumers: vec![],

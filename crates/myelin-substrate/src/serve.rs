@@ -64,7 +64,9 @@
 //!   the in-memory models of the SQL `outbox` / `consumer_dedup` tables (P-S07/P-S08); the real
 //!   binding inside the caller's DB transaction lands when the driver does.
 
+use crate::holders::{HolderRegistration, HolderRegistry, StoreKind};
 use crate::metrics_health::{CriticalDependencies, HealthTable, MetricsHealthSurface};
+use crate::migrations::{HotTables, Migration, MigrationRunner, Migrations};
 use crate::topology::PublicSurface;
 use crate::{Config, ServeError};
 use myelin_events::relay::{BusTransport, InProcessBus};
@@ -75,65 +77,6 @@ use myelin_storage::{OltpConfig, OltpPool, OltpStoreHolder};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-
-/// The forward-only embedded migration set (architecture §3.1, §9; contract 1.5). Each entry
-/// is a forward-only DDL statement (the `outbox` / `consumer_dedup` tables, a service's own
-/// schema). The runner (P-S15) applies them in order at boot; a destructive `DROP` is rejected
-/// (forward-only, the `forward-only-migration` lint P-S11 reads the same shape).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Migrations(pub Vec<Migration>);
-
-/// One forward-only migration: a stable id + its DDL. Ordered by registration (the runner
-/// applies them in `Vec` order so a later migration sees the earlier ones' tables).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Migration {
-    /// A stable, monotonically-ordered id (e.g. `0001_outbox`). PII-free.
-    pub id: &'static str,
-    /// The forward-only DDL (`CREATE TABLE …` / `CREATE INDEX …` / an `ALTER … ADD`). A
-    /// destructive `DROP TABLE`/`DROP COLUMN` is forward-only-illegal and is rejected by the
-    /// runner.
-    pub ddl: &'static str,
-}
-
-impl Migrations {
-    /// Register migrations from `(id, ddl)` pairs (ordered).
-    pub fn new(items: impl IntoIterator<Item = (&'static str, &'static str)>) -> Migrations {
-        Migrations(items.into_iter().map(|(id, ddl)| Migration { id, ddl }).collect())
-    }
-}
-
-/// The forward-only migration RUNNER seam (the body is **P-S15**; here it applies the embedded
-/// DDL in order and records what it applied, rejecting a destructive migration loudly). The
-/// expand→backfill→contract online runner is P-S15; the same `apply` shape stands.
-#[derive(Default)]
-pub struct MigrationRunner {
-    applied: Vec<&'static str>,
-}
-
-impl MigrationRunner {
-    /// Apply each migration in order. Rejects a destructive (`DROP TABLE` / `DROP COLUMN`)
-    /// migration with [`ServeError`] — forward-only is structural (the `forward-only-migration`
-    /// lint, P-S11, enforces it over the source; here the runner refuses one at boot so a
-    /// service cannot start having silently destroyed data).
-    pub fn run(&mut self, migrations: &Migrations) -> Result<(), ServeError> {
-        for m in &migrations.0 {
-            let upper = m.ddl.to_ascii_uppercase();
-            if upper.contains("DROP TABLE") || upper.contains("DROP COLUMN") {
-                return Err(ServeError(format!(
-                    "migration {} is destructive (DROP) — forward-only migrations only (§9)",
-                    m.id
-                )));
-            }
-            self.applied.push(m.id);
-        }
-        Ok(())
-    }
-
-    /// The ids applied, in order (so a test can assert boot ran the migrations before serving).
-    pub fn applied(&self) -> &[&'static str] {
-        &self.applied
-    }
-}
 
 /// The auto-started outbox relay spec (architecture §3.3; contract 2.3). Carries the
 /// [`OutboxStore`] the service emits into (P-S07) and the [`BusTransport`] the relay publishes
@@ -418,6 +361,12 @@ pub struct AppSpec {
     pub config: Config,
     /// The forward-only embedded migration set (§9; run at boot).
     pub migrations: Migrations,
+    /// The per-subsystem hot-table declaration (§9.4; contract 1.5; C-3). A table is flagged hot
+    /// when its write rate warrants expand→backfill→contract (measured, not predicted). The
+    /// migration runner refuses a blocking `ALTER` on a declared-hot table at boot, and the
+    /// `forward-only-migration` lint (P-S11) reads the SAME declaration at source-scan. Defaults
+    /// to none ([`HotTables::none`]); a high-write subsystem declares its set here (M1+).
+    pub hot_tables: HotTables,
     /// The public surface (§4.1 — behind the gateway, identity-injected; SUB-D7 is P-S13).
     pub public: PublicRoutes,
     /// The internal RPC surface (§4.2 — inside the trust boundary only).
@@ -449,6 +398,7 @@ impl AppSpec {
             name,
             config,
             migrations: Migrations::default(),
+            hot_tables: HotTables::none(),
             public: PublicRoutes::default(),
             internal: InternalRpc::default(),
             consumers: Vec::new(),
@@ -492,7 +442,7 @@ pub struct ServeHandle {
     outbox: OutboxStore,
     relay: Relay<RelayTransport>,
     consumers: Vec<ConsumerReg>,
-    holders: Vec<&'static str>,
+    holders: HolderRegistry,
     ports: PortOpener,
     telemetry: Telemetry,
     /// Set once a drain has been requested (the graceful-drain trigger). After this, intake is
@@ -520,8 +470,16 @@ impl ServeHandle {
         &self.outbox
     }
 
-    /// The stores auto-registered as `PersonalDataHolder`s at boot (§3.4).
-    pub fn registered_holders(&self) -> &[&'static str] {
+    /// The stores auto-registered as `PersonalDataHolder`s at boot (§3.4). Every store the
+    /// harness opened — OLTP / blob / cache / search index — is one [`HolderRegistration`]
+    /// receipt; "we forgot a store" is structurally impossible (opening IS registering).
+    pub fn registered_holders(&self) -> &[HolderRegistration] {
+        self.holders.registrations()
+    }
+
+    /// The auto-registration registry the lifecycle populated (so the holder-registered
+    /// architecture test can assert no store escaped registration, §3.4 / contract 1.4).
+    pub fn holder_registry(&self) -> &HolderRegistry {
         &self.holders
     }
 
@@ -625,6 +583,7 @@ pub fn boot(spec: AppSpec) -> Result<ServeHandle, ServeError> {
         name,
         config,
         migrations,
+        hot_tables,
         public: _public,
         internal: _internal,
         consumers,
@@ -642,27 +601,32 @@ pub fn boot(spec: AppSpec) -> Result<ServeHandle, ServeError> {
     let pool = OltpPool::open(pool_config)
         .map_err(|e| ServeError(format!("failed to open the OLTP pool at boot: {e}")))?;
 
-    // (2) migrate — run the forward-only migrations at boot (the runner is P-S15; here it
-    //     applies them in order and refuses a destructive one). The substrate co-located
-    //     `outbox` + `consumer_dedup` tables are part of every service's embedded set.
-    let mut runner = MigrationRunner::default();
+    // (2) migrate — run the forward-only migrations at boot (P-S15): the runner applies them in
+    //     order, refusing a destructive (`DROP`) migration AND a blocking `ALTER` on a declared-
+    //     hot table (§9.1/§9.4). The substrate co-located `outbox` + `consumer_dedup` tables are
+    //     part of every service's embedded set.
+    let mut runner = MigrationRunner::new();
     let mut full_migrations = Migrations(vec![
-        Migration { id: "0000_outbox", ddl: myelin_events::OUTBOX_MIGRATION },
-        Migration {
-            id: "0001_consumer_dedup",
-            ddl: myelin_events::CONSUMER_DEDUP_MIGRATION,
-        },
+        Migration::plain("0000_outbox", myelin_events::OUTBOX_MIGRATION),
+        Migration::plain("0001_consumer_dedup", myelin_events::CONSUMER_DEDUP_MIGRATION),
     ]);
     full_migrations.0.extend(migrations.0);
-    runner.run(&full_migrations)?;
+    runner.run(&full_migrations, &hot_tables)?;
 
-    // (5) holders — auto-register every store the harness opened as a PersonalDataHolder
-    //     (§3.4, GD-3). On this floor the opened store is the OLTP store; the exhaustive
-    //     H1–H18 confirmation is P-S27. `Auto` is the only policy (a service cannot opt out).
+    // (5) holders — auto-register EVERY store the harness opened as a PersonalDataHolder
+    //     (§3.4, GD-3) through the one door, the HolderRegistry: opening IS registering, so "we
+    //     forgot a store" is structurally impossible. On this M0 floor the harness opens the
+    //     OLTP store (every service has one); a service that owns a blob prefix / cache namespace
+    //     / search index opens those through the same registry as its backends land (the
+    //     exhaustive H1–H18 confirmation against the real holder set is P-S27). `Auto` is the
+    //     only policy (a service cannot opt out).
     let HoldersSpec::Auto = holders;
+    let mut holder_registry = HolderRegistry::new();
+    // The OLTP store — opened, therefore registered. The OltpStoreHolder is the concrete
+    // PersonalDataHolder the DSR fan-out drives (its DSR bodies are the GDPR M1 floor, P-ST-01).
     let oltp_holder = OltpStoreHolder::new(name);
-    let _registration = oltp_holder.register();
-    let registered_holders = vec![name];
+    let _oltp_receipt = oltp_holder.register();
+    holder_registry.open(StoreKind::Oltp, name);
 
     // (3) relay — start the outbox relay automatically (§3.3, BUS-2). The relay's `published_at`
     //     clock is the boot clock; the real wall-clock source lands with the driver (P-S15).
@@ -700,7 +664,7 @@ pub fn boot(spec: AppSpec) -> Result<ServeHandle, ServeError> {
         outbox: outbox_store,
         relay,
         consumers,
-        holders: registered_holders,
+        holders: holder_registry,
         ports,
         telemetry,
         draining: Arc::new(AtomicBool::new(false)),
@@ -818,6 +782,7 @@ mod tests {
             name: "hello",
             config: Config::default(),
             migrations: Migrations::new([("0010_hello", "CREATE TABLE IF NOT EXISTS hello (id TEXT)")]),
+            hot_tables: HotTables::none(),
             public: PublicRoutes::default(),
             internal: InternalRpc::default(),
             consumers: vec![consumer],
@@ -835,7 +800,15 @@ mod tests {
             &[Surface::Public, Surface::Internal, Surface::MetricsHealth],
             "the three ports opened in the lifecycle"
         );
-        assert_eq!(handle.registered_holders(), &["hello"], "the OLTP store auto-registered (§3.4)");
+        assert_eq!(
+            handle.registered_holders(),
+            &[HolderRegistration { kind: StoreKind::Oltp, name: "hello" }],
+            "the OLTP store auto-registered as a holder (§3.4)"
+        );
+        assert!(
+            handle.holder_registry().is_registered(StoreKind::Oltp, "hello"),
+            "no store escaped registration (opening IS registering)"
+        );
 
         // emit ONE event through the outbox (a handler's state-change + event, co-committed).
         let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
@@ -904,6 +877,7 @@ mod tests {
             name: "drainer",
             config: Config::default(),
             migrations: Migrations::default(),
+            hot_tables: HotTables::none(),
             public: PublicRoutes::default(),
             internal: InternalRpc::default(),
             consumers: vec![consumer],
@@ -942,6 +916,7 @@ mod tests {
             name: "dedup",
             config: Config::default(),
             migrations: Migrations::default(),
+            hot_tables: HotTables::none(),
             public: PublicRoutes::default(),
             internal: InternalRpc::default(),
             consumers: vec![consumer],
@@ -971,6 +946,7 @@ mod tests {
             name: "bad",
             config: Config::default(),
             migrations: Migrations::new([("0010_bad", "DROP TABLE hello")]),
+            hot_tables: HotTables::none(),
             public: PublicRoutes::default(),
             internal: InternalRpc::default(),
             consumers: vec![],
@@ -988,13 +964,13 @@ mod tests {
     /// FIRST, then the service's own migrations, in order (the boot-time migrate phase).
     #[test]
     fn migration_runner_applies_outbox_dedup_then_service_migrations_in_order() {
-        let mut runner = MigrationRunner::default();
-        let migrations = Migrations(vec![
-            Migration { id: "0000_outbox", ddl: myelin_events::OUTBOX_MIGRATION },
-            Migration { id: "0001_consumer_dedup", ddl: myelin_events::CONSUMER_DEDUP_MIGRATION },
-            Migration { id: "0010_svc", ddl: "CREATE TABLE IF NOT EXISTS svc (id TEXT)" },
+        let mut runner = MigrationRunner::new();
+        let migrations = Migrations::of([
+            Migration::plain("0000_outbox", myelin_events::OUTBOX_MIGRATION),
+            Migration::plain("0001_consumer_dedup", myelin_events::CONSUMER_DEDUP_MIGRATION),
+            Migration::plain("0010_svc", "CREATE TABLE IF NOT EXISTS svc (id TEXT)"),
         ]);
-        runner.run(&migrations).unwrap();
+        runner.run(&migrations, &HotTables::none()).unwrap();
         assert_eq!(runner.applied(), &["0000_outbox", "0001_consumer_dedup", "0010_svc"]);
     }
 
@@ -1027,6 +1003,7 @@ mod tests {
             name: "poison",
             config: Config::default(),
             migrations: Migrations::default(),
+            hot_tables: HotTables::none(),
             public: PublicRoutes::default(),
             internal: InternalRpc::default(),
             consumers: vec![ConsumerReg::new(consumer)],
