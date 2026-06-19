@@ -65,6 +65,7 @@
 
 pub mod authenticate;
 pub mod check_engine;
+pub mod expand;
 pub mod list_objects;
 pub mod lowering;
 pub mod machine_auth;
@@ -78,6 +79,7 @@ pub use authenticate::{
     StructuralVerifier, VerifiedAssertion,
 };
 pub use check_engine::{eval_caveat, CheckEngine, MAX_REWRITE_DEPTH};
+pub use expand::Expand;
 pub use list_objects::{ListObjects, DEFAULT_IDS_CARDINALITY_CAP};
 pub use lowering::{
     fall_back_to_check, is_fall_back, lower, watermark_verdict, AuthzJoin, BoundParam, Lowered,
@@ -415,6 +417,55 @@ impl StoreBackedCheck {
     pub fn namespace(&self) -> NamespaceEngine {
         self.namespace.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
+
+    /// **The scoped, LIVE `list_subjects` (P-ID-13) — the Zanzibar Expand served by S8 at density.**
+    /// The verified `(tenant, region)` scope is carried explicitly (the ABI trait method cannot — it
+    /// has no caller principal). The object's type is inferred from its id's `type:` prefix (the §7.3
+    /// id-column convention); the [`Expand`] engine resolves the permission's rewrite (a compiled
+    /// permission, the four operators) or serves a direct relation via the S8 reverse index. Returns
+    /// the flattened [`myelin_identity::SubjectTree`].
+    pub fn list_subjects_in(
+        &self,
+        scope: &myelin_storage::TenantScope,
+        object: &myelin_identity::ObjectId,
+        permission: &Permission,
+        at: &Consistency,
+    ) -> myelin_identity::SubjectTree {
+        let namespace = self.namespace.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let expand = Expand::new(self.tuples.clone(), namespace, self.index.clone());
+        let object_type = ObjectType(infer_object_type(&object.0));
+        expand.list_subjects(scope, object, &object_type, permission, at)
+    }
+
+    /// **The scoped, LIVE `explain` (P-ID-13) — the userset-rewrite trace for the admin inspector /
+    /// HITL.** The verified scope is carried explicitly (as for [`StoreBackedCheck::list_subjects_in`]).
+    /// Returns the [`myelin_identity::RewriteTrace`] of why `subject`'s access to `permission` on
+    /// `object` resolved — non-empty, ending in `ALLOW`/`DENY` (never a silent allow).
+    pub fn explain_in(
+        &self,
+        scope: &myelin_storage::TenantScope,
+        subject: &myelin_identity::PrincipalId,
+        permission: &Permission,
+        object: &myelin_identity::ObjectId,
+        at: &Consistency,
+    ) -> myelin_identity::RewriteTrace {
+        let namespace = self.namespace.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let expand = Expand::new(self.tuples.clone(), namespace, self.index.clone());
+        let object_type = ObjectType(infer_object_type(&object.0));
+        expand.explain(scope, subject, object, &object_type, permission, at)
+    }
+}
+
+/// Infer an object's TYPE from its id by the leading `type:` prefix (`channel:general` → `channel`).
+/// The §7.3 id-column convention the core hierarchy + the M3/M4 fragments follow; a bare id with no
+/// prefix is its own type (resolving no compiled permission → a direct relation expand, the safe
+/// floor). Mirrors `namespace`/`reverse_index`/`expand`'s local helper (kept here so the service slot
+/// does not reach into a module-private helper).
+fn infer_object_type(object_id: &str) -> String {
+    object_id
+        .split_once(':')
+        .map(|(ty, _)| ty.to_string())
+        .unwrap_or_else(|| object_id.to_string())
 }
 
 impl IdentityService for StoreBackedCheck {
@@ -486,15 +537,31 @@ impl IdentityService for StoreBackedCheck {
         Ok(lo.list_objects(&scope, subject, permission, ty, at))
     }
 
+    /// 4.4 (Expand) — the LIVE `list_subjects` (P-ID-13): the Zanzibar Expand served by S8 at
+    /// 50k-member density. The scope is derived from the **caller's own** verified subject — but the
+    /// ABI trait method does not carry the caller principal, so this slot uses the internal-RPC
+    /// re-authorization seam's scope. To keep the ONE expand seam, the live entry the service wires is
+    /// [`StoreBackedCheck::list_subjects_in`] (which carries the verified `(tenant, region)` scope the
+    /// ABI method cannot); the ABI method errors loudly so a tenant-less expand is never served.
     fn list_subjects(
         &self,
         _object: &myelin_identity::ObjectId,
         _permission: &Permission,
         _at: &Consistency,
     ) -> myelin_identity::Result<myelin_identity::SubjectTree> {
-        Err(AuthzError::NotYetImplemented("list_subjects → P-ID-13 (M1)"))
+        // The ABI trait method carries no verified (tenant, region) scope (no caller principal); a
+        // tenant-less expand has no partition to read and MUST NOT be served (the tenant-predicate
+        // floor — a cross-tenant or unscoped expand is a leak). The live, scoped entry the service
+        // surface wires is `StoreBackedCheck::list_subjects_in`, which carries the verified scope.
+        Err(AuthzError::NotYetImplemented(
+            "list_subjects (ABI, scope-less) → use StoreBackedCheck::list_subjects_in (P-ID-13); a \
+             tenant-less expand is never served (the tenant-predicate floor)",
+        ))
     }
 
+    /// 4.4 (`explain`) — the LIVE `explain` (P-ID-13): the userset-rewrite trace. Like
+    /// `list_subjects`, the ABI method carries no verified scope; the scoped entry is
+    /// [`StoreBackedCheck::explain_in`]. The ABI method errors loudly (never a scope-less trace).
     fn explain(
         &self,
         _subject: &Principal,
@@ -502,7 +569,9 @@ impl IdentityService for StoreBackedCheck {
         _object: &myelin_identity::ObjectId,
         _at: &Consistency,
     ) -> myelin_identity::Result<myelin_identity::RewriteTrace> {
-        Err(AuthzError::NotYetImplemented("explain → P-ID-13 (M1)"))
+        Err(AuthzError::NotYetImplemented(
+            "explain (ABI, scope-less) → use StoreBackedCheck::explain_in (P-ID-13)",
+        ))
     }
 
     fn delegation(

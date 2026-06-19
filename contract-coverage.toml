@@ -239,8 +239,18 @@ cdc = ["crates/myelin-identity-service/tests/cdc_4_3_list_objects.rs"]
 [[contract]]
 row = "4.4"
 title = "list_subjects + explain"
-status = "deferred"
-landing = "P-071"
+# COVERED by P-ID-13 / P-071: the Zanzibar Expand served by S8 at 50k-member density.
+# `list_subjects(object, permission, zookie?) → SubjectTree` flattens the concrete subjects holding a
+# permission (a direct relation served by the S8 reverse index `subjects_for` — an indexed lookup at
+# density, not a per-member scan; a compiled permission composes the four operators over the
+# per-relation S8 expansions) + `explain → RewriteTrace` returns the userset-rewrite trace
+# (non-empty, ending ALLOW/DENY, never a silent allow). The provider
+# (StoreBackedCheck::list_subjects_in / explain_in over S3 + S8) + consumer (an admin-inspector /
+# HITL-approver-set rendering the membership) CDC pair ships here. The 50k-density synthetic GATE is
+# the lib unit `list_subjects_50k_member_density_within_budget`; the REAL-density proof (the watcher
+# relation + Chat channels) is the named floor → P-134 (P-ID-23) + M4.
+status = "covered"
+cdc = ["crates/myelin-identity-service/tests/cdc_4_4_list_subjects.rs"]
 
 [[contract]]
 row = "4.5"

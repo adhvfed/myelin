@@ -272,6 +272,42 @@ impl ReverseIndex {
             .unwrap_or_default()
     }
 
+    /// **The inverse reverse lookup the `list_subjects` Expand serves at density (architecture
+    /// §7.5):** the concrete principal subjects that have `relation` directly on `object_id`, within
+    /// the verified `(tenant, region, type)` partition. This is the `(object_id, relation) →
+    /// {subject}` direction the Zanzibar **Expand** (`list_subjects(channel, watcher)`) flattens — the
+    /// **same** S8 projection [`ReverseIndex::objects_for`] reads in the opposite direction, so a
+    /// 50k-member channel expands via an indexed lookup, NOT a per-member scan (C8). Scoped to the
+    /// verified scope — there is NO cross-tenant read path (the `tenant-predicate` floor + the
+    /// partition isolation). Returns the DIRECT principal subjects (the projection S8 carries —
+    /// userset/inheritance edges are expanded by the [`crate::expand`] engine over the S3 snapshot).
+    pub fn subjects_for(
+        &self,
+        scope: &TenantScope,
+        object_type: &ObjectType,
+        object_id: &str,
+        relation: &RelName,
+    ) -> Vec<PrincipalId> {
+        let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S8_TABLE));
+        let pk = PartKey {
+            tenant: scope.tenant().0.clone(),
+            region: scope.region().0.clone(),
+            object_type: object_type.0.clone(),
+        };
+        let inner = self.lock();
+        inner
+            .partitions
+            .get(&pk)
+            .map(|p| {
+                p.rows
+                    .values()
+                    .filter(|r| r.object_id.0 == object_id && &r.relation == relation)
+                    .map(|r| r.subject.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The `revision_watermark` for a `(tenant, region)` partition (§8.7) — the latest applied
     /// `iam.tuple_written` zookie. The read-side consistency path (compare a scan's required revision
     /// against this; wait / fall back to per-row `check` if behind) is P-ID-12; here the column +
