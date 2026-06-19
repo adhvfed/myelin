@@ -66,6 +66,7 @@
 pub mod authenticate;
 pub mod check_engine;
 pub mod expand;
+pub mod failstatic_cache;
 pub mod list_objects;
 pub mod lowering;
 pub mod machine_auth;
@@ -81,6 +82,9 @@ pub use authenticate::{
 };
 pub use check_engine::{eval_caveat, CheckEngine, MAX_REWRITE_DEPTH};
 pub use expand::Expand;
+pub use failstatic_cache::{
+    CachedDecision, CacheTelemetry, CoarseGrant, FailStaticCache, Served, FRESH_TTL_SECS, S6_STORE,
+};
 pub use list_objects::{ListObjects, DEFAULT_IDS_CARDINALITY_CAP};
 pub use lowering::{
     fall_back_to_check, is_fall_back, lower, watermark_verdict, AuthzJoin, BoundParam, Lowered,
@@ -460,6 +464,95 @@ impl StoreBackedCheck {
     /// bus consumer over the SAME index).
     pub fn index(&self) -> &ReverseIndex {
         &self.index
+    }
+
+    /// **Build the S6 fail-static availability cache (P-ID-15) in front of THIS `check` engine.** The
+    /// returned [`failstatic_cache::FailStaticCache`] shares this slot's S7 [`revocation::RevocationStore`]
+    /// (so a `revoke`/disable here is seen by the cache's just-revoked deny), and reads the
+    /// `static_max ≤ revocation SLA ≥ agent-token-TTL` bound from the thresholds-file `[fail_static]`
+    /// row (the W = 5 min `[OPEN — LEGAL]` engineering seed). Wire a `BoundedStale` authz read
+    /// through [`StoreBackedCheck::check_failstatic`] (S6 in front of the engine `check`); a
+    /// `Strong`/zookie-stamped read bypasses S6 and hits this engine directly (the 4.10 bypass half).
+    ///
+    /// **One cache primitive (EI-01 §7):** the cache wraps the SAME `check` the platform calls — it
+    /// is not a bespoke availability path. On a healthy read it caches + returns the engine's coarse
+    /// answer; on an Id-dependency hiccup (the `source` returns `Err`) it serves the bounded-staleness
+    /// fallback. Errors (`FailStaticError`) only if the thresholds-file bound is structurally invalid
+    /// (it cannot be, given the M0 `[fail_static]` row — but the bound is enforced, never assumed).
+    pub fn failstatic_cache(
+        &self,
+        revocation_sla_secs: myelin_substrate::Seconds,
+        threshold: &myelin_substrate::thresholds::FailStaticThreshold,
+    ) -> Result<failstatic_cache::FailStaticCache, myelin_substrate::FailStaticError> {
+        failstatic_cache::FailStaticCache::try_new(
+            revocation_sla_secs,
+            threshold,
+            self.revocations.clone(),
+        )
+    }
+
+    /// **Build the S6 fail-static cache against an INJECTED clock (the drill/CDC seam).** Identical
+    /// to [`StoreBackedCheck::failstatic_cache`] but with a caller-supplied [`myelin_substrate::Clock`]
+    /// so the ID-D2 drill / the 4.11 CDC can advance a `TestClock` across the `fresh_ttl` /
+    /// `static_max` boundaries deterministically (the production `SystemClock` exposes no mutators,
+    /// so wiring it via [`StoreBackedCheck::failstatic_cache`] leaks no control over wall time). The
+    /// SAME shared S7 denylist is threaded (a `revoke` here is seen by the cache's just-revoked deny).
+    pub fn failstatic_cache_with_clock<C: myelin_substrate::Clock>(
+        &self,
+        revocation_sla_secs: myelin_substrate::Seconds,
+        threshold: &myelin_substrate::thresholds::FailStaticThreshold,
+        clock: C,
+    ) -> Result<failstatic_cache::FailStaticCache<C>, myelin_substrate::FailStaticError> {
+        failstatic_cache::FailStaticCache::try_new_with_clock(
+            revocation_sla_secs,
+            threshold,
+            self.revocations.clone(),
+            clock,
+        )
+    }
+
+    /// **The S6-fronted `check` (P-ID-15) — the availability read path.** Serve a `check` answer
+    /// through the fail-static availability cache `s6` (built via [`StoreBackedCheck::failstatic_cache`]),
+    /// honouring the zookie-bypass: a `Strong`/zookie-stamped read bypasses S6 and hits THIS engine
+    /// directly (fail-closed-or-wait); a `BoundedStale` read is served static during an Id hiccup.
+    ///
+    /// `source_ok` decides whether the authoritative engine `check` is currently reachable: on the
+    /// healthy path it is `true` (the engine answer is cached + served); during an injected
+    /// Id-dependency hiccup it is `false` (the cache serves the bounded-staleness fallback, the ID-D2
+    /// drill path). This `source_ok` seam is how a drill injects the hiccup at the authz boundary
+    /// (the substrate `ResilientClient` surfaces a real transport hiccup the same way; here the
+    /// in-cell engine is local, so the hiccup is injected explicitly). The `question` is the
+    /// `permission@object` cache discriminator. The just-revoked subject is denied through the cache
+    /// regardless (the S7 consult on every served answer).
+    #[allow(clippy::too_many_arguments)]
+    pub fn check_failstatic<C: myelin_substrate::Clock>(
+        &self,
+        s6: &failstatic_cache::FailStaticCache<C>,
+        scope: &myelin_storage::TenantScope,
+        subject: &Principal,
+        permission: &Permission,
+        object: &ArtifactRef,
+        at: &Consistency,
+        caveat: Option<&CaveatContext>,
+        now: &myelin_events::Timestamp,
+        source_ok: bool,
+    ) -> failstatic_cache::CachedDecision {
+        let question = format!("{}@{}", permission.0, object.0);
+        s6.check_cached(scope, &subject.principal_id, &question, at, now, || {
+            if !source_ok {
+                // The injected Id-dependency hiccup: the authoritative engine is unreachable. The
+                // cache serves the bounded-staleness fallback (BoundedStale) or fails closed (Strong).
+                return Err(myelin_substrate::ServeError("identity authz hiccup".into()));
+            }
+            // The healthy path: run the SAME authoritative engine `check` the platform calls (one
+            // primitive, no bespoke availability path). Its decision is cached + served.
+            match self.check(subject, permission, object, at, caveat) {
+                Ok(decision) => Ok(decision),
+                // A genuine engine error (not a hiccup) is treated as a fail-closed Deny by the
+                // cache's source — never an open fall-through.
+                Err(_) => Ok(Decision::Deny),
+            }
+        })
     }
 
     /// Admit a **rich** [`FragmentDef`] (carrying the permission rewrite structure) into the cell

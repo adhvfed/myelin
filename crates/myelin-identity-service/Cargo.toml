@@ -65,3 +65,10 @@ myelin-gdpr = { path = "../myelin-gdpr" }
 # (the contract-1.8 survival-signal set, incl. CrossTenantCount) the cross-tenant drill emits its
 # dated green artifact through. DEV-only — myelin-harness never enters the service production DAG.
 myelin-harness = { path = "../myelin-harness" }
+# P-ID-15 (P-073) CDC for 4.11: the critical-dep caller wraps `check` in the ResilientClient
+# (contract 1.9) — the M0 shared resilient inter-service client (timeout + breaker + bulkhead +
+# jittered retry). The CDC pins the provider (Identity `check` + S6 FailStatic) against the
+# consumer (a critical-dep caller wrapping the check in ResilientClient + S6). DEV-only — the
+# client never enters the identity-service production DAG; the CDC models a DOWNSTREAM consumer
+# of Identity (every other service is such a caller).
+myelin-client = { path = "../myelin-client" }
