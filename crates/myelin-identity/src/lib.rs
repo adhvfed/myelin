@@ -669,6 +669,116 @@ pub trait IdentityService {
 )]
 pub trait AuthzClient: IdentityService {}
 
+/// **The FROZEN pseudonym grammar `<pseudonym>@<tenant>.noreply` (contract 4.8, pin C5;
+/// recon §X-7; EI-04 §1).** P-ID-19.
+///
+/// This is the pseudonymous identity a subject is attributed under in any IMMUTABLE,
+/// erasure-resistant surface — first and foremost **git commit author/email** (the bytes are
+/// baked into the commit hash, so they must never contain erasable real PII, EI-04 §1). The
+/// grammar is frozen **NOW**, in M1, **before** the Git data model freezes in M3 — the
+/// decide-before-the-git-data-model obligation (EI-04 §1: "decide this BEFORE the git
+/// subsystem's data model is fixed; it is nearly impossible to bolt on later"). Git commits
+/// become pseudonymous-by-default in M3 ([P-ID-25]) by consuming THIS type.
+///
+/// **Why a frozen value type, not a bare `format!`:** the grammar is a cross-band contract
+/// (frozen M1, consumed M3) — freezing it as a parse/format-round-tripping type in the
+/// **contract crate** (the DAG sink everyone can import, never the service crate) means a
+/// drift in the `@`/`.noreply` shape fails to compile at every consumer, not silently at
+/// runtime in a commit's immutable bytes. The `pseudonym` token is the per-tenant opaque
+/// handle the S2 map ([the service crate's pseudonym store, P-ID-19]) mints + stores under the
+/// subject's per-subject key (the erasure lever); this type carries the **public, PII-free**
+/// rendering of that handle — never the real identity, which lives crypto-shred-protected in
+/// S2 (resolvable only by `resolve_pseudonym`, [P-ID-20]).
+///
+/// ## What is frozen (drift here is a compile break at every consumer)
+/// - the rendering is **exactly** `<pseudonym>@<tenant>.noreply` ([`PseudonymHandle::render`]);
+/// - it round-trips: [`PseudonymHandle::parse`] of a rendering recovers the same
+///   `(pseudonym, tenant)` (the byte-identical conformance the Git M3 commit codec relies on);
+/// - the local-part (`<pseudonym>`) and the domain label (`<tenant>`) are **opaque, PII-free
+///   tokens** — the grammar carries NO real name/email (the immutable-bytes-stay-PII-free
+///   invariant, EI-04 §1 / recon §X-7).
+///
+/// `[P-ID-25]`: Git pseudonymous-by-default commits consume this (M3 — the named follow-on).
+/// `[P-ID-20]`: `resolve_pseudonym`/`erase` (the S2 read + crypto-shred) consume the S2 map.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PseudonymHandle {
+    /// The per-tenant opaque pseudonym token — the local-part `<pseudonym>`. PII-free: it is
+    /// the S2 map's per-tenant handle for a subject (the real identity lives in S2 under the
+    /// per-subject key), never a real name/email.
+    pseudonym: String,
+    /// The tenant label — the `<tenant>` segment before `.noreply`. The tenant slug
+    /// ([`TenantId`]); PII-free.
+    tenant: String,
+}
+
+/// The frozen domain suffix of the pseudonym grammar (contract 4.8, pin C5). The rendering is
+/// `<pseudonym>@<tenant>` + THIS. A `.noreply` TLD is unroutable by construction (RFC 6761-class
+/// reserved use) — a pseudonymous commit email never reaches a real mailbox.
+pub const PSEUDONYM_DOMAIN_SUFFIX: &str = ".noreply";
+
+impl PseudonymHandle {
+    /// Construct a pseudonym handle from a PII-free `(pseudonym, tenant)` pair (the S2 map's
+    /// per-tenant handle + the tenant slug). Returns `None` if either token is empty or would
+    /// break the grammar's unambiguous round-trip (a token containing `@` or `.noreply`, or a
+    /// tenant containing `.`/`@`), so a malformed handle can never be minted (the immutable
+    /// bytes never carry a grammar-breaking — or PII-smuggling — token).
+    pub fn new(pseudonym: impl Into<String>, tenant: impl Into<String>) -> Option<PseudonymHandle> {
+        let pseudonym = pseudonym.into();
+        let tenant = tenant.into();
+        if pseudonym.is_empty() || tenant.is_empty() {
+            return None;
+        }
+        // The local-part must not contain `@` (the separator) so `parse` splits unambiguously.
+        if pseudonym.contains('@') {
+            return None;
+        }
+        // The tenant label sits immediately before `.noreply`; it must not contain `@` or `.`
+        // (a `.` would make the `.noreply`-suffix split ambiguous, an `@` is the separator).
+        if tenant.contains('@') || tenant.contains('.') {
+            return None;
+        }
+        Some(PseudonymHandle { pseudonym, tenant })
+    }
+
+    /// The per-tenant opaque pseudonym token (the local-part). PII-free.
+    pub fn pseudonym(&self) -> &str {
+        &self.pseudonym
+    }
+
+    /// The tenant label (the `<tenant>` segment). PII-free.
+    pub fn tenant(&self) -> &str {
+        &self.tenant
+    }
+
+    /// **Render the FROZEN grammar `<pseudonym>@<tenant>.noreply` (contract 4.8, pin C5).**
+    /// This is the exact string baked into a pseudonymous git commit's author email (M3,
+    /// P-ID-25) — the bytes that go into the immutable commit hash, so they carry ONLY the
+    /// PII-free handle.
+    pub fn render(&self) -> String {
+        format!("{}@{}{}", self.pseudonym, self.tenant, PSEUDONYM_DOMAIN_SUFFIX)
+    }
+
+    /// **Parse a `<pseudonym>@<tenant>.noreply` rendering back to its `(pseudonym, tenant)`
+    /// (the byte-identical round-trip the Git M3 commit codec relies on).** Returns `None` if
+    /// the input does not match the frozen grammar exactly (wrong suffix, missing/extra `@`,
+    /// empty token) — a non-conforming string is REFUSED, never silently coerced (so a
+    /// resurrected real-PII email can never be mistaken for a valid pseudonym).
+    pub fn parse(s: &str) -> Option<PseudonymHandle> {
+        let local_and_domain = s.strip_suffix(PSEUDONYM_DOMAIN_SUFFIX)?;
+        // Exactly ONE `@` (split into the local-part + the tenant label).
+        let (pseudonym, tenant) = local_and_domain.split_once('@')?;
+        // Re-validate through the constructor so parse and `new` agree on the frozen shape
+        // (one source of truth for "what is a well-formed handle").
+        PseudonymHandle::new(pseudonym.to_string(), tenant.to_string())
+    }
+}
+
+impl core::fmt::Display for PseudonymHandle {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.render())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -949,5 +1059,57 @@ mod tests {
             }),
             Err(AuthzError::NotYetImplemented(_))
         ));
+    }
+
+    /// **The frozen pseudonym grammar renders EXACTLY `<pseudonym>@<tenant>.noreply` (contract
+    /// 4.8, pin C5).** This is the byte-for-byte string baked into a pseudonymous git commit
+    /// (M3, P-ID-25) — drift in the `@`/`.noreply` shape fails THIS test (and every consumer's
+    /// compile, since the grammar is a frozen type).
+    #[test]
+    fn pseudonym_grammar_renders_the_frozen_shape() {
+        let h = PseudonymHandle::new("anon-7f3a", "acme").expect("a well-formed handle");
+        assert_eq!(
+            h.render(),
+            "anon-7f3a@acme.noreply",
+            "the frozen grammar is `<pseudonym>@<tenant>.noreply`"
+        );
+        // Display agrees with render (one rendering).
+        assert_eq!(h.to_string(), "anon-7f3a@acme.noreply");
+    }
+
+    /// **The grammar round-trips: parse(render(h)) == h (the byte-identical conformance the
+    /// Git M3 commit codec relies on).** A rendering parses back to the same `(pseudonym,
+    /// tenant)`; this is the cross-band guarantee that lets Git store the rendered email and
+    /// recover the handle.
+    #[test]
+    fn pseudonym_grammar_round_trips() {
+        let h = PseudonymHandle::new("anon-7f3a", "globex").unwrap();
+        let parsed = PseudonymHandle::parse(&h.render()).expect("the rendering parses back");
+        assert_eq!(parsed, h, "parse(render(h)) == h");
+        assert_eq!(parsed.pseudonym(), "anon-7f3a");
+        assert_eq!(parsed.tenant(), "globex");
+    }
+
+    /// **A non-conforming string is REFUSED (never silently coerced).** A wrong suffix, a
+    /// missing/extra `@`, or an empty token must NOT parse to a fabricated handle — otherwise a
+    /// resurrected real-PII email could be mistaken for a valid pseudonym. This pins the
+    /// fail-loud parse the immutable-bytes-stay-PII-free invariant depends on.
+    #[test]
+    fn pseudonym_grammar_refuses_non_conforming() {
+        // Wrong domain suffix (a routable real email, NOT a `.noreply` pseudonym).
+        assert!(PseudonymHandle::parse("alice@acme.com").is_none());
+        // Missing the `@` separator.
+        assert!(PseudonymHandle::parse("anon-acme.noreply").is_none());
+        // Two `@` — ambiguous local-part (a real `user@host` smuggled in).
+        assert!(PseudonymHandle::parse("a@b@acme.noreply").is_none());
+        // Empty pseudonym / empty tenant.
+        assert!(PseudonymHandle::parse("@acme.noreply").is_none());
+        assert!(PseudonymHandle::parse("anon@.noreply").is_none());
+        // The constructor refuses a tenant with a `.` (would make the `.noreply` split
+        // ambiguous) and a pseudonym carrying an `@`.
+        assert!(PseudonymHandle::new("anon", "ac.me").is_none());
+        assert!(PseudonymHandle::new("a@b", "acme").is_none());
+        assert!(PseudonymHandle::new("", "acme").is_none());
+        assert!(PseudonymHandle::new("anon", "").is_none());
     }
 }
