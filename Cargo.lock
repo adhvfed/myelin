@@ -256,6 +256,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "myelin-control-plane"
+version = "0.0.0"
+dependencies = [
+ "myelin-gdpr",
+ "myelin-identity",
+ "myelin-substrate",
+ "myelin-tenancy",
+]
+
+[[package]]
 name = "myelin-events"
 version = "0.0.0"
 dependencies = [
