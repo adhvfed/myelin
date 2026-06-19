@@ -1,0 +1,17 @@
+// GREEN fixture for `tenant-predicate` — the REFS slice (REF-P2 / P-053). The lint MUST admit this.
+//
+// The same Refs backlink read, now threading the tenant predicate: the query carries a `TenantId`
+// bound (the RLS guard / the `(tenant, target_root)` partition prefix the `edge_inbound` index
+// requires), so it can only ever see one tenant's edges — there is no cross-tenant query path
+// (refined-arch reference-graph §3; ID-3). This is the structurally-correct edge read.
+pub async fn backlinks(pool: &PgPool, tenant_id: TenantId, target_root: &ArtifactRef) -> Vec<Edge> {
+    // OK: the TenantId is threaded into the query — `(tenant, target_root)`, the edge_inbound key.
+    sqlx::query(
+        "SELECT source, rel FROM edge WHERE tenant = $1 AND target_root = $2 AND NOT tombstoned",
+    )
+    .bind(tenant_id)
+    .bind(target_root.as_str())
+    .fetch_all(pool)
+    .await
+    .expect("backlink query")
+}

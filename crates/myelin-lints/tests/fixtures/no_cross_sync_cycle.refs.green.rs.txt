@@ -1,0 +1,14 @@
+// GREEN fixture for `no-cross-sync-cycle` — the REFS slice (REF-P2 / P-053). The lint MUST admit this.
+//
+// The same per-viewer resolution write path, now reading Refs' OWN bus-fed projection (the R1
+// `edge` projection + the R2 display-hint cache, kept fresh by the owner's `*.updated`/`*.erased`
+// events) instead of synchronously calling the owner subsystem. CI/Issues/Git EMIT, Refs READS its
+// projection — the cross-subsystem edge is async over the bus, so the call graph stays acyclic
+// (refined-arch reference-graph §3; EI-02 §3; 00-reconciliation §X-1).
+// @write-path
+pub async fn resolve_edge(projection: &EdgeProjection, edge: &Edge) -> ResolvedEdge {
+    // OK: read the local, bus-fed projection — no synchronous cross-subsystem call. The display hint
+    // is invalidated by the owner's `*.updated`/`*.erased` events, never fetched by a sync RPC.
+    let target = projection.display_hint(edge.target_root());
+    ResolvedEdge::new(edge, target)
+}

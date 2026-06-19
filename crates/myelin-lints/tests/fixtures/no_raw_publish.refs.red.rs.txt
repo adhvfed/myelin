@@ -1,0 +1,14 @@
+// RED fixture for `no-raw-publish` — the REFS slice (REF-P2 / P-053). The lint MUST reject this.
+//
+// There is NO standalone edge-write API in Refs (refined-arch reference-graph §3, contract 5.4):
+// an `refs.edge.*` event must be emitted in the SAME transaction as the structured node it mirrors
+// (emit-iff-committed), so the edge projection can never diverge from the source. A refs-edge
+// extractor that fire-and-forget-publishes the edge event directly onto the broker bypasses the
+// outbox — the lost-event / causality-break bug class (the edge silently never lands, or lands
+// without its source committing).
+pub async fn extract_edges(broker: &Broker, node: &StructuredNode) -> Result<(), Error> {
+    let draft = edge_event_for(node);
+    // BUG: a raw broker publish bypasses OutboxTx::emit — no same-transaction co-commit.
+    broker.publish("refs.edge.created", draft).await?;
+    Ok(())
+}

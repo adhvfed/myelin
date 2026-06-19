@@ -1,0 +1,13 @@
+// GREEN fixture for `no-raw-publish` — the REFS slice (REF-P2 / P-053). The lint MUST admit this.
+//
+// The same refs-edge extractor, now emitting the `refs.edge.*` event through `OutboxTx::emit` in
+// the SAME transaction as the structured node write (emit-iff-committed, contract 5.4): one edge
+// per structured node, co-committed with the source. The relay is the only component on the broker
+// publish side — there is no standalone edge-write path.
+pub async fn extract_edges(tx: &mut OutboxTx, node: &StructuredNode) -> Result<(), Error> {
+    tx.write_structured_node(node)?;
+    let draft = edge_event_for(node);
+    // OK: the edge event is emitted in-transaction via the outbox — co-committed with its source.
+    tx.emit(draft, Cause::from_node(node))?;
+    tx.commit().await
+}

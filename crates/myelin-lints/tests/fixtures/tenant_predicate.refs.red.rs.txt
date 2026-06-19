@@ -1,0 +1,19 @@
+// RED fixture for `tenant-predicate` — the REFS slice (REF-P2 / P-053). The lint MUST reject this.
+//
+// The Refs `edge` table is `(tenant, region)`-first with NO cross-tenant query path
+// (refined-arch reference-graph §3 line 3; EI-02 §1, ID-3). A backlink read ("what references
+// this artifact, + its children?") that builds its `edge`-table query WITHOUT threading the tenant
+// predicate is the cross-tenant IDOR bug class: it would return another tenant's edges. The
+// `edge_inbound`/`edge_outbound` indexes are themselves `(tenant, target_root)` / `(tenant,
+// source_root)` — the tenant column is the partition prefix, so a tenant-less query is structurally
+// wrong, not just unsafe.
+pub async fn backlinks(pool: &PgPool, target_root: &ArtifactRef) -> Vec<Edge> {
+    // BUG: no TenantId / tenant predicate threaded — this reads `edge` across ALL tenants.
+    sqlx::query(
+        "SELECT source, rel FROM edge WHERE target_root = $1 AND NOT tombstoned",
+    )
+    .bind(target_root.as_str())
+    .fetch_all(pool)
+    .await
+    .expect("backlink query")
+}
