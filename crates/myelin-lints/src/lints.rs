@@ -573,46 +573,144 @@ pub fn forward_only_migration() -> Lint {
 /// call). The full call-graph-acyclicity check across ALL service pairs rides the resilient
 /// inter-service client (`SyncClient`, P-S16 / P-033) + the per-edge sync-call registry; this
 /// scanner enforces the load-bearing sink invariant now and tightens when the client lands.
+///
+/// **EB-08 reconciliation (P-044, the Bus's OWNED slice; coherence rule EI-01 §7).** The
+/// `no-cross-sync-cycle` lint, its engine, and its `@identity-sink` red/green fixtures were first
+/// shipped by the SUBSTRATE prompt P-S11 → P-018 (the remaining eight architecture lints; the lint
+/// harness is shared substrate). That P-018 form is the *Identity-sink* half: it fires ONLY inside
+/// an `@identity-sink`-marked file (Identity originates no sync cross-service call). EB-08 is the
+/// Bus's OWNED slice of the SAME contract-1.6 lint, and its CANON docs name the BROADER, canonical
+/// rule (refined-arch event-bus §7.1 + 00-reconciliation §X-1 line 117-118): *the bus is cell-local;
+/// heavy cross-system work is async off the bus, never synchronous in the write path — CI emits,
+/// Git reads; Git never synchronously calls CI to ask "is it green," it reads its own projection.*
+/// This is a genuinely DISTINCT bug fingerprint from the Identity-sink leg: here the originator is
+/// ANY subsystem (Git, Issues, Chat …), the call is a synchronous cross-subsystem RPC asking
+/// another subsystem for its state INSIDE A WRITE PATH, and the sanctioned alternative is a
+/// projection read / a bus reaction (an `EventHandler`), never a sync call. Rather than duplicate a
+/// parallel scanner (EI-01 §7), the in-place scanner is EXTENDED with this second leg — keyed to a
+/// loud, named `// @write-path` marker (the same marker discipline `@identity-sink` /
+/// `@workflow-body` / `@residency-write` use) so it fires ONLY where a write path is being scanned,
+/// and admits the whole current (no-write-path-yet) workspace until the producer write paths land
+/// (Git M3 GIT-P*, the merge-gate consumer). The lint is SHARPENED (it now also guards the general
+/// cross-subsystem write-path acyclicity), never weakened (EI-01 §5).
+///
+/// **Floor (named) — the runtime acyclicity drill is later-band.** This is the *lint leg* (the
+/// compile-time rejection of the bug fingerprint) only. The full call-graph-acyclicity check across
+/// ALL service pairs rides the resilient inter-service client (`SyncClient`, P-S16 / P-033) + the
+/// per-edge sync-call registry; the live Git→CI "reads its own projection, never a sync call" path
+/// lands with the X-1 check-seam consumer (Git M3). The marker-keyed scanner ships the gate NOW so
+/// the Git-synchronously-calls-CI bug fingerprint is un-mergeable before that write path exists.
 pub const NO_CROSS_SYNC_CYCLE: LintId = LintId("no-cross-sync-cycle");
 
+/// A synchronous OUTBOUND cross-service/cross-subsystem call fingerprint. Shared by BOTH legs of
+/// `no-cross-sync-cycle`: the Identity-sink leg (forbidden inside `@identity-sink`) and the EB-08
+/// write-path leg (forbidden inside `@write-path`). The reactive/bus path (`.emit(`, an
+/// `EventHandler`, a projection read) is NOT a sync call and is always admitted.
+const SYNC_OUTBOUND_SITES: &[&str] = &[
+    ".call_sync(",
+    ".sync_call(",
+    "SyncServiceClient",
+    ".rpc_call(",
+    "reqwest::Client",
+    ".send_request(",
+];
+
 fn scan_no_cross_sync_cycle(src: &str) -> Vec<Violation> {
-    // A synchronous OUTBOUND cross-service call fingerprint. From Identity these are forbidden
-    // (Identity is the sink). The reactive/bus path (`.emit(`, an EventHandler) is NOT a sync
-    // call and is always allowed.
-    const SYNC_OUTBOUND_SITES: &[&str] = &[
-        ".call_sync(",
-        ".sync_call(",
-        "SyncServiceClient",
-        ".rpc_call(",
-        "reqwest::Client",
-        ".send_request(",
-    ];
     let mut out = Vec::new();
-    // This lint only fires INSIDE the identity crate (the sink). The workspace scan passes the
-    // file's crate via a marker the scanner detects: an identity source file carries the module
-    // path `myelin-identity` in its own header doc OR is scanned with the identity guard. Because
-    // the scanner is a pure fn of source text, we key off an in-source sink marker the identity
-    // crate's modules carry: a `//! IDENTITY-SINK` doc-line, OR the canonical crate self-reference
-    // `crate` within a file that also names itself identity. To stay hermetic and avoid coupling,
-    // the fixture marks the sink explicitly with `// @identity-sink`.
+    // ---- Leg 1: the Identity-sink half (P-S11 → P-018). ----------------------------------------
+    // Fires INSIDE the identity crate (the sink). Because the scanner is a pure fn of source text,
+    // we key off an in-source sink marker the identity crate's modules carry: a `//! IDENTITY-SINK`
+    // doc-line, OR the explicit `// @identity-sink` fixture marker. From Identity, ANY sync outbound
+    // cross-service call is forbidden (Identity calls no one synchronously).
     let is_identity_sink = src.contains("@identity-sink") || src.contains("IDENTITY-SINK");
-    if !is_identity_sink {
-        return out;
-    }
-    for (line, code) in code_lines(src) {
-        for site in SYNC_OUTBOUND_SITES {
-            if code.contains(site) {
-                out.push(Violation {
-                    lint: NO_CROSS_SYNC_CYCLE,
-                    line,
-                    reason: format!(
-                        "a synchronous outbound cross-service call `{site}` originates from \
-                         Identity — Identity is the SINK of the sync call graph (everyone may \
-                         call Identity synchronously; Identity calls no one synchronously). React \
-                         over the bus instead so the sync call graph stays acyclic (EI-02 §3)."
-                    ),
-                });
+    if is_identity_sink {
+        for (line, code) in code_lines(src) {
+            for site in SYNC_OUTBOUND_SITES {
+                if code.contains(site) {
+                    out.push(Violation {
+                        lint: NO_CROSS_SYNC_CYCLE,
+                        line,
+                        reason: format!(
+                            "a synchronous outbound cross-service call `{site}` originates from \
+                             Identity — Identity is the SINK of the sync call graph (everyone may \
+                             call Identity synchronously; Identity calls no one synchronously). \
+                             React over the bus instead so the sync call graph stays acyclic \
+                             (EI-02 §3)."
+                        ),
+                    });
+                }
             }
+        }
+    }
+    // ---- Leg 2: the EB-08 write-path half (the Bus's OWNED slice, P-044). ----------------------
+    out.extend(scan_cross_sync_in_write_path(src));
+    out
+}
+
+/// The EB-08 write-path leg of `no-cross-sync-cycle` (P-044, the Bus's owned slice). Inside a
+/// write-path site (a file/line marked `// @write-path`), a SYNCHRONOUS cross-subsystem call asking
+/// another subsystem for its state — the "is it green?" sync call — is rejected. The bus is
+/// cell-local; heavy cross-system work is async OFF the bus, never synchronous in the write path
+/// (refined-arch event-bus §7.1, ADR-11.5); CI emits, Git reads its own projection — Git never
+/// synchronously calls CI (00-reconciliation §X-1). This is a DISTINCT fingerprint from the
+/// Identity-sink leg: the originator is any subsystem, scoped by the `@write-path` marker so the
+/// whole current workspace (no producer write path yet) is admitted until those paths land.
+fn scan_cross_sync_in_write_path(src: &str) -> Vec<Violation> {
+    const WRITE_MARKER: &str = "@write-path";
+    if !src.contains(WRITE_MARKER) {
+        return Vec::new();
+    }
+    // A module-doc (`//!`) or top-of-file marker arms the whole file; otherwise each offending
+    // statement needs the marker in its attached comment block (per-line arming), so the leg never
+    // fires on an unmarked statement.
+    let raw_lines: Vec<&str> = src.lines().collect();
+    let file_armed = raw_lines.iter().any(|l| {
+        let t = l.trim_start();
+        t.starts_with("//!") && t.contains(WRITE_MARKER)
+    });
+    let mut out = Vec::new();
+    for (line, code) in code_statements(src) {
+        let Some(site) = SYNC_OUTBOUND_SITES.iter().find(|s| code.contains(**s)) else {
+            continue;
+        };
+        // Per-line arming: the marker on the statement's start line, or in the attached comment
+        // block directly above it (stops at the first non-comment, non-blank line so a marker on an
+        // unrelated earlier statement does not leak its arming downward).
+        let idx = line.saturating_sub(1);
+        let site_armed = file_armed
+            || raw_lines.get(idx).is_some_and(|l| l.contains(WRITE_MARKER))
+            || {
+                let mut armed = false;
+                let mut i = idx;
+                for _ in 0..6 {
+                    let Some(j) = i.checked_sub(1) else { break };
+                    i = j;
+                    let Some(raw) = raw_lines.get(i) else { break };
+                    let t = raw.trim();
+                    if t.contains(WRITE_MARKER) {
+                        armed = true;
+                        break;
+                    }
+                    if !t.is_empty() && !t.starts_with("//") {
+                        break;
+                    }
+                }
+                armed
+            };
+        if site_armed {
+            out.push(Violation {
+                lint: NO_CROSS_SYNC_CYCLE,
+                line,
+                reason: format!(
+                    "a synchronous cross-subsystem call `{site}` in a WRITE PATH asks another \
+                     subsystem for its state (the \"is it green?\" sync call) — the bus is \
+                     cell-local; heavy cross-system work is async OFF the bus, never synchronous in \
+                     the write path (refined-arch event-bus §7.1, ADR-11.5). CI emits, Git reads \
+                     its OWN projection; Git never synchronously calls CI (00-reconciliation §X-1). \
+                     React over the bus / read a projection so the cross-subsystem dependency stays \
+                     acyclic (EI-02 §3)."
+                ),
+            });
         }
     }
     out

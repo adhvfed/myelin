@@ -45,6 +45,28 @@ fn ci_gate_passes_on_the_no_raw_publish_green_fixture() {
 }
 
 #[test]
+fn ci_gate_fails_loudly_on_the_eb08_write_path_red_fixture() {
+    // EB-08 → P-044 (the Bus's owned slice of no-cross-sync-cycle, the write-path leg): the red
+    // fixture (a sync cross-subsystem `call_sync` RPC in an `@write-path` merge gate — the "is it
+    // green?" call) MUST make the gate exit NON-ZERO. The exit code IS the gate, so it cannot be
+    // `|| true`-swallowed (EI-01 §5). This is the dated green proof that the EB-08 leg is wired into
+    // CI loud-never-swallowed.
+    let red = fixtures_dir().join("no_cross_sync_cycle.eb08.red.rs.txt");
+    let code = run_gate_over(&red);
+    assert_ne!(code, 0, "lint-gate MUST exit non-zero on the EB-08 write-path red fixture");
+}
+
+#[test]
+fn ci_gate_passes_on_the_eb08_write_path_green_fixture() {
+    // The EB-08 green fixture (the merge gate reads its OWN cell-local projection, no sync RPC): the
+    // gate MUST exit zero — proving the lint does not over-reject (both fixtures are the EB-08 pass
+    // condition).
+    let green = fixtures_dir().join("no_cross_sync_cycle.eb08.green.rs.txt");
+    let code = run_gate_over(&green);
+    assert_eq!(code, 0, "lint-gate MUST exit zero on the EB-08 write-path green fixture");
+}
+
+#[test]
 fn ci_gate_is_clean_over_the_real_workspace() {
     // Belt-and-braces: the gate run with no args (the workspace `crates/*/src` tree, exclusions
     // honoured) exits zero — the live CI job is green on real code, not just fixtures.
