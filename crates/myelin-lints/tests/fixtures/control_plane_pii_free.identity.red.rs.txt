@@ -1,0 +1,17 @@
+// @control-plane
+// RED fixture for `control-plane-pii-free` — the IDENTITY-relevant slice (P-ID-03 / P-024).
+// The lint MUST reject this. An `iam.*` event projection (P-ID-02) that crosses the control plane
+// (routing / the immutable cross-cell log) leaks `email`/`display_name` into the event — but an
+// `iam.*` event must attribute its actor/subject by OPAQUE principal_id ONLY, never the erasable
+// profile (EI-04 §1, the erasure-vs-immutability split; ADR-11/OQ-I). PII is born inside the cell,
+// never on an event/routing frame. The fields ARE #[personal_data]-tagged (so
+// `no-untagged-personal-data` is satisfied — this fixture isolates the control-plane rule):
+// tagging does NOT make PII admissible on an iam.* event. This is the bug P-ID-02 makes
+// structurally impossible and this lint guards.
+pub struct IamEventProjection {
+    pub type_: &'static str,
+    #[personal_data(contact)]
+    pub email: String,
+    #[personal_data(identity)]
+    pub display_name: String,
+}

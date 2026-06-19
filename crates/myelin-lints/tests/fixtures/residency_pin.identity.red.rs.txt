@@ -1,0 +1,9 @@
+// RED fixture for `residency-pin` — the IDENTITY-relevant slice (P-ID-03 / P-024).
+// The lint MUST reject this. The Identity S1 principal store is opened as a GLOBAL (region-less)
+// pool — there is no `Region` pinned on the construction statement and no named-floor waiver, so
+// an authz read can cross the residency boundary: the cross-region Id read path bug class
+// (ADR-11; refined-arch §1 — Identity is residency-pinned, no global pool). Reading a principal
+// or a tuple from a region-less pool serves data that may live in another region.
+pub async fn open_principal_store(config: OltpConfig) -> ColocatedOltp {
+    ColocatedOltp::open(config).unwrap()
+}

@@ -1,0 +1,13 @@
+// RED fixture for `no-untagged-personal-data` — the IDENTITY-relevant slice (P-ID-03 / P-024).
+// The lint MUST reject this. The S1 principal store carries profile PII (`email`, `display_name`)
+// and S2 carries real-identity columns (`full_name`) — none are #[personal_data(...)]-tagged, so
+// they escape the per-subject crypto-shred erase (ID-D8) and the RoPA/data-map fan-out: the
+// un-erasable / un-mapped subject bug class (ADR-12). The opaque `principal_id` is correctly
+// untagged (it is not PII); only the real-identity columns must carry the tag.
+pub struct PrincipalRow {
+    pub principal_id: PrincipalId,
+    pub email: String,
+    pub display_name: String,
+    pub full_name: String,
+    pub region: Region,
+}
