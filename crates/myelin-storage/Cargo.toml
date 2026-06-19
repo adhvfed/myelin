@@ -85,6 +85,14 @@ integration = [
 # build path pulls myelin-harness into the storage crate's runtime DAG.
 [dev-dependencies]
 myelin-harness = { path = "../myelin-harness" }
+# myelin-lints is TEST-SUPPORT only: the P-ST-08 encryption GATE drill
+# (tests/encryption_gate_drill.rs) exercises the `no-untagged-personal-data` lint over an inline
+# red (untagged PII scratch field fires) + green (tagged) fixture — the GATE's "a deliberately-
+# untagged PII scratch field fires the lint, then remove it" step. The lint scanner is a pure
+# function over source text (no live backend). It is a dev-dep ONLY — nothing in the storage
+# crate's production DAG pulls myelin-lints (and myelin-lints does not depend on myelin-storage,
+# so there is no cycle).
+myelin-lints = { path = "../myelin-lints" }
 # serde_json is TEST-SUPPORT only: the co-location unit/CDC/drill tests construct an
 # EventDraft (whose `payload` is a `serde_json::Value`) to exercise the same-tx co-commit.
 # It never enters the storage crate's production DAG.
