@@ -67,6 +67,58 @@ impl PgRelay {
         Ok(())
     }
 
+    /// **Same-tx co-commit (BUS-D4 emit-iff-committed):** insert a domain STATE row into
+    /// `state_table` AND the outbox row in ONE transaction — both commit, or both roll back. This
+    /// is the structural emit-iff-committed property the silent-data-loss floor rests on: a
+    /// relay can only ever publish an event whose state change durably committed (no ghost
+    /// without its committed state change), and a committed state change always has its outbox row
+    /// (no lost emit). `state_table` is expected to carry `(id text primary key, event_id text)`.
+    /// Used by the stage-3 OUTBOX-NO-LOSS-UNDER-CRASH drill to write N events co-committed with a
+    /// state change before crashing the relay.
+    pub async fn enqueue_with_state(
+        &self,
+        state_table: &str,
+        state_id: &str,
+        aggregate: &str,
+        seq: i64,
+        envelope: &EventEnvelope,
+    ) -> Result<(), PgError> {
+        let payload = serde_json::to_value(envelope)
+            .map_err(|e| PgError::Query(format!("serialize envelope: {e}")))?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| PgError::Query(e.to_string()))?;
+        // The domain state change. The table name is a trusted, drill-internal identifier (never
+        // user input) — it is interpolated because Postgres does not bind identifiers; the VALUES
+        // are bound parameters.
+        sqlx::query(&format!(
+            "INSERT INTO {state_table} (id, event_id) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING"
+        ))
+        .bind(state_id)
+        .bind(&envelope.event_id.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| PgError::Query(e.to_string()))?;
+        // The outbox row, in the SAME transaction. If the commit below fails, neither the state
+        // row nor the outbox row exists — emit-iff-committed by construction.
+        sqlx::query(
+            "INSERT INTO outbox (event_id, aggregate, seq, subject, envelope) \
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (event_id) DO NOTHING",
+        )
+        .bind(&envelope.event_id.0)
+        .bind(aggregate)
+        .bind(seq)
+        .bind(&envelope.subject.0)
+        .bind(payload)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| PgError::Query(e.to_string()))?;
+        tx.commit().await.map_err(|e| PgError::Query(e.to_string()))?;
+        Ok(())
+    }
+
     /// One relay drain pass against REAL Postgres: in ONE transaction, claim up to `batch`
     /// unsent rows with `SELECT … FOR UPDATE SKIP LOCKED` (so a second relay worker SKIPs a
     /// claimed row — no double-claim across replicas), publish each to `bus` (carrying the
@@ -119,6 +171,75 @@ impl PgRelay {
         }
 
         tx.commit().await.map_err(|e| PgError::Query(e.to_string()))?;
+        Ok(published)
+    }
+
+    /// **Crash-injection drain (stage-3 OUTBOX-NO-LOSS-UNDER-CRASH drill).** Claims the unsent
+    /// rows and PUBLISHES each to `bus` — exactly as [`relay_once`](Self::relay_once) — but
+    /// SIMULATES A CRASH after publishing `crash_after` rows: the per-row `published_at` UPDATEs
+    /// are NEVER committed (the transaction is dropped/rolled back). This reproduces the worst-case
+    /// silent-data-loss window: the relay forwarded the event to the broker but died before
+    /// recording that it did. On restart, [`relay_once`](Self::relay_once) re-claims those rows
+    /// (they are still `published_at IS NULL`) and re-publishes them — the broker's
+    /// `Nats-Msg-Id = event_id` dedup suppresses the re-delivery (0 ghost), and because no
+    /// committed row was ever dropped (0 lost), every committed event is delivered exactly once.
+    ///
+    /// Returns how many rows were published to the broker before the simulated crash (these are
+    /// the rows that will be re-published-and-deduplicated by the post-restart relay).
+    pub async fn relay_once_crash_after<B: BusTransport>(
+        &self,
+        bus: &B,
+        batch: i64,
+        crash_after: usize,
+    ) -> Result<usize, PgError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| PgError::Query(e.to_string()))?;
+
+        let rows = sqlx::query(
+            "SELECT event_id, subject, envelope FROM outbox \
+             WHERE published_at IS NULL \
+             ORDER BY aggregate, seq \
+             FOR UPDATE SKIP LOCKED LIMIT $1",
+        )
+        .bind(batch)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| PgError::Query(e.to_string()))?;
+
+        let mut published = 0usize;
+        for row in &rows {
+            let event_id: String = row.get("event_id");
+            let payload: serde_json::Value = row.get("envelope");
+            let envelope: EventEnvelope = serde_json::from_value(payload)
+                .map_err(|e| PgError::Query(format!("deserialize envelope: {e}")))?;
+
+            match bus.put(&envelope.subject, &envelope, &envelope.event_id) {
+                Ok(Delivery::Accepted) | Ok(Delivery::Deduplicated) => {}
+                Err(e) => return Err(PgError::Publish(e.0)),
+            }
+            published += 1;
+
+            // CRASH SIMULATION: drop the transaction WITHOUT committing the published_at UPDATEs.
+            // The rows we published stay `published_at IS NULL`, so the restarted relay re-claims
+            // and re-publishes them — exactly the crash-mid-drain window the drill exercises.
+            if published >= crash_after {
+                drop(tx); // rolls back: no published_at is recorded for ANY row this pass.
+                return Ok(published);
+            }
+
+            sqlx::query("UPDATE outbox SET published_at = now() WHERE event_id = $1")
+                .bind(&event_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| PgError::Query(e.to_string()))?;
+        }
+
+        // crash_after was never reached (fewer rows than crash_after) — roll back anyway so the
+        // whole pass is a "crash" (no marks committed).
+        drop(tx);
         Ok(published)
     }
 
