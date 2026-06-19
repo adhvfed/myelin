@@ -1,0 +1,4 @@
+// A CDC-pair fixture file carrying BOTH sides of the seam.
+// The PROVIDER side records the fact; the CONSUMER side reads it.
+fn provider_side() {}
+fn consumer_side() {}

@@ -1,0 +1,653 @@
+# contract-coverage.toml — the coverage manifest the contract-coverage scanner (P-S21 → P-037)
+# reconciles against the frozen contract surface.
+#
+# SOURCE OF TRUTH FOR THE ROW SET: every `N.M` row of
+#   planning/05-refined-shared-systems-architecture/contract-index.md  (§1–§13).
+# The scanner parses that file directly for the authoritative row set, then checks THIS file:
+#   - every contract-index row MUST have exactly one [[contract]] entry here (a missing one is a
+#     silently-dropped contract — a build failure);
+#   - status = "covered"  ⇒ `cdc` lists the test file(s) carrying the provider+consumer CDC pair;
+#                            each named file MUST exist on disk and carry BOTH a provider-side and a
+#                            consumer-side marker (a falsely-claimed pair is a build failure);
+#   - status = "deferred" ⇒ `landing` names the prompt that will ship the CDC pair (an un-named
+#                            floor is a build failure — EI-01 §1, name-your-floors).
+#
+# DOCTRINE: external-insights/01-process-and-quality-doctrine.md §5 — convert the "every contract
+# has a CDC pair" discipline into a committed, LOUD, mechanical gate. A contract violation dropped
+# silently is a multi-day misdiagnosis. NEVER weaken this gate to pass; ship the pair instead.
+#
+# WHEN A LATER PROMPT SHIPS A CONTRACT: flip its row here from `deferred` to `covered` and name its
+# CDC file(s). The scanner is the meta-gate that prompt's DEFINITION OF DONE leans on.
+#
+# `landing` ids below are the GLOBAL ledger ids (P-NNN) from
+#   planning/07-prompts/README.md  (the run table). The scanner does not verify the landing id is a
+# real prompt (that is the ledger's job); it requires only that one is NAMED.
+
+# ───────────────────────── §1 Bootstrap & service shell (substrate 00) ─────────────────────────
+
+[[contract]]
+row = "1.1"
+title = "serve(AppSpec) lifecycle"
+status = "covered"
+cdc = ["crates/myelin-substrate/tests/cdc_1_1_serve.rs"]
+
+[[contract]]
+row = "1.2"
+title = "three-surface topology + tenant-from-token"
+status = "covered"
+cdc = ["crates/myelin-substrate/tests/cdc_1_2_topology.rs"]
+
+[[contract]]
+row = "1.3"
+title = "liveness != readiness"
+status = "covered"
+cdc = ["crates/myelin-substrate/tests/cdc_1_3_liveness_readiness.rs"]
+
+[[contract]]
+row = "1.4"
+title = "PersonalDataHolder auto-registration"
+status = "covered"
+cdc = ["crates/myelin-substrate/tests/cdc_1_4_1_5_holders_and_migrations.rs"]
+
+[[contract]]
+row = "1.5"
+title = "forward-only online migrations"
+status = "covered"
+cdc = ["crates/myelin-substrate/tests/cdc_1_4_1_5_holders_and_migrations.rs"]
+
+# 1.6 (architecture lints) is the committed-lint RATCHET itself — a gate, not a producer⇄consumer
+# data seam, so it has no CDC pair (the lint crate's fixture matrix + workspace scan ARE its proof).
+# It is recorded here so the row is not silently dropped; its landing is the M0 exit gate that
+# greens all twelve lints (P-039).
+[[contract]]
+row = "1.6"
+title = "the twelve architecture lints (the ratchet)"
+status = "deferred"
+landing = "P-039"
+
+[[contract]]
+row = "1.7"
+title = "cross-language harness shim (frozen)"
+status = "deferred"
+landing = "P-128"
+
+# 1.8 (telemetry signal set) — the survival-signal contract every drill reads; greened transitively
+# by every drill's signal assertions. Its dedicated CDC pair lands with the harness self-test prompt.
+[[contract]]
+row = "1.8"
+title = "telemetry signal set (contract 1.8)"
+status = "deferred"
+landing = "P-039"
+
+[[contract]]
+row = "1.9"
+title = "ResilientClient::call (timeout/breaker/bulkhead/retry)"
+status = "deferred"
+landing = "P-033"
+
+[[contract]]
+row = "1.10"
+title = "FailStatic<T> bounded-staleness cache"
+status = "deferred"
+landing = "P-040"
+
+[[contract]]
+row = "1.11"
+title = "protected-human-lane shed order"
+status = "covered"
+cdc = [
+  "crates/myelin-substrate/tests/cdc_1_11_shed_order.rs",
+  "crates/myelin-substrate/tests/cdc_1_11_agent_load.rs",
+]
+
+# ──────────────── §2 Event envelope, outbox & consumer template (Bus myelin-events) ─────────────
+
+[[contract]]
+row = "2.1"
+title = "EventEnvelope (the names/units anchor)"
+status = "deferred"
+landing = "P-011"
+
+[[contract]]
+row = "2.2"
+title = "OutboxTx::emit(draft, cause) — the only emit path"
+status = "covered"
+cdc = ["crates/myelin-storage/tests/cdc_st_02_coloc.rs"]
+
+[[contract]]
+row = "2.3"
+title = "outbox table + FOR UPDATE SKIP LOCKED relay"
+status = "covered"
+cdc = ["crates/myelin-storage/tests/cdc_st_02_coloc.rs"]
+
+[[contract]]
+row = "2.4"
+title = "EventHandler consumer template"
+status = "deferred"
+landing = "P-043"
+
+[[contract]]
+row = "2.5"
+title = "consumer_dedup ledger"
+status = "covered"
+cdc = ["crates/myelin-events/tests/cdc_2_5_consumer_dedup.rs"]
+
+[[contract]]
+row = "2.6"
+title = "reindex-from-source"
+status = "deferred"
+landing = "P-142"
+
+[[contract]]
+row = "2.7"
+title = "crypto-shred / tombstone on the log"
+status = "deferred"
+landing = "P-092"
+
+[[contract]]
+row = "2.8"
+title = "schema evolution / upcasters"
+status = "covered"
+cdc = ["crates/myelin-events/tests/cdc_2_8_upcaster.rs"]
+
+[[contract]]
+row = "2.9"
+title = "event taxonomy + token table"
+status = "deferred"
+landing = "P-042"
+
+# ──────────────── §3 Signals, Automations, Triggers & the firehose (Bus) ────────────────────────
+
+[[contract]]
+row = "3.1"
+title = "define_signal_rule"
+status = "deferred"
+landing = "P-138"
+
+[[contract]]
+row = "3.2"
+title = "register_automation"
+status = "deferred"
+landing = "P-139"
+
+[[contract]]
+row = "3.3"
+title = "arm_trigger / disarm_trigger"
+status = "deferred"
+landing = "P-140"
+
+[[contract]]
+row = "3.4"
+title = "EventMatcher = the frozen QueryAst"
+status = "deferred"
+landing = "P-137"
+
+[[contract]]
+row = "3.5"
+title = "firehose transport + resume-cursor protocol"
+status = "deferred"
+landing = "P-141"
+
+[[contract]]
+row = "3.6"
+title = "reactive/dispatch tier"
+status = "deferred"
+landing = "P-143"
+
+# ──────────────── §4 Identity & access (myelin-identity) ────────────────────────────────────────
+
+[[contract]]
+row = "4.1"
+title = "authenticate -> Principal"
+status = "deferred"
+landing = "P-065"
+
+[[contract]]
+row = "4.2"
+title = "check (per-action gate, fail-closed)"
+status = "deferred"
+landing = "P-067"
+
+[[contract]]
+row = "4.3"
+title = "list_objects (SetExpr push-down)"
+status = "deferred"
+landing = "P-070"
+
+[[contract]]
+row = "4.4"
+title = "list_subjects + explain"
+status = "deferred"
+landing = "P-071"
+
+[[contract]]
+row = "4.5"
+title = "delegation -> EffectivePolicy"
+status = "deferred"
+landing = "P-075"
+
+[[contract]]
+row = "4.6"
+title = "write_tuples -> zookie"
+status = "deferred"
+landing = "P-057"
+
+[[contract]]
+row = "4.7"
+title = "mint_run_token + revoke"
+status = "deferred"
+landing = "P-076"
+
+[[contract]]
+row = "4.8"
+title = "resolve_pseudonym + erase (pseudonym map)"
+status = "deferred"
+landing = "P-078"
+
+[[contract]]
+row = "4.9"
+title = "per-subsystem ReBAC namespace fragment"
+status = "deferred"
+landing = "P-068"
+
+[[contract]]
+row = "4.10"
+title = "Consistency / zookie semantics"
+status = "deferred"
+landing = "P-073"
+
+[[contract]]
+row = "4.11"
+title = "FailStatic bound (Id usage)"
+status = "deferred"
+landing = "P-073"
+
+# ──────────────── §5 ArtifactRef, refs & projection (myelin-refs) + Git<->CI check seam ─────────
+
+[[contract]]
+row = "5.1"
+title = "ArtifactRef"
+status = "deferred"
+landing = "P-052"
+
+[[contract]]
+row = "5.2"
+title = "resolve(ref, viewer, mode)"
+status = "deferred"
+landing = "P-159"
+
+[[contract]]
+row = "5.3"
+title = "backlinks / edges / traverse"
+status = "deferred"
+landing = "P-162"
+
+[[contract]]
+row = "5.4"
+title = "refs.edge.created / refs.edge.removed"
+status = "deferred"
+landing = "P-157"
+
+[[contract]]
+row = "5.5"
+title = "TE-7 typed-edge mirror"
+status = "deferred"
+landing = "P-163"
+
+[[contract]]
+row = "5.6"
+title = "project(ref, viewer)"
+status = "deferred"
+landing = "P-159"
+
+[[contract]]
+row = "5.7"
+title = "unified #sub sub-artifact scheme (frozen)"
+status = "deferred"
+landing = "P-164"
+
+[[contract]]
+row = "5.8"
+title = "reindex(scope) (Refs)"
+status = "deferred"
+landing = "P-165"
+
+[[contract]]
+row = "5.9"
+title = "Git<->CI CheckStatus seam"
+status = "deferred"
+landing = "P-232"
+
+# ──────────────── §6 Search (myelin-search) ─────────────────────────────────────────────────────
+
+[[contract]]
+row = "6.1"
+title = "query(ast, viewer, zookie?, page) -> RankedResults"
+status = "deferred"
+landing = "P-171"
+
+[[contract]]
+row = "6.2"
+title = "semantic(text|vec, viewer, k, filter_ast?)"
+status = "deferred"
+landing = "P-174"
+
+[[contract]]
+row = "6.3"
+title = "declare_indexable(IndexSpec)"
+status = "deferred"
+landing = "P-167"
+
+[[contract]]
+row = "6.4"
+title = "reindex(scope) -> job (Search)"
+status = "deferred"
+landing = "P-179"
+
+[[contract]]
+row = "6.5"
+title = "code-search input"
+status = "deferred"
+landing = "P-231"
+
+# ──────────────── §7 Notifications (myelin-notif) ───────────────────────────────────────────────
+
+[[contract]]
+row = "7.1"
+title = "list_inbox"
+status = "deferred"
+landing = "P-183"
+
+[[contract]]
+row = "7.2"
+title = "mark / snooze / mark_all_read"
+status = "deferred"
+landing = "P-184"
+
+[[contract]]
+row = "7.3"
+title = "humanise"
+status = "deferred"
+landing = "P-187"
+
+[[contract]]
+row = "7.4"
+title = "get_prefs / set_prefs"
+status = "deferred"
+landing = "P-188"
+
+[[contract]]
+row = "7.5"
+title = "oncall_now / page (escalation)"
+status = "deferred"
+landing = "P-192"
+
+[[contract]]
+row = "7.6"
+title = "define_notif_rule"
+status = "deferred"
+landing = "P-186"
+
+[[contract]]
+row = "7.7"
+title = "PersonalDataHolder (Notif history) + replay"
+status = "deferred"
+landing = "P-195"
+
+[[contract]]
+row = "7.8"
+title = "DeliveryAdapter"
+status = "deferred"
+landing = "P-194"
+
+# ──────────────── §8 Agent fabric (myelin-agent) ────────────────────────────────────────────────
+
+[[contract]]
+row = "8.1"
+title = "ToolSurface::register_tool(ToolDef)"
+status = "deferred"
+landing = "P-218"
+
+[[contract]]
+row = "8.2"
+title = "EffectApi::apply (plan-then-apply)"
+status = "deferred"
+landing = "P-218"
+
+[[contract]]
+row = "8.3"
+title = "AgentRuntime::step"
+status = "deferred"
+landing = "P-217"
+
+[[contract]]
+row = "8.4"
+title = "ToolHands::exec (unified sandbox)"
+status = "deferred"
+landing = "P-226"
+
+[[contract]]
+row = "8.5"
+title = "Agent::handle"
+status = "deferred"
+landing = "P-216"
+
+[[contract]]
+row = "8.6"
+title = "EventInbox::deliver"
+status = "deferred"
+landing = "P-216"
+
+[[contract]]
+row = "8.7"
+title = "run --dry-run -> Vec<ProposedEffect>"
+status = "deferred"
+landing = "P-220"
+
+[[contract]]
+row = "8.8"
+title = "AG-7 agent trace"
+status = "deferred"
+landing = "P-153"
+
+# ──────────────── §9 Durable workflow (myelin-flow) ─────────────────────────────────────────────
+
+[[contract]]
+row = "9.1"
+title = "DurableExecutor{start, signal, describe, cancel}"
+status = "deferred"
+landing = "P-203"
+
+[[contract]]
+row = "9.2"
+title = "WfCtx core"
+status = "deferred"
+landing = "P-199"
+
+[[contract]]
+row = "9.3"
+title = "durable timer wheel"
+status = "deferred"
+landing = "P-207"
+
+[[contract]]
+row = "9.4"
+title = "durable signal (multi-day HITL)"
+status = "deferred"
+landing = "P-205"
+
+[[contract]]
+row = "9.5"
+title = "workflow<->agent mapping"
+status = "deferred"
+landing = "P-213"
+
+[[contract]]
+row = "9.6"
+title = "PersonalDataHolder (workflow history) + replay"
+status = "deferred"
+landing = "P-201"
+
+# ──────────────── §10 GDPR / Audit / PersonalDataHolder (myelin-gdpr) ───────────────────────────
+
+[[contract]]
+row = "10.1"
+title = "PersonalDataHolder{locate, export, rectify, restrict, erase}"
+status = "deferred"
+landing = "P-105"
+
+[[contract]]
+row = "10.2"
+title = "#[personal_data(...)] classify-derive"
+status = "deferred"
+landing = "P-107"
+
+[[contract]]
+row = "10.3"
+title = "data_map() / ropa(tenant)"
+status = "deferred"
+landing = "P-109"
+
+[[contract]]
+row = "10.4"
+title = "dsr_submit / dsr_status / dsr_certificate"
+status = "deferred"
+landing = "P-111"
+
+[[contract]]
+row = "10.5"
+title = "retention / consent / sub-processor / legal-hold"
+status = "deferred"
+landing = "P-150"
+
+[[contract]]
+row = "10.6"
+title = "tamper-evident audit log"
+status = "deferred"
+landing = "P-119"
+
+[[contract]]
+row = "10.7"
+title = "eDiscovery / legal-hold export"
+status = "deferred"
+landing = "P-153"
+
+[[contract]]
+row = "10.8"
+title = "erasure ledger"
+status = "deferred"
+landing = "P-115"
+
+[[contract]]
+row = "10.9"
+title = "the ONE free-text / immutable-content erasure posture"
+status = "deferred"
+landing = "P-116"
+
+# ──────────────── §11 Storage — tiers / BlobStore / KMS / reserve-settle / backup-restore ───────
+
+[[contract]]
+row = "11.1"
+title = "OLTP tier client"
+status = "covered"
+cdc = ["crates/myelin-storage/tests/cdc_11_1.rs"]
+
+[[contract]]
+row = "11.2"
+title = "BlobStore{put, get, head, delete}"
+status = "deferred"
+landing = "P-047"
+
+[[contract]]
+row = "11.3"
+title = "KMS hierarchy + KeyOrigin trait"
+status = "deferred"
+landing = "P-094"
+
+[[contract]]
+row = "11.4"
+title = "crypto-shred + GD-4 granularity"
+status = "deferred"
+landing = "P-099"
+
+[[contract]]
+row = "11.5"
+title = "backup / restore / cross-seam"
+status = "deferred"
+landing = "P-061"
+
+[[contract]]
+row = "11.6"
+title = "OLAP read store"
+status = "deferred"
+landing = "P-145"
+
+[[contract]]
+row = "11.7"
+title = "reserve/settle cost gate"
+status = "deferred"
+landing = "P-103"
+
+[[contract]]
+row = "11.8"
+title = "T3 log tier (CI)"
+status = "deferred"
+landing = "P-147"
+
+# ──────────────── §12 Tenancy & control plane (myelin-tenancy) ──────────────────────────────────
+
+[[contract]]
+row = "12.1"
+title = "TenantId / Region / ResidencyTag"
+status = "deferred"
+landing = "P-025"
+
+[[contract]]
+row = "12.2"
+title = "discover(slug|tenant_id)"
+status = "deferred"
+landing = "P-081"
+
+[[contract]]
+row = "12.3"
+title = "place / placement_of"
+status = "deferred"
+landing = "P-084"
+
+[[contract]]
+row = "12.4"
+title = "residency_verify -> SignedAttestation"
+status = "deferred"
+landing = "P-085"
+
+[[contract]]
+row = "12.5"
+title = "isolation-tier contract"
+status = "deferred"
+landing = "P-086"
+
+[[contract]]
+row = "12.6"
+title = "cross-cell PII-free pointer bridge"
+status = "deferred"
+landing = "P-091"
+
+# ──────────────── §13 The shared crates' refined shapes (myelin-content, myelin-query) ──────────
+
+[[contract]]
+row = "13.1"
+title = "myelin-content taxonomy (frozen)"
+status = "deferred"
+landing = "P-234"
+
+[[contract]]
+row = "13.2"
+title = "ADF -> myelin-content lossy-map (frozen)"
+status = "deferred"
+landing = "P-235"
+
+[[contract]]
+row = "13.3"
+title = "myelin-query primitive (frozen byte-identical)"
+status = "deferred"
+landing = "P-235"
