@@ -602,12 +602,22 @@ status = "covered"
 # consistent point (PITR to the seq ≤ T cursor, referenced-ContentHash-presence verification with a
 # hard FAIL on a missing hash = the §7.3 silent-corruption case, reindex-from-source derived rebuild
 # = derived == source by construction, and KEK restore-except-crypto-shredded = §7.5). Its CDC pair
-# is the restore-verify gate's restore caller (cdc_11_5_restore.rs). The REMAINING half completes it:
-# the CI-wired restore-verify GATE (STOR-D1, the permanent gate) is P-ST-13 (global P-061) — it adds
-# its CI-gate caller CDC pair to this same row.
+# is the restore-verify gate's restore caller (cdc_11_5_restore.rs).
+# P-061 (P-ST-13): THE HEADLINE — the CI-wired restore-verify GATE (STOR-D1, the permanent gate). The
+# RestoreVerifyGate spins a clean target, drives restore(to_offset T), and runs the §7.4 assertions:
+# no-loss/checksum-parity (every restored object's bytes re-hash to its BLAKE3 address — the leg the
+# bare presence check misses), cross-seam/one-consistent-point (derived == source-replay, checked
+# storage-native + cross-validated against the harness SUB-D6 assertion in the drill), and
+# erasure-held (a tenant crypto-shredded before the backup stays erased — §7.5). It emits a dated
+# green artifact with measured numbers on pass and a typed GateFailure on red; the verdict is
+# #[must_use] and run_or_fail_ci() turns a red into a process-failing Err (loud-never-swallowed, no
+# `|| true`). Its CDC pair is the CI durability-gate caller (cdc_11_5_restore_verify_gate.rs). This is
+# one of the TWO PERMANENT gates (master §4): it re-runs on every store-touching change, forever. The
+# post-restore re-erasure (STOR-D3) + the cell-kill RTO (STOR-D2) are P-ST-14 (global P-100).
 cdc = [
     "crates/myelin-storage/tests/cdc_11_5_backup.rs",
     "crates/myelin-storage/tests/cdc_11_5_restore.rs",
+    "crates/myelin-storage/tests/cdc_11_5_restore_verify_gate.rs",
 ]
 
 [[contract]]
