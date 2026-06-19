@@ -1,0 +1,39 @@
+[package]
+name = "myelin-identity-service"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The service binary the harness runs (the "every service `main.rs`" of contract 1.1). Named
+# `identity` (= SERVICE_NAME) so the deployable matches the service/trace identifier.
+[[bin]]
+name = "identity"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+# THE Identity SERVICE crate (P-ID-04 → P-054): the bootable service shell the harness wires
+# (boot → migrate → relay → consumers → three ports → graceful drain), NOT a hand-rolled main.
+#
+# DAG POSITION (a documented, NAMED extension of the §2.9 eleven-crate DAG, like myelin-harness
+# and myelin-lints): this is a SERVICE crate — the "every service `main.rs`" consumer the
+# contract-index row 1.1 names. It is the FIRST such service. It sits ABOVE myelin-substrate
+# (the root-last harness) as a leaf consumer: it depends on the harness (serve/AppSpec) and the
+# frozen identity contract surface, and NOTHING in the production DAG depends on it. It is
+# therefore OUTSIDE the eleven-crate library DAG modelled by `crate_graph.rs`
+# (substrate_is_root() — "no crate depends on substrate" — is preserved: a service main is not
+# part of that library graph, it is the graph's terminal consumer). See the crate-level note in
+# src/lib.rs.
+[dependencies]
+# The frozen Identity & Access contract surface (the eleven-method IdentityService ABI, the
+# Principal/Decision/Consistency types) — P-ID-04 wires the shell's check/list_objects SLOTS
+# against these signatures with fail-closed stubs until the bodies land (P-ID-09/P-ID-11).
+myelin-identity = { path = "../myelin-identity" }
+# The harness: serve(AppSpec) + the three-surface topology (public/internal/metrics-health) +
+# liveness≠readiness + graceful drain. The shell is an AppSpec this wires; it is NOT a service
+# that re-implements the lifecycle (architecture 00 §3.1, the one call).
+myelin-substrate = { path = "../myelin-substrate" }
+# TenantId / Region value types (for the Principal the internal-RPC authorizer threads).
+myelin-tenancy = { path = "../myelin-tenancy" }
