@@ -3,6 +3,17 @@ resolver = "2"
 members = [
     "crates/myelin-tenancy",
     "crates/myelin-identity",
+    # The Identity SERVICE crate (P-ID-04 → P-054): the bootable service SHELL the harness wires
+    # (boot → migrate → relay → consumers → three ports → graceful drain; liveness ≠ readiness;
+    # fail-closed check/list_objects slots until the M1 bodies land). This is the "every service
+    # `main.rs`" consumer the contract-index row 1.1 names — the FIRST such service. Like
+    # myelin-harness and myelin-lints it is a LEAF consumer ABOVE myelin-substrate (the root-last
+    # harness): it depends on the harness (serve/AppSpec) + the frozen identity contract surface,
+    # and NOTHING in the production crate DAG depends on it. It is therefore OUTSIDE the
+    # eleven-crate library DAG modelled by crate_graph.rs (substrate_is_root() — "no *library*
+    # crate depends on substrate" — is preserved; a service main is the harness's terminal
+    # consumer). See the crate-level note in crates/myelin-identity-service/src/lib.rs.
+    "crates/myelin-identity-service",
     "crates/myelin-events",
     "crates/myelin-refs",
     # The myelin-search SERVICE crate skeleton (SRCH-P01 → P-021). Search owns NO contract
