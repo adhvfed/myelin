@@ -17,7 +17,15 @@
 //! control plane [`DegenerateControlPlane`] runs the IDENTICAL `discover`/`place`/`placement_of`/
 //! `residency_verify` + four-layer code path over a one-row registry; the `residency-pin` lint holds
 //! and CP-D3 runs green on the degenerate cell; `residency_verify` is green on the install's own data;
-//! managed-fleet-only features are N/A by definition, not a gap; see [`self_host`]).
+//! managed-fleet-only features are N/A by definition, not a gap; see [`self_host`]), and
+//! **P-CP-14 / P-098** (**the CP-outage blast-radius win, CP-D4** — hard-down the control plane and
+//! already-placed tenants KEEP SERVING entirely within their cells (routing is served fail-static
+//! from the client-cached [`DiscoveryCache`], contract 1.10); ONLY signup/provisioning degrades.
+//! [`cp_outage::DataPlane::serve`] routes a placed tenant fail-static through a hard-down
+//! [`cp_outage::ControlPlane`]; [`cp_outage::SignupPlane::signup`] is the ONLY thing that degrades;
+//! [`cp_outage::CpOutageReport`] is the measured `serving-uptime` (100%) + degrade-scope
+//! ([`cp_outage::DegradeScope::SignupAndProvisioningOnly`]). No new floor — a property assertion over
+//! the already-built discovery cache; see [`cp_outage`]).
 //!
 //! **Owning architecture doc:**
 //! `planning/05-refined-shared-systems-architecture/tenancy-and-control-plane.md`
@@ -130,6 +138,7 @@
 //!   gating under `myelin-flow`'s `DurableExecutor`, 9.1, M2) is **P-CP-22**'s re-confirmation. The
 //!   `cell_provisioning` log records each gating step.
 
+pub mod cp_outage;
 pub mod discover;
 pub mod four_layer;
 pub mod holder;
@@ -142,6 +151,10 @@ pub mod residency_verify;
 pub mod schema;
 pub mod self_host;
 
+pub use cp_outage::{
+    cp_outage_bound, ControlPlane, CpOutageReport, DataPlane, DegradeScope, Served, ServeFailure,
+    SignupDegraded, SignupPlane,
+};
 pub use discover::{DiscoverKey, DiscoveryCache, DiscoverySignals, RouteTuple};
 pub use four_layer::{
     CrossRegionPathError, FourLayerEnforcement, ResidencyWriteBoundary, ResidencyWriteRejected,
