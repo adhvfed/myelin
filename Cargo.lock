@@ -1862,6 +1862,7 @@ name = "myelin-events"
 version = "0.0.0"
 dependencies = [
  "async-nats",
+ "futures",
  "myelin-config",
  "myelin-harness",
  "myelin-identity",

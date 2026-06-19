@@ -150,6 +150,9 @@ fred = { version = "10", default-features = false, features = ["i-std"] }
 
 # Durable bus: NATS JetStream via async-nats.
 async-nats = "0.38"
+# Stream combinators (StreamExt) for draining the NATS JetStream pull-consumer batch. A tiny,
+# default-feature `futures` — pulled ONLY behind the events `integration` feature (the NATS bus).
+futures = "0.3"
 
 # The env-config layer (the dev<->prod swap seam).
 myelin-config = { path = "crates/myelin-config" }

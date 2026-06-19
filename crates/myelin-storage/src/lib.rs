@@ -209,6 +209,28 @@ pub mod restore;
 pub mod restore_verify;
 pub mod rls;
 
+// ---- Stage 2 / infra: the REAL backends behind the existing traits (config-selected) ----
+// These modules are compiled ONLY under `--features integration` (they pull the real sqlx /
+// aws-sdk-s3 / fred clients). The default `cargo build --workspace` compiles NONE of them, so
+// it stays DB-free. Each implements an EXISTING trait — it does not fork one:
+//   - s3blob::S3BlobStore  implements blob::BlobStore  (object store, RustFS/Scaleway)
+//   - valkey::ValkeyCache  implements cache::Cache     (Valkey/Redis)
+//   - pg::PgStore          backs the OLTP + outbox/relay + ReBAC tuple store on real Postgres
+// The `backend` module is the config-selection seam (real-vs-in-memory from MyelinConfig).
+#[cfg(feature = "integration")]
+pub mod s3blob;
+#[cfg(feature = "integration")]
+pub mod valkey;
+#[cfg(feature = "integration")]
+pub mod pg;
+// The OLTP-co-located outbox relay (the one legitimate broker-publish site, BUS-2) — kept in its
+// own module so the broker-publish call is isolated to a single named relay file (the same
+// posture as myelin-events/src/relay.rs).
+#[cfg(feature = "integration")]
+pub mod pgrelay;
+#[cfg(feature = "integration")]
+pub mod backend;
+
 pub use backup::{
     BackupError, BackupSet, BaseBackup, ContinuousArchiver, EpochSecs, LogTierSeal, ObjectTierBackup,
     ObjectVersion, StoreTier, WalOffset, WalSegment,
