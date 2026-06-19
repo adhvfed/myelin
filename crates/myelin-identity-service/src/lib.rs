@@ -65,9 +65,11 @@
 
 pub mod authenticate;
 pub mod check_engine;
+pub mod list_objects;
 pub mod machine_auth;
 pub mod namespace;
 pub mod principal_store;
+pub mod reverse_index;
 pub mod tuple_store;
 
 pub use authenticate::{
@@ -75,6 +77,10 @@ pub use authenticate::{
     StructuralVerifier, VerifiedAssertion,
 };
 pub use check_engine::{eval_caveat, CheckEngine, MAX_REWRITE_DEPTH};
+pub use list_objects::{ListObjects, DEFAULT_IDS_CARDINALITY_CAP};
+pub use reverse_index::{
+    ReverseIndex, ReverseIndexConsumer, ReverseRow, S8_CONSUMER, S8_HOLDER, S8_TABLE,
+};
 pub use namespace::{
     core_hierarchy, AdmitReject, FragmentDef, NamespaceEngine, PermissionRule, Userset,
     MAX_RULE_DEPTH,
@@ -339,6 +345,14 @@ impl<S: IdentityService + Send + Sync> Authorizer for CheckAuthorizer<S> {
 #[derive(Clone)]
 pub struct StoreBackedCheck {
     engine: CheckEngine,
+    /// The S3 tuple store (kept so the `list_objects` slot can build a [`ListObjects`] over it +
+    /// the S8 index; `check` already reads it through [`CheckEngine`]).
+    tuples: TupleStore,
+    /// The S8 authz reverse index (P-ID-11) — the JOIN/candidate source `list_objects` materialises
+    /// the `Ids` path from + the `Filter` push-down targets. Fed off the bus by
+    /// [`reverse_index::ReverseIndexConsumer`]; shared so the live consumer and this `list_objects`
+    /// slot read the same projection.
+    index: ReverseIndex,
     /// The compiled ReBAC namespace engine (P-ID-10) — the org/team/project core hierarchy + any
     /// admitted subsystem fragments. `check` resolves a **compiled permission** (the four-operator
     /// rewrite) through it; a name that is not a compiled permission falls through to a raw
@@ -350,14 +364,32 @@ pub struct StoreBackedCheck {
 impl StoreBackedCheck {
     /// Wire the real `check` engine over the S3 [`TupleStore`], with the **core org/team/project
     /// hierarchy** pre-loaded into the namespace engine (the M3/M4 subsystem fragments are admitted
-    /// on top via [`StoreBackedCheck::admit_fragment`] / [`NamespaceEngine::admit`]).
+    /// on top via [`StoreBackedCheck::admit_fragment`] / [`NamespaceEngine::admit`]). A fresh S8
+    /// reverse index is created; for a live service the index fed off the bus is shared via
+    /// [`StoreBackedCheck::with_index`].
     pub fn new(tuples: TupleStore) -> StoreBackedCheck {
+        StoreBackedCheck::with_index(tuples, ReverseIndex::new())
+    }
+
+    /// Wire the real `check` + `list_objects` engine over the S3 [`TupleStore`] AND a shared S8
+    /// [`ReverseIndex`] (the one fed off the bus by [`reverse_index::ReverseIndexConsumer`]), so the
+    /// `list_objects` slot materialises the `Ids` path / targets the `Filter` push-down over the live
+    /// projection. The core hierarchy is pre-loaded; subsystem fragments admit on top.
+    pub fn with_index(tuples: TupleStore, index: ReverseIndex) -> StoreBackedCheck {
         StoreBackedCheck {
-            engine: CheckEngine::new(tuples),
+            engine: CheckEngine::new(tuples.clone()),
+            tuples,
+            index,
             namespace: std::sync::Arc::new(std::sync::Mutex::new(
                 NamespaceEngine::with_core_hierarchy(),
             )),
         }
+    }
+
+    /// The shared S8 reverse index this slot's `list_objects` reads (so a caller can wire the live
+    /// bus consumer over the SAME index).
+    pub fn index(&self) -> &ReverseIndex {
+        &self.index
     }
 
     /// Admit a **rich** [`FragmentDef`] (carrying the permission rewrite structure) into the cell
@@ -429,14 +461,24 @@ impl IdentityService for StoreBackedCheck {
         }
     }
 
+    /// 4.3 — the LIVE `list_objects` (P-ID-11): the return-shape dispatch + the S4 `Ids` materialise
+    /// path over S8, the `Filter` push-down above the cardinality cap. The scope is the subject's
+    /// verified `(tenant, region)` (tenant-from-token, never a path — ID-3), exactly as `check`'s is.
+    /// The full `Filter` SetExpr→SQL lowering + the watermark read-consistency path are P-ID-12.
     fn list_objects(
         &self,
-        _subject: &Principal,
-        _permission: &Permission,
-        _ty: &ObjectType,
-        _at: &Consistency,
+        subject: &Principal,
+        permission: &Permission,
+        ty: &ObjectType,
+        at: &Consistency,
     ) -> myelin_identity::Result<ListObjectsResult> {
-        Err(AuthzError::NotYetImplemented("list_objects → P-ID-11/12 (M1)"))
+        // tenant-from-token (ID-3): the scope is the SUBJECT's own verified (tenant, region).
+        let scope = myelin_storage::TenantScope::from_verified_token(subject, subject.region.clone());
+        // Build the list_objects evaluator over the shared S3 store + S8 index + the compiled
+        // namespace engine (one snapshot of the schema; admit holds the lock only to clone).
+        let namespace = self.namespace.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let lo = ListObjects::new(self.tuples.clone(), namespace, self.index.clone());
+        Ok(lo.list_objects(&scope, subject, permission, ty, at))
     }
 
     fn list_subjects(

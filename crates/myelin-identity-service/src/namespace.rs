@@ -466,6 +466,16 @@ impl NamespaceEngine {
             .and_then(|t| t.permissions.get(permission).cloned())
     }
 
+    /// The declared relations of an object type, sorted (the vocabulary `list_objects` unions the S8
+    /// candidate lookup over — P-ID-11). An unknown type has no relations (empty). Returned as owned
+    /// `String`s so the caller (the S4 candidate path) does not hold the schema lock.
+    pub fn relations_of(&self, object_type: &str) -> Vec<String> {
+        self.schema
+            .get(object_type)
+            .map(|t| t.relations.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
     /// Whether `relation` is a declared relation on `object_type` (used by `check` to decide a
     /// bare relation vs an unknown name).
     pub fn has_relation(&self, object_type: &str, relation: &str) -> bool {

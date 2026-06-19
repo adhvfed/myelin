@@ -82,6 +82,12 @@ pub struct Thresholds {
     pub rpo_rto: RpoRto,
     /// The causal-depth ceilings the agent-loop guard halts a loop at (SUB-D8).
     pub depth_ceilings: DepthCeilings,
+    /// The S8 authz-reverse-index measured tunables (the Ids↔Filter cardinality cap + the
+    /// reverse_index_lag SLO; P-ID-11 / contract 4.3). The SHAPE is frozen; the NUMBERS are the
+    /// default-to-beat re-measured + finalised at world-scale in P-ID-31. `#[serde(default)]` so an
+    /// older thresholds file (pre-P-ID-11) still parses (the cap falls back to the seed).
+    #[serde(default)]
+    pub authz_index: AuthzIndex,
     /// The per-surface shed-budget v1 floors (contract 1.11, §7.6).
     #[serde(default)]
     pub shed_budgets: Vec<ShedBudgetRow>,
@@ -161,6 +167,34 @@ pub struct DepthCeilings {
     pub soft: u32,
     /// The hard ceiling — at/over this depth a reaction is halted (default: 16).
     pub hard: u32,
+}
+
+/// The S8 authz-reverse-index measured tunables (P-ID-11 / P-069; identity §7.1, contract 4.3/1.8).
+///
+/// The Ids↔Filter SHAPE is frozen (small reachable sets materialise as `Ids`, large ones push down
+/// as `Filter`); only the NUMBERS — the cardinality cap that switches between them + the
+/// `reverse_index_lag` freshness SLO — are open. These are the default-to-beat; they are re-measured
+/// at world-scale (the surge + cell-scale load) and FINALISED/dated in P-ID-31 (P-074), which CLOSES
+/// the P-ID-11 cardinality-cap floor. `#[serde(default)]` on the parent field + [`Default`] here so
+/// an older thresholds file still parses (the cap falls back to the seed default-to-beat).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthzIndex {
+    /// The Ids↔Filter cardinality cap (the §7.1 switch point): at-or-under → `Ids` (materialise),
+    /// above → `Filter` (push down). Default-to-beat: 1000 (re-measured + finalised at P-ID-31).
+    pub ids_cardinality_cap: usize,
+    /// The `reverse_index_lag` freshness SLO, in milliseconds (the watermark-fallback the P-ID-12
+    /// read path reads). Default-to-beat: 1000 ms (re-measured + finalised at P-ID-31).
+    pub reverse_index_lag_slo_ms: u64,
+}
+
+impl Default for AuthzIndex {
+    /// The seed default-to-beat (mirrors `myelin_identity_service::DEFAULT_IDS_CARDINALITY_CAP`).
+    fn default() -> Self {
+        AuthzIndex {
+            ids_cardinality_cap: 1000,
+            reverse_index_lag_slo_ms: 1000,
+        }
+    }
 }
 
 /// A per-surface shed-budget v1-floor row (the `shed::SurfaceBudget` for one `shed::Surface`).
