@@ -28,6 +28,7 @@ name = "myelin-client"
 version = "0.0.0"
 dependencies = [
  "myelin-events",
+ "myelin-harness",
  "myelin-identity",
  "myelin-tenancy",
  "serde",

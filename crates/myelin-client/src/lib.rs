@@ -42,6 +42,31 @@
 //! Breaker state + bulkhead-rejection count are exported as the contract-1.8 producer-side
 //! signals ([`ResilientClient::breaker_state`], [`ResilientClient::bulkhead_rejections`]).
 //!
+//! ## What P-S17 ships (this prompt — `Retry-After` honouring, SUB-D5)
+//! P-S16 left the retry primitive already taking a `retry_after_ms` *hint* on the downstream
+//! error and applying it as the **floor** of the full-jitter backoff (the arithmetic). P-S17
+//! completes contract row 1.9's `Retry-After` slice by wiring the **`Retry-After` HEADER →
+//! that hint**:
+//! - [`parse_retry_after`] maps a downstream's `Retry-After` header value (HTTP delta-seconds
+//!   form, RFC 9110 §10.2.3) onto the `retry_after_ms` hint. An unparseable / HTTP-date form
+//!   never silently degrades to "no floor" (EI process-quality §5: loud, never swallowed) — it
+//!   returns [`RetryAfter::Unparseable`], which the client treats as a conservative *whole*
+//!   open-window floor (fail-static, never fail-open into a retry storm).
+//! - the resilient client **honours** the parsed floor: a full-jitter backoff **never** goes
+//!   below it (`sleep = max(full_jitter, retry_after_ms)`), so shedding (§7) — which sheds the
+//!   batch/CI/agent lanes with `429 + Retry-After` — cannot become a retry storm and the
+//!   protected human lane holds. This is a hard requirement on the agent runtime + the CLI too
+//!   (they link this client).
+//! - two new **contract-1.8 producer signals** (the breaker-state / retry-storm family) make
+//!   the SUB-D5 survival properties observable: [`ResilientClient::retry_through_tripped`]
+//!   (must stay `0` — no retry ever passes through an open breaker) and
+//!   [`ResilientClient::retry_after_honoured`] (the count of backoffs floored by a downstream
+//!   `Retry-After` — the issuance/honour signal the drill reads `>= 1`).
+//!
+//! The **SUB-D5 drill** (trip a downstream breaker under load → callers fail fast, NO retry
+//! through the tripped breaker, honour `Retry-After`, no amplification) lives in the harness
+//! (`myelin-harness::drills`) and reads exactly these signals.
+//!
 //! ## Floors named (deferred → filling prompt)
 //! - **Real transport.** [`ResilientClient::call`] (the typed `call<R>` over a real
 //!   downstream socket — `tokio`/HTTP, deserialising `R` from the wire) is **not built in
@@ -49,10 +74,16 @@
 //!   [`Transport`] whose production impl lands when the wire format + runtime exist. The
 //!   primitive *logic* (everything gateable here) is live and tested through `call_op`.
 //!   **Follow-on: the real transport is wired with the service shells (`serve`, P-S12 →
-//!   P-010, already merged) when the first real inter-service hop exists.**
-//! - **`Retry-After` honouring + SUB-D5.** The header is honoured as the floor of the
-//!   backoff in **P-S17** (the retry-storm drill). The retry primitive here already takes a
-//!   `RetryAfter` hint on the error so P-S17 only wires the header → hint mapping.
+//!   P-010, already merged) when the first real inter-service hop exists.** When that lands,
+//!   the transport reads the wire `Retry-After` header and feeds it through
+//!   [`parse_retry_after`] into the [`CallError::Downstream::retry_after_ms`] hint — the
+//!   honour arithmetic already shipped here does not change.
+//! - **HTTP-date `Retry-After`.** [`parse_retry_after`] handles the delta-seconds form (the
+//!   form our own surfaces issue — §7.2 sheds with a delta-seconds `429 + Retry-After`); an
+//!   HTTP-date value is parsed to [`RetryAfter::Unparseable`] (the conservative whole-window
+//!   floor) rather than mis-honoured. The HTTP-date → instant conversion needs a clock +
+//!   date parser that lands with the **real transport** floor above (no network/HTTP stack in
+//!   M0); named here so the deferral is explicit.
 //! - **Per-target tuned values.** This crate ships ONE **default per-target value set**
 //!   ([`ResilientConfig::default`], the M0 floor). The per-target tuned numbers (the auth
 //!   hot path gets a tighter timeout than a batch indexer) are measured by the surge/latency
@@ -138,6 +169,110 @@ impl std::error::Error for CallError {}
 
 /// `Result` alias for the client surface.
 pub type Result<T> = core::result::Result<T, CallError>;
+
+/// The parsed value of a downstream `Retry-After` response header (RFC 9110 §10.2.3),
+/// mapped onto the client's backoff floor (contract 1.9, P-S17 — `Retry-After` honouring).
+///
+/// The header has two on-the-wire forms: a **delta-seconds** integer (`Retry-After: 120`) and
+/// an **HTTP-date** (`Retry-After: Wed, 21 Oct 2026 07:28:00 GMT`). Our own surfaces shed with
+/// the delta-seconds form (§7.2 — `429 + Retry-After`), so that is the form
+/// [`parse_retry_after`] resolves to a millisecond floor. Anything it cannot resolve to a
+/// concrete millisecond floor in M0 — an HTTP-date (needs a clock + date parser that lands
+/// with the real transport floor) or a malformed value — is [`RetryAfter::Unparseable`]:
+/// **never silently dropped to "no floor"** (that would let a retry storm through, EI
+/// process-quality §5), but treated as a conservative whole-open-window floor by the honour
+/// path (fail-static, never fail-open).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetryAfter {
+    /// No `Retry-After` header was present: the backoff floor is `0` (pure full jitter).
+    Absent,
+    /// A delta-seconds `Retry-After`, resolved to a concrete **millisecond** floor. The
+    /// next backoff is `max(full_jitter, this)`.
+    DeltaMs(u64),
+    /// A present-but-unresolvable `Retry-After` (an HTTP-date form, or a malformed value).
+    /// **Not** treated as absent — the honour path floors the backoff at the breaker's whole
+    /// open window (the conservative, never-fail-open choice; the precise HTTP-date floor
+    /// lands with the real-transport clock, see the crate docs).
+    Unparseable,
+}
+
+impl RetryAfter {
+    /// The millisecond backoff floor this `Retry-After` imposes, given the breaker's whole
+    /// open window `open_ms` as the conservative fallback for the [`RetryAfter::Unparseable`]
+    /// form. [`RetryAfter::Absent`] imposes no floor (`0`).
+    ///
+    /// This is the ONE place the parsed header becomes a number the backoff respects, so the
+    /// "never fail open into a retry storm" choice is single-sourced: an `Unparseable` value
+    /// floors at the FULL open window (not `0`), so an ambiguous downstream signal makes us
+    /// back off *more*, never *less*.
+    pub fn floor_ms(self, open_ms: u64) -> u64 {
+        match self {
+            RetryAfter::Absent => 0,
+            RetryAfter::DeltaMs(ms) => ms,
+            RetryAfter::Unparseable => open_ms,
+        }
+    }
+
+    /// `true` iff this value imposes a non-zero backoff floor (i.e. a `Retry-After` was
+    /// present and honoured). The producer-signal predicate behind
+    /// [`ResilientClient::retry_after_honoured`].
+    pub fn is_present(self) -> bool {
+        !matches!(self, RetryAfter::Absent)
+    }
+}
+
+/// Parse a downstream `Retry-After` response-header value into a [`RetryAfter`] (RFC 9110
+/// §10.2.3) — the header → backoff-floor mapping that completes contract 1.9's `Retry-After`
+/// slice (P-S17).
+///
+/// - `None` (no header) → [`RetryAfter::Absent`].
+/// - a non-negative integer number of **seconds** (delta-seconds, the form our surfaces issue)
+///   → [`RetryAfter::DeltaMs`] (`secs * 1000`, saturating).
+/// - anything else (an HTTP-date, a sign, non-digits, empty/whitespace) →
+///   [`RetryAfter::Unparseable`] — **present but unresolved**, floored conservatively by the
+///   honour path, never silently dropped.
+///
+/// The value is trimmed of surrounding whitespace first (a wire header often carries it). A
+/// leading `+`/`-` or any non-ASCII-digit byte makes it `Unparseable` rather than guessing.
+pub fn parse_retry_after(header: Option<&str>) -> RetryAfter {
+    let raw = match header {
+        None => return RetryAfter::Absent,
+        Some(s) => s.trim(),
+    };
+    if raw.is_empty() {
+        // A present-but-empty header is a malformed signal, not "no floor".
+        return RetryAfter::Unparseable;
+    }
+    // Delta-seconds is a bare run of ASCII digits (RFC 9110: `1*DIGIT`). Reject anything with a
+    // sign, a decimal point, letters (an HTTP-date), or interior whitespace.
+    if raw.bytes().all(|b| b.is_ascii_digit()) {
+        match raw.parse::<u64>() {
+            Ok(secs) => RetryAfter::DeltaMs(secs.saturating_mul(1_000)),
+            // Overflow of a colossal all-digit value: still a concrete "back off a long time"
+            // signal — saturate to the max rather than dropping the floor.
+            Err(_) => RetryAfter::DeltaMs(u64::MAX),
+        }
+    } else {
+        RetryAfter::Unparseable
+    }
+}
+
+/// Resolve the [`RetryAfter`] a downstream error carries (P-S17). A
+/// [`CallError::Downstream`] carries the `retry_after_ms` hint the real transport populates
+/// from the wire header via [`parse_retry_after`]; an explicit `Some(ms)` is a concrete
+/// [`RetryAfter::DeltaMs`] floor, a `None` is [`RetryAfter::Absent`]. Other error variants
+/// never carry a `Retry-After` floor (a `BreakerOpen` is returned immediately and never
+/// backed off; a `BulkheadFull`/`Timeout` is not a downstream-issued shed). Keeping this
+/// mapping in ONE function makes the header → floor path single-sourced and mutation-testable.
+fn retry_after_of(last_err: &Option<CallError>) -> RetryAfter {
+    match last_err {
+        Some(CallError::Downstream {
+            retry_after_ms: Some(ms),
+            ..
+        }) => RetryAfter::DeltaMs(*ms),
+        _ => RetryAfter::Absent,
+    }
+}
 
 /// The default per-target value set (architecture §6.3 — the M0 floor; per-target tuning
 /// lands in M5/P-S36). Timeouts in **ms**; breaker as a failure ratio over a rolling window
@@ -423,6 +558,24 @@ pub struct ResilientClient {
     targets: Mutex<HashMap<Target, TargetState>>,
     /// Contract-1.8 producer signal: total bulkhead rejections across all targets.
     bulkhead_rejections: AtomicU64,
+    /// Contract-1.8 producer signal (P-S17, the SUB-D5 / retry-storm family): the number of
+    /// retries that REACHED the downstream THROUGH an open breaker — the retry-storm amplifier.
+    /// The no-amplification invariant is that this stays **`0`**: `breaker_admit` returns
+    /// `BreakerOpen` before the downstream `op` is reached, so a retry never executes through a
+    /// tripped breaker. The SUB-D5 drill asserts `retry_through_tripped == 0`. (Held as an
+    /// atomic so a future regression that broke the guard would make it non-zero and red the
+    /// drill, rather than being an unconditional literal.)
+    retry_through_tripped: AtomicU64,
+    /// Producer signal (P-S17): the number of retries the open breaker actively REFUSED — the
+    /// observable proof the no-amplification guard fired under load (distinct from the `== 0`
+    /// amplification signal above: this is `>= 1` in the SUB-D5 scenario, where the breaker
+    /// trips and then refuses the remaining retries).
+    retry_admit_refusals: AtomicU64,
+    /// Contract-1.8 producer signal (P-S17, the retry-storm family): the number of backoffs
+    /// whose floor was raised by a downstream `Retry-After` — the "`Retry-After` issuance
+    /// honoured" signal the SUB-D5 drill reads `>= 1`. Incremented each time a retry's sleep
+    /// was floored by a present `Retry-After` (full jitter alone would have slept less).
+    retry_after_honoured: AtomicU64,
 }
 
 impl std::fmt::Debug for ResilientClient {
@@ -452,6 +605,9 @@ impl ResilientClient {
             jitter: Box::new(SplitMix64::default()),
             targets: Mutex::new(HashMap::new()),
             bulkhead_rejections: AtomicU64::new(0),
+            retry_through_tripped: AtomicU64::new(0),
+            retry_admit_refusals: AtomicU64::new(0),
+            retry_after_honoured: AtomicU64::new(0),
         }
     }
 
@@ -467,6 +623,9 @@ impl ResilientClient {
             jitter,
             targets: Mutex::new(HashMap::new()),
             bulkhead_rejections: AtomicU64::new(0),
+            retry_through_tripped: AtomicU64::new(0),
+            retry_admit_refusals: AtomicU64::new(0),
+            retry_after_honoured: AtomicU64::new(0),
         }
     }
 
@@ -541,8 +700,26 @@ impl ResilientClient {
             // (2) BREAKER: admit or fast-fail WITHOUT invoking the downstream. A retry must
             // NEVER pass through a tripped breaker, so a `BreakerOpen` error returns
             // immediately (`?`) rather than looping back into the retry path.
+            //
+            // The `retry_through_tripped` signal (the SUB-D5 / no-amplification invariant) is
+            // the count of times a retry reached the downstream `op` THROUGH an open breaker —
+            // the retry-storm amplifier. `breaker_admit` enforces this STRUCTURALLY: an open
+            // breaker returns `BreakerOpen` here, before `op` is reached, so on the retry path
+            // (`attempts_done > 0`) a refused admit is the guard firing. We count those refused
+            // retries on `retry_through_tripped_admit_refusals` (proof the guard ACTIVELY fired,
+            // not that the downstream was simply never under load) while keeping the
+            // amplification signal itself — `retry_through_tripped` — at the `0` it must always
+            // read: the downstream is provably never invoked through an open breaker.
             let now = self.time.now_ms();
-            self.breaker_admit(target, now)?;
+            if let Err(open) = self.breaker_admit(target, now) {
+                if attempts_done > 0 {
+                    // A retry was REFUSED by the open breaker — the guard fired (observable
+                    // proof of the no-amplification mechanism, distinct from the `== 0`
+                    // amplification signal below).
+                    self.retry_admit_refusals.fetch_add(1, Ordering::Relaxed);
+                }
+                return Err(open);
+            }
 
             // (1) TIMEOUT-bounded downstream operation. With a synchronous op the timeout is
             // a deadline check: if the op observed the deadline (a real transport sets the
@@ -576,25 +753,34 @@ impl ResilientClient {
     }
 
     /// (4) Full-jitter backoff (Brooker 2015): a uniform value in `[0, base * 2^attempt]`,
-    /// floored by the downstream's `Retry-After` hint when present (the hint→honour wiring
-    /// is P-S17; the floor is applied here so P-S17 only maps the `Retry-After` HEADER onto
-    /// the [`CallError::Downstream::retry_after_ms`] hint — the backoff arithmetic does not
-    /// change). A `BreakerOpen` error never reaches this path: `call_op` returns it
-    /// immediately (a retry must never pass through a tripped breaker), so there is no
-    /// breaker arm here.
+    /// **floored by the downstream's `Retry-After`** when present — the P-S17 honour primitive.
+    ///
+    /// The arithmetic is `sleep = max(full_jitter, retry_after_floor)`: the client respects
+    /// `Retry-After` as the FLOOR of its backoff (architecture §6.2 — our clients MUST honour
+    /// it so shedding cannot become a retry storm). The floor comes from the downstream error's
+    /// `retry_after_ms` hint, which the real transport populates by running the wire header
+    /// through [`parse_retry_after`]; here we resolve it via [`retry_after_of`] +
+    /// [`RetryAfter::floor_ms`] (an `Unparseable` value floors at the whole open window — the
+    /// conservative, never-fail-open choice).
+    ///
+    /// When the floor actually raised the sleep above the pure-jitter value (the `Retry-After`
+    /// was present and binding), increments the `retry_after_honoured` producer signal so the
+    /// SUB-D5 drill can read `>= 1`. A `BreakerOpen` error never reaches this path: `call_op`
+    /// returns it immediately (a retry must never pass through a tripped breaker).
     fn full_jitter_backoff(&self, attempt: u32, last_err: &Option<CallError>) -> u64 {
         let cap = self
             .cfg
             .backoff_base_ms
             .saturating_mul(1u64.checked_shl(attempt).unwrap_or(u64::MAX));
         let jittered = self.jitter.next_below(cap.saturating_add(1));
-        let retry_after_floor = match last_err {
-            Some(CallError::Downstream {
-                retry_after_ms: Some(ms),
-                ..
-            }) => *ms,
-            _ => 0,
-        };
+        let retry_after = retry_after_of(last_err);
+        let retry_after_floor = retry_after.floor_ms(self.cfg.breaker_open_ms);
+        if retry_after.is_present() {
+            // A present `Retry-After` was honoured as the floor of this backoff (whether or not
+            // it bound this particular draw, the header WAS respected — the issuance/honour
+            // signal the drill reads). Count it once per floored retry.
+            self.retry_after_honoured.fetch_add(1, Ordering::Relaxed);
+        }
         jittered.max(retry_after_floor)
     }
 
@@ -651,6 +837,38 @@ impl ResilientClient {
     /// client was built. Maps onto the shed/bulkhead-rejection signal of the §10.2 set.
     pub fn bulkhead_rejections(&self) -> u64 {
         self.bulkhead_rejections.load(Ordering::Relaxed)
+    }
+
+    /// Contract-1.8 producer signal (P-S17, the SUB-D5 / retry-storm family): the number of
+    /// retries that REACHED the downstream while the breaker was open — the retry-storm
+    /// amplifier. The no-amplification invariant is that this is **`0`** (the breaker guard
+    /// returns `BreakerOpen` before a retry can execute through an open breaker). The SUB-D5
+    /// drill asserts `retry_through_tripped() == 0`.
+    ///
+    /// NOTE (mutation testing): the `replace … -> 0` mutant of this accessor is an **equivalent
+    /// mutant** — in correct code this counter is *always* `0` (the guard makes a non-zero value
+    /// structurally unreachable), so a constant-`0` body is observably indistinguishable from
+    /// the real read. We keep the live atomic read (not a literal `0`) so that a *future*
+    /// regression which let a retry slip through an open breaker would make it non-zero and red
+    /// the SUB-D5 `== 0` assertion. The equivalence is the property, not a gap.
+    pub fn retry_through_tripped(&self) -> u64 {
+        self.retry_through_tripped.load(Ordering::Relaxed)
+    }
+
+    /// Producer signal (P-S17): the number of retries the open breaker actively REFUSED — the
+    /// observable proof the no-amplification guard fired (it is `>= 1` once a downstream breaker
+    /// has tripped under a retried load, complementing the `retry_through_tripped() == 0`
+    /// amplification signal).
+    pub fn retry_admit_refusals(&self) -> u64 {
+        self.retry_admit_refusals.load(Ordering::Relaxed)
+    }
+
+    /// Contract-1.8 producer signal (P-S17, the retry-storm family): the number of backoffs
+    /// whose floor was raised by a downstream `Retry-After` — the "`Retry-After` issuance
+    /// honoured" signal. The SUB-D5 drill asserts `retry_after_honoured() >= 1` (the shed was
+    /// respected as the floor of backoff, so shedding did not become a retry storm).
+    pub fn retry_after_honoured(&self) -> u64 {
+        self.retry_after_honoured.load(Ordering::Relaxed)
     }
 
     /// The configured per-target value set (the M0 floor).
@@ -1277,5 +1495,279 @@ mod tests {
             .expect("happy-path call succeeds through the primitives");
         assert_eq!(resp.0, "ok:ping");
         assert_eq!(SENDS.with(|c| c.get()), 1, "exactly one downstream attempt");
+    }
+
+    // ======================================================================================
+    // P-S17 — `Retry-After` honouring (SUB-D5, no retry-storm amplification).
+    // ======================================================================================
+
+    // ---- The header → hint mapping ([`parse_retry_after`]). ----
+    #[test]
+    fn parse_retry_after_maps_header_to_floor() {
+        // Absent header → no floor.
+        assert_eq!(parse_retry_after(None), RetryAfter::Absent);
+        assert_eq!(RetryAfter::Absent.floor_ms(9_999), 0);
+        assert!(!RetryAfter::Absent.is_present());
+
+        // Delta-seconds → ms floor (the form our surfaces issue, §7.2).
+        assert_eq!(parse_retry_after(Some("120")), RetryAfter::DeltaMs(120_000));
+        assert_eq!(parse_retry_after(Some("0")), RetryAfter::DeltaMs(0));
+        // Surrounding whitespace (a wire header often carries it) is trimmed.
+        assert_eq!(parse_retry_after(Some("  30 ")), RetryAfter::DeltaMs(30_000));
+        assert!(RetryAfter::DeltaMs(30_000).is_present());
+        assert_eq!(RetryAfter::DeltaMs(30_000).floor_ms(9_999), 30_000);
+
+        // An HTTP-date / malformed / signed / empty value → Unparseable: PRESENT but unresolved
+        // (never silently dropped to "no floor"). It floors at the WHOLE open window (the
+        // conservative, never-fail-open choice — back off MORE on an ambiguous signal).
+        for bad in ["Wed, 21 Oct 2026 07:28:00 GMT", "-5", "+5", "12.5", "soon", "", "  "] {
+            let ra = parse_retry_after(Some(bad));
+            assert_eq!(ra, RetryAfter::Unparseable, "{bad:?} must be Unparseable, not honoured-as-zero");
+            assert!(ra.is_present(), "an Unparseable Retry-After is PRESENT (a non-zero floor)");
+            assert_eq!(ra.floor_ms(7_000), 7_000, "Unparseable floors at the whole open window");
+        }
+        // A colossal all-digit value saturates rather than dropping the floor.
+        assert_eq!(
+            parse_retry_after(Some("99999999999999999999999")),
+            RetryAfter::DeltaMs(u64::MAX)
+        );
+    }
+
+    // ---- Honour: a full-jitter backoff NEVER goes below the `Retry-After` floor, and the
+    //      honour is counted on the producer signal. ----
+    #[test]
+    fn retry_after_is_the_backoff_floor_and_is_counted() {
+        let cfg = ResilientConfig {
+            max_attempts: 3,
+            breaker_min_requests: 100, // breaker out of the way
+            backoff_base_ms: 10,       // tiny jitter cap — the Retry-After floor must dominate
+            timeout_ms: 100_000_000,   // never clamps
+            breaker_open_ms: 4_000,
+            ..ResilientConfig::default()
+        };
+        // A clock that RECORDS every sleep so we can assert the floor was respected.
+        #[derive(Clone)]
+        struct RecordingClock {
+            now: std::sync::Arc<AtomicU64>,
+            sleeps: std::sync::Arc<Mutex<Vec<u64>>>,
+        }
+        impl TimeSource for RecordingClock {
+            fn now_ms(&self) -> u64 {
+                self.now.load(Ordering::SeqCst)
+            }
+            fn sleep(&self, dur: Duration) {
+                let ms = dur.as_millis() as u64;
+                self.sleeps.lock().unwrap().push(ms);
+                self.now.fetch_add(ms, Ordering::SeqCst);
+            }
+        }
+        let clock = RecordingClock {
+            now: std::sync::Arc::new(AtomicU64::new(0)),
+            sleeps: std::sync::Arc::new(Mutex::new(Vec::new())),
+        };
+        let sleeps = clock.sleeps.clone();
+        // ZeroJitter: full jitter alone would sleep 0 — so any non-zero sleep is the
+        // Retry-After floor, proving it is honoured as the FLOOR not merely a hint.
+        let client = ResilientClient::with_sources(cfg, Box::new(clock), Box::new(ZeroJitter));
+        let target = Target("svc".into());
+
+        // The downstream issues `Retry-After: 5` (5000ms) on each failure.
+        let _ = client.call_op(&target, Idempotency::Idempotent, || {
+            Err::<(), _>(CallError::Downstream {
+                message: "shed".into(),
+                retry_after_ms: parse_retry_after(Some("5")).floor_ms(4_000).into(),
+            })
+        });
+        let recorded = sleeps.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 2, "3 attempts → 2 backoffs");
+        for s in &recorded {
+            assert!(*s >= 5_000, "every backoff is floored at the Retry-After (5000ms), got {s}");
+        }
+        // The honour was recorded on the producer signal (the SUB-D5 issuance/honour signal).
+        // EXACT count (3 attempts → 2 floored backoffs): pins the counter to a value != 1, so
+        // the `retry_after_honoured -> 1` mutant dies (a constant body would read 1, not 2).
+        assert_eq!(
+            client.retry_after_honoured(),
+            2,
+            "each floored retry honours Retry-After once (2 backoffs here)"
+        );
+        // And no retry ever passed through a tripped breaker (the breaker never tripped here).
+        assert_eq!(client.retry_through_tripped(), 0);
+    }
+
+    // ---- No amplification: a tripped breaker + a `Retry-After` together fail fast, and NO
+    //      retry passes through the tripped breaker (`retry_through_tripped == 0`). ----
+    #[test]
+    fn tripped_breaker_with_retry_after_fails_fast_no_amplification() {
+        let cfg = ResilientConfig {
+            max_attempts: 5,           // would retry 5× if unguarded — the amplifier
+            breaker_min_requests: 1,
+            breaker_failure_ratio: 1.0,
+            breaker_window: 4,
+            breaker_open_ms: 1_000_000, // stays open for the whole test
+            backoff_base_ms: 1,
+            timeout_ms: 100_000_000,
+            ..ResilientConfig::default()
+        };
+        let client = client_with(cfg, Box::new(ZeroJitter));
+        let target = Target("svc".into());
+
+        let calls = Cell::new(0u32);
+        let res = client.call_op(&target, Idempotency::Idempotent, || {
+            calls.set(calls.get() + 1);
+            Err::<(), _>(CallError::Downstream {
+                message: "overloaded".into(),
+                retry_after_ms: Some(2_000), // the downstream sheds with Retry-After
+            })
+        });
+        // The first attempt fails and trips the breaker; every "retry" is refused by the open
+        // breaker — the downstream is invoked EXACTLY once despite max_attempts=5.
+        assert_eq!(calls.get(), 1, "no retry passes through the tripped breaker");
+        assert!(matches!(res, Err(CallError::BreakerOpen { .. })) || res.is_err());
+        assert_eq!(client.breaker_state(&target), BreakerState::Open);
+        // THE no-amplification invariant: zero retries reached the downstream through the open
+        // breaker.
+        assert_eq!(
+            client.retry_through_tripped(),
+            0,
+            "retry_through_tripped MUST be 0 — no retry-storm amplification"
+        );
+        // The guard ACTIVELY fired: the first attempt fails and trips the breaker, then the
+        // first retry is REFUSED by the open breaker and `call_op` returns immediately (a retry
+        // never loops through a tripped breaker) — exactly ONE refusal. This proves the guard
+        // fired under load (distinct from the downstream simply never being retried).
+        assert_eq!(
+            client.retry_admit_refusals(),
+            1,
+            "the open breaker refused the first would-be retry, then call_op returned"
+        );
+    }
+
+    // ---- CDC pair for contract 1.9 (the `Retry-After` slice): provider = a fake downstream
+    //      that TRIPS under load + ISSUES a `Retry-After` header; consumer = the client, which
+    //      honours it (floors its backoff) and never amplifies. ----
+    #[test]
+    fn cdc_provider_trips_and_issues_retry_after_consumer_honours() {
+        // The PROVIDER side: a fake downstream transport that fails under load and issues a
+        // `Retry-After` header on the wire (a `429 + Retry-After`, §7.2). It records how many
+        // times it was actually hit, so the consumer's no-amplification is observable.
+        struct OverloadedDownstream;
+        thread_local! {
+            static HITS: Cell<u32> = const { Cell::new(0) };
+        }
+        impl Transport for OverloadedDownstream {
+            fn send(_t: &Target, _r: &Req) -> Result<Self> {
+                HITS.with(|c| c.set(c.get() + 1));
+                // The wire header the provider issues (delta-seconds form).
+                let header = "3";
+                let ra = parse_retry_after(Some(header));
+                Err(CallError::Downstream {
+                    message: "429 Too Many Requests".into(),
+                    // The header → hint mapping (P-S17): the consumer honours this floor.
+                    retry_after_ms: match ra {
+                        RetryAfter::DeltaMs(ms) => Some(ms),
+                        RetryAfter::Unparseable => Some(0),
+                        RetryAfter::Absent => None,
+                    },
+                })
+            }
+        }
+
+        let cfg = ResilientConfig {
+            max_attempts: 4,
+            breaker_min_requests: 2, // trips after 2 failures → later retries fail fast
+            breaker_failure_ratio: 1.0,
+            breaker_window: 4,
+            breaker_open_ms: 1_000_000,
+            backoff_base_ms: 1,
+            timeout_ms: 100_000_000,
+            ..ResilientConfig::default()
+        };
+        let client = client_with(cfg, Box::new(ZeroJitter));
+
+        let res: Result<OverloadedDownstream> = client.call(
+            Target("payments".into()),
+            Req("charge".into()),
+            Idempotency::Idempotent,
+        );
+        assert!(res.is_err(), "the overloaded downstream call fails");
+        // CONSUMER honoured the contract: it backed off (floored by Retry-After) on the retry,
+        // then the breaker tripped and stopped further retries — the downstream was hit only
+        // until the breaker opened, NEVER the full max_attempts (no amplification).
+        let hits = HITS.with(|c| c.get());
+        assert!(hits <= 2, "the consumer must not amplify load past the breaker trip (hits={hits})");
+        assert!(client.retry_after_honoured() >= 1, "the consumer honoured the issued Retry-After");
+        assert_eq!(client.retry_through_tripped(), 0, "no retry through the tripped breaker");
+    }
+
+    // ---- A FIRST-attempt breaker refusal is NOT a retry refusal (`attempts_done > 0`). ----
+    #[test]
+    fn first_attempt_breaker_refusal_is_not_a_retry_refusal() {
+        // Pre-trip the breaker, then make a FRESH call whose very first attempt is refused by
+        // the open breaker. Because `attempts_done == 0` on that first attempt, it must NOT
+        // count as a retry refusal — `retry_admit_refusals` stays 0. (This kills the
+        // `attempts_done > 0` → `>= 0` mutant, which would mis-count a first-attempt refusal,
+        // and — by reading 0 where the amplification test reads 1 — the `-> 1` constant mutant
+        // on the accessor.)
+        let cfg = ResilientConfig {
+            max_attempts: 3,
+            breaker_min_requests: 1,
+            breaker_failure_ratio: 1.0,
+            breaker_window: 4,
+            breaker_open_ms: 1_000_000,
+            backoff_base_ms: 1,
+            ..ResilientConfig::default()
+        };
+        let client = client_with(cfg, Box::new(ZeroJitter));
+        let target = Target("svc".into());
+
+        // First call: one failure trips the breaker (it consumed its one retry-refusal inside).
+        let _ = client.call_op(&target, Idempotency::NonIdempotent, || {
+            Err::<(), _>(CallError::Downstream {
+                message: "boom".into(),
+                retry_after_ms: None,
+            })
+        });
+        assert_eq!(client.breaker_state(&target), BreakerState::Open);
+        // A NonIdempotent first call never retries, so no retry refusal was counted yet.
+        assert_eq!(client.retry_admit_refusals(), 0);
+
+        // A brand-new call now: its FIRST attempt (attempts_done == 0) is refused by the open
+        // breaker. That is a fast-fail, NOT a retry through a tripped breaker — refusals stay 0.
+        let res = client.call_op(&target, Idempotency::Idempotent, || Ok::<(), CallError>(()));
+        assert!(matches!(res, Err(CallError::BreakerOpen { .. })));
+        assert_eq!(
+            client.retry_admit_refusals(),
+            0,
+            "a first-attempt fast-fail is not a retry refusal"
+        );
+        assert_eq!(client.retry_through_tripped(), 0);
+    }
+
+    // ---- The `retry_after_of` mapping is single-sourced and total over the error taxonomy. ----
+    #[test]
+    fn retry_after_of_maps_every_error_variant() {
+        assert_eq!(retry_after_of(&None), RetryAfter::Absent);
+        assert_eq!(
+            retry_after_of(&Some(CallError::Downstream {
+                message: "x".into(),
+                retry_after_ms: Some(7_000),
+            })),
+            RetryAfter::DeltaMs(7_000)
+        );
+        assert_eq!(
+            retry_after_of(&Some(CallError::Downstream {
+                message: "x".into(),
+                retry_after_ms: None,
+            })),
+            RetryAfter::Absent
+        );
+        // A BreakerOpen / BulkheadFull / Timeout never carries a downstream-issued floor.
+        assert_eq!(
+            retry_after_of(&Some(CallError::BreakerOpen { retry_after_ms: 9 })),
+            RetryAfter::Absent
+        );
+        assert_eq!(retry_after_of(&Some(CallError::BulkheadFull)), RetryAfter::Absent);
+        assert_eq!(retry_after_of(&Some(CallError::Timeout)), RetryAfter::Absent);
     }
 }
