@@ -225,8 +225,16 @@ cdc = ["crates/myelin-identity-service/tests/cdc_4_2_check.rs"]
 [[contract]]
 row = "4.3"
 title = "list_objects (SetExpr push-down)"
-status = "deferred"
-landing = "P-070"
+# COVERED by P-ID-11 / P-069: the return-shape dispatch + the S4 `Ids` materialise path over the S8
+# reverse index + the `Filter` push-down shape above the cardinality cap. The provider
+# (StoreBackedCheck::list_objects → Ids|Filter, leak-free) + consumer (a list/board query rendering
+# exactly the pre-filter, conjoining the Filter push-down, never a post-filter) CDC pair ships here.
+# S8 (the per-tenant authz reverse index) is fed off the bus by the iam.tuple_written EventHandler
+# and carries the revision_watermark. Floors: the full Filter SetExpr→SQL no-N+1 lowering + the
+# watermark read-consistency path → P-070 (P-ID-12); list_subjects → P-071 (P-ID-13); the
+# Ids↔Filter cardinality cap finalised at scale → P-074 (P-ID-31).
+status = "covered"
+cdc = ["crates/myelin-identity-service/tests/cdc_4_3_list_objects.rs"]
 
 [[contract]]
 row = "4.4"

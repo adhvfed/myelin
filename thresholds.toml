@@ -104,6 +104,20 @@ soft = 12
 hard = 16
 
 # ---------------------------------------------------------------------------------------------
+# [authz_index] — the S8 authz-reverse-index measured tunables (P-ID-11 / P-069, identity §7.1).
+# The Ids↔Filter SHAPE is FROZEN (small reachable sets materialise as `Ids`, large ones push down as
+# `Filter`); only the NUMBER — the cardinality cap that switches between them — is open. This is the
+# default-to-beat written now; it is re-measured at WORLD-SCALE (the surge + the cell-scale load) and
+# FINALISED/dated in P-ID-31 (P-074), which CLOSES the P-ID-11 cardinality-cap floor. The
+# `reverse_index_lag` freshness SLO (the watermark-fallback the P-ID-12 read path reads) is measured
+# + finalised in the same prompt. Keyed on contract 4.3 / 1.8. Mirrors
+# `list_objects::DEFAULT_IDS_CARDINALITY_CAP` (the seed constant); this file is its source of truth.
+# ---------------------------------------------------------------------------------------------
+[authz_index]
+ids_cardinality_cap = 1000      # the Ids↔Filter switch point (P-ID-31 finalises the measured value).
+reverse_index_lag_slo_ms = 1000 # the freshness SLO seed (P-ID-12 read-fallback reads it; P-ID-31 finalises).
+
+# ---------------------------------------------------------------------------------------------
 # [[shed_budgets]] — the per-surface shed-budget v1 FLOORS (contract 1.11, architecture §7.6).
 #
 # NAMED FLOOR: these are the M0 v1 floor numbers. The floor DISCIPLINE (bounded + reserved human
