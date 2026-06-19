@@ -1,0 +1,14 @@
+// RED fixture for `no-cross-db` — the REFS slice (REF-P2 / P-053). The lint MUST reject this.
+//
+// Refs builds its edge projection ONLY from the bus (the `*.snapshot`/`refs.edge.*` events) and its
+// OWN edge store — it NEVER reads an owner subsystem's database (refined-arch reference-graph §3;
+// ADR-01). Here the refs-edge-builder reaches directly into the Issues subsystem's internal store
+// to read a worklog — the cross-DB coupling bug class. The edge projection must be fed by Issues'
+// EVENTS, not by a shared data path into Issues' tables.
+use myelin_issues::store::WorklogStore;
+use myelin_issues::db::ConnectionPool;
+
+pub fn build_edge_from_issue_directly(store: &WorklogStore) {
+    // BUG: reaching across into Issues' data layer instead of consuming its events.
+    let _ = store;
+}

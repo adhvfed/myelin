@@ -1,0 +1,13 @@
+// GREEN fixture for `no-cross-db` — the REFS slice (REF-P2 / P-053). The lint MUST admit this.
+//
+// The same refs-edge-builder, now coupling only over the frozen CONTRACT surface: it consumes the
+// Issues subsystem's public event/value types (`IssueId`, the `issue.*` event the bus carries) —
+// the glue-crate coupling ADR-01 sanctions — never reaching into Issues' storage internals. The
+// edge is built from the EVENT projection, not a shared data path.
+use myelin_issues::IssueId;
+use myelin_events::EventEnvelope;
+
+pub fn build_edge_from_issue_event(id: IssueId, evt: &EventEnvelope) {
+    // OK: depend on the contract surface (public ids + the bus event), not the owner's store.
+    let _ = (id, evt);
+}
