@@ -39,6 +39,37 @@ hex.workspace = true
 # engine seam (Vault-Transit-class) fronts this in-process software engine on this floor.
 aes-gcm = "0.10"
 
+# ------------------------------------------------------------------------------------------
+# REAL backends behind the `integration` feature (Stage 1 / infra). OPTIONAL deps: the default
+# `cargo build --workspace` compiles NONE of them, so the unit build stays DB-free. They are
+# pulled only by `--features integration`, which carries the real-backend tests
+# (tests/integration_*.rs) run against the docker-compose dev stack.
+#   - sqlx            : the OLTP/outbox/ReBAC Postgres client (RUNTIME queries, no live-DB build);
+#   - aws-sdk-s3      : the object-store BlobStore backing (RustFS/Scaleway, path-style);
+#   - fred            : the Valkey/Redis backing for the Cache seam (cache.rs);
+#   - tokio           : the async runtime the real clients need.
+# ------------------------------------------------------------------------------------------
+sqlx = { workspace = true, optional = true }
+aws-config = { workspace = true, optional = true }
+aws-sdk-s3 = { workspace = true, optional = true }
+aws-credential-types = { workspace = true, optional = true }
+fred = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+myelin-config = { workspace = true, optional = true }
+
+[features]
+default = []
+# Pull the real Postgres + S3 + Valkey clients and compile the live-backend integration tests.
+integration = [
+    "dep:sqlx",
+    "dep:aws-config",
+    "dep:aws-sdk-s3",
+    "dep:aws-credential-types",
+    "dep:fred",
+    "dep:tokio",
+    "dep:myelin-config",
+]
+
 # The failure-injection harness is TEST-SUPPORT only (the same posture as a service's
 # main.rs / the harness's own dev usage). The IDOR + pool-saturation DRILLS read the
 # contract-1.8 survival signal set (CrossTenantCount == 0, PoolSaturation) off the

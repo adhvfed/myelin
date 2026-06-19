@@ -16,6 +16,21 @@ myelin-identity = { path = "../myelin-identity" }
 serde.workspace = true
 serde_json.workspace = true
 
+# ------------------------------------------------------------------------------------------
+# REAL durable bus behind the `integration` feature (Stage 1 / infra). The BusTransport trait
+# (relay.rs) gets a NATS JetStream backing here in later prompts; the OPTIONAL async-nats +
+# tokio deps are pulled ONLY by `--features integration` (the live-NATS tests in
+# tests/integration_nats.rs). The default `cargo build --workspace` compiles neither — the
+# in-process InProcessBus remains the unit/floor transport.
+# ------------------------------------------------------------------------------------------
+async-nats = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+myelin-config = { workspace = true, optional = true }
+
+[features]
+default = []
+integration = ["dep:async-nats", "dep:tokio", "dep:myelin-config"]
+
 # TEST-SUPPORT ONLY (dev-dependency, P-S07). The SUB-D1 / BUS-D4 drill scenarios ride the
 # P-S03 scoped-reversible dependency-break injector (Dependency::Broker) + the P-S04
 # telemetry-assertion library (outbox_depth / dead_letter_count signals), exactly as the

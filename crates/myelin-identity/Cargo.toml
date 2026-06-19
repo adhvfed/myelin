@@ -14,9 +14,24 @@ publish = false
 myelin-tenancy = { path = "../myelin-tenancy" }
 serde.workspace = true
 
+# ------------------------------------------------------------------------------------------
+# REAL ReBAC tuple store behind the `integration` feature (Stage 1 / infra). The relation-tuple
+# store (the (object, relation, subject) rows + the S8 reverse-index projection) gets its
+# Postgres backing here in later prompts; the OPTIONAL sqlx + tokio deps are pulled ONLY by
+# `--features integration` (the live-PG tuple tests in tests/integration_rebac.rs). NO new
+# myelin edge is added — these are external crates only — so identity stays a DAG sink and the
+# crate-graph-acyclic test is preserved. The default `cargo build --workspace` is DB-free.
+# ------------------------------------------------------------------------------------------
+sqlx = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+
 # serde_json is test-only: the SetExpr / CaveatContext / Principal round-trip "names are
 # the wire contract" drift tests (P-ID-01 TESTS) serialize the frozen shapes. It is NOT a
 # runtime dep of the contract surface (the carrier types are serde-derived; no JSON at the
 # ABI boundary), so it stays out of [dependencies] and cannot widen the sink's prod graph.
+[features]
+default = []
+integration = ["dep:sqlx", "dep:tokio"]
+
 [dev-dependencies]
 serde_json.workspace = true
