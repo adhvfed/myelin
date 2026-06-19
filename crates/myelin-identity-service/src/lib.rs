@@ -71,6 +71,7 @@ pub mod lowering;
 pub mod machine_auth;
 pub mod namespace;
 pub mod principal_store;
+pub mod revocation;
 pub mod reverse_index;
 pub mod tuple_store;
 
@@ -99,6 +100,10 @@ pub use machine_auth::{
 };
 pub use principal_store::{
     PrincipalError, PrincipalProfile, PrincipalRow, PrincipalStore, ProfileRef, S1_HOLDER, S1_TABLE,
+};
+pub use revocation::{
+    RevocationEntry, RevocationStore, RevocationTelemetry, RevokedKind, REVOCATION_SLA_SECS,
+    S7_TABLE,
 };
 pub use tuple_store::{
     run_grant_expiry, StoredTuple, TupleStore, WriteError, S3_HOLDER, S3_TABLE,
@@ -155,6 +160,22 @@ fn identity_migrations() -> Migrations {
                  data_role TEXT NOT NULL, \
                  status TEXT NOT NULL, \
                  PRIMARY KEY (tenant, region, principal_id))",
+        ),
+        // The S7 revocation mirror (P-ID-14): the (tenant, region)-partitioned PG MIRROR of the
+        // Redis/Valkey-class denylist (architecture §2 S7 row: "Redis/Valkey + PG mirror"). Holds
+        // revoked `jti`s, suspended principals, and per-run agent-token TTLs — PII-free handles
+        // only (no payloads). The fast Redis/Valkey layer is rebuilt FROM this durable mirror on
+        // recovery, which is what makes `revoke` idempotent even on crash. Forward-only.
+        Migration::plain(
+            "0102_s7_revocation",
+            "CREATE TABLE IF NOT EXISTS revocation (\
+                 tenant TEXT NOT NULL, \
+                 region TEXT NOT NULL, \
+                 kind TEXT NOT NULL, \
+                 handle TEXT NOT NULL, \
+                 revoked_at TEXT NOT NULL, \
+                 expires_at TEXT, \
+                 PRIMARY KEY (tenant, region, kind, handle))",
         ),
     ])
 }
@@ -366,6 +387,12 @@ pub struct StoreBackedCheck {
     /// relation check. Behind an `Arc` so the cloneable `check` handle shares one schema and
     /// [`StoreBackedCheck::admit_fragment`] mutates it under a lock.
     namespace: std::sync::Arc<std::sync::Mutex<NamespaceEngine>>,
+    /// The S7 revocation list / token denylist (P-ID-14) — the SCIM-disable cross-surface deny path.
+    /// `check` consults it so a disabled/revoked principal is denied within the W = 5 min bound
+    /// **regardless of a stale cached `subject.status`** (the F8 / ID-D1 deny: every surface that
+    /// calls `check` denies). Cloneable + shared so every surface holding a `check` handle reads the
+    /// SAME denylist (one revocation oracle, EI-01 §7 — no bespoke per-surface revocation path).
+    revocations: revocation::RevocationStore,
 }
 
 impl StoreBackedCheck {
@@ -390,7 +417,43 @@ impl StoreBackedCheck {
             namespace: std::sync::Arc::new(std::sync::Mutex::new(
                 NamespaceEngine::with_core_hierarchy(),
             )),
+            revocations: revocation::RevocationStore::new(),
         }
+    }
+
+    /// The shared S7 revocation list / token denylist (P-ID-14) this `check` slot consults — so a
+    /// caller can `revoke` / SCIM-disable a principal and observe the cross-surface deny, and a
+    /// drill can read the `revocation_lag` telemetry. Every clone of this `StoreBackedCheck` shares
+    /// the SAME denylist (one revocation oracle).
+    pub fn revocations(&self) -> &revocation::RevocationStore {
+        &self.revocations
+    }
+
+    /// **`revoke(jti | principal_id)` (contract 4.7) — the LIVE, scoped, idempotent, crash-safe
+    /// revoke (P-ID-14).** Carries the verified `(tenant, region)` scope the ABI trait method cannot
+    /// (it has no caller scope). Writes the S7 denylist (mirror-first, idempotent) so every surface
+    /// that consults `check` denies the target within the W = 5 min bound. The scope-less ABI
+    /// [`IdentityService::revoke`] delegates to this with the target's own tenant scope.
+    pub fn revoke_in(
+        &self,
+        scope: &myelin_storage::TenantScope,
+        target: &myelin_identity::RevokeTarget,
+        now: myelin_events::Timestamp,
+    ) {
+        self.revocations.revoke(scope, target, now);
+    }
+
+    /// **The SCIM-disable revocation path (P-ID-14) — the authoritative deny.** Disable a principal
+    /// across every surface in the verified `(tenant, region)` partition (the §4 authoritative
+    /// revocation path). After this, every surface's `check` for `principal` returns `Deny` within
+    /// the bound. Idempotent + crash-safe (it is a `revoke` of the principal).
+    pub fn disable_principal_in(
+        &self,
+        scope: &myelin_storage::TenantScope,
+        principal: &myelin_identity::PrincipalId,
+        now: myelin_events::Timestamp,
+    ) {
+        self.revocations.disable_principal(scope, principal, now);
     }
 
     /// The shared S8 reverse index this slot's `list_objects` reads (so a caller can wire the live
@@ -489,6 +552,21 @@ impl IdentityService for StoreBackedCheck {
         // userset operators; a name that is not a compiled permission falls through to a raw
         // relation check (one primitive — both compose over the SAME depth-bounded rewrite core).
         let scope = myelin_storage::TenantScope::from_verified_token(subject, subject.region.clone());
+
+        // The S7 revocation consult (P-ID-14, the SCIM-disable cross-surface deny path). A
+        // disabled/revoked principal is DENIED here — within the W = 5 min bound — regardless of a
+        // stale cached `subject.status` (the F8 / ID-D1 deny: every surface that calls `check`
+        // denies). This is the FAST cross-surface deny that does not wait for the next
+        // `authenticate`. A `Principal` denylist entry carries no TTL, so the consult `now` is the
+        // zero instant (it never gates a no-expiry entry). The check engine's own `subject.status`
+        // gate (P-ID-09) remains the second line of defence (fail-closed in depth).
+        let revoke_target = myelin_identity::RevokeTarget::Principal(subject.principal_id.clone());
+        if self
+            .revocations
+            .is_revoked(&scope, &revoke_target, &myelin_events::Timestamp(String::new()))
+        {
+            return Ok(Decision::Deny);
+        }
 
         // A caveat is the field/transition ABAC rider evaluated AFTER the relation/permission
         // grant holds (off the hot path, §8.6). The permission-aware namespace resolution is the
@@ -602,8 +680,18 @@ impl IdentityService for StoreBackedCheck {
         Err(AuthzError::NotYetImplemented("mint_run_token → P-ID-16 (M1)"))
     }
 
+    /// 4.7 (`revoke`) — the LIVE, idempotent, crash-safe `revoke` (P-ID-14) over the S7 denylist.
+    /// The ABI trait method carries no verified `(tenant, region)` scope; a revoke writes a
+    /// partition and the partition must come from a verified scope (never inferred), so the
+    /// scope-carrying entry the service wires is [`StoreBackedCheck::revoke_in`] (it threads the
+    /// verified scope + the revoke timestamp), with [`StoreBackedCheck::disable_principal_in`] the
+    /// SCIM-disable path. The ABI method errors loudly so an unscoped revoke is never silently
+    /// mis-partitioned (the tenant-predicate floor).
     fn revoke(&self, _target: &myelin_identity::RevokeTarget) -> myelin_identity::Result<()> {
-        Err(AuthzError::NotYetImplemented("revoke → P-ID-14 (M1)"))
+        Err(AuthzError::NotYetImplemented(
+            "revoke (ABI, scope-less) → use StoreBackedCheck::revoke_in (P-ID-14); a revoke writes a \
+             (tenant, region) partition and must carry a verified scope (the tenant-predicate floor)",
+        ))
     }
 
     fn resolve_pseudonym(
