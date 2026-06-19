@@ -111,10 +111,16 @@
 //!   semantics until then. The real `SELECT … FOR UPDATE SKIP LOCKED` + `INSERT` against the
 //!   Storage pool lands when the OLTP client is wired (P-007 + `serve` P-S12). See the
 //!   DEVIATION note in [`outbox`].
-//! - **The real `BusTransport` adapter is the Bus's M0 deliverable (EB-04 → P-013).** This
-//!   prompt ships the trait + an in-process fake ([`relay::InProcessBus`]); EB-04 builds the
-//!   JetStream-class reference impl on the SAME `put/consume/ack/purge` shape (+ the 24h GC,
-//!   the `dlq.<tenant>.<subsystem>` subject, the dead-letter Signal alert).
+//! - **The real `BusTransport` adapter is the Bus's M0 deliverable (EB-04 → P-013).** P-S07
+//!   shipped the trait + an in-process fake ([`relay::InProcessBus`]); **EB-04 (P-013) added the
+//!   three relay refinements** arch §4.1 names — the `dlq.<tenant>.<subsystem>` dead-letter
+//!   Signal alert ([`relay::DeadLetterAlert`] / [`relay::Relay::dead_letter_alerts`]), the 24h
+//!   published-row GC ([`relay::Relay::gc_published`]), and the `BusTransport` put/consume CDC
+//!   conformance pair — reconciled IN PLACE on the same trait, no second implementation. The one
+//!   thing still owed: the JetStream-class reference adapter that implements the SAME frozen
+//!   `put/consume/ack/purge` shape against a real broker is wired when the `serve` lifecycle +
+//!   the broker binding land (P-S12 / the Bus M0 deployment); the relay algorithm + the drilled
+//!   0-ghost/0-lost property do not change.
 //! - **The single-region event log → column-store seam** is the post-M5 follow-on (the
 //!   `BusTransport` trait IS that seam; promoted only when volume is measured; named in EB-31).
 //! - **The ULID source** is the injected [`outbox::IdMinter`] ([`outbox::MonotonicMinter`] is
@@ -140,7 +146,8 @@ pub use outbox::{
     OUTBOX_MIGRATION,
 };
 pub use relay::{
-    BusTransport, Delivery, DrainReport, InProcessBus, Relay, TransportError, MAX_PUBLISH_ATTEMPTS,
+    dlq_subject, BusTransport, DeadLetterAlert, Delivery, DrainReport, InProcessBus, Relay,
+    TransportError, MAX_PUBLISH_ATTEMPTS,
 };
 
 use serde::{Deserialize, Serialize};
