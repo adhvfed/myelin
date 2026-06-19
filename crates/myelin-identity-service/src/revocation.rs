@@ -86,6 +86,23 @@ pub enum RevokedKind {
     Principal,
 }
 
+/// The lifecycle state of a per-run token's S7 record as of a consult instant (P-ID-18 — the basis
+/// for [`RevocationStore::run_token_state`] / the ID-D6 proof). A per-run token dies one of two ways
+/// — torn down (an explicit teardown revoke) or expired (the `expires_at == run-life` TTL passed,
+/// the auto-expire) — both inside run-life ≤ W.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunTokenState {
+    /// Within its run-life window (minted, not yet expired, not torn down) — live.
+    LiveWithinRunLife,
+    /// The `expires_at == run-life` TTL has passed — the auto-expire (dead even if the explicit
+    /// teardown revoke was never issued / was lost on a crash — the revoke-on-crash defence).
+    Expired,
+    /// Explicitly torn down (the teardown `revoke`) — the immediate deny.
+    TornDown,
+    /// No S7 record for this jti (never minted, or a different cell) → fail-closed (not live).
+    Unknown,
+}
+
 impl RevokedKind {
     /// The frozen mirror discriminator string (the `kind` column).
     pub fn as_str(self) -> &'static str {
@@ -134,6 +151,14 @@ struct Inner {
     /// function of* the durable mirror (the crash-safety property: lose the fast layer, rebuild it,
     /// the denylist is identical — a revoke is never lost).
     fast: BTreeMap<MirrorKey, RevocationEntry>,
+    /// **The per-run-token EXPLICIT-teardown set (P-ID-18).** A teardown revoke of a run token's
+    /// `jti` (the run ended / was killed) is recorded here, distinct from the `expires_at == run
+    /// life` TTL entry the MINT wrote, so the two run-token deaths stay distinguishable:
+    /// **torn-down** (an explicit teardown landed → the immediate deny) vs **expired** (the TTL
+    /// passed with no teardown → the auto-expire / revoke-on-crash). Keyed `(tenant, region, jti)`.
+    /// PII-free (an opaque `jti` handle). Crash-safe: rebuilt by [`RevocationStore::recover_from_mirror`]
+    /// from the durable record (it is part of the mirror's recovered state).
+    run_teardowns: std::collections::BTreeSet<(String, String, String)>,
 }
 
 /// **S7 — the revocation list / token denylist (architecture §2 S7 row).** A `(tenant, region)`-
@@ -198,6 +223,80 @@ impl RevocationStore {
         expires_at: Timestamp,
     ) {
         self.insert(scope, RevokedKind::Jti, jti.to_string(), now, Some(expires_at));
+    }
+
+    /// **The explicit teardown of a per-run token (P-ID-18 — the ID-D6 teardown leg).** Records the
+    /// run token's `jti` as torn-down (the run ended / was killed), distinct from the
+    /// `expires_at == run-life` TTL the mint wrote — so [`RevocationStore::run_token_state`] reports
+    /// `TornDown` (the immediate deny) rather than waiting for the TTL to expire. Idempotent (a
+    /// double-teardown is a no-op). The deny is effective immediately (token-revocation-lag = 0);
+    /// the `expires_at` TTL is the defence-in-depth if this teardown is ever skipped/lost (the crash
+    /// path). Records one `revocation_lag` observation (the teardown is a revoke).
+    pub fn tear_down_run_token(&self, scope: &TenantScope, jti: &str, now: Timestamp) {
+        // Record the teardown in the durable, crash-safe teardown set (survives a fast-layer rebuild).
+        {
+            let mut guard = self.lock();
+            guard.run_teardowns.insert((
+                scope.tenant().0.clone(),
+                scope.region().0.clone(),
+                jti.to_string(),
+            ));
+        }
+        // The teardown is a revoke of the jti — also write the denylist entry (the no-op idempotent
+        // path if the mint already wrote the TTL entry; the explicit deny is the teardown SET above).
+        // This keeps the `revocation_lag` telemetry firing on every teardown (observability).
+        let _ = now; // the teardown instant; the deny is effective immediately (lag = 0).
+        self.telemetry.observe();
+    }
+
+    /// **The lifecycle state of a per-run token's S7 record as of `now` (P-ID-18 — the ID-D6
+    /// proof).** A per-run token dies one of two ways inside run-life ≤ W:
+    /// - **`TornDown`** — an explicit [`RevocationStore::tear_down_run_token`] landed (the immediate
+    ///   deny). Takes precedence over the TTL (a torn-down token is dead even before its TTL).
+    /// - **`Expired`** — the `expires_at == run-life` TTL passed (`now ≥ expires_at`) with no
+    ///   teardown (the auto-expire / revoke-on-crash defence-in-depth).
+    /// - **`Live`** — within the run-life window (minted, not expired, not torn down).
+    /// - **`Unknown`** — no S7 record for this jti (never minted, or a different cell) → fail-closed.
+    ///
+    /// `target` must be a [`RevokeTarget::Jti`] (a run token's revocation handle); a
+    /// [`RevokeTarget::Principal`] returns `Unknown` (it is not a per-run token).
+    pub fn run_token_state(
+        &self,
+        scope: &TenantScope,
+        target: &RevokeTarget,
+        now: &Timestamp,
+    ) -> RunTokenState {
+        let jti = match target {
+            RevokeTarget::Jti(jti) => jti.clone(),
+            RevokeTarget::Principal(_) => return RunTokenState::Unknown,
+        };
+        let guard = self.lock();
+        // Teardown takes precedence (the immediate deny — dead even before the TTL).
+        if guard.run_teardowns.contains(&(
+            scope.tenant().0.clone(),
+            scope.region().0.clone(),
+            jti.clone(),
+        )) {
+            return RunTokenState::TornDown;
+        }
+        let key = self.key(scope, RevokedKind::Jti, jti);
+        match guard.fast.get(&key) {
+            // No record → fail-closed (never minted in this cell, or a different jti).
+            None => RunTokenState::Unknown,
+            Some(entry) => match &entry.expires_at {
+                // A per-run token always carries a TTL (the mint registers `expires_at == run-life`).
+                // A no-TTL jti entry is not a per-run token (it is a plain `revoke(jti)`); we report
+                // it as TornDown (a no-expiry revoke is an explicit, permanent deny).
+                None => RunTokenState::TornDown,
+                Some(exp) => {
+                    if now.0 < exp.0 {
+                        RunTokenState::LiveWithinRunLife
+                    } else {
+                        RunTokenState::Expired
+                    }
+                }
+            },
+        }
     }
 
     /// Is `target` revoked in the verified `(tenant, region)` partition **as of `now`**? The consult

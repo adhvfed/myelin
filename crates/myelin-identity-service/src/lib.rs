@@ -71,6 +71,7 @@ pub mod failstatic_cache;
 pub mod list_objects;
 pub mod lowering;
 pub mod machine_auth;
+pub mod mint;
 pub mod namespace;
 pub mod principal_store;
 pub mod read_replica;
@@ -112,12 +113,16 @@ pub use machine_auth::{
     Authority, CapabilityAuthenticator, CapabilityToken, MachineKind, S7Denylist,
     StructuralTokenVerifier, TokenVerifier,
 };
+pub use mint::{
+    expires_at_of, run_token_jti, MintError, RevocationProof, RunTokenMinter, StructuralTokenSigner,
+    TokenSigner, RUN_GRANT_RELATION, SELFHOSTED_GRANT_PREFIX,
+};
 pub use principal_store::{
     PrincipalError, PrincipalProfile, PrincipalRow, PrincipalStore, ProfileRef, S1_HOLDER, S1_TABLE,
 };
 pub use revocation::{
-    RevocationEntry, RevocationStore, RevocationTelemetry, RevokedKind, REVOCATION_SLA_SECS,
-    S7_TABLE,
+    RevocationEntry, RevocationStore, RevocationTelemetry, RevokedKind, RunTokenState,
+    REVOCATION_SLA_SECS, S7_TABLE,
 };
 pub use tuple_store::{
     run_grant_expiry, StoredTuple, TupleStore, WriteError, S3_HOLDER, S3_TABLE,
@@ -301,7 +306,7 @@ impl IdentityService for FailClosedCheck {
         _delegation_caveats: &myelin_identity::DelegationCaveats,
         _ttl: &myelin_identity::FailStaticBound,
     ) -> myelin_identity::Result<myelin_identity::RunToken> {
-        Err(AuthzError::NotYetImplemented("mint_run_token → P-ID-16 (M1)"))
+        Err(AuthzError::NotYetImplemented("mint_run_token → P-ID-18 (M1)"))
     }
 
     fn revoke(&self, _target: &myelin_identity::RevokeTarget) -> myelin_identity::Result<()> {
@@ -416,6 +421,14 @@ pub struct StoreBackedCheck {
     /// [`StoreBackedCheck::route_read`]; the replica is fed by the primary's replication stream
     /// ([`read_replica::AuthzReadReplica::replicate`]).
     read_replica: read_replica::AuthzReadReplica,
+    /// **The per-run-token minter (P-ID-18) — the `mint_run_token` half of 4.7.** Mints per-run
+    /// attenuated tokens that never exceed the composed delegation policy (it re-applies the
+    /// monotone intersection P-ID-17 ships), registers the `expires_at == run-life` TTL in THIS
+    /// slot's shared S7 [`revocation::RevocationStore`] (so a teardown/auto-expire here is seen by
+    /// the SAME denylist `check`/`authenticate` consult), enforces the self-hosted-runner one-tenant
+    /// scope, and re-mints a fresh attenuated token mid-workflow on resume. Wired over the SAME S7
+    /// store + S3 tuple store this slot holds (one revocation oracle, one write primitive).
+    minter: mint::RunTokenMinter,
 }
 
 impl StoreBackedCheck {
@@ -433,6 +446,11 @@ impl StoreBackedCheck {
     /// `list_objects` slot materialises the `Ids` path / targets the `Filter` push-down over the live
     /// projection. The core hierarchy is pre-loaded; subsystem fragments admit on top.
     pub fn with_index(tuples: TupleStore, index: ReverseIndex) -> StoreBackedCheck {
+        let revocations = revocation::RevocationStore::new();
+        // The minter shares THIS slot's S7 store + S3 tuple store (one revocation oracle, one write
+        // primitive): a mint registers the per-run TTL into the SAME denylist `check`/`authenticate`
+        // consult, and the auto-expiring per-run grant tuple goes through the SAME write_tuples path.
+        let minter = mint::RunTokenMinter::with_tuple_store(revocations.clone(), tuples.clone());
         StoreBackedCheck {
             engine: CheckEngine::new(tuples.clone()),
             tuples,
@@ -440,8 +458,9 @@ impl StoreBackedCheck {
             namespace: std::sync::Arc::new(std::sync::Mutex::new(
                 NamespaceEngine::with_core_hierarchy(),
             )),
-            revocations: revocation::RevocationStore::new(),
+            revocations,
             read_replica: read_replica::AuthzReadReplica::new(),
+            minter,
         }
     }
 
@@ -675,6 +694,95 @@ impl StoreBackedCheck {
         )
     }
 
+    /// The shared per-run-token minter (P-ID-18) this slot wires — so a caller can mint / re-mint /
+    /// tear down a run token and observe the auto-expire + teardown through the SAME S7 denylist
+    /// this slot's `check`/`authenticate` consult. Every clone shares the SAME minter (one mint).
+    pub fn run_token_minter(&self) -> &mint::RunTokenMinter {
+        &self.minter
+    }
+
+    /// **`mint_run_token(agent_id, run_id, delegation_caveats, ttl) → token` (contract 4.7, the mint
+    /// half) — the LIVE, scoped mint (P-ID-18).** Carries the verified `(tenant, region)` scope + the
+    /// rich [`delegation::DelegationInput`] (the agent ceiling / delegation chain / tenant guardrails / the
+    /// delegator's held set) the scope-less, policy-less ABI [`IdentityService::mint_run_token`]
+    /// cannot. Applies the monotone delegation intersection (so the token never exceeds the effective
+    /// policy), registers the `expires_at == run-life` TTL in THIS slot's shared S7 store (the
+    /// revoke-on-crash defence), enforces the self-hosted-runner one-tenant scope, and writes the
+    /// auto-expiring per-run grant tuple. Returns the minted [`myelin_identity::RunToken`] or a
+    /// [`mint::MintError`] (never a fabricated/over-broad token).
+    #[allow(clippy::too_many_arguments)]
+    pub fn mint_run_token_in(
+        &self,
+        scope: &myelin_storage::TenantScope,
+        agent_id: &myelin_identity::PrincipalId,
+        run_id: &myelin_identity::RunId,
+        agent: &Principal,
+        trigger_actor: &Principal,
+        input: &delegation::DelegationInput,
+        delegation_caveats: &myelin_identity::DelegationCaveats,
+        kind: MachineKind,
+        ttl: &myelin_identity::FailStaticBound,
+        now: &myelin_events::Timestamp,
+    ) -> Result<myelin_identity::RunToken, mint::MintError> {
+        self.minter.mint_run_token(
+            scope,
+            agent_id,
+            run_id,
+            agent,
+            trigger_actor,
+            input,
+            delegation_caveats,
+            kind,
+            ttl,
+            now,
+        )
+    }
+
+    /// **The mid-workflow re-mint on resume (P-ID-18, C9) — the LIVE, scoped re-mint.** A days-later
+    /// HITL approval re-mints a FRESH attenuated token applying the intersection as-of-resume (a
+    /// delegator who lost the right yields a narrower token). Carries the verified scope + the rich
+    /// as-of-resume [`delegation::DelegationInput`] the ABI method cannot.
+    #[allow(clippy::too_many_arguments)]
+    pub fn re_mint_run_token_in(
+        &self,
+        scope: &myelin_storage::TenantScope,
+        agent_id: &myelin_identity::PrincipalId,
+        run_id: &myelin_identity::RunId,
+        agent: &Principal,
+        trigger_actor: &Principal,
+        input_as_of_resume: &delegation::DelegationInput,
+        delegation_caveats: &myelin_identity::DelegationCaveats,
+        kind: MachineKind,
+        ttl: &myelin_identity::FailStaticBound,
+        now_resume: &myelin_events::Timestamp,
+    ) -> Result<myelin_identity::RunToken, mint::MintError> {
+        self.minter.re_mint_on_resume(
+            scope,
+            agent_id,
+            run_id,
+            agent,
+            trigger_actor,
+            input_as_of_resume,
+            delegation_caveats,
+            kind,
+            ttl,
+            now_resume,
+        )
+    }
+
+    /// **The explicit teardown of a run token (P-ID-18 — the ID-D6 teardown leg).** The run ended /
+    /// was killed → the token's `jti` is torn down (the immediate deny, token-revocation-lag = 0) in
+    /// THIS slot's shared S7 store. Pairs with the auto-expiry (the `expires_at` TTL is the
+    /// defence-in-depth if teardown is skipped on a crash).
+    pub fn tear_down_run_token_in(
+        &self,
+        scope: &myelin_storage::TenantScope,
+        token: &myelin_identity::RunToken,
+        now: &myelin_events::Timestamp,
+    ) {
+        self.minter.teardown(scope, token, now);
+    }
+
     /// **The scoped, LIVE `list_subjects` (P-ID-13) — the Zanzibar Expand served by S8 at density.**
     /// The verified `(tenant, region)` scope is carried explicitly (the ABI trait method cannot — it
     /// has no caller principal). The object's type is inferred from its id's `type:` prefix (the §7.3
@@ -876,6 +984,16 @@ impl IdentityService for StoreBackedCheck {
         Err(AuthzError::NotYetImplemented("write_tuples → TupleStore::write_tuples (P-ID-08)"))
     }
 
+    /// 4.7 (`mint_run_token`) — the LIVE per-run-token mint (P-ID-18). The ABI trait method carries
+    /// only the agent_id / run_id / the frozen `DelegationCaveats` carrier / the TTL — NOT the
+    /// verified `(tenant, region)` scope (the partition the TTL is registered in) NOR the rich
+    /// delegation conjunct SETS (the agent ceiling / tenant guardrails / the delegator's held set)
+    /// the intersection composes over. A scope-/policy-less mint cannot compute the real effective
+    /// authority and MUST NOT fabricate one (an over-broad or empty token would be a silent over- or
+    /// under-grant). The scoped entry the service surface wires is
+    /// [`StoreBackedCheck::mint_run_token_in`] (it carries the verified scope + the
+    /// [`delegation::DelegationInput`]); the ABI method errors loudly so a policy-less mint is never
+    /// silently served.
     fn mint_run_token(
         &self,
         _agent_id: &myelin_identity::PrincipalId,
@@ -883,7 +1001,13 @@ impl IdentityService for StoreBackedCheck {
         _delegation_caveats: &myelin_identity::DelegationCaveats,
         _ttl: &myelin_identity::FailStaticBound,
     ) -> myelin_identity::Result<myelin_identity::RunToken> {
-        Err(AuthzError::NotYetImplemented("mint_run_token → P-ID-16 (M1)"))
+        Err(AuthzError::NotYetImplemented(
+            "mint_run_token (ABI, scope-/policy-less) → use StoreBackedCheck::mint_run_token_in \
+             (P-ID-18); the mint applies the monotone delegation intersection over the conjunct \
+             policy sets the credentials carry + registers the expires_at == run-life TTL in the \
+             verified (tenant, region) partition, which the scope-less ABI method cannot supply \
+             (never a fabricated/over-broad RunToken)",
+        ))
     }
 
     /// 4.7 (`revoke`) — the LIVE, idempotent, crash-safe `revoke` (P-ID-14) over the S7 denylist.
