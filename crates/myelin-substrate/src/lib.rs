@@ -90,6 +90,29 @@
 //! (P-S11, at source-scan) read. The holder-registration + runner + lint tests are the dated green
 //! artifact.
 //!
+//! ## Status (P-S19 → P-035, 2026-06-19) — the protected-human-lane shed order + bounded-everything
+//! The **principal-aware shed lane** + **bounded everything** + the **§7.6 per-surface shed-budget
+//! v1 floor table** (contract 1.11) are **implemented** in [`shed`]:
+//! - **(a) the shed lane** — [`shed::ShedLane`] reads the run-class ([`shed::RunClass::derive`],
+//!   derived from the verified `Principal.kind` + the injected run-class header — a header may only
+//!   *down-class*, the human lane is structurally unspoofable) and applies the shed order
+//!   `speculative → batch/CI → agent → human-last` with `429 + Retry-After` ([`shed::ShedDecision`]),
+//!   **per-tenant** (one tenant's surge fills only its own budget — it can never shed another
+//!   tenant's human; EI-02 §1 / EI-01 §2 blast-radius). The human lane is shed LAST and only in true
+//!   saturation.
+//! - **(b) bounded everything** — [`shed::BoundedQueue`] is the one bounded-queue/pool primitive
+//!   (consumer prefetch / DB pool / bulkhead per target / per-tenant in-flight / HTTP intake): it
+//!   **fast-fails (sheds)** when full rather than growing latency unboundedly (§7.1, Little's Law).
+//! - **(c) the §7.6 v1 floor table** — [`shed::ShedBudgetTable::v1_floor`] (named floors).
+//!
+//! The shed-count-per-lane + per-surface signals are exported (the contract-1.8 producer slice,
+//! [`shed::ShedLane::shed_count`] / [`shed::BoundedQueue::shed_count`]). The shed-order + bounded
+//! unit tests (`shed::tests`) + the CDC 1.11 pair (`tests/cdc_1_11_shed_order.rs`) are the dated
+//! green artifact. **Floors named:** the shed-budget NUMBERS are the M0 v1 floor → tuned by the
+//! surge/latency drills in **M5 (P-S33)**; the **agent-load caps + the SUB-D8 causal-loop guard**
+//! (bounded dispatch pool / causal-depth ceiling / shared-root tripwire / bounded predicate guard)
+//! land in **P-S20 (P-036)** — this module ships only the agent *lane* of the shed order.
+//!
 //! ## Floors named (deferred bodies → filling prompt)
 //! - The env-first `Config::from_env()` parse of the real `DATABASE_URL`/broker/KMS/region knobs
 //!   plus the concrete `tokio-postgres`/`sqlx` connection behind [`myelin_storage::OltpPool`] land
@@ -129,6 +152,7 @@ pub mod holders;
 pub mod metrics_health;
 pub mod migrations;
 pub mod serve;
+pub mod shed;
 pub mod topology;
 
 pub use holders::{HolderRegistration, HolderRegistry, StoreKind};
@@ -143,6 +167,10 @@ pub use migrations::{
 pub use serve::{
     boot, serve, AppSpec, ConsumerReg, HoldersSpec, InternalRpc, OutboxSpec, PortOpener,
     PublicRoutes, ServeHandle, Surface, Telemetry,
+};
+pub use shed::{
+    BoundedQueue, RunClass, RunClassHeader, ShedBudgetTable, ShedDecision, ShedLane,
+    Surface as ShedSurface, SurfaceBudget,
 };
 pub use topology::{
     AllowPrincipal, AuditSink, Authorizer, DenyAll, IdorAuditRecord, InjectedIdentity,
