@@ -7,8 +7,21 @@
 //!
 //! ```text
 //! myelin-tenancy → myelin-identity → myelin-events (+ -refs, -content, -query)
-//!                → myelin-agent, myelin-gdpr → myelin-client → myelin-substrate
+//!                → myelin-agent, myelin-gdpr → myelin-client, myelin-storage → myelin-substrate
 //! ```
+//!
+//! ## The `myelin-storage` node (P-ST-01 → P-007) — a documented DAG extension
+//! The architecture §2.9 froze TEN crates with no `myelin-storage` node (§2.8: there is
+//! deliberately no shared "storage API" crate spanning subsystems). The Storage by-system
+//! prompt mandates a `myelin-storage` crate for Storage's *runtime* code (the tier clients
+//! / KMS / BlobStore impls). The reconciliation (see `myelin-storage`'s crate-level
+//! DEVIATION note): `myelin-storage` is the harness-wired storage SUBSTRATE — the
+//! *mechanism* every subsystem opens its pool THROUGH (the thin query layer §2.8 itself
+//! names) — NOT a cross-subsystem data-access crate, so the `no-cross-db` rule is
+//! preserved. In root-last order it sits below `-gdpr`/`-client` and ABOVE `-substrate`
+//! (the harness depends on the tier client it wires). This module is updated to ELEVEN
+//! crates accordingly; the acyclic + identity-sink + substrate-root invariants are
+//! unchanged.
 //!
 //! The frozen invariants this module asserts (the `crate-graph-acyclic` test):
 //! 1. **The DAG is acyclic** — a dependency that would create a cycle must not exist.
@@ -36,12 +49,14 @@ pub enum Crate {
     Agent,
     Gdpr,
     Client,
+    Storage,
     Substrate,
 }
 
 impl Crate {
-    /// All ten crates.
-    pub const ALL: [Crate; 10] = [
+    /// All eleven crates (the §2.9 ten + the documented `myelin-storage` storage-substrate
+    /// node, P-ST-01 → P-007).
+    pub const ALL: [Crate; 11] = [
         Crate::Tenancy,
         Crate::Identity,
         Crate::Events,
@@ -51,6 +66,7 @@ impl Crate {
         Crate::Agent,
         Crate::Gdpr,
         Crate::Client,
+        Crate::Storage,
         Crate::Substrate,
     ];
 
@@ -66,6 +82,7 @@ impl Crate {
             Crate::Agent => "myelin-agent",
             Crate::Gdpr => "myelin-gdpr",
             Crate::Client => "myelin-client",
+            Crate::Storage => "myelin-storage",
             Crate::Substrate => "myelin-substrate",
         }
     }
@@ -90,7 +107,19 @@ impl Crate {
             Crate::Gdpr => &[Crate::Tenancy, Crate::Identity],
             // The client tier (below agent/gdpr).
             Crate::Client => &[Crate::Tenancy, Crate::Identity, Crate::Events],
-            // Root-last: the harness depends on everything; nothing depends on it.
+            // The storage-substrate tier (below gdpr): the OLTP tier client + (tenant,
+            // region) RLS guard depends on tenancy (TenantId/Region), identity (Principal —
+            // the verified token), events (the co-located outbox), and gdpr
+            // (PersonalDataHolder — the auto-registered holder). Mirrors
+            // crates/myelin-storage/Cargo.toml. It must NOT depend on -client or -substrate.
+            Crate::Storage => &[
+                Crate::Tenancy,
+                Crate::Identity,
+                Crate::Events,
+                Crate::Gdpr,
+            ],
+            // Root-last: the harness depends on everything (incl. the storage substrate it
+            // wires); nothing depends on it.
             Crate::Substrate => &[
                 Crate::Tenancy,
                 Crate::Identity,
@@ -101,6 +130,7 @@ impl Crate {
                 Crate::Agent,
                 Crate::Gdpr,
                 Crate::Client,
+                Crate::Storage,
             ],
         }
     }
@@ -118,7 +148,7 @@ pub fn is_acyclic() -> bool {
         Done,
     }
 
-    fn visit(node: Crate, marks: &mut [Mark; 10]) -> bool {
+    fn visit(node: Crate, marks: &mut [Mark; 11]) -> bool {
         let idx = node as usize;
         match marks[idx] {
             Mark::Done => return true,
@@ -135,7 +165,7 @@ pub fn is_acyclic() -> bool {
         true
     }
 
-    let mut marks = [Mark::Unvisited; 10];
+    let mut marks = [Mark::Unvisited; 11];
     Crate::ALL.iter().all(|&c| visit(c, &mut marks))
 }
 
@@ -213,17 +243,38 @@ mod tests {
         assert!(!acyclic_2(&[1], &[0]));
     }
 
-    /// Every crate node's `name()` is unique and matches the ten workspace members.
+    /// Every crate node's `name()` is unique and matches the eleven workspace members
+    /// (the §2.9 ten + the documented `myelin-storage` storage-substrate node).
     #[test]
-    fn ten_crates_named() {
+    fn eleven_crates_named() {
         let names: Vec<&str> = Crate::ALL.iter().map(|c| c.name()).collect();
-        assert_eq!(names.len(), 10);
+        assert_eq!(names.len(), 11);
         assert!(names.contains(&"myelin-tenancy"));
+        assert!(names.contains(&"myelin-storage"));
         assert!(names.contains(&"myelin-substrate"));
         // names are unique
         let mut sorted = names.clone();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), 10, "crate names must be unique");
+        assert_eq!(sorted.len(), 11, "crate names must be unique");
+    }
+
+    /// The `myelin-storage` node is NOT a sink and is below the harness: it depends on
+    /// tenancy/identity/events/gdpr, and `myelin-substrate` (the harness) depends on it —
+    /// the storage substrate is wired BY the harness (P-ST-01 → P-007).
+    #[test]
+    fn storage_is_below_the_harness_and_above_its_deps() {
+        assert_eq!(
+            Crate::Storage.deps(),
+            [Crate::Tenancy, Crate::Identity, Crate::Events, Crate::Gdpr],
+            "storage depends on tenancy/identity/events/gdpr (mirrors its Cargo.toml)"
+        );
+        assert!(
+            Crate::Substrate.deps().contains(&Crate::Storage),
+            "the harness (substrate) must depend on the storage substrate it wires"
+        );
+        // storage must NOT pull in downstream crates (client/substrate) — no back-edge.
+        assert!(!Crate::Storage.deps().contains(&Crate::Client));
+        assert!(!Crate::Storage.deps().contains(&Crate::Substrate));
     }
 }

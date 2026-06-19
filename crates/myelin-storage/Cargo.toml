@@ -1,0 +1,36 @@
+[package]
+name = "myelin-storage"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# myelin-storage is the STORAGE SUBSTRATE crate (architecture 05-…/storage.md §47-52, the
+# "implementation crate" note: Storage's runtime code — the tier clients, KMS adapters,
+# BlobStore impls, backup/restore machinery — lands in this new workspace crate). It is the
+# harness-level seam the bootstrap harness (`serve(AppSpec)`) wires every subsystem through;
+# it is NOT a per-subsystem data-access crate (architecture 00 §2.8: there is deliberately
+# no shared storage-API crate spanning subsystems — each service owns its schema, the
+# boundary is the no-cross-db lint). See the crate-level DEVIATION note in src/lib.rs.
+#
+# DAG position (architecture 00 §2.9, root-last): it sits below -gdpr/-client and ABOVE
+# -substrate (the harness depends on the tier clients it wires). It depends on:
+#   - myelin-tenancy   : TenantId / Region — the (tenant, region) partition key (12.1);
+#   - myelin-identity  : Principal — the verified token the tenant is sourced FROM (12.1);
+#   - myelin-events    : the outbox the OLTP DB co-locates (11.1; co-location body is P-ST-02);
+#   - myelin-gdpr      : PersonalDataHolder — every store auto-registers as a holder (1.4/10.1).
+# It MUST NOT depend on -client or -substrate (downstream); such an edge MUST NOT compile.
+[dependencies]
+myelin-tenancy = { path = "../myelin-tenancy" }
+myelin-identity = { path = "../myelin-identity" }
+myelin-events = { path = "../myelin-events" }
+myelin-gdpr = { path = "../myelin-gdpr" }
+serde.workspace = true
+
+# The failure-injection harness is TEST-SUPPORT only (the same posture as a service's
+# main.rs / the harness's own dev usage). The IDOR + pool-saturation DRILLS read the
+# contract-1.8 survival signal set (CrossTenantCount == 0, PoolSaturation) off the
+# telemetry-assertion library. It is a dev-dependency ONLY — nothing in the production
+# build path pulls myelin-harness into the storage crate's runtime DAG.
+[dev-dependencies]
+myelin-harness = { path = "../myelin-harness" }
