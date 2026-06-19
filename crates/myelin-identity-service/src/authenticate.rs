@@ -211,7 +211,11 @@ impl AuthTelemetry {
     /// path). On this floor we record the OCCURRENCE (the count); the latency-bucket histogram lands
     /// with the metrics-health-port binding — the named signal + the per-request emission are what
     /// the gate asserts.
-    fn observe(&self) {
+    ///
+    /// `pub(crate)` so BOTH authenticator bodies (the human/SSO [`HumanSsoAuthenticator`] and the
+    /// machine-identity [`crate::machine_auth::CapabilityAuthenticator`]) emit through the SAME
+    /// telemetry primitive — one signal seam, never two parallel counters (EI-01 §7).
+    pub(crate) fn observe(&self) {
         self.count.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -247,6 +251,20 @@ impl IdorCounters {
     /// The count of rejected path/credential tenant mismatches (attacks the guard caught).
     pub fn attempted_path_mismatch_count(&self) -> u64 {
         self.attempted_path_mismatch_count.load(Ordering::Relaxed)
+    }
+
+    /// Count a request whose effective tenant was (unexpectedly) path-derived — **must stay 0** (the
+    /// IDOR floor). `pub(crate)` so the machine-identity body shares the SAME counter primitive (one
+    /// IDOR seam, never two; EI-01 §7).
+    pub(crate) fn count_path_derived(&self) {
+        self.path_derived_tenant_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a rejected path/credential tenant mismatch (the guard held; the effective tenant was
+    /// still the credential's/token's). `pub(crate)` for the shared machine-identity body.
+    pub(crate) fn count_attempted_path_mismatch(&self) {
+        self.attempted_path_mismatch_count
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 

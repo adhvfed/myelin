@@ -40,7 +40,12 @@
 //! - `authenticate` (4.1) → P-ID-06 (the human/SSO half — LANDED:
 //!   [`authenticate::HumanSsoAuthenticator`] resolves OIDC/SAML/SCIM/passkey/SSH to the polymorphic
 //!   `Principal` over S1, tenant-from-credential, `auth_decision_latency` per request) /
-//!   P-ID-07 (the capability-token + machine-identity half — still a floor).
+//!   P-ID-07 (the capability-token + machine-identity half — LANDED:
+//!   [`machine_auth::CapabilityAuthenticator`] resolves PAT/CI/agent/deploy-key/per-job to the
+//!   polymorphic `Principal`, tenant-from-token, monotone caveat-chain attenuation, the deploy-key
+//!   repo ceiling + the self-hosted-runner one-tenant `SelfHosted` scope (C6), the DPoP-binding
+//!   requirement for long-lived PATs, and the S7-denylist + TTL revocation consult — S7 store body
+//!   → P-ID-14).
 //! - **`check` (4.2)** → **P-ID-09** — the depth-bounded Zanzibar userset-rewrite. Until then,
 //!   [`FailClosedCheck::check`] returns `Deny` for every input (fail-closed, never fail-open).
 //! - `list_objects` (4.3) → P-ID-11 / P-ID-12 — returns `NotYetImplemented` (a leak-free
@@ -55,12 +60,17 @@
 //! Identity's migrations so the booting instance is **not-ready until they apply**.
 
 pub mod authenticate;
+pub mod machine_auth;
 pub mod principal_store;
 pub mod tuple_store;
 
 pub use authenticate::{
     scheme, AuthTelemetry, CredentialVerifier, HumanSsoAuthenticator, IdorCounters,
     StructuralVerifier, VerifiedAssertion,
+};
+pub use machine_auth::{
+    Authority, CapabilityAuthenticator, CapabilityToken, MachineKind, S7Denylist,
+    StructuralTokenVerifier, TokenVerifier,
 };
 pub use principal_store::{
     PrincipalError, PrincipalProfile, PrincipalRow, PrincipalStore, ProfileRef, S1_HOLDER, S1_TABLE,

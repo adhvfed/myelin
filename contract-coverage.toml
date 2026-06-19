@@ -196,11 +196,17 @@ landing = "P-143"
 
 # ──────────────── §4 Identity & access (myelin-identity) ────────────────────────────────────────
 
+# 4.1 authenticate -> Principal: BOTH halves now ship their CDC pair — the human/SSO half
+# (OIDC/SAML/SCIM/passkey/SSH, P-065) and the capability-token + machine-identity half
+# (PAT/CI/agent/deploy-key/per-job, P-066). The two pairs together cover the 4.1 seam.
 [[contract]]
 row = "4.1"
 title = "authenticate -> Principal"
-status = "deferred"
-landing = "P-065"
+status = "covered"
+cdc = [
+    "crates/myelin-identity-service/tests/cdc_4_1_authenticate.rs",
+    "crates/myelin-identity-service/tests/cdc_4_1_machine_identity.rs",
+]
 
 [[contract]]
 row = "4.2"
