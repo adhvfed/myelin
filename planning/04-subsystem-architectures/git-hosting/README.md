@@ -1,16 +1,21 @@
 # Git Hosting & Code Review — Subsystem Architecture (index)
 
 > Phase: `04-subsystem-architectures/git-hosting`. Canonical brief:
-> [`VISION.md`](../../../VISION.md). Build-to surface: the Phase-3 contracts
-> ([`contract-index.md`](../../03-shared-systems-architecture/contract-index.md)). Date: 2026-06-19.
+> [`VISION.md`](../../../VISION.md). **The `architecture/` folder was rewritten from scratch in Phase 5-B**
+> against the RECONCILED, FROZEN shared layer:
+> [`05-refined-shared-systems-architecture/contract-index.md`](../../05-refined-shared-systems-architecture/contract-index.md)
+> + [`00-reconciliation-decisions.md`](../../05-refined-shared-systems-architecture/00-reconciliation-decisions.md)
+> (X-1..X-7, OQ-A..OQ-L). Date: 2026-06-19.
 >
 > Git hosting is the **system of record for source code** and the gravitational centre of Myelin's
 > engineering side: EU-sovereign, GDPR-by-construction, world-scale, agent-native, on the shared
 > identity/permission/event/reference fabric. The differentiator is **not** the git server — it is that
 > this one sits on that fabric and treats agents as first-class, legible, bounded actors.
 >
-> This subsystem is a **two-stage** deliverable: Stage-1 (exploration `sketches/` + design `design/`)
-> committed the direction; Stage-2 (`architecture/`) is the final detailed architecture built on it.
+> This subsystem is a **two-stage** deliverable: Stage-1 (exploration `sketches/` + design `design/` —
+> **PRESERVED, the design record**) committed the direction; Stage-2 (`architecture/`) is the final
+> detailed architecture, now conformed to the frozen Phase-5 contracts. **What changed in the 5-B rewrite is
+> listed in [`architecture/00-overview.md` §0.1](./architecture/00-overview.md).**
 
 ---
 
@@ -38,14 +43,14 @@ fidelity; the visual/token pass is the named follow-on (OQ-12).
 
 | Doc | Covers |
 |---|---|
-| [`00-overview.md`](./architecture/00-overview.md) | Role; owns-vs-delegates; the four-tier component map; the **floors register** (GF-1…GF-9, GF-2b); inherited non-negotiables. |
-| [`01-tech-and-data-model.md`](./architecture/01-tech-and-data-model.md) | **Language/DB choice + justification** (Rust + Postgres + object tier; no divergence); the **git-core embed decision** (TE-8: layered `GitCore` — canonical `git` for the wire + maintenance, `gix`/`libgit2` in-process for reads); the **SHA decision** (TE-23: SHA-1+`sha1dc` default / SHA-256 opt-in, hash-agnostic model); the full data model (git object tier + reftable-on-OLTP + hosting OLTP); the personal-data inventory. |
-| [`02-internals-and-algorithms.md`](./architecture/02-internals-and-algorithms.md) | Smart-transport (protocol-v2/partial-clone/bundle-URI, canonical `git`); the **sandboxed `receive-pack` + in-process Rust push-policy engine**; the ref store CAS; **replication = the DB ref-store transaction as the linearisation point + primary/quorum-WAL pack replicas** (TE-24); GC/repack; **diff-anchoring** (TE-22); the **merge gate + merge queue**; **forks** (TE-26); **monorepo** serving (TE-25); the **code projection** (TE-27); scaling/hot-spots. |
-| [`03-events-contracts-and-glue.md`](./architecture/03-events-contracts-and-glue.md) | The complete **`git.*` taxonomy** (owned) + consumed events; **every glue contract**: ArtifactRef + `#sub`, `project`, `replay`, the outbox envelope, Identity `check`/`list_objects` + the **ReBAC namespace fragment**, `PersonalDataHolder` (+ restriction flag), `ToolDef`s, reserve/settle. |
-| [`04-views-cli-and-api.md`](./architecture/04-views-cli-and-api.md) | The **views** (IA + flows + empty/loading/error + agent-aware/per-viewer states, consuming `design/`); the two **CLI** surfaces (plain git + `myelin`); the HTTP/RPC + **agent-tool** API. |
-| [`05-hard-problems.md`](./architecture/05-hard-problems.md) | Each **hard problem resolved with cited prior art** (HP-1…HP-10) + named floors. |
-| [`06-shared-system-change-requests.md`](./architecture/06-shared-system-change-requests.md) | The **itemized Phase-5 reconciliation list** (Id/Bus/Refs/Search/Storage/Workflow/Agents/GDPR/Tenancy). |
-| [`07-drills-and-open-questions.md`](./architecture/07-drills-and-open-questions.md) | The **quantified drills owed** (D-1…D-9) + **open questions** (OQ-1…OQ-12) + honesty notes. |
+| [`00-overview.md`](./architecture/00-overview.md) | **Changes vs the Phase-4 first pass (§0.1)**; role; owns-vs-delegates; the four-tier component map; the **floors register** (GF-1…GF-9, GF-2b); inherited non-negotiables (incl. the four uniform sandbox guarantees). |
+| [`01-tech-and-data-model.md`](./architecture/01-tech-and-data-model.md) | **Language/DB (carried forward + confirmed)** (Rust + Postgres + object tier); the **git-core embed decision** (TE-8: layered `GitCore`); the **SHA decision** (TE-23: hash-agnostic, SHA-1+`sha1dc` default / SHA-256 opt-in); the data model now with the **frozen `check_status` projection (X-1)**, the **content-anchor fingerprint (OQ-D)**, **per-subject DEK** bodies, and the CDN clone / trust-scoped cache classes. |
+| [`02-internals-and-algorithms.md`](./architecture/02-internals-and-algorithms.md) | Smart-transport; the sandboxed `receive-pack` + in-process Rust policy; the ref-store CAS; **replication** (TE-24); GC/repack; **diff-anchoring as the content-fingerprint 4-state resolver (OQ-D)**; **the merge gate + merge queue implementing the X-1 CheckStatus consumer + `run_attempt` supersession + fork-endorsement + the `ci.result` durable-signal wait**; forks; monorepo; code projection; scaling. |
+| [`03-events-contracts-and-glue.md`](./architecture/03-events-contracts-and-glue.md) | The complete **`git.*` taxonomy** + consumed events (incl. **`ci.check.updated`/`ci.result`**); **every glue contract against the FROZEN shapes**: ArtifactRef + the unified `#sub` grammar, `project`, `replay`, the outbox envelope, Identity `check`/`list_objects` **SetExpr push-down** + the frozen ReBAC fragment (`approve_untrusted_ci`), `PersonalDataHolder` + the ONE erasure posture by reference, `ToolDef`s with the **frozen `requires_approval` defaults**, reserve/settle. |
+| [`04-views-cli-and-api.md`](./architecture/04-views-cli-and-api.md) | The **views** (IA + flows + states, consuming `design/`; incl. the X-1 fork-trust + checks-panel + merge-queue affordances); the two **CLI** surfaces; the HTTP/RPC + **agent-tool** API. |
+| [`05-hard-problems.md`](./architecture/05-hard-problems.md) | Each **hard problem resolved with cited prior art** (HP-0 the X-1 seam … HP-10) + named floors. |
+| [`06-reconciliation-compliance.md`](./architecture/06-reconciliation-compliance.md) | **How this subsystem now IMPLEMENTS the frozen reconciled contracts** (CheckStatus, the `#sub` grammar, the `list_objects` Filter, the erasure posture, REF-3, trust-scoped cache, CDN clone, mirror gate) + the **residual requests for Phase 6** (R-1…R-9). |
+| [`07-drills-and-open-questions.md`](./architecture/07-drills-and-open-questions.md) | The **quantified drills owed** (D-1…D-11, incl. the X-1 seam drill D-10 + the leak-free `list_objects` drill D-11) + **open questions** (OQ-1…OQ-12) + honesty notes. |
 
 ---
 
@@ -64,19 +69,28 @@ fidelity; the visual/token pass is the named follow-on (OQ-12).
   Praefect; "outbox order == ref-update order by construction", BUS-2) — **not** a bespoke per-repo
   consensus group — with **content-addressed packs made durable by a primary + quorum-ack WAL replica
   set** (consistency and durability decoupled). The DB ref index is the recovery tiebreaker.
-- **Diff-anchoring (TE-22):** content anchor + blob-diff remap + **`outdated` fallback** (never silently
-  wrong).
+- **Diff-anchoring (TE-22 / OQ-D):** content anchor with a **BLAKE3 fingerprint**, resolving through the
+  unified 4-state ladder **exact/rebased(moved)/partial(outdated)/tombstone** (never silently wrong).
+- **The Git↔CI check seam (X-1, FROZEN contract 5.9):** Git is the **consumer + gate** — it owns the
+  `check_status` projection, the **monotonic `run_attempt` supersession**, the branch-protection
+  `required`-set policy, and the **fork-endorsement** flow (`untrusted_fork` is neutral for gating until
+  endorsed via `approve_untrusted_ci` or re-run trusted). Git **reads `trust_tier` off the fact** and
+  **never synchronously calls CI**. The merge queue is a durable workflow waking on the rollup `ci.result`.
 - **Forks (TE-26):** shared object pool per network (residency-safe; cross-tenant forks copy). Merge
   queue = single-lane durable workflow; web edit = single-file edit (no 3-way conflict editor v1).
-- **Code search (TE-27):** git emits a **symbol/path/literal/trigram projection**; Search owns the index.
-- **Erasure (GD-1):** **pseudonymous-commit-by-default** (commit-time prerequisite, GIT-1) makes erasure
-  usually a pseudonym-map delete; **history-rewrite** is the supported disruptive path; the immutable-
-  content residual is **`[OPEN — LEGAL]`**.
+- **Code search (TE-27):** git emits a **symbol/path/literal/trigram projection**; Search owns the index;
+  always conjoins the OQ-E `list_objects` `Filter`.
+- **Erasure (the ONE platform posture, contract 10.9 / X-7):** **pseudonymous-commit-by-default** (GIT-1)
+  makes erasure usually a pseudonym-map delete; per-subject DEK crypto-shred for self-authored bodies;
+  **history-rewrite** (an audited op with fork/mirror/clone-cache invalidation) is the disruptive path. The
+  residual is **instantiated by reference, not restated**; the Art. 17 reach is **`[OPEN — LEGAL]`**.
 
 ---
 
 ## Cross-references
+- **Frozen build-to surface (Phase 5):** [`05-refined-shared-systems-architecture/contract-index.md`](../../05-refined-shared-systems-architecture/contract-index.md)
+  + [`00-reconciliation-decisions.md`](../../05-refined-shared-systems-architecture/00-reconciliation-decisions.md).
 - Phase-2 high-level arch: [`02-holistic-architecture/subsystems/git-hosting.md`](../../02-holistic-architecture/subsystems/git-hosting.md).
 - Phase-1 deep-dive: [`01-research/subsystem-deep-dives/git-hosting.md`](../../01-research/subsystem-deep-dives/git-hosting.md).
-- Phase-3 handoff (this subsystem's obligation list): [`03-shared-systems-architecture/README.md`](../../03-shared-systems-architecture/README.md) §5.
+- Phase-3 handoff (superseded by Phase 5): [`03-shared-systems-architecture/README.md`](../../03-shared-systems-architecture/README.md) §5.
 - Binding directives (GIT-1, STOR-5, GD-1): [`02b-doctrine-integration/integration-directives.md`](../../02b-doctrine-integration/integration-directives.md).
