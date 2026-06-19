@@ -21,4 +21,16 @@ myelin-query = { path = "../myelin-query" }
 myelin-agent = { path = "../myelin-agent" }
 myelin-gdpr = { path = "../myelin-gdpr" }
 myelin-client = { path = "../myelin-client" }
+# The storage SUBSTRATE (P-007): serve opens the bounded OLTP pool through it (§3.3) and
+# auto-registers the OLTP store as a PersonalDataHolder (§3.4). The crate_graph DAG already
+# models Substrate → Storage (root-last); this manifest edge realises it.
+myelin-storage = { path = "../myelin-storage" }
 serde.workspace = true
+
+[dev-dependencies]
+# Test-support ONLY: the hello-world serve test reads the contract-1.8 producer signals
+# serve exports back through the harness's telemetry-assertion library (the SAME SignalName
+# set). A dev-dependency so myelin-harness stays OUT of the production crate DAG
+# (architecture §2.9 — the harness is a leaf consumer; nothing in the DAG depends on it).
+myelin-harness = { path = "../myelin-harness" }
+serde_json.workspace = true

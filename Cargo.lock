@@ -121,11 +121,14 @@ dependencies = [
  "myelin-content",
  "myelin-events",
  "myelin-gdpr",
+ "myelin-harness",
  "myelin-identity",
  "myelin-query",
  "myelin-refs",
+ "myelin-storage",
  "myelin-tenancy",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

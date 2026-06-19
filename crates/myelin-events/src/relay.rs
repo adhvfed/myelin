@@ -224,6 +224,36 @@ impl BusTransport for InProcessBus {
     }
 }
 
+/// Forwarding impl so a `Box<dyn BusTransport>` is itself a [`BusTransport`] (added P-S12 →
+/// P-010): the substrate harness ([`crate`]'s `serve`) holds a `Relay<Box<dyn BusTransport>>`
+/// so it can wire EITHER the in-process fake OR EB-04's JetStream-class adapter without making
+/// `serve` generic over the transport. A trivial delegation — every method forwards to the
+/// boxed value — so no behaviour changes; it only lets the relay erase the concrete transport
+/// type. (DEVIATION note, EI-01 §1: this is an additive impl the consumer needs; it does not
+/// change the frozen `put/consume/ack/purge` shape.)
+impl BusTransport for Box<dyn BusTransport> {
+    fn put(
+        &self,
+        subject: &ArtifactRef,
+        envelope: &EventEnvelope,
+        dedup_id: &EventId,
+    ) -> std::result::Result<Delivery, TransportError> {
+        (**self).put(subject, envelope, dedup_id)
+    }
+
+    fn consume(&self, subject_prefix: &str) -> Vec<EventEnvelope> {
+        (**self).consume(subject_prefix)
+    }
+
+    fn ack(&self, consumer: &str, event_id: &EventId) {
+        (**self).ack(consumer, event_id)
+    }
+
+    fn purge(&self) {
+        (**self).purge()
+    }
+}
+
 /// How many failed publish attempts a row gets before the relay dead-letters it (the bounded
 /// retry — never an unbounded retry-storm). EB-04 may tune this; the floor default is 5.
 pub const MAX_PUBLISH_ATTEMPTS: u32 = 5;
