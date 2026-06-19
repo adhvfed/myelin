@@ -1,0 +1,15 @@
+//! @residency-write
+//! GREEN fixture for `residency-pin` — the TENANCY write-boundary (layer-3) slice (P-CP-03 / P-026).
+//! The lint MUST admit this. The cell write boundary pins the row's `region` to the harness-threaded
+//! CELL region (`ctx.region`), NOT to any request field — so a forged request cannot move the row
+//! out of the cell's region; every write asserts `row.region == cell.region` with the cell's region
+//! injected by the harness (refined-arch tenancy §4.3/§5.3 layer 3; ADR-11). This is the
+//! region-pinned write the lint admits.
+pub async fn write_artifact(ctx: &CellCtx, req: &WriteRequest, store: &TenantStore) -> Result<()> {
+    let row = ArtifactRow {
+        tenant_id: req.tenant_id,
+        region: ctx.region,
+        payload_ref: req.payload_ref,
+    };
+    store.insert(row).await
+}
