@@ -329,6 +329,7 @@ version = "0.0.0"
 dependencies = [
  "myelin-events",
  "myelin-gdpr",
+ "myelin-harness",
  "myelin-identity",
  "myelin-storage",
  "myelin-substrate",

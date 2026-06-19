@@ -181,6 +181,37 @@ impl CheckEngine {
         }
     }
 
+    /// The **direct subject strings** of `object#relation` at the zookie snapshot — each either a
+    /// concrete principal id (`p:alice`) or a userset (`team:eng#view`). The ReBAC namespace engine
+    /// (P-ID-10) uses this to walk a **tuple-to-userset** inheritance edge: it reads the parent
+    /// usersets named by the child's `tupleset` relation, then resolves the parent's *compiled
+    /// permission* (not a raw relation) through the permission-aware engine. Scoped to the verified
+    /// `(tenant, region)` — there is no cross-tenant read path (ID-D3).
+    pub fn direct_subjects(
+        &self,
+        scope: &TenantScope,
+        object: &ArtifactRef,
+        relation: &RelName,
+        at: &Consistency,
+    ) -> Vec<String> {
+        let object_id = match object_id_of(object) {
+            Some(id) => id,
+            None => return Vec::new(),
+        };
+        let snapshot = self.snapshot_view(scope, &at.at_least);
+        snapshot
+            .by_object
+            .get(&object_id)
+            .map(|tuples| {
+                tuples
+                    .iter()
+                    .filter(|t| t.relation == relation.0)
+                    .map(|t| t.subject.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Build the zookie-snapshot view: this tenant's tuples whose write zookie is **at-or-before**
     /// the requested snapshot, indexed by object id. Scoped to the verified `(tenant, region)` —
     /// there is no cross-tenant query path.
@@ -296,8 +327,10 @@ impl SnapshotView {
 }
 
 /// Parse a userset subject `"object#relation"` into `(object, relation)`; `None` for a concrete
-/// principal id (no `#`). Exactly one `#` separates the object from the relation.
-fn parse_userset(subject: &str) -> Option<(&str, &str)> {
+/// principal id (no `#`). Exactly one `#` separates the object from the relation. `pub(crate)` so
+/// the namespace engine (P-ID-10) can split a parent userset `team:eng#view` when walking a
+/// tuple-to-userset inheritance edge into the parent's *compiled* permission.
+pub(crate) fn parse_userset(subject: &str) -> Option<(&str, &str)> {
     let (obj, rel) = subject.split_once(USERSET_SEP)?;
     if obj.is_empty() || rel.is_empty() || rel.contains(USERSET_SEP) {
         return None;
