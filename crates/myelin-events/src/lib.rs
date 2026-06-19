@@ -171,6 +171,28 @@
 //! Bus-flavoured `v1→v2→v3`-chain / un-upcastable→DLQ / unknown-forward-field tests + the 2.8
 //! CDC pair — no second registry, no type re-definition.
 //!
+//! ## Status (P-042 / EB-02, 2026-06-19) — the taxonomy grammar validator + the seed token table
+//! EB-02 ships the **one grammar** ([`taxonomy::validate`]) every `EventEnvelope.type_` is
+//! validated against (Bus §6.1: `<subsystem>.<artifact_type>.<event_name>`, lowercase singular
+//! past-tense, tokens `[a-z][a-z0-9_]*`, 2 segments min / 3 when an artifact type clarifies, the
+//! leading token a canonical §6.2 subsystem), the **seed** token table
+//! ([`taxonomy::SEED_EVENT_NAMES`] — the §6.4 representative names), and the **three new tokens**
+//! the reconciliation registered (recon §2): `ci.check.updated` + `ci.result` (the X-1 check seam,
+//! §6.3) and the `initiative` artifact-type token (§6.2 extension), all in
+//! [`taxonomy::new_tokens`]. The structural gate is the red+green fixture pair (the same ratchet
+//! shape the lints use): [`taxonomy::tests::reject_fixture_malformed_names_are_rejected_with_their_rule`]
+//! (RED — uppercase / plural / present-tense / single-segment / unknown subsystem / hyphen /
+//! leading-digit / empty-segment / too-many-segments all rejected with their rule) and
+//! [`taxonomy::tests::admit_fixture_every_seed_name_and_the_three_new_tokens_pass`] (GREEN — every
+//! seed name + the three new tokens admitted). The provider+consumer CDC pair for row 2.9 is
+//! `tests/cdc_2_9_taxonomy.rs` (a PROVIDER that emits canonical-shape types through the
+//! validator + a CONSUMER that admits a canonical type and rejects a malformed one); the
+//! contract-coverage manifest flips 2.9 `deferred → covered` naming it. **FLOOR named (EI-01 §1):**
+//! the per-subsystem dotted-name LIST completion is **EB-24** (each subsystem owns its full list in
+//! M3/M4, validated against THIS grammar); EB-02 is the grammar + seed + the new tokens only. The
+//! `iam.*` family Identity already ships (`myelin-identity::iam_events`) is Identity's OWN §11.2
+//! token set (distinct from the §6.4 `identity.*` Bus seed); both obey this grammar.
+//!
 //! ## Floors named (stubbed bodies → filling prompt)
 //! - **The OLTP binding is modeled in-memory at M0.** There is no live database (the OLTP tier
 //!   client is **P-007 / P-ST-01**; the migration runner is **P-S15**). [`outbox::OUTBOX_MIGRATION`]
@@ -216,6 +238,7 @@ pub mod dedup;
 pub mod envelope;
 pub mod outbox;
 pub mod relay;
+pub mod taxonomy;
 pub mod telemetry;
 pub mod upcast;
 
@@ -224,6 +247,10 @@ pub use consumer::{
     Subscription,
 };
 pub use dedup::{DedupLedger, CONSUMER_DEDUP_MIGRATION};
+pub use taxonomy::{
+    validate as validate_event_type, TaxonomyError, ARTIFACT_TYPE_TOKENS, SEED_EVENT_NAMES,
+    SUBSYSTEM_TOKENS,
+};
 pub use upcast::{RegisterError, UpcastError, UpcasterRegistry};
 pub use telemetry::{
     BusObservations, BusSignal, BusSignals, MetricLabel, MetricRecorder, MetricSample, MetricsSink,
