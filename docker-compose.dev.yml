@@ -1,0 +1,138 @@
+# Myelin dev data-layer stack (Stage 1).
+#
+# STANDARD interfaces so dev<->prod is a CONFIG SWAP, not a code change:
+#   - Postgres 16     : OLTP + outbox + ReBAC tuple store + audit (prod: Scaleway Managed PostgreSQL)
+#   - RustFS          : S3-compatible object store, Apache-2.0 (prod: Scaleway Object Storage)
+#   - Valkey 8        : cache, BSD Redis fork                     (prod: Scaleway Managed Redis)
+#   - NATS 2.10 (-js) : durable JetStream bus, Apache-2.0        (prod: NATS container on Scaleway compute)
+#
+# Bring up (blocks until every healthcheck passes):
+#   docker compose -f docker-compose.dev.yml up -d --wait
+#
+# The credentials/ports below are the DEV defaults the myelin-config layer points at
+# (see crates/myelin-config + docs/dev-stack.md). They are NOT secrets — dev only.
+
+name: myelin-dev
+
+services:
+  # ---------------------------------------------------------------------------
+  # Postgres 16 — OLTP + outbox + ReBAC tuple store + audit.
+  # The init script (scripts/pg-init/) enables the (tenant, region) RLS conventions:
+  # a non-superuser app role that does NOT bypass RLS, and a FORCE ROW LEVEL SECURITY
+  # default so every tenant-scoped table is RLS-ready from the first migration.
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16
+    container_name: myelin-postgres
+    environment:
+      POSTGRES_USER: myelin_admin
+      POSTGRES_PASSWORD: myelin_dev_pw
+      POSTGRES_DB: myelin
+      # Deterministic, locale-stable ordering for the ReBAC tuple JOINs in dev.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "5433:5432"
+    volumes:
+      - myelin-pg-data:/var/lib/postgresql/data
+      - ./scripts/pg-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # pg_isready against the app DB + role; "up -d --wait" blocks until this passes.
+      test: ["CMD-SHELL", "pg_isready -U myelin_admin -d myelin"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # RustFS — Apache-2.0, S3-compatible object store (PREFERRED over AGPL MinIO).
+  # Static creds in dev; aws-sdk-s3 talks to it with a custom endpoint + path-style.
+  # ---------------------------------------------------------------------------
+  rustfs:
+    image: rustfs/rustfs:latest
+    container_name: myelin-rustfs
+    environment:
+      RUSTFS_ACCESS_KEY: myelin_dev_access
+      RUSTFS_SECRET_KEY: myelin_dev_secret
+      RUSTFS_ADDRESS: "0.0.0.0:9000"
+      RUSTFS_CONSOLE_ENABLE: "true"
+    ports:
+      - "9000:9000"   # S3 API endpoint (S3_ENDPOINT=http://localhost:9000)
+    volumes:
+      - myelin-rustfs-data:/data
+    command: ["/data"]
+    healthcheck:
+      # RustFS exposes a health endpoint on the S3 port; fall back to a TCP probe.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9000/health || curl -fsS http://localhost:9000/ -o /dev/null || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  # The default bucket (S3_BUCKET=myelin-dev). A one-shot init container that creates
+  # the bucket via the AWS CLI against RustFS, then exits 0. Path-style addressing
+  # (--endpoint-url + the s3 verbs) mirrors the aws-sdk-s3 force-path-style dev config.
+  rustfs-init:
+    image: amazon/aws-cli:latest
+    container_name: myelin-rustfs-init
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: myelin_dev_access
+      AWS_SECRET_ACCESS_KEY: myelin_dev_secret
+      AWS_DEFAULT_REGION: fr-par
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        aws --endpoint-url http://rustfs:9000 s3 mb s3://myelin-dev 2>/dev/null || true;
+        aws --endpoint-url http://rustfs:9000 s3 ls s3://myelin-dev >/dev/null;
+        echo "bucket myelin-dev ready";
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # Valkey 8 — BSD Redis fork, the cache tier (prod: Scaleway Managed Redis).
+  # ---------------------------------------------------------------------------
+  valkey:
+    image: valkey/valkey:8
+    container_name: myelin-valkey
+    ports:
+      - "6380:6379"
+    volumes:
+      - myelin-valkey-data:/data
+    command: ["valkey-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD-SHELL", "valkey-cli ping | grep -q PONG"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  # ---------------------------------------------------------------------------
+  # NATS 2.10 with JetStream (-js) — Apache-2.0 durable bus.
+  # ---------------------------------------------------------------------------
+  nats:
+    # The alpine variant ships a shell + wget so the JetStream /healthz probe below can run
+    # in-container (the scratch-based nats:2.10 has no /bin/sh for an exec healthcheck).
+    image: nats:2.10-alpine
+    container_name: myelin-nats
+    # -js   : enable JetStream (durable streams/consumers, the BusTransport backing).
+    # -m    : HTTP monitoring port 8222, used by the healthcheck below.
+    command: ["-js", "-m", "8222"]
+    ports:
+      - "4222:4222"   # client port (NATS_URL=nats://localhost:4222)
+      - "8222:8222"   # monitoring
+    volumes:
+      - myelin-nats-data:/data
+    healthcheck:
+      # The /healthz endpoint on the monitoring port reports JetStream readiness.
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:8222/healthz | grep -q ok || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+volumes:
+  myelin-pg-data:
+  myelin-rustfs-data:
+  myelin-valkey-data:
+  myelin-nats-data:

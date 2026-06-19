@@ -85,6 +85,13 @@ members = [
     # cargo-level source-scanning checks (red + green fixtures) run as CI jobs over the
     # workspace source + the fixture matrix. See crates/myelin-lints/Cargo.toml.
     "crates/myelin-lints",
+    # The env-driven CONFIG layer (Stage 1 / infra): the dev<->prod CONFIG SWAP seam. Reads the
+    # standard-interface endpoints (DATABASE_URL, S3_*, REDIS_URL, NATS_URL, MYELIN_REGION) from
+    # the environment so moving from the docker-compose dev stack to Scaleway (fr-par) is a
+    # config change, not a code change. A LEAF, zero-myelin-dep, zero-client-dep crate — it
+    # keeps `cargo build --workspace` DB-free; the real backend clients live behind the
+    # `integration` feature in the crates that own the trait impls.
+    "crates/myelin-config",
 ]
 
 # Workspace-wide dependency versions. Pinned once here so every glue crate shares
@@ -105,6 +112,47 @@ toml = "0.8"
 # self-describing content-address string + the fs key path.
 blake3 = "1"
 hex = "0.4"
+
+# ----------------------------------------------------------------------------------------------
+# REAL-BACKEND CLIENTS (Stage 1 / infra). Declared here once for a single pinned shape, but
+# referenced ONLY behind the `integration` cargo feature in the crates that own the trait impls
+# (BlobStore in -storage, BusTransport in -events, the OLTP client + outbox + ReBAC tuple store
+# in -substrate/-storage/-identity). A workspace.dependencies entry compiles NOTHING on its own —
+# it is pulled only by a crate that lists it under `[dependencies]`/an optional dep. So the
+# default `cargo build --workspace` stays DB-FREE; only `--features integration` pulls these.
+# ----------------------------------------------------------------------------------------------
+
+# OLTP client. sqlx with RUNTIME-checked queries (sqlx::query / query_as — NOT the query!
+# compile-time macros), so the build never needs a live DB. rustls (no system OpenSSL),
+# migrate for the forward-only DDL, uuid/chrono for the tuple/audit columns.
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "postgres",
+    "migrate",
+    "uuid",
+    "chrono",
+] }
+# async runtime for the real-backend tests/impls.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+
+# Object store: aws-sdk-s3 against a custom endpoint + path-style addressing (RustFS/Scaleway).
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }
+# rustls-aware HTTP client (no system OpenSSL) — required so put/get actually dispatch over HTTP.
+aws-sdk-s3 = { version = "1", default-features = false, features = [
+    "behavior-version-latest",
+    "rt-tokio",
+    "default-https-client",
+] }
+aws-credential-types = "1"
+
+# Cache: Valkey/Redis via fred.
+fred = { version = "10", default-features = false, features = ["i-std"] }
+
+# Durable bus: NATS JetStream via async-nats.
+async-nats = "0.38"
+
+# The env-config layer (the dev<->prod swap seam).
+myelin-config = { path = "crates/myelin-config" }
 
 [workspace.package]
 edition = "2021"
