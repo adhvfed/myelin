@@ -3,8 +3,9 @@
 //! Built across the CP-M1 prompts: **P-CP-05 / P-080** (the registry tables + the HARD placement
 //! invariant), **P-CP-06 / P-081** (`discover` — PII-free tenant-grain routing, off the hot path,
 //! client-cacheable fail-static), and **P-CP-07 / P-082** (`place(region, requested_tier)` +
-//! two-phase signup — PII born inside the cell; see [`place`]). The remaining routing/attestation
-//! answers (`placement_of` / `residency_verify`) land in P-CP-08 / P-CP-09.
+//! two-phase signup — PII born inside the cell; see [`place`]), and **P-CP-08 / P-084**
+//! (`placement_of(tenant_id)` — the routing answer + the gateway misroute-rejection, layer 4, CP-D2;
+//! see [`placement_of`]). The remaining attestation answer (`residency_verify`) lands in P-CP-09.
 //!
 //! **Owning architecture doc:**
 //! `planning/05-refined-shared-systems-architecture/tenancy-and-control-plane.md`
@@ -60,11 +61,19 @@
 //!   multi-cell `CrossCellPointer` resolution is the **M5 floor, P-CP-19 / P-CP-20** (bridge
 //!   resolution live + the fan-out). The schema field is a `Vec<CellId>` (so the shape is frozen)
 //!   but every v1 placement carries exactly one member cell (its home), asserted in tests.
-//! - **The remaining routing/attestation answers** (`placement_of`, `residency_verify`) are the
-//!   **next prompts P-CP-08 / P-CP-09**. `discover` is LIVE (P-CP-06 / P-081); `place` + two-phase
-//!   signup is LIVE (P-CP-07 / P-082, [`place`]) — it emits the `placement_count` + `provision_latency`
-//!   routing signals ([`place::PlacementSignals`]); the `placement_of` answer + gateway misroute-reject
-//!   land in P-CP-08.
+//! - **`placement_of` + the gateway misroute-reject (layer 4, CP-D2) are LIVE (P-CP-08 / P-084,
+//!   [`placement_of`]).** [`Registry::placement_of`] returns the frozen routing tuple `{region,
+//!   home_cell, member_cells, isolation_tier, status}` (`member_cells` single-element in v1 — the
+//!   floor); [`CellGateway::route`] REJECTS (does not proxy) + REDIRECTS + AUDITS a request for a
+//!   `tenant_id` a cell doesn't host, reading **0** cross-tenant/cross-cell rows (the CP-D2 zero) and
+//!   emitting `misroute_count`. The remaining attestation answer (`residency_verify`) is the next
+//!   prompt **P-CP-09**. `discover` is LIVE (P-CP-06 / P-081); `place` + two-phase signup is LIVE
+//!   (P-CP-07 / P-082, [`place`]) — it emits the `placement_count` + `provision_latency` routing
+//!   signals ([`place::PlacementSignals`]).
+//! - **`member_cells` single-element / resolution always same-cell in v1 (P-CP-08 floor).** The
+//!   gateway accepts a request IFF the tenant's `home_cell` is THIS cell; the multi-cell resolution
+//!   path (a member cell serving a slice, the `CrossCellPointer` bridge) goes live in **M5
+//!   (P-CP-19 / P-CP-20)**.
 //! - **The GeoDNS/anycast discovery edge is `[OPEN → P4 (infra)]`** (architecture §7.3) — a latency
 //!   optimisation that fronts the PII-free discovery contract with a geo-routed edge. **v1 is
 //!   CP-lookup + client cache** ([`discover::DiscoveryCache`]); the edge is an infra follow-on, not a
@@ -89,11 +98,15 @@
 pub mod discover;
 pub mod holder;
 pub mod place;
+pub mod placement_of;
 pub mod provision;
 pub mod registry;
 pub mod schema;
 
 pub use discover::{DiscoverKey, DiscoveryCache, DiscoverySignals, RouteTuple};
+pub use placement_of::{
+    CellGateway, GatewayReject, Misroute, MisrouteAudit, MisrouteAuditRecord, PlacementOf,
+};
 pub use provision::{
     ProvisionFailure, ProvisionVerdict, ProvisioningGate, ProvisioningSignals, STEP_ACTIVATE,
     STEP_READINESS, STEP_RESTORE_VERIFY,
@@ -507,5 +520,81 @@ mod tests {
             .discover(&DiscoverKey::Slug("acme".into()), 30)
             .expect("the slug resolves to a route");
         assert_eq!(GatewayRoute::from_route(&by_slug).target_endpoint, "cell.eu-west.myelin.eu");
+    }
+
+    /// **CDC pair for the `placement_of` half of 12.3 (provider + consumer) — P-CP-08.** The PROVIDER
+    /// is this crate's [`Registry::placement_of`] answering the frozen routing tuple `{region,
+    /// home_cell, member_cells, isolation_tier, status}` from `tenant_placement`. The CONSUMER stands
+    /// in for a **cell gateway** (architecture §5.3 layer 4): it takes the answer and decides — purely
+    /// off the routing fields — whether it hosts the tenant, NEVER reading the tenant's data. It can
+    /// read ONLY the routing fields (there is no grant/principal/permission on [`PlacementOf`]); if the
+    /// `placement_of` shape drifts (a field added/removed/retyped) the consumer stops compiling — the
+    /// point of a glue-crate CDC.
+    #[test]
+    fn cdc_12_3_placement_of_provider_consumer() {
+        use myelin_tenancy::{CellId, Region, TenantId};
+
+        /// A stand-in **cell gateway** consumer: it reads the `placement_of` routing answer and
+        /// decides whether THIS cell hosts the tenant — purely from the routing fields, never from the
+        /// tenant's data. This is the read side of the layer-4 misroute decision.
+        struct GatewayHostsDecision {
+            home_cell: CellId,
+            region: Region,
+            member_cells: Vec<CellId>,
+            isolation_tier: IsolationKind,
+            status: PlacementStatus,
+        }
+        impl GatewayHostsDecision {
+            fn from_answer(a: &crate::placement_of::PlacementOf) -> GatewayHostsDecision {
+                GatewayHostsDecision {
+                    home_cell: a.home_cell.clone(),
+                    region: a.region.clone(),
+                    member_cells: a.member_cells.clone(),
+                    isolation_tier: a.isolation_tier,
+                    status: a.status,
+                }
+            }
+            /// The layer-4 decision: this cell hosts the tenant IFF its home cell is `this_cell`.
+            fn this_cell_hosts(&self, this_cell: &CellId) -> bool {
+                &self.home_cell == this_cell
+            }
+        }
+
+        // PROVIDER: a placed tenant homed on cell-w-1, in eu-west.
+        let mut registry = Registry::new();
+        registry.insert_cell(Cell {
+            cell_id: CellId::from_token("cell-w-1"),
+            region: Region::new("eu-west"),
+            status: CellStatus::Active,
+            isolation_kind: IsolationKind::Pool,
+            capacity: Capacity { tenants_max: 1000, write_qps_max: 5000, storage_bytes_max: 1 << 40 },
+            utilisation: 5,
+            version: 1,
+            endpoint: "cell.eu-west.cell-w-1.myelin.eu".into(),
+        });
+        registry
+            .place_tenant(TenantPlacement {
+                tenant_id: TenantId::from_token("01J0ACME"),
+                region: Region::new("eu-west"),
+                home_cell: CellId::from_token("cell-w-1"),
+                isolation_tier: IsolationKind::Pool,
+                slug: "acme".into(),
+                status: PlacementStatus::Active,
+                member_cells: vec![CellId::from_token("cell-w-1")],
+            })
+            .expect("the single-region placement is admitted");
+
+        // PROVIDER answers `placement_of`; CONSUMER decides hosting off the frozen routing tuple.
+        let answer = registry
+            .placement_of(&TenantId::from_token("01J0ACME"))
+            .expect("the placed tenant resolves to a placement_of answer");
+        let decision = GatewayHostsDecision::from_answer(&answer);
+        assert_eq!(decision.region.as_str(), "eu-west");
+        assert_eq!(decision.member_cells.len(), 1, "v1 member_cells single-element");
+        assert_eq!(decision.isolation_tier, IsolationKind::Pool);
+        assert_eq!(decision.status, PlacementStatus::Active);
+        // The home cell hosts; a different cell does NOT (the layer-4 decision, off routing only).
+        assert!(decision.this_cell_hosts(&CellId::from_token("cell-w-1")), "the home cell hosts");
+        assert!(!decision.this_cell_hosts(&CellId::from_token("cell-w-2")), "a different cell misroutes");
     }
 }
