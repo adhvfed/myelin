@@ -22,8 +22,21 @@
 //! the M0 ratchet (EI-01 §5): any drift in a signature here breaks every consumer's build
 //! *now*, never silently.
 //!
-//! **This prompt ships NO service, NO algorithm, and NO event tokens.** The `iam.*` event
-//! tokens + their `EventEnvelope` projections are the *next* prompt (P-ID-02 → P-023).
+//! **P-ID-01 ships NO service, NO algorithm, and NO event tokens.** The `iam.*` event
+//! tokens + their `EventEnvelope` projections are P-ID-02 (P-023) — see [`iam_events`].
+//!
+//! ## What P-ID-02 (P-023) adds: the `iam.*` tokens + their envelope projections
+//! [`iam_events`] registers the three `iam.*` event tokens (architecture §11.2:
+//! [`iam_events::IAM_TUPLE_WRITTEN`], [`iam_events::IAM_ROLE_GRANTED`],
+//! [`iam_events::IAM_BREAK_GLASS`]) and their `EventEnvelope` projections
+//! ([`iam_events::IamEventProjection`]) with **opaque-`principal_id`-only attribution** — the
+//! erasable `profile_ref` never enters the immutable envelope, so the GDPR
+//! erasure-vs-immutability split (EI-04 §1) is baked into the shape at M0. It also declares
+//! the §1.8 telemetry signal-name constants Identity owns ([`iam_events::signals`]). The
+//! projection is expressed as an identity-owned compile-time descriptor (NOT an
+//! `myelin_events::EventEnvelope` import) because identity is a DAG sink — see the
+//! DAG-deviation note in [`iam_events`]. **Floor:** the emit bodies land in M1
+//! (`iam.tuple_written` → P-ID-08); the Bus taxonomy seed validator is EB-02 / P-042.
 //!
 //! ## Reconciliation with the P-001 substrate skeleton
 //! P-001 stood up a partial skeleton of this surface (`Principal{id, kind, tenant}`, a
@@ -62,6 +75,13 @@
 //!   fragments (P-ID-24/26/27/29/30, closed by P-ID-30).
 //! - the `FailStatic` bound (4.11) → `myelin-substrate` `FailStatic<T>` (P-S18) wired to
 //!   Identity's `W` (the `[OPEN — LEGAL]` L-1 number; the structural bound ships now).
+
+pub mod iam_events;
+
+pub use iam_events::{
+    signals, IamEventProjection, IamSubjectRef, IAM_BREAK_GLASS, IAM_EVENT_TOKENS,
+    IAM_ROLE_GRANTED, IAM_TUPLE_WRITTEN,
+};
 
 use myelin_tenancy::{ArtifactRef, Region, TenantId};
 use serde::{Deserialize, Serialize};
