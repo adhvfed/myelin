@@ -206,6 +206,36 @@
 //!   records into); the real seam bindings land with their subsystems (Id P-ID-20, Search M2, Refs
 //!   M2, Bus P-092/P-093, ledger P-GA-15). The mutation floor on the six-step ordering + the
 //!   idempotent short-circuit + the 0-recoverable-in-backup verify is mandatory-core.
+//! - **GD-4 granularity wiring (complete) + the structural GDPR floor — by reference to X-7 (P-ST-10
+//!   / contract 11.4 the GD-4 granularity + structural-floor half — global P-101)** is now
+//!   IMPLEMENTED in [`gd4`]: it COMPLETES the P-099 [`erase`] algorithm's GD-4 half. (1) **GD-4
+//!   granularity COMPLETENESS:** [`gd4::DataClass`] enumerates the storage.md §5.1 decision-rule table
+//!   and [`gd4::DataClass::granularity`] routes EVERY class to its correct granularity, proven 0
+//!   misrouted by [`gd4::assert_gd4_table_complete`] (the dated green artifact). This adds the THIRD
+//!   granularity the DEK key-choice rule alone could not express — **tenant offboarding = the L1
+//!   per-tenant KEK** ([`gd4::KeyGranularity::PerTenantKek`]), the level ABOVE the per-subject /
+//!   per-tenant DEKs ([`gd4::KeyGranularity::PerSubjectDek`] / `PerTenantDek`). It is WIRED to the
+//!   existing P-095 [`encryption::key_class_for`] rule via [`gd4::granularity_of_key_class`] +
+//!   [`gd4::key_choice_granularity`] (the DEK key-choice and the granularity model agree by
+//!   construction — never a second rule). (2) **The structural GDPR floor (X-7's structural half):**
+//!   [`gd4::StructuralErasureFloor::verify`] proves the three guarantees that hold for ALL
+//!   free-text/immutable content — the per-subject DEK crypto-shred lever renders content
+//!   unrecoverable, the destroyed DEK is EXCLUDED from the backup snapshot (crypto-shred reaches
+//!   backups by construction, §7.5 — `recoverable_in_backup == 0`), and the pseudonym-map shred reach
+//!   is the Id step (P-099 step 1). It REUSES the SAME P-058 [`kms::KmsEngine`] the encrypted stores
+//!   resolve through (never a parallel key store) and the P-099 [`erase::EraseHolders`] seam set (the
+//!   structural reach IS the algorithm's reach — [`gd4::structural_reach_uses_erase_seams`], never a
+//!   second reach). (3) **The residual handled BY REFERENCE (X-7), never restated:**
+//!   [`gd4::RESIDUAL_POSTURE_REF`] is the ONLY thing Storage says about the residual — *"handled per
+//!   the platform erasure posture in 00-reconciliation §X-7 (contract 10.9)"* —
+//!   [`gd4::assert_no_local_residual_statement`] is the structural assertion the TESTS make that NO
+//!   Storage-local residual statement exists (§5.3 / C7: one platform residual posture, not five).
+//!   **Floors named in [`gd4`]:** the residual lawful-basis is `[OPEN → P6/LEGAL]` (counsel/DPO
+//!   ratifies ONCE for all five subsystems — the structural floor ships regardless); the git
+//!   crypto-shred reach (reflogs/bitmaps/pack-tier backups) is the Git **M3 reach P-ST-24 (global
+//!   P-253)**; the CI inline-PII log-segment per-subject DEK wiring (C1) is the **M4 follow-on
+//!   P-ST-27** (its GRANULARITY is fixed here as a named per-subject class). The mutation floor on the
+//!   class→granularity routing is mandatory-core (≥ 80%).
 //! - **Continuous WAL archiving + base backups + PITR (P-ST-11 / contract 11.5 — global P-059)**
 //!   is now IMPLEMENTED in [`backup`]: [`backup::ContinuousArchiver`] ships sealed WAL segments
 //!   off-host continuously (strictly forward, append-only) + takes periodic [`backup::BaseBackup`]s,
@@ -310,6 +340,7 @@ pub mod backup;
 pub mod blob;
 pub mod encryption;
 pub mod erase;
+pub mod gd4;
 // The minimal cache seam (Stage 1 / infra — NEW). No cache trait existed before; this is the
 // one-line-swap Cache trait (in-memory floor + Valkey/Redis backing behind `integration`).
 pub mod cache;
@@ -363,6 +394,11 @@ pub use encryption::{
 pub use erase::{
     BusErase, CryptoShredErase, EpochMillis, EraseError, EraseHolders, ErasureLedgerSink,
     ErasureReceipt, PseudonymShred, RefsTombstone, SearchPurge,
+};
+pub use gd4::{
+    assert_gd4_table_complete, assert_no_local_residual_statement, granularity_of_key_class,
+    key_choice_granularity, structural_reach_uses_erase_seams, DataClass, Gd4TableReport,
+    KeyGranularity, StructuralErasureFloor, StructuralFloorReport, RESIDUAL_POSTURE_REF,
 };
 pub use holder::{register_holder, BlobStoreHolder, OltpHolderRegistration, OltpStoreHolder};
 pub use key_origin::{
