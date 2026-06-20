@@ -110,6 +110,7 @@
 //! reindex** is the follow-on, landing in **SRCH-P15** once the index exists; the DEK is NOT the
 //! whole erasure answer. No index / layout / migration / real ciphertext / real vectors ship here.
 
+pub mod compiler;
 pub mod dek;
 pub mod engine;
 pub mod erasure_posture;
@@ -120,6 +121,11 @@ pub mod residency;
 pub mod shell;
 pub mod vector;
 
+pub use compiler::{
+    compile, render, CompileError, CompiledPlan, ConjoinedPlan, FieldDecl, FieldKind, FieldSchema,
+    FtClause, PostFetchPredicate, Sort, StructuredClause, VectorBranch, FT_BODY_FIELD,
+    SEMANTIC_FIELD, SORT_FIELD,
+};
 pub use dek::{srch_p03_inherited_gates, hyok_skips_index, InheritedGate, SearchDekPin};
 pub use engine::{
     AclFilter, Hit, IndexBackend, IndexDocument, IndexError, TantivyBackend, ORDER_KEY_FIELD,
