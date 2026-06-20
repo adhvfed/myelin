@@ -45,8 +45,9 @@
 //!   NOTIF-P27).
 //! - **The contract BODIES** behind every carrier here — `list_inbox` (NOTIF-P5, landed),
 //!   `mark/snooze/mark_all_read` (NOTIF-P6, landed — see [`read_state`]), `humanise` (NOTIF-P9),
-//!   `define_notif_rule` (NOTIF-P8), `DeliveryAdapter` delivery fabric (NOTIF-P16). The carriers are
-//!   SHAPES; the algorithms are the follow-ons.
+//!   `define_notif_rule` (NOTIF-P8, landed — see [`define_rule`]: the registration seam + the
+//!   stubbed Notif-owned default reason set), `DeliveryAdapter` delivery fabric (NOTIF-P16). The
+//!   carriers are SHAPES; the algorithms are the follow-ons.
 //!
 //! The shell carries NO mandatory-core algorithm module (it is the boot lifecycle + frozen type
 //! shapes), so there is no mutation-score floor on this prompt — stated explicitly per the
@@ -67,6 +68,7 @@ use serde::{Deserialize, Serialize};
 // lint-fixture proof (the three schema gates bite) lives in `tests/lint_fixtures.rs` over RED/GREEN
 // fixtures under `tests/fixtures/` (which the lint-gate excludes by the `/fixtures/` convention).
 pub mod cli;
+pub mod define_rule;
 pub mod holder;
 pub mod list_inbox;
 pub mod migrations;
@@ -76,6 +78,10 @@ pub mod router;
 pub mod schema;
 
 pub use cli::{inbox_list, inbox_read, inbox_show, inbox_snooze, CliView, InboxShow};
+pub use define_rule::{
+    define_notif_rule, platform_default_reason, platform_default_rules, Classification, DedupTpl,
+    DefineRuleError, NotifRule, NotifRuleRegistry,
+};
 pub use holder::{
     notif_history_holder, notif_store_classifier, register_notif_holder, NotifBacking,
     NotifHistoryHolder, NotifHolderRegistration, RestrictSet, NOTIF_OLTP_STORE,
