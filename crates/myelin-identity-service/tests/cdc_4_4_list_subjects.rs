@@ -29,7 +29,7 @@ use myelin_identity::{
 };
 use myelin_identity_service::{
     namespace::{FragmentDef, PermissionRule, Userset},
-    ReverseIndex, ReverseIndexConsumer, StoreBackedCheck, TupleStore,
+    ReverseIndex, ReverseIndexConsumer, StoreBackedCheck, TupleStore, WATCHER_RELATION,
 };
 use myelin_storage::TenantScope;
 use myelin_tenancy::{Region, TenantId};
@@ -89,18 +89,23 @@ fn provider(scope: &TenantScope, grants: &[TupleDelta]) -> StoreBackedCheck {
     }
 
     let svc = StoreBackedCheck::with_index(store, index);
-    // An `issue` fragment: `approve = approver ∪ lead` (the HITL approver-set permission).
-    let _ = svc.admit_fragment_def(&FragmentDef {
-        object_type: ObjectType("issue".into()),
-        relations: vec![RelName("approver".into()), RelName("lead".into())],
-        permissions: vec![PermissionRule {
-            permission: Permission("approve".into()),
-            rewrite: Userset::Union(vec![
-                Userset::Relation(RelName("approver".into())),
-                Userset::Relation(RelName("lead".into())),
-            ]),
-        }],
-    });
+    // An `issue` fragment: `approve = approver ∪ lead` (the HITL approver-set permission). The issue is
+    // also WATCHABLE (P-ID-23, C8) so the Notif read-fanout consumer (`list_subjects(issue, watcher)`)
+    // is exercised on the SAME provider — the third consumer row 4.4 names.
+    let _ = svc.admit_fragment_def(
+        &FragmentDef {
+            object_type: ObjectType("issue".into()),
+            relations: vec![RelName("approver".into()), RelName("lead".into())],
+            permissions: vec![PermissionRule {
+                permission: Permission("approve".into()),
+                rewrite: Userset::Union(vec![
+                    Userset::Relation(RelName("approver".into())),
+                    Userset::Relation(RelName("lead".into())),
+                ]),
+            }],
+        }
+        .watchable(),
+    );
     svc
 }
 
@@ -221,6 +226,39 @@ fn cdc_4_4_explain_trace_is_non_empty_and_correct() {
         deny_trace.steps.last().unwrap().starts_with("DENY"),
         "a non-approver's trace ends in DENY (never a silent allow): {:?}",
         deny_trace.steps
+    );
+}
+
+/// **The 4.4 Notif read-fanout consumer (P-ID-23, C8): `list_subjects(object, watcher)` flattens the
+/// watcher set the Notif fanout delivers to.** The third consumer row 4.4 names ("Notif read-fanout").
+/// `issue:PROJ-1` is watched by alice + bob (not the approver carol who does not watch);
+/// `list_watchers_in` returns EXACTLY the watchers — the Notif fanout delivers to them and no one else
+/// (a non-watcher never gets the notification, so the humanised-tombstone path has no title to leak).
+#[test]
+fn cdc_4_4_notif_read_fanout_flattens_the_watcher_set() {
+    let s = scope("acme");
+    let svc = provider(
+        &s,
+        &[
+            grant("issue:PROJ-1", WATCHER_RELATION, "p:alice"),
+            grant("issue:PROJ-1", WATCHER_RELATION, "p:bob"),
+            // carol is an approver but does NOT watch — she must not be in the fanout set.
+            grant("issue:PROJ-1", "approver", "p:carol"),
+            // a different issue's watcher must not leak into PROJ-1's fanout.
+            grant("issue:PROJ-2", WATCHER_RELATION, "p:dave"),
+        ],
+    );
+    let tree = svc.list_watchers_in(&s, &ObjectId("issue:PROJ-1".into()), &at_latest());
+    assert_eq!(
+        tree.relation,
+        RelName(WATCHER_RELATION.into()),
+        "the fanout expands the watcher relation"
+    );
+    let watchers = admin_inspector_renders(&tree);
+    assert_eq!(
+        watchers,
+        vec!["p:alice".to_string(), "p:bob".into()],
+        "the Notif fanout delivers to exactly the watchers (carol does not watch; PROJ-2's dave absent)"
     );
 }
 

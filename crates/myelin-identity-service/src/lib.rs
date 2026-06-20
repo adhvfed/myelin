@@ -110,7 +110,7 @@ pub use reverse_index::{
 };
 pub use namespace::{
     core_hierarchy, AdmitReject, FragmentDef, NamespaceEngine, PermissionRule, Userset,
-    MAX_RULE_DEPTH,
+    MAX_RULE_DEPTH, WATCHER_RELATION,
 };
 // `StoreBackedCheck` is defined below in this module; re-exported at the crate root for callers.
 pub use machine_auth::{
@@ -1038,6 +1038,28 @@ impl StoreBackedCheck {
         let expand = Expand::new(self.tuples.clone(), namespace, self.index.clone());
         let object_type = ObjectType(infer_object_type(&object.0));
         expand.list_subjects(scope, object, &object_type, permission, at)
+    }
+
+    /// **The Notif read-fanout entry (P-ID-23, C8): `list_watchers(object) → SubjectTree` over the
+    /// frozen [`WATCHER_RELATION`].** Notif's ambient-unread fanout for a watchable object (a Chat
+    /// channel, an Issue, a KN page) is `list_subjects(object, watcher)` — served by the SAME S8
+    /// reverse index at 50k-member density (the expand density path), an ORDINARY direct-relation
+    /// Expand, never a bespoke per-subscriber scan. This is a thin, named wrapper over
+    /// [`StoreBackedCheck::list_subjects_in`] with the `watcher` permission fixed (one primitive — the
+    /// fanout reuses the expand, it is not a second engine), so Notif calls ONE documented entry and
+    /// the `watcher` relation name is not stringly-typed at the call site.
+    ///
+    /// The verified `(tenant, region)` scope is carried explicitly (the ABI trait method cannot — a
+    /// tenant-less fanout has no partition and is a leak). Returns the flattened watcher
+    /// [`myelin_identity::SubjectTree`] `{object, relation: watcher, members, zookie}`; a consumer
+    /// stamps the zookie for read-your-writes (a just-added watcher is seen at the snapshot).
+    pub fn list_watchers_in(
+        &self,
+        scope: &myelin_storage::TenantScope,
+        object: &myelin_identity::ObjectId,
+        at: &Consistency,
+    ) -> myelin_identity::SubjectTree {
+        self.list_subjects_in(scope, object, &Permission(WATCHER_RELATION.to_string()), at)
     }
 
     /// **The scoped, LIVE `explain` (P-ID-13) — the userset-rewrite trace for the admin inspector /

@@ -1986,6 +1986,7 @@ dependencies = [
 name = "myelin-identity-service"
 version = "0.0.0"
 dependencies = [
+ "myelin-agent",
  "myelin-client",
  "myelin-events",
  "myelin-gdpr",

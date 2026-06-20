@@ -79,3 +79,10 @@ myelin-harness = { path = "../myelin-harness" }
 # client never enters the identity-service production DAG; the CDC models a DOWNSTREAM consumer
 # of Identity (every other service is such a caller).
 myelin-client = { path = "../myelin-client" }
+# P-ID-23 (P-134) ID-D5 re-run: the frozen Agent-Fabric EffectApi trait + its plan-then-apply value
+# types (ProposedEffect / EffectResult / RunCtx, contract 8.2). The M2 re-run of ID-D5 drives a real
+# `impl EffectApi` whose capability+delegation step routes through Identity's `delegation_with_check_in`
+# (the agent never re-implements the algebra) — the Id-SIDE verification of the consumer integration.
+# DEV-only: myelin-agent is a frozen contract carrier; nothing in the identity-service production DAG
+# depends on it (the live EffectApi body is AG-P6 → P-218; this drill proves Id's half is consumed).
+myelin-agent = { path = "../myelin-agent" }
