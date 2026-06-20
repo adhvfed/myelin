@@ -489,21 +489,39 @@ landing = "P-194"
 
 [[contract]]
 row = "8.1"
+# COVERED at AG-P1 (P-130): the SIGNATURE half — the `ToolSurface` trait (register_tool/resolve) +
+# the `ToolDef` value type with its frozen field list (name, subsystem, version, input_schema,
+# required_caps, effect_kind, side_effecting, requires_approval, exposed_over_mcp). The CDC pair
+# pins the PROVIDER (the platform-owned catalogue: register then resolve round-trips every field)
+# against the CONSUMER (a subsystem contributing a ToolDef). The persisted catalogue + the
+# per-subsystem requires_approval defaults SEED are AG-P8 (→ P-220); the migration is AG-P2
+# (→ P-131) — IMPL follow-ons, not contract-pair gaps; the 8.1 signature pair carries both sides NOW.
 title = "ToolSurface::register_tool(ToolDef)"
-status = "deferred"
-landing = "P-218"
+status = "covered"
+cdc = ["crates/myelin-agent/tests/cdc_8_1_tool_surface.rs"]
 
 [[contract]]
 row = "8.2"
+# COVERED at AG-P1 (P-130): the SIGNATURE half — the `EffectApi::apply(&RunCtx, ProposedEffect) ->
+# Applied(EventId) | Gated(GateId) | Denied(reason)` outcome shape. The CDC pair pins the PROVIDER
+# (plan-then-apply returns exactly one of three outcomes; a gated effect does NOT mutate, AG-8)
+# against the CONSUMER (the loop / external MCP / a workflow activity branching on the outcome). The
+# eight-step pipeline BODY (AG-D1/D2/D3) is AG-P6 (→ P-218) — an IMPL follow-on, not a pair gap.
 title = "EffectApi::apply (plan-then-apply)"
-status = "deferred"
-landing = "P-218"
+status = "covered"
+cdc = ["crates/myelin-agent/tests/cdc_8_2_effect_api.rs"]
 
 [[contract]]
 row = "8.3"
+# COVERED at AG-P1 (P-130): the SIGNATURE half — `AgentRuntime::step(&Conversation) -> UseTools |
+# Submit`, the stateless-brain strategy seam. The CDC pair pins the PROVIDER (a deterministic
+# scripted brain on the `--use-mock` code path; step is a pure function of the conversation, NO LLM
+# SDK) against the CONSUMER (the platform loop reading the StepOutcome). The runtimes are SKELETON
+# (AG-P4 → P-216) + MockAgentRuntime (AG-P5 → P-217); LlmAgentRuntime is designed-not-built (AG-P25)
+# — IMPL follow-ons, not a pair gap; the 8.3 signature pair carries both sides NOW.
 title = "AgentRuntime::step"
-status = "deferred"
-landing = "P-217"
+status = "covered"
+cdc = ["crates/myelin-agent/tests/cdc_8_3_agent_runtime.rs"]
 
 [[contract]]
 row = "8.4"
@@ -522,21 +540,37 @@ cdc = ["crates/myelin-ci-sandbox/tests/cdc_8_4_unified_sandbox.rs"]
 
 [[contract]]
 row = "8.5"
+# COVERED at AG-P1 (P-130): the SIGNATURE half — `Agent::handle(InboxEvent, &dyn AgentRuntime) ->
+# RunOutcome`, the platform-owned bounded multi-turn loop. The CDC pair pins the PROVIDER (the loop
+# drives the brain through the `&dyn AgentRuntime` strategy seam — dynamically dispatched + swappable
+# for mock/real) against the CONSUMER (the dispatch tier delivering an event + a runtime choice). The
+# bounded loop BODY (build_conversation → reserve → step → route → settle) is AG-P4 (→ P-216) — an
+# IMPL follow-on, not a pair gap; the 8.5 signature pair carries both sides NOW.
 title = "Agent::handle"
-status = "deferred"
-landing = "P-216"
+status = "covered"
+cdc = ["crates/myelin-agent/tests/cdc_8_5_agent_handle.rs"]
 
 [[contract]]
 row = "8.6"
+# COVERED at AG-P1 (P-130): the SIGNATURE half — `EventInbox::deliver(InboxEvent)`, the platform
+# delivery seam (agents don't poll; explicit-first dispatch — a mention notifies, it does not
+# auto-spawn a costed run). The CDC pair pins the PROVIDER (the platform delivers a matched event)
+# against the CONSUMER (the agent fabric records it). The dispatch-tier wiring is the Bus's (§3.6) +
+# the SKELETON consumer body is AG-P4 (→ P-216) — IMPL follow-ons, not a pair gap.
 title = "EventInbox::deliver"
-status = "deferred"
-landing = "P-216"
+status = "covered"
+cdc = ["crates/myelin-agent/tests/cdc_8_6_event_inbox.rs"]
 
 [[contract]]
 row = "8.7"
+# COVERED at AG-P1 (P-130): the SIGNATURE half — `run --dry-run(InboxEvent) -> Vec<ProposedEffect>`,
+# the plan-then-apply testability lever (the `DryRun` trait). The CDC pair pins the PROVIDER (dry_run
+# returns the proposed effects WITHOUT applying any — no mutation) against the CONSUMER (the CLI / a
+# test reading the plan). The `run --dry-run` plan-lever BODY is AG-P8 (→ P-220) — an IMPL follow-on,
+# not a pair gap; the 8.7 signature pair carries both sides NOW.
 title = "run --dry-run -> Vec<ProposedEffect>"
-status = "deferred"
-landing = "P-220"
+status = "covered"
+cdc = ["crates/myelin-agent/tests/cdc_8_7_dry_run.rs"]
 
 [[contract]]
 row = "8.8"

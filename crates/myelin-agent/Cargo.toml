@@ -12,3 +12,8 @@ publish = false
 myelin-identity = { path = "../myelin-identity" }
 myelin-events = { path = "../myelin-events" }
 serde.workspace = true
+
+[dev-dependencies]
+# The value-type wire-shape round-trip test (the frozen 8.1 ToolDef field list + the
+# EffectResult tag) serialises via serde_json — a renamed/dropped field fails the assertion.
+serde_json.workspace = true
