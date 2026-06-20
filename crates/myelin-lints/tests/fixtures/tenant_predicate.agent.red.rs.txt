@@ -1,0 +1,18 @@
+// RED fixture for `tenant-predicate` — the AGENT-FABRIC slice (AG-P2 / P-131). The lint MUST reject this.
+//
+// The Agent-Fabric `agent_run` table is `(tenant, region)`-first with NO cross-tenant query path
+// (refined-arch agent-fabric §4; EI-02 §1, ID-3). A "list this agent's runs" read that builds its
+// `agent_run`-table query WITHOUT threading the (tenant, region) predicate is the cross-tenant IDOR
+// bug class: it would return ANOTHER tenant's agent runs (and through them, their proposed effects,
+// HITL gates, and traces). The primary key is `(tenant_id, region, run_id)` — the tenant column is
+// the partition prefix, so a tenant-less query is structurally wrong, not merely unsafe.
+pub async fn list_runs(pool: &PgPool, agent_principal: &str) -> Vec<Run> {
+    // BUG: no TenantId / tenant predicate threaded — this reads `agent_run` across ALL tenants.
+    sqlx::query(
+        "SELECT run_id, state FROM agent_run WHERE agent_principal = $1 AND state = 'running'",
+    )
+    .bind(agent_principal)
+    .fetch_all(pool)
+    .await
+    .expect("list runs query")
+}

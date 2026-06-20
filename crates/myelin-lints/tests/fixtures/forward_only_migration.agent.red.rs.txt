@@ -1,0 +1,8 @@
+-- RED fixture for `forward-only-migration` — the AGENT-FABRIC slice (AG-P2 / P-131). The lint MUST
+-- reject this. The two DDL statements below REWRITE a column in place and then DROP the old column
+-- before any backfill: the destructive / contract-before-backfill bug class the storage online
+-- migration runner (P-ST-05) admits ONLY as expand→backfill→contract. A destructive in-place rewrite
+-- on the high-write `agent_run` table (millions of durable runs) stalls writes under load and can
+-- never be rolled back forward-only (a rollback is a NEW forward migration, never a down).
+ALTER TABLE agent_run ALTER COLUMN runtime_ref TYPE TEXT;
+DROP COLUMN runtime_ref_old;

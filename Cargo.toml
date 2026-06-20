@@ -29,6 +29,17 @@ members = [
     "crates/myelin-content",
     "crates/myelin-query",
     "crates/myelin-agent",
+    # The Agent-Fabric IMPLEMENTATION / SERVICE crate (AG-P2 → P-131), distinct from the glue crate
+    # myelin-agent (AG-P1 → P-130). It ships the data-model MIGRATIONS — the five (tenant, region)-
+    # first RLS tables (run/tool_def/proposed_effect/hitl_gate/trace, architecture §4) applied
+    # forward-only through the storage online runner + the myelin_make_tenant_scoped RLS convention,
+    # with the #[personal_data] tags on every PII column. Like the other SERVICE / SUBSYSTEM crates
+    # (myelin-identity-service, myelin-gdpr-service, myelin-git, myelin-issues, myelin-notif) it is a
+    # LEAF CONSUMER above the glue crates (depends on -agent/-gdpr/-storage/-tenancy/-identity) and
+    # is NOT a node in the eleven-crate library DAG modelled by myelin-substrate::crate_graph —
+    # nothing in the production DAG depends back on it; substrate_is_root()/identity_is_sink() are
+    # preserved (a service is the graph's terminal consumer). See crates/myelin-agent-service/src/lib.rs.
+    "crates/myelin-agent-service",
     "crates/myelin-gdpr",
     # The GDPR/Audit SERVICE crate (P-GA-19 → P-062): the tamper-evident audit log core — the
     # outbox-only audit CONSUMER + the per-tenant hash-chain + the Merkle leaves + the
