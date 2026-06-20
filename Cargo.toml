@@ -98,6 +98,19 @@ members = [
     # data model (NOTIF-P2), the Signal-consumer router (NOTIF-P3), and the holder (NOTIF-P4) are
     # the named floors. See the crate-level note in crates/myelin-notif/src/lib.rs.
     "crates/myelin-notif",
+    # The Chat SUBSYSTEM crate (CHAT-P1 → P-128, M2). Chat is the MAXIMAL CONSUMER subsystem
+    # (architecture chat 00-overview §2.1). At CHAT-P1 it carries ONLY the M2-C0
+    # "freeze-so-dependents-compile" taxonomy slice: the COMPLETE `chat.*` event-token list
+    # (architecture 03 §1.1/§1.2) split into the DURABLE-via-outbox set vs the FIREHOSE-only set,
+    # each token PROVEN grammatical against the one Bus validator (EB-02/P-042) — chat REGISTERS
+    # its list; it does NOT author the grammar (the names anchor X-5). Like the other
+    # subsystem/service crates (myelin-git, myelin-issues, myelin-notif) it is a LEAF CONSUMER
+    # above the glue crates (depends on -events) and is NOT a node in the eleven-crate library DAG
+    # modelled by crate_graph.rs — nothing in the production DAG depends back on it;
+    # substrate_is_root()/identity_is_sink() are preserved. No chat FEATURE ships at P-128: the
+    # durable set's emit behaviour begins in CHAT-P5, the firehose set's in CHAT-P10. See the
+    # crate-level note in crates/myelin-chat/src/lib.rs.
+    "crates/myelin-chat",
     # The storage SUBSTRATE crate (P-ST-01 → P-007): the OLTP tier client (harness pool +
     # (tenant, region) RLS guard), and — in later prompts — the KMS hierarchy + BlobStore
     # impls + backup/restore machinery. Sits below -gdpr/-client and ABOVE -substrate in

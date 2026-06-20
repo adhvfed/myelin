@@ -1,0 +1,33 @@
+[package]
+name = "myelin-chat"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The Chat SUBSYSTEM crate (CHAT-P1 → P-128, M2). Chat is the MAXIMAL CONSUMER subsystem
+# (architecture chat 00-overview §2.1: four owned hot parts, everything else consumed). At
+# CHAT-P1 it carries ONLY the M2-C0 "freeze-so-dependents-compile" taxonomy slice: the COMPLETE
+# `chat.*` event-token list (architecture 03 §1.1/§1.2) split into the DURABLE-via-outbox set vs
+# the FIREHOSE-only set, each token PROVEN grammatical against the one Bus validator (EB-02/P-042)
+# — chat REGISTERS its list; it does NOT author the grammar (the names anchor X-5, no second token
+# language). The ReBAC fragment + #sub grammar are CHAT-P2; the humanise/notif/fanout slice is
+# CHAT-P3.
+#
+# DAG POSITION (a documented, NAMED leaf consumer, exactly like myelin-git / myelin-issues /
+# myelin-notif): it sits ABOVE the shared glue crates — it depends on the Bus event-taxonomy
+# carrier (myelin-events) and NOTHING in the production library DAG depends back on it. It is
+# therefore OUTSIDE the eleven-crate library DAG modelled by `myelin-substrate::crate_graph`
+# (substrate_is_root()/identity_is_sink() are preserved — a subsystem crate is the graph's
+# terminal consumer, not a node in it). No chat FEATURE ships at P-128: the durable set's emit
+# behaviour begins in CHAT-P5 (the outbox co-commit) and the firehose set's in CHAT-P10 (live
+# delivery). See the crate-level note in src/lib.rs.
+[dependencies]
+# The Bus event-taxonomy grammar validator + token table (contract 2.9 / EB-02). CHAT-P1 (P-128)
+# REGISTERS chat's complete `chat.*` token list and PROVES each grammatical against this one
+# validator — chat registers, it does not author the grammar. A producer LEAF depending on the
+# events glue crate is a sanctioned edge: `myelin-events` is a shared contract carrier and NOTHING
+# in the production DAG depends back on `myelin-chat` (the §2.9 graph stays acyclic —
+# `substrate_is_root()` / `identity_is_sink()` are unaffected).
+myelin-events = { path = "../myelin-events" }
+serde.workspace = true

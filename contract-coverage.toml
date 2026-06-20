@@ -155,11 +155,13 @@ row = "2.9"
 title = "event taxonomy + token table"
 status = "covered"
 # EB-02/P-042 ships the Bus grammar + seed CDC pair; GIT-P2/P-124 adds Git COMPLETING its `git.*`
-# token list (contract 2.9: "each subsystem completes its list") — git registers, the Bus owns the
-# grammar. Each file carries both a provider and a consumer marker.
+# token list; CHAT-P1/P-128 adds Chat COMPLETING its `chat.*` list, split DURABLE-via-outbox vs
+# FIREHOSE-only (contract 2.9: "each subsystem completes its list") — each subsystem registers, the
+# Bus owns the grammar. Each file carries both a provider and a consumer marker.
 cdc = [
     "crates/myelin-events/tests/cdc_2_9_taxonomy.rs",
     "crates/myelin-git/tests/cdc_2_9_git_tokens.rs",
+    "crates/myelin-chat/tests/cdc_2_9_chat_tokens.rs",
 ]
 
 # ──────────────── §3 Signals, Automations, Triggers & the firehose (Bus) ────────────────────────
