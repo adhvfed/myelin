@@ -66,6 +66,14 @@ pub use automations::{
     Outcome, RunAs, StartedRun, WorkflowRef,
 };
 
+pub mod triggers;
+// NB: `WorkflowRef` is NOT re-exported here — it is the SAME type re-exported from `automations`
+// (triggers REUSES `crate::WorkflowRef`, no second workflow-reference type).
+pub use triggers::{
+    arm_trigger, disarm_trigger, ArmingId, DurableTimer, InMemoryTimer, OnResolve, Resolution,
+    StaleAfter, TimerError, Trigger, TriggerArming, TriggerEngine, TriggerId, TriggerState,
+};
+
 /// The static cost ceiling: the maximum number of AST nodes a [`QueryAst`] may contain. A
 /// predicate exceeding this is **rejected before evaluation** ([`QueryAst::validate`]) — a
 /// crafted matcher can never present an unboundedly large tree to the interpreter. The

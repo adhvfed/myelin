@@ -187,8 +187,8 @@ cdc = ["crates/myelin-query/tests/cdc_3_2_automations.rs"]
 [[contract]]
 row = "3.3"
 title = "arm_trigger / disarm_trigger"
-status = "deferred"
-landing = "P-140"
+status = "covered"
+cdc = ["crates/myelin-query/tests/cdc_3_3_triggers.rs"]
 
 [[contract]]
 row = "3.4"
