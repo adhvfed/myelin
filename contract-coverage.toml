@@ -526,11 +526,19 @@ cdc = [
     "crates/myelin-notif/tests/cdc_7_4_notif_prefs.rs",
 ]
 
+# 7.5 oncall_now / page: the escalation chain on the durable wheel (the FROZEN §2.4 chain shape;
+# ack-as-event). Notif owns the POLICY (chain-walk, at-fire-time target resolution, the critical
+# pierce); the DURABILITY is the myelin-flow durable timer wheel + signal (9.1/9.3/9.4), seamed
+# behind escalation::DurableWheel (the real engine is P-FLOW-09/P-FLOW-13, a named floor; the
+# in-memory InMemoryWheel models effectively-once). The provider+consumer CDC pair + the NOTIF-D7
+# (exactly-once page across a kill) / NOTIF-D8 (critical pierces) drills are the dated green artifact.
 [[contract]]
 row = "7.5"
 title = "oncall_now / page (escalation)"
-status = "deferred"
-landing = "P-192"
+status = "covered"
+cdc = [
+    "crates/myelin-notif/tests/cdc_7_5_notif_escalation.rs",
+]
 
 [[contract]]
 row = "7.6"
