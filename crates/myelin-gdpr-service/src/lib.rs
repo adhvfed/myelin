@@ -87,6 +87,65 @@
 //! on NAMED FLOOR surfaces whose live behavior lands later (the metrics-health wiring → P-119; the
 //! per-subsystem subject roster → P-GA-26). Stated, not hidden (EI-01 §3).
 //!
+//! ## P-GA-26 (→ P-153) — eDiscovery export (10.7) + the agent-trace H17 seam (8.8) + the history-rewrite resumable-activity skeleton (10.6)
+//! Three deliverables, each REUSING the audit substrate / the holder seam / the durable-activity
+//! idiom rather than re-implementing them (EI-01 §7 coherence):
+//! - **[`ediscovery`] — the eDiscovery / legal-hold export (contract 10.7).** The
+//!   [`ediscovery::EDiscoveryExporter`] is a READ-side authority OVER the existing
+//!   [`audit_proofs::AuditAuthority`] (the per-tenant Merkle tree + STH + inclusion proofs,
+//!   P-GA-19/P-GA-20) + the existing [`fanout::LegalHoldRegistry`] (the G4 hold gate, P-GA-12). An
+//!   `ediscovery_export(scope) → MerkleProvenBundle` (subject/tenant/matter scope) is
+//!   **content-addressed** ([`ediscovery::EDiscoveryBundle::bundle_digest`] binds the exact record
+//!   set), **inclusion-proof-bearing** (every [`ediscovery::EDiscoveryRecord`] carries its `O(log n)`
+//!   proof against the bundle STH — a recipient runs [`verify_inclusion`], "the unaltered record" is
+//!   *checked* not *asserted*, EI-01 §3), and **legal-hold-frozen** (the export PLACES a hold so the
+//!   records cannot be erased while the bundle is assembled — §5.4). The dual-use of the ONE
+//!   tamper-evident substrate (prove-we-erased-it / prove-this-is-the-record) is coherent by
+//!   construction — both ride the same per-tenant tree + STH + witness. The CDC pair for 10.7 (a
+//!   legal/auditor consuming + verifying the export) is `tests/cdc_10_7_ediscovery_export.rs`.
+//! - **[`agent_trace_seam`] — the agent-trace H17 holder seam (8.8), DISTINCT from the audit log.**
+//!   The GDPR-orchestration SEAM ([`agent_trace_seam::AGENT_TRACE_HOLDER_ID`] +
+//!   [`agent_trace_seam::agent_trace_phase`]) the DSR fan-out registers H17 through, with the
+//!   **distinct-from-audit boundary** an architecture test asserts
+//!   ([`agent_trace_seam::trace_is_distinct_from_audit`] — trace = erasable crypto-shred; audit = the
+//!   retain carve-out; different holder id, different H-number, different mechanism — gdpr §3.2 H17 /
+//!   §6.5). The holder BODY is a LOUD named floor ([`agent_trace_seam::AgentTraceHolderSeam`] returns
+//!   an error naming **M3 P-GA-27**, never a silent false-green); the live content-addressed trace
+//!   `locate`/`export`/`erase` over the Knowledge block model lands in P-GA-27. The id is the SAME
+//!   `agent_fabric_trace` name the agent subsystem registers its trace store under (`myelin-agent-
+//!   service::holder`, P-131) — ONE name across the seam, reconciled-in-place not duplicated. The CDC
+//!   pair for 8.8 is `tests/cdc_8_8_agent_trace_seam.rs`.
+//! - **[`history_rewrite`] — the history-rewrite resumable-activity SKELETON (gdpr §6.6 / GA-10).**
+//!   A resumable, idempotent [`history_rewrite::HistoryRewriteActivity`] over the ordered
+//!   [`history_rewrite::RewritePhase`]s (audit → rewrite → crypto-shred-pack-tier → invalidate-caches)
+//!   — the same §4.1-step-4 durable-activity idiom the DSR fan-out + the deadline timer use. A
+//!   re-drive after a crash runs ONLY the un-receipted phases + returns the SAME receipts (the
+//!   resumability proof). The audit action token [`history_rewrite::HISTORY_REWRITE_ACTION`]
+//!   (`git.history_rewrite`) is pinned; the **invalidation fan-out phase is the NAMED M5 floor** (the
+//!   trust-tier cache namespaces it fans over do not exist until M5) — a loud deferral, and the
+//!   off-platform-clones residual is **named, not pretended-solved** (§6.6). **Floor named:** the
+//!   first-class audited op + the invalidation fan-out → **M5 (P-GA-35, GA-10)**.
+//! - **Mutation floor (P-GA-26 TESTS — the export-inclusion-proof + the trace-distinct-from-audit +
+//!   the resumable-idempotent-activity paths are mandatory-core).** `cargo mutants -p
+//!   myelin-gdpr-service` over the three new files (2026-06-20): [`ediscovery`] **23 mutants, 19
+//!   caught, 4 unviable, 0 missed**; [`agent_trace_seam`] + [`history_rewrite`] **49 mutants, 24
+//!   caught, 24 unviable, 1 missed**. Every BEHAVIORAL mutant on the mandatory-core paths is CAUGHT —
+//!   the export's per-record proof attachment + the bundle content-address (a dropped/added/reordered
+//!   record fails `verify`), the scope-token + record-proof serialisation, each distinctness conjunct
+//!   ([`agent_trace_seam`]'s factored `distinctness_holds` — a same-id / same-H / same-erasability all
+//!   collapse distinctness), and the resumable activity's per-phase resume + `skeleton_complete` +
+//!   phase tokens. The 1 residual is documented non-core: `trace_is_distinct_from_audit -> true` is
+//!   the thin public wrapper that delegates to `distinctness_holds` with the REAL constants (which
+//!   ARE distinct) — its boolean output is unobservable-false through the public API (the same
+//!   equivalent-wrapper class as `audit::verify_chain -> true`), while its delegation LOGIC is
+//!   mutation-killed by `each_distinctness_conjunct_is_load_bearing`. Stated, not hidden (EI-01 §3).
+//!   **No
+//!   `--features integration` leg owed:** all three compose already-shipped in-memory seams (the audit
+//!   tree, the hold registry, the durable-activity model) and touch NO new DB / object-store / cache /
+//!   bus contract — the eDiscovery export READS the existing audit log + freezes through the existing
+//!   hold gate; the durable `legal_hold`/`audit_entry`/`audit_sth` tables are the same DB floor every
+//!   M0/M1 store carries (P-007 / P-S12).
+//!
 //! ## DAG position (a named §2.9 extension — like `myelin-identity-service`)
 //! This is a SERVICE crate, the GDPR/Audit subsystem's bootable home. It is a leaf consumer
 //! ABOVE `myelin-events` / `myelin-identity` / `myelin-tenancy`: it depends on the frozen bus +
@@ -424,9 +483,12 @@
 //! `--features integration` leg owed:** the registries + the gate are pure in-memory decision models
 //! over already-shipped seams — they touch NO new DB / object-store / cache / bus contract.
 
+pub mod agent_trace_seam;
 pub mod audit;
 pub mod audit_proofs;
 pub mod commit_prerequisite;
+pub mod ediscovery;
+pub mod history_rewrite;
 pub mod datamap;
 pub mod derivative_erasure;
 pub mod diffgate;
@@ -447,9 +509,21 @@ pub use audit::{
     AuditConsumer, AuditEntry, AuditLog, Minimised, Outcome, AUDIT_APPEND_LAG,
 };
 pub use audit_proofs::{
-    verify_consistency, verify_inclusion, AuditAuthority, CellSigningKey, ConsistencyProof,
-    InclusionProof, NotaryWitness, SignedTreeHead, SigningKey, Witness, WitnessAttestation,
-    DSR_SEAL_ACTION, STH_PUBLISH_AGE,
+    serialize_sth_commitment, verify_consistency, verify_inclusion, AuditAuthority, CellSigningKey,
+    ConsistencyProof, InclusionProof, NotaryWitness, SignedTreeHead, SigningKey, Witness,
+    WitnessAttestation, DSR_SEAL_ACTION, STH_PUBLISH_AGE,
+};
+pub use agent_trace_seam::{
+    agent_trace_phase, trace_is_distinct_from_audit, AgentTraceHolderSeam, AGENT_TRACE_ERASABLE,
+    AGENT_TRACE_HOLDER_ID, AGENT_TRACE_IMPL_PROMPT, AUDIT_LOG_ERASABLE,
+};
+pub use ediscovery::{
+    EDiscoveryBundle, EDiscoveryExporter, EDiscoveryRecord, EDiscoveryScope,
+    EDISCOVERY_EXPORT_RECORDS,
+};
+pub use history_rewrite::{
+    HistoryRewriteActivity, HistoryRewriteReceipt, HistoryRewriteRequest, PhaseReceipt,
+    RewritePhase, HISTORY_REWRITE_ACTION, HISTORY_REWRITE_FIRST_CLASS_PROMPT,
 };
 pub use commit_prerequisite::{
     commit_actor_holds_only_pseudonym, verdict_for, CommitActorVerdict, CommitIdentityPrerequisite,
