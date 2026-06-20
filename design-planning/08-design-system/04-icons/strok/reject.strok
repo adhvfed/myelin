@@ -7,13 +7,11 @@ defaults
   stroke-linejoin round
 palette
   ink #ff00ff
-shape ring template=ellipse
-place r1 shape=ring at=3,3 size=18x18
 shape l1 template=path
-  addpoint a at=9,9
-  addpoint b at=15,15
+  addpoint a at=6,6
+  addpoint b at=18,18
 place a1 shape=l1 at=0,0
 shape l2 template=path
-  addpoint a at=15,9
-  addpoint b at=9,15
+  addpoint a at=18,6
+  addpoint b at=6,18
 place a2 shape=l2 at=0,0
