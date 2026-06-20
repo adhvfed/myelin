@@ -84,7 +84,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use myelin_identity::{
-    ColRef, Consistency, ListObjectsResult, ObjectType, Permission, Principal, RelName,
+    ColRef, Consistency, ListObjectsResult, ObjectId, ObjectType, Permission, Principal, RelName,
     Result as AuthzResult, SetExpr,
 };
 use myelin_query::QueryAst;
@@ -396,7 +396,11 @@ impl From<IndexError> for QueryError {
 /// `…@<rev>`; a zookie with no suffix carries watermark 0 (any non-stale revision satisfies it). The
 /// real zookie→revision mapping is Identity's (contract 4.10); this is the deterministic embedded
 /// model the SRCH-P09 watermark mechanism is proven against (the full fail-static path is SRCH-P10).
-fn watermark_from_zookie(zookie: &str) -> RevisionWatermark {
+///
+/// `pub(crate)` so the SRCH-P10 consistency path ([`crate::consistency`]) shares the SAME
+/// zookie→revision decoding the watermark uses — ONE encoding, no drift between the JOIN watermark
+/// and the no-stale-grant candidate comparison.
+pub(crate) fn watermark_from_zookie(zookie: &str) -> RevisionWatermark {
     let rev = zookie
         .rsplit_once('@')
         .and_then(|(_, suffix)| suffix.parse::<u64>().ok())
@@ -572,6 +576,61 @@ pub fn query<B: IndexBackend>(
     page: Page,
     stats: &QueryStats,
 ) -> Result<RankedResults, QueryError> {
+    // The default-consistency path with NO bounded-check port wired: a candidate whose
+    // `indexed_zookie` is stale relative to the passed zookie is EXCLUDED pending re-index (fail
+    // CLOSED, ADR-03 — never served stale-allow). The full zookie re-validation (bounded `check` on
+    // the affected candidates) is [`query_consistent`] (SRCH-P10); this entry preserves the
+    // SRCH-P08/P09 call shape and still honours the no-stale-grant exclusion.
+    let consistency_stats = crate::consistency::ConsistencyStats::new();
+    query_consistent(
+        engine,
+        identity,
+        None,
+        ast,
+        viewer,
+        ty,
+        at,
+        page,
+        stats,
+        &consistency_stats,
+    )
+}
+
+/// **THE ZOOKIE/CONSISTENCY QUERY ENTRY (SRCH-P10 / P-173; §4.2.3 + contract 4.2/4.10/1.10).** The
+/// permission-aware [`query`] PLUS the **no-stale-grant zookie re-validation** + the **fail-static
+/// degrade-not-cascade** mechanism (the consistency mechanism). Identical steps 0–4 to [`query`],
+/// then — between execution and pagination — the **STEP 4.5 no-stale-grant pass**:
+///
+/// A candidate doc whose `indexed_zookie` is OLDER than the passed query `at` zookie for an
+/// ACL-relevant facet carries a STALE permission projection (the new-enemy problem). Such a
+/// candidate is **re-validated** via a bounded `check` on the affected candidate only (contract
+/// 4.2, the `check` port) and surfaces iff the check still ALLOWS at the demanded snapshot — or is
+/// **excluded pending re-index** when no `check` port is wired (fail CLOSED, ADR-03). A fresh
+/// candidate (indexed at-or-after the passed zookie) is served as-is. The re-validation runs over
+/// the BOUNDED affected set ONLY (the stale subset, never every hit — no N+1).
+///
+/// **The fail-static decision (contract 4.10/1.10):** a **zookie-stamped strong** read
+/// ([`ConsistencyMode::Strong`]) BYPASSES the fail-static cache (read-your-writes-after-revocation
+/// must see the revocation); a **default-consistency** read ([`ConsistencyMode::BoundedStale`]) MAY
+/// degrade-not-cascade on an Id hiccup (the substrate `FailStatic<T>` cache; the bypass decision is
+/// [`crate::consistency::fail_static_bypass`]). The fail-static ratio telemetry (1.8) is recorded.
+///
+/// - `check` — the bounded re-validation port (contract 4.2); `None` ⇒ a stale candidate is
+///   excluded pending re-index (fail closed — the safe default).
+/// - `cstats` — the consistency telemetry (the SRCH-D2 zero-escape + the fail-static ratio).
+#[allow(clippy::too_many_arguments)]
+pub fn query_consistent<B: IndexBackend>(
+    engine: &ScopedEngine<'_, B>,
+    identity: &dyn ListObjectsPort,
+    check: Option<&dyn crate::consistency::BoundedCheckPort>,
+    ast: &QueryAst,
+    viewer: &Principal,
+    ty: &ObjectType,
+    at: &Consistency,
+    page: Page,
+    stats: &QueryStats,
+    cstats: &crate::consistency::ConsistencyStats,
+) -> Result<RankedResults, QueryError> {
     // **CROSS-TENANT 0 (SRCH-D3, step 0):** the tenant is the verified principal's, never a path.
     // The engine MUST be the viewer's-tenant index; a mismatch is a mis-wired caller → REJECT (no
     // cross-tenant read path exists). There is NO path/tenant parameter to spoof.
@@ -580,6 +639,17 @@ pub fn query<B: IndexBackend>(
             viewer_tenant: viewer.tenant.0.clone(),
             engine_tenant: engine.tenant.clone(),
         });
+    }
+
+    // **STEP 0.5 — the fail-static bypass decision (contract 4.10/1.10).** A zookie-stamped strong
+    // read bypasses the fail-static cache (it must see a just-revoked grant); a default-consistency
+    // read may degrade-not-cascade. Recorded for the fail-static ratio (1.8). The cache itself is
+    // the substrate `FailStatic<T>` the production `list_objects` client fronts (P-S25) — the bypass
+    // flag tells that client whether a stale coarse-grant answer is permissible for THIS read.
+    if crate::consistency::fail_static_bypass(at) {
+        cstats.record_fail_static_bypass();
+    } else {
+        cstats.record_fail_static_served();
     }
 
     // **STEP 1 — the ACL filter FIRST.** Exactly ONE list_objects call (the no-N+1 invariant; the
@@ -610,16 +680,98 @@ pub fn query<B: IndexBackend>(
     }
 
     // **STEP 4 — execute EVERY branch under the SAME conjoined ACL filter** (the pre-filter, §4.2.1).
+    // Fetch the full ranked candidate list (not yet paginated) so the no-stale-grant pass can
+    // exclude stale candidates BEFORE the page window is sliced (an excluded stale doc must not
+    // consume a visible page slot — otherwise the page would be short by the excluded count).
     let hits = execute(engine.backend, &conjoined, page, stats)?;
 
+    // **STEP 4.5 — THE NO-STALE-GRANT ZOOKIE PASS (§4.2.3).** A candidate whose `indexed_zookie` is
+    // OLDER than the **passed query zookie** (`at.at_least`, the read-your-writes snapshot the
+    // CALLER demanded — NOT the list_objects answer's zookie) carries a stale permission projection.
+    // Re-validate it (a bounded `check` on the affected candidate only) or exclude pending re-index.
+    // NEVER served stale-allow. The re-validation runs over the bounded stale SUBSET, never every
+    // hit. A default-consistency query with no real zookie watermark (rev 0) finds nothing stale —
+    // it uses the indexed filter as-is (bounded staleness ≤ W), the degrade-not-cascade path.
+    let hits = revalidate_stale_candidates(
+        engine.backend,
+        hits,
+        identity_subject(viewer),
+        &permission,
+        &at.at_least.0,
+        at,
+        check,
+        cstats,
+    )?;
+
     // **STEP 5 — rank / fuse / paginate / project.** `execute` already merged + deduped on doc_id;
-    // here we slice the page window.
+    // here we slice the page window (over the post-revalidation visible set).
     let paged = paginate(hits, page);
     Ok(RankedResults {
         hits: paged.into_iter().map(|h| RankedResult { doc_id: h.doc_id, score: h.score }).collect(),
         zookie,
         post_fetch_fields,
     })
+}
+
+/// The verified principal whose reachable set drives both `list_objects` and the bounded re-check
+/// (named so the re-validation's subject is self-evidently the SAME verified viewer, never a
+/// re-derived one — no cross-subject drift in the consistency pass).
+fn identity_subject(viewer: &Principal) -> &Principal {
+    viewer
+}
+
+/// **The no-stale-grant re-validation (§4.2.3 / SRCH-P10).** Partition the ranked hits into fresh
+/// (indexed at-or-after the passed `zookie`) and stale (indexed before it) by the per-doc
+/// `indexed_zookie` point lookup; serve the fresh as-is; re-validate each STALE candidate via the
+/// bounded `check` port (contract 4.2) at the demanded consistency `at` — admit iff it still
+/// ALLOWS, otherwise EXCLUDE; with NO check port wired, exclude every stale candidate pending
+/// re-index (fail CLOSED, ADR-03). NEVER served stale-allow. The bounded affected set is the stale
+/// subset only (no N+1 over every hit). The fresh hits keep their ranked order; an admitted stale
+/// hit is re-appended after the fresh set (its rank is preserved relative to other admitted-stale).
+#[allow(clippy::too_many_arguments)]
+fn revalidate_stale_candidates<B: IndexBackend>(
+    backend: &B,
+    hits: Vec<Hit>,
+    subject: &Principal,
+    permission: &Permission,
+    zookie: &str,
+    at: &Consistency,
+    check: Option<&dyn crate::consistency::BoundedCheckPort>,
+    cstats: &crate::consistency::ConsistencyStats,
+) -> Result<Vec<Hit>, QueryError> {
+    let mut out: Vec<Hit> = Vec::with_capacity(hits.len());
+    for hit in hits {
+        // The per-doc staleness anchor — a doc-id POINT LOOKUP (not a scored search).
+        let indexed = backend.indexed_zookie_of(&hit.doc_id);
+        match crate::consistency::disposition(indexed.as_deref(), zookie) {
+            // Fresh: its indexed ACL state already reflects the demanded snapshot — serve as-is.
+            crate::consistency::CandidateDisposition::Fresh => out.push(hit),
+            // Stale: re-validate via a bounded `check`, or exclude pending re-index (fail closed).
+            crate::consistency::CandidateDisposition::StaleNeedsRevalidation => {
+                match check {
+                    Some(port) => {
+                        cstats.record_revalidation();
+                        let object = ObjectId(hit.doc_id.clone());
+                        let still_allowed =
+                            port.check(subject, permission, &object, at).map_err(QueryError::Authz)?;
+                        if still_allowed {
+                            // The grant survives the demanded snapshot — surface it.
+                            out.push(hit);
+                        } else {
+                            // The grant is gone at the demanded zookie (the new-enemy) — EXCLUDE.
+                            cstats.record_excluded_stale();
+                        }
+                    }
+                    None => {
+                        // No bounded-check port → exclude the stale candidate pending re-index
+                        // (fail CLOSED — never served stale-allow, ADR-03).
+                        cstats.record_excluded_stale();
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// **Execute every lowered branch (FT / structured / vector) under the conjoined ACL filter, then

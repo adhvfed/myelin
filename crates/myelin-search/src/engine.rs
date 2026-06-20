@@ -344,6 +344,16 @@ pub trait IndexBackend {
     /// upsert/delete (the reindex/backup seam, §4.9). Returns the number of live documents at the
     /// snapshot point.
     fn snapshot(&mut self) -> Result<u64, IndexError>;
+
+    /// **Read the `indexed_zookie` staleness anchor of `doc_id` (§3.1) — `None` if the doc is
+    /// absent.** A doc-id POINT LOOKUP (NOT a scored, permission-scoped search — it must NOT ride
+    /// the `search` path the `search-requires-acl-filter` lint guards). The **no-stale-grant zookie
+    /// path** (SRCH-P10 / §4.2.3) reads it: a candidate whose `indexed_zookie` is OLDER than the
+    /// passed query zookie for an ACL-relevant facet is re-validated (a bounded `check` on the
+    /// affected candidate) or excluded pending re-index — never served stale-allow. Stamped by the
+    /// indexer ([`TantivyBackend::upsert_stamped`]) + advanced by an ACL-state-indexed re-stamp
+    /// ([`TantivyBackend::restamp_zookie`]).
+    fn indexed_zookie_of(&self, doc_id: &str) -> Option<String>;
 }
 
 /// **The Tantivy v1 reference engine** — the in-process `IndexBackend` (§2.1). One Tantivy `Index`
@@ -914,6 +924,12 @@ impl IndexBackend for TantivyBackend {
         let reader = self.index.reader()?;
         let searcher = reader.searcher();
         Ok(searcher.num_docs())
+    }
+
+    fn indexed_zookie_of(&self, doc_id: &str) -> Option<String> {
+        // Forward to the inherent point-lookup over the SRCH-P06 side map (NOT a scored search —
+        // an `indexed_zookie` read is a doc-id POINT LOOKUP, never a permission-scoped query).
+        TantivyBackend::indexed_zookie_of(self, doc_id)
     }
 }
 
