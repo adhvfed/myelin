@@ -608,8 +608,8 @@ cdc = ["crates/myelin-agent/tests/cdc_8_7_dry_run.rs"]
 [[contract]]
 row = "8.8"
 title = "AG-7 agent trace"
-status = "deferred"
-landing = "P-153"
+status = "covered"
+cdc = ["crates/myelin-gdpr-service/tests/cdc_8_8_agent_trace_seam.rs"]
 
 # ──────────────── §9 Durable workflow (myelin-flow) ─────────────────────────────────────────────
 
@@ -750,8 +750,8 @@ cdc = [
 [[contract]]
 row = "10.7"
 title = "eDiscovery / legal-hold export"
-status = "deferred"
-landing = "P-153"
+status = "covered"
+cdc = ["crates/myelin-gdpr-service/tests/cdc_10_7_ediscovery_export.rs"]
 
 [[contract]]
 row = "10.8"

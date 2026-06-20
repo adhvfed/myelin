@@ -576,6 +576,14 @@ fn serialize_inclusion(p: &InclusionProof) -> String {
     format!("{}@{}:{}|{}->{}", p.leaf_index, p.tree_size, p.leaf_hash, path, p.root_hash)
 }
 
+/// Serialise an STH to the compact `size@root@signed_at` commitment string (the chain-of-custody
+/// anchor an eDiscovery bundle (10.7, [`crate::ediscovery`]) carries in its `merkle_inclusion` —
+/// a verifiable, PII-free root commitment, never entry content). Pinned here (next to the STH type)
+/// so the export's commitment encoding stays beside the STH definition.
+pub fn serialize_sth_commitment(sth: &SignedTreeHead) -> String {
+    format!("{}@{}@{}", sth.tree_size, sth.root_hash, sth.signed_at)
+}
+
 // ───────────────────────────── the consumer DSR-seal append path ─────────────────────────────
 
 impl AuditConsumer {
