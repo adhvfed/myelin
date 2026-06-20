@@ -216,6 +216,40 @@
 //! and the restrict/rectify/portability routing are mandatory-core; the `cargo mutants` score is in
 //! the commit body.
 //!
+//! ## P-GA-24 (→ P-151) — the per-derivative erasure fan-out: Search purge+reindex (incl. embeddings) + Refs tombstone + reindex-from-source rectification (contract 6.4/5.8/2.6 wired; 10.1 orchestration leg)
+//! [`derivative_erasure`] ships the **per-derivative erasure fan-out** over the M2 derived stores —
+//! the orchestration leg of 10.1 that wires Search/Refs/Notif as the orchestrator's per-holder erase
+//! calls, with their derivative-SPECIFIC `erase` semantics (each a REAL purge, never hide): **Search
+//! (H7)** [`derivative_erasure::SearchIndexHolder`] — *purge + reindex incl. embeddings* (purged-not-
+//! hidden; a re-identification probe [`derivative_erasure::SearchIndexModel::reidentify_hits`] returns
+//! **0** after erase — GA-D2 / SRCH-D4); **Refs (H12)** [`derivative_erasure::RefsGraphHolder`] —
+//! *tombstone* (0 recoverable, [`derivative_erasure::RefsGraphModel::resolve`] returns a
+//! [`derivative_erasure::RefsResolve::Tombstone`], **never a 500** — REF-D5); **Notif (H13)**
+//! [`derivative_erasure::NotifHistoryHolder`] — *humanise mentions to `[erased user]`*
+//! ([`derivative_erasure::ERASED_USER`] — NOTIF-D6). Plus the **reindex-from-source rectification**
+//! ([`derivative_erasure::DerivativeErasureDriver::rectify_via_reindex_from_source`]) — Art. 16's
+//! derivative-correction half: the derived stores **rebuild from the corrected source** (drift = 0),
+//! NEVER patched-in-place (there is no patch entry point — the structural foreclosure of patch-and-
+//! drift, §4.4 / EI-04 §5). It REUSES the [`orchestration::RegisteredHolder`] seam +
+//! [`orchestration::CanonicalErasePhase`] order wholesale (the derivative holders register at their
+//! [`derivative_erasure::derivative_phase_of`] phases alongside the upstream holders — EI-01 §7
+//! coherence; no second orchestrator). The green artifact is the **embedding-purge receipt**
+//! ([`derivative_erasure::DerivativeEraseReceipt::embeddings_purged`]). **GA-D2** (the subject's docs
+//! AND embeddings purged+reindexed out, 0 embedding re-identification) + **REF-D5** (refs tombstone,
+//! 0 recoverable, no resolve-500) + **NOTIF-D6** (inbox humanises to `[erased user]`) emit their dated
+//! green artifacts in `tests/ga_d2_derivative_erasure.rs`; the CDC pairs for 6.4/5.8/2.6 are in
+//! `tests/cdc_6_4_5_8_2_6_derivative_erasure.rs`. **Floors named:** the `restrict` suppression INTO
+//! these same derived stores (GA-D7) → **M2 P-GA-25 → P-152** (this prompt ships the per-derivative
+//! ERASE + RECTIFY; the restriction-honoured-into-derived proof rides this fan-out); the **agent-trace
+//! H17 seam** → **M2 P-GA-26 → P-153**. The live Search/Refs/Notif `erase` bindings behind the
+//! [`myelin_gdpr::PersonalDataHolder`] seam are a config swap at boot (the in-memory models here have
+//! byte-for-byte the GA-D2/REF-D5/NOTIF-D6 post-conditions); this module touches **NO new DB / object-
+//! store / cache / bus contract — no `--features integration` leg owed**. **Mutation floor (P-GA-24
+//! TESTS — the purge-not-hide [embeddings] + the reindex-from-source paths are mandatory-core):**
+//! [`derivative_erasure::SearchIndexModel::erase`] (the embedding compaction), the Refs tombstone-not-
+//! 500 branch, the Notif `[erased user]` humanise branch, and `rectify_via_reindex_from_source` (the
+//! rebuild-never-patch path) are the behavioral core; the `cargo mutants` score is in the commit body.
+//!
 //! ## P-GA-15 (→ P-115) — the erasure ledger (10.8) + post-restore re-erasure + the crypto-shred-reaches-backups proof
 //! [`erasure_ledger`] ships the **erasure ledger** ([`erasure_ledger::ErasureLedger`]) — the GDPR-owned,
 //! **PII-free, NON-shred-erasable** record of every completed erasure (the opaque subject token + the
@@ -358,6 +392,7 @@ pub mod audit;
 pub mod audit_proofs;
 pub mod commit_prerequisite;
 pub mod datamap;
+pub mod derivative_erasure;
 pub mod diffgate;
 pub mod dsr;
 pub mod dsr_timer;
@@ -387,6 +422,11 @@ pub use commit_prerequisite::{
 pub use datamap::{
     data_map, ropa, ropa_for_tenant, tagged_field_count, HolderSchema, Inventory, InventoryEntry,
     ProcessingActivities, ProcessingActivity, DATA_MAP_ENTRY_COUNT, DATA_MAP_HOLDER_COUNT,
+};
+pub use derivative_erasure::{
+    derivative_holder_ids, derivative_phase_of, DerivativeEraseReceipt, DerivativeErasureDriver,
+    NotifHistoryHolder, NotifHistoryModel, RectifyOutcome, RefsGraphHolder, RefsGraphModel,
+    RefsResolve, SearchIndexHolder, SearchIndexModel, DERIVATIVE_ERASE_FANOUT_COVERAGE, ERASED_USER,
 };
 pub use diffgate::{
     check_against_baseline, diff, CommittedBaseline, DataMapDiff, GateVerdict, Reclassification,
