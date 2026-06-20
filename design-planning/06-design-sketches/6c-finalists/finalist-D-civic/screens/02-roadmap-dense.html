@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<!-- FINALIST D · CIVIC | Screen 2 of 7 — DENSE ENGINEER SURFACE: roadmap/portfolio timetable grid
+     Carrier: C-12 (Vignelli dense roadmap, "density-is-tuning-not-a-fork"). Same shell, same chip,
+     same status grammar, same tokens as screen 1 — tuned DENSE (compact tokens, transit-timetable grid).
+     This is the D4 proof (one product, density-tuned) + D1 (earned density, kept calm) + D7 (dense-but-calm).
+     G2 demo: NON-LATIN SCRIPT (Greek + Cyrillic real strings with diacritics, no tofu/clipping) lives here.
+     Keyboard model: roving tabindex on rows (j/k or ↑/↓), Enter opens, x selects, / focuses filter, ⌘K palette.
+     [DEFERRED-UNTIL-USERS] expert sketch. -->
+<html lang="en" dir="ltr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Roadmap (dense) — Payments Platform · acme · Myelin</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../tokens.css">
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{background:var(--bg);color:var(--text-primary);font:12px/1.4 var(--font-sans);-webkit-font-smoothing:antialiased;overflow:hidden}
+  a{color:var(--accent-text);text-decoration:none}
+  button{font:inherit;color:inherit;background:none;border:none;cursor:pointer}
+  .mono{font-family:var(--font-mono)}
+  .shell{display:grid;grid-template-columns:46px 200px 1fr;height:100vh;overflow:hidden}
+
+  /* collapsed icon rail — same nav, compact tuning */
+  .rail{background:var(--surface);border-inline-end:1px solid var(--border);display:flex;flex-direction:column;align-items:center;padding:var(--space-2) 0;gap:3px}
+  .rail .m{width:26px;height:26px;border-radius:var(--radius-1);background:var(--text-primary);color:var(--surface);display:grid;place-items:center;font-weight:700;font-size:13px;margin-bottom:var(--space-2)}
+  .rail a{width:32px;height:32px;border-radius:var(--radius-1);display:grid;place-items:center;color:var(--text-muted);font-size:10px;font-weight:600}
+  .rail a.on{background:var(--surface-sunken);color:var(--accent-text)}
+  .rail a:hover{color:var(--text-primary)}
+
+  .side{background:var(--surface);border-inline-end:1px solid var(--border);padding:var(--space-3) 10px;overflow:auto}
+  .side h4{font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--text-muted);margin-bottom:6px;font-weight:700;margin-top:var(--space-3)}
+  .side h4:first-child{margin-top:0}
+  .side ul{list-style:none}
+  .side li{padding:4px 7px;border-radius:var(--radius-1);color:var(--text-secondary);display:flex;gap:7px;align-items:center;margin-bottom:1px}
+  .side li.on{background:var(--surface-sunken);color:var(--text-primary);font-weight:500}
+  .side li .g{color:var(--text-muted);font-size:9px;width:11px;text-align:center}
+
+  .main{display:flex;flex-direction:column;overflow:hidden;min-width:0}
+  .top{display:flex;align-items:center;gap:10px;padding:8px var(--space-4);border-bottom:1px solid var(--border);background:var(--surface)}
+  .top h1{font-size:13px;font-weight:600}
+  .top .sub{font-size:11px;color:var(--text-muted)}
+  .top .live{display:inline-flex;gap:6px;align-items:center;font-size:10.5px;color:var(--text-muted)}
+  .top .live .pip{width:6px;height:6px;border-radius:50%;background:var(--status-ok)}
+  .top .right{margin-inline-start:auto;display:flex;gap:10px;align-items:center}
+  .pill{font-size:10.5px;color:var(--text-secondary);border:1px solid var(--border);border-radius:var(--radius-1);padding:3px 8px}
+  .pill .gl{color:var(--accent-text)}
+  .ident{width:24px;height:24px;border-radius:50%;background:var(--surface-sunken);border:1px solid var(--border);color:var(--text-secondary);display:grid;place-items:center;font-size:10px;font-weight:600}
+
+  /* always-on residency stays present in compact form too (Axis-6 always-on) */
+  .filters{display:flex;align-items:center;gap:var(--space-2);padding:6px var(--space-4);border-bottom:1px solid var(--border);background:var(--surface-sunken);font-size:11px;color:var(--text-secondary)}
+  .filters .f{border:1px solid var(--border);border-radius:var(--radius-1);padding:2px 8px;display:inline-flex;gap:6px;align-items:center}
+  .filters .f b{color:var(--text-primary);font-weight:500}
+  .filters input{border:1px solid var(--border);border-radius:var(--radius-1);padding:2px 8px;background:var(--surface);color:var(--text-primary);font:inherit;width:150px}
+  .filters .legend{margin-inline-start:auto;display:flex;gap:var(--space-3)}
+  .filters .legend span{display:inline-flex;gap:5px;align-items:center;color:var(--text-muted)}
+  .filters .legend .ic{font-family:var(--font-mono);font-size:10px}
+
+  .scroll{flex:1;overflow:auto;min-height:0}
+  table{border-collapse:collapse;width:100%;min-width:1000px}
+  thead th{position:sticky;top:0;z-index:3;background:var(--surface);border-bottom:1px solid var(--border-strong);font-size:9.5px;letter-spacing:.05em;text-transform:uppercase;color:var(--text-muted);font-weight:700;text-align:start;padding:7px 10px}
+  thead .qtr{border-inline-start:1px solid var(--border);text-align:center}
+  thead .qtr small{display:block;color:var(--text-muted);font-weight:500;letter-spacing:0;text-transform:none;font-size:9.5px}
+  tbody .grp td{background:var(--surface-sunken);border-top:1px solid var(--border-strong);border-bottom:1px solid var(--border);font-size:10px;letter-spacing:.07em;text-transform:uppercase;color:var(--text-secondary);font-weight:700;padding:5px 10px}
+  tbody td{border-bottom:1px solid var(--border);padding:0;vertical-align:middle;height:30px}
+  tbody tr.item:hover{background:var(--surface-sunken)}
+  tbody tr.item:focus-visible{outline:var(--focus-width) solid var(--focus-ring);outline-offset:-2px}
+  td.lab{padding:4px 10px;white-space:nowrap}
+  .lab .ref{font-family:var(--font-mono);font-size:9.5px;color:var(--text-muted);margin-inline-end:7px}
+  .lab .nm{font-size:11.5px;color:var(--text-primary)}
+  .lab .own{color:var(--text-muted);font-size:10px;margin-inline-start:7px}
+  td.meta{font-family:var(--font-mono);font-size:10px;color:var(--text-secondary);text-align:end;padding:0 10px;white-space:nowrap}
+  td.stat{padding:0 10px}
+  .st{display:inline-flex;align-items:center;gap:5px;font-size:10.5px;font-weight:500}
+  .st .ic{font-family:var(--font-mono);font-size:10px}
+  .st.ok{color:var(--status-ok)} .st.risk{color:var(--status-warn)} .st.off{color:var(--status-bad)} .st.plan{color:var(--text-muted)}
+  /* Gantt cells */
+  .qcell{border-inline-start:1px solid var(--border);position:relative;height:30px}
+  .bar{position:absolute;top:9px;height:12px;border-radius:2px;background:var(--accent);display:flex;align-items:center}
+  .bar.ok{background:var(--status-ok)} .bar.risk{background:var(--status-warn)} .bar.plan{background:var(--text-muted)} .bar.idea{background:transparent;border:1px dashed var(--border-strong)}
+  .bar .fill{position:absolute;inset:0;background:rgba(255,255,255,.30);border-radius:2px}
+  [data-theme="dark"] .bar .fill{background:rgba(0,0,0,.30)}
+  .dep{position:absolute;top:5px;bottom:5px;width:1.5px;background:var(--text-muted)}
+  /* restricted rollup — never leak (R-19 §5.2) */
+  tbody .restr td{background:var(--surface);color:var(--text-secondary);font-size:10.5px;padding:7px 10px;border-bottom:1px solid var(--border)}
+  tbody .restr .lk{font-family:var(--font-mono);color:var(--status-restricted)}
+  /* ambient agent footnote row */
+  tbody .agentnote td{background:var(--surface-sunken);padding:7px 10px;border-bottom:1px solid var(--border)}
+  .agbadge{display:inline-flex;align-items:center;gap:4px;font-size:9px;font-weight:700;color:var(--agent);border:1px solid var(--agent);border-radius:var(--radius-1);padding:1px 5px;margin-inline-end:8px}
+  .agbadge .sq{width:7px;height:7px;border:1.4px solid var(--agent);border-radius:1px}
+  .agentnote span{font-size:11px;color:var(--text-secondary)}
+  .khint{padding:5px var(--space-4);border-top:1px solid var(--border);background:var(--surface);font-size:10.5px;color:var(--text-muted);display:flex;gap:var(--space-4)}
+  .khint kbd{font-family:var(--font-mono);border:1px solid var(--border);border-radius:3px;padding:0 4px;color:var(--text-secondary)}
+  @media (max-width:760px){ .shell{grid-template-columns:1fr} .rail,.side{display:none} }
+</style>
+</head>
+<body>
+<div class="shell">
+  <nav class="rail" aria-label="Primary">
+    <span class="m">M</span>
+    <a href="01-shell-exec-dashboard.html" title="Code">Co</a>
+    <a href="#" title="CI">CI</a>
+    <a href="#" class="on" title="Issues" aria-current="page">Is</a>
+    <a href="#" title="Knowledge">Kn</a>
+    <a href="#" title="Chat">Ch</a>
+  </nav>
+
+  <aside class="side">
+    <h4>Payments Platform</h4>
+    <ul>
+      <li><span class="g" aria-hidden="true">▦</span>Cycle board</li>
+      <li class="on"><span class="g" aria-hidden="true">▱</span>Roadmap · dicht</li>
+      <li><span class="g" aria-hidden="true">≡</span>All work items</li>
+      <li><span class="g" aria-hidden="true">▤</span>Portfolio rollup</li>
+    </ul>
+    <h4>Gruppieren nach</h4>
+    <ul>
+      <li class="on"><span class="g" aria-hidden="true">◆</span>Initiative</li>
+      <li><span class="g" aria-hidden="true">○</span>Team</li>
+      <li><span class="g" aria-hidden="true">○</span>OKR</li>
+    </ul>
+    <h4>Gespeicherte Ansichten</h4>
+    <ul>
+      <li><span class="g" aria-hidden="true">★</span>Q3-Zusagen</li>
+      <li><span class="g" aria-hidden="true">○</span>Nur gefährdet</li>
+    </ul>
+  </aside>
+
+  <main class="main">
+    <header class="top">
+      <h1>Roadmap</h1>
+      <span class="sub">Payments Platform · 38 Vorgänge · gruppiert nach Initiative</span>
+      <span class="live"><span class="pip" aria-hidden="true"></span>live · aktualisiert sich aus der Lieferung</span>
+      <div class="right">
+        <!-- always-on residency, compact -->
+        <span class="pill" title="Wo diese Daten liegen"><span class="gl" aria-hidden="true">⬡</span> EU · FRA</span>
+        <span class="pill">⌘K</span>
+        <span class="ident" title="Mara Ø.">MØ</span>
+      </div>
+    </header>
+
+    <div class="filters">
+      <label class="f" style="border:none;padding:0">
+        <span class="mono" aria-hidden="true">/</span>
+        <input type="text" placeholder="Filtern…" aria-label="Vorgänge filtern">
+      </label>
+      <span class="f">GJ2026 <b>·</b> Status <b>alle</b></span>
+      <span class="f">Dichte <b>kompakt</b></span>
+      <span class="legend" aria-hidden="true">
+        <span><span class="ic" style="color:var(--status-ok)">●</span>Im Plan</span>
+        <span><span class="ic" style="color:var(--status-warn)">▲</span>Gefährdet</span>
+        <span><span class="ic" style="color:var(--text-muted)">◇</span>Geplant</span>
+        <span><span class="ic" style="color:var(--text-muted)">│</span>Ziel</span>
+      </span>
+    </div>
+
+    <div class="scroll">
+      <table aria-label="Roadmap-Fahrplan">
+        <thead>
+          <tr>
+            <th scope="col" style="width:330px">Vorgang</th>
+            <th scope="col" style="width:118px;text-align:end">Fortschritt</th>
+            <th scope="col" style="width:120px">Status</th>
+            <th scope="col" class="qtr">Q1<small>Jan–Mär</small></th>
+            <th scope="col" class="qtr">Q2<small>Apr–Jun</small></th>
+            <th scope="col" class="qtr">Q3<small>Jul–Sep</small></th>
+            <th scope="col" class="qtr">Q4<small>Okt–Dez</small></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr class="grp"><td colspan="7">Jetzt — laufender Zyklus</td></tr>
+
+          <!-- the canonical Payments reliability initiative, dense -->
+          <tr class="item" tabindex="0">
+            <td class="lab"><span class="ref">INIT-04</span><span class="nm">Payments reliability</span><span class="own">Platform</span></td>
+            <td class="meta">7/17 · 41%</td>
+            <td class="stat"><span class="st risk"><span class="ic" aria-hidden="true">▲</span>Gefährdet</span></td>
+            <td class="qcell"></td>
+            <td class="qcell"><div class="bar risk" style="inset-inline-start:20%;width:75%"><div class="fill" style="width:41%"></div></div></td>
+            <td class="qcell"><div class="bar risk" style="inset-inline-start:0;width:25%"></div><div class="dep" style="inset-inline-start:30%"></div></td>
+            <td class="qcell"></td>
+          </tr>
+          <!-- Greek string with diacritics (tonos) — G2 non-Latin, no tofu/clipping -->
+          <tr class="item" tabindex="0">
+            <td class="lab"><span class="ref">INIT-12</span><span class="nm" lang="el">Άμεσες πληρωμές SEPA</span><span class="own">Λίνα Ρ.</span></td>
+            <td class="meta">13/18 · 72%</td>
+            <td class="stat"><span class="st ok"><span class="ic" aria-hidden="true">●</span>Im Plan</span></td>
+            <td class="qcell"></td>
+            <td class="qcell"><div class="bar ok" style="inset-inline-start:8%;width:88%"><div class="fill" style="width:72%"></div></div></td>
+            <td class="qcell"></td>
+            <td class="qcell"></td>
+          </tr>
+          <!-- Cyrillic string with accents — G2 non-Latin -->
+          <tr class="item" tabindex="0">
+            <td class="lab"><span class="ref">INIT-09</span><span class="nm" lang="bg">Засилване на надеждността</span><span class="own">SRE</span></td>
+            <td class="meta">27/30 · 90%</td>
+            <td class="stat"><span class="st ok"><span class="ic" aria-hidden="true">●</span>Im Plan</span></td>
+            <td class="qcell"><div class="bar ok" style="inset-inline-start:40%;width:60%"><div class="fill" style="width:100%"></div></div></td>
+            <td class="qcell"><div class="bar ok" style="inset-inline-start:0;width:70%"><div class="fill" style="width:60%"></div></div></td>
+            <td class="qcell"></td>
+            <td class="qcell"></td>
+          </tr>
+
+          <tr class="agentnote"><td colspan="7"><span class="agbadge"><span class="sq" aria-hidden="true"></span>agent</span><span><b style="color:var(--text-primary)">InsightAgent</b> — INIT-04 hat den Zieltermin zwei Zyklen verfehlt; ISS-377 (Cache-Thrashing) ist der Blocker. <a href="#">Herkunfts-Pfad →</a></span></td></tr>
+
+          <tr class="grp"><td colspan="7">Als Nächstes — Q3</td></tr>
+
+          <tr class="item" tabindex="0">
+            <td class="lab"><span class="ref">INIT-15</span><span class="nm">Ledger export</span><span class="own">Payments</span></td>
+            <td class="meta">0/11 · 8%</td>
+            <td class="stat"><span class="st plan"><span class="ic" aria-hidden="true">◇</span>Geplant</span></td>
+            <td class="qcell"></td><td class="qcell"></td>
+            <td class="qcell"><div class="bar plan" style="inset-inline-start:10%;width:80%"></div></td>
+            <td class="qcell"></td>
+          </tr>
+          <tr class="item" tabindex="0">
+            <td class="lab"><span class="ref">INIT-21</span><span class="nm">EU-Datenresidenz-Steuerung</span><span class="own">Security</span></td>
+            <td class="meta">Discovery</td>
+            <td class="stat"><span class="st plan"><span class="ic" aria-hidden="true">◇</span>Discovery</span></td>
+            <td class="qcell"></td><td class="qcell"></td>
+            <td class="qcell"><div class="bar plan" style="inset-inline-start:55%;width:45%"></div></td>
+            <td class="qcell"><div class="bar plan" style="inset-inline-start:0;width:50%"></div></td>
+          </tr>
+
+          <tr class="restr"><td colspan="7"><span class="lk" aria-hidden="true">▣</span> <b style="color:var(--status-restricted);font-weight:600">1 eingeschränkter Vorgang</b> in Q3 — nur als Anzahl gezeigt; öffnen Sie die Projekt-Zugriffsansicht für „wer darf ihn sehen“. <span class="mono" style="color:var(--text-muted)">(kein Titel-Leak)</span></td></tr>
+
+          <tr class="grp"><td colspan="7">Später — Q4 &amp; danach</td></tr>
+          <tr class="item" tabindex="0">
+            <td class="lab"><span class="ref">INIT-30</span><span class="nm">CO₂-Beleg pro Transaktion</span><span class="own">—</span></td>
+            <td class="meta">7× angefragt</td>
+            <td class="stat"><span class="st plan"><span class="ic" aria-hidden="true">◇</span>Idee</span></td>
+            <td class="qcell"></td><td class="qcell"></td><td class="qcell"></td>
+            <td class="qcell"><div class="bar idea" style="inset-inline-start:45%;width:50%"></div></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="khint" aria-label="Tastaturkürzel">
+      <span><kbd>↑</kbd><kbd>↓</kbd> / <kbd>j</kbd><kbd>k</kbd> Zeile</span>
+      <span><kbd>Enter</kbd> öffnen</span>
+      <span><kbd>x</kbd> auswählen</span>
+      <span><kbd>/</kbd> filtern</span>
+      <span><kbd>⌘K</kbd> Palette</span>
+      <span style="margin-inline-start:auto"><a href="08-rtl-mirror.html">RTL-Ansicht →</a> · <a href="07-states.html">Zustände →</a></span>
+    </div>
+  </main>
+</div>
+<script>
+  // roving-tabindex keyboard nav demo: j/k and ↑/↓ move row focus; Enter "opens"
+  var rows=[].slice.call(document.querySelectorAll('tr.item'));
+  document.addEventListener('keydown',function(e){
+    var i=rows.indexOf(document.activeElement);
+    if(e.key==='j'||e.key==='ArrowDown'){ if(i<rows.length-1){rows[i+1>=0?i+1:0].focus();e.preventDefault();} else if(i<0){rows[0].focus();e.preventDefault();} }
+    if(e.key==='k'||e.key==='ArrowUp'){ if(i>0){rows[i-1].focus();e.preventDefault();} }
+    if(e.key==='/'&&i<0){ document.querySelector('input').focus(); e.preventDefault(); }
+  });
+</script>
+</body>
+</html>

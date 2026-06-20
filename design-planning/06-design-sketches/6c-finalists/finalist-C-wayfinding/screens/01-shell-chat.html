@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<!-- FINALIST C · Wayfinding — SCREEN 1: the shell + chat (carrier C-20).
+     Axes: density=medium · nav=rail · unification=distinct-per-surface · tone=utilitarian · agent=FOREGROUNDED · sovereignty=on-demand.
+     The one-product frame: icon rail · channel▸topic wayfinding nav · stream · topic context pane.
+     Agents are FOREGROUNDED (visible inline collaborators) yet CONTAINED in their topic (foregrounded ≠ firehose).
+     The §4.3 threading bet realised: channel ▸ topic ▸ message, each addressable like a platform number. [DEFERRED-UNTIL-USERS] -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wayfinding · Chat — #payments-incidents ▸ cache thrash</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<!-- throwaway: single CDN font; production self-hosts (sovereignty §3.3); Archivo carries Latin-ext+Greek+Cyrillic -->
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../tokens.css">
+<style>
+  /* wayfinding nav — the channel▸topic column, addressable like a departures board */
+  .nav{background:var(--panel);border-inline-end:1px solid var(--line);overflow:auto}
+  .nav .head{padding:var(--sp-4) var(--sp-4) var(--sp-3);border-bottom:1px solid var(--line)}
+  .nav .head h2{font-size:var(--fs-lg);font-weight:600}
+  .nav .head .scope{font-size:var(--fs-xs);color:var(--ink-3);margin-top:3px;display:flex;gap:6px;align-items:center}
+  .grp{font-size:10px;letter-spacing:.13em;text-transform:uppercase;color:var(--ink-3);padding:var(--sp-4) var(--sp-4) 6px;font-weight:600}
+  .ch{padding:0 var(--sp-2)}
+  .ch > a{display:flex;align-items:center;gap:var(--sp-2);padding:7px var(--sp-2);color:var(--ink-2);font-size:13.5px;text-decoration:none;border-radius:var(--r-md)}
+  .ch > a:hover{background:var(--panel-2)}
+  .ch > a.open{color:var(--ink);font-weight:500}
+  .ch > a .hash{color:var(--ink-3);font-family:var(--mono)}
+  .ch > a .un{margin-inline-start:auto;font-family:var(--mono);font-size:var(--fs-xs);background:var(--accent);color:var(--accent-ink);border-radius:var(--r-pill);padding:0 6px;font-weight:600}
+  .topics{margin:2px 0 6px;border-inline-start:1px solid var(--line-2);margin-inline-start:18px}
+  .topics a{display:flex;align-items:baseline;gap:var(--sp-2);padding:5px var(--sp-2) 5px 14px;color:var(--ink-3);font-size:var(--fs-sm);text-decoration:none}
+  .topics a:hover{color:var(--ink-2);background:var(--panel-2)}
+  .topics a.on{color:var(--ink);box-shadow:inset var(--addr-w) 0 0 var(--topic)}
+  .topics a .tn{color:var(--topic);font-family:var(--mono);font-size:var(--fs-xs)}
+  .topics a .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+  .topics a .un{font-family:var(--mono);font-size:10px;color:var(--ink-2);background:var(--line-2);border-radius:var(--r-pill);padding:0 5px}
+  .topics a .agent-dot{width:8px;height:8px;border-radius:2px;border:1.5px solid var(--agent);flex:none}
+
+  /* main stream */
+  .stream{display:flex;flex-direction:column;overflow:hidden;background:var(--bg)}
+  .streamhead{padding:var(--sp-3) var(--sp-5);border-bottom:1px solid var(--line);display:flex;align-items:center;gap:14px;background:var(--panel)}
+  .addr{display:flex;align-items:baseline;gap:var(--sp-2)}
+  .addr .ch2{font-family:var(--mono);color:var(--ink-2);font-size:13px}
+  .addr .sep{color:var(--line-2)}
+  .addr .topic{font-size:var(--fs-lg);font-weight:600;color:var(--ink)}
+  .addr .tn{font-family:var(--mono);font-size:var(--fs-xs);color:var(--topic);border:1px solid var(--agent-line);border-radius:var(--r-sm);padding:1px 6px}
+  .streamhead .sp{flex:1}
+  .streamhead .mut{font-size:var(--fs-xs);color:var(--ink-3)}
+
+  .scroll{flex:1;overflow:auto;padding:var(--sp-2) 0 var(--sp-3)}
+  .msg{display:grid;grid-template-columns:36px 1fr;gap:var(--sp-3);padding:7px var(--sp-5)}
+  .msg:hover{background:var(--panel)}
+  .ava{width:30px;height:30px;border-radius:6px;background:var(--panel-2);border:1px solid var(--line-2);display:grid;place-items:center;font-size:var(--fs-xs);font-weight:600;color:var(--ink-2);margin-top:2px}
+  .who{display:flex;align-items:baseline;gap:9px;margin-bottom:2px;flex-wrap:wrap}
+  .who .name{font-size:13.5px;font-weight:600;color:var(--ink)}
+  .who time{font-size:var(--fs-xs);color:var(--ink-3);font-family:var(--mono)}
+  .text{font-size:var(--fs-md);color:var(--ink);line-height:var(--lh-body)}
+  .text .mention{color:var(--accent);font-weight:600}
+  .text code{font-family:var(--mono);font-size:12px;background:var(--panel-2);padding:0 4px;border-radius:var(--r-sm)}
+
+  /* foregrounded agent message — unmistakably agent, contained inline */
+  .msg.agent{background:var(--agent-bg);box-shadow:inset 3px 0 0 var(--agent-line)}
+  .msg.agent .ava{border-color:var(--agent-line);color:var(--agent);background:var(--agent-bg)}
+  .obo{font-size:var(--fs-xs);color:var(--ink-3)}
+  .why{font-size:var(--fs-xs);color:var(--agent);text-decoration:underline;text-underline-offset:2px;background:none;border:0;margin-inline-start:auto}
+
+  /* unfurl card in stream — live, calm-by-default */
+  .unfurl{border:1px solid var(--line-2);border-radius:var(--r-md);margin-top:var(--sp-2);max-width:560px;overflow:hidden;background:var(--panel)}
+  .uh{display:flex;align-items:center;gap:var(--sp-2);padding:9px var(--sp-3);border-bottom:1px solid var(--line);font-size:var(--fs-sm)}
+  .uh .t{font-family:var(--mono);font-size:var(--fs-xs);color:var(--ink-3)}
+  .uh .title{color:var(--ink);font-weight:500}
+  .uh .live{margin-inline-start:auto;font-size:var(--fs-xs);color:var(--ink-2);display:inline-flex;gap:5px;align-items:center}
+  .uh .live .d{width:6px;height:6px;border-radius:50%;background:var(--ok)}
+  .ub{padding:var(--sp-3);font-size:var(--fs-sm);color:var(--ink-2);display:flex;gap:18px;flex-wrap:wrap}
+  .ub b{color:var(--ink);font-weight:500}
+  .ua{padding:var(--sp-2) var(--sp-3);border-top:1px solid var(--line);display:flex;gap:var(--sp-2)}
+
+  /* HITL approval card in-stream — pointer to the standout screen */
+  .msg.approval{background:var(--agent-bg);box-shadow:inset 3px 0 0 var(--accent)}
+  .card{border:1px solid var(--agent-line);border-radius:var(--r-md);margin-top:6px;max-width:560px;background:var(--panel)}
+  .ch3{padding:11px 14px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+  .auth{font-size:var(--fs-xs);color:var(--ink-3)} .auth b{color:var(--ink-2)}
+  .effects{list-style:none;padding:var(--sp-3) 14px;font-size:var(--fs-sm);color:var(--ink-2)}
+  .effects li{padding:4px 0;display:flex;gap:9px;align-items:center;flex-wrap:wrap}
+  .effects .v{font-family:var(--mono);font-size:var(--fs-xs);color:var(--ink);background:var(--panel-2);border:1px solid var(--line-2);border-radius:var(--r-sm);padding:1px 6px}
+  .effects .gate{margin-inline-start:auto;font-size:10px;color:var(--warn);border:1px solid var(--warn);border-radius:var(--r-sm);padding:0 6px}
+  .foot{padding:var(--sp-3) 14px;border-top:1px solid var(--line);display:flex;gap:var(--sp-2);align-items:center;flex-wrap:wrap}
+  .budget{margin-inline-start:auto;font-family:var(--mono);font-size:10.5px;color:var(--ink-3)}
+
+  /* collapsed agent chain — calm volume (foregrounded contained: chain = one line + count) */
+  .chain{margin:6px var(--sp-5);border:1px dashed var(--agent-line);border-radius:var(--r-md);background:var(--agent-bg);padding:9px var(--sp-3);display:flex;align-items:center;gap:var(--sp-3);font-size:var(--fs-sm);color:var(--ink-2)}
+  .chain .corr{font-family:var(--mono);font-size:10.5px;color:var(--topic);border:1px solid var(--agent-line);border-radius:var(--r-sm);padding:0 6px}
+  .chain .cnt{margin-inline-start:auto;font-family:var(--mono);font-size:var(--fs-xs);color:var(--ink-3)}
+
+  /* composer */
+  .composer{border-top:1px solid var(--line);padding:14px var(--sp-5) 18px;background:var(--panel)}
+  .box{border:1px solid var(--line-2);border-radius:6px;background:var(--bg)}
+  .row1{display:flex;align-items:center;gap:var(--sp-2);padding:var(--sp-2) var(--sp-3);color:var(--ink-3);font-size:13px}
+  .row2{display:flex;align-items:center;gap:6px;padding:7px var(--sp-3);border-top:1px solid var(--line)}
+  .tool{width:28px;height:28px;border-radius:var(--r-md);display:grid;place-items:center;color:var(--ink-3);font-size:13px;border:0;background:none}
+  .tool:hover{background:var(--panel-2);color:var(--ink-2)}
+  .send{margin-inline-start:auto;font-size:var(--fs-sm);font-weight:600;background:var(--accent);color:var(--accent-ink);border:0;border-radius:var(--r-md);padding:7px 16px}
+  .hint{font-size:var(--fs-xs);color:var(--ink-3);margin-top:7px;display:flex;gap:14px;flex-wrap:wrap}
+  .hint kbd{font-family:var(--mono);font-size:10px;border:1px solid var(--line-2);border-radius:var(--r-sm);padding:0 4px;color:var(--ink-2)}
+
+  /* right context pane */
+  .pane{background:var(--panel);border-inline-start:1px solid var(--line);overflow:auto;padding:var(--sp-5) 18px}
+  .pane h4{font-size:10px;letter-spacing:.13em;text-transform:uppercase;color:var(--ink-3);margin-bottom:11px}
+  .pane section{margin-bottom:var(--sp-6)}
+  .pinned{border:1px solid var(--line-2);border-radius:var(--r-md);padding:var(--sp-3);background:var(--bg)}
+  .pinned .r{display:flex;gap:var(--sp-2);align-items:center;font-size:var(--fs-sm);color:var(--ink-2);padding:5px 0}
+  .pinned .r .t{font-family:var(--mono);font-size:10px;color:var(--ink-3);width:28px}
+  .pinned .r .dot{width:7px;height:7px;border-radius:50%;margin-inline-start:auto}
+  .part{display:flex;flex-wrap:wrap;gap:6px}
+  .part .p{display:inline-flex;gap:6px;align-items:center;border:1px solid var(--line);border-radius:var(--r-pill);padding:3px 9px;font-size:var(--fs-xs);color:var(--ink-2)}
+  .part .p.ag{border-color:var(--agent-line);color:var(--agent)}
+  .part .p .mk{width:8px;height:8px;border:1.5px solid var(--agent);border-radius:2px;position:relative}
+  .part .p .mk::after{content:"";position:absolute;inset:2px;background:var(--agent);border-radius:1px}
+  .corrwalk{font-size:var(--fs-xs);color:var(--ink-3);line-height:1.7}
+  .corrwalk a{color:var(--topic);text-decoration:none}
+  .themebtn{position:fixed;bottom:14px;inset-inline-end:14px;z-index:10}
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <!-- ICON RAIL (one-product frame) -->
+  <nav class="iconrail" aria-label="Primary">
+    <div class="logo">M</div>
+    <a href="02-ci-run.html" title="CI"><span aria-hidden="true">◴</span></a>
+    <a href="02-ci-run.html" title="Code / PR"><span aria-hidden="true">⊘</span></a>
+    <a href="03-roadmap.html" title="Issues"><span aria-hidden="true">▤</span></a>
+    <a href="03-roadmap.html" title="Roadmap"><span aria-hidden="true">▦</span></a>
+    <a href="#" class="on" aria-current="page" title="Chat"><span aria-hidden="true">◇</span></a>
+    <a href="04-hitl-card.html" title="Inbox" style="position:relative"><span aria-hidden="true">▼</span><span class="bdg"></span></a>
+    <div class="sp"></div>
+    <a href="05-palette.html" title="Search (⌘K)"><span aria-hidden="true">⌕</span></a>
+    <a href="states.html" title="States"><span aria-hidden="true">○</span></a>
+  </nav>
+
+  <!-- CHANNEL ▸ TOPIC WAYFINDING NAV -->
+  <nav class="nav" aria-label="Channels and topics">
+    <div class="head">
+      <h2>Chat</h2>
+      <div class="scope">⌖ EU-West · Frankfurt cell · acme</div>
+    </div>
+    <div class="grp">Channels</div>
+    <div class="ch">
+      <a class="open" href="#"><span class="hash">#</span>payments-incidents</a>
+      <div class="topics" role="list">
+        <a class="on" href="#" role="listitem"><span class="tn">▸01</span><span class="name">cache thrash under burst</span><span class="agent-dot" title="agents active"></span><span class="un">3</span></a>
+        <a href="#" role="listitem"><span class="tn">▸02</span><span class="name">SLA risk · ISS-377</span><span class="un">1</span></a>
+        <a href="#" role="listitem"><span class="tn">▸03</span><span class="name">weighted-LRU canary</span></a>
+      </div>
+    </div>
+    <div class="ch">
+      <a href="#"><span class="hash">#</span>payments-api</a>
+      <div class="topics" role="list">
+        <a href="#" role="listitem"><span class="tn">▸07</span><span class="name">CI run #1894 red</span><span class="agent-dot"></span></a>
+      </div>
+    </div>
+    <div class="ch"><a href="#"><span class="hash">#</span>platform-eng<span class="un">5</span></a></div>
+    <div class="ch"><a href="#"><span class="hash">#</span>releases</a></div>
+    <div class="grp">Direct</div>
+    <div class="ch"><a href="#"><span class="hash" style="border-radius:50%;width:9px;height:9px;background:var(--ok);display:inline-block"></span>Mara Ø.</a></div>
+  </nav>
+
+  <!-- STREAM (one topic — the container that keeps foregrounded agents calm) -->
+  <section class="stream" aria-label="Topic: cache thrash under burst">
+    <header class="streamhead">
+      <div class="addr">
+        <span class="ch2">#payments-incidents</span><span class="sep" aria-hidden="true">▸</span>
+        <span class="topic">cache thrash under burst</span>
+        <span class="tn">topic 01</span>
+      </div>
+      <div class="sp"></div>
+      <span class="resid" title="Data residency (on demand)"><span class="d"></span>eu-west · Frankfurt</span>
+      <span class="mut" style="margin-inline-start:12px">3 participants · 1 agent · started 3h ago</span>
+    </header>
+
+    <div class="scroll">
+
+      <article class="msg">
+        <div class="ava">MØ</div>
+        <div>
+          <div class="who"><span class="name">Mara Ø.</span><time>13:02</time></div>
+          <div class="text">The OOM repro is in <a class="ref" href="02-ci-run.html">CI run #1894 <span class="dot status crit"><span aria-hidden="true">✗</span></span></a>. Counting entries was the bug — switching to a weight bound in <a class="ref" href="#">PR #412 <span class="dot" style="background:var(--accent)"></span></a>.</div>
+        </div>
+      </article>
+
+      <article class="msg">
+        <div class="ava">JV</div>
+        <div>
+          <div class="who"><span class="name">Jürgen Vögel</span><time>13:09</time></div>
+          <div class="text"><span class="mention">@mara</span> hast du <code>weight()</code> beim Einfügen zwischengespeichert? Neuberechnung bei der Verdrängung ist der Hot-Path.</div>
+        </div>
+      </article>
+
+      <!-- FOREGROUNDED agent: visible inline collaborator, clearly labelled, CONTAINED in this topic -->
+      <article class="msg agent">
+        <div class="ava" aria-hidden="true">▣</div>
+        <div>
+          <div class="who">
+            <span class="agent-tag"><span class="mk"></span>TriageAgent</span>
+            <span class="obo">triggered by ci.failed on payments-api · on behalf of @mara</span>
+            <time>13:10</time>
+            <button class="why">Why? ↗</button>
+          </div>
+          <div class="text">Filed and linked the regression. Eviction recomputes <code>weight()</code> per pop — Jürgen's point. Suggested cached-weight patch on the diff.</div>
+          <div class="unfurl" role="group" aria-label="Live issue preview">
+            <div class="uh"><span class="t">ISS</span><span class="title">#377 Payments cache thrashes under burst load</span><span class="live"><span class="d"></span>Live · In review</span></div>
+            <div class="ub">
+              <span>Assignee <b>@mara</b></span>
+              <span>Priority <b>High</b></span>
+              <span class="status ok"><span class="g" aria-hidden="true">✓</span>linked PR #412</span>
+            </div>
+            <div class="ua"><a class="btn sm" href="03-roadmap.html">Open issue</a><button class="btn sm">Transition →</button></div>
+          </div>
+        </div>
+      </article>
+
+      <!-- collapsed agent chain — foregrounded ≠ firehose: the chain folds to ONE line + count -->
+      <div class="chain" role="button" tabindex="0">
+        <span class="agent-tag"><span class="mk"></span>chain</span>
+        TriageAgent did 4 more things — labelled, deduped, posted status, linked CI
+        <span class="corr">correlation · incident-#9</span>
+        <span class="cnt">expand 4 ▾</span>
+      </div>
+
+      <article class="msg">
+        <div class="ava">MØ</div>
+        <div>
+          <div class="who"><span class="name">Mara Ø.</span><time>13:24</time></div>
+          <div class="text">Looks right. <span class="mention">@FixAgent</span> prep the follow-up once green? Open the PR, move #377 to In Review, post here.</div>
+        </div>
+      </article>
+
+      <!-- HITL approval card in-stream — full version is screen 4 -->
+      <article class="msg approval agent">
+        <div class="ava" aria-hidden="true">▣</div>
+        <div>
+          <div class="who"><span class="agent-tag"><span class="mk"></span>FixAgent</span><span class="obo">awaiting your approval</span><time>13:31</time><button class="why">Why? ↗</button></div>
+          <div class="text">Plan ready. Nothing happens until a human approves:</div>
+          <div class="card" role="group" aria-label="Agent proposal awaiting your approval">
+            <div class="ch3">
+              <span class="agent-tag"><span class="mk"></span>FixAgent</span>
+              <span class="auth">on behalf of <b>@mara</b> · scope <span class="mono" style="font-size:11px">repo/payments-api</span></span>
+            </div>
+            <ul class="effects">
+              <li><span aria-hidden="true">→</span> open follow-up <span class="v">PR #412</span> on <span class="v">main</span> <span class="gate">⚷ gated</span></li>
+              <li><span aria-hidden="true">→</span> transition <span class="v">ISS-377</span> → In Review</li>
+              <li><span aria-hidden="true">→</span> post result to <span class="v">#payments-incidents ▸ 01</span></li>
+            </ul>
+            <div class="foot">
+              <a class="btn p" href="04-hitl-card.html">Approve</a>
+              <a class="btn" href="04-hitl-card.html">Edit</a>
+              <a class="btn" href="04-hitl-card.html">Reject</a>
+              <span class="budget">budget 3 / 12 · depth 2 / 12</span>
+            </div>
+          </div>
+        </div>
+      </article>
+
+    </div>
+
+    <!-- COMPOSER -->
+    <div class="composer">
+      <div class="box">
+        <div class="row1"><span>Message #payments-incidents ▸ cache thrash under burst…</span></div>
+        <div class="row2">
+          <button class="tool" title="Slash command" aria-label="Slash command">/</button>
+          <button class="tool" title="Mention" aria-label="Mention">@</button>
+          <button class="tool" title="Reference" aria-label="Reference">#</button>
+          <button class="tool" title="Code block" aria-label="Code block">⟨⟩</button>
+          <button class="tool" title="Attach" aria-label="Attach">⊕</button>
+          <button class="send">Send</button>
+        </div>
+      </div>
+      <div class="hint"><span><kbd>@</kbd> people · agents · artifacts</span><span><kbd>#</kbd> reference, unfurls live</span><span>paste a link → it unfurls (screen 5)</span></div>
+    </div>
+  </section>
+
+  <!-- TOPIC CONTEXT PANE -->
+  <aside class="pane" aria-label="Topic context">
+    <section>
+      <h4>Topic · pinned</h4>
+      <div class="pinned">
+        <div class="r"><span class="t">PR</span><span>#412 weighted LRU</span><span class="dot" style="background:var(--accent)"></span></div>
+        <div class="r"><span class="t">ISS</span><span>#377 cache thrash</span><span class="dot" style="background:var(--accent)"></span></div>
+        <div class="r"><span class="t">CI</span><span>run #1894 red</span><span class="dot" style="background:var(--crit)"></span></div>
+        <div class="r"><span class="t">DOC</span><span>Cache Eviction Design</span><span class="dot" style="background:var(--ok)"></span></div>
+      </div>
+    </section>
+    <section>
+      <h4>Participants</h4>
+      <div class="part">
+        <span class="p">MØ Mara Ø.</span>
+        <span class="p">JV Jürgen Vögel</span>
+        <span class="p ag"><span class="mk"></span>TriageAgent</span>
+        <span class="p ag"><span class="mk"></span>FixAgent</span>
+      </div>
+    </section>
+    <section>
+      <h4>Provenance · this chain</h4>
+      <div class="corrwalk">
+        <span class="mono" style="color:var(--topic)">correlation: incident-#9</span><br>
+        ci.failed → <a href="02-ci-run.html">TriageAgent run</a> → <a href="03-roadmap.html">ISS-377</a> → this topic → <a href="04-hitl-card.html">FixAgent plan</a> · <a href="#">audit ✓</a>
+      </div>
+    </section>
+  </aside>
+</div>
+
+<button class="btn themebtn" onclick="document.documentElement.dataset.theme = document.documentElement.dataset.theme==='light'?'dark':'light'">◐ light / dark</button>
+</body>
+</html>

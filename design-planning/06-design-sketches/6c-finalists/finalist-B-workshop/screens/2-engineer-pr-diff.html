@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<!-- Finalist B "Workshop" · Screen 2 — DENSE ENGINEER SURFACE: PR #412 context pane + diff (flagship wedge W1)
+     The bet: even at the warm/calm pole, engineers are NOT starved. Earned density (compact rows, mono diff,
+     keyboard hints) kept calm. Same shell/chip/identity/palette as the roadmap — this is the engineer LENS of
+     the SAME ISS-377 data (D4 one-product + D5 dual-audience proof). Distinct-per-surface = mono diff + compact
+     density (config on the shared views component), NOT a forked look.
+     Keyboard model: j/k move file/hunk, n/p next-prev change, c comment on focused line, F7 next change,
+     a approve review, x toggle file viewed — full muscle-memory path, mouse-complete. -->
+<html lang="en" dir="ltr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Workshop · PR #412 — Fix cache eviction under load</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,560&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../tokens.css">
+<style>
+  .prbar{display:flex;align-items:center;gap:var(--s-3);flex-wrap:wrap;margin-block-end:var(--s-4)}
+  .prbar h1{font-family:var(--serif);font-weight:560;font-size:22px;letter-spacing:-.01em}
+  .prbar .num{color:var(--text-3);font-weight:500}
+  .ci-banner{display:flex;align-items:center;gap:10px;border:1px solid var(--diff-del-line);background:var(--status-danger-bg);
+    border-radius:var(--r-md);padding:9px 13px;font-size:13px;color:var(--text);margin-block-end:var(--s-4)}
+  .ci-banner .grow{flex:1}
+  .toolbar{display:flex;align-items:center;gap:var(--s-2);font-size:12px;color:var(--text-3);margin-block-end:var(--s-2)}
+  .toolbar kbd{font-family:var(--mono);font-size:11px;border:1px solid var(--line);border-radius:4px;padding:0 5px;color:var(--text-2);background:var(--surface-raise)}
+  .filehdr{display:flex;align-items:center;gap:8px;border:1px solid var(--line);border-block-end:0;
+    border-radius:var(--r-md) var(--r-md) 0 0;background:var(--surface-sunk);padding:8px 12px;font-family:var(--mono);font-size:12.5px;color:var(--text)}
+  .filehdr .stat{margin-inline-start:auto;font-size:12px;color:var(--text-3)}
+  .diff{border:1px solid var(--line);border-radius:0 0 var(--r-md) var(--r-md);overflow:hidden;
+    font-family:var(--mono);font-size:12.5px;line-height:1.7;background:var(--surface-raise)}
+  .row{display:grid;grid-template-columns:44px 44px 1fr;align-items:start}
+  .row .ln{text-align:end;padding-inline-end:10px;color:var(--diff-add-line);user-select:none;font-variant-numeric:tabular-nums}
+  .row .code{padding-inline-start:12px;white-space:pre-wrap;color:var(--text)}
+  .row.add{background:var(--diff-add-bg)} .row.add .code::before{content:"+ ";color:var(--status-ok)}
+  .row.del{background:var(--diff-del-bg)} .row.del .code::before{content:"- ";color:var(--status-danger)}
+  .row.ctx .code::before{content:"  "}
+  .row.focused{box-shadow:inset 3px 0 0 var(--focus)}
+  .hunk{background:var(--surface-sunk);color:var(--text-3);padding:3px 12px;font-size:12px;grid-column:1/-1}
+  .tok-k{color:var(--accent);font-weight:500} .tok-c{color:var(--text-3);font-style:italic}
+  /* inline agent review comment, anchored to a line — ambient, labelled, gated nowhere (advisory) */
+  .review{margin:0;border:1px solid var(--line);border-block-start:0;background:var(--agent-wash);padding:11px 14px}
+  .review .rh{display:flex;align-items:center;gap:8px;margin-block-end:6px;font-size:13px}
+  .review .rh time{margin-inline-start:auto;font-size:11px;color:var(--text-3)}
+  .review p{font-family:var(--sans);font-size:13px;color:var(--text-2);line-height:1.5}
+  .review .acts{margin-block-start:9px;display:flex;gap:8px}
+  /* CONTEXT PANE — the why-pane assembles itself (the wedge) */
+  .pane h4{font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--text-3);margin-block-end:10px}
+  .pane section{margin-block-end:var(--s-6)}
+  .pane .reflist{display:flex;flex-direction:column;gap:8px}
+  .pane .reflist a{display:flex;gap:9px;align-items:flex-start;text-decoration:none;border:1px solid var(--line);
+    border-radius:var(--r-sm);padding:9px 11px;background:var(--surface)}
+  .pane .reflist a:hover{border-color:var(--line-strong)}
+  .pane .reflist .t{font-family:var(--mono);font-size:10px;color:var(--text-3);margin-block-start:2px}
+  .pane .reflist .ti{font-size:12.5px;color:var(--text);line-height:1.35}
+  .pane .reflist .w{font-size:11px;color:var(--text-3);margin-block-start:3px}
+  .pane .reviewer{display:flex;align-items:center;gap:8px;font-size:13px}
+</style>
+</head>
+<body>
+<div class="shell">
+  <header class="topbar">
+    <span class="brand">Myelin</span>
+    <span class="scope">Code <b>·</b> <b>acme/payments-api</b> <b>·</b>
+      <span class="resid" title="Residency"><span class="d"></span>EU-West · Frankfurt</span></span>
+    <span class="grow"></span>
+    <button class="kbtn">Jump to… <kbd>⌘K</kbd></button>
+    <button class="kbtn">Inbox</button>
+    <button class="avatar" aria-label="Mara Ø.">MØ</button>
+  </header>
+
+  <div class="body has-pane">
+    <nav class="rail" aria-label="Primary">
+      <a href="#" class="on" title="Code" aria-current="page">Co</a>
+      <a href="3-fixagent-hitl.html" title="CI">CI</a>
+      <a href="1-shell-roadmap-lens.html" title="Issues">Is</a>
+      <a href="4-knowledge-unfurl.html" title="Knowledge">Kn</a>
+      <a href="3-fixagent-hitl.html" title="Chat">Ch</a>
+      <span class="sep"></span>
+      <a href="#" title="Home">Ho</a>
+    </nav>
+
+    <aside class="side" aria-label="PR navigation">
+      <div class="ctx">Pull request</div>
+      <a class="v on" href="#"><span class="dot"></span>Conversation</a>
+      <a class="v" href="#"><span class="dot"></span>Files changed · 3</a>
+      <a class="v" href="3-fixagent-hitl.html"><span class="dot"></span>Checks · 1 failing</a>
+      <div class="ctx">Same data, other lens</div>
+      <a class="v" href="1-shell-roadmap-lens.html"><span class="dot"></span>PM roadmap</a>
+      <div class="lens">
+        <div class="l">This view · lens</div>
+        <div class="seg" role="group" aria-label="Audience lens (same issue records)">
+          <button class="on" aria-pressed="true">Engineer</button>
+          <button onclick="location.href='1-shell-roadmap-lens.html'">PM</button>
+          <button onclick="location.href='1-shell-roadmap-lens.html'">Exec</button>
+        </div>
+      </div>
+    </aside>
+
+    <main class="content">
+      <div class="prbar">
+        <h1 class="serif">Fix cache eviction under load <span class="num">#412</span></h1>
+        <span class="status neutral"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="6" r="2.4"/><circle cx="6" cy="18" r="2.4"/><path d="M6 8.4v7M18 8v4a4 4 0 0 1-4 4h-3"/><circle cx="18" cy="6" r="2.4"/></svg> Open · weighted LRU</span>
+      </div>
+
+      <div class="ci-banner" role="status">
+        <span class="status danger"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M15 9l-6 6M9 9l6 6"/></svg> main is RED</span>
+        <span class="grow">CI run <b>#1894</b> failing — <span class="mono">payments-api</span> integration test. Merge to <code class="mono">main</code> is gated.</span>
+        <a class="btn" href="3-fixagent-hitl.html">View run #1894</a>
+      </div>
+
+      <div class="toolbar">
+        Keyboard: <kbd>j</kbd>/<kbd>k</kbd> hunk · <kbd>n</kbd>/<kbd>p</kbd> change · <kbd>c</kbd> comment line · <kbd>x</kbd> mark viewed · <kbd>a</kbd> approve
+      </div>
+
+      <div class="filehdr"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3h9l3 3v15H6z"/><path d="M9 9h6M9 13h6"/></svg> src/cache/weighted_lru.rs <span class="stat">+18 −6</span></div>
+      <div class="diff" role="region" aria-label="Diff for src/cache/weighted_lru.rs">
+        <div class="hunk">@@ -41,9 +41,12 @@ impl WeightedLru {</div>
+        <div class="row ctx"><span class="ln">41</span><span class="ln">41</span><span class="code">    <span class="tok-k">fn</span> insert(&amp;mut self, k: Key, v: Value) {</span></div>
+        <div class="row del"><span class="ln">42</span><span class="ln"></span><span class="code">        self.map.insert(k, v);</span></div>
+        <div class="row del"><span class="ln">43</span><span class="ln"></span><span class="code">        <span class="tok-c">// evict by entry count</span></span></div>
+        <div class="row add"><span class="ln"></span><span class="ln">42</span><span class="code">        <span class="tok-k">let</span> w = v.weight();</span></div>
+        <div class="row add focused" tabindex="0"><span class="ln"></span><span class="ln">43</span><span class="code">        self.bytes += w;  <span class="tok-c">// bound by total weight</span></span></div>
+        <div class="row add"><span class="ln"></span><span class="ln">44</span><span class="code">        self.map.insert(k, v);</span></div>
+        <div class="row ctx"><span class="ln">44</span><span class="ln">45</span><span class="code">        <span class="tok-k">while</span> self.over_limit() {</span></div>
+        <div class="row del"><span class="ln">45</span><span class="ln"></span><span class="code">            self.evict_one_by_count();</span></div>
+        <div class="row add"><span class="ln"></span><span class="ln">46</span><span class="code">            self.evict_oldest_until_under_weight();</span></div>
+        <div class="row ctx"><span class="ln">46</span><span class="ln">47</span><span class="code">        }</span></div>
+      </div>
+
+      <!-- agent reviewer comment, anchored to focused line — advisory, labelled, never disguised -->
+      <div class="review" role="group" aria-label="Agent review comment on line 43">
+        <div class="rh">
+          <svg class="agent-mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M12 3l8 5.8-3 9.4H7L4 8.8 12 3z"/></svg>
+          <b>ReviewAgent</b><span class="agent-badge">Agent · advisory</span><time>commented 12m ago</time>
+        </div>
+        <p><code class="mono">self.bytes += w</code> isn't decremented in <code class="mono">evict_oldest_until_under_weight()</code> on the
+           error path — a rejected oversized insert will leak weight. Suggest decrementing before the early return.
+           This is advisory; no effect runs without your action.</p>
+        <div class="acts"><button class="btn">View suggested patch</button><button class="btn-quiet btn">Dismiss</button></div>
+      </div>
+    </main>
+
+    <!-- CONTEXT PANE: the why-pane assembles itself from the graph (the wedge) -->
+    <aside class="context-pane pane" aria-label="Pull request context">
+      <section>
+        <h4>Reviewers</h4>
+        <div class="reviewer"><span class="av">MØ</span>Mara Ø. <span class="status neutral">requested</span></div>
+        <div class="reviewer" style="margin-top:8px">
+          <svg class="agent-mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M12 3l8 5.8-3 9.4H7L4 8.8 12 3z"/></svg>
+          ReviewAgent <span class="agent-badge">Agent</span>
+        </div>
+      </section>
+      <section>
+        <h4>Linked artifacts · resolves</h4>
+        <div class="reflist">
+          <a href="1-shell-roadmap-lens.html"><span class="status warn" style="padding:2px 6px"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01"/></svg></span><div><div class="t">ISS</div><div class="ti">#377 Payments cache thrashes under burst load</div><div class="w">resolved-by · High · SLA at risk</div></div></a>
+          <a href="3-fixagent-hitl.html"><span class="status danger" style="padding:2px 6px"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 9l-6 6M9 9l6 6"/></svg></span><div><div class="t">CI</div><div class="ti">run #1894 · integration test</div><div class="w">triggered by this PR · failing</div></div></a>
+          <a href="4-knowledge-unfurl.html"><span class="chip" style="padding:2px 6px"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3h9l3 3v15H6z"/></svg></span><div><div class="t">DOC</div><div class="ti">Cache Eviction Design</div><div class="w">referenced in description</div></div></a>
+        </div>
+      </section>
+      <section>
+        <h4>Merge</h4>
+        <p style="font-size:12.5px;color:var(--text-2)">Blocked: <code class="mono">main</code> protected, checks must pass.
+           FixAgent has proposed a follow-up — review it on the <a href="3-fixagent-hitl.html">incident topic</a>.</p>
+      </section>
+    </aside>
+  </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<!-- Finalist A "Instrument" · Screen 2 — the DENSE engineer surface: PR #412 diff (flagship wedge W1, C-05 evolved).
+     Earns density, keeps it calm: hairline grouping, status by glyph+label, one accent on focus only, line-level keyboard hints.
+     G1: status-not-colour-alone (+/- sign + glyph), diff keyboard model documented, visible focus.
+     G2: German review comment (umlaut), Greek comment in a mono diff line (non-Latin coverage), refs <bdi>-isolated. Light+dark via vars. -->
+<html lang="en" dir="ltr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Instrument · PR #412 · diff</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../tokens.css">
+<style>
+html,body{height:100%}
+body{margin:0;background:var(--surface-base);color:var(--t1);font:13px/var(--lh-body) var(--sans);-webkit-font-smoothing:antialiased;overflow:hidden}
+.mono{font-family:var(--mono)}
+button,input{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
+
+.shell{display:grid;grid-template-rows:40px 1fr;height:100vh}
+.topbar{display:flex;align-items:center;gap:var(--space-3);border-block-end:var(--hairline) solid var(--border);padding-inline:var(--space-3);background:var(--surface-raised)}
+.brand{display:flex;align-items:center;gap:7px;font-weight:600}
+.brand .glyph{width:14px;height:14px;border:1.5px solid var(--t2);border-radius:var(--r1);position:relative}
+.brand .glyph::after{content:"";position:absolute;inset:3px 3px auto auto;width:4px;height:4px;background:var(--accent);border-radius:1px}
+.crumbs{display:flex;align-items:center;gap:6px;color:var(--t2);font-family:var(--mono);font-size:12px}
+.crumbs b{color:var(--t1);font-weight:500}.crumbs .sep{color:var(--t3)}
+.kbar{margin-inline-start:auto;display:flex;align-items:center;gap:var(--space-2)}
+.cmdk{display:flex;align-items:center;gap:8px;height:var(--control-h);padding-inline:9px;min-width:220px;border:var(--hairline) solid var(--border-strong);border-radius:var(--r1);color:var(--t3);background:var(--surface-sunken)}
+.cmdk .k{margin-inline-start:auto;font-family:var(--mono);font-size:11px;border:var(--hairline) solid var(--border);border-radius:var(--r1);padding:1px 5px}
+.theme{font-size:11px;color:var(--t3);border:var(--hairline) solid var(--border);border-radius:var(--r1);padding:4px 8px}
+.avatar{width:22px;height:22px;border-radius:50%;background:var(--surface-hover);display:grid;place-items:center;font-size:10px;color:var(--t2)}
+
+.bodyrow{display:grid;grid-template-columns:48px 1fr 320px;min-height:0}
+.rail{border-inline-end:var(--hairline) solid var(--border);background:var(--surface-raised);display:flex;flex-direction:column;align-items:center;padding-block-start:var(--space-2);gap:2px}
+.rail a{width:34px;height:34px;display:grid;place-items:center;color:var(--t3);border-radius:var(--r1);font-size:11px;text-decoration:none;font-family:var(--mono)}
+.rail a.on{color:var(--t1);background:var(--surface-hover);box-shadow:inset 2px 0 0 var(--c-rail-active)}
+.rail .sep{flex:1}
+
+.diffwrap{overflow:auto;background:var(--surface-base)}
+.prhead{position:sticky;top:0;z-index:5;background:var(--surface-raised);border-block-end:var(--hairline) solid var(--border);padding:11px 18px}
+.prtitle{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.prtitle h1{margin:0;font-size:15px;font-weight:600;letter-spacing:-.01em}
+.prtitle .num{font-family:var(--mono);color:var(--t3);font-size:13px}
+.pill{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;font-weight:500;border:var(--hairline) solid var(--border);border-radius:var(--r-pill);padding:2px 8px;color:var(--t1)}
+.pill.bad .ic{color:var(--bad)} .pill.open .ic{color:var(--ok)}
+.difftools{display:flex;align-items:center;gap:6px;padding:8px 18px;border-block-end:var(--hairline) solid var(--border);background:var(--surface-raised);position:sticky;top:42px;z-index:4;flex-wrap:wrap}
+.seg{display:flex;border:var(--hairline) solid var(--border-strong);border-radius:var(--r1);overflow:hidden}
+.seg button{padding:4px 10px;font-size:11.5px;color:var(--t2);border-inline-end:var(--hairline) solid var(--border)}
+.seg button:last-child{border-inline-end:0}
+.seg button.on{background:var(--surface-hover);color:var(--t1)}
+.toolbtn{padding:4px 9px;border:var(--hairline) solid var(--border-strong);border-radius:var(--r1);font-size:11.5px;color:var(--t2);min-height:var(--target-min)}
+.toolbtn:hover{color:var(--t1)}
+.difftools .spacer{flex:1}
+.diffstat{font-family:var(--mono);font-size:11px;color:var(--t2)}
+.diffstat .p{color:var(--ok)}.diffstat .m{color:var(--bad)}
+.kbdhint{font-family:var(--mono);font-size:10.5px;color:var(--t3);border:var(--hairline) solid var(--border);border-radius:var(--r1);padding:2px 6px}
+
+.file{border-block-end:var(--hairline) solid var(--border)}
+.filehd{display:flex;align-items:center;gap:9px;padding:8px 18px;background:var(--surface-sunken);position:sticky;top:84px;z-index:3;border-block-end:var(--hairline) solid var(--border)}
+.filehd .chev{color:var(--t3);font-family:var(--mono)}
+.filehd .path{font-family:var(--mono);font-size:12px;color:var(--t1)}
+.filehd .badge{font-family:var(--mono);font-size:10px;color:var(--t2);border:var(--hairline) solid var(--border);border-radius:var(--r1);padding:0 5px}
+.filehd .vw{margin-inline-start:auto;display:flex;align-items:center;gap:6px;font-size:11px;color:var(--t2)}
+.filehd input{accent-color:var(--accent)}
+
+table.code{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:12px;line-height:1.55}
+table.code td{vertical-align:top}
+.ln{width:46px;text-align:end;padding-inline-end:10px;color:var(--t3);user-select:none;border-inline-end:var(--hairline) solid var(--border)}
+.cd{padding-inline:14px;white-space:pre;color:var(--t2)}
+tr.codeline:focus-within,tr.codeline.cur{box-shadow:inset 2px 0 0 var(--c-focus-ring);background:var(--surface-raised)}
+tr.hunk td{background:var(--surface-sunken);color:var(--t3);padding:2px 14px;border-block:var(--hairline) solid var(--border)}
+tr.add .cd{background:var(--add-bg)}tr.add .ln{background:var(--add-bg);color:var(--add-txt)}
+tr.del .cd{background:var(--del-bg)}tr.del .ln{background:var(--del-bg);color:var(--del-txt)}
+/* the +/- sign is a TEXT marker — change is not colour-alone */
+.sign{display:inline-block;width:10px;color:var(--t3)}
+tr.add .sign{color:var(--add-txt)}tr.del .sign{color:var(--del-txt)}
+.tok-k{color:var(--tok-k)}.tok-s{color:var(--tok-s)}.tok-f{color:var(--tok-f)}.tok-c{color:var(--tok-c);font-style:italic}.tok-n{color:var(--tok-n)}
+.ref{unicode-bidi:isolate} /* SHAs/handles/myelin:// stay LTR inside any prose (R-18 §4.1) */
+
+/* inline agent-suggested fix — reserved treatment, label + plain mark, no sparkle */
+.agentfix{margin:6px 14px 6px 60px;border:var(--hairline) solid var(--agent);border-radius:var(--r1);background:var(--surface-raised);padding:8px 10px}
+.agentfix .hd{display:flex;align-items:center;gap:7px;font-family:var(--sans);font-size:11.5px;color:var(--t1);margin-bottom:6px}
+.agentfix .mark{width:13px;height:13px;border:1.5px solid var(--agent);border-radius:2px;display:grid;place-items:center}
+.agentfix .mark i{width:3px;height:3px;background:var(--agent)}
+.agentfix .lbl{font-size:9px;text-transform:uppercase;letter-spacing:.04em;color:var(--agent);border:var(--hairline) solid var(--agent);border-radius:var(--r1);padding:0 4px}
+.agentfix .scope{margin-inline-start:auto;color:var(--t3);font-size:10.5px}
+.agentfix .b{font-family:var(--mono);font-size:11.5px;color:var(--t2);white-space:pre-wrap}
+.agentfix .sug{color:var(--add-txt)}
+.agentfix .acts{margin-top:8px;display:flex;gap:6px}
+.agentfix .acts button{font-family:var(--sans);font-size:11px;padding:4px 10px;border:var(--hairline) solid var(--border-strong);border-radius:var(--r1);color:var(--t2);min-height:var(--target-min)}
+.agentfix .acts button.primary{background:var(--c-btn-primary-bg);border-color:var(--c-btn-primary-bg);color:var(--c-btn-primary-text);font-weight:600}
+
+/* inline review comment anchored to a line */
+.comment{margin:6px 14px 8px 60px;border:var(--hairline) solid var(--border);border-radius:var(--r1);background:var(--surface-raised)}
+.comment .ch{display:flex;align-items:center;gap:7px;padding:7px 10px;border-block-end:var(--hairline) solid var(--border);font-size:11.5px}
+.comment .av{width:18px;height:18px;border-radius:50%;background:var(--surface-hover);display:inline-grid;place-items:center;font-size:9px;color:var(--t2)}
+.comment .cb{padding:8px 10px;font-size:12.5px;color:var(--t2)}
+.comment .cb code{font-family:var(--mono);background:var(--surface-sunken);padding:1px 4px;border-radius:var(--r1);color:var(--t1)}
+.cchip{display:inline-flex;align-items:center;gap:4px;font-family:var(--mono);font-size:11px;border:var(--hairline) solid var(--border-strong);border-radius:var(--r1);padding:0 5px;color:var(--t1)}
+
+/* right why-pane */
+.why{border-inline-start:var(--hairline) solid var(--border);background:var(--surface-raised);overflow:auto}
+.why h2{font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--t3);margin:0;padding:12px 16px 6px;font-weight:600}
+.card{margin:0 12px 8px;border:var(--hairline) solid var(--border);border-radius:var(--r1);background:var(--surface-base);padding:9px 11px}
+.card .top{display:flex;align-items:center;gap:7px;font-family:var(--mono);font-size:11px;color:var(--t2)}
+.card .ti{margin-top:5px;font-size:12.5px;color:var(--t1);font-weight:500}
+.card .sub{margin-top:5px;display:flex;align-items:center;gap:7px;color:var(--t2);font-size:11px}
+.reviewers{display:flex;flex-direction:column;gap:6px}
+.rev{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--t2)}
+.rev .av{width:18px;height:18px;border-radius:50%;background:var(--surface-hover);display:inline-grid;place-items:center;font-size:9px}
+.rev .av.agent{border-radius:2px;border:var(--hairline) solid var(--agent);background:transparent;color:var(--agent)}
+.rev .st{margin-inline-start:auto;font-size:11px}
+.warn-c{color:var(--warn)}.agent-c{color:var(--agent)}
+.foot{padding:10px 16px;color:var(--t3);font-size:11px;font-family:var(--mono);border-block-start:var(--hairline) solid var(--border)}
+
+/* rebase-orphan banner (an unglamorous diff state, honest + a path) */
+.orphan{margin:10px 14px;border:var(--hairline) solid var(--warn);border-radius:var(--r1);background:var(--surface-raised);padding:10px 12px;display:flex;gap:10px;align-items:flex-start}
+.orphan .ic{color:var(--warn);flex:none;margin-top:1px}
+.orphan .tx{font-size:12px;color:var(--t2)}
+.orphan .tx b{color:var(--t1);font-weight:500}
+.orphan button{margin-top:7px;font-size:11.5px;padding:5px 11px;border:var(--hairline) solid var(--border-strong);border-radius:var(--r1);color:var(--t1);min-height:var(--target-min)}
+</style>
+</head>
+<body>
+<div class="shell">
+  <header class="topbar">
+    <span class="brand"><span class="glyph"></span>myelin</span>
+    <nav class="crumbs" aria-label="Breadcrumb"><span>acme</span><span class="sep">/</span><b>payments-api</b><span class="sep">/</span><span>PR</span><b>#412</b><span class="sep">/</span><span>diff</span></nav>
+    <div class="kbar">
+      <button class="cmdk" aria-label="Search or run a command">Search or run a command <span class="k">⌘K</span></button>
+      <button class="theme" id="themebtn" aria-pressed="false">Theme: dark</button>
+      <span class="avatar" title="Mara Ø.">MØ</span>
+    </div>
+  </header>
+
+  <div class="bodyrow">
+    <nav class="rail" aria-label="Surfaces">
+      <a href="1-shell-pr-context.html" class="on" aria-current="page" title="Code">Co</a>
+      <a href="3-ci-run.html" title="CI">CI</a>
+      <a href="4-board-roadmap.html" title="Issues">Is</a>
+      <a href="#" title="Knowledge">Kn</a>
+      <a href="#" title="Chat">Ch</a>
+      <span class="sep"></span>
+      <a href="5-hitl-inbox.html" title="Inbox">In</a>
+    </nav>
+
+    <main class="diffwrap" aria-label="Files changed in PR #412">
+      <div class="prhead">
+        <div class="prtitle">
+          <h1>Fix cache eviction under load</h1><span class="num">#412</span>
+          <span class="pill open" title="State: Open"><svg class="ic" width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="5" cy="4" r="2"/><circle cx="5" cy="12" r="2"/><path d="M5 6v4"/><path d="M11 12a5 5 0 00-5-5"/><circle cx="11" cy="12" r="1.6"/></svg>Open</span>
+          <span class="pill bad" title="Checks: 1 failing"><svg class="ic" width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 5l6 6M11 5l-6 6"/></svg>integration failing</span>
+        </div>
+      </div>
+
+      <div class="difftools" role="toolbar" aria-label="Diff controls">
+        <div class="seg" role="tablist" aria-label="Diff layout">
+          <button class="on" role="tab" aria-selected="true">Unified</button>
+          <button role="tab" aria-selected="false">Split</button>
+        </div>
+        <button class="toolbtn">Whitespace</button>
+        <button class="toolbtn">Wrap</button>
+        <span class="spacer"></span>
+        <span class="diffstat"><span class="p">+96</span> <span class="m">−41</span> · 2 files</span>
+        <span class="kbdhint">j/k line · ] [ change · . comment · v viewed</span>
+      </div>
+
+      <!-- rebase-orphan: this comment lost its anchor after a force-push (honest degraded state) -->
+      <div class="orphan" role="note">
+        <span class="ic statusic" aria-hidden="true"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M8 1.5v6M8 11h.01"/><circle cx="8" cy="8" r="6.5"/></svg></span>
+        <div class="tx"><b>1 comment lost its line after a force-push (rebase).</b> The thread is kept and shown against its last known position; the diff itself is intact. <button>Show orphaned thread</button></div>
+      </div>
+
+      <section class="file">
+        <div class="filehd">
+          <span class="chev">▾</span>
+          <span class="path">crates/payments-cache/src/eviction.rs</span>
+          <span class="badge">+71 −28</span>
+          <label class="vw"><input type="checkbox"> Viewed</label>
+        </div>
+        <table class="code" aria-label="Diff for eviction.rs">
+          <tbody>
+          <tr class="hunk"><td class="ln"></td><td class="cd">@@ -88,12 +88,21 @@ impl CacheStore {</td></tr>
+          <tr class="codeline" tabindex="0"><td class="ln">88</td><td class="cd"><span class="sign"> </span><span class="tok-f">    fn</span> evict(&<span class="tok-k">mut</span> self) -&gt; <span class="tok-n">Option</span>&lt;Key&gt; {</td></tr>
+          <tr class="codeline del" tabindex="0"><td class="ln">89</td><td class="cd"><span class="sign">−</span>        self.lru.pop_back()  <span class="tok-c">// naive: drops hot in-flight keys</span></td></tr>
+          <tr class="codeline add" tabindex="0"><td class="ln">89</td><td class="cd"><span class="sign">+</span>        <span class="tok-k">let</span> victim = self.entries.iter()</td></tr>
+          <tr class="codeline add" tabindex="0"><td class="ln">90</td><td class="cd"><span class="sign">+</span>            .min_by_key(|e| e.weight())  <span class="tok-c">// weight = recency × in-flight refs</span></td></tr>
+          <tr class="codeline add cur" tabindex="0"><td class="ln">91</td><td class="cd"><span class="sign">+</span>            .filter(|e| e.in_flight == <span class="tok-n">0</span>)?;</td></tr>
+          <tr class="codeline"><td colspan="2">
+            <div class="agentfix" role="group" aria-label="Agent suggested fix">
+              <div class="hd"><span class="mark" aria-hidden="true"><i></i></span><span class="lbl">Agent</span> FixAgent · suggested fix <span class="scope">scope: review-comment · advisory · non-blocking</span></div>
+              <div class="b"><span class="tok-c">// .filter after .min_by_key can return None even when an evictable entry exists.</span>
+<span class="tok-c">// Filter first, then pick the min:</span>
+        <span class="sug">let victim = self.entries.iter().filter(|e| e.in_flight == 0).min_by_key(|e| e.weight())?;</span></div>
+              <div class="acts"><button class="primary">Commit suggestion</button><button>Reply</button><button>Dismiss</button></div>
+            </div>
+          </td></tr>
+          <tr class="codeline add" tabindex="0"><td class="ln">92</td><td class="cd"><span class="sign">+</span>        self.entries.remove(victim.key());</td></tr>
+          <tr class="codeline"><td class="ln">93</td><td class="cd"><span class="sign"> </span>        Some(victim.key().clone())</td></tr>
+          <tr class="codeline"><td class="ln">94</td><td class="cd"><span class="sign"> </span>    }</td></tr>
+          <tr class="codeline"><td colspan="2">
+            <div class="comment">
+              <!-- German review comment: umlaut + compound, no clipping -->
+              <div class="ch"><span class="av">JV</span> <b style="color:var(--t1)">Jürgen Vögel</b> <span style="color:var(--t3)">kommentierte Zeile 90 · vor 2 Std.</span></div>
+              <div class="cb">Sollten wir den <code>high_watermark</code> aus der Konfiguration lesen statt ihn hart zu kodieren? Die Rate-Limiting-Schwellenwert-Diskussion in <span class="cchip ref">ISS-377</span> ist die gleiche.</div>
+            </div>
+          </td></tr>
+          <tr class="codeline"><td colspan="2">
+            <div class="comment">
+              <!-- Greek comment in mono context: non-Latin coverage incl. tonos diacritic, refs <bdi>-isolated -->
+              <div class="ch"><span class="av">ΑΠ</span> <b style="color:var(--t1)">Αλέξανδρος Παπαδόπουλος</b> <span style="color:var(--t3)">σχολίασε · πριν 40 λεπτά</span></div>
+              <div class="cb">Η σταθμισμένη LRU λύνει το πρόβλημα — δες το <span class="cchip ref">CI #1894</span> για το burst test. Καλή δουλειά.</div>
+            </div>
+          </td></tr>
+          <tr class="hunk"><td class="ln"></td><td class="cd">@@ -140,4 +149,9 @@ impl CacheStore {</td></tr>
+          <tr class="codeline add" tabindex="0"><td class="ln">149</td><td class="cd"><span class="sign">+</span>    <span class="tok-f">fn</span> weight(&self) -&gt; <span class="tok-n">u64</span> {</td></tr>
+          <tr class="codeline add" tabindex="0"><td class="ln">150</td><td class="cd"><span class="sign">+</span>        self.last_used.elapsed().as_secs() + self.in_flight <span class="tok-k">as</span> <span class="tok-n">u64</span> * <span class="tok-n">64</span></td></tr>
+          <tr class="codeline add" tabindex="0"><td class="ln">151</td><td class="cd"><span class="sign">+</span>    }</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="file">
+        <div class="filehd"><span class="chev">▸</span><span class="path">crates/payments-cache/tests/burst.rs</span><span class="badge">+25 −13</span><label class="vw"><input type="checkbox" checked> Viewed</label></div>
+      </section>
+    </main>
+
+    <aside class="why" aria-label="Pull request context">
+      <h2>Linked issue</h2>
+      <div class="card"><div class="top"><span class="cchip ref">ISS-377</span> · in progress</div><div class="ti">Payments cache thrashes under burst load</div><div class="sub">High · SLA: in 2 Tg 4 Std · Q3 Payments reliability</div></div>
+      <h2>Failing check</h2>
+      <div class="card"><div class="top"><span class="cchip ref">CI #1894</span> · <span style="color:var(--bad)">failed</span></div><div class="ti mono" style="font-size:12px">burst_eviction_test</div><div class="sub">step 4/6 · evicted a hot in-flight key</div></div>
+      <h2>Linked doc</h2>
+      <div class="card"><div class="top"><span class="cchip ref">DOC</span></div><div class="ti">Cache Eviction Design</div><div class="sub agent-c"><span class="statusic" aria-hidden="true"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="3" y="3" width="10" height="10" rx="2"/><path d="M6 8h4M8 6v4"/></svg></span>referenced from line 90</div></div>
+      <h2>Reviewers</h2>
+      <div class="card"><div class="reviewers">
+        <div class="rev"><span class="av">JV</span> Jürgen Vögel <span class="st warn-c">○ requested</span></div>
+        <div class="rev"><span class="av agent" aria-hidden="true">⌬</span> <span style="color:var(--agent)">FixAgent</span> <span class="st agent-c">◐ advisory</span></div>
+      </div></div>
+      <div class="foot">⌘K to act · ] next change · . comment</div>
+    </aside>
+  </div>
+</div>
+<script>
+var b=document.getElementById('themebtn');
+b.addEventListener('click',function(){var r=document.documentElement,d=r.getAttribute('data-theme')!=='light';r.setAttribute('data-theme',d?'light':'dark');b.textContent='Theme: '+(d?'light':'dark');b.setAttribute('aria-pressed',String(d));});
+// j/k line nav over focusable code lines (diff keyboard model, G1 M3)
+var lines=[].slice.call(document.querySelectorAll('tr.codeline[tabindex]'));
+document.addEventListener('keydown',function(e){
+  if(e.target.matches('input,button,[role=tab]'))return;
+  var i=lines.indexOf(document.activeElement);
+  if(e.key==='j'){e.preventDefault();(lines[i+1]||lines[0]).focus();}
+  if(e.key==='k'){e.preventDefault();(lines[i-1]||lines[lines.length-1]).focus();}
+});
+</script>
+</body>
+</html>
