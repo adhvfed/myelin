@@ -37,7 +37,12 @@
 //!   inbox items, and emits `notif.*` via the outbox — the ONLY emit path) → **NOTIF-P3** (P-181).
 //!   The `consumers` slot is an empty seam here.
 //! - **The `PersonalDataHolder` registration** (references-not-payloads → tombstone-for-free) →
-//!   **NOTIF-P4** (P-182). The store-holder lands with the data model.
+//!   **landed at NOTIF-P4** (P-182), see [`holder`]. Notif is the H13 `NotificationHistory` holder:
+//!   `register_notif_holder` opens the OLTP store through the one door (1.4); [`NotifHistoryHolder`]
+//!   implements the 7.7 holder half (locate/export/rectify/restrict + the structural
+//!   references-not-payloads erase — 0 PII-column mutation on refs-stored items). FLOORS still open:
+//!   the reindex/replay half of 7.7 (NOTIF-P17); the off-cell-payload erasure residual (X-7 / 10.9,
+//!   NOTIF-P27).
 //! - **The contract BODIES** behind every carrier here — `list_inbox` (NOTIF-P5), `mark/snooze`
 //!   (NOTIF-P6), `humanise` (NOTIF-P9), `define_notif_rule` (NOTIF-P8), `DeliveryAdapter`
 //!   delivery fabric (NOTIF-P16). The carriers are SHAPES; the algorithms are the follow-ons.
@@ -60,10 +65,15 @@ use serde::{Deserialize, Serialize};
 // the nine forward-only `(tenant, region)`-first RLS migrations (contract 1.5). The committed-ratchet
 // lint-fixture proof (the three schema gates bite) lives in `tests/lint_fixtures.rs` over RED/GREEN
 // fixtures under `tests/fixtures/` (which the lint-gate excludes by the `/fixtures/` convention).
+pub mod holder;
 pub mod migrations;
 pub mod router;
 pub mod schema;
 
+pub use holder::{
+    notif_history_holder, notif_store_classifier, register_notif_holder, NotifBacking,
+    NotifHistoryHolder, NotifHolderRegistration, RestrictSet, NOTIF_OLTP_STORE,
+};
 pub use router::{
     build_router, signal_subject_prefix, InboxProjection, RoutedInboxItem, SignalRouter,
     NOTIF_ESCALATION_ACKED, NOTIF_ITEM_CREATED, ROUTER_CONSUMER_NAME,
@@ -274,9 +284,10 @@ pub fn notif_app_spec(config: Config) -> AppSpec {
         internal: InternalRpc::default(),
         // No consumers yet — the Signal-consumer router (the EventHandler) is NOTIF-P3 (P-181).
         consumers: Vec::new(),
-        // Every opened store auto-registers as a PersonalDataHolder (§3.4, GD-3) — the Notif
-        // references-not-payloads holder lands with the data model (NOTIF-P4); the OLTP store
-        // registers at boot.
+        // Every opened store auto-registers as a PersonalDataHolder (§3.4, GD-3) — the Notif OLTP
+        // store auto-registers at boot as the H13 NotificationHistory holder (NOTIF-P4 landed; see
+        // `holder::register_notif_holder` + `holder::notif_store_classifier`). The references-not-
+        // payloads structural erase tombstones an erased person's appearance for free.
         holders: AppSpec::auto(),
         stores: StoreManifest::new(),
         outbox: myelin_substrate::OutboxSpec::default(),

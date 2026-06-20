@@ -225,6 +225,16 @@ impl InboxProjection {
         }
     }
 
+    /// **Test/holder seam: UPSERT a row directly (the same write-time-collapse path the router
+    /// uses).** Lets a holder property test (NOTIF-P4, `crate::holder`) seed the projection with a
+    /// known set of refs-stored items, then assert the structural-erase 0-mutation property — without
+    /// standing up the whole Signal pipeline. Routes through the SAME private [`Self::upsert`] (one
+    /// write path, no second store).
+    #[doc(hidden)]
+    pub fn upsert_for_test(&self, item: RoutedInboxItem) {
+        self.upsert(item);
+    }
+
     /// The number of DISTINCT inbox rows (post-collapse). A drill asserts that N same-key Signals
     /// produce ONE row (not N).
     pub fn len(&self) -> usize {
@@ -243,6 +253,42 @@ impl InboxProjection {
             .unwrap_or_else(|e| e.into_inner())
             .get(&(tenant.0.clone(), recipient.to_string(), dedup_key.to_string()))
             .cloned()
+    }
+
+    /// **A snapshot of all rows under one tenant (the holder's scan surface, NOTIF-P4).** The
+    /// `PersonalDataHolder` (`crate::holder`) walks this to `locate`/`erase` a subject's appearances
+    /// — the references-not-payloads holder reads, it never reaches around the projection. Returns a
+    /// CLONE (so the holder scans without holding the lock); the projection is the model of the
+    /// `notif_inbox_item` table the live OLTP `SELECT … WHERE tenant_id = $1` reads.
+    pub fn snapshot_for_tenant(&self, tenant: &TenantId) -> Vec<RoutedInboxItem> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|row| row.tenant == *tenant)
+            .cloned()
+            .collect()
+    }
+}
+
+impl RoutedInboxItem {
+    /// **Does this item reference the subject (the references-not-payloads `locate` predicate,
+    /// NOTIF-P4)?** A subject appears in an inbox row in two structural places, BOTH as refs/ids,
+    /// never as a stored name:
+    ///
+    /// 1. as the **`recipient`** (the subject's OWN inbox — the opaque Principal pseudonym, 4.8); or
+    /// 2. as a referenced actor in the **`subject`** / **`origin_event`** [`ArtifactRef`] (a
+    ///    `myelin://<tenant>/identity/principal/<id>` ref the subject is the actor of) — someone
+    ///    ELSE's inbox row that names the subject by reference.
+    ///
+    /// In NEITHER case is the subject's name stored: the recipient is an opaque pseudonym and the
+    /// refs resolve per-viewer at humanise time. So erasing the subject tombstones the appearance
+    /// **for free** (Identity's 4.8 pseudonym-map shred makes the opaque id unresolvable) with NO
+    /// mutation of these columns — the structural references-not-payloads property (§3.9, C7).
+    pub fn references_subject(&self, subject_id: &str) -> bool {
+        self.recipient == subject_id
+            || self.subject.0.ends_with(&format!("/principal/{subject_id}"))
+            || self.origin_event.0.ends_with(&format!("/principal/{subject_id}"))
     }
 }
 
