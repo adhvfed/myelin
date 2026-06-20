@@ -934,8 +934,26 @@ cdc = [
 [[contract]]
 row = "11.8"
 title = "T3 log tier (CI)"
-status = "deferred"
-landing = "P-147"
+status = "covered"
+# P-147 (P-ST-20): the T3 firehose-archive seam — the SEALING + per-tenant-DEK segment encryption
+# HALF of 11.8, validated on a NON-CI firehose (a synthetic op-stream). `FirehoseArchiver` (storage.md
+# §3.3) rides the 3.5 resume-cursor transport (`myelin_events::Firehose`, P-141 — the SAME `Frame`s a
+# live viewer subscribes to) and SEALS frame batches into content-addressed T2 blobs encrypted under
+# the per-tenant DEK (a real `DekContentWrap` over `KmsEngine`, P-095/P-058): a sealed segment INHERITS
+# T2 crypto-shred — destroying the tenant DEK renders it unrecoverable LIVE and IN BACKUPS (excluded
+# from `backup_snapshot`, §7.5). Telemetry: `unencrypted_segment_count == 0`, `segment_content_addressed
+# == true`. The durable bus carries only a references-not-payloads `SealedSegment` POINTER, never the
+# inline frame bodies (an agent is never woken per log line). The CDC pair is a non-CI op-stream
+# producer sealing + resolving through the seam (cdc_11_8_firehose_archive.rs); the gate drill is
+# stor_p147_firehose_archive_gate_drill.rs. The T3 archive registers a new residency store class
+# (`ResidencyStoreClass::T3FirehoseArchive`) that feeds the SAME `verify_region_pinning` aggregation.
+# Floors named: the CI-specific `(job, step, byte-range)` INDEX (C2) — the resolver behind the X-1
+# `CheckStatus.details_ref` `#step-<n>` jump-to-failure sub-anchor — is the M4 follow-on P-ST-26; the
+# per-SUBJECT CI-log DEK (C1) is M4 P-ST-27 (a key-class swap on the same DekContentWrap seam); the
+# real broker firehose + object-store segment backing are the P-S12 / P-ST-30 floors.
+cdc = [
+    "crates/myelin-storage/tests/cdc_11_8_firehose_archive.rs",
+]
 
 # ──────────────── §12 Tenancy & control plane (myelin-tenancy) ──────────────────────────────────
 

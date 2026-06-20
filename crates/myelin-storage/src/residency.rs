@@ -101,6 +101,13 @@ pub enum ResidencyStoreClass {
     IndexSearch,
     /// The KMS (P-ST-06) — the tenant's per-tenant DEK/KEK material.
     Kms,
+    /// **The T3 firehose archive (P-ST-20 / P-147) — the durable, sealed, DEK-encrypted segments of
+    /// the firehose.** A follow-on store class (NOT in the M1 set): a sealed segment is a
+    /// tenant-keyspace T2 blob in the cell's region, so the archive reports its region here and
+    /// `verify_region_pinning` catches a wrong-region archive without a code change (the floor this
+    /// module named for P-ST-20). The C2 `(job,step,byte-range)` index (P-ST-26) + the C1 per-subject
+    /// CI-log DEK (P-ST-27) are the M4 follow-ons; they do not change this residency shape.
+    T3FirehoseArchive,
 }
 
 impl ResidencyStoreClass {
@@ -111,6 +118,7 @@ impl ResidencyStoreClass {
             ResidencyStoreClass::Blob => "blob",
             ResidencyStoreClass::IndexSearch => "index_search",
             ResidencyStoreClass::Kms => "kms",
+            ResidencyStoreClass::T3FirehoseArchive => "t3_firehose_archive",
         }
     }
 
