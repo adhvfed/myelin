@@ -250,6 +250,42 @@
 //! 500 branch, the Notif `[erased user]` humanise branch, and `rectify_via_reindex_from_source` (the
 //! rebuild-never-patch path) are the behavioral core; the `cargo mutants` score is in the commit body.
 //!
+//! ## P-GA-25 (→ P-152) — `restrict` suppression into the derived stores (Search/Refs/Notif/Agents/OLAP) — GA-D7 (contract 11.6 + the 10.1 derived-store faces)
+//! [`restrict_fanout`] FILLS the floor P-GA-17 named: the **`restrict` suppression FLAG** — the ONE
+//! [`structural_floor::RestrictRegistry`] shipped in P-117 — is now HONOURED by the **five M2 derived
+//! stores**, the full GA-D7 proof. P-117 proved the M1 holders honour the flag; THIS proves the
+//! derived stores do — **0 processing of a restricted subject** across Search / Refs / Notif / Agents
+//! / OLAP, reversible. It REUSES the [`structural_floor::RestrictRegistry`] WHOLESALE (there is
+//! exactly ONE suppression flag per subject — every derived store + M1 store reads the SAME registry,
+//! the §4.4 "every holder honours" property; no second flag, no parallel mechanism — EI-01 §7
+//! coherence). The genuinely-new piece is the **per-derivative-store PROCESSING op that HONOURS the
+//! flag** ([`restrict_fanout::DerivedStore::process`]) — a derived store's chokepoint differs from an
+//! M1 store's source-content op: **Search** *no indexing* / **Refs** *no edge projection* / **Notif**
+//! *no notification* / **Agents** *no agent-use* / **OLAP** *no analytics* (contract 11.6, GA-9, the
+//! §8 restriction-flag-into-OLAP propagation). While restricted, each reads
+//! [`restrict_fanout::DerivedProcessed::Suppressed`] while RETAINING the derived row (suppression ≠
+//! delete — reversible). The [`restrict_fanout::RestrictFanOutDriver`] fans `restrict(subject, on)`
+//! over the five through the [`myelin_gdpr::PersonalDataHolder`] seam (never reaching into a store —
+//! the no-cross-store-read law) and reads back the verdicts; the green artifact is
+//! [`restrict_fanout::RestrictFanOutOutcome::processed_count`] = **0**. **GA-D7** (restrict → 0
+//! processing across all five derived stores, storage retained, reversible) emits its dated green
+//! artifact in `tests/ga_d7_derived_restrict.rs`; the CDC pair for 11.6 (the OLAP consumer honouring
+//! `restrict`) + the Search/Refs/Notif/Agent restriction faces is in
+//! `tests/cdc_11_6_derived_restrict.rs`. **Floors named:** the **multi-cell restriction** (the flag
+//! fanned across `member_cells` over the cross-cell PII-free bridge) → **M5 (rides P-GA-32 / P-GA-33,
+//! GA-D8)**; the live Search/Refs/Notif/Agent/OLAP bindings behind the seam are a config swap at boot
+//! (the in-memory models here have byte-for-byte the §4.4 / GA-D7 post-condition); this module touches
+//! **NO new DB / object-store / cache / bus contract — no `--features integration` leg owed**.
+//! **Mutation floor (P-GA-25 TESTS — the restriction-suppression-across-derived-stores path is
+//! mandatory-core):** each derived store's [`restrict_fanout::DerivedStore::process`] suppression
+//! branch (both polarities, storage retained either way) + the
+//! [`restrict_fanout::RestrictFanOutDriver::fan_out_restrict`] 0-processing roll-up are the behavioral
+//! core. `cargo mutants -p myelin-gdpr-service --file crates/myelin-gdpr-service/src/restrict_fanout.rs`
+//! (2026-06-20): **47 mutants, 20 caught, 27 unviable, 0 missed** — EVERY behavioral mutant on the
+//! mandatory-core path is CAUGHT (the per-store suppression branch both polarities, the
+//! `processed_count`/`all_suppressed`/`all_rows_retained` GA-D7 readings, the per-`(tenant,subject)`
+//! key, the shared-flag set/clear receipts).
+//!
 //! ## P-GA-15 (→ P-115) — the erasure ledger (10.8) + post-restore re-erasure + the crypto-shred-reaches-backups proof
 //! [`erasure_ledger`] ships the **erasure ledger** ([`erasure_ledger::ErasureLedger`]) — the GDPR-owned,
 //! **PII-free, NON-shred-erasable** record of every completed erasure (the opaque subject token + the
@@ -402,6 +438,7 @@ pub mod holders;
 pub mod orchestration;
 pub mod posture;
 pub mod registries;
+pub mod restrict_fanout;
 pub mod retention;
 pub mod structural_floor;
 pub mod tenant_ops;
@@ -466,6 +503,11 @@ pub use registries::{
     is_eea_region, ConsentRecord, ConsentRegistry, SubProcessor, SubProcessorRegistry, TransferGate,
     TransferVerdict, WithdrawalBasis, WithdrawalEffect, CONSENT_WITHDRAWALS, SUBPROCESSOR_OBJECTIONS,
     TRANSFER_GATE_EXTRA_EU_DENIALS,
+};
+pub use restrict_fanout::{
+    restrict_holder_ids, DerivedProcessed, DerivedProcessing, DerivedRestrictVerdict, DerivedStore,
+    DerivedStoreHolder, RestrictFanOutDriver, RestrictFanOutOutcome,
+    RESTRICT_FANOUT_PROCESSING_SUPPRESSED,
 };
 pub use retention::{
     legal_floor, platform_default, tenant_delete_immediately, tenant_window, EffectiveRetention,
