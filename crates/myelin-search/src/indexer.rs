@@ -382,6 +382,18 @@ impl IndexRegistry {
         }
     }
 
+    /// **Wipe the `(tenant, region)` index (the cold-rebuild precondition, §4.9 / SRCH-D5).** Drops the
+    /// per-tenant backend so the next write re-opens an EMPTY one over the SAME facet schema — the
+    /// modelled equivalent of deleting the DEK-sealed index directory before a reindex-from-source. This
+    /// is NOT a backdoor write path: it only DESTROYS derived state (Search holds no system-of-record),
+    /// after which the ONLY way docs re-enter is the live [`with_backend`] upsert the indexer drives from
+    /// the bus re-emit. An absent partition is a no-op. Tenant-first (no cross-tenant handle).
+    fn wipe(&self, tenant: &TenantId, region: &Region) {
+        let pk = PartKey { tenant: tenant.clone(), region: region.clone() };
+        let mut guard = self.indices.lock().unwrap_or_else(|e| e.into_inner());
+        guard.remove(&pk);
+    }
+
     /// Whether the `(tenant, region)` index has ANY orphan (tombstoned-until-compact) embedding — the
     /// 0-orphan-after-compact GATE reads this. An absent partition has none.
     fn has_orphan_embedding(&self, tenant: &TenantId, region: &Region) -> bool {
@@ -548,6 +560,15 @@ impl IncrementalIndexer {
     /// 0-orphan-after-compact GATE reads this (SRCH-D4: 0 recoverable incl. vectors). Tenant-first.
     pub fn has_orphan_embedding(&self, tenant: &TenantId, region: &Region) -> bool {
         self.registry.has_orphan_embedding(tenant, region)
+    }
+
+    /// **Wipe the `(tenant, region)` index (the cold-rebuild precondition — §4.9 / SRCH-D5).** Destroys
+    /// the per-tenant derived index so a reindex-from-source rebuilds it cold; the next write re-opens an
+    /// empty index over the SAME facet schema. Used by the [`crate::reindex`] path before a full rebuild
+    /// and by the SRCH-D5 cold-vs-live parity drill. Search holds no system-of-record state, so this only
+    /// drops reconstructible state (§1). Tenant-first.
+    pub fn wipe(&self, tenant: &TenantId, region: &Region) {
+        self.registry.wipe(tenant, region);
     }
 
     /// **Index ONE delivered event (the ONE ingest step — §4.1).** Factored out of

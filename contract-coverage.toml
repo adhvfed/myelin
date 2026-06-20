@@ -462,8 +462,15 @@ landing = "P-167"
 [[contract]]
 row = "6.4"
 title = "reindex(scope) -> job (Search)"
-status = "deferred"
-landing = "P-179"
+status = "covered"
+# SRCH-P16/P-179 ships Search's OWNED reindex-from-source seam (SearchReindexer::reindex) — the ONLY
+# rebuild path (SEARCH-1): wipe -> bus re-emit (2.6, events::reindex) -> *.snapshot through the LIVE
+# indexer's index() step, idempotent on the deterministic snapshot event_id, with the cursor store S4
+# (throttled/resumable/per-tenant in-flight caps). No "load the index from Postgres" backdoor (the
+# no-cross-db lint holds). FLOOR named: the per-owner real `replay` bodies are EB-26/per-owner M3/M4;
+# the full-scale reindex-parity (SRCH-D5 at scale, E2E-3) is SRCH-P32 (M5) — this row is the CI-variant
+# seam pair (provider: the reindex job; consumer: the live indexer; cold == live).
+cdc = ["crates/myelin-search/tests/cdc_6_4_reindex.rs"]
 
 [[contract]]
 row = "6.5"
