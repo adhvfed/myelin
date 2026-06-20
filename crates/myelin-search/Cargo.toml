@@ -55,6 +55,22 @@ myelin-storage = { path = "../myelin-storage" }
 myelin-substrate = { path = "../myelin-substrate" }
 myelin-identity = { path = "../myelin-identity" }
 
+# ------------------------------------------------------------------------------------------
+# SRCH-P04 (P-167, M2): the IndexBackend trait + the Tantivy v1 reference engine + the FT-inverted
+# and structured/columnar shapes (architecture §2.1/§2.2/§3.1/§3.2). NEW consumer edges, both
+# DAG-safe (Search stays a terminal leaf consumer; nothing depends back on it):
+#   - myelin-query  → the FROZEN FieldType enum (contract 13.3) the structured/columnar shape is
+#                     typed BYTE-IDENTICALLY over (FieldType/FieldValue/OrderKey) — the same enum
+#                     Issues'/Knowledge's compilers use. (myelin-query is mid-tier; Search is a
+#                     downstream consumer of it — the §2.9 edge holds.)
+#   - tantivy       → the in-process v1 reference search engine behind the IndexBackend trait. A
+#                     pure-Rust, single-binary library (NOT a network backend): it is part of the
+#                     default `cargo build --workspace` (the build stays DB-free — Tantivy writes a
+#                     local on-disk/RAM index directory, it is not the Postgres/S3/NATS data layer).
+#                     OpenSearch is the reserved per-cell upgrade behind the SAME trait (M5/§6.2).
+myelin-query = { path = "../myelin-query" }
+tantivy = { workspace = true }
+
 # TEST-ONLY. The names/units drift test constructs a canonical EventEnvelope (which embeds a
 # Principal from myelin-identity, now a prod dep above) to read the REAL frozen field names off a
 # value, and confirms the search-requires-acl-filter lint (its home is the shared myelin-lints

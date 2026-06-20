@@ -199,6 +199,15 @@ syn = { version = "2", default-features = false, features = ["derive", "parsing"
 quote = "1"
 proc-macro2 = "1"
 
+# Tantivy — the in-process v1 reference search engine (SRCH-P04 / search-and-indexing.md §2.1).
+# Pure-Rust, single-binary, per-tenant index directories (residency + crypto-shred-per-index for
+# free). It is the REFERENCE engine behind the `IndexBackend` trait; OpenSearch is the reserved
+# per-cell upgrade behind the SAME trait (a measured M5/§6.2 promotion — a config/impl swap, not a
+# rewrite). Referenced ONLY by `myelin-search`; `mmap` is its default Directory. This is a normal
+# (non-DB) dependency and is part of the default `cargo build --workspace` (it is in-process, not a
+# network backend — unlike the `integration`-gated Postgres/S3/NATS clients above).
+tantivy = "0.26"
+
 # ----------------------------------------------------------------------------------------------
 # REAL-BACKEND CLIENTS (Stage 1 / infra). Declared here once for a single pinned shape, but
 # referenced ONLY behind the `integration` cargo feature in the crates that own the trait impls

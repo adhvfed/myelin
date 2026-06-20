@@ -111,6 +111,7 @@
 //! whole erasure answer. No index / layout / migration / real ciphertext / real vectors ship here.
 
 pub mod dek;
+pub mod engine;
 pub mod erasure_posture;
 pub mod holder;
 pub mod layout;
@@ -118,6 +119,9 @@ pub mod residency;
 pub mod shell;
 
 pub use dek::{srch_p03_inherited_gates, hyok_skips_index, InheritedGate, SearchDekPin};
+pub use engine::{
+    AclFilter, Hit, IndexBackend, IndexDocument, IndexError, TantivyBackend, ORDER_KEY_FIELD,
+};
 pub use erasure_posture::{erasure_posture, ErasurePosture};
 pub use holder::{
     register_search_holder, search_index_holder, SearchHolderRegistration, SearchIndexHolder,
