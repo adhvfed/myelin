@@ -378,6 +378,10 @@ pub mod key_origin;
 pub mod kms;
 pub mod kms_failstatic;
 pub mod migration;
+// The STOR-D8 online-migration-under-load drill (P-ST-21 / P-126, M2): expand→backfill→contract on
+// the restored prod-scale copy under load, lock-wait p99 within budget + 0 downtime. Reuses the
+// online runner (migration.rs) for admission + the restore-verify gate's restored copy.
+pub mod migration_under_load;
 // The OLAP read store FRAME — the holder + the CQRS-fed-by-the-bus contract shape (P-ST-17 /
 // P-104, contract 11.6 partial): a per-cell residency-pinned, idempotent-consumer-fed (dedup on
 // `event_id`) analytics read model, populated ONLY by replaying the durable event stream — live
@@ -464,6 +468,10 @@ pub use kms::{
 };
 pub use kms_failstatic::{
     KmsFailStaticSignals, KmsReadError, KmsReadPath, KmsReadResult, KmsReadiness,
+};
+pub use migration_under_load::{
+    lock_cost_ms, LockBudget, LockClass, MigrationLoadArtifact, MigrationLoadFailure,
+    MigrationLoadVerdict, MigrationUnderLoad, StepLockMeasure, WriteLoad,
 };
 pub use migration::{
     is_blocking_alter, is_destructive, HotTables, Migration, MigrationError, MigrationPhase,

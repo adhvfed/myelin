@@ -100,6 +100,29 @@ rto_tenant_max_mins = 60     # recovery-time objective, per tenant: ≤ 1 hour.
 rto_cell_max_mins = 240      # recovery-time objective, per cell: ≤ 4 hours.
 
 # ---------------------------------------------------------------------------------------------
+# [online_migration] — the STOR-D8 lock-wait budget the online-migration drill (P-ST-21 / P-126)
+# asserts against. Drill catalogue row STOR-D8: "expand→backfill→contract on a restored prod-scale
+# copy under load → no blocking lock beyond budget; 0 downtime. Telemetry: lock-wait p99; 0
+# downtime." (storage.md §3.1: forward-only online migrations — lock time measured against a
+# RESTORED copy, now that restore-verify exists.)
+#
+# This is the PROPOSED DEFAULT-TO-BEAT measured here at prod-scale (P-126) and re-confirmed at
+# CELL scale in M5 (P-ST-34 / world-scale). The online idiom's defining property is that each
+# step (Expand = a nullable add / CREATE INDEX CONCURRENTLY; Backfill = throttled off-hot-path
+# batches; Contract = a validated swap) takes only a SHORT metadata/catalog lock, never a
+# table-rewrite lock at write QPS. A step whose p99 lock-wait exceeds this budget is NOT the
+# online idiom and the drill FAILs (it is the blocking-ALTER bug class the runner rejects, now
+# proven empirically under load). `downtime_max_ms = 0` is the 0-downtime invariant: an online
+# migration NEVER takes the table offline. Weakening either number to pass is forbidden (EI-01
+# §3) — a red is a dated `[[claimed_not_proven]]` scorecard row, never a lowered bar. Keyed on
+# contract 1.5 (the migration runner) + 11.5 (the restored copy STOR-D8 rehearses against).
+# ---------------------------------------------------------------------------------------------
+[online_migration]
+lock_wait_p99_max_ms = 500   # STOR-D8: an online step's p99 lock-wait must stay ≤ 500 ms (a short
+                             # metadata/catalog lock), never a table-rewrite lock at write QPS.
+downtime_max_ms = 0          # STOR-D8: 0 downtime — an online migration NEVER takes the table offline.
+
+# ---------------------------------------------------------------------------------------------
 # [depth_ceilings] — the causal-depth ceilings the agent-loop guard halts a loop at (SUB-D8).
 # Roadmap §2 item 5: "depth ceilings 12/16". The soft ceiling flags a deepening loop early; the
 # hard ceiling structurally halts it (reads EventEnvelope.depth). These ARE the seed constants in
