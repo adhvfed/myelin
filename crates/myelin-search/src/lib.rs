@@ -123,6 +123,7 @@ pub mod holder;
 pub mod indexer;
 pub mod layout;
 pub mod pipeline;
+pub mod reindex;
 pub mod residency;
 pub mod shell;
 pub mod telemetry;
@@ -166,6 +167,10 @@ pub use pipeline::{
     query, query_consistent, semantic, ListObjectsPort, Page, QueryError, QueryStats, RankedResult,
     RankedResults, RelationalLeaf, ReverseIndexAnswer, RevisionWatermark, ScopedEngine, VectorQuery,
     READ_PERMISSION,
+};
+pub use reindex::{
+    ReindexCursorStore, ReindexError, ReindexJob, ReindexProgress, SearchReindexer,
+    DEFAULT_BATCH_CAP, DEFAULT_MAX_IN_FLIGHT_PER_TENANT,
 };
 pub use residency::{search_store_descriptors, SearchStoreDescriptor};
 pub use shell::{
