@@ -42,15 +42,25 @@
 //!    (it is **not** a cross-request cache — that is S6, the fail-static cache, §10) so it cannot
 //!    serve a stale grant.
 //!
-//! ## The `CaveatContext` literal-only floor (named, with its follow-on)
-//! The `caveat` rider is wired with a **LITERAL-ONLY** predicate evaluator ([`eval_caveat`]): a
-//! caveat over an `attrs: Map<String, Literal>` map of **literal** comparisons (`field == literal`,
-//! `int < literal`, `bool`). A caveat needing context the caller did **not** supply returns
-//! [`Decision::Conditional`] (the caller supplies it) — **never a silent `Allow`** (§8.6). **Floor:**
-//! the full safe `QueryAst` predicate core (no UDFs/loops/recursion; the ONE platform predicate
-//! language, contract 3.4) replaces this literal-only path in **P-ID-22 (P-133, M2)**. This module
-//! ships ONLY the literal comparison surface; a non-literal predicate is out of scope here and
-//! returns `Conditional` (the safe floor), never an allow.
+//! ## The `CaveatContext` evaluator — the full `QueryAst` predicate core (P-ID-22, P-133)
+//! **The M1 literal-only floor is CLOSED here.** The `caveat` rider now evaluates through the ONE
+//! platform predicate language — the bounded, DoS-hardened, statically-cost-bounded
+//! `myelin_query::QueryAst` interpreter (contract 3.4, the `EventMatcher` core; no UDFs/loops/
+//! recursion). A caveat carries a [`myelin_query::Predicate`] tree (the field/transition ABAC
+//! predicate the namespace fragment declares); the [`CaveatContext`]'s `attrs` supply the runtime
+//! context the predicate reads. The evaluator ([`eval_caveat_predicate`]) maps the interpreter's
+//! outcome to the decision: a **satisfied** predicate keeps the `Allow`; a **violated** one denies;
+//! a predicate referencing context the caller did **not** supply (an unbound variable) returns
+//! [`Decision::Conditional`] (the caller supplies it) — **never a silent `Allow`** (§8.6). There is
+//! now **exactly ONE predicate language in the platform** (EI-01 §7).
+//!
+//! The frozen `check` ABI carries `caveat: Option<&CaveatContext>` (the context + the field/
+//! transition target). The legacy self-describing `__caveat_*` encoding the literal-only floor used
+//! is preserved as a thin compatibility bridge ([`eval_caveat`]) that LOWERS that encoding to a real
+//! `QueryAst` predicate and routes it through the one core — so the M1 (P-ID-09) literal cases pass
+//! unchanged with **no second predicate language**. The non-literal field/transition caveat
+//! INSTANCES (their predicates wired onto the namespace-fragment tuples) land with their subsystems:
+//! Git/Knowledge **P-ID-25/P-ID-26** and Issues/Knowledge **P-ID-29/P-ID-30** (named follow-ons).
 //!
 //! ## Floors named (frozen now → bodies in a later prompt)
 //! - **The namespace/permission engine is P-ID-10 (P-068).** This floor treats `permission` as a
@@ -59,7 +69,9 @@
 //!   tuple-to-userset) compiled from a fragment land in P-ID-10; the rewrite **core** they evaluate
 //!   through is here (the architecture: "check here resolves direct + simple inherited relations as
 //!   the core engine matures alongside").
-//! - **The literal-only `CaveatContext` → the full `QueryAst` core is P-ID-22 (P-133).** Named above.
+//! - **The literal-only `CaveatContext` → the full `QueryAst` core: CLOSED in P-ID-22 (P-133).**
+//!   The evaluator now runs on the one `myelin_query::QueryAst` interpreter; the floor named in
+//!   P-ID-09 is closed (the follow-on caveat INSTANCES land with their subsystems, named above).
 //! - **The fail-static cache (S6) + the zookie-bypass is P-ID-15 (P-073).** This engine reads the
 //!   authoritative store at the snapshot (the correctness floor the cache is layered over); the
 //!   bounded-staleness availability face is P-ID-15.
@@ -68,6 +80,7 @@ use crate::tuple_store::TupleStore;
 use myelin_identity::{
     CaveatContext, Consistency, Decision, Literal, Principal, PrincipalStatus, RelName, Zookie,
 };
+use myelin_query::{CmpOp, EvalContext, EvalError, Expr, Predicate, QueryAst};
 use myelin_storage::TenantScope;
 use myelin_tenancy::ArtifactRef;
 use std::collections::HashMap;
@@ -362,90 +375,132 @@ fn object_id_of(object: &ArtifactRef) -> Option<String> {
     Some(id.to_string())
 }
 
-/// Evaluate a `CaveatContext` literal predicate (the **literal-only** floor, §8.6).
+/// **Evaluate a field/transition caveat predicate through the ONE `QueryAst` predicate core**
+/// (P-ID-22, contract 4.2 × 3.4; §8.6) — the promoted evaluator that CLOSES the M1 literal-only
+/// floor.
 ///
-/// The M1 floor evaluates a tiny, safe set of literal comparisons carried in `attrs`, keyed by a
-/// reserved convention so a caveat is self-describing without a predicate AST (which is the
-/// P-ID-22 `QueryAst` core). The supported forms (all over `attrs` literals — no field reads, no
-/// UDFs, no loops):
-/// - `attrs["__caveat_op"]` = one of `"eq" | "ne" | "lt" | "le" | "gt" | "ge"` (the comparison),
-///   with `attrs["__caveat_lhs"]` and `attrs["__caveat_rhs"]` the two literal operands; OR
-/// - `attrs["__caveat_bool"]` = a `Bool` literal gate (e.g. a pre-evaluated `!confidential`).
+/// `predicate` is the field/transition ABAC predicate (the `myelin_query::QueryAst`, a bounded,
+/// DoS-hardened, statically-cost-bounded tree — the namespace fragment declares it; here it is
+/// supplied alongside the matched relation). The [`CaveatContext`]'s `attrs` map supplies the
+/// runtime context the predicate's variables read. The decision maps the one interpreter's outcome:
 ///
-/// Semantics (fail-closed): a **satisfied** predicate keeps the `Allow`; a **violated** one returns
-/// `Deny`; a predicate whose required keys are **absent / non-literal** returns `Conditional` (the
-/// caller must supply the missing context) — **never a silent `Allow`** (the mutation-tested
-/// mandatory-core branch: a mutation turning `Conditional`/`Deny` into `Allow` is caught).
+/// - predicate **holds** over the supplied context ⇒ [`Decision::Allow`] (the field is visible / the
+///   transition is permitted; the relation grant already held);
+/// - predicate **is violated** ⇒ [`Decision::Deny`] (the field is redacted / the transition gated);
+/// - predicate references a variable the caller did **not** supply ([`EvalError::MissingContext`])
+///   ⇒ [`Decision::Conditional`] (the caller supplies it) — **NEVER a silent `Allow`** (the
+///   mutation-tested mandatory-core branch: a mutation turning `Conditional` into `Allow` is caught);
+/// - the comparison is un-evaluable over the operand types ([`EvalError::TypeError`]) ⇒
+///   [`Decision::Conditional`] (un-evaluable is uncertainty, never a silent allow);
+/// - the predicate hits the runtime step ceiling ([`EvalError::CostExceeded`]) — a DoS-bounded
+///   predicate ⇒ [`Decision::Deny`] (fail-closed: a cost-bounded reject never allows);
+/// - the predicate is the un-compiled placeholder surface ([`EvalError::NotCompiled`]) ⇒
+///   [`Decision::Conditional`] (the parser is the P-235 floor; an un-parsed predicate is
+///   uncertainty, never a silent allow).
 ///
-/// **Floor:** the full safe `QueryAst` predicate core (the ONE platform predicate language, no
-/// UDFs/loops/recursion) replaces this in **P-ID-22 (P-133)**. A non-literal predicate is out of
-/// scope here and is reported `Conditional` (the safe floor), never an allow.
-pub fn eval_caveat(caveat: &CaveatContext) -> Decision {
-    // The pre-evaluated boolean-gate form: `__caveat_bool` is a literal Bool that must be true.
-    if let Some(Literal::Bool(b)) = caveat.attrs.get("__caveat_bool") {
-        return if *b { Decision::Allow } else { Decision::Deny };
+/// **There is exactly ONE predicate language** (EI-01 §7): this calls into the single
+/// `myelin_query` interpreter — no second evaluator exists in the platform.
+pub fn eval_caveat_predicate(predicate: &QueryAst, caveat: &CaveatContext) -> Decision {
+    // The runtime context is the caveat's supplied attrs (the field/transition values the caller
+    // fetched on the already-filtered row). The predicate's variables read from here; an unbound
+    // variable is missing context → Conditional (never a silent allow).
+    let ctx = EvalContext::from_attrs(caveat.attrs.clone());
+    match predicate.eval(&ctx) {
+        Ok(true) => Decision::Allow,
+        Ok(false) => Decision::Deny,
+        // The predicate needs context the caller did not supply → Conditional (the caller supplies
+        // it). This is the mandatory-core branch: it must NEVER become Allow.
+        Err(EvalError::MissingContext { .. }) => Decision::Conditional,
+        // An un-evaluable comparison (e.g. ordering on strings) or an un-parsed placeholder is
+        // genuine uncertainty → Conditional, never a silent allow.
+        Err(EvalError::TypeError) | Err(EvalError::NotCompiled) => Decision::Conditional,
+        // A DoS-bounded predicate (the step ceiling) fails closed → Deny (a cost-bounded reject
+        // never allows by exhausting the budget — the boundedness is the gate).
+        Err(EvalError::CostExceeded) => Decision::Deny,
     }
+}
 
-    // The comparison form: an op + two literal operands. A missing op (and no bool gate) means the
-    // caveat needs context the caller did not supply → Conditional (never a silent allow).
-    let op = match caveat.attrs.get("__caveat_op") {
-        Some(Literal::Str(op)) => op.as_str(),
-        // No literal op present: the predicate is non-literal / context-dependent → Conditional.
-        _ => return Decision::Conditional,
-    };
-    let (lhs, rhs) = match (
-        caveat.attrs.get("__caveat_lhs"),
-        caveat.attrs.get("__caveat_rhs"),
-    ) {
-        (Some(l), Some(r)) => (l, r),
-        // The operands are not both present as literals → missing context → Conditional.
-        _ => return Decision::Conditional,
-    };
-
-    match compare_literals(op, lhs, rhs) {
-        // A satisfied predicate keeps the Allow; a violated one denies.
-        Some(true) => Decision::Allow,
-        Some(false) => Decision::Deny,
-        // The comparison is not defined over these literals (e.g. `<` on two bools, or an unknown
-        // op) — un-evaluable as a literal predicate → Conditional (the safe floor), never Allow.
+/// **Compatibility bridge: lower the legacy self-describing `CaveatContext` encoding to a real
+/// `QueryAst` predicate, then evaluate it through the ONE core** ([`eval_caveat_predicate`]).
+///
+/// The M1 literal-only floor (P-ID-09) carried its predicate INSIDE `attrs` via reserved
+/// `__caveat_*` keys (a self-describing caveat, because no predicate AST existed yet). This bridge
+/// preserves those M1 cases with **no regression and no second predicate language**: it LOWERS the
+/// encoding to a `myelin_query::Predicate` tree and routes it through the promoted evaluator. The
+/// supported legacy forms:
+/// - `attrs["__caveat_bool"]` = a `Bool` literal gate → `Predicate::Cmp(bool == true)`;
+/// - `attrs["__caveat_op"]` ∈ `{eq,ne,lt,le,gt,ge}` with `__caveat_lhs`/`__caveat_rhs` literal
+///   operands → the corresponding `Predicate::Cmp`.
+///
+/// A caveat with **no** recognised legacy encoding and **no** explicitly-supplied predicate is a
+/// non-literal/context-dependent caveat the caller must resolve → [`Decision::Conditional`] (never a
+/// silent allow). The non-literal field/transition INSTANCES land with their subsystems
+/// (P-ID-25/26/29/30); this bridge keeps the M1 surface green meanwhile.
+pub fn eval_caveat(caveat: &CaveatContext) -> Decision {
+    match lower_legacy_caveat(caveat) {
+        Some(predicate) => match QueryAst::compiled(predicate) {
+            Ok(ast) => eval_caveat_predicate(&ast, caveat),
+            // An over-budget lowered predicate (cannot happen for the tiny legacy forms, but the
+            // interpreter never trusts its input) → fail-closed Conditional.
+            Err(_) => Decision::Conditional,
+        },
+        // No literal predicate present: a non-literal / context-dependent caveat → Conditional (the
+        // caller supplies the predicate context) — never a silent allow.
         None => Decision::Conditional,
     }
 }
 
-/// Compare two literals under a literal-only operator. `Some(true|false)` is a defined comparison;
-/// `None` means the comparison is **not** defined over these literal types (un-evaluable → the
-/// caller returns `Conditional`, never a silent allow). Ordering is defined only on `Int`; equality
-/// is defined on all three same-typed pairs.
-fn compare_literals(op: &str, lhs: &Literal, rhs: &Literal) -> Option<bool> {
-    match op {
-        "eq" => Some(literals_eq(lhs, rhs)?),
-        "ne" => Some(!literals_eq(lhs, rhs)?),
-        "lt" | "le" | "gt" | "ge" => match (lhs, rhs) {
-            (Literal::Int(a), Literal::Int(b)) => Some(match op {
-                "lt" => a < b,
-                "le" => a <= b,
-                "gt" => a > b,
-                "ge" => a >= b,
-                _ => unreachable!("op set is constrained above"),
-            }),
-            // Ordering is not defined over non-Int literals (no string/bool ordering at the literal
-            // floor) → un-evaluable.
-            _ => None,
-        },
-        // An unknown op is un-evaluable (never silently true).
-        _ => None,
+/// Lower the legacy `__caveat_*` self-describing encoding into a real `myelin_query::Predicate`
+/// tree (the ONE predicate language). `None` ⇒ no recognised legacy encoding (a non-literal
+/// caveat → the caller returns `Conditional`).
+///
+/// Two operand forms are supported (both compile to the SAME `Predicate::Cmp` node — there is no
+/// second evaluator):
+/// - **literal operand** — `__caveat_lhs` / `__caveat_rhs` hold a `Literal` value, lowered to
+///   `Expr::Lit` (the M1 self-describing form: the predicate embedded its constants);
+/// - **variable operand** — `__caveat_lhs_var` / `__caveat_rhs_var` hold a `Str` naming a context
+///   key, lowered to `Expr::Var` (a genuinely NON-LITERAL predicate: the operand is resolved from
+///   the supplied `attrs` at eval time, and an unbound one surfaces as `Conditional`). This is the
+///   field/transition caveat shape Issues/Knowledge use (e.g. `issue.severity < threshold`), routed
+///   through the public `check` ABI without a frozen-shape change.
+fn lower_legacy_caveat(caveat: &CaveatContext) -> Option<Predicate> {
+    // The pre-evaluated boolean-gate form: `__caveat_bool == true`.
+    if let Some(b @ Literal::Bool(_)) = caveat.attrs.get("__caveat_bool") {
+        return Some(Predicate::Cmp {
+            op: CmpOp::Eq,
+            lhs: Expr::Lit(b.clone()),
+            rhs: Expr::Lit(Literal::Bool(true)),
+        });
     }
+
+    // The comparison form: an op + two operands (each a literal constant OR a context variable).
+    let op = match caveat.attrs.get("__caveat_op") {
+        Some(Literal::Str(op)) => match op.as_str() {
+            "eq" => CmpOp::Eq,
+            "ne" => CmpOp::Ne,
+            "lt" => CmpOp::Lt,
+            "le" => CmpOp::Le,
+            "gt" => CmpOp::Gt,
+            "ge" => CmpOp::Ge,
+            // An unknown op is un-evaluable → no lowered predicate (Conditional).
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let lhs = lower_operand(caveat, "__caveat_lhs")?;
+    let rhs = lower_operand(caveat, "__caveat_rhs")?;
+    Some(Predicate::Cmp { op, lhs, rhs })
 }
 
-/// Literal equality — defined only for same-typed pairs (`Some`); a cross-type comparison is
-/// un-evaluable (`None`) so it surfaces as `Conditional`, never a silent allow.
-fn literals_eq(lhs: &Literal, rhs: &Literal) -> Option<bool> {
-    match (lhs, rhs) {
-        (Literal::Bool(a), Literal::Bool(b)) => Some(a == b),
-        (Literal::Int(a), Literal::Int(b)) => Some(a == b),
-        (Literal::Str(a), Literal::Str(b)) => Some(a == b),
-        _ => None,
+/// Lower one comparison operand from the caveat encoding into an `Expr`. A `<base>_var` key (a
+/// `Str` naming a context variable) lowers to `Expr::Var` (the non-literal form — resolved from
+/// `attrs` at eval time); otherwise a literal `<base>` key lowers to `Expr::Lit`. `None` if neither
+/// is present (missing operand → the caller returns `Conditional`).
+fn lower_operand(caveat: &CaveatContext, base: &str) -> Option<Expr> {
+    if let Some(Literal::Str(var)) = caveat.attrs.get(&format!("{base}_var")) {
+        return Some(Expr::Var(var.clone()));
     }
+    caveat.attrs.get(base).map(|lit| Expr::Lit(lit.clone()))
 }
 
 #[cfg(test)]
@@ -809,6 +864,172 @@ mod tests {
             "a caveat needing missing context is Conditional, NEVER a silent Allow"
         );
         assert_ne!(d, Decision::Allow, "the missing-context branch is mandatory-core: it must not Allow");
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // P-ID-22 (P-133): the promoted evaluator on the full `myelin_query::QueryAst` predicate core.
+    // The non-literal field/transition caveats exercise a real predicate tree reading the
+    // CaveatContext's supplied `attrs` as the evaluation context (the floor is CLOSED — the
+    // evaluator runs on the ONE platform predicate language, not the literal-only encoding).
+    // ------------------------------------------------------------------------------------------
+
+    /// Build a `CaveatContext` carrying the supplied attrs (the runtime context the predicate
+    /// reads) for the given field — the off-hot-path field-redaction caveat shape (§8.6).
+    fn field_caveat(object: &str, field: &str, attrs: BTreeMap<String, Literal>) -> CaveatContext {
+        CaveatContext {
+            object: ArtifactRef(object.into()),
+            field: Some(FieldId(field.into())),
+            transition: None,
+            attrs,
+        }
+    }
+
+    /// **A NON-LITERAL field caveat redacts correctly through the QueryAst core.** The predicate
+    /// `issue.severity < threshold` reads BOTH operands from the supplied context (real variables,
+    /// not embedded literals). `severity=3, threshold=5` ⇒ visible (Allow); `severity=7` ⇒ redacted
+    /// (Deny). This is the field-level column hiding Issues/Knowledge need (the promotion's point).
+    #[test]
+    fn non_literal_field_caveat_redacts_through_query_ast() {
+        // predicate: severity < threshold  (both are context variables — non-literal)
+        let predicate = QueryAst::compiled(Predicate::Cmp {
+            op: CmpOp::Lt,
+            lhs: Expr::Var("severity".into()),
+            rhs: Expr::Var("threshold".into()),
+        })
+        .unwrap();
+
+        let mut visible = BTreeMap::new();
+        visible.insert("severity".to_string(), Literal::Int(3));
+        visible.insert("threshold".to_string(), Literal::Int(5));
+        let cav_visible = field_caveat("issue:PROJ-1", "salary", visible);
+        assert_eq!(
+            eval_caveat_predicate(&predicate, &cav_visible),
+            Decision::Allow,
+            "severity(3) < threshold(5) ⇒ the field is visible (Allow)"
+        );
+
+        let mut redacted = BTreeMap::new();
+        redacted.insert("severity".to_string(), Literal::Int(7));
+        redacted.insert("threshold".to_string(), Literal::Int(5));
+        let cav_redacted = field_caveat("issue:PROJ-1", "salary", redacted);
+        assert_eq!(
+            eval_caveat_predicate(&predicate, &cav_redacted),
+            Decision::Deny,
+            "severity(7) < threshold(5) is false ⇒ the field is redacted (Deny)"
+        );
+    }
+
+    /// **A transition caveat gates correctly through the QueryAst core.** A transition is permitted
+    /// iff `has_approver == true` (a context variable). With the approver edge present ⇒ Allow;
+    /// absent (false) ⇒ Deny.
+    #[test]
+    fn transition_caveat_gates_through_query_ast() {
+        let predicate = QueryAst::compiled(Predicate::Cmp {
+            op: CmpOp::Eq,
+            lhs: Expr::Var("has_approver".into()),
+            rhs: Expr::Lit(Literal::Bool(true)),
+        })
+        .unwrap();
+
+        let mut approved = BTreeMap::new();
+        approved.insert("has_approver".to_string(), Literal::Bool(true));
+        let cav_ok = CaveatContext {
+            object: ArtifactRef("issue:PROJ-1".into()),
+            field: None,
+            transition: Some(myelin_identity::TransitionId("close".into())),
+            attrs: approved,
+        };
+        assert_eq!(
+            eval_caveat_predicate(&predicate, &cav_ok),
+            Decision::Allow,
+            "an approver edge permits the transition"
+        );
+
+        let mut unapproved = BTreeMap::new();
+        unapproved.insert("has_approver".to_string(), Literal::Bool(false));
+        let cav_bad = CaveatContext {
+            object: ArtifactRef("issue:PROJ-1".into()),
+            field: None,
+            transition: Some(myelin_identity::TransitionId("close".into())),
+            attrs: unapproved,
+        };
+        assert_eq!(
+            eval_caveat_predicate(&predicate, &cav_bad),
+            Decision::Deny,
+            "no approver edge gates the transition"
+        );
+    }
+
+    /// **A predicate needing missing context returns Conditional, NEVER a silent Allow** — the
+    /// mutation-tested mandatory-core branch on the promoted core. The predicate reads
+    /// `issue.severity` but the caller supplied NO `severity` attr ⇒ Conditional.
+    #[test]
+    fn promoted_missing_context_is_conditional_not_allow() {
+        let predicate = QueryAst::compiled(Predicate::Cmp {
+            op: CmpOp::Lt,
+            lhs: Expr::Var("severity".into()),
+            rhs: Expr::Lit(Literal::Int(5)),
+        })
+        .unwrap();
+        // attrs is EMPTY — `severity` is unbound (missing context).
+        let cav = field_caveat("issue:PROJ-1", "salary", BTreeMap::new());
+        let d = eval_caveat_predicate(&predicate, &cav);
+        assert_eq!(
+            d,
+            Decision::Conditional,
+            "a caveat needing missing context is Conditional (the caller supplies it)"
+        );
+        assert_ne!(
+            d,
+            Decision::Allow,
+            "MANDATORY-CORE: the missing-context branch must NEVER become Allow (mutation-caught)"
+        );
+    }
+
+    /// **An un-evaluable comparison (ordering on strings) is Conditional, never a silent Allow.**
+    #[test]
+    fn promoted_un_evaluable_comparison_is_conditional() {
+        let predicate = QueryAst::compiled(Predicate::Cmp {
+            op: CmpOp::Lt,
+            lhs: Expr::Var("name".into()),
+            rhs: Expr::Lit(Literal::Str("z".into())),
+        })
+        .unwrap();
+        let mut attrs = BTreeMap::new();
+        attrs.insert("name".to_string(), Literal::Str("alice".into()));
+        let cav = field_caveat("issue:PROJ-1", "salary", attrs);
+        assert_eq!(
+            eval_caveat_predicate(&predicate, &cav),
+            Decision::Conditional,
+            "ordering on strings is un-evaluable ⇒ Conditional, never a silent allow"
+        );
+    }
+
+    /// **A deliberately-expensive predicate is cost-bounded (no DoS).** A predicate at the maximum
+    /// permitted size still evaluates within the step ceiling (bounded), and an OVER-budget tree is
+    /// rejected at construction (never reaches the interpreter) — the boundedness is structural.
+    #[test]
+    fn promoted_predicate_is_cost_bounded() {
+        // A large-but-legal conjunction of trues evaluates bounded (Allow).
+        let conjuncts: Vec<Predicate> = (0..(myelin_query::MAX_PREDICATE_NODES / 2))
+            .map(|_| Predicate::True)
+            .collect();
+        let ast = QueryAst::compiled(Predicate::And(conjuncts)).unwrap();
+        let cav = field_caveat("issue:PROJ-1", "salary", BTreeMap::new());
+        assert_eq!(
+            eval_caveat_predicate(&ast, &cav),
+            Decision::Allow,
+            "a large-but-legal predicate evaluates bounded (no DoS)"
+        );
+
+        // An OVER-budget tree is statically rejected — it never reaches the interpreter at all.
+        let oversized: Vec<Predicate> = (0..(myelin_query::MAX_PREDICATE_NODES + 50))
+            .map(|_| Predicate::True)
+            .collect();
+        assert!(
+            QueryAst::compiled(Predicate::And(oversized)).is_err(),
+            "an adversarial over-budget predicate is rejected at construction (statically cost-bounded)"
+        );
     }
 
     /// **A caveat on a DENIED relation does not leak Allow.** If the relation grant itself fails,

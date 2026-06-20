@@ -59,6 +59,13 @@ serde_json = { workspace = true }
 # lint (contract 1.6) is GREEN on S1 and the store compiles against the FROZEN tags (never drift).
 # The PersonalDataHolder trait id the S1 store registers under also lives here (10.1).
 myelin-gdpr = { path = "../myelin-gdpr" }
+# P-133 (P-ID-22): the ONE platform predicate language. The promoted `CaveatContext`
+# evaluator (check_engine::eval_caveat) calls into the single bounded, DoS-hardened,
+# statically-cost-bounded `myelin-query` QueryAst interpreter (contract 3.4, the EventMatcher
+# core) — there is no second predicate language. A service crate (the terminal consumer ABOVE
+# the mid-tier library DAG) depends on myelin-query; nothing in the production library DAG
+# depends back on this service.
+myelin-query = { path = "../myelin-query" }
 
 [dev-dependencies]
 # P-ID-10 (P-068) ID-D3 drill: the failure-injection harness's telemetry-assertion library

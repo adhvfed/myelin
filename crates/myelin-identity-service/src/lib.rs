@@ -48,8 +48,10 @@
 //!   → P-ID-14).
 //! - **`check` (4.2)** → **P-ID-09 — LANDED:** [`check_engine::CheckEngine`] is the depth-bounded,
 //!   memoised-per-request, fail-closed, zookie-snapshot Zanzibar userset-rewrite over the raw S3
-//!   tuples (direct grants + tuple-to-userset inheritance), with the literal-only `CaveatContext`
-//!   rider (full `QueryAst` core → P-ID-22). The shell's [`FailClosedCheck::check`] remains the
+//!   tuples (direct grants + tuple-to-userset inheritance), with the `CaveatContext` rider
+//!   **promoted to the full `myelin_query::QueryAst` predicate core in P-ID-22 (P-133)** — the
+//!   literal-only floor is CLOSED; the evaluator ([`check_engine::eval_caveat_predicate`]) runs on
+//!   the ONE platform predicate language. The shell's [`FailClosedCheck::check`] remains the
 //!   **no-store** default (a shell with no tuple store wired still denies, fail-closed); a service
 //!   instance with the S3 store wired runs the real engine behind the SAME [`CheckAuthorizer`] seam.
 //! - `list_objects` (4.3) → P-ID-11 / P-ID-12 — returns `NotYetImplemented` (a leak-free
@@ -85,7 +87,7 @@ pub use authenticate::{
     scheme, AuthTelemetry, CredentialVerifier, HumanSsoAuthenticator, IdorCounters,
     StructuralVerifier, VerifiedAssertion,
 };
-pub use check_engine::{eval_caveat, CheckEngine, MAX_REWRITE_DEPTH};
+pub use check_engine::{eval_caveat, eval_caveat_predicate, CheckEngine, MAX_REWRITE_DEPTH};
 pub use delegation::{
     authority_of, effective_policy_of, DelegationAlgebra, DelegationInput, IntersectionProof,
     EFFECTIVE_GRANT_CARRIER,

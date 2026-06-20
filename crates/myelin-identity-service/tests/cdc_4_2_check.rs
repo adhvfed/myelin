@@ -175,6 +175,75 @@ fn cdc_4_2_caveat_gates_the_action() {
     );
 }
 
+/// **The 4.2 NON-LITERAL caveat path (P-ID-22): a predicate reading context variables gates the
+/// action through the ONE `QueryAst` core.** The predicate `issue.severity < threshold` resolves
+/// BOTH operands from the supplied `attrs` (real variables, not embedded constants — the
+/// promotion's point). `severity=2, threshold=5` ⇒ visible ⇒ proceeds; `severity=8` ⇒ redacted ⇒
+/// refused. This re-affirms the 4.2 pair now exercises a non-literal caveat (the literal-only floor
+/// closed), routed through the public `check` ABI with no frozen-shape change.
+#[test]
+fn cdc_4_2_non_literal_caveat_gates_through_query_ast_core() {
+    let s = scope("acme");
+    let svc = provider(&s, &[grant("issue:PROJ-1", "view_field", "p:alice")]);
+    let obj = ArtifactRef("myelin://acme/issues/issue/issue:PROJ-1".into());
+
+    // The NON-LITERAL predicate: `severity < threshold` — operands are context VARIABLES
+    // (`__caveat_lhs_var` / `__caveat_rhs_var`), resolved from `attrs` at eval time.
+    let predicate_keys = |severity: i64, threshold: i64| {
+        let mut attrs = BTreeMap::new();
+        attrs.insert("__caveat_op".to_string(), Literal::Str("lt".into()));
+        attrs.insert("__caveat_lhs_var".to_string(), Literal::Str("severity".into()));
+        attrs.insert("__caveat_rhs_var".to_string(), Literal::Str("threshold".into()));
+        attrs.insert("severity".to_string(), Literal::Int(severity));
+        attrs.insert("threshold".to_string(), Literal::Int(threshold));
+        CaveatContext {
+            object: obj.clone(),
+            field: Some(myelin_identity::FieldId("salary".into())),
+            transition: None,
+            attrs,
+        }
+    };
+
+    // severity(2) < threshold(5) ⇒ visible ⇒ proceeds.
+    let cav_ok = predicate_keys(2, 5);
+    assert!(
+        write_path_gated_action(&svc, &subject("p:alice"), "view_field", &obj, Some(&cav_ok)),
+        "a satisfied NON-LITERAL caveat (variable operands) proceeds through the QueryAst core"
+    );
+
+    // severity(8) < threshold(5) is false ⇒ redacted ⇒ refused.
+    let cav_bad = predicate_keys(8, 5);
+    assert!(
+        !write_path_gated_action(&svc, &subject("p:alice"), "view_field", &obj, Some(&cav_bad)),
+        "a violated NON-LITERAL caveat redacts (the field is hidden)"
+    );
+
+    // A non-literal predicate whose referenced variable is ABSENT ⇒ Conditional ⇒ refused
+    // (missing context is never a silent allow — the mandatory-core branch, on the promoted core).
+    let mut missing = BTreeMap::new();
+    missing.insert("__caveat_op".to_string(), Literal::Str("lt".into()));
+    missing.insert("__caveat_lhs_var".to_string(), Literal::Str("severity".into()));
+    missing.insert("__caveat_rhs_var".to_string(), Literal::Str("threshold".into()));
+    // NOTE: neither `severity` nor `threshold` is supplied.
+    let cav_missing = CaveatContext {
+        object: obj.clone(),
+        field: Some(myelin_identity::FieldId("salary".into())),
+        transition: None,
+        attrs: missing,
+    };
+    assert_eq!(
+        svc.check(
+            &subject("p:alice"),
+            &Permission("view_field".into()),
+            &obj,
+            &at_latest(),
+            Some(&cav_missing),
+        ),
+        Ok(Decision::Conditional),
+        "a non-literal caveat whose variable is unbound is Conditional, never a silent Allow"
+    );
+}
+
 /// **The 4.2 mandatory-core branch: a missing-context caveat does NOT proceed.** The consumer
 /// gates on `Allow` only; a `Conditional` (missing context) refuses the silent action — the write
 /// path never opens on a caveat it could not evaluate.
