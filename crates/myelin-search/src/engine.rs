@@ -752,6 +752,121 @@ impl TantivyBackend {
         // advances monotonically; the body is unchanged — a permission change does not re-embed).
         let _ = self.upsert_stamped(&meta.doc, new_zookie, meta.version + 1);
     }
+
+    /// **Locate every live `doc_id` that references a subject (§4.8 `locate(subject)`, contract 10.1).**
+    /// The erase/locate path's enumeration: walks the per-doc side map (the SAME side map the re-stamp
+    /// path uses — a doc-id point walk, NOT a scored permission search, so it never rides the
+    /// `search`-requires-acl-filter path) and returns the doc-ids the [`SubjectMatcher`] admits.
+    ///
+    /// A subject is referenced when (§4.8): its **`acl_object`** is the subject (a doc owned by / pinned
+    /// on the subject), one of its **subject-locator facets** (`actor`/`assignee`/`mention`, the §4.8
+    /// "actor/assignee/mention facets") carries the subject id, OR the doc's **text mentions the subject
+    /// pseudonym** `<pseudonym>@<tenant>.noreply` (contract 4.8). This is the set `erase` purges + the
+    /// set `locate` reports + the set `restrict` suppresses — ONE matcher, no drift between the three
+    /// holder ops. Deterministic order (`doc_id`-sorted) so a receipt over the located set is stable.
+    pub fn locate_subject(&self, matcher: &SubjectMatcher) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .doc_meta
+            .iter()
+            .filter(|(_, meta)| matcher.matches(&meta.doc))
+            .map(|(doc_id, _)| doc_id.clone())
+            .collect();
+        out.sort_unstable();
+        out
+    }
+}
+
+/// **The subject-locator matcher (§4.8 `locate(subject)`; contract 10.1 + 4.8).** Encodes the §4.8
+/// rule for "an index document references this subject": by `acl_object`, by an actor/assignee/mention
+/// **subject-locator facet**, or by the subject's **pseudonym** `<pseudonym>@<tenant>.noreply` appearing
+/// in the analyzable body (contract 4.8). The matcher is the ONE meaning of "references the subject" the
+/// `locate`/`erase`/`restrict` holder ops share (no drift): `erase` purges what it matches, `locate`
+/// reports it, `restrict` suppresses it.
+///
+/// PII posture: the matcher keys on the **pseudonymous opaque subject id** (the Principal id) and the
+/// subject's **pseudonym handle** (a `.noreply` token, never a real email — EI-04 §1) — never a name.
+#[derive(Clone, Debug)]
+pub struct SubjectMatcher {
+    /// The pseudonymous opaque subject id (the Principal id) — matched against the `acl_object` and the
+    /// subject-locator facet values.
+    subject_id: String,
+    /// The subject's pseudonym handle `<pseudonym>@<tenant>.noreply` (contract 4.8) — matched against the
+    /// analyzable body (a doc that *mentions* the subject by their `.noreply` handle references them).
+    /// `None` when the subject has no resolved pseudonym (then only id/facet matches apply).
+    pseudonym: Option<String>,
+    /// The subject-locator facet names the §4.8 walk inspects (`actor`/`assignee`/`mention`, …). A facet
+    /// whose value equals the subject id means the doc references the subject through that role.
+    locator_facets: Vec<String>,
+}
+
+/// The default subject-locator facet names (§4.8: the "actor/assignee/mention facets"). A doc carrying
+/// any of these with the subject's id as the value references the subject.
+pub const DEFAULT_SUBJECT_LOCATOR_FACETS: &[&str] = &["actor", "assignee", "mention"];
+
+impl SubjectMatcher {
+    /// Build a matcher for `subject_id` (the pseudonymous Principal id) with an optional `pseudonym`
+    /// handle (`<pseudonym>@<tenant>.noreply`, 4.8) over the default subject-locator facets (§4.8).
+    pub fn new(subject_id: impl Into<String>, pseudonym: Option<String>) -> SubjectMatcher {
+        SubjectMatcher {
+            subject_id: subject_id.into(),
+            pseudonym,
+            locator_facets: DEFAULT_SUBJECT_LOCATOR_FACETS.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// Override the subject-locator facet set (e.g. a subsystem with bespoke role facets).
+    pub fn with_locator_facets(
+        mut self,
+        facets: impl IntoIterator<Item = impl Into<String>>,
+    ) -> SubjectMatcher {
+        self.locator_facets = facets.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// The pseudonymous subject id this matcher keys on (PII-free).
+    pub fn subject_id(&self) -> &str {
+        &self.subject_id
+    }
+
+    /// **Does this index document reference the subject (§4.8)?** True iff its `acl_object` is the
+    /// subject, a subject-locator facet carries the subject id, or the body mentions the subject's
+    /// `.noreply` pseudonym. The single "references the subject" predicate the three holder ops share.
+    pub fn matches(&self, doc: &IndexDocument) -> bool {
+        // (1) by acl_object — a doc owned by / pinned on the subject.
+        if doc.acl_object == self.subject_id || doc.doc_id == self.subject_id {
+            return true;
+        }
+        // (2) by an actor/assignee/mention subject-locator facet equal to the subject id (§4.8).
+        for facet in &self.locator_facets {
+            if let Some(value) = doc.fields.get(facet) {
+                if Self::facet_text(value).as_deref() == Some(self.subject_id.as_str()) {
+                    return true;
+                }
+            }
+        }
+        // (3) by the subject's pseudonym appearing in the analyzable body (contract 4.8 — a doc that
+        // *mentions* the subject by their `<pseudonym>@<tenant>.noreply` handle references them).
+        if let Some(pseudonym) = &self.pseudonym {
+            if doc.text.contains(pseudonym.as_str()) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The string form of a facet value for an exact subject-id comparison (a subject locator is a
+    /// Principal/Relation/Text/Select id, never an Int/Bool/OrderKey).
+    fn facet_text(value: &FieldValue) -> Option<String> {
+        match value {
+            FieldValue::Text(s)
+            | FieldValue::Date(s)
+            | FieldValue::Select(s)
+            | FieldValue::Relation(s)
+            | FieldValue::Principal(s) => Some(s.clone()),
+            FieldValue::OrderKey(k) => Some(k.as_str().to_string()),
+            FieldValue::Int(_) | FieldValue::Bool(_) => None,
+        }
+    }
 }
 
 impl IndexBackend for TantivyBackend {

@@ -351,6 +351,47 @@ impl IndexRegistry {
             None => 0,
         }
     }
+
+    /// Locate every live doc in the `(tenant, region)` index referencing the subject (§4.8 locate).
+    /// A doc-id point walk over the per-tenant backend's side map (NOT a scored search). An absent
+    /// partition has no docs. Tenant-first (no cross-tenant index handle).
+    fn locate_subject(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+        matcher: &crate::engine::SubjectMatcher,
+    ) -> Vec<String> {
+        let pk = PartKey { tenant: tenant.clone(), region: region.clone() };
+        let guard = self.indices.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.get(&pk) {
+            Some(be) => be.locate_subject(matcher),
+            None => Vec::new(),
+        }
+    }
+
+    /// **Compact-on-merge the `(tenant, region)` index (§3.3) — the erasure-critical compaction.** After
+    /// the `*.erased` purge soft-deletes the affected docs' vectors, this physically removes every
+    /// tombstoned embedding (0 orphan embedding survives) and merges the Tantivy segments. An absent
+    /// partition is a no-op. Tenant-first.
+    fn compact(&self, tenant: &TenantId, region: &Region) -> Result<(), crate::engine::IndexError> {
+        let pk = PartKey { tenant: tenant.clone(), region: region.clone() };
+        let mut guard = self.indices.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.get_mut(&pk) {
+            Some(be) => be.merge(),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether the `(tenant, region)` index has ANY orphan (tombstoned-until-compact) embedding — the
+    /// 0-orphan-after-compact GATE reads this. An absent partition has none.
+    fn has_orphan_embedding(&self, tenant: &TenantId, region: &Region) -> bool {
+        let pk = PartKey { tenant: tenant.clone(), region: region.clone() };
+        let guard = self.indices.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.get(&pk) {
+            Some(be) => be.vectors().has_orphan_embedding(),
+            None => false,
+        }
+    }
 }
 
 /// Why the indexer could not project an event into the index. A `Malformed` event (a missing
@@ -452,6 +493,21 @@ impl IncrementalIndexer {
             .with_backend(tenant, region, |be| be.search(acl_filter, text_query, limit))
     }
 
+    /// **Semantic (vector) k-NN over the `(tenant, region)` co-located HNSW shape, ACL-filtered.** The
+    /// erase drill reads this to assert a purged subject's VECTOR is gone (not just the FT doc). Tenant-first.
+    pub fn search_semantic(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+        acl_filter: &crate::engine::AclFilter,
+        query: &Embedding,
+        k: usize,
+    ) -> Result<Vec<crate::vector::VectorHit>, crate::engine::IndexError> {
+        use crate::engine::IndexBackend;
+        self.registry
+            .with_backend(tenant, region, |be| be.semantic(acl_filter, query, k))
+    }
+
     /// Read the stored `indexed_zookie` of a doc (the ACL-state-indexed assertion reads it — a
     /// permission change advances it). Returns `None` if the doc is absent. Tenant-first.
     pub fn indexed_zookie_of(
@@ -464,6 +520,34 @@ impl IncrementalIndexer {
             .with_backend(tenant, region, |be| Ok(be.indexed_zookie_of(doc_id)))
             .ok()
             .flatten()
+    }
+
+    /// **Locate every live doc in `(tenant, region)` referencing the subject (§4.8 `locate(subject)`;
+    /// contract 10.1).** A doc-id point walk (NOT a scored search): returns the doc-ids the
+    /// [`SubjectMatcher`](crate::engine::SubjectMatcher) admits (by `acl_object`, by an
+    /// actor/assignee/mention subject-locator facet, or by the subject's `.noreply` pseudonym in the
+    /// body). The set the holder's `locate` reports, `erase` purges, and `restrict` suppresses — ONE
+    /// matcher, no drift. Tenant-first.
+    pub fn locate_subject(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+        matcher: &crate::engine::SubjectMatcher,
+    ) -> Vec<String> {
+        self.registry.locate_subject(tenant, region, matcher)
+    }
+
+    /// **Compact the `(tenant, region)` index (§3.3) — physically remove every tombstoned embedding
+    /// (0 orphan after compact) + merge segments.** The erase path calls this after the `*.erased`
+    /// purge soft-deletes the affected docs' vectors. Tenant-first.
+    pub fn compact(&self, tenant: &TenantId, region: &Region) -> Result<(), crate::engine::IndexError> {
+        self.registry.compact(tenant, region)
+    }
+
+    /// Whether `(tenant, region)` holds ANY orphan (tombstoned-until-compact) embedding — the
+    /// 0-orphan-after-compact GATE reads this (SRCH-D4: 0 recoverable incl. vectors). Tenant-first.
+    pub fn has_orphan_embedding(&self, tenant: &TenantId, region: &Region) -> bool {
+        self.registry.has_orphan_embedding(tenant, region)
     }
 
     /// **Index ONE delivered event (the ONE ingest step — §4.1).** Factored out of
