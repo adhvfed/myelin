@@ -1,0 +1,27 @@
+documentsize 24x24
+defaults
+  fill none
+  stroke $ink
+  stroke-width 2
+  stroke-linecap round
+  stroke-linejoin round
+palette
+  ink #ff00ff
+shape head1 template=ellipse
+place h1 shape=head1 at=4,5 size=7x7
+shape body1 template=path
+  addpoint a at=2,19
+  addpoint b at=2,17
+  addpoint c at=5,14
+  addpoint d at=10,14
+  addpoint e at=13,17
+  addpoint f at=13,19
+place b1 shape=body1 at=0,0
+shape head2 template=ellipse
+place h2 shape=head2 at=14,5 size=7x7
+shape body2 template=path
+  addpoint a at=15,14
+  addpoint b at=18,14
+  addpoint c at=21,17
+  addpoint d at=21,19
+place b2 shape=body2 at=0,0

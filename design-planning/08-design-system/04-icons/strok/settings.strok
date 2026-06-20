@@ -1,0 +1,30 @@
+documentsize 24x24
+defaults
+  fill none
+  stroke $ink
+  stroke-width 2
+  stroke-linecap round
+  stroke-linejoin round
+palette
+  ink #ff00ff
+shape line1 template=path
+  addpoint a at=4,7
+  addpoint b at=20,7
+place ln1 shape=line1 at=0,0
+shape line2 template=path
+  addpoint a at=4,12
+  addpoint b at=20,12
+place ln2 shape=line2 at=0,0
+shape line3 template=path
+  addpoint a at=4,17
+  addpoint b at=20,17
+place ln3 shape=line3 at=0,0
+shape k1 template=ellipse
+  fill $ink
+place knob1 shape=k1 at=13,5 size=4x4
+shape k2 template=ellipse
+  fill $ink
+place knob2 shape=k2 at=7,10 size=4x4
+shape k3 template=ellipse
+  fill $ink
+place knob3 shape=k3 at=15,15 size=4x4

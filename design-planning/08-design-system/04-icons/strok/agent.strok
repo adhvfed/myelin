@@ -1,0 +1,15 @@
+documentsize 24x24
+defaults
+  fill none
+  stroke $ink
+  stroke-width 2
+  stroke-linecap round
+  stroke-linejoin round
+palette
+  ink #ff00ff
+shape body template=rectangle
+  round-corners 4
+place b1 shape=body at=4,4 size=16x16
+shape dot template=ellipse
+  fill $ink
+place d1 shape=dot at=10,10 size=4x4

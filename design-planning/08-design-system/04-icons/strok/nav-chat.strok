@@ -1,0 +1,31 @@
+documentsize 24x24
+defaults
+  fill none
+  stroke $ink
+  stroke-width 2
+  stroke-linecap round
+  stroke-linejoin round
+palette
+  ink #ff00ff
+shape bubble template=path
+  addpoint a at=6,18
+  addpoint b at=6,15
+  addpoint c at=5,15 mode=catmull-rom
+  addpoint d at=4,14 mode=catmull-rom
+  addpoint e at=4,7 mode=catmull-rom
+  addpoint f at=5,6 mode=catmull-rom
+  addpoint g at=19,6 mode=catmull-rom
+  addpoint h at=20,7 mode=catmull-rom
+  addpoint i at=20,14 mode=catmull-rom
+  addpoint j at=19,15 mode=catmull-rom
+  addpoint k at=10,15
+  close
+place b1 shape=bubble at=0,0
+shape l1 template=path
+  addpoint a at=8,10
+  addpoint b at=16,10
+place line1 shape=l1 at=0,0
+shape l2 template=path
+  addpoint a at=8,12.5
+  addpoint b at=13,12.5
+place line2 shape=l2 at=0,0

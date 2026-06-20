@@ -1,0 +1,25 @@
+documentsize 24x24
+defaults
+  fill none
+  stroke $ink
+  stroke-width 2
+  stroke-linecap round
+  stroke-linejoin round
+palette
+  ink #ff00ff
+shape rail template=path
+  addpoint a at=7,8
+  addpoint b at=7,16
+place r1 shape=rail at=0,0
+shape diverge template=path
+  addpoint a at=7,13
+  addpoint b at=13,13 mode=catmull-rom
+  addpoint c at=17,9 mode=catmull-rom
+  addpoint d at=17,7
+place d1 shape=diverge at=0,0
+shape nbottom template=ellipse
+place n1 shape=nbottom at=4,16 size=6x6
+shape ntop template=ellipse
+place n2 shape=ntop at=4,3 size=6x6
+shape nbranch template=ellipse
+place n3 shape=nbranch at=14,3 size=6x6
