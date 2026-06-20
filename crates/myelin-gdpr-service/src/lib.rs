@@ -200,11 +200,42 @@
 //! (P-GA-13 TESTS):** the Art-28 cross-tenant guard, the `EraseScope::Tenant` offboarding fan-out,
 //! and the restrict/rectify/portability routing are mandatory-core; the `cargo mutants` score is in
 //! the commit body.
+//!
+//! ## P-GA-15 (→ P-115) — the erasure ledger (10.8) + post-restore re-erasure + the crypto-shred-reaches-backups proof
+//! [`erasure_ledger`] ships the **erasure ledger** ([`erasure_ledger::ErasureLedger`]) — the GDPR-owned,
+//! **PII-free, NON-shred-erasable** record of every completed erasure (the opaque subject token + the
+//! holders erased + the **destroyed key epochs** + the **cross-seam completion offset**). On a DSR
+//! completion the fan-out driver ([`fanout::FanOutDriver::with_ledger`]) writes one
+//! [`erasure_ledger::ErasureLedgerEntry`] **idempotently** (keyed on the DSR id — a worker restart
+//! re-driving the same id does NOT duplicate). The ledger is itself a **recursive
+//! [`myelin_gdpr::PersonalDataHolder`]** whose `erase` **RETAINS** the PII-free record (it holds no
+//! PII and MUST survive to drive re-erasure — §2.3, the carve-out with the audit log) — the ONE holder
+//! the per-tenant crypto-shred does NOT erase away. It drives **Storage's `post_restore_reerase`**
+//! (11.5): a restore reads [`erasure_ledger::ErasureLedger::post_pit_records_after`] and re-erases
+//! every subject erased AFTER the restore's PIT, so a restore never resurrects erased PII (§3.2 /
+//! GD-14). **§1.2 ownership split:** Storage owns the restore MECHANISM (the `ReErasePass` +
+//! `PostRestoreErasureLedger` seam, P-100); GDPR owns the LEDGER that drives it — this module. The
+//! [`erasure_ledger::PostPitRecord`] field shape mirrors Storage's `ErasureRecord` exactly so the boot
+//! wiring (`myelin-control-plane`, which depends on BOTH crates) is a 1:1 field copy; the **CDC pair**
+//! (`crates/myelin-control-plane/tests/cdc_10_8_erasure_ledger_drives_reerase.rs`) proves the
+//! provider (this ledger writes) ⇄ consumer (Storage re-erases from it) seam; the STOR-D4-GA-face /
+//! STOR-D3-GA-face **drills** there emit the dated green artifacts (0 recoverable in backups; 0
+//! resurrected after a restore). **Floors named:** the M1-scale drills re-run at CELL scale + the full
+//! H1–H18 GA-D1 fan-out → **M5 P-GA-32 → P-505**; the durable Postgres `erasure_ledger` table
+//! (excluded from the crypto-shred by construction) + the live WAL completion offset → the same
+//! DB/cursor floor every M0/M1 in-memory store carries (P-007 / P-S12; on this floor the offset is the
+//! monotone completion timestamp surrogate); the Merkle SEAL / audit hash-link of the completion fact
+//! → **P-GA-20 → P-119**. **Mutation floor (P-GA-15 TESTS):** the
+//! [`erasure_ledger::ErasureLedger::record_completion`] write (idempotent, keyed on the DSR id) and the
+//! [`erasure_ledger::ErasureLedger::post_pit_records_after`] re-erasure-trigger read (the
+//! `completed_at_offset > pit` selection) are mandatory-core; the `cargo mutants` score is in the
+//! commit body.
 
 pub mod audit;
 pub mod datamap;
 pub mod diffgate;
 pub mod dsr;
+pub mod erasure_ledger;
 pub mod fanout;
 pub mod holders;
 pub mod orchestration;
@@ -225,6 +256,10 @@ pub use dsr::{
     resolve_checklist_from_map, ChecklistItem, Dsr, DsrError, DsrId, DsrKind, DsrOrchestrator,
     DsrRequestView, DsrState, DsrStatus, Initiator, MerkleProvenBundle, Posture, DSR_DEADLINE_SECS,
     DSR_STATE,
+};
+pub use erasure_ledger::{
+    DestroyedKeyEpoch, ErasureLedger, ErasureLedgerEntry, PostPitRecord, ERASURE_LEDGER_ENTRIES,
+    ERASURE_LEDGER_STORE,
 };
 pub use fanout::{
     DsrCompletionReceipt, FanOutDriver, FanOutOutcome, HoldScope, HoldVerdict, LegalHoldRegistry,
