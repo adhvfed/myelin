@@ -221,6 +221,33 @@
 //! drill needs BOTH halves; the **scope-bounded selector (reject `*`) + the per-surface frame shed
 //! budgets** are **P-S29 (P-136)**; the **M4 connection-storm re-confirm** of this half is **P-S31
 //! (P-326)**.
+//!
+//! ## Status (P-S29 → P-136, M2) — firehose scope-bounded selector + per-surface frame shed budgets DONE
+//! The substrate's half of D-11 is now **COMPLETE** (P-S28 the cap + slow-consumer drop; P-S29 the
+//! scope-bounded selector + frame shed budgets). Shipped in [`firehose_selector`] — it WRAPS the P-S28
+//! [`firehose::FrameBuffer`] (coherence, EI-01 §7 — no re-defined buffer), adding the two seams P-S28
+//! named:
+//! - **(a) scope as a bounded selector, never `*`** — [`firehose_selector::BoundedSelector::parse`]
+//!   admits ONLY `board:`/`doc:`/`channel:<id>` and **REJECTS `*`** (and `board:*`, empty, un-prefixed,
+//!   unknown-kind) with a typed [`firehose_selector::SelectorError`] — an unbounded subscription is
+//!   unrepresentable. A 50k-row board subscribes to a [`firehose_selector::ScopeWindow`] (visible rows +
+//!   margin); a frame on an off-screen row is [`firehose_selector::FrameOutcome::OutOfWindow`] and never
+//!   enters the buffer (memory bounded by the WINDOW, not the board — the §7.7 "never `*`" guarantee).
+//! - **(b) the per-surface shed budgets applied to FRAMES** — [`firehose_selector::FrameShedBudget`]
+//!   gives each [`firehose::FrameClass`] a fraction of the buffer (presence ≤ agent ≤ human, the §7.6
+//!   order): **presence/speculative frames shed BEFORE message delivery; agents shed BEFORE humans**.
+//!   The human/message frames are shed LAST (only the per-connection cap, in true saturation, sheds them).
+//!
+//! [`firehose_selector::FrameSelector`] composes the window + the frame budget over the P-S28 buffer
+//! into the connection tier's one call per inbound frame ([`firehose_selector::FrameSelector::offer`]).
+//! The per-class frame-shed count is exported as the §10.2 `ShedCount`-by-lane signal (labelled by the
+//! frame class). The unit tests (`firehose_selector::tests`) + the CDC 3.5 scope-selector pair
+//! (`tests/cdc_3_5_firehose_scope_selector.rs`) + the SUB-D11 frame-budget drill completion
+//! (`tests/drill_sub_d11_firehose_frame_budgets.rs`) are the dated green artifact. **Floors named:** the
+//! Bus-side **zero-loss-replay half** (`subscribe`/`resume`/`resync → *.snapshot`) is **P-141 (EB-21)**
+//! — the full D-11 reconnect-loses-zero-ops proof needs BOTH halves; the per-class frame-budget
+//! FRACTIONS are the M2 v1 floor → tuned by the connection-storm drill in **M5 (P-S33)**; the **M4
+//! connection-storm re-confirm** of this half is **P-S31 (P-326)**.
 
 use serde::{Deserialize, Serialize};
 
@@ -229,6 +256,7 @@ pub mod crate_graph;
 pub mod fail_static;
 pub mod fail_static_authz;
 pub mod firehose;
+pub mod firehose_selector;
 pub mod holder_catalog;
 pub mod holder_registered;
 pub mod holders;
@@ -254,6 +282,10 @@ pub use fail_static_authz::{
 };
 pub use firehose::{
     Frame, FrameBuffer, FrameClass, FrameLagSample, FirehoseScope, FirehoseSignals, PushOutcome,
+};
+pub use firehose_selector::{
+    BoundedSelector, FrameBudgetVerdict, FrameOutcome, FrameSelector, FrameShedBudget, ScopeWindow,
+    SelectorError, SelectorKind, WindowVerdict,
 };
 pub use holder_catalog::{
     assert_holder_completeness, classify_store, holder_completeness, Holder, OrphanStore,
