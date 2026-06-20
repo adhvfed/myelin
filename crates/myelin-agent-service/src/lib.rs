@@ -59,9 +59,11 @@
 //!   fixtures live alongside the above (`forward_only_migration.agent.*`).
 //!
 //! ## Floors named (state cross-references; VISION §3)
-//! - **The `PersonalDataHolder` REGISTRATION seam lands in AG-P3 (→ P-132).** Here the five tables
-//!   exist and carry their `#[personal_data(...)]` classification tags; the holder *registration*
-//!   (so the harness auto-registers the Fabric's holders on boot) is the very next prompt.
+//! - **The `PersonalDataHolder` REGISTRATION seam landed in AG-P3 (→ P-132) — [`holder`].** The five
+//!   tables carry their `#[personal_data(...)]` classification tags (here, AG-P2); the holder
+//!   *registration* through the substrate `HolderRegistry` (so the harness auto-registers the
+//!   Fabric's H11 OLTP + H17 trace holders on boot) ships in [`holder`] (AG-P3). The holder BODIES
+//!   are the named floor below.
 //! - **The `PersonalDataHolder` BODIES (locate / export / erase) land in AG-P23 (→ P-1371-band).**
 //!   The schema is complete and the crypto-shred lever (per-subject DEK) exists by tag here; the full
 //!   DSR fan-out across all Fabric holders (run table, trace, agent memory) is the M5 follow-on
@@ -74,5 +76,14 @@
 //!   `integration` test proves the RLS policy denies a cross-tenant read against the LIVE dev stack.
 //!   The validation logic does not change shape when the driver lands.
 
+pub mod holder;
 pub mod migrations;
 pub mod schema;
+
+// Re-export the PersonalDataHolder registration seam (AG-P3 → P-132) at the crate root — the shape
+// the harness `serve` (AG-P4) + the DSR fan-out (AG-P23) + the 10.1 CDC consume (mirrors
+// myelin-refs-service / myelin-search re-exporting their holder seam).
+pub use holder::{
+    agent_store_classifier, register_agent_holders, AgentHolderRegistration, AgentOltpHolder,
+    AgentTraceHolder, AGENT_OLTP_STORE, AGENT_TRACE_STORE,
+};

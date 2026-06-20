@@ -1,24 +1,33 @@
-//! The TWO Agent-Fabric data-model lints, the agent-relevant slice (AG-P2 → global P-131).
+//! The THREE Agent-Fabric data-model lints, the agent-relevant slice (AG-P2 → global P-131 +
+//! AG-P3 → global P-132).
 //!
 //! AG-P2 ships the Agent-Fabric data model — the five `(tenant, region)`-first RLS migrations
 //! (`run`/`tool_def`/`proposed_effect`/`hitl_gate`/`trace`, architecture §4) in the
-//! `myelin-agent-service` crate. The two CONSTRAINING lints (contract 1.6) are the
+//! `myelin-agent-service` crate. Its two CONSTRAINING lints (contract 1.6) are the
 //! `tenant-predicate` (no cross-tenant query path) + `forward-only-migration` (online
-//! expand→backfill→contract, no DROP/in-place rewrite) ratchet gates. Their generic scanners + the
-//! engine were first shipped by the substrate prompt P-S10/P-S11 → P-017/P-018; rather than
-//! duplicate a parallel scanner (EI-01 §7), this slice ships the AGENT-SHAPED red+green fixtures that
-//! prove BOTH lints reject the agent-fabric bug fingerprint and admit the agent-fabric correct shape.
+//! expand→backfill→contract, no DROP/in-place rewrite) ratchet gates. **AG-P3 (→ P-132)** adds the
+//! third Agent-Fabric ratchet: the `no-untagged-personal-data` lint (contract 1.6 / 10.2) — every
+//! PII-bearing Fabric column MUST carry its `#[personal_data(...)]` tag so the per-subject DEK
+//! crypto-shred erase + the RoPA/data-map fan-out (AG-D10) reach it; an untagged PII column leaves
+//! an un-erasable subject (ADR-12).
 //!
-//! These tests ARE the AG-P2 lint fixtures (the TESTS field: "the tenant-predicate red+green
-//! fixtures"). They run loud over the agent fixtures and assert the exact verdict; the CI-wiring
-//! proof (an agent red fixture ⇒ the `lint-gate` binary exits non-zero, no `|| true` swallow) is the
-//! last test. No threshold is weakened: a lint is never softened to admit a red fixture (EI-01 §5).
+//! Their generic scanners + the engine were first shipped by the substrate prompt P-S10/P-S11 →
+//! P-017/P-018; rather than duplicate a parallel scanner (EI-01 §7), this slice ships the
+//! AGENT-SHAPED red+green fixtures that prove each lint rejects the agent-fabric bug fingerprint and
+//! admits the agent-fabric correct shape.
+//!
+//! These tests ARE the AG-P2/AG-P3 lint fixtures. They run loud over the agent fixtures and assert
+//! the exact verdict; the CI-wiring proof (an agent red fixture ⇒ the `lint-gate` binary exits
+//! non-zero, no `|| true` swallow) is the last test. No threshold is weakened: a lint is never
+//! softened to admit a red fixture (EI-01 §5).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use myelin_lints::engine::run;
-use myelin_lints::lints::{all_twelve, forward_only_migration, tenant_predicate};
+use myelin_lints::lints::{
+    all_twelve, forward_only_migration, no_untagged_personal_data, tenant_predicate,
+};
 use myelin_lints::{Lint, LintId};
 
 fn fixtures_dir() -> PathBuf {
@@ -52,12 +61,20 @@ fn agent_matrix() -> Vec<AgentRow> {
             red: "forward_only_migration.agent.red.rs.txt",
             green: "forward_only_migration.agent.green.rs.txt",
         },
+        // AG-P3 (→ P-132): the no-untagged-personal-data ratchet over the Fabric stores. The red
+        // fixture is the deliberately-untagged Fabric body field; the green is the fully-tagged row.
+        AgentRow {
+            lint: no_untagged_personal_data,
+            id: LintId("no-untagged-personal-data"),
+            red: "no_untagged_personal_data.agent.red.rs.txt",
+            green: "no_untagged_personal_data.agent.green.rs.txt",
+        },
     ]
 }
 
 #[test]
-fn the_two_agent_lints_reject_their_agent_red_fixtures() {
-    // 2/2 REJECT: each agent red fixture produces >= 1 violation, fired by THAT lint.
+fn the_agent_lints_reject_their_agent_red_fixtures() {
+    // REJECT: each agent red fixture produces >= 1 violation, fired by THAT lint.
     for row in agent_matrix() {
         let lint = (row.lint)();
         let violations = lint.run(&read_fixture(row.red));
@@ -76,8 +93,8 @@ fn the_two_agent_lints_reject_their_agent_red_fixtures() {
 }
 
 #[test]
-fn the_two_agent_lints_admit_their_agent_green_fixtures() {
-    // 2/2 ADMIT: each agent green fixture produces 0 violations from ITS lint.
+fn the_agent_lints_admit_their_agent_green_fixtures() {
+    // ADMIT: each agent green fixture produces 0 violations from ITS lint.
     for row in agent_matrix() {
         let lint = (row.lint)();
         let violations = lint.run(&read_fixture(row.green));
@@ -168,5 +185,50 @@ fn ci_gate_exits_non_zero_on_an_agent_red_fixture_and_zero_on_green() {
         run_over("forward_only_migration.agent.green.rs.txt"),
         0,
         "lint-gate MUST exit zero on the agent forward-only-migration green fixture"
+    );
+    // AG-P3 (→ P-132): the no-untagged-personal-data ratchet over the Fabric stores is wired the
+    // same way — non-zero on the untagged-body red fixture, zero on the fully-tagged green.
+    assert_ne!(
+        run_over("no_untagged_personal_data.agent.red.rs.txt"),
+        0,
+        "lint-gate MUST exit non-zero on the agent no-untagged-personal-data red fixture"
+    );
+    assert_eq!(
+        run_over("no_untagged_personal_data.agent.green.rs.txt"),
+        0,
+        "lint-gate MUST exit zero on the agent no-untagged-personal-data green fixture"
+    );
+}
+
+/// **The AG-P3 no-untagged-personal-data GATE (contract 1.6 / 10.2): the red fixture is rejected on
+/// EXACTLY the untagged Fabric body field; the green is admitted.** The lint fingerprints by PII
+/// field NAME — the agent_principal pseudonym is tagged in the red fixture, isolating the failure to
+/// the deliberately-untagged conversation/card body so the assertion is sharp. The live workspace
+/// scan (`workspace_clean.rs`) additionally runs all twelve lints over `myelin-agent-service/src`,
+/// holding the SHIPPED tagged Fabric schema green by the same gate (a permanent ratchet).
+#[test]
+fn the_agent_no_untagged_red_names_the_untagged_field_and_green_is_admitted() {
+    let red = read_fixture("no_untagged_personal_data.agent.red.rs.txt");
+    let violations = no_untagged_personal_data().run(&red);
+    assert_eq!(
+        violations.len(),
+        1,
+        "exactly the untagged Fabric body field must fire, got: {violations:?}"
+    );
+    assert_eq!(
+        violations[0].lint,
+        LintId("no-untagged-personal-data"),
+        "the agent red-fixture violation must carry the no-untagged-personal-data id"
+    );
+    assert!(
+        violations[0].reason.contains("message_body"),
+        "the violation must name the untagged Fabric body field, got: {:?}",
+        violations[0]
+    );
+
+    let green = read_fixture("no_untagged_personal_data.agent.green.rs.txt");
+    assert!(
+        no_untagged_personal_data().run(&green).is_empty(),
+        "the fully-tagged Fabric row must be admitted (no false positive)"
     );
 }
