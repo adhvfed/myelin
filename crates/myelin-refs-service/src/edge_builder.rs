@@ -260,6 +260,78 @@ impl EdgeProjection {
         self.lock().get(&pk).map(|p| p.len()).unwrap_or(0)
     }
 
+    /// **The canonical byte-image of the `(tenant, region)` partition (the REF-D4 reindex-parity
+    /// comparison reads this — §4.7).** Serialises EVERY row (live AND tombstoned) in a DETERMINISTIC
+    /// order (ascending `edge_id`) into a stable byte string, so two projections built by different
+    /// paths (steady-state ingestion vs a cold reindex-from-source rebuild) are byte-identical **iff**
+    /// they hold the same rows. This is the §4.7 "the rebuilt index byte-matches the live index"
+    /// equality the reindex drill asserts on. It is a PURE function of the projection state (no clock,
+    /// no randomness), so a re-run reproduces the same bytes.
+    ///
+    /// **`origin_event` is DELIBERATELY EXCLUDED** from the parity image. It is the PROVENANCE id of
+    /// the log event that wrote the row — and a `*.snapshot` re-emit carries a DIFFERENT (deterministic
+    /// `snap-…`) `event_id` than the original live event by construction (§4.7: the snapshot's id is
+    /// `snapshot_event_id(aggregate, version)`, NOT the live ULID). So including `origin_event` would
+    /// make a cold rebuild NEVER byte-match a live index, which is wrong — the architecture's
+    /// "byte-matches the live index" is over the EDGE CONTENT the index serves (the edge identity +
+    /// endpoints + derived roots + rel + class + actor + zookie + tombstone), the part that MUST be
+    /// reproduced identically, NOT the per-write provenance id that legitimately differs between a live
+    /// event and its replayed snapshot. (DEVIATION from a naive "every column" reading of §4.7, per
+    /// EI-01 §1: documented here + in the reindex module; the parity property is content-equality, the
+    /// recovery guarantee callers actually depend on.) Tenant-first (no cross-tenant read path);
+    /// PII-free (every field is an opaque ref/token/pseudonymous id).
+    pub fn parity_bytes(&self, tenant: &TenantId, region: &Region) -> Vec<u8> {
+        let pk = PartKey { tenant: tenant.clone(), region: region.clone() };
+        let mut rows: Vec<EdgeRow> = self
+            .lock()
+            .get(&pk)
+            .map(|p| p.values().cloned().collect())
+            .unwrap_or_default();
+        rows.sort_by(|a, b| a.edge_id.cmp(&b.edge_id));
+        // A stable, unambiguous canonical encoding: one NUL-joined record per row, the records
+        // newline-joined. Every field is rendered so no field boundary is ambiguous (the fields are
+        // NUL-free URNs/tokens). Deterministic over the `edge_id`-sorted row vector.
+        let mut out = Vec::new();
+        for r in &rows {
+            let rec = format!(
+                "{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}",
+                r.edge_id,
+                r.source.0,
+                r.source_root.0,
+                r.target.0,
+                r.target_root.0,
+                r.rel,
+                r.rel_class.as_str(),
+                r.origin_actor,
+                r.zookie.as_deref().unwrap_or(""),
+                r.tombstoned,
+            );
+            out.extend_from_slice(rec.as_bytes());
+            out.push(b'\n');
+        }
+        out
+    }
+
+    /// A stable parity HASH of the `(tenant, region)` partition (the green-artifact the reindex drill
+    /// emits, §4.7 — "the reindex-parity hash"). A BLAKE3 digest of [`parity_bytes`], hex-rendered —
+    /// the SAME `blake3:<hex>` content-address convention the BlobStore + the GDPR receipt + the audit
+    /// Merkle leaf use (ONE convention, not a second one). Two paths agree on the bytes ⇒ agree on the
+    /// hash; a single differing row flips it. PII-free (a hash over opaque refs).
+    pub fn parity_hash(&self, tenant: &TenantId, region: &Region) -> String {
+        let bytes = self.parity_bytes(tenant, region);
+        format!("blake3:{}", blake3::hash(&bytes).to_hex())
+    }
+
+    /// **Wipe every row in the `(tenant, region)` partition (the cold-rebuild precondition — §4.7).**
+    /// The reindex-from-source drill WIPES the derived index, then rebuilds it ONLY from the owner's
+    /// replayed `*.snapshot` log through the live consumer — there is NO "reload from an owner DB"
+    /// backdoor. This models the `TRUNCATE`/drop of the per-tenant `edge` partition before a recovery
+    /// rebuild. Tenant-first (a wipe NEVER touches another tenant's partition).
+    pub fn wipe_partition(&self, tenant: &TenantId, region: &Region) {
+        let pk = PartKey { tenant: tenant.clone(), region: region.clone() };
+        self.lock().remove(&pk);
+    }
+
     /// **Locate every edge naming `subject_id` as its `origin_actor` in the `(tenant, region)`
     /// partition (the REF-P15 holder `locate` query — §4.6).** Refs holds the subject ONLY as the
     /// PSEUDONYMOUS `origin_actor` opaque id (never the name), so "locate the subject's Refs data" is
@@ -481,7 +553,15 @@ impl RefsEdgeBuilder {
             rel_class,
             origin_event: ev.event_id.0.clone(),
             // PSEUDONYMOUS Principal ref — the opaque actor id, never the name (erasure-safe, §4.6).
-            origin_actor: ev.actor.0.principal_id.0.clone(),
+            // PROVENANCE-PRESERVING across a reindex: a `*.snapshot` re-emit carries the ORIGINAL
+            // author in the payload `origin_actor` (the reindex DRIVER's principal is the envelope
+            // actor, NOT the edge's author). So prefer the payload's `origin_actor` if present (the
+            // snapshot path), falling back to the envelope actor (the live `refs.edge.created` path,
+            // where the emitting principal IS the author). This is what makes the rebuilt index
+            // byte-match the live index on the authorship column — and keeps erasure-by-actor
+            // (`edges_by_actor`) correct after a recovery rebuild (§4.6/§4.7).
+            origin_actor: str_field(p, "origin_actor")
+                .unwrap_or_else(|| ev.actor.0.principal_id.0.clone()),
             zookie: str_field(p, "zookie"),
             tombstoned: false,
         };

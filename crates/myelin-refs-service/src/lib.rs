@@ -244,6 +244,34 @@
 //! exercised against synthetic + available producers. The full backup-level 0-recoverable shred drill
 //! (REF-D5 at scale) is REF-P25.
 //!
+//! **REF-P16 (P-165) ships:** the [`reindex`] module — **reindex-from-source: rebuild byte-parity**
+//! (contract 5.8 OWNED `reindex(scope)`, contract 2.6 CONSUMED the re-emit + replay; §4.7). The
+//! [`reindex::RefsReindexSource`] is Refs' [`myelin_events::ReindexSource`] body — it replays a
+//! sub-artifact-granular scope as `refs.edge.snapshot` drafts off the owner's SOURCE OF TRUTH (the edge
+//! log), NEVER off the derived index (the no-cross-db / reindex-from-source discipline). The
+//! [`reindex::RefsReindexer::reindex`] surface drives the §4.7 recovery path as **ONE code path**:
+//! [`myelin_events::reindex`] re-emits the snapshots through the outbox at their deterministic ids → each
+//! snapshot is ingested through the **SAME** [`edge_builder::RefsEdgeBuilder::handle`] the live consumer
+//! runs (cold == live — `handle` does NOT branch on cold-vs-live; there is NO "load the edge table from
+//! an owner's DB" backdoor) → the rebuilt index byte-matches the live index
+//! ([`edge_builder::EdgeProjection::parity_hash`], the §4.7 green artifact). On a Refs↔typed-table TE-7
+//! drift, [`reindex::RefsReindexer::reconverge_typed`] reconverges Refs to the typed snapshot via the
+//! REF-P14 [`mirror::reconverge`] — the drifted lifecycle edge is tombstoned, **the typed table always
+//! wins** (§3.3/§4.7). The `refs.reindex_parity` telemetry
+//! ([`reindex::RefsReindexer::REINDEX_PARITY_SIGNAL`], contract 1.8) is LIVE — `1` iff the rebuilt
+//! partition byte-matched the live partition, `0` iff it drifted (a failed recovery is LOUD +
+//! observable, never a silent partial rebuild). An ERASED aggregate is NOT re-snapshotted
+//! ([`reindex::RefsReindexSource::erase`]) — the erasure stays erased across a rebuild (X-7). **REF-D4
+//! (CI variant)** — wipe → reindex → byte-parity, plus a synthetic TE-7 drift → typed-wins — is greened
+//! in unit + chained + CDC tests; the REAL reindex over the per-tenant-DEK-encrypted Postgres `edge`
+//! table (wipe the partition → re-drive the upserts from the replayed snapshots → byte-match the live
+//! table) is PROVEN against the live dev-stack Postgres in
+//! `tests/integration_ref_p16_reindex_parity.rs` (the `integration` feature). **FLOORS named:** the
+//! per-owner `replay` body is SYNTHETIC at M2 (the real per-blob / block-granular replay over producer
+//! content is **R-M3 REF-P17 Git / REF-P18 Knowledge**); the FULL-SCALE byte-parity drill (REF-D4 at the
+//! 30× corpus across both TE-7 mirrors) is **R-M5 (REF-P24)** — the CI variant here is NOT the at-scale
+//! proof. This slice completes R-M2.
+//!
 //! **Does NOT ship (floors named):**
 //! - **The producers are SYNTHETIC at M2.** REF-P8 exercises the seam with a TEST content writer; the
 //!   first REAL producers (Git diffs / Knowledge blocks / Chat messages writing actual content) land
@@ -290,6 +318,7 @@ pub mod ladder;
 pub mod loop_guard;
 pub mod migration;
 pub mod mirror;
+pub mod reindex;
 pub mod residency;
 pub mod restrict;
 pub mod resolve;
@@ -337,6 +366,10 @@ pub use ladder::{
 pub use holder::{
     refs_store_classifier, register_refs_holders, EdgeBacking, RefsCacheHolder, RefsEdgeHolder,
     RefsHolderRegistration, REFS_CACHE_STORE, REFS_EDGE_STORE,
+};
+pub use reindex::{
+    ReindexError, ReindexReceipt, RefsReindexSource, RefsReindexer, SourceEdge, REFS_EDGE_SNAPSHOT_TYPE,
+    REFS_OWNER_TOKEN,
 };
 pub use restrict::RestrictSet;
 pub use residency::{refs_store_descriptors, RefsStoreDescriptor};
