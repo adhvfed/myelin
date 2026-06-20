@@ -48,6 +48,7 @@ fn workspace_root() -> PathBuf {
 const EXCLUDED_SUBSTRINGS: &[&str] = &[
     "myelin-events/src/relay.rs", // the one legitimate broker-publish component (by design).
     "myelin-storage/src/pgrelay.rs", // the OLTP-co-located relay (Stage 2): same legitimate broker-publish role as relay.rs (BUS-2); outbox queries are relay-internal, not tenant-store.
+    "myelin-events/src/firehose.rs", // the EPHEMERAL firehose transport (EB-21/P-141): `firehose::publish` is the frozen contract-3.5/§5.5 method NAME for a DIFFERENT seam from the durable bus — §4.3 "the durable bus carries only pointer events" while the firehose carries ephemeral frames over its own publish/subscribe/resume API (a references-not-payloads pointer, not an outbox-emitted durable event). NAMED, LOUD (see firehose.rs).
     "myelin-harness/src/bin/sub-m0-scorecard.rs", // the SUB-M0 exit-gate runner: the one legitimate host-exec site (CI orchestration).
     "myelin-harness/src/bin/id-m1-scorecard.rs", // the Identity M1→M2 exit-gate runner (P-079): same legitimate host-exec site (CI orchestration).
     "myelin-harness/src/bin/infra-scorecard.rs", // the infra integration exit-gate runner (Stage 4): same legitimate host-exec site (spawns `cargo test --features integration` per drill).

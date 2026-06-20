@@ -50,6 +50,18 @@ const EXCLUDED_SUBSTRINGS: &[&str] = &[
     // queries — the same posture as relay.rs. NAMED, LOUD exclusion (see the crate note in
     // pgrelay.rs), never a silent skip; the tenant-store code in pg.rs stays fully linted.
     "myelin-storage/src/pgrelay.rs",
+    // The FIREHOSE transport (EB-21 / P-141): `firehose::publish(stream, scope, frame)` is the
+    // FROZEN contract-3.5 / §5.5 method name for the EPHEMERAL firehose transport — a DIFFERENT
+    // seam from the durable bus the `no-raw-publish` lint guards. §4.3 is explicit: "the durable bus
+    // carries only pointer/summary events" while the firehose carries the high-volume ephemeral
+    // frames (CI logs, collab op-streams, chat live delivery) over its OWN `publish`/`subscribe`/
+    // `resume` API. A firehose frame is a references-not-payloads pointer (`FramePayload`), never an
+    // inline-PII durable event, and it is NOT emitted-iff-committed through the outbox — it is a
+    // separate transport by design (OQ-J). The lint's `.publish(` fingerprint collides with the
+    // frozen `firehose::publish` method NAME; excluding this ONE file keeps the lint live on every
+    // durable-bus call site while honouring the architecture's two-transport split. NAMED, LOUD
+    // exclusion (see the module note in firehose.rs), never a silent skip.
+    "myelin-events/src/firehose.rs",
     "myelin-harness/src/bin/sub-m0-scorecard.rs",
     "myelin-harness/src/bin/id-m1-scorecard.rs",
     // The infra integration exit-gate runner (Stage 4): same posture as the two runners above —

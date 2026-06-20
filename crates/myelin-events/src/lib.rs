@@ -305,6 +305,7 @@ pub mod consumer;
 pub mod crosscell;
 pub mod dedup;
 pub mod envelope;
+pub mod firehose;
 pub mod holder;
 // Stage 2 / infra: the REAL durable bus behind the BusTransport trait — NATS JetStream via
 // async-nats. Compiled ONLY under `--features integration` (it pulls the real async-nats +
@@ -326,6 +327,22 @@ pub use consumer::{
     PerTenantInflight, PrefetchBound, SubscribeError, Subscription,
 };
 pub use dedup::{DedupLedger, CONSUMER_DEDUP_MIGRATION};
+/// The firehose resume-cursor subscription protocol (contract 3.5, the Bus-owned zero-loss-replay
+/// half — EB-21 / P-141, built FIRST per EI-04 §2.2). `Firehose::publish`/`tail`/`subscribe`/`resume`
+/// implement the §5.5 surface: a per-`(stream, scope)` monotonic `seq`, `(last_seq, now]` backfill on
+/// reconnect (loses ZERO ops), an out-of-window `last_seq` → `resync_required` → `*.snapshot` fallback
+/// (the cold-rebuild path, NAMED not silent — the rebuild itself is EB-22 / P-142), a bounded scope
+/// (`FirehoseScope` — never `*`; the transport rejects an over-broad scope), and a per-connection
+/// in-flight cap (a slow consumer drops to `resync_required`, never buffers unboundedly). FLOORS: the
+/// retention-window size per stream class is NAMED-not-numbered → MEASURED by D-10 in EB-30 / P-439;
+/// D-10 re-runs green across the KN CAS→CRDT `engine_promote` boundary (EB-30). The substrate's
+/// `FrameBuffer`/`BoundedSelector` (P-135/P-136) are the bounded-and-sheds half that RIDES this
+/// protocol at the connection tier (Chat M4) — events cannot depend on substrate, so the two halves
+/// compose at the connection tier (EI-01 §7 reconciliation noted in `firehose.rs`).
+pub use firehose::{
+    Firehose, FirehoseError, FirehoseScope, Frame, FrameDraft, FramePayload, RetentionWindow,
+    ScopeKind, SubStream, Subscription as FirehoseSubscription, DEFAULT_INFLIGHT_CAP,
+};
 pub use taxonomy::{
     validate as validate_event_type, TaxonomyError, ARTIFACT_TYPE_TOKENS, SEED_EVENT_NAMES,
     SUBSYSTEM_TOKENS,
