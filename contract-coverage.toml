@@ -220,11 +220,20 @@ cdc = [
     "crates/myelin-events/tests/cdc_3_5_firehose_resume_cursor.rs",
 ]
 
+# 3.6 reactive/dispatch tier (EB-23 / P-143). OWNED by the Bus; built in myelin-query (the
+# DOCUMENTED DEVIATION — the tier consumes curated Signals + the EventMatcher, both of which live in
+# myelin-query, which depends on myelin-events; siting it in myelin-events would invert the §2.9 DAG,
+# the same deviation the matcher/signals/automations/triggers already follow). The CDC pair pins the
+# 3.6 PROVIDER (the dispatch tier derives the nested-causality action envelope + reserves) against the
+# 8.6 CONSUMER (the agent EventInbox reads the exact envelope) + the 11.7 CONSUMER (reserve/settle
+# enforces no-balance-no-execution). BUS-D1/BUS-D3/BUS-D6 drills prove 0-lost/0-dup, replay==original,
+# and depth-ceiling+tripwire-trips-the-breaker. FLOORS named: the 8.6 real EventInbox is AG-P4/P-216;
+# the 11.7 real CostLedger is P-ST-16/P-103 + P-ST-19/P-146; the OQ-K shed-budget numbers are EB-29.
 [[contract]]
 row = "3.6"
 title = "reactive/dispatch tier"
-status = "deferred"
-landing = "P-143"
+status = "covered"
+cdc = ["crates/myelin-query/tests/cdc_3_6_dispatch_tier.rs"]
 
 # ──────────────── §4 Identity & access (myelin-identity) ────────────────────────────────────────
 
