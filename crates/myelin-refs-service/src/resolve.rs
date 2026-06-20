@@ -122,7 +122,11 @@ pub enum ResolveMode {
 /// another subsystem's artifact (ADR-13.1; Refs never reads the owner's DB). Pre-permission-checked by
 /// the chokepoint (a `Projection` is only ever returned on the ALLOWED branch). May carry a name in
 /// the title (it is a `PersonalDataHolder` payload, §3.6).
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Derives `Serialize`/`Deserialize` so the live R2 cache (REF-P12, [`crate::cache`]) can seal a
+/// projection under the per-tenant DEK and round-trip it — the cache stores the SEALED bytes of this
+/// shape, never plaintext (it "may hold a name in a title", §3.6).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Projection {
     /// The artifact this projection renders (the ref that resolved). Carried so a caller can key the
     /// rendered unfurl + subscribe to its `*.updated`/`*.erased`.
@@ -147,7 +151,7 @@ pub struct Projection {
 /// The §4.6 graceful-degradation flag on a sub-anchored [`Projection`]. A LIVE sub has `None`; a
 /// MOVED/OUTDATED sub still renders (the parent + the shifted/partial anchor) with the flag set so the
 /// UI can mark it; a GONE sub does NOT render a projection — it returns a [`Tombstone`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ProjectionFlag {
     /// The sub-anchor moved (Git rebased range, KN block moved) — render the shifted anchor, flagged.
     Moved,
@@ -324,6 +328,17 @@ pub trait ProjectionCacheRead: Send + Sync {
     /// Read the cached projection for `ref_` in `(tenant, region)`, or `None` on a miss. Read ONLY on
     /// the permission-allowed branch (the chokepoint gates it).
     fn read(&self, tenant: &TenantId, region: &Region, ref_: &ArtifactRef) -> Option<Projection>;
+
+    /// **Populate the cache for `(tenant, ref)` after a resolve MISS (§4.2 post-miss fill).** Called by
+    /// the chokepoint on the allowed branch once the owner's `project` returns a live projection, so the
+    /// NEXT viewer of the same `(tenant, ref)` is served a HIT (viewer-independent, ref-keyed). The
+    /// default is a **no-op** — the REF-P10 [`NoOpCacheRead`] holds nothing, so it never fills (the
+    /// floor). The live R2 cache (REF-P12, [`crate::cache::R2ProjectionCache`]) overrides this to seal +
+    /// write the projection under the per-tenant DEK. Best-effort: a fill failure is swallowed (the
+    /// cache is derived — the next read just re-resolves).
+    fn fill(&self, _tenant: &TenantId, _region: &Region, _ref_: &ArtifactRef, _projection: &Projection) {
+        // No-op default (the NoOpCacheRead floor never caches). The live R2 cache overrides it.
+    }
 }
 
 /// **The NO-OP R2-cache read shim (the REF-P10/P7 floor — REF-P12 ships the live cache).** Implements
@@ -512,15 +527,24 @@ impl ResolveService {
         // Cache miss → the owner's project(ref, viewer) over the resilient client. Refs NEVER reads the
         // owner's DB — only this seam. The §4.6 sub-ladder maps onto the Resolution.
         let resolution = match self.owner.project(tenant, region, ref_, viewer, mode) {
-            Ok(ProjectOutcome::Live(op)) => Resolution::Projection(Projection {
-                ref_: ref_.clone(),
-                title: op.title,
-                state: op.state,
-                icon: op.icon,
-                render_hint: op.render_hint,
-                sub_anchor: op.sub_anchor,
-                flag: op.flag,
-            }),
+            Ok(ProjectOutcome::Live(op)) => {
+                let projection = Projection {
+                    ref_: ref_.clone(),
+                    title: op.title,
+                    state: op.state,
+                    icon: op.icon,
+                    render_hint: op.render_hint,
+                    sub_anchor: op.sub_anchor,
+                    flag: op.flag,
+                };
+                // §4.2 post-miss FILL: populate the ref-keyed cache so the NEXT viewer of the same
+                // (tenant, ref) is served a HIT. Viewer-independent + safe — we are on the ALLOWED
+                // branch (the per-viewer gate already passed). The REF-P10 NoOpCacheRead's fill is a
+                // no-op; the live R2 cache (REF-P12) seals + writes it under the per-tenant DEK.
+                // Best-effort (the cache is derived — a failed fill just means the next read re-resolves).
+                self.cache.fill(tenant, region, ref_, &projection);
+                Resolution::Projection(projection)
+            }
             Ok(ProjectOutcome::RootGone) => Resolution::Tombstone(Tombstone {
                 root: root.clone(),
                 reason: TombstoneReason::RootGone,

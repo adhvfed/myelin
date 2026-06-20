@@ -2063,6 +2063,7 @@ dependencies = [
  "myelin-storage",
  "myelin-substrate",
  "myelin-tenancy",
+ "serde",
  "serde_json",
  "sqlx",
  "tokio",

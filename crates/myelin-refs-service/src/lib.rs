@@ -143,6 +143,32 @@
 //! budget) is **REF-P23** (R-M5) — "we page them, we don't materialise them" is not the at-scale
 //! answer.
 //!
+//! **REF-P12 (P-161) ships:** the [`cache`] module — the **live R2 projection cache**
+//! ([`cache::R2ProjectionCache`], §3.6) that **REPLACES the REF-P7 no-op shim**. A bounded,
+//! invalidatable, per-tenant-DEK-encrypted, residency-pinned holder keyed `(tenant, ref)`, riding the
+//! ONE [`myelin_storage::Cache`] primitive (the [`myelin_storage::InMemoryCache`] floor for unit tests
+//! / the `ValkeyCache` real backing behind `--features integration`). It implements BOTH seams the
+//! REF-P7/REF-P10 floors stubbed — the write/invalidate side
+//! ([`invalidator::ProjectionCache`] — the REF-P7 [`invalidator::NoOpCacheShim`] is replaced, an
+//! `*.updated`/`*.erased` now EVICTS a live entry) AND the read side
+//! ([`resolve::ProjectionCacheRead`] — the REF-P10 [`resolve::NoOpCacheRead`] is replaced, a warm
+//! `(tenant, ref)` now serves a live HIT). The resolve chokepoint FILLS the cache after a miss
+//! ([`cache::R2ProjectionCache::fill`], §4.2) so the next viewer is served a HIT (viewer-independent,
+//! ref-keyed, gated by the per-viewer check). The cached projection — which **may hold a name in a
+//! title** (§3.6) — is **sealed under the per-tenant DEK** (REF-P4; 11.3/11.4), so it is
+//! encrypted-at-rest + **crypto-shred-able** (destroy the DEK → every cached title unrecoverable; a
+//! decrypt-fail is a clean MISS, never a plaintext fall-through). Every write carries a **TTL**
+//! ([`cache::R2_DEFAULT_TTL`]) — the cache self-evicts, so it is **NEVER a source of truth** (on a
+//! miss/bust/erasure it re-resolves via the owner's `project`). The `resolve_cache_hit_ratio` telemetry
+//! (1.8) is LIVE — it now reads real hits. The chained (hit → `*.updated` → miss → re-resolve through
+//! the chokepoint) + the never-serve-stale-on-erasure + the crypto-shred CDC tests pass DB-free
+//! (`tests/cdc_ref_p12_r2_cache.rs`); the REAL Valkey round-trip (fill/read/bust/crypto-shred/tenant-
+//! isolation) is proven against the live dev stack in `tests/integration_ref_p12_r2_cache.rs` (the
+//! `integration` feature). **FLOOR named:** the cache holds PII (a name in a title) sealed under the
+//! per-tenant DEK; the SUBJECT-grain structural ERASE that drives the holder `erase` body (purge the
+//! subject's cached titles + Identity pseudonym shred for `origin_actor` + reindex-from-source) lands
+//! in **REF-P15** — the cache is the crypto-shred-able holder, NOT the complete erasure answer.
+//!
 //! **Does NOT ship (floors named):**
 //! - **The producers are SYNTHETIC at M2.** REF-P8 exercises the seam with a TEST content writer; the
 //!   first REAL producers (Git diffs / Knowledge blocks / Chat messages writing actual content) land
@@ -152,14 +178,14 @@
 //!   already rides [`myelin_events::derive_envelope`] correct-by-construction (the emit passes `cause =
 //!   Some(content_event)`); REF-P9 adds the explicit depth-stamp assert + the depth-ceiling tripwire
 //!   over THIS seam.
-//! - **No LIVE R2 cache.** REF-P7 ships the invalidator + the NO-OP shim (records busts; evicts
-//!   nothing — nothing is cached yet). The live bounded, per-tenant-DEK-encrypted Valkey-class R2
-//!   cache that implements [`invalidator::ProjectionCache`] is **REF-P12**; it swaps the shim, leaving
-//!   the invalidator unchanged. Named so the invalidation is not mistaken for live cache-busting: the
-//!   WIRING is real, the CACHE is a shim.
-//! - **No mutation floor on the no-op shim.** Per the REF-P7 prompt: the no-op shim has no mutable
-//!   projection state to mutation-test; the REAL cache mutation floor (eviction under TTL + bound)
-//!   lands in **REF-P12**. The invalidator's routing IS asserted by the unit + CDC tests.
+//! - **The LIVE R2 cache HAS LANDED (REF-P12 / P-161).** The REF-P7 [`invalidator::NoOpCacheShim`] +
+//!   the REF-P10 [`resolve::NoOpCacheRead`] are no longer the only impls of the cache seams: the live
+//!   [`cache::R2ProjectionCache`] now implements both, sealed under the per-tenant DEK + TTL-bounded +
+//!   crypto-shred-able (the floor named in REF-P7 is RESOLVED here). The no-op shims REMAIN as the
+//!   floor/default impls (a `serve` that has not wired Valkey, and the `ProjectionCacheRead::fill`
+//!   default) — the invalidator/resolve are unchanged; only the trait object behind them swapped, as
+//!   REF-P7/P10 promised. The REAL cache mutation floor (keying/sealing/invalidation under TTL +
+//!   crypto-shred) IS met here ([`cache`] mutation-score floor; see the module doc + the COMMIT body).
 //! - **No real crypto-shred over real data.** The holder is a STUB surface: `erase` is a
 //!   well-defined no-op now (nothing to purge). The DEK lever EXISTS + FIRES (proven structurally in
 //!   [`dek`]), but the structural erasure body that USES it — R2-cache PII purge + reliance on
@@ -176,6 +202,7 @@
 #![forbid(unsafe_code)]
 
 pub mod backlinks;
+pub mod cache;
 pub mod dek;
 pub mod edge_builder;
 pub mod emit;
@@ -192,6 +219,9 @@ pub use backlinks::{
     watermark_verdict, AuthzJoin, AuthzVisibleIndex, Backlink, BacklinkError, BacklinkPage,
     BacklinkRead, BoundParam, FilterMode, SourceRootFilter, WatermarkVerdict,
     AUTHZ_VISIBLE_TABLE, FILTER_MODE_SPLIT_SIGNAL, SOURCE_ROOT_COLUMN,
+};
+pub use cache::{
+    CacheFillError, R2ProjectionCache, R2_DEFAULT_TTL, R2_KEY_PREFIX,
 };
 pub use dek::{ref_p5_inherited_gates, InheritedGate, RefsDekPin};
 pub use edge_builder::{
