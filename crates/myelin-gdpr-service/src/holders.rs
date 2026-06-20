@@ -891,6 +891,8 @@ mod tests {
             ("lib.rs", include_str!("lib.rs")),
             ("audit.rs", include_str!("audit.rs")),
             ("orchestration.rs", include_str!("orchestration.rs")),
+            ("dsr.rs", include_str!("dsr.rs")),
+            ("fanout.rs", include_str!("fanout.rs")),
         ] {
             for line in src.lines() {
                 let code = line.trim_start();

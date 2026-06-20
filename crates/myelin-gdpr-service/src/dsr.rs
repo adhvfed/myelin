@@ -28,11 +28,12 @@
 //!
 //! ## Floors named (deferred → filling prompt) — VISION §3 name-your-floors
 //! - **The per-holder checklist drive + the resumable fan-out + the verifiable receipts + the
-//!   legal-hold gate** → **P-GA-12 → P-112** (this prompt RESOLVES the read-only checklist FROM
-//!   the data map into `dsr_status`, but it does NOT *drive* the fan-out — the
-//!   [`Dsr::advance_to_fanned_out`] transition records the resolved checklist and moves the
-//!   machine to `awaiting-holders`; the actual holder `erase` calls + receipt collection +
-//!   resumability are P-GA-12, which drives [`crate::orchestration::UpstreamHolderOrchestrator`]).
+//!   legal-hold gate** → **P-GA-12 → P-112, NOW FILLED in [`crate::fanout`]** (this prompt
+//!   RESOLVES the read-only checklist FROM the data map into `dsr_status` via [`Self::fan_out`] and
+//!   moves the machine to `awaiting-holders`; the actual holder `erase` calls + receipt collection
+//!   plus resumability plus the legal-hold gate are the P-GA-12 [`crate::fanout::FanOutDriver`],
+//!   which drives [`crate::orchestration::UpstreamHolderOrchestrator`] and reads the request via
+//!   [`Self::request_view`]).
 //! - **Tenant-operability** (Art. 28 tenant-facing DSR + `EraseScope::Tenant` offboarding +
 //!   restrict/rectify/portability surfaces) → **P-GA-13 → P-113**.
 //! - **The durable deadline timer** (the `myelin-flow` minute-bucket wheel `sleep_until` + the
@@ -430,6 +431,11 @@ pub enum DsrError {
     /// `dsr_certificate` was requested for a DSR that has not reached a state where a certificate
     /// exists (`Verified` / `Completed`). Carries the current state.
     CertificateNotReady(DsrState),
+    /// A per-holder fan-out (P-GA-12, [`crate::fanout`]) errored — a holder's `erase` returned a
+    /// fault (a holder unavailable / a key-destruction error). Carries the holder error message.
+    /// The fan-out leaves a RESUMABLE checklist (the receipted holders are recorded), so re-driving
+    /// the DSR re-drives only the failed-onward holders (§4.1 step 4).
+    HolderFanOut(String),
 }
 
 impl std::fmt::Display for DsrError {
@@ -447,6 +453,11 @@ impl std::fmt::Display for DsrError {
                 f,
                 "dsr_certificate not ready: DSR is `{}` (a certificate exists only once verified)",
                 state.as_str()
+            ),
+            DsrError::HolderFanOut(msg) => write!(
+                f,
+                "holder fan-out errored: {msg} (§4.1 step 4 — the checklist is resumable; re-drive \
+                 to resume from the failed holder)"
             ),
         }
     }
@@ -640,6 +651,51 @@ impl<C: Clock> DsrOrchestrator<C> {
         let reg = self.register.lock().unwrap_or_else(|e| e.into_inner());
         reg.dsrs.get(id).map(|d| d.state).ok_or_else(|| DsrError::UnknownDsr(id.clone()))
     }
+
+    /// **The PII-free request view the P-GA-12 fan-out driver reads** (the request inputs the
+    /// driver needs to drive the erase: the kind, the scope, the posture, and the deadline base).
+    /// A read-only snapshot — never mutates. Errors on an unknown id. The driver
+    /// ([`crate::fanout`]) consumes this to decide WHAT to fan out (the scope) and HOW (the kind);
+    /// the orchestrator itself never reaches into a store (the no-cross-store-read law, §3.1).
+    pub fn request_view(&self, id: &DsrId) -> Result<DsrRequestView> {
+        let reg = self.register.lock().unwrap_or_else(|e| e.into_inner());
+        let dsr = reg.dsrs.get(id).ok_or_else(|| DsrError::UnknownDsr(id.clone()))?;
+        Ok(DsrRequestView {
+            id: dsr.id.clone(),
+            kind: dsr.kind,
+            tenant: dsr.tenant.clone(),
+            scope: dsr.scope.clone(),
+            posture: dsr.posture,
+            initiator: dsr.initiator,
+            state: dsr.state,
+            submitted_at_secs: dsr.submitted_at_secs,
+        })
+    }
+}
+
+/// A read-only, PII-free view of a DSR's request inputs (the P-GA-12 fan-out driver reads it to
+/// decide WHAT to fan out + HOW). Carries only opaque ids + enum tags — never a name/email (the
+/// [`SubjectRef`] inside `scope` holds the opaque `principal_id`, never PII). The driver
+/// ([`crate::fanout`]) consumes this; the orchestrator hands it out so the driver never has to
+/// reach into the private register.
+#[derive(Clone, Debug)]
+pub struct DsrRequestView {
+    /// The opaque DSR id.
+    pub id: DsrId,
+    /// The Art. 15–20 right requested.
+    pub kind: DsrKind,
+    /// The tenant the request runs under (the partition key).
+    pub tenant: TenantId,
+    /// The erase scope (subject-within-tenant, or a whole-tenant offboarding) the fan-out drives.
+    pub scope: EraseScope,
+    /// The legal posture the request validated under (§1).
+    pub posture: Posture,
+    /// Who initiated it.
+    pub initiator: Initiator,
+    /// The current state-machine state.
+    pub state: DsrState,
+    /// The wall-clock second the request was submitted (the receipt timestamp base).
+    pub submitted_at_secs: u64,
 }
 
 /// Run ONE state-machine transition through the total guard (§4.1). The single chokepoint every
