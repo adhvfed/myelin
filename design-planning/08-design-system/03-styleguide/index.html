@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<!-- Myelin LIVE STYLEGUIDE · direction A "Instrument" (Phase 8b deliverable 03).
+     §8b.6 mandate: renders from the REAL generated tokens, runs with the stack DOWN (static, no API, no build).
+     It consumes ../01-tokens/tokens.css via CSS custom properties ONLY — no hardcoded colour/spacing values.
+     Swapping the linked token file (a B/C/D direction) re-skins this whole page with NO edit here (00-plan §2).
+     Contrast ratios beside each swatch are MEASURED live in JS from the resolved token values (not copied),
+     so they re-compute on every theme switch — the measured-not-claimed gate, visible. (00-plan §1.3, tokens.md §2)
+     a11y: visible focus (the real --focus-ring token), keyboard-operable controls, semantic landmarks, reduced-motion honoured.
+     Fonts: system-font stack fallback (tokens.css names Inter/JetBrains Mono); production self-hosts the variable family, no CDN (§1.5). -->
+<html lang="en" dir="ltr" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Myelin · Live Styleguide · direction A "Instrument"</title>
+<!-- The ONE dependency: the real generated tokens. No CDN, no framework, no build. -->
+<link rel="stylesheet" href="../01-tokens/tokens.css">
+<link rel="stylesheet" href="./styleguide.css">
+</head>
+<body>
+<a href="#main" class="skiplink">Skip to content</a>
+
+<!-- ============ HEADER / CONTROLS ============ -->
+<header class="sg-head" role="banner">
+  <div class="sg-head-row">
+    <h1 class="sg-title"><span class="sg-mark" aria-hidden="true"></span>Myelin Live Styleguide</h1>
+    <div class="sg-controls" role="group" aria-label="Styleguide display controls">
+      <div class="seg" role="radiogroup" aria-label="Theme">
+        <span class="seg-label" id="themelbl">Theme</span>
+        <button type="button" role="radio" aria-checked="true"  data-theme-set="dark">Dark</button>
+        <button type="button" role="radio" aria-checked="false" data-theme-set="light">Light</button>
+        <button type="button" role="radio" aria-checked="false" data-theme-set="high-contrast">High-contrast</button>
+      </div>
+      <button type="button" class="toggle" id="dirbtn" aria-pressed="false">
+        Direction: <b id="dirval">LTR</b>
+      </button>
+    </div>
+  </div>
+  <p class="sg-lead">
+    The living styleguide for the <b>recommended</b> visual direction <b>A&nbsp;&ldquo;Instrument&rdquo;</b>
+    (midnight command-deck: neutral-led, one rationed electric-blue accent, near-zero radius, hairlines-first,
+    compact default, crisp motion). Every pixel below is rendered from the <b>real generated</b>
+    <code>../01-tokens/tokens.css</code> via CSS custom properties &mdash; <b>nothing is hardcoded</b>.
+    The page runs <b>with the stack down</b> (static; no API, no framework, no build step).
+  </p>
+  <p class="sg-note">
+    <b>Parameterized.</b> This is direction A. Picking B / C / D / the hybrid is a <b>token-file swap</b>
+    (re-point the <code>&lt;link&gt;</code> to that direction&rsquo;s <code>tokens.css</code>) + a flip of six variant flags
+    &mdash; <b>never a rewrite of this page</b> (00-plan §2). The theme and RTL toggles above prove the same
+    mechanism live: all three theme sets and RTL mirroring re-skin every component below from the one token table.
+    Contrast ratios beside each swatch are <b>measured live</b> from the resolved tokens and re-compute on theme switch.
+    <span class="mono">[DEFERRED-UNTIL-USERS]</span> the direction itself is expert-recommended, not user-validated.
+  </p>
+</header>
+
+<main id="main" class="sg-main">
+
+  <!-- ============ COLOUR / SEMANTIC TOKENS ============ -->
+  <section class="sg-section" aria-labelledby="s-color">
+    <h2 id="s-color" class="sg-h2">Colour &amp; semantic tokens</h2>
+    <p class="sg-p">Surfaces, text, borders, the identity accent, the <b>derived</b> focus/primary token (distinct from
+      accent, §8b.3), the functional status set, and the reserved agent axis. Each swatch is labelled with its
+      <b>token name</b> and its <b>measured contrast</b> against its paired surface (computed live; floors: text 4.5:1, UI/large 3:1).</p>
+
+    <h3 class="sg-h3">Surfaces</h3>
+    <div class="swatch-grid" id="grid-surface"></div>
+
+    <h3 class="sg-h3">Text (measured on <code>--surface</code>)</h3>
+    <div class="swatch-grid" id="grid-text"></div>
+
+    <h3 class="sg-h3">Borders <span class="sg-hint">(hairlines are decorative grouping; the focus-ring carries the 3:1 UI floor)</span></h3>
+    <div class="swatch-grid" id="grid-border"></div>
+
+    <h3 class="sg-h3">Accent vs derived focus/primary <span class="sg-hint">(focus-ring &ne; accent &mdash; the keyboard affordance never rests on a sub-AA colour)</span></h3>
+    <div class="swatch-grid" id="grid-accent"></div>
+
+    <h3 class="sg-h3">Functional status <span class="sg-hint">(muted, never traffic-light; always paired with glyph + label below)</span></h3>
+    <div class="swatch-grid" id="grid-status"></div>
+
+    <h3 class="sg-h3">Agent <span class="sg-hint">(a fourth neutral semantic axis &mdash; never a status colour)</span></h3>
+    <div class="swatch-grid" id="grid-agent"></div>
+  </section>
+
+  <!-- ============ TYPE SCALE ============ -->
+  <section class="sg-section" aria-labelledby="s-type">
+    <h2 id="s-type" class="sg-h2">Type scale</h2>
+    <p class="sg-p">~1.2 ratio, shared platform-wide. Hierarchy comes from <b>weight &amp; colour before size</b>.
+      Line-heights keep diacritic headroom (body &ge;1.45). Sans for UI; <b>load-bearing mono</b> for refs/SHAs/code.</p>
+    <div class="type-list" id="type-list"></div>
+    <div class="type-extra">
+      <div><span class="sg-hint">mono</span> <span class="mono" style="font-size:var(--fs-code)">myelin://acme/payments-api/iss-377 · a94bcc7 · +96 −41</span></div>
+      <div><span class="sg-hint">weights</span>
+        <span style="font-weight:var(--weight-regular)">Regular 400</span> ·
+        <span style="font-weight:var(--weight-medium)">Medium 500</span> ·
+        <span style="font-weight:var(--weight-semibold)">Semibold 600</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ SPACING + RADIUS ============ -->
+  <section class="sg-section" aria-labelledby="s-space">
+    <h2 id="s-space" class="sg-h2">Spacing &amp; radius scale</h2>
+    <p class="sg-p">4px base ramp (no off-ramp magic numbers). Radius is near-zero (Instrument character): sharp reads fast.</p>
+    <h3 class="sg-h3">Spacing</h3>
+    <div class="scale-list" id="space-list"></div>
+    <h3 class="sg-h3">Radius</h3>
+    <div class="radius-list" id="radius-list"></div>
+  </section>
+
+  <!-- ============ ELEVATION ============ -->
+  <section class="sg-section" aria-labelledby="s-elev">
+    <h2 id="s-elev" class="sg-h2">Elevation</h2>
+    <p class="sg-p">Borders-first: hairlines do nearly all grouping. Shadow is reserved for genuinely floating layers.
+      In high-contrast, shadow is visually inert &mdash; a border carries the layer (try the high-contrast theme).</p>
+    <div class="elev-grid">
+      <div class="elev-card" style="box-shadow:none;border:var(--hairline) solid var(--border)">
+        <span class="mono">--border</span><span class="sg-hint">hairline grouping (default)</span>
+      </div>
+      <div class="elev-card" style="box-shadow:var(--shadow-popover)">
+        <span class="mono">--shadow-popover</span><span class="sg-hint">menus / dropdowns / hovercards</span>
+      </div>
+      <div class="elev-card" style="box-shadow:var(--shadow-overlay)">
+        <span class="mono">--shadow-overlay</span><span class="sg-hint">palette / dialog</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ MOTION ============ -->
+  <section class="sg-section" aria-labelledby="s-motion">
+    <h2 id="s-motion" class="sg-h2">Motion &amp; duration tokens</h2>
+    <p class="sg-p">Functional band &le;240ms, no spring/bounce. The chips below animate continuously on a loop using each
+      duration token. <b><code>prefers-reduced-motion</code></b> zeroes every duration (the animation is removed, never the
+      information) &mdash; if your OS has reduce-motion on, the chips hold still and show their value statically.</p>
+    <div class="motion-grid" id="motion-grid"></div>
+  </section>
+
+  <!-- ============ COMPONENT SHOWCASE ============ -->
+  <section class="sg-section" aria-labelledby="s-comp">
+    <h2 id="s-comp" class="sg-h2">Component showcase</h2>
+    <p class="sg-p">Core components rendered entirely in the tokens. They re-skin live with the theme and mirror with RTL.</p>
+
+    <!-- BUTTONS -->
+    <h3 class="sg-h3">Buttons <span class="sg-hint">(primary rides the <b>derived focus token</b>, not the identity accent &mdash; §8b.3)</span></h3>
+    <div class="comp-row">
+      <button type="button" class="btn btn-primary">Merge when green</button>
+      <button type="button" class="btn">Request review</button>
+      <button type="button" class="btn btn-danger">Reject</button>
+      <button type="button" class="btn btn-quiet">Cancel</button>
+      <button type="button" class="btn" disabled aria-disabled="true">Disabled</button>
+    </div>
+    <p class="sg-hint" style="margin-top:var(--space-2)">Tab into any control to see the one <code>--focus-ring</code> token applied via <code>:focus-visible</code>.</p>
+
+    <!-- INPUTS / FIELDS -->
+    <h3 class="sg-h3">Inputs &amp; fields</h3>
+    <div class="comp-grid-2">
+      <div class="field">
+        <label class="field-label" for="f-text">Issue title</label>
+        <input id="f-text" class="input" type="text" value="Fix cache eviction under load">
+      </div>
+      <div class="field">
+        <label class="field-label" for="f-sel">Status</label>
+        <select id="f-sel" class="input">
+          <option>In progress</option><option>In review</option><option>Done</option>
+        </select>
+      </div>
+      <div class="field">
+        <label class="field-label" for="f-err">Branch <span class="field-err-tag">invalid</span></label>
+        <input id="f-err" class="input input-err" type="text" value="fix/weighted lru" aria-invalid="true" aria-describedby="f-err-msg">
+        <span id="f-err-msg" class="field-msg field-msg-err">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 8v4M12 16h.01"/></svg>
+          Branch names can&rsquo;t contain spaces.
+        </span>
+      </div>
+      <div class="field">
+        <label class="field-label" for="f-area">Description</label>
+        <textarea id="f-area" class="input" rows="2">Weighted LRU scores entries by recency × in-flight refs.</textarea>
+      </div>
+    </div>
+
+    <!-- REFERENCE CHIP + UNFURL -->
+    <h3 class="sg-h3">Reference chip + unfurl card <span class="sg-hint">(the connective tissue &mdash; same chip everywhere)</span></h3>
+    <div class="comp-row" style="align-items:flex-start">
+      <span class="chip">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/></svg>
+        ISS-377
+      </span>
+      <span class="chip mono">PR&nbsp;#412</span>
+      <span class="chip mono">a94bcc7</span>
+      <div class="unfurl" role="group" aria-label="Reference preview: ISS-377">
+        <div class="unfurl-head">
+          <span class="mono unfurl-ico" aria-hidden="true">&#9737;</span>
+          <span class="unfurl-tt">ISS-377 · Payments cache thrashes under burst load</span>
+          <span class="chip">In&nbsp;progress</span>
+        </div>
+        <div class="unfurl-body">
+          <div class="unfurl-ln"><span>Priority</span><b>High</b></div>
+          <div class="unfurl-ln"><span>SLA</span><b class="txt-warn">Due 23.06.2026, 17:00 · in 2d 4h</b></div>
+          <div class="unfurl-ln"><span>Initiative</span><b>Payments reliability (Q3)</b></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- IDENTITY + AGENT BADGE -->
+    <h3 class="sg-h3">Identity &amp; agent badge <span class="sg-hint">(agent = plain geometric mark + &ldquo;Agent&rdquo; label, four-channel, never colour-alone, no sparkle/emoji)</span></h3>
+    <div class="comp-row">
+      <span class="ident">
+        <span class="avatar" aria-hidden="true">MØ</span>
+        <span class="ident-name">Mara Ø.</span>
+        <span class="ident-sub">human</span>
+      </span>
+      <span class="ident">
+        <span class="agent-mark" aria-hidden="true"><i></i></span>
+        <span class="ident-name">FixAgent</span>
+        <span class="badge-agent">Agent</span>
+      </span>
+    </div>
+
+    <!-- STATUS SET -->
+    <h3 class="sg-h3">Status set <span class="sg-hint">(glyph + label + colour together &mdash; proves status is not colour-alone, WCAG 1.4.1)</span></h3>
+    <div class="comp-row" id="status-set"></div>
+
+    <!-- OVERLAY / TOAST -->
+    <h3 class="sg-h3">Overlay &amp; toast</h3>
+    <div class="comp-grid-2" style="align-items:start">
+      <div class="overlay-demo">
+        <div class="scrim" aria-hidden="true"></div>
+        <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dlg-t" aria-describedby="dlg-d">
+          <h4 id="dlg-t" class="dialog-title">Discard 3 unsaved changes?</h4>
+          <p id="dlg-d" class="dialog-desc">This can&rsquo;t be undone. Your typed content will be lost.</p>
+          <div class="dialog-actions">
+            <button type="button" class="btn">Keep editing</button>
+            <button type="button" class="btn btn-danger">Discard</button>
+          </div>
+        </div>
+      </div>
+      <div class="toast-demo">
+        <div class="toast" role="status">
+          <svg class="txt-ok" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M4 12l5 5L20 6"/></svg>
+          <span>Issue moved to <b>In&nbsp;review</b>.</span>
+          <button type="button" class="toast-undo">Undo</button>
+        </div>
+        <div class="toast">
+          <span class="agent-mark" aria-hidden="true"><i></i></span>
+          <span><b>FixAgent</b> applied 2 reversible effects.</span>
+          <button type="button" class="toast-undo">Undo</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- AGENT / HITL APPROVAL CARD -->
+    <h3 class="sg-h3">Agent / HITL approval card <span class="sg-hint">(plan-then-apply: per-effect target chips, gated consequential effect, attribution, audit)</span></h3>
+    <div class="hitl" role="group" aria-label="Agent approval awaiting you">
+      <div class="hitl-head">
+        <span class="agent-mark" aria-hidden="true"><i></i></span>
+        <span class="hitl-who">FixAgent</span>
+        <span class="badge-agent">Agent</span>
+        <span>proposes 3 effects &mdash; <b>nothing applied yet</b></span>
+        <span class="hitl-status txt-warn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>
+          awaiting approval
+        </span>
+      </div>
+      <div class="hitl-eff">
+        <span class="hitl-n mono">1</span>
+        <span class="hitl-ed">Open follow-up PR · <span class="tgt mono">acme/payments-api</span> · <span class="tgt mono">fix/weighted-lru-eviction</span> → <span class="tgt mono">main</span>
+          <span class="hitl-au">consequential · <b class="txt-warn">protected branch</b> · authority <code>git.open_pr</code></span></span>
+        <span class="gate">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>
+          Needs approval
+        </span>
+      </div>
+      <div class="hitl-eff">
+        <span class="hitl-n mono">2</span>
+        <span class="hitl-ed">Transition <span class="tgt mono">ISS-377</span> → <span class="tgt mono">In Review</span>
+          <span class="hitl-au">advisory · reversible · authority <code>issue.transition</code></span></span>
+        <span class="nogate">no gate · reversible</span>
+      </div>
+      <div class="hitl-eff">
+        <span class="hitl-n mono">3</span>
+        <span class="hitl-ed">Post update to <span class="tgt mono">#payments-incidents</span>
+          <span class="hitl-au">advisory · authority <code>chat.post</code></span></span>
+        <span class="nogate">no gate · advisory</span>
+      </div>
+      <div class="hitl-scope">
+        <span><span class="sg-hint">Budget</span> 3 / 12 effects · est. €0.04</span>
+        <span><span class="sg-hint">Attribution</span> on behalf of Mara Ø. · triggered by <code>ci.failed</code></span>
+      </div>
+      <div class="hitl-actions">
+        <button type="button" class="btn btn-primary">Approve all</button>
+        <button type="button" class="btn">Edit plan…</button>
+        <button type="button" class="btn btn-quiet">Reject</button>
+        <span class="hitl-sp"></span>
+        <a href="#" class="hitl-link">Why?</a>
+        <a href="#" class="hitl-link">Audit trail</a>
+      </div>
+    </div>
+  </section>
+
+  <footer class="sg-foot" role="contentinfo">
+    <p>Direction A &ldquo;Instrument&rdquo; · consumes <code>../01-tokens/tokens.css</code> · runs stack-down · no CDN / no framework / no build.
+       Swap the linked token file = a different direction (00-plan §2). Not committed.</p>
+  </footer>
+</main>
+
+<!-- announce theme/dir changes politely for SR users -->
+<div id="live" class="visually-hidden" role="status" aria-live="polite"></div>
+
+<script src="./styleguide.js"></script>
+</body>
+</html>
