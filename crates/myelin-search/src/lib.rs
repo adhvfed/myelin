@@ -115,6 +115,7 @@ pub mod consistency;
 pub mod dek;
 pub mod engine;
 pub mod erasure_posture;
+pub mod fusion;
 pub mod holder;
 pub mod indexer;
 pub mod layout;
@@ -137,6 +138,7 @@ pub use engine::{
     AclFilter, Hit, IndexBackend, IndexDocument, IndexError, TantivyBackend, ORDER_KEY_FIELD,
 };
 pub use erasure_posture::{erasure_posture, ErasurePosture};
+pub use fusion::{fuse_with_k, reciprocal_rank_fusion, FusedHit, RankedList, RRF_K};
 pub use indexer::{
     EmbeddingAdapter, IncrementalIndexer, IndexEventError, IndexSpec, MockEmbeddingAdapter,
     ProjectFetchError, ProjectFetcher, SearchProjection, INDEXER_CONSUMER,
@@ -151,8 +153,8 @@ pub use layout::{
     SrchP03Floor, StatefulComponent,
 };
 pub use pipeline::{
-    query, query_consistent, ListObjectsPort, Page, QueryError, QueryStats, RankedResult,
-    RankedResults, RelationalLeaf, ReverseIndexAnswer, RevisionWatermark, ScopedEngine,
+    query, query_consistent, semantic, ListObjectsPort, Page, QueryError, QueryStats, RankedResult,
+    RankedResults, RelationalLeaf, ReverseIndexAnswer, RevisionWatermark, ScopedEngine, VectorQuery,
     READ_PERMISSION,
 };
 pub use residency::{search_store_descriptors, SearchStoreDescriptor};

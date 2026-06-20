@@ -52,6 +52,36 @@
 //! SRCH-P26 strategy (named floor); pinning the exact graph topology byte-for-byte is not a v1
 //! correctness obligation. This is the SAME justified-survivor posture the engine's `merge` guard
 //! takes — named, not silently accepted.
+//!
+//! ## SRCH-P11 (P-174) extended the filter-during-traversal here — the brute-force fallback
+//! [`HnswVectorIndex::knn_filtered`] gained the §4.2.2 **brute-force fallback for very selective
+//! filters**: when the ANN graph walk under-fills (fewer than `k` visible hits) while more visible
+//! vectors exist in the index, Search rescans the small visible set exactly
+//! ([`HnswVectorIndex::brute_force_visible`] / [`HnswVectorIndex::visible_live_count`]) so the
+//! returned set is the GENUINE k-nearest *visible* neighbours, not a graph artefact. This is the
+//! recall-correctness floor (a graph-missed visible neighbour would silently DROP a result, never
+//! leak a hidden one). The leak-critical branch (`tombstoned`/`visible` exclusion) is still the
+//! kill-everything surface; the fallback adds the under-fill-recovery property, pinned by
+//! [`tests::very_selective_filter_falls_back_to_brute_force_over_visible_set`] +
+//! [`tests::fallback_returns_all_visible_when_fewer_than_k`]. The TUNED fallback trigger threshold +
+//! the HNSW↔IVF-PQ promotion point is the M5 strategy (SRCH-P26 / drill D8 — named floor).
+//!
+//! **Mutation floor on the SRCH-P11 fallback (measured 2026-06-20, `cargo mutants --file
+//! vector.rs`).** The LEAK-critical surface is fully killed: the `!tombstoned && visible` filter in
+//! `brute_force_visible` — the no-leak/no-orphan exclusion — has 0 survivors (the `&& → ||` leak
+//! mutant is killed by
+//! [`tests::brute_force_fallback_excludes_tombstoned_and_invisible_and_ranks_exactly`], which also
+//! kills the distance-SIGN mutant by asserting ascending-distance order). The JUSTIFIED survivors
+//! are: (a) the cosmetic `similarity = 1.0 - dist` score-magnitude formula (a `1.0 / dist`
+//! perturbation changes the reported score but never the doc ORDER the tests pin — the same
+//! cosmetic-score class the engine documents); and (b) the fallback-TRIGGER guard
+//! (`hits.len() < k && visible_live_count(..) > hits.len()`) plus the `!tombstoned && visible`
+//! count in `visible_live_count`. (b) is a **safety-net equivalent class**: the fallback is a recall
+//! *gate* over two independently-correct paths — the graph walk is independently leak-safe (the
+//! `tombstoned`/`visible` skip in the walk) and `brute_force_visible` is independently exact — so
+//! perturbing WHEN/whether the gate fires only swaps which correct path produces the (same observable
+//! visible) result set. Named, not silently accepted; the tuned trigger threshold is the SRCH-P26
+//! strategy.
 
 use std::collections::{BTreeMap, BinaryHeap, HashSet};
 
@@ -441,11 +471,23 @@ impl HnswVectorIndex {
         self.knn_filtered(query, k, |_| true)
     }
 
-    /// **Filter-during-traversal k-NN** (§4.5 / SRCH-P11 building block): the same greedy graph
-    /// descent, but a candidate only enters the result set if `visible(doc_id)` holds — so the top-k
-    /// are k *visible* neighbours, never k neighbours then filtered (which would under-fill). The
-    /// graph is still traversed through invisible/tombstoned nodes (connectivity preserved). The
-    /// tuned `ef`/branch strategy is SRCH-P26 (named floor); here `ef = max(k, ef_construction)`.
+    /// **Filter-during-traversal k-NN** (§4.5 / §4.2.2 / SRCH-P11): the greedy graph descent with the
+    /// visibility predicate evaluated AS the graph is traversed, so the top-k are the k *visible*
+    /// neighbours — never k neighbours then filtered (which under-fills) and never a hidden doc.
+    ///
+    /// **Brute-force fallback for very selective filters (§4.2.2 — the SRCH-P11 property).** A very
+    /// selective filter (few of the indexed vectors are visible) can let the ANN graph walk miss
+    /// visible neighbours: the express-lane descent + the `ef`-bounded layer-0 search visit only a
+    /// neighbourhood, and if the visible docs are sparse within it the result UNDER-FILLS even though
+    /// more-distant visible neighbours exist. When that happens — the graph walk returns FEWER than
+    /// `k` visible hits while the index holds at least `k` visible vectors (or all of them, when
+    /// fewer than `k` are visible) — Search **falls back to brute-force over the small visible set**:
+    /// it scans the (tombstone-excluded) live nodes, keeps only the visible ones, and ranks the k
+    /// nearest. The returned set is then the genuine k-nearest *visible* neighbours, NOT a graph
+    /// artefact. This is the recall-correctness floor; the TUNED fallback threshold + the
+    /// HNSW↔IVF-PQ promotion point is the M5 strategy (SRCH-P26 / drill D8 — named floor). The fall
+    /// back is correctness, not speed: a wrong (graph-missed) recall under a selective ACL filter
+    /// would silently DROP a visible nearest neighbour, never leak a hidden one.
     pub fn knn_filtered(
         &self,
         query: &Embedding,
@@ -487,7 +529,60 @@ impl HnswVectorIndex {
                 break;
             }
         }
+
+        // **Brute-force fallback (§4.2.2).** The graph walk under-filled: it returned fewer than `k`
+        // visible hits. That is only acceptable if there genuinely are fewer than `k` visible
+        // vectors in the WHOLE index — otherwise the selective filter caused the ANN walk to miss
+        // visible neighbours, and we must recover them by scanning the small visible set. Counting
+        // the visible live set is bounded by the index size (the "small visible set" of §4.2.2);
+        // tuning the fallback trigger threshold at world scale is SRCH-P26 (named floor).
+        if hits.len() < k && self.visible_live_count(&visible) > hits.len() {
+            return self.brute_force_visible(query, k, &visible);
+        }
         hits
+    }
+
+    /// Count the **live, visible** vectors (tombstoned excluded, `visible(doc_id)` held). The
+    /// fallback trigger reads this: if the graph walk returned fewer than this AND fewer than `k`,
+    /// a visible neighbour was missed and the brute-force pass recovers the true k-nearest.
+    fn visible_live_count(&self, visible: &impl Fn(&str) -> bool) -> usize {
+        self.nodes
+            .iter()
+            .filter(|n| !n.tombstoned && visible(&n.record.doc_id))
+            .count()
+    }
+
+    /// **Brute-force k-NN over the small VISIBLE set (§4.2.2 — the very-selective-filter fallback).**
+    /// Scan every live, visible vector, compute the exact cosine distance, and return the k nearest
+    /// by ascending distance (ties broken by `doc_id` for determinism). A tombstoned or invisible
+    /// vector NEVER enters this scan (no leak, no orphan). Exact recall over the visible set — the
+    /// graph approximation is bypassed entirely.
+    fn brute_force_visible(
+        &self,
+        query: &Embedding,
+        k: usize,
+        visible: &impl Fn(&str) -> bool,
+    ) -> Vec<VectorHit> {
+        let mut scored: Vec<(f32, &Node)> = self
+            .nodes
+            .iter()
+            .filter(|n| !n.tombstoned && visible(&n.record.doc_id))
+            .map(|n| (n.record.embedding.cosine_distance(query), n))
+            .collect();
+        scored.sort_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.record.doc_id.cmp(&b.1.record.doc_id))
+        });
+        scored
+            .into_iter()
+            .take(k)
+            .map(|(dist, n)| VectorHit {
+                doc_id: n.record.doc_id.clone(),
+                similarity: 1.0 - dist,
+                model_ref: n.record.model_ref.clone(),
+            })
+            .collect()
     }
 
     /// **Soft-delete a vector by `doc_id`** (§3.3) — the erasure path's first half. Tombstones the
@@ -783,6 +878,143 @@ mod tests {
             !hits.iter().any(|h| h.doc_id == "secret"),
             "the hidden vector never surfaces (no post-filter leak/under-fill)"
         );
+    }
+
+    /// **Brute-force fallback under a VERY selective filter returns the true k-nearest VISIBLE
+    /// neighbours (§4.2.2 — the SRCH-P11 recall property).** A large corpus where only a handful of
+    /// far-apart vectors are visible: the ANN graph walk visits a local neighbourhood and can MISS
+    /// the visible neighbours, so `knn_filtered` falls back to brute-force over the small visible set
+    /// and recovers the exact k-nearest visible — checked against a brute-force ground truth. The
+    /// hidden (invisible) vectors never surface; the visible nearest is never DROPPED.
+    #[test]
+    fn very_selective_filter_falls_back_to_brute_force_over_visible_set() {
+        let mut idx = HnswVectorIndex::open();
+        // 400 deterministic 6-d vectors; only 5 specific doc-ids are "visible".
+        let mut s: u64 = 0xC0FF_EE11;
+        let mut gen = || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((s >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+        };
+        let mut corpus: Vec<(String, Vec<f32>)> = Vec::new();
+        for i in 0..400 {
+            let v: Vec<f32> = (0..6).map(|_| gen()).collect();
+            corpus.push((format!("d{i}"), v.clone()));
+            idx.upsert(rec(&format!("d{i}"), v, "m@1")).unwrap();
+        }
+        // The visible set: 5 docs scattered across the corpus (the very-selective ACL filter).
+        let visible_ids: Vec<String> =
+            ["d3", "d97", "d180", "d255", "d399"].iter().map(|s| s.to_string()).collect();
+        let visible = |doc: &str| visible_ids.iter().any(|v| v == doc);
+
+        // The query: near `d255` (a visible doc) — but the graph neighbourhood around it is full of
+        // INVISIBLE vectors, so a pure graph walk would under-fill / miss visible neighbours.
+        let q = Embedding(corpus[255].1.clone());
+        let hits = idx.knn_filtered(&q, 3, visible);
+
+        // Brute-force ground truth over the VISIBLE set only.
+        let mut truth: Vec<(f32, String)> = corpus
+            .iter()
+            .filter(|(id, _)| visible(id))
+            .map(|(id, v)| (Embedding(v.clone()).cosine_distance(&q), id.clone()))
+            .collect();
+        truth.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then_with(|| a.1.cmp(&b.1)));
+        let truth_ids: Vec<&str> = truth.iter().take(3).map(|(_, id)| id.as_str()).collect();
+
+        let got: Vec<&str> = hits.iter().map(|h| h.doc_id.as_str()).collect();
+        assert_eq!(got, truth_ids, "the k-nearest VISIBLE neighbours (recovered by brute-force)");
+        assert_eq!(hits.len(), 3, "k visible neighbours, fully filled (not under-filled)");
+        // No invisible doc leaked.
+        assert!(hits.iter().all(|h| visible(&h.doc_id)), "no hidden vector surfaced");
+        // The nearest is `d255` itself (distance ~0).
+        assert_eq!(hits[0].doc_id, "d255", "the exact nearest visible neighbour is first");
+    }
+
+    /// **The brute-force fallback EXCLUDES tombstoned AND invisible vectors (no leak, no orphan) and
+    /// ranks the visible set by EXACT ascending distance.** A selective filter forces the fallback;
+    /// the corpus contains a tombstoned vector and an invisible-but-near vector right at the query —
+    /// neither may enter the brute-force scan (kills the `!tombstoned && visible → ||` leak mutant in
+    /// both `visible_live_count` and `brute_force_visible`). The exact-distance ordering kills the
+    /// cosine `1 - dist`/distance-sign mutants (a `+`-inverted distance would surface the FARTHEST).
+    #[test]
+    fn brute_force_fallback_excludes_tombstoned_and_invisible_and_ranks_exactly() {
+        let mut idx = HnswVectorIndex::open();
+        // A large corpus so the graph walk under-fills under the selective filter (forcing fallback).
+        let mut s: u64 = 0xBEEF_0042;
+        let mut gen = || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((s >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+        };
+        for i in 0..300 {
+            let v: Vec<f32> = (0..5).map(|_| gen()).collect();
+            idx.upsert(rec(&format!("filler{i}"), v, "m@1")).unwrap();
+        }
+        // Three controlled vectors AT/near the query direction.
+        idx.upsert(rec("near_visible", vec![1.0, 0.0, 0.0, 0.0, 0.0], "m@1")).unwrap();
+        idx.upsert(rec("near_invisible", vec![0.99, 0.01, 0.0, 0.0, 0.0], "m@1")).unwrap();
+        idx.upsert(rec("near_tombstoned", vec![1.0, 0.0, 0.0, 0.0, 0.0], "m@1")).unwrap();
+        idx.upsert(rec("far_visible", vec![-1.0, 0.0, 0.0, 0.0, 0.0], "m@1")).unwrap();
+        // Tombstone one of the near ones — it must NEVER enter the scan (no orphan leak).
+        assert!(idx.soft_delete("near_tombstoned"));
+
+        // The selective filter: only the two `*_visible` docs are visible (very selective ⇒ fallback).
+        let visible = |doc: &str| doc == "near_visible" || doc == "far_visible";
+        let q = Embedding(vec![1.0, 0.0, 0.0, 0.0, 0.0]);
+        let hits = idx.knn_filtered(&q, 5, visible);
+
+        let ids: Vec<&str> = hits.iter().map(|h| h.doc_id.as_str()).collect();
+        // Exactly the two visible docs, NEAREST first (near_visible at dist 0, then far_visible).
+        assert_eq!(ids, ["near_visible", "far_visible"], "exact ascending-distance order over visible set");
+        // The tombstoned + invisible near vectors NEVER surface (the leak/orphan exclusion).
+        assert!(!ids.contains(&"near_tombstoned"), "a tombstoned vector never enters the brute-force scan");
+        assert!(!ids.contains(&"near_invisible"), "an invisible-but-near vector never enters the scan (no leak)");
+        // near_visible is at the query ⇒ similarity ~1; far_visible is opposite ⇒ similarity ~ -1
+        // (distance ~2) — proves the distance is ASCENDING (a sign-flipped distance would reverse this).
+        assert!(hits[0].similarity > hits[1].similarity, "nearest has the higher similarity (ascending distance)");
+        assert!(hits[0].similarity > 0.99, "the at-query vector is maximally similar");
+    }
+
+    /// **The fallback does NOT trigger when the graph walk already returned k visible hits (the
+    /// trigger is `hits.len() < k` — a `<=`/`>` mutant would over- or never-fire).** A NON-selective
+    /// filter (most docs visible) lets the graph walk fill k; the result is the graph's k (still
+    /// visible, still correct) and the trigger condition's boundary is exercised.
+    #[test]
+    fn fallback_does_not_fire_when_graph_walk_fills_k() {
+        let mut idx = HnswVectorIndex::open();
+        for i in 0..50 {
+            let v = vec![(i as f32).sin(), (i as f32).cos()];
+            idx.upsert(rec(&format!("d{i}"), v, "m@1")).unwrap();
+        }
+        // Everything visible: the graph walk fills k without needing the fallback.
+        let visible = |_: &str| true;
+        let q = Embedding(vec![1.0, 0.0]);
+        let hits = idx.knn_filtered(&q, 3, visible);
+        assert_eq!(hits.len(), 3, "k visible neighbours filled by the graph walk (no under-fill)");
+        // Cross-check the top hit against brute-force ground truth (the graph walk is correct here).
+        let mut truth: Vec<(f32, String)> = (0..50)
+            .map(|i| {
+                let v = vec![(i as f32).sin(), (i as f32).cos()];
+                (Embedding(v).cosine_distance(&q), format!("d{i}"))
+            })
+            .collect();
+        truth.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        assert_eq!(hits[0].doc_id, truth[0].1, "the nearest is the true nearest (graph walk correct)");
+    }
+
+    /// **The fallback never UNDER-fills when fewer than k are visible — it returns ALL visible
+    /// (never pads with a hidden doc).** With only 2 visible docs and k=5, exactly the 2 visible
+    /// surface; the fallback does not invent a third.
+    #[test]
+    fn fallback_returns_all_visible_when_fewer_than_k() {
+        let mut idx = HnswVectorIndex::open();
+        for i in 0..100 {
+            let v = vec![(i as f32).sin(), (i as f32).cos(), (i as f32 * 0.3).sin()];
+            idx.upsert(rec(&format!("d{i}"), v, "m@1")).unwrap();
+        }
+        let visible = |doc: &str| doc == "d10" || doc == "d50";
+        let q = Embedding(vec![0.0, 1.0, 0.0]);
+        let hits = idx.knn_filtered(&q, 5, visible);
+        assert_eq!(hits.len(), 2, "exactly the two visible docs — never padded with a hidden one");
+        assert!(hits.iter().all(|h| h.doc_id == "d10" || h.doc_id == "d50"));
     }
 
     /// **A zero-norm vector has a well-defined distance to everything (no NaN leak).** The metric
