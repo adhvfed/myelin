@@ -1,0 +1,250 @@
+<!-- CONCEPT C-06 | screen: Diff (code-feels-like-code) | persona: Wim Crouwel "Gridnik" (Systematic/Raw-Brutalist, mono honesty)
+     (commit: the grid is visible and absolute — every element snaps to a hard module; one monospace does EVERYTHING
+      including the chrome, so the code surface keeps its own terminal-grade identity; numbers are first-class data;
+      hairline rules build structure; refuse: rounded corners, soft shadows, mixed type families, decorative colour,
+      pretending a code review is anything other than a structured grid of changed lines)
+     axes: density=dense nav=rail unification=distinct-per-surface tone=utilitarian agent=ambient sovereignty=on-demand
+     rationale: this should feel like a precision drafting grid / a terminal that knows it is one — because the diff
+       is the densest surface (Axis-3 0.85) and "code feels like code" means the WHOLE surface adopts the monospace
+       module rather than wrapping code in a soft product chrome; distinct-per-surface, yet still the SAME shell,
+       chip, identity and command bar (D4 holds across the seam). -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>C06 — Diff · Gridnik (code-feels-like-code)</title>
+<style>
+:root{
+  /* warm-neutral paper ramp for light; this surface is light to feel like printed code listings */
+  --p0:#ffffff; --p1:#f7f6f3; --p2:#efeee9; --p3:#e4e2db; --p4:#d3d0c6; --p5:#b8b4a6;
+  --ink:#15140f; --ink2:#3a382f; --ink3:#6b685c; --ink4:#94917f;
+  --rule:#15140f;            /* hairlines are INK — the grid is loud, deliberate */
+  --rule-soft:#cdcabd;
+  --accent:#1a3acc;          /* one saturated accent — ultramarine, used only for the active focus/primary */
+  --add-bg:#eaf2e6; --add-mk:#2f6b2a; --add-rule:#9bbf8e;
+  --del-bg:#f7e9e6; --del-mk:#a33a2c; --del-rule:#d4a59c;
+  --ok:#2f6b2a; --warn:#9a6b12; --bad:#a33a2c; --agent:#5b3fb0;
+  --mod:24px;                /* the hard grid module */
+  --mono:"JetBrains Mono","SF Mono",ui-monospace,"Cascadia Mono",monospace;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0;background:var(--p1);color:var(--ink);
+  font-family:var(--mono);font-size:12.5px;line-height:1.4;
+  overflow:hidden;-webkit-font-smoothing:antialiased;
+}
+:focus-visible{outline:2px solid var(--accent);outline-offset:0}
+button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
+
+/* SHARED SHELL (same skeleton as every surface) but rendered in this surface's mono identity */
+.shell{height:100vh;display:grid;grid-template-rows:var(--mod) 1fr;overflow:hidden}
+.top{
+  display:flex;align-items:stretch;border-bottom:2px solid var(--rule);background:var(--p0);
+}
+.top>*{display:flex;align-items:center;padding:0 12px;border-right:1px solid var(--rule)}
+.brand{font-weight:700;letter-spacing:.06em;text-transform:uppercase;gap:8px}
+.brand .mk{width:12px;height:12px;border:2px solid var(--ink);position:relative}
+.brand .mk::after{content:"";position:absolute;inset:2px 2px auto auto;width:4px;height:4px;background:var(--accent)}
+.crumbs{color:var(--ink3);gap:6px;font-size:11.5px}
+.crumbs b{color:var(--ink)}
+.crumbs .s{color:var(--p5)}
+.grow{flex:1;border-right:1px solid var(--rule)}
+.cmd{gap:8px;color:var(--ink3);min-width:200px}
+.cmd .k{margin-left:auto;border:1px solid var(--rule);padding:0 6px;font-size:11px;color:var(--ink2)}
+.resid{gap:6px;font-size:11px;color:var(--ink2)}
+.resid .b{width:8px;height:8px;background:var(--ok)}
+.me{font-weight:700;border-right:0!important}
+
+.body{display:grid;grid-template-columns:200px 1fr;overflow:hidden}
+
+/* PERSISTENT RAIL (this surface keeps a visible structural rail — Axis-2 rail pole) */
+.rail{border-right:2px solid var(--rule);background:var(--p0);overflow:auto;display:flex;flex-direction:column}
+.railsec{border-bottom:1px solid var(--rule)}
+.railsec h3{margin:0;padding:6px 12px;font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--ink3);background:var(--p2);border-bottom:1px solid var(--rule-soft)}
+.railnav a{display:flex;align-items:center;gap:9px;padding:5px 12px;color:var(--ink2);text-decoration:none;border-bottom:1px solid var(--rule-soft)}
+.railnav a:hover{background:var(--p2)}
+.railnav a.on{background:var(--ink);color:var(--p0)}
+.railnav a .n{margin-left:auto;color:var(--ink4);font-size:11px}
+.railnav a.on .n{color:var(--p4)}
+/* file list = the diff's own contextual sidebar */
+.filelist a{display:grid;grid-template-columns:1fr auto;gap:6px;padding:5px 12px;color:var(--ink2);text-decoration:none;border-bottom:1px solid var(--rule-soft);font-size:11.5px}
+.filelist a:hover{background:var(--p2)}
+.filelist a.on{box-shadow:inset 3px 0 0 var(--accent);background:var(--p2)}
+.filelist .ds{font-size:10px;color:var(--ink4);white-space:nowrap}
+.filelist .ds .a{color:var(--add-mk)}.filelist .ds .d{color:var(--del-mk)}
+.filelist .fn{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:rtl;text-align:left}
+
+/* MAIN: the diff, as a hard grid */
+.main{overflow:auto;background:var(--p1)}
+.diffhd{position:sticky;top:0;z-index:6;background:var(--p0);border-bottom:2px solid var(--rule)}
+.dh1{display:flex;align-items:baseline;gap:10px;padding:8px 16px;border-bottom:1px solid var(--rule-soft)}
+.dh1 h1{margin:0;font-size:14px;font-weight:700;letter-spacing:-.01em}
+.dh1 .num{color:var(--ink3)}
+.dh2{display:flex;align-items:center;gap:0;font-size:11.5px}
+.dh2>*{padding:6px 12px;border-right:1px solid var(--rule-soft);display:flex;align-items:center;gap:6px}
+/* status as monospace token: [GLYPH] LABEL — never colour alone */
+.stat{font-weight:700;letter-spacing:.02em}
+.stat .g{display:inline-block;width:14px;text-align:center}
+.stat.open .g{color:var(--ok)} .stat.ck .g{color:var(--ok)}
+.stat.vis{color:var(--ink2);font-weight:400}
+.dh2 .grow{border-right:1px solid var(--rule-soft)}
+.dh2 .totals{color:var(--ink2)}
+.dh2 .totals .a{color:var(--add-mk);font-weight:700}.dh2 .totals .d{color:var(--del-mk);font-weight:700}
+.dh2 .ag{color:var(--agent);font-weight:700}
+.btn{border:1px solid var(--rule)!important;padding:3px 9px!important;font-size:11px;background:var(--p0)}
+.btn:hover{background:var(--ink);color:var(--p0)}
+
+/* file block */
+.fb{border-bottom:2px solid var(--rule)}
+.fbhd{position:sticky;top:62px;z-index:4;display:flex;align-items:center;gap:10px;padding:6px 16px;background:var(--p2);border-bottom:1px solid var(--rule)}
+.fbhd .fp{font-weight:700}
+.fbhd .lang{color:var(--ink4);font-size:10px;border:1px solid var(--rule-soft);padding:0 5px;text-transform:uppercase;letter-spacing:.08em}
+.fbhd .vw{margin-left:auto;font-size:11px;color:var(--ink3);display:flex;align-items:center;gap:6px}
+.fbhd input{accent-color:var(--accent)}
+
+/* THE GRID: line-number column | marker column | code — absolute modules */
+table.diff{width:100%;border-collapse:collapse}
+table.diff td{padding:0;vertical-align:top}
+.lno{width:52px;text-align:right;padding:0 8px 0 0!important;color:var(--ink4);user-select:none;border-right:1px solid var(--rule-soft);background:var(--p0)}
+.lno.r{width:52px}
+.mk{width:18px;text-align:center;color:var(--ink4);user-select:none;border-right:1px solid var(--rule-soft);background:var(--p0)}
+.src{padding:0 14px!important;white-space:pre;color:var(--ink2)}
+tr.h td{background:var(--p3);color:var(--ink3);padding:2px 14px!important;border-top:1px solid var(--rule);border-bottom:1px solid var(--rule);font-size:11px}
+tr.a .src{background:var(--add-bg)} tr.a .mk{background:var(--add-bg);color:var(--add-mk);font-weight:700;border-right:1px solid var(--add-rule)} tr.a .lno{background:var(--add-bg)}
+tr.d .src{background:var(--del-bg)} tr.d .mk{background:var(--del-bg);color:var(--del-mk);font-weight:700;border-right:1px solid var(--del-rule)} tr.d .lno{background:var(--del-bg)}
+tr.foc .src{box-shadow:inset 0 0 0 2px var(--accent)}
+.k{color:#7a2fb0}.s{color:#2f6b2a}.f{color:#1a3acc}.c{color:var(--ink4);font-style:italic}.t{color:#9a6b12}
+
+/* agent-suggested-fix marker — ambient, framed by the same hairline grid */
+tr.ag-row td{background:var(--p1)}
+.agentbox{margin-left:70px;border:1px solid var(--agent);border-left-width:3px;background:#f4f1fb}
+.agentbox .ah{display:flex;align-items:center;gap:8px;padding:5px 10px;border-bottom:1px solid var(--rule-soft);font-size:11px}
+.agentbox .ah .tag{color:var(--agent);font-weight:700;border:1px solid var(--agent);padding:0 4px;letter-spacing:.04em}
+.agentbox .ah .scope{color:var(--ink3)}
+.agentbox .ab{padding:6px 10px;white-space:pre}
+.agentbox .ab .add{color:var(--add-mk)}
+.agentbox .acts{display:flex;border-top:1px solid var(--rule-soft)}
+.agentbox .acts button{flex:1;padding:5px;font-size:11px;border-right:1px solid var(--rule-soft)}
+.agentbox .acts button:last-child{border-right:0}
+.agentbox .acts .pri{background:var(--accent);color:#fff;font-weight:700}
+.agentbox .acts button:hover:not(.pri){background:var(--p2)}
+
+/* anchored comment row */
+tr.cm td{background:var(--p1)}
+.cbox{margin-left:70px;border:1px solid var(--rule);background:var(--p0)}
+.cbox .ch{display:flex;align-items:center;gap:8px;padding:5px 10px;border-bottom:1px solid var(--rule-soft);font-size:11px}
+.cbox .ch .who{font-weight:700}
+.cbox .ch .when{color:var(--ink4);margin-left:auto}
+.cbox .cc{padding:7px 10px;color:var(--ink2)}
+.av{width:18px;height:18px;background:var(--ink);color:var(--p0);display:inline-grid;place-items:center;font-size:9px;font-weight:700}
+.av.agent{background:var(--p0);border:1.5px solid var(--agent);color:var(--agent)}
+.chip{display:inline-flex;align-items:center;gap:4px;border:1px solid var(--rule);padding:0 5px;font-size:11px;background:var(--p2)}
+.chip .ti{color:var(--ink4)}
+/* outdated/detached comment pill — honest detach after rebase, never silent wrong-line */
+.outdated{margin:6px 16px 6px 70px;border:1px dashed var(--p5);background:var(--p2);padding:5px 10px;color:var(--ink3);font-size:11px;display:flex;gap:8px;align-items:center}
+.outdated .pill{border:1px solid var(--warn);color:var(--warn);padding:0 5px;font-weight:700}
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <header class="top">
+    <div class="brand"><span class="mk"></span>MYELIN</div>
+    <div class="crumbs">platform <span class="s">/</span> <b>myelin-core</b> <span class="s">/</span> PR <b>#1284</b> <span class="s">/</span> diff</div>
+    <button class="cmd" aria-label="Command palette">⌕ search · run command <span class="k">⌘K</span></button>
+    <div class="resid"><span class="b"></span>EU-WEST · DE</div>
+    <div class="grow"></div>
+    <div class="me">AH</div>
+  </header>
+
+  <div class="body">
+    <!-- PERSISTENT RAIL: shell nav + the diff's file list as its contextual sidebar -->
+    <nav class="rail" aria-label="Navigation">
+      <div class="railsec">
+        <h3>Surfaces</h3>
+        <div class="railnav">
+          <a href="#" class="on" aria-current="page">▣ Code <span class="n">1284</span></a>
+          <a href="#">◷ CI <span class="n">2</span></a>
+          <a href="#">▤ Issues <span class="n">17</span></a>
+          <a href="#">▢ Knowledge</a>
+          <a href="#">▭ Chat <span class="n">4</span></a>
+          <a href="#">⌂ Inbox <span class="n">9</span></a>
+        </div>
+      </div>
+      <div class="railsec" style="flex:1">
+        <h3>Files changed · 2</h3>
+        <div class="filelist">
+          <a href="#" class="on"><span class="fn">…/indexer/nrt.rs</span><span class="ds"><span class="a">+31</span> <span class="d">−9</span></span></a>
+          <a href="#"><span class="fn">…/indexer/config.rs</span><span class="ds"><span class="a">+7</span> <span class="d">−3</span></span></a>
+        </div>
+      </div>
+    </nav>
+
+    <main class="main" aria-label="Diff">
+      <div class="diffhd">
+        <div class="dh1">
+          <h1>Backpressure on the search NRT indexer queue</h1>
+          <span class="num">#1284</span>
+        </div>
+        <div class="dh2">
+          <span class="stat open" title="State: open"><span class="g">◑</span>OPEN</span>
+          <span class="stat ck" title="Checks: 6 passed, 1 running"><span class="g">✓</span>6 OK · 1 RUN</span>
+          <span class="stat vis" title="Visibility: internal"><span class="g">⊟</span>internal</span>
+          <span class="ag" title="Agent activity">⌬ agent · 1 fix</span>
+          <span class="grow"></span>
+          <span class="totals"><span class="a">+38</span> / <span class="d">−12</span></span>
+          <button class="btn">unified ▾</button>
+          <button class="btn" title="Next change F7">F7 ›</button>
+        </div>
+      </div>
+
+      <section class="fb">
+        <div class="fbhd">
+          <span class="fp">crates/myelin-search/src/indexer/nrt.rs</span>
+          <span class="lang">rust</span>
+          <label class="vw"><input type="checkbox"> viewed</label>
+        </div>
+        <table class="diff" aria-label="nrt.rs changes">
+          <tr class="h"><td class="lno"></td><td class="lno r"></td><td class="mk"></td><td class="src">@@ -142,9 +142,18 @@ impl NrtIndexer</td></tr>
+          <tr><td class="lno">142</td><td class="lno r">142</td><td class="mk"> </td><td class="src">    <span class="f">pub fn</span> enqueue(&<span class="k">mut</span> self, doc: Doc) {</td></tr>
+          <tr class="d"><td class="lno">143</td><td class="lno r"></td><td class="mk">−</td><td class="src">        self.queue.push(doc);</td></tr>
+          <tr class="a"><td class="lno"></td><td class="lno r">143</td><td class="mk">+</td><td class="src">        <span class="k">if</span> self.queue.len() &gt;= self.high_watermark {</td></tr>
+          <tr class="a"><td class="lno"></td><td class="lno r">144</td><td class="mk">+</td><td class="src">            <span class="c">// Backpressure: block producer until drained &lt; low_watermark</span></td></tr>
+          <tr class="a foc"><td class="lno"></td><td class="lno r">145</td><td class="mk">+</td><td class="src">            self.permits.acquire().<span class="f">await</span>;</td></tr>
+          <tr class="a"><td class="lno"></td><td class="lno r">146</td><td class="mk">+</td><td class="src">        }</td></tr>
+          <tr class="ag-row"><td colspan="4">
+            <div class="agentbox">
+              <div class="ah"><span class="av agent">⌬</span><span class="tag">AGENT</span> review-bot <span class="scope">· suggested fix · scope: review-comment (advisory · merge-gated)</span></div>
+              <div class="ab"><span class="c">// .acquire() Result ignored — Err on closed semaphore panics</span>
+self.permits.acquire().await<span class="add">.map_err(|_| IndexErr::Shutdown)?</span>;</div>
+              <div class="acts"><button class="pri">Commit</button><button>Reply</button><button>Dismiss</button></div>
+            </div>
+          </td></tr>
+          <tr class="a"><td class="lno"></td><td class="lno r">147</td><td class="mk">+</td><td class="src">        self.queue.push(doc);</td></tr>
+          <tr><td class="lno">144</td><td class="lno r">148</td><td class="mk"> </td><td class="src">    }</td></tr>
+          <tr class="cm"><td colspan="4">
+            <div class="cbox">
+              <div class="ch"><span class="av">JD</span><span class="who">Jonas Duarte</span><span class="when">vor 2 Std.</span></div>
+              <div class="cc">Sollten wir <span class="chip"><span class="ti">⊟</span>high_watermark</span> aus der Konfiguration lesen? Vgl. <span class="chip"><span class="ti">▤</span>ENG-412</span>.</div>
+            </div>
+          </td></tr>
+          <tr class="h"><td class="lno"></td><td class="lno r"></td><td class="mk"></td><td class="src">@@ -201,4 +210,9 @@ impl NrtIndexer</td></tr>
+          <tr class="a"><td class="lno"></td><td class="lno r">210</td><td class="mk">+</td><td class="src">    <span class="f">fn</span> drain_below(&<span class="k">mut</span> self, lw: <span class="t">usize</span>) {</td></tr>
+          <tr class="a"><td class="lno"></td><td class="lno r">211</td><td class="mk">+</td><td class="src">        <span class="k">while</span> self.queue.len() &gt; lw { self.flush_one(); }</td></tr>
+          <tr class="a"><td class="lno"></td><td class="lno r">212</td><td class="mk">+</td><td class="src">        self.permits.add_permits(<span class="t">1</span>);</td></tr>
+          <tr class="a"><td class="lno"></td><td class="lno r">213</td><td class="mk">+</td><td class="src">    }</td></tr>
+          <tr><td class="lno">204</td><td class="lno r">214</td><td class="mk"> </td><td class="src">}</td></tr>
+        </table>
+        <!-- honest detach: comment whose anchored line vanished after rebase -->
+        <div class="outdated">
+          <span class="pill">⚑ OUTDATED</span>
+          Comment by Priya Krishnan — anchored to former line 149 (removed by rebase). Shown detached; never relocated to a wrong line.
+        </div>
+      </section>
+    </main>
+  </div>
+</div>
+</body>
+</html>

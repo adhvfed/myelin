@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<!-- CONCEPT C-10 | screen: Exec dashboard | persona: Edward Tufte (commit: maximize data-ink, small multiples, sparklines in-line with their label, direct labelling over legends, no chartjunk; refuse: gauge dials, donut charts, drop-shadowed KPI tiles, saturated traffic-light fills, gridlines that out-shout the data, any number set in a gradient)
+     axes: density=calm nav=rail unification=highly-unified tone=sober agent=ambient sovereignty=always-on
+     rationale: this should feel like a quiet annual-report spread an executive trusts at a glance — because sober, data-dense-yet-calm small-multiples (Direction B "Civic" warmed by gravity, I-4 portfolio rollup) earn governance trust without alarm; always-on residency + visibility cues sit near the data, not in a settings page (R-19 §7 always-on pole). -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Executive overview — Helio GmbH · Myelin</title>
+<style>
+  :root{
+    --bg:#f4f5f3; --panel:#ffffff; --ink:#1c1f1d; --ink-2:#4c524e; --ink-3:#7d837e;
+    --line:#e2e5e1; --line-2:#cfd4cf;
+    --accent:#1f5e57;          /* steady low-chroma authority (teal) */
+    --accent-2:#33685f;
+    --ok:#2f6b3a; --warn:#8a6112; --risk:#9a3b34; --info:#2a5681;
+    --agent:#444466; --agent-soft:#ececf3;
+    --focus:#1a4f6e;          /* derived AA-safe focus, not the accent */
+    --ink-line:#a9aea9;       /* sparkline ink */
+    --r:8px;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{background:var(--bg);color:var(--ink);font-family:"Inter",ui-sans-serif,system-ui,sans-serif;font-size:13.5px;line-height:1.45;-webkit-font-smoothing:antialiased}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .shell{display:grid;grid-template-columns:208px 1fr;height:100vh;overflow:hidden}
+  /* rail-led nav */
+  .rail{background:var(--panel);border-inline-end:1px solid var(--line);padding:14px 12px;overflow:auto}
+  .brand{display:flex;align-items:center;gap:9px;margin:2px 4px 18px}
+  .brand .m{width:26px;height:26px;border-radius:7px;background:var(--ink);color:#fff;display:grid;place-items:center;font-weight:600;font-size:13px}
+  .brand b{font-size:14px}
+  .nav h5{font-size:10px;letter-spacing:.09em;text-transform:uppercase;color:var(--ink-3);margin:14px 4px 5px;font-weight:600}
+  .nav a{display:flex;align-items:center;gap:9px;padding:6px 8px;border-radius:6px;color:var(--ink-2);text-decoration:none;font-size:13px}
+  .nav a.on{background:#eaf0ee;color:var(--accent);font-weight:600}
+  .nav a:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+  .nav a .g{width:15px;text-align:center;font-size:11px;color:var(--ink-3)}
+  .nav a.on .g{color:var(--accent)}
+  .main{display:flex;flex-direction:column;overflow:hidden}
+  .top{display:flex;align-items:center;gap:14px;padding:13px 24px;border-bottom:1px solid var(--line);background:var(--panel)}
+  .top h1{font-size:15px;font-weight:600;margin:0}
+  .top .sub{font-size:12px;color:var(--ink-3)}
+  .top .right{margin-inline-start:auto;display:flex;align-items:center;gap:12px}
+  /* always-on cues */
+  .resid{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--ink-2);border:1px solid var(--line-2);border-radius:999px;padding:3px 10px}
+  .resid .dot{width:6px;height:6px;border-radius:50%;background:var(--accent)}
+  .vis{display:inline-flex;align-items:center;gap:5px;font-size:12px;color:var(--ink-2);border:1px solid var(--line-2);border-radius:999px;padding:3px 10px}
+  .ident{width:27px;height:27px;border-radius:50%;background:var(--info);color:#fff;display:grid;place-items:center;font-size:11px;font-weight:600}
+  .canvas{flex:1;overflow:auto;padding:20px 24px 40px}
+  .lede{display:flex;align-items:baseline;gap:14px;margin:0 0 16px}
+  .lede h2{font-size:19px;font-weight:600;margin:0;letter-spacing:-.01em}
+  .lede .per{font-size:12.5px;color:var(--ink-3)}
+  .lede .upd{margin-inline-start:auto;font-size:12px;color:var(--ink-3);display:inline-flex;gap:7px;align-items:center}
+  .lede .upd .pip{width:7px;height:7px;border-radius:50%;background:var(--ok)}
+  /* KPI strip — direct-labelled numbers + inline sparkline, no tiles-with-shadow */
+  .kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);border:1px solid var(--line);border-radius:var(--r);overflow:hidden;margin-bottom:22px}
+  .kpi{background:var(--panel);padding:14px 16px}
+  .kpi .lab{font-size:11.5px;color:var(--ink-3);text-transform:uppercase;letter-spacing:.05em;font-weight:600}
+  .kpi .num{font-size:27px;font-weight:600;margin:5px 0 3px;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+  .kpi .delta{font-size:12px;color:var(--ink-2);display:inline-flex;align-items:center;gap:5px}
+  .kpi .delta .ar{font-family:ui-monospace,monospace;font-size:11px}
+  .kpi .delta.up{color:var(--ok)} .kpi .delta.down{color:var(--risk)} .kpi .delta.flat{color:var(--ink-3)}
+  .kpi svg{display:block;margin-top:9px}
+  /* main grid: small multiples */
+  .grid{display:grid;grid-template-columns:1.6fr 1fr;gap:18px;align-items:start}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:16px 18px}
+  .panel h3{font-size:13px;font-weight:600;margin:0 0 2px}
+  .panel .cap{font-size:11.5px;color:var(--ink-3);margin:0 0 14px}
+  /* portfolio rows = small multiples of delivery */
+  .row{display:grid;grid-template-columns:1fr 88px 96px 70px;gap:10px;align-items:center;padding:9px 0;border-top:1px solid var(--line)}
+  .row:first-of-type{border-top:0}
+  .row .name{font-size:13px}
+  .row .name .ref{font-size:10.5px;color:var(--ink-3)}
+  .row .bar{height:6px;background:#eef1ee;border-radius:3px;overflow:hidden;position:relative}
+  .row .bar i{display:block;height:100%;background:var(--accent);border-radius:3px}
+  .row .bar .tgt{position:absolute;top:-2px;bottom:-2px;width:1.5px;background:var(--ink-3)}
+  .row .stat{font-size:11.5px;font-weight:600;display:inline-flex;align-items:center;gap:5px}
+  .row .stat .ic{font-family:ui-monospace,monospace;font-size:10px}
+  .stat.ok{color:var(--ok)} .stat.risk{color:var(--risk)} .stat.plan{color:var(--ink-3)}
+  .row .pct{text-align:end;font-size:12px;color:var(--ink-2);font-variant-numeric:tabular-nums}
+  /* right column stacked small panels */
+  .stack{display:grid;gap:18px}
+  .mini .row2{display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-top:1px solid var(--line);font-size:12.5px}
+  .mini .row2:first-of-type{border-top:0}
+  .mini .row2 .v{font-weight:600;font-variant-numeric:tabular-nums}
+  .agentnote{display:flex;gap:9px;align-items:flex-start;margin-top:14px;padding-top:13px;border-top:1px solid var(--line);font-size:12.5px;color:var(--ink-2)}
+  .agbadge{flex:none;display:inline-flex;align-items:center;gap:5px;font-size:10px;font-weight:700;color:var(--agent);background:var(--agent-soft);border-radius:5px;padding:2px 6px}
+  .agbadge .sq{width:8px;height:8px;border:1.5px solid var(--agent);border-radius:2px}
+  .agentnote a{color:var(--accent);text-decoration:none;font-weight:600}
+  .footnote{font-size:11.5px;color:var(--ink-3);margin-top:6px}
+</style>
+</head>
+<body>
+<div class="shell">
+  <nav class="rail" aria-label="Primary">
+    <div class="brand"><div class="m">M</div><b>Myelin</b></div>
+    <div class="nav">
+      <h5>Workspace</h5>
+      <a href="#" class="on" aria-current="page"><span class="g">▤</span>Executive overview</a>
+      <a href="#"><span class="g">⌖</span>Home</a>
+      <a href="#"><span class="g">◷</span>Inbox</a>
+      <h5>Subsystems</h5>
+      <a href="#"><span class="g">◧</span>Code</a>
+      <a href="#"><span class="g">▷</span>CI</a>
+      <a href="#"><span class="g">≣</span>Issues</a>
+      <a href="#"><span class="g">▦</span>Knowledge</a>
+      <a href="#"><span class="g">◌</span>Chat</a>
+      <h5>Govern</h5>
+      <a href="#"><span class="g">⚖</span>GDPR · DSR</a>
+      <a href="#"><span class="g">◈</span>Audit</a>
+    </div>
+  </nav>
+
+  <main class="main">
+    <header class="top">
+      <div>
+        <h1>Helio GmbH</h1>
+        <div class="sub">Executive overview · Q3 2026</div>
+      </div>
+      <div class="right">
+        <span class="vis" title="Who can see this dashboard">◐ Visibility: Leadership</span>
+        <span class="resid" title="Where this workspace's data lives — operator &amp; key control on click"><span class="dot"></span>EU · Frankfurt · BYOK</span>
+        <div class="ident" title="Mara Voß — CTO">MV</div>
+      </div>
+    </header>
+
+    <div class="canvas">
+      <div class="lede">
+        <h2>Delivery &amp; engineering health</h2>
+        <span class="per">rolling 12 weeks</span>
+        <span class="upd"><span class="pip"></span>live · these are the delivery records, not a snapshot</span>
+      </div>
+
+      <!-- KPI strip with inline sparklines -->
+      <section class="kpis" aria-label="Key indicators">
+        <div class="kpi">
+          <div class="lab">Cycle throughput</div>
+          <div class="num">38<span style="font-size:14px;color:var(--ink-3);font-weight:500"> items</span></div>
+          <div class="delta up"><span class="ar">▲</span>+12% vs prev cycle</div>
+          <svg width="150" height="26" viewBox="0 0 150 26"><polyline fill="none" stroke="var(--ink-line)" stroke-width="1.5" points="0,20 18,18 36,21 54,15 72,16 90,11 108,13 126,8 150,6"/></svg>
+        </div>
+        <div class="kpi">
+          <div class="lab">Lead time (median)</div>
+          <div class="num">3.4<span style="font-size:14px;color:var(--ink-3);font-weight:500"> d</span></div>
+          <div class="delta down"><span class="ar">▼</span>−0.6 d (faster)</div>
+          <svg width="150" height="26" viewBox="0 0 150 26"><polyline fill="none" stroke="var(--ink-line)" stroke-width="1.5" points="0,7 18,9 36,8 54,12 72,11 90,14 108,15 126,18 150,19"/></svg>
+        </div>
+        <div class="kpi">
+          <div class="lab">Main green rate (CI)</div>
+          <div class="num">96.2<span style="font-size:14px;color:var(--ink-3);font-weight:500"> %</span></div>
+          <div class="delta flat"><span class="ar">→</span>±0.0 stable</div>
+          <svg width="150" height="26" viewBox="0 0 150 26"><polyline fill="none" stroke="var(--ink-line)" stroke-width="1.5" points="0,8 18,6 36,9 54,7 72,8 90,6 108,7 126,7 150,6"/></svg>
+        </div>
+        <div class="kpi">
+          <div class="lab">SLA breaches (open)</div>
+          <div class="num">2</div>
+          <div class="delta up"><span class="ar">▲</span>+1 needs attention</div>
+          <svg width="150" height="26" viewBox="0 0 150 26"><polyline fill="none" stroke="var(--ink-line)" stroke-width="1.5" points="0,18 18,17 36,19 54,16 72,17 90,15 108,16 126,12 150,9"/></svg>
+        </div>
+      </section>
+
+      <div class="grid">
+        <!-- portfolio small multiples -->
+        <section class="panel">
+          <h3>Portfolio — initiatives vs. plan</h3>
+          <p class="cap">% complete · the vertical tick marks the on-date target. Same work items as the team roadmap.</p>
+
+          <div class="row">
+            <div class="name">Instant SEPA payouts <span class="ref">INIT-12</span></div>
+            <div class="bar"><i style="width:72%"></i><span class="tgt" style="left:68%"></span></div>
+            <div class="stat ok"><span class="ic">●</span>On track</div>
+            <div class="pct">72%</div>
+          </div>
+          <div class="row">
+            <div class="name">3-D Secure 2 step-up <span class="ref">INIT-09</span></div>
+            <div class="bar"><i style="width:41%"></i><span class="tgt" style="left:62%"></span></div>
+            <div class="stat risk"><span class="ic">▲</span>At risk</div>
+            <div class="pct">41%</div>
+          </div>
+          <div class="row">
+            <div class="name">Dispute &amp; chargeback console <span class="ref">INIT-15</span></div>
+            <div class="bar"><i style="width:8%"></i><span class="tgt" style="left:30%"></span></div>
+            <div class="stat plan"><span class="ic">◇</span>Planned</div>
+            <div class="pct">8%</div>
+          </div>
+          <div class="row">
+            <div class="name">Reliability hardening <span class="ref">INIT-04</span></div>
+            <div class="bar"><i style="width:90%"></i><span class="tgt" style="left:88%"></span></div>
+            <div class="stat ok"><span class="ic">●</span>On track</div>
+            <div class="pct">90%</div>
+          </div>
+          <div class="row">
+            <div class="name">Multi-currency wallets <span class="ref">INIT-21</span></div>
+            <div class="bar"><i style="width:3%"></i><span class="tgt" style="left:18%"></span></div>
+            <div class="stat plan"><span class="ic">◇</span>Discovery</div>
+            <div class="pct">3%</div>
+          </div>
+
+          <div class="agentnote">
+            <span class="agbadge"><span class="sq"></span>agent</span>
+            <span><b>InsightAgent</b> notes INIT-09 has slipped its target tick two cycles running; the blocker is an external 3-DS sandbox. <a href="#">Open the why-walk</a></span>
+          </div>
+          <p class="footnote">1 confidential initiative not shown — included in totals as a count, never opened here.</p>
+        </section>
+
+        <div class="stack">
+          <section class="panel mini">
+            <h3>Where work is committed</h3>
+            <p class="cap">open items by team</p>
+            <div class="row2"><span>Payments</span><span class="v">34</span></div>
+            <div class="row2"><span>Identity &amp; Access</span><span class="v">19</span></div>
+            <div class="row2"><span>Platform / SRE</span><span class="v">22</span></div>
+            <div class="row2"><span>Plattform-Sicherheit</span><span class="v">11</span></div>
+          </section>
+
+          <section class="panel mini">
+            <h3>Agent activity (this week)</h3>
+            <p class="cap">applied effects passed a human gate · ambient</p>
+            <div class="row2"><span>Proposals raised</span><span class="v">47</span></div>
+            <div class="row2"><span>Approved by a human</span><span class="v">31</span></div>
+            <div class="row2"><span>Edited then applied</span><span class="v">9</span></div>
+            <div class="row2"><span>Rejected</span><span class="v">7</span></div>
+            <div class="agentnote">
+              <span class="agbadge"><span class="sq"></span>agent</span>
+              <span>Every effect is attributed &amp; audit-linked. <a href="#">Agent governance →</a></span>
+            </div>
+          </section>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+</body>
+</html>
