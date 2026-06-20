@@ -512,11 +512,19 @@ title = "humanise"
 status = "deferred"
 landing = "P-187"
 
+# 7.4 COVERED at NOTIF-P10 (P-188): get_prefs / set_prefs — prefs + quiet-hours over the frozen
+# myelin-query QueryAst (the matcher = the EventMatcher core 3.4; Notif invents NO second predicate
+# language); quiet-hours in the recipient tz; critical/escalated pierce by default (pierce_classes —
+# you cannot silence an on-call page). The provider (Notif owns 7.4 — set/get/route) + consumer (the
+# router/CLI/a subsystem rule, building the ONE QueryAst matcher; `notify test` previews the SAME
+# route decision) CDC pair is the dated green artifact.
 [[contract]]
 row = "7.4"
 title = "get_prefs / set_prefs"
-status = "deferred"
-landing = "P-188"
+status = "covered"
+cdc = [
+    "crates/myelin-notif/tests/cdc_7_4_notif_prefs.rs",
+]
 
 [[contract]]
 row = "7.5"

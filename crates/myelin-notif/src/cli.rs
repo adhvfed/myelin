@@ -34,9 +34,13 @@
 
 use myelin_identity::{Consistency, Principal};
 
-use crate::list_inbox::{list_inbox, InboxFilter, InboxPage, Page, ReadAuthorizePort};
+use crate::list_inbox::{list_inbox, InboxFilter, InboxPage, Page, ReadAuthorizePort, Subsystem};
+use crate::prefs::{
+    get_prefs, route, set_prefs, PrefStore, PrefView, QuietHours,
+};
 use crate::read_state::{mark, snooze, ReadState, ReadStateError};
 use crate::router::{InboxProjection, RoutedInboxItem};
+use crate::{Class, NotifPrefs, Reason};
 
 /// **The named scoped view a `myelin inbox list --view <name>` selects** (the C-9 §1.3 surfaces).
 /// Each maps to a frozen [`InboxFilter`] — a filter over the ONE inbox, never a second store.
@@ -149,6 +153,95 @@ pub fn inbox_snooze(
     until: &str,
 ) -> Result<(), ReadStateError> {
     snooze(inbox, principal, item_id, until)
+}
+
+// ===========================================================================================
+//  `myelin inbox prefs` / `myelin notify prefs|test` — the prefs CLI (NOTIF-P10 / P-188)
+// ===========================================================================================
+
+/// **`myelin inbox prefs` / `myelin notify prefs` — show the caller's prefs + quiet-hours.** A thin
+/// seam over [`get_prefs`] (contract 7.4); renders the routing matrix (channel ← matcher source),
+/// the quiet windows (in the recipient tz), and the pierce-classes as PII-free lines. Recipient-
+/// scoped (a principal reads only their own prefs). The caller renders via [`render_prefs`].
+pub fn notify_prefs(store: &PrefStore, principal: &Principal) -> PrefView {
+    get_prefs(store, principal)
+}
+
+/// **`myelin notify prefs --set …` — UPSERT the caller's prefs + quiet-hours.** A thin seam over
+/// [`set_prefs`] (contract 7.4). The routing matchers are already cost-bounded frozen `QueryAst`s
+/// (an over-budget matcher could never have been built). Returns the stored [`PrefView`] to echo.
+pub fn notify_prefs_set(
+    store: &PrefStore,
+    principal: &Principal,
+    prefs: NotifPrefs,
+    quiet: QuietHours,
+) -> PrefView {
+    set_prefs(store, principal, prefs, quiet)
+}
+
+/// **`myelin notify test --reason <r> --class <c> --subsystem <s> [--at <utc_min> --weekday <d>]` —
+/// preview the routing decision.** Shows which channels the caller's CURRENT prefs would deliver a
+/// hypothetical item on, AT a given instant (so a recipient can see "would a fyi at 03:00 reach my
+/// phone?"). Drives the SAME [`route`] decision the router uses (no second decision path) — the
+/// preview can never disagree with the real delivery. Returns the PII-free channel-token list.
+pub fn notify_test(
+    store: &PrefStore,
+    principal: &Principal,
+    reason: Reason,
+    class: Class,
+    subsystem: Subsystem,
+    utc_minute_of_day: i32,
+    utc_weekday: u8,
+) -> Vec<String> {
+    let view = get_prefs(store, principal);
+    route(
+        &view.prefs,
+        &view.quiet,
+        reason,
+        class,
+        subsystem,
+        utc_minute_of_day,
+        utc_weekday,
+    )
+    .into_iter()
+    .map(|c| c.token().to_string())
+    .collect()
+}
+
+/// Render a [`PrefView`] as PII-free CLI lines: the routing matrix (channel ← matcher source), the
+/// quiet windows (offset tz + minute ranges), and the pierce-classes. Never a rendered string.
+pub fn render_prefs(view: &PrefView) -> String {
+    let mut out = String::new();
+    out.push_str("routing:\n");
+    for rule in &view.prefs.routing {
+        // The matcher's textual source (the P-235 parser surface) or its node-count if a built tree.
+        let m = if rule.matcher.source().is_empty() {
+            "<compiled matcher>".to_string()
+        } else {
+            rule.matcher.source().to_string()
+        };
+        out.push_str(&format!("  {} <- {}\n", rule.channel.token(), m));
+    }
+    out.push_str(&format!("digest: {}\n", view.prefs.digest.cadence));
+    out.push_str(&format!("quiet-hours (tz offset {}m):\n", view.quiet.tz.offset_minutes));
+    for w in &view.quiet.windows {
+        out.push_str(&format!(
+            "  [{:02}:{:02}, {:02}:{:02})  days={:?}\n",
+            w.from / 60,
+            w.from % 60,
+            w.to / 60,
+            w.to % 60,
+            w.days
+        ));
+    }
+    let pierces: Vec<&str> = view
+        .quiet
+        .pierce_classes
+        .iter()
+        .map(|c| crate::prefs::class_token(*c))
+        .collect();
+    out.push_str(&format!("pierce-classes: {}\n", pierces.join(",")));
+    out
 }
 
 /// **One item's structured read-surface detail (`myelin inbox show`).** PII-free: the opaque
