@@ -298,6 +298,34 @@
 //! leg owed). **Mutation floor (P-GA-17 TESTS):** the [`structural_floor::RestrictRegistry::is_restricted`]
 //! flag, the [`structural_floor::M1Store`] suppression branch, and [`structural_floor::classify_residual`]
 //! are mandatory-core; the `cargo mutants` score is in the commit body.
+//!
+//! ## P-GA-22 (→ P-149) — the retention engine: tightest-policy-wins merge + legal-hold-aware suspend (contract 10.5)
+//! [`retention`] ships the **retention engine** ([`retention::RetentionEngine`]) — the retention leg
+//! of contract 10.5 (§5.1). Two responsibilities: (1) the **tightest-policy-wins merge**
+//! ([`retention::RetentionEngine::effective_retention`]) — given the per-field [`myelin_gdpr::
+//! RetentionClass`] (G3) inputs for a `(category, tenant, store)`, each tagged with which
+//! [`retention::RetentionSource`] named it, it picks the **most restrictive** policy that **does not
+//! violate a legal-retention floor**, deterministically, and **records which input won**
+//! ([`retention::EffectiveRetention::winning_source`] — a tenant 30-day policy beats a 90-day
+//! default; a lawful 6-month floor — an [`myelin_gdpr::RetentionClass::AuditCarveOut`] — clamps a
+//! tenant "delete immediately" UP, recorded as the floor winner); (2) the **legal-hold-aware
+//! suspend-don't-delete expiry** ([`retention::RetentionEngine::expire`]) — an elapsed field is
+//! expired via the §3 erasure mechanisms (the SAME canonical-order holder fan-out the DSR erase
+//! uses) UNLESS an active `legal_hold` over the scope SUSPENDS it (read through the EXISTING G4
+//! [`fanout::LegalHoldRegistry`], P-GA-12 — fail-safe-to-suspend; **0 held-scope deletions**;
+//! resumes on hold-lift). It REUSES the hold gate + the holder fan-out wholesale (EI-01 §7 coherence
+//! — no second hold registry, no re-implemented fan-out). **GA-D6** (set a hold → submit an expiry →
+//! deferred-by-hold, 0 held-scope deletions → lift → resumes) emits its dated green artifact in
+//! `tests/ga_d6_retention_legal_hold.rs`; the CDC pair is `tests/cdc_10_5_retention_engine.rs`.
+//! **Floors named:** GA-D6 runs at M2 scale here; it re-confirms at CELL scale → **M5 P-GA-35**; the
+//! consent / sub-processor registries + the `transfer_allowed` gate (the rest of 10.5) → **P-GA-23
+//! → P-150**; the durable Postgres `retention_policy` (G3) table + the periodic expiry SWEEP
+//! scheduler (the `myelin-flow` wheel) → the same DB / timer floor every M0/M1 store carries (P-007
+//! / P-S12 / the P-GA-21 wheel — a config wire, not a code change). **Mutation floor (P-GA-22
+//! TESTS):** the tightest-wins merge + the legal-hold suspend paths are mandatory-core; the
+//! `cargo mutants` score is recorded in the [`retention`] module note + the commit body. **No
+//! `--features integration` leg owed:** the engine is a pure decision + a holder-fan-out driver over
+//! already-shipped in-memory seams — it touches NO new DB / object-store / cache / bus contract.
 
 pub mod audit;
 pub mod audit_proofs;
@@ -311,6 +339,7 @@ pub mod fanout;
 pub mod holders;
 pub mod orchestration;
 pub mod posture;
+pub mod retention;
 pub mod structural_floor;
 pub mod tenant_ops;
 
@@ -364,6 +393,11 @@ pub use orchestration::{
 pub use posture::{
     reference_is_by_reference, restatement_markers, ErasurePosture, LegalStatus, StructuralLever,
     SubsystemReference, CANONICAL_POSTURE, POSTURE_ANCHOR, POSTURE_CONTRACT_ROW,
+};
+pub use retention::{
+    legal_floor, platform_default, tenant_delete_immediately, tenant_window, EffectiveRetention,
+    ExpiryError, ExpiryOutcome, RetentionEngine, RetentionInput, RetentionSource,
+    RETENTION_EXPIRY_RUNS, RETENTION_HELD_SCOPE_DELETIONS,
 };
 pub use structural_floor::{
     classify_residual, shred_pseudonym_identity, Authorship, LeverCoverage, M1Store, Processed,
