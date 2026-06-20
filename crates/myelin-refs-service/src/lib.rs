@@ -84,7 +84,32 @@
 //! implementing the SAME trait — the consumer is unchanged. Telemetry `refs.invalidations`
 //! ([`invalidator::RefsProjectionInvalidator::INVALIDATIONS_SIGNAL`]) is live.
 //!
+//! **REF-P8 (P-157) ships:** the [`emit`] module — the **edge-extraction emit seam** (contract 5.4
+//! EMIT side, the §4.1 producer #1): given a `myelin-content` document (the three structured inline
+//! nodes [`myelin_content::InlineNode`] — `mention`/`artifact_ref`/`embed`, frozen X-2), [`extract_edges`]
+//! yields **one edge per structured node** (`mention → mentions`, `artifact_ref → links`,
+//! `embed → embeds`; `rel_class = reference`) by **matching the enum variant** — structured-node
+//! extraction, NOT a regex over prose (the reliability guarantee, EI-04 §2.4). [`emit_edges`] emits one
+//! `refs.edge.created` per edge in the **SAME transaction** that writes the content, via
+//! [`myelin_events::OutboxTx::emit`]`(draft, cause = Some(content_event))` — so the **correlation root
+//! carries**, `causation = the content event`, and `depth = content.depth + 1` (the loop-guard stamp,
+//! the explicit drill REF-P9). There is **NO standalone edge-write API** (the only verb is
+//! `OutboxTx::emit`; the `no-raw-publish` lint, P-019, stays green). **Emit-iff-committed** (REF-D7
+//! producer half, BUS-D4): the edge rows are BUFFERED into the content transaction and become durable
+//! **iff** the caller commits — abort → 0 edges (no edge without its content). Proven against the live
+//! dev-stack outbox in `tests/integration_ref_p8_emit_seam.rs` (the `integration` feature: N nodes
+//! committed → N rows visible to the relay; aborted → 0). The mention's target is the PSEUDONYMOUS
+//! `member` URN, never the name (erasure-safe, §4.6).
+//!
 //! **Does NOT ship (floors named):**
+//! - **The producers are SYNTHETIC at M2.** REF-P8 exercises the seam with a TEST content writer; the
+//!   first REAL producers (Git diffs / Knowledge blocks / Chat messages writing actual content) land
+//!   in **REF-P17 / REF-P18** (M3+). Named so the seam is not mistaken for live producer edges — the
+//!   WIRING (structured-node extraction + same-tx outbox emit) is real, the CALLERS are synthetic.
+//! - **The loop-guard causal-depth STAMP drill is REF-P9 / P-158.** The `depth = content.depth + 1`
+//!   already rides [`myelin_events::derive_envelope`] correct-by-construction (the emit passes `cause =
+//!   Some(content_event)`); REF-P9 adds the explicit depth-stamp assert + the depth-ceiling tripwire
+//!   over THIS seam.
 //! - **No LIVE R2 cache.** REF-P7 ships the invalidator + the NO-OP shim (records busts; evicts
 //!   nothing — nothing is cached yet). The live bounded, per-tenant-DEK-encrypted Valkey-class R2
 //!   cache that implements [`invalidator::ProjectionCache`] is **REF-P12**; it swaps the shim, leaving
@@ -110,6 +135,7 @@
 
 pub mod dek;
 pub mod edge_builder;
+pub mod emit;
 pub mod erasure_posture;
 pub mod holder;
 pub mod invalidator;
@@ -120,6 +146,9 @@ pub use dek::{ref_p5_inherited_gates, InheritedGate, RefsDekPin};
 pub use edge_builder::{
     edge_id, EdgeProjection, EdgeRow, ProjectError, RefsEdgeBuilder, RelClass,
     EDGE_BUILDER_CONSUMER, EDGE_BUILDER_SUBJECTS, EDGE_BUILDER_SUBJECT_PREFIXES,
+};
+pub use emit::{
+    edge_aggregate_key, emit_edges, extract_edges, EdgeDraft, EdgeRel, REFS_EDGE_CREATED,
 };
 pub use migration::{
     edge_ddl_is_forward_only, edge_table_dek_ref, edge_table_migrations, CREATE_EDGE_INDEXES_DDL,
