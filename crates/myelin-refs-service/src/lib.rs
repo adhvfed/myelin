@@ -101,6 +101,24 @@
 //! committed → N rows visible to the relay; aborted → 0). The mention's target is the PSEUDONYMOUS
 //! `member` URN, never the name (erasure-safe, §4.6).
 //!
+//! **REF-P9 (P-158) ships:** the [`loop_guard`] module — the **loop-guard causal-depth stamp** on
+//! every `refs.edge.*` emit (§4.1 `depth +1`; AG-6). [`RefsLoopGuard::guarded_emit_edges`] wraps the
+//! REF-P8 emit seam and (1) STAMPS every emitted `refs.edge.*` at [`stamped_depth`] =
+//! `content.depth + 1` (the explicit drill REF-P8 deferred — the `+1` rides
+//! [`myelin_events::derive_envelope`] correct-by-construction, now ASSERTED through the real outbox);
+//! (2) gates the **re-trigger source** to structured `artifact_ref`/`embed` nodes only
+//! ([`is_retrigger_source`] — a `mention` notifies, never auto re-triggers; AG-6 / CHAT-1); and
+//! (3) PARKS the emit + fires a **depth-ceiling tripwire** ([`RefsLoopGuard::ceiling_tripwire_firings`])
+//! when a chain reaches the frozen AG-6 causal ceiling ([`CAUSAL_DEPTH_CEILING`] = 12, DISTINCT from
+//! the Refs traversal ceiling 16, REF-P13) — **before runaway**, so the deepest edge ever written
+//! sits at `ceiling - 1`. The guard FEEDS the **causal-depth telemetry** (`bus.causal_depth_max`,
+//! contract 1.8 / [`myelin_events::BusSignal::CausalDepthMax`]) so an approaching chain is observable.
+//! The mutation floor is on the stamp/ceiling logic (leak-of-runaway-critical): the saturating `+1`,
+//! the `>= ceiling` park boundary, and the re-trigger gate are each asserted (a mutant that wraps the
+//! depth, parks one hop late, or treats a mention as a re-trigger is caught). There is NO second
+//! causality function — the `+1` is still `derive_envelope`; only the ceiling NUMBER is re-stated
+//! (refs-service must not depend on the mid-tier query crate; DOCUMENTED in [`loop_guard`]).
+//!
 //! **Does NOT ship (floors named):**
 //! - **The producers are SYNTHETIC at M2.** REF-P8 exercises the seam with a TEST content writer; the
 //!   first REAL producers (Git diffs / Knowledge blocks / Chat messages writing actual content) land
@@ -139,6 +157,7 @@ pub mod emit;
 pub mod erasure_posture;
 pub mod holder;
 pub mod invalidator;
+pub mod loop_guard;
 pub mod migration;
 pub mod residency;
 
@@ -149,6 +168,10 @@ pub use edge_builder::{
 };
 pub use emit::{
     edge_aggregate_key, emit_edges, extract_edges, EdgeDraft, EdgeRel, REFS_EDGE_CREATED,
+};
+pub use loop_guard::{
+    is_retrigger_source, stamped_depth, target_is_structured_node, would_exceed_ceiling,
+    GuardDecision, RefsLoopGuard, CAUSAL_DEPTH_CEILING,
 };
 pub use migration::{
     edge_ddl_is_forward_only, edge_table_dek_ref, edge_table_migrations, CREATE_EDGE_INDEXES_DDL,
