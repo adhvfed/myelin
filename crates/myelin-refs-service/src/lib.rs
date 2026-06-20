@@ -160,6 +160,7 @@ pub mod invalidator;
 pub mod loop_guard;
 pub mod migration;
 pub mod residency;
+pub mod resolve;
 
 pub use dek::{ref_p5_inherited_gates, InheritedGate, RefsDekPin};
 pub use edge_builder::{
@@ -188,3 +189,9 @@ pub use holder::{
     RefsHolderRegistration, REFS_CACHE_STORE, REFS_EDGE_STORE,
 };
 pub use residency::{refs_store_descriptors, RefsStoreDescriptor};
+pub use resolve::{
+    bounded_stale, strong_read, AuthzServed, CrossCellDisposition, NoOpCacheRead, OwnerProjection,
+    ProjectApi, ProjectApiError, ProjectOutcome, Projection, ProjectionCacheRead, ProjectionFlag,
+    ResolveMode, ResolveService, Resolution, Tombstone, TombstoneReason,
+    RESOLVE_CACHE_HIT_RATIO_SIGNAL, VIEW_PERMISSION,
+};
