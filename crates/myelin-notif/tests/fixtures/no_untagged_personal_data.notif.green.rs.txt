@@ -1,0 +1,16 @@
+// NOTIF-P2 GREEN fixture: the same PII column, tagged with the canonical multi-line six-tag
+// #[personal_data(...)] form the Notif schema uses (the recipient/principal pseudonym columns). The
+// lint must ADMIT it (it is now erasable + RoPA-mapped).
+pub struct NotifPrefRow {
+    pub tenant_id: String,
+    pub region: String,
+    #[personal_data(
+        category = Identifier,
+        role = TenantContent,
+        basis = Contract,
+        retention = UntilContractEnd,
+        erasure = Pseudonymise,
+        subject_locator = "display_name",
+    )]
+    pub display_name: String,
+}

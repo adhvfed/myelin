@@ -1,0 +1,5 @@
+// NOTIF-P2 GREEN fixture: a region-pinned pool — the residency-pin lint admits it (the region pins
+// the data to its residency boundary, ADR-11).
+fn open() {
+    let pool = PgPool::connect(url).region(Region::EuWest).await?;
+}

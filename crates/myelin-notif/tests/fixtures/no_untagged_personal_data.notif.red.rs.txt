@@ -1,0 +1,9 @@
+// NOTIF-P2 RED fixture: an inbox/pref row whose PII column carries NO #[personal_data(...)] tag —
+// the un-erasable-subject bug class the no-untagged-personal-data lint exists to kill. NOT real
+// crate code (lives under /fixtures/, excluded from the live lint-gate); the lint-fixture test runs
+// the lint over it and asserts it is REJECTED.
+pub struct NotifPrefRow {
+    pub tenant_id: String,
+    pub region: String,
+    pub display_name: String,
+}
