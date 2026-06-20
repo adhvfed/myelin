@@ -1,0 +1,42 @@
+[package]
+name = "myelin-ci-sandbox"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The CI SANDBOX crate (CI-P1 → P-129, M2). The runner/backend home (architecture
+# continuous-integration 01 §2: the runtime-agnostic seam; ADR-20 / X-6 / CI-1). At P-129 it
+# carries ONLY the SEAM, frozen byte-authoritative to arch 01 §2:
+#   - the JobSpec struct (kind ∈ {Ci, Agent} — the UNIFY point) + its supporting value types
+#     (ImageRef digest-pin-or-reject, EgressPolicy default-deny, ResourceLimits incl. pids_max +
+#     zero-swap + timeout, TrustTier, RunTokenRef, MeterTarget, IdemToken, …);
+#   - the SandboxBackend trait SHAPE (launch / kill) + the FleetProvider trait SHAPE
+#     (provision / deprovision / capacity) — shapes ONLY (no impl: Firecracker is CI-P2/P-237,
+#     gVisor is CI-P28, the fleet impl is CI-P14);
+#   - the four-uniform-guarantee wiring SEAM (RunnerHooks: reserve/settle 11.7, mint_run_token
+#     4.7 attribution, the HITL-withhold routing note, the isolation-floor hook CI-P5's escape
+#     drill drives). ToolHands::exec (8.4) IS launch(JobSpec{kind:Agent}) — the equivalence wired
+#     here (agent_job(...)) so the agent fabric (AG-P8/P-226) dispatches onto THIS exact runner.
+#
+# DAG POSITION (a documented, NAMED leaf consumer, exactly like myelin-git / myelin-issues /
+# myelin-notif / myelin-chat): it sits ABOVE the shared glue crates — it depends ONLY on
+# myelin-tenancy (the frozen Region partition type the FleetProvider trait names) and NOTHING in
+# the production library DAG depends back on it. It is therefore OUTSIDE the eleven-crate library
+# DAG modelled by `myelin-substrate::crate_graph` (substrate_is_root() / identity_is_sink() are
+# preserved — a subsystem crate is the graph's terminal consumer, not a node in it).
+#
+# DB-FREE: this is a pure value/trait crate. P-129 touches NO DB / object-store / cache / bus
+# contract — so there is no `integration` feature and no live-stack test here; the Firecracker
+# backend (the real launch) + its escape drill are CI-P2/CI-P5 (named floors). `cargo build
+# --workspace` stays DB-free.
+[dependencies]
+# The frozen (tenant, region) partition types (contract 12.1 / P-CP-01). The FleetProvider trait
+# names `Region` in provision/capacity (arch 01 §2). myelin-tenancy is a shared partition-key
+# carrier and NOTHING in the production DAG depends back on myelin-ci-sandbox, so this leaf edge
+# keeps the §2.9 graph acyclic.
+myelin-tenancy = { path = "../myelin-tenancy" }
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

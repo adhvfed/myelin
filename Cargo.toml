@@ -111,6 +111,19 @@ members = [
     # durable set's emit behaviour begins in CHAT-P5, the firehose set's in CHAT-P10. See the
     # crate-level note in crates/myelin-chat/src/lib.rs.
     "crates/myelin-chat",
+    # The CI SANDBOX crate (CI-P1 → P-129, M2). The runner/backend home: the JobSpec struct
+    # (the "one struct, two kinds" seam, kind ∈ {Ci, Agent}), the SandboxBackend / FleetProvider
+    # trait SHAPES (no backend impl — Firecracker is CI-P2/P-237, gVisor is CI-P28), and the
+    # four-uniform-guarantee wiring SEAM (reserve/settle 11.7, mint_run_token 4.7, HITL-withhold
+    # routing note, isolation-floor hook). ToolHands::exec (8.4) IS launch(JobSpec{kind:Agent}) —
+    # the equivalence wired here so the agent fabric (AG-P8/P-226) dispatches onto this exact
+    # runner. Like the other subsystem crates it is a LEAF CONSUMER above the glue crates (depends
+    # on -tenancy for Region) and is NOT a node in the eleven-crate library DAG modelled by
+    # crate_graph.rs — nothing in the production DAG depends back on it; substrate_is_root() /
+    # identity_is_sink() are preserved. cargo build --workspace stays DB-free (this is a pure
+    # value/trait crate; no DB/object-store/cache/bus contract is touched at P-129). See the
+    # crate-level note in crates/myelin-ci-sandbox/src/lib.rs.
+    "crates/myelin-ci-sandbox",
     # The storage SUBSTRATE crate (P-ST-01 → P-007): the OLTP tier client (harness pool +
     # (tenant, region) RLS guard), and — in later prompts — the KMS hierarchy + BlobStore
     # impls + backup/restore machinery. Sits below -gdpr/-client and ABOVE -substrate in
