@@ -94,6 +94,8 @@ use myelin_events::{
 use myelin_query::signals::{Severity, Signal};
 use myelin_tenancy::{Region, TenantId};
 
+use crate::prefs::QuietHours;
+use crate::storm_control::{subject_root_of, RateConfig, StormContext, StormControl, StormDecision};
 use crate::{Class, Reason};
 
 /// The frozen `notif.item.created` event type (architecture §3.4 — the router's create-side emit
@@ -212,21 +214,22 @@ impl InboxProjection {
     }
 
     /// **UPSERT the row with `(tenant, recipient, dedup_key)` write-time collapse (§3.2).** A FRESH
-    /// key inserts the row (returning [`Upsert::Inserted`]); an EXISTING key COLLAPSES into it
-    /// (`coalesce_count += 1`, returning [`Upsert::Collapsed`]) — it does NOT create a second row.
-    /// This is the storm-control primitive the body (NOTIF-P11) builds on; the skeleton just counts.
-    fn upsert(&self, mut item: RoutedInboxItem) -> Upsert {
+    /// key inserts the row (`coalesce_count = 1`); an EXISTING key COLLAPSES into it
+    /// (`coalesce_count += 1`) — it does NOT create a second row. This is the storm-control mechanism-2
+    /// primitive: the insert-vs-collapse VERDICT is decided one step earlier by
+    /// [`StormControl::decide`](crate::storm_control::StormControl::decide) (reading
+    /// [`InboxProjection::contains`] BEFORE this UPSERT), so the router can surface the N→1 collapse +
+    /// the dedup-collapse-ratio for the NOTIF-D2 drill; this method performs the write either way.
+    fn upsert(&self, mut item: RoutedInboxItem) {
         let key = (item.tenant.0.clone(), item.recipient.clone(), item.dedup_key.clone());
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         match guard.get_mut(&key) {
             Some(existing) => {
                 existing.coalesce_count += 1;
-                Upsert::Collapsed(existing.coalesce_count)
             }
             None => {
                 item.coalesce_count = 1;
                 guard.insert(key, item);
-                Upsert::Inserted
             }
         }
     }
@@ -250,6 +253,17 @@ impl InboxProjection {
     /// Whether the projection holds no rows.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// **Does a row already exist at `(tenant, recipient, dedup_key)`?** The storm-control
+    /// dedup-collapse mechanism (NOTIF-P11) reads this BEFORE the UPSERT to decide insert-vs-collapse
+    /// (so the verdict can surface `Collapse` for the drill's N→1 + the collapse-ratio). In the OLTP
+    /// binding the UPSERT's `ON CONFLICT` reports this; the in-memory projection answers it directly.
+    pub fn contains(&self, tenant: &TenantId, recipient: &str, dedup_key: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&(tenant.0.clone(), recipient.to_string(), dedup_key.to_string()))
     }
 
     /// Read one row by `(tenant, recipient, dedup_key)` (for tests / a drill).
@@ -349,15 +363,6 @@ impl RoutedInboxItem {
     }
 }
 
-/// What an [`InboxProjection::upsert`] did (the write-time-collapse outcome, §3.2).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Upsert {
-    /// A fresh `(tenant, recipient, dedup_key)` → a new row was inserted (`coalesce_count = 1`).
-    Inserted,
-    /// An existing key → collapsed into the row (`coalesce_count` is now the carried count).
-    Collapsed(i32),
-}
-
 /// **The Signal-consumer router (the skeleton, NOTIF-P3).** An [`EventHandler`] consumer of curated
 /// Signals (`sig.<tenant>.>`) that UPSERTs an inbox item and emits `notif.item.created` via the
 /// outbox — the ONLY emit path. Wrapped by the [`Consumer`] runtime (the seven rules) through
@@ -372,6 +377,12 @@ pub struct SignalRouter {
     inbox: InboxProjection,
     outbox: OutboxStore,
     minter: Arc<dyn IdMinter>,
+    /// **The five write-time storm-control mechanisms (NOTIF-P11 / §3.2).** Run between classify
+    /// ([`SignalRouter::derive_item`]) and UPSERT: self-suppression, dedup-key collapse,
+    /// thread/subject coalescing, per-`(recipient, subject_root)` rate damping, and mute/DND honoring.
+    /// Holds the per-pool storm state (the coalescer + the token buckets + the mute set). A cloneable
+    /// handle, so the whole router pool shares ONE storm-control truth.
+    storm: StormControl,
     /// The `'static` whitelist the trait requires. Built once at [`build_router`] from the
     /// per-tenant `sig.<tenant>.` prefix and leaked to `'static` (the binding set is fixed for the
     /// life of the consumer pool; one leak per tenant per process — bounded, never per-event).
@@ -404,12 +415,18 @@ impl SignalRouter {
         minter: Arc<dyn IdMinter>,
         subjects: &'static [SubjectPattern],
     ) -> SignalRouter {
-        SignalRouter { inbox, outbox, minter, subjects }
+        SignalRouter { inbox, outbox, minter, storm: StormControl::new(), subjects }
     }
 
     /// The inbox projection this router UPSERTs into (so a drill can read the result).
     pub fn inbox(&self) -> &InboxProjection {
         &self.inbox
+    }
+
+    /// The storm-control stage this router runs between classify and UPSERT (so a drill / a test can
+    /// read its state or mute a thread). The five §3.2 mechanisms live here.
+    pub fn storm(&self) -> &StormControl {
+        &self.storm
     }
 
     /// **Route ONE curated Signal into the inbox + emit `notif.item.created` (the skeleton body).**
@@ -423,9 +440,17 @@ impl SignalRouter {
     ///    the emit co-commit (emit-iff-committed, BUS-D4). The cause makes causality
     ///    correct-by-construction (the correlation root carries; `depth+1` — the loop-guard stamp).
     ///
-    /// Returns the [`Upsert`] outcome on success (so the handler can observe insert-vs-collapse) or
-    /// a [`RouteError`] poison. **No `publish_now`** — the emit rides the ONE sanctioned outbox path.
-    fn route(&self, signal_event: &EventEnvelope) -> Result<Upsert, RouteError> {
+    /// Returns the [`StormDecision`] on success (so the handler can observe deliver/collapse/coalesce/
+    /// suppress) or a [`RouteError`] poison. **No `publish_now`** — the emit rides the ONE sanctioned
+    /// outbox path.
+    ///
+    /// **The five write-time storm-control mechanisms (NOTIF-P11) run between (2) classify and (3)
+    /// UPSERT.** A self-notification / rate-damped candidate writes NO row and emits NOTHING (the
+    /// underlying Signal stays on the bus — the audit is untouched, EI-04 §5.3); a muted / quiet-hours
+    /// candidate WRITES the row (the ONE inbox always receives) but does not push (the emit is the
+    /// create-side projection event, so a suppressed-delivery candidate writes the row WITHOUT the
+    /// emit); a deliver/collapse/coalesce candidate co-commits the row + the emit.
+    fn route(&self, signal_event: &EventEnvelope) -> Result<StormDecision, RouteError> {
         // (1) Parse the curated Signal from the envelope payload (poison → NonRetryable).
         let signal: Signal = serde_json::from_value(signal_event.payload.clone())
             .map_err(|e| RouteError::MalformedSignal(e.to_string()))?;
@@ -434,6 +459,34 @@ impl SignalRouter {
         let item = self.derive_item(signal_event, &signal);
         let recipient = item.recipient.clone();
         let dedup_key = item.dedup_key.clone();
+        let subject_root = subject_root_of(&item.subject.0);
+
+        // (2b) STORM-CONTROL (NOTIF-P11, §3.2) — the five write-time mechanisms, between classify and
+        // UPSERT. `row_exists` (the dedup-collapse input) is read BEFORE the UPSERT so the verdict can
+        // surface a Collapse (the drill's N→1 + the collapse-ratio). The quiet-hours/rate context is
+        // the per-pool default (never-quiet + critical-pierce, the §3.2.4 default rate) until the live
+        // per-recipient PrefStore (NOTIF-P10) wires in here — a NAMED floor; the mechanisms that need
+        // no prefs (self-suppression, dedup-collapse, coalescing, rate-damping) are fully live now.
+        let row_exists = self.inbox.contains(&item.tenant, &recipient, &dedup_key);
+        let quiet = QuietHours::default();
+        let storm_ctx = StormContext {
+            // The logical clock the token bucket is damped on: the skeleton uses tick 0 (a single
+            // pool tick); the live wiring advances it from the Signal clock (the named floor).
+            tick: 0,
+            utc_minute_of_day: 0,
+            utc_weekday: 0,
+            quiet: &quiet,
+            rate: RateConfig::default(),
+        };
+        let decision = self
+            .storm
+            .decide(signal_event, &item, &subject_root, row_exists, &storm_ctx);
+
+        // A storm-control verdict NEVER touches the audit (EI-04 §5.3): the underlying Signal is on
+        // the bus regardless. A self-action / rate-damped candidate writes no row and emits nothing.
+        if !decision.writes_row() {
+            return Ok(decision);
+        }
 
         // (3) Co-commit: open a tx, UPSERT the inbox row, emit notif.item.created, COMMIT. The
         // tx's ambient context is the INCOMING Signal's (tenant/region/actor/clock) so the emitted
@@ -446,27 +499,33 @@ impl SignalRouter {
         // OLTP binding (P-007) this is the `INSERT … ON CONFLICT DO UPDATE` in the tx; here the
         // in-memory projection models it and we record the state-change on the tx for the co-commit
         // assertion.
-        let outcome = self.inbox.upsert(item.clone());
+        self.inbox.upsert(item.clone());
         tx.stage_state_change(format!(
             "UPSERT notif_inbox_item ({}, {}, {})",
             item.tenant.0, recipient, dedup_key
         ));
 
-        // The ONE sanctioned emit verb (contract 2.2; no-raw-publish). `cause = Some(signal_event)`
-        // → the correlation root carries + causation = the Signal + depth+1 (the loop-guard stamp).
-        // A `notif.item.created` is references-not-payloads: it carries the item_id + subject ref,
-        // never a rendered string (humanise is per-viewer at read time, NOTIF-P9).
-        tx.emit(self.item_created_draft(&item), Some(signal_event))
-            .map_err(|e| RouteError::EmitFailed(format!("outbox emit failed: {e:?}")))?;
+        // The emit is the create-side DELIVERY projection event. It rides the outbox ONLY when the
+        // verdict DELIVERS (a fresh deliver, a collapse, or a coalesce bumps a counter the inbox
+        // reads — those still surface the item). A muted / quiet-hours verdict WRITES the row (above)
+        // but SUPPRESSES the channel push, so it does NOT emit the delivery event — the row is in the
+        // ONE inbox (the audit/history), only the off-cell push is silenced (§3.2.5).
+        if decision.delivers() {
+            // The ONE sanctioned emit verb (contract 2.2; no-raw-publish). `cause = Some(signal_event)`
+            // → the correlation root carries + causation = the Signal + depth+1 (the loop-guard stamp).
+            // A `notif.item.created` is references-not-payloads: it carries the item_id + subject ref,
+            // never a rendered string (humanise is per-viewer at read time, NOTIF-P9).
+            tx.emit(self.item_created_draft(&item), Some(signal_event))
+                .map_err(|e| RouteError::EmitFailed(format!("outbox emit failed: {e:?}")))?;
+        }
 
-        // Commit: the inbox row + the notif.item.created emit become durable atomically. A commit
-        // failure is a TRANSIENT outbox hiccup → Retry (never a silent half-write, never a
-        // dead-letter of a good Signal). A UNIQUE(event_id) collision would be a programming error
-        // (the minter is monotonic); the in-memory happy path never hits it.
+        // Commit: the inbox row (+ the notif.item.created emit, when delivered) become durable
+        // atomically. A commit failure is a TRANSIENT outbox hiccup → Retry (never a silent
+        // half-write, never a dead-letter of a good Signal).
         tx.commit()
             .map_err(|e| RouteError::EmitFailed(format!("outbox commit failed: {e:?}")))?;
 
-        Ok(outcome)
+        Ok(decision)
     }
 
     /// Derive the SKELETON [`RoutedInboxItem`] from a curated Signal (the create-skeleton mapping).

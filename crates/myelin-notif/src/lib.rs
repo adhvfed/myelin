@@ -85,6 +85,11 @@ pub mod ranking;
 pub mod read_state;
 pub mod router;
 pub mod schema;
+// The five write-time storm-control mechanisms (NOTIF-P11 / P-189 — §3.2): self-suppression,
+// dedup-key collapse, thread/subject coalescing, per-(recipient, subject_root) token-bucket rate
+// damping, and mute/DND honoring. Storm-control suppresses DELIVERY and RANKING only — NEVER the
+// audit/history (Notif is a projection, EI-04 §5.3). The router runs it between classify and UPSERT.
+pub mod storm_control;
 
 pub use cli::{
     inbox_list, inbox_read, inbox_show, inbox_snooze, notify_prefs, notify_prefs_set, notify_test,
@@ -125,6 +130,10 @@ pub use read_state::{
 pub use router::{
     build_router, signal_subject_prefix, InboxProjection, RoutedInboxItem, SignalRouter,
     NOTIF_ESCALATION_ACKED, NOTIF_ITEM_CREATED, ROUTER_CONSUMER_NAME,
+};
+pub use storm_control::{
+    dedup_collapse_ratio_bps, is_self_notification, subject_root_of, Coalescer, RateConfig,
+    StormContext, StormControl, StormDecision, StormPrefs, SuppressReason, TokenBucket,
 };
 
 /// The service name (a PII-free label, the telemetry / trace / deployable identifier). The
