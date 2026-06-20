@@ -192,6 +192,29 @@
 //! land with the OLTP store in `serve` (REF-P5+); the BOUND DISCIPLINE is real + proven over the
 //! in-memory adjacency model here.
 //!
+//! **REF-P14 (P-163) ships:** the [`mirror`] module — the **TE-7 typed-edge mirror discipline**
+//! (contract 5.5 OWNED; §3.3). Refs does NOT own the typed relation TABLES (Issues `issue_relation`;
+//! Knowledge `db_relation`/`page_parent`) — it owns the DISCIPLINE they mirror under: (1) the **frozen
+//! lifecycle `rel` vocabulary** ([`mirror::LifecycleRel`]) `closes`/`blocks`/`blocked_by`/`depends_on`/
+//! `parent`/`assigns`/`relates` — an unknown lifecycle token is REJECTED, never guessed (REF-3); (2)
+//! the **inverse pairing** ([`mirror::LifecycleRel::inverse`]) — the §3.3 frozen pairs
+//! `blocks↔blocked_by` and `parent↔child`, `relates` SYMMETRIC, `closes`/`depends_on`/`assigns` with
+//! NO frozen inverse token yet (the floor — the subsystem's mint, REF-P18/REF-P20; the mirror never
+//! invents a token); (3) the **`rel_class='lifecycle'` mirror discipline** ([`mirror::mirror_edges`])
+//! — ONE typed lifecycle event projects **BOTH** the forward edge AND its inverse (endpoints swapped),
+//! both lifecycle-class, so cross-subsystem traversal in either direction is ONE Refs query (a `blocks`
+//! event yields both `blocks` and `blocked_by` — the GATE); (4) the **drift reconvergence — typed
+//! wins** ([`mirror::reconverge`]) — a scoped reindex re-emits the typed snapshots, Refs reconverges,
+//! and any lifecycle edge inbound to a covered root that the typed snapshot does NOT back is tombstoned
+//! (the typed table always wins, §4.7 / drill REF-D4 TE-7 half; `reference`-class edges are untouched).
+//! **FLOOR named:** the producers are SYNTHETIC at M2 ([`mirror::SyntheticTypedEvent`]) — there is no
+//! real `issue_relation`/`page_parent` table; the first REAL typed mirrors land in **R-M3 (KN
+//! `page_parent`, REF-P18)** and **R-M4 (Issues `issue_relation`, REF-P20)**. Named so the discipline
+//! is NOT mistaken for a working mirror over real tables — the vocabulary + inverse pairing +
+//! reconvergence are real + drilled here; the typed TABLES are the subsystems' deliverables. The full
+//! reindex byte-parity (REF-D4 full) is REF-P16/REF-P24; this prompt freezes + drills the TE-7
+//! reconvergence SEMANTICS (typed wins).
+//!
 //! **Does NOT ship (floors named):**
 //! - **The producers are SYNTHETIC at M2.** REF-P8 exercises the seam with a TEST content writer; the
 //!   first REAL producers (Git diffs / Knowledge blocks / Chat messages writing actual content) land
@@ -234,6 +257,7 @@ pub mod holder;
 pub mod invalidator;
 pub mod loop_guard;
 pub mod migration;
+pub mod mirror;
 pub mod residency;
 pub mod resolve;
 pub mod traverse;
@@ -258,6 +282,10 @@ pub use emit::{
 pub use loop_guard::{
     is_retrigger_source, stamped_depth, target_is_structured_node, would_exceed_ceiling,
     GuardDecision, RefsLoopGuard, CAUSAL_DEPTH_CEILING,
+};
+pub use mirror::{
+    mirror_edges, project_typed_event, reconverge, Inverse, LifecycleRel, MirrorError,
+    SyntheticTypedEvent,
 };
 pub use migration::{
     edge_ddl_is_forward_only, edge_table_dek_ref, edge_table_migrations, CREATE_EDGE_INDEXES_DDL,
