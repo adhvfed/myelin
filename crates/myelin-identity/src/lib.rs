@@ -62,8 +62,10 @@
 //! Every trait method body is `todo!()` / a fail-closed default. The SHAPES are frozen
 //! here (P-ID-01 / P-022); the Identity roadmap fills the bodies:
 //! - `authenticate` + machine-identity resolution (4.1) → P-ID-06 / P-ID-07 (M1).
-//! - `check` literal-only caveat (4.2) → P-ID-09 (M1); the full `QueryAst` caveat core
-//!   → P-ID-22 (M2).
+//! - `check` (4.2) → P-ID-09 (M1, the engine + the literal-only caveat floor); the literal-only
+//!   floor is **CLOSED** in P-ID-22 (P-133, M2) — the caveat evaluator now runs on the ONE
+//!   `myelin_query::QueryAst` predicate core (no second predicate language). The non-literal
+//!   field/transition caveat INSTANCES land with their subsystems (P-ID-25/26/29/30).
 //! - `list_objects` + the `SetExpr` push-down / authz reverse index (4.3) → P-ID-11 /
 //!   P-ID-12 (M1). The single most load-bearing inter-system contract.
 //! - `list_subjects` / `explain` (4.4) → P-ID-13 (M1).
@@ -352,9 +354,15 @@ pub struct TransitionId(pub String);
 /// A literal value in a caveat's attribute map (architecture §8.6 `attrs: Map<String,
 /// Literal>`). The caveat predicate reuses the safe, non-Turing-complete `QueryAst` core
 /// (ADR-07 = the `EventMatcher`, contract 3.4) — **no second predicate language**. At M0
-/// only the literal value space is frozen; the predicate evaluator is the literal-only
-/// floor (P-ID-09) → the full `QueryAst` core (P-ID-22).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// only the literal value space is frozen; the predicate evaluator started as the literal-only
+/// floor (P-ID-09) and is **promoted to the full `myelin_query::QueryAst` core in P-ID-22**
+/// (P-133) — this `Literal` is the value space the one bounded interpreter reads (`Expr::Lit`).
+///
+/// `Eq` is derived (P-133 / P-ID-22): the value space is `bool | i64 | String` — all `Eq` —
+/// and the promoted `myelin-query` predicate AST (`Expr::Lit(Literal)`) requires `Eq` to be
+/// a hashable/total-equality wire type. A non-breaking strengthening of the frozen contract
+/// type (no field/variant change; the round-trip wire shape is unchanged).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Literal {
     Bool(bool),
     Int(i64),
