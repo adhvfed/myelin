@@ -1981,6 +1981,19 @@ name = "myelin-lints"
 version = "0.0.0"
 
 [[package]]
+name = "myelin-notif"
+version = "0.0.0"
+dependencies = [
+ "myelin-events",
+ "myelin-harness",
+ "myelin-identity",
+ "myelin-refs",
+ "myelin-substrate",
+ "myelin-tenancy",
+ "serde",
+]
+
+[[package]]
 name = "myelin-query"
 version = "0.0.0"
 dependencies = [

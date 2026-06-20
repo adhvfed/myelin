@@ -84,6 +84,20 @@ members = [
     # confirmation. The edge schema (REF-P5), the per-tenant DEK pin (REF-P4), the builder/
     # invalidator consumers (REF-P6/P7) and the real erasure body (REF-P15) land here in M1/M2.
     "crates/myelin-refs-service",
+    # The Notifications crate (NOTIF-P1 → P-127, M2). Notif owns ZERO new contracts vs Phase 3
+    # (architecture notifications.md §0/§1.2 — it is overwhelmingly a CONSUMER), so it carries no
+    # separate glue crate; THIS crate plays both roles at the leaf of the §2.9 DAG: (1) the §4.1
+    # EXPOSED contract CARRIERS (InboxItem / HumanisedString / the reason+class enums / the
+    # DeliveryAdapter trait SHAPE — compile-time carriers so a contract change breaks every
+    # consumer's build NOW, ADR-01), and (2) the SERVICE SHELL (an AppSpec passed to
+    # serve(AppSpec) — boot → migrate → relay → three ports → drain, liveness≠readiness, empty
+    # migration set + empty consumer seam). Like the other service/subsystem crates it is a LEAF
+    # CONSUMER above the glue crates (depends on -tenancy/-events/-identity/-refs/-substrate) and
+    # is NOT a node in the eleven-crate library DAG modelled by crate_graph.rs — nothing in the
+    # production DAG depends back on it; substrate_is_root()/identity_is_sink() are preserved. The
+    # data model (NOTIF-P2), the Signal-consumer router (NOTIF-P3), and the holder (NOTIF-P4) are
+    # the named floors. See the crate-level note in crates/myelin-notif/src/lib.rs.
+    "crates/myelin-notif",
     # The storage SUBSTRATE crate (P-ST-01 → P-007): the OLTP tier client (harness pool +
     # (tenant, region) RLS guard), and — in later prompts — the KMS hierarchy + BlobStore
     # impls + backup/restore machinery. Sits below -gdpr/-client and ABOVE -substrate in
