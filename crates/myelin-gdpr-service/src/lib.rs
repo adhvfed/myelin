@@ -149,11 +149,38 @@
 //! [`dsr::DsrOrchestrator::posture_gate_refuses`] predicate, and the `now + 1 month` deadline are the
 //! behavioral core every mutation must be caught on (the `cargo mutants` score for this module is recorded in
 //! the commit body — EI-01 §3, stated not hidden).
+//!
+//! ## P-GA-12 (→ P-112) — the data-map-driven checklist + the resumable fan-out + receipts + the legal-hold gate (contract 10.4)
+//! [`fanout`] ships the **DSR fan-out driver** ([`fanout::FanOutDriver`]) — it DRIVES the §4.1
+//! algorithm by tying the DSR spine ([`dsr::DsrOrchestrator`], P-GA-11) + the canonical-order
+//! resumable holder fan-out ([`orchestration::UpstreamHolderOrchestrator`], P-GA-06) + the NEW
+//! **legal-hold gate** ([`fanout::LegalHoldRegistry`], G4) together: (1) it resolves the per-holder
+//! checklist FROM the data map (the map, not a hand-written list, drives the scope — §4.1 step 2);
+//! (2) it applies the **legal-hold gate** (§4.1 step 3 — an erase under an active hold is DEFERRED
+//! *partially*, fail-safe-to-suspend; a read right is never suspended); (3) it **fans the erase out**
+//! through the holder contract in the canonical erase order, idempotently + resumably (the durable
+//! [`orchestration::EraseChecklist`] IS the state — a worker kill re-drives only un-receipted
+//! holders, 0 double-erase); (4) it collects + verifies the receipts and constructs the
+//! **verifiable content-addressed DSR completion receipt** ([`fanout::DsrCompletionReceipt`],
+//! §4.2 — `request_id ∥ holder ∥ scope ∥ outcome ∥ key_epoch_destroyed? ∥ timestamp`); and (5) it
+//! completes the DSR state machine. It REUSES both orchestrators wholesale (EI-01 §7 coherence — no
+//! re-definition of the state machine, the checklist, or the fan-out). **Floors named:** the Merkle
+//! SEAL of the completion receipt into the per-tenant audit tree → **P-GA-20 → P-119** (this prompt
+//! CONSTRUCTS the content-addressed receipt; [`dsr::MerkleProvenBundle::merkle_inclusion`] stays
+//! `None`); the end-to-end erasure PROOF (0 recoverable incl. backups + worker-kill resumability
+//! across a restart) → **P-GA-14 → P-114** (reuses this driver); the multi-cell `member_cells`
+//! iteration → **M5 P-GA-33**; the retention-expiry suspend under a hold (the tightest-policy-wins
+//! retention engine) → **M2 P-GA-22 → P-149** (the GATE is wired here); the durable Postgres
+//! `legal_hold` (G4) / `dsr_receipt` (G2) tables → the same DB floor every M0 in-memory store
+//! carries (P-007). **Mutation floor (P-GA-12 TESTS):** the [`fanout::LegalHoldRegistry::verdict`]
+//! gate, the [`fanout::FanOutDriver::drive`] sequence, and the [`fanout::DsrCompletionReceipt`]
+//! content-address are mandatory-core; the `cargo mutants` score is in the commit body.
 
 pub mod audit;
 pub mod datamap;
 pub mod diffgate;
 pub mod dsr;
+pub mod fanout;
 pub mod holders;
 pub mod orchestration;
 
@@ -170,7 +197,12 @@ pub use diffgate::{
 };
 pub use dsr::{
     resolve_checklist_from_map, ChecklistItem, Dsr, DsrError, DsrId, DsrKind, DsrOrchestrator,
-    DsrState, DsrStatus, Initiator, MerkleProvenBundle, Posture, DSR_DEADLINE_SECS, DSR_STATE,
+    DsrRequestView, DsrState, DsrStatus, Initiator, MerkleProvenBundle, Posture, DSR_DEADLINE_SECS,
+    DSR_STATE,
+};
+pub use fanout::{
+    DsrCompletionReceipt, FanOutDriver, FanOutOutcome, HoldScope, HoldVerdict, LegalHoldRegistry,
+    LEGAL_HOLD_ACTIVE_COUNT,
 };
 pub use holders::{
     gdpr_owned_holder_ids, AuditCarveOutHolder, CryptoShredKms, GdprOwnStoreHolder,
