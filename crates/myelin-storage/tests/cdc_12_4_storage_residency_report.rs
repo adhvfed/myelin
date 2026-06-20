@@ -38,6 +38,14 @@ fn to_cp_class(class: ResidencyStoreClass) -> CpStoreClass {
         ResidencyStoreClass::Blob => CpStoreClass::Blob,
         ResidencyStoreClass::IndexSearch => CpStoreClass::IndexSearch,
         ResidencyStoreClass::Kms => CpStoreClass::Kms,
+        // The T3 firehose archive (P-ST-20 / P-147) is a Storage follow-on store class whose sealed
+        // segments physically rest as content-addressed T2 BLOBS (storage.md §3.3: "sealed segments
+        // flush to the object tier (T2) as content-addressed blobs"). At the control-plane
+        // no-global-pool WIRE it therefore reports under the T2 blob tier — it is not a distinct M1
+        // attestation class (the control-plane M1 set is OLTP/blob/index/KMS). Its residency is
+        // verified Storage-side by `verify_region_pinning` (which checks ANY reported class's region,
+        // so a wrong-region archive FAILs there without a wire change).
+        ResidencyStoreClass::T3FirehoseArchive => CpStoreClass::Blob,
     }
 }
 

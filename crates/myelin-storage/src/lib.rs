@@ -367,6 +367,18 @@
 pub mod backup;
 pub mod blob;
 pub mod encryption;
+// The T3 firehose-archive seam (P-ST-20 / P-147, M2, contract 11.8 sealing + per-tenant-DEK half):
+// the DURABLE archive of the firehose (storage.md §3.3). It RIDES the 3.5 resume-cursor transport
+// (`myelin_events::Firehose`, P-141) — consuming the SAME `Frame`s a live viewer subscribes to —
+// and SEALS frame batches into content-addressed T2 blobs encrypted under the per-tenant DEK
+// (inheriting T2 crypto-shred): a destroyed tenant DEK renders the segment unrecoverable, live AND
+// in backups by construction. Telemetry: `unencrypted_segment_count == 0`,
+// `segment_content_addressed == true`. It REUSES blob (P-047) + DekContentWrap/KmsEngine
+// (P-095/P-058) — never a parallel firehose or key store — and EXTENDS `residency_verify` with the
+// `T3FirehoseArchive` store class. Validated on a NON-CI firehose (a synthetic op-stream). FLOORS
+// NAMED: the CI `(job,step,byte-range)` index (C2) is P-ST-26 (M4); the per-subject CI-log DEK (C1)
+// is P-ST-27 (M4) — a key-class swap on the same DekContentWrap seam.
+pub mod firehose_archive;
 pub mod erase;
 pub mod gd4;
 // The minimal cache seam (Stage 1 / infra — NEW). No cache trait existed before; this is the
@@ -457,6 +469,10 @@ pub use cache::{Cache, CacheError, InMemoryCache};
 pub use coloc::{ColocError, ColocatedOltp, ColocatedTx, COLOCATED_OUTBOX_MIGRATION};
 pub use encryption::{
     key_class_for, ColumnCryptor, DekContentWrap, EncryptedColumn, KeyChoiceError, SubjectId,
+};
+pub use firehose_archive::{
+    segment_pointer_draft, ArchiveError, ArchiveTelemetry, FirehoseArchiver, SealedSegment,
+    SegmentBytes,
 };
 pub use erase::{
     BusErase, CryptoShredErase, EpochMillis, EraseError, EraseHolders, ErasureLedgerSink,
