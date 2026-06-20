@@ -53,3 +53,19 @@ myelin-refs = { path = "../myelin-refs" }
 myelin-tenancy = { path = "../myelin-tenancy" }
 # Principal — the verified subject the holder's locate/erase key on (via SubjectRef).
 myelin-identity = { path = "../myelin-identity" }
+
+# ------------------------------------------------------------------------------------------
+# REAL edge inverse-index schema apply behind the `integration` feature (REF-P5 / P-154). The
+# §3.2 `edge` table migration gets PROVEN against the live dev-stack Postgres (RLS isolation +
+# the three indexes + forward-only) in tests/integration_ref_p5_edge_schema.rs. The OPTIONAL
+# sqlx + tokio deps are pulled ONLY by `--features integration` — the default
+# `cargo build --workspace` / `cargo test --workspace` stay DB-free. These are EXTERNAL crates
+# only; no new myelin edge is added, so refs-service stays the graph's terminal leaf consumer.
+# The test reads DATABASE_URL inline (no myelin-config edge — same posture as identity).
+# ------------------------------------------------------------------------------------------
+sqlx = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+
+[features]
+default = []
+integration = ["dep:sqlx", "dep:tokio"]

@@ -2061,6 +2061,8 @@ dependencies = [
  "myelin-storage",
  "myelin-substrate",
  "myelin-tenancy",
+ "sqlx",
+ "tokio",
 ]
 
 [[package]]
