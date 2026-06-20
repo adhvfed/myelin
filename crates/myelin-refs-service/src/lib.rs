@@ -119,6 +119,30 @@
 //! causality function — the `+1` is still `derive_envelope`; only the ceiling NUMBER is re-stated
 //! (refs-service must not depend on the mid-tier query crate; DOCUMENTED in [`loop_guard`]).
 //!
+//! **REF-P11 (P-160) ships:** the [`backlinks`] module — the **permission-filtered backlink read**
+//! (contract 5.3 OWNED): [`backlinks::BacklinkRead::backlinks`]`(target, viewer, page)` +
+//! [`backlinks::BacklinkRead::edges`]`(ref, viewer)` lower the FROZEN `list_objects` `SetExpr`
+//! (consumed contract 4.3) over the §3.2 `edge.source_root` column (C-4) — `Ids`/`NotIds` →
+//! `IN`/`NOT IN`, `InRelation`/`TupleSet` → JOIN the per-tenant residency-pinned `authz_visible`
+//! reverse index, `Union`/`Intersect`/`Difference` → `AND`/`OR`/`EXCEPT`, `All` → no predicate,
+//! `None` → `WHERE false` — into **ONE** query with **NO N+1** and **NO post-filter**, always
+//! paginated, carrying `WHERE tenant = :viewer.tenant` (no cross-tenant path). The carried zookie
+//! drives the new-enemy guard (4.10): a reverse index BEHIND the zookie's required revision falls
+//! back to per-source `check` rather than serving a stale grant ([`backlinks::watermark_verdict`]).
+//! The query-count (no-N+1) + filter-mode-split (`Ids` vs pushed-down) telemetry fire (1.8). Refs is
+//! one of the five named `SetExpr` consumers — it shares the FROZEN `myelin_identity::SetExpr` enum
+//! (the CONTRACT crate both consume), lowering it over its OWN id column; **no Id signature change**,
+//! and **no dep on identity-service** (the identity-side lowering is a sibling leaf service; the
+//! algebra is restated over `source_root`, the SHAPE pinned identical by tests — DOCUMENTED in
+//! [`backlinks`]). REF-D1 (backlink half: 0 leak), REF-D2 (0 cross-tenant), REF-D6 (no stale allow)
+//! are greened in unit + chained + drill tests; the REAL SQL conjoin (the lowered predicate ANDed
+//! into the `edge_inbound` scan with the live `authz_visible` JOIN) is PROVEN against the live
+//! dev-stack Postgres in `tests/integration_ref_p11_backlink_setexpr.rs` (the `integration` feature).
+//! **FLOOR named:** the read-time scan + filter + pagination is the hot-artifact floor; the
+//! Leopard-style flattened reach index **R4** (the follow-on, promoted at measured hot-fanout > read
+//! budget) is **REF-P23** (R-M5) — "we page them, we don't materialise them" is not the at-scale
+//! answer.
+//!
 //! **Does NOT ship (floors named):**
 //! - **The producers are SYNTHETIC at M2.** REF-P8 exercises the seam with a TEST content writer; the
 //!   first REAL producers (Git diffs / Knowledge blocks / Chat messages writing actual content) land
@@ -151,6 +175,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod backlinks;
 pub mod dek;
 pub mod edge_builder;
 pub mod emit;
@@ -162,6 +187,12 @@ pub mod migration;
 pub mod residency;
 pub mod resolve;
 
+pub use backlinks::{
+    ids_result, lower_over_source_root, set_expr_admits, source_root_colref, view_permission,
+    watermark_verdict, AuthzJoin, AuthzVisibleIndex, Backlink, BacklinkError, BacklinkPage,
+    BacklinkRead, BoundParam, FilterMode, SourceRootFilter, WatermarkVerdict,
+    AUTHZ_VISIBLE_TABLE, FILTER_MODE_SPLIT_SIGNAL, SOURCE_ROOT_COLUMN,
+};
 pub use dek::{ref_p5_inherited_gates, InheritedGate, RefsDekPin};
 pub use edge_builder::{
     edge_id, EdgeProjection, EdgeRow, ProjectError, RefsEdgeBuilder, RelClass,

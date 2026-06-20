@@ -259,6 +259,39 @@ impl EdgeProjection {
         let pk = PartKey { tenant: tenant.clone(), region: region.clone() };
         self.lock().get(&pk).map(|p| p.len()).unwrap_or(0)
     }
+
+    /// **The LIVE inbound edges to `target_root` in the `(tenant, region)` partition (the
+    /// `edge_inbound WHERE NOT tombstoned` range scan — §3.2).** This is the row source the REF-P11
+    /// permission-filtered backlink read scans ONCE: tenant-first (no cross-tenant path), live edges
+    /// only, keyed on the §3.2 stored `target_root` column (so "all backlinks to this artifact AND its
+    /// sub-artifacts" is one range scan, not a `LIKE` prefix). Ordering is deterministic by `edge_id`
+    /// for the in-memory model (the real Postgres `edge` table uses `ORDER BY created_at DESC`; the
+    /// in-memory model has no `created_at` column — documented). The SetExpr/pagination are applied by
+    /// [`crate::backlinks`] over this set — this method does NOT filter by permission (the permission
+    /// filter is the lowered SetExpr the backlink read conjoins; this is the unfiltered candidate
+    /// range the conjoin runs over, never returned raw to a caller).
+    pub fn inbound_live(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+        target_root: &ArtifactRef,
+    ) -> Vec<EdgeRow> {
+        let pk = PartKey { tenant: tenant.clone(), region: region.clone() };
+        let mut rows: Vec<EdgeRow> = self
+            .lock()
+            .get(&pk)
+            .map(|p| {
+                p.values()
+                    .filter(|r| !r.tombstoned && &r.target_root == target_root)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Deterministic order (the real table orders by `created_at DESC`; the in-memory model has no
+        // timestamp, so order by the deterministic `edge_id` for a stable, reproducible scan).
+        rows.sort_by(|a, b| a.edge_id.cmp(&b.edge_id));
+        rows
+    }
 }
 
 /// Why a `refs.edge.*` / typed-lifecycle event could not be projected — a structurally-malformed
