@@ -5,6 +5,18 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+# SRCH-P03 (P-166, M2): the Search service is a `serve(AppSpec)` shell (contract 1.1) — the binary
+# below is the "every service main.rs" the row names: it does nothing but hand the Search AppSpec to
+# the harness's one call (NOT a hand-rolled lifecycle). The library carries the shell builder
+# (`search_app_spec` / `run_search`), the encrypted-from-birth per-tenant index layout, the S1–S5
+# register, and the SRCH-P01/P02 anchors/holder/DEK.
+[[bin]]
+name = "search"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
 # myelin-search is a CONSUMER crate (architecture §0/§1): it owns no contract crate and
 # holds only derived, reconstructible state. At M0 (SRCH-P01 → P-021) it carries ONLY the
 # index-document NAME ANCHORS aligned to the frozen EventEnvelope (contract 2.1) + ArtifactRef
@@ -48,6 +60,23 @@ myelin-identity = { path = "../myelin-identity" }
 # value, and confirms the search-requires-acl-filter lint (its home is the shared myelin-lints
 # ratchet crate; SRCH-P01 confirms it in place rather than duplicating it — EI-01 §7). The lint crate
 # is not a production dependency; it is the harness the lint proof runs against.
+
+# ------------------------------------------------------------------------------------------
+# SRCH-P03 (P-166, M2): the per-tenant index-directory forward-only migration (contract 1.5)
+# gets PROVEN against the live dev-stack Postgres in tests/integration_srch_p03_index_directory.rs
+# (the CREATE applies forward-only; the (tenant, region) PK keys per-tenant directories; the
+# migration is non-destructive). The OPTIONAL sqlx + tokio deps are pulled ONLY by
+# `--features integration` — the default `cargo build --workspace` / `cargo test --workspace` stay
+# DB-free. EXTERNAL crates only; no new myelin edge — Search stays a terminal leaf consumer. The
+# test reads DATABASE_URL inline (no myelin-config edge — same posture as refs-service/identity).
+# ------------------------------------------------------------------------------------------
+sqlx = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+
+[features]
+default = []
+integration = ["dep:sqlx", "dep:tokio"]
+
 [dev-dependencies]
 myelin-lints = { path = "../myelin-lints" }
 serde_json = { workspace = true }
