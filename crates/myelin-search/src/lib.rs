@@ -110,6 +110,7 @@
 //! reindex** is the follow-on, landing in **SRCH-P15** once the index exists; the DEK is NOT the
 //! whole erasure answer. No index / layout / migration / real ciphertext / real vectors ship here.
 
+pub mod analysis;
 pub mod compiler;
 pub mod consistency;
 pub mod dek;
