@@ -1,0 +1,50 @@
+[package]
+name = "myelin-issues"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# myelin-issues is a CONSUMER SUBSYSTEM crate (the most cross-subsystem-coupled of the five —
+# architecture issue-tracker 00-overview §1), NOT a node in the eleven-crate library DAG modelled
+# by `myelin-substrate::crate_graph` (architecture 00 §2.9). Like the other subsystem/service
+# crates (myelin-git, myelin-identity-service, myelin-gdpr-service) it is a LEAF CONSUMER above the
+# shared glue crates: it depends on the frozen contract surfaces (identity NamespaceFragment +
+# Principal, gdpr PersonalDataHolder + the #[personal_data] classify-derive, tenancy partition keys)
+# and NOTHING in the production library DAG depends back on it. `substrate_is_root()` /
+# `identity_is_sink()` in crate_graph.rs are preserved (a subsystem crate is the graph's terminal
+# consumer, OUTSIDE the modelled DAG).
+#
+# At ISS-P01 (P-125 / M1) this crate carries ONLY the M1 "freeze-so-dependents-compile" slice
+# (issue-tracker roadmap §3.0): the frozen Issues ReBAC namespace fragment (contract 4.9 — the
+# `issue` namespace + the `- confidential` set-difference userset + `watcher` + the field/transition
+# ABAC sub-objects) Identity compiles into the one cell schema, PLUS the H-Issues holder INTENT +
+# the #[personal_data(...)] classification tags on the skeletal issue schema (contract 10.2 — incl.
+# the OQ-H worklog/productivity behavioural tags) so the no-untagged-personal-data lint (contract
+# 1.6) is GREEN from the first migration (ISS-P05). No Issues FEATURE ships here — the holder is
+# OPENED + auto-registered by serve when the store opens in ISS-P07.
+[dependencies]
+# The frozen Identity contract surface: the names-only `NamespaceFragment` ABI carrier Identity
+# admits into the cell schema (contract 4.9) + Principal (the verified subject the holder keys on).
+# A consumer LEAF depending on the identity GLUE crate (not the service) keeps the §2.9 DAG acyclic.
+myelin-identity = { path = "../myelin-identity" }
+# The GDPR contract surface: contract 10.1 PersonalDataHolder + contract 10.2 the #[personal_data]
+# classify-derive + the five frozen tag enums. Consumed (the H-Issues INTENT + the schema tags), not
+# provided here.
+myelin-gdpr = { path = "../myelin-gdpr" }
+# The canonical (tenant, region) partition keys threaded through every issue schema row + ArtifactRef.
+myelin-tenancy = { path = "../myelin-tenancy" }
+serde.workspace = true
+
+# DEV-ONLY: the rich ReBAC namespace ENGINE (FragmentDef / Userset / StoreBackedCheck) lives in the
+# Identity SERVICE crate. The runtime Issues fragment is the names-only `myelin_identity::Namespace-
+# Fragment` ABI carrier (above) — a consumer subsystem never depends on a service crate at runtime
+# (the §2.9 DAG stays acyclic). The contract-4.9 CDC pair (tests/cdc_4_9_issues_fragment.rs) needs
+# the real engine to PROVE the Issues fragment admits + that the `- confidential` set-difference
+# userset resolves LEAK-FREE (a confidential issue is absent from view for a non-grantee) — so the
+# engine is a dev-dependency (test scaffolding only — no runtime edge). EI-01 §7: prove against the
+# frozen engine, never re-define it.
+[dev-dependencies]
+myelin-identity-service = { path = "../myelin-identity-service" }
+myelin-storage = { path = "../myelin-storage" }
+myelin-events = { path = "../myelin-events" }

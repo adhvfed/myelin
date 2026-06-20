@@ -308,10 +308,17 @@ title = "per-subsystem ReBAC namespace fragment (engine + admit-contract + core 
 # as-relations + approve_untrusted_ci + watcher) is GIT-P1 / P-123 — its CDC declares the Git
 # fragment (CONSUMER) + admits it through the real engine (PROVIDER), proving it COMPILES into the
 # cell schema (the GIT-P1 gate) and its rewrites are admissible (wired LIVE in GIT-P13 / P-ID-24).
+# The ISSUES fragment SLICE (the `issue` namespace + the `- confidential` set-difference userset +
+# `watcher` + the field/transition ABAC sub-objects) is ISS-P01 / P-125 — its CDC declares the
+# Issues fragment (CONSUMER) + admits it through the real engine (PROVIDER), proving it COMPILES into
+# the cell schema (the ISS-P01 gate) AND that the `- confidential` set-difference resolves LEAK-FREE
+# (a confidential issue is absent from view for a non-grantee; the rewrites wired LIVE on Id's M2
+# CaveatContext/list_objects bodies, ISS-P11 / P-ID-*).
 status = "covered"
 cdc = [
     "crates/myelin-identity-service/tests/cdc_4_9_namespace_engine.rs",
     "crates/myelin-git/tests/cdc_4_9_git_fragment.rs",
+    "crates/myelin-issues/tests/cdc_4_9_issues_fragment.rs",
 ]
 
 [[contract]]

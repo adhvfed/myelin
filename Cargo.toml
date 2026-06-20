@@ -57,6 +57,20 @@ members = [
     # depends back on it; substrate_is_root()/identity_is_sink() are preserved. The holder is
     # OPENED + auto-registered by serve in GIT-P8 (M3-G1); no git feature ships at P-063.
     "crates/myelin-git",
+    # The Issue-tracker SUBSYSTEM crate (ISS-P01 → P-125 / M1). The most cross-subsystem-coupled
+    # consumer subsystem (architecture issue-tracker 00-overview §1). At M1 it carries ONLY the
+    # "freeze-so-dependents-compile" slice (roadmap §3.0): the frozen Issues ReBAC namespace fragment
+    # (contract 4.9 — the `issue` namespace + the `- confidential` set-difference userset + `watcher`
+    # + the field/transition ABAC sub-objects) Identity compiles into the one cell schema, PLUS the
+    # H3 holder INTENT + the #[personal_data(...)] classification tags on the skeletal issue schema
+    # (contract 10.2 — incl. the OQ-H worklog/productivity behavioural tags, basis = TBD_LEGAL) so
+    # the no-untagged-personal-data lint (contract 1.6) is GREEN from the first migration (ISS-P05).
+    # Like the other subsystem/service crates (myelin-git, myelin-identity-service) it is a LEAF
+    # CONSUMER above the glue crates (depends on -identity/-gdpr/-tenancy) and is NOT a node in the
+    # eleven-crate library DAG modelled by crate_graph.rs — nothing in the production DAG depends back
+    # on it; substrate_is_root()/identity_is_sink() are preserved. No Issues FEATURE ships at P-125;
+    # the holder is OPENED + auto-registered by serve in ISS-P07. See crates/myelin-issues/src/lib.rs.
+    "crates/myelin-issues",
     # The Refs SERVICE/SUBSYSTEM crate (REF-P3 → P-120). Distinct from the `myelin-refs` GLUE
     # crate (the ArtifactRef value type + #sub codec, a MODELLED node in the eleven-crate library
     # DAG that MUST NOT depend on -gdpr). Like the other service/subsystem crates
