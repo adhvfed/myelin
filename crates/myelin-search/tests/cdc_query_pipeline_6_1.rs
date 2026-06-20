@@ -37,7 +37,8 @@ use myelin_tenancy::TenantId;
 
 use myelin_search::{
     query, FieldDecl, FieldSchema, IndexBackend, IndexDocument, ListObjectsPort, Page, QueryError,
-    QueryStats, ScopedEngine, TantivyBackend, FT_BODY_FIELD, ORDER_KEY_FIELD,
+    QueryStats, RelationalLeaf, ReverseIndexAnswer, RevisionWatermark, ScopedEngine, TantivyBackend,
+    FT_BODY_FIELD, ORDER_KEY_FIELD,
 };
 
 fn var(name: &str) -> Expr {
@@ -93,10 +94,22 @@ fn ast() -> QueryAst {
 struct ScriptedAuthz {
     answer: ListObjectsResult,
     calls: AtomicU64,
+    /// The canned reverse-index JOIN answer (SRCH-P09) — `None` if the test exercises only the
+    /// bounded-set path (then a relational leaf fails closed via the default `resolve_relation`).
+    reverse: Option<ReverseIndexAnswer>,
+    resolve_calls: AtomicU64,
 }
 impl ScriptedAuthz {
     fn new(answer: ListObjectsResult) -> ScriptedAuthz {
-        ScriptedAuthz { answer, calls: AtomicU64::new(0) }
+        ScriptedAuthz { answer, calls: AtomicU64::new(0), reverse: None, resolve_calls: AtomicU64::new(0) }
+    }
+    fn with_reverse(answer: ListObjectsResult, reverse: ReverseIndexAnswer) -> ScriptedAuthz {
+        ScriptedAuthz {
+            answer,
+            calls: AtomicU64::new(0),
+            reverse: Some(reverse),
+            resolve_calls: AtomicU64::new(0),
+        }
     }
 }
 impl ListObjectsPort for ScriptedAuthz {
@@ -113,6 +126,17 @@ impl ListObjectsPort for ScriptedAuthz {
         assert_eq!(ty, &ObjectType("issue".into()), "the object type is forwarded verbatim");
         self.calls.fetch_add(1, Ordering::Relaxed);
         Ok(self.answer.clone())
+    }
+    fn resolve_relation(
+        &self,
+        _subject: &Principal,
+        _form: &RelationalLeaf,
+        _required: &RevisionWatermark,
+    ) -> AuthzResult<ReverseIndexAnswer> {
+        self.resolve_calls.fetch_add(1, Ordering::Relaxed);
+        self.reverse
+            .clone()
+            .ok_or_else(|| myelin_identity::AuthzError::Unavailable("no reverse index".into()))
     }
 }
 
@@ -212,18 +236,60 @@ fn cdc_6_1_cross_tenant_zero() {
     assert_eq!(stats.engine_branches(), 0, "0 cross-tenant engine touches");
 }
 
-/// **CONSUMER 4.3 (the relational floor): a relational `SetExpr` form is a loud SRCH-P09 floor, never
-/// a silent widen to All.**
+/// **CONSUMER 4.3 (the SRCH-P09 relational reverse-index JOIN): a `TupleSet` form resolves through
+/// the per-tenant authz reverse index to the visible-id set (an `Ids` membership clause) — one JOIN,
+/// honouring the revision watermark — never a silent widen to All.**
 #[test]
-fn cdc_4_3_relational_form_is_a_named_floor() {
+fn cdc_4_3_relational_tuple_set_joins_the_reverse_index() {
     use myelin_identity::AuthzIndexRef;
     let be = corpus();
-    let answer = ListObjectsResult::Filter {
-        set_expr: SetExpr::TupleSet { index: AuthzIndexRef("ix".into()) },
-        zookie: Zookie("z".into()),
-    };
-    let (res, _, _) = run(&be, answer, &viewer("acme"));
-    let err = res.expect_err("a relational SetExpr is the SRCH-P09 floor");
-    assert!(matches!(err, QueryError::RelationalSetExpr { .. }));
-    assert!(err.to_string().contains("SRCH-P09"), "the floor names its follow-on");
+    let eng = ScopedEngine::new(&be, "acme", "eu-west", schema());
+    // The reverse-index JOIN resolves ONLY PUB-1 at revision 4; the watermark from `z@4` is 4.
+    let authz = ScriptedAuthz::with_reverse(
+        ListObjectsResult::Filter {
+            set_expr: SetExpr::TupleSet { index: AuthzIndexRef("authz_visible".into()) },
+            zookie: Zookie("z@4".into()),
+        },
+        ReverseIndexAnswer {
+            object_ids: vec!["acme/issue/PUB-1".into()],
+            revision: RevisionWatermark(4),
+        },
+    );
+    let stats = QueryStats::new();
+    let res = query(&eng, &authz, &ast(), &viewer("acme"), &ObjectType("issue".into()),
+        &consistency(), Page::FIRST, &stats).expect("the relational JOIN resolves");
+    assert_eq!(
+        res.hits.iter().map(|h| h.doc_id.as_str()).collect::<Vec<_>>(),
+        ["acme/issue/PUB-1"],
+        "the JOIN resolves to the visible-id set; the confidential doc never surfaces"
+    );
+    assert_eq!(authz.resolve_calls.load(Ordering::Relaxed), 1, "exactly ONE reverse-index JOIN (no N+1)");
+    assert_eq!(authz.calls.load(Ordering::Relaxed), 1, "and exactly one list_objects");
+}
+
+/// **CONSUMER 4.3 / contract 4.10 (the revision watermark): a reverse-index revision STALER than the
+/// `list_objects` watermark is refused (StaleReverseIndex) — never read stale (SRCH-P09; the full
+/// fail-static path is SRCH-P10).**
+#[test]
+fn cdc_4_10_stale_reverse_index_revision_is_refused() {
+    use myelin_identity::AuthzIndexRef;
+    let be = corpus();
+    let eng = ScopedEngine::new(&be, "acme", "eu-west", schema());
+    // The zookie requires watermark 9; the reverse index serves a stale revision 3.
+    let authz = ScriptedAuthz::with_reverse(
+        ListObjectsResult::Filter {
+            set_expr: SetExpr::TupleSet { index: AuthzIndexRef("ix".into()) },
+            zookie: Zookie("z@9".into()),
+        },
+        ReverseIndexAnswer {
+            object_ids: vec!["acme/issue/PUB-1".into()],
+            revision: RevisionWatermark(3),
+        },
+    );
+    let stats = QueryStats::new();
+    let res = query(&eng, &authz, &ast(), &viewer("acme"), &ObjectType("issue".into()),
+        &consistency(), Page::FIRST, &stats);
+    let err = res.expect_err("a stale reverse-index revision is refused (4.10)");
+    assert!(matches!(err, QueryError::StaleReverseIndex { .. }), "the stale revision is loud");
+    assert!(err.to_string().contains("4.10"), "the error names the watermark contract");
 }
