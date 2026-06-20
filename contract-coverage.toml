@@ -141,8 +141,13 @@ cdc = ["crates/myelin-events/tests/cdc_2_5_consumer_dedup.rs"]
 [[contract]]
 row = "2.6"
 title = "reindex-from-source"
-status = "deferred"
-landing = "P-142"
+status = "covered"
+# EB-22/P-142 ships the Bus's OWNED reindex-from-source seam (events::reindex(scope)) + the
+# *.snapshot schema (deterministic event_id from (aggregate, version)) + a reference derived-store
+# consumer proving cold == live (BUS-D5). The per-OWNER `replay` bodies (CI one-run, KN page-subtree
+# at block granularity, Refs per-blob, Search full reindex) land with each owner in EB-26/P-246 (M3)
+# + the owners' M3/M4 prompts — the named floor; this row is the SEAM + schema CDC pair.
+cdc = ["crates/myelin-events/tests/cdc_2_6_reindex.rs"]
 
 [[contract]]
 row = "2.7"

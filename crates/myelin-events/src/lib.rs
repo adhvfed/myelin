@@ -261,6 +261,30 @@
 //! cross-seam restore TRIGGER (Storage calling every holder's re-erase over the global ledger) is
 //! **P-ST-14 (P-100)** + **P-GA-06 (P-106)**. This completes B-M1 for the Bus.
 //!
+//! ## Status (P-142 / EB-22, 2026-06-20) — the reindex-from-source seam + the `*.snapshot` schema
+//! EB-22 ships [`reindex`] — the **only** recovery path for every derived store (Search, Refs, OLAP,
+//! Notif read-models): the index NEVER reads an owner DB; it asks each owner to **re-emit through
+//! the live consumer path** ([`reindex::reindex`] = §5.6 `events::reindex(scope)`), so steady-state
+//! (live events) and recovery (snapshots) are ONE code path and cannot drift (EI-04 §5.3, contract
+//! **2.6 OWNED**). A `*.snapshot` ([`reindex::SnapshotDraft`]) carries the SAME envelope shape as the
+//! live event but a **deterministic `event_id` from `(aggregate, version)`** ([`reindex::snapshot_event_id`]),
+//! so re-running a reindex is idempotent — the outbox `UNIQUE(event_id)` skips a duplicate
+//! (`ON CONFLICT DO NOTHING`; [`reindex::reindex`] reports it as skipped-duplicate) and the
+//! consumer's [`DedupLedger`] no-ops a redelivered snapshot. The scope ([`reindex::SnapshotScope`])
+//! is **sub-artifact-granular + PII-free** (CI one-run `ci:run:<id>`, KN page-subtree at block
+//! granularity `knowledge:page:<id>`). This seam is FOUR paths in one: recovery, the schema-upcaster
+//! backfill, the new-consumer bootstrap, AND the `resync_required` fallback target for the firehose
+//! resume-cursor protocol ([`firehose`], EB-21 / P-141 — an out-of-window `last_seq` raises
+//! `resync_required`, the client falls back to a `*.snapshot` replay this seam produces). The
+//! **BUS-D5** `cold == live` drill (`tests/drills_bus_d5_reindex.rs`) wipes a derived store, reindexes,
+//! and asserts the rebuild is BYTE-IDENTICAL to the live projection (proven on the reference
+//! [`reindex::DerivedStore`] + [`reindex::ReferenceReindexSource`]); the 2.6 CDC pair is
+//! `tests/cdc_2_6_reindex.rs` (the coverage manifest flips 2.6 `deferred → covered`). **FLOOR named
+//! (EI-01 §1):** each OWNER's real `replay` body (CI one-run, KN page-subtree at block granularity,
+//! Refs per-blob, Search full reindex) lands with that subsystem in **EB-26 (P-246, M3)** + the
+//! owners' M3/M4 prompts (`coverage-matrix` rows 2.6 / 4.x / 5.x); this prompt ships the SEAM + the
+//! `*.snapshot` schema + the reference consumer the BUS-D5 drill runs against.
+//!
 //! ## Floors named (stubbed bodies → filling prompt)
 //! - **The OLTP binding is modeled in-memory at M0.** There is no live database (the OLTP tier
 //!   client is **P-007 / P-ST-01**; the migration runner is **P-S15**). [`outbox::OUTBOX_MIGRATION`]
@@ -316,6 +340,7 @@ pub mod nats;
 pub mod outbox;
 pub mod partition;
 pub mod reerase;
+pub mod reindex;
 pub mod relay;
 pub mod residency;
 pub mod taxonomy;
@@ -390,6 +415,24 @@ pub use reerase::{BusErasureLedger, ErasedSubject, ReErasureReceipt};
 pub use holder::{
     degrade_on_tombstone, BusEventLog, BusHolder, EraseReceipt, ExportedEvent, InMemoryShredder,
     InlinePiiShredder, LocateReport, LocatedEvent, ShredError, BUS_ERASED_TYPE, ERASED_EVENT_NAME,
+};
+
+/// The reindex-from-source seam + the `*.snapshot` event schema (contract 2.6 OWNED, EB-22 / P-142).
+/// [`reindex::reindex`] is the §5.6 `events::reindex(scope)` surface: ask the OWNER of a
+/// sub-artifact-granular [`reindex::SnapshotScope`] to `replay(scope, since)`, then emit each
+/// `*.snapshot` through the SAME outbox→bus→live-consumer path (no backdoor). A `*.snapshot` carries
+/// the live envelope shape and a DETERMINISTIC `event_id` from `(aggregate, version)`
+/// ([`reindex::snapshot_event_id`]), so a re-run is an idempotent no-op (the outbox `UNIQUE(event_id)`
+/// and the consumer's `consumer_dedup` ledger both absorb the duplicate). This is the recovery path,
+/// the upcaster-backfill path, the new-consumer-bootstrap path, and the `resync_required` fallback
+/// target for the firehose ([`firehose`], EB-21). [`reindex::DerivedStore`] and
+/// [`reindex::ReferenceReindexSource`] are the small reference consumer the BUS-D5 `cold == live`
+/// drill proves byte-parity over. FLOOR: each OWNER's real `replay` body (CI one-run, KN
+/// page-subtree at block granularity, Refs per-blob, Search full reindex) lands with that subsystem
+/// in EB-26 (P-246, M3) and the owners' M3/M4 prompts.
+pub use reindex::{
+    reindex, snapshot_event_id, DerivedStore, ReferenceReindexSource, ReindexError, ReindexReceipt,
+    ReindexSource, SnapshotDraft, SnapshotScope, SNAPSHOT_EVENT_NAME,
 };
 
 use serde::{Deserialize, Serialize};
