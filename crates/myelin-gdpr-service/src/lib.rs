@@ -230,6 +230,34 @@
 //! [`erasure_ledger::ErasureLedger::post_pit_records_after`] re-erasure-trigger read (the
 //! `completed_at_offset > pit` selection) are mandatory-core; the `cargo mutants` score is in the
 //! commit body.
+//!
+//! ## P-GA-16 (→ P-116) — the ONE free-text/immutable erasure posture (X-7) written ONCE (contract 10.9)
+//! [`posture`] ships the **single canonical artifact** for the free-text / immutable-content erasure
+//! posture ([`posture::CANONICAL_POSTURE`]) — the keystone X-7 deliverable. The same legal seam was
+//! named five times (Git immutable bytes, CI log PII, Issues/Knowledge/Chat free-text); this is the
+//! ONE platform-wide posture, instantiated per subsystem **BY REFERENCE, never restated five times**
+//! (gdpr §7.4). The artifact states: the **structural floor** (the three §7.1 levers —
+//! [`posture::StructuralLever`]: per-subject DEK crypto-shred (11.4) + pseudonym-map shred (4.8) +
+//! `restrict` suppression (10.1), all built, no legal dependency); the **residual** (§7.2 —
+//! third-party / immutable free-text PII authored by *others*, encrypted under the AUTHOR's DEK not
+//! the subject's, so NOT crypto-shreddable by the subject's key — the documented limit, not a
+//! defect); and the **ratified engineering posture** (§7.3 — the documented lawful-basis limit +
+//! best-effort `rectify`/tombstone + the standing `restrict` guarantee). The residual ratification
+//! is the **`[OPEN — LEGAL]`** tag ([`posture::LegalStatus::OpenLegal`]) — **ONE statement, not
+//! five** — and the structural floor ships regardless ([`posture::ErasurePosture::structural_floor_ships`]).
+//! [`posture::ErasurePosture::render`] emits the doc text the artifact GENERATES. The GATE is the
+//! **architecture-test scaffolding** that the posture is a SINGLE source: a subsystem erasure
+//! section must REFERENCE the anchor ([`posture::POSTURE_ANCHOR`]) and **never restate** the posture
+//! ([`posture::reference_is_by_reference`] — rejects a section that contains a canonical marker
+//! phrase, the X-7 anti-pattern). **Floors named:** the structural-floor PROOF on the M1 stores →
+//! **P-GA-17 → P-117**; the pseudonymous-by-default commit-identity prerequisite for Git →
+//! **P-GA-18 → P-118**; the audited history-rewrite erasure path → **M5 P-GA-35**; the per-subsystem
+//! reference ASSERTIONS fire when the M3/M4 instances register references (Git first, the consumer
+//! half of the 10.9 CDC pair → **P-GA-28 → P-256/P-257**; CI/Issues/Knowledge/Chat → P-GA-29/-31);
+//! the residual lawful-basis ratification (`[OPEN — LEGAL]` → ratified) is **parallel-legal** (the
+//! DPO ratifies; the structural floor ships regardless). **Mutation floor:** none — a documented
+//! canonical artifact, not core logic (NAMED per the prompt TESTS); the one behavioral predicate
+//! ([`posture::reference_is_by_reference`]) is unit-covered.
 
 pub mod audit;
 pub mod datamap;
@@ -239,6 +267,7 @@ pub mod erasure_ledger;
 pub mod fanout;
 pub mod holders;
 pub mod orchestration;
+pub mod posture;
 pub mod tenant_ops;
 
 pub use audit::{
@@ -273,5 +302,9 @@ pub use orchestration::{
     canonical_phase_of, holder_ids, CanonicalErasePhase, EraseChecklist, HolderReceipt,
     RegisteredHolder, SeamHolder, UpstreamHolderOrchestrator, CRYPTO_SHRED_LAG,
     ERASURE_FANOUT_COVERAGE,
+};
+pub use posture::{
+    reference_is_by_reference, restatement_markers, ErasurePosture, LegalStatus, StructuralLever,
+    SubsystemReference, CANONICAL_POSTURE, POSTURE_ANCHOR, POSTURE_CONTRACT_ROW,
 };
 pub use tenant_ops::{OffboardingCertificate, TenantDsrError, TenantDsrSurface};

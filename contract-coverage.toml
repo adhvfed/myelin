@@ -638,8 +638,17 @@ landing = "P-115"
 [[contract]]
 row = "10.9"
 title = "the ONE free-text / immutable-content erasure posture"
-status = "deferred"
-landing = "P-116"
+status = "covered"
+# P-116 (GA-16): the ONE free-text/immutable erasure posture written ONCE as the single canonical
+# artifact (myelin-gdpr-service::posture::CANONICAL_POSTURE) — structural floor (§7.1) + residual
+# (§7.2) + the [OPEN — LEGAL] ratified posture (§7.3), instantiated per subsystem BY REFERENCE. The
+# CDC pair: the PROVIDER side (the posture as OWNED) is COMPLETE here; the CONSUMER side is the
+# by-reference subsystem-section SHAPE (a Git-like reference) — the REAL subsystem-reference
+# consumer (over the real M3/M4 docs) lands in P-GA-28 → P-256/P-257 (Git) and P-GA-29/-31
+# (CI/Issues/Knowledge/Chat), at which point the `references-it-never-restates` architecture
+# assertion fires over the real subsystem docs. The structural-floor PROOF on the M1 stores is
+# P-GA-17 → P-117; the pseudonymous-by-default commit prerequisite is P-GA-18 → P-118.
+cdc = ["crates/myelin-gdpr-service/tests/cdc_10_9_erasure_posture.rs"]
 
 # ──────────────── §11 Storage — tiers / BlobStore / KMS / reserve-settle / backup-restore ───────
 
