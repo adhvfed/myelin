@@ -59,6 +59,13 @@ pub use signals::{
     Severity, Signal, SignalEngine, SignalRule, SignalState,
 };
 
+pub mod automations;
+pub use automations::{
+    register_automation, Action, ActionKind, AutomationEngine, AutomationId, AutomationRule,
+    Budget, Delegation, DurableExecutor, DurableHandle, ExecutorError, Gate, InMemoryExecutor,
+    Outcome, RunAs, StartedRun, WorkflowRef,
+};
+
 /// The static cost ceiling: the maximum number of AST nodes a [`QueryAst`] may contain. A
 /// predicate exceeding this is **rejected before evaluation** ([`QueryAst::validate`]) — a
 /// crafted matcher can never present an unboundedly large tree to the interpreter. The
