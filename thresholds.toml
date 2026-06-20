@@ -134,6 +134,20 @@ soft = 12
 hard = 16
 
 # ---------------------------------------------------------------------------------------------
+# [refs_traverse] — the Refs recursive-CTE traverse bounds (REF-P13 / P-162; contract 5.3,
+# reference-graph §4.5). The bounded, cycle-safe `WITH RECURSIVE` walk reads its DEPTH CEILING
+# (default 16) + its collected-node budget (the partial-result truncation point, X-3) from HERE —
+# the single source of truth, no hardcoded magic in the traverse. This is the GRAPH-HOP ceiling,
+# DISTINCT from [depth_ceilings] (the agent CAUSAL depth, contract 1.11): a deep dependency tree is
+# not a runaway agent loop. These ARE the seed constants in
+# `myelin_refs_service::traverse::{TRAVERSE_DEPTH_CEILING, TRAVERSE_MAX_NODES}`. Keyed on contract
+# 5.3. `max_nodes` is a default-to-beat re-measured at world-scale (REF-P22).
+# ---------------------------------------------------------------------------------------------
+[refs_traverse]
+depth_ceiling = 16
+max_nodes = 10000
+
+# ---------------------------------------------------------------------------------------------
 # [authz_index] — the S8 authz-reverse-index measured tunables (P-ID-11 / P-069, identity §7.1).
 # The Ids↔Filter SHAPE is FROZEN (small reachable sets materialise as `Ids`, large ones push down as
 # `Filter`); only the NUMBER — the cardinality cap that switches between them — is open. This is the

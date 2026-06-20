@@ -97,6 +97,13 @@ pub struct Thresholds {
     /// thresholds file (pre-P-GA-21) still parses (the rows fall back to the Art. 12(3) seed).
     #[serde(default)]
     pub dsr: DsrDeadline,
+    /// The Refs recursive-CTE traverse bounds (REF-P13 / contract 5.3 — the traverse depth ceiling +
+    /// the collected-node budget the `WITH RECURSIVE` walk truncates at). DISTINCT from
+    /// [`DepthCeilings`] (those are the agent CAUSAL depth, contract 1.11; this is the GRAPH-HOP
+    /// traverse ceiling, architecture §4.5 default 16). `#[serde(default)]` so an older thresholds
+    /// file (pre-REF-P13) still parses (the bounds fall back to the §4.5 seed).
+    #[serde(default)]
+    pub refs_traverse: RefsTraverse,
     /// The scorecard: drills that came back red live here, never edited green (EI-01 §3).
     #[serde(default)]
     pub claimed_not_proven: Vec<ClaimedNotProven>,
@@ -232,6 +239,38 @@ impl Default for DsrDeadline {
             deadline_secs: 30 * 24 * 60 * 60,
             warning_margin_secs: 7 * 24 * 60 * 60,
             extension_total_secs: 90 * 24 * 60 * 60,
+        }
+    }
+}
+
+/// The Refs recursive-CTE traverse bounds (REF-P13 / P-162; contract 5.3; architecture §4.5).
+///
+/// The bounded, cycle-safe `WITH RECURSIVE` walk over the `edge` adjacency list reads its DEPTH
+/// CEILING (default 16, §4.5) + its COLLECTED-NODE budget (the max distinct nodes a single traverse
+/// may visit before it returns a PARTIAL result + a `truncated` marker, never an unbounded scan,
+/// X-3) from HERE — the single source of truth, no hardcoded magic number in the traverse. This is
+/// the GRAPH-HOP ceiling, DISTINCT from the agent CAUSAL [`DepthCeilings`] (contract 1.11): a deep
+/// dependency tree is not a runaway agent loop. `#[serde(default)]` + [`Default`] so an older file
+/// parses (falls back to the §4.5 seed). Mirrors `myelin_refs_service::traverse::TRAVERSE_DEPTH_CEILING`
+/// (the seed constant); this file is its source of truth.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefsTraverse {
+    /// The traverse depth ceiling (§4.5 default 16): the walk stops descending past this many hops
+    /// from the root and marks the result `truncated`. Never an unbounded scan.
+    pub depth_ceiling: u32,
+    /// The collected-node budget (X-3): the max distinct nodes a single traverse may visit before it
+    /// returns a PARTIAL result + a `truncated` marker. Bounds a wide (high-fan-out) graph the depth
+    /// ceiling alone would not. Default-to-beat seed; re-measured at world-scale (REF-P22).
+    pub max_nodes: u32,
+}
+
+impl Default for RefsTraverse {
+    /// The §4.5 seed: a depth ceiling of 16, a collected-node budget of 10 000 (the default-to-beat
+    /// a single bounded traverse stays under; re-measured at world-scale in REF-P22).
+    fn default() -> Self {
+        RefsTraverse {
+            depth_ceiling: 16,
+            max_nodes: 10_000,
         }
     }
 }
