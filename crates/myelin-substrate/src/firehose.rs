@@ -264,6 +264,29 @@ impl FrameBuffer {
         }
     }
 
+    /// **Note a frame that was offered but shed BEFORE taking a buffer slot (P-S29 §7.6 class shed).**
+    /// The scope-bounded selector (P-S29) may shed a frame by its per-surface CLASS budget without ever
+    /// occupying a per-connection slot. That frame still advanced the producer — so its seq must still
+    /// advance the lag, or a class-shedding-but-stalled consumer would look like it kept up (the
+    /// slow-consumer drop would never fire). This advances `offered_seq` and applies the slow-consumer
+    /// drop check (§7.7 (b)) WITHOUT taking a slot: the consumer is dropped to `resync_required` once the
+    /// lag reaches the ceiling, exactly as in [`Self::offer`]. Returns the verdict (`Shed` if the frame
+    /// was merely noted as shed; `ResyncRequired` if noting it tipped the connection into a drop).
+    ///
+    /// This is the ONE seam P-S29 needs in the P-S28 buffer (the buffer owns the lag; the selector owns
+    /// the class budget). It never *buffers* a frame — it only keeps the lag honest across a class shed.
+    pub fn note_shed_offer(&mut self, frame: Frame) -> PushOutcome {
+        if self.resync_required {
+            return PushOutcome::ResyncRequired;
+        }
+        self.offered_seq = self.offered_seq.max(frame.seq);
+        if self.frame_lag() >= self.slow_consumer_lag_ceiling {
+            self.drop_to_resync();
+            return PushOutcome::ResyncRequired;
+        }
+        PushOutcome::Shed
+    }
+
     /// **Deliver one buffered frame to the consumer (advance the consumer side of the lag).** The
     /// consumer calls this as it drains a frame: it releases a per-connection slot (so a new frame can
     /// buffer) and advances `delivered_seq` to `frame.seq` (closing the lag). A delivery on a dropped
