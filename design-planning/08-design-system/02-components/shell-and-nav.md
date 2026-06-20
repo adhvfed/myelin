@@ -81,7 +81,7 @@ The shell is the component most exposed to the §8b.4 bugs; these are **binding*
 
 | State | Behaviour |
 |---|---|
-| **default** | all regions rendered; rail item `aria-current="page"` with an inset 2px `--accent` marker (the one identity-accent use as a 2px marker paired with `--surface-hover` — never colour-alone). |
+| **default** | all regions rendered; the current rail item carries `aria-current="page"` and reads selected via a **`--surface-hover` fill + `--text-primary`** (brighter than the resting `--text-subtle`) — and may tint its glyph with `--accent`. **No colored side-bar / inset accent marker** (user feedback 2026-06-20: no rounded colored side borders — see [`../REFINEMENTS.md`](../REFINEMENTS.md)). The selected state is a non-colour difference (fill + brightness), so it never relies on colour alone. |
 | **hover** | rail/sidebar item → `--text-primary` + `--surface-hover`. |
 | **focus** | every interactive shell element shows the one `--focus-ring` (2px, logical offset). |
 | **active** | pressed nav item. |
