@@ -63,6 +63,10 @@ myelin-events = { path = "../myelin-events" }
 # serde_json — the references-not-payloads `refs.edge.*` payload the builder reads (source/target/
 # rel/rel_class/zookie). A leaf dev/runtime dep, already in the workspace; no DAG edge added.
 serde_json = { workspace = true }
+# serde derive — the R2 projection cache (REF-P12 / P-161) seals the `Projection` shape (5.6) under
+# the per-tenant DEK; the cache value is the serde-serialized projection, sealed, never plaintext.
+# A leaf dev/runtime dep, already in the workspace; no DAG edge added.
+serde = { workspace = true }
 # The three platform-load-bearing structured inline nodes (`myelin-content::InlineNode` —
 # mention/artifact_ref/embed, contract 13.1, frozen X-2). REF-P8 / P-157: the edge-extraction
 # emit seam reads these structured nodes (NOT a regex over prose) and emits one `refs.edge.created`
@@ -84,4 +88,8 @@ tokio = { workspace = true, optional = true }
 
 [features]
 default = []
-integration = ["dep:sqlx", "dep:tokio"]
+# REF-P12 / P-161: the R2 cache integration test (tests/integration_ref_p12_r2_cache.rs) drives the
+# REAL `myelin_storage::ValkeyCache` against the live dev-stack Valkey, so it turns on storage's
+# `integration` feature (which pulls fred + tokio + compiles `ValkeyCache`). The default
+# `cargo build --workspace` / `cargo test --workspace` stay DB-free.
+integration = ["dep:sqlx", "dep:tokio", "myelin-storage/integration"]
