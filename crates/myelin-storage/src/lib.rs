@@ -394,6 +394,7 @@ pub mod migration_under_load;
 // [OPEN → LEGAL] (OQ-H). See the module-level DEVIATION note (OLAP stays out of the frozen
 // residency M1 backup-able set because T4 is a derived, NOT-backed-up, reindex-from-source store).
 pub mod olap;
+pub mod olap_feed;
 pub mod oltp;
 pub mod reerase;
 // The reserve/settle cost gate mechanism + the durable per-tenant ledger (P-ST-16 / P-103,
@@ -479,6 +480,9 @@ pub use migration::{
 };
 pub use olap::{
     OlapApply, OlapDoc, OlapEvent, OlapFrameSignal, OlapIngestError, OlapReadStore, OlapStoreHolder,
+};
+pub use olap_feed::{
+    reindex_olap_from_bus, OlapAnalyticsSource, OlapBusConsumer, OlapReindexParitySignal,
 };
 pub use oltp::{OltpConfig, OltpError, OltpPool, PermitGuard};
 pub use reerase::{

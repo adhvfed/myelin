@@ -56,9 +56,12 @@ aws-credential-types = { workspace = true, optional = true }
 fred = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 myelin-config = { workspace = true, optional = true }
-# serde_json: the pg.rs outbox stores the EventEnvelope as JSONB (serialize on enqueue,
-# deserialize on relay). Pulled ONLY behind `integration` — it never enters the default DAG.
-serde_json = { workspace = true, optional = true }
+# serde_json: (1) the OLAP live feed (olap_feed.rs, P-145) constructs the `*.snapshot`
+# `SnapshotDraft.payload` (a `serde_json::Value`) it re-emits through the bus reindex seam — a
+# pure-Rust JSON lib already in `myelin-events`' non-optional DAG, NOT a DB client, so it does not
+# affect the DB-free build floor; (2) the pg.rs outbox stores the EventEnvelope as JSONB behind the
+# `integration` feature. It is a normal (non-optional) dependency.
+serde_json.workspace = true
 
 [features]
 default = []
@@ -71,7 +74,6 @@ integration = [
     "dep:fred",
     "dep:tokio",
     "dep:myelin-config",
-    "dep:serde_json",
     # The PgStore relay publishes through the events BusTransport, and the NATS bus impl lives
     # behind the events `integration` feature; the storage smoke test for the outbox→bus drain
     # needs it, so storage's integration feature turns on the events one transitively.
@@ -93,10 +95,7 @@ myelin-harness = { path = "../myelin-harness" }
 # crate's production DAG pulls myelin-lints (and myelin-lints does not depend on myelin-storage,
 # so there is no cycle).
 myelin-lints = { path = "../myelin-lints" }
-# serde_json is TEST-SUPPORT only: the co-location unit/CDC/drill tests construct an
-# EventDraft (whose `payload` is a `serde_json::Value`) to exercise the same-tx co-commit.
-# It never enters the storage crate's production DAG.
-serde_json.workspace = true
+# (serde_json is a normal [dependencies] entry — see above — so it is available to tests too.)
 # toml is TEST-SUPPORT only: the STOR-D2 RPO drill (tests/stor_d2_rpo_drill.rs) reads its
 # `rpo_max_mins` bound from the workspace-root `thresholds.toml` (the versioned source of
 # truth, P-038) — NEVER a hardcoded magic number (EI-01 §3). It never enters the runtime DAG.

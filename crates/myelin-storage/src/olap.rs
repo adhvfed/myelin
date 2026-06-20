@@ -306,6 +306,26 @@ impl OlapReadStore {
         self.docs.len()
     }
 
+    /// **The reindex-parity byte view (the F4 gate's comparison, P-ST-18).** The read model
+    /// rendered as canonical, deterministic bytes — the artifact the OLAP reindex-parity drill
+    /// compares (`reindex_parity_hash`): a store rebuilt COLD from source must be BYTE-IDENTICAL to
+    /// the same store fed LIVE. We render the projected docs (the `BTreeMap` iterates in key order,
+    /// so the bytes are order-independent of ingest order) as `[(aggregate_row, last_event_id,
+    /// subject?), …]`. This is PII-free (only routing refs travel) and excludes the dedup ledger /
+    /// the C5 set (those are consumer-side bookkeeping, not the projected read model under
+    /// comparison — two stores that PROJECTED the same docs are equal regardless of how many
+    /// redeliveries each absorbed). The same posture as
+    /// [`myelin_events::DerivedStore::parity_bytes`] (the BUS-D5 byte-parity comparison this is the
+    /// storage face of).
+    pub fn parity_bytes(&self) -> Vec<u8> {
+        let view: Vec<(&String, &String, &Option<String>)> = self
+            .docs
+            .values()
+            .map(|d| (&d.aggregate_row, &d.last_event_id, &d.subject))
+            .collect();
+        serde_json::to_vec(&view).expect("the OLAP projection serializes deterministically")
+    }
+
     /// The projected doc for a source `aggregate_row`, if present (the CQRS read).
     pub fn doc(&self, aggregate_row: &str) -> Option<&OlapDoc> {
         self.docs.get(aggregate_row)
