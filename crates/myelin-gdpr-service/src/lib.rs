@@ -175,6 +175,31 @@
 //! carries (P-007). **Mutation floor (P-GA-12 TESTS):** the [`fanout::LegalHoldRegistry::verdict`]
 //! gate, the [`fanout::FanOutDriver::drive`] sequence, and the [`fanout::DsrCompletionReceipt`]
 //! content-address are mandatory-core; the `cargo mutants` score is in the commit body.
+//!
+//! ## P-GA-13 (→ P-113) — DSR tenant-operability: Art. 28 + offboarding + restrict/rectify/portability (contract 10.4)
+//! [`tenant_ops`] ships the **DSR tenant-operability surface** ([`tenant_ops::TenantDsrSurface`]) —
+//! the orchestrator EXPOSED to **tenants** for *their own* data subjects (§4.4): (1) **Art. 28**
+//! tenant-facing DSR ([`tenant_ops::TenantDsrSurface::submit_for_my_subject`]) with the **Art-28
+//! scoping guard** (a tenant may only act for a subject in ITS OWN tenant — a cross-tenant request is
+//! REFUSED, [`tenant_ops::TenantDsrError::CrossTenantSubject`], the cross-tenant-IDOR/SUB-D7 GDPR
+//! face), encoded `Initiator::TenantInstructed` + `Posture::Processor` (the customer org is the
+//! controller — the posture gate ADMITS even a processor-posture erase the tenant instructed); (2)
+//! **tenant offboarding** ([`tenant_ops::TenantDsrSurface::offboard_tenant`]) = `erase(EraseScope::
+//! Tenant)` fanned over the holder list (the tenant KEK destroyed ⇒ every DEK unwrappable ⇒ the whole
+//! tenant, backups included, unrecoverable), sealing an [`tenant_ops::OffboardingCertificate`]; (3)
+//! the **restrict / rectify / portability** entry points routed through the orchestrator
+//! ([`tenant_ops::TenantDsrSurface::restrict_subject`] / `rectify_subject` /
+//! `portability_for_subject`). It REUSES the DSR spine (P-GA-11) + the fan-out driver + the
+//! legal-hold gate (P-GA-12) wholesale (EI-01 §7 coherence — no second state machine, posture gate,
+//! or fan-out). **Floors named:** single-cell offboarding ships here; the **multi-cell `member_cells`
+//! iteration** over the cross-cell PII-free bridge → **M5 P-GA-33** (GA-D8); the full
+//! **`restrict`-honoured-into-derived-stores** proof → **M2 P-GA-25 → P-152**; the
+//! **reindex-from-source rectification** derivative fan-out → **M2 P-GA-24 → P-151**; the durable
+//! Postgres `dsr_request` table + the live KMS binding for the tenant-KEK shred → the same DB/KMS
+//! floor every M0/M1 in-memory store carries (P-007 / the Storage KMS hierarchy). **Mutation floor
+//! (P-GA-13 TESTS):** the Art-28 cross-tenant guard, the `EraseScope::Tenant` offboarding fan-out,
+//! and the restrict/rectify/portability routing are mandatory-core; the `cargo mutants` score is in
+//! the commit body.
 
 pub mod audit;
 pub mod datamap;
@@ -183,6 +208,7 @@ pub mod dsr;
 pub mod fanout;
 pub mod holders;
 pub mod orchestration;
+pub mod tenant_ops;
 
 pub use audit::{
     AuditConsumer, AuditEntry, AuditLog, Minimised, Outcome, AUDIT_APPEND_LAG,
@@ -213,3 +239,4 @@ pub use orchestration::{
     RegisteredHolder, SeamHolder, UpstreamHolderOrchestrator, CRYPTO_SHRED_LAG,
     ERASURE_FANOUT_COVERAGE,
 };
+pub use tenant_ops::{OffboardingCertificate, TenantDsrError, TenantDsrSurface};
