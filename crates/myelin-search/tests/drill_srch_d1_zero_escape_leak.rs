@@ -48,9 +48,9 @@ use myelin_query::{CmpOp, Expr, FieldType, FieldValue, OrderKey, Predicate, Quer
 use myelin_tenancy::TenantId;
 
 use myelin_search::{
-    query, AclFilter, Embedding, FieldDecl, FieldSchema, IndexBackend, IndexDocument,
+    query, semantic, AclFilter, Embedding, FieldDecl, FieldSchema, IndexBackend, IndexDocument,
     ListObjectsPort, Page, QueryStats, RelationalLeaf, ReverseIndexAnswer, RevisionWatermark,
-    ScopedEngine, TantivyBackend, FT_BODY_FIELD, ORDER_KEY_FIELD,
+    ScopedEngine, TantivyBackend, VectorQuery, FT_BODY_FIELD, ORDER_KEY_FIELD, SEMANTIC_FIELD,
 };
 
 fn facet_decl() -> BTreeMap<String, FieldType> {
@@ -256,6 +256,56 @@ fn srch_d1_zero_escape_leak_rag_vector_half() {
         assert!(!ids.contains(&c.as_str()), "RAG LEAK: confidential `{c}` surfaced as a neighbour");
     }
     assert_eq!(ids, ["acme/issue/PUB-1"], "only the visible neighbour; the nearest hidden one never surfaces");
+}
+
+/// **SRCH-D1 (the RAG/vector half) through the PUBLIC `semantic` pipeline entry (contract 6.2 /
+/// SRCH-P11).** The full path: `list_objects` → a relational `TupleSet` → the reverse-index JOIN
+/// resolves ONLY PUB-1 → the vector branch runs filter-during-traversal under that conjoined ACL
+/// filter. The query vector is NEAREST the confidential STRONG doc, yet it (and every other
+/// confidential doc) NEVER surfaces in the semantic/RAG result — the agent-RAG retrieval is
+/// permission-correct by the same pre-filter (an agent never retrieves a doc its delegated principal
+/// cannot see). One list_objects + one reverse-index JOIN (no N+1).
+#[test]
+fn srch_d1_rag_vector_half_through_the_public_semantic_entry() {
+    let be = adversarial_corpus();
+    let eng = ScopedEngine::new(&be, "acme", "eu-west", schema());
+    let confidential = confidential_ids();
+
+    // The unauthorized viewer's reachable set is a TupleSet the JOIN resolves to ONLY PUB-1.
+    let authz = ScriptedAuthz::new(&VISIBLE, "z@10", 10);
+    let stats = QueryStats::new();
+    let cstats = myelin_search::ConsistencyStats::new();
+    // The pure-semantic AST (the vector branch); the query vector is supplied directly (the agent-RAG
+    // `vec` form), nearest the confidential STRONG doc `[1.0, 0.0, 0.0]`.
+    let q = ast(Predicate::Cmp { op: CmpOp::Eq, lhs: var(SEMANTIC_FIELD), rhs: lit("deadlock") });
+    let vq = VectorQuery::Vec(Embedding::new(vec![1.0, 0.0, 0.0]));
+
+    let res = semantic(
+        &eng,
+        &authz,
+        None,
+        &q,
+        &viewer(),
+        &ObjectType("issue".into()),
+        &consistency(),
+        &vq,
+        Page { offset: 0, limit: 1000 }, // a generous page so a count-leak would show up
+        &stats,
+        &cstats,
+    )
+    .expect("semantic");
+
+    let ids: Vec<&str> = res.hits.iter().map(|h| h.doc_id.as_str()).collect();
+    for c in &confidential {
+        assert!(
+            !ids.contains(&c.as_str()),
+            "RAG LEAK through the public semantic entry: confidential `{c}` surfaced as a neighbour"
+        );
+    }
+    assert_eq!(ids, ["acme/issue/PUB-1"], "only the visible neighbour; the nearest hidden one never surfaces");
+    assert_eq!(res.hits.len(), 1, "0 count-leak on the RAG/vector path");
+    assert_eq!(authz.calls.load(Ordering::Relaxed), 1, "exactly one list_objects (no N+1 on the RAG path)");
+    assert_eq!(authz.resolve_calls.load(Ordering::Relaxed), 1, "exactly one reverse-index JOIN");
 }
 
 /// **SRCH-D1 — the chained grant: grant the relation → the reverse-index JOIN now resolves the

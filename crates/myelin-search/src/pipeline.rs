@@ -631,6 +631,80 @@ pub fn query_consistent<B: IndexBackend>(
     stats: &QueryStats,
     cstats: &crate::consistency::ConsistencyStats,
 ) -> Result<RankedResults, QueryError> {
+    // The FT/structured path: NO query-time embedding is supplied, so the vector branch is
+    // recognised but not executed (the hybrid/semantic execution is the `semantic`/`hybrid` entries
+    // below). All other steps — list_objects, lower, conjoin, no-stale-grant — are identical.
+    query_consistent_with_vector(
+        engine, identity, check, ast, viewer, ty, at, None, page, stats, cstats,
+    )
+}
+
+/// **THE HYBRID / SEMANTIC QUERY ENTRY (SRCH-P11 / P-174; contract 6.2 `semantic(text|vec, viewer,
+/// k, filter_ast?)`; §4.5).** The full permission-aware + zookie-consistent query path of
+/// [`query_consistent`] PLUS the executed **vector branch** (filter-during-traversal — k VISIBLE
+/// neighbours) and the **RRF fusion** of the lexical + semantic ranked lists. The semantic surface
+/// REUSES the SAME SRCH-P10 zookie path (no-stale-grant for RAG too): a vector hit whose
+/// `indexed_zookie` is stale is re-validated / excluded exactly as a lexical hit is — an agent's RAG
+/// retrieval is permission-correct AND consistency-correct by the same machinery.
+///
+/// - `vec` — the query-time embedding source (contract 6.2 `text|vec`): a directly-supplied vector
+///   OR query text embedded through the swappable [`crate::indexer::EmbeddingAdapter`] (the
+///   model_ref-pinned adapter, §3.3; mock v1, real EU-hostable model post-M5 — the named floor). The
+///   query embedding shares the corpus's vector space (same adapter), so the k-NN is meaningful.
+/// - `filter_ast` is carried in the `ast` exactly as for [`query_consistent`] (the structured/FT
+///   predicates conjoined with the ACL filter); a pure-semantic query passes an `ast` with only the
+///   semantic clause. Both branches carry the SAME conjoined ACL filter, so **fusion can never
+///   introduce a hidden doc** (§4.5 — the SRCH-D1 vector/RAG half).
+///
+/// **Agent RAG (contract 6.2 / VISION §3):** an agent's retrieval rides this entry with the agent's
+/// DELEGATED principal as `viewer`; the top-k VISIBLE passages are returned, so the agent never
+/// retrieves a doc its delegated principal cannot see (RAG is permission-correct by the same
+/// pre-filter — not a separate, weaker path).
+#[allow(clippy::too_many_arguments)]
+pub fn semantic<B: IndexBackend>(
+    engine: &ScopedEngine<'_, B>,
+    identity: &dyn ListObjectsPort,
+    check: Option<&dyn crate::consistency::BoundedCheckPort>,
+    ast: &QueryAst,
+    viewer: &Principal,
+    ty: &ObjectType,
+    at: &Consistency,
+    vec: &VectorQuery<'_>,
+    page: Page,
+    stats: &QueryStats,
+    cstats: &crate::consistency::ConsistencyStats,
+) -> Result<RankedResults, QueryError> {
+    query_consistent_with_vector(
+        engine,
+        identity,
+        check,
+        ast,
+        viewer,
+        ty,
+        at,
+        Some(vec),
+        page,
+        stats,
+        cstats,
+    )
+}
+
+/// The shared query path for [`query_consistent`] (no vector) and [`semantic`] (executed vector
+/// branch + RRF). `vector_query` is the query-time embedding source threaded into [`execute`].
+#[allow(clippy::too_many_arguments)]
+fn query_consistent_with_vector<B: IndexBackend>(
+    engine: &ScopedEngine<'_, B>,
+    identity: &dyn ListObjectsPort,
+    check: Option<&dyn crate::consistency::BoundedCheckPort>,
+    ast: &QueryAst,
+    viewer: &Principal,
+    ty: &ObjectType,
+    at: &Consistency,
+    vector_query: Option<&VectorQuery<'_>>,
+    page: Page,
+    stats: &QueryStats,
+    cstats: &crate::consistency::ConsistencyStats,
+) -> Result<RankedResults, QueryError> {
     // **CROSS-TENANT 0 (SRCH-D3, step 0):** the tenant is the verified principal's, never a path.
     // The engine MUST be the viewer's-tenant index; a mismatch is a mis-wired caller → REJECT (no
     // cross-tenant read path exists). There is NO path/tenant parameter to spoof.
@@ -683,7 +757,7 @@ pub fn query_consistent<B: IndexBackend>(
     // Fetch the full ranked candidate list (not yet paginated) so the no-stale-grant pass can
     // exclude stale candidates BEFORE the page window is sliced (an excluded stale doc must not
     // consume a visible page slot — otherwise the page would be short by the excluded count).
-    let hits = execute(engine.backend, &conjoined, page, stats)?;
+    let hits = execute(engine.backend, &conjoined, vector_query, page, stats)?;
 
     // **STEP 4.5 — THE NO-STALE-GRANT ZOOKIE PASS (§4.2.3).** A candidate whose `indexed_zookie` is
     // OLDER than the **passed query zookie** (`at.at_least`, the read-your-writes snapshot the
@@ -774,14 +848,53 @@ fn revalidate_stale_candidates<B: IndexBackend>(
     Ok(out)
 }
 
+/// **The query-time embedding source for the vector branch (SRCH-P11 / contract 6.2 `text|vec`).**
+/// `semantic(text|vec, …)` accepts EITHER a directly-supplied query vector (`Vec`) OR query text to
+/// embed through the swappable [`EmbeddingAdapter`] (`Text`) — the §3.3 model_ref-pinned adapter
+/// (mock v1, real EU-hostable model post-M5, the named floor). `None` (the [`query`] /
+/// [`query_consistent`] path) means NO embedding is supplied: the vector branch is recognised but
+/// not executed (the FT/structured query path is unchanged). The adapter is borrowed, never owned.
+pub enum VectorQuery<'a> {
+    /// A query vector supplied directly (the `vec` form of contract 6.2) — already embedded.
+    Vec(crate::vector::Embedding),
+    /// Query text to embed through the adapter at query time (the `text` form) — the SAME adapter
+    /// that embedded the corpus, so the query and the docs live in one vector space (§3.3).
+    Text { text: String, embedder: &'a dyn crate::indexer::EmbeddingAdapter },
+}
+
+impl VectorQuery<'_> {
+    /// Resolve to the query embedding (embedding the text through the adapter if needed). `None` if
+    /// the text is empty (no embedding for empty text — a vector with no source is meaningless,
+    /// §3.3). The directly-supplied `Vec` form is always present.
+    fn resolve(&self) -> Option<crate::vector::Embedding> {
+        match self {
+            VectorQuery::Vec(e) => Some(e.clone()),
+            VectorQuery::Text { text, embedder } => embedder.embed(text),
+        }
+    }
+}
+
 /// **Execute every lowered branch (FT / structured / vector) under the conjoined ACL filter, then
-/// merge + dedup on `doc_id` (the one-doc-id-space fusion, §3.2).** Each branch is run with the
-/// IDENTICAL [`AclFilter`] from the [`ConjoinedPlan`] (the conjoin-into-every-branch GATE) — no
-/// branch can reach the engine without the filter, and no branch uses a different ACL clause. The
-/// deterministic interleave/merge here is the M2 fusion; the tuned RRF rank fusion is SRCH-P11.
+/// fuse on `doc_id` (the one-doc-id-space fusion, §3.2).** Each branch is run with the IDENTICAL
+/// [`AclFilter`] from the [`ConjoinedPlan`] (the conjoin-into-every-branch GATE) — no branch can
+/// reach the engine without the filter, and no branch uses a different ACL clause.
+///
+/// **Fusion (§4.5 — the SRCH-P11 RRF).** When a query carries BOTH a lexical (FT) and a semantic
+/// (vector) branch, the two ranked lists are fused with **Reciprocal Rank Fusion** ([`crate::fusion`])
+/// — score-scale-free (no per-corpus calibration), and because BOTH branches carry the SAME conjoined
+/// ACL filter (FT via the posting-list pre-filter, vector via filter-during-traversal), fusion can
+/// **never introduce a hidden doc** (the leak-safe property; the SRCH-D1 vector/RAG half). Structured
+/// equality branches (exact-match filters, not relevance-ranked) keep the deterministic max-score
+/// merge and are unioned with the fused relevance ranking. A query with no FT/structured/vector
+/// clause runs an admit-all FT search so the ACL allow/deny set is the only predicate.
+///
+/// `vector_query` is the query-time embedding source (SRCH-P11): `Some` for the `semantic`/`hybrid`
+/// entries (the vector branch runs through `backend.semantic`, filter-during-traversal); `None` for
+/// the FT-only [`query`]/[`query_consistent`] path (the vector branch is recognised but not executed).
 fn execute<B: IndexBackend>(
     backend: &B,
     conjoined: &crate::compiler::ConjoinedPlan<AclFilter>,
+    vector_query: Option<&VectorQuery<'_>>,
     page: Page,
     stats: &QueryStats,
 ) -> Result<Vec<Hit>, QueryError> {
@@ -794,31 +907,74 @@ fn execute<B: IndexBackend>(
     // clamped page limit so a crafted limit cannot exhaust the engine.
     let fetch = page.offset.saturating_add(page.effective_limit());
 
-    // Merge branch hits keyed by doc_id (one doc-id space); keep the MAX score across branches (the
-    // deterministic M2 fusion — a doc hit by two branches ranks by its best branch score).
+    // The FT branch(es) → ONE ranked list (BM25 order). Each conjoins the ACL clause BEFORE BM25
+    // scoring (the engine's `search` takes the filter as a mandatory parameter — the ratchet). The
+    // ranked doc-ids feed RRF (rank, not score — score-scale-free).
+    let mut ft_ranked: Vec<Hit> = Vec::new();
+    for ft in &plan.ft {
+        for h in backend.search(acl_filter, &ft.query, fetch)? {
+            if !ft_ranked.iter().any(|e| e.doc_id == h.doc_id) {
+                ft_ranked.push(h);
+            }
+        }
+        stats.engine_branches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // The VECTOR branch (SRCH-P11 / §4.5) → ONE ranked list (cosine-similarity order), executed via
+    // filter-during-traversal with the SAME conjoined ACL filter (k VISIBLE neighbours, never
+    // k-then-filtered — `backend.semantic`). It runs ONLY when a query-time embedding is supplied
+    // (the `semantic`/`hybrid` entries). With no embedding (the FT-only [`query`] path) the branch is
+    // recognised but not executed (the prior counted-no-op behaviour, preserved).
+    let mut vector_ranked: Vec<crate::vector::VectorHit> = Vec::new();
+    if plan.vector.is_some() {
+        stats.engine_branches.fetch_add(1, Ordering::Relaxed);
+        if let Some(vq) = vector_query {
+            if let Some(query_embedding) = vq.resolve() {
+                // k = the fetch window (the page's worth of nearest VISIBLE neighbours). The engine
+                // conjoins the ACL filter DURING traversal — a hidden doc never enters the candidate
+                // set (the SRCH-D1 vector/RAG half).
+                vector_ranked = backend.semantic(acl_filter, &query_embedding, fetch)?;
+            }
+        }
+    }
+
+    // **RRF FUSION (§4.5).** Build the rank lists and fuse. When both branches are present this is
+    // the hybrid lexical+semantic ranking; when only one is present RRF degenerates to that branch's
+    // order (an empty branch contributes nothing). The fused set is EXACTLY the union of the branch
+    // lists — fusion holds no ACL state, so no hidden doc is introduced (leak-safe by construction).
+    let mut fusion_inputs: Vec<crate::fusion::RankedList> = Vec::new();
+    if !ft_ranked.is_empty() {
+        fusion_inputs
+            .push(crate::fusion::RankedList::from_ranked(ft_ranked.iter().map(|h| h.doc_id.clone())));
+    }
+    if !vector_ranked.is_empty() {
+        fusion_inputs.push(crate::fusion::RankedList::from_ranked(
+            vector_ranked.iter().map(|h| h.doc_id.clone()),
+        ));
+    }
+    let fused = crate::fusion::reciprocal_rank_fusion(&fusion_inputs);
+
+    // Merge the fused relevance ranking with the structured equality branches (exact-match filters)
+    // keyed by doc_id (one doc-id space); keep the MAX score across contributions (a doc surfaced by
+    // both relevance fusion and an exact-match facet ranks by its best contribution).
     let mut merged: BTreeMap<String, f32> = BTreeMap::new();
     let mut record = |hits: Vec<Hit>| {
         for h in hits {
             let e = merged.entry(h.doc_id).or_insert(f32::MIN);
             // Keep the MAX score across branches. NOTE on the cargo-mutants `> → >=` survivor on
             // this guard (2026-06-20): it is an EQUIVALENT mutant — when `h.score == *e` the `>=`
-            // branch re-assigns the IDENTICAL value (`*e = h.score` where `h.score == *e`), an
-            // observably identical merged max. No test can distinguish `>` from `>=` here. Named,
-            // not silently accepted (the mutation floor counts it as the one justified survivor —
-            // the same equivalent-mutant class the engine's `merge` `>1` guard documents).
+            // branch re-assigns the IDENTICAL value, an observably identical merged max. No test can
+            // distinguish `>` from `>=` here. Named, not silently accepted (the one justified
+            // survivor — the same equivalent-mutant class the engine's `merge` `>1` guard documents).
             if h.score > *e {
                 *e = h.score;
             }
         }
     };
+    // The fused relevance hits (FT + vector via RRF).
+    record(fused.into_iter().map(|f| Hit { doc_id: f.doc_id, score: f.score }).collect());
 
-    // The FT branch(es) — each conjoins the ACL clause BEFORE BM25 scoring (the engine's `search`
-    // takes the filter as a mandatory parameter — the ratchet).
-    for ft in &plan.ft {
-        record(backend.search(acl_filter, &ft.query, fetch)?);
-        stats.engine_branches.fetch_add(1, Ordering::Relaxed);
-    }
-    // The structured branch(es) — each conjoins the SAME ACL clause first.
+    // The structured branch(es) — each conjoins the SAME ACL clause first (exact-match equality).
     for sc in &plan.structured {
         match sc {
             crate::compiler::StructuredClause::Cmp { field, value, .. } => {
@@ -835,25 +991,20 @@ fn execute<B: IndexBackend>(
             }
         }
     }
-    // The vector branch — filter-during-traversal with the SAME ACL filter (k VISIBLE neighbours).
-    // The query-text→embedding adapter is the indexer's concern (SRCH-P06); at M2 a `semantic`
-    // request with no supplied embedding is a no-op branch here (the embed-at-query-time wiring +
-    // RRF fusion is SRCH-P11). Named, not silent: the branch is recognised, its execution is the
-    // downstream prompt.
-    if plan.vector.is_some() {
-        stats.engine_branches.fetch_add(1, Ordering::Relaxed);
-    }
 
-    // A pure-ACL query (no FT/structured/vector clause — e.g. "everything I can read") still must
-    // honour the ACL filter: run an admit-all FT search ("*"-equivalent) so the bounded allow/deny
-    // set is the only predicate. The engine's `search` with a match-all text returns the visible
-    // docs.
-    if plan.ft.is_empty() && plan.structured.is_empty() && plan.vector.is_none() {
+    // A pure-ACL query (no FT/structured clause AND no executed vector branch — e.g. "everything I
+    // can read") still must honour the ACL filter: run an admit-all FT search ("*"-equivalent) so the
+    // bounded allow/deny set is the only predicate. The engine's `search` with a match-all text
+    // returns the visible docs.
+    // (When all three are absent, nothing was recorded yet, so `merged` is empty — the structural
+    // condition below is exactly "no relevance/structured/vector clause".)
+    if plan.ft.is_empty() && plan.structured.is_empty() && vector_ranked.is_empty() {
         record(backend.search(acl_filter, "*", fetch)?);
         stats.engine_branches.fetch_add(1, Ordering::Relaxed);
     }
 
-    // Sort by score desc, then doc_id asc (a stable deterministic order — the tuned RRF is SRCH-P11).
+    // Sort by score desc, then doc_id asc (a stable deterministic order — the RRF fusion is applied
+    // above; the tuned re-rank is SRCH-P26).
     let mut hits: Vec<Hit> =
         merged.into_iter().map(|(doc_id, score)| Hit { doc_id, score }).collect();
     hits.sort_by(|a, b| {
@@ -1616,6 +1767,186 @@ mod tests {
             pub1.score
         );
         assert!(stats.engine_branches() >= 2, "both the FT and structured branches ran");
+    }
+
+    // ---- SRCH-P11 (P-174): hybrid + vector — RRF fusion + filter-during-traversal --------------
+
+    use crate::compiler::SEMANTIC_FIELD;
+    use crate::indexer::MockEmbeddingAdapter;
+    use crate::vector::Embedding;
+    use crate::EmbeddingAdapter;
+
+    /// An embedded corpus: each doc carries a vector under the SAME mock model as the query embedder,
+    /// so a query embedding and the docs live in ONE vector space (§3.3). `embed(text)` is the mock
+    /// adapter's deterministic embedding — the doc and a query of the same text are identical vectors.
+    fn embedded_corpus(embedder: &MockEmbeddingAdapter) -> TantivyBackend {
+        let mut be = TantivyBackend::open(&facet_decl()).expect("open");
+        let mut emb = |id: &str, body: &str, status: &str| {
+            let v = embedder.embed(body).expect("non-empty body embeds");
+            let k = OrderKey::bisect(None, None);
+            let d = IndexDocument::new(id, body)
+                .with_field("status", FieldValue::Select(status.into()))
+                .with_field(ORDER_KEY_FIELD, FieldValue::OrderKey(k))
+                .with_embedding(v, embedder.model_ref());
+            be.upsert(&d).unwrap();
+        };
+        emb("acme/issue/PUB-1", "deadlock in the scheduler", "open");
+        emb("acme/issue/PUB-2", "deadlock in the indexer", "open");
+        emb("acme/issue/SECRET-9", "deadlock secret ops runbook", "open");
+        be
+    }
+
+    /// A pure-semantic AST (`__semantic__ == query_text`) — lowers to the vector branch only.
+    fn semantic_ast(query_text: &str) -> QueryAst {
+        ast(Predicate::Cmp {
+            op: CmpOp::Eq,
+            lhs: var(SEMANTIC_FIELD),
+            rhs: s(query_text),
+        })
+    }
+
+    /// A hybrid AST: an FT clause AND a semantic clause over ONE compiled plan (one doc-id space).
+    fn hybrid_ast(ft_text: &str, semantic_text: &str) -> QueryAst {
+        ast(Predicate::And(vec![
+            Predicate::Cmp { op: CmpOp::Eq, lhs: var(FT_BODY_FIELD), rhs: s(ft_text) },
+            Predicate::Cmp { op: CmpOp::Eq, lhs: var(SEMANTIC_FIELD), rhs: s(semantic_text) },
+        ]))
+    }
+
+    /// **SRCH-D1 (the vector/RAG leak half): a confidential doc NEVER appears in a semantic result
+    /// for an unauthorized viewer — filter-during-traversal returns k VISIBLE neighbours.** The
+    /// query text matches the SECRET-9 doc exactly (its nearest neighbour), but the allow-set
+    /// excludes it: it never enters the candidate set (no count/rank leak through the vector/RAG
+    /// path). Then GRANT → re-search: it surfaces (the visible neighbours grew).
+    #[test]
+    fn semantic_filter_during_traversal_excludes_confidential_then_grant_makes_visible() {
+        let embedder = MockEmbeddingAdapter::new(16);
+        let be = embedded_corpus(&embedder);
+        let eng = ScopedEngine::new(&be, "acme", "eu-west", schema());
+        // The query is the EXACT text of the secret doc — so SECRET-9 is its nearest vector.
+        let vq = VectorQuery::Text { text: "deadlock secret ops runbook".into(), embedder: &embedder };
+        let q = semantic_ast("deadlock secret ops runbook");
+
+        // UNAUTHORIZED: the allow-set EXCLUDES SECRET-9 (its nearest neighbour).
+        let unauth = FakeAuthz::ids(&["acme/issue/PUB-1", "acme/issue/PUB-2"]);
+        let stats = QueryStats::new();
+        let cstats = crate::consistency::ConsistencyStats::new();
+        let res = semantic(
+            &eng, &unauth, None, &q, &viewer("acme"), &ObjectType("issue".into()),
+            &consistency(), &vq, Page::FIRST, &stats, &cstats,
+        ).expect("semantic");
+        let ids: std::collections::BTreeSet<&str> = res.hits.iter().map(|h| h.doc_id.as_str()).collect();
+        assert!(
+            !ids.contains("acme/issue/SECRET-9"),
+            "the confidential doc NEVER surfaces in the semantic/RAG result (SRCH-D1 vector half: 0 leak)"
+        );
+        assert!(ids.contains("acme/issue/PUB-1") && ids.contains("acme/issue/PUB-2"), "visible neighbours");
+        assert_eq!(stats.list_objects_calls(), 1, "exactly ONE list_objects (no N+1 on the semantic path)");
+
+        // GRANT SECRET-9 → re-search: now it is one of the visible neighbours (the nearest, in fact).
+        let granted = FakeAuthz::ids(&["acme/issue/PUB-1", "acme/issue/PUB-2", "acme/issue/SECRET-9"]);
+        let stats2 = QueryStats::new();
+        let cstats2 = crate::consistency::ConsistencyStats::new();
+        let res2 = semantic(
+            &eng, &granted, None, &q, &viewer("acme"), &ObjectType("issue".into()),
+            &consistency(), &vq, Page::FIRST, &stats2, &cstats2,
+        ).expect("semantic after grant");
+        let ids2: std::collections::BTreeSet<&str> = res2.hits.iter().map(|h| h.doc_id.as_str()).collect();
+        assert!(ids2.contains("acme/issue/SECRET-9"), "after grant the doc is in the visible neighbours");
+    }
+
+    /// **The `vec` form of contract 6.2: a directly-supplied query vector is searched
+    /// filter-during-traversal (the agent-RAG shape — an agent passes an embedding directly).** The
+    /// same leak-free property holds.
+    #[test]
+    fn semantic_accepts_a_directly_supplied_query_vector() {
+        let embedder = MockEmbeddingAdapter::new(16);
+        let be = embedded_corpus(&embedder);
+        let eng = ScopedEngine::new(&be, "acme", "eu-west", schema());
+        // Embed the query text OURSELVES and pass the vector (the `vec` form).
+        let query_vec: Embedding = embedder.embed("deadlock in the scheduler").unwrap();
+        let vq = VectorQuery::Vec(query_vec);
+        let q = semantic_ast("ignored — the vec form supplies the embedding");
+
+        let authz = FakeAuthz::ids(&["acme/issue/PUB-1", "acme/issue/PUB-2"]);
+        let stats = QueryStats::new();
+        let cstats = crate::consistency::ConsistencyStats::new();
+        let res = semantic(
+            &eng, &authz, None, &q, &viewer("acme"), &ObjectType("issue".into()),
+            &consistency(), &vq, Page::FIRST, &stats, &cstats,
+        ).expect("semantic");
+        assert_eq!(res.hits[0].doc_id, "acme/issue/PUB-1", "the exact-text doc is the nearest visible vector");
+    }
+
+    /// **RRF fusion of a HYBRID query introduces no hidden doc + fuses the lexical + semantic ranked
+    /// lists (§4.5).** Both branches carry the SAME conjoined ACL filter; the confidential doc is in
+    /// neither branch's list, so fusion cannot introduce it. The doc both branches rank surfaces.
+    #[test]
+    fn hybrid_rrf_fusion_no_hidden_doc_and_fuses_both_branches() {
+        let embedder = MockEmbeddingAdapter::new(16);
+        let be = embedded_corpus(&embedder);
+        let eng = ScopedEngine::new(&be, "acme", "eu-west", schema());
+        // FT "deadlock" matches all three; semantic "deadlock in the scheduler" is nearest PUB-1.
+        let vq = VectorQuery::Text { text: "deadlock in the scheduler".into(), embedder: &embedder };
+        let q = hybrid_ast("deadlock", "deadlock in the scheduler");
+
+        // Allow-set EXCLUDES SECRET-9 — it is in NEITHER branch's list, so RRF cannot fuse it in.
+        let authz = FakeAuthz::ids(&["acme/issue/PUB-1", "acme/issue/PUB-2"]);
+        let stats = QueryStats::new();
+        let cstats = crate::consistency::ConsistencyStats::new();
+        let res = semantic(
+            &eng, &authz, None, &q, &viewer("acme"), &ObjectType("issue".into()),
+            &consistency(), &vq, Page::FIRST, &stats, &cstats,
+        ).expect("hybrid");
+        let ids: std::collections::BTreeSet<&str> = res.hits.iter().map(|h| h.doc_id.as_str()).collect();
+        assert!(!ids.contains("acme/issue/SECRET-9"), "RRF introduces no hidden doc (SRCH-D1 vector half)");
+        // PUB-1 is rank-high in BOTH the FT and the vector branch (exact semantic match) — the RRF
+        // agreement boost ranks it first.
+        assert_eq!(res.hits[0].doc_id, "acme/issue/PUB-1", "the doc both branches rank fuses to the top (RRF)");
+        // Both branches ran (FT + vector) plus the list_objects is still exactly one.
+        assert!(stats.engine_branches() >= 2, "the FT and the vector branch both executed");
+        assert_eq!(stats.list_objects_calls(), 1, "ONE list_objects for the hybrid query (no N+1)");
+    }
+
+    /// **The semantic surface reuses the SRCH-P10 zookie path (no-stale-grant for RAG too).** A
+    /// vector candidate whose `indexed_zookie` is STALE relative to the demanded strong zookie, with
+    /// NO bounded-check port wired, is EXCLUDED pending re-index (fail closed) — exactly as a lexical
+    /// hit would be. RAG never serves a stale-granted doc.
+    #[test]
+    fn semantic_reuses_the_no_stale_grant_zookie_path() {
+        use myelin_identity::ConsistencyMode;
+        let embedder = MockEmbeddingAdapter::new(16);
+        // A backend where the docs are indexed at an OLD zookie; the query demands a NEWER strong one.
+        let mut be = TantivyBackend::open(&facet_decl()).expect("open");
+        let v = embedder.embed("deadlock in the scheduler").unwrap();
+        let k = OrderKey::bisect(None, None);
+        let d = IndexDocument::new("acme/issue/PUB-1", "deadlock in the scheduler")
+            .with_field("status", FieldValue::Select("open".into()))
+            .with_field(ORDER_KEY_FIELD, FieldValue::OrderKey(k))
+            .with_embedding(v, embedder.model_ref());
+        // Stamp it at an OLD zookie revision (rev 1).
+        be.upsert_stamped(&d, "z@1", 1).unwrap();
+        let eng = ScopedEngine::new(&be, "acme", "eu-west", schema());
+
+        let vq = VectorQuery::Text { text: "deadlock in the scheduler".into(), embedder: &embedder };
+        let q = semantic_ast("deadlock in the scheduler");
+        let authz = FakeAuthz::ids(&["acme/issue/PUB-1"]);
+        // A STRONG read demanding zookie rev 9 — newer than the doc's indexed rev 1 (stale).
+        let strong = Consistency {
+            at_least: myelin_identity::Zookie("z@9".into()),
+            mode: ConsistencyMode::Strong,
+        };
+        let stats = QueryStats::new();
+        let cstats = crate::consistency::ConsistencyStats::new();
+        // NO bounded-check port → the stale candidate is EXCLUDED (fail closed) — RAG serves nothing stale.
+        let res = semantic(
+            &eng, &authz, None, &q, &viewer("acme"), &ObjectType("issue".into()),
+            &strong, &vq, Page::FIRST, &stats, &cstats,
+        ).expect("semantic strong");
+        assert!(
+            res.hits.is_empty(),
+            "the stale-indexed vector candidate is excluded pending re-index (no-stale-grant for RAG; fail closed)"
+        );
     }
 
     /// **The `QueryError` Display messages are loud + name their drill/floor (kills the Display
