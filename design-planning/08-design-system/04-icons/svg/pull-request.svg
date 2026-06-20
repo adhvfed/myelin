@@ -1,8 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
-    <path id="lr" d="M6 8 L6 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
-    <path id="cn" d="M18 16 C18 15.1667, 18.5 12.3333, 18 11 C17.5 9.6667, 16.5 8.5, 15 8 L9 8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
-    <path id="ah" d="M11 5 L8 8 L11 11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
-    <path id="n1" d="M6 3 C7.6569 3, 9 4.3431, 9 6 C9 7.6569, 7.6569 9, 6 9 C4.3431 9, 3 7.6569, 3 6 C3 4.3431, 4.3431 3, 6 3Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
-    <path id="n2" d="M6 17 C7.6569 17, 9 18.3431, 9 20 C9 21.6569, 7.6569 23, 6 23 C4.3431 23, 3 21.6569, 3 20 C3 18.3431, 4.3431 17, 6 17Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
-    <path id="n3" d="M18 17 C19.6569 17, 21 18.3431, 21 20 C21 21.6569, 19.6569 23, 18 23 C16.3431 23, 15 21.6569, 15 20 C15 18.3431, 16.3431 17, 18 17Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+    <path id="lr" d="M7 8 L7 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+    <path id="rr" d="M17 8 L17 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+    <path id="ah" d="M14 11 L17 8 L20 11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+    <path id="n1" d="M7 4 C8.6569 4, 10 5.3431, 10 7 C10 8.6569, 8.6569 10, 7 10 C5.3431 10, 4 8.6569, 4 7 C4 5.3431, 5.3431 4, 7 4Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+    <path id="n2" d="M7 14 C8.6569 14, 10 15.3431, 10 17 C10 18.6569, 8.6569 20, 7 20 C5.3431 20, 4 18.6569, 4 17 C4 15.3431, 5.3431 14, 7 14Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+    <path id="n3" d="M17 14 C18.6569 14, 20 15.3431, 20 17 C20 18.6569, 18.6569 20, 17 20 C15.3431 20, 14 18.6569, 14 17 C14 15.3431, 15.3431 14, 17 14Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
 </svg>

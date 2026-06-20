@@ -7,19 +7,21 @@ defaults
   stroke-linejoin round
 palette
   ink #ff00ff
-shape ring1 template=path
-  addpoint a at=10,14
-  addpoint b at=7,17 mode=catmull-rom
-  addpoint c at=4,14 mode=catmull-rom
-  addpoint d at=7,11 mode=catmull-rom
-place r1 shape=ring1 at=0,0
-shape ring2 template=path
-  addpoint a at=14,10
-  addpoint b at=17,7 mode=catmull-rom
-  addpoint c at=20,10 mode=catmull-rom
-  addpoint d at=17,13 mode=catmull-rom
-place r2 shape=ring2 at=0,0
 shape bar template=path
-  addpoint a at=9,15
-  addpoint b at=15,9
+  addpoint a at=9,12
+  addpoint b at=15,12
 place b1 shape=bar at=0,0
+shape lefthook template=path
+  addpoint a at=10,8
+  addpoint b at=6,8 mode=catmull-rom
+  addpoint c at=4,12 mode=catmull-rom
+  addpoint d at=6,16 mode=catmull-rom
+  addpoint e at=10,16
+place lh shape=lefthook at=0,0
+shape righthook template=path
+  addpoint a at=14,8
+  addpoint b at=18,8 mode=catmull-rom
+  addpoint c at=20,12 mode=catmull-rom
+  addpoint d at=18,16 mode=catmull-rom
+  addpoint e at=14,16
+place rh shape=righthook at=0,0
