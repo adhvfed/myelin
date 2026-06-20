@@ -26,3 +26,15 @@ myelin-tenancy = { path = "../myelin-tenancy" }
 # Principal — the verified subject reference the holder's locate/erase key on (via SubjectRef).
 myelin-identity = { path = "../myelin-identity" }
 serde.workspace = true
+
+# DEV-ONLY: the rich ReBAC namespace ENGINE (FragmentDef / Userset / StoreBackedCheck) lives in the
+# Identity SERVICE crate. The runtime Git fragment is the names-only `myelin_identity::Namespace-
+# Fragment` ABI carrier (above) — a producer LEAF never depends on a service crate (the §2.9 DAG
+# stays acyclic). The contract-4.9 CDC pair (tests/cdc_4_9_git_fragment.rs) needs the real engine to
+# PROVE the Git fragment admits + its rewrites compile through the four operators, so the engine is a
+# dev-dependency (test scaffolding only — no runtime edge). EI-01 §7: extend/prove against the frozen
+# engine, never re-define it.
+[dev-dependencies]
+myelin-identity-service = { path = "../myelin-identity-service" }
+myelin-events = { path = "../myelin-events" }
+myelin-storage = { path = "../myelin-storage" }

@@ -1,5 +1,13 @@
-//! # `myelin-git` — the Git-hosting subsystem (GIT-P3 / P-063 floor: the H1 holder INTENT
-//! + the `#[personal_data(...)]` classification tags on the skeletal git schema)
+//! # `myelin-git` — the Git-hosting subsystem (the M1 freeze-so-dependents-compile slice)
+//!
+//! This crate carries the Git subsystem's **M1 contract freezes** — the relation/event/holder
+//! SHAPES dependents compile against, ahead of the M3 feature bulk:
+//! - [`rebac_fragment`] — **GIT-P1 / P-123**: the frozen Git ReBAC namespace fragment (contract
+//!   4.9) Identity compiles into the one cell schema (ref-glob + CODEOWNERS-as-relations +
+//!   `approve_untrusted_ci` + per-watchable `watcher`). Names freeze here; the permission rewrites
+//!   are wired LIVE in GIT-P13 (M3-G2) / P-ID-24.
+//! - [`holder_intent`] + [`schema`] — **GIT-P3 / P-063**: the H1 holder INTENT + the
+//!   `#[personal_data(...)]` classification tags (see below).
 //!
 //! **Owning architecture doc:**
 //! `planning/04-subsystem-architectures/git-hosting/architecture/00-overview.md` §1.1 (git OWNS
@@ -52,4 +60,5 @@
 #![forbid(unsafe_code)]
 
 pub mod holder_intent;
+pub mod rebac_fragment;
 pub mod schema;
