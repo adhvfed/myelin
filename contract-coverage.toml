@@ -594,7 +594,11 @@ cdc = ["crates/myelin-gdpr-service/tests/cdc_10_3_data_map.rs"]
 row = "10.4"
 title = "dsr_submit / dsr_status / dsr_certificate"
 status = "covered"
-cdc = ["crates/myelin-gdpr-service/tests/cdc_10_4_dsr_orchestrator.rs"]
+cdc = [
+    "crates/myelin-gdpr-service/tests/cdc_10_4_dsr_orchestrator.rs",
+    "crates/myelin-gdpr-service/tests/cdc_10_4_fanout.rs",
+    "crates/myelin-gdpr-service/tests/cdc_10_4_tenant_ops.rs",
+]
 
 [[contract]]
 row = "10.5"
