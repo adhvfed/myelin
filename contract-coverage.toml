@@ -297,8 +297,16 @@ landing = "P-078"
 [[contract]]
 row = "4.9"
 title = "per-subsystem ReBAC namespace fragment (engine + admit-contract + core hierarchy)"
+# The engine + admit-contract + core-hierarchy half (Identity, P-068). The per-subsystem fragment
+# SLICES of the same row land with each subsystem's freeze: the GIT fragment (ref-glob + CODEOWNERS-
+# as-relations + approve_untrusted_ci + watcher) is GIT-P1 / P-123 — its CDC declares the Git
+# fragment (CONSUMER) + admits it through the real engine (PROVIDER), proving it COMPILES into the
+# cell schema (the GIT-P1 gate) and its rewrites are admissible (wired LIVE in GIT-P13 / P-ID-24).
 status = "covered"
-cdc = ["crates/myelin-identity-service/tests/cdc_4_9_namespace_engine.rs"]
+cdc = [
+    "crates/myelin-identity-service/tests/cdc_4_9_namespace_engine.rs",
+    "crates/myelin-git/tests/cdc_4_9_git_fragment.rs",
+]
 
 [[contract]]
 row = "4.10"
