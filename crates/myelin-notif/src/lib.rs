@@ -69,6 +69,13 @@ use serde::{Deserialize, Serialize};
 // fixtures under `tests/fixtures/` (which the lint-gate excludes by the `/fixtures/` convention).
 pub mod cli;
 pub mod define_rule;
+// The delivery fabric (NOTIF-P16 / P-194 — §3.6, contract 7.8): the BODY behind the carrier trait.
+// The idempotent [`DeliveryFabric`] (at-least-once + idempotent on `UNIQUE(tenant, idem_key)`), the
+// deterministic [`MockAdapter`] (`--use-mock`-as-runtime), the redaction discipline (off-cell carries
+// a summary + deep link, `delivery.redacted=true`; in-app stays in-cell — 0 off-cell egress), and the
+// `delivery_success` telemetry signal. NOTIF-D9 (crash between provider-ack and ledger-write, retry →
+// EXACTLY ONE effective delivery per (item, channel)). FLOOR: the real EU provider is NOTIF-P25/P26.
+pub mod delivery;
 // Escalation on the durable wheel (NOTIF-P14 / P-192 — §2.4/§3.7, contract 7.5): `page(target,
 // reason)` starts an escalation DURABLE WORKFLOW walking the FROZEN chain shape (page →
 // oncall_now → notify(class=critical, pierces quiet-hours) → escalate-after-timer(ack_window) →
@@ -127,6 +134,10 @@ pub use cli::{
 pub use define_rule::{
     define_notif_rule, platform_default_reason, platform_default_rules, Classification, DedupTpl,
     DefineRuleError, NotifRule, NotifRuleRegistry,
+};
+pub use delivery::{
+    build_idem_key, channel_from_token, effective_delivery_count, is_eu_region, redact_for_offcell,
+    DeliveryError, DeliveryFabric, DeliveryLedger, DeliveryOutcome, DeliveryRecord, MockAdapter,
 };
 pub use escalation::{
     notify_for, oncall_now, render_oncall, render_page, DurableWheel, EscalationEngine,
