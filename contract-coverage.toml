@@ -516,11 +516,19 @@ title = "define_notif_rule"
 status = "deferred"
 landing = "P-186"
 
+# 7.7 SPLIT: the HOLDER HALF (registration + locate/export/rectify/restrict + the structural
+# references-not-payloads erase) ships NOW at NOTIF-P4 (P-182) with its provider+consumer CDC pair
+# (crates/myelin-notif/tests/cdc_7_7_notif_holder.rs) — Notif as holder H13 (NotificationHistory). The
+# REPLAY half (`replay(scope, since)` — the inbox rebuilt by reindex-from-source, the only recovery
+# path) lands at NOTIF-P17 (P-195); the off-cell-payload erasure residual (X-7 / 10.9) at NOTIF-P27
+# (P-469). The holder-half CDC pair is the dated green artifact for row 7.7 here.
 [[contract]]
 row = "7.7"
 title = "PersonalDataHolder (Notif history) + replay"
-status = "deferred"
-landing = "P-195"
+status = "covered"
+cdc = [
+    "crates/myelin-notif/tests/cdc_7_7_notif_holder.rs",
+]
 
 [[contract]]
 row = "7.8"
