@@ -1,10 +1,11 @@
-//! The **permission-aware query pipeline** (SRCH-P08 / P-171; architecture
-//! `search-and-indexing.md` §4.2 / §4.2.1): the ONE public [`query`] entry that composes the ACL
-//! filter FIRST, conjoins it into EVERY branch (FT / structured / vector) before any scoring, and
-//! proves **cross-tenant 0** (SRCH-D3) + the **structural no-N+1** (exactly ONE `list_objects` per
-//! query). The bounded-set `SetExpr` lowering (`All`/`None`/`Ids`/`NotIds`) lives here; the
-//! relational reverse-index JOIN forms (`InRelation`/`TupleSet` + `Union`/`Intersect`/`Difference`)
-//! are the sibling slice **SRCH-P09** (P-172), fed the SAME conjoin step.
+//! The **permission-aware query pipeline** (SRCH-P08 / P-171 + SRCH-P09 / P-172; architecture
+//! `search-and-indexing.md` §4.2 / §4.2.1 / §4.2.3): the ONE public [`query`] entry that composes
+//! the ACL filter FIRST, conjoins it into EVERY branch (FT / structured / vector) before any
+//! scoring, and proves **cross-tenant 0** (SRCH-D3) + the **structural no-N+1** (exactly ONE
+//! `list_objects` per query). The bounded-set `SetExpr` lowering (`All`/`None`/`Ids`/`NotIds`) is
+//! SRCH-P08; the **relational reverse-index JOIN** (`InRelation`/`TupleSet`) + the **boolean
+//! composition** (`Union`/`Intersect`/`Difference`) are **SRCH-P09** (P-172) — fed the SAME conjoin
+//! step (the big-result path; the cardinal zero-escape leak drill SRCH-D1).
 //!
 //! ## The pipeline (§4.2 — the five steps)
 //! 1. `acl ← Id.list_objects(viewer, read, ty, at)` → `Ids{ids,zookie} | Filter{set_expr,zookie}`
@@ -24,9 +25,21 @@
 //! - `Filter{SetExpr::None}` → [`AclFilter::None`] (short-circuit to empty — `WHERE false`).
 //! - `Filter{SetExpr::Ids}` → [`AclFilter::Ids`]; `Filter{SetExpr::NotIds}` → [`AclFilter::NotIds`]
 //!   (the bounded deny-set; `WHERE id NOT IN (...)`).
-//! - the RELATIONAL forms (`InRelation`/`TupleSet`/`Union`/`Intersect`/`Difference`) → a loud
-//!   [`QueryError::RelationalSetExpr`] **floor** (SRCH-P09) — surfaced, NEVER silently widened to
-//!   `All` (a silent widen would be a cross-tenant/permission leak).
+//!
+//! ## The relational `SetExpr` reverse-index JOIN (the SRCH-P09 crux, §4.2 / §4.2.3)
+//! - `Filter{SetExpr::InRelation{relation, via_column}}` / `Filter{SetExpr::TupleSet{index}}` → the
+//!   **reverse-index JOIN**: [`ListObjectsPort::resolve_relation`] JOINs against the per-tenant
+//!   authz reverse index (Identity's materialised `(subject, relation, object_id)` projection,
+//!   replicated per cell) for the visible-id set, which lowers to the SAME [`AclFilter::Ids`]
+//!   membership clause as the bounded path (the Zanzibar/Leopard `LookupResources` reverse index as
+//!   a conjoinable filter; ONE JOIN per leaf, no N+1, no post-filter). The JOIN **honours the
+//!   revision watermark** ([`RevisionWatermark`], contract 4.10): a resolved revision below the
+//!   `list_objects` watermark is a loud [`QueryError::StaleReverseIndex`], NEVER read stale.
+//! - `Filter{SetExpr::Union/Intersect/Difference}` → [`AclFilter::Or`]/[`AclFilter::And`]/
+//!   (`And` + [`AclFilter::Not`]) — the boolean composition of the lowered sub-clauses, composed at
+//!   the posting-list level BEFORE scoring (a hidden doc never enters the candidate set under ANY
+//!   branch). NO form is EVER silently widened to `All` (that would be a permission/cross-tenant
+//!   leak).
 //!
 //! ## Cross-tenant 0 (SRCH-D3, F2 — the GATE) — tenant from the verified token, never the path
 //! [`query`] takes the **verified [`Principal`]** (`viewer`) and derives the tenant from
@@ -51,14 +64,18 @@
 //! conjoin step) has 0 unjustified survivors: a surviving mutant there would be a permission lowering
 //! the tests do not pin (a potential leak), so the floor is the full kill of that surface.
 //!
-//! ## FLOOR named (so the bounded-set lowering is not mistaken for the whole crux)
-//! - The **relational** `SetExpr` reverse-index JOIN (`InRelation`/`TupleSet`) + boolean composition
-//!   (`Union`/`Intersect`/`Difference`) + the full zero-escape leak drill **SRCH-D1** across an
-//!   adversarial corpus → **SRCH-P09** (P-172). Here those forms are a loud floor error.
-//! - The **zookie/consistency mechanism** (no-stale-grant + the fail-static bypass) → **SRCH-P10**
-//!   (P-173). Here the zookie from `list_objects` is THREADED through onto every result
-//!   ([`RankedResults::zookie`]) and the [`Consistency`] mode is forwarded, but the
-//!   revision-watermark wait/fail-static-bypass enforcement is the downstream prompt.
+//! ## FLOOR named (the downstream slices, so SRCH-P09 is not mistaken for the whole consistency story)
+//! - The **relational reverse-index JOIN** (`InRelation`/`TupleSet`) + the **boolean composition**
+//!   (`Union`/`Intersect`/`Difference`) is IMPLEMENTED HERE (SRCH-P09 / P-172): the JOIN resolves
+//!   the visible-id set, honours the revision watermark, and composes at the posting-list level. The
+//!   full zero-escape leak drill **SRCH-D1** (the cardinal sin, the big-result path, incl.
+//!   counts/IDF/RAG) is proven by this crate's drill test.
+//! - The **full no-stale-grant + fail-static mechanism** (SRCH-D2: the new-enemy drill — revoke,
+//!   re-search, the fail-static cache bypass) → **SRCH-P10** (P-173). Here the watermark mechanism
+//!   is wired so the JOIN never READS a stale reverse-index revision (a stale revision is a loud
+//!   [`QueryError::StaleReverseIndex`]); the wait/bounded-recheck/fail-static bypass is downstream.
+//! - The **BM25 default ranking** → the post-M5 learning-to-rank / semantic re-rank floor
+//!   (**SRCH-P26**). Here scoring is BM25 / the deterministic interleave.
 //! - The **hybrid RRF fusion + vector filter-during-traversal** → **SRCH-P11** (P-174). Here a
 //!   hybrid query runs all three branches with the conjoined ACL and a deterministic interleave; the
 //!   tuned RRF rank fusion is the downstream prompt.
@@ -67,8 +84,8 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use myelin_identity::{
-    Consistency, ListObjectsResult, ObjectType, Permission, Principal, Result as AuthzResult,
-    SetExpr,
+    ColRef, Consistency, ListObjectsResult, ObjectType, Permission, Principal, RelName,
+    Result as AuthzResult, SetExpr,
 };
 use myelin_query::QueryAst;
 
@@ -98,6 +115,75 @@ pub trait ListObjectsPort {
         ty: &ObjectType,
         at: &Consistency,
     ) -> AuthzResult<ListObjectsResult>;
+
+    /// **Resolve a relational `SetExpr` form to the co-located visible-id set (the SRCH-P09
+    /// reverse-index JOIN, contract 4.3 / §4.2).** When `list_objects` returns a `Filter` whose
+    /// algebra contains the relational forms `InRelation{relation, via_column}` / `TupleSet{index}`,
+    /// Search JOINs against the **per-tenant authz reverse index** — Identity's materialised
+    /// `(subject, relation, object_id)` projection, replicated/queried per cell, kept fresh off the
+    /// bus. This resolves ONE such form for `subject` to the set of `object_id`s the subject reaches,
+    /// together with the **revision** the reverse index served the answer at (contract 4.10, the
+    /// revision watermark — the JOIN never reads a revision staler than the `required` watermark
+    /// derived from the `list_objects` zookie). The Zanzibar/Leopard `LookupResources` reverse index
+    /// as a conjoinable filter; ONE resolve per relational leaf, no N+1.
+    ///
+    /// **Default = unavailable (deny-when-unsure, ADR-03).** A port wired ONLY for the bounded-set
+    /// path (the SRCH-P08 fakes) has no reverse index; resolving a relational form against it is a
+    /// loud `Unavailable`, never a silent widen. The production wiring + the SRCH-P09 tests provide
+    /// a real resolver.
+    fn resolve_relation(
+        &self,
+        _subject: &Principal,
+        _form: &RelationalLeaf,
+        _required: &RevisionWatermark,
+    ) -> AuthzResult<ReverseIndexAnswer> {
+        Err(myelin_identity::AuthzError::Unavailable(
+            "the authz reverse index is not wired for this query path — a relational SetExpr leaf \
+             cannot be resolved (deny-when-unsure, ADR-03; SRCH-P09 needs a reverse-index resolver)"
+                .into(),
+        ))
+    }
+}
+
+/// **A relational `SetExpr` leaf the reverse-index JOIN resolves (SRCH-P09).** The two relational
+/// forms of the frozen algebra (OQ-E): `InRelation{relation, via_column}` (objects where the
+/// doc_id is the object of `relation` for the subject — a JOIN keyed by the consumer's own
+/// `via_column`) and `TupleSet{index}` (a server-materialised tuple set to JOIN against — the
+/// big-result path). Lifted out of [`myelin_identity::SetExpr`] so the resolver port takes JUST the
+/// relational leaf (the boolean composition is resolved by the pipeline, not the port).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RelationalLeaf {
+    /// `InRelation{relation, via_column}` — objects where the doc_id is the object of `relation`
+    /// for the subject, JOINed by the consumer's own `via_column`.
+    InRelation { relation: RelName, via_column: ColRef },
+    /// `TupleSet{index}` — a server-materialised `(subject, relation, object_id)` tuple set to
+    /// JOIN/semijoin against (the big-result path).
+    TupleSet { index: myelin_identity::AuthzIndexRef },
+}
+
+/// **The authz reverse-index revision watermark (contract 4.10, §4.2.3).** A monotone revision the
+/// reverse-index JOIN honours: the JOIN must read at a revision **≥** the watermark the
+/// `list_objects` answer was computed at (derived from its zookie), so a JOIN never composes a
+/// reverse-index revision OLDER than the ACL snapshot the rest of the filter was computed at (a
+/// stale reverse-index revision could re-admit a just-revoked grant — the new-enemy problem). The
+/// FULL no-stale-grant + fail-static drill (SRCH-D2) is **SRCH-P10**; here the mechanism is wired so
+/// the JOIN never READS a stale revision — a resolver returning a revision below the watermark is a
+/// loud [`QueryError::StaleReverseIndex`], resolved by the bounded-check fallback, never served.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RevisionWatermark(pub u64);
+
+/// **The reverse-index JOIN answer (SRCH-P09).** The co-located visible-id set the relational leaf
+/// resolved to + the **revision** the reverse index served it at (contract 4.10). The pipeline
+/// checks `revision >= required` (the watermark) before composing the set into the ACL filter — a
+/// revision below the watermark is rejected loudly (never read stale).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReverseIndexAnswer {
+    /// The `object_id`s the subject reaches via this relational leaf (the visible-id set the JOIN
+    /// produced — the `LookupResources` reverse index as a conjoinable membership clause).
+    pub object_ids: Vec<String>,
+    /// The reverse-index revision this answer was served at (contract 4.10). The watermark check
+    /// asserts `revision >= required`.
+    pub revision: RevisionWatermark,
 }
 
 /// **A per-tenant [`IndexBackend`] coupled to the `(tenant, region)` it was opened for** (§3.4 — the
@@ -208,6 +294,11 @@ pub struct QueryStats {
     /// The number of engine `search`/`search_structured`/`semantic` branch executions (FT +
     /// structured + vector). Observable so a hybrid query's branch count is provable.
     engine_branches: AtomicU64,
+    /// **The number of authz reverse-index JOINs the relational lowering issued (SRCH-P09).** One
+    /// resolve per relational `SetExpr` leaf — the no-N+1 GATE on the relational path asserts the
+    /// JOIN against the reverse index is ONE query per leaf (a single relational filter ⇒ exactly 1,
+    /// never one resolve per candidate doc). The `Ids vs Filter/TupleSet` filter-mode split (1.8).
+    reverse_index_joins: AtomicU64,
 }
 
 impl QueryStats {
@@ -224,6 +315,12 @@ impl QueryStats {
     /// The number of engine branch executions recorded.
     pub fn engine_branches(&self) -> u64 {
         self.engine_branches.load(Ordering::Relaxed)
+    }
+
+    /// The number of authz reverse-index JOINs recorded (SRCH-P09 — the relational-path no-N+1 GATE
+    /// reads this: ONE resolve per relational `SetExpr` leaf, never one per candidate doc).
+    pub fn reverse_index_joins(&self) -> u64 {
+        self.reverse_index_joins.load(Ordering::Relaxed)
     }
 }
 
@@ -245,11 +342,13 @@ pub enum QueryError {
     /// tenant's index. (The tenant is from the verified token, never a path — this catches a
     /// mis-wired caller, never a spoofable path parameter.)
     TenantMismatch { viewer_tenant: String, engine_tenant: String },
-    /// The `list_objects` answer was a RELATIONAL `SetExpr` form (`InRelation`/`TupleSet`/
-    /// `Union`/`Intersect`/`Difference`) — the reverse-index JOIN that the SRCH-P09 sibling slice
-    /// lowers. The bounded-set pipeline does NOT widen it to `All` (that would leak); it surfaces a
-    /// loud floor error naming SRCH-P09.
-    RelationalSetExpr { form: &'static str },
+    /// **The authz reverse-index JOIN read a revision STALER than the required watermark (SRCH-P09 /
+    /// contract 4.10).** A relational `SetExpr` leaf resolved to a reverse-index answer whose
+    /// revision is BELOW the watermark the `list_objects` zookie required — the JOIN refuses to
+    /// compose a stale reverse-index revision (a stale revision could re-admit a just-revoked grant,
+    /// the new-enemy problem). Surfaced loudly here; the full no-stale-grant + fail-static bounded
+    /// re-check is SRCH-P10. NEVER served stale-allow.
+    StaleReverseIndex { required: u64, served: u64, form: &'static str },
 }
 
 impl std::fmt::Display for QueryError {
@@ -264,11 +363,13 @@ impl std::fmt::Display for QueryError {
                  `{engine_tenant}` (SRCH-D3 — tenant from the verified token, the engine is the \
                  wrong tenant's index)"
             ),
-            QueryError::RelationalSetExpr { form } => write!(
+            QueryError::StaleReverseIndex { required, served, form } => write!(
                 f,
-                "the list_objects answer is the relational SetExpr form `{form}` — the \
-                 reverse-index JOIN is the SRCH-P09 (P-172) sibling slice; the bounded-set pipeline \
-                 surfaces it loudly rather than widening to All (a silent widen would leak)"
+                "the authz reverse-index JOIN for the relational form `{form}` served revision \
+                 {served} but the list_objects watermark requires >= {required} (contract 4.10) — \
+                 the JOIN refuses to compose a stale reverse-index revision (SRCH-P09; a stale \
+                 revision could re-admit a revoked grant — the new-enemy problem); the full \
+                 no-stale-grant + fail-static path is SRCH-P10"
             ),
         }
     }
@@ -288,12 +389,35 @@ impl From<IndexError> for QueryError {
     }
 }
 
-/// **Lower a bounded-set [`ListObjectsResult`] to the engine [`AclFilter`] (the SRCH-P08 crux).**
-/// `Ids{ids}` (the materialised S4 path) → a doc-id allow-set; `Filter{set_expr}` lowers the
-/// bounded-set `SetExpr` forms (`All`/`None`/`Ids`/`NotIds`). A RELATIONAL form is a loud floor
-/// error ([`QueryError::RelationalSetExpr`], SRCH-P09) — NEVER silently widened to `All`. Returns
-/// the lowered filter + the zookie the answer was computed at.
-fn lower_acl(result: &ListObjectsResult) -> Result<(AclFilter, String), QueryError> {
+/// **Derive the reverse-index revision watermark from a `list_objects` zookie (contract 4.10).** The
+/// zookie is the consistency snapshot the ACL answer was computed at; the reverse-index JOIN must
+/// read at a revision **≥** this watermark so it never composes a revision older than the rest of the
+/// filter. In Search's embedded model the opaque zookie carries a monotone revision suffix
+/// `…@<rev>`; a zookie with no suffix carries watermark 0 (any non-stale revision satisfies it). The
+/// real zookie→revision mapping is Identity's (contract 4.10); this is the deterministic embedded
+/// model the SRCH-P09 watermark mechanism is proven against (the full fail-static path is SRCH-P10).
+fn watermark_from_zookie(zookie: &str) -> RevisionWatermark {
+    let rev = zookie
+        .rsplit_once('@')
+        .and_then(|(_, suffix)| suffix.parse::<u64>().ok())
+        .unwrap_or(0);
+    RevisionWatermark(rev)
+}
+
+/// **Lower a [`ListObjectsResult`] to the engine [`AclFilter`] (the SRCH-P08 bounded-set crux +
+/// the SRCH-P09 relational reverse-index JOIN).** `Ids{ids}` (the materialised S4 path) → a doc-id
+/// allow-set; `Filter{set_expr}` lowers the FULL frozen `SetExpr` algebra: the bounded-set forms
+/// (`All`/`None`/`Ids`/`NotIds`) directly, and the **relational** forms (`InRelation`/`TupleSet`)
+/// via the reverse-index JOIN (`identity.resolve_relation` against the per-tenant authz reverse
+/// index, honouring the revision watermark), composing `Union`/`Intersect`/`Difference` into the
+/// `And`/`Or`/`Not` boolean clauses. Returns the lowered filter + the zookie the answer was computed
+/// at. No form is EVER silently widened to `All` (that would leak).
+fn lower_acl(
+    result: &ListObjectsResult,
+    subject: &Principal,
+    identity: &dyn ListObjectsPort,
+    stats: &QueryStats,
+) -> Result<(AclFilter, String), QueryError> {
     match result {
         ListObjectsResult::Ids { ids, zookie } => {
             let ids: Vec<String> = ids.iter().map(|o| o.0.clone()).collect();
@@ -302,13 +426,26 @@ fn lower_acl(result: &ListObjectsResult) -> Result<(AclFilter, String), QueryErr
             Ok((filter, zookie.0.clone()))
         }
         ListObjectsResult::Filter { set_expr, zookie } => {
-            Ok((lower_set_expr(set_expr)?, zookie.0.clone()))
+            // The watermark the reverse-index JOIN must honour is the snapshot the ACL answer was
+            // computed at (contract 4.10) — the SAME zookie the rest of the filter rode.
+            let required = watermark_from_zookie(&zookie.0);
+            let filter = lower_set_expr(set_expr, subject, identity, &required, stats)?;
+            Ok((filter, zookie.0.clone()))
         }
     }
 }
 
-/// Lower a BOUNDED-SET [`SetExpr`] to an [`AclFilter`]. The relational forms are the SRCH-P09 floor.
-fn lower_set_expr(set_expr: &SetExpr) -> Result<AclFilter, QueryError> {
+/// **Lower a [`SetExpr`] to an [`AclFilter`] — the full frozen algebra (OQ-E).** The bounded-set
+/// forms lower directly; the relational forms JOIN against the reverse index (honouring `required`,
+/// the revision watermark); the boolean forms compose recursively into `And`/`Or`/`Not`. No silent
+/// widen to `All` for any form.
+fn lower_set_expr(
+    set_expr: &SetExpr,
+    subject: &Principal,
+    identity: &dyn ListObjectsPort,
+    required: &RevisionWatermark,
+    stats: &QueryStats,
+) -> Result<AclFilter, QueryError> {
     match set_expr {
         SetExpr::All => Ok(AclFilter::All),
         SetExpr::None => Ok(AclFilter::None),
@@ -322,14 +459,93 @@ fn lower_set_expr(set_expr: &SetExpr) -> Result<AclFilter, QueryError> {
             // An empty deny-set excludes nothing ⇒ everything of this type is visible (`All`).
             Ok(if ids.is_empty() { AclFilter::All } else { AclFilter::NotIds(ids) })
         }
-        // The RELATIONAL forms (the reverse-index JOIN + boolean composition) are SRCH-P09. Surface
-        // the form name loudly — a silent widen to `All` would be a permission/cross-tenant leak.
-        SetExpr::InRelation { .. } => Err(QueryError::RelationalSetExpr { form: "InRelation" }),
-        SetExpr::TupleSet { .. } => Err(QueryError::RelationalSetExpr { form: "TupleSet" }),
-        SetExpr::Union(_) => Err(QueryError::RelationalSetExpr { form: "Union" }),
-        SetExpr::Intersect(_) => Err(QueryError::RelationalSetExpr { form: "Intersect" }),
-        SetExpr::Difference(_, _) => Err(QueryError::RelationalSetExpr { form: "Difference" }),
+        // **THE RELATIONAL REVERSE-INDEX JOIN (SRCH-P09).** Resolve the relational leaf to the
+        // co-located visible-id set via the per-tenant authz reverse index, honouring the watermark.
+        SetExpr::InRelation { relation, via_column } => resolve_relational_leaf(
+            &RelationalLeaf::InRelation {
+                relation: relation.clone(),
+                via_column: via_column.clone(),
+            },
+            "InRelation",
+            subject,
+            identity,
+            required,
+            stats,
+        ),
+        SetExpr::TupleSet { index } => resolve_relational_leaf(
+            &RelationalLeaf::TupleSet { index: index.clone() },
+            "TupleSet",
+            subject,
+            identity,
+            required,
+            stats,
+        ),
+        // **THE BOOLEAN COMPOSITION (SRCH-P09).** Union/Intersect/Difference compose the lowered
+        // sub-clauses into the engine `Or`/`And`/`Not` — at the posting-list level, before scoring.
+        SetExpr::Union(subs) => {
+            let mut clauses = Vec::with_capacity(subs.len());
+            for s in subs {
+                clauses.push(lower_set_expr(s, subject, identity, required, stats)?);
+            }
+            Ok(AclFilter::Or(clauses))
+        }
+        SetExpr::Intersect(subs) => {
+            let mut clauses = Vec::with_capacity(subs.len());
+            for s in subs {
+                clauses.push(lower_set_expr(s, subject, identity, required, stats)?);
+            }
+            Ok(AclFilter::And(clauses))
+        }
+        SetExpr::Difference(left, right) => {
+            // `left EXCEPT right` = `left AND NOT right` — the visible-under-left minus the
+            // reachable-under-right, composed at the posting-list level (BEFORE scoring).
+            let l = lower_set_expr(left, subject, identity, required, stats)?;
+            let r = lower_set_expr(right, subject, identity, required, stats)?;
+            Ok(AclFilter::And(vec![l, AclFilter::Not(Box::new(r))]))
+        }
     }
+}
+
+/// **Resolve ONE relational `SetExpr` leaf to the co-located visible-id set (the SRCH-P09
+/// reverse-index JOIN).** JOINs against the per-tenant authz reverse index
+/// ([`ListObjectsPort::resolve_relation`]), honours the revision watermark (a served revision below
+/// `required` is a loud [`QueryError::StaleReverseIndex`], never read stale — §4.2.3 / contract
+/// 4.10), and lowers the resulting visible-id set to the SAME `Ids` membership clause the bounded
+/// set path uses (an empty resolved set ⇒ `None` — the subject reaches nothing via this relation,
+/// never a silent widen). ONE resolve per leaf (no N+1; the resolve count is recorded so the GATE
+/// can assert it).
+fn resolve_relational_leaf(
+    leaf: &RelationalLeaf,
+    form: &'static str,
+    subject: &Principal,
+    identity: &dyn ListObjectsPort,
+    required: &RevisionWatermark,
+    stats: &QueryStats,
+) -> Result<AclFilter, QueryError> {
+    let answer = identity
+        .resolve_relation(subject, leaf, required)
+        .map_err(QueryError::Authz)?;
+    stats.reverse_index_joins.fetch_add(1, Ordering::Relaxed);
+
+    // **THE REVISION WATERMARK CHECK (contract 4.10):** the JOIN must read at a revision >= the
+    // watermark the ACL snapshot was computed at. A staler revision is REFUSED — never composed
+    // into the filter (a stale reverse-index revision could re-admit a just-revoked grant).
+    if answer.revision < *required {
+        return Err(QueryError::StaleReverseIndex {
+            required: required.0,
+            served: answer.revision.0,
+            form,
+        });
+    }
+
+    // Lower the resolved visible-id set to the SAME membership clause as the bounded `Ids` path
+    // (one membership-clause meaning — no drift between the bounded path and the relational JOIN).
+    // An empty resolved set is deny (the subject reaches nothing via this relation), never `All`.
+    Ok(if answer.object_ids.is_empty() {
+        AclFilter::None
+    } else {
+        AclFilter::Ids(answer.object_ids)
+    })
 }
 
 /// **THE ONE PUBLIC QUERY ENTRY (contract 6.1) — permission-aware by construction.** Composes the
@@ -374,8 +590,10 @@ pub fn query<B: IndexBackend>(
         .map_err(QueryError::Authz)?;
     stats.list_objects_calls.fetch_add(1, Ordering::Relaxed);
 
-    // Lower the bounded-set SetExpr → AclFilter (the relational forms are the SRCH-P09 floor).
-    let (acl, zookie) = lower_acl(&lo)?;
+    // Lower the FULL SetExpr algebra → AclFilter: the bounded-set forms directly (SRCH-P08) AND the
+    // relational reverse-index JOIN + boolean composition (SRCH-P09), honouring the revision
+    // watermark. A relational leaf JOINs against the per-tenant authz reverse index via `identity`.
+    let (acl, zookie) = lower_acl(&lo, viewer, identity, stats)?;
 
     // **STEP 2 — compile the frozen AST** to the FT/structured/vector branches (SRCH-P07).
     let plan = compiler::compile(ast, &engine.schema)?;
@@ -578,13 +796,20 @@ mod tests {
     }
 
     /// A scripted [`ListObjectsPort`] returning a canned [`ListObjectsResult`] and counting calls.
+    /// For the SRCH-P09 relational path it ALSO carries a canned reverse-index answer (the visible-id
+    /// set + revision the JOIN resolves) and counts `resolve_relation` calls (the no-N+1 GATE).
     struct FakeAuthz {
         answer: ListObjectsResult,
         calls: AtomicU64,
+        /// The canned reverse-index JOIN answer (the visible-id set + served revision). `None` ⇒ the
+        /// port has no reverse index (the bounded-set fakes) and a relational leaf is `Unavailable`.
+        reverse: Option<ReverseIndexAnswer>,
+        /// The number of `resolve_relation` (reverse-index JOIN) calls (the relational no-N+1 GATE).
+        resolve_calls: AtomicU64,
     }
     impl FakeAuthz {
         fn new(answer: ListObjectsResult) -> FakeAuthz {
-            FakeAuthz { answer, calls: AtomicU64::new(0) }
+            FakeAuthz { answer, calls: AtomicU64::new(0), reverse: None, resolve_calls: AtomicU64::new(0) }
         }
         fn ids(ids: &[&str]) -> FakeAuthz {
             FakeAuthz::new(ListObjectsResult::Ids {
@@ -594,6 +819,16 @@ mod tests {
         }
         fn filter(set_expr: SetExpr) -> FakeAuthz {
             FakeAuthz::new(ListObjectsResult::Filter { set_expr, zookie: Zookie("z-acl".into()) })
+        }
+        /// A `Filter{set_expr, zookie}` answer with an explicit zookie (carrying a `@<rev>` suffix
+        /// so the watermark can be exercised) + a canned reverse-index JOIN answer.
+        fn filter_with(set_expr: SetExpr, zookie: &str, reverse: ReverseIndexAnswer) -> FakeAuthz {
+            FakeAuthz {
+                answer: ListObjectsResult::Filter { set_expr, zookie: Zookie(zookie.into()) },
+                calls: AtomicU64::new(0),
+                reverse: Some(reverse),
+                resolve_calls: AtomicU64::new(0),
+            }
         }
     }
     impl ListObjectsPort for FakeAuthz {
@@ -607,6 +842,17 @@ mod tests {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Ok(self.answer.clone())
         }
+        fn resolve_relation(
+            &self,
+            _subject: &Principal,
+            _form: &RelationalLeaf,
+            _required: &RevisionWatermark,
+        ) -> AuthzResult<ReverseIndexAnswer> {
+            self.resolve_calls.fetch_add(1, Ordering::Relaxed);
+            self.reverse
+                .clone()
+                .ok_or_else(|| myelin_identity::AuthzError::Unavailable("no reverse index".into()))
+        }
     }
 
     fn corpus() -> TantivyBackend {
@@ -619,70 +865,208 @@ mod tests {
 
     // ---- the bounded-set SetExpr lowering ---------------------------------
 
+    /// A no-reverse-index port + a default watermark — the bounded-set lowering needs neither.
+    fn no_reverse() -> FakeAuthz {
+        FakeAuthz::ids(&[])
+    }
+    /// Lower a bounded-set `SetExpr` directly (no reverse index needed).
+    fn lower_bounded(set_expr: &SetExpr) -> Result<AclFilter, QueryError> {
+        let v = viewer("acme");
+        let authz = no_reverse();
+        lower_set_expr(set_expr, &v, &authz, &RevisionWatermark(0), &QueryStats::new())
+    }
+
     /// **`SetExpr::All` → `AclFilter::All` (no clause); `None` → `AclFilter::None` (short-circuit).**
     #[test]
     fn lower_all_and_none() {
-        assert_eq!(lower_set_expr(&SetExpr::All).unwrap(), AclFilter::All);
-        assert_eq!(lower_set_expr(&SetExpr::None).unwrap(), AclFilter::None);
+        assert_eq!(lower_bounded(&SetExpr::All).unwrap(), AclFilter::All);
+        assert_eq!(lower_bounded(&SetExpr::None).unwrap(), AclFilter::None);
     }
 
     /// **`SetExpr::Ids` → an allow-set; an EMPTY `Ids` → `None` (deny), never `All`.**
     #[test]
     fn lower_ids_and_empty_ids() {
-        let f = lower_set_expr(&SetExpr::Ids(vec![ObjectId("a".into()), ObjectId("b".into())]))
+        let f = lower_bounded(&SetExpr::Ids(vec![ObjectId("a".into()), ObjectId("b".into())]))
             .unwrap();
         assert_eq!(f, AclFilter::Ids(vec!["a".into(), "b".into()]));
         // An explicit empty allow-set is DENY (the viewer sees nothing), never a silent widen.
-        assert_eq!(lower_set_expr(&SetExpr::Ids(vec![])).unwrap(), AclFilter::None);
+        assert_eq!(lower_bounded(&SetExpr::Ids(vec![])).unwrap(), AclFilter::None);
     }
 
     /// **`SetExpr::NotIds` → a bounded deny-set; an EMPTY `NotIds` → `All` (excludes nothing).**
     #[test]
     fn lower_not_ids_and_empty_not_ids() {
-        let f = lower_set_expr(&SetExpr::NotIds(vec![ObjectId("x".into())])).unwrap();
+        let f = lower_bounded(&SetExpr::NotIds(vec![ObjectId("x".into())])).unwrap();
         assert_eq!(f, AclFilter::NotIds(vec!["x".into()]));
-        assert_eq!(lower_set_expr(&SetExpr::NotIds(vec![])).unwrap(), AclFilter::All);
+        assert_eq!(lower_bounded(&SetExpr::NotIds(vec![])).unwrap(), AclFilter::All);
     }
 
-    /// **THE FLOOR: every RELATIONAL `SetExpr` form is a LOUD error (SRCH-P09), NEVER widened to
-    /// `All`.** A silent widen would be a cross-tenant/permission leak.
+    // ---- SRCH-P09: the relational reverse-index JOIN + boolean composition --
+
+    fn rev_answer(ids: &[&str], revision: u64) -> ReverseIndexAnswer {
+        ReverseIndexAnswer {
+            object_ids: ids.iter().map(|s| (*s).to_string()).collect(),
+            revision: RevisionWatermark(revision),
+        }
+    }
+
+    /// **`InRelation` lowers via the reverse-index JOIN to the resolved visible-id set (an `Ids`
+    /// membership clause), honouring the watermark — ONE resolve, never widened to `All`.**
     #[test]
-    fn relational_set_expr_forms_are_a_loud_floor_not_widened() {
-        use myelin_identity::{AuthzIndexRef, ColRef, RelName};
-        let relational = [
+    fn relational_in_relation_lowers_via_reverse_index_join() {
+        use myelin_identity::{ColRef, RelName};
+        let authz = FakeAuthz::filter_with(
             SetExpr::InRelation {
                 relation: RelName("reader".into()),
                 via_column: ColRef { table: "issue".into(), column: "id".into() },
             },
+            "z@7",
+            rev_answer(&["acme/issue/PUB-1", "acme/issue/PUB-2"], 7),
+        );
+        let v = viewer("acme");
+        let stats = QueryStats::new();
+        let (f, z) = lower_acl(&authz.answer.clone(), &v, &authz, &stats).unwrap();
+        assert_eq!(
+            f,
+            AclFilter::Ids(vec!["acme/issue/PUB-1".into(), "acme/issue/PUB-2".into()]),
+            "the JOIN resolves to the visible-id set as an Ids membership clause (not All)"
+        );
+        assert_eq!(z, "z@7", "the list_objects zookie is threaded through");
+        assert_eq!(stats.reverse_index_joins(), 1, "exactly ONE reverse-index JOIN (no N+1)");
+    }
+
+    /// **`TupleSet` lowers via the reverse-index JOIN; an EMPTY resolved set is `None` (the subject
+    /// reaches nothing via this relation), NEVER a silent widen to `All`.**
+    #[test]
+    fn relational_tuple_set_empty_resolved_is_deny_not_widen() {
+        use myelin_identity::AuthzIndexRef;
+        let authz = FakeAuthz::filter_with(
+            SetExpr::TupleSet { index: AuthzIndexRef("authz_visible".into()) },
+            "z@3",
+            rev_answer(&[], 3), // the subject reaches NOTHING
+        );
+        let v = viewer("acme");
+        let (f, _) = lower_acl(&authz.answer.clone(), &v, &authz, &QueryStats::new()).unwrap();
+        assert_eq!(f, AclFilter::None, "an empty resolved set ⇒ deny, never widened to All");
+    }
+
+    /// **THE REVISION WATERMARK (contract 4.10): a reverse-index revision BELOW the watermark is a
+    /// loud `StaleReverseIndex`, never read stale (the JOIN refuses the stale revision).**
+    #[test]
+    fn relational_stale_reverse_index_revision_is_refused() {
+        use myelin_identity::AuthzIndexRef;
+        // The list_objects zookie requires watermark 9; the reverse index serves only revision 4.
+        let authz = FakeAuthz::filter_with(
             SetExpr::TupleSet { index: AuthzIndexRef("ix".into()) },
-            SetExpr::Union(vec![SetExpr::All]),
-            SetExpr::Intersect(vec![SetExpr::All]),
-            SetExpr::Difference(Box::new(SetExpr::All), Box::new(SetExpr::None)),
-        ];
-        for form in relational {
-            let err = lower_set_expr(&form).expect_err("a relational form is the SRCH-P09 floor");
-            assert!(
-                matches!(err, QueryError::RelationalSetExpr { .. }),
-                "relational form must be a loud floor, not silently widened: {err}"
-            );
-            // The error names SRCH-P09 (the sibling slice) — it is a NAMED floor, not a panic.
-            assert!(err.to_string().contains("SRCH-P09"), "the floor names its follow-on");
+            "z@9",
+            rev_answer(&["acme/issue/PUB-1"], 4),
+        );
+        let v = viewer("acme");
+        let err = lower_acl(&authz.answer.clone(), &v, &authz, &QueryStats::new())
+            .expect_err("a stale reverse-index revision is refused");
+        match err {
+            QueryError::StaleReverseIndex { required, served, .. } => {
+                assert_eq!(required, 9);
+                assert_eq!(served, 4);
+            }
+            other => panic!("expected StaleReverseIndex, got {other}"),
         }
+    }
+
+    /// **A reverse-index revision AT or ABOVE the watermark is accepted (the watermark is `>=`, not
+    /// `>`).** Served revision == required watermark is fresh enough.
+    #[test]
+    fn relational_revision_at_watermark_is_accepted() {
+        use myelin_identity::AuthzIndexRef;
+        let authz = FakeAuthz::filter_with(
+            SetExpr::TupleSet { index: AuthzIndexRef("ix".into()) },
+            "z@5",
+            rev_answer(&["acme/issue/PUB-1"], 5), // exactly at the watermark
+        );
+        let v = viewer("acme");
+        let (f, _) = lower_acl(&authz.answer.clone(), &v, &authz, &QueryStats::new()).unwrap();
+        assert_eq!(f, AclFilter::Ids(vec!["acme/issue/PUB-1".into()]), "revision == watermark is fresh");
+    }
+
+    /// **`Union`/`Intersect`/`Difference` compose into `Or`/`And`/(`And` + `Not`) over the lowered
+    /// sub-clauses (the boolean composition, SRCH-P09).**
+    #[test]
+    fn boolean_composition_lowers_to_engine_and_or_not() {
+        // Union(Ids[a], Ids[b]) → Or([Ids[a], Ids[b]]).
+        let u = lower_bounded(&SetExpr::Union(vec![
+            SetExpr::Ids(vec![ObjectId("a".into())]),
+            SetExpr::Ids(vec![ObjectId("b".into())]),
+        ]))
+        .unwrap();
+        assert_eq!(
+            u,
+            AclFilter::Or(vec![AclFilter::Ids(vec!["a".into()]), AclFilter::Ids(vec!["b".into()])])
+        );
+
+        // Intersect(All, NotIds[x]) → And([All, NotIds[x]]).
+        let i = lower_bounded(&SetExpr::Intersect(vec![
+            SetExpr::All,
+            SetExpr::NotIds(vec![ObjectId("x".into())]),
+        ]))
+        .unwrap();
+        assert_eq!(i, AclFilter::And(vec![AclFilter::All, AclFilter::NotIds(vec!["x".into()])]));
+
+        // Difference(All, Ids[secret]) → And([All, Not(Ids[secret])]) = everything EXCEPT secret.
+        let d = lower_bounded(&SetExpr::Difference(
+            Box::new(SetExpr::All),
+            Box::new(SetExpr::Ids(vec![ObjectId("secret".into())])),
+        ))
+        .unwrap();
+        assert_eq!(
+            d,
+            AclFilter::And(vec![
+                AclFilter::All,
+                AclFilter::Not(Box::new(AclFilter::Ids(vec!["secret".into()])))
+            ])
+        );
+    }
+
+    /// **A relational leaf with NO reverse index wired is `Unavailable` (deny-when-unsure), NEVER a
+    /// silent widen — the default `resolve_relation` fails closed.**
+    #[test]
+    fn relational_without_reverse_index_fails_closed() {
+        use myelin_identity::AuthzIndexRef;
+        let authz = no_reverse(); // no reverse index
+        let v = viewer("acme");
+        let err = lower_set_expr(
+            &SetExpr::TupleSet { index: AuthzIndexRef("ix".into()) },
+            &v,
+            &authz,
+            &RevisionWatermark(0),
+            &QueryStats::new(),
+        )
+        .expect_err("no reverse index ⇒ fail closed, never widen");
+        assert!(matches!(err, QueryError::Authz(_)), "unavailable surfaces, never widens to All");
     }
 
     /// **`ListObjectsResult::Ids` (the materialised S4 path) lowers to an allow-set; the threaded
     /// zookie is carried.** An empty materialised set is `None` (deny).
     #[test]
     fn lower_materialised_ids_result() {
-        let (f, z) = lower_acl(&ListObjectsResult::Ids {
-            ids: vec![ObjectId("d1".into())],
-            zookie: Zookie("zX".into()),
-        })
+        let v = viewer("acme");
+        let authz = no_reverse();
+        let stats = QueryStats::new();
+        let (f, z) = lower_acl(
+            &ListObjectsResult::Ids { ids: vec![ObjectId("d1".into())], zookie: Zookie("zX".into()) },
+            &v,
+            &authz,
+            &stats,
+        )
         .unwrap();
         assert_eq!(f, AclFilter::Ids(vec!["d1".into()]));
         assert_eq!(z, "zX");
-        let (empty, _) =
-            lower_acl(&ListObjectsResult::Ids { ids: vec![], zookie: Zookie("z".into()) }).unwrap();
+        let (empty, _) = lower_acl(
+            &ListObjectsResult::Ids { ids: vec![], zookie: Zookie("z".into()) },
+            &v,
+            &authz,
+            &stats,
+        )
+        .unwrap();
         assert_eq!(empty, AclFilter::None, "empty materialised set ⇒ deny");
     }
 
@@ -709,6 +1093,10 @@ mod tests {
         .expect("query");
         assert_eq!(stats.list_objects_calls(), 1, "EXACTLY one list_objects per query (no N+1)");
         assert_eq!(authz.calls.load(Ordering::Relaxed), 1, "the port saw exactly one call");
+        // A BOUNDED-SET query issues ZERO reverse-index JOINs (the JOIN is only for the relational
+        // forms) — distinguishes the join counter's 0 from the relational path's 1 (kills the
+        // constant-`1` accessor mutant).
+        assert_eq!(stats.reverse_index_joins(), 0, "a bounded-set (Ids) query does NO reverse-index JOIN");
         // Only PUB-1 is both in the allow-set AND matches `deadlock` (SECRET-9 is excluded by ACL).
         assert_eq!(res.hits.iter().map(|h| h.doc_id.as_str()).collect::<Vec<_>>(), ["acme/issue/PUB-1"]);
         assert_eq!(res.zookie, "z-acl", "the list_objects zookie is threaded onto the result");
@@ -835,6 +1223,70 @@ mod tests {
         assert_eq!(res.hits.iter().map(|h| h.doc_id.as_str()).collect::<Vec<_>>(), ["acme/issue/PUB-1"],
             "the structured branch excludes the ACL-denied doc");
         assert!(stats.engine_branches() >= 1, "a structured branch ran");
+    }
+
+    /// **THE SRCH-P09 CHAINED GRANT (the big-result path): a confidential + a public doc reachable
+    /// only via a `TupleSet` relation → query as an UNAUTHORIZED viewer (the reverse-index JOIN
+    /// resolves to ONLY the public doc) → 0 leak incl. count → grant (the JOIN now resolves the
+    /// confidential doc too) → re-query, now visible.** The whole query runs through the engine with
+    /// the conjoined relational `Ids` clause; exactly ONE reverse-index JOIN (no N+1).
+    #[test]
+    fn relational_tuple_set_chained_grant_through_query_no_leak() {
+        use myelin_identity::AuthzIndexRef;
+        let be = corpus();
+        let eng = ScopedEngine::new(&be, "acme", "eu-west", schema());
+        let q = ast(Predicate::Cmp { op: CmpOp::Eq, lhs: var(FT_BODY_FIELD), rhs: s("deadlock") });
+        let tuple_set = SetExpr::TupleSet { index: AuthzIndexRef("authz_visible".into()) };
+
+        // UNAUTHORIZED: the reverse-index JOIN resolves to ONLY PUB-1 (SECRET-9 unreachable) at
+        // revision 5; the watermark from `z@5` is 5 — fresh enough.
+        let unauth =
+            FakeAuthz::filter_with(tuple_set.clone(), "z@5", rev_answer(&["acme/issue/PUB-1"], 5));
+        let stats = QueryStats::new();
+        let res = query(&eng, &unauth, &q, &viewer("acme"), &ObjectType("issue".into()),
+            &consistency(), Page::FIRST, &stats).expect("q");
+        let ids: Vec<&str> = res.hits.iter().map(|h| h.doc_id.as_str()).collect();
+        assert_eq!(ids, ["acme/issue/PUB-1"], "the confidential doc is excluded (no leak, big-result path)");
+        assert_eq!(stats.reverse_index_joins(), 1, "exactly ONE reverse-index JOIN (no N+1)");
+        assert_eq!(stats.list_objects_calls(), 1, "and exactly one list_objects");
+
+        // GRANTED: the JOIN now resolves SECRET-9 too (at a fresher revision 6, zookie z@6).
+        let granted = FakeAuthz::filter_with(
+            tuple_set,
+            "z@6",
+            rev_answer(&["acme/issue/PUB-1", "acme/issue/SECRET-9"], 6),
+        );
+        let stats2 = QueryStats::new();
+        let res2 = query(&eng, &granted, &q, &viewer("acme"), &ObjectType("issue".into()),
+            &consistency(), Page::FIRST, &stats2).expect("q2");
+        let ids2: std::collections::BTreeSet<&str> =
+            res2.hits.iter().map(|h| h.doc_id.as_str()).collect();
+        assert!(ids2.contains("acme/issue/SECRET-9"), "after grant the confidential doc is visible");
+        assert!(ids2.contains("acme/issue/PUB-1"));
+    }
+
+    /// **A `Difference(All, TupleSet)` through `query`: everything EXCEPT the reachable-via-relation
+    /// set — the boolean composition conjoins into the engine branch (`All AND NOT Ids`).** A doc in
+    /// the difference's excluded set never surfaces.
+    #[test]
+    fn relational_difference_through_query_excludes_the_relation_set() {
+        use myelin_identity::AuthzIndexRef;
+        let be = corpus();
+        let eng = ScopedEngine::new(&be, "acme", "eu-west", schema());
+        let q = ast(Predicate::Cmp { op: CmpOp::Eq, lhs: var(FT_BODY_FIELD), rhs: s("deadlock") });
+        // Difference(All, TupleSet) — everything EXCEPT what the relation reaches; the relation
+        // reaches SECRET-9, so SECRET-9 is excluded and PUB-1 (which matches `deadlock`) surfaces.
+        let set_expr = SetExpr::Difference(
+            Box::new(SetExpr::All),
+            Box::new(SetExpr::TupleSet { index: AuthzIndexRef("blocked".into()) }),
+        );
+        let authz =
+            FakeAuthz::filter_with(set_expr, "z@2", rev_answer(&["acme/issue/SECRET-9"], 2));
+        let stats = QueryStats::new();
+        let res = query(&eng, &authz, &q, &viewer("acme"), &ObjectType("issue".into()),
+            &consistency(), Page::FIRST, &stats).expect("q");
+        let ids: Vec<&str> = res.hits.iter().map(|h| h.doc_id.as_str()).collect();
+        assert_eq!(ids, ["acme/issue/PUB-1"], "the relation-reached doc is excluded by the Difference");
     }
 
     // ---- cross-tenant 0 (SRCH-D3) ------------------------------------------
@@ -1024,7 +1476,9 @@ mod tests {
         };
         let s = tm.to_string();
         assert!(s.contains("evil") && s.contains("acme") && s.contains("SRCH-D3"));
-        let rel = QueryError::RelationalSetExpr { form: "InRelation" };
-        assert!(rel.to_string().contains("InRelation") && rel.to_string().contains("SRCH-P09"));
+        let stale = QueryError::StaleReverseIndex { required: 9, served: 4, form: "TupleSet" };
+        let sm = stale.to_string();
+        assert!(sm.contains("TupleSet") && sm.contains("SRCH-P09"), "the stale-revision error is loud");
+        assert!(sm.contains('9') && sm.contains('4'), "it names the required + served revisions");
     }
 }

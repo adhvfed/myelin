@@ -146,8 +146,8 @@ pub use layout::{
     SrchP03Floor, StatefulComponent,
 };
 pub use pipeline::{
-    query, ListObjectsPort, Page, QueryError, QueryStats, RankedResult, RankedResults, ScopedEngine,
-    READ_PERMISSION,
+    query, ListObjectsPort, Page, QueryError, QueryStats, RankedResult, RankedResults,
+    RelationalLeaf, ReverseIndexAnswer, RevisionWatermark, ScopedEngine, READ_PERMISSION,
 };
 pub use residency::{search_store_descriptors, SearchStoreDescriptor};
 pub use shell::{

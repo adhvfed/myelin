@@ -167,10 +167,18 @@ pub const ORDER_KEY_FIELD: &str = "order_key";
 /// level (§4.2). The **bounded-set** lowering the architecture names (SRCH-P08): `All` (no clause —
 /// admin sees everything of this type in the tenant), `None` (short-circuit to empty — `WHERE
 /// false`), `Ids` (a doc-id / `acl_object` term-set membership clause), and `NotIds` (the bounded
-/// **deny-set** over an otherwise-visible space — `WHERE id NOT IN (...)`). The **relational**
-/// `SetExpr` forms (`InRelation`/`TupleSet`) + boolean composition (`Union`/`Intersect`/
-/// `Difference`) lower to the reverse-index JOIN in the SRCH-P09 sibling slice (fed the SAME
-/// conjoin step). The trait already TAKES the filter so the engine can never be reached without one.
+/// **deny-set** over an otherwise-visible space — `WHERE id NOT IN (...)`).
+///
+/// **The relational reverse-index JOIN + boolean composition (SRCH-P09 / P-172).** The relational
+/// `SetExpr` forms (`InRelation`/`TupleSet`) resolve — via the per-tenant authz reverse index
+/// (Identity's materialised `(subject, relation, object_id)` projection, replicated per cell) — to a
+/// **co-located visible-id set**, lowered into the SAME term-set membership clause as `Ids` (the
+/// Zanzibar/Leopard `LookupResources` reverse index as a conjoinable filter; ONE query, no N+1, no
+/// post-filter, §4.2). Boolean composition (`Union`/`Intersect`/`Difference`) lowers to the
+/// [`And`](AclFilter::And)/[`Or`](AclFilter::Or)/[`Not`](AclFilter::Not) clauses HERE — composed at
+/// the posting-list level, BEFORE scoring, so a hidden doc never enters the candidate set under ANY
+/// branch of the boolean tree. The trait already TAKES the filter so the engine can never be reached
+/// without one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AclFilter {
     /// The viewer sees everything of this type in the tenant (admin) — **no** ACL clause needed
@@ -180,7 +188,9 @@ pub enum AclFilter {
     /// document can surface.
     None,
     /// A bounded allow-set — a **doc-id / `acl_object` set membership** clause; only documents whose
-    /// `doc_id` OR `acl_object` is in the set can surface.
+    /// `doc_id` OR `acl_object` is in the set can surface. Both the `Ids` bounded-set lowering AND
+    /// the resolved `InRelation`/`TupleSet` reverse-index visible-id set lower to THIS clause (one
+    /// membership-clause shape — no drift between the bounded path and the relational JOIN path).
     Ids(Vec<String>),
     /// A bounded **deny-set** over the otherwise-visible space (the `SetExpr::NotIds` lowering,
     /// §7.1) — a document surfaces **unless** its `doc_id` OR `acl_object` is in the set
@@ -189,6 +199,21 @@ pub enum AclFilter {
     /// `MUST_NOT` at the posting-list level, BEFORE scoring — a denied doc never enters the
     /// candidate set (no count/rank leak), exactly like `Ids`.
     NotIds(Vec<String>),
+    /// **Boolean AND (the `SetExpr::Intersect` lowering, §4.2).** A document surfaces iff it
+    /// satisfies EVERY sub-clause — composed as a conjunction of `MUST` clauses at the posting-list
+    /// level (an empty `And` ⇒ `All`, the identity of intersection). The composition happens BEFORE
+    /// scoring; no sub-branch can leak a hidden doc.
+    And(Vec<AclFilter>),
+    /// **Boolean OR (the `SetExpr::Union` lowering, §4.2).** A document surfaces iff it satisfies AT
+    /// LEAST ONE sub-clause — composed as a disjunction of `SHOULD` clauses. An empty `Or` ⇒ `None`
+    /// (the identity of union — nothing is visible). A `None` sub-clause contributes nothing; an
+    /// `All` sub-clause makes the whole union `All`.
+    Or(Vec<AclFilter>),
+    /// **Boolean NOT (the right side of the `SetExpr::Difference` lowering, §4.2).** The set of docs
+    /// to EXCLUDE — the caller composes it as `left AND NOT right` (an `And` of `left` and
+    /// `Not(right)`). `Not(All)` ⇒ `None`; `Not(None)` ⇒ `All`. The exclusion is a `MUST_NOT` at the
+    /// posting-list level (BEFORE scoring), exactly like `NotIds`.
+    Not(Box<AclFilter>),
 }
 
 impl AclFilter {
@@ -200,6 +225,25 @@ impl AclFilter {
     /// Build a deny-set filter from an iterator of ACL object ids (the bounded `NotIds` lowering).
     pub fn not_ids(ids: impl IntoIterator<Item = impl Into<String>>) -> AclFilter {
         AclFilter::NotIds(ids.into_iter().map(Into::into).collect())
+    }
+
+    /// **Does this filter ADMIT `doc_id`?** The predicate the vector path evaluates DURING traversal
+    /// (filter-during-traversal, §4.2.2) so the top-k are k VISIBLE neighbours, never k-then-filtered.
+    /// It is the exact set semantics the posting-list-level [`TantivyBackend::acl_query`] lowers — the
+    /// SAME predicate fed into the HNSW traversal as into the FT/structured pre-filter (one ACL
+    /// meaning, no drift). `All` admits all; `None` admits nothing; `Ids` is membership; `NotIds` is
+    /// the complement; `And`/`Or`/`Not` compose recursively.
+    pub fn admits(&self, doc_id: &str) -> bool {
+        match self {
+            AclFilter::All => true,
+            AclFilter::None => false,
+            AclFilter::Ids(ids) => ids.iter().any(|i| i == doc_id),
+            AclFilter::NotIds(ids) => !ids.iter().any(|i| i == doc_id),
+            AclFilter::And(subs) => subs.iter().all(|s| s.admits(doc_id)),
+            // An empty `Or` (no sub-clause) admits nothing (the union identity — ∅).
+            AclFilter::Or(subs) => !subs.is_empty() && subs.iter().any(|s| s.admits(doc_id)),
+            AclFilter::Not(inner) => !inner.admits(doc_id),
+        }
     }
 }
 
@@ -505,12 +549,14 @@ impl TantivyBackend {
         self.acl_clause(ids)
     }
 
-    /// Lower an [`AclFilter`] to the conjoinable engine clause (the bounded-set lowering crux,
-    /// §4.2): `None`/empty-allow-set ⇒ [`AclQuery::Empty`] (the caller short-circuits to no
-    /// results); `All`/empty-deny-set ⇒ an `AllQuery` (no exclusion needed within the
+    /// Lower an [`AclFilter`] to the conjoinable engine clause (the bounded-set + relational
+    /// lowering crux, §4.2): `None`/empty-allow-set ⇒ [`AclQuery::Empty`] (the caller short-circuits
+    /// to no results); `All`/empty-deny-set ⇒ an `AllQuery` (no exclusion needed within the
     /// type-and-tenant scope); `Ids` ⇒ a `MUST` membership clause; `NotIds` ⇒ a `MUST_NOT`
-    /// exclusion clause. The ONE place an `AclFilter` becomes a Tantivy clause, so every search
-    /// entry conjoins the identical ACL semantics.
+    /// exclusion clause; and the SRCH-P09 boolean composition (`And`/`Or`/`Not`) recurses, composing
+    /// the sub-clauses as `MUST`/`SHOULD`/`MUST_NOT` at the posting-list level BEFORE scoring. The
+    /// ONE place an `AclFilter` becomes a Tantivy clause, so every search entry conjoins the
+    /// identical ACL semantics across the bounded-set path AND the relational JOIN path.
     fn acl_query(&self, acl_filter: &AclFilter) -> AclQuery {
         match acl_filter {
             AclFilter::None => AclQuery::Empty,
@@ -528,6 +574,47 @@ impl TantivyBackend {
                 ]))),
                 // An empty deny-set excludes nothing ⇒ everything of this type is visible.
                 None => AclQuery::Clause(Box::new(tantivy::query::AllQuery)),
+            },
+            // **SRCH-P09: boolean composition (Intersect/Union/Difference).** Each recurses; a
+            // sub-clause that resolves to `Empty` is the absorbing/identity element of its operator.
+            AclFilter::And(subs) => {
+                // Intersection: every sub-clause MUST hold. An `Empty` sub-clause makes the whole
+                // AND empty (∅ ∩ X = ∅). An empty `And` is `All` (the identity of intersection).
+                let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+                for sub in subs {
+                    match self.acl_query(sub) {
+                        AclQuery::Empty => return AclQuery::Empty, // ∅ absorbs the conjunction.
+                        AclQuery::Clause(q) => clauses.push((Occur::Must, q)),
+                    }
+                }
+                if clauses.is_empty() {
+                    return AclQuery::Clause(Box::new(tantivy::query::AllQuery));
+                }
+                AclQuery::Clause(Box::new(BooleanQuery::new(clauses)))
+            }
+            AclFilter::Or(subs) => {
+                // Union: at least one sub-clause holds. An `Empty` sub-clause contributes nothing
+                // (∅ ∪ X = X). An empty `Or` (every sub `Empty`) is `Empty` (nothing visible).
+                let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+                for sub in subs {
+                    match self.acl_query(sub) {
+                        AclQuery::Empty => {} // ∅ drops out of the union.
+                        AclQuery::Clause(q) => clauses.push((Occur::Should, q)),
+                    }
+                }
+                if clauses.is_empty() {
+                    return AclQuery::Empty;
+                }
+                AclQuery::Clause(Box::new(BooleanQuery::new(clauses)))
+            }
+            AclFilter::Not(inner) => match self.acl_query(inner) {
+                // ¬∅ = All (excluding nothing).
+                AclQuery::Empty => AclQuery::Clause(Box::new(tantivy::query::AllQuery)),
+                // ¬clause = admit everything, then exclude the inner clause (`WHERE NOT (...)`).
+                AclQuery::Clause(q) => AclQuery::Clause(Box::new(BooleanQuery::new(vec![
+                    (Occur::Must, Box::new(tantivy::query::AllQuery) as Box<dyn Query>),
+                    (Occur::MustNot, q),
+                ]))),
             },
         }
     }
@@ -787,26 +874,15 @@ impl IndexBackend for TantivyBackend {
             AclFilter::None => Vec::new(),
             // Admin: every live vector is visible — k-NN over the whole HNSW shape.
             AclFilter::All => self.vectors.knn(query, k),
-            AclFilter::Ids(ids) if ids.is_empty() => Vec::new(),
-            AclFilter::Ids(ids) => {
-                // FILTER-DURING-TRAVERSAL (§4.5 / SRCH-P11 building block): a candidate enters the
-                // result set ONLY if its doc_id is in the allow-set, so the top-k are k VISIBLE
-                // neighbours. The allow-set is by `doc_id` (the one-doc-id-space key) — the SAME key
-                // the FT/structured ACL clause pins on.
-                let allow: std::collections::HashSet<&str> =
-                    ids.iter().map(String::as_str).collect();
-                self.vectors
-                    .knn_filtered(query, k, |doc_id| allow.contains(doc_id))
-            }
-            // The bounded deny-set: a candidate enters ONLY if its doc_id is NOT in the deny-set
-            // (filter-during-traversal, the complement of `Ids`). An empty deny-set admits all
-            // (≡ `All`). The denied nearest neighbour never enters the candidate set (no leak).
-            AclFilter::NotIds(ids) => {
-                let deny: std::collections::HashSet<&str> =
-                    ids.iter().map(String::as_str).collect();
-                self.vectors
-                    .knn_filtered(query, k, |doc_id| !deny.contains(doc_id))
-            }
+            // FILTER-DURING-TRAVERSAL (§4.2.2 / SRCH-P11 building block): a candidate enters the
+            // result set ONLY if the ACL filter ADMITS its doc_id, so the top-k are k VISIBLE
+            // neighbours, never k-then-filtered. The predicate is keyed by `doc_id` (the
+            // one-doc-id-space key) and is the SAME set semantics the FT/structured posting-list
+            // pre-filter lowers — including the SRCH-P09 relational `Ids` (the resolved reverse-index
+            // visible-id set) and the `And`/`Or`/`Not` boolean composition. The hidden nearest
+            // neighbour (under ANY branch of the boolean tree) never enters the candidate set (no
+            // count/rank leak through the vector/RAG path — the SRCH-D1 vector half).
+            _ => self.vectors.knn_filtered(query, k, |doc_id| acl_filter.admits(doc_id)),
         };
         Ok(hits)
     }
@@ -1226,6 +1302,86 @@ mod tests {
         d.model_ref = None; // an embedding with no model_ref
         let err = be.upsert(&d).expect_err("must reject");
         assert!(matches!(err, IndexError::Engine(_)), "loud rejection: a vector needs a model_ref");
+    }
+
+    /// **SRCH-P09: the boolean-composition `AclFilter` (`And`/`Or`/`Not`) filters at the posting-list
+    /// level — the SAME pre-filter semantics as the bounded set, composed before scoring.** Indexes
+    /// three docs (a/b/c) all matching the text, then proves each boolean shape admits exactly the
+    /// right subset (no leak through any branch of the boolean tree).
+    #[test]
+    fn boolean_composition_acl_filter_pre_filters() {
+        let mut be = TantivyBackend::open(&facet_decl()).expect("open");
+        let k = OrderKey::bisect(None, None);
+        for id in ["a", "b", "c"] {
+            be.upsert(&doc(id, "shared deadlock note", "open", 1, &k)).expect("upsert");
+        }
+
+        // Each composed filter is bound to `acl_filter` (the conjoin binder the
+        // `search-requires-acl-filter` ratchet, contract 1.6, reads at the `be.search(&acl_filter,…)`
+        // call site — the boolean composition is the ACL pre-filter, conjoined before scoring).
+
+        // Or(Ids[a], Ids[b]) ⇒ {a, b}.
+        let acl_filter = AclFilter::Or(vec![AclFilter::ids(["a"]), AclFilter::ids(["b"])]);
+        let got: std::collections::BTreeSet<String> =
+            be.search(&acl_filter, "deadlock", 10).unwrap().into_iter().map(|h| h.doc_id).collect();
+        assert_eq!(got, ["a", "b"].iter().map(|s| s.to_string()).collect());
+
+        // And(All, NotIds[c]) ⇒ everything EXCEPT c ⇒ {a, b}.
+        let acl_filter = AclFilter::And(vec![AclFilter::All, AclFilter::not_ids(["c"])]);
+        let got: std::collections::BTreeSet<String> =
+            be.search(&acl_filter, "deadlock", 10).unwrap().into_iter().map(|h| h.doc_id).collect();
+        assert_eq!(got, ["a", "b"].iter().map(|s| s.to_string()).collect());
+
+        // And(Ids[a,b], Not(Ids[b])) ⇒ {a, b} minus b ⇒ {a} (the Difference lowering shape).
+        let acl_filter = AclFilter::And(vec![
+            AclFilter::ids(["a", "b"]),
+            AclFilter::Not(Box::new(AclFilter::ids(["b"]))),
+        ]);
+        let got: Vec<String> =
+            be.search(&acl_filter, "deadlock", 10).unwrap().into_iter().map(|h| h.doc_id).collect();
+        assert_eq!(got, vec!["a".to_string()], "left AND NOT right = the difference, no leak of b");
+
+        // An empty And ⇒ All (identity of intersection); an empty Or ⇒ None (identity of union).
+        let acl_filter = AclFilter::And(vec![]);
+        let all_via_empty_and = be.search(&acl_filter, "deadlock", 10).unwrap();
+        assert_eq!(all_via_empty_and.len(), 3, "empty And ⇒ All (every matching doc)");
+        let acl_filter = AclFilter::Or(vec![]);
+        let none_via_empty_or = be.search(&acl_filter, "deadlock", 10).unwrap();
+        assert!(none_via_empty_or.is_empty(), "empty Or ⇒ None (nothing visible)");
+
+        // An Or with a None sub-clause drops it (∅ ∪ {a} = {a}); an And with a None sub-clause is
+        // empty (∅ ∩ X = ∅).
+        let acl_filter = AclFilter::Or(vec![AclFilter::None, AclFilter::ids(["a"])]);
+        let got: Vec<String> =
+            be.search(&acl_filter, "deadlock", 10).unwrap().into_iter().map(|h| h.doc_id).collect();
+        assert_eq!(got, vec!["a".to_string()], "a None sub-clause drops out of the union");
+        let acl_filter = AclFilter::And(vec![AclFilter::None, AclFilter::All]);
+        assert!(be.search(&acl_filter, "deadlock", 10).unwrap().is_empty(), "None absorbs the And");
+    }
+
+    /// **SRCH-P09: `AclFilter::admits` (the vector filter-during-traversal predicate) matches the
+    /// posting-list set semantics for every variant — the SAME ACL meaning fed into the HNSW
+    /// traversal as into the FT pre-filter (no drift).**
+    #[test]
+    fn acl_filter_admits_matches_set_semantics() {
+        assert!(AclFilter::All.admits("x"));
+        assert!(!AclFilter::None.admits("x"));
+        assert!(AclFilter::ids(["x"]).admits("x") && !AclFilter::ids(["y"]).admits("x"));
+        assert!(!AclFilter::not_ids(["x"]).admits("x") && AclFilter::not_ids(["y"]).admits("x"));
+        // And: every sub admits; Or: at least one; Not: the complement.
+        assert!(AclFilter::And(vec![AclFilter::All, AclFilter::ids(["x"])]).admits("x"));
+        assert!(!AclFilter::And(vec![AclFilter::None, AclFilter::All]).admits("x"));
+        assert!(AclFilter::Or(vec![AclFilter::None, AclFilter::ids(["x"])]).admits("x"));
+        assert!(!AclFilter::Or(vec![]).admits("x"), "empty Or admits nothing");
+        // A NON-EMPTY Or whose every sub-clause REJECTS the doc admits nothing (kills the `&&`→`||`
+        // mutant: `!is_empty() || any` would wrongly admit here, `!is_empty() && any` correctly does
+        // not).
+        assert!(
+            !AclFilter::Or(vec![AclFilter::ids(["y"]), AclFilter::None]).admits("x"),
+            "a non-empty Or whose subs all reject the doc admits nothing"
+        );
+        assert!(AclFilter::Not(Box::new(AclFilter::ids(["y"]))).admits("x"));
+        assert!(!AclFilter::Not(Box::new(AclFilter::All)).admits("x"));
     }
 
     /// **The `IndexError` Display message is non-empty and names the engine error (the loud, never
