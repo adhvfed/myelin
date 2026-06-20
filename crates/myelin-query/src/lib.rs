@@ -74,6 +74,14 @@ pub use triggers::{
     StaleAfter, TimerError, Trigger, TriggerArming, TriggerEngine, TriggerId, TriggerState,
 };
 
+pub mod dispatch;
+pub use dispatch::{
+    CostGate, DispatchBreaker, DispatchError, DispatchRequest, DispatchTarget, DispatchTelemetry,
+    DispatchTier, Disposition, InMemoryCostGate, RecordingTarget, Reservation, ShedReason,
+    ShedSignal, SignalBinding, TriggerKind, CAUSAL_DEPTH_CEILING, DISPATCH_INFLIGHT_CAP,
+    SHARED_ROOT_TRIPWIRE_K, SHED_RETRY_AFTER_SECONDS,
+};
+
 /// The static cost ceiling: the maximum number of AST nodes a [`QueryAst`] may contain. A
 /// predicate exceeding this is **rejected before evaluation** ([`QueryAst::validate`]) — a
 /// crafted matcher can never present an unboundedly large tree to the interpreter. The

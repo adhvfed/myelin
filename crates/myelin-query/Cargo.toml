@@ -19,3 +19,16 @@ serde.workspace = true
 # NORMAL dependency now (the envelope payload type crosses into the matcher). It stays
 # DB-free — pure value projection, no I/O.
 serde_json = { workspace = true }
+
+# TEST-SUPPORT ONLY (dev-dependency, P-143 / EB-23). The BUS-D1 / BUS-D3 / BUS-D6 dispatch-tier
+# drills ride the P-S03 scoped-reversible dependency-break injector (Dependency::Broker — the
+# kill-consumer-+-sever-broker fault) and assert their verdicts off the FROZEN §10.2 harness
+# signal vocabulary (CausalDepthFirings / DispatchPoolDrops / ShedCount / BreakerState /
+# ConsumerLag), exactly as the events crate's drills do. This is a DEV-dependency, never a
+# normal one: myelin-harness is the leaf TEST-SUPPORT crate (it depends on -identity + -tenancy,
+# both BELOW query), and nothing in the production crate DAG (architecture §2.9) depends on it.
+# A dev-only edge query → harness pulls test machinery into the test build only and forms NO
+# production cycle (harness does not depend on query). The crate-graph-acyclic model continues to
+# model the production crates only.
+[dev-dependencies]
+myelin-harness = { path = "../myelin-harness" }
