@@ -6,6 +6,10 @@
 //!   4.9) Identity compiles into the one cell schema (ref-glob + CODEOWNERS-as-relations +
 //!   `approve_untrusted_ci` + per-watchable `watcher`). Names freeze here; the permission rewrites
 //!   are wired LIVE in GIT-P13 (M3-G2) / P-ID-24.
+//! - [`events`] — **GIT-P2 / P-124**: the complete `git.*` event-token registration (contract 2.9)
+//!   — git COMPLETES its dotted-name list, each token validated against the one Bus grammar. The
+//!   tokens are registered here but EMITTED only from the outbox in GIT-P8 (`git.ref.updated`) /
+//!   GIT-P16 (`git.pr.*` / `git.review.*` / `git.comment.*`).
 //! - [`holder_intent`] + [`schema`] — **GIT-P3 / P-063**: the H1 holder INTENT + the
 //!   `#[personal_data(...)]` classification tags (see below).
 //!
@@ -59,6 +63,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod events;
 pub mod holder_intent;
 pub mod rebac_fragment;
 pub mod schema;
