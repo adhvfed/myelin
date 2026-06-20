@@ -2260,13 +2260,18 @@ version = "0.0.0"
 name = "myelin-notif"
 version = "0.0.0"
 dependencies = [
+ "myelin-config",
  "myelin-events",
+ "myelin-gdpr",
  "myelin-harness",
  "myelin-identity",
+ "myelin-lints",
  "myelin-refs",
  "myelin-substrate",
  "myelin-tenancy",
  "serde",
+ "sqlx",
+ "tokio",
 ]
 
 [[package]]

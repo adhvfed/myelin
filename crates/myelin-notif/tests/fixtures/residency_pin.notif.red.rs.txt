@@ -1,0 +1,5 @@
+// NOTIF-P2 RED fixture: a global (region-less) connection pool — the EU-sovereignty leak the
+// residency-pin lint (ADR-11) rejects. The nine (tenant, region)-first tables rest on this floor.
+fn open() {
+    let pool = PgPool::connect(url).await?;
+}

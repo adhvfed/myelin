@@ -54,10 +54,34 @@ myelin-refs = { path = "../myelin-refs" }
 # liveness≠readiness + the outbox relay + graceful drain. The shell is an AppSpec this wires; it
 # is NOT a service that re-implements the lifecycle (contract 1.1).
 myelin-substrate = { path = "../myelin-substrate" }
+# The #[derive(PersonalData)] + #[personal_data(...)] classification (contract 10.2) the nine
+# data-model row types (NOTIF-P2, src/schema.rs) carry on every PII-bearing column — the
+# no-untagged-personal-data gate's compile-time half.
+myelin-gdpr = { path = "../myelin-gdpr" }
 serde = { workspace = true }
+
+# REAL Postgres backend behind the `integration` feature (Stage 1 / infra). OPTIONAL deps pulled
+# ONLY by `--features integration`, which compiles the live-PG schema-apply + RLS denial test
+# (tests/integration_notif_schema.rs) run against the docker-compose dev stack. The default
+# `cargo build --workspace` stays DB-free (the binding-policy floor — no DB at build).
+#   - myelin-config : the dev<->prod CONFIG SWAP seam (the DATABASE_URL the live test reads);
+#   - sqlx          : the OLTP Postgres client (RUNTIME queries — sqlx::query, NOT query!);
+#   - tokio         : the async runtime the live client needs.
+myelin-config = { path = "../myelin-config", optional = true }
+sqlx = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 # The shell's boot self-test asserts against the same three-port / liveness≠readiness surface
 # the later drills (the §4.1 telemetry set) read from. DEV-only — the harness never enters the
 # notif production DAG.
 myelin-harness = { path = "../myelin-harness" }
+# The committed-ratchet lint-fixture test (src/lint_fixtures.rs): the THREE schema gates this prompt
+# names (no-untagged-personal-data / residency-pin / tenant-predicate) run over RED/GREEN fixtures so
+# a regression that lets an untagged-PII column / a region-less store / a tenant-less query slip
+# through fails THIS build. DEV-only — the lint engine never enters the notif production DAG.
+myelin-lints = { path = "../myelin-lints" }
+
+[features]
+# The live-PG integration test (tests/integration_notif_schema.rs). DB-free by default.
+integration = ["dep:myelin-config", "dep:sqlx", "dep:tokio"]

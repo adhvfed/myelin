@@ -31,7 +31,8 @@
 //!
 //! - **The data model** (the nine tenant-partitioned tables: `inbox_item`, `notif_pref`,
 //!   `quiet_hours`, `delivery`, `oncall_schedule`, `escalation_policy`, `escalation_run`,
-//!   `humanise_template`, `mute`) → **NOTIF-P2** (P-180). The migration set is empty here.
+//!   `humanise_template`, `mute`) → **landed at NOTIF-P2** (P-180), see [`migrations`] + [`schema`].
+//!   The migration set is now the nine `(tenant, region)`-first RLS tables (no longer empty).
 //! - **The Signal-consumer router** (the EventHandler that consumes curated Signals, UPSERTs
 //!   inbox items, and emits `notif.*` via the outbox — the ONLY emit path) → **NOTIF-P3** (P-181).
 //!   The `consumers` slot is an empty seam here.
@@ -51,6 +52,14 @@ use myelin_substrate::{
     PublicRoutes, ServeError, ServeHandle, StoreManifest,
 };
 use serde::{Deserialize, Serialize};
+
+// The Notif data model — the nine tenant-partitioned tables (NOTIF-P2 / P-180). `schema` carries the
+// row types + the `#[personal_data(...)]` classification tags (contract 10.2); `migrations` carries
+// the nine forward-only `(tenant, region)`-first RLS migrations (contract 1.5). The committed-ratchet
+// lint-fixture proof (the three schema gates bite) lives in `tests/lint_fixtures.rs` over RED/GREEN
+// fixtures under `tests/fixtures/` (which the lint-gate excludes by the `/fixtures/` convention).
+pub mod migrations;
+pub mod schema;
 
 /// The service name (a PII-free label, the telemetry / trace / deployable identifier). The
 /// `notif` binary (`src/main.rs`) and the `AppSpec::name` both read this so the deployable
@@ -221,13 +230,13 @@ pub struct Receipt {
 //  THE SERVICE SHELL (the impl role — an AppSpec the harness wires, contract 1.1; NOT a main)
 // ===========================================================================================
 
-/// The Notif forward-only migration set (contract 1.5). **EMPTY at NOTIF-P1** — the nine
-/// tenant-partitioned tables (`inbox_item`, `notif_pref`, `quiet_hours`, `delivery`,
-/// `oncall_schedule`, `escalation_policy`, `escalation_run`, `humanise_template`, `mute`) land in
-/// **NOTIF-P2** (P-180). The empty set still exercises the migrate-complete readiness gate (the
-/// boot lifecycle runs migrate → ready even with zero migrations).
+/// The Notif forward-only migration set (contract 1.5). **The nine tenant-partitioned tables land
+/// here at NOTIF-P2 (P-180)** — `notif_inbox_item`, `notif_pref`, `notif_quiet_hours`,
+/// `notif_delivery`, `notif_oncall_schedule`, `notif_escalation_policy`, `notif_escalation_run`,
+/// `notif_humanise_template`, `notif_mute` — each `(tenant, region)`-first, RLS-scoped,
+/// encrypted-from-birth (see [`migrations`]). The boot lifecycle runs migrate → ready over this set.
 fn notif_migrations() -> Migrations {
-    Migrations::default()
+    migrations::migrations()
 }
 
 /// Assemble the Notif service [`AppSpec`] (contract 1.1; architecture §5.1) the harness wires.
@@ -355,18 +364,21 @@ mod tests {
         );
     }
 
-    /// **The shell ships ZERO consumers and ZERO migrations (the named floors are seams, not
-    /// done).** The Signal-consumer router is NOTIF-P3 (empty `consumers`); the data model is
-    /// NOTIF-P2 (empty `migrations`). This asserts the shell is honestly NOT the working inbox.
+    /// **The shell ships ZERO consumers but now the NINE-table data model (NOTIF-P2 landed).** The
+    /// Signal-consumer router is still the NOTIF-P3 floor (empty `consumers`); the migration set is
+    /// no longer empty — it carries the nine `(tenant, region)`-first tables (the data model this
+    /// prompt, NOTIF-P2 / P-180, ships). This asserts the shell still has NO writer (the inbox is not
+    /// working until NOTIF-P3 UPSERTs items), but the SCHEMA exists.
     #[test]
-    fn shell_carries_empty_consumer_and_migration_seams() {
+    fn shell_carries_empty_consumer_seam_and_the_nine_table_data_model() {
         let spec = notif_app_spec(Config::default());
         assert!(spec.consumers.is_empty(), "the Signal-consumer router is the NOTIF-P3 floor");
         assert_eq!(
-            spec.migrations,
-            Migrations::default(),
-            "the nine-table data model is the NOTIF-P2 floor (empty migration set here)"
+            spec.migrations.0.len(),
+            9,
+            "the nine-table data model landed at NOTIF-P2 (P-180): the migration set is non-empty"
         );
+        assert_eq!(spec.migrations, migrations::migrations(), "the AppSpec wires the NOTIF-P2 set");
         assert_eq!(spec.name, SERVICE_NAME);
     }
 }
