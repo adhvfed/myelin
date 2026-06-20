@@ -81,8 +81,11 @@ pub struct BoundedSelector {
     id: String,
 }
 
-/// The three bounded selector kinds the firehose admits (§7.7 / contract 3.5: `board:`/`doc:`/`channel:`).
-/// There is deliberately **no `All`/`*` variant** — the type cannot represent an unbounded subscription.
+/// The bounded selector kinds the firehose admits (§7.7 / contract 3.5: `board:`/`doc:`/`channel:`/
+/// `inbox:`). There is deliberately **no `All`/`*` variant** — the type cannot represent an unbounded
+/// subscription. `Inbox` (Notif's own-inbox slice, `notifications.md` §7 / C4) is the fourth bounded
+/// kind, kept 1:1 with the Bus-protocol [`myelin_events`-side] `ScopeKind` so a scope validated at the
+/// Bus seam lowers to the SAME selector key at this connection-tier seam (EI-01 §7 coherence).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SelectorKind {
     /// A board (Issues huge-board) — paginated to the visible window + margin (the 50k-row case).
@@ -91,15 +94,19 @@ pub enum SelectorKind {
     Doc,
     /// A channel (Chat hot-channel) — live delivery + presence on one channel.
     Channel,
+    /// One principal's inbox slice (Notif `inbox watch`, §7 / C4) — a BOUNDED selector
+    /// `inbox:<principal>`; never `*` (a client gets only its own inbox's frames).
+    Inbox,
 }
 
 impl SelectorKind {
-    /// The selector prefix (`board` / `doc` / `channel`) — the wire form before the `:`.
+    /// The selector prefix (`board` / `doc` / `channel` / `inbox`) — the wire form before the `:`.
     pub fn prefix(self) -> &'static str {
         match self {
             SelectorKind::Board => "board",
             SelectorKind::Doc => "doc",
             SelectorKind::Channel => "channel",
+            SelectorKind::Inbox => "inbox",
         }
     }
 }
@@ -165,6 +172,7 @@ impl BoundedSelector {
             "board" => SelectorKind::Board,
             "doc" => SelectorKind::Doc,
             "channel" => SelectorKind::Channel,
+            "inbox" => SelectorKind::Inbox,
             other => return Err(SelectorError::UnknownKind(other.to_string())),
         };
         Ok(BoundedSelector { kind, id: id.to_string() })

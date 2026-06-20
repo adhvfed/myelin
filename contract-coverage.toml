@@ -216,8 +216,14 @@ landing = "P-137"
 row = "3.5"
 title = "firehose transport + resume-cursor protocol"
 status = "covered"
+# CONSUMER leg — Notif's `inbox watch` (NOTIF-P15 / P-193, §7 / C4) rides this SAME frozen protocol
+# (no bespoke Notif transport): scope = inbox:<principal> (a fourth bounded scope kind, EXTENDED in
+# place on the one ScopeKind grammar, never `*`); a reconnect backfills (last_seq,now] then live (0
+# items lost); an over-old cursor -> resync_required -> a full list_inbox cold rebuild (NAMED). The
+# D-N11 resume-leg drill (drill_notif_d11.rs) proves 0 items lost.
 cdc = [
     "crates/myelin-events/tests/cdc_3_5_firehose_resume_cursor.rs",
+    "crates/myelin-notif/tests/cdc_3_5_notif_inbox_watch.rs",
 ]
 
 # 3.6 reactive/dispatch tier (EB-23 / P-143). OWNED by the Bus; built in myelin-query (the
