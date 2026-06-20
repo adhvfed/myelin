@@ -12,8 +12,7 @@ shape body template=rectangle
 place b1 shape=body at=5,11 size=14x9
 shape shackle template=path
   addpoint a at=8,11
-  addpoint b at=8,7 mode=catmull-rom
-  addpoint c at=12,5 mode=catmull-rom
-  addpoint d at=16,7 mode=catmull-rom
-  addpoint e at=16,11 mode=catmull-rom
+  addpoint b at=8,9
+  addpoint c at=16,9 mode=arc rx=4 ry=4
+  addpoint d at=16,11
 place s1 shape=shackle at=0,0
