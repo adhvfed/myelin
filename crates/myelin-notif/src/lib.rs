@@ -70,6 +70,10 @@ use serde::{Deserialize, Serialize};
 pub mod cli;
 pub mod define_rule;
 pub mod holder;
+// The ONE platform templating surface (NOTIF-P9 / P-187 — contract 7.3): `humanise` + the
+// `humanise_template` store + the per-viewer resolve seam + the ONE myelin-content render path +
+// the NOTIF-D4 (0 title/PII leak) gate. See [`humanise`].
+pub mod humanise;
 pub mod list_inbox;
 pub mod migrations;
 pub mod ranking;
@@ -85,6 +89,13 @@ pub use define_rule::{
 pub use holder::{
     notif_history_holder, notif_store_classifier, register_notif_holder, NotifBacking,
     NotifHistoryHolder, NotifHolderRegistration, RestrictSet, NOTIF_OLTP_STORE,
+};
+pub use humanise::{
+    humanise, humanise_item, parse_markdown, reason_template_key, render_html, render_markdown,
+    render_message, render_plain, shared_platform_templates, tombstone_display, Channel, ContentDoc,
+    HumaniseTemplate, RefProjection, RefResolution, RefResolvePort, Span, TemplateStore, Tombstone,
+    TombstoneReason, DEFAULT_LOCALE, HUMANISE_RESOLVE_MODE, PLATFORM_DEFAULT_TEMPLATES,
+    PLATFORM_DEFAULT_TENANT,
 };
 pub use list_inbox::{
     list_inbox, list_inbox_ranked, subsystem_of, AllowAllAuthorize, Cursor, InboxFilter, InboxPage,
