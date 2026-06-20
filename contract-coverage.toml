@@ -181,8 +181,8 @@ landing = "P-138"
 [[contract]]
 row = "3.2"
 title = "register_automation"
-status = "deferred"
-landing = "P-139"
+status = "covered"
+cdc = ["crates/myelin-query/tests/cdc_3_2_automations.rs"]
 
 [[contract]]
 row = "3.3"
