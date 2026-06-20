@@ -72,11 +72,27 @@
 //! table; the REAL `INSERT … ON CONFLICT` against the per-tenant-DEK-encrypted table (executed in the
 //! SAME tx as the `consumer_dedup` mark) lands when the OLTP store is wired into `serve`.
 //!
+//! **REF-P7 (P-156) ships:** the [`invalidator`] module — the **refs-projection-invalidator
+//! consumer** (§4.3 second consumer): an ordinary [`myelin_events::EventHandler`] that whitelists the
+//! `*.updated`/`*.erased` lifecycle subjects (NEVER `*` — a reviewed BUS-4 firehose-class consumer)
+//! and **busts the projection cache per `ArtifactRef`** (the §3.6 `(tenant, ref)` bust) through the
+//! [`invalidator::ProjectionCache`] invalidation INTERFACE, idempotent on `event_id` via
+//! `consumer_dedup` (2.4/2.5). Because the live R2 cache lands in **REF-P12**, this prompt ships the
+//! interface plus a **[`invalidator::NoOpCacheShim`]** behind it — the shim holds nothing but RECORDS
+//! every bust call, so the consumer's behaviour is observable + testable (one `invalidate(tenant,
+//! ref)` per `*.updated`/`*.erased`). REF-P12 replaces the shim with the live bounded cache by
+//! implementing the SAME trait — the consumer is unchanged. Telemetry `refs.invalidations`
+//! ([`invalidator::RefsProjectionInvalidator::INVALIDATIONS_SIGNAL`]) is live.
+//!
 //! **Does NOT ship (floors named):**
-//! - **No INVALIDATOR, no R2 cache.** REF-P6 ships the BUILDER (ingest); the `*.updated`/`*.erased`
-//!   cache invalidation it would drive is **REF-P7**'s refs-projection-invalidator (over the no-op
-//!   cache shim); the live R2 cache is **REF-P12**. Nothing here busts a cache yet — ingestion is not
-//!   a live projection.
+//! - **No LIVE R2 cache.** REF-P7 ships the invalidator + the NO-OP shim (records busts; evicts
+//!   nothing — nothing is cached yet). The live bounded, per-tenant-DEK-encrypted Valkey-class R2
+//!   cache that implements [`invalidator::ProjectionCache`] is **REF-P12**; it swaps the shim, leaving
+//!   the invalidator unchanged. Named so the invalidation is not mistaken for live cache-busting: the
+//!   WIRING is real, the CACHE is a shim.
+//! - **No mutation floor on the no-op shim.** Per the REF-P7 prompt: the no-op shim has no mutable
+//!   projection state to mutation-test; the REAL cache mutation floor (eviction under TTL + bound)
+//!   lands in **REF-P12**. The invalidator's routing IS asserted by the unit + CDC tests.
 //! - **No real crypto-shred over real data.** The holder is a STUB surface: `erase` is a
 //!   well-defined no-op now (nothing to purge). The DEK lever EXISTS + FIRES (proven structurally in
 //!   [`dek`]), but the structural erasure body that USES it — R2-cache PII purge + reliance on
@@ -96,6 +112,7 @@ pub mod dek;
 pub mod edge_builder;
 pub mod erasure_posture;
 pub mod holder;
+pub mod invalidator;
 pub mod migration;
 pub mod residency;
 
@@ -110,6 +127,10 @@ pub use migration::{
     EDGE_OUTBOUND_INDEX, EDGE_TABLE, MAKE_EDGE_TENANT_SCOPED_DDL,
 };
 pub use erasure_posture::{erasure_posture, ErasurePosture};
+pub use invalidator::{
+    InvalidateError, InvalidationCall, NoOpCacheShim, ProjectionCache, RefsProjectionInvalidator,
+    INVALIDATOR_CONSUMER, INVALIDATOR_SUBJECTS, INVALIDATOR_SUBJECT_PREFIXES,
+};
 pub use holder::{
     refs_store_classifier, register_refs_holders, RefsCacheHolder, RefsEdgeHolder,
     RefsHolderRegistration, REFS_CACHE_STORE, REFS_EDGE_STORE,
