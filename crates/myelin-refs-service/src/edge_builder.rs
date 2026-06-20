@@ -260,6 +260,29 @@ impl EdgeProjection {
         self.lock().get(&pk).map(|p| p.len()).unwrap_or(0)
     }
 
+    /// **Locate every edge naming `subject_id` as its `origin_actor` in the `(tenant, region)`
+    /// partition (the REF-P15 holder `locate` query — §4.6).** Refs holds the subject ONLY as the
+    /// PSEUDONYMOUS `origin_actor` opaque id (never the name), so "locate the subject's Refs data" is
+    /// "the edges this opaque actor authored". Tenant-first (no cross-tenant path). Returns live AND
+    /// tombstoned rows (a `locate` reports everything the subject touches; the audit row is retained).
+    /// Deterministic order by `edge_id`. The opaque id is matched, never a name — erasure-safe.
+    pub fn edges_by_actor(&self, tenant: &TenantId, region: &Region, subject_id: &str) -> Vec<EdgeRow> {
+        let pk = PartKey { tenant: tenant.clone(), region: region.clone() };
+        let mut rows: Vec<EdgeRow> = self
+            .lock()
+            .get(&pk)
+            .map(|p| p.values().filter(|r| r.origin_actor == subject_id).cloned().collect())
+            .unwrap_or_default();
+        rows.sort_by(|a, b| a.edge_id.cmp(&b.edge_id));
+        rows
+    }
+
+    /// **The total count of edges naming `subject_id` (the `locate` cardinality the receipt records).**
+    /// Tenant-first. PII-free: a count over an opaque-actor match.
+    pub fn count_by_actor(&self, tenant: &TenantId, region: &Region, subject_id: &str) -> usize {
+        self.edges_by_actor(tenant, region, subject_id).len()
+    }
+
     /// **The LIVE inbound edges to `target_root` in the `(tenant, region)` partition (the
     /// `edge_inbound WHERE NOT tombstoned` range scan — §3.2).** This is the row source the REF-P11
     /// permission-filtered backlink read scans ONCE: tenant-first (no cross-tenant path), live edges

@@ -3,9 +3,13 @@
 //!
 //! **Contract:** index row 10.1 (`PersonalDataHolder` — the five DSR operations). The SIGNATURE was
 //! frozen at P-GA-01 (`myelin-gdpr`); the GDPR-owned holder bodies landed at P-GA-05. THIS file
-//! ships the **Refs side** of 10.1 — Refs as holder **H12 (`ReferenceGraph`)**, a STUB surface at
-//! M1 (no edge index exists yet; the real erase is REF-P15). It is the provider+consumer CDC pair
-//! the contract-coverage scanner (P-S21) reads for the Refs holder seam.
+//! ships the **Refs side** of 10.1 — Refs as holder **H12 (`ReferenceGraph`)**. The REAL §4.6
+//! erasure body landed at REF-P15 / P-164 (`with_backing` / `with_cache` over the live edge
+//! projection + R2 cache); this CDC pair exercises the contract over the **registration-only
+//! (unbacked) form** (the `serve`-before-the-store-is-wired posture), which is **empty-but-correct**
+//! by construction. The unbacked surface is the provider+consumer CDC pair the contract-coverage
+//! scanner (P-S21) reads for the Refs holder seam; the REAL backed body is drilled in the
+//! `holder::tests` unit module (REF-D5 CI variant: 0 recoverable cache PII).
 //!
 //! - **PROVIDER** = the Refs holders ([`RefsEdgeHolder`] H12 / [`RefsCacheHolder`] §3.6) IMPLEMENTING
 //!   the five-operation 10.1 contract. At M1 they respond with **empty-but-correct** receipts (a
@@ -18,11 +22,11 @@
 //!   orchestrator (P-GA-11/P-GA-12) takes when it fans a DSR out to the Refs holder.
 //!
 //! The dated green artifact: the consumer fans `locate(subject)` + `erase(subject)` out to the Refs
-//! holders; each returns a content-addressed receipt over its (empty) surface; the holders classify
-//! to H12/H9 with 0 orphan stores. If 10.1's body shape drifts, this stops compiling/passing — that
-//! is the contract. The REAL erase body (purge R2-cache PII + Identity pseudonym shred for
-//! `origin_actor` + `*.erased` tombstoning, §4.6) lands in REF-P15; this prompt records the surface
-//! as untested-at-runtime-but-named (no engine to drill at M1), honestly.
+//! holders; each returns a content-addressed receipt over its (unbacked, empty-but-correct) surface;
+//! the holders classify to H12/H9 with 0 orphan stores. If 10.1's body shape drifts, this stops
+//! compiling/passing — that is the contract. The REAL erase body (purge R2-cache PII + reliance on
+//! Identity's pseudonym shred for `origin_actor` + `*.erased` tombstoning, §4.6) landed at REF-P15;
+//! the full backup-level 0-recoverable shred drill (REF-D5 at scale) is REF-P25 (named).
 
 use myelin_gdpr::{EraseScope, LocateReport, PersonalDataHolder, SubjectRef, TenantId};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
@@ -84,8 +88,8 @@ impl<'a> DsrOrchestratorConsumer<'a> {
 /// the dated green artifact for the Refs side of 10.1.
 #[test]
 fn dsr_orchestrator_fans_locate_and_erase_out_to_the_refs_holders_via_the_contract() {
-    let edge = RefsEdgeHolder;
-    let cache = RefsCacheHolder;
+    let edge = RefsEdgeHolder::default();
+    let cache = RefsCacheHolder::default();
     let consumer = DsrOrchestratorConsumer::new(vec![&edge, &cache]);
     let subj = subject("u-cdc");
 
@@ -135,7 +139,7 @@ fn refs_holder_stores_register_and_classify_with_zero_orphans() {
 /// a `todo!()`/`Err`. The real located/exported data lands with the edge index (REF-P15).
 #[test]
 fn refs_holder_export_is_empty_but_correct() {
-    let edge = RefsEdgeHolder;
+    let edge = RefsEdgeHolder::default();
     let bundle = edge
         .export(&subject("u-1"), tenant())
         .expect("export of an empty bundle succeeds (no edges yet)");

@@ -215,6 +215,35 @@
 //! reindex byte-parity (REF-D4 full) is REF-P16/REF-P24; this prompt freezes + drills the TE-7
 //! reconvergence SEMANTICS (typed wins).
 //!
+//! **REF-P15 (P-164) ships:** the [`ladder`] module — the **unified 4-step `#sub` resolution ladder**
+//! (contract 5.7 OWNED; §4.6, C-2) layered ON TOP OF the REF-P10 [`resolve::ResolveService`] (NOT a
+//! second resolver): the frozen [`ladder::SubState`] vocabulary (`live/moved/outdated/gone`/`erased`)
+//! the owner's 5.6 `project` sub-anchor resolver answers in, the ONE [`ladder::SubState::into_outcome`]
+//! mapping onto the [`resolve::ProjectOutcome`] (so every content shape — Git line-ranges, KN
+//! block/heading/row anchors, Chat message/thread anchors, the check-/step- CI kinds, C-6 — degrades
+//! identically), and the **reference content-anchored Git line-range resolver**
+//! ([`ladder::resolve_line_range`], §3.5: BLAKE3 fingerprint + 3-way context → exact/rebased/partial/
+//! content_gone). **A tombstone ALWAYS carries the root** (the chokepoint's [`resolve::Tombstone`] holds
+//! the `#sub`-stripped root) — 0 dangling embed, 0 hard 404, no leak (REF-D9). PLUS the **REAL erasure
+//! holder** (contract 10.1) in [`holder`] — REPLACING the REF-P3 STUB: [`holder::RefsEdgeHolder`] /
+//! [`holder::RefsCacheHolder`] gain an optional runtime backing ([`holder::RefsEdgeHolder::with_backing`]
+//! / [`holder::RefsCacheHolder::with_cache`]) so `locate` walks the live [`edge_builder::EdgeProjection`]
+//! for the subject's edges (by the PSEUDONYMOUS opaque `origin_actor`), `erase` purges the subject's R2
+//! cache PII through the cache's `invalidate` (the ONE eviction path the `*.erased` consumer drives — no
+//! backdoor) + relies on Identity's 4.8 pseudonym shred for the opaque edge id, and `restrict` records
+//! into the shared [`restrict::RestrictSet`] suppression set (GA-D7, suppress-don't-delete) — the
+//! unbacked [`Default`] form stays empty-but-correct (the `serve`-before-the-store posture, one holder
+//! type, no parallel second holder, EI-01 §7). The `tombstone_count` telemetry
+//! ([`ladder::TOMBSTONE_COUNT_SIGNAL`]) is named (1.8). REF-D9 (the ladder across the three content
+//! shapes, root carried) + REF-D5 (CI variant: 0 recoverable cache PII, no resolve-error) are greened
+//! in unit + CDC tests; the REAL cache purge through live Valkey is PROVEN in
+//! `tests/integration_ref_p15_holder_erase.rs` (the `integration` feature). **FLOORS named:** each
+//! subsystem's STABLE `#sub` MINT (a block id survives moves, a message id is immutable, a Git range
+//! carries the BLAKE3 fingerprint) is the subsystem's deliverable — the first REAL producer mints land
+//! in R-M3/R-M4 (REF-P17 Git / REF-P18 Knowledge / REF-P19/P20/P21 the rest); at M2 the ladder is
+//! exercised against synthetic + available producers. The full backup-level 0-recoverable shred drill
+//! (REF-D5 at scale) is REF-P25.
+//!
 //! **Does NOT ship (floors named):**
 //! - **The producers are SYNTHETIC at M2.** REF-P8 exercises the seam with a TEST content writer; the
 //!   first REAL producers (Git diffs / Knowledge blocks / Chat messages writing actual content) land
@@ -232,11 +261,13 @@
 //!   default) — the invalidator/resolve are unchanged; only the trait object behind them swapped, as
 //!   REF-P7/P10 promised. The REAL cache mutation floor (keying/sealing/invalidation under TTL +
 //!   crypto-shred) IS met here ([`cache`] mutation-score floor; see the module doc + the COMMIT body).
-//! - **No real crypto-shred over real data.** The holder is a STUB surface: `erase` is a
-//!   well-defined no-op now (nothing to purge). The DEK lever EXISTS + FIRES (proven structurally in
-//!   [`dek`]), but the structural erasure body that USES it — R2-cache PII purge + reliance on
-//!   Identity's pseudonym shred for `origin_actor` + `*.erased` tombstoning — lands in **REF-P15**
-//!   (M2); the world-scale 0-recoverable shred drill (REF-D5) is **REF-P15 / REF-P25**.
+//! - **The structural erasure body HAS LANDED (REF-P15 / P-164).** The holder is no longer a stub:
+//!   `erase(Subject)` purges the subject's R2-cache PII through the live cache's `invalidate` (0
+//!   recoverable, proven against live Valkey) + relies on Identity's 4.8 pseudonym shred for the opaque
+//!   `origin_actor` (the edge keeps the opaque id; the human becomes unresolvable) + tombstones
+//!   content-erased targets via the `*.erased` consumer (REF-P7, no backdoor). The unbacked `Default`
+//!   form remains empty-but-correct (the `serve`-before-the-store posture). The world-scale
+//!   0-recoverable shred drill at BACKUP scale (REF-D5 full) is the remaining floor — **REF-P25** (R-M5).
 //! - **The holder is registered + the DEK reserved, but no store is OPENED at runtime here.** `serve`
 //!   opens the real stores (auto-registering them + wiring the [`dek::RefsDekPin`] into them) when
 //!   the edge schema lands (REF-P5+). This crate proves the registration + classification + DEK pin
@@ -255,10 +286,12 @@ pub mod emit;
 pub mod erasure_posture;
 pub mod holder;
 pub mod invalidator;
+pub mod ladder;
 pub mod loop_guard;
 pub mod migration;
 pub mod mirror;
 pub mod residency;
+pub mod restrict;
 pub mod resolve;
 pub mod traverse;
 
@@ -297,10 +330,15 @@ pub use invalidator::{
     InvalidateError, InvalidationCall, NoOpCacheShim, ProjectionCache, RefsProjectionInvalidator,
     INVALIDATOR_CONSUMER, INVALIDATOR_SUBJECTS, INVALIDATOR_SUBJECT_PREFIXES,
 };
+pub use ladder::{
+    ladder_root, resolve_line_range, resolve_sub_outcome, LineRangeState, MintedLineRange,
+    SubAnchorResolver, SubState, SyntheticSubResolver, TOMBSTONE_COUNT_SIGNAL,
+};
 pub use holder::{
-    refs_store_classifier, register_refs_holders, RefsCacheHolder, RefsEdgeHolder,
+    refs_store_classifier, register_refs_holders, EdgeBacking, RefsCacheHolder, RefsEdgeHolder,
     RefsHolderRegistration, REFS_CACHE_STORE, REFS_EDGE_STORE,
 };
+pub use restrict::RestrictSet;
 pub use residency::{refs_store_descriptors, RefsStoreDescriptor};
 pub use traverse::{
     apply_post_filter, depth_ceiling_from_thresholds, max_nodes_from_thresholds, Traverse,
