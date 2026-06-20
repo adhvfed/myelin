@@ -116,6 +116,7 @@ pub mod compiler;
 pub mod consistency;
 pub mod dek;
 pub mod engine;
+pub mod erase;
 pub mod erasure_posture;
 pub mod fusion;
 pub mod holder;
@@ -142,8 +143,10 @@ pub use consistency::{
 };
 pub use dek::{srch_p03_inherited_gates, hyok_skips_index, InheritedGate, SearchDekPin};
 pub use engine::{
-    AclFilter, Hit, IndexBackend, IndexDocument, IndexError, TantivyBackend, ORDER_KEY_FIELD,
+    AclFilter, Hit, IndexBackend, IndexDocument, IndexError, SubjectMatcher, TantivyBackend,
+    DEFAULT_SUBJECT_LOCATOR_FACETS, ORDER_KEY_FIELD,
 };
+pub use erase::{EraseOutcome, SearchEraseHolder, SEARCH_ERASE_EVENT_TYPE};
 pub use erasure_posture::{erasure_posture, ErasurePosture};
 pub use fusion::{fuse_with_k, reciprocal_rank_fusion, FusedHit, RankedList, RRF_K};
 pub use indexer::{

@@ -17,18 +17,21 @@
 //! holds **only derived, reconstructible** state (architecture §0/§1); the export source of truth
 //! is always the owning subsystem, never the index.
 //!
-//! ## Why a STUB surface now (the named floor)
-//! No index exists yet at M1 — the encrypted-from-birth per-tenant index layout is **SRCH-P03**
-//! (M2), the IndexBackend/Tantivy/vector shapes SRCH-P04/P05, the incremental indexer SRCH-P06. So
-//! the holder is **registered + classified + callable**, but its bodies return
-//! **empty-but-correct** results (a tenant with no index has no located docs/vectors) and `erase`
-//! is a well-defined no-op (nothing to purge) returning a content-addressed receipt. The REAL
-//! body — `locate` → docs/fields/vectors referencing the subject; `erase` → **purge + reindex**
-//! (delete the docs, tombstone+compact the vectors, reindex from the source's now-tombstoned
-//! projection, §4.8); `restrict` → suppress indexing/RAG/notification — lands in **SRCH-P15** (M2),
-//! and the per-tenant index DEK that crypto-shreds the whole tenant index on decommission +
-//! backstops backups is reserved by [`crate::dek`] in THIS prompt. The point of registering NOW:
-//! the M5 DSAR fan-out cannot silently miss Search (10.1 exhaustiveness).
+//! ## Why a STUB surface here (the registration / empty-index path) + the REAL mechanism (SRCH-P15)
+//! This [`SearchIndexHolder`] is the **registration / empty-index** holder: it is what `serve` opens
+//! at boot (the per-tenant index store auto-registers as H7 through the harness's one door) BEFORE any
+//! tenant has an index. Over an empty surface its bodies are **empty-but-correct** (a tenant with no
+//! index has no located docs/vectors; `erase` is a well-defined no-op — nothing to purge).
+//!
+//! The **REAL erase mechanism** — `locate` → docs/fields/vectors referencing the subject; `erase` →
+//! **PURGE + REINDEX** (delete the docs, tombstone+compact the vectors via the live consumer path,
+//! §4.8); `restrict` → suppress indexing/RAG/notification; the **HYOK structural skip** — shipped in
+//! **SRCH-P15** ([`crate::erase::SearchEraseHolder`], P-178): it wraps a LIVE
+//! [`crate::indexer::IncrementalIndexer`] and is the holder the DSR fan-out reaches once a tenant has
+//! an index. The per-tenant index DEK that crypto-shreds the whole tenant index on decommission +
+//! backstops backups is reserved by [`crate::dek`]. The point of registering through THIS stub at
+//! boot: the M5 DSAR fan-out cannot silently miss Search (10.1 exhaustiveness), whether or not a
+//! given tenant has yet built an index.
 
 use myelin_gdpr::{
     EraseReceipt, EraseScope, LocateReport, Patch, PersonalDataHolder, PortableBundle, Receipt,
@@ -157,12 +160,12 @@ impl PersonalDataHolder for SearchIndexHolder {
     }
 
     fn erase(&self, scope: EraseScope) -> DsrResult<EraseReceipt> {
-        // No-op purge: no index exists, so there is nothing to purge or compact. The real
-        // structural erasure — PURGE + REINDEX (delete docs/fields, tombstone+compact vectors,
-        // reindex the surviving artifact from the source's now-tombstoned projection, §4.8) — is
-        // the PRIMARY per-subject erasure and lands in SRCH-P15. The per-tenant index DEK
-        // (crate::dek) crypto-shreds the whole tenant index on decommission + backstops backups;
-        // it is reserved in THIS prompt but is NOT the whole erasure answer (named floor).
+        // No-op purge over an EMPTY surface: this registration-path holder has no live index, so there
+        // is nothing to purge or compact. The REAL structural erasure — PURGE + REINDEX (delete
+        // docs/fields, tombstone+compact vectors via the live consumer path, §4.8) — is shipped in
+        // SRCH-P15 ([`crate::erase::SearchEraseHolder`]), which wraps a LIVE indexer. The per-tenant
+        // index DEK (crate::dek) crypto-shreds the whole tenant index on decommission + backstops
+        // backups; the per-subject PRIMARY erasure is the purge + reindex SearchEraseHolder performs.
         let (subject_id, tenant) = match &scope {
             EraseScope::Subject { subject, tenant } => {
                 (Self::subject_id(subject), tenant.0.clone())
