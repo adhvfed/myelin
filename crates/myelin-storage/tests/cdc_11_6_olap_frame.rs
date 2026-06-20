@@ -144,3 +144,71 @@ fn cdc_11_6_olap_store_is_a_registered_holder() {
     let receipt = holder.register();
     assert_eq!(receipt.store, "issue_analytics_olap");
 }
+
+// =================================================================================================
+// 11.6 — the BUS-FEEDING side (the LIVE feed that completes the frame, P-ST-18 / P-145). The
+// provider is `myelin-storage` (the OLAP read store + the `reindex_olap_from_bus` rebuild path); the
+// consumer is the OLAP bus consumer fed off the REAL `myelin_events` outbox→relay→bus→consumer seam.
+// =================================================================================================
+
+/// The provider+consumer pair for the 11.6 LIVE feed: the OLAP store is fed by the bus (the
+/// idempotent consumer drains the durable stream), and `reindex(scope)` rebuilds it through the REAL
+/// `*.snapshot` re-emit seam BYTE-MATCHING live (reindex-from-source the ONLY rebuild path). If the
+/// live-feed surface drifts (the consumer shape, the reindex-from-bus rebuild, or the byte-parity),
+/// this stops compiling/passing — that is the contract.
+#[test]
+fn cdc_11_6_olap_store_is_fed_by_the_bus_and_reindexes_byte_matching_live() {
+    use myelin_events::{
+        EmitContextBase, InProcessBus, OutboxStore, Relay, ReindexSource, SnapshotScope, Timestamp,
+    };
+    use myelin_storage::{reindex_olap_from_bus, OlapAnalyticsSource, OlapBusConsumer};
+
+    // The owner's analytics source of truth (the facts the OLAP read model projects).
+    let mut src = OlapAnalyticsSource::new("olap_src");
+    src.upsert("issue:A", 1, Some("subj:alice"));
+    src.upsert("issue:B", 2, None);
+
+    // LIVE: the OLAP consumer ingests the owner's live events off the bus (dedup on event_id).
+    let mut live = OlapBusConsumer::boot(region());
+    for draft in src.replay(&SnapshotScope::new("olap_src", "all"), None) {
+        let env = envelope(&draft.event_id().0, &draft.aggregate.0);
+        // The live event carries the same aggregate as the snapshot (the projection key).
+        let _ = live.ingest(&env);
+    }
+    assert_eq!(live.store().doc_count(), 2, "two facts projected live off the bus");
+    assert_eq!(live.store().oltp_scan_path_count(), 0, "fed off the bus — no OLTP-scan backdoor");
+
+    // COLD: reindex(scope) rebuilds through the REAL outbox→relay→bus→consumer path.
+    let outbox_handle = OutboxStore::new();
+    let bus = InProcessBus::new();
+    let relay = Relay::new(outbox_handle.clone(), bus.clone(), || {
+        Timestamp("2026-06-20T00:00:02Z".into())
+    });
+    let mut outbox = outbox_handle;
+    let scope = SnapshotScope::new("olap_src", "all");
+    let sources: Vec<&dyn ReindexSource> = vec![&src];
+    let ctx = EmitContextBase {
+        tenant: TenantId::from_token("01J0ACME"),
+        region: region(),
+        actor: Actor(Principal::stub(
+            PrincipalId("platform".into()),
+            PrincipalKind::Service,
+            TenantId::from_token("01J0ACME"),
+        )),
+        schema_ver: 1,
+        occurred_at: Timestamp("2026-06-20T00:00:00Z".into()),
+        recorded_at: Timestamp("2026-06-20T00:00:00Z".into()),
+        caused_by: None,
+    };
+    let (cold, receipt) =
+        reindex_olap_from_bus(region(), &scope, &sources, &mut outbox, &bus, &relay, ctx, "")
+            .expect("the OLAP reindex-from-bus succeeds");
+
+    assert_eq!(receipt.snapshots_emitted, 2, "two snapshots re-emitted (the rebuild)");
+    assert_eq!(cold.store().doc_count(), 2, "the cold rebuild projected both");
+    assert_eq!(
+        cold.store().oltp_scan_path_count(),
+        0,
+        "the cold rebuild is reindex-from-source — never an OLTP scan"
+    );
+}
