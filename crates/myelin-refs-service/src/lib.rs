@@ -48,10 +48,19 @@
 //! cached title") + the inherited-M1-gate precondition list named for REF-P5
 //! ([`dek::ref_p5_inherited_gates`]).
 //!
+//! **REF-P5 (P-154) ships:** the [`migration`] module — the **edge inverse-index schema migration**
+//! (the §3.2 `edge` table + its three indexes `edge_inbound`/`edge_outbound`/`edge_by_rel`), as a
+//! **forward-only online migration** (contract 1.5) through the substrate framework, **RLS-on**
+//! (the platform `myelin_make_tenant_scoped` convention), **`(tenant, region)`-first**, and
+//! **encrypted-from-birth** under the REF-P4 per-tenant DEK ([`edge_table_dek_ref`]). The live-DB
+//! apply + RLS isolation + the three indexes are proven against the dev stack in
+//! `tests/integration_ref_p5_edge_schema.rs` (the `integration` feature). This is the SCHEMA ONLY —
+//! the builder/invalidator that POPULATE it are **REF-P6/P7**.
+//!
 //! **Does NOT ship (floors named):**
-//! - **No edge engine, no migration, no R2 cache.** The edge inverse-index schema is **REF-P5**
-//!   (M2); the builder/invalidator consumers are **REF-P6/P7** (M2); the live R2 cache is
-//!   **REF-P12**. REF-P4 reserves the key class; nothing is encrypted yet (no data exists).
+//! - **No edge BUILDER/INVALIDATOR, no R2 cache.** REF-P5 ships the empty schema; the
+//!   builder/invalidator consumers that populate it are **REF-P6/P7** (M2); the live R2 cache is
+//!   **REF-P12**. An empty table is not a working index — nothing writes a row here yet.
 //! - **No real crypto-shred over real data.** The holder is a STUB surface: `erase` is a
 //!   well-defined no-op now (nothing to purge). The DEK lever EXISTS + FIRES (proven structurally in
 //!   [`dek`]), but the structural erasure body that USES it — R2-cache PII purge + reliance on
@@ -70,9 +79,15 @@
 pub mod dek;
 pub mod erasure_posture;
 pub mod holder;
+pub mod migration;
 pub mod residency;
 
 pub use dek::{ref_p5_inherited_gates, InheritedGate, RefsDekPin};
+pub use migration::{
+    edge_ddl_is_forward_only, edge_table_dek_ref, edge_table_migrations, CREATE_EDGE_INDEXES_DDL,
+    CREATE_EDGE_TABLE_DDL, EDGE_BY_REL_INDEX, EDGE_INBOUND_INDEX, EDGE_MIGRATION_ID,
+    EDGE_OUTBOUND_INDEX, EDGE_TABLE, MAKE_EDGE_TENANT_SCOPED_DDL,
+};
 pub use erasure_posture::{erasure_posture, ErasurePosture};
 pub use holder::{
     refs_store_classifier, register_refs_holders, RefsCacheHolder, RefsEdgeHolder,
