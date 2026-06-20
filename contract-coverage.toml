@@ -583,11 +583,18 @@ title = "data_map() / ropa(tenant)"
 status = "covered"
 cdc = ["crates/myelin-gdpr-service/tests/cdc_10_3_data_map.rs"]
 
+# 10.4 — the DSR orchestrator API + the state machine + the controller/processor posture gate ships
+# its provider+consumer CDC pair NOW (P-GA-11 → P-111): the orchestrator (provider) + a DSR-submitting
+# caller polling `dsr_status` + an auditor reading `dsr_certificate` (consumer). The per-holder fan-out
+# DRIVE + the verifiable receipts (P-GA-12 → P-112), tenant-operability (P-GA-13 → P-113), the durable
+# deadline timer (P-GA-21 → P-148), and the Merkle SEAL of the certificate (P-GA-20 → P-119) EXTEND this
+# spine; they are not a missing pair (the pair below is a real provider+consumer seam), so the row is
+# `covered`.
 [[contract]]
 row = "10.4"
 title = "dsr_submit / dsr_status / dsr_certificate"
-status = "deferred"
-landing = "P-111"
+status = "covered"
+cdc = ["crates/myelin-gdpr-service/tests/cdc_10_4_dsr_orchestrator.rs"]
 
 [[contract]]
 row = "10.5"

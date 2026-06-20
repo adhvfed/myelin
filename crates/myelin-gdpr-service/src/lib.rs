@@ -125,10 +125,35 @@
 //! `serve(AppSpec)` boot that assembles the full registered-holder set (the gate LOGIC is complete + tested
 //! here — the pipeline invocation is one call to [`diffgate::check_against_baseline`] over the boot's holder
 //! set).
+//!
+//! ## P-GA-11 (→ P-111) — the DSR orchestrator API + the state machine + the posture gate (contract 10.4)
+//! [`dsr`] ships the **DSR orchestrator** ([`dsr::DsrOrchestrator`]) — the three API entry points
+//! (`dsr_submit(kind, subject, scope, posture) → dsr_id`, `dsr_status(dsr_id) → {state, deadline,
+//! checklist}`, `dsr_certificate(dsr_id) → MerkleProvenBundle`), the **total + ordered state machine**
+//! ([`dsr::DsrState`]: `received → validated → fanned-out → {awaiting-holders} → verified → completed`, with
+//! the `awaiting-holders`-cannot-be-skipped property the single transition guard
+//! [`dsr::DsrState::can_transition_to`] enforces), and the **controller/processor posture gate** (§1 — a
+//! Myelin-initiated erase of *tenant content* is REFUSED, [`dsr::DsrState::Refused`], unless tenant-instructed
+//! or a `EraseScope::Tenant` offboarding). The deadline is set COARSE on submit (`now + 1 month` via an
+//! injectable [`myelin_substrate::Clock`]). The orchestrator RESOLVES a read-only per-holder checklist FROM
+//! the generated [`datamap::Inventory`] (the map, not a hand-written list, drives the scope — §4.1 step 2).
+//! **Floors named:** the per-holder checklist DRIVE + the resumable fan-out + the verifiable receipts + the
+//! legal-hold gate → **P-GA-12 → P-112**; tenant-operability (Art. 28 + offboarding + restrict/rectify/
+//! portability) → **P-GA-13 → P-113**; the durable deadline timer (the `myelin-flow` wheel) → **M2 P-GA-21 →
+//! P-148**; the Merkle SEAL of the certificate receipts into the per-tenant audit tree → **P-GA-20 → P-119**
+//! (the [`dsr::MerkleProvenBundle::merkle_inclusion`] field is `None` until then); the durable Postgres
+//! `dsr_request`/`dsr_receipt` (G1/G2) tables → the same DB floor every M0 in-memory store carries (P-007).
+//!
+//! ## Mutation floor (P-GA-11 TESTS — the state-machine transitions + the posture gate are mandatory-core).
+//! See the module note in [`dsr`]; the [`dsr::DsrState::can_transition_to`] guard, the
+//! [`dsr::DsrOrchestrator::posture_gate_refuses`] predicate, and the `now + 1 month` deadline are the
+//! behavioral core every mutation must be caught on (the `cargo mutants` score for this module is recorded in
+//! the commit body — EI-01 §3, stated not hidden).
 
 pub mod audit;
 pub mod datamap;
 pub mod diffgate;
+pub mod dsr;
 pub mod holders;
 pub mod orchestration;
 
@@ -142,6 +167,10 @@ pub use datamap::{
 pub use diffgate::{
     check_against_baseline, diff, CommittedBaseline, DataMapDiff, GateVerdict, Reclassification,
     COMMITTED_BASELINE_FINGERPRINT,
+};
+pub use dsr::{
+    resolve_checklist_from_map, ChecklistItem, Dsr, DsrError, DsrId, DsrKind, DsrOrchestrator,
+    DsrState, DsrStatus, Initiator, MerkleProvenBundle, Posture, DSR_DEADLINE_SECS, DSR_STATE,
 };
 pub use holders::{
     gdpr_owned_holder_ids, AuditCarveOutHolder, CryptoShredKms, GdprOwnStoreHolder,
