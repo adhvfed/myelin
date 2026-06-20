@@ -178,7 +178,13 @@ pub struct RoutedInboxItem {
     /// the body, NOTIF-P11, builds on; here the skeleton just counts the collapse).
     pub coalesce_count: i32,
     /// The ONE read-state column (the C-9 read-state truth) — a fresh row is `unread`.
+    /// `mark`/`snooze`/`mark_all_read` (NOTIF-P6) flip THIS column on the SAME row across every view.
     pub state: String,
+    /// The durable-snooze re-surface time (the §2.1 `snooze_until`) — `snooze(item, until)` records
+    /// it here; the item is suppressed from the active inbox until then. A fresh row has `None`. The
+    /// durable re-surface TIMER that flips a due snooze back to `unread` is the `myelin-flow` wheel
+    /// (NOTIF-P14 / NOTIF-P18); here only the until is recorded (the named floor).
+    pub snooze_until: Option<String>,
 }
 
 /// **The in-memory inbox projection the skeleton router UPSERTs into** (the model of the
@@ -253,6 +259,57 @@ impl InboxProjection {
             .unwrap_or_else(|e| e.into_inner())
             .get(&(tenant.0.clone(), recipient.to_string(), dedup_key.to_string()))
             .cloned()
+    }
+
+    /// **Mutate the ONE read-state row for `(tenant, recipient, item_id)` in place (the NOTIF-P6
+    /// read-state write path).** Finds the SINGLE row addressed to `recipient` whose `item_id` is
+    /// `item_id` and applies `f` to it — the C-9 "one store → one read-state truth": the `state`
+    /// column is the SAME row across every view, so the mutation is visible in the unified inbox AND
+    /// in every scoped view at once (there is no second store to keep in sync). Returns `true` iff a
+    /// row was found and mutated (a row not addressed to `recipient`, or a missing `item_id`, mutates
+    /// NOTHING — a principal can only flip the read-state of their OWN items).
+    ///
+    /// The projection is keyed `(tenant, recipient, dedup_key)`; the contract addresses items by the
+    /// opaque `item_id` (the 7.2 read-state handle). `item_id` is deterministic from
+    /// `(tenant, recipient, dedup_key)` ([`item_id_for`]), so within a `(tenant, recipient)` it is
+    /// unique — this scan finds the one row. In the OLTP binding this is a single
+    /// `UPDATE notif_inbox_item SET state = $1 WHERE tenant_id = $2 AND recipient = $3 AND item_id = $4`.
+    pub fn mutate_state<F: FnOnce(&mut RoutedInboxItem)>(
+        &self,
+        tenant: &TenantId,
+        recipient: &str,
+        item_id: &str,
+        f: F,
+    ) -> bool {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        for row in guard.values_mut() {
+            if row.tenant == *tenant && row.recipient == recipient && row.item_id == item_id {
+                f(row);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// **Apply `f` to EVERY row addressed to `recipient` for which `select(row)` is true (the
+    /// `mark_all_read(filter)` write path, NOTIF-P6).** Flips state on exactly the rows the filter
+    /// selects — and ONLY rows addressed to `recipient` (never another principal's inbox). Returns
+    /// the count mutated. In the OLTP binding this is one set-based
+    /// `UPDATE notif_inbox_item SET state = 'read' WHERE tenant_id = $1 AND recipient = $2 AND <filter>`.
+    pub fn mutate_matching<S, F>(&self, tenant: &TenantId, recipient: &str, select: S, mut f: F) -> usize
+    where
+        S: Fn(&RoutedInboxItem) -> bool,
+        F: FnMut(&mut RoutedInboxItem),
+    {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut n = 0;
+        for row in guard.values_mut() {
+            if row.tenant == *tenant && row.recipient == recipient && select(row) {
+                f(row);
+                n += 1;
+            }
+        }
+        n
     }
 
     /// **A snapshot of all rows under one tenant (the holder's scan surface, NOTIF-P4).** The
@@ -444,6 +501,7 @@ impl SignalRouter {
             dedup_key,
             coalesce_count: 1,
             state: "unread".to_string(),
+            snooze_until: None,
         }
     }
 

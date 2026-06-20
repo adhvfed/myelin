@@ -52,6 +52,7 @@ fn item(recipient: &str, id: &str, subject: &str, reason: Reason) -> RoutedInbox
         dedup_key: id.into(),
         coalesce_count: 1,
         state: "unread".into(),
+        snooze_until: None,
     }
 }
 

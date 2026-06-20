@@ -492,11 +492,19 @@ cdc = [
     "crates/myelin-notif/tests/cdc_7_1_notif_list_inbox.rs",
 ]
 
+# 7.2 COVERED at NOTIF-P6 (P-184): mark / snooze / mark_all_read — the ONE read-state truth. The
+# provider (Notif owns 7.2 — one store, one read-state: a mark in a scoped view is read in the
+# unified inbox, 0 divergence; snooze records the until + suppresses from the active inbox;
+# mark_all_read(filter) flips EXACTLY the C-9-filtered rows) + consumer (the inbox UI / the CLI
+# inbox read|snooze through the SAME read-state path). The durable snooze re-surface timer is the
+# named floor NOTIF-P14/P18 (the myelin-flow wheel); here only the until is recorded.
 [[contract]]
 row = "7.2"
 title = "mark / snooze / mark_all_read"
-status = "deferred"
-landing = "P-184"
+status = "covered"
+cdc = [
+    "crates/myelin-notif/tests/cdc_7_2_notif_read_state.rs",
+]
 
 [[contract]]
 row = "7.3"

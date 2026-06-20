@@ -381,6 +381,7 @@ mod tests {
             dedup_key: item_id.into(),
             coalesce_count: 1,
             state: "unread".into(),
+            snooze_until: None,
         }
     }
 
