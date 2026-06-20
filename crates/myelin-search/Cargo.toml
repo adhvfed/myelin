@@ -24,12 +24,30 @@ publish = false
 myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-events = { path = "../myelin-events" }
 
-# TEST-ONLY. The names/units drift test constructs a canonical EventEnvelope (which embeds a
-# Principal from myelin-identity) to read the REAL frozen field names off a value, and confirms
-# the search-requires-acl-filter lint (its home is the shared myelin-lints ratchet crate; SRCH-P01
-# confirms it in place rather than duplicating it — EI-01 §7). Neither is a production dependency
-# of this M0 anchor crate; they are the harness the drift+lint proofs run against.
-[dev-dependencies]
+# SRCH-P02 (P-122, M1) consumer dependencies — Search registers into the platform GDPR/KMS/residency
+# substrate (holder registration + per-tenant index DEK + residency-pin confirmation). Like
+# myelin-refs-service (REF-P3/P4), Search is a LEAF CONSUMER above these glue crates and is OUTSIDE
+# the eleven-crate library DAG modelled by myelin-substrate::crate_graph (it is not a Crate::* node),
+# so adding these does NOT mutate the modelled DAG (substrate stays root; nothing depends back on
+# Search). The acyclicity holds: -gdpr/-storage/-substrate never depend on -search.
+#   - myelin-gdpr      → the PersonalDataHolder contract (10.1) + the receipt/scope/SubjectRef types
+#                        Search IMPLEMENTS as holder H7 (stub surface now; real purge+reindex SRCH-P15).
+#   - myelin-storage   → the KMS hierarchy (11.3/11.4: KmsEngine + KeyClass + PiiKeyRef) the Search
+#                        per-tenant index DEK is reserved in + the KeyOrigin/IndexAdmission HYOK gate.
+#   - myelin-substrate → the holder registry (StoreKind/HolderRegistry, contract 1.4) + the H1–H18
+#                        catalog (Holder::H7SearchIndex + classify_store + the completeness assertion).
+#   - myelin-identity  → Principal — the verified subject the holder's locate/erase key on (via
+#                        SubjectRef). (Promoted from dev-only: the holder surface now uses it in prod.)
+myelin-gdpr = { path = "../myelin-gdpr" }
+myelin-storage = { path = "../myelin-storage" }
+myelin-substrate = { path = "../myelin-substrate" }
 myelin-identity = { path = "../myelin-identity" }
+
+# TEST-ONLY. The names/units drift test constructs a canonical EventEnvelope (which embeds a
+# Principal from myelin-identity, now a prod dep above) to read the REAL frozen field names off a
+# value, and confirms the search-requires-acl-filter lint (its home is the shared myelin-lints
+# ratchet crate; SRCH-P01 confirms it in place rather than duplicating it — EI-01 §7). The lint crate
+# is not a production dependency; it is the harness the lint proof runs against.
+[dev-dependencies]
 myelin-lints = { path = "../myelin-lints" }
 serde_json = { workspace = true }

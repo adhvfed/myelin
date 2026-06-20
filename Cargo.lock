@@ -2001,8 +2001,11 @@ name = "myelin-search"
 version = "0.0.0"
 dependencies = [
  "myelin-events",
+ "myelin-gdpr",
  "myelin-identity",
  "myelin-lints",
+ "myelin-storage",
+ "myelin-substrate",
  "myelin-tenancy",
  "serde_json",
 ]

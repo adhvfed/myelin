@@ -73,6 +73,55 @@
 //! Nothing here must be mistaken for a working index: this M0 deliverable is the committed lint
 //! plus the name anchors that keep the M2 build from drifting off the frozen envelope. The
 //! anchors below are `const` field-NAME strings, deliberately carrying no runtime mechanism.
+//!
+//! ## What SRCH-P02 (P-122, M1) adds — holder registration + the per-tenant index DEK + residency
+//!
+//! On top of the M0 ratchet, SRCH-P02 (M1) registers Search into the platform GDPR/KMS/residency
+//! substrate so the S-M2 index is encrypted-from-birth and the M5 DSAR fan-out cannot miss it.
+//! **Reconciliation (coherence, EI-01 §7):** this is the EXACT analog of REF-P3/REF-P4 (P-120/P-121,
+//! the Refs `myelin-refs-service` holder registration + per-tenant DEK pin). Refs needed a SEPARATE
+//! `-service` crate because its glue crate is a modelled node in the eleven-crate library DAG
+//! (`myelin-substrate::crate_graph`) that may not depend on `-gdpr`; **`myelin-search` is already a
+//! consumer/service crate OUTSIDE that modelled DAG** (it is not a `Crate::*` node — substrate's
+//! `crate_graph` does not model it), so SRCH-P02 EXTENDS this crate in place rather than spawning a
+//! second one. It pulls in `-gdpr` / `-storage` / `-substrate` as the consumer dependencies the
+//! holder + DEK + residency confirmation need.
+//!
+//! - [`holder`] — Search as a real, registered `PersonalDataHolder` (**H7 `SearchIndex`**) over its
+//!   ONE store (the per-tenant index, §3.4), registered through the substrate holder registry
+//!   (contract 1.4) so the H1–H18 list is exhaustive before any tenant data exists (10.1). At M1 a
+//!   STUB surface: `locate`/`export` return empty-but-correct, `restrict`/`rectify`/`erase` are
+//!   well-defined no-ops. The REAL erase — PURGE + REINDEX (the primary per-subject erasure), vectors
+//!   compacted, restrict suppression — lands in **SRCH-P15**.
+//! - [`dek`] — the Search **per-tenant index DEK** reserved in the cell's ONE KMS hierarchy
+//!   (`myelin_storage::KmsEngine`, 11.3 / 11.4) so the (future) index is **encrypted-from-birth**,
+//!   with **destroy callable** (the tenant-decommission crypto-shred + backup backstop) + the
+//!   **per-subject SOURCE-DEK backstop** (§4.8, the added backstop) + the **HYOK structural-skip**
+//!   reference ([`dek::hyok_skips_index`]) + the inherited-M1-gate precondition list named for
+//!   SRCH-P03 ([`dek::srch_p03_inherited_gates`]).
+//! - [`residency`] — the `(tenant, region)` + residency-tag store descriptor that confirms the
+//!   residency-pin applies (no cross-region index read on personal data, §1/§3.4) + links the
+//!   residency-pin / tenant-predicate lints.
+//! - [`erasure_posture`] — the record that Search instantiates the ONE platform free-text/immutable
+//!   erasure posture (X-7 / 10.9) **by reference** and adds NO new `[OPEN — LEGAL]` residual.
+//!
+//! **SRCH-P02 FLOOR (named):** THE floor is the per-tenant index DEK (the crypto-shred + backup
+//! backstop unit) — reserved + destroyable here. The **PRIMARY per-subject erasure by purge +
+//! reindex** is the follow-on, landing in **SRCH-P15** once the index exists; the DEK is NOT the
+//! whole erasure answer. No index / layout / migration / real ciphertext / real vectors ship here.
+
+pub mod dek;
+pub mod erasure_posture;
+pub mod holder;
+pub mod residency;
+
+pub use dek::{srch_p03_inherited_gates, hyok_skips_index, InheritedGate, SearchDekPin};
+pub use erasure_posture::{erasure_posture, ErasurePosture};
+pub use holder::{
+    register_search_holder, search_index_holder, SearchHolderRegistration, SearchIndexHolder,
+    SEARCH_INDEX_STORE,
+};
+pub use residency::{search_store_descriptors, SearchStoreDescriptor};
 
 /// The frozen field-NAME of the Search index document's `doc_id` — the
 /// [`ArtifactRef`](myelin_events::ArtifactRef) key (architecture §3.1; contract 5.1). This is
