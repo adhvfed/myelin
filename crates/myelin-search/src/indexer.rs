@@ -559,12 +559,19 @@ impl IncrementalIndexer {
             }
         };
 
-        // Analyze (language-detect → tokenize → normalize, §4.7). The real per-language analyzer chain
-        // is SRCH-P12; here it is pass-through-correct (the owner-pinned lang, else a floor `und`/`en`).
-        // The tokenize/normalize is Tantivy's default analyzer at upsert time (the FT shape). The lang
-        // TAG selects the analyzer chain (SRCH-P12); it is detected here (the named floor) and carried
-        // as the `lang` index-doc field — stored on the engine alongside the staleness anchor.
+        // Analyze (language-detect → tokenize → normalize, §4.7). The REAL per-language analyzer chain
+        // (SRCH-P12 / P-175) lives in `crate::analysis`: a source-declared `lang` overrides; else the
+        // index-time detector ([`Self::detect_lang`]) selects the field-language. The `lang` TAG is
+        // carried as the `lang` index-doc field (stored alongside the staleness anchor) so the
+        // query-time path selects the IDENTICAL chain — the no-analyzer-mismatch-miss parity invariant.
         let lang = projection.lang.clone().unwrap_or_else(|| Self::detect_lang(&projection.text));
+        // Run the ONE chain over the body at index time (the analyzed term set is what a query-time
+        // analysis of the SAME language must match — proven in `crate::analysis`'s parity gate). The
+        // analyzed terms inform the inverted shape; the Tantivy `TEXT` field carries the body so the
+        // round-trip + re-stamp path (§4.1 tail) keeps it. (The custom-tokenizer engine registration is
+        // the downstream integration; the analyzer SEMANTICS — the load-bearing correctness — are here.)
+        let _analyzed_terms =
+            crate::analysis::Analyzer::for_tag(&lang).analyze(&projection.text);
 
         // Build the IndexDocument (§3.1): doc_id = the ArtifactRef key (sub-precise), acl_object = the
         // #sub-stripped parent (the ACL pre-filter key, §3.1). For a sub-artifact doc (a `#sub`-anchored
@@ -660,15 +667,16 @@ impl IncrementalIndexer {
         Ok(())
     }
 
-    /// A pass-through-correct language detector (the SRCH-P12 floor). Returns a coarse tag: `und`
-    /// (undetermined) for empty text, else a floor `en` default. The REAL per-language analyzer chain
-    /// (EU + CJK + code tokenizer) is SRCH-P12; this is the named floor (a tag, not a real detector).
+    /// **Index-time language detection (§4.7, SRCH-P12 / P-175).** Selects the field-language whose
+    /// per-language analyzer chain ([`crate::analysis`]) analyzed this body — script-first (CJK vs
+    /// Latin), then an EU stopword-overlap best-effort, defaulting to `und` (never a wrong confident
+    /// guess). The returned `lang` TAG is stamped on the index doc (§3.1); the query-time path reads
+    /// it back to select the IDENTICAL chain (the no-analyzer-mismatch-miss parity invariant). A
+    /// source-declared language overrides this (the projection's `lang`, handled by the caller). The
+    /// exact EU language set + CJK strategy remain the [OPEN → P6] floor; the per-language MECHANISM is
+    /// built in [`crate::analysis`].
     fn detect_lang(text: &str) -> String {
-        if text.trim().is_empty() {
-            "und".to_string()
-        } else {
-            "en".to_string()
-        }
+        crate::analysis::detect_language(text).tag().to_string()
     }
 
     fn str_field(payload: &serde_json::Value, key: &str) -> Option<String> {
