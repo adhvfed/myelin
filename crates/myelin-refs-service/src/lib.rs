@@ -34,33 +34,45 @@
 //!   this crate LINKS them by threading `myelin_tenancy::{TenantId, Region, ResidencyTag}` through
 //!   its store descriptors (the token types the lints recognise).
 //!
-//! ## What REF-P3 (P-120) ships — and what it deliberately does NOT (VISION §3 name-your-floors)
-//! **Ships:** the [`holder`] module — Refs as a real, registered `PersonalDataHolder` (H12) over
-//! its two (future) stores (the edge OLTP index + the R2 projection cache), each registered through
-//! the substrate holder registry; the [`residency`] module — the `(tenant, region)` + residency-tag
-//! store descriptors that confirm the residency-pin applies + link the residency-pin lint; the
-//! [`erasure_posture`] record — Refs adds NO new free-text residual (X-7 by reference).
+//! ## What REF-P3 (P-120) + REF-P4 (P-121) ship — and what they deliberately do NOT (VISION §3)
+//! **REF-P3 ships:** the [`holder`] module — Refs as a real, registered `PersonalDataHolder` (H12)
+//! over its two (future) stores (the edge OLTP index + the R2 projection cache), each registered
+//! through the substrate holder registry; the [`residency`] module — the `(tenant, region)` +
+//! residency-tag store descriptors that confirm the residency-pin applies + link the residency-pin
+//! lint; the [`erasure_posture`] record — Refs adds NO new free-text residual (X-7 by reference).
+//!
+//! **REF-P4 (P-121) ships:** the [`dek`] module — the Refs **per-tenant DEK** reserved in the cell's
+//! ONE KMS hierarchy ([`myelin_storage::KmsEngine`], 11.3 / 11.4) so the (future) edge index + R2
+//! cache are **encrypted-from-birth**, with **destroy callable** on the key class (the
+//! tenant-decommission crypto-shred lever) + the **per-subject DEK backstop** (§3.6, "a name in a
+//! cached title") + the inherited-M1-gate precondition list named for REF-P5
+//! ([`dek::ref_p5_inherited_gates`]).
 //!
 //! **Does NOT ship (floors named):**
 //! - **No edge engine, no migration, no R2 cache.** The edge inverse-index schema is **REF-P5**
-//!   (M2); the per-tenant DEK that encrypts it is **REF-P4** (M1, the very next prompt); the
-//!   builder/invalidator consumers are **REF-P6/P7** (M2).
-//! - **No real crypto-shred.** The holder is a STUB surface: `erase` is a well-defined no-op now
-//!   (nothing to purge). The structural erasure body — R2-cache PII purge + reliance on Identity's
-//!   pseudonym shred for `origin_actor` + `*.erased` tombstoning — lands in **REF-P15** (M2).
-//! - **The holder is registered, but no store is OPENED at runtime here.** `serve` opens the real
-//!   stores (and auto-registers them) when the edge schema lands (REF-P5+). This crate proves the
-//!   registration + classification is correct so the M5 DSAR fan-out cannot silently miss Refs.
+//!   (M2); the builder/invalidator consumers are **REF-P6/P7** (M2); the live R2 cache is
+//!   **REF-P12**. REF-P4 reserves the key class; nothing is encrypted yet (no data exists).
+//! - **No real crypto-shred over real data.** The holder is a STUB surface: `erase` is a
+//!   well-defined no-op now (nothing to purge). The DEK lever EXISTS + FIRES (proven structurally in
+//!   [`dek`]), but the structural erasure body that USES it — R2-cache PII purge + reliance on
+//!   Identity's pseudonym shred for `origin_actor` + `*.erased` tombstoning — lands in **REF-P15**
+//!   (M2); the world-scale 0-recoverable shred drill (REF-D5) is **REF-P15 / REF-P25**.
+//! - **The holder is registered + the DEK reserved, but no store is OPENED at runtime here.** `serve`
+//!   opens the real stores (auto-registering them + wiring the [`dek::RefsDekPin`] into them) when
+//!   the edge schema lands (REF-P5+). This crate proves the registration + classification + DEK pin
+//!   are correct so the M5 DSAR fan-out cannot silently miss Refs and the index is encrypted-from-birth.
 //!
-//! So this crate at M1 is the holder REGISTRATION + the residency-pin CONFIRMATION only — not the
-//! engine, not the real erasure.
+//! So this crate at M1 is the holder REGISTRATION + the residency-pin CONFIRMATION + the per-tenant
+//! DEK PIN — not the engine, not the real erasure.
 
 #![forbid(unsafe_code)]
 
+pub mod dek;
 pub mod erasure_posture;
 pub mod holder;
 pub mod residency;
 
+pub use dek::{ref_p5_inherited_gates, InheritedGate, RefsDekPin};
 pub use erasure_posture::{erasure_posture, ErasurePosture};
 pub use holder::{
     refs_store_classifier, register_refs_holders, RefsCacheHolder, RefsEdgeHolder,
