@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<!-- FINALIST D · CIVIC | Screen 1 of 7 — THE SHELL + Q3 EXEC DASHBOARD (PM/corporate surface)
+     Carrier: C-03 (Vignelli exec dashboard) absorbing C-10 small-multiples.
+     Axis position: density=medium · nav=rail · unification=highly-unified · tone=sober · agent=ambient · sovereignty=ALWAYS-ON.
+     This single screen satisfies brief screen #1 (shell: primary nav + contextual sidebar + content + context pane,
+     composing Issues + Govern surfaces) AND screen #3 (approachable PM/corporate = Q3 roadmap/exec over the SAME issue data).
+     Canonical scenario: acme (EU-West/Frankfurt), Q3 "Payments reliability" initiative, ISS-377, PR #412.
+     [DEFERRED-UNTIL-USERS] expert sketch, not user-validated. Tags: PROVEN = cited mechanism; HOUSE STYLE = our synthesis. -->
+<html lang="en" dir="ltr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Delivery — Q3 executive overview · acme · Myelin</title>
+<!-- sketch-only CDN font; production self-hosts (design-language §3.3, no font CDN) -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../tokens.css">
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{background:var(--bg);color:var(--text-primary);font:13px/1.5 var(--font-sans);-webkit-font-smoothing:antialiased;overflow:hidden}
+  a{color:var(--accent-text);text-decoration:none}
+  button{font:inherit;color:inherit;background:none;border:none;cursor:pointer}
+  .num{font-variant-numeric:tabular-nums}
+  .mono{font-family:var(--font-mono)}
+
+  /* shell: pinned to viewport; each region owns its scroller; flex children min-height:0 (§8b.4) */
+  .shell{display:grid;grid-template-rows:auto auto 1fr;height:100vh}
+  .topbar{display:flex;align-items:center;gap:var(--space-4);border-bottom:1px solid var(--border);padding:0 var(--space-4);height:46px;background:var(--surface)}
+  .brand{display:flex;align-items:center;gap:var(--space-2);font-weight:700}
+  .brand .m{width:24px;height:24px;border-radius:var(--radius-1);background:var(--text-primary);color:var(--surface);display:grid;place-items:center;font-size:13px}
+  .scope{display:flex;align-items:center;gap:var(--space-2);color:var(--text-secondary)}
+  .scope b{color:var(--text-primary);font-weight:600}
+  .scope .sep{color:var(--border-strong)}
+  .topbar .right{margin-inline-start:auto;display:flex;align-items:center;gap:var(--space-3)}
+  .kbtn{border:1px solid var(--border);border-radius:var(--radius-1);padding:4px 10px;color:var(--text-secondary);display:inline-flex;gap:var(--space-2);align-items:center}
+  .kbtn kbd{font-family:var(--font-mono);font-size:11px;color:var(--text-muted)}
+  .avatar{width:26px;height:26px;border-radius:var(--radius-1);background:var(--surface-sunken);border:1px solid var(--border);display:grid;place-items:center;font-size:11px;color:var(--text-secondary)}
+  .theme-toggle{border:1px solid var(--border);border-radius:var(--radius-1);padding:4px 8px;color:var(--text-secondary);font-size:11px}
+
+  /* ALWAYS-ON sovereignty band — Axis-6 always-on pole; sits across the top, near the data (R-19 §1.1 T0).
+     Two ambient cues survive the calm budget; rest is on-demand. PROVEN: data is region-pinned (ADR-11). */
+  .sov{display:flex;align-items:center;gap:var(--space-6);background:var(--surface-band);border-bottom:1px solid var(--border);padding:6px var(--space-4);font-size:11.5px;color:var(--text-secondary)}
+  .sov .item{display:flex;align-items:center;gap:var(--space-2)}
+  .sov .gl{width:13px;text-align:center;color:var(--accent-text)}
+  .sov b{color:var(--text-primary);font-weight:600}
+  .sov .right{margin-inline-start:auto}
+
+  .body{display:grid;grid-template-columns:200px 1fr 300px;min-height:0}
+  /* primary nav rail */
+  .rail{border-inline-end:1px solid var(--border);background:var(--surface);padding:var(--space-2) 0;overflow:auto}
+  .rail .grp{font-size:10px;text-transform:uppercase;letter-spacing:.1em;color:var(--text-muted);padding:var(--space-3) var(--space-4) var(--space-1);font-weight:700}
+  .rail a{display:flex;align-items:start;gap:var(--space-2);padding:6px var(--space-4);color:var(--text-secondary);border-inline-start:3px solid transparent}
+  .rail a:hover{color:var(--text-primary);background:var(--surface-sunken)}
+  .rail a.on{color:var(--text-primary);font-weight:600;border-inline-start-color:var(--accent);background:var(--surface-sunken)}
+  .rail a .g{width:14px;text-align:center;color:var(--text-muted);flex:none}
+  .rail a.on .g{color:var(--accent-text)}
+
+  /* main content scroller */
+  .main{overflow:auto;min-height:0;padding:var(--space-6)}
+  .h1{display:flex;align-items:baseline;gap:var(--space-4);flex-wrap:wrap}
+  .h1 h1{font-size:20px;font-weight:700;letter-spacing:-.01em}
+  .h1 .period{color:var(--text-secondary)}
+  .h1 .as-of{margin-inline-start:auto;color:var(--text-muted);font-size:12px}
+
+  .kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:var(--space-3);margin:var(--space-4) 0}
+  .kpi{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-1);padding:var(--space-3) var(--space-4)}
+  .kpi .lab{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--text-muted)}
+  .kpi .val{font-size:26px;font-weight:600;margin-top:6px;letter-spacing:-.02em}
+  .kpi .delta{font-size:12px;margin-top:4px;color:var(--text-secondary);display:flex;align-items:center;gap:5px}
+  .kpi .delta .gl{font-size:10px}
+  .up{color:var(--status-ok)} .down{color:var(--status-bad)} .flat{color:var(--text-muted)}
+
+  .grid2{display:grid;grid-template-columns:1.6fr 1fr;gap:var(--space-4)}
+  .panel{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-1);overflow:hidden}
+  .panel h2{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--text-secondary);padding:10px var(--space-4);border-bottom:1px solid var(--border);font-weight:600;display:flex;align-items:center;gap:var(--space-2)}
+  .panel h2 .resi{margin-inline-start:auto;font-size:10.5px;font-weight:500;color:var(--accent-text);border:1px solid var(--border);border-radius:999px;padding:1px 8px;text-transform:none;letter-spacing:0}
+
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th{text-align:start;font-size:10.5px;text-transform:uppercase;letter-spacing:.04em;color:var(--text-muted);font-weight:600;padding:8px var(--space-4);border-bottom:1px solid var(--border)}
+  th.r,td.r{text-align:end}
+  td{padding:9px var(--space-4);border-bottom:1px solid var(--border);color:var(--text-secondary);vertical-align:middle}
+  tr:last-child td{border-bottom:none}
+  td b{color:var(--text-primary);font-weight:600}
+  tr.now-init{background:var(--surface-sunken)}
+  /* status: glyph + label + position, never colour-alone (§8b.3) */
+  .st{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:500}
+  .st .gl{font-size:10px;width:11px;text-align:center}
+  .st.ontrack{color:var(--status-ok)} .st.atrisk{color:var(--status-warn)} .st.off{color:var(--status-bad)}
+  .bar{height:6px;background:var(--surface-sunken);border:1px solid var(--border);border-radius:999px;overflow:hidden;width:84px;display:inline-block;vertical-align:middle}
+  .bar i{display:block;height:100%;background:var(--accent)}
+
+  /* restrained chart — single hue, no chartjunk; bar length is the only variable */
+  .chart{padding:var(--space-3) var(--space-4)}
+  .crow{display:grid;grid-template-columns:78px 1fr 36px;align-items:center;gap:var(--space-2);margin-bottom:9px;font-size:12px}
+  .crow .cl{color:var(--text-secondary)}
+  .crow .ct{height:14px;background:var(--surface-sunken);border:1px solid var(--border);border-radius:2px;overflow:hidden}
+  .crow .ct i{display:block;height:100%;background:var(--accent)}
+  .crow .cv{text-align:end;color:var(--text-primary);font-weight:600}
+  .legend{font-size:11px;color:var(--text-muted);margin-top:var(--space-2)}
+
+  /* ambient agent footnote — label + plain square glyph, NO sparkle (§8b.3 / R-14) */
+  .agentnote{display:flex;gap:var(--space-2);align-items:start;background:var(--surface-sunken);border-top:1px solid var(--border);padding:8px var(--space-4);font-size:11.5px;color:var(--text-secondary)}
+  .agbadge{display:inline-flex;align-items:center;gap:5px;font-size:9px;font-weight:700;color:var(--agent);border:1px solid var(--agent);border-radius:var(--radius-1);padding:1px 5px;flex:none}
+  .agbadge .sq{width:7px;height:7px;border:1.4px solid var(--agent);border-radius:1px}
+
+  /* right-hand context pane — the wedge surface; assembles cross-artifact context */
+  .ctx{border-inline-start:1px solid var(--border);background:var(--surface);overflow:auto;padding:var(--space-4)}
+  .ctx h3{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--text-muted);font-weight:700;margin-bottom:var(--space-2)}
+  .ctx .card{border:1px solid var(--border);border-radius:var(--radius-1);padding:var(--space-3);margin-bottom:var(--space-3)}
+  .ctx .card .top{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text-muted);margin-bottom:4px}
+  .ctx .card .ttl{font-size:13px;font-weight:600;color:var(--text-primary);margin-bottom:6px}
+  .ctx .chiprow{display:flex;flex-wrap:wrap;gap:6px}
+  /* one reference chip (§5.3) shared everywhere */
+  .chip{display:inline-flex;align-items:center;gap:5px;border:1px solid var(--border);border-radius:var(--radius-1);padding:2px 7px;font-size:11px;color:var(--text-secondary);background:var(--surface)}
+  .chip .ty{font-family:var(--font-mono);font-size:9px;color:var(--text-muted)}
+  .chip .dot{width:6px;height:6px;border-radius:50%;flex:none}
+  .chip .dot.bad{background:var(--status-bad)} .chip .dot.warn{background:var(--status-warn)} .chip .dot.ok{background:var(--status-ok)}
+  .ctx .resi-note{font-size:11px;color:var(--text-muted);display:flex;gap:6px;align-items:start;padding-top:var(--space-2);border-top:1px solid var(--border);margin-top:var(--space-2)}
+  .skip{position:absolute;left:-999px}
+  .skip:focus{left:var(--space-2);top:var(--space-2);background:var(--surface);padding:var(--space-2);border:1px solid var(--accent);z-index:10}
+
+  @media (max-width:1100px){ .body{grid-template-columns:200px 1fr} .ctx{display:none} }
+  @media (max-width:760px){ .body{grid-template-columns:1fr} .rail{display:none} .kpis{grid-template-columns:repeat(2,1fr)} .grid2{grid-template-columns:1fr} }
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<div class="shell">
+
+  <div class="topbar">
+    <div class="brand"><span class="m">M</span>Myelin</div>
+    <div class="scope">Issues <span class="sep">·</span> <b>acme</b> <span class="sep">·</span> Portfolio</div>
+    <div class="right">
+      <button class="theme-toggle" id="tt" aria-label="Toggle colour theme">Theme</button>
+      <span class="kbtn">Search <kbd>⌘K</kbd></span>
+      <span class="kbtn">Inbox</span>
+      <span class="avatar" title="Mara Ø. (you)">MØ</span>
+    </div>
+  </div>
+
+  <!-- ALWAYS-ON sovereignty band (T0). German compound label + Greek demonstrate G2 in the cue itself. -->
+  <div class="sov" aria-label="Datenhoheit / sovereignty status for this tenant">
+    <span class="item"><span class="gl" aria-hidden="true">⬡</span>Datenresidenz <b>EU · Frankfurt (eu-west)</b></span>
+    <span class="item"><span class="gl" aria-hidden="true">§</span>Rechtsgrundlage <b>Vertrag · Art. 6(1)(b)</b></span>
+    <span class="item"><span class="gl" aria-hidden="true">⚿</span>Schlüssel <b>kundenseitig (BYOK)</b></span>
+    <span class="item"><span class="gl" aria-hidden="true">⊘</span>Auftragsverarbeiter <b>alle EWR</b></span>
+    <a class="right" href="#">Datenkarte &amp; VVT →</a>
+  </div>
+
+  <div class="body">
+    <!-- primary nav rail -->
+    <nav class="rail" aria-label="Primary">
+      <div class="grp">Workspace</div>
+      <a href="#"><span class="g" aria-hidden="true">◧</span>Code</a>
+      <a href="#"><span class="g" aria-hidden="true">▷</span>CI</a>
+      <a href="#"><span class="g" aria-hidden="true">≣</span>Issues</a>
+      <a href="#"><span class="g" aria-hidden="true">▤</span>Knowledge</a>
+      <a href="#"><span class="g" aria-hidden="true">◌</span>Chat</a>
+      <div class="grp">Delivery</div>
+      <a href="#" class="on" aria-current="page"><span class="g" aria-hidden="true">▦</span>Executive dashboard</a>
+      <a href="02-roadmap-dense.html"><span class="g" aria-hidden="true">▱</span>Roadmap</a>
+      <a href="#"><span class="g" aria-hidden="true">○</span>Cycles</a>
+      <div class="grp">Govern</div>
+      <a href="06-dsr-console.html"><span class="g" aria-hidden="true">⚖</span>GDPR · DSR</a>
+      <a href="#"><span class="g" aria-hidden="true">◈</span>Audit log</a>
+      <a href="#"><span class="g" aria-hidden="true">◌</span>Agent governance</a>
+      <a href="#"><span class="g" aria-hidden="true">⌖</span>Residency &amp; cell</a>
+    </nav>
+
+    <!-- PM/corporate surface: Q3 exec overview over the SAME issue data (D5 dual-audience) -->
+    <main class="main" id="main">
+      <div class="h1">
+        <h1>Delivery — Executive overview</h1>
+        <span class="period">Q3 2026 · 4 teams · 6 initiatives</span>
+        <!-- locale-aware date via Intl (C4); rendered for de-DE here -->
+        <span class="as-of num">Stand: 20.06.2026, 14:02 MESZ</span>
+      </div>
+
+      <div class="kpis">
+        <div class="kpi"><div class="lab">Termintreue</div><div class="val num">82&#8201;%</div><div class="delta up"><span class="gl" aria-hidden="true">▲</span>+6 Pkt. ggü. Q2</div></div>
+        <div class="kpi"><div class="lab">Durchsatz/Zyklus</div><div class="val num">147</div><div class="delta up"><span class="gl" aria-hidden="true">▲</span>+12 Vorgänge</div></div>
+        <div class="kpi"><div class="lab">SLA-Verletzungen</div><div class="val num">3</div><div class="delta down"><span class="gl" aria-hidden="true">▲</span>+1 ggü. Q2 · prüfen</div></div>
+        <div class="kpi"><div class="lab">Main grün</div><div class="val num">96,4&#8201;%</div><div class="delta flat"><span class="gl" aria-hidden="true">▬</span>stabil</div></div>
+      </div>
+
+      <div class="grid2">
+        <section class="panel">
+          <h2>Initiativen <span class="resi">EU-west</span></h2>
+          <table>
+            <thead><tr><th scope="col">Initiative</th><th scope="col">Verantwortlich</th><th scope="col">Status</th><th scope="col" class="r">Fortschritt</th><th scope="col" class="r">Ziel</th></tr></thead>
+            <tbody>
+              <tr class="now-init"><td><b>Payments reliability</b></td><td>Platform</td><td><span class="st atrisk"><span class="gl" aria-hidden="true">◐</span>Gefährdet</span></td><td class="r"><span class="bar"><i style="width:41%"></i></span></td><td class="r num">11.07.</td></tr>
+              <tr><td><b>Ledger export</b></td><td>Payments</td><td><span class="st ontrack"><span class="gl" aria-hidden="true">●</span>Im Plan</span></td><td class="r"><span class="bar"><i style="width:72%"></i></span></td><td class="r num">04.08.</td></tr>
+              <tr><td><b>EU-Datenresidenz-Steuerung</b></td><td>Security</td><td><span class="st ontrack"><span class="gl" aria-hidden="true">●</span>Im Plan</span></td><td class="r"><span class="bar"><i style="width:33%"></i></span></td><td class="r num">19.09.</td></tr>
+              <tr><td><b>Passwortlose Anmeldung</b></td><td>Growth</td><td><span class="st ontrack"><span class="gl" aria-hidden="true">●</span>Im Plan</span></td><td class="r"><span class="bar"><i style="width:88%"></i></span></td><td class="r num">27.06.</td></tr>
+              <tr><td><b>Offline-Sync-Warteschlange</b></td><td>Mobile</td><td><span class="st off"><span class="gl" aria-hidden="true">■</span>Nicht im Plan</span></td><td class="r"><span class="bar"><i style="width:18%"></i></span></td><td class="r num">25.07.</td></tr>
+            </tbody>
+          </table>
+          <div class="agentnote">
+            <span class="agbadge"><span class="sq" aria-hidden="true"></span>agent</span>
+            <span><b style="color:var(--text-primary)">ForecastAgent</b> projiziert Q3-Abschluss bei <b style="color:var(--text-primary)">85&#8201;% Termintreue</b>. Schätzung — keine Aktion; im Agenten-Console prüfbar. <a href="#">Herkunft →</a></span>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>Durchsatz nach Team</h2>
+          <div class="chart">
+            <div class="crow"><span class="cl">Platform</span><span class="ct"><i style="width:90%"></i></span><span class="cv num">52</span></div>
+            <div class="crow"><span class="cl">Payments</span><span class="ct"><i style="width:64%"></i></span><span class="cv num">37</span></div>
+            <div class="crow"><span class="cl">Growth</span><span class="ct"><i style="width:52%"></i></span><span class="cv num">30</span></div>
+            <div class="crow"><span class="cl">Mobile</span><span class="ct"><i style="width:48%"></i></span><span class="cv num">28</span></div>
+            <p class="legend">Abgeschlossene Vorgänge je Zyklus · eine Farbe, keine Dekoration — die Balkenlänge ist die einzige Variable.</p>
+          </div>
+        </section>
+      </div>
+    </main>
+
+    <!-- context pane: assembles cross-artifact context for the at-risk initiative -->
+    <aside class="ctx" aria-label="Context — Payments reliability">
+      <h3>Payments reliability</h3>
+      <div class="card">
+        <div class="top"><span class="mono">ISS-377</span> · High · SLA gefährdet</div>
+        <div class="ttl">Payments cache thrashes under burst load</div>
+        <div class="chiprow">
+          <span class="chip"><span class="ty">PR</span><span class="dot bad" aria-hidden="true"></span>#412 main rot</span>
+          <span class="chip"><span class="ty">CI</span><span class="dot bad" aria-hidden="true"></span>#1894 fehlgeschlagen</span>
+          <span class="chip"><span class="ty">DOC</span>Cache Eviction Design</span>
+        </div>
+      </div>
+      <div class="card">
+        <div class="top">Beteiligte</div>
+        <div class="chiprow">
+          <span class="chip">Mara Ø.</span>
+          <span class="chip" style="border-color:var(--agent);color:var(--agent)"><span class="ty" style="color:var(--agent)">⬚</span>FixAgent</span>
+        </div>
+        <div class="resi-note"><span class="mono" aria-hidden="true">⬡</span><span>Alle verlinkten Artefakte liegen in <b style="color:var(--text-secondary)">EU-west</b>. Kein Export außerhalb des EWR.</span></div>
+      </div>
+      <a href="04-hitl-card.html" class="chip" style="width:100%;justify-content:center;padding:8px;color:var(--accent-text);border-color:var(--accent)">FixAgent-Vorschlag prüfen →</a>
+    </aside>
+  </div>
+</div>
+<script>
+  // theme toggle (functional, not decorative)
+  document.getElementById('tt').addEventListener('click',function(){
+    var r=document.documentElement;
+    r.setAttribute('data-theme', r.getAttribute('data-theme')==='dark'?'light':'dark');
+  });
+</script>
+</body>
+</html>

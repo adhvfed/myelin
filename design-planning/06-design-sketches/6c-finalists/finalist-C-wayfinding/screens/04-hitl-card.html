@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<!-- FINALIST C · Wayfinding — SCREEN 4 (THE STANDOUT): FixAgent HITL approval card.
+     Agents FOREGROUNDED but legible + topic-contained + calm-not-noisy. Grafts C-13's single-object focal craft
+     into the wayfinding skin. The card is the held focal object; the topic timeline recedes (but stays present, in-stream).
+     Shows: agent treatment (label + plain geometric mark, NO sparkle/emoji), proposed effects, per-effect target chips,
+     the GATED consequential effect (open PR on protected main), per-effect Approve/Edit/Reject, the EDIT diff state,
+     scope (∩ intersection), live budget, attribution + Why? + audit link, correlation walk. Backs onto R-14 §2/§3, R-15 §1. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wayfinding · FixAgent — approval awaiting you</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../tokens.css">
+<style>
+  body{display:grid;grid-template-columns:1fr;justify-items:center;overflow:auto}
+  .frame{width:100%;max-width:780px;min-height:100vh;background:var(--panel);border-inline:1px solid var(--line);display:flex;flex-direction:column}
+  /* contextual header — addressable, but quiet (the card is the focus) */
+  .head{padding:14px var(--sp-5);border-bottom:1px solid var(--line);display:flex;align-items:center;gap:var(--sp-3)}
+  .addr{display:flex;align-items:baseline;gap:var(--sp-2)}
+  .addr .ch{font-family:var(--mono);color:var(--ink-2);font-size:13px}
+  .addr .sep{color:var(--line-2)} .addr .topic{font-weight:600}
+  .head .sp{flex:1}
+
+  /* the timeline recedes to a whisper */
+  .stream{padding:var(--sp-5) var(--sp-5) var(--sp-2);display:flex;flex-direction:column;gap:var(--sp-4)}
+  .msg{display:flex;gap:var(--sp-3);opacity:.6}
+  .ava{width:30px;height:30px;border-radius:6px;flex:none;background:var(--panel-2);border:1px solid var(--line-2);display:grid;place-items:center;font-size:var(--fs-xs);font-weight:600;color:var(--ink-2)}
+  .msg .who{font-size:13px;font-weight:600} .msg .when{font-size:var(--fs-xs);color:var(--ink-3);margin-inline-start:7px}
+  .msg .txt{font-size:var(--fs-md);color:var(--ink-2);margin-top:2px}
+
+  /* THE focal object */
+  .wrap{padding:var(--sp-2) var(--sp-5) var(--sp-7)}
+  .card{background:var(--bg);border:1px solid var(--agent-line);border-radius:var(--r-lg);overflow:hidden;
+    animation:rise var(--dur-agent) ease-out both}
+  @keyframes rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+  @media (prefers-reduced-motion:reduce){.card{animation:none}}
+
+  .ctop{padding:var(--sp-4) var(--sp-5) var(--sp-3);display:flex;gap:var(--sp-3);align-items:flex-start;border-bottom:1px solid var(--line);background:var(--agent-bg)}
+  .amark{width:34px;height:34px;border-radius:8px;flex:none;background:var(--panel);border:1px solid var(--agent-line);color:var(--agent);display:grid;place-items:center}
+  /* plain geometric mark (pentagon node) — NOT a sparkle/wand */
+  .amark svg{width:19px;height:19px}
+  .aid{flex:1;min-width:0}
+  .aid .l1{display:flex;align-items:center;gap:var(--sp-2);flex-wrap:wrap}
+  .aid .nm{font-weight:600;font-size:var(--fs-lg)}
+  .attribline{font-size:var(--fs-sm);color:var(--ink-2);margin-top:4px} .attribline b{color:var(--ink)}
+  .corr{font-size:var(--fs-xs);color:var(--ink-3);margin-top:3px;font-family:var(--mono)}
+  .corr a{color:var(--topic);text-decoration:none}
+
+  .ask{padding:var(--sp-4) var(--sp-5) var(--sp-1);font-size:13px;color:var(--ink-2);font-weight:500}
+
+  .effects{padding:var(--sp-2) var(--sp-5);display:flex;flex-direction:column;gap:var(--sp-3)}
+  .eff{border:1px solid var(--line);border-radius:var(--r-md);background:var(--panel)}
+  .eff .ehead{display:flex;gap:var(--sp-3);padding:var(--sp-3);align-items:flex-start}
+  .eff .num{width:20px;height:20px;border-radius:var(--r-sm);flex:none;background:var(--bg);border:1px solid var(--line-2);font-size:var(--fs-xs);font-weight:600;color:var(--ink-2);display:grid;place-items:center}
+  .eff .ebody{flex:1;min-width:0}
+  .eff .et{font-size:var(--fs-md);font-weight:500;color:var(--ink);display:flex;align-items:center;gap:var(--sp-2);flex-wrap:wrap}
+  .eff .target{display:inline-flex;align-items:center;gap:5px;border:1px solid var(--line-2);border-radius:var(--r-sm);padding:1px 7px;font-size:var(--fs-xs);color:var(--ink-2);background:var(--bg);font-family:var(--mono)}
+  .eff .auth2{font-size:var(--fs-xs);color:var(--ink-3);margin-top:5px}
+  .eff .auth2 code{font-family:var(--mono);font-size:11px;color:var(--ink-2);background:var(--panel-2);border-radius:var(--r-sm);padding:1px 5px}
+  .gate{display:inline-flex;align-items:center;gap:5px;font-size:var(--fs-xs);font-weight:600;color:var(--warn);background:transparent;border:1px solid var(--warn);border-radius:var(--r-sm);padding:2px 7px;margin-inline-start:auto}
+  .nogate{font-size:var(--fs-xs);color:var(--ink-3);margin-inline-start:auto}
+  /* per-effect controls */
+  .effacts{display:flex;gap:6px;padding:0 var(--sp-3) var(--sp-3) 48px;align-items:center}
+  .effacts .approved{font-size:var(--fs-xs);color:var(--ok);display:inline-flex;gap:5px;align-items:center}
+  /* the EDIT state — proposed→amended diff (the §6.3 differentiator) */
+  .editbox{margin:0 var(--sp-3) var(--sp-3) 48px;border:1px solid var(--agent-line);border-radius:var(--r-md);overflow:hidden}
+  .editbox .eh{padding:6px var(--sp-3);font-size:var(--fs-xs);color:var(--ink-2);background:var(--agent-bg);border-bottom:1px solid var(--line);display:flex;align-items:center;gap:var(--sp-2)}
+  .editbox .diff{font-family:var(--mono);font-size:var(--fs-xs);padding:var(--sp-2) var(--sp-3);line-height:1.7}
+  .editbox .diff .del{color:var(--crit)} .editbox .diff .add{color:var(--ok)}
+  .editbox .ef{padding:var(--sp-2) var(--sp-3);border-top:1px solid var(--line);display:flex;gap:6px}
+
+  .meta{padding:var(--sp-4) var(--sp-5);border-top:1px solid var(--line);display:flex;flex-direction:column;gap:9px}
+  .mrow{display:flex;gap:10px;font-size:var(--fs-sm);color:var(--ink-2);align-items:baseline}
+  .mrow .k{width:72px;flex:none;color:var(--ink-3);font-weight:500}
+  .mrow .narrow{color:var(--ink-3)}
+  .bud{display:flex;align-items:center;gap:9px}
+  .bud .track{width:120px;height:6px;border-radius:3px;background:var(--line);overflow:hidden}
+  .bud .fill{height:100%;width:25%;background:var(--agent)}
+
+  .actions{padding:var(--sp-4) var(--sp-5);display:flex;gap:10px;align-items:center;border-top:1px solid var(--line);flex-wrap:wrap}
+  .prov{margin-inline-start:auto;font-size:var(--fs-sm);color:var(--ink-3);display:flex;gap:14px}
+  .prov a{color:var(--ink-2);text-decoration:none;border-bottom:1px solid var(--line-2)}
+  .prov a:hover{color:var(--accent);border-color:var(--accent)}
+  .note{font-size:var(--fs-xs);color:var(--ink-3);padding:0 var(--sp-5) var(--sp-4)}
+  .themebtn{position:fixed;bottom:14px;inset-inline-end:14px;z-index:10}
+</style>
+</head>
+<body>
+<div class="frame">
+  <div class="head">
+    <div class="addr"><span class="ch">#payments-incidents</span><span class="sep" aria-hidden="true">▸</span><span class="topic">cache thrash under burst</span></div>
+    <div class="sp"></div>
+    <span class="resid"><span class="d"></span>eu-west · Frankfurt</span>
+  </div>
+
+  <!-- the team conversation, deliberately receded -->
+  <div class="stream">
+    <div class="msg"><div class="ava">MØ</div><div><div><span class="who">Mara Ø.</span><span class="when">13:24</span></div><div class="txt">@FixAgent prep the follow-up once green — open the PR, move #377 to In Review, post here.</div></div></div>
+  </div>
+
+  <!-- THE focal object -->
+  <div class="wrap">
+    <div class="card" role="group" aria-label="FixAgent proposal awaiting your approval">
+      <div class="ctop">
+        <div class="amark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M12 3l8 5.8-3 9.4H7L4 8.8 12 3z"/></svg>
+        </div>
+        <div class="aid">
+          <div class="l1"><span class="nm">FixAgent</span><span class="agent-tag"><span class="mk"></span>Agent</span></div>
+          <div class="attribline">on behalf of <b>Mara Ø.</b> · triggered by <b>ci.passed</b> on payments-api</div>
+          <div class="corr">correlation · <a href="01-shell-chat.html">incident-#9</a></div>
+        </div>
+      </div>
+
+      <div class="ask">Proposes 3 effects — review before anything happens. Effect 1 is gated (protected branch).</div>
+
+      <div class="effects">
+        <!-- EFFECT 1 — the GATED consequential effect, currently in EDIT state -->
+        <div class="eff">
+          <div class="ehead">
+            <div class="num">1</div>
+            <div class="ebody">
+              <div class="et">Open follow-up pull request
+                <span class="target"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="11" height="11"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><path d="M6 8.5v7M18 8v4a4 4 0 0 1-4 4h-3"/><circle cx="18" cy="6" r="2.5"/></svg> repo/payments-api</span>
+                <span class="gate"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="11" height="11"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg> Needs your approval</span>
+              </div>
+              <div class="auth2">Consequential — opens a PR on protected <code>main</code> · authority <code>open_pr</code> (delegation ∩ tenant)</div>
+            </div>
+          </div>
+          <!-- EDIT state shown: human amended the branch + narrowed scope; proposed→amended diff -->
+          <div class="editbox">
+            <div class="eh">Editing effect 1 · the human amends the agent's proposed effect <span style="margin-inline-start:auto;color:var(--ink-3)">re-runs the full pipeline · cannot widen scope</span></div>
+            <div class="diff">
+              <div><span class="del">− branch  fix/auto-377</span></div>
+              <div><span class="add">+ branch  fix/lru-weight-bound-377</span></div>
+              <div style="color:var(--ink-3)">  base    main  ·  links  ISS-377</div>
+            </div>
+            <div class="ef"><button class="btn p sm">Apply my version</button><button class="btn sm">Cancel edit</button></div>
+          </div>
+        </div>
+
+        <!-- EFFECT 2 — ungated advisory, already approved -->
+        <div class="eff">
+          <div class="ehead">
+            <div class="num">2</div>
+            <div class="ebody">
+              <div class="et">Transition issue → In Review
+                <span class="target"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="11" height="11"><rect x="4" y="4" width="16" height="16" rx="2"/></svg> ISS-377</span>
+                <span class="nogate">no gate · advisory</span>
+              </div>
+              <div class="auth2">authority <code>issue.transition</code></div>
+            </div>
+          </div>
+          <div class="effacts"><span class="approved"><span aria-hidden="true">✓</span> Approved by Mara Ø. · 13:32 · applied</span></div>
+        </div>
+
+        <!-- EFFECT 3 — post to chat -->
+        <div class="eff">
+          <div class="ehead">
+            <div class="num">3</div>
+            <div class="ebody">
+              <div class="et">Post result to topic
+                <span class="target"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="11" height="11"><path d="M5 5h14v10H9l-4 4z"/></svg> #payments-incidents ▸ 01</span>
+                <span class="nogate">no gate</span>
+              </div>
+              <div class="auth2">authority <code>chat.post</code></div>
+            </div>
+          </div>
+          <div class="effacts"><button class="btn sm">Approve</button><button class="btn sm">Reject</button></div>
+        </div>
+      </div>
+
+      <div class="meta">
+        <div class="mrow"><span class="k">Scope</span><span>may act on <span class="target">repo/payments-api</span> <span class="target">ISS-377</span> <span class="narrow">— delegation ∩ tenant, never wider than @Mara</span></span></div>
+        <div class="mrow"><span class="k">Budget</span><span class="bud"><span class="track"><span class="fill"></span></span> 3 / 12 effects · est. 0,04 € · depth 2 / 12</span></div>
+      </div>
+
+      <div class="actions">
+        <button class="btn p">Approve all</button>
+        <button class="btn">Edit…</button>
+        <button class="btn">Reject</button>
+        <div class="prov"><a href="#">Why?</a><a href="#">Audit trail ✓</a></div>
+      </div>
+    </div>
+    <p class="note">Partial approval is well-defined: effect 2 applied, effect 1 is being edited, effect 3 awaits. Nothing on <code>main</code> happens until effect 1 is approved. The same card lands in your Inbox so the gate is never missed. See <a href="states.html" style="color:var(--topic)">states</a> for rejected / agent-error / budget-exceeded / stale-approval / denied-cross-cell, and the agent-storm.</p>
+  </div>
+</div>
+<button class="btn themebtn" onclick="document.documentElement.dataset.theme = document.documentElement.dataset.theme==='light'?'dark':'light'">◐ light / dark</button>
+</body>
+</html>

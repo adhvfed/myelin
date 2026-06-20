@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<!-- FINALIST D · CIVIC | Screen 4 of 7 — AGENT / HITL APPROVAL CARD (the F-AGT-1 gate moment)
+     Carriers: C-14 (ambient-agent-as-one-row) + C-18 (Rams inbox restraint). Sober plan-then-apply card.
+     Shows: FixAgent proposed effects (plan-then-apply), per-effect target chips, the GATED effect (open PR on
+     protected main), Approve / EDIT / Reject, attribution (on-behalf-of), provenance walk (one correlation_id),
+     budget, and the reserved agent treatment (label + plain square glyph, NO sparkle/emoji — §8b.3 / R-14 / design-language §6).
+     Surfaced in the unified inbox (§5.8) — agent volume kept calm, collapsed by default.
+     [DEFERRED-UNTIL-USERS] expert sketch. -->
+<html lang="en" dir="ltr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Inbox — FixAgent approval · acme · Myelin</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../tokens.css">
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{background:var(--bg);color:var(--text-primary);font:13px/1.5 var(--font-sans);-webkit-font-smoothing:antialiased;overflow:hidden}
+  a{color:var(--accent-text);text-decoration:none}
+  button{font:inherit;color:inherit;background:none;border:none;cursor:pointer}
+  .mono{font-family:var(--font-mono)}
+  .shell{display:grid;grid-template-columns:200px 1fr;height:100vh}
+  .rail{border-inline-end:1px solid var(--border);background:var(--surface);padding:var(--space-2) 0;overflow:auto}
+  .rail .brand{display:flex;align-items:center;gap:var(--space-2);font-weight:700;padding:var(--space-2) var(--space-4) var(--space-3)}
+  .rail .brand .m{width:24px;height:24px;border-radius:var(--radius-1);background:var(--text-primary);color:var(--surface);display:grid;place-items:center;font-size:13px}
+  .rail .grp{font-size:10px;text-transform:uppercase;letter-spacing:.1em;color:var(--text-muted);padding:var(--space-3) var(--space-4) var(--space-1);font-weight:700}
+  .rail a{display:flex;align-items:center;gap:var(--space-2);padding:6px var(--space-4);color:var(--text-secondary);border-inline-start:3px solid transparent}
+  .rail a.on{color:var(--text-primary);font-weight:600;border-inline-start-color:var(--accent);background:var(--surface-sunken)}
+  .rail a .g{width:14px;text-align:center;color:var(--text-muted)}
+  .rail a .ct{margin-inline-start:auto;font-size:10px;color:var(--text-muted);border:1px solid var(--border);border-radius:999px;padding:0 6px}
+
+  .main{overflow:auto;min-height:0;padding:var(--space-6);max-width:1000px}
+  h1{font-size:18px;font-weight:700;margin-bottom:2px}
+  .sub{color:var(--text-secondary);margin-bottom:var(--space-4)}
+
+  /* the inbox list — agent lane collapsed by default; this gate is expanded */
+  .inbox-row{display:flex;gap:var(--space-3);align-items:center;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-1);padding:10px var(--space-4);margin-bottom:var(--space-2)}
+  .inbox-row .why{flex:1;min-width:0}
+  .inbox-row .why .t{font-weight:600}
+  .inbox-row .why .p{font-size:11.5px;color:var(--text-muted)}
+  .inbox-row .when{font-size:11px;color:var(--text-muted);white-space:nowrap}
+  .lane{font-size:11px;color:var(--text-secondary);background:var(--surface-sunken);border:1px solid var(--border);border-radius:var(--radius-1);padding:6px var(--space-4);margin-bottom:var(--space-3);display:flex;align-items:center;gap:var(--space-2)}
+  .lane .agbadge{margin:0}
+
+  /* the HITL plan card — sober, the agent treatment border; NO drama */
+  .card{background:var(--surface);border:1px solid var(--border);border-inline-start:3px solid var(--agent);border-radius:var(--radius-1);overflow:hidden;margin-bottom:var(--space-4)}
+  .card .head{display:flex;align-items:center;gap:var(--space-3);padding:var(--space-4);border-bottom:1px solid var(--border)}
+  .agbadge{display:inline-flex;align-items:center;gap:5px;font-size:10px;font-weight:700;color:var(--agent);border:1px solid var(--agent);border-radius:var(--radius-1);padding:2px 6px}
+  .agbadge .sq{width:8px;height:8px;border:1.5px solid var(--agent);border-radius:1px}
+  .card .head .ttl{font-weight:600}
+  .card .head .ttl .who{color:var(--text-muted);font-weight:400;font-size:12px}
+  .card .head .state{margin-inline-start:auto;display:inline-flex;align-items:center;gap:6px;font-size:11.5px;font-weight:600;color:var(--status-warn)}
+  .card .head .state .gl{font-family:var(--font-mono)}
+
+  .card .body{padding:var(--space-4)}
+  .plan-h{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--text-muted);font-weight:700;margin-bottom:var(--space-2)}
+  /* proposed effects — each a reviewable item with target chips */
+  .effect{display:flex;gap:var(--space-3);align-items:start;padding:10px 0;border-bottom:1px solid var(--border)}
+  .effect:last-child{border-bottom:none}
+  .effect .n{width:18px;height:18px;border:1px solid var(--border-strong);border-radius:var(--radius-1);display:grid;place-items:center;font-size:10px;color:var(--text-muted);font-family:var(--font-mono);flex:none;margin-top:1px}
+  .effect .d{flex:1;min-width:0}
+  .effect .d .verb{font-weight:600}
+  .effect .targets{display:flex;flex-wrap:wrap;gap:6px;margin-top:5px}
+  .chip{display:inline-flex;align-items:center;gap:5px;border:1px solid var(--border);border-radius:var(--radius-1);padding:2px 7px;font-size:11px;color:var(--text-secondary)}
+  .chip .ty{font-family:var(--font-mono);font-size:9px;color:var(--text-muted)}
+  .chip .dot{width:6px;height:6px;border-radius:50%}
+  .chip .dot.bad{background:var(--status-bad)} .chip .dot.ok{background:var(--status-ok)}
+  /* the GATED effect — marked, not alarmist */
+  .effect.gated{background:var(--surface-sunken);margin:0 calc(-1*var(--space-4));padding:10px var(--space-4)}
+  .gate-tag{display:inline-flex;align-items:center;gap:5px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--status-restricted);border:1px solid var(--status-restricted);border-radius:var(--radius-1);padding:1px 6px;margin-inline-start:8px}
+
+  /* provenance walk — one correlation_id across surfaces (R-19 §4 / R-22 wedge) */
+  .prov{margin-top:var(--space-3);padding:var(--space-3);background:var(--surface-sunken);border:1px solid var(--border);border-radius:var(--radius-1);font-size:11.5px;color:var(--text-secondary)}
+  .prov .k{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--text-muted);font-weight:700;margin-bottom:5px}
+  .prov .walk{font-family:var(--font-mono);font-size:11px;color:var(--text-secondary);line-height:1.7}
+  .prov .walk b{color:var(--text-primary)}
+  .prov .corr{color:var(--accent-text)}
+
+  .meta-row{display:flex;gap:var(--space-6);margin-top:var(--space-3);font-size:11.5px;color:var(--text-secondary);flex-wrap:wrap}
+  .meta-row .m b{color:var(--text-primary)}
+  .meta-row .m .k{color:var(--text-muted)}
+
+  /* Approve / Edit / Reject */
+  .actions{display:flex;gap:var(--space-2);padding:var(--space-4);border-top:1px solid var(--border);background:var(--surface-sunken)}
+  .btn{border:1px solid var(--border-strong);border-radius:var(--radius-1);padding:8px var(--space-4);font-weight:600;font-size:13px;background:var(--surface);color:var(--text-primary)}
+  .btn:hover{border-color:var(--text-muted)}
+  .btn.primary{background:var(--accent);color:var(--on-accent);border-color:var(--accent)}
+  .btn.primary:hover{filter:brightness(.95)}
+  .btn.reject{color:var(--status-bad)}
+  .actions .right{margin-inline-start:auto;display:flex;gap:var(--space-2);align-items:center}
+  .note{font-size:11px;color:var(--text-muted);align-self:center}
+  @media (max-width:760px){ .shell{grid-template-columns:1fr} .rail{display:none} .actions{flex-wrap:wrap} }
+</style>
+</head>
+<body>
+<div class="shell">
+  <nav class="rail" aria-label="Primary">
+    <div class="brand"><span class="m">M</span>Myelin</div>
+    <div class="grp">Mir zugewiesen</div>
+    <a href="#" class="on" aria-current="page"><span class="g" aria-hidden="true">▣</span>Inbox<span class="ct">3</span></a>
+    <a href="01-shell-exec-dashboard.html"><span class="g" aria-hidden="true">▦</span>Dashboard</a>
+    <a href="02-roadmap-dense.html"><span class="g" aria-hidden="true">▱</span>Roadmap</a>
+    <div class="grp">Govern</div>
+    <a href="06-dsr-console.html"><span class="g" aria-hidden="true">⚖</span>GDPR · DSR</a>
+    <a href="#"><span class="g" aria-hidden="true">◌</span>Agent governance</a>
+  </nav>
+
+  <main class="main">
+    <h1>Inbox — what needs you</h1>
+    <p class="sub">Prioritised, deduped. Agent volume is collapsed by default; one gate awaits your decision.</p>
+
+    <!-- two calm rows above the gate -->
+    <div class="inbox-row">
+      <span class="chip"><span class="ty">PR</span><span class="dot bad" aria-hidden="true"></span>#412</span>
+      <div class="why"><div class="t">Review requested · Fix cache eviction under load</div><div class="p">Mara Ø. requested your review · main is RED</div></div>
+      <span class="when">vor 18 Min.</span>
+    </div>
+
+    <!-- agent lane, collapsed-by-default, sheds first (C-18 restraint) -->
+    <div class="lane">
+      <span class="agbadge"><span class="sq" aria-hidden="true"></span>agent</span>
+      3 agent updates this hour (triage, status posts) — collapsed. <a href="#">Show</a>
+    </div>
+
+    <!-- THE GATE -->
+    <article class="card" aria-labelledby="gate-ttl">
+      <div class="head">
+        <span class="agbadge"><span class="sq" aria-hidden="true"></span>agent</span>
+        <div class="ttl" id="gate-ttl">FixAgent proposes 3 effects <span class="who">on behalf of Mara Ø.</span></div>
+        <span class="state"><span class="gl" aria-hidden="true">◷</span>Awaiting approval</span>
+      </div>
+
+      <div class="body">
+        <p style="color:var(--text-secondary);margin-bottom:var(--space-3)">Triggered by CI run <a href="#" class="mono">#1894</a> failing the <span class="mono">payments-api</span> integration test. Plan shown before any effect is applied (plan-then-apply).</p>
+
+        <div class="plan-h">Proposed effects</div>
+
+        <div class="effect">
+          <span class="n" aria-hidden="true">1</span>
+          <div class="d">
+            <span class="verb">Transition issue → In Review</span>
+            <div class="targets">
+              <span class="chip"><span class="ty">ISS</span>377 · Payments cache thrashes under burst load</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="effect">
+          <span class="n" aria-hidden="true">2</span>
+          <div class="d">
+            <span class="verb">Post incident note</span>
+            <div class="targets">
+              <span class="chip"><span class="ty">CH</span>#payments-incidents</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- the consequential, GATED effect: opening a PR on protected main -->
+        <div class="effect gated">
+          <span class="n" aria-hidden="true">3</span>
+          <div class="d">
+            <span class="verb">Open follow-up PR on protected branch <span class="mono">main</span></span>
+            <span class="gate-tag"><span aria-hidden="true">⛉</span>Gated effect</span>
+            <div class="targets">
+              <span class="chip"><span class="ty">PR</span>#412 → follow-up · weighted-LRU fix</span>
+              <span class="chip"><span class="ty" aria-hidden="true">⬡</span>Target: EU-west</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- provenance walk: one correlation_id end-to-end -->
+        <div class="prov">
+          <div class="k">Provenance · one correlation_id across surfaces</div>
+          <div class="walk">
+            <span class="corr">corr-9f2a</span> &nbsp;<b>CI #1894 failed</b> → <b>TriageAgent</b> filed ISS-377 → <b>FixAgent</b> proposed this plan → <b>(you)</b> ⟶ audit ✓
+          </div>
+        </div>
+
+        <div class="meta-row">
+          <span class="m"><span class="k">Authority:</span> <b>perms ∩ delegation ∩ tenant</b></span>
+          <span class="m"><span class="k">Budget:</span> <b>2 / 5 effects</b> · 0:42 wall-clock</span>
+          <span class="m"><span class="k">Audit:</span> <a href="#">every action attributed →</a></span>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button class="btn primary">Approve</button>
+        <button class="btn">Edit plan…</button>
+        <button class="btn reject">Reject</button>
+        <div class="right">
+          <span class="note">Edit lets you amend the gated effect (branch / scope) before it applies.</span>
+        </div>
+      </div>
+    </article>
+
+    <p class="sub" style="font-size:12px"><a href="07-states.html">See agent-pending / rejected / edited / budget / stale states →</a></p>
+  </main>
+</div>
+</body>
+</html>

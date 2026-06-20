@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<!-- Finalist A "Instrument" · Screen 7 — UNGLAMOROUS STATES (board surface) + a MIRRORED RTL state.
+     Part A: the designed states for the issue/board surface — empty · loading-skeleton · error · permission-denied · erased/tombstoned · agent-pending.
+     Part B (G2 D-G2.3): the SHELL + a content surface fully mirrored in real Arabic, via logical properties (no override sheet),
+       with ≥1 mixed-direction run (LTR `myelin://`/PR ref / SHA inside RTL prose, <bdi>-isolated); directional icons mirror, status glyphs don't. -->
+<html lang="en" dir="ltr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Instrument · states + RTL</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Noto+Sans+Arabic:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../tokens.css">
+<style>
+html,body{height:100%}
+body{margin:0;background:var(--surface-base);color:var(--t1);font:13px/var(--lh-body) var(--sans);-webkit-font-smoothing:antialiased}
+.mono{font-family:var(--mono)}
+button{font:inherit;color:inherit;background:var(--surface-sunken);border:var(--hairline) solid var(--border-strong);border-radius:var(--r1);padding:6px 12px;color:var(--t1);cursor:pointer;min-height:var(--target-min)}
+.b-primary{background:var(--c-btn-primary-bg);border-color:var(--c-btn-primary-bg);color:var(--c-btn-primary-text);font-weight:600}
+.page{max-width:1180px;margin:0 auto;padding:24px 24px 60px}
+h1{font-size:18px;font-weight:600;letter-spacing:-.01em;margin:0 0 4px}
+.lead{color:var(--t2);font-size:13px;margin:0 0 24px;max-width:70ch}
+.theme{position:fixed;top:12px;inset-inline-end:14px;font-size:11px;color:var(--t2);border:var(--hairline) solid var(--border-strong);border-radius:var(--r1);padding:5px 9px;background:var(--surface-sunken);z-index:30}
+h2{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--t3);margin:28px 0 10px;font-weight:600}
+.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}
+.state{border:var(--hairline) solid var(--border);border-radius:var(--r1);background:var(--surface-raised);overflow:hidden}
+.state .sh{display:flex;align-items:center;gap:8px;padding:8px 12px;border-block-end:var(--hairline) solid var(--border);font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--t3);font-weight:600}
+.state .body{padding:18px;min-height:150px;display:flex;flex-direction:column;justify-content:center}
+.tag{font-family:var(--mono);font-size:10px;border:var(--hairline) solid var(--border-strong);border-radius:var(--r1);padding:0 5px;color:var(--t2);margin-inline-start:auto}
+
+/* empty — onboarding-forward */
+.empty{text-align:center}
+.empty .ic{width:34px;height:34px;border:1.5px solid var(--border-strong);border-radius:var(--r1);display:grid;place-items:center;margin:0 auto 12px;color:var(--t3)}
+.empty h3{margin:0 0 4px;font-size:14px}
+.empty p{margin:0 0 14px;color:var(--t2);font-size:12.5px}
+
+/* loading skeleton — structure, never a blank spinner */
+.skrow{display:flex;align-items:center;gap:10px;padding:7px 0}
+.skbar{height:10px;border-radius:3px;background:linear-gradient(90deg,var(--surface-hover),var(--g4),var(--surface-hover));background-size:200% 100%;animation:sk 1.4s linear infinite}
+@keyframes sk{to{background-position:-200% 0}}
+.skdot{width:14px;height:14px;border-radius:3px;background:var(--surface-hover);flex:none}
+
+/* error — quiet, blames the system, offers a path */
+.err .ic,.perm .ic,.tomb .ic{display:inline-grid;place-items:center;margin-bottom:8px}
+.err .ic{color:var(--bad)} .perm .ic{color:var(--t3)} .tomb .ic{color:var(--t3)}
+.msg h3{margin:0 0 4px;font-size:13.5px}
+.msg p{margin:0 0 12px;color:var(--t2);font-size:12.5px}
+.msg .acts{display:flex;gap:8px}
+
+/* agent-pending */
+.pend{display:flex;align-items:center;gap:10px;color:var(--t2);font-size:12.5px}
+.spin{width:16px;height:16px;border:2px solid var(--border-strong);border-top-color:var(--agent);border-radius:50%;animation:rot .9s linear infinite;flex:none}
+@keyframes rot{to{transform:rotate(360deg)}}
+.amark{width:13px;height:13px;border:1.5px solid var(--agent);border-radius:2px;display:inline-grid;place-items:center}
+.amark i{width:3px;height:3px;background:var(--agent)}
+.badge-agent{font-size:9.5px;font-weight:700;color:var(--agent);border:var(--hairline) solid var(--agent);border-radius:var(--r1);padding:1px 4px;text-transform:uppercase}
+
+/* ===== RTL mirrored demo (Part B) ===== */
+.rtldemo{border:var(--hairline) solid var(--border);border-radius:var(--r1);overflow:hidden;margin-top:10px}
+.mini{height:360px;display:grid;grid-template-rows:36px 1fr;background:var(--surface-base)}
+.mini .top{display:flex;align-items:center;gap:10px;padding-inline:12px;border-block-end:var(--hairline) solid var(--border);background:var(--surface-raised);font-size:12px}
+.mini .top .brand{font-weight:600;display:flex;align-items:center;gap:6px}
+.mini .top .glyph{width:13px;height:13px;border:1.5px solid var(--t2);border-radius:var(--r1)}
+.mini .top .k{margin-inline-start:auto;font-family:var(--mono);font-size:11px;border:var(--hairline) solid var(--border-strong);border-radius:var(--r1);padding:2px 6px;color:var(--t3)}
+.mini .grid2{display:grid;grid-template-columns:44px 200px 1fr;min-height:0}
+.mini .rail{border-inline-end:var(--hairline) solid var(--border);background:var(--surface-raised);display:flex;flex-direction:column;align-items:center;padding-top:8px;gap:3px}
+.mini .rail a{width:30px;height:30px;display:grid;place-items:center;color:var(--t3);font-family:var(--mono);font-size:10px;border-radius:var(--r1);text-decoration:none}
+.mini .rail a.on{color:var(--t1);background:var(--surface-hover);box-shadow:inset 2px 0 0 var(--c-rail-active)}
+[dir="rtl"] .mini .rail a.on{box-shadow:inset -2px 0 0 var(--c-rail-active)} /* inset marker follows reading start */
+.mini .side{border-inline-end:var(--hairline) solid var(--border);background:var(--surface-raised);padding:10px;font-size:12px;color:var(--t2)}
+.mini .side .it{padding:5px 6px;border-radius:var(--r1);display:flex;gap:6px;align-items:center}
+.mini .side .it.on{background:var(--accent-weak);color:var(--t1);box-shadow:inset 2px 0 0 var(--accent)}
+[dir="rtl"] .mini .side .it.on{box-shadow:inset -2px 0 0 var(--accent)}
+.mini .content{padding:14px;overflow:auto;font-family:"Noto Sans Arabic",var(--sans)}
+.mini .content h3{margin:0 0 4px;font-size:14px;color:var(--t1)}
+.mini .crumb{font-size:11px;color:var(--t3);margin-bottom:10px}
+.chev{display:inline-block} /* breadcrumb chevron mirrors automatically with dir */
+.icard{border:var(--hairline) solid var(--border);border-radius:var(--r1);background:var(--surface-sunken);padding:10px 12px;margin-bottom:8px}
+.icard .ti{font-size:13px;color:var(--t1);margin-bottom:5px}
+.icard .meta{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--t2)}
+.sg{font-family:var(--mono);font-size:11px}.sg.rev{color:var(--warn)}.sg.prog{color:var(--accent)}
+.ref{unicode-bidi:isolate;font-family:var(--mono);font-size:11px;border:var(--hairline) solid var(--border-strong);border-radius:var(--r1);padding:0 5px;color:var(--t1)} /* LTR ref isolated inside RTL prose */
+.note{font-size:11px;color:var(--t3);margin-top:8px}
+.dirbtn{margin-top:10px}
+.callout{font-size:11.5px;color:var(--t2);border:var(--hairline) solid var(--border);border-radius:var(--r1);padding:10px 12px;background:var(--surface-raised);margin-top:10px}
+.callout code{font-family:var(--mono);background:var(--surface-sunken);padding:0 4px;border-radius:var(--r1)}
+</style>
+</head>
+<body>
+<button class="theme" id="themebtn" aria-pressed="false">Theme: dark</button>
+<div class="page">
+  <h1>Designed states + mirrored RTL</h1>
+  <p class="lead">The states the demo screens don't show — designed, not skipped — for the issue/board surface; plus the mirrored RTL state proving the shell mirrors by construction (logical properties, no override sheet). <span class="mono">[DEFERRED-UNTIL-USERS]</span> these are expert sketches, not user-validated.</p>
+
+  <h2>Unglamorous states · issue/board surface</h2>
+  <div class="grid">
+    <!-- EMPTY -->
+    <div class="state"><div class="sh">Empty · onboarding-forward<span class="tag">no issues yet</span></div>
+      <div class="body empty">
+        <div class="ic" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6M9 13h4"/></svg></div>
+        <h3>No issues in this cycle yet</h3>
+        <p>Create the first issue, or let FixAgent triage incoming reports into here.</p>
+        <div style="display:flex;gap:8px;justify-content:center"><button class="b-primary">New issue · c</button><button>Import from CSV</button></div>
+      </div>
+    </div>
+
+    <!-- LOADING SKELETON -->
+    <div class="state"><div class="sh">Loading · structure skeleton<span class="tag">aria-busy</span></div>
+      <div class="body" aria-busy="true">
+        <div class="skrow"><span class="skdot"></span><span class="skbar" style="width:62%"></span></div>
+        <div class="skrow"><span class="skdot"></span><span class="skbar" style="width:80%"></span></div>
+        <div class="skrow"><span class="skdot"></span><span class="skbar" style="width:48%"></span></div>
+        <div class="skrow"><span class="skdot"></span><span class="skbar" style="width:70%"></span></div>
+      </div>
+    </div>
+
+    <!-- ERROR -->
+    <div class="state"><div class="sh">Error · blames the system<span class="tag">retryable</span></div>
+      <div class="body err msg">
+        <div class="ic" aria-hidden="true"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 8v4M12 16h.01"/></svg></div>
+        <h3>We couldn't load this board</h3>
+        <p>The issues service in the Frankfurt cell didn't respond. Your data is fine — this is on us.</p>
+        <div class="acts"><button class="b-primary">Retry</button><button>View status page</button></div>
+      </div>
+    </div>
+
+    <!-- PERMISSION-DENIED -->
+    <div class="state"><div class="sh">Permission-denied · no leak<span class="tag">restricted</span></div>
+      <div class="body perm msg">
+        <div class="ic" aria-hidden="true"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg></div>
+        <h3>You don't have access to this board</h3>
+        <p>It belongs to a team you're not in. We're not showing its name or contents. Request access and an owner decides.</p>
+        <div class="acts"><button class="b-primary">Request access</button></div>
+      </div>
+    </div>
+
+    <!-- ERASED / TOMBSTONED -->
+    <div class="state"><div class="sh">Erased · GDPR tombstone<span class="tag">erased</span></div>
+      <div class="body tomb msg">
+        <div class="ic" aria-hidden="true"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M7 7l1 13h8l1-13M9 7V4h6v3"/></svg></div>
+        <h3>This issue was erased</h3>
+        <p>ISS-340 was erased under a data-subject request. Its references degrade safely — author shows as <em>[erased user]</em>, body removed. The audit record of the erasure is retained.</p>
+        <div class="acts"><button>View erasure receipt</button></div>
+      </div>
+    </div>
+
+    <!-- AGENT-PENDING -->
+    <div class="state"><div class="sh">Agent-pending · working / awaiting<span class="tag">gated</span></div>
+      <div class="body">
+        <div class="pend" style="margin-bottom:14px"><span class="spin" aria-hidden="true"></span><span><span class="badge-agent">Agent</span> FixAgent is drafting a follow-up plan… (2 of 3 effects resolved)</span></div>
+        <div class="pend"><span class="amark" aria-hidden="true"><i></i></span><span>1 effect <b style="color:var(--warn)">awaiting your approval</b> — nothing applied yet. <a href="5-hitl-inbox.html" style="color:var(--focus);text-decoration:underline">Review plan</a></span></div>
+      </div>
+    </div>
+  </div>
+
+  <h2>Mirrored RTL state · shell + content (real Arabic)</h2>
+  <div class="rtldemo">
+    <div class="mini" id="mini" dir="rtl" lang="ar">
+      <div class="top">
+        <span class="brand"><span class="glyph"></span>myelin</span>
+        <span class="crumb">acme ‹ payments-api ‹ المشكلات</span>
+        <span class="k">⌘K</span>
+      </div>
+      <div class="grid2">
+        <nav class="rail" aria-label="الأسطح">
+          <a class="on" aria-current="page">Co</a><a>CI</a><a>Is</a><a>Kn</a><a>Ch</a>
+        </nav>
+        <aside class="side">
+          <div class="it on">المشكلات</div>
+          <div class="it">طلبات السحب</div>
+          <div class="it">المعرفة</div>
+        </aside>
+        <div class="content">
+          <div class="crumb">المشكلات <span class="chev">‹</span> الربع الثالث <span class="chev">‹</span> موثوقية المدفوعات</div>
+          <h3>ذاكرة التخزين المؤقت للمدفوعات تتعثر تحت الحمل</h3>
+          <div class="icard">
+            <div class="ti">إصلاح إخلاء ذاكرة التخزين المؤقت تحت الحمل</div>
+            <!-- mixed-direction run: LTR refs bidi-isolated inside RTL prose -->
+            <div class="meta"><span class="sg rev" title="قيد المراجعة">◑</span> قيد المراجعة · مرتبط بـ <span class="ref">PR #412</span> · <span class="ref">CI #1894</span></div>
+          </div>
+          <div class="icard">
+            <div class="ti">طرح خوارزمية LRU الموزونة خلف علامة</div>
+            <div class="meta"><span class="sg prog" title="قيد التنفيذ">◐</span> قيد التنفيذ · الموعد النهائي 23.06.2026 · المسؤول: <bdi>Mara Ø.</bdi></div>
+          </div>
+          <p class="note">الالتزام <span class="ref">a94bcc7</span> · راجع <bdi dir="ltr">myelin://acme/payments-api/iss-377</bdi></p>
+        </div>
+      </div>
+    </div>
+    <div class="callout">
+      Mirrored by construction: every rule uses logical properties (<code>inline-start/end</code>, <code>border-inline</code>, <code>margin-inline</code>) — the rail renders on the visual right, the context flows right→left, the breadcrumb chevrons reverse, and the active-rail inset marker follows the reading start. The status glyphs (◑ ◐) and the brand mark do <b>not</b> mirror (non-directional). LTR tokens — <code>PR #412</code>, the SHA, the <code>myelin://</code> ref, and the Latin name <code>Mara Ø.</code> — stay LTR via <code>&lt;bdi&gt;</code> / <code>unicode-bidi:isolate</code>, never visually reversed.
+      <button class="dirbtn" id="flip">Flip to LTR to compare</button>
+    </div>
+  </div>
+</div>
+<script>
+var b=document.getElementById('themebtn');
+b.addEventListener('click',function(){var r=document.documentElement,d=r.getAttribute('data-theme')!=='light';r.setAttribute('data-theme',d?'light':'dark');b.textContent='Theme: '+(d?'light':'dark');b.setAttribute('aria-pressed',String(d));});
+var f=document.getElementById('flip'),m=document.getElementById('mini');
+f.addEventListener('click',function(){var rtl=m.getAttribute('dir')!=='rtl';m.setAttribute('dir',rtl?'rtl':'ltr');f.textContent=rtl?'Flip to LTR to compare':'Flip to RTL to compare';});
+</script>
+</body>
+</html>

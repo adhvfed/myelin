@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<!-- Finalist B "Workshop" · Screen 6 — UNGLAMOROUS STATES for the roadmap/issues surface (R-21 state set).
+     empty (onboarding-forward, teaches the PM the next step — D2) · loading (structure skeleton, never a blank
+     spinner — D8) · error (quiet, blames the system, offers a path) · permission-denied (graceful, no leak) ·
+     erased/tombstoned (GDPR-aware degraded — the Jürgen Vögel DSR erasure) · agent-pending (working / awaiting).
+     Same shell tokens; warm-but-restrained; status always glyph+label+position. -->
+<html lang="en" dir="ltr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Workshop · Designed states</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,560&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../tokens.css">
+<style>
+  .wrap{max-width:1100px;margin-inline:auto;padding:var(--s-6) var(--s-6)}
+  .wrap > h1{font-family:var(--serif);font-weight:560;font-size:26px;margin-block-end:6px}
+  .wrap > p.lede{color:var(--text-2);font-size:14px;margin-block-end:var(--s-6);max-width:64ch}
+  .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:var(--s-5)}
+  .state{border:1px solid var(--line);border-radius:var(--r-md);background:var(--surface-raise);overflow:hidden}
+  .state > .lbl{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--text-3);
+    padding:8px 14px;border-block-end:1px solid var(--line);background:var(--surface-sunk);display:flex;align-items:center;gap:8px}
+  .state .b{padding:18px}
+  .empty-ill{width:40px;height:40px;border-radius:var(--r-md);background:var(--surface-sunk);border:1px solid var(--line-strong);display:grid;place-items:center;color:var(--accent);margin-block-end:12px}
+  .state h3{font-family:var(--serif);font-size:18px;font-weight:560;margin-block-end:6px}
+  .state p{font-size:13px;color:var(--text-2);line-height:1.5;margin-block-end:12px}
+  .state .actions{display:flex;gap:8px}
+  /* skeleton */
+  .sk{height:12px;border-radius:5px;background:linear-gradient(90deg,var(--surface-sunk) 25%,var(--cream-200) 37%,var(--surface-sunk) 63%);background-size:400% 100%;animation:sh 1.3s ease infinite;margin-block-end:10px}
+  @keyframes sh{0%{background-position:100% 0}100%{background-position:-100% 0}}
+  @media (prefers-reduced-motion:reduce){.sk{animation:none;background:var(--surface-sunk)}}
+  .sk.card{height:64px;border-radius:var(--r-md)}
+  /* tombstone */
+  .tomb{border:1px dashed var(--line-strong);border-radius:var(--r-md);padding:12px 14px;background:var(--surface-sunk);color:var(--text-2);font-size:13px}
+  .tomb code{font-family:var(--mono);font-size:11.5px;background:var(--surface-raise);border-radius:4px;padding:1px 5px}
+  .receipt{font-family:var(--mono);font-size:11px;color:var(--text-3);margin-block-start:8px}
+  /* agent pending */
+  .pending{display:flex;gap:11px;border:1px dashed var(--agent);border-radius:var(--r-md);background:var(--agent-wash);padding:13px 14px}
+  .pending .sp{width:14px;height:14px;border:2px solid var(--agent);border-block-start-color:transparent;border-radius:50%;animation:spin .8s linear infinite;flex:none;margin-block-start:2px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  @media (prefers-reduced-motion:reduce){.pending .sp{animation:none}}
+  .denied .lock{width:34px;height:34px;border-radius:var(--r-md);background:var(--surface-sunk);display:grid;place-items:center;color:var(--text-2);margin-block-end:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1 class="serif">Designed states · Issues / Roadmap surface</h1>
+  <p class="lede">The unglamorous states, in the Workshop skin. Status is always glyph + label + position; loading shows
+     structure, never a blank spinner; errors blame the system and offer a path; nothing leaks under permission or erasure.</p>
+
+  <div class="grid">
+    <!-- EMPTY (onboarding-forward) -->
+    <section class="state">
+      <div class="lbl"><span class="status neutral" style="padding:1px 6px">empty</span> first-run · teaches the next step (D2)</div>
+      <div class="b">
+        <div class="empty-ill"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg></div>
+        <h3>Your roadmap is empty — let's place the first outcome</h3>
+        <p>A roadmap lane is just your real work read over time. Create an outcome, or link existing issues like
+           <span class="chip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/></svg> ISS-377</span> — they'll appear here as they ship. No second copy to maintain.</p>
+        <div class="actions"><button class="btn-primary btn">New outcome</button><button class="btn">Link existing issues</button></div>
+      </div>
+    </section>
+
+    <!-- LOADING skeleton -->
+    <section class="state">
+      <div class="lbl"><span class="status neutral" style="padding:1px 6px">loading</span> structure skeleton, not a spinner (D8)</div>
+      <div class="b" aria-busy="true" aria-label="Loading roadmap">
+        <div class="sk" style="width:40%"></div>
+        <div class="sk card"></div>
+        <div class="sk card"></div>
+        <div class="sk" style="width:55%;margin-block-start:14px"></div>
+      </div>
+    </section>
+
+    <!-- ERROR -->
+    <section class="state">
+      <div class="lbl"><span class="status danger" style="padding:1px 6px"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M15 9l-6 6M9 9l6 6"/></svg> error</span> quiet · blames the system · offers a path</div>
+      <div class="b">
+        <h3>We couldn't load this roadmap</h3>
+        <p>The roadmap service in the EU-West cell didn't respond. Your work is safe — this is on us, not you.
+           Cached cards from 2 min ago are shown below.</p>
+        <div class="actions"><button class="btn-primary btn">Retry</button><button class="btn">Show cached view</button><button class="btn btn-quiet">Report ↗</button></div>
+        <p class="receipt" style="margin-block-start:12px">ref · roadmap.load · cell=eu-west · 14:06 CEST</p>
+      </div>
+    </section>
+
+    <!-- PERMISSION-DENIED (no leak) -->
+    <section class="state denied">
+      <div class="lbl"><span class="status neutral" style="padding:1px 6px"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg> permission-denied</span> graceful · never a leak</div>
+      <div class="b">
+        <div class="lock"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg></div>
+        <h3>You don't have access to this initiative</h3>
+        <p>This roadmap belongs to a space you're not a member of. We're not showing its name or contents — only that it exists.
+           Request access and an owner decides.</p>
+        <div class="actions"><button class="btn-primary btn">Request access</button></div>
+      </div>
+    </section>
+
+    <!-- ERASED / TOMBSTONED (GDPR — Jürgen Vögel DSR) -->
+    <section class="state">
+      <div class="lbl"><span class="status neutral" style="padding:1px 6px">erased</span> GDPR-aware degraded · DSR honoured</div>
+      <div class="b">
+        <h3>An item here was erased</h3>
+        <p>Following a data-subject erasure request, personal data for <b>Jürgen Vögel</b> was removed across all five
+           surfaces. The work item structure remains so history stays consistent; the person is gone.</p>
+        <div class="tomb">
+          <span class="status neutral" style="padding:1px 6px"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13"/></svg> tombstoned</span>
+          ISS-361 · assignee <code>[erased subject]</code> · authored-by <code>[erased subject]</code>
+          <div class="receipt">DSR receipt · subject=jv-2026-0118 · erased 18.06.2026 · cells=eu-west · verifiable: <code>sha256:9f2a…c107</code></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- AGENT-PENDING -->
+    <section class="state">
+      <div class="lbl"><span class="agent-badge">Agent</span> agent-pending · working / awaiting approval</div>
+      <div class="b">
+        <div class="pending" role="status" aria-label="PlanningAgent working">
+          <span class="sp" aria-hidden="true"></span>
+          <div>
+            <div style="display:flex;align-items:center;gap:7px;font-size:13px"><b>PlanningAgent</b><span class="agent-badge">Agent</span></div>
+            <p style="margin:6px 0 0">Drafting 4 candidate work items from the backlog for the <b>Later</b> lane. It will present them
+               for your approval — nothing is scheduled until you accept. <span style="color:var(--text-3)">~20s remaining.</span></p>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+</div>
+</body>
+</html>

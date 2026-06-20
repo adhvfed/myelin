@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<!-- FINALIST C · Wayfinding — SCREEN 5: the wedge — command palette (⌘K) over the universal graph + live unfurl.
+     Makes the cross-artifact thesis tangible: Navigate / Act / Search / Build-query modes; permission-pre-filtered
+     rows; consequential verbs route INTO the HITL gate; a pasted myelin:// link unfurls LIVE with an inline action.
+     Same components as every other screen (refs, agent treatment, status grammar). Keyboard-first. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wayfinding · ⌘K palette + live unfurl</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../tokens.css">
+<style>
+  body{display:grid;place-items:start center;padding-top:8vh;background:var(--bg)}
+  .backdrop{position:fixed;inset:0;background:rgba(5,7,11,.55)}
+  .stack{position:relative;width:100%;max-width:640px;display:flex;flex-direction:column;gap:var(--sp-5);padding:0 var(--sp-4) var(--sp-7)}
+
+  .palette{background:var(--panel);border:1px solid var(--line-2);border-radius:var(--r-lg);overflow:hidden;box-shadow:0 24px 60px -20px rgba(0,0,0,.6)}
+  .pq{display:flex;align-items:center;gap:var(--sp-3);padding:var(--sp-4);border-bottom:1px solid var(--line)}
+  .pq .mode{font-size:var(--fs-xs);font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--accent-ink);background:var(--accent);border-radius:var(--r-sm);padding:3px 9px}
+  .pq input{flex:1;background:none;border:0;color:var(--ink);font:inherit;font-size:var(--fs-lg);outline:none}
+  .pq .scope{font-family:var(--mono);font-size:var(--fs-xs);color:var(--ink-3);border:1px solid var(--line);border-radius:var(--r-sm);padding:2px 7px}
+  .modes{display:flex;gap:6px;padding:var(--sp-2) var(--sp-4);border-bottom:1px solid var(--line)}
+  .modes a{font-size:var(--fs-xs);color:var(--ink-3);text-decoration:none;border:1px solid var(--line);border-radius:var(--r-pill);padding:2px 10px}
+  .modes a.on{color:var(--accent);border-color:var(--accent)}
+  .grp{font-size:10px;letter-spacing:.13em;text-transform:uppercase;color:var(--ink-3);padding:var(--sp-3) var(--sp-4) 4px;font-weight:600}
+  .row{display:flex;align-items:center;gap:var(--sp-3);padding:8px var(--sp-4);text-decoration:none;color:var(--ink-2)}
+  .row .ic{width:18px;text-align:center;color:var(--ink-3);font-family:var(--mono)}
+  .row .pri{color:var(--ink);font-size:var(--fs-md)}
+  .row .pri .id{font-family:var(--mono);font-size:var(--fs-xs);color:var(--ink-3);margin-inline-start:6px}
+  .row .end{margin-inline-start:auto;display:flex;gap:var(--sp-2);align-items:center}
+  .row .kbd{font-family:var(--mono);font-size:10px;border:1px solid var(--line-2);border-radius:var(--r-sm);padding:0 5px;color:var(--ink-3)}
+  .row.sel{background:var(--panel-2);box-shadow:inset var(--addr-w) 0 0 var(--accent)}
+  .row .gate{font-size:10px;color:var(--warn);border:1px solid var(--warn);border-radius:var(--r-sm);padding:0 6px}
+  .pfoot{display:flex;gap:var(--sp-4);padding:var(--sp-2) var(--sp-4);border-top:1px solid var(--line);font-size:var(--fs-xs);color:var(--ink-3)}
+  .pfoot kbd{font-family:var(--mono);font-size:10px;border:1px solid var(--line-2);border-radius:var(--r-sm);padding:0 4px;color:var(--ink-2)}
+
+  /* the live unfurl wedge (paste-a-link-it-unfurls) */
+  .composer{background:var(--panel);border:1px solid var(--line-2);border-radius:var(--r-lg);overflow:hidden}
+  .composer .lbl{font-size:var(--fs-xs);color:var(--ink-3);padding:var(--sp-3) var(--sp-4) 0}
+  .composer .pasted{font-family:var(--mono);font-size:13px;color:var(--topic);padding:6px var(--sp-4)}
+  .unfurl{margin:0 var(--sp-4) var(--sp-4);border:1px solid var(--line-2);border-radius:var(--r-md);overflow:hidden;background:var(--bg)}
+  .uf-live{display:flex;align-items:center;gap:7px;padding:7px var(--sp-3);background:var(--panel-2);border-bottom:1px solid var(--line);font-size:var(--fs-xs);color:var(--ink-3)}
+  .uf-live .pulse{width:7px;height:7px;border-radius:50%;background:var(--ok)}
+  .uf-live .right{margin-inline-start:auto;font-family:var(--mono)}
+  .uf-head{padding:var(--sp-3);display:flex;align-items:flex-start;gap:var(--sp-3)}
+  .uf-head .title{font-weight:600;font-size:var(--fs-md)}
+  .uf-head .crumb{font-size:var(--fs-xs);color:var(--ink-3);font-family:var(--mono);margin-top:1px}
+  .uf-head .badge{margin-inline-start:auto;font-size:var(--fs-xs);font-weight:600;color:var(--crit);border:1px solid var(--crit);border-radius:var(--r-sm);padding:2px 8px;white-space:nowrap}
+  .uf-foot{display:flex;align-items:center;gap:9px;padding:var(--sp-3);border-top:1px solid var(--line)}
+  .uf-foot .open{margin-inline-start:auto;color:var(--ink-3);text-decoration:none;font-size:var(--fs-sm)}
+  .nochip{margin:0 var(--sp-4) var(--sp-4);font-size:var(--fs-xs);color:var(--ink-3)}
+  .nochip .ref{margin-inline-start:6px}
+  .themebtn{position:fixed;bottom:14px;inset-inline-end:14px;z-index:10}
+</style>
+</head>
+<body>
+<div class="backdrop"></div>
+<div class="stack">
+
+  <!-- COMMAND PALETTE -->
+  <div class="palette" role="dialog" aria-label="Command palette">
+    <div class="pq">
+      <span class="mode">Act</span>
+      <input value="re-run failed job" aria-label="Command" autofocus>
+      <span class="scope">⌖ acme · payments-api</span>
+    </div>
+    <nav class="modes" aria-label="Palette modes">
+      <a href="#">Navigate</a>
+      <a href="#" class="on" aria-current="true">Act</a>
+      <a href="#">Search</a>
+      <a href="#">Build query</a>
+    </nav>
+
+    <div class="grp">Actions · permission-filtered for you</div>
+    <a class="row sel" href="02-ci-run.html">
+      <span class="ic" aria-hidden="true">◴</span>
+      <span class="pri">Re-run failed job <span class="id">CI #1894 · integration·payments</span></span>
+      <span class="end"><span class="kbd">↵</span></span>
+    </a>
+    <a class="row" href="04-hitl-card.html">
+      <span class="ic" aria-hidden="true">⊘</span>
+      <span class="pri">Merge PR #412 into main <span class="id">protected</span></span>
+      <span class="end"><span class="gate">⚷ routes to gate</span></span>
+    </a>
+    <a class="row" href="03-roadmap.html">
+      <span class="ic" aria-hidden="true">▤</span>
+      <span class="pri">Transition ISS-377 → In Review</span>
+      <span class="end"></span>
+    </a>
+
+    <div class="grp">Navigate · the universal graph</div>
+    <a class="row" href="01-shell-chat.html"><span class="ic" aria-hidden="true">◇</span><span class="pri">#payments-incidents ▸ cache thrash <span class="id">topic 01</span></span></a>
+    <a class="row" href="#"><span class="ic" aria-hidden="true">○</span><span class="pri">DOC · Cache Eviction Design</span></a>
+
+    <div class="pfoot"><span><kbd>↑↓</kbd> move</span><span><kbd>↵</kbd> run</span><span><kbd>⇥</kbd> drill</span><span><kbd>esc</kbd> close</span><span style="margin-inline-start:auto">consequential verbs → HITL gate, never silent</span></div>
+  </div>
+
+  <!-- LIVE UNFURL (the second wedge tangible) -->
+  <div class="composer">
+    <div class="lbl">Composer · paste a link — it unfurls live, permission-aware, with an inline action</div>
+    <div class="pasted">myelin://ci/payments-api/run/1894</div>
+    <div class="unfurl" role="group" aria-label="Live CI run preview">
+      <div class="uf-live"><span class="pulse"></span> Live · updated 4s ago · re-resolves itself <span class="right">payments-api · #1894</span></div>
+      <div class="uf-head">
+        <div>
+          <div class="title">integration · payments — run #1894</div>
+          <div class="crumb">repo/payments-api › main › triggered by push</div>
+        </div>
+        <span class="badge"><span aria-hidden="true">✗</span> Failed · 1 of 14</span>
+      </div>
+      <div class="uf-foot">
+        <button class="btn p sm">Re-run failed step</button>
+        <button class="btn sm">View full log</button>
+        <a class="open" href="02-ci-run.html">Open run ↗</a>
+      </div>
+    </div>
+    <div class="nochip">A cross-cell / restricted reference keeps its residency tag, never the home title:
+      <span class="ref noaccess"><span aria-hidden="true">⚷</span> Restricted reference</span>
+      <span class="ref"><span aria-hidden="true">⌖</span> eu-central</span>
+    </div>
+  </div>
+</div>
+<button class="btn themebtn" onclick="document.documentElement.dataset.theme = document.documentElement.dataset.theme==='light'?'dark':'light'">◐ light / dark</button>
+</body>
+</html>
