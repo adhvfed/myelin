@@ -47,7 +47,13 @@ cdc = ["crates/myelin-substrate/tests/cdc_1_3_liveness_readiness.rs"]
 row = "1.4"
 title = "PersonalDataHolder auto-registration"
 status = "covered"
-cdc = ["crates/myelin-substrate/tests/cdc_1_4_1_5_holders_and_migrations.rs"]
+# The substrate ships the MECHANISM + enforcement; AG-P3 / P-132 adds the Agent-Fabric side (its H11
+# OLTP + H17 trace stores opened through the one door; an unregistered Fabric store fails the
+# holder-registered architecture test). Each CDC carries its own provider+consumer pair.
+cdc = [
+    "crates/myelin-substrate/tests/cdc_1_4_1_5_holders_and_migrations.rs",
+    "crates/myelin-agent-service/tests/cdc_10_1_agent_holder.rs",
+]
 
 [[contract]]
 row = "1.5"
@@ -635,6 +641,10 @@ status = "covered"
 cdc = [
     "crates/myelin-gdpr-service/tests/cdc_10_1_holder_bodies.rs",
     "crates/myelin-refs-service/tests/cdc_10_1_refs_holder.rs",
+    # AG-P3 / P-132 — the Agent-Fabric side: the H11 OLTP + H17 trace stores as holders (a
+    # REGISTRATION SEAM; locate/export empty-but-correct, erase/rectify/restrict no-ops naming their
+    # AG-P23 / AG-P19 follow-on). The provider+consumer pair fans out via `dyn PersonalDataHolder`.
+    "crates/myelin-agent-service/tests/cdc_10_1_agent_holder.rs",
 ]
 
 [[contract]]

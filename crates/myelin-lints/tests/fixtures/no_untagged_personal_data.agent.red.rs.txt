@@ -1,0 +1,24 @@
+// RED fixture for `no-untagged-personal-data` — the AGENT-FABRIC slice (AG-P3 / P-132).
+// The lint MUST reject this. The Agent-Fabric hitl_gate / trace rows carry the per-run
+// conversation/humanised card body the brain authored from tenant content (architecture
+// agent-fabric §4.4 / §4.5). Here that free-text body field (`message_body`, a PII fingerprint —
+// the analogue of the real `risk_summary` / `trace_body` Content fields) carries NO
+// #[personal_data(...)] tag, so the per-subject DEK crypto-shred erase (contract 11.4) and the
+// RoPA/data-map fan-out (AG-D10) would NOT reach it, leaving an un-erasable subject (ADR-12). The
+// actor pseudonym (`agent_principal`) IS tagged here, isolating the failure to the deliberately
+// untagged body field.
+pub struct HitlGateRow {
+    pub tenant: TenantId,
+    pub region: Region,
+    pub gate_id: u128,
+    #[personal_data(
+        category = Identifier,
+        role = TenantContent,
+        basis = Contract,
+        retention = UntilContractEnd,
+        erasure = Pseudonymise,
+        subject_locator = "agent_principal",
+    )]
+    pub agent_principal: String,
+    pub message_body: Vec<u8>,
+}

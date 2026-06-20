@@ -21,6 +21,11 @@ myelin-gdpr = { path = "../myelin-gdpr" }
 myelin-storage = { path = "../myelin-storage" }
 myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-identity = { path = "../myelin-identity" }
+# The PersonalDataHolder REGISTRATION seam (AG-P3 → P-132): the substrate HolderRegistry (the ONE
+# door — opening IS registering, contract 1.4), the StoreClassifier (the data-map's "this OLTP store
+# is holder HN" fact), and the H1–H18 catalog (the Fabric stores classify to H11 agent-memory + H17
+# agent-trace). Mirrors myelin-refs-service / myelin-search (the M1 holder-registration pattern).
+myelin-substrate = { path = "../myelin-substrate" }
 
 # REAL Postgres backend behind the `integration` feature (Stage 1 / infra). OPTIONAL deps: the
 # DEFAULT `cargo build --workspace` stays DB-free (the binding policy floor — no DB at build). They

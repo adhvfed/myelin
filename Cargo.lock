@@ -1832,6 +1832,7 @@ dependencies = [
  "myelin-gdpr",
  "myelin-identity",
  "myelin-storage",
+ "myelin-substrate",
  "myelin-tenancy",
  "serde_json",
  "sqlx",
