@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<!-- CONCEPT C-17 | screen: Engineer surface (diff / files-changed) at the CALM EXTREME | persona: Massimo Vignelli (commit: a tiny canon of typefaces on a rigid grid, generous air, hierarchy from one serif + one grotesque + one mono, paper-like calm; refuse: clutter, decorative colour, "more chrome = more serious", saturated status fills, any sparkle)
+     axes: density=calm-EXTREME nav=contextual unification=highly-unified tone=warm agent=ambient sovereignty=on-demand
+     rationale: this should feel like a typeset code-review *broadside* — a diff that breathes like a printed page — because the honest test is whether Myelin's densest engineer surface can survive the calm pole without becoming a starved or precious toy. It keeps the monospace load-bearing and the gutters real, but spends whitespace and a reading rhythm instead of density. Throwaway-grade. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>C17 — Calm diff (Vignelli)</title>
+<!-- throwaway concept: single CDN font; production self-hosts (sovereignty, design-language §3.3) -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Spectral:ital,wght@0,400;0,500;0,600;1,400&family=Archivo:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    /* neutral-led warm-paper ramp (Workshop temperature) — ~90% of the UI */
+    --paper:#faf8f3; --paper-2:#f3efe6; --line:#e0dacd; --line-2:#cdc6b5;
+    --ink:#23211c; --ink-2:#5b574c; --ink-3:#8a8576;
+    --accent:#7a341e;            /* one rationed terracotta; never a fill, only a mark/rule */
+    --add:#3d6b3f; --add-bg:#eef3ea; --add-gutter:#cfe0cd;
+    --del:#9a3b34; --del-bg:#f6ecea; --del-gutter:#e6cfcc;
+    --agent:#3a4a63; --agent-bg:#eef0f4;   /* reserved, non-alarming agent treatment */
+    --ok:#3d6b3f; --warn:#8a6d18;
+    --focus:#1f4f6e;             /* derived AA-safe focus, NOT the accent */
+    --r:3px; --grid:8px;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{background:var(--paper);color:var(--ink);font-family:"Archivo",system-ui,sans-serif;
+    font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased;
+    display:grid;grid-template-columns:248px 1fr 300px;grid-template-rows:54px 1fr;
+    grid-template-areas:"rail top top" "rail main aside";height:100vh;overflow:hidden}
+  ::selection{background:#e9dfca}
+  a{color:inherit}
+  .mono{font-family:"JetBrains Mono",ui-monospace,monospace}
+  .serif{font-family:"Spectral",Georgia,serif}
+  :focus-visible{outline:2px solid var(--focus);outline-offset:2px;border-radius:2px}
+
+  /* ---- shell rail (contextual; calm, contents-as-table) ---- */
+  .rail{grid-area:rail;border-right:1px solid var(--line);background:var(--paper);
+    display:flex;flex-direction:column;padding:16px 0}
+  .brand{font-family:"Spectral";font-weight:600;font-size:18px;letter-spacing:.01em;padding:0 20px 18px;
+    display:flex;align-items:baseline;gap:8px}
+  .brand b{color:var(--accent);font-weight:600}
+  .brand span{font-size:11px;color:var(--ink-3);font-family:"Archivo";letter-spacing:.12em;text-transform:uppercase}
+  .nav{padding:0 12px;display:flex;flex-direction:column;gap:2px}
+  .nav a{display:flex;gap:10px;align-items:center;padding:7px 8px;border-radius:var(--r);color:var(--ink-2);
+    font-size:13px;text-decoration:none}
+  .nav a .g{width:16px;text-align:center;color:var(--ink-3);font-size:12px}
+  .nav a:hover{background:var(--paper-2)}
+  .nav a.on{color:var(--ink);background:var(--paper-2);box-shadow:inset 2px 0 0 var(--accent)}
+  .rail hr{border:0;border-top:1px solid var(--line);margin:14px 16px}
+  .toc{padding:0 20px;font-size:12px;color:var(--ink-3)}
+  .toc .h{font-family:"Archivo";letter-spacing:.12em;text-transform:uppercase;font-size:10px;color:var(--ink-3);margin-bottom:10px}
+  .toc ol{list-style:none;counter-reset:f}
+  .toc li{counter-increment:f;display:flex;gap:10px;padding:5px 0;align-items:baseline}
+  .toc li::before{content:counter(f,decimal-leading-zero);font-family:"JetBrains Mono";font-size:11px;color:var(--ink-3);width:18px}
+  .toc li.done::before{content:"\2713";color:var(--ok)}
+  .toc li span{color:var(--ink-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .toc li b{margin-left:auto;font-family:"JetBrains Mono";font-weight:400;font-size:11px}
+  .toc li b i{color:var(--add);font-style:normal} .toc li b u{color:var(--del);text-decoration:none}
+
+  /* ---- top bar ---- */
+  .top{grid-area:top;border-bottom:1px solid var(--line);display:flex;align-items:center;
+    gap:18px;padding:0 28px;background:var(--paper)}
+  .crumb{font-size:12.5px;color:var(--ink-2);display:flex;gap:8px;align-items:center}
+  .crumb .mono{color:var(--ink)} .crumb sep,.crumb .s{color:var(--line-2)}
+  .pill{font-size:11px;border:1px solid var(--line-2);border-radius:99px;padding:2px 10px;color:var(--ink-2);
+    display:inline-flex;gap:6px;align-items:center}
+  .pill.open{color:var(--accent);border-color:#d9b9ad}
+  .top .sp{margin-left:auto}
+  .kbd{font-family:"JetBrains Mono";font-size:11px;color:var(--ink-3);border:1px solid var(--line);
+    border-radius:var(--r);padding:4px 8px}
+  .id{width:28px;height:28px;border-radius:50%;background:var(--paper-2);border:1px solid var(--line-2);
+    display:grid;place-items:center;font-size:11px;font-weight:600;color:var(--ink-2)}
+
+  /* ---- main: the diff, as a typeset page ---- */
+  .main{grid-area:main;overflow:auto;padding:34px 40px 80px}
+  .stage{max-width:880px;margin:0 auto}
+  .lede .eyebrow{font-family:"Archivo";letter-spacing:.16em;text-transform:uppercase;font-size:10.5px;
+    color:var(--accent);margin-bottom:10px}
+  .lede h1{font-family:"Spectral";font-weight:600;font-size:30px;line-height:1.18;letter-spacing:-.01em;margin-bottom:8px}
+  .lede .sub{font-family:"Spectral";font-style:italic;font-size:16px;color:var(--ink-2);max-width:62ch}
+  .meta{display:flex;gap:26px;margin:20px 0 0;padding:16px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+  .meta div{display:flex;flex-direction:column;gap:3px}
+  .meta .k{font-family:"Archivo";letter-spacing:.1em;text-transform:uppercase;font-size:9.5px;color:var(--ink-3)}
+  .meta .v{font-size:13px;color:var(--ink)} .meta .v .mono{font-size:12.5px}
+  .meta .stat .mono i{color:var(--add);font-style:normal} .meta .stat .mono u{color:var(--del);text-decoration:none}
+
+  /* file block — air around it, hairline frame */
+  .file{margin-top:40px}
+  .fhead{display:flex;align-items:baseline;gap:14px;padding-bottom:10px;border-bottom:1px solid var(--line-2)}
+  .fhead .num{font-family:"Spectral";font-size:22px;color:var(--line-2);width:34px}
+  .fhead .path{font-family:"JetBrains Mono";font-size:13.5px;color:var(--ink)}
+  .fhead .path b{color:var(--ink-3);font-weight:400}
+  .fhead .chg{margin-left:auto;font-family:"JetBrains Mono";font-size:11.5px;color:var(--ink-3)}
+  .fhead .chg i{color:var(--add);font-style:normal} .fhead .chg u{color:var(--del);text-decoration:none}
+  .fhead .seen{font-size:11px;color:var(--ink-3);display:inline-flex;gap:6px;align-items:center;
+    border:1px solid var(--line);border-radius:var(--r);padding:3px 8px;cursor:pointer}
+  .fhead .seen .bx{width:11px;height:11px;border:1px solid var(--line-2);border-radius:2px}
+  .fhead .seen.is .bx{background:var(--ok);border-color:var(--ok);position:relative}
+  .fhead .seen.is .bx::after{content:"\2713";position:absolute;inset:-3px 0 0 1px;color:#fff;font-size:9px}
+
+  /* hunk: monospace stays load-bearing; calm comes from line-height + gutter air, not density */
+  .hunk{margin-top:22px;border:1px solid var(--line);border-radius:var(--r);overflow:hidden;background:#fffdf8}
+  .hunkbar{font-family:"JetBrains Mono";font-size:11.5px;color:var(--ink-3);background:var(--paper-2);
+    padding:8px 16px;border-bottom:1px solid var(--line);display:flex;gap:12px;align-items:center}
+  .hunkbar .ctx{font-family:"Spectral";font-style:italic;color:var(--ink-2)}
+  table.code{width:100%;border-collapse:collapse;font-family:"JetBrains Mono";font-size:12.5px;line-height:1.85}
+  table.code td{padding:0 0}
+  .gut{width:48px;text-align:right;padding:0 12px 0 0!important;color:var(--ink-3);user-select:none;
+    border-right:1px solid var(--line);font-size:11px;vertical-align:top}
+  .ln{padding:1px 18px!important;white-space:pre;color:var(--ink);vertical-align:top}
+  tr.add .ln{background:var(--add-bg)} tr.add .gut{background:var(--add-gutter);color:#4d6b4f}
+  tr.del .ln{background:var(--del-bg)} tr.del .gut{background:var(--del-gutter);color:#7d4742}
+  tr.add .ln::before{content:"+ ";color:var(--add)} tr.del .ln::before{content:"\2212 ";color:var(--del)}
+  tr.ctx .ln::before{content:"  "}
+  .tok-k{color:#7a341e} .tok-s{color:#3d6b3f} .tok-c{color:var(--ink-3);font-style:italic} .tok-f{color:#3a4a63}
+
+  /* inline comment thread — reads as a marginal note, not a chat bubble */
+  tr.note td{padding:0!important}
+  .note .wrap{margin:6px 18px 6px 60px;border-left:2px solid var(--accent);padding:12px 16px;background:var(--paper);
+    border-radius:0 var(--r) var(--r) 0;font-family:"Archivo"}
+  .note .who{font-size:12px;color:var(--ink);display:flex;align-items:center;gap:8px;margin-bottom:6px}
+  .note .who .ava{width:20px;height:20px;border-radius:50%;background:var(--paper-2);border:1px solid var(--line-2);
+    font-size:9px;display:grid;place-items:center;color:var(--ink-2);font-weight:600}
+  .note .who time{color:var(--ink-3);font-size:11px;margin-left:auto}
+  .note p{font-size:13px;color:var(--ink-2);line-height:1.55} .note p .mono{font-size:12px;background:var(--paper-2);padding:1px 5px;border-radius:3px}
+  .note .chip{display:inline-flex;gap:5px;align-items:center;border:1px solid var(--line-2);border-radius:var(--r);
+    padding:1px 7px;font-size:11.5px;font-family:"Archivo";color:var(--ink);background:var(--paper)}
+  .note .chip .d{width:6px;height:6px;border-radius:50%;background:var(--warn)}
+
+  /* agent suggested-fix — reserved neutral treatment, geometric mark, label, NO sparkle */
+  .note.agent .wrap{border-left-color:var(--agent);background:var(--agent-bg)}
+  .agent-tag{display:inline-flex;gap:6px;align-items:center;font-size:10.5px;font-family:"Archivo";font-weight:600;
+    letter-spacing:.06em;text-transform:uppercase;color:var(--agent);border:1px solid #c7cfdc;border-radius:var(--r);
+    padding:2px 7px;background:#fff}
+  .agent-tag .mk{width:11px;height:11px;border:1.5px solid var(--agent);border-radius:2px;
+    display:inline-block;position:relative}
+  .agent-tag .mk::after{content:"";position:absolute;inset:2px;background:var(--agent);border-radius:1px}
+  .sugg{margin-top:10px;border:1px solid #c7cfdc;border-radius:var(--r);overflow:hidden;font-family:"JetBrains Mono";font-size:12px}
+  .sugg .lbl{background:#e3e7ee;color:var(--agent);padding:5px 12px;font-family:"Archivo";font-size:10.5px;
+    letter-spacing:.08em;text-transform:uppercase}
+  .sugg pre{padding:8px 14px;background:#fff;color:var(--ink);line-height:1.7}
+  .sugg pre .add{color:var(--add)} .sugg pre .del{color:var(--del);text-decoration:line-through}
+  .acts{display:flex;gap:8px;margin-top:10px}
+  .btn{font-family:"Archivo";font-size:12px;border:1px solid var(--line-2);background:var(--paper);color:var(--ink);
+    border-radius:var(--r);padding:6px 14px;cursor:pointer}
+  .btn:hover{background:var(--paper-2)}
+  .btn.p{background:var(--ink);color:var(--paper);border-color:var(--ink)}
+  .btn.p:hover{background:#000}
+  .why{font-family:"Archivo";font-size:11.5px;color:var(--agent);text-decoration:underline;text-underline-offset:2px;
+    background:none;border:0;cursor:pointer;padding:6px 4px}
+
+  /* ---- aside: review verdict + linked artifacts (the wedge, quietly) ---- */
+  .aside{grid-area:aside;border-left:1px solid var(--line);background:var(--paper);overflow:auto;padding:26px 22px}
+  .aside h3{font-family:"Archivo";letter-spacing:.12em;text-transform:uppercase;font-size:10px;color:var(--ink-3);margin-bottom:12px}
+  .aside section{margin-bottom:30px}
+  .verdict{border:1px solid var(--line-2);border-radius:var(--r);padding:14px;background:#fffdf8}
+  .verdict .row{display:flex;align-items:center;gap:10px;font-size:13px;padding:5px 0}
+  .verdict .row .st{width:16px;text-align:center}
+  .verdict .row .st.ok{color:var(--ok)} .verdict .row .st.wait{color:var(--warn)} .verdict .row .st.gate{color:var(--agent)}
+  .verdict .row b{margin-left:auto;font-family:"JetBrains Mono";font-size:11px;color:var(--ink-3);font-weight:400}
+  .lk{display:flex;flex-direction:column;gap:8px}
+  .lk a{display:flex;gap:9px;align-items:center;text-decoration:none;border:1px solid var(--line);border-radius:var(--r);
+    padding:8px 10px;background:#fffdf8}
+  .lk a:hover{border-color:var(--line-2)}
+  .lk .t{font-family:"JetBrains Mono";font-size:11px;color:var(--ink-3);width:30px}
+  .lk .ti{font-size:12.5px;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+  .lk .s2{font-size:10px;color:var(--ink-3)}
+  .lk .dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+  .lk .dot.ok{background:var(--ok)} .lk .dot.warn{background:var(--warn)} .lk .dot.open{background:var(--accent)}
+  .vis{font-size:11px;color:var(--ink-2);display:flex;gap:8px;align-items:center;border:1px dashed var(--line-2);
+    border-radius:var(--r);padding:8px 10px;background:none}
+  .vis .g{color:var(--ink-3)}
+  .foot{font-family:"Spectral";font-style:italic;color:var(--ink-3);font-size:12px;margin-top:20px;line-height:1.5}
+</style>
+</head>
+<body>
+
+  <!-- RAIL -->
+  <nav class="rail">
+    <div class="brand"><b>Myelin</b><span>Code</span></div>
+    <div class="nav">
+      <a href="#"><span class="g">◐</span>Repository</a>
+      <a href="#"><span class="g">⎇</span>Branches</a>
+      <a href="#" class="on"><span class="g">⇄</span>Pull requests</a>
+      <a href="#"><span class="g">⊘</span>Checks</a>
+      <a href="#"><span class="g">⌕</span>Code search</a>
+    </div>
+    <hr>
+    <div class="toc">
+      <div class="h">Files changed · 4</div>
+      <ol>
+        <li class="done"><span>cache/store.rs</span><b><i>+18</i> <u>−6</u></b></li>
+        <li><span>cache/eviction.rs</span><b><i>+41</i> <u>−12</u></b></li>
+        <li><span>cache/mod.rs</span><b><i>+3</i> <u>−1</u></b></li>
+        <li><span>tests/eviction.rs</span><b><i>+52</i></b></li>
+      </ol>
+    </div>
+  </nav>
+
+  <!-- TOP -->
+  <header class="top">
+    <div class="crumb">
+      <span class="mono">myelin/cache-service</span><span class="s">/</span>
+      <span class="pill open">⇄ PR #412 · open</span>
+    </div>
+    <div class="sp"></div>
+    <span class="kbd">F7 next change</span>
+    <span class="kbd">⌘K</span>
+    <div class="id">AH</div>
+  </header>
+
+  <!-- MAIN -->
+  <main class="main">
+    <div class="stage">
+
+      <div class="lede">
+        <div class="eyebrow">Files changed — review</div>
+        <h1>Bound the cache by weight, not by entry count</h1>
+        <p class="sub serif">Under burst traffic the LRU grew unbounded because eviction counted entries, not bytes. This swaps to a weighted bound and adds the regression test that reproduced the OOM.</p>
+      </div>
+
+      <div class="meta">
+        <div><span class="k">Author</span><span class="v">Lena Bauer · <span class="mono">@lena</span></span></div>
+        <div><span class="k">Branch</span><span class="v mono">fix/weighted-eviction → main</span></div>
+        <div class="stat"><span class="k">Net change</span><span class="v mono"><i>+114</i> <u>−19</u></span></div>
+        <div><span class="k">Reviewers</span><span class="v">@ana, @marc</span></div>
+      </div>
+
+      <!-- FILE 2 (the interesting one) -->
+      <section class="file">
+        <div class="fhead">
+          <div class="num serif">02</div>
+          <div class="path"><b>cache/</b>eviction.rs</div>
+          <div class="chg"><i>+41</i> <u>−12</u></div>
+          <div class="seen" tabindex="0" role="checkbox" aria-checked="false"><span class="bx"></span>Viewed</div>
+        </div>
+
+        <div class="hunk">
+          <div class="hunkbar"><span>@@ −44,9 +44,18 @@</span><span class="ctx">impl WeightedLru</span></div>
+          <table class="code">
+            <tr class="ctx"><td class="gut">44</td><td class="ln">    <span class="tok-k">fn</span> <span class="tok-f">evict_until_fit</span>(&<span class="tok-k">mut</span> self) {</td></tr>
+            <tr class="del"><td class="gut">45</td><td class="ln">        <span class="tok-k">while</span> self.len() &gt; self.max_entries {</td></tr>
+            <tr class="del"><td class="gut">46</td><td class="ln">            self.pop_oldest();</td></tr>
+            <tr class="add"><td class="gut">45</td><td class="ln">        <span class="tok-c">// weight, not count — count let bursty large values OOM us</span></td></tr>
+            <tr class="add"><td class="gut">46</td><td class="ln">        <span class="tok-k">while</span> self.weight &gt; self.max_weight {</td></tr>
+            <tr class="add"><td class="gut">47</td><td class="ln">            <span class="tok-k">let</span> ev = self.pop_oldest();</td></tr>
+            <tr class="add"><td class="gut">48</td><td class="ln">            self.weight -= ev.weight();</td></tr>
+            <tr class="ctx"><td class="gut">49</td><td class="ln">        }</td></tr>
+
+            <!-- human inline note -->
+            <tr class="note"><td colspan="2"><div class="wrap">
+              <div class="who"><span class="ava">A</span> Ana Schmidt <time>2h · on line 48</time></div>
+              <p>Should <span class="mono">ev.weight()</span> be cached at insert time? Recomputing on every eviction is the hot path. See <span class="chip"><span class="d"></span>ENG-377 bench</span>.</p>
+            </div></td></tr>
+
+            <tr class="ctx"><td class="gut">50</td><td class="ln">    }</td></tr>
+            <tr class="ctx"><td class="gut">51</td><td class="ln"></td></tr>
+            <tr class="del"><td class="gut">52</td><td class="ln">    <span class="tok-k">fn</span> <span class="tok-f">insert</span>(&<span class="tok-k">mut</span> self, k: K, v: V) {</td></tr>
+            <tr class="add"><td class="gut">53</td><td class="ln">    <span class="tok-k">fn</span> <span class="tok-f">insert</span>(&<span class="tok-k">mut</span> self, k: K, v: V) -&gt; <span class="tok-f">Result</span>&lt;()&gt; {</td></tr>
+            <tr class="add"><td class="gut">54</td><td class="ln">        self.weight += v.weight();</td></tr>
+
+            <!-- agent suggested-fix note (ambient: it sits inline, labelled, no sparkle) -->
+            <tr class="note agent"><td colspan="2"><div class="wrap">
+              <div class="who">
+                <span class="agent-tag"><span class="mk"></span>FixAgent</span>
+                <time>suggested · on behalf of @lena · on line 54</time>
+              </div>
+              <p>Insert now mutates <span class="mono">weight</span> but can early-return on a full cache, leaking the increment. Proposed guard:</p>
+              <div class="sugg">
+                <div class="lbl">Suggested change · eviction.rs:54</div>
+                <pre><span class="del">        self.weight += v.weight();</span>
+<span class="add">        let w = v.weight();
+        if w > self.max_weight { return Err(TooLarge); }
+        self.weight += w;</span></pre>
+              </div>
+              <div class="acts">
+                <button class="btn p">Apply suggestion</button>
+                <button class="btn">Edit</button>
+                <button class="why">Why this? ↗</button>
+              </div>
+            </div></td></tr>
+
+            <tr class="ctx"><td class="gut">55</td><td class="ln">        self.map.insert(k, v);</td></tr>
+            <tr class="add"><td class="gut">56</td><td class="ln">        self.evict_until_fit();</td></tr>
+            <tr class="add"><td class="gut">57</td><td class="ln">        <span class="tok-f">Ok</span>(())</td></tr>
+            <tr class="ctx"><td class="gut">58</td><td class="ln">    }</td></tr>
+          </table>
+        </div>
+      </section>
+
+      <p class="foot serif">— Two more files follow. „Weniger, aber besser" gilt auch für ein Diff: nur die Zeilen, die sich ändern, mit Luft dazwischen.</p>
+    </div>
+  </main>
+
+  <!-- ASIDE -->
+  <aside class="aside">
+    <section>
+      <h3>Merge readiness</h3>
+      <div class="verdict">
+        <div class="row"><span class="st ok">✓</span> CI · all required green <b>build · test · lint</b></div>
+        <div class="row"><span class="st ok">✓</span> Approved by @marc <b>1 of 2</b></div>
+        <div class="row"><span class="st wait">◔</span> @ana — changes requested <b>1 thread</b></div>
+        <div class="row"><span class="st gate">▣</span> FixAgent suggestion <b>pending</b></div>
+      </div>
+    </section>
+
+    <section>
+      <h3>Linked artifacts</h3>
+      <div class="lk">
+        <a href="#"><span class="t">ISS</span><span class="ti">Cache OOM under burst load</span><span class="dot open"></span></a>
+        <a href="#"><span class="t">CI</span><span class="ti">run #2041 · weighted-eviction</span><span class="dot ok"></span></a>
+        <a href="#"><span class="t">DOC</span><span class="ti">Runbook · cache sizing</span><span class="dot warn"></span></a>
+      </div>
+    </section>
+
+    <section>
+      <h3>Residency &amp; visibility</h3>
+      <div class="vis"><span class="g">⌖</span> Repo · <b>EU-West (Frankfurt)</b> · Internal</div>
+    </section>
+  </aside>
+
+</body>
+</html>

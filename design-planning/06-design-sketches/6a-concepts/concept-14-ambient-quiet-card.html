@@ -1,0 +1,242 @@
+<!-- CONCEPT C-14 | screen: HITL approval card (agent AMBIENT / quiet)
+     persona: Otto Aicher (commit: the systematic grid as the whole design — every item a typed row on one strict module, rigorous pictographic icon system, near-monochrome order, the agent is one signed-and-classified entry among many; refuse: hero treatment, shadows, soft cards, decorative colour, any drama or exception that breaks the system)
+     axes: density=dense nav=rail unification=highly-unified tone=utilitarian agent=AMBIENT sovereignty=on-demand
+     rationale: this should feel like the quiet pole of agent presence because the proposal sits in the unified Inbox as one more typed row among CI/review/mention items — calm by default, NOT foregrounded — yet still fully legible: labelled agent, proposed-effects shown inline, Approve/Edit/Reject reachable without leaving the list. -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>C14 — Ambient HITL card in the inbox</title>
+<!-- throwaway: Inter via CDN; production self-hosts (§3.3) -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --n-0:#ffffff; --n-25:#fafafa; --n-50:#f4f4f5; --n-100:#e8e8ea; --n-150:#dcdcdf;
+    --n-300:#bcbcc2; --n-500:#86868d; --n-600:#67676e; --n-700:#48484e; --n-900:#1c1c20;
+    --accent:#3a5bd9; --accent-weak:#eaeefc;
+    --agent:#574c7a; --agent-weak:#efecf6;          /* reserved neutral agent token, not a status colour */
+    --danger:#b23b3b; --success:#2c7a4b; --warn:#a06a16;
+    --focus:#1f6fd6;
+    --mono:'IBM Plex Mono',ui-monospace,Menlo,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;background:var(--n-50);color:var(--n-900);font-family:Inter,system-ui,sans-serif;font-size:13px;-webkit-font-smoothing:antialiased;}
+  .app{display:grid;grid-template-columns:54px 224px 1fr;height:100vh}
+
+  /* rail */
+  .rail{background:var(--n-900);display:flex;flex-direction:column;align-items:center;padding:10px 0;gap:4px}
+  .rail .logo{width:26px;height:26px;border-radius:7px;background:var(--accent);margin-bottom:8px}
+  .rail a{width:34px;height:34px;border-radius:8px;display:flex;align-items:center;justify-content:center;color:#8e8e98;text-decoration:none}
+  .rail a svg{width:18px;height:18px}
+  .rail a.on{background:#2c2c33;color:#fff}
+  .rail .gap{flex:1}
+
+  /* secondary nav */
+  .nav{background:var(--n-25);border-right:1px solid var(--n-100);padding:14px 12px;overflow:auto}
+  .nav h2{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--n-500);margin:0 4px 10px;font-weight:600}
+  .nav .item{display:flex;align-items:center;gap:9px;padding:6px 8px;border-radius:6px;color:var(--n-700);cursor:default}
+  .nav .item:hover{background:var(--n-50)}
+  .nav .item.on{background:var(--accent-weak);color:var(--n-900);font-weight:500}
+  .nav .item svg{width:15px;height:15px;color:var(--n-500)}
+  .nav .item .ct{margin-left:auto;font-size:11px;color:var(--n-500);font-variant-numeric:tabular-nums}
+  .nav .sec{margin-top:16px}
+
+  /* content */
+  .content{display:flex;flex-direction:column;overflow:hidden;background:var(--n-0)}
+  .topbar{height:46px;border-bottom:1px solid var(--n-100);display:flex;align-items:center;gap:12px;padding:0 16px}
+  .topbar .title{font-weight:600;font-size:14px}
+  .topbar .sub{color:var(--n-500)}
+  .topbar .spacer{flex:1}
+  .topbar .k{font-size:11px;color:var(--n-600);border:1px solid var(--n-150);border-radius:5px;padding:3px 7px;font-family:var(--mono)}
+  .topbar .resid{font-size:11px;color:var(--n-600);display:flex;gap:5px;align-items:center}
+  .topbar .resid .dot{width:6px;height:6px;border-radius:50%;background:var(--success)}
+
+  .list{overflow:auto;flex:1}
+  /* every inbox row shares one grid — the agent row is just another typed row */
+  .row{display:grid;grid-template-columns:22px 78px 1fr 150px 92px;gap:12px;align-items:center;
+    padding:10px 16px;border-bottom:1px solid var(--n-100);cursor:default}
+  .row:hover{background:var(--n-25)}
+  .row .ind{width:7px;height:7px;border-radius:50%;justify-self:center;background:transparent}
+  .row.unread .ind{background:var(--accent)}
+  .row .kind{font-size:10.5px;text-transform:uppercase;letter-spacing:.04em;color:var(--n-500);font-weight:600;display:flex;align-items:center;gap:5px}
+  .row .kind svg{width:13px;height:13px}
+  .row .main{min-width:0}
+  .row .main .t{font-size:13.5px;color:var(--n-900);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .row .main .why{font-size:11.5px;color:var(--n-500);margin-top:2px}
+  .row .ref{display:flex;gap:5px;flex-wrap:wrap}
+  .chip{display:inline-flex;align-items:center;gap:4px;border:1px solid var(--n-150);border-radius:5px;padding:1px 6px;font-size:11.5px;color:var(--n-700);background:var(--n-0)}
+  .chip svg{width:11px;height:11px;color:var(--n-500)}
+  .chip .st-fail{color:var(--danger)}
+  .chip .st-ok{color:var(--success)}
+  .row .when{font-size:11.5px;color:var(--n-500);text-align:right;font-variant-numeric:tabular-nums}
+
+  /* status glyph+label, never colour alone */
+  .stat{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;color:var(--n-600)}
+  .stat svg{width:13px;height:13px}
+
+  /* the AMBIENT agent row — same grid, expands in place; quiet agent marker */
+  .agentrow{background:var(--n-25)}
+  .agentrow .kind{color:var(--agent)}
+  .badge-agent{font-size:9.5px;font-weight:700;letter-spacing:.04em;color:var(--agent);background:var(--agent-weak);border-radius:3px;padding:1px 4px;text-transform:uppercase}
+  .expand{grid-column:3 / 6;margin-top:2px;border:1px solid var(--n-150);border-radius:8px;background:var(--n-0);overflow:hidden}
+  .expand .xhead{padding:9px 12px;border-bottom:1px solid var(--n-100);display:flex;align-items:center;gap:8px;font-size:12px;color:var(--n-600)}
+  .expand .xhead .who{font-weight:600;color:var(--n-900);font-size:12.5px}
+  .expand .xhead .attr{color:var(--n-500)}
+  .eff{display:grid;grid-template-columns:18px 1fr auto;gap:10px;padding:8px 12px;border-bottom:1px solid var(--n-100);align-items:center}
+  .eff .n{font-family:var(--mono);font-size:11px;color:var(--n-500)}
+  .eff .ed{font-size:12.5px;color:var(--n-900)}
+  .eff .ed .tgt{color:var(--n-600);font-family:var(--mono);font-size:11.5px}
+  .eff .ed .au{font-size:11px;color:var(--n-500);margin-top:1px}
+  .eff .ed .au code{font-family:var(--mono);background:var(--n-50);border-radius:3px;padding:0 4px}
+  .gate{display:inline-flex;align-items:center;gap:4px;font-size:10.5px;font-weight:600;color:var(--warn);border:1px solid #ecd9b3;background:#faf3e3;border-radius:4px;padding:2px 6px}
+  .gate svg{width:11px;height:11px}
+  .nogate{font-size:10.5px;color:var(--n-500)}
+  .scope{padding:8px 12px;font-size:11.5px;color:var(--n-600);display:flex;gap:14px;flex-wrap:wrap;border-bottom:1px solid var(--n-100)}
+  .scope .k{color:var(--n-500)}
+  .scope code{font-family:var(--mono);background:var(--n-50);border-radius:3px;padding:0 4px;color:var(--n-700)}
+  .xactions{display:flex;gap:8px;align-items:center;padding:9px 12px}
+  button{font:inherit;cursor:pointer;border-radius:6px;border:1px solid var(--n-150);background:var(--n-0);padding:6px 12px;font-size:12.5px;font-weight:500;color:var(--n-700)}
+  button:focus-visible{outline:2px solid var(--focus);outline-offset:1px}
+  .b-primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  .b-primary:hover{background:#2f4ec0}
+  .b-quiet{border-color:transparent;color:var(--n-600)}
+  .b-quiet:hover{color:var(--danger)}
+  .xactions .sp{flex:1}
+  .xactions .lnk{font-size:11.5px;color:var(--n-500)}
+  .xactions .lnk a{color:var(--n-600);text-decoration:none;border-bottom:1px solid var(--n-150);margin-left:12px}
+
+  .grouphdr{padding:7px 16px;font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--n-500);background:var(--n-25);border-bottom:1px solid var(--n-100);font-weight:600}
+</style>
+</head>
+<body>
+<div class="app">
+
+  <nav class="rail">
+    <div class="logo"></div>
+    <a href="#"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M4 12h16M4 17h10"/></svg></a>
+    <a href="#"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></a>
+    <a href="#"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="5" width="16" height="14" rx="2"/><path d="M9 5v14"/></svg></a>
+    <a class="on" href="#" aria-current="page"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 18V9a7 7 0 0 1 14 0v9M3 18h18M10 21h4"/></svg></a>
+    <div class="gap"></div>
+    <a href="#"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 4-6 8-6s8 2 8 6"/></svg></a>
+  </nav>
+
+  <aside class="nav">
+    <h2>Inbox</h2>
+    <div class="item on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 18V9a7 7 0 0 1 14 0v9M3 18h18"/></svg> What needs me <span class="ct">7</span></div>
+    <div class="item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16v12H4z"/><path d="M4 7l8 6 8-6"/></svg> Snoozed <span class="ct">2</span></div>
+    <div class="item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12l5 5L20 7"/></svg> Done</div>
+    <div class="sec">
+      <h2>Filter</h2>
+      <div class="item">Review requests <span class="ct">2</span></div>
+      <div class="item">Mentions <span class="ct">3</span></div>
+      <div class="item">CI failures <span class="ct">1</span></div>
+      <div class="item">Approvals <span class="ct">1</span></div>
+    </div>
+  </aside>
+
+  <main class="content">
+    <div class="topbar">
+      <span class="title">What needs me</span>
+      <span class="sub">· 7 items, deduped</span>
+      <div class="spacer"></div>
+      <span class="resid"><span class="dot"></span>eu-west</span>
+      <span class="k">⌘K</span>
+    </div>
+
+    <div class="list">
+      <div class="grouphdr">Today</div>
+
+      <div class="row unread">
+        <span class="ind"></span>
+        <span class="kind"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="6" r="2"/><circle cx="6" cy="18" r="2"/><path d="M6 8v8M18 8v3a3 3 0 0 1-3 3H8"/><circle cx="18" cy="6" r="2"/></svg> Review</span>
+        <span class="main"><span class="t">Add retry to checkout webhook handler</span><span class="why">Because you’re a required reviewer</span></span>
+        <span class="ref"><span class="chip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="6" r="2"/><circle cx="18" cy="6" r="2"/></svg> PR #214</span></span>
+        <span class="when">12m</span>
+      </div>
+
+      <div class="row unread">
+        <span class="ind"></span>
+        <span class="kind"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg> CI</span>
+        <span class="main"><span class="t">Pipeline failed on <code style="font-family:var(--mono);font-size:11px">main</code> · checkout-e2e</span><span class="why">Because it’s on your branch</span></span>
+        <span class="ref"><span class="stat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M15 9l-6 6M9 9l6 6"/></svg><span class="st-fail">failed</span></span></span>
+        <span class="when">31m</span>
+      </div>
+
+      <!-- the AMBIENT agent approval: same row grid, just one more typed item, expanded in place -->
+      <div class="row unread agentrow" aria-label="Agent approval awaiting you">
+        <span class="ind"></span>
+        <span class="kind"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"><path d="M12 3l8 5.8-3 9.4H7L4 8.8 12 3z"/></svg> Approval</span>
+        <span class="main">
+          <span class="t" style="display:flex;align-items:center;gap:7px"><span class="badge-agent">Agent</span> FixAgent proposes a fix &amp; merge for the checkout NPE</span>
+          <span class="why">on behalf of @Dejan · triggered by ci.failed · correlation incident-9</span>
+        </span>
+        <span class="ref"><span class="stat" style="color:var(--warn)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>1 gate</span></span>
+        <span class="when">34m</span>
+
+        <div class="expand">
+          <div class="xhead">
+            <span class="who">FixAgent</span><span class="badge-agent">Agent</span>
+            <span class="attr">proposes 2 effects — nothing applied yet</span>
+          </div>
+          <div class="eff">
+            <span class="n">1</span>
+            <span class="ed">Open PR · <span class="tgt">repo/checkout</span> · branch <span class="tgt">fix/checkout-npe-3411</span>, fixes #88
+              <span class="au">authority <code>open_pr</code></span></span>
+            <span class="nogate">no gate · advisory</span>
+          </div>
+          <div class="eff">
+            <span class="n">2</span>
+            <span class="ed">Merge to <span class="tgt">main</span> after checks pass · <span class="tgt">repo/checkout</span>
+              <span class="au">consequential · protected branch · authority <code>git.merge</code></span></span>
+            <span class="gate"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg> Needs approval</span>
+          </div>
+          <div class="scope">
+            <span><span class="k">Scope</span> may act on <code>repo/checkout</code>, <code>#88</code> — delegation ∩ tenant</span>
+            <span><span class="k">Budget</span> 3 / 12 effects · est. €0.04</span>
+          </div>
+          <div class="xactions">
+            <button class="b-primary">Approve</button>
+            <button>Edit…</button>
+            <button class="b-quiet">Reject</button>
+            <span class="sp"></span>
+            <span class="lnk"><a href="#">Why?</a><a href="#">Audit trail</a></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="row unread">
+        <span class="ind"></span>
+        <span class="kind"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg> Mention</span>
+        <span class="main"><span class="t">@you — “can you confirm the SLA target for ENG-412?”</span><span class="why">Mentioned by Priya in #delivery</span></span>
+        <span class="ref"><span class="chip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="2"/></svg> ENG-412</span></span>
+        <span class="when">1h</span>
+      </div>
+
+      <div class="grouphdr">Earlier</div>
+
+      <div class="row">
+        <span class="ind"></span>
+        <span class="kind"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="6" r="2"/><circle cx="18" cy="6" r="2"/></svg> Review</span>
+        <span class="main"><span class="t">Bump pg driver to 16.2</span><span class="why">You requested changes · author replied</span></span>
+        <span class="ref"><span class="chip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="6" r="2"/><circle cx="18" cy="6" r="2"/></svg> PR #209</span><span class="stat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12l5 5L20 7"/></svg><span class="st-ok">green</span></span></span>
+        <span class="when">5h</span>
+      </div>
+
+      <div class="row">
+        <span class="ind"></span>
+        <span class="kind"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"><path d="M12 3l8 5.8-3 9.4H7L4 8.8 12 3z"/></svg> Agent</span>
+        <span class="main"><span class="t" style="display:flex;align-items:center;gap:7px"><span class="badge-agent">Agent</span> TriageAgent labelled 4 incoming issues</span><span class="why">Advisory · no action needed · review if you disagree</span></span>
+        <span class="ref"><span class="chip">+4 issues</span></span>
+        <span class="when">1d</span>
+      </div>
+
+    </div>
+  </main>
+</div>
+</body>
+</html>
