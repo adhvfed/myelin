@@ -71,6 +71,12 @@ myelin-identity = { path = "../myelin-identity" }
 myelin-query = { path = "../myelin-query" }
 tantivy = { workspace = true }
 
+# SRCH-P06 (P-169, M2): the near-real-time incremental indexer reads the references-not-payloads
+# `EventEnvelope.payload` (a `serde_json::Value`) to extract the zookie/version/refs the index doc is
+# stamped from — so serde_json is now a PROD dependency (it was test-only before). No new myelin edge;
+# Search stays a terminal leaf consumer.
+serde_json = { workspace = true }
+
 # TEST-ONLY. The names/units drift test constructs a canonical EventEnvelope (which embeds a
 # Principal from myelin-identity, now a prod dep above) to read the REAL frozen field names off a
 # value, and confirms the search-requires-acl-filter lint (its home is the shared myelin-lints

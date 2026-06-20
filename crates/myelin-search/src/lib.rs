@@ -114,6 +114,7 @@ pub mod dek;
 pub mod engine;
 pub mod erasure_posture;
 pub mod holder;
+pub mod indexer;
 pub mod layout;
 pub mod residency;
 pub mod shell;
@@ -124,6 +125,11 @@ pub use engine::{
     AclFilter, Hit, IndexBackend, IndexDocument, IndexError, TantivyBackend, ORDER_KEY_FIELD,
 };
 pub use erasure_posture::{erasure_posture, ErasurePosture};
+pub use indexer::{
+    EmbeddingAdapter, IncrementalIndexer, IndexEventError, IndexSpec, MockEmbeddingAdapter,
+    ProjectFetchError, ProjectFetcher, SearchProjection, INDEXER_CONSUMER,
+    INDEXER_SUBJECT_PREFIXES,
+};
 pub use holder::{
     register_search_holder, search_index_holder, SearchHolderRegistration, SearchIndexHolder,
     SEARCH_INDEX_STORE,
