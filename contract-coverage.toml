@@ -508,8 +508,17 @@ landing = "P-217"
 [[contract]]
 row = "8.4"
 title = "ToolHands::exec (unified sandbox)"
-status = "deferred"
-landing = "P-226"
+# COVERED at CI-P1 (P-129): the CI runner-seam half — the JobSpec shape + the SandboxBackend/
+# FleetProvider trait seam + the four-uniform-guarantee hooks (X-6). The CDC pair pins the
+# PROVIDER (the CI runner seam: launch drives isolation-floor → attribution → reserve → settle,
+# fail-closed on un-digested image / exhausted wallet) against the CONSUMER (a dispatcher building
+# a JobSpec; the agent-fabric case wires the X-6 equivalence ToolHands::exec == launch(JobSpec
+# {kind:Agent})). The FULL agent-fabric consumer body (the real ToolHands::exec dispatch path) is
+# AG-P8 (→ P-226); the ZERO-escapes real-kernel GATE is CI-P5 (→ P-239); the Firecracker backend
+# is CI-P2 (→ P-237). Those are runner IMPL/GATE follow-ons, not contract-pair gaps — the 8.4 seam
+# pair exists and carries both sides NOW.
+status = "covered"
+cdc = ["crates/myelin-ci-sandbox/tests/cdc_8_4_unified_sandbox.rs"]
 
 [[contract]]
 row = "8.5"
