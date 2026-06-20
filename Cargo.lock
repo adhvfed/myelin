@@ -1820,6 +1820,7 @@ dependencies = [
  "myelin-events",
  "myelin-identity",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
