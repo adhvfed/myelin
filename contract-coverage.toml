@@ -568,9 +568,20 @@ cdc = [
 
 [[contract]]
 row = "7.8"
+# COVERED at NOTIF-P16 (P-194): the BODY behind the carrier trait — the idempotent `DeliveryFabric`
+# (at-least-once + idempotent on `UNIQUE(tenant, idem_key)` — a retried send collapses to exactly one
+# effective delivery), the deterministic mock adapter (`--use-mock`-as-runtime, the §3.6 FLOOR), and
+# the redaction discipline (off-cell carries a humanised summary + deep link, `delivery.redacted=true`;
+# in-app stays in-cell — 0 off-cell egress, 0 off-cell full-body). The CDC pair pins the PROVIDER (the
+# fabric: idempotent + redacted + EU-preferring) against the CONSUMER (a concrete adapter implementing
+# the SAME trait — the strategy-pattern swap point the real EU provider, NOTIF-P25/P26, plugs into).
+# The NOTIF-D9 drill (crash between provider-ack and ledger-write, retry → exactly 1 effective delivery
+# per (item, channel)) is the dated green artifact. FLOOR: the real EU email/push provider (with its
+# DPA/sub-processor posture) is NOTIF-P25/P26 ([OPEN — LEGAL]); the durable `notif_delivery` PgStore
+# backing is the integration leg.
 title = "DeliveryAdapter"
-status = "deferred"
-landing = "P-194"
+status = "covered"
+cdc = ["crates/myelin-notif/tests/cdc_7_8_notif_delivery.rs"]
 
 # ──────────────── §8 Agent fabric (myelin-agent) ────────────────────────────────────────────────
 
