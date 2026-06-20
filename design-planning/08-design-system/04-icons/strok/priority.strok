@@ -1,0 +1,21 @@
+documentsize 24x24
+defaults
+  fill none
+  stroke $ink
+  stroke-width 2
+  stroke-linecap round
+  stroke-linejoin round
+palette
+  ink #ff00ff
+shape b1 template=path
+  addpoint a at=6,18
+  addpoint b at=6,14
+place bar1 shape=b1 at=0,0
+shape b2 template=path
+  addpoint a at=12,18
+  addpoint b at=12,10
+place bar2 shape=b2 at=0,0
+shape b3 template=path
+  addpoint a at=18,18
+  addpoint b at=18,6
+place bar3 shape=b3 at=0,0

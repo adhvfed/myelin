@@ -1,0 +1,25 @@
+documentsize 24x24
+defaults
+  fill none
+  stroke $ink
+  stroke-width 2
+  stroke-linecap round
+  stroke-linejoin round
+palette
+  ink #ff00ff
+shape ring1 template=path
+  addpoint a at=10,14
+  addpoint b at=7,17 mode=catmull-rom
+  addpoint c at=4,14 mode=catmull-rom
+  addpoint d at=7,11 mode=catmull-rom
+place r1 shape=ring1 at=0,0
+shape ring2 template=path
+  addpoint a at=14,10
+  addpoint b at=17,7 mode=catmull-rom
+  addpoint c at=20,10 mode=catmull-rom
+  addpoint d at=17,13 mode=catmull-rom
+place r2 shape=ring2 at=0,0
+shape bar template=path
+  addpoint a at=9,15
+  addpoint b at=15,9
+place b1 shape=bar at=0,0

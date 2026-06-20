@@ -1,0 +1,15 @@
+documentsize 24x24
+defaults
+  fill none
+  stroke $ink
+  stroke-width 2
+  stroke-linecap round
+  stroke-linejoin round
+palette
+  ink #ff00ff
+shape lens template=ellipse
+place l1 shape=lens at=4,4 size=12x12
+shape handle template=path
+  addpoint a at=15,15
+  addpoint b at=20,20
+place h1 shape=handle at=0,0

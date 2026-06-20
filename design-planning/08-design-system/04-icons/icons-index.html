@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Myelin icons — CORE set (iteration 1)</title>
+<style>
+  :root {
+    --bg: #fafafa;
+    --panel: #ffffff;
+    --ink: #1a1a1a;
+    --muted: #6b7280;
+    --border: #e5e7eb;
+  }
+  body.dark {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --ink: #e6edf3;
+    --muted: #8b949e;
+    --border: #30363d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+    transition: background .2s, color .2s;
+  }
+  header {
+    position: sticky; top: 0; z-index: 10;
+    display: flex; align-items: baseline; gap: 1rem; flex-wrap: wrap;
+    padding: 1rem 1.5rem;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 1rem; margin: 0; font-weight: 600; }
+  header p { margin: 0; color: var(--muted); }
+  .controls { margin-left: auto; display: flex; gap: .75rem; align-items: center; }
+  button {
+    font: inherit; cursor: pointer;
+    padding: .4rem .8rem;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--ink);
+  }
+  label { color: var(--muted); display: flex; gap: .4rem; align-items: center; }
+  input[type=range] { width: 120px; }
+
+  /* The container sets color: — every inline SVG inherits it via currentColor. */
+  main {
+    color: var(--ink);
+    padding: 1.5rem;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+    gap: 1rem;
+  }
+  .cell {
+    margin: 0;
+    display: flex; flex-direction: column; align-items: center; gap: .6rem;
+    padding: 1rem .5rem;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    text-align: center;
+  }
+  .cell svg {
+    width: var(--size, 32px);
+    height: var(--size, 32px);
+    display: block;
+    /* no stroke/fill set here — proves inheritance from container color */
+  }
+  figcaption {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 11px;
+    color: var(--muted);
+    word-break: break-all;
+  }
+  /* An accent swatch row to prove currentColor follows any color, not just ink */
+  .accent { color: #d9480f; }
+  body.dark .accent { color: #ff922b; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Myelin icons — CORE set</h1>
+  <p>42 icons · iteration 1 · 24×24 outline · <code>stroke="currentColor"</code></p>
+  <div class="controls">
+    <label>size
+      <input id="size" type="range" min="16" max="64" value="32">
+      <span id="sizeval">32px</span>
+    </label>
+    <button id="accent">toggle accent color</button>
+    <button id="theme">toggle dark</button>
+  </div>
+</header>
+
+<main id="grid">
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="b1" d="M4 6.6667 A2.6667 2.6667 0 0 1 6.6667 4 L17.3333 4 A2.6667 2.6667 0 0 1 20 6.6667 L20 17.3333 A2.6667 2.6667 0 0 1 17.3333 20 L6.6667 20 A2.6667 2.6667 0 0 1 4 17.3333Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="d1" d="M12 10 C13.1046 10, 14 10.8954, 14 12 C14 13.1046, 13.1046 14, 12 14 C10.8954 14, 10 13.1046, 10 12 C10 10.8954, 10.8954 10, 12 10Z" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>agent</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="r1" d="M12 3 C16.9706 3, 21 7.0294, 21 12 C21 16.9706, 16.9706 21, 12 21 C7.0294 21, 3 16.9706, 3 12 C3 7.0294, 7.0294 3, 12 3Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="m1" d="M8 12 L11 15 L16 9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>approve</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="r1" d="M7 8 L7 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="d1" d="M7 13 C8 13, 11.3333 13.6667, 13 13 C14.6667 12.3333, 16.3333 10, 17 9 L17 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="n1" d="M7 16 C8.6569 16, 10 17.3431, 10 19 C10 20.6569, 8.6569 22, 7 22 C5.3431 22, 4 20.6569, 4 19 C4 17.3431, 5.3431 16, 7 16Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="n2" d="M7 3 C8.6569 3, 10 4.3431, 10 6 C10 7.6569, 8.6569 9, 7 9 C5.3431 9, 4 7.6569, 4 6 C4 4.3431, 5.3431 3, 7 3Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="n3" d="M17 3 C18.6569 3, 20 4.3431, 20 6 C20 7.6569, 18.6569 9, 17 9 C15.3431 9, 14 7.6569, 14 6 C14 4.3431, 15.3431 3, 17 3Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>branch</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="a1" d="M9 4 L7 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="a2" d="M17 4 L15 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="b1" d="M4 9 L20 9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="b2" d="M4 15 L20 15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>channel</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="a1" d="M6 6 L18 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="a2" d="M18 6 L6 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>check-fail</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="m1" d="M5 12 L10 17 L19 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>check-pass</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="r1" d="M12 4 C16.4183 4, 20 7.5817, 20 12 C20 16.4183, 16.4183 20, 12 20 C7.5817 20, 4 16.4183, 4 12 C4 7.5817, 7.5817 4, 12 4Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="h1" d="M12 8 L12 12 L15 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>check-pending</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="m1" d="M9 5 L16 12 L9 19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>chevron</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="a1" d="M6 6 L18 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="a2" d="M18 6 L6 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>close</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="l1" d="M12 3 L12 9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="l2" d="M12 15 L12 21" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="n1" d="M12 8 C14.2091 8, 16 9.7909, 16 12 C16 14.2091, 14.2091 16, 12 16 C9.7909 16, 8 14.2091, 8 12 C8 9.7909, 9.7909 8, 12 8Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>commit</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="r1" d="M12 4 C16.4183 4, 20 7.5817, 20 12 C20 16.4183, 16.4183 20, 12 20 C7.5817 20, 4 16.4183, 4 12 C4 7.5817, 7.5817 4, 12 4Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="ar" d="M16 4 L20 4 L20 8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>cycle</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="t1" d="M12 4 C15.866 4, 19 5.1193, 19 6.5 C19 7.8807, 15.866 9, 12 9 C8.134 9, 5 7.8807, 5 6.5 C5 5.1193, 8.134 4, 12 4Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="s1" d="M5 6 L5 18 L8 20 L12 20.5 L16 20 L19 18 L19 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="bd" d="M5 12 L8 14 L12 14.5 L16 14 L19 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>database</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="b1" d="M6 3 L14 3 L18 7 L18 21 L6 21Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="f1" d="M14 3 L14 7 L18 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="line1" d="M9 13 L15 13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="line2" d="M9 17 L15 17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>doc</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="b1" d="M15 5 L19 9 L9 19 L5 19 L5 15Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="t1" d="M13 7 L17 11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>edit</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="b1" d="M12 5 L5 5 L5 19 L19 19 L19 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="ar" d="M13 5 L19 5 L19 11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="sh" d="M19 5 L11 13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>external-link</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="b1" d="M6 3 L14 3 L19 8 L19 21 L6 21Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="f1" d="M14 3 L14 8 L19 8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>file</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="b1" d="M3 8 A1 1 0 0 1 4 7 L8 7 A1 1 0 0 1 9.7071 7.7071 L10.2929 8.2929 A1 1 0 0 1 12 9 L20 9 A1 1 0 0 1 21 10 L21 18 A1 1 0 0 1 20 19 L4 19 A1 1 0 0 1 3 18Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>folder</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="b1" d="M5 11.75 A1.1667 0.75 0 0 1 6.1667 11 L17.8333 11 A1.1667 0.75 0 0 1 19 11.75 L19 19.25 A1.1667 0.75 0 0 1 17.8333 20 L6.1667 20 A1.1667 0.75 0 0 1 5 19.25Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="s1" d="M8 11 C8 10.3333, 7.3333 8, 8 7 C8.6667 6, 10.6667 5, 12 5 C13.3333 5, 15.3333 6, 16 7 C16.6667 8, 16 10.3333, 16 11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>gate</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="h1" d="M12 4 C14.2091 4, 16 5.7909, 16 8 C16 10.2091, 14.2091 12, 12 12 C9.7909 12, 8 10.2091, 8 8 C8 5.7909, 9.7909 4, 12 4Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="b1" d="M5 20 L5 17 L9 14 L15 14 L19 17 L19 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>human</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="t1" d="M4 4 L4 15 L8 15 L9 18 L15 18 L16 15 L20 15 L20 4Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="i1" d="M4 15 L9 15 L10 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>inbox</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="r1" d="M12 4 C16.4183 4, 20 7.5817, 20 12 C20 16.4183, 16.4183 20, 12 20 C7.5817 20, 4 16.4183, 4 12 C4 7.5817, 7.5817 4, 12 4Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>issue</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="dot1" d="M12 4 C12.8284 4, 13.5 4.6716, 13.5 5.5 C13.5 6.3284, 12.8284 7, 12 7 C11.1716 7, 10.5 6.3284, 10.5 5.5 C10.5 4.6716, 11.1716 4, 12 4Z" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="dot2" d="M12 10.5 C12.8284 10.5, 13.5 11.1716, 13.5 12 C13.5 12.8284, 12.8284 13.5, 12 13.5 C11.1716 13.5, 10.5 12.8284, 10.5 12 C10.5 11.1716, 11.1716 10.5, 12 10.5Z" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="dot3" d="M12 17 C12.8284 17, 13.5 17.6716, 13.5 18.5 C13.5 19.3284, 12.8284 20, 12 20 C11.1716 20, 10.5 19.3284, 10.5 18.5 C10.5 17.6716, 11.1716 17, 12 17Z" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>kebab</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="r1" d="M10 14 C9.5 14.5, 8 17, 7 17 C6 17, 4 15, 4 14 C4 13, 6.5 11.5, 7 11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="r2" d="M14 10 C14.5 9.5, 16 7, 17 7 C18 7, 20 9, 20 10 C20 11, 17.5 12.5, 17 13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="b1" d="M9 15 L15 9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>link</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="r1" d="M7 8 L7 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="c1" d="M17 7 C17 7.3333, 17.6667 8, 17 9 C16.3333 10, 14.6667 12.3333, 13 13 L7 13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="n2" d="M7 3 C8.6569 3, 10 4.3431, 10 6 C10 7.6569, 8.6569 9, 7 9 C5.3431 9, 4 7.6569, 4 6 C4 4.3431, 5.3431 3, 7 3Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="n1" d="M7 16 C8.6569 16, 10 17.3431, 10 19 C10 20.6569, 8.6569 22, 7 22 C5.3431 22, 4 20.6569, 4 19 C4 17.3431, 5.3431 16, 7 16Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="n3" d="M17 3 C18.6569 3, 20 4.3431, 20 6 C20 7.6569, 18.6569 9, 17 9 C15.3431 9, 14 7.6569, 14 6 C14 4.3431, 15.3431 3, 17 3Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>merge</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="b1" d="M6 19 L6 16 C5.8333 15.5, 5.3333 16.1667, 5 16 C4.6667 15.8333, 4.1667 16.5, 4 15 C3.8333 13.5, 3.8333 8.5, 4 7 C4.1667 5.5, 2.5 6.1667, 5 6 C7.5 5.8333, 16.5 5.8333, 19 6 C21.5 6.1667, 19.8333 5.5, 20 7 C20.1667 8.5, 20.1667 13.5, 20 15 C19.8333 16.5, 20.6667 15.8333, 19 16 L10 16Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>message</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="b1" d="M6 18 L6 15 C5.8333 14.5, 5.3333 15.1667, 5 15 C4.6667 14.8333, 4.1667 15.3333, 4 14 C3.8333 12.6667, 3.8333 8.3333, 4 7 C4.1667 5.6667, 2.5 6.1667, 5 6 C7.5 5.8333, 16.5 5.8333, 19 6 C21.5 6.1667, 19.8333 5.6667, 20 7 C20.1667 8.3333, 20.1667 12.6667, 20 14 C19.8333 15.3333, 20.6667 14.8333, 19 15 L10 15Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="line1" d="M8 10 L16 10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="line2" d="M8 12.5 L13 12.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>nav-chat</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="r1" d="M12 3 C16.9706 3, 21 7.0294, 21 12 C21 16.9706, 16.9706 21, 12 21 C7.0294 21, 3 16.9706, 3 12 C3 7.0294, 7.0294 3, 12 3Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="p1" d="M10 8 L16 12 L10 16Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>nav-ci</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="left1" d="M9 7 L4 12 L9 17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="right1" d="M15 7 L20 12 L15 17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>nav-code</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="r1" d="M12 3 C16.9706 3, 21 7.0294, 21 12 C21 16.9706, 16.9706 21, 12 21 C7.0294 21, 3 16.9706, 3 12 C3 7.0294, 7.0294 3, 12 3Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="d1" d="M12 10 C13.1046 10, 14 10.8954, 14 12 C14 13.1046, 13.1046 14, 12 14 C10.8954 14, 10 13.1046, 10 12 C10 10.8954, 10.8954 10, 12 10Z" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>nav-issues</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="s1" d="M12 5 L12 19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="lp" d="M12 5 L7 4 L4 5 L4 18 L7 17 L12 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="rp" d="M12 5 L17 4 L20 5 L20 18 L17 17 L12 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>nav-knowledge</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="bar1" d="M6 18 L6 14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="bar2" d="M12 18 L12 10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="bar3" d="M18 18 L18 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>priority</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="lr" d="M6 8 L6 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="cn" d="M18 16 C18 15.1667, 18.5 12.3333, 18 11 C17.5 9.6667, 16.5 8.5, 15 8 L9 8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="ah" d="M11 5 L8 8 L11 11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="n1" d="M6 3 C7.6569 3, 9 4.3431, 9 6 C9 7.6569, 7.6569 9, 6 9 C4.3431 9, 3 7.6569, 3 6 C3 4.3431, 4.3431 3, 6 3Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="n2" d="M6 17 C7.6569 17, 9 18.3431, 9 20 C9 21.6569, 7.6569 23, 6 23 C4.3431 23, 3 21.6569, 3 20 C3 18.3431, 4.3431 17, 6 17Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="n3" d="M18 17 C19.6569 17, 21 18.3431, 21 20 C21 21.6569, 19.6569 23, 18 23 C16.3431 23, 15 21.6569, 15 20 C15 18.3431, 16.3431 17, 18 17Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>pull-request</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="r1" d="M12 3 C16.9706 3, 21 7.0294, 21 12 C21 16.9706, 16.9706 21, 12 21 C7.0294 21, 3 16.9706, 3 12 C3 7.0294, 7.0294 3, 12 3Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="a1" d="M9 9 L15 15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="a2" d="M15 9 L9 15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>reject</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="b1" d="M5 3.75 A0.5833 0.75 0 0 1 5.5833 3 L18.4167 3 A0.5833 0.75 0 0 1 19 3.75 L19 20.25 A0.5833 0.75 0 0 1 18.4167 21 L5.5833 21 A0.5833 0.75 0 0 1 5 20.25Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="s1" d="M9 3 L9 21" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="m1" d="M13 7 L16 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>repo</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="a1" d="M19 9 C18.6667 8.3333, 18.1667 5.8333, 17 5 C15.8333 4.1667, 13.8333 3.6667, 12 4 C10.1667 4.3333, 7.1667 5.5, 6 7 C4.8333 8.5, 4.5 11.1667, 5 13 C5.5 14.8333, 7.3333 17.1667, 9 18 C10.6667 18.8333, 13.3333 18.6667, 15 18 C16.6667 17.3333, 18.3333 14.6667, 19 14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="ah" d="M14 9 L19 9 L19 4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>rerun</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="bar1" d="M4 7 L14 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="bar2" d="M10 12 L20 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="bar3" d="M6 17 L16 17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>roadmap</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="b1" d="M3 6 A3 3 0 0 1 6 3 L18 3 A3 3 0 0 1 21 6 L21 18 A3 3 0 0 1 18 21 L6 21 A3 3 0 0 1 3 18Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="p1" d="M10 8 L16 12 L10 16Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>run</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="l1" d="M10 4 C13.3137 4, 16 6.6863, 16 10 C16 13.3137, 13.3137 16, 10 16 C6.6863 16, 4 13.3137, 4 10 C4 6.6863, 6.6863 4, 10 4Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="h1" d="M15 15 L20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>search</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="ln1" d="M4 7 L20 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="ln2" d="M4 12 L20 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="ln3" d="M4 17 L20 17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="knob1" d="M15 5 C16.1046 5, 17 5.8954, 17 7 C17 8.1046, 16.1046 9, 15 9 C13.8954 9, 13 8.1046, 13 7 C13 5.8954, 13.8954 5, 15 5Z" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="knob2" d="M9 10 C10.1046 10, 11 10.8954, 11 12 C11 13.1046, 10.1046 14, 9 14 C7.8954 14, 7 13.1046, 7 12 C7 10.8954, 7.8954 10, 9 10Z" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="knob3" d="M17 15 C18.1046 15, 19 15.8954, 19 17 C19 18.1046, 18.1046 19, 17 19 C15.8954 19, 15 18.1046, 15 17 C15 15.8954, 15.8954 15, 17 15Z" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>settings</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="e1" d="M7 4 L7 14 L13 14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="r1" d="M17 11 C18.6569 11, 20 12.3431, 20 14 C20 15.6569, 18.6569 17, 17 17 C15.3431 17, 14 15.6569, 14 14 C14 12.3431, 15.3431 11, 17 11Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>sub-issue</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="b1" d="M4.7071 11.7071 A1 1 0 0 1 4.7071 10.2929 L10.2929 4.7071 A1 1 0 0 1 12 4 L19 4 A1 1 0 0 1 20 5 L20 12 A1 1 0 0 1 19.2929 13.7071 L13.7071 19.2929 A1 1 0 0 1 12.2929 19.2929Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="h1" d="M15.5 7 C16.3284 7, 17 7.6716, 17 8.5 C17 9.3284, 16.3284 10, 15.5 10 C14.6716 10, 14 9.3284, 14 8.5 C14 7.6716, 14.6716 7, 15.5 7Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>tag</figcaption>
+      </figure>
+      <figure class="cell">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"> <path id="h1" d="M7.5 5 C9.433 5, 11 6.567, 11 8.5 C11 10.433, 9.433 12, 7.5 12 C5.567 12, 4 10.433, 4 8.5 C4 6.567, 5.567 5, 7.5 5Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="b1" d="M2 19 L2 17 L5 14 L10 14 L13 17 L13 19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="h2" d="M17.5 5 C19.433 5, 21 6.567, 21 8.5 C21 10.433, 19.433 12, 17.5 12 C15.567 12, 14 10.433, 14 8.5 C14 6.567, 15.567 5, 17.5 5Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path id="b2" d="M15 14 L18 14 L21 17 L21 19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> </svg> 
+        <figcaption>team</figcaption>
+      </figure>
+</main>
+
+<script>
+  var grid = document.getElementById('grid');
+  document.getElementById('theme').onclick = function () {
+    document.body.classList.toggle('dark');
+  };
+  document.getElementById('accent').onclick = function () {
+    grid.classList.toggle('accent');
+  };
+  var size = document.getElementById('size');
+  var sizeval = document.getElementById('sizeval');
+  size.oninput = function () {
+    grid.style.setProperty('--size', this.value + 'px');
+    sizeval.textContent = this.value + 'px';
+  };
+</script>
+</body>
+</html>

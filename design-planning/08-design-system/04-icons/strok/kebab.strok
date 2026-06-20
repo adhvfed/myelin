@@ -1,0 +1,18 @@
+documentsize 24x24
+defaults
+  fill none
+  stroke $ink
+  stroke-width 2
+  stroke-linecap round
+  stroke-linejoin round
+palette
+  ink #ff00ff
+shape d1 template=ellipse
+  fill $ink
+place dot1 shape=d1 at=10.5,4 size=3x3
+shape d2 template=ellipse
+  fill $ink
+place dot2 shape=d2 at=10.5,10.5 size=3x3
+shape d3 template=ellipse
+  fill $ink
+place dot3 shape=d3 at=10.5,17 size=3x3

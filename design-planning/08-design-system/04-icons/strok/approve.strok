@@ -1,0 +1,16 @@
+documentsize 24x24
+defaults
+  fill none
+  stroke $ink
+  stroke-width 2
+  stroke-linecap round
+  stroke-linejoin round
+palette
+  ink #ff00ff
+shape ring template=ellipse
+place r1 shape=ring at=3,3 size=18x18
+shape mark template=path
+  addpoint a at=8,12
+  addpoint b at=11,15
+  addpoint c at=16,9
+place m1 shape=mark at=0,0
