@@ -195,6 +195,32 @@
 //! layout/portal/focus APIs) lands with the **first frontend-bearing subsystem (M3+)** — the
 //! design-system pass (**GIT-P7 / P-233** and the Knowledge/Issues design-system passes). Every
 //! frontend feature from M3 on builds on THESE primitives (EI-01 §7: abstract once, here).
+//!
+//! ## Status (P-S28 → P-135, M2) — firehose per-connection frame caps + slow-consumer drop DONE
+//! The substrate's **bounded-and-sheds half** of the firehose resume-cursor seam (contract 3.5,
+//! §7.7) is **implemented** in [`firehose`] — it rides the Bus's protocol (`subscribe`/`resume`,
+//! the zero-loss-replay half, P-141/EB-21) without depending on its impl:
+//! - **(a) per-connection in-flight frame caps** — [`firehose::FrameBuffer`] is a per-subscription
+//!   bounded frame queue built on the one [`shed::BoundedQueue`] primitive (§7.1 generalised to
+//!   streaming): a frame offered over-cap **sheds in the firehose's own bounded queue**
+//!   ([`firehose::PushOutcome::Shed`]) — buffered frames NEVER exceed the cap (Little's Law).
+//! - **(b) slow-consumer drop to `resync_required`** — once a buffer's per-`(stream,scope)` frame
+//!   lag crosses the slow-consumer ceiling, the connection is **dropped to `resync_required`**
+//!   ([`firehose::PushOutcome::ResyncRequired`]): the buffer is RELEASED (memory → bounded, lag → 0)
+//!   and the consumer falls back to a full `*.snapshot` replay (the cold-rebuild path, NAMED not
+//!   silent). The drop is counted exactly once per connection.
+//!
+//! The per-`(stream,scope)` frame-lag + `resync_required` count are exported into the contract-1.8
+//! telemetry set ([`firehose::FirehoseSignals`], mapping onto the harness
+//! `SignalName::{FirehoseFrameLag, ResyncRequiredCount}`). The unit tests (`firehose::tests`) + the
+//! CDC 3.5-substrate-half pair (`tests/cdc_3_5_firehose_backpressure.rs`) + the SUB-D11 hot-stream
+//! drill (`tests/drill_sub_d11_firehose_slow_consumer.rs`, the P-S03 injector drops a firehose
+//! subscription on a hot stream, asserted by the P-S04 telemetry library) are the dated green
+//! artifact. **Floors named:** the Bus-side **zero-loss-replay half** (`subscribe`/`resume`/
+//! `resync_required → *.snapshot`) is **P-141 (EB-21)** — the full D-11 reconnect-loses-zero-ops
+//! drill needs BOTH halves; the **scope-bounded selector (reject `*`) + the per-surface frame shed
+//! budgets** are **P-S29 (P-136)**; the **M4 connection-storm re-confirm** of this half is **P-S31
+//! (P-326)**.
 
 use serde::{Deserialize, Serialize};
 
@@ -202,6 +228,7 @@ pub mod agent_load;
 pub mod crate_graph;
 pub mod fail_static;
 pub mod fail_static_authz;
+pub mod firehose;
 pub mod holder_catalog;
 pub mod holder_registered;
 pub mod holders;
@@ -224,6 +251,9 @@ pub use fail_static::{
 };
 pub use fail_static_authz::{
     AuthzDecision, AuthzServed, CoarseAuthz, FailStaticAuthz, AUTHZ_FRESH_TTL_SECS,
+};
+pub use firehose::{
+    Frame, FrameBuffer, FrameClass, FrameLagSample, FirehoseScope, FirehoseSignals, PushOutcome,
 };
 pub use holder_catalog::{
     assert_holder_completeness, classify_store, holder_completeness, Holder, OrphanStore,

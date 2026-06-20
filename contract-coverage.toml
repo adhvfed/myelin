@@ -196,6 +196,13 @@ title = "EventMatcher = the frozen QueryAst"
 status = "deferred"
 landing = "P-137"
 
+# 3.5 firehose: SPLIT into the Bus-owned protocol half (subscribe/resume + zero-loss-replay) and the
+# SUBSTRATE-owned bounded-and-sheds half (§7.7). The substrate half — per-connection in-flight frame
+# caps + slow-consumer drop to resync_required (P-S28 / P-135) — SHIPS NOW with its CDC pair
+# (myelin-substrate/tests/cdc_3_5_firehose_backpressure.rs) + the SUB-D11 hot-stream drill. The
+# Bus-owned protocol half (the row below) is still deferred → P-141 (EB-21, built FIRST per EI-04 §2.2);
+# the full D-11 reconnect-loses-zero-ops drill needs BOTH halves. The scope-bounded selector (reject *)
+# + per-surface frame shed budgets are P-136 (P-S29).
 [[contract]]
 row = "3.5"
 title = "firehose transport + resume-cursor protocol"
