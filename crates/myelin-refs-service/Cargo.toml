@@ -63,6 +63,12 @@ myelin-events = { path = "../myelin-events" }
 # serde_json — the references-not-payloads `refs.edge.*` payload the builder reads (source/target/
 # rel/rel_class/zookie). A leaf dev/runtime dep, already in the workspace; no DAG edge added.
 serde_json = { workspace = true }
+# The three platform-load-bearing structured inline nodes (`myelin-content::InlineNode` —
+# mention/artifact_ref/embed, contract 13.1, frozen X-2). REF-P8 / P-157: the edge-extraction
+# emit seam reads these structured nodes (NOT a regex over prose) and emits one `refs.edge.created`
+# per node via `OutboxTx::emit`. `myelin-content` depends only on tenancy/events/identity (never on
+# refs-service), so this is acyclic — refs-service stays the graph's terminal leaf consumer.
+myelin-content = { path = "../myelin-content" }
 
 # ------------------------------------------------------------------------------------------
 # REAL edge inverse-index schema apply behind the `integration` feature (REF-P5 / P-154). The

@@ -2055,6 +2055,7 @@ dependencies = [
 name = "myelin-refs-service"
 version = "0.0.0"
 dependencies = [
+ "myelin-content",
  "myelin-events",
  "myelin-gdpr",
  "myelin-identity",
