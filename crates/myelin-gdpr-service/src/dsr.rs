@@ -37,10 +37,12 @@
 //! - **Tenant-operability** (Art. 28 tenant-facing DSR + `EraseScope::Tenant` offboarding +
 //!   restrict/rectify/portability surfaces) → **P-GA-13 → P-113**.
 //! - **The durable deadline timer** (the `myelin-flow` minute-bucket wheel `sleep_until` + the
-//!   nearing-deadline warning `Signal`) → **M2 P-GA-21 → P-148** (GA-D4). On THIS floor the
-//!   deadline is a COARSE tracked timestamp (`submitted_at + 30 days`), computed via an
-//!   injectable [`myelin_substrate::Clock`]; the durable wheel REPLACES the coarse tracking — the
-//!   `deadline` field shape does not change.
+//!   nearing-deadline warning `Signal`) → **M2 P-GA-21 → P-148, NOW FILLED in
+//!   [`crate::dsr_timer`]** (GA-D4). On THIS module's floor the deadline is still the COARSE tracked
+//!   timestamp (`submitted_at + 30 days`, [`Dsr::deadline_secs`]); the durable
+//!   [`crate::dsr_timer::DsrDeadlineTimer`] arms a `sleep_until(deadline − warning_margin)` on the
+//!   minute-bucket wheel that REPLACES the coarse tracking (it fires the warning Signal + survives a
+//!   restart + re-arms on the Art. 12(3) extension) — the `deadline` field shape does not change.
 //! - **The Merkle SEAL of the certificate receipts into the per-tenant audit tree** → **P-GA-20
 //!   → P-119** (this prompt SIGNS the certificate bundle content-address; P-GA-20 anchors the
 //!   root into the audit Merkle tree, making `dsr_certificate → MerkleProvenBundle` inclusion-

@@ -316,8 +316,8 @@ pub use shed::{
     Surface as ShedSurface, SurfaceBudget,
 };
 pub use thresholds::{
-    ClaimedNotProven, DepthCeilings, FailStaticThreshold, Revocation, RpoRto, ShedBudgetRow, Surge,
-    ThresholdError, Thresholds, THRESHOLDS_FILENAME,
+    ClaimedNotProven, DepthCeilings, DsrDeadline, FailStaticThreshold, Revocation, RpoRto,
+    ShedBudgetRow, Surge, ThresholdError, Thresholds, THRESHOLDS_FILENAME,
 };
 pub use topology::{
     AllowPrincipal, AuditSink, Authorizer, DenyAll, IdorAuditRecord, InjectedIdentity,

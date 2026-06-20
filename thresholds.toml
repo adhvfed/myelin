@@ -32,7 +32,7 @@
 version = 1
 # The date this file's current row set was last asserted against its drills (ISO-8601). Bump
 # (with a [[claimed_not_proven]] or a drill-dated note) on every threshold change.
-as_of = "2026-06-19"
+as_of = "2026-06-20"
 
 # ---------------------------------------------------------------------------------------------
 # [revocation] — N, the deprovision / revocation SLA (the disabled-user blast-radius bound).
@@ -156,6 +156,23 @@ reverse_index_lag_slo_ms = 1000 # the freshness SLO seed (P-ID-12 read-fallback 
 # 50k-member synthetic expand finishes well under this ceiling.
 list_subjects_density_members = 50000 # the pinned density (a 50k-member channel, C8).
 list_subjects_density_budget_ms = 250 # the 50k-density expand budget seed (P-ID-23/M4 re-measure at real density).
+
+# ---------------------------------------------------------------------------------------------
+# [dsr] — the DSR (data-subject-request) deadline thresholds (contract 10.4 / gdpr §4.1 step 6 /
+# the GA-D4 drill). The durable deadline timer (P-GA-21 / P-148) arms a `sleep_until(now +
+# deadline_secs)` on the `myelin-flow` minute-bucket wheel on `dsr_submit`; a nearing-deadline
+# point — `warning_margin_secs` BEFORE the deadline — fires the `dsr_deadline_margin` warning
+# Signal so the statutory deadline is NEVER silently missed (GA-D4: 0 silent misses). The
+# extension-to-3-months-for-complex case re-arms to `extension_total_secs` with a recorded reason.
+#
+# UNITS: seconds (the §2.10 names/units anchor). The numbers are the Art. 12(3) STATUTORY seeds;
+# Phase 6 may WIDEN `warning_margin_secs` (a wider margin = an earlier, safer warning) — it is
+# never tightened toward 0 (that would re-introduce the silent-miss risk).
+# ---------------------------------------------------------------------------------------------
+[dsr]
+deadline_secs = 2592000          # Art. 12(3): 1 month = 30 days.
+warning_margin_secs = 604800     # the nearing-deadline warning fires 7 days (1 week) before the deadline.
+extension_total_secs = 7776000   # Art. 12(3) extension-for-complex: 3 months = 90 days (re-arm w/ recorded reason).
 
 # ---------------------------------------------------------------------------------------------
 # [[shed_budgets]] — the per-surface shed-budget v1 FLOORS (contract 1.11, architecture §7.6).
