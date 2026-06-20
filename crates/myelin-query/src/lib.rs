@@ -53,6 +53,12 @@ pub use matcher::{
     project_envelope, EventMatcher, RelMembership, MAX_SETEXPR_DEPTH, MAX_SETEXPR_NODES,
 };
 
+pub mod signals;
+pub use signals::{
+    define_signal_rule, DedupKey, DedupKeyTpl, DedupWindow, PublishDraft, PublishKind, RuleId,
+    Severity, Signal, SignalEngine, SignalRule, SignalState,
+};
+
 /// The static cost ceiling: the maximum number of AST nodes a [`QueryAst`] may contain. A
 /// predicate exceeding this is **rejected before evaluation** ([`QueryAst::validate`]) — a
 /// crafted matcher can never present an unboundedly large tree to the interpreter. The
