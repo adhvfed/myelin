@@ -1,0 +1,47 @@
+[package]
+name = "myelin-refs-service"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# myelin-refs-service is the Refs SUBSYSTEM / SERVICE crate (REF-P3 → P-120 onward), distinct
+# from the `myelin-refs` GLUE crate (the ArtifactRef value type + the #sub codec, REF-P1).
+# Like the other service/subsystem crates (myelin-identity-service, myelin-gdpr-service,
+# myelin-git) it is a LEAF CONSUMER above the shared glue crates: it depends on the frozen
+# contract surfaces (gdpr/PersonalDataHolder, the substrate holder-registry + residency-pin
+# lint, the refs value type, tenancy partition keys, identity Principal) and NOTHING in the
+# production eleven-crate library DAG (modelled by `myelin-substrate::crate_graph`, architecture
+# 00 §2.9) depends back on it. So `substrate_is_root()` / `identity_is_sink()` in crate_graph.rs
+# are preserved — a subsystem crate is the graph's terminal consumer, OUTSIDE the modelled DAG.
+#
+# WHY a separate crate (and NOT a `myelin-gdpr` dep on the GLUE crate): the `myelin-refs` glue
+# crate is a MODELLED node in the eleven-crate library DAG (`Crate::Refs.deps() = [Tenancy,
+# Identity, Events]`) and MUST NOT depend on -gdpr (it would mutate the modelled DAG + the glue
+# crate's stated invariant). The ledger calls for "the myelin-refs SERVICE crate, not the glue
+# crate" (REF-P3 DELIVERABLE; REF-P5 "In the myelin-refs service crate" for the edge migration);
+# this crate is that home. The edge inverse-index schema (REF-P5), the per-tenant DEK pin
+# (REF-P4), the builder/invalidator consumers (REF-P6/P7), and the real erasure body (REF-P15)
+# all land HERE in M2.
+#
+# At REF-P3 (P-120) this crate carries ONLY: the Refs PersonalDataHolder registration (a STUB
+# surface — no edge index exists yet, so locate/export return empty-but-correct, restrict/erase
+# are no-ops; H12 ReferenceGraph in the §3.2 holder catalog) + the residency-pin CONFIRMATION
+# (the future edge table + R2 cache are (tenant, region)-partitioned, cell-local, no cross-tenant
+# query path — asserted structurally, leaning on the REF-P2 residency-pin + tenant-predicate
+# lints). No edge engine, no migration, no real crypto-shred ship here.
+[dependencies]
+# The GDPR contract surface (contract 10.1 PersonalDataHolder + the receipt/scope types). Refs
+# IMPLEMENTS this as holder H12 — a stub surface now, the real erase in REF-P15.
+myelin-gdpr = { path = "../myelin-gdpr" }
+# The substrate holder-registry (StoreKind/HolderRegistration/HolderRegistry — the auto-register
+# mechanism, contract 1.4) + the H1–H18 holder catalog (StoreClassifier/Holder::H12ReferenceGraph
+# + the completeness assertion) + the residency-pin lint linkage. Refs is a LEAF consumer above it.
+myelin-substrate = { path = "../myelin-substrate" }
+# The Refs GLUE crate (the ArtifactRef value type + the #sub codec) — the value type the edge
+# index + R2 cache will key on; consumed here so the holder names its stores against the real type.
+myelin-refs = { path = "../myelin-refs" }
+# The canonical (tenant, region) partition keys the future edge table + R2 cache are pinned to.
+myelin-tenancy = { path = "../myelin-tenancy" }
+# Principal — the verified subject the holder's locate/erase key on (via SubjectRef).
+myelin-identity = { path = "../myelin-identity" }

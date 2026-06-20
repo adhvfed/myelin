@@ -1985,6 +1985,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "myelin-refs-service"
+version = "0.0.0"
+dependencies = [
+ "myelin-gdpr",
+ "myelin-identity",
+ "myelin-refs",
+ "myelin-substrate",
+ "myelin-tenancy",
+]
+
+[[package]]
 name = "myelin-search"
 version = "0.0.0"
 dependencies = [

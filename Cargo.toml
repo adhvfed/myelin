@@ -57,6 +57,19 @@ members = [
     # depends back on it; substrate_is_root()/identity_is_sink() are preserved. The holder is
     # OPENED + auto-registered by serve in GIT-P8 (M3-G1); no git feature ships at P-063.
     "crates/myelin-git",
+    # The Refs SERVICE/SUBSYSTEM crate (REF-P3 → P-120). Distinct from the `myelin-refs` GLUE
+    # crate (the ArtifactRef value type + #sub codec, a MODELLED node in the eleven-crate library
+    # DAG that MUST NOT depend on -gdpr). Like the other service/subsystem crates
+    # (myelin-identity-service, myelin-gdpr-service, myelin-git) it is a LEAF CONSUMER above the
+    # glue crates: it depends on -gdpr (PersonalDataHolder) / -substrate (the holder registry +
+    # H1–H18 catalog) / -refs (the value type) / -tenancy / -identity, and NOTHING in the
+    # production library DAG depends back on it (so substrate_is_root()/identity_is_sink() in
+    # crate_graph.rs are preserved — a subsystem crate is the graph's terminal consumer, OUTSIDE
+    # the modelled DAG). At REF-P3 it carries ONLY the Refs PersonalDataHolder registration (H12,
+    # a STUB surface — locate/export empty-but-correct, restrict/erase no-ops) + the residency-pin
+    # confirmation. The edge schema (REF-P5), the per-tenant DEK pin (REF-P4), the builder/
+    # invalidator consumers (REF-P6/P7) and the real erasure body (REF-P15) land here in M1/M2.
+    "crates/myelin-refs-service",
     # The storage SUBSTRATE crate (P-ST-01 → P-007): the OLTP tier client (harness pool +
     # (tenant, region) RLS guard), and — in later prompts — the KMS hierarchy + BlobStore
     # impls + backup/restore machinery. Sits below -gdpr/-client and ABOVE -substrate in

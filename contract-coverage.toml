@@ -561,8 +561,15 @@ landing = "P-201"
 [[contract]]
 row = "10.1"
 title = "PersonalDataHolder{locate, export, rectify, restrict, erase}"
+# COVERED by the GDPR-owned holder bodies (P-GA-05) AND — extended at REF-P3 / P-120 — the Refs
+# side: Refs as holder H12 (a STUB surface at M1; locate/export empty-but-correct, restrict/erase
+# no-ops; the real erase = R2-cache purge + Identity pseudonym shred for origin_actor + *.erased
+# tombstoning lands in REF-P15). Each CDC file carries its own provider+consumer pair.
 status = "covered"
-cdc = ["crates/myelin-gdpr-service/tests/cdc_10_1_holder_bodies.rs"]
+cdc = [
+    "crates/myelin-gdpr-service/tests/cdc_10_1_holder_bodies.rs",
+    "crates/myelin-refs-service/tests/cdc_10_1_refs_holder.rs",
+]
 
 [[contract]]
 row = "10.2"
