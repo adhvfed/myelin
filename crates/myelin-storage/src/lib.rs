@@ -404,6 +404,15 @@ pub mod reerase;
 // float cost is unrepresentable). Storage owns the durable ledger correctness; the gate
 // FRONTS agent runs in M2 (P-ST-19 / P-146) and CI runs in M4 (named floors).
 pub mod reserve_settle;
+// Reserve/settle FRONTS agent runs — the live consumer half of 11.7 (P-ST-19 / P-146): the
+// dispatch-fronting gate that now sits in front of every `AgentRuntime` run + every
+// `SCHEDULE_AND_RUN_JOB`. Reserve-at-dispatch → no balance → no run (no in-flight handle is
+// minted); the run executes behind a move-only `InFlightRun` handle whose ONLY exit is
+// settle-on-completion; the gate exposes NO API that interrupts an in-flight run (never
+// interrupt in-flight is structural). Drives the P-ST-16 `CostLedger` (Storage owns the
+// durable ledger correctness). Fills the P-ST-16 floor; the CI-run-fronting M4 follow-on is
+// named. Drill rows AG-D6 (surge sheds over-budget) / AG-D11 (runaway loop stops at the wallet).
+pub mod agent_run_gate;
 // Residency pinning enforced end-to-end (STOR-D5, P-ST-15 / P-102): the per-pool runtime region-pin
 // (closes the oltp/holder M0 floor), the in-process residency WRITE boundary, the per-store region
 // report, and the `myelin storage residency verify <tenant>` admin path. The control plane's
@@ -492,6 +501,9 @@ pub use reerase::{
 pub use reserve_settle::{
     CostEvent, CostLedger, MeteredUnit, MinorUnits, Reservation, ReservationState,
     ReserveError, ReserveSettleSignal, RunId, SettleError, SettleOutcome,
+};
+pub use agent_run_gate::{
+    AgentRunGate, AgentRunGateSignal, DispatchError, InFlightRun, RunKind,
 };
 pub use residency::{
     verify_region_pinning, RegionPinnedStore, RegionPinningAttestation, ResidencyStoreClass,

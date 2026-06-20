@@ -912,11 +912,24 @@ status = "covered"
 # checked integer minor-units (a float cost is unrepresentable). The synthetic-run drill emits a
 # green ReserveSettleSignal (cost_events_per_unit == 1, inflight_interrupt_count == 0). The CDC pair
 # is an agent/CI run-dispatcher fronting every run with the gate (cdc_11_7_reserve_settle.rs).
-# Floors named: the gate FRONTS agent runs in M2 → P-ST-19 (global P-146); it fronts CI runs in M4
-# (a CI-subsystem consumer); the real Postgres-backed durable ledger lands with the OLTP driver
+#
+# P-146 (P-ST-19): the LIVE CONSUMER HALF — the Storage-owned `AgentRunGate` that fronts every
+# `AgentRuntime` run + every `SCHEDULE_AND_RUN_JOB`. Reserve-at-dispatch mints a move-only
+# `InFlightRun` handle (no balance → no handle → the run never starts); the handle's ONLY exit is
+# settle-on-completion; the gate exposes NO API that interrupts an in-flight run (never interrupt
+# in-flight is structural). The CDC pair adds the gate-fronting consumer cases to
+# cdc_11_7_reserve_settle.rs; the AG-D6 (surge sheds over-budget) / AG-D11 (runaway loop stops at
+# the wallet, 0 interrupt) drills emit the dated green AgentRunGateSignal.
+# Floors named: the gate FRONTS agent runs in M2 → DONE (P-146); it fronts CI runs in M4 (a
+# CI-subsystem run-dispatch consumer — the named M4 follow-on); the real `LlmAgentRuntime` brain is
+# designed-not-built (AG-P25); the real Postgres-backed durable ledger lands with the OLTP driver
 # (P-S12) — the arithmetic + invariants are complete + testable now over the same OLTP tier whose
-# real backend (PgStore) is already proven by the infra-stage integration drills.
-cdc = ["crates/myelin-storage/tests/cdc_11_7_reserve_settle.rs"]
+# real backend (PgStore) is already proven by the infra-stage integration drills (no NEW
+# db/object-store/cache/bus trait is touched by P-146, so no new integration drill is owed).
+cdc = [
+    "crates/myelin-storage/tests/cdc_11_7_reserve_settle.rs",
+    "crates/myelin-storage/tests/ag_d6_d11_reserve_refusal_drill.rs",
+]
 
 [[contract]]
 row = "11.8"
