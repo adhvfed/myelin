@@ -12,9 +12,9 @@
 | Path | What it is |
 |---|---|
 | `strok/<name>.strok` | **Source of truth** — one `.strok` per icon. Edit these. |
-| `svg/<name>.svg` | **Shipped artifact** — post-processed inline SVG with `stroke="currentColor"`. The app imports these. |
+| `svg/<name>.svg` | **Shipped artifact** — themeable SVG with `stroke="currentColor"` (native; the app imports these). |
 | `preview/<name>.png` | PNG preview (render-loop output / styleguide swatch). Generated. |
-| `build.sh` | The one build step: render previews + export SVG + swap the `$ink` sentinel → `currentColor`. |
+| `build.sh` | Wraps `strok batch`: exports themeable SVGs (currentColor) + inked PNG previews. |
 | `icons-index.html` | Live contact sheet — renders every shipped SVG, proves `currentColor` inheritance and recolor. |
 
 **SVGs and PNGs are generated. Never hand-edit them — edit the `.strok` and re-run `build.sh`.**
@@ -106,24 +106,33 @@ not illustrations.
 
 ---
 
-## 4. The build step — `$ink` → `currentColor`
+## 4. The build step — native `currentColor` via `strok batch`
 
-`strok` cannot emit `currentColor` (it resolves color tokens to hex and rejects the literal
-`currentColor`). So every icon authors its stroke as a single **sentinel palette token** `$ink` bound to a
-reserved hex used nowhere else:
+Each icon authors its paint as the literal **`currentColor`** in the `defaults` block (the icon
+profile), so the exported SVG inherits the host stylesheet's color and PNG previews substitute a
+concrete ink:
 
 ```
-palette
-  ink #ff00ff        # sentinel — swapped to currentColor at build
+defaults
+  fill none
+  stroke currentColor   # preserved verbatim in exported SVG; --color inks the PNG previews
+  stroke-width 2
+  stroke-linecap round
+  stroke-linejoin round
 ```
 
-`build.sh` is the only non-`strok` step (~2 lines of real work). For every `strok/<name>.strok` it:
+`build.sh` wraps **`strok batch`** (the icon-set export path — requires a `strok` build with `batch`,
+i.e. the currentColor/batch-era binary; rebuild with `cargo install --path strok-cli --force` and
+ensure it's on `PATH`). It:
 
-1. renders `preview/<name>.png`,
-2. exports a raw SVG (sentinel hex still present),
-3. `sed`-swaps `#ff00ff` → `currentColor` and writes `svg/<name>.svg` (the shipped file; `fill="none"`
-   survives untouched),
-4. fails loudly if any sentinel hex leaks into a shipped file.
+1. `strok batch strok --svg --out svg` → `svg/<name>.svg` with `stroke="currentColor"` preserved (the
+   shipped files; no post-processing),
+2. `strok batch strok --png --color '#1a1a1a' --sizes 64 --out preview` → `preview/<name>.png`,
+3. fails loudly if any shipped SVG lacks `currentColor` or contains a baked hex color.
+
+> Historical note: earlier passes used a `$ink` sentinel-hex + `sed` swap because the *installed*
+> binary predated `currentColor` support. That workaround is gone — the sources now use native
+> `currentColor`. See `STROK-FEEDBACK.md`.
 
 **To (re)generate everything:**
 
@@ -132,8 +141,8 @@ cd design-planning/08-design-system/04-icons
 bash build.sh
 ```
 
-It loops over whatever `.strok` files exist (no hardcoded names), skips `_*` includes, and is
-**idempotent** — re-running produces a no-op diff. Requires `strok` on `PATH` and `sed`.
+It renders whatever `.strok` files exist (no hardcoded names) and is **idempotent**. Requires a
+`strok` on `PATH` that supports `batch`.
 
 ---
 
