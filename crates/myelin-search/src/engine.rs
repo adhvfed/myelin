@@ -39,7 +39,9 @@
 //!   upgrade (M5 / **SRCH-P26**); the tuned filter-during-traversal `ef`/branch strategy is
 //!   **SRCH-P11 property / SRCH-P26 strategy** (see [`crate::vector`]).
 //! - **the near-real-time incremental indexer** (the `evt.*` consumer that upserts into these
-//!   shapes) — **SRCH-P06**.
+//!   shapes) — **SRCH-P06** (SHIPPED, [`crate::indexer`]): it calls
+//!   [`TantivyBackend::upsert_stamped`] (stamping `indexed_zookie`/`version` from the event) and
+//!   [`TantivyBackend::restamp_zookie`] (the ACL-state-indexed re-stamp, §4.1 tail) over this engine.
 //! - **the permission-aware query path** (the public `query(ast, viewer, zookie?)` that composes
 //!   `list_objects` into [`AclFilter`] and lowers the frozen `QueryAst`/`SetExpr`) — **SRCH-P08**.
 //! - the per-tenant index DEK **encryption-at-rest of the Tantivy directory** is the layout's
@@ -94,6 +96,10 @@ pub struct IndexDocument {
     /// produced by (§3.3) — carried on every vector so a model swap triggers a re-embed reindex,
     /// never a silent mixed-model index. Required iff `embedding` is `Some`.
     pub model_ref: Option<crate::vector::ModelRef>,
+    /// The analyzer-selection language tag (§3.1) — `Some("en")`/`Some("und")`/… set by the indexer's
+    /// index-time language detection (the SRCH-P12 analyzer chain reads it). `None` for a doc whose
+    /// language is unset. Stored so it round-trips; not a structured facet (it selects the analyzer).
+    pub lang: Option<String>,
 }
 
 impl IndexDocument {
@@ -107,7 +113,14 @@ impl IndexDocument {
             fields: BTreeMap::new(),
             embedding: None,
             model_ref: None,
+            lang: None,
         }
+    }
+
+    /// Set the analyzer-selection language tag (§3.1; the SRCH-P12 analyzer chain reads it).
+    pub fn with_lang(mut self, lang: impl Into<String>) -> IndexDocument {
+        self.lang = Some(lang.into());
+        self
     }
 
     /// Set the explicit ACL pre-filter object (when it differs from `doc_id`, e.g. a sub-artifact
@@ -289,6 +302,25 @@ pub struct TantivyBackend {
     /// `upsert`/`delete`/`merge` drive it in lockstep with the FT/structured shapes, so a vector hit
     /// and a keyword hit with the same `doc_id` are the same document.
     vectors: crate::vector::HnswVectorIndex,
+    /// **The doc-id → (document, staleness-anchor) side map** (SRCH-P06).** Keyed by the SAME
+    /// `doc_id`, this holds the last-upserted [`IndexDocument`] + its `indexed_zookie`/`version`, so
+    /// the ACL-state-indexed re-stamp ([`restamp_zookie`](Self::restamp_zookie)) can advance the
+    /// staleness anchor by a pure re-upsert of the SAME content (a permission change is the same body,
+    /// a new consistency token) — WITHOUT a scored Tantivy query (a doc-id POINT LOOKUP is not a
+    /// permission-scoped search, so it must not ride the `search` path the `search-requires-acl-filter`
+    /// lint guards). The map is derived from the upsert stream (rebuildable by reindex-from-source); it
+    /// is the in-process model of the per-doc metadata the real DEK-sealed segment store carries.
+    doc_meta: BTreeMap<String, DocMeta>,
+}
+
+/// The per-doc metadata side-record (SRCH-P06): the last-upserted document + its staleness anchor,
+/// keyed by `doc_id`. Lets a permission-change re-stamp advance the anchor by a content-identical
+/// re-upsert (no scored search, no body re-fetch — §4.1 tail).
+#[derive(Clone)]
+struct DocMeta {
+    doc: IndexDocument,
+    indexed_zookie: String,
+    version: u64,
 }
 
 /// The Tantivy schema field handles for the co-located shapes (built once at [`TantivyBackend::open`]).
@@ -304,6 +336,16 @@ struct SearchSchema {
     facets: BTreeMap<String, (Field, FieldType)>,
     /// `order_key` — the LexoRank columnar fast-field (`STRING|FAST`, sorted by raw byte order).
     order_key: Field,
+    /// `indexed_zookie` — the consistency token captured at index time (§3.1, the staleness anchor).
+    /// `STRING|STORED|FAST` so it round-trips (the ACL-state-indexed re-stamp + the SRCH-P10 path read
+    /// it). Stamped by [`TantivyBackend::upsert_stamped`] from the event, re-stamped by
+    /// [`TantivyBackend::restamp_zookie`] on a permission change.
+    indexed_zookie: Field,
+    /// `version` — the monotonic projection version (§3.1, the other half of the staleness anchor).
+    /// `INDEXED|STORED|FAST`.
+    version: Field,
+    /// `lang` — the analyzer-selection language tag (§3.1). `STRING|STORED|FAST` so it round-trips.
+    lang: Field,
 }
 
 impl TantivyBackend {
@@ -317,8 +359,18 @@ impl TantivyBackend {
         let mut builder = Schema::builder();
         let doc_id = builder.add_text_field("doc_id", STRING | STORED | FAST);
         let acl_object = builder.add_text_field("acl_object", STRING | FAST);
-        let text = builder.add_text_field("text", TEXT);
+        // `text` is `TEXT|STORED`: the inverted shape (BM25) AND stored so the body round-trips — the
+        // ACL-state-indexed re-stamp ([`restamp_zookie`]) rebuilds the doc from its stored fields
+        // WITHOUT re-fetching the body (a permission change is the same content, a new consistency
+        // token). Storing the analyzable body is consistent with §3.1 (Search holds analyzed text to be
+        // a real holder whose erase is a real purge).
+        let text = builder.add_text_field("text", TEXT | STORED);
         let order_key = builder.add_text_field(ORDER_KEY_FIELD, STRING | FAST);
+        // The staleness anchor (§3.1): indexed_zookie + version, stored so they round-trip (the
+        // ACL-state-indexed re-stamp reads + advances them; the SRCH-P10 consistency path reads them).
+        let indexed_zookie = builder.add_text_field("indexed_zookie", STRING | STORED | FAST);
+        let version = builder.add_u64_field("version", INDEXED | STORED | FAST);
+        let lang = builder.add_text_field("lang", STRING | STORED | FAST);
 
         let mut facet_fields = BTreeMap::new();
         for (name, ty) in facets {
@@ -355,8 +407,12 @@ impl TantivyBackend {
                 text,
                 facets: facet_fields,
                 order_key,
+                indexed_zookie,
+                version,
+                lang,
             },
             vectors: crate::vector::HnswVectorIndex::open(),
+            doc_meta: BTreeMap::new(),
         })
     }
 
@@ -441,8 +497,18 @@ impl TantivyBackend {
     }
 }
 
-impl IndexBackend for TantivyBackend {
-    fn upsert(&mut self, doc: &IndexDocument) -> Result<(), IndexError> {
+impl TantivyBackend {
+    /// **Upsert a document, STAMPING `indexed_zookie` + `version` (§3.1, the staleness anchor).** The
+    /// SRCH-P06 indexer calls this to pin WHEN the doc was indexed (the consistency token from the
+    /// event + the projection version), so the ACL-state-indexed re-stamp + the SRCH-P10 zookie path
+    /// can tell a stale-grant read apart from a fresh one. `upsert` is this with an empty stamp.
+    /// Idempotent on `doc_id` (delete-then-add).
+    pub fn upsert_stamped(
+        &mut self,
+        doc: &IndexDocument,
+        indexed_zookie: &str,
+        version: u64,
+    ) -> Result<(), IndexError> {
         // Idempotent on doc_id: delete-then-add so a re-index replaces, never duplicates.
         let key = Term::from_field_text(self.schema.doc_id, &doc.doc_id);
         self.writer.delete_term(key);
@@ -451,6 +517,11 @@ impl IndexBackend for TantivyBackend {
         td.add_text(self.schema.doc_id, &doc.doc_id);
         td.add_text(self.schema.acl_object, &doc.acl_object);
         td.add_text(self.schema.text, &doc.text);
+        td.add_text(self.schema.indexed_zookie, indexed_zookie);
+        td.add_u64(self.schema.version, version);
+        if let Some(lang) = &doc.lang {
+            td.add_text(self.schema.lang, lang);
+        }
 
         for (name, value) in &doc.fields {
             if name == ORDER_KEY_FIELD {
@@ -492,7 +563,46 @@ impl IndexBackend for TantivyBackend {
                 self.vectors.soft_delete(&doc.doc_id);
             }
         }
+
+        // Record the per-doc staleness anchor + the document in the side map (SRCH-P06) so the
+        // ACL-state-indexed re-stamp can advance the anchor by a content-identical re-upsert WITHOUT a
+        // scored Tantivy query (a doc-id point lookup is not a permission-scoped search).
+        self.doc_meta.insert(
+            doc.doc_id.clone(),
+            DocMeta { doc: doc.clone(), indexed_zookie: indexed_zookie.to_string(), version },
+        );
         Ok(())
+    }
+
+    /// Read the `indexed_zookie` of `doc_id` (the staleness anchor, §3.1) — `None` if the doc is
+    /// absent. The ACL-state-indexed assertion + the SRCH-P10 consistency path read it; a permission
+    /// change advances it ([`restamp_zookie`](Self::restamp_zookie)). A doc-id POINT LOOKUP over the
+    /// side map — NOT a scored search (it is not a permission-scoped query).
+    pub fn indexed_zookie_of(&self, doc_id: &str) -> Option<String> {
+        self.doc_meta.get(doc_id).map(|m| m.indexed_zookie.clone())
+    }
+
+    /// **Re-stamp a doc's `indexed_zookie` (the ACL-state-indexed path, §4.1 tail) WITHOUT re-fetching
+    /// its body.** A permission change advances the staleness anchor (and bumps `version`) so the
+    /// SRCH-P10 consistency path sees a newer projection. Re-upserts the SAME document (the body +
+    /// facets + vector are content-identical) with the new zookie + an incremented version — a doc-id
+    /// point operation, never a scored search. A no-op (idempotent) for an absent doc — a permission
+    /// change on an un-indexed object re-stamps nothing.
+    pub fn restamp_zookie(&mut self, doc_id: &str, new_zookie: &str) {
+        let Some(meta) = self.doc_meta.get(doc_id).cloned() else {
+            return; // un-indexed object → nothing to re-stamp (idempotent no-op).
+        };
+        // Re-upsert the SAME content with the new zookie + bumped version (the staleness anchor
+        // advances monotonically; the body is unchanged — a permission change does not re-embed).
+        let _ = self.upsert_stamped(&meta.doc, new_zookie, meta.version + 1);
+    }
+}
+
+impl IndexBackend for TantivyBackend {
+    fn upsert(&mut self, doc: &IndexDocument) -> Result<(), IndexError> {
+        // `upsert` is `upsert_stamped` with an empty staleness anchor (version 0) — the SRCH-P04
+        // engine-level upsert (the SRCH-P06 indexer calls `upsert_stamped` with the event's stamp).
+        self.upsert_stamped(doc, "", 0)
     }
 
     fn delete(&mut self, doc_id: &str) -> Result<(), IndexError> {
@@ -503,6 +613,8 @@ impl IndexBackend for TantivyBackend {
         // immediately; its bytes are removed on the next `merge` (compact-on-merge). One doc-id
         // space ⇒ deleting the doc deletes its vector too (no orphan embedding).
         self.vectors.soft_delete(doc_id);
+        // Drop the per-doc staleness anchor (SRCH-P06) — a deleted doc has no anchor to re-stamp.
+        self.doc_meta.remove(doc_id);
         Ok(())
     }
 
