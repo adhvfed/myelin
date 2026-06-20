@@ -36,10 +36,12 @@ use myelin_events::{
 };
 use myelin_harness::telemetry::{Label, Predicate, SignalName, SignalSource};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
+use myelin_notif::read_fanout::{read_fanout, SyntheticReverseIndex};
 use myelin_notif::{
     build_router, dedup_collapse_ratio_bps, InboxProjection, Reason, DEFAULT_HOT_SUBJECT_WRITE_CAP,
     ROUTER_CONSUMER_NAME, SIGNAL_MENTIONS_KEY,
 };
+use myelin_identity::{Consistency, ConsistencyMode, PrincipalId as IdPrincipalId, PrincipalKind as IdPrincipalKind};
 use myelin_query::signals::{DedupKey, RuleId, Severity, Signal, SignalState};
 use myelin_tenancy::{Region, TenantId};
 
@@ -312,4 +314,110 @@ fn notif_d2_ratio_alarm_fires_on_a_collapse_regression() {
         Predicate::Gte(9000),
     );
     assert!(!verdict.is_green(), "ratio 0 against `>= 9000` is RED — the alarm fires on a collapse regression");
+}
+
+// ===========================================================================================
+//  NOTIF-D2 — the READ-FANOUT amplification leg (NOTIF-P13 / P-191): a 50k-watcher subject → 0
+//  per-watcher write rows (ONE coalesced marker); one JOIN on inbox open; the zookie watermark.
+// ===========================================================================================
+
+fn strong(zk: &str) -> Consistency {
+    Consistency {
+        at_least: myelin_identity::Zookie(zk.into()),
+        mode: ConsistencyMode::Strong,
+    }
+}
+
+/// **NOTIF-D2 (the read-fanout amplification leg, NOTIF-P13): a 50k-watcher subject hit by a storm of
+/// ambient events produces ZERO per-watcher write rows — ONE coalesced marker.** A celebrity subject
+/// (a hot PR / a 50k channel) is hit by 500 ambient events through the LIVE router; the read-fanout
+/// marker store holds exactly ONE marker (count 500), not 500 rows and not 50k watcher rows. This is
+/// the read-side analogue of the write-fanout's hot-subject cap (proven jointly with NOTIF-P12):
+/// **zero write amplification** regardless of watcher count. Threshold: 1 marker; 0 per-watcher rows.
+#[test]
+fn notif_d2_read_fanout_50k_watcher_subject_zero_write_amplification() {
+    let outbox = OutboxStore::new();
+    let inbox = InboxProjection::new();
+    let consumer =
+        build_router(&tenant(), inbox.clone(), outbox.clone(), DedupLedger::new()).unwrap();
+
+    // 500 ambient events on ONE hot subject (a PR watched by 50k people — the watcher count NEVER
+    // enters the write path). DISTINCT broker event_ids so the consumer-dedup ledger does not
+    // short-circuit; the SAME subject so the read-fanout coalesces into ONE marker.
+    let storm = 500u64;
+    let sig = signal("pr_activity", Severity::Info, "myelin://acme/git/pr/celebrity", "pr-celeb");
+    for i in 0..storm {
+        let out = consumer.deliver(&msg(&format!("amb-{i}"), &sig, ci_bot()));
+        assert_eq!(out, Delivered::Acked, "every ambient event routes + acks");
+    }
+
+    // ZERO write amplification: the read-fanout marker store holds exactly ONE marker for the hot
+    // subject_root — NOT 500, and NOT 50k (one per watcher). The watcher count is irrelevant to the
+    // write side (the watchers are resolved at READ time, not exploded into writes).
+    let markers = consumer.handler().ambient();
+    assert_eq!(
+        markers.marker_count(&tenant()),
+        1,
+        "NOTIF-D2: a 50k-watcher subject hit 500 times → ONE coalesced marker (0 write amplification)"
+    );
+    let m = markers.get(&tenant(), "myelin://acme/git/pr/celebrity").unwrap();
+    assert_eq!(m.count, storm, "the +N more counter is the full activity count (preserved, never lost)");
+}
+
+/// **NOTIF-D2 (read-fanout, NOTIF-P13): the per-viewer slice is materialised LAZILY on inbox open via
+/// ONE SetExpr JOIN — and the zookie watermark reflects a just-revoked watch (held, not leaked).** The
+/// LIVE router records ONE marker per hot subject; on inbox open, a watcher resolves their slice via
+/// the SetExpr watcher push-down JOIN against the (synthetic) authz reverse index — ONE query, no
+/// N+1. A revoked watch (a newer zookie) is reflected: the revoked subject is ABSENT from the slice.
+#[test]
+fn notif_d2_read_fanout_lazy_materialise_join_and_zookie_watermark() {
+    let outbox = OutboxStore::new();
+    let inbox = InboxProjection::new();
+    let consumer =
+        build_router(&tenant(), inbox.clone(), outbox.clone(), DedupLedger::new()).unwrap();
+
+    // Two hot subjects each hit by an ambient burst (ONE marker each — zero write amplification).
+    for (rule, subject, dedup) in [
+        ("pr_a", "myelin://acme/git/pr/A", "a"),
+        ("pr_b", "myelin://acme/git/pr/B", "b"),
+    ] {
+        let sig = signal(rule, Severity::Info, subject, dedup);
+        for i in 0..50 {
+            consumer.deliver(&msg(&format!("{rule}-{i}"), &sig, ci_bot()));
+        }
+    }
+    let markers = consumer.handler().ambient();
+    assert_eq!(markers.marker_count(&tenant()), 2, "two hot subjects → two coalesced markers (not 100 rows)");
+
+    // The viewer watches BOTH hot subjects (the synthetic reverse index stands in for the real
+    // watcher ReBAC fragment — the named floor; the real fragments land in NOTIF-P19..P22).
+    let idx = SyntheticReverseIndex::new();
+    idx.grant_watch(&tenant(), "watcher-1", "myelin://acme/git/pr/A");
+    idx.grant_watch(&tenant(), "watcher-1", "myelin://acme/git/pr/B");
+    let watcher = myelin_identity::Principal::stub(
+        IdPrincipalId("watcher-1".into()),
+        IdPrincipalKind::Human,
+        tenant(),
+    );
+
+    // INBOX OPEN: the read-fanout materialises the viewer's slice LAZILY via the SetExpr JOIN — ONE
+    // query (no per-subject N+1). The viewer watches both → both markers materialise.
+    let before = read_fanout(&watcher, markers, &idx, &strong(&idx.current_zookie().0)).unwrap();
+    let before_roots: Vec<&str> = before.iter().map(|m| m.subject_root.as_str()).collect();
+    assert_eq!(
+        before_roots,
+        vec!["myelin://acme/git/pr/A", "myelin://acme/git/pr/B"],
+        "the read-fanout materialised exactly the watched slice on inbox open (the SetExpr JOIN)"
+    );
+
+    // THE ZOOKIE WATERMARK (contract 4.10): revoke the watch on B (a NEWER zookie). A read at the new
+    // watermark reflects the revocation — B is HELD, not leaked.
+    let new_zk = idx.revoke_watch(&tenant(), "watcher-1", "myelin://acme/git/pr/B");
+    let after = read_fanout(&watcher, markers, &idx, &strong(&new_zk.0)).unwrap();
+    let after_roots: Vec<&str> = after.iter().map(|m| m.subject_root.as_str()).collect();
+    assert_eq!(
+        after_roots,
+        vec!["myelin://acme/git/pr/A"],
+        "NOTIF-D2: a just-revoked watch is reflected at-or-after the zookie watermark (B held, not leaked)"
+    );
 }

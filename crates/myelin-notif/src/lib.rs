@@ -82,6 +82,13 @@ pub mod migrations;
 // default — you cannot silence an on-call page). See [`prefs`].
 pub mod prefs;
 pub mod ranking;
+// Read-fanout for the unbounded ambient set (NOTIF-P13 / P-191 — §3.5): the watchers / 50k-channel
+// members are NOT exploded into writes — ONE coalesced marker is stored per subject_root (zero write
+// amplification) and the viewer's slice is materialised LAZILY on inbox open via the frozen
+// `list_objects(recipient, watch, type) → Filter{set_expr, zookie}` push-down, lowered into a SQL
+// JOIN against the `authz_visible` reverse index over Notif's own subject_root column (one query, no
+// N+1, no post-filter) + the zookie watermark (a just-revoked watch reflected; held, not leaked).
+pub mod read_fanout;
 pub mod read_state;
 pub mod router;
 pub mod schema;
@@ -128,6 +135,11 @@ pub use ranking::{
     band_ceiling, band_floor, base_priority, class_for, rank_and_order, reason_base_class,
     AffinitySource, DeterministicV1, ExplainTrace, NeutralAffinity, RankStrategy, RankedItem,
     PRIORITY_MAX, PRIORITY_MIN,
+};
+pub use read_fanout::{
+    read_fanout, subject_root_col, AmbientMarkerStore, ReadFanoutError, ReadFanoutMarker,
+    RelationalLeaf, ReverseIndexAnswer, RevisionWatermark, SyntheticReverseIndex, WatcherResolvePort,
+    SUBJECT_ROOT_TYPE, WATCHER_RELATION, WATCH_PERMISSION,
 };
 pub use read_state::{
     active_inbox, mark, mark_all_read, snooze, ReadState, ReadStateError,

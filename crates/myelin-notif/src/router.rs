@@ -392,6 +392,13 @@ pub struct SignalRouter {
     /// marker rather than write-amplifying into N rows. A cloneable handle so the whole pool shares
     /// ONE cap truth per subject_root.
     hot_cap: HotSubjectCap,
+    /// **The read-fanout ambient marker store (NOTIF-P13 / §3.5).** The UNBOUNDED ambient set
+    /// (watchers / 50k-channel members) is NOT exploded into per-recipient writes — the router records
+    /// ONE coalesced marker per `subject_root` here, and the viewer's slice is materialised LAZILY on
+    /// inbox open via [`crate::read_fanout::read_fanout`] (the `SetExpr` watcher push-down JOIN + the
+    /// zookie watermark). A 50k-watcher celebrity subject costs ONE marker, never 50k rows (zero write
+    /// amplification). A cloneable handle so the read path + a drill share one truth.
+    ambient: crate::read_fanout::AmbientMarkerStore,
     /// The `'static` whitelist the trait requires. Built once at [`build_router`] from the
     /// per-tenant `sig.<tenant>.` prefix and leaked to `'static` (the binding set is fixed for the
     /// life of the consumer pool; one leak per tenant per process — bounded, never per-event).
@@ -430,6 +437,7 @@ impl SignalRouter {
             minter,
             storm: StormControl::new(),
             hot_cap: HotSubjectCap::new(),
+            ambient: crate::read_fanout::AmbientMarkerStore::new(),
             subjects,
         }
     }
@@ -437,6 +445,15 @@ impl SignalRouter {
     /// The inbox projection this router UPSERTs into (so a drill can read the result).
     pub fn inbox(&self) -> &InboxProjection {
         &self.inbox
+    }
+
+    /// **The read-fanout ambient marker store (NOTIF-P13 / §3.5).** A drill / the inbox-open read
+    /// reads the ONE coalesced marker per watched `subject_root` the router records (zero write
+    /// amplification); the per-viewer slice is materialised lazily via
+    /// [`crate::read_fanout::read_fanout`] (the `SetExpr` watcher push-down JOIN + the zookie
+    /// watermark). Cloneable.
+    pub fn ambient(&self) -> &crate::read_fanout::AmbientMarkerStore {
+        &self.ambient
     }
 
     /// The storm-control stage this router runs between classify and UPSERT (so a drill / a test can
@@ -486,8 +503,26 @@ impl SignalRouter {
         // (the unbounded watcher set is NOTIF-P13); the mention set is the bounded write-fanout leg.
         self.write_fanout(signal_event, &signal)?;
 
+        // (1c) READ-FANOUT for the UNBOUNDED ambient set (NOTIF-P13, §3.5 step-1 AMBIENT). The
+        // watcher set (every watcher of a hot PR, every member of a 50k channel) is NOT exploded into
+        // per-recipient writes — the router records ONE coalesced marker per `subject_root` in the
+        // ambient marker store (zero write amplification, regardless of watcher count). The viewer's
+        // slice is materialised LAZILY on inbox open via `read_fanout` (the `SetExpr` watcher push-down
+        // JOIN + the zookie watermark). The subject's `#sub` fragment is stripped to the root so all
+        // ambient activity on the same thread/PR coalesces into the ONE marker (§3.2.3). A `Watched`
+        // ambient event feeds the marker; the bounded DIRECT mention set (above) feeds per-recipient
+        // rows. (The marker is recorded for EVERY routed Signal: an ambient event on a watched subject
+        // is the read-fanout's input; who WATCHES it is resolved at read time, not here.)
+        self.ambient.record(
+            &signal.tenant,
+            &signal.subject,
+            Reason::Watched,
+            &ArtifactRef(format!("myelin://{}/bus/event/{}", signal_event.tenant.0, signal_event.event_id.0)),
+        );
+
         // (2) Derive the SKELETON ambient inbox row (the real per-reason/per-recipient routing is
-        // NOTIF-P8+; the unbounded ambient watcher read-fanout is the NOTIF-P13 floor).
+        // NOTIF-P8+; the unbounded ambient watcher read-fanout is recorded above — this skeleton row
+        // is the per-rule `psn:watcher:<rule>` digest candidate, kept for the storm-control contract).
         let item = self.derive_item(signal_event, &signal);
         let subject_root = subject_root_of(&item.subject.0);
         self.route_one_candidate(signal_event, item, &subject_root)
