@@ -258,6 +258,31 @@
 //! DPO ratifies; the structural floor ships regardless). **Mutation floor:** none — a documented
 //! canonical artifact, not core logic (NAMED per the prompt TESTS); the one behavioral predicate
 //! ([`posture::reference_is_by_reference`]) is unit-covered.
+//!
+//! ## P-GA-17 (→ P-117) — the structural erasure floor PROVEN on the M1 stores (contract 10.9 §7.1)
+//! [`structural_floor`] PROVES the [`posture`] structural floor (§7.1) **working end-to-end on the
+//! M1 stores** — the three levers, observable THROUGH a faithful M1-store model: **lever 1**
+//! per-subject DEK crypto-shred ([`structural_floor::M1Store::erase_self_authored`] renders
+//! self-authored free-text [`structural_floor::StoredContent::Unrecoverable`]); **lever 2**
+//! pseudonym-map shred ([`structural_floor::shred_pseudonym_identity`] leaves the immutable bytes
+//! holding ONLY the frozen `<pseudonym>@<tenant>.noreply` form, contract 4.8); **lever 3** the
+//! genuinely-new **`restrict` suppression FLAG every M1 holder HONOURS** (the
+//! [`structural_floor::RestrictRegistry`] plus the [`structural_floor::M1Store`] processing ops) —
+//! while restricted, index/agent-read/analyse/notify are
+//! [`structural_floor::Processed::Suppressed`] while storage is RETAINED
+//! ([`structural_floor::M1Store::fetch_stored`] still returns the content), reversible (§4.4). Before
+//! P-117 the holders RECORDED a restrict receipt but no store HONOURED it — the floor was stated,
+//! not proven. The residual (a third-party mention under the AUTHOR's DEK) is classified
+//! ([`structural_floor::classify_residual`] → [`structural_floor::LeverCoverage::RestrictSuppressOnly`])
+//! as `restrict`-suppressed, NEVER crypto-shredded by the subject's key — the documented limit from
+//! P-GA-16 / §7.2. The GATE drill (`tests/ga_d7_m1_restrict_honoured.rs`) observes the floor
+//! end-to-end. **Floor named:** the full restriction-into-derived-stores proof (GA-D7 — the flag into
+//! Search/Refs/Notif/Agents/OLAP) → **M2 P-GA-25 → P-152**; the live store/KMS/Identity bindings are
+//! the same DB/KMS floor every M0/M1 store carries (P-007 / P-S12) — this module composes already-
+//! shipped seams and touches NO new DB/object-store/cache/bus contract (no `--features integration`
+//! leg owed). **Mutation floor (P-GA-17 TESTS):** the [`structural_floor::RestrictRegistry::is_restricted`]
+//! flag, the [`structural_floor::M1Store`] suppression branch, and [`structural_floor::classify_residual`]
+//! are mandatory-core; the `cargo mutants` score is in the commit body.
 
 pub mod audit;
 pub mod datamap;
@@ -268,6 +293,7 @@ pub mod fanout;
 pub mod holders;
 pub mod orchestration;
 pub mod posture;
+pub mod structural_floor;
 pub mod tenant_ops;
 
 pub use audit::{
@@ -306,5 +332,9 @@ pub use orchestration::{
 pub use posture::{
     reference_is_by_reference, restatement_markers, ErasurePosture, LegalStatus, StructuralLever,
     SubsystemReference, CANONICAL_POSTURE, POSTURE_ANCHOR, POSTURE_CONTRACT_ROW,
+};
+pub use structural_floor::{
+    classify_residual, shred_pseudonym_identity, Authorship, LeverCoverage, M1Store, Processed,
+    Processing, RestrictRegistry, ShreddedIdentity, StoredContent,
 };
 pub use tenant_ops::{OffboardingCertificate, TenantDsrError, TenantDsrSurface};

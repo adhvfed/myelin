@@ -646,9 +646,21 @@ status = "covered"
 # by-reference subsystem-section SHAPE (a Git-like reference) — the REAL subsystem-reference
 # consumer (over the real M3/M4 docs) lands in P-GA-28 → P-256/P-257 (Git) and P-GA-29/-31
 # (CI/Issues/Knowledge/Chat), at which point the `references-it-never-restates` architecture
-# assertion fires over the real subsystem docs. The structural-floor PROOF on the M1 stores is
-# P-GA-17 → P-117; the pseudonymous-by-default commit prerequisite is P-GA-18 → P-118.
-cdc = ["crates/myelin-gdpr-service/tests/cdc_10_9_erasure_posture.rs"]
+# assertion fires over the real subsystem docs. The pseudonymous-by-default commit prerequisite is
+# P-GA-18 → P-118.
+#
+# P-117 (GA-17): the structural-floor PROOF on the M1 stores (§7.1, contract 10.9) —
+# myelin-gdpr-service::structural_floor proves the three levers end-to-end on a faithful M1-store
+# model: per-subject DEK crypto-shred (11.4) + pseudonym-map shred (4.8) + the genuinely-new
+# `restrict` suppression FLAG every M1 holder HONOURS (no indexing/agent-use/analytics/notification
+# while RETAINING storage; reversible — §4.4). cdc_10_9_structural_floor.rs carries the
+# `restrict`-honoured-by-M1-holder pair the prompt requires; the residual (third-party mention under
+# the author's DEK) is restrict-suppress-only, never crypto-shredded (the documented limit, §7.2).
+# The full restriction-into-derived-stores proof (GA-D7) is M2 P-GA-25 → P-152.
+cdc = [
+    "crates/myelin-gdpr-service/tests/cdc_10_9_erasure_posture.rs",
+    "crates/myelin-gdpr-service/tests/cdc_10_9_structural_floor.rs",
+]
 
 # ──────────────── §11 Storage — tiers / BlobStore / KMS / reserve-settle / backup-restore ───────
 
