@@ -117,6 +117,7 @@ pub mod erasure_posture;
 pub mod holder;
 pub mod indexer;
 pub mod layout;
+pub mod pipeline;
 pub mod residency;
 pub mod shell;
 pub mod vector;
@@ -143,6 +144,10 @@ pub use holder::{
 pub use layout::{
     derived_state_invariant_holds, srch_p03_floors, LayoutError, PerTenantIndexLayout,
     SrchP03Floor, StatefulComponent,
+};
+pub use pipeline::{
+    query, ListObjectsPort, Page, QueryError, QueryStats, RankedResult, RankedResults, ScopedEngine,
+    READ_PERMISSION,
 };
 pub use residency::{search_store_descriptors, SearchStoreDescriptor};
 pub use shell::{
