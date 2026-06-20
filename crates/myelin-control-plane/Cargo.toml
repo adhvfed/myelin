@@ -61,6 +61,14 @@ hex = { workspace = true }
 # Principal/PrincipalId/PrincipalKind — used only to construct a `SubjectRef` in the DSR-surface
 # test (the control-plane holder's surface is empty by construction). DEV-only.
 myelin-identity = { path = "../myelin-identity" }
+# The GDPR/Audit SERVICE crate — DEV-only, for the contract-10.8 CDC pair + the STOR-D4/STOR-D3-GA-face
+# drills (P-GA-15 / P-115). The control-plane is the ONLY crate that sees BOTH the GDPR erasure ledger
+# (10.8, the PROVIDER — `myelin-gdpr-service`) and Storage's `post_restore_reerase` (11.5, the CONSUMER
+# — `myelin-storage`), so the cross-subsystem seam that wires the ledger into the restore-verify
+# re-erasure pass is proven HERE (it is the cell-orchestration / boot home that drives restores). DEV-only:
+# it is a TEST seam — the production `serve(AppSpec)` wiring is the named boot floor; nothing in the
+# control-plane production DAG depends on the GDPR service (substrate_is_root() preserved).
+myelin-gdpr-service = { path = "../myelin-gdpr-service" }
 # The drill harness (SignalSource/SignalName/Predicate) — the CP-D6 drill emits its dated green
 # artifact through the SAME telemetry the other drills use (observability is part of the pass, EI-01
 # §3). DEV-only — myelin-harness never enters the service production DAG (a test-support crate above

@@ -372,13 +372,36 @@ pub struct FanOutDriver<'a, C: Clock> {
     dsr: &'a DsrOrchestrator<C>,
     /// The legal-hold gate (G4).
     holds: &'a LegalHoldRegistry,
+    /// **The erasure ledger (10.8, P-GA-15) — written on a completed ERASE.** When present, a driven
+    /// erase that completes writes one PII-free [`crate::erasure_ledger::ErasureLedgerEntry`]
+    /// recording the opaque subject + the holders erased + the destroyed key epochs + the cross-seam
+    /// completion offset, so a later restore re-erases the subject from it (Storage's
+    /// `post_restore_reerase`, §4.4 / GD-14). The write is IDEMPOTENT (keyed on the DSR id — a worker
+    /// restart re-driving the same id does NOT duplicate). `None` for the read-only / non-ledgered
+    /// fan-out paths (e.g. the unit drills that prove the fan-out in isolation).
+    ledger: Option<&'a crate::erasure_ledger::ErasureLedger>,
 }
 
 impl<'a, C: Clock> FanOutDriver<'a, C> {
-    /// Build a driver over the DSR spine + the legal-hold gate. The upstream holder orchestrator +
-    /// the durable checklist are passed per-`drive` (they are per-DSR-fan-out state).
+    /// Build a driver over the DSR spine + the legal-hold gate (no erasure ledger — the fan-out runs
+    /// but no completion is recorded into the 10.8 ledger). The upstream holder orchestrator + the
+    /// durable checklist are passed per-`drive` (they are per-DSR-fan-out state).
     pub fn new(dsr: &'a DsrOrchestrator<C>, holds: &'a LegalHoldRegistry) -> FanOutDriver<'a, C> {
-        FanOutDriver { dsr, holds }
+        FanOutDriver { dsr, holds, ledger: None }
+    }
+
+    /// **Build a driver that WRITES the erasure ledger (10.8, P-GA-15) on a completed erase.** A
+    /// driven erase that reaches `Completed` records one PII-free completion entry into `ledger`
+    /// (the opaque subject + holders + destroyed key epochs + the cross-seam completion offset),
+    /// driving Storage's `post_restore_reerase`. This is the constructor the cell-orchestration /
+    /// boot path (`myelin-control-plane`) wires; the ledger then drives the restore-verify gate's
+    /// re-erasure pass. The write is idempotent (a resume does not duplicate).
+    pub fn with_ledger(
+        dsr: &'a DsrOrchestrator<C>,
+        holds: &'a LegalHoldRegistry,
+        ledger: &'a crate::erasure_ledger::ErasureLedger,
+    ) -> FanOutDriver<'a, C> {
+        FanOutDriver { dsr, holds, ledger: Some(ledger) }
     }
 
     /// **Drive a validated DSR's fan-out (§4.1 steps 2–5), data-map-driven + resumable.** The
@@ -481,7 +504,68 @@ impl<'a, C: Clock> FanOutDriver<'a, C> {
             &holder_receipts,
             now,
         );
+
+        // §4.4 step 5 (P-GA-15) — WRITE THE ERASURE LEDGER (10.8) on a completed erase. The PII-free
+        // completion entry (opaque subject + holders erased + destroyed key epochs + the cross-seam
+        // completion offset) DRIVES Storage's `post_restore_reerase`: a later restore re-erases this
+        // subject from the ledger so the restore never resurrects them (§3.2 / GD-14). The write is
+        // IDEMPOTENT (keyed on the DSR id) — a worker restart re-driving the SAME id does NOT
+        // duplicate (the ledger keeps the FIRST completion's offset). The LOAD-BEARING guard is
+        // `state == Completed`: we NEVER record a completion entry for a DSR that did not reach the
+        // verified+sealed terminal (a partial/failed fan-out leaves a resumable checklist, not a
+        // completion). The ledger-present check lives inside [`Self::write_erasure_ledger_entry`].
+        if self.dsr.state_of(id)? == DsrState::Completed {
+            self.write_erasure_ledger_entry(id, &req.scope, &holder_receipts, now);
+        }
+
         Ok(FanOutOutcome::Erased(receipt))
+    }
+
+    /// Write the PII-free [`crate::erasure_ledger::ErasureLedgerEntry`] for a completed erase (10.8)
+    /// — a NO-OP when no ledger is wired ([`FanOutDriver::new`] vs [`FanOutDriver::with_ledger`]).
+    /// The opaque subject token is the pseudonymous `principal_id` (never PII); a tenant offboarding
+    /// records the `"*"` sentinel. The per-holder destroyed key epochs are read off the collected
+    /// receipts (the §4.2 trail). The write is idempotent (keyed on the DSR id).
+    ///
+    /// **FLOOR (documented, EI-01 §1):** the **cross-seam completion offset** is, on this M1 floor,
+    /// the completion timestamp `completed_at_secs` (a monotonic surrogate for the §7.3 WAL cursor —
+    /// the same value Storage's `ErasureRecord.completed_at_offset` carries). The live binding (the
+    /// real WAL offset the DSR completion lands at) is supplied by the cell-orchestration restore
+    /// driver (the P-S12/P-S15 storage floor) when the durable `erasure_ledger` table lands; the
+    /// ledger read shape (`completed_at_offset > pit`) does not change. The timestamp is monotone +
+    /// strictly ordered with the restore PITs in the M1 drills, so the `> pit` selection is exact.
+    fn write_erasure_ledger_entry(
+        &self,
+        id: &DsrId,
+        scope: &EraseScope,
+        holder_receipts: &[HolderReceipt],
+        completed_at_secs: u64,
+    ) {
+        let Some(ledger) = self.ledger else { return };
+        let (subject_token, tenant_token) = match scope {
+            EraseScope::Subject { subject, tenant } => {
+                (subject.principal.principal_id.0.clone(), tenant.0.clone())
+            }
+            EraseScope::Tenant(tenant) => ("*".to_string(), tenant.0.clone()),
+        };
+        let holders_erased: Vec<String> =
+            holder_receipts.iter().map(|hr| hr.holder_id.to_string()).collect();
+        let key_epochs_destroyed: Vec<crate::erasure_ledger::DestroyedKeyEpoch> = holder_receipts
+            .iter()
+            .map(|hr| crate::erasure_ledger::DestroyedKeyEpoch {
+                holder_id: hr.holder_id.to_string(),
+                key_epoch_destroyed: hr.receipt.receipt.key_epoch_destroyed,
+            })
+            .collect();
+        ledger.record_completion(
+            id.clone(),
+            subject_token,
+            tenant_token,
+            holders_erased,
+            key_epochs_destroyed,
+            completed_at_secs, // the cross-seam completion offset (the §7.3 cursor surrogate — see floor).
+            completed_at_secs,
+        );
     }
 
     /// The §4.1-step-4 fan-out itself (split out so [`Self::drive`] reads as the §4.1 algorithm).
@@ -929,6 +1013,84 @@ mod tests {
     fn scope_token_is_pii_free_tenant_or_tenant_subject() {
         assert_eq!(scope_token(&subject_scope("u1")), "acme/u1");
         assert_eq!(scope_token(&EraseScope::Tenant(t("acme"))), "acme");
+    }
+
+    // ───────────── the erasure-ledger write on completion (P-GA-15, 10.8) ─────────────
+
+    /// **A completed ERASE writes a PII-free erasure-ledger entry (10.8) — and a RESUME does not
+    /// duplicate it.** The `with_ledger` driver records the opaque subject + holders + destroyed key
+    /// epochs + the cross-seam completion offset; a second drive (a worker restart) re-affirms the
+    /// SAME completion with NO duplicate entry (the idempotent ledger write). This is the §4.4 step-5
+    /// write that drives Storage's `post_restore_reerase`.
+    #[test]
+    fn a_completed_erase_writes_the_erasure_ledger_idempotently() {
+        use crate::erasure_ledger::ErasureLedger;
+
+        let tenant = t("acme");
+        let kms = kms_with_all_holder_keys(&tenant, 600);
+        let holders = seam_holders(&kms);
+        let upstream = UpstreamHolderOrchestrator::register_m1_upstream(
+            holders.iter().map(|(id, h)| (*id, h as &dyn PersonalDataHolder)).collect(),
+        );
+        let dsr = DsrOrchestrator::new(TestClock::at(1_700_000_000));
+        let holds = LegalHoldRegistry::new();
+        let ledger = ErasureLedger::new();
+        let driver = FanOutDriver::with_ledger(&dsr, &holds, &ledger);
+
+        let id = submit_validated_erase(&dsr, "u-ledger");
+        let checklist = EraseChecklist::new();
+        let outcome = driver.drive(&id, &inventory(), &upstream, &checklist).unwrap();
+        assert!(matches!(outcome, FanOutOutcome::Erased(_)));
+        assert_eq!(dsr.state_of(&id).unwrap(), DsrState::Completed);
+
+        // The ledger recorded ONE PII-free entry for the completion.
+        assert_eq!(ledger.len(), 1, "the completion wrote one ledger entry");
+        let entry = ledger.entry(&id).unwrap();
+        assert_eq!(entry.subject_token, "u-ledger", "the opaque subject token (principal_id), never PII");
+        assert_eq!(entry.tenant_token, "acme");
+        // every driven holder is recorded with its destroyed key epoch (the §4.2 trail).
+        assert_eq!(entry.holders_erased.len(), 6, "all six driven holders recorded");
+        assert!(entry.erased_holder(holder_ids::IDENTITY));
+        for ke in &entry.key_epochs_destroyed {
+            assert!(ke.key_epoch_destroyed.is_some(), "each holder's destroyed key epoch is recorded");
+        }
+        // the completion offset drives re-erasure: a restore to BEFORE it re-erases this subject.
+        assert_eq!(entry.completed_at_offset, 1_700_000_000);
+        let post_pit = ledger.post_pit_records_after(1_699_999_999);
+        assert_eq!(post_pit.len(), 1, "a restore before the completion re-erases this subject");
+        assert_eq!(post_pit[0].subject, "u-ledger");
+        // a restore AFTER the completion does not re-erase (already dead in that backup).
+        assert!(ledger.post_pit_records_after(1_700_000_000).is_empty());
+
+        // A RESUME (a worker restart re-driving the SAME id over the durable checklist) does NOT
+        // duplicate the ledger entry (idempotent write).
+        let driver2 = FanOutDriver::with_ledger(&dsr, &holds, &ledger);
+        driver2.drive(&id, &inventory(), &upstream, &checklist).unwrap();
+        assert_eq!(ledger.len(), 1, "a resume does NOT duplicate the ledger entry");
+    }
+
+    /// **A DEFERRED erase (under a legal hold) writes NO ledger entry** (the erasure did not complete,
+    /// so there is nothing to re-erase). The ledger records only COMPLETED erasures.
+    #[test]
+    fn a_deferred_erase_writes_no_ledger_entry() {
+        use crate::erasure_ledger::ErasureLedger;
+
+        let tenant = t("acme");
+        let kms = kms_with_all_holder_keys(&tenant, 700);
+        let holders = seam_holders(&kms);
+        let upstream = UpstreamHolderOrchestrator::register_m1_upstream(
+            holders.iter().map(|(id, h)| (*id, h as &dyn PersonalDataHolder)).collect(),
+        );
+        let dsr = DsrOrchestrator::new(TestClock::at(0));
+        let holds = LegalHoldRegistry::new();
+        holds.set(HoldScope::Subject { tenant: "acme".into(), subject: "u-held".into() }, true);
+        let ledger = ErasureLedger::new();
+        let driver = FanOutDriver::with_ledger(&dsr, &holds, &ledger);
+
+        let id = submit_validated_erase(&dsr, "u-held");
+        let outcome = driver.drive(&id, &inventory(), &upstream, &EraseChecklist::new()).unwrap();
+        assert!(matches!(outcome, FanOutOutcome::DeferredUnderHold(_)));
+        assert!(ledger.is_empty(), "a deferred erase writes NO ledger entry (it did not complete)");
     }
 
     /// The telemetry signal name + unit are pinned (the `legal_hold_active_count` SLO, contract 1.8).

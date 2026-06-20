@@ -1854,6 +1854,7 @@ dependencies = [
  "blake3",
  "hex",
  "myelin-gdpr",
+ "myelin-gdpr-service",
  "myelin-harness",
  "myelin-identity",
  "myelin-storage",
