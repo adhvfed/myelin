@@ -117,6 +117,7 @@ pub mod holder;
 pub mod layout;
 pub mod residency;
 pub mod shell;
+pub mod vector;
 
 pub use dek::{srch_p03_inherited_gates, hyok_skips_index, InheritedGate, SearchDekPin};
 pub use engine::{
@@ -135,6 +136,7 @@ pub use residency::{search_store_descriptors, SearchStoreDescriptor};
 pub use shell::{
     boot_search, run_search, search_app_spec, SEARCH_INDEX_DIR_MIGRATION, SERVICE_NAME,
 };
+pub use vector::{Embedding, HnswVectorIndex, ModelRef, VectorHit, VectorRecord};
 
 /// The frozen field-NAME of the Search index document's `doc_id` — the
 /// [`ArtifactRef`](myelin_events::ArtifactRef) key (architecture §3.1; contract 5.1). This is

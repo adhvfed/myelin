@@ -26,8 +26,18 @@
 //!   lowering + the `list_objects` conjoin is the query-path follow-on (SRCH-P08); here the filter is
 //!   the **doc-id set membership clause** the architecture names ([`AclFilter`]).
 //!
+//! ## SRCH-P05 (P-168) extended this engine in place — the vector HNSW shape
+//! The **vector HNSW shape** ([`crate::vector`]) is the THIRD co-located sub-index, added behind
+//! THIS `IndexBackend` trait (SRCH-P05): [`IndexDocument`] now carries an optional
+//! `embedding`/`model_ref`, [`TantivyBackend`] holds a co-located [`crate::vector::HnswVectorIndex`]
+//! driven in lockstep by `upsert`/`delete`/`merge` (one doc-id space, no separate vector store,
+//! §3.2), and [`IndexBackend::semantic`] is the ACL-filtered (filter-during-traversal) k-NN entry.
+//! `merge` compacts the vector shape too (soft-delete-then-compact, 0 orphan embedding, §3.3).
+//!
 //! ## FLOOR named (the follow-ons that make this answer a real user query)
-//! - **the vector HNSW shape** co-located in the same index space — **SRCH-P05**.
+//! - the vector HNSW shape is HERE now (SRCH-P05); **IVF-PQ** is its per-cell memory-pressure
+//!   upgrade (M5 / **SRCH-P26**); the tuned filter-during-traversal `ef`/branch strategy is
+//!   **SRCH-P11 property / SRCH-P26 strategy** (see [`crate::vector`]).
 //! - **the near-real-time incremental indexer** (the `evt.*` consumer that upserts into these
 //!   shapes) — **SRCH-P06**.
 //! - **the permission-aware query path** (the public `query(ast, viewer, zookie?)` that composes
@@ -57,7 +67,10 @@ use tantivy::{Index, IndexWriter, TantivyDocument, Term};
 /// inverted shape) + the typed structured `fields` (the structured/columnar shape). The `acl_object`
 /// is stored explicitly as the cheap pre-filter key (§3.1) the ACL clause pins on; `order_key`, when
 /// present, is the columnar fast-field for sort.
-#[derive(Clone, Debug, PartialEq, Eq)]
+// NOTE: `Eq` is intentionally NOT derived — the optional vector [`embedding`](IndexDocument::embedding)
+// is a `Vec<f32>`, and `f32` is not `Eq` (NaN). `PartialEq` is enough for the round-trip assertions;
+// the doc is keyed by `doc_id` everywhere it matters.
+#[derive(Clone, Debug, PartialEq)]
 pub struct IndexDocument {
     /// The primary key — the `ArtifactRef` key string (§3.1; contract 5.1). One `doc_id` keys the
     /// whole co-located document.
@@ -72,6 +85,15 @@ pub struct IndexDocument {
     /// value typed **byte-identically over the frozen [`FieldType`]** (contract 13.3). Includes the
     /// `order_key` columnar fast-field when the doc participates in an ordered collection.
     pub fields: BTreeMap<String, FieldValue>,
+    /// The optional **vector embedding** (the **vector HNSW shape**, SRCH-P05 / §3.3) for THIS
+    /// `doc_id` — co-located in the SAME index space (§3.2), keyed by the same `doc_id`. `None` for
+    /// a doc with no embedding (a model swap re-embeds; the embedding adapter is the indexer's
+    /// SRCH-P06 concern). When `Some`, [`model_ref`](IndexDocument::model_ref) MUST also be set.
+    pub embedding: Option<crate::vector::Embedding>,
+    /// The [`ModelRef`](crate::vector::ModelRef) the [`embedding`](IndexDocument::embedding) was
+    /// produced by (§3.3) — carried on every vector so a model swap triggers a re-embed reindex,
+    /// never a silent mixed-model index. Required iff `embedding` is `Some`.
+    pub model_ref: Option<crate::vector::ModelRef>,
 }
 
 impl IndexDocument {
@@ -83,6 +105,8 @@ impl IndexDocument {
             doc_id,
             text: text.into(),
             fields: BTreeMap::new(),
+            embedding: None,
+            model_ref: None,
         }
     }
 
@@ -97,6 +121,19 @@ impl IndexDocument {
     /// [`FieldType`] (the byte-identical frozen taxonomy).
     pub fn with_field(mut self, name: impl Into<String>, value: FieldValue) -> IndexDocument {
         self.fields.insert(name.into(), value);
+        self
+    }
+
+    /// Attach a **vector embedding + its `model_ref`** (the vector HNSW shape, §3.3) to THIS doc —
+    /// co-located in the one doc-id space (§3.2). The `model_ref` is carried so a model swap is a
+    /// re-embed reindex, never a silent mixed-model index.
+    pub fn with_embedding(
+        mut self,
+        embedding: crate::vector::Embedding,
+        model_ref: impl Into<crate::vector::ModelRef>,
+    ) -> IndexDocument {
+        self.embedding = Some(embedding);
+        self.model_ref = Some(model_ref.into());
         self
     }
 
@@ -214,9 +251,23 @@ pub trait IndexBackend {
         limit: usize,
     ) -> Result<Vec<Hit>, IndexError>;
 
+    /// **Semantic (vector) k-NN over the co-located HNSW shape** (SRCH-P05 / §3.3 / §4.5), keyed by
+    /// the SAME `doc_id` as the FT/structured shapes (§3.2 — no separate store). `acl_filter` is
+    /// conjoined **during traversal** (filter-during-traversal, the SRCH-P11 building block): the
+    /// top-`k` are k *visible* neighbours, never k neighbours then filtered. `None` short-circuits to
+    /// empty. Returns the visible nearest doc-ids by cosine similarity. A doc with no embedding never
+    /// surfaces here (it only has the FT/structured shapes).
+    fn semantic(
+        &self,
+        acl_filter: &AclFilter,
+        query: &crate::vector::Embedding,
+        k: usize,
+    ) -> Result<Vec<crate::vector::VectorHit>, IndexError>;
+
     /// Force a **merge** of the index segments (the compaction the soft-delete-then-compact erasure
-    /// path rides, §3.3; here for the two non-vector shapes). After merge, deleted docs are gone
-    /// from the segment files.
+    /// path rides, §3.3; this compacts BOTH the Tantivy segments AND the co-located vector HNSW
+    /// shape — a soft-deleted vector's bytes are gone after merge, 0 orphan embedding). After merge,
+    /// deleted docs are gone from the segment files.
     fn merge(&mut self) -> Result<(), IndexError>;
 
     /// Take a **snapshot** — flush all in-flight writes so the committed index reflects every
@@ -233,6 +284,11 @@ pub struct TantivyBackend {
     index: Index,
     writer: IndexWriter,
     schema: SearchSchema,
+    /// The **co-located vector HNSW shape** (SRCH-P05, §3.3) — the THIRD sub-index in the SAME
+    /// per-tenant index space, keyed by the SAME `doc_id` (§3.2). There is NO separate vector store:
+    /// `upsert`/`delete`/`merge` drive it in lockstep with the FT/structured shapes, so a vector hit
+    /// and a keyword hit with the same `doc_id` are the same document.
+    vectors: crate::vector::HnswVectorIndex,
 }
 
 /// The Tantivy schema field handles for the co-located shapes (built once at [`TantivyBackend::open`]).
@@ -300,7 +356,15 @@ impl TantivyBackend {
                 facets: facet_fields,
                 order_key,
             },
+            vectors: crate::vector::HnswVectorIndex::open(),
         })
+    }
+
+    /// Borrow the co-located vector HNSW shape (the SRCH-P05 shape) for direct inspection (the
+    /// segment-seal / model-ref / orphan-embedding observability the erase/reindex paths read). The
+    /// shape is keyed by the SAME `doc_id` as the FT/structured shapes (§3.2).
+    pub fn vectors(&self) -> &crate::vector::HnswVectorIndex {
+        &self.vectors
     }
 
     /// Map a [`FieldValue`] onto its Tantivy column value and add it to the document under `field`.
@@ -406,6 +470,28 @@ impl IndexBackend for TantivyBackend {
 
         self.writer.add_document(td)?;
         self.writer.commit()?;
+
+        // The co-located VECTOR shape (§3.2): upsert the embedding under the SAME doc_id when the
+        // doc carries one; otherwise ensure no stale vector survives for this doc_id (a re-index that
+        // dropped the embedding must remove the old vector — one doc-id space, no orphan).
+        match (&doc.embedding, &doc.model_ref) {
+            (Some(embedding), Some(model_ref)) => {
+                self.vectors.upsert(crate::vector::VectorRecord {
+                    doc_id: doc.doc_id.clone(),
+                    embedding: embedding.clone(),
+                    model_ref: model_ref.clone(),
+                })?;
+            }
+            (Some(_), None) => {
+                return Err(IndexError::Engine(
+                    "an embedding requires a model_ref (a vector must pin its model — §3.3)".into(),
+                ));
+            }
+            (None, _) => {
+                // No embedding on this revision ⇒ soft-delete any prior vector for this doc_id.
+                self.vectors.soft_delete(&doc.doc_id);
+            }
+        }
         Ok(())
     }
 
@@ -413,6 +499,10 @@ impl IndexBackend for TantivyBackend {
         let key = Term::from_field_text(self.schema.doc_id, doc_id);
         self.writer.delete_term(key);
         self.writer.commit()?;
+        // The co-located vector shape: SOFT-DELETE the embedding (§3.3) — it stops surfacing
+        // immediately; its bytes are removed on the next `merge` (compact-on-merge). One doc-id
+        // space ⇒ deleting the doc deletes its vector too (no orphan embedding).
+        self.vectors.soft_delete(doc_id);
         Ok(())
     }
 
@@ -522,7 +612,38 @@ impl IndexBackend for TantivyBackend {
         Ok(hits)
     }
 
+    fn semantic(
+        &self,
+        acl_filter: &AclFilter,
+        query: &crate::vector::Embedding,
+        k: usize,
+    ) -> Result<Vec<crate::vector::VectorHit>, IndexError> {
+        // The ACL pre-filter (§4.2.1): None / empty-allow-set short-circuit to empty BEFORE any
+        // traversal — no hidden vector can surface even as the nearest neighbour.
+        let hits = match acl_filter {
+            AclFilter::None => Vec::new(),
+            // Admin: every live vector is visible — k-NN over the whole HNSW shape.
+            AclFilter::All => self.vectors.knn(query, k),
+            AclFilter::Ids(ids) if ids.is_empty() => Vec::new(),
+            AclFilter::Ids(ids) => {
+                // FILTER-DURING-TRAVERSAL (§4.5 / SRCH-P11 building block): a candidate enters the
+                // result set ONLY if its doc_id is in the allow-set, so the top-k are k VISIBLE
+                // neighbours. The allow-set is by `doc_id` (the one-doc-id-space key) — the SAME key
+                // the FT/structured ACL clause pins on.
+                let allow: std::collections::HashSet<&str> =
+                    ids.iter().map(String::as_str).collect();
+                self.vectors
+                    .knn_filtered(query, k, |doc_id| allow.contains(doc_id))
+            }
+        };
+        Ok(hits)
+    }
+
     fn merge(&mut self) -> Result<(), IndexError> {
+        // Compact-on-merge the co-located VECTOR shape FIRST (§3.3): physically remove every
+        // tombstoned (soft-deleted) embedding — 0 orphan embedding survives the merge (the
+        // erasure-critical property; embeddings are personal data).
+        self.vectors.compact();
         // Commit any pending writes, then merge all segments (the compaction the erasure path
         // rides). Collect the live segment ids and merge them into one.
         self.writer.commit()?;
@@ -793,6 +914,146 @@ mod tests {
         let wrong = IndexDocument::new("d", "x")
             .with_field(ORDER_KEY_FIELD, FieldValue::Text("not-a-key".into()));
         assert_eq!(wrong.order_key(), None, "a wrongly-typed order_key facet is None");
+    }
+
+    /// **The vector HNSW shape round-trips behind the trait: upsert an EMBEDDED doc → semantic k-NN
+    /// → soft-delete (via `delete`) → compact (via `merge`) leaves 0 orphan embedding (the SRCH-P05
+    /// GATE).** The vector is co-located under the SAME `doc_id` as the FT/structured shapes.
+    #[test]
+    fn vector_shape_round_trips_through_the_trait() {
+        use crate::vector::Embedding;
+        let mut be = TantivyBackend::open(&facet_decl()).expect("open");
+        let k = OrderKey::bisect(None, None);
+        let embed = |id: &str, v: Vec<f32>| {
+            doc(id, "body", "open", 1, &k).with_embedding(Embedding::new(v), "text-embed@1")
+        };
+        be.upsert(&embed("acme/doc/A", vec![1.0, 0.0, 0.0])).expect("upsert A");
+        be.upsert(&embed("acme/doc/B", vec![0.0, 1.0, 0.0])).expect("upsert B");
+        be.upsert(&embed("acme/doc/C", vec![0.9, 0.1, 0.0])).expect("upsert C");
+
+        // Semantic k-NN near A returns A (and C), ACL-filtered to the allow-set.
+        let acl_filter = AclFilter::ids(["acme/doc/A", "acme/doc/B", "acme/doc/C"]);
+        let hits = be.semantic(&acl_filter, &Embedding::new(vec![1.0, 0.05, 0.0]), 2).expect("semantic");
+        assert_eq!(hits.len(), 2);
+        let ids: std::collections::BTreeSet<&str> = hits.iter().map(|h| h.doc_id.as_str()).collect();
+        assert!(ids.contains("acme/doc/A") && ids.contains("acme/doc/C"), "A and C nearest: {ids:?}");
+        // Every hit carries its model_ref (§3.3).
+        assert!(hits.iter().all(|h| h.model_ref == crate::vector::ModelRef("text-embed@1".into())));
+
+        // Delete B (soft-delete the vector); it is gone from results immediately, bytes present.
+        be.delete("acme/doc/B").expect("delete B");
+        assert!(be.vectors().has_orphan_embedding(), "B's vector tombstoned but physically present");
+        let bhit = be.semantic(&acl_filter, &Embedding::new(vec![0.0, 1.0, 0.0]), 3).expect("semantic");
+        assert!(!bhit.iter().any(|h| h.doc_id == "acme/doc/B"), "the deleted vector never surfaces");
+
+        // Merge compacts the vector shape: 0 orphan embedding.
+        be.merge().expect("merge compacts vectors");
+        assert!(!be.vectors().has_orphan_embedding(), "0 orphan embedding after merge (the GATE)");
+        assert_eq!(be.vectors().live_len(), 2, "A and C survive");
+    }
+
+    /// **The ACL pre-filter holds for the vector shape: `None` short-circuits, an allow-set
+    /// filter-during-traversal returns only visible vectors — even the NEAREST hidden one never
+    /// surfaces (no count/rank leak through the vector path, SRCH-D1 vector half property).**
+    #[test]
+    fn semantic_acl_pre_filters_no_leak() {
+        use crate::vector::Embedding;
+        let mut be = TantivyBackend::open(&facet_decl()).expect("open");
+        let k = OrderKey::bisect(None, None);
+        let embed = |id: &str, v: Vec<f32>| {
+            doc(id, "body", "open", 1, &k).with_embedding(Embedding::new(v), "m@1")
+        };
+        be.upsert(&embed("secret", vec![1.0, 0.0])).expect("u");
+        be.upsert(&embed("visible", vec![0.8, 0.2])).expect("u");
+
+        // None ⇒ empty even though `secret` is the nearest.
+        assert!(be.semantic(&AclFilter::None, &Embedding::new(vec![1.0, 0.0]), 5).unwrap().is_empty());
+
+        // The allow-set excludes `secret`: only `visible` surfaces (the nearest hidden vector never
+        // enters the candidate set).
+        let acl_filter = AclFilter::ids(["visible"]);
+        let hits = be.semantic(&acl_filter, &Embedding::new(vec![1.0, 0.0]), 5).expect("semantic");
+        let ids: Vec<&str> = hits.iter().map(|h| h.doc_id.as_str()).collect();
+        assert_eq!(ids, vec!["visible"], "only the visible vector; the secret never surfaces");
+    }
+
+    /// **THE ONE-DOC-ID-SPACE FUSION PROPERTY (the SRCH-P05 GATE): a hybrid query fuses results that
+    /// share ONE `doc_id` across the FT / structured / vector shapes — there is NO separate vector
+    /// store.** The SAME `doc_id` that surfaces from a keyword search ALSO surfaces from the vector
+    /// search; the RRF fusion ranking is SRCH-P11, but the structural property (one key space) is
+    /// proven here: a doc indexed once is reachable by all three shapes under one key.
+    #[test]
+    fn hybrid_query_fuses_on_one_doc_id_space() {
+        use crate::vector::Embedding;
+        let mut be = TantivyBackend::open(&facet_decl()).expect("open");
+        let k = OrderKey::bisect(None, None);
+        // ONE upsert per doc carries all three shapes (FT text + structured facets + the vector) —
+        // there is no separate vector store; the doc_id is the single key.
+        be.upsert(
+            &doc("acme/page/42", "distributed consensus and raft", "open", 5, &k)
+                .with_embedding(Embedding::new(vec![1.0, 0.0, 0.0]), "m@1"),
+        )
+        .expect("upsert the tri-shape doc");
+        be.upsert(
+            &doc("acme/page/99", "frontend css layout", "closed", 2, &k)
+                .with_embedding(Embedding::new(vec![0.0, 1.0, 0.0]), "m@1"),
+        )
+        .expect("upsert the other doc");
+
+        let acl_filter = AclFilter::ids(["acme/page/42", "acme/page/99"]);
+
+        // The FT shape surfaces page/42 by keyword.
+        let ft = be.search(&acl_filter, "raft", 10).expect("ft");
+        assert_eq!(ft.iter().map(|h| h.doc_id.as_str()).collect::<Vec<_>>(), vec!["acme/page/42"]);
+
+        // The structured shape surfaces page/42 by facet.
+        let st = be
+            .search_structured(&acl_filter, "status", &FieldValue::Select("open".into()), 10)
+            .expect("structured");
+        assert_eq!(st.iter().map(|h| h.doc_id.as_str()).collect::<Vec<_>>(), vec!["acme/page/42"]);
+
+        // The vector shape surfaces THE SAME page/42 by semantic neighbourhood.
+        let ve = be.semantic(&acl_filter, &Embedding::new(vec![0.95, 0.05, 0.0]), 1).expect("semantic");
+        assert_eq!(ve.iter().map(|h| h.doc_id.as_str()).collect::<Vec<_>>(), vec!["acme/page/42"]);
+
+        // THE FUSION PROPERTY: the doc_id from the keyword hit == the doc_id from the vector hit ==
+        // the doc_id from the structured hit. One key, three shapes, no separate store.
+        assert_eq!(ft[0].doc_id, ve[0].doc_id, "keyword and vector hits share one doc_id");
+        assert_eq!(ft[0].doc_id, st[0].doc_id, "and the structured hit too — one doc-id space (§3.2)");
+    }
+
+    /// **A re-index that DROPS the embedding removes the old vector (no orphan in the one doc-id
+    /// space).** Upsert with a vector, then re-upsert the same doc_id WITHOUT one ⇒ the vector is
+    /// soft-deleted (it no longer surfaces).
+    #[test]
+    fn reindex_dropping_embedding_removes_the_vector() {
+        use crate::vector::Embedding;
+        let mut be = TantivyBackend::open(&facet_decl()).expect("open");
+        let k = OrderKey::bisect(None, None);
+        be.upsert(&doc("d", "body", "open", 1, &k).with_embedding(Embedding::new(vec![1.0, 0.0]), "m@1"))
+            .expect("upsert with vector");
+        let acl_filter = AclFilter::ids(["d"]);
+        assert_eq!(be.semantic(&acl_filter, &Embedding::new(vec![1.0, 0.0]), 1).unwrap().len(), 1);
+
+        // Re-index the same doc_id without an embedding ⇒ the vector is removed (one doc-id space).
+        be.upsert(&doc("d", "body", "open", 1, &k)).expect("re-upsert without vector");
+        assert!(
+            be.semantic(&acl_filter, &Embedding::new(vec![1.0, 0.0]), 1).unwrap().is_empty(),
+            "the dropped embedding leaves no orphan vector"
+        );
+    }
+
+    /// **An embedding without a model_ref is rejected (a vector MUST pin its model — §3.3).** Built
+    /// by hand (the `with_embedding` helper always pairs them; this guards the trait's own invariant).
+    #[test]
+    fn embedding_without_model_ref_is_rejected() {
+        use crate::vector::Embedding;
+        let mut be = TantivyBackend::open(&facet_decl()).expect("open");
+        let mut d = IndexDocument::new("d", "body");
+        d.embedding = Some(Embedding::new(vec![1.0, 0.0]));
+        d.model_ref = None; // an embedding with no model_ref
+        let err = be.upsert(&d).expect_err("must reject");
+        assert!(matches!(err, IndexError::Engine(_)), "loud rejection: a vector needs a model_ref");
     }
 
     /// **The `IndexError` Display message is non-empty and names the engine error (the loud, never
