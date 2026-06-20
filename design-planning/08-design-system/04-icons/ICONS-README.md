@@ -164,9 +164,9 @@ It renders whatever `.strok` files exist (no hardcoded names) and is **idempoten
 
 ## 6. Adding a new icon
 
-1. `strok new strok/<name>.strok 24x24`, then paste the shared header (`documentsize 24x24` + the
-   `defaults` block: `fill none`, `stroke $ink`, `stroke-width 2`, `stroke-linecap round`,
-   `stroke-linejoin round`) + `palette { ink #ff00ff }`. Copy an existing icon as a template.
+1. `strok new strok/<name>.strok --profile icon` (seeds `documentsize 24x24` + the `defaults` block:
+   `fill none`, `stroke currentColor`, `stroke-width 2`, round caps/joins). Or copy an existing icon
+   as a template. No palette/sentinel — paint is the literal `currentColor`.
 2. Use **kebab-case, meaning-named, subsystem-agnostic** filenames (`pull-request`, not `pr-header-icon`).
    The filename is the contract key — add the row to the §2 registry too.
 3. Build geometry **inside the 2,2 → 22,22 live area**. Reuse the family vocabulary (⌀6 node, ⌀4 dot, the
