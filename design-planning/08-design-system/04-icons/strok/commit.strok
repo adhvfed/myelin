@@ -8,12 +8,12 @@ defaults
 palette
   ink #ff00ff
 shape line template=path
-  addpoint a at=12,3
+  addpoint a at=12,4
   addpoint b at=12,9
 place l1 shape=line at=0,0
 shape line2 template=path
   addpoint a at=12,15
-  addpoint b at=12,21
+  addpoint b at=12,20
 place l2 shape=line2 at=0,0
 shape node template=ellipse
-place n1 shape=node at=8,8 size=8x8
+place n1 shape=node at=9,9 size=6x6
