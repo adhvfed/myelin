@@ -69,6 +69,15 @@ use serde::{Deserialize, Serialize};
 // fixtures under `tests/fixtures/` (which the lint-gate excludes by the `/fixtures/` convention).
 pub mod cli;
 pub mod define_rule;
+// Escalation on the durable wheel (NOTIF-P14 / P-192 — §2.4/§3.7, contract 7.5): `page(target,
+// reason)` starts an escalation DURABLE WORKFLOW walking the FROZEN chain shape (page →
+// oncall_now → notify(class=critical, pierces quiet-hours) → escalate-after-timer(ack_window) →
+// if !acked next-step / if acked stop). Notif owns POLICY (chain-walk, target resolution at fire
+// time, the pierce); the durability is the `myelin-flow` durable timer wheel + signal (9.3/9.4,
+// seamed behind [`escalation::DurableWheel`] — the real engine is P-FLOW-09/P-FLOW-13). Ack is an
+// EVENT (`notif.escalation.acked` via the outbox) the signal-wait resolves on; on-call cannot be
+// silenced. NOTIF-D7 (exactly-once page across a kill mid-ack_window) + NOTIF-D8 (critical pierces).
+pub mod escalation;
 pub mod holder;
 // The ONE platform templating surface (NOTIF-P9 / P-187 — contract 7.3): `humanise` + the
 // `humanise_template` store + the per-viewer resolve seam + the ONE myelin-content render path +
@@ -110,6 +119,11 @@ pub use cli::{
 pub use define_rule::{
     define_notif_rule, platform_default_reason, platform_default_rules, Classification, DedupTpl,
     DefineRuleError, NotifRule, NotifRuleRegistry,
+};
+pub use escalation::{
+    notify_for, oncall_now, render_oncall, render_page, DurableWheel, EscalationEngine,
+    EscalationError, EscalationPolicy, EscalationRun, EscalationStep, EscalationTarget,
+    InMemoryWheel, OncallSchedule, PageOutcome, RotationWindow, RunState, ESCALATION_REASON,
 };
 pub use holder::{
     notif_history_holder, notif_store_classifier, register_notif_holder, NotifBacking,
