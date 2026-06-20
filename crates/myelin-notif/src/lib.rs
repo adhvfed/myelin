@@ -76,12 +76,20 @@ pub mod holder;
 pub mod humanise;
 pub mod list_inbox;
 pub mod migrations;
+// prefs / quiet-hours over the frozen QueryAst (NOTIF-P10 / P-188 — contract 7.4): get_prefs /
+// set_prefs, the per-channel matcher (the frozen `myelin-query` QueryAst — Notif invents no second
+// predicate language), quiet-hours in the recipient tz, and `pierce_classes` (critical pierces by
+// default — you cannot silence an on-call page). See [`prefs`].
+pub mod prefs;
 pub mod ranking;
 pub mod read_state;
 pub mod router;
 pub mod schema;
 
-pub use cli::{inbox_list, inbox_read, inbox_show, inbox_snooze, CliView, InboxShow};
+pub use cli::{
+    inbox_list, inbox_read, inbox_show, inbox_snooze, notify_prefs, notify_prefs_set, notify_test,
+    render_prefs, CliView, InboxShow,
+};
 pub use define_rule::{
     define_notif_rule, platform_default_reason, platform_default_rules, Classification, DedupTpl,
     DefineRuleError, NotifRule, NotifRuleRegistry,
@@ -100,6 +108,11 @@ pub use humanise::{
 pub use list_inbox::{
     list_inbox, list_inbox_ranked, subsystem_of, AllowAllAuthorize, Cursor, InboxFilter, InboxPage,
     Page, RankedPage, ReadAuthorizePort, Subsystem,
+};
+pub use prefs::{
+    build_routing_matcher, get_prefs, route, route_context, set_prefs, Channel as PrefChannel,
+    DigestConfig, NotifPrefs, PrefStore, PrefView, QuietHours, QuietWindow, RoutingRule, Tz,
+    PREFS_MAX_PREDICATE_DEPTH, PREFS_MAX_PREDICATE_NODES,
 };
 pub use ranking::{
     band_ceiling, band_floor, base_priority, class_for, rank_and_order, reason_base_class,
