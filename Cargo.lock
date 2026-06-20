@@ -1964,6 +1964,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "myelin-issues"
+version = "0.0.0"
+dependencies = [
+ "myelin-events",
+ "myelin-gdpr",
+ "myelin-identity",
+ "myelin-identity-service",
+ "myelin-storage",
+ "myelin-tenancy",
+ "serde",
+]
+
+[[package]]
 name = "myelin-lints"
 version = "0.0.0"
 

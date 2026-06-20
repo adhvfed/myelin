@@ -1,0 +1,32 @@
+// GREEN fixture for `no-untagged-personal-data` — the ISSUES-relevant slice (ISS-P01 / P-125).
+// The lint MUST admit this. Every PII-carrying field of the issue rows carries its canonical
+// six-tag #[personal_data(...)] classification (architecture issue-tracker §6.1 / 03 §7):
+// the author identity is an opaque pseudonym (erasure = Pseudonymise, contract 4.8), the comment
+// body is encrypted under the per-subject DEK (erasure = CryptoShred, contract 11.4), and the OQ-H
+// worklog/productivity field is the behavioural tag (category = Behavioural, basis = TBD_LEGAL — the
+// [OPEN — LEGAL] residual R-2 — restricted-by-default), so the crypto-shred erase + the RoPA/data-map
+// fan-out reach every personal field. The non-PII columns (tenant/region partition keys, opaque ids)
+// need no tag.
+pub struct IssueComment {
+    pub tenant: TenantId,
+    pub region: Region,
+    pub comment_id: u128,
+    #[personal_data(
+        category = Identifier,
+        role = TenantContent,
+        basis = Contract,
+        retention = UntilContractEnd,
+        erasure = Pseudonymise,
+        subject_locator = "author_pseudonym",
+    )]
+    pub author_pseudonym: String,
+    #[personal_data(
+        category = Content,
+        role = TenantContent,
+        basis = Contract,
+        retention = TenantPolicy,
+        erasure = CryptoShred(subject_dek),
+        subject_locator = "author_pseudonym",
+    )]
+    pub comment_text: Vec<u8>,
+}
