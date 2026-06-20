@@ -94,7 +94,8 @@ use std::collections::HashMap;
 
 /// **A firehose scope — the BOUNDED selector that bounds which frames a subscription receives
 /// (§4.3, contract 3.5).** Scope is a bounded selector, **never `*`**: `board:<id>` / `doc:<id>` /
-/// `channel:<id>`. The transport REJECTS an unbounded/over-broad scope at `subscribe`/`resume` (the
+/// `channel:<id>` / `inbox:<id>` (Notif's own-inbox slice, §7 / C4). The transport REJECTS an
+/// unbounded/over-broad scope at `subscribe`/`resume` (the
 /// whitelist-not-`*` rule, BUS-3, generalised to the firehose). A huge board paginates its scope to
 /// the visible window + a margin (the windowing itself is the connection tier's / the substrate
 /// `ScopeWindow`'s job; here the protocol enforces that the scope NAMES a single bounded resource).
@@ -114,8 +115,19 @@ pub struct FirehoseScope {
     id: String,
 }
 
-/// The three bounded scope kinds the firehose admits (§4.3: `board:`/`doc:`/`channel:`). There is
-/// deliberately **no `All`/`*` variant** — the type cannot represent an unbounded subscription.
+/// The bounded scope kinds the firehose admits (§4.3: `board:`/`doc:`/`channel:`/`inbox:`). There
+/// is deliberately **no `All`/`*` variant** — the type cannot represent an unbounded subscription.
+///
+/// **Coherence (EI-01 §7 — the scope grammar is ONE set, extended in place not forked).** The OQ-J
+/// protocol froze the resume-cursor `subscribe`/`resume`/`scope` *behaviour* and co-designed the
+/// scope discipline once for the three storm surfaces named at the time (board / doc / channel). The
+/// scope *kind set* is the bounded-selector whitelist, and it grows by ADMITTING a new bounded
+/// resource kind — never by forking a second transport. Notif's `inbox watch` (architecture
+/// `notifications.md` §7 / contract 3.5 C4) names a FOURTH bounded scope, `inbox:<principal>` (one
+/// principal's own inbox slice, never `*`), and rides this SAME protocol — "there is no bespoke
+/// Notif live transport" (§7). So `Inbox` is added here, to the one scope grammar, rather than
+/// Notif inventing its own validator: the `*`-rejection, the per-`(stream, scope)` monotone seq, the
+/// `(last_seq, now]` backfill, and the `resync_required` fallback all apply to `inbox:` identically.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ScopeKind {
     /// A board (Issues huge-board) — paginated to the visible window + margin (the 50k-row case).
@@ -124,15 +136,19 @@ pub enum ScopeKind {
     Doc,
     /// A channel (Chat hot-channel) — live delivery + presence on one channel.
     Channel,
+    /// One principal's inbox slice (Notif `inbox watch`, §7 / contract 3.5 C4) — a BOUNDED selector
+    /// `inbox:<principal>`; a client gets only its own inbox's live frames, never the tenant firehose.
+    Inbox,
 }
 
 impl ScopeKind {
-    /// The selector prefix (`board` / `doc` / `channel`) — the wire form before the `:`.
+    /// The selector prefix (`board` / `doc` / `channel` / `inbox`) — the wire form before the `:`.
     pub fn prefix(self) -> &'static str {
         match self {
             ScopeKind::Board => "board",
             ScopeKind::Doc => "doc",
             ScopeKind::Channel => "channel",
+            ScopeKind::Inbox => "inbox",
         }
     }
 }
@@ -176,10 +192,11 @@ impl FirehoseScope {
             "board" => ScopeKind::Board,
             "doc" => ScopeKind::Doc,
             "channel" => ScopeKind::Channel,
+            "inbox" => ScopeKind::Inbox,
             _ => {
                 return Err(FirehoseError::OverBroadScope {
                     scope: raw.to_string(),
-                    why: "unknown scope kind (only board:/doc:/channel:)",
+                    why: "unknown scope kind (only board:/doc:/channel:/inbox:)",
                 })
             }
         };
@@ -973,6 +990,24 @@ mod tests {
         for raw in ["board:42", "doc:design", "channel:eng", "board:proj-1_x"] {
             let s = FirehoseScope::parse(raw).unwrap_or_else(|_| panic!("`{raw}` must parse"));
             assert_eq!(s.selector(), raw, "a bounded scope round-trips its selector string");
+        }
+    }
+
+    /// **`inbox:<principal>` is admitted as a fourth BOUNDED scope (§7 / contract 3.5 C4).** Notif's
+    /// `inbox watch` rides the SAME protocol; `inbox:<principal>` parses to [`ScopeKind::Inbox`] and
+    /// round-trips, while `inbox:*` / a bare `inbox:` are STILL rejected as over-broad — the
+    /// `*`-rejection generalises to the new kind exactly as for board/doc/channel.
+    #[test]
+    fn inbox_scope_is_a_bounded_kind_and_unbounded_inbox_is_rejected() {
+        let s = FirehoseScope::parse("inbox:p-opaque-1").expect("a bounded inbox scope parses");
+        assert_eq!(s.kind(), ScopeKind::Inbox, "inbox: parses to the Inbox kind");
+        assert_eq!(s.id(), "p-opaque-1", "the principal id is the bounded resource id");
+        assert_eq!(s.selector(), "inbox:p-opaque-1", "the inbox scope round-trips its selector");
+        // the *-rejection generalises to inbox: an unbounded inbox scope is STILL rejected.
+        for raw in ["inbox:*", "inbox:", "inbox"] {
+            let r = FirehoseScope::parse(raw);
+            assert!(r.is_err(), "unbounded/empty inbox scope `{raw}` must be rejected, got {r:?}");
+            assert!(r.unwrap_err().is_over_broad_scope(), "`{raw}` is an over-broad-scope rejection");
         }
     }
 

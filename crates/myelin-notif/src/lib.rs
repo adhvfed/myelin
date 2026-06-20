@@ -111,10 +111,18 @@ pub mod storm_control;
 // materialises one inbox_item per mentioned recipient, bounded by the hot-subject cap so a
 // mention-storm cannot write-amplify. The read-fanout for the unbounded ambient set is NOTIF-P13.
 pub mod write_fanout;
+// The `inbox watch` live transport (NOTIF-P15 / P-193 — §7, contract 3.5 C4): inbox watch rides the
+// FROZEN firehose resume-cursor protocol (`subscribe`/`resume`/`scope`, consumed from
+// `myelin_events::Firehose` — NO bespoke Notif transport). `inbox watch` opens a BOUNDED
+// `inbox:<principal>` scope (never `*`); a reconnect backfills `(last_seq, now]` then live (ZERO
+// items lost, the D-N11 drill); an over-old cursor → `resync_required` → a full `list_inbox` cold
+// rebuild (NAMED, not silent). The wire mechanism is the connection tier's (a named floor). See
+// [`watch`].
+pub mod watch;
 
 pub use cli::{
-    inbox_list, inbox_read, inbox_show, inbox_snooze, notify_prefs, notify_prefs_set, notify_test,
-    render_prefs, CliView, InboxShow,
+    inbox_list, inbox_read, inbox_show, inbox_snooze, inbox_watch, notify_prefs, notify_prefs_set,
+    notify_test, render_prefs, render_watch, CliView, InboxShow, WatchView,
 };
 pub use define_rule::{
     define_notif_rule, platform_default_reason, platform_default_rules, Classification, DedupTpl,
@@ -168,6 +176,10 @@ pub use storm_control::{
 };
 pub use write_fanout::{
     extract_mentions, CapVerdict, HotSubjectCap, DEFAULT_HOT_SUBJECT_WRITE_CAP,
+};
+pub use watch::{
+    cold_rebuild, cold_rebuild_item_ids, inbox_scope, inbox_stream, publish_inbox_frame, watch_open,
+    watch_resume, InboxFrame, InboxWatch, WatchOutcome,
 };
 
 /// The service name (a PII-free label, the telemetry / trace / deployable identifier). The

@@ -30,7 +30,15 @@
 //!   renders the structured refs/tokens (the read surface, not the humanised render).
 //! - **The durable snooze re-surface TIMER** (the `myelin-flow` wheel that flips a due snooze back to
 //!   the active inbox) is **NOTIF-P14 / NOTIF-P18**; `inbox snooze` records the until only.
-//! - **watch** (`myelin inbox watch`) is NOTIF-P15.
+//!
+//! ## What this ships (inbox watch added at NOTIF-P15 / P-193)
+//! - [`inbox_watch`] — `myelin inbox watch [--from <seq>]`: stream new items live over the FROZEN
+//!   firehose resume-cursor protocol (§7). Opens (or resumes from `<seq>`) a watch on the BOUNDED
+//!   `inbox:<principal>` scope; drains the ready frames as PII-free `WATCH <seq> <item_id>` lines; an
+//!   over-old cursor surfaces as the NAMED `resync_required` → fall back to `myelin inbox list`. The
+//!   wire mechanism (long-poll/SSE/WebSocket) is the connection tier's (a named floor). No bespoke
+//!   Notif transport — it consumes [`watch_open`](crate::watch::watch_open) /
+//!   [`watch_resume`](crate::watch::watch_resume).
 
 use myelin_identity::{Consistency, Principal};
 
@@ -40,7 +48,9 @@ use crate::prefs::{
 };
 use crate::read_state::{mark, snooze, ReadState, ReadStateError};
 use crate::router::{InboxProjection, RoutedInboxItem};
+use crate::watch::{watch_open, watch_resume, InboxFrame, WatchOutcome};
 use crate::{Class, NotifPrefs, Reason};
+use myelin_events::firehose::Firehose;
 
 /// **The named scoped view a `myelin inbox list --view <name>` selects** (the C-9 §1.3 surfaces).
 /// Each maps to a frozen [`InboxFilter`] — a filter over the ONE inbox, never a second store.
@@ -153,6 +163,72 @@ pub fn inbox_snooze(
     until: &str,
 ) -> Result<(), ReadStateError> {
     snooze(inbox, principal, item_id, until)
+}
+
+/// **`myelin inbox watch` — stream new items live over the resume-cursor path (NOTIF-P15 / P-193).**
+/// A thin seam over the FROZEN firehose resume-cursor protocol ([`watch_open`] / [`watch_resume`],
+/// §7) — there is NO bespoke Notif live transport. Opens (or, with `last_seq`, RESUMES) a watch on
+/// the BOUNDED `inbox:<principal>` scope and drains the currently-ready frames into PII-free
+/// `WATCH <seq> <item_id>` lines (a frame carries ONLY the `item_id` pointer — refs-not-payloads;
+/// the humanised render is a per-viewer READ, NOTIF-P9). On reconnect with an over-old `last_seq` the
+/// transport returns `resync_required`; this surfaces it as the NAMED cold-rebuild signal so the
+/// caller falls back to a full `myelin inbox list` (the §7 cold rebuild — never a silent gap).
+///
+/// **FLOOR (named):** the WIRE mechanism (long-poll vs SSE vs WebSocket — the long-lived connection
+/// that keeps pulling) is the CONNECTION TIER's, NOT Notif's (§7); this library entry drains the
+/// frames ready at call time over the in-process protocol. The real streaming connection is Chat M4.
+pub fn inbox_watch(
+    firehose: &mut Firehose,
+    principal: &Principal,
+    cursor: Option<u64>,
+) -> WatchView {
+    let outcome = match cursor {
+        None => watch_open(firehose, principal),
+        Some(last_seq) => watch_resume(firehose, principal, last_seq),
+    };
+    match outcome {
+        // a real principal always makes a bounded scope, so an Err here is a transport fault, not a
+        // user input error — surface it as a resync (the safe, NAMED recovery), never a silent drop.
+        Err(_) => WatchView::ResyncRequired,
+        Ok(WatchOutcome::ResyncRequired { .. }) => WatchView::ResyncRequired,
+        Ok(WatchOutcome::Live(watch)) => {
+            let frames = watch.drain();
+            WatchView::Live { last_seq: watch.last_seq(), frames }
+        }
+    }
+}
+
+/// **The presentation view of `myelin inbox watch`.** Either the live frames drained at call time
+/// (with the resume cursor to present on the next reconnect) OR the NAMED `resync_required`
+/// cold-rebuild signal (the client falls back to `myelin inbox list`). PII-free.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WatchView {
+    /// The watch is live: the frames ready now + the resume cursor (the `last_seq` to reconnect with).
+    Live {
+        /// The resume cursor — the last delivered seq (present on the next reconnect).
+        last_seq: u64,
+        /// The frames drained at call time (refs-not-payloads `item_id` pointers).
+        frames: Vec<InboxFrame>,
+    },
+    /// The cursor was over-old — the client must fall back to a full `myelin inbox list` cold rebuild
+    /// (the §7 cold-rebuild path, NAMED not silent).
+    ResyncRequired,
+}
+
+/// Render a [`WatchView`] as PII-free lines (`WATCH <seq> <item_id>`; or the resync directive).
+pub fn render_watch(view: &WatchView) -> String {
+    match view {
+        WatchView::ResyncRequired => {
+            "RESYNC_REQUIRED cursor too old — run `myelin inbox list` to cold-rebuild".to_string()
+        }
+        WatchView::Live { last_seq, frames } => {
+            let mut out = format!("WATCHING cursor={last_seq}\n");
+            for f in frames {
+                out.push_str(&format!("WATCH {} {}\n", f.seq, f.item_id));
+            }
+            out
+        }
+    }
 }
 
 // ===========================================================================================
@@ -456,5 +532,45 @@ mod tests {
         assert!(out.contains("iss-1  [assigned/direct]  myelin://acme/issue/issue/PROJ-1  (unread)"));
         // the subject is a ref, never a title — there is no humanised string in the CLI output.
         assert!(out.contains("myelin://acme/git/pr/9"));
+    }
+
+    /// **`myelin inbox watch` streams live frames + reports the resume cursor (NOTIF-P15).** Opening a
+    /// watch then publishing two frames yields the two `WATCH <seq> <item_id>` lines (refs-not-payloads)
+    /// and advances the cursor.
+    #[test]
+    fn inbox_watch_streams_live_frames_pii_free() {
+        let mut fh = myelin_events::firehose::Firehose::new();
+        let me = principal("u1");
+        // open a live watch, then two items arrive.
+        let _open = inbox_watch(&mut fh, &me, None);
+        crate::watch::publish_inbox_frame(&mut fh, &me, "itm-1").unwrap();
+        crate::watch::publish_inbox_frame(&mut fh, &me, "itm-2").unwrap();
+        // a no-cursor `watch` opens a FRESH live view (the prior handle dropped); to see the two
+        // frames we resume from 0 (the connection-tier holds the live handle — here we drive a poll).
+        let view = inbox_watch(&mut fh, &me, Some(0));
+        let out = render_watch(&view);
+        assert!(out.contains("WATCH 1 itm-1"), "the first live frame renders as a pii-free pointer line");
+        assert!(out.contains("WATCH 2 itm-2"), "the second live frame renders");
+        // the cursor advanced to the head.
+        if let WatchView::Live { last_seq, .. } = view {
+            assert_eq!(last_seq, 2, "the resume cursor is the last delivered seq");
+        } else {
+            panic!("expected a live watch");
+        }
+    }
+
+    /// **An over-old cursor surfaces as the NAMED resync directive (NOTIF-P15).** With a tiny window,
+    /// a stale cursor cannot backfill → `inbox watch` returns the resync view (fall back to `list`),
+    /// never a silent partial replay.
+    #[test]
+    fn inbox_watch_over_old_cursor_directs_a_cold_rebuild() {
+        let mut fh = myelin_events::firehose::Firehose::with_limits(2, 1024);
+        let me = principal("u1");
+        for i in 1..=5 {
+            crate::watch::publish_inbox_frame(&mut fh, &me, &format!("itm-{i}")).unwrap();
+        }
+        let view = inbox_watch(&mut fh, &me, Some(1)); // op 2 evicted → resync
+        assert_eq!(view, WatchView::ResyncRequired);
+        assert!(render_watch(&view).contains("RESYNC_REQUIRED"), "the resync directive is surfaced, NAMED");
     }
 }
