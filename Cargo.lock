@@ -1823,6 +1823,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "myelin-chat"
+version = "0.0.0"
+dependencies = [
+ "myelin-events",
+ "serde",
+]
+
+[[package]]
 name = "myelin-client"
 version = "0.0.0"
 dependencies = [
