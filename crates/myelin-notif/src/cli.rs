@@ -14,18 +14,28 @@
 //!   subject ref, read-state), for the principal (recipient-scoped + authorized through the SAME
 //!   `list_inbox` path, so `show` can never reveal an item `list` would not).
 //!
+//! ## What this ships (read-state added at NOTIF-P6 / P-184)
+//! - [`inbox_read`] — `myelin inbox read <item_id>`: mark the caller's item read (the ONE
+//!   read-state truth — it is read in every view at once). Recipient-scoped (you can only read your
+//!   own items).
+//! - [`inbox_snooze`] — `myelin inbox snooze <item_id> --until <ts>`: park the item until `<ts>`
+//!   (suppressed from the active inbox; the until recorded). The durable re-surface timer is
+//!   NOTIF-P14/P18 (named floor).
+//!
 //! ## FLOORS named
 //! - **The argv parse + the wired binary** (the actual `myelin` CLI command tree / the gateway
 //!   route) is the driver's (the CLI binary lands with the gateway wiring, P-S15+). Here the CLI is
 //!   the LIBRARY surface a binary calls — keeping `cargo build --workspace` DB-free and the read
 //!   logic unit-testable. The presentation (humanised per-viewer strings) is NOTIF-P9; here the CLI
 //!   renders the structured refs/tokens (the read surface, not the humanised render).
-//! - **read-state mutation** (`myelin inbox read|snooze`) is NOTIF-P6; **watch** (`myelin inbox
-//!   watch`) is NOTIF-P15. This is the read-only `list|show` surface.
+//! - **The durable snooze re-surface TIMER** (the `myelin-flow` wheel that flips a due snooze back to
+//!   the active inbox) is **NOTIF-P14 / NOTIF-P18**; `inbox snooze` records the until only.
+//! - **watch** (`myelin inbox watch`) is NOTIF-P15.
 
 use myelin_identity::{Consistency, Principal};
 
 use crate::list_inbox::{list_inbox, InboxFilter, InboxPage, Page, ReadAuthorizePort};
+use crate::read_state::{mark, snooze, ReadState, ReadStateError};
 use crate::router::{InboxProjection, RoutedInboxItem};
 
 /// **The named scoped view a `myelin inbox list --view <name>` selects** (the C-9 §1.3 surfaces).
@@ -112,6 +122,33 @@ pub fn inbox_show(
         .into_iter()
         .find(|row| row.item_id == item_id)
         .map(InboxShow::from_row)
+}
+
+/// **`myelin inbox read <item_id>` — mark the caller's item read (the ONE read-state truth).** A
+/// thin seam over [`mark`]`(.., ReadState::Read)`: it flips the `state` of the calling principal's
+/// item to `read`, visible in the unified inbox AND every scoped view at once (one store). A row not
+/// addressed to the caller / a missing id is [`ReadStateError::NotFound`] (you can only read your own
+/// items; held, not leaked).
+pub fn inbox_read(
+    inbox: &InboxProjection,
+    principal: &Principal,
+    item_id: &str,
+) -> Result<(), ReadStateError> {
+    mark(inbox, principal, item_id, ReadState::Read)
+}
+
+/// **`myelin inbox snooze <item_id> --until <ts>` — park the caller's item until `<ts>`.** A thin
+/// seam over [`snooze`]: it sets the item to `snoozed` and records the `until`; the item is then
+/// suppressed from the active inbox. A row not addressed to the caller / a missing id is
+/// [`ReadStateError::NotFound`]. **FLOOR:** the durable re-surface timer is NOTIF-P14/P18 — here only
+/// the until is recorded.
+pub fn inbox_snooze(
+    inbox: &InboxProjection,
+    principal: &Principal,
+    item_id: &str,
+    until: &str,
+) -> Result<(), ReadStateError> {
+    snooze(inbox, principal, item_id, until)
 }
 
 /// **One item's structured read-surface detail (`myelin inbox show`).** PII-free: the opaque
@@ -213,6 +250,7 @@ mod tests {
             dedup_key: item_id.into(),
             coalesce_count: 1,
             state: "unread".into(),
+            snooze_until: None,
         }
     }
     fn seeded(me: &str) -> InboxProjection {
@@ -285,6 +323,34 @@ mod tests {
         assert!(inbox_show(&inbox, &principal("u2"), "iss-1", &AllowAllAuthorize, &strong()).is_none(), "not my item → not shown");
         // a missing id is None.
         assert!(inbox_show(&inbox, &principal("u1"), "no-such", &AllowAllAuthorize, &strong()).is_none());
+    }
+
+    /// **`inbox read <id>` marks the caller's item read (the ONE read-state truth), recipient-
+    /// scoped.** After `read`, `show` reports `read`. u2 cannot read u1's item (NotFound).
+    #[test]
+    fn inbox_read_marks_read_recipient_scoped() {
+        let inbox = seeded("u1");
+        inbox_read(&inbox, &principal("u1"), "iss-1").expect("read my own item");
+        let show = inbox_show(&inbox, &principal("u1"), "iss-1", &AllowAllAuthorize, &strong()).unwrap();
+        assert_eq!(show.state, "read", "the item is read after `inbox read`");
+        // u2 cannot read u1's item.
+        assert_eq!(inbox_read(&inbox, &principal("u2"), "iss-1"), Err(crate::read_state::ReadStateError::NotFound));
+        // a missing id is NotFound.
+        assert_eq!(inbox_read(&inbox, &principal("u1"), "no-such"), Err(crate::read_state::ReadStateError::NotFound));
+    }
+
+    /// **`inbox snooze <id> --until <ts>` records the until + parks the item.** After snooze, `show`
+    /// reports `snoozed`; the active inbox no longer contains it.
+    #[test]
+    fn inbox_snooze_records_until_and_parks() {
+        let inbox = seeded("u1");
+        inbox_snooze(&inbox, &principal("u1"), "chat-1", "2026-06-25T09:00:00Z").expect("snooze my own item");
+        let show = inbox_show(&inbox, &principal("u1"), "chat-1", &AllowAllAuthorize, &strong()).unwrap();
+        assert_eq!(show.state, "snoozed", "the item is snoozed after `inbox snooze`");
+        // suppressed from the active inbox.
+        let page = inbox_list(&inbox, &principal("u1"), CliView::All, &Page::default(), &AllowAllAuthorize, &strong());
+        let active = crate::read_state::active_inbox(page.items);
+        assert!(!active.iter().any(|r| r.item_id == "chat-1"), "the snoozed item is absent from the active inbox");
     }
 
     /// **`render_list` renders PII-free lines (item_id + reason/class token + subject ref + state),

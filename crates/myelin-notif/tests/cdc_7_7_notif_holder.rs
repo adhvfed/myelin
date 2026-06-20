@@ -62,6 +62,7 @@ fn row(recipient: &str, subject: &str, actor: &str, dedup_key: &str) -> RoutedIn
         dedup_key: dedup_key.into(),
         coalesce_count: 1,
         state: "unread".into(),
+        snooze_until: None,
     }
 }
 

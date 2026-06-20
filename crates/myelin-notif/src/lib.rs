@@ -43,9 +43,10 @@
 //!   references-not-payloads erase — 0 PII-column mutation on refs-stored items). FLOORS still open:
 //!   the reindex/replay half of 7.7 (NOTIF-P17); the off-cell-payload erasure residual (X-7 / 10.9,
 //!   NOTIF-P27).
-//! - **The contract BODIES** behind every carrier here — `list_inbox` (NOTIF-P5), `mark/snooze`
-//!   (NOTIF-P6), `humanise` (NOTIF-P9), `define_notif_rule` (NOTIF-P8), `DeliveryAdapter`
-//!   delivery fabric (NOTIF-P16). The carriers are SHAPES; the algorithms are the follow-ons.
+//! - **The contract BODIES** behind every carrier here — `list_inbox` (NOTIF-P5, landed),
+//!   `mark/snooze/mark_all_read` (NOTIF-P6, landed — see [`read_state`]), `humanise` (NOTIF-P9),
+//!   `define_notif_rule` (NOTIF-P8), `DeliveryAdapter` delivery fabric (NOTIF-P16). The carriers are
+//!   SHAPES; the algorithms are the follow-ons.
 //!
 //! The shell carries NO mandatory-core algorithm module (it is the boot lifecycle + frozen type
 //! shapes), so there is no mutation-score floor on this prompt — stated explicitly per the
@@ -69,10 +70,11 @@ pub mod cli;
 pub mod holder;
 pub mod list_inbox;
 pub mod migrations;
+pub mod read_state;
 pub mod router;
 pub mod schema;
 
-pub use cli::{inbox_list, inbox_show, CliView, InboxShow};
+pub use cli::{inbox_list, inbox_read, inbox_show, inbox_snooze, CliView, InboxShow};
 pub use holder::{
     notif_history_holder, notif_store_classifier, register_notif_holder, NotifBacking,
     NotifHistoryHolder, NotifHolderRegistration, RestrictSet, NOTIF_OLTP_STORE,
@@ -80,6 +82,9 @@ pub use holder::{
 pub use list_inbox::{
     list_inbox, subsystem_of, AllowAllAuthorize, Cursor, InboxFilter, InboxPage, Page,
     ReadAuthorizePort, Subsystem,
+};
+pub use read_state::{
+    active_inbox, mark, mark_all_read, snooze, ReadState, ReadStateError,
 };
 pub use router::{
     build_router, signal_subject_prefix, InboxProjection, RoutedInboxItem, SignalRouter,
