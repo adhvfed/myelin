@@ -285,6 +285,7 @@
 //! are mandatory-core; the `cargo mutants` score is in the commit body.
 
 pub mod audit;
+pub mod commit_prerequisite;
 pub mod datamap;
 pub mod diffgate;
 pub mod dsr;
@@ -298,6 +299,11 @@ pub mod tenant_ops;
 
 pub use audit::{
     AuditConsumer, AuditEntry, AuditLog, Minimised, Outcome, AUDIT_APPEND_LAG,
+};
+pub use commit_prerequisite::{
+    commit_actor_holds_only_pseudonym, verdict_for, CommitActorVerdict, CommitIdentityPrerequisite,
+    COMMIT_IDENTITY_PREREQUISITE, M3_ENFORCEMENT_PROMPT, PREREQUISITE_CONTRACT_ROW,
+    PREREQUISITE_GRAMMAR, PREREQUISITE_RECORDED_ON,
 };
 pub use datamap::{
     data_map, ropa, ropa_for_tenant, tagged_field_count, HolderSchema, Inventory, InventoryEntry,
