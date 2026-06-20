@@ -146,12 +146,23 @@ pub enum SignalName {
     /// (≤ 4 h) — both read from the thresholds file. Labelled by `{grain}` (`tenant` / `cell`) so
     /// the per-tenant and per-cell objectives are read independently.
     RestoreRtoSecs,
+    /// **Dedup-collapse ratio** — the write-time storm-control collapse effectiveness signal
+    /// (contract 1.8; Notif §3.2, the NOTIF-D2 drill). It is the percentage of inbound Signals
+    /// that COLLAPSED into an existing inbox row rather than opening a new one, scaled to basis
+    /// points (`0..10000`, so a value can be carried as the integer `i64` the predicate reads):
+    /// `10000 * collapsed / inbound`. A storm of `N` near-identical CI failures that collapse to
+    /// ONE row reads `~10000 * (N-1)/N` (≈ 9990 for N=1000) — the higher the ratio, the more the
+    /// storm was absorbed write-time (delivery/ranking suppressed, the audit untouched). The
+    /// NOTIF-D2 drill asserts a high floor (`>= the configured minimum`) so a regression that
+    /// stops collapsing (every Signal opens its own row → ratio 0) fails LOUDLY. Labelled by
+    /// `{consumer}` (the router pool the ratio is measured on). Scaled basis points.
+    DedupCollapseRatio,
 }
 
 impl SignalName {
     /// Every contract-1.8 signal name (for the "the library covers the §10.2 set" test —
     /// observability is part of the pass condition, so the set must be exhaustive).
-    pub const ALL: [SignalName; 21] = [
+    pub const ALL: [SignalName; 22] = [
         SignalName::RequestRate,
         SignalName::RequestErrors,
         SignalName::RequestDuration,
@@ -173,6 +184,7 @@ impl SignalName {
         SignalName::RestoreCrossSeamMismatch,
         SignalName::RestoreRpoSecs,
         SignalName::RestoreRtoSecs,
+        SignalName::DedupCollapseRatio,
     ];
 }
 
@@ -674,6 +686,9 @@ mod tests {
         uniq.sort();
         uniq.dedup();
         assert_eq!(uniq.len(), n, "every contract-1.8 signal name is distinct");
-        assert_eq!(n, 21, "the §10.2 set + the restore-verify triplet is covered exhaustively");
+        assert_eq!(
+            n, 22,
+            "the §10.2 set + the restore-verify triplet + the Notif dedup-collapse-ratio (1.8) is covered exhaustively"
+        );
     }
 }
