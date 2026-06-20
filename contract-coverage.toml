@@ -646,8 +646,17 @@ status = "covered"
 # by-reference subsystem-section SHAPE (a Git-like reference) — the REAL subsystem-reference
 # consumer (over the real M3/M4 docs) lands in P-GA-28 → P-256/P-257 (Git) and P-GA-29/-31
 # (CI/Issues/Knowledge/Chat), at which point the `references-it-never-restates` architecture
-# assertion fires over the real subsystem docs. The pseudonymous-by-default commit prerequisite is
-# P-GA-18 → P-118.
+# assertion fires over the real subsystem docs.
+#
+# P-118 (GA-18): the pseudonymous-by-default commit-identity PREREQUISITE leg of 10.9 — GDPR's ONE
+# critical-path obligation, recorded in M1 as the commit-time prerequisite Git must satisfy in M3,
+# before the Git data model freezes (EI-04 §1; gdpr §7.1.2 GIT-1; VISION §3). Ships
+# myelin-gdpr-service::commit_prerequisite::COMMIT_IDENTITY_PREREQUISITE (the recorded obligation,
+# dated 2026-06-20, expressed in the frozen 4.8 grammar) + commit_actor_holds_only_pseudonym (the
+# architecture-test scaffold: a pseudonym-form commit actor passes, a real-identity form fails).
+# cdc_10_9_commit_prerequisite.rs carries the provider (GDPR records) + consumer (Git-like
+# commit-actor shape) pair. The REAL Git consumer (the scaffold firing over Git's commit codec) lands
+# in P-GA-27 / P-GA-28 → P-256/P-257.
 #
 # P-117 (GA-17): the structural-floor PROOF on the M1 stores (§7.1, contract 10.9) —
 # myelin-gdpr-service::structural_floor proves the three levers end-to-end on a faithful M1-store
@@ -660,6 +669,7 @@ status = "covered"
 cdc = [
     "crates/myelin-gdpr-service/tests/cdc_10_9_erasure_posture.rs",
     "crates/myelin-gdpr-service/tests/cdc_10_9_structural_floor.rs",
+    "crates/myelin-gdpr-service/tests/cdc_10_9_commit_prerequisite.rs",
 ]
 
 # ──────────────── §11 Storage — tiers / BlobStore / KMS / reserve-settle / backup-restore ───────
