@@ -326,6 +326,33 @@
 //! `cargo mutants` score is recorded in the [`retention`] module note + the commit body. **No
 //! `--features integration` leg owed:** the engine is a pure decision + a holder-fan-out driver over
 //! already-shipped in-memory seams — it touches NO new DB / object-store / cache / bus contract.
+//!
+//! ## P-GA-23 (→ P-150) — the consent registry + the sub-processor registry + the `transfer_allowed` gate (contract 10.5)
+//! [`registries`] ships the **consent / sub-processor / transfer-gate legs of 10.5** (§5.2 / §5.3),
+//! the rest of contract 10.5 after the retention leg (P-GA-22): (1) the **consent registry (G5)**
+//! ([`registries::ConsentRegistry`]) — versioned + timestamped + granular + withdrawable +
+//! per-subject-keyed; a withdrawal **propagates** ([`registries::ConsentRegistry::withdraw`] →
+//! [`registries::WithdrawalEffect`]) — it stops the path AND, for a controller-posture consent-only
+//! activity, **may trigger deletion** (carrying the [`myelin_gdpr::EraseScope`] the caller drives the
+//! EXISTING holder fan-out over — no second erase path); (2) the **sub-processor registry (G6)**
+//! ([`registries::SubProcessorRegistry`]) — versioned + region + DPA ref + the change-notification /
+//! **objection workflow** ([`registries::SubProcessorRegistry::object`]); (3) the **`transfer_allowed`
+//! gate** ([`registries::TransferGate::transfer_allowed`]) — **deny extra-EU by default** + admit
+//! within-EU/EEA (the structural boundary is [`registries::is_eea_region`], fail-closed on an unknown
+//! region), the SAME policy the §5.3 outbound push-mirror residency gate reads (the future real-LLM
+//! backend is one such gated, EU-preferring, swappable adapter). It reuses the EXISTING G5 consent
+//! DEK holder ([`holders::GdprOwnStoreHolder`], P-GA-05) — it does NOT re-define the key path. The
+//! green artifact is [`registries::TransferGate::extra_eu_denial_count`] (0 default extra-EU
+//! transfers slip through). **Floors named:** the outbound-mirror gate's POLICY ships here; the Git
+//! mirror SEAM it gates is M3/M4 and the gate is PROVEN end-to-end at **M5 → P-GA-35 (GA-11)**; the
+//! durable Postgres `consent` (G5) / `subprocessor_registry` (G6) tables are the same DB floor every
+//! M0/M1 store carries (P-007 / P-S12 — in-memory model with byte-for-byte §5.2 semantics, a config
+//! wire); the DPA legal-sufficiency ratification is **`[OPEN — LEGAL]`** (engineering carries the
+//! `dpa_ref` + region + objection workflow; counsel ratifies). **Mutation floor (P-GA-23 TESTS — the
+//! `transfer_allowed` deny-by-default + the consent-withdrawal-propagation paths are mandatory-core):**
+//! the `cargo mutants` score is recorded in the [`registries`] module note + the commit body. **No
+//! `--features integration` leg owed:** the registries + the gate are pure in-memory decision models
+//! over already-shipped seams — they touch NO new DB / object-store / cache / bus contract.
 
 pub mod audit;
 pub mod audit_proofs;
@@ -339,6 +366,7 @@ pub mod fanout;
 pub mod holders;
 pub mod orchestration;
 pub mod posture;
+pub mod registries;
 pub mod retention;
 pub mod structural_floor;
 pub mod tenant_ops;
@@ -393,6 +421,11 @@ pub use orchestration::{
 pub use posture::{
     reference_is_by_reference, restatement_markers, ErasurePosture, LegalStatus, StructuralLever,
     SubsystemReference, CANONICAL_POSTURE, POSTURE_ANCHOR, POSTURE_CONTRACT_ROW,
+};
+pub use registries::{
+    is_eea_region, ConsentRecord, ConsentRegistry, SubProcessor, SubProcessorRegistry, TransferGate,
+    TransferVerdict, WithdrawalBasis, WithdrawalEffect, CONSENT_WITHDRAWALS, SUBPROCESSOR_OBJECTIONS,
+    TRANSFER_GATE_EXTRA_EU_DENIALS,
 };
 pub use retention::{
     legal_floor, platform_default, tenant_delete_immediately, tenant_window, EffectiveRetention,

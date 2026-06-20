@@ -713,11 +713,24 @@ cdc = [
     "crates/myelin-gdpr-service/tests/cdc_10_4_deadline_timer.rs",
 ]
 
+# 10.5 — the retention engine + consent + sub-processor + legal-hold + the transfer gate. The
+# RETENTION leg (tightest-policy-wins + legal-hold-aware suspend-don't-delete) ships its
+# provider+consumer CDC pair at P-GA-22 → P-149 (`cdc_10_5_retention_engine.rs`: the engine ⇄ a
+# retention caller + a hold caller). The CONSENT / SUB-PROCESSOR / TRANSFER-GATE legs ship NOW at
+# P-GA-23 → P-150 (`cdc_10_5_consent_transfer_gate.rs`: the `transfer_allowed` gate ⇄ a transfer
+# caller — deny extra-EU by default; the consent registry ⇄ a consent caller — withdrawal
+# propagates + may trigger deletion; the sub-processor registry ⇄ a change-notification caller —
+# versioned + region + DPA ref + objection). The §5.3 outbound push-mirror residency gate reads the
+# SAME `transfer_allowed` policy shipped here; its end-to-end proof is M5 P-GA-35 (GA-11). All are
+# real provider+consumer seams, so the row is now `covered`.
 [[contract]]
 row = "10.5"
-title = "retention / consent / sub-processor / legal-hold"
-status = "deferred"
-landing = "P-150"
+title = "retention / consent / sub-processor / legal-hold / transfer gate"
+status = "covered"
+cdc = [
+    "crates/myelin-gdpr-service/tests/cdc_10_5_retention_engine.rs",
+    "crates/myelin-gdpr-service/tests/cdc_10_5_consent_transfer_gate.rs",
+]
 
 # 10.6 — the CONSTRUCTION half (the outbox-only audit consumer + the per-tenant hash-chain +
 # the Merkle leaves + the minimisation) ships its provider+consumer CDC pair (P-GA-19 → P-062).
