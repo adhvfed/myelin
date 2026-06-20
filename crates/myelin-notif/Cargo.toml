@@ -50,6 +50,11 @@ myelin-identity = { path = "../myelin-identity" }
 # ArtifactRef (re-exported) — InboxItem stores refs-not-payloads (NOTIF-1), so erasure
 # tombstones a person's appearance for free (the §3.9/C7 invariant the holder, NOTIF-P4, leans on).
 myelin-refs = { path = "../myelin-refs" }
+# The frozen `mention(Principal)` inline structured node (contract 13.1, X-2/C10). Write-fanout
+# (NOTIF-P12) reads the STRUCTURED node — `InlineNode::Mention(Principal)` — it does NOT parse free
+# text (AG-6: only a structured ref re-triggers). Notif consumes the frozen taxonomy node, never a
+# local re-invention of the mention shape (§3.5).
+myelin-content = { path = "../myelin-content" }
 # The curated Signal type + Severity (myelin_query::signals, P-138 / EB-18). The router (NOTIF-P3)
 # consumes Signals over `sig.<tenant>.>` — it deserializes `Signal` from the envelope payload and
 # UPSERTs an inbox item. The Signal engine lives in myelin-query (the documented EB-18 deviation:

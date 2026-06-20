@@ -29,6 +29,7 @@
 //! The storm-tolerance is the router's, not the test's: [`myelin_notif::StormControl`] runs the five
 //! mechanisms between classify and UPSERT inside [`SignalRouter::handle`].
 
+use myelin_content::InlineNode;
 use myelin_events::{
     Actor, AggregateKey, ArtifactRef, CorrelationId, DataRole, DedupLedger, Delivered,
     EventEnvelope, EventId, EventType, Message, OutboxStore, Timestamp, Visibility,
@@ -36,7 +37,8 @@ use myelin_events::{
 use myelin_harness::telemetry::{Label, Predicate, SignalName, SignalSource};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_notif::{
-    build_router, dedup_collapse_ratio_bps, InboxProjection, ROUTER_CONSUMER_NAME,
+    build_router, dedup_collapse_ratio_bps, InboxProjection, Reason, DEFAULT_HOT_SUBJECT_WRITE_CAP,
+    ROUTER_CONSUMER_NAME, SIGNAL_MENTIONS_KEY,
 };
 use myelin_query::signals::{DedupKey, RuleId, Severity, Signal, SignalState};
 use myelin_tenancy::{Region, TenantId};
@@ -200,6 +202,94 @@ fn notif_d2_30_comment_pr_burst_is_bounded() {
     let row = inbox.get(&tenant(), "psn:watcher:pr_comment", "pr_comment:pr-9").unwrap();
     assert_eq!(row.coalesce_count, 30, "+N more = 30 (the full comment count, bounded into one row)");
     assert_eq!(outbox.committed_count(), 1, "bounded pushes (1, not 30) — the audit (30 Signals) untouched");
+}
+
+/// A `sig.<tenant>.…` envelope carrying the Signal + the STRUCTURED `mention(Principal)` nodes under
+/// the frozen wire key (the dispatch tier stamps them; Notif reads the structured node, never free
+/// text — AG-6). The actor is the CI bot (not a mentioned recipient, so not self-suppressed).
+fn mention_msg(id: &str, sig: &Signal, mentions: &[Principal]) -> Message {
+    let subject = format!("sig.{}.{}.{}", sig.tenant.0, sig.severity.token(), sig.rule_id.0);
+    let nodes: Vec<InlineNode> = mentions.iter().cloned().map(InlineNode::Mention).collect();
+    let mut payload = serde_json::to_value(sig).unwrap();
+    if let serde_json::Value::Object(map) = &mut payload {
+        map.insert(SIGNAL_MENTIONS_KEY.into(), serde_json::to_value(&nodes).unwrap());
+    }
+    Message {
+        subject: subject.clone(),
+        envelope: EventEnvelope {
+            event_id: EventId(id.into()),
+            type_: EventType("signal.opened".into()),
+            schema_ver: 1,
+            tenant: tenant(),
+            region: region(),
+            actor: Actor(ci_bot()),
+            subject: ArtifactRef(subject),
+            aggregate: AggregateKey(format!("signal:{}", sig.dedup_key.0)),
+            causation_id: None,
+            correlation_id: CorrelationId(id.into()),
+            caused_by: None,
+            depth: 0,
+            contains_personal_data: false,
+            data_role: DataRole::Controller,
+            visibility: Visibility::Internal,
+            pii_key_ref: None,
+            occurred_at: Timestamp("2026-06-20T00:00:00Z".into()),
+            recorded_at: Timestamp("2026-06-20T00:00:01Z".into()),
+            payload,
+        },
+    }
+}
+
+/// **NOTIF-D2 (the mention-storm WRITE-FANOUT side, NOTIF-P12): a mention-storm on ONE hot subject is
+/// BOUNDED by the hot-subject cap — at most `cap` mention rows materialise; the rest coalesce. 0
+/// unbounded write amplification.**
+///
+/// A `@here`-style spray of 200 DISTINCT mentioned principals on ONE hot subject_root is driven
+/// through the LIVE router. The hot-subject cap (§3.2.4) bounds the write-amplification: exactly
+/// [`DEFAULT_HOT_SUBJECT_WRITE_CAP`] (64) DISTINCT mention rows materialise; the other 136 overflow
+/// into the coalesced "+N more were mentioned" marker (counted, never lost). This is the write-side
+/// analogue of the read-fanout's "store ONE coalesced marker" (§3.5) — a celebrity-spray mention
+/// costs at most `cap` write rows, never `N`. Proven jointly with NOTIF-P13's read-fanout.
+#[test]
+fn notif_d2_mention_storm_write_fanout_is_bounded_by_the_hot_subject_cap() {
+    let outbox = OutboxStore::new();
+    let inbox = InboxProjection::new();
+    let consumer =
+        build_router(&tenant(), inbox.clone(), outbox.clone(), DedupLedger::new()).unwrap();
+
+    // A mention-storm: 200 DISTINCT recipients mentioned on ONE hot subject (a @here on a big channel).
+    let storm_size = 200usize;
+    let sig = signal("mention_spray", Severity::Info, "myelin://acme/chat/thread/hot", "spray");
+    let mentions: Vec<Principal> = (0..storm_size)
+        .map(|i| Principal::stub(PrincipalId(format!("p-{i}")), PrincipalKind::Human, tenant()))
+        .collect();
+
+    let out = consumer.deliver(&mention_msg("evt-mention-storm", &sig, &mentions));
+    assert_eq!(out, Delivered::Acked, "the mention-storm Signal routes + acks");
+
+    // BOUNDED: exactly `cap` DISTINCT mention rows materialised on the hot subject_root — NOT 200.
+    let subject_root = "myelin://acme/chat/thread/hot";
+    assert_eq!(
+        consumer.handler().hot_cap().admitted_count(subject_root),
+        DEFAULT_HOT_SUBJECT_WRITE_CAP,
+        "NOTIF-D2: the mention-storm is bounded to `cap` write rows (0 unbounded write amplification)"
+    );
+    assert_eq!(
+        consumer.handler().hot_cap().overflow_count(subject_root),
+        storm_size as u32 - DEFAULT_HOT_SUBJECT_WRITE_CAP,
+        "the rest overflowed into the coalesced marker (the +N more were mentioned counter — preserved)"
+    );
+
+    // The inbox holds the bounded mention rows (`cap`) — NOT 200. A mention-storm CANNOT write-amplify.
+    let mention_rows = inbox
+        .snapshot_for_tenant(&tenant())
+        .into_iter()
+        .filter(|r| r.reason == Reason::Mentioned)
+        .count();
+    assert_eq!(
+        mention_rows as u32, DEFAULT_HOT_SUBJECT_WRITE_CAP,
+        "exactly `cap` mention rows materialised — the write-amplification bound holds (§3.2.4)"
+    );
 }
 
 /// **The dedup-collapse-ratio alarm WOULD fire on a regression (the drill is not vacuous).** A run

@@ -90,6 +90,11 @@ pub mod schema;
 // damping, and mute/DND honoring. Storm-control suppresses DELIVERY and RANKING only — NEVER the
 // audit/history (Notif is a projection, EI-04 §5.3). The router runs it between classify and UPSERT.
 pub mod storm_control;
+// Write-fanout for the bounded high-signal set (NOTIF-P12 / P-190 — §3.5/§3.2.4): the router reads
+// the frozen `mention(Principal)` STRUCTURED node (contract 13.1) — NEVER free text (AG-6) — and
+// materialises one inbox_item per mentioned recipient, bounded by the hot-subject cap so a
+// mention-storm cannot write-amplify. The read-fanout for the unbounded ambient set is NOTIF-P13.
+pub mod write_fanout;
 
 pub use cli::{
     inbox_list, inbox_read, inbox_show, inbox_snooze, notify_prefs, notify_prefs_set, notify_test,
@@ -129,11 +134,14 @@ pub use read_state::{
 };
 pub use router::{
     build_router, signal_subject_prefix, InboxProjection, RoutedInboxItem, SignalRouter,
-    NOTIF_ESCALATION_ACKED, NOTIF_ITEM_CREATED, ROUTER_CONSUMER_NAME,
+    NOTIF_ESCALATION_ACKED, NOTIF_ITEM_CREATED, ROUTER_CONSUMER_NAME, SIGNAL_MENTIONS_KEY,
 };
 pub use storm_control::{
     dedup_collapse_ratio_bps, is_self_notification, subject_root_of, Coalescer, RateConfig,
     StormContext, StormControl, StormDecision, StormPrefs, SuppressReason, TokenBucket,
+};
+pub use write_fanout::{
+    extract_mentions, CapVerdict, HotSubjectCap, DEFAULT_HOT_SUBJECT_WRITE_CAP,
 };
 
 /// The service name (a PII-free label, the telemetry / trace / deployable identifier). The
