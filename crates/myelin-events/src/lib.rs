@@ -325,6 +325,7 @@
 //!   signal name/unit + the snapshot seam are frozen so EB-23 only feeds the count (until then
 //!   it is `0` — no tripwire has fired).
 
+pub mod check_seam;
 pub mod consumer;
 pub mod crosscell;
 pub mod dedup;
@@ -367,6 +368,24 @@ pub use dedup::{DedupLedger, CONSUMER_DEDUP_MIGRATION};
 pub use firehose::{
     Firehose, FirehoseError, FirehoseScope, Frame, FrameDraft, FramePayload, RetentionWindow,
     ScopeKind, SubStream, Subscription as FirehoseSubscription, DEFAULT_INFLIGHT_CAP,
+};
+/// The Git↔CI check-seam CARRIAGE (contract 5.9 the Bus's narrow half + 9.4 consumed, EB-24 /
+/// P-144). The Bus owns ONLY: envelope conformance ([`check_seam::check_updated_draft`] — the
+/// `ci.check.updated` subject `repo#commit-<oid>/check-<context>` + the `(repo, commit_oid)`
+/// aggregate, the CI-owned `CheckStatus` carried OPAQUE), per-aggregate ordering on
+/// `(repo, commit_oid)` ([`check_seam::CheckSeamOrder`] — interleaved/late arrivals stay
+/// per-aggregate ordered, the D-11 substrate Git's `run_attempt` supersession rests on), and the
+/// durable `wait_for_signal("ci.result", idem_key)` substrate
+/// ([`check_seam::CiResultWaitSubstrate`] — a doubly-delivered `ci.result` wakes EXACTLY once,
+/// contract 9.4). It does NOT own the `CheckStatus` shape, the supersession rule, trust-tier
+/// gating, or the merge gate (all CI/Git, contract 5.9). FLOORS: the CONSUMER leg (Git's
+/// `check_status` projection over this ordered carriage) is EB-26 / P-246 (M3); the PRODUCER leg
+/// (CI emits `ci.check.updated` + the rollup `ci.result`) is EB-27 (M4) — the seam goes end-to-end
+/// there; the real `myelin-flow` durable engine behind `wait_for_signal` is P-FLOW-04 (this is its
+/// in-cell signal substrate).
+pub use check_seam::{
+    check_aggregate, check_subject, check_updated_draft, CheckSeamError, CheckSeamOrder, CiOverall,
+    CiResult, CiResultWaitSubstrate, OrderedCheck, WakeOutcome,
 };
 pub use taxonomy::{
     validate as validate_event_type, TaxonomyError, ARTIFACT_TYPE_TOKENS, SEED_EVENT_NAMES,
