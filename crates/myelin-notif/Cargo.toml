@@ -69,6 +69,10 @@ myelin-substrate = { path = "../myelin-substrate" }
 # no-untagged-personal-data gate's compile-time half.
 myelin-gdpr = { path = "../myelin-gdpr" }
 serde = { workspace = true }
+# The reindex-parity hash (NOTIF-P17 / NOTIF-D3): a deterministic BLAKE3 over the rebuilt inbox
+# projection (the cold == live artifact). `inbox_parity_hash` renders `blake3:<hex>` — the SAME
+# content-addressed digest family the gdpr receipts use.
+blake3 = { workspace = true }
 # The router (NOTIF-P3) deserializes the curated `Signal` out of the envelope payload (a poison
 # payload → NonRetryable) and builds the `notif.item.created` references-not-payloads emit payload.
 serde_json = { workspace = true }

@@ -120,6 +120,22 @@ impl DedupLedger {
         self.lock().remove(&(consumer.clone(), event_id.clone()));
     }
 
+    /// **Forget `(consumer, event_id)` so a later delivery re-runs the handler (the reindex-after-wipe
+    /// path).** A FULL `reindex(scope)` WIPES the derived read-model and rebuilds it from source by
+    /// re-driving the owner's `*.snapshot` events through the SAME live consumer. Those snapshots carry
+    /// DETERMINISTIC ids ([`crate::snapshot_event_id`]); if a prior rebuild already marked them handled,
+    /// the redelivery would be deduplicated and the wiped store would stay EMPTY. Forgetting the
+    /// snapshot's mark for the scope being rebuilt lets the cold rebuild re-apply it (the within-pass
+    /// idempotency is then the consumer's OWN write-time collapse, e.g. the inbox `(tenant, recipient,
+    /// dedup_key)` UPSERT). This is the dedup-ledger analog of `reindex`'s cursor-store `reset_scope`
+    /// (SRCH-P16): a full rebuild resets the applied guard for the generation it re-emits. In the OLTP
+    /// binding this is a scoped `DELETE FROM consumer_dedup WHERE consumer = $1 AND event_id = $2`
+    /// (forward-only; the snapshot id re-applies idempotently into the wiped store). Returns `true` iff
+    /// a mark was present and removed.
+    pub fn forget(&self, consumer: &ConsumerName, event_id: &crate::EventId) -> bool {
+        self.lock().remove(&(consumer.clone(), event_id.clone()))
+    }
+
     /// How many `(consumer, event_id)` pairs the ledger holds (for tests / a depth read).
     pub fn len(&self) -> usize {
         self.lock().len()

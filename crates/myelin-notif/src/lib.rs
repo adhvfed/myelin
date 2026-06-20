@@ -98,6 +98,15 @@ pub mod migrations;
 // default — you cannot silence an on-call page). See [`prefs`].
 pub mod prefs;
 pub mod ranking;
+// Reindex-from-source — the ONLY recovery path (NOTIF-P17 / P-195 — §3.8, contract 7.7 replay half).
+// `reindex(scope=notif)` → the owning Signal source replays `*.snapshot` events (carrying the curated
+// Signal, on the `sig.<tenant>.*` subject) through outbox→bus→the SAME router (NOTIF-P3) → the inbox
+// projection is reconstructed; cold == live (NOTIF-D3 parity hash). This completes the 7.7 holder
+// contract started in NOTIF-P4 (holder half) — the replay half. There is NO second read path (the
+// rebuild re-drives `Consumer::deliver`, the same live step a `sig.*` Signal hits). FLOOR: the ~90-day
+// item-retention window (older items reconstruct from the OLAP/Audit long-term holder); the real owner
+// replay is the dispatch tier / EB-26. See [`reindex`].
+pub mod reindex;
 // Read-fanout for the unbounded ambient set (NOTIF-P13 / P-191 — §3.5): the watchers / 50k-channel
 // members are NOT exploded into writes — ONE coalesced marker is stored per subject_root (zero write
 // amplification) and the viewer's slice is materialised LAZILY on inbox open via the frozen
@@ -168,6 +177,11 @@ pub use ranking::{
     band_ceiling, band_floor, base_priority, class_for, rank_and_order, reason_base_class,
     AffinitySource, DeterministicV1, ExplainTrace, NeutralAffinity, RankStrategy, RankedItem,
     PRIORITY_MAX, PRIORITY_MIN,
+};
+pub use reindex::{
+    inbox_parity_hash, notif_scope, signal_snapshot_draft, signal_snapshot_subject, NotifReindexer,
+    ReindexError as NotifReindexError, ReindexReceipt as NotifReindexReceipt, RetentionWindow,
+    SignalReindexSource, DEFAULT_RETENTION_DAYS, NOTIF_OWNER_TOKEN, NOTIF_SNAPSHOT_TYPE,
 };
 pub use read_fanout::{
     read_fanout, subject_root_col, AmbientMarkerStore, ReadFanoutError, ReadFanoutMarker,
