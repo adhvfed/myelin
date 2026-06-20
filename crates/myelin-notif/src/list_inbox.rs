@@ -280,12 +280,14 @@ pub struct InboxPage {
 ///    scoped view; `InboxFilter::all()` = the unfiltered inbox);
 /// 3. **step-0 read authorize** — drops any item whose `subject` the recipient cannot `check`-READ
 ///    at the consistency snapshot `at` (ADR-03, never leak — held, not leaked);
-/// 4. **orders stably** — by `(item_id)` (the unranked-but-stable order; the NOTIF-P7 ranking plugs
-///    into this same slot), then **pages** the bounded slice.
+/// 4. **orders by RANK** — by `(priority DESC, item_id ASC)` (the deterministic explainable v1
+///    ranking, NOTIF-P7, plugs into this exact slot: `priority` is the primary key, `item_id` the
+///    stable tiebreak), then **pages** the bounded slice.
 ///
 /// Returns the [`InboxPage`] (the items + the forward cursor). The recipient scope + the authorize
 /// are the two non-negotiables: a row not addressed to the caller is never returned, and a row the
-/// caller cannot see is never leaked.
+/// caller cannot see is never leaked. For the per-item priorities + the explain-trace (NOTIF-2),
+/// call [`list_inbox_ranked`].
 pub fn list_inbox(
     inbox: &InboxProjection,
     principal: &Principal,
@@ -308,9 +310,19 @@ pub fn list_inbox(
         .filter(|row| authorize.can_read(principal, &row.subject, at) == Decision::Allow)
         .collect();
 
-    // (4) Stable order — by item_id (the unranked-but-stable order; the NOTIF-P7 ranking plugs in
-    // here). Deterministic so paging is consistent across calls (no random/HashMap order leaks).
-    candidates.sort_by(|a, b| a.item_id.cmp(&b.item_id));
+    // (4) RANKED order (NOTIF-P7) — the deterministic explainable v1 ranking plugs into this exact
+    // slot: order by `(priority DESC, item_id ASC)` (the ranked inbox; `item_id` is the stable
+    // deterministic tiebreak so paging is consistent across calls — no random/HashMap order leaks).
+    // The ranking runs AFTER the recipient-scope + the C-9 filter + the step-0 authorize above, so
+    // it only ever orders items the recipient is allowed to see (the authorize is never skipped).
+    // The v1 strategy uses the NeutralAffinity seam (the live Id/Refs affinity is NOTIF-P13); the
+    // ML ranker swaps in behind the SAME `RankStrategy`. `list_inbox_ranked` exposes the priorities
+    // + the per-rank explain-trace (NOTIF-2); this convenience entry returns just the ordered rows.
+    let ranker = crate::ranking::DeterministicV1::default();
+    candidates = crate::ranking::rank_and_order(candidates, principal, &ranker)
+        .into_iter()
+        .map(|ranked| ranked.item)
+        .collect();
 
     // Page: skip past the `after` cursor (exclusive), take `limit`, and compute the forward cursor.
     let start = match &page.after {
@@ -330,6 +342,73 @@ pub fn list_inbox(
         Cursor(None)
     };
     InboxPage { items, cursor }
+}
+
+/// **One page of RANKED `list_inbox` results (contract 7.1, NOTIF-P7).** Each item carries its
+/// deterministic priority + the explain-trace (NOTIF-2 — "why am I seeing this, ranked here?"), so
+/// the inbox UI / CLI / a drill can show the rank AND its justification. Same recipient-scope +
+/// C-9 filter + step-0 authorize + paging as [`list_inbox`]; this surface additionally exposes the
+/// [`RankedItem`](crate::ranking::RankedItem)s instead of the bare rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RankedPage {
+    /// The ranked items on this page (recipient-scoped, filtered, authorized, `(priority DESC,
+    /// item_id ASC)`-ordered) — each carrying its priority + explain-trace.
+    pub items: Vec<crate::ranking::RankedItem>,
+    /// The forward cursor (`Some` ⇒ more pages; `None` ⇒ exhausted).
+    pub cursor: Cursor,
+}
+
+/// **`list_inbox_ranked(...)` — the ONE inbox, RANKED, with the per-rank explain-trace (NOTIF-P7).**
+///
+/// Identical narrowing to [`list_inbox`] (recipient-scope → C-9 filter → step-0 authorize → rank →
+/// page) but takes an explicit [`RankStrategy`](crate::ranking::RankStrategy) (so the ML ranker
+/// swaps in at the call boundary, §3.1) and returns the [`RankedItem`](crate::ranking::RankedItem)s
+/// — each with its `priority` + `trace`. The plain [`list_inbox`] is this with the default
+/// [`DeterministicV1`](crate::ranking::DeterministicV1) ranker, projecting away the priorities.
+///
+/// **The non-negotiable:** the ranking runs over the ALREADY-AUTHORIZED candidate set — a denied
+/// item is dropped BEFORE it is ranked (the authorize is never skipped to rank an item). Every
+/// returned item carries a trace (the NOTIF-2 100%-trace gate is structural).
+pub fn list_inbox_ranked(
+    inbox: &InboxProjection,
+    principal: &Principal,
+    filter: &InboxFilter,
+    page: &Page,
+    authorize: &dyn ReadAuthorizePort,
+    at: &Consistency,
+    strategy: &dyn crate::ranking::RankStrategy,
+) -> RankedPage {
+    // (1)-(3) recipient-scope + C-9 filter + step-0 authorize (identical to `list_inbox` — never
+    // skipped). Only items the recipient may see reach the ranker.
+    let me = principal.principal_id.0.as_str();
+    let candidates: Vec<RoutedInboxItem> = inbox
+        .snapshot_for_tenant(&principal.tenant)
+        .into_iter()
+        .filter(|row| row.recipient == me)
+        .filter(|row| filter.matches(row))
+        .filter(|row| authorize.can_read(principal, &row.subject, at) == Decision::Allow)
+        .collect();
+
+    // (4) rank + order `(priority DESC, item_id ASC)` — every item gets its priority + explain-trace.
+    let ranked = crate::ranking::rank_and_order(candidates, principal, strategy);
+
+    // page over the ranked order (same cursor math as `list_inbox` — keyed on item_id).
+    let start = match &page.after {
+        Some(after) => ranked
+            .iter()
+            .position(|r| &r.item.item_id == after)
+            .map(|i| i + 1)
+            .unwrap_or(ranked.len()),
+        None => 0,
+    };
+    let end = start.saturating_add(page.limit).min(ranked.len());
+    let items = ranked[start..end].to_vec();
+    let cursor = if end < ranked.len() {
+        Cursor(items.last().map(|r| r.item.item_id.clone()))
+    } else {
+        Cursor(None)
+    };
+    RankedPage { items, cursor }
 }
 
 /// **A permissive read-authorize port (every read ALLOWED).** The seam Notif uses until the live
@@ -562,11 +641,13 @@ mod tests {
 
     // --- stable order + paging ---
 
-    /// **The order is stable + deterministic, and paging walks it exactly once (no dup, no skip).**
-    /// Two pages of limit 2 over 6 items + a final page; the cursor chains; the union is the full
-    /// ordered set with no overlap. A mutant that breaks the order or the cursor math is caught.
+    /// **The order is the RANKED order (priority DESC, item_id ASC), deterministic, and paging walks
+    /// it exactly once (no dup, no skip).** Two pages of limit 2 over 6 items + a final page; the
+    /// cursor chains; the paged union equals the single-call ranked order with no overlap. A mutant
+    /// that breaks the rank order or the cursor math is caught. (NOTIF-P7: the order is now the rank,
+    /// not the pure item_id sort.)
     #[test]
-    fn stable_order_and_paging_is_exhaustive_and_non_overlapping() {
+    fn ranked_order_and_paging_is_exhaustive_and_non_overlapping() {
         let me = "u1";
         let inbox = seeded_inbox(me);
         let p = principal(me);
@@ -596,15 +677,86 @@ mod tests {
                 None => break,
             }
         }
-        // exhaustive: all 6 items, in stable (sorted item_id) order, no dup.
-        let mut expected = ids(&list_inbox(&inbox, &p, &InboxFilter::all(), &Page { after: None, limit: 1000 }, &AllowAllAuthorize, &strong()))
-            .into_iter()
-            .collect::<Vec<_>>();
-        expected.sort();
+        // The single-call ranked order (priority DESC, item_id ASC) is the EXPECTED order: the three
+        // direct (70) items by item_id, then the three watching (35) items by item_id.
+        let expected: Vec<String> = list_inbox(
+            &inbox,
+            &p,
+            &InboxFilter::all(),
+            &Page { after: None, limit: 1000 },
+            &AllowAllAuthorize,
+            &strong(),
+        )
+        .items
+        .iter()
+        .map(|i| i.item_id.clone())
+        .collect();
+        assert_eq!(
+            expected,
+            vec![
+                "itm-chat-ment".to_string(),  // mentioned = 70 (direct)
+                "itm-git-review".to_string(), // review_requested = 70 (direct)
+                "itm-iss-assigned".to_string(), // assigned = 70 (direct)
+                "itm-chat-state".to_string(), // state_changed = 35 (watching)
+                "itm-git-watched".to_string(), // watched = 35 (watching)
+                "itm-iss-state".to_string(),  // state_changed = 35 (watching)
+            ],
+            "the order is (priority DESC, item_id ASC): the three direct(70) above the three watching(35)"
+        );
         assert_eq!(seen.len(), 6, "paging visited every item once (no skip)");
         let unique: BTreeSet<_> = seen.iter().cloned().collect();
         assert_eq!(unique.len(), 6, "paging never returned a duplicate");
-        assert_eq!(seen, expected, "the page order is the stable (sorted) order");
+        assert_eq!(seen, expected, "the page order is the RANKED order (priority DESC, item_id ASC)");
+    }
+
+    /// **`list_inbox_ranked` exposes the per-item priority + the explain-trace (NOTIF-2) and ranks
+    /// the same candidate set `list_inbox` orders.** Every returned item carries a non-empty,
+    /// deterministic trace whose `final_priority` == the item's priority (the 100%-trace gate), and
+    /// the order is `(priority DESC, item_id ASC)`. The ranked surface authorizes identically (a
+    /// denied item is dropped BEFORE ranking).
+    #[test]
+    fn list_inbox_ranked_carries_priority_and_trace_per_item() {
+        use crate::ranking::DeterministicV1;
+        let me = "u1";
+        let inbox = seeded_inbox(me);
+        let p = principal(me);
+        let ranker = DeterministicV1::default();
+        let page = list_inbox_ranked(
+            &inbox,
+            &p,
+            &InboxFilter::all(),
+            &Page { after: None, limit: 100 },
+            &AllowAllAuthorize,
+            &strong(),
+            &ranker,
+        );
+        assert_eq!(page.items.len(), 6, "all 6 visible items are ranked");
+        // every item carries a complete, deterministic trace (the NOTIF-2 100%-trace gate).
+        for r in &page.items {
+            assert_eq!(r.priority, r.trace.final_priority, "the trace's final == the priority");
+            assert!(!r.trace.render().is_empty(), "every rank carries a non-empty explain-trace");
+        }
+        // the order is priority-descending (the first item's priority ≥ the last's).
+        let priorities: Vec<u8> = page.items.iter().map(|r| r.priority).collect();
+        let mut sorted = priorities.clone();
+        sorted.sort_by(|a, b| b.cmp(a));
+        assert_eq!(priorities, sorted, "ranked page is priority-descending");
+        // a denied item is dropped BEFORE ranking (authorize never skipped on the ranked surface).
+        let deny = DenySubjects(["myelin://acme/issue/issue/PROJ-1".to_string()].into_iter().collect());
+        let denied_page = list_inbox_ranked(
+            &inbox,
+            &p,
+            &InboxFilter::all(),
+            &Page { after: None, limit: 100 },
+            &deny,
+            &strong(),
+            &ranker,
+        );
+        assert!(
+            !denied_page.items.iter().any(|r| r.item.item_id == "itm-iss-assigned"),
+            "the denied subject's item is held, not ranked (authorize before rank)"
+        );
+        assert_eq!(denied_page.items.len(), 5);
     }
 
     /// **A page is bounded by `limit` and reports a forward cursor iff more rows remain.** The first

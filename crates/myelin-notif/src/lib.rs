@@ -70,6 +70,7 @@ pub mod cli;
 pub mod holder;
 pub mod list_inbox;
 pub mod migrations;
+pub mod ranking;
 pub mod read_state;
 pub mod router;
 pub mod schema;
@@ -80,8 +81,13 @@ pub use holder::{
     NotifHistoryHolder, NotifHolderRegistration, RestrictSet, NOTIF_OLTP_STORE,
 };
 pub use list_inbox::{
-    list_inbox, subsystem_of, AllowAllAuthorize, Cursor, InboxFilter, InboxPage, Page,
-    ReadAuthorizePort, Subsystem,
+    list_inbox, list_inbox_ranked, subsystem_of, AllowAllAuthorize, Cursor, InboxFilter, InboxPage,
+    Page, RankedPage, ReadAuthorizePort, Subsystem,
+};
+pub use ranking::{
+    band_ceiling, band_floor, base_priority, class_for, rank_and_order, reason_base_class,
+    AffinitySource, DeterministicV1, ExplainTrace, NeutralAffinity, RankStrategy, RankedItem,
+    PRIORITY_MAX, PRIORITY_MIN,
 };
 pub use read_state::{
     active_inbox, mark, mark_all_read, snooze, ReadState, ReadStateError,
