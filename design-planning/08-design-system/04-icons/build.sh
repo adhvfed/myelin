@@ -48,4 +48,7 @@ if grep -lE '#[0-9a-fA-F]{3,6}' "$SVG_DIR"/*.svg >/dev/null 2>&1; then
   grep -lE '#[0-9a-fA-F]{3,6}' "$SVG_DIR"/*.svg >&2; exit 1
 fi
 
+# Regenerate the live contact sheet by inlining the just-built svg/ (never goes stale).
+bash "$ROOT/gen-index.sh"
+
 echo "built $(ls "$SVG_DIR"/*.svg | wc -l | tr -d ' ') icon(s) -> svg/ (currentColor) + preview/ (64px @ $INK)"
