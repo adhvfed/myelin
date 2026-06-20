@@ -53,6 +53,16 @@ myelin-refs = { path = "../myelin-refs" }
 myelin-tenancy = { path = "../myelin-tenancy" }
 # Principal — the verified subject the holder's locate/erase key on (via SubjectRef).
 myelin-identity = { path = "../myelin-identity" }
+# The Bus consumer surface (REF-P6 / P-155): the frozen `EventHandler` template + the
+# `EventEnvelope` (contract 2.1) the refs-edge-builder consumes, the `Consumer` runtime + the
+# `DedupLedger` (contracts 2.4/2.5) that make it idempotent, and the `reindex` seam (contract 2.6)
+# that replays `*.snapshot` events through the SAME `handle` path (steady-state == cold-rebuild).
+# myelin-events sits below the service crates in the DAG (it depends only on tenancy/identity), so
+# refs-service stays the graph's terminal leaf consumer — no new modelled edge.
+myelin-events = { path = "../myelin-events" }
+# serde_json — the references-not-payloads `refs.edge.*` payload the builder reads (source/target/
+# rel/rel_class/zookie). A leaf dev/runtime dep, already in the workspace; no DAG edge added.
+serde_json = { workspace = true }
 
 # ------------------------------------------------------------------------------------------
 # REAL edge inverse-index schema apply behind the `integration` feature (REF-P5 / P-154). The
