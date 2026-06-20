@@ -8,12 +8,12 @@ defaults
 palette
   ink #ff00ff
 shape body template=path
-  addpoint a at=3,7
-  addpoint b at=9,7
-  addpoint c at=11,9
-  addpoint d at=21,9
-  addpoint e at=21,19
-  addpoint f at=3,19
+  addpoint a at=4,18
+  addpoint b at=4,7
+  addpoint c at=9,7
+  addpoint d at=9,9
+  addpoint e at=20,9
+  addpoint f at=20,18
   close
-  round-corners 1
+  round-corners 1.5
 place b1 shape=body at=0,0

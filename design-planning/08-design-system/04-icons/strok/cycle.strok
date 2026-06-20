@@ -8,18 +8,14 @@ defaults
 palette
   ink #ff00ff
 shape ring template=path
-  addpoint a at=14,4
-  addpoint b at=19,7 mode=catmull-rom
-  addpoint c at=20,12 mode=catmull-rom
-  addpoint d at=17,17 mode=catmull-rom
-  addpoint e at=12,19 mode=catmull-rom
-  addpoint f at=6,17 mode=catmull-rom
-  addpoint g at=4,12 mode=catmull-rom
-  addpoint h at=6,7 mode=catmull-rom
-  addpoint i at=10,5
+  addpoint a at=14,4.5
+  addpoint b at=20,12 mode=arc rx=8 ry=8
+  addpoint c at=12,20 mode=arc rx=8 ry=8
+  addpoint d at=4,12 mode=arc rx=8 ry=8
+  addpoint e at=9,5 mode=arc rx=8 ry=8
 place r1 shape=ring at=0,0
 shape arrowhead template=path
-  addpoint a at=11,8
-  addpoint b at=14,4
-  addpoint c at=11,3
+  addpoint a at=5,6
+  addpoint b at=9,5
+  addpoint c at=10,9
 place ah shape=arrowhead at=0,0

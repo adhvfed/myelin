@@ -12,10 +12,8 @@ shape rail template=path
   addpoint b at=7,17
 place r1 shape=rail at=0,0
 shape diverge template=path
-  addpoint a at=7,11
-  addpoint b at=12,11 mode=catmull-rom
-  addpoint c at=17,8 mode=catmull-rom
-  addpoint d at=17,7
+  addpoint a at=7,12
+  addpoint b at=17,10 mode=arc rx=11 ry=11
 place d1 shape=diverge at=0,0
 shape ntop template=ellipse
 place n1 shape=ntop at=4,4 size=6x6

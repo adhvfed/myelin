@@ -12,16 +12,10 @@ shape bar template=path
   addpoint b at=15,12
 place b1 shape=bar at=0,0
 shape lefthook template=path
-  addpoint a at=10,8
-  addpoint b at=6,8 mode=catmull-rom
-  addpoint c at=4,12 mode=catmull-rom
-  addpoint d at=6,16 mode=catmull-rom
-  addpoint e at=10,16
+  addpoint a at=10,16
+  addpoint b at=10,8 mode=arc rx=6 ry=4
 place lh shape=lefthook at=0,0
 shape righthook template=path
   addpoint a at=14,8
-  addpoint b at=18,8 mode=catmull-rom
-  addpoint c at=20,12 mode=catmull-rom
-  addpoint d at=18,16 mode=catmull-rom
-  addpoint e at=14,16
+  addpoint b at=14,16 mode=arc rx=6 ry=4
 place rh shape=righthook at=0,0
