@@ -343,6 +343,20 @@ impl InboxProjection {
             .cloned()
             .collect()
     }
+
+    /// **Wipe every row for `tenant` (the reindex-from-source cold-rebuild precondition, NOTIF-P17).**
+    /// A FULL `reindex(notif)` starts from an empty inbox — the inbox is a DERIVED read-model (a
+    /// projection, not a system-of-record), so wiping it is safe: the reindex re-drives the SAME
+    /// router over the owner's replayed Signals to rebuild it (cold == live). Tenant-scoped (one
+    /// tenant's rebuild never disturbs another's live inbox). In the OLTP binding this is a single
+    /// `DELETE FROM notif_inbox_item WHERE tenant_id = $1` (the wiped generation is rebuilt from
+    /// source). Returns the number of rows wiped (observability — the drill reads it).
+    pub fn wipe_tenant(&self, tenant: &TenantId) -> usize {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let before = guard.len();
+        guard.retain(|_, row| row.tenant != *tenant);
+        before - guard.len()
+    }
 }
 
 impl RoutedInboxItem {
