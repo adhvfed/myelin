@@ -91,11 +91,14 @@ use myelin_events::{
     IdMinter, MonotonicMinter, OutboxStore, OutboxTx, Reason as BusReason, SubjectPattern,
     SubscribeError, Visibility,
 };
+use myelin_content::InlineNode;
+use myelin_identity::Principal;
 use myelin_query::signals::{Severity, Signal};
 use myelin_tenancy::{Region, TenantId};
 
 use crate::prefs::QuietHours;
 use crate::storm_control::{subject_root_of, RateConfig, StormContext, StormControl, StormDecision};
+use crate::write_fanout::{extract_mentions, CapVerdict, HotSubjectCap};
 use crate::{Class, Reason};
 
 /// The frozen `notif.item.created` event type (architecture §3.4 — the router's create-side emit
@@ -383,6 +386,12 @@ pub struct SignalRouter {
     /// Holds the per-pool storm state (the coalescer + the token buckets + the mute set). A cloneable
     /// handle, so the whole router pool shares ONE storm-control truth.
     storm: StormControl,
+    /// **The hot-subject cap (NOTIF-P12 / §3.2.4 / §3.5).** Bounds the WRITE-FANOUT side: a
+    /// mention-storm on a hot subject_root materialises at most [`HotSubjectCap::cap`] DISTINCT
+    /// recipient rows; further distinct mentions coalesce into the ONE "+N more were mentioned"
+    /// marker rather than write-amplifying into N rows. A cloneable handle so the whole pool shares
+    /// ONE cap truth per subject_root.
+    hot_cap: HotSubjectCap,
     /// The `'static` whitelist the trait requires. Built once at [`build_router`] from the
     /// per-tenant `sig.<tenant>.` prefix and leaked to `'static` (the binding set is fixed for the
     /// life of the consumer pool; one leak per tenant per process — bounded, never per-event).
@@ -415,7 +424,14 @@ impl SignalRouter {
         minter: Arc<dyn IdMinter>,
         subjects: &'static [SubjectPattern],
     ) -> SignalRouter {
-        SignalRouter { inbox, outbox, minter, storm: StormControl::new(), subjects }
+        SignalRouter {
+            inbox,
+            outbox,
+            minter,
+            storm: StormControl::new(),
+            hot_cap: HotSubjectCap::new(),
+            subjects,
+        }
     }
 
     /// The inbox projection this router UPSERTs into (so a drill can read the result).
@@ -427,6 +443,12 @@ impl SignalRouter {
     /// read its state or mute a thread). The five §3.2 mechanisms live here.
     pub fn storm(&self) -> &StormControl {
         &self.storm
+    }
+
+    /// The hot-subject cap this router bounds write-fanout with (so a drill can read the cap +
+    /// the per-`subject_root` admitted/overflow counts). The §3.2.4/§3.5 write-amplification bound.
+    pub fn hot_cap(&self) -> &HotSubjectCap {
+        &self.hot_cap
     }
 
     /// **Route ONE curated Signal into the inbox + emit `notif.item.created` (the skeleton body).**
@@ -455,11 +477,77 @@ impl SignalRouter {
         let signal: Signal = serde_json::from_value(signal_event.payload.clone())
             .map_err(|e| RouteError::MalformedSignal(e.to_string()))?;
 
-        // (2) Derive the SKELETON inbox row (the real per-reason/per-recipient routing is NOTIF-P8+).
+        // (1b) WRITE-FANOUT for the bounded high-signal set (NOTIF-P12, §3.5 step-1 DIRECT). If the
+        // Signal carries `mention(Principal)` STRUCTURED nodes (the recipient was directly addressed),
+        // materialise one inbox_item per mentioned recipient — bounded by the hot-subject cap so a
+        // mention-storm can't write-amplify. Notif reads the STRUCTURED node, NEVER free text (AG-6):
+        // `mentions_of` returns `Vec<Principal>` from `&[InlineNode]`, a free-text parse is
+        // unconstructable. The ambient skeleton candidate (below) is the §3.5 read-fanout *floor*
+        // (the unbounded watcher set is NOTIF-P13); the mention set is the bounded write-fanout leg.
+        self.write_fanout(signal_event, &signal)?;
+
+        // (2) Derive the SKELETON ambient inbox row (the real per-reason/per-recipient routing is
+        // NOTIF-P8+; the unbounded ambient watcher read-fanout is the NOTIF-P13 floor).
         let item = self.derive_item(signal_event, &signal);
+        let subject_root = subject_root_of(&item.subject.0);
+        self.route_one_candidate(signal_event, item, &subject_root)
+    }
+
+    /// **Write-fanout the bounded high-signal mention set (NOTIF-P12, §3.5/§3.2.4).** Reads the
+    /// `mention(Principal)` STRUCTURED nodes carried by the Signal (via [`mentions_of`] — `&[InlineNode]`,
+    /// NEVER a free-text parse, AG-6) and materialises **one inbox_item per mentioned recipient**,
+    /// classified `reason = Mentioned` / `class = Direct`, through the SAME storm-control collapse +
+    /// outbox co-commit as the ambient candidate.
+    ///
+    /// **The hot-subject cap (§3.2.4) bounds the write-amplification:** per `subject_root`, at most
+    /// [`HotSubjectCap::cap`] DISTINCT mention rows materialise; a NEW distinct recipient past the cap
+    /// **overflows** into the ONE coalesced "+N more were mentioned" marker (it writes NO new row, it
+    /// emits NO new push) — so a `@here` spray on a 10k channel costs at most `cap` write rows, never
+    /// 10k. A repeat mention of an already-admitted recipient is admitted (it collapses on the dedup
+    /// key — `coalesce_count += 1` — it never opens a new row). Returns the FIRST [`RouteError`] (a
+    /// transient outbox hiccup on any recipient → Retry the whole Signal; 0 lost).
+    fn write_fanout(
+        &self,
+        signal_event: &EventEnvelope,
+        signal: &Signal,
+    ) -> Result<(), RouteError> {
+        let mentions = mentions_of(signal_event);
+        if mentions.is_empty() {
+            return Ok(());
+        }
+        let subject_root = subject_root_of(&signal.subject.0);
+        for principal in &mentions {
+            let item = self.derive_mention_item(signal_event, signal, principal);
+            // The hot-subject cap decision FIRST (§3.2.4): a NEW distinct recipient past the cap
+            // OVERFLOWS into the coalesced marker (no new row, no write-amplification). An admitted
+            // recipient (within the cap, or a repeat) proceeds to the storm-control collapse + UPSERT.
+            match self.hot_cap.admit(&item.recipient, &subject_root) {
+                CapVerdict::Overflow => {
+                    // Bounded: the storm is coalesced into the marker, NOT materialised as a new row.
+                    // The count is preserved (`overflow_count`) — bounded, never silently lost.
+                    continue;
+                }
+                CapVerdict::Admit => {
+                    self.route_one_candidate(signal_event, item, &subject_root)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// **Route ONE candidate inbox item through storm-control + the outbox co-commit** (the shared
+    /// per-recipient write path used by BOTH the ambient skeleton candidate and each write-fanout
+    /// mention candidate). Runs the five §3.2 storm-control mechanisms between classify and UPSERT,
+    /// then co-commits the inbox row + the `notif.item.created` emit (emit-iff-committed). Returns the
+    /// [`StormDecision`] (so the caller can observe deliver/collapse/coalesce/suppress).
+    fn route_one_candidate(
+        &self,
+        signal_event: &EventEnvelope,
+        item: RoutedInboxItem,
+        subject_root: &str,
+    ) -> Result<StormDecision, RouteError> {
         let recipient = item.recipient.clone();
         let dedup_key = item.dedup_key.clone();
-        let subject_root = subject_root_of(&item.subject.0);
 
         // (2b) STORM-CONTROL (NOTIF-P11, §3.2) — the five write-time mechanisms, between classify and
         // UPSERT. `row_exists` (the dedup-collapse input) is read BEFORE the UPSERT so the verdict can
@@ -480,7 +568,7 @@ impl SignalRouter {
         };
         let decision = self
             .storm
-            .decide(signal_event, &item, &subject_root, row_exists, &storm_ctx);
+            .decide(signal_event, &item, subject_root, row_exists, &storm_ctx);
 
         // A storm-control verdict NEVER touches the audit (EI-04 §5.3): the underlying Signal is on
         // the bus regardless. A self-action / rate-damped candidate writes no row and emits nothing.
@@ -526,6 +614,48 @@ impl SignalRouter {
             .map_err(|e| RouteError::EmitFailed(format!("outbox commit failed: {e:?}")))?;
 
         Ok(decision)
+    }
+
+    /// **Derive a write-fanout mention [`RoutedInboxItem`] for one mentioned [`Principal`]** (the
+    /// §3.5 step-1 DIRECT high-signal set). The recipient is the mentioned principal's OPAQUE
+    /// `principal_id` (4.8 pseudonym, never a name); `reason = Mentioned` (the C-9 scoped-view filter
+    /// basis — Chat "Activity/Mentions", Git "Review requests"); `class = Direct` (directly addressed
+    /// — a break-out class storm-control never folds into a digest, §3.2.3). The `dedup_key` is
+    /// `mention:<rule>:<dedup>:<principal>` so EACH mentioned recipient gets their OWN row (one
+    /// inbox_item per recipient), while a redelivery of the SAME mention collapses (§3.2).
+    fn derive_mention_item(
+        &self,
+        env: &EventEnvelope,
+        signal: &Signal,
+        principal: &Principal,
+    ) -> RoutedInboxItem {
+        let recipient = principal.principal_id.0.clone();
+        // Per-recipient dedup key: one row per mentioned recipient (write-fanout), idempotent on
+        // redelivery (the same mention re-fires onto the SAME row, never a duplicate).
+        let dedup_key = format!(
+            "mention:{}:{}:{}",
+            signal.rule_id.0, signal.dedup_key.0, recipient
+        );
+        let item_id = item_id_for(&env.tenant, &recipient, &dedup_key);
+        RoutedInboxItem {
+            tenant: env.tenant.clone(),
+            region: env.region.clone(),
+            item_id,
+            recipient,
+            subject: signal.subject.clone(),
+            // A mention is the canonical DIRECT high-signal reason (§3.5 / contract 13.1).
+            reason: Reason::Mentioned,
+            // Directly addressed → Direct (broken out of every digest; pierces by prefs at NOTIF-P10).
+            class: Class::Direct,
+            origin_event: ArtifactRef(format!(
+                "myelin://{}/bus/event/{}",
+                env.tenant.0, env.event_id.0
+            )),
+            dedup_key,
+            coalesce_count: 1,
+            state: "unread".to_string(),
+            snooze_until: None,
+        }
     }
 
     /// Derive the SKELETON [`RoutedInboxItem`] from a curated Signal (the create-skeleton mapping).
@@ -690,6 +820,32 @@ fn item_id_for(tenant: &TenantId, recipient: &str, dedup_key: &str) -> String {
     0u8.hash(&mut h);
     dedup_key.hash(&mut h);
     format!("itm-{:016x}", h.finish())
+}
+
+/// **The frozen envelope key the STRUCTURED `mention(Principal)` nodes ride on (NOTIF-P12, §3.5).**
+/// The curated Signal's envelope payload carries the originating content's STRUCTURED mention nodes
+/// under this key — populated by the dispatch tier (EB-23) from the originating event's
+/// `myelin-content` body, NOT scraped from free text. A named constant so the producer + the consumer
+/// agree on the WIRE (the CDC pins it); a drift breaks the build, never silently in prod.
+pub const SIGNAL_MENTIONS_KEY: &str = "mentions";
+
+/// **Read the STRUCTURED `mention(Principal)` nodes the Signal carries — NEVER parse free text
+/// (AG-6).** The dispatch tier stamps the originating content's structured inline nodes onto the
+/// Signal envelope payload under [`SIGNAL_MENTIONS_KEY`] as a JSON array of [`InlineNode`]s (the
+/// frozen 13.1 taxonomy node). This reads ONLY that structured array and returns the mentioned
+/// [`Principal`]s (deduped by `principal_id`) via [`extract_mentions`]. There is NO `&str` overload
+/// anywhere on this path: Notif reads the structured node the producer froze; it does NOT re-derive
+/// the mention shape from raw text (the agent-loop reference gate — only a structured ref re-triggers).
+/// A missing / malformed `mentions` key → NO mentions (the Signal is ambient-only); it is NOT a
+/// poison (the Signal itself parsed — a content-less Signal is normal, e.g. a CI failure).
+fn mentions_of(env: &EventEnvelope) -> Vec<Principal> {
+    let Some(value) = env.payload.get(SIGNAL_MENTIONS_KEY) else {
+        return Vec::new();
+    };
+    // The structured nodes — a JSON array of `InlineNode` (the 13.1 taxonomy). A malformed shape is
+    // treated as no-mentions (ambient-only), never a free-text fallback (there is none).
+    let nodes: Vec<InlineNode> = serde_json::from_value(value.clone()).unwrap_or_default();
+    extract_mentions(&nodes)
 }
 
 /// The ambient [`EmitContextBase`] for the router's emit, taken from the INCOMING Signal envelope:
@@ -1070,5 +1226,163 @@ mod tests {
         assert_eq!(NOTIF_ITEM_CREATED, "notif.item.created");
         assert_eq!(NOTIF_ESCALATION_ACKED, "notif.escalation.acked");
         assert_eq!(ROUTER_CONSUMER_NAME, "notif-signal-router");
+    }
+
+    // --- NOTIF-P12: write-fanout for the bounded high-signal mention set ---
+
+    use myelin_content::InlineNode;
+
+    /// A `sig.<tenant>.…` envelope carrying the Signal payload + the STRUCTURED `mention(Principal)`
+    /// nodes under [`SIGNAL_MENTIONS_KEY`] (the dispatch tier stamps them from the originating content;
+    /// Notif reads the structured node, never free text — AG-6).
+    fn signal_msg_with_mentions(id: &str, sig: &Signal, mentions: &[Principal]) -> Message {
+        let mut env = signal_envelope(id, sig);
+        let nodes: Vec<InlineNode> =
+            mentions.iter().cloned().map(InlineNode::Mention).collect();
+        // The Signal payload is an object; add the structured `mentions` array beside it.
+        if let serde_json::Value::Object(map) = &mut env.payload {
+            map.insert(SIGNAL_MENTIONS_KEY.into(), serde_json::to_value(&nodes).unwrap());
+        }
+        Message { subject: env.subject.0.clone(), envelope: env }
+    }
+
+    fn mentioned(id: &str) -> Principal {
+        Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant())
+    }
+
+    /// **The mention-write-fanout check (NOTIF-P12 GATE): a Signal carrying `mention(Principal)`
+    /// nodes materialises EXACTLY ONE inbox_item per mentioned recipient; the row is classified
+    /// `Mentioned`/`Direct`; Notif read the STRUCTURED node (0 free-text parse).** Threshold: 1 item
+    /// per mentioned recipient.
+    #[test]
+    fn write_fanout_materialises_one_item_per_mentioned_recipient() {
+        let outbox = OutboxStore::new();
+        let (consumer, inbox) = router_over(&outbox);
+        let sig = signal("pr_review", Severity::Info, "myelin://acme/git/pr/9", "pr-9");
+        let mentions = [mentioned("p-alice"), mentioned("p-bob"), mentioned("p-carol")];
+
+        assert_eq!(
+            consumer.deliver(&signal_msg_with_mentions("evt-m1", &sig, &mentions)),
+            Delivered::Acked
+        );
+
+        // ONE row per mentioned recipient + ONE ambient skeleton row (the read-fanout floor). The
+        // three mention rows are the bounded write-fanout; assert each mentioned recipient has a row.
+        for p in &mentions {
+            let dedup = format!("mention:pr_review:pr-9:{}", p.principal_id.0);
+            let row = inbox
+                .get(&tenant(), &p.principal_id.0, &dedup)
+                .unwrap_or_else(|| panic!("a mention row for {}", p.principal_id.0));
+            assert_eq!(row.reason, Reason::Mentioned, "a mention → reason Mentioned");
+            assert_eq!(row.class, Class::Direct, "a mention is directly addressed → Direct");
+            assert_eq!(row.recipient, p.principal_id.0, "the recipient is the mentioned principal");
+            // refs-not-payloads: the subject is a ref, the recipient an opaque id (no name stored).
+            assert_eq!(row.subject.0, "myelin://acme/git/pr/9");
+        }
+        // 3 mention rows + 1 ambient skeleton row = 4 distinct rows.
+        assert_eq!(inbox.len(), 4, "one row per mentioned recipient (3) + the ambient row (1)");
+    }
+
+    /// **A redelivered / repeated mention COLLAPSES — one row per recipient, never a duplicate.** The
+    /// SAME mention delivered twice (distinct broker ids so the consumer-dedup ledger does not
+    /// short-circuit) collapses on the per-recipient dedup key (`coalesce_count += 1`); it does NOT
+    /// open a second row for that recipient (write-fanout is idempotent on the write side).
+    #[test]
+    fn write_fanout_repeat_mention_collapses_one_row_per_recipient() {
+        let outbox = OutboxStore::new();
+        let (consumer, inbox) = router_over(&outbox);
+        let sig = signal("pr_review", Severity::Info, "myelin://acme/git/pr/9", "pr-9");
+        let mentions = [mentioned("p-alice")];
+
+        consumer.deliver(&signal_msg_with_mentions("evt-a", &sig, &mentions));
+        consumer.deliver(&signal_msg_with_mentions("evt-b", &sig, &mentions));
+
+        let dedup = "mention:pr_review:pr-9:p-alice";
+        let row = inbox.get(&tenant(), "p-alice", dedup).unwrap();
+        assert_eq!(row.coalesce_count, 2, "the repeated mention collapsed (one row, count 2)");
+        // alice has exactly ONE mention row (the ambient skeleton row is the only other row).
+        let alice_rows = inbox
+            .snapshot_for_tenant(&tenant())
+            .into_iter()
+            .filter(|r| r.recipient == "p-alice")
+            .count();
+        assert_eq!(alice_rows, 1, "exactly one row for the mentioned recipient (no duplicate)");
+    }
+
+    /// **A Signal with NO structured mention nodes fans out NOTHING (no free-text parse).** A
+    /// content-less Signal (a CI failure) routes only the ambient skeleton candidate — there is no
+    /// free-text fallback, so 0 mention rows. The AG-6 property: the only recipient source is the
+    /// structured node.
+    #[test]
+    fn no_mention_nodes_means_no_write_fanout() {
+        let outbox = OutboxStore::new();
+        let (consumer, inbox) = router_over(&outbox);
+        let sig = signal("ci_run_failed", Severity::Error, "myelin://acme/ci/run/42", "run-42");
+        // The plain Signal envelope carries NO `mentions` key (only the serialized Signal).
+        consumer.deliver(&signal_msg("evt-1", &sig));
+        assert_eq!(inbox.len(), 1, "only the ambient skeleton row — 0 mention write-fanout rows");
+    }
+
+    /// **The hot-subject-cap check (NOTIF-P12 GATE / NOTIF-D2): past the cap, a mention-storm on a hot
+    /// subject COALESCES rather than write-amplifies.** A spray of distinct mentions on ONE subject is
+    /// bounded by the hot-subject cap: at most `cap` mention rows materialise; the rest overflow into
+    /// the coalesced marker. Threshold: write rows bounded by the cap; 0 unbounded write amplification.
+    #[test]
+    fn write_fanout_hot_subject_cap_bounds_a_mention_storm() {
+        let outbox = OutboxStore::new();
+        let inbox = InboxProjection::new();
+        // A SMALL cap so the test exercises the overflow without thousands of rows. Build the router
+        // and replace its hot_cap with a cap-5 one (the SAME bound, smaller for the test).
+        let mut router = SignalRouter::new(
+            inbox.clone(),
+            outbox.clone(),
+            Arc::new(MonotonicMinter::new()),
+            Box::leak(vec![SubjectPattern("sig.acme.".into())].into_boxed_slice()),
+        );
+        router.hot_cap = HotSubjectCap::with_cap(5);
+
+        // A mention-storm: 50 DISTINCT recipients mentioned on ONE hot subject_root.
+        let sig = signal("mention_spray", Severity::Info, "myelin://acme/chat/thread/hot", "spray");
+        let storm: Vec<Principal> = (0..50).map(|i| mentioned(&format!("p-{i}"))).collect();
+        let _ = router.route(&signal_envelope("evt-storm", &sig));
+
+        let subject_root = "myelin://acme/chat/thread/hot";
+        // Drive the storm through write_fanout directly (one Signal envelope carrying 50 mentions).
+        let env = {
+            let mut e = signal_envelope("evt-storm-2", &sig);
+            let nodes: Vec<InlineNode> = storm.iter().cloned().map(InlineNode::Mention).collect();
+            if let serde_json::Value::Object(map) = &mut e.payload {
+                map.insert(SIGNAL_MENTIONS_KEY.into(), serde_json::to_value(&nodes).unwrap());
+            }
+            e
+        };
+        router.write_fanout(&env, &sig).unwrap();
+
+        // BOUNDED: at most `cap` (5) distinct mention rows materialised on the hot subject_root; the
+        // other 45 overflowed into the coalesced marker (counted, never lost — bounded, not 50 rows).
+        assert_eq!(
+            router.hot_cap().admitted_count(subject_root),
+            5,
+            "the mention-storm is bounded to `cap` write rows (0 unbounded write amplification)"
+        );
+        assert_eq!(
+            router.hot_cap().overflow_count(subject_root),
+            45,
+            "the rest overflowed into the coalesced marker (the +N more were mentioned counter)"
+        );
+        // The inbox holds the bounded mention rows (5) — NOT 50. A mention-storm cannot write-amplify.
+        let mention_rows = inbox
+            .snapshot_for_tenant(&tenant())
+            .into_iter()
+            .filter(|r| r.reason == Reason::Mentioned)
+            .count();
+        assert_eq!(mention_rows, 5, "exactly `cap` mention rows materialised (bounded write-fanout)");
+    }
+
+    /// **`SIGNAL_MENTIONS_KEY` is the frozen wire key** — the named constant the CDC pins (producer +
+    /// consumer agree on it). A mutant that renames it breaks the build, never silently in prod.
+    #[test]
+    fn signal_mentions_key_is_frozen() {
+        assert_eq!(SIGNAL_MENTIONS_KEY, "mentions");
     }
 }
