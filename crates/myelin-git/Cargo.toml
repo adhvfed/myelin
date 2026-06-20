@@ -25,6 +25,13 @@ myelin-gdpr = { path = "../myelin-gdpr" }
 myelin-tenancy = { path = "../myelin-tenancy" }
 # Principal — the verified subject reference the holder's locate/erase key on (via SubjectRef).
 myelin-identity = { path = "../myelin-identity" }
+# The Bus event-taxonomy grammar validator + token table (contract 2.9 / EB-02). GIT-P2 (P-124)
+# REGISTERS git's complete `git.*` token list and PROVES each grammatical against this one validator
+# — git registers, it does not author the grammar (no second token language; the names anchor X-5).
+# A producer LEAF depending on the events glue crate is a sanctioned edge: `myelin-events` is a
+# shared contract carrier and NOTHING in the production DAG depends back on `myelin-git` (the §2.9
+# graph stays acyclic — `substrate_is_root()` / `identity_is_sink()` are unaffected).
+myelin-events = { path = "../myelin-events" }
 serde.workspace = true
 
 # DEV-ONLY: the rich ReBAC namespace ENGINE (FragmentDef / Userset / StoreBackedCheck) lives in the
@@ -36,5 +43,4 @@ serde.workspace = true
 # engine, never re-define it.
 [dev-dependencies]
 myelin-identity-service = { path = "../myelin-identity-service" }
-myelin-events = { path = "../myelin-events" }
 myelin-storage = { path = "../myelin-storage" }
