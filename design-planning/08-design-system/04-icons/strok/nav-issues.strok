@@ -1,14 +1,12 @@
 documentsize 24x24
 defaults
   fill none
-  stroke $ink
+  stroke currentColor
   stroke-width 2
   stroke-linecap round
   stroke-linejoin round
-palette
-  ink #ff00ff
 shape ring template=ellipse
 place r1 shape=ring at=3,3 size=18x18
 shape dot template=ellipse
-  fill $ink
+  fill currentColor
 place d1 shape=dot at=10,10 size=4x4

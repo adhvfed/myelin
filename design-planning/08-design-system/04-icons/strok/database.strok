@@ -1,12 +1,10 @@
 documentsize 24x24
 defaults
   fill none
-  stroke $ink
+  stroke currentColor
   stroke-width 2
   stroke-linecap round
   stroke-linejoin round
-palette
-  ink #ff00ff
 shape top template=ellipse
 place t1 shape=top at=5,4 size=14x5
 shape sides template=path
