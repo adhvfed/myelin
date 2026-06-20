@@ -73,6 +73,13 @@ serde = { workspace = true }
 # per node via `OutboxTx::emit`. `myelin-content` depends only on tenancy/events/identity (never on
 # refs-service), so this is acyclic — refs-service stays the graph's terminal leaf consumer.
 myelin-content = { path = "../myelin-content" }
+# BLAKE3 + hex — the content-anchored Git line-range fingerprint (REF-P15 / P-164, §3.5: a
+# `#L<a>-L<b>` carries a BLAKE3 fingerprint of the anchored lines so resolution is content-anchored,
+# not positional). The SAME `blake3:<hex>` multihash convention the BlobStore content-address + the
+# GDPR receipt + the audit Merkle leaf use (one convention, not a second one). Leaf dev/runtime deps,
+# already in the workspace; no DAG edge added.
+blake3 = { workspace = true }
+hex = { workspace = true }
 
 # ------------------------------------------------------------------------------------------
 # REAL edge inverse-index schema apply behind the `integration` feature (REF-P5 / P-154). The
