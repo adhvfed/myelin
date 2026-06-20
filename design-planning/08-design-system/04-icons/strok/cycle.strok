@@ -19,7 +19,7 @@ shape ring template=path
   addpoint i at=10,5
 place r1 shape=ring at=0,0
 shape arrowhead template=path
-  addpoint a at=10,8
+  addpoint a at=11,8
   addpoint b at=14,4
-  addpoint c at=10,2
+  addpoint c at=11,3
 place ah shape=arrowhead at=0,0
