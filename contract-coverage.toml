@@ -397,8 +397,11 @@ landing = "P-159"
 [[contract]]
 row = "5.3"
 title = "backlinks / edges / traverse"
-status = "deferred"
-landing = "P-162"
+status = "covered"
+cdc = [
+    "crates/myelin-refs-service/tests/cdc_5_3_backlinks.rs",
+    "crates/myelin-refs-service/tests/cdc_5_3_traverse.rs",
+]
 
 [[contract]]
 row = "5.4"

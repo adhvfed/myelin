@@ -169,6 +169,29 @@
 //! subject's cached titles + Identity pseudonym shred for `origin_actor` + reindex-from-source) lands
 //! in **REF-P15** — the cache is the crypto-shred-able holder, NOT the complete erasure answer.
 //!
+//! **REF-P13 (P-162) ships:** the [`traverse`] module — the **bounded, cycle-safe recursive-CTE
+//! traverse** ([`traverse::Traverse::traverse`], contract 5.3 OWNED; §4.5): a `WITH RECURSIVE`-shaped
+//! BFS over the §3.2/§3.4 `edge` adjacency list ([`edge_builder::EdgeProjection::outbound_live`])
+//! filtered by `rel`/`rel_class` ([`traverse::TraverseFilter`]), with a `path`-array **visited-set
+//! cycle guard** (a self-referential graph TERMINATES, the cycle surfaced as a
+//! [`traverse::TraverseResult::cycle_detected`] DIAGNOSTIC, never a hang — drill REF-D8), a **depth
+//! ceiling** (default 16, read from the thresholds file `[refs_traverse]` — the single source of
+//! truth, [`traverse::TRAVERSE_DEPTH_CEILING`]; DISTINCT from the agent CAUSAL ceiling 12), a
+//! **collected-node budget** (X-3 — a wide graph the depth ceiling alone would not bound), a
+//! **PARTIAL result + `truncated` marker** when either budget is hit (never an unbounded scan), and
+//! **ONE** `list_objects` post-filter over the COLLECTED node set — **NOT per-hop**
+//! ([`traverse::apply_post_filter`]) — where a hop into an unreadable artifact **PRUNES that branch**
+//! (the node AND everything reachable only through it are dropped — the traversal is not a
+//! side-channel; drill REF-D1 traverse half: 0 leak). The post-filter reuses the SAME FROZEN
+//! [`backlinks::set_expr_admits`] the backlink read lowers (ONE source of truth, no second algebra).
+//! **FLOOR named:** the `rel_class`/lifecycle edges the traverse walks are minted as a DISCIPLINED,
+//! inverse-paired vocabulary by the **TE-7 mirror discipline (REF-P14)** — named so a `blocked_by`
+//! traverse is not mistaken for cross-subsystem-lifecycle-aware before the mirror discipline lands
+//! (the walk MECHANISM is real here; the lifecycle VOCABULARY is REF-P14). The statement-timeout +
+//! the real Postgres `WITH RECURSIVE … CYCLE … LIMIT` over the per-tenant-DEK-encrypted `edge` table
+//! land with the OLTP store in `serve` (REF-P5+); the BOUND DISCIPLINE is real + proven over the
+//! in-memory adjacency model here.
+//!
 //! **Does NOT ship (floors named):**
 //! - **The producers are SYNTHETIC at M2.** REF-P8 exercises the seam with a TEST content writer; the
 //!   first REAL producers (Git diffs / Knowledge blocks / Chat messages writing actual content) land
@@ -213,6 +236,7 @@ pub mod loop_guard;
 pub mod migration;
 pub mod residency;
 pub mod resolve;
+pub mod traverse;
 
 pub use backlinks::{
     ids_result, lower_over_source_root, set_expr_admits, source_root_colref, view_permission,
@@ -250,6 +274,10 @@ pub use holder::{
     RefsHolderRegistration, REFS_CACHE_STORE, REFS_EDGE_STORE,
 };
 pub use residency::{refs_store_descriptors, RefsStoreDescriptor};
+pub use traverse::{
+    apply_post_filter, depth_ceiling_from_thresholds, max_nodes_from_thresholds, Traverse,
+    TraverseFilter, TraverseNode, TraverseResult, TRAVERSE_DEPTH_CEILING, TRAVERSE_MAX_NODES,
+};
 pub use resolve::{
     bounded_stale, strong_read, AuthzServed, CrossCellDisposition, NoOpCacheRead, OwnerProjection,
     ProjectApi, ProjectApiError, ProjectOutcome, Projection, ProjectionCacheRead, ProjectionFlag,

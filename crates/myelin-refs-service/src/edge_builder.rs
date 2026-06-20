@@ -292,6 +292,36 @@ impl EdgeProjection {
         rows.sort_by(|a, b| a.edge_id.cmp(&b.edge_id));
         rows
     }
+
+    /// **The LIVE outbound edges from `source_root` in the `(tenant, region)` partition (the
+    /// `edge_outbound WHERE NOT tombstoned` range scan — §3.2).** This is the adjacency-list step the
+    /// REF-P13 recursive-CTE traverse takes at each hop: "the edges DEPARTING this node" (so the
+    /// multi-hop walk follows `source_root → target_root`). Tenant-first (no cross-tenant path), live
+    /// edges only, keyed on the §3.2 stored `source_root` column (the `edge_outbound` index, §3.4).
+    /// Deterministic order by `edge_id` (the in-memory model has no `created_at`; the real Postgres
+    /// `edge` table uses the index order — documented). This is the UNFILTERED adjacency step; the
+    /// traverse applies the `rel`/`rel_class` filter + the ONE `list_objects` post-filter over the
+    /// COLLECTED node set (NOT per-hop) — see [`crate::traverse`].
+    pub fn outbound_live(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+        source_root: &ArtifactRef,
+    ) -> Vec<EdgeRow> {
+        let pk = PartKey { tenant: tenant.clone(), region: region.clone() };
+        let mut rows: Vec<EdgeRow> = self
+            .lock()
+            .get(&pk)
+            .map(|p| {
+                p.values()
+                    .filter(|r| !r.tombstoned && &r.source_root == source_root)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        rows.sort_by(|a, b| a.edge_id.cmp(&b.edge_id));
+        rows
+    }
 }
 
 /// Why a `refs.edge.*` / typed-lifecycle event could not be projected — a structurally-malformed
