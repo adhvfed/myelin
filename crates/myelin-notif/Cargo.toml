@@ -50,6 +50,11 @@ myelin-identity = { path = "../myelin-identity" }
 # ArtifactRef (re-exported) — InboxItem stores refs-not-payloads (NOTIF-1), so erasure
 # tombstones a person's appearance for free (the §3.9/C7 invariant the holder, NOTIF-P4, leans on).
 myelin-refs = { path = "../myelin-refs" }
+# The curated Signal type + Severity (myelin_query::signals, P-138 / EB-18). The router (NOTIF-P3)
+# consumes Signals over `sig.<tenant>.>` — it deserializes `Signal` from the envelope payload and
+# UPSERTs an inbox item. The Signal engine lives in myelin-query (the documented EB-18 deviation:
+# its matcher IS an EventMatcher, promoted into myelin-query); the router references the Signal type.
+myelin-query = { path = "../myelin-query" }
 # The harness: serve(AppSpec) + the three-surface topology (public/internal/metrics-health) +
 # liveness≠readiness + the outbox relay + graceful drain. The shell is an AppSpec this wires; it
 # is NOT a service that re-implements the lifecycle (contract 1.1).
@@ -59,6 +64,9 @@ myelin-substrate = { path = "../myelin-substrate" }
 # no-untagged-personal-data gate's compile-time half.
 myelin-gdpr = { path = "../myelin-gdpr" }
 serde = { workspace = true }
+# The router (NOTIF-P3) deserializes the curated `Signal` out of the envelope payload (a poison
+# payload → NonRetryable) and builds the `notif.item.created` references-not-payloads emit payload.
+serde_json = { workspace = true }
 
 # REAL Postgres backend behind the `integration` feature (Stage 1 / infra). OPTIONAL deps pulled
 # ONLY by `--features integration`, which compiles the live-PG schema-apply + RLS denial test

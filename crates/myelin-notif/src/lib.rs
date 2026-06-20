@@ -46,11 +46,13 @@
 //! shapes), so there is no mutation-score floor on this prompt — stated explicitly per the
 //! template's TESTS field.
 
+use myelin_events::{DedupLedger, InProcessBus, OutboxStore};
 use myelin_refs::ArtifactRef;
 use myelin_substrate::{
-    boot, serve, AppSpec, Config, CriticalDependencies, HotTables, InternalRpc, Migrations,
-    PublicRoutes, ServeError, ServeHandle, StoreManifest,
+    boot, serve, AppSpec, Config, ConsumerReg, CriticalDependencies, HotTables, InternalRpc,
+    Migrations, OutboxSpec, PublicRoutes, ServeError, ServeHandle, StoreManifest,
 };
+use myelin_tenancy::TenantId;
 use serde::{Deserialize, Serialize};
 
 // The Notif data model — the nine tenant-partitioned tables (NOTIF-P2 / P-180). `schema` carries the
@@ -59,7 +61,13 @@ use serde::{Deserialize, Serialize};
 // lint-fixture proof (the three schema gates bite) lives in `tests/lint_fixtures.rs` over RED/GREEN
 // fixtures under `tests/fixtures/` (which the lint-gate excludes by the `/fixtures/` convention).
 pub mod migrations;
+pub mod router;
 pub mod schema;
+
+pub use router::{
+    build_router, signal_subject_prefix, InboxProjection, RoutedInboxItem, SignalRouter,
+    NOTIF_ESCALATION_ACKED, NOTIF_ITEM_CREATED, ROUTER_CONSUMER_NAME,
+};
 
 /// The service name (a PII-free label, the telemetry / trace / deployable identifier). The
 /// `notif` binary (`src/main.rs`) and the `AppSpec::name` both read this so the deployable
@@ -278,6 +286,49 @@ pub fn notif_app_spec(config: Config) -> AppSpec {
     }
 }
 
+/// **Assemble the Notif [`AppSpec`] WITH the Signal-consumer router wired into the consumer seam
+/// (NOTIF-P3 / P-181).** Unlike the bare [`notif_app_spec`] (whose `consumers` slot is empty at the
+/// shell, awaiting the homed-tenant binding), this builds the [`SignalRouter`](router::SignalRouter)
+/// — the [`EventHandler`](myelin_events::EventHandler) consumer of curated Signals (`sig.<tenant>.>`)
+/// that UPSERTs inbox items and emits `notif.item.created` via the outbox — for each tenant in
+/// `tenants`, registers them into the AppSpec `consumers` slot, and supplies the SAME
+/// [`OutboxStore`] the routers emit into to the [`OutboxSpec`] the relay drains (so the emit →
+/// relay → bus path is the ONE sanctioned outbox path, BUS-2/2.2).
+///
+/// Returns the spec + the shared [`InboxProjection`] the routers UPSERT into (so a drill / the
+/// integration test can read the routed inbox). One [`DedupLedger`] is shared across the tenant
+/// routers (the `(consumer, event_id)` PK keeps them isolated; rule 1/4).
+///
+/// **Floor named:** the LIVE homed-tenant set a cell's router pool binds is the control plane's
+/// (`placement_of`, CP-15, M3) — at M2 the caller passes the tenant set explicitly (the drill / the
+/// integration / a single-cell self-host). The bare [`notif_app_spec`] keeps the empty seam for the
+/// shell-boot property; this is the wired path.
+pub fn notif_app_spec_with_router(
+    config: Config,
+    tenants: &[TenantId],
+) -> (AppSpec, router::InboxProjection) {
+    let inbox = router::InboxProjection::new();
+    // The ONE outbox the routers emit into AND the relay drains (BUS-2): supply it to the
+    // OutboxSpec so the emit → relay → bus path is the sanctioned one (no second store).
+    let outbox = OutboxStore::new();
+    let dedup = DedupLedger::new();
+    let mut consumers: Vec<ConsumerReg> = Vec::with_capacity(tenants.len());
+    for tenant in tenants {
+        // `build_router` binds the `sig.<tenant>.` whitelist through the sanctioned `consume`
+        // (rule 3: rejects `*`/empty). A malformed/over-broad tenant is skipped loudly (it never
+        // silently narrows to an over-broad subscription) — the shell still boots without it.
+        if let Ok(router) = router::build_router(tenant, inbox.clone(), outbox.clone(), dedup.clone())
+        {
+            consumers.push(ConsumerReg::new(router));
+        }
+    }
+    let mut spec = notif_app_spec(config);
+    spec.consumers = consumers;
+    // The routers emit into `outbox`; the relay must drain THAT store (not a fresh default one).
+    spec.outbox = OutboxSpec::new(outbox, InProcessBus::new());
+    (spec, inbox)
+}
+
 /// Boot the Notif service shell under the harness (contract 1.1) up to the pre-serve state,
 /// returning the [`ServeHandle`] the lifecycle drives. A thin wrapper over
 /// [`boot`](myelin_substrate::boot) of [`notif_app_spec`] — separated so a test/drill can boot,
@@ -380,6 +431,45 @@ mod tests {
         );
         assert_eq!(spec.migrations, migrations::migrations(), "the AppSpec wires the NOTIF-P2 set");
         assert_eq!(spec.name, SERVICE_NAME);
+    }
+
+    /// **NOTIF-P3: `notif_app_spec_with_router` REGISTERS the Signal-consumer router into the
+    /// AppSpec consumer seam (no longer empty).** For a homed-tenant set, the routers are wired as
+    /// `ConsumerReg`s and the SAME outbox they emit into is supplied to the relay (BUS-2). The bare
+    /// `notif_app_spec` keeps the empty seam for the shell-boot property; this is the wired path.
+    #[test]
+    fn notif_app_spec_with_router_registers_the_router_consumer() {
+        let tenants = [TenantId("acme".into()), TenantId("globex".into())];
+        let (spec, _inbox) = notif_app_spec_with_router(Config::default(), &tenants);
+        assert_eq!(
+            spec.consumers.len(),
+            2,
+            "the Signal-consumer router is registered for each homed tenant (the seam is wired)"
+        );
+        assert_eq!(spec.name, SERVICE_NAME);
+        // the wired spec STILL carries the nine-table data model + boots.
+        assert_eq!(spec.migrations.0.len(), 9, "the NOTIF-P2 data model is still wired");
+        let handle = boot(spec).expect("the router-wired notif spec boots under the harness");
+        assert_eq!(
+            handle.surfaces(),
+            &[
+                myelin_substrate::Surface::Public,
+                myelin_substrate::Surface::Internal,
+                myelin_substrate::Surface::MetricsHealth
+            ],
+            "the three ports bind around the router-wired spec"
+        );
+    }
+
+    /// **An over-broad / malformed tenant is skipped loudly (never silently narrowed) — the shell
+    /// still boots with the valid routers.** A malformed tenant cannot bind an over-broad `sig.>`
+    /// subscription; it is dropped, the valid tenant's router is wired.
+    #[test]
+    fn notif_app_spec_with_router_skips_overbroad_tenant_but_boots() {
+        let tenants = [TenantId("acme".into()), TenantId("".into())]; // the empty tenant is invalid.
+        let (spec, _inbox) = notif_app_spec_with_router(Config::default(), &tenants);
+        assert_eq!(spec.consumers.len(), 1, "only the valid tenant's router is wired (the empty one is skipped)");
+        boot(spec).expect("the shell still boots with the valid router");
     }
 }
 

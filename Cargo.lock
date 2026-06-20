@@ -2266,10 +2266,12 @@ dependencies = [
  "myelin-harness",
  "myelin-identity",
  "myelin-lints",
+ "myelin-query",
  "myelin-refs",
  "myelin-substrate",
  "myelin-tenancy",
  "serde",
+ "serde_json",
  "sqlx",
  "tokio",
 ]
