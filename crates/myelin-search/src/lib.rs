@@ -111,6 +111,7 @@
 //! whole erasure answer. No index / layout / migration / real ciphertext / real vectors ship here.
 
 pub mod compiler;
+pub mod consistency;
 pub mod dek;
 pub mod engine;
 pub mod erasure_posture;
@@ -126,6 +127,10 @@ pub use compiler::{
     compile, render, CompileError, CompiledPlan, ConjoinedPlan, FieldDecl, FieldKind, FieldSchema,
     FtClause, PostFetchPredicate, Sort, StructuredClause, VectorBranch, FT_BODY_FIELD,
     SEMANTIC_FIELD, SORT_FIELD,
+};
+pub use consistency::{
+    disposition, fail_static_bypass, stale_candidates, BoundedCheckPort, CandidateDisposition,
+    ConsistencyStats,
 };
 pub use dek::{srch_p03_inherited_gates, hyok_skips_index, InheritedGate, SearchDekPin};
 pub use engine::{
@@ -146,8 +151,9 @@ pub use layout::{
     SrchP03Floor, StatefulComponent,
 };
 pub use pipeline::{
-    query, ListObjectsPort, Page, QueryError, QueryStats, RankedResult, RankedResults,
-    RelationalLeaf, ReverseIndexAnswer, RevisionWatermark, ScopedEngine, READ_PERMISSION,
+    query, query_consistent, ListObjectsPort, Page, QueryError, QueryStats, RankedResult,
+    RankedResults, RelationalLeaf, ReverseIndexAnswer, RevisionWatermark, ScopedEngine,
+    READ_PERMISSION,
 };
 pub use residency::{search_store_descriptors, SearchStoreDescriptor};
 pub use shell::{
