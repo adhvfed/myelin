@@ -1,81 +1,51 @@
 #!/usr/bin/env bash
 #
-# build.sh — render + export every icon in strok/ to preview/ and svg/.
+# build.sh — render + export every icon in strok/ to svg/ and preview/.
 #
-# For every strok/<name>.strok:
-#   1. render a PNG preview         -> preview/<name>.png
-#   2. export a raw SVG (sentinel)  -> svg/<name>.raw.svg
-#   3. post-process the $ink sentinel hex (#ff00ff) -> currentColor
-#                                    -> svg/<name>.svg   (the shipped file)
+#   svg/<name>.svg      themeable SVG, stroke="currentColor" preserved (shipped file)
+#   preview/<name>.png  raster preview at 64px, inked for visual review
 #
-# Idempotent: re-running regenerates the same outputs from the .strok sources,
-# which remain the source of truth. No icon names are hardcoded — it loops over
-# whatever .strok files exist, so the refine passes can add/edit freely.
+# Uses `strok batch` (the icon-set export path): the .strok sources author colour as
+# the literal `currentColor` (icon profile), so the exported SVG inherits the host
+# stylesheet's colour and PNG previews substitute a concrete --color. No sentinel,
+# no sed, no per-file loop.
 #
-# Requires: strok (vector CLI) on PATH, and sed.
+# Idempotent: regenerates the same outputs from the .strok sources (the source of
+# truth). No icon names are hardcoded.
+#
+# Requires: strok (vector CLI) with `batch` support on PATH.
 
 set -euo pipefail
 
-# Resolve directories relative to this script so it runs from anywhere.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STROK_DIR="$ROOT/strok"
 SVG_DIR="$ROOT/svg"
 PREVIEW_DIR="$ROOT/preview"
+INK="#1a1a1a"   # preview ink (SVGs stay currentColor; this only colours the PNGs)
 
-# The reserved sentinel hex bound to the $ink palette token in every .strok.
-# It is used NOWHERE else, so the swap to currentColor can never collide.
-SENTINEL="#ff00ff"
+if ! command -v strok >/dev/null 2>&1; then
+  echo "error: 'strok' not found on PATH" >&2; exit 1
+fi
+if ! strok batch --help >/dev/null 2>&1; then
+  echo "error: this strok build lacks 'batch' — rebuild/reinstall strok (cargo install --path strok-cli --force)" >&2; exit 1
+fi
 
 mkdir -p "$SVG_DIR" "$PREVIEW_DIR"
 
-if ! command -v strok >/dev/null 2>&1; then
-  echo "error: 'strok' not found on PATH" >&2
-  exit 1
+# Themeable SVGs (currentColor preserved).
+strok batch "$STROK_DIR" --svg --out "$SVG_DIR" >/dev/null
+
+# 64px inked PNG previews (single size -> <name>.png).
+strok batch "$STROK_DIR" --png --color "$INK" --sizes 64 --out "$PREVIEW_DIR" >/dev/null
+
+# Verify every shipped SVG inherits currentColor and carries no baked hex.
+missing="$(grep -L 'currentColor' "$SVG_DIR"/*.svg || true)"
+if [ -n "$missing" ]; then
+  echo "error: these SVGs do not inherit currentColor:" >&2; echo "$missing" >&2; exit 1
+fi
+if grep -lE '#[0-9a-fA-F]{3,6}' "$SVG_DIR"/*.svg >/dev/null 2>&1; then
+  echo "error: a shipped SVG contains a baked hex colour" >&2
+  grep -lE '#[0-9a-fA-F]{3,6}' "$SVG_DIR"/*.svg >&2; exit 1
 fi
 
-shopt -s nullglob
-files=("$STROK_DIR"/*.strok)
-shopt -u nullglob
-
-if [ ${#files[@]} -eq 0 ]; then
-  echo "warning: no .strok files found in $STROK_DIR" >&2
-  exit 0
-fi
-
-count=0
-for src in "${files[@]}"; do
-  name="$(basename "$src" .strok)"
-  # Skip the optional shared-defaults include (not a renderable icon).
-  case "$name" in
-    _*) continue ;;
-  esac
-
-  png="$PREVIEW_DIR/$name.png"
-  raw="$SVG_DIR/$name.raw.svg"
-  out="$SVG_DIR/$name.svg"
-
-  # 1. PNG preview (base palette: the sentinel renders as magenta, which is
-  #    fine for a preview — it just proves the geometry).
-  strok -f "$src" render --out "$png" >/dev/null
-
-  # 2. Raw SVG export (sentinel hex still present).
-  strok -f "$src" export svg --out "$raw" >/dev/null
-
-  # 3. Sentinel -> currentColor. fill="none" survives untouched.
-  sed "s/${SENTINEL}/currentColor/g" "$raw" > "$out"
-
-  # Drop the intermediate raw file; the .strok + svg are the kept artifacts.
-  rm -f "$raw"
-
-  # Safety check: no leftover sentinel hex in the shipped file.
-  if grep -qi "$SENTINEL" "$out"; then
-    echo "error: $out still contains the sentinel hex $SENTINEL" >&2
-    exit 1
-  fi
-
-  count=$((count + 1))
-  echo "built $name"
-done
-
-echo "----"
-echo "built $count icon(s) -> svg/ + preview/"
+echo "built $(ls "$SVG_DIR"/*.svg | wc -l | tr -d ' ') icon(s) -> svg/ (currentColor) + preview/ (64px @ $INK)"

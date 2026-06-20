@@ -1,12 +1,10 @@
 documentsize 24x24
 defaults
   fill none
-  stroke $ink
+  stroke currentColor
   stroke-width 2
   stroke-linecap round
   stroke-linejoin round
-palette
-  ink #ff00ff
 shape body template=path
   addpoint a at=15,5
   addpoint b at=19,9
