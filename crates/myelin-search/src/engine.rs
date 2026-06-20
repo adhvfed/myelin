@@ -164,12 +164,13 @@ impl IndexDocument {
 pub const ORDER_KEY_FIELD: &str = "order_key";
 
 /// **The lowered ACL filter** — the doc-id set membership clause conjoined at the posting-list
-/// level (§4.2). SRCH-P04 carries the minimal lowering the architecture names: `All` (no clause —
+/// level (§4.2). The **bounded-set** lowering the architecture names (SRCH-P08): `All` (no clause —
 /// admin sees everything of this type in the tenant), `None` (short-circuit to empty — `WHERE
-/// false`), and `Ids` (a doc-id / `acl_object` term-set membership clause). The full frozen
-/// `SetExpr` algebra (`NotIds`/`InRelation`/`TupleSet`/`Union`/`Intersect`/`Difference`) +
-/// `list_objects` conjoin is the SRCH-P08 query-path follow-on; the trait already TAKES the filter
-/// so the engine can never be reached without one.
+/// false`), `Ids` (a doc-id / `acl_object` term-set membership clause), and `NotIds` (the bounded
+/// **deny-set** over an otherwise-visible space — `WHERE id NOT IN (...)`). The **relational**
+/// `SetExpr` forms (`InRelation`/`TupleSet`) + boolean composition (`Union`/`Intersect`/
+/// `Difference`) lower to the reverse-index JOIN in the SRCH-P09 sibling slice (fed the SAME
+/// conjoin step). The trait already TAKES the filter so the engine can never be reached without one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AclFilter {
     /// The viewer sees everything of this type in the tenant (admin) — **no** ACL clause needed
@@ -181,12 +182,24 @@ pub enum AclFilter {
     /// A bounded allow-set — a **doc-id / `acl_object` set membership** clause; only documents whose
     /// `doc_id` OR `acl_object` is in the set can surface.
     Ids(Vec<String>),
+    /// A bounded **deny-set** over the otherwise-visible space (the `SetExpr::NotIds` lowering,
+    /// §7.1) — a document surfaces **unless** its `doc_id` OR `acl_object` is in the set
+    /// (`WHERE id NOT IN (...)`). An empty deny-set ⇒ everything of this type is visible
+    /// (equivalent to `All` within the type-and-tenant scope). The exclusion is conjoined as a
+    /// `MUST_NOT` at the posting-list level, BEFORE scoring — a denied doc never enters the
+    /// candidate set (no count/rank leak), exactly like `Ids`.
+    NotIds(Vec<String>),
 }
 
 impl AclFilter {
     /// Build an allow-set filter from an iterator of ACL object ids.
     pub fn ids(ids: impl IntoIterator<Item = impl Into<String>>) -> AclFilter {
         AclFilter::Ids(ids.into_iter().map(Into::into).collect())
+    }
+
+    /// Build a deny-set filter from an iterator of ACL object ids (the bounded `NotIds` lowering).
+    pub fn not_ids(ids: impl IntoIterator<Item = impl Into<String>>) -> AclFilter {
+        AclFilter::NotIds(ids.into_iter().map(Into::into).collect())
     }
 }
 
@@ -348,6 +361,16 @@ struct SearchSchema {
     lang: Field,
 }
 
+/// The result of lowering an [`AclFilter`] to a Tantivy clause (the `acl_query` helper): either a
+/// conjoinable clause, or the short-circuit-to-empty signal (`None`/empty allow-set).
+enum AclQuery {
+    /// The filter resolves to no visible documents — the search entry returns an empty result set
+    /// WITHOUT touching the engine (the `WHERE false` short-circuit).
+    Empty,
+    /// The conjoinable ACL clause (a `MUST` membership, an `AllQuery`, or a `MUST_NOT` exclusion).
+    Clause(Box<dyn Query>),
+}
+
 impl TantivyBackend {
     /// **Open** an in-RAM per-tenant Tantivy index over the given structured-facet declaration
     /// (`name → FieldType`). The FT body, `doc_id`/`acl_object`, the `order_key` fast-field, and one
@@ -471,6 +494,42 @@ impl TantivyBackend {
             }
         }
         Some(Box::new(BooleanQuery::new(subs)))
+    }
+
+    /// Build the **deny** membership clause (a `doc_id`/`acl_object` term-set) for a `NotIds`
+    /// filter — the set of docs that must be EXCLUDED. The caller wraps it in a `MUST_NOT`. An
+    /// empty deny-set ⇒ `None` (nothing to exclude — every doc of this type is visible).
+    fn deny_clause(&self, ids: &[String]) -> Option<Box<dyn Query>> {
+        // The same membership shape as `acl_clause` (doc_id OR acl_object in the set); the caller
+        // negates it. Reusing `acl_clause` keeps ONE membership-clause builder (no drift).
+        self.acl_clause(ids)
+    }
+
+    /// Lower an [`AclFilter`] to the conjoinable engine clause (the bounded-set lowering crux,
+    /// §4.2): `None`/empty-allow-set ⇒ [`AclQuery::Empty`] (the caller short-circuits to no
+    /// results); `All`/empty-deny-set ⇒ an `AllQuery` (no exclusion needed within the
+    /// type-and-tenant scope); `Ids` ⇒ a `MUST` membership clause; `NotIds` ⇒ a `MUST_NOT`
+    /// exclusion clause. The ONE place an `AclFilter` becomes a Tantivy clause, so every search
+    /// entry conjoins the identical ACL semantics.
+    fn acl_query(&self, acl_filter: &AclFilter) -> AclQuery {
+        match acl_filter {
+            AclFilter::None => AclQuery::Empty,
+            AclFilter::All => AclQuery::Clause(Box::new(tantivy::query::AllQuery)),
+            AclFilter::Ids(ids) => match self.acl_clause(ids) {
+                Some(q) => AclQuery::Clause(q),
+                None => AclQuery::Empty, // empty allow-set ⇒ nothing visible.
+            },
+            AclFilter::NotIds(ids) => match self.deny_clause(ids) {
+                // `MUST_NOT` alone matches nothing in Tantivy, so pair it with an `AllQuery` MUST
+                // (admit everything, then exclude the deny-set) — `WHERE NOT IN (...)`.
+                Some(deny) => AclQuery::Clause(Box::new(BooleanQuery::new(vec![
+                    (Occur::Must, Box::new(tantivy::query::AllQuery) as Box<dyn Query>),
+                    (Occur::MustNot, deny),
+                ]))),
+                // An empty deny-set excludes nothing ⇒ everything of this type is visible.
+                None => AclQuery::Clause(Box::new(tantivy::query::AllQuery)),
+            },
+        }
     }
 
     /// The number of searchable segments currently in the index (after the last commit). A fresh
@@ -625,13 +684,9 @@ impl IndexBackend for TantivyBackend {
         limit: usize,
     ) -> Result<Vec<Hit>, IndexError> {
         // The ACL pre-filter (§4.2.1): None short-circuits to empty BEFORE any scoring.
-        let acl_clause: Box<dyn Query> = match acl_filter {
-            AclFilter::None => return Ok(Vec::new()),
-            AclFilter::All => Box::new(tantivy::query::AllQuery),
-            AclFilter::Ids(ids) => match self.acl_clause(ids) {
-                Some(q) => q,
-                None => return Ok(Vec::new()), // empty allow-set ⇒ nothing visible.
-            },
+        let acl_clause: Box<dyn Query> = match self.acl_query(acl_filter) {
+            AclQuery::Empty => return Ok(Vec::new()),
+            AclQuery::Clause(q) => q,
         };
 
         let reader = self.index.reader()?;
@@ -665,13 +720,9 @@ impl IndexBackend for TantivyBackend {
         value: &FieldValue,
         limit: usize,
     ) -> Result<Vec<Hit>, IndexError> {
-        let acl_clause: Box<dyn Query> = match acl_filter {
-            AclFilter::None => return Ok(Vec::new()),
-            AclFilter::All => Box::new(tantivy::query::AllQuery),
-            AclFilter::Ids(ids) => match self.acl_clause(ids) {
-                Some(q) => q,
-                None => return Ok(Vec::new()),
-            },
+        let acl_clause: Box<dyn Query> = match self.acl_query(acl_filter) {
+            AclQuery::Empty => return Ok(Vec::new()),
+            AclQuery::Clause(q) => q,
         };
 
         let (tf, declared) = self.schema.facets.get(field).copied().ok_or_else(|| {
@@ -746,6 +797,15 @@ impl IndexBackend for TantivyBackend {
                     ids.iter().map(String::as_str).collect();
                 self.vectors
                     .knn_filtered(query, k, |doc_id| allow.contains(doc_id))
+            }
+            // The bounded deny-set: a candidate enters ONLY if its doc_id is NOT in the deny-set
+            // (filter-during-traversal, the complement of `Ids`). An empty deny-set admits all
+            // (≡ `All`). The denied nearest neighbour never enters the candidate set (no leak).
+            AclFilter::NotIds(ids) => {
+                let deny: std::collections::HashSet<&str> =
+                    ids.iter().map(String::as_str).collect();
+                self.vectors
+                    .knn_filtered(query, k, |doc_id| !deny.contains(doc_id))
             }
         };
         Ok(hits)
