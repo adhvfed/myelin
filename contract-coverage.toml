@@ -480,11 +480,17 @@ landing = "P-231"
 
 # ──────────────── §7 Notifications (myelin-notif) ───────────────────────────────────────────────
 
+# 7.1 COVERED at NOTIF-P5 (P-183): the list_inbox read surface + the C-9 scoped-view filter grammar.
+# The provider (Notif owns 7.1 — the ONE inbox, a view is a STRICT SUBSET) + consumer (a subsystem
+# scoped view / the CLI inbox list|show reading through the SAME list_inbox path) CDC pair. Step-0
+# read authorize (4.2/4.10) drops an unseeable item (held, not leaked, ADR-03). Ranking is NOTIF-P7.
 [[contract]]
 row = "7.1"
 title = "list_inbox"
-status = "deferred"
-landing = "P-183"
+status = "covered"
+cdc = [
+    "crates/myelin-notif/tests/cdc_7_1_notif_list_inbox.rs",
+]
 
 [[contract]]
 row = "7.2"

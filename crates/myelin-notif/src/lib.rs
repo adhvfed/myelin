@@ -65,14 +65,21 @@ use serde::{Deserialize, Serialize};
 // the nine forward-only `(tenant, region)`-first RLS migrations (contract 1.5). The committed-ratchet
 // lint-fixture proof (the three schema gates bite) lives in `tests/lint_fixtures.rs` over RED/GREEN
 // fixtures under `tests/fixtures/` (which the lint-gate excludes by the `/fixtures/` convention).
+pub mod cli;
 pub mod holder;
+pub mod list_inbox;
 pub mod migrations;
 pub mod router;
 pub mod schema;
 
+pub use cli::{inbox_list, inbox_show, CliView, InboxShow};
 pub use holder::{
     notif_history_holder, notif_store_classifier, register_notif_holder, NotifBacking,
     NotifHistoryHolder, NotifHolderRegistration, RestrictSet, NOTIF_OLTP_STORE,
+};
+pub use list_inbox::{
+    list_inbox, subsystem_of, AllowAllAuthorize, Cursor, InboxFilter, InboxPage, Page,
+    ReadAuthorizePort, Subsystem,
 };
 pub use router::{
     build_router, signal_subject_prefix, InboxProjection, RoutedInboxItem, SignalRouter,
