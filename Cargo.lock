@@ -2055,12 +2055,14 @@ dependencies = [
 name = "myelin-refs-service"
 version = "0.0.0"
 dependencies = [
+ "myelin-events",
  "myelin-gdpr",
  "myelin-identity",
  "myelin-refs",
  "myelin-storage",
  "myelin-substrate",
  "myelin-tenancy",
+ "serde_json",
  "sqlx",
  "tokio",
 ]

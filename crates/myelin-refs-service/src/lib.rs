@@ -57,10 +57,26 @@
 //! `tests/integration_ref_p5_edge_schema.rs` (the `integration` feature). This is the SCHEMA ONLY —
 //! the builder/invalidator that POPULATE it are **REF-P6/P7**.
 //!
+//! **REF-P6 (P-155) ships:** the [`edge_builder`] module — the **refs-edge-builder consumer**
+//! (contract 5.4 consumer side): an ordinary [`myelin_events::EventHandler`] that whitelists
+//! `refs.edge.>` + the typed-lifecycle subjects `issue.relation.>` / `knowledge.page.>` (NEVER `*` —
+//! a reviewed firehose-class consumer, BUS-4), **upserts on `*.created`** (idempotent via the
+//! deterministic [`edge_builder::edge_id`] = `hash(tenant, source, target, rel)`), **tombstones on
+//! `*.removed`/`*.erased`** (§4.6), writes `source_root`/`target_root` by [`myelin_refs::strip_sub`],
+//! and emits the **`refs.index_lag`** telemetry (contract 1.8). **Steady-state == cold-rebuild is ONE
+//! code path** ([`edge_builder::RefsEdgeBuilder::project`]) — a live event and a reindex-from-source
+//! `*.snapshot` replay both flow through it, with NO owner-DB backdoor (the no-cross-db floor,
+//! REF-D4). The REF-D7 ingest half (0 ghost / 0 lost, emit-iff-committed) + the idempotent rebuild
+//! upsert are proven against the live dev-stack Postgres in `tests/integration_ref_p6_edge_builder.rs`
+//! (the `integration` feature). The in-memory [`edge_builder::EdgeProjection`] models the §3.2 `edge`
+//! table; the REAL `INSERT … ON CONFLICT` against the per-tenant-DEK-encrypted table (executed in the
+//! SAME tx as the `consumer_dedup` mark) lands when the OLTP store is wired into `serve`.
+//!
 //! **Does NOT ship (floors named):**
-//! - **No edge BUILDER/INVALIDATOR, no R2 cache.** REF-P5 ships the empty schema; the
-//!   builder/invalidator consumers that populate it are **REF-P6/P7** (M2); the live R2 cache is
-//!   **REF-P12**. An empty table is not a working index — nothing writes a row here yet.
+//! - **No INVALIDATOR, no R2 cache.** REF-P6 ships the BUILDER (ingest); the `*.updated`/`*.erased`
+//!   cache invalidation it would drive is **REF-P7**'s refs-projection-invalidator (over the no-op
+//!   cache shim); the live R2 cache is **REF-P12**. Nothing here busts a cache yet — ingestion is not
+//!   a live projection.
 //! - **No real crypto-shred over real data.** The holder is a STUB surface: `erase` is a
 //!   well-defined no-op now (nothing to purge). The DEK lever EXISTS + FIRES (proven structurally in
 //!   [`dek`]), but the structural erasure body that USES it — R2-cache PII purge + reliance on
@@ -77,12 +93,17 @@
 #![forbid(unsafe_code)]
 
 pub mod dek;
+pub mod edge_builder;
 pub mod erasure_posture;
 pub mod holder;
 pub mod migration;
 pub mod residency;
 
 pub use dek::{ref_p5_inherited_gates, InheritedGate, RefsDekPin};
+pub use edge_builder::{
+    edge_id, EdgeProjection, EdgeRow, ProjectError, RefsEdgeBuilder, RelClass,
+    EDGE_BUILDER_CONSUMER, EDGE_BUILDER_SUBJECTS, EDGE_BUILDER_SUBJECT_PREFIXES,
+};
 pub use migration::{
     edge_ddl_is_forward_only, edge_table_dek_ref, edge_table_migrations, CREATE_EDGE_INDEXES_DDL,
     CREATE_EDGE_TABLE_DDL, EDGE_BY_REL_INDEX, EDGE_INBOUND_INDEX, EDGE_MIGRATION_ID,
