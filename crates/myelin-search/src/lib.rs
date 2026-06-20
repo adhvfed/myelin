@@ -111,6 +111,7 @@
 //! whole erasure answer. No index / layout / migration / real ciphertext / real vectors ship here.
 
 pub mod analysis;
+pub mod cache;
 pub mod compiler;
 pub mod consistency;
 pub mod dek;
@@ -125,6 +126,10 @@ pub mod residency;
 pub mod shell;
 pub mod vector;
 
+pub use cache::{
+    should_bypass, zookie_bucket, CacheStats, CacheTtl, FilterCache, ResultCache,
+    TtlExceedsRevocationSla,
+};
 pub use compiler::{
     compile, render, CompileError, CompiledPlan, ConjoinedPlan, FieldDecl, FieldKind, FieldSchema,
     FtClause, PostFetchPredicate, Sort, StructuredClause, VectorBranch, FT_BODY_FIELD,
