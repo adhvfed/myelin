@@ -124,6 +124,7 @@ pub mod layout;
 pub mod pipeline;
 pub mod residency;
 pub mod shell;
+pub mod telemetry;
 pub mod vector;
 
 pub use cache::{
@@ -166,6 +167,9 @@ pub use pipeline::{
 pub use residency::{search_store_descriptors, SearchStoreDescriptor};
 pub use shell::{
     boot_search, run_search, search_app_spec, SEARCH_INDEX_DIR_MIGRATION, SERVICE_NAME,
+};
+pub use telemetry::{
+    signal as telemetry_signal, LabelledSignal, RedLabels, SearchTelemetry, CACHE_RATIO_ABSENT,
 };
 pub use vector::{Embedding, HnswVectorIndex, ModelRef, VectorHit, VectorRecord};
 

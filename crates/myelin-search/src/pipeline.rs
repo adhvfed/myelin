@@ -299,6 +299,16 @@ pub struct QueryStats {
     /// JOIN against the reverse index is ONE query per leaf (a single relational filter ⇒ exactly 1,
     /// never one resolve per candidate doc). The `Ids vs Filter/TupleSet` filter-mode split (1.8).
     reverse_index_joins: AtomicU64,
+    /// **The filter-mode split (contract 1.8 / §4.11) — the `Ids` leg.** Incremented once per query
+    /// whose `list_objects` answer was the MATERIALISED `Ids{ids,zookie}` form (the S4 path: a
+    /// concrete visible doc-id allow-set). Read against [`Self::filter_mode_count`] so the
+    /// metrics-health port emits `list_objects` mode = `Ids` vs `Filter`/`TupleSet` (SRCH-P14).
+    ids_mode_count: AtomicU64,
+    /// **The filter-mode split (contract 1.8 / §4.11) — the `Filter`/`TupleSet` leg.** Incremented
+    /// once per query whose `list_objects` answer was the PUSHED-DOWN `Filter{set_expr,zookie}` form
+    /// (the S8 path: a `SetExpr` algebra lowered into the engine filter, including the relational
+    /// `InRelation`/`TupleSet` reverse-index JOINs). The other half of the 1.8 filter-mode split.
+    filter_mode_count: AtomicU64,
 }
 
 impl QueryStats {
@@ -321,6 +331,20 @@ impl QueryStats {
     /// reads this: ONE resolve per relational `SetExpr` leaf, never one per candidate doc).
     pub fn reverse_index_joins(&self) -> u64 {
         self.reverse_index_joins.load(Ordering::Relaxed)
+    }
+
+    /// **The `Ids` leg of the filter-mode split (contract 1.8 / §4.11).** Queries whose
+    /// `list_objects` answer was the materialised `Ids{ids}` form. SRCH-P14 reads this onto the
+    /// metrics-health port as the `Ids` half of the `Ids vs Filter/TupleSet` split.
+    pub fn ids_mode_count(&self) -> u64 {
+        self.ids_mode_count.load(Ordering::Relaxed)
+    }
+
+    /// **The `Filter`/`TupleSet` leg of the filter-mode split (contract 1.8 / §4.11).** Queries whose
+    /// `list_objects` answer was the pushed-down `Filter{set_expr}` form (incl. the relational
+    /// `InRelation`/`TupleSet` reverse-index JOINs). The other half of the 1.8 filter-mode split.
+    pub fn filter_mode_count(&self) -> u64 {
+        self.filter_mode_count.load(Ordering::Relaxed)
     }
 }
 
@@ -424,12 +448,17 @@ fn lower_acl(
 ) -> Result<(AclFilter, String), QueryError> {
     match result {
         ListObjectsResult::Ids { ids, zookie } => {
+            // **Filter-mode split (1.8):** this query used the MATERIALISED `Ids` mode (S4).
+            stats.ids_mode_count.fetch_add(1, Ordering::Relaxed);
             let ids: Vec<String> = ids.iter().map(|o| o.0.clone()).collect();
             // An empty materialised allow-set is `None` (the viewer can see nothing of this type).
             let filter = if ids.is_empty() { AclFilter::None } else { AclFilter::Ids(ids) };
             Ok((filter, zookie.0.clone()))
         }
         ListObjectsResult::Filter { set_expr, zookie } => {
+            // **Filter-mode split (1.8):** this query used the PUSHED-DOWN `Filter`/`TupleSet` mode
+            // (S8 — the `SetExpr` algebra, incl. the relational reverse-index JOINs).
+            stats.filter_mode_count.fetch_add(1, Ordering::Relaxed);
             // The watermark the reverse-index JOIN must honour is the snapshot the ACL answer was
             // computed at (contract 4.10) — the SAME zookie the rest of the filter rode.
             let required = watermark_from_zookie(&zookie.0);

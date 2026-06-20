@@ -102,3 +102,12 @@ integration = ["dep:sqlx", "dep:tokio"]
 [dev-dependencies]
 myelin-lints = { path = "../myelin-lints" }
 serde_json = { workspace = true }
+
+# SRCH-P14 (P-177, M2): the telemetry-assertion library is the CONSUMER side of the contract-1.8
+# signal set — `myelin_harness::telemetry::SignalSource` reads each §4.11 signal back off the
+# SearchTelemetry snapshot and `assert_signal`/`assert_labelled`s it (a missing signal fails the
+# gate; observability is part of the pass, EI-01 §3). It is a DEV-only dependency: the harness is
+# the test-support failure-injection harness and must NEVER appear in a production crate's
+# [dependencies] (its own crate docs are explicit). The Search prod telemetry module is a
+# self-contained typed snapshot (the producer); this test wires the harness reader to it.
+myelin-harness = { path = "../myelin-harness" }
