@@ -33,20 +33,27 @@
 //! and the third copy is already here).
 //!
 //! ## Floor named (this crate's grammar-surface, NOT the predicate engine)
-//! The predicate ENGINE (this module) is now real. What is still a NAMED floor: the full
-//! frozen `QueryAst` **textual grammar parser** + the `ViewSpec` view-model + the
-//! field-type enum + the `order_key`/LexoRank encoding (13.3, frozen X-3) — Issues +
-//! Knowledge's co-owned deliverable (their compilers/executors differ; the definitions are
-//! identical), landing in **P-235 (KN-P02)** and the Issues prompts, and the Bus matcher
-//! `subscribe`-time compile target in **P-137 (EB-17)**. Those prompts EXTEND this core in
-//! place (add the parser/view/order-key surfaces on top of the one [`Predicate`] tree); they
-//! do NOT re-define a second predicate engine. The deviation (promoting the engine here,
-//! ahead of the prose `myelin-query freeze` dependency the topo-sort placed later) is
-//! recorded in the P-133 report and at the call site (`check_engine::eval_caveat`).
+//! The predicate ENGINE (this module) is now real, and the **frozen `FieldType` enum +
+//! `FieldValue` + the `order_key`/LexoRank encoding (13.3, frozen X-3)** now land in [`field`]
+//! (see the DEVIATION note there). What is still a NAMED floor: the full frozen `QueryAst`
+//! **textual grammar parser** + the `ViewSpec` view-model — Issues + Knowledge's co-owned
+//! deliverable (their compilers/executors differ; the definitions are identical), landing in
+//! **P-235 (KN-P02)** and the Issues prompts, and the Bus matcher `subscribe`-time compile
+//! target in **P-137 (EB-17)**. Those prompts EXTEND this core in place (add the parser/view
+//! surfaces on top of the one [`Predicate`] tree + the one [`field::FieldType`] enum); they do
+//! NOT re-define a second predicate engine or a second field-type enum. The deviations
+//! (promoting the engine here, ahead of the prose `myelin-query freeze` dependency the topo-sort
+//! placed later — P-133; and landing the frozen `FieldType` here for SRCH-P04's structured shape
+//! to be typed over — P-167/[`field`]) are recorded at their sites.
 
 use myelin_identity::Literal;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+pub mod field;
+pub use field::{
+    FieldType, FieldValue, OrderKey, LEXORANK_ALPHABET, LEXORANK_REBALANCE_LEN,
+};
 
 pub mod matcher;
 pub use matcher::{
