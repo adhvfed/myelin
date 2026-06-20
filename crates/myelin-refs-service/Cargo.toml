@@ -34,6 +34,14 @@ publish = false
 # The GDPR contract surface (contract 10.1 PersonalDataHolder + the receipt/scope types). Refs
 # IMPLEMENTS this as holder H12 — a stub surface now, the real erase in REF-P15.
 myelin-gdpr = { path = "../myelin-gdpr" }
+# The KMS hierarchy (contracts 11.3/11.4: per-cell root → per-tenant KEK → per-tenant DEK + the
+# per-subject DEK backstop, crypto-shred). REF-P4 PINS the per-tenant DEK for the (future) edge
+# index + R2 cache into THIS engine — the L0→L1→L2 hierarchy storage froze at P-058. Refs reserves
+# the key CLASS (per-tenant DEK + per-subject backstop) and proves destroy is callable; it does NOT
+# re-implement the engine (no second KMS) — it consumes the one storage-owned `KmsEngine`. Storage
+# depends only on tenancy/identity/events/gdpr (never on refs), so this is acyclic; refs-service
+# stays the graph's terminal leaf consumer.
+myelin-storage = { path = "../myelin-storage" }
 # The substrate holder-registry (StoreKind/HolderRegistration/HolderRegistry — the auto-register
 # mechanism, contract 1.4) + the H1–H18 holder catalog (StoreClassifier/Holder::H12ReferenceGraph
 # + the completeness assertion) + the residency-pin lint linkage. Refs is a LEAF consumer above it.
