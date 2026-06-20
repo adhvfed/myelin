@@ -78,7 +78,12 @@
 //!   four-operator vocabulary they compile against ship here.
 //! - **The `watcher` relation per watchable type** (C8, the Notif read-fanout) is declared by each
 //!   watchable type's fragment (M2+), not by the core hierarchy; the engine admits it like any
-//!   other relation. Named.
+//!   other relation. **The declaration mechanism LANDED in P-ID-23 (P-134):** [`WATCHER_RELATION`]
+//!   (the frozen `watcher` relation name) + [`FragmentDef::watchable`] / [`NamespaceEngine::declare_watchable`]
+//!   make a type watchable so `list_subjects(object, watcher)` serves Notif's read-fanout as an
+//!   ordinary direct-relation Expand over S8 (one relation name platform-wide; no bespoke fanout
+//!   path). Each subsystem's fragment (Chat channel, Issue, KN page — M3/M4) declares watchability
+//!   via this helper.
 
 use crate::check_engine::{CheckEngine, USERSET_SEP};
 use myelin_identity::{
@@ -93,6 +98,20 @@ use std::collections::{BTreeMap, BTreeSet};
 /// evaluation bound [`crate::check_engine::MAX_REWRITE_DEPTH`]). Sixteen comfortably exceeds the
 /// deepest legitimate `a ∪ (b ∩ (c − d))` rewrite while staying a hard ceiling.
 pub const MAX_RULE_DEPTH: usize = 16;
+
+/// **The frozen `watcher` relation name — the cross-cutting read-fanout relation a WATCHABLE type
+/// declares (C4/C8, architecture §5: "a `watcher` relation per watchable type … `watcher: user`,
+/// so Notif's read-fanout (`list_subjects(object, watcher)`) is served by the same engine + reverse
+/// index (S8)").**
+///
+/// Declared by P-ID-23 (the watcher relation): a watchable type (a Chat channel, an Issue, a KN
+/// page — anything Notif can deliver a read-fanout notification about) adds THIS relation through
+/// [`FragmentDef::watchable`] / [`NamespaceEngine::declare_watchable`], making
+/// `list_subjects(object, watcher)` an **ordinary direct-relation Expand** over S8 (the density path
+/// proven in `expand`), NOT a bespoke fanout query. One relation name, platform-wide (EI-01 §7 — one
+/// primitive): every watchable type uses the SAME `watcher` relation, so Notif never branches per
+/// subsystem and the 50k-density expand is the same indexed reverse lookup regardless of type.
+pub const WATCHER_RELATION: &str = "watcher";
 
 /// A Zanzibar **userset** rewrite expression — the four operators (§5) a permission compiles to.
 /// `check(subject, permission, object)` evaluates a permission by walking this tree over the raw
@@ -167,6 +186,26 @@ impl FragmentDef {
             relations: self.relations.clone(),
             permissions: self.permissions.iter().map(|r| r.permission.clone()).collect(),
         }
+    }
+
+    /// **Declare this object type WATCHABLE (P-ID-23, C4/C8): add the cross-cutting
+    /// [`WATCHER_RELATION`] (`watcher`) so Notif's read-fanout `list_subjects(object, watcher)` is an
+    /// ordinary direct-relation Expand over S8.** A watchable subsystem (Chat channel, Issue, KN page)
+    /// calls THIS on its fragment so the `watcher` relation is declared exactly like any other relation
+    /// — admitted, validated, and reverse-indexed identically (no bespoke fanout path). Idempotent: a
+    /// type that already declares `watcher` is unchanged (so a fragment that already named it, or a
+    /// double-call, does not duplicate the relation). Returns `self` for builder chaining.
+    pub fn watchable(mut self) -> FragmentDef {
+        if !self.relations.iter().any(|r| r.0 == WATCHER_RELATION) {
+            self.relations.push(RelName(WATCHER_RELATION.to_string()));
+        }
+        self
+    }
+
+    /// Whether this fragment declares the [`WATCHER_RELATION`] (i.e. its object type is watchable —
+    /// Notif can fan out a read-notification over it).
+    pub fn is_watchable(&self) -> bool {
+        self.relations.iter().any(|r| r.0 == WATCHER_RELATION)
     }
 }
 
@@ -488,6 +527,54 @@ impl NamespaceEngine {
     /// The admitted object types (the compiled cell schema's vocabulary), sorted.
     pub fn object_types(&self) -> Vec<String> {
         self.schema.keys().cloned().collect()
+    }
+
+    /// **Whether `object_type` is WATCHABLE (P-ID-23, C8) — i.e. it declares the
+    /// [`WATCHER_RELATION`], so `list_subjects(object, watcher)` serves Notif's read-fanout over it.**
+    /// A watchable type's `watcher` relation is an ordinary declared relation (it reverse-indexes into
+    /// S8 like any other), so this is simply [`NamespaceEngine::has_relation`] on `watcher` — exposed
+    /// as a named query so a watchable subsystem / a drill can assert the relation is declared (the
+    /// fanout is wired) without reaching into the relation vocabulary.
+    pub fn is_watchable(&self, object_type: &str) -> bool {
+        self.has_relation(object_type, WATCHER_RELATION)
+    }
+
+    /// The admitted object types that are WATCHABLE (declare the [`WATCHER_RELATION`]), sorted — the
+    /// set of types Notif can fan a read-notification out over via `list_subjects(object, watcher)`.
+    pub fn watchable_types(&self) -> Vec<String> {
+        self.schema
+            .iter()
+            .filter(|(_, t)| t.relations.contains(WATCHER_RELATION))
+            .map(|(ot, _)| ot.clone())
+            .collect()
+    }
+
+    /// **Declare an ALREADY-ADMITTED object type WATCHABLE (P-ID-23, C8): add the
+    /// [`WATCHER_RELATION`] to its relation set in place.** This is the engine-side of "every watchable
+    /// type declares `watcher: user`" for a type whose fragment was admitted without it (e.g. the
+    /// core hierarchy, or a subsystem fragment that declares watchability separately). Returns:
+    /// - `FragmentAdmit::Admitted{fragment_id}` (the object type) when the relation is added (or was
+    ///   already present — idempotent, so re-declaring is a no-op success, not a duplicate error);
+    /// - `FragmentAdmit::Rejected{reason}` when the type is not admitted (a watcher relation cannot be
+    ///   attached to a type the cell schema does not know — loudly, never silently created).
+    ///
+    /// The added `watcher` relation participates in `check`/`list_subjects`/`list_objects` exactly like
+    /// any declared relation (one primitive — no bespoke watcher path).
+    pub fn declare_watchable(&mut self, object_type: &str) -> FragmentAdmit {
+        match self.schema.get_mut(object_type) {
+            Some(t) => {
+                t.relations.insert(WATCHER_RELATION.to_string());
+                FragmentAdmit::Admitted {
+                    fragment_id: object_type.to_string(),
+                }
+            }
+            None => FragmentAdmit::Rejected {
+                reason: format!(
+                    "cannot declare `{object_type}` watchable: it is not an admitted object type (a \
+                     watcher relation attaches to a known type, never invents one)"
+                ),
+            },
+        }
     }
 
     /// **Evaluate a permission through the engine's compiled rewrite over the raw tuples** — the
@@ -1080,6 +1167,75 @@ mod tests {
             !ns.permits(&eng, &globex, &subject("p:alice"), "project", "view", &ArtifactRef("project:web".into()), &latest()),
             "a grant in one tenant does not permit a resolution in another (ID-D3)"
         );
+    }
+
+    /// **P-ID-23 — a watchable type declares the `watcher` relation (C4/C8).** `FragmentDef::watchable`
+    /// adds the cross-cutting `watcher` relation; once admitted, `is_watchable` holds and the relation
+    /// is an ordinary declared relation (so `list_subjects(object, watcher)` is an ordinary Expand).
+    #[test]
+    fn a_watchable_fragment_declares_the_watcher_relation() {
+        let mut ns = NamespaceEngine::new();
+        // A `channel` type made watchable (the Chat M4 shape: channel + watcher).
+        let frag = FragmentDef {
+            object_type: ObjectType("channel".into()),
+            relations: vec![RelName("member".into())],
+            permissions: vec![],
+        }
+        .watchable();
+        assert!(frag.is_watchable(), "the fragment declares the watcher relation");
+        assert!(matches!(ns.admit(&frag), FragmentAdmit::Admitted { .. }));
+        // The admitted type is watchable + the `watcher` relation is an ordinary declared relation.
+        assert!(ns.is_watchable("channel"));
+        assert!(ns.has_relation("channel", WATCHER_RELATION));
+        assert_eq!(ns.watchable_types(), vec!["channel".to_string()]);
+        // A non-watchable type is not in the watchable set.
+        let plain = FragmentDef {
+            object_type: ObjectType("secret".into()),
+            relations: vec![RelName("reader".into())],
+            permissions: vec![],
+        };
+        assert!(matches!(ns.admit(&plain), FragmentAdmit::Admitted { .. }));
+        assert!(!ns.is_watchable("secret"));
+        assert_eq!(ns.watchable_types(), vec!["channel".to_string()]);
+    }
+
+    /// **P-ID-23 — `watchable()` is idempotent (a fragment that already names `watcher` is unchanged).**
+    /// A subsystem fragment that declared `watcher` itself, or a double `.watchable()` call, does not
+    /// duplicate the relation (the declared relation set is deduped, one `watcher` edge).
+    #[test]
+    fn watchable_is_idempotent() {
+        let frag = FragmentDef {
+            object_type: ObjectType("issue".into()),
+            relations: vec![RelName(WATCHER_RELATION.into()), RelName("assignee".into())],
+            permissions: vec![],
+        }
+        .watchable()
+        .watchable();
+        let watcher_count = frag.relations.iter().filter(|r| r.0 == WATCHER_RELATION).count();
+        assert_eq!(watcher_count, 1, "watcher is declared exactly once (idempotent)");
+        assert!(frag.is_watchable());
+    }
+
+    /// **P-ID-23 — `declare_watchable` attaches `watcher` to an already-admitted type, and rejects an
+    /// unknown one (Id never invents a type for a watcher relation).** The core `project` type is made
+    /// watchable in place; an undeclared type is rejected loudly.
+    #[test]
+    fn declare_watchable_attaches_to_admitted_type_rejects_unknown() {
+        let mut ns = NamespaceEngine::with_core_hierarchy();
+        // project is admitted (core hierarchy) but not yet watchable.
+        assert!(!ns.is_watchable("project"));
+        let admit = ns.declare_watchable("project");
+        assert!(matches!(admit, FragmentAdmit::Admitted { fragment_id } if fragment_id == "project"));
+        assert!(ns.is_watchable("project"), "project is now watchable");
+        // Idempotent: re-declaring is a no-op success (not a duplicate-relation error).
+        assert!(matches!(ns.declare_watchable("project"), FragmentAdmit::Admitted { .. }));
+        // An unknown type cannot be made watchable (Id never invents a type for the relation).
+        match ns.declare_watchable("nonexistent_type") {
+            FragmentAdmit::Rejected { reason } => {
+                assert!(reason.contains("not an admitted object type"), "rejection names why: {reason}")
+            }
+            FragmentAdmit::Admitted { .. } => panic!("an unknown type must not be made watchable"),
+        }
     }
 
     /// **A too-deep rewrite is rejected at admit (the schema bound).**

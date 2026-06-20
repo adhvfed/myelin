@@ -59,9 +59,13 @@
 //!
 //! ## Floors named (frozen now → bodies in a later prompt)
 //! - **The 50k-density proof against a REAL watchable subsystem is P-ID-23 (P-134) + Chat (M4).**
-//!   This prompt exercises the engine + density path against **synthetic** density (a 50k-member
-//!   relation seeded into S8); the `watcher` relation per watchable type + the live read-fanout land
-//!   with P-ID-23 (the watcher relation) and Chat channels (M4). Named, not silently assumed done.
+//!   This prompt (P-ID-13) exercises the engine + density path against **synthetic** density (a
+//!   50k-member relation seeded into S8). **P-ID-23 (P-134) LANDED the `watcher` relation declaration**
+//!   ([`crate::namespace::WATCHER_RELATION`] + [`crate::namespace::FragmentDef::watchable`]) + the
+//!   Notif read-fanout entry ([`crate::StoreBackedCheck::list_watchers_in`]) + the chained M2-consumer
+//!   re-confirm (the ID-D5 re-run against the live EffectApi + the SRCH/REF/NOTIF rides). The
+//!   **full** 50k-density proof against the live Chat channel data model still lands with Chat (M4) —
+//!   the engine + watcher path are proven against synthetic + the watchable-fragment path here.
 //! - **The in-memory S8 models the SQL table** (the same EI-01 §1 deviation S3/S8 document): there is
 //!   no live OLTP database until the driver lands (P-S15); the `(tenant, region)` + type partition,
 //!   the RLS scope, and the zookie snapshot are byte-for-byte the §2/§7.2/§8.7 contract.
