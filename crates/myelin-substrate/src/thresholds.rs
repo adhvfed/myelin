@@ -91,6 +91,12 @@ pub struct Thresholds {
     /// The per-surface shed-budget v1 floors (contract 1.11, §7.6).
     #[serde(default)]
     pub shed_budgets: Vec<ShedBudgetRow>,
+    /// The DSR (data-subject-request) deadline thresholds (contract 10.4 / gdpr §4.1 step 6 / the
+    /// GA-D4 drill): the statutory 1-month window + the nearing-deadline warning margin the durable
+    /// timer fires the `dsr_deadline_margin` warning Signal at. `#[serde(default)]` so an older
+    /// thresholds file (pre-P-GA-21) still parses (the rows fall back to the Art. 12(3) seed).
+    #[serde(default)]
+    pub dsr: DsrDeadline,
     /// The scorecard: drills that came back red live here, never edited green (EI-01 §3).
     #[serde(default)]
     pub claimed_not_proven: Vec<ClaimedNotProven>,
@@ -193,6 +199,39 @@ impl Default for AuthzIndex {
         AuthzIndex {
             ids_cardinality_cap: 1000,
             reverse_index_lag_slo_ms: 1000,
+        }
+    }
+}
+
+/// The DSR deadline thresholds (contract 10.4 / gdpr §4.1 step 6 — the durable deadline timer +
+/// the nearing-deadline warning Signal; the GA-D4 drill).
+///
+/// `deadline_secs` is the Art. 12(3) statutory window (1 month = 30 days). `warning_margin_secs` is
+/// the nearing-deadline margin: the durable timer fires the `dsr_deadline_margin` warning Signal
+/// `warning_margin_secs` BEFORE the deadline, so a deadline is never silently missed (the default-to-
+/// beat margin GA-D4 reads). `extension_secs` is the Art. 12(3) extension-for-complex window (3
+/// months total — the re-arm carries a recorded reason). The default-to-beat numbers here are the
+/// statutory seeds; Phase 6 may tighten the warning margin (a wider margin = earlier warning).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DsrDeadline {
+    /// The statutory deadline window, in seconds (Art. 12(3): 1 month = 30 days = 2 592 000 s).
+    pub deadline_secs: u64,
+    /// The nearing-deadline warning margin, in seconds (the durable timer fires the warning Signal
+    /// this far BEFORE the deadline). Default-to-beat: 7 days = 604 800 s (a full week's warning).
+    pub warning_margin_secs: u64,
+    /// The Art. 12(3) extension window for a complex request, in seconds — the TOTAL deadline after
+    /// an extension (3 months = 90 days = 7 776 000 s; the re-arm carries a recorded reason).
+    pub extension_total_secs: u64,
+}
+
+impl Default for DsrDeadline {
+    /// The statutory seeds (Art. 12(3)): a 1-month deadline, a 1-week nearing-deadline warning, a
+    /// 3-month extension ceiling. These are the default-to-beat; Phase 6 may widen the warning margin.
+    fn default() -> Self {
+        DsrDeadline {
+            deadline_secs: 30 * 24 * 60 * 60,
+            warning_margin_secs: 7 * 24 * 60 * 60,
+            extension_total_secs: 90 * 24 * 60 * 60,
         }
     }
 }

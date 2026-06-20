@@ -305,6 +305,7 @@ pub mod commit_prerequisite;
 pub mod datamap;
 pub mod diffgate;
 pub mod dsr;
+pub mod dsr_timer;
 pub mod erasure_ledger;
 pub mod fanout;
 pub mod holders;
@@ -338,6 +339,10 @@ pub use dsr::{
     resolve_checklist_from_map, ChecklistItem, Dsr, DsrError, DsrId, DsrKind, DsrOrchestrator,
     DsrRequestView, DsrState, DsrStatus, Initiator, MerkleProvenBundle, Posture, DSR_DEADLINE_SECS,
     DSR_STATE,
+};
+pub use dsr_timer::{
+    DsrDeadlineTimer, DsrDeadlineWarning, DsrTimerWheel, TimerEntrySnapshot, TimerError,
+    DSR_DEADLINE_MARGIN,
 };
 pub use erasure_ledger::{
     DestroyedKeyEpoch, ErasureLedger, ErasureLedgerEntry, PostPitRecord, ERASURE_LEDGER_ENTRIES,
