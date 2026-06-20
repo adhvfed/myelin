@@ -1,0 +1,44 @@
+[package]
+name = "myelin-agent-service"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The Agent-Fabric IMPLEMENTATION / SERVICE crate (AG-P2 → P-131), distinct from the glue crate
+# `myelin-agent` (AG-P1 → P-130, which owns the frozen six-trait contract surface). Like the other
+# SERVICE / SUBSYSTEM crates (myelin-identity-service, myelin-gdpr-service, myelin-git,
+# myelin-issues, myelin-notif) it is a LEAF CONSUMER above the glue crates: it depends on
+# -agent (the ToolDef/effect value types the data model references) + -gdpr (the #[personal_data]
+# classify-derive) + -storage (the forward-only online migration runner + the (tenant, region) RLS
+# guard) + -tenancy (the partition key types). NOTHING in the production library DAG depends back on
+# it; it is OUTSIDE the eleven-crate library DAG modelled by myelin-substrate::crate_graph
+# (substrate_is_root() / identity_is_sink() are preserved — a service is the graph's terminal
+# consumer). See the crate-level note in src/lib.rs.
+[dependencies]
+myelin-agent = { path = "../myelin-agent" }
+myelin-gdpr = { path = "../myelin-gdpr" }
+myelin-storage = { path = "../myelin-storage" }
+myelin-tenancy = { path = "../myelin-tenancy" }
+myelin-identity = { path = "../myelin-identity" }
+
+# REAL Postgres backend behind the `integration` feature (Stage 1 / infra). OPTIONAL deps: the
+# DEFAULT `cargo build --workspace` stays DB-free (the binding policy floor — no DB at build). They
+# are pulled ONLY by `--features integration`, which compiles the live-PG RLS denial test
+# (tests/integration_rls.rs) run against the docker-compose dev stack.
+#   - myelin-config : the dev<->prod CONFIG SWAP seam (the DATABASE_URL the live test reads);
+#   - sqlx          : the OLTP Postgres client (RUNTIME queries — sqlx::query, NOT query!, so the
+#                     build is DB-free even with the feature off);
+#   - tokio         : the async runtime the live client needs.
+myelin-config = { path = "../myelin-config", optional = true }
+sqlx = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The migration test re-uses the storage online runner; serde_json round-trips the trace ArtifactRef.
+serde_json.workspace = true
+
+[features]
+default = []
+# Pull the real Postgres client + compile the live-PG (tenant, region) RLS cross-tenant denial test.
+integration = ["dep:myelin-config", "dep:sqlx", "dep:tokio"]

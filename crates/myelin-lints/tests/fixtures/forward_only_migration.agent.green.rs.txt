@@ -1,0 +1,10 @@
+-- GREEN fixture for `forward-only-migration` — the AGENT-FABRIC slice (AG-P2 / P-131). The lint MUST
+-- admit this. The five fresh `CREATE TABLE`s of the data model (agent-fabric §4.1..§4.5), each
+-- `(tenant, region)`-first with a `(tenant_id, region, …)` primary-key prefix, are non-destructive
+-- forward migrations (no DROP, no in-place rewrite). A later column change on the hot `agent_run`
+-- table uses the online expand→backfill→contract shape (a NULLABLE add, no blocking lock), then a
+-- forward migration backfills + constrains — never a reverse/rollback step.
+CREATE TABLE agent_run (tenant_id text NOT NULL, region text NOT NULL, run_id numeric NOT NULL, PRIMARY KEY (tenant_id, region, run_id));
+CREATE TABLE agent_tool_def (tenant_id text NOT NULL, region text NOT NULL, name text NOT NULL, PRIMARY KEY (tenant_id, region, subsystem, name, version));
+ALTER TABLE agent_run ADD COLUMN runtime_ref_v2 TEXT;
+UPDATE agent_run SET runtime_ref_v2 = runtime_ref WHERE runtime_ref_v2 IS NULL;

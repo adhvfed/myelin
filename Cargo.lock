@@ -1824,6 +1824,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "myelin-agent-service"
+version = "0.0.0"
+dependencies = [
+ "myelin-agent",
+ "myelin-config",
+ "myelin-gdpr",
+ "myelin-identity",
+ "myelin-storage",
+ "myelin-tenancy",
+ "serde_json",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
 name = "myelin-chat"
 version = "0.0.0"
 dependencies = [
