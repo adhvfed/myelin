@@ -113,7 +113,9 @@
 pub mod dek;
 pub mod erasure_posture;
 pub mod holder;
+pub mod layout;
 pub mod residency;
+pub mod shell;
 
 pub use dek::{srch_p03_inherited_gates, hyok_skips_index, InheritedGate, SearchDekPin};
 pub use erasure_posture::{erasure_posture, ErasurePosture};
@@ -121,7 +123,14 @@ pub use holder::{
     register_search_holder, search_index_holder, SearchHolderRegistration, SearchIndexHolder,
     SEARCH_INDEX_STORE,
 };
+pub use layout::{
+    derived_state_invariant_holds, srch_p03_floors, LayoutError, PerTenantIndexLayout,
+    SrchP03Floor, StatefulComponent,
+};
 pub use residency::{search_store_descriptors, SearchStoreDescriptor};
+pub use shell::{
+    boot_search, run_search, search_app_spec, SEARCH_INDEX_DIR_MIGRATION, SERVICE_NAME,
+};
 
 /// The frozen field-NAME of the Search index document's `doc_id` — the
 /// [`ArtifactRef`](myelin_events::ArtifactRef) key (architecture §3.1; contract 5.1). This is
