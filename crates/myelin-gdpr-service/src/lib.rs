@@ -39,12 +39,27 @@
 //!    [`myelin_events::EventEnvelope`] verbatim — the audit log IS the "why did this happen" walk
 //!    (one mechanism for audit + provenance + the loop guard, EI-02 §6).
 //!
-//! ## Floors named (deferred → filling prompt) — VISION §3 name-your-floors
-//! - The **CT-style proofs** (`inclusion_proof` / `consistency_proof` / `signed_tree_head`), the
-//!   **independent-witness anchoring** (RFC-3161 TSA / a different cell's notary), the
-//!   **DSR-receipt seal**, and the **H16 audit-carve-out body** → **P-GA-20 / P-119** (the
-//!   construction here is what those proofs run over; this crate stores the full chain + the
-//!   incremental Merkle root the STH will sign).
+//! ## P-GA-20 (→ P-119) — the audit CT-style proofs + STH + witness + DSR-receipt seal + H16 carve-out
+//! [`audit_proofs`] ships the PROOFS half of contract 10.6 OVER the [`audit`] construction: the
+//! three CT-style proofs (`signed_tree_head` / `inclusion_proof` / `consistency_proof`, RFC 6962)
+//! served by [`audit_proofs::AuditAuthority`]; the **independent-witness anchoring**
+//! ([`audit_proofs::Witness`] / [`audit_proofs::NotaryWitness`] — the witness sees ONLY the opaque
+//! root, no PII crosses, residency-safe); the **DSR-receipt seal**
+//! ([`audit_proofs::AuditAuthority::seal_dsr_certificate`] — a DSR completion certificate is sealed
+//! into the per-tenant tree via the SAME outbox-consumer append path, closing the P-GA-12
+//! `merkle_inclusion = None` floor); and the **H16 carve-out at the tree level**
+//! ([`audit_proofs::AuditAuthority::carve_out_erase`] — a subject erasure RETAINS the minimised
+//! entry and NEVER rewrites it, proven by an unchanged STH root + an intact chain). **GA-D3** (a
+//! retroactive edit is detected THREE independent ways — the chain break + the consistency-proof
+//! failure against the published STH + the witness mismatch) emits its dated green artifact in
+//! `tests/ga_d3_audit_tamper.rs` (tamper detected 100%). The auditor-side CDC pair is
+//! `tests/cdc_10_6_audit_proofs.rs`. **Floors named:** GA-D3 at CELL scale + the E2E-3 audit leg +
+//! the `git.history_rewrite` audited op → **M5 P-GA-35**; the real in-cell KMS signing key
+//! (P-ST-06) + a real RFC-3161 TSA witness + the durable `audit_sth` table are the same DB/KMS
+//! floor every M0/M1 store carries (P-007 / P-S12) — swapping the [`audit_proofs::SigningKey`] /
+//! [`audit_proofs::Witness`] impl is a config swap, not a code change. **Mutation floor (P-GA-20
+//! TESTS — the Merkle-proof + consistency-proof verification paths are mandatory-core):** the
+//! `cargo mutants` score for [`audit_proofs`] is recorded in the commit body.
 //! - The **`git.history_rewrite` audited op** (gdpr §6.6, GA-10) → **M5 P-GA-35**.
 //! - The **durable Postgres `audit_entry` / `audit_sth` tables** (the §6.2 DDL) + running the
 //!   consumer inside `serve(AppSpec)` against the OLTP pool: the seam shape (the [`audit::AuditEntry`]
@@ -285,6 +300,7 @@
 //! are mandatory-core; the `cargo mutants` score is in the commit body.
 
 pub mod audit;
+pub mod audit_proofs;
 pub mod commit_prerequisite;
 pub mod datamap;
 pub mod diffgate;
@@ -299,6 +315,11 @@ pub mod tenant_ops;
 
 pub use audit::{
     AuditConsumer, AuditEntry, AuditLog, Minimised, Outcome, AUDIT_APPEND_LAG,
+};
+pub use audit_proofs::{
+    verify_consistency, verify_inclusion, AuditAuthority, CellSigningKey, ConsistencyProof,
+    InclusionProof, NotaryWitness, SignedTreeHead, SigningKey, Witness, WitnessAttestation,
+    DSR_SEAL_ACTION, STH_PUBLISH_AGE,
 };
 pub use commit_prerequisite::{
     commit_actor_holds_only_pseudonym, verdict_for, CommitActorVerdict, CommitIdentityPrerequisite,

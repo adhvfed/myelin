@@ -62,6 +62,12 @@ pub enum Outcome {
 }
 
 impl Outcome {
+    /// The frozen §6.2 wire spelling (the token that goes into the Merkle-leaf preimage). Public so
+    /// a verifier (the GA-D3 drill) recomputes the identical leaf the store committed.
+    pub fn as_wire(self) -> &'static str {
+        self.as_str()
+    }
+
     /// The frozen §6.2 wire spelling.
     fn as_str(self) -> &'static str {
         match self {
@@ -398,11 +404,34 @@ impl AuditLog {
     pub fn verify_chain(&self, tenant: &TenantId) -> bool {
         verify_entries(&self.entries_for(tenant))
     }
+
+    /// The ordered raw leaf digests for one tenant's Merkle tree (the leaves the
+    /// [`super::audit_proofs`] inclusion / consistency proofs walk). Crate-private — the proof
+    /// machinery reads it; a downstream crate sees only the higher-level proof API. Returns an
+    /// empty vec for a tenant with no entries.
+    pub(crate) fn leaf_digests(&self, tenant: &TenantId) -> Vec<[u8; 32]> {
+        self.chains
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(tenant)
+            .map(|h| h.leaves.clone())
+            .unwrap_or_default()
+    }
 }
 
 /// Render raw 32 digest bytes as `blake3:<hex>` (the variant that takes bytes, not a preimage).
-fn blake3_multihash_raw(digest: &[u8]) -> String {
+/// Crate-private so the proof machinery renders the STH root + path nodes identically.
+pub(crate) fn blake3_multihash_raw(digest: &[u8]) -> String {
     format!("blake3:{}", hex::encode(digest))
+}
+
+/// **A public chain-integrity verifier over an explicit entry vector** (for the GA-D3 tamper drill,
+/// which models a DB-level tamper a verifier reads from the store — the chain store is crate-
+/// private). Recomputes every leaf + chain link from the bodies and checks the dense `0..n` `seq`;
+/// returns `true` iff the chain is unbroken. A retroactive edit / re-order / deletion flips it to
+/// `false`. This is the cross-crate face of [`verify_entries`].
+pub fn verify_entries_for_test(entries: &[AuditEntry]) -> bool {
+    verify_entries(entries)
 }
 
 /// **The chain-integrity verifier core** (the tamper-evidence check the construction guarantees).
@@ -438,11 +467,23 @@ pub(crate) fn verify_entries(entries: &[AuditEntry]) -> bool {
     true
 }
 
+/// The RFC-6962 interior-node hash of two child digests: `BLAKE3(0x01 || left || right)`. The
+/// `0x01` prefix is the interior-node domain separation so an interior node never collides with a
+/// leaf hash (RFC 6962 §2.1). Crate-private so the proof machinery ([`super::audit_proofs`])
+/// recomputes path nodes with byte-identical semantics to the tree.
+pub(crate) fn interior_node(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(&[0x01]); // interior-node domain separation (RFC 6962).
+    h.update(left);
+    h.update(right);
+    h.finalize().into()
+}
+
 /// The Merkle root over an ordered set of leaf digests (RFC-6962-style pairwise reduction:
 /// hash each adjacent pair, carrying an odd final leaf up unchanged, until one root remains). A
-/// single leaf is its own root. The interior-node format follows RFC 6962's domain separation
-/// (a `0x01` interior-node prefix) so it never collides with a leaf hash.
-fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
+/// single leaf is its own root. Crate-private so the STH ([`super::audit_proofs`]) signs exactly
+/// the root the tree computes.
+pub(crate) fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     debug_assert!(!leaves.is_empty(), "merkle_root is only called for a non-empty chain");
     let mut level: Vec<[u8; 32]> = leaves.to_vec();
     while level.len() > 1 {
@@ -450,11 +491,7 @@ fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
         let mut i = 0;
         while i < level.len() {
             if i + 1 < level.len() {
-                let mut h = blake3::Hasher::new();
-                h.update(&[0x01]); // interior-node domain separation (RFC 6962).
-                h.update(&level[i]);
-                h.update(&level[i + 1]);
-                next.push(h.finalize().into());
+                next.push(interior_node(&level[i], &level[i + 1]));
                 i += 2;
             } else {
                 next.push(level[i]); // odd final node carries up unchanged.
