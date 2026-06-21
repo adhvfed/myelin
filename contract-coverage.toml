@@ -1110,8 +1110,11 @@ cdc = ["crates/myelin-events/tests/cdc_12_6_crosscell.rs"]
 [[contract]]
 row = "13.1"
 title = "myelin-content taxonomy (frozen)"
-status = "deferred"
-landing = "P-234"
+# P-234 (KN-P01): the frozen 15-variant Block taxonomy + the markdown-subset inline
+# grammar + the three structured nodes, with the WASM render path and the KN-D2 round-trip
+# gate. Knowledge PROVIDES the frozen taxonomy; Chat/Issues consume strict subsets (X-2).
+status = "covered"
+cdc = ["crates/myelin-content/tests/cdc_13_1_taxonomy.rs"]
 
 [[contract]]
 row = "13.2"

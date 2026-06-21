@@ -13,3 +13,6 @@ myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-events = { path = "../myelin-events" }
 myelin-identity = { path = "../myelin-identity" }
 serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

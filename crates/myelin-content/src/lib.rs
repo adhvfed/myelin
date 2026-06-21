@@ -1,61 +1,79 @@
-//! # `myelin-content` — block/inline taxonomy + the three platform-load-bearing inline nodes
+//! # `myelin-content` — the FROZEN v1 block + inline taxonomy (contract 13.1, X-2/OQ-B)
 //!
-//! **Owning architecture doc:** `planning/05-refined-shared-systems-architecture/00-platform-substrate.md`
-//! §2.5 (`myelin-content` — the substrate-relevant seam).
+//! **Owning architecture docs:**
+//! `04-subsystem-architectures/knowledge-platform/architecture/01-tech-and-data-model.md`
+//! §2.1 (the canonical [`Block`] taxonomy) + §2.2 (the markdown-subset inline grammar +
+//! the three structured nodes) and `02-internals-and-algorithms.md` §8 (the ONE editor
+//! render path; the WASM target; why a markdown-subset string not inline-range JSON).
 //!
-//! **Contract-index cluster:** 13 — the shared crates' refined shapes
-//! (`planning/05-refined-shared-systems-architecture/contract-index.md` row 13.1
-//! `myelin-content` taxonomy, frozen X-2/OQ-B).
+//! **Contract-index 13.1** (`05-refined-shared-systems-architecture/contract-index.md`
+//! row 13.1, **SHARPENED → frozen**, recon §X-2): Knowledge **leads and freezes** this
+//! canonical taxonomy; Chat and Issues consume strict **subsets** (neither adds a node
+//! type, X-2). The three inline ref nodes ([`InlineNode::Mention`] /
+//! [`InlineNode::ArtifactRef`] / [`InlineNode::Embed`]) produce `refs.edge.created`
+//! **uniformly** across Chat, Issues, and Knowledge (5.4).
 //!
-//! ## What crosses the crate boundary here (the substrate-relevant surface)
-//! The three platform-load-bearing inline nodes — `mention(Principal)`,
-//! `artifact_ref(ArtifactRef)`, `embed(ArtifactRef)` — are the **producers of
-//! `refs.edge.created`** (emitted via the outbox). Inline content is a markdown-subset
-//! string (KN-2/D10); the three structured nodes are stored structured. The crate has a
-//! **WASM compile target** (C-8) so the one editor render path reuses the Rust core
-//! client-side (`render(parse(md)) === md`).
+//! ## The one render path (KN-D2, the frozen correctness bar)
+//! [`parse_inline`]/[`serialize_inline`] are ONE implementation, compiled native
+//! (server) and to `wasm32-unknown-unknown` (client editor) from this single source —
+//! eliminating the two-divergent-renderers trap structurally (EI-01 §7). The frozen gate
+//! is the round-trip invariant `serialize_inline(parse_inline(md)) == md` over the frozen
+//! [`corpus`] (KN-D2: 100% round-trip, 0 regressions). See [`corpus::corpus_pass_rate`].
 //!
-//! ## Floor named (this is a SUBSTRATE-RELEVANT SEAM, not the full taxonomy)
-//! The full canonical block set + the ADF lossy-map (13.1/13.2, frozen X-2) is
-//! **Knowledge's** deliverable (Knowledge leads; Chat/Issues consume strict subsets) —
-//! NOT this prompt. P-001 ships only the three substrate-load-bearing inline-node TYPES
-//! so subsystems have a stable surface to register against; the taxonomy + WASM target
-//! land with the Knowledge roadmap. Bodies/variants beyond the three nodes are `todo!()`.
+//! ## NO Knowledge feature ships here — this is a FREEZE
+//! This crate ships ONLY the shared shapes that Chat / Issues / Search / Refs compile
+//! against. No store, no service, no editor. The block tree, OLTP store, collab
+//! transport, and editor land in the Knowledge M3 prompts (KN-P04+).
+//!
+//! ## Named floors
+//! - **`sync_block` engine** ([`Block::SyncBlock`]): the node TYPE is frozen here so the
+//!   taxonomy is complete, but its v1 engine is a read-projection FLOOR (renders like
+//!   `embed`, §2.4) shipped in **KN-P12**; the editable-in-place multi-home follow-on is
+//!   post-M5 (KQ-6, designed against the CRDT).
+//! - **`db_view.view`** ([`block::ViewHandle`]): carried as an [`ArtifactRef`]-keyed view
+//!   handle until `myelin-query::ViewSpec` is frozen in **KN-P02**, which swaps in the
+//!   structured `ViewSpec` (a single compile break).
+//! - **WASM-artifact green** (KN-D2 second leg): the crate is structured `std`-only and
+//!   dependency-clean so it builds for `wasm32-unknown-unknown` from this one source; the
+//!   `build-wasm.sh` script + the `wasm-render-path` integration test gate it. On a host
+//!   without the `wasm32-unknown-unknown` std component the artifact build is a NAMED
+//!   FLOOR (red-until-proven on real CI with the target installed) — the round-trip gate
+//!   itself is proven green natively against the identical single source.
 
-use myelin_events::ArtifactRef;
-use myelin_identity::Principal;
-use serde::{Deserialize, Serialize};
+#![forbid(unsafe_code)]
 
-/// The three platform-load-bearing structured inline nodes (architecture §2.5). These
-/// three uniformly produce `refs.edge.created` via the outbox (contract 5.4). The rest
-/// of the inline taxonomy is a markdown-subset string (KN-2), owned by Knowledge (13.1).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum InlineNode {
-    /// @-mention of a principal.
-    Mention(Principal),
-    /// inline reference to an artifact.
-    ArtifactRefNode(ArtifactRef),
-    /// inline embed/unfurl of an artifact.
-    Embed(ArtifactRef),
-}
+pub mod block;
+pub mod corpus;
+pub mod inline;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use myelin_identity::{PrincipalId, PrincipalKind};
-    use myelin_tenancy::TenantId;
+pub use block::{
+    Block, CalloutTone, Cell, Column, EmbedDisplay, HeadingLevel, ListItem, TaskItem, ViewHandle,
+};
+pub use inline::{parse_inline, serialize_inline, Inline, InlineNode, Mark, Span, OBJ};
 
-    /// Compile-asserting test: the three substrate-load-bearing inline nodes exist with
-    /// their frozen payload types — `Mention(Principal)`, `ArtifactRefNode(ArtifactRef)`,
-    /// `Embed(ArtifactRef)` (architecture §2.5; these are the `refs.edge.created`
-    /// producers). The full taxonomy is Knowledge's (13.1).
-    #[test]
-    fn three_load_bearing_inline_nodes_exist() {
-        let m = InlineNode::Mention(Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId("acme".into())));
-        let a = InlineNode::ArtifactRefNode(ArtifactRef("myelin://acme/issues/issue/PROJ-1".into()));
-        let e = InlineNode::Embed(ArtifactRef("myelin://acme/knowledge/page/42".into()));
-        assert!(matches!(m, InlineNode::Mention(_)));
-        assert!(matches!(a, InlineNode::ArtifactRefNode(_)));
-        assert!(matches!(e, InlineNode::Embed(_)));
+/// The WASM render-path export surface (contract 13.1 WASM target). These free functions
+/// are the stable C-ABI-friendly entry points the editor's WASM glue calls; they operate
+/// on the SAME [`parse_inline`]/[`serialize_inline`] core as the server, so there is no
+/// second renderer. They are plain `pub` Rust (no `wasm-bindgen` macro dependency in the
+/// frozen crate) — the editor crate (KN-P08, the TS/React shell) wraps these behind its
+/// own `wasm-bindgen` boundary, keeping this freeze crate toolchain-light.
+pub mod wasm {
+    use crate::inline::{parse_inline, serialize_inline, Inline, InlineNode};
+
+    /// Parse a markdown-subset string + its positional structured-node array into the
+    /// inline AST. The WASM client and the native server call THIS one function.
+    pub fn render_parse(md: &str, nodes: &[InlineNode]) -> Inline {
+        parse_inline(md, nodes)
+    }
+
+    /// Serialize the inline AST back to the canonical markdown-subset string. The frozen
+    /// round-trip invariant `render_serialize(render_parse(md)) == md` holds on the SAME
+    /// compiled code native and on `wasm32-unknown-unknown` (KN-D2).
+    pub fn render_serialize(inline: &Inline) -> String {
+        serialize_inline(inline)
     }
 }
+
+// The contract-index 13.1 provider/consumer CDC pair lives in
+// `tests/cdc_13_1_taxonomy.rs` (the file the contract-coverage manifest names): Knowledge
+// PROVIDES the frozen taxonomy; Chat/Issues/Search CONSUME strict subsets (X-2).
