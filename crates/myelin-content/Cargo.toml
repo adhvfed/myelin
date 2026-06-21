@@ -17,6 +17,7 @@ myelin-identity = { path = "../myelin-identity" }
 # `ViewHandle` floor (P-235/KN-P02). query is std-only + serde-only, so it stays WASM-clean.
 myelin-query = { path = "../myelin-query" }
 serde.workspace = true
-
-[dev-dependencies]
+# JSON for the per-owner reindex `replay` body (EB-26 / P-246, M3): KN's `KnowledgeReindexSource`
+# re-emits `*.snapshot` drafts carrying the live block payload (`serde_json::Value`, references-not-
+# payloads). serde_json is pure-Rust + std-only, so the crate stays WASM-clean.
 serde_json.workspace = true

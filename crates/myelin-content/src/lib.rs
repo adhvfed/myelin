@@ -46,7 +46,15 @@
 pub mod adf;
 pub mod block;
 pub mod corpus;
+/// The complete `knowledge.*` event-token list (contract 2.9, EB-26 / P-246, M3) — KN COMPLETES its
+/// dotted-name list, durable-via-outbox vs firehose-only split, each validated against the one Bus
+/// grammar.
+pub mod events;
 pub mod inline;
+/// Knowledge's per-owner reindex-from-source `replay` body (contract 2.6, EB-26 / P-246, M3) —
+/// page-subtree at BLOCK granularity. Fills the per-owner `replay` floor named in
+/// `myelin_events::reindex`.
+pub mod replay;
 
 pub use adf::{AdfMapping, AdfNode, AdfTarget, ImportReport, Loss, LossyConversion, MAP};
 pub use block::{

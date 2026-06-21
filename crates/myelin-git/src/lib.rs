@@ -79,6 +79,7 @@ pub mod check_status;
 pub mod events;
 pub mod holder_intent;
 pub mod rebac_fragment;
+pub mod replay;
 pub mod schema;
 pub mod search_projection;
 pub mod subs;
