@@ -933,14 +933,20 @@ cdc = [
 # propagates + may trigger deletion; the sub-processor registry ⇄ a change-notification caller —
 # versioned + region + DPA ref + objection). The §5.3 outbound push-mirror residency gate reads the
 # SAME `transfer_allowed` policy shipped here; its end-to-end proof is M5 P-GA-35 (GA-11). All are
-# real provider+consumer seams, so the row is now `covered`.
+# real provider+consumer seams, so the row is now `covered`. The MIRROR half (C-4, Tenancy-owned —
+# the control-plane residency-boundary decision `mirror_allowed`) ships at P-CP-16 → P-251
+# (`cdc_10_5_mirror_gate.rs`: the Git mirror feature ⇄ `mirror_allowed` over the REAL GDPR
+# `transfer_allowed` — deny-by-default for a residency-boundary crossing without a recorded lawful
+# basis). The control plane owns "does this target cross the residency boundary?"; GDPR owns "is this
+# transfer lawful?".
 [[contract]]
 row = "10.5"
-title = "retention / consent / sub-processor / legal-hold / transfer gate"
+title = "retention / consent / sub-processor / legal-hold / transfer gate / outbound-mirror (C-4)"
 status = "covered"
 cdc = [
     "crates/myelin-gdpr-service/tests/cdc_10_5_retention_engine.rs",
     "crates/myelin-gdpr-service/tests/cdc_10_5_consent_transfer_gate.rs",
+    "crates/myelin-control-plane/tests/cdc_10_5_mirror_gate.rs",
 ]
 
 # 10.6 — the CONSTRUCTION half (the outbox-only audit consumer + the per-tenant hash-chain +
