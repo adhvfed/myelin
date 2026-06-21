@@ -82,6 +82,18 @@ serde_json = { workspace = true }
 # CDC. The serialized shape IS the declare_indexable wire contract; serde derive is the mechanism.
 serde = { workspace = true }
 
+# SRCH-P17 (P-260, M3): Search wires the real KNOWLEDGE producer corpus into the index. The KN
+# declare_indexable IndexSpec + the block/page/row/field SearchProjection builder (`kn_projection`)
+# consume the FROZEN `myelin-content` taxonomy (contract 13.1) — the canonical `Block`/`Inline`
+# block + the three structured inline nodes (mention/artifact_ref/embed) Search indexes as dependable
+# facets, and `Block::CodeBlock.text` raw (X-2). This is the §0/§1 consumer edge the Search crate
+# docs always named ("it composes … `myelin-content`"). DAG-safe: Search is a terminal leaf consumer;
+# `myelin-content` is a mid-tier freeze crate that does NOT depend back on Search (no cycle). KN has
+# NO service crate yet (unlike git, whose code-projection spec lives in `myelin-git`), so KN's owned
+# IndexSpec is modelled HERE against the frozen taxonomy it consumes — the wiring the prompt's
+# DELIVERABLE places "in the myelin-search service crate". The engine is UNCHANGED.
+myelin-content = { path = "../myelin-content" }
+
 # TEST-ONLY. The names/units drift test constructs a canonical EventEnvelope (which embeds a
 # Principal from myelin-identity, now a prod dep above) to read the REAL frozen field names off a
 # value, and confirms the search-requires-acl-filter lint (its home is the shared myelin-lints
