@@ -35,9 +35,33 @@
 //!   Storage 11.7, `mint_run_token` is Identity 4.7, KMS is Storage 11.3 — all consumed, not
 //!   implemented, at P-129.
 //!
-//! ## DB-free
-//! A pure value/trait crate. P-129 touches NO DB / object-store / cache / bus contract, so there
-//! is no `integration` feature and no live-stack test; `cargo build --workspace` stays DB-free.
+//! ## DB-free / VM-free by default
+//! The seam (this module) is a pure value/trait crate — `cargo build --workspace` and the default
+//! `cargo test` stay DB-free AND VM-free. The real backends (CI-P2 → P-237) add no DB; their unit
+//! tests inject a fake VMM/runtime so they never boot a guest. The REAL microVM boot lives ONLY in
+//! the `integration`-feature self-test (`tests/hardened_boot_selftest.rs`), gated to SKIP gracefully
+//! when `/dev/kvm` or `firecracker` is absent — so CI without KVM still passes.
+//!
+//! ## The CI-P2 backends + the named floor
+//! - [`firecracker`] — the **Firecracker default** [`SandboxBackend`] (microVM = KVM + minimal VMM):
+//!   the production default for untrusted code (arch 02 §5.1).
+//! - [`gvisor`] — the **gVisor (`runsc`) named-second** [`SandboxBackend`] behind the SAME trait. The
+//!   CI-P28 "gVisor second backend" floor is satisfied **early** here (the host has `runsc`; the
+//!   handoff inverts the original deferral) so the AG-D4 escape drill (CI-P5 → P-239) can parametrize
+//!   per available backend. gVisor uses the OCI/`runsc` path; Firecracker uses the microVM path. The
+//!   drill governs which is the production default (microVM, §5.1).
+//! - [`hardening`] — the **backend-independent mandatory hardening profile** (arch 02 §5.3) applied
+//!   identically regardless of backend or kind, incl. the unit-tested egress-allowlist evaluator
+//!   (metadata / control-plane / cross-tenant always denied).
+//!
+//! **FLOOR named (CI-P2):** ONE backend (Firecracker) goes through the escape drill first; gVisor is
+//! the named second backend behind the same trait (its own drill). The ZERO-escapes real-kernel GATE
+//! (AG-D4 / CI-T1) is CI-P5 (→ P-239); this prompt ships only the **hardened-boot self-test** (the
+//! floor under that drill — proves the runner BOOTS hardened, not that it survives the corpus).
+
+pub mod firecracker;
+pub mod gvisor;
+pub mod hardening;
 
 use serde::{Deserialize, Serialize};
 
