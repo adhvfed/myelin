@@ -17,10 +17,13 @@
 //! once. The parked run holds no runtime (the worker is freed between dispatch and completion).
 
 use myelin_agent::{Command, EffectKind, ToolDef, ToolName};
+use myelin_agent_service::escape_gate::{AgentExecGate, ProductionBackendId};
 use myelin_agent_service::{dispatch_long_compute, LongComputeProfile};
+use myelin_ci_sandbox::escape_corpus::{BEGIN_MARKER, END_MARKER};
 use myelin_ci_sandbox::{
-    EgressPolicy, IdemToken, ImageRef, MeterTarget, ResourceLimits, RunTokenRef, SandboxBackend,
-    SandboxHandle, SpecError, TrustTier,
+    parse_console, Backend, BackendRun, EgressPolicy, EscapeAttestation, IdemToken, ImageRef,
+    MeterTarget, ResourceLimits, RunTokenRef, SandboxBackend, SandboxHandle, SpecError, TrustTier,
+    CORPUS, CORPUS_VERSION,
 };
 use myelin_ci_sandbox::{JobSpec as SandboxJobSpec, RunnerHooks};
 use myelin_events::{
@@ -123,6 +126,38 @@ fn compute_def() -> ToolDef {
         exposed_over_mcp: false,
     }
 }
+/// A real GREEN AG-D4 gate (AG-P17 → P-229) — the structural fail-closed prerequisite the long-park
+/// dispatcher requires to exist at all. Minted from the corpus parser (never hardcoded).
+fn green_gate() -> AgentExecGate {
+    let id = ProductionBackendId {
+        backend: Backend::FirecrackerMicrovm,
+        rootfs_sha256: "rootfs-digest".into(),
+        kernel_sha256: "kernel-digest".into(),
+        corpus_version: CORPUS_VERSION,
+    };
+    let mut console = format!("{BEGIN_MARKER} corpus_version=1 kernel=6.1.168 guest_euid=0\n");
+    for atk in CORPUS {
+        console.push_str(&format!("{} CONTAINED\n", atk.id));
+    }
+    console.push_str(&format!("{END_MARKER}\n"));
+    let report = parse_console(&console);
+    let att = EscapeAttestation::from_green_drill(
+        "2026-06-21",
+        &report,
+        vec![BackendRun {
+            backend: Backend::FirecrackerMicrovm,
+            exercised: true,
+            residual_note: None,
+        }],
+        Backend::FirecrackerMicrovm,
+        "rootfs-digest",
+        "kernel-digest",
+        "6.1.168",
+    )
+    .unwrap();
+    AgentExecGate::admit(Some(&att), &id).unwrap()
+}
+
 fn profile() -> LongComputeProfile {
     LongComputeProfile {
         image: ImageRef::pinned("registry.example/runner@sha256:0123456789abcdef").unwrap(),
@@ -161,6 +196,7 @@ fn long_park_dispatches_and_parks_holding_no_runtime() {
     let mut ctx = begin(&outbox, journal, signals);
     let out = dispatch_long_compute(
         &mut ctx,
+        green_gate(),
         &runner,
         &compute_def(),
         &Command("--workspace".into()),
@@ -217,6 +253,7 @@ fn a_doubly_delivered_job_done_wakes_the_long_parked_run_exactly_once() {
     let mut ctx = begin(&outbox, journal, signals.clone());
     let out = dispatch_long_compute(
         &mut ctx,
+        green_gate(),
         &runner,
         &compute_def(),
         &Command("--workspace".into()),

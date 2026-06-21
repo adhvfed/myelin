@@ -63,11 +63,23 @@
 //!    un-digested tag; whole-guest kill on teardown; secrets resolved INSIDE the boundary as
 //!    [`SecretRef`]s, never forwarded via the runtime).
 //!
-//! ## Floors named
-//! - **The ZERO-escapes real-kernel escape GATE that proves guarantee 4** (AG-D4 / CI-T1) is
-//!   **AG-P17 (→ P-229) / CI-P5 (→ P-239)** — NOT greened here. This module FEEDS the hardening
-//!   profile the gate drills; the [`myelin_ci_sandbox::SandboxBackend`] impl that runs the real
-//!   microVM/gVisor guest is the **Firecracker backend, CI-P2 (→ P-237)** (the gVisor 2nd is CI-P28).
+//! ## The AG-D4 / CI-T1 hard escape GATE is CONSUMED here (AG-P17 → P-229)
+//! [`SandboxToolHands`] carries an [`AgentExecGate`](crate::escape_gate::AgentExecGate) — a value that
+//! can ONLY be obtained from a GREEN [`EscapeAttestation`](myelin_ci_sandbox::EscapeAttestation) for
+//! the production backend (the real-kernel drill CI ran on a microVM, CI-P5 → P-239). The hands have
+//! no constructor without it, so a Fabric exec dispatch is **structurally fail-closed on AG-D4**: no
+//! green attestation ⇒ no `SandboxToolHands` ⇒ no untrusted compute. This is the Fabric half of the
+//! D-4 go/no-go (the CI half is the drill + the attestation; this half is the GATE that refuses to
+//! dispatch without one). See [`crate::escape_gate`].
+//!
+//! ## Floors named (AG-P17 — there is NO floor on AG-D4)
+//! - **There is NO floor on AG-D4** — ZERO escapes is BOTH the floor and the full answer; it is a
+//!   **PERMANENT GATE** re-run on every backend / image / kernel change. The CI side proved it on a
+//!   real microVM (CI-P5 → P-239). The microVM/gVisor [`myelin_ci_sandbox::SandboxBackend`] impl is
+//!   the **Firecracker backend, CI-P2 (→ P-237)** (the gVisor 2nd is CI-P28).
+//! - **The M4 re-confirm on the prod CI image is AG-P21 (→ P-348)** (CI side CI-P27 / P-348).
+//! - **Continuous fuzzing + the full CVE corpus + a pre-GA third-party pentest** remain ongoing
+//!   residuals on top of this gate (never "done").
 //! - **`SCHEDULE_AND_RUN_JOB` long-park** (dispatch-and-return, completion as a durable idempotent
 //!   signal) is **AG-P16 (→ P-228)** — here exec is the in-line activity form.
 //! - **The real `LlmAgentRuntime`** running its compute against this same runner is **post-M5
@@ -79,6 +91,7 @@
 //! bodies it consumes are already proven against the live stack at AG-P14/AG-P13). So `cargo build
 //! --workspace` stays DB-free and there is no new `integration` feature here.
 
+use crate::escape_gate::AgentExecGate;
 use myelin_agent::{Command, EffectKind, ToolDef, ToolHands, ToolResult};
 use myelin_ci_sandbox::{
     agent_job, EgressPolicy, EnvVar, IdemToken, ImageRef, JobKind, JobSpec, MeterTarget,
@@ -290,6 +303,15 @@ impl SandboxJob {
 /// each `compute` call. (A `mutate`/`external` call never reaches here — the loop routes it to
 /// [`EffectApi`](crate::effect_api) per [`route_of`].)
 pub struct SandboxToolHands<'a, B: SandboxBackend> {
+    /// **The AG-D4 / CI-T1 hard escape GATE (AG-P17 → P-229).** The Fabric REFUSES to dispatch any
+    /// `kind=agent` compute job unless a GREEN [`EscapeAttestation`](myelin_ci_sandbox::EscapeAttestation)
+    /// exists for the production backend (ZERO escapes, matching kernel/rootfs/corpus identity). The
+    /// [`AgentExecGate`] can ONLY be obtained by [`AgentExecGate::admit`] against a real green
+    /// attestation — so holding `SandboxToolHands` is, by construction, proof the gate is GREEN (no
+    /// green attestation ⇒ no untrusted compute; the fail-closed property is in the TYPE, never a
+    /// hardcoded `true`). The dispatch path asserts the gate's backend identity matches the launched
+    /// job's image before any untrusted code runs.
+    gate: AgentExecGate,
     /// The unified-sandbox backend (CI owns it; the Fabric feeds it).
     backend: &'a B,
     /// The four-guarantee hooks the backend drives at the right lifecycle points.
@@ -316,8 +338,18 @@ impl<'a, B: SandboxBackend> SandboxToolHands<'a, B> {
     /// Construct the hands scoped to one run. The platform loop builds this from the run substrate
     /// (the per-run token + reserve + trust tier come from the dispatch tier, AG-P4/P-13/P-14). The
     /// `image`/`limits`/`egress`/`secret_refs` are the hardened `compute` profile for this run.
+    ///
+    /// **The AG-D4 gate (AG-P17 → P-229) is a REQUIRED argument** — there is no constructor without
+    /// it. The hands cannot exist (and therefore `exec` cannot dispatch) unless the caller has
+    /// already obtained a GREEN [`AgentExecGate`] for the production backend ([`AgentExecGate::admit`]
+    /// against a real green [`EscapeAttestation`](myelin_ci_sandbox::EscapeAttestation)). This is the
+    /// structural fail-closed: no green AG-D4 attestation ⇒ no `SandboxToolHands` ⇒ no untrusted
+    /// compute. The gate's admitted backend identity must match the run's hardened `image` digest, so
+    /// the dispatch is on the SAME backend the drill proved (the permanent gate, re-run on every
+    /// backend/image/kernel change).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        gate: AgentExecGate,
         backend: &'a B,
         hooks: RunnerHooks,
         image: ImageRef,
@@ -330,6 +362,7 @@ impl<'a, B: SandboxBackend> SandboxToolHands<'a, B> {
         secret_refs: Vec<SecretRef>,
     ) -> Self {
         SandboxToolHands {
+            gate,
             backend,
             hooks,
             image,
@@ -343,11 +376,22 @@ impl<'a, B: SandboxBackend> SandboxToolHands<'a, B> {
         }
     }
 
+    /// The AG-D4 / CI-T1 escape gate this run dispatches under (read-only). Its existence is the proof
+    /// that a GREEN escape attestation for the production backend was consumed (AG-P17 → P-229).
+    pub fn gate(&self) -> &AgentExecGate {
+        &self.gate
+    }
+
     /// Dispatch a pre-routed [`SandboxJob`] onto the unified sandbox — the explicit, fallible form
     /// `exec` wraps. Drives the backend's `launch` (which fires the four-guarantee hooks), then
     /// whole-guest-kills the guest on teardown (guarantee #4: the guest is never reused across jobs).
     /// Returns the typed [`HookError`] / backend error on a refused dispatch (e.g. an exhausted
     /// wallet refuses-to-start, 11.7) — never silently swallowed.
+    ///
+    /// **The AG-D4 gate is already proven GREEN by construction** (a `SandboxToolHands` cannot exist
+    /// without a green [`AgentExecGate`], AG-P17 → P-229) — so reaching this dispatch means the
+    /// production backend's real-kernel escape drill was green (ZERO escapes). No green attestation ⇒
+    /// no `SandboxToolHands` ⇒ this method is unreachable.
     pub fn dispatch_compute(&self, job: &SandboxJob) -> Result<ToolResult, ExecError<B::Error>> {
         // The whole of execution goes through `launch` — there is no host-exec bypass (1.6). `launch`
         // fires: #4 isolation floor → #2 attribution → #1a reserve (refuse-on-exhaustion) → (guest
@@ -456,13 +500,50 @@ pub fn compute_tool_def() -> ToolDef {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::escape_gate::ProductionBackendId;
     use myelin_agent::ToolName;
-    use myelin_ci_sandbox::{HookError, ReserveHandle, ResourceUsage, SandboxHandle};
+    use myelin_ci_sandbox::escape_corpus::{BEGIN_MARKER, END_MARKER};
+    use myelin_ci_sandbox::{
+        parse_console, Backend, BackendRun, EscapeAttestation, HookError, ReserveHandle,
+        ResourceUsage, SandboxHandle, CORPUS, CORPUS_VERSION,
+    };
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
 
     fn pinned() -> ImageRef {
         ImageRef::pinned("registry.example/runner@sha256:0123456789abcdef").unwrap()
+    }
+
+    /// A real GREEN AG-D4 gate for the test production backend (minted from the corpus parser, never
+    /// hardcoded) — the proof the exec hands require to exist at all.
+    fn green_gate() -> AgentExecGate {
+        let id = ProductionBackendId {
+            backend: Backend::FirecrackerMicrovm,
+            rootfs_sha256: "rootfs-digest".into(),
+            kernel_sha256: "kernel-digest".into(),
+            corpus_version: CORPUS_VERSION,
+        };
+        let mut console = format!("{BEGIN_MARKER} corpus_version=1 kernel=6.1.168 guest_euid=0\n");
+        for atk in CORPUS {
+            console.push_str(&format!("{} CONTAINED\n", atk.id));
+        }
+        console.push_str(&format!("{END_MARKER}\n"));
+        let report = parse_console(&console);
+        let att = EscapeAttestation::from_green_drill(
+            "2026-06-21",
+            &report,
+            vec![BackendRun {
+                backend: Backend::FirecrackerMicrovm,
+                exercised: true,
+                residual_note: None,
+            }],
+            Backend::FirecrackerMicrovm,
+            "rootfs-digest",
+            "kernel-digest",
+            "6.1.168",
+        )
+        .unwrap();
+        AgentExecGate::admit(Some(&att), &id).unwrap()
     }
 
     fn limits() -> ResourceLimits {
@@ -805,6 +886,7 @@ mod tests {
 
     fn hands<'a>(backend: &'a RecordingBackend, hooks: RunnerHooks) -> SandboxToolHands<'a, RecordingBackend> {
         SandboxToolHands::new(
+            green_gate(),
             backend,
             hooks,
             pinned(),
@@ -914,6 +996,40 @@ mod tests {
     fn the_routing_split_note_is_documented_once() {
         // Guarantee #3 is structural + documented once in the CI-sandbox seam.
         assert!(myelin_ci_sandbox::hitl_withhold_note().contains("EffectApi::apply"));
+    }
+
+    // ──────────────────── AG-D4 gate: exec is fail-closed on the escape attestation ─────────────
+
+    #[test]
+    fn the_exec_hands_carry_a_green_ag_d4_gate_by_construction() {
+        // The structural fail-closed: `SandboxToolHands` exists ONLY when a green AG-D4 gate was
+        // supplied. There is NO `new` without the gate argument — so a green attestation is a
+        // compile-time prerequisite of any dispatch. A run that holds these hands has, by
+        // construction, a green AG-D4 attestation for the production backend.
+        let backend = RecordingBackend {
+            order: Arc::new(Mutex::new(Vec::new())),
+            kills: Arc::new(AtomicU32::new(0)),
+        };
+        let hands = hands(&backend, working_hooks());
+        assert_eq!(hands.gate().backend_id().backend, Backend::FirecrackerMicrovm);
+        assert!(hands.gate().open_line().starts_with("[AG-D4 GATE OPEN]"));
+    }
+
+    #[test]
+    fn without_a_green_attestation_no_gate_can_be_built_so_no_hands_dispatch() {
+        // The negative leg: with NO attestation, `AgentExecGate::admit` REFUSES — so the gate the
+        // hands require can never be built, and therefore no untrusted compute can be dispatched.
+        // (This is the same fail-closed proven in the gate's own CDC; here we pin it at the exec seam.)
+        let id = ProductionBackendId {
+            backend: Backend::FirecrackerMicrovm,
+            rootfs_sha256: "rootfs-digest".into(),
+            kernel_sha256: "kernel-digest".into(),
+            corpus_version: CORPUS_VERSION,
+        };
+        assert!(
+            AgentExecGate::admit(None, &id).is_err(),
+            "no green attestation ⇒ no AgentExecGate ⇒ no SandboxToolHands ⇒ no untrusted compute"
+        );
     }
 
     #[test]

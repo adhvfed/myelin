@@ -82,6 +82,7 @@ pub mod cost_gate;
 pub mod defaults;
 pub mod dry_run;
 pub mod effect_api;
+pub mod escape_gate;
 pub mod exec;
 pub mod hitl;
 pub mod hitl_batch;
@@ -170,6 +171,20 @@ pub use exec::{
     compute_tool_def, route_of, ExecError, RoutingError, SandboxJob, SandboxToolHands, ToolRoute,
     PLATFORM_TOKEN_ENV,
 };
+
+// The AG-D4 / CI-T1 hard escape GATE consumed on the Fabric exec dispatch path (AG-P17 → P-229,
+// M2-C, contract 8.4 — the drill-as-gate). CI owns the runner + the real-kernel escape drill (CI-P5
+// → P-239, proven on a real Firecracker microVM); this is the FABRIC half that CONSUMES the green
+// `EscapeAttestation` (myelin-ci-sandbox, NOT re-implemented / NOT forked) and turns it into a
+// fail-closed gate: the `AgentExecGate` can ONLY be obtained from a GREEN attestation for the
+// production backend (ZERO escapes, matching kernel/rootfs/corpus identity) — so a `SandboxToolHands`
+// / `AgentJobDispatcher` cannot exist without one (no green attestation ⇒ no untrusted compute; the
+// fail-closed property is in the TYPE, never a hardcoded `true`). FLOORS (AG-P17): there is NO floor
+// on AG-D4 — ZERO escapes is both floor and full answer; it is a PERMANENT GATE re-run on every
+// backend/image/kernel change. The M4 re-confirm on the prod CI image is AG-P21 (→ P-348); the real
+// LlmAgentRuntime against this hardened runner is post-M5 (AG-P25); continuous fuzzing + CVE corpus +
+// pre-GA pentest remain ongoing residuals.
+pub use escape_gate::{AgentExecGate, GateRefusal, ProductionBackendId};
 
 // The FROZEN §6.3 requires_approval defaults seed (AG-P8 → P-220): the per-subsystem default lookup
 // + the cross-subsystem "governed where it lands" rule + the seed seam + the VISION §3

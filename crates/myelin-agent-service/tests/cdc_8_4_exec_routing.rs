@@ -28,13 +28,16 @@
 //! guarantee #4 is AG-P17 (→ P-229) / CI-P5 (→ P-239); the Firecracker backend is CI-P2 (→ P-237).
 
 use myelin_agent::{Command, EffectKind, ToolDef, ToolHands, ToolName};
+use myelin_agent_service::escape_gate::{AgentExecGate, ProductionBackendId};
 use myelin_agent_service::exec::{
     route_of, RoutingError, SandboxJob, SandboxToolHands, ToolRoute, PLATFORM_TOKEN_ENV,
 };
+use myelin_ci_sandbox::escape_corpus::{BEGIN_MARKER, END_MARKER};
 use myelin_ci_sandbox::{
-    EgressPolicy, EnvVar, HookError, IdemToken, ImageRef, JobKind, JobSpec, MeterTarget,
-    ReserveHandle, ResourceLimits, ResourceUsage, RunTokenRef, RunnerHooks, SandboxBackend,
-    SandboxHandle, SecretRef, TrustTier,
+    parse_console, Backend, BackendRun, EgressPolicy, EnvVar, EscapeAttestation, HookError,
+    IdemToken, ImageRef, JobKind, JobSpec, MeterTarget, ReserveHandle, ResourceLimits,
+    ResourceUsage, RunTokenRef, RunnerHooks, SandboxBackend, SandboxHandle, SecretRef, TrustTier,
+    CORPUS, CORPUS_VERSION,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -127,9 +130,42 @@ fn working_hooks() -> RunnerHooks {
     }
 }
 
+/// A real GREEN AG-D4 gate (AG-P17 → P-229) — the structural fail-closed prerequisite the exec hands
+/// require to exist at all. Minted from the corpus parser (never hardcoded).
+fn green_gate() -> AgentExecGate {
+    let id = ProductionBackendId {
+        backend: Backend::FirecrackerMicrovm,
+        rootfs_sha256: "rootfs-digest".into(),
+        kernel_sha256: "kernel-digest".into(),
+        corpus_version: CORPUS_VERSION,
+    };
+    let mut console = format!("{BEGIN_MARKER} corpus_version=1 kernel=6.1.168 guest_euid=0\n");
+    for atk in CORPUS {
+        console.push_str(&format!("{} CONTAINED\n", atk.id));
+    }
+    console.push_str(&format!("{END_MARKER}\n"));
+    let report = parse_console(&console);
+    let att = EscapeAttestation::from_green_drill(
+        "2026-06-21",
+        &report,
+        vec![BackendRun {
+            backend: Backend::FirecrackerMicrovm,
+            exercised: true,
+            residual_note: None,
+        }],
+        Backend::FirecrackerMicrovm,
+        "rootfs-digest",
+        "kernel-digest",
+        "6.1.168",
+    )
+    .unwrap();
+    AgentExecGate::admit(Some(&att), &id).unwrap()
+}
+
 /// **CONSUMER side (the agent fabric).** Build the run-scoped hands the platform loop uses.
 fn fabric_hands<'a>(backend: &'a RunnerSeam, hooks: RunnerHooks) -> SandboxToolHands<'a, RunnerSeam> {
     SandboxToolHands::new(
+        green_gate(),
         backend,
         hooks,
         pinned(),
