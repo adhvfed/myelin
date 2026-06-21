@@ -1139,9 +1139,20 @@ row = "13.3"
 # the created_at+ULID tiebreak) + the SHARED X-3 conformance vector (authored once in
 # order_key.rs, replayed byte-identically by Knowledge here and by Issues at ISS-P02/P-241). The
 # X-3 anti-drift gate = 0 rank divergences across the shared vector.
+#
+# P-241 (ISS-P02): Issues now CO-OWNS the 13.3 primitive byte-identical — the genuine consumer leg.
+# The myelin-issues crate LINKS myelin-query as a dependency (architecture issue-tracker §1 "Issues
+# links them directly — the same bytes Knowledge uses, not a re-implementation") and re-exports the
+# four shared shapes from src/query_coown.rs (no second definition; EI-01 §7). The Issues-side CDC
+# (cdc_13_3_issues_coown.rs, living IN the issues crate) replays the shared CONFORMANCE_VECTOR and
+# serializes the shared ViewSpec/FieldType through Issues' OWN call sites, asserting byte-diff = 0 vs
+# Knowledge's frozen outputs. A FieldType rename / ViewSpec reorder / order_key midpoint-or-jitter
+# change now fails BOTH co-owners' tests at once. Issues' own AST→store compiler is ISS-P13; the
+# order_key CAS reorder is ISS-P09; the co-equal views are ISS-P16 (no data written yet).
 title = "myelin-query primitive (frozen byte-identical)"
 status = "covered"
 cdc = [
     "crates/myelin-query/tests/cdc_13_3_query_primitive.rs",
     "crates/myelin-query/tests/cdc_13_3_order_key.rs",
+    "crates/myelin-issues/tests/cdc_13_3_issues_coown.rs",
 ]
