@@ -358,11 +358,19 @@ title = "per-subsystem ReBAC namespace fragment (engine + admit-contract + core 
 # the cell schema (the ISS-P01 gate) AND that the `- confidential` set-difference resolves LEAK-FREE
 # (a confidential issue is absent from view for a non-grantee; the rewrites wired LIVE on Id's M2
 # CaveatContext/list_objects bodies, ISS-P11 / P-ID-*).
+# The CHAT fragment SLICE (the `channel` + `message` namespace; the frozen `channel.read = member +
+# parent_project->read` clause, recon §1; the `watcher` Notif read-fanout relation) is CHAT-P2 / P-244
+# — its CDC declares the Chat fragment (CONSUMER) + admits it through the real engine (PROVIDER),
+# proving it COMPILES into the cell schema (the CHAT-P2 gate) AND that `channel.read` resolves (a
+# member reads; a public-channel project-reader inherits read; `message.view` inherits the channel's
+# read; `watcher` is read-fanout, not a read grant). Rewrites wired LIVE on the Chat M4 spine; the
+# runtime membership tuple writes are the CHAT-P8 floor.
 status = "covered"
 cdc = [
     "crates/myelin-identity-service/tests/cdc_4_9_namespace_engine.rs",
     "crates/myelin-git/tests/cdc_4_9_git_fragment.rs",
     "crates/myelin-issues/tests/cdc_4_9_issues_fragment.rs",
+    "crates/myelin-chat/tests/cdc_4_9_chat_fragment.rs",
 ]
 
 [[contract]]
@@ -433,8 +441,22 @@ landing = "P-159"
 [[contract]]
 row = "5.7"
 title = "unified #sub sub-artifact scheme (frozen)"
-status = "deferred"
-landing = "P-164"
+# The frozen `#sub` GRAMMAR + the per-subsystem stable-opaque MINT half of 5.7 is now PROVEN by real
+# provider+consumer CDC pairs: Refs owns the ONE grammar (REF-P1 / P-052, the parse/format value type
+# in cdc_5_1_artifactref.rs), and each owner registers + mints its declared kinds through that one
+# grammar — git (`comment-`/`thread-`/`L<a>-L<b>`, GIT-P4 / P-230) and chat (`message-`/`thread-`,
+# CHAT-P2 / P-244). The PROVIDER mints stable opaque sub-ids of its kinds (0 ungrammatical by
+# construction); the CONSUMER (Refs) ACCEPTS the registration + classifies every mint + strips it to
+# the canonical root. FLOOR (named): the `resolve(ref, viewer, mode)` 4-step tombstone LADDER half of
+# 5.7 (the per-kind project/resolution) is the separate row 5.2 (deferred P-159) + the Refs resolver
+# bulk (P-164) + the per-kind resolvers (GIT-P18/P-24, the Chat projection spine); this row's
+# GRAMMAR+MINT pairs ship here.
+status = "covered"
+cdc = [
+    "crates/myelin-refs/tests/cdc_5_1_artifactref.rs",
+    "crates/myelin-git/tests/cdc_5_7_git_sub_mints.rs",
+    "crates/myelin-chat/tests/cdc_5_7_chat_sub_mints.rs",
+]
 
 [[contract]]
 row = "5.8"

@@ -2090,6 +2090,11 @@ name = "myelin-chat"
 version = "0.0.0"
 dependencies = [
  "myelin-events",
+ "myelin-identity",
+ "myelin-identity-service",
+ "myelin-refs",
+ "myelin-storage",
+ "myelin-tenancy",
  "serde",
 ]
 
