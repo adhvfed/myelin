@@ -1156,11 +1156,23 @@ status = "covered"
 # (STOR-D5 CDN within-EU, 0 cross-region PII egress via the CDN). The CDN clone class RIDES the
 # unchanged base FsBlobStore (the structural "not a new store" assertion). The C6 outbound push-mirror
 # residency gate seam is the sibling → P-ST-25 (P-255).
+# P-272 (GIT-P11): the GIT-SIDE pack tier on the local-NVMe floor (myelin-git/src/pack_tier.rs) — the
+# git subsystem CONSUMES this row's GitPackTier (REUSED, never re-defined). NEW git-side layer: the
+# accepted-quarantine → object-DB migration THROUGH the trait (PackTierMigration, closing the
+# QuarantineMigration floor receive_pack.rs named GIT-P11 to fill), the commit-graph/reachability-
+# bitmap/MIDX maintenance artifacts + their staleness fences (arch 01 §4.1 / 02 §8, each a content-
+# addressed blob through the trait), the byte-identical clone round-trip (the GATE: receive-pack →
+# store → clone, 0 corruption — proven end-to-end through RefStore::receive with the REAL pack tier),
+# and the residency-pin lint green on the pack placement (relocatable, never node-pinned — STOR-5).
+# Floors named GF-1 (object-backed packs) / GF-2 (cross-cell) / GF-2b (SHA-256 flip) / GF-4 (Mononoke-
+# class) all → GIT-P33. The git consumer-half CDC is cdc_11_2_git_pack_tier_consumer.rs (the REAL
+# PackObjectDb drives the storage provider — pins the frozen put/get/placement shape).
 cdc = [
     "crates/myelin-storage/tests/cdc_11_2_blobstore.rs",
     "crates/myelin-storage/tests/cdc_11_2_git_pack_tier.rs",
     "crates/myelin-storage/tests/cdc_11_2_11_4_git_crypto_shred_reach.rs",
     "crates/myelin-storage/tests/cdc_11_2_c3_cdn_clone_class.rs",
+    "crates/myelin-git/tests/cdc_11_2_git_pack_tier_consumer.rs",
 ]
 
 [[contract]]
