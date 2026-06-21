@@ -866,6 +866,13 @@ impl WfCtx {
         }
     }
 
+    /// **`run_id()` — the run this body is executing (read-only).** A pure accessor (NOT journaled —
+    /// the run id is structural, fixed for the run's lifetime), so a body can build per-run keys (e.g.
+    /// the §6.4 per-effect approval card's `run_id` the gated loop reads its buffered signals under).
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
     /// **`now()` (contract 9.2, §5.1) — a journaled SIDE-MARKER.** Returns the deterministic
     /// RFC-3339 UTC clock for this run AND journals a `side_marker` `wf_history` row capturing it,
     /// so on replay (P-FLOW-05) the workflow body reads back the SAME timestamp — making a
