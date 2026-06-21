@@ -38,6 +38,17 @@ myelin-events = { path = "../myelin-events" }
 # through this one codec — git mints, Refs owns the grammar (no second URN language, REF-3). Refs is
 # a shared glue crate that does NOT depend back on git (the §2.9 DAG stays acyclic).
 myelin-refs = { path = "../myelin-refs" }
+# The Search indexing-contract surface (contract 6.3 declare_indexable / IndexSpec). GIT-P5 (P-231)
+# REGISTERS git's owned code-projection spec — the `git.*` blob projection shape — by constructing
+# the frozen `myelin_search::IndexSpec` and proving it serializes to the 6.3 wire shape. Git declares
+# its spec; Search owns the IndexSpec type (no second indexing-contract shape, EI-01 §7). The EMITTER
+# that feeds the projection at push time is the GIT-P25 follow-on. `myelin-search` is a sibling
+# subsystem/glue crate that does NOT depend back on `myelin-git` (the §2.9 DAG stays acyclic).
+myelin-search = { path = "../myelin-search" }
+# The frozen FieldType enum (contract 13.3) — the structured/columnar facet taxonomy git's
+# code-projection `struct_fields` (path/language/blob_oid) are typed over. Owned by Search/Query, not
+# re-defined here.
+myelin-query = { path = "../myelin-query" }
 serde.workspace = true
 
 # DEV-ONLY: the rich ReBAC namespace ENGINE (FragmentDef / Userset / StoreBackedCheck) lives in the
@@ -50,3 +61,7 @@ serde.workspace = true
 [dev-dependencies]
 myelin-identity-service = { path = "../myelin-identity-service" }
 myelin-storage = { path = "../myelin-storage" }
+# JSON for the contract-6.3 wire-shape CDC (proving git's declare_indexable spec serializes to the
+# frozen 6.3 key set/values). Test scaffolding only — the same serde_json::Value the rest of the
+# workspace pins (no runtime edge).
+serde_json.workspace = true

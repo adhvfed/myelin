@@ -72,4 +72,5 @@ pub mod events;
 pub mod holder_intent;
 pub mod rebac_fragment;
 pub mod schema;
+pub mod search_projection;
 pub mod subs;

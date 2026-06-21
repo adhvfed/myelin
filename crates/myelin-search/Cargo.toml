@@ -77,6 +77,11 @@ tantivy = { workspace = true }
 # Search stays a terminal leaf consumer.
 serde_json = { workspace = true }
 
+# GIT-P5 (P-231): `IndexSpec` derives `Serialize` so a producer's owned spec half (git's
+# code-projection spec) can be proven byte-stable against the frozen contract-6.3 wire keys in its
+# CDC. The serialized shape IS the declare_indexable wire contract; serde derive is the mechanism.
+serde = { workspace = true }
+
 # TEST-ONLY. The names/units drift test constructs a canonical EventEnvelope (which embeds a
 # Principal from myelin-identity, now a prod dep above) to read the REAL frozen field names off a
 # value, and confirms the search-requires-acl-filter lint (its home is the shared myelin-lints

@@ -124,11 +124,21 @@ pub const INDEXER_SUBJECT_PREFIXES: &[&str] = &[
 /// semantically indexed, and the `acl_object_type` the ACL filter pins on. SRCH-P06 freezes the SHAPE
 /// and exercises it with a synthetic producer; the REAL per-subsystem instances land M3/M4
 /// (SRCH-P17 et al.). To the frozen shape (a rename of a field breaks the registrants then).
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// **Serialization (the 6.3 wire shape — GIT-P5/P-231).** The spec is `Serialize` so a producer's
+/// owned spec half (e.g. git's code-projection spec, `myelin_git::search_projection`) can be
+/// proven byte-stable against the frozen contract-6.3 keys in a CDC test. The contract row names
+/// `projection` + `ft_fields` alongside `struct_fields`; this implementation realizes those two as
+/// the **index-time [`SearchProjection`]** (`text` = the full-text/projection body, the `ft_fields`
+/// content; `fields` = the structured facets typed by `struct_fields`). So the SPEC carries the
+/// structured/semantic/acl half here and the projection+ft content arrives at emit time — no second
+/// shape. A rename of a serialized key is a wire-breaking change the registrants' CDC tests catch.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct IndexSpec {
     /// The owning subsystem (`issue`/`knowledge`/`chat`/`git`/…) — the projection source.
     pub subsystem: String,
     /// The artifact type within the subsystem (`issue`/`page`/`message`/`blob`/…).
+    #[serde(rename = "type")]
     pub type_: String,
     /// The structured facets (the structured/columnar shape) this type carries, by name → frozen
     /// [`FieldType`]. The engine types its columnar fast-fields byte-identically over these (13.3).
@@ -161,6 +171,16 @@ impl IndexSpec {
     /// Mark this spec as semantically indexed (its docs get an embedding via the adapter, §4.8).
     pub fn semantic(mut self) -> IndexSpec {
         self.semantic = true;
+        self
+    }
+
+    /// Pin the `acl_object_type` the ACL filter keys on when it DIFFERS from `type_` (§3.1). A git
+    /// `blob` doc, for instance, is a sub-artifact whose reachability is decided by its parent
+    /// **`repo`** (the ACL object is the repository, not the individual blob) — so git's
+    /// code-projection spec is `type_ = "blob"` but `acl_object_type = "repo"` (GIT-P5/P-231). The
+    /// default (constructor) keeps `acl_object_type == type_`.
+    pub fn with_acl_object_type(mut self, acl_object_type: impl Into<String>) -> IndexSpec {
+        self.acl_object_type = acl_object_type.into();
         self
     }
 }

@@ -462,8 +462,14 @@ landing = "P-174"
 [[contract]]
 row = "6.3"
 title = "declare_indexable(IndexSpec)"
-status = "deferred"
-landing = "P-167"
+status = "covered"
+# GIT-P5/P-231 ships git's owned spec half: git declares its `declare_indexable` code-projection
+# spec (`myelin_git::search_projection::git_code_projection_spec` — git/blob, the path/language/
+# blob_oid facets, non-semantic, acl_object_type=repo) and Search ADMITS it into a live indexer's
+# per-tenant facet union (the build-time registration). The CDC carries BOTH the provider (git
+# declares + serializes to the 6.3 wire shape) and consumer (Search admits) sides. The Search engine
+# half was frozen at SRCH-P06/P-167; the projection EMITTER that feeds the rows is GIT-P25/P-287.
+cdc = ["crates/myelin-git/tests/cdc_6_3_git_code_projection.rs"]
 
 [[contract]]
 row = "6.4"
