@@ -13,6 +13,15 @@
 //!   (ISS-P11 / P-ID-*).
 //! - [`holder_intent`] + [`schema`] — **ISS-P01 / P-125**: the H3 holder INTENT + the
 //!   `#[personal_data(...)]` classification tags (see below).
+//! - [`query_coown`] — **ISS-P02 / P-241**: Issues **co-owns `myelin-query` byte-identical** with
+//!   Knowledge (contract 13.3, X-3/OQ-C). The four shared shapes (the `FieldType` enum, the
+//!   `ViewSpec` view-model, the `QueryAst` grammar, the `order_key`/LexoRank codec) are **linked**
+//!   from the frozen shared crate — *the same bytes* Knowledge uses, never a re-implementation — and
+//!   the byte-identity drift-killer (`tests/cdc_13_3_issues_coown.rs`) replays the shared
+//!   conformance vector + serializes the shared `ViewSpec` *from the Issues crate* and proves **0
+//!   byte differences** vs Knowledge's frozen outputs. NO Issues data is written yet; Issues' own
+//!   AST→store compiler lands in **ISS-P13**, the `order_key` CAS reorder in **ISS-P09**, the
+//!   co-equal views in **ISS-P16** (floors named in [`query_coown`]).
 //!
 //! **Owning architecture doc:**
 //! `planning/04-subsystem-architectures/issue-tracker/architecture/03-events-contracts-and-glue.md`
@@ -79,5 +88,6 @@
 #![forbid(unsafe_code)]
 
 pub mod holder_intent;
+pub mod query_coown;
 pub mod rebac_fragment;
 pub mod schema;

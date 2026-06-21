@@ -2280,9 +2280,11 @@ dependencies = [
  "myelin-gdpr",
  "myelin-identity",
  "myelin-identity-service",
+ "myelin-query",
  "myelin-storage",
  "myelin-tenancy",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

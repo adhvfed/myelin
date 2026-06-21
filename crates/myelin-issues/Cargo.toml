@@ -34,6 +34,15 @@ myelin-identity = { path = "../myelin-identity" }
 myelin-gdpr = { path = "../myelin-gdpr" }
 # The canonical (tenant, region) partition keys threaded through every issue schema row + ArtifactRef.
 myelin-tenancy = { path = "../myelin-tenancy" }
+# The frozen shared QUERY core (contract 13.3, X-3): the FieldType enum + the ViewSpec view-model +
+# the QueryAst grammar + the order_key/LexoRank codec. Issues CO-OWNS this crate with Knowledge
+# (ADR-06): it LINKS the frozen definitions directly — *the same bytes* Knowledge uses, never a
+# re-implementation (architecture issue-tracker 01-tech-and-data-model §1 + §3). Issues owns its OWN
+# AST→store compiler (ISS-P13) ON TOP of these shared shapes; the DEFINITIONS are byte-identical and
+# live here, linked. The byte-identity drift-killer (tests/cdc_13_3_issues_coown.rs) replays the
+# shared CONFORMANCE_VECTOR + serializes the shared ViewSpec from the Issues side and asserts 0 byte
+# differences vs Knowledge's frozen outputs.
+myelin-query = { path = "../myelin-query" }
 serde.workspace = true
 
 # DEV-ONLY: the rich ReBAC namespace ENGINE (FragmentDef / Userset / StoreBackedCheck) lives in the
@@ -48,3 +57,6 @@ serde.workspace = true
 myelin-identity-service = { path = "../myelin-identity-service" }
 myelin-storage = { path = "../myelin-storage" }
 myelin-events = { path = "../myelin-events" }
+# The 13.3 byte-identity CDC (tests/cdc_13_3_issues_coown.rs) serializes the co-owned ViewSpec/
+# FieldType to JSON and asserts the golden bytes (a build-time drift test, no DB).
+serde_json.workspace = true
