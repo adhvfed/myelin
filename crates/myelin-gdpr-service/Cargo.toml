@@ -57,3 +57,13 @@ serde_json = { workspace = true }
 # and `myelin-control-plane`, which both depend on `myelin-substrate`); substrate depends only
 # on the `myelin-gdpr` CONTRACT crate (not the service), so there is no cycle.
 myelin-substrate = { path = "../myelin-substrate" }
+
+[dev-dependencies]
+# TEST-ONLY (P-GA-28 → P-257): the GIT-D2 drill fires the P-GA-18 commit-identity architecture test
+# over Git's REAL commit codec (`myelin_git::commit::Commit` — pseudonymous-by-construction, GIT-P25).
+# This is a test-only edge: `myelin-git` depends on the `myelin-gdpr` CONTRACT crate (not this
+# service), so there is no production-DAG cycle (and nothing in the library DAG depends back on this
+# service — it is a leaf consumer). The dependency exists ONLY so the architecture test can scan the
+# author/committer lines lifted from `Commit::canonical_bytes` and assert they hold only the frozen
+# pseudonym form — the M3 enforcement P-GA-18 named (the verdict scaffold firing on the live codec).
+myelin-git = { path = "../myelin-git" }

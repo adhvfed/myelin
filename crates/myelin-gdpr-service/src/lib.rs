@@ -482,6 +482,35 @@
 //! the `cargo mutants` score is recorded in the [`registries`] module note + the commit body. **No
 //! `--features integration` leg owed:** the registries + the gate are pure in-memory decision models
 //! over already-shipped seams — they touch NO new DB / object-store / cache / bus contract.
+//!
+//! ## P-GA-28 (→ P-257) — the Git pseudonymous-commit instance of X-7 (10.9 BY REFERENCE) + GIT-D2
+//! [`git_instance`] ships the **Git instance of the ONE posture — BY REFERENCE** (§7.4), the FIRST
+//! real subsystem register that fires the P-GA-16 by-reference GATE scaffolding green. It (1)
+//! registers the Git erasure-section reference ([`git_instance::GIT_INSTANCE`]) that CITES the
+//! canonical anchor ([`posture::POSTURE_ANCHOR`]) and **never restates** the posture
+//! ([`git_instance::git_section_references_posture`] — the consumer half of the 10.9 CDC pair,
+//! completing the P-GA-16/P-GA-18 stubs); (2) confirms **GIT-D2's residual == the ONE platform-posture
+//! residual** ([`git_instance::git_residual_is_the_one_posture`] — the Git residual IS the canonical
+//! [`posture::CANONICAL_POSTURE`]`.residual`, confirmed equal, never re-described); and (3) makes the
+//! **P-GA-18 commit-identity prerequisite FIRE over Git's REAL commit codec** — the recorded obligation
+//! (*Git's M3 commits hold only `<pseudonym>@<tenant>.noreply`*) is now enforced over
+//! [`myelin_git::commit::Commit::canonical_bytes`] (pseudonymous-by-construction, GIT-P25) by the
+//! verdict scaffold [`commit_prerequisite::commit_actor_holds_only_pseudonym`], called via
+//! [`git_instance::pseudonym_actor_lines_pass_the_prerequisite`]. The GIT-D2 drill
+//! (`tests/git_d2_pseudonymous_commit.rs`) is the dated green artifact: erase an author → 0 recoverable
+//! real identity in the immutable bytes, residual == the ONE posture, crypto-shred reaches backups; the
+//! P-GA-18 architecture test PASSES on the live codec. It REUSES the canonical posture / the
+//! by-reference predicate / the pseudonym-verdict / the Git H1 holder ([`producer_holders::GitDbHolder`])
+//! WHOLESALE — no restatement, no second predicate. **Floor named:** the audited **history-rewrite
+//! erasure path** (the rare commit-body expunge, with the disruptive changed-hash consequence) →
+//! **M5 P-GA-35 (GA-10)** ([`git_instance::HISTORY_REWRITE_FLOOR_PROMPT`]); the live Git `erase`
+//! binding is the config swap P-GA-27 named. **No `--features integration` leg owed:** this confirms a
+//! reference + fires a pure-bytes architecture test over the in-process commit codec — it touches NO
+//! new DB / object-store / cache / bus contract. **Mutation floor (P-GA-28 TESTS — the
+//! pseudonym-form-only-in-commit-bytes check is mandatory-core):** the verdict
+//! [`commit_prerequisite::commit_actor_holds_only_pseudonym`] is killed by {a pseudonym actor passes,
+//! every real-identity actor fails} over fixtures AND over Git's real `canonical_bytes`; Git's own
+//! `erase`-impl floor is owned by Git (GIT-P25). `cargo mutants` score recorded in the commit body.
 
 pub mod agent_trace_seam;
 pub mod audit;
@@ -493,6 +522,7 @@ pub mod datamap;
 pub mod derivative_erasure;
 pub mod diffgate;
 pub mod dsr;
+pub mod git_instance;
 pub mod dsr_timer;
 pub mod erasure_ledger;
 pub mod fanout;
@@ -560,6 +590,11 @@ pub use erasure_ledger::{
 pub use fanout::{
     DsrCompletionReceipt, FanOutDriver, FanOutOutcome, HoldScope, HoldVerdict, LegalHoldRegistry,
     LEGAL_HOLD_ACTIVE_COUNT,
+};
+pub use git_instance::{
+    git_residual, git_residual_is_the_one_posture, git_section_references_posture,
+    pseudonym_actor_lines_pass_the_prerequisite, residual_is_the_one_posture,
+    section_references_posture, GIT_INSTANCE, GIT_SUBSYSTEM, HISTORY_REWRITE_FLOOR_PROMPT,
 };
 pub use holders::{
     gdpr_owned_holder_ids, AuditCarveOutHolder, CryptoShredKms, GdprOwnStoreHolder,

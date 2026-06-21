@@ -1023,6 +1023,18 @@ status = "covered"
 # `restrict`-honoured-by-M1-holder pair the prompt requires; the residual (third-party mention under
 # the author's DEK) is restrict-suppress-only, never crypto-shredded (the documented limit, §7.2).
 # The full restriction-into-derived-stores proof (GA-D7) is M2 P-GA-25 → P-152.
+#
+# P-257 (GA-28): the Git pseudonymous-commit INSTANCE of X-7 (10.9 BY REFERENCE) + GIT-D2. The FIRST
+# real subsystem-reference register lands: myelin-gdpr-service::git_instance::GIT_INSTANCE cites the
+# canonical anchor and does NOT restate the posture, so the P-GA-16 `references-it-never-restates`
+# architecture assertion now FIRES over a real subsystem doc (the consumer half of the 10.9 pair).
+# GIT-D2's residual == the ONE platform-posture residual (git_residual_is_the_one_posture, confirmed
+# equal — never re-described). The P-GA-18 commit-identity architecture test now FIRES over Git's REAL
+# commit codec (myelin_git::commit::Commit::canonical_bytes — pseudonymous-by-construction, GIT-P25):
+# commit_actor_holds_only_pseudonym PASSES over the live author/committer lines. The dated green
+# artifact is tests/git_d2_pseudonymous_commit.rs (erase → 0 recoverable real identity in the
+# immutable bytes, crypto-shred reaches backups, residual == the ONE posture). The audited
+# history-rewrite erasure path (the rare commit-body expunge) is the named M5 follow-on P-GA-35 (GA-10).
 cdc = [
     "crates/myelin-gdpr-service/tests/cdc_10_9_erasure_posture.rs",
     "crates/myelin-gdpr-service/tests/cdc_10_9_structural_floor.rs",
