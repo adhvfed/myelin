@@ -104,6 +104,28 @@
 //!     code runs until green); the 9.2/9.4 CDC pair is `tests/cdc_9_2_schedule_and_run_job.rs`.
 //!     **NAMED FLOORS:** reserve/settle bookend **P-FLOW-16**) — the rest land later. An empty journal
 //!     is not a working engine.
+//! - **The merge-queue durable workflow body** (the durable-execution half of the X-1 seam, §6.5)
+//!   — **LANDED at P-FLOW-19** (P-215), see [`merge_queue`] ([`WfCtx::run_merge_attempt`]: ONE merge
+//!   attempt per queued PR — compute the speculative merge commit + dispatch the required CI under a
+//!   DETERMINISTIC `merge_attempt_id` ([`merge_attempt_id`]) reserving budget at dispatch (no balance
+//!   → no CI), park on `wait_for_signal("ci.result", idem_key=<merge_attempt_id>)` holding NO runtime
+//!   with a timeout-timer bounding a vanished CI run; on a `success` rollup for ALL required contexts
+//!   → merge ([`MergePerformer`]) + emit `git.pr.merged` via the outbox + settle → [`MergeOutcome::
+//!   Merged`]; on `failure` / a missing required context / a failed merge → dequeue with a HUMANISED
+//!   reason (contract 7.3, [`humanise_dequeue_reason`]) → [`MergeOutcome::Dequeued`]; a vanished CI
+//!   run's timeout → [`MergeOutcome::TimedOut`]). A double-delivered `ci.result` wakes the run ONCE
+//!   (the `wf_signal` PK dedup) → 0 double-merge; replay re-derives the SAME id + short-circuits
+//!   dispatch+wait+merge. The body imports the CI-owned [`CiResult`](myelin_events::check_seam::
+//!   CiResult) / `ci.result` data shape (contract 5.9) from `myelin-events` — it does NOT redefine it
+//!   ([`encode_ci_result`]/[`decode_ci_result`] are the references-not-payloads codec over that
+//!   shape). The CI dispatch into [`CiDispatcher`] is GATED by AG-D4 (Agent-Fabric/CI-owned —
+//!   `04-sandbox-AG-D4.md`, NO untrusted code until green). The merge-queue-in-isolation drill (0
+//!   double-merge, 1 wake/attempt, timeout-bounded) is `tests/drills_flow_merge_queue.rs`; the 5.9
+//!   merge-queue CONSUMER CDC pair (vs CI's `ci.result` producer shape) is
+//!   `tests/cdc_5_9_merge_queue.rs`. **NAMED FLOOR:** this is the merge-queue body built + drilled
+//!   IN ISOLATION against a MOCK [`MockCiResultProducer`]; the X-1 seam END-TO-END against CI's REAL
+//!   `ci.result` producer (GIT-D10 / CI-D8) is **P-FLOW-22** (M4 — the floor this prompt opens). (M2.4
+//!   — and the whole M2 engine surface for myelin-flow — is now covered across P-FLOW-13..19.)
 //! - **The §6.2 loop-safety enforcement** (the causal-depth ceiling + the shared-root tripwire + the
 //!   bounded activity pool — *an adversarial workflow→event→workflow loop is dropped/parked, NEVER
 //!   forked*) → **LANDED at P-FLOW-18** (P-214), see [`loopsafety`] ([`CausalGuard`]: `admit_child`
@@ -149,6 +171,7 @@ pub mod executor;
 pub mod holder;
 pub mod job;
 pub mod loopsafety;
+pub mod merge_queue;
 pub mod migrations;
 pub mod remint;
 pub mod schema;
@@ -187,6 +210,11 @@ pub use job::{
 };
 pub use loopsafety::{
     CausalGuard, LoopVerdict, RefusalReason, ACTIVITY_POOL_CAP, CEILING, SHARED_ROOT_WINDOW_CAP,
+};
+pub use merge_queue::{
+    ci_dispatch_marker, decode_ci_result, encode_ci_result, git_pr_merged_draft,
+    humanise_dequeue_reason, merge_attempt_id, CiDispatch, CiDispatcher, DequeueCause, MergeOutcome,
+    MergePerformer, MergeRequest, MockCiResultProducer, CI_RESULT_SIGNAL, GIT_PR_MERGED_EVENT,
 };
 pub use budget::{BudgetError, BudgetGate, BudgetSettle, Wallet};
 pub use remint::{
