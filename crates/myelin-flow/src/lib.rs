@@ -126,6 +126,21 @@
 //!   IN ISOLATION against a MOCK [`MockCiResultProducer`]; the X-1 seam END-TO-END against CI's REAL
 //!   `ci.result` producer (GIT-D10 / CI-D8) is **P-FLOW-22** (M4 — the floor this prompt opens). (M2.4
 //!   — and the whole M2 engine surface for myelin-flow — is now covered across P-FLOW-13..19.)
+//! - **The §6.6 resumable maintenance activities + the history-rewrite invalidation fan-out** (the M3
+//!   support Git's GC / repack / bundle-gen / history-rewrite ride) → **LANDED at P-FLOW-20** (P-265),
+//!   see [`maintenance`] ([`WfCtx::run_maintenance`]: a maintenance op as a sequence of journaled
+//!   activities so a crash mid-repack replays to the un-journaled step §4.1 with 0 re-executed side
+//!   effect; [`WfCtx::run_heavy_maintenance`]: the heavy ops ride the `SCHEDULE_AND_RUN_JOB` long-park;
+//!   [`WfCtx::run_history_rewrite_invalidation`]: the fan-out over the trust-scoped cache namespaces
+//!   [`CacheNamespace`] — Fork/Mirror/CloneBundle, contract 11.2 — as a journaled sequence replaying
+//!   FROM the last journaled step). CONSUMES contract 10.6 (the history-rewrite audited op — GDPR/
+//!   Audit-owned) + 11.2 (the trust-scoped cache namespaces — Storage-owned). NO new engine primitive
+//!   (the application of the §4.4 activity model). NO new FLOW drill is owed in M3 (roadmap §2 M3 —
+//!   GIT-D9 is Git's gate); the gate artifact is the crash-mid-repack-resumes-with-no-side-effect +
+//!   the fan-out-replays-from-last-step drill `tests/drills_flow_maintenance.rs`. **NAMED FLOORS:** the
+//!   Git GC/repack/bundle-gen/history-rewrite CALL SITES are co-built in Git's M3 prompts (GIT-D9);
+//!   the cheap SLA re-arm under Issues/Trigger + the merge-queue holds-no-runtime re-green are
+//!   **P-FLOW-21**.
 //! - **The §6.2 loop-safety enforcement** (the causal-depth ceiling + the shared-root tripwire + the
 //!   bounded activity pool — *an adversarial workflow→event→workflow loop is dropped/parked, NEVER
 //!   forked*) → **LANDED at P-FLOW-18** (P-214), see [`loopsafety`] ([`CausalGuard`]: `admit_child`
@@ -171,6 +186,7 @@ pub mod executor;
 pub mod holder;
 pub mod job;
 pub mod loopsafety;
+pub mod maintenance;
 pub mod merge_queue;
 pub mod migrations;
 pub mod remint;
@@ -210,6 +226,10 @@ pub use job::{
 };
 pub use loopsafety::{
     CausalGuard, LoopVerdict, RefusalReason, ACTIVITY_POOL_CAP, CEILING, SHARED_ROOT_WINDOW_CAP,
+};
+pub use maintenance::{
+    invalidation_marker, maintenance_step_marker, CacheNamespace, MaintenanceOp,
+    MaintenancePerformer,
 };
 pub use merge_queue::{
     ci_dispatch_marker, decode_ci_result, encode_ci_result, git_pr_merged_draft,
