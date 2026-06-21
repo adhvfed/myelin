@@ -2161,6 +2161,7 @@ dependencies = [
  "myelin-harness",
  "myelin-identity",
  "myelin-lints",
+ "myelin-query",
  "myelin-refs",
  "myelin-substrate",
  "myelin-tenancy",

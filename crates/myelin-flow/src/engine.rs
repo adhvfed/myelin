@@ -74,6 +74,19 @@ pub mod run_state {
     pub const COMPLETED: &str = "completed";
     /// The run failed (an un-handled activity exhaustion) — terminal (§3.1).
     pub const FAILED: &str = "failed";
+    /// The run was CANCELLED via `DurableExecutor::cancel` — terminal (§3.1, §5.1). A cancel
+    /// transitions a non-terminal run to this state; it is never driven further (P-FLOW-06).
+    pub const TERMINATED: &str = "terminated";
+    /// The run's body diverged from its journal on replay — terminal, dead-lettered (§3.1). Written
+    /// by the replay-divergence guard (P-FLOW-07); admitted here so `describe` can report it.
+    pub const NONDETERMINISTIC: &str = "nondeterministic";
+
+    /// Whether a state token is TERMINAL (the run will never be driven again — §3.1). The
+    /// `DurableExecutor::cancel` surface refuses to re-terminate a terminal run (idempotent /
+    /// no-op), and `describe` reports terminality to the caller.
+    pub fn is_terminal(state: &str) -> bool {
+        matches!(state, COMPLETED | FAILED | TERMINATED | NONDETERMINISTIC)
+    }
 }
 
 /// The outcome of driving a workflow function to one suspension/terminal point (§4.1).
@@ -236,6 +249,18 @@ impl RunStore {
             run.lease_expires = None;
         }
     }
+
+    /// **Transition a run to a terminal `state` and release its lease — the `DurableExecutor::cancel`
+    /// move (P-FLOW-06, §5.1).** Unlike [`settle`], the cursor is UNCHANGED (a cancel does not
+    /// rewrite the journal — the journal is the source of truth). The run becomes non-runnable so
+    /// the dispatcher never leases it again. A no-op if the run is absent.
+    pub fn terminate(&self, tenant: &TenantId, run_id: &str, state: &str) {
+        if let Some(run) = self.lock().get_mut(&(tenant.0.clone(), run_id.to_string())) {
+            run.state = state.to_string();
+            run.lease_owner = None;
+            run.lease_expires = None;
+        }
+    }
 }
 
 /// **The contract-1.8 engine telemetry — the replay/lease survival signals (§1.8).** A cloneable
@@ -258,6 +283,18 @@ struct TelemetryInner {
     double_effect_count: u64,
     /// the last observed runnable-run lag (the §1.8 runnable-run-lag gauge).
     runnable_run_lag: u64,
+    /// the activity-queue DEPTH gauge (§1.8): how many activity attempts are scheduled-but-not-yet-
+    /// terminal across the engine — the work the activity pool has queued. Set as the engine
+    /// schedules/settles attempts. The timer/signal-buffer depth signals are added by their owning
+    /// prompts (P-FLOW-09/13); this is the activity leg of the §1.8 contract.
+    activity_queue_depth: u64,
+    /// the activity RETRY counter (§1.8): total activity attempts past the first (a `retrying`
+    /// transition). A monotonic `+=` — the retry-rate numerator the metrics-health port reads.
+    activity_retry_count: u64,
+    /// the activity DEAD-LETTER counter (§1.8): total activities that exhausted their retry budget
+    /// (an `activity_failed` terminal). A monotonic `+=` — the dead-letter signal the §1.8 contract
+    /// names. NON-zero is the "an activity could not be made to succeed" health signal.
+    dead_letter_count: u64,
 }
 
 impl FlowTelemetry {
@@ -285,6 +322,39 @@ impl FlowTelemetry {
     /// Set the runnable-run-lag gauge (the §1.8 signal) from the run store.
     pub fn set_runnable_lag(&self, lag: u64) {
         self.lock().runnable_run_lag = lag;
+    }
+
+    /// Set the activity-queue-depth gauge (§1.8) — how many activity attempts are scheduled-but-not-
+    /// terminal. Set by the engine/`DurableExecutor` as it schedules/settles activity attempts.
+    pub fn set_activity_queue_depth(&self, depth: u64) {
+        self.lock().activity_queue_depth = depth;
+    }
+
+    /// Record one activity RETRY (§1.8) — an attempt past the first. Monotonic `+=` (the retry-rate
+    /// numerator).
+    pub fn record_activity_retry(&self) {
+        self.lock().activity_retry_count += 1;
+    }
+
+    /// Record one activity DEAD-LETTER (§1.8) — an activity that exhausted its retry budget.
+    /// Monotonic `+=` (the dead-letter signal).
+    pub fn record_dead_letter(&self) {
+        self.lock().dead_letter_count += 1;
+    }
+
+    /// The activity-queue-depth gauge (§1.8) — the activity work queued.
+    pub fn activity_queue_depth(&self) -> u64 {
+        self.lock().activity_queue_depth
+    }
+
+    /// The activity-retry counter (§1.8) — total attempts past the first.
+    pub fn activity_retry_count(&self) -> u64 {
+        self.lock().activity_retry_count
+    }
+
+    /// The activity dead-letter counter (§1.8) — total retry-exhausted activities.
+    pub fn dead_letter_count(&self) -> u64 {
+        self.lock().dead_letter_count
     }
 
     /// The **replay rate** — the fraction of commands a drive REPLAYED vs total commands, scaled to

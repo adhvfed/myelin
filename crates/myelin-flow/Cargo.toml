@@ -91,6 +91,12 @@ myelin-events = { path = "../myelin-events" }
 serde_json = { workspace = true }
 myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-refs = { path = "../myelin-refs" }
+# The bus-automation CONSUMER of contract 9.1 (the `DurableExecutor::start` seam): the CDC pair
+# (tests/cdc_9_1_executor.rs) pairs the myelin-flow PROVIDER (FlowExecutor start/describe/cancel)
+# with the Automation engine's consumer fixture (action.kind = workflow → start). Dev-dep ONLY (the
+# production DAG is unchanged — myelin-query does NOT depend on myelin-flow, so no cycle; the CDC
+# test depends on BOTH ends of the seam to prove the agreement).
+myelin-query = { path = "../myelin-query" }
 
 [features]
 # The live-PG integration test (tests/integration_flow_schema.rs). DB-free by default.
