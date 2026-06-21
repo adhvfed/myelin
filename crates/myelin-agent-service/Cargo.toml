@@ -40,6 +40,14 @@ myelin-substrate = { path = "../myelin-substrate" }
 myelin-flow = { path = "../myelin-flow" }
 myelin-events = { path = "../myelin-events" }
 myelin-refs = { path = "../myelin-refs" }
+# AG-P11 (→ P-223) — the ONE templating surface (C9/OQ-L). The HITL card text + every
+# agent-authored message route through Notif `humanise` (contract 7.3, the sole templating
+# surface). `myelin-notif` owns `humanise((template_key, args), viewer, locale) -> HumanisedString`,
+# the `TemplateStore`, the `RefResolvePort` resolve seam, and the `Channel` projections. This crate
+# CONSUMES that surface — it ships no second template engine. NO cycle: `myelin-notif` is itself a
+# leaf consumer (it depends on -tenancy/-events/-identity/-refs/-content/-query/-substrate) and does
+# NOT depend back on `myelin-agent` or `myelin-agent-service`, so this edge keeps the DAG acyclic.
+myelin-notif = { path = "../myelin-notif" }
 # The SKELETON's terminal trace event carries a references-not-payloads JSON payload (the trace
 # `ArtifactRef`); serde_json builds the `EventDraft.payload` value (it was a dev-dep for AG-P2's
 # round-trip test; the SKELETON's emit needs it at lib scope).

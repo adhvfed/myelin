@@ -2073,6 +2073,7 @@ dependencies = [
  "myelin-flow",
  "myelin-gdpr",
  "myelin-identity",
+ "myelin-notif",
  "myelin-refs",
  "myelin-storage",
  "myelin-substrate",
