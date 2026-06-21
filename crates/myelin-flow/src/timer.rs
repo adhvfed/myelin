@@ -1,14 +1,29 @@
-//! # `timer` — the minute-bucket durable timer wheel + the timer-wheel scan loop (P-FLOW-13 → P-207, M2)
+//! # `timer` — the minute-bucket durable timer wheel + the cheap disarm/re-arm (P-FLOW-13/14 → P-207/P-210, M2)
 //!
 //! **Owning architecture doc:**
 //! `planning/05-refined-shared-systems-architecture/durable-workflow.md` §3.3 (`wf_timer`;
 //! `bucket = epoch_minute(fire_at)` + the partial index `(bucket, partition) WHERE NOT fired`),
 //! §4.2 (the timer wheel: scan `bucket <= now AND NOT fired`, `FOR UPDATE SKIP LOCKED`, NO calendar
-//! logic on the wheel — a 30-day timer is never read until its minute), §7.3 (the
+//! logic on the wheel — a 30-day timer is never read until its minute), §6.6 (the cheap SLA-timer
+//! disarm/re-arm: a re-arm is a row update of `fire_at` + `bucket`, a disarm sets `fired = true` or
+//! deletes — millions re-arm at row-update cost, no wheel pollution), §7.3 (the
 //! millions-of-timers scaling story), §5.4 (the timer-wheel-lag telemetry — the SC-11 health
 //! signal). Carried forward from Phase-3 §3.3/§4.2/§7.3 unchanged. Contract 9.3 (the durable timer
-//! wheel — the wheel + arm/fire OWNED here; the cheap disarm/re-arm half is the named follow-on
-//! **P-FLOW-14**) + 9.2 (`WfCtx::sleep_until`/`sleep_for` — the timer half, owned here).
+//! wheel — the wheel + arm/fire from **P-FLOW-13/P-207**; the cheap disarm/re-arm half is **P-FLOW-14
+//! / P-210**, OWNED here: [`TimerStore::re_arm`] / [`TimerStore::disarm`] / [`TimerStore::disarm_delete`])
+//! + 9.2 (`WfCtx::sleep_until`/`sleep_for` — the timer half, owned by P-FLOW-13).
+//!
+//! ## What P-FLOW-14 (P-210) adds — the cheap SLA-timer disarm/re-arm (§6.6)
+//!
+//! A re-arm of a precomputed `fire_at` is a SINGLE row UPDATE ([`TimerStore::re_arm`]): rewrite
+//! `wf_timer.fire_at` and its derived `bucket = epoch_minute(fire_at)`, re-open the timer
+//! (`fired = false`). No new row, no calendar logic on the wheel (the wheel still only scans
+//! `bucket <= now AND NOT fired`, §4.2) — re-arming N timers is N row updates, so millions of SLA
+//! timers re-arm at row-update cost, not wheel-scan cost (the SC-11 property holds under churn). A
+//! disarm ([`TimerStore::disarm`]/[`TimerStore::disarm_delete`]) sets `fired = true` (the partial-index
+//! pivot — the wheel never reads it again) or deletes the row, making the timer never fire. These are
+//! the documented Issues "stale_after" / SLA-deadline re-arm + SLA-cancel helper calls; the
+//! Issues/Trigger CALL SITES are confirmed-and-tested under their producers in **M3, P-FLOW-17**.
 //!
 //! ## What this prompt (P-FLOW-13) ships — the durable timer wheel
 //!
@@ -50,10 +65,11 @@
 //!
 //! ## FLOORS named
 //!
-//! - **The cheap SLA-timer disarm/re-arm** (a re-arm is a single row update of `fire_at` + `bucket`;
-//!   a disarm sets `fired = true` — millions re-arm at row-update cost, no wheel pollution) → the
-//!   named follow-on **P-FLOW-14** (contract 9.3 disarm/re-arm half). This prompt owns the wheel +
-//!   arm/fire; [`TimerStore::arm`]/[`TimerStore::fire`] are the seam the re-arm updates in place.
+//! - **The cheap SLA-timer disarm/re-arm** — NOW OWNED here (P-FLOW-14 / P-210): [`TimerStore::re_arm`]
+//!   (a single row update of `fire_at` + `bucket`), [`TimerStore::disarm`] (`fired = true`), and
+//!   [`TimerStore::disarm_delete`] (delete the row). Millions re-arm at row-update cost, no wheel
+//!   pollution. The Issues/Trigger CALL SITES (the `stale_after` / SLA-deadline producers) are the
+//!   named follow-on **P-FLOW-17** (M3) — confirmed-and-tested under their producers there.
 //! - **The seven-figure (1M+) cell-scale run** + the per-cell timer-wheel-promotion threshold → the
 //!   M5 follow-on **P-FLOW-24** (FLOW-D3 full). This prompt proves the ALGORITHM at 100k+ timers (six
 //!   figures) — the FLOW-D3 floor (`tests/drills_flow_d3_timer_wheel.rs`). The algorithm is unchanged
@@ -134,6 +150,34 @@ pub enum FireOutcome {
     AlreadyFired,
 }
 
+/// **The outcome of a cheap SLA-timer RE-ARM (§6.6, contract 9.3 disarm/re-arm half — P-FLOW-14).** A
+/// re-arm of a precomputed `fire_at` is a SINGLE row UPDATE of `wf_timer.fire_at` + its derived
+/// `bucket` — **no calendar logic ever pollutes the wheel** (the wheel only scans
+/// `bucket <= now AND NOT fired`, §4.2). Millions of SLA timers re-arm at row-update cost, not
+/// wheel-scan cost — the SC-11 property holds under churn (the Issues "stale_after" / SLA-deadline
+/// re-arm). A re-arm RE-OPENS a fired timer (`fired = false`) and re-buckets it, so a re-armed timer
+/// that had already fired is live again at its NEW deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReArmOutcome {
+    /// the timer's `fire_at` + `bucket` were UPDATED in place (one row touched) — the cheap re-arm.
+    ReArmed,
+    /// no timer under `(tenant, timer_id)` — the re-arm touched 0 rows (the timer was never armed, or
+    /// was disarmed-by-delete). A no-op; the caller re-arms by [`TimerStore::arm`] if it wants the row.
+    Absent,
+}
+
+/// **The outcome of a cheap SLA-timer DISARM (§6.6, contract 9.3 disarm/re-arm half — P-FLOW-14).** A
+/// disarm makes the timer NEVER fire: it sets `fired = true` (the partial-index pivot — the wheel's
+/// `WHERE NOT fired` scan never reads it again) OR deletes the row. Either is a single cheap row op —
+/// no wheel scan, no calendar logic. The Issues "the SLA was satisfied, cancel the breach timer" call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DisarmOutcome {
+    /// the timer was DISARMED — `fired = true` set (or the row deleted); it will never fire. One row touched.
+    Disarmed,
+    /// no timer under `(tenant, timer_id)`, or it had already fired — a no-op (0 rows; nothing to disarm).
+    Absent,
+}
+
 /// **The in-memory `wf_timer` store — the bucketed durable-timer wheel substrate (§3.3/§4.2/§7.3).** A
 /// cloneable handle over a shared map keyed by `(tenant, timer_id)` (the frozen PK), mirroring the
 /// `wf_timer` shape. The SC-11 move is the BUCKETED scan: [`TimerStore::scan_due`] reads ONLY the
@@ -182,6 +226,68 @@ impl TimerStore {
         }
         inner.timers.insert(key, row);
         ArmOutcome::Armed
+    }
+
+    /// **Cheap SLA-timer RE-ARM — `UPDATE wf_timer SET fire_at = $new, bucket = epoch_minute($new),
+    /// fired = false WHERE (tenant, timer_id) = …` (§6.6, contract 9.3 disarm/re-arm half).** A re-arm
+    /// of a precomputed `fire_at` is a SINGLE row UPDATE — it slides the timer's deadline forward (or
+    /// back) by rewriting `fire_at` and its DERIVED `bucket = epoch_minute(fire_at)`, and re-opens it
+    /// (`fired = false`) so a timer that already fired is live again at its NEW deadline. **No calendar
+    /// logic ever pollutes the wheel** — the wheel still only scans `bucket <= now AND NOT fired`
+    /// (§4.2). The cost is ONE row update, NOT a wheel rescan: re-arming N timers is N row updates, so
+    /// millions of SLA timers re-arm at row-update cost (the SC-11 property holds under churn). The
+    /// deterministic `timer_id` is unchanged (the re-arm targets the SAME row — no new row, no
+    /// duplicate on the wheel). This is the Issues "stale_after" / SLA-deadline re-arm helper call (the
+    /// Issues/Trigger call sites are confirmed-and-tested under their producers in M3, P-FLOW-17).
+    pub fn re_arm(&self, tenant: &TenantId, timer_id: &str, new_fire_at: i64) -> ReArmOutcome {
+        let mut inner = self.lock();
+        let key = (tenant.0.clone(), timer_id.to_string());
+        let Some(t) = inner.timers.get_mut(&key) else {
+            return ReArmOutcome::Absent; // no row to re-arm — UPDATE … touched 0 rows.
+        };
+        // The cheap row update: rewrite fire_at + its derived bucket, re-open the timer. NO new row,
+        // NO calendar scan — a single field write on the existing row (the SC-11 row-update cost).
+        t.fire_at = new_fire_at;
+        t.bucket = epoch_minute(new_fire_at);
+        t.fired = false;
+        ReArmOutcome::ReArmed
+    }
+
+    /// **Cheap SLA-timer DISARM — `UPDATE wf_timer SET fired = true WHERE (tenant, timer_id) = … AND
+    /// NOT fired` (§6.6, contract 9.3 disarm/re-arm half).** A disarm makes the timer NEVER fire by
+    /// setting the partial-index pivot `fired = true` — the wheel's `WHERE NOT fired` scan never reads
+    /// it again (the SLA was satisfied, cancel the breach timer). A single cheap row op — no wheel
+    /// scan, no calendar logic. A disarm of an already-fired/absent timer is a no-op
+    /// ([`DisarmOutcome::Absent`], 0 rows). The disarmed row stays on the table (excluded from the
+    /// wheel by the partial index) — [`TimerStore::disarm_delete`] is the delete variant when the row
+    /// itself should go. The Issues/Trigger SLA-cancel call site is confirmed under its producer in M3
+    /// (P-FLOW-17).
+    pub fn disarm(&self, tenant: &TenantId, timer_id: &str) -> DisarmOutcome {
+        let mut inner = self.lock();
+        let key = (tenant.0.clone(), timer_id.to_string());
+        let Some(t) = inner.timers.get_mut(&key) else {
+            return DisarmOutcome::Absent; // no row — UPDATE … touched 0 rows.
+        };
+        if t.fired {
+            return DisarmOutcome::Absent; // already fired — nothing to disarm (the wheel never reads it).
+        }
+        // Set the partial-index pivot: the wheel's `WHERE NOT fired` scan excludes it forever. One row.
+        t.fired = true;
+        DisarmOutcome::Disarmed
+    }
+
+    /// **The DELETE variant of disarm — `DELETE FROM wf_timer WHERE (tenant, timer_id) = …` (§6.6).** A
+    /// disarm may delete the row instead of flipping `fired` (the architecture admits either: "sets
+    /// `fired = true` or deletes the row"). Use this when the timer should leave no trace (a cancelled
+    /// SLA whose run is also gone); use [`TimerStore::disarm`] when the audit row should remain
+    /// (excluded from the wheel by the partial index). A single cheap row op — no wheel scan.
+    pub fn disarm_delete(&self, tenant: &TenantId, timer_id: &str) -> DisarmOutcome {
+        let mut inner = self.lock();
+        let key = (tenant.0.clone(), timer_id.to_string());
+        match inner.timers.remove(&key) {
+            Some(_) => DisarmOutcome::Disarmed,
+            None => DisarmOutcome::Absent,
+        }
     }
 
     /// **The bucketed wheel SCAN — `SELECT … WHERE bucket <= epoch_minute(now) AND NOT fired AND
@@ -605,6 +711,129 @@ mod tests {
         // far-future timer is still unfired but NOT due, so it does not count as lag.
         assert_eq!(tele.timer_wheel_lag(), 0, "the timer-wheel-lag is 0 after the tick (the SC-11 health signal)");
         assert!(!store.get(&tenant(), "far").unwrap().fired, "the far-future timer is untouched");
+    }
+
+    /// **A re-arm is a SINGLE row UPDATE of `fire_at` + `bucket` — no new row, no wheel rescan
+    /// (§6.6, P-FLOW-14).** Arm a timer due in 10 minutes, then re-arm it to 30 minutes: the SAME row
+    /// is updated in place (its `fire_at` + derived `bucket` change), the wheel depth stays 1 (no
+    /// duplicate row), and the new bucket is `epoch_minute(new_fire_at)` — the cheap row-update cost,
+    /// not a wheel scan. A scan at the OLD due time now returns nothing (the row moved forward).
+    #[test]
+    fn a_re_arm_is_one_row_update_of_fire_at_and_bucket_no_new_row() {
+        let store = TimerStore::new();
+        // armed due at minute 10 (fire_at = 600s, bucket 10).
+        store.arm(timer("sla", "R1", 600, 0));
+        assert_eq!(store.armed_count(), 1);
+        assert_eq!(store.get(&tenant(), "sla").unwrap().bucket, 10);
+        assert_eq!(store.rows_scanned(), 0, "no scan yet — the re-arm must not rescan the wheel");
+
+        // re-arm forward to minute 30 (fire_at = 1800s, bucket 30) — a SINGLE row update.
+        assert_eq!(store.re_arm(&tenant(), "sla", 1800), ReArmOutcome::ReArmed, "the re-arm updates the row");
+        let row = store.get(&tenant(), "sla").unwrap();
+        assert_eq!(row.fire_at, 1800, "fire_at slid forward (the cheap row update)");
+        assert_eq!(row.bucket, epoch_minute(1800), "the derived bucket was recomputed");
+        assert_eq!(row.bucket, 30, "the new minute bucket");
+        assert_eq!(store.armed_count(), 1, "STILL one row — a re-arm is an UPDATE, not a new INSERT (no wheel pollution)");
+        assert_eq!(store.rows_scanned(), 0, "the re-arm did NOT scan the wheel (row-update cost, not wheel-scan cost)");
+
+        // a scan at minute 15 (now = 900s) finds NOTHING — the timer moved to minute 30 (far-future).
+        assert!(store.scan_due(0, 900, 100).is_empty(), "the re-armed timer is no longer due at the old time");
+    }
+
+    /// **A re-arm RE-OPENS a fired timer at its NEW deadline (§6.6).** A timer that already fired is
+    /// live again after a re-arm (`fired = false`), bucketed at the new `fire_at` — the SLA "the issue
+    /// re-opened, re-arm the breach timer" case. Re-arming an ABSENT timer is `Absent` (0 rows).
+    #[test]
+    fn a_re_arm_reopens_a_fired_timer_and_is_absent_for_an_unarmed_one() {
+        let store = TimerStore::new();
+        let journal = WfJournal::new();
+        let runs = RunStore::new();
+        let mut run = RunRow::new_runnable(tenant(), region(), "R1", "agent.run", 0);
+        run.state = run_state::WAITING.into();
+        runs.put(run);
+        store.arm(timer("sla", "R1", 0, 0));
+        assert_eq!(store.fire(&tenant(), "sla", &journal, &runs), FireOutcome::Fired);
+        assert!(store.get(&tenant(), "sla").unwrap().fired, "the timer fired");
+
+        // re-arm re-opens it at a new (future) deadline.
+        assert_eq!(store.re_arm(&tenant(), "sla", 1800), ReArmOutcome::ReArmed);
+        let row = store.get(&tenant(), "sla").unwrap();
+        assert!(!row.fired, "the re-arm re-opened the fired timer (fired = false)");
+        assert_eq!(row.fire_at, 1800);
+        assert_eq!(row.bucket, 30);
+
+        // re-arming a timer that was never armed is Absent (UPDATE … touched 0 rows).
+        assert_eq!(store.re_arm(&tenant(), "ghost", 1800), ReArmOutcome::Absent, "no row to re-arm");
+    }
+
+    /// **Re-arming N timers is N row updates, NOT a wheel rescan (§6.6 — the SC-11 churn property).**
+    /// Arm 1000 timers, then re-arm every one: the wheel depth stays 1000 (no new rows), and the scan
+    /// counter is UNTOUCHED (re-arm never scans the wheel) — millions re-arm at row-update cost.
+    #[test]
+    fn re_arming_n_timers_is_n_row_updates_not_a_wheel_rescan() {
+        let store = TimerStore::new();
+        for i in 0..1000 {
+            store.arm(timer(&format!("sla{i}"), &format!("R{i}"), 600, 0));
+        }
+        assert_eq!(store.armed_count(), 1000);
+        assert_eq!(store.rows_scanned(), 0);
+
+        // re-arm all 1000 forward — each is a single row update.
+        for i in 0..1000 {
+            assert_eq!(store.re_arm(&tenant(), &format!("sla{i}"), 1800 + i as i64), ReArmOutcome::ReArmed);
+        }
+        assert_eq!(store.armed_count(), 1000, "STILL 1000 rows (no duplicates — every re-arm was an in-place UPDATE)");
+        assert_eq!(store.rows_scanned(), 0, "1000 re-arms scanned the wheel ZERO times (row-update cost, not wheel-scan cost)");
+    }
+
+    /// **A disarm (`fired = true`) makes the timer NEVER fire — excluded by the partial index (§6.6).**
+    /// Arm a due timer, disarm it, then run the wheel: the disarmed timer is NOT in the due scan
+    /// (`WHERE NOT fired` excludes it) and never fires. A disarm of an absent/already-fired timer is a
+    /// no-op (`Absent`). The disarmed row remains (the audit trail) but is invisible to the wheel.
+    #[test]
+    fn a_disarm_sets_fired_and_the_timer_never_fires() {
+        let store = TimerStore::new();
+        let journal = WfJournal::new();
+        let runs = RunStore::new();
+        let mut run = RunRow::new_runnable(tenant(), region(), "R1", "agent.run", 0);
+        run.state = run_state::WAITING.into();
+        runs.put(run);
+        store.arm(timer("sla", "R1", 0, 0)); // due now.
+
+        // disarm: a single row op — sets fired = true.
+        assert_eq!(store.disarm(&tenant(), "sla"), DisarmOutcome::Disarmed, "the disarm sets fired");
+        assert!(store.get(&tenant(), "sla").unwrap().fired, "the disarmed timer's partial-index pivot is set");
+        // the row REMAINS on the table (the audit trail) but is invisible to the wheel.
+        assert_eq!(store.armed_count(), 1, "the disarmed row stays (excluded from the wheel by WHERE NOT fired)");
+
+        // the wheel never sees it: the due-scan excludes the disarmed (fired) timer.
+        let due = store.scan_due(0, 30, 100);
+        assert!(due.is_empty(), "the disarmed timer is NOT in the due scan (WHERE NOT fired excludes it)");
+        let wheel = TimerWheel::new(store.clone(), journal.clone(), runs.clone(), FlowTelemetry::new(), 0, 100);
+        assert_eq!(wheel.tick(30), 0, "the wheel fires NOTHING — the disarmed timer never fires");
+        assert_eq!(journal.history_for(&tenant(), "R1").len(), 0, "no timer_fired row — the disarm cancelled the fire");
+        assert_eq!(runs.get(&tenant(), "R1").unwrap().state, run_state::WAITING, "the parked run was never woken");
+
+        // a disarm of an already-disarmed (fired) timer is a no-op; an absent timer too.
+        assert_eq!(store.disarm(&tenant(), "sla"), DisarmOutcome::Absent, "re-disarm of a fired timer is a no-op");
+        assert_eq!(store.disarm(&tenant(), "ghost"), DisarmOutcome::Absent, "disarm of an absent timer is a no-op");
+    }
+
+    /// **The DELETE variant of disarm removes the row entirely (§6.6).** `disarm_delete` deletes the
+    /// `wf_timer` row (the no-trace cancel) — the wheel depth drops, the timer never fires, and a
+    /// re-delete is `Absent`.
+    #[test]
+    fn disarm_delete_removes_the_row_and_the_timer_never_fires() {
+        let store = TimerStore::new();
+        store.arm(timer("sla", "R1", 0, 0));
+        assert_eq!(store.armed_count(), 1);
+
+        assert_eq!(store.disarm_delete(&tenant(), "sla"), DisarmOutcome::Disarmed, "the row is deleted");
+        assert_eq!(store.armed_count(), 0, "the row is gone (the no-trace cancel)");
+        assert!(store.get(&tenant(), "sla").is_none(), "the timer no longer exists");
+        assert!(store.scan_due(0, 30, 100).is_empty(), "nothing to fire — the timer was deleted");
+
+        assert_eq!(store.disarm_delete(&tenant(), "sla"), DisarmOutcome::Absent, "a re-delete is a no-op");
     }
 
     /// **A late timer fire on a TERMINAL run is a harmless no-op (the wake never resurrects).** A

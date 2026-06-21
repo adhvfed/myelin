@@ -693,8 +693,10 @@ landing = "P-199"
 [[contract]]
 row = "9.3"
 title = "durable timer wheel"
-status = "deferred"
-landing = "P-207"
+# Wheel + arm/fire half: P-207 (FLOW-D3 100k floor + live-PG). Cheap disarm/re-arm half: P-210
+# (the §6.6 row-update re-arm + disarm), paired with the Issues `stale_after`/SLA consumer fixture.
+status = "covered"
+cdc = ["crates/myelin-flow/tests/cdc_9_3_disarm_rearm.rs"]
 
 [[contract]]
 row = "9.4"
