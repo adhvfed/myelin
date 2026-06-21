@@ -101,6 +101,21 @@ impl ContentHash {
         }
     }
 
+    /// Compute the SHA-256 content address of `bytes` — the read-side verify for git-imported
+    /// objects (P-ST-22). Git addresses its objects by SHA (SHA-1 legacy / SHA-256 modern), so a
+    /// `sha256:`-tagged blob (a git loose object / a pack member) is re-hashed under this to
+    /// detect a corrupt object on read. A cited proven structure (RustCrypto `sha2`,
+    /// FIPS-180-4) — VISION §4, never a hand-rolled hash. NEW blobs are never written under this
+    /// tag by the native [`Self::blake3`] path; this admits the externally-addressed git world.
+    pub fn sha256(bytes: &[u8]) -> ContentHash {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(bytes);
+        ContentHash {
+            algo: HashAlgo::Sha256,
+            digest_hex: hex::encode(digest),
+        }
+    }
+
     /// The self-describing string form `<algo>:<hex>` — the on-the-wire / key-path address.
     pub fn to_multihash_string(&self) -> String {
         format!("{}:{}", self.algo.tag(), self.digest_hex)
@@ -158,17 +173,17 @@ impl HashAlgo {
     }
 
     /// Re-hash `bytes` under this algorithm and return the address — the read-side integrity
-    /// check. BLAKE3 is implemented; SHA-256 verification is the named floor (no SHA-256 blob
-    /// is *written* by this prompt, so a SHA-256 read path is exercised only once Git import
-    /// lands — P-ST-22). It returns an explicit error rather than a wrong/`todo!()` answer.
+    /// check. Both admitted algorithms are now verifiable:
+    /// - **BLAKE3** — the native hash-on-write address for new blobs (P-ST-03).
+    /// - **SHA-256** — the read-side verify for **git-imported objects** (P-ST-22): git
+    ///   addresses its objects by SHA, so a `sha256:`-tagged blob (a git loose object / a pack
+    ///   member) is re-hashed under SHA-256 and refused on a content-address mismatch — closing
+    ///   the floor blob.rs named ("SHA-256 verification rides in with the git object import —
+    ///   P-ST-22"). Uses the vetted RustCrypto `sha2` (FIPS-180-4), never a hand-rolled hash.
     fn rehash(self, bytes: &[u8]) -> std::result::Result<ContentHash, BlobError> {
         match self {
             HashAlgo::Blake3 => Ok(ContentHash::blake3(bytes)),
-            // Floor: SHA-256 verification rides in with the Git object import (P-ST-22). It is
-            // an explicit "not on this floor" — never a silent pass (which would defeat the
-            // integrity gate). Until then no SHA-256 blob is written, so this is unreachable
-            // in the M0 path; it must NOT fabricate a green verification.
-            HashAlgo::Sha256 => Err(BlobError::AlgoNotVerifiable(HashAlgo::Sha256)),
+            HashAlgo::Sha256 => Ok(ContentHash::sha256(bytes)),
         }
     }
 }
@@ -207,8 +222,11 @@ pub enum BlobError {
     MalformedAddress(String),
     /// A content-address string carried an algorithm tag this store does not know.
     UnknownAlgo(String),
-    /// The blob's algorithm has no verification path on this floor (the SHA-256 read floor →
-    /// P-ST-22). Never a silent pass.
+    /// The blob's algorithm has no verification path. Both admitted tags (BLAKE3, SHA-256) are
+    /// now verifiable (SHA-256 closed by P-ST-22), so this is no longer produced on the read
+    /// path; it is retained as the explicit "never a silent pass" answer for any FUTURE algo tag
+    /// admitted to [`HashAlgo`] before its `rehash` arm lands (the integrity gate is never
+    /// bypassed by an un-verifiable tag).
     AlgoNotVerifiable(HashAlgo),
 }
 
@@ -664,29 +682,37 @@ mod tests {
             .contains("no on-floor verification"));
     }
 
-    /// A SHA-256-tagged blob has no on-floor verification path (the named P-ST-22 floor): a
-    /// read is an EXPLICIT refusal + a `blob_integrity_fail`, never a silent pass.
+    /// **SHA-256 verification is now LIVE (P-ST-22 closes the P-ST-03 floor).** A `sha256:`-tagged
+    /// blob (a git-imported object) re-hashes under SHA-256 on read: a CORRECT object round-trips
+    /// the exact bytes; a CORRUPT one is detected as an `IntegrityFail` and refused (0 silent
+    /// serve), incrementing `blob_integrity_fail`. This is the git-object integrity floor the
+    /// blob.rs module named ("SHA-256 verification rides in with the git object import — P-ST-22").
     #[test]
-    fn sha256_blob_read_is_explicit_refusal_not_silent_pass() {
+    fn sha256_blob_verifies_correct_and_refuses_corrupt() {
         let store = FsBlobStore::new();
         let acme = tenant("acme");
-        // Hand-craft a SHA-256-tagged object directly into the modelled fs.
-        let h = ContentHash {
-            algo: HashAlgo::Sha256,
-            digest_hex: hex::encode([0u8; 32]),
-        };
+        // A SHA-256-addressed object (the git world). Address it by the SHA-256 of its bytes.
+        let object = b"blob 11\0hello world";
+        let h = ContentHash::sha256(object);
+        assert_eq!(h.algo, HashAlgo::Sha256);
         let path = FsBlobStore::key_path(&acme, &h);
-        store.objects.lock().unwrap().insert(path, b"bytes".to_vec());
+        store.objects.lock().unwrap().insert(path, object.to_vec());
 
+        // A correct SHA-256 object verifies + serves the exact bytes (no false positive).
+        assert_eq!(store.get(&acme, &h).expect("sha256 object verifies"), object);
+        assert_eq!(store.telemetry().blob_integrity_fail(), 0);
+
+        // Corrupt it → re-hash-on-read (SHA-256) detects + refuses (0 silent serve).
+        assert!(store.corrupt_for_drill(&acme, &h));
         match store.get(&acme, &h) {
-            Err(BlobError::AlgoNotVerifiable(HashAlgo::Sha256)) => {}
-            other => panic!("SHA-256 read must be an explicit refusal, got {other:?}"),
+            Err(BlobError::IntegrityFail { requested, actual }) => {
+                assert_eq!(requested, h);
+                assert_eq!(actual.algo, HashAlgo::Sha256, "verified under the blob's own tag");
+                assert_ne!(actual, h);
+            }
+            other => panic!("a corrupt sha256 object must be refused, got {other:?}"),
         }
-        assert_eq!(
-            store.telemetry().blob_integrity_fail(),
-            1,
-            "an unverifiable-algo read counts as an integrity refusal, not a silent serve"
-        );
+        assert_eq!(store.telemetry().blob_integrity_fail(), 1);
     }
 
     /// head returns PII-free metadata without serving the bytes; NotFound is explicit.

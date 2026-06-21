@@ -366,6 +366,17 @@
 
 pub mod backup;
 pub mod blob;
+// The local-disk git pack/object tier behind the BlobStore trait (P-ST-22 / P-252, contract 11.2
+// git pack tier + 12.2 repo-granular relocatable placement): git packs + loose objects are
+// addressed THROUGH the content-addressed `BlobStore` trait (REUSES blob.rs — never a parallel
+// store), so "local-disk → object-store-backed packs" is a backing SWAP not a rewrite (§3.5). A
+// repo's placement is region-pinned + node-RELOCATABLE (a stored fact, no node hash) — the
+// relocatability §3.5 DECIDES now. SHA-256 read-side verify (closing the blob.rs P-ST-22 floor)
+// detects a corrupt git object on read (0 silent serve, STOR-D7 on packs); recovery is re-fetch
+// of the same content address from a replica. FLOORS NAMED: object-backed pack/delta + smart
+// transport → M5 P-ST-31 (a backing swap by the trait's design, trigger GIT-D4); the within-EU CDN
+// clone/bundle class (C3) → sibling P-ST-23.
+pub mod gitpack;
 pub mod encryption;
 // The T3 firehose-archive seam (P-ST-20 / P-147, M2, contract 11.8 sealing + per-tenant-DEK half):
 // the DURABLE archive of the firehose (storage.md §3.3). It RIDES the 3.5 resume-cursor transport
@@ -466,6 +477,10 @@ pub use blob::{
     HashAlgo, IdentityWrap,
 };
 pub use cache::{Cache, CacheError, InMemoryCache};
+pub use gitpack::{
+    git_object_address, GitObjectKind, GitPackError, GitPackTier, PackManifest, PlacementError,
+    RepoGitPlacement, RepoId, RepoPlacementStatus, StorageGroup,
+};
 pub use coloc::{ColocError, ColocatedOltp, ColocatedTx, COLOCATED_OUTBOX_MIGRATION};
 pub use encryption::{
     key_class_for, ColumnCryptor, DekContentWrap, EncryptedColumn, KeyChoiceError, SubjectId,
