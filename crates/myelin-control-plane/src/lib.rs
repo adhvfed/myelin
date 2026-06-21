@@ -143,6 +143,7 @@ pub mod discover;
 pub mod four_layer;
 pub mod holder;
 pub mod isolation;
+pub mod mirror_allowed;
 pub mod place;
 pub mod placement_of;
 pub mod placement_of_repo;
@@ -161,6 +162,9 @@ pub use four_layer::{
     CrossRegionPathError, FourLayerEnforcement, ResidencyWriteBoundary, ResidencyWriteRejected,
 };
 pub use isolation::{partition_key, IsolationTier, PartitionKey, PoolStore};
+pub use mirror_allowed::{
+    MirrorAllowReason, MirrorDecision, MirrorDenyReason, MirrorGate, MirrorTarget, TransferPolicy,
+};
 pub use placement_of::{
     CellGateway, GatewayReject, Misroute, MisrouteAudit, MisrouteAuditRecord, PlacementOf,
 };
