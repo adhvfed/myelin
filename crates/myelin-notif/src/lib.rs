@@ -117,6 +117,15 @@ pub mod read_fanout;
 pub mod read_state;
 pub mod router;
 pub mod schema;
+// Snooze re-surfacing on the SAME `myelin-flow` durable timer wheel (NOTIF-P18 / P-196 — §3.7/§2.4,
+// contract 9.3 consumed). NOTIF-P6's `snooze(item, until)` records the `until` + parks the item; this
+// fills the named re-surface floor: a snoozed item re-surfaces at its `until` via a DURABLE TIMER on
+// the SAME wheel escalation (NOTIF-P14) arms its ack_window timers on (ONE substrate, three uses —
+// escalation, snooze, SLA). The timer survives a Notif restart and fires effectively-once (0 missed,
+// 0 duplicate re-surface). At the `until` the row flips `snoozed → unread` (back in the active inbox).
+// No in-process sleep, no second timer mechanism. FLOOR: SLA timers (the third use) are NOTIF-P21; the
+// real `myelin-flow` wheel is P-FLOW-09/P-FLOW-13. See [`snooze_resurface`].
+pub mod snooze_resurface;
 // The five write-time storm-control mechanisms (NOTIF-P11 / P-189 — §3.2): self-suppression,
 // dedup-key collapse, thread/subject coalescing, per-(recipient, subject_root) token-bucket rate
 // damping, and mute/DND honoring. Storm-control suppresses DELIVERY and RANKING only — NEVER the
@@ -190,6 +199,9 @@ pub use read_fanout::{
 };
 pub use read_state::{
     active_inbox, mark, mark_all_read, snooze, ReadState, ReadStateError,
+};
+pub use snooze_resurface::{
+    snooze_and_arm, snooze_timer_key, ResurfaceOutcome, SnoozeResurfacer, SNOOZE_TIMER_NS,
 };
 pub use router::{
     build_router, signal_subject_prefix, InboxProjection, RoutedInboxItem, SignalRouter,
