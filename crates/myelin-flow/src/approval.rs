@@ -48,11 +48,15 @@
 //!   `myelin-agent` in production (the DAG stays acyclic). The Agent Fabric `EffectApi::apply`
 //!   consumer is paired with this provider in the CDC fixture `tests/cdc_9_1_per_effect.rs`
 //!   (dev-dep only).
-//! - **The F-4-extended drill (the per-effect form across a restart + deploy)** lands at **P-FLOW-12**
-//!   (architecture §8) and at the subsystem face **CHAT-D10** (M4). This prompt ships the rule + the
-//!   structural gate (3 independent apply/decline, 0 double-apply, 0 mutation-on-decline); the
-//!   durable-wait wiring of the loop (`wait_for_signal` consuming the buffered signals across a
-//!   multi-day park) is **P-FLOW-11**.
+//! - **The F-4-extended drill (the per-effect form across a restart + deploy)** LANDED at **P-FLOW-12**
+//!   (P-209, architecture §8) — `tests/drills_flow_d4_per_effect.rs`: a three-effect card parks on the
+//!   durable wait across a worker restart + deploy; the partial approval `{0=approve,1=decline,2=approve}`
+//!   arrives days later WITH a double-click on "approve all"; the gate asserts 3 per-effect ledger entries
+//!   (apply/decline/apply), a 0-double-apply counter, and 0 mutation on the declined effect (AG-8) across
+//!   the restart. The subsystem face **CHAT-D10** (M4) is recorded as **Chat's**, NOT this engine. This
+//!   prompt (P-FLOW-10) shipped the rule + the structural gate (3 independent apply/decline, 0
+//!   double-apply, 0 mutation-on-decline); the durable-wait wiring of the loop (`wait_for_signal`
+//!   consuming the buffered signals across a multi-day park) is **P-FLOW-11**.
 
 use crate::engine::SignalStore;
 use crate::wfctx::{RetryPolicy, WaitOutcome, WfCtx, WfResult};
