@@ -73,6 +73,16 @@ serde = { workspace = true }
 # per node via `OutboxTx::emit`. `myelin-content` depends only on tenancy/events/identity (never on
 # refs-service), so this is acyclic — refs-service stays the graph's terminal leaf consumer.
 myelin-content = { path = "../myelin-content" }
+# The REAL Git producer (REF-P17 / P-258, M3). Refs WIRES to Git's owned `#sub` mints (the
+# `comment-`/`thread-`/`L<a>-L<b>` kinds, contract 5.7) — Refs reuses Git's grammatical mint
+# helpers (`mint_blob_line_range`/`mint_pr_comment`/`decode_path_segment`) + its canonical
+# event/relation/replay tokens rather than re-deriving them (EI-01 §7 coherence — one mint, not a
+# parallel second one). `myelin-git` is a SUBSYSTEM (producer) crate that depends on `myelin-refs`
+# (the GLUE crate) and NOTHING in the production eleven-crate DAG (nor `myelin-refs-service`)
+# depends back on it (its Cargo manifest §2.9 note) — so this is acyclic and refs-service stays the
+# graph's terminal leaf consumer. This is a CONSUMER edge (Refs consumes Git's producer surface),
+# the natural shape of "Refs wires to the real Git producer" (REF-P17 DELIVERABLE).
+myelin-git = { path = "../myelin-git" }
 # BLAKE3 + hex — the content-anchored Git line-range fingerprint (REF-P15 / P-164, §3.5: a
 # `#L<a>-L<b>` carries a BLAKE3 fingerprint of the anchored lines so resolution is content-anchored,
 # not positional). The SAME `blake3:<hex>` multihash convention the BlobStore content-address + the
