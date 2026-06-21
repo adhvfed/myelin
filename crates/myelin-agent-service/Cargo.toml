@@ -55,6 +55,17 @@ myelin-notif = { path = "../myelin-notif" }
 # -events/-identity/-tenancy below this crate) and does NOT depend back on -agent/-agent-service, so
 # this edge keeps the DAG acyclic.
 myelin-content = { path = "../myelin-content" }
+# AG-P15 (→ P-226) — ToolHands::exec IS the CI runner's `kind=agent` job on the ONE unified sandbox
+# (X-6 / contract 8.4). `myelin-ci-sandbox` (CI-P1 → P-129) owns the runner seam: the `JobSpec`
+# shape (kind ∈ {Ci, Agent}, fail-closed digest-pin / pids_max / timeout), the `agent_job`
+# constructor that wires the X-6 equivalence, the `SandboxBackend` launch seam, and the
+# `RunnerHooks` through which the four uniform guarantees fire. This crate is the FABRIC CONSUMER:
+# it builds the `kind=agent` JobSpec + dispatches it through `SandboxBackend::launch`, feeding the
+# hardening profile + the four-guarantee hooks. NO cycle: `myelin-ci-sandbox` depends only on
+# `myelin-tenancy` (the Region partition type) and does NOT depend back on -agent/-agent-service,
+# so this edge keeps the DAG acyclic. The Firecracker backend (CI-P2 → P-237) + the ZERO-escapes
+# real-kernel GATE (CI-P5 / AG-P17 → P-239/P-229) are the runner IMPL/GATE follow-ons.
+myelin-ci-sandbox = { path = "../myelin-ci-sandbox" }
 # The SKELETON's terminal trace event carries a references-not-payloads JSON payload (the trace
 # `ArtifactRef`); serde_json builds the `EventDraft.payload` value (it was a dev-dep for AG-P2's
 # round-trip test; the SKELETON's emit needs it at lib scope).
