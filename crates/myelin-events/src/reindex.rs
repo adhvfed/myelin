@@ -41,13 +41,20 @@
 //! re-derives at sub-artifact granularity, the `#sub` resolution ladder (contract 5.7) degrades over
 //! the same granularity. The scope is a **PII-free** opaque selector (references-not-payloads).
 //!
-//! ## FLOOR named (EI-01 §1) — the per-owner `replay` bodies are EB-26 (M3/M4)
-//! This prompt ships **the SEAM + the `*.snapshot` schema + a small reference consumer** to prove
+//! ## Per-owner `replay` bodies (EI-01 §1) — M3 owners FILLED in EB-26, M4 owners are EB-27
+//! This module ships **the SEAM + the `*.snapshot` schema + a small reference consumer** to prove
 //! `cold == live` (BUS-D5). Each OWNING subsystem implements its real [`ReindexSource::replay`] body
-//! — CI's one-run replay, Knowledge's page-subtree-at-block-granularity replay, Refs' per-blob
-//! replay, Search's full reindex — with that subsystem, in **EB-26 (P-246, M3)** and each owner's
-//! M3/M4 prompts (`coverage-matrix` rows 2.6/4.x/5.x). The `ReferenceReindexSource` here is the
-//! reference owner the BUS-D5 drill runs against; it is NOT a stand-in for a real owner's replay.
+//! with THAT subsystem (it reads its own source of truth, never the derived index — EI-04 §5.3):
+//! - **M3 owners — FILLED (EB-26 / P-246):** Git's per-repo / per-blob / per-PR replay
+//!   (`myelin_git::replay::GitReindexSource`) + Knowledge's page-subtree-at-BLOCK-granularity replay
+//!   (`myelin_content::replay::KnowledgeReindexSource`) — both proven cold == live + idempotent in
+//!   their own crates' tests against THIS seam.
+//! - **FLOOR (M4 owners — EB-27):** CI's one-run replay, Issues/Chat replay, Refs' per-blob replay,
+//!   Search's full reindex land with those subsystems' M4 prompts (`coverage-matrix` rows
+//!   2.6/4.x/5.x).
+//!
+//! The [`ReferenceReindexSource`] here is the reference owner the BUS-D5 drill runs against; it is
+//! NOT a stand-in for a real owner's replay (the real M3 owners are the two named above).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

@@ -31,18 +31,24 @@
 //!    decides which facts gate, X-1 / Δ1). An `untrusted_fork` success is **neutral for gating**
 //!    until endorsed/re-run-trusted (Δ3 — the poisoned-pipeline defence).
 //!
-//! ## FLOOR (named — VISION §3 / the roadmap §5 seam-floor register)
-//! **The X-1 seam-floor.** The consumer declared here is **not live**: no event consumer is wired, no
-//! migration is run, no merge gate fires. It is BUILT against a **synthetic `ci.check.updated`
-//! emitter** in **GIT-P20 (M3-G4)** — the projection table + the live supersession consumer + the
-//! merge gate land there against a drill fixture. The **real CI producer** wiring (CI emits
-//! `ci.check.updated` + the rollup `ci.result`) is the **M4 co-gate (GIT-D10 / CI-D8 end-to-end)**.
-//! Until then the seam is *frozen-but-not-live* (roadmap §2 / §5). The Bus's narrow carriage half
-//! (envelope conformance + per-aggregate ordering + the durable `ci.result` wait substrate) already
-//! exists in `myelin_events::check_seam` (EB-24) — this module is the GIT CONSUMER half that decodes
-//! that ordered carriage; it does NOT re-define the Bus carriage (EI-01 §7: extend/reconcile, never
-//! duplicate — the opaque payload `myelin_events::check_seam::OrderedCheck::check_status` decodes to
-//! exactly the [`CheckStatus`] declared here).
+//! ## The consumer leg is now LIVE (EB-26 / P-246, M3) — and what is still a FLOOR
+//! As of **EB-26 (P-246, M3)** the consumer leg is **WIRED**: [`CheckStatusConsumer`] is an
+//! idempotent [`myelin_events::EventHandler`] over the Bus's per-aggregate-ordered `ci.check.updated`
+//! carriage (the §4.2 idempotent template — idempotent on `event_id`, applying the monotonic
+//! `run_attempt` supersession). The Bus's narrow carriage half (envelope conformance + per-aggregate
+//! ordering + the durable `ci.result` wait substrate) lives in `myelin_events::check_seam` (EB-24) —
+//! this module is the GIT CONSUMER half that decodes that ordered carriage; it does NOT re-define the
+//! Bus carriage (EI-01 §7: extend/reconcile, never duplicate — the opaque payload
+//! `myelin_events::check_seam::OrderedCheck::check_status` decodes to exactly the [`CheckStatus`]
+//! declared here).
+//!
+//! **FLOOR (named — VISION §3 / roadmap §5 seam-floor register).** Two legs remain:
+//! 1. **The real CI PRODUCER** (CI emits `ci.check.updated` + the rollup `ci.result`) lands
+//!    **EB-27/M4** — it makes the seam END-TO-END (the **M4 co-gate GIT-D10 / CI-D8**). In M3 the
+//!    consumer is proven against a synthetic `ci.check.updated` emitter (the carriage drill fixture).
+//! 2. **The store-backed projection** — the real `check_status` table + the migration + the same-tx
+//!    `consumer_dedup` write — is the data-layer follow-on; here the projection is the in-memory
+//!    [`CheckStatusProjection`] (the SEMANTICS the live store implements byte-for-byte).
 //!
 //! ## Acyclic-by-construction (EI-02 §3)
 //! Git **never synchronously calls CI**. It reads its OWN [`CheckStatusProjection`] (a mirror of CI's
@@ -50,9 +56,14 @@
 //! provenance + the `read & !is_untrusted_fork` ABAC edge, X-1). CI emits, Git reads — the dependency
 //! is one-way.
 
+use myelin_events::taxonomy::new_tokens::CI_CHECK_UPDATED;
+use myelin_events::{
+    EventEnvelope, EventHandler, HandleOutcome, Reason, SubjectPattern,
+};
 use myelin_tenancy::{ArtifactRef, TenantId};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::Mutex;
 
 // ---------------------------------------------------------------------------
 // 1. The frozen CheckStatus fact (the consumer view) — contract 5.9 / X-1
@@ -520,6 +531,130 @@ pub enum GateOutcome {
         /// The specific contexts that are not satisfied (missing, failing, or un-endorsed fork).
         unmet: Vec<CheckContext>,
     },
+}
+
+// ---------------------------------------------------------------------------
+// 5. THE LIVE CONSUMER LEG (EB-26 / P-246, M3) — Git's check_status projection
+//    wired as an idempotent EventHandler over the Bus's per-aggregate-ordered carriage.
+// ---------------------------------------------------------------------------
+
+/// The subject whitelist for the check-status consumer — exactly `ci.check.updated` (rule 3 — NEVER
+/// `*`). Git consumes ONLY this token from CI; it never subscribes to a wildcard (a poison/slow CI
+/// subject must never head-of-line-block git's other consumers). Pinned to the NAMED Bus token. A
+/// `const` `SubjectPattern` cannot embed an owned `String`, so the whitelist is built once into a
+/// `'static` slice the [`EventHandler::subjects`] signature requires (a one-time `OnceLock` init).
+fn check_status_subjects() -> &'static [SubjectPattern] {
+    use std::sync::OnceLock;
+    static SUBJECTS: OnceLock<Vec<SubjectPattern>> = OnceLock::new();
+    SUBJECTS
+        .get_or_init(|| vec![SubjectPattern(CI_CHECK_UPDATED.to_string())])
+        .as_slice()
+}
+
+/// **The LIVE check-seam consumer leg (EB-26 / P-246, M3).** Git's `check_status` projection wired as
+/// an idempotent [`EventHandler`] over the Bus's per-aggregate-ordered `ci.check.updated` carriage
+/// (the §4.2 idempotent consumer template, §4.12 / contract 5.9). This is the consumer half of the
+/// X-1 seam going LIVE in M3 (the producer half — CI's real emit — lands EB-27/M4, making the seam
+/// end-to-end).
+///
+/// What the runtime around it guarantees (the Bus's [`myelin_events::consumer::Consumer`] template,
+/// EB-05) and what THIS handler guarantees:
+/// - **Idempotent on `event_id`** — the Bus consumer runtime's `consumer_dedup` ledger skips a
+///   redelivered `event_id` (rule 1), so `handle` is invoked at most once per event; AND this
+///   handler's `apply` is ITSELF idempotent (a re-applied same-attempt fact is a no-op overwrite,
+///   [`supersedes`] is `>=`) — belt and braces, so even a dedup-ledger miss never double-effects.
+/// - **Per-aggregate ordered on `(repo, commit_oid)`** — the Bus delivers the per-context facts in
+///   per-aggregate `seq` order ([`myelin_events::check_seam::CheckSeamOrder`]), so the monotonic
+///   `run_attempt` supersession this handler applies is well-defined regardless of physical arrival
+///   order (a late lower-attempt re-delivery is [`ApplyOutcome::DroppedStale`], never a clobber).
+/// - **The Bus's role stays NARROW** — it carries the envelope + the order; this handler is the
+///   GIT-OWNED projection logic (decode the opaque payload → apply supersession). The Bus does not
+///   name a `CheckStatus` field; Git decodes it here.
+///
+/// The projection is interior-mutable (a `Mutex`) because [`EventHandler::handle`] takes `&self` (the
+/// Bus runtime owns the handler and may deliver concurrently); the lock is held only for the
+/// O(1) apply. The live store-backed projection (the real `check_status` table + the same-tx dedup
+/// write) is the data-layer follow-on; the SEMANTICS — idempotent-on-`event_id`, per-aggregate
+/// ordered, monotonic supersession — are exactly what this handler proves.
+#[derive(Debug, Default)]
+pub struct CheckStatusConsumer {
+    /// The Git-owned projection the handler mutates (one current row per `(commit_oid, context)`).
+    projection: Mutex<CheckStatusProjection>,
+    /// The count of facts that became current (superseded/seeded the row) — for the carriage drill's
+    /// telemetry assertion.
+    applied: Mutex<u64>,
+    /// The count of late lower-attempt facts dropped as stale — the supersession's observable half.
+    dropped_stale: Mutex<u64>,
+}
+
+impl CheckStatusConsumer {
+    /// A fresh consumer with an empty projection.
+    pub fn new() -> CheckStatusConsumer {
+        CheckStatusConsumer::default()
+    }
+
+    /// Decode the opaque `ci.check.updated` payload (the `serde_json::Value` the Bus carries OPAQUE,
+    /// `myelin_events::check_seam::OrderedCheck::check_status`) into the typed Git [`CheckStatus`]
+    /// consumer view. A malformed payload is a LOUD [`Reason`] (the handler dead-letters it — never a
+    /// silent drop, never the wrong shape into the projection).
+    pub fn decode(payload: &serde_json::Value) -> Result<CheckStatus, Reason> {
+        serde_json::from_value(payload.clone()).map_err(|e| {
+            Reason(format!("ci.check.updated payload is not a valid CheckStatus fact: {e}"))
+        })
+    }
+
+    /// Snapshot of the current projection (a clone) — the merge gate reads this. Cloned out under the
+    /// lock so the gate scan never races a concurrent apply.
+    pub fn projection(&self) -> CheckStatusProjection {
+        self.projection.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The number of facts that became current (the supersession high-water advances).
+    pub fn applied_count(&self) -> u64 {
+        *self.applied.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The number of late lower-attempt facts dropped as stale (the at-least-once supersession drop).
+    pub fn dropped_stale_count(&self) -> u64 {
+        *self.dropped_stale.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl EventHandler for CheckStatusConsumer {
+    /// The `*`-free whitelist: exactly `ci.check.updated` (rule 3). Git consumes only this from CI.
+    fn subjects(&self) -> &'static [SubjectPattern] {
+        check_status_subjects()
+    }
+
+    /// **Apply one delivered `ci.check.updated` to the `check_status` projection** (idempotent on
+    /// `event_id` via the runtime; idempotent-by-construction here too). Decodes the opaque payload →
+    /// applies the monotonic [`supersedes`] rule. A wrong-type event or a malformed payload is a LOUD
+    /// [`HandleOutcome::NonRetryable`] (dead-letter — never silently dropped, never the wrong shape
+    /// into the projection). A valid fact is applied and `Done` (the runtime acks + dedup-marks it).
+    fn handle(&self, ev: &EventEnvelope) -> HandleOutcome {
+        // The handler binds only `ci.check.updated`; a foreign type slipping through the whitelist is
+        // a wiring bug — dead-letter it loudly (rule 5), never apply it.
+        if ev.type_.0 != CI_CHECK_UPDATED {
+            return HandleOutcome::NonRetryable(Reason(format!(
+                "check_status consumer received a non-ci.check.updated event: {}",
+                ev.type_.0
+            )));
+        }
+        let fact = match Self::decode(&ev.payload) {
+            Ok(f) => f,
+            Err(reason) => return HandleOutcome::NonRetryable(reason),
+        };
+        let mut proj = self.projection.lock().unwrap_or_else(|e| e.into_inner());
+        match proj.apply(&fact) {
+            ApplyOutcome::Superseded { .. } => {
+                *self.applied.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+            }
+            ApplyOutcome::DroppedStale { .. } => {
+                *self.dropped_stale.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+            }
+        }
+        HandleOutcome::Done
+    }
 }
 
 #[cfg(test)]

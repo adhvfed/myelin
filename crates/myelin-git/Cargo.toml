@@ -50,6 +50,12 @@ myelin-search = { path = "../myelin-search" }
 # re-defined here.
 myelin-query = { path = "../myelin-query" }
 serde.workspace = true
+# JSON for the LIVE check-seam consumer leg (EB-26 / P-246, M3): Git decodes the OPAQUE
+# `ci.check.updated` payload (`myelin_events::check_seam::OrderedCheck::check_status`, carried as a
+# `serde_json::Value`) into the typed `CheckStatus` consumer view in `CheckStatusConsumer::handle`.
+# A runtime edge now (the consumer is wired), not just test scaffolding — the same serde_json the
+# rest of the workspace pins.
+serde_json.workspace = true
 
 # DEV-ONLY: the rich ReBAC namespace ENGINE (FragmentDef / Userset / StoreBackedCheck) lives in the
 # Identity SERVICE crate. The runtime Git fragment is the names-only `myelin_identity::Namespace-
@@ -61,7 +67,3 @@ serde.workspace = true
 [dev-dependencies]
 myelin-identity-service = { path = "../myelin-identity-service" }
 myelin-storage = { path = "../myelin-storage" }
-# JSON for the contract-6.3 wire-shape CDC (proving git's declare_indexable spec serializes to the
-# frozen 6.3 key set/values). Test scaffolding only — the same serde_json::Value the rest of the
-# workspace pins (no runtime edge).
-serde_json.workspace = true

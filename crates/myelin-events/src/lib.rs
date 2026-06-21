@@ -331,6 +331,10 @@ pub mod crosscell;
 pub mod dedup;
 pub mod envelope;
 pub mod firehose;
+/// The per-subsystem token-list VALIDATION HARNESS (contract 2.9, EB-26 / P-246, M3). The Bus owns
+/// the §6.1 grammar + this list-registration harness; each subsystem REGISTERS its completed
+/// dotted-name list (name + schema_ver lineage + payload shape) against the one grammar.
+pub mod harness;
 pub mod holder;
 // Stage 2 / infra: the REAL durable bus behind the BusTransport trait — NATS JetStream via
 // async-nats. Compiled ONLY under `--features integration` (it pulls the real async-nats +
@@ -390,6 +394,15 @@ pub use check_seam::{
 pub use taxonomy::{
     validate as validate_event_type, TaxonomyError, ARTIFACT_TYPE_TOKENS, SEED_EVENT_NAMES,
     SUBSYSTEM_TOKENS,
+};
+/// The per-subsystem token-list validation harness (contract 2.9, EB-26 / P-246, M3). Each
+/// subsystem registers its completed [`harness::SubsystemTokenList`] into a [`harness::TokenListHarness`]
+/// — the Bus admits the full list iff every name is §6.1-grammar-conformant + own-prefixed + unique,
+/// and rejects a malformed addition LOUDLY ([`harness::HarnessError`]). The Bus owns the grammar +
+/// harness; the subsystem owns its list (its own crate constant). FLOOR: CI/Issues/Chat register
+/// their M4 lists through this same harness in EB-27/P-?.
+pub use harness::{
+    HarnessError, PayloadShape, RegisteredToken, SubsystemTokenList, TokenListHarness,
 };
 pub use upcast::{RegisterError, UpcastError, UpcasterRegistry};
 pub use telemetry::{

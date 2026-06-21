@@ -152,10 +152,15 @@ title = "reindex-from-source"
 status = "covered"
 # EB-22/P-142 ships the Bus's OWNED reindex-from-source seam (events::reindex(scope)) + the
 # *.snapshot schema (deterministic event_id from (aggregate, version)) + a reference derived-store
-# consumer proving cold == live (BUS-D5). The per-OWNER `replay` bodies (CI one-run, KN page-subtree
-# at block granularity, Refs per-blob, Search full reindex) land with each owner in EB-26/P-246 (M3)
-# + the owners' M3/M4 prompts — the named floor; this row is the SEAM + schema CDC pair.
-cdc = ["crates/myelin-events/tests/cdc_2_6_reindex.rs"]
+# consumer proving cold == live (BUS-D5). EB-26/P-246 (M3) FILLED the two M3-owner `replay` bodies:
+# Git's per-repo/per-blob/per-PR replay (`myelin_git::replay::GitReindexSource`) + Knowledge's
+# page-subtree-at-BLOCK-granularity replay (`myelin_content::replay::KnowledgeReindexSource`) — both
+# proven cold == live + idempotent against THIS seam. FLOOR (M4 owners, EB-27): CI one-run, Issues/Chat,
+# Refs per-blob, Search full reindex land with those subsystems' M4 prompts.
+cdc = [
+    "crates/myelin-events/tests/cdc_2_6_reindex.rs",
+    "crates/myelin-content/tests/cdc_2_9_2_6_knowledge_tokens_and_replay.rs",
+]
 
 [[contract]]
 row = "2.7"
@@ -176,14 +181,22 @@ status = "covered"
 # EB-02/P-042 ships the Bus grammar + seed CDC pair; GIT-P2/P-124 adds Git COMPLETING its `git.*`
 # token list; CHAT-P1/P-128 adds Chat COMPLETING its `chat.*` list, split DURABLE-via-outbox vs
 # FIREHOSE-only; ISS-P03/P-242 adds Issues COMPLETING its `issue.*` list incl. the registered
-# `initiative` type token + the 2.1 EventEnvelope unit-anchor half (seconds-vs-millis rejected)
-# (contract 2.9: "each subsystem completes its list") — each subsystem registers, the Bus owns the
-# grammar. Each file carries both a provider and a consumer marker.
+# `initiative` type token + the 2.1 EventEnvelope unit-anchor half (seconds-vs-millis rejected).
+# EB-26/P-246 (M3) adds the Bus-owned per-subsystem token-list VALIDATION HARNESS
+# (`myelin_events::TokenListHarness`) — the cross-subsystem registry each completed list registers
+# INTO (admits the full list iff §6.1-conformant + own-prefixed + unique; rejects a malformed addition
+# LOUDLY) — and registers the M3 owners' lists through it (Git's complete GIT_EVENT_TOKENS + Knowledge
+# COMPLETING its new `knowledge.*` list, durable-via-outbox vs firehose-only). (contract 2.9: "each
+# subsystem completes its list" — each subsystem registers, the Bus owns the grammar + the harness.)
+# Each file carries both a provider and a consumer marker.
 cdc = [
     "crates/myelin-events/tests/cdc_2_9_taxonomy.rs",
+    "crates/myelin-events/tests/cdc_2_9_token_list_harness.rs",
     "crates/myelin-git/tests/cdc_2_9_git_tokens.rs",
+    "crates/myelin-git/tests/cdc_2_9_git_token_list_harness.rs",
     "crates/myelin-chat/tests/cdc_2_9_chat_tokens.rs",
     "crates/myelin-issues/tests/cdc_2_9_issues_tokens.rs",
+    "crates/myelin-content/tests/cdc_2_9_2_6_knowledge_tokens_and_replay.rs",
 ]
 
 # ──────────────── §3 Signals, Automations, Triggers & the firehose (Bus) ────────────────────────
@@ -486,13 +499,20 @@ landing = "P-281"
 # (commit_oid, context), the monotonic `run_attempt` supersession rule, the `required`-set policy +
 # the gate outcome, and the typed `CheckStatus` consumer view that decodes the OPAQUE Bus payload
 # (`myelin_git::check_status`) — a COMPILING, not-yet-live seam module against the M2-frozen 5.9 shape,
-# with a consumer-half CDC (`crates/myelin-git/tests/cdc_5_9_check_status_consumer.rs`). The row stays
-# DEFERRED because the seam is not live end-to-end: there is no event consumer wired, no migration run,
-# and no CI PRODUCER yet. The live consumer + merge gate (the check_status projection table + the
-# run_attempt supersession core) land in GIT-P20/P-281 (M3, against a SYNTHETIC `ci.check.updated`
-# emitter — the X-1 seam-floor). The real CI producer wiring (CI emits `ci.check.updated` + the rollup
-# `ci.result`) is the M4 co-gate (GIT-D10/CI-D8 end-to-end) — only then is the full provider+consumer
-# CDC pair closeable to `covered`.
+# with a consumer-half CDC (`crates/myelin-git/tests/cdc_5_9_check_status_consumer.rs`).
+# EB-26/P-246 (M3) WIRED THE CONSUMER LEG LIVE: `myelin_git::check_status::CheckStatusConsumer` is now
+# an idempotent `myelin_events::EventHandler` over the Bus's per-aggregate-ordered `ci.check.updated`
+# carriage (the §4.2 idempotent template) — proven through the Bus consumer runtime (idempotent on
+# event_id → 0 dup; per-aggregate-ordered → monotonic supersession; malformed payload dead-letters) in
+# `crates/myelin-git/tests/drills_git_d9_check_seam_consumer_leg.rs`, and the carriage itself proven
+# over the LIVE NATS JetStream stack in
+# `crates/myelin-events/tests/integration_eb26_check_seam_carriage.rs` (envelope conformance +
+# broker-dedup + per-aggregate ordering — run with --features integration). The row stays DEFERRED
+# because the seam is not yet live END-TO-END: the consumer leg runs against a SYNTHETIC
+# `ci.check.updated` emitter (the X-1 seam-floor) — no real CI PRODUCER yet, and the store-backed
+# projection table/migration is the data-layer follow-on. The real CI producer wiring (CI emits
+# `ci.check.updated` + the rollup `ci.result`) is the M4 co-gate (GIT-D10/CI-D8 end-to-end) — only
+# then is the full provider+consumer CDC pair closeable to `covered`.
 
 # ──────────────── §6 Search (myelin-search) ─────────────────────────────────────────────────────
 
