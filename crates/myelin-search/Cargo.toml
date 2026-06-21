@@ -94,6 +94,16 @@ serde = { workspace = true }
 # DELIVERABLE places "in the myelin-search service crate". The engine is UNCHANGED.
 myelin-content = { path = "../myelin-content" }
 
+# SRCH-P19 (P-262, M3): Search indexes SUB-ARTIFACT-GRANULAR + CONTENT-ANCHORED projections (doc
+# blocks `b<id>`/`h<id>`, KN db rows/fields `row-`/`field-`, Git content-anchored line-ranges
+# `L<a>-L<b>`). The `#sub` grain is keyed off the ONE FROZEN grammar `myelin_refs::sub_kind`/`Sub`/
+# `SubKind` (contract 5.7) — Search does NOT re-implement the grammar (EI-01 §7: never a second
+# parser). `myelin-refs` is a leaf grammar crate (it depends only on -tenancy/-identity/-events and
+# NEVER back on Search), so this consumer edge is DAG-safe: Search stays a terminal leaf consumer.
+# Search keys the doc at the right grain + pins the ACL on the #sub-stripped parent; the owner's
+# `project` re-derives the content-anchored span (the index never stores a raw line number, §3.1/§4.9).
+myelin-refs = { path = "../myelin-refs" }
+
 # TEST-ONLY. The names/units drift test constructs a canonical EventEnvelope (which embeds a
 # Principal from myelin-identity, now a prod dep above) to read the REAL frozen field names off a
 # value, and confirms the search-requires-acl-filter lint (its home is the shared myelin-lints

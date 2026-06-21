@@ -128,6 +128,7 @@ pub mod pipeline;
 pub mod reindex;
 pub mod residency;
 pub mod shell;
+pub mod subartifact;
 pub mod telemetry;
 pub mod vector;
 
@@ -189,6 +190,11 @@ pub use reindex::{
 pub use residency::{search_store_descriptors, SearchStoreDescriptor};
 pub use shell::{
     boot_search, run_search, search_app_spec, SEARCH_INDEX_DIR_MIGRATION, SERVICE_NAME,
+};
+pub use subartifact::{
+    block_subdoc_projection, db_field_subdoc_projection, db_row_subdoc_projection,
+    line_range_subdoc_facets, line_range_subdoc_projection, AnchorState, ContentAnchoredSpan,
+    M4ProducerSubAnchorFloor, SubGrain, FACET_ANCHOR_STATE, FACET_LINE_END, FACET_LINE_START,
 };
 pub use telemetry::{
     signal as telemetry_signal, LabelledSignal, RedLabels, SearchTelemetry, CACHE_RATIO_ABSENT,
