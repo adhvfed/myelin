@@ -272,11 +272,40 @@
 //! 30× corpus across both TE-7 mirrors) is **R-M5 (REF-P24)** — the CI variant here is NOT the at-scale
 //! proof. This slice completes R-M2.
 //!
+//! **REF-P17 (P-258) ships:** the [`git_producer`] module — **Refs consumes the REAL Git producer
+//! edges + content-anchored line-range sub-anchors + per-blob/ref replay** (M3; the engine is
+//! UNCHANGED — this WIRES Refs to the real Git producer + RE-CONFIRMS the invariants on the Git
+//! corpus). [`git_producer::GitEdgeProducer`] emits a real Git PR/commit body's reference edges
+//! (commit-trailer / PR-link / "Closes <issue>") through the SAME [`emit`] seam the M2 synthetic
+//! writer used — the producer is no longer synthetic, only the caller + source URN changed (contract
+//! 5.4). [`git_producer::GitOwner`] is a REAL [`resolve::ProjectApi`] + [`ladder::SubAnchorResolver`]
+//! over Git content: its `project`/`resolve_sub` classifies a Git `#sub` into the frozen
+//! [`resolve::ProjectOutcome`] — a `L<a>-L<b>` line range through the engine's [`ladder::resolve_line_range`]
+//! (exact→LIVE / rebased→MOVED / partial→OUTDATED / content_gone→GONE, §3.5), a `comment-`/`thread-`
+//! review anchor through its recorded state, the CI `check-`/`step-` kinds USED (not built — CI's
+//! producer is REF-P19) — all through the ONE [`ladder`] (contracts 5.6/5.7, the root ALWAYS carried,
+//! 0 dangling embed / 0 hard 404, REF-D9 the Refs half of GIT-D7). [`git_producer::git_replay_scope`]
+//! names the Git per-blob/ref reindex grain (contract 2.6) so a scoped reindex re-derives the
+//! content-anchored anchors at blob grain (never a stale raw line number, §4.7). The Git ReBAC
+//! fragment (4.9) flows through `list_objects` via the REF-P11 [`backlinks::BacklinkRead`] (a viewer
+//! with no `repo->pull` sees 0 PR/repo backlinks — GIT-D11 leak-free). REF-D1/REF-D2 (leak + IDOR)
+//! are re-confirmed on the REAL Git edge corpus, REF-D9 green on a force-pushed Git line-range
+//! (MOVED/OUTDATED/GONE, root carried) + Git comment/thread anchors, REF-D4 reindex-parity green on a
+//! Git corpus — in unit + CDC tests; the REAL Postgres reindex-parity + the real-Git-edge ingest are
+//! PROVEN against the live dev stack in `tests/integration_ref_p17_git_producer.rs` (the `integration`
+//! feature). **FLOORS named (Git deliverables Refs depends on):** the in-cell single-home-cell graph
+//! build — cross-cell fan-out is **R-M5 (REF-P26)**; Git pseudonymous-by-default commit authors as
+//! `origin_actor` — the audited history-rewrite erasure path (10.6) is **R-M5 / on-demand**; CI's
+//! `check-`/`step-` PRODUCER half is **R-M4 (REF-P19)** (Refs resolves the sub-anchor here, awaiting
+//! CI's emitter). No Refs threshold weakened; no engine type re-defined; no second ladder minted.
+//!
 //! **Does NOT ship (floors named):**
-//! - **The producers are SYNTHETIC at M2.** REF-P8 exercises the seam with a TEST content writer; the
-//!   first REAL producers (Git diffs / Knowledge blocks / Chat messages writing actual content) land
-//!   in **REF-P17 / REF-P18** (M3+). Named so the seam is not mistaken for live producer edges — the
-//!   WIRING (structured-node extraction + same-tx outbox emit) is real, the CALLERS are synthetic.
+//! - **The GIT producer HAS LANDED (REF-P17 / P-258).** REF-P8 exercised the seam with a TEST content
+//!   writer; the first REAL producer — Git (PR/commit bodies, content-anchored line-range +
+//!   comment/thread sub-anchors) — now drives the SAME seam through [`git_producer`]. The remaining
+//!   producers (Knowledge blocks, Chat messages, Issues) land in **REF-P18 / REF-P21 / REF-P20**.
+//!   Named so the Git wiring is not mistaken for the full producer corpus — the WIRING was always
+//!   real; Git is the first real CALLER, the rest are the named follow-ons.
 //! - **The loop-guard causal-depth STAMP drill is REF-P9 / P-158.** The `depth = content.depth + 1`
 //!   already rides [`myelin_events::derive_envelope`] correct-by-construction (the emit passes `cause =
 //!   Some(content_event)`); REF-P9 adds the explicit depth-stamp assert + the depth-ceiling tripwire
@@ -312,6 +341,7 @@ pub mod dek;
 pub mod edge_builder;
 pub mod emit;
 pub mod erasure_posture;
+pub mod git_producer;
 pub mod holder;
 pub mod invalidator;
 pub mod ladder;
@@ -355,6 +385,9 @@ pub use migration::{
     EDGE_OUTBOUND_INDEX, EDGE_TABLE, MAKE_EDGE_TENANT_SCOPED_DDL,
 };
 pub use erasure_posture::{erasure_posture, ErasurePosture};
+pub use git_producer::{
+    git_replay_scope, CommentState, GitEdgeProducer, GitOwner, GitReplayGrain, GIT_OWNER_TOKEN,
+};
 pub use invalidator::{
     InvalidateError, InvalidationCall, NoOpCacheShim, ProjectionCache, RefsProjectionInvalidator,
     INVALIDATOR_CONSUMER, INVALIDATOR_SUBJECTS, INVALIDATOR_SUBJECT_PREFIXES,
