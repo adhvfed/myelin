@@ -62,6 +62,12 @@
 pub mod firecracker;
 pub mod gvisor;
 pub mod hardening;
+pub mod runner;
+
+pub use runner::{
+    CountingFirehose, EngineTerminalReporter, FirehoseSink, JobLeaseStore, QueuedJob, RunOutcome,
+    RunnerAgent, RunnerError, TerminalReport, TerminalReporter,
+};
 
 use serde::{Deserialize, Serialize};
 

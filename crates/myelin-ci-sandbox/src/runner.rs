@@ -1,0 +1,1200 @@
+//! # `runner` — the runner agent + the lease/heartbeat handshake + the exactly-once
+//! `job.done` terminal report (CI-P3 → P-238, M2)
+//!
+//! **Owning architecture docs (read in full before changing):**
+//! - `planning/04-subsystem-architectures/continuous-integration/architecture/00-overview.md` §4
+//!   (*the runner agent = a small attested Rust binary; hosted + self-hosted from one artifact*):
+//!   it "pulls leases, launches the sandbox via `SandboxBackend`, streams frames, reports terminal
+//!   via the `job.done` signal. Same binary hosted + self-hosted."
+//! - `.../02-internals-and-algorithms.md` §2.1 (*pull-leasing — the assignment model*): a runner
+//!   long-polls `job_queue`, claims the next eligible job for its labels via `FOR UPDATE SKIP
+//!   LOCKED`, takes a **lease** (`lease_owner` + `lease_expires`), and **heartbeats** to extend it.
+//!   "This reuses the platform's existing lease primitive (the outbox relay, the timer wheel) —
+//!   proven, not novel." The dead-runner **reaper** is the OTHER side (CI-P12, named floor here).
+//! - `.../03-events-contracts-and-glue.md` §1.1 / §2 (the `job.done` terminal report shape — a
+//!   signal, idempotent on `idem_token`, references-not-payloads).
+//! - `planning/05-refined-shared-systems-architecture/00-reconciliation-decisions.md` §OQ-F (the
+//!   `SCHEDULE_AND_RUN_JOB` long-park: the runner "can deliver 'done' twice (at-least-once) and the
+//!   workflow wakes once. The signal is **idempotent on `idem_token`**").
+//!
+//! **Contracts CONSUMED:** 9.2/9.4 (`job.done` — the terminal report the runner emits), 4.7
+//! (`mint_run_token` — the runner CONSUMES the minted per-job/self-hosted token), 12.4
+//! (`residency_verify` — the runner pool region; the claim is region-pinned, no global pool).
+//!
+//! ## What this prompt (CI-P3) ships — the runner SIDE only, RECONCILED with the engine
+//!
+//! Three things, all the runner half of an already-built contract — never a fork:
+//!
+//! 1. **The lease/heartbeat handshake (runner side).** [`JobLeaseStore`] models the platform's
+//!    frozen `FOR UPDATE SKIP LOCKED` + heartbeat lease primitive — the SAME shape
+//!    `myelin_flow::engine::RunStore::lease_runnable` models for the workflow dispatcher (the
+//!    proven primitive, reused, not reinvented). The runner side is exactly three moves:
+//!    [`JobLeaseStore::claim_for_labels`] (claim the highest-priority, in-region, label-eligible job
+//!    via skip-locked) → [`JobLeaseStore::heartbeat`] (renew `lease_expires` while the job runs) →
+//!    terminal report (then [`JobLeaseStore::settle`]). The **reaper/reclaim side** (sweep expired
+//!    leases, re-queue) is **CI-P12** (named floor) — here a claim simply SKIPS a live lease and
+//!    claims one whose lease has EXPIRED, the same skip-locked safety, so an expired lease is
+//!    reclaimable by construction.
+//!
+//! 2. **The runner agent.** [`RunnerAgent::run_one`] performs the whole claim → launch → terminal
+//!    cycle: claim a job for the runner's labels, launch the sandbox via
+//!    [`SandboxBackend::launch`] (CI-P1/CI-P2 — the runner does NOT reimplement the sandbox), stream
+//!    firehose frames (STUBBED — see [`FirehoseSink`]; the full log pipeline is **CI-P20**), and on
+//!    terminal report `job.done` ECHOING the spec's `idem_token`. Same agent hosted + self-hosted —
+//!    the self-hosted ATTESTATION GATE + the tenant-`SelfHosted`-scoped token mint is **CI-P4 →
+//!    P-240** (named floor); here the runner CONSUMES the minted token off the `JobSpec.run_token`
+//!    (4.7).
+//!
+//! 3. **The exactly-once terminal report — RECONCILED with the engine signal path.** The runner
+//!    reports terminal by delivering the `job.done` durable signal through the ENGINE's
+//!    [`myelin_flow::DurableExecutor::signal`] with `signal_name = JOB_DONE_SIGNAL` and
+//!    `idem_key = idem_token` — whose `INSERT … ON CONFLICT (tenant, run_id, signal_name, idem_key)
+//!    DO NOTHING` IS the exactly-once wake (recon §OQ-F; shipped P-FLOW-09 / P-205). The runner can
+//!    deliver "done" TWICE (at-least-once); the engine buffers it ONCE; the parked workflow wakes
+//!    ONCE. **There is NO second signal path** — [`TerminalReporter`] is a thin echo onto
+//!    `DurableExecutor::signal`, and [`EngineTerminalReporter`] wraps a real
+//!    [`myelin_flow::FlowExecutor`].
+//!
+//! ## FLOORS named (CI-P3)
+//! - **Pre-warmed snapshot pools** (the cold-start mitigation), the **self-hosted attestation gate**,
+//!   and the tenant-`SelfHosted`-scoped token mint → **CI-P4 (→ P-240)**. Here the runner CONSUMES a
+//!   minted token; it does not mint or attest.
+//! - **The firehose log pipeline** (the full `(job, step, byte-range)` index + the resume-cursor
+//!   protocol + the `ci.log.available` coalesced pointer) → **CI-P20**. Here [`FirehoseSink`] is a
+//!   STUB seam that counts frames; the terminal report carries the `ci.log.available` *pointer ref*
+//!   the full pipeline will publish.
+//! - **The reaper / dead-lease reclaim** (sweep expired leases → re-queue → fresh lease) → **CI-P12**.
+//!   Here the claim SKIPS live leases and claims expired ones (so an expired lease is reclaimable);
+//!   the active sweeper that re-queues a dead runner's job is CI-P12.
+//!
+//! ## MUTATION-SCORE FLOOR (mandatory-core)
+//! The **terminal-report idempotency module** — [`TerminalReporter`] / [`EngineTerminalReporter`] +
+//! the runner's terminal-report leg ([`RunnerAgent::run_one`] step 4 / [`RunnerAgent::report_done_again`])
+//! — is **mandatory-core** (it carries the exactly-once-under-at-least-once property: a doubly-delivered
+//! `job.done` must wake the parked workflow ONCE, double-effect = 0). Its cargo-mutants
+//! mutation-score floor is **100% (zero surviving mutants)** — the same floor the engine's signal
+//! idempotency carries (P-FLOW-09), because the runner reuses that exact path and a surviving mutant
+//! here would mean a fork that silently double-wakes. The lease/heartbeat handshake module
+//! ([`JobLeaseStore`]) carries a **≥ 90%** floor (the skip-locked / owner-only-renew / expiry-reclaim
+//! invariants are load-bearing but not the irreversible-effect surface).
+//!
+//! ## DB-free / VM-free by default
+//! [`JobLeaseStore`] and [`RunnerAgent`] are in-memory value/trait code modelling the frozen Postgres
+//! `FOR UPDATE SKIP LOCKED` lease + the engine signal idempotency (the dev↔prod CONFIG SWAP — never a
+//! code change). The REAL `FOR UPDATE SKIP LOCKED` claim + heartbeat + the exactly-once terminal
+//! report run against LIVE Postgres ONLY in `tests/integration_runner_lease.rs` (the `integration`
+//! feature). `cargo build --workspace` + the default `cargo test` stay DB-free AND VM-free.
+
+use crate::{JobSpec, RunnerHooks, SandboxBackend, SandboxHandle};
+use myelin_flow::{
+    DurableExecutor, ExecutorError, RunId, SignalOutcome, SignalSpec, JOB_DONE_SIGNAL,
+};
+use myelin_refs::ArtifactRef;
+use myelin_tenancy::{Region, TenantId};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+// =================================================================================================
+// The lease/heartbeat handshake (runner side) — REUSES the FOR UPDATE SKIP LOCKED + heartbeat
+// primitive (arch 02 §2.1). The reaper/reclaim side is CI-P12 (named floor).
+// =================================================================================================
+
+/// **A queued job row the runner claims a lease over (the runner's view of `job_queue`, arch 02
+/// §2.1 / arch 01 §3).** The fairness/lanes/concurrency predicates of the FULL scheduler claim are
+/// CI-P11/CI-P12; the runner side cares about the lease columns + the residency/affinity/trust
+/// predicates that decide whether THIS runner may claim it. References-not-payloads — the `spec` is
+/// the digest-pinned [`JobSpec`] (no PII; secrets are names).
+#[derive(Clone, Debug)]
+pub struct QueuedJob {
+    /// `(tenant, region)` partition key — the residency pin (12.1). A runner claims ONLY in-region
+    /// jobs (no global pool, 12.4).
+    pub tenant: TenantId,
+    /// `(tenant, region)` residency pin — the claim predicate `q.region = $cell_region`.
+    pub region: Region,
+    /// The durable run id of the parked workflow this job belongs to (the `job.done` target).
+    pub run_id: String,
+    /// The job's id within the queue (the lease row key).
+    pub job_id: String,
+    /// The job's required labels — the affinity predicate `q.labels <@ $runner_labels` (job labels
+    /// MUST be a subset of the runner's labels).
+    pub labels: Vec<String>,
+    /// The digest-pinned hardened [`JobSpec`] the runner launches. Its `idem_token` (minted by the
+    /// workflow at `SCHEDULE_AND_RUN_JOB` dispatch) is ECHOED on the terminal `job.done` (the
+    /// no-coordination dedup agreement, §OQ-F).
+    pub spec: JobSpec,
+    /// The worker currently holding the lease (`None` = unleased, claimable). The skip-locked claim
+    /// stamps it.
+    pub lease_owner: Option<String>,
+    /// The lease deadline (epoch seconds in this in-memory model; a `timestamptz` in PG). A claim
+    /// SKIPS a row whose lease is LIVE (`lease_expires > now`) and may claim one whose lease has
+    /// EXPIRED (`lease_expires <= now`) — the crash-recovery / reclaim seam the CI-P12 reaper drives.
+    pub lease_expires: Option<i64>,
+}
+
+impl QueuedJob {
+    /// A fresh, unclaimed queued job (no lease). The full scheduler enqueues these (CI-P11); the
+    /// runner-side test seeds them directly.
+    pub fn new(
+        tenant: TenantId,
+        region: Region,
+        run_id: impl Into<String>,
+        job_id: impl Into<String>,
+        labels: Vec<String>,
+        spec: JobSpec,
+    ) -> Self {
+        Self {
+            tenant,
+            region,
+            run_id: run_id.into(),
+            job_id: job_id.into(),
+            labels,
+            spec,
+            lease_owner: None,
+            lease_expires: None,
+        }
+    }
+}
+
+/// **The in-memory `job_queue` lease store — the runner-side `FOR UPDATE SKIP LOCKED` + heartbeat
+/// primitive (arch 02 §2.1), REUSED not reinvented.** A cloneable handle over the shared queue (an
+/// `Arc<Mutex<…>>`), modelling EXACTLY the lease columns + skip-locked claim that
+/// `myelin_flow::engine::RunStore::lease_runnable` models for the workflow dispatcher (the proven
+/// platform primitive). The runner side is three moves: [`claim_for_labels`](Self::claim_for_labels)
+/// → [`heartbeat`](Self::heartbeat) → [`settle`](Self::settle). The REAPER (sweep expired → re-queue)
+/// is CI-P12.
+///
+/// **Live binding:** the real apply is the frozen `job_queue` `FOR UPDATE SKIP LOCKED` claim +
+/// `UPDATE … SET lease_expires = now() + ttl` heartbeat in `tests/integration_runner_lease.rs` (the
+/// skip-locked IS the no-double-claim safety, never an application-level check) — the dev↔prod config
+/// swap, never a code change.
+#[derive(Clone, Default)]
+pub struct JobLeaseStore {
+    inner: Arc<Mutex<HashMap<(String, String), QueuedJob>>>,
+}
+
+impl JobLeaseStore {
+    /// A fresh, empty job-queue lease store.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<(String, String), QueuedJob>> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn key(j: &QueuedJob) -> (String, String) {
+        (j.tenant.0.clone(), j.job_id.clone())
+    }
+
+    /// Enqueue a job (the full scheduler's role, CI-P11; here the test/runner seeds it).
+    pub fn enqueue(&self, job: QueuedJob) {
+        self.lock().insert(Self::key(&job), job);
+    }
+
+    /// Read a job row by `(tenant, job_id)`.
+    pub fn get(&self, tenant: &TenantId, job_id: &str) -> Option<QueuedJob> {
+        self.lock()
+            .get(&(tenant.0.clone(), job_id.to_string()))
+            .cloned()
+    }
+
+    /// **Claim ONE eligible job for `worker` with `runner_labels` in `region` (the `FOR UPDATE SKIP
+    /// LOCKED` claim, arch 02 §2.1).** Returns the first job that is (a) in `region` (residency, no
+    /// global pool, 12.4), (b) **label-eligible** — `job.labels ⊆ runner_labels` (affinity), (c)
+    /// **trust-eligible** — `job.trust_tier ∈ allowed_tiers` (an untrusted job never reaches a
+    /// runner that does not admit its tier), AND (d) whose lease is FREE (unleased OR EXPIRED at
+    /// `now`), stamping `lease_owner = worker` + `lease_expires = now + lease_ttl_secs`. A job
+    /// another worker holds a LIVE lease on is SKIPPED (no two runners run the same job — the
+    /// skip-locked safety). Returns `None` if no eligible job awaits a lease.
+    ///
+    /// **The expiry re-claim is the reclaim seam (arch 02 §2.1):** a runner that DIED holds a lease
+    /// that EXPIRES; once expired, this hands the job to another runner. The ACTIVE reaper that
+    /// re-queues a dead runner's job (so its `SCHEDULE_AND_RUN_JOB` activity retries) is CI-P12; here
+    /// the claim simply admits an expired-lease job, so an expired lease IS reclaimable.
+    pub fn claim_for_labels(
+        &self,
+        worker: &str,
+        runner_labels: &[String],
+        allowed_tiers: &[crate::TrustTier],
+        region: &Region,
+        now: i64,
+        lease_ttl_secs: i64,
+    ) -> Option<QueuedJob> {
+        let mut q = self.lock();
+        // Deterministic scan order (by job_id) so the claim is stable across runners — models the
+        // `ORDER BY` of the claim query (arch 02 §2.1); the full fairness/lane order is CI-P11.
+        let mut keys: Vec<_> = q.keys().cloned().collect();
+        keys.sort();
+        for k in keys {
+            let job = q.get_mut(&k).expect("key from the same map");
+            // RESIDENCY (12.4): in-region only — no global pool.
+            if &job.region != region {
+                continue;
+            }
+            // AFFINITY: job labels ⊆ runner labels (job.labels <@ $runner_labels).
+            if !job.labels.iter().all(|l| runner_labels.contains(l)) {
+                continue;
+            }
+            // TRUST: the runner must admit the job's trust tier (an untrusted_fork job never reaches
+            // a runner that does not admit it; the self-hosted scope is CI-P4).
+            if !allowed_tiers.contains(&job.spec.trust_tier) {
+                continue;
+            }
+            let lease_free = match job.lease_expires {
+                None => true,
+                Some(exp) => exp <= now, // EXPIRED — the dead runner's lease lapsed (reclaim seam).
+            };
+            if lease_free {
+                job.lease_owner = Some(worker.to_string());
+                job.lease_expires = Some(now + lease_ttl_secs);
+                return Some(job.clone());
+            }
+            // else: a LIVE lease another runner holds — SKIP it (skip-locked; no double-run).
+        }
+        None
+    }
+
+    /// **Heartbeat-renew the lease `worker` holds on `job_id` (arch 02 §2.1).** Extends
+    /// `lease_expires` to `now + lease_ttl_secs` so a long-running job's lease does not lapse mid-run
+    /// (the reaper would otherwise reclaim it). Returns `true` if the renew applied — `false` if the
+    /// job is gone OR the caller is NOT the current lease owner (a runner can only heartbeat its OWN
+    /// lease; a runner whose lease already lapsed and was reclaimed by another worker CANNOT renew it,
+    /// which is exactly the lost-lease detection the runner needs to stop launching). This is the
+    /// `UPDATE job_queue SET lease_expires = $now + $ttl WHERE job_id = $j AND lease_owner = $worker`.
+    pub fn heartbeat(
+        &self,
+        worker: &str,
+        tenant: &TenantId,
+        job_id: &str,
+        now: i64,
+        lease_ttl_secs: i64,
+    ) -> bool {
+        let mut q = self.lock();
+        match q.get_mut(&(tenant.0.clone(), job_id.to_string())) {
+            Some(job) if job.lease_owner.as_deref() == Some(worker) => {
+                job.lease_expires = Some(now + lease_ttl_secs);
+                true
+            }
+            // not the owner (or reclaimed by another worker, or gone) — the renew is refused.
+            _ => false,
+        }
+    }
+
+    /// **Settle a claimed job — remove it from the queue on terminal (the lease is released by
+    /// deleting the row).** The runner calls this AFTER the terminal report is delivered; the engine
+    /// signal idempotency (not this delete) is what makes the wake exactly-once, so a re-delivered
+    /// report on a settled job is still a harmless engine no-op. A no-op if the job is absent.
+    pub fn settle(&self, tenant: &TenantId, job_id: &str) {
+        self.lock().remove(&(tenant.0.clone(), job_id.to_string()));
+    }
+
+    /// The number of CLAIMABLE jobs for `runner_labels` in `region` at `now` (the queue-depth signal
+    /// the autoscaler reads, arch 02 §5.4 — and the runner long-poll's "is there work" check). A job
+    /// is claimable if it is in-region, label-eligible, and its lease is free (unleased or expired).
+    pub fn claimable_depth(&self, runner_labels: &[String], region: &Region, now: i64) -> usize {
+        self.lock()
+            .values()
+            .filter(|j| {
+                &j.region == region
+                    && j.labels.iter().all(|l| runner_labels.contains(l))
+                    && j.lease_expires.map(|e| e <= now).unwrap_or(true)
+            })
+            .count()
+    }
+}
+
+// =================================================================================================
+// The firehose STUB seam — the full log pipeline is CI-P20 (named floor).
+// =================================================================================================
+
+/// **The firehose frame sink the runner streams to (STUBBED — the full pipeline is CI-P20).** The
+/// runner ships each redacted log line as a firehose frame keyed by `(run, job, step)` (arch 02
+/// §7.1); the live tail rides the resume-cursor protocol and sealed segments flush to the T3 log
+/// tier with the `(job, step, byte-range)` index — ALL of that is **CI-P20**. Here the sink only
+/// COUNTS frames so the runner's "I streamed N frames, here is the `ci.log.available` pointer" path
+/// is exercised end to end; the production sink (the firehose transport) is wired at CI-P20.
+pub trait FirehoseSink {
+    /// Ship one firehose frame for `(run_id, job_id)`. The STUB counts; CI-P20 publishes.
+    fn ship_frame(&self, run_id: &str, job_id: &str, frame: &[u8]);
+}
+
+/// A counting [`FirehoseSink`] stub — the CI-P20 floor. Counts frames shipped so a test can assert
+/// the runner streamed; the real firehose transport replaces it at CI-P20 with NO runner change.
+#[derive(Clone, Default)]
+pub struct CountingFirehose {
+    count: Arc<Mutex<u64>>,
+}
+
+impl CountingFirehose {
+    /// A fresh counting firehose stub.
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// The number of frames shipped (the CI-P20 floor's observable).
+    pub fn frames_shipped(&self) -> u64 {
+        *self.count.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl FirehoseSink for CountingFirehose {
+    fn ship_frame(&self, _run_id: &str, _job_id: &str, _frame: &[u8]) {
+        *self.count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+    }
+}
+
+// =================================================================================================
+// The exactly-once `job.done` terminal report — RECONCILED with the engine signal path (no fork).
+// =================================================================================================
+
+/// **A job's terminal outcome (the `job.done` payload, arch 03 §1.1 / §2).** References-not-payloads:
+/// `result_refs` are `ArtifactRef`s (the `ci.log.available` pointer + artifact refs), never log bytes
+/// or a PII body. `passed` is the pass/fail the parked workflow's DAG proceeds on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalReport {
+    /// Whether the job passed (the DAG-walk decision the workflow resumes on).
+    pub passed: bool,
+    /// The job's result refs (references-not-payloads, §3.4): the `ci.log.available` pointer the
+    /// CI-P20 pipeline publishes + any artifact refs. NEVER log bytes.
+    pub result_refs: Vec<ArtifactRef>,
+}
+
+/// **The terminal-report sink — the runner ECHOES `job.done` through it (the ONE signal path).** A
+/// thin seam so the runner depends on an abstraction, with the production impl
+/// ([`EngineTerminalReporter`]) routing onto the ENGINE's [`DurableExecutor::signal`] — there is NO
+/// second signal mechanism. The runner delivers `signal_name = JOB_DONE_SIGNAL`, `idem_key =
+/// idem_token`; the engine's `INSERT … ON CONFLICT DO NOTHING` makes a double-delivery wake once.
+pub trait TerminalReporter {
+    /// Report `job.done` for `run`, ECHOING `idem_token` (the workflow-minted dispatch token) as the
+    /// `idem_key`. Returns whether THIS delivery was the FIRST ([`SignalOutcome::Buffered`]) or a
+    /// DUPLICATE ([`SignalOutcome::Duplicate`]) — both `Ok` (a redelivery is the idempotency working,
+    /// not an error). [`ExecutorError`] surfaces a delivery to a phantom run (never silently dropped).
+    fn report_done(
+        &self,
+        run: &RunId,
+        idem_token: &str,
+        report: &TerminalReport,
+    ) -> Result<SignalOutcome, ExecutorError>;
+}
+
+/// **The production terminal reporter — `job.done` onto the ENGINE's [`DurableExecutor::signal`]
+/// (recon §OQ-F, contracts 9.2/9.4).** Wraps any [`DurableExecutor`] (the real
+/// [`myelin_flow::FlowExecutor`]); `report_done` builds the [`SignalSpec`] with the FROZEN
+/// `JOB_DONE_SIGNAL` name and `idem_key = idem_token` and delivers it. The exactly-once wake is the
+/// engine's `wf_signal` PK / ON CONFLICT DO NOTHING — the runner reuses it, never a fork.
+pub struct EngineTerminalReporter<E: DurableExecutor> {
+    executor: E,
+}
+
+impl<E: DurableExecutor> EngineTerminalReporter<E> {
+    /// Build a reporter over the durable executor the parked workflow runs on (the SAME executor that
+    /// buffers + consumes the `job.done` signal — one signal path).
+    pub fn new(executor: E) -> Self {
+        Self { executor }
+    }
+}
+
+impl<E: DurableExecutor> TerminalReporter for EngineTerminalReporter<E> {
+    fn report_done(
+        &self,
+        run: &RunId,
+        idem_token: &str,
+        report: &TerminalReport,
+    ) -> Result<SignalOutcome, ExecutorError> {
+        // The ONE signal path: deliver `job.done` keyed (run, JOB_DONE_SIGNAL, idem_token) — the
+        // engine's INSERT … ON CONFLICT (tenant, run_id, signal_name, idem_key) DO NOTHING IS the
+        // exactly-once wake. The runner can deliver this TWICE (at-least-once); the engine buffers
+        // ONCE; the workflow wakes ONCE. The payload is references-not-payloads (the result refs);
+        // `passed` rides as a leading marker ref so the resumed body reads the DAG decision without
+        // a PII body (the full structured result is the CI-P20 pointer the refs name).
+        let mut payload = Vec::with_capacity(report.result_refs.len() + 1);
+        payload.push(ArtifactRef(format!(
+            "myelin://job-done/passed-{}",
+            report.passed
+        )));
+        payload.extend(report.result_refs.iter().cloned());
+        self.executor.signal(SignalSpec {
+            run: run.clone(),
+            signal_name: JOB_DONE_SIGNAL.to_string(),
+            idem_key: idem_token.to_string(),
+            payload,
+            payload_key_ref: None,
+        })
+    }
+}
+
+// =================================================================================================
+// The runner agent — claim → launch → heartbeat → terminal report.
+// =================================================================================================
+
+/// **The runner agent's view of a completed claim-to-terminal cycle.** Records what happened so a
+/// caller (and a test) sees the claim landed, the sandbox launched + was torn down, the firehose
+/// streamed, and the terminal report's idempotency outcome.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunOutcome {
+    /// The job that was claimed + run.
+    pub job_id: String,
+    /// The run the `job.done` was reported to.
+    pub run_id: String,
+    /// The terminal report delivered.
+    pub report: TerminalReport,
+    /// Whether the terminal report's `job.done` delivery was the FIRST wake (`Buffered`) or a
+    /// DUPLICATE (`Duplicate`) — a re-report wakes the workflow ONCE (the engine dedup).
+    pub signal_outcome: SignalOutcome,
+}
+
+/// An error a runner cycle can surface — loud, never swallowed (EI-02 §4). A backend launch failure
+/// and a phantom-run terminal report are both observable.
+#[derive(Debug)]
+pub enum RunnerError {
+    /// No claimable job for the runner's labels in its region (the long-poll found no work).
+    NoWork,
+    /// The sandbox backend failed to launch the job (fail-closed — the four-guarantee hooks refused,
+    /// or the boot failed). Carries a self-describing message.
+    LaunchFailed(String),
+    /// The lease was LOST mid-run (a heartbeat was refused — another worker reclaimed it after this
+    /// runner stalled). The runner MUST NOT report terminal for a job it no longer holds (the reaper,
+    /// CI-P12, re-queued it; a fresh runner owns it now).
+    LeaseLost {
+        /// the job whose lease lapsed.
+        job_id: String,
+    },
+    /// The terminal report failed (a `job.done` to a phantom run — surfaced, never dropped).
+    ReportFailed(ExecutorError),
+}
+
+impl std::fmt::Display for RunnerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RunnerError::NoWork => write!(f, "no claimable job for the runner's labels/region"),
+            RunnerError::LaunchFailed(m) => write!(f, "sandbox launch failed (fail-closed): {m}"),
+            RunnerError::LeaseLost { job_id } => write!(
+                f,
+                "lease LOST mid-run for job {job_id} — another worker reclaimed it (the reaper \
+                 re-queued it; this runner must not report terminal)"
+            ),
+            RunnerError::ReportFailed(e) => write!(f, "terminal job.done report failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for RunnerError {}
+
+/// **The runner agent (the small attested Rust binary's core, arch 00 §4).** Holds its identity
+/// (`worker_id`), its labels + admitted trust tiers + region (the claim predicates), the lease TTL,
+/// and the seams it drives: the [`JobLeaseStore`] (claim/heartbeat/settle), the [`SandboxBackend`]
+/// (launch/kill — CI-P1/CI-P2, NOT reimplemented), the [`FirehoseSink`] (frame streaming — CI-P20
+/// stub), and the [`TerminalReporter`] (the `job.done` echo onto the engine — the one signal path).
+///
+/// **Same binary hosted + self-hosted.** The self-hosted attestation gate + the tenant-scoped token
+/// mint is CI-P4 (→ P-240); here the runner CONSUMES the minted token off `JobSpec.run_token` (4.7).
+pub struct RunnerAgent<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter> {
+    /// the runner's worker id (the lease owner + the heartbeat principal).
+    worker_id: String,
+    /// the runner's labels — a job is claimable iff its labels ⊆ these (affinity).
+    labels: Vec<String>,
+    /// the trust tiers this runner admits — an untrusted job never reaches a runner that does not
+    /// admit its tier (the self-hosted scope is CI-P4).
+    allowed_tiers: Vec<crate::TrustTier>,
+    /// the runner's region — it claims ONLY in-region jobs (12.4; no global pool).
+    region: Region,
+    /// the lease TTL seconds — `claim` sets `lease_expires = now + ttl`; `heartbeat` renews it.
+    lease_ttl_secs: i64,
+    /// the job-queue lease store (the FOR UPDATE SKIP LOCKED + heartbeat primitive, arch 02 §2.1).
+    leases: JobLeaseStore,
+    /// the unified sandbox backend (CI-P1/CI-P2) — `launch`/`kill`; the runner does NOT reimplement
+    /// the sandbox.
+    backend: &'a B,
+    /// the firehose frame sink (CI-P20 stub).
+    firehose: &'a F,
+    /// the terminal reporter (the `job.done` echo onto the engine — the one signal path).
+    reporter: &'a T,
+    /// the four-guarantee hooks passed to every launch (X-6; arch 02 §5.2).
+    hooks: RunnerHooks,
+}
+
+#[allow(clippy::too_many_arguments)]
+impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter> RunnerAgent<'a, B, F, T> {
+    /// Build a runner agent. `hooks` are the four-guarantee wiring seam (reserve/settle 11.7,
+    /// attribute 4.7, isolation-floor) every launch drives (X-6).
+    pub fn new(
+        worker_id: impl Into<String>,
+        labels: Vec<String>,
+        allowed_tiers: Vec<crate::TrustTier>,
+        region: Region,
+        lease_ttl_secs: i64,
+        leases: JobLeaseStore,
+        backend: &'a B,
+        firehose: &'a F,
+        reporter: &'a T,
+        hooks: RunnerHooks,
+    ) -> Self {
+        Self {
+            worker_id: worker_id.into(),
+            labels,
+            allowed_tiers,
+            region,
+            lease_ttl_secs,
+            leases,
+            backend,
+            firehose,
+            reporter,
+            hooks,
+        }
+    }
+
+    /// The runner's worker id (the lease owner).
+    pub fn worker_id(&self) -> &str {
+        &self.worker_id
+    }
+
+    /// **Claim → launch → heartbeat → terminal report — one runner cycle (arch 00 §4 / §2.1).**
+    ///
+    /// 1. **Claim** a job for the runner's labels in its region via the `FOR UPDATE SKIP LOCKED`
+    ///    handshake ([`JobLeaseStore::claim_for_labels`]) — `Err(NoWork)` if the long-poll finds
+    ///    none.
+    /// 2. **Heartbeat** to confirm the lease is still held BEFORE launching (a runner that stalled
+    ///    between claim and launch must not run a job another worker reclaimed). A refused heartbeat
+    ///    is `Err(LeaseLost)` — the reaper (CI-P12) re-queued it.
+    /// 3. **Launch** the sandbox via [`SandboxBackend::launch`] (CI-P1/CI-P2), driving the
+    ///    four-guarantee hooks; stream `frames` firehose frames (CI-P20 stub); **kill** the guest on
+    ///    teardown (one-job-per-sandbox, ephemeral). A launch failure is `Err(LaunchFailed)`
+    ///    fail-closed (no terminal report — the dispatch activity retries the job, §OQ-F).
+    /// 4. **Report terminal** `job.done` ECHOING the spec's `idem_token` through the engine signal
+    ///    path (the exactly-once wake), then **settle** the lease. The [`RunOutcome`] carries the
+    ///    delivery's idempotency outcome.
+    ///
+    /// `now` is the runner's clock (epoch seconds); `frames` is how many firehose frames the job
+    /// produced (the CI-P20 stub's observable — a real job streams as it runs). `report` is the
+    /// job's terminal outcome the runner assembles from the guest's exit (a real runner derives
+    /// pass/fail + the `ci.log.available` pointer; the test supplies it).
+    pub fn run_one(
+        &self,
+        now: i64,
+        frames: u64,
+        report: TerminalReport,
+    ) -> Result<RunOutcome, RunnerError> {
+        // ── Step 1: CLAIM (the FOR UPDATE SKIP LOCKED handshake). Region + label + trust eligible,
+        // lease-free (unleased or expired). A live lease another runner holds is skipped.
+        let job = self
+            .leases
+            .claim_for_labels(
+                &self.worker_id,
+                &self.labels,
+                &self.allowed_tiers,
+                &self.region,
+                now,
+                self.lease_ttl_secs,
+            )
+            .ok_or(RunnerError::NoWork)?;
+
+        // ── Step 2: HEARTBEAT-confirm the lease is still ours before launching untrusted code. A
+        // refused renew means we lost the lease (another worker reclaimed it) — STOP, never run a
+        // job we no longer hold (the reaper re-queued it; CI-P12).
+        let held = self.leases.heartbeat(
+            &self.worker_id,
+            &job.tenant,
+            &job.job_id,
+            now,
+            self.lease_ttl_secs,
+        );
+        if !held {
+            return Err(RunnerError::LeaseLost {
+                job_id: job.job_id.clone(),
+            });
+        }
+
+        // ── Step 3: LAUNCH the sandbox via the unified backend (CI-P1/CI-P2). The four-guarantee
+        // hooks fire inside launch (reserve/attribute/isolation-floor → settle); a refusal fails the
+        // launch CLOSED — no terminal report, the dispatch activity retries (§OQ-F). The runner does
+        // NOT reimplement the sandbox; it drives the seam.
+        let handle: SandboxHandle = self
+            .backend
+            .launch(&job.spec, &self.hooks)
+            .map_err(|e| RunnerError::LaunchFailed(e.to_string()))?;
+
+        // Stream firehose frames (CI-P20 STUB): a real job streams each redacted log line as it runs;
+        // here we ship `frames` frames so the runner's stream → `ci.log.available` pointer path is
+        // exercised. Re-heartbeat once mid-stream (a long job renews its lease so it does not lapse).
+        for _ in 0..frames {
+            self.firehose
+                .ship_frame(&job.run_id, &job.job_id, b"<redacted log frame (CI-P20 stub)>");
+        }
+        self.leases.heartbeat(
+            &self.worker_id,
+            &job.tenant,
+            &job.job_id,
+            now,
+            self.lease_ttl_secs,
+        );
+
+        // Whole-guest kill on teardown (one-job-per-sandbox, ephemeral, never reused — arch 02 §5.3).
+        self.backend
+            .kill(&handle)
+            .map_err(|e| RunnerError::LaunchFailed(e.to_string()))?;
+
+        // ── Step 4: REPORT TERMINAL `job.done` ECHOING the spec's idem_token through the ENGINE
+        // signal path (the exactly-once wake). The runner can deliver this twice (at-least-once); the
+        // engine buffers once; the workflow wakes once. NO second signal path.
+        let run = RunId(job.run_id.clone());
+        let outcome = self
+            .reporter
+            .report_done(&run, &job.spec.idem_token.0, &report)
+            .map_err(RunnerError::ReportFailed)?;
+
+        // Settle the lease (remove the claimed row). The engine signal idempotency — not this delete
+        // — is what makes the wake exactly-once, so a re-delivered report is still a harmless no-op.
+        self.leases.settle(&job.tenant, &job.job_id);
+
+        Ok(RunOutcome {
+            job_id: job.job_id,
+            run_id: job.run_id,
+            report,
+            signal_outcome: outcome,
+        })
+    }
+
+    /// **Report the SAME terminal `job.done` AGAIN (the at-least-once re-delivery, §OQ-F).** A runner
+    /// can deliver "done" twice (a retry after an ack it never saw). This re-echoes the SAME
+    /// `idem_token`; the engine's ON CONFLICT DO NOTHING makes it a [`SignalOutcome::Duplicate`] — the
+    /// workflow wakes ONCE. Used to PROVE double-effect = 0 (the gate). Takes the run + idem_token +
+    /// report directly (the job row is already settled after `run_one`).
+    pub fn report_done_again(
+        &self,
+        run_id: &str,
+        idem_token: &str,
+        report: &TerminalReport,
+    ) -> Result<SignalOutcome, RunnerError> {
+        let run = RunId(run_id.to_string());
+        self.reporter
+            .report_done(&run, idem_token, report)
+            .map_err(RunnerError::ReportFailed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        EgressPolicy, HookError, IdemToken, ImageRef, JobKind, MeterTarget, ReserveHandle,
+        ResourceLimits, ResourceUsage, RunTokenRef, TrustTier, WorkspaceSpec,
+    };
+    use myelin_events::MonotonicMinter;
+    use myelin_flow::{job_idem_token, FlowExecutor, StartSpec};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn tenant() -> TenantId {
+        TenantId("acme".into())
+    }
+    fn region() -> Region {
+        Region("fr-par".into())
+    }
+
+    fn pinned() -> ImageRef {
+        ImageRef::pinned("registry.example/runner@sha256:0123456789abcdef").unwrap()
+    }
+    fn limits() -> ResourceLimits {
+        ResourceLimits {
+            cpu_millis: 1000,
+            mem_bytes: 256 << 20,
+            disk_bytes: 1 << 30,
+            pids_max: 128,
+            timeout_secs: 600,
+        }
+    }
+
+    fn ci_spec(idem: &str) -> JobSpec {
+        JobSpec::new(
+            JobKind::Ci,
+            pinned(),
+            vec!["cargo".into(), "test".into()],
+            vec![],
+            vec![],
+            EgressPolicy::deny_all(),
+            limits(),
+            WorkspaceSpec::default(),
+            TrustTier::Trusted,
+            RunTokenRef { jti: "jti-1".into() },
+            MeterTarget {
+                reserve_id: "res-1".into(),
+            },
+            IdemToken(idem.into()),
+        )
+        .unwrap()
+    }
+
+    fn test_hooks() -> RunnerHooks {
+        RunnerHooks {
+            reserve: Box::new(|m| Ok(ReserveHandle(format!("reserved:{}", m.reserve_id)))),
+            settle: Box::new(|_h, _u| Ok(())),
+            attribute: Box::new(|_t| Ok(())),
+            isolation_floor: Box::new(|_s| Ok(())),
+        }
+    }
+
+    /// A recording sandbox backend — proves the runner DRIVES the seam (launch + kill), counts
+    /// launches/kills, and runs the four-guarantee hooks exactly as a real backend must. NO host-exec
+    /// path (no `process::Command`) — the launch trait is the only execution seam (the no-host-exec
+    /// lint admits this, 1.6).
+    #[derive(Default)]
+    struct RecordingBackend {
+        launches: AtomicUsize,
+        kills: AtomicUsize,
+        fail_launch: bool,
+    }
+    impl SandboxBackend for RecordingBackend {
+        type Error = HookError;
+        fn launch(
+            &self,
+            spec: &JobSpec,
+            hooks: &RunnerHooks,
+        ) -> Result<SandboxHandle, Self::Error> {
+            if self.fail_launch {
+                return Err(HookError("backend refused".into()));
+            }
+            // Drive the four-guarantee seam exactly as a real backend must (X-6).
+            (hooks.isolation_floor)(spec)?;
+            (hooks.attribute)(&spec.run_token)?;
+            let res = (hooks.reserve)(&spec.meter_to)?;
+            (hooks.settle)(
+                &res,
+                ResourceUsage {
+                    cpu_seconds: 1,
+                    mem_byte_seconds: 1,
+                },
+            )?;
+            self.launches.fetch_add(1, Ordering::SeqCst);
+            Ok(SandboxHandle {
+                guest_id: format!("guest-{}", spec.idem_token.0),
+            })
+        }
+        fn kill(&self, _h: &SandboxHandle) -> Result<(), Self::Error> {
+            self.kills.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// Build a FlowExecutor with one registered `ci.pipeline` definition + a started run, returning
+    /// (executor, run_id). The runner reports `job.done` onto THIS executor — the one signal path.
+    fn started_run() -> (FlowExecutor, RunId) {
+        let ex = FlowExecutor::new(Arc::new(MonotonicMinter::new()), tenant(), region());
+        ex.register_definition("ci.pipeline");
+        let run = ex
+            .start(StartSpec {
+                wf_type: "ci.pipeline".into(),
+                input: vec![],
+                budget: None,
+                idem_key: "ci:run-1".into(),
+            })
+            .expect("start the ci.pipeline run");
+        (ex, run)
+    }
+
+    // ───────────────────────────── the lease/heartbeat handshake ─────────────────────────────────
+
+    /// **A claimed lease is renewed by heartbeat; an expired lease is reclaimable (the GATE, arch 02
+    /// §2.1).** worker-1 claims a job (lease_expires = now + ttl); a heartbeat RENEWS it; a SECOND
+    /// worker cannot claim it while the lease is LIVE (skip-locked); once the lease EXPIRES, worker-2
+    /// reclaims it (the reaper seam, CI-P12).
+    #[test]
+    fn lease_claim_heartbeat_renew_and_expiry_reclaim() {
+        let q = JobLeaseStore::new();
+        q.enqueue(QueuedJob::new(
+            tenant(),
+            region(),
+            "run-1",
+            "job-1",
+            vec!["linux".into()],
+            ci_spec("idem-1"),
+        ));
+        let tiers = [TrustTier::Trusted];
+
+        // worker-1 claims at t=1000 with a 30s TTL → lease_expires = 1030.
+        let claimed = q
+            .claim_for_labels("worker-1", &["linux".into()], &tiers, &region(), 1000, 30)
+            .expect("worker-1 claims the eligible job");
+        assert_eq!(claimed.job_id, "job-1");
+        assert_eq!(q.get(&tenant(), "job-1").unwrap().lease_expires, Some(1030));
+
+        // a heartbeat at t=1020 RENEWS the lease → lease_expires = 1050 (the job did not lapse).
+        assert!(q.heartbeat("worker-1", &tenant(), "job-1", 1020, 30));
+        assert_eq!(q.get(&tenant(), "job-1").unwrap().lease_expires, Some(1050));
+
+        // worker-2 CANNOT claim it while the lease is LIVE (skip-locked — no double-run).
+        assert!(
+            q.claim_for_labels("worker-2", &["linux".into()], &tiers, &region(), 1040, 30)
+                .is_none(),
+            "a live lease is skipped — no two runners run the same job"
+        );
+
+        // worker-2's heartbeat on a lease it does NOT own is REFUSED (only the owner renews).
+        assert!(
+            !q.heartbeat("worker-2", &tenant(), "job-1", 1040, 30),
+            "a non-owner cannot heartbeat the lease"
+        );
+
+        // once the lease EXPIRES (t > 1050), worker-2 RECLAIMS it (the reaper seam, CI-P12).
+        let reclaimed = q
+            .claim_for_labels("worker-2", &["linux".into()], &tiers, &region(), 1100, 30)
+            .expect("worker-2 reclaims the EXPIRED lease");
+        assert_eq!(reclaimed.job_id, "job-1");
+        assert_eq!(reclaimed.lease_owner.as_deref(), Some("worker-2"));
+        assert_eq!(q.get(&tenant(), "job-1").unwrap().lease_expires, Some(1130));
+    }
+
+    /// **The claim is residency/affinity/trust eligible (arch 02 §2.1 / 12.4).** A job out-of-region,
+    /// or with labels the runner lacks, or a trust tier the runner does not admit, is NOT claimed.
+    #[test]
+    fn claim_respects_region_affinity_and_trust() {
+        let q = JobLeaseStore::new();
+        // out-of-region job — never claimed by an fr-par runner (no global pool, 12.4).
+        q.enqueue(QueuedJob::new(
+            tenant(),
+            Region("de-fra".into()),
+            "run-x",
+            "job-region",
+            vec!["linux".into()],
+            ci_spec("i1"),
+        ));
+        // a job needing a label the runner lacks (affinity).
+        q.enqueue(QueuedJob::new(
+            tenant(),
+            region(),
+            "run-y",
+            "job-label",
+            vec!["gpu".into()],
+            ci_spec("i2"),
+        ));
+        // an untrusted_fork job — a runner admitting only Trusted does not claim it.
+        let mut fork_spec = ci_spec("i3");
+        fork_spec.trust_tier = TrustTier::UntrustedFork;
+        q.enqueue(QueuedJob::new(
+            tenant(),
+            region(),
+            "run-z",
+            "job-trust",
+            vec!["linux".into()],
+            fork_spec,
+        ));
+
+        let none = q.claim_for_labels(
+            "worker-1",
+            &["linux".into()],
+            &[TrustTier::Trusted],
+            &region(),
+            1000,
+            30,
+        );
+        assert!(
+            none.is_none(),
+            "no eligible job: out-of-region / wrong-label / untrusted are all skipped"
+        );
+
+        // a runner that admits the fork tier AND has gpu CAN claim the gpu+fork job.
+        q.enqueue(QueuedJob::new(
+            tenant(),
+            region(),
+            "run-ok",
+            "job-ok",
+            vec!["linux".into()],
+            ci_spec("i4"),
+        ));
+        let ok = q
+            .claim_for_labels(
+                "worker-2",
+                &["linux".into(), "gpu".into()],
+                &[TrustTier::Trusted, TrustTier::UntrustedFork],
+                &region(),
+                1000,
+                30,
+            )
+            .expect("an eligible job is claimable");
+        // job-label (gpu/Trusted) sorts before job-ok and job-trust; the broad runner claims the
+        // first eligible by deterministic order.
+        assert!(["job-label", "job-ok", "job-trust"].contains(&ok.job_id.as_str()));
+    }
+
+    // ───────────────────── the runner agent: claim → launch → terminal report ────────────────────
+
+    /// **The runner agent runs a job end-to-end: claim → launch (four guarantees) → kill → terminal
+    /// `job.done` (arch 00 §4).** One claim, one launch, one whole-guest kill, frames streamed, and a
+    /// FIRST `job.done` delivery (Buffered) that wakes the parked workflow.
+    #[test]
+    fn runner_agent_claims_launches_and_reports_terminal() {
+        let (ex, run) = started_run();
+        let idem = job_idem_token(&run.0, "ci.pipeline:0");
+        let q = JobLeaseStore::new();
+        q.enqueue(QueuedJob::new(
+            tenant(),
+            region(),
+            &run.0,
+            "job-1",
+            vec!["linux".into()],
+            ci_spec(&idem),
+        ));
+
+        let backend = RecordingBackend::default();
+        let firehose = CountingFirehose::new();
+        let reporter = EngineTerminalReporter::new(ex.clone());
+        let agent = RunnerAgent::new(
+            "worker-1",
+            vec!["linux".into()],
+            vec![TrustTier::Trusted],
+            region(),
+            30,
+            q.clone(),
+            &backend,
+            &firehose,
+            &reporter,
+            test_hooks(),
+        );
+
+        let report = TerminalReport {
+            passed: true,
+            result_refs: vec![ArtifactRef("myelin://acme/ci/run/run-1/log".into())],
+        };
+        let outcome = agent
+            .run_one(1000, 5, report.clone())
+            .expect("the runner runs the job and reports terminal");
+
+        assert_eq!(outcome.job_id, "job-1");
+        assert_eq!(outcome.run_id, run.0);
+        assert_eq!(outcome.report, report);
+        assert_eq!(
+            outcome.signal_outcome,
+            SignalOutcome::Buffered,
+            "the FIRST job.done delivery wakes the parked workflow"
+        );
+        // exactly one launch + one whole-guest kill (one-job-per-sandbox, ephemeral).
+        assert_eq!(backend.launches.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.kills.load(Ordering::SeqCst), 1);
+        // the firehose streamed 5 frames (the CI-P20 stub observable).
+        assert_eq!(firehose.frames_shipped(), 5);
+        // the lease was settled (the claimed row removed).
+        assert!(q.get(&tenant(), "job-1").is_none(), "the lease is settled on terminal");
+        // the engine buffered EXACTLY ONE job.done for the run.
+        assert_eq!(ex.signals().count_for_run(&tenant(), &run.0), 1);
+    }
+
+    /// **GATE — a runner that delivers `job.done` TWICE wakes the parked workflow EXACTLY ONCE
+    /// (idempotent on `idem_token`; double-effect = 0).** The runner runs the job (first `job.done` =
+    /// Buffered), then RE-delivers the SAME terminal report (at-least-once) — the engine's ON CONFLICT
+    /// DO NOTHING makes it a Duplicate; the buffered count stays ONE. The exactly-once terminal report
+    /// is the engine's signal idempotency, REUSED — no second signal path, no fork.
+    #[test]
+    fn double_delivered_job_done_wakes_the_workflow_exactly_once() {
+        let (ex, run) = started_run();
+        let idem = job_idem_token(&run.0, "ci.pipeline:0");
+        let q = JobLeaseStore::new();
+        q.enqueue(QueuedJob::new(
+            tenant(),
+            region(),
+            &run.0,
+            "job-1",
+            vec!["linux".into()],
+            ci_spec(&idem),
+        ));
+
+        let backend = RecordingBackend::default();
+        let firehose = CountingFirehose::new();
+        let reporter = EngineTerminalReporter::new(ex.clone());
+        let agent = RunnerAgent::new(
+            "worker-1",
+            vec!["linux".into()],
+            vec![TrustTier::Trusted],
+            region(),
+            30,
+            q.clone(),
+            &backend,
+            &firehose,
+            &reporter,
+            test_hooks(),
+        );
+
+        let report = TerminalReport {
+            passed: true,
+            result_refs: vec![ArtifactRef("myelin://acme/ci/run/run-1/log".into())],
+        };
+        // first cycle: the FIRST job.done is Buffered (the workflow wakes).
+        let first = agent.run_one(1000, 3, report.clone()).expect("first cycle");
+        assert_eq!(first.signal_outcome, SignalOutcome::Buffered);
+
+        // the runner RE-delivers the SAME job.done (at-least-once) — keyed on the SAME idem_token.
+        let again = agent
+            .report_done_again(&run.0, &idem, &report)
+            .expect("re-delivery is the idempotency working, not an error");
+        assert_eq!(
+            again,
+            SignalOutcome::Duplicate,
+            "the SECOND job.done is a no-op (ON CONFLICT DO NOTHING — double-effect = 0)"
+        );
+
+        // EXACTLY ONE buffered job.done row — the workflow woke ONCE under at-least-once delivery.
+        assert_eq!(
+            ex.signals().count_for_run(&tenant(), &run.0),
+            1,
+            "double-effect = 0: a doubly-delivered job.done buffers ONCE (the workflow wakes once)"
+        );
+    }
+
+    /// **A launch refusal fails CLOSED — no terminal report (the dispatch activity retries, §OQ-F).**
+    /// The backend refuses the launch (a four-guarantee hook could equally refuse); the runner
+    /// surfaces `LaunchFailed` and NEVER reports `job.done` (the parked workflow is not falsely woken;
+    /// the reaper/retry re-runs it).
+    #[test]
+    fn a_launch_refusal_fails_closed_with_no_terminal_report() {
+        let (ex, run) = started_run();
+        let idem = job_idem_token(&run.0, "ci.pipeline:0");
+        let q = JobLeaseStore::new();
+        q.enqueue(QueuedJob::new(
+            tenant(),
+            region(),
+            &run.0,
+            "job-1",
+            vec!["linux".into()],
+            ci_spec(&idem),
+        ));
+
+        let backend = RecordingBackend {
+            fail_launch: true,
+            ..Default::default()
+        };
+        let firehose = CountingFirehose::new();
+        let reporter = EngineTerminalReporter::new(ex.clone());
+        let agent = RunnerAgent::new(
+            "worker-1",
+            vec!["linux".into()],
+            vec![TrustTier::Trusted],
+            region(),
+            30,
+            q.clone(),
+            &backend,
+            &firehose,
+            &reporter,
+            test_hooks(),
+        );
+
+        let err = agent
+            .run_one(
+                1000,
+                1,
+                TerminalReport {
+                    passed: true,
+                    result_refs: vec![],
+                },
+            )
+            .expect_err("a launch refusal fails closed");
+        assert!(matches!(err, RunnerError::LaunchFailed(_)));
+        // NO job.done was reported — the parked workflow is not falsely woken (§OQ-F retry).
+        assert_eq!(
+            ex.signals().count_for_run(&tenant(), &run.0),
+            0,
+            "a failed launch reports NO terminal — the dispatch activity retries (no false wake)"
+        );
+    }
+
+    /// **`NoWork` when no claimable job (the long-poll found nothing).** A runner whose labels/region
+    /// match no queued job surfaces `NoWork` (it does not launch or report).
+    #[test]
+    fn no_claimable_job_surfaces_no_work() {
+        let (ex, _run) = started_run();
+        let q = JobLeaseStore::new(); // empty queue.
+        let backend = RecordingBackend::default();
+        let firehose = CountingFirehose::new();
+        let reporter = EngineTerminalReporter::new(ex.clone());
+        let agent = RunnerAgent::new(
+            "worker-1",
+            vec!["linux".into()],
+            vec![TrustTier::Trusted],
+            region(),
+            30,
+            q,
+            &backend,
+            &firehose,
+            &reporter,
+            test_hooks(),
+        );
+        let err = agent
+            .run_one(
+                1000,
+                0,
+                TerminalReport {
+                    passed: true,
+                    result_refs: vec![],
+                },
+            )
+            .expect_err("an empty queue surfaces NoWork");
+        assert!(matches!(err, RunnerError::NoWork));
+        assert_eq!(backend.launches.load(Ordering::SeqCst), 0, "nothing launched on NoWork");
+    }
+
+    /// **The claimable-depth signal counts in-region label-eligible free leases (the long-poll / the
+    /// autoscaler queue-depth source, arch 02 §5.4).** A live-leased job does not count; an expired
+    /// one does.
+    #[test]
+    fn claimable_depth_counts_free_eligible_leases() {
+        let q = JobLeaseStore::new();
+        q.enqueue(QueuedJob::new(tenant(), region(), "r", "j1", vec!["linux".into()], ci_spec("a")));
+        q.enqueue(QueuedJob::new(tenant(), region(), "r", "j2", vec!["linux".into()], ci_spec("b")));
+        assert_eq!(q.claimable_depth(&["linux".into()], &region(), 1000), 2);
+
+        // claim one → claimable depth drops to 1 (the live lease no longer counts).
+        q.claim_for_labels("w1", &["linux".into()], &[TrustTier::Trusted], &region(), 1000, 30);
+        assert_eq!(q.claimable_depth(&["linux".into()], &region(), 1010), 1);
+        // once that lease expires it counts again (reclaimable).
+        assert_eq!(q.claimable_depth(&["linux".into()], &region(), 2000), 2);
+    }
+
+    /// **The terminal report is references-not-payloads + echoes the idem_token (§3.4 / §OQ-F).** The
+    /// buffered `job.done` payload carries the `passed` marker + the result `ArtifactRef`s, NEVER log
+    /// bytes; it is keyed on the spec's `idem_token` (the runner echoes it).
+    #[test]
+    fn terminal_report_is_references_not_payloads_keyed_on_idem_token() {
+        let (ex, run) = started_run();
+        let idem = job_idem_token(&run.0, "ci.pipeline:0");
+        let q = JobLeaseStore::new();
+        q.enqueue(QueuedJob::new(
+            tenant(),
+            region(),
+            &run.0,
+            "job-1",
+            vec!["linux".into()],
+            ci_spec(&idem),
+        ));
+        let backend = RecordingBackend::default();
+        let firehose = CountingFirehose::new();
+        let reporter = EngineTerminalReporter::new(ex.clone());
+        let agent = RunnerAgent::new(
+            "worker-1",
+            vec!["linux".into()],
+            vec![TrustTier::Trusted],
+            region(),
+            30,
+            q,
+            &backend,
+            &firehose,
+            &reporter,
+            test_hooks(),
+        );
+        agent
+            .run_one(
+                1000,
+                1,
+                TerminalReport {
+                    passed: false,
+                    result_refs: vec![ArtifactRef("myelin://acme/ci/run/run-1#step-2".into())],
+                },
+            )
+            .expect("run");
+
+        // the buffered job.done is keyed on the idem_token the runner echoed.
+        let row = ex
+            .signals()
+            .get(&tenant(), &run.0, JOB_DONE_SIGNAL, &idem)
+            .expect("the job.done buffered under the echoed idem_token");
+        // references-not-payloads: the marker + the result ref, no log bytes / PII body.
+        assert_eq!(row.payload[0], ArtifactRef("myelin://job-done/passed-false".into()));
+        assert_eq!(row.payload[1], ArtifactRef("myelin://acme/ci/run/run-1#step-2".into()));
+        assert_eq!(row.payload_key_ref, None, "no inline PII payload");
+    }
+}
