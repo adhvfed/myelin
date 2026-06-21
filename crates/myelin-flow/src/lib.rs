@@ -138,9 +138,20 @@
 //!   (the application of the §4.4 activity model). NO new FLOW drill is owed in M3 (roadmap §2 M3 —
 //!   GIT-D9 is Git's gate); the gate artifact is the crash-mid-repack-resumes-with-no-side-effect +
 //!   the fan-out-replays-from-last-step drill `tests/drills_flow_maintenance.rs`. **NAMED FLOORS:** the
-//!   Git GC/repack/bundle-gen/history-rewrite CALL SITES are co-built in Git's M3 prompts (GIT-D9);
-//!   the cheap SLA re-arm under Issues/Trigger + the merge-queue holds-no-runtime re-green are
-//!   **P-FLOW-21**.
+//!   Git GC/repack/bundle-gen/history-rewrite CALL SITES are co-built in Git's M3 prompts (GIT-D9).
+//! - **The §6.6 cheap SLA-timer re-arm CONFIRMED under the Git/Issues + Trigger call sites + the
+//!   merge-queue holds-no-runtime re-green** (the M3 confirmation pass) → **LANDED at P-FLOW-21**
+//!   (P-266), see [`timer::sla`] ([`SlaTimerCall`]: the ONE documented call-site helper both the Issues
+//!   SLA-breach deadline ([`sla_timer_id`]) and the Event-Bus stateful Trigger's `stale_after`
+//!   ([`trigger_stale_timer_id`], contract 3.3) call — a re-arm at the call boundary is a SINGLE row
+//!   update ([`SlaTimerCall::re_arm`], the IDENTICAL path for both producers, no ad-hoc key, no second
+//!   code path), a disarm is one cheap row op ([`SlaTimerCall::disarm`])). NO new engine primitive (the
+//!   M3 confirmation that the P-FLOW-14 cheap row op is what the REAL call sites hit). NO new FLOW drill
+//!   is owed in M3 (roadmap §2 M3 — GIT-D9 is Git's gate); the gate artifacts are the
+//!   re-arm-is-row-update-at-the-call-boundary CDC pair `tests/cdc_9_3_disarm_rearm.rs` (now routed
+//!   through the helper, not ad-hoc keys) + the P-FLOW-19 merge-queue-in-isolation drill RE-GREEN
+//!   (holds-no-runtime across the wait, 0 double-merge) `tests/drills_flow_merge_queue.rs`. **NAMED
+//!   FLOOR:** the X-1 seam END-TO-END against CI's real `ci.result` producer is **P-FLOW-22** (M4).
 //! - **The §6.2 loop-safety enforcement** (the causal-depth ceiling + the shared-root tripwire + the
 //!   bounded activity pool — *an adversarial workflow→event→workflow loop is dropped/parked, NEVER
 //!   forked*) → **LANDED at P-FLOW-18** (P-214), see [`loopsafety`] ([`CausalGuard`]: `admit_child`
@@ -208,6 +219,7 @@ pub use engine::{
     drive, drive_full, drive_versioned, drive_with_timers, run_state, DriveOutcome, FlowDispatcher,
     FlowTelemetry, RunRow, RunStore, SignalRow, SignalStore, WorkflowBody,
 };
+pub use timer::sla::{sla_timer_id, trigger_stale_timer_id, SlaTimerCall};
 pub use timer::{
     epoch_minute, ArmOutcome, DisarmOutcome, FireOutcome, ReArmOutcome, TimerRow, TimerStore, TimerWheel,
     SECS_PER_MINUTE,
