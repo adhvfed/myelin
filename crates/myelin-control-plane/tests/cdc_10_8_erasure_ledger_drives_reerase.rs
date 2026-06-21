@@ -323,6 +323,7 @@ fn cdc_gdpr_erasure_ledger_drives_storage_post_restore_reerase() {
         refs: &seams,
         bus: &seams,
         ledger: &seams,
+        git_reach: None,
     };
     let rep = ReErasePass::new(&kms, region())
         .run(&report, &seam, &holders, 1_000)
@@ -443,6 +444,7 @@ fn stor_d3_id_d8_ga_face_restore_older_backup_re_erases_zero_resurrected() {
         refs: &seams,
         bus: &seams,
         ledger: &seams,
+        git_reach: None,
     };
     let rep = ReErasePass::new(&kms, region())
         .run(&report, &seam, &holders, 2_000)

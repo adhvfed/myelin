@@ -117,6 +117,7 @@ fn stor_d4_crypto_shred_erase_leaves_zero_recoverable_pii_in_backups() {
     let wiring = DrillWiring::default();
     let holders = EraseHolders {
         pseudonym: &wiring, search: &wiring, refs: &wiring, bus: &wiring, ledger: &wiring,
+        git_reach: None,
     };
     let receipt = eraser
         .erase(&erase_me, &tenant, &holders, 1_718_000_000_000)
@@ -196,6 +197,7 @@ fn stor_d4_re_erase_after_a_restore_style_replay_stays_zero_recoverable() {
     let wiring = DrillWiring::default();
     let holders = EraseHolders {
         pseudonym: &wiring, search: &wiring, refs: &wiring, bus: &wiring, ledger: &wiring,
+        git_reach: None,
     };
     eraser.erase(&subject, &tenant, &holders, 1).unwrap();
     // Re-erase (the resume / re-erasure path).

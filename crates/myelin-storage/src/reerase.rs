@@ -527,6 +527,7 @@ mod tests {
             refs: seams,
             bus: seams,
             ledger: seams,
+            git_reach: None,
         }
     }
 

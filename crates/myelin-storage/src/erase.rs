@@ -126,6 +126,27 @@ pub trait BusErase {
     fn erase_inline_pii(&self, subject: &SubjectId, tenant: &TenantId) -> Result<(), EraseError>;
 }
 
+/// **Step 2 EXTENSION seam — the git crypto-shred reach** (P-ST-24 / P-253; contract 11.2/11.4,
+/// storage.md §5.3). The per-subject DEK destroy (step 2, owned in-crate) shreds the subject's
+/// free-text/chat/profile/agent-memory; this seam extends the SAME crypto-shred step to reach git's
+/// structures — the **reflog / bitmap / pack-tier backups** sealed under the per-tenant blob DEK
+/// (`KeyClass::Blob`). Destroying that DEK renders those structures unrecoverable live AND in backups
+/// by construction (§7.5); the commit-object bytes are the pseudonymous-by-default residual (10.9, by
+/// reference — NOT byte-mutated). The DSR orchestrator wires `myelin-storage`'s
+/// [`crate::git_shred::GitCryptoShredReach`] behind this trait. It is OPTIONAL on
+/// [`EraseHolders`]: a subject who authored no git content needs no git reach (a `None` is a no-op
+/// success), and the per-subject free-text shred (step 2 proper) is unconditional either way.
+///
+/// **Verified, not assumed (§5.2):** the reach returns a loud [`EraseError::BlobShredReach`] only if
+/// its post-condition is NOT met (a backup still holds a recoverable git structure) — never a silent
+/// claim that the reach happened.
+pub trait BlobShredReach {
+    /// Reach the git reflog / bitmap / pack-tier-backup ciphertext for the subject's tenant by
+    /// destroying the per-tenant blob DEK + verifying 0 recoverable in backup. Idempotent (a second
+    /// reach is a no-op success). Loud [`EraseError::BlobShredReach`] if the post-condition fails.
+    fn shred_blob_tier(&self, subject: &SubjectId, tenant: &TenantId) -> Result<(), EraseError>;
+}
+
 /// **Step 6 seam — the erasure-ledger receipt sink** (10.8). The durable, PII-free,
 /// **non-shred-erasable** record of every completed erasure (it must survive the crypto-shred it
 /// records AND a restore, so post-restore re-erasure can replay it). The DSR orchestrator wires the
@@ -159,6 +180,12 @@ pub struct EraseHolders<'a> {
     pub bus: &'a dyn BusErase,
     /// Step 6 — the erasure-ledger receipt sink (10.8).
     pub ledger: &'a dyn ErasureLedgerSink,
+    /// Step 2 EXTENSION (OPTIONAL) — the git crypto-shred reach (P-ST-24 / P-253): reflog / bitmap /
+    /// pack-tier backups sealed under the per-tenant blob DEK. `None` when the subject authored no
+    /// git content (the per-subject free-text shred — step 2 proper — runs regardless). When wired,
+    /// it runs as part of the SAME crypto-shred step (after the per-subject DEK destroy), so a commit
+    /// author's erase reaches git's structures too.
+    pub git_reach: Option<&'a dyn BlobShredReach>,
 }
 
 // ───────────────────────────── the loud erase error ─────────────────────────────
@@ -177,6 +204,10 @@ pub enum EraseError {
     RefsTombstone(String),
     /// Step 5 (Bus erase) failed — an inline-PII event key could still be live.
     BusErase(String),
+    /// Step 2's git crypto-shred reach (P-ST-24) failed its post-condition — a reflog / bitmap /
+    /// pack-tier-backup git structure is still recoverable from a backup (the per-tenant blob DEK was
+    /// not excluded). The erase is INCOMPLETE: a backup could resurrect the git structure.
+    BlobShredReach(String),
 }
 
 impl fmt::Display for EraseError {
@@ -201,6 +232,12 @@ impl fmt::Display for EraseError {
                 f,
                 "erase step 5 (Bus erase) failed: {m} — erase ABORTED as INCOMPLETE (an inline-PII \
                  event key could still be live)"
+            ),
+            EraseError::BlobShredReach(m) => write!(
+                f,
+                "erase step 2 (git crypto-shred reach, P-ST-24) failed: {m} — erase ABORTED as \
+                 INCOMPLETE (a reflog/bitmap/pack-tier-backup git structure could still be \
+                 recoverable from a backup)"
             ),
         }
     }
@@ -309,6 +346,17 @@ impl<'a> CryptoShredErase<'a> {
         // algorithm treats as success (the post-condition "the key is destroyed" already holds).
         let subject_dek = DekId::new(tenant.clone(), KeyClass::Subject(subject.0.clone()));
         let dek_destroyed_now = self.engine.destroy_dek(&subject_dek);
+
+        // ── Step 2 EXTENSION (P-ST-24 / P-253): the git crypto-shred REACH. The SAME crypto-shred
+        // step reaches git's reflog/bitmap/pack-tier-backup ciphertext (sealed under the per-tenant
+        // blob DEK) when the subject authored git content — destroying that DEK + VERIFYING 0
+        // recoverable in backup (the reach is verified, not assumed, §5.2). The commit-object bytes
+        // are the pseudonymous-by-default residual (10.9, by reference — NOT byte-mutated). A subject
+        // with no git content has `git_reach = None` (a no-op). A failed post-condition is a LOUD
+        // EraseError::BlobShredReach (the erasure is not recorded). ──
+        if let Some(git_reach) = holders.git_reach {
+            git_reach.shred_blob_tier(subject, tenant)?;
+        }
 
         // ── Step 3: Search purge+reindex — the plaintext-derived EXCEPTION (purge, not key-destroy). ──
         holders.search.purge_and_reindex(subject, tenant)?;
@@ -486,6 +534,7 @@ mod tests {
         let bu = RecBus { log: &log };
         let holders = EraseHolders {
             pseudonym: &ps, search: &se, refs: &rf, bus: &bu, ledger: &ledger,
+            git_reach: None,
         };
         let receipt = eraser
             .erase(&subject, &tenant, &holders, 1_000)
@@ -543,6 +592,7 @@ mod tests {
         let bu = RecBus { log: &log };
         let holders = EraseHolders {
             pseudonym: &ps, search: &se, refs: &rf, bus: &bu, ledger: &ledger,
+            git_reach: None,
         };
         eraser.erase(&subject, &tenant, &holders, 5).unwrap();
 
@@ -571,6 +621,7 @@ mod tests {
         let bu = RecBus { log: &log };
         let holders = EraseHolders {
             pseudonym: &ps, search: &se, refs: &rf, bus: &bu, ledger: &ledger,
+            git_reach: None,
         };
 
         // First erase: destroys the DEK.
@@ -607,6 +658,7 @@ mod tests {
         let bu = RecBus { log: &log };
         let holders = EraseHolders {
             pseudonym: &ps, search: &se, refs: &rf, bus: &bu, ledger: &ledger,
+            git_reach: None,
         };
         let err = eraser
             .erase(&subject, &tenant, &holders, 1)
@@ -639,6 +691,7 @@ mod tests {
         let bu = RecBus { log: &log };
         let holders = EraseHolders {
             pseudonym: &ps, search: &se, refs: &rf, bus: &bu, ledger: &ledger,
+            git_reach: None,
         };
         let err = eraser
             .erase(&subject, &tenant, &holders, 1)
@@ -667,6 +720,7 @@ mod tests {
         let bu = RecBus { log: &log };
         let holders = EraseHolders {
             pseudonym: &ps, search: &se, refs: &rf, bus: &bu, ledger: &ledger,
+            git_reach: None,
         };
         let receipt = eraser.erase(&subject, &tenant, &holders, 140).unwrap();
         assert_eq!(receipt.subject, "u-lag");

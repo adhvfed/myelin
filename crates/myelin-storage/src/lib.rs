@@ -377,6 +377,7 @@ pub mod blob;
 // transport → M5 P-ST-31 (a backing swap by the trait's design, trigger GIT-D4); the within-EU CDN
 // clone/bundle class (C3) → sibling P-ST-23.
 pub mod gitpack;
+pub mod git_shred;
 pub mod encryption;
 // The T3 firehose-archive seam (P-ST-20 / P-147, M2, contract 11.8 sealing + per-tenant-DEK half):
 // the DURABLE archive of the firehose (storage.md §3.3). It RIDES the 3.5 resume-cursor transport
@@ -490,8 +491,11 @@ pub use firehose_archive::{
     SegmentBytes,
 };
 pub use erase::{
-    BusErase, CryptoShredErase, EpochMillis, EraseError, EraseHolders, ErasureLedgerSink,
-    ErasureReceipt, PseudonymShred, RefsTombstone, SearchPurge,
+    BlobShredReach, BusErase, CryptoShredErase, EpochMillis, EraseError, EraseHolders,
+    ErasureLedgerSink, ErasureReceipt, PseudonymShred, RefsTombstone, SearchPurge,
+};
+pub use git_shred::{
+    GitCryptoShredReach, GitResidual, GitShredReceipt, GitShreddable,
 };
 pub use gd4::{
     assert_gd4_table_complete, assert_no_local_residual_statement, granularity_of_key_class,

@@ -95,6 +95,7 @@ fn cdc_11_4_dsr_orchestrator_calls_erase_and_the_six_steps_run_in_order() {
     let wiring = OrchestratorWiring::default();
     let holders = EraseHolders {
         pseudonym: &wiring, search: &wiring, refs: &wiring, bus: &wiring, ledger: &wiring,
+        git_reach: None,
     };
     let receipt = eraser
         .erase(&subject, &tenant, &holders, 1_000)
@@ -122,6 +123,7 @@ fn cdc_11_4_erase_is_idempotent_for_the_orchestrator() {
     let wiring = OrchestratorWiring::default();
     let holders = EraseHolders {
         pseudonym: &wiring, search: &wiring, refs: &wiring, bus: &wiring, ledger: &wiring,
+        git_reach: None,
     };
 
     let r1 = eraser.erase(&subject, &tenant, &holders, 1).expect("first erase");

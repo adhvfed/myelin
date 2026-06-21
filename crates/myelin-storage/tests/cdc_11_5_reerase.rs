@@ -144,6 +144,7 @@ fn restore_driver_re_erases_a_post_pit_subject_to_zero_resurrected() {
         refs: &seams,
         bus: &seams,
         ledger: &seams,
+        git_reach: None,
     };
 
     let arch = reachable_archiver(300);
@@ -194,6 +195,7 @@ fn the_gate_run_with_reerase_greens_a_re_erased_restore() {
         refs: &seams,
         bus: &seams,
         ledger: &seams,
+        git_reach: None,
     };
     let before_backup = ErasureLedger::new();
     let arch = reachable_archiver(300);

@@ -1040,9 +1040,17 @@ status = "covered"
 # closing the blob.rs git-object floor, and STOR-D7 on packs (corrupt object detected + recovered
 # from replica, 0 silent serve). The object-backed pack/delta + smart-transport is the named M5
 # follow-on → P-ST-31 (P-442); the C3 CDN clone/bundle class is the sibling → P-ST-23 (P-254).
+# P-253 (P-ST-24): the GIT CRYPTO-SHRED REACH (rows 11.2/11.4 reach) — the per-tenant blob DEK
+# (KeyClass::Blob) shreds the reflog / bitmap / pack-tier-backup ciphertext that rides this pack tier,
+# live AND in backups by construction (§7.5); the commit-object bytes are the pseudonymous-by-default
+# residual (10.9, by reference — NOT byte-mutated; the on-demand audited history-rewrite is 10.6, the
+# named follow-on). GitCryptoShredReach IS the BlobShredReach seam the erase orchestrator's step-2
+# crypto-shred invokes; GIT-D2 (storage half) green. See also row 11.4. The C6 outbound push-mirror
+# residency gate seam is the sibling → P-ST-25 (P-255).
 cdc = [
     "crates/myelin-storage/tests/cdc_11_2_blobstore.rs",
     "crates/myelin-storage/tests/cdc_11_2_git_pack_tier.rs",
+    "crates/myelin-storage/tests/cdc_11_2_11_4_git_crypto_shred_reach.rs",
 ]
 
 [[contract]]
@@ -1074,11 +1082,23 @@ status = "covered"
 # recovery from the backup snapshot → 0 recoverable (the key is destroyed + excluded from backup,
 # §7.5). The CDC pair is the DSR orchestrator wiring the five seams + calling erase
 # (cdc_11_4_erase_algorithm.rs). The GD-4 granularity + structural-floor completeness is the sibling
-# P-ST-10 (global P-101); the git crypto-shred reach is P-ST-24 (P-253); the cross-holder reach
-# completeness is P-ST-35 (M5); the post-restore re-erasure (STOR-D3) is P-ST-14 (P-100).
+# P-ST-10 (global P-101); the cross-holder reach completeness is P-ST-35 (M5); the post-restore
+# re-erasure (STOR-D3) is P-ST-14 (P-100).
+# P-253 (P-ST-24): the GIT CRYPTO-SHRED REACH half — extends the step-2 crypto-shred to git's
+# structures. GitCryptoShredReach destroys the per-tenant blob DEK (KeyClass::Blob) the reflog /
+# bitmap / pack-tier-backup ciphertext seals under (unrecoverable live AND 0 recoverable in backup,
+# §7.5) and is wired as the OPTIONAL BlobShredReach seam on EraseHolders (a commit author's erase
+# reaches git's structures in the SAME crypto-shred step; a subject with no git content has
+# git_reach=None). The commit-object bytes are the pseudonymous-by-default residual (10.9, by
+# reference — NOT byte-mutated; on-demand audited history-rewrite = 10.6, the named follow-on). The
+# reach is verified-not-assumed (a failed 0-recoverable post-condition is a loud
+# EraseError::BlobShredReach, the erasure not recorded). GIT-D2 (storage half) green
+# (git_d2_git_crypto_shred_drill.rs). The CDC pair is the DSR orchestrator wiring the git reach into
+# erase for a commit author (cdc_11_2_11_4_git_crypto_shred_reach.rs).
 cdc = [
     "crates/myelin-storage/tests/cdc_11_4_classify_key_choice.rs",
     "crates/myelin-storage/tests/cdc_11_4_erase_algorithm.rs",
+    "crates/myelin-storage/tests/cdc_11_2_11_4_git_crypto_shred_reach.rs",
 ]
 
 [[contract]]
