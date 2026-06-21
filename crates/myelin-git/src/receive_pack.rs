@@ -1402,4 +1402,54 @@ mod tests {
         assert!(GIT_REF_MIGRATION.contains("pusher_pseudonym"));
         assert!(!GIT_REF_MIGRATION.contains("DROP TABLE"));
     }
+
+    /// **GIT-P11 closes the named floor end-to-end: `RefStore::receive` migrates the accepted
+    /// quarantine into the REAL local-NVMe pack tier (`PackObjectDb`, NOT the `InMemoryObjectDb`
+    /// floor), then a clone round-trips byte-identical.** The push commits one `git.ref.updated`
+    /// (emit-iff-committed) AND the pushed objects are durable + content-addressed in the pack tier,
+    /// servable as a byte-identical clone — the receive-pack → store → clone GATE through the
+    /// production migration the architecture §2 step 3 mandates.
+    #[test]
+    fn receive_pack_migrates_into_the_real_pack_tier_and_clone_round_trips() {
+        use crate::pack_tier::{PackObjectDb, PackTierMigration};
+        use myelin_storage::{
+            FsBlobStore, GitPackTier, RepoGitPlacement, RepoId, RepoPlacementStatus, StorageGroup,
+        };
+        use myelin_tenancy::{Region, TenantId};
+
+        // The real local-NVMe pack tier (fs floor), repo placed region-pinned + relocatable.
+        let tier = GitPackTier::new(TenantId("acme".into()), FsBlobStore::new());
+        let repo = RepoId::from_token("core");
+        tier.place_repo(
+            repo.clone(),
+            RepoGitPlacement {
+                group: StorageGroup::from_token("pack-0"),
+                region: Region::new("fr-par"),
+                status: RepoPlacementStatus::Active,
+            },
+        );
+        let object_db = PackObjectDb::new(tier, repo);
+        let migration = PackTierMigration::new(&object_db);
+
+        // A real push: the quarantine carries the pushed object bytes.
+        let (store, outbox) = store();
+        let pushed_oid = Oid::new("cafe");
+        let pushed_bytes = b"a normal commit blob".to_vec(); // matches `human_push`'s quarantine.
+        let push = human_push("refs/heads/feature", Oid::zero(), Oid::new("aaaa"));
+
+        // receive-pack → policy → REAL migration → one-tx ref-CAS + outbox.
+        let outcome = store.receive(&push, &migration, CrashPoint::None).unwrap();
+        assert!(matches!(outcome, PushOutcome::Accepted { .. }), "the push is accepted");
+        assert_eq!(outbox.outbox_depth(), 1, "one git.ref.updated committed (emit-iff-committed)");
+
+        // The pushed object is durable + content-addressed in the pack tier — a clone serves it back
+        // BYTE-IDENTICAL (0 corruption; the GIT-P11 round-trip GATE through the production migration).
+        let served = object_db.serve_clone(std::slice::from_ref(&pushed_oid)).expect("clone served");
+        assert_eq!(served.len(), 1);
+        assert_eq!(served[0].0, pushed_oid);
+        assert_eq!(
+            served[0].1, pushed_bytes,
+            "the clone round-trips byte-identical to the receive-pack input (0 corruption)"
+        );
+    }
 }

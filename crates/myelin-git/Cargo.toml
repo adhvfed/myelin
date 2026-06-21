@@ -86,6 +86,16 @@ hex.workspace = true
 # does NOT touch a DB/object-store/cache/bus contract, so the build stays DB-free.
 git2.workspace = true
 
+# The content-addressed object backing — the `BlobStore` trait + the local-disk git PACK TIER
+# (`GitPackTier<B: BlobStore>` + `RepoGitPlacement`, contract 11.2 / storage §3.5, shipped by P-252).
+# GIT-P11 (P-272, M3) lands the git-SIDE pack tier ON TOP of this storage seam: the quarantine→object
+# migration writes accepted objects THROUGH the trait, and the commit-graph/bitmap/MIDX maintenance
+# artifacts ride the same content-addressed backing. REUSED, never re-defined (EI-01 §7) — the git
+# side owns the acceleration structures + the clone round-trip; storage owns the byte addressing +
+# the region-pinned relocatable placement. `myelin-storage` is a shared glue crate that does NOT
+# depend back on `myelin-git` (the §2.9 DAG stays acyclic; the build stays DB-free — fs-floor only).
+myelin-storage = { path = "../myelin-storage" }
+
 # DEV-ONLY: the rich ReBAC namespace ENGINE (FragmentDef / Userset / StoreBackedCheck) lives in the
 # Identity SERVICE crate. The runtime Git fragment is the names-only `myelin_identity::Namespace-
 # Fragment` ABI carrier (above) — a producer LEAF never depends on a service crate (the §2.9 DAG
@@ -95,4 +105,3 @@ git2.workspace = true
 # engine, never re-define it.
 [dev-dependencies]
 myelin-identity-service = { path = "../myelin-identity-service" }
-myelin-storage = { path = "../myelin-storage" }

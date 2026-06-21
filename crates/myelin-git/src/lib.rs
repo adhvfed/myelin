@@ -105,6 +105,13 @@ pub mod events;
 pub mod gix_backend;
 pub mod holder_intent;
 pub mod notif_rules;
+/// The git **PACK TIER on the local-NVMe `BlobStore` floor** (GIT-P11 / P-272, M3-G1): the git-side
+/// object-DB migration THROUGH the [`myelin_storage::GitPackTier`] (closing the receive-pack
+/// `QuarantineMigration` floor), the commit-graph/reachability-bitmap/MIDX maintenance artifacts +
+/// their staleness fences (arch `01 §4.1` / `02 §8`), the byte-identical clone round-trip (the GATE),
+/// and the residency-pin lint (repos relocatable, never node-pinned — STOR-5). Floors GF-1 (object-
+/// backed packs) / GF-2 (cross-cell) / GF-2b (SHA-256 flip) / GF-4 (Mononoke-class) all → GIT-P33.
+pub mod pack_tier;
 pub mod rebac_fragment;
 /// The **receive-pack write path** (GIT-P9 / P-270, M3-G1): the in-process Rust policy +
 /// one-transaction ref-CAS + `git.ref.updated` outbox emit (the silent-data-loss floor, GIT-D9 —
