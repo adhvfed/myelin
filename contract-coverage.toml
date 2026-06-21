@@ -430,6 +430,13 @@ cdc = [
     "crates/myelin-identity-service/tests/cdc_4_9_git_fragment.rs",
     "crates/myelin-identity-service/tests/cdc_4_9_knowledge_fragment.rs",
     "crates/myelin-git/tests/cdc_4_9_git_fragment.rs",
+    # The CODEOWNERS-as-relations RESOLVER slice (GIT-P16 / P-277, M3-G3): Git owns the CODEOWNERS
+    # file PARSE + the path MATCHER (00-overview §1.1: "Git decides which glob a change matches"); the
+    # resolver compiles each path pattern to a `ref:<repo>::<glob>#code_owner@<owner>` reviewer-
+    # requirement tuple (the CONSUMER), byte-identical to the engine's `compile_codeowners` (the
+    # PROVIDER half), and the CDC PROVES the written tuples resolve through the real engine's
+    # `list_subjects(ref, code_owner)` Expand with 0 mis-resolved owners over a fixture CODEOWNERS.
+    "crates/myelin-git/tests/cdc_4_9_git_codeowners.rs",
     "crates/myelin-issues/tests/cdc_4_9_issues_fragment.rs",
     "crates/myelin-chat/tests/cdc_4_9_chat_fragment.rs",
 ]

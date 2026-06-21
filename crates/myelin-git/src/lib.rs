@@ -136,6 +136,20 @@ pub mod holder_intent;
 /// (bounded-stale coarse grant) instead of cascading, a just-revoked subject is still denied, and a
 /// zookie read bypasses the cache (4.10 read-your-writes).
 pub mod live_check;
+/// The **PR/review/inline-thread lifecycle + branch-protection rulesets + the CODEOWNERS resolver**
+/// (GIT-P16 / P-277, M3-G3 — the domain-entities half): the hosting-layer entities not in git itself
+/// (00-overview §1.1). [`lifecycle::PullRequest`] + [`lifecycle::PrState`] are the PR lifecycle state
+/// machine (0 illegal transitions); [`lifecycle::Review`] / [`lifecycle::Thread`] the review +
+/// inline-comment-THREAD entities; [`lifecycle::BranchProtectionRuleset`] +
+/// [`lifecycle::evaluate_ruleset`] the entity-layer branch-protection gate (0 unprotected merges to a
+/// protected ref); and [`lifecycle::CodeOwners`] the **4.9 CODEOWNERS-as-relations resolver** —
+/// compiling CODEOWNERS path patterns to `code_owner` relation tuples (0 mis-resolved owners), so "who
+/// must approve this path" is the ordinary `list_subjects(ref, code_owner)` Expand
+/// [`live_check::GitCheckGate::code_owners`] already runs. Floors: PR/review/thread BODIES are
+/// single-author CAS — the body content + the myelin-content round-trip is GIT-P17; the diff
+/// line-anchor 4-state resolver is GIT-P23/GIT-P24; the live OLTP store + per-ref ruleset persistence
+/// (+ the `write_tuples` CODEOWNERS tuple write) is GIT-P20/GIT-P22.
+pub mod lifecycle;
 pub mod notif_rules;
 /// The git **PACK TIER on the local-NVMe `BlobStore` floor** (GIT-P11 / P-272, M3-G1): the git-side
 /// object-DB migration THROUGH the [`myelin_storage::GitPackTier`] (closing the receive-pack
