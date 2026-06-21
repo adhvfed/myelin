@@ -896,6 +896,23 @@ title = "PersonalDataHolder (workflow history) + replay"
 status = "deferred"
 landing = "P-201"
 
+# P-FLOW-20 / P-265 (M3) — resumable maintenance activities + the history-rewrite invalidation
+# fan-out. NO new owned FLOW row + NO new FLOW drill is owed in M3 (roadmap §2 M3 Exit gate — GIT-D9
+# is Git's gate). This prompt ships the myelin-flow helper (crates/myelin-flow/src/maintenance.rs):
+# (a) WfCtx::run_maintenance / run_heavy_maintenance — Git's GC/repack/bundle-gen/history-rewrite run
+# as journaled activities (or SCHEDULE_AND_RUN_JOB long-parks for the heavy ones), so a crash
+# mid-repack replays to the un-journaled step (§4.1) with 0 re-executed side effect; (b)
+# WfCtx::run_history_rewrite_invalidation — the fan-out over the trust-scoped cache namespaces
+# (contract 11.2: Fork/Mirror/CloneBundle) as a journaled sequence replaying from the last journaled
+# step. CONSUMES contract 10.6 (history-rewrite audited op — GDPR/Audit-owned, `covered` above) +
+# 11.2 (trust-scoped cache namespaces — Storage-owned, `covered` below). The application of the
+# existing activity model (§4.4) — NO new engine primitive. The Git GC/repack/bundle-gen/
+# history-rewrite CALL SITES are co-built in Git's M3 prompts (GIT-D9 is Git's gate). The cheap SLA
+# re-arm confirmation under Issues/Trigger + the merge-queue holds-no-runtime re-green are P-FLOW-21.
+# Green artifact: crates/myelin-flow/tests/drills_flow_maintenance.rs — crash-mid-repack-resumes-with-
+# no-side-effect + the fan-out-replays-from-last-step (the FLOW-D1 property reused on a maintenance
+# workflow), registered into the M0 permanent suite.
+
 # ──────────────── §10 GDPR / Audit / PersonalDataHolder (myelin-gdpr) ───────────────────────────
 
 # 10.1 — the SIGNATURE was frozen at P-GA-01 (`myelin-gdpr`); the BODIES + the GDPR-owned holder
