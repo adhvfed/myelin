@@ -344,6 +344,7 @@ pub mod erasure_posture;
 pub mod git_producer;
 pub mod holder;
 pub mod invalidator;
+pub mod kn_producer;
 pub mod ladder;
 pub mod loop_guard;
 pub mod migration;
@@ -391,6 +392,10 @@ pub use git_producer::{
 pub use invalidator::{
     InvalidateError, InvalidationCall, NoOpCacheShim, ProjectionCache, RefsProjectionInvalidator,
     INVALIDATOR_CONSUMER, INVALIDATOR_SUBJECTS, INVALIDATOR_SUBJECT_PREFIXES,
+};
+pub use kn_producer::{
+    kn_replay_scope, mirror_page_parent, project_page_parent, reconverge_page_tree, KnAnchorState,
+    KnEdgeProducer, KnOwner, KnReplayGrain, PageParentEvent, KN_OWNER_TOKEN,
 };
 pub use ladder::{
     ladder_root, resolve_line_range, resolve_sub_outcome, LineRangeState, MintedLineRange,
