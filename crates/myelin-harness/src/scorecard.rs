@@ -104,6 +104,18 @@ pub enum Band {
     /// with their floor NAMED — their containerized smokes are not the full gate, only the
     /// not-zero-coverage proof under Docker.
     Infra,
+    /// The **M2 reactive-shared-layer exit gate** (M2 → M3) — the consolidated go/no-go over the
+    /// reactive layer: the bus/reactive dispatch engine (BUS-D1/D3/D6/D5/D8), the Reference Graph
+    /// (REF-CDC), Search (SRCH-D1/D2/D3/D4/D7, the zero-leak keystone), Notifications
+    /// (NOTIF-D1..D11 + snooze), the Agent Fabric M2-B deterministic-correctness family
+    /// (AG-D1/2/3/5/7/8/11) INCLUDING the **AG-D4 real-kernel escape gate** (proven on real
+    /// silicon: a real Firecracker microVM boots, runs the adversarial corpus, 0 escapes), and the
+    /// Durable Workflow engine (FLOW-D1/D3/D4/D5/D6/D7 + merge-queue). It WIRES (does not
+    /// re-implement) each per-feature drill and re-affirms the contract-coverage scanner. A single
+    /// RED row blocks M3 (the master band gate invariant, master-sequencing §2 / EI-01 §2). The one
+    /// genuine remaining floor — the world-scale 30x LOAD drill (real fleet hardware) — is a named,
+    /// dated M5 deferral, not a row that reds this gate.
+    M2Reactive,
 }
 
 impl fmt::Display for Band {
@@ -112,6 +124,7 @@ impl fmt::Display for Band {
             Band::M0 => write!(f, "M0"),
             Band::M1Identity => write!(f, "M1→M2 (Identity)"),
             Band::Infra => write!(f, "Infra (integration)"),
+            Band::M2Reactive => write!(f, "M2 (reactive shared layer)"),
         }
     }
 }
@@ -126,6 +139,7 @@ impl Band {
             Band::M0 => required_rows(),
             Band::M1Identity => id_m1_required_rows(),
             Band::Infra => infra_required_rows(),
+            Band::M2Reactive => m2_required_rows(),
         }
     }
 }
@@ -550,6 +564,247 @@ pub fn infra_required_rows() -> Vec<GateRow> {
     ]
 }
 
+/// The FROZEN required-row set for the **M2 reactive-shared-layer exit gate** (M2 → M3). This is
+/// the build-layer realisation of the master band gate invariant (master-sequencing §2/§4,
+/// EI-01 §2): the reactive layer (M2) is *correct* before M3 is started. It WIRES the per-feature
+/// M2 drills (it does not re-implement them — each `proof_command` is the real `cargo test` target
+/// that already lives with its feature prompt, P-126..P-245) across the six M2 families:
+///
+/// - **Bus / reactive dispatch engine:** BUS-D1 (dispatch reconnect), BUS-D3 (dispatch replay),
+///   BUS-D6 (dispatch loop guards), BUS-D5 (reindex), BUS-D8 (crypto-shred).
+/// - **Reference Graph:** REF-CDC (the ArtifactRef provider/consumer contract, CDC 5.1).
+/// - **Search:** SRCH-D1 (the zero-leak keystone), SRCH-D2 (no stale grant), SRCH-D3
+///   (cross-tenant), SRCH-D4 (erasure), SRCH-D7 (freshness).
+/// - **Notifications:** NOTIF-D1/D2/D3/D4/D7/D8/D9/D10/D11 + NOTIF-snooze (snooze resurface).
+/// - **Agent Fabric (M2-B deterministic-correctness family):** AG-D1/2/3 (the plan-then-apply
+///   schema→cap→delegation→tenant→budget→HITL→apply→meter pipeline, CDC 8.2), AG-D5 (per-effect
+///   HITL exactly-once — batch + loop), AG-D7 (loop guards), AG-D8 (per-run identity/skeleton,
+///   CDC 8.5), AG-D11 (runaway self-limiter); plus the **AG-D4 keystone** — the REAL-kernel
+///   escape gate, `permanent`, run `--features integration` and **proven-on-real-hardware** (a real
+///   Firecracker microVM boots, the adversarial corpus runs, 0 escapes attested). Its three named
+///   residuals are printed by [`Scorecard::render_markdown`].
+/// - **Durable Workflow:** FLOW-D1 (replay), FLOW-D3 (timer wheel), FLOW-D4 (multiday HITL +
+///   per-effect), FLOW-D5 (co-commit), FLOW-D6 (reserve/settle), FLOW-D7 (loop safety),
+///   FLOW-mergeq (merge queue).
+/// - **contract-coverage:** the scanner re-affirm (no falsely-claimed / silently-dropped row).
+///
+/// AG-D4 is the only `permanent` row (the re-run-forever real-kernel escape gate, EI-01 §2:
+/// RCE/sandbox-escape outranks every feature). The one genuine remaining floor — the world-scale
+/// 30× LOAD drill (real fleet hardware) — is a named, dated M5 deferral in `render_markdown`, NOT a
+/// row here (it would red the gate; M2 is *correct*, M5 is *load-hardened*).
+pub fn m2_required_rows() -> Vec<GateRow> {
+    fn row(id: &'static str, title: &'static str, cmd: &'static [&'static str]) -> GateRow {
+        GateRow { id, title, proof_command: cmd, permanent: false, floor: None }
+    }
+    vec![
+        // ---- Bus / reactive dispatch engine ----
+        row(
+            "BUS-D1",
+            "dispatch reconnect → 0 lost across a broker drop on the reactive dispatch path",
+            &["test", "-p", "myelin-query", "--test", "drills_bus_d1_dispatch_reconnect"],
+        ),
+        row(
+            "BUS-D3",
+            "dispatch replay → at-least-once redelivery is idempotent (no double-fire)",
+            &["test", "-p", "myelin-query", "--test", "drills_bus_d3_dispatch_replay"],
+        ),
+        row(
+            "BUS-D6",
+            "dispatch loop guards → reactive automation cycle halts at the depth ceiling",
+            &["test", "-p", "myelin-query", "--test", "drills_bus_d6_dispatch_loop_guards"],
+        ),
+        row(
+            "BUS-D5",
+            "reindex → a re-index pass is replay-safe; no stale/dup projection rows",
+            &["test", "-p", "myelin-events", "--test", "drills_bus_d5_reindex"],
+        ),
+        row(
+            "BUS-D8",
+            "crypto-shred → erased-key payload is unrecoverable across the bus replay path",
+            &["test", "-p", "myelin-events", "--test", "drills_bus_d8_crypto_shred"],
+        ),
+        // ---- Reference Graph ----
+        row(
+            "REF-CDC",
+            "ArtifactRef provider mints canonical URN / consumer parses + rejects display projections (CDC 5.1)",
+            &["test", "-p", "myelin-refs", "--test", "cdc_5_1_artifactref"],
+        ),
+        // ---- Search ----
+        row(
+            "SRCH-D1",
+            "zero-leak keystone → a confidential doc never appears in any unauthorized search result set",
+            &["test", "-p", "myelin-search", "--test", "drill_srch_d1_zero_escape_leak"],
+        ),
+        row(
+            "SRCH-D2",
+            "no stale grant → revoke then re-query → the just-revoked doc is gone (watermark honoured)",
+            &["test", "-p", "myelin-search", "--test", "drill_srch_d2_no_stale_grant"],
+        ),
+        row(
+            "SRCH-D3",
+            "cross-tenant → a path-spoofed query reads 0 cross-tenant documents",
+            &["test", "-p", "myelin-search", "--test", "drill_srch_d3_cross_tenant"],
+        ),
+        row(
+            "SRCH-D4",
+            "erasure → an erased doc is purged from the index; re-query returns 0 hits",
+            &["test", "-p", "myelin-search", "--test", "drill_srch_d4_erasure"],
+        ),
+        row(
+            "SRCH-D7",
+            "freshness → a just-indexed doc is visible within the freshness bound (no lost write)",
+            &["test", "-p", "myelin-search", "--test", "drill_srch_d7_freshness"],
+        ),
+        // ---- Notifications ----
+        row(
+            "NOTIF-D1",
+            "notif drill D1 — mention fan-out delivers exactly the addressed recipients",
+            &["test", "-p", "myelin-notif", "--test", "drill_notif_d1"],
+        ),
+        row(
+            "NOTIF-D2",
+            "notif drill D2 — read-state fan-out / dedup is consistent across surfaces",
+            &["test", "-p", "myelin-notif", "--test", "drill_notif_d2"],
+        ),
+        row(
+            "NOTIF-D3",
+            "notif drill D3 — preference gating: a muted channel delivers 0",
+            &["test", "-p", "myelin-notif", "--test", "drill_notif_d3"],
+        ),
+        row(
+            "NOTIF-D4",
+            "notif drill D4 — escalation honours the ladder without double-paging",
+            &["test", "-p", "myelin-notif", "--test", "drill_notif_d4"],
+        ),
+        row(
+            "NOTIF-D7",
+            "notif drill D7 — cross-tenant: a notification never leaks across the tenant boundary",
+            &["test", "-p", "myelin-notif", "--test", "drill_notif_d7"],
+        ),
+        row(
+            "NOTIF-D8",
+            "notif drill D8 — erasure: an erased subject's notifications are structurally purged",
+            &["test", "-p", "myelin-notif", "--test", "drill_notif_d8"],
+        ),
+        row(
+            "NOTIF-D9",
+            "notif drill D9 — holder replay: redelivery after a crash is idempotent",
+            &["test", "-p", "myelin-notif", "--test", "drill_notif_d9"],
+        ),
+        row(
+            "NOTIF-D10",
+            "notif drill D10 — delivery survives a consumer reconnect with 0 lost",
+            &["test", "-p", "myelin-notif", "--test", "drill_notif_d10"],
+        ),
+        row(
+            "NOTIF-D11",
+            "notif drill D11 — inbox watch / list consistency under concurrent reads",
+            &["test", "-p", "myelin-notif", "--test", "drill_notif_d11"],
+        ),
+        row(
+            "NOTIF-snooze",
+            "notif snooze → a snoozed notification resurfaces exactly once at the wake time",
+            &["test", "-p", "myelin-notif", "--test", "drill_notif_snooze_resurface"],
+        ),
+        // ---- Agent Fabric (M2-B deterministic-correctness family) ----
+        row(
+            "AG-D1/2/3",
+            "plan-then-apply pipeline: schema→cap→delegation→tenant→budget→HITL→apply→meter (CDC 8.2)",
+            &["test", "-p", "myelin-agent-service", "--test", "cdc_8_2_apply_pipeline"],
+        ),
+        row(
+            "AG-D5-batch",
+            "per-effect HITL exactly-once (batch) — each effect gated by its own approval (CDC 8.2)",
+            &["test", "-p", "myelin-agent-service", "--test", "cdc_8_2_hitl_batch"],
+        ),
+        row(
+            "AG-D5-loop",
+            "per-effect HITL exactly-once (loop) — re-entry never double-applies an approved effect (CDC 8.2)",
+            &["test", "-p", "myelin-agent-service", "--test", "cdc_8_2_hitl_loop"],
+        ),
+        row(
+            "AG-D7",
+            "agent loop guards → a self-invoking agent halts at the depth ceiling / shared-root tripwire",
+            &["test", "-p", "myelin-agent-service", "--test", "drills_ag_d7_loop_guards"],
+        ),
+        row(
+            "AG-D8",
+            "per-run identity/skeleton → each run drives the chained substrate path under its own run token (CDC 8.5)",
+            &["test", "-p", "myelin-agent-service", "--test", "cdc_8_5_skeleton_loop"],
+        ),
+        row(
+            "AG-D11",
+            "runaway self-limiter → a reserve/settle runaway agent is rate-limited and halts",
+            &["test", "-p", "myelin-agent-service", "--test", "drills_ag_d11_runaway_self_limiter"],
+        ),
+        // ---- Agent Fabric AG-D4: THE KEYSTONE, proven-on-real-hardware (permanent) ----
+        GateRow {
+            id: "AG-D4",
+            title: "REAL-kernel escape gate → a real Firecracker microVM boots, runs the adversarial corpus, 0 escapes (proven-on-real-hardware)",
+            proof_command: &[
+                "test",
+                "-p",
+                "myelin-ci-sandbox",
+                "--features",
+                "integration",
+                "--test",
+                "escape_drill_test",
+            ],
+            permanent: true,
+            floor: None,
+        },
+        // ---- Durable Workflow ----
+        row(
+            "FLOW-D1",
+            "durable replay → a workflow re-driven from its log lands on the same deterministic state",
+            &["test", "-p", "myelin-flow", "--test", "drills_flow_d1_replay"],
+        ),
+        row(
+            "FLOW-D3",
+            "timer wheel → a durable timer fires exactly once at its deadline across a restart",
+            &["test", "-p", "myelin-flow", "--test", "drills_flow_d3_timer_wheel"],
+        ),
+        row(
+            "FLOW-D4-hitl",
+            "multiday HITL → a workflow parked on human approval resumes correctly days later",
+            &["test", "-p", "myelin-flow", "--test", "drills_flow_d4_multiday_hitl"],
+        ),
+        row(
+            "FLOW-D4-per-effect",
+            "per-effect durability → each effect is committed exactly once across replay",
+            &["test", "-p", "myelin-flow", "--test", "drills_flow_d4_per_effect"],
+        ),
+        row(
+            "FLOW-D5",
+            "co-commit → state + emitted effect commit in the same transaction (emit-iff-committed)",
+            &["test", "-p", "myelin-flow", "--test", "drills_flow_d5_cocommit"],
+        ),
+        row(
+            "FLOW-D6",
+            "reserve/settle → a reserved budget settles exactly once; a crash leaves no double-charge",
+            &["test", "-p", "myelin-flow", "--test", "drills_flow_d6_reserve_settle"],
+        ),
+        row(
+            "FLOW-D7",
+            "loop safety → a self-scheduling workflow halts at the loop-safety ceiling",
+            &["test", "-p", "myelin-flow", "--test", "drills_flow_d7_loop_safety"],
+        ),
+        row(
+            "FLOW-mergeq",
+            "merge queue → serialized merge-queue admission commits in order without a lost update",
+            &["test", "-p", "myelin-flow", "--test", "drills_flow_merge_queue"],
+        ),
+        // ---- contract-coverage re-affirm ----
+        GateRow {
+            id: "contract-coverage",
+            title: "the contract-coverage scanner re-affirms the M2 CDC rows — no falsely-claimed/dropped row",
+            proof_command: &["run", "-p", "myelin-lints", "--bin", "contract-coverage"],
+            permanent: false,
+            floor: None,
+        },
+    ]
+}
+
 /// The verdict of one recorded scorecard row. A `Pass` is only constructible WITH a non-empty
 /// proof line (the dated green artifact the proof command emitted) — a green must be earned, it
 /// cannot be flipped from nothing (the ratchet's "no green without proof" half).
@@ -691,6 +946,12 @@ impl Scorecard {
                 "STOR-D-OUTBOX/RESTORE/RLS + ID-D-REBAC (--features integration) + 2 floor smokes",
                 "the next band",
             ),
+            Band::M2Reactive => (
+                "BUS-D1/D3/D6/D5/D8 + REF-CDC + SRCH-D1/D2/D3/D4/D7 + NOTIF-D1..D11+snooze + \
+                 AG-D1/2/3/5/7/8/11 + AG-D4 (real-kernel escape, proven-on-real-hardware) + \
+                 FLOW-D1/D3/D4/D5/D6/D7+mergeq + contract-coverage",
+                "M3",
+            ),
         };
         let mut out = String::new();
         out.push_str(&format!(
@@ -777,6 +1038,47 @@ impl Scorecard {
                      (gVisor / microVM) and the WORLD-SCALE 30× LOAD drill (real hardware) stay RED \
                      until run on the real substrate — the deferral is visible, never invisible \
                      (EI-01 §1).\n",
+                );
+            }
+            Band::M2Reactive => {
+                out.push_str(
+                    "**AG-D4 is PROVEN-ON-REAL-HARDWARE, NOT vacuous.** The escape gate runs \
+                     `--features integration` with `MYELIN_REQUIRE_KVM=1` set by the scorecard \
+                     runner: on a host without /dev/kvm or firecracker the drill HARD-FAILS (it does \
+                     not skip), so this row only goes green when a real Firecracker microVM actually \
+                     boots, runs the 11-attack adversarial corpus, and attests 0 escapes (a dated \
+                     `target/ag-d4-attestation/<date>.json`). It is marked re-run-forever (EI-01 §2: \
+                     RCE/sandbox-escape outranks every feature).\n\n",
+                );
+                out.push_str("**AG-D4 — three NAMED residuals (proven-on-real-hardware is not absence-of-all-escapes):**\n");
+                out.push_str(
+                    "- (a) **one green run proves THIS config against THIS battery on THIS kernel** — \
+                     continuous fuzzing + full CVE-corpus tracking + a pre-GA third-party pentest \
+                     remain ongoing; a single green is necessary, not sufficient-forever.\n",
+                );
+                out.push_str(
+                    "- (b) **production must run on KVM-capable Scaleway hardware** (Elastic Metal / \
+                     nested-virt) — an explicit infra requirement; on a non-KVM box this gate cannot \
+                     be greened (the row hard-fails, never fakes green).\n",
+                );
+                out.push_str(
+                    "- (c) **single-box ≠ fleet** — multi-tenant density / blast-radius at scale \
+                     still overlaps the unproven 30× world-scale LOAD floor below.\n\n",
+                );
+                out.push_str(
+                    "**The ONE true remaining floor (named, dated deferral — NOT a row that reds this gate):** \
+                     the **world-scale 30× LOAD drill** needs real fleet hardware (a multi-node \
+                     cluster), so it is deferred to **M5** (the FLOW-D8 / AG-D6 / NOTIF surge \
+                     prompts). It is the only genuine remaining floor — everything else in M2 is \
+                     proven with a dated artifact above. The deferral is visible, never invisible \
+                     (EI-01 §1).\n\n",
+                );
+                out.push_str(
+                    "**Named residual (not a floor, run-when-available):** gVisor (`runsc`) as a \
+                     SECOND escape-drill backend (CI-P28) — runsc is on PATH but running the corpus \
+                     under it needs an OCI bundle + root/userns privileges this host lacks; the \
+                     AG-D4 attestation records it as a NAMED parametrized residual, never faked \
+                     green. Firecracker (the production default) IS the exercised gate backend.\n",
                 );
             }
         }
@@ -1095,5 +1397,122 @@ mod tests {
         }
         assert!(!card.is_green(), "an unproven integration drill blocks the infra gate");
         assert_eq!(card.not_proven().len(), 1);
+    }
+
+    // ---- M2 reactive-shared-layer exit gate (M2 → M3) ----
+
+    /// The M2 required row set covers every M2 family: the bus/reactive engine, the Reference
+    /// Graph, Search, Notifications, the Agent Fabric (incl. the AG-D4 real-kernel keystone), the
+    /// Durable Workflow engine, and the contract-coverage re-affirm. The frozen-row ratchet asserts
+    /// a future edit cannot silently shrink the proof set.
+    #[test]
+    fn m2_required_rows_cover_the_reactive_layer_families() {
+        let ids: Vec<&str> = m2_required_rows().iter().map(|r| r.id).collect();
+        for must in [
+            // bus/reactive engine
+            "BUS-D1", "BUS-D3", "BUS-D6", "BUS-D5", "BUS-D8",
+            // Reference Graph
+            "REF-CDC",
+            // Search (incl. the zero-leak keystone)
+            "SRCH-D1", "SRCH-D2", "SRCH-D3", "SRCH-D4", "SRCH-D7",
+            // Notifications
+            "NOTIF-D1", "NOTIF-D2", "NOTIF-D3", "NOTIF-D4", "NOTIF-D7", "NOTIF-D8", "NOTIF-D9",
+            "NOTIF-D10", "NOTIF-D11", "NOTIF-snooze",
+            // Agent Fabric (M2-B family) incl. the AG-D4 keystone
+            "AG-D1/2/3", "AG-D5-batch", "AG-D5-loop", "AG-D7", "AG-D8", "AG-D11", "AG-D4",
+            // Durable Workflow
+            "FLOW-D1", "FLOW-D3", "FLOW-D4-hitl", "FLOW-D4-per-effect", "FLOW-D5", "FLOW-D6",
+            "FLOW-D7", "FLOW-mergeq",
+            // coverage
+            "contract-coverage",
+        ] {
+            assert!(ids.contains(&must), "M2 gate is missing required row {must}");
+        }
+        // The band dispatch returns the same frozen set (the single dispatch point).
+        assert_eq!(
+            Band::M2Reactive.required_rows().iter().map(|r| r.id).collect::<Vec<_>>(),
+            ids
+        );
+    }
+
+    /// AG-D4 is the ONLY permanent (re-run-forever) M2 row — the real-kernel escape gate
+    /// (EI-01 §2: RCE/sandbox-escape outranks every feature). It runs `--features integration`.
+    #[test]
+    fn m2_ag_d4_is_the_only_permanent_row_and_runs_integration() {
+        let perm: Vec<&str> = m2_required_rows()
+            .into_iter()
+            .filter(|r| r.permanent)
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(perm, vec!["AG-D4"], "AG-D4 is the only re-run-forever M2 row");
+        let ag_d4 = m2_required_rows().into_iter().find(|r| r.id == "AG-D4").unwrap();
+        assert!(
+            ag_d4.proof_command.contains(&"--features") && ag_d4.proof_command.contains(&"integration"),
+            "AG-D4 must run --features integration (the real-kernel escape drill), got {:?}",
+            ag_d4.proof_command
+        );
+        assert!(ag_d4.proof_command.contains(&"escape_drill_test"));
+    }
+
+    /// A fully-proven M2 scorecard reads GREEN and renders the M3-may-start verdict, AG-D4's three
+    /// NAMED residuals, and the ONE true remaining floor (the world-scale 30× LOAD drill, M5) as a
+    /// named, visible deferral that does NOT red the gate.
+    #[test]
+    fn m2_all_rows_proven_is_green_with_residuals_and_floor_named() {
+        let mut card = Scorecard::new(Band::M2Reactive);
+        for r in m2_required_rows() {
+            card.record(RowResult::pass(r.id, format!("[2026-06-21] PASS {}", r.id), "2026-06-21"));
+        }
+        assert!(card.is_green(), "every M2 row proven ⇒ green");
+        assert!(card.missing_required().is_empty());
+        let md = card.render_markdown("2026-06-21");
+        assert!(md.contains("GREEN — M3 may start"));
+        // AG-D4 non-vacuous: MYELIN_REQUIRE_KVM + proven-on-real-hardware named.
+        assert!(md.contains("MYELIN_REQUIRE_KVM"), "AG-D4 non-vacuous mechanism must be named");
+        assert!(md.contains("PROVEN-ON-REAL-HARDWARE"));
+        // AG-D4's three residuals (a)/(b)/(c).
+        assert!(md.contains("THIS kernel"), "residual (a) must be named");
+        assert!(md.contains("Scaleway"), "residual (b) must be named");
+        assert!(md.contains("single-box ≠ fleet"), "residual (c) must be named");
+        // The one true floor + the gVisor named residual.
+        assert!(md.contains("world-scale 30× LOAD"), "the one true 30× floor must be named");
+        assert!(md.contains("M5"), "the floor is deferred to M5");
+        assert!(md.contains("CI-P28"), "the gVisor second-backend residual must be named");
+    }
+
+    /// THE RATCHET on the M2 set: dropping ANY single row reds the M2→M3 gate (you cannot ship M3
+    /// over a missing M2 reactive-layer drill).
+    #[test]
+    fn m2_dropping_any_row_reds_the_gate() {
+        for dropped in m2_required_rows() {
+            let mut card = Scorecard::new(Band::M2Reactive);
+            for r in m2_required_rows().into_iter().filter(|r| r.id != dropped.id) {
+                card.record(RowResult::pass(r.id, "[2026-06-21] PASS", "2026-06-21"));
+            }
+            assert_eq!(card.missing_required(), vec![dropped.id]);
+            assert!(!card.is_green(), "dropping {} must RED the M2→M3 gate", dropped.id);
+        }
+    }
+
+    /// THE RATCHET on the M2 set: a claimed-not-proven row (e.g. an AG-D4 drill that did not really
+    /// boot a microVM) keeps the gate RED — recorded honestly, never softened into a green (EI-01
+    /// §3). The honest red blocks M3.
+    #[test]
+    fn m2_claimed_not_proven_row_reds_the_gate() {
+        let mut card = Scorecard::new(Band::M2Reactive);
+        for r in m2_required_rows() {
+            if r.id == "AG-D4" {
+                card.record(RowResult::claimed_not_proven(
+                    r.id,
+                    "MYELIN_REQUIRE_KVM=1 but no microVM booted — a vacuous green is refused, recorded RED",
+                    "2026-06-21",
+                ));
+            } else {
+                card.record(RowResult::pass(r.id, "[2026-06-21] PASS", "2026-06-21"));
+            }
+        }
+        assert!(!card.is_green(), "a claimed-not-proven M2 row blocks M3");
+        assert_eq!(card.not_proven().len(), 1);
+        assert!(card.render_markdown("2026-06-21").contains("RED — M3 is BLOCKED"));
     }
 }
