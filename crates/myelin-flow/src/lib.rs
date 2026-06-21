@@ -102,9 +102,19 @@
 //!     re-derives the SAME token + short-circuits dispatch+wait — consume-exactly-once. The dispatch
 //!     into the runner is GATED by AG-D4 (Agent-Fabric/CI-owned, `04-sandbox-AG-D4.md` — NO untrusted
 //!     code runs until green); the 9.2/9.4 CDC pair is `tests/cdc_9_2_schedule_and_run_job.rs`.
-//!     **NAMED FLOORS:** reserve/settle bookend **P-FLOW-16**, re-mint **P-FLOW-17**, loop-safety
+//!     **NAMED FLOORS:** reserve/settle bookend **P-FLOW-16**, loop-safety
 //!     **P-FLOW-18**) — the rest land later. An empty journal is not a
 //!     working engine.
+//! - **The mid-workflow `mint_run_token` re-mint on resume** (token life == activity life, contract
+//!   4.7 CONSUMED, §6.2) → **LANDED at P-FLOW-17** (P-213), see [`remint`]
+//!   ([`WfCtx::remint_on_resume`]: a resume across a multi-day wait re-mints a fresh SHORT-LIVED
+//!   ATTENUATED per-run token via the contract-4.7 [`RunTokenMinter`] seam — token life == activity
+//!   life, NOT the days-long workflow life; the workflow holds no long-lived privileged token across a
+//!   wait. Wired into the resume legs of [`WfCtx::wait_for_signal`] (the HITL approval resume) +
+//!   [`WfCtx::schedule_and_run_job`] (the long-park `job.done` resume, through the wait). The 4.7 CDC
+//!   pair vs Identity's `IdentityService::mint_run_token` provider is `tests/cdc_4_7_remint.rs`. **NAMED
+//!   FLOOR:** the `mint_run_token` BODY is Identity's (P-ID-18, M1); the E2E-2 spine re-mint assertion
+//!   lands at **P-FLOW-27**.
 //!
 //! There is **no mandatory-core algorithm module** here (it is the schema + frozen type shapes), so
 //! there is no mutation-score floor on this prompt — stated explicitly per the template's TESTS
@@ -125,6 +135,7 @@ pub mod executor;
 pub mod holder;
 pub mod job;
 pub mod migrations;
+pub mod remint;
 pub mod schema;
 pub mod signal_consumer;
 pub mod timer;
@@ -160,6 +171,9 @@ pub use job::{
     job_dispatch_marker, job_idem_token, JobKind, JobOutcome, JobRunner, JobSpec, JOB_DONE_SIGNAL,
 };
 pub use budget::{BudgetError, BudgetGate, BudgetSettle, Wallet};
+pub use remint::{
+    DelegationCaveats, RunTokenError, RunTokenHandle, RunTokenLease, RunTokenMinter,
+};
 pub use wfctx::{
     attempt_state, history_kind, ActivityError, RetryPolicy, WaitOutcome, WfCtx, WfError, WfJournal,
     WfResult,
