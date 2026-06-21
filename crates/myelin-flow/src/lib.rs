@@ -29,8 +29,10 @@
 //! ## FLOORS named (this is explicitly NOT a working engine)
 //!
 //! - **The AppSpec service shell** (boot → migrate → outbox relay → empty consumer slot → three
-//!   ports → graceful drain, liveness≠readiness) → **P-FLOW-02** (P-198). This crate ships NO
-//!   `serve(AppSpec)` wiring and NO `main.rs` yet — it is the schema + the type carriers.
+//!   ports → graceful drain, liveness≠readiness) → **LANDED at P-FLOW-02** (P-198), see [`app`]
+//!   plus `src/main.rs`. [`app::flow_app_spec`] assembles the [`AppSpec`](myelin_substrate::AppSpec)
+//!   the harness wires; the `myelin-flow` binary hands it to `serve`. The `consumers` slot is the
+//!   EMPTY seam (the replay engine plus the signal/timer consumers are P-FLOW-04..05/09/13).
 //! - **The `PersonalDataHolder` auto-registration** over `workflow_run` / `wf_history` / `wf_signal`
 //!   (the structural references-not-payloads half) → **P-FLOW-03** (P-201).
 //! - **The algorithms**: WfCtx + journal/outbox co-commit (**P-FLOW-04**, FLOW-D5); deterministic
@@ -50,5 +52,8 @@
 //! back on it; `substrate_is_root()` / `identity_is_sink()` are preserved (a subsystem schema crate
 //! is the graph's terminal consumer, not a node in it).
 
+pub mod app;
 pub mod migrations;
 pub mod schema;
+
+pub use app::{boot_flow, flow_app_spec, run_flow, SERVICE_NAME};

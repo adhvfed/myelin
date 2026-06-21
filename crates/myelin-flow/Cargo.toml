@@ -8,6 +8,15 @@ publish = false
 [lib]
 path = "src/lib.rs"
 
+# The myelin-flow service binary (P-FLOW-02 → P-198, M2): the "every service `main.rs`" the
+# contract-index row 1.1 names. It does NOTHING but hand the flow `AppSpec` to the harness's one
+# call (`serve`) — the harness owns the whole lifecycle (boot → migrate → outbox relay →
+# consumers → three ports → graceful drain, liveness ≠ readiness). A four-line shim, never a
+# hand-rolled lifecycle.
+[[bin]]
+name = "myelin-flow"
+path = "src/main.rs"
+
 # THE durable-workflow substrate crate (P-FLOW-01 → P-197, M2). myelin-flow is a BUILD,
 # DBOS-class, Postgres-embedded engine (architecture durable-workflow.md §2, ADR-09) — NO new
 # datastore. It sits inside the myelin-flow service's own Postgres and inherits the M0
