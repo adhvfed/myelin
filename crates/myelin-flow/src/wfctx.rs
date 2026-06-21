@@ -291,6 +291,36 @@ pub struct WfCtx {
     /// The deterministic `now()` clock the side-marker captures (RFC-3339 UTC; §5.1). In the live
     /// engine this is the worker's wall-clock at first execution, journaled so replay returns it.
     now_clock: String,
+    /// **The loaded journal a replay short-circuits against (P-FLOW-05, §4.1).** Keyed by the
+    /// deterministic `command_id`, it holds the prior run's journaled `wf_history` outcome rows so a
+    /// re-driven run RETURNS the journaled result (an activity result, a `now()`/`rand()` marker's
+    /// captured value) WITHOUT re-executing the side effect — the whole point of journaled-result
+    /// replay (§4.1: "do NOT re-execute the side effect"). Empty for a cold (never-driven) run.
+    replay_history: std::collections::HashMap<String, ReplayedCommand>,
+    /// **The count of activity closures actually EXECUTED on this drive** (the double-effect probe).
+    /// A pure replay of an N-command journal executes ZERO activity closures (every one
+    /// short-circuits); only commands past the cursor execute. The FLOW-D1 drill reads this to assert
+    /// "0 re-executed side effects" — a replay that re-runs a journaled activity increments this and
+    /// fails the drill loudly (§4.1, the silent-double-effect floor).
+    side_effects_executed: u64,
+    /// **The count of journaled commands that got RE-EXECUTED on this drive (the 0-double-effect
+    /// counter, §4.1).** Incremented IFF a command whose `command_id` is in [`Self::replay_history`]
+    /// reaches LIVE execution (the side effect re-runs) — which the short-circuit makes impossible on
+    /// the activity-replay path. It MUST stay 0; a non-zero is a silent double-effect the FLOW-D1
+    /// drill reds on. This is the direct, in-`WfCtx` measurement (not an inference in [`crate::engine`]).
+    double_effects: u64,
+}
+
+/// One journaled command outcome a replay reads back (§4.1) — the result an `activity` returns on
+/// replay, or the captured value a `now()`/`rand()` side-marker journaled. Carried so a re-driven
+/// `WfCtx` returns the SAME value the original drive produced, WITHOUT re-executing the side effect.
+#[derive(Clone, Debug)]
+struct ReplayedCommand {
+    /// The `wf_history.kind` of the journaled row (`activity_completed`/`activity_failed`/
+    /// `side_marker`) — the replay branch selector.
+    kind: String,
+    /// The journaled activity result refs (for `activity_completed`) — returned verbatim on replay.
+    result: Option<Vec<myelin_refs::ArtifactRef>>,
 }
 
 impl WfCtx {
@@ -326,7 +356,67 @@ impl WfCtx {
             history_seq: 0,
             rand_state: rand_seed,
             now_clock: now_clock.into(),
+            replay_history: std::collections::HashMap::new(),
+            side_effects_executed: 0,
+            double_effects: 0,
         }
+    }
+
+    /// **Resume (re-drive) a `WfCtx` from its journaled `wf_history` — the deterministic
+    /// replay/recovery entry point (P-FLOW-05, §4.1).** Identical to [`WfCtx::begin`] but LOADS the
+    /// run's prior journal so each subsequent `activity`/`now`/`rand` SHORT-CIRCUITS its journaled
+    /// command (returning the journaled outcome WITHOUT re-executing the side effect) and the run
+    /// CONTINUES from the first un-journaled command. The `history` is the rows read back from the
+    /// journal (`journal.history_for(tenant, run_id)`), in replay order.
+    ///
+    /// This is what makes crash recovery work (§4.7): a worker that re-leases a half-driven run calls
+    /// `resume`, replays every journaled step (0 re-execution of side effects — the result was
+    /// journaled, not re-run), and resumes "as if nothing happened". The per-run command counter +
+    /// `seq` advance past the journaled rows so a newly-journaled command lands AFTER the replayed
+    /// ones (the cursor floor, §3.1).
+    #[allow(clippy::too_many_arguments)]
+    pub fn resume(
+        outbox: &OutboxStore,
+        minter: Arc<dyn IdMinter>,
+        journal: WfJournal,
+        ctx_base: EmitContextBase,
+        run_id: impl Into<String>,
+        wf_type: impl Into<String>,
+        now_clock: impl Into<String>,
+        rand_seed: u64,
+        history: Vec<WfHistoryRow>,
+    ) -> Self {
+        let mut ctx = Self::begin(
+            outbox, minter, journal, ctx_base, run_id, wf_type, now_clock, rand_seed,
+        );
+        // The replay-order seq continues past the journaled rows (the cursor floor §3.1): a
+        // newly-journaled command must land AFTER everything replayed, never overwrite it.
+        ctx.history_seq = history.iter().map(|r| r.seq).max().map(|m| m + 1).unwrap_or(0);
+        for row in history {
+            ctx.replay_history.insert(
+                row.command_id,
+                ReplayedCommand {
+                    kind: row.kind,
+                    result: row.result,
+                },
+            );
+        }
+        ctx
+    }
+
+    /// The number of activity closures actually EXECUTED on this drive (the FLOW-D1 double-effect
+    /// probe). A pure replay of a fully-journaled run reads `0` (every command short-circuited); a
+    /// regression that re-executes a journaled activity reads `> 0` and reds the drill.
+    pub fn side_effects_executed(&self) -> u64 {
+        self.side_effects_executed
+    }
+
+    /// **The 0-double-effect counter (the FLOW-D1 floor, §4.1).** The number of JOURNALED commands
+    /// that nonetheless reached LIVE execution on this drive (a re-executed side effect). The
+    /// activity-replay short-circuit makes this 0 by construction; a regression that re-runs a
+    /// journaled activity increments it and the drill reds. MUST be 0.
+    pub fn double_effects(&self) -> u64 {
+        self.double_effects
     }
 
     /// The deterministic `command_id` for the NEXT command (`<wf_type>:<n>`) — the replay-match key
@@ -392,6 +482,40 @@ impl WfCtx {
         F: Fn(&str, u32) -> Result<Vec<myelin_refs::ArtifactRef>, ActivityError>,
     {
         let command_id = self.next_command_id();
+        // **REPLAY SHORT-CIRCUIT (§4.1).** If this command is already journaled, RETURN the journaled
+        // outcome WITHOUT re-executing the closure — the side effect is NOT re-run (the result was
+        // journaled, not the activity re-executed). This is the heart of crash recovery: a re-driven
+        // run replays every journaled step with 0 double-effect, then continues from the first
+        // un-journaled command. The closure body never runs, so `side_effects_executed` is NOT bumped.
+        if let Some(replayed) = self.replay_history.get(&command_id) {
+            match replayed.kind.as_str() {
+                history_kind::ACTIVITY_COMPLETED => {
+                    return Ok(replayed.result.clone().unwrap_or_default());
+                }
+                history_kind::ACTIVITY_FAILED => {
+                    // A journaled failure replays to the same failure (the run takes its error
+                    // branch deterministically) — still 0 re-execution of the activity.
+                    return Err(WfError::ActivityExhausted(ActivityError(
+                        "replayed activity_failed".into(),
+                    )));
+                }
+                // A command_id that journaled a NON-activity kind here is a determinism divergence
+                // (the workflow body issued a different command than the journal records). The
+                // divergence GUARD that halts-as-nondeterministic is P-FLOW-07; here we fall through
+                // to LIVE execution rather than silently mis-replaying, and the guard catches the
+                // structural mismatch when it lands.
+                _ => {}
+            }
+        }
+        // LIVE: this command is past the cursor — execute it for real (and count the side effect).
+        // **The double-effect probe (§4.1):** if this command_id WAS journaled yet reached live
+        // execution, the side effect is being RE-RUN — a silent double-effect. The activity-replay
+        // short-circuit above makes this impossible; counting it here makes a regression that removes
+        // the short-circuit LOUD (the FLOW-D1 0-double-effect floor).
+        if self.replay_history.contains_key(&command_id) {
+            self.double_effects += 1;
+        }
+        self.side_effects_executed += 1;
         // The idem_token is DETERMINISTIC from the command position (so producer and consumer agree
         // WITHOUT coordination, §3.5) and is the SAME across every attempt — the retry-dedup anchor.
         let idem_token = format!("{}/{}/{}", self.run_id, command_id, "act");
@@ -474,8 +598,17 @@ impl WfCtx {
     /// `now()`-dependent workflow deterministic. The marker is STAGED (durable iff commit).
     pub fn now(&mut self) -> String {
         let command_id = self.next_command_id();
-        self.stage_history(history_kind::SIDE_MARKER, command_id, None);
-        self.now_clock.clone()
+        // REPLAY SHORT-CIRCUIT (§4.1): a journaled `now()` side-marker returns the CAPTURED clock so
+        // replay reads back the SAME timestamp (the worker's wall-clock at FIRST execution), making a
+        // `now()`-dependent workflow deterministic even though the replay-time clock differs.
+        if let Some(value) = self.replayed_marker_value(&command_id) {
+            return value;
+        }
+        // LIVE: capture the deterministic clock INTO the side-marker (so the value, not the
+        // resume-time clock, drives replay).
+        let value = self.now_clock.clone();
+        self.stage_marker_value(command_id, &value);
+        value
     }
 
     /// **`rand()` (contract 9.2, §5.1) — a journaled SIDE-MARKER.** Returns the next value of a
@@ -483,6 +616,13 @@ impl WfCtx {
     /// source of entropy; it is replay-stable BY DESIGN) AND journals a `side_marker` row capturing
     /// the draw, so replay returns the SAME number. The marker is STAGED (durable iff commit).
     pub fn rand(&mut self) -> u64 {
+        let command_id = self.next_command_id();
+        // REPLAY SHORT-CIRCUIT (§4.1): a journaled `rand()` side-marker returns the CAPTURED draw so
+        // replay reads back the SAME number (even if the resume seed differs) — the draw is a side
+        // effect, captured-not-recomputed.
+        if let Some(value) = self.replayed_marker_value(&command_id) {
+            return value.parse::<u64>().unwrap_or(0);
+        }
         // splitmix64 — a deterministic, well-mixed sequence (replay-stable; the journaled marker is
         // what makes it correct under replay, the sequence itself is just reproducible).
         self.rand_state = self.rand_state.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -490,9 +630,35 @@ impl WfCtx {
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         let value = z ^ (z >> 31);
-        let command_id = self.next_command_id();
-        self.stage_history(history_kind::SIDE_MARKER, command_id, None);
+        // LIVE: capture the drawn value INTO the side-marker (the value drives replay, not the seed).
+        self.stage_marker_value(command_id, &value.to_string());
         value
+    }
+
+    /// If the side-marker `command_id` is already journaled, return its CAPTURED value (the string
+    /// the original draw stored in the marker's `result` ref) — the replay short-circuit for
+    /// `now()`/`rand()` (§4.1). `None` for a live (un-journaled) command.
+    fn replayed_marker_value(&self, command_id: &str) -> Option<String> {
+        let replayed = self.replay_history.get(command_id)?;
+        if replayed.kind != history_kind::SIDE_MARKER {
+            return None;
+        }
+        replayed
+            .result
+            .as_ref()
+            .and_then(|refs| refs.first())
+            .map(|r| r.0.clone())
+    }
+
+    /// Stage a `side_marker` `wf_history` row CARRYING its captured value (encoded as a single
+    /// [`ArtifactRef`] in the row's `result`) so replay returns the captured value, not a recomputed
+    /// one — the determinism levers `now()`/`rand()` depend on (§4.1/§5.1).
+    fn stage_marker_value(&mut self, command_id: String, value: &str) {
+        self.stage_history(
+            history_kind::SIDE_MARKER,
+            command_id,
+            Some(vec![myelin_refs::ArtifactRef(value.to_string())]),
+        );
     }
 
     /// **`emit(EventDraft)` (contract 9.2, §4.5; consumes 2.2) — the ONLY emit path.** Buffers the
@@ -926,6 +1092,144 @@ mod tests {
             journal.history_for(&TenantId("other".into()), "R1").is_empty(),
             "a different tenant sees none of acme's rows (the tenant half of the AND-filter)"
         );
+    }
+
+    /// **REPLAY: a resumed `WfCtx` short-circuits a journaled activity — 0 re-execution (§4.1).** A
+    /// run journals one activity, commits, then a SECOND `WfCtx` resumes from that journal: the same
+    /// activity's closure is NOT re-run (the journaled result is returned), `side_effects_executed`
+    /// stays 0, and `double_effects` stays 0 (the FLOW-D1 floor in the WfCtx).
+    #[test]
+    fn resume_short_circuits_a_journaled_activity_zero_re_execution() {
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        // first drive: run + journal one activity.
+        let mut c1 = begin(&outbox, journal.clone());
+        c1.activity(RetryPolicy::default_policy(), |_i, _a| {
+            Ok(vec![ArtifactRef("myelin://acme/agent/effect/e1".into())])
+        })
+        .expect("activity");
+        c1.commit().expect("co-commit");
+        let history = journal.history_for(&tenant(), "R1");
+        assert_eq!(history.len(), 1, "one journaled command");
+
+        // resume: re-drive the SAME activity from the journal — it short-circuits.
+        let ran = Arc::new(Mutex::new(false));
+        let ran2 = ran.clone();
+        let mut c2 = WfCtx::resume(
+            &outbox, minter(), journal.clone(), ctx_base(), "R1", "agent.run",
+            "2026-06-21T00:00:00Z", 42, history,
+        );
+        let out = c2
+            .activity(RetryPolicy::default_policy(), move |_i, _a| {
+                *ran2.lock().unwrap() = true; // would flip true IF the closure re-ran.
+                Ok(vec![ArtifactRef("myelin://acme/agent/effect/SHOULD-NOT-APPEAR".into())])
+            })
+            .expect("the activity replays");
+        assert!(!*ran.lock().unwrap(), "the closure was NOT re-executed (replay short-circuit)");
+        assert_eq!(
+            out[0].0, "myelin://acme/agent/effect/e1",
+            "the JOURNALED result is returned, not the re-run closure's"
+        );
+        assert_eq!(c2.side_effects_executed(), 0, "0 side effects executed on a pure replay");
+        assert_eq!(c2.double_effects(), 0, "0 double-effect (the FLOW-D1 floor)");
+    }
+
+    /// **REPLAY: a journaled `activity_failed` command replays to the SAME failure — 0 re-execution
+    /// (§4.1).** A run journals an exhausted (failed) activity, commits, then a resume re-drives the
+    /// same activity: the closure is NOT re-run, the failure is returned deterministically (the run
+    /// takes its error branch on replay), and `side_effects_executed`/`double_effects` stay 0.
+    #[test]
+    fn resume_short_circuits_a_journaled_activity_failed() {
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        // first drive: an activity that exhausts its retries → an activity_failed history row.
+        let mut c1 = begin(&outbox, journal.clone());
+        c1.activity(RetryPolicy { max_attempts: 1 }, |_i, _a| {
+            Err(ActivityError("hard failure".into()))
+        })
+        .expect_err("the activity exhausts");
+        c1.commit().expect("co-commit the failure");
+        let history = journal.history_for(&tenant(), "R1");
+        assert!(
+            history.iter().any(|r| r.kind == history_kind::ACTIVITY_FAILED),
+            "an activity_failed row is journaled"
+        );
+
+        // resume: the failed activity replays to the same failure WITHOUT re-running the closure.
+        let ran = Arc::new(Mutex::new(false));
+        let ran2 = ran.clone();
+        let mut c2 = WfCtx::resume(
+            &outbox, minter(), journal.clone(), ctx_base(), "R1", "agent.run",
+            "2026-06-21T00:00:00Z", 42, history,
+        );
+        let err = c2
+            .activity(RetryPolicy { max_attempts: 5 }, move |_i, _a| {
+                *ran2.lock().unwrap() = true; // would flip IF re-run.
+                Ok(vec![ArtifactRef("myelin://acme/SHOULD-NOT-RUN".into())])
+            })
+            .expect_err("the journaled failure replays to a failure");
+        assert!(matches!(err, WfError::ActivityExhausted(_)), "replays to ActivityExhausted");
+        assert!(!*ran.lock().unwrap(), "the closure was NOT re-executed (failed-replay short-circuit)");
+        assert_eq!(c2.side_effects_executed(), 0, "0 side effects on a failed-replay short-circuit");
+        assert_eq!(c2.double_effects(), 0, "0 double-effect on the failed-replay path");
+    }
+
+    /// **The double-effect counter is a REAL probe: a journaled command that nonetheless reaches LIVE
+    /// activity execution increments it (the FLOW-D1 floor, §4.1).** We force the divergence path: a
+    /// position journaled as a `side_marker` (a `now()`/`rand()` in the original drive) is re-driven
+    /// as an `activity` — the activity-replay short-circuit does NOT match the marker kind, so the
+    /// activity executes LIVE against a journaled command_id → a counted double-effect. This proves
+    /// the counter increments (not a constant 0) so a regression on the short-circuit reds the drill.
+    #[test]
+    fn double_effect_counter_increments_when_a_journaled_command_re_executes() {
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        // first drive journals a side-marker at position 0 (a now()).
+        let mut c1 = begin(&outbox, journal.clone());
+        let _ = c1.now();
+        c1.commit().expect("co-commit the marker");
+        let history = journal.history_for(&tenant(), "R1");
+
+        // resume but the body now issues an ACTIVITY at position 0 (the divergence): the marker-kind
+        // journal does not match the activity-replay short-circuit, so the activity runs LIVE against
+        // a journaled command_id — a double-effect the counter records.
+        let mut c2 = WfCtx::resume(
+            &outbox, minter(), journal.clone(), ctx_base(), "R1", "agent.run",
+            "2026-06-21T00:00:00Z", 42, history,
+        );
+        c2.activity(RetryPolicy::default_policy(), |_i, _a| {
+            Ok(vec![ArtifactRef("myelin://acme/agent/effect/e0".into())])
+        })
+        .expect("the divergent activity runs live");
+        assert_eq!(c2.side_effects_executed(), 1, "the divergent activity executed once (live)");
+        assert_eq!(
+            c2.double_effects(),
+            1,
+            "the journaled command re-executed → exactly one counted double-effect (the floor probe)"
+        );
+    }
+
+    /// **REPLAY: a resumed `now()`/`rand()` returns its CAPTURED value, not a recomputed one (§4.1).**
+    /// The first drive captures the clock + the draw into side-markers; a resume with a DIFFERENT
+    /// clock + seed still returns the original captured values — `now()`/`rand()` are replay-stable
+    /// because the value, not the seed, is journaled.
+    #[test]
+    fn resume_now_and_rand_return_captured_values_not_recomputed() {
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        let mut c1 = begin(&outbox, journal.clone());
+        let t1 = c1.now();
+        let r1 = c1.rand();
+        c1.commit().expect("co-commit");
+        let history = journal.history_for(&tenant(), "R1");
+
+        // resume with a DIFFERENT clock + seed — the captured values must still come back.
+        let mut c2 = WfCtx::resume(
+            &outbox, minter(), journal.clone(), ctx_base(), "R1", "agent.run",
+            "2099-01-01T00:00:00Z", 999_999, history,
+        );
+        assert_eq!(c2.now(), t1, "now() replays its captured clock (not the resume-time clock)");
+        assert_eq!(c2.rand(), r1, "rand() replays its captured draw (not a re-seeded draw)");
     }
 
     /// **`staged_emit_len` reflects the OPEN transaction's buffered emits precisely.** Two emits on
