@@ -487,6 +487,20 @@ pub struct WfCtx {
     /// run's [`crate::RunBudget`] so a body's spend-bearing dispatch reserves-at-dispatch (no balance →
     /// no dispatch) + settles-on-completion into the SAME wallet, never interrupting in-flight.
     pub(crate) budget: Option<crate::budget::BudgetGate>,
+    /// **The per-run mint context a resume re-mints a fresh token against (P-FLOW-17, contract 4.7,
+    /// §6.2).** `None` on a `WfCtx` with no run-identity wired (a body that never crosses a multi-day
+    /// wait, or a unit test of the pure activity surface) — [`WfCtx::remint_on_resume`] then returns a
+    /// loud [`WfError::CoCommit`] rather than silently running a resumed activity under no/expired
+    /// token. Supplied via [`WfCtx::with_run_identity`] so the resume legs of [`WfCtx::wait_for_signal`]
+    /// and [`WfCtx::schedule_and_run_job`] re-mint a short-lived attenuated per-run token (token life
+    /// equals activity life, NOT the days-long workflow life — the workflow holds no long-lived
+    /// privileged token across a wait).
+    pub(crate) run_identity: Option<crate::remint::RunTokenLease>,
+    /// **The count of fresh per-run tokens re-minted on this drive (the §6.2 re-mint probe,
+    /// P-FLOW-17).** Each resume across a multi-day wait re-mints exactly one fresh short-lived token;
+    /// the gate reads it to assert a resume DID re-mint. `0` on a drive that never resumed (a cold first
+    /// drive that parked, or a pure non-waiting body).
+    pub(crate) reminted_tokens: u64,
 }
 
 /// One journaled command outcome a replay reads back (§4.1) — the result an `activity` returns on
@@ -545,6 +559,8 @@ impl WfCtx {
             parked_on_signal: false,
             consumed_signals: Vec::new(),
             budget: None,
+            run_identity: None,
+            reminted_tokens: 0,
         }
     }
 
@@ -1192,6 +1208,16 @@ impl WfCtx {
             // Journal the `signal_received` row carrying the consumed signal (idem_key + payload refs)
             // so replay returns the SAME signal (consume-exactly-once). references-not-payloads.
             self.stage_received(command_id, &idem_key, &row.payload, row.payload_key_ref.as_deref());
+            // **MID-WORKFLOW TOKEN RE-MINT ON RESUME (P-FLOW-17, contract 4.7, §6.2).** This wait had
+            // PARKED (a journaled `signal_waited`) and is now RESUMING — the resumed body is about to run
+            // (the consumed approval/job.done leads back into live activity), so the workflow's per-run
+            // token (expired during the days-long wait) is re-minted FRESH + short-lived + attenuated
+            // (token life == activity life, NOT the days-long workflow life). Only fires on a TRUE resume
+            // (a prior `signal_waited`); a fast first-drive consume (no park) does not re-mint. A wired
+            // lease whose mint fails surfaces LOUD (the resumed activity must not run under a stale token).
+            if already_waited {
+                self.remint_if_resuming()?;
+            }
             return Ok(WaitOutcome::Signalled {
                 idem_key,
                 payload: row.payload,
@@ -1215,6 +1241,13 @@ impl WfCtx {
                 // the timeout fired before the signal arrived — journal a `signal_received` carrying the
                 // TIMEOUT marker (so replay returns TimedOut deterministically) and take the timeout path.
                 self.stage_received(command_id, WAIT_TIMEOUT_MARKER, &[], Some(WAIT_TIMEOUT_MARKER));
+                // **RE-MINT ON RESUME (P-FLOW-17, §6.2).** A timed-out wait that had PARKED is ALSO a
+                // resume — the body takes its timeout branch (the §6.3 auto-deny), which runs live (it may
+                // compensate / withhold), so it too runs under a FRESH short-lived per-run token. Only on a
+                // true resume (a prior `signal_waited`); a first-drive immediate timeout did not park.
+                if already_waited {
+                    self.remint_if_resuming()?;
+                }
                 return Ok(WaitOutcome::TimedOut);
             }
             // not yet due — arm/keep the durable timeout-timer (idempotent on the deterministic timer_id)

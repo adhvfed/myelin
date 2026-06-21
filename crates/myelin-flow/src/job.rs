@@ -268,6 +268,15 @@ impl WfCtx {
         // times out (the timeout timer bounds a vanished runner). The idem_key the wait matches is the
         // DISPATCH idem_token (the runner echoes it) — but wait_for_signal scans by signal NAME, and
         // the consume returns the consumed signal's idem_key; we VERIFY it is our token below.
+        //
+        // **MID-WORKFLOW TOKEN RE-MINT ON RESUME (P-FLOW-17, contract 4.7, §6.2).** The long-park
+        // resume re-mints a fresh short-lived attenuated per-run token THROUGH this wait: when a prior
+        // drive parked here (journaling `signal_waited` on `job.done`) and a later drive resumes by
+        // consuming the runner's `job.done` (or timing out), `wait_for_signal`'s resume leg calls the
+        // re-mint hook ([`WfCtx::remint_if_resuming`]) BEFORE returning — so the resumed body (which
+        // settles the job + runs its continuation) executes under a token whose life == activity life,
+        // never the days-long workflow life. No separate re-mint call is needed here: the long-park
+        // resume IS a wait resume, so the wait owns the one re-mint (no double-mint per resume).
         let outcome = self.wait_for_signal(JOB_DONE_SIGNAL, timeout_secs)?;
 
         // Step 3: map the wait outcome to the job outcome. A consumed job.done is the completion (the
