@@ -77,6 +77,7 @@
 //!   The validation logic does not change shape when the driver lands.
 
 pub mod app;
+pub mod effect_api;
 pub mod holder;
 pub mod migrations;
 pub mod mock;
@@ -106,6 +107,16 @@ pub use skeleton::{
 pub use mock::{
     build_conversation, model_turns_taken, replay, replay_bounded, select_runtime, HistoryEntry,
     MockAgentRuntime, MockScript, ReplayRecord, RuntimeFlag, TraceHistory, MOCK_MAX_STEPS,
+};
+
+// The plan-then-apply EffectApi pipeline (AG-P6 → P-218): the eight-step fail-closed body — SCHEMA
+// → CAPABILITY → DELEGATION → TENANT → BUDGET → HITL-GATE → APPLY → METER. The owned 8.2 body + the
+// consumer seams (4.2 check / 4.5 delegation / tenant / 11.7 budget / subsystem public-endpoint
+// apply) + the AG-D2 denial signals (0 privileged fallback by construction).
+pub use effect_api::{
+    decode_proposed, encode_proposed, validate_schema, ApplyError, CapabilityCheck, DelegationLookup,
+    EffectApiBridge, EffectBudget, EffectCost, PipelineSignals, PipelineStep, PlanThenApply,
+    PlannedEffect, SubsystemApply, TenantGuard,
 };
 
 // The agent-service `serve(AppSpec)` shell (AG-P4 → P-216): the three ports, liveness != readiness,
