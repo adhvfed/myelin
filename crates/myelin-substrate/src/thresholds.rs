@@ -372,6 +372,7 @@ fn parse_surface(name: &str) -> Result<Surface, ThresholdError> {
         "CollabOpStream" => Surface::CollabOpStream,
         "ConnectionTier" => Surface::ConnectionTier,
         "AgentMention" => Surface::AgentMention,
+        "GitFrontDoor" => Surface::GitFrontDoor,
         other => {
             return Err(ThresholdError::Parse(format!(
                 "unknown shed-budget surface `{other}` (not a shed::Surface variant)"
@@ -384,7 +385,8 @@ fn parse_surface(name: &str) -> Result<Surface, ThresholdError> {
         | Surface::CiDispatch
         | Surface::CollabOpStream
         | Surface::ConnectionTier
-        | Surface::AgentMention => Ok(s),
+        | Surface::AgentMention
+        | Surface::GitFrontDoor => Ok(s),
     }
 }
 
@@ -422,7 +424,7 @@ mod tests {
         assert_eq!(t.rpo_rto.rto_cell_max_mins, 240, "RTO ≤ 4h/cell");
         assert_eq!(t.depth_ceilings.soft, 12);
         assert_eq!(t.depth_ceilings.hard, 16);
-        assert_eq!(t.shed_budgets.len(), 5, "one row per shed::Surface");
+        assert_eq!(t.shed_budgets.len(), 6, "one row per shed::Surface");
     }
 
     /// The shed-budget rows in the file match the `shed::ShedBudgetTable::v1_floor()` seed table
@@ -437,6 +439,7 @@ mod tests {
             Surface::CollabOpStream,
             Surface::ConnectionTier,
             Surface::AgentMention,
+            Surface::GitFrontDoor,
         ] {
             assert_eq!(
                 t.shed_budget(surface).expect("present"),

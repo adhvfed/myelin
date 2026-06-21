@@ -242,6 +242,13 @@ pub enum Surface {
     ConnectionTier,
     /// Agent-mention (Chat/all) — the agent-mention-storm; humans never queue behind agent runs.
     AgentMention,
+    /// **The Git front door (clone/push)** — the clone-storm / hot-repo read profile (Git
+    /// architecture `02 §6`, the OQ-K per-surface budget). A CI/agent clone storm sheds (`429 +
+    /// Retry-After`) BEFORE a human's interactive fetch; the human lane is protected. This is the
+    /// surface the Git front door's shed gate (GIT-P15) admits against, per-tenant. The CDN
+    /// bundle-URI accelerated-clone (Git `02 §1.4`, Storage 11.2 C3) is the *complement* — it moves
+    /// clone-storm read fan-out off serving compute so the budget is reached later.
+    GitFrontDoor,
     /// The generic HTTP intake queue (§7.1) — every public surface's request intake.
     HttpIntake,
 }
@@ -274,6 +281,12 @@ impl ShedBudgetTable {
         rows.insert(
             Surface::AgentMention,
             SurfaceBudget { per_tenant_in_flight_cap: 96, human_lane_reservation: 24, retry_after_secs: 10 },
+        );
+        // Git front door (clone/push): the clone-storm read profile. A CI/agent clone storm sheds
+        // before a human's interactive fetch — a reserved human fraction protects the human lane.
+        rows.insert(
+            Surface::GitFrontDoor,
+            SurfaceBudget { per_tenant_in_flight_cap: 128, human_lane_reservation: 32, retry_after_secs: 5 },
         );
         // The generic HTTP intake (§7.1): every public surface reserves a human fraction.
         rows.insert(
@@ -635,6 +648,7 @@ mod tests {
             Surface::CollabOpStream,
             Surface::ConnectionTier,
             Surface::AgentMention,
+            Surface::GitFrontDoor,
             Surface::HttpIntake,
         ] {
             let b = table.budget(surface);
@@ -654,6 +668,8 @@ mod tests {
         assert!(table.budget(Surface::CollabOpStream).human_lane_reservation > 0);
         assert!(table.budget(Surface::ConnectionTier).human_lane_reservation > 0);
         assert!(table.budget(Surface::AgentMention).human_lane_reservation > 0);
+        // The Git front door protects a human lane (a human's interactive fetch is shed last).
+        assert!(table.budget(Surface::GitFrontDoor).human_lane_reservation > 0);
     }
 
     #[test]

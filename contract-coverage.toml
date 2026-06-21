@@ -112,7 +112,15 @@ status = "covered"
 cdc = [
   "crates/myelin-substrate/tests/cdc_1_11_shed_order.rs",
   "crates/myelin-substrate/tests/cdc_1_11_agent_load.rs",
+  "crates/myelin-git/tests/cdc_1_11_git_shed_order.rs",
 ]
+# P-276 (GIT-P15): the GIT-SIDE consumer of the protected-human-lane shed order — the Git front-door
+# shed gate (myelin-git/src/shed_clone.rs GitFrontDoorShed) WIRES the substrate ShedLane over the NEW
+# Surface::GitFrontDoor budget (the OQ-K per-surface floor) read FROM THE THRESHOLDS FILE (REUSED, never
+# re-defined, EI-01 §7): a clone storm's agent/CI lane sheds (429 + Retry-After) while the human's
+# interactive fetch is served; a machine principal can never up-class to the protected human lane.
+# The consumer-half CDC is cdc_1_11_git_shed_order.rs. FLOOR: the per-surface budget NUMBERS are tuned
+# by the 30× clone-storm GIT-D6 → GIT-P34 (M5); here the order is asserted at 1× with mixed principals.
 
 # ──────────────── §2 Event envelope, outbox & consumer template (Bus myelin-events) ─────────────
 
@@ -1190,7 +1198,15 @@ cdc = [
     "crates/myelin-storage/tests/cdc_11_2_11_4_git_crypto_shred_reach.rs",
     "crates/myelin-storage/tests/cdc_11_2_c3_cdn_clone_class.rs",
     "crates/myelin-git/tests/cdc_11_2_git_pack_tier_consumer.rs",
+    "crates/myelin-git/tests/cdc_11_2_c3_git_bundle_uri.rs",
 ]
+# P-276 (GIT-P15): the GIT-SIDE consumer of the C3 within-EU CDN clone/bundle class — the bundle-URI
+# accelerated-clone path (myelin-git/src/shed_clone.rs BundleUriClone) CONSUMES the storage
+# CdnCloneClass (REUSED, never re-defined, EI-01 §7): publish a precomputed bundle → advertise a
+# bundle-URI → serve a clone BY CONTENT-ADDRESS. The accelerated-clone floor holds (a bundle-URI clone
+# round-trips a valid clone); a tampered bundle is REFUSED (0 silent serve — the content-address is the
+# cache-validity check). The consumer-half CDC is cdc_11_2_c3_git_bundle_uri.rs. FLOOR: the full
+# within-EU CDN class (real edge POP fleet + cache-fill transport) hardens → GIT-P33 (M5).
 
 [[contract]]
 row = "11.3"
