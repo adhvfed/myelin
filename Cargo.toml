@@ -228,6 +228,20 @@ proc-macro2 = "1"
 # network backend — unlike the `integration`-gated Postgres/S3/NATS clients above).
 tantivy = "0.26"
 
+# git2 (libgit2 bindings) — the in-process READ backend of the GitCore layered seam (GIT-P8 /
+# P-269, architecture git-hosting 01 §2.2). The architecture PREFERS gix (gitoxide) in-process and
+# names libgit2 as the FALLBACK "where gix lacks a read capability"; at GIT-P8 the current gix
+# release (gix 0.84 / gix-hash) does not compile on the workspace toolchain (rustc 1.95, 2026-06),
+# so the v1 read/diff/blame backend is realised over the architecture-named libgit2 fallback. A
+# REAL in-process read path (NOT a `git` fork — no-host-exec holds by construction); the gix-
+# preferred swap rides the OQ-1 named floor (GIT-P33). default-features=false drops the SSH/HTTPS
+# transports (we only open + read local object DBs in-process; the WIRE transports run sandboxed
+# canonical `git`, not libgit2). vendored-libgit2 builds the C lib in-tree so the build is
+# self-contained / EU-deployable with no system libgit2 dependency. An in-process library (like
+# tantivy), part of the default `cargo build --workspace` — NOT a network backend, so it does NOT
+# ride the `integration` feature and keeps the build DB-free.
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
+
 # ----------------------------------------------------------------------------------------------
 # REAL-BACKEND CLIENTS (Stage 1 / infra). Declared here once for a single pinned shape, but
 # referenced ONLY behind the `integration` cargo feature in the crates that own the trait impls

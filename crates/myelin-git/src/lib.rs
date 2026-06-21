@@ -92,7 +92,17 @@
 
 pub mod check_status;
 pub mod commit;
+/// The **GitCore layered seam** (GIT-P8 / P-269, M3-G1): the strategy trait + router that sends
+/// wire/maintenance ops to sandboxed canonical `git` (the [`core::WireExecutor`] port) and read
+/// ops to the in-process backend. The internal substrate GIT-P9 (receive-pack) + GIT-P13 (serving
+/// tier) build on. See the module docs for the TE-8 position, the no-host-exec discipline, and the
+/// OQ-1 gix-ward floor (GIT-P33).
+pub mod core;
 pub mod events;
+/// The in-process read backend ([`gix_backend::GixCore`]) over `git2` (libgit2 — the
+/// architecture-named fallback; gix-preferred is the OQ-1 floor, GIT-P33). Read/diff/blame with no
+/// `git` fork (no-host-exec by construction).
+pub mod gix_backend;
 pub mod holder_intent;
 pub mod notif_rules;
 pub mod rebac_fragment;

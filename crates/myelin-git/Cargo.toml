@@ -77,6 +77,15 @@ serde_json.workspace = true
 blake3.workspace = true
 hex.workspace = true
 
+# git2 (libgit2) — the in-process READ backend of the GitCore layered seam (GIT-P8 / P-269,
+# arch 01 §2.2). The architecture-NAMED fallback (gix-preferred is the OQ-1 floor, GIT-P33), used
+# here because gix 0.84 does not compile on the workspace toolchain. A real in-process read/diff/
+# blame path — NOT a `git` fork (no-host-exec holds by construction). default-features=false +
+# vendored-libgit2: in-process object-DB reads only, no SSH/HTTPS transport, C lib built in-tree
+# (self-contained / EU-deployable). Part of the default build (an in-process library like tantivy);
+# does NOT touch a DB/object-store/cache/bus contract, so the build stays DB-free.
+git2.workspace = true
+
 # DEV-ONLY: the rich ReBAC namespace ENGINE (FragmentDef / Userset / StoreBackedCheck) lives in the
 # Identity SERVICE crate. The runtime Git fragment is the names-only `myelin_identity::Namespace-
 # Fragment` ABI carrier (above) — a producer LEAF never depends on a service crate (the §2.9 DAG
