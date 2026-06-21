@@ -499,6 +499,7 @@ pub mod fanout;
 pub mod holders;
 pub mod orchestration;
 pub mod posture;
+pub mod producer_holders;
 pub mod registries;
 pub mod restrict_fanout;
 pub mod retention;
@@ -572,6 +573,11 @@ pub use orchestration::{
 pub use posture::{
     reference_is_by_reference, restatement_markers, ErasurePosture, LegalStatus, StructuralLever,
     SubsystemReference, CANONICAL_POSTURE, POSTURE_ANCHOR, POSTURE_CONTRACT_ROW,
+};
+pub use producer_holders::{
+    producer_holder_ids, producer_holder_schemas, producer_phase_of, producer_registrations,
+    AgentTraceModel, GitDbHolder, KnowledgeAgentTraceHolder, KnowledgeStoreHolder,
+    KnowledgeStoreModel, ProducerHolderRegistration,
 };
 pub use registries::{
     is_eea_region, ConsentRecord, ConsentRegistry, SubProcessor, SubProcessorRegistry, TransferGate,

@@ -883,6 +883,11 @@ cdc = [
     # REGISTRATION SEAM; locate/export empty-but-correct, erase/rectify/restrict no-ops naming their
     # AG-P23 / AG-P19 follow-on). The provider+consumer pair fans out via `dyn PersonalDataHolder`.
     "crates/myelin-agent-service/tests/cdc_10_1_agent_holder.rs",
+    # P-GA-27 → P-256 — the M3 PRODUCER-holder fan-out leg: the orchestrator fans to Git H1 /
+    # Knowledge H4 / agent-trace H17 (crypto-shred inline bodies / blocks+db-rows+embeddings / the
+    # agent trace), and those holders respond. The Knowledge instance (10.9 by reference) + the H17
+    # trace holder body (distinct from audit) light up here; the Git X-7 instance is P-GA-28 → P-257.
+    "crates/myelin-gdpr-service/tests/cdc_10_1_producer_holders.rs",
 ]
 
 [[contract]]
