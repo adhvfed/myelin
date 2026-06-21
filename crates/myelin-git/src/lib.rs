@@ -171,6 +171,16 @@ pub mod notif_rules;
 /// and the residency-pin lint (repos relocatable, never node-pinned — STOR-5). Floors GF-1 (object-
 /// backed packs) / GF-2 (cross-cell) / GF-2b (SHA-256 flip) / GF-4 (Mononoke-class) all → GIT-P33.
 pub mod pack_tier;
+/// **`project(ref, viewer)` for git artifacts + the `ArtifactRef` id grammar** (GIT-P18 / P-279,
+/// M3-G3 — the projection half): the [`project::Projector::project`] is the ONLY way Refs/Search/Notif
+/// read a git artifact (no cross-DB), **per-viewer permission-checked** — a viewer without access gets
+/// a [`project::Tombstone`], NEVER the title (0 title leaks; feeds the M3-G5/M5 leak drills GIT-D11 /
+/// SRCH-D1/D3). The [`project::git_pr_ref`] / [`project::git_commit_ref`] helpers mint git's STABLE
+/// canonical keys (`pr/<repo>:<n>`, `commit/<repo>:<sha>`) through the ONE Refs codec; the
+/// [`project::display_key`] `#1421`/short-sha is render-time ONLY (0 stored display keys, REF-3).
+/// Floors: the live OLTP store is GIT-P20; the `blob`/`#L<a>-L<b>` content-anchored 4-state resolver is
+/// GIT-P24; cross-cell projection is single-home (the named multi-cell floor).
+pub mod project;
 pub mod rebac_fragment;
 /// The **receive-pack write path** (GIT-P9 / P-270, M3-G1): the in-process Rust policy +
 /// one-transaction ref-CAS + `git.ref.updated` outbox emit (the silent-data-loss floor, GIT-D9 —

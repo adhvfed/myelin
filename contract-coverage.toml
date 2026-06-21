@@ -476,8 +476,17 @@ cdc = ["crates/myelin-refs/tests/cdc_5_1_artifactref.rs"]
 [[contract]]
 row = "5.2"
 title = "resolve(ref, viewer, mode)"
-status = "deferred"
-landing = "P-159"
+# GIT-P18 / P-279 ships the GIT-OWNED half of 5.2/5.6: `project(ref, viewer)` for git artifacts
+# (`myelin_git::project::Projector::project`) — the ONLY way Refs/Search/Notif read a git artifact
+# (no cross-DB), per-viewer permission-checked: a denied viewer gets a content-free Tombstone, NEVER
+# the title (the 0-leak invariant that feeds the M3-G5/M5 leak drills GIT-D11 / SRCH-D1/D3). The CDC
+# carries the provider (git mints canonical keys + permission-first project) + consumer (a downstream
+# reader sees the {title,state,icon} projection IFF authorized, else "(not available)") pair. FLOOR
+# (named): the GENERAL Refs `resolve(ref, viewer, mode)` 4-step tombstone LADDER over ALL subsystems
+# (the per-kind resolution spine) is the P-159 Refs-resolver follow-on; the `blob`/`#L<a>-L<b>`
+# content-anchored sub-resolver is GIT-P24; cross-cell projection is single-home (the multi-cell floor).
+status = "covered"
+cdc = ["crates/myelin-git/tests/cdc_5_1_5_2_5_6_git_project.rs"]
 
 [[contract]]
 row = "5.3"
@@ -519,8 +528,12 @@ landing = "P-163"
 [[contract]]
 row = "5.6"
 title = "project(ref, viewer)"
-status = "deferred"
-landing = "P-159"
+# COVERED by GIT-P18 / P-279 (the git-owned `project(ref, viewer)` half — the SAME provider+consumer
+# pair as row 5.2): git's `project` is the ONLY way Refs/Search/Notif read a git artifact, per-viewer
+# permission-checked (deny ⇒ Tombstone, 0 title leak). The general Refs resolver bulk (the per-kind
+# resolution spine across ALL subsystems) remains the P-159 follow-on (named in row 5.2).
+status = "covered"
+cdc = ["crates/myelin-git/tests/cdc_5_1_5_2_5_6_git_project.rs"]
 
 [[contract]]
 row = "5.7"
