@@ -2224,6 +2224,7 @@ dependencies = [
  "hex",
  "myelin-events",
  "myelin-gdpr",
+ "myelin-git",
  "myelin-identity",
  "myelin-substrate",
  "myelin-tenancy",

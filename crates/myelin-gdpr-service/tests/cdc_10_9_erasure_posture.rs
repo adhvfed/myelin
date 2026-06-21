@@ -21,7 +21,8 @@
 //! shape drifts, this stops compiling/passing — that is the contract.
 
 use myelin_gdpr_service::{
-    reference_is_by_reference, LegalStatus, StructuralLever, SubsystemReference, CANONICAL_POSTURE,
+    git_residual_is_the_one_posture, git_section_references_posture, reference_is_by_reference,
+    LegalStatus, StructuralLever, SubsystemReference, CANONICAL_POSTURE, GIT_INSTANCE,
     POSTURE_ANCHOR,
 };
 
@@ -68,6 +69,24 @@ fn a_by_reference_consumer_cites_the_anchor_and_is_accepted() {
     assert!(
         reference_is_by_reference(&git_like),
         "the provider+consumer 10.9 pair: a by-reference subsystem section is accepted"
+    );
+}
+
+/// **consumer (10.9) — the REAL Git instance (P-GA-28): the consumer half of the 10.9 pair now FIRES
+/// over a live subsystem register.** The Git-like SHAPE above was the stub; this asserts the PRODUCTION
+/// [`GIT_INSTANCE`] register cites the canonical anchor, does not restate the posture, and that GIT-D2's
+/// residual == the ONE platform-posture residual. The P-GA-16/P-GA-18 stubs are completed: the
+/// `references-it-never-restates` assertion now fires over the first REAL subsystem doc.
+#[test]
+fn the_real_git_instance_completes_the_10_9_consumer_half() {
+    assert_eq!(GIT_INSTANCE.cited_anchor, POSTURE_ANCHOR, "the real Git instance cites the ONE anchor");
+    assert!(
+        git_section_references_posture(),
+        "the REAL Git erasure section references the posture (does not restate it) — P-GA-28"
+    );
+    assert!(
+        git_residual_is_the_one_posture(),
+        "GIT-D2's residual == the ONE platform-posture residual (confirmed equal, not restated)"
     );
 }
 
