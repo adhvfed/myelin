@@ -87,6 +87,7 @@ pub mod hitl;
 pub mod hitl_batch;
 pub mod holder;
 pub mod identity;
+pub mod long_park;
 pub mod loop_guards;
 pub mod migrations;
 pub mod mock;
@@ -236,6 +237,24 @@ pub use hitl_batch::{
 pub use loop_guards::{
     AgentLoopGuards, GuardRefusal, GuardVerdict, IdempotentToolLedger, ReferenceGate, SelfGuard,
     AGENT_CEILING, AGENT_DISPATCH_POOL_CAP, AGENT_SHARED_ROOT_CAP,
+};
+
+// The SCHEDULE_AND_RUN_JOB long-park idiom CONSUMED by the Agent-Fabric (AG-P16 → P-228, M2-C,
+// §5.6): a long `kind=agent` `ToolHands::exec` job (a compute that takes minutes-to-hours) dispatches
+// via the engine's `WfCtx::schedule_and_run_job` (9.2) and the run PARKS holding NO runtime;
+// completion arrives HOURS later as a durable `job.done` signal (9.4) idempotent on the deterministic
+// dispatch idem_token (a doubly-delivered job.done wakes the run EXACTLY ONCE). On wake the per-run
+// token is RE-MINTED through the engine's wait-resume leg (4.7 / §5.7 C6, AG-P13 — token life ==
+// activity life). The Fabric CONSUMES the idiom (the `AgentJobDispatcher` JobRunner async-dispatches
+// the SAME hardened SandboxJob the in-line exec builds — the routing split + four-guarantee profile
+// are identical; only completed-by-signal instead of in-line); it does NOT reinvent durable waits.
+// The metered form fronts the dispatch with the reserve/settle bookend (11.7 — no balance → never
+// dispatched). NO FLOOR — the idiom is consumed from the durable-workflow engine; the real microVM
+// backend (CI-P2 → P-237) + the ZERO-escapes real-kernel GATE (AG-P17 → P-229) are RECORDED in
+// `crate::exec`, not owned here.
+pub use long_park::{
+    dispatch_long_compute, dispatch_long_compute_metered, AgentJobDispatcher, LongComputeProfile,
+    LongParkOutcome,
 };
 
 // The delegation-scoped tool-list (AG-P7 → P-219): the `list_objects` SetExpr push-down (the no-N+1

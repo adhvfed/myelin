@@ -256,6 +256,18 @@ impl SandboxJob {
         &self.spec
     }
 
+    /// **Re-stamp the dispatch `idem_token` on the hardened spec (the `SCHEDULE_AND_RUN_JOB`
+    /// long-park dedup key, §5.6 / §4.9).** The in-line `exec` form (AG-P15) carries the Fabric's own
+    /// idem token; the LONG-PARK form (AG-P16, [`crate::long_park`]) instead stamps the ENGINE's
+    /// DETERMINISTIC dispatch token (minted on the dispatch position, deterministic on the run's
+    /// `command_id`) so the runner echoes THAT token on the `job.done` signal — the no-coordination
+    /// dedup agreement the workflow keys its `wait_for_signal` on. Returns the same hardened spec with
+    /// only the dedup token rebound (the four-guarantee profile is untouched). Chainable.
+    pub fn with_dispatch_idem_token(mut self, idem_token: IdemToken) -> SandboxJob {
+        self.spec.idem_token = idem_token;
+        self
+    }
+
     /// The child env after the platform-token scrub (guarantee #2; the env the guest actually sees).
     pub fn scrubbed_env(&self) -> &[EnvVar] {
         &self.spec.env

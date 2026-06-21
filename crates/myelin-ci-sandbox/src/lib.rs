@@ -376,6 +376,29 @@ pub trait SandboxBackend {
     /// Whole-guest kill on teardown (arch 01 §2): the guest is destroyed, never reused across
     /// tenants/jobs. Idempotent (killing an already-dead guest is a no-op success).
     fn kill(&self, h: &SandboxHandle) -> Result<(), Self::Error>;
+
+    /// **The ASYNC-DISPATCH seam for the `SCHEDULE_AND_RUN_JOB` long-park idiom (arch agent-fabric
+    /// §5.6; AG-P16 → P-228).** Where [`launch`](SandboxBackend::launch) BLOCKS for the duration of an
+    /// in-line `compute` job (it returns the [`SandboxHandle`] only when the guest is up and the four
+    /// guarantees have fired), `accept_async` DISPATCHES a long job (one that takes minutes-to-hours)
+    /// and RETURNS immediately — the caller (the durable workflow) then PARKS holding no runtime and is
+    /// resumed HOURS later by the durable `job.done` signal the runner delivers when the job finishes.
+    ///
+    /// It returns `Ok(())` if the runner ACCEPTED the job for asynchronous execution (the dispatch
+    /// succeeded, NOT the job — completion arrives later as `job.done`), or `Err(..)` if the dispatch
+    /// itself failed (the runner is unreachable / rejected the spec) — a dispatch failure surfaces LOUD
+    /// so the workflow's dispatch activity RETRIES it on the SAME `idem_token` (the runner dedups a
+    /// re-dispatched job on it). The `spec.idem_token` is the dispatch dedup key the runner echoes on
+    /// the `job.done` signal (the no-coordination agreement).
+    ///
+    /// **Default:** accept the spec (return `Ok(())`). A backend that genuinely supports asynchronous
+    /// dispatch (the real microVM fleet, CI-P2/CI-P14) overrides this to enqueue the guest and arrange
+    /// the eventual `job.done` delivery; the default makes every backend usable on the long-park path
+    /// without a second hardening profile (the long-park job is the SAME hardened `JobSpec`).
+    fn accept_async(&self, spec: &JobSpec) -> Result<(), Self::Error> {
+        let _ = spec;
+        Ok(())
+    }
 }
 
 /// A runner class (the label-class the scheduler/fleet sizes a warm buffer per — arch 02 §5.4).
