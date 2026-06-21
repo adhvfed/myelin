@@ -192,6 +192,31 @@ impl WfJournal {
             .collect()
     }
 
+    /// All `wf_history` rows for a tenant, in commit order (the tenant-scoped journal scan the
+    /// `PersonalDataHolder` `locate`/`export` over `wf_history` consumes — P-FLOW-03). Tenant-first:
+    /// the DSR fan-out is per (subject, tenant), so the holder scopes its scan to ONE tenant's rows.
+    pub fn history_in_tenant(&self, tenant: &TenantId) -> Vec<WfHistoryRow> {
+        self.lock()
+            .history
+            .iter()
+            .filter(|r| &r.tenant == tenant)
+            .cloned()
+            .collect()
+    }
+
+    /// **Test/holder seam: append a `wf_history` row directly** (bypassing the [`WfCtx`] co-commit),
+    /// so a unit/CDC test of a journal CONSUMER (the P-FLOW-03 holder's `locate`/`erase` over a
+    /// populated journal — [`crate::holder`]) can seed the journal with a known set of refs-stored
+    /// rows, then assert the structural-erase 0-mutation property, without standing up a whole run.
+    /// Routes through the SAME private `commit_rows` (one write path, idempotent on
+    /// `(tenant, run_id, command_id)` §3.2) — NO second store. NOT a production write path: the ONE
+    /// production write path is [`WfCtx::commit`] (the FLOW-D5 co-commit). Mirrors Notif's
+    /// `upsert_for_test` holder seam.
+    #[doc(hidden)]
+    pub fn append_history_for_test(&self, row: WfHistoryRow) {
+        self.commit_rows(vec![row], Vec::new());
+    }
+
     /// The `wf_activity_attempt` ledger rows for a run, in attempt order.
     pub fn attempts_for(&self, tenant: &TenantId, run_id: &str) -> Vec<WfActivityAttemptRow> {
         self.lock()
