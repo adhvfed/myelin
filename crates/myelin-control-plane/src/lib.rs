@@ -145,6 +145,7 @@ pub mod holder;
 pub mod isolation;
 pub mod place;
 pub mod placement_of;
+pub mod placement_of_repo;
 pub mod provision;
 pub mod registry;
 pub mod residency_verify;
@@ -163,6 +164,7 @@ pub use isolation::{partition_key, IsolationTier, PartitionKey, PoolStore};
 pub use placement_of::{
     CellGateway, GatewayReject, Misroute, MisrouteAudit, MisrouteAuditRecord, PlacementOf,
 };
+pub use placement_of_repo::{RepoPlacement, RepoPlacementError, StorageGroup};
 pub use provision::{
     ProvisionFailure, ProvisionVerdict, ProvisioningGate, ProvisioningSignals, STEP_ACTIVATE,
     STEP_READINESS, STEP_RESTORE_VERIFY,
