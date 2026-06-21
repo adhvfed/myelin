@@ -1,0 +1,6 @@
+-- P-FLOW-01 GREEN fixture for `forward-only-migration` — the lint MUST admit this.
+-- The expand step of expand->backfill->contract: a NULLABLE column add takes no blocking lock,
+-- and there is no down migration (a rollback would be a NEW forward migration). The shape the six
+-- flow migrations use (fresh CREATE TABLE, then later online column adds).
+ALTER TABLE wf_history ADD COLUMN result_key_ref TEXT;
+CREATE INDEX CONCURRENTLY idx_wf_history_command ON wf_history (tenant_id, run_id, command_id);

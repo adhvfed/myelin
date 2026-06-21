@@ -1,0 +1,10 @@
+// P-FLOW-01 RED fixture for `no-cross-db` — the lint MUST reject this. The flow engine reaches into
+// ANOTHER service's storage module: the cross-DB coupling bug class (ADR-01, EI-02 §8 — one DB per
+// service). myelin-flow is Postgres-EMBEDDED in its OWN DB; it may couple to siblings only over the
+// frozen contract crate, never a shared data path. Here it imports Identity's internal store.
+use myelin_identity::store::PrincipalStore;
+use myelin_identity::db::ConnectionPool;
+
+pub fn read_principals_directly(store: &PrincipalStore) {
+    let _ = store;
+}

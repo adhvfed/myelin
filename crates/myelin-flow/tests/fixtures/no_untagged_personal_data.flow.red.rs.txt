@@ -1,0 +1,11 @@
+// P-FLOW-01 RED fixture: a wf_history row carrying an inline-PII result body with NO
+// #[personal_data(...)] tag — the un-erasable-subject bug class the no-untagged-personal-data lint
+// exists to kill. The flow engine is references-not-payloads, so the rare inline-PII result MUST be
+// envelope-encrypted + tagged (the result_key_ref crypto-shred lever); an untagged inline body
+// leaves an un-erasable subject. NOT real crate code (lives under /fixtures/, excluded from the
+// live lint-gate).
+pub struct WfHistoryRow {
+    pub tenant_id: String,
+    pub region: String,
+    pub message_body: String,
+}

@@ -109,6 +109,19 @@ members = [
     # data model (NOTIF-P2), the Signal-consumer router (NOTIF-P3), and the holder (NOTIF-P4) are
     # the named floors. See the crate-level note in crates/myelin-notif/src/lib.rs.
     "crates/myelin-notif",
+    # The durable-workflow SUBSTRATE crate (P-FLOW-01 → P-197, M2). myelin-flow is a BUILD,
+    # DBOS-class, Postgres-embedded engine (architecture durable-workflow.md §2, ADR-09 — NO new
+    # datastore). At P-FLOW-01 it carries the SCHEMA ONLY: the six-table data model (architecture
+    # §3 — workflow_run / wf_history / wf_timer / wf_signal / wf_activity_attempt / wf_definition)
+    # as forward-only `(tenant, region)`-first RLS migrations, plus the row TYPE carriers with the
+    # `#[personal_data(...)]` tags on the rare inline-PII result/payload envelope key refs. Like
+    # the other service/subsystem crates (myelin-notif / myelin-agent-service) it is a LEAF
+    # CONSUMER above the glue crates (depends on -tenancy/-refs/-gdpr/-substrate) and is NOT a node
+    # in the eleven-crate library DAG modelled by crate_graph.rs — nothing in the production DAG
+    # depends back on it; substrate_is_root()/identity_is_sink() are preserved. The AppSpec service
+    # shell (P-FLOW-02), the holder auto-registration (P-FLOW-03), and the algorithms
+    # (P-FLOW-04..08) are the named floors. See the crate-level note in crates/myelin-flow/src/lib.rs.
+    "crates/myelin-flow",
     # The Chat SUBSYSTEM crate (CHAT-P1 → P-128, M2). Chat is the MAXIMAL CONSUMER subsystem
     # (architecture chat 00-overview §2.1). At CHAT-P1 it carries ONLY the M2-C0
     # "freeze-so-dependents-compile" taxonomy slice: the COMPLETE `chat.*` event-token list

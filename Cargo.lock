@@ -2152,6 +2152,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "myelin-flow"
+version = "0.0.0"
+dependencies = [
+ "myelin-config",
+ "myelin-gdpr",
+ "myelin-lints",
+ "myelin-refs",
+ "myelin-substrate",
+ "myelin-tenancy",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
 name = "myelin-gdpr"
 version = "0.0.0"
 dependencies = [
