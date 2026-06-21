@@ -35,7 +35,9 @@
 //!   EMPTY seam (the replay engine plus the signal/timer consumers are P-FLOW-04..05/09/13).
 //! - **The `PersonalDataHolder` auto-registration** over `workflow_run` / `wf_history` / `wf_signal`
 //!   (the structural references-not-payloads half) → **P-FLOW-03** (P-201).
-//! - **The algorithms**: WfCtx + journal/outbox co-commit (**P-FLOW-04**, FLOW-D5); deterministic
+//! - **The algorithms**: WfCtx + journal/outbox co-commit (**P-FLOW-04**, FLOW-D5) — **LANDED**,
+//!   see [`wfctx`] ([`WfCtx`]: `activity`/`now`/`rand`/`emit` + the single-txn co-commit; the
+//!   FLOW-D5 drill is `tests/drills_flow_d5_cocommit.rs`); deterministic
 //!   replay + lease dispatch + crash recovery (**P-FLOW-05**, FLOW-D1); the DurableExecutor
 //!   (**P-FLOW-06**); the replay-divergence guard (**P-FLOW-07**, FLOW-D2); the flow-determinism
 //!   lint fixtures (**P-FLOW-08**); durable signals (**P-FLOW-09**); durable timers
@@ -55,5 +57,9 @@
 pub mod app;
 pub mod migrations;
 pub mod schema;
+pub mod wfctx;
 
 pub use app::{boot_flow, flow_app_spec, run_flow, SERVICE_NAME};
+pub use wfctx::{
+    attempt_state, history_kind, ActivityError, RetryPolicy, WfCtx, WfError, WfJournal, WfResult,
+};

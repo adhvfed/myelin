@@ -92,7 +92,7 @@ pub struct WorkflowRunRow {
 /// key); the `UNIQUE(tenant, run_id, command_id)` makes journaling idempotent. `result` is
 /// references-not-payloads; `result_key_ref` is the ONLY PII locator — the inline-PII crypto-shred
 /// envelope key (§4.8).
-#[derive(PersonalData)]
+#[derive(PersonalData, Clone, Debug, PartialEq)]
 pub struct WfHistoryRow {
     /// `(tenant, region)` partition key — opaque routing keys, no tag.
     pub tenant: TenantId,
@@ -194,7 +194,7 @@ pub struct WfSignalRow {
 /// The `wf_activity_attempt` row (architecture §3.5) — the idempotency ledger; `(tenant, region)`-
 /// first. `idem_token` bridges to BUS-2 so a retried emit is broker-deduped (§3.5). Carries NO PII
 /// column.
-#[derive(PersonalData)]
+#[derive(PersonalData, Clone, Debug, PartialEq)]
 pub struct WfActivityAttemptRow {
     /// `(tenant, region)` partition key — opaque routing keys, no tag.
     pub tenant: TenantId,

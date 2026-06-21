@@ -51,6 +51,14 @@ myelin-gdpr = { path = "../myelin-gdpr" }
 # is_destructive (contract 1.5). The migrations are built through it so the boot-time runner
 # applies them forward-only AND the forward-only-migration lint reads them at source-scan.
 myelin-substrate = { path = "../myelin-substrate" }
+# The transactional outbox (contract 2.2/2.3): OutboxStore / OutboxTransaction / OutboxTx::emit —
+# the ONLY emit path (BUS-2, §4.5). The WfCtx core (src/wfctx.rs, P-FLOW-04) journals its
+# wf_history row + emits its event in the SAME transaction (the FLOW-D5 co-commit), via this
+# crate's emit-iff-committed primitive. EventDraft / EventEnvelope / EmitContextBase / IdMinter
+# are the canonical substrate emit types the WfCtx surface consumes (NO second emit path).
+myelin-events = { path = "../myelin-events" }
+# serde_json — the EventDraft payload is a serde_json::Value (the WfCtx emit surface consumes it).
+serde_json = { workspace = true }
 
 # REAL Postgres backend behind the `integration` feature (Stage 1 / infra). OPTIONAL deps pulled
 # ONLY by `--features integration`, which compiles the live-PG schema-apply + RLS denial +
@@ -67,6 +75,22 @@ tokio = { workspace = true, optional = true }
 # no-cross-db) run over RED/GREEN fixtures so a regression that lets a destructive migration / an
 # untagged-PII column / a tenant-less query / a cross-DB reach slip through fails THIS build.
 myelin-lints = { path = "../myelin-lints" }
+# The Actor/Principal the WfCtx co-commit tests (src/wfctx.rs) build the EmitContextBase actor
+# from — test-only (the production WfCtx takes a caller-supplied EmitContextBase; the principal
+# type is needed only to CONSTRUCT one in unit tests).
+myelin-identity = { path = "../myelin-identity" }
+# The M0 failure-injection harness (DependencyBreaker / SignalSource / Predicate / DrillRegistry):
+# the FLOW-D5 co-commit drill (tests/drills_flow_d5_cocommit.rs) rides the scoped-reversible
+# injector to inject the "crash between journal and emit" fault + reads the survival signals
+# (outbox_depth / dead_letter_count) — the inject → load → assert green unit-of-proof (EI-01 §4).
+myelin-harness = { path = "../myelin-harness" }
+# The Relay + InProcessBus that drain the co-committed outbox in the FLOW-D5 drill (so the drill
+# proves the journaled-AND-emitted step is delivered exactly-once, 0 ghost / 0 lost).
+myelin-events = { path = "../myelin-events" }
+# serde_json — the EventDraft payload in the drill/CDC fixtures.
+serde_json = { workspace = true }
+myelin-tenancy = { path = "../myelin-tenancy" }
+myelin-refs = { path = "../myelin-refs" }
 
 [features]
 # The live-PG integration test (tests/integration_flow_schema.rs). DB-free by default.
