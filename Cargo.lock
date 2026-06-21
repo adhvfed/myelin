@@ -2104,9 +2104,15 @@ dependencies = [
 name = "myelin-ci-sandbox"
 version = "0.0.0"
 dependencies = [
+ "myelin-config",
+ "myelin-events",
+ "myelin-flow",
+ "myelin-refs",
  "myelin-tenancy",
  "serde",
  "serde_json",
+ "sqlx",
+ "tokio",
 ]
 
 [[package]]

@@ -39,15 +39,48 @@ publish = false
 # carrier and NOTHING in the production DAG depends back on myelin-ci-sandbox, so this leaf edge
 # keeps the §2.9 graph acyclic.
 myelin-tenancy = { path = "../myelin-tenancy" }
+# The runner agent (CI-P3 → P-238) reports terminal via the FROZEN `job.done` durable signal
+# (9.2/9.4) — it ECHOES the workflow-minted `idem_token` onto the ENGINE's `DurableExecutor::signal`
+# (`SignalSpec{signal_name = JOB_DONE_SIGNAL, idem_key = idem_token}`), whose `INSERT … ON CONFLICT
+# (tenant, run_id, signal_name, idem_key) DO NOTHING` IS the exactly-once wake (recon §OQ-F, shipped
+# P-FLOW-09/P-205). The runner does NOT build a second signal path — it consumes the one engine
+# signal idempotency. NO cycle: `myelin-flow` is a TERMINAL DAG consumer (nothing depends back on it,
+# and it has no edge to `myelin-ci-sandbox`), so `myelin-ci-sandbox → myelin-flow` stays acyclic —
+# exactly the edge `myelin-agent-service` already carries to both crates.
+myelin-flow = { path = "../myelin-flow" }
+# The `job.done` signal payload is references-not-payloads `ArtifactRef`s (§3.4) — the terminal
+# report carries result refs (the `ci.log.available` pointer + artifact refs), never a PII body.
+myelin-refs = { path = "../myelin-refs" }
 serde.workspace = true
 
 [features]
-# The REAL hardened-boot self-test (tests/hardened_boot_selftest.rs) boots a Firecracker microVM with
-# the full hardening profile ON and asserts (from real enforced state) egress-default-deny + pids.max
-# + read-only-root. VM-free by default: the boot is integration-only, gated to SKIP gracefully when
-# /dev/kvm or `firecracker` is absent (so CI without KVM passes). `cargo build --workspace` + the
-# default `cargo test` stay DB-free AND VM-free (CI-P2 GATE).
-integration = []
+# Two REAL live-stack proofs, both DB/VM-free by default:
+#   - tests/hardened_boot_selftest.rs (CI-P2) boots a Firecracker microVM with the full hardening
+#     profile ON; gated to SKIP gracefully without /dev/kvm or `firecracker`.
+#   - tests/integration_runner_lease.rs (CI-P3 → P-238) proves the runner-side lease handshake
+#     against REAL Postgres: claim (`FOR UPDATE SKIP LOCKED`) + heartbeat-renew + the exactly-once
+#     terminal report (`job.done` ON CONFLICT DO NOTHING → double-deliver buffers once). The
+#     `FOR UPDATE SKIP LOCKED` lease is a Postgres contract — it MUST be proven on the live stack,
+#     not mocked. Run: cargo test -p myelin-ci-sandbox --features integration.
+# `cargo build --workspace` + the default `cargo test` stay DB-free AND VM-free.
+integration = ["dep:myelin-config", "dep:sqlx", "dep:tokio"]
+
+[dependencies.myelin-config]
+path = "../myelin-config"
+optional = true
+
+[dependencies.sqlx]
+workspace = true
+optional = true
+
+[dependencies.tokio]
+workspace = true
+optional = true
 
 [dev-dependencies]
 serde_json.workspace = true
+# The `MonotonicMinter` (the `IdMinter` the unit tests build a `FlowExecutor` over to PROVE the
+# runner's `job.done` reports onto the ONE engine signal path). Dev-dep ONLY — the production runner
+# takes a caller-supplied executor; the minter is needed only to CONSTRUCT one in the unit tests.
+# NO cycle: nothing in the production DAG depends back on myelin-ci-sandbox.
+myelin-events = { path = "../myelin-events" }
