@@ -57,8 +57,15 @@
 //!     [`signal_consumer`] ([`FlowSignalConsumer`] the bus side wired into the consumer slot via
 //!     [`flow_signal_consumer_reg`]) + the signal-buffer-depth telemetry on [`FlowTelemetry`]; the
 //!     9.1 signal CDC pair is `tests/cdc_9_1_signal.rs`, the live-PG ON CONFLICT apply
-//!     `tests/integration_flow_signal.rs`; the consuming wait (`wait_for_signal`) is **P-FLOW-11**
-//!     and the per-effect `idem_key`-construction rule is **P-FLOW-10**); durable timers
+//!     `tests/integration_flow_signal.rs`; the consuming wait (`wait_for_signal`) is **P-FLOW-11**);
+//!     the per-effect `idem_key`-construction rule for batch/partial HITL approval (**P-FLOW-10**)
+//!     — **LANDED**, see [`approval`] ([`per_effect_idem_key`] the FROZEN §6.4 rule — `card_id`
+//!     single / `card_id:effect_idx` multi — over the P-FLOW-09 signal delivery + [`apply_approved_effects`]
+//!     the gated loop: each approved effect → exactly one `EffectApi::apply`, a declined effect is
+//!     WITHHELD (`Denied`, 0 mutation, AG-8), a double-click on "approve all" re-sends the same keys
+//!     → ON CONFLICT DO NOTHING → 0 double-apply; the 9.1 per-effect CDC pair vs the Agent Fabric
+//!     `EffectApi` consumer is `tests/cdc_9_1_per_effect.rs`; the F-4-extended drill across a
+//!     restart+deploy lands at **P-FLOW-12** and at **CHAT-D10** M4); durable timers
 //!     (**P-FLOW-13**, FLOW-D3) — the rest land later. An empty journal is not a working engine.
 //!
 //! There is **no mandatory-core algorithm module** here (it is the schema + frozen type shapes), so
@@ -73,6 +80,7 @@
 //! is the graph's terminal consumer, not a node in it).
 
 pub mod app;
+pub mod approval;
 pub mod engine;
 pub mod executor;
 pub mod holder;
@@ -84,6 +92,10 @@ pub mod wfctx;
 pub use app::{
     boot_flow, flow_app_spec, flow_app_spec_with_engine, flow_signal_consumer_reg, run_flow,
     SERVICE_NAME,
+};
+pub use approval::{
+    apply_approved_effects, per_effect_idem_key, ApplyError, ApprovalCard, ApprovalDecision,
+    EffectApplier, EffectOutcome, GateResult, GatedEffect, APPROVAL_SIGNAL_NAME, DECLINE_MARKER,
 };
 pub use engine::{
     drive, run_state, DriveOutcome, FlowDispatcher, FlowTelemetry, RunRow, RunStore, SignalRow,

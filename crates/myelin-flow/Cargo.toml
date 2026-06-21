@@ -97,6 +97,13 @@ myelin-refs = { path = "../myelin-refs" }
 # production DAG is unchanged — myelin-query does NOT depend on myelin-flow, so no cycle; the CDC
 # test depends on BOTH ends of the seam to prove the agreement).
 myelin-query = { path = "../myelin-query" }
+# The Agent Fabric CONSUMER of the per-effect idem_key rule (contract 9.1 / §6.4): the CDC pair
+# (tests/cdc_9_1_per_effect.rs) pairs the myelin-flow PROVIDER (the per-effect key rule + the gated
+# loop over wf_signal, P-FLOW-10) with the Agent Fabric `EffectApi::apply` consumer fixture (each
+# approved effect → exactly one apply; a declined effect → withheld, AG-8). Dev-dep ONLY — the
+# production DAG is unchanged (myelin-agent does NOT depend on myelin-flow, so no cycle; the CDC
+# test depends on BOTH ends to prove the apply/withhold agreement).
+myelin-agent = { path = "../myelin-agent" }
 
 [features]
 # The live-PG integration test (tests/integration_flow_schema.rs). DB-free by default.

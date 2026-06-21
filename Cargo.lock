@@ -2155,6 +2155,7 @@ dependencies = [
 name = "myelin-flow"
 version = "0.0.0"
 dependencies = [
+ "myelin-agent",
  "myelin-config",
  "myelin-events",
  "myelin-gdpr",
