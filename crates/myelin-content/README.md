@@ -54,8 +54,10 @@ makes the round-trip byte-stable.
   v1 engine is a **read-projection FLOOR** (renders like `embed`, §2.4) shipped in
   **KN-P12**; the editable-in-place multi-home follow-on is post-M5 (**KQ-6**, designed
   against the CRDT).
-- **`db_view.view`** — carried as an `ArtifactRef`-keyed `ViewHandle` until
-  `myelin-query::ViewSpec` is frozen in **KN-P02** (a single compile break swaps it in).
+- **`db_view.view`** — RESOLVED in **KN-P02 (P-235)**: the `ViewHandle` floor is gone;
+  `db_view` now carries the frozen `myelin_query::ViewSpec` (13.3, X-3) directly. The
+  **ADF → `myelin-content` lossy-map (13.2)** also landed here (`adf` module): Knowledge
+  freezes the conversion table; Issues consumes it at import.
 - **WASM-artifact green** — the round-trip correctness gate is proven green natively
   against the identical single source. The "compiles to wasm32 from one source" artifact
   is gated by `build-wasm.sh`; on a host without the `wasm32-unknown-unknown` std

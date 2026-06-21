@@ -12,6 +12,10 @@ publish = false
 myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-events = { path = "../myelin-events" }
 myelin-identity = { path = "../myelin-identity" }
+# myelin-query is a same-tier mid-DAG crate (00 §2.9: `-events (+ -refs, -content, -query)`);
+# `db_view.view` carries the frozen `myelin_query::ViewSpec` (13.3), swapping the KN-P01
+# `ViewHandle` floor (P-235/KN-P02). query is std-only + serde-only, so it stays WASM-clean.
+myelin-query = { path = "../myelin-query" }
 serde.workspace = true
 
 [dev-dependencies]

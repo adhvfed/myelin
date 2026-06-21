@@ -1118,12 +1118,21 @@ cdc = ["crates/myelin-content/tests/cdc_13_1_taxonomy.rs"]
 
 [[contract]]
 row = "13.2"
+# P-235 (KN-P02): the frozen ADF -> myelin-content lossy-node map (the Issues import
+# conversion table; lossy nodes named + recorded in the import report, X-2/CR-9).
+# Knowledge PROVIDES the table; Issues' import CONSUMES it (builds the named targets +
+# records each lossy conversion).
 title = "ADF -> myelin-content lossy-map (frozen)"
-status = "deferred"
-landing = "P-235"
+status = "covered"
+cdc = ["crates/myelin-content/tests/cdc_13_2_adf_map.rs"]
 
 [[contract]]
 row = "13.3"
+# P-235 (KN-P02): the type/grammar half of the 13.3 primitive — the frozen FieldType enum
+# (field.rs, P-167), the ViewSpec view-model (view.rs), and the textual QueryAst grammar
+# parser (parse.rs) over the ONE Predicate core. Knowledge PROVIDES the shared definitions;
+# Issues + Search CONSUME them byte-identically (each owns its executor; the shapes are
+# identical, X-3). The order_key/LexoRank half rides the same crate (field.rs) + its unit tests.
 title = "myelin-query primitive (frozen byte-identical)"
-status = "deferred"
-landing = "P-235"
+status = "covered"
+cdc = ["crates/myelin-query/tests/cdc_13_3_query_primitive.rs"]

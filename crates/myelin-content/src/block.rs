@@ -16,6 +16,7 @@
 
 use crate::inline::Inline;
 use myelin_events::ArtifactRef;
+use myelin_query::ViewSpec;
 use serde::{Deserialize, Serialize};
 
 /// The frozen v1 block taxonomy (§2.1). Byte-for-byte the architecture's set:
@@ -62,11 +63,11 @@ pub enum Block {
         display: EmbedDisplay,
     },
     /// `db_view { db: ArtifactRef, view: ViewSpec }` — **Knowledge-only** in v1; a
-    /// `myelin-query` view. `ViewSpec` is frozen by KN-P02 (`myelin-query`); until that
-    /// crate lands it is carried opaquely here as an [`ArtifactRef`]-keyed view handle so
-    /// the taxonomy compiles without a forward dependency. (FLOOR — KN-P02 swaps in the
-    /// real `myelin_query::ViewSpec`.)
-    DbView { db: ArtifactRef, view: ViewHandle },
+    /// `myelin-query` view. `view` is the **frozen [`ViewSpec`]** (contract 13.3, X-3),
+    /// landed by **KN-P02 (P-235)** — the KN-P01 `ViewHandle` floor is now resolved: the
+    /// `db_view` carries the real structured view-model (kind/filter:`QueryAst`/group_by/
+    /// sort/visible/order_field), not an opaque ref.
+    DbView { db: ArtifactRef, view: ViewSpec },
     /// `toggle { summary: inline, blocks: [Block] }`.
     Toggle { summary: Inline, blocks: Vec<Block> },
     /// `sync_block { source: ArtifactRef }` — **Knowledge-only**; transclusion. The node
@@ -138,20 +139,11 @@ pub struct Cell {
     pub blocks: Vec<Block>,
 }
 
-/// A FLOOR handle for `db_view.view` until `myelin-query::ViewSpec` is frozen (KN-P02).
-/// Carries the view's `ArtifactRef` so the edge/reference surface is already correct;
-/// KN-P02 replaces this with the structured `ViewSpec`. Named so the forward dependency
-/// is explicit and the swap is a single compile break.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ViewHandle {
-    /// The `myelin-query` view this `db_view` renders (KN-P02 swaps in `ViewSpec`).
-    pub view_ref: ArtifactRef,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::inline::parse_inline;
+    use myelin_query::{FieldId, ViewSpec};
 
     #[test]
     fn heading_level_range_is_frozen() {
@@ -196,7 +188,7 @@ mod tests {
             Block::Divider,
             Block::Image { blob: ArtifactRef("myelin://t/blob/1".into()), alt: "a".into(), caption: None },
             Block::Embed { reference: ArtifactRef("myelin://t/issue/1".into()), display: EmbedDisplay::Card },
-            Block::DbView { db: ArtifactRef("myelin://t/db/1".into()), view: ViewHandle { view_ref: ArtifactRef("myelin://t/view/1".into()) } },
+            Block::DbView { db: ArtifactRef("myelin://t/db/1".into()), view: ViewSpec::table(FieldId::new("order_key")) },
             Block::Toggle { summary: parse_inline("more", &[]), blocks: vec![] },
             Block::SyncBlock { source: ArtifactRef("myelin://t/block/9".into()) },
         ];
