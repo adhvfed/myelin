@@ -45,8 +45,12 @@
 //!   ([`drive`] short-circuits the journaled prefix with 0 re-execution + [`RunStore`] lease
 //!   re-lease + [`FlowDispatcher`] the consumer-seam worker loop + [`FlowTelemetry`] the replay-rate
 //!   + 0-double-effect signals; the FLOW-D1 drill is `tests/drills_flow_d1_replay.rs`, the live-PG
-//!     apply `tests/integration_flow_replay.rs`); the DurableExecutor
-//!     (**P-FLOW-06**); the replay-divergence guard (**P-FLOW-07**, FLOW-D2); the flow-determinism
+//!     apply `tests/integration_flow_replay.rs`); the DurableExecutor start/describe/cancel + the
+//!     engine telemetry set (**P-FLOW-06**) — **LANDED**, see [`executor`] ([`FlowExecutor`]:
+//!     `start` idempotent-on-`idem_key` seeds a runnable run the dispatcher drives, `describe` reads
+//!     the [`RunStatus`], `cancel` terminates; the §1.8 activity-queue/retry/dead-letter telemetry
+//!     leg on [`FlowTelemetry`]; the 9.1 CDC pair is `tests/cdc_9_1_executor.rs`; the `signal` half
+//!     is the named follow-on **P-FLOW-09**); the replay-divergence guard (**P-FLOW-07**, FLOW-D2); the flow-determinism
 //!     lint fixtures (**P-FLOW-08**); durable signals (**P-FLOW-09**); durable timers
 //!     (**P-FLOW-13**, FLOW-D3) — the rest land later. An empty journal is not a working engine.
 //!
@@ -63,6 +67,7 @@
 
 pub mod app;
 pub mod engine;
+pub mod executor;
 pub mod holder;
 pub mod migrations;
 pub mod schema;
@@ -71,6 +76,10 @@ pub mod wfctx;
 pub use app::{boot_flow, flow_app_spec, flow_app_spec_with_engine, run_flow, SERVICE_NAME};
 pub use engine::{
     drive, run_state, DriveOutcome, FlowDispatcher, FlowTelemetry, RunRow, RunStore, WorkflowBody,
+};
+pub use executor::{
+    DurableExecutor, ExecutorError, FlowExecutor, RunBudget, RunId, RunStatus, StartSpec,
+    PARTITION_COUNT,
 };
 pub use holder::{
     flow_history_holder, flow_store_classifier, register_flow_holder, FlowBacking,
