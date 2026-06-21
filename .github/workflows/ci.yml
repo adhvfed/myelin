@@ -15,6 +15,15 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Infra levers (NOT a code change): as the workspace grew (sandbox/aws-lc-sys/ring/sqlx + all the
+  # M2/M3 crates) the standard GitHub runner began running OUT OF DISK while linking — the same
+  # `collect2: ld terminated with signal 7 [Bus error]` / `No space left on device` the integration
+  # workflow hit (see ~/myelin-handoff/03-infra-and-ci.md). debuginfo=0 is the big lever (debuginfo
+  # is the bulk of the link size); CARGO_INCREMENTAL=0 keeps target/ small. Paired with a
+  # free-disk-space step + rust-cache on the heavy compile jobs below.
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: "-C debuginfo=0"
+  RUSTDOCFLAGS: "-C debuginfo=0"
 
 jobs:
   architecture-lints:
@@ -23,6 +32,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Reclaim ~25GB on the runner (dotnet/android/ghc) so the workspace link does not run out of
+      # disk — see the env: note above. Loud-but-non-fatal so a tooling hiccup never fails the gate.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          large-packages: false
       - uses: dtolnay/rust-toolchain@stable
       - name: The twelve architecture lints over the workspace source (loud, non-zero on any violation)
         run: cargo run -p myelin-lints --bin lint-gate
@@ -39,6 +55,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Reclaim ~25GB on the runner (dotnet/android/ghc) so the workspace link does not run out of
+      # disk — see the env: note above. Loud-but-non-fatal so a tooling hiccup never fails the gate.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          large-packages: false
       - uses: dtolnay/rust-toolchain@stable
       - name: The contract-coverage scanner over the contract-index + manifest (loud, non-zero on any falsely-claimed row)
         run: cargo run -p myelin-lints --bin contract-coverage
@@ -58,6 +81,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Reclaim ~25GB on the runner (dotnet/android/ghc) so the workspace link does not run out of
+      # disk — see the env: note above. Loud-but-non-fatal so a tooling hiccup never fails the gate.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          large-packages: false
       - uses: dtolnay/rust-toolchain@stable
       - name: The SUB-M0 exit-gate scorecard (runs every required drill; non-zero on any red/missing row)
         run: cargo run -p myelin-harness --bin sub-m0-scorecard
@@ -80,6 +110,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Reclaim ~25GB on the runner (dotnet/android/ghc) so the workspace link does not run out of
+      # disk — see the env: note above. Loud-but-non-fatal so a tooling hiccup never fails the gate.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          large-packages: false
       - uses: dtolnay/rust-toolchain@stable
       - name: The Id M1→M2 exit-gate scorecard (re-runs every M1 Id drill; non-zero on any red/missing row)
         run: cargo run -p myelin-harness --bin id-m1-scorecard
@@ -90,6 +127,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Reclaim ~25GB on the runner (dotnet/android/ghc) so the workspace link does not run out of
+      # disk — see the env: note above. Loud-but-non-fatal so a tooling hiccup never fails the gate.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          large-packages: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
