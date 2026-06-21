@@ -283,6 +283,23 @@ pub enum PipelineStep {
     Applied,
 }
 
+/// **The verdict of the steps-1..6 gate run (the dry-run plan + the apply's pre-mutation decision).**
+/// The pipeline's first SIX steps (SCHEMA → CAPABILITY → DELEGATION → TENANT → BUDGET → HITL-GATE)
+/// are SIDE-EFFECT-FREE: they validate but never mutate or meter. This is exactly what `run --dry-run`
+/// returns (8.7 — *steps 1..6, no apply*), and exactly the decision [`apply_planned`](PlanThenApply::apply_planned)
+/// branches on before step 7. Extracting it makes the dry-run and the live apply share ONE code path
+/// (no second implementation — the plan a dry-run shows IS the plan the apply executes, AG-D9).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlanVerdict {
+    /// Steps 1..6 all PASS and the tool is NOT gated → the effect WOULD apply (step 7) if run live.
+    WouldApply,
+    /// Step 6 WITHHELD the effect (`requires_approval` + not yet approved) → it WOULD gate (does NOT
+    /// mutate). Carries the gate id the live apply would return.
+    WouldGate(GateId),
+    /// A step 1..6 DENIED the effect → it WOULD deny. Carries the deciding step + the reason.
+    WouldDeny(PipelineStep, String),
+}
+
 /// **The contract-1.8 survival signals the pipeline emits (the green artifacts; §3.1, EI-01 §3).**
 /// A path that denies/gates but emits NO signal has FAILED the drill. The AG-D2 drill reads the
 /// **denial counter** (it increments on every Denied) and the **fallback counter** (which is ALWAYS
@@ -397,20 +414,72 @@ where
     /// happens ONLY at step 7 via the subsystem's PUBLIC endpoint. Records the signals (the AG-D2
     /// denial counter, the meter) and returns the glue [`EffectResult`].
     pub fn apply_planned(&mut self, plan: &PlannedEffect) -> EffectResult {
+        // Steps 1..6 — the SIDE-EFFECT-FREE gate (schema → cap → delegation → tenant → budget →
+        // HITL-gate). Shared verbatim with `run --dry-run` (8.7): the plan a dry-run shows IS the
+        // plan the live apply executes (AG-D9 — there is no second pipeline). This records the
+        // denial/gated signals (the gate IS the decision); steps 7..8 below only run on WouldApply.
+        match self.plan_through_gate(plan) {
+            PlanVerdict::WouldDeny(step, reason) => return self.deny(step, reason),
+            PlanVerdict::WouldGate(gate_id) => {
+                // Step 6 WITHHELD — the tool does NOT mutate (AG-8). Count it + return Gated.
+                self.signals.gated = self.signals.gated.saturating_add(1);
+                return EffectResult::Gated(gate_id);
+            }
+            PlanVerdict::WouldApply => {}
+        }
+
+        // (7) APPLY — call the subsystem's PUBLIC endpoint as the agent principal (same gateway, no
+        //     carve-out) ⇒ the subsystem emits its domain event via ITS outbox. The ONLY mutation
+        //     path. A failed apply is surfaced LOUD and is NOT metered (refund the reserve).
+        let event_id = match self.apply_endpoint.apply_public(
+            &self.agent,
+            &plan.tool,
+            &plan.object,
+            &plan.input_json,
+        ) {
+            Ok(id) => id,
+            Err(e) => return self.deny(PipelineStep::Apply, e.to_string()),
+        };
+
+        // (8) METER — settle exactly one cost event for this applied effect (wholesale ≠ markup).
+        let billed = self.budget.settle_one(&plan.cost.as_metered_unit());
+        self.signals.applied = self.signals.applied.saturating_add(1);
+        self.signals.metered_total = self.signals.metered_total.saturating_add(billed);
+        EffectResult::Applied(event_id)
+    }
+
+    /// **Run the SIDE-EFFECT-FREE gate (steps 1..6) and return the [`PlanVerdict`] (the `run
+    /// --dry-run` plan, 8.7; the apply's pre-mutation decision).** SCHEMA → CAPABILITY → DELEGATION
+    /// → TENANT → BUDGET → HITL-GATE, **in order, fail-closed** — but it NEVER calls the apply
+    /// endpoint (step 7) and NEVER meters (step 8). The mutation + meter are the caller's
+    /// ([`apply_planned`](PlanThenApply::apply_planned)) when (and only when) the verdict is
+    /// [`PlanVerdict::WouldApply`].
+    ///
+    /// **Determinism (AG-D9):** the verdict is a pure function of `(plan, catalogue, check,
+    /// delegation, tenant, budget-balance, approved-set)` — two runs over the same inputs produce
+    /// byte-identical verdicts (the dry-run plan is reproducible). It does NOT mutate `self.signals`
+    /// (a dry-run is observational — the denial/gated counters are the LIVE apply's, recorded by
+    /// `apply_planned`; the dry-run plan is metering-free, [`DryRunPlanner`](crate::dry_run::DryRunPlanner)).
+    pub fn plan_through_gate(&self, plan: &PlannedEffect) -> PlanVerdict {
         // (1) SCHEMA — the tool must be in the catalogue, and the input must validate against its
         //     JSON Schema. An unknown tool or a malformed input is Denied (fail-closed).
         let def: &ToolDef = match self.catalogue.resolve(&plan.tool) {
             Some(d) => d,
-            None => return self.deny(PipelineStep::Schema, format!("unknown tool {}", plan.tool.0)),
+            None => {
+                return PlanVerdict::WouldDeny(
+                    PipelineStep::Schema,
+                    format!("unknown tool {}", plan.tool.0),
+                )
+            }
         };
         if let Err(reason) = validate_schema(&def.input_schema, &plan.input_json) {
-            return self.deny(PipelineStep::Schema, reason);
+            return PlanVerdict::WouldDeny(PipelineStep::Schema, reason);
         }
 
         // Only `mutate`/`external` effects route through EffectApi (§5.0). A `read`/`compute` tool
         // reaching the apply path is a routing bug — fail-closed (never apply a non-mutate here).
         if !matches!(def.effect_kind, EffectKind::Mutate | EffectKind::External) {
-            return self.deny(
+            return PlanVerdict::WouldDeny(
                 PipelineStep::Schema,
                 format!(
                     "tool {} is {:?}, not mutate/external — it does not route through EffectApi (§5.0)",
@@ -445,7 +514,7 @@ where
                 // Conditional == a caveat needs context the run did not supply → DENY, never a
                 // silent allow (fail-closed, ADR-03 / §8.6).
                 Decision::Deny | Decision::Conditional => {
-                    return self.deny(
+                    return PlanVerdict::WouldDeny(
                         PipelineStep::Capability,
                         format!("capability check denied for {cap}"),
                     );
@@ -461,7 +530,7 @@ where
             .delegation(&self.agent, &self.trigger_actor);
         for cap in &def.required_caps {
             if !policy.caveats.iter().any(|c| c == cap) {
-                return self.deny(
+                return PlanVerdict::WouldDeny(
                     PipelineStep::Delegation,
                     format!(
                         "{cap} is outside the delegation intersection \
@@ -474,7 +543,7 @@ where
         // (4) TENANT — the tenant guardrails (agent-allow-list, residency, AI-Act). Forbidden →
         //     Denied (no carve-out).
         if !self.tenant.permits(&self.agent, &plan.tool, &plan.object) {
-            return self.deny(
+            return PlanVerdict::WouldDeny(
                 PipelineStep::Tenant,
                 format!("tenant guardrails forbid {} on {}", plan.tool.0, plan.object.0),
             );
@@ -484,39 +553,22 @@ where
         //     balance → Denied (no privileged fallback — the run cannot spend past its reserve).
         let cost = plan.cost.total();
         if !self.budget.has_remaining(cost) {
-            return self.deny(
+            return PlanVerdict::WouldDeny(
                 PipelineStep::Budget,
                 format!("reserve has no remaining balance for cost {cost} minor-units"),
             );
         }
 
         // (6) HITL GATE — if the tool requires_approval AND is not yet approved for this run →
-        //     WITHHELD: return Gated and STOP. The tool does NOT mutate (AG-8). The HITL machinery
-        //     (open the card, surface, resume) is AG-P9 — HERE we only return Gated.
+        //     WITHHELD: the tool does NOT mutate (AG-8). The HITL machinery (open the card, surface,
+        //     resume) is AG-P9 — HERE we only signal the gate. The COLUMN read here is the FROZEN
+        //     §6.3 default (seeded at registration, [`crate::defaults`]).
         if def.requires_approval && !self.approved.contains(&plan.tool.0) {
             let gate_id = GateId(format!("gate:{}:{}", plan.tool.0, plan.object.0));
-            self.signals.gated = self.signals.gated.saturating_add(1);
-            return EffectResult::Gated(gate_id);
+            return PlanVerdict::WouldGate(gate_id);
         }
 
-        // (7) APPLY — call the subsystem's PUBLIC endpoint as the agent principal (same gateway, no
-        //     carve-out) ⇒ the subsystem emits its domain event via ITS outbox. The ONLY mutation
-        //     path. A failed apply is surfaced LOUD and is NOT metered (refund the reserve).
-        let event_id = match self.apply_endpoint.apply_public(
-            &self.agent,
-            &plan.tool,
-            &plan.object,
-            &plan.input_json,
-        ) {
-            Ok(id) => id,
-            Err(e) => return self.deny(PipelineStep::Apply, e.to_string()),
-        };
-
-        // (8) METER — settle exactly one cost event for this applied effect (wholesale ≠ markup).
-        let billed = self.budget.settle_one(&plan.cost.as_metered_unit());
-        self.signals.applied = self.signals.applied.saturating_add(1);
-        self.signals.metered_total = self.signals.metered_total.saturating_add(billed);
-        EffectResult::Applied(event_id)
+        PlanVerdict::WouldApply
     }
 
     /// Record a DENIED verdict at `step` and return the ordinary `Denied` tool error (NO privileged
