@@ -43,7 +43,14 @@ myelin-tenancy = { path = "../myelin-tenancy" }
 # shared CONFORMANCE_VECTOR + serializes the shared ViewSpec from the Issues side and asserts 0 byte
 # differences vs Knowledge's frozen outputs.
 myelin-query = { path = "../myelin-query" }
+# The frozen Bus event grammar (contract 2.9) + the EventEnvelope unit anchor (contract 2.1). Issues
+# REGISTERS its complete `issue.*` taxonomy AGAINST this grammar (ISS-P03 / P-242) — `events.rs`
+# below calls the ONE Bus validator (`myelin_events::validate_event_type`); there is no second token
+# language and Issues does NOT author the grammar (EI-01 §7). The `initiative` type token is already
+# in the Bus seed (recon §2); Issues completes the `issue.*`/`initiative.*` event-name list here.
+myelin-events = { path = "../myelin-events" }
 serde.workspace = true
+serde_json.workspace = true
 
 # DEV-ONLY: the rich ReBAC namespace ENGINE (FragmentDef / Userset / StoreBackedCheck) lives in the
 # Identity SERVICE crate. The runtime Issues fragment is the names-only `myelin_identity::Namespace-
@@ -56,7 +63,7 @@ serde.workspace = true
 [dev-dependencies]
 myelin-identity-service = { path = "../myelin-identity-service" }
 myelin-storage = { path = "../myelin-storage" }
-myelin-events = { path = "../myelin-events" }
-# The 13.3 byte-identity CDC (tests/cdc_13_3_issues_coown.rs) serializes the co-owned ViewSpec/
-# FieldType to JSON and asserts the golden bytes (a build-time drift test, no DB).
-serde_json.workspace = true
+# Note: `myelin-events` + `serde_json` are now REGULAR dependencies (above) — `events.rs` (ISS-P03)
+# registers the `issue.*` taxonomy against the Bus grammar at RUNTIME, and the 13.3 byte-identity CDC
+# (tests/cdc_13_3_issues_coown.rs) keeps serializing the co-owned ViewSpec/FieldType to JSON. Both
+# resolve through the regular deps; no separate dev entry needed.

@@ -22,6 +22,17 @@
 //!   byte differences** vs Knowledge's frozen outputs. NO Issues data is written yet; Issues' own
 //!   AST→store compiler lands in **ISS-P13**, the `order_key` CAS reorder in **ISS-P09**, the
 //!   co-equal views in **ISS-P16** (floors named in [`query_coown`]).
+//! - [`events`] — **ISS-P03 / P-242**: the complete `issue.*` **event taxonomy** Issues owns
+//!   (arch §1), **registered against the frozen Bus §6 grammar** (contract 2.9) — the named
+//!   `&'static str` token constants + the [`events::ISSUE_EVENT_TOKENS`] registry, each PROVEN
+//!   grammatical by the ONE Bus validator (`myelin_events::validate_event_type`; **0 ungrammatical
+//!   tokens**). Includes the registered **`initiative`** type token
+//!   ([`events::INITIATIVE_HEALTH_CHANGED`], recon §2 / §6.2). Plus the Issues-side
+//!   [`events::unit_check`] pinning the EventEnvelope unit anchor (contract 2.1) for issue
+//!   payloads — durations in **seconds**, timestamps RFC-3339 UTC — with a loud seconds-vs-millis
+//!   rejection. **NO Issues data is written yet**: these tokens are REGISTERED (a names freeze);
+//!   the emit bodies attach to them via `OutboxTx::emit` in the write path (ISS-P06 / P-372) on the
+//!   issue-spine migrations (ISS-P05 / P-371) — the floor named in [`events`].
 //!
 //! **Owning architecture doc:**
 //! `planning/04-subsystem-architectures/issue-tracker/architecture/03-events-contracts-and-glue.md`
@@ -87,6 +98,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod events;
 pub mod holder_intent;
 pub mod query_coown;
 pub mod rebac_fragment;
