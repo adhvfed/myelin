@@ -2235,6 +2235,8 @@ dependencies = [
 name = "myelin-git"
 version = "0.0.0"
 dependencies = [
+ "blake3",
+ "hex",
  "myelin-events",
  "myelin-gdpr",
  "myelin-identity",

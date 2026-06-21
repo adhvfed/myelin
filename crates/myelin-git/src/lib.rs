@@ -17,6 +17,14 @@
 //!   and minted as grammatical sub-URNs through the one Refs codec ([`subs::mint_pr_comment`] etc.).
 //!   The kind REGISTRATION + the grammatical mints ship; the per-kind resolvers are named follow-ons
 //!   (GIT-P18 comment/thread, GIT-P24 the L-range 4-state content-anchored resolver).
+//! - [`commit`] — **GIT-P25 / P-ID-25**: Git **pseudonymous-by-default commits** consuming the 4.8
+//!   grammar. A commit's author/committer line is the per-tenant pseudonym
+//!   `<pseudonym>@<tenant>.noreply` ([`myelin_identity::PseudonymHandle`]) baked into the IMMUTABLE
+//!   commit bytes — never the erasable real identity. After `erase(subject)` shreds the pseudonym
+//!   map (DSR step 1, X-7) the bytes carry 0 recoverable real identity (the GIT-D2 residual ==
+//!   the one platform posture); the opaque `principal_id` still attributes the commit for authz
+//!   out-of-band. Floor: the audited history-rewrite path (a *body* expunge) is the M5/on-demand
+//!   follow-on (00-recon §X-7 / CR §9 10.6, Git+GDPR roadmaps).
 //! - [`check_status`] — **GIT-P6 / P-232**: the X-1 Git↔CI `CheckStatus` **consumer contract**
 //!   (contract 5.9) — the `check_status` projection-table schema keyed `(commit_oid, context)`, the
 //!   monotonic `run_attempt` supersession rule, and the `required`-set policy shape, declared as a
@@ -76,6 +84,7 @@
 #![forbid(unsafe_code)]
 
 pub mod check_status;
+pub mod commit;
 pub mod events;
 pub mod holder_intent;
 pub mod rebac_fragment;
