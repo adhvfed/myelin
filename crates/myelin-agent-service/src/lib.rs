@@ -84,6 +84,7 @@ pub mod effect_api;
 pub mod hitl;
 pub mod hitl_batch;
 pub mod holder;
+pub mod loop_guards;
 pub mod migrations;
 pub mod mock;
 pub mod schema;
@@ -177,6 +178,20 @@ pub use card_text::{
 pub use hitl_batch::{
     per_effect_idem_key, run_batch_hitl_loop, ApplyLedger, BatchApprovalCard, BatchGatedEffect,
     BatchHitlWait, BatchOutcome, DecisionScript, EffectOutcome,
+};
+
+// The FIVE structural loop guards, re-enforced at the Fabric tier (AG-P12 → P-224, AG-D7): the
+// self-guard + reference gate (owned here, keyed on the frozen 13.1 inline ref nodes) + the apply-time
+// idempotent-tool ledger on (run, effect_id) (owned here), composed with the RE-USED engine three
+// (causal-depth ceiling default 12 + shared-root tripwire + bounded dispatch pool — myelin_flow::
+// CausalGuard, P-214, NOT re-implemented). Every refusal is Drop/Park — there is NO Fork variant (the
+// 0-unbounded-fork invariant is in the TYPE). Loop prevention is structural, not a convention: a human
+// or agent can NEVER typo into a loop (raw text never re-triggers; only a structured artifact_ref node
+// does). Floors named: the agent-lane shed budget (the in-flight cap NUMBER) is AG-P22; per-run
+// identity (mint/scrub/revoke/re-mint, the principal the self-guard reads) is AG-P13 (→ P-225).
+pub use loop_guards::{
+    AgentLoopGuards, GuardRefusal, GuardVerdict, IdempotentToolLedger, ReferenceGate, SelfGuard,
+    AGENT_CEILING, AGENT_DISPATCH_POOL_CAP, AGENT_SHARED_ROOT_CAP,
 };
 
 // The delegation-scoped tool-list (AG-P7 → P-219): the `list_objects` SetExpr push-down (the no-N+1
