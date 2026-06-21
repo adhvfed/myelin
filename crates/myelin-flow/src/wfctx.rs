@@ -480,6 +480,13 @@ pub struct WfCtx {
     /// (a consumed signal drops the buffered depth). The FLOW-D4 drill asserts EXACTLY ONE consume per
     /// delivered approval (a double-click delivers one buffered row → one consume).
     consumed_signals: Vec<(String, String)>,
+    /// **The reserve/settle bookend the spend-bearing dispatches reserve/settle against (P-FLOW-16,
+    /// contract 9.5/§4.9).** `None` on an UN-METERED `WfCtx` (the pure activity/now/rand/sleep/signal
+    /// surface) — a `metered_activity`/`metered_schedule_and_run_job` then runs WITHOUT a reserve (the
+    /// loop-cap depth is still the runaway bound, AG-6). Supplied via [`WfCtx::with_budget`] from the
+    /// run's [`crate::RunBudget`] so a body's spend-bearing dispatch reserves-at-dispatch (no balance →
+    /// no dispatch) + settles-on-completion into the SAME wallet, never interrupting in-flight.
+    pub(crate) budget: Option<crate::budget::BudgetGate>,
 }
 
 /// One journaled command outcome a replay reads back (§4.1) — the result an `activity` returns on
@@ -537,6 +544,7 @@ impl WfCtx {
             signals: None,
             parked_on_signal: false,
             consumed_signals: Vec::new(),
+            budget: None,
         }
     }
 
@@ -881,6 +889,13 @@ impl WfCtx {
     /// the §6.4 per-effect approval card's `run_id` the gated loop reads its buffered signals under).
     pub fn run_id(&self) -> &str {
         &self.run_id
+    }
+
+    /// The run's [`TenantId`] — the partition key the reserve/settle bookend (P-FLOW-16) keys its
+    /// ledger reservations under (there is no cross-tenant ledger path; §1.1). Fixed for the run's
+    /// lifetime.
+    pub(crate) fn tenant_id(&self) -> &TenantId {
+        &self.tenant
     }
 
     /// **`now()` (contract 9.2, §5.1) — a journaled SIDE-MARKER.** Returns the deterministic
