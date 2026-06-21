@@ -33,6 +33,15 @@
 //!   rejection. **NO Issues data is written yet**: these tokens are REGISTERED (a names freeze);
 //!   the emit bodies attach to them via `OutboxTx::emit` in the write path (ISS-P06 / P-372) on the
 //!   issue-spine migrations (ISS-P05 / P-371) — the floor named in [`events`].
+//! - [`declares`] — **ISS-P04 / P-243**: the Issues **`declare_indexable` IndexSpec** (contract
+//!   6.3 — the `issue.*` facets projection: the seven structured board/list/search facets +
+//!   `acl_object_type = "issue"`, registered with + accepted by Search) and the **`define_notif_rule`
+//!   reason set** (contract 7.6 — SLA-at-risk / unblocked / approval-requested, registered against
+//!   Notif's ONE §3.1 ranking table). Both construct the ONE frozen consumer-owned shape
+//!   ([`myelin_search::IndexSpec`] / [`myelin_notif::NotifRule`]); Issues defines no second indexing
+//!   contract and no second reason vocabulary (EI-01 §7). **NO emitter / NO wiring ships here**: the
+//!   live `issue.*` Search projection emitter is **ISS-P17** and the live trigger/SLA → Notif inbox
+//!   wiring ("My Work") is **ISS-P22** — both floors named in [`declares`].
 //!
 //! **Owning architecture doc:**
 //! `planning/04-subsystem-architectures/issue-tracker/architecture/03-events-contracts-and-glue.md`
@@ -98,6 +107,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod declares;
 pub mod events;
 pub mod holder_intent;
 pub mod query_coown;

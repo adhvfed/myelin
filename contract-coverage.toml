@@ -483,7 +483,16 @@ status = "covered"
 # per-tenant facet union (the build-time registration). The CDC carries BOTH the provider (git
 # declares + serializes to the 6.3 wire shape) and consumer (Search admits) sides. The Search engine
 # half was frozen at SRCH-P06/P-167; the projection EMITTER that feeds the rows is GIT-P25/P-287.
-cdc = ["crates/myelin-git/tests/cdc_6_3_git_code_projection.rs"]
+#
+# ISS-P04/P-243 adds the ISSUES slice: Issues declares its `issue.*` facets-projection spec
+# (`myelin_issues::declares::issue_facets_projection_spec` — issue/issue, the seven structured
+# board/list/search facets state_category/priority/assignee/type_rank/project_id/cycle_id/rank,
+# non-semantic, acl_object_type=issue) and Search ADMITS it. The Issues `issue.*` projection EMITTER
+# that feeds the rows is ISS-P17.
+cdc = [
+    "crates/myelin-git/tests/cdc_6_3_git_code_projection.rs",
+    "crates/myelin-issues/tests/cdc_6_3_issues_facets_projection.rs",
+]
 
 [[contract]]
 row = "6.4"
@@ -569,8 +578,20 @@ cdc = [
 [[contract]]
 row = "7.6"
 title = "define_notif_rule"
-status = "deferred"
-landing = "P-186"
+status = "covered"
+# The Notif SEAM + the registration verb + the §3.1 ranking table is owned + frozen at NOTIF-P8/P-186
+# (the inverse-signal registry: a subsystem registers its reason set by CALLING `register`, zero Notif
+# change). ISS-P04/P-243 ships the ISSUES slice on top: Issues declares its reason set
+# (`myelin_issues::declares::issue_notif_rules` — SLA at-risk→critical / unblocked→watching /
+# approval-requested→critical, each via the frozen `define_notif_rule` verb reconciled against the
+# §3.1 table) and Notif ADMITS + ROUTES it. The CDC carries BOTH the provider (Issues declares the
+# three reasons at their table-correct bands) and consumer (Notif registry admits + classifies) sides.
+# The live trigger/SLA → Signal → inbox WIRING ("My Work") is the ISS-P22 follow-on; the other
+# per-subsystem reason sets (Git/KN/Chat/CI) land in NOTIF-P19..P23.
+cdc = [
+    "crates/myelin-notif/tests/cdc_7_6_notif_define_rule.rs",
+    "crates/myelin-issues/tests/cdc_7_6_issues_notif_rules.rs",
+]
 
 # 7.7 SPLIT: the HOLDER HALF (registration + locate/export/rectify/restrict + the structural
 # references-not-payloads erase) ships NOW at NOTIF-P4 (P-182) with its provider+consumer CDC pair
