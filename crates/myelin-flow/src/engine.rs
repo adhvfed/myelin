@@ -96,6 +96,13 @@ pub enum DriveOutcome {
     Completed(Vec<ArtifactRef>),
     /// The workflow function FAILED (an un-handled activity exhaustion) — the run is `failed`.
     Failed(String),
+    /// **The workflow PARKED on a durable timer (a `sleep_until`/`sleep_for` into the future,
+    /// P-FLOW-13, §4.2).** The body armed a `wf_timer` row and parked — the run is `waiting`, holding
+    /// NO runtime, until the wheel fires the timer at its minute (which wakes it `waiting → running`).
+    /// The newly-journaled commands (the `timer_set` marker + any prior steps) ARE co-committed (the
+    /// progress up to the park is durable); the run is settled `waiting`, not terminal. The wheel's
+    /// fire + the dispatcher's re-lease re-drive it past the `sleep`.
+    Waiting,
     /// **The replay-DIVERGENCE verdict (P-FLOW-07, FLOW-D2).** The workflow body diverged from its
     /// journal on replay (a command-kind mismatch at a journaled position, or a pinned-`wf_version`
     /// mismatch) — the run is HALTED as `nondeterministic` and DEAD-LETTERED, never silently
@@ -211,6 +218,16 @@ impl RunStore {
     /// Read a run by `(tenant, run_id)`.
     pub fn get(&self, tenant: &TenantId, run_id: &str) -> Option<RunRow> {
         self.lock().get(&(tenant.0.clone(), run_id.to_string())).cloned()
+    }
+
+    /// **Run a mutation `f` over the `(tenant, run_id)` run row under the store lock — the seam the
+    /// timer/signal WAKE (`waiting → running`) updates through (§4.2/§4.3).** Returns `f`'s result, or
+    /// `None` (without calling `f`) if the run is absent. The lock is held for the duration of `f` so
+    /// the wake is atomic (the dispatcher's lease scan sees the woken state). Used by
+    /// [`RunStore::wake`] (`crate::timer`) to flip a parked run runnable in place.
+    pub fn with_run_mut<R>(&self, tenant: &TenantId, run_id: &str, f: impl FnOnce(&mut RunRow) -> R) -> Option<R> {
+        let mut runs = self.lock();
+        runs.get_mut(&(tenant.0.clone(), run_id.to_string())).map(f)
     }
 
     /// **Lease ONE runnable run for `worker` (the `FOR UPDATE SKIP LOCKED` claim, §4.7).** Returns
@@ -463,6 +480,13 @@ struct TelemetryInner {
     /// NOTHING dedup is what makes the gauge truthful). This also covers the `job.done`/`ci.result`
     /// long-park backlog (§5.4 — the merge-queue/CI-stage backlog health signal).
     signal_buffer_depth: u64,
+    /// **the timer-wheel-LAG gauge (the SC-11 health signal, §1.8 / §5.4 — durable timers,
+    /// P-FLOW-13).** How many DUE timers (`bucket <= now AND NOT fired`) await firing past their
+    /// minute. Set from the [`crate::timer::TimerStore`] after each wheel tick. 0 on a healthy wheel
+    /// (it fires due timers within the tick budget); a growing lag means the wheel is falling behind.
+    /// Far-future timers are NOT counted (they are not due — the SC-11 point: they cost nothing). The
+    /// FLOW-D3 floor reads this staying within budget under the one-minute 100k+ burst.
+    timer_wheel_lag: u64,
 }
 
 impl FlowTelemetry {
@@ -587,6 +611,21 @@ impl FlowTelemetry {
     pub fn signal_buffer_depth(&self) -> u64 {
         self.lock().signal_buffer_depth
     }
+
+    /// **Set the timer-wheel-lag gauge (the SC-11 health signal, §1.8 / §5.4 — durable timers,
+    /// P-FLOW-13).** The count of DUE timers (`bucket <= now AND NOT fired`) awaiting firing — set
+    /// from the [`crate::timer::TimerStore`] after each wheel tick. A healthy wheel keeps it ~0; the
+    /// FLOW-D3 green artifact is this staying within budget under the one-minute 100k+ burst. A
+    /// far-future timer is NOT lag (it is not due — the SC-11 point: it costs nothing).
+    pub fn set_timer_wheel_lag(&self, lag: u64) {
+        self.lock().timer_wheel_lag = lag;
+    }
+
+    /// The timer-wheel-lag gauge (the SC-11 health signal, §1.8 / §5.4) — how many due timers await
+    /// firing past their minute. 0 on a healthy wheel; a growing lag means the wheel cannot keep up.
+    pub fn timer_wheel_lag(&self) -> u64 {
+        self.lock().timer_wheel_lag
+    }
 }
 
 /// A workflow body the engine drives — a DETERMINISTIC function over a [`WfCtx`] (§2.5/§4.1). It
@@ -656,6 +695,40 @@ pub fn drive_versioned(
     run_version: i32,
     replay_version: i32,
 ) -> DriveOutcome {
+    // No timer wheel: the version-aware drive over the activity/now/rand surface (a `sleep` in the
+    // body would error loudly — WfCtx::sleep_until requires a wheel). The timer-aware path is
+    // `drive_with_timers` (the dispatcher supplies the wheel + the live clock for the park decision).
+    drive_with_timers(
+        runs, outbox, journal, telemetry, minter, ctx_base, run, now_clock, rand_seed, body,
+        run_version, replay_version, None, 0,
+    )
+}
+
+/// **Drive a workflow run WITH the durable-timer wheel armed (P-FLOW-13, §4.2).** Identical to
+/// [`drive_versioned`] but supplies the engine's [`crate::timer::TimerStore`] + the live drive clock
+/// `now_secs` so a body's `ctx.sleep_until`/`ctx.sleep_for` arms a durable `wf_timer` row and PARKS
+/// the run (`waiting`, holding no runtime) until the wheel fires the timer. A drive that parks on a
+/// sleep co-commits its progress-up-to-the-park (the `timer_set` marker + prior steps are durable)
+/// and settles the run `waiting` (not `completed`); the wheel's fire + a re-lease re-drive it past the
+/// sleep. `timers = None` is the version-aware drive over the activity surface (a body `sleep` errors
+/// loudly). `now_secs` is the live drive clock (epoch seconds) the park decision reads.
+#[allow(clippy::too_many_arguments)]
+pub fn drive_with_timers(
+    runs: &RunStore,
+    outbox: &OutboxStore,
+    journal: &crate::wfctx::WfJournal,
+    telemetry: &FlowTelemetry,
+    minter: Arc<dyn IdMinter>,
+    ctx_base: EmitContextBase,
+    run: &RunRow,
+    now_clock: impl Into<String>,
+    rand_seed: u64,
+    body: &WorkflowBody,
+    run_version: i32,
+    replay_version: i32,
+    timers: Option<crate::timer::TimerStore>,
+    now_secs: i64,
+) -> DriveOutcome {
     let tenant = run.tenant.clone();
     // Load the journal so far (the replay prefix the body short-circuits over §4.1).
     let history: Vec<WfHistoryRow> = journal.history_for(&tenant, &run.run_id);
@@ -674,6 +747,11 @@ pub fn drive_versioned(
         run_version,
         replay_version,
     );
+    // Supply the durable-timer wheel + the run's partition + the live epoch-seconds clock so a body
+    // `sleep` arms a `wf_timer` row (and the park decision reads the live clock).
+    if let Some(timers) = timers {
+        ctx = ctx.with_timers(timers, run.partition, now_secs);
+    }
 
     // Run the body. It replays the journaled commands (short-circuit, 0 side effect) then runs the
     // first un-journaled command live. `side_effects_executed` counts the LIVE activity executions;
@@ -712,18 +790,26 @@ pub fn drive_versioned(
         return DriveOutcome::Nondeterministic(reason);
     }
 
+    // **PARK on a durable timer (P-FLOW-13, §4.2):** a body that armed a not-yet-due `sleep` parks —
+    // read it BEFORE the commit consumes the ctx. The progress-up-to-the-park (the `timer_set` marker
+    // + prior steps) co-commits; the run settles `waiting` (holding NO runtime), not terminal. The
+    // wheel fires the armed timer at its minute (waking the run), and a re-lease re-drives past sleep.
+    let parked = ctx.parked_on_timer();
+
     // Co-commit the newly-journaled commands + their emits (FLOW-D5). A failed co-commit leaves the
     // journal untouched (the drive is retried by a re-lease).
     let committed = ctx.commit().is_ok();
 
     let new_cursor = journal.history_for(&tenant, &run.run_id).len() as i64;
-    let (outcome, state) = match (&result, committed) {
-        (Ok(refs), true) => (DriveOutcome::Completed(refs.clone()), run_state::COMPLETED),
-        (Ok(_), false) => (
+    let (outcome, state) = match (&result, committed, parked) {
+        // A parked drive that co-committed: the run is WAITING (the wheel + a re-lease re-drive it).
+        (Ok(_), true, true) => (DriveOutcome::Waiting, run_state::WAITING),
+        (Ok(refs), true, false) => (DriveOutcome::Completed(refs.clone()), run_state::COMPLETED),
+        (Ok(_), false, _) => (
             DriveOutcome::Failed("co-commit failed".into()),
             run_state::FAILED,
         ),
-        (Err(e), _) => (DriveOutcome::Failed(e.clone()), run_state::FAILED),
+        (Err(e), _, _) => (DriveOutcome::Failed(e.clone()), run_state::FAILED),
     };
     runs.settle(&tenant, &run.run_id, new_cursor, state);
     let lag = runs.runnable_lag(run.partition, i64::MAX) as u64;
@@ -761,6 +847,12 @@ pub struct FlowDispatcher {
     /// halts the run as `nondeterministic`. Defaults to 1 per registered type ([`Self::register`]);
     /// [`Self::register_versioned`] sets an explicit running version.
     running_versions: HashMap<String, i32>,
+    /// **The durable-timer wheel a body's `sleep` arms into (P-FLOW-13, §4.2).** `None` until
+    /// [`Self::with_timers`] supplies it — then a workflow body's `ctx.sleep_until`/`ctx.sleep_for`
+    /// arms a `wf_timer` row + parks the run (`waiting`). The [`crate::timer::TimerWheel`] (built over
+    /// the SAME store) fires it at its minute, waking the run. A dispatcher WITHOUT a wheel drives the
+    /// pure activity/now/rand surface (a body `sleep` errors loudly — never a silent no-op).
+    timers: Option<crate::timer::TimerStore>,
 }
 
 impl FlowDispatcher {
@@ -791,7 +883,24 @@ impl FlowDispatcher {
             lease_ttl_secs,
             bodies: HashMap::new(),
             running_versions: HashMap::new(),
+            timers: None,
         }
+    }
+
+    /// **Supply the durable-timer wheel so a workflow body's `sleep` arms a `wf_timer` row + parks
+    /// (P-FLOW-13, §4.2).** Chainable on [`Self::new`]. A body that calls `ctx.sleep_until`/`sleep_for`
+    /// arms a durable timer into THIS store and parks the run (`waiting`); the [`crate::timer::TimerWheel`]
+    /// built over the SAME store fires it at its minute, waking the run for a re-lease. Returns the
+    /// store handle so the caller can build the wheel over it.
+    pub fn with_timers(mut self, timers: crate::timer::TimerStore) -> Self {
+        self.timers = Some(timers);
+        self
+    }
+
+    /// The durable-timer wheel the dispatcher arms into (if supplied via [`Self::with_timers`]) — so
+    /// the caller builds the [`crate::timer::TimerWheel`] over the SAME store.
+    pub fn timers(&self) -> Option<&crate::timer::TimerStore> {
+        self.timers.as_ref()
     }
 
     /// Register a deterministic workflow body under its `wf_type` (the definition registry seam,
@@ -835,7 +944,10 @@ impl FlowDispatcher {
             .get(&run.wf_type)
             .copied()
             .unwrap_or(run.wf_version);
-        let outcome = drive_versioned(
+        // Thread the durable-timer wheel + the live clock so a body `sleep` arms a `wf_timer` row +
+        // parks the run (`waiting`); a dispatcher with no wheel drives the activity surface (a body
+        // `sleep` would error loudly — never a silent no-op).
+        let outcome = drive_with_timers(
             &self.runs,
             &self.outbox,
             &self.journal,
@@ -848,6 +960,8 @@ impl FlowDispatcher {
             body.as_ref(),
             run.wf_version,
             replay_version,
+            self.timers.clone(),
+            now,
         );
         Some(outcome)
     }
