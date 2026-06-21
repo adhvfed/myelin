@@ -2067,6 +2067,8 @@ dependencies = [
 name = "myelin-agent-service"
 version = "0.0.0"
 dependencies = [
+ "blake3",
+ "hex",
  "myelin-agent",
  "myelin-ci-sandbox",
  "myelin-config",

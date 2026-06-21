@@ -853,8 +853,17 @@ cdc = ["crates/myelin-agent/tests/cdc_8_7_dry_run.rs"]
 [[contract]]
 row = "8.8"
 title = "AG-7 agent trace"
+# COVERED at the GDPR-service seam (cdc_8_8_agent_trace_seam). AG-P19 (→ P-268, M3) adds the FABRIC
+# consumer leg: the agent-trace HOLDER seam — run.trace_ref resolves to a CONTENT-ADDRESSED Knowledge
+# document reusing the frozen myelin-content 13.1 block model (a blake3:<hex> over a Vec<Block>), and
+# the trace registers as the erasable H17 PersonalDataHolder, distinct from the audit log. The drill
+# pair below carries the PROVIDER (the Fabric builds + content-addresses the 13.1 trace document) +
+# CONSUMER (run.trace_ref reads the content address; the H17 holder erase crypto-shreds it, KN-D12).
 status = "covered"
-cdc = ["crates/myelin-gdpr-service/tests/cdc_8_8_agent_trace_seam.rs"]
+cdc = [
+    "crates/myelin-gdpr-service/tests/cdc_8_8_agent_trace_seam.rs",
+    "crates/myelin-agent-service/tests/drills_ag_p19_knowledge_tools.rs",
+]
 
 # ──────────────── §9 Durable workflow (myelin-flow) ─────────────────────────────────────────────
 
