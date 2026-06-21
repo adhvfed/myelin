@@ -70,6 +70,7 @@ pub mod check_engine;
 pub mod delegation;
 pub mod expand;
 pub mod failstatic_cache;
+pub mod git_fragment;
 pub mod list_objects;
 pub mod lowering;
 pub mod machine_auth;
@@ -93,6 +94,10 @@ pub use delegation::{
     EFFECTIVE_GRANT_CARRIER,
 };
 pub use expand::Expand;
+pub use git_fragment::{
+    compile_codeowners, git_fragment, CodeownersRule, APPROVE_UNTRUSTED_CI, CODE_OWNER,
+    PROTECTED_PUSH,
+};
 pub use failstatic_cache::{
     CachedDecision, CacheTelemetry, CoarseGrant, FailStaticCache, Served, FRESH_TTL_SECS, S6_STORE,
 };
@@ -865,6 +870,23 @@ impl StoreBackedCheck {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .admit(frag)
+    }
+
+    /// **Admit Id's compiled Git ReBAC namespace fragment into the cell schema (contract 4.9,
+    /// P-ID-24 / P-247) — the FIRST of the five per-subsystem fragments.** Admits the four rich
+    /// [`git_fragment`] `FragmentDef`s (`repo` → `ref` → `pull_request` → `pr_comment`,
+    /// parent-before-child) on top of the core org/team/project hierarchy, so `check`/`list_objects`
+    /// resolve the Git permissions (`pull`/`push`/`administer`/`protected_push`, `push_protected`,
+    /// `view`/`review`/`merge`) through the SAME four-operator engine the core hierarchy uses (one
+    /// primitive — no bespoke Git check path). `approve_untrusted_ci` becomes an ordinary `repo`
+    /// relation the fork-endorsement gate checks (X-1). Returns the per-type admit verdicts in admit
+    /// order; a malformed fragment is `Rejected{reason}` (loudly, never silently admitted).
+    pub fn admit_git_fragment(&self) -> Vec<myelin_identity::FragmentAdmit> {
+        let mut ns = self.namespace.lock().unwrap_or_else(|e| e.into_inner());
+        git_fragment::git_fragment()
+            .iter()
+            .map(|def| ns.admit(def))
+            .collect()
     }
 
     /// A read-only snapshot of the compiled namespace engine (for inspection / the explain path).
