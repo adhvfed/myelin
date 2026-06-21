@@ -1,0 +1,17 @@
+// P-FLOW-01 GREEN fixture: the same rare inline-PII result body, tagged with the canonical
+// multi-line six-tag #[personal_data(...)] form the flow schema uses on its crypto-shred locators
+// (result_key_ref / payload_key_ref). The lint must ADMIT it (it is now erasable: erasing a subject
+// crypto-shreds the inline-PII result by destroying the named per-subject DEK — §4.8 / ADR-12.3).
+pub struct WfHistoryRow {
+    pub tenant_id: String,
+    pub region: String,
+    #[personal_data(
+        category = Content,
+        role = TenantContent,
+        basis = Contract,
+        retention = TenantPolicy,
+        erasure = CryptoShred(subject_dek),
+        subject_locator = "message_body",
+    )]
+    pub message_body: String,
+}

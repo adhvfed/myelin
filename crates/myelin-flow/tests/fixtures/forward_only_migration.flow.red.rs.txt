@@ -1,0 +1,8 @@
+-- P-FLOW-01 RED fixture for `forward-only-migration` — the lint MUST reject this.
+-- A reversible (down) migration AND a blocking ALTER that adds a NOT NULL column without a
+-- default on the wf_history journal: the reversible-migration + table-lock-under-load bug classes
+-- (STOR-2, §9). The flow journal is the SOURCE OF TRUTH; a destructive/blocking migration over it
+-- is the silent-data-loss floor. NOT real crate code (lives under /fixtures/, excluded from the
+-- live lint-gate).
+-- down
+ALTER TABLE wf_history ADD COLUMN command_id TEXT NOT NULL;
