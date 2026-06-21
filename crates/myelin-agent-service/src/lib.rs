@@ -79,6 +79,7 @@
 pub mod app;
 pub mod holder;
 pub mod migrations;
+pub mod mock;
 pub mod schema;
 pub mod skeleton;
 
@@ -96,6 +97,15 @@ pub use holder::{
 pub use skeleton::{
     ChildEnv, RunOutcomeKind, RunSubstrate, RunTokenRevoker, SkeletonAgent, SkeletonAgentRuntime,
     SkeletonError, SkeletonTelemetry, AGENT_RUN_TRACED_EVENT, SKELETON_STEP_UNIT,
+};
+
+// The MockAgentRuntime (AG-P5 → P-217): the deterministic scripted brain on the real `--use-mock`
+// code path. The scripted queue + the stateless step, the platform-owned history reconstruction
+// (build_conversation), the AG-D9 step-determinism replay lever (golden + cargo-mutants), and the
+// real `--use-mock` runtime flag (select_runtime behind the frozen &dyn AgentRuntime seam).
+pub use mock::{
+    build_conversation, model_turns_taken, replay, replay_bounded, select_runtime, HistoryEntry,
+    MockAgentRuntime, MockScript, ReplayRecord, RuntimeFlag, TraceHistory, MOCK_MAX_STEPS,
 };
 
 // The agent-service `serve(AppSpec)` shell (AG-P4 → P-216): the three ports, liveness != readiness,
