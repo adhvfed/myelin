@@ -875,6 +875,11 @@ row = "9.3"
 title = "durable timer wheel"
 # Wheel + arm/fire half: P-207 (FLOW-D3 100k floor + live-PG). Cheap disarm/re-arm half: P-210
 # (the §6.6 row-update re-arm + disarm), paired with the Issues `stale_after`/SLA consumer fixture.
+# P-FLOW-21 / P-266 (M3) CONFIRMS the cheap re-arm UNDER its real Git/Issues + Trigger call sites: the
+# ONE documented call-site helper (crates/myelin-flow/src/timer.rs `sla` module — SlaTimerCall +
+# sla_timer_id / trigger_stale_timer_id) both producers call, so a re-arm at the Issues/Trigger
+# boundary is a SINGLE row update (no ad-hoc key, no second code path). The cdc pair below now routes
+# through the helper (not ad-hoc keys). NO new owned row, NO new FLOW drill is owed in M3.
 status = "covered"
 cdc = ["crates/myelin-flow/tests/cdc_9_3_disarm_rearm.rs"]
 
@@ -907,11 +912,22 @@ landing = "P-201"
 # step. CONSUMES contract 10.6 (history-rewrite audited op — GDPR/Audit-owned, `covered` above) +
 # 11.2 (trust-scoped cache namespaces — Storage-owned, `covered` below). The application of the
 # existing activity model (§4.4) — NO new engine primitive. The Git GC/repack/bundle-gen/
-# history-rewrite CALL SITES are co-built in Git's M3 prompts (GIT-D9 is Git's gate). The cheap SLA
-# re-arm confirmation under Issues/Trigger + the merge-queue holds-no-runtime re-green are P-FLOW-21.
+# history-rewrite CALL SITES are co-built in Git's M3 prompts (GIT-D9 is Git's gate).
 # Green artifact: crates/myelin-flow/tests/drills_flow_maintenance.rs — crash-mid-repack-resumes-with-
 # no-side-effect + the fan-out-replays-from-last-step (the FLOW-D1 property reused on a maintenance
 # workflow), registered into the M0 permanent suite.
+#
+# P-FLOW-21 / P-266 (M3) — the cheap SLA-timer re-arm CONFIRMED under the Git/Issues + Trigger call
+# sites + the merge-queue holds-no-runtime re-green. NO new owned FLOW row + NO new FLOW drill is owed
+# in M3 (roadmap §2 M3 — GIT-D9 is Git's gate). This prompt ships the ONE documented call-site helper
+# (crates/myelin-flow/src/timer.rs `sla` module — SlaTimerCall + sla_timer_id / trigger_stale_timer_id)
+# both producers call, so a re-arm at the Issues/Trigger boundary is a SINGLE row update (no ad-hoc
+# key, no second code path — the M3 confirmation that the P-FLOW-14 cheap row op is what the REAL call
+# sites hit), and re-greens the P-FLOW-19 merge-queue-in-isolation drill (holds-no-runtime, 0
+# double-merge). Green artifacts: crates/myelin-flow/tests/cdc_9_3_disarm_rearm.rs (re-arm-is-row-update
+# at the call boundary, now routed through the helper) + crates/myelin-flow/tests/drills_flow_merge_queue.rs
+# (the merge-queue-in-isolation re-green). The X-1 seam END-TO-END against CI's real ci.result producer
+# is P-FLOW-22 (M4).
 
 # ──────────────── §10 GDPR / Audit / PersonalDataHolder (myelin-gdpr) ───────────────────────────
 

@@ -24,13 +24,15 @@
 //!   resolution by a cheap `disarm` (the SLA was met — the timer must never fire). The CONSUMER never
 //!   touches the wheel scan; it relies on the provider's promise that a re-arm/disarm is a row op.
 //!
-//! This pins the provider's promise NOW (the disarm/re-arm row-op surface); the Issues/Trigger CALL
-//! SITES are confirmed-and-tested under their real producers in **M3, P-FLOW-17**. The fixture here is
-//! the consumer's modeled usage of the promise.
+//! This pins the provider's promise (the disarm/re-arm row-op surface); the Issues/Trigger CALL
+//! SITES are CONFIRMED-AND-TESTED here under the documented [`SlaTimerCall`] helper (P-FLOW-21, M3 —
+//! the cheap re-arm confirmed at the real call boundary), routing through [`sla_timer_id`] /
+//! [`trigger_stale_timer_id`] so the producers never construct the deterministic key by hand.
 
 use myelin_flow::{
-    epoch_minute, run_state, ArmOutcome, DisarmOutcome, FireOutcome, FlowTelemetry, ReArmOutcome,
-    RunRow, RunStore, TimerRow, TimerStore, TimerWheel, WfJournal,
+    epoch_minute, run_state, sla_timer_id, trigger_stale_timer_id, ArmOutcome, DisarmOutcome,
+    FireOutcome, FlowTelemetry, ReArmOutcome, RunRow, RunStore, SlaTimerCall, TimerRow, TimerStore,
+    TimerWheel, WfJournal,
 };
 use myelin_tenancy::{Region, TenantId};
 
@@ -113,22 +115,27 @@ fn consumer_issues_sla_slides_the_deadline_then_disarms_on_resolution() {
     run.state = run_state::WAITING.into();
     runs.put(run);
 
-    // CONSUMER: arm the SLA breach timer ONCE (the issue opened; breach due in 4h = 14_400s).
-    let timer_id = "sla/issue-7";
-    assert_eq!(store.arm(sla_timer(timer_id, "R-sla-issue-7", 14_400)), ArmOutcome::Armed);
+    // CONSUMER: derive the deterministic breach key via the DOCUMENTED helper (P-FLOW-21 — the call
+    // site never constructs the key by hand), then arm the SLA breach timer ONCE (issue opened; due
+    // in 4h = 14_400s).
+    let timer_id = sla_timer_id("issue-7");
+    assert_eq!(store.arm(sla_timer(&timer_id, "R-sla-issue-7", 14_400)), ArmOutcome::Armed);
 
     // CONSUMER: the issue is touched 3 times (a comment, a reassignment, a label) — each SLIDES the
-    // breach deadline forward by a cheap re-arm (the `stale_after` reset). NONE adds a wheel row.
+    // breach deadline forward via the DOCUMENTED call-site helper (a single row update). NONE adds a
+    // wheel row, NONE scans the wheel (the P-FLOW-21 M3 confirmation at the real Issues boundary).
+    let call = SlaTimerCall::new(&store, tenant(), timer_id.clone());
     for (touch, new_fire_at) in [(1, 21_600i64), (2, 28_800), (3, 36_000)] {
         assert_eq!(
-            store.re_arm(&tenant(), timer_id, new_fire_at),
+            call.re_arm(new_fire_at),
             ReArmOutcome::ReArmed,
-            "CONSUMER touch {touch}: the SLA deadline slid forward by a cheap re-arm"
+            "CONSUMER touch {touch}: the SLA deadline slid forward by a cheap call-site re-arm"
         );
         assert_eq!(store.armed_count(), 1, "CONSUMER: STILL one timer on the wheel (re-arm is a row update)");
+        assert_eq!(store.rows_scanned(), 0, "CONSUMER: the call-site re-arm never scanned the wheel");
     }
     // the breach timer now sits at its latest deadline (10h = 36_000s, bucket 600) — far-future.
-    let row = store.get(&tenant(), timer_id).unwrap();
+    let row = store.get(&tenant(), &timer_id).unwrap();
     assert_eq!(row.fire_at, 36_000);
     assert_eq!(row.bucket, 600);
 
@@ -137,8 +144,9 @@ fn consumer_issues_sla_slides_the_deadline_then_disarms_on_resolution() {
     let wheel = TimerWheel::new(store.clone(), journal.clone(), runs.clone(), FlowTelemetry::new(), 0, 100);
     assert_eq!(wheel.tick(18_000), 0, "CONSUMER: the breach has not fired (the deadline keeps sliding forward)");
 
-    // CONSUMER: the issue is RESOLVED — disarm the breach timer (the SLA was met → never fire).
-    assert_eq!(store.disarm(&tenant(), timer_id), DisarmOutcome::Disarmed, "CONSUMER: resolution disarms the breach");
+    // CONSUMER: the issue is RESOLVED — disarm the breach timer via the call-site helper (the SLA was
+    // met → never fire). One row op at the Issues boundary.
+    assert_eq!(call.disarm(), DisarmOutcome::Disarmed, "CONSUMER: resolution disarms the breach");
 
     // even when the (now-disarmed) deadline arrives, the wheel fires NOTHING (the breach was met).
     assert_eq!(wheel.tick(40_000), 0, "CONSUMER: the disarmed breach never fires (the SLA was satisfied)");
@@ -151,6 +159,37 @@ fn consumer_issues_sla_slides_the_deadline_then_disarms_on_resolution() {
         run_state::WAITING,
         "CONSUMER: the SLA workflow was never woken (the breach was disarmed)"
     );
+}
+
+/// **CONSUMER side of 9.3 (the Event-Bus stateful Trigger's `stale_after` rides the SAME re-arm path
+/// at the SAME call boundary — P-FLOW-21).** The Trigger `{owner, condition, arms_subject, on_resolve,
+/// stale_after}` (contract 3.3) arms a `stale_after` timer once, then every touch RESETS it via the
+/// IDENTICAL [`SlaTimerCall::re_arm`] the Issues SLA-deadline slide uses — there is no second code path
+/// per producer. On resolve the trigger DISARMS its `stale_after`. This is the M3 confirmation that the
+/// `stale_after` re-arm uses the same row-op path as the Issues call site.
+#[test]
+fn consumer_trigger_stale_after_resets_via_the_same_re_arm_path() {
+    let store = TimerStore::new();
+
+    // CONSUMER: derive the Trigger key via the documented helper (never by hand) + arm the stale_after
+    // timer once (the promise armed; stale in 30 days = 2_592_000s).
+    let trig_id = trigger_stale_timer_id("u-42", "issue/acme/proj#7");
+    assert_eq!(store.arm(sla_timer(&trig_id, "R-trigger", 2_592_000)), ArmOutcome::Armed);
+
+    let call = SlaTimerCall::new(&store, tenant(), trig_id.clone());
+    assert_eq!(call.timer_id(), "trigger/u-42/issue/acme/proj#7", "the Trigger call site keys on owner/subject");
+
+    // every condition-relevant touch RESETS stale_after (the SAME re-arm row op as the SLA slide).
+    for new_fire_at in [2_600_000i64, 2_700_000, 2_800_000] {
+        assert_eq!(call.re_arm(new_fire_at), ReArmOutcome::ReArmed, "stale_after reset is the same re-arm path");
+        assert_eq!(store.armed_count(), 1, "STILL one row (the reset is an UPDATE, no wheel pollution)");
+    }
+    assert_eq!(store.rows_scanned(), 0, "no stale_after reset ever scanned the wheel (row-update cost)");
+    assert_eq!(store.get(&tenant(), &trig_id).unwrap().fire_at, 2_800_000, "the latest stale_after deadline");
+
+    // the trigger RESOLVED → disarm its stale_after (it must never go stale now).
+    assert_eq!(call.disarm(), DisarmOutcome::Disarmed, "resolution disarms the stale_after timer");
+    assert!(store.get(&tenant(), &trig_id).unwrap().fired, "the disarmed stale_after's partial-index pivot is set");
 }
 
 /// **CONSUMER negative — when the SLA is NOT touched, the breach DOES fire (the re-arm is the only

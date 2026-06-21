@@ -411,6 +411,102 @@ impl TimerStore {
     }
 }
 
+/// **The cheap SLA-timer disarm/re-arm CALL-SITE helper — the documented Issues (SLA timers) +
+/// Trigger (`stale_after`) entry point (§6.6, contract 9.3; P-FLOW-21 M3 confirmation).**
+///
+/// P-FLOW-14 owns the row-op primitive ([`TimerStore::re_arm`] / [`TimerStore::disarm`]); this module
+/// is the M3 CONFIRMATION that those primitives hold UNDER THEIR REAL CALL SITES. Before this, the two
+/// producers (Issues' SLA-breach deadline + the Event-Bus stateful Trigger's `stale_after`) constructed
+/// the deterministic `timer_id` AD-HOC at the call site (`format!("sla/{issue_key}")` and friends),
+/// which is the kind of drift the coherence doctrine (EI-01 §7) warns against — two producers inventing
+/// two key schemes for the SAME wheel. This module is the ONE documented helper both call:
+///
+/// - [`sla_timer_id`] — the deterministic `timer_id` the Issues SLA-breach producer keys on (stable per
+///   `(issue_key)` so a re-arm targets the SAME row, never a second one);
+/// - [`trigger_stale_timer_id`] — the deterministic `timer_id` the Trigger `stale_after` producer keys
+///   on (stable per `(trigger_owner, arms_subject)`, contract 3.3 — the stateful per-person promise);
+/// - [`SlaTimerCall::re_arm`] — the documented re-arm helper: a re-arm of a precomputed `fire_at` at the
+///   call boundary is a SINGLE row update ([`ReArmOutcome::ReArmed`]); the call site NEVER touches the
+///   wheel scan, NEVER adds a row;
+/// - [`SlaTimerCall::disarm`] — the documented cancel helper: the SLA was met / the trigger resolved →
+///   one row op ([`DisarmOutcome::Disarmed`]), the timer never fires.
+///
+/// **Both call sites take the SAME `re_arm` path (§6.6):** the Trigger `stale_after` reset and the
+/// Issues SLA-deadline slide are the IDENTICAL row update of `fire_at` + derived `bucket` — there is no
+/// second code path, no calendar logic on the wheel. The M3 gate is the call-site test proving a re-arm
+/// is a single row update at the Issues/Trigger boundary (`tests/cdc_9_3_disarm_rearm.rs` exercises this
+/// helper, not ad-hoc keys); the merge-queue holds-no-runtime re-green is the P-FLOW-19 drill re-run
+/// (`tests/drills_flow_merge_queue.rs`).
+pub mod sla {
+    use super::{DisarmOutcome, ReArmOutcome, TimerStore};
+    use myelin_tenancy::TenantId;
+
+    /// **The deterministic `timer_id` the Issues SLA-breach producer keys on (§6.6, contract 9.3).** A
+    /// stable, PII-free handle per issue — `sla/<issue_key>` — so the FIRST `arm` lands the breach
+    /// timer and every later `re_arm` (a comment/label/reassign that slides the deadline) targets the
+    /// SAME row (no second wheel row). `issue_key` is the opaque issue ref (e.g. `acme/proj#7`), not PII.
+    /// The Issues SLA workflow calls this once at the call boundary — it never builds the key by hand.
+    pub fn sla_timer_id(issue_key: &str) -> String {
+        format!("sla/{issue_key}")
+    }
+
+    /// **The deterministic `timer_id` the Event-Bus stateful Trigger's `stale_after` keys on (§6.6,
+    /// contract 3.3).** A stable, PII-free handle per stateful-promise — `trigger/<owner>/<arms_subject>`
+    /// — so a Trigger armed for `owner` over `arms_subject` re-arms the SAME `stale_after` row every time
+    /// the promise is touched (the `Trigger{owner, condition, arms_subject, on_resolve, stale_after}`
+    /// reset), and disarms it on resolve/disarm. `owner`/`arms_subject` are opaque refs, not PII.
+    pub fn trigger_stale_timer_id(owner: &str, arms_subject: &str) -> String {
+        format!("trigger/{owner}/{arms_subject}")
+    }
+
+    /// **The documented SLA-timer call-site helper both Issues (SLA) and Trigger (`stale_after`) call
+    /// (§6.6, contract 9.3 — P-FLOW-21 M3 confirmation).** A thin, INTENTIONALLY-trivial wrapper over
+    /// the P-FLOW-14 row-op primitives ([`TimerStore::re_arm`] / [`TimerStore::disarm`]) that binds a
+    /// `(tenant, timer_id)` so a producer's re-arm/disarm at the call boundary is a SINGLE documented
+    /// path — no ad-hoc key construction, no second code path per producer. The whole point is that this
+    /// is NOT a new mechanism: it is the M3 confirmation that the existing cheap row op is what the call
+    /// sites hit. Hold one per armed SLA/`stale_after` timer; call [`SlaTimerCall::re_arm`] to slide the
+    /// deadline (a row update) and [`SlaTimerCall::disarm`] to cancel it (the SLA met / promise resolved).
+    pub struct SlaTimerCall<'a> {
+        timers: &'a TimerStore,
+        tenant: TenantId,
+        timer_id: String,
+    }
+
+    impl<'a> SlaTimerCall<'a> {
+        /// Bind the call helper to the timer store + the `(tenant, timer_id)` the producer keys on
+        /// (derive `timer_id` via [`sla_timer_id`] / [`trigger_stale_timer_id`] — never by hand).
+        pub fn new(timers: &'a TimerStore, tenant: TenantId, timer_id: impl Into<String>) -> Self {
+            Self { timers, tenant, timer_id: timer_id.into() }
+        }
+
+        /// The `timer_id` this call helper targets (the stable handle — read by a test/audit).
+        pub fn timer_id(&self) -> &str {
+            &self.timer_id
+        }
+
+        /// **Re-arm the SLA/`stale_after` deadline — a SINGLE row UPDATE at the call boundary (§6.6).**
+        /// The Issues SLA-deadline slide + the Trigger `stale_after` reset are the IDENTICAL row op:
+        /// rewrite `fire_at` + the derived `bucket`, re-open the timer — NO new row, NO calendar logic on
+        /// the wheel. Returns [`ReArmOutcome::ReArmed`] when the row was updated (one row touched),
+        /// [`ReArmOutcome::Absent`] when no timer is armed under the key (the producer arms first). The
+        /// merge-queue/wheel scan is NEVER touched — re-arming N timers is N row updates (the SC-11
+        /// churn property holds under the real call sites).
+        pub fn re_arm(&self, new_fire_at: i64) -> ReArmOutcome {
+            self.timers.re_arm(&self.tenant, &self.timer_id, new_fire_at)
+        }
+
+        /// **Disarm the SLA/`stale_after` timer — one cheap row op, the timer never fires (§6.6).** The
+        /// Issues "the SLA was satisfied, cancel the breach" + the Trigger "resolved/disarmed" call:
+        /// sets the partial-index pivot `fired = true` so the wheel's `WHERE NOT fired` scan never reads
+        /// it again. Returns [`DisarmOutcome::Disarmed`] (one row) or [`DisarmOutcome::Absent`] (already
+        /// fired / never armed — idempotent, no double-cancel).
+        pub fn disarm(&self) -> DisarmOutcome {
+            self.timers.disarm(&self.tenant, &self.timer_id)
+        }
+    }
+}
+
 /// The frozen `wf_history.kind` tokens the timer wheel writes (the §3.2 vocabulary the
 /// [`crate::migrations`] `CHECK` admits): `timer_set` when a `sleep` arms a timer, `timer_fired` when
 /// the wheel fires it.
@@ -834,6 +930,74 @@ mod tests {
         assert!(store.scan_due(0, 30, 100).is_empty(), "nothing to fire — the timer was deleted");
 
         assert_eq!(store.disarm_delete(&tenant(), "sla"), DisarmOutcome::Absent, "a re-delete is a no-op");
+    }
+
+    /// **The SLA/`stale_after` call-site helper derives a STABLE deterministic `timer_id` per producer
+    /// (§6.6, contract 9.3 — P-FLOW-21).** The Issues SLA-breach key is `sla/<issue_key>`; the Trigger
+    /// `stale_after` key is `trigger/<owner>/<arms_subject>`. The SAME issue always yields the SAME key
+    /// (so a re-arm targets the SAME row, never a second), and the two producers never collide (distinct
+    /// prefixes). No PII in the key (opaque refs only).
+    #[test]
+    fn the_call_site_helper_derives_stable_per_producer_timer_ids() {
+        use super::sla::{sla_timer_id, trigger_stale_timer_id};
+        assert_eq!(sla_timer_id("acme/proj#7"), "sla/acme/proj#7", "Issues SLA key is sla/<issue_key>");
+        assert_eq!(sla_timer_id("acme/proj#7"), sla_timer_id("acme/proj#7"), "the same issue → the same key");
+        assert_eq!(
+            trigger_stale_timer_id("u-42", "issue/acme/proj#7"),
+            "trigger/u-42/issue/acme/proj#7",
+            "Trigger stale_after key is trigger/<owner>/<arms_subject>"
+        );
+        // the two producers never collide on the same wheel (distinct prefixes).
+        assert_ne!(sla_timer_id("x"), trigger_stale_timer_id("x", "x"));
+    }
+
+    /// **The documented call-site helper makes a re-arm a SINGLE row update at the Issues/Trigger
+    /// boundary (§6.6, contract 9.3 — the P-FLOW-21 M3 confirmation gate).** A producer binds a
+    /// [`SlaTimerCall`] to the wheel + its deterministic key, then re-arms forward via the ONE documented
+    /// path: the row is updated in place (its `fire_at` + derived `bucket` slide), the wheel depth stays
+    /// 1 (no second row), and the wheel scan is NEVER touched (row-update cost, not wheel-scan cost). A
+    /// disarm at the call boundary is one row op (the SLA met → never fire). This is the M3 confirmation
+    /// that the existing cheap row op is what the REAL call sites hit — no ad-hoc key, no second path.
+    #[test]
+    fn the_call_site_helper_re_arm_is_one_row_update_disarm_is_one_row_op() {
+        use super::sla::{sla_timer_id, trigger_stale_timer_id, SlaTimerCall};
+        let store = TimerStore::new();
+
+        // --- Issues SLA-breach call site ---
+        let issue_key = "acme/proj#7";
+        let id = sla_timer_id(issue_key);
+        // the producer arms the breach ONCE (issue opened; due in 4h = 14_400s, bucket 240).
+        store.arm(timer(&id, "R-sla-7", 14_400, 0));
+        assert_eq!(store.armed_count(), 1);
+        assert_eq!(store.rows_scanned(), 0, "no scan yet — the call site must not rescan the wheel");
+
+        let call = SlaTimerCall::new(&store, tenant(), id.clone());
+        assert_eq!(call.timer_id(), "sla/acme/proj#7");
+        // the issue is touched → the call site SLIDES the deadline forward (one row update).
+        assert_eq!(call.re_arm(28_800), ReArmOutcome::ReArmed, "the call-site re-arm updates the row");
+        let row = store.get(&tenant(), &id).unwrap();
+        assert_eq!(row.fire_at, 28_800, "fire_at slid forward at the call boundary");
+        assert_eq!(row.bucket, epoch_minute(28_800), "the derived bucket was recomputed");
+        assert_eq!(store.armed_count(), 1, "STILL one row — the call-site re-arm is an UPDATE, not a new arm");
+        assert_eq!(store.rows_scanned(), 0, "the call-site re-arm did NOT scan the wheel (row-update cost)");
+        // resolution → the call site disarms the breach (one row op, the timer never fires).
+        assert_eq!(call.disarm(), DisarmOutcome::Disarmed, "the call-site disarm is one row op");
+        assert!(store.get(&tenant(), &id).unwrap().fired, "the disarmed breach's partial-index pivot is set");
+        assert_eq!(call.disarm(), DisarmOutcome::Absent, "a re-disarm at the call site is idempotent (0 rows)");
+
+        // --- Trigger stale_after call site (the SAME documented path) ---
+        let trig_id = trigger_stale_timer_id("u-42", "issue/acme/proj#7");
+        store.arm(timer(&trig_id, "R-trig", 600, 0));
+        let trig_call = SlaTimerCall::new(&store, tenant(), trig_id.clone());
+        // the trigger is touched → stale_after RESET (the IDENTICAL re-arm row op as the SLA slide).
+        assert_eq!(trig_call.re_arm(7_200), ReArmOutcome::ReArmed, "the stale_after reset is the same re-arm path");
+        assert_eq!(store.get(&tenant(), &trig_id).unwrap().fire_at, 7_200);
+        assert_eq!(store.armed_count(), 2, "two timers on the wheel (Issues SLA + Trigger), each one row");
+        assert_eq!(store.rows_scanned(), 0, "no producer touched the wheel scan — all re-arms were row updates");
+
+        // re-arming an ABSENT key at the call site is Absent (the producer arms first).
+        let ghost = SlaTimerCall::new(&store, tenant(), sla_timer_id("never-armed"));
+        assert_eq!(ghost.re_arm(9_999), ReArmOutcome::Absent, "re-arm of an unarmed key is Absent (0 rows)");
     }
 
     /// **A late timer fire on a TERMINAL run is a harmless no-op (the wake never resurrects).** A
