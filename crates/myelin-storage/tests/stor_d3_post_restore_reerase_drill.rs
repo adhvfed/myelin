@@ -125,6 +125,7 @@ fn stor_d3_post_restore_reerase_zero_resurrected() {
         refs: &seams,
         bus: &seams,
         ledger: &seams,
+        git_reach: None,
     };
     let pass = ReErasePass::new(&kms, region());
     let rep = pass.run(&report, &ledger, &holders, 1_000).expect("re-erasure pass runs");

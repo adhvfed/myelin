@@ -670,7 +670,7 @@ mod tests {
         }
         let n = Noop;
         let holders = EraseHolders {
-            pseudonym: &n, search: &n, refs: &n, bus: &n, ledger: &n,
+            pseudonym: &n, search: &n, refs: &n, bus: &n, ledger: &n, git_reach: None,
         };
         assert!(structural_reach_uses_erase_seams(&holders));
     }
