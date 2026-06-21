@@ -292,6 +292,131 @@ impl RunStore {
     }
 }
 
+/// **One delivered durable signal — the `wf_signal` row carrier (§3.4, references-not-payloads).** A
+/// buffered inbound signal (`approval` / `cancel` / `ci.result` / `job.done`) keyed by the per-effect
+/// idempotency anchor `(tenant, run_id, signal_name, idem_key)`. `payload` is `ArtifactRef`s (never a
+/// PII body); the RARE inline-PII payload crypto-shreds via `payload_key_ref`. `consumed_seq` is
+/// `None` while buffered (the consuming wait, P-FLOW-11, stamps the `wf_history` seq that consumed it).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignalRow {
+    /// `(tenant, region)` partition key.
+    pub tenant: TenantId,
+    /// `(tenant, region)` residency pin.
+    pub region: Region,
+    /// the run this signal is buffered for — an opaque run id, no PII.
+    pub run_id: String,
+    /// the FROZEN signal name (`approval` / `cancel` / `ci.result` / `job.done`, §4.3) — a taxonomy
+    /// token, not PII.
+    pub signal_name: String,
+    /// the per-effect idempotency anchor (§3.4 / §6.4) — the PK's idem dimension. A re-delivered
+    /// signal under the same key is a no-op (the workflow wakes once, §4.9). Often the deterministic
+    /// `idem_token` minted at dispatch (so producer + consumer agree without coordination).
+    pub idem_key: String,
+    /// the signal body as **`ArtifactRef`s, never a PII body** (§3.4) — references-not-payloads.
+    pub payload: Vec<ArtifactRef>,
+    /// the crypto-shred key id IF the payload carries inline PII (the RARE case, §3.4) — the ONLY PII
+    /// locator on the row; erasing a subject crypto-shreds the payload.
+    pub payload_key_ref: Option<String>,
+    /// the `wf_history` seq that consumed it (`None` = buffered, unconsumed, §3.4) — the consuming
+    /// wait (P-FLOW-11) stamps it.
+    pub consumed_seq: Option<i64>,
+}
+
+/// **The in-memory `wf_signal` store — the durably-buffered inbound-signal substrate (§3.4).** A
+/// cloneable handle over a shared map keyed by the per-effect idempotency anchor `(tenant, run_id,
+/// signal_name, idem_key)`. [`SignalStore::deliver`] models the frozen `INSERT … ON CONFLICT (tenant,
+/// run_id, signal_name, idem_key) DO NOTHING`: a doubly-delivered signal is buffered EXACTLY ONCE (a
+/// redelivery under at-least-once bus delivery wakes the workflow once, §4.9). This is the P-FLOW-09
+/// delivery + idempotency mechanism; the consuming wait (`wait_for_signal`) is P-FLOW-11 and the
+/// per-effect key-CONSTRUCTION rule (single vs multi-effect) is P-FLOW-10.
+///
+/// **Live binding:** the real apply is the frozen `wf_signal` DDL + ON CONFLICT DO NOTHING in
+/// `tests/integration_flow_signal.rs` (the PK IS the dedup, never an application-level check) — the
+/// dev↔prod config swap, never a code change.
+/// The `wf_signal` PK tuple `(tenant, run_id, signal_name, idem_key)` — the per-effect idempotency
+/// anchor (§3.4) the [`SignalStore`] keys on. An ON CONFLICT under THIS key is the dedup.
+type SignalKey = (String, String, String, String);
+
+#[derive(Clone, Default)]
+pub struct SignalStore {
+    inner: Arc<Mutex<HashMap<SignalKey, SignalRow>>>,
+}
+
+impl SignalStore {
+    /// A fresh, empty signal store.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<SignalKey, SignalRow>> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn key(row: &SignalRow) -> SignalKey {
+        (
+            row.tenant.0.clone(),
+            row.run_id.clone(),
+            row.signal_name.clone(),
+            row.idem_key.clone(),
+        )
+    }
+
+    /// **Deliver a signal idempotently — the `INSERT … ON CONFLICT (tenant, run_id, signal_name,
+    /// idem_key) DO NOTHING` (§3.4 / §4.9).** Returns `true` if the signal was BUFFERED (the first
+    /// delivery under its key), `false` if it was a DUPLICATE (an already-buffered key — the no-op
+    /// that makes at-least-once delivery wake-once). The PK is the dedup; no application-level read-
+    /// then-write race (the conflict resolves atomically under the unique key).
+    pub fn deliver(&self, row: SignalRow) -> bool {
+        let mut signals = self.lock();
+        let key = Self::key(&row);
+        // ON CONFLICT DO NOTHING: the FIRST delivery under (tenant, run_id, signal_name, idem_key)
+        // wins; a re-delivery (the at-least-once bus redelivering "done" twice, §4.9) is a no-op —
+        // the buffered row is UNCHANGED (never overwritten, never a second buffered copy).
+        if signals.contains_key(&key) {
+            return false;
+        }
+        signals.insert(key, row);
+        true
+    }
+
+    /// Read a buffered signal by its per-effect key `(tenant, run_id, signal_name, idem_key)`.
+    pub fn get(
+        &self,
+        tenant: &TenantId,
+        run_id: &str,
+        signal_name: &str,
+        idem_key: &str,
+    ) -> Option<SignalRow> {
+        self.lock()
+            .get(&(
+                tenant.0.clone(),
+                run_id.to_string(),
+                signal_name.to_string(),
+                idem_key.to_string(),
+            ))
+            .cloned()
+    }
+
+    /// The count of BUFFERED (delivered-not-yet-consumed) signals — the signal-buffer-depth telemetry
+    /// source (§1.8 / §5.4). A signal whose `consumed_seq` is set (consumed by a wait, P-FLOW-11) no
+    /// longer counts.
+    pub fn buffered_depth(&self) -> u64 {
+        self.lock()
+            .values()
+            .filter(|s| s.consumed_seq.is_none())
+            .count() as u64
+    }
+
+    /// The total number of signal rows buffered for a run (consumed or not) — used to assert a double-
+    /// delivery inserted exactly ONE row, not two.
+    pub fn count_for_run(&self, tenant: &TenantId, run_id: &str) -> usize {
+        self.lock()
+            .values()
+            .filter(|s| s.tenant.0 == tenant.0 && s.run_id == run_id)
+            .count()
+    }
+}
+
 /// **The contract-1.8 engine telemetry — the replay/lease survival signals (§1.8).** A cloneable
 /// handle (an `Arc<Mutex<…>>`) the metrics-health port reads. The FLOW-D1 green artifact is the
 /// REPLAY RATE signal emitted + the 0-DOUBLE-EFFECT counter on this port: a replay that re-executes a
@@ -331,6 +456,13 @@ struct TelemetryInner {
     /// divergences silently continued. NON-zero is the "a workflow body diverged on replay" health
     /// signal; the run is dead-lettered, never silently continued.
     nondeterministic_halt_count: u64,
+    /// **the signal-buffer-DEPTH gauge (the §1.8 / §5.4 signal — durable signals, P-FLOW-09).** How
+    /// many `wf_signal` rows are BUFFERED (delivered, not yet consumed by a wait) across the engine.
+    /// Set from the [`SignalStore`] after each delivery — a doubly-delivered signal under the same
+    /// `(tenant, run_id, signal_name, idem_key)` increments it by ONE, not two (the ON CONFLICT DO
+    /// NOTHING dedup is what makes the gauge truthful). This also covers the `job.done`/`ci.result`
+    /// long-park backlog (§5.4 — the merge-queue/CI-stage backlog health signal).
+    signal_buffer_depth: u64,
 }
 
 impl FlowTelemetry {
@@ -438,6 +570,22 @@ impl FlowTelemetry {
     /// The last observed runnable-run lag (the §1.8 gauge).
     pub fn runnable_run_lag(&self) -> u64 {
         self.lock().runnable_run_lag
+    }
+
+    /// **Set the signal-buffer-depth gauge (the §1.8 / §5.4 signal — durable signals, P-FLOW-09).**
+    /// The count of BUFFERED (delivered-not-yet-consumed) `wf_signal` rows. Set from the
+    /// [`SignalStore`] after each idempotent delivery — a double-delivery under the same key sets the
+    /// SAME depth (the ON CONFLICT DO NOTHING dedup, never a `+2`). Also the `job.done`/`ci.result`
+    /// long-park backlog signal (§5.4).
+    pub fn set_signal_buffer_depth(&self, depth: u64) {
+        self.lock().signal_buffer_depth = depth;
+    }
+
+    /// The signal-buffer-depth gauge (the §1.8 / §5.4 signal) — how many delivered signals await a
+    /// consuming wait. A growing depth is the "signals are buffered but nothing is consuming them"
+    /// health signal (and the long-park backlog for `job.done`/`ci.result`).
+    pub fn signal_buffer_depth(&self) -> u64 {
+        self.lock().signal_buffer_depth
     }
 }
 
