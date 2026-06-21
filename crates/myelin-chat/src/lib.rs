@@ -19,7 +19,16 @@
 //!   frozen `message-`/`thread-` grammar + the grammatical mint codecs. The runtime mint SITE
 //!   (co-committed with the outbox event) is the CHAT-P6 floor.
 //!
-//! The humanise/notif/fanout slice is CHAT-P3.
+//! - [`glue`] — **CHAT-P3 / P-245**: the M2-C0 humanise/notif/fanout-class + firehose-scope + TE-21
+//!   slice (contracts 7.3 / 7.6 / 3.5 / 1.7). Chat REGISTERS its humanise template keys (card /
+//!   agent-message / `chat.message.mentioned` — the ONE templating surface, OQ-L) + its
+//!   `define_notif_rule` reason set (mentioned / replied / thread_watched / approval_requested) into
+//!   Notif's frozen verbs, declares the fanout-class (write-fanout the bounded high-signal set,
+//!   read-fanout the unbounded ambient set, arch §4), VALIDATES its `channel:<id>` firehose scope
+//!   against the frozen resume-cursor protocol (contract 3.5, never `*`), and pins the TE-21
+//!   connection-tier language call (Rust default; the BEAM hatch written-but-closed — a no-op against
+//!   the 1.7 harness shim). This CLOSES the M2-C0 contract surface. The rules are USED in
+//!   CHAT-P16/P18, the scope is IMPLEMENTED in CHAT-P9, the TE-21 hatch opens in CHAT-P26 (floors).
 //!
 //! **Owning architecture doc:**
 //! `planning/04-subsystem-architectures/chat/architecture/03-events-contracts-and-glue.md` §1 (the
@@ -67,5 +76,6 @@
 #![forbid(unsafe_code)]
 
 pub mod events;
+pub mod glue;
 pub mod rebac_fragment;
 pub mod subs;
