@@ -683,6 +683,17 @@ cdc = [
     # decision (arch §4: write-fanout the bounded high-signal `mention` producer vs read-fanout the
     # unbounded ambient set that never write-amplifies). Notif ADMITS + ROUTES it (zero Notif change).
     "crates/myelin-chat/tests/cdc_7_6_chat_notif_rules.rs",
+    # GIT slice — git (GIT-P19 / P-263, M3) declares its reason set (review_requested->direct /
+    # mentioned->direct / watched->watching, each via the frozen `define_notif_rule` verb reconciled
+    # against the §3.1 table) AND wires its REAL PR/repo watcher reverse index behind the frozen
+    # `WatcherResolvePort` (4.3/4.10), over the `watcher` relation its frozen ReBAC fragment declares
+    # (4.9). Notif ADMITS + ROUTES the rules + READ-FANS-OUT a viewer's ambient Git slice over the real
+    # watcher graph (replacing the NOTIF-P13 synthetic fixtures for Git subjects) — zero Notif change.
+    # The CDC carries BOTH the provider (Git declares the reasons at table-correct bands + serves only
+    # the Git watcher relation) and consumer (Notif registry admits/classifies + read-fanout lowers the
+    # InRelation{watcher} push-down, held-not-leaked on revoke/unavailable) sides; it also pins the 4.9
+    # watcher-relation slice for the read-fanout half (the fragment-admit slice stays cdc_4_9_git_fragment).
+    "crates/myelin-git/tests/cdc_7_6_4_9_git_notif_rules.rs",
 ]
 
 # 7.7 SPLIT: the HOLDER HALF (registration + locate/export/rectify/restrict + the structural

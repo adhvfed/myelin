@@ -2242,6 +2242,7 @@ dependencies = [
  "myelin-gdpr",
  "myelin-identity",
  "myelin-identity-service",
+ "myelin-notif",
  "myelin-query",
  "myelin-refs",
  "myelin-search",

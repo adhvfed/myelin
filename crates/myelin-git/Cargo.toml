@@ -49,6 +49,17 @@ myelin-search = { path = "../myelin-search" }
 # code-projection `struct_fields` (path/language/blob_oid) are typed over. Owned by Search/Query, not
 # re-defined here.
 myelin-query = { path = "../myelin-query" }
+# The Notif registration seam (contract 7.6 define_notif_rule + the read-fanout WatcherResolvePort,
+# 4.3/4.10). GIT-P19 (P-263) is producer accretion: Git REGISTERS its define_notif_rule set
+# (review_requested / mentioned) by constructing the frozen `myelin_notif::NotifRule` values + wires
+# its REAL PR-watcher reverse index behind the frozen `myelin_notif::WatcherResolvePort` — Git
+# registers/produces, Notif owns the seam (ZERO Notif code change, the inverse-signal property,
+# EI-01 §1). `myelin-notif` is a NAMED leaf CONSUMER (it depends on no subsystem crate and NOTHING in
+# the production DAG depends back on it); a producer LEAF (`myelin-git`) calling its public
+# registration seam is an acyclic sanctioned edge (mirrors the `myelin-search` declare_indexable +
+# `myelin-refs` mint edges this crate already carries). Notif's `Reason`/`Class`/`NotifRule`/
+# `WatcherResolvePort` are consumed, never re-defined (the names anchor X-5).
+myelin-notif = { path = "../myelin-notif" }
 serde.workspace = true
 # JSON for the LIVE check-seam consumer leg (EB-26 / P-246, M3): Git decodes the OPAQUE
 # `ci.check.updated` payload (`myelin_events::check_seam::OrderedCheck::check_status`, carried as a
