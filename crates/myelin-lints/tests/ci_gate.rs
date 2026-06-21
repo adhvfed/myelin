@@ -13,6 +13,15 @@ fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
+/// The `myelin-flow` crate's fixtures dir (a sibling crate). The flow-determinism RED+GREEN
+/// fixtures (P-FLOW-08 / P-200) live there, expressed against the real `WfCtx` surface; this
+/// CI-wiring test runs the SAME `lint-gate` binary CI runs over them, so the "the lint rejects the
+/// red and admits the green" proof is end-to-end (the binary exit code, not just a unit assertion).
+fn flow_fixtures_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../myelin-flow/tests/fixtures")
+}
+
 /// Run the compiled `lint-gate` binary over `--no-exclude PATH` and return its exit status code.
 /// `--no-exclude` disables the by-design `/fixtures/` exclusion so the fixture is actually scanned.
 fn run_gate_over(path: &Path) -> i32 {
@@ -84,6 +93,29 @@ fn ci_gate_passes_on_the_eb09_stream_scope_green_fixture() {
     let green = fixtures_dir().join("tenant_predicate.eb09.green.rs.txt");
     let code = run_gate_over(&green);
     assert_eq!(code, 0, "lint-gate MUST exit zero on the EB-09 stream-scope green fixture");
+}
+
+#[test]
+fn ci_gate_fails_loudly_on_the_flow_determinism_red_fixture() {
+    // P-FLOW-08 / P-200 (the flow-determinism red+green fixtures, contract 1.6 / index 9.2): the
+    // RED fixture (a `@workflow-body` reading SystemTime::now / rand:: / tokio::time::sleep /
+    // Uuid::new_v4 — the non-deterministic-replay bug class) MUST make the gate exit NON-ZERO. The
+    // exit code IS the gate, so it cannot be `|| true`-swallowed (EI-01 §5). This is the dated green
+    // proof the flow-determinism lint REJECTS the red, wired into CI loud-never-swallowed.
+    let red = flow_fixtures_dir().join("flow_determinism.flow.red.rs.txt");
+    let code = run_gate_over(&red);
+    assert_ne!(code, 0, "lint-gate MUST exit non-zero on the flow-determinism red fixture");
+}
+
+#[test]
+fn ci_gate_passes_on_the_flow_determinism_green_fixture() {
+    // The flow-determinism GREEN fixture (the same digest workflow via ctx.now()/ctx.rand()/
+    // ctx.activity(..)): the gate MUST exit ZERO — proving the lint ADMITS the WfCtx-routed body
+    // (it does not over-reject). The green fixture is also COMPILE-checked against the real `WfCtx`
+    // by `myelin-flow`'s `lint_fixtures::green_compiles` test (the "admits" half is an artifact).
+    let green = flow_fixtures_dir().join("flow_determinism.flow.green.rs.txt");
+    let code = run_gate_over(&green);
+    assert_eq!(code, 0, "lint-gate MUST exit zero on the flow-determinism green fixture");
 }
 
 #[test]
