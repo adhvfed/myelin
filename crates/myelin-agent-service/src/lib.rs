@@ -83,6 +83,7 @@ pub mod migrations;
 pub mod mock;
 pub mod schema;
 pub mod skeleton;
+pub mod tool_scope;
 
 // Re-export the PersonalDataHolder registration seam (AG-P3 → P-132) at the crate root — the shape
 // the harness `serve` (AG-P4) + the DSR fan-out (AG-P23) + the 10.1 CDC consume (mirrors
@@ -117,6 +118,18 @@ pub use effect_api::{
     decode_proposed, encode_proposed, validate_schema, ApplyError, CapabilityCheck, DelegationLookup,
     EffectApiBridge, EffectBudget, EffectCost, PipelineSignals, PipelineStep, PlanThenApply,
     PlannedEffect, SubsystemApply, TenantGuard,
+};
+
+// The delegation-scoped tool-list (AG-P7 → P-219): the `list_objects` SetExpr push-down (the no-N+1
+// pre-filter the brain's `Conversation.tools` is built from, §2.1) + the apply-time re-check (the
+// scoping is an OPTIMISATION; `EffectApi` is the GUARANTEE, fail-closed). The single-query subset
+// builder (4.3 consumed, 4.10 zookie honoured, 8.1 resolve) lowered to ONE predicate over the
+// Fabric's own `tool_def.id`; the live-PG push-down SQL behind the `integration` feature.
+pub use tool_scope::{
+    apply_scope_to_conversation, assert_apply_rechecks_revoked, build_scoped_tool_list,
+    lower_list_objects, lower_set_expr, scoped_tool_ids_sql, tool_def_id, ScopedToolList,
+    ToolCatalogueIds, ToolListObjects, ToolScopePredicate, TOOL_DEF_OBJECT_TYPE, TOOL_ID_COLUMN,
+    TOOL_USE_PERMISSION,
 };
 
 // The agent-service `serve(AppSpec)` shell (AG-P4 → P-216): the three ports, liveness != readiness,
