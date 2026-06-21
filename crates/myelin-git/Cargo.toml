@@ -96,6 +96,24 @@ git2.workspace = true
 # depend back on `myelin-git` (the §2.9 DAG stays acyclic; the build stays DB-free — fs-floor only).
 myelin-storage = { path = "../myelin-storage" }
 
+# The substrate ROOT surface (contract 1.10 FailStatic<T> + 4.11 the Id-usage bound, contract 1.8
+# fail-static survival signals). GIT-P14 (P-275, M3) bounds the git→Id `check` with the SAME
+# `myelin_substrate::FailStaticAuthz` the platform Identity dependency root rides (P-S25 / SUB-D4) —
+# so an Id hiccup DEGRADES (serves the bounded-stale coarse grant within `static_max ≤ revocation
+# SLA`) instead of cascading every request closed, and a just-revoked subject is still denied THROUGH
+# the stale cache. REUSED, never re-defined (EI-01 §7): there is ONE fail-static cache primitive on
+# the platform; the Git front door wraps it, it does not author a bespoke availability path.
+# `myelin-substrate` is the crate-DAG ROOT (architecture 00 §2.9): it depends on the shared glue
+# crates `myelin-git` also consumes (storage/identity/events/…) and NOTHING in the production DAG
+# depends back on `myelin-git`, so the `myelin-git → myelin-substrate` edge is acyclic + sanctioned
+# (the terminal subsystem consumer of the substrate root, the same pattern as the service crates).
+myelin-substrate = { path = "../myelin-substrate" }
+# The ONE resilient client (contract 1.9 — timeout + breaker + bulkhead + jittered-retry-idempotent-
+# only). GIT-P14 rides it as the transport layer UNDER the fail-static cache on the git→Id `check`
+# dependency: ResilientClient bounds the call (a tripped breaker / timeout surfaces as the hiccup the
+# fail-static cache then degrades on). One client, never a bespoke retry loop (EI-01 §7).
+myelin-client = { path = "../myelin-client" }
+
 # DEV-ONLY: the rich ReBAC namespace ENGINE (FragmentDef / Userset / StoreBackedCheck) lives in the
 # Identity SERVICE crate. The runtime Git fragment is the names-only `myelin_identity::Namespace-
 # Fragment` ABI carrier (above) — a producer LEAF never depends on a service crate (the §2.9 DAG

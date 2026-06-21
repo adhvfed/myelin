@@ -52,9 +52,16 @@
 //! rotation but stays alive.
 //!
 //! ## FLOORS named (VISION §3 — name your floors)
-//! - **GIT-P14** wires the Git ReBAC fragment LIVE (the rich rewrites through Identity's engine) +
-//!   the **FailStatic** degrade-not-cascade bound on the Id dependency (here the door fails CLOSED;
-//!   the bounded-stale fail-static cache is GIT-P14).
+//! - **GIT-P14 (P-275) — DONE.** The Git ReBAC fragment is wired LIVE (the rich rewrites through
+//!   Identity's engine, proven enforced at the check) + the **FailStatic** degrade-not-cascade bound
+//!   on the Id dependency lands in [`crate::live_check::GitCheckGate`]: the front door's `pull`/`push`
+//!   `check` now rides the shared `myelin_substrate::FailStaticAuthz` so a transient Id hiccup
+//!   DEGRADES (serves the bounded-stale coarse grant within `static_max ≤ revocation SLA`) instead of
+//!   cascading every request closed, while a just-revoked subject is still denied. The
+//!   [`FrontDoorError::IdentityUnavailable`] fail-CLOSED below remains the correct posture for a
+//!   `Strong` (zookie-stamped) authz read — a security-sensitive read never serves stale (the
+//!   new-enemy guard, 4.10); the bounded-stale degrade applies to the availability-tolerant
+//!   clone/fetch hot path through `GitCheckGate::front_door_check`.
 //! - **GIT-P15** lands the **protected-human-lane shed order** (per-surface admission budgets,
 //!   OQ-K) + the **CDN bundle-URI accelerated-clone** floor.
 //! - The production `russh` / `axum` transport wiring + the X-6-hardened `WireExecutor` host live in

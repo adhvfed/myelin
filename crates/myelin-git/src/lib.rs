@@ -128,6 +128,14 @@ pub mod front_door;
 /// `git` fork (no-host-exec by construction).
 pub mod gix_backend;
 pub mod holder_intent;
+/// The Git ReBAC fragment wired LIVE + the FailStatic bound on the Id dependency (GIT-P14 / P-275,
+/// M3-G2): the [`live_check::GitCheckGate`] runs the front door's `pull`/`push` + the push-policy
+/// `protected_push` + the merge gate's `merge` + the X-1 `approve_untrusted_ci` fork-endorsement +
+/// CODEOWNERS `list_subjects` against the live fragment (contract 4.9), with the git→Id `check`
+/// bounded by the shared `myelin_substrate::FailStaticAuthz` (1.10/4.11) so an Id hiccup DEGRADES
+/// (bounded-stale coarse grant) instead of cascading, a just-revoked subject is still denied, and a
+/// zookie read bypasses the cache (4.10 read-your-writes).
+pub mod live_check;
 pub mod notif_rules;
 /// The git **PACK TIER on the local-NVMe `BlobStore` floor** (GIT-P11 / P-272, M3-G1): the git-side
 /// object-DB migration THROUGH the [`myelin_storage::GitPackTier`] (closing the receive-pack
