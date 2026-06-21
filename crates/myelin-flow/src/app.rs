@@ -124,6 +124,53 @@ pub fn run_flow(config: Config) -> Result<(), ServeError> {
     serve(flow_app_spec(config))
 }
 
+/// **Build the myelin-flow AppSpec WITH the replay/lease engine wired into the consumer seam
+/// (P-FLOW-05).** Returns the spec the harness wires PLUS the [`FlowDispatcher`] worker loop —
+/// the engine's per-partition worker that leases a runnable run and drives it (replaying the
+/// journal, resuming at the first un-journaled command, §4.1/§4.7). The dispatcher emits into — and
+/// the relay drains — the SAME [`OutboxStore`] (the ONE sanctioned outbox path, BUS-2/2.2), so the
+/// drive's co-commits flow through the sanctioned emit → relay → bus path.
+///
+/// **Why this returns the dispatcher instead of pushing a `ConsumerReg`:** the replay/lease engine
+/// is a tick-driven WORKER that polls the run store for leasable work (the `FOR UPDATE SKIP LOCKED`
+/// claim, §4.7) — NOT a bus-subscriber `EventHandler` the `consumers` slot holds. So the engine
+/// occupies the consumer SEAM as the returned dispatcher; the harness drives its `tick` on the
+/// worker cadence. The DurableExecutor surface that SEEDS runnable runs (`start`) + the signal/timer
+/// wakers (that flip `waiting` → `running`) land at P-FLOW-06/09/13 — this wires the loop + the core.
+///
+/// **Floor named:** the workflow-body registry the dispatcher drives is supplied by the caller here
+/// (the engine/test registers bodies via [`FlowDispatcher::register`]); the boot-time definition
+/// registry (§3.6, populated by `DurableExecutor`) lands at **P-FLOW-06**.
+pub fn flow_app_spec_with_engine(
+    config: Config,
+    minter: std::sync::Arc<dyn myelin_events::IdMinter>,
+    ctx_base: myelin_events::EmitContextBase,
+    partition: i16,
+    worker: impl Into<String>,
+    lease_ttl_secs: i64,
+) -> (AppSpec, crate::engine::FlowDispatcher) {
+    use myelin_events::{InProcessBus, OutboxStore};
+    // The ONE outbox the engine drives co-commit into AND the relay drains (BUS-2): supply it to the
+    // OutboxSpec so the drive → relay → bus path is the sanctioned one (no second store).
+    let outbox = OutboxStore::new();
+    let dispatcher = crate::engine::FlowDispatcher::new(
+        crate::engine::RunStore::new(),
+        outbox.clone(),
+        crate::wfctx::WfJournal::new(),
+        crate::engine::FlowTelemetry::new(),
+        minter,
+        ctx_base,
+        partition,
+        worker,
+        lease_ttl_secs,
+    );
+    let mut spec = flow_app_spec(config);
+    // The engine drives co-commit into `outbox`; the relay must drain THAT store (the sanctioned
+    // emit → relay → bus path), not a fresh default one.
+    spec.outbox = OutboxSpec::new(outbox, InProcessBus::new());
+    (spec, dispatcher)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,6 +329,73 @@ mod tests {
             r.unwrap_err().0.contains("fail-fast"),
             "the boot error names the §3.2 fail-fast config validation"
         );
+    }
+
+    /// **The engine-wired AppSpec returns a dispatcher whose tick drives a runnable run (P-FLOW-05).**
+    /// `flow_app_spec_with_engine` assembles the SAME six-table spec PLUS the replay/lease worker
+    /// loop; a registered body + a seeded runnable run drive to completion on one tick — the consumer
+    /// seam is filled by the engine's worker (not a bus subscriber). The spec still wires the six
+    /// tables (the migrate phase is unchanged).
+    #[test]
+    fn engine_wired_spec_returns_a_driving_dispatcher() {
+        use crate::engine::{run_state, DriveOutcome, RunRow};
+        use crate::RetryPolicy;
+        use myelin_events::{
+            Actor, EmitContextBase, MonotonicMinter, Timestamp,
+        };
+        use myelin_identity::{Principal, PrincipalId, PrincipalKind};
+        use myelin_refs::ArtifactRef;
+        use myelin_tenancy::{Region, TenantId};
+        use std::sync::Arc;
+
+        let tenant = TenantId("acme".into());
+        let region = Region("fr-par".into());
+        let ctx_base = EmitContextBase {
+            tenant: tenant.clone(),
+            region: region.clone(),
+            actor: Actor(Principal::stub(
+                PrincipalId("p".into()),
+                PrincipalKind::Human,
+                tenant.clone(),
+            )),
+            schema_ver: 1,
+            occurred_at: Timestamp("2026-06-21T00:00:00Z".into()),
+            recorded_at: Timestamp("2026-06-21T00:00:01Z".into()),
+            caused_by: None,
+        };
+        let (spec, mut dispatcher) = flow_app_spec_with_engine(
+            Config::default(),
+            Arc::new(MonotonicMinter::new()),
+            ctx_base,
+            0,
+            "worker-1",
+            30,
+        );
+        // the six-table migrate phase is unchanged (the engine wiring does not add a second schema).
+        assert_eq!(spec.migrations.0.len(), 6, "the engine-wired spec still wires the six tables");
+
+        // register a body + seed a runnable run; one tick drives it to completion.
+        dispatcher.register(
+            "agent.run",
+            Box::new(|ctx: &mut crate::WfCtx| {
+                ctx.activity(RetryPolicy::default_policy(), |_i, _a| {
+                    Ok(vec![ArtifactRef("myelin://acme/agent/effect/e0".into())])
+                })
+                .map_err(|e| format!("{e:?}"))?;
+                Ok(vec![])
+            }),
+        );
+        dispatcher
+            .runs()
+            .put(RunRow::new_runnable(tenant.clone(), region, "R1", "agent.run", 0));
+        let outcome = dispatcher.tick(1000, "2026-06-21T00:00:00Z", 7);
+        assert!(matches!(outcome, Some(DriveOutcome::Completed(_))), "the dispatcher drove the run");
+        assert_eq!(
+            dispatcher.runs().get(&tenant, "R1").unwrap().state,
+            run_state::COMPLETED,
+            "the seeded run completed under the engine-wired dispatcher"
+        );
+        assert_eq!(dispatcher.telemetry().double_effect_count(), 0, "0 double-effect");
     }
 
     /// **Graceful drain leaves the outbox at depth 0 (contract 1.1 / §3.1).** A booted-then-drained

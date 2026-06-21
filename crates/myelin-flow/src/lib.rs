@@ -41,10 +41,14 @@
 //! - **The algorithms**: WfCtx + journal/outbox co-commit (**P-FLOW-04**, FLOW-D5) — **LANDED**,
 //!   see [`wfctx`] ([`WfCtx`]: `activity`/`now`/`rand`/`emit` + the single-txn co-commit; the
 //!   FLOW-D5 drill is `tests/drills_flow_d5_cocommit.rs`); deterministic
-//!   replay + lease dispatch + crash recovery (**P-FLOW-05**, FLOW-D1); the DurableExecutor
-//!   (**P-FLOW-06**); the replay-divergence guard (**P-FLOW-07**, FLOW-D2); the flow-determinism
-//!   lint fixtures (**P-FLOW-08**); durable signals (**P-FLOW-09**); durable timers
-//!   (**P-FLOW-13**, FLOW-D3) — all land later. An empty journal is not a working engine.
+//!   replay + lease dispatch + crash recovery (**P-FLOW-05**, FLOW-D1) — **LANDED**, see [`engine`]
+//!   ([`drive`] short-circuits the journaled prefix with 0 re-execution + [`RunStore`] lease
+//!   re-lease + [`FlowDispatcher`] the consumer-seam worker loop + [`FlowTelemetry`] the replay-rate
+//!   + 0-double-effect signals; the FLOW-D1 drill is `tests/drills_flow_d1_replay.rs`, the live-PG
+//!     apply `tests/integration_flow_replay.rs`); the DurableExecutor
+//!     (**P-FLOW-06**); the replay-divergence guard (**P-FLOW-07**, FLOW-D2); the flow-determinism
+//!     lint fixtures (**P-FLOW-08**); durable signals (**P-FLOW-09**); durable timers
+//!     (**P-FLOW-13**, FLOW-D3) — the rest land later. An empty journal is not a working engine.
 //!
 //! There is **no mandatory-core algorithm module** here (it is the schema + frozen type shapes), so
 //! there is no mutation-score floor on this prompt — stated explicitly per the template's TESTS
@@ -58,12 +62,16 @@
 //! is the graph's terminal consumer, not a node in it).
 
 pub mod app;
+pub mod engine;
 pub mod holder;
 pub mod migrations;
 pub mod schema;
 pub mod wfctx;
 
-pub use app::{boot_flow, flow_app_spec, run_flow, SERVICE_NAME};
+pub use app::{boot_flow, flow_app_spec, flow_app_spec_with_engine, run_flow, SERVICE_NAME};
+pub use engine::{
+    drive, run_state, DriveOutcome, FlowDispatcher, FlowTelemetry, RunRow, RunStore, WorkflowBody,
+};
 pub use holder::{
     flow_history_holder, flow_store_classifier, register_flow_holder, FlowBacking,
     FlowHolderRegistration, RestrictSet, WfHistoryHolder, FLOW_OLTP_STORE,
