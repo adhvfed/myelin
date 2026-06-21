@@ -102,9 +102,23 @@
 //!     re-derives the SAME token + short-circuits dispatch+wait — consume-exactly-once. The dispatch
 //!     into the runner is GATED by AG-D4 (Agent-Fabric/CI-owned, `04-sandbox-AG-D4.md` — NO untrusted
 //!     code runs until green); the 9.2/9.4 CDC pair is `tests/cdc_9_2_schedule_and_run_job.rs`.
-//!     **NAMED FLOORS:** reserve/settle bookend **P-FLOW-16**, loop-safety
-//!     **P-FLOW-18**) — the rest land later. An empty journal is not a
-//!     working engine.
+//!     **NAMED FLOORS:** reserve/settle bookend **P-FLOW-16**) — the rest land later. An empty journal
+//!     is not a working engine.
+//! - **The §6.2 loop-safety enforcement** (the causal-depth ceiling + the shared-root tripwire + the
+//!   bounded activity pool — *an adversarial workflow→event→workflow loop is dropped/parked, NEVER
+//!   forked*) → **LANDED at P-FLOW-18** (P-214), see [`loopsafety`] ([`CausalGuard`]: `admit_child`
+//!   gates a would-be child start against the causal-depth [`CEILING`] (the in-engine `workflow_run.
+//!   depth` bound, §3.1) THEN the shared-root tripwire ([`SHARED_ROOT_WINDOW_CAP`] same-root starts in
+//!   the window → trip); `admit_activity`/`release_activity` bound the concurrent-activity pool
+//!   ([`ACTIVITY_POOL_CAP`]); every refusal is a [`LoopVerdict::Drop`]/[`LoopVerdict::Park`] — there is
+//!   NO `Fork` variant). The causal-depth-histogram + 0-fork telemetry are on [`FlowTelemetry`]
+//!   ([`FlowTelemetry::observe_causal_depth`]/[`FlowTelemetry::causal_depth_max`]/`depth_ceiling_hits`/
+//!   `shared_root_tripwire_firings`/`activity_pool_sheds`/`fork_count`, §5.4 / contract 1.8). The
+//!   FLOW-D7 drill (the adversarial loop on the M0 failure-injection harness, asserting causal-depth
+//!   `<=` ceiling + 0 fork) is `tests/drills_flow_d7_loop_safety.rs`; the 9.2 loop-safety CDC pair is
+//!   `tests/cdc_9_2_loop_safety.rs`. **NAMED FLOOR:** the bus's dispatch-tier shared-root tripwire
+//!   COUNTER (the cross-subsystem mirror, event-bus §4.7) is EB-23 (P-143) — this is the in-engine
+//!   half the `workflow_run.depth` reads.
 //! - **The mid-workflow `mint_run_token` re-mint on resume** (token life == activity life, contract
 //!   4.7 CONSUMED, §6.2) → **LANDED at P-FLOW-17** (P-213), see [`remint`]
 //!   ([`WfCtx::remint_on_resume`]: a resume across a multi-day wait re-mints a fresh SHORT-LIVED
@@ -134,6 +148,7 @@ pub mod engine;
 pub mod executor;
 pub mod holder;
 pub mod job;
+pub mod loopsafety;
 pub mod migrations;
 pub mod remint;
 pub mod schema;
@@ -169,6 +184,9 @@ pub use holder::{
 };
 pub use job::{
     job_dispatch_marker, job_idem_token, JobKind, JobOutcome, JobRunner, JobSpec, JOB_DONE_SIGNAL,
+};
+pub use loopsafety::{
+    CausalGuard, LoopVerdict, RefusalReason, ACTIVITY_POOL_CAP, CEILING, SHARED_ROOT_WINDOW_CAP,
 };
 pub use budget::{BudgetError, BudgetGate, BudgetSettle, Wallet};
 pub use remint::{

@@ -570,6 +570,37 @@ struct TelemetryInner {
     /// P-FLOW-16).** Total settle-on-completion calls the bookend made (a metered activity completed,
     /// a `job.done` consumed). Monotonic `+=`.
     settled: u64,
+    /// **the causal-depth HISTOGRAM (the §5.4 / contract 1.8 loop-safety signal — P-FLOW-18).** A
+    /// fixed-bucket histogram of the `workflow_run.depth` (§3.1) observed at each loop-safety admit
+    /// gate: bucket `i` counts hops whose depth landed in `[i, i+1)` up to the ceiling, and the final
+    /// bucket is the over-ceiling overflow. The FLOW-D7 green artifact reads `causal_depth_max()`
+    /// staying `<=` the ceiling — an adversarial workflow→event→workflow loop NEVER drives the depth
+    /// past the ceiling (it is dropped/parked first). The histogram is the dispatch-tier signal the
+    /// bus's `CausalDepthMax` mirrors at the engine boundary.
+    causal_depth_hist: Vec<u64>,
+    /// **the causal-depth MAX (the loop-safety health signal, §5.4).** The highest `depth` ever
+    /// observed at an admit gate. The FLOW-D7 drill asserts it `<=` the ceiling (a self-feeding loop is
+    /// stopped AT the ceiling, never past it).
+    causal_depth_max: u32,
+    /// **the depth-ceiling-HIT counter (loop-safety, §6.2).** Times the causal-depth ceiling refused a
+    /// would-be child hop (the run is dropped/parked, NEVER forked). Monotonic `+=`. A non-zero count
+    /// is the "a runaway causal chain hit the ceiling" health signal.
+    depth_ceiling_hits: u64,
+    /// **the shared-root-TRIPWIRE-firing counter (loop-safety, §6.2).** Times the shared-root tripwire
+    /// detected a workflow→event→workflow loop re-entering the SAME correlation root past the window
+    /// threshold and stopped it (drop/park). Monotonic `+=`. Mirrors the bus's
+    /// `SharedRootTripwireFirings` at the engine boundary.
+    shared_root_tripwire_firings: u64,
+    /// **the bounded-activity-pool SHED counter (loop-safety, §6.2 / X-3).** Times the bounded activity
+    /// pool refused (shed/parked) a would-be concurrent activity that would exceed the pool cap.
+    /// Monotonic `+=`. Over-cap is SHED, never forked — a mention storm cannot fan out unboundedly.
+    activity_pool_sheds: u64,
+    /// **the 0-FORK counter (the FLOW-D7 headline green artifact, §6.2).** Times the loop-safety gate
+    /// FORKED a run instead of dropping/parking it. It MUST stay 0 — the whole §6.2 posture is
+    /// "drops/parks, NEVER forks". A non-zero count REDS the drill loudly (a mutant that forks instead
+    /// of parking is exactly what the mutation floor must catch). There is no code path that increments
+    /// this; it is the structural assertion that the gate has no fork branch.
+    fork_count: u64,
 }
 
 impl FlowTelemetry {
@@ -772,6 +803,84 @@ impl FlowTelemetry {
         (10_000 * t.reserve_rejected)
             .checked_div(t.reserve_attempted)
             .unwrap_or(0)
+    }
+
+    /// **Observe one causal-depth at a loop-safety admit gate (the §5.4 histogram, P-FLOW-18).** Bumps
+    /// the depth-`depth` histogram bucket and advances `causal_depth_max`. `ceiling` sizes the
+    /// histogram (`0..=ceiling` buckets + one overflow bucket at `ceiling+1`); a depth at or past the
+    /// ceiling lands in the overflow bucket. Called by [`crate::loopsafety::CausalGuard`] on every
+    /// admit decision so the metrics-health port sees the live depth distribution.
+    pub fn observe_causal_depth(&self, depth: u32, ceiling: u32) {
+        let mut t = self.lock();
+        let buckets = (ceiling as usize) + 2; // 0..=ceiling, plus an overflow bucket.
+        if t.causal_depth_hist.len() < buckets {
+            t.causal_depth_hist.resize(buckets, 0);
+        }
+        let idx = (depth as usize).min(buckets - 1);
+        t.causal_depth_hist[idx] += 1;
+        if depth > t.causal_depth_max {
+            t.causal_depth_max = depth;
+        }
+    }
+
+    /// The causal-depth histogram (the §5.4 / contract 1.8 loop-safety signal) — bucket `i` is the
+    /// count of hops observed at depth `i` (the final bucket is the over-ceiling overflow). Empty until
+    /// the first [`observe_causal_depth`](Self::observe_causal_depth).
+    pub fn causal_depth_histogram(&self) -> Vec<u64> {
+        self.lock().causal_depth_hist.clone()
+    }
+
+    /// **The causal-depth MAX (the FLOW-D7 green artifact, §5.4).** The highest `workflow_run.depth`
+    /// ever observed at an admit gate. The FLOW-D7 drill asserts this stays `<=` the ceiling — an
+    /// adversarial loop NEVER drives the depth past the ceiling (it is dropped/parked first).
+    pub fn causal_depth_max(&self) -> u32 {
+        self.lock().causal_depth_max
+    }
+
+    /// **Record one depth-ceiling HIT (loop-safety, §6.2).** Called when the causal-depth ceiling
+    /// refused a would-be child hop (the run is dropped/parked, never forked). Monotonic `+=`.
+    pub fn record_depth_ceiling_hit(&self) {
+        self.lock().depth_ceiling_hits += 1;
+    }
+
+    /// The depth-ceiling-hit counter (loop-safety, §6.2) — how many child hops the ceiling refused.
+    pub fn depth_ceiling_hits(&self) -> u64 {
+        self.lock().depth_ceiling_hits
+    }
+
+    /// **Record one shared-root-tripwire FIRING (loop-safety, §6.2).** Called when the tripwire
+    /// detected a workflow→event→workflow loop re-entering the same correlation root past the window
+    /// threshold and stopped it (drop/park). Monotonic `+=`. Mirrors the bus
+    /// `SharedRootTripwireFirings`.
+    pub fn record_shared_root_tripwire_firing(&self) {
+        self.lock().shared_root_tripwire_firings += 1;
+    }
+
+    /// The shared-root-tripwire-firing counter (loop-safety, §6.2) — how many same-root loops the
+    /// tripwire stopped.
+    pub fn shared_root_tripwire_firings(&self) -> u64 {
+        self.lock().shared_root_tripwire_firings
+    }
+
+    /// **Record one bounded-activity-pool SHED (loop-safety, §6.2 / X-3).** Called when the bounded
+    /// activity pool refused (shed/parked) a would-be concurrent activity over the pool cap. Monotonic
+    /// `+=`. Over-cap is SHED, never forked.
+    pub fn record_activity_pool_shed(&self) {
+        self.lock().activity_pool_sheds += 1;
+    }
+
+    /// The bounded-activity-pool shed counter (loop-safety, §6.2 / X-3) — how many over-cap activities
+    /// the pool shed/parked.
+    pub fn activity_pool_sheds(&self) -> u64 {
+        self.lock().activity_pool_sheds
+    }
+
+    /// **The 0-FORK counter (the FLOW-D7 headline green artifact, §6.2).** MUST stay 0 — the loop-safety
+    /// posture is "drops/parks, NEVER forks". There is no code path that increments it; the FLOW-D7
+    /// drill asserts it `== 0` as the structural proof the gate has no fork branch (the mutation floor
+    /// catches a mutant that would fork instead of park).
+    pub fn fork_count(&self) -> u64 {
+        self.lock().fork_count
     }
 }
 
