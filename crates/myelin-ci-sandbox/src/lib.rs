@@ -59,10 +59,16 @@
 //! (AG-D4 / CI-T1) is CI-P5 (→ P-239); this prompt ships only the **hardened-boot self-test** (the
 //! floor under that drill — proves the runner BOOTS hardened, not that it survives the corpus).
 
+pub mod escape_corpus;
 pub mod firecracker;
 pub mod gvisor;
 pub mod hardening;
 pub mod runner;
+
+pub use escape_corpus::{
+    build_corpus_script, parse_console, AttackFamily, AttackMarker, AttackOutcome, Backend,
+    BackendRun, DrillReport, EscapeAttestation, CORPUS, CORPUS_VERSION,
+};
 
 pub use runner::{
     CountingFirehose, EngineTerminalReporter, FirehoseSink, JobLeaseStore, QueuedJob, RunOutcome,
