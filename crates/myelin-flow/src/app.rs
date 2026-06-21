@@ -171,6 +171,44 @@ pub fn flow_app_spec_with_engine(
     (spec, dispatcher)
 }
 
+/// **Build the inbound-signal `ConsumerReg` for `tenant` — the bus side of `DurableExecutor::signal`
+/// wired into the P-FLOW-02 `consumers` slot (P-FLOW-09).** Constructs the
+/// [`FlowSignalConsumer`](crate::FlowSignalConsumer) over `executor` and wraps it in the seven-rule
+/// [`Consumer`](myelin_events::Consumer) runtime through the SANCTIONED
+/// [`consume`](myelin_events::consume) — binding the `sig.<tenant>.` whitelist (rule 3: `consume`
+/// REJECTS a `*`/`>`/empty subject loudly), the durable consumer name (rule 4), the bounded prefetch
+/// plus per-tenant fairness cap (rule 6), and the shared `dedup` ledger (rule 1: `event_id`
+/// idempotency, belt-and-braces with the `wf_signal` PK INSIDE `signal`).
+///
+/// Returns the [`ConsumerReg`](myelin_substrate::ConsumerReg) the `serve` lifecycle registers in the
+/// AppSpec `consumers` slot — the registration that FILLS the P-FLOW-02 empty signal seam. An
+/// over-broad / malformed tenant prefix returns [`SubscribeError`](myelin_events::SubscribeError) —
+/// the shell never silently narrows to an over-broad subscription.
+pub fn flow_signal_consumer_reg(
+    tenant: &myelin_tenancy::TenantId,
+    executor: crate::FlowExecutor,
+    dedup: myelin_events::DedupLedger,
+) -> Result<myelin_substrate::ConsumerReg, myelin_events::SubscribeError> {
+    use myelin_events::{consume, ConsumerName, ConsumerSpec, SubjectPattern};
+    // The `sig.<tenant>.` subject whitelist (NEVER `*`, BUS-3). Validated + leaked to `'static` once
+    // per tenant per process (the binding set is fixed for the consumer pool's life — bounded).
+    let prefix = format!("sig.{}.", tenant.0);
+    let subjects: &'static [SubjectPattern] =
+        Box::leak(vec![SubjectPattern(prefix.clone())].into_boxed_slice());
+    let consumer = crate::FlowSignalConsumer::new(executor, subjects);
+    // The ONE sanctioned consumer entry-point — `consume` validates the spec (rule 3: rejects a
+    // `*`/empty subject LOUDLY) and constructs the [`Consumer`] with all seven rules wired.
+    let runtime = consume(
+        ConsumerSpec::new(
+            ConsumerName(format!("flow-signal-{}", tenant.0)),
+            &[prefix.as_str()],
+        ),
+        consumer,
+        dedup,
+    )?;
+    Ok(myelin_substrate::ConsumerReg::new(runtime))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,6 +302,27 @@ mod tests {
             crate::migrations::migrations(),
             "the migrate phase wires EXACTLY the P-FLOW-01 set (no second schema)"
         );
+    }
+
+    /// **The inbound-signal consumer FILLS the P-FLOW-02 `consumers` slot (P-FLOW-09).** Building the
+    /// signal `ConsumerReg` over a [`FlowExecutor`] binds the `sig.<tenant>.` whitelist through the
+    /// sanctioned `consume` (rule 3: `*`/empty rejected) and registers it — the empty signal seam is
+    /// now occupied. A subsequent AppSpec carrying it has a non-empty `consumers` slot.
+    #[test]
+    fn inbound_signal_consumer_fills_the_consumer_slot() {
+        use myelin_events::DedupLedger;
+        use myelin_tenancy::{Region, TenantId};
+        let minter: std::sync::Arc<dyn myelin_events::IdMinter> =
+            std::sync::Arc::new(myelin_events::MonotonicMinter::new());
+        let tenant = TenantId("acme".into());
+        let ex = crate::FlowExecutor::new(minter, tenant.clone(), Region("fr-par".into()));
+        let reg = flow_signal_consumer_reg(&tenant, ex, DedupLedger::new())
+            .expect("the sig.acme. whitelist binds through the sanctioned consume (never `*`)");
+
+        // wire it into the slot — the P-FLOW-02 empty seam is now filled for the signal leg.
+        let mut spec = flow_app_spec(Config::default());
+        spec.consumers = vec![reg];
+        assert_eq!(spec.consumers.len(), 1, "the inbound-signal consumer occupies the consumer slot (P-FLOW-09)");
     }
 
     /// **The flow OLTP store auto-registers as a `PersonalDataHolder` at boot (§3.4, GD-3).** Even

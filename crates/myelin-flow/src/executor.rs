@@ -56,7 +56,7 @@
 //!   added by the prompts that ship those surfaces (P-FLOW-09/13/…); this prompt adds the
 //!   activity-queue/retry/dead-letter leg + confirms the runnable-lag/replay-rate leg.
 
-use crate::engine::{run_state, FlowTelemetry, RunRow, RunStore};
+use crate::engine::{run_state, FlowTelemetry, RunRow, RunStore, SignalRow, SignalStore};
 use myelin_events::IdMinter;
 use myelin_refs::ArtifactRef;
 use myelin_tenancy::{Region, TenantId};
@@ -102,6 +102,42 @@ pub struct StartSpec {
 /// ULID-ordered opaque run id the control plane carries to `describe`/`cancel` and the firing audit.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RunId(pub String);
+
+/// **The `DurableExecutor::signal` spec** (contract 9.1 / §3.4, P-FLOW-09). Names the target `run`,
+/// the FROZEN `signal_name` (`approval` / `cancel` / `ci.result` / `job.done`, §4.3), the per-effect
+/// `idem_key` (the §6.4 anchor — a re-delivery under the same key is a no-op, the workflow wakes
+/// once), and the references-not-payloads `payload` (`ArtifactRef`s, never a PII body, §3.4). The
+/// rare inline-PII payload crypto-shreds via `payload_key_ref`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignalSpec {
+    /// the run to deliver the signal to (the handle `start` returned).
+    pub run: RunId,
+    /// the FROZEN signal name (`approval` / `cancel` / `ci.result` / `job.done`, §4.3) — a taxonomy
+    /// token, not PII.
+    pub signal_name: String,
+    /// the per-effect idempotency key (FROZEN, contract 9.1 / §6.4): a re-delivery under this key is a
+    /// no-op (the workflow wakes once). Often the deterministic `idem_token` minted at dispatch (§4.9)
+    /// so producer + consumer agree without coordination.
+    pub idem_key: String,
+    /// the signal body as **`ArtifactRef`s, never a PII body** (§3.4) — references-not-payloads.
+    pub payload: Vec<ArtifactRef>,
+    /// the crypto-shred key id IF the payload carries inline PII (the RARE case, §3.4) — the ONLY PII
+    /// locator; erasing a subject crypto-shreds the signal payload.
+    pub payload_key_ref: Option<String>,
+}
+
+/// **The outcome of a `DurableExecutor::signal` delivery** (P-FLOW-09). Both variants are `Ok` — a
+/// redelivery is the idempotency WORKING, never an error. The control plane can tell whether THIS
+/// delivery was the first (it should not re-emit/ack) or a duplicate (already handled).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignalOutcome {
+    /// the FIRST delivery under `(tenant, run_id, signal_name, idem_key)` — the signal was buffered
+    /// into `wf_signal` (the signal-buffer-depth incremented by one).
+    Buffered,
+    /// a RE-delivery under an already-buffered key — a no-op (the ON CONFLICT DO NOTHING fired). The
+    /// at-least-once bus redelivering "done" twice (§4.9) lands here: the workflow wakes once.
+    Duplicate,
+}
 
 /// **The run status `describe` returns** (contract 9.1 — `describe(RunId) → RunStatus`). The run's
 /// lifecycle `state` + replay `cursor` + pinned `wf_version` (§4.6) + the derived `terminal` flag.
@@ -162,6 +198,21 @@ pub trait DurableExecutor {
     /// definition (surfaced, never a silent dropped run).
     fn start(&self, spec: StartSpec) -> Result<RunId, ExecutorError>;
 
+    /// **Deliver an inbound durable signal to a run — idempotent on `idem_key` (FROZEN, contract
+    /// 9.1, P-FLOW-09).** Buffers the signal into `wf_signal` via `INSERT … ON CONFLICT (tenant,
+    /// run_id, signal_name, idem_key) DO NOTHING`, so a doubly-delivered signal (at-least-once bus
+    /// delivery redelivering "done" twice, §4.9) is buffered EXACTLY ONCE — the workflow wakes once,
+    /// never twice. Returns [`SignalOutcome::Buffered`] for the first delivery, [`SignalOutcome::
+    /// Duplicate`] for a redelivery (both `Ok` — a redelivery is NOT an error, it is the idempotency
+    /// working). The `payload` is references-not-payloads (`ArtifactRef`s, never a PII body).
+    ///
+    /// This prompt (P-FLOW-09) ships the DELIVERY + IDEMPOTENCY mechanism. The consuming wait
+    /// (`wait_for_signal`, which re-leases + replays + consumes the buffered signal) is P-FLOW-11;
+    /// the per-effect `idem_key`-CONSTRUCTION rule (single `card_id` vs multi `card_id:<idx>`) is
+    /// P-FLOW-10. Returns [`ExecutorError::UnknownRun`] for an unknown run handle (surfaced, never a
+    /// silently dropped signal to a phantom run).
+    fn signal(&self, spec: SignalSpec) -> Result<SignalOutcome, ExecutorError>;
+
     /// **Describe a run** — its lifecycle `state` + `cursor` + pinned `wf_version` + terminality
     /// (contract 9.1). Returns [`ExecutorError::UnknownRun`] for an unknown handle.
     fn describe(&self, run: &RunId) -> Result<RunStatus, ExecutorError>;
@@ -200,6 +251,9 @@ struct StartedRun {
 #[derive(Clone)]
 pub struct FlowExecutor {
     runs: RunStore,
+    /// the durably-buffered inbound-signal store (`wf_signal`, §3.4) — `signal` delivers idempotently
+    /// into it (the P-FLOW-09 delivery mechanism); the consuming wait (P-FLOW-11) drains it.
+    signals: SignalStore,
     telemetry: FlowTelemetry,
     minter: Arc<dyn IdMinter>,
     tenant: TenantId,
@@ -226,6 +280,7 @@ impl FlowExecutor {
     pub fn new(minter: Arc<dyn IdMinter>, tenant: TenantId, region: Region) -> Self {
         Self {
             runs: RunStore::new(),
+            signals: SignalStore::new(),
             telemetry: FlowTelemetry::new(),
             minter,
             tenant,
@@ -258,6 +313,21 @@ impl FlowExecutor {
     /// The run store the executor seeds + reads (so a test/dispatcher shares it).
     pub fn runs(&self) -> &RunStore {
         &self.runs
+    }
+
+    /// The durably-buffered signal store (`wf_signal`, §3.4) — `signal` delivers into it idempotently
+    /// (P-FLOW-09); the consuming wait (P-FLOW-11) drains it. Shared so a test/dispatcher can read the
+    /// buffered signals.
+    pub fn signals(&self) -> &SignalStore {
+        &self.signals
+    }
+
+    /// Refresh the signal-buffer-depth gauge (the §1.8 / §5.4 signal) from the signal store — called
+    /// after a delivery so the metrics-health port reads a current depth. A double-delivery sets the
+    /// SAME depth (the ON CONFLICT DO NOTHING dedup made the buffer count truthful).
+    fn refresh_signal_buffer_depth(&self) {
+        self.telemetry
+            .set_signal_buffer_depth(self.signals.buffered_depth());
     }
 
     /// The references-not-payloads `input` a run was started with (`ArtifactRef`s, never a PII body
@@ -347,6 +417,45 @@ impl DurableExecutor for FlowExecutor {
 
         self.refresh_runnable_lag();
         Ok(run_id)
+    }
+
+    fn signal(&self, spec: SignalSpec) -> Result<SignalOutcome, ExecutorError> {
+        // The run must exist — a signal to a phantom run is surfaced, never silently dropped (EI-02
+        // §4). (A signal to a TERMINAL run still buffers: a late `job.done` to a cancelled run is a
+        // harmless buffered row the GDPR holder erases; the consuming wait, P-FLOW-11, decides
+        // whether a terminal run drains it. Buffering-not-rejecting keeps delivery decoupled from the
+        // run's lifecycle race, §4.9.)
+        {
+            let started = self.started.lock().unwrap();
+            if !started.run_to_idem.contains_key(&spec.run.0) {
+                return Err(ExecutorError::UnknownRun(spec.run.0.clone()));
+            }
+        }
+
+        // Deliver idempotently: INSERT … ON CONFLICT (tenant, run_id, signal_name, idem_key) DO
+        // NOTHING. The FIRST delivery buffers (Buffered); a re-delivery under the same per-effect key
+        // is a no-op (Duplicate) — at-least-once bus delivery wakes the workflow ONCE (§4.9). The PK
+        // IS the dedup; there is no application-level read-then-write race.
+        let buffered = self.signals.deliver(SignalRow {
+            tenant: self.tenant.clone(),
+            region: self.region.clone(),
+            run_id: spec.run.0.clone(),
+            signal_name: spec.signal_name.clone(),
+            idem_key: spec.idem_key.clone(),
+            payload: spec.payload.clone(),
+            payload_key_ref: spec.payload_key_ref.clone(),
+            consumed_seq: None,
+        });
+
+        // Refresh the signal-buffer-depth gauge (§1.8 / §5.4): a double-delivery leaves it UNCHANGED
+        // (the buffered row is one, not two — the gauge stays truthful).
+        self.refresh_signal_buffer_depth();
+
+        Ok(if buffered {
+            SignalOutcome::Buffered
+        } else {
+            SignalOutcome::Duplicate
+        })
     }
 
     fn describe(&self, run: &RunId) -> Result<RunStatus, ExecutorError> {
@@ -642,6 +751,101 @@ mod tests {
         assert_eq!(ex.telemetry().activity_queue_depth(), 3, "activity-queue-depth readable");
         assert_eq!(ex.telemetry().activity_retry_count(), 1, "activity-retry readable");
         assert_eq!(ex.telemetry().dead_letter_count(), 1, "dead-letter readable");
+    }
+
+    fn signal_spec(run: &RunId, name: &str, idem: &str) -> SignalSpec {
+        SignalSpec {
+            run: run.clone(),
+            signal_name: name.into(),
+            idem_key: idem.into(),
+            payload: vec![ArtifactRef("myelin://acme/agent/result/r0".into())],
+            payload_key_ref: None,
+        }
+    }
+
+    /// **`signal` is IDEMPOTENT on `(signal_name, idem_key)` — a double-delivery buffers ONCE (the
+    /// P-FLOW-09 gate, FROZEN contract 9.1).** Two deliveries under the same per-effect key insert one
+    /// `wf_signal` row (`ON CONFLICT DO NOTHING`): the first is `Buffered`, the second `Duplicate`; the
+    /// signal-buffer-depth increments by ONE, not two.
+    #[test]
+    fn signal_double_delivery_buffers_once() {
+        let ex = executor();
+        let run = ex.start(spec("k")).expect("start");
+
+        let first = ex.signal(signal_spec(&run, "job.done", "tok-1")).expect("first delivery");
+        let second = ex.signal(signal_spec(&run, "job.done", "tok-1")).expect("re-delivery");
+        assert_eq!(first, SignalOutcome::Buffered, "the first delivery buffered the signal");
+        assert_eq!(second, SignalOutcome::Duplicate, "the re-delivery is a no-op (ON CONFLICT DO NOTHING)");
+        assert_eq!(
+            ex.signals().count_for_run(&tenant(), &run.0),
+            1,
+            "the wf_signal PK buffered the signal EXACTLY ONCE (the workflow wakes once, §4.9)"
+        );
+        // the signal-buffer-depth telemetry incremented by ONE, not two (the §1.8 / §5.4 gate).
+        assert_eq!(ex.telemetry().signal_buffer_depth(), 1, "signal-buffer-depth = 1 (a double-delivery is one)");
+    }
+
+    /// **Two signals differing ONLY in `idem_key` BOTH insert (distinct per-effect keys).** The PK's
+    /// idem dimension separates them — a batch/partial approval (P-FLOW-10) rides exactly this.
+    #[test]
+    fn signals_differing_in_idem_key_both_insert() {
+        let ex = executor();
+        let run = ex.start(spec("k")).expect("start");
+        ex.signal(signal_spec(&run, "approval", "card-7:0")).expect("effect 0");
+        ex.signal(signal_spec(&run, "approval", "card-7:1")).expect("effect 1");
+        assert_eq!(
+            ex.signals().count_for_run(&tenant(), &run.0),
+            2,
+            "two distinct per-effect keys buffer two rows (the multi-effect anchor, §6.4)"
+        );
+        assert_eq!(ex.telemetry().signal_buffer_depth(), 2, "signal-buffer-depth = 2 (two distinct keys)");
+    }
+
+    /// **Two signals differing in `signal_name` BOTH insert (the PK's name dimension).** An `approval`
+    /// and a `cancel` to the same run under the same idem_key are distinct buffered signals.
+    #[test]
+    fn signals_differing_in_signal_name_both_insert() {
+        let ex = executor();
+        let run = ex.start(spec("k")).expect("start");
+        ex.signal(signal_spec(&run, "approval", "tok-1")).expect("approval");
+        ex.signal(signal_spec(&run, "cancel", "tok-1")).expect("cancel");
+        assert_eq!(ex.signals().count_for_run(&tenant(), &run.0), 2, "distinct signal_names are distinct rows");
+    }
+
+    /// **A signal payload is stored as a REFERENCE, not inline PII (the §3.4 invariant).** The
+    /// buffered `wf_signal` row carries `ArtifactRef`s; the rare inline-PII case names a
+    /// `payload_key_ref` crypto-shred envelope key, never an inline body.
+    #[test]
+    fn signal_payload_stores_as_a_reference_not_pii() {
+        let ex = executor();
+        let run = ex.start(spec("k")).expect("start");
+        let mut sp = signal_spec(&run, "approval", "tok-1");
+        sp.payload_key_ref = Some("kms://acme/epoch-1/content".into());
+        ex.signal(sp).expect("deliver");
+        let row = ex
+            .signals()
+            .get(&tenant(), &run.0, "approval", "tok-1")
+            .expect("the buffered signal");
+        // the body is ArtifactRefs (references-not-payloads), never an inline PII string.
+        assert_eq!(row.payload, vec![ArtifactRef("myelin://acme/agent/result/r0".into())]);
+        assert_eq!(
+            row.payload_key_ref.as_deref(),
+            Some("kms://acme/epoch-1/content"),
+            "the rare inline-PII payload names a crypto-shred key ref, never an inline body"
+        );
+        assert_eq!(row.consumed_seq, None, "a freshly-delivered signal is buffered, unconsumed (the wait is P-FLOW-11)");
+    }
+
+    /// **A signal to an UNKNOWN run is surfaced (never a silently dropped signal to a phantom run,
+    /// EI-02 §4).** The `UnknownRun` error is observable so a mis-routed delivery is caught.
+    #[test]
+    fn signal_to_unknown_run_is_surfaced() {
+        let ex = executor();
+        let err = ex
+            .signal(signal_spec(&RunId("nope".into()), "job.done", "tok-1"))
+            .expect_err("a signal to an unknown run is surfaced");
+        assert_eq!(err, ExecutorError::UnknownRun("nope".into()));
+        assert_eq!(ex.telemetry().signal_buffer_depth(), 0, "nothing buffered for a phantom run");
     }
 
     /// **The references-not-payloads `input` is carried as `ArtifactRef`s (the §3.1 invariant).** A

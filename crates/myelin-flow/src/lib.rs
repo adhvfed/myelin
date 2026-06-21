@@ -49,9 +49,16 @@
 //!     engine telemetry set (**P-FLOW-06**) — **LANDED**, see [`executor`] ([`FlowExecutor`]:
 //!     `start` idempotent-on-`idem_key` seeds a runnable run the dispatcher drives, `describe` reads
 //!     the [`RunStatus`], `cancel` terminates; the §1.8 activity-queue/retry/dead-letter telemetry
-//!     leg on [`FlowTelemetry`]; the 9.1 CDC pair is `tests/cdc_9_1_executor.rs`; the `signal` half
-//!     is the named follow-on **P-FLOW-09**); the replay-divergence guard (**P-FLOW-07**, FLOW-D2); the flow-determinism
-//!     lint fixtures (**P-FLOW-08**); durable signals (**P-FLOW-09**); durable timers
+//!     leg on [`FlowTelemetry`]; the 9.1 CDC pair is `tests/cdc_9_1_executor.rs`); the
+//!     replay-divergence guard (**P-FLOW-07**, FLOW-D2); the flow-determinism lint fixtures
+//!     (**P-FLOW-08**); durable signals (**P-FLOW-09**) — **LANDED**, see [`executor`]
+//!     ([`DurableExecutor::signal`] buffers into `wf_signal` idempotently via `ON CONFLICT (tenant,
+//!     run_id, signal_name, idem_key) DO NOTHING` so a double-delivery wakes the workflow once) +
+//!     [`signal_consumer`] ([`FlowSignalConsumer`] the bus side wired into the consumer slot via
+//!     [`flow_signal_consumer_reg`]) + the signal-buffer-depth telemetry on [`FlowTelemetry`]; the
+//!     9.1 signal CDC pair is `tests/cdc_9_1_signal.rs`, the live-PG ON CONFLICT apply
+//!     `tests/integration_flow_signal.rs`; the consuming wait (`wait_for_signal`) is **P-FLOW-11**
+//!     and the per-effect `idem_key`-construction rule is **P-FLOW-10**); durable timers
 //!     (**P-FLOW-13**, FLOW-D3) — the rest land later. An empty journal is not a working engine.
 //!
 //! There is **no mandatory-core algorithm module** here (it is the schema + frozen type shapes), so
@@ -71,16 +78,22 @@ pub mod executor;
 pub mod holder;
 pub mod migrations;
 pub mod schema;
+pub mod signal_consumer;
 pub mod wfctx;
 
-pub use app::{boot_flow, flow_app_spec, flow_app_spec_with_engine, run_flow, SERVICE_NAME};
+pub use app::{
+    boot_flow, flow_app_spec, flow_app_spec_with_engine, flow_signal_consumer_reg, run_flow,
+    SERVICE_NAME,
+};
 pub use engine::{
-    drive, run_state, DriveOutcome, FlowDispatcher, FlowTelemetry, RunRow, RunStore, WorkflowBody,
+    drive, run_state, DriveOutcome, FlowDispatcher, FlowTelemetry, RunRow, RunStore, SignalRow,
+    SignalStore, WorkflowBody,
 };
 pub use executor::{
-    DurableExecutor, ExecutorError, FlowExecutor, RunBudget, RunId, RunStatus, StartSpec,
-    PARTITION_COUNT,
+    DurableExecutor, ExecutorError, FlowExecutor, RunBudget, RunId, RunStatus, SignalOutcome,
+    SignalSpec, StartSpec, PARTITION_COUNT,
 };
+pub use signal_consumer::{FlowSignalConsumer, SIGNAL_EVENT_TYPE};
 pub use holder::{
     flow_history_holder, flow_store_classifier, register_flow_holder, FlowBacking,
     FlowHolderRegistration, RestrictSet, WfHistoryHolder, FLOW_OLTP_STORE,
