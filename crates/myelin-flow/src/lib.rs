@@ -91,7 +91,19 @@
 //!     [`FlowTelemetry`] (the SC-11 health signal); the FLOW-D3-floor drill at 100k+ is
 //!     `tests/drills_flow_d3_timer_wheel.rs`, the live-PG bucketed-scan apply
 //!     `tests/integration_flow_timer.rs`; the cheap disarm/re-arm half is **P-FLOW-14**, the 1M+
-//!     seven-figure cell-scale run is **P-FLOW-24**) — the rest land later. An empty journal is not a
+//!     seven-figure cell-scale run is **P-FLOW-24**); the **`SCHEDULE_AND_RUN_JOB` long-park idiom**
+//!     (**P-FLOW-15**, §4.9) — **LANDED**, see [`job`] ([`WfCtx::schedule_and_run_job`]: dispatch-and-
+//!     return as a journaled activity minting `idem_token` DETERMINISTIC on the dispatch `command_id`
+//!     ([`job_idem_token`]) + stamping it on the [`JobSpec`]`{kind: ci|agent}` handed to the unified
+//!     runner ([`JobRunner::dispatch`] = `ToolHands::exec`, contract 8.4 CONSUMED) + journaling
+//!     `activity_completed{job_dispatched, idem_token}` + RETURNING; then park on
+//!     `wait_for_signal("job.done", idem_key=idem_token)` with a timeout-timer bounding a vanished
+//!     runner; a double-delivered `job.done` wakes the run ONCE (the `wf_signal` PK dedup); replay
+//!     re-derives the SAME token + short-circuits dispatch+wait — consume-exactly-once. The dispatch
+//!     into the runner is GATED by AG-D4 (Agent-Fabric/CI-owned, `04-sandbox-AG-D4.md` — NO untrusted
+//!     code runs until green); the 9.2/9.4 CDC pair is `tests/cdc_9_2_schedule_and_run_job.rs`.
+//!     **NAMED FLOORS:** reserve/settle bookend **P-FLOW-16**, re-mint **P-FLOW-17**, loop-safety
+//!     **P-FLOW-18**) — the rest land later. An empty journal is not a
 //!     working engine.
 //!
 //! There is **no mandatory-core algorithm module** here (it is the schema + frozen type shapes), so
@@ -110,6 +122,7 @@ pub mod approval;
 pub mod engine;
 pub mod executor;
 pub mod holder;
+pub mod job;
 pub mod migrations;
 pub mod schema;
 pub mod signal_consumer;
@@ -141,6 +154,9 @@ pub use signal_consumer::{FlowSignalConsumer, SIGNAL_EVENT_TYPE};
 pub use holder::{
     flow_history_holder, flow_store_classifier, register_flow_holder, FlowBacking,
     FlowHolderRegistration, RestrictSet, WfHistoryHolder, FLOW_OLTP_STORE,
+};
+pub use job::{
+    job_dispatch_marker, job_idem_token, JobKind, JobOutcome, JobRunner, JobSpec, JOB_DONE_SIGNAL,
 };
 pub use wfctx::{
     attempt_state, history_kind, ActivityError, RetryPolicy, WaitOutcome, WfCtx, WfError, WfJournal,

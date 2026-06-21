@@ -692,6 +692,16 @@ impl WfCtx {
         id
     }
 
+    /// **PEEK the `command_id` the NEXT command will use — WITHOUT consuming the counter (§3.2).**
+    /// The [`SCHEDULE_AND_RUN_JOB`](WfCtx::schedule_and_run_job) idiom (P-FLOW-15, §4.9) needs the
+    /// dispatch position's `command_id` to mint its DETERMINISTIC `idem_token` BEFORE the dispatch
+    /// `activity` consumes the counter — so the wait (the next command) and a re-drive both reconstruct
+    /// the SAME token. This returns the SAME value [`WfCtx::next_command_id`] would, but leaves the
+    /// counter untouched (the `activity` that follows consumes it for real).
+    pub(crate) fn peek_next_command_id(&self) -> String {
+        format!("{}:{}", self.wf_type, self.command_seq)
+    }
+
     /// The next per-run monotonic history `seq` (the replay-order PK, §3.2).
     fn next_history_seq(&mut self) -> i64 {
         let s = self.history_seq;
