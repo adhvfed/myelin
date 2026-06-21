@@ -136,3 +136,53 @@ fn cdc_4_8_provider_consumer_agree_on_one_grammar_rendering() {
     assert_eq!(parsed.tenant(), "globex");
     assert_eq!(parsed.render(), rendered);
 }
+
+// ─────────────── the GIT half of 4.8: the receive-pack ENFORCEMENT CDC (GIT-P12 / P-273) ─────────
+//
+// The pair above pins the DATA-MODEL half (the codec mints pseudonymous bytes; erase leaves the
+// posture residual). This pair pins the ENFORCEMENT half (contract 4.8, owned by Git): the front-door
+// CONSUMER side of the grammar — Git ENFORCES that an inbound (client-built) commit's author/committer
+// identity is the `<pseudonym>@<tenant>.noreply` handle for the principal's tenant, REJECTING a
+// non-pseudonymous identity at receive-pack BEFORE the ref moves. Id owns the grammar; Git is the
+// enforcer at the door.
+
+use myelin_git::commit::{enforce_pseudonymous_commit, NonPseudonymousIdentity};
+
+/// A raw commit object's bytes the receive-pack gate inspects (a CLIENT built these — they may carry
+/// any identity). `identity_line` is the `<name> <email> ts tz` tail of the author/committer headers.
+fn client_commit_bytes(identity_line: &str) -> Vec<u8> {
+    format!("tree blake3:t\nauthor {identity_line}\ncommitter {identity_line}\n\nfeat: x\n")
+        .into_bytes()
+}
+
+/// **The GIT-half CDC of 4.8 — the door ENFORCES the grammar.** Git (the enforcer) accepts a commit
+/// whose identity is the tenant pseudonym (the one Id-owned grammar) and REJECTS one that is not —
+/// the two sides agree that only `<pseudonym>@<tenant>.noreply` identities admit.
+#[test]
+fn cdc_4_8_git_enforces_pseudonymous_commit_identity_at_the_door() {
+    let tenant = "acme";
+
+    // PROVIDER (Id grammar) → a tenant pseudonym handle, rendered into a commit identity line.
+    let handle = PseudonymHandle::new("psn-7f3a9c", tenant).unwrap();
+    let pseudonymous = client_commit_bytes(&format!(
+        "{rendered} <{rendered}> 1700000000 +0000",
+        rendered = handle.render()
+    ));
+    // CONSUMER (Git enforcer) → ACCEPT: the author/committer parse back to the SAME (psn, tenant).
+    let (author, committer) =
+        enforce_pseudonymous_commit(&pseudonymous, tenant).expect("a tenant pseudonym admits");
+    assert_eq!(author, handle);
+    assert_eq!(committer, handle);
+
+    // A non-cooperating client's raw identity → REJECT (the grammar is not satisfied; cleartext PII
+    // never moves a ref). The two sides agree the door admits ONLY the grammar.
+    let raw = client_commit_bytes("Ada Lovelace <ada.lovelace@example.com> 1700000000 +0000");
+    assert_eq!(
+        enforce_pseudonymous_commit(&raw, tenant),
+        Err(NonPseudonymousIdentity::NotAPseudonym {
+            role: "author".into(),
+            offending_email: "ada.lovelace@example.com".into(),
+        }),
+        "the door rejects a non-pseudonymous identity"
+    );
+}

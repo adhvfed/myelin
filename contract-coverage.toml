@@ -369,6 +369,23 @@ row = "4.8"
 title = "resolve_pseudonym + erase (pseudonym map)"
 status = "deferred"
 landing = "P-078"
+# P-273 (GIT-P12): the GIT half of 4.8 — pseudonymous-by-default commit identities, ENFORCED at
+# receive-pack (the erasure-vs-immutability data-model gate, GIT-1). The data-model + codec half
+# (pseudonymous-by-construction `myelin_git::commit::Commit`) shipped at P-257/GIT-P25; the schema
+# `author_pseudonym`/`reviewer_pseudonym`/`pusher_pseudonym` columns (tagged `#[personal_data]`) at
+# GIT-P3. P-273 adds the ADMISSION half: `myelin_git::commit::enforce_pseudonymous_commit` +
+# `receive_pack::PushPolicy`'s pseudonymity rule REJECT a pushed commit whose author/committer
+# identity is not `<pseudonym>@<tenant>.noreply` for the principal's tenant, BEFORE the ref moves —
+# so the immutable object DB admits 0 cleartext PII in a commit identity field (the GIT-D2 GIT-1
+# half). Enforcement default (OQ-10/R-8): REJECT-AT-PUSH (client-cooperative, sha-stable; the
+# server-side rewrite-at-push mode is the GIT-P29 follow-on — see myelin_git::commit). 10.9
+# instantiated BY REFERENCE (never restated). GF-7 floor: structural mechanism across
+# GIT-P9/GIT-P12/GIT-P29; the lawful-basis residual is the ONE posture's [OPEN — LEGAL] (R-7,
+# parallel/Legal). The receive-pack scan green artifact:
+# crates/myelin-git/tests/drills_git_d2_receive_pack_pseudonymity.rs (0 cleartext-PII commit
+# identities admitted, dated); the GIT half CDC:
+# crates/myelin-git/tests/cdc_4_8_git_pseudonymous_commits.rs
+# (cdc_4_8_git_enforces_pseudonymous_commit_identity_at_the_door).
 
 [[contract]]
 row = "4.9"
