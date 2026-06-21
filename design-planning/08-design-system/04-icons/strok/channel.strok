@@ -1,3 +1,5 @@
+# @meaning Chat channel — the named glyph (#)
+# @tags channel, chat, hash, room
 documentsize 24x24
 defaults
   fill none

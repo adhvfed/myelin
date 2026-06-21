@@ -1,3 +1,5 @@
+# @meaning Agent mark — plain geometric: rounded square + centered dot
+# @tags agent, ai, bot, principal, mark
 documentsize 24x24
 defaults
   fill none

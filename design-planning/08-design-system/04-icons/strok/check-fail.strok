@@ -1,3 +1,5 @@
+# @meaning Check failed — cross in status ring
+# @tags ci, check, fail, error, verdict, ring
 documentsize 24x24
 defaults
   fill none

@@ -1,3 +1,5 @@
+# @meaning Notifications ("what needs me")
+# @tags inbox, notifications, tray, alerts
 documentsize 24x24
 defaults
   fill none

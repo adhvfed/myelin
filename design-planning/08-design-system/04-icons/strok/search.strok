@@ -1,3 +1,5 @@
+# @meaning Global / scoped search
+# @tags search, find, filter, magnifier
 documentsize 24x24
 defaults
   fill none

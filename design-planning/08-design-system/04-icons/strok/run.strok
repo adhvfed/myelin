@@ -1,3 +1,5 @@
+# @meaning CI run / workflow (rounded square + play)
+# @tags ci, run, workflow, play, execute
 documentsize 24x24
 defaults
   fill none

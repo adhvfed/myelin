@@ -1,3 +1,5 @@
+# @meaning Disclosure / next-prev — one glyph, rotated by CSS
+# @tags chevron, disclosure, arrow, expand, next, prev
 documentsize 24x24
 defaults
   fill none
