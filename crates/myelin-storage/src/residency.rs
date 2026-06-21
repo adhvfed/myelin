@@ -87,11 +87,12 @@ use myelin_tenancy::{Region, TenantId};
 /// data. Byte-for-byte the same set the control plane's `residency_verify` requires (P-085); the
 /// two crates pin the SAME M1 set without sharing a type (the DAG forbids the edge).
 ///
-/// **FLOOR (named):** the within-EU CDN edge set ([`Self::CdnEdgeSet`], P-ST-23 / P-254 — now
-/// LANDED, see [`crate::cdn`]) + the T3 firehose archive ([`Self::T3FirehoseArchive`], P-ST-20 /
-/// P-147 — landed) are follow-on variants that feed the SAME [`StoreSet::residency_verify`]; the
-/// push-mirror target (P-ST-25 / P-255) is the remaining M3 follow-on (it becomes another variant
-/// here without changing the aggregation shape). The M1 set is OLTP / blob / index-search / KMS.
+/// **FLOOR (named, all M3 follow-ons now LANDED):** the within-EU CDN edge set
+/// ([`Self::CdnEdgeSet`], P-ST-23 / P-254 — see [`crate::cdn`]), the T3 firehose archive
+/// ([`Self::T3FirehoseArchive`], P-ST-20 / P-147), and the C6 outbound push-mirror target
+/// ([`Self::PushMirror`], P-ST-25 / P-255 — see [`crate::mirror`]) are follow-on variants that feed
+/// the SAME [`StoreSet::residency_verify`] aggregation WITHOUT changing its shape. The M1 set is
+/// OLTP / blob / index-search / KMS.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ResidencyStoreClass {
     /// The OLTP tier (P-ST-01) — the tenant's transactional rows.
@@ -118,6 +119,17 @@ pub enum ResidencyStoreClass {
     /// extra-EU POP is caught here without a code change (storage.md §3.2 C3 — "residency_verify
     /// covers the CDN edge set"). The C6 push-mirror target is the sibling P-ST-25 / P-255.
     CdnEdgeSet,
+    /// **The C6 outbound push-mirror target (P-ST-25 / P-255) — the foreign-host region a Git
+    /// push-mirror would push the tenant's PII-bearing repo to.** A follow-on store class (NOT in
+    /// the M1 set): an outbound push-mirror to a host outside the tenant's region is a residency
+    /// boundary CROSSING (storage.md §6 C6). Storage does NOT author the allow/deny — that GATE
+    /// lives at GDPR/Audit `transfer_allowed` (10.5) + the control plane (`mirror_allowed`,
+    /// deny-by-default, P-251). Storage's role is to **FLAG the crossing**: it reports the mirror
+    /// target's region into the SAME [`verify_region_pinning`] aggregation, so a mirror target in a
+    /// region ≠ the tenant's region SURFACES here (the no-extra-EU-PII property is attestable). A
+    /// same-region mirror reports the tenant's own region (no crossing). The deny is NOT a Storage
+    /// policy — see [`crate::mirror`].
+    PushMirror,
 }
 
 impl ResidencyStoreClass {
@@ -130,6 +142,7 @@ impl ResidencyStoreClass {
             ResidencyStoreClass::Kms => "kms",
             ResidencyStoreClass::T3FirehoseArchive => "t3_firehose_archive",
             ResidencyStoreClass::CdnEdgeSet => "cdn_edge_set",
+            ResidencyStoreClass::PushMirror => "push_mirror",
         }
     }
 
@@ -358,9 +371,10 @@ impl RegionPinningAttestation {
 ///    the attestation must catch; fail-closed).
 ///
 /// On success the attestation aggregates every store's `(class, region)` (store-class-ordered);
-/// `cross_region_egress == 0` is the green artifact. Reports for classes beyond the M1 set (a
-/// future CDN/mirror report added by P-ST-23/P-ST-25) are checked for region too, so a wrong-region
-/// follow-on store is caught here WITHOUT a code change.
+/// `cross_region_egress == 0` is the green artifact. Reports for classes beyond the M1 set (the
+/// CDN/firehose/push-mirror reports added by P-ST-23/P-ST-20/P-ST-25) are checked for region too, so
+/// a wrong-region follow-on store — incl. an extra-EU push-mirror TARGET — is caught here WITHOUT a
+/// code change (the storage half of the C6 flag).
 pub fn verify_region_pinning(
     tenant: &TenantId,
     tenant_region: &Region,

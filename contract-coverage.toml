@@ -938,7 +938,11 @@ cdc = [
 # (`cdc_10_5_mirror_gate.rs`: the Git mirror feature ⇄ `mirror_allowed` over the REAL GDPR
 # `transfer_allowed` — deny-by-default for a residency-boundary crossing without a recorded lawful
 # basis). The control plane owns "does this target cross the residency boundary?"; GDPR owns "is this
-# transfer lawful?".
+# transfer lawful?". The STORAGE HALF of the C6 mirror seam ships at P-ST-25 → P-255
+# (`cdc_10_5_mirror_crossing_flag.rs`): Storage FLAGS the residency-boundary crossing (it reports the
+# mirror TARGET region into `residency_verify` + counts `mirror_residency_deny{tenant}`) and the
+# control plane's `mirror_allowed` gate DENIES the same crossing by default — Storage flags, the
+# control plane gates (storage.md §6). Storage authors NO local mirror policy (the deny is at 10.5).
 [[contract]]
 row = "10.5"
 title = "retention / consent / sub-processor / legal-hold / transfer gate / outbound-mirror (C-4)"
@@ -947,6 +951,7 @@ cdc = [
     "crates/myelin-gdpr-service/tests/cdc_10_5_retention_engine.rs",
     "crates/myelin-gdpr-service/tests/cdc_10_5_consent_transfer_gate.rs",
     "crates/myelin-control-plane/tests/cdc_10_5_mirror_gate.rs",
+    "crates/myelin-storage/tests/cdc_10_5_mirror_crossing_flag.rs",
 ]
 
 # 10.6 — the CONSTRUCTION half (the outbox-only audit consumer + the per-tenant hash-chain +
@@ -1268,11 +1273,17 @@ title = "residency_verify -> SignedAttestation"
 # shared report type (the DAG forbids a myelin-storage -> myelin-control-plane edge; documented
 # deviation, EI-01 §1). The CDN edge set EXTENDS this same row in M3 (P-ST-23 / P-254 — LANDED: the
 # ResidencyStoreClass::CdnEdgeSet report feeds the SAME aggregation, the cross-crate CDC maps it to
-# the control-plane T2 blob tier; a cross-region CDN edge FAILs the same residency_verify); the
-# push-mirror target is the remaining M3 follow-on (P-ST-25 / P-255) — the aggregation shape does not
-# change.
+# the control-plane T2 blob tier; a cross-region CDN edge FAILs the same residency_verify). The C6
+# outbound PUSH-MIRROR TARGET EXTENDS this same row in M3 (P-ST-25 / P-255 — LANDED: the
+# ResidencyStoreClass::PushMirror report flags the mirror TARGET's region into the SAME aggregation,
+# so an extra-EU mirror target FAILs residency_verify WITHOUT a code change; the cross-crate CDC
+# `cdc_10_5_mirror_crossing_flag.rs` proves Storage's flag and the control-plane `mirror_allowed` gate
+# agree on the crossing). The aggregation shape does not change for any of the three follow-ons.
 status = "covered"
-cdc = ["crates/myelin-storage/tests/cdc_12_4_storage_residency_report.rs"]
+cdc = [
+    "crates/myelin-storage/tests/cdc_12_4_storage_residency_report.rs",
+    "crates/myelin-storage/tests/cdc_10_5_mirror_crossing_flag.rs",
+]
 
 [[contract]]
 row = "12.5"

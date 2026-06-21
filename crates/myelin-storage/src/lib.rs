@@ -358,9 +358,10 @@
 //!   the two halves agree WITHOUT a shared report type (the DAG forbids a `myelin-storage ->
 //!   myelin-control-plane` edge; documented deviation, EI-01 §1). **Floors named in [`residency`]:**
 //!   the within-EU CDN edge set is **P-ST-23 (global P-254)**, the outbound push-mirror targets are
-//!   **P-ST-25 (global P-255)**, and the T3 firehose archive is **P-ST-20 (global P-147)** — all
-//!   EXTEND this same `residency_verify` with additional store-class variants (the aggregation and
-//!   fail-on-mismatch shape does not change). The mutation floor on the write-boundary region compare,
+//!   **P-ST-25 (global P-255 — now LANDED, see [`mirror`])**, and the T3 firehose archive is
+//!   **P-ST-20 (global P-147)** — all EXTEND this same `residency_verify` with additional store-class
+//!   variants (the aggregation and fail-on-mismatch shape does not change). The mutation floor on the
+//!   write-boundary region compare,
 //!   the out-of-region-report branch, and the missing-store fail-closed branch is mandatory-core
 //!   (≥ 80% — the region-pin enforcement carrying the token-region into the partition key).
 //! - **The within-EU CDN clone/bundle blob class (C3) (P-ST-23 / contract 11.2-C3 + 12.4 — global
@@ -389,6 +390,34 @@
 //!   fleet + the object-store backing the bundles ultimately rest on are deployment/M5 follow-ons
 //!   (P-ST-30/P-ST-31) — a backing swap by the trait's design. The mutation floor on the
 //!   within-EU-edge-set filter + the content-address validity check is mandatory-core (≥ 80%).
+//! - **The outbound push-mirror residency gate SEAM (C6) (P-ST-25 / contract 10.5 consumed + 12.4 —
+//!   global P-255)** is now IMPLEMENTED in [`mirror`]: it FILLS the C6 outbound-push-mirror floor
+//!   [`residency`] + [`cdn`] named. Storage FLAGS the crossing — it does NOT author the allow/deny
+//!   (the GATE is GDPR `transfer_allowed` 10.5 + the control plane's `mirror_allowed` deny-by-default,
+//!   P-251). (1) **Mirror-source blobs content-addressed + encrypted (storage.md §6(a)):**
+//!   [`mirror::PushMirrorClass`] BORROWS the tenant's content-addressed blob tier (`&dyn BlobStore`,
+//!   never a new store) — the mirror-source bytes are ordinary content-addressed blobs sealed under
+//!   the per-tenant blob DEK ([`encryption::DekContentWrap`], the same seam the git pack tier uses);
+//!   [`mirror::PushMirrorClass::source_is_content_addressed_and_encrypted`] proves the address is the
+//!   plaintext BLAKE3 + a tampered source blob is refused (STOR-D7 rides through). (2) **The C6 flag
+//!   into `residency_verify` (storage.md §6(b), 12.4):** [`mirror::PushMirrorClass::residency_report`]
+//!   reports [`residency::ResidencyStoreClass::PushMirror`] @ **the mirror TARGET's region** into the
+//!   SAME [`residency::verify_region_pinning`] aggregation — an extra-EU mirror target FAILs the
+//!   attestation WITHOUT a code change (the no-extra-EU-PII property is attestable; a same-region
+//!   mirror reports the tenant's own region — no crossing). (3) **The `mirror_residency_deny{tenant}`
+//!   telemetry (C6 / D-S13):** [`mirror::MirrorTelemetry::flag_crossing`] counts the flagged
+//!   extra-region crossings the control-plane gate denies — *0 PII reaches an ungated extra-EU mirror*
+//!   (the byte never leaves: the gate denies, the flag makes the crossing attestable). The class
+//!   exposes NO `allow`/`deny` (the structural ownership split — Storage flags, the control plane
+//!   gates). It REUSES [`blob`] (P-047) + [`residency`] (P-102) + the control-plane `mirror_allowed`
+//!   gate (P-251) — never a parallel store or a second mirror policy (EI-01 §7); the CDC pair
+//!   (`tests/cdc_10_5_mirror_crossing_flag.rs`) proves Storage's flag REACHES the control-plane gate.
+//!   **Floors named in [`mirror`]:** the `transfer_allowed` lawful-basis entries for a SPECIFIC
+//!   extra-EU mirror are `[OPEN — LEGAL]` (Schrems II — counsel/DPO ratifies; the engineering gate
+//!   denies by default regardless); the real `git push --mirror` transport is the Git subsystem M3
+//!   consumer (it consults the gate before pushing; here the storage flag is complete + proven). The
+//!   mutation floor on the report-the-TARGET-region flag + the `mirror_residency_deny` increment + the
+//!   content-address property is mandatory-core (≥ 80%).
 
 pub mod backup;
 pub mod blob;
@@ -414,6 +443,17 @@ pub mod cdn;
 // clone/bundle class (C3) → sibling P-ST-23.
 pub mod gitpack;
 pub mod git_shred;
+// The outbound push-mirror residency gate SEAM (C6, P-ST-25 / P-255, contract 10.5 consumed + 12.4):
+// Storage FLAGS the residency-boundary crossing of a Git push-mirror — it (a) keeps mirror-source
+// blobs content-addressed + encrypted (REUSES blob + DekContentWrap — never a new store), and (b)
+// REPORTS the mirror TARGET region into `residency_verify` (the `PushMirror` store class feeds the
+// SAME `verify_region_pinning` aggregation, so an extra-EU target FAILs the attestation WITHOUT a
+// code change). The `mirror_residency_deny{tenant}` telemetry counts flagged extra-region crossings
+// (0 PII to an ungated extra-EU mirror, D-S13). Storage authors NO allow/deny — the GATE lives at
+// GDPR `transfer_allowed` (10.5) + the control plane's `mirror_allowed` (deny-by-default, P-251);
+// the CDC pair proves Storage's flag reaches that gate. REUSES blob (P-047) + residency (P-102) +
+// the control-plane gate (P-251) — never a parallel store or a second mirror policy (EI-01 §7).
+pub mod mirror;
 pub mod encryption;
 // The T3 firehose-archive seam (P-ST-20 / P-147, M2, contract 11.8 sealing + per-tenant-DEK half):
 // the DURABLE archive of the firehose (storage.md §3.3). It RIDES the 3.5 resume-cursor transport
@@ -534,6 +574,7 @@ pub use erase::{
 pub use git_shred::{
     GitCryptoShredReach, GitResidual, GitShredReceipt, GitShreddable,
 };
+pub use mirror::{MirrorTelemetry, PushMirrorClass, PushMirrorTarget};
 pub use gd4::{
     assert_gd4_table_complete, assert_no_local_residual_statement, granularity_of_key_class,
     key_choice_granularity, structural_reach_uses_erase_seams, DataClass, Gd4TableReport,
