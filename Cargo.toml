@@ -290,3 +290,18 @@ myelin-config = { path = "crates/myelin-config" }
 edition = "2021"
 license = "UNLICENSED"
 publish = false
+
+# ----------------------------------------------------------------------------------------------
+# Build-profile infra (NOT a code change). A session of debug + `--features integration` builds
+# across 50+ crates grew `target/debug/deps` to 336GB and filled the disk to 100%, making `ld`
+# bus-error out of disk (signal 7) while linking the large integration test binaries. Debuginfo is
+# the bulk of that size, so cap it workspace-wide: test binaries stay small and the disk stays
+# healthy. Correctness is unaffected — tests run identically; panic `file:line` is emitted by the
+# panic macro at compile time (not from debuginfo); `RUST_BACKTRACE` still resolves function names
+# from the symbol table. Same lever as the `.github/workflows/ci.yml` debuginfo=0 fix.
+# ----------------------------------------------------------------------------------------------
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0
