@@ -66,6 +66,15 @@ myelin-content = { path = "../myelin-content" }
 # so this edge keeps the DAG acyclic. The Firecracker backend (CI-P2 → P-237) + the ZERO-escapes
 # real-kernel GATE (CI-P5 / AG-P17 → P-239/P-229) are the runner IMPL/GATE follow-ons.
 myelin-ci-sandbox = { path = "../myelin-ci-sandbox" }
+# AG-P18 (→ P-267) — the per-producer Git ToolDefs (git.merge gated + open_pr) consume the FROZEN
+# Git ReBAC fragment (contract 4.9) for their `required_caps`: `myelin-git` (GIT-P1 → P-123) owns
+# `rebac_fragment::object_types` (the canonical `repo`/`pull_request`/... names + the frozen
+# permission set `merge`/`push`/...). This crate REGISTERS the Git producer ToolDefs into the ONE
+# ToolSurface (8.1) sourcing the cap STRINGS from that frozen fragment (one source of truth — a
+# rename in the fragment breaks our test, never a silent drift). NO cycle: `myelin-git` is a leaf
+# consumer (it depends only on glue/substrate crates below this one) and does NOT depend back on
+# -agent/-agent-service, so this edge keeps the DAG acyclic.
+myelin-git = { path = "../myelin-git" }
 # The SKELETON's terminal trace event carries a references-not-payloads JSON payload (the trace
 # `ArtifactRef`); serde_json builds the `EventDraft.payload` value (it was a dev-dep for AG-P2's
 # round-trip test; the SKELETON's emit needs it at lib scope).
