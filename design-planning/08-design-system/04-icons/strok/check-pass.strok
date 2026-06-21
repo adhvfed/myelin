@@ -1,0 +1,16 @@
+# @meaning Check passed — check in status ring
+# @tags ci, check, pass, success, verdict, ring
+documentsize 24x24
+defaults
+  fill none
+  stroke currentColor
+  stroke-width 2
+  stroke-linecap round
+  stroke-linejoin round
+shape ring template=ellipse
+place r1 shape=ring at=4,4 size=16x16
+shape mark template=path
+  addpoint a at=8,12
+  addpoint b at=11,15
+  addpoint c at=16,9
+place m1 shape=mark at=0,0

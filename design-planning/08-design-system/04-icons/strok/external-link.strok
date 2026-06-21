@@ -1,0 +1,25 @@
+# @meaning Open in full / navigate away (arrow up-right)
+# @tags external-link, open, navigate, new-tab, arrow
+documentsize 24x24
+defaults
+  fill none
+  stroke currentColor
+  stroke-width 2
+  stroke-linecap round
+  stroke-linejoin round
+shape box template=path
+  addpoint a at=12,5
+  addpoint b at=5,5
+  addpoint c at=5,19
+  addpoint d at=19,19
+  addpoint e at=19,12
+place b1 shape=box at=0,0
+shape arrow template=path
+  addpoint a at=13,5
+  addpoint b at=19,5
+  addpoint c at=19,11
+place ar shape=arrow at=0,0
+shape shaft template=path
+  addpoint a at=19,5
+  addpoint b at=11,13
+place sh shape=shaft at=0,0

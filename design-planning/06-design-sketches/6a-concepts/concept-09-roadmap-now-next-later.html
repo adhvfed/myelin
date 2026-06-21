@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<!-- CONCEPT C-09 | screen: Roadmap now-next-later | persona: Jonathan Hoefler (commit: typographic warmth carries hierarchy — a quiet serif display + an honest text sans, generous measure, ink-on-cream; refuse: a "Gantt grid" stapled on, saturated status bars, any decorative illustration or emoji, size-as-only-hierarchy)
+     axes: density=calm nav=contextual unification=distinct-per-surface tone=warm agent=ambient sovereignty=on-demand
+     rationale: this should feel like an editor's planning page — a roadmap you'd actually read aloud in a stakeholder room — because warmth + reading rhythm (not chart chrome) is what makes a PM lens approachable, while it stays the SAME issue records as the engineer board (Direction C "Workshop", I-3). -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Roadmap · Payments Platform — Myelin</title>
+<!-- throwaway: web-font via CDN; production self-hosts (design-language §3.3) -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    /* warm neutral ramp (Workshop) — never pure #fff/#000 */
+    --paper:#faf7f1; --paper-raised:#fffdf8; --ink:#23201b; --ink-2:#544f45;
+    --ink-3:#85806f; --line:#e6dfd1; --line-2:#d8cfbb;
+    --accent:#9a5b2e;          /* single warm brand accent */
+    --accent-soft:#f0e3d3;
+    --blue:#2f5d8a;            /* functional info */
+    --ok:#3f6b43; --warn:#9c6a17; --risk:#8c3a32;
+    --agent:#4a4a6a;          /* reserved agent treatment, non-alarming */
+    --agent-soft:#eceaf2;
+    --focus:#1f4e79;          /* derived AA-safe focus, NOT the accent */
+    --shadow:0 1px 0 rgba(35,32,27,.04), 0 8px 24px -16px rgba(35,32,27,.30);
+    --r:10px;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{
+    background:var(--paper); color:var(--ink);
+    font-family:Inter,system-ui,sans-serif; font-size:15px; line-height:1.5;
+    -webkit-font-smoothing:antialiased;
+  }
+  .serif{font-family:Fraunces,Georgia,serif}
+  /* ---- shell (constant frame; content region distinct) ---- */
+  .shell{display:grid; grid-template-columns:60px 248px 1fr; height:100vh; overflow:hidden}
+  .rail{background:var(--paper-raised); border-inline-end:1px solid var(--line); display:flex; flex-direction:column; align-items:center; padding:14px 0; gap:4px}
+  .rail .brand{width:30px;height:30px;border-radius:8px;background:var(--ink);color:var(--paper);display:grid;place-items:center;font-weight:600;font-size:15px;margin-bottom:14px}
+  .rail a{width:38px;height:38px;border-radius:8px;display:grid;place-items:center;color:var(--ink-3);text-decoration:none;font-size:12px;font-weight:600}
+  .rail a.on{background:var(--accent-soft); color:var(--accent)}
+  .rail a:focus-visible{outline:2px solid var(--focus); outline-offset:2px}
+  .side{background:var(--paper-raised); border-inline-end:1px solid var(--line); padding:16px 14px; overflow:auto}
+  .side h4{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-3);margin:0 0 8px;font-weight:600}
+  .views{list-style:none;margin:0 0 18px;padding:0}
+  .views li{padding:6px 8px;border-radius:7px;color:var(--ink-2);font-size:13.5px;cursor:default;display:flex;gap:8px;align-items:center}
+  .views li.on{background:var(--accent-soft);color:var(--ink);font-weight:500}
+  .views li .g{width:14px;color:var(--ink-3);font-size:11px}
+  .main{display:flex;flex-direction:column;overflow:hidden}
+  /* ---- topbar ---- */
+  .top{display:flex;align-items:center;gap:12px;padding:12px 26px;border-bottom:1px solid var(--line);background:var(--paper)}
+  .scope{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--ink-2)}
+  .scope b{color:var(--ink);font-weight:600}
+  /* residency cue T0 — quiet, neutral-weight, NOT accent (R-19 §1.1) */
+  .resid{margin-inline-start:auto;display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--ink-3);border:1px solid var(--line-2);border-radius:999px;padding:3px 10px}
+  .resid .dot{width:6px;height:6px;border-radius:50%;background:var(--ink-3)}
+  .cmd{font-size:12px;color:var(--ink-3);border:1px solid var(--line-2);border-radius:7px;padding:4px 9px}
+  .ident{width:28px;height:28px;border-radius:50%;background:var(--blue);color:#fff;display:grid;place-items:center;font-size:12px;font-weight:600}
+  /* ---- masthead ---- */
+  .head{padding:24px 26px 8px}
+  .head .kicker{font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);font-weight:600}
+  .head h1{font-family:Fraunces,serif;font-weight:500;font-size:30px;line-height:1.1;margin:6px 0 6px;letter-spacing:-.01em}
+  .head p{margin:0;max-width:62ch;color:var(--ink-2);font-size:14.5px}
+  .head .live{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:var(--ink-3);margin-top:10px}
+  .head .live .pip{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 3px rgba(63,107,67,.15)}
+  /* ---- board ---- */
+  .board{flex:1;overflow:auto;padding:14px 26px 40px;display:grid;grid-template-columns:repeat(3,1fr);gap:22px;align-items:start}
+  .col h3{font-family:Fraunces,serif;font-weight:600;font-size:18px;margin:8px 0 2px}
+  .col .when{font-size:12px;color:var(--ink-3);margin-bottom:14px;border-bottom:1px solid var(--line);padding-bottom:10px}
+  .card{background:var(--paper-raised);border:1px solid var(--line);border-radius:var(--r);padding:14px 15px;margin-bottom:14px;box-shadow:var(--shadow)}
+  .card .top-row{display:flex;align-items:center;gap:8px;margin-bottom:7px}
+  .ref{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;color:var(--ink-3)}
+  .card h5{font-family:Fraunces,serif;font-weight:500;font-size:16px;margin:0 0 5px;line-height:1.25}
+  .card .outcome{font-size:13px;color:var(--ink-2);margin:0 0 11px}
+  /* status: glyph + label + position, never colour-alone */
+  .pill{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:600;border-radius:6px;padding:2px 7px;border:1px solid var(--line-2);color:var(--ink-2)}
+  .pill .ic{font-family:ui-monospace,monospace;font-size:10px}
+  .pill.ontrack{color:var(--ok);border-color:#cfe0cf}
+  .pill.atrisk{color:var(--risk);border-color:#e6cdca}
+  .pill.plan{color:var(--ink-3)}
+  /* progress: weight/position hierarchy, muted not saturated */
+  .prog{height:5px;background:var(--line);border-radius:3px;overflow:hidden;margin:11px 0 6px}
+  .prog i{display:block;height:100%;background:var(--accent);border-radius:3px}
+  .meta{display:flex;align-items:center;gap:12px;font-size:12px;color:var(--ink-3);flex-wrap:wrap}
+  .meta .who{display:inline-flex;align-items:center;gap:6px}
+  .av{width:18px;height:18px;border-radius:50%;background:var(--blue);color:#fff;display:grid;place-items:center;font-size:9px;font-weight:600}
+  .chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
+  .chip{font-size:11px;color:var(--ink-2);border:1px solid var(--line-2);border-radius:6px;padding:2px 7px;display:inline-flex;gap:5px;align-items:center;background:var(--paper)}
+  .chip .t{font-family:ui-monospace,monospace;font-size:9.5px;color:var(--ink-3)}
+  /* agent line — ambient, flat-labelled, no sparkle */
+  .agentline{display:flex;gap:9px;align-items:flex-start;margin-top:11px;padding-top:11px;border-top:1px dashed var(--line-2);font-size:12.5px;color:var(--ink-2)}
+  .agbadge{flex:none;display:inline-flex;align-items:center;gap:5px;font-size:10.5px;font-weight:600;color:var(--agent);background:var(--agent-soft);border-radius:5px;padding:2px 6px}
+  .agbadge .sq{width:8px;height:8px;border:1.5px solid var(--agent);border-radius:2px}
+  .agentline a{color:var(--accent);text-decoration:none;font-weight:500}
+  /* restricted rollup count — no leak (I-3, R-04 §5) */
+  .restr{font-size:12px;color:var(--ink-3);border:1px dashed var(--line-2);border-radius:8px;padding:9px 12px;display:flex;gap:8px;align-items:center}
+  .restr .lk{font-family:ui-monospace,monospace;font-size:11px}
+  .de{font-size:11.5px;color:var(--ink-3);font-style:italic}
+</style>
+</head>
+<body>
+<div class="shell">
+  <nav class="rail" aria-label="Primary">
+    <div class="brand">M</div>
+    <a href="#" title="Code">Co</a>
+    <a href="#" title="CI">CI</a>
+    <a href="#" class="on" title="Issues" aria-current="page">Is</a>
+    <a href="#" title="Knowledge">Kn</a>
+    <a href="#" title="Chat">Ch</a>
+  </nav>
+
+  <aside class="side">
+    <h4>Payments Platform</h4>
+    <ul class="views">
+      <li><span class="g">▦</span>Cycle board</li>
+      <li class="on"><span class="g">▱</span>Roadmap</li>
+      <li><span class="g">≡</span>All work items</li>
+      <li><span class="g">◷</span>Calendar</li>
+      <li><span class="g">▤</span>Portfolio rollup</li>
+    </ul>
+    <h4>Saved views</h4>
+    <ul class="views">
+      <li><span class="g">★</span>Q3 commitments</li>
+      <li><span class="g">○</span>At-risk only</li>
+      <li><span class="g">○</span>Sichtbar extern</li>
+    </ul>
+  </aside>
+
+  <main class="main">
+    <div class="top">
+      <div class="scope">Workspace <b>Helio GmbH</b> · Project <b>Payments Platform</b></div>
+      <span class="resid" title="Where this data lives — open for operator & key control"><span class="dot"></span>EU · Frankfurt</span>
+      <span class="cmd">⌘K</span>
+      <div class="ident" title="Dana Okonkwo (PM)">DO</div>
+    </div>
+
+    <header class="head">
+      <div class="kicker">Roadmap — Now · Next · Later</div>
+      <h1 class="serif">What we're shipping for Payments</h1>
+      <p>This page is the delivery data, read as a roadmap. The same work items the engineering cycle board tracks — nothing maintained twice. It updates itself as the team transitions issues.</p>
+      <span class="live"><span class="pip"></span>Live · last delivery change 4&nbsp;min ago by an engineer transitioning <span class="ref" style="margin-inline-start:4px">PAY-318</span></span>
+    </header>
+
+    <section class="board" aria-label="Roadmap columns">
+      <!-- NOW -->
+      <div class="col">
+        <h3 class="serif">Now</h3>
+        <div class="when">In this cycle · ends 27 Jun</div>
+
+        <article class="card">
+          <div class="top-row"><span class="ref">INIT-12</span><span class="pill ontrack"><span class="ic">●</span>On track</span></div>
+          <h5 class="serif">Instant SEPA payouts</h5>
+          <p class="outcome">Merchants receive settled funds in seconds, not the next business day.</p>
+          <div class="prog"><i style="width:72%"></i></div>
+          <div class="meta"><span>72% · 13 of 18 items</span><span class="who"><span class="av">LR</span>Lina R.</span></div>
+          <div class="chips">
+            <span class="chip"><span class="t">PR</span>#1204 merged</span>
+            <span class="chip"><span class="t">CI</span>main green</span>
+            <span class="chip"><span class="t">DOC</span>Settlement runbook</span>
+          </div>
+          <div class="agentline">
+            <span class="agbadge"><span class="sq"></span>agent</span>
+            <span><b>PlanningAgent</b> flags 2 items unestimated — proposes pulling them to Next. <a href="#">Review proposal</a></span>
+          </div>
+        </article>
+
+        <article class="card">
+          <div class="top-row"><span class="ref">INIT-09</span><span class="pill atrisk"><span class="ic">▲</span>At risk</span></div>
+          <h5 class="serif">3-D Secure 2 step-up flows</h5>
+          <p class="outcome">Reduce false declines while staying PSD2-compliant on strong auth.</p>
+          <div class="prog"><i style="width:41%"></i></div>
+          <div class="meta"><span>41% · blocked on vendor sandbox</span><span class="who"><span class="av" style="background:var(--accent)">KM</span>Kofi M.</span></div>
+          <div class="chips"><span class="chip"><span class="t">ISS</span>PAY-318 in review</span><span class="chip"><span class="t">DEP</span>after INIT-12</span></div>
+        </article>
+      </div>
+
+      <!-- NEXT -->
+      <div class="col">
+        <h3 class="serif">Next</h3>
+        <div class="when">Next 1–2 cycles · Jul</div>
+
+        <article class="card">
+          <div class="top-row"><span class="ref">INIT-15</span><span class="pill plan"><span class="ic">◇</span>Planned</span></div>
+          <h5 class="serif">Dispute & chargeback console</h5>
+          <p class="outcome">Ops teams resolve disputes in one place instead of three dashboards.</p>
+          <div class="meta"><span>Scoped · 0 of 11 started</span><span class="who"><span class="av" style="background:var(--ink-3)">—</span>Unassigned</span></div>
+          <div class="chips"><span class="chip"><span class="t">DOC</span>PRD draft</span><span class="chip"><span class="t">REF</span>links INIT-09</span></div>
+        </article>
+
+        <article class="card">
+          <div class="top-row"><span class="ref">INIT-21</span><span class="pill plan"><span class="ic">◇</span>Planned</span></div>
+          <h5 class="serif">Multi-currency wallets</h5>
+          <p class="outcome">Hold balances in EUR, GBP, and SEK without forced conversion.</p>
+          <div class="meta"><span>Discovery</span><span class="who"><span class="av">DO</span>Dana O.</span></div>
+          <div class="agentline">
+            <span class="agbadge"><span class="sq"></span>agent</span>
+            <span><b>PlanningAgent</b> drafted an estimate from 3 similar past items. <a href="#">See breakdown</a></span>
+          </div>
+        </article>
+
+        <div class="restr">
+          <span class="lk">🔒︎</span>
+          <span><b>1 restricted item</b> in this column — visible to you as a count only. Open the project's access view for who can see it.</span>
+        </div>
+      </div>
+
+      <!-- LATER -->
+      <div class="col">
+        <h3 class="serif">Later</h3>
+        <div class="when">This quarter & beyond</div>
+
+        <article class="card">
+          <div class="top-row"><span class="ref">INIT-26</span><span class="pill plan"><span class="ic">◇</span>Idea</span></div>
+          <h5 class="serif">Embedded lending API</h5>
+          <p class="outcome">Let platform partners offer credit at checkout under our licence.</p>
+          <div class="meta"><span>Outcome defined · not scoped</span></div>
+          <div class="chips"><span class="chip"><span class="t">OKR</span>Revenue diversification</span></div>
+        </article>
+
+        <article class="card">
+          <div class="top-row"><span class="ref">INIT-30</span><span class="pill plan"><span class="ic">◇</span>Idea</span></div>
+          <h5 class="serif">Carbon-cost receipts</h5>
+          <p class="outcome">Show estimated emissions per transaction for ESG reporting.</p>
+          <div class="meta"><span>Customer-requested ×7</span></div>
+        </article>
+
+        <p class="de">Items here carry an outcome, not a date — promises we haven't made yet.</p>
+      </div>
+    </section>
+  </main>
+</div>
+</body>
+</html>

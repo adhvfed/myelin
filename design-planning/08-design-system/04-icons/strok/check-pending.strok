@@ -1,0 +1,16 @@
+# @meaning Check pending / in-progress — clock in status ring
+# @tags ci, check, pending, progress, clock, ring
+documentsize 24x24
+defaults
+  fill none
+  stroke currentColor
+  stroke-width 2
+  stroke-linecap round
+  stroke-linejoin round
+shape ring template=ellipse
+place r1 shape=ring at=4,4 size=16x16
+shape hand template=path
+  addpoint a at=12,8
+  addpoint b at=12,12
+  addpoint c at=15,12
+place h1 shape=hand at=0,0

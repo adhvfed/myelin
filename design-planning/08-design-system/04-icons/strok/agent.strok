@@ -1,0 +1,15 @@
+# @meaning Agent mark — plain geometric: rounded square + centered dot
+# @tags agent, ai, bot, principal, mark
+documentsize 24x24
+defaults
+  fill none
+  stroke currentColor
+  stroke-width 2
+  stroke-linecap round
+  stroke-linejoin round
+shape body template=rectangle
+  round-corners 4
+place b1 shape=body at=4,4 size=16x16
+shape dot template=ellipse
+  fill currentColor
+place d1 shape=dot at=10,10 size=4x4

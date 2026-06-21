@@ -1,0 +1,17 @@
+# @meaning Reject a proposed effect — bare cross (HITL action)
+# @tags reject, decline, deny, cross, hitl
+documentsize 24x24
+defaults
+  fill none
+  stroke currentColor
+  stroke-width 2
+  stroke-linecap round
+  stroke-linejoin round
+shape l1 template=path
+  addpoint a at=6,6
+  addpoint b at=18,18
+place a1 shape=l1 at=0,0
+shape l2 template=path
+  addpoint a at=18,6
+  addpoint b at=6,18
+place a2 shape=l2 at=0,0

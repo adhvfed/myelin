@@ -1,0 +1,20 @@
+# @meaning Chat subsystem (stacked bubbles)
+# @tags nav, chat, messages, conversation, subsystem
+documentsize 24x24
+defaults
+  fill none
+  stroke currentColor
+  stroke-width 2
+  stroke-linecap round
+  stroke-linejoin round
+shape back template=rectangle
+  round-corners 2.5
+place bk shape=back at=11,4 size=9x8
+shape front template=rectangle
+  round-corners 2.5
+place fr shape=front at=4,9 size=11x8
+shape tail template=path
+  addpoint a at=7,17
+  addpoint b at=6,20
+  addpoint c at=10,17
+place t1 shape=tail at=0,0

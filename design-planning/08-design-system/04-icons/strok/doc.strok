@@ -1,0 +1,30 @@
+# @meaning Doc / page — the named glyph
+# @tags doc, page, document, article
+documentsize 24x24
+defaults
+  fill none
+  stroke currentColor
+  stroke-width 2
+  stroke-linecap round
+  stroke-linejoin round
+shape body template=path
+  addpoint a at=6,3
+  addpoint b at=14,3
+  addpoint c at=18,7
+  addpoint d at=18,21
+  addpoint e at=6,21
+  close
+place b1 shape=body at=0,0
+shape fold template=path
+  addpoint a at=14,3
+  addpoint b at=14,7
+  addpoint c at=18,7
+place f1 shape=fold at=0,0
+shape t1 template=path
+  addpoint a at=9,13
+  addpoint b at=15,13
+place line1 shape=t1 at=0,0
+shape t2 template=path
+  addpoint a at=9,17
+  addpoint b at=15,17
+place line2 shape=t2 at=0,0

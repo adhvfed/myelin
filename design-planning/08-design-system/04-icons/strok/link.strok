@@ -1,0 +1,21 @@
+# @meaning Link / reference / backlink (chain)
+# @tags link, reference, backlink, chain, url
+documentsize 24x24
+defaults
+  fill none
+  stroke currentColor
+  stroke-width 2
+  stroke-linecap round
+  stroke-linejoin round
+shape bar template=path
+  addpoint a at=9,12
+  addpoint b at=15,12
+place b1 shape=bar at=0,0
+shape lefthook template=path
+  addpoint a at=10,16
+  addpoint b at=10,8 mode=arc rx=6 ry=4 bulge=right
+place lh shape=lefthook at=0,0
+shape righthook template=path
+  addpoint a at=14,8
+  addpoint b at=14,16 mode=arc rx=6 ry=4 bulge=right
+place rh shape=righthook at=0,0

@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<!-- FINALIST C · Wayfinding — STATES: the unglamorous states for the chat/HITL surface.
+     Required set: empty · loading (skeleton) · error · permission-denied · erased/tombstone · agent-pending.
+     PLUS the full HITL gate states (gate-awaiting → approved/edited/rejected + agent-error/budget-exceeded/loop-guard/denied-cross-cell/stale).
+     PLUS — the load-bearing one for Axis-5 FOREGROUNDED — the AGENT-STORM / notification-storm state:
+     a 30× agent surge stays CALM (human lane holds, agent lane sheds; chain collapses to one line + count;
+     inbox groups "N approvals awaiting you"). PROVES calm-under-agent-volume. Backs onto R-14 §5, R-15 §5.2. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wayfinding · states (incl. agent-storm)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../tokens.css">
+<style>
+  body{overflow:auto}
+  .page{max-width:1180px;margin:0 auto;padding:var(--sp-6) var(--sp-5)}
+  h1{font-size:22px;font-weight:700;margin-bottom:4px}
+  .lede{color:var(--ink-3);font-size:var(--fs-sm);margin-bottom:var(--sp-6)}
+  .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:var(--sp-4)}
+  @media (max-width:900px){.grid{grid-template-columns:1fr}}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-lg);overflow:hidden}
+  .panel.wide{grid-column:1/-1}
+  .ph{padding:var(--sp-3) var(--sp-4);border-bottom:1px solid var(--line);display:flex;align-items:baseline;gap:var(--sp-2)}
+  .ph .t{font-size:var(--fs-md);font-weight:600}
+  .ph .tag{font-family:var(--mono);font-size:10px;color:var(--ink-3);border:1px solid var(--line);border-radius:var(--r-sm);padding:1px 6px;margin-inline-start:auto}
+  .pb{padding:var(--sp-4)}
+  .sub{font-size:var(--fs-sm);color:var(--ink-2);margin-bottom:var(--sp-3)}
+
+  /* skeleton */
+  .sk{height:12px;border-radius:var(--r-sm);background:linear-gradient(90deg,var(--panel-2),var(--line),var(--panel-2));background-size:200% 100%;animation:shine 1.4s linear infinite;margin-bottom:9px}
+  @keyframes shine{to{background-position:-200% 0}}
+  @media (prefers-reduced-motion:reduce){.sk{animation:none;background:var(--panel-2)}}
+
+  .empty{text-align:center;padding:var(--sp-5) var(--sp-3)}
+  .empty .icon{width:40px;height:40px;border:2px dashed var(--line-2);border-radius:8px;margin:0 auto var(--sp-3);display:grid;place-items:center;color:var(--ink-3)}
+  .empty .h{font-weight:600;margin-bottom:4px}
+  .empty .p{font-size:var(--fs-sm);color:var(--ink-3);margin-bottom:var(--sp-3)}
+
+  .quiet{border:1px solid var(--line-2);border-radius:var(--r-md);padding:var(--sp-3);font-size:var(--fs-sm);color:var(--ink-2);display:flex;gap:var(--sp-3);align-items:flex-start}
+  .quiet .g{color:var(--ink-3);font-family:var(--mono);margin-top:1px}
+  .quiet.err{border-color:var(--crit)} .quiet.err .g{color:var(--crit)}
+  .quiet.warn{border-color:var(--warn)} .quiet.warn .g{color:var(--warn)}
+  .quiet .row-acts{margin-top:6px;display:flex;gap:6px}
+
+  .tomb{font-family:var(--mono);font-size:var(--fs-sm);color:var(--ink-3);border:1px dashed var(--line-2);border-radius:var(--r-md);padding:var(--sp-3);background:var(--bg)}
+
+  /* HITL state chips */
+  .statelist{display:flex;flex-direction:column;gap:var(--sp-2)}
+  .srow{display:flex;gap:var(--sp-3);align-items:flex-start;border:1px solid var(--line);border-radius:var(--r-md);padding:var(--sp-3);font-size:var(--fs-sm)}
+  .srow .nm{font-weight:600;color:var(--ink);width:150px;flex:none;display:flex;gap:6px;align-items:center}
+  .srow .desc{color:var(--ink-2)}
+  .srow .desc code{font-family:var(--mono);font-size:11px;background:var(--panel-2);padding:0 4px;border-radius:var(--r-sm)}
+  .pill{font-family:var(--mono);font-size:10px;border-radius:var(--r-sm);padding:1px 6px;border:1px solid currentColor}
+  .pill.await{color:var(--warn)} .pill.ok{color:var(--ok)} .pill.edit{color:var(--agent)} .pill.rej{color:var(--crit)} .pill.err{color:var(--crit)}
+
+  /* AGENT-STORM */
+  .lanes{display:grid;grid-template-columns:1fr 1fr;gap:var(--sp-4)}
+  @media (max-width:760px){.lanes{grid-template-columns:1fr}}
+  .lane{border:1px solid var(--line);border-radius:var(--r-md);overflow:hidden}
+  .lanehd{padding:var(--sp-2) var(--sp-3);border-bottom:1px solid var(--line);font-size:var(--fs-xs);font-weight:600;display:flex;align-items:center;gap:6px}
+  .lane.human .lanehd{box-shadow:inset 0 var(--addr-w) 0 var(--accent)}
+  .lane.agent .lanehd{box-shadow:inset 0 var(--addr-w) 0 var(--agent-line)}
+  .lanehd .n{margin-inline-start:auto;font-family:var(--mono);color:var(--ink-3)}
+  .lanebody{padding:var(--sp-3);font-size:var(--fs-sm);color:var(--ink-2);display:flex;flex-direction:column;gap:var(--sp-2)}
+  .mini{display:flex;gap:var(--sp-2);align-items:center;color:var(--ink-2)}
+  .mini .ava{width:22px;height:22px;border-radius:5px;background:var(--panel-2);border:1px solid var(--line-2);display:grid;place-items:center;font-size:10px;flex:none}
+  .chain{border:1px dashed var(--agent-line);border-radius:var(--r-md);background:var(--agent-bg);padding:9px var(--sp-3);display:flex;align-items:center;gap:var(--sp-2);font-size:var(--fs-sm);color:var(--ink-2);flex-wrap:wrap}
+  .chain .cnt{margin-inline-start:auto;font-family:var(--mono);font-size:var(--fs-xs);color:var(--ink-3)}
+  .shed{font-size:var(--fs-xs);color:var(--ink-3);font-family:var(--mono);margin-top:6px}
+  .inboxgroup{border:1px solid var(--accent);border-radius:var(--r-md);padding:var(--sp-3);display:flex;gap:var(--sp-3);align-items:center}
+  .inboxgroup .big{font-size:var(--fs-lg);font-weight:700}
+  .themebtn{position:fixed;bottom:14px;inset-inline-end:14px;z-index:10}
+</style>
+</head>
+<body>
+<div class="page">
+  <h1>Designed states — chat / HITL surface</h1>
+  <p class="lede">Every state is designed, not a 500. The standout is the <b>agent-storm</b>: Axis-5 foregrounded raises volume, so the surface PROVES calm-under-agent-volume. [DEFERRED-UNTIL-USERS] — expert sketch, not user-validated.</p>
+
+  <div class="grid">
+
+    <!-- EMPTY -->
+    <section class="panel">
+      <div class="ph"><span class="t">Empty</span><span class="tag">onboarding-forward</span></div>
+      <div class="pb">
+        <div class="empty">
+          <div class="icon" aria-hidden="true">◇</div>
+          <div class="h">No topics yet in #payments-incidents</div>
+          <div class="p">Topics keep a busy channel navigable — and keep agent volume contained. Start one to see it on the wayfinding nav.</div>
+          <button class="btn p sm">New topic</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- LOADING -->
+    <section class="panel">
+      <div class="ph"><span class="t">Loading</span><span class="tag">structure skeleton</span></div>
+      <div class="pb">
+        <div class="sk" style="width:55%"></div>
+        <div class="sk" style="width:90%"></div>
+        <div class="sk" style="width:78%"></div>
+        <div class="sk" style="width:40%"></div>
+        <p style="font-size:var(--fs-xs);color:var(--ink-3);margin-top:6px">Chrome renders instantly; the topic stream fills in. Never a blank spinner.</p>
+      </div>
+    </section>
+
+    <!-- ERROR -->
+    <section class="panel">
+      <div class="ph"><span class="t">Error</span><span class="tag">blames the system</span></div>
+      <div class="pb">
+        <div class="quiet err"><span class="g" aria-hidden="true">✗</span><div>We couldn't load this topic — the Frankfurt cell is slow to respond. Your draft is saved.<div class="row-acts"><button class="btn sm">Retry</button><button class="btn sm">Open status page</button></div></div></div>
+      </div>
+    </section>
+
+    <!-- PERMISSION-DENIED -->
+    <section class="panel">
+      <div class="ph"><span class="t">Permission-denied</span><span class="tag">no leak</span></div>
+      <div class="pb">
+        <div class="quiet"><span class="g" aria-hidden="true">⚷</span><div>You don't have access to <b>#payments-secrets</b>. We won't show its name in your nav, its topics, or its members.<div class="row-acts"><button class="btn sm">Request access</button></div></div></div>
+        <p style="font-size:var(--fs-xs);color:var(--ink-3);margin-top:8px">A restricted reference shows no title, by construction: <span class="ref noaccess"><span aria-hidden="true">⚷</span> Restricted reference</span></p>
+      </div>
+    </section>
+
+    <!-- ERASED / TOMBSTONE -->
+    <section class="panel">
+      <div class="ph"><span class="t">Erased / tombstoned</span><span class="tag">GDPR-aware</span></div>
+      <div class="pb">
+        <div class="tomb">[erased subject] transitioned ISS-377 · 13:32<br><span style="color:var(--line-2)">— content crypto-shredded; the audit hash is never rewritten —</span></div>
+        <p style="font-size:var(--fs-xs);color:var(--ink-3);margin-top:8px">An erased message keeps the thread intact: <span class="tomb" style="display:inline-block;padding:2px 8px">Message deleted</span></p>
+      </div>
+    </section>
+
+    <!-- AGENT-PENDING -->
+    <section class="panel">
+      <div class="ph"><span class="t">Agent-pending</span><span class="tag">present, not noisy</span></div>
+      <div class="pb">
+        <div class="quiet"><span class="agent-tag"><span class="mk"></span>SummaryAgent</span><div style="margin-top:2px">drafting the incident summary… <span style="color:var(--ink-3)">no fake progress bar; the step it's on, or a calm marker</span></div></div>
+      </div>
+    </section>
+
+    <!-- HITL GATE STATES -->
+    <section class="panel wide">
+      <div class="ph"><span class="t">HITL gate states</span><span class="tag">durable gate · R-14 §5</span></div>
+      <div class="pb">
+        <div class="statelist">
+          <div class="srow"><span class="nm"><span class="pill await">⚷</span>gate-awaiting</span><span class="desc">The plan card live in chat + inbox; budget/scope shown; reminded, never lost.</span></div>
+          <div class="srow"><span class="nm"><span class="pill ok">✓</span>approved</span><span class="desc"><code>Approved by Mara Ø. · 13:32</code> — effect applied; the chip updates live.</span></div>
+          <div class="srow"><span class="nm"><span class="pill edit">±</span>gate-edited</span><span class="desc">Shows the proposed→amended diff (<code>fix/auto-377</code> → <code>fix/lru-weight-bound-377</code>); attributed <code>human-edited-agent-proposal</code>.</span></div>
+          <div class="srow"><span class="nm"><span class="pill rej">✗</span>gate-rejected</span><span class="desc"><code>Rejected by Mara Ø. · "use the existing PR"</code> — PR not opened; completed steps stand; agent won't retry the same plan.</span></div>
+          <div class="srow"><span class="nm"><span class="pill err">!</span>agent-error</span><span class="desc">"FixAgent couldn't propose a fix — the issue is filed; take it from here." No half-open PR; coherent partial state (saga).</span></div>
+          <div class="srow"><span class="nm"><span class="pill warn" style="color:var(--warn)">€</span>budget-exceeded</span><span class="desc">"Paused — budget reached. Resume · Increase budget (admin) · Take over." Work so far stands.</span></div>
+          <div class="srow"><span class="nm"><span class="pill err">∞</span>loop-guard-tripped</span><span class="desc">"Automation paused to prevent a loop." Operator alarm, not a user crash; kill-switch in governance.</span></div>
+          <div class="srow"><span class="nm"><span class="pill err">⚷</span>denied / cross-cell</span><span class="desc">Names the missing grant; never leaks the target's content (ADR-03). Nothing silently happens.</span></div>
+          <div class="srow"><span class="nm"><span class="pill warn" style="color:var(--warn)">↻</span>stale-approval</span><span class="desc">"The base changed — re-propose?" rather than a silent stale merge.</span></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- THE STANDOUT: AGENT-STORM -->
+    <section class="panel wide" style="border-color:var(--accent)">
+      <div class="ph"><span class="t">Agent-storm · 30× surge — calm-under-agent-volume</span><span class="tag">Axis-5 PROOF · R-15 §5.2</span></div>
+      <div class="pb">
+        <p class="sub">A burst incident fires 30× the agent runs. Foregrounded must stay calm: the <b>human lane holds</b>, the <b>agent lane sheds</b> (infra C10), agent chatter <b>collapses</b> to one line + count, and gates <b>group</b> in the inbox. The main stream never shows 30 rows.</p>
+        <div class="lanes">
+          <div class="lane human">
+            <div class="lanehd">Human lane <span class="status ok"><span class="g" aria-hidden="true">✓</span>holds</span><span class="n">no queue</span></div>
+            <div class="lanebody">
+              <div class="mini"><span class="ava">MØ</span>Mara Ø. — "rolling back the canary"</div>
+              <div class="mini"><span class="ava">JV</span>Jürgen Vögel — "+1, watching p99"</div>
+            </div>
+          </div>
+          <div class="lane agent">
+            <div class="lanehd"><span class="agent-tag"><span class="mk"></span>Agent lane</span><span class="status warn"><span class="g" aria-hidden="true">◷</span>shedding</span><span class="n">429 · Retry-After</span></div>
+            <div class="lanebody">
+              <div class="chain"><span class="agent-tag"><span class="mk"></span>chain</span> TriageAgent + 2 agents did 34 things — labelled, deduped, linked, posted status <span class="cnt">expand 34 ▾</span></div>
+              <div class="shed">agent-run in-flight cap reached · humans never queue behind agents · other tenants unaffected</div>
+            </div>
+          </div>
+        </div>
+        <div style="margin-top:var(--sp-4)">
+          <div class="inboxgroup">
+            <span class="status open"><span class="g" aria-hidden="true">▼</span></span>
+            <div><div class="big">7 approvals awaiting you</div><div style="font-size:var(--fs-xs);color:var(--ink-3)">grouped, ranked by stakes · per-item Approve / Edit / Reject · one bounded list, not a firehose</div></div>
+            <button class="btn p sm" style="margin-inline-start:auto">Triage</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- STREAM-DROP / RESUME -->
+    <section class="panel wide">
+      <div class="ph"><span class="t">Stream-drop / resume</span><span class="tag">chat timeline owns it</span></div>
+      <div class="pb">
+        <div class="quiet warn"><span class="g" aria-hidden="true">◷</span><div>Reconnecting to the Frankfurt cell… catching up on <span class="mono">chat.*</span> since 13:29. Live tail resumes automatically — no messages are lost or reordered.</div></div>
+      </div>
+    </section>
+
+  </div>
+</div>
+<button class="btn themebtn" onclick="document.documentElement.dataset.theme = document.documentElement.dataset.theme==='light'?'dark':'light'">◐ light / dark</button>
+</body>
+</html>

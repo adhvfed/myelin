@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<!-- FINALIST D · CIVIC | RTL MIRROR (G2 D-G2.3) — whole shell + a content surface mirrored, REAL Arabic strings
+     dir="rtl" at the root. Built on logical properties (inline-start/end) — NO physical left/right override sheet,
+     so RTL is correct BY CONSTRUCTION (R-18 §4.1). Mirrors: rail → inline-start (renders right), receipt rail →
+     inline-end (renders left), tabs, table columns, status glyphs (non-directional, NOT mirrored).
+     Mixed-direction run: an LTR myelin:// ref + SHA + @handle bidi-ISOLATED (<bdi>) inside Arabic prose, proving
+     code/refs never visually reverse. Status glyphs/agent glyph stay non-mirrored (R-18 §4.2).
+     [DEFERRED-UNTIL-USERS] — RTL real-use comprehension is a deferred user test (R-18 §10.2). -->
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DSR-2026-0471 — طلب محو · acme · Myelin</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../tokens.css">
+<style>
+  /* IMPORTANT: only logical properties below (inline-start/end, margin-inline-*, border-inline-*).
+     No left/right anywhere — this is what makes the mirror correct by construction. */
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{background:var(--bg);color:var(--text-primary);font:13px/1.55 var(--font-sans);-webkit-font-smoothing:antialiased;overflow:hidden}
+  a{color:var(--accent-text);text-decoration:none}
+  .mono{font-family:var(--font-mono)}
+  .shell{display:grid;grid-template-columns:210px 1fr 300px;height:100vh;overflow:hidden}
+
+  .rail{background:var(--surface);border-inline-end:1px solid var(--border);padding:var(--space-3) 10px;overflow:auto}
+  .brand{display:flex;align-items:center;gap:var(--space-2);margin:2px 4px var(--space-2);font-weight:700}
+  .brand .m{width:26px;height:26px;border-radius:var(--radius-1);background:var(--text-primary);color:var(--surface);display:grid;place-items:center;font-size:13px}
+  .sov{border:1px solid var(--border-strong);border-radius:var(--radius-1);padding:9px 10px;margin:var(--space-3) 4px var(--space-4);background:var(--surface-band)}
+  .sov h6{font-size:9.5px;letter-spacing:.04em;color:var(--text-muted);font-weight:700;margin-bottom:7px}
+  .sov .li{display:flex;align-items:start;gap:7px;font-size:11.5px;color:var(--text-secondary);padding:3px 0}
+  .sov .li .ic{flex:none;width:14px;height:14px;border:1.4px solid var(--accent);border-radius:3px;display:grid;place-items:center;font-size:8px;color:var(--accent-text);margin-top:1px}
+  .sov .li b{color:var(--text-primary);font-weight:600}
+  .nav h5{font-size:9.5px;color:var(--text-muted);margin:var(--space-3) 4px 5px;font-weight:700}
+  .nav a{display:flex;align-items:center;gap:var(--space-2);padding:5px var(--space-2);border-radius:var(--radius-1);color:var(--text-secondary)}
+  .nav a.on{background:var(--surface-sunken);color:var(--accent-text);font-weight:600}
+  .nav a .g{width:14px;text-align:center;font-size:10px;color:var(--text-muted)}
+
+  .main{display:flex;flex-direction:column;overflow:hidden;min-width:0}
+  .top{display:flex;align-items:center;gap:var(--space-3);padding:var(--space-3) var(--space-6);border-bottom:1px solid var(--border);background:var(--surface)}
+  .top .req{font-family:var(--font-mono);font-size:12px;color:var(--text-muted)}
+  .top h1{font-size:16px;font-weight:600}
+  .clock{margin-inline-start:auto;display:inline-flex;align-items:center;gap:9px;border:1px solid var(--border-strong);border-radius:var(--radius-1);padding:5px var(--space-3);font-size:12px}
+  .clock .lab{color:var(--text-muted)} .clock .v{font-weight:700;color:var(--status-warn);font-variant-numeric:tabular-nums}
+  .tabs{display:flex;gap:2px;padding:0 var(--space-6);background:var(--surface);border-bottom:1px solid var(--border)}
+  .tabs a{padding:11px var(--space-3);font-size:12.5px;color:var(--text-muted);border-bottom:2px solid transparent;display:inline-flex;align-items:center;gap:7px}
+  .tabs a .n{font-family:var(--font-mono);font-size:10px;color:var(--text-muted)}
+  .tabs a.on{color:var(--text-primary);font-weight:600;border-bottom-color:var(--accent)}
+
+  .canvas{flex:1;overflow:auto;min-height:0;padding:var(--space-4) var(--space-6)}
+  .subj{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-1);padding:var(--space-3) var(--space-4);display:flex;align-items:center;gap:var(--space-4);margin-bottom:var(--space-4)}
+  .subj .ava{width:42px;height:42px;border-radius:var(--radius-1);background:var(--surface-sunken);border:1px solid var(--border);color:var(--text-secondary);display:grid;place-items:center;font-weight:600;font-size:15px}
+  .subj .who b{font-size:14px}
+  .subj .who .meta{font-size:11.5px;color:var(--text-muted)}
+  /* the mixed-direction line: LTR ref isolated inside RTL prose */
+  .mixline{background:var(--surface-band);border:1px solid var(--border-strong);border-radius:var(--radius-1);padding:var(--space-3) var(--space-4);margin-bottom:var(--space-4);font-size:12px;color:var(--text-secondary)}
+  .mixline bdi{font-family:var(--font-mono);color:var(--accent-text);direction:ltr;unicode-bidi:isolate}
+
+  .holders{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-1);overflow:hidden}
+  .holders .h,.hrow{display:grid;grid-template-columns:1.6fr 1.1fr .8fr 130px;gap:var(--space-3);align-items:center}
+  .holders .h{padding:9px var(--space-4);background:var(--surface-sunken);border-bottom:1px solid var(--border);font-size:10.5px;color:var(--text-muted);font-weight:700}
+  .hrow{padding:11px var(--space-4);border-bottom:1px solid var(--border)}
+  .hrow:last-child{border:none}
+  .hrow .nm{font-size:12.5px;font-weight:500;display:flex;align-items:center;gap:9px;color:var(--text-primary)}
+  .hrow .nm .gi{width:18px;height:18px;border:1.4px solid var(--text-muted);border-radius:3px;display:grid;place-items:center;font-size:8px;color:var(--text-muted);font-family:var(--font-mono);flex:none}
+  .hrow .cells{font-size:11.5px;color:var(--text-secondary)}
+  .hrow .resi .mono{color:var(--text-secondary);font-size:11px}
+  .st{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;font-weight:600;justify-self:end}
+  .st .ic{font-family:var(--font-mono);font-size:11px}
+  .st.done{color:var(--status-ok)} .st.fail{color:var(--status-bad)} .st.restr{color:var(--status-restricted)}
+  .retry{font-size:10.5px;color:var(--accent-text);border:1px solid var(--border-strong);border-radius:var(--radius-1);padding:2px 7px;margin-inline-start:8px}
+
+  .receipt{background:var(--surface);border-inline-start:1px solid var(--border);padding:var(--space-4);overflow:auto}
+  .receipt h4{font-size:11px;color:var(--text-muted);font-weight:700;margin-bottom:4px}
+  .receipt .sub{font-size:11.5px;color:var(--text-muted);margin-bottom:var(--space-4)}
+  .rc{border:1px solid var(--border);border-radius:var(--radius-1);padding:var(--space-3);margin-bottom:var(--space-3);background:var(--surface-sunken)}
+  .rc .k{font-size:10px;color:var(--text-muted);font-weight:700;margin-bottom:3px}
+  .rc .v{font-size:12px;color:var(--text-primary)}
+  .rc .v.mono{font-family:var(--font-mono);font-size:11px;color:var(--text-secondary);direction:ltr;unicode-bidi:isolate;display:inline-block}
+  .verify{display:block;width:100%;text-align:center;border:1px solid var(--accent);color:var(--accent-text);background:var(--surface);border-radius:var(--radius-1);padding:9px;font-size:12px;font-weight:600;cursor:pointer}
+  .legal{font-size:11px;color:var(--text-muted);margin-top:var(--space-4);padding-top:var(--space-3);border-top:1px solid var(--border)}
+  .legal .open{font-weight:700;color:var(--status-restricted);direction:ltr;unicode-bidi:isolate;display:inline-block}
+  .note-en{font-size:11px;color:var(--text-muted);margin-top:var(--space-3)}
+  @media (max-width:1100px){ .shell{grid-template-columns:210px 1fr} .receipt{display:none} }
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <!-- rail mirrors to inline-start → renders on the RIGHT in RTL, by construction -->
+  <nav class="rail" aria-label="التنقل الرئيسي">
+    <div class="brand"><span class="m">M</span>Myelin</div>
+    <div class="sov" aria-label="السيادة على البيانات">
+      <h6>السيادة على البيانات — هذا المستأجر</h6>
+      <div class="li"><span class="ic" aria-hidden="true">⬡</span><span><b>الاتحاد الأوروبي · فرانكفورت</b> · كل المخازن مقيّدة إقليميًا</span></div>
+      <div class="li"><span class="ic" aria-hidden="true">⚿</span><span>المفاتيح: <b>يديرها العميل (BYOK)</b></span></div>
+      <div class="li"><span class="ic" aria-hidden="true">→</span><span>النقل خارج الاتحاد: <b>مرفوض افتراضيًا</b></span></div>
+      <div class="li"><span class="ic" aria-hidden="true">⊘</span><span>لا معالِجين فرعيين خارج المنطقة الاقتصادية</span></div>
+    </div>
+    <div class="nav">
+      <h5>الحوكمة</h5>
+      <a href="#" class="on" aria-current="page"><span class="g" aria-hidden="true">⚖</span>حماية البيانات · DSR</a>
+      <a href="#"><span class="g" aria-hidden="true">▤</span>خريطة البيانات</a>
+      <a href="#"><span class="g" aria-hidden="true">◈</span>سجل التدقيق</a>
+      <a href="#"><span class="g" aria-hidden="true">◌</span>حوكمة الوكلاء</a>
+    </div>
+  </nav>
+
+  <main class="main">
+    <header class="top">
+      <span class="req">DSR-2026-0471</span>
+      <h1>طلب المحو — المادة 17</h1>
+      <div class="clock"><span class="lab">المهلة</span><span class="v">6 أيام</span></div>
+    </header>
+
+    <nav class="tabs" aria-label="عمليات DSR">
+      <a href="#"><span class="n">15</span>الاطّلاع</a>
+      <a href="#"><span class="n">20</span>التصدير</a>
+      <a href="#"><span class="n">16</span>التصحيح</a>
+      <a href="#"><span class="n">18</span>التقييد</a>
+      <a href="#" class="on" aria-current="page"><span class="n">17</span>المحو</a>
+    </nav>
+
+    <div class="canvas">
+      <div class="subj">
+        <div class="ava">JV</div>
+        <div class="who">
+          <b>Jürgen Vögel</b> · مساهم سابق
+          <div class="meta">تم حلّه إلى شخص معنيّ واحد دون لبس</div>
+        </div>
+      </div>
+
+      <!-- THE mixed-direction run: LTR myelin:// ref + SHA + @handle bidi-isolated inside RTL prose -->
+      <p class="mixline">
+        أُنشئ هذا الطلب من تشغيل التكامل الفاشل
+        <bdi>myelin://acme/payments-api/ci/run/1894</bdi>
+        على الالتزام
+        <bdi>a94bcc7</bdi>
+        بواسطة
+        <bdi>@mara.o</bdi>
+        — تبقى المراجع والشيفرة بالاتجاه LTR ولا تنعكس بصريًا.
+      </p>
+
+      <section class="holders" aria-label="حالة المحو لكل حائز">
+        <div class="h"><span>حائز البيانات الشخصية</span><span>ما هو محفوظ</span><span>الإقامة</span><span style="text-align:start">الحالة</span></div>
+        <div class="hrow"><div class="nm"><span class="gi" aria-hidden="true">Id</span>الهوية / خريطة الأسماء المستعارة</div><div class="cells">الاسم، البريد، المعرّف</div><div class="resi"><span class="mono">EU-FRA</span></div><div class="st done"><span class="ic" aria-hidden="true">✓</span>دُمّر المفتاح</div></div>
+        <div class="hrow"><div class="nm"><span class="gi" aria-hidden="true">Gi</span>استضافة Git</div><div class="cells">الالتزامات والتأليف</div><div class="resi"><span class="mono">EU-FRA</span></div><div class="st done"><span class="ic" aria-hidden="true">✓</span>مُستعار</div></div>
+        <div class="hrow"><div class="nm"><span class="gi" aria-hidden="true">Ch</span>الدردشة</div><div class="cells">الرسائل والمحادثات</div><div class="resi"><span class="mono">EU-WEST</span></div><div class="st fail"><span class="ic" aria-hidden="true">✗</span>فشلت الفهرسة<a class="retry" href="#">إعادة</a></div></div>
+        <div class="hrow"><div class="nm"><span class="gi" aria-hidden="true">Au</span>التدقيق (استثناء)</div><div class="cells">سجل مُصغّر فقط</div><div class="resi"><span class="mono">EU-FRA</span></div><div class="st restr"><span class="ic" aria-hidden="true">▣</span>محفوظ، مُستعار</div></div>
+      </section>
+    </div>
+  </main>
+
+  <!-- receipt mirrors to inline-end → renders on the LEFT in RTL -->
+  <aside class="receipt" aria-label="الإيصال القابل للتحقق">
+    <h4>الإيصال</h4>
+    <p class="sub">مختوم في شجرة Merkle للتدقيق. دليل، لا وعد.</p>
+    <div class="rc"><div class="k">الحائزون</div><div class="v">9 مختومون · 1 معلّق (الدردشة)</div></div>
+    <div class="rc"><div class="k">حقبة المفتاح المُدمَّرة</div><div class="v mono">dek/jv-7c2e · epoch 14</div></div>
+    <div class="rc"><div class="k">تجزئة الإيصال</div><div class="v mono">sha256:7e1c…a90f</div></div>
+    <button class="verify">تحقّق من إثبات الإدراج</button>
+    <p class="legal">بقايا صادقة: اسم كتبه شخص آخر في رسالته يُعالَج تحت حدّ الأساس القانوني — <span class="open">[OPEN — LEGAL]</span>.</p>
+    <p class="note-en">EN note (for reviewers): rail renders on the right, receipt on the left — both by logical inline-start/end, no physical-property override. The <code class="mono">myelin://</code> ref, SHA, <code class="mono">@handle</code> and <code class="mono">[OPEN — LEGAL]</code> stay LTR via <code class="mono">&lt;bdi&gt;</code> / unicode-bidi:isolate. Status glyphs (✓ ✗ ▣) and the agent square are non-directional and intentionally NOT mirrored (R-18 §4.2).</p>
+  </aside>
+</div>
+</body>
+</html>

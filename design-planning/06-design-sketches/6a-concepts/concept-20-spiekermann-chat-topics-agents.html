@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<!-- CONCEPT C-20 | screen: Chat with Zulip-style topics + foregrounded agents | persona: Erik Spiekermann (commit: information design as wayfinding — signage-grade legibility, a functional grotesk, clear address/labelling, density that stays navigable like a transit map; type does the work, colour is rationed to a single wayfinding accent; refuse: decorative bubbles, gradient avatars, emoji-as-UI, ambiguity about WHO said WHAT, a flat firehose)
+     axes: density=medium nav=rail unification=distinct-per-surface tone=utilitarian agent=FOREGROUNDED sovereignty=on-demand
+     rationale: this should feel like a well-signed departures board for a conversation — channel ▸ topic ▸ message, each addressable like a platform number — because agent participation raises volume, so Zulip-style topics-within-channels are the containment, and agents are FOREGROUNDED (a visible inline collaborator) yet still threaded, labelled, gated and one click from provenance. Agent volume stays in its topic, never the firehose. A HITL approval card sits in-stream where the team is. Throwaway-grade. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>C20 — Chat · topics + agents (Spiekermann)</title>
+<!-- throwaway: single CDN font; production self-hosts -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    /* neutral-led; functional cool-grey ramp, signage clarity */
+    --bg:#10131a; --panel:#161a23; --panel-2:#1d222d; --line:#2a3140; --line-2:#3a4254;
+    --ink:#e8ebf1; --ink-2:#a7afbe; --ink-3:#6f7888;
+    --accent:#e0732a;            /* one wayfinding orange — addresses, unread, the live thing */
+    --topic:#7fa8d8;             /* topic-thread token blue (cool, not alarming) */
+    --ok:#5aa86a; --warn:#cda23a; --crit:#d2614f;
+    --agent:#8fa4cf; --agent-bg:#1c2333; --agent-line:#39456a;
+    --focus:#5fa8d8;             /* derived AA-safe focus, NOT the accent */
+    --r:4px;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{background:var(--bg);color:var(--ink);font-family:"Archivo",system-ui,sans-serif;font-size:14px;line-height:1.45;
+    -webkit-font-smoothing:antialiased;display:grid;grid-template-columns:56px 264px 1fr 300px;height:100vh;overflow:hidden}
+  .mono{font-family:"JetBrains Mono",monospace}
+  :focus-visible{outline:2px solid var(--focus);outline-offset:2px;border-radius:3px}
+
+  /* icon rail */
+  .iconrail{background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column;
+    align-items:center;padding:12px 0;gap:3px}
+  .iconrail .logo{width:30px;height:30px;border:2px solid var(--ink);border-radius:6px;display:grid;place-items:center;
+    font-weight:700;font-size:14px;margin-bottom:12px}
+  .iconrail a{width:36px;height:36px;border-radius:var(--r);display:grid;place-items:center;color:var(--ink-3);font-size:15px;text-decoration:none;position:relative}
+  .iconrail a:hover{background:var(--panel-2);color:var(--ink-2)}
+  .iconrail a.on{background:var(--accent);color:#1a1206}
+  .iconrail .bdg{position:absolute;top:5px;right:5px;width:7px;height:7px;border-radius:50%;background:var(--accent);border:1.5px solid var(--panel)}
+  .iconrail .sp{flex:1}
+
+  /* channel + topic list — the wayfinding column */
+  .nav{background:var(--panel);border-right:1px solid var(--line);overflow:auto}
+  .nav .head{padding:16px 16px 12px;border-bottom:1px solid var(--line)}
+  .nav .head h2{font-size:15px;font-weight:600}
+  .nav .head .scope{font-size:11px;color:var(--ink-3);margin-top:3px;display:flex;gap:6px;align-items:center}
+  .nav .grp{font-size:10px;letter-spacing:.13em;text-transform:uppercase;color:var(--ink-3);padding:16px 16px 6px;font-weight:600}
+  .ch{padding:0 8px}
+  .ch > a{display:flex;align-items:center;gap:8px;padding:7px 8px;color:var(--ink-2);font-size:13.5px;text-decoration:none;border-radius:var(--r)}
+  .ch > a:hover{background:var(--panel-2)}
+  .ch > a.open{color:var(--ink);font-weight:500}
+  .ch > a .hash{color:var(--ink-3);font-family:"JetBrains Mono"}
+  .ch > a .un{margin-left:auto;font-family:"JetBrains Mono";font-size:11px;background:var(--accent);color:#1a1206;border-radius:99px;padding:0 6px;font-weight:600}
+  /* topics within a channel — addressable like platform numbers */
+  .topics{margin:2px 0 6px;border-left:1px solid var(--line-2);margin-left:18px}
+  .topics a{display:flex;align-items:baseline;gap:8px;padding:5px 8px 5px 14px;color:var(--ink-3);font-size:12.5px;text-decoration:none}
+  .topics a:hover{color:var(--ink-2);background:var(--panel-2)}
+  .topics a.on{color:var(--ink);box-shadow:inset 2px 0 0 var(--topic)}
+  .topics a .tn{color:var(--topic);font-family:"JetBrains Mono";font-size:11px}
+  .topics a .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+  .topics a .un{font-family:"JetBrains Mono";font-size:10px;color:var(--ink-2);background:var(--line-2);border-radius:99px;padding:0 5px}
+  .topics a .agent-dot{width:7px;height:7px;border-radius:2px;border:1.5px solid var(--agent);flex-shrink:0}
+
+  /* main stream */
+  .stream{display:flex;flex-direction:column;overflow:hidden;background:var(--bg)}
+  .streamhead{padding:13px 24px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:14px;background:var(--panel)}
+  .streamhead .addr{display:flex;align-items:baseline;gap:8px}
+  .streamhead .addr .ch{font-family:"JetBrains Mono";color:var(--ink-2);font-size:13px;padding:0}
+  .streamhead .addr .sep{color:var(--line-2)}
+  .streamhead .addr .topic{font-size:15px;font-weight:600;color:var(--ink)}
+  .streamhead .addr .tn{font-family:"JetBrains Mono";font-size:11px;color:var(--topic);border:1px solid var(--agent-line);border-radius:3px;padding:1px 6px}
+  .streamhead .sp{flex:1}
+  .streamhead .mut{font-size:11.5px;color:var(--ink-3);display:flex;gap:6px;align-items:center}
+
+  .scroll{flex:1;overflow:auto;padding:8px 0 12px}
+  .msg{display:grid;grid-template-columns:36px 1fr;gap:12px;padding:7px 24px}
+  .msg:hover{background:var(--panel)}
+  .msg .ava{width:30px;height:30px;border-radius:6px;background:var(--panel-2);border:1px solid var(--line-2);
+    display:grid;place-items:center;font-size:11px;font-weight:600;color:var(--ink-2);margin-top:2px}
+  .msg .who{display:flex;align-items:baseline;gap:9px;margin-bottom:2px}
+  .msg .who .name{font-size:13.5px;font-weight:600;color:var(--ink)}
+  .msg .who time{font-size:11px;color:var(--ink-3);font-family:"JetBrains Mono"}
+  .msg .text{font-size:14px;color:var(--ink);line-height:1.5}
+  .msg .text .ref{font-family:"JetBrains Mono";font-size:12px;color:var(--ink);background:var(--panel-2);
+    border:1px solid var(--line-2);border-radius:3px;padding:0 5px;text-decoration:none;display:inline-flex;gap:5px;align-items:center}
+  .msg .text .ref .st{width:6px;height:6px;border-radius:50%}
+  .msg .text .ref .st.open{background:var(--accent)} .msg .text .ref .st.ok{background:var(--ok)} .msg .text .ref .st.warn{background:var(--warn)}
+  .msg .text .mention{color:var(--accent);font-weight:600}
+
+  /* agent message — FOREGROUNDED but unmistakably an agent (label + geometric mark + reserved tint) */
+  .msg.agent{background:var(--agent-bg);box-shadow:inset 3px 0 0 var(--agent-line)}
+  .msg.agent .ava{border-color:var(--agent-line);color:var(--agent);background:#1a2236}
+  .agent-tag{display:inline-flex;gap:6px;align-items:center;font-size:10px;font-weight:700;letter-spacing:.05em;
+    text-transform:uppercase;color:var(--agent);border:1px solid var(--agent-line);border-radius:3px;padding:1px 7px;background:#141b2b}
+  .agent-tag .mk{width:10px;height:10px;border:1.5px solid var(--agent);border-radius:2px;display:inline-block;position:relative}
+  .agent-tag .mk::after{content:"";position:absolute;inset:2px;background:var(--agent);border-radius:1px}
+  .msg.agent .who .obo{font-size:11px;color:var(--ink-3)}
+  .why{font-size:11px;color:var(--agent);text-decoration:underline;text-underline-offset:2px;background:none;border:0;cursor:pointer;margin-left:auto}
+
+  /* unfurl card in stream — live, calm-by-default (one expands, rest stay chips) */
+  .unfurl{border:1px solid var(--line-2);border-radius:var(--r);margin-top:8px;max-width:560px;overflow:hidden;background:var(--panel)}
+  .unfurl .uh{display:flex;align-items:center;gap:8px;padding:9px 12px;border-bottom:1px solid var(--line);font-size:12px}
+  .unfurl .uh .t{font-family:"JetBrains Mono";font-size:11px;color:var(--ink-3)}
+  .unfurl .uh .title{color:var(--ink);font-weight:500}
+  .unfurl .uh .state{margin-left:auto;font-size:11px;display:inline-flex;gap:5px;align-items:center;color:var(--ink-2)}
+  .unfurl .uh .state .d{width:6px;height:6px;border-radius:50%;background:var(--accent)}
+  .unfurl .ub{padding:10px 12px;font-size:12.5px;color:var(--ink-2);display:flex;gap:18px;flex-wrap:wrap}
+  .unfurl .ub b{color:var(--ink);font-weight:500}
+  .unfurl .ub .ci{display:inline-flex;gap:6px;align-items:center}
+  .unfurl .ub .ci .d{width:7px;height:7px;border-radius:50%}
+  .unfurl .ua{padding:8px 12px;border-top:1px solid var(--line);display:flex;gap:8px}
+
+  /* HITL approval card in-stream (agent flagship surface, where the team is) */
+  .msg.approval{background:var(--agent-bg);box-shadow:inset 3px 0 0 var(--accent)}
+  .approval .card{border:1px solid var(--agent-line);border-radius:var(--r);margin-top:6px;max-width:560px;background:var(--panel)}
+  .approval .ch2{padding:11px 14px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:9px}
+  .approval .ch2 .auth{font-size:11.5px;color:var(--ink-3)}
+  .approval .ch2 .auth b{color:var(--ink-2)}
+  .approval .effects{list-style:none;padding:10px 14px;font-size:12.5px;color:var(--ink-2)}
+  .approval .effects li{padding:4px 0;display:flex;gap:9px;align-items:center}
+  .approval .effects li .g{color:var(--ink-3)}
+  .approval .effects li .v{font-family:"JetBrains Mono";font-size:11px;color:var(--ink);background:var(--panel-2);border:1px solid var(--line-2);border-radius:3px;padding:1px 6px}
+  .approval .effects li .gate{margin-left:auto;font-size:10px;color:var(--warn);border:1px solid #5a4a1f;border-radius:3px;padding:0 6px}
+  .approval .foot{padding:10px 14px;border-top:1px solid var(--line);display:flex;gap:8px;align-items:center}
+  .approval .foot .budget{margin-left:auto;font-family:"JetBrains Mono";font-size:10.5px;color:var(--ink-3)}
+
+  .btn{font-family:"Archivo";font-size:12px;border:1px solid var(--line-2);background:var(--panel-2);color:var(--ink);
+    border-radius:var(--r);padding:6px 13px;cursor:pointer}
+  .btn:hover{border-color:var(--ink-3)}
+  .btn.p{background:var(--accent);color:#1a1206;border-color:var(--accent);font-weight:600} .btn.p:hover{filter:brightness(1.07)}
+  .btn.sm{padding:4px 10px;font-size:11px}
+
+  /* collapsed agent-chain line (calm volume: chain collapses to one line + count) */
+  .chain{margin:6px 24px;border:1px dashed var(--agent-line);border-radius:var(--r);background:rgba(28,35,51,.5);
+    padding:9px 12px;display:flex;align-items:center;gap:10px;font-size:12px;color:var(--ink-2);cursor:pointer}
+  .chain .cnt{margin-left:auto;font-family:"JetBrains Mono";font-size:11px;color:var(--ink-3)}
+  .chain .corr{font-family:"JetBrains Mono";font-size:10.5px;color:var(--topic);border:1px solid var(--agent-line);border-radius:3px;padding:0 6px}
+
+  /* composer */
+  .composer{border-top:1px solid var(--line);padding:14px 24px 18px;background:var(--panel)}
+  .composer .box{border:1px solid var(--line-2);border-radius:6px;background:var(--bg)}
+  .composer .row1{display:flex;align-items:center;gap:8px;padding:8px 12px;color:var(--ink-3);font-size:13px}
+  .composer .row1 .ph{flex:1;color:var(--ink-3)}
+  .composer .row2{display:flex;align-items:center;gap:6px;padding:7px 10px;border-top:1px solid var(--line)}
+  .composer .tool{width:28px;height:28px;border-radius:var(--r);display:grid;place-items:center;color:var(--ink-3);font-size:13px;cursor:pointer}
+  .composer .tool:hover{background:var(--panel-2);color:var(--ink-2)}
+  .composer .send{margin-left:auto;font-family:"Archivo";font-size:12px;font-weight:600;background:var(--accent);color:#1a1206;
+    border:0;border-radius:var(--r);padding:7px 16px;cursor:pointer}
+  .composer .hint{font-size:11px;color:var(--ink-3);margin-top:7px;display:flex;gap:14px}
+  .composer .hint kbd{font-family:"JetBrains Mono";font-size:10px;border:1px solid var(--line-2);border-radius:3px;padding:0 4px;color:var(--ink-2)}
+
+  /* RIGHT: topic context pane */
+  .pane{background:var(--panel);border-left:1px solid var(--line);overflow:auto;padding:22px 18px}
+  .pane h4{font-size:10px;letter-spacing:.13em;text-transform:uppercase;color:var(--ink-3);margin-bottom:11px}
+  .pane section{margin-bottom:28px}
+  .pinned{border:1px solid var(--line-2);border-radius:var(--r);padding:12px;background:var(--bg)}
+  .pinned .r{display:flex;gap:8px;align-items:center;font-size:12.5px;color:var(--ink-2);padding:5px 0}
+  .pinned .r .t{font-family:"JetBrains Mono";font-size:10px;color:var(--ink-3);width:28px}
+  .pinned .r .dot{width:7px;height:7px;border-radius:50%}
+  .pinned .r .dot.open{background:var(--accent)} .pinned .r .dot.ok{background:var(--ok)} .pinned .r .dot.warn{background:var(--warn)}
+  .part{display:flex;flex-wrap:wrap;gap:6px}
+  .part .p{display:inline-flex;gap:6px;align-items:center;border:1px solid var(--line);border-radius:99px;padding:3px 9px;font-size:11.5px;color:var(--ink-2)}
+  .part .p.ag{border-color:var(--agent-line);color:var(--agent)}
+  .part .p .mk{width:8px;height:8px;border:1.5px solid var(--agent);border-radius:2px;position:relative}
+  .part .p .mk::after{content:"";position:absolute;inset:2px;background:var(--agent);border-radius:1px}
+  .pane .corrwalk{font-size:11.5px;color:var(--ink-3);line-height:1.6}
+  .pane .corrwalk a{color:var(--topic);text-decoration:none}
+</style>
+</head>
+<body>
+
+  <!-- ICON RAIL -->
+  <nav class="iconrail">
+    <div class="logo">M</div>
+    <a href="#"><span>◐</span></a>
+    <a href="#"><span>⊘</span></a>
+    <a href="#"><span>▤</span></a>
+    <a href="#"><span>▦</span></a>
+    <a href="#" class="on"><span>◇</span></a>
+    <a href="#" style="position:relative"><span>▼</span><span class="bdg"></span></a>
+    <div class="sp"></div>
+    <a href="#"><span>⌕</span></a>
+    <a href="#"><span>○</span></a>
+  </nav>
+
+  <!-- CHANNEL + TOPIC NAV -->
+  <nav class="nav">
+    <div class="head">
+      <h2>Chat</h2>
+      <div class="scope">⌖ EU-West · Acme Platform</div>
+    </div>
+    <div class="grp">Channels</div>
+    <div class="ch">
+      <a class="open"><span class="hash">#</span>cache-service</a>
+      <div class="topics">
+        <a class="on"><span class="tn">▸01</span><span class="name">weighted eviction OOM</span><span class="agent-dot" title="agents active"></span><span class="un">3</span></a>
+        <a><span class="tn">▸02</span><span class="name">canary rollout plan</span></a>
+        <a><span class="tn">▸03</span><span class="name">p99 latency follow-up</span><span class="un">1</span></a>
+      </div>
+    </div>
+    <div class="ch">
+      <a><span class="hash">#</span>incidents</a>
+      <div class="topics">
+        <a><span class="tn">▸09</span><span class="name">INC-9 stale runbook</span><span class="agent-dot"></span></a>
+      </div>
+    </div>
+    <div class="ch"><a><span class="hash">#</span>platform-eng<span class="un">5</span></a></div>
+    <div class="ch"><a><span class="hash">#</span>releases</a></div>
+    <div class="grp">Direct</div>
+    <div class="ch"><a><span class="hash" style="border-radius:50%;width:9px;height:9px;background:var(--ok);display:inline-block"></span>Marc Vogel</a></div>
+  </nav>
+
+  <!-- STREAM (one topic) -->
+  <section class="stream">
+    <header class="streamhead">
+      <div class="addr">
+        <span class="ch">#cache-service</span><span class="sep">▸</span>
+        <span class="topic">weighted eviction OOM</span>
+        <span class="tn">topic 01</span>
+      </div>
+      <div class="sp"></div>
+      <div class="mut">3 participants · 1 agent · started 3h ago</div>
+    </header>
+
+    <div class="scroll">
+
+      <div class="msg">
+        <div class="ava">LB</div>
+        <div>
+          <div class="who"><span class="name">Lena Bauer</span><time>13:02</time></div>
+          <div class="text">The OOM repro is in <a class="ref" href="#">CI run #2041 <span class="st warn"></span></a>. Counting entries was the bug — switching to a weight bound in <a class="ref" href="#">PR #412 <span class="st open"></span></a>.</div>
+        </div>
+      </div>
+
+      <div class="msg">
+        <div class="ava">AS</div>
+        <div>
+          <div class="who"><span class="name">Ana Schmidt</span><time>13:09</time></div>
+          <div class="text"><span class="mention">@lena</span> did you cache <span class="mono" style="font-size:12px;background:var(--panel-2);padding:0 4px;border-radius:3px">weight()</span> at insert? Recomputing on eviction is the hot path.</div>
+        </div>
+      </div>
+
+      <!-- foregrounded agent: a visible inline collaborator, clearly labelled -->
+      <div class="msg agent">
+        <div class="ava">▣</div>
+        <div>
+          <div class="who">
+            <span class="agent-tag"><span class="mk"></span>TriageAgent</span>
+            <span class="obo">triggered by ci.failed on cache-service · on behalf of @lena</span>
+            <time>13:10</time>
+            <button class="why">Why? ↗</button>
+          </div>
+          <div class="text">Filed and linked the regression. Eviction now recomputes <span class="mono" style="font-size:12px;background:var(--panel-2);padding:0 4px;border-radius:3px">weight()</span> per pop — Ana's point. Suggested cached-weight patch on the diff.</div>
+          <div class="unfurl">
+            <div class="uh"><span class="t">ISS</span><span class="title">#377 Cache OOM under burst load</span><span class="state"><span class="d"></span>In review</span></div>
+            <div class="ub">
+              <span>Assignee <b>@lena</b></span>
+              <span>Priority <b>High</b></span>
+              <span class="ci"><span class="d" style="background:var(--ok)"></span>linked PR #412</span>
+            </div>
+            <div class="ua"><button class="btn sm">Open issue</button><button class="btn sm">Transition →</button></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- collapsed agent chain (calm volume; chain = a correlation_id, one line + count) -->
+      <div class="chain">
+        <span class="agent-tag"><span class="mk"></span>chain</span>
+        TriageAgent did 4 more things — labelled, deduped, posted status, linked CI
+        <span class="corr">correlation · incident-#9</span>
+        <span class="cnt">expand 4 ▾</span>
+      </div>
+
+      <div class="msg">
+        <div class="ava">MV</div>
+        <div>
+          <div class="who"><span class="name">Marc Vogel</span><time>13:24</time></div>
+          <div class="text">Looks right. <span class="mention">@FixAgent</span> can you prep the merge once green? Squash, close #377, post here.</div>
+        </div>
+      </div>
+
+      <!-- HITL approval card, in-stream, where the team is -->
+      <div class="msg approval agent">
+        <div class="ava">▣</div>
+        <div>
+          <div class="who"><span class="agent-tag"><span class="mk"></span>FixAgent</span><span class="obo">awaiting your approval</span><time>13:31</time><button class="why">Why? ↗</button></div>
+          <div class="text">Plan ready. Nothing happens until a human approves:</div>
+          <div class="card">
+            <div class="ch2">
+              <span class="agent-tag"><span class="mk"></span>FixAgent</span>
+              <span class="auth">on behalf of <b>@marc</b> · scope <span class="mono" style="font-size:11px">repo/cache-service</span></span>
+            </div>
+            <ul class="effects">
+              <li><span class="g">→</span> merge <span class="v">PR #412</span> into <span class="v">main</span> (squash) <span class="gate">gated</span></li>
+              <li><span class="g">→</span> close <span class="v">ISS-377</span></li>
+              <li><span class="g">→</span> post result to <span class="v">#cache-service ▸ 01</span></li>
+            </ul>
+            <div class="foot">
+              <button class="btn p">Approve</button>
+              <button class="btn">Edit</button>
+              <button class="btn">Reject</button>
+              <span class="budget">budget 3 / 12 · depth 2 / 12</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- COMPOSER -->
+    <div class="composer">
+      <div class="box">
+        <div class="row1"><span class="ph">Message #cache-service ▸ weighted eviction OOM…</span></div>
+        <div class="row2">
+          <span class="tool" title="Slash command">/</span>
+          <span class="tool" title="Mention">@</span>
+          <span class="tool" title="Reference">#</span>
+          <span class="tool" title="Code block">⟨⟩</span>
+          <span class="tool" title="Attach">⊕</span>
+          <button class="send">Send</button>
+        </div>
+      </div>
+      <div class="hint"><span><kbd>@</kbd> people · agents · artifacts</span><span><kbd>#</kbd> reference, unfurls live</span><span>paste a link → it unfurls</span></div>
+    </div>
+  </section>
+
+  <!-- TOPIC CONTEXT PANE -->
+  <aside class="pane">
+    <section>
+      <h4>Topic · pinned</h4>
+      <div class="pinned">
+        <div class="r"><span class="t">PR</span><span>#412 weighted eviction</span><span class="dot open" style="margin-left:auto"></span></div>
+        <div class="r"><span class="t">ISS</span><span>#377 Cache OOM</span><span class="dot open" style="margin-left:auto"></span></div>
+        <div class="r"><span class="t">CI</span><span>run #2041 repro</span><span class="dot warn" style="margin-left:auto"></span></div>
+        <div class="r"><span class="t">DOC</span><span>Eviction &amp; sizing RFC</span><span class="dot ok" style="margin-left:auto"></span></div>
+      </div>
+    </section>
+    <section>
+      <h4>Participants</h4>
+      <div class="part">
+        <span class="p">LB Lena</span>
+        <span class="p">AS Ana</span>
+        <span class="p">MV Marc</span>
+        <span class="p ag"><span class="mk"></span>TriageAgent</span>
+        <span class="p ag"><span class="mk"></span>FixAgent</span>
+      </div>
+    </section>
+    <section>
+      <h4>Provenance · this chain</h4>
+      <div class="corrwalk">
+        <span class="mono" style="color:var(--topic)">correlation: incident-#9</span><br>
+        ci.failed → <a href="#">TriageAgent run</a> → <a href="#">ISS-377</a> → this topic → <a href="#">FixAgent plan</a> · <a href="#">audit ✓</a>
+      </div>
+    </section>
+  </aside>
+
+</body>
+</html>

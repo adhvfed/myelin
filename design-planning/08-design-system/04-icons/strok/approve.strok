@@ -1,0 +1,14 @@
+# @meaning Approve a proposed effect — bare check (HITL action)
+# @tags approve, accept, confirm, check, hitl
+documentsize 24x24
+defaults
+  fill none
+  stroke currentColor
+  stroke-width 2
+  stroke-linecap round
+  stroke-linejoin round
+shape mark template=path
+  addpoint a at=5,13
+  addpoint b at=10,18
+  addpoint c at=19,6
+place m1 shape=mark at=0,0

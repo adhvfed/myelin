@@ -1,0 +1,20 @@
+# @meaning Repository
+# @tags repo, repository, project, codebase
+documentsize 24x24
+defaults
+  fill none
+  stroke currentColor
+  stroke-width 2
+  stroke-linecap round
+  stroke-linejoin round
+shape body template=rectangle
+  round-corners 1
+place b1 shape=body at=5,3 size=14x18
+shape spine template=path
+  addpoint a at=9,3
+  addpoint b at=9,21
+place s1 shape=spine at=0,0
+shape mark template=path
+  addpoint a at=13,7
+  addpoint b at=16,7
+place m1 shape=mark at=0,0
