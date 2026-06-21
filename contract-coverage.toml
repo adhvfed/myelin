@@ -1133,6 +1133,15 @@ row = "13.3"
 # parser (parse.rs) over the ONE Predicate core. Knowledge PROVIDES the shared definitions;
 # Issues + Search CONSUME them byte-identically (each owns its executor; the shapes are
 # identical, X-3). The order_key/LexoRank half rides the same crate (field.rs) + its unit tests.
+#
+# P-236 (KN-P03): the order_key/LexoRank half is now a FULL provider+consumer CDC pair — the
+# frozen encoding (rank_first/rank_last/rank_between + the 2-char jitter + the 48-char rebalance +
+# the created_at+ULID tiebreak) + the SHARED X-3 conformance vector (authored once in
+# order_key.rs, replayed byte-identically by Knowledge here and by Issues at ISS-P02/P-241). The
+# X-3 anti-drift gate = 0 rank divergences across the shared vector.
 title = "myelin-query primitive (frozen byte-identical)"
 status = "covered"
-cdc = ["crates/myelin-query/tests/cdc_13_3_query_primitive.rs"]
+cdc = [
+    "crates/myelin-query/tests/cdc_13_3_query_primitive.rs",
+    "crates/myelin-query/tests/cdc_13_3_order_key.rs",
+]

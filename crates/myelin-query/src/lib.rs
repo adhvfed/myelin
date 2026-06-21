@@ -35,7 +35,17 @@
 //! ## The 13.3 freeze surface (engine + field-type + view-model + grammar — all now real)
 //! The predicate ENGINE (this module) is real ([`Predicate`]/[`Expr`]/[`CmpOp`]/[`QueryAst`],
 //! P-133); the **frozen `FieldType` enum + `FieldValue` + the `order_key`/LexoRank encoding (13.3,
-//! frozen X-3)** live in [`field`] (P-167, see the DEVIATION note there). **P-235 (KN-P02)** —
+//! frozen X-3)** live in [`field`] (P-167, see the DEVIATION note there). **P-236 (KN-P03)** freezes
+//! the order_key half end-to-end: the NAMED public operations
+//! [`OrderKey::rank_first`]/[`OrderKey::rank_last`]/[`OrderKey::rank_between`] over the midpoint
+//! bisection core, the 2-char concurrency-safety [`Jitter`], the 48-char rebalance trigger, the
+//! `created_at`+ULID [`order_key::tiebreak`], and — the X-3 anti-drift artifact — the single shared
+//! [`order_key::CONFORMANCE_VECTOR`] both co-owners (Knowledge here + Issues at ISS-P02/P-241) replay
+//! byte-identically (0 rank divergences). The rank-encoding module (the `OrderKey`/`midpoint` core in
+//! [`field`] plus [`order_key`]) is mandatory-core; its cargo-mutants mutation-score floor is
+//! **≥ 90% caught** — MEASURED at **52/52 viable mutants caught (100%, 0 missed; 14 unviable)** on
+//! the freeze (the conformance vector and the unit tests kill every midpoint/jitter/boundary/tiebreak
+//! mutant). **P-235 (KN-P02)** —
 //! this slice — lands the **last two halves of the 13.3 primitive**: the frozen [`view::ViewSpec`]
 //! view-model and the textual [`parse`] grammar front-end (`"status == 'open'"` → a validated
 //! [`Predicate`] tree). These EXTEND the one core in place — they add the view-model + the parser
@@ -53,8 +63,12 @@ use std::collections::BTreeMap;
 
 pub mod field;
 pub use field::{
-    FieldType, FieldValue, OrderKey, LEXORANK_ALPHABET, LEXORANK_REBALANCE_LEN,
+    FieldType, FieldValue, Jitter, OrderKey, LEXORANK_ALPHABET, LEXORANK_FIRST,
+    LEXORANK_JITTER_LEN, LEXORANK_REBALANCE_LEN,
 };
+
+pub mod order_key;
+pub use order_key::{tiebreak, ConformanceStep, RankOp, CONFORMANCE_VECTOR};
 
 pub mod view;
 pub use view::{FieldId, SortDir, SortSpec, ViewKind, ViewSpec};
