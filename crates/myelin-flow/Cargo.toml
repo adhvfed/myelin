@@ -59,6 +59,14 @@ myelin-substrate = { path = "../myelin-substrate" }
 myelin-events = { path = "../myelin-events" }
 # serde_json — the EventDraft payload is a serde_json::Value (the WfCtx emit surface consumes it).
 serde_json = { workspace = true }
+# The reserve/settle cost gate (contract 11.7 CONSUMED, storage.md §9): CostLedger / MinorUnits /
+# RunId / ReserveError / MeteredUnit / SettleOutcome — the durable per-tenant reserve/settle ledger
+# the BudgetGate bookend (src/budget.rs, P-FLOW-16) reserves-at-dispatch / settles-on-completion
+# against. myelin-flow is a TERMINAL DAG consumer (no production crate depends back on it), and
+# myelin-storage does NOT depend on myelin-flow, so this edge is acyclic. The storage default build
+# is DB-free (its Postgres backend is behind its own `integration` feature) — this dependency does
+# NOT pull a DB into `cargo build --workspace`.
+myelin-storage = { path = "../myelin-storage" }
 
 # REAL Postgres backend behind the `integration` feature (Stage 1 / infra). OPTIONAL deps pulled
 # ONLY by `--features integration`, which compiles the live-PG schema-apply + RLS denial +

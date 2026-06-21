@@ -298,6 +298,101 @@ impl WfCtx {
             WaitOutcome::TimedOut => Ok(JobOutcome::TimedOut),
         }
     }
+
+    /// **`metered_schedule_and_run_job(spec, runner, timeout, cost, units)` (contract 9.5/9.2/9.4,
+    /// §4.9) — the `SCHEDULE_AND_RUN_JOB` long-park FRONTED by the reserve/settle bookend (P-FLOW-16).**
+    /// The full step-1+4 §4.9 mechanic: **reserve `cost` minor-units at dispatch** (no balance → the
+    /// job is NEVER handed to the runner, the dispatch never starts), dispatch + park (the
+    /// [`WfCtx::schedule_and_run_job`] idiom), and **settle the actual `units` on the consumed
+    /// `job.done`** (refunding the over-reservation into the SAME wallet a synchronous activity meters
+    /// into). An in-flight job (dispatched, `Parked`/`TimedOut`) is NEVER interrupted — its reservation
+    /// stays in-flight across the park and settles only on a later drive's `Completed`.
+    ///
+    /// **The reserve fronts the dispatch (§4.9 step 1):** it is taken BEFORE the dispatch activity, so a
+    /// refused reserve (exhausted wallet) returns a loud [`WfError`] and the runner is never called. The
+    /// reserve is keyed on the deterministic dispatch-position ledger run-id
+    /// ([`WfCtx::dispatch_ledger_run`]) so a re-drive re-keys identically (the duplicate-reserve guard
+    /// makes the replay reserve a no-op — 0 double-debit).
+    ///
+    /// **Settle on completion only (§4.9 step 4):** on [`JobOutcome::Completed`] the bookend settles the
+    /// metered `units`. On [`JobOutcome::Parked`] / [`JobOutcome::TimedOut`] the reservation stays
+    /// **in-flight** (it is never torn down — the never-interrupt-in-flight invariant); a `Parked`
+    /// body returns promptly and the dispatcher re-drives it when `job.done` arrives, at which point the
+    /// re-driven call's `Completed` settles. A `TimedOut` runs the body's error branch (the body
+    /// settles/compensates the reservation itself, like a failed synchronous activity).
+    ///
+    /// An UN-METERED `WfCtx` (no [`WfCtx::with_budget`]) delegates to the plain
+    /// [`WfCtx::schedule_and_run_job`] (no reserve — the loop-cap depth is the runaway bound, AG-6).
+    pub fn metered_schedule_and_run_job<R>(
+        &mut self,
+        spec: JobSpec,
+        runner: &R,
+        timeout_secs: Option<i64>,
+        cost: myelin_storage::reserve_settle::MinorUnits,
+        units: Vec<myelin_storage::reserve_settle::MeteredUnit>,
+    ) -> WfResult<JobOutcome>
+    where
+        R: JobRunner,
+    {
+        // Un-metered: no bookend wired — the plain long-park (no reserve, AG-6 loop-cap is the bound).
+        let Some(gate) = self.budget().cloned() else {
+            return self.schedule_and_run_job(spec, runner, timeout_secs);
+        };
+
+        // The dispatch activity is the FIRST command of this idiom; its command_id is the next position.
+        // Reserve under the SAME deterministic ledger run-id the dispatch will occupy (so a re-drive
+        // re-keys identically — the duplicate guard makes the replay reserve a no-op).
+        let dispatch_command_id = self.peek_next_command_id();
+        let ledger_run = self.dispatch_ledger_run(&dispatch_command_id);
+        let tenant = self.tenant_id().clone();
+
+        // ── RESERVE-AT-DISPATCH (§4.9 step 1). No balance → no dispatch: the runner is never called.
+        // `fresh` is false on a re-drive (the duplicate guard caught an already-reserved dispatch):
+        // its begin already ran on the first drive, so we do NOT re-progress the ledger.
+        let fresh = match gate.reserve(&tenant, &ledger_run, cost) {
+            Ok(()) => {
+                // The reservation is in-flight from here — the job, once dispatched, is never
+                // interrupted; it settles on completion.
+                gate.begin(&tenant, &ledger_run).map_err(|e| {
+                    WfError::CoCommit(format!("schedule_and_run_job begin failed: {e}"))
+                })?;
+                true
+            }
+            Err(crate::budget::BudgetError::DuplicateReservation) => false,
+            Err(crate::budget::BudgetError::Refused {
+                requested,
+                available,
+            }) => {
+                // No balance → the job is NEVER handed to the runner (the dispatch never starts).
+                return Err(WfError::CoCommit(format!(
+                    "schedule_and_run_job refused at reserve: wallet exhausted (requested {} \
+                     minor-units, {} available) — the job was never dispatched (§4.9)",
+                    requested.0, available.0
+                )));
+            }
+            Err(other) => {
+                return Err(WfError::CoCommit(format!(
+                    "schedule_and_run_job reserve failed: {other}"
+                )));
+            }
+        };
+
+        // ── DISPATCH + PARK (the existing §4.9 idiom — composes activity/signal/timer primitives).
+        let outcome = self.schedule_and_run_job(spec, runner, timeout_secs)?;
+
+        // ── SETTLE-ON-COMPLETION (§4.9 step 4) — ONLY on a fresh-drive consumed job.done. A Parked /
+        // TimedOut leaves the reservation IN-FLIGHT (never interrupted): a re-drive that consumes
+        // job.done settles it; a TimedOut runs the body's error branch. A re-drive (`!fresh`) whose
+        // settle already ran does NOT re-settle (the replay is a pure short-circuit).
+        if fresh {
+            if let JobOutcome::Completed { .. } = &outcome {
+                gate.settle(&tenant, &ledger_run, &units).map_err(|e| {
+                    WfError::CoCommit(format!("schedule_and_run_job settle failed: {e}"))
+                })?;
+            }
+        }
+        Ok(outcome)
+    }
 }
 
 /// **The DETERMINISTIC `idem_token` a `SCHEDULE_AND_RUN_JOB` mints at dispatch (§4.9).** Derived

@@ -555,6 +555,21 @@ struct TelemetryInner {
     /// "an approval card / a long-park job has been waiting a long time" health signal (and the
     /// merge-queue / CI-stage backlog age, §5.4). 0 when no run is parked on a wait.
     oldest_unconsumed_wait_age_secs: u64,
+    /// **the reserve ATTEMPT counter (the §5.4 reserve/settle-reject-rate denominator — the bookend,
+    /// P-FLOW-16).** Total reserve-at-dispatch calls made by the bookend across the engine (a metered
+    /// activity OR a `SCHEDULE_AND_RUN_JOB` dispatch). Monotonic `+=`. The reject rate is
+    /// `reserve_rejected / reserve_attempted`.
+    reserve_attempted: u64,
+    /// **the reserve REJECT counter (the §5.4 reserve/settle-reject-rate numerator — the no-balance →
+    /// no-run self-limiter, P-FLOW-16).** Total reserve-at-dispatch calls REFUSED for insufficient
+    /// balance (the wallet was exhausted; the job/activity never started). Monotonic `+=`. The FLOW-D6
+    /// green artifact is this `> 0` (a depleting wallet refused new dispatches) paired with the
+    /// in-flight-interrupt counter staying `0`.
+    reserve_rejected: u64,
+    /// **the settle counter (the §5.4 reserve/settle telemetry — the bookend's completion leg,
+    /// P-FLOW-16).** Total settle-on-completion calls the bookend made (a metered activity completed,
+    /// a `job.done` consumed). Monotonic `+=`.
+    settled: u64,
 }
 
 impl FlowTelemetry {
@@ -708,6 +723,55 @@ impl FlowTelemetry {
     /// approval / long-park job has been outstanding (seconds). 0 when no run is parked on a wait.
     pub fn oldest_unconsumed_wait_age_secs(&self) -> u64 {
         self.lock().oldest_unconsumed_wait_age_secs
+    }
+
+    /// **Record one reserve-at-dispatch ATTEMPT (the §5.4 reserve/settle-reject-rate denominator —
+    /// the bookend, P-FLOW-16).** Called by [`crate::BudgetGate`] once per reserve, whether it admits
+    /// or refuses. Monotonic `+=`.
+    pub fn record_reserve_attempt(&self) {
+        self.lock().reserve_attempted += 1;
+    }
+
+    /// **Record one reserve REJECT (the §5.4 reject-rate numerator — the no-balance → no-run
+    /// self-limiter, P-FLOW-16).** Called by [`crate::BudgetGate`] when a reserve is refused for
+    /// insufficient balance (the dispatch never started). Monotonic `+=`. The FLOW-D6 green artifact
+    /// reads this `> 0`.
+    pub fn record_reserve_reject(&self) {
+        self.lock().reserve_rejected += 1;
+    }
+
+    /// **Record one settle-on-completion (the §5.4 reserve/settle telemetry, P-FLOW-16).** Called by
+    /// [`crate::BudgetGate`] when a metered activity / a consumed `job.done` settles. Monotonic `+=`.
+    pub fn record_settle(&self) {
+        self.lock().settled += 1;
+    }
+
+    /// Total reserve-at-dispatch attempts the bookend made (the reject-rate denominator, §5.4).
+    pub fn reserve_attempted(&self) -> u64 {
+        self.lock().reserve_attempted
+    }
+
+    /// Total reserve-at-dispatch calls REFUSED for insufficient balance (the §5.4 reject-rate
+    /// numerator — the no-balance → no-run self-limiter). The FLOW-D6 green artifact reads this `> 0`.
+    pub fn reserve_rejected(&self) -> u64 {
+        self.lock().reserve_rejected
+    }
+
+    /// Total settle-on-completion calls the bookend made (the §5.4 telemetry).
+    pub fn settled(&self) -> u64 {
+        self.lock().settled
+    }
+
+    /// **The reserve/settle REJECT RATE in basis points (`0..=10000` — the §5.4 telemetry the
+    /// metrics-health port reads, contract 1.8).** `10000 * reserve_rejected / reserve_attempted`.
+    /// `0` when no reserve has been attempted (no division by zero). A non-zero rate is the
+    /// "dispatches are being refused at reserve — a wallet is depleting" health signal; FLOW-D6's
+    /// green artifact pairs a `> 0` rate (refusals happened) with `inflight_interrupt_count == 0`.
+    pub fn reserve_reject_rate_bps(&self) -> u64 {
+        let t = self.lock();
+        (10_000 * t.reserve_rejected)
+            .checked_div(t.reserve_attempted)
+            .unwrap_or(0)
     }
 }
 

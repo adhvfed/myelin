@@ -2164,6 +2164,7 @@ dependencies = [
  "myelin-lints",
  "myelin-query",
  "myelin-refs",
+ "myelin-storage",
  "myelin-substrate",
  "myelin-tenancy",
  "serde_json",

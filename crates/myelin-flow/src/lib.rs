@@ -119,6 +119,7 @@
 
 pub mod app;
 pub mod approval;
+pub mod budget;
 pub mod engine;
 pub mod executor;
 pub mod holder;
@@ -158,6 +159,7 @@ pub use holder::{
 pub use job::{
     job_dispatch_marker, job_idem_token, JobKind, JobOutcome, JobRunner, JobSpec, JOB_DONE_SIGNAL,
 };
+pub use budget::{BudgetError, BudgetGate, BudgetSettle, Wallet};
 pub use wfctx::{
     attempt_state, history_kind, ActivityError, RetryPolicy, WaitOutcome, WfCtx, WfError, WfJournal,
     WfResult,
