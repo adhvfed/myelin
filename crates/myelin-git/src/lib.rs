@@ -12,6 +12,11 @@
 //!   GIT-P16 (`git.pr.*` / `git.review.*` / `git.comment.*`).
 //! - [`holder_intent`] + [`schema`] — **GIT-P3 / P-063**: the H1 holder INTENT + the
 //!   `#[personal_data(...)]` classification tags (see below).
+//! - [`subs`] — **GIT-P4 / P-230**: git's `#sub` mints registered with Refs (contract 5.7) — the
+//!   `comment-` / `thread-` / `L<a>-L<b>` kinds git owns are DECLARED to Refs ([`subs::register_git_sub_kinds`])
+//!   and minted as grammatical sub-URNs through the one Refs codec ([`subs::mint_pr_comment`] etc.).
+//!   The kind REGISTRATION + the grammatical mints ship; the per-kind resolvers are named follow-ons
+//!   (GIT-P18 comment/thread, GIT-P24 the L-range 4-state content-anchored resolver).
 //!
 //! **Owning architecture doc:**
 //! `planning/04-subsystem-architectures/git-hosting/architecture/00-overview.md` §1.1 (git OWNS
@@ -67,3 +72,4 @@ pub mod events;
 pub mod holder_intent;
 pub mod rebac_fragment;
 pub mod schema;
+pub mod subs;

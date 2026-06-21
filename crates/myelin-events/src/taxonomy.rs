@@ -50,8 +50,10 @@ pub const SUBSYSTEM_TOKENS: &[&str] =
 /// ranked `issue`-family type `myelin://<tenant>/issue/initiative/<id>`; no new subsystem token).
 /// This is the seed set the grammar admits; subsystems extend it under EB-24.
 pub const ARTIFACT_TYPE_TOKENS: &[&str] = &[
-    // git
-    "pr", "ref", "review", "comment", // ci
+    // git (EB-24: git's full canonical-root type list — `repo`/`commit`/`blob` complete the
+    // architecture §2 root table the #sub mints attach to: pr/comment+thread, blob/L<a>-L<b>,
+    // commit/review canonical roots; GIT-P4 / P-230)
+    "pr", "ref", "review", "comment", "repo", "commit", "blob", // ci
     "run", "check", "log", "artifact", // issue
     "issue", "initiative", // NEW type token (recon §2 / §6.2)
     "relation", // knowledge
