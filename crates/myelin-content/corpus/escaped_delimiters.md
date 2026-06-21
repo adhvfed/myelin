@@ -1,0 +1,1 @@
+a \* not a delim and \[not a link]
