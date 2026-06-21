@@ -89,6 +89,7 @@ pub mod hitl;
 pub mod hitl_batch;
 pub mod holder;
 pub mod identity;
+pub mod knowledge_tools;
 pub mod long_park;
 pub mod loop_guards;
 pub mod migrations;
@@ -96,6 +97,7 @@ pub mod mock;
 pub mod schema;
 pub mod skeleton;
 pub mod tool_scope;
+pub mod trace_seam;
 
 // Re-export the PersonalDataHolder registration seam (AG-P3 → P-132) at the crate root — the shape
 // the harness `serve` (AG-P4) + the DSR fan-out (AG-P23) + the 10.1 CDC consume (mirrors
@@ -207,6 +209,34 @@ pub use git_tools::{
     git_merge_required_caps, git_merge_tool_def, git_tool_defs, open_pr_required_caps,
     open_pr_tool_def, register_git_tools, GIT_MERGE_TOOL, GIT_SUBSYSTEM, GIT_TOOL_VERSION,
     OPEN_PR_TOOL,
+};
+
+// The per-producer KNOWLEDGE ToolDefs (AG-P19 → P-268, M3): publish + edit_confidential (the
+// consequential gates — gated by the frozen §6.3 default, withhold at EffectApi step 6 → Gated until
+// the HITL resume) + draft + comment (reversible, NOT gated — apply directly). Registered into the
+// ONE ToolSurface (8.1 / §6.1) with their required_caps sourced from the FROZEN KN ReBAC carrier
+// (4.9: page.publish / page.edit / page.draft / page.comment from myelin_content::rebac_fragment) and
+// their requires_approval SEEDED from the frozen defaults (AG-P8), guarded by the VISION §3
+// no-silent-loosening ratchet. NO new engine — a ToolDef is a row in the existing registry; the
+// routing/gating/HITL are the existing plan-then-apply pipeline (the same registration pattern as the
+// Git producer tools, AG-P18 — the compounding-payoff reuse).
+pub use knowledge_tools::{
+    comment_required_caps, comment_tool_def, draft_required_caps, draft_tool_def,
+    edit_confidential_required_caps, edit_confidential_tool_def, knowledge_tool_defs, publish_required_caps,
+    publish_tool_def, register_knowledge_tools, COMMENT_TOOL, DRAFT_TOOL, EDIT_CONFIDENTIAL_TOOL,
+    KNOWLEDGE_SUBSYSTEM, KNOWLEDGE_TOOL_VERSION, PUBLISH_TOOL,
+};
+
+// The agent-trace HOLDER seam (AG-P19 → P-268, M3, AG-7 / contract 8.8): the execution trace is a
+// CONTENT-ADDRESSED Knowledge document reusing the frozen myelin-content 13.1 block model;
+// run.trace_ref resolves to its blake3:<hex> content address; the holder registers as the erasable
+// H17 PersonalDataHolder (crate::holder::AgentTraceHolder), DISTINCT from the audit log. The Fabric
+// owns the SEAM (build the 13.1 document + content-address it + resolve run.trace_ref); Knowledge owns
+// the live holder body (the content-addressed write/erase against the real store). FLOOR named in
+// STATELESS_EXCEPT_TRACE_FLOOR: v1 agents are stateless across runs EXCEPT for this trace document;
+// long-term memory / RAG is post-M5 (AG-P25); the full DSR fan-out over the trace is AG-P23 (→ P-479).
+pub use trace_seam::{
+    is_content_addressed_kn_document, trace_ref_of, TraceDocument, STATELESS_EXCEPT_TRACE_FLOOR,
 };
 
 // The run --dry-run lever (AG-P8 → P-220, contract 8.7): the side-effect-free planner (steps 1..6,

@@ -51,6 +51,12 @@ pub mod corpus;
 /// grammar.
 pub mod events;
 pub mod inline;
+/// Knowledge's names-only **write-side** ReBAC carrier (contract 4.9; AG-P19 → P-268) — the frozen
+/// `page.publish` / `page.edit` / `page.draft` / `page.comment` producer-tool cap vocabulary the
+/// Agent-Fabric's KN ToolDefs source their `required_caps` from (one source of truth, mirroring
+/// `myelin_git::rebac_fragment`). The read-side rich fragment is the engine's
+/// (`myelin_identity_service::knowledge_fragment`).
+pub mod rebac_fragment;
 /// Knowledge's per-owner reindex-from-source `replay` body (contract 2.6, EB-26 / P-246, M3) —
 /// page-subtree at BLOCK granularity. Fills the per-owner `replay` floor named in
 /// `myelin_events::reindex`.

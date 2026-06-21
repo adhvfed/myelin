@@ -79,6 +79,12 @@ myelin-git = { path = "../myelin-git" }
 # `ArtifactRef`); serde_json builds the `EventDraft.payload` value (it was a dev-dep for AG-P2's
 # round-trip test; the SKELETON's emit needs it at lib scope).
 serde_json.workspace = true
+# AG-P19 (→ P-268) — the agent-trace HOLDER seam (8.8): the execution trace is a CONTENT-ADDRESSED
+# Knowledge document reusing the frozen `myelin-content` 13.1 block model; `run.trace_ref` resolves to
+# its content hash. blake3 + hex compute the ONE platform multihash convention `blake3:<hex>` over the
+# canonical serialized trace document (the SAME convention the GDPR Receipt + BlobStore use).
+blake3.workspace = true
+hex.workspace = true
 
 # REAL Postgres backend behind the `integration` feature (Stage 1 / infra). OPTIONAL deps: the
 # DEFAULT `cargo build --workspace` stays DB-free (the binding policy floor — no DB at build). They
