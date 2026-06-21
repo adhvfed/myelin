@@ -30,4 +30,22 @@ publish = false
 # in the production DAG depends back on `myelin-chat` (the §2.9 graph stays acyclic —
 # `substrate_is_root()` / `identity_is_sink()` are unaffected).
 myelin-events = { path = "../myelin-events" }
+# CHAT-P2 (P-244): the frozen names-only ReBAC namespace-fragment ABI carrier
+# (`myelin_identity::NamespaceFragment`) chat declares its `channel`/`message` fragment in (contract
+# 4.9). A consumer LEAF depending on the identity GLUE crate (NOT the service) keeps the §2.9 DAG
+# acyclic — `substrate_is_root()` / `identity_is_sink()` are unaffected.
+myelin-identity = { path = "../myelin-identity" }
+# CHAT-P2 (P-244): the one Refs `#sub` grammar + the `mint`/`SubKindRegistration` codec chat
+# registers its `message-`/`thread-` mints with (contract 5.7). Refs owns the grammar; chat mints.
+myelin-refs = { path = "../myelin-refs" }
 serde.workspace = true
+
+[dev-dependencies]
+# The Identity namespace ENGINE — the CDC for contract 4.9 admits chat's RICH fragment (the
+# `+ parent_project->read` TTU, the `& parent_project->admin` intersection) into the real cell schema
+# to PROVE the frozen names-only carrier is admissible. A DEV-only edge (the runtime fragment chat
+# ships is the names-only carrier `myelin_identity::NamespaceFragment`; the rich form is exercised
+# only by the CDC test), so the production DAG stays acyclic.
+myelin-identity-service = { path = "../myelin-identity-service" }
+myelin-storage = { path = "../myelin-storage" }
+myelin-tenancy = { path = "../myelin-tenancy" }

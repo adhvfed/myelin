@@ -58,7 +58,12 @@ pub const ARTIFACT_TYPE_TOKENS: &[&str] = &[
     "issue", "initiative", // NEW type token (recon §2 / §6.2)
     "relation", // knowledge
     "page", "doc", "row", // chat
-    "message", "read_state", // identity
+    // chat's three canonical-root type tokens (architecture chat §2:
+    // `myelin://<tenant>/chat/{channel|message|thread}/<id>`). `message` was already present (it
+    // is also an identity type); `channel`/`thread` are added here so chat's `#sub` mints
+    // (`message-`/`thread-`) attach to a parsing URN root (CHAT-P2 / P-244, mirroring git's
+    // EB-24 `repo`/`commit`/`blob` extension for the same reason).
+    "channel", "message", "thread", "read_state", // identity
     "permission", "member", // refs
     "edge",
 ];

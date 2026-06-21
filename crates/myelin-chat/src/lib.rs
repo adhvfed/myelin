@@ -9,8 +9,17 @@
 //!
 //! - [`events`] — **CHAT-P1 / P-128**: the complete `chat.*` event-token registration (contract
 //!   2.9) split into the **durable-via-outbox** set vs the **firehose-only** set — chat COMPLETES
-//!   its dotted-name list, each token validated against the one Bus grammar. The ReBAC fragment +
-//!   `#sub` grammar are CHAT-P2; the humanise/notif/fanout slice is CHAT-P3.
+//!   its dotted-name list, each token validated against the one Bus grammar.
+//! - [`rebac_fragment`] — **CHAT-P2 / P-244**: the FROZEN Chat ReBAC namespace fragment (contract
+//!   4.9) — the `channel` + `message` definitions (`channel.read = member + parent_project->read`,
+//!   the `watcher` Notif read-fanout relation), the names-only [`myelin_identity::NamespaceFragment`]
+//!   carriers Identity admits into the one cell schema. The runtime membership tuple writes are the
+//!   CHAT-P8 floor.
+//! - [`subs`] — **CHAT-P2 / P-244**: chat's `#sub` mints registered with Refs (contract 5.7) — the
+//!   frozen `message-`/`thread-` grammar + the grammatical mint codecs. The runtime mint SITE
+//!   (co-committed with the outbox event) is the CHAT-P6 floor.
+//!
+//! The humanise/notif/fanout slice is CHAT-P3.
 //!
 //! **Owning architecture doc:**
 //! `planning/04-subsystem-architectures/chat/architecture/03-events-contracts-and-glue.md` §1 (the
@@ -58,3 +67,5 @@
 #![forbid(unsafe_code)]
 
 pub mod events;
+pub mod rebac_fragment;
+pub mod subs;
