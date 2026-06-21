@@ -1192,9 +1192,19 @@ landing = "P-025"
 
 [[contract]]
 row = "12.2"
-title = "discover(slug|tenant_id)"
-status = "deferred"
-landing = "P-081"
+title = "discover(slug|tenant_id) + placement_of(repo) repo-grain (C-1)"
+# COVERED: the tenant-grain `discover` half landed P-081; the repo-grain `placement_of(repo) ->
+# {cell_id, group, region, status}` half (C-1: region-pinned, relocatable, NEVER node-pinned) lands
+# P-250 (P-CP-15) in myelin-control-plane (src/placement_of_repo.rs). The CDC pair below proves the
+# PROVIDER (control-plane `placement_of_repo` + the repo-grain gateway `route_repo`) feeds the
+# CONSUMER (the git wire, `git@<cell-endpoint>:tenant/repo.git`, §7.3) WITHOUT a shared type (the DAG
+# forbids a myelin-control-plane -> myelin-git edge; the git-wire consumer is modelled in-test over
+# the public provider surface, documented deviation EI-01 §1). The GIT residency leg drill
+# (repo-grain misroute -> 0 cross-tenant + relocation redirect + cross-region-relocation reject) is
+# the dated green artifact. The relocation BYTE-MOVE mechanism is the M5 floor P-CP-22; this row is
+# the live routing ANSWER + the redirect-on-relocation PROPERTY.
+status = "covered"
+cdc = ["crates/myelin-control-plane/tests/cdc_12_2_repo_grain_git_wire.rs"]
 
 [[contract]]
 row = "12.3"

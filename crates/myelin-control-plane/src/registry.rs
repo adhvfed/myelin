@@ -118,6 +118,12 @@ pub struct Registry {
     /// The per-cell `local_tenant` directory, keyed by `cell_id` then `tenant_id`. Each cell's
     /// directory maps the tenants IT homes (the cell-local mirror of the global placement record).
     local_tenants: BTreeMap<String, BTreeMap<String, LocalTenant>>,
+    /// **The `repo_placement` table (architecture §5.2, C-1; P-CP-15/P-250).** The repo-grain placement
+    /// facts, keyed by the repo's opaque `ArtifactRef` string. Each row stores the repo's stored
+    /// `{cell_id, group}` (region-pinned + relocatable, NEVER node-pinned — the cell is a stored fact,
+    /// not a node hash). The repo's region + status are NOT stored here — they derive from the repo's
+    /// tenant placement (so the residency pin cannot drift). See [`crate::placement_of_repo`].
+    pub(crate) repo_placements: BTreeMap<String, crate::placement_of_repo::RepoPlacementRow>,
 }
 
 impl Registry {

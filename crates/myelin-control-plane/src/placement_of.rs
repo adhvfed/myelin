@@ -235,6 +235,13 @@ impl MisrouteAudit {
         self.records.lock().unwrap_or_else(|e| e.into_inner()).push(rec);
     }
 
+    /// **Record a rejected misroute from the repo-grain path** ([`crate::placement_of_repo`]) — the
+    /// repo-grain gateway shares the SAME PII-free audit sink + record shape as the tenant-grain path
+    /// (one audit consumer reads one shape, P-GA-19). A crate-internal seam over [`Self::record`].
+    pub(crate) fn record_misroute(&self, rec: MisrouteAuditRecord) {
+        self.record(rec);
+    }
+
     /// Every audited misroute so far (so a drill/test can assert the rejection was audited).
     pub fn records(&self) -> Vec<MisrouteAuditRecord> {
         self.records.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -319,6 +326,13 @@ impl CellGateway {
     /// regression lands (mirrors `topology::PublicSurface::misroute_count`).
     pub fn cross_tenant_reads(&self) -> u64 {
         self.cross_tenant_reads.load(Ordering::SeqCst)
+    }
+
+    /// **Bump the `misroute_count` signal** (a crate-internal seam the repo-grain path
+    /// [`crate::placement_of_repo::CellGateway::route_repo`] shares — one `misroute_count` telemetry
+    /// signal across tenant- + repo-grain misroutes).
+    pub(crate) fn bump_misroute_count(&self) {
+        self.misroute_count.fetch_add(1, Ordering::SeqCst);
     }
 
     /// **`route(registry, tenant_id) → Ok(PlacementOf) | Err(GatewayReject)` (architecture §5.3 layer
