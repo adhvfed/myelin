@@ -84,6 +84,7 @@ pub mod dry_run;
 pub mod effect_api;
 pub mod escape_gate;
 pub mod exec;
+pub mod git_tools;
 pub mod hitl;
 pub mod hitl_batch;
 pub mod holder;
@@ -192,6 +193,20 @@ pub use escape_gate::{AgentExecGate, GateRefusal, ProductionBackendId};
 pub use defaults::{
     assert_no_silent_loosening, default_for_tool, requires_approval_default,
     requires_approval_for_landing, seed_requires_approval, LooseningViolation, WrittenDeviation,
+};
+
+// The per-producer GIT ToolDefs (AG-P18 → P-267, M3): git.merge (the consequential gate, gated by
+// the frozen §6.3 default — withholds at EffectApi step 6 → Gated until the HITL resume) + open_pr
+// (reversible, NOT gated — applies directly). Registered into the ONE ToolSurface (8.1 / §6.1) with
+// their required_caps sourced from the FROZEN Git ReBAC fragment (4.9: pull_request.merge / repo.push)
+// and their requires_approval SEEDED from the frozen defaults (AG-P8), guarded by the VISION §3
+// no-silent-loosening ratchet. NO new engine — a ToolDef is a row in the existing registry; the
+// routing/gating/HITL are the existing plan-then-apply pipeline. The KNOWLEDGE producer ToolDefs +
+// the agent-trace holder seam (KN-D11/KN-D12) are AG-P19 (→ P-268) and reuse THIS registration pattern.
+pub use git_tools::{
+    git_merge_required_caps, git_merge_tool_def, git_tool_defs, open_pr_required_caps,
+    open_pr_tool_def, register_git_tools, GIT_MERGE_TOOL, GIT_SUBSYSTEM, GIT_TOOL_VERSION,
+    OPEN_PR_TOOL,
 };
 
 // The run --dry-run lever (AG-P8 → P-220, contract 8.7): the side-effect-free planner (steps 1..6,
