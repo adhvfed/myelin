@@ -121,6 +121,19 @@ fn attestation_dir() -> PathBuf {
 #[test]
 fn ag_d4_ci_t1_hard_escape_gate_zero_escapes_on_a_real_kernel() {
     if !preconditions() {
+        // The band-boundary scorecard (the M2 exit gate) sets `MYELIN_REQUIRE_KVM=1` for THIS row,
+        // because a graceful skip would be a VACUOUS green — the gate must only read green when a
+        // real microVM actually boots and attests zero escapes (EI-04 §5.1: a property not drilled
+        // on a real kernel is a CLAIM, not a fact). With the env set, an absent /dev/kvm /
+        // firecracker / staged-assets is a HARD FAILURE (panic), never a skip.
+        if std::env::var("MYELIN_REQUIRE_KVM").as_deref() == Ok("1") {
+            panic!(
+                "[AG-D4 escape drill] MYELIN_REQUIRE_KVM=1 but the host cannot boot a real microVM \
+                 (/dev/kvm absent, `firecracker` not on PATH, or the staged guest assets missing). \
+                 The M2 exit gate refuses a VACUOUS green: this row is RED until the drill really \
+                 boots a microVM on KVM-capable hardware and attests zero escapes."
+            );
+        }
         // GRACEFUL SKIP (not a failure) — CI without KVM/firecracker/assets still passes. On this
         // host (real silicon) the preconditions hold and the drill REALLY runs.
         eprintln!(
