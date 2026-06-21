@@ -405,6 +405,50 @@ pub fn boot_and_capture(cfg_path: &PathBuf) -> Result<(i32, String), String> {
     Ok((output.status.code().unwrap_or(-1), console))
 }
 
+/// Build the Firecracker `--config-file` JSON for the **AG-D4 escape drill** (CI-P5 → P-239): the
+/// SAME staged kernel + read-only squashfs rootfs the hardened-boot self-test boots, plus a SECOND
+/// read-only virtio drive (`/dev/vdb`) carrying the adversarial corpus script, booted as PID1 bash
+/// via `init=/bin/bash /dev/vdb`. The corpus prints per-attack CONTAINED/ESCAPED markers to the
+/// serial console (`ttyS0`), which [`boot_and_capture`] captures for the host-side parser.
+///
+/// This REUSES the production Firecracker launch recipe (the same `vmlinux` + squashfs assets, the
+/// same read-only-root cmdline base, the same no-NIC fully-default-deny posture — there is no
+/// `network-interfaces` key) — it does not fork the backend. `script_drive_path` is the host path to
+/// the (block-boundary-padded) corpus script; `vcpu`/`mem_mib` size the guest.
+pub fn drill_config_json(script_drive_path: &std::path::Path, vcpu: u32, mem_mib: u32) -> String {
+    // The corpus runs as PID1 bash reading the script from the second virtio drive (/dev/vdb).
+    // root=/dev/vda ro keeps the rootfs READ-ONLY (the read-only-root posture, enforced at the
+    // kernel cmdline); no `network-interfaces` key ⇒ NO NIC ⇒ egress closed at the device level.
+    let boot_args = format!("{BOOT_ARGS_BASE} init=/bin/bash /dev/vdb");
+    format!(
+        "{{\n  \"boot-source\": {{\n    \"kernel_image_path\": {kernel:?},\n    \
+         \"boot_args\": {args:?}\n  }},\n  \"drives\": [\n    {{\n      \
+         \"drive_id\": \"rootfs\",\n      \"path_on_host\": {root:?},\n      \
+         \"is_root_device\": true,\n      \"is_read_only\": true\n    }},\n    {{\n      \
+         \"drive_id\": \"script\",\n      \"path_on_host\": {script:?},\n      \
+         \"is_root_device\": false,\n      \"is_read_only\": true\n    }}\n  ],\n  \
+         \"machine-config\": {{\n    \"vcpu_count\": {vcpu},\n    \"mem_size_mib\": {mem}\n  }}\n}}",
+        kernel = default_kernel().to_string_lossy(),
+        args = boot_args,
+        root = default_rootfs().to_string_lossy(),
+        script = script_drive_path.to_string_lossy(),
+        vcpu = vcpu,
+        mem = mem_mib,
+    )
+}
+
+/// The resolved staged kernel path (env override → `~/.local/share/firecracker-assets/vmlinux-…`).
+/// Public so the escape drill can sha256 the kernel image for the attestation.
+pub fn resolved_kernel_path() -> PathBuf {
+    default_kernel()
+}
+
+/// The resolved staged rootfs path. Public so the escape drill can sha256 the rootfs image for the
+/// attestation (the "image digest" re-run-on-every-image-change field).
+pub fn resolved_rootfs_path() -> PathBuf {
+    default_rootfs()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
