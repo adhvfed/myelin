@@ -1,3 +1,5 @@
+# @meaning Priority marker (bars)
+# @tags priority, bars, importance, rank
 documentsize 24x24
 defaults
   fill none

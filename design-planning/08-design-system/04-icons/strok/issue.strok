@@ -1,3 +1,5 @@
+# @meaning Issue / work item
+# @tags issue, work, item, ticket
 documentsize 24x24
 defaults
   fill none

@@ -1,3 +1,5 @@
+# @meaning Approve a proposed effect — bare check (HITL action)
+# @tags approve, accept, confirm, check, hitl
 documentsize 24x24
 defaults
   fill none

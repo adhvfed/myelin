@@ -1,3 +1,5 @@
+# @meaning Open in full / navigate away (arrow up-right)
+# @tags external-link, open, navigate, new-tab, arrow
 documentsize 24x24
 defaults
   fill none

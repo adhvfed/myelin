@@ -14,7 +14,9 @@
 | `strok/<name>.strok` | **Source of truth** — one `.strok` per icon. Edit these. |
 | `svg/<name>.svg` | **Shipped artifact** — themeable SVG with `stroke="currentColor"` (native; the app imports these). |
 | `preview/<name>.png` | PNG preview (render-loop output / styleguide swatch). Generated. |
-| `build.sh` | Wraps `strok batch`: exports themeable SVGs (currentColor) + inked PNG previews. |
+| `dist/sprite.svg` | **`<symbol>` sprite sheet** (currentColor preserved) — host with `<use href="sprite.svg#name"/>`. Generated. |
+| `dist/manifest.json` | **Icon registry** — `name → meaning / tags / canvas / sizes`, from the `# @meaning` / `# @tags` header comments in each `.strok`. Generated. |
+| `build.sh` | Wraps `strok batch`: exports themeable SVGs (currentColor) + inked PNG previews + `dist/` sprite & manifest. |
 | `icons-index.html` | Live contact sheet — renders every shipped SVG, proves `currentColor` inheritance and recolor. |
 
 **SVGs and PNGs are generated. Never hand-edit them — edit the `.strok` and re-run `build.sh`.**
@@ -128,7 +130,24 @@ ensure it's on `PATH`). It:
 1. `strok batch strok --svg --out svg` → `svg/<name>.svg` with `stroke="currentColor"` preserved (the
    shipped files; no post-processing),
 2. `strok batch strok --png --color '#1a1a1a' --sizes 64 --out preview` → `preview/<name>.png`,
-3. fails loudly if any shipped SVG lacks `currentColor` or contains a baked hex color.
+3. `strok batch strok --sprite dist/sprite.svg --manifest dist/manifest.json` → the design-system
+   outputs (see below), generated from the same parsed set so they never drift,
+4. fails loudly if any shipped SVG lacks `currentColor` or contains a baked hex color.
+
+### Design-system outputs (`dist/`)
+
+`build.sh` also emits, from the *same* `strok batch` parse:
+
+- **`dist/sprite.svg`** — one `<symbol id="<name>">` per icon, `currentColor` preserved. Hosts
+  reference a glyph with `<svg><use href="sprite.svg#commit"/></svg>` (no per-icon `<img>`/fetch).
+  One sprite serves every theme/size — recolor via the host's CSS `color`, size via `width`/`height`.
+- **`dist/manifest.json`** — the machine-readable registry:
+  `{ "version": 1, "count": 42, "icons": [ { "name", "meaning", "tags", "canvas", "sizes" } ] }`.
+  `meaning` + `tags` come from **leading `# @meaning …` / `# @tags a, b` header comments** in each
+  `.strok` (the §2 registry, authored into the source). Use it to drive icon pickers / search.
+
+Both are pure generated artifacts — never hand-edit; edit the `.strok` (incl. its `# @meaning` /
+`# @tags` header) and re-run `build.sh`.
 
 > Historical note: earlier passes used a `$ink` sentinel-hex + `sed` swap because the *installed*
 > binary predated `currentColor` support. That workaround is gone — the sources now use native
@@ -168,7 +187,9 @@ It renders whatever `.strok` files exist (no hardcoded names) and is **idempoten
    `fill none`, `stroke currentColor`, `stroke-width 2`, round caps/joins). Or copy an existing icon
    as a template. No palette/sentinel — paint is the literal `currentColor`.
 2. Use **kebab-case, meaning-named, subsystem-agnostic** filenames (`pull-request`, not `pr-header-icon`).
-   The filename is the contract key — add the row to the §2 registry too.
+   The filename is the contract key — add the row to the §2 registry too. Prepend a
+   `# @meaning …` + `# @tags a, b, c` header (mirrors the §2 row) so the icon lands in
+   `dist/manifest.json` with its meaning + search tags.
 3. Build geometry **inside the 2,2 → 22,22 live area**. Reuse the family vocabulary (⌀6 node, ⌀4 dot, the
    status ring for CI verdicts only, one arrowhead size). Snap to the pixel grid.
 4. `strok -f strok/<name>.strok render --out preview/<name>.png` and **look at it** at 16px too — iterate.

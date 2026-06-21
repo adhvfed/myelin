@@ -1,3 +1,5 @@
+# @meaning Sub-issue / child
+# @tags sub-issue, child, subtask, nested
 documentsize 24x24
 defaults
   fill none

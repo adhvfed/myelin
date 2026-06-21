@@ -1,3 +1,5 @@
+# @meaning Doc / page — the named glyph
+# @tags doc, page, document, article
 documentsize 24x24
 defaults
   fill none

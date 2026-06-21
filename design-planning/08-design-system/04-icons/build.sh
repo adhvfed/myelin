@@ -4,6 +4,8 @@
 #
 #   svg/<name>.svg      themeable SVG, stroke="currentColor" preserved (shipped file)
 #   preview/<name>.png  raster preview at 64px, inked for visual review
+#   dist/sprite.svg     <symbol> sprite sheet (host: <use href="sprite.svg#name"/>)
+#   dist/manifest.json  registry: name -> meaning/tags/canvas/sizes (from `# @meaning`/`# @tags`)
 #
 # Uses `strok batch` (the icon-set export path): the .strok sources author colour as
 # the literal `currentColor` (icon profile), so the exported SVG inherits the host
@@ -21,6 +23,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STROK_DIR="$ROOT/strok"
 SVG_DIR="$ROOT/svg"
 PREVIEW_DIR="$ROOT/preview"
+DIST_DIR="$ROOT/dist"
+SPRITE="$DIST_DIR/sprite.svg"
+MANIFEST="$DIST_DIR/manifest.json"
 INK="#1a1a1a"   # preview ink (SVGs stay currentColor; this only colours the PNGs)
 
 if ! command -v strok >/dev/null 2>&1; then
@@ -30,13 +35,20 @@ if ! strok batch --help >/dev/null 2>&1; then
   echo "error: this strok build lacks 'batch' — rebuild/reinstall strok (cargo install --path strok-cli --force)" >&2; exit 1
 fi
 
-mkdir -p "$SVG_DIR" "$PREVIEW_DIR"
+mkdir -p "$SVG_DIR" "$PREVIEW_DIR" "$DIST_DIR"
 
 # Themeable SVGs (currentColor preserved).
 strok batch "$STROK_DIR" --svg --out "$SVG_DIR" >/dev/null
 
 # 64px inked PNG previews (single size -> <name>.png).
 strok batch "$STROK_DIR" --png --color "$INK" --sizes 64 --out "$PREVIEW_DIR" >/dev/null
+
+# Design-system outputs, driven off the same parsed set so they never drift:
+#   dist/sprite.svg    — <symbol> sprite (currentColor kept) for <use href="sprite.svg#name"/>
+#   dist/manifest.json — name -> meaning/tags/canvas/sizes registry (from `# @meaning`/`# @tags`)
+strok batch "$STROK_DIR" --svg --out "$DIST_DIR/.svgtmp" \
+  --sprite "$SPRITE" --manifest "$MANIFEST" >/dev/null
+rm -rf "$DIST_DIR/.svgtmp"
 
 # Verify every shipped SVG inherits currentColor and carries no baked hex.
 missing="$(grep -L 'currentColor' "$SVG_DIR"/*.svg || true)"

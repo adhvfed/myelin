@@ -1,3 +1,5 @@
+# @meaning Re-run a check / job (circular arrow)
+# @tags ci, rerun, retry, refresh, circular-arrow
 documentsize 24x24
 defaults
   fill none
@@ -7,10 +9,10 @@ defaults
   stroke-linejoin round
 shape arc template=path
   addpoint a at=15,4.5
-  addpoint b at=20,12 mode=arc rx=8 ry=8
-  addpoint c at=12,20 mode=arc rx=8 ry=8
-  addpoint d at=4,12 mode=arc rx=8 ry=8
-  addpoint e at=10,5 mode=arc rx=8 ry=8
+  addpoint b at=20,12 mode=arc rx=8 ry=8 bulge=right
+  addpoint c at=12,20 mode=arc rx=8 ry=8 bulge=right
+  addpoint d at=4,12 mode=arc rx=8 ry=8 bulge=right
+  addpoint e at=10,5 mode=arc rx=8 ry=8 bulge=right
 place a1 shape=arc at=0,0
 shape arrowhead template=path
   addpoint a at=19,6

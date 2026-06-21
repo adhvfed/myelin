@@ -1,3 +1,5 @@
+# @meaning Cycle / sprint (loop + arrowhead)
+# @tags cycle, sprint, loop, iteration
 documentsize 24x24
 defaults
   fill none
@@ -7,10 +9,10 @@ defaults
   stroke-linejoin round
 shape ring template=path
   addpoint a at=14,4.5
-  addpoint b at=20,12 mode=arc rx=8 ry=8
-  addpoint c at=12,20 mode=arc rx=8 ry=8
-  addpoint d at=4,12 mode=arc rx=8 ry=8
-  addpoint e at=9,5 mode=arc rx=8 ry=8
+  addpoint b at=20,12 mode=arc rx=8 ry=8 bulge=right
+  addpoint c at=12,20 mode=arc rx=8 ry=8 bulge=right
+  addpoint d at=4,12 mode=arc rx=8 ry=8 bulge=right
+  addpoint e at=9,5 mode=arc rx=8 ry=8 bulge=right
 place r1 shape=ring at=0,0
 shape arrowhead template=path
   addpoint a at=5,6

@@ -1,3 +1,5 @@
+# @meaning Message / comment (single bubble)
+# @tags message, comment, bubble, chat
 documentsize 24x24
 defaults
   fill none

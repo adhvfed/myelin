@@ -1,3 +1,5 @@
+# @meaning File
+# @tags file, document, page
 documentsize 24x24
 defaults
   fill none

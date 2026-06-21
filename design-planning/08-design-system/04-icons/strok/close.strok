@@ -1,3 +1,5 @@
+# @meaning Dismiss / remove — bare cross (chip/dialog corner)
+# @tags close, dismiss, remove, cross, cancel
 documentsize 24x24
 defaults
   fill none

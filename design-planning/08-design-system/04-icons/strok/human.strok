@@ -1,3 +1,5 @@
+# @meaning Human principal / avatar fallback
+# @tags human, user, person, avatar, principal
 documentsize 24x24
 defaults
   fill none

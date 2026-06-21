@@ -1,3 +1,5 @@
+# @meaning HITL gate / awaiting approval (lock)
+# @tags gate, lock, hitl, approval, secure
 documentsize 24x24
 defaults
   fill none

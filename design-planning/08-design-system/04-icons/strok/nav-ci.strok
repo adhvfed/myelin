@@ -1,3 +1,5 @@
+# @meaning CI subsystem (circle + play)
+# @tags nav, ci, build, pipeline, subsystem
 documentsize 24x24
 defaults
   fill none

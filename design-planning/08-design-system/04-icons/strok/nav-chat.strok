@@ -1,3 +1,5 @@
+# @meaning Chat subsystem (stacked bubbles)
+# @tags nav, chat, messages, conversation, subsystem
 documentsize 24x24
 defaults
   fill none
