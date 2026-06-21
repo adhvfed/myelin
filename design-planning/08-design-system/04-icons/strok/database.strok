@@ -1,0 +1,25 @@
+# @meaning Database view (cylinder)
+# @tags database, cylinder, data, store, db
+documentsize 24x24
+defaults
+  fill none
+  stroke currentColor
+  stroke-width 2
+  stroke-linecap round
+  stroke-linejoin round
+shape top template=ellipse
+place t1 shape=top at=5,4 size=14x5
+shape sides template=path
+  addpoint a at=19,6.5
+  addpoint b at=19,17.5
+  addpoint c at=5,17.5 mode=arc rx=7 ry=2.5 bulge=right
+  addpoint d at=5,6.5
+place s1 shape=sides at=0,0
+shape band1 template=path
+  addpoint a at=19,10.5
+  addpoint b at=5,10.5 mode=arc rx=7 ry=2.5 bulge=right
+place bd1 shape=band1 at=0,0
+shape band2 template=path
+  addpoint a at=19,14
+  addpoint b at=5,14 mode=arc rx=7 ry=2.5 bulge=right
+place bd2 shape=band2 at=0,0

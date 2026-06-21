@@ -1,0 +1,21 @@
+# @meaning Edit a proposed effect / edit affordance (pencil)
+# @tags edit, pencil, modify, write
+documentsize 24x24
+defaults
+  fill none
+  stroke currentColor
+  stroke-width 2
+  stroke-linecap round
+  stroke-linejoin round
+shape body template=path
+  addpoint a at=15,5
+  addpoint b at=19,9
+  addpoint c at=9,19
+  addpoint d at=5,19
+  addpoint e at=5,15
+  close
+place b1 shape=body at=0,0
+shape tip template=path
+  addpoint a at=13,7
+  addpoint b at=17,11
+place t1 shape=tip at=0,0

@@ -1,0 +1,20 @@
+# @meaning Git tag / release
+# @tags git, tag, release, label, version
+documentsize 24x24
+defaults
+  fill none
+  stroke currentColor
+  stroke-width 2
+  stroke-linecap round
+  stroke-linejoin round
+shape body template=path
+  addpoint a at=4,11
+  addpoint b at=11,4
+  addpoint c at=20,4
+  addpoint d at=20,13
+  addpoint e at=13,20
+  close
+  round-corners 1
+place b1 shape=body at=0,0
+shape hole template=ellipse
+place h1 shape=hole at=14,7 size=3x3

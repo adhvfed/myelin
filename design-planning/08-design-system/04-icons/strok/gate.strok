@@ -1,0 +1,18 @@
+# @meaning HITL gate / awaiting approval (lock)
+# @tags gate, lock, hitl, approval, secure
+documentsize 24x24
+defaults
+  fill none
+  stroke currentColor
+  stroke-width 2
+  stroke-linecap round
+  stroke-linejoin round
+shape body template=rectangle
+  round-corners 2
+place b1 shape=body at=5,11 size=14x9
+shape shackle template=path
+  addpoint a at=8,11
+  addpoint b at=8,9
+  addpoint c at=16,9 mode=arc rx=4 ry=4
+  addpoint d at=16,11
+place s1 shape=shackle at=0,0

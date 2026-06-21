@@ -1,0 +1,19 @@
+# @meaning Commit (node on a rail)
+# @tags git, commit, node, revision
+documentsize 24x24
+defaults
+  fill none
+  stroke currentColor
+  stroke-width 2
+  stroke-linecap round
+  stroke-linejoin round
+shape line template=path
+  addpoint a at=12,4
+  addpoint b at=12,9
+place l1 shape=line at=0,0
+shape line2 template=path
+  addpoint a at=12,15
+  addpoint b at=12,20
+place l2 shape=line2 at=0,0
+shape node template=ellipse
+place n1 shape=node at=9,9 size=6x6

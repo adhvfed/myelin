@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<!-- Finalist A "Instrument" · Screen 5 — the AGENT / HITL moment: FixAgent plan-then-apply card (C-14 evolved, ambient).
+     The proposal is ONE typed row in the unified inbox (calm-by-default agent presence, P8), expanded in place.
+     Shows: proposed effects, per-effect target chips, the GATED consequential effect (open PR on protected main),
+     attribution (on behalf of Mara Ø., triggered by ci.failed, correlation), Approve / EDIT / Reject, audit link.
+     Agent treatment: label + plain geometric mark, NO sparkle/emoji. G2: German row, locale times. -->
+<html lang="en" dir="ltr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Instrument · Inbox · FixAgent approval</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../tokens.css">
+<style>
+html,body{height:100%}
+body{margin:0;background:var(--surface-base);color:var(--t1);font:13px/var(--lh-body) var(--sans);-webkit-font-smoothing:antialiased}
+.mono{font-family:var(--mono)}
+button{font:inherit;color:inherit;cursor:pointer;border-radius:var(--r1);border:var(--hairline) solid var(--border-strong);background:var(--surface-sunken);padding:6px 12px;font-size:12.5px;font-weight:500;color:var(--t1);min-height:var(--target-min)}
+.app{display:grid;grid-template-columns:48px 224px 1fr;height:100vh}
+.rail{border-inline-end:var(--hairline) solid var(--border);background:var(--surface-raised);display:flex;flex-direction:column;align-items:center;padding-block-start:var(--space-2);gap:2px}
+.rail a{width:34px;height:34px;display:grid;place-items:center;color:var(--t3);border-radius:var(--r1);font-size:11px;text-decoration:none;font-family:var(--mono)}
+.rail a.on{color:var(--t1);background:var(--surface-hover)}
+.rail .sep{flex:1}
+.nav{background:var(--surface-raised);border-inline-end:var(--hairline) solid var(--border);padding:14px 12px;overflow:auto}
+.nav h2{font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--t3);margin:0 4px 10px;font-weight:600}
+.nav .item{display:flex;align-items:center;gap:9px;padding:6px 8px;border-radius:var(--r1);color:var(--t2);min-height:var(--target-min)}
+.nav .item.on{background:var(--accent-weak);color:var(--t1);font-weight:500}
+.nav .item .ct{margin-inline-start:auto;font-size:11px;color:var(--t3);font-variant-numeric:tabular-nums}
+.nav .sec{margin-top:16px}
+.content{display:flex;flex-direction:column;overflow:hidden;background:var(--surface-base)}
+.topbar{height:46px;border-block-end:var(--hairline) solid var(--border);display:flex;align-items:center;gap:12px;padding-inline:16px}
+.topbar .title{font-weight:600;font-size:14px}
+.topbar .sub{color:var(--t3)}
+.topbar .spacer{flex:1}
+.topbar .resid{font-size:11px;color:var(--t2);display:flex;gap:5px;align-items:center}
+.topbar .resid .dot{width:6px;height:6px;border-radius:50%;background:var(--ok)}
+.topbar .k{font-size:11px;color:var(--t3);border:var(--hairline) solid var(--border);border-radius:var(--r1);padding:3px 7px;font-family:var(--mono)}
+.topbar .theme{font-size:11px;color:var(--t3);border:var(--hairline) solid var(--border);border-radius:var(--r1);padding:4px 8px;background:none}
+.list{overflow:auto;flex:1}
+.grouphdr{padding:7px 16px;font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--t3);background:var(--surface-raised);border-block-end:var(--hairline) solid var(--border);font-weight:600}
+.row{display:grid;grid-template-columns:18px 86px 1fr 150px 64px;gap:12px;align-items:start;padding:10px 16px;border-block-end:var(--hairline) solid var(--border)}
+.row:hover{background:var(--surface-raised)}
+.row .ind{width:7px;height:7px;border-radius:50%;justify-self:center;background:transparent;margin-top:5px}
+.row.unread .ind{background:var(--accent)}
+.row .kind{font-size:10.5px;text-transform:uppercase;letter-spacing:.04em;color:var(--t3);font-weight:600;display:flex;align-items:center;gap:5px}
+.row .kind svg{width:13px;height:13px}
+.row .main{min-width:0}
+.row .main .t{font-size:13.5px;color:var(--t1)}
+.row .main .why{font-size:11.5px;color:var(--t3);margin-top:2px}
+.chip{display:inline-flex;align-items:center;gap:4px;border:var(--hairline) solid var(--border-strong);border-radius:var(--r1);padding:1px 6px;font-size:11.5px;color:var(--t2);font-family:var(--mono)}
+.stat{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;color:var(--t2)}
+.stat svg{width:13px;height:13px}.st-fail{color:var(--bad)}.st-ok{color:var(--ok)}
+.row .when{font-size:11.5px;color:var(--t3);text-align:end;font-variant-numeric:tabular-nums}
+
+/* the AMBIENT agent approval — same grid, expands in place; reserved agent marker */
+.agentrow{background:var(--surface-raised)}
+.agentrow .kind{color:var(--agent)}
+.badge-agent{font-size:9.5px;font-weight:700;letter-spacing:.04em;color:var(--agent);border:var(--hairline) solid var(--agent);border-radius:var(--r1);padding:1px 4px;text-transform:uppercase}
+.amark{width:13px;height:13px;border:1.5px solid var(--agent);border-radius:2px;display:inline-grid;place-items:center;vertical-align:-2px}
+.amark i{width:3px;height:3px;background:var(--agent)}
+.expand{grid-column:3 / 6;margin-top:6px;border:var(--hairline) solid var(--border);border-radius:var(--r1);background:var(--surface-base);overflow:hidden}
+.xhead{padding:9px 12px;border-block-end:var(--hairline) solid var(--border);display:flex;align-items:center;gap:8px;font-size:12px;color:var(--t2);flex-wrap:wrap}
+.xhead .who{font-weight:600;color:var(--t1);font-size:12.5px}
+.xstatus{margin-inline-start:auto;display:inline-flex;align-items:center;gap:5px;font-size:11px;color:var(--warn)}
+.eff{display:grid;grid-template-columns:18px 1fr auto;gap:10px;padding:9px 12px;border-block-end:var(--hairline) solid var(--border);align-items:start}
+.eff .n{font-family:var(--mono);font-size:11px;color:var(--t3);margin-top:1px}
+.eff .ed{font-size:12.5px;color:var(--t1)}
+.eff .ed .tgt{color:var(--t2);font-family:var(--mono);font-size:11.5px;border:var(--hairline) solid var(--border-strong);border-radius:var(--r1);padding:0 5px}
+.eff .ed .au{font-size:11px;color:var(--t3);margin-top:3px}
+.eff .ed .au code{font-family:var(--mono);background:var(--surface-sunken);border-radius:var(--r1);padding:0 4px}
+.gate{display:inline-flex;align-items:center;gap:4px;font-size:10.5px;font-weight:600;color:var(--warn);border:var(--hairline) solid var(--warn);border-radius:var(--r1);padding:2px 6px;white-space:nowrap}
+.gate svg{width:11px;height:11px}
+.nogate{font-size:10.5px;color:var(--t3);white-space:nowrap}
+.scope{padding:8px 12px;font-size:11.5px;color:var(--t2);display:flex;gap:14px;flex-wrap:wrap;border-block-end:var(--hairline) solid var(--border)}
+.scope .k{color:var(--t3)}
+.scope code{font-family:var(--mono);background:var(--surface-sunken);border-radius:var(--r1);padding:0 4px;color:var(--t1)}
+.xactions{display:flex;gap:8px;align-items:center;padding:9px 12px;flex-wrap:wrap}
+.b-primary{background:var(--c-btn-primary-bg);border-color:var(--c-btn-primary-bg);color:var(--c-btn-primary-text)}
+.b-quiet{border-color:transparent;background:none;color:var(--t2)}
+.b-quiet:hover{color:var(--bad)}
+.xactions .sp{flex:1}
+.xactions .lnk a{color:var(--t2);text-decoration:underline;margin-inline-start:12px;font-size:11.5px}
+
+/* agent-pending state (an unglamorous state: working / awaiting) */
+.pending{display:flex;align-items:center;gap:8px;padding:9px 12px;font-size:12px;color:var(--t2);border-block-start:var(--hairline) solid var(--border);background:var(--surface-raised)}
+.pending .sp{display:inline-block;width:12px;height:12px;border:2px solid var(--border-strong);border-top-color:var(--agent);border-radius:50%;animation:spin .9s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div class="app">
+  <nav class="rail" aria-label="Surfaces">
+    <a href="1-shell-pr-context.html" title="Code">Co</a>
+    <a href="3-ci-run.html" title="CI">CI</a>
+    <a href="4-board-roadmap.html" title="Issues">Is</a>
+    <a href="#" title="Knowledge">Kn</a>
+    <a href="#" title="Chat">Ch</a>
+    <span class="sep"></span>
+    <a href="#" class="on" aria-current="page" title="Inbox">In</a>
+  </nav>
+  <aside class="nav" aria-label="Inbox folders">
+    <h2>Inbox</h2>
+    <div class="item on">What needs me <span class="ct">6</span></div>
+    <div class="item">Snoozed <span class="ct">2</span></div>
+    <div class="item">Done</div>
+    <div class="sec"><h2>Filter</h2>
+      <div class="item">Review requests <span class="ct">2</span></div>
+      <div class="item">Mentions <span class="ct">2</span></div>
+      <div class="item">CI failures <span class="ct">1</span></div>
+      <div class="item">Approvals <span class="ct">1</span></div>
+    </div>
+  </aside>
+
+  <main class="content">
+    <div class="topbar">
+      <span class="title">What needs me</span><span class="sub">· 6 items, deduped</span>
+      <div class="spacer"></div>
+      <span class="resid"><span class="dot"></span>EU-WEST · Frankfurt</span>
+      <button class="theme" id="themebtn" aria-pressed="false">Theme: dark</button>
+      <span class="k">⌘K</span>
+    </div>
+
+    <div class="list">
+      <div class="grouphdr">Heute</div>
+
+      <div class="row unread">
+        <span class="ind"></span>
+        <span class="kind"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M15 9l-6 6M9 9l6 6"/></svg> CI</span>
+        <span class="main"><span class="t">integration · payments-api failed on <code class="mono" style="font-size:11px">main</code> · run #1894</span><span class="why">Weil es deinen Branch betrifft</span></span>
+        <span class="ref"><span class="stat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M15 9l-6 6M9 9l6 6"/></svg><span class="st-fail">failed</span></span></span>
+        <span class="when">vor 31 Min.</span>
+      </div>
+
+      <!-- THE HITL MOMENT: FixAgent plan-then-apply, ambient row, expanded -->
+      <div class="row unread agentrow" aria-label="Agent approval awaiting you">
+        <span class="ind"></span>
+        <span class="kind"><span class="amark" aria-hidden="true"><i></i></span> Approval</span>
+        <span class="main">
+          <span class="t" style="display:flex;align-items:center;gap:7px;flex-wrap:wrap"><span class="badge-agent">Agent</span> FixAgent proposes a follow-up for the burst-load cache thrash</span>
+          <span class="why">on behalf of Mara Ø. · triggered by ci.failed · correlation incident-9 → CI #1894 → ISS-377</span>
+        </span>
+        <span class="ref"><span class="stat" style="color:var(--warn)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>1 gate</span></span>
+        <span class="when">vor 34 Min.</span>
+
+        <div class="expand">
+          <div class="xhead">
+            <span class="amark" aria-hidden="true"><i></i></span><span class="who">FixAgent</span><span class="badge-agent">Agent</span>
+            <span>proposes 3 effects — <b style="color:var(--t1);font-weight:500">nothing applied yet</b></span>
+            <span class="xstatus"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="1"/><path d="M5 7V5a3 3 0 016 0v2"/></svg> awaiting approval</span>
+          </div>
+
+          <div class="eff">
+            <span class="n">1</span>
+            <span class="ed">Open follow-up PR · <span class="tgt">acme/payments-api</span> · branch <span class="tgt">fix/weighted-lru-eviction</span> → <span class="tgt">main</span>, fixes ISS-377
+              <span class="au">consequential · <b style="color:var(--warn)">protected branch</b> · authority <code>git.open_pr</code></span></span>
+            <span class="gate"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg> Needs approval</span>
+          </div>
+          <div class="eff">
+            <span class="n">2</span>
+            <span class="ed">Transition <span class="tgt">ISS-377</span> → <span class="tgt">In Review</span>
+              <span class="au">advisory · reversible · authority <code>issue.transition</code></span></span>
+            <span class="nogate">no gate · reversible</span>
+          </div>
+          <div class="eff">
+            <span class="n">3</span>
+            <span class="ed">Post update to <span class="tgt">#payments-incidents</span>
+              <span class="au">advisory · authority <code>chat.post</code> · visible to platform team</span></span>
+            <span class="nogate">no gate · advisory</span>
+          </div>
+
+          <div class="scope">
+            <span><span class="k">Scope</span> may act on <code>acme/payments-api</code>, <code>ISS-377</code>, <code>#payments-incidents</code> — delegation ∩ tenant (EU-West)</span>
+            <span><span class="k">Budget</span> 3 / 12 effects · est. €0.04</span>
+          </div>
+          <div class="xactions">
+            <button class="b-primary">Approve all</button>
+            <button>Edit plan…</button>
+            <button class="b-quiet">Reject</button>
+            <span class="sp"></span>
+            <span class="lnk"><a href="#">Why?</a><a href="#">Audit trail</a></span>
+          </div>
+          <div class="pending">
+            <span class="sp" aria-hidden="true"></span>
+            <span>If approved: effect 1 opens a PR (gated, logged); effects 2–3 apply immediately and are reversible. Nothing runs until you choose.</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="row unread">
+        <span class="ind"></span>
+        <span class="kind"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="6" cy="6" r="2"/><circle cx="18" cy="6" r="2"/><path d="M6 8v6a3 3 0 0 0 3 3h6"/></svg> Review</span>
+        <span class="main"><span class="t">Fix cache eviction under load · PR #412</span><span class="why">Du bist erforderlicher Reviewer</span></span>
+        <span class="ref"><span class="chip">PR #412</span></span>
+        <span class="when">vor 38 Min.</span>
+      </div>
+
+      <div class="grouphdr">Früher</div>
+      <div class="row">
+        <span class="ind"></span>
+        <span class="kind"><span class="amark" aria-hidden="true"><i></i></span> Agent</span>
+        <span class="main"><span class="t" style="display:flex;align-items:center;gap:7px"><span class="badge-agent">Agent</span> FixAgent labelled 4 incoming burst reports</span><span class="why">Advisory · keine Aktion nötig · prüfen, falls du widersprichst</span></span>
+        <span class="ref"><span class="chip">+4 issues</span></span>
+        <span class="when">gestern</span>
+      </div>
+    </div>
+  </main>
+</div>
+<script>
+var b=document.getElementById('themebtn');
+b.addEventListener('click',function(){var r=document.documentElement,d=r.getAttribute('data-theme')!=='light';r.setAttribute('data-theme',d?'light':'dark');b.textContent='Theme: '+(d?'light':'dark');b.setAttribute('aria-pressed',String(d));});
+</script>
+</body>
+</html>

@@ -1,0 +1,25 @@
+# @meaning Notifications ("what needs me")
+# @tags inbox, notifications, tray, alerts
+documentsize 24x24
+defaults
+  fill none
+  stroke currentColor
+  stroke-width 2
+  stroke-linecap round
+  stroke-linejoin round
+shape tray template=path
+  addpoint a at=4,4
+  addpoint b at=4,15
+  addpoint c at=8,15
+  addpoint d at=9,18
+  addpoint e at=15,18
+  addpoint f at=16,15
+  addpoint g at=20,15
+  addpoint h at=20,4
+  close
+place t1 shape=tray at=0,0
+shape inner template=path
+  addpoint a at=4,15
+  addpoint b at=9,15
+  addpoint c at=10,18
+place i1 shape=inner at=0,0

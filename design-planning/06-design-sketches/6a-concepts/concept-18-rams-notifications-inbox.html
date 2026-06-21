@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<!-- CONCEPT C-18 | screen: Notifications inbox ("what needs me") | persona: Dieter Rams (commit: as little design as possible; every element earns its place; honest function over expression; a near-monochrome braun-grey palette; one quiet accent reserved for the single thing that needs you; legibility and order; refuse: decoration, drop-shadows-for-mood, colour-as-mood, three equal cards, any element that does not do work)
+     axes: density=calm nav=rail unification=highly-unified tone=sober agent=ambient sovereignty=on-demand
+     rationale: this should feel like a well-made control panel — quiet, ordered, every row a function, nothing shouting — because P8 "attention is sacred": the inbox is the antidote to the firehose, so its whole craft is restraint. Provenance ("why am I getting this") is always shown; deduped groups collapse; the agent lane is collapsed by default and sheds first; inbox-zero is a quiet reward, never confetti. Throwaway-grade. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>C18 — Notifications inbox (Rams)</title>
+<!-- throwaway: single CDN font; production self-hosts -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;450;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    /* near-monochrome neutral ramp; Rams' restrained greys carry ~95% of the UI */
+    --bg:#f5f5f4; --panel:#ffffff; --line:#e4e3e0; --line-2:#d3d2cd;
+    --ink:#1c1c1a; --ink-2:#56554f; --ink-3:#8c8b84;
+    --accent:#b6541f;            /* ONE reserved orange — used only for the thing that needs you now */
+    --ok:#3f6b46; --warn:#8a6d18; --crit:#a23a2f;
+    --agent:#42506a; --agent-bg:#eef0f4;
+    --focus:#235a7d;             /* derived AA-safe focus, NOT the accent */
+    --r:4px;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{background:var(--bg);color:var(--ink);font-family:"IBM Plex Sans",system-ui,sans-serif;font-size:14px;
+    line-height:1.5;-webkit-font-smoothing:antialiased;
+    display:grid;grid-template-columns:60px 230px 1fr;height:100vh;overflow:hidden}
+  .mono{font-family:"IBM Plex Mono",monospace}
+  :focus-visible{outline:2px solid var(--focus);outline-offset:2px;border-radius:3px}
+
+  /* icon rail (highly-unified shell) */
+  .iconrail{background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column;
+    align-items:center;padding:14px 0;gap:4px}
+  .iconrail .logo{width:30px;height:30px;border:2px solid var(--ink);border-radius:6px;display:grid;place-items:center;
+    font-weight:600;font-size:14px;margin-bottom:14px}
+  .iconrail a{width:36px;height:36px;border-radius:var(--r);display:grid;place-items:center;color:var(--ink-3);
+    font-size:16px;text-decoration:none;position:relative}
+  .iconrail a:hover{background:var(--bg);color:var(--ink-2)}
+  .iconrail a.on{background:var(--ink);color:var(--panel)}
+  .iconrail a .bdg{position:absolute;top:5px;right:5px;width:7px;height:7px;border-radius:50%;background:var(--accent);
+    border:1.5px solid var(--panel)}
+  .iconrail .sp{flex:1}
+
+  /* filters column — "one inbox, everything else is a saved filter on it" */
+  .filters{background:var(--panel);border-right:1px solid var(--line);padding:20px 14px;overflow:auto}
+  .filters h2{font-size:17px;font-weight:600;letter-spacing:-.01em;padding:0 6px 4px}
+  .filters .ix{font-size:11.5px;color:var(--ink-3);padding:0 6px 18px}
+  .fgrp{margin-bottom:22px}
+  .fgrp .lbl{font-size:10px;letter-spacing:.13em;text-transform:uppercase;color:var(--ink-3);padding:0 6px 8px;font-weight:500}
+  .filters a{display:flex;align-items:center;gap:10px;padding:6px 8px;border-radius:var(--r);color:var(--ink-2);
+    font-size:13px;text-decoration:none}
+  .filters a:hover{background:var(--bg)}
+  .filters a.on{background:var(--bg);color:var(--ink);font-weight:500}
+  .filters a .g{width:15px;text-align:center;color:var(--ink-3);font-size:13px}
+  .filters a .ct{margin-left:auto;font-family:"IBM Plex Mono";font-size:11px;color:var(--ink-3)}
+  .filters a.on .ct{color:var(--ink-2)}
+  .filters a .ct.acc{color:var(--accent);font-weight:500}
+
+  /* main inbox */
+  .inbox{display:flex;flex-direction:column;overflow:hidden}
+  .ibhead{padding:18px 28px;border-bottom:1px solid var(--line);background:var(--bg);display:flex;align-items:center;gap:16px}
+  .ibhead h1{font-size:15px;font-weight:600}
+  .ibhead .meta{font-size:12px;color:var(--ink-3)}
+  .ibhead .sp{flex:1}
+  .ibhead .tri{display:flex;gap:6px}
+  .ibhead .tri button{font-family:"IBM Plex Sans";font-size:12px;color:var(--ink-2);background:var(--panel);
+    border:1px solid var(--line-2);border-radius:var(--r);padding:5px 11px;cursor:pointer;display:flex;gap:6px;align-items:center}
+  .ibhead .tri button:hover{border-color:var(--ink-3)}
+  .ibhead .tri button .k{font-family:"IBM Plex Mono";font-size:10px;color:var(--ink-3);border:1px solid var(--line);
+    border-radius:3px;padding:0 4px}
+
+  .scroll{overflow:auto;flex:1;padding:0 0 60px}
+  .daylbl{font-size:10px;letter-spacing:.13em;text-transform:uppercase;color:var(--ink-3);font-weight:500;
+    padding:18px 28px 8px}
+
+  /* the row — every part does work; nothing decorative */
+  .item{display:grid;grid-template-columns:30px 1fr auto;gap:14px;align-items:start;padding:13px 28px;
+    border-bottom:1px solid var(--line);background:var(--panel);cursor:pointer;position:relative}
+  .item:hover{background:#fbfbfa}
+  .item.unread{box-shadow:inset 3px 0 0 var(--accent)}
+  .item .glyph{width:26px;height:26px;border-radius:50%;border:1px solid var(--line-2);display:grid;place-items:center;
+    font-size:12px;color:var(--ink-2);background:var(--bg)}
+  .item.crit .glyph{border-color:var(--crit);color:var(--crit)}
+  .item .body{min-width:0}
+  .item .subject{font-size:13.5px;color:var(--ink);line-height:1.4}
+  .item .subject .ref{font-family:"IBM Plex Mono";font-size:12px;color:var(--ink);border:1px solid var(--line-2);
+    border-radius:3px;padding:0 5px;background:var(--bg)}
+  .item .subject .ref .st{color:var(--ok)} .item .subject .ref .st.open{color:var(--accent)}
+  /* the "why am I getting this" provenance line — always present (NOTIF-2) */
+  .item .why{font-size:11.5px;color:var(--ink-3);margin-top:4px;display:flex;align-items:center;gap:7px;flex-wrap:wrap}
+  .item .why .reason{font-weight:500;color:var(--ink-2)}
+  .item .why .sep{color:var(--line-2)}
+  .item .why .pre{font-size:11px;color:var(--ink-3);font-style:italic}  /* pre-fetched next hop hint */
+  .item .meta-r{text-align:right;display:flex;flex-direction:column;align-items:flex-end;gap:8px}
+  .item time{font-size:11px;color:var(--ink-3);font-family:"IBM Plex Mono"}
+  .item .rowact{display:flex;gap:4px;opacity:0;transition:opacity .1s}
+  .item:hover .rowact{opacity:1}
+  .item .rowact button{width:24px;height:24px;border:1px solid var(--line-2);background:var(--panel);border-radius:3px;
+    color:var(--ink-3);font-size:11px;cursor:pointer}
+  .item .rowact button:hover{color:var(--ink);border-color:var(--ink-3)}
+  .prio{font-family:"IBM Plex Mono";font-size:10px;color:var(--ink-3)}
+  .prio b{color:var(--ink-2);font-weight:500}
+
+  /* a HITL approval card docked as a row (critical priority) */
+  .item.approval{background:#fffaf6;align-items:stretch}
+  .item.approval .glyph{border-color:var(--accent);color:var(--accent)}
+  .approval .card{border:1px solid #e7c9b8;border-radius:var(--r);padding:12px 14px;margin-top:6px;background:var(--panel)}
+  .approval .card .ah{display:flex;align-items:center;gap:9px;margin-bottom:9px}
+  .agent-tag{display:inline-flex;gap:6px;align-items:center;font-size:10px;font-weight:600;letter-spacing:.05em;
+    text-transform:uppercase;color:var(--agent);border:1px solid #c7cfdc;border-radius:3px;padding:2px 7px;background:#fff}
+  .agent-tag .mk{width:10px;height:10px;border:1.5px solid var(--agent);border-radius:2px;display:inline-block;position:relative}
+  .agent-tag .mk::after{content:"";position:absolute;inset:2px;background:var(--agent);border-radius:1px}
+  .approval .auth{font-size:11.5px;color:var(--ink-3)}
+  .approval .effects{list-style:none;font-size:12.5px;color:var(--ink-2);margin:2px 0 10px}
+  .approval .effects li{padding:4px 0;display:flex;gap:8px;align-items:center}
+  .approval .effects li .v{font-family:"IBM Plex Mono";font-size:11px;color:var(--ink);background:var(--bg);
+    border:1px solid var(--line);border-radius:3px;padding:1px 6px}
+  .approval .effects li .g{color:var(--ink-3)}
+  .approval .acts{display:flex;gap:8px;align-items:center}
+  .btn{font-family:"IBM Plex Sans";font-size:12px;border:1px solid var(--line-2);background:var(--panel);color:var(--ink);
+    border-radius:var(--r);padding:6px 14px;cursor:pointer}
+  .btn:hover{border-color:var(--ink-3)}
+  .btn.p{background:var(--ink);color:var(--panel);border-color:var(--ink)} .btn.p:hover{background:#000}
+  .why-link{font-size:11px;color:var(--agent);text-decoration:underline;text-underline-offset:2px;
+    background:none;border:0;cursor:pointer;margin-left:auto}
+
+  /* deduped group — "+N more", grouped not enumerated */
+  .item.group .subject .cnt{font-family:"IBM Plex Mono";font-size:11px;color:var(--ink-2);background:var(--bg);
+    border:1px solid var(--line-2);border-radius:99px;padding:1px 8px;margin-left:6px}
+
+  /* agent lane — collapsed by default; sheds first; out of the human stream */
+  .agentlane{margin:14px 28px;border:1px solid var(--line);border-radius:var(--r);background:#fcfcfb}
+  .agentlane summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:10px;padding:12px 14px;
+    font-size:12.5px;color:var(--ink-2)}
+  .agentlane summary::-webkit-details-marker{display:none}
+  .agentlane summary .chev{color:var(--ink-3);transition:transform .12s}
+  .agentlane[open] summary .chev{transform:rotate(90deg)}
+  .agentlane summary .cnt{margin-left:auto;font-family:"IBM Plex Mono";font-size:11px;color:var(--ink-3)}
+  .agentlane .note{font-size:11px;color:var(--ink-3);font-style:italic;border:1px solid var(--line);border-radius:3px;padding:1px 7px;font-style:normal}
+  .agentlane .ai{padding:8px 14px;border-top:1px solid var(--line);font-size:12.5px;color:var(--ink-2);display:flex;gap:10px;align-items:center}
+  .agentlane .ai time{margin-left:auto;font-family:"IBM Plex Mono";font-size:11px;color:var(--ink-3)}
+
+  /* footer: empty/inbox-zero reward (quiet) */
+  .zero{padding:40px 28px;text-align:center;color:var(--ink-3)}
+  .zero .mk{width:40px;height:40px;border:1.5px solid var(--line-2);border-radius:50%;margin:0 auto 14px;
+    display:grid;place-items:center;font-size:18px;color:var(--ok)}
+  .zero p{font-size:13px} .zero p b{color:var(--ink-2);font-weight:500}
+</style>
+</head>
+<body>
+
+  <!-- ICON RAIL -->
+  <nav class="iconrail">
+    <div class="logo">M</div>
+    <a href="#" title="Code"><span>◐</span></a>
+    <a href="#" title="CI"><span>⊘</span></a>
+    <a href="#" title="Issues"><span>▤</span></a>
+    <a href="#" title="Knowledge"><span>▦</span></a>
+    <a href="#" title="Chat"><span>◇</span></a>
+    <a href="#" class="on" title="Inbox"><span>▼</span><span class="bdg"></span></a>
+    <div class="sp"></div>
+    <a href="#" title="Search"><span>⌕</span></a>
+    <a href="#" title="You"><span>○</span></a>
+  </nav>
+
+  <!-- FILTERS -->
+  <aside class="filters">
+    <h2>Inbox</h2>
+    <div class="ix">One inbox. Everything below is a saved filter on it.</div>
+    <div class="fgrp">
+      <a href="#" class="on"><span class="g">▼</span>Needs me<span class="ct acc">6</span></a>
+      <a href="#"><span class="g">◷</span>Snoozed<span class="ct">2</span></a>
+      <a href="#"><span class="g">✓</span>Done<span class="ct">—</span></a>
+    </div>
+    <div class="fgrp">
+      <div class="lbl">By reason</div>
+      <a href="#"><span class="g">▣</span>Approvals<span class="ct acc">1</span></a>
+      <a href="#"><span class="g">@</span>Mentions<span class="ct">3</span></a>
+      <a href="#"><span class="g">⇄</span>Review requests<span class="ct">2</span></a>
+      <a href="#"><span class="g">◎</span>Assigned<span class="ct">4</span></a>
+      <a href="#"><span class="g">⚠</span>SLA &amp; failures<span class="ct">1</span></a>
+    </div>
+    <div class="fgrp">
+      <div class="lbl">By surface</div>
+      <a href="#"><span class="g">◐</span>Code<span class="ct">3</span></a>
+      <a href="#"><span class="g">▤</span>Issues<span class="ct">2</span></a>
+      <a href="#"><span class="g">◇</span>Chat<span class="ct">1</span></a>
+    </div>
+  </aside>
+
+  <!-- INBOX -->
+  <section class="inbox">
+    <header class="ibhead">
+      <h1>Needs me</h1>
+      <span class="meta">6 items · ranked by reason → base → class</span>
+      <div class="sp"></div>
+      <div class="tri">
+        <button>Done <span class="k">E</span></button>
+        <button>Snooze <span class="k">H</span></button>
+        <button>Mark all read</button>
+      </div>
+    </header>
+
+    <div class="scroll">
+      <div class="daylbl">Critical · needs a decision</div>
+
+      <!-- HITL approval as inbox row -->
+      <div class="item approval unread crit">
+        <div class="glyph">▣</div>
+        <div class="body">
+          <div class="subject">Approval requested — merge of <span class="ref">PR&nbsp;#412 <span class="st open">open</span></span></div>
+          <div class="why"><span class="reason">approval_requested</span><span class="sep">·</span>priority 92 / critical<span class="sep">·</span><span class="pre">next hop pre-fetched</span></div>
+          <div class="card">
+            <div class="ah">
+              <span class="agent-tag"><span class="mk"></span>FixAgent</span>
+              <span class="auth">on behalf of <b style="color:var(--ink-2)">@lena</b> · scope <span class="mono" style="font-size:11px">repo/cache-service</span></span>
+              <button class="why-link">Why? ↗</button>
+            </div>
+            <ul class="effects">
+              <li><span class="g">→</span> merge <span class="v">PR #412</span> into <span class="v">main</span> (squash)</li>
+              <li><span class="g">→</span> close <span class="v">ISS-377 Cache OOM</span></li>
+              <li><span class="g">→</span> post result to <span class="v">#cache-service</span></li>
+            </ul>
+            <div class="acts">
+              <button class="btn p">Approve</button>
+              <button class="btn">Edit</button>
+              <button class="btn">Reject</button>
+              <span class="prio" style="margin-left:auto">budget <b>3 / 12</b> effects</span>
+            </div>
+          </div>
+        </div>
+        <div class="meta-r"><time>4m</time></div>
+      </div>
+
+      <div class="daylbl">Today</div>
+
+      <div class="item unread">
+        <div class="glyph">@</div>
+        <div class="body">
+          <div class="subject">Ana mentioned you on <span class="ref">PR&nbsp;#412 <span class="st open">open</span></span> — “cached weight at insert?”</div>
+          <div class="why"><span class="reason">mentioned</span><span class="sep">·</span>by @ana · Code<span class="sep">·</span><span class="pre">opens to the comment, line 48</span></div>
+        </div>
+        <div class="meta-r"><time>2h</time>
+          <div class="rowact"><button title="Done">✓</button><button title="Snooze">◷</button><button title="Mute">⊘</button></div>
+        </div>
+      </div>
+
+      <div class="item unread">
+        <div class="glyph">⇄</div>
+        <div class="body">
+          <div class="subject">Review requested — <span class="ref">PR&nbsp;#418 <span class="st open">open</span></span> Add weighted-eviction docs</div>
+          <div class="why"><span class="reason">review_requested</span><span class="sep">·</span>by @marc · Code · CODEOWNERS</div>
+        </div>
+        <div class="meta-r"><time>3h</time>
+          <div class="rowact"><button title="Done">✓</button><button title="Snooze">◷</button><button title="Mute">⊘</button></div>
+        </div>
+      </div>
+
+      <!-- deduped group, +N more -->
+      <div class="item group">
+        <div class="glyph">▤</div>
+        <div class="body">
+          <div class="subject">Activity on <span class="ref">ISS-377</span> Cache OOM under burst load <span class="cnt">+5 more</span></div>
+          <div class="why"><span class="reason">watched</span><span class="sep">·</span>5 updates coalesced · status, 2 comments, linked PR<span class="sep">·</span>expandable</div>
+        </div>
+        <div class="meta-r"><time>5h</time></div>
+      </div>
+
+      <div class="item crit">
+        <div class="glyph">⚠</div>
+        <div class="body">
+          <div class="subject">SLA at risk — <span class="ref">ISS-360</span> Latency p99 regression · 6h to breach</div>
+          <div class="why"><span class="reason">sla</span><span class="sep">·</span>assigned to you · business-calendar aware</div>
+        </div>
+        <div class="meta-r"><time>5h</time></div>
+      </div>
+
+      <!-- AGENT LANE: collapsed, out of the human stream, sheds first -->
+      <details class="agentlane">
+        <summary>
+          <span class="chev">▸</span>
+          <span class="agent-tag"><span class="mk"></span>Agent activity</span>
+          <span>TriageAgent and DocBot did 14 things you may want, but none need you</span>
+          <span class="note">lane shed-budgeted separately</span>
+          <span class="cnt">14 · collapsed</span>
+        </summary>
+        <div class="ai"><span class="agent-tag" style="font-size:9px"><span class="mk"></span>TriageAgent</span> labelled &amp; deduped 9 incoming issues<time>1h</time></div>
+        <div class="ai"><span class="agent-tag" style="font-size:9px"><span class="mk"></span>DocBot</span> flagged Runbook · cache sizing as likely stale<time>3h</time></div>
+        <div class="ai" style="color:var(--ink-3);font-style:italic">+ 12 more informational — kept on the artifacts, off your stream</div>
+      </details>
+
+      <div class="zero">
+        <div class="mk">✓</div>
+        <p><b>That's everything that needs you.</b><br>Snoozed items return at 9:00. Quiet hours respected; on-call pages always pierce.</p>
+      </div>
+    </div>
+  </section>
+
+</body>
+</html>

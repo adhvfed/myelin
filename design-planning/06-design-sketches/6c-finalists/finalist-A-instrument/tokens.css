@@ -1,0 +1,107 @@
+/* Finalist A — "Instrument" · CSS custom-property projection of tokens.json (DTCG).
+   Screens consume ONLY these vars — no hardcoded colours/space in the HTML.
+   Dark is the default ("midnight command-deck"). [data-theme="light"] re-points the aliases.
+   The --focus / --c-focus-ring token is DERIVED AA-safe and is a DISTINCT token from --accent
+   (design-language §8b.3; R-17 audit-method §3.2). Measured ratios are in README.md.
+   RTL is by-construction: components use logical properties (inline-start/end), so [dir="rtl"]
+   mirrors for free with no override sheet (R-18 §4.1). */
+
+:root,
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  /* primitive — dark ramp */
+  --g0:#0c0d10; --g1:#101116; --g2:#16181d; --g3:#1d2026;
+  --g4:#24272f; --g5:#2e323b; --g6:#3a3f47;
+
+  /* semantic — surfaces, borders, text */
+  --surface-base:var(--g0);
+  --surface-raised:var(--g1);
+  --surface-sunken:var(--g2);
+  --surface-hover:var(--g3);
+  --border:var(--g4);
+  --border-strong:var(--g6);
+  --t1:#e7e9ee;   /* 16.00:1 on base */
+  --t2:#aeb3be;   /* 9.25:1 on base */
+  --t3:#868d99;   /* 5.81:1 on base */
+
+  /* accent (IDENTITY) vs focus (DERIVED, AA-safe, distinct) */
+  --accent:#5b8cff;            /* 6.14:1 on base */
+  --accent-weak:#172238;
+  --focus:#7ea6ff;             /* 8.13:1 on base — the ONE focus/primary token */
+  --on-focus:#0c0d10;          /* text on a focus fill */
+
+  /* functional status (always paired with glyph+label) */
+  --ok:#46b277;    /* 7.31:1 */
+  --warn:#d6a93f;  /* 8.89:1 */
+  --bad:#e0695c;   /* 5.87:1 */
+  --agent:#a99bf2; /* 8.01:1 — reserved, NOT a status colour */
+
+  /* diff */
+  --add-bg:#10231a; --del-bg:#27151a;
+  --add-txt:#74d39b; --del-txt:#f2897e;
+  --tok-k:#c4a3f5; --tok-s:#8fc7a0; --tok-f:#7fb0e8; --tok-c:#7b8290; --tok-n:#e0a878;
+
+  /* component */
+  --c-btn-primary-bg:var(--focus);
+  --c-btn-primary-text:var(--on-focus);
+  --c-focus-ring:var(--focus);
+  --c-rail-active:var(--accent);
+
+  /* dimension — 4/8 ramp, near-zero radius */
+  --space-1:4px; --space-2:8px; --space-3:12px; --space-4:16px; --space-5:24px; --space-6:32px;
+  --r0:0px; --r1:3px; --r2:6px; --r-pill:999px; --hairline:1px;
+  --target-min:24px;
+  --control-h:28px; --row-h:32px;
+
+  /* type */
+  --sans:"Inter",-apple-system,system-ui,"Segoe UI",sans-serif;
+  --mono:"JetBrains Mono","SF Mono",ui-monospace,"Cascadia Mono",monospace;
+  --lh-body:1.45; --lh-tight:1.3;
+
+  /* motion */
+  --d-fast:90ms; --d-base:150ms;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --g0:#ffffff; --g1:#f7f8fa; --g2:#eef0f3; --g3:#e3e6ea;
+  --g4:#d4d8de; --g5:#b9bfc8; --g6:#9aa1ac;
+  --surface-base:var(--g0);
+  --surface-raised:var(--g1);
+  --surface-sunken:var(--g2);
+  --surface-hover:var(--g2);
+  --border:var(--g3);
+  --border-strong:var(--g6);
+  --t1:#15171c;  /* 17.93:1 */
+  --t2:#4a505b;  /* 8.11:1 */
+  --t3:#646b78;  /* 5.36:1 */
+  --accent:#2f6bff;            /* 4.50:1 */
+  --accent-weak:#e7eeff;
+  --focus:#1452d6;             /* 6.55:1 — derived, white-on-it 6.55:1 */
+  --on-focus:#ffffff;
+  --ok:#15794a;   /* 5.43:1 */
+  --warn:#8a5a07; /* 5.92:1 */
+  --bad:#c0392b;  /* 5.44:1 */
+  --agent:#5b4ec9;/* 6.22:1 */
+  --add-bg:#e3f5ea; --del-bg:#fbe6e6;
+  --add-txt:#0d6b3e; --del-txt:#a32f25;
+  --tok-k:#6f3fc0; --tok-s:#0d6b3e; --tok-f:#1452d6; --tok-c:#646b78; --tok-n:#9a5712;
+}
+
+/* one focus-ring token, every interactive element, every theme (R-17 M2) */
+*{box-sizing:border-box}
+:where(a,button,input,[tabindex],[role="button"],[role="tab"],[role="option"]):focus-visible{
+  outline:2px solid var(--c-focus-ring);
+  outline-offset:1px;
+  border-radius:var(--r1);
+}
+
+/* high-contrast / forced-colors: never lose focus or status meaning */
+@media (forced-colors: active){
+  :where(a,button,[tabindex],[role="button"]):focus-visible{outline:2px solid Highlight}
+}
+
+@media (prefers-reduced-motion: reduce){
+  *{animation-duration:0ms !important; transition-duration:0ms !important}
+}
