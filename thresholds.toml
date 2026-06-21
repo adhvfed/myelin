@@ -223,6 +223,13 @@ human_lane_reservation = 24
 retry_after_secs = 10
 
 [[shed_budgets]]
+surface = "GitFrontDoor"      # the Git clone/push front door (GIT-P15, OQ-K): a CI/agent clone storm
+                              # sheds before a human's interactive fetch (a reserved human fraction).
+per_tenant_in_flight_cap = 128
+human_lane_reservation = 32
+retry_after_secs = 5
+
+[[shed_budgets]]
 surface = "HttpIntake"        # the generic public surface (§7.1): every surface reserves a human fraction.
 per_tenant_in_flight_cap = 200
 human_lane_reservation = 50

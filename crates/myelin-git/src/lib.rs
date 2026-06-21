@@ -155,4 +155,14 @@ pub mod receive_pack;
 pub mod replay;
 pub mod schema;
 pub mod search_projection;
+/// The **protected-human-lane shed order + the CDN bundle-URI accelerated-clone** (GIT-P15 / P-276,
+/// M3-G2): the [`shed_clone::GitFrontDoorShed`] wires the substrate's shed lane
+/// (`speculative → batch/CI → agent → human-last`, `429 + Retry-After`) over the new
+/// `myelin_substrate::shed::Surface::GitFrontDoor` budget read from the thresholds file — a clone
+/// storm's agent/CI lane sheds while the human's interactive fetch is served (the OQ-K per-surface
+/// budget floor; the 30× clone storm GIT-D6 tunes the numbers in GIT-P34). The
+/// [`shed_clone::BundleUriClone`] serves a clone a **bundle-URI** from the within-EU CDN clone/bundle
+/// class (`myelin_storage::cdn::CdnCloneClass`, 11.2 C3) — a content-address-verified accelerated
+/// clone (the full within-EU CDN class hardens in GIT-P33).
+pub mod shed_clone;
 pub mod subs;

@@ -134,7 +134,10 @@ fn cdc_1_11_v1_floor_table_is_bounded_with_a_reserved_human_lane() {
         assert!(b.retry_after_secs > 0, "{surface:?} sheds with a Retry-After (clients honour it)");
         seen += 1;
     }
-    assert_eq!(seen, 5, "the v1 floor names all four §7.6 surfaces + the generic HTTP intake");
+    assert_eq!(
+        seen, 6,
+        "the v1 floor names the four §7.6 surfaces + the Git front door (GIT-P15) + the generic HTTP intake"
+    );
     // CI is the batch lane — no human reservation; the human-facing surfaces reserve a lane.
     assert_eq!(table.budget(ShedSurface::CiDispatch).human_lane_reservation, 0);
     assert!(table.budget(ShedSurface::ConnectionTier).human_lane_reservation > 0);
