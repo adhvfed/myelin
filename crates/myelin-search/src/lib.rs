@@ -121,6 +121,7 @@ pub mod erasure_posture;
 pub mod fusion;
 pub mod holder;
 pub mod indexer;
+pub mod kn_projection;
 pub mod layout;
 pub mod pipeline;
 pub mod reindex;
@@ -158,6 +159,11 @@ pub use indexer::{
 pub use holder::{
     register_search_holder, search_index_holder, SearchHolderRegistration, SearchIndexHolder,
     SEARCH_INDEX_STORE,
+};
+pub use kn_projection::{
+    kn_db_row_index_spec, kn_index_specs, kn_page_index_spec, page_search_projection,
+    register_kn_index_specs, FACET_ARTIFACT_REF, FACET_EMBED, FACET_MENTION, KN_DB_ROW_TYPE,
+    KN_PAGE_TYPE, KN_SUBSYSTEM,
 };
 pub use layout::{
     derived_state_invariant_holds, srch_p03_floors, LayoutError, PerTenantIndexLayout,

@@ -525,6 +525,29 @@ impl IncrementalIndexer {
             .with_backend(tenant, region, |be| be.search(acl_filter, text_query, limit))
     }
 
+    /// **Search the `(tenant, region)` structured/columnar shape on a typed facet equality, ACL-filtered
+    /// (the JSONB GIN-scan path for KN custom DB-fields / Issues facets, §3.1 / §4.6.1).** Delegates to
+    /// the per-tenant backend's structured shape — a `field == value` predicate over a typed columnar
+    /// facet, `acl_filter` conjoined first, ordered by the `order_key` fast-field. This is the
+    /// SRCH-P17 (P-260) KN custom-field facet drill seam — the in-doc database struct fields are served
+    /// correctly by this typed-facet scan (the GIN-scan FLOOR; the measured projection-feeder promotion
+    /// to a generated index is the M5 follow-on, SRCH-P27, which changes COST never correctness). Like
+    /// [`search_ft`](Self::search_ft) this re-exposes the SRCH-P04 engine surface for the producer-corpus
+    /// drills, NOT the SRCH-P08 `list_objects`-lowering query path. `acl_filter` is MANDATORY. Tenant-first.
+    pub fn search_structured(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+        acl_filter: &crate::engine::AclFilter,
+        field: &str,
+        value: &FieldValue,
+        limit: usize,
+    ) -> Result<Vec<crate::engine::Hit>, crate::engine::IndexError> {
+        use crate::engine::IndexBackend;
+        self.registry
+            .with_backend(tenant, region, |be| be.search_structured(acl_filter, field, value, limit))
+    }
+
     /// **Semantic (vector) k-NN over the `(tenant, region)` co-located HNSW shape, ACL-filtered.** The
     /// erase drill reads this to assert a purged subject's VECTOR is gone (not just the FT doc). Tenant-first.
     pub fn search_semantic(

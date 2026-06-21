@@ -554,9 +554,20 @@ status = "covered"
 # board/list/search facets state_category/priority/assignee/type_rank/project_id/cycle_id/rank,
 # non-semantic, acl_object_type=issue) and Search ADMITS it. The Issues `issue.*` projection EMITTER
 # that feeds the rows is ISS-P17.
+# SRCH-P17/P-260 adds the KNOWLEDGE slice: KN declares its index specs
+# (`myelin_search::kn_page_index_spec` — knowledge/page semantic + the three structured inline-node
+# reference facets mention/artifact_ref/embed; `myelin_search::kn_db_row_index_spec` — knowledge/db_row
+# non-semantic + the custom DB-field GIN-scan facets priority/owner/due + order_key) and Search ADMITS
+# them. KN has no service crate yet, so the owned specs + the page projection builder are modelled in
+# the Search consumer crate against the frozen myelin-content taxonomy (the GIT-P5-style emitter-less
+# posture). The real-corpus indexing GATE (multilingual + facets + JSONB GIN-scan + vector-in-v1 +
+# read-time rollup/formula + SRCH-D1/D3 on the KN corpus) is in
+# crates/myelin-search/tests/integration_srch_p17_kn_indexing.rs. The KN projection EMITTER is the M3
+# KN service prompt cluster.
 cdc = [
     "crates/myelin-git/tests/cdc_6_3_git_code_projection.rs",
     "crates/myelin-issues/tests/cdc_6_3_issues_facets_projection.rs",
+    "crates/myelin-search/tests/cdc_6_3_kn_index_specs.rs",
 ]
 
 [[contract]]
