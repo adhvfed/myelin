@@ -21,7 +21,7 @@ use myelin_git::receive_pack::{
     QuarantineObject, RefName, RefStore,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 
 /// The CONSUMER-side view of a `git.ref.updated` event (the fields CI/Search/Refs key on) decoded
 /// from the wire envelope's JSON payload — the consumer half of the CDC pair.
@@ -182,4 +182,73 @@ fn git_ref_updated_per_ref_ordering_is_consumed_in_order() {
         .map(|r| RefUpdatedView::decode(&r.envelope).unwrap().update_seq)
         .collect();
     assert_eq!(update_seqs, vec![1, 2, 3], "the consumer reads update_seq in per-ref order");
+}
+
+/// **2.3 per-ref ordering UNDER A HOT-REF BURST (GIT-P10 / GIT-D1): a concurrent burst on one ref
+/// still yields a contiguous, per-aggregate-ordered consumer stream.** N racers chain-advance one
+/// hot ref (one wins each generation, the rest are CAS-rejected); the consumer, reading the
+/// committed rows in per-aggregate `seq` order, sees `update_seq` 1,2,…,k with NO gap and NO reorder
+/// — proving the per-ref aggregate ordering (2.3) holds at push QPS, not just for serial pushes.
+#[test]
+fn git_ref_updated_per_ref_ordering_survives_a_concurrent_burst() {
+    let outbox = OutboxStore::new();
+    let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
+    let store = Arc::new(RefStore::open("core", ctx_base(), outbox.clone(), minter));
+
+    let k = 20u64;
+    let multiplier = 12usize; // 12 racers per generation, all hammering the one hot ref.
+    let mut tip = Oid::zero();
+    let mut committed_ids = Vec::new();
+
+    for round in 1..=k {
+        let barrier = Arc::new(Barrier::new(multiplier));
+        let mut handles = Vec::new();
+        for racer in 0..multiplier {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            let old = tip.clone();
+            let new = Oid::new(format!("g{round:02}c{racer:02}"));
+            handles.push(std::thread::spawn(move || {
+                let db = InMemoryObjectDb::new();
+                let p = PushSession {
+                    updates: vec![ProposedRefUpdate {
+                        ref_name: RefName::new("refs/heads/hot"),
+                        expected_old: old,
+                        new_oid: new.clone(),
+                        forced: false,
+                        commit_oids: vec![new],
+                    }],
+                    quarantine: vec![],
+                    pusher: Pusher { pseudonym: "anon-1@acme.noreply".into(), is_agent: false },
+                };
+                barrier.wait();
+                store.receive(&p, &db, CrashPoint::None).unwrap()
+            }));
+        }
+        let mut winner: Option<(Oid, myelin_events::EventId)> = None;
+        for h in handles {
+            if let PushOutcome::Accepted { moved, emitted } = h.join().unwrap() {
+                assert!(winner.is_none(), "round {round}: two winners — a lost update!");
+                winner = Some((moved[0].1.clone(), emitted[0].clone()));
+            }
+        }
+        let (winner_tip, id) = winner.expect("exactly one winner per generation");
+        committed_ids.push(id);
+        tip = winner_tip;
+    }
+
+    // The consumer reads the per-aggregate rows in `seq` order → contiguous `update_seq` 1..=k.
+    let mut rows: Vec<_> = committed_ids.iter().map(|id| outbox.row(id).unwrap()).collect();
+    rows.sort_by_key(|r| r.seq);
+    let seqs: Vec<u64> = rows.iter().map(|r| r.seq).collect();
+    assert_eq!(seqs, (0..k).collect::<Vec<_>>(), "per-aggregate outbox seq is gap-free under burst (2.3)");
+    let update_seqs: Vec<u64> = rows
+        .iter()
+        .map(|r| RefUpdatedView::decode(&r.envelope).unwrap().update_seq)
+        .collect();
+    assert_eq!(
+        update_seqs,
+        (1..=k).collect::<Vec<_>>(),
+        "the consumer reads update_seq in per-ref push order despite the concurrent burst"
+    );
 }
