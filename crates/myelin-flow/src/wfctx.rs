@@ -344,6 +344,22 @@ pub struct WfCtx {
     /// `nondeterministic` rather than replaying a different definition over an old journal. `None`
     /// when no version pin is supplied (the version-divergence leg is not armed).
     pinned_wf_version: Option<i32>,
+    /// **The durable-timer wheel a `sleep_until`/`sleep_for` arms into (P-FLOW-13, §4.2).** `None`
+    /// until [`WfCtx::with_timers`] supplies the engine's [`crate::timer::TimerStore`] + the run's
+    /// partition — a `WfCtx` built WITHOUT it (the pure activity/now/rand surface) cannot `sleep` (the
+    /// arming target is absent). The dispatcher supplies it so a workflow body's `sleep` arms a
+    /// durable `wf_timer` row the wheel then fires; the run parks (`waiting`) holding no runtime. The
+    /// tuple carries `(store, partition, now_secs)` — the engine's live EPOCH-SECONDS clock so a
+    /// `sleep_until(deadline)` parks iff `deadline > now_secs` and `sleep_for(d)` arms `now_secs + d`
+    /// (the deterministic `now()` side-marker is the BODY's RFC-3339 clock; this is the engine's
+    /// lease/wheel clock — [`crate::engine::FlowDispatcher::tick`]'s `now: i64`).
+    timers: Option<(crate::timer::TimerStore, i16, i64)>,
+    /// **Whether this drive PARKED on a durable timer — a `sleep` that armed a not-yet-due timer
+    /// (§4.2).** Set by [`WfCtx::sleep_until`] when the deadline is in the future (the run must wait):
+    /// the engine reads it to settle the run `waiting` (holding NO runtime) instead of `completed`.
+    /// `false` on a drive with no live sleep (or a `sleep` whose deadline already passed — it returns
+    /// immediately, no park).
+    parked_on_timer: bool,
 }
 
 /// One journaled command outcome a replay reads back (§4.1) — the result an `activity` returns on
@@ -396,7 +412,22 @@ impl WfCtx {
             double_effects: 0,
             divergence: None,
             pinned_wf_version: None,
+            timers: None,
+            parked_on_timer: false,
         }
+    }
+
+    /// **Supply the durable-timer wheel + the run's partition so this `WfCtx` can `sleep` (P-FLOW-13,
+    /// §4.2).** A `WfCtx` built without this (the pure `activity`/`now`/`rand`/`emit` surface) cannot
+    /// arm a durable timer — [`WfCtx::sleep_until`]/[`WfCtx::sleep_for`] return a [`WfError::CoCommit`]
+    /// naming the missing wheel rather than silently no-op-ing (a sleep that did nothing would be a
+    /// silent correctness bug, EI-01 §2). The dispatcher calls this when it builds the drive's `WfCtx`
+    /// so a workflow body's `sleep` arms a `wf_timer` row the wheel fires. `now_secs` is the engine's
+    /// live epoch-seconds clock (the lease/wheel clock) the park decision + `sleep_for`'s relative base
+    /// read. Chainable on `begin`/`resume`.
+    pub fn with_timers(mut self, timers: crate::timer::TimerStore, partition: i16, now_secs: i64) -> Self {
+        self.timers = Some((timers, partition, now_secs));
+        self
     }
 
     /// **Resume (re-drive) a `WfCtx` from its journaled `wf_history` — the deterministic
@@ -810,6 +841,104 @@ impl WfCtx {
             command_id,
             Some(vec![myelin_refs::ArtifactRef(value.to_string())]),
         );
+    }
+
+    /// **`sleep_until(fire_at_secs)` (contract 9.2, §4.2/§9.2) — arm a durable timer + park.** Arms a
+    /// durable `wf_timer` row in its minute `bucket = epoch_minute(fire_at)` (idempotent on the
+    /// deterministic `timer_id = <run_id>/<command_id>`, so a replayed `sleep` never double-arms),
+    /// journals a `timer_set` `wf_history` side row under the command position (the replay short-circuit
+    /// reads it back so the body issues NO second arm on re-drive), and PARKS the run: the workflow
+    /// holds NO runtime while it waits — it is a `wf_timer` row + a `waiting` run, not a thread (the
+    /// SC-11 substrate). The wheel ([`crate::timer::TimerWheel`]) fires it at its minute, wakes the run
+    /// (`waiting → running`), and the dispatcher re-drives past the `sleep`. A crash re-fires only the
+    /// unfired timer (effectively-once).
+    ///
+    /// **Replay (§4.1):** on re-drive, the `timer_set` command short-circuits — the `sleep` returns
+    /// WITHOUT re-arming (the timer is already on the wheel; the journaled command is replayed, not
+    /// re-issued). The arming is the live (first-drive) effect; the journal makes it replay-safe.
+    ///
+    /// **Returns:** `Ok(())` once the timer is armed/journaled. If the deadline is already PAST
+    /// (`fire_at <= now`) on the live drive, the timer is armed in bucket 0 (immediately due) and the
+    /// run does NOT park (the next wheel tick fires it) — a `sleep` into the past is a no-wait
+    /// continuation. A [`WfError::CoCommit`] is returned if no timer wheel was supplied
+    /// ([`WfCtx::with_timers`]) — a `sleep` with no wheel is a loud error, never a silent no-op.
+    /// `fire_at_secs` is the absolute deadline in epoch seconds (the §5.1 units convention the engine's
+    /// in-memory clock uses); the live drive clock the park decision reads is the engine's `now_secs`
+    /// (supplied via [`WfCtx::with_timers`]).
+    pub fn sleep_until(&mut self, fire_at_secs: i64) -> WfResult<()> {
+        // DIVERGENCE HALT (P-FLOW-07): a latched divergence freezes the sleep too (the run already halts).
+        if let Some(reason) = self.divergence.clone() {
+            return Err(WfError::Nondeterministic(reason));
+        }
+        let command_id = self.next_command_id();
+        // REPLAY SHORT-CIRCUIT (§4.1): a journaled `timer_set` returns WITHOUT re-arming — the timer is
+        // already on the wheel (armed on the first drive). The body issues no second arm on re-drive.
+        if let Some(replayed) = self.replay_history.get(&command_id) {
+            match replayed.kind.as_str() {
+                crate::timer::history_kind::TIMER_SET => return Ok(()),
+                // **DIVERGENCE GUARD (P-FLOW-07, FLOW-D2):** a `sleep` at a position journaled as a
+                // NON-`timer_set` kind (an activity / a side-marker) is a body that diverged from its
+                // journal — latch the divergence + halt (never re-arm against a journaled activity).
+                other => {
+                    let reason = format!(
+                        "replay divergence at {command_id}: body issued `sleep` but the journal records \
+                         kind `{other}` (the workflow body diverged from its journal)"
+                    );
+                    self.latch_divergence(reason.clone());
+                    return Err(WfError::Nondeterministic(reason));
+                }
+            }
+        }
+        // LIVE: arm the durable timer + journal the timer_set marker.
+        let (timers, partition, now_secs) = self
+            .timers
+            .clone()
+            .ok_or_else(|| WfError::CoCommit("sleep_until requires a timer wheel (WfCtx::with_timers)".into()))?;
+        // The deterministic timer_id = <run_id>/<command_id> (so a replayed sleep re-arms the SAME key
+        // → ON CONFLICT DO NOTHING; producer + consumer agree without coordination, §3.3).
+        let timer_id = format!("{}/{}", self.run_id, command_id);
+        let bucket = crate::timer::epoch_minute(fire_at_secs);
+        timers.arm(crate::timer::TimerRow {
+            tenant: self.tenant.clone(),
+            region: self.region.clone(),
+            timer_id,
+            run_id: Some(self.run_id.clone()),
+            command_id: command_id.clone(),
+            fire_at: fire_at_secs,
+            bucket,
+            fired: false,
+            partition,
+        });
+        // Journal the timer_set side row (the replay short-circuit reads it back) — references-not-
+        // payloads (the marker carries no result body). STAGED — durable iff commit (FLOW-D5).
+        self.stage_history(crate::timer::history_kind::TIMER_SET, command_id, None);
+        // PARK iff the deadline is in the FUTURE: the run waits (holding no runtime) until the wheel
+        // fires the timer. A deadline already past arms immediately-due (bucket 0) and does NOT park —
+        // the next wheel tick fires it (a sleep into the past is a no-wait continuation, §4.2).
+        if fire_at_secs > now_secs {
+            self.parked_on_timer = true;
+        }
+        Ok(())
+    }
+
+    /// **`sleep_for(duration_secs)` (contract 9.2, §4.2/§9.2) — sleep a RELATIVE duration.** Computes
+    /// the absolute deadline `now + duration` and arms a durable timer via [`WfCtx::sleep_until`]. The
+    /// SAME park/replay/effectively-once semantics — a relative `sleep_for(30 days)` arms a far-future
+    /// timer that costs nothing until its minute (the SC-11 substrate). `duration_secs` is in seconds
+    /// (the §5.1 units convention); a non-positive duration is a no-wait continuation (the deadline is
+    /// now/past). The relative base is the engine's live `now_secs` (supplied via [`WfCtx::with_timers`]).
+    pub fn sleep_for(&mut self, duration_secs: i64) -> WfResult<()> {
+        let now_secs = self.timers.as_ref().map(|(_, _, n)| *n).unwrap_or(0);
+        let fire_at = now_secs.saturating_add(duration_secs.max(0));
+        self.sleep_until(fire_at)
+    }
+
+    /// **Whether this drive PARKED on a durable timer (a `sleep` into the future, §4.2).** The engine
+    /// reads it to settle the run `waiting` (holding NO runtime) rather than `completed` — the run
+    /// wakes when the wheel fires the timer. `false` if no live `sleep` parked (or a `sleep` whose
+    /// deadline already passed — a no-wait continuation).
+    pub fn parked_on_timer(&self) -> bool {
+        self.parked_on_timer
     }
 
     /// **`emit(EventDraft)` (contract 9.2, §4.5; consumes 2.2) — the ONLY emit path.** Buffers the
@@ -1465,5 +1594,138 @@ mod tests {
         assert_eq!(ctx.staged_emit_len(), 2, "two emits staged (not a constant)");
         ctx.commit().expect("co-commit");
         assert_eq!(outbox.outbox_depth(), 2, "both emits durable after the co-commit");
+    }
+
+    /// **`sleep_until` arms a durable `wf_timer` row + journals `timer_set` + PARKS (P-FLOW-13,
+    /// §4.2).** A future deadline: the timer lands on the wheel in its minute bucket, one `timer_set`
+    /// history row is staged, the deterministic `timer_id = <run_id>/<command_id>`, and `parked_on_timer`
+    /// is true (the run waits, holding no runtime). After commit the journal holds the marker.
+    #[test]
+    fn sleep_until_arms_a_durable_timer_journals_timer_set_and_parks() {
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        let timers = crate::timer::TimerStore::new();
+        // now = 1000s; sleep until 1600s (future → parks). partition 3.
+        let mut ctx = begin(&outbox, journal.clone()).with_timers(timers.clone(), 3, 1000);
+        ctx.sleep_until(1600).expect("the sleep arms + journals");
+        assert!(ctx.parked_on_timer(), "a future-deadline sleep parks the run (waiting, no runtime)");
+        // the timer is armed on the wheel in its minute bucket (1600/60 = 26), deterministic id.
+        let timer = timers.get(&tenant(), "R1/agent.run:0").expect("the armed timer");
+        assert_eq!(timer.fire_at, 1600, "the absolute deadline");
+        assert_eq!(timer.bucket, 26, "the minute bucket = epoch_minute(1600) = 26");
+        assert_eq!(timer.partition, 3, "the timer rides the run's partition (co-located dispatch)");
+        assert!(!timer.fired, "armed-not-fired (the partial-index pivot)");
+        // one timer_set side row staged + journaled.
+        assert_eq!(ctx.staged_history_len(), 1, "one timer_set marker staged");
+        ctx.commit().expect("co-commit");
+        let hist = journal.history_for(&tenant(), "R1");
+        assert_eq!(hist.len(), 1, "the timer_set marker is journaled");
+        assert_eq!(hist[0].kind, crate::timer::history_kind::TIMER_SET);
+        assert_eq!(hist[0].command_id, "agent.run:0", "under the deterministic command position");
+    }
+
+    /// **A `sleep_until` whose deadline already PASSED arms immediately-due and does NOT park (§4.2).**
+    /// A deadline `<= now` is a no-wait continuation: the timer is armed in bucket 0 (the next wheel
+    /// tick fires it) but the run does not park — the body continues.
+    #[test]
+    fn a_past_deadline_sleep_does_not_park() {
+        let outbox = OutboxStore::new();
+        let timers = crate::timer::TimerStore::new();
+        // now = 1000s; sleep until 500s (already past).
+        let mut ctx = begin(&outbox, WfJournal::new()).with_timers(timers.clone(), 0, 1000);
+        ctx.sleep_until(500).expect("the sleep arms");
+        assert!(!ctx.parked_on_timer(), "a past-deadline sleep is a no-wait continuation (no park)");
+        // the timer is still armed (immediately due — the next wheel tick fires it).
+        assert!(timers.get(&tenant(), "R1/agent.run:0").is_some(), "the immediately-due timer is armed");
+    }
+
+    /// **`sleep_for` arms a RELATIVE timer (now + duration) and parks (§4.2).** `sleep_for(30 days)`
+    /// over now=1000s arms a far-future timer (bucket far in the future, never scanned until its
+    /// minute — the SC-11 substrate) and parks. A non-positive duration is a no-wait continuation.
+    #[test]
+    fn sleep_for_arms_a_relative_timer_and_parks() {
+        let outbox = OutboxStore::new();
+        let timers = crate::timer::TimerStore::new();
+        let mut ctx = begin(&outbox, WfJournal::new()).with_timers(timers.clone(), 0, 1000);
+        ctx.sleep_for(30 * 24 * 3600).expect("the relative sleep arms");
+        assert!(ctx.parked_on_timer(), "a 30-day sleep parks the run");
+        let timer = timers.get(&tenant(), "R1/agent.run:0").expect("the armed timer");
+        assert_eq!(timer.fire_at, 1000 + 30 * 24 * 3600, "the deadline is now + duration");
+        // a far-future bucket — the SC-11 partial index never reads it until its minute.
+        assert_eq!(timer.bucket, crate::timer::epoch_minute(1000 + 30 * 24 * 3600));
+    }
+
+    /// **A `sleep` on a `WfCtx` with NO timer wheel errors LOUDLY — never a silent no-op (EI-01 §2).**
+    /// A `WfCtx` built without `with_timers` cannot arm a durable timer; `sleep_until` returns a
+    /// `CoCommit` error naming the missing wheel rather than silently doing nothing (a silent sleep
+    /// that did not park would be a correctness bug — the run would "complete" without waiting).
+    #[test]
+    fn sleep_with_no_timer_wheel_errors_loudly() {
+        let outbox = OutboxStore::new();
+        let mut ctx = begin(&outbox, WfJournal::new()); // NO with_timers.
+        let err = ctx.sleep_until(2000).expect_err("a sleep with no wheel is a loud error");
+        match err {
+            WfError::CoCommit(msg) => assert!(msg.contains("timer wheel"), "the error names the missing wheel: {msg}"),
+            other => panic!("expected CoCommit naming the missing wheel, got {other:?}"),
+        }
+        assert!(!ctx.parked_on_timer(), "a failed sleep did not park (it errored)");
+    }
+
+    /// **REPLAY: a resumed `sleep_until` returns WITHOUT re-arming the timer (§4.1).** The first drive
+    /// arms the timer + journals `timer_set`; a resume re-issues the `sleep` at the same command
+    /// position — it short-circuits (the journaled `timer_set` replays), arms NO second timer, and does
+    /// NOT re-park (the run already waited; the re-drive continues past the sleep). The wheel holds one
+    /// timer, not two.
+    #[test]
+    fn resume_sleep_replays_without_re_arming() {
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        let timers = crate::timer::TimerStore::new();
+        // first drive: arm + journal the timer_set marker.
+        let mut c1 = begin(&outbox, journal.clone()).with_timers(timers.clone(), 0, 1000);
+        c1.sleep_until(1600).expect("arm");
+        c1.commit().expect("co-commit the marker");
+        assert_eq!(timers.armed_count(), 1, "one timer armed on the first drive");
+        let history = journal.history_for(&tenant(), "R1");
+
+        // resume: re-issue the sleep at the same position — it replays (no re-arm, no second park).
+        let mut c2 = WfCtx::resume(
+            &outbox, minter(), journal.clone(), ctx_base(), "R1", "agent.run",
+            "2026-06-21T00:00:00Z", 42, history,
+        )
+        .with_timers(timers.clone(), 0, 1700);
+        c2.sleep_until(1600).expect("the sleep replays");
+        assert_eq!(timers.armed_count(), 1, "no SECOND timer armed (the replay short-circuited)");
+        assert!(!c2.parked_on_timer(), "the resumed sleep does not re-park (the run already waited)");
+    }
+
+    /// **REVERSE divergence: a `sleep` at a position journaled as an ACTIVITY halts (P-FLOW-07,
+    /// FLOW-D2).** Position 0 journals an activity; a resume issues a `sleep` at position 0 — the body
+    /// diverged from its journal. The sleep latches the divergence + returns `Nondeterministic`
+    /// (the engine halts + dead-letters the run), never re-arms against the journaled activity.
+    #[test]
+    fn sleep_at_an_activity_position_halts_nondeterministic() {
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        let timers = crate::timer::TimerStore::new();
+        // first drive journals an activity at position 0.
+        let mut c1 = begin(&outbox, journal.clone());
+        c1.activity(RetryPolicy::default_policy(), |_i, _a| {
+            Ok(vec![ArtifactRef("myelin://acme/agent/effect/e0".into())])
+        })
+        .expect("activity");
+        c1.commit().expect("co-commit");
+        let history = journal.history_for(&tenant(), "R1");
+
+        // resume but issue a sleep at position 0 (the divergence).
+        let mut c2 = WfCtx::resume(
+            &outbox, minter(), journal.clone(), ctx_base(), "R1", "agent.run",
+            "2026-06-21T00:00:00Z", 42, history,
+        )
+        .with_timers(timers.clone(), 0, 1000);
+        let err = c2.sleep_until(2000).expect_err("the sleep-at-activity-position diverges");
+        assert!(err.is_nondeterministic(), "the verdict is Nondeterministic, got {err:?}");
+        assert!(c2.is_divergent(), "the divergence latch is set (the engine dead-letters the run)");
+        assert_eq!(timers.armed_count(), 0, "no timer armed against the journaled activity position");
     }
 }

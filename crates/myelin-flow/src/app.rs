@@ -148,27 +148,48 @@ pub fn flow_app_spec_with_engine(
     partition: i16,
     worker: impl Into<String>,
     lease_ttl_secs: i64,
-) -> (AppSpec, crate::engine::FlowDispatcher) {
+) -> (AppSpec, crate::engine::FlowDispatcher, crate::timer::TimerWheel) {
     use myelin_events::{InProcessBus, OutboxStore};
     // The ONE outbox the engine drives co-commit into AND the relay drains (BUS-2): supply it to the
     // OutboxSpec so the drive → relay → bus path is the sanctioned one (no second store).
     let outbox = OutboxStore::new();
+    let runs = crate::engine::RunStore::new();
+    let journal = crate::wfctx::WfJournal::new();
+    let telemetry = crate::engine::FlowTelemetry::new();
+    // The ONE durable-timer wheel store BOTH the dispatcher arms into (a body `sleep` → a `wf_timer`
+    // row) AND the timer-wheel worker scans (the SC-11 minute-bucket wheel, §4.2). One substrate.
+    let timers = crate::timer::TimerStore::new();
     let dispatcher = crate::engine::FlowDispatcher::new(
-        crate::engine::RunStore::new(),
+        runs.clone(),
         outbox.clone(),
-        crate::wfctx::WfJournal::new(),
-        crate::engine::FlowTelemetry::new(),
+        journal.clone(),
+        telemetry.clone(),
         minter,
         ctx_base,
         partition,
         worker,
         lease_ttl_secs,
+    )
+    .with_timers(timers.clone());
+    // The timer-wheel worker for THIS partition — the scan loop wired into the consumer seam alongside
+    // the dispatcher (P-FLOW-13, §4.2). Each wheel tick scans the due bucket (`bucket <= now AND NOT
+    // fired`, far-future untouched), fires each due timer effectively-once (set fired + journal
+    // `timer_fired` + wake the run), and refreshes the timer-wheel-lag telemetry (the SC-11 health
+    // signal). The harness drives its tick on the wheel cadence (jittered ~1s, §4.2). The bounded
+    // per-tick fire LIMIT is generous (a burst drains over a few ticks; the lag signal tracks it).
+    let wheel = crate::timer::TimerWheel::new(
+        timers,
+        journal,
+        runs,
+        telemetry,
+        partition,
+        /* batch */ 4_096,
     );
     let mut spec = flow_app_spec(config);
     // The engine drives co-commit into `outbox`; the relay must drain THAT store (the sanctioned
     // emit → relay → bus path), not a fresh default one.
     spec.outbox = OutboxSpec::new(outbox, InProcessBus::new());
-    (spec, dispatcher)
+    (spec, dispatcher, wheel)
 }
 
 /// **Build the inbound-signal `ConsumerReg` for `tenant` — the bus side of `DurableExecutor::signal`
@@ -422,7 +443,7 @@ mod tests {
             recorded_at: Timestamp("2026-06-21T00:00:01Z".into()),
             caused_by: None,
         };
-        let (spec, mut dispatcher) = flow_app_spec_with_engine(
+        let (spec, mut dispatcher, _wheel) = flow_app_spec_with_engine(
             Config::default(),
             Arc::new(MonotonicMinter::new()),
             ctx_base,
@@ -455,6 +476,78 @@ mod tests {
             "the seeded run completed under the engine-wired dispatcher"
         );
         assert_eq!(dispatcher.telemetry().double_effect_count(), 0, "0 double-effect");
+    }
+
+    /// **The timer-wheel scan loop is wired into the consumer seam alongside the dispatcher
+    /// (P-FLOW-13, §4.2).** `flow_app_spec_with_engine` returns the dispatcher PLUS the
+    /// [`crate::timer::TimerWheel`] over the SAME run store + journal + timer store. A body that
+    /// `ctx.sleep_for`s arms a `wf_timer` row and PARKS the run (`waiting`); the wheel's tick fires the
+    /// timer at its minute (waking the run `waiting → running`); a SECOND dispatcher tick re-drives the
+    /// run past the sleep to completion. End-to-end: arm → park → wheel-fire → wake → re-drive.
+    #[test]
+    fn timer_wheel_wired_into_consumer_seam_parks_fires_and_re_drives() {
+        use crate::engine::{run_state, DriveOutcome, RunRow};
+        use myelin_events::{Actor, EmitContextBase, MonotonicMinter, Timestamp};
+        use myelin_identity::{Principal, PrincipalId, PrincipalKind};
+        use myelin_refs::ArtifactRef;
+        use myelin_tenancy::{Region, TenantId};
+        use std::sync::Arc;
+
+        let tenant = TenantId("acme".into());
+        let region = Region("fr-par".into());
+        let ctx_base = EmitContextBase {
+            tenant: tenant.clone(),
+            region: region.clone(),
+            actor: Actor(Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, tenant.clone())),
+            schema_ver: 1,
+            occurred_at: Timestamp("2026-06-21T00:00:00Z".into()),
+            recorded_at: Timestamp("2026-06-21T00:00:01Z".into()),
+            caused_by: None,
+        };
+        let (_spec, mut dispatcher, wheel) = flow_app_spec_with_engine(
+            Config::default(),
+            Arc::new(MonotonicMinter::new()),
+            ctx_base,
+            0,
+            "worker-1",
+            30,
+        );
+
+        // a body that sleeps 600s then completes — the sleep is the FIRST command (a fresh run parks).
+        dispatcher.register(
+            "sla.run",
+            Box::new(|ctx: &mut crate::WfCtx| {
+                ctx.sleep_for(600).map_err(|e| format!("{e:?}"))?;
+                ctx.activity(crate::RetryPolicy::default_policy(), |_i, _a| {
+                    Ok(vec![ArtifactRef("myelin://acme/agent/effect/after-sleep".into())])
+                })
+                .map_err(|e| format!("{e:?}"))?;
+                Ok(vec![])
+            }),
+        );
+        dispatcher.runs().put(RunRow::new_runnable(tenant.clone(), region, "R1", "sla.run", 0));
+
+        // tick 1 (now=1000s): the body arms a 600s timer (fires at 1600s) + PARKS — the run is waiting.
+        let o1 = dispatcher.tick(1000, "2026-06-21T00:00:00Z", 7);
+        assert!(matches!(o1, Some(DriveOutcome::Waiting)), "the sleep parked the run, got {o1:?}");
+        assert_eq!(dispatcher.runs().get(&tenant, "R1").unwrap().state, run_state::WAITING, "the run is waiting (no runtime)");
+        assert_eq!(wheel.timers().unfired_count(), 1, "one durable timer armed on the wheel");
+
+        // a wheel tick BEFORE the minute (now=1100s): the timer is far-future (bucket > now) → not fired.
+        assert_eq!(wheel.tick(1100), 0, "the not-yet-due timer is NOT fired (far-future bucket untouched)");
+        assert_eq!(dispatcher.runs().get(&tenant, "R1").unwrap().state, run_state::WAITING, "still waiting");
+
+        // a wheel tick AT the minute (now=1600s): the timer fires → the run wakes (waiting → running).
+        assert_eq!(wheel.tick(1600), 1, "the due timer fires at its minute");
+        assert_eq!(dispatcher.runs().get(&tenant, "R1").unwrap().state, run_state::RUNNING, "the wheel woke the run");
+        assert_eq!(wheel.telemetry().timer_wheel_lag(), 0, "the timer-wheel-lag is 0 after the fire (SC-11 health signal)");
+
+        // tick 2 (now=1601s): the dispatcher re-leases + re-drives — the sleep replays (no re-arm), the
+        // post-sleep activity runs, the run completes.
+        let o2 = dispatcher.tick(1601, "2026-06-21T00:00:01Z", 7);
+        assert!(matches!(o2, Some(DriveOutcome::Completed(_))), "the run completed past the sleep, got {o2:?}");
+        assert_eq!(dispatcher.runs().get(&tenant, "R1").unwrap().state, run_state::COMPLETED, "the run is completed");
+        assert_eq!(dispatcher.telemetry().double_effect_count(), 0, "0 double-effect (the sleep replayed, did not re-arm)");
     }
 
     /// **Graceful drain leaves the outbox at depth 0 (contract 1.1 / §3.1).** A booted-then-drained

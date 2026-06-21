@@ -66,7 +66,18 @@
 //!     → ON CONFLICT DO NOTHING → 0 double-apply; the 9.1 per-effect CDC pair vs the Agent Fabric
 //!     `EffectApi` consumer is `tests/cdc_9_1_per_effect.rs`; the F-4-extended drill across a
 //!     restart+deploy lands at **P-FLOW-12** and at **CHAT-D10** M4); durable timers
-//!     (**P-FLOW-13**, FLOW-D3) — the rest land later. An empty journal is not a working engine.
+//!     (**P-FLOW-13**, FLOW-D3) — **LANDED**, see [`timer`] ([`TimerStore`] the minute-bucket wheel:
+//!     `arm` (idempotent on the deterministic `timer_id`) + the bucketed due-scan ([`TimerStore::scan_due`]:
+//!     `bucket <= now AND NOT fired`, `FOR UPDATE SKIP LOCKED`, far-future NEVER scanned — the SC-11
+//!     partial-index move) + effectively-once `fire` (set fired + idempotent `timer_fired` journal +
+//!     wake the parked run); [`WfCtx::sleep_until`]/[`WfCtx::sleep_for`] arm a `wf_timer` row + park the
+//!     run holding no runtime; the [`TimerWheel`] scan loop wired into the consumer seam alongside the
+//!     dispatcher ([`app::flow_app_spec_with_engine`]); the timer-wheel-lag telemetry on
+//!     [`FlowTelemetry`] (the SC-11 health signal); the FLOW-D3-floor drill at 100k+ is
+//!     `tests/drills_flow_d3_timer_wheel.rs`, the live-PG bucketed-scan apply
+//!     `tests/integration_flow_timer.rs`; the cheap disarm/re-arm half is **P-FLOW-14**, the 1M+
+//!     seven-figure cell-scale run is **P-FLOW-24**) — the rest land later. An empty journal is not a
+//!     working engine.
 //!
 //! There is **no mandatory-core algorithm module** here (it is the schema + frozen type shapes), so
 //! there is no mutation-score floor on this prompt — stated explicitly per the template's TESTS
@@ -87,6 +98,7 @@ pub mod holder;
 pub mod migrations;
 pub mod schema;
 pub mod signal_consumer;
+pub mod timer;
 pub mod wfctx;
 
 pub use app::{
@@ -98,9 +110,10 @@ pub use approval::{
     EffectApplier, EffectOutcome, GateResult, GatedEffect, APPROVAL_SIGNAL_NAME, DECLINE_MARKER,
 };
 pub use engine::{
-    drive, run_state, DriveOutcome, FlowDispatcher, FlowTelemetry, RunRow, RunStore, SignalRow,
-    SignalStore, WorkflowBody,
+    drive, drive_versioned, drive_with_timers, run_state, DriveOutcome, FlowDispatcher,
+    FlowTelemetry, RunRow, RunStore, SignalRow, SignalStore, WorkflowBody,
 };
+pub use timer::{epoch_minute, ArmOutcome, FireOutcome, TimerRow, TimerStore, TimerWheel, SECS_PER_MINUTE};
 pub use executor::{
     DurableExecutor, ExecutorError, FlowExecutor, RunBudget, RunId, RunStatus, SignalOutcome,
     SignalSpec, StartSpec, PARTITION_COUNT,
