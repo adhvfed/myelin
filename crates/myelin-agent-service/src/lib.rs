@@ -81,6 +81,7 @@ pub mod defaults;
 pub mod dry_run;
 pub mod effect_api;
 pub mod hitl;
+pub mod hitl_batch;
 pub mod holder;
 pub mod migrations;
 pub mod mock;
@@ -149,6 +150,19 @@ pub use hitl::{
     derive_approver_set, gate_id_of, live_cost_estimate, run_hitl_loop, surface_card, ApprovedTools,
     ApproverSet, Halted, HitlCard, HitlGate, HitlGateState, HitlOutcome, HitlWait, InvalidTransition,
     RiskSummary, WaitDecision,
+};
+
+// Per-effect HITL idempotency (C4/OQ-F; AG-P10 → P-222): the AG-D5 EXACTLY-ONCE leg — a batch /
+// partial-approval card gating N effects keys each effect's resume signal per-effect (`card_id` single,
+// `card_id:effect_idx` multi), so a PARTIAL approval (approve 0+2, decline 1) sends three
+// independently-idempotent decisions (each → exactly one apply) and a DOUBLE-CLICK on approve-all
+// re-sends the same keys → no double-apply. The `ApplyLedger` is the exactly-once binding
+// (apply-counter == approved-effect count, never more). Reconciles with the durable-engine half
+// (`myelin-flow::approval`, P-206) by producing the SAME per-effect key (a parity CDC, not a second
+// engine). No floor — the M2-B HITL family (AG-D5) is now complete.
+pub use hitl_batch::{
+    per_effect_idem_key, run_batch_hitl_loop, ApplyLedger, BatchApprovalCard, BatchGatedEffect,
+    BatchHitlWait, BatchOutcome, DecisionScript, EffectOutcome,
 };
 
 // The delegation-scoped tool-list (AG-P7 → P-219): the `list_objects` SetExpr push-down (the no-N+1
