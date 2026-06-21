@@ -26,10 +26,13 @@ publish = false
 # DAG modelled by `myelin-substrate::crate_graph` (substrate_is_root() / identity_is_sink() are
 # preserved — a subsystem crate is the graph's terminal consumer, not a node in it).
 #
-# DB-FREE: this is a pure value/trait crate. P-129 touches NO DB / object-store / cache / bus
-# contract — so there is no `integration` feature and no live-stack test here; the Firecracker
-# backend (the real launch) + its escape drill are CI-P2/CI-P5 (named floors). `cargo build
-# --workspace` stays DB-free.
+# DB-FREE / VM-FREE BY DEFAULT: this crate touches NO DB / object-store / cache / bus contract.
+# CI-P2 (P-237) adds the Firecracker default backend + the gVisor named-second backend + the
+# backend-independent mandatory hardening profile. Their unit tests inject a fake VMM/runtime so
+# the default `cargo test` NEVER boots a guest. The REAL microVM boot lives ONLY behind the
+# `integration` feature (tests/hardened_boot_selftest.rs), gated to SKIP gracefully without
+# /dev/kvm or `firecracker`. `cargo build --workspace` + the default `cargo test` stay DB-free AND
+# VM-free. The ZERO-escapes real-kernel GATE (AG-D4 / CI-T1) is CI-P5 (named floor).
 [dependencies]
 # The frozen (tenant, region) partition types (contract 12.1 / P-CP-01). The FleetProvider trait
 # names `Region` in provision/capacity (arch 01 §2). myelin-tenancy is a shared partition-key
@@ -37,6 +40,14 @@ publish = false
 # keeps the §2.9 graph acyclic.
 myelin-tenancy = { path = "../myelin-tenancy" }
 serde.workspace = true
+
+[features]
+# The REAL hardened-boot self-test (tests/hardened_boot_selftest.rs) boots a Firecracker microVM with
+# the full hardening profile ON and asserts (from real enforced state) egress-default-deny + pids.max
+# + read-only-root. VM-free by default: the boot is integration-only, gated to SKIP gracefully when
+# /dev/kvm or `firecracker` is absent (so CI without KVM passes). `cargo build --workspace` + the
+# default `cargo test` stay DB-free AND VM-free (CI-P2 GATE).
+integration = []
 
 [dev-dependencies]
 serde_json.workspace = true

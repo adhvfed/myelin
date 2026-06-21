@@ -69,6 +69,19 @@ const EXCLUDED_SUBSTRINGS: &[&str] = &[
     // one legitimate host-exec site for a CI/test-support orchestration binary. NAMED, LOUD
     // exclusion of a single tool file; the lint stays fully live on every production crate.
     "myelin-harness/src/bin/infra-scorecard.rs",
+    // The Firecracker + gVisor sandbox BACKENDS (CI-P2 → P-237): the ONE legitimate VMM/runtime
+    // spawn sites. The `no-host-exec` rule forbids platform code SHELLING OUT to the host kernel so
+    // that all execution goes through the unified sandbox seam (`SandboxBackend::launch`). These two
+    // files ARE that seam's enforcement mechanism: spawning the Firecracker VMM (`firecracker
+    // --no-api --config-file`) / the gVisor `runsc` runtime is precisely HOW the isolation boundary
+    // is CREATED — it is not a path that bypasses the sandbox, it is the path that builds it. Exactly
+    // analogous to the relay's one broker-publish site + the harness runners' one cargo-spawn site
+    // above. The routing split (only compute/external untrusted code reaches launch; mutation goes
+    // through EffectApi, contract 8.2) is unweakened, and the lint stays fully live on every OTHER
+    // production file. NAMED, LOUD exclusion of these two files (see the module notes in
+    // firecracker.rs / gvisor.rs), never a silent skip.
+    "myelin-ci-sandbox/src/firecracker.rs",
+    "myelin-ci-sandbox/src/gvisor.rs",
     "myelin-lints/",
     "/tests/",
     "/fixtures/",
