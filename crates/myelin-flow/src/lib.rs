@@ -34,7 +34,10 @@
 //!   the harness wires; the `myelin-flow` binary hands it to `serve`. The `consumers` slot is the
 //!   EMPTY seam (the replay engine plus the signal/timer consumers are P-FLOW-04..05/09/13).
 //! - **The `PersonalDataHolder` auto-registration** over `workflow_run` / `wf_history` / `wf_signal`
-//!   (the structural references-not-payloads half) → **P-FLOW-03** (P-201).
+//!   (the structural references-not-payloads half) → **LANDED at P-FLOW-03** (P-201), see [`holder`]
+//!   ([`WfHistoryHolder`]: `locate`/`export` real over the journal, `erase` structurally wired; the
+//!   flow store classifies to H8 — the §5.5 references-not-payloads reconcile; the per-subject-DEK
+//!   crypto-shred reach is the NAMED M5 follow-on **P-FLOW-23**).
 //! - **The algorithms**: WfCtx + journal/outbox co-commit (**P-FLOW-04**, FLOW-D5) — **LANDED**,
 //!   see [`wfctx`] ([`WfCtx`]: `activity`/`now`/`rand`/`emit` + the single-txn co-commit; the
 //!   FLOW-D5 drill is `tests/drills_flow_d5_cocommit.rs`); deterministic
@@ -55,11 +58,16 @@
 //! is the graph's terminal consumer, not a node in it).
 
 pub mod app;
+pub mod holder;
 pub mod migrations;
 pub mod schema;
 pub mod wfctx;
 
 pub use app::{boot_flow, flow_app_spec, run_flow, SERVICE_NAME};
+pub use holder::{
+    flow_history_holder, flow_store_classifier, register_flow_holder, FlowBacking,
+    FlowHolderRegistration, RestrictSet, WfHistoryHolder, FLOW_OLTP_STORE,
+};
 pub use wfctx::{
     attempt_state, history_kind, ActivityError, RetryPolicy, WfCtx, WfError, WfJournal, WfResult,
 };

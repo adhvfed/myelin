@@ -236,6 +236,29 @@ mod tests {
         );
     }
 
+    /// **The boot-registered flow OLTP store classifies to H8 — holder-completeness GREEN on boot
+    /// (P-FLOW-03; contract 1.4 + gdpr §3.2).** The store the harness auto-registers on boot is in the
+    /// exhaustive H1–H18 list (H8, the §5.5 references-not-payloads reconcile) — 0 orphan, so the M5
+    /// DSAR fan-out cannot miss workflow history. This is the structural gate: the holder
+    /// auto-registers on boot AND is accounted for in the data map.
+    #[test]
+    fn boot_registered_flow_store_classifies_and_completeness_is_green() {
+        use crate::holder::{flow_history_holder, flow_store_classifier};
+        use myelin_substrate::{assert_holder_completeness, Holder};
+        let handle = boot_flow(Config::default()).expect("boot");
+        // the auto-registered boot store classifies to H8 (no orphan).
+        assert_eq!(flow_history_holder(), Some(Holder::H8EventBus));
+        // the holder-completeness assertion is green over the boot registry + the flow classifier.
+        assert_eq!(
+            assert_holder_completeness(
+                handle.holder_registry().registrations(),
+                &flow_store_classifier(),
+            ),
+            Ok(()),
+            "every store the flow harness opens is in the exhaustive H1–H18 list — 0 orphan"
+        );
+    }
+
     /// **`run_flow` runs the whole lifecycle end-to-end and returns Ok on a clean drain (the CDC
     /// consumer side of 1.1 — a `main` that just calls `serve`).** A clean drain leaves the outbox
     /// at depth 0 (nothing committed is left unpublished) — the silent-data-loss floor.
