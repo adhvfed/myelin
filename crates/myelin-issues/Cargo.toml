@@ -49,6 +49,18 @@ myelin-query = { path = "../myelin-query" }
 # language and Issues does NOT author the grammar (EI-01 §7). The `initiative` type token is already
 # in the Bus seed (recon §2); Issues completes the `issue.*`/`initiative.*` event-name list here.
 myelin-events = { path = "../myelin-events" }
+# The frozen Search-owned `declare_indexable` surface (contract 6.3): the `IndexSpec` shape Issues
+# CONSTRUCTS its `issue.*` facets projection against + the `IncrementalIndexer` admission seam that
+# ACCEPTS the registration (the build-time gate). Issues does NOT define a second indexing-contract
+# shape — it links the ONE frozen `myelin_search::IndexSpec` (EI-01 §7). The live emitter
+# (`issue.*` Search projection rows) lands in ISS-P17; here the DECLARATION is the deliverable.
+myelin-search = { path = "../myelin-search" }
+# The frozen Notif-owned `define_notif_rule` surface (contract 7.6): the `NotifRule`/`Reason`/`Class`
+# shapes + the `NotifRuleRegistry::register` inverse-signal seam. Issues registers its reason set
+# (SLA at-risk / unblocked / approval-requested) against the ONE Notif ranking table — never a second
+# reason vocabulary (EI-01 §1/§7). The live notif wiring ("My Work" inbox routing) lands in ISS-P22;
+# here the DECLARATION is the deliverable.
+myelin-notif = { path = "../myelin-notif" }
 serde.workspace = true
 serde_json.workspace = true
 
@@ -63,6 +75,10 @@ serde_json.workspace = true
 [dev-dependencies]
 myelin-identity-service = { path = "../myelin-identity-service" }
 myelin-storage = { path = "../myelin-storage" }
+# The frozen `ArtifactRef` token (contract 5.1) the Notif `classify`/dedup-render seam keys on — used
+# ONLY in the 7.6 declares CDC + unit tests to render an Issues subject's inbox dedup key. Test
+# scaffolding (no runtime edge: the declares module is generic over the caller's subject ref).
+myelin-refs = { path = "../myelin-refs" }
 # Note: `myelin-events` + `serde_json` are now REGULAR dependencies (above) — `events.rs` (ISS-P03)
 # registers the `issue.*` taxonomy against the Bus grammar at RUNTIME, and the 13.3 byte-identity CDC
 # (tests/cdc_13_3_issues_coown.rs) keeps serializing the co-owned ViewSpec/FieldType to JSON. Both
