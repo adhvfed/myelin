@@ -491,8 +491,24 @@ cdc = [
 [[contract]]
 row = "5.4"
 title = "refs.edge.created / refs.edge.removed"
-status = "deferred"
-landing = "P-157"
+# The 5.4 producer/consumer seam is REAL: producers emit `refs.edge.created` from the three structured
+# content nodes via the outbox (no standalone edge-write API), and the Refs edge-builder consumes them.
+# REF-P6/P-155 (the edge-builder consumer, cdc_5_4_edge_builder.rs) + REF-P8/P-157 (the content-node
+# extraction + same-tx emit seam, cdc_5_4_emit_seam.rs) ship the Refs half. GIT-P17/P-278 adds the
+# GIT-OWNED producer half — Git PR/review/comment bodies are `myelin-content` documents whose three
+# structured nodes emit the byte-identical `refs.edge.created` wire shape the edge-builder ingests
+# (`myelin_git::body::{extract_body_edges, emit_body_edges}`; the CDC models the consumer's field reads
+# + the deterministic `edge_id` locally because `myelin-git` cannot depend on the Refs SERVICE crate —
+# the §2.9 one-directional edge: `myelin-refs-service` depends on `myelin-git`). FLOOR (named): the
+# typed-edge LIFECYCLE mirror (`Closes`/PR-link `refs.edge.*` with `rel_class='lifecycle'`) is the
+# DISTINCT GIT-P19 producer + row 5.5; this row's content-node `reference`-class edges ship here.
+status = "covered"
+# The Git content-edge CDC carries BOTH sides in one file (provider = the Git body producer; consumer =
+# the Refs edge-builder's field reads + the deterministic `edge_id`, modelled locally because
+# `myelin-git` cannot depend on the Refs SERVICE crate). The Refs-side emit/edge-builder unit + CDC
+# (cdc_5_4_emit_seam.rs / cdc_5_4_edge_builder.rs) prove the same seam from the Refs crate; the
+# self-complete pair listed here satisfies the gate's per-file provider+consumer evidence.
+cdc = ["crates/myelin-git/tests/cdc_5_4_13_1_git_content_edges.rs"]
 
 [[contract]]
 row = "5.5"
@@ -1456,8 +1472,14 @@ title = "myelin-content taxonomy (frozen)"
 # P-234 (KN-P01): the frozen 15-variant Block taxonomy + the markdown-subset inline
 # grammar + the three structured nodes, with the WASM render path and the KN-D2 round-trip
 # gate. Knowledge PROVIDES the frozen taxonomy; Chat/Issues consume strict subsets (X-2).
+# GIT-P17/P-278 adds GIT as a CONSUMER of the frozen subset: PR/review/comment bodies are
+# `myelin-content` documents (`myelin_git::body::Body`) round-tripped `render(parse(md)) === md`
+# through the ONE editor render path (the KN-D2-class git-body corpus parity, 100%).
 status = "covered"
-cdc = ["crates/myelin-content/tests/cdc_13_1_taxonomy.rs"]
+cdc = [
+    "crates/myelin-content/tests/cdc_13_1_taxonomy.rs",
+    "crates/myelin-git/tests/cdc_5_4_13_1_git_content_edges.rs",
+]
 
 [[contract]]
 row = "13.2"

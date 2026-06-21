@@ -104,6 +104,19 @@
 
 #![forbid(unsafe_code)]
 
+/// **PR/review/comment BODIES on the frozen `myelin-content` subset + the content-node →
+/// `refs.edge.created` emission** (GIT-P17 / P-278, M3-G3 — the content-bodies half). A Git body is a
+/// real [`myelin_content`] document ([`body::Body`]): the markdown-subset string + the three positional
+/// structured inline nodes, round-tripped through the ONE editor render path (`render(parse(md)) ===
+/// md`) and **single-author CAS** ([`body::Body::cas_edit`]). The three inline ref nodes produce
+/// `refs.edge.created` UNIFORMLY via the outbox ([`body::emit_body_edges`], contract 5.4 — no standalone
+/// edge-write API), in the SAME transaction as the body's `git.pr.*`/`git.comment.*` content event
+/// (emit-iff-committed). This is the **Git-owned producer half** of 5.4 (Git cannot depend on the Refs
+/// service crate — the §2.9 DAG); it produces the byte-identical edge wire-shape the Refs edge-builder
+/// consumes (CDC-pinned). Replaces the GIT-P16 opaque `BodyRef` ciphertext floor for the body content.
+/// Floors: the typed-edge LIFECYCLE mirror (`Closes`/PR-link edges) is the DISTINCT GIT-P19 follow-on;
+/// the per-subject-DEK at-rest seal rides the GIT-P20 store wiring.
+pub mod body;
 pub mod check_status;
 pub mod commit;
 /// The **GitCore layered seam** (GIT-P8 / P-269, M3-G1): the strategy trait + router that sends

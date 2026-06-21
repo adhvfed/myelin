@@ -49,6 +49,16 @@ myelin-search = { path = "../myelin-search" }
 # code-projection `struct_fields` (path/language/blob_oid) are typed over. Owned by Search/Query, not
 # re-defined here.
 myelin-query = { path = "../myelin-query" }
+# The FROZEN myelin-content markdown-subset + the three structured inline nodes (contract 13.1,
+# X-2/OQ-B). GIT-P17 (P-278, M3-G3): Git PR/review/comment BODIES are a `myelin-content` document —
+# the markdown-subset string + the positional `mention`/`artifact_ref`/`embed` nodes — round-tripped
+# through the ONE editor render path (`render(parse(md)) === md`), and the three inline ref nodes
+# produce `refs.edge.created` uniformly via the outbox (5.4). Git CONSUMES the frozen subset; Knowledge
+# leads/freezes the taxonomy (no second content model, EI-01 §7). `myelin-content` is the Knowledge
+# data-model LEAF (it depends on no subsystem crate and NOTHING in the production DAG depends back on
+# it); a producer LEAF (`myelin-git`) consuming the frozen shared content shape is an acyclic sanctioned
+# edge (mirrors the `myelin-refs` / `myelin-search` / `myelin-notif` edges this crate already carries).
+myelin-content = { path = "../myelin-content" }
 # The Notif registration seam (contract 7.6 define_notif_rule + the read-fanout WatcherResolvePort,
 # 4.3/4.10). GIT-P19 (P-263) is producer accretion: Git REGISTERS its define_notif_rule set
 # (review_requested / mentioned) by constructing the frozen `myelin_notif::NotifRule` values + wires
