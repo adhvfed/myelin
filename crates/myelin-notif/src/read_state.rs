@@ -37,9 +37,12 @@
 //!
 //! `snooze` RECORDS the `snooze_until` and parks the item; the **durable re-surface TIMER** that
 //! flips a due snooze back to `unread` (so it re-enters the active inbox at its `until`) is the
-//! `myelin-flow` durable timer wheel — **NOTIF-P14 / NOTIF-P18** (the same minute-bucket wheel that
-//! serves SLA + escalation timers — one substrate, three uses). Here only the until is recorded; the
-//! wheel is NOT wired. Named so this read-state slice is not mistaken for the re-surfacing snooze.
+//! `myelin-flow` durable timer wheel — the same minute-bucket wheel that serves SLA + escalation
+//! timers (one substrate, three uses). Here only the until is recorded; the wheel is NOT wired. Named
+//! so this read-state slice is not mistaken for the re-surfacing snooze. **FLOOR FILLED:** the durable
+//! re-surface timer landed at **NOTIF-P18 / P-196** ([`crate::snooze_resurface`]: a snoozed item
+//! re-surfaces at its `until` via a durable timer on the SAME wheel escalation arms — survives a Notif
+//! restart, fires effectively-once, 0 missed / 0 duplicate re-surface).
 //!
 //! ## Mutation floor (the read-state module — mandatory-core)
 //!
