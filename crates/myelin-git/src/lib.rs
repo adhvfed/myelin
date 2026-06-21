@@ -113,6 +113,16 @@ pub mod commit;
 /// OQ-1 gix-ward floor (GIT-P33).
 pub mod core;
 pub mod events;
+/// The **stateless Git front door / router** (GIT-P13 / P-274, M3-G2 — FIRST RUNNABLE): the one
+/// pipeline every SSH (`russh`) + smart-HTTP-v2 (`axum`/`hyper`) entrypoint funnels through —
+/// `authenticate` (Id 4.1) → `check` + `CaveatContext` (Id 4.2) → `placement_of(repo)` (12.2) →
+/// **residency reject-if-leaving-region** (ADR-11 / 12.4) → stream packs through the [`core`] seam
+/// (no whole-pack buffering); `liveness ≠ readiness`. The GIT-D8 invariant — **tenant from the
+/// TOKEN, never the URL path** — is enforced as a structural cross-tenant deny BEFORE check/
+/// placement/stream (0 cross-tenant read). Floors: GIT-P14 wires the ReBAC fragment LIVE + the
+/// FailStatic degrade-not-cascade bound; GIT-P15 lands the protected-human-lane shed order + the
+/// CDN bundle-URI accelerated-clone. See [`front_door::FrontDoor`].
+pub mod front_door;
 /// The in-process read backend ([`gix_backend::GixCore`]) over `git2` (libgit2 — the
 /// architecture-named fallback; gix-preferred is the OQ-1 floor, GIT-P33). Read/diff/blame with no
 /// `git` fork (no-host-exec by construction).
