@@ -87,10 +87,11 @@ use myelin_tenancy::{Region, TenantId};
 /// data. Byte-for-byte the same set the control plane's `residency_verify` requires (P-085); the
 /// two crates pin the SAME M1 set without sharing a type (the DAG forbids the edge).
 ///
-/// **FLOOR (named):** the within-EU CDN edge set (P-ST-23 / P-254) + the push-mirror targets
-/// (P-ST-25 / P-255) + the T3 firehose archive (P-ST-20 / P-147) are the M3/M2 follow-ons — they
-/// become additional variants here and feed the SAME [`StoreSet::residency_verify`]. The M1 set is
-/// OLTP / blob / index-search / KMS.
+/// **FLOOR (named):** the within-EU CDN edge set ([`Self::CdnEdgeSet`], P-ST-23 / P-254 — now
+/// LANDED, see [`crate::cdn`]) + the T3 firehose archive ([`Self::T3FirehoseArchive`], P-ST-20 /
+/// P-147 — landed) are follow-on variants that feed the SAME [`StoreSet::residency_verify`]; the
+/// push-mirror target (P-ST-25 / P-255) is the remaining M3 follow-on (it becomes another variant
+/// here without changing the aggregation shape). The M1 set is OLTP / blob / index-search / KMS.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ResidencyStoreClass {
     /// The OLTP tier (P-ST-01) — the tenant's transactional rows.
@@ -108,6 +109,15 @@ pub enum ResidencyStoreClass {
     /// module named for P-ST-20). The C2 `(job,step,byte-range)` index (P-ST-26) + the C1 per-subject
     /// CI-log DEK (P-ST-27) are the M4 follow-ons; they do not change this residency shape.
     T3FirehoseArchive,
+    /// **The within-EU CDN clone/bundle edge set (C3, P-ST-23 / P-254) — the delivery-edge POPs the
+    /// hot-repo/clone-storm acceleration class serves content-addressed bundles from.** A follow-on
+    /// store class (NOT in the M1 set): the CDN is NOT a new store (the base blob tier is unchanged);
+    /// it is a *delivery layer* whose eligible edge POPs are all within-EU for an EU tenant. The CDN
+    /// reports the (single) region its eligible edge set serves into the SAME
+    /// [`verify_region_pinning`] aggregation, so a CDN edge serving an EU tenant's bundles from an
+    /// extra-EU POP is caught here without a code change (storage.md §3.2 C3 — "residency_verify
+    /// covers the CDN edge set"). The C6 push-mirror target is the sibling P-ST-25 / P-255.
+    CdnEdgeSet,
 }
 
 impl ResidencyStoreClass {
@@ -119,6 +129,7 @@ impl ResidencyStoreClass {
             ResidencyStoreClass::IndexSearch => "index_search",
             ResidencyStoreClass::Kms => "kms",
             ResidencyStoreClass::T3FirehoseArchive => "t3_firehose_archive",
+            ResidencyStoreClass::CdnEdgeSet => "cdn_edge_set",
         }
     }
 

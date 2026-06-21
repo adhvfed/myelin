@@ -363,9 +363,45 @@
 //!   fail-on-mismatch shape does not change). The mutation floor on the write-boundary region compare,
 //!   the out-of-region-report branch, and the missing-store fail-closed branch is mandatory-core
 //!   (≥ 80% — the region-pin enforcement carrying the token-region into the partition key).
+//! - **The within-EU CDN clone/bundle blob class (C3) (P-ST-23 / contract 11.2-C3 + 12.4 — global
+//!   P-254)** is now IMPLEMENTED in [`cdn`]: it FILLS the within-EU CDN edge-set floor [`residency`]
+//!   named. (1) **A blob-class TAG over the unchanged [`blob::BlobStore`], NOT a new store (EI-01
+//!   §7):** [`cdn::CdnCloneClass`] BORROWS the base content-addressed blob tier (`&dyn BlobStore`,
+//!   never an owned second store) and serves clone/bundle blobs BY CONTENT-ADDRESS — a published
+//!   bundle is an ordinary content-addressed blob ([`cdn::CdnCloneClass::publish_bundle`] →
+//!   `BlobStore::put`), and a serve ([`cdn::CdnCloneClass::bundle`] → `BlobStore::get`)
+//!   re-hash-verifies the bytes, so **the content-address IS the cache-validity check** (no staleness
+//!   model to get wrong; a tampered bundle is refused — the STOR-D7 0-silent-serve floor rides
+//!   through). The structural "not a new store" property is asserted by the SAME [`blob::FsBlobStore`]
+//!   backing both a CDN serve and a plain trait `get`. (2) **Residency-respecting (within-EU edge
+//!   set):** [`cdn::CdnEdgeSet::eligible_for`] filters a candidate POP set to ONLY the within-EU POPs
+//!   for an EU tenant ([`cdn::CdnEdgePop::within_eu`]) — *no PII-bearing bundle reaches an extra-EU
+//!   edge*; the within-EU classification is an INPUT (control-plane-sourced geography), Storage owns
+//!   the FILTER (the mandatory-core). (3) **`residency_verify` covers the CDN edge set (extends
+//!   P-ST-15, 12.4):** [`cdn::CdnCloneClass::residency_report`] produces a
+//!   [`residency::ResidencyStoreClass::CdnEdgeSet`] report @ the tenant's region, fed into the SAME
+//!   [`residency::verify_region_pinning`] aggregation — a CDN serving an EU tenant from an extra-EU
+//!   region FAILs the attestation WITHOUT a code change (the aggregation already checks any reported
+//!   class's region; STOR-D5 CDN extension → 0 cross-region PII egress via the CDN). It REUSES
+//!   [`blob`] (P-047) + [`residency`] (P-102) — never a parallel store or a second residency shape.
+//!   **Floor named in [`cdn`]:** the C6 outbound push-mirror residency gate (the mirror TARGET added
+//!   to the same attestation) is the sibling **P-ST-25 (global P-255)**; the real edge-delivery POP
+//!   fleet + the object-store backing the bundles ultimately rest on are deployment/M5 follow-ons
+//!   (P-ST-30/P-ST-31) — a backing swap by the trait's design. The mutation floor on the
+//!   within-EU-edge-set filter + the content-address validity check is mandatory-core (≥ 80%).
 
 pub mod backup;
 pub mod blob;
+// The within-EU CDN clone/bundle blob class (C3, P-ST-23 / P-254, contract 11.2-C3 + 12.4): a
+// content-addressed blob CLASS over the UNCHANGED `BlobStore` trait (a tag + an eligible-edge-set
+// policy, NOT a new store — EI-01 §7) for hot-repo/clone-storm acceleration. The content-address
+// IS the cache-validity check (no staleness model). Residency-respecting: an EU tenant's eligible
+// edge set is within-EU-only (the `CdnEdgeSet` filter, mandatory-core). EXTENDS `residency_verify`
+// with the `CdnEdgeSet` store class (the CDN report feeds the SAME `verify_region_pinning`
+// aggregation — a cross-region CDN edge FAILs there, 0 cross-region PII egress). FLOOR NAMED: the
+// C6 outbound push-mirror target is the sibling P-ST-25 / P-255. REUSES blob (P-047) + residency
+// (P-102) — never a parallel store or a second residency shape.
+pub mod cdn;
 // The local-disk git pack/object tier behind the BlobStore trait (P-ST-22 / P-252, contract 11.2
 // git pack tier + 12.2 repo-granular relocatable placement): git packs + loose objects are
 // addressed THROUGH the content-addressed `BlobStore` trait (REUSES blob.rs — never a parallel
@@ -478,6 +514,7 @@ pub use blob::{
     HashAlgo, IdentityWrap,
 };
 pub use cache::{Cache, CacheError, InMemoryCache};
+pub use cdn::{CdnCloneClass, CdnEdgePop, CdnEdgeSet};
 pub use gitpack::{
     git_object_address, GitObjectKind, GitPackError, GitPackTier, PackManifest, PlacementError,
     RepoGitPlacement, RepoId, RepoPlacementStatus, StorageGroup,

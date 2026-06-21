@@ -46,6 +46,14 @@ fn to_cp_class(class: ResidencyStoreClass) -> CpStoreClass {
         // verified Storage-side by `verify_region_pinning` (which checks ANY reported class's region,
         // so a wrong-region archive FAILs there without a wire change).
         ResidencyStoreClass::T3FirehoseArchive => CpStoreClass::Blob,
+        // The within-EU CDN clone/bundle edge set (C3, P-ST-23 / P-254) is a Storage follow-on
+        // store class whose bundles physically rest as content-addressed T2 BLOBS (storage.md §3.2:
+        // "rides the existing trait — a blob-class tag, not a new store"); the CDN is a delivery
+        // layer in FRONT of the T2 blob tier. At the control-plane no-global-pool WIRE it therefore
+        // reports under the T2 blob tier (the control-plane M1 set is OLTP/blob/index/KMS). Its
+        // residency is verified Storage-side by `verify_region_pinning` (which checks ANY reported
+        // class's region — a wrong-region CDN edge FAILs there without a wire change).
+        ResidencyStoreClass::CdnEdgeSet => CpStoreClass::Blob,
     }
 }
 

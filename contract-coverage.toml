@@ -1047,10 +1047,20 @@ status = "covered"
 # named follow-on). GitCryptoShredReach IS the BlobShredReach seam the erase orchestrator's step-2
 # crypto-shred invokes; GIT-D2 (storage half) green. See also row 11.4. The C6 outbound push-mirror
 # residency gate seam is the sibling → P-ST-25 (P-255).
+# P-254 (P-ST-23): the within-EU CDN CLONE/BUNDLE class (C3, row 11.2-C3) — a content-addressed blob
+# CLASS over the UNCHANGED BlobStore (a blob-class tag + an eligible-edge-set policy, NOT a new store,
+# EI-01 §7): the content-address IS the cache-validity check (no staleness model), an EU tenant's
+# eligible edge set is within-EU-only (the CdnEdgeSet filter), and the CDN reports into
+# `verify_region_pinning` (the new ResidencyStoreClass::CdnEdgeSet variant) so the residency
+# attestation covers the CDN edge set (12.4) — a cross-region CDN edge FAILs the SAME aggregation
+# (STOR-D5 CDN within-EU, 0 cross-region PII egress via the CDN). The CDN clone class RIDES the
+# unchanged base FsBlobStore (the structural "not a new store" assertion). The C6 outbound push-mirror
+# residency gate seam is the sibling → P-ST-25 (P-255).
 cdc = [
     "crates/myelin-storage/tests/cdc_11_2_blobstore.rs",
     "crates/myelin-storage/tests/cdc_11_2_git_pack_tier.rs",
     "crates/myelin-storage/tests/cdc_11_2_11_4_git_crypto_shred_reach.rs",
+    "crates/myelin-storage/tests/cdc_11_2_c3_cdn_clone_class.rs",
 ]
 
 [[contract]]
@@ -1256,8 +1266,11 @@ title = "residency_verify -> SignedAttestation"
 # Storage's reports (PROVIDER) feed the control plane's `residency_verify` (CONSUMER) that signs the
 # no-global-pool attestation — the two halves agree (green + the cross-region fail leg) WITHOUT a
 # shared report type (the DAG forbids a myelin-storage -> myelin-control-plane edge; documented
-# deviation, EI-01 §1). The CDN edge set + push-mirror targets EXTEND this same row in M3
-# (P-ST-23/P-254, P-ST-25/P-255) — the aggregation shape does not change.
+# deviation, EI-01 §1). The CDN edge set EXTENDS this same row in M3 (P-ST-23 / P-254 — LANDED: the
+# ResidencyStoreClass::CdnEdgeSet report feeds the SAME aggregation, the cross-crate CDC maps it to
+# the control-plane T2 blob tier; a cross-region CDN edge FAILs the same residency_verify); the
+# push-mirror target is the remaining M3 follow-on (P-ST-25 / P-255) — the aggregation shape does not
+# change.
 status = "covered"
 cdc = ["crates/myelin-storage/tests/cdc_12_4_storage_residency_report.rs"]
 
