@@ -158,6 +158,20 @@ Binds only to semantics / the chip handles.
 
 ---
 
+## 7b. Icons (canonical glyphs — registry names)
+
+From the 42-icon library ([`../04-icons/ICONS-README.md`](../04-icons/ICONS-README.md) §2;
+[USAGE-MAP](../04-icons/USAGE-MAP.md) §A).
+
+- **Comment header identity:** `human` / `agent` (agent author → four-channel treatment, the plain mark).
+- **Inline mention / ref nodes:** the `<ReferenceChip>` type-icons (`message` · `issue` · `doc` · …).
+- **Anchored-thread anchor chip:** the target's type-icon + `link`.
+- **Per-comment actions:** `message` (reply) · `kebab` (overflow: edit/delete/quote/copy-ref) · `link`
+  (copy-ref) · `edit`.
+- **Review verdict:** `approve` · `reject` · `message` (comment) — **always glyph + label**.
+- *Gap:* the add-reaction `+` affordance has no core glyph yet ([USAGE-MAP](../04-icons/USAGE-MAP.md) §C);
+  emoji reactions are user *content*, distinct from agent-marker iconography.
+
 ## 8. Motion (token-based, reduced-motion first-class)
 
 - **New comment enters** — `--dur-base` `--ease-enter`, subtle, no scroll-jump if the user is reading above.

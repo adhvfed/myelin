@@ -125,6 +125,20 @@ for "agent" makes the screen a traffic light **and** conflates "an agent touched
 `--border` (hairlines), `--radius-1`, `--focus-ring` (interactive). **Status colours are never used for the
 agent treatment** (the §3 rule).
 
+## 7b. Icons (canonical glyphs — registry names)
+
+From the 42-icon library ([`../04-icons/ICONS-README.md`](../04-icons/ICONS-README.md) §2;
+[USAGE-MAP](../04-icons/USAGE-MAP.md) §A). The mark is the **shape** channel of the four-channel signature (§3).
+
+| `Principal.kind` | Icon |
+|---|---|
+| human | `human` (avatar fallback) |
+| agent | `agent` — the **plain geometric mark** (rounded square + centered dot); **NOT** sparkle/shimmer/magic-wand/star/emoji (§3) |
+| team | `team` (two people) |
+| service | *gap:* no `service` glyph in the core 42 yet — interim plain glyph + the word "Service" ([USAGE-MAP](../04-icons/USAGE-MAP.md) §C) |
+
+The mark must read in pure monochrome / `forced-colors` (the §6 audit) — `currentColor`-inheriting SVG satisfies this.
+
 ## 8. Motion
 
 The agent enter (a new agent appearing in a thread/pane) may use the reserved `--ease-emphasized` at

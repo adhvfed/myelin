@@ -205,6 +205,17 @@ server error; **don't** announce per keystroke.
 
 ---
 
+## 6b. Icons (canonical glyphs — registry names)
+
+From the 42-icon library ([`../04-icons/ICONS-README.md`](../04-icons/ICONS-README.md) §2;
+[USAGE-MAP](../04-icons/USAGE-MAP.md) §A). Leading/trailing icons inherit `currentColor`.
+
+- **Button:** any registry glyph (e.g. `search` · `edit` · `external-link`); `iconOnly` still requires `aria-label` + Tooltip.
+- **Input (search / clear / async-validate):** `search` · `close` (clear) · `check-pass` (valid).
+- **Select / Combobox:** `chevron` (trigger) · `check-pass` (selected) · `search` (type-to-filter) · `close` (remove multi-select chip).
+- **Checkbox / radio / switch:** the checked state uses the `approve` ✓ glyph — **checked by glyph + position, not colour-alone**.
+- **Field validation (error):** a danger glyph (the `check-fail` ✗ pattern) + `--danger` + message — **never colour-alone** (1.4.1).
+
 ## 7. Reuse seam (with the rich-components set)
 
 These atoms are composed by [R]: the **HITL Edit form** (typed against a `ToolDef` JSON Schema — R-14 §3.3),

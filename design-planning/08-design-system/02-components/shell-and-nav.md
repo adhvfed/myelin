@@ -135,6 +135,18 @@ The shell is the component most exposed to the §8b.4 bugs; these are **binding*
 `--danger` (+ glyph+label) for sidebar status hints; `--overlay-scrim` (drawer backdrop); spacing/radius/
 motion/z scales; `--z-chrome` (shell) and `--z-modal`/`--z-popover` (drawers).
 
+## 7b. Icons (canonical glyphs — registry names)
+
+From the 42-icon library ([`../04-icons/ICONS-README.md`](../04-icons/ICONS-README.md) §2;
+[USAGE-MAP](../04-icons/USAGE-MAP.md) §A). Inline SVG inheriting `currentColor`.
+
+- **Rail subsystem switcher:** `nav-code` · `nav-ci` · `nav-issues` · `nav-knowledge` · `nav-chat`.
+- **Topbar constant chrome:** `search` · `inbox` · `settings` · `human` (identity-menu fallback).
+- **Sidebar tree / disclosure:** `chevron` (rotated by CSS, never four files) · `folder` · `repo` · `file` ·
+  `doc` · `channel` · `database`.
+- **Sidebar status hints:** `check-pass` / `check-fail` / `check-pending` — **glyph + colour, never colour-alone**.
+- **Mobile drawer dismiss:** `close`.
+
 ## 8. Motion
 
 Region content uses `--dur-fast` for live-update transitions (no scroll-jump). Drawers slide in at `--dur-base`

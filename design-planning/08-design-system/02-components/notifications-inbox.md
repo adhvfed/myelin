@@ -161,6 +161,19 @@ Binds only to semantics / chip + agent handles.
 
 ---
 
+## 8b. Icons (canonical glyphs — registry names)
+
+From the 42-icon library ([`../04-icons/ICONS-README.md`](../04-icons/ICONS-README.md) §2;
+[USAGE-MAP](../04-icons/USAGE-MAP.md) §A). Unread / priority by glyph + weight + position, **never colour-alone**.
+
+- **Surface entry (topbar):** `inbox`. **Filter-tabs tune:** `settings`.
+- **Item kind glyphs:** `message` (mention/reply) · `pull-request` (review request) · `issue` (assignment) ·
+  `check-fail` (CI failure on my work) · `gate` / `agent` (approval requested) · `priority` (SLA/escalated).
+- **Item subject:** `<ReferenceChip>` (live, permission-aware). **Group expand:** `chevron`.
+- **Agent-activity group / docked HITL row:** `agent` · `approve` · `edit` · `reject`.
+- **Triage actions:** `check-pass` (done) · `external-link` (go/open) · `close` (mute/dismiss).
+- *Gap:* dedicated snooze and mute/bell-off glyphs are backlog ([USAGE-MAP](../04-icons/USAGE-MAP.md) §C).
+
 ## 9. Motion (token-based, reduced-motion first-class)
 
 - **New item enters** — `--dur-base` `--ease-enter`, subtle, no scroll-jump while reading.
