@@ -50,7 +50,92 @@ pub use myelin_events::ArtifactRef;
 /// parser/formatter, the `#sub`-stripped root, the `#sub` kind accessor + the typed rejection
 /// taxonomy. These are the value-type behaviours every service consumes (REF-3 — never
 /// re-implemented per service).
-pub use parse::{format, parse, strip_sub, sub_kind, ParseError, Sub, SCHEME};
+pub use parse::{format, mint, parse, strip_sub, sub_kind, ParseError, Sub, SubKind, SCHEME};
+
+/// A subsystem's declaration to Refs that it OWNS (mints) a set of `#sub` kinds (contract 5.7 /
+/// §3.5). Refs owns the grammar + the resolution ladder; each subsystem owns the **stable mint** of
+/// its declared kinds (recon X-4). This is the registration value Refs accepts: the minting
+/// subsystem's canonical token + the [`SubKind`]s it is the resolver-owner for. The opaque-id
+/// stability obligation is the subsystem's (Refs validates the grammar shape only).
+///
+/// Validation ([`SubKindRegistration::validate`]) checks the kinds are the **frozen vocabulary**
+/// (every [`SubKind`] is, by construction — the type IS the vocabulary) and that the subsystem token
+/// is a canonical Bus §6.2 token. Accepting a registration does NOT install a resolver — the
+/// `project(ref, viewer)` sub-anchor resolver per kind is the named follow-on (Git: GIT-P18 for
+/// comment/thread, GIT-P24 for the L-range 4-state resolver).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubKindRegistration {
+    /// The canonical Bus §6.2 subsystem token that owns these mints (e.g. `"git"`).
+    pub subsystem: String,
+    /// The `#sub` kinds this subsystem is the mint+resolver owner of (a frozen-vocabulary subset).
+    pub kinds: Vec<SubKind>,
+}
+
+/// Why a [`SubKindRegistration`] is not accepted by Refs (LOUD, typed — EI-01 §5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RegistrationError {
+    /// The declared owning subsystem is not a canonical Bus §6.2 token (Refs validates against the
+    /// Bus token table; it never authors a subsystem).
+    UnknownSubsystem {
+        /// The rejected subsystem token.
+        token: String,
+    },
+    /// The registration declared no kinds — an empty ownership claim is meaningless, rejected.
+    NoKinds,
+    /// The same [`SubKind`] appears twice in one registration (an ambiguous double-claim).
+    DuplicateKind {
+        /// The kind label declared more than once.
+        kind: &'static str,
+    },
+}
+
+impl core::fmt::Display for RegistrationError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            RegistrationError::UnknownSubsystem { token } => write!(
+                f,
+                "unknown subsystem token `{token}`: a `#sub` mint owner must be a canonical Bus \
+                 §6.2 subsystem token — Refs validates against the Bus table, it never authors one."
+            ),
+            RegistrationError::NoKinds => write!(
+                f,
+                "empty `#sub` registration: a subsystem must claim at least one `#sub` kind to \
+                 register ownership (an empty claim is meaningless)."
+            ),
+            RegistrationError::DuplicateKind { kind } => write!(
+                f,
+                "ambiguous `#sub` registration: kind `{kind}` is claimed twice in one registration."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RegistrationError {}
+
+impl SubKindRegistration {
+    /// Validate the registration against the frozen grammar + the Bus token table (contract 5.7).
+    /// The kinds are the frozen vocabulary by type; this checks the subsystem token is canonical,
+    /// the claim is non-empty, and no kind is double-claimed. Returns the accepted registration so
+    /// the call site reads as a registration that Refs *accepts*.
+    pub fn validate(self) -> core::result::Result<Self, RegistrationError> {
+        if self.kinds.is_empty() {
+            return Err(RegistrationError::NoKinds);
+        }
+        if !myelin_events::SUBSYSTEM_TOKENS.contains(&self.subsystem.as_str()) {
+            return Err(RegistrationError::UnknownSubsystem {
+                token: self.subsystem.clone(),
+            });
+        }
+        let mut seen: Vec<SubKind> = Vec::with_capacity(self.kinds.len());
+        for &k in &self.kinds {
+            if seen.contains(&k) {
+                return Err(RegistrationError::DuplicateKind { kind: k.label() });
+            }
+            seen.push(k);
+        }
+        Ok(self)
+    }
+}
 
 /// An outbound or inbound edge between two artifacts (architecture §2.3; contract 5.3/5.4).
 /// The typed-edge taxonomy (`closes/blocks/depends_on/parent/...`) is the TE-7 mirror
@@ -161,6 +246,59 @@ mod tests {
             PrincipalKind::Human,
             TenantId("acme".into()),
         );
+    }
+
+    /// A subsystem's `#sub` kind registration (contract 5.7) is ACCEPTED when its owner is a
+    /// canonical Bus token and the kinds are a non-empty, duplicate-free frozen-vocabulary subset.
+    #[test]
+    fn sub_kind_registration_is_accepted_for_a_canonical_owner() {
+        let reg = SubKindRegistration {
+            subsystem: "git".into(),
+            kinds: vec![SubKind::Comment, SubKind::Thread, SubKind::LineRange],
+        }
+        .validate()
+        .expect("a canonical-owner, frozen-kind registration is accepted");
+        assert_eq!(reg.subsystem, "git");
+    }
+
+    /// The registration is REJECTED LOUDLY for a non-canonical owner, an empty claim, or a
+    /// double-claimed kind (Refs validates against the Bus table + the grammar; it never coerces).
+    #[test]
+    fn sub_kind_registration_is_rejected_loudly_for_bad_claims() {
+        // non-canonical owning subsystem
+        assert!(matches!(
+            SubKindRegistration {
+                subsystem: "billing".into(),
+                kinds: vec![SubKind::Comment],
+            }
+            .validate(),
+            Err(RegistrationError::UnknownSubsystem { .. })
+        ));
+        // empty claim
+        assert!(matches!(
+            SubKindRegistration {
+                subsystem: "git".into(),
+                kinds: vec![],
+            }
+            .validate(),
+            Err(RegistrationError::NoKinds)
+        ));
+        // double-claimed kind
+        assert!(matches!(
+            SubKindRegistration {
+                subsystem: "git".into(),
+                kinds: vec![SubKind::Comment, SubKind::Comment],
+            }
+            .validate(),
+            Err(RegistrationError::DuplicateKind { .. })
+        ));
+        // the rejection messages are loud + name the rule
+        assert!(RegistrationError::NoKinds.to_string().contains("empty"));
+        assert!(RegistrationError::UnknownSubsystem {
+            token: "billing".into()
+        }
+        .to_string()
+        .contains("billing"));
     }
 
     /// The codec rejects a display projection (REF-3) through the `Refs` trait surface — the

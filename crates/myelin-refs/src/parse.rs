@@ -57,6 +57,7 @@
 //! `parse_error_display_is_loud_and_names_the_rule`.)
 
 use myelin_events::{ArtifactRef, ARTIFACT_TYPE_TOKENS, SUBSYSTEM_TOKENS};
+use serde::{Deserialize, Serialize};
 
 /// The canonical URN scheme prefix. The ONLY scheme `parse` admits (a bare `https://…` or a
 /// scheme-less string is rejected — there is no implicit scheme).
@@ -191,6 +192,74 @@ pub enum Sub {
     Check(String),
     /// `step-<n>` — a CI run step (jump-to-failure). First-class `#sub` kind (C-6); `<n>` is numeric.
     Step(u64),
+}
+
+/// The frozen `#sub` **kind discriminator** — the self-describing kind prefix WITHOUT its opaque
+/// body (§3.5 / contract 5.7). This is the unit a subsystem *registers ownership of* with Refs (a
+/// subsystem owns a KIND, then mints any number of stable opaque ids of that kind). [`Sub::kind`]
+/// projects a parsed [`Sub`] down to its discriminator; the variant-to-prefix mapping is the one
+/// frozen vocabulary Refs uses to pick a resolver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SubKind {
+    /// `comment-<opaqueid>` (Git PR, Knowledge, Issues).
+    Comment,
+    /// `thread-<opaqueid>` (Chat, Git review thread).
+    Thread,
+    /// `message-<opaqueid>` (Chat).
+    Message,
+    /// `b<opaqueid>` (Knowledge, Issue description block).
+    Block,
+    /// `h<opaqueid>` (Knowledge).
+    Heading,
+    /// `row-<opaqueid>` (Knowledge db, Issue-as-row).
+    Row,
+    /// `field-<opaqueid>` (Issues, Knowledge db).
+    Field,
+    /// `L<start>-L<end>` — content-anchored line range (Git).
+    LineRange,
+    /// `check-<context>` (CI).
+    Check,
+    /// `step-<n>` (CI).
+    Step,
+}
+
+impl SubKind {
+    /// The self-describing kind prefix as it appears in the URN (§3.5). For the single-letter and
+    /// the positional `L…-L…` forms this is the leading token, not a full prefix; it is the human
+    /// label of the kind, used in registration + diagnostics.
+    pub const fn label(self) -> &'static str {
+        match self {
+            SubKind::Comment => "comment-",
+            SubKind::Thread => "thread-",
+            SubKind::Message => "message-",
+            SubKind::Block => "b",
+            SubKind::Heading => "h",
+            SubKind::Row => "row-",
+            SubKind::Field => "field-",
+            SubKind::LineRange => "L<a>-L<b>",
+            SubKind::Check => "check-",
+            SubKind::Step => "step-",
+        }
+    }
+}
+
+impl Sub {
+    /// Project a parsed [`Sub`] down to its frozen [`SubKind`] discriminator (the kind a subsystem
+    /// registers ownership of; the resolver-selection key).
+    pub const fn kind(&self) -> SubKind {
+        match self {
+            Sub::Comment(_) => SubKind::Comment,
+            Sub::Thread(_) => SubKind::Thread,
+            Sub::Message(_) => SubKind::Message,
+            Sub::Block(_) => SubKind::Block,
+            Sub::Heading(_) => SubKind::Heading,
+            Sub::Row(_) => SubKind::Row,
+            Sub::Field(_) => SubKind::Field,
+            Sub::LineRange { .. } => SubKind::LineRange,
+            Sub::Check(_) => SubKind::Check,
+            Sub::Step(_) => SubKind::Step,
+        }
+    }
 }
 
 /// Parse the text after the `#` into a frozen [`Sub`] kind, or reject it (REF-3 — the kind prefix is
@@ -371,6 +440,28 @@ pub fn strip_sub(r: &ArtifactRef) -> ArtifactRef {
 pub fn sub_kind(r: &ArtifactRef) -> Option<Sub> {
     let (_, sub) = r.0.split_once('#')?;
     parse_sub(sub).ok()
+}
+
+/// `mint(root, sub) -> Result<ArtifactRef>` — attach a frozen [`Sub`] anchor to a **root**
+/// `ArtifactRef`, returning the canonical full sub-URN (§3.5 / contract 5.7). This is the codec a
+/// minting subsystem calls to produce a grammatical sub-URN from its stable opaque id: it FORMATS
+/// the `Sub` and re-parses the composed URN so the result is validated by the one grammar (0
+/// ungrammatical mints by construction — a malformed opaque body, e.g. an empty comment id, is
+/// rejected LOUDLY rather than emitted). The `root` MUST be a bare root (no existing `#sub`); minting
+/// onto an already-anchored ref is rejected with [`ParseError::UnknownSubKind`] (a sub-of-a-sub is
+/// not in the grammar). Refs stores both the returned full sub-URN AND the [`strip_sub`] root.
+pub fn mint(root: &ArtifactRef, sub: Sub) -> Result<ArtifactRef, ParseError> {
+    if root.0.contains('#') {
+        // A sub-of-a-sub is not grammatical: the root must be a bare artifact. Echo the offending
+        // sub so the rejection is self-describing (REF-3 — reject, never coerce).
+        return Err(ParseError::UnknownSubKind {
+            sub: format_sub(&sub),
+        });
+    }
+    // Compose and re-parse: `parse` validates the scope tokens AND re-runs `parse_sub` over the
+    // formatted body, so an opaque body that does not round-trip the grammar (empty / non-numeric
+    // step / inverted range) is rejected here, at mint time.
+    parse(&format!("{}#{}", root.0, format_sub(&sub)))
 }
 
 #[cfg(test)]
@@ -647,6 +738,56 @@ mod tests {
         // a `b…` that starts with the letters of `comment` is still a block (it lacks `comment-`).
         let b = parse("myelin://acme/knowledge/page/7#bcomment").unwrap();
         assert_eq!(sub_kind(&b), Some(Sub::Block("comment".into())));
+    }
+
+    /// `mint(root, sub)` attaches a frozen [`Sub`] to a bare root and produces the canonical full
+    /// sub-URN; the result round-trips and `sub_kind` classifies it (contract 5.7, the mint codec).
+    #[test]
+    fn mint_attaches_a_sub_to_a_root_and_round_trips() {
+        let root = parse("myelin://acme/git/pr/repo7:4291").unwrap();
+        let r = mint(&root, Sub::Comment("c9".into())).unwrap();
+        assert_eq!(format(&r), "myelin://acme/git/pr/repo7:4291#comment-c9");
+        assert_eq!(sub_kind(&r), Some(Sub::Comment("c9".into())));
+        assert_eq!(strip_sub(&r), root);
+    }
+
+    /// `mint` validates the opaque body through the one grammar: an empty comment id / inverted line
+    /// range is rejected LOUDLY at mint time (0 ungrammatical mints by construction).
+    #[test]
+    fn mint_rejects_a_malformed_opaque_body() {
+        let root = parse("myelin://acme/git/pr/repo7:1").unwrap();
+        assert!(matches!(
+            mint(&root, Sub::Comment(String::new())),
+            Err(ParseError::UnknownSubKind { .. })
+        ));
+        let blob = parse("myelin://acme/git/blob/r:main:f.rs").unwrap();
+        assert!(matches!(
+            mint(&blob, Sub::LineRange { start: 88, end: 42 }),
+            Err(ParseError::UnknownSubKind { .. })
+        ));
+    }
+
+    /// `mint` refuses a sub-of-a-sub (the root must be a bare artifact — the grammar has no nested
+    /// `#sub`).
+    #[test]
+    fn mint_refuses_a_sub_of_a_sub() {
+        let already = parse("myelin://acme/git/pr/repo7:1#comment-c1").unwrap();
+        assert!(matches!(
+            mint(&already, Sub::Thread("t2".into())),
+            Err(ParseError::UnknownSubKind { .. })
+        ));
+    }
+
+    /// [`Sub::kind`] projects every variant to its frozen [`SubKind`] discriminator, and
+    /// [`SubKind::label`] is the self-describing prefix (the registration unit).
+    #[test]
+    fn sub_kind_discriminator_and_label_are_frozen() {
+        assert_eq!(Sub::Comment("x".into()).kind(), SubKind::Comment);
+        assert_eq!(Sub::Thread("x".into()).kind(), SubKind::Thread);
+        assert_eq!(Sub::LineRange { start: 1, end: 2 }.kind(), SubKind::LineRange);
+        assert_eq!(Sub::Step(3).kind(), SubKind::Step);
+        assert_eq!(SubKind::Comment.label(), "comment-");
+        assert_eq!(SubKind::LineRange.label(), "L<a>-L<b>");
     }
 
     /// PROPERTY / FUZZ — ambiguity-rejection: a corpus of malformed / short-hash / ambiguous /

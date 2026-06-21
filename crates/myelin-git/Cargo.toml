@@ -32,6 +32,12 @@ myelin-identity = { path = "../myelin-identity" }
 # shared contract carrier and NOTHING in the production DAG depends back on `myelin-git` (the §2.9
 # graph stays acyclic — `substrate_is_root()` / `identity_is_sink()` are unaffected).
 myelin-events = { path = "../myelin-events" }
+# The one Refs library (contract 5.1/5.7) — the `ArtifactRef` codec + the frozen unified `#sub`
+# grammar + the `mint`/`SubKind`/`SubKindRegistration` registration surface. GIT-P4 (P-230) REGISTERS
+# the `#sub` kinds git owns (comment-/thread-/L<a>-L<b>) with Refs and mints grammatical sub-URNs
+# through this one codec — git mints, Refs owns the grammar (no second URN language, REF-3). Refs is
+# a shared glue crate that does NOT depend back on git (the §2.9 DAG stays acyclic).
+myelin-refs = { path = "../myelin-refs" }
 serde.workspace = true
 
 # DEV-ONLY: the rich ReBAC namespace ENGINE (FragmentDef / Userset / StoreBackedCheck) lives in the
