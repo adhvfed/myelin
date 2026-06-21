@@ -80,6 +80,7 @@ pub mod app;
 pub mod defaults;
 pub mod dry_run;
 pub mod effect_api;
+pub mod hitl;
 pub mod holder;
 pub mod migrations;
 pub mod mock;
@@ -135,6 +136,19 @@ pub use defaults::{
 // the frozen DryRun bridge.
 pub use dry_run::{
     dry_run_plan, proposed_effect_sequence, DryRunBridge, DryRunEntry, DryRunPlanner,
+};
+
+// The HITL withhold → surface → resume loop + the `hitl_gate` state machine (AG-P9 → P-221): the
+// agent-fabric side the durable wait (9.4) drives — the `hitl_gate` state machine
+// (Waiting → Approved/Rejected/Expired), the card projection (action + risk + LIVE cost estimate),
+// the approver-set derivation (4.4 `list_subjects`), and the resume that threads the approved tool
+// into the run's `approved` set so `EffectApi::apply`'s step 6 passes. The 0-mutation-pre-approval
+// guarantee is structural (the loop opens the gate but never applies). Floors: per-effect resume
+// idempotency AG-P10 (→ P-222); humanise card text AG-P11 (→ P-223); auto-dispatch L-3 AG-P20.
+pub use hitl::{
+    derive_approver_set, gate_id_of, live_cost_estimate, run_hitl_loop, surface_card, ApprovedTools,
+    ApproverSet, Halted, HitlCard, HitlGate, HitlGateState, HitlOutcome, HitlWait, InvalidTransition,
+    RiskSummary, WaitDecision,
 };
 
 // The delegation-scoped tool-list (AG-P7 → P-219): the `list_objects` SetExpr push-down (the no-N+1
