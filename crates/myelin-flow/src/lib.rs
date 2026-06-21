@@ -129,7 +129,10 @@ pub use engine::{
     drive, drive_full, drive_versioned, drive_with_timers, run_state, DriveOutcome, FlowDispatcher,
     FlowTelemetry, RunRow, RunStore, SignalRow, SignalStore, WorkflowBody,
 };
-pub use timer::{epoch_minute, ArmOutcome, FireOutcome, TimerRow, TimerStore, TimerWheel, SECS_PER_MINUTE};
+pub use timer::{
+    epoch_minute, ArmOutcome, DisarmOutcome, FireOutcome, ReArmOutcome, TimerRow, TimerStore, TimerWheel,
+    SECS_PER_MINUTE,
+};
 pub use executor::{
     DurableExecutor, ExecutorError, FlowExecutor, RunBudget, RunId, RunStatus, SignalOutcome,
     SignalSpec, StartSpec, PARTITION_COUNT,
