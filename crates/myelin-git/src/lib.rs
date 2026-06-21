@@ -106,6 +106,13 @@ pub mod gix_backend;
 pub mod holder_intent;
 pub mod notif_rules;
 pub mod rebac_fragment;
+/// The **receive-pack write path** (GIT-P9 / P-270, M3-G1): the in-process Rust policy +
+/// one-transaction ref-CAS + `git.ref.updated` outbox emit (the silent-data-loss floor, GIT-D9 —
+/// emit-iff-committed, 0 ghost / 0 lost). The [`receive_pack::RefStore`] models the reftable-on-OLTP
+/// ref store (the per-ref CAS is the linearisation point) and co-commits the ref move with the event
+/// through the frozen [`myelin_events::OutboxStore`] same-transaction surface. Opening the store
+/// auto-registers it as `PersonalDataHolder` H1 (the DSR bodies are the GIT-P29 floor).
+pub mod receive_pack;
 pub mod replay;
 pub mod schema;
 pub mod search_projection;

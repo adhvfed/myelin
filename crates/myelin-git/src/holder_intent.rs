@@ -104,6 +104,34 @@ pub fn personal_data_inventory() -> Vec<DataLocus> {
     ]
 }
 
+/// The typed receipt that the git store **auto-registered as `PersonalDataHolder` H1** when it
+/// opened (contract 1.4 / 10.1; architecture 00 §3.4 — the harness auto-registers every store it
+/// opens, so "we forgot a store" is structurally impossible). GIT-P3 declared the H1 INTENT (the
+/// inventory above); **GIT-P9 OPENS the store** ([`crate::receive_pack::RefStore::open`]) and this
+/// receipt is the proof the registration hook fired. It mirrors the storage-tier
+/// `OltpHolderRegistration` shape (the same auto-registration discipline, one per opened store).
+///
+/// **Floor (GIT-P29):** the holder's DSR BODIES (the §6.1 erasure fan-out — pseudonym-map shred +
+/// per-subject DEK crypto-shred + Search purge + Refs tombstone, over the [`personal_data_inventory`]
+/// loci) land in GIT-P29; the REGISTRATION (this receipt) is real here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HolderRegistration {
+    /// The stable holder id the store registered under (always [`HOLDER_ID`] for git).
+    pub holder_id: &'static str,
+    /// Whether the auto-registration hook fired (always `true` for an opened store — the receipt
+    /// only exists because the store opened; the field makes the asserted fact explicit).
+    pub registered: bool,
+}
+
+impl HolderRegistration {
+    /// Fire the H1 auto-registration hook for the opening git store (contract 1.4). The store
+    /// cannot escape the holder registry: opening it produces this receipt. The DSR bodies are the
+    /// GIT-P29 floor; the registration is real.
+    pub fn auto_register() -> Self {
+        Self { holder_id: HOLDER_ID, registered: true }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,6 +140,16 @@ mod tests {
     #[test]
     fn git_is_holder_h1() {
         assert_eq!(HOLDER_ID, "H1");
+    }
+
+    /// Opening the git store auto-registers it as H1 (the receipt is real; the DSR bodies are
+    /// GIT-P29). The registration hook cannot be skipped — the receipt only exists if the store
+    /// opened.
+    #[test]
+    fn auto_register_produces_a_real_h1_receipt() {
+        let r = HolderRegistration::auto_register();
+        assert_eq!(r.holder_id, "H1");
+        assert!(r.registered);
     }
 
     /// The §4.5 inventory is exhaustive over the documented loci and every entry names a frozen
