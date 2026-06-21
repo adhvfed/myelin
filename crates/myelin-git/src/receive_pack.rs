@@ -473,16 +473,16 @@ pub struct ReflogEntry {
     pub pusher_pseudonym: String,
 }
 
-/// The shared inner state of a [`RefStore`] (behind the lock that models the per-ref `FOR UPDATE`
-/// serialisation + the one-transaction co-commit with the outbox).
-#[derive(Default)]
-struct RefStoreInner {
-    /// `(repo, ref_name) → row`. The repo is fixed per store (one store per repo cell here); the
-    /// key is the ref name.
-    refs: BTreeMap<RefName, RefRow>,
-    /// the reflog (append-only).
-    reflog: Vec<ReflogEntry>,
-}
+/// One per-ref lock cell — the in-memory model of the **single `git_ref` row** the CAS locks
+/// `FOR UPDATE` (arch §3 / GIT-P10). The cell holds `Some(row)` once the ref exists, `None` while it
+/// does not (a create transitions `None → Some`; a delete transitions `Some → None`). The `Mutex`
+/// IS the per-ref linearisation point: a rapid burst of pushes to ONE hot ref serialises on THIS
+/// lock, while pushes to OTHER refs lock OTHER cells and proceed in PARALLEL — the per-ref-order /
+/// refs-fan-out-parallel property GIT-P10 (GIT-D1) hardens. (The previous GIT-P9 store held one
+/// global lock over the whole repo, which serialised EVERY ref — arch §3 requires per-row locks so
+/// different refs advance in parallel. This is the reconciliation.)
+type RefCell = std::sync::Mutex<Option<RefRow>>;
+
 
 /// **The reftable-on-OLTP ref store + the receive-pack write path** (arch §2 / §3). The per-ref CAS
 /// is the linearisation point; the ref-update + the reflog insert + the `git.ref.updated` outbox emit
@@ -500,8 +500,12 @@ pub struct RefStore {
     outbox: OutboxStore,
     /// the id minter (the stable ULID source — injected, the frozen seam).
     minter: Arc<dyn IdMinter>,
-    /// the in-memory ref rows + reflog (the modeled `git_ref` / `git_reflog` tables).
-    inner: std::sync::Mutex<RefStoreInner>,
+    /// the registry of per-ref lock cells (the modeled `git_ref` rows, each behind its OWN lock —
+    /// the per-ref linearisation point) + the reflog. The registry lock guards only lookup/vivify;
+    /// the per-ref CAS holds the individual cells, so different refs fan out parallel (arch §3).
+    registry: std::sync::Mutex<BTreeMap<RefName, Arc<RefCell>>>,
+    /// the append-only reflog (the modeled `git_reflog` table), behind its own short-lived lock.
+    reflog: std::sync::Mutex<Vec<ReflogEntry>>,
     /// the H1 holder-registration receipt (proof the store registered when it opened).
     holder: crate::holder_intent::HolderRegistration,
 }
@@ -521,7 +525,8 @@ impl RefStore {
             ctx_base,
             outbox,
             minter,
-            inner: std::sync::Mutex::new(RefStoreInner::default()),
+            registry: std::sync::Mutex::new(BTreeMap::new()),
+            reflog: std::sync::Mutex::new(Vec::new()),
             holder: crate::holder_intent::HolderRegistration::auto_register(),
         }
     }
@@ -537,14 +542,17 @@ impl RefStore {
     }
 
     /// The current tip of a ref (for the CAS expected-old + a read-your-writes check). `None` if the
-    /// ref does not exist.
+    /// ref does not exist. Reads under the ref's OWN lock (a snapshot read, not the registry lock —
+    /// so a tip read of ref A never blocks a CAS on ref B).
     pub fn tip(&self, ref_name: &RefName) -> Option<Oid> {
-        self.lock().refs.get(ref_name).map(|r| r.target_oid.clone())
+        let cell = self.cell(ref_name);
+        let g = cell.lock().unwrap_or_else(|e| e.into_inner());
+        g.as_ref().map(|r| r.target_oid.clone())
     }
 
     /// The reflog (append-only; the per-ref history — used by the holder + the audit walk).
     pub fn reflog(&self) -> Vec<ReflogEntry> {
-        self.lock().reflog.clone()
+        self.reflog.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// The per-ref aggregate key for the outbox (arch §2.2 / §3): `<repo>:<ref_name>`. The `:`
@@ -607,22 +615,39 @@ impl RefStore {
         }
 
         // ── Step 4: ONE transaction — ref-CAS + reflog + git.ref.updated emit, then COMMIT. ──
-        // The per-ref CAS is the linearisation point. We take the store lock (models the per-ref
-        // `FOR UPDATE` row locks + the all-or-nothing push) and the outbox transaction together, so
-        // the ref-update and the emit are co-committed (BUS-2). If ANY ref's CAS is stale, we return
-        // WITHOUT committing the outbox transaction → emit-iff-committed: nothing is written.
-        let mut inner = self.lock();
+        // The per-ref CAS is the linearisation point. We take the involved refs' OWN locks (each
+        // models that ref's `FOR UPDATE` row lock; pushes to OTHER refs hold OTHER locks → they run
+        // in PARALLEL — arch §3 / GIT-P10) plus the outbox transaction, so the ref-update and the
+        // emit are co-committed (BUS-2). If ANY ref's CAS is stale, we return WITHOUT committing the
+        // outbox transaction → emit-iff-committed: nothing is written.
+        //
+        // **Deadlock-free multi-ref lock acquisition (the all-or-nothing atomic push):** an atomic
+        // push touches a SET of refs; we lock them in a TOTAL (sorted, de-duplicated) order so two
+        // concurrent atomic pushes that overlap on refs A,B can never deadlock (both acquire A
+        // before B). Single-ref pushes (the overwhelmingly common hot-ref burst) take exactly one
+        // lock. Different refs never contend — the registry lock is dropped before the cells lock.
+        let mut targets: Vec<RefName> = push.updates.iter().map(|u| u.ref_name.clone()).collect();
+        targets.sort();
+        targets.dedup();
+        let cells: Vec<Arc<RefCell>> = targets.iter().map(|r| self.cell(r)).collect();
+        // Lock each cell in the sorted order (the deadlock-free discipline). The guards are held for
+        // the whole CAS→commit→apply window — the per-ref linearisation point spans check + apply.
+        let mut guards: BTreeMap<RefName, std::sync::MutexGuard<'_, Option<RefRow>>> = BTreeMap::new();
+        for (name, cell) in targets.iter().zip(cells.iter()) {
+            guards.insert(name.clone(), cell.lock().unwrap_or_else(|e| e.into_inner()));
+        }
 
         // First pass: CAS-staleness check over EVERY ref (the per-ref linearisation assertion). A
-        // single stale ref aborts the WHOLE atomic push (no partial write).
+        // single stale ref aborts the WHOLE atomic push (no partial write). Reading the locked cell
+        // is the `SELECT … FOR UPDATE` row read.
         for u in &push.updates {
-            let actual = inner
-                .refs
+            let actual = guards
                 .get(&u.ref_name)
+                .and_then(|g| g.as_ref())
                 .map(|r| r.target_oid.clone())
                 .unwrap_or_else(Oid::zero);
             if actual != u.expected_old {
-                // Reject BEFORE moving any ref — drop the lock (transaction never opened) → 0 ghost.
+                // Reject BEFORE moving any ref — drop the locks (transaction never opened) → 0 ghost.
                 return Ok(PushOutcome::Rejected(RejectReason::NonFastForward {
                     ref_name: u.ref_name.clone(),
                     expected: u.expected_old.clone(),
@@ -640,8 +665,9 @@ impl RefStore {
         // Stage each ref-CAS as the transaction's state change + emit its git.ref.updated together.
         let mut planned: Vec<(RefName, Oid, u64, Option<Oid>, myelin_events::EventId)> = Vec::new();
         for u in &push.updates {
-            let old = inner.refs.get(&u.ref_name).map(|r| r.target_oid.clone());
-            let prev_seq = inner.refs.get(&u.ref_name).map(|r| r.update_seq).unwrap_or(0);
+            let cur = guards.get(&u.ref_name).and_then(|g| g.as_ref());
+            let old = cur.map(|r| r.target_oid.clone());
+            let prev_seq = cur.map(|r| r.update_seq).unwrap_or(0);
             let new_seq = prev_seq + 1;
 
             // The state change (the ref CAS + reflog) — staged into THIS transaction (co-commit).
@@ -688,26 +714,39 @@ impl RefStore {
         // committed" identical to the real "UPDATE git_ref … + INSERT outbox … in one tx".
         tx.commit()?;
 
-        // The ref CAS + reflog are the COMMITTED state-change half (applied under the same lock the
-        // CAS-staleness check read, so no interleaving moved the ref between the check and the apply
-        // — the per-ref linearisation point holds).
+        // The ref CAS + reflog are the COMMITTED state-change half (applied under the SAME per-ref
+        // locks the CAS-staleness check read, still held here — so no interleaving moved the ref
+        // between the check and the apply; the per-ref linearisation point holds). A push to the new
+        // zero-oid is a DELETE (the cell transitions to `None`); otherwise the cell becomes `Some`.
         let mut moved = Vec::new();
         let mut emitted = Vec::new();
-        for (ref_name, new_oid, new_seq, old, id) in planned {
-            inner.refs.insert(
-                ref_name.clone(),
-                RefRow { target_oid: new_oid.clone(), update_seq: new_seq },
-            );
-            inner.reflog.push(ReflogEntry {
-                ref_name: ref_name.clone(),
-                old_oid: old,
-                new_oid: new_oid.clone(),
-                update_seq: new_seq,
-                pusher_pseudonym: push.pusher.pseudonym.clone(),
-            });
-            moved.push((ref_name, new_oid, new_seq));
-            emitted.push(id);
+        {
+            let mut reflog = self.reflog.lock().unwrap_or_else(|e| e.into_inner());
+            for (ref_name, new_oid, new_seq, old, id) in planned {
+                let guard = guards
+                    .get_mut(&ref_name)
+                    .expect("the ref's cell was locked for the CAS");
+                if new_oid.is_zero() {
+                    // A delete: the ref row is removed (the cell goes empty); the next create starts
+                    // a fresh generation (matching the `git_ref` row being deleted).
+                    **guard = None;
+                } else {
+                    **guard = Some(RefRow { target_oid: new_oid.clone(), update_seq: new_seq });
+                }
+                reflog.push(ReflogEntry {
+                    ref_name: ref_name.clone(),
+                    old_oid: old,
+                    new_oid: new_oid.clone(),
+                    update_seq: new_seq,
+                    pusher_pseudonym: push.pusher.pseudonym.clone(),
+                });
+                moved.push((ref_name, new_oid, new_seq));
+                emitted.push(id);
+            }
         }
+        // The per-ref guards drop HERE — the linearisation window (check → commit → apply) closes,
+        // releasing each ref for the next push in the burst.
+        drop(guards);
 
         // The crash-after-commit point: the transaction committed (the event rows are durable +
         // unsent; the ref moved). A crash HERE loses nothing — the relay publishes the durable rows
@@ -720,8 +759,13 @@ impl RefStore {
         Ok(PushOutcome::Accepted { moved, emitted })
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, RefStoreInner> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    /// Look up — vivifying if absent — the per-ref lock cell for a ref. The registry lock is held
+    /// ONLY for this lookup/insert, never across the per-ref CAS (so different refs never contend on
+    /// the registry). Returns an `Arc` clone so the caller holds the cell's lock independently — the
+    /// per-ref `FOR UPDATE` serialisation lives in the cell, not the registry (arch §3 / GIT-P10).
+    fn cell(&self, ref_name: &RefName) -> Arc<RefCell> {
+        let mut g = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(g.entry(ref_name.clone()).or_default())
     }
 }
 
@@ -1073,6 +1117,187 @@ mod tests {
             .collect();
         agg_seqs.sort_unstable();
         assert_eq!(agg_seqs, vec![0, 1, 2], "per-ref outbox ordering is gap-free");
+    }
+
+    // ───────────────────── GIT-P10 (GIT-D1): the per-ref CAS concurrency control ─────────────────
+
+    /// **GIT-P10 hot-ref burst: rapid SAME-ref pushes SERIALISE per ref (the per-ref CAS is the
+    /// linearisation point).** N threads race the SAME hot ref, each presenting the SAME stale
+    /// expected-old (the create-from-zero). Exactly ONE wins (commits the create); the rest see the
+    /// moved tip and are non-fast-forward rejected — 0 lost (the winner is durable), 0 ghost (no
+    /// rejected push emitted). This is the per-ref serialisation: the ref advances by exactly one
+    /// generation no matter how many racers hit it at once.
+    #[test]
+    fn hot_ref_burst_serialises_exactly_one_winner_per_generation() {
+        use std::sync::Barrier;
+        let (store, outbox) = store();
+        let store = Arc::new(store);
+        let n = 32usize;
+        let barrier = Arc::new(Barrier::new(n));
+
+        let mut handles = Vec::new();
+        for i in 0..n {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let db = InMemoryObjectDb::new();
+                // Every racer creates the SAME ref from zero to its OWN new oid — only one can win.
+                let push = human_push("refs/heads/hot", Oid::zero(), Oid::new(format!("w{i:02}")));
+                barrier.wait(); // release all racers at once → maximal contention on the one ref.
+                store.receive(&push, &db, CrashPoint::None).unwrap()
+            }));
+        }
+        let outcomes: Vec<PushOutcome> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let accepted = outcomes.iter().filter(|o| matches!(o, PushOutcome::Accepted { .. })).count();
+        let rejected = outcomes
+            .iter()
+            .filter(|o| matches!(o, PushOutcome::Rejected(RejectReason::NonFastForward { .. })))
+            .count();
+        assert_eq!(accepted, 1, "exactly one racer wins the create (per-ref linearisation)");
+        assert_eq!(rejected, n - 1, "every loser is a non-fast-forward reject (0 lost-update)");
+        // 0 ghost: exactly ONE event committed (only the winner emitted); the ref advanced by one.
+        assert_eq!(outbox.committed_count(), 1, "only the winner's git.ref.updated committed (0 ghost)");
+        assert_eq!(
+            store.reflog().iter().filter(|e| e.ref_name == RefName::new("refs/heads/hot")).count(),
+            1,
+            "the ref advanced by exactly one generation"
+        );
+        // The committed tip is one of the racers' oids, at update_seq 1.
+        let tip = store.tip(&RefName::new("refs/heads/hot")).unwrap();
+        assert!(tip.0.starts_with('w'), "the tip is a racer's oid: {tip:?}");
+    }
+
+    /// **GIT-P10: a chained hot-ref burst keeps push order per ref (the outbox order == the
+    /// ref-update order).** A single feeder thread chains rapid pushes to one hot ref (each from the
+    /// previous tip), interleaved with losing racers on the same ref. The committed `update_seq`
+    /// sequence is contiguous 1..=k AND the outbox per-aggregate seq is gap-free 0..k-1 in the SAME
+    /// order — the burst never reorders or drops a generation.
+    #[test]
+    fn chained_hot_ref_burst_preserves_push_order_per_ref() {
+        let (store, outbox) = store();
+        let db = InMemoryObjectDb::new();
+        let k = 50u64;
+        let mut prev = Oid::zero();
+        let mut ids = Vec::new();
+        for i in 1..=k {
+            let new = Oid::new(format!("gen{i:03}"));
+            match store
+                .receive(&human_push("refs/heads/hot", prev.clone(), new.clone()), &db, CrashPoint::None)
+                .unwrap()
+            {
+                PushOutcome::Accepted { emitted, moved } => {
+                    assert_eq!(moved[0].2, i, "update_seq is the contiguous generation");
+                    ids.push(emitted[0].clone());
+                }
+                o => panic!("a fast-forward chain push must be accepted, got {o:?}"),
+            }
+            prev = new;
+        }
+        // The outbox per-aggregate seqs are gap-free 0..k-1 in push order (the ref-update order).
+        let agg = AggregateKey("core:refs/heads/hot".into());
+        let outbox_seqs: Vec<u64> = ids
+            .iter()
+            .map(|id| {
+                let row = outbox.row(id).unwrap();
+                assert_eq!(row.aggregate, agg, "every burst event is on the one per-ref aggregate");
+                row.seq
+            })
+            .collect();
+        assert_eq!(
+            outbox_seqs,
+            (0..k).collect::<Vec<_>>(),
+            "outbox order == ref-update order per ref (gap-free, in push order)"
+        );
+    }
+
+    /// **GIT-P10: DIFFERENT refs FAN OUT PARALLEL (no whole-repo serialisation).** Concurrent pushes
+    /// to N distinct refs ALL succeed — none blocks another (each takes its OWN ref lock, never a
+    /// whole-repo lock). After the burst every ref is at its own tip and there are exactly N
+    /// committed events. (The previous GIT-P9 store held one global lock; arch §3 / GIT-P10 require
+    /// per-ref locks so distinct refs advance in parallel — this is the property under test.)
+    #[test]
+    fn distinct_refs_fan_out_parallel_all_succeed() {
+        use std::sync::Barrier;
+        let (store, outbox) = store();
+        let store = Arc::new(store);
+        let n = 24usize;
+        let barrier = Arc::new(Barrier::new(n));
+
+        let mut handles = Vec::new();
+        for i in 0..n {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let db = InMemoryObjectDb::new();
+                let ref_name = format!("refs/heads/r{i:02}");
+                let push = human_push(&ref_name, Oid::zero(), Oid::new(format!("t{i:02}")));
+                barrier.wait(); // all distinct-ref pushes fire at once → they must NOT serialise.
+                (ref_name, store.receive(&push, &db, CrashPoint::None).unwrap())
+            }));
+        }
+        let results: Vec<(String, PushOutcome)> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // EVERY distinct-ref push committed (none lost to a whole-repo lock contention reject).
+        for (ref_name, outcome) in &results {
+            assert!(
+                matches!(outcome, PushOutcome::Accepted { .. }),
+                "distinct ref {ref_name} must commit in parallel, got {outcome:?}"
+            );
+        }
+        assert_eq!(outbox.committed_count(), n, "all N distinct-ref events committed");
+        // Each ref is at its own tip with update_seq 1 (one create each, independent generations).
+        for i in 0..n {
+            assert_eq!(
+                store.tip(&RefName::new(format!("refs/heads/r{i:02}"))),
+                Some(Oid::new(format!("t{i:02}"))),
+                "ref r{i:02} advanced independently"
+            );
+        }
+        // The per-aggregate outbox seqs are each 0 (every ref is its own aggregate, first move).
+        for row in (0..n).filter_map(|i| {
+            outbox
+                .row(&match &results[i].1 {
+                    PushOutcome::Accepted { emitted, .. } => emitted[0].clone(),
+                    _ => unreachable!(),
+                })
+        }) {
+            assert_eq!(row.seq, 0, "each distinct ref's first event is its own aggregate's seq 0");
+        }
+    }
+
+    /// **GIT-P10: a non-protected ref DELETE removes the row (the cell goes empty), then a re-create
+    /// starts a fresh generation.** (Hardens the create→delete→create lifecycle the burst can hit.)
+    #[test]
+    fn non_protected_ref_delete_then_recreate() {
+        let (store, outbox) = store();
+        let db = InMemoryObjectDb::new();
+        // create feature@v1 (seq 1), then delete it (seq 2), then re-create (seq 1 of a fresh row).
+        store.receive(&human_push("refs/heads/feature", Oid::zero(), Oid::new("v1")), &db, CrashPoint::None).unwrap();
+        let del = PushSession {
+            updates: vec![ProposedRefUpdate {
+                ref_name: RefName::new("refs/heads/feature"),
+                expected_old: Oid::new("v1"),
+                new_oid: Oid::zero(),
+                forced: false,
+                commit_oids: vec![],
+            }],
+            quarantine: vec![],
+            pusher: Pusher { pseudonym: "anon-1@acme.noreply".into(), is_agent: false },
+        };
+        assert!(matches!(
+            store.receive(&del, &db, CrashPoint::None).unwrap(),
+            PushOutcome::Accepted { .. }
+        ));
+        assert_eq!(store.tip(&RefName::new("refs/heads/feature")), None, "the ref was deleted");
+        // Re-create: a delete-from-zero CAS (the row is gone → expected-old is zero again).
+        match store.receive(&human_push("refs/heads/feature", Oid::zero(), Oid::new("v2")), &db, CrashPoint::None).unwrap() {
+            PushOutcome::Accepted { moved, .. } => assert_eq!(moved[0].2, 1, "the re-created row starts a fresh generation"),
+            o => panic!("re-create must be accepted, got {o:?}"),
+        }
+        assert_eq!(store.tip(&RefName::new("refs/heads/feature")), Some(Oid::new("v2")));
+        assert_eq!(outbox.committed_count(), 3, "create + delete + re-create each emitted");
     }
 
     /// **H1 holder registration: opening the store auto-registers it (contract 1.4 / 10.1).** The
