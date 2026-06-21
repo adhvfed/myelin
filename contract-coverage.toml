@@ -443,7 +443,18 @@ landing = "P-165"
 row = "5.9"
 title = "Git<->CI CheckStatus seam"
 status = "deferred"
-landing = "P-232"
+landing = "P-281"
+# GIT-P6/P-232 DECLARED the consumer half: the `check_status` projection-table schema keyed
+# (commit_oid, context), the monotonic `run_attempt` supersession rule, the `required`-set policy +
+# the gate outcome, and the typed `CheckStatus` consumer view that decodes the OPAQUE Bus payload
+# (`myelin_git::check_status`) — a COMPILING, not-yet-live seam module against the M2-frozen 5.9 shape,
+# with a consumer-half CDC (`crates/myelin-git/tests/cdc_5_9_check_status_consumer.rs`). The row stays
+# DEFERRED because the seam is not live end-to-end: there is no event consumer wired, no migration run,
+# and no CI PRODUCER yet. The live consumer + merge gate (the check_status projection table + the
+# run_attempt supersession core) land in GIT-P20/P-281 (M3, against a SYNTHETIC `ci.check.updated`
+# emitter — the X-1 seam-floor). The real CI producer wiring (CI emits `ci.check.updated` + the rollup
+# `ci.result`) is the M4 co-gate (GIT-D10/CI-D8 end-to-end) — only then is the full provider+consumer
+# CDC pair closeable to `covered`.
 
 # ──────────────── §6 Search (myelin-search) ─────────────────────────────────────────────────────
 

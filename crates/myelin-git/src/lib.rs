@@ -17,6 +17,13 @@
 //!   and minted as grammatical sub-URNs through the one Refs codec ([`subs::mint_pr_comment`] etc.).
 //!   The kind REGISTRATION + the grammatical mints ship; the per-kind resolvers are named follow-ons
 //!   (GIT-P18 comment/thread, GIT-P24 the L-range 4-state content-anchored resolver).
+//! - [`check_status`] — **GIT-P6 / P-232**: the X-1 Git↔CI `CheckStatus` **consumer contract**
+//!   (contract 5.9) — the `check_status` projection-table schema keyed `(commit_oid, context)`, the
+//!   monotonic `run_attempt` supersession rule, and the `required`-set policy shape, declared as a
+//!   COMPILING (not-yet-live) seam module against the M2-frozen 5.9 shape. The live consumer + merge
+//!   gate land in GIT-P20 (against a synthetic `ci.check.updated` emitter — the seam-floor); the real
+//!   CI producer wiring is the M4 co-gate (GIT-D10 / CI-D8 end-to-end). No event consumer is wired
+//!   and no migration is run here.
 //!
 //! **Owning architecture doc:**
 //! `planning/04-subsystem-architectures/git-hosting/architecture/00-overview.md` §1.1 (git OWNS
@@ -68,6 +75,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod check_status;
 pub mod events;
 pub mod holder_intent;
 pub mod rebac_fragment;
