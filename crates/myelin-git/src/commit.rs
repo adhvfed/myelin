@@ -271,6 +271,158 @@ pub fn erased_residual(commit: &Commit, real_identity_tokens: &[&str]) -> Erasur
     }
 }
 
+// ─────────────────── receive-pack pseudonymity enforcement (GIT-P12 / P-273) ────────────────────
+//
+// **Mandatory-core mutation floor (the prompt's cargo-mutants gate).** The pseudonymity rule gates
+// the data model — it is mandatory-core. The floor is **100% of viable mutants caught** over the
+// enforcement surface ([`enforce_pseudonymous_commit`], [`email_in_identity_line`],
+// [`is_commit_object`]). MET: `cargo mutants -p myelin-git --file src/commit.rs` → 30 caught, 5
+// unviable, 0 MISSED (2026-06-21).
+//
+// The [`CommitIdentity`] codec above is pseudonymous-**by-construction** — it mints OUR commits and
+// cannot express a raw name/email. But a `git push` carries commit objects a CLIENT built with its
+// OWN (possibly non-cooperating) git, whose author/committer lines may carry a real name + a real
+// routable email. Those bytes arrive in the receive-pack QUARANTINE. GIT-1 (the data-model gate)
+// requires that a commit whose author/committer identity is NOT the principal's tenant pseudonym is
+// REJECTED *before the ref moves* — so the immutable object DB never admits cleartext PII in a commit
+// identity field (the GIT-D2 "0 cleartext-PII commits admitted" gate). This is the receive-pack
+// ENFORCEMENT half (the schema/codec half is the data model above).
+//
+// ## The chosen enforcement default (OQ-10 / R-8 — recorded here with its rationale)
+// The decided PROPERTY is invariant: *the immutable commit bytes carry only the opaque pseudonym*
+// (recon §X-7). The OQ-10/R-8 OPEN call is the *enforcement mode* — **client-cooperative,
+// sha-stable REJECT-at-push** vs **server-side rewrite-at-push** (which would change the client's
+// commit SHAs silently). **The default chosen here is REJECT-AT-PUSH (client-cooperative,
+// sha-stable).** Rationale: (1) it is sha-STABLE — the client's local history and the server agree
+// on every OID, so no silent hash divergence (the rewrite-at-push mode mutates SHAs under the
+// client, breaking signatures and any external reference to the pre-rewrite OID); (2) it keeps the
+// platform's `git` byte-plumbing a verbatim relay (no server-side history surgery on the hot push
+// path — EI-04 §1 "never bake erasable PII in the first place" is met at the door, not patched
+// after); (3) the cooperative path is a one-time `git config user.email <pseudonym>@<tenant>.noreply`
+// the front door advertises, so the friction is bounded. The server-side rewrite-at-push mode
+// remains the named follow-on for the non-cooperating-client long tail (GIT-P29, the history-rewrite
+// machinery) — but it is NOT the default, because a silent SHA change is the more disruptive
+// surprise. This default is restated in the crate doc (`lib.rs`).
+
+/// The reason a pushed commit's author/committer identity is **not pseudonymous** — the receive-pack
+/// pseudonymity rule rejects it BEFORE the ref moves (GIT-1, the GIT-D2 gate: 0 cleartext-PII commit
+/// identities admitted). Each variant names exactly what the door refused (a rejected push is LOUD).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NonPseudonymousIdentity {
+    /// A commit header line (`author`/`committer`) did not match the frozen grammar
+    /// `<name> <<pseudonym>@<tenant>.noreply> <ts> <tz>` — its email is not a pseudonym handle at
+    /// all (it is a real routable address, or malformed). `role` is `"author"`/`"committer"`.
+    NotAPseudonym {
+        /// the offending header role (`author` or `committer`).
+        role: String,
+        /// the offending address the client baked into the commit's identity line — surfaced LOUDLY
+        /// in the reject (NOT silently coerced). This is a transient diagnostic of the REFUSED value
+        /// (the thing the door keeps OUT of storage), never a persisted PII column — hence it is not
+        /// (and must not be) a `#[personal_data]` field: the gate exists so this string is never
+        /// stored.
+        offending_email: String,
+    },
+    /// The email IS a well-formed pseudonym, but for the WRONG tenant — a commit authored to
+    /// `<pseudonym>@<other-tenant>.noreply` must not move a ref in THIS tenant (cross-tenant
+    /// pseudonym smuggling). `expected_tenant` is the principal's tenant; `found_tenant` is the
+    /// commit's.
+    WrongTenant {
+        /// the header role (`author`/`committer`).
+        role: String,
+        /// the tenant the principal pushes under.
+        expected_tenant: String,
+        /// the tenant baked into the commit's pseudonym.
+        found_tenant: String,
+    },
+    /// The commit object's bytes were not a parseable git commit (no `author`/`committer` header) —
+    /// a malformed commit cannot be proven pseudonymous, so it is refused (fail-closed).
+    Unparseable {
+        /// which header was missing.
+        missing: String,
+    },
+}
+
+/// Parse the email out of a git `author`/`committer` header line. A real git identity line is
+/// `<role> Name <email> <unix-ts> <tz>`; the email is the text between the LAST `<` and the matching
+/// `>`. Returns `None` if the line has no `<…>` email span (a malformed header).
+fn email_in_identity_line(line: &str) -> Option<&str> {
+    let open = line.rfind('<')?;
+    let close = line[open + 1..].find('>')? + open + 1;
+    Some(&line[open + 1..close])
+}
+
+/// **The receive-pack pseudonymity gate (GIT-1 / GIT-P12 — the GIT-D2 enforcement half).** Given the
+/// raw bytes of a pushed commit object and the principal's tenant, prove the commit's author AND
+/// committer identities are the per-tenant pseudonym `<pseudonym>@<tenant>.noreply` (contract 4.8).
+///
+/// REJECT-AT-PUSH (the chosen default): a commit whose author/committer email is not a pseudonym
+/// handle for THIS tenant returns `Err(NonPseudonymousIdentity)` — the caller (the push policy)
+/// refuses the whole push before the ref moves, so the cleartext-PII identity never lands in the
+/// immutable object DB. On success returns the parsed `(author, committer)` pseudonym handles (the
+/// thing the reflog/attribution records).
+///
+/// The scan covers BOTH `author` and `committer` (a rebase/cherry-pick can differ them; both must be
+/// pseudonymous). The check is sha-STABLE: it inspects, it does not mutate — a rejected commit's OID
+/// is never silently changed (the rewrite-at-push alternative is the GIT-P29 follow-on).
+pub fn enforce_pseudonymous_commit(
+    commit_bytes: &[u8],
+    tenant: &str,
+) -> Result<(PseudonymHandle, PseudonymHandle), NonPseudonymousIdentity> {
+    // A commit object is UTF-8 by git convention (the header is ASCII; only the message may carry
+    // arbitrary text, and we only parse the header lines before the blank line).
+    let text = String::from_utf8_lossy(commit_bytes);
+    let mut author: Option<PseudonymHandle> = None;
+    let mut committer: Option<PseudonymHandle> = None;
+    for line in text.lines() {
+        // The header ends at the first blank line; the message body is past it (and is NOT an
+        // identity field — it is author-content under the per-subject DEK, X-7).
+        if line.is_empty() {
+            break;
+        }
+        let role = if let Some(rest) = line.strip_prefix("author ") {
+            ("author", rest)
+        } else if let Some(rest) = line.strip_prefix("committer ") {
+            ("committer", rest)
+        } else {
+            continue;
+        };
+        let (role_name, rest) = role;
+        let email = email_in_identity_line(rest).ok_or(NonPseudonymousIdentity::NotAPseudonym {
+            role: role_name.to_string(),
+            offending_email: rest.to_string(),
+        })?;
+        // The email MUST be a well-formed pseudonym handle in the frozen grammar.
+        let handle = PseudonymHandle::parse(email).ok_or(NonPseudonymousIdentity::NotAPseudonym {
+            role: role_name.to_string(),
+            offending_email: email.to_string(),
+        })?;
+        // …and for the PRINCIPAL's tenant (no cross-tenant pseudonym in this tenant's refs).
+        if handle.tenant() != tenant {
+            return Err(NonPseudonymousIdentity::WrongTenant {
+                role: role_name.to_string(),
+                expected_tenant: tenant.to_string(),
+                found_tenant: handle.tenant().to_string(),
+            });
+        }
+        match role_name {
+            "author" => author = Some(handle),
+            _ => committer = Some(handle),
+        }
+    }
+    let author = author.ok_or(NonPseudonymousIdentity::Unparseable { missing: "author".into() })?;
+    let committer =
+        committer.ok_or(NonPseudonymousIdentity::Unparseable { missing: "committer".into() })?;
+    Ok((author, committer))
+}
+
+/// `true` iff `bytes` look like a git **commit** object (the first header is `tree …`). The push
+/// policy scans only commit objects for the pseudonymity rule — a blob/tree carries no author line.
+/// A git commit's canonical bytes always begin with the `tree <oid>` header, so the prefix is the
+/// discriminant (a tag object begins `object …`; a blob/tree has no such header).
+pub fn is_commit_object(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"tree ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,6 +540,112 @@ mod tests {
         assert_eq!(format!("{oid}"), oid.0);
         assert!(format!("{oid}").starts_with("blake3:"));
         assert!(!format!("{oid}").is_empty());
+    }
+
+    /// **GIT-P12 enforcement: a pushed commit whose author/committer is the tenant pseudonym is
+    /// ACCEPTED.** The pseudonymous-by-construction codec's own bytes pass the receive-pack gate (the
+    /// cooperative-client happy path) — author + committer parse back to the same `(psn, tenant)`.
+    #[test]
+    fn enforce_accepts_a_pseudonymous_commit_for_the_tenant() {
+        let c = commit(); // author == committer == psn-7f3a9c@acme.noreply
+        let (author, committer) =
+            enforce_pseudonymous_commit(&c.canonical_bytes(), "acme").expect("pseudonymous → accept");
+        assert_eq!(author, handle());
+        assert_eq!(committer, handle());
+    }
+
+    /// **GIT-P12 enforcement: a commit carrying a REAL name/email is REJECTED before the ref moves.**
+    /// A non-cooperating client's commit (`Ada Lovelace <ada@example.com>`) is the cleartext-PII case
+    /// the GIT-D2 gate must refuse at the door — `NotAPseudonym`, naming the offending email LOUDLY.
+    #[test]
+    fn enforce_rejects_a_raw_name_email_commit() {
+        // Bytes a stock `git commit` would produce — a real routable identity in the author line.
+        let raw = b"tree blake3:t\n\
+                    author Ada Lovelace <ada.lovelace@example.com> 1700000000 +0000\n\
+                    committer Ada Lovelace <ada.lovelace@example.com> 1700000000 +0000\n\
+                    \n\
+                    fix: the bug\n";
+        match enforce_pseudonymous_commit(raw, "acme") {
+            Err(NonPseudonymousIdentity::NotAPseudonym { role, offending_email }) => {
+                assert_eq!(role, "author", "the FIRST non-pseudonymous header is named");
+                assert_eq!(offending_email, "ada.lovelace@example.com");
+            }
+            other => panic!("expected NotAPseudonym, got {other:?}"),
+        }
+    }
+
+    /// **GIT-P12 enforcement: a well-formed pseudonym for the WRONG tenant is REJECTED.** A commit
+    /// authored to `psn@globex.noreply` must not move a ref in tenant `acme` (cross-tenant pseudonym
+    /// smuggling) — `WrongTenant`, naming both tenants.
+    #[test]
+    fn enforce_rejects_a_wrong_tenant_pseudonym() {
+        let foreign = PseudonymHandle::new("psn-x", "globex").unwrap();
+        let id = CommitIdentity::pseudonymous(foreign, 1_700_000_000, 0);
+        let mut c = commit();
+        c.author = id.clone();
+        c.committer = id;
+        match enforce_pseudonymous_commit(&c.canonical_bytes(), "acme") {
+            Err(NonPseudonymousIdentity::WrongTenant { role, expected_tenant, found_tenant }) => {
+                assert_eq!(role, "author");
+                assert_eq!(expected_tenant, "acme");
+                assert_eq!(found_tenant, "globex");
+            }
+            other => panic!("expected WrongTenant, got {other:?}"),
+        }
+    }
+
+    /// **GIT-P12 enforcement: the COMMITTER is checked too (not just the author).** A rebase can leave
+    /// a pseudonymous author but a raw committer; both are immutable identity fields, so both gate.
+    #[test]
+    fn enforce_rejects_a_raw_committer_even_with_pseudonymous_author() {
+        let raw = b"tree blake3:t\n\
+                    author psn-ok@acme.noreply <psn-ok@acme.noreply> 1700000000 +0000\n\
+                    committer Real Committer <real@corp.example> 1700000000 +0000\n\
+                    \n\
+                    chore: rebase\n";
+        match enforce_pseudonymous_commit(raw, "acme") {
+            Err(NonPseudonymousIdentity::NotAPseudonym { role, offending_email }) => {
+                assert_eq!(role, "committer", "the committer is gated independently of the author");
+                assert_eq!(offending_email, "real@corp.example");
+            }
+            other => panic!("expected committer NotAPseudonym, got {other:?}"),
+        }
+    }
+
+    /// **GIT-P12 enforcement: a malformed commit (no author header) FAILS CLOSED.** A commit object
+    /// that cannot be proven pseudonymous is refused, not admitted.
+    #[test]
+    fn enforce_fails_closed_on_a_missing_author_header() {
+        let raw = b"tree blake3:t\n\
+                    committer psn-ok@acme.noreply <psn-ok@acme.noreply> 1700000000 +0000\n\
+                    \n\
+                    msg\n";
+        assert_eq!(
+            enforce_pseudonymous_commit(raw, "acme"),
+            Err(NonPseudonymousIdentity::Unparseable { missing: "author".into() })
+        );
+    }
+
+    /// **`is_commit_object` distinguishes a commit from a blob** (so the policy scans only commits):
+    /// a `tree …`-headed object is a commit; arbitrary blob bytes are not.
+    #[test]
+    fn is_commit_object_detects_only_commits() {
+        let c = commit();
+        assert!(is_commit_object(&c.canonical_bytes()), "a tree-headed object is a commit");
+        assert!(!is_commit_object(b"just some file contents\n"), "a blob is not a commit");
+        assert!(!is_commit_object(b"AKIAEXAMPLE secret blob"), "a secret blob is not a commit");
+    }
+
+    /// The pseudonymity gate does NOT scan the message body — a third-party name typed into a commit
+    /// MESSAGE is the documented X-7 residual (per-subject DEK + history-rewrite follow-on), NOT a
+    /// receive-pack reject. Only the author/committer IDENTITY fields gate (the GIT-1 property).
+    #[test]
+    fn enforce_ignores_third_party_mention_in_the_message_body() {
+        let mut c = commit();
+        // The body mentions a real person — that is author-content (X-7 residual), not an identity.
+        c.message = "fix: as reported by Ada Lovelace <ada@example.com>\n".into();
+        // The IDENTITY fields are still the tenant pseudonym → accepted (the body is not gated here).
+        assert!(enforce_pseudonymous_commit(&c.canonical_bytes(), "acme").is_ok());
     }
 
     /// A commit with a different REAL author but the SAME pseudonym + bytes is byte-identical: the

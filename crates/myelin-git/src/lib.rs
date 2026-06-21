@@ -25,6 +25,20 @@
 //!   the one platform posture); the opaque `principal_id` still attributes the commit for authz
 //!   out-of-band. Floor: the audited history-rewrite path (a *body* expunge) is the M5/on-demand
 //!   follow-on (00-recon §X-7 / CR §9 10.6, Git+GDPR roadmaps).
+//!   - **GIT-P12 / P-273 (M3)** adds the receive-pack ENFORCEMENT half of the same data-model gate
+//!     ([`commit::enforce_pseudonymous_commit`] + [`receive_pack::PushPolicy`]'s pseudonymity rule):
+//!     a pushed commit whose author/committer identity is NOT the principal's tenant pseudonym
+//!     `<pseudonym>@<tenant>.noreply` is REJECTED at receive-pack BEFORE the ref moves, so the
+//!     immutable object DB admits **0 cleartext PII** in a commit identity field (the GIT-D2 GIT-1
+//!     half). **The chosen enforcement default (OQ-10 / R-8): REJECT-AT-PUSH (client-cooperative,
+//!     sha-stable)** — the decided PROPERTY ("immutable bytes carry only the opaque pseudonym",
+//!     §X-7) is enforced at the door, not by silently rewriting the client's commit SHAs; the
+//!     server-side rewrite-at-push mode is the named GIT-P29 follow-on (the rationale is in
+//!     [`commit`]). The residual lawful-basis posture is instantiated BY REFERENCE to the ONE
+//!     platform posture (10.9 / recon §X-7) — never restated as a git-local statement. **Floor
+//!     (GF-7):** the structural mechanism ships across GIT-P9/GIT-P12/GIT-P29; the lawful-basis
+//!     residual is the ONE posture's `[OPEN — LEGAL]` statement (R-7, parallel/Legal — NOT a code
+//!     gate); the erase-reaches-every-holder GIT-D2 completion is GIT-P29.
 //! - [`notif_rules`] — **GIT-P19 / P-263 (M3)**: producer accretion — Git **registers** its
 //!   `define_notif_rule` set (review_requested / mentioned / watched, contract 7.6) into the frozen
 //!   `myelin_notif::NotifRuleRegistry` and **wires** its REAL PR/repo watcher reverse index behind the

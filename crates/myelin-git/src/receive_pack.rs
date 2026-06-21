@@ -243,6 +243,17 @@ pub enum RejectReason {
     },
     /// The push's pseudonymity assertion failed (an empty/non-pseudonymous identity — GIT-1).
     PseudonymRequired,
+    /// A pushed COMMIT object's author/committer identity is not the principal's tenant pseudonym
+    /// (GIT-1 / GIT-P12 — the data-model gate). Reject-at-push (the chosen default, sha-stable):
+    /// the cleartext-PII commit never moves a ref, so the immutable object DB admits 0 cleartext PII
+    /// in a commit identity field (the GIT-D2 gate). Carries the offending object's oid + the
+    /// specific [`crate::commit::NonPseudonymousIdentity`] the door refused.
+    NonPseudonymousCommit {
+        /// the offending commit object's oid.
+        oid: Oid,
+        /// exactly why the commit identity is not the tenant pseudonym (LOUD — never silently coerced).
+        identity: crate::commit::NonPseudonymousIdentity,
+    },
     /// The CAS expected-old did not match the ref's current tip (a non-fast-forward / lost-update
     /// race) — the per-ref linearisation point rejected the stale push (arch §3).
     NonFastForward {
@@ -268,6 +279,11 @@ pub struct PushPolicy {
     pub secret_patterns: Vec<String>,
     /// Whether protected refs require a human pusher (an agent direct-push is rejected).
     pub protected_needs_human: bool,
+    /// The tenant the push is authenticated under (from the token, never the URL — X-1). The
+    /// pseudonymity rule (GIT-1 / GIT-P12) requires every pushed commit's author/committer identity
+    /// to be a `<pseudonym>@<tenant>.noreply` handle for THIS tenant; a commit carrying a raw
+    /// name/email — or a pseudonym for another tenant — is rejected before the ref moves.
+    pub tenant: String,
 }
 
 impl Default for PushPolicy {
@@ -281,6 +297,11 @@ impl Default for PushPolicy {
                 "-----BEGIN RSA PRIVATE KEY".to_string(),
             ],
             protected_needs_human: true,
+            // The default policy is tenant-agnostic for the non-pseudonymity rules; `RefStore::receive`
+            // overrides this with the store's authenticated tenant before evaluating (so the
+            // pseudonymity rule has the principal's tenant). A blank tenant matches no pseudonym
+            // handle → fail-closed if a caller forgets to set it.
+            tenant: String::new(),
         }
     }
 }
@@ -332,6 +353,23 @@ impl PushPolicy {
                     return Err(RejectReason::SecretDetected {
                         oid: obj.oid.clone(),
                         pattern: pat.clone(),
+                    });
+                }
+            }
+            // Pseudonymity (GIT-1 / GIT-P12 — the data-model gate): a pushed COMMIT object's
+            // author/committer identity MUST be the principal's tenant pseudonym
+            // `<pseudonym>@<tenant>.noreply` (contract 4.8). REJECT-AT-PUSH (the chosen default,
+            // sha-stable — see `crate::commit`): a commit carrying a raw name/email — or a pseudonym
+            // for another tenant — is refused BEFORE the ref moves, so the immutable object DB never
+            // admits cleartext PII in a commit identity field (the GIT-D2 "0 cleartext PII" gate).
+            // Only commit objects carry an identity line; blobs/trees are skipped.
+            if crate::commit::is_commit_object(&obj.bytes) {
+                if let Err(identity) =
+                    crate::commit::enforce_pseudonymous_commit(&obj.bytes, &self.tenant)
+                {
+                    return Err(RejectReason::NonPseudonymousCommit {
+                        oid: obj.oid.clone(),
+                        identity,
                     });
                 }
             }
@@ -584,7 +622,13 @@ impl RefStore {
         crash: CrashPoint,
     ) -> Result<PushOutcome, OutboxError> {
         // ── Step 2: in-process policy — REJECT BEFORE THE REF MOVES (arch §2). ──
-        if let Err(reason) = PushPolicy::default().evaluate(push) {
+        // The policy is tenant-scoped: the pseudonymity rule (GIT-1) checks every pushed commit's
+        // author/committer identity against the store's AUTHENTICATED tenant (from the token, X-1).
+        let policy = PushPolicy {
+            tenant: self.ctx_base.tenant.0.clone(),
+            ..PushPolicy::default()
+        };
+        if let Err(reason) = policy.evaluate(push) {
             // The quarantine is discarded (never promoted) — we simply do NOT call migration.
             return Ok(PushOutcome::Rejected(reason));
         }
@@ -1000,6 +1044,131 @@ mod tests {
         );
     }
 
+    // ───────────── GIT-P12 (P-273): the receive-pack pseudonymity rule (the data-model gate) ──────
+
+    /// Build a push whose quarantine carries a single COMMIT object with the given author/committer
+    /// identity LINE (the raw bytes a client pushed). `identity_line` is the `<name> <email> ts tz`
+    /// tail of both the `author` and `committer` headers.
+    fn push_with_commit_identity(ref_name: &str, identity_line: &str) -> PushSession {
+        let commit_bytes = format!(
+            "tree blake3:t\nauthor {identity_line}\ncommitter {identity_line}\n\nfeat: x\n"
+        )
+        .into_bytes();
+        PushSession {
+            updates: vec![ProposedRefUpdate {
+                ref_name: RefName::new(ref_name),
+                expected_old: Oid::zero(),
+                new_oid: Oid::new("aaaa"),
+                forced: false,
+                commit_oids: vec![Oid::new("c0")],
+            }],
+            quarantine: vec![QuarantineObject { oid: Oid::new("c0"), bytes: commit_bytes }],
+            pusher: Pusher { pseudonym: "psn-7@acme.noreply".into(), is_agent: false },
+        }
+    }
+
+    /// **GIT-P12 GATE — a pushed commit with a RAW name/email is REJECTED before the ref moves (0
+    /// cleartext-PII commit admitted).** The non-cooperating-client commit `Ada Lovelace <ada@…>`
+    /// never moves a ref; nothing is emitted; the quarantine is not promoted.
+    #[test]
+    fn non_pseudonymous_commit_is_rejected_before_ref_moves() {
+        let (store, outbox) = store(); // tenant = acme
+        let db = InMemoryObjectDb::new();
+        let push = push_with_commit_identity(
+            "refs/heads/feature",
+            "Ada Lovelace <ada.lovelace@example.com> 1700000000 +0000",
+        );
+        match store.receive(&push, &db, CrashPoint::None).unwrap() {
+            PushOutcome::Rejected(RejectReason::NonPseudonymousCommit { oid, identity }) => {
+                assert_eq!(oid, Oid::new("c0"));
+                assert_eq!(
+                    identity,
+                    crate::commit::NonPseudonymousIdentity::NotAPseudonym {
+                        role: "author".into(),
+                        offending_email: "ada.lovelace@example.com".into(),
+                    }
+                );
+            }
+            o => panic!("expected NonPseudonymousCommit, got {o:?}"),
+        }
+        // 0 cleartext PII admitted: the ref never moved, nothing emitted, the commit not promoted.
+        assert_eq!(store.tip(&RefName::new("refs/heads/feature")), None, "the ref never moved");
+        assert_eq!(outbox.outbox_depth(), 0, "a rejected push emits nothing");
+        assert!(db.is_empty(), "the cleartext-PII commit was NOT promoted out of quarantine");
+    }
+
+    /// **GIT-P12 GATE — a pushed commit authored to the tenant pseudonym is ACCEPTED.** The
+    /// cooperative-client happy path: `<pseudonym>@acme.noreply` passes the door, the ref moves, one
+    /// event commits.
+    #[test]
+    fn pseudonymous_commit_for_the_tenant_is_accepted() {
+        let (store, outbox) = store(); // tenant = acme
+        let db = InMemoryObjectDb::new();
+        let push = push_with_commit_identity(
+            "refs/heads/feature",
+            "psn-7f3a9c@acme.noreply <psn-7f3a9c@acme.noreply> 1700000000 +0000",
+        );
+        assert!(matches!(
+            store.receive(&push, &db, CrashPoint::None).unwrap(),
+            PushOutcome::Accepted { .. }
+        ));
+        assert_eq!(store.tip(&RefName::new("refs/heads/feature")), Some(Oid::new("aaaa")));
+        assert_eq!(outbox.outbox_depth(), 1, "the accepted push committed one git.ref.updated");
+        assert!(db.contains(&Oid::new("c0")), "the pseudonymous commit was promoted");
+    }
+
+    /// **GIT-P12 GATE — a well-formed pseudonym for ANOTHER tenant is REJECTED (cross-tenant
+    /// smuggling).** A commit authored `psn@globex.noreply` cannot move a ref in tenant `acme`.
+    #[test]
+    fn wrong_tenant_pseudonym_commit_is_rejected() {
+        let (store, _outbox) = store(); // tenant = acme
+        let db = InMemoryObjectDb::new();
+        let push = push_with_commit_identity(
+            "refs/heads/feature",
+            "psn-x@globex.noreply <psn-x@globex.noreply> 1700000000 +0000",
+        );
+        match store.receive(&push, &db, CrashPoint::None).unwrap() {
+            PushOutcome::Rejected(RejectReason::NonPseudonymousCommit { identity, .. }) => assert_eq!(
+                identity,
+                crate::commit::NonPseudonymousIdentity::WrongTenant {
+                    role: "author".into(),
+                    expected_tenant: "acme".into(),
+                    found_tenant: "globex".into(),
+                }
+            ),
+            o => panic!("expected WrongTenant NonPseudonymousCommit, got {o:?}"),
+        }
+        assert_eq!(store.tip(&RefName::new("refs/heads/feature")), None, "the ref never moved");
+    }
+
+    /// **GIT-P12: a non-commit object (a blob) is NOT subject to the pseudonymity rule.** A blob
+    /// carrying a stray `<email>` is not a commit identity — it passes the rule (only commit objects
+    /// have an author line). The push is accepted on its other merits.
+    #[test]
+    fn blob_object_is_not_gated_by_the_pseudonymity_rule() {
+        let (store, _outbox) = store();
+        let db = InMemoryObjectDb::new();
+        let push = PushSession {
+            updates: vec![ProposedRefUpdate {
+                ref_name: RefName::new("refs/heads/feature"),
+                expected_old: Oid::zero(),
+                new_oid: Oid::new("aaaa"),
+                forced: false,
+                commit_oids: vec![],
+            }],
+            // A blob (NOT tree-headed) whose contents mention a real email — not an identity field.
+            quarantine: vec![QuarantineObject {
+                oid: Oid::new("blob0"),
+                bytes: b"contact: ada@example.com for support\n".to_vec(),
+            }],
+            pusher: Pusher { pseudonym: "psn-7@acme.noreply".into(), is_agent: false },
+        };
+        assert!(
+            matches!(store.receive(&push, &db, CrashPoint::None).unwrap(), PushOutcome::Accepted { .. }),
+            "a blob is not gated by the commit pseudonymity rule"
+        );
+    }
+
     /// **Reject: a blank pseudonym (pseudonymity required, GIT-1).**
     #[test]
     fn blank_pseudonym_is_rejected() {
@@ -1337,7 +1506,7 @@ mod tests {
     /// object EXACTLY at the limit is accepted; one byte over is rejected.
     #[test]
     fn object_size_limit_is_strict_greater_than() {
-        let policy = PushPolicy { max_object_bytes: 8, secret_patterns: vec![], protected_needs_human: true };
+        let policy = PushPolicy { max_object_bytes: 8, secret_patterns: vec![], protected_needs_human: true, tenant: "acme".into() };
         let at_limit = PushSession {
             updates: vec![ProposedRefUpdate {
                 ref_name: RefName::new("refs/heads/f"),
