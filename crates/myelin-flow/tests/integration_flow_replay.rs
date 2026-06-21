@@ -180,3 +180,114 @@ async fn flow_d1_lease_crash_recovery_and_replay_short_circuit_in_real_postgres(
         "[2026-06-21] PASS  drill=FLOW-D1(live-PG)  kill@5/10 resume@6  re_executed=0 lost=0  lease=skip-locked replay=short-circuit  (real Postgres FOR UPDATE SKIP LOCKED + UNIQUE replay key)"
     );
 }
+
+/// **FLOW-D2 (live-PG): the replay-divergence guard dead-letters a run as `nondeterministic` in REAL
+/// Postgres (P-FLOW-07).** Drives the in-memory engine's divergence guard to its terminal verdict and
+/// proves the dead-letter row PERSISTS to the real `workflow_run` — the `state` CHECK admits
+/// `nondeterministic` (the frozen DDL) and a divergent run lands there, never silently continues. The
+/// `nondeterministic`-halt count is the green artifact; here we prove its terminal write is durable
+/// against the live state-CHECK (a state the CHECK rejected would error the UPDATE — the floor).
+#[tokio::test]
+async fn flow_d2_divergence_guard_dead_letters_nondeterministic_in_real_postgres() {
+    use myelin_events::{
+        Actor, EmitContextBase, MonotonicMinter, OutboxStore, Timestamp,
+    };
+    use myelin_flow::engine::{drive_versioned, run_state, FlowTelemetry, RunRow, RunStore, DriveOutcome, WorkflowBody};
+    use myelin_flow::wfctx::{RetryPolicy, WfCtx, WfJournal};
+    use myelin_identity::{Principal, PrincipalId, PrincipalKind};
+    use myelin_refs::ArtifactRef;
+    use myelin_tenancy::{Region, TenantId};
+    use sqlx::Row;
+    use std::sync::Arc;
+
+    let cfg = MyelinConfig::dev();
+    let admin = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&cfg.database_url.replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw"))
+        .await
+        .expect("connect as admin to dev Postgres (is the stack up?)");
+
+    let pid = std::process::id();
+    let run_tbl = format!("workflow_run_divergence_{pid}");
+    let run_create = WORKFLOW_RUN_DDL.replacen("workflow_run", &run_tbl, 1);
+    sqlx::query(&format!("DROP TABLE IF EXISTS {run_tbl}")).execute(&admin).await.unwrap();
+    sqlx::query(&run_create).execute(&admin).await.expect("the workflow_run DDL applies");
+
+    // Seed a runnable run pinned to wf_version=1 in real Postgres.
+    sqlx::query(&format!(
+        "INSERT INTO {run_tbl} \
+         (tenant_id, region, run_id, wf_type, wf_version, input, state, cursor, correlation_id, depth, partition) \
+         VALUES ('acme','fr-par','RD','agent.run',1,'[]'::jsonb,'running',0,'corr-d',0,0)"
+    ))
+    .execute(&admin)
+    .await
+    .expect("seed the runnable run");
+
+    // Drive the in-memory engine's divergence guard: a v1-pinned run replayed with v2 (a deploy bump)
+    // — the guard halts as nondeterministic WITHOUT running a command (the version-divergence leg).
+    let ctx_base = EmitContextBase {
+        tenant: TenantId("acme".into()),
+        region: Region("fr-par".into()),
+        actor: Actor(Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId("acme".into()))),
+        schema_ver: 1,
+        occurred_at: Timestamp("2026-06-21T00:00:00Z".into()),
+        recorded_at: Timestamp("2026-06-21T00:00:01Z".into()),
+        caused_by: None,
+    };
+    let runs = RunStore::new();
+    runs.put(RunRow::new_runnable_versioned(
+        TenantId("acme".into()), Region("fr-par".into()), "RD", "agent.run", 1, 0,
+    ));
+    let outbox = OutboxStore::new();
+    let journal = WfJournal::new();
+    let tele = FlowTelemetry::new();
+    let minter: Arc<dyn myelin_events::IdMinter> = Arc::new(MonotonicMinter::new());
+    let body: Box<WorkflowBody> = Box::new(|ctx: &mut WfCtx| {
+        ctx.activity(RetryPolicy::default_policy(), |_i, _a| {
+            Ok(vec![ArtifactRef("myelin://acme/agent/effect/e0".into())])
+        })
+        .map_err(|e| format!("{e:?}"))?;
+        Ok(vec![])
+    });
+    let run = runs.get(&TenantId("acme".into()), "RD").unwrap();
+    let outcome = drive_versioned(
+        &runs, &outbox, &journal, &tele, minter, ctx_base, &run,
+        "2026-06-21T00:00:00Z", 7, body.as_ref(), 1, 2,
+    );
+    assert!(matches!(outcome, DriveOutcome::Nondeterministic(_)), "the version mismatch halts");
+    assert_eq!(tele.nondeterministic_halt_count(), 1, "the nondeterministic-halt count incremented by exactly 1");
+
+    // PERSIST the dead-letter to REAL Postgres — the state CHECK MUST admit 'nondeterministic'.
+    let settled = runs.get(&TenantId("acme".into()), "RD").unwrap();
+    assert_eq!(settled.state, run_state::NONDETERMINISTIC, "the in-memory run is dead-lettered");
+    sqlx::query(&format!(
+        "UPDATE {run_tbl} SET state=$1, lease_owner=NULL, lease_expires=NULL \
+         WHERE tenant_id='acme' AND run_id='RD'"
+    ))
+    .bind(&settled.state)
+    .execute(&admin)
+    .await
+    .expect("the dead-letter state persists — the frozen state CHECK admits 'nondeterministic'");
+
+    // read it back: the run is durably 'nondeterministic' (terminal, never re-driven by the wf_runnable index).
+    let st: String = sqlx::query(&format!("SELECT state FROM {run_tbl} WHERE run_id='RD'"))
+        .fetch_one(&admin)
+        .await
+        .unwrap()
+        .get("state");
+    assert_eq!(st, "nondeterministic", "the dead-letter row persists in real Postgres");
+    // it is NOT runnable (the partial wf_runnable index covers only state IN ('running')).
+    let runnable: i64 = sqlx::query(&format!(
+        "SELECT count(*) AS c FROM {run_tbl} WHERE partition=0 AND state='running'"
+    ))
+    .fetch_one(&admin)
+    .await
+    .unwrap()
+    .get("c");
+    assert_eq!(runnable, 0, "the dead-lettered run is no longer runnable (the divergence parked it)");
+
+    sqlx::query(&format!("DROP TABLE IF EXISTS {run_tbl}")).execute(&admin).await.unwrap();
+    println!(
+        "[2026-06-21] PASS  drill=FLOW-D2(live-PG)  divergent/wrong-version replay -> halt nondeterministic + dead-letter  nondeterministic_halt=1 silent_divergence=0  (real Postgres state CHECK admits 'nondeterministic')"
+    );
+}

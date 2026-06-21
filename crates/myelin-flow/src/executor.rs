@@ -321,11 +321,14 @@ impl DurableExecutor for FlowExecutor {
         // the dispatcher then leases + drives, and record the references-not-payloads StartSpec.
         let run_id = RunId(self.minter.mint().0);
         let partition = Self::partition_for(&run_id.0);
-        self.runs.put(RunRow::new_runnable(
+        // Seed the run with its PINNED wf_version (§4.6) so the divergence guard can detect a deploy
+        // that bumps the definition while the run is in flight (P-FLOW-07).
+        self.runs.put(RunRow::new_runnable_versioned(
             self.tenant.clone(),
             self.region.clone(),
             run_id.0.clone(),
             spec.wf_type.clone(),
+            wf_version,
             partition,
         ));
         let record = StartedRun {
@@ -541,6 +544,42 @@ mod tests {
         let status = ex.describe(&run).expect("describe");
         assert_eq!(status.state, run_state::COMPLETED, "the run describes as completed");
         assert!(status.terminal, "a completed run is terminal");
+    }
+
+    /// **FLOW-D2 end-to-end (P-FLOW-07, §4.6): a deploy that bumps the definition version HALTS an
+    /// in-flight run as `nondeterministic`.** A run starts pinned to `wf_version = 1`; the worker is
+    /// then redeployed running version 2 of `agent.run` (registered via `register_versioned`). When
+    /// the dispatcher leases + drives the v1-pinned run, the version-divergence guard halts it as
+    /// `nondeterministic` and dead-letters it — `describe` reports the terminal state and the
+    /// nondeterministic-halt telemetry increments. This is the control-plane face of the FLOW-D2 drill.
+    #[test]
+    fn deploy_version_bump_halts_in_flight_run_as_nondeterministic() {
+        let ex = executor(); // registers agent.run at pinned version 1.
+        let run = ex.start(spec("k")).expect("start a v1-pinned run");
+        assert_eq!(ex.describe(&run).unwrap().wf_version, 1, "the run pinned to v1 at start");
+
+        // the worker is redeployed running VERSION 2 of agent.run (a new body shape).
+        let part = FlowExecutor::partition_for(&run.0);
+        let (runs, tele) = ex.dispatcher_handles();
+        let mut disp = FlowDispatcher::new(
+            runs, OutboxStore::new(), WfJournal::new(), tele, minter(), ctx_base(), part, "worker-2", 30,
+        );
+        disp.register_versioned("agent.run", 2, one_activity_body());
+
+        // the dispatcher leases + drives the v1-pinned run with the v2 engine → the version guard halts.
+        let outcome = disp.tick(1000, "2026-06-21T00:00:00Z", 7);
+        assert!(
+            matches!(outcome, Some(DriveOutcome::Nondeterministic(_))),
+            "the version mismatch halts the run, got {outcome:?}"
+        );
+        let status = ex.describe(&run).expect("describe after the halt");
+        assert_eq!(status.state, run_state::NONDETERMINISTIC, "the run is dead-lettered as nondeterministic");
+        assert!(status.terminal, "a nondeterministic run is terminal — never re-driven");
+        assert_eq!(
+            ex.telemetry().nondeterministic_halt_count(),
+            1,
+            "the nondeterministic-halt count incremented (the FLOW-D2 green artifact, surfaced on the metrics port)"
+        );
     }
 
     /// **`cancel` transitions a non-terminal run to `terminated` (contract 9.1).** A cancel of a

@@ -105,6 +105,25 @@ pub enum WfError {
     /// The co-commit / emit path failed (the outbox emit returned an error). Surfaces the
     /// underlying [`myelin_events::OutboxError`] message verbatim — never swallowed.
     CoCommit(String),
+    /// **The replay-DIVERGENCE verdict (P-FLOW-07, FLOW-D2).** The workflow body, on replay, issued
+    /// a command that does NOT match the journal at that position — either a KIND mismatch (the body
+    /// issues an `activity` where the journal records a `side_marker`, or vice versa) or a pinned
+    /// `wf_version` mismatch (the replay ran a DIFFERENT definition version than the run was pinned to
+    /// at start, §4.6). This is a determinism violation: the body is NOT a deterministic function of
+    /// its journal. The engine HALTS the run as `nondeterministic` and DEAD-LETTERS it — it NEVER
+    /// silently continues (a silent divergence is a Tier-1 failure, EI-01 §2). Carries a machine
+    /// reason (no PII) describing the position + the expected-vs-issued shapes.
+    Nondeterministic(String),
+}
+
+impl WfError {
+    /// Whether this error is the replay-DIVERGENCE verdict (P-FLOW-07). The engine reads it to settle
+    /// the run as `nondeterministic` + dead-letter it (vs `failed` for an activity exhaustion). A
+    /// divergence is NOT a normal failure — it means the run can never make deterministic progress,
+    /// so it is parked for a human, not retried.
+    pub fn is_nondeterministic(&self) -> bool {
+        matches!(self, WfError::Nondeterministic(_))
+    }
 }
 
 /// The result type for the durable `WfCtx` surface.
@@ -304,11 +323,27 @@ pub struct WfCtx {
     /// fails the drill loudly (§4.1, the silent-double-effect floor).
     side_effects_executed: u64,
     /// **The count of journaled commands that got RE-EXECUTED on this drive (the 0-double-effect
-    /// counter, §4.1).** Incremented IFF a command whose `command_id` is in [`Self::replay_history`]
-    /// reaches LIVE execution (the side effect re-runs) — which the short-circuit makes impossible on
-    /// the activity-replay path. It MUST stay 0; a non-zero is a silent double-effect the FLOW-D1
-    /// drill reds on. This is the direct, in-`WfCtx` measurement (not an inference in [`crate::engine`]).
+    /// counter, §4.1).** It MUST stay 0; a non-zero would be a silent double-effect the FLOW-D1 drill
+    /// reds on. The activity-replay short-circuit makes a re-execution of a MATCHING journaled command
+    /// impossible, and the P-FLOW-07 divergence guard now HALTS a kind-MISMATCH (an `activity` issued
+    /// at a `side_marker` position) as `nondeterministic` BEFORE any live execution — so this counter
+    /// is 0 by construction (the divergence that once double-effected is now a halt). Retained as the
+    /// direct, in-`WfCtx` 0-floor probe (a regression that re-runs a journaled command would trip it).
     double_effects: u64,
+    /// **The replay-DIVERGENCE latch (P-FLOW-07, FLOW-D2).** Set to the FIRST detected divergence
+    /// reason (a KIND mismatch at a journaled command position, or a pinned-`wf_version` mismatch) so
+    /// the engine HALTS the run as `nondeterministic` instead of silently continuing. Once latched,
+    /// the run is dead-lettered; the latch is sticky (a later command never CLEARS a divergence).
+    /// `None` on a deterministic drive. This is the surface-level enforcement of the determinism
+    /// contract (9.2): a body that diverges from its journal cannot be replayed, so it halts.
+    divergence: Option<String>,
+    /// **The `wf_version` the run is PINNED to (§4.6).** Set on [`WfCtx::resume_versioned`] to the
+    /// version recorded on the run at start; the divergence guard compares it against the version of
+    /// the definition the engine is REPLAYING with — a mismatch (a deploy bumped the definition while
+    /// the run was in flight) is a divergence (the body shape may differ), so the run halts as
+    /// `nondeterministic` rather than replaying a different definition over an old journal. `None`
+    /// when no version pin is supplied (the version-divergence leg is not armed).
+    pinned_wf_version: Option<i32>,
 }
 
 /// One journaled command outcome a replay reads back (§4.1) — the result an `activity` returns on
@@ -359,6 +394,8 @@ impl WfCtx {
             replay_history: std::collections::HashMap::new(),
             side_effects_executed: 0,
             double_effects: 0,
+            divergence: None,
+            pinned_wf_version: None,
         }
     }
 
@@ -402,6 +439,67 @@ impl WfCtx {
             );
         }
         ctx
+    }
+
+    /// **Resume a `WfCtx` from its journal WITH the version pin armed (P-FLOW-07, §4.6).** Identical
+    /// to [`WfCtx::resume`] but records the run's pinned `wf_version` (`run_version`) AND the version
+    /// the engine is REPLAYING with (`replay_version`). If they MISMATCH — a deploy bumped the
+    /// definition while the run was in flight — the divergence guard immediately latches a
+    /// `nondeterministic` halt (the body shape may differ; replaying a new definition over an old
+    /// journal is a silent divergence, §4.6). A MATCH arms the per-command kind-divergence guard
+    /// over the journal (a body that issues a command whose kind differs from the journaled command at
+    /// that position halts). Use this on the replay/recovery path where the run's pinned version is
+    /// known; [`WfCtx::resume`] is the version-agnostic form (the kind guard still applies).
+    #[allow(clippy::too_many_arguments)]
+    pub fn resume_versioned(
+        outbox: &OutboxStore,
+        minter: Arc<dyn IdMinter>,
+        journal: WfJournal,
+        ctx_base: EmitContextBase,
+        run_id: impl Into<String>,
+        wf_type: impl Into<String>,
+        now_clock: impl Into<String>,
+        rand_seed: u64,
+        history: Vec<WfHistoryRow>,
+        run_version: i32,
+        replay_version: i32,
+    ) -> Self {
+        let mut ctx = Self::resume(
+            outbox, minter, journal, ctx_base, run_id, wf_type, now_clock, rand_seed, history,
+        );
+        ctx.pinned_wf_version = Some(run_version);
+        // **Version-divergence guard (§4.6):** the run was pinned to `run_version` at start; if the
+        // engine is replaying a DIFFERENT definition version, halt as nondeterministic BEFORE running
+        // a single command — replaying a new body over an old journal is a silent divergence. The
+        // latch is set eagerly so even an empty body (no commands) halts.
+        if run_version != replay_version {
+            ctx.latch_divergence(format!(
+                "wf_version pin mismatch: run pinned to v{run_version} but replayed with v{replay_version} \
+                 (a deploy diverged an in-flight run, §4.6)"
+            ));
+        }
+        ctx
+    }
+
+    /// **The replay-DIVERGENCE verdict (P-FLOW-07, FLOW-D2).** `Some(reason)` if this drive detected a
+    /// divergence (a kind mismatch at a journaled position, or a pinned-`wf_version` mismatch) — the
+    /// engine reads it to HALT the run as `nondeterministic` + dead-letter it, never silently continue.
+    /// `None` on a deterministic drive. The reason is a machine string (no PII).
+    pub fn divergence(&self) -> Option<&str> {
+        self.divergence.as_deref()
+    }
+
+    /// Whether this drive diverged (P-FLOW-07) — the engine's halt predicate.
+    pub fn is_divergent(&self) -> bool {
+        self.divergence.is_some()
+    }
+
+    /// Latch the FIRST divergence reason (sticky — a later command never clears it). Idempotent on a
+    /// re-latch: only the first reason is kept (the position the body first diverged).
+    fn latch_divergence(&mut self, reason: String) {
+        if self.divergence.is_none() {
+            self.divergence = Some(reason);
+        }
     }
 
     /// The number of activity closures actually EXECUTED on this drive (the FLOW-D1 double-effect
@@ -481,6 +579,13 @@ impl WfCtx {
     where
         F: Fn(&str, u32) -> Result<Vec<myelin_refs::ArtifactRef>, ActivityError>,
     {
+        // **DIVERGENCE HALT (P-FLOW-07).** Once a divergence is latched (a prior kind mismatch, or a
+        // pinned-`wf_version` mismatch armed at resume), NO further command executes — the body is not
+        // a deterministic function of its journal, so the run halts as `nondeterministic` rather than
+        // making more (possibly double-effecting) progress. Surface the latched reason.
+        if let Some(reason) = self.divergence.clone() {
+            return Err(WfError::Nondeterministic(reason));
+        }
         let command_id = self.next_command_id();
         // **REPLAY SHORT-CIRCUIT (§4.1).** If this command is already journaled, RETURN the journaled
         // outcome WITHOUT re-executing the closure — the side effect is NOT re-run (the result was
@@ -499,22 +604,25 @@ impl WfCtx {
                         "replayed activity_failed".into(),
                     )));
                 }
-                // A command_id that journaled a NON-activity kind here is a determinism divergence
-                // (the workflow body issued a different command than the journal records). The
-                // divergence GUARD that halts-as-nondeterministic is P-FLOW-07; here we fall through
-                // to LIVE execution rather than silently mis-replaying, and the guard catches the
-                // structural mismatch when it lands.
-                _ => {}
+                // **THE REPLAY-DIVERGENCE GUARD (P-FLOW-07, FLOW-D2).** This command_id journaled a
+                // NON-activity kind (e.g. a `side_marker`) but the body is now issuing an `activity` at
+                // the same position — the body DIVERGED from its journal. This is a determinism
+                // violation: the body is not the deterministic function of its journal the replay
+                // contract (9.2) requires. We HALT — latch `nondeterministic` and return the verdict —
+                // rather than execute the activity LIVE against a journaled position (which would be a
+                // silent double-effect). 0 silent divergence: the guard halts, never silent-continues
+                // (EI-01 §3 — a red gate is information; never invert an assertion).
+                other => {
+                    let reason = format!(
+                        "replay divergence at {command_id}: body issued `activity` but the journal \
+                         records kind `{other}` (the workflow body diverged from its journal)"
+                    );
+                    self.latch_divergence(reason.clone());
+                    return Err(WfError::Nondeterministic(reason));
+                }
             }
         }
         // LIVE: this command is past the cursor — execute it for real (and count the side effect).
-        // **The double-effect probe (§4.1):** if this command_id WAS journaled yet reached live
-        // execution, the side effect is being RE-RUN — a silent double-effect. The activity-replay
-        // short-circuit above makes this impossible; counting it here makes a regression that removes
-        // the short-circuit LOUD (the FLOW-D1 0-double-effect floor).
-        if self.replay_history.contains_key(&command_id) {
-            self.double_effects += 1;
-        }
         self.side_effects_executed += 1;
         // The idem_token is DETERMINISTIC from the command position (so producer and consumer agree
         // WITHOUT coordination, §3.5) and is the SAME across every attempt — the retry-dedup anchor.
@@ -597,7 +705,20 @@ impl WfCtx {
     /// so on replay (P-FLOW-05) the workflow body reads back the SAME timestamp — making a
     /// `now()`-dependent workflow deterministic. The marker is STAGED (durable iff commit).
     pub fn now(&mut self) -> String {
+        // DIVERGENCE HALT (P-FLOW-07): a latched divergence freezes the side-marker too — the captured
+        // clock is meaningless once the body has diverged. Return the run's clock unchanged (the engine
+        // already halts the run via the latch; a `now()` mid-divergence never makes durable progress).
+        if self.is_divergent() {
+            return self.now_clock.clone();
+        }
         let command_id = self.next_command_id();
+        // **THE REPLAY-DIVERGENCE GUARD (P-FLOW-07, FLOW-D2):** if this position IS journaled but NOT
+        // as a `side_marker` (the body issues `now()` where the journal records an activity), the body
+        // diverged from its journal — latch `nondeterministic` and return the live clock (the engine
+        // halts the run on the latch). Never silently recompute against a journaled activity position.
+        if self.divergent_marker(&command_id) {
+            return self.now_clock.clone();
+        }
         // REPLAY SHORT-CIRCUIT (§4.1): a journaled `now()` side-marker returns the CAPTURED clock so
         // replay reads back the SAME timestamp (the worker's wall-clock at FIRST execution), making a
         // `now()`-dependent workflow deterministic even though the replay-time clock differs.
@@ -616,7 +737,16 @@ impl WfCtx {
     /// source of entropy; it is replay-stable BY DESIGN) AND journals a `side_marker` row capturing
     /// the draw, so replay returns the SAME number. The marker is STAGED (durable iff commit).
     pub fn rand(&mut self) -> u64 {
+        // DIVERGENCE HALT (P-FLOW-07): a latched divergence freezes the draw (the body already halted).
+        if self.is_divergent() {
+            return 0;
+        }
         let command_id = self.next_command_id();
+        // **THE REPLAY-DIVERGENCE GUARD (P-FLOW-07, FLOW-D2):** a `rand()` at a position journaled as a
+        // NON-side-marker (an activity) is a body that diverged from its journal — latch and halt.
+        if self.divergent_marker(&command_id) {
+            return 0;
+        }
         // REPLAY SHORT-CIRCUIT (§4.1): a journaled `rand()` side-marker returns the CAPTURED draw so
         // replay reads back the SAME number (even if the resume seed differs) — the draw is a side
         // effect, captured-not-recomputed.
@@ -638,6 +768,27 @@ impl WfCtx {
     /// If the side-marker `command_id` is already journaled, return its CAPTURED value (the string
     /// the original draw stored in the marker's `result` ref) — the replay short-circuit for
     /// `now()`/`rand()` (§4.1). `None` for a live (un-journaled) command.
+    /// **The side-marker DIVERGENCE check (P-FLOW-07, FLOW-D2).** Returns `true` (AND latches the
+    /// divergence) IFF `command_id` IS journaled but as a NON-`side_marker` kind — i.e. the body
+    /// issued a `now()`/`rand()` at a position the journal records as an activity. That is a body
+    /// that diverged from its journal (a determinism violation); the caller returns a halt-time
+    /// value and the engine halts the run as `nondeterministic` via the latch. Returns `false` for a
+    /// matching `side_marker` (the normal replay) or an un-journaled (live) position.
+    fn divergent_marker(&mut self, command_id: &str) -> bool {
+        let Some(replayed) = self.replay_history.get(command_id) else {
+            return false; // un-journaled — a live side-marker, no divergence.
+        };
+        if replayed.kind == history_kind::SIDE_MARKER {
+            return false; // the expected kind — a normal marker replay.
+        }
+        let kind = replayed.kind.clone();
+        self.latch_divergence(format!(
+            "replay divergence at {command_id}: body issued a side-marker (`now`/`rand`) but the \
+             journal records kind `{kind}` (the workflow body diverged from its journal)"
+        ));
+        true
+    }
+
     fn replayed_marker_value(&self, command_id: &str) -> Option<String> {
         let replayed = self.replay_history.get(command_id)?;
         if replayed.kind != history_kind::SIDE_MARKER {
@@ -1174,14 +1325,15 @@ mod tests {
         assert_eq!(c2.double_effects(), 0, "0 double-effect on the failed-replay path");
     }
 
-    /// **The double-effect counter is a REAL probe: a journaled command that nonetheless reaches LIVE
-    /// activity execution increments it (the FLOW-D1 floor, §4.1).** We force the divergence path: a
-    /// position journaled as a `side_marker` (a `now()`/`rand()` in the original drive) is re-driven
-    /// as an `activity` — the activity-replay short-circuit does NOT match the marker kind, so the
-    /// activity executes LIVE against a journaled command_id → a counted double-effect. This proves
-    /// the counter increments (not a constant 0) so a regression on the short-circuit reds the drill.
+    /// **P-FLOW-07: a KIND-MISMATCH on replay HALTS as `nondeterministic` — it does NOT re-execute
+    /// (FLOW-D2, the divergence guard).** A position journaled as a `side_marker` (a `now()` in the
+    /// original drive) is re-driven as an `activity`: the body diverged from its journal. The guard
+    /// HALTS — the activity does NOT run live (0 side effect, 0 double-effect), `activity()` returns
+    /// [`WfError::Nondeterministic`], and the divergence latch is set so the engine dead-letters the
+    /// run. This is the reconciled successor of the former double-effect probe: the divergence that
+    /// once silently double-effected is now a loud halt (0 silent divergence, EI-01 §2/§3).
     #[test]
-    fn double_effect_counter_increments_when_a_journaled_command_re_executes() {
+    fn kind_mismatch_on_replay_halts_nondeterministic_not_re_execute() {
         let outbox = OutboxStore::new();
         let journal = WfJournal::new();
         // first drive journals a side-marker at position 0 (a now()).
@@ -1191,22 +1343,89 @@ mod tests {
         let history = journal.history_for(&tenant(), "R1");
 
         // resume but the body now issues an ACTIVITY at position 0 (the divergence): the marker-kind
-        // journal does not match the activity-replay short-circuit, so the activity runs LIVE against
-        // a journaled command_id — a double-effect the counter records.
+        // journal does NOT match an `activity` — the guard HALTS rather than re-executing live.
+        let ran = Arc::new(Mutex::new(false));
+        let ran2 = ran.clone();
         let mut c2 = WfCtx::resume(
             &outbox, minter(), journal.clone(), ctx_base(), "R1", "agent.run",
             "2026-06-21T00:00:00Z", 42, history,
         );
-        c2.activity(RetryPolicy::default_policy(), |_i, _a| {
+        let err = c2
+            .activity(RetryPolicy::default_policy(), move |_i, _a| {
+                *ran2.lock().unwrap() = true; // would flip IF the divergent activity ran live.
+                Ok(vec![ArtifactRef("myelin://acme/agent/effect/SHOULD-NOT-RUN".into())])
+            })
+            .expect_err("the kind-mismatch halts as nondeterministic");
+        assert!(matches!(err, WfError::Nondeterministic(_)), "the verdict is Nondeterministic, got {err:?}");
+        assert!(err.is_nondeterministic(), "is_nondeterministic predicate is true");
+        assert!(!*ran.lock().unwrap(), "the divergent activity did NOT run live (the guard halted it)");
+        assert_eq!(c2.side_effects_executed(), 0, "0 side effects — the guard halted before live exec");
+        assert_eq!(c2.double_effects(), 0, "0 double-effect — the divergence is a halt, not a re-execution");
+        assert!(c2.is_divergent(), "the divergence latch is set (the engine dead-letters the run)");
+        assert!(
+            c2.divergence().unwrap().contains("agent.run:0"),
+            "the divergence reason names the diverging position: {:?}",
+            c2.divergence()
+        );
+    }
+
+    /// **`WfError::is_nondeterministic` discriminates the divergence verdict from the others.** Only
+    /// the `Nondeterministic` variant reads true; an `ActivityExhausted`/`CoCommit` reads FALSE — so
+    /// the engine settles a normal failure as `failed` (retryable) and ONLY a divergence as
+    /// `nondeterministic` (dead-lettered). Pins the predicate is real, not a constant `true` (a
+    /// vacuous-true would dead-letter every failure, mis-parking retryable work).
+    #[test]
+    fn is_nondeterministic_is_true_only_for_the_divergence_verdict() {
+        assert!(
+            WfError::Nondeterministic("diverged".into()).is_nondeterministic(),
+            "the divergence verdict reads true"
+        );
+        assert!(
+            !WfError::ActivityExhausted(ActivityError("x".into())).is_nondeterministic(),
+            "an activity exhaustion is NOT a divergence (it is a retryable failure, not a dead-letter)"
+        );
+        assert!(
+            !WfError::CoCommit("y".into()).is_nondeterministic(),
+            "a co-commit failure is NOT a divergence (the predicate is not a constant true)"
+        );
+    }
+
+    /// **P-FLOW-07: the REVERSE kind-mismatch (a `now()`/`rand()` issued at a journaled ACTIVITY
+    /// position) also HALTS (FLOW-D2).** Position 0 journals an `activity`; a resume issues a `now()`
+    /// at position 0 — the side-marker guard latches the divergence so the engine halts the run.
+    #[test]
+    fn reverse_kind_mismatch_now_at_activity_position_halts() {
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        // first drive journals an activity at position 0.
+        let mut c1 = begin(&outbox, journal.clone());
+        c1.activity(RetryPolicy::default_policy(), |_i, _a| {
             Ok(vec![ArtifactRef("myelin://acme/agent/effect/e0".into())])
         })
-        .expect("the divergent activity runs live");
-        assert_eq!(c2.side_effects_executed(), 1, "the divergent activity executed once (live)");
-        assert_eq!(
-            c2.double_effects(),
-            1,
-            "the journaled command re-executed → exactly one counted double-effect (the floor probe)"
+        .expect("activity");
+        c1.commit().expect("co-commit");
+        let history = journal.history_for(&tenant(), "R1");
+
+        // resume but issue a now() at position 0 (the reverse divergence).
+        let mut c2 = WfCtx::resume(
+            &outbox, minter(), journal.clone(), ctx_base(), "R1", "agent.run",
+            "2026-06-21T00:00:00Z", 42, history,
         );
+        let _ = c2.now(); // the body reads now() where the journal records an activity.
+        assert!(c2.is_divergent(), "a now() at an activity position latches the divergence");
+        assert!(
+            c2.divergence().unwrap().contains("side-marker"),
+            "the reason names the side-marker divergence: {:?}",
+            c2.divergence()
+        );
+        // a rand() at a journaled activity position likewise diverges (resume fresh to test rand).
+        let history2 = journal.history_for(&tenant(), "R1");
+        let mut c3 = WfCtx::resume(
+            &outbox, minter(), journal.clone(), ctx_base(), "R1", "agent.run",
+            "2026-06-21T00:00:00Z", 42, history2,
+        );
+        let _ = c3.rand();
+        assert!(c3.is_divergent(), "a rand() at an activity position also latches the divergence");
     }
 
     /// **REPLAY: a resumed `now()`/`rand()` returns its CAPTURED value, not a recomputed one (§4.1).**
