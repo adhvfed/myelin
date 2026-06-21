@@ -66,6 +66,23 @@ myelin-gdpr = { path = "../myelin-gdpr" }
 # the mid-tier library DAG) depends on myelin-query; nothing in the production library DAG
 # depends back on this service.
 myelin-query = { path = "../myelin-query" }
+# P-264 (NOTIF-P20, M3): the Notif registration seam (contract 7.6 define_notif_rule + the
+# read-fanout WatcherResolvePort, 4.3/4.10). Knowledge REGISTERS its define_notif_rule set
+# (mentions / comments / shares / watched) by constructing the frozen `myelin_notif::NotifRule`
+# values + wires its REAL page/space/database_row watcher reverse index behind the frozen
+# `myelin_notif::WatcherResolvePort` — Knowledge registers/produces, Notif owns the seam (ZERO
+# Notif code change, the inverse-signal property, EI-01 §1). This module lives in the
+# identity-service crate for the SAME §2.9-DAG reason `knowledge_fragment` does: `myelin-content`
+# (the Knowledge data-model leaf) MUST NOT depend back on Notif (Notif already depends ON content,
+# so the reverse edge would be a cycle), and Id already owns Knowledge's compiled authz content
+# (the `watcher` relation on space/page/database_row, contract 4.9). `myelin-notif` is a NAMED leaf
+# CONSUMER (it depends on no subsystem crate and NOTHING in `myelin-refs`/this service edges it) —
+# so this service crate (the graph's terminal consumer) may depend on it; nothing in the production
+# library DAG depends back. Notif's Reason/Class/NotifRule/WatcherResolvePort surface is frozen.
+myelin-notif = { path = "../myelin-notif" }
+# The `myelin_refs::ArtifactRef` the Notif router `classify`s a curated KN Signal under (the subject
+# the inbox item is about). A pure value carrier; no production DAG edge depends back on this service.
+myelin-refs = { path = "../myelin-refs" }
 
 [dev-dependencies]
 # P-ID-10 (P-068) ID-D3 drill: the failure-injection harness's telemetry-assertion library

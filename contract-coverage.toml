@@ -694,6 +694,20 @@ cdc = [
     # InRelation{watcher} push-down, held-not-leaked on revoke/unavailable) sides; it also pins the 4.9
     # watcher-relation slice for the read-fanout half (the fragment-admit slice stays cdc_4_9_git_fragment).
     "crates/myelin-git/tests/cdc_7_6_4_9_git_notif_rules.rs",
+    # KNOWLEDGE slice — knowledge (NOTIF-P20 / P-264, M3) declares its reason set (mentioned->direct /
+    # comments->participating / shared->direct / watched->watching, each via the frozen
+    # `define_notif_rule` verb reconciled against the §3.1 table) AND wires its REAL page/space/row
+    # watcher reverse index behind the frozen `WatcherResolvePort` (4.3/4.10), over the `watcher`
+    # relation Id's compiled Knowledge ReBAC fragment declares (4.9, on space/page/database_row). Notif
+    # ADMITS + ROUTES the rules + READ-FANS-OUT a viewer's ambient KN slice over the real watcher graph
+    # (replacing the NOTIF-P13 synthetic fixtures for KN subjects) — zero Notif change, the SECOND
+    # producer no harder than the first. The KN registration lives in `myelin-identity-service`
+    # (alongside `knowledge_fragment`) for the same §2.9-DAG reason the fragment does: `myelin-content`
+    # is the Knowledge data-model leaf and Notif already depends ON content, so a `content -> notif`
+    # edge would be a cycle. The CDC carries BOTH provider + consumer sides; it pins the 4.9
+    # watcher-relation slice for the read-fanout half (the fragment-admit slice stays
+    # cdc_4_9_knowledge_fragment).
+    "crates/myelin-identity-service/tests/cdc_7_6_4_9_knowledge_notif_rules.rs",
 ]
 
 # 7.7 SPLIT: the HOLDER HALF (registration + locate/export/rectify/restrict + the structural

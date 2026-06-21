@@ -72,6 +72,7 @@ pub mod expand;
 pub mod failstatic_cache;
 pub mod git_fragment;
 pub mod knowledge_fragment;
+pub mod knowledge_rules;
 pub mod list_objects;
 pub mod lowering;
 pub mod machine_auth;
