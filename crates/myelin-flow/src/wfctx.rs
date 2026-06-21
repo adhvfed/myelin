@@ -75,6 +75,18 @@ pub mod history_kind {
     pub const ACTIVITY_FAILED: &str = "activity_failed";
     /// A `now()`/`rand()` non-deterministic read, captured for deterministic replay — §3.2.
     pub const SIDE_MARKER: &str = "side_marker";
+    /// **The run PARKED on a `wait_for_signal` (the multi-day HITL wait, P-FLOW-11, §4.3).** Journaled
+    /// the first time the body reaches a `wait_for_signal` whose named signal is not yet buffered — the
+    /// run goes `waiting` holding no runtime. On replay this short-circuits: the body re-issues the wait
+    /// and the journal says "we are/were parked here", so the wait re-checks the buffer (a signal that
+    /// arrived in the meantime resumes; an absent one re-parks). Admitted by the migrations `CHECK`.
+    pub const SIGNAL_WAITED: &str = "signal_waited";
+    /// **A `wait_for_signal` CONSUMED its signal (P-FLOW-11, §4.3).** Journaled when the buffered signal
+    /// arrives and the wait resumes — it carries the consumed signal's payload refs (references-not-
+    /// payloads). On replay this short-circuits to the SAME consumed payload (the wait returns the
+    /// journaled signal, never re-consuming a second buffered row). This is the consume-exactly-once
+    /// anchor: the journal records WHICH signal woke the run. Admitted by the migrations `CHECK`.
+    pub const SIGNAL_RECEIVED: &str = "signal_received";
 }
 
 /// The `wf_activity_attempt.state` tokens this prompt writes (the §3.5 ledger lifecycle; mirrors
@@ -128,6 +140,93 @@ impl WfError {
 
 /// The result type for the durable `WfCtx` surface.
 pub type WfResult<T> = core::result::Result<T, WfError>;
+
+/// **The outcome of a [`WfCtx::wait_for_signal`] (contract 9.2/9.4, §4.3).** A wait either RESUMES with
+/// the consumed signal's references-not-payloads body, PARKS (the named signal has not arrived — the run
+/// is `waiting`, holding no runtime, until `DurableExecutor::signal` delivers it), or TIMES OUT (the wait
+/// carried a timeout and the durable timeout-timer fired before the signal arrived — the timeout branch,
+/// §6.3). The HITL approval round-trip maps these to resume-and-run (`Signalled` approve) / withhold
+/// (`Signalled` decline → 0 mutation, AG-8) / timeout (auto-deny).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WaitOutcome {
+    /// **The named signal arrived and was CONSUMED exactly once (§4.3).** Carries the signal's
+    /// references-not-payloads `payload` (`ArtifactRef`s — e.g. the approval decision's effect refs, the
+    /// job's result refs) and the `idem_key` the producer chose (`card_id` / the job's `idem_token`),
+    /// so the body can branch (approve vs decline — read off the payload / the per-effect rule §6.4). On
+    /// replay this returns the SAME journaled signal (consume-exactly-once across a re-drive).
+    Signalled {
+        /// the per-effect `idem_key` of the consumed signal (the producer's choice — `card_id` single,
+        /// `card_id:idx` multi, a job's `idem_token` for a long-park).
+        idem_key: String,
+        /// the consumed signal's body as `ArtifactRef`s (references-not-payloads, §3.4) — never a PII
+        /// body.
+        payload: Vec<myelin_refs::ArtifactRef>,
+        /// the crypto-shred key ref IF the consumed signal carried inline PII (the rare §3.4 case).
+        payload_key_ref: Option<String>,
+    },
+    /// **The wait PARKED — the named signal has not arrived (§4.3).** The run is `waiting`, holding NO
+    /// runtime, until `DurableExecutor::signal` delivers the named signal (which may be DAYS later,
+    /// across restarts + deploys — the durability is the point, FLOW-D4). The engine settles the run
+    /// `waiting`; the dispatcher re-drives it when the signal is delivered (the body re-issues the wait
+    /// and finds the now-buffered signal). The body should RETURN promptly on a `Parked` (it made no
+    /// progress past the wait).
+    Parked,
+    /// **The wait TIMED OUT — the durable timeout-timer fired before the signal arrived (§4.3/§6.3).**
+    /// The wait carried a `timeout` and the durable `wf_timer` armed for it fired first. The body takes
+    /// the timeout branch (the HITL round-trip's auto-deny → 0 mutation, AG-8). On replay this returns
+    /// the SAME journaled timeout (the timeout is a deterministic outcome once journaled).
+    TimedOut,
+}
+
+/// The marker prefix the `signal_waited`/`signal_received` rows encode the consumed signal's `idem_key`
+/// under (so replay reconstructs the [`WaitOutcome::Signalled`] idem_key) — a machine token, no PII.
+const WAIT_IDEM_PREFIX: &str = "wait:idem:";
+/// The marker prefix a journaled `signal_received` encodes the consumed signal's `payload_key_ref`
+/// under (the rare inline-PII crypto-shred ref) — a machine token, no PII.
+const WAIT_KEYREF_PREFIX: &str = "wait:keyref:";
+/// The marker prefix a journaled `signal_waited` encodes the stable timeout DEADLINE under (so a resume
+/// reads the SAME deadline across re-drives) — a machine token, no PII.
+const WAIT_DEADLINE_PREFIX: &str = "wait:deadline:";
+/// The marker a TIMED-OUT wait journals as its `signal_received` idem_key + key_ref (so replay returns
+/// [`WaitOutcome::TimedOut`] deterministically) — a machine token, no PII.
+const WAIT_TIMEOUT_MARKER: &str = "wait:timeout";
+
+/// Decode a journaled `signal_received` row's `result` back into a [`WaitOutcome`] (the replay short-
+/// circuit, §4.1). A row whose idem-marker is [`WAIT_TIMEOUT_MARKER`] decodes to [`WaitOutcome::
+/// TimedOut`]; otherwise it is a [`WaitOutcome::Signalled`] carrying the consumed signal's idem_key +
+/// payload refs (+ the rare crypto-shred key ref). The encoding mirrors [`WfCtx::stage_received`].
+fn decode_received(result: &Option<Vec<myelin_refs::ArtifactRef>>) -> WaitOutcome {
+    let refs = match result {
+        Some(r) => r,
+        None => {
+            return WaitOutcome::Signalled {
+                idem_key: String::new(),
+                payload: vec![],
+                payload_key_ref: None,
+            }
+        }
+    };
+    let mut idem_key = String::new();
+    let mut payload_key_ref: Option<String> = None;
+    let mut payload = Vec::new();
+    for r in refs {
+        if let Some(k) = r.0.strip_prefix(WAIT_IDEM_PREFIX) {
+            idem_key = k.to_string();
+        } else if let Some(kr) = r.0.strip_prefix(WAIT_KEYREF_PREFIX) {
+            payload_key_ref = Some(kr.to_string());
+        } else {
+            payload.push(r.clone());
+        }
+    }
+    if idem_key == WAIT_TIMEOUT_MARKER {
+        return WaitOutcome::TimedOut;
+    }
+    WaitOutcome::Signalled {
+        idem_key,
+        payload,
+        payload_key_ref,
+    }
+}
 
 /// The retry policy for [`WfCtx::activity`] (§4.4) — the bounded attempt count. The `idem_token`
 /// is REUSED across attempts (a retried activity produces no duplicate downstream effect), and the
@@ -360,6 +459,27 @@ pub struct WfCtx {
     /// `false` on a drive with no live sleep (or a `sleep` whose deadline already passed — it returns
     /// immediately, no park).
     parked_on_timer: bool,
+    /// **The durably-buffered `wf_signal` store a `wait_for_signal` consumes from (P-FLOW-11, §4.3).**
+    /// `None` until [`WfCtx::with_signals`] supplies the engine's [`crate::engine::SignalStore`] — a
+    /// `WfCtx` built WITHOUT it (the pure activity/now/rand/sleep surface) cannot `wait_for_signal`
+    /// (the buffer to consume from is absent), so the wait returns a loud [`WfError::CoCommit`] rather
+    /// than silently no-op-ing. The dispatcher supplies it so a body's `wait_for_signal` consumes the
+    /// signal `DurableExecutor::signal` buffered (P-FLOW-09) and parks the run (`waiting`) when the
+    /// signal has not arrived yet.
+    signals: Option<crate::engine::SignalStore>,
+    /// **Whether this drive PARKED on a `wait_for_signal` — a wait whose named signal is not yet
+    /// buffered (§4.3).** Set by [`WfCtx::wait_for_signal`] when no buffered signal is found (the run
+    /// must wait, holding NO runtime, until `DurableExecutor::signal` delivers it). The engine reads it
+    /// to settle the run `waiting` instead of `completed`. `false` on a drive whose waits all found a
+    /// buffered signal (or that issued no wait). This is the multi-day-HITL state=waiting holds no
+    /// runtime property (FLOW-D4).
+    parked_on_signal: bool,
+    /// **The per-effect `idem_key`s a `wait_for_signal` CONSUMED on this drive (P-FLOW-11, §4.3).** Each
+    /// entry is `(signal_name, idem_key)` — the buffered `wf_signal` row a wait consumed (stamped
+    /// `consumed_seq`). The engine reads it to refresh the signal-buffer-depth telemetry after a drive
+    /// (a consumed signal drops the buffered depth). The FLOW-D4 drill asserts EXACTLY ONE consume per
+    /// delivered approval (a double-click delivers one buffered row → one consume).
+    consumed_signals: Vec<(String, String)>,
 }
 
 /// One journaled command outcome a replay reads back (§4.1) — the result an `activity` returns on
@@ -414,6 +534,9 @@ impl WfCtx {
             pinned_wf_version: None,
             timers: None,
             parked_on_timer: false,
+            signals: None,
+            parked_on_signal: false,
+            consumed_signals: Vec::new(),
         }
     }
 
@@ -427,6 +550,18 @@ impl WfCtx {
     /// read. Chainable on `begin`/`resume`.
     pub fn with_timers(mut self, timers: crate::timer::TimerStore, partition: i16, now_secs: i64) -> Self {
         self.timers = Some((timers, partition, now_secs));
+        self
+    }
+
+    /// **Supply the durably-buffered `wf_signal` store so this `WfCtx` can `wait_for_signal` (P-FLOW-11,
+    /// §4.3).** A `WfCtx` built without this (the pure activity/now/rand/sleep surface) cannot consume a
+    /// durable signal — [`WfCtx::wait_for_signal`] returns a [`WfError::CoCommit`] naming the missing
+    /// store rather than silently no-op-ing (a wait that did nothing would be a silent correctness bug,
+    /// EI-01 §2). The dispatcher calls this when it builds the drive's `WfCtx` so a body's
+    /// `wait_for_signal` consumes the signal `DurableExecutor::signal` buffered (P-FLOW-09) and parks
+    /// the run (`waiting`) when no signal has arrived. Chainable on `begin`/`resume`.
+    pub fn with_signals(mut self, signals: crate::engine::SignalStore) -> Self {
+        self.signals = Some(signals);
         self
     }
 
@@ -933,12 +1068,229 @@ impl WfCtx {
         self.sleep_until(fire_at)
     }
 
+    /// **`wait_for_signal(name, timeout)` (contract 9.2/9.4, §4.3 — the multi-day HITL wait).** PARKS
+    /// the run on a named durable signal (`approval` / `cancel` / `ci.result` / `job.done`, §4.3): the
+    /// workflow is `state=waiting` holding NO runtime until `DurableExecutor::signal` delivers the named
+    /// signal — which may be DAYS later, across worker restarts + deploys (the durability is the point,
+    /// FLOW-D4). When the signal arrives, the wait CONSUMES it EXACTLY ONCE (stamps `consumed_seq`,
+    /// journals a `signal_received` row carrying the consumed payload) and RESUMES with [`WaitOutcome::
+    /// Signalled`]. An optional `timeout` (seconds) arms a durable timeout-timer (P-FLOW-13); if it
+    /// fires before the signal arrives, the wait returns [`WaitOutcome::TimedOut`] (the §6.3 auto-deny
+    /// branch).
+    ///
+    /// **The round-trip (§6.3):** a gated tool calls `wait_for_signal("approval:<call>", timeout)`; a
+    /// human clicks Approve/Deny days later; Chat calls `DurableExecutor::signal(run, "approval:<call>",
+    /// {decision}, idem_key)`; the buffered signal wakes the run; the wait consumes it and the body runs
+    /// (approve) / withholds (decline → 0 mutation, AG-8) / takes the timeout path. The CARD UX/visual is
+    /// Chat+Agent-Fabric product work (OQ #1) — NOT this engine; this engine owns the wait + the
+    /// consume-once + the park.
+    ///
+    /// **Replay (§4.1):** a `signal_received` command short-circuits to the SAME journaled signal (the
+    /// wait returns the journaled payload, NEVER re-consuming a second buffered row — consume-exactly-
+    /// once across a re-drive). A `signal_waited` command re-checks the live buffer: a signal that
+    /// arrived since the park resumes (consumes + journals `signal_received` at the NEXT seq); an absent
+    /// one re-parks (the run stays `waiting`); a fired timeout returns `TimedOut`.
+    ///
+    /// **Returns** [`WaitOutcome::Signalled`] (consumed), [`WaitOutcome::Parked`] (the run waits — the
+    /// body should return promptly), or [`WaitOutcome::TimedOut`]. A [`WfError::CoCommit`] is returned if
+    /// no signal store was supplied ([`WfCtx::with_signals`]) — a wait with no buffer is a loud error,
+    /// never a silent no-op. A [`WfError::Nondeterministic`] is latched if the journal records a
+    /// different command kind at this position (the divergence guard, P-FLOW-07).
+    pub fn wait_for_signal(
+        &mut self,
+        name: &str,
+        timeout_secs: Option<i64>,
+    ) -> WfResult<WaitOutcome> {
+        // DIVERGENCE HALT (P-FLOW-07): a latched divergence freezes the wait (the run already halts).
+        if let Some(reason) = self.divergence.clone() {
+            return Err(WfError::Nondeterministic(reason));
+        }
+        let command_id = self.next_command_id();
+
+        // **REPLAY SHORT-CIRCUIT (§4.1).** A `signal_received` at this position returns the SAME
+        // journaled signal (consume-exactly-once) — NEVER re-scans the buffer (a second buffered row
+        // under a different key would otherwise be wrongly consumed on re-drive). A `signal_waited`
+        // re-checks the live buffer below (a signal may have arrived since the park). Any OTHER
+        // journaled kind is a body that diverged from its journal → latch + halt.
+        if let Some(replayed) = self.replay_history.get(&command_id).cloned() {
+            match replayed.kind.as_str() {
+                history_kind::SIGNAL_RECEIVED => {
+                    // The journaled consumed signal: idem_key + payload were captured in the row's
+                    // result (the first ref is the idem_key marker, the rest are the payload refs).
+                    return Ok(decode_received(&replayed.result));
+                }
+                // a journaled `signal_waited` — fall through to the live re-check (the resume path).
+                crate::wfctx::history_kind::SIGNAL_WAITED => {}
+                other => {
+                    let reason = format!(
+                        "replay divergence at {command_id}: body issued `wait_for_signal` but the \
+                         journal records kind `{other}` (the workflow body diverged from its journal)"
+                    );
+                    self.latch_divergence(reason.clone());
+                    return Err(WfError::Nondeterministic(reason));
+                }
+            }
+        }
+
+        // LIVE (or the resume re-check of a journaled `signal_waited`): scan the durable buffer for the
+        // first unconsumed signal under (tenant, run, name). The signal store is REQUIRED — a wait with
+        // no buffer is a loud error (never a silent no-op).
+        let signals = self
+            .signals
+            .clone()
+            .ok_or_else(|| WfError::CoCommit("wait_for_signal requires a signal store (WfCtx::with_signals)".into()))?;
+
+        // Whether this command was already journaled as a `signal_waited` (a resume re-check) — so we do
+        // NOT journal a SECOND `signal_waited` for the same park (idempotent on the command position).
+        let already_waited = self
+            .replay_history
+            .get(&command_id)
+            .map(|r| r.kind == crate::wfctx::history_kind::SIGNAL_WAITED)
+            .unwrap_or(false);
+
+        if let Some((idem_key, row)) = signals.first_unconsumed_for(&self.tenant, &self.run_id, name) {
+            // **THE SIGNAL ARRIVED — consume it EXACTLY ONCE (§4.3).** Stamp its `consumed_seq` (the
+            // history seq the `signal_received` row will land at) so the signal-buffer-depth drops and a
+            // re-scan never re-consumes it. The consume is idempotent on `consumed_seq IS NULL` (a re-
+            // drive races to the same NULL guard) — if a concurrent drive already consumed it we would
+            // see it as consumed (None from the scan); here the scan returned it unconsumed so we win.
+            let received_seq = self.history_seq; // the seq the signal_received row will get.
+            signals.consume(&self.tenant, &self.run_id, name, &idem_key, received_seq);
+            self.consumed_signals.push((name.to_string(), idem_key.clone()));
+            // Journal the `signal_received` row carrying the consumed signal (idem_key + payload refs)
+            // so replay returns the SAME signal (consume-exactly-once). references-not-payloads.
+            self.stage_received(command_id, &idem_key, &row.payload, row.payload_key_ref.as_deref());
+            return Ok(WaitOutcome::Signalled {
+                idem_key,
+                payload: row.payload,
+                payload_key_ref: row.payload_key_ref,
+            });
+        }
+
+        // **NO SIGNAL YET.** If a timeout was set and the timeout-timer's deadline has PASSED relative to
+        // the engine's live clock, the wait TIMES OUT (the §6.3 auto-deny branch) — a deterministic
+        // outcome the next re-drive reads off the same clock. Otherwise the run PARKS (`waiting`).
+        let now_secs = self.timers.as_ref().map(|(_, _, n)| *n).unwrap_or(0);
+        if let Some(t) = timeout_secs {
+            // The absolute timeout deadline: on the FIRST park it is now + timeout; on a resume it is the
+            // deadline captured in the `signal_waited` marker (so the deadline is stable across re-drives).
+            let deadline = if already_waited {
+                self.replayed_wait_deadline(&command_id).unwrap_or_else(|| now_secs.saturating_add(t))
+            } else {
+                now_secs.saturating_add(t)
+            };
+            if now_secs >= deadline {
+                // the timeout fired before the signal arrived — journal a `signal_received` carrying the
+                // TIMEOUT marker (so replay returns TimedOut deterministically) and take the timeout path.
+                self.stage_received(command_id, WAIT_TIMEOUT_MARKER, &[], Some(WAIT_TIMEOUT_MARKER));
+                return Ok(WaitOutcome::TimedOut);
+            }
+            // not yet due — arm/keep the durable timeout-timer (idempotent on the deterministic timer_id)
+            // so the wheel wakes the run at the deadline even if the signal never arrives. Best-effort: a
+            // wait with no timer wheel still parks (the signal delivery wakes it; the timeout is the
+            // wheel's job when present).
+            if let Some((timers, partition, _)) = self.timers.clone() {
+                let timer_id = format!("{}/{}/timeout", self.run_id, command_id);
+                let bucket = crate::timer::epoch_minute(deadline);
+                timers.arm(crate::timer::TimerRow {
+                    tenant: self.tenant.clone(),
+                    region: self.region.clone(),
+                    timer_id,
+                    run_id: Some(self.run_id.clone()),
+                    command_id: command_id.clone(),
+                    fire_at: deadline,
+                    bucket,
+                    fired: false,
+                    partition,
+                });
+            }
+            // park, recording the deadline so the resume reads a STABLE deadline.
+            if !already_waited {
+                self.stage_waited(command_id, Some(deadline));
+            }
+        } else if !already_waited {
+            // an unbounded wait — journal `signal_waited` (no deadline) on the first park only.
+            self.stage_waited(command_id, None);
+        }
+        self.parked_on_signal = true;
+        Ok(WaitOutcome::Parked)
+    }
+
+    /// The deadline captured in a journaled `signal_waited` marker (the stable timeout deadline a resume
+    /// reads, §4.3). `None` if the marker carried no deadline (an unbounded wait) or is absent.
+    fn replayed_wait_deadline(&self, command_id: &str) -> Option<i64> {
+        let replayed = self.replay_history.get(command_id)?;
+        if replayed.kind != crate::wfctx::history_kind::SIGNAL_WAITED {
+            return None;
+        }
+        replayed
+            .result
+            .as_ref()
+            .and_then(|refs| refs.first())
+            .and_then(|r| r.0.strip_prefix(WAIT_DEADLINE_PREFIX))
+            .and_then(|s| s.parse::<i64>().ok())
+    }
+
+    /// Stage a `signal_waited` row (the park marker, §4.3) carrying the optional timeout deadline so a
+    /// resume reads a STABLE deadline. references-not-payloads (no PII body). STAGED — durable iff
+    /// commit (FLOW-D5).
+    fn stage_waited(&mut self, command_id: String, deadline: Option<i64>) {
+        let result = deadline
+            .map(|d| vec![myelin_refs::ArtifactRef(format!("{WAIT_DEADLINE_PREFIX}{d}"))]);
+        self.stage_history(crate::wfctx::history_kind::SIGNAL_WAITED, command_id, result);
+    }
+
+    /// Stage a `signal_received` row (the consume marker, §4.3) carrying the consumed signal's idem_key
+    /// and payload refs so replay returns the SAME signal (consume-exactly-once). references-not-
+    /// payloads. The first ref encodes the idem_key (prefixed), the rest are the payload refs. STAGED —
+    /// durable iff commit (FLOW-D5).
+    fn stage_received(
+        &mut self,
+        command_id: String,
+        idem_key: &str,
+        payload: &[myelin_refs::ArtifactRef],
+        payload_key_ref: Option<&str>,
+    ) {
+        let mut result = vec![myelin_refs::ArtifactRef(format!("{WAIT_IDEM_PREFIX}{idem_key}"))];
+        if let Some(kr) = payload_key_ref {
+            result.push(myelin_refs::ArtifactRef(format!("{WAIT_KEYREF_PREFIX}{kr}")));
+        }
+        result.extend(payload.iter().cloned());
+        self.stage_history(crate::wfctx::history_kind::SIGNAL_RECEIVED, command_id, Some(result));
+    }
+
     /// **Whether this drive PARKED on a durable timer (a `sleep` into the future, §4.2).** The engine
     /// reads it to settle the run `waiting` (holding NO runtime) rather than `completed` — the run
     /// wakes when the wheel fires the timer. `false` if no live `sleep` parked (or a `sleep` whose
     /// deadline already passed — a no-wait continuation).
     pub fn parked_on_timer(&self) -> bool {
         self.parked_on_timer
+    }
+
+    /// **Whether this drive PARKED on a `wait_for_signal` (a wait whose named signal is not yet
+    /// buffered, §4.3).** The engine reads it (alongside [`WfCtx::parked_on_timer`]) to settle the run
+    /// `waiting` (holding NO runtime) rather than `completed` — the run wakes when
+    /// `DurableExecutor::signal` delivers the named signal. `false` if every wait found a buffered
+    /// signal (or no wait was issued). This is the multi-day-HITL `state=waiting` holds-no-runtime
+    /// property (FLOW-D4).
+    pub fn parked_on_signal(&self) -> bool {
+        self.parked_on_signal
+    }
+
+    /// **Whether this drive PARKED on ANY durable wait — a timer OR a signal (§4.2/§4.3).** The engine's
+    /// single park predicate: a body that armed a not-yet-due `sleep` OR reached a `wait_for_signal`
+    /// whose signal has not arrived settles `waiting`, not terminal.
+    pub fn parked(&self) -> bool {
+        self.parked_on_timer || self.parked_on_signal
+    }
+
+    /// **The `(signal_name, idem_key)` pairs a `wait_for_signal` CONSUMED on this drive (P-FLOW-11).**
+    /// The engine reads it after a drive to refresh the signal-buffer-depth telemetry (a consumed
+    /// signal drops the buffered depth). Exactly one entry per signal a wait woke on; the FLOW-D4 drill
+    /// asserts ONE consume per delivered approval (a double-click delivers one buffered row → one
+    /// consume).
+    pub fn consumed_signals(&self) -> &[(String, String)] {
+        &self.consumed_signals
     }
 
     /// **`emit(EventDraft)` (contract 9.2, §4.5; consumes 2.2) — the ONLY emit path.** Buffers the
@@ -1727,5 +2079,219 @@ mod tests {
         assert!(err.is_nondeterministic(), "the verdict is Nondeterministic, got {err:?}");
         assert!(c2.is_divergent(), "the divergence latch is set (the engine dead-letters the run)");
         assert_eq!(timers.armed_count(), 0, "no timer armed against the journaled activity position");
+    }
+
+    // ---- wait_for_signal (P-FLOW-11, §4.3) -------------------------------------------------------
+
+    use crate::engine::{SignalRow, SignalStore};
+
+    fn buffer_signal(signals: &SignalStore, name: &str, idem: &str, payload: Vec<ArtifactRef>) {
+        signals.deliver(SignalRow {
+            tenant: tenant(),
+            region: region(),
+            run_id: "R1".into(),
+            signal_name: name.into(),
+            idem_key: idem.into(),
+            payload,
+            payload_key_ref: None,
+            consumed_seq: None,
+        });
+    }
+
+    /// **A `wait_for_signal` on an ABSENT signal PARKS — state=waiting holds no runtime (FLOW-D4).** The
+    /// body reaches the wait, no signal is buffered, so the run parks (`parked_on_signal`) — the engine
+    /// settles it `waiting`. The park journals a `signal_waited` marker (the resume short-circuit reads
+    /// it back). NO signal was consumed.
+    #[test]
+    fn wait_on_absent_signal_parks_holding_no_runtime() {
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        let signals = SignalStore::new();
+        let mut ctx = begin(&outbox, journal.clone()).with_signals(signals.clone());
+        let out = ctx.wait_for_signal("approval:call-1", None).expect("wait");
+        assert_eq!(out, WaitOutcome::Parked, "an absent signal parks the run");
+        assert!(ctx.parked_on_signal(), "the run is parked on the signal (state=waiting holds no runtime)");
+        assert!(ctx.parked(), "the unified park predicate sees the signal park");
+        assert_eq!(ctx.consumed_signals().len(), 0, "nothing consumed — the signal has not arrived");
+        ctx.commit().expect("co-commit the park marker");
+        let hist = journal.history_for(&tenant(), "R1");
+        assert_eq!(hist.len(), 1, "one signal_waited marker journaled");
+        assert_eq!(hist[0].kind, history_kind::SIGNAL_WAITED);
+    }
+
+    /// **A buffered signal RESUMES the wait, consuming it EXACTLY ONCE (FLOW-D4 — 1 consume).** The
+    /// approval arrives (buffered), the body's wait finds it, consumes it (stamps `consumed_seq` — the
+    /// buffered depth drops to 0), and returns `Signalled` carrying the references-not-payloads payload.
+    /// A `signal_received` marker is journaled (the replay short-circuit).
+    #[test]
+    fn buffered_signal_resumes_and_consumes_exactly_once() {
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        let signals = SignalStore::new();
+        buffer_signal(&signals, "approval:call-1", "card-7",
+            vec![ArtifactRef("myelin://acme/agent/decision/approve".into())]);
+        assert_eq!(signals.buffered_depth(), 1, "the approval is buffered");
+
+        let mut ctx = begin(&outbox, journal.clone()).with_signals(signals.clone());
+        let out = ctx.wait_for_signal("approval:call-1", None).expect("wait");
+        match out {
+            WaitOutcome::Signalled { idem_key, payload, .. } => {
+                assert_eq!(idem_key, "card-7", "the consumed signal's per-effect key");
+                assert_eq!(payload, vec![ArtifactRef("myelin://acme/agent/decision/approve".into())],
+                    "the references-not-payloads decision body");
+            }
+            other => panic!("expected Signalled, got {other:?}"),
+        }
+        assert!(!ctx.parked_on_signal(), "a consumed wait does NOT park");
+        assert_eq!(ctx.consumed_signals(), &[("approval:call-1".to_string(), "card-7".to_string())],
+            "exactly ONE signal consumed (FLOW-D4: 1 consume)");
+        // the consume stamped consumed_seq → buffered depth dropped to 0 (the §4.3 consume-once).
+        assert_eq!(signals.buffered_depth(), 0, "the consumed signal no longer counts (1 consume)");
+        ctx.commit().expect("co-commit the signal_received marker");
+        let hist = journal.history_for(&tenant(), "R1");
+        assert_eq!(hist[0].kind, history_kind::SIGNAL_RECEIVED, "the consume is journaled");
+    }
+
+    /// **The multi-day round-trip: park, then a days-later signal resumes + consumes ONCE (FLOW-D4).**
+    /// Drive 1 parks (no signal). The approval arrives DAYS later. Drive 2 (a re-lease / re-drive) re-
+    /// issues the wait, finds the now-buffered signal, consumes it EXACTLY once, and resumes. This is the
+    /// state=waiting-holds-no-runtime → signal-arrives → resume bridge across a restart.
+    #[test]
+    fn park_then_days_later_signal_resumes_and_consumes_once() {
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        let signals = SignalStore::new();
+
+        // DRIVE 1: the body waits; no signal is buffered → park (state=waiting).
+        let mut c1 = begin(&outbox, journal.clone()).with_signals(signals.clone());
+        assert_eq!(c1.wait_for_signal("approval:call-1", None).unwrap(), WaitOutcome::Parked);
+        assert!(c1.parked_on_signal());
+        c1.commit().expect("co-commit the park");
+        let history = journal.history_for(&tenant(), "R1");
+
+        // DAYS LATER: a human clicks Approve → the signal is buffered (DurableExecutor::signal).
+        buffer_signal(&signals, "approval:call-1", "card-7",
+            vec![ArtifactRef("myelin://acme/agent/decision/approve".into())]);
+
+        // DRIVE 2 (re-lease / re-drive): the wait replays the journaled `signal_waited` then re-checks
+        // the buffer — the now-present signal resumes the run, consuming it EXACTLY once.
+        let mut c2 = WfCtx::resume(
+            &outbox, minter(), journal.clone(), ctx_base(), "R1", "agent.run",
+            "2026-06-21T00:00:00Z", 42, history,
+        )
+        .with_signals(signals.clone());
+        let out = c2.wait_for_signal("approval:call-1", None).expect("the days-later resume");
+        assert!(matches!(out, WaitOutcome::Signalled { .. }), "the days-later signal resumes, got {out:?}");
+        assert_eq!(c2.consumed_signals().len(), 1, "exactly ONE consume across the restart (FLOW-D4)");
+        assert!(!c2.parked_on_signal(), "the resumed run no longer parks");
+        c2.commit().expect("co-commit the consume");
+        assert_eq!(signals.buffered_depth(), 0, "the signal is consumed once (buffered depth 0)");
+    }
+
+    /// **Replay returns the SAME consumed signal — consume-exactly-once across a re-drive (§4.1).** A
+    /// run that consumed a signal, re-driven AGAIN (a third drive, e.g. a later step crashed), replays
+    /// the `signal_received` marker → returns the SAME journaled signal WITHOUT re-scanning the buffer
+    /// (so a SECOND buffered signal under a different key is NOT wrongly consumed).
+    #[test]
+    fn replay_returns_the_journaled_signal_without_reconsuming() {
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        let signals = SignalStore::new();
+        buffer_signal(&signals, "approval:call-1", "card-7",
+            vec![ArtifactRef("myelin://acme/agent/decision/approve".into())]);
+        // drive 1 consumes the signal + journals signal_received.
+        let mut c1 = begin(&outbox, journal.clone()).with_signals(signals.clone());
+        c1.wait_for_signal("approval:call-1", None).expect("consume");
+        c1.commit().expect("co-commit");
+        let history = journal.history_for(&tenant(), "R1");
+
+        // a SECOND, distinct signal is buffered (a different key) — replay must NOT consume it.
+        buffer_signal(&signals, "approval:call-1", "card-99",
+            vec![ArtifactRef("myelin://acme/agent/decision/other".into())]);
+        let depth_before = signals.buffered_depth();
+
+        // drive 2: re-issue the wait — it short-circuits to the journaled signal (card-7), not card-99.
+        let mut c2 = WfCtx::resume(
+            &outbox, minter(), journal.clone(), ctx_base(), "R1", "agent.run",
+            "2026-06-21T00:00:00Z", 42, history,
+        )
+        .with_signals(signals.clone());
+        let out = c2.wait_for_signal("approval:call-1", None).expect("replay the consume");
+        match out {
+            WaitOutcome::Signalled { idem_key, .. } => assert_eq!(idem_key, "card-7",
+                "replay returns the SAME journaled signal (card-7), never re-scans to card-99"),
+            other => panic!("expected the journaled Signalled, got {other:?}"),
+        }
+        assert_eq!(c2.consumed_signals().len(), 0, "replay consumed NOTHING new (the journal is the truth)");
+        assert_eq!(signals.buffered_depth(), depth_before, "the second signal (card-99) was NOT consumed on replay");
+    }
+
+    /// **A wait with a TIMEOUT whose deadline PASSED returns `TimedOut` (the §6.3 auto-deny branch).** No
+    /// signal arrives; the engine clock advances past the timeout deadline → the wait times out (the
+    /// body takes the auto-deny path → 0 mutation, AG-8).
+    #[test]
+    fn wait_times_out_when_deadline_passes_without_a_signal() {
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        let signals = SignalStore::new();
+        let timers = crate::timer::TimerStore::new();
+
+        // DRIVE 1 at clock=1000 with a 100s timeout → parks (deadline 1100 not yet reached).
+        let mut c1 = begin(&outbox, journal.clone())
+            .with_signals(signals.clone())
+            .with_timers(timers.clone(), 0, 1000);
+        assert_eq!(c1.wait_for_signal("approval:call-1", Some(100)).unwrap(), WaitOutcome::Parked);
+        c1.commit().expect("co-commit the park + the timeout-timer");
+        assert_eq!(timers.armed_count(), 1, "a durable timeout-timer was armed");
+        let history = journal.history_for(&tenant(), "R1");
+
+        // DRIVE 2 at clock=2000 (past the deadline 1100), STILL no signal → TimedOut.
+        let mut c2 = WfCtx::resume(
+            &outbox, minter(), journal.clone(), ctx_base(), "R1", "agent.run",
+            "2026-06-21T00:00:00Z", 42, history,
+        )
+        .with_signals(signals.clone())
+        .with_timers(timers.clone(), 0, 2000);
+        let out = c2.wait_for_signal("approval:call-1", Some(100)).expect("the timeout drive");
+        assert_eq!(out, WaitOutcome::TimedOut, "the deadline passed without a signal → TimedOut (auto-deny)");
+        assert_eq!(c2.consumed_signals().len(), 0, "a timeout consumes no signal (0 mutation, AG-8)");
+    }
+
+    /// **A `wait_for_signal` with NO signal store is a LOUD error (never a silent no-op, EI-01 §2).** A
+    /// `WfCtx` built without `with_signals` cannot consume a durable signal — the wait returns a
+    /// CoCommit error naming the missing store rather than silently doing nothing.
+    #[test]
+    fn wait_without_a_signal_store_is_a_loud_error() {
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        let mut ctx = begin(&outbox, journal); // NO with_signals.
+        let err = ctx.wait_for_signal("approval:call-1", None).expect_err("a wait with no store errors");
+        assert!(matches!(err, WfError::CoCommit(ref m) if m.contains("signal store")),
+            "the missing-store wait is a loud CoCommit error, got {err:?}");
+    }
+
+    /// **A `wait_for_signal` at a position journaled as an ACTIVITY halts nondeterministic (P-FLOW-07).**
+    /// Position 0 journals an activity; a resume issues a `wait_for_signal` at position 0 — the body
+    /// diverged from its journal. The wait latches the divergence + returns `Nondeterministic`.
+    #[test]
+    fn wait_at_an_activity_position_halts_nondeterministic() {
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        let signals = SignalStore::new();
+        let mut c1 = begin(&outbox, journal.clone());
+        c1.activity(RetryPolicy::default_policy(), |_i, _a| {
+            Ok(vec![ArtifactRef("myelin://acme/agent/effect/e0".into())])
+        }).expect("activity");
+        c1.commit().expect("co-commit");
+        let history = journal.history_for(&tenant(), "R1");
+
+        let mut c2 = WfCtx::resume(
+            &outbox, minter(), journal.clone(), ctx_base(), "R1", "agent.run",
+            "2026-06-21T00:00:00Z", 42, history,
+        )
+        .with_signals(signals.clone());
+        let err = c2.wait_for_signal("approval:call-1", None).expect_err("wait-at-activity diverges");
+        assert!(err.is_nondeterministic(), "the verdict is Nondeterministic, got {err:?}");
+        assert!(c2.is_divergent(), "the divergence latch is set");
     }
 }
