@@ -2092,6 +2092,7 @@ dependencies = [
  "myelin-events",
  "myelin-identity",
  "myelin-identity-service",
+ "myelin-notif",
  "myelin-refs",
  "myelin-storage",
  "myelin-tenancy",

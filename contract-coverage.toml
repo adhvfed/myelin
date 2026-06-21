@@ -74,8 +74,16 @@ landing = "P-039"
 [[contract]]
 row = "1.7"
 title = "cross-language harness shim (frozen)"
-status = "deferred"
-landing = "P-128"
+# COVERED at CHAT-P3 / P-245: chat PINS the TE-21 connection-tier language (Rust default; the
+# BEAM/Phoenix hatch written-but-CLOSED, opened only if CHAT-D3/D4 prove Rust intractable, CHAT-P26)
+# and RECORDS the no-op against the frozen 1.7 cross-language harness shim. The CDC carries the
+# PROVIDER (chat pins Rust + records the obligation) + CONSUMER (the shim is a NO-OP in the all-Rust
+# default — no cross-language boundary; the obligation binds only on the BEAM divergence) sides. The
+# divergence is written-but-closed — the shim's obligations are stated, satisfied as a no-op today.
+status = "covered"
+cdc = [
+    "crates/myelin-chat/tests/cdc_1_7_chat_te21_pin.rs",
+]
 
 # 1.8 (telemetry signal set) — the survival-signal contract every drill reads; greened transitively
 # by every drill's signal assertions. Its dedicated CDC pair lands with the harness self-test prompt.
@@ -227,6 +235,11 @@ status = "covered"
 cdc = [
     "crates/myelin-events/tests/cdc_3_5_firehose_resume_cursor.rs",
     "crates/myelin-notif/tests/cdc_3_5_notif_inbox_watch.rs",
+    # CONSUMER leg — chat (CHAT-P3 / P-245) VALIDATES its per-view firehose scope shape
+    # `channel:<id>` against this SAME frozen protocol's `*`-rejecting chokepoint (the bounded
+    # `Channel` selector, never `*`; the `resync_required -> *.snapshot` fallback names chat's
+    # durable channel/message/thread snapshots). No transport here (the live subscribe is CHAT-P9).
+    "crates/myelin-chat/tests/cdc_3_5_chat_firehose_scope.rs",
 ]
 
 # 3.6 reactive/dispatch tier (EB-23 / P-143). OWNED by the Bus; built in myelin-query (the
@@ -566,8 +579,18 @@ cdc = [
 [[contract]]
 row = "7.3"
 title = "humanise"
-status = "deferred"
-landing = "P-187"
+# COVERED: the ONE templating surface (humanise + the ICU-subset formatter + the per-viewer
+# tombstone-never-leak render) is owned + built at NOTIF-P9/P-187 (myelin-notif/src/humanise.rs,
+# with its unit + NOTIF-D4 leak tests). CHAT-P3 / P-245 ships the CHAT registration slice on top:
+# chat REGISTERS its humanise template keys (the card string, the agent-message string, the
+# chat.message.mentioned string — NO chat-private string map, OQ-L) and Notif's ONE templating
+# surface ADMITS + SERVES them. The CDC carries the PROVIDER (chat registers its keys) + CONSUMER
+# (Notif's ONE TemplateStore admits + renders through the ONE formatter) sides. The per-subsystem
+# humanise key sets for Git/KN/Issues/CI accrete the same way (each a registration, no Notif change).
+status = "covered"
+cdc = [
+    "crates/myelin-chat/tests/cdc_7_3_chat_humanise_keys.rs",
+]
 
 # 7.4 COVERED at NOTIF-P10 (P-188): get_prefs / set_prefs — prefs + quiet-hours over the frozen
 # myelin-query QueryAst (the matcher = the EventMatcher core 3.4; Notif invents NO second predicate
@@ -613,6 +636,12 @@ status = "covered"
 cdc = [
     "crates/myelin-notif/tests/cdc_7_6_notif_define_rule.rs",
     "crates/myelin-issues/tests/cdc_7_6_issues_notif_rules.rs",
+    # CHAT slice — chat (CHAT-P3 / P-245) declares its reason set (mentioned->direct /
+    # replied->participating / thread_watched->watching / approval_requested->critical, each via the
+    # frozen `define_notif_rule` verb reconciled against the §3.1 table) + its OWNED fanout-class
+    # decision (arch §4: write-fanout the bounded high-signal `mention` producer vs read-fanout the
+    # unbounded ambient set that never write-amplifies). Notif ADMITS + ROUTES it (zero Notif change).
+    "crates/myelin-chat/tests/cdc_7_6_chat_notif_rules.rs",
 ]
 
 # 7.7 SPLIT: the HOLDER HALF (registration + locate/export/rectify/restrict + the structural

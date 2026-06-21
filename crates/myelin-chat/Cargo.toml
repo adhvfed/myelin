@@ -38,6 +38,16 @@ myelin-identity = { path = "../myelin-identity" }
 # CHAT-P2 (P-244): the one Refs `#sub` grammar + the `mint`/`SubKindRegistration` codec chat
 # registers its `message-`/`thread-` mints with (contract 5.7). Refs owns the grammar; chat mints.
 myelin-refs = { path = "../myelin-refs" }
+# CHAT-P3 (P-245): the ONE Notif templating + notif-rule surface (contracts 7.3 / 7.6). Chat
+# REGISTERS its humanise template keys (card / agent-message / chat.message.mentioned strings — the
+# ONE templating surface, OQ-L) and its `define_notif_rule` reason set (mentioned / replied /
+# thread_watched / approval_requested) into Notif's frozen verbs + registry — chat registers, Notif
+# owns the engine + the §3.1 ranking table (the inverse-signal seam, EI-01 §1). A consumer LEAF
+# depending on the Notif crate keeps the §2.9 DAG acyclic (nothing depends back on myelin-chat).
+myelin-notif = { path = "../myelin-notif" }
+# (myelin-events is already a dependency above — CHAT-P3 ALSO validates chat's firehose
+# `channel:<id>` scope shape against the Bus-owned `myelin_events::FirehoseScope` (contract 3.5),
+# the `*`-rejecting chokepoint; no transport here, only that chat's scope shape fits the protocol.)
 serde.workspace = true
 
 [dev-dependencies]
