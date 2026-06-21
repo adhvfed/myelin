@@ -84,6 +84,7 @@ pub mod effect_api;
 pub mod hitl;
 pub mod hitl_batch;
 pub mod holder;
+pub mod identity;
 pub mod loop_guards;
 pub mod migrations;
 pub mod mock;
@@ -106,6 +107,16 @@ pub use skeleton::{
     ChildEnv, RunOutcomeKind, RunSubstrate, RunTokenRevoker, SkeletonAgent, SkeletonAgentRuntime,
     SkeletonError, SkeletonTelemetry, AGENT_RUN_TRACED_EVENT, SKELETON_STEP_UNIT,
 };
+
+// Per-run identity COMPLETED (AG-P13 → P-225): mint at dispatch (token life == run life), scrub the
+// shared platform token in the child env, revoke idempotently on teardown even on crash, and RE-MINT
+// on resume after a multi-day HITL pause / long SCHEDULE_AND_RUN_JOB with the SAME caveats and the
+// REMAINING run life (the §5.7 C6 clamp: TTL == min(W, remaining run life) — a long pause never
+// widens the attribution window beyond the run's deadline). The AttributionWindow is the AG-D8
+// re-mint-leg proof (0 unattributed window across the pause). Completes AG-P4's simple form +
+// reconciles with myelin-flow's WfCtx re-mint (the engine-side lease). NO FLOOR — per-run identity is
+// complete; the anti-leak scrub is RE-ASSERTED inside ToolHands::exec (AG-P15 → P-226).
+pub use identity::{AttributionWindow, RunIdentity, FAIL_STATIC_W_SECS};
 
 // The MockAgentRuntime (AG-P5 → P-217): the deterministic scripted brain on the real `--use-mock`
 // code path. The scripted queue + the stateless step, the platform-owned history reconstruction

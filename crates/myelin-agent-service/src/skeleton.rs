@@ -391,6 +391,41 @@ impl SkeletonAgent {
         SkeletonAgent
     }
 
+    /// **Drive a multi-day-paused run through RESUME using the per-run identity (AG-P13, §5.7 C6).**
+    /// The loop-driver wiring the AG-P13 deliverable owns: a run that parked for *days* on a HITL gate
+    /// (or a long `SCHEDULE_AND_RUN_JOB`, AG-P16) spans its per-run token's TTL. On wake the driver
+    /// RE-MINTS a fresh attenuated token via [`crate::RunIdentity::remint_on_resume`] (same caveats,
+    /// the REMAINING run life) BEFORE the resumed work runs, so the resumed activity executes under a
+    /// FRESH live token — the run stays attributed within the TTL bound, 0 unattributed window. On
+    /// teardown the CURRENT (re-minted) token is revoked idempotently.
+    ///
+    /// This is the engine-side counterpart to `myelin-flow::WfCtx::remint_on_resume` (the durable
+    /// engine's automatic resume-leg hook): the Agent-Fabric driver additionally clamps the re-mint
+    /// TTL to the run's *remaining* life (the §5.7 C6 tightening), so a long pause never widens the
+    /// attribution window past the run's own deadline. Returns the fresh token's `jti` (the resumed
+    /// run's live attribution principal) or a [`SkeletonError::MintFailed`] LOUD (a resume past the
+    /// run deadline, or a refused mint, never silently runs unattributed).
+    pub fn resume_run(
+        &self,
+        identity: &mut crate::RunIdentity,
+        revoker: &dyn RunTokenRevoker,
+        resume_at_secs: i64,
+        telemetry: &mut SkeletonTelemetry,
+    ) -> Result<String, SkeletonError> {
+        // RE-MINT on resume (4.7, §5.7 C6): a fresh attenuated token with the SAME caveats and the
+        // REMAINING run life. A resume past the run deadline (no remaining life) surfaces LOUD — the
+        // resumed work must NOT run past the run's own allotted life (never widen attribution).
+        let jti = identity
+            .remint_on_resume(resume_at_secs)
+            .map_err(|e| SkeletonError::MintFailed(e.to_string()))?
+            .jti
+            .clone();
+        // TEARDOWN: revoke the CURRENT (re-minted) token idempotently even on crash (4.7, §5.7).
+        let lag = identity.revoke_on_teardown(revoker, resume_at_secs, resume_at_secs);
+        telemetry.record_revoke(lag);
+        Ok(jti)
+    }
+
     /// **Drive ONE SKELETON run end-to-end on the real substrate, CHAINING the operations (8.5,
     /// §5.1).** This is the chained-e2e path (EI-01 §4 — real sessions chain mutations, never a single
     /// handler call): deliver → mint → reserve → step → trace → settle → revoke. `kill` injects the
