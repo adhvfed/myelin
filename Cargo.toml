@@ -203,6 +203,13 @@ toml = "0.8"
 # self-describing content-address string + the fs key path.
 blake3 = "1"
 hex = "0.4"
+# SHA-256 — the read-side integrity verification for git-imported objects/packs (P-ST-22 /
+# contract 11.2 git pack tier). Git addresses its objects by SHA (SHA-1 legacy / SHA-256
+# modern); the BlobStore admits a self-describing `sha256:` multihash tag (P-ST-03) so a
+# git object coexists with native BLAKE3 blobs, but the verification path for that tag was the
+# named P-ST-22 floor. `sha2` is the vetted RustCrypto FIPS-180-4 impl (never a hand-rolled
+# hash — VISION §4 / EI-01 §7), used ONLY to re-hash a `sha256:`-addressed object on read.
+sha2 = "0.10"
 # The proc-macro toolchain for the `#[derive(PersonalData)]` classify-derive BODY (contract 10.2,
 # P-GA-07 / P-107): parse the tagged struct + its `#[personal_data(...)]` helper args (syn), emit
 # the generated registry entry + the structural `subject_locator` accessor (quote). `full` is not

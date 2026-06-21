@@ -31,6 +31,11 @@ serde.workspace = true
 # self-describing content-address + the per-tenant fs key path.
 blake3.workspace = true
 hex.workspace = true
+# SHA-256 verification for git-imported objects (P-ST-22 / 11.2 git pack tier). The BlobStore
+# admits a `sha256:` multihash tag (P-ST-03); the git pack tier supplies the read-side verify
+# for that tag so a corrupt git object is detected on read (0 silent serve, STOR-D7 on packs).
+# RustCrypto `sha2` (FIPS-180-4) — never a hand-rolled hash (VISION §4 / EI-01 §7).
+sha2.workspace = true
 # The three-level KMS hierarchy (P-ST-06 / 11.3): the L2 DEK working keys are AES-256-GCM
 # (storage.md §4). We use the vetted RustCrypto `aes-gcm` AEAD (NIST SP 800-38D) for the
 # real wrap/unwrap envelope crypto rather than hand-rolling it (EI-01 §7: one primitive

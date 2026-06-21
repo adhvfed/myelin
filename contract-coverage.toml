@@ -1034,7 +1034,16 @@ status = "covered"
 # P-047 (P-ST-03): the content-addressed BlobStore trait + fs-backed floor. The base trait +
 # fs floor ship here; the per-blob content-key WRAP is the named floor → P-ST-08 (P-095), the
 # object-store backing → P-ST-30 (P-636), the C3/C4/object-backed-pack additions → later prompts.
-cdc = ["crates/myelin-storage/tests/cdc_11_2_blobstore.rs"]
+# P-252 (P-ST-22): the local-disk GIT PACK TIER behind the trait — git packs + loose objects
+# addressed THROUGH the BlobStore (so local-disk → object-store is a backing swap, §3.5),
+# region-pinned + node-RELOCATABLE placement (the storage face of 12.2), SHA-256 read-side verify
+# closing the blob.rs git-object floor, and STOR-D7 on packs (corrupt object detected + recovered
+# from replica, 0 silent serve). The object-backed pack/delta + smart-transport is the named M5
+# follow-on → P-ST-31 (P-442); the C3 CDN clone/bundle class is the sibling → P-ST-23 (P-254).
+cdc = [
+    "crates/myelin-storage/tests/cdc_11_2_blobstore.rs",
+    "crates/myelin-storage/tests/cdc_11_2_git_pack_tier.rs",
+]
 
 [[contract]]
 row = "11.3"
