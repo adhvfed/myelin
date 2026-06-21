@@ -57,6 +57,15 @@ serde.workspace = true
 # rest of the workspace pins.
 serde_json.workspace = true
 
+# BLAKE3 content-addresses the IMMUTABLE git commit object (GIT-P25 / P-ID-25, M3): the commit OID
+# is `blake3:<hex>` over the canonical commit bytes — the SAME multihash convention the GDPR holder
+# Receipt + the BlobStore content-address use (one digest convention across the platform, never a
+# hand-rolled hash). The OID is computed OVER the pseudonymous author/committer line, so the property
+# the GIT-D2 drill proves (no recoverable real identity in the immutable bytes) is anchored in the
+# content-address itself.
+blake3.workspace = true
+hex.workspace = true
+
 # DEV-ONLY: the rich ReBAC namespace ENGINE (FragmentDef / Userset / StoreBackedCheck) lives in the
 # Identity SERVICE crate. The runtime Git fragment is the names-only `myelin_identity::Namespace-
 # Fragment` ABI carrier (above) — a producer LEAF never depends on a service crate (the §2.9 DAG
