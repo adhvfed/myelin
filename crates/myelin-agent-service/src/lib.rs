@@ -77,6 +77,7 @@
 //!   The validation logic does not change shape when the driver lands.
 
 pub mod app;
+pub mod card_text;
 pub mod defaults;
 pub mod dry_run;
 pub mod effect_api;
@@ -150,6 +151,19 @@ pub use hitl::{
     derive_approver_set, gate_id_of, live_cost_estimate, run_hitl_loop, surface_card, ApprovedTools,
     ApproverSet, Halted, HitlCard, HitlGate, HitlGateState, HitlOutcome, HitlWait, InvalidTransition,
     RiskSummary, WaitDecision,
+};
+
+// The AG-P11 (→ P-223) card-text path (C9/OQ-L): the HITL card text + every agent-authored message
+// route through Notif `humanise` (contract 7.3, the ONE templating surface) — NEVER raw strings. The
+// `risk_summary` + an `AgentMessage` are `(template_key, args)` pairs humanised per-viewer
+// (permission-/erasure-safe); the same card renders differently for two viewers with different
+// permissions. `assert_no_raw_agent_surface` is the 0-raw-string-surfaces GATE (a raw agent string is
+// REJECTED). The agent-fabric templates register into the SAME Notif `TemplateStore` — no second
+// engine, no frontend string map. NO FLOOR — humanise is the sole templating surface.
+pub use card_text::{
+    assert_no_raw_agent_surface, humanise_agent_message, humanise_card, humanise_risk_summary,
+    register_agent_templates, AgentMessage, RawAgentString, RenderedCard,
+    AGENT_PLATFORM_DEFAULT_TEMPLATES,
 };
 
 // Per-effect HITL idempotency (C4/OQ-F; AG-P10 → P-222): the AG-D5 EXACTLY-ONCE leg — a batch /
