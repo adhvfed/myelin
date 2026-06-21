@@ -722,11 +722,20 @@ title = "ToolHands::exec (unified sandbox)"
 # fail-closed on un-digested image / exhausted wallet) against the CONSUMER (a dispatcher building
 # a JobSpec; the agent-fabric case wires the X-6 equivalence ToolHands::exec == launch(JobSpec
 # {kind:Agent})). The FULL agent-fabric consumer body (the real ToolHands::exec dispatch path) is
-# AG-P8 (→ P-226); the ZERO-escapes real-kernel GATE is CI-P5 (→ P-239); the Firecracker backend
-# is CI-P2 (→ P-237). Those are runner IMPL/GATE follow-ons, not contract-pair gaps — the 8.4 seam
-# pair exists and carries both sides NOW.
+# SHIPPED at AG-P15 (→ P-226): myelin-agent-service::exec::SandboxToolHands realises
+# ToolHands::exec as the dispatch of the kind=agent JobSpec onto the unified sandbox, with the
+# routing split (only `compute` reaches the sandbox; a mutate/external effect can NEVER build a
+# SandboxJob → 0 mutate-via-exec, encoded in the type) + the four guarantees wired by construction.
+# Its CDC (cdc_8_4_exec_routing.rs) pins the AGENT-FABRIC CONSUMER half (the runner-seam PROVIDER
+# driving the four guarantees in order; the Fabric CONSUMER routing compute → sandbox + refusing a
+# mutate). The ZERO-escapes real-kernel GATE proving guarantee #4 is CI-P5 (→ P-239) / AG-P17 (→
+# P-229); the Firecracker backend is CI-P2 (→ P-237). Those are runner IMPL/GATE follow-ons, not
+# contract-pair gaps — the 8.4 seam pair carries both the runner-seam AND the agent-fabric halves NOW.
 status = "covered"
-cdc = ["crates/myelin-ci-sandbox/tests/cdc_8_4_unified_sandbox.rs"]
+cdc = [
+    "crates/myelin-ci-sandbox/tests/cdc_8_4_unified_sandbox.rs",
+    "crates/myelin-agent-service/tests/cdc_8_4_exec_routing.rs",
+]
 
 [[contract]]
 row = "8.5"

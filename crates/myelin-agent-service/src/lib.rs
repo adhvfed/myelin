@@ -82,6 +82,7 @@ pub mod cost_gate;
 pub mod defaults;
 pub mod dry_run;
 pub mod effect_api;
+pub mod exec;
 pub mod hitl;
 pub mod hitl_batch;
 pub mod holder;
@@ -148,6 +149,25 @@ pub use effect_api::{
     decode_proposed, encode_proposed, validate_schema, ApplyError, CapabilityCheck, DelegationLookup,
     EffectApiBridge, EffectBudget, EffectCost, PipelineSignals, PipelineStep, PlanThenApply,
     PlanVerdict, PlannedEffect, SubsystemApply, TenantGuard,
+};
+
+// ToolHands::exec on the unified sandbox (AG-P15 → P-226, M2-C, contract 8.4 — the Fabric half): the
+// real `ToolHands::exec` body realised as the dispatch of CI's `kind=agent` JobSpec onto the ONE
+// unified sandbox (`myelin-ci-sandbox`, CI-P1 → P-129), with NO host-exec bypass (the `no-host-exec`
+// lint, 1.6, green over the crate). The ROUTING SPLIT (the safety boundary, §5.0/X-6 #3) is encoded
+// in the TYPE: only `compute` builds a `SandboxJob` (`route_of`), so a `mutate`/`external` effect can
+// NEVER reach exec (0 mutate-via-exec). The FOUR uniform guarantees are wired by construction (every
+// dispatch inherits them — NO subsystem re-implements any): #1 reserve at dispatch (11.7, AG-P14), #2
+// per-run attenuated token + the anti-leak platform-token scrub into the child env (4.7, AG-P13), #3
+// HITL withhold (mutation via EffectApi, structural), #4 the FULL hardening profile fed into the
+// kind=agent spec (digest-pinned fail-closed on un-digested tags, default-deny egress, pids.max +
+// zero swap, read-only root + tmpfs, secrets as in-boundary refs, whole-guest kill on teardown).
+// FLOORS: the ZERO-escapes real-kernel GATE proving guarantee #4 is AG-P17 (→ P-229) / CI-P5 (→
+// P-239); the Firecracker backend is CI-P2 (→ P-237); SCHEDULE_AND_RUN_JOB long-park is AG-P16 (→
+// P-228); the real LlmAgentRuntime against this runner is post-M5 (AG-P25).
+pub use exec::{
+    compute_tool_def, route_of, ExecError, RoutingError, SandboxJob, SandboxToolHands, ToolRoute,
+    PLATFORM_TOKEN_ENV,
 };
 
 // The FROZEN §6.3 requires_approval defaults seed (AG-P8 → P-220): the per-subsystem default lookup

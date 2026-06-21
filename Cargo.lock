@@ -2068,6 +2068,7 @@ name = "myelin-agent-service"
 version = "0.0.0"
 dependencies = [
  "myelin-agent",
+ "myelin-ci-sandbox",
  "myelin-config",
  "myelin-content",
  "myelin-events",
