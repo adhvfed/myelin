@@ -77,6 +77,8 @@
 //!   The validation logic does not change shape when the driver lands.
 
 pub mod app;
+pub mod defaults;
+pub mod dry_run;
 pub mod effect_api;
 pub mod holder;
 pub mod migrations;
@@ -117,7 +119,22 @@ pub use mock::{
 pub use effect_api::{
     decode_proposed, encode_proposed, validate_schema, ApplyError, CapabilityCheck, DelegationLookup,
     EffectApiBridge, EffectBudget, EffectCost, PipelineSignals, PipelineStep, PlanThenApply,
-    PlannedEffect, SubsystemApply, TenantGuard,
+    PlanVerdict, PlannedEffect, SubsystemApply, TenantGuard,
+};
+
+// The FROZEN §6.3 requires_approval defaults seed (AG-P8 → P-220): the per-subsystem default lookup
+// + the cross-subsystem "governed where it lands" rule + the seed seam + the VISION §3
+// no-silent-loosening guard (a frozen yes→no loosening without a written deviation is rejected).
+pub use defaults::{
+    assert_no_silent_loosening, default_for_tool, requires_approval_default,
+    requires_approval_for_landing, seed_requires_approval, LooseningViolation, WrittenDeviation,
+};
+
+// The run --dry-run lever (AG-P8 → P-220, contract 8.7): the side-effect-free planner (steps 1..6,
+// 0 apply + 0 meter) + the AG-D9 proposed-effect-sequence determinism (two runs byte-identical) +
+// the frozen DryRun bridge.
+pub use dry_run::{
+    dry_run_plan, proposed_effect_sequence, DryRunBridge, DryRunEntry, DryRunPlanner,
 };
 
 // The delegation-scoped tool-list (AG-P7 → P-219): the `list_objects` SetExpr push-down (the no-N+1
