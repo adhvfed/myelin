@@ -2069,8 +2069,11 @@ version = "0.0.0"
 dependencies = [
  "myelin-agent",
  "myelin-config",
+ "myelin-events",
+ "myelin-flow",
  "myelin-gdpr",
  "myelin-identity",
+ "myelin-refs",
  "myelin-storage",
  "myelin-substrate",
  "myelin-tenancy",

@@ -76,9 +76,11 @@
 //!   `integration` test proves the RLS policy denies a cross-tenant read against the LIVE dev stack.
 //!   The validation logic does not change shape when the driver lands.
 
+pub mod app;
 pub mod holder;
 pub mod migrations;
 pub mod schema;
+pub mod skeleton;
 
 // Re-export the PersonalDataHolder registration seam (AG-P3 → P-132) at the crate root — the shape
 // the harness `serve` (AG-P4) + the DSR fan-out (AG-P23) + the 10.1 CDC consume (mirrors
@@ -86,4 +88,19 @@ pub mod schema;
 pub use holder::{
     agent_store_classifier, register_agent_holders, AgentHolderRegistration, AgentOltpHolder,
     AgentTraceHolder, AGENT_OLTP_STORE, AGENT_TRACE_STORE,
+};
+
+// The SKELETON runtime (AG-P4 → P-216): the gateway → identity → dispatch → reserve → trace path at
+// zero cost. The brain (no model, no tools) + the platform-owned `Agent::handle` durable-workflow
+// loop body + the per-run identity (mint/revoke/anti-leak) + the contract-1.8 telemetry signals.
+pub use skeleton::{
+    ChildEnv, RunOutcomeKind, RunSubstrate, RunTokenRevoker, SkeletonAgent, SkeletonAgentRuntime,
+    SkeletonError, SkeletonTelemetry, AGENT_RUN_TRACED_EVENT, SKELETON_STEP_UNIT,
+};
+
+// The agent-service `serve(AppSpec)` shell (AG-P4 → P-216): the three ports, liveness != readiness,
+// holder auto-registration, and the dispatch consumer bound by name with a subjects() whitelist.
+pub use app::{
+    agent_app_spec, agent_dispatch_consumer_reg, boot_agent, run_agent, SkeletonDispatchConsumer,
+    AGENT_DISPATCH_SUBJECT_PREFIX, SERVICE_NAME,
 };

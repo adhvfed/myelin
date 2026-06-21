@@ -25,7 +25,25 @@ myelin-identity = { path = "../myelin-identity" }
 # door — opening IS registering, contract 1.4), the StoreClassifier (the data-map's "this OLTP store
 # is holder HN" fact), and the H1–H18 catalog (the Fabric stores classify to H11 agent-memory + H17
 # agent-trace). Mirrors myelin-refs-service / myelin-search (the M1 holder-registration pattern).
+# AG-P4 (→ P-216) also uses `serve(AppSpec)` (contract 1.1) + `consume` (the dispatch consumer) here.
 myelin-substrate = { path = "../myelin-substrate" }
+
+# AG-P4 (→ P-216) — the SKELETON runtime ties the substrate path together. NEW deps (all leaf
+# consumers above the glue crates; NO cycle — `myelin-flow` depends on `myelin-agent` [glue], NOT on
+# `myelin-agent-service`, so this crate may depend on `myelin-flow` and remains OUTSIDE the
+# eleven-crate library DAG modelled by `myelin-substrate::crate_graph`):
+#   - myelin-flow   : a run is a durable workflow (ADR-09) — the `WfCtx` loop body the SKELETON drives
+#                     + the `DurableExecutor` seam (contracts 9.1/9.2/9.5); reused, not reinvented.
+#   - myelin-events : the transactional outbox `OutboxTx::emit(draft, cause)` nested-causality emit
+#                     (contract 2.2) + the `consume` dispatch-consumer entry-point (contract 3.6).
+#   - myelin-refs   : the `ArtifactRef` the trace row is keyed by (references-not-payloads).
+myelin-flow = { path = "../myelin-flow" }
+myelin-events = { path = "../myelin-events" }
+myelin-refs = { path = "../myelin-refs" }
+# The SKELETON's terminal trace event carries a references-not-payloads JSON payload (the trace
+# `ArtifactRef`); serde_json builds the `EventDraft.payload` value (it was a dev-dep for AG-P2's
+# round-trip test; the SKELETON's emit needs it at lib scope).
+serde_json.workspace = true
 
 # REAL Postgres backend behind the `integration` feature (Stage 1 / infra). OPTIONAL deps: the
 # DEFAULT `cargo build --workspace` stays DB-free (the binding policy floor — no DB at build). They
