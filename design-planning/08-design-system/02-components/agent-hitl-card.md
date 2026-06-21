@@ -231,6 +231,20 @@ The agent token is the load-bearing reserved token (00-plan §2.1 names it expli
 
 ---
 
+## 9b. Icons (canonical glyphs — registry names)
+
+From the 42-icon library ([`../04-icons/ICONS-README.md`](../04-icons/ICONS-README.md) §2;
+[USAGE-MAP](../04-icons/USAGE-MAP.md) §A).
+
+- **Agent treatment (header):** `agent` — the **plain geometric mark** (rounded square + centered dot). **Never**
+  sparkle/shimmer/magic-wand/star/emoji (§3 hard prohibition).
+- **Per-effect gate marker:** `gate` (consequential effect; pairs with `--warning` + the word "GATE", never
+  colour-alone).
+- **Per-effect targets:** the `<ReferenceChip>` type-icons (see reference-chip §9b).
+- **Controls:** `approve` (bare ✓) · `edit` (pencil) · `reject` (bare ✗) — bare ✓/✗ are **actions, not CI
+  verdicts** (the ring-enclosed `check-*` trio is the verdict set).
+- **Provenance / chain / audit:** `link` (clickable `correlation_id`) · `external-link` (audit deep-link).
+
 ## 10. Motion (token-based, reduced-motion first-class)
 
 - **Card / inbox-row expand** — `--dur-base` (180ms) `--ease-standard`; expands in place, no jump.

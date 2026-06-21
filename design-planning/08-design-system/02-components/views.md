@@ -161,6 +161,19 @@ Compact tabular numbers (`font-variant-numeric: tabular-nums`) for counts/dates.
 
 ---
 
+## 7b. Icons (canonical glyphs — registry names)
+
+From the 42-icon library ([`../04-icons/ICONS-README.md`](../04-icons/ICONS-README.md) §2;
+[USAGE-MAP](../04-icons/USAGE-MAP.md) §A).
+
+- **Projection switcher:** `roadmap` (timeline/Gantt) · `cycle` (calendar). **Gap:** board/table/list/gallery
+  have **no core glyph yet** — interim text labels; a `view-*` mini-family is the largest concrete gap
+  ([USAGE-MAP](../04-icons/USAGE-MAP.md) §C).
+- **View-bar query controls:** `search` (filter) · `priority` (group/sort field) · `settings` (visible fields ⊞).
+- **Ref-typed cells:** `<ReferenceChip>` type-icons.
+- **Status cells:** `check-pass` / `check-fail` / `check-pending` · `priority` — **glyph + label**.
+- **Disclosure / group collapse:** `chevron` (CSS-rotated). **Row overflow:** `kebab`. **Agent-pending row:** `agent`.
+
 ## 8. Motion (token-based, reduced-motion first-class)
 
 - **Card-moves-column / drag-settle** — `--dur-fast` `--ease-standard`; **rollback reverses the move** so a

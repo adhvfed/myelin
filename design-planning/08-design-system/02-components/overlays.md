@@ -266,6 +266,16 @@ time-critical/blocking events. Toasts with actions are reachable via a documente
 
 ---
 
+## 7b. Icons (canonical glyphs — registry names)
+
+From the 42-icon library ([`../04-icons/ICONS-README.md`](../04-icons/ICONS-README.md) §2;
+[USAGE-MAP](../04-icons/USAGE-MAP.md) §A). The substrate itself is near-glyphless; what it does use:
+
+- **Dialog / drawer corner:** `close` (bare ✗ — the dismiss affordance, distinct from `reject`).
+- **Dropdown / Menu rows:** the shared row atom's leading type-icon (any registry glyph) + `chevron` (submenu, CSS-rotated).
+- **Toast:** a status glyph where it carries a verdict (`check-pass`, etc.) — glyph + label, never colour-alone; `close` to dismiss.
+- **ConfirmDialog (destructive):** pairs the danger token with a glyph (the `check-fail` ✗ pattern) + label.
+
 ## 8. Nested overlays (the foot-gun — R-10 §5.3 / R-17 §5.7) — PROVEN
 
 A Confirm over a Dialog, a Dropdown inside a Popover: the **z-index scale** (§0.2) plus a **focus-trap stack**

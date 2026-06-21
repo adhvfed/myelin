@@ -223,6 +223,26 @@ table re-skins it with no edit.
 
 ---
 
+## 9b. Icons (canonical glyphs — registry names)
+
+The **type-icon is the persistent identity, known from the URN `<type>` before resolution** (§2.1) and
+**identical across every surface** (D4). From the 42-icon library
+([`../04-icons/ICONS-README.md`](../04-icons/ICONS-README.md) §2; [USAGE-MAP](../04-icons/USAGE-MAP.md) §A).
+
+| Type | type-icon | status-glyph (glyph + label) |
+|---|---|---|
+| PR | `pull-request` | `check-pass` / `check-fail` / `check-pending`; `merge` (merged) |
+| Issue / sub-issue | `issue` / `sub-issue` | `priority` + status glyph |
+| Doc / block | `doc` | — |
+| CI run / step | `run` | `check-pass` / `check-fail` / `check-pending`; `rerun` |
+| Commit · branch · tag | `commit` · `branch` · `tag` | — |
+| Thread / message | `message` | — |
+| Repo · file · folder · database | `repo` · `file` · `folder` · `database` | — |
+| Person / Agent | `human` / `agent` (four-channel treatment) | — |
+| Backlink / reference | `link` | — |
+
+**Action bar:** `external-link` (open ↗) · `kebab` (overflow `···`) · `edit`.
+
 ## 10. Motion (token-based, reduced-motion first-class)
 
 - **Live-update flip** (red→green in place) — `--dur-deliberate` (240ms, the reserved notice-without-interrupt

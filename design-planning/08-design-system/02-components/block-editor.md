@@ -165,6 +165,18 @@ Binds only to semantics / chip handles. Type scale + line-heights from the scale
 
 ---
 
+## 8b. Icons (canonical glyphs — registry names)
+
+From the 42-icon library ([`../04-icons/ICONS-README.md`](../04-icons/ICONS-README.md) §2;
+[USAGE-MAP](../04-icons/USAGE-MAP.md) §A).
+
+- **Block drag handle / convert menu:** `kebab` (the six-dot handle / overflow mark).
+- **Slash-menu insertable blocks:** `doc` · `database` (`/database` live board) · `file` · `link` (`/embed`) ·
+  `issue` (`/issue`).
+- **Inline mention / ref / embed nodes:** `<ReferenceChip>` type-icons; `@agent` → `agent`.
+- **Disclosure (toggle blocks):** `chevron` (CSS-rotated).
+- *Gap:* attachment/paperclip and a generic add `+` have no core glyph yet ([USAGE-MAP](../04-icons/USAGE-MAP.md) §C).
+
 ## 9. Motion (token-based, reduced-motion first-class)
 
 - **Slash menu / mention picker open** — `--dur-fast` `--ease-enter`; appears, doesn't slide the paragraph.

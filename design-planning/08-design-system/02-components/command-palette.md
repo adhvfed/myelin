@@ -178,6 +178,20 @@ covered by the one derived focus token, 00-plan §4 footnote); `--accent-weak` (
 "Agent" label (agent rows — via the [F] identity/agent badge); `--warning` (gate marker, with glyph+label);
 `--success` (the permission cue check); spacing/motion/z (`--z-modal`).
 
+## 9b. Icons (canonical glyphs — registry names)
+
+From the 42-icon library ([`../04-icons/ICONS-README.md`](../04-icons/ICONS-README.md) §2;
+[USAGE-MAP](../04-icons/USAGE-MAP.md) §A). The **row atom's type icon disambiguates type for colour-blind
+users** (§3) — not colour-alone.
+
+- **Navigate-mode type icons:** `repo` · `pull-request` · `issue` · `doc` · `channel` · `run` · `human` ·
+  `agent` · `settings`.
+- **Act-mode rows:** the verb's `ToolDef` glyph (e.g. `merge` · `run` · `rerun` · `edit` · `tag`).
+- **Search / Build-query:** `search` · `priority`.
+- **Agent-armable row:** `agent` (the [Agent] badge mark — the plain geometric mark, never sparkle/star).
+- **Consequential-verb gate marker:** `gate` (routes into the HITL/Confirm gate; pairs with `--warning` + "GATE").
+- **Chrome:** `chevron` (↑↓ hint) · `external-link` ("Open in Search view").
+
 ## 10. Motion + reduced-motion (R-08 §3.3)
 
 Open/close: opacity show via the [F] Dialog substrate at `--dur-fast`; the palette **never animates in** under

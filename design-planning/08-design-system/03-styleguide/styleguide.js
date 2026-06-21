@@ -239,5 +239,30 @@
     live.textContent = "Direction: " + (rtl ? "right to left" : "left to right");
   });
 
+  /* ---------- icon gallery: ink + size controls (proves currentColor recolor) ---------- */
+  var icoGrid = document.getElementById("ico-grid");
+  if (icoGrid) {
+    var inkBtns = Array.prototype.slice.call(document.querySelectorAll("[data-ico-ink]"));
+    inkBtns.forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var tok = btn.getAttribute("data-ico-ink");
+        // recolor the whole grid via one CSS color → every inline SVG follows (currentColor)
+        icoGrid.style.color = "var(--" + tok + ")";
+        inkBtns.forEach(function (b) {
+          b.setAttribute("aria-checked", String(b === btn));
+        });
+        live.textContent = "Icon ink: " + tok;
+      });
+    });
+    var icoSize = document.getElementById("ico-size");
+    var icoSv = document.getElementById("ico-sv");
+    if (icoSize) {
+      icoSize.addEventListener("input", function () {
+        icoGrid.style.setProperty("--ico-size", icoSize.value + "px");
+        if (icoSv) icoSv.textContent = icoSize.value + "px";
+      });
+    }
+  }
+
   renderAll();
 })();
