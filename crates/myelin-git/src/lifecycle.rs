@@ -44,11 +44,14 @@
 //!    pattern to a [`myelin_identity::TupleDelta`] `code_owner` tuple (the 4.9 consumer).
 //!
 //! **Does NOT ship (FLOORS named — VISION §3):**
-//! - **PR/review/thread bodies are single-author CAS** here: the body content + its myelin-content
-//!   markdown-subset round-trip is **GIT-P17** (the content-node → `refs.edge.created` emission). This
-//!   layer carries the body as an opaque per-subject-DEK ciphertext handle ([`BodyRef`]) — the entity,
-//!   not the rendered content. The multi-author collaborative-edit story is owned by **Knowledge**,
-//!   not git (§1.1 — git PR/review bodies are single-author).
+//! - **PR/review/thread bodies are single-author CAS** here. As of **GIT-P17 / P-278** the body content
+//!   IS the frozen [`crate::body::Body`] (`myelin-content` markdown-subset + the three structured inline
+//!   nodes, round-tripped `render(parse(md)) === md`, with the content-node → `refs.edge.created`
+//!   emission) — the GIT-P16 opaque `BodyRef` ciphertext floor is RESOLVED for the body content. The
+//!   per-subject-DEK at-rest SEAL of those bytes (contract 11.4 `erasure = CryptoShred`) rides the
+//!   GIT-P20 store wiring; this layer carries the cleartext document. The multi-author
+//!   collaborative-edit story is owned by **Knowledge**, not git (§1.1 — git PR/review bodies are
+//!   single-author).
 //! - **The diff line-anchor** (the `#L<a>-L<b>` content-anchored 4-state resolver a thread anchors to)
 //!   is **GIT-P23/GIT-P24** — this layer carries the anchor as an opaque [`DiffAnchor`] handle.
 //! - **The live OLTP store + migration + the per-ref ruleset persistence** ride GIT-P20/GIT-P22 (the
@@ -58,6 +61,8 @@
 //!   `write_tuples` CODEOWNERS tuple persistence is the GIT-P20 wiring (it consumes [`CodeOwners::resolve`]).
 
 use myelin_identity::{ObjectId, PrincipalId, RelName, RelationTuple, TupleDelta};
+
+use crate::body::Body;
 
 // ════════════════════════════════════════════════════════════════════════════════════════════════
 // 1. THE PULL-REQUEST LIFECYCLE STATE MACHINE (00-overview §1.1)
@@ -164,13 +169,6 @@ impl std::fmt::Display for LifecycleError {
 
 impl std::error::Error for LifecycleError {}
 
-/// An opaque per-subject-DEK ciphertext handle to a PR/review/comment BODY (the single-author CAS
-/// floor — the body content + its myelin-content markdown-subset round-trip is GIT-P17). This layer
-/// carries the entity + the ciphertext handle, never the rendered content (the per-subject DEK
-/// crypto-shred reaches it live + in backups — [`crate::schema`] tags it). Opaque here on purpose.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
-pub struct BodyRef(pub Vec<u8>);
-
 /// An opaque diff line-anchor handle a [`Thread`] anchors to (the `#L<a>-L<b>` content-anchored
 /// range). The 4-state content-anchored resolver (`live/moved/outdated/gone`) is GIT-P23/GIT-P24; this
 /// layer carries the anchor as an opaque handle (the thread ENTITY, not the resolved position).
@@ -203,8 +201,10 @@ pub struct PullRequest {
     pub head_ref: String,
     /// The PR author's OPAQUE pseudonym (GIT-1, contract 4.8) — never a raw name/email.
     pub author_pseudonym: String,
-    /// The opaque per-subject-DEK body handle (the GIT-P17 single-author-CAS floor).
-    pub body: BodyRef,
+    /// The PR description body — a frozen [`crate::body::Body`] (`myelin-content` markdown-subset + the
+    /// three structured inline nodes; single-author CAS; the content-node → `refs.edge.created`
+    /// producer, GIT-P17). The per-subject-DEK at-rest seal of these bytes rides the GIT-P20 store.
+    pub body: Body,
 }
 
 impl PullRequest {
@@ -223,7 +223,7 @@ impl PullRequest {
             base_ref: base_ref.into(),
             head_ref: head_ref.into(),
             author_pseudonym: author_pseudonym.into(),
-            body: BodyRef::default(),
+            body: Body::empty(),
         }
     }
 
@@ -380,17 +380,20 @@ pub enum ThreadState {
     Resolved,
 }
 
-/// A single inline comment in a thread (`git.comment.created`). The body is the GIT-P17 single-author
-/// CAS floor (opaque [`BodyRef`] here). The stable `#comment-<id>` opaque id is the mint
-/// [`crate::subs::mint_pr_comment`] produces; here it is carried as a `u128`.
+/// A single inline comment in a thread (`git.comment.created`). The body is the frozen
+/// [`crate::body::Body`] (`myelin-content` markdown-subset + the three structured inline nodes;
+/// single-author CAS; the content-node → `refs.edge.created` producer, GIT-P17). The stable
+/// `#comment-<id>` opaque id is the mint [`crate::subs::mint_pr_comment`] produces; here it is carried
+/// as a `u128`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Comment {
     /// The stable opaque comment id (`#comment-<id>`, 5.7) — survives edits.
     pub id: u128,
     /// The comment author's OPAQUE pseudonym (GIT-1).
     pub author_pseudonym: String,
-    /// The opaque per-subject-DEK body handle (GIT-P17 floor).
-    pub body: BodyRef,
+    /// The comment body — a frozen [`crate::body::Body`] (the content-node → `refs.edge.created`
+    /// producer, GIT-P17). The per-subject-DEK at-rest seal rides the GIT-P20 store.
+    pub body: Body,
     /// `true` iff the comment author is an agent (ADR-08 legibility — labelled, never disguised).
     pub is_agent: bool,
 }
@@ -1024,7 +1027,7 @@ mod tests {
     // ════════ 3. THREAD LIFECYCLE ════════
 
     fn a_comment(id: u128) -> Comment {
-        Comment { id, author_pseudonym: "psn:alice".into(), body: BodyRef::default(), is_agent: false }
+        Comment { id, author_pseudonym: "psn:alice".into(), body: Body::empty(), is_agent: false }
     }
 
     #[test]
