@@ -45,8 +45,8 @@
         <path id="n1" d="M12 9 C13.6569 9, 15 10.3431, 15 12 C15 13.6569, 13.6569 15, 12 15 C10.3431 15, 9 13.6569, 9 12 C9 10.3431, 10.3431 9, 12 9Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
   </symbol>
   <symbol id="cycle" viewBox="0 0 24 24">
-    <path id="r1" d="M14 4.5 A8 8 0 0 1 20 12 A8 8 0 0 1 12 20 A8 8 0 0 1 4 12 A8 8 0 0 1 9 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
-        <path id="ah" d="M5 6 L9 5 L10 9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+    <path id="r1" d="M9.26 4.48 A8 8 0 0 0 4 12 A8 8 0 0 0 12 20 A8 8 0 0 0 20 12 A8 8 0 0 0 14.74 4.48" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+        <path id="ah" d="M18.3 2.25 L14.74 4.48 L16.04 8.47" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
   </symbol>
   <symbol id="database" viewBox="0 0 24 24">
     <path id="t1" d="M12 4 C15.866 4, 19 5.11929, 19 6.5 C19 7.88071, 15.866 9, 12 9 C8.13401 9, 5 7.88071, 5 6.5 C5 5.11929, 8.13401 4, 12 4Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
@@ -157,8 +157,8 @@
         <path id="m1" d="M13 7 L16 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
   </symbol>
   <symbol id="rerun" viewBox="0 0 24 24">
-    <path id="a1" d="M15 4.5 A8 8 0 0 1 20 12 A8 8 0 0 1 12 20 A8 8 0 0 1 4 12 A8 8 0 0 1 10 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
-        <path id="ah" d="M19 6 L15 4.5 L14 9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+    <path id="a1" d="M14.74 4.48 A8 8 0 0 1 20 12 A8 8 0 0 1 12 20 A8 8 0 0 1 4 12 A8 8 0 0 1 9.26 4.48" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+        <path id="ah" d="M5.7 2.25 L9.26 4.48 L7.96 8.47" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
   </symbol>
   <symbol id="roadmap" viewBox="0 0 24 24">
     <path id="bar1" d="M4 7 L14 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />

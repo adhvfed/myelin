@@ -185,7 +185,7 @@
     },
     {
       "name": "cycle",
-      "meaning": "Cycle / sprint (loop + arrowhead)",
+      "meaning": "Cycle / sprint / iteration (counter-clockwise circular arrow)",
       "tags": [
         "cycle",
         "sprint",
@@ -603,7 +603,7 @@
     },
     {
       "name": "rerun",
-      "meaning": "Re-run a check / job (circular arrow)",
+      "meaning": "Re-run a check / job (clockwise circular arrow)",
       "tags": [
         "ci",
         "rerun",
