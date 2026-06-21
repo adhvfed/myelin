@@ -729,12 +729,25 @@ title = "ToolHands::exec (unified sandbox)"
 # Its CDC (cdc_8_4_exec_routing.rs) pins the AGENT-FABRIC CONSUMER half (the runner-seam PROVIDER
 # driving the four guarantees in order; the Fabric CONSUMER routing compute → sandbox + refusing a
 # mutate). The ZERO-escapes real-kernel GATE proving guarantee #4 is CI-P5 (→ P-239) / AG-P17 (→
-# P-229); the Firecracker backend is CI-P2 (→ P-237). Those are runner IMPL/GATE follow-ons, not
-# contract-pair gaps — the 8.4 seam pair carries both the runner-seam AND the agent-fabric halves NOW.
+# P-229); the Firecracker backend is CI-P2 (→ P-237).
+#
+# DRILL-AS-GATE consumed at AG-P17 (→ P-229): the CI side ran the real-kernel escape drill on a real
+# Firecracker microVM and emitted a GREEN EscapeAttestation (CI-P5 → P-239). The FABRIC half CONSUMES
+# that attestation (myelin-agent-service::escape_gate::AgentExecGate — it does NOT re-implement the
+# drill nor fork the attestation type) as a FAIL-CLOSED gate on the exec dispatch path: a
+# SandboxToolHands / AgentJobDispatcher cannot be constructed without a GREEN AgentExecGate for the
+# production backend (ZERO escapes, matching kernel/rootfs/corpus identity) — so no green attestation
+# ⇒ no untrusted compute, encoded in the TYPE (never a hardcoded true). The consumer CDC
+# (cdc_8_4_escape_gate.rs) proves the Fabric exec path is fail-closed without a green attestation and
+# admits with one; the integration test (integration_escape_gate.rs, integration-gated) consumes the
+# REAL P-239 artifact. There is NO floor on AG-D4 (ZERO escapes is floor + full answer; a PERMANENT
+# GATE re-run on every backend/image/kernel change); the M4 re-confirm is AG-P21 (→ P-348); the real
+# LlmAgentRuntime against this runner is post-M5 (AG-P25). These are follow-ons, not pair gaps.
 status = "covered"
 cdc = [
     "crates/myelin-ci-sandbox/tests/cdc_8_4_unified_sandbox.rs",
     "crates/myelin-agent-service/tests/cdc_8_4_exec_routing.rs",
+    "crates/myelin-agent-service/tests/cdc_8_4_escape_gate.rs",
 ]
 
 [[contract]]

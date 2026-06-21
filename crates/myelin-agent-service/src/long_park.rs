@@ -69,6 +69,7 @@
 //! --workspace` stays DB-free; no new `integration` feature here (no new data-layer contract is
 //! crossed — recorded in the P-228 report).
 
+use crate::escape_gate::AgentExecGate;
 use crate::exec::{RoutingError, SandboxJob};
 use myelin_agent::{Command, ToolDef};
 use myelin_ci_sandbox::{
@@ -145,10 +146,17 @@ impl LongParkOutcome {
 /// digest-pin / pids.max / timeout / egress / token-scrub hardening), it is just completed-by-signal
 /// instead of in-line. There is NO second hardening profile and NO host-exec bypass.
 ///
-/// **GATED BY AG-D4.** The real backend executes untrusted code in the kernel sandbox — the
-/// production binding MUST NOT run until the sandbox-escape gate AG-D4 is GREEN (AG-P17 → P-229 /
-/// CI-P5). The backend is CI's (`myelin-ci-sandbox`); the Fabric feeds it the hardened spec.
+/// **GATED BY AG-D4 — STRUCTURALLY (AG-P17 → P-229).** The real backend executes untrusted code in
+/// the kernel sandbox, so this dispatcher carries an [`AgentExecGate`] — a value obtainable ONLY from
+/// a GREEN [`EscapeAttestation`](myelin_ci_sandbox::EscapeAttestation) for the production backend. The
+/// dispatcher has no constructor without it (mirroring [`crate::exec::SandboxToolHands`]), so the
+/// long-park dispatch is fail-closed on AG-D4 exactly like the in-line `exec` form: no green
+/// attestation ⇒ no `AgentJobDispatcher` ⇒ no untrusted compute. The backend is CI's
+/// (`myelin-ci-sandbox`); the Fabric feeds it the hardened spec.
 pub struct AgentJobDispatcher<'a, B: SandboxBackend> {
+    /// The AG-D4 / CI-T1 escape gate (AG-P17 → P-229) — its existence is the proof a green escape
+    /// attestation for the production backend was consumed (fail-closed: no green ⇒ no dispatcher).
+    gate: AgentExecGate,
     /// The unified-sandbox backend (CI owns it; the Fabric feeds the hardened `kind=agent` spec).
     backend: &'a B,
     /// The pre-built HARDENED `kind=agent` job (the four-guarantee profile, AG-P15). The engine's
@@ -163,13 +171,24 @@ impl<'a, B: SandboxBackend> AgentJobDispatcher<'a, B> {
     /// Build the long-park dispatcher over the unified-sandbox `backend` for the hardened `job` (the
     /// `kind=agent` four-guarantee spec). Usually constructed by [`dispatch_long_compute`], which
     /// builds the hardened job from a `compute` `ToolDef`+`Command` and binds it here.
-    pub fn new(backend: &'a B, job: SandboxJob) -> AgentJobDispatcher<'a, B> {
-        AgentJobDispatcher { backend, job }
+    ///
+    /// **The AG-D4 `gate` is a REQUIRED argument** — there is no constructor without it. The
+    /// dispatcher cannot exist (and therefore cannot hand untrusted compute to the backend) unless the
+    /// caller holds a GREEN [`AgentExecGate`] for the production backend (the structural fail-closed,
+    /// AG-P17 → P-229; mirrors [`crate::exec::SandboxToolHands::new`]).
+    pub fn new(gate: AgentExecGate, backend: &'a B, job: SandboxJob) -> AgentJobDispatcher<'a, B> {
+        AgentJobDispatcher { gate, backend, job }
     }
 
     /// The hardened `kind=agent` job this dispatcher async-dispatches (read-only view).
     pub fn job(&self) -> &SandboxJob {
         &self.job
+    }
+
+    /// The AG-D4 / CI-T1 escape gate this dispatcher runs under (read-only). Its existence is the
+    /// proof a green escape attestation for the production backend was consumed (AG-P17 → P-229).
+    pub fn gate(&self) -> &AgentExecGate {
+        &self.gate
     }
 }
 
@@ -242,6 +261,7 @@ impl<B: SandboxBackend> JobRunner for AgentJobDispatcher<'_, B> {
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_long_compute<B: SandboxBackend>(
     ctx: &mut WfCtx,
+    gate: AgentExecGate,
     backend: &B,
     def: &ToolDef,
     cmd: &Command,
@@ -252,10 +272,11 @@ pub fn dispatch_long_compute<B: SandboxBackend>(
     // non-`compute` tool is REFUSED LOUD here — it has no path to the sandbox (the type-level safety
     // boundary, AG-P15). The hardened SandboxJob carries the Fabric's own dispatch idem token (the
     // backend dedups a re-dispatch on it); the engine ALSO mints its OWN deterministic idem_token for
-    // the `job.done` wait — both are carried, bound through `long_job_target`.
+    // the `job.done` wait — both are carried, bound through `long_job_target`. The AG-D4 `gate`
+    // (AG-P17) gates the dispatcher fail-closed: no green attestation ⇒ no dispatcher.
     let job = build_long_job(def, cmd, &profile)?;
     let target = long_job_target(&job);
-    let dispatcher = AgentJobDispatcher::new(backend, job);
+    let dispatcher = AgentJobDispatcher::new(gate, backend, job);
 
     // Drive the engine's long-park idiom (9.2/9.4): dispatch-and-return + park-on-job.done +
     // idempotent completion. The engine owns the deterministic idem_token, the parking, the
@@ -276,6 +297,7 @@ pub fn dispatch_long_compute<B: SandboxBackend>(
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_long_compute_metered<B: SandboxBackend>(
     ctx: &mut WfCtx,
+    gate: AgentExecGate,
     backend: &B,
     def: &ToolDef,
     cmd: &Command,
@@ -286,7 +308,7 @@ pub fn dispatch_long_compute_metered<B: SandboxBackend>(
 ) -> Result<WfResult<LongParkOutcome>, RoutingError> {
     let job = build_long_job(def, cmd, &profile)?;
     let target = long_job_target(&job);
-    let dispatcher = AgentJobDispatcher::new(backend, job);
+    let dispatcher = AgentJobDispatcher::new(gate, backend, job);
     let engine_spec = JobSpec::new(JobKind::Agent, target);
     Ok(ctx
         .metered_schedule_and_run_job(engine_spec, &dispatcher, timeout_secs, cost, units)
@@ -501,6 +523,44 @@ mod tests {
         }
     }
 
+    /// A real GREEN AG-D4 gate for the long-park test (minted from the corpus parser — never
+    /// hardcoded). The long-park dispatcher requires it to exist at all (the structural fail-closed,
+    /// AG-P17 → P-229): no green attestation ⇒ no `AgentJobDispatcher` ⇒ no untrusted long compute.
+    fn green_gate() -> AgentExecGate {
+        use crate::escape_gate::ProductionBackendId;
+        use myelin_ci_sandbox::escape_corpus::{BEGIN_MARKER, END_MARKER};
+        use myelin_ci_sandbox::{
+            parse_console, Backend, BackendRun, EscapeAttestation, CORPUS, CORPUS_VERSION,
+        };
+        let id = ProductionBackendId {
+            backend: Backend::FirecrackerMicrovm,
+            rootfs_sha256: "rootfs-digest".into(),
+            kernel_sha256: "kernel-digest".into(),
+            corpus_version: CORPUS_VERSION,
+        };
+        let mut console = format!("{BEGIN_MARKER} corpus_version=1 kernel=6.1.168 guest_euid=0\n");
+        for atk in CORPUS {
+            console.push_str(&format!("{} CONTAINED\n", atk.id));
+        }
+        console.push_str(&format!("{END_MARKER}\n"));
+        let report = parse_console(&console);
+        let att = EscapeAttestation::from_green_drill(
+            "2026-06-21",
+            &report,
+            vec![BackendRun {
+                backend: Backend::FirecrackerMicrovm,
+                exercised: true,
+                residual_note: None,
+            }],
+            Backend::FirecrackerMicrovm,
+            "rootfs-digest",
+            "kernel-digest",
+            "6.1.168",
+        )
+        .unwrap();
+        AgentExecGate::admit(Some(&att), &id).unwrap()
+    }
+
     /// Deliver a `job.done` keyed on the engine's deterministic dispatch token (the runner echoes it).
     fn deliver_job_done(signals: &SignalStore, idem_token: &str, result: Vec<ArtifactRef>) {
         signals.deliver(SignalRow {
@@ -530,6 +590,7 @@ mod tests {
         let mut ctx = begin(&outbox, journal, signals);
         let out = dispatch_long_compute(
             &mut ctx,
+            green_gate(),
             &backend,
             &compute_def("agent.long_test"),
             &Command("--workspace".into()),
@@ -562,6 +623,7 @@ mod tests {
         let mut ctx = begin(&outbox, journal, signals);
         let _ = dispatch_long_compute(
             &mut ctx,
+            green_gate(),
             &backend,
             &compute_def("agent.long_test"),
             &Command("--workspace".into()),
@@ -607,6 +669,7 @@ mod tests {
         let mut ctx = begin(&outbox, journal, signals.clone());
         let out = dispatch_long_compute(
             &mut ctx,
+            green_gate(),
             &backend,
             &compute_def("agent.long_test"),
             &Command("--workspace".into()),
@@ -676,6 +739,7 @@ mod tests {
             .with_run_identity(lease.clone());
         let out1 = dispatch_long_compute(
             &mut c1,
+            green_gate(),
             &backend,
             &compute_def("agent.long_test"),
             &Command("--workspace".into()),
@@ -710,6 +774,7 @@ mod tests {
         .with_run_identity(lease);
         let out2 = dispatch_long_compute(
             &mut c2,
+            green_gate(),
             &backend,
             &compute_def("agent.long_test"),
             &Command("--workspace".into()),
@@ -750,6 +815,7 @@ mod tests {
             .with_timers(timers.clone(), 0, 1000);
         let out1 = dispatch_long_compute(
             &mut c1,
+            green_gate(),
             &backend,
             &compute_def("agent.long_test"),
             &Command("--workspace".into()),
@@ -778,6 +844,7 @@ mod tests {
         .with_timers(timers.clone(), 0, 9000);
         let out2 = dispatch_long_compute(
             &mut c2,
+            green_gate(),
             &backend,
             &compute_def("agent.long_test"),
             &Command("--workspace".into()),
@@ -819,6 +886,7 @@ mod tests {
         let mut ctx = begin(&outbox, journal, signals);
         let err = dispatch_long_compute(
             &mut ctx,
+            green_gate(),
             &backend,
             &mutate,
             &Command("x".into()),
