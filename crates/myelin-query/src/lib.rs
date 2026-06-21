@@ -32,19 +32,20 @@
 //! predicate language (the architecture/EI-01 §7 invariant — abstract at the third copy,
 //! and the third copy is already here).
 //!
-//! ## Floor named (this crate's grammar-surface, NOT the predicate engine)
-//! The predicate ENGINE (this module) is now real, and the **frozen `FieldType` enum +
-//! `FieldValue` + the `order_key`/LexoRank encoding (13.3, frozen X-3)** now land in [`field`]
-//! (see the DEVIATION note there). What is still a NAMED floor: the full frozen `QueryAst`
-//! **textual grammar parser** + the `ViewSpec` view-model — Issues + Knowledge's co-owned
-//! deliverable (their compilers/executors differ; the definitions are identical), landing in
-//! **P-235 (KN-P02)** and the Issues prompts, and the Bus matcher `subscribe`-time compile
-//! target in **P-137 (EB-17)**. Those prompts EXTEND this core in place (add the parser/view
-//! surfaces on top of the one [`Predicate`] tree + the one [`field::FieldType`] enum); they do
-//! NOT re-define a second predicate engine or a second field-type enum. The deviations
-//! (promoting the engine here, ahead of the prose `myelin-query freeze` dependency the topo-sort
-//! placed later — P-133; and landing the frozen `FieldType` here for SRCH-P04's structured shape
-//! to be typed over — P-167/[`field`]) are recorded at their sites.
+//! ## The 13.3 freeze surface (engine + field-type + view-model + grammar — all now real)
+//! The predicate ENGINE (this module) is real ([`Predicate`]/[`Expr`]/[`CmpOp`]/[`QueryAst`],
+//! P-133); the **frozen `FieldType` enum + `FieldValue` + the `order_key`/LexoRank encoding (13.3,
+//! frozen X-3)** live in [`field`] (P-167, see the DEVIATION note there). **P-235 (KN-P02)** —
+//! this slice — lands the **last two halves of the 13.3 primitive**: the frozen [`view::ViewSpec`]
+//! view-model and the textual [`parse`] grammar front-end (`"status == 'open'"` → a validated
+//! [`Predicate`] tree). These EXTEND the one core in place — they add the view-model + the parser
+//! ON TOP of the one [`Predicate`] tree + the one [`field::FieldType`] enum; they do **NOT**
+//! re-define a second predicate engine, a second field-type enum, or a second view-filter language.
+//! The Bus matcher `subscribe`-time compile target is **P-137 (EB-17)** (it reuses this same
+//! grammar + parser). Issues co-owns these definitions byte-identically (its prompts build their
+//! own *executor* against the SAME [`ViewSpec`]/[`QueryAst`]). The deviations (promoting the engine
+//! here ahead of the prose freeze dependency — P-133; landing `FieldType` here for SRCH-P04 —
+//! P-167) are recorded at their sites; **no NAMED floor remains in the 13.3 grammar surface**.
 
 use myelin_identity::Literal;
 use serde::{Deserialize, Serialize};
@@ -54,6 +55,12 @@ pub mod field;
 pub use field::{
     FieldType, FieldValue, OrderKey, LEXORANK_ALPHABET, LEXORANK_REBALANCE_LEN,
 };
+
+pub mod view;
+pub use view::{FieldId, SortDir, SortSpec, ViewKind, ViewSpec};
+
+pub mod parse;
+pub use parse::{parse_predicate, parse_query, ParseError, MAX_PARSE_DEPTH};
 
 pub mod matcher;
 pub use matcher::{
@@ -143,6 +150,23 @@ impl QueryAst {
             raw: String::new(),
             predicate: Some(predicate),
         })
+    }
+
+    /// Build an AST from a compiled [`Predicate`] tree **while retaining the textual source**
+    /// the grammar parser ([`parse::parse_query`]) compiled it from. The tree is validated
+    /// against the static cost bound exactly like [`QueryAst::compiled`]; the source is kept for
+    /// observability and round-trip recovery. This is the constructor the **P-235 grammar
+    /// front-end** uses — it does NOT introduce a second engine, it wraps the ONE validated tree.
+    pub fn compiled_with_source(
+        predicate: Predicate,
+        source: impl Into<String>,
+    ) -> QueryAst {
+        // The parser already re-validates; this constructor is infallible by contract (the parser
+        // never hands an over-budget tree). We still keep the validated tree as the source of truth.
+        QueryAst {
+            raw: source.into(),
+            predicate: Some(predicate),
+        }
     }
 
     /// The legacy placeholder surface: a not-yet-parsed textual predicate (the P-001 seam,

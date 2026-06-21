@@ -30,9 +30,10 @@
 //!   taxonomy is complete, but its v1 engine is a read-projection FLOOR (renders like
 //!   `embed`, §2.4) shipped in **KN-P12**; the editable-in-place multi-home follow-on is
 //!   post-M5 (KQ-6, designed against the CRDT).
-//! - **`db_view.view`** ([`block::ViewHandle`]): carried as an [`ArtifactRef`]-keyed view
-//!   handle until `myelin-query::ViewSpec` is frozen in **KN-P02**, which swaps in the
-//!   structured `ViewSpec` (a single compile break).
+//! - **`db_view.view`**: RESOLVED in **KN-P02 (P-235)** — the KN-P01 `ViewHandle` floor is
+//!   gone; the `db_view` block now carries the frozen `myelin_query::ViewSpec` (13.3, X-3)
+//!   directly. The **ADF → `myelin-content` lossy-map (13.2)** also lands here ([`adf`]):
+//!   Knowledge freezes the conversion table; Issues consumes it at import.
 //! - **WASM-artifact green** (KN-D2 second leg): the crate is structured `std`-only and
 //!   dependency-clean so it builds for `wasm32-unknown-unknown` from this one source; the
 //!   `build-wasm.sh` script + the `wasm-render-path` integration test gate it. On a host
@@ -42,12 +43,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod adf;
 pub mod block;
 pub mod corpus;
 pub mod inline;
 
+pub use adf::{AdfMapping, AdfNode, AdfTarget, ImportReport, Loss, LossyConversion, MAP};
 pub use block::{
-    Block, CalloutTone, Cell, Column, EmbedDisplay, HeadingLevel, ListItem, TaskItem, ViewHandle,
+    Block, CalloutTone, Cell, Column, EmbedDisplay, HeadingLevel, ListItem, TaskItem,
 };
 pub use inline::{parse_inline, serialize_inline, Inline, InlineNode, Mark, Span, OBJ};
 

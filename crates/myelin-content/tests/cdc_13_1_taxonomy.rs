@@ -9,9 +9,10 @@
 
 use myelin_content::{
     parse_inline, serialize_inline, Block, CalloutTone, Cell, Column, EmbedDisplay, HeadingLevel,
-    Inline, InlineNode, ListItem, TaskItem, ViewHandle,
+    Inline, InlineNode, ListItem, TaskItem,
 };
 use myelin_events::ArtifactRef;
+use myelin_query::{FieldId, ViewSpec};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_tenancy::TenantId;
 
@@ -47,7 +48,7 @@ fn provider_full_taxonomy() -> Vec<Block> {
         Block::Divider,
         Block::Image { blob: ArtifactRef("myelin://acme/blob/1".into()), alt: "a".into(), caption: None },
         Block::Embed { reference: ArtifactRef("myelin://acme/issue/1".into()), display: EmbedDisplay::Card },
-        Block::DbView { db: ArtifactRef("myelin://acme/db/1".into()), view: ViewHandle { view_ref: ArtifactRef("myelin://acme/view/1".into()) } },
+        Block::DbView { db: ArtifactRef("myelin://acme/db/1".into()), view: ViewSpec::table(FieldId::new("order_key")) },
         Block::Toggle { summary: Inline::default(), blocks: vec![] },
         Block::SyncBlock { source: ArtifactRef("myelin://acme/block/9".into()) },
     ]
