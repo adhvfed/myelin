@@ -48,6 +48,13 @@ myelin-refs = { path = "../myelin-refs" }
 # leaf consumer (it depends on -tenancy/-events/-identity/-refs/-content/-query/-substrate) and does
 # NOT depend back on `myelin-agent` or `myelin-agent-service`, so this edge keeps the DAG acyclic.
 myelin-notif = { path = "../myelin-notif" }
+# AG-P12 (→ P-224) — the reference gate (one of the five structural loop guards) keys on the
+# FROZEN 13.1 inline ref nodes: ONLY a structured `InlineNode::ArtifactRefNode` may re-trigger a run;
+# raw typed text NEVER does. `myelin-content` owns the three platform-load-bearing inline nodes
+# (`Mention`/`ArtifactRefNode`/`Embed`, contract 13.1). It is a leaf substrate crate (depends only on
+# -events/-identity/-tenancy below this crate) and does NOT depend back on -agent/-agent-service, so
+# this edge keeps the DAG acyclic.
+myelin-content = { path = "../myelin-content" }
 # The SKELETON's terminal trace event carries a references-not-payloads JSON payload (the trace
 # `ArtifactRef`); serde_json builds the `EventDraft.payload` value (it was a dev-dep for AG-P2's
 # round-trip test; the SKELETON's emit needs it at lib scope).
@@ -68,6 +75,14 @@ tokio = { workspace = true, optional = true }
 [dev-dependencies]
 # The migration test re-uses the storage online runner; serde_json round-trips the trace ArtifactRef.
 serde_json.workspace = true
+# AG-P12 (→ P-224, AG-D7) — the M0 failure-injection harness: the tenant-scoped DependencyBreaker
+# (Broker seam, the SAME one FLOW-D5/D6/D7 use) models the adversarial agent->agent self-trigger loop,
+# and the SignalSource/Predicate assertion library gives the AG-D7 drill a TYPED green/red (causal-depth
+# <= ceiling, 0 fork, tripwire fired) that is never a swallowed pass (EI-01 §3). Dev-dep only.
+myelin-harness = { path = "../myelin-harness" }
+# The CDC + drill build the inbound EventEnvelope / InlineNode fixtures the guards read (3.6 dispatch
+# tier, 13.1 inline ref nodes). myelin-content/-events/-identity/-tenancy are already lib deps; the
+# fixtures use them at test scope.
 
 [features]
 default = []
