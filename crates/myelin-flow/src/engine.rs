@@ -96,6 +96,12 @@ pub enum DriveOutcome {
     Completed(Vec<ArtifactRef>),
     /// The workflow function FAILED (an un-handled activity exhaustion) — the run is `failed`.
     Failed(String),
+    /// **The replay-DIVERGENCE verdict (P-FLOW-07, FLOW-D2).** The workflow body diverged from its
+    /// journal on replay (a command-kind mismatch at a journaled position, or a pinned-`wf_version`
+    /// mismatch) — the run is HALTED as `nondeterministic` and DEAD-LETTERED, never silently
+    /// continued. Carries the machine divergence reason (no PII). The nondeterministic-halt telemetry
+    /// counter increments by exactly one per occurrence (the FLOW-D2 green artifact).
+    Nondeterministic(String),
 }
 
 /// The `workflow_run` row the engine leases + drives (a working subset of [`crate::schema::WorkflowRunRow`]:
@@ -112,6 +118,12 @@ pub struct RunRow {
     pub run_id: String,
     /// the registered definition name (e.g. `agent.run`) — the body `drive` runs (§3.1).
     pub wf_type: String,
+    /// **the definition version PINNED at start (§4.6).** The replay-divergence guard (P-FLOW-07)
+    /// compares it against the version of the definition the engine is replaying with; a mismatch (a
+    /// deploy bumped the definition while the run was in flight) halts the run as `nondeterministic`.
+    /// Defaults to 1 for a run seeded without an explicit pin (`new_runnable`); the executor stamps
+    /// the real pinned version on start.
+    pub wf_version: i32,
     /// the ONE lifecycle state column (running|waiting|completed|failed) — §3.1.
     pub state: String,
     /// the highest applied history seq — the replay short-circuit floor (§3.1).
@@ -140,12 +152,29 @@ impl RunRow {
             region,
             run_id: run_id.into(),
             wf_type: wf_type.into(),
+            wf_version: 1,
             state: run_state::RUNNING.into(),
             cursor: 0,
             partition,
             lease_owner: None,
             lease_expires: None,
         }
+    }
+
+    /// A fresh runnable run pinned to an explicit `wf_version` (§4.6) — the executor stamps the
+    /// pinned definition version so the divergence guard can detect a deploy that bumps the
+    /// definition while the run is in flight.
+    pub fn new_runnable_versioned(
+        tenant: TenantId,
+        region: Region,
+        run_id: impl Into<String>,
+        wf_type: impl Into<String>,
+        wf_version: i32,
+        partition: i16,
+    ) -> Self {
+        let mut row = Self::new_runnable(tenant, region, run_id, wf_type, partition);
+        row.wf_version = wf_version;
+        row
     }
 }
 
@@ -295,6 +324,13 @@ struct TelemetryInner {
     /// (an `activity_failed` terminal). A monotonic `+=` — the dead-letter signal the §1.8 contract
     /// names. NON-zero is the "an activity could not be made to succeed" health signal.
     dead_letter_count: u64,
+    /// **the nondeterministic-HALT counter (the FLOW-D2 green artifact, §1.8 / contract 1.8).** A
+    /// monotonic `+=` incremented EXACTLY ONCE each time the replay-divergence guard halts a run as
+    /// `nondeterministic` (a body that diverged from its journal, or a pinned-`wf_version` mismatch).
+    /// The FLOW-D2 drill asserts it increments by EXACTLY the injected divergence count — and that 0
+    /// divergences silently continued. NON-zero is the "a workflow body diverged on replay" health
+    /// signal; the run is dead-lettered, never silently continued.
+    nondeterministic_halt_count: u64,
 }
 
 impl FlowTelemetry {
@@ -340,6 +376,21 @@ impl FlowTelemetry {
     /// Monotonic `+=` (the dead-letter signal).
     pub fn record_dead_letter(&self) {
         self.lock().dead_letter_count += 1;
+    }
+
+    /// **Record one nondeterministic HALT (the FLOW-D2 green artifact, §1.8).** Incremented EXACTLY
+    /// once when the replay-divergence guard halts a run as `nondeterministic` + dead-letters it.
+    /// Monotonic `+=` — the FLOW-D2 drill reads it to assert the guard fired by exactly the injected
+    /// divergence count (and that 0 divergences silently continued).
+    pub fn record_nondeterministic_halt(&self) {
+        self.lock().nondeterministic_halt_count += 1;
+    }
+
+    /// The nondeterministic-halt counter (the FLOW-D2 green artifact, §1.8) — total runs the
+    /// divergence guard halted as `nondeterministic`. 0 on a healthy fleet; each `+=` is a dead-
+    /// lettered divergent run.
+    pub fn nondeterministic_halt_count(&self) -> u64 {
+        self.lock().nondeterministic_halt_count
     }
 
     /// The activity-queue-depth gauge (§1.8) — the activity work queued.
@@ -411,6 +462,11 @@ pub type WorkflowBody = dyn Fn(&mut WfCtx) -> Result<Vec<ArtifactRef>, String>;
 ///
 /// `now_clock`/`rand_seed` seed the LIVE side-markers (a replayed `now()`/`rand()` returns its
 /// CAPTURED value, not these — §4.1). Returns the [`DriveOutcome`] and the new cursor.
+///
+/// **The version-divergence leg (§4.6) is NOT armed here** — this version-agnostic `drive` replays
+/// against whatever body is registered (the kind-divergence guard still fires). Use
+/// [`drive_versioned`] on the replay path where the run's pinned `wf_version` is known, so a deploy
+/// that bumped the definition while the run was in flight halts as `nondeterministic`.
 #[allow(clippy::too_many_arguments)]
 pub fn drive(
     runs: &RunStore,
@@ -424,12 +480,40 @@ pub fn drive(
     rand_seed: u64,
     body: &WorkflowBody,
 ) -> DriveOutcome {
+    // Version-agnostic: pin == replay (the version-divergence leg is disarmed; the kind guard fires).
+    drive_versioned(
+        runs, outbox, journal, telemetry, minter, ctx_base, run, now_clock, rand_seed, body, 1, 1,
+    )
+}
+
+/// **Drive a workflow run WITH the version-divergence leg armed (P-FLOW-07, §4.6).** Identical to
+/// [`drive`] but threads the run's pinned `wf_version` (`run_version`, recorded at start) and the
+/// version of the definition the engine is REPLAYING with (`replay_version`). If they MISMATCH — a
+/// deploy bumped the definition while the run was in flight — the replay-divergence guard halts the
+/// run as `nondeterministic` + dead-letters it BEFORE running a command (replaying a new body over an
+/// old journal is a silent divergence). A MATCH drives exactly as [`drive`] (the kind-divergence
+/// guard still applies over the journal).
+#[allow(clippy::too_many_arguments)]
+pub fn drive_versioned(
+    runs: &RunStore,
+    outbox: &OutboxStore,
+    journal: &crate::wfctx::WfJournal,
+    telemetry: &FlowTelemetry,
+    minter: Arc<dyn IdMinter>,
+    ctx_base: EmitContextBase,
+    run: &RunRow,
+    now_clock: impl Into<String>,
+    rand_seed: u64,
+    body: &WorkflowBody,
+    run_version: i32,
+    replay_version: i32,
+) -> DriveOutcome {
     let tenant = run.tenant.clone();
     // Load the journal so far (the replay prefix the body short-circuits over §4.1).
     let history: Vec<WfHistoryRow> = journal.history_for(&tenant, &run.run_id);
     let journaled_commands = history.len() as u64;
 
-    let mut ctx = WfCtx::resume(
+    let mut ctx = WfCtx::resume_versioned(
         outbox,
         minter,
         journal.clone(),
@@ -439,6 +523,8 @@ pub fn drive(
         now_clock,
         rand_seed,
         history,
+        run_version,
+        replay_version,
     );
 
     // Run the body. It replays the journaled commands (short-circuit, 0 side effect) then runs the
@@ -451,6 +537,32 @@ pub fn drive(
     // The replay accounting: the drive REPLAYED `journaled_commands` commands (short-circuited) and
     // EXECUTED `side_effects_executed` activity closures live; `double_effects` MUST be 0.
     telemetry.record_drive(journaled_commands, side_effects_executed, double_effects);
+
+    // **THE REPLAY-DIVERGENCE GUARD (P-FLOW-07, FLOW-D2).** If the body DIVERGED from its journal on
+    // replay (a command-kind mismatch at a journaled position, or a pinned-`wf_version` mismatch), the
+    // run is HALTED as `nondeterministic` and DEAD-LETTERED — it is NEVER silently continued (a silent
+    // divergence is a Tier-1 failure, EI-01 §2; a red gate is information, never invert it, EI-01 §3).
+    // We DROP the `WfCtx` WITHOUT committing — the divergent drive's partial journal rows are
+    // discarded (they would corrupt the journal), and the run's cursor is UNCHANGED (the journal
+    // source-of-truth is preserved as it was at the crash/divergence point). The
+    // nondeterministic-halt counter increments by EXACTLY one (the FLOW-D2 green artifact). The
+    // divergence reason is surfaced (no PII) so an operator can see WHICH position diverged.
+    if let Some(reason) = ctx.divergence() {
+        let reason = reason.to_string();
+        drop(ctx); // discard the divergent drive's staged journal/outbox rows — 0 corruption.
+        telemetry.record_nondeterministic_halt();
+        // Dead-letter the run: settle it `nondeterministic` (terminal, never re-driven) WITHOUT
+        // advancing the cursor (the journal is unchanged — the guard rewrote nothing).
+        runs.settle(
+            &tenant,
+            &run.run_id,
+            run.cursor,
+            run_state::NONDETERMINISTIC,
+        );
+        let lag = runs.runnable_lag(run.partition, i64::MAX) as u64;
+        telemetry.set_runnable_lag(lag);
+        return DriveOutcome::Nondeterministic(reason);
+    }
 
     // Co-commit the newly-journaled commands + their emits (FLOW-D5). A failed co-commit leaves the
     // journal untouched (the drive is retried by a re-lease).
@@ -496,6 +608,11 @@ pub struct FlowDispatcher {
     worker: String,
     lease_ttl_secs: i64,
     bodies: HashMap<String, Box<WorkflowBody>>,
+    /// **the version of each registered definition the engine is RUNNING (§4.6).** The divergence
+    /// guard compares it against the run's pinned `wf_version`; a mismatch (a deploy bumped the body)
+    /// halts the run as `nondeterministic`. Defaults to 1 per registered type ([`Self::register`]);
+    /// [`Self::register_versioned`] sets an explicit running version.
+    running_versions: HashMap<String, i32>,
 }
 
 impl FlowDispatcher {
@@ -525,13 +642,30 @@ impl FlowDispatcher {
             worker: worker.into(),
             lease_ttl_secs,
             bodies: HashMap::new(),
+            running_versions: HashMap::new(),
         }
     }
 
     /// Register a deterministic workflow body under its `wf_type` (the definition registry seam,
-    /// §3.6 — populated by the DurableExecutor at P-FLOW-06).
+    /// §3.6 — populated by the DurableExecutor at P-FLOW-06). The running version defaults to 1.
     pub fn register(&mut self, wf_type: impl Into<String>, body: Box<WorkflowBody>) {
-        self.bodies.insert(wf_type.into(), body);
+        let wf_type = wf_type.into();
+        self.running_versions.insert(wf_type.clone(), 1);
+        self.bodies.insert(wf_type, body);
+    }
+
+    /// Register a deterministic workflow body under its `wf_type` at an explicit RUNNING `wf_version`
+    /// (§4.6) — so the divergence guard halts a run pinned to a DIFFERENT version (a deploy bumped
+    /// the body while the run was in flight). The body is the version-`wf_version` definition.
+    pub fn register_versioned(
+        &mut self,
+        wf_type: impl Into<String>,
+        wf_version: i32,
+        body: Box<WorkflowBody>,
+    ) {
+        let wf_type = wf_type.into();
+        self.running_versions.insert(wf_type.clone(), wf_version);
+        self.bodies.insert(wf_type, body);
     }
 
     /// **One worker tick (§4.7): lease one runnable run and drive it.** Leases the next runnable run
@@ -545,7 +679,15 @@ impl FlowDispatcher {
             .runs
             .lease_runnable(self.partition, &self.worker, now, self.lease_ttl_secs)?;
         let body = self.bodies.get(&run.wf_type)?;
-        let outcome = drive(
+        // **The version-divergence leg (§4.6):** drive with the run's PINNED `wf_version` against the
+        // version the engine is RUNNING for this `wf_type`. A mismatch (a deploy bumped the body while
+        // the run was in flight) halts the run as `nondeterministic` (the divergence guard).
+        let replay_version = self
+            .running_versions
+            .get(&run.wf_type)
+            .copied()
+            .unwrap_or(run.wf_version);
+        let outcome = drive_versioned(
             &self.runs,
             &self.outbox,
             &self.journal,
@@ -556,6 +698,8 @@ impl FlowDispatcher {
             now_clock,
             rand_seed,
             body.as_ref(),
+            run.wf_version,
+            replay_version,
         );
         Some(outcome)
     }
@@ -861,21 +1005,22 @@ mod tests {
         assert_eq!(journal.history_for(&tenant(), "R1").len(), 1, "the failure is journaled");
     }
 
-    /// **A drive that RE-EXECUTES a journaled command propagates the double-effect to the telemetry
-    /// (the FLOW-D1 floor probe end-to-end, §4.1).** We force the divergence: position 0 is journaled
-    /// as a `side_marker` (a `now()`), then a re-drive issues an `activity` at position 0 — the
-    /// activity-replay short-circuit does not match the marker, so it executes LIVE against a
-    /// journaled command, and `record_drive` increments the telemetry's double-effect counter. Pins
-    /// the `double_effect_count +=` in `record_drive` (a regression would leave the floor silent).
+    /// **FLOW-D2 CORE (P-FLOW-07): a divergent replay HALTS the run as `nondeterministic` +
+    /// DEAD-LETTERS it — 0 silent divergence, 0 double-effect.** Position 0 is journaled as a
+    /// `side_marker` (a `now()`); a re-drive issues an `activity` at position 0 — the body diverged
+    /// from its journal. The `drive` divergence guard HALTS: the run settles `nondeterministic`
+    /// (terminal, dead-lettered), the activity does NOT run live (0 double-effect), the divergent
+    /// drive's partial journal is DISCARDED (the journal stays exactly the 1 marker row), and the
+    /// nondeterministic-halt counter increments by EXACTLY 1 (the FLOW-D2 green artifact).
     #[test]
-    fn drive_propagates_a_double_effect_to_telemetry() {
+    fn divergent_replay_halts_nondeterministic_and_dead_letters() {
         let runs = RunStore::new();
         let outbox = OutboxStore::new();
         let journal = WfJournal::new();
         let tele = FlowTelemetry::new();
         runs.put(RunRow::new_runnable(tenant(), region(), "R1", "agent.run", 0));
 
-        // journal a side-marker (a now()) at position 0, leave the run runnable.
+        // journal a side-marker (a now()) at position 0, leave the run runnable at cursor 1.
         {
             let mut ctx = WfCtx::begin(
                 &outbox, minter(), journal.clone(), ctx_base(), "R1", "agent.run",
@@ -883,24 +1028,141 @@ mod tests {
             );
             let _ = ctx.now();
             ctx.commit().expect("co-commit the marker");
+            let mut r = runs.get(&tenant(), "R1").unwrap();
+            r.cursor = 1;
+            runs.put(r);
         }
-        // re-drive with an ACTIVITY at position 0 — the divergence re-executes the journaled command.
+        // re-drive with an ACTIVITY at position 0 — the divergence. The guard HALTS, does not re-exec.
+        let ran = std::sync::Arc::new(Mutex::new(false));
+        let ran2 = ran.clone();
         let run = runs.get(&tenant(), "R1").unwrap();
-        let body: Box<WorkflowBody> = Box::new(|ctx: &mut WfCtx| {
-            ctx.activity(RetryPolicy::default_policy(), |_i, _a| {
+        let body: Box<WorkflowBody> = Box::new(move |ctx: &mut WfCtx| {
+            let ran3 = ran2.clone();
+            ctx.activity(RetryPolicy::default_policy(), move |_i, _a| {
+                *ran3.lock().unwrap() = true; // would flip IF the divergent activity ran live.
+                Ok(vec![ArtifactRef("myelin://acme/agent/effect/SHOULD-NOT-RUN".into())])
+            })
+            .map_err(|e| format!("{e:?}"))?;
+            Ok(vec![])
+        });
+        let outcome = drive(
+            &runs, &outbox, &journal, &tele, minter(), ctx_base(), &run,
+            "2026-06-21T00:00:00Z", 7, body.as_ref(),
+        );
+
+        // THE FLOW-D2 ASSERTIONS:
+        assert!(
+            matches!(outcome, DriveOutcome::Nondeterministic(_)),
+            "the drive halts as Nondeterministic, got {outcome:?}"
+        );
+        assert!(!*ran.lock().unwrap(), "the divergent activity did NOT run live (the guard halted it)");
+        let settled = runs.get(&tenant(), "R1").expect("run row");
+        assert_eq!(
+            settled.state,
+            run_state::NONDETERMINISTIC,
+            "the run is dead-lettered as nondeterministic (terminal)"
+        );
+        assert!(run_state::is_terminal(&settled.state), "nondeterministic is terminal — never re-driven");
+        assert!(settled.lease_owner.is_none(), "the lease is released on the halt");
+        assert_eq!(settled.cursor, 1, "the cursor is UNCHANGED (the guard rewrote no journal)");
+        // the divergent drive's partial journal was DISCARDED — only the original marker row survives.
+        assert_eq!(
+            journal.history_for(&tenant(), "R1").len(),
+            1,
+            "the journal is unchanged (the divergent drive committed NOTHING — 0 corruption)"
+        );
+        assert_eq!(tele.double_effect_count(), 0, "0 double-effect — the divergence is a halt, not a re-exec");
+        // THE GREEN ARTIFACT: the nondeterministic-halt count incremented by EXACTLY 1.
+        assert_eq!(
+            tele.nondeterministic_halt_count(),
+            1,
+            "the nondeterministic-halt counter incremented by exactly the injected divergence count (1)"
+        );
+    }
+
+    /// **FLOW-D2 versioning leg (§4.6): a WRONG-VERSION replay HALTS as `nondeterministic`.** A run
+    /// pinned to `wf_version = 1` at start is re-driven by an engine running definition version 2 (a
+    /// deploy bumped the body while the run was in flight). `drive_versioned` halts the run BEFORE a
+    /// single command runs — replaying a new body over an old journal is a silent divergence. The
+    /// nondeterministic-halt counter increments by 1.
+    #[test]
+    fn wrong_version_replay_halts_nondeterministic() {
+        let runs = RunStore::new();
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        let tele = FlowTelemetry::new();
+        runs.put(RunRow::new_runnable(tenant(), region(), "R1", "agent.run", 0));
+
+        // a body whose activity would run IF the version guard did not halt first.
+        let ran = std::sync::Arc::new(Mutex::new(false));
+        let ran2 = ran.clone();
+        let run = runs.get(&tenant(), "R1").unwrap();
+        let body: Box<WorkflowBody> = Box::new(move |ctx: &mut WfCtx| {
+            let ran3 = ran2.clone();
+            ctx.activity(RetryPolicy::default_policy(), move |_i, _a| {
+                *ran3.lock().unwrap() = true;
                 Ok(vec![ArtifactRef("myelin://acme/agent/effect/e0".into())])
             })
             .map_err(|e| format!("{e:?}"))?;
             Ok(vec![])
         });
+        // the run was pinned to v1 at start; the engine is replaying with v2 — a version divergence.
+        let outcome = drive_versioned(
+            &runs, &outbox, &journal, &tele, minter(), ctx_base(), &run,
+            "2026-06-21T00:00:00Z", 7, body.as_ref(), 1, 2,
+        );
+        assert!(
+            matches!(outcome, DriveOutcome::Nondeterministic(ref r) if r.contains("wf_version")),
+            "the version mismatch halts as Nondeterministic naming the version pin, got {outcome:?}"
+        );
+        assert!(!*ran.lock().unwrap(), "the body did NOT run a command (the version guard halted first)");
+        assert_eq!(
+            runs.get(&tenant(), "R1").unwrap().state,
+            run_state::NONDETERMINISTIC,
+            "the wrong-version run is dead-lettered"
+        );
+        assert_eq!(tele.nondeterministic_halt_count(), 1, "the version-divergence halt counted once");
+        // a MATCHING version (v1 == v1) drives normally (the version leg does NOT false-positive).
+        runs.put(RunRow::new_runnable(tenant(), region(), "R2", "agent.run", 0));
+        let run2 = runs.get(&tenant(), "R2").unwrap();
+        let ok_body = n_activity_body(1, std::sync::Arc::new(Mutex::new(Vec::new())));
+        let outcome2 = drive_versioned(
+            &runs, &outbox, &journal, &tele, minter(), ctx_base(), &run2,
+            "2026-06-21T00:00:00Z", 7, ok_body.as_ref(), 1, 1,
+        );
+        assert!(matches!(outcome2, DriveOutcome::Completed(_)), "a matching version drives normally");
+        assert_eq!(tele.nondeterministic_halt_count(), 1, "no false-positive halt on a matching version");
+    }
+
+    /// **FLOW-D2: 0 SILENT divergence — a DETERMINISTIC replay never trips the guard.** A clean
+    /// crash-recovery re-drive (the FLOW-D1 happy path) replays its journal and completes WITHOUT
+    /// incrementing the nondeterministic-halt counter. This pins the guard does not fire on a healthy
+    /// replay (the "0 silent divergence" floor reads BOTH ways: the guard halts a divergence AND stays
+    /// silent on a deterministic run).
+    #[test]
+    fn deterministic_replay_does_not_trip_the_guard() {
+        let runs = RunStore::new();
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        let tele = FlowTelemetry::new();
+        runs.put(RunRow::new_runnable(tenant(), region(), "R1", "agent.run", 0));
+
+        // a full deterministic drive of 3 activities, then a clean re-drive of the SAME body.
+        let run = runs.get(&tenant(), "R1").unwrap();
         drive(
             &runs, &outbox, &journal, &tele, minter(), ctx_base(), &run,
-            "2026-06-21T00:00:00Z", 7, body.as_ref(),
+            "2026-06-21T00:00:00Z", 7, n_activity_body(3, std::sync::Arc::new(Mutex::new(Vec::new()))).as_ref(),
         );
+        let again = runs.get(&tenant(), "R1").unwrap();
+        let outcome = drive(
+            &runs, &outbox, &journal, &tele, minter(), ctx_base(), &again,
+            "2026-06-21T00:00:00Z", 7, n_activity_body(3, std::sync::Arc::new(Mutex::new(Vec::new()))).as_ref(),
+        );
+        assert!(matches!(outcome, DriveOutcome::Completed(_)), "the deterministic re-drive completes");
         assert_eq!(
-            tele.double_effect_count(),
-            1,
-            "the re-executed journaled command propagated exactly one double-effect to the telemetry"
+            tele.nondeterministic_halt_count(),
+            0,
+            "0 silent divergence: a deterministic replay NEVER trips the divergence guard"
         );
     }
 
