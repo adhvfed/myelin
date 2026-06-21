@@ -25,6 +25,13 @@
 //!   the one platform posture); the opaque `principal_id` still attributes the commit for authz
 //!   out-of-band. Floor: the audited history-rewrite path (a *body* expunge) is the M5/on-demand
 //!   follow-on (00-recon §X-7 / CR §9 10.6, Git+GDPR roadmaps).
+//! - [`notif_rules`] — **GIT-P19 / P-263 (M3)**: producer accretion — Git **registers** its
+//!   `define_notif_rule` set (review_requested / mentioned / watched, contract 7.6) into the frozen
+//!   `myelin_notif::NotifRuleRegistry` and **wires** its REAL PR/repo watcher reverse index behind the
+//!   frozen `myelin_notif::WatcherResolvePort` (contract 4.3/4.10), over the `watcher` relation its
+//!   [`rebac_fragment`] declares (4.9). Git registers/produces; Notif owns the seams (ZERO Notif code
+//!   change — the inverse-signal property, EI-01 §1). The Knowledge half is NOTIF-P20; Issues/Chat/CI
+//!   are M4 (NOTIF-P21/P22/P23); cross-cell is single-home (NOTIF-P24).
 //! - [`check_status`] — **GIT-P6 / P-232**: the X-1 Git↔CI `CheckStatus` **consumer contract**
 //!   (contract 5.9) — the `check_status` projection-table schema keyed `(commit_oid, context)`, the
 //!   monotonic `run_attempt` supersession rule, and the `required`-set policy shape, declared as a
@@ -87,6 +94,7 @@ pub mod check_status;
 pub mod commit;
 pub mod events;
 pub mod holder_intent;
+pub mod notif_rules;
 pub mod rebac_fragment;
 pub mod replay;
 pub mod schema;
