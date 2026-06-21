@@ -78,6 +78,7 @@
 
 pub mod app;
 pub mod card_text;
+pub mod cost_gate;
 pub mod defaults;
 pub mod dry_run;
 pub mod effect_api;
@@ -106,6 +107,18 @@ pub use holder::{
 pub use skeleton::{
     ChildEnv, RunOutcomeKind, RunSubstrate, RunTokenRevoker, SkeletonAgent, SkeletonAgentRuntime,
     SkeletonError, SkeletonTelemetry, AGENT_RUN_TRACED_EVENT, SKELETON_STEP_UNIT,
+};
+
+// The reserve/settle cost gate as the runaway self-limiter (AG-P14 → P-227, M2-B, AG-D11): the
+// agent-fabric CONSUMER that fronts every run through the Storage AgentRunGate/CostLedger (11.7) and
+// proves the gate as the runaway self-limiter end-to-end — a MockAgentRuntime brain looping
+// run-after-run against ONE draining wallet, reserve refuses past exhaustion (the loop stops at the
+// wallet, never by a kill), the in-flight run is NEVER interrupted (0 interrupt), and the books
+// balance (reserved == settled; a Mock bills 0 → the reservation refunds). NO FLOOR in the gate
+// mechanism — real per-model-call cost metering arrives with LlmAgentRuntime (AG-P25, post-M5); the
+// Mock metering ZERO is correct (the limiter is brain-independent).
+pub use cost_gate::{
+    runaway_brain, AgentFabricCostSignal, RunawaySelfLimiter, RunawayStep,
 };
 
 // Per-run identity COMPLETED (AG-P13 → P-225): mint at dispatch (token life == run life), scrub the
