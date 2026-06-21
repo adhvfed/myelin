@@ -71,6 +71,7 @@ pub mod delegation;
 pub mod expand;
 pub mod failstatic_cache;
 pub mod git_fragment;
+pub mod knowledge_fragment;
 pub mod list_objects;
 pub mod lowering;
 pub mod machine_auth;
@@ -97,6 +98,9 @@ pub use expand::Expand;
 pub use git_fragment::{
     compile_codeowners, git_fragment, CodeownersRule, APPROVE_UNTRUSTED_CI, CODE_OWNER,
     PROTECTED_PUSH,
+};
+pub use knowledge_fragment::{
+    field_view_caveat, knowledge_fragment, DIRECT_BLOCK, DIRECT_READER, READ as KN_READ, VIEW_FIELD,
 };
 pub use failstatic_cache::{
     CachedDecision, CacheTelemetry, CoarseGrant, FailStaticCache, Served, FRESH_TTL_SECS, S6_STORE,
@@ -884,6 +888,27 @@ impl StoreBackedCheck {
     pub fn admit_git_fragment(&self) -> Vec<myelin_identity::FragmentAdmit> {
         let mut ns = self.namespace.lock().unwrap_or_else(|e| e.into_inner());
         git_fragment::git_fragment()
+            .iter()
+            .map(|def| ns.admit(def))
+            .collect()
+    }
+
+    /// **Admit Id's compiled Knowledge ReBAC namespace fragment into the cell schema (contract 4.9,
+    /// P-ID-26 / P-249) — the SECOND of the five per-subsystem fragments.** Admits the four rich
+    /// [`knowledge_fragment`] `FragmentDef`s (`space` → `page` → `block` → `database_row`,
+    /// parent-before-child) on top of the core org/team/project hierarchy, so `check`/`list_objects`
+    /// resolve the Knowledge permissions through the SAME four-operator engine the core hierarchy uses
+    /// (one primitive — no bespoke KN check path). The headline rewrite is the **page-tree-with-
+    /// overrides** `page.read = (parent_page->read ∪ parent_space->read ∪ direct_reader) −
+    /// direct_block` (a sub-page narrows inherited access by the `- direct_block` exclusion); the
+    /// `database_row.read` row-level ACL is what `list_objects` pushes down via the `db_row.id`
+    /// via_column (§7.3). Field-level column hiding rides off the hot path as a `check`-time
+    /// `CaveatContext` caveat over the ONE `QueryAst` core ([`knowledge_fragment::field_view_caveat`]).
+    /// Returns the per-type admit verdicts in admit order; a malformed fragment is `Rejected{reason}`
+    /// (loudly, never silently admitted).
+    pub fn admit_knowledge_fragment(&self) -> Vec<myelin_identity::FragmentAdmit> {
+        let mut ns = self.namespace.lock().unwrap_or_else(|e| e.into_inner());
+        knowledge_fragment::knowledge_fragment()
             .iter()
             .map(|def| ns.admit(def))
             .collect()

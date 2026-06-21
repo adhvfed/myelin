@@ -391,9 +391,19 @@ title = "per-subsystem ReBAC namespace fragment (engine + admit-contract + core 
 # member reads; a public-channel project-reader inherits read; `message.view` inherits the channel's
 # read; `watcher` is read-fanout, not a read grant). Rewrites wired LIVE on the Chat M4 spine; the
 # runtime membership tuple writes are the CHAT-P8 floor.
+# The KNOWLEDGE fragment SLICE (the `space`/`page`/`block`/`database_row` namespace; the
+# page-tree-with-overrides rewrite `page.read = (parent_page->read ∪ parent_space->read ∪
+# direct_reader) − direct_block`; the `database_row.read` row-level ACL the list_objects push-down
+# keys on via `db_row.id` §7.3; the field-level column hiding as the off-hot-path `view_field`
+# CaveatContext caveat over the ONE QueryAst core §8.6) is P-ID-26 / P-249 — Id's compiled
+# Knowledge fragment (PROVIDER) admits the four rich FragmentDefs into the cell schema and its
+# rewrites resolve the page-tree override LEAK-FREE (a `- direct_block` sub-page is absent from
+# list_objects INCLUDING the COUNT). The Id-side compiled-fragment CDCs co-own the PROVIDER half.
 status = "covered"
 cdc = [
     "crates/myelin-identity-service/tests/cdc_4_9_namespace_engine.rs",
+    "crates/myelin-identity-service/tests/cdc_4_9_git_fragment.rs",
+    "crates/myelin-identity-service/tests/cdc_4_9_knowledge_fragment.rs",
     "crates/myelin-git/tests/cdc_4_9_git_fragment.rs",
     "crates/myelin-issues/tests/cdc_4_9_issues_fragment.rs",
     "crates/myelin-chat/tests/cdc_4_9_chat_fragment.rs",

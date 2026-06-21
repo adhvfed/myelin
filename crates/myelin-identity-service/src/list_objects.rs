@@ -391,10 +391,29 @@ impl ListObjects {
 /// `message.id`). On this floor the table is the type name and the column is `id` (the convention the
 /// §7.3 table follows); the precise per-consumer column is the consumer's declaration (P-ID-12 wiring).
 fn via_column_for(ty: &ObjectType) -> ColRef {
+    // §7.3 freezes the five subsystem via_columns. Most are the object type's own `<type>.id`; the
+    // ONE exception is Knowledge's `database_row`, whose consumer table is named `db_row` (the §7.3
+    // mapping says `via_column = db_row.id`, NOT `database_row.id`). The table is the consumer's OWN
+    // id column name, so we honour the consumer's table spelling here rather than the authz type name.
+    let table = match ty.0.as_str() {
+        knowledge_db_row::OBJECT_TYPE => knowledge_db_row::TABLE.to_string(),
+        _ => ty.0.clone(),
+    };
     ColRef {
-        table: ty.0.clone(),
+        table,
         column: "id".to_string(),
     }
+}
+
+/// The §7.3-frozen Knowledge `database_row` via_column mapping (the ONE type whose consumer table name
+/// differs from its authz object-type name): the `database_row` object type JOINs against the
+/// consumer's `db_row.id` column. Kept local + named so the mapping is a single source of truth the
+/// drill/CDC reference, not a stringly-typed literal at the call site.
+mod knowledge_db_row {
+    /// The Knowledge row authz object type (the §5 `database_row` fragment type).
+    pub const OBJECT_TYPE: &str = "database_row";
+    /// The consumer's table name for the §7.3 `db_row.id` via_column.
+    pub const TABLE: &str = "db_row";
 }
 
 /// Infer an object's TYPE from its id by the leading `type:` prefix (`repo:core` → `repo`). Mirrors
