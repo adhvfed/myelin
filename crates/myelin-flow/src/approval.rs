@@ -55,6 +55,7 @@
 //!   multi-day park) is **P-FLOW-11**.
 
 use crate::engine::SignalStore;
+use crate::wfctx::{RetryPolicy, WaitOutcome, WfCtx, WfResult};
 use myelin_refs::ArtifactRef;
 use myelin_tenancy::TenantId;
 
@@ -268,6 +269,106 @@ pub fn apply_approved_effects(
 /// signal carries an empty payload and this marker so the gated loop withholds it (AG-8) without an
 /// inline PII body.
 pub const DECLINE_MARKER: &str = "decline";
+
+/// **The FROZEN event type the HITL approval-card round-trip emits via the outbox (§6.3).** A gated
+/// tool's `request_approval_and_wait` emits `agent.approval.requested` (payload: tool name, args
+/// `ArtifactRef`s, risk, the live cost estimate — all references-not-payloads); Notif/Chat consumes it
+/// and renders the approval CARD (humanised at the backend, contract 7.3 — the one templating surface).
+/// The card UX/visual data model is Chat+Agent-Fabric product work (OQ #1), NOT this engine — this
+/// engine owns ONLY the emit + the wait.
+pub const APPROVAL_REQUESTED_EVENT: &str = "agent.approval.requested";
+
+/// **The signal NAME a gated tool's approval round-trip waits on (§6.3).** The §6.3 round-trip uses
+/// `approval:<call>` so each gated call's approval is a distinct wait; a multi-effect batch card keys
+/// the per-effect decisions under the [`APPROVAL_SIGNAL_NAME`] signal with the §6.4 per-effect
+/// `idem_key`. This helper builds the `approval:<call>` name from the call id.
+pub fn approval_wait_name(call_id: &str) -> String {
+    format!("approval:{call_id}")
+}
+
+/// **The HITL approval-card round-trip on a [`WfCtx`] (§6.3, FLOW-D4) — a gated tool's
+/// approve→resume bridge.** This is the durable mechanism a gated tool call uses:
+///
+/// 1. **Emit the request.** `agent.approval.requested` is emitted via the outbox (inside an `activity`
+///    so a re-drive does NOT re-emit — the activity short-circuits on replay, §4.1) carrying the
+///    references-not-payloads request refs (the tool/args/cost-estimate refs). Notif/Chat renders the
+///    card (contract 7.3).
+/// 2. **Wait.** `ctx.wait_for_signal("approval:<call>", timeout)` PARKS the run (`state=waiting`, holding
+///    NO runtime) until a human clicks Approve/Deny — which may be DAYS later, across restarts +
+///    deploys (the durability is the point, FLOW-D4).
+/// 3. **Resume.** When the `approval:<call>` signal arrives, the wait consumes it EXACTLY ONCE; the
+///    caller branches on the returned [`WaitOutcome`]: a `Signalled` carrying a NON-decline payload is
+///    APPROVE (the tool runs); a `Signalled` whose `payload_key_ref` is [`DECLINE_MARKER`] is DENY (the
+///    tool is WITHHELD → 0 mutation, AG-8); a `TimedOut` takes the auto-deny branch.
+///
+/// Returns the [`WaitOutcome`] so the caller (the gated tool body) runs / withholds / times-out. The
+/// CARD UX/visual is Chat+Agent-Fabric product work (OQ #1) — NOT this engine.
+///
+/// `call_id` names the gated call (the `approval:<call>` wait name); `request_refs` are the
+/// references-not-payloads request body (tool name, args, risk, cost-estimate refs); `timeout_secs` is
+/// the optional approval window (the §6.3 auto-deny deadline — `None` waits unbounded). The
+/// `agent.approval.requested` draft is built by `make_request_draft` (the caller supplies the event
+/// envelope shape so this engine does NOT depend on a concrete event schema).
+pub fn request_approval_and_wait<MkDraft>(
+    ctx: &mut WfCtx,
+    call_id: &str,
+    request_refs: Vec<ArtifactRef>,
+    timeout_secs: Option<i64>,
+    make_request_draft: MkDraft,
+) -> WfResult<WaitOutcome>
+where
+    MkDraft: Fn(&[ArtifactRef]) -> myelin_events::EventDraft,
+{
+    // 1. Emit `agent.approval.requested` via the outbox — wrapped in an `activity` so a re-drive does
+    //    NOT re-emit (the activity short-circuits on replay, §4.1: the card is requested ONCE even
+    //    though the body replays the prefix on every resume). The activity emits then returns the
+    //    request refs as its journaled result.
+    let refs = request_refs.clone();
+    let draft = make_request_draft(&refs);
+    // The emit must happen on the LIVE (first) drive only; the activity closure runs only when the
+    // command is past the cursor (replay short-circuits it), so the card is emitted exactly once.
+    let emitted_via = std::cell::RefCell::new(false);
+    {
+        let draft_cell = std::cell::RefCell::new(Some(draft));
+        let request_refs2 = request_refs.clone();
+        ctx_activity_emit(ctx, &emitted_via, &draft_cell, &request_refs2)?;
+    }
+
+    // 2 + 3. Wait on `approval:<call>` — parks (state=waiting holds no runtime) until the human decides
+    //        (which may be days later); resumes with the consumed decision (approve / decline / timeout).
+    ctx.wait_for_signal(&approval_wait_name(call_id), timeout_secs)
+}
+
+/// Emit the approval-request draft inside an `activity` (so a re-drive short-circuits it — the card is
+/// emitted exactly once across resumes, §4.1). The activity's journaled result is the request refs.
+fn ctx_activity_emit(
+    ctx: &mut WfCtx,
+    emitted: &std::cell::RefCell<bool>,
+    draft: &std::cell::RefCell<Option<myelin_events::EventDraft>>,
+    request_refs: &[ArtifactRef],
+) -> WfResult<()> {
+    // NOTE: the activity closure may be invoked once (live) — it emits the request via the outbox (the
+    // ONLY emit path, §4.5) and returns the request refs. On replay the activity short-circuits (the
+    // closure never runs), so the card is requested ONCE. The emit + the `activity_completed` journal +
+    // any prior steps co-commit in the one transaction (FLOW-D5).
+    //
+    // Because `WfCtx::emit` borrows `ctx` mutably and `activity` also borrows it, the emit cannot run
+    // INSIDE the activity closure (which only gets the idem_token). So we run the activity to mark the
+    // request command journaled (replay-guarding it), and emit on the LIVE drive only (guarded by the
+    // activity having executed a live closure this drive — `emitted` is set iff the closure ran).
+    ctx.activity(RetryPolicy { max_attempts: 1 }, |_idem, _attempt| {
+        *emitted.borrow_mut() = true;
+        Ok(request_refs.to_vec())
+    })?;
+    // The activity ran LIVE this drive (it was past the cursor) iff `emitted` is set — emit the card
+    // request now (on replay the closure short-circuited, `emitted` stays false, so NO re-emit).
+    if *emitted.borrow() {
+        if let Some(d) = draft.borrow_mut().take() {
+            ctx.emit(d, None)?;
+        }
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -504,6 +605,187 @@ mod tests {
             Some(Err(ApplyError::EffectDenied("capability denied".into()))),
             "an EffectApi denial is surfaced, distinct from the AG-8 withhold of a decline"
         );
+    }
+
+    // ---- the HITL approval-card round-trip (P-FLOW-11, §6.3) -------------------------------------
+
+    use crate::engine::{drive_full, run_state, DriveOutcome, RunRow, WorkflowBody};
+    use crate::wfctx::{WfCtx, WfJournal};
+    use myelin_events::{
+        Actor, AggregateKey, ArtifactRef as EvArtifactRef, DataRole, EmitContextBase, EventDraft,
+        EventType, OutboxStore, Timestamp, Visibility,
+    };
+    use myelin_identity::{Principal, PrincipalId, PrincipalKind};
+
+    fn ctx_base() -> EmitContextBase {
+        EmitContextBase {
+            tenant: tenant(),
+            region: region(),
+            actor: Actor(Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, tenant())),
+            schema_ver: 1,
+            occurred_at: Timestamp("2026-06-21T00:00:00Z".into()),
+            recorded_at: Timestamp("2026-06-21T00:00:01Z".into()),
+            caused_by: None,
+        }
+    }
+
+    fn approval_request_draft(refs: &[ArtifactRef]) -> EventDraft {
+        EventDraft {
+            type_: EventType(APPROVAL_REQUESTED_EVENT.into()),
+            subject: EvArtifactRef("myelin://acme/agent/run/R1".into()),
+            aggregate: AggregateKey("run:R1".into()),
+            payload: serde_json::json!({ "refs": refs.iter().map(|r| r.0.clone()).collect::<Vec<_>>() }),
+            data_role: DataRole::Controller,
+            visibility: Visibility::Internal,
+            contains_personal_data: false,
+            pii_key_ref: None,
+        }
+    }
+
+    /// The gated-tool body: it requests approval (`agent.approval.requested` via the outbox) + waits;
+    /// on approve it runs (an activity that mutates → one effect ref); on decline/timeout it withholds
+    /// (returns NO effect — 0 mutation, AG-8). Returns the terminal result refs.
+    fn gated_tool_body() -> Box<WorkflowBody> {
+        Box::new(|ctx: &mut WfCtx| {
+            let outcome = request_approval_and_wait(
+                ctx,
+                "call-1",
+                vec![ArtifactRef("myelin://acme/agent/tool/merge".into())],
+                Some(86_400), // a one-day approval window.
+                approval_request_draft,
+            )
+            .map_err(|e| format!("{e:?}"))?;
+            match outcome {
+                WaitOutcome::Signalled { payload_key_ref, .. } if payload_key_ref.as_deref() == Some(DECLINE_MARKER) => {
+                    // DENY → WITHHELD: 0 mutation (AG-8). The tool does NOT run.
+                    Ok(vec![])
+                }
+                WaitOutcome::Signalled { .. } => {
+                    // APPROVE → run the tool (one mutating activity → one effect).
+                    let eff = ctx
+                        .activity(RetryPolicy { max_attempts: 1 }, |_i, _a| {
+                            Ok(vec![ArtifactRef("myelin://acme/agent/effect/merged".into())])
+                        })
+                        .map_err(|e| format!("{e:?}"))?;
+                    Ok(eff)
+                }
+                WaitOutcome::TimedOut => Ok(vec![]), // auto-deny → 0 mutation.
+                WaitOutcome::Parked => Ok(vec![]),   // still waiting (the run parks).
+            }
+        })
+    }
+
+    /// **The full round-trip end-to-end through the engine: request → park → approve days later →
+    /// resume + run, the request emitted EXACTLY once (FLOW-D4 / §6.3).** Drive 1 emits the
+    /// `agent.approval.requested` card request and parks (state=waiting). The approval arrives. Drive 2
+    /// resumes, consumes the approval ONCE, and runs the tool — and the card request is NOT re-emitted.
+    #[test]
+    fn approval_round_trip_requests_once_parks_then_approve_resumes_and_runs() {
+        let ex = executor();
+        let run = start_a_run(&ex);
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        let part = 0i16;
+        let run_row = RunRow::new_runnable(tenant(), region(), run.0.clone(), "agent.run", part);
+        ex.runs().put(run_row.clone());
+        let body = gated_tool_body();
+        let tele = crate::engine::FlowTelemetry::new();
+
+        // DRIVE 1: emit the card request + park on the approval wait.
+        let o1 = drive_full(
+            ex.runs(), &outbox, &journal, &tele, minter(), ctx_base(), &run_row,
+            "2026-06-21T00:00:00Z", 7, body.as_ref(), 1, 1, None, Some(ex.signals().clone()), 1_000,
+        );
+        assert_eq!(o1, DriveOutcome::Waiting, "drive 1 parks on the approval wait (state=waiting)");
+        assert_eq!(outbox.committed_count(), 1, "the agent.approval.requested card request was emitted ONCE");
+        assert_eq!(
+            ex.runs().get(&tenant(), &run.0).unwrap().state,
+            run_state::WAITING,
+            "the run holds no runtime while it waits (FLOW-D4)"
+        );
+
+        // DAYS LATER: a human clicks Approve → Chat posts the approval signal (idempotent on idem_key).
+        ex.signal(SignalSpec {
+            run: run.clone(),
+            signal_name: approval_wait_name("call-1"),
+            idem_key: "card-7".into(),
+            payload: vec![ArtifactRef("myelin://acme/agent/decision/approve".into())],
+            payload_key_ref: None,
+        })
+        .expect("approve");
+
+        // DRIVE 2 (re-lease after the signal): resume, consume ONCE, run the tool. The run is runnable
+        // again (a signal wake would set it running; here we re-issue the drive over the same row state
+        // simulating the wake — the row is `waiting`, so set it runnable as the signal-wake path would).
+        ex.runs().wake(&tenant(), &run.0);
+        let run_row2 = ex.runs().get(&tenant(), &run.0).unwrap();
+        let o2 = drive_full(
+            ex.runs(), &outbox, &journal, &tele, minter(), ctx_base(), &run_row2,
+            "2026-06-21T00:00:00Z", 7, body.as_ref(), 1, 1, None, Some(ex.signals().clone()), 200_000,
+        );
+        match o2 {
+            DriveOutcome::Completed(refs) => assert_eq!(
+                refs,
+                vec![ArtifactRef("myelin://acme/agent/effect/merged".into())],
+                "drive 2 resumed + RAN the approved tool (one effect)"
+            ),
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        // the card request was emitted EXACTLY once across BOTH drives (NOT re-emitted on the resume
+        // drive — the activity-guarded emit short-circuits on replay). The approved tool runs (its
+        // effect is the terminal result above) but emits no event here, so the card request is the only
+        // emit: committed_count stays 1 (the re-drive did NOT re-emit the card).
+        assert_eq!(outbox.committed_count(), 1, "the card request was emitted EXACTLY once (NO re-emit on the resume)");
+        // the approval was consumed EXACTLY once (the buffered depth dropped to 0).
+        assert_eq!(ex.signals().buffered_depth(), 0, "the approval was consumed EXACTLY once (FLOW-D4: 1 consume)");
+    }
+
+    /// **A DENY withholds the tool → 0 mutation (AG-8 / FLOW-D4).** The approval round-trip parks; a
+    /// DECLINE signal arrives; the resume consumes it and the body WITHHOLDS the tool (returns no
+    /// effect) — the merge activity NEVER runs (0 mutation).
+    #[test]
+    fn approval_round_trip_deny_withholds_zero_mutation() {
+        let ex = executor();
+        let run = start_a_run(&ex);
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        let run_row = RunRow::new_runnable(tenant(), region(), run.0.clone(), "agent.run", 0);
+        ex.runs().put(run_row.clone());
+        let body = gated_tool_body();
+        let tele = crate::engine::FlowTelemetry::new();
+
+        // DRIVE 1: park.
+        drive_full(
+            ex.runs(), &outbox, &journal, &tele, minter(), ctx_base(), &run_row,
+            "2026-06-21T00:00:00Z", 7, body.as_ref(), 1, 1, None, Some(ex.signals().clone()), 1_000,
+        );
+        let emits_after_park = outbox.committed_count();
+
+        // a DECLINE arrives (empty payload + the DECLINE_MARKER, §3.4).
+        ex.signal(SignalSpec {
+            run: run.clone(),
+            signal_name: approval_wait_name("call-1"),
+            idem_key: "card-7".into(),
+            payload: vec![],
+            payload_key_ref: Some(DECLINE_MARKER.into()),
+        })
+        .expect("decline");
+
+        // DRIVE 2: resume + WITHHOLD (0 mutation).
+        ex.runs().wake(&tenant(), &run.0);
+        let run_row2 = ex.runs().get(&tenant(), &run.0).unwrap();
+        let o2 = drive_full(
+            ex.runs(), &outbox, &journal, &tele, minter(), ctx_base(), &run_row2,
+            "2026-06-21T00:00:00Z", 7, body.as_ref(), 1, 1, None, Some(ex.signals().clone()), 2_000,
+        );
+        assert_eq!(o2, DriveOutcome::Completed(vec![]), "a DENY completes with NO effect (withheld)");
+        // 0 mutation: the merge effect was NEVER emitted (only the card request, before the park).
+        assert_eq!(
+            outbox.committed_count(),
+            emits_after_park,
+            "the declined tool made 0 mutation — no effect emitted past the card request (AG-8)"
+        );
+        assert_eq!(ex.signals().buffered_depth(), 0, "the decline was consumed once");
     }
 
     /// **`ApprovalCard::idem_key_for` applies the §6.4 rule to the card's own arity.** A multi-effect

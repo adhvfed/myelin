@@ -65,7 +65,22 @@
 //!     WITHHELD (`Denied`, 0 mutation, AG-8), a double-click on "approve all" re-sends the same keys
 //!     → ON CONFLICT DO NOTHING → 0 double-apply; the 9.1 per-effect CDC pair vs the Agent Fabric
 //!     `EffectApi` consumer is `tests/cdc_9_1_per_effect.rs`; the F-4-extended drill across a
-//!     restart+deploy lands at **P-FLOW-12** and at **CHAT-D10** M4); durable timers
+//!     restart+deploy lands at **P-FLOW-12** and at **CHAT-D10** M4); the consuming WAIT
+//!     (`wait_for_signal` + the multi-day HITL approval-card round-trip, **P-FLOW-11**, FLOW-D4) —
+//!     **LANDED**, see [`wfctx`] ([`WfCtx::wait_for_signal`]: parks the run `state=waiting` holding NO
+//!     runtime on an absent named signal (journals `signal_waited`); a buffered signal RESUMES + is
+//!     CONSUMED exactly once via [`SignalStore::consume`] (stamp `consumed_seq` WHERE NULL, journals
+//!     `signal_received`); the optional timeout arms the P-FLOW-13 durable timer + returns
+//!     [`WaitOutcome::TimedOut`] when the deadline passes; replay short-circuits the journaled
+//!     `signal_received` to the SAME signal — consume-exactly-once across a re-drive) + the HITL
+//!     approval-card round-trip [`request_approval_and_wait`] in [`approval`] (emit
+//!     `agent.approval.requested` via the outbox ONCE → wait → resume/withhold/timeout; the card
+//!     UX/visual data model is Chat+Agent-Fabric product work, OQ #1, NOT this engine) + the
+//!     oldest-unconsumed-wait-age telemetry on [`FlowTelemetry`] (§5.4); the FLOW-D4 drill across a
+//!     restart+deploy with a days-later double-click is `tests/drills_flow_d4_multiday_hitl.rs`, the
+//!     9.4 wait CDC pair is `tests/cdc_9_4_wait.rs`, the live-PG consume-once apply is
+//!     `tests/integration_flow_wait.rs`; the `ci.result`/`job.done` long-park PRODUCER wiring is
+//!     **P-FLOW-14/15**); durable timers
 //!     (**P-FLOW-13**, FLOW-D3) — **LANDED**, see [`timer`] ([`TimerStore`] the minute-bucket wheel:
 //!     `arm` (idempotent on the deterministic `timer_id`) + the bucketed due-scan ([`TimerStore::scan_due`]:
 //!     `bucket <= now AND NOT fired`, `FOR UPDATE SKIP LOCKED`, far-future NEVER scanned — the SC-11
@@ -106,11 +121,12 @@ pub use app::{
     SERVICE_NAME,
 };
 pub use approval::{
-    apply_approved_effects, per_effect_idem_key, ApplyError, ApprovalCard, ApprovalDecision,
-    EffectApplier, EffectOutcome, GateResult, GatedEffect, APPROVAL_SIGNAL_NAME, DECLINE_MARKER,
+    apply_approved_effects, approval_wait_name, per_effect_idem_key, request_approval_and_wait,
+    ApplyError, ApprovalCard, ApprovalDecision, EffectApplier, EffectOutcome, GateResult,
+    GatedEffect, APPROVAL_REQUESTED_EVENT, APPROVAL_SIGNAL_NAME, DECLINE_MARKER,
 };
 pub use engine::{
-    drive, drive_versioned, drive_with_timers, run_state, DriveOutcome, FlowDispatcher,
+    drive, drive_full, drive_versioned, drive_with_timers, run_state, DriveOutcome, FlowDispatcher,
     FlowTelemetry, RunRow, RunStore, SignalRow, SignalStore, WorkflowBody,
 };
 pub use timer::{epoch_minute, ArmOutcome, FireOutcome, TimerRow, TimerStore, TimerWheel, SECS_PER_MINUTE};
@@ -124,5 +140,6 @@ pub use holder::{
     FlowHolderRegistration, RestrictSet, WfHistoryHolder, FLOW_OLTP_STORE,
 };
 pub use wfctx::{
-    attempt_state, history_kind, ActivityError, RetryPolicy, WfCtx, WfError, WfJournal, WfResult,
+    attempt_state, history_kind, ActivityError, RetryPolicy, WaitOutcome, WfCtx, WfError, WfJournal,
+    WfResult,
 };

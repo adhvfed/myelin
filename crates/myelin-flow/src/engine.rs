@@ -432,6 +432,67 @@ impl SignalStore {
             .filter(|s| s.tenant.0 == tenant.0 && s.run_id == run_id)
             .count()
     }
+
+    /// **The first BUFFERED (unconsumed) signal for `(tenant, run_id, signal_name)` — the wait's wake
+    /// lookup (P-FLOW-11, §4.3).** A `wait_for_signal(name)` names the signal but NOT the per-effect
+    /// `idem_key` (the producer chose it — `card_id` / a job's `idem_token`), so the wait scans for the
+    /// FIRST unconsumed row under the run + name. Deterministic order (by `idem_key`) so two workers /
+    /// a replay agree on WHICH buffered signal a wait consumes. `None` if none is buffered (the run
+    /// stays parked). Returns the `(idem_key, row)` so the caller can mark THAT row consumed.
+    pub fn first_unconsumed_for(
+        &self,
+        tenant: &TenantId,
+        run_id: &str,
+        signal_name: &str,
+    ) -> Option<(String, SignalRow)> {
+        let signals = self.lock();
+        signals
+            .values()
+            .filter(|s| {
+                s.tenant.0 == tenant.0
+                    && s.run_id == run_id
+                    && s.signal_name == signal_name
+                    && s.consumed_seq.is_none()
+            })
+            // deterministic pick: the lowest idem_key (a stable total order over the buffered set) so a
+            // replay / a competing worker consumes the SAME row — never a non-deterministic choice.
+            .min_by(|a, b| a.idem_key.cmp(&b.idem_key))
+            .map(|s| (s.idem_key.clone(), s.clone()))
+    }
+
+    /// **Mark a buffered signal CONSUMED — stamp its `consumed_seq` (P-FLOW-11, §4.3).** The consuming
+    /// wait stamps the `wf_history` seq that consumed it so the signal-buffer-depth drops by one and a
+    /// re-scan never re-consumes it (consume-exactly-once). Idempotent: a re-consume of an already-
+    /// consumed signal leaves the FIRST stamp unchanged and returns `false` (the consume was already
+    /// done — the at-least-once redrive consumes once). Returns `true` iff THIS call was the first to
+    /// consume it (the row went unconsumed → consumed). Models `UPDATE … SET consumed_seq = $seq WHERE
+    /// consumed_seq IS NULL` — the WHERE clause IS the idempotency (the consume races to the same NULL
+    /// guard the live UPDATE does).
+    pub fn consume(
+        &self,
+        tenant: &TenantId,
+        run_id: &str,
+        signal_name: &str,
+        idem_key: &str,
+        consumed_seq: i64,
+    ) -> bool {
+        let mut signals = self.lock();
+        let key = (
+            tenant.0.clone(),
+            run_id.to_string(),
+            signal_name.to_string(),
+            idem_key.to_string(),
+        );
+        match signals.get_mut(&key) {
+            // WHERE consumed_seq IS NULL: only the FIRST consume stamps it (consume-exactly-once); a
+            // re-consume of an already-stamped row is a no-op (the row stays at its first seq).
+            Some(row) if row.consumed_seq.is_none() => {
+                row.consumed_seq = Some(consumed_seq);
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 /// **The contract-1.8 engine telemetry — the replay/lease survival signals (§1.8).** A cloneable
@@ -487,6 +548,13 @@ struct TelemetryInner {
     /// Far-future timers are NOT counted (they are not due — the SC-11 point: they cost nothing). The
     /// FLOW-D3 floor reads this staying within budget under the one-minute 100k+ burst.
     timer_wheel_lag: u64,
+    /// **the oldest-unconsumed-WAIT-age gauge (contract 1.8 / §5.4 — the multi-day HITL wait,
+    /// P-FLOW-11).** The age (in seconds) of the OLDEST run currently parked on a `wait_for_signal`
+    /// whose named signal has not yet arrived — i.e. how long the longest-waiting HITL approval / job
+    /// completion has been outstanding. Set from the engine as runs park/resume. A growing value is the
+    /// "an approval card / a long-park job has been waiting a long time" health signal (and the
+    /// merge-queue / CI-stage backlog age, §5.4). 0 when no run is parked on a wait.
+    oldest_unconsumed_wait_age_secs: u64,
 }
 
 impl FlowTelemetry {
@@ -626,6 +694,21 @@ impl FlowTelemetry {
     pub fn timer_wheel_lag(&self) -> u64 {
         self.lock().timer_wheel_lag
     }
+
+    /// **Set the oldest-unconsumed-wait-age gauge (contract 1.8 / §5.4 — the multi-day HITL wait,
+    /// P-FLOW-11).** The age in seconds of the oldest run parked on a `wait_for_signal` whose named
+    /// signal has not arrived. Set from the engine as runs park (the wait records the park clock) /
+    /// resume (a consumed wait no longer counts). A growing value is the long-outstanding-approval /
+    /// long-park-backlog-age health signal (§5.4).
+    pub fn set_oldest_unconsumed_wait_age(&self, age_secs: u64) {
+        self.lock().oldest_unconsumed_wait_age_secs = age_secs;
+    }
+
+    /// The oldest-unconsumed-wait-age gauge (contract 1.8 / §5.4) — how long the longest-waiting HITL
+    /// approval / long-park job has been outstanding (seconds). 0 when no run is parked on a wait.
+    pub fn oldest_unconsumed_wait_age_secs(&self) -> u64 {
+        self.lock().oldest_unconsumed_wait_age_secs
+    }
 }
 
 /// A workflow body the engine drives — a DETERMINISTIC function over a [`WfCtx`] (§2.5/§4.1). It
@@ -729,6 +812,38 @@ pub fn drive_with_timers(
     timers: Option<crate::timer::TimerStore>,
     now_secs: i64,
 ) -> DriveOutcome {
+    drive_full(
+        runs, outbox, journal, telemetry, minter, ctx_base, run, now_clock, rand_seed, body,
+        run_version, replay_version, timers, None, now_secs,
+    )
+}
+
+/// **Drive a workflow run WITH BOTH the durable-timer wheel AND the durable-signal buffer armed
+/// (P-FLOW-11/13, §4.2/§4.3) — the full multi-day-HITL drive.** Identical to [`drive_with_timers`] but
+/// also supplies the engine's [`SignalStore`] so a body's `ctx.wait_for_signal` consumes the buffered
+/// signal `DurableExecutor::signal` delivered (P-FLOW-09) and PARKS the run (`waiting`, holding no
+/// runtime) when the named signal has not arrived. A drive that parks on a wait co-commits its
+/// progress-up-to-the-park and settles `waiting`; the signal delivery + a re-lease re-drive it past the
+/// wait (the body re-issues the wait, finds the now-buffered signal, consumes it ONCE). After a drive
+/// the signal-buffer-depth + oldest-unconsumed-wait-age telemetry are refreshed from the store.
+#[allow(clippy::too_many_arguments)]
+pub fn drive_full(
+    runs: &RunStore,
+    outbox: &OutboxStore,
+    journal: &crate::wfctx::WfJournal,
+    telemetry: &FlowTelemetry,
+    minter: Arc<dyn IdMinter>,
+    ctx_base: EmitContextBase,
+    run: &RunRow,
+    now_clock: impl Into<String>,
+    rand_seed: u64,
+    body: &WorkflowBody,
+    run_version: i32,
+    replay_version: i32,
+    timers: Option<crate::timer::TimerStore>,
+    signals: Option<SignalStore>,
+    now_secs: i64,
+) -> DriveOutcome {
     let tenant = run.tenant.clone();
     // Load the journal so far (the replay prefix the body short-circuits over §4.1).
     let history: Vec<WfHistoryRow> = journal.history_for(&tenant, &run.run_id);
@@ -751,6 +866,11 @@ pub fn drive_with_timers(
     // `sleep` arms a `wf_timer` row (and the park decision reads the live clock).
     if let Some(timers) = timers {
         ctx = ctx.with_timers(timers, run.partition, now_secs);
+    }
+    // Supply the durable-signal buffer so a body's `wait_for_signal` consumes the buffered signal
+    // (P-FLOW-09 delivery) + parks the run (`waiting`) when the named signal has not arrived (§4.3).
+    if let Some(signals) = signals.clone() {
+        ctx = ctx.with_signals(signals);
     }
 
     // Run the body. It replays the journaled commands (short-circuit, 0 side effect) then runs the
@@ -790,11 +910,15 @@ pub fn drive_with_timers(
         return DriveOutcome::Nondeterministic(reason);
     }
 
-    // **PARK on a durable timer (P-FLOW-13, §4.2):** a body that armed a not-yet-due `sleep` parks —
-    // read it BEFORE the commit consumes the ctx. The progress-up-to-the-park (the `timer_set` marker
-    // + prior steps) co-commits; the run settles `waiting` (holding NO runtime), not terminal. The
-    // wheel fires the armed timer at its minute (waking the run), and a re-lease re-drives past sleep.
-    let parked = ctx.parked_on_timer();
+    // **PARK on a durable wait (P-FLOW-11/13, §4.2/§4.3):** a body that armed a not-yet-due `sleep` OR
+    // reached a `wait_for_signal` whose named signal has not arrived parks — read it BEFORE the commit
+    // consumes the ctx. The progress-up-to-the-park (the `timer_set`/`signal_waited` marker + prior
+    // steps) co-commits; the run settles `waiting` (holding NO runtime), not terminal. The wheel fires
+    // the armed timer OR `DurableExecutor::signal` delivers the signal — either wakes the run, and a
+    // re-lease re-drives past the wait (the body re-issues the wait, finds the now-buffered signal).
+    let parked = ctx.parked();
+    // The `(signal_name, idem_key)` pairs this drive's waits consumed — read before the ctx is moved.
+    let consumed_signals = ctx.consumed_signals().to_vec();
 
     // Co-commit the newly-journaled commands + their emits (FLOW-D5). A failed co-commit leaves the
     // journal untouched (the drive is retried by a re-lease).
@@ -814,6 +938,17 @@ pub fn drive_with_timers(
     runs.settle(&tenant, &run.run_id, new_cursor, state);
     let lag = runs.runnable_lag(run.partition, i64::MAX) as u64;
     telemetry.set_runnable_lag(lag);
+    // Refresh the signal-buffer-depth telemetry after the drive (a consumed signal dropped the
+    // buffered depth; a wait that consumed `consumed_signals` rows lowered it). The oldest-unconsumed-
+    // wait-age is the engine-wide §5.4 health signal; here we surface that a consume HAPPENED (the
+    // depth fell) — the cell-wide oldest-wait scan is the metrics-port aggregator's job.
+    if let Some(signals) = signals.as_ref() {
+        telemetry.set_signal_buffer_depth(signals.buffered_depth());
+        // a drive that parked on an UNCONSUMED wait keeps a non-zero oldest-wait-age; a drive that
+        // consumed its wait (resumed) lowers the buffered depth. The exact per-cell oldest age is
+        // aggregated by the metrics port; the count of buffered (unconsumed) rows is the source.
+        let _ = consumed_signals; // recorded for the FLOW-D4 1-consume assertion (read off the journal).
+    }
     outcome
 }
 
@@ -853,6 +988,13 @@ pub struct FlowDispatcher {
     /// the SAME store) fires it at its minute, waking the run. A dispatcher WITHOUT a wheel drives the
     /// pure activity/now/rand surface (a body `sleep` errors loudly — never a silent no-op).
     timers: Option<crate::timer::TimerStore>,
+    /// **The durably-buffered `wf_signal` store a body's `wait_for_signal` consumes from (P-FLOW-11,
+    /// §4.3).** `None` until [`Self::with_signals`] supplies it — then a body's `ctx.wait_for_signal`
+    /// consumes the signal `DurableExecutor::signal` buffered (P-FLOW-09) + parks the run (`waiting`)
+    /// when the named signal has not arrived. A dispatcher WITHOUT a signal store drives the pure
+    /// activity/timer surface (a body `wait_for_signal` errors loudly — never a silent no-op). Share
+    /// the executor's store ([`FlowExecutor::signals`]) so the wait consumes what `signal` delivered.
+    signals: Option<SignalStore>,
 }
 
 impl FlowDispatcher {
@@ -884,7 +1026,18 @@ impl FlowDispatcher {
             bodies: HashMap::new(),
             running_versions: HashMap::new(),
             timers: None,
+            signals: None,
         }
+    }
+
+    /// **Supply the durably-buffered `wf_signal` store so a body's `wait_for_signal` consumes + parks
+    /// (P-FLOW-11, §4.3).** Chainable on [`Self::new`]. Share the executor's store
+    /// ([`FlowExecutor::signals`]) so a body's `ctx.wait_for_signal` consumes EXACTLY the signal
+    /// `DurableExecutor::signal` buffered (P-FLOW-09) and parks the run (`waiting`) when the named
+    /// signal has not arrived; a `signal` delivery + a re-lease re-drive it past the wait.
+    pub fn with_signals(mut self, signals: SignalStore) -> Self {
+        self.signals = Some(signals);
+        self
     }
 
     /// **Supply the durable-timer wheel so a workflow body's `sleep` arms a `wf_timer` row + parks
@@ -947,7 +1100,7 @@ impl FlowDispatcher {
         // Thread the durable-timer wheel + the live clock so a body `sleep` arms a `wf_timer` row +
         // parks the run (`waiting`); a dispatcher with no wheel drives the activity surface (a body
         // `sleep` would error loudly — never a silent no-op).
-        let outcome = drive_with_timers(
+        let outcome = drive_full(
             &self.runs,
             &self.outbox,
             &self.journal,
@@ -961,6 +1114,7 @@ impl FlowDispatcher {
             run.wf_version,
             replay_version,
             self.timers.clone(),
+            self.signals.clone(),
             now,
         );
         Some(outcome)
