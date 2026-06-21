@@ -119,6 +119,7 @@ pub mod engine;
 pub mod erase;
 pub mod erasure_posture;
 pub mod fusion;
+pub mod git_code_projection;
 pub mod holder;
 pub mod indexer;
 pub mod kn_projection;
@@ -151,6 +152,13 @@ pub use engine::{
 pub use erase::{EraseOutcome, SearchEraseHolder, SEARCH_ERASE_EVENT_TYPE};
 pub use erasure_posture::{erasure_posture, ErasurePosture};
 pub use fusion::{fuse_with_k, reciprocal_rank_fusion, FusedHit, RankedList, RRF_K};
+pub use git_code_projection::{
+    git_blob_search_projection, git_code_projection_spec, git_index_specs, register_git_index_specs,
+    trigram_query, trigrams, GitBlobProjectionInput, ScipLsifFindUsagesFloor,
+    FACET_BLOB_OID as GIT_FACET_BLOB_OID, FACET_LANGUAGE as GIT_FACET_LANGUAGE,
+    FACET_PATH as GIT_FACET_PATH, GIT_BLOB_ACL_OBJECT_TYPE, GIT_BLOB_TYPE, GIT_SUBSYSTEM,
+    TRIGRAM_N,
+};
 pub use indexer::{
     EmbeddingAdapter, IncrementalIndexer, IndexEventError, IndexSpec, MockEmbeddingAdapter,
     ProjectFetchError, ProjectFetcher, SearchProjection, INDEXER_CONSUMER,
