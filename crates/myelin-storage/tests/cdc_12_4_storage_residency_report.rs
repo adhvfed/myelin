@@ -54,6 +54,16 @@ fn to_cp_class(class: ResidencyStoreClass) -> CpStoreClass {
         // residency is verified Storage-side by `verify_region_pinning` (which checks ANY reported
         // class's region — a wrong-region CDN edge FAILs there without a wire change).
         ResidencyStoreClass::CdnEdgeSet => CpStoreClass::Blob,
+        // The C6 outbound push-mirror TARGET (P-ST-25 / P-255) is a Storage follow-on store class:
+        // Storage FLAGS the crossing by reporting the mirror target's region, and the mirror-source
+        // bytes it holds rest as content-addressed T2 BLOBS (storage.md §6(a) — sealed under the
+        // per-tenant blob DEK, like the git pack tier). At the control-plane no-global-pool WIRE it
+        // therefore reports under the T2 blob tier (the control-plane M1 set is OLTP/blob/index/KMS).
+        // Its residency is verified Storage-side by `verify_region_pinning` (which checks ANY reported
+        // class's region — an extra-EU mirror TARGET FAILs there without a wire change). The actual
+        // allow/deny of the crossing is the control plane's `mirror_allowed` gate (10.5 / P-251), a
+        // SEPARATE seam from this no-global-pool attestation.
+        ResidencyStoreClass::PushMirror => CpStoreClass::Blob,
     }
 }
 
