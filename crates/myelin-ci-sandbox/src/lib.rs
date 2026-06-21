@@ -64,10 +64,22 @@ pub mod firecracker;
 pub mod gvisor;
 pub mod hardening;
 pub mod runner;
+pub mod self_hosted;
+pub mod snapshot_pool;
 
 pub use escape_corpus::{
     build_corpus_script, parse_console, AttackFamily, AttackMarker, AttackOutcome, Backend,
     BackendRun, DrillReport, EscapeAttestation, CORPUS, CORPUS_VERSION,
+};
+
+pub use self_hosted::{
+    mint_self_hosted_token, self_hosted_grant, Attestation, AttestState, AttestationVerifier,
+    SelfHostedMintError, SelfHostedRunner, StructuralAttestationVerifier, TenantScopedToken,
+    SELFHOSTED_GRANT_PREFIX,
+};
+
+pub use snapshot_pool::{
+    AcquirePath, ModeledRestore, PoolStats, SnapshotPool, SnapshotRestore, WarmSandbox,
 };
 
 pub use runner::{
