@@ -142,8 +142,8 @@ pub use cross_language_shim::{
 pub use dependency_break::{BreakOutcome, Dependency, DependencyBreaker, Scope};
 pub use drills::{DrillContext, DrillRegistry, DrillResult, DrillScenario};
 pub use load_generator::{
-    LoadGenerator, LoadPrincipalKind, Multiplier, PrincipalMix, Request, RunClass, Sink,
-    StormProfile, Surface,
+    LoadGenerator, LoadPrincipalKind, Multiplier, PrincipalMix, RecordingSink, Request, RunClass,
+    Sink, StormProfile, Surface,
 };
 pub use restore::{
     BlobAddr, CrossSeamMismatch, CrossSeamReport, IndexDoc, Offset, OltpRow, RestoreOutcome,
