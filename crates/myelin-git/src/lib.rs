@@ -361,3 +361,26 @@ pub mod anchor;
 /// are the Issues/Knowledge typed tables' (REF-P18/REF-P20); the live PR-merge transition wiring is
 /// GIT-P20/GIT-P22.
 pub mod typed_edges;
+
+/// The **Git Web UI view-model + HTML render layer** (GIT-P32 / P-293, M3-G8 — FIRST USEFUL). The
+/// server-rendered view-model for the load-bearing Web UI surfaces (repo home + file view, the PR
+/// overview centrepiece, the **checks panel**, the signed-off **fork-trust badge**, the
+/// **merge-readiness** affordance, the single-file **web-edit** form), built TO the GIT-P7 signed-off
+/// design pass and conforming to the frozen design system (DESIGN-MANUAL, direction A "Instrument").
+/// NO new contract — the views CONSUME the already-built [`project::Projected`] (0-leak per-viewer
+/// projection), [`check_status`] (the X-1 consumer rows), [`merge_gate`] (the gate outcome), and
+/// [`lifecycle`] (the PR state). Status is glyph + label + token (never colour alone, WCAG 1.4.1);
+/// a tombstone never leaks a title; the inline-colour ban holds. Driven in a real browser by
+/// `tests/e2e_git_p32_web_browser.rs` (the switch-test rehearsal, EI-01 §4). Floor named: **GF-6**
+/// single-file web edit (the in-browser 3-way conflict editor is GIT-P33/M5+).
+pub mod web;
+
+/// The **Git CLI + HTTP/RPC + agent-tool API surface catalogue** (GIT-P32 / P-293, M3-G8 — arch
+/// `04-views-cli-and-api.md` §3/§4). The `myelin …` git CLI command surface ([`api::CliCommand`]) +
+/// the HTTP endpoint route table ([`api::Endpoint`]) — ONE API, three consumers (UI, CLI, agents). NO
+/// new handler: each CLI verb / HTTP route maps to an EXISTING git handler (the merge gate, the
+/// fork-endorsement, the projection, the receive-pack path). The surface is the catalogue + the
+/// parse/route logic; it surfaces the existing handlers (the prompt states this). Every write route is
+/// `Id.check` → state change + outbox emit in one transaction (BUS-2); every cross-subsystem read uses
+/// `project`/`resolve` (cell-local, never cross-DB).
+pub mod api;
