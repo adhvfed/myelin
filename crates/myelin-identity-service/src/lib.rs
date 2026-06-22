@@ -66,6 +66,7 @@
 //! Identity's migrations so the booting instance is **not-ready until they apply**.
 
 pub mod authenticate;
+pub mod chat_fragment;
 pub mod check_engine;
 pub mod ci_fragment;
 pub mod delegation;
@@ -91,6 +92,10 @@ pub mod tuple_store;
 pub use authenticate::{
     scheme, AuthTelemetry, CredentialVerifier, HumanSsoAuthenticator, IdorCounters,
     StructuralVerifier, VerifiedAssertion,
+};
+pub use chat_fragment::{
+    channel_fragment, chat_fragment_defs, message_fragment, unfurl_fragment,
+    MEMBER as CHANNEL_MEMBER, READ as CHANNEL_READ, TARGET as UNFURL_TARGET, VIEW as MESSAGE_VIEW,
 };
 pub use check_engine::{eval_caveat, eval_caveat_predicate, CheckEngine, MAX_REWRITE_DEPTH};
 pub use ci_fragment::{
@@ -984,6 +989,22 @@ impl StoreBackedCheck {
     pub fn admit_issue_fragment(&self) -> Vec<myelin_identity::FragmentAdmit> {
         let mut ns = self.namespace.lock().unwrap_or_else(|e| e.into_inner());
         issue_fragment::issue_fragment_defs()
+            .iter()
+            .map(|def| ns.admit(def))
+            .collect()
+    }
+
+    /// **Admit Id's compiled Chat ReBAC fragment (contract 4.9, P-ID-30) — the FIFTH and FINAL of the
+    /// five per-subsystem fragments, CLOSING the M1 engine-only floor.** Declares + compiles the
+    /// `channel`/`message`/`unfurl` object types (`channel.read = member ∪ parent_project->view`;
+    /// `message.view = parent_channel->read`; `unfurl.view = parent_message->view`) into the cell
+    /// schema via the SAME admit-contract every fragment uses (no bespoke Chat path). The channel is
+    /// watchable so Notif's `list_subjects(channel, watcher)` read-fanout at 50k density (§7.5) is an
+    /// ordinary Expand. With this admitted, all five subsystem fragments (Git/Knowledge/CI/Issues/Chat)
+    /// exist in the engine.
+    pub fn admit_chat_fragment(&self) -> Vec<myelin_identity::FragmentAdmit> {
+        let mut ns = self.namespace.lock().unwrap_or_else(|e| e.into_inner());
+        chat_fragment::chat_fragment_defs()
             .iter()
             .map(|def| ns.admit(def))
             .collect()
