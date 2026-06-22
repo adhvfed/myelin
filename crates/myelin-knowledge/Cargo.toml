@@ -58,8 +58,18 @@ myelin-content = { path = "../myelin-content" }
 # (KN-P02/P03); the shell depends on it so the flexible-database executor (KN-P09+) compiles
 # against the frozen query shapes.
 myelin-query = { path = "../myelin-query" }
+# The Storage tier (KN-P05): the OLTP bounded pool (11.1, OltpPool), the (tenant, region)-first RLS
+# tenant-scoping guard (11.1/12.1, TenantScope/TenantQuery — the structural tenant-predicate floor),
+# and the fs-backed content-addressed BlobStore (11.2, the M1 media + CRDT-snapshot floor).
+# Knowledge CONSUMES these frozen primitives; it does NOT re-implement a parallel store/RLS/blob
+# path (EI-01 §7, one primitive). A leaf service consumer above the storage glue, like the others.
+myelin-storage = { path = "../myelin-storage" }
 
 [dev-dependencies]
 # The shell's boot self-test asserts against the same three-port / liveness≠readiness surface the
 # later drills read from. DEV-only — the harness never enters the knowledge production DAG.
 myelin-harness = { path = "../myelin-harness" }
+# DEV-only: the architecture-lint engine, so the KN-D13 CDC asserts the `tenant-predicate` lint is
+# RED on a deliberately tenant-less Knowledge query fixture and GREEN on a tenant-bound one (the
+# drill's compile-time half). The live workspace scan is in `myelin-lints` (this is the fixture).
+myelin-lints = { path = "../myelin-lints" }

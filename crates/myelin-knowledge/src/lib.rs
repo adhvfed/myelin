@@ -53,6 +53,12 @@
 //!   The entrypoint slot ([`FailClosedEntrypoint`]) returns the fail-closed default `Deny` for
 //!   every `check` and `NotYetImplemented` for `list_objects` until those bodies land.
 
+pub mod store;
+
+pub use store::{
+    knowledge_scope, knowledge_store_migrations, KnowledgeStore, KnowledgeTable,
+};
+
 use myelin_identity::{
     AuthzError, CaveatContext, Consistency, Decision, IdentityService, ListObjectsResult,
     ObjectType, Permission, Principal,
@@ -89,15 +95,21 @@ pub const HOT_TABLES: [&str; 3] = ["block", "db_row", "doc_op"];
 /// store prompt (KN-P05, the `block`/`db_row`/`doc_op` tables) extends; the substrate co-located
 /// `outbox` + `consumer_dedup` tables are prepended by the harness itself ([`boot`]).
 ///
-/// **Floor:** the high-write `block`/`db_row`/`doc_op` table DDL is KN-P05; the outbox table +
-/// the relay/consumer wiring is KN-P06. What matters here is that migrations EXIST so the booting
-/// instance is **not-ready until they apply** (the gate the shell proves) and the schema marker is
-/// the anchor those prompts' DDL appends to (forward-only — no backward/destructive migration).
+/// **KN-P05 (P-295) extends this:** the shell's `0200_knowledge_schema_marker` is now followed by
+/// the OLTP **store** schema ([`store::knowledge_store_migrations`]) — the `page`/`block`/`db_row`/
+/// `db_collection`/`db_view`/`db_relation`/`page_parent`/`doc_op`/`doc_snapshot` tables, all
+/// `(tenant, region)`-partitioned with the hot-table flags on `block`/`db_row`/`doc_op`. The chain
+/// stays forward-only (the marker, then the additive `02xx_*` table DDL — no backward/destructive
+/// migration). The outbox table + the relay/consumer wiring remains the KN-P06 follow-on.
 fn knowledge_migrations() -> Migrations {
-    Migrations::of([Migration::plain(
+    let mut migrations = vec![Migration::plain(
         "0200_knowledge_schema_marker",
         "CREATE TABLE IF NOT EXISTS knowledge_schema_marker (applied_at TEXT)",
-    )])
+    )];
+    // KN-P05: append the OLTP store schema to the same forward-only chain (EI-01 §7 — one chain,
+    // the store DDL extends the shell's anchor, it does not fork a second migration set).
+    migrations.extend(store::knowledge_store_migrations().0);
+    Migrations::of(migrations)
 }
 
 /// The fail-closed `authenticate` / `check` / `list_objects` slot the Knowledge read/write
