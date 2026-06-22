@@ -66,6 +66,12 @@ pub mod compaction;
 pub mod database;
 pub mod editor;
 pub mod emit;
+/// The Export/Import service (KN-P24 / P-314, M3): the Art. 20 lossless JSON portable bundle (the
+/// mechanism the GDPR `PersonalDataHolder::export` in KN-P25 reuses, 10.1) + the Markdown/HTML/PDF
+/// exporters + the flexible-DB CSV export + the ADF → `myelin-content` lossy-map import (13.2)
+/// recording each lossy node in the [`myelin_content::ImportReport`]. The export/import round-trip
+/// is byte-faithful for the content model (`render(parse(md)) === md` across the boundary, 13.1).
+pub mod export;
 pub mod list_filter;
 pub mod merge;
 pub mod notif_resolve;
@@ -104,6 +110,10 @@ pub use database::{
 };
 pub use editor::{
     Document, EditOp, Editor, EditorBlock, SecondViewer, BROWSER_DRIVE_EVIDENCE,
+};
+pub use export::{
+    export_rows_to_csv, import_adf, AdfImportResult, ExportBlock, ExportDoc, ExportError,
+    ExportFormat, ParsedAdfNode, EXPORT_SCHEMA_VERSION,
 };
 pub use subs::{
     mint_block, mint_heading, register_knowledge_sub_kinds, KNOWLEDGE_OWNED_SUB_KINDS,

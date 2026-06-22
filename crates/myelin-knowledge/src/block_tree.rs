@@ -53,7 +53,7 @@ use std::collections::BTreeMap;
 /// `b<id>`/`h<id>` `#sub` target, 5.7). Minted ONCE at [`BlockTree::insert_block`]; a move or an edit
 /// NEVER re-mints it. Opaque: the bytes carry no positional meaning (it is NOT a Vec index — that is
 /// the editor floor [`crate::editor`] this tree replaces).
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub struct BlockId(pub String);
 
 impl BlockId {
@@ -65,7 +65,7 @@ impl BlockId {
 
 /// A **stable opaque page id** (§2.6 — `page.page_id`; the independently-addressable root of a
 /// root-block subtree, the `knowledge/page/<page_id>` `#sub` root).
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub struct PageId(pub String);
 
 impl PageId {

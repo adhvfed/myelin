@@ -1361,6 +1361,13 @@ cdc = [
     # posture 10.9/X-7, backups shredded). The provider+consumer pair fans locate out + drives the
     # real fan-out via the wired EraseHolders bundle.
     "crates/myelin-git/tests/cdc_10_1_10_4_git_holder.rs",
+    # KN-P24 / P-314 (M3) — the EXPORT half of 10.1: the Knowledge Export/Import service
+    # (`myelin_knowledge::export`) is the Art. 20 lossless-JSON portable-bundle MECHANISM the GDPR
+    # `PersonalDataHolder::export` in KN-P25 reuses (`ExportDoc::to_json_bundle`/`from_json_bundle`,
+    # byte-faithful round-trip + `render(parse(md))===md` across the boundary). The provider+consumer
+    # pair drives the Export service (provider) + the GDPR export(subject) holder pattern (consumer)
+    # that assembles the subject's bundle by reusing it (EI-01 §7, one mechanism).
+    "crates/myelin-knowledge/tests/cdc_13_2_10_1_knowledge_export_import.rs",
 ]
 
 [[contract]]
@@ -1847,9 +1854,17 @@ row = "13.2"
 # conversion table; lossy nodes named + recorded in the import report, X-2/CR-9).
 # Knowledge PROVIDES the table; Issues' import CONSUMES it (builds the named targets +
 # records each lossy conversion).
+# KN-P24 / P-314 (M3): the Knowledge IMPORT consumer — `myelin_knowledge::import_adf` builds the
+# Export/Import service's ADF import against the frozen `myelin_content::MAP`, constructing the named
+# target Block for each node and recording every lossy conversion in the ImportReport (named, never
+# silent); the degraded content survives. Bounded to EXACTLY the frozen map (the X-2 anti-drift
+# anchor). The provider+consumer pair drives the frozen map + the per-import report artifact.
 title = "ADF -> myelin-content lossy-map (frozen)"
 status = "covered"
-cdc = ["crates/myelin-content/tests/cdc_13_2_adf_map.rs"]
+cdc = [
+    "crates/myelin-content/tests/cdc_13_2_adf_map.rs",
+    "crates/myelin-knowledge/tests/cdc_13_2_10_1_knowledge_export_import.rs",
+]
 
 [[contract]]
 row = "13.3"
