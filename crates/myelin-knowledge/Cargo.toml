@@ -99,6 +99,14 @@ default = []
 # ops over `props` (the GIN-covered source of truth) AND conjoins the ACL JOIN over `db_row.id` into
 # ONE leak-free query AND the permission-correct COUNT (0 leak, 0 count-leak, no-cross-db/tenant).
 # tests/integration_kn_d9_flex_db.rs. Registered red-until-proven; flips green only with the real artifact.
+#
+# KN-D10 / P-308 (the read-time rollup permission crux): the read-time rollup engine's
+# permission-filtered conjoin PROVEN against the live dev-stack Postgres — a SUM/COUNT/MAX over the
+# `db_relation` `rollup_source` edges JOINED to `db_row` for the target value AND conjoined with the
+# `list_objects` SetExpr ACL (the authz_visible JOIN over db_row.id) into ONE query → a restricted
+# related row is never counted/summed (0 rollup leak, composing with KN-D5); the per-viewer conjoin
+# (not a blanket hide). Computed at READ TIME, never stored. tests/integration_kn_d10_rollup.rs.
+# Registered red-until-proven; flips green only with the real artifact.
 integration = ["dep:sqlx", "dep:tokio"]
 
 [dev-dependencies]

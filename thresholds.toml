@@ -172,6 +172,14 @@ max_nodes = 10000
 view_read_p99_max_ms = 200    # KN-D9: the flex-DB view-read p99 budget (JSONB + GIN + SetExpr conjoin).
 page_row_cap = 500            # §4.1 step 5: the page row cap (a view read is always row-capped).
 facet_promotion_ratio = 0.05  # contract 6.3: the FROZEN >5% facet-promotion trigger (measured, acted on KN-P31).
+rollup_read_p99_max_ms = 250  # KN-D10 (KN-P18 / P-308, architecture §4.2 / KQ-4): the read-time rollup/formula
+                              # recompute p99 budget. A rollup over a large related set is computed at READ TIME
+                              # (permission-filtered, conjoining list_objects), NEVER stored; its recompute p99 must
+                              # stay within this. A rollup whose MEASURED read-time recompute p99 crosses it
+                              # (RollupLatencyTelemetry::materialisation_candidates) is the per-rollup materialisation
+                              # trigger — promoted to an incrementally-maintained materialised aggregate fed off the bus
+                              # → the OLAP read store (11.6) in KN-P31 (M5). STRICTLY greater-than (a rollup at exactly
+                              # the budget is within budget). Weakening to pass is forbidden (EI-01 §3).
 
 # ---------------------------------------------------------------------------------------------
 # [authz_index] — the S8 authz-reverse-index measured tunables (P-ID-11 / P-069, identity §7.1).

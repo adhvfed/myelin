@@ -313,17 +313,29 @@ pub struct FlexDb {
     /// in KN-P31). The trigger is STRICTLY greater-than (a facet at exactly the ratio does NOT
     /// promote — the frozen wording).
     pub facet_promotion_ratio: f64,
+    /// The KN-D10 read-time rollup/formula recompute p99 budget, in milliseconds (KN-P18 / P-308,
+    /// architecture §4.2 / KQ-4). A rollup over a large related set is computed at READ TIME
+    /// (permission-filtered, conjoining `list_objects`), never stored; its recompute p99 must stay
+    /// within this budget. A rollup whose MEASURED read-time recompute p99 crosses it
+    /// (`RollupLatencyTelemetry::materialisation_candidates`) is the per-rollup promotion trigger —
+    /// promoted to an incrementally-maintained materialised aggregate fed off the bus → the OLAP
+    /// read store (contract 11.6) in KN-P31 (M5). The trigger is STRICTLY greater-than (a rollup at
+    /// exactly the budget is within budget). Weakening this to pass is forbidden (EI-01 §3) — a red
+    /// is a dated `[[claimed_not_proven]]` row, never a lowered bar.
+    pub rollup_read_p99_max_ms: u64,
 }
 
 impl Default for FlexDb {
-    /// The §4.1 / 6.3 seeds: a 200 ms flex-DB view-read p99 budget (the KN-D9 default-to-beat,
+    /// The §4.1 / 6.3 / §4.2 seeds: a 200 ms flex-DB view-read p99 budget (the KN-D9 default-to-beat,
     /// re-confirmed at world scale in KN-P31), a 500-row page cap (`PageBound::MAX`), the frozen 5%
-    /// facet-promotion ratio.
+    /// facet-promotion ratio, and a 250 ms read-time rollup recompute p99 budget (the KN-D10
+    /// default-to-beat; a rollup crossing it is the per-rollup materialisation trigger, KN-P31).
     fn default() -> Self {
         FlexDb {
             view_read_p99_max_ms: 200,
             page_row_cap: 500,
             facet_promotion_ratio: 0.05,
+            rollup_read_p99_max_ms: 250,
         }
     }
 }

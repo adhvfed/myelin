@@ -68,6 +68,7 @@ pub mod emit;
 pub mod list_filter;
 pub mod merge;
 pub mod rebac_fragment;
+pub mod rollup;
 pub mod store;
 pub mod subs;
 pub mod sync_block;
@@ -115,6 +116,11 @@ pub use merge::{
 pub use rebac_fragment::{
     block_read_fragment, database_row_read_fragment, field_view_permission, knowledge_read_fragment,
     page_read_fragment, page_read_override, row_reader_set_expr, space_read_fragment,
+};
+pub use rollup::{
+    compute_row, CellValue, FormulaExpr, FormulaField, FormulaSchema, FormulaSchemaError,
+    MaterialisationHint, RollupFn, RollupLatencyTelemetry, RollupResolver, MAX_DEPENDENCY_DEPTH,
+    MAX_FORMULA_DEPTH, MAX_FORMULA_NODES,
 };
 pub use store::{
     knowledge_scope, knowledge_store_migrations, KnowledgeStore, KnowledgeTable,
