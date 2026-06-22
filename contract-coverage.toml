@@ -589,12 +589,21 @@ landing = "P-281"
 # `crates/myelin-git/tests/drills_git_d9_check_seam_consumer_leg.rs`, and the carriage itself proven
 # over the LIVE NATS JetStream stack in
 # `crates/myelin-events/tests/integration_eb26_check_seam_carriage.rs` (envelope conformance +
-# broker-dedup + per-aggregate ordering — run with --features integration). The row stays DEFERRED
-# because the seam is not yet live END-TO-END: the consumer leg runs against a SYNTHETIC
-# `ci.check.updated` emitter (the X-1 seam-floor) — no real CI PRODUCER yet, and the store-backed
-# projection table/migration is the data-layer follow-on. The real CI producer wiring (CI emits
+# broker-dedup + per-aggregate ordering — run with --features integration).
+# GIT-P20/P-281 (M3) LANDED THE STORE-BACKED PROJECTION (the data-layer follow-on the seam-floor
+# named): `myelin_git::check_status_store::PgCheckStatusProjection` is the LIVE Postgres `check_status`
+# table + migration; its `apply` runs the idempotent-on-event_id consumer_dedup guard + the monotonic
+# `run_attempt` supersession UPSERT (`WHERE EXCLUDED.run_attempt >= …`, the < drop atomic in SQL) in
+# ONE transaction — proven against the dev Postgres stack (GIT-D10 part (a): out-of-order/dup →
+# exactly 1 current row/key; idempotent on event_id) in
+# `crates/myelin-git/tests/integration_git_d10_check_status_projection.rs` (run with
+# --features integration). The supersession-core mutation floor is met (cargo-mutants on
+# `check_status.rs` supersedes/apply/gate path: 10 caught, 0 missed). The row stays DEFERRED because
+# the seam is not yet live END-TO-END: the consumer leg runs against a SYNTHETIC `ci.check.updated`
+# emitter (the X-1 seam-floor) — no real CI PRODUCER yet. The real CI producer wiring (CI emits
 # `ci.check.updated` + the rollup `ci.result`) is the M4 co-gate (GIT-D10/CI-D8 end-to-end) — only
-# then is the full provider+consumer CDC pair closeable to `covered`.
+# then is the full provider+consumer CDC pair closeable to `covered`. The merge gate that READS this
+# projection is GIT-P21; the fork-endorsement is GIT-P22; the merge queue is GIT-P23.
 
 # ──────────────── §6 Search (myelin-search) ─────────────────────────────────────────────────────
 

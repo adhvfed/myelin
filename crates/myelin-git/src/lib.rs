@@ -118,6 +118,13 @@
 /// the per-subject-DEK at-rest seal rides the GIT-P20 store wiring.
 pub mod body;
 pub mod check_status;
+/// The **STORE-BACKED `check_status` projection** (GIT-P20 / P-281, M3): the LIVE Postgres binding of
+/// the in-memory [`check_status::CheckStatusProjection`] — the real table + migration + the same-tx
+/// idempotent-on-`event_id` + monotonic `run_attempt` supersession apply (contract 5.9 / X-1 / §6.1).
+/// Compiled ONLY under `--features integration` (the default build stays DB-free); the GIT-D10
+/// part-(a) green artifact is proven against the dev Postgres stack.
+#[cfg(feature = "integration")]
+pub mod check_status_store;
 pub mod commit;
 /// The **GitCore layered seam** (GIT-P8 / P-269, M3-G1): the strategy trait + router that sends
 /// wire/maintenance ops to sandboxed canonical `git` (the [`core::WireExecutor`] port) and read
