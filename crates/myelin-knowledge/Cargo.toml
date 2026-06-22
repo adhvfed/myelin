@@ -70,6 +70,17 @@ myelin-refs = { path = "../myelin-refs" }
 # Knowledge CONSUMES these frozen primitives; it does NOT re-implement a parallel store/RLS/blob
 # path (EI-01 §7, one primitive). A leaf service consumer above the storage glue, like the others.
 myelin-storage = { path = "../myelin-storage" }
+# The Search feed (KN-P21 / P-311, M3): Knowledge OWNS its `declare_indexable` IndexSpecs (contract
+# 6.3 — the page + significant-block + db_row projections) and DRIVES the `query`/`semantic` Filter
+# conjoin (6.1/6.2) for the KN-D5 re-confirm gate. This is the SAME sanctioned acyclic edge `myelin-git`
+# carries (GIT-P5 `register_git_code_projection_spec`): Search is a LEAF consumer that owns the
+# `IndexSpec` TYPE + the query engine and does NOT depend back on any producer — so a producer service
+# crate may depend on `myelin-search` to register its owned spec + drive the conjoin gate (the DAG stays
+# acyclic; `myelin-search` does NOT depend on `myelin-knowledge`). Knowledge NEVER indexes itself — it
+# PROJECTS text (`page_search_projection`) and Search consumes off the bus (no cross-DB; external-
+# insights/04 §5). The `kn_*_index_spec` shapes are RE-HOMED here verbatim from `myelin-search`
+# (modelled there emitter-less at SRCH-P17 when KN had no service crate; the SHAPE does not change).
+myelin-search = { path = "../myelin-search" }
 # serde_json — the references-not-payloads `knowledge.*` event payload the emit seam (KN-P06) builds
 # (the EventEnvelope.payload carries ids/refs, never an inline body — contract 2.7). The SAME shape
 # every other producer's payload uses; not a parallel serializer.

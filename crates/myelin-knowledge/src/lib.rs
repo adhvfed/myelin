@@ -71,6 +71,7 @@ pub mod rebac_fragment;
 pub mod refs_glue;
 pub mod replay;
 pub mod rollup;
+pub mod search_feed;
 pub mod store;
 pub mod subs;
 pub mod sync_block;
@@ -135,6 +136,19 @@ pub use rollup::{
     compute_row, CellValue, FormulaExpr, FormulaField, FormulaSchema, FormulaSchemaError,
     MaterialisationHint, RollupFn, RollupLatencyTelemetry, RollupResolver, MAX_DEPENDENCY_DEPTH,
     MAX_FORMULA_DEPTH, MAX_FORMULA_NODES,
+};
+// The Search feed (KN-P21 / P-311): Knowledge's OWNED `declare_indexable` 6.3 surface (the page +
+// significant-block + db_row projections, re-homed verbatim from `myelin-search`) + the `query`/
+// `semantic` Filter-conjoin entries (6.1/6.2) that drive the KN-D5 re-confirm (0 leak incl. COUNT
+// across the search/embed/RAG paths). Knowledge NEVER indexes itself — it PROJECTS text via
+// `feed_project`; Search consumes off the bus (no cross-DB). The `FACET_*`/`KN_*_TYPE` consts are
+// re-exported through `search_feed` (re-homed from `myelin-search`); read via that module path to
+// avoid a name clash with the database/refs facets, the same posture `refs_glue` takes.
+pub use search_feed::{
+    feed_project, kn_db_row_index_spec, kn_declared_index_specs, kn_index_specs,
+    kn_page_index_spec, kn_read_permission, kn_search_query, kn_search_semantic,
+    page_search_projection, register_kn_index_specs, FeedGrain, SearchAclFilter,
+    KN_READ_PERMISSION, KN_SEARCH_OBJECT_TYPE,
 };
 pub use store::{
     knowledge_scope, knowledge_store_migrations, KnowledgeStore, KnowledgeTable,
