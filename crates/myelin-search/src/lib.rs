@@ -131,6 +131,7 @@ pub mod residency;
 pub mod shell;
 pub mod subartifact;
 pub mod telemetry;
+pub mod tier3_valve;
 pub mod vector;
 
 pub use cache::{
@@ -207,6 +208,10 @@ pub use subartifact::{
 };
 pub use telemetry::{
     signal as telemetry_signal, LabelledSignal, RedLabels, SearchTelemetry, CACHE_RATIO_ABSENT,
+};
+pub use tier3_valve::{
+    board_acl_filter, escalate_to_search, oltp_board_admits, BoardEscalationAuthz, BoardQuery,
+    OltpBudget, ReverseResolver, Tier3ValveSurgeFloor,
 };
 pub use vector::{Embedding, HnswVectorIndex, ModelRef, VectorHit, VectorRecord};
 

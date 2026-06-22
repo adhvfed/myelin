@@ -503,7 +503,13 @@ fn lower_acl(
 /// forms lower directly; the relational forms JOIN against the reverse index (honouring `required`,
 /// the revision watermark); the boolean forms compose recursively into `And`/`Or`/`Not`. No silent
 /// widen to `All` for any form.
-fn lower_set_expr(
+///
+/// `pub(crate)` so the **Issues Tier-3 board-escalation valve** ([`crate::tier3_valve`], SRCH-P21 /
+/// P-339) lowers the board's `Filter{set_expr}` through the **SAME ONE lowering** the live
+/// permission-aware [`query`] pipeline uses — there is NO second `SetExpr` lowering the valve could
+/// drift from. The valve's byte-identical-ACL-pre-filter parity (the OLTP board and Search apply the
+/// IDENTICAL pre-filter) is a property of sharing THIS function, not of two implementations agreeing.
+pub(crate) fn lower_set_expr(
     set_expr: &SetExpr,
     subject: &Principal,
     identity: &dyn ListObjectsPort,

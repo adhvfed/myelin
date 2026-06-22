@@ -964,10 +964,17 @@ title = "query(ast, viewer, zookie?, page) -> RankedResults"
 # KN-P21/P-311 (M3) adds the KNOWLEDGE CONSUMER half: `myelin_knowledge::search_feed::kn_search_query`
 # drives `query` ALWAYS through the conjoining entry, pinned to the `page` object type — the KN-D5
 # re-confirm: a confidential page appears in NEITHER the result NOR the COUNT (0 leak incl. COUNT).
+# SRCH-P21/P-339 (M4) adds the ISSUES TIER-3 BOARD-ESCALATION VALVE CONSUMER half: an over-budget
+# Issues board escalates to `escalate_to_search`, which drives `query` conjoining the SAME
+# `Filter{set_expr}` the OLTP board would have used (carried verbatim, not re-derived). The valve
+# parity check proves BYTE-IDENTICAL visible rows across the OLTP board tier and the Search valve
+# tier (0 leak divergence between the two ACL pre-filters — both share `pipeline::lower_set_expr`,
+# no second interpreter), plus SRCH-D1 on the valve path (0 confidential-issue leak incl. counts).
 status = "covered"
 cdc = [
     "crates/myelin-search/tests/cdc_query_pipeline_6_1.rs",
     "crates/myelin-knowledge/tests/cdc_6_3_6_1_6_2_knowledge_search_feed.rs",
+    "crates/myelin-search/tests/cdc_tier3_valve_6_1.rs",
 ]
 
 [[contract]]
