@@ -97,6 +97,10 @@ myelin-search = { path = "../myelin-search" }
 # serde_json — the references-not-payloads `knowledge.*` event payload the emit seam (KN-P06) builds
 # (the EventEnvelope.payload carries ids/refs, never an inline body — contract 2.7). The SAME shape
 # every other producer's payload uses; not a parallel serializer.
+# serde derive — the Export/Import service (KN-P24 / P-314) derives Serialize/Deserialize on the
+# Art. 20 lossless JSON bundle shapes (ExportDoc/ExportBlock/ExportFormat). The SAME workspace serde
+# every crate uses; not a parallel serializer.
+serde = { workspace = true }
 serde_json = { workspace = true }
 # KN-P06: the REAL Postgres outbox co-commit proof behind the `integration` feature
 # (tests/integration_kn_d7_outbox.rs). The OPTIONAL sqlx + tokio deps are pulled ONLY by
