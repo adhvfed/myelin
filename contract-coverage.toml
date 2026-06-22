@@ -637,7 +637,16 @@ status = "covered"
 # `myelin-git` cannot depend on the Refs SERVICE crate). The Refs-side emit/edge-builder unit + CDC
 # (cdc_5_4_emit_seam.rs / cdc_5_4_edge_builder.rs) prove the same seam from the Refs crate; the
 # self-complete pair listed here satisfies the gate's per-file provider+consumer evidence.
-cdc = ["crates/myelin-git/tests/cdc_5_4_13_1_git_content_edges.rs"]
+# KN-P19 / P-309 (M3) adds the KNOWLEDGE-OWNED producer half: the three structured content nodes
+# (`mention`/`artifact_ref`/`embed`) in a Knowledge page/block emit the byte-identical
+# `refs.edge.created` (reference-class) wire shape via the outbox, NOT coalesced (a discrete edge
+# fact); no standalone edge-write API (`myelin_knowledge::refs_glue::emit_content_edges`). The CDC
+# carries the provider (the emit shape + the shared edge aggregate) + the consumer field reads
+# (reference-class never aliases lifecycle), modelled locally (myelin-knowledge is a producer LEAF).
+cdc = [
+    "crates/myelin-git/tests/cdc_5_4_13_1_git_content_edges.rs",
+    "crates/myelin-knowledge/tests/cdc_5_4_5_5_5_6_5_7_knowledge_refs_glue.rs",
+]
 
 [[contract]]
 row = "5.5"
@@ -653,8 +662,20 @@ title = "TE-7 typed-edge mirror"
 # cannot depend on the Refs SERVICE crate (the §2.9 one-directional edge: `myelin-refs-service` depends
 # on `myelin-git`). Git emits the FORWARD edge only; the inverse projection is the Refs mirror's
 # (`relates` symmetric swap; `closes` has the `Inverse::None` floor — REF-P18/REF-P20 mint the token).
+# KN-P19 / P-309 (M3) adds the KNOWLEDGE-OWNED PRODUCER half — the SAME transaction that writes a
+# `page_parent` (`PageTree::set_parent`) / `db_relation` (`RelationStore::relate`) typed row emits
+# `knowledge.page.parent_set` / `knowledge.relation.created`/`.removed` (`rel_class='lifecycle'`) via
+# the outbox (`myelin_knowledge::refs_glue::{emit_page_parent_set, emit_relation_edge}`), so 0
+# typed-row-without-edge. The typed table is the SOURCE OF TRUTH; Knowledge emits the FORWARD edge
+# only — the inverse `child` pairing + the both-directions projection is the Refs mirror's (the §2.9
+# one-directional edge: `myelin-refs-service` depends on the producer crates; the CDC models the
+# consumer field reads locally). The block-granular replay that REBUILDS the Refs projection from the
+# typed table (the TE-7 drift-correction; cold == live) is KN-P20 / P-310 (named).
 status = "covered"
-cdc = ["crates/myelin-git/tests/cdc_5_5_git_lifecycle_edges.rs"]
+cdc = [
+    "crates/myelin-git/tests/cdc_5_5_git_lifecycle_edges.rs",
+    "crates/myelin-knowledge/tests/cdc_5_4_5_5_5_6_5_7_knowledge_refs_glue.rs",
+]
 
 [[contract]]
 row = "5.6"
@@ -663,8 +684,18 @@ title = "project(ref, viewer)"
 # pair as row 5.2): git's `project` is the ONLY way Refs/Search/Notif read a git artifact, per-viewer
 # permission-checked (deny ⇒ Tombstone, 0 title leak). The general Refs resolver bulk (the per-kind
 # resolution spine across ALL subsystems) remains the P-159 follow-on (named in row 5.2).
+# KN-P19 / P-309 (M3) adds the KNOWLEDGE-OWNED `project(ref, viewer)` half
+# (`myelin_knowledge::refs_glue::Projector::project`) — the ONLY way Refs/Search/Notif read a
+# Knowledge artifact (no cross-DB), per-viewer permission-checked on the `#sub`-stripped ROOT (a sub
+# is never more visible than its parent): a confidential page degrades to a content-free tombstone
+# CARRYING THE ROOT, never the title (the project-leak counter = 0). The frozen
+# `{title,state,icon,render_hint,sub_anchor?}` shape; mandatory-core (a project leak IS the failure),
+# mutation floor ≥ 90% on refs_glue.rs (the permission-first gate + each ladder rung).
 status = "covered"
-cdc = ["crates/myelin-git/tests/cdc_5_1_5_2_5_6_git_project.rs"]
+cdc = [
+    "crates/myelin-git/tests/cdc_5_1_5_2_5_6_git_project.rs",
+    "crates/myelin-knowledge/tests/cdc_5_4_5_5_5_6_5_7_knowledge_refs_glue.rs",
+]
 
 [[contract]]
 row = "5.7"
@@ -685,14 +716,19 @@ cdc = [
     "crates/myelin-git/tests/cdc_5_7_git_sub_mints.rs",
     "crates/myelin-chat/tests/cdc_5_7_chat_sub_mints.rs",
     "crates/myelin-knowledge/tests/cdc_5_7_knowledge_stable_id_mint.rs",
+    "crates/myelin-knowledge/tests/cdc_5_4_5_5_5_6_5_7_knowledge_refs_glue.rs",
 ]
 # KN-P10 / P-300 (M3) adds Knowledge's owned `b<id>` / `h<id>` stable block-id mints — the §2.3
 # stability obligation (the `block_id` is stable across edits/moves/collaboration; the move is an
 # `order_key` write, NEVER an id re-mint). The provider+consumer pair
 # (cdc_5_7_knowledge_stable_id_mint.rs) registers the kinds with Refs, classifies every mint to its
 # declared kind (0 ungrammatical), and PROVES the minted `#sub` is byte-identical across a real
-# `BlockTree::move_block` (the `moved_block_id_dangles == 0` stable-id gate). The `b`/`h`
-# `project(ref, viewer)` 4-step-ladder resolver is the KN-P19 follow-on (deferred, NAMED).
+# `BlockTree::move_block` (the `moved_block_id_dangles == 0` stable-id gate).
+# KN-P19 / P-309 (M3) FILLS the named `b`/`h` `project(ref, viewer)` 4-step-ladder follow-on: the
+# Knowledge projector runs the ONE frozen ladder (permission → root → sub {LIVE/MOVED/OUTDATED/GONE}
+# → ERASED) over Knowledge's `#sub` anchors — a tombstone ALWAYS carries the root (the embed degrades
+# to "this referenced <page>" rather than vanishing); a MOVED block still resolves (the stable
+# `block_id` is a tree move, not a 3-way diff). Proven in cdc_5_4_5_5_5_6_5_7_knowledge_refs_glue.rs.
 
 [[contract]]
 row = "5.8"

@@ -68,6 +68,7 @@ pub mod emit;
 pub mod list_filter;
 pub mod merge;
 pub mod rebac_fragment;
+pub mod refs_glue;
 pub mod rollup;
 pub mod store;
 pub mod subs;
@@ -116,6 +117,17 @@ pub use merge::{
 pub use rebac_fragment::{
     block_read_fragment, database_row_read_fragment, field_view_permission, knowledge_read_fragment,
     page_read_fragment, page_read_override, row_reader_set_expr, space_read_fragment,
+};
+// The Refs glue (KN-P19 / P-309): the inline-node `refs.edge.created` producer (5.4), the TE-7
+// typed-edge mirror (5.5), and the `project(ref, viewer)` 4-step tombstone ladder (5.6 / 5.7). The
+// projector's `Projection`/`Tombstone`/`TombstoneReason` types collide by NAME with the `sync_block`
+// read-projection floor's (a DIFFERENT shape — that is the sync_block render, this is the refs
+// project), so they are NOT glob-re-exported; consumers read them through the `refs_glue` module path.
+// The non-clashing producer/mirror surface is re-exported here.
+pub use refs_glue::{
+    edge_aggregate_key, emit_content_edges, emit_page_parent_set, emit_relation_edge,
+    KnowledgeLifecycleRel, LadderRung, PageMeta, PageStore, Projected, Projector, SubAnchor, SubState,
+    ProjectError as RefsProjectError, REFS_EDGE_CREATED, REL_CLASS_LIFECYCLE, REL_CLASS_REFERENCE,
 };
 pub use rollup::{
     compute_row, CellValue, FormulaExpr, FormulaField, FormulaSchema, FormulaSchemaError,
