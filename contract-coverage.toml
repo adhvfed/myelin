@@ -1913,11 +1913,23 @@ title = "residency_verify -> SignedAttestation"
 # proves a CI-coverage attestation provider + an auditor consumer that DEMANDS CI coverage agree; the
 # CI-R3 drill (ci_r3_residency_verify_ci_drill.rs) proves the gate goes red on a wrong-region CI
 # runner/log/cache. The in-region runner-CLAIM enforcement is the sibling P-CP-18 / P-325.
+# The RESIDENCY-PINNED-RUNNERS leg EXTENDS this same row in M4 (P-CP-18 / P-325 — LANDED: P-CP-17 made
+# the no-global-CI-pool property ATTESTABLE (a wrong-region CI store FAILs residency_verify); P-CP-18
+# makes it ENFORCED AT CLAIM TIME — the control-plane region-pin assertion (RunnerClaimPin::admit_claim)
+# admits a CI runner-claim of an EU tenant's run ONLY from an in-region runner (0 out-of-region claims),
+# and the residency-pin leg (RunnerClaimPin::pin_ci_store_write, contract 1.6) pins every CI-store write
+# (logs/artifacts/caches never leave the region). The CI subsystem owns the runner-claim MECHANISM
+# (myelin_ci_sandbox::JobLeaseStore::claim_for_labels, whose predicate already skips out-of-region jobs);
+# Tenancy owns the region-pin ASSERTION. The cross-owner CDC pair below proves the CI claim mechanism
+# (PROVIDER) and the control-plane region-pin assertion (CONSUMER) AGREE — an out-of-region runner is
+# refused from both sides; the CI-R3 runner-claim drill (ci_r3_runner_claim_drill.rs) proves the gate
+# goes red on an out-of-region claim. No floor — this completes the CI residency posture begun in P-CP-17.
 status = "covered"
 cdc = [
     "crates/myelin-storage/tests/cdc_12_4_storage_residency_report.rs",
     "crates/myelin-storage/tests/cdc_10_5_mirror_crossing_flag.rs",
     "crates/myelin-control-plane/tests/cdc_12_4_residency_verify_ci_coverage.rs",
+    "crates/myelin-control-plane/tests/cdc_ci_r3_runner_claim_region_pin.rs",
 ]
 
 [[contract]]

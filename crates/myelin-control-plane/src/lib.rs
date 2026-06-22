@@ -107,6 +107,17 @@
 //!   `residency_verify`). The in-region runner-CLAIM enforcement is the sibling **P-CP-18**; the CP-D3
 //!   write-boundary runtime drill + STOR-D5 cross-region egress ride the four-layer enforcement
 //!   (P-CP-12), against the live stack.
+//! - **Residency-pinned runners are LIVE (P-CP-18 / P-325, [`runner_claim_pin`]).** P-CP-17 made the
+//!   no-global-CI-pool property ATTESTABLE (a wrong-region CI store FAILS `residency_verify`); P-CP-18
+//!   makes it ENFORCED at claim time. [`runner_claim_pin::RunnerClaimPin::admit_claim`] is the
+//!   control-plane region-pin assertion over the CI runner claim: an EU-resident tenant's CI run is
+//!   claimed ONLY by an in-region runner (an out-of-region runner is REJECTED, **0 out-of-region
+//!   claims**); [`runner_claim_pin::RunnerClaimPin::pin_ci_store_write`] runs the `residency-pin` leg
+//!   (1.6) over every CI-store write the run makes (logs/artifacts/caches never leave the region),
+//!   REUSING the four-layer [`four_layer::ResidencyWriteBoundary`] (P-CP-12). The CI subsystem owns the
+//!   runner-claim MECHANISM (`myelin_ci_sandbox::JobLeaseStore::claim_for_labels`, whose claim
+//!   predicate already skips out-of-region jobs); Tenancy owns the region-pin ASSERTION. No floor here
+//!   — this completes the CI residency posture begun in P-CP-17 (CI-R3 runner-claim leg).
 //! - **The GeoDNS/anycast discovery edge is `[OPEN → P4 (infra)]`** (architecture §7.3) — a latency
 //!   optimisation that fronts the PII-free discovery contract with a geo-routed edge. **v1 is
 //!   CP-lookup + client cache** ([`discover::DiscoveryCache`]); the edge is an infra follow-on, not a
@@ -154,6 +165,7 @@ pub mod placement_of_repo;
 pub mod provision;
 pub mod registry;
 pub mod residency_verify;
+pub mod runner_claim_pin;
 pub mod schema;
 pub mod self_host;
 
@@ -190,6 +202,7 @@ pub use residency_verify::{
     ResidencyAttestationSignal, ResidencyMismatch, ResidencySigningKey, ResidencyStoreClass,
     SignedAttestation, StoreRegionReport,
 };
+pub use runner_claim_pin::{CiStoreWritePinError, OutOfRegionRunnerClaim, RunnerClaimPin};
 pub use schema::{
     Capacity, Cell, CellProvisioning, CellStatus, IsolationKind, LocalTenant, PlacementStatus,
     ProvisioningOutcome, TenantPlacement,
