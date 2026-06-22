@@ -352,6 +352,38 @@ impl FirehoseArchiver {
         }
     }
 
+    /// **Build a firehose archive that seals every segment under a per-SUBJECT DEK (the C1 lever,
+    /// P-ST-27).** Identical to [`Self::with_tenant_dek`] except the [`DekContentWrap`] is keyed to
+    /// the per-SUBJECT DEK class (`CryptoShred("subject_dek")` + the subject) — so every segment this
+    /// archive seals rests as ciphertext under THAT subject's DEK, and destroying the subject's DEK
+    /// (the [`crate::erase`] step-2 crypto-shred) renders exactly this subject's segments
+    /// unrecoverable (live AND in backups) **without touching the rest of the tenant's logs**. This is
+    /// the key-CLASS swap the P-ST-20 floor named: NO new sealing mechanism, NO second key store — the
+    /// SAME [`DekContentWrap`] seam over the SAME [`KmsEngine`], differing only in the chosen key
+    /// class. Used by the CI log tier (P-ST-27) for an isolable-PII CI log segment.
+    pub fn with_subject_dek(
+        subject: crate::encryption::SubjectId,
+        tenant: TenantId,
+        region: Region,
+        engine: std::sync::Arc<KmsEngine>,
+    ) -> FirehoseArchiver {
+        // The per-SUBJECT DEK class — the GD-4 individual-erasure lever (§5.1). The `key_class_for`
+        // rule maps `CryptoShred("subject_dek")` + a subject to `KeyClass::Subject(<id>)`.
+        let wrap = DekContentWrap::new(
+            engine,
+            region.clone(),
+            ErasureMethod::CryptoShred("subject_dek".to_string()),
+            Some(subject),
+        );
+        FirehoseArchiver {
+            tenant,
+            region,
+            store: FsBlobStore::with_wrap(Box::new(wrap)),
+            segments: Mutex::new(Vec::new()),
+            telemetry: ArchiveTelemetry::default(),
+        }
+    }
+
     /// **Seal a batch of firehose frames into a content-addressed, DEK-encrypted T2 segment (§3.3).**
     /// The frames are encoded deterministically ([`SegmentBytes::encode`]), written through the
     /// DEK-wrapping content-addressed store (the segment rests as ciphertext under the tenant DEK,
@@ -655,6 +687,45 @@ mod tests {
         assert!(
             result.is_err(),
             "a crypto-shredded segment is unrecoverable (LOUD), never served"
+        );
+    }
+
+    #[test]
+    fn with_subject_dek_seals_under_the_subject_and_shreds_only_that_subject() {
+        // C1 (P-ST-27): a subject-keyed archive seals under the subject's per-subject DEK — destroying
+        // THAT subject's DEK renders its segments unrecoverable, while the tenant DEK does NOT.
+        use crate::encryption::SubjectId;
+        let eng = engine();
+        let arch = FirehoseArchiver::with_subject_dek(
+            SubjectId::new("u-alice"),
+            tenant(),
+            region(),
+            eng.clone(),
+        );
+        let seg = arch.seal("ci-logs", "run:1", &frames(&[1])).expect("seal");
+        assert_eq!(
+            arch.read_segment(&seg.content_hash).expect("read"),
+            frames(&[1])
+        );
+
+        // Destroying the per-TENANT DEK leaves the subject segment readable (it keys per-subject).
+        // (The tenant DEK may not even exist for this subject-only archive — a no-op destroy; the
+        // point is the subject segment is keyed under the subject DEK, not the tenant DEK.)
+        eng.destroy_dek(&DekId::new(tenant(), KeyClass::Tenant));
+        assert_eq!(
+            arch.read_segment(&seg.content_hash)
+                .expect("read after tenant-DEK destroy"),
+            frames(&[1]),
+            "the subject-keyed segment is not shredded by the tenant DEK destroy"
+        );
+        // Destroying the SUBJECT's DEK renders it unrecoverable (LOUD).
+        assert!(eng.destroy_dek(&DekId::new(tenant(), KeyClass::Subject("u-alice".into()))));
+        let after = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            arch.read_segment(&seg.content_hash)
+        }));
+        assert!(
+            after.is_err(),
+            "the subject's segment is crypto-shredded (unrecoverable)"
         );
     }
 
