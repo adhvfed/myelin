@@ -99,7 +99,8 @@ pub use myelin_gdpr_macros::PersonalData;
 
 pub mod __registry;
 pub use __registry::{
-    ErasureKeyClass, HasPersonalData, PersonalDataField, PersonalDataTags, SpecialCategoryFlag,
+    default_data_role_default, DataRoleDefault, ErasureKeyClass, HasPersonalData,
+    PersonalDataField, PersonalDataTags, SpecialCategoryFlag,
 };
 
 /// The `SpecialCategory` → DPIA router (contract 10.2; gdpr §2.3) — P-GA-08 / P-108. The

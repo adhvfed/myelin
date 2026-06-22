@@ -67,3 +67,9 @@ myelin-substrate = { path = "../myelin-substrate" }
 # author/committer lines lifted from `Commit::canonical_bytes` and assert they hold only the frozen
 # pseudonym form — the M3 enforcement P-GA-18 named (the verdict scaffold firing on the live codec).
 myelin-git = { path = "../myelin-git" }
+# TEST-ONLY (P-GA-31 → P-334): the GA-D7 worklog-leg drill reads the LIVE Issues schema tags
+# (`myelin_issues::schema::Issue` — the `worklog_seconds` / `story_points` restricted-by-default
+# fields) off the classify-derive registry, proving the OQ-H §2.4 restriction over the real tag, not
+# a fixture. `myelin-issues` depends on the `myelin-gdpr` CONTRACT crate (not this service), so there
+# is no production-DAG cycle (and nothing in the library DAG depends back on this leaf service).
+myelin-issues = { path = "../myelin-issues" }

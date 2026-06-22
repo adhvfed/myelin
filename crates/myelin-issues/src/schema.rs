@@ -23,9 +23,10 @@
 //!   `role = TenantContent`, **`basis = TBD_LEGAL`** (the `[OPEN — LEGAL]` residual, R-2:
 //!   special-category-vs-elevated ratification is a parallel legal track — counsel/DPO ratify the
 //!   basis; the structural tag ships NOW), `retention = TenantPolicy`,
-//!   **restricted-by-default** (OQ-H: excluded from cross-individual analytics + agent-use for a
-//!   restricted subject; per-individual rollups OFF by default behind tenant-admin enablement). They
-//!   carry the same per-subject DEK crypto-shred lever as other free-text PII.
+//!   **`data_role_default = Restricted`** (OQ-H, P-GA-31 — now a STRUCTURAL tag: excluded from
+//!   cross-individual analytics + agent-use for a restricted subject; per-individual rollups OFF by
+//!   default behind tenant-admin enablement that surfaces the works-council consultation trigger).
+//!   They carry the same per-subject DEK crypto-shred lever as other free-text PII.
 //!
 //! All free-text/identity fields are `role = TenantContent` (processor posture: the customer org is
 //! the controller of issue content; a DSR is answered by/for the tenant, Art. 28 — 03 §7). The tag's
@@ -120,6 +121,7 @@ pub struct Issue {
         retention = TenantPolicy,
         erasure = CryptoShred(subject_dek),
         subject_locator = "created_by_pseudonym",
+        data_role_default = Restricted,
     )]
     pub worklog_seconds: i64,
     /// **OQ-H productivity (behavioural).** The issue's story-point estimate (a numeric, not money).
@@ -131,6 +133,7 @@ pub struct Issue {
         retention = TenantPolicy,
         erasure = CryptoShred(subject_dek),
         subject_locator = "assignee_pseudonym",
+        data_role_default = Restricted,
     )]
     pub story_points: f64,
 }
