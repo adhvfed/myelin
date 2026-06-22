@@ -268,7 +268,9 @@ impl SendOutcome {
 /// are byte-faithful, so the KN-D1 protocol property proven here holds against the live table.
 #[derive(Debug, Default, Clone)]
 pub struct DocOpLog {
-    /// The applied ops in `op_seq` order (the live tail; compaction to a snapshot is KN-P11).
+    /// The applied ops in `op_seq` order (the live tail; compaction to a content-addressed snapshot +
+    /// op-log GC landed in KN-P11 — see [`crate::compaction::SnapshotCompactor`], which reads this tail
+    /// via [`Self::ops_up_to`] / [`Self::ops_in_range`] and prunes it via [`Self::gc_below`]).
     ops: Vec<PersistedOp>,
     /// The `UNIQUE(op_id)` index: `op_id.wire()` → the `op_seq` it first got (the idempotent guard).
     by_op_id: HashMap<String, u64>,
@@ -317,6 +319,49 @@ impl DocOpLog {
     /// The highest assigned `op_seq` (the live head; the resume cursor a caught-up client holds).
     pub fn head_seq(&self) -> u64 {
         self.last_seq
+    }
+
+    /// **The ops with `op_seq ≤ up_to`, in `op_seq` order (the compaction prefix, KN-P11).** The
+    /// materialised state a compaction snapshots is `materialize(ops_up_to(snap_seq))` — the doc's
+    /// state up to (and including) the snapshot boundary. After a GC pruned rows ≤ a watermark, this
+    /// returns only the RETAINED ops ≤ `up_to` (the snapshot carries the pruned remainder).
+    pub fn ops_up_to(&self, up_to: u64) -> Vec<PersistedOp> {
+        self.ops.iter().filter(|p| p.op_seq <= up_to).cloned().collect()
+    }
+
+    /// **The ops in `(from, to]`, in `op_seq` order (the tail a version-history reconstruct appends on
+    /// top of a snapshot seed, KN-P11).** A reconstruct of version `to` from the nearest snapshot at
+    /// `from = snap_seq` is `seed_state ++ materialize(ops_in_range(snap_seq, to))`.
+    pub fn ops_in_range(&self, from: u64, to: u64) -> Vec<PersistedOp> {
+        self.ops
+            .iter()
+            .filter(|p| p.op_seq > from && p.op_seq <= to)
+            .cloned()
+            .collect()
+    }
+
+    /// **The lowest `op_seq` still retained in the op-log (the GC floor), or `0` if the log is empty.**
+    /// A version-history reconstruct uses this to detect a pruned gap: a needed op below this floor was
+    /// GC'd with (potentially) no covering snapshot (KN-P11's `guard_no_gap`).
+    pub fn lowest_seq(&self) -> u64 {
+        self.ops.iter().map(|p| p.op_seq).min().unwrap_or(0)
+    }
+
+    /// **GC: prune the ops with `op_seq ≤ watermark` (the compacted, no-longer-needed range, KN-P11 /
+    /// arch §3).** The caller ([`crate::compaction::SnapshotCompactor::gc`]) computes the watermark as
+    /// `min(snap_seq, lowest_open_cursor)` so a row a connected client still trails is RETAINED (the
+    /// cursor is the GC watermark — KD-1 survives compaction). The `by_op_id` idempotent-apply index is
+    /// pruned in lock-step (a pruned op's `op_id` is no longer in the live tail; a re-delivery of it
+    /// would re-apply — but a re-delivery older than the watermark is below every open cursor, so no
+    /// connected client can produce it; the durable record is the snapshot). **The `last_seq` counter
+    /// is NOT reset** — it stays monotone so future ops continue `head + 1`. Returns the rows pruned.
+    pub fn gc_below(&mut self, watermark: u64) -> usize {
+        let before = self.ops.len();
+        self.ops.retain(|p| p.op_seq > watermark);
+        // Keep the idempotent-apply index consistent with the retained tail (prune the pruned ops'
+        // op_ids). The monotone last_seq is untouched (the seq counter survives the prune).
+        self.by_op_id.retain(|_, seq| *seq > watermark);
+        before - self.ops.len()
     }
 
     /// The number of ops in the live tail (bounded by the compaction cadence, KN-P11).
@@ -961,5 +1006,103 @@ mod tests {
         assert_ne!(OpId::new("c1", 1).wire(), OpId::new("c1", 2).wire());
         // the same (client, lamport) is the SAME key (the idempotent-apply determinism).
         assert_eq!(OpId::new("c1", 1).wire(), OpId::new("c1", 1).wire());
+    }
+
+    // ---- the KN-P11 compaction helpers (ops_up_to / ops_in_range / lowest_seq / gc_below) ---------
+
+    /// A log with ops op_seq 1..=n (one per lamport), for the compaction-helper boundary tests.
+    fn log_seq(n: u64) -> DocOpLog {
+        let mut log = DocOpLog::new();
+        for i in 1..=n {
+            log.persist(op("c1", i, OpKind::Insert));
+        }
+        log
+    }
+
+    /// **`ops_up_to(k)` is INCLUSIVE of `k` (the compaction prefix boundary).** The compacted prefix
+    /// must include op_seq == k (the snapshot includes ops up to AND including snap_seq).
+    #[test]
+    fn ops_up_to_is_inclusive() {
+        let log = log_seq(5);
+        let seqs: Vec<u64> = log.ops_up_to(3).iter().map(|p| p.op_seq).collect();
+        assert_eq!(seqs, vec![1, 2, 3], "ops_up_to(3) includes op_seq 3 (inclusive prefix)");
+        assert!(log.ops_up_to(0).is_empty(), "ops_up_to(0) is empty");
+        assert_eq!(log.ops_up_to(5).len(), 5, "ops_up_to(head) is the whole log");
+    }
+
+    /// **`ops_in_range(from, to)` is `(from, to]` — `from` EXCLUSIVE, `to` INCLUSIVE (the tail boundary
+    /// a reconstruct appends on a snapshot seed).** op_seq == from is EXCLUDED (the seed covers it);
+    /// op_seq == to is INCLUDED (the target version).
+    #[test]
+    fn ops_in_range_is_from_exclusive_to_inclusive() {
+        let log = log_seq(6);
+        let seqs: Vec<u64> = log.ops_in_range(2, 5).iter().map(|p| p.op_seq).collect();
+        assert_eq!(
+            seqs,
+            vec![3, 4, 5],
+            "(2, 5] excludes the seed boundary 2 and includes the target 5"
+        );
+        // The from-exclusive boundary specifically: op_seq == from must NOT appear (kills `>` → `>=`).
+        assert!(
+            !log.ops_in_range(3, 6).iter().any(|p| p.op_seq == 3),
+            "op_seq == from is excluded (the seed already covers it)"
+        );
+    }
+
+    /// **`lowest_seq` is the GC floor (the lowest retained op_seq, 0 if empty).** After a GC prunes
+    /// the low end, `lowest_seq` rises — the gap detector reads it.
+    #[test]
+    fn lowest_seq_is_the_gc_floor() {
+        let mut log = log_seq(5);
+        assert_eq!(log.lowest_seq(), 1, "the lowest retained op is op_seq 1");
+        log.gc_below(2); // prune ≤ 2
+        assert_eq!(log.lowest_seq(), 3, "after GC ≤ 2 the floor rises to op_seq 3");
+        log.gc_below(99); // prune everything retained
+        assert_eq!(log.lowest_seq(), 0, "an empty log's floor is 0");
+    }
+
+    /// **`gc_below(w)` prunes `op_seq ≤ w` and RETAINS `op_seq > w` (the watermark boundary).** A row
+    /// AT the watermark is pruned; a row ABOVE it is retained (kills the `>` → `==`/`<`/`>=` mutants on
+    /// the retention predicate). The monotone `last_seq` counter survives.
+    #[test]
+    fn gc_below_prunes_at_and_below_the_watermark_keeps_above() {
+        let mut log = log_seq(6);
+        let pruned = log.gc_below(3); // prune op_seq ≤ 3, keep 4,5,6
+        assert_eq!(pruned, 3, "exactly op_seq 1,2,3 (≤ watermark) pruned");
+        let kept: Vec<u64> = log.ops_up_to(6).iter().map(|p| p.op_seq).collect();
+        assert_eq!(kept, vec![4, 5, 6], "op_seq AT the watermark (3) is pruned; ABOVE it is kept");
+        assert_eq!(log.head_seq(), 6, "the monotone op_seq counter survives the prune");
+        // The idempotent index is pruned in lock-step with the SAME watermark boundary: a RETAINED
+        // op's op_id stays in the index (a re-delivery is still a Duplicate resolving to its kept
+        // op_seq), while a PRUNED op's op_id leaves the index (a re-delivery becomes a fresh Apply).
+        // This pins line 361's `> watermark` boundary exactly (kills ==/</>= on the index prune).
+        let redelivered_kept = log.persist(op("c1", 4, OpKind::Insert)); // op_seq 4 was KEPT (> 3)
+        assert!(
+            matches!(redelivered_kept, SendOutcome::Duplicate(_)),
+            "a retained op's op_id stays in the index → its re-delivery is an idempotent Duplicate"
+        );
+        assert_eq!(redelivered_kept.persisted().op_seq, 4, "resolves to the kept op_seq (4)");
+        let redelivered_pruned = log.persist(op("c1", 2, OpKind::Insert)); // op_seq 2 was PRUNED (≤ 3)
+        assert!(
+            redelivered_pruned.applied(),
+            "a pruned op's op_id left the index → its re-delivery is a fresh Apply (not a stale dup)"
+        );
+        // The op EXACTLY AT the watermark (op_seq 3) is pruned from BOTH ops and the index in
+        // lock-step (the same `> watermark` boundary on line 361): its re-delivery is a fresh Apply,
+        // never a Duplicate pointing at a pruned-from-ops op_seq (which would panic). Pins `>` vs `>=`.
+        let redelivered_at_watermark = log.persist(op("c1", 3, OpKind::Insert)); // op_seq 3 == watermark
+        assert!(
+            redelivered_at_watermark.applied(),
+            "the op AT the watermark left the index too (consistent prune) → a fresh Apply"
+        );
+        // The fresh op continues head+1 (the monotone counter survived the prune). Head: 6 (kept dup
+        // op_seq 4 was a no-op) → 7 (pruned op_seq 2 re-applied) → 8 (op_seq 3 re-applied), so the
+        // next fresh op is op_seq 9.
+        let next = log.persist(op("c1", 7, OpKind::Insert));
+        assert_eq!(next.persisted().op_seq, 9, "a fresh op continues head+1 after GC + the re-applies");
+        // gc_below(0) is a no-op (nothing at-or-below 0).
+        let mut log2 = log_seq(3);
+        assert_eq!(log2.gc_below(0), 0, "gc_below(0) prunes nothing");
+        assert_eq!(log2.len(), 3);
     }
 }

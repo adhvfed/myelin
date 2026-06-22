@@ -60,6 +60,7 @@
 /// fixed point). The block tree + stable ids is the follow-on KN-P10 (P-300); no merge engine
 /// (KN-P13/P29) and no perms beyond tenant isolation (KN-P14/P16).
 pub mod block_tree;
+pub mod compaction;
 pub mod editor;
 pub mod emit;
 pub mod store;
@@ -69,6 +70,9 @@ pub mod transport;
 pub use block_tree::{
     children_index_range_sql, recursive_subtree_cte_sql, BlockId, BlockRow, BlockTree, PageId,
     PageTree, TreeError,
+};
+pub use compaction::{
+    content_address, materialize, CompactionError, DocSnapshot, SnapshotCompactor,
 };
 pub use editor::{
     Document, EditOp, Editor, EditorBlock, SecondViewer, BROWSER_DRIVE_EVIDENCE,
