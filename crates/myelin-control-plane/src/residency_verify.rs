@@ -27,14 +27,22 @@
 //!    aggregate, PII-free `(tenant_id, region, stores_attested, region_mismatches)` the CP-D3 /
 //!    STOR-D5 drills assert against (`region_mismatches == 0` is the green artifact).
 //!
-//! ## `residency_verify` is a NAMED PARTIAL (the M1-store-set floor → P-CP-17) — VISION §3
-//! The store set here is the **M1 store set only** (OLTP/blob/index/KMS). The **CI runner pool + CI
-//! log tier (T3 segments) + CI artifact store + CI cache namespaces** are the M4 follow-on
-//! (**P-CP-17**), which EXTENDS this same `residency_verify` over the CI surfaces (a wrong-region CI
-//! store then fails the attestation too). The mechanism (every store reports its region; the
-//! attestation aggregates + fails-on-mismatch; the signed PII-free body) does NOT change shape when
-//! the CI coverage lands — P-CP-17 adds CI [`ResidencyStoreClass`] variants and feeds their reports
-//! into the SAME [`residency_verify`]. Recorded in writing (here + the report + the scorecard).
+//! ## P-CP-17 (P-324) — the CI-store coverage CLOSES the P-CP-09 named partial (VISION §1/§3, C-2)
+//! P-CP-09 shipped `residency_verify` over the **M1 store set only** (OLTP/blob/index/KMS) and NAMED
+//! the CI surfaces as the M4 follow-on. **P-CP-17 closes that partial:** the **CI runner pool + CI log
+//! tier (T3 segments, Storage 11.8) + CI artifact store + CI cache namespaces (incl. the
+//! trust-tier/branch-scoped namespaces, Storage 11.2)** are now [`ResidencyStoreClass`] variants
+//! ([`ResidencyStoreClass::CI_SET`]) and [`residency_verify_ci`] attests over the full
+//! [`RequiredStoreSet::M1AndCi`] set. A wrong-region (or absent) CI runner / log / artifact / cache
+//! FAILS the attestation exactly as a wrong-region M1 store does — the **no-global-CI-pool property is
+//! now attestable per-tenant** (a CI runner that executed a tenant's job in the wrong region fails
+//! `residency_verify`). The mechanism did NOT fork: both coverages call the SAME
+//! [`residency_verify_over`] (EI-01 §7 — one mechanism, two coverages); the CI coverage is a VISIBLE
+//! extension, not a silent redefinition (the attestation declares its `coverage`). The in-region
+//! runner-CLAIM enforcement (a job claimed only by an in-region runner) is the sibling **P-CP-18**.
+//! The store-region report remains a VALUE the store/CI layer feeds in (the live store-driver floor,
+//! below); the CI subsystem's full crate + its runner-pool region report lands with CI in M4 and feeds
+//! these SAME CI [`ResidencyStoreClass`] variants. Recorded in writing (here + the report + scorecard).
 //!
 //! ## The store-region report is a VALUE the store layer feeds in (the live store-driver floor)
 //! On this floor each M1 store's region is delivered to `residency_verify` as a [`StoreRegionReport`]
@@ -54,22 +62,27 @@
 //! the wrong region is the residency breach the no-global-pool attestation exists to catch (EI-01
 //! §2). The floor is **>= 80%**; the achieved score is
 //! `cargo mutants -p myelin-control-plane -f crates/myelin-control-plane/src/residency_verify.rs` ->
-//! **14 caught, 4 unviable, 0 missed = 100% of the 14 viable mutants**. Every mutation of the
-//! region-compare branch (`report.region != *region`), the missing-store-class fail-closed branch
-//! (`!by_class.contains_key`), the aggregation loop, the canonical-body encoding, and the MAC verify
-//! (`==` -> `!=`) is killed by an assertion.
+//! **17 caught, 7 unviable, 0 missed = 100% of the 17 viable mutants** (P-CP-17 added the CI-store
+//! aggregation; the count grew from P-085's 14). Every mutation of the region-compare branch
+//! (`report.region != *region`), the missing-store-class fail-closed branch (`!by_class.contains_key`),
+//! the coverage-required-set loop (M1 vs M1+CI), the aggregation loop, the canonical-body encoding
+//! (incl. the coverage bind), and the MAC verify (`==` -> `!=`) is killed by an assertion — the
+//! CI-store coverage's fail-on-mismatch path is mandatory-core and fully covered.
 
 use std::collections::BTreeMap;
 
 use myelin_tenancy::{Region, TenantId};
 
-/// **The M1 store set `residency_verify` covers (architecture §5.4).** Each M1 store class reports the
-/// tenant's region; the attestation requires a report from EVERY class (a missing report is a FAIL,
-/// not a pass). PII-free — a store-class tag, never data.
+/// **The store set `residency_verify` covers (architecture §5.4).** Each store class reports the
+/// tenant's region; the attestation requires a report from EVERY class in the [`RequiredStoreSet`]
+/// it is run over (a missing report is a FAIL, not a pass). PII-free — a store-class tag, never data.
 ///
-/// **FLOOR (named, P-CP-17):** the CI surfaces (runner pool, log tier, artifact store, cache
-/// namespaces) are the **M4 follow-on** — they become additional variants here and feed the SAME
-/// [`residency_verify`]. The M1 set is OLTP / blob / index-search / KMS.
+/// **M1 set (P-CP-09):** OLTP / blob / index-search / KMS. **CI set (P-CP-17, the M4 follow-on that
+/// CLOSES the P-CP-09 named partial):** the CI runner pool, the CI log tier (T3 content-addressed
+/// segments, Storage 11.8), the CI artifact store, and the CI cache namespaces (incl. the
+/// trust-tier/branch-scoped namespaces, Storage 11.2). The CI variants feed the SAME aggregation
+/// ([`residency_verify_over`]) — the mechanism is unchanged, only the coverage is pinned. A wrong-
+/// region CI store then FAILS the attestation exactly as a wrong-region M1 store does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ResidencyStoreClass {
     /// The OLTP tier (Storage P-ST-01) — the tenant's transactional rows.
@@ -80,6 +93,27 @@ pub enum ResidencyStoreClass {
     IndexSearch,
     /// The KMS (Storage P-ST-04) — the tenant's per-tenant DEK/KEK material.
     Kms,
+    /// **The CI runner pool (P-CP-17 / CI M4) — the compute the tenant's CI jobs EXECUTE on.** A CI
+    /// surface (NOT in the M1 set): a runner that executed a tenant's job reports the region it ran
+    /// in. A runner in a region ≠ the tenant's region is the *global CI pool* the no-global-pool
+    /// pitch (VISION §1) forbids — it FAILS `residency_verify` here (not a silent pass). The in-region
+    /// runner-CLAIM enforcement (a job claimed only by an in-region runner) is the sibling P-CP-18;
+    /// this variant makes the property ATTESTABLE.
+    CiRunnerPool,
+    /// **The CI log tier (P-CP-17 / Storage 11.8) — the T3 content-addressed log segments + the
+    /// `(job, step, byte-range)` OLTP index, per-tenant-DEK.** A CI surface (NOT in the M1 set): the
+    /// sealed log segments for a tenant's CI run report the region they were sealed in. A log tier in
+    /// the wrong region FAILS `residency_verify` here.
+    CiLogTier,
+    /// **The CI artifact store (P-CP-17 / CI M4) — the build artifacts a tenant's CI run produces.** A
+    /// CI surface (NOT in the M1 set): the artifact store reports the region it persisted the run's
+    /// artifacts in. An artifact store in the wrong region FAILS `residency_verify` here.
+    CiArtifactStore,
+    /// **The CI cache namespaces (P-CP-17 / Storage 11.2) — the build caches, including the
+    /// trust-tier/branch-scoped namespaces (an UntrustedFork write cannot reach the trusted scope).**
+    /// A CI surface (NOT in the M1 set): the cache namespaces report the region they hold a tenant's
+    /// cache entries in. A cache namespace in the wrong region FAILS `residency_verify` here.
+    CiCacheNamespaces,
 }
 
 impl ResidencyStoreClass {
@@ -90,19 +124,87 @@ impl ResidencyStoreClass {
             ResidencyStoreClass::Blob => "blob",
             ResidencyStoreClass::IndexSearch => "index_search",
             ResidencyStoreClass::Kms => "kms",
+            ResidencyStoreClass::CiRunnerPool => "ci_runner_pool",
+            ResidencyStoreClass::CiLogTier => "ci_log_tier",
+            ResidencyStoreClass::CiArtifactStore => "ci_artifact_store",
+            ResidencyStoreClass::CiCacheNamespaces => "ci_cache_namespaces",
         }
     }
 
     /// **The M1 store set `residency_verify` requires a region report from (architecture §5.4).** A
     /// `residency_verify` that is missing ANY of these reports FAILS (a store that never reported its
     /// region is exactly the silent global-pool the attestation must catch). The CI surfaces are the
-    /// P-CP-17 follow-on (NOT in this M1 set).
+    /// P-CP-17 follow-on ([`Self::CI_SET`]) — NOT in this M1 set.
     pub const M1_SET: [ResidencyStoreClass; 4] = [
         ResidencyStoreClass::Oltp,
         ResidencyStoreClass::Blob,
         ResidencyStoreClass::IndexSearch,
         ResidencyStoreClass::Kms,
     ];
+
+    /// **The CI store set `residency_verify` requires a region report from when run over the CI
+    /// coverage (P-CP-17, architecture §5.4 — the no-global-CI-pool surfaces).** The CI runner pool,
+    /// the CI log tier (T3 segments, Storage 11.8), the CI artifact store, and the CI cache namespaces
+    /// (incl. the trust-tier/branch-scoped namespaces, Storage 11.2). A CI run whose runner / log /
+    /// artifact / cache surface is missing — or in the wrong region — FAILS the CI-coverage attestation
+    /// (the no-global-CI-pool property is attestable per-tenant).
+    pub const CI_SET: [ResidencyStoreClass; 4] = [
+        ResidencyStoreClass::CiRunnerPool,
+        ResidencyStoreClass::CiLogTier,
+        ResidencyStoreClass::CiArtifactStore,
+        ResidencyStoreClass::CiCacheNamespaces,
+    ];
+
+    /// **The full store set `residency_verify` requires when run over the CI coverage (P-CP-17).** The
+    /// M1 stores AND the CI surfaces — the complete no-global-pool set (every store the tenant uses,
+    /// M1 + CI, must report the tenant's region). This is the set [`RequiredStoreSet::M1AndCi`]
+    /// enforces; the P-CP-09 M1-only partial is CLOSED by this set covering the CI surfaces too.
+    pub const M1_AND_CI_SET: [ResidencyStoreClass; 8] = [
+        ResidencyStoreClass::Oltp,
+        ResidencyStoreClass::Blob,
+        ResidencyStoreClass::IndexSearch,
+        ResidencyStoreClass::Kms,
+        ResidencyStoreClass::CiRunnerPool,
+        ResidencyStoreClass::CiLogTier,
+        ResidencyStoreClass::CiArtifactStore,
+        ResidencyStoreClass::CiCacheNamespaces,
+    ];
+}
+
+/// **Which store set `residency_verify` requires a complete region report from (the attestation's
+/// coverage — architecture §5.4).** Naming the required set explicitly keeps the P-CP-17 CI extension
+/// VISIBLE (an attestation declares whether it covered M1-only or M1+CI) rather than a silent
+/// redefinition of "every store". A `residency_verify` run over a [`RequiredStoreSet`] FAILS if any
+/// store class in that set never reported (fail-closed — a silently-absent store is the global pool).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RequiredStoreSet {
+    /// **The M1 store set only (P-CP-09):** OLTP / blob / index-search / KMS. The original coverage;
+    /// the CI surfaces were a NAMED PARTIAL on this set until P-CP-17.
+    M1Only,
+    /// **The M1 store set AND the CI surfaces (P-CP-17 — the no-global-CI-pool coverage):** OLTP /
+    /// blob / index-search / KMS + the CI runner pool / log tier / artifact store / cache namespaces.
+    /// This is the set that closes the P-CP-09 partial — a wrong-region CI store FAILS the attestation
+    /// exactly as a wrong-region M1 store does.
+    M1AndCi,
+}
+
+impl RequiredStoreSet {
+    /// The store classes this set requires a region report from (a missing one FAILS fail-closed).
+    pub fn required_classes(self) -> &'static [ResidencyStoreClass] {
+        match self {
+            RequiredStoreSet::M1Only => &ResidencyStoreClass::M1_SET,
+            RequiredStoreSet::M1AndCi => &ResidencyStoreClass::M1_AND_CI_SET,
+        }
+    }
+
+    /// A stable, PII-free label for the coverage (for the attestation body + telemetry) — so an
+    /// attestation is self-describing about WHICH set it attested over (M1-only vs M1+CI).
+    pub fn label(self) -> &'static str {
+        match self {
+            RequiredStoreSet::M1Only => "m1",
+            RequiredStoreSet::M1AndCi => "m1+ci",
+        }
+    }
 }
 
 /// **One store's region report for a tenant (architecture §5.4 — "every store reports its region").**
@@ -244,8 +346,14 @@ pub struct SignedAttestation {
     pub tenant_id: TenantId,
     /// The tenant's (immutable) region of record — every store reported THIS region.
     pub region: Region,
-    /// The per-store-class region reports, in a stable (store-class-ordered) order — every M1 store
-    /// class is present (a missing one would have FAILED the attestation). PII-free pairs.
+    /// **The store set this attestation attested over (M1-only or M1+CI — P-CP-17).** Self-describing
+    /// coverage: an auditor reads whether the no-global-pool property was attested over the M1 stores
+    /// only or the full M1+CI set. The coverage is bound into the signed body (an M1-only attestation
+    /// can never be passed off as an M1+CI one — the MACs differ).
+    pub coverage: RequiredStoreSet,
+    /// The per-store-class region reports, in a stable (store-class-ordered) order — every required
+    /// store class (per `coverage`) is present (a missing one would have FAILED the attestation).
+    /// PII-free pairs.
     pub store_regions: Vec<(ResidencyStoreClass, Region)>,
     /// The keyed-BLAKE3 MAC of the canonical body (`blake3-mac:<hex>`) — the "signed" half. Binds the
     /// attestation to the control-plane signing key.
@@ -260,6 +368,7 @@ impl SignedAttestation {
     fn canonical_body(
         tenant_id: &TenantId,
         region: &Region,
+        coverage: RequiredStoreSet,
         store_regions: &[(ResidencyStoreClass, Region)],
     ) -> Vec<u8> {
         let mut body = String::new();
@@ -267,6 +376,11 @@ impl SignedAttestation {
         body.push_str(tenant_id.as_str());
         body.push('\x1f');
         body.push_str(region.as_str());
+        // Bind the COVERAGE into the body (P-CP-17): an M1-only attestation and an M1+CI attestation
+        // over the same tenant/region/reports MUST NOT share a MAC — the coverage is load-bearing.
+        body.push('\x1f');
+        body.push_str("coverage=");
+        body.push_str(coverage.label());
         for (class, r) in store_regions {
             body.push('\x1f');
             body.push_str(class.label());
@@ -281,7 +395,12 @@ impl SignedAttestation {
     /// (any field changed) fails. This is what makes the attestation *signed* (not merely structured):
     /// only the control plane (holding the key) can mint a verifying attestation.
     pub fn verify(&self, key: &ResidencySigningKey) -> bool {
-        let body = Self::canonical_body(&self.tenant_id, &self.region, &self.store_regions);
+        let body = Self::canonical_body(
+            &self.tenant_id,
+            &self.region,
+            self.coverage,
+            &self.store_regions,
+        );
         // Constant-time-ish compare is not required (the MAC is the secret); a string compare of the
         // hex MACs is sufficient — an attacker cannot produce a matching MAC without the key.
         key.mac(&body) == self.signature
@@ -309,15 +428,54 @@ impl SignedAttestation {
 /// Duplicate reports for a class are tolerated (the last wins) — a store reporting twice consistently
 /// is fine; if two reports for the same class DISAGREE the wrong-region one is caught (every report is
 /// checked before aggregation).
+///
+/// This is the M1-only entry point ([`RequiredStoreSet::M1Only`]); the **CI-store coverage** is
+/// [`residency_verify_ci`] ([`RequiredStoreSet::M1AndCi`], P-CP-17) — both delegate to the SAME
+/// [`residency_verify_over`] mechanism.
 pub fn residency_verify(
     tenant_id: &TenantId,
     region: &Region,
     reports: &[StoreRegionReport],
     key: &ResidencySigningKey,
 ) -> Result<SignedAttestation, ResidencyMismatch> {
+    residency_verify_over(tenant_id, region, RequiredStoreSet::M1Only, reports, key)
+}
+
+/// **`residency_verify_ci(...)` — the no-global-pool attestation over the M1 stores AND the CI
+/// surfaces (P-CP-17, architecture §5.4, C-2; the M4 follow-on that CLOSES the P-CP-09 named
+/// partial).**
+///
+/// Identical mechanism to [`residency_verify`], but the required store set is
+/// [`RequiredStoreSet::M1AndCi`] — the attestation requires a region report from EVERY M1 store AND
+/// EVERY CI surface (the CI runner pool, the CI log tier, the CI artifact store, the CI cache
+/// namespaces). A CI runner / log / artifact / cache that reported a region ≠ the tenant's region — or
+/// that never reported — FAILS the attestation (the no-global-CI-pool property is attestable
+/// per-tenant; NEVER a silent pass). The in-region runner-CLAIM enforcement is the sibling P-CP-18.
+pub fn residency_verify_ci(
+    tenant_id: &TenantId,
+    region: &Region,
+    reports: &[StoreRegionReport],
+    key: &ResidencySigningKey,
+) -> Result<SignedAttestation, ResidencyMismatch> {
+    residency_verify_over(tenant_id, region, RequiredStoreSet::M1AndCi, reports, key)
+}
+
+/// **The shared no-global-pool aggregation (architecture §4.1 / §5.4, frozen) — parameterized over the
+/// required store set ([`RequiredStoreSet`]).** Both [`residency_verify`] (M1) and
+/// [`residency_verify_ci`] (M1+CI, P-CP-17) call this; the mechanism (check every report's region,
+/// require every store class in the coverage set, aggregate + sign) is identical — only the required
+/// set differs. This is the structural guarantee that adding CI coverage did NOT fork the attestation
+/// logic (EI-01 §7 — one mechanism, two coverages).
+pub fn residency_verify_over(
+    tenant_id: &TenantId,
+    region: &Region,
+    coverage: RequiredStoreSet,
+    reports: &[StoreRegionReport],
+    key: &ResidencySigningKey,
+) -> Result<SignedAttestation, ResidencyMismatch> {
     // 1. Check EVERY report's region against the tenant's region — a wrong region FAILS (loud, never
-    //    a silent pass). We check all reports (not just the M1 set) so a CI report added by P-CP-17
-    //    is caught here too without a code change.
+    //    a silent pass). We check all reports (M1 + CI alike) so a wrong-region CI store is caught by
+    //    the SAME branch as a wrong-region M1 store.
     let mut by_class: BTreeMap<ResidencyStoreClass, Region> = BTreeMap::new();
     for report in reports {
         if report.region != *region {
@@ -331,9 +489,11 @@ pub fn residency_verify(
         by_class.insert(report.store_class, report.region.clone());
     }
 
-    // 2. Require a report from EVERY M1 store class — a missing one FAILS fail-closed (a silently-
-    //    absent store is the global-pool the attestation must catch).
-    for class in ResidencyStoreClass::M1_SET {
+    // 2. Require a report from EVERY store class in the coverage set — a missing one FAILS fail-closed
+    //    (a silently-absent store is the global-pool the attestation must catch). For M1+CI this means
+    //    a CI runner / log / artifact / cache that never reported FAILS the no-global-CI-pool
+    //    attestation (it is not assumed in-region).
+    for &class in coverage.required_classes() {
         if !by_class.contains_key(&class) {
             return Err(ResidencyMismatch::MissingStoreReport {
                 tenant: tenant_id.clone(),
@@ -342,13 +502,15 @@ pub fn residency_verify(
         }
     }
 
-    // 3. Aggregate the per-store reports (store-class-ordered via the BTreeMap) + sign.
+    // 3. Aggregate the per-store reports (store-class-ordered via the BTreeMap) + sign over the body
+    //    (which binds the coverage — an M1-only and an M1+CI attestation never share a MAC).
     let store_regions: Vec<(ResidencyStoreClass, Region)> = by_class.into_iter().collect();
-    let body = SignedAttestation::canonical_body(tenant_id, region, &store_regions);
+    let body = SignedAttestation::canonical_body(tenant_id, region, coverage, &store_regions);
     let signature = key.mac(&body);
     Ok(SignedAttestation {
         tenant_id: tenant_id.clone(),
         region: region.clone(),
+        coverage,
         store_regions,
         signature,
     })
@@ -413,6 +575,15 @@ mod tests {
     /// Every M1 store class reporting the tenant's region (the green input).
     fn all_in_region(region: &str) -> Vec<StoreRegionReport> {
         ResidencyStoreClass::M1_SET
+            .iter()
+            .map(|c| StoreRegionReport::new(*c, Region::new(region)))
+            .collect()
+    }
+
+    /// Every M1 store class AND every CI surface reporting the tenant's region (the green CI input,
+    /// P-CP-17).
+    fn all_in_region_with_ci(region: &str) -> Vec<StoreRegionReport> {
+        ResidencyStoreClass::M1_AND_CI_SET
             .iter()
             .map(|c| StoreRegionReport::new(*c, Region::new(region)))
             .collect()
@@ -607,8 +778,169 @@ mod tests {
             .map(|c| c.label())
             .collect();
         assert_eq!(labels, vec!["oltp", "blob", "index_search", "kms"]);
-        // CI surfaces are NOT in the M1 set (they are the P-CP-17 follow-on) — there is no CI variant
-        // here, so this is structurally pinned: adding CI coverage is a deliberate edit in P-CP-17.
+        // CI surfaces are NOT in the M1 set — they are the P-CP-17 CI_SET. The M1 set staying exactly
+        // these four pins that the CI extension did not silently widen the M1 coverage.
+        for ci in ResidencyStoreClass::CI_SET {
+            assert!(
+                !ResidencyStoreClass::M1_SET.contains(&ci),
+                "the CI surface `{}` is in CI_SET, not M1_SET",
+                ci.label()
+            );
+        }
+    }
+
+    /// **P-CP-17: the CI store set is exactly the runner pool / log tier / artifact store / cache
+    /// namespaces, and M1_AND_CI_SET is the disjoint union (8 stores).** Pins the CI extension's shape
+    /// so it is a VISIBLE coverage, not a silent redefinition of "every store".
+    #[test]
+    fn the_ci_store_set_is_runner_log_artifact_cache() {
+        let ci_labels: Vec<&str> = ResidencyStoreClass::CI_SET
+            .iter()
+            .map(|c| c.label())
+            .collect();
+        assert_eq!(
+            ci_labels,
+            vec![
+                "ci_runner_pool",
+                "ci_log_tier",
+                "ci_artifact_store",
+                "ci_cache_namespaces"
+            ]
+        );
+        // M1_AND_CI_SET is the union: every M1 class + every CI class, no duplicates, 8 total.
+        assert_eq!(ResidencyStoreClass::M1_AND_CI_SET.len(), 8);
+        for c in ResidencyStoreClass::M1_SET {
+            assert!(ResidencyStoreClass::M1_AND_CI_SET.contains(&c));
+        }
+        for c in ResidencyStoreClass::CI_SET {
+            assert!(ResidencyStoreClass::M1_AND_CI_SET.contains(&c));
+        }
+        assert_eq!(
+            RequiredStoreSet::M1AndCi.required_classes(),
+            &ResidencyStoreClass::M1_AND_CI_SET
+        );
+        assert_eq!(
+            RequiredStoreSet::M1Only.required_classes(),
+            &ResidencyStoreClass::M1_SET
+        );
+    }
+
+    /// **P-CP-17 GREEN leg: `residency_verify_ci` attests over the M1 stores AND the CI surfaces when
+    /// all report the tenant's region — a signed, verifying attestation whose `coverage` is M1+CI.**
+    /// The no-global-CI-pool property is attestable: every CI surface reported fr-par.
+    #[test]
+    fn residency_verify_ci_aggregates_m1_and_ci() {
+        let tenant = TenantId::from_token("01J0ACME");
+        let region = Region::new("fr-par");
+        let att = residency_verify_ci(&tenant, &region, &all_in_region_with_ci("fr-par"), &key())
+            .expect("every M1 + CI store in-region → a signed CI-coverage attestation");
+        assert_eq!(att.coverage, RequiredStoreSet::M1AndCi);
+        assert_eq!(
+            att.store_regions.len(),
+            ResidencyStoreClass::M1_AND_CI_SET.len(),
+            "the attestation aggregates ALL 8 (M1 + CI) stores — none silently absent"
+        );
+        // All four CI surfaces are present in the attestation.
+        for ci in ResidencyStoreClass::CI_SET {
+            assert!(
+                att.store_regions.iter().any(|(c, _)| *c == ci),
+                "CI surface `{}` is attested",
+                ci.label()
+            );
+        }
+        assert!(att.verify(&key()), "the CI-coverage attestation verifies");
+    }
+
+    /// **P-CP-17 RED leg 1 (no silent pass): a CI runner that executed the tenant's job in the WRONG
+    /// region FAILS `residency_verify_ci`.** The global-CI-pool the no-global-pool pitch forbids.
+    #[test]
+    fn residency_verify_ci_fails_on_a_wrong_region_ci_runner() {
+        let tenant = TenantId::from_token("01J0ACME");
+        let region = Region::new("fr-par");
+        let mut reports = all_in_region_with_ci("fr-par");
+        // The CI runner pool executed the job in eu-north (a runner outside the tenant's region).
+        let idx = reports
+            .iter()
+            .position(|r| r.store_class == ResidencyStoreClass::CiRunnerPool)
+            .unwrap();
+        reports[idx] =
+            StoreRegionReport::new(ResidencyStoreClass::CiRunnerPool, Region::new("eu-north"));
+        let err = residency_verify_ci(&tenant, &region, &reports, &key())
+            .expect_err("a wrong-region CI runner FAILS the attestation (not a silent pass)");
+        assert_eq!(
+            err,
+            ResidencyMismatch::WrongRegion {
+                tenant: tenant.clone(),
+                tenant_region: Region::new("fr-par"),
+                store_class: ResidencyStoreClass::CiRunnerPool,
+                store_region: Region::new("eu-north"),
+            }
+        );
+        assert!(err.to_string().contains("not a silent pass"), "loud: {err}");
+    }
+
+    /// **P-CP-17 RED leg 2 (fail-closed): a CI surface that NEVER reported FAILS `residency_verify_ci`
+    /// — a silently-absent CI store is the global-CI-pool the attestation must catch.** Here the CI
+    /// artifact store never reported its region.
+    #[test]
+    fn residency_verify_ci_fails_on_a_missing_ci_store() {
+        let tenant = TenantId::from_token("01J0ACME");
+        let region = Region::new("fr-par");
+        let reports: Vec<StoreRegionReport> = all_in_region_with_ci("fr-par")
+            .into_iter()
+            .filter(|r| r.store_class != ResidencyStoreClass::CiArtifactStore)
+            .collect();
+        let err = residency_verify_ci(&tenant, &region, &reports, &key())
+            .expect_err("a missing CI artifact-store report FAILS fail-closed");
+        assert_eq!(
+            err,
+            ResidencyMismatch::MissingStoreReport {
+                tenant: tenant.clone(),
+                store_class: ResidencyStoreClass::CiArtifactStore,
+            }
+        );
+        assert!(err.to_string().contains("fail-closed"), "loud: {err}");
+    }
+
+    /// **P-CP-17: the M1-only attestation is NOT valid as an M1+CI attestation (the coverage is bound
+    /// into the MAC).** A green M1-only attestation, relabelled M1+CI, FAILS verification — an
+    /// attestation can never overstate its coverage. AND: an M1+CI set of reports run through the
+    /// M1-only entry point still succeeds (the CI reports are checked but not required).
+    #[test]
+    fn coverage_is_bound_into_the_signature() {
+        let tenant = TenantId::from_token("01J0ACME");
+        let region = Region::new("fr-par");
+        // An M1-only attestation: its coverage is M1Only.
+        let mut m1 = residency_verify(&tenant, &region, &all_in_region("fr-par"), &key())
+            .expect("an M1 attestation");
+        assert_eq!(m1.coverage, RequiredStoreSet::M1Only);
+        assert!(m1.verify(&key()));
+        // Relabel it M1+CI without re-signing → the MAC no longer matches (coverage is load-bearing).
+        m1.coverage = RequiredStoreSet::M1AndCi;
+        assert!(
+            !m1.verify(&key()),
+            "an M1-only attestation cannot be passed off as an M1+CI one — the coverage is signed"
+        );
+
+        // The M1-only entry point over M1+CI reports succeeds (CI reports are checked for wrong-region
+        // but only the M1 set is REQUIRED) — and its coverage is honestly M1Only.
+        let m1_over_ci =
+            residency_verify(&tenant, &region, &all_in_region_with_ci("fr-par"), &key())
+                .expect("M1-only verify over a superset of reports still succeeds");
+        assert_eq!(m1_over_ci.coverage, RequiredStoreSet::M1Only);
+        // A wrong-region CI store is STILL caught by the M1-only entry point (the region check runs
+        // over every report) — so even M1-only never silently passes a wrong-region CI store.
+        let mut wrong_ci = all_in_region_with_ci("fr-par");
+        let idx = wrong_ci
+            .iter()
+            .position(|r| r.store_class == ResidencyStoreClass::CiLogTier)
+            .unwrap();
+        wrong_ci[idx] =
+            StoreRegionReport::new(ResidencyStoreClass::CiLogTier, Region::new("eu-north"));
+        assert!(
+            residency_verify(&tenant, &region, &wrong_ci, &key()).is_err(),
+            "a wrong-region CI log tier is caught even by the M1-only entry point"
+        );
     }
 
     /// **CDC pair for 12.4 (provider + consumer) — an auditor / `myelin tenant residency verify`
