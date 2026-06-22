@@ -64,6 +64,7 @@ pub mod block_tree;
 pub mod compaction;
 pub mod editor;
 pub mod emit;
+pub mod list_filter;
 pub mod merge;
 pub mod rebac_fragment;
 pub mod store;
@@ -93,6 +94,11 @@ pub use subs::{
 pub use emit::{
     block_ref, database_ref, emit_change, page_ref, row_ref, KnowledgeChange,
     KnowledgeLivingDocHandler, KNOWLEDGE_LIVING_DOC_TRIGGERS,
+};
+pub use list_filter::{
+    compose_db_count_query, compose_db_view_query, db_row_id_colref, lower_over, lower_over_db_row_id,
+    lower_over_page_id, page_id_colref, AuthzJoin, AuthzVisibleIndex, BoundParam, ComposedQuery,
+    FilterMode, LoweredFilter, AUTHZ_VISIBLE_TABLE, PAGE_ID_COLUMN, PAGE_TABLE,
 };
 pub use merge::{
     cas_update_sql, BlockState, CasError, CasOutcome, CasStore, ConflictMeter, OfflineQueue,
