@@ -124,9 +124,17 @@ impl PgCheckStatusProjection {
         dedup_table: &str,
         consumer: &str,
     ) -> Result<PgCheckStatusProjection, sqlx::Error> {
-        sqlx::raw_sql(&projection_ddl(table, dedup_table))
-            .execute(&pool)
-            .await?;
+        // Run the `CREATE TABLE IF NOT EXISTS` projection DDL under the SAME app-wide advisory-lock
+        // discipline the storage `PgMigrator` uses (`myelin_storage::with_migration_lock`), NOT a
+        // bare `raw_sql(ddl).execute(&pool)`. Concurrent startup of multiple consumers against the
+        // same DB would otherwise race two `CREATE TABLE`s on Postgres's `pg_type_typname_nsp_index`
+        // (the same bug `PgStore::migrate` had); serializing on the shared migration lock closes it.
+        // We do NOT version-record this DDL (it is a per-table, idempotent `IF NOT EXISTS` projection
+        // a consumer re-runs on every startup), so the lock-around-DDL helper is the right tool
+        // rather than a recorded `PgMigrator::apply`.
+        myelin_storage::with_migration_lock(&pool, &projection_ddl(table, dedup_table))
+            .await
+            .map_err(|e| sqlx::Error::Protocol(format!("check_status migration: {e}")))?;
         Ok(PgCheckStatusProjection {
             pool,
             table: table.to_string(),

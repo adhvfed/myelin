@@ -159,31 +159,38 @@ impl PgStore {
     /// app role connects separately at runtime so RLS is actually enforced (the owner is FORCEd
     /// under RLS too, so even DDL-side seeding must set the session GUCs).
     pub async fn migrate(&self) -> Result<(), PgError> {
-        // The outbox table (the frozen 2.3 DDL — RUN, not re-defined) and the tuple table. Each
-        // const is a multi-statement script; sqlx `execute` runs a simple multi-statement query.
-        for ddl in [myelin_events::OUTBOX_MIGRATION, REBAC_TUPLE_MIGRATION] {
-            sqlx::raw_sql(ddl)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| PgError::Migrate(e.to_string()))?;
-        }
-        // Make the tuple table RLS-ready: ENABLE + FORCE RLS and install the (tenant_id, region)
-        // isolation policy. We run the policy DDL inline (idempotent — a duplicate-policy error is
-        // swallowed) so migrate() is self-contained even if the pg-init convention helper did not
-        // run. This DDL is precisely what INSTALLS the tenant predicate the tenant-predicate lint
-        // guards: the RLS policy keys on `tenant_id = current_setting('myelin.tenant_id')`.
-        let _ = sqlx::raw_sql(
-            "ALTER TABLE rebac_tuple ENABLE ROW LEVEL SECURITY;\n\
-             ALTER TABLE rebac_tuple FORCE ROW LEVEL SECURITY;\n\
-             CREATE POLICY myelin_tenant_isolation ON rebac_tuple \
-               USING (tenant_id = current_setting('myelin.tenant_id', true) \
-                      AND region = current_setting('myelin.region', true)) \
-               WITH CHECK (tenant_id = current_setting('myelin.tenant_id', true) \
-                           AND region = current_setting('myelin.region', true));",
-        )
-        .execute(&self.pool)
-        .await;
-        Ok(())
+        // Route the forward-only DDL through the race-safe [`crate::pg_migrator::PgMigrator`] (the
+        // P-S12 driver): each statement is one Migration with a STABLE id, applied under a Postgres
+        // session advisory lock + recorded in `myelin_applied_migration`. This SERIALIZES concurrent
+        // migrate() across processes/tests, fixing the `pg_type_typname_nsp_index` race the bare
+        // `raw_sql(ddl).execute(&pool)` loop had, and makes re-runs idempotent (an already-applied id
+        // is SKIPPED, never re-run — so the RLS-policy CREATE, which is NOT `IF NOT EXISTS`-able,
+        // runs exactly once and never errors on a second migrate()).
+        //
+        // The RLS-policy migration INSTALLS the tenant predicate the tenant-predicate lint guards:
+        // `tenant_id = current_setting('myelin.tenant_id')` (+ region). Its idempotency is now the
+        // version table's job (the id is recorded once), not a swallowed duplicate-policy error.
+        let migrations = crate::migration::Migrations::of([
+            crate::migration::Migration::plain("0001_outbox", myelin_events::OUTBOX_MIGRATION),
+            crate::migration::Migration::plain("0002_rebac_tuple", REBAC_TUPLE_MIGRATION),
+            crate::migration::Migration::plain(
+                "0003_rebac_rls_policy",
+                // `DROP POLICY IF EXISTS` makes the CREATE idempotent against a DB that already
+                // carries the policy (e.g. one migrated before the version table existed, or seeded
+                // by the pg-init `myelin_make_tenant_scoped` helper). It drops only a POLICY, never a
+                // table/column, so it is forward-only-legal (`is_destructive` is false). Under the
+                // advisory lock this whole script runs serialized + exactly once (recorded).
+                "ALTER TABLE rebac_tuple ENABLE ROW LEVEL SECURITY;\n\
+                 ALTER TABLE rebac_tuple FORCE ROW LEVEL SECURITY;\n\
+                 DROP POLICY IF EXISTS myelin_tenant_isolation ON rebac_tuple;\n\
+                 CREATE POLICY myelin_tenant_isolation ON rebac_tuple \
+                   USING (tenant_id = current_setting('myelin.tenant_id', true) \
+                          AND region = current_setting('myelin.region', true)) \
+                   WITH CHECK (tenant_id = current_setting('myelin.tenant_id', true) \
+                               AND region = current_setting('myelin.region', true));",
+            ),
+        ]);
+        crate::pg_migrator::PgMigrator::apply(&self.pool, &migrations).await
     }
 
     // ---- ReBAC tuple store (the S3 store, RLS-isolated) -------------------------------------

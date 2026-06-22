@@ -51,6 +51,19 @@ const EXCLUDED_SUBSTRINGS: &[&str] = &[
     // queries — the same posture as relay.rs. NAMED, LOUD exclusion (see the crate note in
     // pgrelay.rs), never a silent skip; the tenant-store code in pg.rs stays fully linted.
     "myelin-storage/src/pgrelay.rs",
+    // The race-safe LIVE MIGRATION DRIVER (Stage 2 / infra, the P-S12 floor): `PgMigrator::apply`
+    // + `with_migration_lock` run SCHEMA/INFRA statements only — the Postgres session advisory lock
+    // (`pg_advisory_lock`/`unlock`), the global schema-version table `myelin_applied_migration`
+    // (id + checksum, a GLOBAL ledger with NO tenant column — there is no tenant to bind), and a
+    // `pg_locks` probe. NONE of these are tenant-store queries (they touch no tenant table), so the
+    // `tenant-predicate` IDOR fingerprint (`sqlx::query` without a `tenant_id`) flags them falsely —
+    // exactly the same relay-INTERNAL/non-tenant-store posture as pgrelay.rs above. The DDL the
+    // driver EXECUTES is run via `conn.execute(&str)` (the caller's migration text, e.g. the
+    // tenant-scoped `rebac_tuple` table whose RLS policy keys on `tenant_id`), not a `sqlx::query`
+    // builder, so the migrator introduces no tenant-store query of its own. The tenant-store code in
+    // pg.rs stays FULLY linted. NAMED, LOUD exclusion (see the module note in pg_migrator.rs), never
+    // a silent skip; the lint is NOT weakened.
+    "myelin-storage/src/pg_migrator.rs",
     // The FIREHOSE transport (EB-21 / P-141): `firehose::publish(stream, scope, frame)` is the
     // FROZEN contract-3.5 / §5.5 method name for the EPHEMERAL firehose transport — a DIFFERENT
     // seam from the durable bus the `no-raw-publish` lint guards. §4.3 is explicit: "the durable bus

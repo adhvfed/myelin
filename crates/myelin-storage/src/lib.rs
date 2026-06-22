@@ -549,6 +549,13 @@ pub mod rls;
 // The `backend` module is the config-selection seam (real-vs-in-memory from MyelinConfig).
 #[cfg(feature = "integration")]
 pub mod pg;
+// The race-safe LIVE migration DRIVER (the P-S12 floor): a forward-only, idempotent, SERIALIZED
+// (Postgres session advisory lock on a fixed app-wide key), version-recorded migrator. It fixes the
+// concurrent-`CREATE TABLE` `pg_type_typname_nsp_index` race that the bare
+// `raw_sql(ddl).execute(&pool)` sites (PgStore::migrate, git check_status) had. Behind `integration`
+// like the rest of the live-PG code.
+#[cfg(feature = "integration")]
+pub mod pg_migrator;
 #[cfg(feature = "integration")]
 pub mod s3blob;
 #[cfg(feature = "integration")]
@@ -646,3 +653,10 @@ pub use restore_verify::{
     RestoreVerifyGate, RestoredObject,
 };
 pub use rls::{RlsError, TenantQuery, TenantScope, TenantTable};
+
+// The race-safe live migration driver (the P-S12 floor) — re-exported behind `integration`, along
+// with the live `PgStore` + its typed `PgError` the driver returns.
+#[cfg(feature = "integration")]
+pub use pg::{PgError, PgStore};
+#[cfg(feature = "integration")]
+pub use pg_migrator::{with_migration_lock, PgMigrator, MIGRATION_LOCK_KEY};
