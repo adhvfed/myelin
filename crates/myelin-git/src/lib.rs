@@ -265,6 +265,18 @@ pub mod search_projection;
 /// clone (the full within-EU CDN class hardens in GIT-P33).
 pub mod shed_clone;
 pub mod subs;
+/// The **content-anchored inline-thread line-range resolver: the `#sub` 4-state ladder** (GIT-P24 /
+/// P-286, M3-G4 — GIT-D7). The mint half ([`subs::mint_blob_line_range`], GIT-P4) ships the
+/// grammatical `#L<a>-L<b>` sub-URN; this module is the RESOLVER the Refs ladder calls in its
+/// sub-resolve step. A [`anchor::LineAnchor`] stores the mint-time blob oid + path + side + range +
+/// commit + the **BLAKE3 fingerprint** of the anchored lines + a [`anchor::CONTEXT_WINDOW`] context
+/// window; [`anchor::resolve`] resolves it against the head blob through the frozen 4-state ladder —
+/// **EXACT→Live / REBASED→Moved / PARTIAL→Outdated / GONE→content_gone** (contract 5.7 / X-4 / arch
+/// §5.1) — and ALWAYS carries the state + the "view in original context" position so a relocated/lost
+/// anchor is **never silently wrong** (EI-01 §3; GIT-D7 = 0 mis-anchored). Floor named: **GF-5** —
+/// patch-id-chain carry-over across a multi-commit rebase is the **GIT-P33 / M5** follow-on; v1 does
+/// the per-pair blob-diff fingerprint remap.
+pub mod anchor;
 /// The **typed-edge mirror: PR-link / commit-trailer lifecycle edges into the Refs projection**
 /// (GIT-P19 / P-280, M3-G3 — the typed-edge-mirror half). As the PR lifecycle advances, a Git PR emits
 /// **lifecycle edges** (`closes`/`relates`, `rel_class='lifecycle'`) via the outbox — DISTINCT from the
