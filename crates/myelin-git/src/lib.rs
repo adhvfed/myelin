@@ -182,6 +182,20 @@ pub mod holder_intent;
 /// (bounded-stale coarse grant) instead of cascading, a just-revoked subject is still denied, and a
 /// zookie read bypasses the cache (4.10 read-your-writes).
 pub mod live_check;
+/// The **leak-free `list_objects` `SetExpr` push-down for repo/PR lists + the code-search pre-filter**
+/// (GIT-P26 / P-288, M3-G5 — the GIT-D11 gate). The git-SIDE consumer of the frozen contract-4.3
+/// push-down: [`list_filter::lower_over_repo_id`] / [`list_filter::lower_over_pr_id`] lower the
+/// returned `SetExpr` into a SQL predicate + `authz_visible` JOIN over Git's OWN id column
+/// (`repo.id` / `pr.id`, §5.3 / §7.3) — **one query, no N+1, no post-filter**;
+/// [`list_filter::compose_repo_list_query`] / [`list_filter::compose_pr_list_query`] conjoin it into
+/// the ONE leak-free list statement (the ACL pre-filter BEFORE pagination, the tenant predicate
+/// always emitted); [`list_filter::code_search_pre_filter`] is the 6.1 code-search pre-filter (the
+/// blob doc's ACL object is the parent `repo`, GIT-P5) the `search-requires-acl-filter` lint requires
+/// conjoined before scoring. [`list_filter::AuthzVisibleIndex`] models the per-tenant residency-pinned
+/// reverse index + the new-enemy zookie guard for the DB-free unit/CDC drills; the live one-query/
+/// 0-leak/revoke-reflected GIT-D11 proof is the `--features integration` test against the dev-stack
+/// Postgres. Git's code projection is asserted leak-free in the shared SRCH-D1/D3 here. No new floor.
+pub mod list_filter;
 /// The **PR/review/inline-thread lifecycle + branch-protection rulesets + the CODEOWNERS resolver**
 /// (GIT-P16 / P-277, M3-G3 — the domain-entities half): the hosting-layer entities not in git itself
 /// (00-overview §1.1). [`lifecycle::PullRequest`] + [`lifecycle::PrState`] are the PR lifecycle state
