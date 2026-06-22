@@ -61,6 +61,7 @@
 /// (KN-P13/P29) and no perms beyond tenant isolation (KN-P14/P16).
 pub mod authority;
 pub mod block_tree;
+pub mod comments;
 pub mod compaction;
 pub mod database;
 pub mod editor;
@@ -86,6 +87,11 @@ pub use authority::{
 pub use block_tree::{
     children_index_range_sql, recursive_subtree_cte_sql, BlockId, BlockRow, BlockTree, PageId,
     PageTree, TreeError,
+};
+pub use comments::{
+    create_comment, mint_comment, mint_thread, register_knowledge_comment_kinds, resolve_comment,
+    Comment, CommentAnchor, CommentError, CommentOpError, CommentStore, CommentThread,
+    KNOWLEDGE_COMMENT_SUB_KINDS,
 };
 pub use compaction::{
     content_address, materialize, CompactionError, DocSnapshot, SnapshotCompactor,
