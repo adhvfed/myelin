@@ -67,6 +67,7 @@ pub mod editor;
 pub mod emit;
 pub mod list_filter;
 pub mod merge;
+pub mod notif_resolve;
 pub mod rebac_fragment;
 pub mod refs_glue;
 pub mod replay;
@@ -131,6 +132,12 @@ pub use refs_glue::{
     KnowledgeLifecycleRel, LadderRung, PageMeta, PageStore, Projected, Projector, SubAnchor, SubState,
     ProjectError as RefsProjectError, REFS_EDGE_CREATED, REL_CLASS_LIFECYCLE, REL_CLASS_REFERENCE,
 };
+// The notif/humanise glue (KN-P22 / P-312): the Knowledge-side `RefResolvePort` that feeds the
+// per-viewer project Display projection into the ONE humanise templating surface (7.3 / 5.2) — a
+// confidential subject degrades to a humanised tombstone (NOTIF-D4, 0 title leak). The producer-
+// accretion half (the define_notif_rule set + the watcher reverse index, NOTIF-P20) lives in
+// `myelin_identity_service::knowledge_rules` (the §2.9-DAG reason the fragment does).
+pub use notif_resolve::KnowledgeRefResolver;
 pub use replay::{KnowledgeReindexSource, REFS_EDGE_SNAPSHOT};
 pub use rollup::{
     compute_row, CellValue, FormulaExpr, FormulaField, FormulaSchema, FormulaSchemaError,
