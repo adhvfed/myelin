@@ -186,6 +186,22 @@ pub mod front_door;
 /// architecture-named fallback; gix-preferred is the OQ-1 floor, GIT-P33). Read/diff/blame with no
 /// `git` fork (no-host-exec by construction).
 pub mod gix_backend;
+/// The **git `PersonalDataHolder` H1 BODY: the DSR fan-out + history-rewrite erasure semantics**
+/// (GIT-P29 / P-290, M3-G7 — GIT-D2 complete). [`holder::GitPersonalDataHolder`] is the real
+/// `locate/export/rectify/restrict/erase` over git + metadata (contract 10.1/10.4), completing the H1
+/// holder [`holder_intent`] declared (GIT-P3) + [`receive_pack::RefStore::open`] auto-registered
+/// (GIT-P9). [`holder::GitPersonalDataHolder::erase_fanout`] drives the architecture-§6.1 erasure
+/// algorithm over the storage [`myelin_storage::erase::CryptoShredErase`] orchestrator (pseudonym-map
+/// shred 4.8 + per-subject DEK crypto-shred 11.4 + the [`myelin_storage::git_shred::GitCryptoShredReach`]
+/// reflog/bitmap/pack-backup reach + Search purge + Refs tombstone + Bus erase + erasure ledger 10.8)
+/// PLUS git's H9 cache/CDN invalidation fan-out, asserting EVERY git holder ([`holder::GitHolder::ALL`])
+/// is hit (GIT-D2: 0 holders missed, 0 recoverable PII in backups, residual == the ONE platform posture
+/// 10.9/X-7 — by reference, never restated). [`holder::GitPersonalDataHolder::expunge_body`] is the
+/// history-rewrite erasure SEMANTICS (10.6): the X-7 body-expunge residual path through the GIT-P27
+/// audited [`code_tools::HistoryRewriteTool`] (changed-hash consequence + the invalidation fan-out).
+/// Floor (GF-7): the structural floor ships here regardless; the lawful-basis residual is R-7
+/// (parallel/Legal, NOT a code gate). The reindex-from-cold parity (GIT-D3) is GIT-P30.
+pub mod holder;
 pub mod holder_intent;
 /// The Git ReBAC fragment wired LIVE + the FailStatic bound on the Id dependency (GIT-P14 / P-275,
 /// M3-G2): the [`live_check::GitCheckGate`] runs the front door's `pull`/`push` + the push-policy

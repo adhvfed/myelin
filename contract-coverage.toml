@@ -1119,6 +1119,13 @@ cdc = [
     # agent trace), and those holders respond. The Knowledge instance (10.9 by reference) + the H17
     # trace holder body (distinct from audit) light up here; the Git X-7 instance is P-GA-28 → P-257.
     "crates/myelin-gdpr-service/tests/cdc_10_1_producer_holders.rs",
+    # GIT-P29 / P-290 — the GIT side of 10.1: the H1 holder BODY (GitPersonalDataHolder) implementing
+    # locate/export/rectify/restrict over git + metadata, with the contract-shaped erase(EraseScope)
+    # loud-refusing (the EI-01 §1 deviation — no seam bundle on the frozen signature) and pointing at
+    # the real §6.1 fan-out erase_fanout (GIT-D2 complete: every git holder hit, residual == the ONE
+    # posture 10.9/X-7, backups shredded). The provider+consumer pair fans locate out + drives the
+    # real fan-out via the wired EraseHolders bundle.
+    "crates/myelin-git/tests/cdc_10_1_10_4_git_holder.rs",
 ]
 
 [[contract]]
@@ -1158,6 +1165,11 @@ cdc = [
     "crates/myelin-gdpr-service/tests/cdc_10_4_fanout.rs",
     "crates/myelin-gdpr-service/tests/cdc_10_4_tenant_ops.rs",
     "crates/myelin-gdpr-service/tests/cdc_10_4_deadline_timer.rs",
+    # GIT-P29 / P-290 — the GIT-side DSR fan-out leg of 10.4: the §6.1 erasure algorithm over git as
+    # holder H1 reaches EVERY git holder (pseudonym map + per-subject DEK bodies + reflog/bitmap/pack
+    # backups + search + refs + bus + cache/CDN + erasure ledger) — GIT-D2 complete. The same CDC file
+    # pins the per-holder fan-out drive shape the orchestrator takes for H1.
+    "crates/myelin-git/tests/cdc_10_1_10_4_git_holder.rs",
 ]
 
 # 10.5 — the retention engine + consent + sub-processor + legal-hold + the transfer gate. The
