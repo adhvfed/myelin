@@ -8,12 +8,30 @@
 //! `AppSpec`, which the `forward-only-migration` lint reads to forbid a blocking `ALTER` on a
 //! flagged-hot table).
 //!
-//! **Contract-index:** row 1.5 (forward-only online migrations + hot-table flags) — OWNED here.
+//! **Contract-index:** row 1.5 (forward-only online migrations + hot-table flags) — the RUNNER
+//! is owned here; the contract VOCABULARY is owned by `myelin-storage` and RE-EXPORTED here.
 //! **P-S15 → global P-032.** DEPENDS-ON P-S12 (`serve` calls the runner), P-S11 (the
 //! `forward-only-migration` lint reads the hot-table declaration this module surfaces).
 //!
+//! ## SINGLE MIGRATION-CONTRACT AUTHORITY (de-dup, P-233 hardening)
+//! **`myelin-storage` is the single migration-contract authority; substrate re-exports it.** The
+//! contract vocabulary — [`Migration`], [`Migrations`], [`MigrationPhase`], [`HotTables`],
+//! [`is_destructive`], [`is_blocking_alter`] — used to be DUPLICATED here (a structurally identical
+//! second copy, kept in sync by hand). It is now defined ONCE in
+//! [`myelin_storage::migration`] and **re-exported** below. The substrate→storage edge already
+//! exists in the crate DAG (root-last; the harness depends on the tier client it wires); the reverse
+//! `myelin-storage → myelin-substrate` edge is forbidden by the DAG, so storage is the canonical
+//! home and substrate is the re-exporter. Consequently `myelin_substrate::migrations::Migration` and
+//! `myelin_storage::migration::Migration` are now the SAME type — every existing importer (via either
+//! path) keeps compiling unchanged. Substrate keeps its OWN [`MigrationRunner`] (this file): the
+//! general forward-only **boot-time** validator that returns [`ServeError`], operating on the
+//! re-exported types. (Storage additionally owns the ordering-enforcing
+//! [`OnlineMigrationRunner`](myelin_storage::migration::OnlineMigrationRunner) — the
+//! expand→backfill→contract gate — and, behind `--features integration`, the race-safe live
+//! `PgMigrator` driver; those are storage-tier concerns, not re-exported here.)
+//!
 //! ## Forward-only (§9.1): no down migrations — you can't un-delete data
-//! The runner applies embedded migrations in order at boot. It REFUSES, loudly, at boot:
+//! The [`MigrationRunner`] applies embedded migrations in order at boot. It REFUSES, loudly, at boot:
 //!   - a **destructive** migration (`DROP TABLE` / `DROP COLUMN`) — forward-only is structural;
 //!     "rollback" is a NEW forward migration, never a `down` (EI-01 §2 — silent data loss is
 //!     the floor that outranks every feature);
@@ -38,173 +56,31 @@
 //!   restored production-scale copy under load + asserting no blocking lock beyond budget + zero
 //!   downtime — proves at **M5 (P-S34)**. Here the runner + phase model + the hot-table
 //!   declaration + the destructive/blocking refusals are complete and testable at boot scale.
-//! - **The concrete `tokio-postgres`/`sqlx` DDL execution** lands with the driver (the runner
-//!   here records what it applied; the real connection executes the DDL through
-//!   [`myelin_storage::OltpPool`]).
+//! - **The concrete `tokio-postgres`/`sqlx` DDL execution** lands with the driver — now the
+//!   race-safe [`PgMigrator`](myelin_storage::pg_migrator) in `myelin-storage` (behind
+//!   `--features integration`): an advisory lock + an applied-migration version table serialise
+//!   concurrent migrate() and record what was applied. The boot-time runner here records what it
+//!   admitted; the live driver executes the admitted DDL.
 
 use crate::ServeError;
-use std::collections::BTreeSet;
 
-/// The three-deploy phase of a forward-only online schema change (architecture §9.1). A
-/// hot-table change is **expand → backfill → contract**, never one blocking `ALTER`. Carried on
-/// each [`Migration`] so the runner + a test can see the idiom; `Plain` is a non-hot, ordinary
-/// forward migration (a new table, a nullable add on a cold table).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MigrationPhase {
-    /// An ordinary forward migration on a non-hot table (new table; nullable add on a cold table).
-    Plain,
-    /// **Expand** — add the new shape additively + non-blockingly (nullable column;
-    /// `CREATE INDEX CONCURRENTLY`; new table); write both old + new behind a flag (§9.1).
-    Expand,
-    /// **Backfill** — populate in bounded, throttled, resumable batches off the hot path
-    /// (idempotent, re-runnable; shares the event-replay posture) (§9.1).
-    Backfill,
-    /// **Contract** — switch reads to the new shape, stop writing the old, drop the old in a
-    /// LATER non-blocking deploy (§9.1).
-    Contract,
-}
-
-/// One forward-only migration: a stable, PII-free id + its DDL + its phase + the table it
-/// targets (architecture §9). Ordered by registration (the runner applies them in order so a
-/// later migration sees the earlier ones' tables).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Migration {
-    /// A stable, monotonically-ordered id (e.g. `0001_outbox`). PII-free.
-    pub id: &'static str,
-    /// The forward-only DDL (`CREATE TABLE …` / `CREATE INDEX CONCURRENTLY …` / a nullable
-    /// `ALTER … ADD`). A destructive `DROP TABLE`/`DROP COLUMN` is forward-only-illegal and is
-    /// rejected by the runner; a blocking `ALTER` on a declared-hot table is rejected too.
-    pub ddl: &'static str,
-    /// The expand→backfill→contract phase (§9.1). `Plain` for an ordinary non-hot migration.
-    pub phase: MigrationPhase,
-    /// The table this migration targets, if it is a single-table change (so the runner can match
-    /// it against the [`HotTables`] declaration). `None` for a multi-table / non-table migration.
-    pub table: Option<&'static str>,
-}
-
-impl Migration {
-    /// A plain forward migration (non-hot table; no phase discipline required).
-    pub fn plain(id: &'static str, ddl: &'static str) -> Migration {
-        Migration {
-            id,
-            ddl,
-            phase: MigrationPhase::Plain,
-            table: None,
-        }
-    }
-
-    /// A phased migration on a (possibly hot) table — the runner checks it against the hot-table
-    /// declaration and the phase records which step of expand→backfill→contract it is.
-    pub fn phased(
-        id: &'static str,
-        ddl: &'static str,
-        phase: MigrationPhase,
-        table: &'static str,
-    ) -> Migration {
-        Migration {
-            id,
-            ddl,
-            phase,
-            table: Some(table),
-        }
-    }
-}
-
-/// The forward-only embedded migration set (architecture §9; contract 1.5). Each entry is a
-/// forward-only DDL statement (the `outbox` / `consumer_dedup` tables, a service's own schema).
-/// The runner applies them in order at boot.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Migrations(pub Vec<Migration>);
-
-impl Migrations {
-    /// Register PLAIN migrations from `(id, ddl)` pairs (ordered) — the ergonomic path for
-    /// ordinary forward migrations (new tables, cold-table nullable adds).
-    pub fn new(items: impl IntoIterator<Item = (&'static str, &'static str)>) -> Migrations {
-        Migrations(
-            items
-                .into_iter()
-                .map(|(id, ddl)| Migration::plain(id, ddl))
-                .collect(),
-        )
-    }
-
-    /// Register an explicit migration list (so a hot-table change can carry its phase + table).
-    pub fn of(items: impl IntoIterator<Item = Migration>) -> Migrations {
-        Migrations(items.into_iter().collect())
-    }
-}
-
-/// The per-subsystem **hot-table declaration** (architecture §9.4; contract 1.5; C-3). Every
-/// subsystem declares its hot tables in its `AppSpec`; a table is flagged hot when its write
-/// rate warrants expand→backfill→contract (**measured, not predicted** — per ADR-10). Both the
-/// migration RUNNER (at boot) and the `forward-only-migration` LINT (at source-scan) read this
-/// declaration to forbid a blocking `ALTER` on exactly these tables.
-///
-/// The seed set §9.4 names (measured per subsystem): Knowledge `block`/`db_row`/`doc_op`; the
-/// high-write subsystems (Git ref/object metadata, CI `run`/`step`/log index, Issues
-/// `issue`/`issue_relation`, Chat `message`/`channel_membership`). Those are declared by their
-/// owning subsystems' `AppSpec`s as they land (M1+); the MECHANISM is frozen here.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct HotTables {
-    tables: BTreeSet<String>,
-}
-
-impl HotTables {
-    /// No hot tables declared (the default for a service with no high-write table yet).
-    pub fn none() -> HotTables {
-        HotTables {
-            tables: BTreeSet::new(),
-        }
-    }
-
-    /// Declare a service's hot tables (§9.4) — measured-not-predicted per subsystem.
-    pub fn declare(tables: impl IntoIterator<Item = impl Into<String>>) -> HotTables {
-        HotTables {
-            tables: tables.into_iter().map(Into::into).collect(),
-        }
-    }
-
-    /// Whether `table` is declared hot (the runner + the lint both ask this).
-    pub fn is_hot(&self, table: &str) -> bool {
-        self.tables.contains(table)
-    }
-
-    /// The declared hot tables, sorted (so the data-map / the lint can read the set).
-    pub fn tables(&self) -> impl Iterator<Item = &str> {
-        self.tables.iter().map(String::as_str)
-    }
-
-    /// Whether any hot table is declared.
-    pub fn is_empty(&self) -> bool {
-        self.tables.is_empty()
-    }
-}
-
-/// Whether a DDL statement is **destructive** (a forward-only violation): `DROP TABLE` /
-/// `DROP COLUMN` would un-delete-able-y destroy data (§9.1; EI-01 §2). Case-insensitive.
-pub fn is_destructive(ddl: &str) -> bool {
-    let upper = ddl.to_ascii_uppercase();
-    upper.contains("DROP TABLE") || upper.contains("DROP COLUMN")
-}
-
-/// Whether a DDL statement is a **blocking `ALTER`** (takes a table lock at write QPS):
-/// `ALTER TABLE … ADD COLUMN … NOT NULL` without a `DEFAULT`, an in-place `ALTER … ALTER COLUMN`,
-/// or a non-concurrent `CREATE INDEX` (architecture §9.1/§9.4). On a HOT table any of these
-/// stalls writes — it must be the expand→backfill→contract idiom instead. Case-insensitive.
-pub fn is_blocking_alter(ddl: &str) -> bool {
-    let lower = ddl.to_ascii_lowercase();
-    let add_not_null = lower.contains("alter table")
-        && lower.contains("add column")
-        && lower.contains("not null")
-        && !lower.contains("default");
-    let alter_column_inplace = lower.contains("alter table") && lower.contains("alter column");
-    let non_concurrent_index = lower.contains("create index") && !lower.contains("concurrently");
-    add_not_null || alter_column_inplace || non_concurrent_index
-}
+// === The single migration-contract authority is `myelin-storage` (de-dup, P-233). ===
+// These six items are DEFINED in `myelin_storage::migration` and RE-EXPORTED here; the substrate
+// does NOT duplicate them. Re-exporting keeps every existing `myelin_substrate::…` importer
+// compiling unchanged while collapsing the two former copies into ONE definition.
+pub use myelin_storage::migration::{
+    is_blocking_alter, is_destructive, HotTables, Migration, MigrationPhase, Migrations,
+};
 
 /// The forward-only migration RUNNER (architecture §9; contract 1.5). Applies the embedded DDL
 /// in order at boot, recording what it applied, and REFUSES — loudly, at boot — a destructive
 /// migration or a blocking `ALTER` on a declared-hot table.
+///
+/// This is substrate's OWN boot-time validator (it returns [`ServeError`], the harness error type);
+/// it operates on the re-exported [`Migration`] / [`Migrations`] / [`HotTables`] types defined in
+/// [`myelin_storage::migration`]. The ordering-enforcing
+/// [`OnlineMigrationRunner`](myelin_storage::migration::OnlineMigrationRunner) and the race-safe live
+/// `PgMigrator` driver are owned by the storage tier (not re-exported here).
 #[derive(Default)]
 pub struct MigrationRunner {
     applied: Vec<&'static str>,
@@ -369,7 +245,7 @@ mod tests {
     }
 
     /// `is_destructive` / `is_blocking_alter` classify the DDL bug classes (the shared predicates
-    /// the runner + the lint both use).
+    /// the runner + the lint both use). These are the re-exported storage predicates.
     #[test]
     fn ddl_classifiers_catch_the_bug_classes() {
         assert!(is_destructive("DROP TABLE issue"));
@@ -389,7 +265,8 @@ mod tests {
     }
 
     /// The hot-table declaration mechanism (§9.4): a service declares its hot tables; `is_hot`
-    /// answers per table (the frozen declare → query contract both the runner + lint read).
+    /// answers per table (the frozen declare → query contract both the runner + lint read). This
+    /// exercises the re-exported storage [`HotTables`].
     #[test]
     fn hot_table_declaration_is_per_subsystem() {
         let hot = HotTables::declare(["block", "db_row", "doc_op"]); // the KN seed set (§9.4).
@@ -400,5 +277,17 @@ mod tests {
             hot.tables().collect::<Vec<_>>(),
             vec!["block", "db_row", "doc_op"]
         );
+    }
+
+    /// The `(id, ddl)`-pair ergonomic constructor still works through the re-exported
+    /// [`Migrations`] (it is now `myelin_storage::migration::Migrations::new`, additively added so
+    /// substrate's pair-callers keep compiling).
+    #[test]
+    fn new_builds_plain_migrations_from_id_ddl_pairs() {
+        let migrations =
+            Migrations::new([("0010_hello", "CREATE TABLE IF NOT EXISTS hello (id TEXT)")]);
+        assert_eq!(migrations.0.len(), 1);
+        assert_eq!(migrations.0[0].id, "0010_hello");
+        assert_eq!(migrations.0[0].phase, MigrationPhase::Plain);
     }
 }
