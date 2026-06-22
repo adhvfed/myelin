@@ -391,10 +391,18 @@ status = "covered"
 # count-leak, revoke reflected) ride here; the live one-query / 0-leak / 0-count-leak / revoke-
 # reflected proof is the `--features integration` test against the dev-stack Postgres
 # (`integration_kn_d5_list_pushdown.rs`).
+#
+# KN-P18 / P-308 adds the ROLLUP consumer leg: a read-time rollup over a `rollup_source` relation
+# CONJOINS the SAME `list_objects` SetExpr (the InRelation{read} → authz_visible JOIN over db_row.id)
+# the view executor uses, so a restricted related row is never counted/summed for an unauthorized
+# viewer (0 rollup leak, composing with KN-D5). The rollup-permission gate rides in
+# cdc_13_3_4_3_knowledge_rollup.rs; the live permission-filtered rollup conjoin against the dev-stack
+# Postgres is integration_kn_d10_rollup.rs.
 cdc = [
   "crates/myelin-identity-service/tests/cdc_4_3_list_objects.rs",
   "crates/myelin-git/tests/cdc_4_3_git_list_pushdown.rs",
   "crates/myelin-knowledge/tests/cdc_4_3_knowledge_list_pushdown.rs",
+  "crates/myelin-knowledge/tests/cdc_13_3_4_3_knowledge_rollup.rs",
 ]
 
 [[contract]]
@@ -1786,6 +1794,20 @@ row = "13.3"
 # the TE-7 source of truth) ride here. The executor CDC (cdc_13_3_6_3_knowledge_flex_db.rs) pins the
 # agreement; the live JSONB+GIN+SetExpr one-query/0-leak proof is the `--features integration` test
 # (integration_kn_d9_flex_db.rs) + the KN-D9 SCHED drill (drill_kn_d9_flex_db.rs).
+# KN-P18 / P-308: Knowledge now OWNS the read-time formula/rollup half of 13.3 — the bounded
+# FormulaAst evaluator (myelin_knowledge::rollup) over the frozen myelin-query expression core. The
+# formula tree REUSES the frozen Literal value space + the SAME static node/depth cost ceilings the
+# predicate core enforces (MAX_FORMULA_NODES==MAX_PREDICATE_NODES, MAX_FORMULA_DEPTH==MAX_PREDICATE_DEPTH
+# — pinned in the CDC; a drift would be a second expression engine, the EI-01 §7 anti-pattern).
+# Formulas/rollups are computed at READ TIME, NEVER stored (KN-3): a rollup over a relation aggregates
+# the related rows the viewer may read, CONJOINING the SAME list_objects SetExpr (4.3) the view
+# executor uses — 0 rollup leak (a restricted target is never counted/summed, composing with KN-D5);
+# a cyclic formula surfaces as #CYCLE via the bounded dependency-graph evaluator, never an infinite
+# loop. The rollup CDC (cdc_13_3_4_3_knowledge_rollup.rs) pins the agreement + the #CYCLE + the
+# rollup-permission gates; the live permission-filtered rollup conjoin against the dev-stack Postgres
+# is the `--features integration` test (integration_kn_d10_rollup.rs) + the KN-D10 SCHED drill
+# (drill_kn_d10_rollup.rs). Floor 2 (per-rollup materialised aggregate when read-time recompute is
+# MEASURED too slow → the OLAP read store 11.6) is KN-P31 (M5), named.
 title = "myelin-query primitive (frozen byte-identical)"
 status = "covered"
 cdc = [
@@ -1793,4 +1815,5 @@ cdc = [
     "crates/myelin-query/tests/cdc_13_3_order_key.rs",
     "crates/myelin-issues/tests/cdc_13_3_issues_coown.rs",
     "crates/myelin-knowledge/tests/cdc_13_3_6_3_knowledge_flex_db.rs",
+    "crates/myelin-knowledge/tests/cdc_13_3_4_3_knowledge_rollup.rs",
 ]
