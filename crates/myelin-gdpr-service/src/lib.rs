@@ -560,6 +560,7 @@ pub mod fanout;
 pub mod git_instance;
 pub mod history_rewrite;
 pub mod holders;
+pub mod issues_chat_instance;
 pub mod orchestration;
 pub mod posture;
 pub mod producer_holders;
@@ -636,6 +637,14 @@ pub use history_rewrite::{
 pub use holders::{
     gdpr_owned_holder_ids, AuditCarveOutHolder, CryptoShredKms, GdprOwnStoreHolder,
     InMemoryShredKms, ShredKeyClass, ShredKeyHandle, AUDIT_CARVE_OUT_STORE, GDPR_OWN_STORE,
+};
+pub use issues_chat_instance::{
+    chat_residual, chat_section_references_posture, issues_chat_holder_schemas,
+    issues_chat_phase_of, issues_chat_registrations, issues_residual,
+    issues_section_references_posture, ChatCascadeReceipt, ChatStoreHolder, ChatStoreModel,
+    IssuesCascadeReceipt, IssuesChatCascadeDriver, IssuesStoreHolder, IssuesStoreModel, CHAT_DB,
+    CHAT_INSTANCE, CHAT_SUBSYSTEM, ISSUES_DB, ISSUES_INSTANCE, ISSUES_SUBSYSTEM,
+    WORKLOG_CLASSIFICATION_FOLLOW_ON,
 };
 pub use orchestration::{
     canonical_phase_of, holder_ids, CanonicalErasePhase, EraseChecklist, HolderReceipt,
