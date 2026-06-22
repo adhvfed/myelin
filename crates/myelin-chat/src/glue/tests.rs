@@ -23,11 +23,16 @@ fn subject() -> ArtifactRef {
 #[test]
 fn chat_humanise_keys_are_registered_into_the_one_templating_surface() {
     let rows = chat_humanise_templates();
-    assert_eq!(rows.len(), 3, "exactly the three chat humanise surfaces");
+    assert_eq!(rows.len(), 4, "exactly the four chat humanise surfaces");
 
     let by_key: BTreeMap<&str, &HumaniseTemplate> =
         rows.iter().map(|r| (r.template_key.as_str(), r)).collect();
-    for key in [TPL_CHAT_CARD, TPL_CHAT_AGENT_MESSAGE, TPL_CHAT_MENTIONED] {
+    for key in [
+        TPL_CHAT_CARD,
+        TPL_CHAT_CARD_FACETS,
+        TPL_CHAT_AGENT_MESSAGE,
+        TPL_CHAT_MENTIONED,
+    ] {
         let row = by_key
             .get(key)
             .unwrap_or_else(|| panic!("chat must register `{key}`"));
@@ -37,10 +42,11 @@ fn chat_humanise_keys_are_registered_into_the_one_templating_surface() {
             "`{key}` is a platform-default row"
         );
         assert_eq!(row.locale, myelin_notif::DEFAULT_LOCALE);
-        // the body carries the `{0}` SUBJECT slot (resolved per-viewer → title|tombstone).
+        // the body binds a `{0}` slot (the subject ref for the per-viewer surfaces; the first facet
+        // for the facets surface) — resolved per-viewer (title|tombstone) or formatter-bound.
         assert!(
             row.body.contains("{0}"),
-            "`{key}` body must bind the {{0}} subject slot"
+            "`{key}` body must bind the {{0}} slot"
         );
         assert!(!row.body.is_empty());
     }
@@ -55,7 +61,12 @@ fn chat_humanise_keys_register_and_look_up_through_notif() {
     let mut store = TemplateStore::with_platform_defaults();
     register_chat_humanise_templates(&mut store);
 
-    for key in [TPL_CHAT_CARD, TPL_CHAT_AGENT_MESSAGE, TPL_CHAT_MENTIONED] {
+    for key in [
+        TPL_CHAT_CARD,
+        TPL_CHAT_CARD_FACETS,
+        TPL_CHAT_AGENT_MESSAGE,
+        TPL_CHAT_MENTIONED,
+    ] {
         let got = store
             .lookup(PLATFORM_DEFAULT_TENANT, key, myelin_notif::DEFAULT_LOCALE)
             .unwrap_or_else(|| panic!("Notif's ONE templating surface serves chat's `{key}`"));
@@ -289,6 +300,85 @@ fn the_write_fanout_set_is_a_bounded_subset_of_the_durable_tokens() {
     );
     // the mention producer is in the write-fanout set (the canonical producer, contract 13.1).
     assert!(CHAT_WRITE_FANOUT_TOKENS.contains(&CHAT_MESSAGE_MENTIONED));
+}
+
+// ---------------------------------------------------------------------------------------------
+// §3b — the explicit-first agent-dispatch boundary (contract 8.6 / CHAT-1, NOTIF-P22): a casual
+//        @agent mention is NOTIFY-ONLY (0 auto-spawn); only an explicit action dispatches a run.
+// ---------------------------------------------------------------------------------------------
+
+/// **A casual `@agent` mention is NOTIFY-ONLY — the explicit-first floor (CHAT-1).** Whatever the
+/// `is_explicit_action` flag says, a `chat.message.mentioned` is [`AgentDispatchClass::NotifyOnly`]
+/// — it notifies, it NEVER auto-spawns a costed run. This is the chat-side half of CHAT-D17 (0
+/// auto-spawn from a casual mention); the dispatch tier maps it to `NotifiedOnly`.
+#[test]
+fn a_casual_agent_mention_is_notify_only() {
+    assert_eq!(
+        agent_dispatch_class(CHAT_MESSAGE_MENTIONED, false),
+        AgentDispatchClass::NotifyOnly,
+        "a casual @agent mention notifies — it does not auto-spawn a costed run (CHAT-1)"
+    );
+    // even mis-flagged as an action, a mention can ONLY notify (the explicit-first floor holds).
+    assert_eq!(
+        agent_dispatch_class(CHAT_MESSAGE_MENTIONED, true),
+        AgentDispatchClass::NotifyOnly,
+        "a mention is never an explicit dispatch — the explicit-first floor is structural"
+    );
+}
+
+/// **Only an EXPLICIT action dispatches a costed run.** A deliberate structured action (not a casual
+/// mention) flagged `is_explicit_action = true` is [`AgentDispatchClass::ExplicitDispatch`]; a
+/// non-mention chat event without the explicit flag stays notify-only (the safe default — a costed
+/// run requires a deliberate action).
+#[test]
+fn only_an_explicit_action_dispatches_a_costed_run() {
+    assert_eq!(
+        agent_dispatch_class("chat.reaction.added", true),
+        AgentDispatchClass::ExplicitDispatch,
+        "a deliberate approve-action dispatches a costed run (after the guards + reserve)"
+    );
+    assert_eq!(
+        agent_dispatch_class("chat.message.created", false),
+        AgentDispatchClass::NotifyOnly,
+        "a non-mention chat event without an explicit action only notifies (the safe default)"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// §3c — the HITL approval card renders ACTION + RISK + COST through the ONE templating surface
+//        (refined §1.4 / NOTIF-P9): the card is leak-safe (the subject slot is the only ref slot).
+// ---------------------------------------------------------------------------------------------
+
+/// **The HITL card surfaces ACTION + RISK + COST via `chat_hitl_card_facets` through the ONE Notif
+/// formatter — refined §1.4 / NOTIF-P9.** The facets are PII-free literal agent strings (NOT
+/// per-viewer refs), bound by Notif's ONE ICU-subset formatter over [`TPL_CHAT_CARD_FACETS`]; the
+/// per-viewer subject is the separate [`TPL_CHAT_CARD`] line. Chat renders nothing itself (OQ-L).
+#[test]
+fn hitl_card_facets_render_action_risk_and_cost_through_the_one_surface() {
+    let mut store = TemplateStore::with_platform_defaults();
+    register_chat_humanise_templates(&mut store);
+
+    // the facets body binds the three facet slots (action {0}, risk {1}, cost {2}).
+    let facets_tpl = store
+        .lookup(
+            PLATFORM_DEFAULT_TENANT,
+            TPL_CHAT_CARD_FACETS,
+            myelin_notif::DEFAULT_LOCALE,
+        )
+        .expect("the facets key is registered");
+    for slot in [CARD_FACET_ACTION, CARD_FACET_RISK, CARD_FACET_COST] {
+        assert!(
+            facets_tpl.body.contains(&format!("{{{slot}}}")),
+            "the facets body must bind slot {{{slot}}}: `{}`",
+            facets_tpl.body
+        );
+    }
+
+    // the helper renders all three facets through the ONE Notif formatter (chat renders nothing).
+    let facets = chat_hitl_card_facets(&store, "merge", "irreversible", "0.40 USD");
+    assert!(facets.contains("merge"), "action: `{facets}`");
+    assert!(facets.contains("irreversible"), "risk: `{facets}`");
+    assert!(facets.contains("0.40 USD"), "cost: `{facets}`");
 }
 
 // ---------------------------------------------------------------------------------------------

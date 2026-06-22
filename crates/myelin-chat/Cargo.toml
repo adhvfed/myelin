@@ -62,3 +62,9 @@ serde_json.workspace = true
 myelin-identity-service = { path = "../myelin-identity-service" }
 myelin-storage = { path = "../myelin-storage" }
 myelin-tenancy = { path = "../myelin-tenancy" }
+# NOTIF-P22 (P-343): the Bus reactive/dispatch tier (contract 3.6 / §4.7) chat's explicit-first
+# boundary (8.6 / CHAT-1) is PROVEN through — the CHAT-D17 drill wires chat's `agent_dispatch_class`
+# decision into the REAL `myelin_query::DispatchTier` and asserts a casual @agent mention →
+# `Disposition::NotifiedOnly` (0 auto-spawn, 0 reservation). A DEV-only edge: `myelin-query` sits in
+# the mid-tier of the §2.9 DAG and NOTHING depends back on `myelin-chat`, so the graph stays acyclic.
+myelin-query = { path = "../myelin-query" }

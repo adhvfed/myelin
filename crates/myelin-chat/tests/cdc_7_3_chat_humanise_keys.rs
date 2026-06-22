@@ -17,7 +17,7 @@
 
 use myelin_chat::glue::{
     chat_humanise_templates, register_chat_humanise_templates, TPL_CHAT_AGENT_MESSAGE,
-    TPL_CHAT_CARD, TPL_CHAT_MENTIONED,
+    TPL_CHAT_CARD, TPL_CHAT_CARD_FACETS, TPL_CHAT_MENTIONED,
 };
 use myelin_notif::{
     render_message, HumaniseTemplate, TemplateStore, DEFAULT_LOCALE, PLATFORM_DEFAULT_TENANT,
@@ -50,12 +50,17 @@ fn cdc_7_3_chat_provider_registers_keys_consumer_admits_and_serves() {
     let rows = provider_chat_humanise_rows();
     assert_eq!(
         rows.len(),
-        3,
-        "chat registers exactly the three humanise surfaces"
+        4,
+        "chat registers exactly the four humanise surfaces (card subject + card facets + agent-message + mentioned)"
     );
 
     let store = consumer_admits_and_serves(&rows);
-    for key in [TPL_CHAT_CARD, TPL_CHAT_AGENT_MESSAGE, TPL_CHAT_MENTIONED] {
+    for key in [
+        TPL_CHAT_CARD,
+        TPL_CHAT_CARD_FACETS,
+        TPL_CHAT_AGENT_MESSAGE,
+        TPL_CHAT_MENTIONED,
+    ] {
         let served = store
             .lookup(PLATFORM_DEFAULT_TENANT, key, DEFAULT_LOCALE)
             .unwrap_or_else(|| panic!("Notif's ONE templating surface must serve chat's `{key}`"));
