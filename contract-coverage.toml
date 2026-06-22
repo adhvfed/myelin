@@ -383,9 +383,18 @@ status = "covered"
 # query (the `authz_visible` JOIN, no N+1, no post-filter) + the code-search pre-filter (6.1). The
 # git consumer CDC + the GIT-D11 chained drill ride here; the live one-query/0-leak/revoke-reflected
 # proof is the `--features integration` test against the dev-stack Postgres.
+# KN-P16 / P-306 adds the KNOWLEDGE-side consumer half: `myelin_knowledge::list_filter` lowers the
+# returned `Filter{set_expr}` over Knowledge's OWN `db_row.id`/`page.id` (§4.1/§7.3) into ONE leak-free
+# db VIEW query AND the **permission-correct `COUNT(*)`** (the KN-D5 count-leak-closed shape — the ACL
+# conjunct INSIDE the aggregate so a COUNT over a row-restricted db reveals neither the existence nor
+# the number of forbidden rows). The knowledge consumer CDC + the KN-D5 chained drill (0 leak, 0
+# count-leak, revoke reflected) ride here; the live one-query / 0-leak / 0-count-leak / revoke-
+# reflected proof is the `--features integration` test against the dev-stack Postgres
+# (`integration_kn_d5_list_pushdown.rs`).
 cdc = [
   "crates/myelin-identity-service/tests/cdc_4_3_list_objects.rs",
   "crates/myelin-git/tests/cdc_4_3_git_list_pushdown.rs",
+  "crates/myelin-knowledge/tests/cdc_4_3_knowledge_list_pushdown.rs",
 ]
 
 [[contract]]

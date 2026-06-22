@@ -86,6 +86,12 @@ default = []
 # KN-D7 (the silent-data-loss floor): the Knowledge outbox emit seam PROVEN against the live
 # dev-stack Postgres `outbox` table (the same-transaction co-commit; write → crash mid-relay →
 # recover → 0 ghost / 0 lost). Registered red-until-proven; flips green only with the real artifact.
+#
+# KN-D5 / P-306 (the 0-leak-incl-COUNT crux): the `list_objects` `SetExpr` push-down + the
+# permission-correct `COUNT(*)` PROVEN against the live dev-stack Postgres (the lowered InRelation →
+# `authz_visible` JOIN conjoined into ONE db-list query AND one COUNT aggregate; 0 leaked rows, 0
+# count-leak, no-cross-db/cross-tenant, revoke reflected). tests/integration_kn_d5_list_pushdown.rs.
+# Registered red-until-proven; flips green only with the real artifact.
 integration = ["dep:sqlx", "dep:tokio"]
 
 [dev-dependencies]
@@ -98,3 +104,11 @@ myelin-harness = { path = "../myelin-harness" }
 # KN-P06 also uses it for the `no-raw-publish` KNOWLEDGE-slice fixture pair (the lint is CENTRAL;
 # Knowledge attaches fixtures + asserts the verdict — the refs_lints.rs precedent).
 myelin-lints = { path = "../myelin-lints" }
+# DEV-only (KN-P16 / P-306): the REAL Identity namespace/list_objects engine, so the contract-4.3 CDC
+# pair drives the PRODUCER (Identity's `ListObjects` over the compiled Knowledge `database_row`
+# fragment, returning the frozen `Filter{set_expr}`) and the CONSUMER (Knowledge's `list_filter`
+# lowering it over its OWN `db_row.id` into ONE leak-free view + permission-correct COUNT query) — the
+# SAME shape both sides agree on, never a stub of the producer (the cdc_4_3_git_list_pushdown.rs
+# precedent). DEV-dependency ONLY — `myelin-identity-service` does NOT enter the Knowledge production
+# DAG (the production crate depends only on the frozen `myelin-identity` ABI; the DAG stays acyclic).
+myelin-identity-service = { path = "../myelin-identity-service" }
