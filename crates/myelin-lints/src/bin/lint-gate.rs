@@ -63,6 +63,18 @@ const EXCLUDED_SUBSTRINGS: &[&str] = &[
     // durable-bus call site while honouring the architecture's two-transport split. NAMED, LOUD
     // exclusion (see the module note in firehose.rs), never a silent skip.
     "myelin-events/src/firehose.rs",
+    // The KNOWLEDGE COLLAB TRANSPORT (KN-P07 / P-297): `CollabTransport::send_op` /
+    // `publish_presence` call `firehose.publish(stream=fan.<tenant>.knowledge, scope=doc:<page_id>,
+    // frame)` — the EPHEMERAL collab op-stream + presence fan-out the architecture explicitly sites
+    // on the firehose (§4.3: "the firehose carries … collab op-streams"; §2.1: "the durable bus
+    // carries only the knowledge.doc.updated pointer; the collab op-stream never melts the durable
+    // control bus", ADR-04.5). A firehose frame is a references-not-payloads pointer (the op_id wire
+    // form), never an inline-PII durable event, and is NOT emitted-iff-committed through the outbox.
+    // Knowledge's DURABLE emit (the coalesced knowledge.doc.updated / knowledge.page.updated via
+    // OutboxTx::emit) lives in `emit.rs`, which stays FULLY linted. Excluding this ONE transport file
+    // (the same posture as firehose.rs / relay.rs) honours the two-transport split. NAMED, LOUD
+    // exclusion (see the module note in transport.rs), never a silent skip.
+    "myelin-knowledge/src/transport.rs",
     "myelin-harness/src/bin/sub-m0-scorecard.rs",
     "myelin-harness/src/bin/id-m1-scorecard.rs",
     // The infra integration exit-gate runner (Stage 4): same posture as the two runners above —
