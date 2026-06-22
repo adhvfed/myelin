@@ -912,11 +912,29 @@ status = "covered"
 # `crates/myelin-events/tests/integration_eb27_check_seam_producer.rs` (envelope conformance for the
 # checks AND the rollup + broker-dedup of a re-published ci.result + per-aggregate ordering — run with
 # --features integration).
+# REF-P19/P-335 (M4) CLOSED THE REFS HALF OF X-1 — the SUB-ANCHOR resolution of `check-`/`step-`. Refs
+# is a CONSUMER of the CI producer half (the Refs engine is FIXED at M2): `myelin_refs_service::CiOwner`
+# maps a CI `#sub` KIND through the ONE ladder (C-6) onto the frozen `live/moved/outdated/gone` state —
+# a `check-<context>` → the CURRENT (latest-by-`run_attempt`) check state off the REUSED
+# `myelin_git::check_status::CheckStatusProjection` supersession (out-of-order honoured at the sub-anchor
+# level — a late lower attempt is dropped, the anchor never regresses); a `step-<n>` `details_ref` →
+# the 11.8 SEALED CI LOG SEGMENTS (`myelin_storage::CiLogTier::resolve_step_anchor` — the exact failing
+# step's bytes; an unknown/pruned step → GONE with the root run carried; a crypto-shredded segment →
+# ERASED, never a wrong serve). Refs does NOT re-build the supersession rule, the merge gate, or the log
+# index — it CONSULTS the frozen seams. REF-D9 GREEN on the CI anchors + the out-of-order chained drill
+# are proven against the REAL CI producer end-to-end (real KMS DEK, real sealed content-addressed
+# segments, real `check_seam` carriage + ordering, the full Refs `ResolveService` chokepoint) in
+# `crates/myelin-refs-service/tests/integration_ref_p19_ci_producer.rs`, plus the unit ladder arms in
+# `crates/myelin-refs-service/src/ci_producer/tests.rs`. The Refs sub-anchor consumer-side CDC pair is
+# `crates/myelin-refs-service/tests/cdc_5_9_ci_sub_anchors.rs`. The NON-Refs half (merge gate, fork
+# endorsement, the merge-queue wake) stays the Git+CI deliverable (GIT-D10/CI-D8, above).
 cdc = [
     # the Bus's carriage CDC (the narrow half — envelope + ordering + the wait substrate)
     "crates/myelin-events/tests/cdc_5_9_check_seam_carriage.rs",
     # Git's consumer leg (the projection over the ordered carriage — provider+consumer markers)
     "crates/myelin-git/tests/cdc_5_9_check_status_consumer.rs",
+    # Refs' sub-anchor resolution half (the Refs half of X-1 — check-/step- through the one ladder)
+    "crates/myelin-refs-service/tests/cdc_5_9_ci_sub_anchors.rs",
 ]
 
 # ──────────────── §6 Search (myelin-search) ─────────────────────────────────────────────────────
