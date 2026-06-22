@@ -60,12 +60,19 @@
 //! floor under that drill — proves the runner BOOTS hardened, not that it survives the corpus).
 
 pub mod escape_corpus;
+pub mod events;
 pub mod firecracker;
 pub mod gvisor;
 pub mod hardening;
+pub mod replay;
 pub mod runner;
 pub mod self_hosted;
 pub mod snapshot_pool;
+
+pub use events::{
+    ci_event_tokens, is_durable, register_ci_tokens, CI_DURABLE_TOKENS, CI_FIREHOSE_TOKENS,
+};
+pub use replay::CiReindexSource;
 
 pub use escape_corpus::{
     build_corpus_script, parse_console, AttackFamily, AttackMarker, AttackOutcome, Backend,

@@ -284,6 +284,81 @@ pub struct CiResult {
     pub idem_token: String,
 }
 
+/// The `ci.result` rollup signal `subject` (§4.12 / X-1): `repo#commit-<oid>/ci-result` — a `#sub`
+/// sub-anchor on the same commit the per-context checks anchor on, so the rollup and its checks
+/// share the commit anchor (the merge-queue waits on the rollup; Git's projection reads the checks).
+/// The Bus only references the `#sub` sub-anchor vocabulary (Refs-owned, contract 5.7).
+pub fn ci_result_subject(repo: &str, commit_oid: &str) -> ArtifactRef {
+    ArtifactRef(format!("{repo}#commit-{commit_oid}/ci-result"))
+}
+
+/// **Build the canonical [`EventDraft`] for the `ci.result` rollup signal (the PRODUCER leg, EB-27/
+/// M4).** CI derives the rollup from the per-context `ci.check.updated` facts and emits it **via the
+/// outbox** (BUS-2) on the same `(repo, commit_oid)` aggregate, so the rollup is per-aggregate
+/// ordered *after* the checks it rolls up. The merge-queue durable workflow waits on it via
+/// `wait_for_signal("ci.result", idem_key=<merge_attempt_id>)` (contract 9.4); the Bus carries the
+/// signal opaque + provides the idempotent wake substrate ([`CiResultWaitSubstrate`]).
+///
+/// The Bus owns ONLY the envelope conformance (`type_ = ci.result`, the commit-anchored aggregate,
+/// the signal payload shape `{commit_oid, overall, contexts, idem_token}`). It does NOT decide the
+/// `overall` verdict (CI derives it from required-context status) nor the merge (Git's gate). The
+/// `aggregate` deliberately matches [`check_aggregate`] so the rollup linearises after its checks on
+/// the one per-commit partition (§2.2/§4.12).
+pub fn ci_result_draft(repo: &str, result: &CiResult) -> EventDraft {
+    EventDraft {
+        type_: EventType(CI_RESULT.to_string()),
+        subject: ci_result_subject(repo, &result.commit_oid),
+        aggregate: check_aggregate(repo, &result.commit_oid),
+        // The rollup signal payload `{commit_oid, overall, contexts, idem_token}` — PII-free
+        // (references-not-payloads: context identifiers + a commit OID, never log bytes).
+        payload: serde_json::to_value(result).expect("CiResult serialises (closed shape)"),
+        data_role: DataRole::Controller,
+        visibility: Visibility::Internal,
+        contains_personal_data: false,
+        pii_key_ref: None,
+    }
+}
+
+/// **Derive the `ci.result` rollup from the per-aggregate-ordered checks (the PRODUCER's roll-up,
+/// EB-27/M4).** Given the CURRENT per-context status (after Git/CI's `run_attempt` supersession has
+/// collapsed each context to one row) and the set of `required` contexts the merge gate enforces,
+/// compute the `overall` verdict: [`CiOverall::Success`] iff EVERY required context succeeded,
+/// [`CiOverall::Failure`] otherwise (a required context failed/errored/missing). The Bus offers this
+/// as a deterministic helper the CI producer uses to mint the rollup it emits via [`ci_result_draft`]
+/// — it does NOT decide *which* contexts are required (Git's gate does; the producer passes the set).
+///
+/// `current` maps a context name → did-it-succeed (the post-supersession truth). `required` is the
+/// gate's required-context set. `idem_token` is the merge-attempt idempotency key CI mints. The
+/// verdict is pure/deterministic (same inputs → same rollup), so a re-derivation after a redelivery
+/// is byte-identical (the idempotent wake then absorbs the duplicate).
+pub fn rollup_ci_result(
+    commit_oid: &str,
+    current: &BTreeMap<String, bool>,
+    required: &[String],
+    idem_token: &str,
+) -> CiResult {
+    // Success iff every REQUIRED context is present AND succeeded; a missing required context is a
+    // failure-to-gate (never an implicit pass — the gate stays closed until CI reports it).
+    let overall = if required
+        .iter()
+        .all(|ctx| current.get(ctx).copied().unwrap_or(false))
+    {
+        CiOverall::Success
+    } else {
+        CiOverall::Failure
+    };
+    // The rolled-up context set is the required gate set, in deterministic (sorted) order so the
+    // rollup is byte-stable across re-derivations (the idempotent-wake precondition).
+    let mut contexts: Vec<String> = required.to_vec();
+    contexts.sort();
+    CiResult {
+        commit_oid: commit_oid.to_string(),
+        overall,
+        contexts,
+        idem_token: idem_token.to_string(),
+    }
+}
+
 /// **The durable `wait_for_signal("ci.result", idem_key)` substrate (the Bus's narrow 9.4 half).**
 ///
 /// The merge-queue is a durable workflow (`myelin-flow`, contract 9.1) that
@@ -692,5 +767,94 @@ mod tests {
         // Round-trip.
         let back: CiResult = serde_json::from_value(v).unwrap();
         assert_eq!(back, result);
+    }
+
+    /// **The PRODUCER leg: the `ci.result` rollup draft follows the §4.12 grammar.** CI emits the
+    /// rollup on the SAME `(repo, commit_oid)` aggregate as the checks it rolls up, so the rollup
+    /// linearises after them on the one per-commit partition; the subject is the `ci-result` `#sub`.
+    #[test]
+    fn ci_result_draft_follows_the_grammar() {
+        let result = CiResult {
+            commit_oid: "abc123".into(),
+            overall: CiOverall::Success,
+            contexts: vec!["build".into(), "test".into()],
+            idem_token: "merge-7".into(),
+        };
+        let draft = ci_result_draft("myelin://acme/git/repo/core", &result);
+        assert_eq!(draft.type_.0, "ci.result");
+        assert_eq!(
+            draft.subject.0, "myelin://acme/git/repo/core#commit-abc123/ci-result",
+            "subject = repo#commit-<oid>/ci-result (§4.12 #sub)"
+        );
+        assert_eq!(
+            draft.aggregate.0, "myelin://acme/git/repo/core#commit-abc123",
+            "the rollup shares the per-commit aggregate so it linearises after its checks"
+        );
+        assert_eq!(
+            draft.aggregate,
+            check_aggregate("myelin://acme/git/repo/core", "abc123"),
+            "the rollup aggregate IS the checks' aggregate"
+        );
+        assert!(!draft.contains_personal_data, "references-not-payloads");
+        // The payload round-trips to the frozen signal shape.
+        let back: CiResult = serde_json::from_value(draft.payload).unwrap();
+        assert_eq!(back, result);
+    }
+
+    /// **The PRODUCER's rollup derivation: success iff EVERY required context succeeded.** The Bus
+    /// offers a deterministic verdict helper; a missing or failing required context closes the gate
+    /// (never an implicit pass). The Bus does NOT decide WHICH contexts are required.
+    #[test]
+    fn rollup_ci_result_is_success_iff_all_required_pass() {
+        let required = vec!["build".to_string(), "test".to_string()];
+
+        // All required succeeded → Success.
+        let mut current = BTreeMap::new();
+        current.insert("build".to_string(), true);
+        current.insert("test".to_string(), true);
+        current.insert("lint".to_string(), false); // non-required failure → irrelevant
+        let r = rollup_ci_result("abc123", &current, &required, "merge-1");
+        assert_eq!(r.overall, CiOverall::Success);
+        assert_eq!(
+            r.contexts,
+            vec!["build".to_string(), "test".to_string()],
+            "the rolled-up set is the required gate set, sorted (byte-stable)"
+        );
+
+        // A required context failed → Failure.
+        let mut current = BTreeMap::new();
+        current.insert("build".to_string(), true);
+        current.insert("test".to_string(), false);
+        let r = rollup_ci_result("abc123", &current, &required, "merge-1");
+        assert_eq!(r.overall, CiOverall::Failure);
+
+        // A required context MISSING (CI hasn't reported it) → the gate stays closed (Failure).
+        let mut current = BTreeMap::new();
+        current.insert("build".to_string(), true);
+        let r = rollup_ci_result("abc123", &current, &required, "merge-1");
+        assert_eq!(
+            r.overall,
+            CiOverall::Failure,
+            "a missing required context never implicitly passes"
+        );
+    }
+
+    /// **The rollup is DETERMINISTIC (the idempotent-wake precondition).** Re-deriving the rollup
+    /// from the same inputs is byte-identical, so a re-delivery of the same rollup carries the same
+    /// `idem_token` + payload → the substrate absorbs it as one wake.
+    #[test]
+    fn rollup_ci_result_is_deterministic() {
+        let required = vec!["test".to_string(), "build".to_string()]; // unsorted input
+        let mut current = BTreeMap::new();
+        current.insert("build".to_string(), true);
+        current.insert("test".to_string(), true);
+        let a = rollup_ci_result("abc123", &current, &required, "merge-1");
+        let b = rollup_ci_result("abc123", &current, &required, "merge-1");
+        assert_eq!(a, b, "same inputs → byte-identical rollup");
+        assert_eq!(
+            a.contexts,
+            vec!["build".to_string(), "test".to_string()],
+            "contexts always sorted regardless of input order"
+        );
     }
 }

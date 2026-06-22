@@ -78,4 +78,7 @@
 pub mod events;
 pub mod glue;
 pub mod rebac_fragment;
+pub mod replay;
 pub mod subs;
+
+pub use replay::{ChatReindexSource, ChatReplayKind};

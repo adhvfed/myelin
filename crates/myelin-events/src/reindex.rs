@@ -49,12 +49,17 @@
 //!   (`myelin_git::replay::GitReindexSource`) + Knowledge's page-subtree-at-BLOCK-granularity replay
 //!   (`myelin_content::replay::KnowledgeReindexSource`) — both proven cold == live + idempotent in
 //!   their own crates' tests against THIS seam.
-//! - **FLOOR (M4 owners — EB-27):** CI's one-run replay, Issues/Chat replay, Refs' per-blob replay,
-//!   Search's full reindex land with those subsystems' M4 prompts (`coverage-matrix` rows
-//!   2.6/4.x/5.x).
+//! - **M4 owners — FILLED (EB-27 / P-327):** CI's one-run replay
+//!   (`myelin_ci_sandbox::replay::CiReindexSource` — `run:`/`deployment:`/`pipeline:` granular) +
+//!   Issues' replay (`myelin_issues::replay::IssueReindexSource` — issue/relation/comment/rollup) +
+//!   Chat's durable replay (`myelin_chat::replay::ChatReindexSource` — channel/message/thread; the
+//!   firehose-only frames recover via resume, not replay) — all proven cold == live + idempotent +
+//!   erased-skip (X-7) in their own crates' tests against THIS seam.
+//! - **FLOOR (still owed):** Refs' per-blob replay + Search's full reindex land with those
+//!   subsystems' own prompts (`coverage-matrix` rows 4.x/5.x).
 //!
 //! The [`ReferenceReindexSource`] here is the reference owner the BUS-D5 drill runs against; it is
-//! NOT a stand-in for a real owner's replay (the real M3 owners are the two named above).
+//! NOT a stand-in for a real owner's replay (the real owners are the five named above).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
