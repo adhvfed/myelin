@@ -59,6 +59,7 @@
 /// edits live. KN-D2 re-runs over the integrated path (every block a `serialize(parse(md))===md`
 /// fixed point). The block tree + stable ids is the follow-on KN-P10 (P-300); no merge engine
 /// (KN-P13/P29) and no perms beyond tenant isolation (KN-P14/P16).
+pub mod authority;
 pub mod block_tree;
 pub mod compaction;
 pub mod editor;
@@ -69,6 +70,11 @@ pub mod subs;
 pub mod sync_block;
 pub mod transport;
 
+pub use authority::{
+    field_caveat, AclZookieTable, AuthZookie, CollectionSchema, ErasureLedger, IncomingOp,
+    OpAuthorizer, OpDecision, OpPermission, RejectReason, SchemaValidator, StaleGrantCounter,
+    STALE_GRANT_WRITES_METRIC,
+};
 pub use block_tree::{
     children_index_range_sql, recursive_subtree_cte_sql, BlockId, BlockRow, BlockTree, PageId,
     PageTree, TreeError,
