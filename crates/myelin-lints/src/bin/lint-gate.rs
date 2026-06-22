@@ -88,6 +88,12 @@ const EXCLUDED_SUBSTRINGS: &[&str] = &[
     // host-exec site for a CI/test-support orchestration binary. NAMED, LOUD exclusion of a single
     // tool file; the lint stays fully live on every production crate.
     "myelin-harness/src/bin/m2-scorecard.rs",
+    // The M3 producer-subsystems exit-gate runner (M3 → M4): same posture as the runners above —
+    // its `Command::new(env!("CARGO"))` spawns `cargo test`/`cargo run` per Git+Knowledge drill
+    // (incl. the GIT-D10/D11-int + KN-D5/D7/D9/D10 `--features integration` rows against the live
+    // stack), the one legitimate host-exec site for a CI/test-support orchestration binary. NAMED,
+    // LOUD exclusion of a single tool file; the lint stays fully live on every production crate.
+    "myelin-harness/src/bin/m3-scorecard.rs",
     // The Firecracker + gVisor sandbox BACKENDS (CI-P2 → P-237): the ONE legitimate VMM/runtime
     // spawn sites. The `no-host-exec` rule forbids platform code SHELLING OUT to the host kernel so
     // that all execution goes through the unified sandbox seam (`SandboxBackend::launch`). These two
