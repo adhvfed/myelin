@@ -65,6 +65,7 @@ pub mod editor;
 pub mod emit;
 pub mod store;
 pub mod subs;
+pub mod sync_block;
 pub mod transport;
 
 pub use block_tree::{
@@ -87,6 +88,10 @@ pub use emit::{
 };
 pub use store::{
     knowledge_scope, knowledge_store_migrations, KnowledgeStore, KnowledgeTable,
+};
+pub use sync_block::{
+    render_sync_block, AllowAll, DenyAll, ProjectionFreshness, SourceReadCheck, SyncBlockProjection,
+    SyncBlockRender, SyncSource, Tombstone, TombstoneReason, Viewer,
 };
 pub use transport::{
     doc_scope, knowledge_stream, AllowAllAuthority, AuthAction, CollabTransport, Connected, DocOp,

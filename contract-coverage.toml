@@ -548,10 +548,19 @@ title = "resolve(ref, viewer, mode)"
 # (resolve `Display` → Projection|Tombstone) over the projector — promoting the GIT-P19 test-local
 # resolve stand-in (the named floor) to a real producer-crate seam (the leak gate now runs over Git's
 # real projection). cell-local (OQ-I); the cross-cell single-home resolve stays the named multi-cell floor.
+# KN-P12 / P-302 (M3) adds the KNOWLEDGE CONSUMER half of 5.2: the `sync_block` read-projection FLOOR
+# (`myelin_knowledge::render_sync_block`) renders the `sync_block` taxonomy node by resolving its
+# `source` per viewer through the SAME 4-step ladder (permission → root → sub-resolve → erased),
+# returning the LIVE source subtree IFF the viewer can read it, else a content-free tombstone (the
+# `sync_block_leak == 0` gate + the reflect gate). The central Refs `resolve` engine is the R-M2
+# follow-on; the per-viewer read decision threads the `SourceReadCheck` seam (the full ABAC body is
+# KN-P16). FLOOR (named): read-projection only; editable-in-place multi-home is KQ-6, post-M5 on the
+# CRDT (KN-P29).
 status = "covered"
 cdc = [
     "crates/myelin-git/tests/cdc_5_1_5_2_5_6_git_project.rs",
     "crates/myelin-git/tests/cdc_5_2_7_3_7_1_git_humanise_resolve.rs",
+    "crates/myelin-knowledge/tests/cdc_5_2_knowledge_sync_block.rs",
 ]
 
 [[contract]]
