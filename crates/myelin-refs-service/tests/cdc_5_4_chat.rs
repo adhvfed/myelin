@@ -1,0 +1,240 @@
+//! **REF-P21 / P-337 — the CDC pair for the Refs consumer side of 5.4 (Chat), the MAXIMAL producer.**
+//!
+//! These run on the default `cargo test --workspace` (DB-free): they exercise the Chat producer →
+//! consumer round-trip through the REAL [`myelin_events::OutboxTransaction`] (the same-tx co-commit,
+//! contract 2.2) over the in-memory [`myelin_events::OutboxStore`] (which models the §3.2 outbox
+//! table's emit-iff-committed semantics exactly) + the in-memory edge projection (which models the
+//! §3.2 `edge` table). The REAL Postgres `edge` table proof for the Chat corpus is
+//! `tests/integration_ref_p21_chat_producer.rs` (the `integration` feature).
+//!
+//! What is proven here (Chat is the FINAL, MAXIMAL producer — it unfurls EVERY artifact class):
+//! - **CDC 5.4 (provider side, Chat):** a real Chat message body (mention/artifact_ref/embed over
+//!   issue / commit / doc / CI run / another message) emits exactly one `refs.edge.created` per
+//!   structured node via [`ChatEdgeProducer::emit_chat_edges`] — the SAME `OutboxTx::emit` seam every
+//!   producer uses, no Chat-specific edge-write API.
+//! - **CDC 5.4 (consumer side, Chat):** those emitted edges, ingested through the edge projection,
+//!   land as the right `(source, target, rel)` reference triples sourced from the Chat message root —
+//!   the leak-free reference corpus Refs traverses.
+//! - **Emit-iff-committed (REF-D7 producer half):** the Chat message's edges become durable IFF the
+//!   message-send transaction commits; an aborted send drops them (no unfurl edge without its message).
+//! - **Cross-subsystem traversal COMPLETE:** the one Chat message's edge set spans all five producer
+//!   subsystems (Git / CI / Knowledge / Issues / Chat) — the R-M4 milestone.
+
+use myelin_content::InlineNode;
+use myelin_events::{
+    Actor, AggregateKey, ArtifactRef, CausedBy, CorrelationId, DataRole, EmitContextBase,
+    EventEnvelope, EventId, EventType, IdMinter, MonotonicMinter, OutboxStore, Region, TenantId,
+    Timestamp, Visibility,
+};
+use myelin_identity::{Principal, PrincipalId, PrincipalKind};
+use myelin_refs_service::{ChatEdgeProducer, EdgeProjection, EdgeRel};
+
+use std::sync::Arc;
+
+fn tenant() -> TenantId {
+    TenantId("acme".into())
+}
+fn region() -> Region {
+    Region("fr-par".into())
+}
+fn principal() -> Principal {
+    Principal::stub(
+        PrincipalId("p-opaque-7".into()),
+        PrincipalKind::Human,
+        tenant(),
+    )
+}
+
+/// The `chat.message.created` event the unfurl edges co-commit into (the CAUSE).
+fn content_event(depth: u32) -> EventEnvelope {
+    EventEnvelope {
+        event_id: EventId("01J-chat-msg".into()),
+        type_: EventType("chat.message.created".into()),
+        schema_ver: 1,
+        tenant: tenant(),
+        region: region(),
+        actor: Actor(principal()),
+        subject: ChatEdgeProducer::message_root("acme", "01HMSGCDC"),
+        aggregate: AggregateKey("chat:message:01HMSGCDC".into()),
+        causation_id: None,
+        correlation_id: CorrelationId("01J-root-corr".into()),
+        caused_by: Some(CausedBy("session:abc".into())),
+        depth,
+        contains_personal_data: false,
+        data_role: DataRole::Controller,
+        visibility: Visibility::Internal,
+        pii_key_ref: None,
+        occurred_at: Timestamp("2026-06-23T00:00:00Z".into()),
+        recorded_at: Timestamp("2026-06-23T00:00:01Z".into()),
+        payload: serde_json::json!({ "body_ref": "r1" }),
+    }
+}
+
+fn ctx_base() -> EmitContextBase {
+    EmitContextBase {
+        tenant: tenant(),
+        region: region(),
+        actor: Actor(principal()),
+        schema_ver: 1,
+        occurred_at: Timestamp("2026-06-23T00:00:00Z".into()),
+        recorded_at: Timestamp("2026-06-23T00:00:01Z".into()),
+        caused_by: Some(CausedBy("session:abc".into())),
+    }
+}
+
+fn store_and_minter() -> (OutboxStore, Arc<dyn IdMinter>) {
+    (
+        OutboxStore::new(),
+        Arc::new(MonotonicMinter::new()) as Arc<dyn IdMinter>,
+    )
+}
+
+/// The MAXIMAL Chat message body: it unfurls every artifact class (Issues / Git / CI / Knowledge /
+/// Chat) + mentions a person — five structured nodes → five edges.
+fn maximal_chat_body() -> Vec<InlineNode> {
+    vec![
+        InlineNode::Mention(principal()),
+        InlineNode::ArtifactRefNode(ArtifactRef("myelin://acme/issue/issue/ENG-1".into())),
+        InlineNode::Embed(ArtifactRef("myelin://acme/git/commit/core:deadbeef".into())),
+        InlineNode::Embed(ArtifactRef("myelin://acme/ci/run/run-9".into())),
+        InlineNode::Embed(ArtifactRef("myelin://acme/knowledge/page/42".into())),
+    ]
+}
+
+/// **CDC 5.4 (Chat, provider→consumer): a real Chat message's unfurls emit one edge per node, commit,
+/// and ingest as the right reference triples sourced from the Chat message root.**
+#[test]
+fn chat_unfurls_emit_commit_and_ingest_as_reference_edges() {
+    let (store, minter) = store_and_minter();
+    let producer = ChatEdgeProducer;
+    let source = ChatEdgeProducer::message_root("acme", "01HMSGCDC");
+    let content = content_event(2);
+    let body = maximal_chat_body();
+
+    // ── PROVIDER side: emit the unfurl edges in the SAME transaction as the message write. ──
+    let mut tx = store.begin(minter, ctx_base());
+    tx.stage_state_change("chat message 01HMSGCDC written");
+    let ids: Vec<EventId> = producer
+        .emit_chat_edges(&mut tx, &source, &body, &content)
+        .expect("emit chat unfurls");
+    assert_eq!(ids.len(), 5, "five structured nodes → five unfurl edges");
+    assert_eq!(
+        store.outbox_depth(),
+        0,
+        "emit-iff-committed: nothing durable before commit"
+    );
+    tx.commit().expect("commit the message + its unfurl edges");
+    assert_eq!(
+        store.outbox_depth(),
+        5,
+        "five edge rows durable after commit"
+    );
+
+    // ── CONSUMER side: each emitted edge is a `refs.edge.created` reference triple from the Chat ──
+    //    message root, spanning all five producer subsystems (cross-subsystem traversal complete).
+    let proj = EdgeProjection::new();
+    let mut rels: Vec<EdgeRel> = Vec::new();
+    for id in &ids {
+        let row = store.row(id).expect("committed edge row");
+        let env = &row.envelope;
+        assert_eq!(env.type_, EventType("refs.edge.created".into()));
+        assert_eq!(env.payload["rel_class"], "reference");
+        assert_eq!(
+            env.payload["source"], "myelin://acme/chat/message/01HMSGCDC",
+            "every unfurl edge is sourced from the Chat message root"
+        );
+        // The loop-guard +1 depth stamp + the carried correlation root.
+        assert_eq!(env.depth, content.depth + 1);
+        assert_eq!(env.correlation_id, content.correlation_id);
+        rels.push(match env.payload["rel"].as_str().unwrap() {
+            "mentions" => EdgeRel::Mentions,
+            "links" => EdgeRel::Links,
+            "embeds" => EdgeRel::Embeds,
+            other => panic!("unexpected rel {other}"),
+        });
+        // Model the consumer-side ingest into the §3.2 edge projection (the reference corpus).
+        let target = env.payload["target"].as_str().unwrap();
+        let id_str = myelin_refs_service::edge_id(
+            &tenant(),
+            "myelin://acme/chat/message/01HMSGCDC",
+            target,
+            env.payload["rel"].as_str().unwrap(),
+        );
+        proj.upsert(
+            &tenant(),
+            &region(),
+            myelin_refs_service::EdgeRow {
+                edge_id: id_str.clone(),
+                source: source.clone(),
+                source_root: myelin_refs::strip_sub(&source),
+                target: ArtifactRef(target.into()),
+                target_root: myelin_refs::strip_sub(&ArtifactRef(target.into())),
+                rel: env.payload["rel"].as_str().unwrap().into(),
+                rel_class: myelin_refs_service::RelClass::Reference,
+                origin_event: format!("evt-{id_str}"),
+                origin_actor: "chat-pseudonym".into(),
+                zookie: Some("zk-1".into()),
+                tombstoned: false,
+            },
+        );
+    }
+    // The X-2 uniform producer mapping, in document order.
+    assert_eq!(
+        rels,
+        vec![
+            EdgeRel::Mentions,
+            EdgeRel::Links,
+            EdgeRel::Embeds,
+            EdgeRel::Embeds,
+            EdgeRel::Embeds
+        ]
+    );
+
+    // Cross-subsystem traversal COMPLETE: the one message's edge set spans all five producer
+    // subsystems (mention → identity/member; + issue/git/ci/knowledge targets).
+    let subsystems: std::collections::BTreeSet<String> = body
+        .iter()
+        .filter_map(|n| match n {
+            InlineNode::ArtifactRefNode(r) | InlineNode::Embed(r) => {
+                r.0.split('/').nth(3).map(|s| s.to_string())
+            }
+            InlineNode::Mention(_) => Some("identity".into()),
+        })
+        .collect();
+    assert!(
+        ["ci", "git", "issue", "knowledge"]
+            .iter()
+            .all(|s| subsystems.contains(*s)),
+        "the maximal Chat message unfurls every prior producer class — traversal complete"
+    );
+}
+
+/// **Emit-iff-committed (REF-D7 producer half): an ABORTED chat message-send emits ZERO unfurl edges.**
+/// No unfurl edge without its chat message — the buffered edge rows drop with the aborted transaction.
+#[test]
+fn aborted_chat_message_emits_zero_unfurl_edges() {
+    let (store, minter) = store_and_minter();
+    let producer = ChatEdgeProducer;
+    let source = ChatEdgeProducer::message_root("acme", "01HMSGCDC");
+    let content = content_event(0);
+    let body = maximal_chat_body();
+    {
+        let mut tx = store.begin(minter, ctx_base());
+        tx.stage_state_change("chat message written");
+        let ids = producer
+            .emit_chat_edges(&mut tx, &source, &body, &content)
+            .expect("emit ok");
+        assert_eq!(
+            ids.len(),
+            5,
+            "five edges buffered into the open transaction"
+        );
+        // DROP tx without commit (the abort / crash between state-write and publish).
+    }
+    assert_eq!(
+        store.outbox_depth(),
+        0,
+        "aborted chat message-send → 0 unfurl edges"
+    );
+    assert_eq!(store.committed_count(), 0);
+}
