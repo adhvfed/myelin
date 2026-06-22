@@ -544,6 +544,27 @@ title = "per-subsystem ReBAC namespace fragment (engine + admit-contract + core 
 # member reads; a public-channel project-reader inherits read; `message.view` inherits the channel's
 # read; `watcher` is read-fanout, not a read grant). Rewrites wired LIVE on the Chat M4 spine; the
 # runtime membership tuple writes are the CHAT-P8 floor.
+# The Id-side COMPILED Chat fragment (the rich FragmentDefs Id OWNS — the `channel`/`message`/`unfurl`
+# types + the rewrites: `channel.read = member ∪ parent_project->view` (watchable C8),
+# `message.view = parent_channel->read`, `unfurl.view = parent_message->view`) is P-ID-30 / P-323 (M4)
+# — `chat_fragment.rs` (PROVIDER); its CDC (cdc_4_9_chat_fragment.rs) admits the three rich FragmentDefs
+# into the cell schema, proves `channel.read` resolves via the `member` arm AND the `parent_project->view`
+# arm (a non-member denies), `message.view` inherits the channel, and the ambient channel list conjoins
+# in ONE query (the channel.id Filter push-down, §7.3) leak-free (a non-member channel is ABSENT, no
+# count leak). The CHAT authz side is the dated green drill (drill_chat_unfurl_tombstone_density.rs):
+# (F1) a confidential unfurl degrades to a TOMBSTONE for a 64-member fleet — 0 chat title leak (the Refs
+# check(viewer, view, target) over the target issue's own − confidential exclusion; Id never recomputes
+# the target ACL); (F1) a non-member's channel search returns 0 results; (F1) list_subjects(channel,
+# watcher) at 50k density returns ALL 50k watchers within budget, 0 cross-channel leak (§7.5, the
+# ordinary S8 Expand; the tighter SLO is the M5 measured tunable P-ID-32).
+# **With the Chat fragment admitted, the M1 engine-only floor (P-068) is CLOSED — all five subsystem
+# fragments (Git/Knowledge/CI/Issues/Chat) now exist in the engine.**
+# RECONCILIATION (EI-01 §1): §5 names the inheritance edge `parent_project->read`; it resolves through
+# the core hierarchy's single compiled `project.view` (the SAME reconciliation Git/Issues make). The
+# P-ID-23 / P-134 m2-consumers drill built an ad-hoc placeholder `channel` (member + watcher, no
+# permissions) as a minimal watchable test fixture; the CANONICAL compiled Chat fragment now lives in
+# `chat_fragment.rs` — the placeholder remains a valid self-contained fixture in its own test binary,
+# not a second definition of the namespace.
 # The KNOWLEDGE fragment SLICE (the `space`/`page`/`block`/`database_row` namespace; the
 # page-tree-with-overrides rewrite `page.read = (parent_page->read ∪ parent_space->read ∪
 # direct_reader) − direct_block`; the `database_row.read` row-level ACL the list_objects push-down
@@ -579,6 +600,7 @@ cdc = [
     "crates/myelin-identity-service/tests/cdc_4_9_knowledge_fragment.rs",
     "crates/myelin-identity-service/tests/cdc_4_9_ci_fragment.rs",
     "crates/myelin-identity-service/tests/cdc_4_9_issue_fragment.rs",
+    "crates/myelin-identity-service/tests/cdc_4_9_chat_fragment.rs",
     "crates/myelin-knowledge/tests/cdc_4_9_knowledge_rebac_fragment.rs",
     "crates/myelin-git/tests/cdc_4_9_git_fragment.rs",
     # The CODEOWNERS-as-relations RESOLVER slice (GIT-P16 / P-277, M3-G3): Git owns the CODEOWNERS
