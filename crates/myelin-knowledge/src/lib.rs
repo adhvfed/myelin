@@ -63,6 +63,7 @@ pub mod block_tree;
 pub mod compaction;
 pub mod editor;
 pub mod emit;
+pub mod merge;
 pub mod store;
 pub mod subs;
 pub mod sync_block;
@@ -85,6 +86,11 @@ pub use subs::{
 pub use emit::{
     block_ref, database_ref, emit_change, page_ref, row_ref, KnowledgeChange,
     KnowledgeLivingDocHandler, KNOWLEDGE_LIVING_DOC_TRIGGERS,
+};
+pub use merge::{
+    cas_update_sql, BlockState, CasError, CasOutcome, CasStore, ConflictMeter, OfflineQueue,
+    QueuedEdit, ReconcileResult, SimultaneousPresence, SoftLock, SoftLockTable,
+    CAS_CONFLICT_RATE_METRIC,
 };
 pub use store::{
     knowledge_scope, knowledge_store_migrations, KnowledgeStore, KnowledgeTable,
