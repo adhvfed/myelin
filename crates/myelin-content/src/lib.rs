@@ -46,6 +46,13 @@
 pub mod adf;
 pub mod block;
 pub mod corpus;
+/// The editor PRIMITIVES standalone (KN-P08 → P-298, M3): the offset model (caret = char
+/// offset into the serialized markdown ↔ DOM positions; a structured node is one caret
+/// position) + the DOM-surgery (Enter-splits-a-block + caret-placement-after-split +
+/// paste/IME normalisation), both over the ONE frozen [`inline`] render path (no second
+/// renderer). Primitives ONLY — the integrated editor is the immediate follow-on KN-P09
+/// (P-299).
+pub mod editor;
 /// The complete `knowledge.*` event-token list (contract 2.9, EB-26 / P-246, M3) — KN COMPLETES its
 /// dotted-name list, durable-via-outbox vs firehose-only split, each validated against the one Bus
 /// grammar.
@@ -65,6 +72,10 @@ pub mod replay;
 pub use adf::{AdfMapping, AdfNode, AdfTarget, ImportReport, Loss, LossyConversion, MAP};
 pub use block::{
     Block, CalloutTone, Cell, Column, EmbedDisplay, HeadingLevel, ListItem, TaskItem,
+};
+pub use editor::{
+    canonicalize, caret_count, dom_to_offset, offset_to_dom, segments, split_at, BlockSplit,
+    CaretMap, DomPosition, Segment, SegmentKind,
 };
 pub use inline::{parse_inline, serialize_inline, Inline, InlineNode, Mark, Span, OBJ};
 
