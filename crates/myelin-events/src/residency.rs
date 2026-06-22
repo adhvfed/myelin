@@ -338,9 +338,9 @@ mod tests {
             .expect("an in-region read is authorized");
 
         // A cross-region read is REJECTED — the headline: no cross-region stream read path.
-        let err = stream
-            .authorize_read(&eu_north())
-            .expect_err("a read from a different region MUST be rejected (no cross-region read path)");
+        let err = stream.authorize_read(&eu_north()).expect_err(
+            "a read from a different region MUST be rejected (no cross-region read path)",
+        );
         assert_eq!(
             err,
             ResidencyError::CrossRegionRead {
@@ -362,7 +362,9 @@ mod tests {
         let cell = fr_par();
         // The partition asks for eu-north, but the cell is fr-par — a cross-region provision.
         let err = BusStreamResidency::provision(&partition(&eu_north()), "issue", &cell)
-            .expect_err("a partition region ≠ the cell region MUST be rejected (the stream lives in its cell)");
+            .expect_err(
+            "a partition region ≠ the cell region MUST be rejected (the stream lives in its cell)",
+        );
         assert_eq!(
             err,
             ResidencyError::WrongCellRegion {
@@ -371,7 +373,10 @@ mod tests {
                 partition_region: eu_north(),
             }
         );
-        assert!(err.to_string().contains("the pin is the cell's"), "loud reason: {err}");
+        assert!(
+            err.to_string().contains("the pin is the cell's"),
+            "loud reason: {err}"
+        );
     }
 
     /// **The Bus reports its region into `residency_verify` (contract 12.4, consumed): a report
@@ -380,8 +385,8 @@ mod tests {
     #[test]
     fn the_bus_reports_its_region_into_residency_verify() {
         let cell = fr_par();
-        let stream = BusStreamResidency::provision(&partition(&cell), "issue", &cell)
-            .expect("provision");
+        let stream =
+            BusStreamResidency::provision(&partition(&cell), "issue", &cell).expect("provision");
         let report = stream.region_report();
         assert_eq!(report.tenant, acme());
         assert_eq!(report.region, fr_par());
@@ -396,12 +401,21 @@ mod tests {
     #[test]
     fn bus_residency_signal_green_and_red() {
         let green = BusResidencySignal::green(acme(), fr_par(), 3);
-        assert_eq!(green.cross_region_reads_admitted, 0, "the green artifact is 0 admitted");
-        assert_eq!(green.cross_region_reads_rejected, 3, "3 cross-region reads were blocked");
+        assert_eq!(
+            green.cross_region_reads_admitted, 0,
+            "the green artifact is 0 admitted"
+        );
+        assert_eq!(
+            green.cross_region_reads_rejected, 3,
+            "3 cross-region reads were blocked"
+        );
         assert!(green.is_green());
 
         let red = BusResidencySignal::red(acme(), fr_par(), 1);
-        assert_eq!(red.cross_region_reads_admitted, 1, "a leaked cross-region read reads RED");
+        assert_eq!(
+            red.cross_region_reads_admitted, 1,
+            "a leaked cross-region read reads RED"
+        );
         assert!(!red.is_green());
     }
 
@@ -412,16 +426,16 @@ mod tests {
     #[test]
     fn cp_d3_bus_slice_zero_cross_region_reads() {
         let cell = fr_par();
-        let stream = BusStreamResidency::provision(&partition(&cell), "issue", &cell)
-            .expect("provision");
+        let stream =
+            BusStreamResidency::provision(&partition(&cell), "issue", &cell).expect("provision");
 
         // A mixed read workload: in-region reads and cross-region read attempts.
         let reads = [
-            fr_par(),   // in-region
-            eu_north(), // cross-region — must be rejected
-            fr_par(),   // in-region
+            fr_par(),               // in-region
+            eu_north(),             // cross-region — must be rejected
+            fr_par(),               // in-region
             Region::new("us-east"), // cross-region — must be rejected
-            eu_north(), // cross-region — must be rejected
+            eu_north(),             // cross-region — must be rejected
         ];
 
         let mut admitted = 0u32;
@@ -431,10 +445,20 @@ mod tests {
                 Ok(()) => {
                     // An admitted read MUST be in-region — assert it (a green that admitted a
                     // cross-region read would be a manufactured pass).
-                    assert_eq!(read_from, stream.region(), "an admitted read must be in-region");
+                    assert_eq!(
+                        read_from,
+                        stream.region(),
+                        "an admitted read must be in-region"
+                    );
                 }
-                Err(ResidencyError::CrossRegionRead { read_from_region, .. }) => {
-                    assert_ne!(&read_from_region, stream.region(), "a rejected read was cross-region");
+                Err(ResidencyError::CrossRegionRead {
+                    read_from_region, ..
+                }) => {
+                    assert_ne!(
+                        &read_from_region,
+                        stream.region(),
+                        "a rejected read was cross-region"
+                    );
                     rejected += 1;
                 }
                 Err(other) => panic!("unexpected error: {other}"),
@@ -445,10 +469,16 @@ mod tests {
             }
         }
 
-        assert_eq!(admitted, 0, "THE GATE: 0 cross-region stream reads admitted (CP-D3 Bus slice)");
+        assert_eq!(
+            admitted, 0,
+            "THE GATE: 0 cross-region stream reads admitted (CP-D3 Bus slice)"
+        );
         assert_eq!(rejected, 3, "every cross-region read attempt was rejected");
 
         let signal = BusResidencySignal::green(acme(), fr_par(), rejected);
-        assert!(signal.is_green(), "the bus-residency artifact is green (0 admitted)");
+        assert!(
+            signal.is_green(),
+            "the bus-residency artifact is green (0 admitted)"
+        );
     }
 }

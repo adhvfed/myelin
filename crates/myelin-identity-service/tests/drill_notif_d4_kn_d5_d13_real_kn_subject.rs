@@ -25,7 +25,9 @@
 //! `- direct_block` override) so the leak property is exercised end to end over a REAL KN subject.
 
 use myelin_harness::telemetry::{Predicate, SignalName, SignalSource};
-use myelin_identity::{Consistency, ConsistencyMode, Principal, PrincipalId, PrincipalKind, Zookie};
+use myelin_identity::{
+    Consistency, ConsistencyMode, Principal, PrincipalId, PrincipalKind, Zookie,
+};
 use myelin_notif::humanise::{
     humanise, Channel, RefProjection, RefResolution, RefResolvePort, Tombstone, TombstoneReason,
     DEFAULT_LOCALE,
@@ -38,7 +40,8 @@ use std::sync::Mutex;
 
 /// The secret title of the REAL confidential KN page (the leak target — must NEVER appear for a denied
 /// or cross-tenant viewer).
-const SECRET_PAGE_TITLE: &str = "Q3 layoffs: the PROJECT-NIGHTFALL severance list before the announcement";
+const SECRET_PAGE_TITLE: &str =
+    "Q3 layoffs: the PROJECT-NIGHTFALL severance list before the announcement";
 
 fn acme() -> TenantId {
     TenantId("acme".into())
@@ -51,7 +54,10 @@ fn viewer_in(id: &str, tenant: TenantId) -> Principal {
     Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant)
 }
 fn strong(zk: &str) -> Consistency {
-    Consistency { at_least: Zookie(zk.into()), mode: ConsistencyMode::Strong }
+    Consistency {
+        at_least: Zookie(zk.into()),
+        mode: ConsistencyMode::Strong,
+    }
 }
 
 /// A REAL KN page subject in acme's space (`myelin://acme/knowledge/page/<n>`). The page inherits read
@@ -77,12 +83,18 @@ struct KnowledgePageResolver {
 impl KnowledgePageResolver {
     /// Grant `viewer_id` (in `tenant`) read on the page backing `r`.
     fn grant_read(&self, tenant: &TenantId, viewer_id: &str, r: &ArtifactRef) {
-        self.allowed.lock().unwrap().push((tenant.0.clone(), viewer_id.into(), r.0.clone()));
+        self.allowed
+            .lock()
+            .unwrap()
+            .push((tenant.0.clone(), viewer_id.into(), r.0.clone()));
     }
     /// Block `viewer_id` (in `tenant`) on the page (the `- direct_block` override — narrows inherited
     /// access even if they would otherwise inherit read).
     fn block(&self, tenant: &TenantId, viewer_id: &str, r: &ArtifactRef) {
-        self.blocked.lock().unwrap().push((tenant.0.clone(), viewer_id.into(), r.0.clone()));
+        self.blocked
+            .lock()
+            .unwrap()
+            .push((tenant.0.clone(), viewer_id.into(), r.0.clone()));
     }
     /// The subject's home tenant, parsed from `myelin://<tenant>/knowledge/...` (the URL-path tenant).
     fn subject_tenant(r: &ArtifactRef) -> Option<String> {
@@ -112,9 +124,10 @@ impl RefResolvePort for KnowledgePageResolver {
         }
         // The `- direct_block` page-tree OVERRIDE: a blocked viewer is removed from the page's read set
         // even if they inherit it (the "a sub-page narrows inherited access" lever, P-249).
-        let is_blocked = self.blocked.lock().unwrap().iter().any(|(t, v, x)| {
-            t == &viewer.tenant.0 && v == &viewer.principal_id.0 && x == &ref_.0
-        });
+        let is_blocked =
+            self.blocked.lock().unwrap().iter().any(|(t, v, x)| {
+                t == &viewer.tenant.0 && v == &viewer.principal_id.0 && x == &ref_.0
+            });
         if is_blocked {
             return RefResolution::Tombstone(Tombstone {
                 root: ref_.clone(),
@@ -122,9 +135,10 @@ impl RefResolvePort for KnowledgePageResolver {
             });
         }
         // Same-tenant + not blocked: allowed iff the viewer holds read on the page.
-        let allowed = self.allowed.lock().unwrap().iter().any(|(t, v, x)| {
-            t == &viewer.tenant.0 && v == &viewer.principal_id.0 && x == &ref_.0
-        });
+        let allowed =
+            self.allowed.lock().unwrap().iter().any(|(t, v, x)| {
+                t == &viewer.tenant.0 && v == &viewer.principal_id.0 && x == &ref_.0
+            });
         if allowed {
             RefResolution::Projection(RefProjection {
                 ref_: ref_.clone(),
@@ -141,7 +155,12 @@ impl RefResolvePort for KnowledgePageResolver {
 }
 
 /// Every KN reason → its template key drives a render; the leak property must hold for ALL of them.
-const KN_REASONS: &[Reason] = &[Reason::Mentioned, Reason::Comments, Reason::Shared, Reason::Watched];
+const KN_REASONS: &[Reason] = &[
+    Reason::Mentioned,
+    Reason::Comments,
+    Reason::Shared,
+    Reason::Watched,
+];
 
 fn contains_leak(text: &str) -> bool {
     let lc = text.to_lowercase();
@@ -159,8 +178,8 @@ fn contains_leak(text: &str) -> bool {
 #[test]
 fn notif_d4_zero_leak_on_real_confidential_kn_page() {
     let resolver = KnowledgePageResolver::default(); // nobody granted read → every same-tenant viewer denied
-    // one of the denied viewers is explicitly BLOCKED by the `- direct_block` override (the page-tree
-    // narrow-inherited-access lever) — the title must still never appear.
+                                                     // one of the denied viewers is explicitly BLOCKED by the `- direct_block` override (the page-tree
+                                                     // narrow-inherited-access lever) — the title must still never appear.
     let subject = confidential_kn_page();
     resolver.block(&acme(), "blocked-by-override", &subject);
 
@@ -196,7 +215,10 @@ fn notif_d4_zero_leak_on_real_confidential_kn_page() {
                 if h.text.contains("a restricted page") {
                     tombstone_present += 1;
                 }
-                assert!(h.links.is_empty(), "a denied KN subject yields no click-route link");
+                assert!(
+                    h.links.is_empty(),
+                    "a denied KN subject yields no click-route link"
+                );
             }
         }
     }
@@ -236,8 +258,15 @@ fn notif_d4_permitted_kn_viewer_sees_the_page_title() {
         &strong("zk-1"),
         Channel::Cli,
     );
-    assert!(h.text.contains(SECRET_PAGE_TITLE), "the permitted editor sees the page title");
-    assert_eq!(h.links, vec![subject.0], "the allowed branch yields the click-route link");
+    assert!(
+        h.text.contains(SECRET_PAGE_TITLE),
+        "the permitted editor sees the page title"
+    );
+    assert_eq!(
+        h.links,
+        vec![subject.0],
+        "the allowed branch yields the click-route link"
+    );
 }
 
 /// **KN-D13 — cross-tenant page access denied, with Notif's humanise path exercised (0 cross-tenant
@@ -251,8 +280,8 @@ fn kn_d13_cross_tenant_page_access_denied_via_humanise() {
     let mut signals = SignalSource::new();
     let resolver = KnowledgePageResolver::default();
     let subject = confidential_kn_page(); // home tenant: acme
-    // an acme principal "spy" WOULD be allowed read (same id) — but the cross-tenant token below is a
-    // DIFFERENT tenant, so the same id from evilcorp must still be denied (token tenant decides).
+                                          // an acme principal "spy" WOULD be allowed read (same id) — but the cross-tenant token below is a
+                                          // DIFFERENT tenant, so the same id from evilcorp must still be denied (token tenant decides).
     resolver.grant_read(&acme(), "spy", &subject);
 
     let cross_tenant = viewer_in("spy", TenantId("evilcorp".into()));
@@ -281,11 +310,20 @@ fn kn_d13_cross_tenant_page_access_denied_via_humanise() {
             if h.links.contains(&subject.0) {
                 cross_tenant_reads += 1;
             }
-            assert!(h.text.contains("a restricted page"), "cross-tenant render is a tombstone");
-            assert!(h.links.is_empty(), "no click-route leaks across the tenant boundary");
+            assert!(
+                h.text.contains("a restricted page"),
+                "cross-tenant render is a tombstone"
+            );
+            assert!(
+                h.links.is_empty(),
+                "no click-route leaks across the tenant boundary"
+            );
         }
     }
-    assert_eq!(leak, 0, "KN-D13: 0 cross-tenant leak — the token tenant decides, the title never crosses");
+    assert_eq!(
+        leak, 0,
+        "KN-D13: 0 cross-tenant leak — the token tenant decides, the title never crosses"
+    );
 
     signals.set_scalar(SignalName::CrossTenantCount, cross_tenant_reads);
     signals

@@ -367,7 +367,10 @@ impl OutboxTransaction {
     /// the same DB transaction the outbox row is inserted into; here it is recorded so a test
     /// can assert the state and the event commit together (and that an abort writes neither).
     pub fn stage_state_change(&mut self, change: impl Into<String>) {
-        *self.state_committed.lock().unwrap_or_else(|e| e.into_inner()) = Some(change.into());
+        *self
+            .state_committed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(change.into());
     }
 
     /// Commit the transaction: every staged outbox row + the staged state change become durable
@@ -483,13 +486,16 @@ impl OutboxTx for OutboxTransaction {
 mod tests {
     use super::*;
     use crate::{
-        Actor, ArtifactRef, CausedBy, DataRole, EventType, Region, TenantId, Timestamp,
-        Visibility,
+        Actor, ArtifactRef, CausedBy, DataRole, EventType, Region, TenantId, Timestamp, Visibility,
     };
     use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 
     fn principal() -> Principal {
-        Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId("acme".into()))
+        Principal::stub(
+            PrincipalId("p".into()),
+            PrincipalKind::Human,
+            TenantId("acme".into()),
+        )
     }
 
     fn ctx_base() -> EmitContextBase {
@@ -531,8 +537,18 @@ mod tests {
         assert!(OUTBOX_MIGRATION.contains("CREATE TABLE IF NOT EXISTS outbox"));
         assert!(OUTBOX_MIGRATION.contains("UNIQUE (event_id)"));
         assert!(OUTBOX_MIGRATION.contains("UNIQUE (aggregate, seq)"));
-        for col in ["event_id", "aggregate", "seq", "subject", "envelope", "published_at"] {
-            assert!(OUTBOX_MIGRATION.contains(col), "migration is missing column {col}");
+        for col in [
+            "event_id",
+            "aggregate",
+            "seq",
+            "subject",
+            "envelope",
+            "published_at",
+        ] {
+            assert!(
+                OUTBOX_MIGRATION.contains(col),
+                "migration is missing column {col}"
+            );
         }
         // forward-only: no destructive DROP on the down path (there is no down path).
         assert!(!OUTBOX_MIGRATION.contains("DROP TABLE"));
@@ -545,11 +561,19 @@ mod tests {
         let (store, minter) = store_and_minter();
         let mut tx = store.begin(minter, ctx_base());
         tx.stage_state_change("issue PROJ-1 created");
-        let id = tx.emit(draft("issues.issue.created", "issue:PROJ-1"), None).unwrap();
+        let id = tx
+            .emit(draft("issues.issue.created", "issue:PROJ-1"), None)
+            .unwrap();
         assert_eq!(tx.staged_len(), 1, "one event buffered");
-        let id2 = tx.emit(draft("issues.issue.updated", "issue:PROJ-1"), None).unwrap();
+        let id2 = tx
+            .emit(draft("issues.issue.updated", "issue:PROJ-1"), None)
+            .unwrap();
         // before commit: nothing durable (emit-iff-committed) — depth still 0.
-        assert_eq!(store.outbox_depth(), 0, "an open transaction has written nothing");
+        assert_eq!(
+            store.outbox_depth(),
+            0,
+            "an open transaction has written nothing"
+        );
         assert_eq!(tx.staged_len(), 2, "two events buffered (not a constant)");
         assert_eq!(tx.staged_state().as_deref(), Some("issue PROJ-1 created"));
 
@@ -559,7 +583,10 @@ mod tests {
         assert_eq!(store.committed_count(), 2);
         let row = store.row(&id).expect("committed row is present");
         assert_eq!(row.seq, 0, "first event for the aggregate is seq 0");
-        assert!(row.published_at.is_none(), "a freshly committed row is unsent");
+        assert!(
+            row.published_at.is_none(),
+            "a freshly committed row is unsent"
+        );
         assert_eq!(store.row(&id2).unwrap().seq, 1, "second event is seq 1");
     }
 
@@ -572,12 +599,17 @@ mod tests {
         {
             let mut tx = store.begin(minter, ctx_base());
             tx.stage_state_change("issue PROJ-9 created");
-            tx.emit(draft("issues.issue.created", "issue:PROJ-9"), None).unwrap();
+            tx.emit(draft("issues.issue.created", "issue:PROJ-9"), None)
+                .unwrap();
             assert_eq!(tx.staged_len(), 1, "buffered, not committed");
             // tx dropped here WITHOUT commit (the crash point).
         }
         // emit-iff-committed: the aborted transaction published nothing.
-        assert_eq!(store.outbox_depth(), 0, "an aborted transaction writes no event");
+        assert_eq!(
+            store.outbox_depth(),
+            0,
+            "an aborted transaction writes no event"
+        );
         assert_eq!(store.committed_count(), 0, "no ghost row from an abort");
         assert_eq!(store.dead_letter_count(), 0);
     }
@@ -590,10 +622,15 @@ mod tests {
         let (store, minter) = store_and_minter();
         let mut tx = store.begin(minter, ctx_base());
 
-        let root_id = tx.emit(draft("issues.issue.created", "issue:PROJ-1"), None).unwrap();
+        let root_id = tx
+            .emit(draft("issues.issue.created", "issue:PROJ-1"), None)
+            .unwrap();
         let root_env = store_envelope(&tx, 0);
         assert_eq!(root_env.depth, 0);
-        assert_eq!(root_env.correlation_id.0, root_id.0, "root carries its own correlation");
+        assert_eq!(
+            root_env.correlation_id.0, root_id.0,
+            "root carries its own correlation"
+        );
 
         let child_id = tx
             .emit(draft("refs.edge.created", "issue:PROJ-1"), Some(&root_env))
@@ -608,7 +645,10 @@ mod tests {
         tx.commit().unwrap();
         assert_eq!(store.row(&root_id).unwrap().seq, 0);
         assert_eq!(store.row(&child_id).unwrap().seq, 1);
-        assert_eq!(store.row(&root_id).unwrap().aggregate, store.row(&child_id).unwrap().aggregate);
+        assert_eq!(
+            store.row(&root_id).unwrap().aggregate,
+            store.row(&child_id).unwrap().aggregate
+        );
     }
 
     fn store_envelope(tx: &OutboxTransaction, i: usize) -> EventEnvelope {
@@ -622,9 +662,15 @@ mod tests {
     fn seq_is_independent_per_aggregate() {
         let (store, minter) = store_and_minter();
         let mut tx = store.begin(minter, ctx_base());
-        let a0 = tx.emit(draft("issues.issue.created", "issue:A"), None).unwrap();
-        let b0 = tx.emit(draft("issues.issue.created", "issue:B"), None).unwrap();
-        let a1 = tx.emit(draft("issues.issue.updated", "issue:A"), None).unwrap();
+        let a0 = tx
+            .emit(draft("issues.issue.created", "issue:A"), None)
+            .unwrap();
+        let b0 = tx
+            .emit(draft("issues.issue.created", "issue:B"), None)
+            .unwrap();
+        let a1 = tx
+            .emit(draft("issues.issue.updated", "issue:A"), None)
+            .unwrap();
         tx.commit().unwrap();
         // A: 0, 1 ; B: 0
         assert_eq!(store.row(&a0).unwrap().seq, 0); // A
@@ -665,8 +711,15 @@ mod tests {
         seqs.sort_unstable();
         // Gap-free + no-dup: exactly the contiguous set {0, 1, …, N-1}.
         let expected: Vec<u64> = (0..N).collect();
-        assert_eq!(seqs, expected, "concurrent emitters must yield contiguous, unique seqs");
-        assert_eq!(store.committed_count(), N as usize, "every committed event is present once");
+        assert_eq!(
+            seqs, expected,
+            "concurrent emitters must yield contiguous, unique seqs"
+        );
+        assert_eq!(
+            store.committed_count(),
+            N as usize,
+            "every committed event is present once"
+        );
     }
 
     /// **EB-03 — an ABORTED transaction consumes NO seq → the committed sequence stays gap-free.**
@@ -696,8 +749,16 @@ mod tests {
         let mut tc = store.begin(Arc::clone(&minter), ctx_base());
         let c = tc.emit(draft("issues.issue.updated", agg), None).unwrap();
         tc.commit().unwrap();
-        assert_eq!(store.row(&c).unwrap().seq, 1, "abort must not burn a seq → gap-free");
-        assert_eq!(store.committed_count(), 2, "only the two committed events exist");
+        assert_eq!(
+            store.row(&c).unwrap().seq,
+            1,
+            "abort must not burn a seq → gap-free"
+        );
+        assert_eq!(
+            store.committed_count(),
+            2,
+            "only the two committed events exist"
+        );
     }
 
     /// The minted id is a stable ULID stamped onto the envelope (the broker-side dedup key).

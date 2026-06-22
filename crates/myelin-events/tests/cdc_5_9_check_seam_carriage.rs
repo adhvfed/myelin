@@ -59,10 +59,16 @@ fn provider_ci_emits_ci_check_updated_with_the_412_envelope_shape() {
 
     // The PROVIDER's promise: a grammar-conformant `type` (the CONSUMER validator admits it).
     assert_eq!(draft.type_.0, "ci.check.updated");
-    assert!(validate_event_type("ci.check.updated").is_ok(), "the type is a §6.1 canonical name");
+    assert!(
+        validate_event_type("ci.check.updated").is_ok(),
+        "the type is a §6.1 canonical name"
+    );
 
     // The §4.12 subject token grammar: repo#commit-<oid>/check-<context> (the #sub sub-anchor).
-    assert_eq!(draft.subject.0, format!("{REPO}#commit-{COMMIT}/check-build"));
+    assert_eq!(
+        draft.subject.0,
+        format!("{REPO}#commit-{COMMIT}/check-build")
+    );
 
     // The aggregate is (repo, commit_oid) — the per-commit ordering partition all contexts share.
     assert_eq!(draft.aggregate.0, format!("{REPO}#commit-{COMMIT}"));
@@ -118,8 +124,16 @@ fn consumer_git_receives_ci_check_updated_per_aggregate_ordered() {
     // The CONSUMER reads the per-aggregate seq order (1,2,3), NOT the arrival order — the Bus's
     // carriage promise. Git's supersession is well-defined over this order.
     let seqs: Vec<u64> = order.in_order().iter().map(|c| c.seq).collect();
-    assert_eq!(seqs, vec![1, 2, 3], "per-aggregate ordered on (repo, commit_oid)");
-    assert_eq!(order.ordering_gap(), 0, "contiguous: at-least-once delivered every op (0 lost)");
+    assert_eq!(
+        seqs,
+        vec![1, 2, 3],
+        "per-aggregate ordered on (repo, commit_oid)"
+    );
+    assert_eq!(
+        order.ordering_gap(),
+        0,
+        "contiguous: at-least-once delivered every op (0 lost)"
+    );
 }
 
 /// **PROVIDER + CONSUMER of 9.4 (the merge-queue `ci.result` wait).** PROVIDER: CI emits the rollup
@@ -138,16 +152,27 @@ fn cdc_9_4_ci_result_rollup_signal_wakes_merge_queue_exactly_once() {
     };
     // The signal NAME the workflow waits on is the NAMED `ci.result` token.
     assert_eq!(CiResultWaitSubstrate::SIGNAL_NAME, "ci.result");
-    assert!(validate_event_type("ci.result").is_ok(), "ci.result is a §6.1 canonical name");
+    assert!(
+        validate_event_type("ci.result").is_ok(),
+        "ci.result is a §6.1 canonical name"
+    );
 
     // CONSUMER (the merge-queue durable workflow) — parks on wait_for_signal, holds NO runtime.
     let mut sub = CiResultWaitSubstrate::new();
-    assert_eq!(sub.wait_for_signal("merge-attempt-99"), None, "pending while CI runs (9.4)");
+    assert_eq!(
+        sub.wait_for_signal("merge-attempt-99"),
+        None,
+        "pending while CI runs (9.4)"
+    );
 
     // CI delivers the rollup TWICE (at-least-once) — the waiter wakes EXACTLY once.
     assert_eq!(sub.deliver(result.clone()), WakeOutcome::Woke);
     assert_eq!(sub.deliver(result.clone()), WakeOutcome::Duplicate);
-    assert_eq!(sub.wake_count("merge-attempt-99"), 1, "exactly one wake (9.1 idem on idem_key)");
+    assert_eq!(
+        sub.wake_count("merge-attempt-99"),
+        1,
+        "exactly one wake (9.1 idem on idem_key)"
+    );
 
     // The workflow re-leases + reads the rollup; Git decides the merge off `overall` (the Bus does
     // not — it carries the signal).

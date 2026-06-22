@@ -323,10 +323,7 @@ impl DurableWheel for InMemoryWheel {
     }
 
     fn has_timer(&self, run_id: &str) -> bool {
-        self.lock()
-            .timers
-            .get(run_id)
-            .is_some_and(|t| !t.fired)
+        self.lock().timers.get(run_id).is_some_and(|t| !t.fired)
     }
 
     fn fire_due(&self, run_id: &str) -> bool {
@@ -473,9 +470,9 @@ impl<W: DurableWheel> EscalationEngine<W> {
         match target {
             EscalationTarget::Principal(p) => Ok(p.clone()),
             EscalationTarget::Schedule(sched_id) => {
-                let sched = schedule.filter(|s| &s.schedule_id == sched_id).ok_or_else(|| {
-                    EscalationError::NoOneOnCall(sched_id.clone())
-                })?;
+                let sched = schedule
+                    .filter(|s| &s.schedule_id == sched_id)
+                    .ok_or_else(|| EscalationError::NoOneOnCall(sched_id.clone()))?;
                 oncall_now(sched, minute_of_day)
                     .ok_or_else(|| EscalationError::NoOneOnCall(sched_id.clone()))
             }
@@ -500,11 +497,23 @@ impl<W: DurableWheel> EscalationEngine<W> {
         recipient_quiet: &QuietHours,
         recipient_in_quiet: bool,
     ) -> Result<(String, PageOutcome), EscalationError> {
-        let first = policy.step_at(0).ok_or(EscalationError::EmptyPolicy)?.clone();
+        let first = policy
+            .step_at(0)
+            .ok_or(EscalationError::EmptyPolicy)?
+            .clone();
         let principal = self.resolve_target(&first.target, schedule, minute_of_day)?;
         // notify(principal, channels, class=critical) — critical ALWAYS pierces quiet-hours (§2.4).
-        let channels = notify_for(&first.channels, Class::Critical, recipient_quiet, recipient_in_quiet);
-        let outcome = PageOutcome { principal: principal.clone(), channels, walk: 0 };
+        let channels = notify_for(
+            &first.channels,
+            Class::Critical,
+            recipient_quiet,
+            recipient_in_quiet,
+        );
+        let outcome = PageOutcome {
+            principal: principal.clone(),
+            channels,
+            walk: 0,
+        };
 
         let run = EscalationRun {
             tenant,
@@ -543,7 +552,9 @@ impl<W: DurableWheel> EscalationEngine<W> {
             return Ok(None);
         }
         let mut runs = self.lock();
-        let run = runs.get_mut(run_id).ok_or_else(|| EscalationError::UnknownRun(run_id.into()))?;
+        let run = runs
+            .get_mut(run_id)
+            .ok_or_else(|| EscalationError::UnknownRun(run_id.into()))?;
         // An ack halted the chain before the timer fired — do not page (ack-halt wins the race).
         if run.state != RunState::Active {
             return Ok(None);
@@ -556,10 +567,19 @@ impl<W: DurableWheel> EscalationEngine<W> {
         };
         // Resolve the next step at fire time (re-resolve the rotation — who is on call NOW).
         let principal = self.resolve_target(&step.target, schedule, minute_of_day)?;
-        let channels = notify_for(&step.channels, Class::Critical, recipient_quiet, recipient_in_quiet);
+        let channels = notify_for(
+            &step.channels,
+            Class::Critical,
+            recipient_quiet,
+            recipient_in_quiet,
+        );
         run.walk = next_walk;
         run.pages.push((next_walk, principal.clone()));
-        let outcome = PageOutcome { principal, channels, walk: next_walk };
+        let outcome = PageOutcome {
+            principal,
+            channels,
+            walk: next_walk,
+        };
         drop(runs);
         // Re-arm the ack_window timer for the new step (the guarded UPDATE — replaces the fired one).
         self.wheel.schedule_timer(run_id, step.ack_window_minutes);
@@ -582,7 +602,9 @@ impl<W: DurableWheel> EscalationEngine<W> {
     ) -> Result<bool, EscalationError> {
         let (tenant, region, trigger_event, already_acked) = {
             let runs = self.lock();
-            let run = runs.get(run_id).ok_or_else(|| EscalationError::UnknownRun(run_id.into()))?;
+            let run = runs
+                .get(run_id)
+                .ok_or_else(|| EscalationError::UnknownRun(run_id.into()))?;
             (
                 run.tenant.clone(),
                 run.region.clone(),
@@ -615,7 +637,9 @@ impl<W: DurableWheel> EscalationEngine<W> {
             caused_by: None,
         };
         let mut tx = self.outbox.begin(self.minter.clone(), base);
-        tx.stage_state_change(format!("UPDATE notif_escalation_run SET state='acked' WHERE run_id={run_id}"));
+        tx.stage_state_change(format!(
+            "UPDATE notif_escalation_run SET state='acked' WHERE run_id={run_id}"
+        ));
         let draft = EventDraft {
             type_: EventType(NOTIF_ESCALATION_ACKED.into()),
             subject: trigger_event,
@@ -669,7 +693,11 @@ pub fn render_oncall(schedule: &OncallSchedule, minute_of_day: i32) -> String {
     for w in &schedule.rotation {
         out.push_str(&format!(
             "  [{:02}:{:02}–{:02}:{:02}) → {}\n",
-            w.from_minute / 60, w.from_minute % 60, w.to_minute / 60, w.to_minute % 60, w.principal.0
+            w.from_minute / 60,
+            w.from_minute % 60,
+            w.to_minute / 60,
+            w.to_minute % 60,
+            w.principal.0
         ));
     }
     out

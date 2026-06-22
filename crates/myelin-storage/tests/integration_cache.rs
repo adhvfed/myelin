@@ -15,12 +15,13 @@ use myelin_config::MyelinConfig;
 #[tokio::test]
 async fn valkey_cache_roundtrip() {
     let cfg = MyelinConfig::dev();
-    let client = Builder::from_config(
-        Config::from_url(&cfg.redis_url).expect("parse REDIS_URL"),
-    )
-    .build()
-    .expect("build fred client");
-    client.init().await.expect("connect to Valkey (is the stack up?)");
+    let client = Builder::from_config(Config::from_url(&cfg.redis_url).expect("parse REDIS_URL"))
+        .build()
+        .expect("build fred client");
+    client
+        .init()
+        .await
+        .expect("connect to Valkey (is the stack up?)");
 
     // The same per-tenant namespacing the InMemoryCache uses: {tenant}:{key}.
     let suffix = std::process::id();

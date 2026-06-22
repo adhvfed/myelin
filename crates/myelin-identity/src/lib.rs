@@ -627,11 +627,7 @@ pub trait IdentityService {
 
     /// 4.5 — `agent.policy ∩ delegation ∩ tenant.policy` (monotone intersection). Body →
     /// P-ID-17 (M1).
-    fn delegation(
-        &self,
-        agent: &Principal,
-        trigger_actor: &Principal,
-    ) -> Result<EffectivePolicy>;
+    fn delegation(&self, agent: &Principal, trigger_actor: &Principal) -> Result<EffectivePolicy>;
 
     /// 4.6 — atomic tuple write; returns the zookie to stamp on the object; emitted via the
     /// outbox (the only emit path). Body + emit → P-ID-08 (M1).
@@ -763,7 +759,10 @@ impl PseudonymHandle {
     /// P-ID-25) — the bytes that go into the immutable commit hash, so they carry ONLY the
     /// PII-free handle.
     pub fn render(&self) -> String {
-        format!("{}@{}{}", self.pseudonym, self.tenant, PSEUDONYM_DOMAIN_SUFFIX)
+        format!(
+            "{}@{}{}",
+            self.pseudonym, self.tenant, PSEUDONYM_DOMAIN_SUFFIX
+        )
     }
 
     /// **Parse a `<pseudonym>@<tenant>.noreply` rendering back to its `(pseudonym, tenant)`
@@ -914,7 +913,9 @@ mod tests {
         struct StubId;
         impl IdentityService for StubId {
             fn authenticate(&self, _c: &Credential) -> Result<Principal> {
-                Err(AuthzError::NotYetImplemented("authenticate → P-ID-06/07 (M1)"))
+                Err(AuthzError::NotYetImplemented(
+                    "authenticate → P-ID-06/07 (M1)",
+                ))
             }
             fn check(
                 &self,
@@ -933,7 +934,9 @@ mod tests {
                 _ty: &ObjectType,
                 _at: &Consistency,
             ) -> Result<ListObjectsResult> {
-                Err(AuthzError::NotYetImplemented("list_objects → P-ID-11/12 (M1)"))
+                Err(AuthzError::NotYetImplemented(
+                    "list_objects → P-ID-11/12 (M1)",
+                ))
             }
             fn list_subjects(
                 &self,
@@ -941,7 +944,9 @@ mod tests {
                 _p: &Permission,
                 _at: &Consistency,
             ) -> Result<SubjectTree> {
-                Err(AuthzError::NotYetImplemented("list_subjects → P-ID-13 (M1)"))
+                Err(AuthzError::NotYetImplemented(
+                    "list_subjects → P-ID-13 (M1)",
+                ))
             }
             fn explain(
                 &self,
@@ -952,11 +957,7 @@ mod tests {
             ) -> Result<RewriteTrace> {
                 Err(AuthzError::NotYetImplemented("explain → P-ID-13 (M1)"))
             }
-            fn delegation(
-                &self,
-                _a: &Principal,
-                _t: &Principal,
-            ) -> Result<EffectivePolicy> {
+            fn delegation(&self, _a: &Principal, _t: &Principal) -> Result<EffectivePolicy> {
                 Err(AuthzError::NotYetImplemented("delegation → P-ID-17 (M1)"))
             }
             fn write_tuples(
@@ -973,19 +974,25 @@ mod tests {
                 _d: &DelegationCaveats,
                 _ttl: &FailStaticBound,
             ) -> Result<RunToken> {
-                Err(AuthzError::NotYetImplemented("mint_run_token → P-ID-18 (M1)"))
+                Err(AuthzError::NotYetImplemented(
+                    "mint_run_token → P-ID-18 (M1)",
+                ))
             }
             fn revoke(&self, _t: &RevokeTarget) -> Result<()> {
                 Err(AuthzError::NotYetImplemented("revoke → P-ID-14 (M1)"))
             }
             fn resolve_pseudonym(&self, _s: &PrincipalId, _t: &TenantId) -> Result<String> {
-                Err(AuthzError::NotYetImplemented("resolve_pseudonym → P-ID-19 (M1)"))
+                Err(AuthzError::NotYetImplemented(
+                    "resolve_pseudonym → P-ID-19 (M1)",
+                ))
             }
             fn erase(&self, _s: &PrincipalId) -> Result<()> {
                 Err(AuthzError::NotYetImplemented("erase → P-ID-20 (M1)"))
             }
             fn admit_fragment(&self, _f: &NamespaceFragment) -> Result<FragmentAdmit> {
-                Err(AuthzError::NotYetImplemented("admit_fragment → P-ID-10 (M1)"))
+                Err(AuthzError::NotYetImplemented(
+                    "admit_fragment → P-ID-10 (M1)",
+                ))
             }
         }
 

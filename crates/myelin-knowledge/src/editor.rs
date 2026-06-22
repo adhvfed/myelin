@@ -125,7 +125,10 @@ impl EditorBlock {
 
     /// An empty block (a fresh line — the document a new page starts with, S1 empty state).
     pub fn empty() -> EditorBlock {
-        EditorBlock { md: String::new(), nodes: Vec::new() }
+        EditorBlock {
+            md: String::new(),
+            nodes: Vec::new(),
+        }
     }
 
     /// The block's caret-position count (`char_len + 1`) — the valid caret range `0..=char_len` on
@@ -147,7 +150,11 @@ pub enum EditOp {
     /// through the surgery primitive's [`insert_text`] (escape-on-serialize through the one render
     /// path; char offsets, never byte — the CJK/IME obligation). `block` is the target block index;
     /// `offset` the caret CHAR offset; `text` the inserted run.
-    InsertText { block: usize, offset: usize, text: String },
+    InsertText {
+        block: usize,
+        offset: usize,
+        text: String,
+    },
     /// **Enter-splits-a-block at a caret offset.** Routes through the surgery primitive's
     /// [`split_at`]: the block is replaced by its left half, a NEW block (the right half) is inserted
     /// after it, and the caret lands at offset 0 of the new block (the #1 "real editor" bar). `block`
@@ -180,7 +187,11 @@ impl EditOp {
     /// encoding is the editor's and swaps freely.)
     pub fn encode(&self) -> Vec<u8> {
         match self {
-            EditOp::InsertText { block, offset, text } => {
+            EditOp::InsertText {
+                block,
+                offset,
+                text,
+            } => {
                 // text is the last field so a tab inside it cannot be misparsed (split_once).
                 format!("it\t{block}\t{offset}\t{text}").into_bytes()
             }
@@ -212,7 +223,9 @@ impl EditOp {
                     offset: offset.parse().ok()?,
                 })
             }
-            "ab" => Some(EditOp::AppendBlock { md: rest.to_string() }),
+            "ab" => Some(EditOp::AppendBlock {
+                md: rest.to_string(),
+            }),
             _ => None,
         }
     }
@@ -235,7 +248,9 @@ pub struct Document {
 impl Document {
     /// A fresh empty document (a new page — the S1 empty state: one empty block to type into).
     pub fn new_page() -> Document {
-        Document { blocks: vec![EditorBlock::empty()] }
+        Document {
+            blocks: vec![EditorBlock::empty()],
+        }
     }
 
     /// A document with no blocks (the receiver state a [`SecondViewer`] starts from before it replays
@@ -257,7 +272,11 @@ impl Document {
     /// place; a viewer ignores it.
     pub fn apply(&mut self, op: &EditOp) -> Option<usize> {
         match op {
-            EditOp::InsertText { block, offset, text } => {
+            EditOp::InsertText {
+                block,
+                offset,
+                text,
+            } => {
                 let b = self.blocks.get_mut(*block)?;
                 let (md, nodes, caret) = insert_text(&b.md, &b.nodes, *offset, text);
                 *b = EditorBlock { md, nodes };
@@ -267,9 +286,17 @@ impl Document {
                 let b = self.blocks.get(*block)?;
                 let split = split_at(&b.md, &b.nodes, *offset);
                 // the left half replaces the block in place; the right (new) block is inserted after.
-                self.blocks[*block] = EditorBlock { md: split.left, nodes: split.left_nodes };
-                self.blocks
-                    .insert(*block + 1, EditorBlock { md: split.right, nodes: split.right_nodes });
+                self.blocks[*block] = EditorBlock {
+                    md: split.left,
+                    nodes: split.left_nodes,
+                };
+                self.blocks.insert(
+                    *block + 1,
+                    EditorBlock {
+                        md: split.right,
+                        nodes: split.right_nodes,
+                    },
+                );
                 Some(split.caret) // caret 0 of the new block (the caret-after-split bar)
             }
             EditOp::AppendBlock { md } => {
@@ -293,7 +320,11 @@ impl Document {
     /// diff / reference-extraction surface (§8.3: the string survives copy/paste/export). Used by the
     /// KN-D2 whole-document round-trip and the viewer-convergence assertion.
     pub fn to_markdown(&self) -> String {
-        self.blocks.iter().map(|b| b.md.as_str()).collect::<Vec<_>>().join("\n")
+        self.blocks
+            .iter()
+            .map(|b| b.md.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
@@ -387,7 +418,12 @@ impl<A: OpAuthority> Editor<A> {
         self.doc.apply(&op);
         // Step 2/3 — mint the op_id + send over the transport (rides the firehose; idempotent apply).
         let op_id = self.next_op_id();
-        let doc_op = DocOp::cas(op_id, self.actor.principal_id.0.clone(), op.kind(), op.encode());
+        let doc_op = DocOp::cas(
+            op_id,
+            self.actor.principal_id.0.clone(),
+            op.kind(),
+            op.encode(),
+        );
         self.transport.send_op(doc_op)
     }
 
@@ -397,7 +433,11 @@ impl<A: OpAuthority> Editor<A> {
     /// stays literal until the user completes a delimiter pair, and a CJK commit lands as one caret
     /// step per char.
     pub fn type_text(&mut self, block: usize, offset: usize, text: &str) -> SendOutcome {
-        self.apply_local(EditOp::InsertText { block, offset, text: text.to_string() })
+        self.apply_local(EditOp::InsertText {
+            block,
+            offset,
+            text: text.to_string(),
+        })
     }
 
     /// **Press Enter — split the block at the caret (caret lands at the START of the new block).** A
@@ -425,7 +465,9 @@ impl<A: OpAuthority> Editor<A> {
     ) -> Result<SecondViewer, TransportError> {
         // Authorize + resume through the transport's CONNECT (no op without authz). The backfill is
         // the ops the viewer missed (replayed exactly once); the live subscription delivers the rest.
-        let connected = self.transport.connect(principal, AuthAction::Edit, cursor)?;
+        let connected = self
+            .transport
+            .connect(principal, AuthAction::Edit, cursor)?;
         let backfill = match connected {
             Connected::Resumed { backfill } => backfill,
             Connected::ResyncFromSnapshot { tail, .. } => tail, // cold path: apply the live tail
@@ -481,14 +523,20 @@ impl SecondViewer {
     /// (the seed block the first keystroke mutates) has no block to apply to. The backfill on connect
     /// + the live frames after then converge it on the editor's document.
     pub fn new() -> SecondViewer {
-        SecondViewer { doc: Document::new_page(), seen: std::collections::HashSet::new() }
+        SecondViewer {
+            doc: Document::new_page(),
+            seen: std::collections::HashSet::new(),
+        }
     }
 
     /// A viewer over an EXPLICIT seed document (the snapshot a `resync_required` cold path loads, or a
     /// page that already had content when the viewer joined). The op stream applies on top of the
     /// seed. The default [`SecondViewer::new`] seeds the fresh-page state (one empty block).
     pub fn with_seed(seed: Document) -> SecondViewer {
-        SecondViewer { doc: seed, seen: std::collections::HashSet::new() }
+        SecondViewer {
+            doc: seed,
+            seen: std::collections::HashSet::new(),
+        }
     }
 
     /// The viewer's converged document (read-only — the rendered surface on the second connection).
@@ -552,7 +600,10 @@ mod tests {
         let e = editor("c1");
         assert_eq!(e.document().block_count(), 1);
         assert_eq!(e.document().blocks[0], EditorBlock::empty());
-        assert!(e.document().corpus_roundtrips(), "an empty doc is a KN-D2 fixed point");
+        assert!(
+            e.document().corpus_roundtrips(),
+            "an empty doc is a KN-D2 fixed point"
+        );
     }
 
     /// **Typing text into a block updates the live document AND sends an op (the §1.1 edit path).**
@@ -561,7 +612,10 @@ mod tests {
     fn typing_updates_the_document_and_sends_an_op() {
         let mut e = editor("c1");
         let out = e.type_text(0, 0, "Severity high");
-        assert!(out.applied(), "a fresh edit is applied (assigned an op_seq)");
+        assert!(
+            out.applied(),
+            "a fresh edit is applied (assigned an op_seq)"
+        );
         assert_eq!(out.persisted().op_seq, 1);
         assert_eq!(e.document().blocks[0].md, "Severity high");
         assert!(e.document().corpus_roundtrips());
@@ -602,7 +656,10 @@ mod tests {
         e.type_text(0, 0, "ax");
         e.type_text(0, 1, "*");
         assert_eq!(e.document().blocks[0].md, r"a\*x");
-        assert!(e.document().corpus_roundtrips(), "the escaped form is canonical");
+        assert!(
+            e.document().corpus_roundtrips(),
+            "the escaped form is canonical"
+        );
     }
 
     /// **THE KN-D2 re-run over the INTEGRATED editor: every block round-trips 100%, 0 regressions.**
@@ -623,7 +680,10 @@ mod tests {
             let (re, _) = canonicalize(&b.md, &b.nodes);
             assert_eq!(re, b.md, "block {i} ({:?}) is NOT a fixed point", b.md);
         }
-        assert!(e.document().corpus_roundtrips(), "the integrated-path corpus-pass-rate is 100%");
+        assert!(
+            e.document().corpus_roundtrips(),
+            "the integrated-path corpus-pass-rate is 100%"
+        );
     }
 
     /// **The whole frozen KN-D2 corpus round-trips when loaded as document blocks (the integrated
@@ -681,8 +741,15 @@ mod tests {
         let mut viewer = SecondViewer::new();
         assert!(viewer.observe(&p), "first observe applies");
         let before = viewer.document().clone();
-        assert!(!viewer.observe(&p), "a re-delivered frame is a no-op (the op_id dedup)");
-        assert_eq!(viewer.document(), &before, "the document did NOT double-apply");
+        assert!(
+            !viewer.observe(&p),
+            "a re-delivered frame is a no-op (the op_id dedup)"
+        );
+        assert_eq!(
+            viewer.document(),
+            &before,
+            "the document did NOT double-apply"
+        );
     }
 
     /// **A late-joining viewer is caught up by the connect backfill, then sees live frames (the §1.1
@@ -717,8 +784,16 @@ mod tests {
         let sub = e.subscribe(None).expect("a live subscription opens");
         let out = e.type_text(0, 0, "live edit");
         let frames = sub.drain_ready();
-        assert_eq!(frames.len(), 1, "the live subscriber received the published frame");
-        assert_eq!(frames[0].seq, out.persisted().op_seq, "the live frame seq == the op_seq");
+        assert_eq!(
+            frames.len(),
+            1,
+            "the live subscriber received the published frame"
+        );
+        assert_eq!(
+            frames[0].seq,
+            out.persisted().op_seq,
+            "the live frame seq == the op_seq"
+        );
     }
 
     /// **A structured-node line survives the integrated editor (mention/ref as a single-offset
@@ -726,18 +801,29 @@ mod tests {
     /// to the correct half (the offset/surgery primitives compose under the integrated editor).
     #[test]
     fn structured_node_survives_the_integrated_editor() {
-        let nodes = vec![InlineNode::ArtifactRefNode(ArtifactRef("myelin://acme/k/1".into()))];
+        let nodes = vec![InlineNode::ArtifactRefNode(ArtifactRef(
+            "myelin://acme/k/1".into(),
+        ))];
         let md = format!("see {OBJ} here");
         let mut doc = Document::blank();
         doc.blocks.push(EditorBlock::new(&md, &nodes));
-        assert!(doc.corpus_roundtrips(), "the structured-node block is canonical");
+        assert!(
+            doc.corpus_roundtrips(),
+            "the structured-node block is canonical"
+        );
         // split right after the chip (the chip stays with the left half up to the cut).
         let obj_pos = md.chars().position(|c| c == OBJ).unwrap();
-        doc.apply(&EditOp::SplitBlock { block: 0, offset: obj_pos + 1 });
+        doc.apply(&EditOp::SplitBlock {
+            block: 0,
+            offset: obj_pos + 1,
+        });
         assert_eq!(doc.block_count(), 2);
         // the chip is in the left block; both halves are canonical (KN-D2 holds across the split).
         assert_eq!(doc.blocks[0].nodes.len(), 1);
-        assert!(doc.corpus_roundtrips(), "both halves are KN-D2 fixed points after the split");
+        assert!(
+            doc.corpus_roundtrips(),
+            "both halves are KN-D2 fixed points after the split"
+        );
     }
 
     /// **An op against an out-of-range block is a no-op (the flat-index floor's bounds guard, never a
@@ -746,9 +832,25 @@ mod tests {
     fn an_out_of_range_op_is_a_no_op() {
         let mut doc = Document::new_page();
         let before = doc.clone();
-        assert_eq!(doc.apply(&EditOp::InsertText { block: 99, offset: 0, text: "x".into() }), None);
-        assert_eq!(doc.apply(&EditOp::SplitBlock { block: 99, offset: 0 }), None);
-        assert_eq!(doc, before, "an out-of-range op did not mutate the document");
+        assert_eq!(
+            doc.apply(&EditOp::InsertText {
+                block: 99,
+                offset: 0,
+                text: "x".into()
+            }),
+            None
+        );
+        assert_eq!(
+            doc.apply(&EditOp::SplitBlock {
+                block: 99,
+                offset: 0
+            }),
+            None
+        );
+        assert_eq!(
+            doc, before,
+            "an out-of-range op did not mutate the document"
+        );
     }
 
     /// **The EditOp wire form round-trips (encode → decode is the identity for every intent).** The
@@ -757,12 +859,25 @@ mod tests {
     #[test]
     fn edit_op_wire_form_roundtrips() {
         for op in [
-            EditOp::InsertText { block: 2, offset: 5, text: "with\ttab and 日本".into() },
-            EditOp::SplitBlock { block: 0, offset: 7 },
-            EditOp::AppendBlock { md: "a new line".into() },
+            EditOp::InsertText {
+                block: 2,
+                offset: 5,
+                text: "with\ttab and 日本".into(),
+            },
+            EditOp::SplitBlock {
+                block: 0,
+                offset: 7,
+            },
+            EditOp::AppendBlock {
+                md: "a new line".into(),
+            },
         ] {
             let bytes = op.encode();
-            assert_eq!(EditOp::decode(&bytes), Some(op), "the wire form round-trips");
+            assert_eq!(
+                EditOp::decode(&bytes),
+                Some(op),
+                "the wire form round-trips"
+            );
         }
         // a foreign / malformed payload is not an editor intent.
         assert_eq!(EditOp::decode(b"foreign-op-bytes"), None);
@@ -782,7 +897,13 @@ mod tests {
     /// dated artifact and is marked `partial` — not a silent claim of a full Playwright run.
     #[test]
     fn browser_drive_evidence_is_recorded_and_honestly_marked() {
-        assert!(BROWSER_DRIVE_EVIDENCE.contains("partial"), "the drive is honestly marked partial");
-        assert!(BROWSER_DRIVE_EVIDENCE.contains("editor-browser-drive.md"), "names the dated artifact");
+        assert!(
+            BROWSER_DRIVE_EVIDENCE.contains("partial"),
+            "the drive is honestly marked partial"
+        );
+        assert!(
+            BROWSER_DRIVE_EVIDENCE.contains("editor-browser-drive.md"),
+            "names the dated artifact"
+        );
     }
 }

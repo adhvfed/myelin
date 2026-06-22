@@ -95,12 +95,22 @@ impl Endpoint {
     /// Construct an endpoint, ENFORCING the BUS-2 invariant: a write endpoint (`POST`) MUST be
     /// `id_checked`. Returns `None` for a write route that is not `Id.check`-gated (the structural
     /// guard — a mutant that registers an un-gated write fails here, not silently).
-    pub fn new(method: Method, path: &'static str, handler: Handler, id_checked: bool) -> Option<Endpoint> {
+    pub fn new(
+        method: Method,
+        path: &'static str,
+        handler: Handler,
+        id_checked: bool,
+    ) -> Option<Endpoint> {
         if method.is_write() && !id_checked {
             // BUS-2: no write endpoint may skip the Id.check → state-change + outbox-emit transaction.
             return None;
         }
-        Some(Endpoint { method, path, handler, id_checked })
+        Some(Endpoint {
+            method,
+            path,
+            handler,
+            id_checked,
+        })
     }
 }
 
@@ -113,12 +123,34 @@ pub fn http_catalogue() -> Vec<Endpoint> {
     vec![
         Endpoint::new(Method::Get, "/api/git/repos", Handler::ListFilter, true).unwrap(),
         Endpoint::new(Method::Post, "/api/git/repos", Handler::Lifecycle, true).unwrap(),
-        Endpoint::new(Method::Get, "/api/git/repos/{repo}/prs/{n}", Handler::Project, true).unwrap(),
-        Endpoint::new(Method::Get, "/api/git/repos/{repo}/prs/{n}/checks", Handler::CheckStatus, true)
-            .unwrap(),
-        Endpoint::new(Method::Post, "/api/git/repos/{repo}/prs", Handler::Lifecycle, true).unwrap(),
-        Endpoint::new(Method::Post, "/api/git/repos/{repo}/prs/{n}/reviews", Handler::Lifecycle, true)
-            .unwrap(),
+        Endpoint::new(
+            Method::Get,
+            "/api/git/repos/{repo}/prs/{n}",
+            Handler::Project,
+            true,
+        )
+        .unwrap(),
+        Endpoint::new(
+            Method::Get,
+            "/api/git/repos/{repo}/prs/{n}/checks",
+            Handler::CheckStatus,
+            true,
+        )
+        .unwrap(),
+        Endpoint::new(
+            Method::Post,
+            "/api/git/repos/{repo}/prs",
+            Handler::Lifecycle,
+            true,
+        )
+        .unwrap(),
+        Endpoint::new(
+            Method::Post,
+            "/api/git/repos/{repo}/prs/{n}/reviews",
+            Handler::Lifecycle,
+            true,
+        )
+        .unwrap(),
         Endpoint::new(
             Method::Post,
             "/api/git/repos/{repo}/prs/{n}/endorse-fork-ci",
@@ -126,15 +158,36 @@ pub fn http_catalogue() -> Vec<Endpoint> {
             true,
         )
         .unwrap(),
-        Endpoint::new(Method::Post, "/api/git/repos/{repo}/prs/{n}/merge", Handler::MergeGate, true)
-            .unwrap(),
-        Endpoint::new(Method::Get, "/api/git/repos/{repo}/blob/{ref}/{path}", Handler::Project, true)
-            .unwrap(),
+        Endpoint::new(
+            Method::Post,
+            "/api/git/repos/{repo}/prs/{n}/merge",
+            Handler::MergeGate,
+            true,
+        )
+        .unwrap(),
+        Endpoint::new(
+            Method::Get,
+            "/api/git/repos/{repo}/blob/{ref}/{path}",
+            Handler::Project,
+            true,
+        )
+        .unwrap(),
         // The single-file web-edit commit (GF-6) lowers to the receive-pack one-tx ref-CAS — a WRITE,
         // Id.check-gated.
-        Endpoint::new(Method::Post, "/api/git/repos/{repo}/blob/{ref}/{path}", Handler::ReceivePack, true)
-            .unwrap(),
-        Endpoint::new(Method::Get, "/api/git/search/code", Handler::CodeSearch, true).unwrap(),
+        Endpoint::new(
+            Method::Post,
+            "/api/git/repos/{repo}/blob/{ref}/{path}",
+            Handler::ReceivePack,
+            true,
+        )
+        .unwrap(),
+        Endpoint::new(
+            Method::Get,
+            "/api/git/search/code",
+            Handler::CodeSearch,
+            true,
+        )
+        .unwrap(),
     ]
 }
 
@@ -254,31 +307,47 @@ pub fn parse_cli(args: &[&str]) -> Result<CliCommand, CliParseError> {
         "repo" => parse_repo(rest),
         "pr" => parse_pr(rest),
         "search" => parse_search(rest),
-        other => Err(CliParseError::Unknown { token: other.to_string() }),
+        other => Err(CliParseError::Unknown {
+            token: other.to_string(),
+        }),
     }
 }
 
 fn parse_repo(rest: &[&str]) -> Result<CliCommand, CliParseError> {
-    let (verb, args) = rest.split_first().ok_or(CliParseError::MissingArg { what: "repo verb" })?;
+    let (verb, args) = rest
+        .split_first()
+        .ok_or(CliParseError::MissingArg { what: "repo verb" })?;
     match *verb {
         "list" => Ok(CliCommand::RepoList),
         "view" => {
-            let repo = args.first().ok_or(CliParseError::MissingArg { what: "repo" })?;
-            Ok(CliCommand::RepoView { repo: repo.to_string() })
+            let repo = args
+                .first()
+                .ok_or(CliParseError::MissingArg { what: "repo" })?;
+            Ok(CliCommand::RepoView {
+                repo: repo.to_string(),
+            })
         }
-        other => Err(CliParseError::Unknown { token: other.to_string() }),
+        other => Err(CliParseError::Unknown {
+            token: other.to_string(),
+        }),
     }
 }
 
 fn parse_pr(rest: &[&str]) -> Result<CliCommand, CliParseError> {
-    let (verb, args) = rest.split_first().ok_or(CliParseError::MissingArg { what: "pr verb" })?;
+    let (verb, args) = rest
+        .split_first()
+        .ok_or(CliParseError::MissingArg { what: "pr verb" })?;
     match *verb {
         "list" => {
             let repo = flag_value(args, "--repo");
             Ok(CliCommand::PrList { repo })
         }
-        "view" => Ok(CliCommand::PrView { number: parse_number(args)? }),
-        "checks" => Ok(CliCommand::PrChecks { number: parse_number(args)? }),
+        "view" => Ok(CliCommand::PrView {
+            number: parse_number(args)?,
+        }),
+        "checks" => Ok(CliCommand::PrChecks {
+            number: parse_number(args)?,
+        }),
         "review" => {
             let number = parse_number(args)?;
             let verdict = if args.contains(&"--approve") {
@@ -288,22 +357,33 @@ fn parse_pr(rest: &[&str]) -> Result<CliCommand, CliParseError> {
             } else if args.contains(&"--comment") {
                 "comment"
             } else {
-                return Err(CliParseError::MissingArg { what: "review verdict" });
+                return Err(CliParseError::MissingArg {
+                    what: "review verdict",
+                });
             };
-            Ok(CliCommand::PrReview { number, verdict: verdict.to_string() })
+            Ok(CliCommand::PrReview {
+                number,
+                verdict: verdict.to_string(),
+            })
         }
         "merge" => {
             let number = parse_number(args)?;
             let auto = args.contains(&"--auto");
             Ok(CliCommand::PrMerge { number, auto })
         }
-        "endorse-fork-ci" => Ok(CliCommand::PrEndorseForkCi { number: parse_number(args)? }),
-        other => Err(CliParseError::Unknown { token: other.to_string() }),
+        "endorse-fork-ci" => Ok(CliCommand::PrEndorseForkCi {
+            number: parse_number(args)?,
+        }),
+        other => Err(CliParseError::Unknown {
+            token: other.to_string(),
+        }),
     }
 }
 
 fn parse_search(rest: &[&str]) -> Result<CliCommand, CliParseError> {
-    let (verb, args) = rest.split_first().ok_or(CliParseError::MissingArg { what: "search verb" })?;
+    let (verb, args) = rest.split_first().ok_or(CliParseError::MissingArg {
+        what: "search verb",
+    })?;
     match *verb {
         "code" => {
             let query = args
@@ -311,9 +391,14 @@ fn parse_search(rest: &[&str]) -> Result<CliCommand, CliParseError> {
                 .find(|a| !a.starts_with("--"))
                 .ok_or(CliParseError::MissingArg { what: "query" })?;
             let repo = flag_value(args, "--repo");
-            Ok(CliCommand::SearchCode { query: query.to_string(), repo })
+            Ok(CliCommand::SearchCode {
+                query: query.to_string(),
+                repo,
+            })
         }
-        other => Err(CliParseError::Unknown { token: other.to_string() }),
+        other => Err(CliParseError::Unknown {
+            token: other.to_string(),
+        }),
     }
 }
 
@@ -323,7 +408,9 @@ fn parse_number(args: &[&str]) -> Result<u64, CliParseError> {
         .iter()
         .find(|a| !a.starts_with("--"))
         .ok_or(CliParseError::MissingArg { what: "number" })?;
-    raw.parse::<u64>().map_err(|_| CliParseError::BadArg { value: raw.to_string() })
+    raw.parse::<u64>().map_err(|_| CliParseError::BadArg {
+        value: raw.to_string(),
+    })
 }
 
 /// The value following a `--flag` (e.g. `--repo core`), or `None` if absent.
@@ -356,8 +443,16 @@ pub struct AgentToolDef {
 /// (authoring is reversible → not HITL-gated, §6.3).
 pub fn agent_tools() -> Vec<AgentToolDef> {
     vec![
-        AgentToolDef { name: "git.merge", requires_approval: true, handler: Handler::MergeGate },
-        AgentToolDef { name: "git.open_pr", requires_approval: false, handler: Handler::Lifecycle },
+        AgentToolDef {
+            name: "git.merge",
+            requires_approval: true,
+            handler: Handler::MergeGate,
+        },
+        AgentToolDef {
+            name: "git.open_pr",
+            requires_approval: false,
+            handler: Handler::Lifecycle,
+        },
         AgentToolDef {
             name: "git.submit_review",
             requires_approval: false,

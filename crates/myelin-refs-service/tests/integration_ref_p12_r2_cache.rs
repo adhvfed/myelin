@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use myelin_events::ArtifactRef;
 use myelin_refs_service::{
-    ProjectionCache, ProjectionCacheRead, Projection, R2ProjectionCache, RefsDekPin,
+    Projection, ProjectionCache, ProjectionCacheRead, R2ProjectionCache, RefsDekPin,
 };
 use myelin_storage::valkey::ValkeyCache;
 use myelin_storage::{KmsEngine, NONCE_LEN};
@@ -66,7 +66,11 @@ async fn r2_cache_fill_read_bust_and_crypto_shred_on_real_valkey() {
 
     let dek = Arc::new(RefsDekPin::new(Arc::new(KmsEngine::new())));
     // Short TTL on this drill so a leaked key self-evicts quickly; the round-trip is synchronous.
-    let cache = R2ProjectionCache::with_ttl(Arc::new(valkey.clone()), dek.clone(), Duration::from_secs(120));
+    let cache = R2ProjectionCache::with_ttl(
+        Arc::new(valkey.clone()),
+        dek.clone(),
+        Duration::from_secs(120),
+    );
 
     let t = tenant("rt");
     let ref_ = ArtifactRef("myelin://acme/issue/issue/ENG-1".into());
@@ -75,8 +79,13 @@ async fn r2_cache_fill_read_bust_and_crypto_shred_on_real_valkey() {
     // ── fill → read round-trips through REAL Valkey (HIT). ──
     tokio::task::block_in_place(|| cache.fill(&t, &region(), &ref_, &p))
         .expect("fill seals + SETs in real Valkey");
-    let hit = tokio::task::block_in_place(|| ProjectionCacheRead::read(&cache, &t, &region(), &ref_));
-    assert_eq!(hit, Some(p.clone()), "the live Valkey entry decrypts to the exact projection (HIT)");
+    let hit =
+        tokio::task::block_in_place(|| ProjectionCacheRead::read(&cache, &t, &region(), &ref_));
+    assert_eq!(
+        hit,
+        Some(p.clone()),
+        "the live Valkey entry decrypts to the exact projection (HIT)"
+    );
 
     // ── the value SEALED in Valkey is nonce || ciphertext — never the plaintext title. ──
     use myelin_storage::Cache;
@@ -84,22 +93,37 @@ async fn r2_cache_fill_read_bust_and_crypto_shred_on_real_valkey() {
         .expect("raw GET")
         .expect("a blob is stored");
     let as_text = String::from_utf8_lossy(&raw);
-    assert!(!as_text.contains("Alice Liddell"), "the cached title is sealed in Valkey, never plaintext");
-    assert!(raw.len() > NONCE_LEN, "the stored blob is nonce || ciphertext");
+    assert!(
+        !as_text.contains("Alice Liddell"),
+        "the cached title is sealed in Valkey, never plaintext"
+    );
+    assert!(
+        raw.len() > NONCE_LEN,
+        "the stored blob is nonce || ciphertext"
+    );
 
     // ── a *.updated/*.erased bust DELETEs the live key → the next read MISSES (re-resolves). ──
     cache.invalidate(&t, &region(), &ref_); // the §3.6 bust against real Valkey
-    let after_bust = tokio::task::block_in_place(|| ProjectionCacheRead::read(&cache, &t, &region(), &ref_));
-    assert!(after_bust.is_none(), "after the bust the real-Valkey read MISSES → re-resolves (never stale)");
+    let after_bust =
+        tokio::task::block_in_place(|| ProjectionCacheRead::read(&cache, &t, &region(), &ref_));
+    assert!(
+        after_bust.is_none(),
+        "after the bust the real-Valkey read MISSES → re-resolves (never stale)"
+    );
 
     // ── crypto-shred: re-fill, then destroy the per-tenant DEK → the surviving Valkey blob is dead. ──
     tokio::task::block_in_place(|| cache.fill(&t, &region(), &ref_, &p)).expect("re-fill");
     assert!(
-        tokio::task::block_in_place(|| ProjectionCacheRead::read(&cache, &t, &region(), &ref_)).is_some(),
+        tokio::task::block_in_place(|| ProjectionCacheRead::read(&cache, &t, &region(), &ref_))
+            .is_some(),
         "decrypts while the DEK lives"
     );
-    assert!(dek.destroy_tenant_dek(&t, &region()), "tenant offboard: the per-tenant DEK is shredded");
-    let after_shred = tokio::task::block_in_place(|| ProjectionCacheRead::read(&cache, &t, &region(), &ref_));
+    assert!(
+        dek.destroy_tenant_dek(&t, &region()),
+        "tenant offboard: the per-tenant DEK is shredded"
+    );
+    let after_shred =
+        tokio::task::block_in_place(|| ProjectionCacheRead::read(&cache, &t, &region(), &ref_));
     assert!(
         after_shred.is_none(),
         "a crypto-shredded cached title is unrecoverable on real Valkey — a MISS, never plaintext"
@@ -109,11 +133,18 @@ async fn r2_cache_fill_read_bust_and_crypto_shred_on_real_valkey() {
     let a = tenant("iso-a");
     let b = tenant("iso-b");
     let dek2 = Arc::new(RefsDekPin::new(Arc::new(KmsEngine::new())));
-    let cache2 = R2ProjectionCache::with_ttl(Arc::new(valkey.clone()), dek2, Duration::from_secs(120));
-    tokio::task::block_in_place(|| cache2.fill(&a, &region(), &ref_, &projection(&ref_.0, "a's title")))
-        .expect("fill for tenant a");
-    let cross = tokio::task::block_in_place(|| ProjectionCacheRead::read(&cache2, &b, &region(), &ref_));
-    assert!(cross.is_none(), "tenant B never reads tenant A's cached projection (real-Valkey namespacing)");
+    let cache2 =
+        R2ProjectionCache::with_ttl(Arc::new(valkey.clone()), dek2, Duration::from_secs(120));
+    tokio::task::block_in_place(|| {
+        cache2.fill(&a, &region(), &ref_, &projection(&ref_.0, "a's title"))
+    })
+    .expect("fill for tenant a");
+    let cross =
+        tokio::task::block_in_place(|| ProjectionCacheRead::read(&cache2, &b, &region(), &ref_));
+    assert!(
+        cross.is_none(),
+        "tenant B never reads tenant A's cached projection (real-Valkey namespacing)"
+    );
 
     // cleanup our keys (best-effort).
     let _ = tokio::task::block_in_place(|| valkey.delete(&a, &R2ProjectionCache::cache_key(&ref_)));

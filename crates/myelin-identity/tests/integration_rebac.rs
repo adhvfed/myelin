@@ -80,8 +80,14 @@ async fn rebac_tuple_store_reverse_index() {
     .await
     .unwrap();
 
-    let objs: Vec<String> = rows.iter().map(|r| r.get::<String, _>("object_id")).collect();
+    let objs: Vec<String> = rows
+        .iter()
+        .map(|r| r.get::<String, _>("object_id"))
+        .collect();
     assert_eq!(objs, vec!["doc1".to_string(), "doc2".to_string()]);
 
-    sqlx::query(&format!("DROP TABLE {tbl}")).execute(&pool).await.unwrap();
+    sqlx::query(&format!("DROP TABLE {tbl}"))
+        .execute(&pool)
+        .await
+        .unwrap();
 }

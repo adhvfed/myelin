@@ -41,11 +41,16 @@ fn tenant() -> TenantId {
 }
 
 fn principal() -> Principal {
-    Principal::stub(PrincipalId("p-opaque".into()), PrincipalKind::Human, tenant())
+    Principal::stub(
+        PrincipalId("p-opaque".into()),
+        PrincipalKind::Human,
+        tenant(),
+    )
 }
 
 fn transport() -> CollabTransport<AllowAllAuthority> {
-    CollabTransport::open_with_authority(tenant(), "doc-allhands", AllowAllAuthority).expect("opens")
+    CollabTransport::open_with_authority(tenant(), "doc-allhands", AllowAllAuthority)
+        .expect("opens")
 }
 
 /// One author's op (`client` + a per-client lamport, the `(client_id, lamport)` op_id) carrying an
@@ -87,7 +92,10 @@ fn kn_d1_kill_and_sever_mid_multi_author_edit_resume_loses_zero_ops_zero_dup() {
     // mid-edit kill): c2's lamport 2 op, sent right as the connection drops.
     let inflight = op("c2", 2);
     let inflight_first = t.send_op(inflight.clone());
-    assert!(inflight_first.applied(), "the in-flight op did reach the server before the sever");
+    assert!(
+        inflight_first.applied(),
+        "the in-flight op did reach the server before the sever"
+    );
     let inflight_seq = inflight_first.persisted().op_seq; // 5
     applied.insert(inflight_seq, label(&inflight_first.persisted().op.payload));
 
@@ -103,7 +111,11 @@ fn kn_d1_kill_and_sever_mid_multi_author_edit_resume_loses_zero_ops_zero_dup() {
         let p = out.persisted();
         applied.insert(p.op_seq, label(&p.op.payload));
     }
-    assert_eq!(t.head_seq(), 8, "while c2 was down, c1 advanced the doc to op_seq 8");
+    assert_eq!(
+        t.head_seq(),
+        8,
+        "while c2 was down, c1 advanced the doc to op_seq 8"
+    );
 
     // ---- (3) RECONNECT: c2 re-runs CONNECT(last_durably_applied = 4) -------------------------------
     let connected = t
@@ -111,12 +123,18 @@ fn kn_d1_kill_and_sever_mid_multi_author_edit_resume_loses_zero_ops_zero_dup() {
         .expect("c2 reconnects (authorized warm resume)");
     let backfill = match connected {
         Connected::Resumed { backfill } => backfill,
-        Connected::ResyncFromSnapshot { .. } => panic!("the cursor was in-window — warm resume, not cold"),
+        Connected::ResyncFromSnapshot { .. } => {
+            panic!("the cursor was in-window — warm resume, not cold")
+        }
     };
     // the resume replays EXACTLY (4, now] = op_seq 5..8 (c2's own op_seq 5 it didn't know about + c1's
     // 6,7,8) — 0 ops lost (the gap is fully replayed).
     let backfill_seqs: Vec<u64> = backfill.iter().map(|p| p.op_seq).collect();
-    assert_eq!(backfill_seqs, vec![5, 6, 7, 8], "resume replays (last_seq, now] EXACTLY — 0 ops lost");
+    assert_eq!(
+        backfill_seqs,
+        vec![5, 6, 7, 8],
+        "resume replays (last_seq, now] EXACTLY — 0 ops lost"
+    );
 
     // c2 re-SENDs its in-flight op (it never saw the ack, so it retransmits) — the UNIQUE(op_id) guard
     // makes it a NO-OP (0 duplicate effect). This is the at-least-once → effectively-once property.
@@ -125,8 +143,16 @@ fn kn_d1_kill_and_sever_mid_multi_author_edit_resume_loses_zero_ops_zero_dup() {
         matches!(resend, SendOutcome::Duplicate(_)),
         "c2's in-flight re-send is an idempotent NO-OP (the UNIQUE(op_id) guard)"
     );
-    assert_eq!(resend.persisted().op_seq, inflight_seq, "the re-send resolves to its FIRST op_seq (5)");
-    assert_eq!(t.head_seq(), 8, "the re-send did NOT advance the head (0 duplicate)");
+    assert_eq!(
+        resend.persisted().op_seq,
+        inflight_seq,
+        "the re-send resolves to its FIRST op_seq (5)"
+    );
+    assert_eq!(
+        t.head_seq(),
+        8,
+        "the re-send did NOT advance the head (0 duplicate)"
+    );
 
     // ---- (4) ASSERT 0 lost / 0 duplicate: the applied set is EXACTLY the full op set, once each ----
     // the full op set the doc should hold: op_seq 1..8 with the exact author#lamport labels.
@@ -143,7 +169,10 @@ fn kn_d1_kill_and_sever_mid_multi_author_edit_resume_loses_zero_ops_zero_dup() {
     .into_iter()
     .map(|(s, l)| (s, l.to_string()))
     .collect();
-    assert_eq!(applied, expected, "the applied set is the FULL op set, each op exactly once (0 lost)");
+    assert_eq!(
+        applied, expected,
+        "the applied set is the FULL op set, each op exactly once (0 lost)"
+    );
 
     // the reconnected client's view (its pre-kill cursor 4 + the backfill 5..8) covers 1..8 with no
     // gap and no duplicate — the dated 0-lost/0-dup artifact.
@@ -168,16 +197,29 @@ fn kn_d1_cold_leg_long_sever_resyncs_from_snapshot_zero_lost() {
     // a compaction minted a snapshot up to op_seq 3 (the block-granular *.snapshot, KN-P11) —
     // modelling the doc already holding ops 1..3, with doc_op rows <= 3 GC'd; the op-log cursor
     // advances to 3 so the next fresh op is op_seq 4.
-    t.install_snapshot(PageSnapshot { snap_seq: 3, blob_hash: "blake3:snap".into() });
+    t.install_snapshot(PageSnapshot {
+        snap_seq: 3,
+        blob_hash: "blake3:snap".into(),
+    });
 
     // a sustained edit appends 8 fresh ops on top → op_seq 4..11; the firehose window holds the last 3.
     for (client, lamport) in [
-        ("c1", 1u64), ("c1", 2), ("c2", 1), ("c1", 3),
-        ("c2", 2), ("c1", 4), ("c1", 5), ("c1", 6),
+        ("c1", 1u64),
+        ("c1", 2),
+        ("c2", 1),
+        ("c1", 3),
+        ("c2", 2),
+        ("c1", 4),
+        ("c1", 5),
+        ("c1", 6),
     ] {
         t.send_op(op(client, lamport));
     }
-    assert_eq!(t.head_seq(), 11, "the doc advanced past the snapshot (op_seq 4..11)");
+    assert_eq!(
+        t.head_seq(),
+        11,
+        "the doc advanced past the snapshot (op_seq 4..11)"
+    );
 
     // a client severed at cursor 2 (below the firehose window floor) reconnects → resync_required.
     let connected = t
@@ -185,7 +227,10 @@ fn kn_d1_cold_leg_long_sever_resyncs_from_snapshot_zero_lost() {
         .expect("the long-severed client reconnects via the cold path");
     match connected {
         Connected::ResyncFromSnapshot { snapshot, tail } => {
-            assert_eq!(snapshot.snap_seq, 3, "the cold path loads the block-granular snapshot (NAMED)");
+            assert_eq!(
+                snapshot.snap_seq, 3,
+                "the cold path loads the block-granular snapshot (NAMED)"
+            );
             // the live tail after the snapshot is (3, now] = op_seq 4..11 — applied on the seed, 0 lost.
             assert_eq!(
                 tail.iter().map(|p| p.op_seq).collect::<Vec<_>>(),
@@ -193,7 +238,9 @@ fn kn_d1_cold_leg_long_sever_resyncs_from_snapshot_zero_lost() {
                 "the live tail after the snapshot is replayed — 0 ops lost across the cold rebuild"
             );
         }
-        Connected::Resumed { .. } => panic!("the cursor was below the window floor — the cold path, not warm"),
+        Connected::Resumed { .. } => {
+            panic!("the cursor was below the window floor — the cold path, not warm")
+        }
     }
 }
 
@@ -210,17 +257,31 @@ fn kn_d1_resume_straddles_an_engine_promote_cutover_unchanged() {
     t.send_op(op("c1", 2));
     // the engine_promote cutover op (KN-P29) — from here the payload would carry Yrs bytes; the
     // transport treats it as an ordinary op (it assigns the next op_seq, persists, fans out).
-    let cutover = DocOp::cas(OpId::new("server", 1), "actor-server", OpKind::EnginePromote, b"seed".to_vec());
+    let cutover = DocOp::cas(
+        OpId::new("server", 1),
+        "actor-server",
+        OpKind::EnginePromote,
+        b"seed".to_vec(),
+    );
     let promoted = t.send_op(cutover);
-    assert!(promoted.applied(), "the engine_promote op is an ordinary op on the log");
-    assert_eq!(promoted.persisted().op_seq, 3, "it gets the next monotone op_seq");
+    assert!(
+        promoted.applied(),
+        "the engine_promote op is an ordinary op on the log"
+    );
+    assert_eq!(
+        promoted.persisted().op_seq,
+        3,
+        "it gets the next monotone op_seq"
+    );
     // "Yrs-era" ops after the cutover.
     t.send_op(op("c1", 3));
     t.send_op(op("c1", 4));
 
     // a client at cursor 1 (a CAS-era op) resumes ACROSS the cutover → backfill {2, cutover(3), 4, 5}
     // — the resume cursor straddles the boundary unchanged (0 lost). KN-P29 re-runs THIS green.
-    let connected = t.reconnect(&principal(), AuthAction::Edit, 1).expect("resume across the cutover");
+    let connected = t
+        .reconnect(&principal(), AuthAction::Edit, 1)
+        .expect("resume across the cutover");
     let backfill = match connected {
         Connected::Resumed { backfill } => backfill,
         Connected::ResyncFromSnapshot { tail, .. } => tail,

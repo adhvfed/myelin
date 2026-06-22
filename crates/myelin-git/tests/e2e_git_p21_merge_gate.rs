@@ -28,9 +28,7 @@ use myelin_git::check_status::{
     TrustTier,
 };
 use myelin_git::lifecycle::BranchProtectionRuleset;
-use myelin_git::merge_gate::{
-    evaluate_merge_gate, MergeGateOutcome, MergeGatePolicy, UnmetReason,
-};
+use myelin_git::merge_gate::{evaluate_merge_gate, MergeGateOutcome, MergeGatePolicy, UnmetReason};
 use myelin_tenancy::{ArtifactRef, TenantId};
 use std::collections::BTreeMap;
 
@@ -51,7 +49,10 @@ fn fact(context: &str, attempt: u32, state: CheckState, trust: TrustTier) -> Che
         run_attempt: attempt,
         trust_tier: trust,
         details_ref: ArtifactRef(format!("myelin://acme/ci/run/{attempt}#step-2")),
-        summary: HumanisedRef { template_key: "ci.check.updated".into(), args },
+        summary: HumanisedRef {
+            template_key: "ci.check.updated".into(),
+            args,
+        },
         started_at: Timestamp("2026-06-22T00:00:00Z".into()),
         completed_at: Some(Timestamp("2026-06-22T00:01:00Z".into())),
         cost_settled: true,
@@ -79,7 +80,10 @@ fn merge_gate_blocks_until_the_required_set_is_complete() {
     // 1. configure the base_ref's required-set policy from the protected-ref ruleset (Git decides which
     //    contexts gate). The ruleset NAMES `ci/build` + `ci/test`.
     let ruleset = protected_main();
-    assert!(ruleset.matches("refs/heads/main"), "the ruleset protects main");
+    assert!(
+        ruleset.matches("refs/heads/main"),
+        "the ruleset protects main"
+    );
     let policy = MergeGatePolicy::from_required_contexts(&ruleset.required_contexts).unwrap();
     assert_eq!(policy.required.len(), 2);
 
@@ -121,7 +125,12 @@ fn fork_self_green_is_neutral_until_a_maintainer_endorses() {
 
     // The fork's CI self-greens `ci/build` — but the run is untrusted_fork (it executed fork code).
     let mut proj = CheckStatusProjection::new();
-    proj.apply(&fact("build", 1, CheckState::Success, TrustTier::UntrustedFork));
+    proj.apply(&fact(
+        "build",
+        1,
+        CheckState::Success,
+        TrustTier::UntrustedFork,
+    ));
 
     // The gate BLOCKS — a fork success is NEUTRAL for gating (0 forks green their own required gate).
     match evaluate_merge_gate(&policy, &proj, &head, &[]) {
@@ -148,7 +157,12 @@ fn rerun_trusted_supersedes_fork_and_admits() {
     let policy = MergeGatePolicy::from_required_contexts(&["ci/build"]).unwrap();
 
     let mut proj = CheckStatusProjection::new();
-    proj.apply(&fact("build", 1, CheckState::Success, TrustTier::UntrustedFork));
+    proj.apply(&fact(
+        "build",
+        1,
+        CheckState::Success,
+        TrustTier::UntrustedFork,
+    ));
     // The maintainer re-runs the context trusted (attempt 2) — supersedes the fork fact in place.
     proj.apply(&fact("build", 2, CheckState::Success, TrustTier::Trusted));
 
@@ -170,12 +184,20 @@ fn a_superseding_failure_re_blocks_a_previously_green_gate() {
     let mut proj = CheckStatusProjection::new();
     // attempt 1 green...
     proj.apply(&fact("build", 1, CheckState::Success, TrustTier::Trusted));
-    assert_eq!(evaluate_merge_gate(&policy, &proj, &head, &[]), MergeGateOutcome::Admitted);
+    assert_eq!(
+        evaluate_merge_gate(&policy, &proj, &head, &[]),
+        MergeGateOutcome::Admitted
+    );
     // ...then a re-run (attempt 2) FAILS — supersedes → the current row is now a failure → re-blocked.
     proj.apply(&fact("build", 2, CheckState::Failure, TrustTier::Trusted));
     match evaluate_merge_gate(&policy, &proj, &head, &[]) {
         MergeGateOutcome::Blocked { unmet } => {
-            assert_eq!(unmet[0].reason, UnmetReason::NotGreen { state: CheckState::Failure });
+            assert_eq!(
+                unmet[0].reason,
+                UnmetReason::NotGreen {
+                    state: CheckState::Failure
+                }
+            );
         }
         MergeGateOutcome::Admitted => panic!("a superseding failure must re-block the gate"),
     }

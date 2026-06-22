@@ -44,87 +44,112 @@ fn human(seq: u64) -> Frame {
 /// scope, flood a paginated window with mixed-class frames, and assert the per-surface frame shed
 /// budgets fire in order (presence sheds before message frames) with a bounded frame-lag.
 fn sub_d11_firehose_frame_budget_scenario() -> DrillScenario {
-    DrillScenario::new("sub-d11-firehose-frame-budgets", |ctx: &mut DrillContext| {
-        // (inject) drop a firehose subscription mid-stream on a hot stream (the D-11 condition).
-        ctx.breaker.break_dependency(Dependency::Firehose, Scope::Global);
+    DrillScenario::new(
+        "sub-d11-firehose-frame-budgets",
+        |ctx: &mut DrillContext| {
+            // (inject) drop a firehose subscription mid-stream on a hot stream (the D-11 condition).
+            ctx.breaker
+                .break_dependency(Dependency::Firehose, Scope::Global);
 
-        // (a) a `*` scope is REJECTED — one client cannot subscribe to the whole tenant firehose (§7.7).
-        assert_eq!(
-            BoundedSelector::parse("*"),
-            Err(SelectorError::Wildcard),
-            "a `*` firehose scope MUST be rejected (bounded selector only)"
-        );
-        // a 50k-row board subscribes to a bounded paginated WINDOW, never the whole board.
-        let sel = BoundedSelector::parse("board:hot").expect("a bounded board selector");
-        let window = ScopeWindow::new(10_000, 100, 50); // delivers rows [9_950, 10_150)
-        // cap 8 → v1 floor: presence 2, agent 4, human 8. A high lag ceiling so the CLASS budgets fire
-        // (the slow-consumer drop is the OTHER half, proven in drill_sub_d11_firehose_slow_consumer.rs).
-        let mut selector = FrameSelector::new("kn-ops", &sel, 8, 100_000, window);
-
-        // ---- (load) flood the hot board with mixed-class frames on in-window + off-window rows. -------
-        // off-window rows (a 50k board's off-screen rows) are NOT delivered — bounded memory.
-        let mut out_of_window = 0u64;
-        for seq in 1..=40u64 {
-            // rows 0..40 are far below the window [9_950, …) → OutOfWindow.
-            if selector.offer(presence(seq), Some(seq)) == FrameOutcome::OutOfWindow {
-                out_of_window += 1;
-            }
-        }
-        assert_eq!(out_of_window, 40, "off-screen board rows are never delivered (paginated slice)");
-        assert_eq!(selector.buffer().buffered_frames(), 0, "off-window frames cost no buffer memory");
-
-        // in-window presence flood: the presence budget (2) fills, then presence sheds BY CLASS — while
-        // message (human) frames still have budget. (No deliveries → the class in-flight stays full.)
-        for seq in 100..=110u64 {
-            selector.offer(presence(seq), Some(10_050)); // an in-window row
-        }
-        // in-window human (message) frames still buffer — message delivery is shed LAST.
-        let mut human_buffered = 0u64;
-        for seq in 200..=203u64 {
-            if selector.offer(human(seq), Some(10_050)) == FrameOutcome::Buffered {
-                human_buffered += 1;
-            }
-        }
-        // an agent frame: agents shed before humans (the agent budget is tighter than the human one).
-        selector.offer(agent(300), Some(10_050));
-
-        let presence_shed = selector.budget().shed_count(FrameClass::Presence);
-        let human_shed = selector.budget().shed_count(FrameClass::HumanDelivery);
-
-        // (assertions baked into the scenario) presence shed > 0 and BEFORE any human (message) shed.
-        assert!(presence_shed >= 1, "presence/speculative frames shed (the lowest budget fills first)");
-        assert_eq!(human_shed, 0, "message (human) frames are shed LAST (never class-shed here)");
-        assert!(human_buffered >= 1, "message frames still buffered while presence shed");
-
-        // (signals) export the §10.2 ShedCount-by-lane (frame budgets) signal, labelled by frame class.
-        for class in [FrameClass::Presence, FrameClass::AgentDelivery, FrameClass::HumanDelivery] {
-            ctx.signals.set_labelled(
-                SignalName::ShedCount,
-                vec![Label::new("lane", class.label().to_string())],
-                selector.budget().shed_count(class) as i64,
+            // (a) a `*` scope is REJECTED — one client cannot subscribe to the whole tenant firehose (§7.7).
+            assert_eq!(
+                BoundedSelector::parse("*"),
+                Err(SelectorError::Wildcard),
+                "a `*` firehose scope MUST be rejected (bounded selector only)"
             );
-        }
-        // the firehose_frame_lag survival signal stays BOUNDED on the (stream,scope) row.
-        ctx.signals.set_labelled(
-            SignalName::FirehoseFrameLag,
-            vec![
-                Label::new("stream", "kn-ops".to_string()),
-                Label::new("scope", "board:hot".to_string()),
-            ],
-            selector.buffer().frame_lag() as i64,
-        );
+            // a 50k-row board subscribes to a bounded paginated WINDOW, never the whole board.
+            let sel = BoundedSelector::parse("board:hot").expect("a bounded board selector");
+            let window = ScopeWindow::new(10_000, 100, 50); // delivers rows [9_950, 10_150)
+                                                            // cap 8 → v1 floor: presence 2, agent 4, human 8. A high lag ceiling so the CLASS budgets fire
+                                                            // (the slow-consumer drop is the OTHER half, proven in drill_sub_d11_firehose_slow_consumer.rs).
+            let mut selector = FrameSelector::new("kn-ops", &sel, 8, 100_000, window);
 
-        // restore the injected fault before returning (a re-run starts clean).
-        ctx.breaker.restore_dependency(Dependency::Firehose, Scope::Global);
+            // ---- (load) flood the hot board with mixed-class frames on in-window + off-window rows. -------
+            // off-window rows (a 50k board's off-screen rows) are NOT delivered — bounded memory.
+            let mut out_of_window = 0u64;
+            for seq in 1..=40u64 {
+                // rows 0..40 are far below the window [9_950, …) → OutOfWindow.
+                if selector.offer(presence(seq), Some(seq)) == FrameOutcome::OutOfWindow {
+                    out_of_window += 1;
+                }
+            }
+            assert_eq!(
+                out_of_window, 40,
+                "off-screen board rows are never delivered (paginated slice)"
+            );
+            assert_eq!(
+                selector.buffer().buffered_frames(),
+                0,
+                "off-window frames cost no buffer memory"
+            );
 
-        // (assert) the presence lane's frame-shed budget fired (>= 1) — presence sheds before message
-        // delivery. The single telemetry assertion that reads green; the rest are asserted in the runner.
-        ctx.signals.assert_labelled(
-            SignalName::ShedCount,
-            vec![Label::new("lane", "presence".to_string())],
-            Predicate::Gte(1),
-        )
-    })
+            // in-window presence flood: the presence budget (2) fills, then presence sheds BY CLASS — while
+            // message (human) frames still have budget. (No deliveries → the class in-flight stays full.)
+            for seq in 100..=110u64 {
+                selector.offer(presence(seq), Some(10_050)); // an in-window row
+            }
+            // in-window human (message) frames still buffer — message delivery is shed LAST.
+            let mut human_buffered = 0u64;
+            for seq in 200..=203u64 {
+                if selector.offer(human(seq), Some(10_050)) == FrameOutcome::Buffered {
+                    human_buffered += 1;
+                }
+            }
+            // an agent frame: agents shed before humans (the agent budget is tighter than the human one).
+            selector.offer(agent(300), Some(10_050));
+
+            let presence_shed = selector.budget().shed_count(FrameClass::Presence);
+            let human_shed = selector.budget().shed_count(FrameClass::HumanDelivery);
+
+            // (assertions baked into the scenario) presence shed > 0 and BEFORE any human (message) shed.
+            assert!(
+                presence_shed >= 1,
+                "presence/speculative frames shed (the lowest budget fills first)"
+            );
+            assert_eq!(
+                human_shed, 0,
+                "message (human) frames are shed LAST (never class-shed here)"
+            );
+            assert!(
+                human_buffered >= 1,
+                "message frames still buffered while presence shed"
+            );
+
+            // (signals) export the §10.2 ShedCount-by-lane (frame budgets) signal, labelled by frame class.
+            for class in [
+                FrameClass::Presence,
+                FrameClass::AgentDelivery,
+                FrameClass::HumanDelivery,
+            ] {
+                ctx.signals.set_labelled(
+                    SignalName::ShedCount,
+                    vec![Label::new("lane", class.label().to_string())],
+                    selector.budget().shed_count(class) as i64,
+                );
+            }
+            // the firehose_frame_lag survival signal stays BOUNDED on the (stream,scope) row.
+            ctx.signals.set_labelled(
+                SignalName::FirehoseFrameLag,
+                vec![
+                    Label::new("stream", "kn-ops".to_string()),
+                    Label::new("scope", "board:hot".to_string()),
+                ],
+                selector.buffer().frame_lag() as i64,
+            );
+
+            // restore the injected fault before returning (a re-run starts clean).
+            ctx.breaker
+                .restore_dependency(Dependency::Firehose, Scope::Global);
+
+            // (assert) the presence lane's frame-shed budget fired (>= 1) — presence sheds before message
+            // delivery. The single telemetry assertion that reads green; the rest are asserted in the runner.
+            ctx.signals.assert_labelled(
+                SignalName::ShedCount,
+                vec![Label::new("lane", "presence".to_string())],
+                Predicate::Gte(1),
+            )
+        },
+    )
 }
 
 /// **THE SUB-D11-completion DRILL** — the dated green artifact the P-S29 GATE/DRILLS names. Register it
@@ -163,8 +188,13 @@ fn sub_d11_frame_shed_order_is_presence_before_message_green() {
         DrillResult::Pass { .. } => {
             // re-derive to assert the message-shed-last half explicitly.
             let sel = BoundedSelector::parse("board:hot").unwrap();
-            let mut selector =
-                FrameSelector::new("kn-ops", &sel, 8, 100_000, ScopeWindow::new(10_000, 100, 50));
+            let mut selector = FrameSelector::new(
+                "kn-ops",
+                &sel,
+                8,
+                100_000,
+                ScopeWindow::new(10_000, 100, 50),
+            );
             for seq in 100..=110u64 {
                 selector.offer(presence(seq), Some(10_050));
             }

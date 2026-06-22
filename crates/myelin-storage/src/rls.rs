@@ -235,7 +235,11 @@ mod tests {
     use myelin_identity::{PrincipalId, PrincipalKind};
 
     fn principal(tenant: &str) -> Principal {
-        Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId(tenant.into()))
+        Principal::stub(
+            PrincipalId("p".into()),
+            PrincipalKind::Human,
+            TenantId(tenant.into()),
+        )
     }
 
     /// THE IDOR-floor test: a read whose **token-tenant ≠ path-tenant** resolves to the
@@ -249,7 +253,10 @@ mod tests {
         // Effective tenant is the TOKEN's, never the path's.
         assert_eq!(resolved.tenant, TenantId("acme".into()));
         // 0 path-derived tenants — the survival-signal floor.
-        assert!(!resolved.path_derived, "the tenant must NEVER come from the path");
+        assert!(
+            !resolved.path_derived,
+            "the tenant must NEVER come from the path"
+        );
         // The attack was attempted and the guard held.
         assert!(resolved.attempted_path_mismatch);
     }
@@ -262,7 +269,10 @@ mod tests {
         let resolved = scope.resolve(Some(&TenantId("acme".into())));
         assert_eq!(resolved.tenant, TenantId("acme".into()));
         assert!(!resolved.path_derived);
-        assert!(!resolved.attempted_path_mismatch, "matching tenants are not a mismatch");
+        assert!(
+            !resolved.attempted_path_mismatch,
+            "matching tenants are not a mismatch"
+        );
     }
 
     /// The no-path case (an internal/RPC call with no URL path): resolves to the token's
@@ -280,7 +290,8 @@ mod tests {
     /// partition key is `(tenant, region)`, not tenant alone).
     #[test]
     fn scope_carries_tenant_and_region_from_token() {
-        let scope = TenantScope::from_verified_token(&principal("acme"), Region("eu-central".into()));
+        let scope =
+            TenantScope::from_verified_token(&principal("acme"), Region("eu-central".into()));
         assert_eq!(scope.tenant(), &TenantId("acme".into()));
         assert_eq!(scope.region(), &Region("eu-central".into()));
     }
@@ -292,9 +303,18 @@ mod tests {
         let scope = TenantScope::from_verified_token(&principal("acme"), Region("eu-west".into()));
         let q = TenantQuery::for_table(scope, TenantTable::new("issue"));
         let sql = q.predicate_sql();
-        assert!(sql.contains("tenant = 'acme'"), "predicate must pin the token tenant: {sql}");
-        assert!(sql.contains("region = 'eu-west'"), "predicate must pin the region: {sql}");
-        assert!(sql.starts_with("issue WHERE"), "predicate must target the declared table: {sql}");
+        assert!(
+            sql.contains("tenant = 'acme'"),
+            "predicate must pin the token tenant: {sql}"
+        );
+        assert!(
+            sql.contains("region = 'eu-west'"),
+            "predicate must pin the region: {sql}"
+        );
+        assert!(
+            sql.starts_with("issue WHERE"),
+            "predicate must target the declared table: {sql}"
+        );
     }
 
     /// A well-formed query validates green; the predicate is present by construction.
@@ -320,9 +340,18 @@ mod tests {
     #[test]
     fn rls_error_display_is_loud_and_specific() {
         let msg = RlsError::MissingTenantPredicate.to_string();
-        assert!(!msg.is_empty(), "an RLS violation must not render as an empty string");
-        assert!(msg.contains("(tenant, region)"), "must name the missing predicate: {msg}");
-        assert!(msg.contains("cross-tenant"), "must cite the §1.1 no-cross-tenant rule: {msg}");
+        assert!(
+            !msg.is_empty(),
+            "an RLS violation must not render as an empty string"
+        );
+        assert!(
+            msg.contains("(tenant, region)"),
+            "must name the missing predicate: {msg}"
+        );
+        assert!(
+            msg.contains("cross-tenant"),
+            "must cite the §1.1 no-cross-tenant rule: {msg}"
+        );
     }
 
     /// The query exposes its scope + table for the holder/relay paths that need them.

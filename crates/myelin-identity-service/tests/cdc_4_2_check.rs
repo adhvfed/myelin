@@ -170,7 +170,13 @@ fn cdc_4_2_caveat_gates_the_action() {
         attrs: bad,
     };
     assert!(
-        !write_path_gated_action(&svc, &subject("p:alice"), "view_field", &obj, Some(&cav_bad)),
+        !write_path_gated_action(
+            &svc,
+            &subject("p:alice"),
+            "view_field",
+            &obj,
+            Some(&cav_bad)
+        ),
         "a violated literal caveat refuses (the field is redacted)"
     );
 }
@@ -192,8 +198,14 @@ fn cdc_4_2_non_literal_caveat_gates_through_query_ast_core() {
     let predicate_keys = |severity: i64, threshold: i64| {
         let mut attrs = BTreeMap::new();
         attrs.insert("__caveat_op".to_string(), Literal::Str("lt".into()));
-        attrs.insert("__caveat_lhs_var".to_string(), Literal::Str("severity".into()));
-        attrs.insert("__caveat_rhs_var".to_string(), Literal::Str("threshold".into()));
+        attrs.insert(
+            "__caveat_lhs_var".to_string(),
+            Literal::Str("severity".into()),
+        );
+        attrs.insert(
+            "__caveat_rhs_var".to_string(),
+            Literal::Str("threshold".into()),
+        );
         attrs.insert("severity".to_string(), Literal::Int(severity));
         attrs.insert("threshold".to_string(), Literal::Int(threshold));
         CaveatContext {
@@ -214,7 +226,13 @@ fn cdc_4_2_non_literal_caveat_gates_through_query_ast_core() {
     // severity(8) < threshold(5) is false ⇒ redacted ⇒ refused.
     let cav_bad = predicate_keys(8, 5);
     assert!(
-        !write_path_gated_action(&svc, &subject("p:alice"), "view_field", &obj, Some(&cav_bad)),
+        !write_path_gated_action(
+            &svc,
+            &subject("p:alice"),
+            "view_field",
+            &obj,
+            Some(&cav_bad)
+        ),
         "a violated NON-LITERAL caveat redacts (the field is hidden)"
     );
 
@@ -222,8 +240,14 @@ fn cdc_4_2_non_literal_caveat_gates_through_query_ast_core() {
     // (missing context is never a silent allow — the mandatory-core branch, on the promoted core).
     let mut missing = BTreeMap::new();
     missing.insert("__caveat_op".to_string(), Literal::Str("lt".into()));
-    missing.insert("__caveat_lhs_var".to_string(), Literal::Str("severity".into()));
-    missing.insert("__caveat_rhs_var".to_string(), Literal::Str("threshold".into()));
+    missing.insert(
+        "__caveat_lhs_var".to_string(),
+        Literal::Str("severity".into()),
+    );
+    missing.insert(
+        "__caveat_rhs_var".to_string(),
+        Literal::Str("threshold".into()),
+    );
     // NOTE: neither `severity` nor `threshold` is supplied.
     let cav_missing = CaveatContext {
         object: obj.clone(),

@@ -30,7 +30,10 @@ fn blob(lines: &[&str]) -> Vec<u8> {
 }
 
 fn oid(tag: &str) -> String {
-    format!("blake3:{}", hex::encode(blake3::hash(tag.as_bytes()).as_bytes()))
+    format!(
+        "blake3:{}",
+        hex::encode(blake3::hash(tag.as_bytes()).as_bytes())
+    )
 }
 
 fn pr_root() -> ArtifactRef {
@@ -40,11 +43,19 @@ fn pr_root() -> ArtifactRef {
 /// **PROVIDER side** — git resolves a minted `#L<a>-L<b>` against a new blob into one of the four
 /// frozen states, threading the endpoints from the minted URN (the consumer-supplied ref) into the
 /// resolver. This is the exact path the Refs ladder calls.
-fn git_sub_resolve(minted: &ArtifactRef, anchor: &LineAnchor, new_blob: &[u8], new_oid: &str) -> AnchorState {
+fn git_sub_resolve(
+    minted: &ArtifactRef,
+    anchor: &LineAnchor,
+    new_blob: &[u8],
+    new_oid: &str,
+) -> AnchorState {
     // The consumer hands a minted #L<a>-L<b> ref — the resolver reads its endpoints (Refs owns the
     // grammar; git reads the parsed range) and they MUST equal the anchor's minted range.
     let range_from_urn = line_range_of(minted).expect("a minted #L<a>-L<b> carries a line range");
-    assert_eq!(range_from_urn, anchor.range, "the minted URN and the anchor agree on the range");
+    assert_eq!(
+        range_from_urn, anchor.range,
+        "the minted URN and the anchor agree on the range"
+    );
     resolve(anchor, new_blob, new_oid, &pr_root()).state
 }
 
@@ -54,17 +65,17 @@ fn git_sub_resolve(minted: &ArtifactRef, anchor: &LineAnchor, new_blob: &[u8], n
 #[test]
 fn cdc_5_7_git_resolver_returns_exactly_one_of_the_four_frozen_states() {
     let pre = blob(&[
-        "// module preamble",  // 1
-        "use std::io;",        // 2
-        "use std::fmt;",       // 3
-        "fn a() {",            // 4
-        "    step_one();",     // 5
-        "    step_two();",     // 6
-        "}",                   // 7
-        "",                    // 8
-        "fn doomed() {",       // 9
-        "    gone();",         // 10
-        "}",                   // 11
+        "// module preamble", // 1
+        "use std::io;",       // 2
+        "use std::fmt;",      // 3
+        "fn a() {",           // 4
+        "    step_one();",    // 5
+        "    step_two();",    // 6
+        "}",                  // 7
+        "",                   // 8
+        "fn doomed() {",      // 9
+        "    gone();",        // 10
+        "}",                  // 11
     ]);
     let pre_oid = oid("pre");
     let commit = oid("commit");
@@ -72,26 +83,68 @@ fn cdc_5_7_git_resolver_returns_exactly_one_of_the_four_frozen_states() {
     // ── LIVE: the blob is untouched. (anchored body = lines 5-6) ──
     {
         let minted = mint_blob_line_range("acme", "repo7", "main", "src/a.rs", 5, 6).unwrap();
-        let anchor = LineAnchor::mint(&pre, "src/a.rs", DiffSide::New, LineRange::new(5, 6), &pre_oid, &commit).unwrap();
-        assert_eq!(git_sub_resolve(&minted, &anchor, &pre, &pre_oid), AnchorState::Live);
+        let anchor = LineAnchor::mint(
+            &pre,
+            "src/a.rs",
+            DiffSide::New,
+            LineRange::new(5, 6),
+            &pre_oid,
+            &commit,
+        )
+        .unwrap();
+        assert_eq!(
+            git_sub_resolve(&minted, &anchor, &pre, &pre_oid),
+            AnchorState::Live
+        );
     }
 
     // ── MOVED: a block prepended above shifts the anchored body (+ its full context) intact. ──
     {
         let minted = mint_blob_line_range("acme", "repo7", "main", "src/a.rs", 5, 6).unwrap();
-        let anchor = LineAnchor::mint(&pre, "src/a.rs", DiffSide::New, LineRange::new(5, 6), &pre_oid, &commit).unwrap();
+        let anchor = LineAnchor::mint(
+            &pre,
+            "src/a.rs",
+            DiffSide::New,
+            LineRange::new(5, 6),
+            &pre_oid,
+            &commit,
+        )
+        .unwrap();
         let moved = blob(&[
-            "// header", "// header2", "// header3", "// header4", // prepend 4 — block + context travel intact
-            "// module preamble", "use std::io;", "use std::fmt;",
-            "fn a() {", "    step_one();", "    step_two();", "}", "", "fn doomed() {", "    gone();", "}",
+            "// header",
+            "// header2",
+            "// header3",
+            "// header4", // prepend 4 — block + context travel intact
+            "// module preamble",
+            "use std::io;",
+            "use std::fmt;",
+            "fn a() {",
+            "    step_one();",
+            "    step_two();",
+            "}",
+            "",
+            "fn doomed() {",
+            "    gone();",
+            "}",
         ]);
-        assert_eq!(git_sub_resolve(&minted, &anchor, &moved, &oid("moved")), AnchorState::Moved);
+        assert_eq!(
+            git_sub_resolve(&minted, &anchor, &moved, &oid("moved")),
+            AnchorState::Moved
+        );
     }
 
     // ── OUTDATED: one of two anchored lines survives, context perturbed. ──
     {
         let minted = mint_blob_line_range("acme", "repo7", "main", "src/a.rs", 5, 6).unwrap();
-        let anchor = LineAnchor::mint(&pre, "src/a.rs", DiffSide::New, LineRange::new(5, 6), &pre_oid, &commit).unwrap();
+        let anchor = LineAnchor::mint(
+            &pre,
+            "src/a.rs",
+            DiffSide::New,
+            LineRange::new(5, 6),
+            &pre_oid,
+            &commit,
+        )
+        .unwrap();
         let outdated = blob(&[
             "// module preamble",
             "use std::io;",
@@ -102,15 +155,37 @@ fn cdc_5_7_git_resolver_returns_exactly_one_of_the_four_frozen_states() {
             "    extra();",     // inserted
             "}",
         ]);
-        assert_eq!(git_sub_resolve(&minted, &anchor, &outdated, &oid("outdated")), AnchorState::Outdated);
+        assert_eq!(
+            git_sub_resolve(&minted, &anchor, &outdated, &oid("outdated")),
+            AnchorState::Outdated
+        );
     }
 
     // ── GONE: the whole `doomed` function deleted. (anchored body = lines 9-10) ──
     {
         let minted = mint_blob_line_range("acme", "repo7", "main", "src/a.rs", 9, 10).unwrap();
-        let anchor = LineAnchor::mint(&pre, "src/a.rs", DiffSide::New, LineRange::new(9, 10), &pre_oid, &commit).unwrap();
-        let gone = blob(&["// module preamble", "use std::io;", "use std::fmt;", "fn a() {", "    step_one();", "    step_two();", "}"]);
-        assert_eq!(git_sub_resolve(&minted, &anchor, &gone, &oid("gone")), AnchorState::Gone);
+        let anchor = LineAnchor::mint(
+            &pre,
+            "src/a.rs",
+            DiffSide::New,
+            LineRange::new(9, 10),
+            &pre_oid,
+            &commit,
+        )
+        .unwrap();
+        let gone = blob(&[
+            "// module preamble",
+            "use std::io;",
+            "use std::fmt;",
+            "fn a() {",
+            "    step_one();",
+            "    step_two();",
+            "}",
+        ]);
+        assert_eq!(
+            git_sub_resolve(&minted, &anchor, &gone, &oid("gone")),
+            AnchorState::Gone
+        );
     }
 }
 

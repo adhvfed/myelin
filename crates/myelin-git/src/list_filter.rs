@@ -655,10 +655,9 @@ impl AuthzVisibleIndex {
         lowered: &LoweredFilter,
         candidate: &str,
     ) -> bool {
-        eval_predicate(
-            &lowered.sql_predicate,
-            &mut |frag| self.frag_holds(tenant, region, viewer, lowered, frag, candidate),
-        )
+        eval_predicate(&lowered.sql_predicate, &mut |frag| {
+            self.frag_holds(tenant, region, viewer, lowered, frag, candidate)
+        })
     }
 
     /// Evaluate one LEAF predicate fragment (`TRUE`/`FALSE`/`<via> IN (…)`/`<via> NOT IN (…)`/

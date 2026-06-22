@@ -21,9 +21,9 @@
 //! invariant is structural: a denied ref maps to a [`Tombstone`](myelin_notif::Tombstone) with no
 //! `title` field.
 
-use myelin_git::git_resolve::GitRefResolver;
 use myelin_git::body::Body;
 use myelin_git::check_status::GateOutcome;
+use myelin_git::git_resolve::GitRefResolver;
 use myelin_git::lifecycle::PullRequest;
 use myelin_git::project::{git_pr_ref, ArtifactStore, Projector};
 use myelin_identity::{
@@ -38,7 +38,8 @@ use myelin_tenancy::{Region, TenantId};
 use std::collections::HashSet;
 
 /// The secret PR title of the REAL private Git repo — must NEVER appear for a denied viewer.
-const SECRET_PR_TITLE: &str = "fix: rotate the PROJECT-NIGHTFALL signing key before the acquisition";
+const SECRET_PR_TITLE: &str =
+    "fix: rotate the PROJECT-NIGHTFALL signing key before the acquisition";
 
 fn acme() -> TenantId {
     TenantId("acme".into())
@@ -57,13 +58,22 @@ fn viewer_in(id: &str, tenant: TenantId) -> Principal {
     )
 }
 fn strong(zk: &str) -> Consistency {
-    Consistency { at_least: Zookie(zk.into()), mode: ConsistencyMode::Strong }
+    Consistency {
+        at_least: Zookie(zk.into()),
+        mode: ConsistencyMode::Strong,
+    }
 }
 
 /// A REAL private PR in acme's repo. Only principals holding `view` (→ `repo->pull`) may see the title.
 fn private_pr() -> (ArtifactRef, PullRequest) {
     let pr_ref = git_pr_ref("acme", "repo7", 9);
-    let mut pr = PullRequest::open(9, "refs/heads/main", "refs/heads/feature", "psn:alice", false);
+    let mut pr = PullRequest::open(
+        9,
+        "refs/heads/main",
+        "refs/heads/feature",
+        "psn:alice",
+        false,
+    );
     pr.body = Body::new(SECRET_PR_TITLE, vec![]);
     (pr_ref, pr)
 }
@@ -76,10 +86,13 @@ struct StubId {
 }
 impl StubId {
     fn new() -> Self {
-        Self { allow: HashSet::new() }
+        Self {
+            allow: HashSet::new(),
+        }
     }
     fn grant(mut self, tenant: &TenantId, object: &ArtifactRef) -> Self {
-        self.allow.insert((tenant.0.clone(), format!("view@{}", object.0)));
+        self.allow
+            .insert((tenant.0.clone(), format!("view@{}", object.0)));
         self
     }
 }
@@ -96,7 +109,11 @@ impl IdentityService for StubId {
         _caveat: Option<&CaveatContext>,
     ) -> IdResult<Decision> {
         let key = (s.tenant.0.clone(), format!("{}@{}", permission.0, object.0));
-        Ok(if self.allow.contains(&key) { Decision::Allow } else { Decision::Deny })
+        Ok(if self.allow.contains(&key) {
+            Decision::Allow
+        } else {
+            Decision::Deny
+        })
     }
     fn list_objects(
         &self,
@@ -107,7 +124,12 @@ impl IdentityService for StubId {
     ) -> IdResult<ListObjectsResult> {
         Err(AuthzError::NotYetImplemented("n/a"))
     }
-    fn list_subjects(&self, _o: &ObjectId, _p: &Permission, _at: &Consistency) -> IdResult<SubjectTree> {
+    fn list_subjects(
+        &self,
+        _o: &ObjectId,
+        _p: &Permission,
+        _at: &Consistency,
+    ) -> IdResult<SubjectTree> {
         Err(AuthzError::NotYetImplemented("n/a"))
     }
     fn explain(
@@ -213,7 +235,10 @@ fn notif_d4_zero_leak_through_real_git_resolver() {
                 if h.text.contains("a restricted pr") {
                     tombstone_present += 1;
                 }
-                assert!(h.links.is_empty(), "a denied Git subject yields no click-route link");
+                assert!(
+                    h.links.is_empty(),
+                    "a denied Git subject yields no click-route link"
+                );
             }
         }
     }
@@ -250,8 +275,15 @@ fn notif_d4_permitted_viewer_sees_the_title() {
         &strong("zk-1"),
         Channel::Cli,
     );
-    assert!(h.text.contains(SECRET_PR_TITLE), "the permitted maintainer sees the PR title");
-    assert_eq!(h.links, vec![subject.0], "the allowed branch yields the click-route link");
+    assert!(
+        h.text.contains(SECRET_PR_TITLE),
+        "the permitted maintainer sees the PR title"
+    );
+    assert_eq!(
+        h.links,
+        vec![subject.0],
+        "the allowed branch yields the click-route link"
+    );
 }
 
 /// **GIT-D8 — cross-tenant unfurl denied through the real resolver (0 cross-tenant leak).** A viewer
@@ -261,7 +293,7 @@ fn notif_d4_permitted_viewer_sees_the_title() {
 #[test]
 fn git_d8_cross_tenant_unfurl_denied_through_real_resolver() {
     let (subject, _) = private_pr(); // home tenant: acme
-    // an acme "spy" WOULD be allowed — but the cross-tenant token below is a DIFFERENT tenant.
+                                     // an acme "spy" WOULD be allowed — but the cross-tenant token below is a DIFFERENT tenant.
     let resolver = resolver(StubId::new().grant(&acme(), &subject));
     let cross_tenant = viewer_in("spy", TenantId("evilcorp".into()));
 
@@ -284,10 +316,19 @@ fn git_d8_cross_tenant_unfurl_denied_through_real_resolver() {
             if contains_leak(&h.text) {
                 leak += 1;
             }
-            assert!(h.text.contains("a restricted pr"), "cross-tenant render is a tombstone");
-            assert!(h.links.is_empty(), "no click-route leaks across the tenant boundary");
+            assert!(
+                h.text.contains("a restricted pr"),
+                "cross-tenant render is a tombstone"
+            );
+            assert!(
+                h.links.is_empty(),
+                "no click-route leaks across the tenant boundary"
+            );
         }
     }
-    assert_eq!(leak, 0, "GIT-D8: 0 cross-tenant leak — the token tenant decides, the title never crosses");
+    assert_eq!(
+        leak, 0,
+        "GIT-D8: 0 cross-tenant leak — the token tenant decides, the title never crosses"
+    );
     eprintln!("GIT-D8 GREEN through the real resolver (2026-06-22): cross-tenant-leak-count = {leak} (threshold 0)");
 }

@@ -27,8 +27,8 @@ use myelin_events::{OutboxStore, Timestamp};
 use myelin_git::rebac_fragment::{self, object_types};
 use myelin_identity::{
     Consistency, ConsistencyMode, Decision, FragmentAdmit, IdentityService, NamespaceFragment,
-    ObjectId, ObjectType, Permission, Principal, PrincipalId, PrincipalKind, RelName, RelationTuple,
-    TupleDelta, Zookie,
+    ObjectId, ObjectType, Permission, Principal, PrincipalId, PrincipalKind, RelName,
+    RelationTuple, TupleDelta, Zookie,
 };
 use myelin_identity_service::{
     FragmentDef, NamespaceEngine, PermissionRule, StoreBackedCheck, TupleStore, Userset,
@@ -203,7 +203,11 @@ fn cdc_4_9_git_names_only_fragment_admits() {
 
     // The CONSUMER declares its fragment at build time (the frozen names-only carriers).
     let consumer_fragment: Vec<NamespaceFragment> = rebac_fragment::git_fragment();
-    assert_eq!(consumer_fragment.len(), 4, "repo + ref + pull_request + pr_comment");
+    assert_eq!(
+        consumer_fragment.len(),
+        4,
+        "repo + ref + pull_request + pr_comment"
+    );
 
     // The PROVIDER admits each. (The names-only ABI admits a permission whose name is also a
     // declared relation; the Git permissions are NOT relations, so the rich-rewrite path is the
@@ -259,21 +263,36 @@ fn cdc_4_9_git_rewrites_admit_and_resolve() {
             Ok(Decision::Allow)
         )
     };
-    assert!(can_pull(&subject("p:alice")), "a direct repo admin can pull");
+    assert!(
+        can_pull(&subject("p:alice")),
+        "a direct repo admin can pull"
+    );
     assert!(
         can_pull(&subject("p:carol")),
         "a project member inherits repo pull (parent_project->view)"
     );
-    assert!(!can_pull(&subject("p:bob")), "an outsider cannot pull (fail-closed)");
+    assert!(
+        !can_pull(&subject("p:bob")),
+        "an outsider cannot pull (fail-closed)"
+    );
 
     // protected_push = admin (the tighter merge/protected-ref gate): alice (admin) yes, carol no.
     let can_protected_push = |actor: &Principal| {
         matches!(
-            svc.check(actor, &Permission("protected_push".into()), &repo, &at_latest(), None),
+            svc.check(
+                actor,
+                &Permission("protected_push".into()),
+                &repo,
+                &at_latest(),
+                None
+            ),
             Ok(Decision::Allow)
         )
     };
-    assert!(can_protected_push(&subject("p:alice")), "admin → protected_push");
+    assert!(
+        can_protected_push(&subject("p:alice")),
+        "admin → protected_push"
+    );
     assert!(
         !can_protected_push(&subject("p:carol")),
         "a mere project reader does NOT get protected_push (it is admin-only, §5.2)"
@@ -287,7 +306,10 @@ fn cdc_4_9_git_rewrites_admit_and_resolve() {
 #[test]
 fn cdc_4_9_approve_untrusted_ci_is_a_plain_relation_check() {
     let s = scope("acme");
-    let svc = provider(&s, &[add("repo:core", "approve_untrusted_ci", "p:maintainer")]);
+    let svc = provider(
+        &s,
+        &[add("repo:core", "approve_untrusted_ci", "p:maintainer")],
+    );
     for def in git_fragment_defs_rich() {
         let _ = svc.admit_fragment_def(&def);
     }
@@ -304,8 +326,14 @@ fn cdc_4_9_approve_untrusted_ci_is_a_plain_relation_check() {
             Ok(Decision::Allow)
         )
     };
-    assert!(endorse(&subject("p:maintainer")), "a maintainer endorses an untrusted fork run");
-    assert!(!endorse(&subject("p:bob")), "an outsider cannot endorse (X-1, fail-closed)");
+    assert!(
+        endorse(&subject("p:maintainer")),
+        "a maintainer endorses an untrusted fork run"
+    );
+    assert!(
+        !endorse(&subject("p:bob")),
+        "an outsider cannot endorse (X-1, fail-closed)"
+    );
 }
 
 /// **The frozen Git fragment matches the architecture §5.2 relation set exactly.** A consumer-side
@@ -323,7 +351,10 @@ fn cdc_4_9_git_fragment_shape_is_frozen() {
         "approve_untrusted_ci",
         "watcher",
     ] {
-        assert!(repo.relations.contains(&RelName(r.into())), "repo declares `{r}`");
+        assert!(
+            repo.relations.contains(&RelName(r.into())),
+            "repo declares `{r}`"
+        );
     }
     // CODEOWNERS-as-relations on `ref`.
     assert!(rebac_fragment::ref_fragment()

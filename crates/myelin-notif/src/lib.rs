@@ -168,10 +168,10 @@ pub use holder::{
 };
 pub use humanise::{
     humanise, humanise_item, parse_markdown, reason_template_key, render_html, render_markdown,
-    render_message, render_plain, shared_platform_templates, tombstone_display, Channel, ContentDoc,
-    HumaniseTemplate, RefProjection, RefResolution, RefResolvePort, Span, TemplateStore, Tombstone,
-    TombstoneReason, DEFAULT_LOCALE, HUMANISE_RESOLVE_MODE, PLATFORM_DEFAULT_TEMPLATES,
-    PLATFORM_DEFAULT_TENANT,
+    render_message, render_plain, shared_platform_templates, tombstone_display, Channel,
+    ContentDoc, HumaniseTemplate, RefProjection, RefResolution, RefResolvePort, Span,
+    TemplateStore, Tombstone, TombstoneReason, DEFAULT_LOCALE, HUMANISE_RESOLVE_MODE,
+    PLATFORM_DEFAULT_TEMPLATES, PLATFORM_DEFAULT_TENANT,
 };
 pub use list_inbox::{
     list_inbox, list_inbox_ranked, subsystem_of, AllowAllAuthorize, Cursor, InboxFilter, InboxPage,
@@ -187,36 +187,34 @@ pub use ranking::{
     AffinitySource, DeterministicV1, ExplainTrace, NeutralAffinity, RankStrategy, RankedItem,
     PRIORITY_MAX, PRIORITY_MIN,
 };
+pub use read_fanout::{
+    read_fanout, subject_root_col, AmbientMarkerStore, ReadFanoutError, ReadFanoutMarker,
+    RelationalLeaf, ReverseIndexAnswer, RevisionWatermark, SyntheticReverseIndex,
+    WatcherResolvePort, SUBJECT_ROOT_TYPE, WATCHER_RELATION, WATCH_PERMISSION,
+};
+pub use read_state::{active_inbox, mark, mark_all_read, snooze, ReadState, ReadStateError};
 pub use reindex::{
     inbox_parity_hash, notif_scope, signal_snapshot_draft, signal_snapshot_subject, NotifReindexer,
     ReindexError as NotifReindexError, ReindexReceipt as NotifReindexReceipt, RetentionWindow,
     SignalReindexSource, DEFAULT_RETENTION_DAYS, NOTIF_OWNER_TOKEN, NOTIF_SNAPSHOT_TYPE,
 };
-pub use read_fanout::{
-    read_fanout, subject_root_col, AmbientMarkerStore, ReadFanoutError, ReadFanoutMarker,
-    RelationalLeaf, ReverseIndexAnswer, RevisionWatermark, SyntheticReverseIndex, WatcherResolvePort,
-    SUBJECT_ROOT_TYPE, WATCHER_RELATION, WATCH_PERMISSION,
-};
-pub use read_state::{
-    active_inbox, mark, mark_all_read, snooze, ReadState, ReadStateError,
-};
-pub use snooze_resurface::{
-    snooze_and_arm, snooze_timer_key, ResurfaceOutcome, SnoozeResurfacer, SNOOZE_TIMER_NS,
-};
 pub use router::{
     build_router, signal_subject_prefix, InboxProjection, RoutedInboxItem, SignalRouter,
     NOTIF_ESCALATION_ACKED, NOTIF_ITEM_CREATED, ROUTER_CONSUMER_NAME, SIGNAL_MENTIONS_KEY,
+};
+pub use snooze_resurface::{
+    snooze_and_arm, snooze_timer_key, ResurfaceOutcome, SnoozeResurfacer, SNOOZE_TIMER_NS,
 };
 pub use storm_control::{
     dedup_collapse_ratio_bps, is_self_notification, subject_root_of, Coalescer, RateConfig,
     StormContext, StormControl, StormDecision, StormPrefs, SuppressReason, TokenBucket,
 };
+pub use watch::{
+    cold_rebuild, cold_rebuild_item_ids, inbox_scope, inbox_stream, publish_inbox_frame,
+    watch_open, watch_resume, InboxFrame, InboxWatch, WatchOutcome,
+};
 pub use write_fanout::{
     extract_mentions, CapVerdict, HotSubjectCap, DEFAULT_HOT_SUBJECT_WRITE_CAP,
-};
-pub use watch::{
-    cold_rebuild, cold_rebuild_item_ids, inbox_scope, inbox_stream, publish_inbox_frame, watch_open,
-    watch_resume, InboxFrame, InboxWatch, WatchOutcome,
 };
 
 /// The service name (a PII-free label, the telemetry / trace / deployable identifier). The
@@ -468,7 +466,8 @@ pub fn notif_app_spec_with_router(
         // `build_router` binds the `sig.<tenant>.` whitelist through the sanctioned `consume`
         // (rule 3: rejects `*`/empty). A malformed/over-broad tenant is skipped loudly (it never
         // silently narrows to an over-broad subscription) — the shell still boots without it.
-        if let Ok(router) = router::build_router(tenant, inbox.clone(), outbox.clone(), dedup.clone())
+        if let Ok(router) =
+            router::build_router(tenant, inbox.clone(), outbox.clone(), dedup.clone())
         {
             consumers.push(ConsumerReg::new(router));
         }
@@ -533,7 +532,10 @@ mod tests {
             Readiness::NotReady,
             "readiness is FALSE until the migrate-complete gate lifts"
         );
-        assert!(r.startup_incomplete, "the not-ready reason names the startup (pre-migrate) gate");
+        assert!(
+            r.startup_incomplete,
+            "the not-ready reason names the startup (pre-migrate) gate"
+        );
         assert!(r.sheds(), "a not-ready instance sheds new traffic");
         assert_eq!(
             surface.liveness(),
@@ -574,13 +576,20 @@ mod tests {
     #[test]
     fn shell_carries_empty_consumer_seam_and_the_nine_table_data_model() {
         let spec = notif_app_spec(Config::default());
-        assert!(spec.consumers.is_empty(), "the Signal-consumer router is the NOTIF-P3 floor");
+        assert!(
+            spec.consumers.is_empty(),
+            "the Signal-consumer router is the NOTIF-P3 floor"
+        );
         assert_eq!(
             spec.migrations.0.len(),
             9,
             "the nine-table data model landed at NOTIF-P2 (P-180): the migration set is non-empty"
         );
-        assert_eq!(spec.migrations, migrations::migrations(), "the AppSpec wires the NOTIF-P2 set");
+        assert_eq!(
+            spec.migrations,
+            migrations::migrations(),
+            "the AppSpec wires the NOTIF-P2 set"
+        );
         assert_eq!(spec.name, SERVICE_NAME);
     }
 
@@ -599,7 +608,11 @@ mod tests {
         );
         assert_eq!(spec.name, SERVICE_NAME);
         // the wired spec STILL carries the nine-table data model + boots.
-        assert_eq!(spec.migrations.0.len(), 9, "the NOTIF-P2 data model is still wired");
+        assert_eq!(
+            spec.migrations.0.len(),
+            9,
+            "the NOTIF-P2 data model is still wired"
+        );
         let handle = boot(spec).expect("the router-wired notif spec boots under the harness");
         assert_eq!(
             handle.surfaces(),
@@ -619,7 +632,11 @@ mod tests {
     fn notif_app_spec_with_router_skips_overbroad_tenant_but_boots() {
         let tenants = [TenantId("acme".into()), TenantId("".into())]; // the empty tenant is invalid.
         let (spec, _inbox) = notif_app_spec_with_router(Config::default(), &tenants);
-        assert_eq!(spec.consumers.len(), 1, "only the valid tenant's router is wired (the empty one is skipped)");
+        assert_eq!(
+            spec.consumers.len(),
+            1,
+            "only the valid tenant's router is wired (the empty one is skipped)"
+        );
         boot(spec).expect("the shell still boots with the valid router");
     }
 }
@@ -681,10 +698,15 @@ mod carrier_conformance {
                 &self.region
             }
             fn send(&self, _message: &RedactedMessage, idem_key: &str) -> Receipt {
-                Receipt { idem_key: idem_key.to_string(), accepted: true }
+                Receipt {
+                    idem_key: idem_key.to_string(),
+                    accepted: true,
+                }
             }
         }
-        let adapter = InAppAdapter { region: myelin_tenancy::Region("fr-par".into()) };
+        let adapter = InAppAdapter {
+            region: myelin_tenancy::Region("fr-par".into()),
+        };
         let msg = RedactedMessage {
             rendered: HumanisedString {
                 text: "redacted".into(),
@@ -721,7 +743,10 @@ mod carrier_conformance {
             Reason::ApprovalRequested,
         ];
         // The class pierce-ordering: critical is the highest signal (pierces quiet-hours).
-        assert!(Class::Critical < Class::Fyi, "critical outranks fyi (the pierce ordering)");
+        assert!(
+            Class::Critical < Class::Fyi,
+            "critical outranks fyi (the pierce ordering)"
+        );
         assert!(Class::Direct < Class::Watching);
     }
 }

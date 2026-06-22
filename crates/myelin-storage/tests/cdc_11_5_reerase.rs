@@ -21,16 +21,16 @@
 //! backup's PIT is RESURRECTED by a restore of T, and the mandatory re-erasure pass re-kills it to 0
 //! recoverable — so the restore driver never marks a copy ready that un-erased a person.
 
+use myelin_gdpr::ErasureMethod;
+use myelin_storage::{
+    restore_to_offset, BlobPresence, BusErase, DekId, EpochMillis, ErasureLedgerSink, KeyClass,
+    PseudonymShred, RefsTombstone, SearchPurge, SourceLog,
+};
 use myelin_storage::{
     ColumnCryptor, ContinuousArchiver, EraseError, EraseHolders, ErasureRecord,
     InMemoryPostPitLedger, KekId, KmsEngine, PostRestoreErasureLedger, ReErasePass, ReEraseReport,
     SubjectId, WalSegment,
 };
-use myelin_storage::{
-    restore_to_offset, BlobPresence, BusErase, DekId, EpochMillis, ErasureLedgerSink, KeyClass,
-    PseudonymShred, RefsTombstone, SearchPurge, SourceLog,
-};
-use myelin_gdpr::ErasureMethod;
 use myelin_tenancy::{Region, TenantId};
 
 use std::cell::RefCell;
@@ -45,9 +45,17 @@ fn tenant(s: &str) -> TenantId {
 
 fn reachable_archiver(tail: u64) -> ContinuousArchiver {
     let mut arch = ContinuousArchiver::new();
-    arch.archive_segment(WalSegment { end_offset: 0, committed_at: 0 }).unwrap();
+    arch.archive_segment(WalSegment {
+        end_offset: 0,
+        committed_at: 0,
+    })
+    .unwrap();
     arch.take_base_backup(1);
-    arch.archive_segment(WalSegment { end_offset: tail, committed_at: 10 }).unwrap();
+    arch.archive_segment(WalSegment {
+        end_offset: tail,
+        committed_at: 10,
+    })
+    .unwrap();
     arch
 }
 
@@ -102,9 +110,15 @@ impl RestoreDriver {
         holders: &EraseHolders<'_>,
         now: EpochMillis,
     ) -> Result<ReEraseReport, EraseError> {
-        let report =
-            restore_to_offset(archiver, target, &[], &BlobPresence::new(), &SourceLog::new(), kms)
-                .expect("the restore lands");
+        let report = restore_to_offset(
+            archiver,
+            target,
+            &[],
+            &BlobPresence::new(),
+            &SourceLog::new(),
+            kms,
+        )
+        .expect("the restore lands");
         ReErasePass::new(kms, region()).run(&report, ledger, holders, now)
     }
 }
@@ -155,7 +169,10 @@ fn restore_driver_re_erases_a_post_pit_subject_to_zero_resurrected() {
     // The consumer-depended-on property: 0 resurrected → the copy is safe to mark ready.
     assert!(report.is_green(), "0 resurrected → ready");
     assert_eq!(report.resurrected_count, 0);
-    assert!(report.re_erased_subject(&subject, &t), "the post-PIT subject was re-erased");
+    assert!(
+        report.re_erased_subject(&subject, &t),
+        "the post-PIT subject was re-erased"
+    );
     // The resurrected DEK is gone from the restored copy.
     assert!(
         !kms.backup_snapshot().iter().any(|(d, _)| *d == subject_dek),
@@ -209,13 +226,8 @@ fn the_gate_run_with_reerase_greens_a_re_erased_restore() {
         erasure_ledger: &before_backup,
     };
 
-    let verdict = RestoreVerifyGate::new().run_with_reerase(
-        &inputs,
-        &post_pit,
-        &holders,
-        region(),
-        1_000,
-    );
+    let verdict =
+        RestoreVerifyGate::new().run_with_reerase(&inputs, &post_pit, &holders, region(), 1_000);
     assert!(
         verdict.is_green(),
         "the gate with re-erasure greens (0 resurrected), got {:?}",

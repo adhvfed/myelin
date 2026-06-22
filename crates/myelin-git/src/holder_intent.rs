@@ -128,7 +128,10 @@ impl HolderRegistration {
     /// cannot escape the holder registry: opening it produces this receipt. The DSR bodies are the
     /// GIT-P29 floor; the registration is real.
     pub fn auto_register() -> Self {
-        Self { holder_id: HOLDER_ID, registered: true }
+        Self {
+            holder_id: HOLDER_ID,
+            registered: true,
+        }
     }
 }
 

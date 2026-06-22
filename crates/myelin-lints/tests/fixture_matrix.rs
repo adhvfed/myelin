@@ -117,7 +117,10 @@ fn the_matrix_has_a_row_per_lint() {
     assert_eq!(rows.len(), 12, "the matrix must cover all twelve lints");
     let row_ids: Vec<LintId> = rows.iter().map(|r| r.id).collect();
     let lint_ids: Vec<LintId> = all_twelve().iter().map(|l| l.id).collect();
-    assert_eq!(row_ids, lint_ids, "matrix rows must match the twelve lints in order");
+    assert_eq!(
+        row_ids, lint_ids,
+        "matrix rows must match the twelve lints in order"
+    );
 }
 
 #[test]
@@ -234,7 +237,9 @@ fn eb08_write_path_red_fixture_is_rejected() {
          sync call), but found 0 violations"
     );
     assert!(
-        violations.iter().all(|v| v.lint == LintId("no-cross-sync-cycle")),
+        violations
+            .iter()
+            .all(|v| v.lint == LintId("no-cross-sync-cycle")),
         "every EB-08 red-fixture violation must carry the no-cross-sync-cycle id"
     );
 }
@@ -332,7 +337,9 @@ fn eb09_stream_scope_red_fixture_is_rejected() {
          subscribe), but found 0 violations"
     );
     assert!(
-        violations.iter().all(|v| v.lint == LintId("tenant-predicate")),
+        violations
+            .iter()
+            .all(|v| v.lint == LintId("tenant-predicate")),
         "every EB-09 red-fixture violation must carry the tenant-predicate id"
     );
 }
@@ -433,7 +440,11 @@ fn removing_any_lint_breaks_the_matrix() {
         // the reduced set → the gate is missing. (Each red fixture is crafted to trip exactly
         // one lint, asserted by `each_red_fixture_trips_exactly_its_own_lint`.)
         let full_violations = run(&all_twelve(), &red);
-        assert!(full_violations.is_err(), "full set must reject {}", dropped.red);
+        assert!(
+            full_violations.is_err(),
+            "full set must reject {}",
+            dropped.red
+        );
         let reduced_violations = run(&reduced, &red);
         assert!(
             reduced_violations.is_ok(),

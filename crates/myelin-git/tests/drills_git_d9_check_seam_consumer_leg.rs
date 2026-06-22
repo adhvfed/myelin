@@ -63,7 +63,10 @@ fn synthetic_check_updated(
         run_attempt: attempt,
         trust_tier: trust,
         details_ref: TArtifactRef("myelin://acme/ci/run/9#step-2".into()),
-        summary: HumanisedRef { template_key: "ci.check.updated".into(), args },
+        summary: HumanisedRef {
+            template_key: "ci.check.updated".into(),
+            args,
+        },
         started_at: GitTimestamp("2026-06-21T00:00:00Z".into()),
         completed_at: Some(GitTimestamp("2026-06-21T00:01:00Z".into())),
         cost_settled: true,
@@ -121,19 +124,30 @@ fn bind_consumer() -> Consumer<CheckStatusConsumer> {
 fn consumer_leg_is_idempotent_on_event_id_zero_dup() {
     let consumer = bind_consumer();
     let env = synthetic_check_updated("build", 1, CheckState::Success, TrustTier::Trusted);
-    let msg = Message { subject: CI_CHECK_UPDATED.into(), envelope: env };
+    let msg = Message {
+        subject: CI_CHECK_UPDATED.into(),
+        envelope: env,
+    };
 
     // First delivery — the handler runs, the fact is applied + acked.
     assert_eq!(consumer.deliver(&msg), Delivered::Acked);
     // The at-least-once transport RE-DELIVERS the same event_id — deduplicated, the handler is SKIPPED.
-    assert_eq!(consumer.deliver(&msg), Delivered::Deduplicated, "0 dup — handler runs once");
+    assert_eq!(
+        consumer.deliver(&msg),
+        Delivered::Deduplicated,
+        "0 dup — handler runs once"
+    );
     // A third redelivery is still deduplicated.
     assert_eq!(consumer.deliver(&msg), Delivered::Deduplicated);
 
     // The projection has exactly ONE row, and the handler applied exactly once.
     let proj = consumer.handler().projection();
     assert_eq!(proj.len(), 1);
-    assert_eq!(consumer.handler().applied_count(), 1, "the fact was applied exactly once");
+    assert_eq!(
+        consumer.handler().applied_count(),
+        1,
+        "the fact was applied exactly once"
+    );
     assert_eq!(consumer.handler().dropped_stale_count(), 0);
 }
 
@@ -166,7 +180,10 @@ fn consumer_leg_per_aggregate_ordered_supersession_drops_stale() {
             3 => &build2,
             _ => unreachable!(),
         };
-        let msg = Message { subject: CI_CHECK_UPDATED.into(), envelope: env.clone() };
+        let msg = Message {
+            subject: CI_CHECK_UPDATED.into(),
+            envelope: env.clone(),
+        };
         assert_eq!(consumer.deliver(&msg), Delivered::Acked);
     }
 
@@ -182,8 +199,15 @@ fn consumer_leg_per_aggregate_ordered_supersession_drops_stale() {
         context: CheckContext::ci("build"),
     };
     let row = proj.current(&build_key).expect("build row present");
-    assert_eq!(row.run_attempt, 2, "the current build row is the highest attempt");
-    assert_eq!(row.state, CheckState::Success, "the re-run success is current, not the stale failure");
+    assert_eq!(
+        row.run_attempt, 2,
+        "the current build row is the highest attempt"
+    );
+    assert_eq!(
+        row.state,
+        CheckState::Success,
+        "the re-run success is current, not the stale failure"
+    );
     // Two contexts → two rows; the supersession was in-place (no duplicate build row).
     assert_eq!(proj.len(), 2);
 
@@ -192,7 +216,10 @@ fn consumer_leg_per_aggregate_ordered_supersession_drops_stale() {
     let mut proj2 = handler.projection();
     assert_eq!(
         proj2.apply(&stale),
-        myelin_git::check_status::ApplyOutcome::DroppedStale { incoming_attempt: 1, current_attempt: 2 }
+        myelin_git::check_status::ApplyOutcome::DroppedStale {
+            incoming_attempt: 1,
+            current_attempt: 2
+        }
     );
 }
 
@@ -204,11 +231,17 @@ fn consumer_leg_dead_letters_a_malformed_payload() {
     let mut env = synthetic_check_updated("build", 1, CheckState::Success, TrustTier::Trusted);
     // Corrupt the opaque payload (not a valid CheckStatus fact).
     env.payload = serde_json::json!({ "garbage": true });
-    let msg = Message { subject: CI_CHECK_UPDATED.into(), envelope: env };
+    let msg = Message {
+        subject: CI_CHECK_UPDATED.into(),
+        envelope: env,
+    };
 
     match consumer.deliver(&msg) {
         Delivered::DeadLettered(reason) => {
-            assert!(reason.0.contains("CheckStatus"), "the dead-letter reason names the decode failure");
+            assert!(
+                reason.0.contains("CheckStatus"),
+                "the dead-letter reason names the decode failure"
+            );
         }
         other => panic!("a malformed payload must dead-letter, got {other:?}"),
     }

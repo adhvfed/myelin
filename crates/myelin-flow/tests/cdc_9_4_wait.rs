@@ -31,9 +31,7 @@
 //! the wait consumes it exactly once across a multi-day park + a re-drive (the provider side) — the
 //! §2.9 DAG-respecting seam (the consumer depends on the `DurableExecutor`/`WfCtx` traits).
 
-use myelin_events::{
-    Actor, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Timestamp,
-};
+use myelin_events::{Actor, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Timestamp};
 use myelin_flow::{
     approval_wait_name, drive_full, run_state, DriveOutcome, DurableExecutor, FlowExecutor,
     FlowTelemetry, RetryPolicy, RunRow, SignalOutcome, SignalSpec, StartSpec, WaitOutcome, WfCtx,
@@ -57,7 +55,11 @@ fn ctx_base() -> EmitContextBase {
     EmitContextBase {
         tenant: tenant(),
         region: region(),
-        actor: Actor(Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, tenant())),
+        actor: Actor(Principal::stub(
+            PrincipalId("p".into()),
+            PrincipalKind::Human,
+            tenant(),
+        )),
         schema_ver: 1,
         occurred_at: Timestamp("2026-06-21T00:00:00Z".into()),
         recorded_at: Timestamp("2026-06-21T00:00:01Z".into()),
@@ -88,9 +90,9 @@ fn waiting_body() -> Box<WorkflowBody> {
             .wait_for_signal(&approval_wait_name("call-1"), None)
             .map_err(|e| format!("{e:?}"))?
         {
-            WaitOutcome::Signalled { payload_key_ref, .. }
-                if payload_key_ref.as_deref() == Some(DECLINE_MARKER) =>
-            {
+            WaitOutcome::Signalled {
+                payload_key_ref, ..
+            } if payload_key_ref.as_deref() == Some(DECLINE_MARKER) => {
                 Ok(vec![]) // withheld (AG-8).
             }
             WaitOutcome::Signalled { .. } => ctx
@@ -114,8 +116,21 @@ fn drive_once(
     let row = ex.runs().get(&tenant(), &run.0).expect("the run row");
     let body = waiting_body();
     drive_full(
-        ex.runs(), outbox, journal, tele, minter(), ctx_base(), &row,
-        "2026-06-21T00:00:00Z", 7, body.as_ref(), 1, 1, None, Some(ex.signals().clone()), now_secs,
+        ex.runs(),
+        outbox,
+        journal,
+        tele,
+        minter(),
+        ctx_base(),
+        &row,
+        "2026-06-21T00:00:00Z",
+        7,
+        body.as_ref(),
+        1,
+        1,
+        None,
+        Some(ex.signals().clone()),
+        now_secs,
     )
 }
 
@@ -133,8 +148,15 @@ fn provider_wait_parks_then_consumes_a_buffered_signal_exactly_once() {
 
     // DRIVE 1: park (state=waiting holds no runtime — the PROVIDER promise).
     let o1 = drive_once(&ex, &journal, &outbox, &tele, &run, 1_000);
-    assert_eq!(o1, DriveOutcome::Waiting, "PROVIDER promise: the wait PARKS on an absent signal");
-    assert_eq!(ex.runs().get(&tenant(), &run.0).unwrap().state, run_state::WAITING);
+    assert_eq!(
+        o1,
+        DriveOutcome::Waiting,
+        "PROVIDER promise: the wait PARKS on an absent signal"
+    );
+    assert_eq!(
+        ex.runs().get(&tenant(), &run.0).unwrap().state,
+        run_state::WAITING
+    );
 
     // the HITL surface posts the approval (the CONSUMER side) — buffered once.
     ex.signal(SignalSpec {
@@ -145,12 +167,19 @@ fn provider_wait_parks_then_consumes_a_buffered_signal_exactly_once() {
         payload_key_ref: None,
     })
     .expect("approve");
-    assert_eq!(ex.signals().buffered_depth(), 1, "the approval is buffered (depth 1)");
+    assert_eq!(
+        ex.signals().buffered_depth(),
+        1,
+        "the approval is buffered (depth 1)"
+    );
 
     // DRIVE 2 (re-lease): resume + consume ONCE.
     ex.runs().wake(&tenant(), &run.0);
     let o2 = drive_once(&ex, &journal, &outbox, &tele, &run, 200_000);
-    assert!(matches!(o2, DriveOutcome::Completed(_)), "PROVIDER: the buffered signal resumes the run");
+    assert!(
+        matches!(o2, DriveOutcome::Completed(_)),
+        "PROVIDER: the buffered signal resumes the run"
+    );
     assert_eq!(
         ex.signals().buffered_depth(),
         0,
@@ -185,7 +214,11 @@ fn consumer_double_click_under_the_same_key_wakes_the_run_once() {
         .expect("post")
     };
     assert_eq!(post(), SignalOutcome::Buffered, "the first click buffered");
-    assert_eq!(post(), SignalOutcome::Duplicate, "the double-click is a no-op (ON CONFLICT DO NOTHING)");
+    assert_eq!(
+        post(),
+        SignalOutcome::Duplicate,
+        "the double-click is a no-op (ON CONFLICT DO NOTHING)"
+    );
     assert_eq!(
         ex.signals().count_for_run(&tenant(), &run.0),
         1,
@@ -195,8 +228,15 @@ fn consumer_double_click_under_the_same_key_wakes_the_run_once() {
     // the wait consumes the single buffered row ONCE — the run wakes once.
     ex.runs().wake(&tenant(), &run.0);
     let o2 = drive_once(&ex, &journal, &outbox, &tele, &run, 200_000);
-    assert!(matches!(o2, DriveOutcome::Completed(_)), "the run woke ONCE on the double-clicked approval");
-    assert_eq!(ex.signals().buffered_depth(), 0, "consume-exactly-once across the double-click");
+    assert!(
+        matches!(o2, DriveOutcome::Completed(_)),
+        "the run woke ONCE on the double-clicked approval"
+    );
+    assert_eq!(
+        ex.signals().buffered_depth(),
+        0,
+        "consume-exactly-once across the double-click"
+    );
 }
 
 /// **The two ends RECONCILE on a DENY: the HITL surface posts a decline → the wait consumes it →
@@ -228,13 +268,21 @@ fn the_decline_path_reconciles_to_zero_mutation() {
     // the wait consumes the decline → the body WITHHOLDS the tool (0 mutation).
     ex.runs().wake(&tenant(), &run.0);
     let o2 = drive_once(&ex, &journal, &outbox, &tele, &run, 200_000);
-    assert_eq!(o2, DriveOutcome::Completed(vec![]), "a DENY completes with NO effect (withheld)");
+    assert_eq!(
+        o2,
+        DriveOutcome::Completed(vec![]),
+        "a DENY completes with NO effect (withheld)"
+    );
     assert_eq!(
         outbox.committed_count(),
         emits_at_park,
         "RECONCILE: the consumer's decline → the provider's WITHHOLD → 0 mutation (AG-8)"
     );
-    assert_eq!(ex.signals().buffered_depth(), 0, "the decline was consumed once");
+    assert_eq!(
+        ex.signals().buffered_depth(),
+        0,
+        "the decline was consumed once"
+    );
 }
 
 /// **The provider's `cancel` wait is the SAME mechanism (9.4 names `cancel` alongside `approval`).** A
@@ -250,7 +298,10 @@ fn the_cancel_wait_rides_the_same_consume_once_mechanism() {
 
     // a body that waits on `cancel` (the §4.3 FROZEN name) instead of approval.
     let cancel_body: Box<WorkflowBody> = Box::new(|ctx: &mut WfCtx| {
-        match ctx.wait_for_signal("cancel", None).map_err(|e| format!("{e:?}"))? {
+        match ctx
+            .wait_for_signal("cancel", None)
+            .map_err(|e| format!("{e:?}"))?
+        {
             WaitOutcome::Signalled { .. } => Ok(vec![]), // the cancel arrived — the body unwinds.
             _ => Ok(vec![]),
         }
@@ -260,8 +311,21 @@ fn the_cancel_wait_rides_the_same_consume_once_mechanism() {
 
     // park on the cancel wait.
     let o1 = drive_full(
-        ex.runs(), &outbox, &journal, &tele, minter(), ctx_base(), &row,
-        "2026-06-21T00:00:00Z", 7, cancel_body.as_ref(), 1, 1, None, Some(ex.signals().clone()), 1_000,
+        ex.runs(),
+        &outbox,
+        &journal,
+        &tele,
+        minter(),
+        ctx_base(),
+        &row,
+        "2026-06-21T00:00:00Z",
+        7,
+        cancel_body.as_ref(),
+        1,
+        1,
+        None,
+        Some(ex.signals().clone()),
+        1_000,
     );
     assert_eq!(o1, DriveOutcome::Waiting, "the cancel wait parks");
 
@@ -277,9 +341,29 @@ fn the_cancel_wait_rides_the_same_consume_once_mechanism() {
     ex.runs().wake(&tenant(), &run.0);
     let row2 = ex.runs().get(&tenant(), &run.0).unwrap();
     let o2 = drive_full(
-        ex.runs(), &outbox, &journal, &tele, minter(), ctx_base(), &row2,
-        "2026-06-21T00:00:00Z", 7, cancel_body.as_ref(), 1, 1, None, Some(ex.signals().clone()), 2_000,
+        ex.runs(),
+        &outbox,
+        &journal,
+        &tele,
+        minter(),
+        ctx_base(),
+        &row2,
+        "2026-06-21T00:00:00Z",
+        7,
+        cancel_body.as_ref(),
+        1,
+        1,
+        None,
+        Some(ex.signals().clone()),
+        2_000,
     );
-    assert!(matches!(o2, DriveOutcome::Completed(_)), "the cancel wait resumes on the cancel signal");
-    assert_eq!(ex.signals().buffered_depth(), 0, "the cancel signal was consumed exactly once");
+    assert!(
+        matches!(o2, DriveOutcome::Completed(_)),
+        "the cancel wait resumes on the cancel signal"
+    );
+    assert_eq!(
+        ex.signals().buffered_depth(),
+        0,
+        "the cancel signal was consumed exactly once"
+    );
 }

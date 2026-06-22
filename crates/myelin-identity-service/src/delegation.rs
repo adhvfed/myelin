@@ -52,9 +52,7 @@
 
 use crate::check_engine::CheckEngine;
 use crate::machine_auth::Authority;
-use myelin_identity::{
-    Consistency, Decision, EffectivePolicy, Permission, Principal, RelName,
-};
+use myelin_identity::{Consistency, Decision, EffectivePolicy, Permission, Principal, RelName};
 use myelin_storage::TenantScope;
 use myelin_tenancy::ArtifactRef;
 
@@ -384,15 +382,28 @@ mod tests {
             &["b", "c", "d"],      // tenant guardrails
             &["a", "b", "c"],      // trigger actor holds what they delegate
         );
-        let (eff, proof) = algebra.delegation_proved(&agent_principal("p:agent"), &human("p:human"), &inp);
+        let (eff, proof) =
+            algebra.delegation_proved(&agent_principal("p:agent"), &human("p:human"), &inp);
         // effective = {a,b,c,d} ∩ ({a,b,c} ∩ {a,b,c}) ∩ {b,c,d} = {b,c}
         assert_eq!(eff.caveats, vec!["b".to_string(), "c".to_string()]);
-        assert!(proof.holds(), "the effective set is a subset of every conjunct (monotone)");
+        assert!(
+            proof.holds(),
+            "the effective set is a subset of every conjunct (monotone)"
+        );
 
         // Adding a TIGHTER tenant conjunct only narrows further (never grows).
-        let tighter = input(&["a", "b", "c", "d"], &["a", "b", "c"], &["b"], &["a", "b", "c"]);
+        let tighter = input(
+            &["a", "b", "c", "d"],
+            &["a", "b", "c"],
+            &["b"],
+            &["a", "b", "c"],
+        );
         let eff2 = algebra.delegation(&agent_principal("p:agent"), &human("p:human"), &tighter);
-        assert_eq!(eff2.caveats, vec!["b".to_string()], "a tighter conjunct narrows, never grows");
+        assert_eq!(
+            eff2.caveats,
+            vec!["b".to_string()],
+            "a tighter conjunct narrows, never grows"
+        );
         assert!(
             authority_of(&eff2).is_subset_of(&authority_of(&eff)),
             "adding/tightening a conjunct yields a SUBSET (monotone — never amplifies)"
@@ -410,7 +421,11 @@ mod tests {
         let inp = input(
             &["repo:acme/web#read", "repo:acme/web#write"], // agent ceiling
             &["repo:acme/web#read", "repo:acme/api#read"],  // delegated chain link
-            &["repo:acme/web#read", "repo:acme/web#write", "repo:acme/api#read"], // tenant
+            &[
+                "repo:acme/web#read",
+                "repo:acme/web#write",
+                "repo:acme/api#read",
+            ], // tenant
             &["repo:acme/web#read", "repo:acme/api#read"],  // delegator holds the chain
         );
         let eff = algebra.delegation(&agent_principal("p:agent"), &human("p:human"), &inp);
@@ -452,7 +467,7 @@ mod tests {
             &["repo:acme/web#read", "repo:acme/web#write"], // agent ceiling unchanged
             &["repo:acme/web#read", "repo:acme/web#write"], // delegation chain unchanged
             &["repo:acme/web#read", "repo:acme/web#write"], // tenant unchanged
-            &["repo:acme/web#read"],                        // delegator HELD set shrank (#write revoked)
+            &["repo:acme/web#read"], // delegator HELD set shrank (#write revoked)
         );
         let eff_after = algebra.delegation(&agent, &delegator, &after);
         assert!(
@@ -477,8 +492,12 @@ mod tests {
             &["repo:acme/web#admin"], // tenant allows admin
             &["repo:acme/web#read"],  // but the delegator never HELD admin
         );
-        let (eff, proof) = algebra.delegation_proved(&agent_principal("p:agent"), &human("p:human"), &inp);
-        assert!(eff.caveats.is_empty(), "a grant the delegator never held is never delegated");
+        let (eff, proof) =
+            algebra.delegation_proved(&agent_principal("p:agent"), &human("p:human"), &inp);
+        assert!(
+            eff.caveats.is_empty(),
+            "a grant the delegator never held is never delegated"
+        );
         assert!(proof.holds());
         assert!(
             proof.delegated_after_recheck.is_empty(),
@@ -497,10 +516,10 @@ mod tests {
         let cases: &[ConjunctCase] = &[
             (&["a", "b"], &["a", "b", "c"], &["a", "b"], &["a", "b", "c"]),
             (&["a", "b", "c"], &["b"], &["a", "b", "c"], &["b"]),
-            (&[], &["a"], &["a"], &["a"]),       // empty agent ceiling ⇒ empty effective
-            (&["a"], &[], &["a"], &["a"]),       // empty delegation ⇒ empty effective
-            (&["a"], &["a"], &[], &["a"]),       // empty tenant guardrail ⇒ empty effective
-            (&["a"], &["a"], &["a"], &[]),       // delegator holds nothing ⇒ empty effective
+            (&[], &["a"], &["a"], &["a"]), // empty agent ceiling ⇒ empty effective
+            (&["a"], &[], &["a"], &["a"]), // empty delegation ⇒ empty effective
+            (&["a"], &["a"], &[], &["a"]), // empty tenant guardrail ⇒ empty effective
+            (&["a"], &["a"], &["a"], &[]), // delegator holds nothing ⇒ empty effective
             (&["x", "y"], &["x", "y"], &["x", "y"], &["x", "y"]), // all equal ⇒ {x,y}
         ];
         for (agent, deleg, tenant, held) in cases {
@@ -519,7 +538,11 @@ mod tests {
         let algebra = DelegationAlgebra::new();
         let inp = input(&["a", "b"], &["b", "c"], &["b", "d"], &["b", "c"]);
         let eff = algebra.delegation(&agent_principal("p:agent"), &human("p:human"), &inp);
-        assert_eq!(eff.caveats, vec!["b".to_string()], "the effective set is the intersection {{b}}");
+        assert_eq!(
+            eff.caveats,
+            vec!["b".to_string()],
+            "the effective set is the intersection {{b}}"
+        );
     }
 
     /// **The frozen `EffectivePolicy` carrier round-trips (the contract-4.5 wire shape).** The
@@ -530,8 +553,15 @@ mod tests {
         let a = auth(&["c:3", "a:1", "b:2"]);
         let policy = effective_policy_of(&a);
         // The carrier is the sorted grant list (BTreeSet order) — deterministic bytes.
-        assert_eq!(policy.caveats, vec!["a:1".to_string(), "b:2".to_string(), "c:3".to_string()]);
-        assert_eq!(authority_of(&policy), a, "the carrier round-trips to the same authority");
+        assert_eq!(
+            policy.caveats,
+            vec!["a:1".to_string(), "b:2".to_string(), "c:3".to_string()]
+        );
+        assert_eq!(
+            authority_of(&policy),
+            a,
+            "the carrier round-trips to the same authority"
+        );
         assert_eq!(EFFECTIVE_GRANT_CARRIER, "grant");
     }
 
@@ -590,7 +620,11 @@ mod tests {
             &obj,
             &at,
         );
-        assert_eq!(d, Decision::Allow, "grant in the intersection + object check pass ⇒ Allow");
+        assert_eq!(
+            d,
+            Decision::Allow,
+            "grant in the intersection + object check pass ⇒ Allow"
+        );
 
         // A grant OUTSIDE the effective intersection → Deny (the agent cannot exceed the composed policy).
         let d_cap = algebra.delegation_with_check(
@@ -603,7 +637,11 @@ mod tests {
             &obj,
             &at,
         );
-        assert_eq!(d_cap, Decision::Deny, "a grant outside the intersection is refused");
+        assert_eq!(
+            d_cap,
+            Decision::Deny,
+            "a grant outside the intersection is refused"
+        );
 
         // The capability holds, but the object check fails (the agent has no `delete` relation) → Deny.
         let d_obj = algebra.delegation_with_check(
@@ -616,7 +654,11 @@ mod tests {
             &obj,
             &at,
         );
-        assert_eq!(d_obj, Decision::Deny, "a failed object check refuses (fail-closed)");
+        assert_eq!(
+            d_obj,
+            Decision::Deny,
+            "a failed object check refuses (fail-closed)"
+        );
     }
 
     /// **Without a wired engine, the four-conjunct check fails closed.** The pure-algebra surface has
@@ -641,6 +683,10 @@ mod tests {
             &ArtifactRef("myelin://acme/git/repo/repo:core".into()),
             &at,
         );
-        assert_eq!(d, Decision::Deny, "no object-check engine ⇒ fail-closed Deny");
+        assert_eq!(
+            d,
+            Decision::Deny,
+            "no object-check engine ⇒ fail-closed Deny"
+        );
     }
 }

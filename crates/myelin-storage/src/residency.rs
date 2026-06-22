@@ -177,7 +177,10 @@ impl RegionPinnedStore {
     /// Construct a store pinned to `region` (the cell's region — the `residency-pin` the harness
     /// injects at store open, closing the M0 region-less-pool floor). The pin is immutable.
     pub fn pinned_to(store_class: ResidencyStoreClass, region: Region) -> RegionPinnedStore {
-        RegionPinnedStore { store_class, region }
+        RegionPinnedStore {
+            store_class,
+            region,
+        }
     }
 
     /// The store class.
@@ -554,7 +557,9 @@ mod tests {
                 row_region: Region::new("eu-central"),
             }
         );
-        assert!(err.to_string().contains("no store ever writes outside its region"));
+        assert!(err
+            .to_string()
+            .contains("no store ever writes outside its region"));
     }
 
     /// **The admin path attests the tenant's SINGLE region across every M1 store (the green leg).**
@@ -572,11 +577,22 @@ mod tests {
         // Every M1 store class is present, store-class-ordered, all reporting the single region.
         assert_eq!(att.store_regions.len(), ResidencyStoreClass::M1_SET.len());
         for (class, r) in &att.store_regions {
-            assert_eq!(r.as_str(), "fr-par", "store `{}` reports the tenant's single region", class.label());
+            assert_eq!(
+                r.as_str(),
+                "fr-par",
+                "store `{}` reports the tenant's single region",
+                class.label()
+            );
         }
         let signal = ResidencyVerifySignal::green(&att);
-        assert_eq!(signal.cross_region_egress, 0, "the green STOR-D5 artifact is 0 cross-region egress");
-        assert_eq!(signal.stores_attested, ResidencyStoreClass::M1_SET.len() as u32);
+        assert_eq!(
+            signal.cross_region_egress, 0,
+            "the green STOR-D5 artifact is 0 cross-region egress"
+        );
+        assert_eq!(
+            signal.stores_attested,
+            ResidencyStoreClass::M1_SET.len() as u32
+        );
     }
 
     /// **THE STOR-D5 FAIL LEG (no silent pass, EI-01 §3): a cross-region store FAILS the
@@ -604,8 +620,14 @@ mod tests {
                 store_region: Region::new("eu-north"),
             }
         );
-        assert!(err.to_string().contains("no-global-pool"), "loud reason: {err}");
-        assert!(err.to_string().contains("not a silent pass"), "loud reason: {err}");
+        assert!(
+            err.to_string().contains("no-global-pool"),
+            "loud reason: {err}"
+        );
+        assert!(
+            err.to_string().contains("not a silent pass"),
+            "loud reason: {err}"
+        );
     }
 
     /// **A missing M1 store report FAILS fail-closed (a silently-absent store is the global-pool).**
@@ -629,7 +651,10 @@ mod tests {
                 store_class: ResidencyStoreClass::Kms,
             }
         );
-        assert!(err.to_string().contains("fail-closed"), "loud reason: {err}");
+        assert!(
+            err.to_string().contains("fail-closed"),
+            "loud reason: {err}"
+        );
         // The RED signal: 0 egress but NOT all stores attested (so a missing store is not a silent green).
         let red = ResidencyVerifySignal::red(tenant(), region, 3, 0);
         assert!(
@@ -643,8 +668,15 @@ mod tests {
     /// redefinition — and so it matches the control plane's `residency_verify` M1 set byte-for-byte.
     #[test]
     fn the_m1_store_set_is_oltp_blob_index_kms() {
-        assert_eq!(ResidencyStoreClass::M1_SET.len(), 4, "the M1 set is OLTP/blob/index/KMS");
-        let labels: Vec<&str> = ResidencyStoreClass::M1_SET.iter().map(|c| c.label()).collect();
+        assert_eq!(
+            ResidencyStoreClass::M1_SET.len(),
+            4,
+            "the M1 set is OLTP/blob/index/KMS"
+        );
+        let labels: Vec<&str> = ResidencyStoreClass::M1_SET
+            .iter()
+            .map(|c| c.label())
+            .collect();
         assert_eq!(labels, vec!["oltp", "blob", "index_search", "kms"]);
     }
 

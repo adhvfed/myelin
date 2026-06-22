@@ -23,9 +23,7 @@
 //! reserve-reject-rate (`> 0`) and the in-flight-interrupt count (`== 0`) — a typed green/red that is
 //! never a swallowed pass (EI-01 §3).
 
-use myelin_events::{
-    Actor, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Timestamp,
-};
+use myelin_events::{Actor, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Timestamp};
 use myelin_flow::{
     BudgetGate, FlowTelemetry, JobKind, JobOutcome, JobRunner, JobSpec, RetryPolicy, SignalStore,
     Wallet, WfCtx, WfError, WfJournal,
@@ -51,7 +49,11 @@ fn ctx_base() -> EmitContextBase {
     EmitContextBase {
         tenant: tenant(),
         region: region(),
-        actor: Actor(Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, tenant())),
+        actor: Actor(Principal::stub(
+            PrincipalId("p".into()),
+            PrincipalKind::Human,
+            tenant(),
+        )),
         schema_ver: 1,
         occurred_at: Timestamp("2026-06-21T00:00:00Z".into()),
         recorded_at: Timestamp("2026-06-21T00:00:01Z".into()),
@@ -101,14 +103,24 @@ fn drill_flow_d6_runaway_activity_loop_refused_when_exhausted_inflight_never_int
     // (1) INJECT the runaway condition: the loop is "broken open" (it keeps feeding itself). The SAME
     //     tenant-scoped Broker seam BUS-D4 / FLOW-D5 use.
     breaker.break_dependency(Dependency::Broker, scope.clone());
-    assert!(breaker.is_broken(&Dependency::Broker, &scope), "the runaway loop is injected");
+    assert!(
+        breaker.is_broken(&Dependency::Broker, &scope),
+        "the runaway loop is injected"
+    );
 
     let ran = Arc::new(AtomicUsize::new(0));
     let mut refused = 0u32;
     let mut admitted = 0u32;
 
     let mut ctx = WfCtx::begin(
-        &outbox, minter(), journal, ctx_base(), "R1", "agent.run", "2026-06-21T00:00:00Z", 7,
+        &outbox,
+        minter(),
+        journal,
+        ctx_base(),
+        "R1",
+        "agent.run",
+        "2026-06-21T00:00:00Z",
+        7,
     )
     .with_budget(gate.clone());
 
@@ -132,26 +144,49 @@ fn drill_flow_d6_runaway_activity_loop_refused_when_exhausted_inflight_never_int
     }
 
     // (3) ASSERT the green artifact via the M0 assertion library.
-    assert_eq!(admitted, 3, "exactly 3 funded dispatches admitted (300 / 100)");
-    assert_eq!(refused, 7, "the remaining 7 were REFUSED at reserve (no balance → no dispatch)");
-    assert_eq!(ran.load(Ordering::SeqCst), 3, "ONLY the 3 funded activities ran (the 7 never started)");
+    assert_eq!(
+        admitted, 3,
+        "exactly 3 funded dispatches admitted (300 / 100)"
+    );
+    assert_eq!(
+        refused, 7,
+        "the remaining 7 were REFUSED at reserve (no balance → no dispatch)"
+    );
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        3,
+        "ONLY the 3 funded activities ran (the 7 never started)"
+    );
     assert_eq!(gate.balance(), MinorUnits::ZERO, "the wallet is exhausted");
 
     let mut signals = SignalSource::new();
     // reserve-reject count > 0 (the depleting wallet refused new dispatches) — the headline green.
-    signals.set_scalar(myelin_harness::SignalName::ShedCount, telemetry.reserve_rejected() as i64);
+    signals.set_scalar(
+        myelin_harness::SignalName::ShedCount,
+        telemetry.reserve_rejected() as i64,
+    );
     signals
         .assert_signal(myelin_harness::SignalName::ShedCount, Predicate::Gte(1))
         .expect_green();
     // the in-flight-interrupt counter == 0 (the headline zero — no running activity torn down).
-    signals.set_scalar(myelin_harness::SignalName::CausalDepthFirings, gate.inflight_interrupt_count() as i64);
+    signals.set_scalar(
+        myelin_harness::SignalName::CausalDepthFirings,
+        gate.inflight_interrupt_count() as i64,
+    );
     signals
-        .assert_signal(myelin_harness::SignalName::CausalDepthFirings, Predicate::Eq(0))
+        .assert_signal(
+            myelin_harness::SignalName::CausalDepthFirings,
+            Predicate::Eq(0),
+        )
         .expect_green();
 
     assert_eq!(telemetry.reserve_attempted(), 10, "10 reserve attempts");
     assert_eq!(telemetry.reserve_rejected(), 7, "7 refused");
-    assert_eq!(telemetry.reserve_reject_rate_bps(), 7_000, "70% reject rate (7/10)");
+    assert_eq!(
+        telemetry.reserve_reject_rate_bps(),
+        7_000,
+        "70% reject rate (7/10)"
+    );
 
     breaker.restore_dependency(Dependency::Broker, scope.clone());
     assert_eq!(breaker.broken_count(), 0, "no leaked break");
@@ -206,8 +241,14 @@ fn drill_flow_d6_runaway_dispatch_loop_refused_when_exhausted_runner_never_calle
         });
 
         let mut ctx = WfCtx::begin(
-            &outbox, minter(), journal.clone(), ctx_base(), run_id, "agent.run",
-            "2026-06-21T00:00:00Z", 7,
+            &outbox,
+            minter(),
+            journal.clone(),
+            ctx_base(),
+            run_id,
+            "agent.run",
+            "2026-06-21T00:00:00Z",
+            7,
         )
         .with_signals(signals_store.clone())
         .with_budget(gate.clone());
@@ -226,16 +267,38 @@ fn drill_flow_d6_runaway_dispatch_loop_refused_when_exhausted_runner_never_calle
         }
     }
 
-    assert_eq!(completed, 2, "exactly 2 funded job dispatches completed (400 / 200)");
+    assert_eq!(
+        completed, 2,
+        "exactly 2 funded job dispatches completed (400 / 200)"
+    );
     assert_eq!(refused, 4, "the remaining 4 were REFUSED at reserve");
-    assert_eq!(runner.calls.load(Ordering::SeqCst), 2, "the runner was called ONLY for the 2 funded jobs");
-    assert_eq!(gate.balance(), MinorUnits::ZERO, "the wallet is exhausted (2 × 200 drawn)");
+    assert_eq!(
+        runner.calls.load(Ordering::SeqCst),
+        2,
+        "the runner was called ONLY for the 2 funded jobs"
+    );
+    assert_eq!(
+        gate.balance(),
+        MinorUnits::ZERO,
+        "the wallet is exhausted (2 × 200 drawn)"
+    );
 
     let mut sig = SignalSource::new();
-    sig.set_scalar(myelin_harness::SignalName::ShedCount, telemetry.reserve_rejected() as i64);
-    sig.assert_signal(myelin_harness::SignalName::ShedCount, Predicate::Gte(1)).expect_green();
-    sig.set_scalar(myelin_harness::SignalName::CausalDepthFirings, gate.inflight_interrupt_count() as i64);
-    sig.assert_signal(myelin_harness::SignalName::CausalDepthFirings, Predicate::Eq(0)).expect_green();
+    sig.set_scalar(
+        myelin_harness::SignalName::ShedCount,
+        telemetry.reserve_rejected() as i64,
+    );
+    sig.assert_signal(myelin_harness::SignalName::ShedCount, Predicate::Gte(1))
+        .expect_green();
+    sig.set_scalar(
+        myelin_harness::SignalName::CausalDepthFirings,
+        gate.inflight_interrupt_count() as i64,
+    );
+    sig.assert_signal(
+        myelin_harness::SignalName::CausalDepthFirings,
+        Predicate::Eq(0),
+    )
+    .expect_green();
 
     breaker.restore_dependency(Dependency::Broker, scope);
     println!(

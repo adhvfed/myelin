@@ -63,13 +63,13 @@ use myelin_agent::{ToolDef, ToolName};
 pub fn requires_approval_default(subsystem: &str, tool: &str) -> bool {
     match (subsystem, tool) {
         // ── CI (§6.3) ──
-        ("ci", "deploy") => true,         // protected-env deploy is consequential
+        ("ci", "deploy") => true, // protected-env deploy is consequential
         ("ci", "approve_deploy") => true, // approval is privileged
-        ("ci", "write_secret") => true,   // secret write is privileged
-        ("ci", "run_pipeline") => false,  // non-prod: cheap, reversible, metered
+        ("ci", "write_secret") => true, // secret write is privileged
+        ("ci", "run_pipeline") => false, // non-prod: cheap, reversible, metered
 
         // ── Git (§6.3) ──
-        ("git", "merge") => true,    // merge is the consequential gate (AG-8)
+        ("git", "merge") => true, // merge is the consequential gate (AG-8)
         ("git", "open_pr") => false, // reversible
         // The AGENT AUTHOR/REVIEWER surface (GIT-P28 → P-289, §7 frozen ToolDef table). Agents are
         // FIRST-CLASS authors/reviewers (legible, bounded): every one of these is REVERSIBLE/advisory
@@ -77,8 +77,8 @@ pub fn requires_approval_default(subsystem: &str, tool: &str) -> bool {
         // §6.3 default is NOT gated (suggest-by-default, VISION §3). The ONLY consequential git gate
         // stays `git.merge` (yes, above). Legibility (ADR-08 AI-Act: an agent author is never disguised
         // as human) is carried by `myelin_git::agent_author`, not by the approval gate.
-        ("git", "comment") => false,        // inline/thread comment (agent legibly labelled)
-        ("git", "submit_review") => false,  // approve / request-changes / comment review
+        ("git", "comment") => false, // inline/thread comment (agent legibly labelled)
+        ("git", "submit_review") => false, // approve / request-changes / comment review
         ("git", "suggest_change") => false, // a committable suggestion (reversible)
         ("git", "resolve_thread") => false, // resolve a review thread (reversible)
         // The CODE-EXECUTING git tools (GIT-P27 → P-283, §7). history_rewrite is the audited
@@ -100,10 +100,10 @@ pub fn requires_approval_default(subsystem: &str, tool: &str) -> bool {
         ("issues", "transition") => true,
 
         // ── Knowledge (§6.3) ──
-        ("knowledge", "publish") => true,          // publishing is consequential (approver set)
+        ("knowledge", "publish") => true, // publishing is consequential (approver set)
         ("knowledge", "edit_confidential") => true, // confidential edit is consequential
-        ("knowledge", "draft") => false,           // reversible
-        ("knowledge", "comment") => false,         // reversible
+        ("knowledge", "draft") => false,  // reversible
+        ("knowledge", "comment") => false, // reversible
 
         // ── Chat (§6.3) ──
         ("chat", "post_message") => false, // reversible, cheap
@@ -267,14 +267,32 @@ mod tests {
     #[test]
     fn the_frozen_6_3_defaults_table_is_seeded_verbatim() {
         // CI — deploy/secret/approval = yes; non-prod pipeline = no.
-        assert!(requires_approval_default("ci", "deploy"), "CI deploy is gated (consequential)");
-        assert!(requires_approval_default("ci", "approve_deploy"), "CI approve_deploy is gated");
-        assert!(requires_approval_default("ci", "write_secret"), "CI write_secret is gated");
-        assert!(!requires_approval_default("ci", "run_pipeline"), "CI non-prod pipeline is NOT gated");
+        assert!(
+            requires_approval_default("ci", "deploy"),
+            "CI deploy is gated (consequential)"
+        );
+        assert!(
+            requires_approval_default("ci", "approve_deploy"),
+            "CI approve_deploy is gated"
+        );
+        assert!(
+            requires_approval_default("ci", "write_secret"),
+            "CI write_secret is gated"
+        );
+        assert!(
+            !requires_approval_default("ci", "run_pipeline"),
+            "CI non-prod pipeline is NOT gated"
+        );
 
         // Git — merge = yes, open_pr = no.
-        assert!(requires_approval_default("git", "merge"), "git.merge is gated (AG-8)");
-        assert!(!requires_approval_default("git", "open_pr"), "open_pr is reversible → NOT gated");
+        assert!(
+            requires_approval_default("git", "merge"),
+            "git.merge is gated (AG-8)"
+        );
+        assert!(
+            !requires_approval_default("git", "open_pr"),
+            "open_pr is reversible → NOT gated"
+        );
         // Git code-executing tools (GIT-P27 → P-283) — history_rewrite = yes (consequential erasure
         // -admin op), scip_index = no (read-only code-intelligence index build).
         assert!(
@@ -288,7 +306,10 @@ mod tests {
 
         // Git agent author/reviewer surface (GIT-P28 → P-289) — every authoring tool is reversible →
         // NOT gated (suggest-by-default); only git.merge stays the consequential gate.
-        assert!(!requires_approval_default("git", "comment"), "git.comment is reversible → NOT gated");
+        assert!(
+            !requires_approval_default("git", "comment"),
+            "git.comment is reversible → NOT gated"
+        );
         assert!(
             !requires_approval_default("git", "submit_review"),
             "git.submit_review is reversible → NOT gated"
@@ -303,20 +324,50 @@ mod tests {
         );
 
         // Issues — forecast/triage/sla_draft = no (advisory); transition = gated (ABAC floor).
-        assert!(!requires_approval_default("issues", "forecast"), "forecast is advisory → NOT gated");
-        assert!(!requires_approval_default("issues", "triage"), "triage is advisory → NOT gated");
-        assert!(!requires_approval_default("issues", "sla_draft"), "sla_draft is advisory → NOT gated");
-        assert!(requires_approval_default("issues", "transition"), "SLA transition is caveat-gated (floor)");
+        assert!(
+            !requires_approval_default("issues", "forecast"),
+            "forecast is advisory → NOT gated"
+        );
+        assert!(
+            !requires_approval_default("issues", "triage"),
+            "triage is advisory → NOT gated"
+        );
+        assert!(
+            !requires_approval_default("issues", "sla_draft"),
+            "sla_draft is advisory → NOT gated"
+        );
+        assert!(
+            requires_approval_default("issues", "transition"),
+            "SLA transition is caveat-gated (floor)"
+        );
 
         // Knowledge — publish/confidential = yes; draft/comment = no.
-        assert!(requires_approval_default("knowledge", "publish"), "publish is gated (consequential)");
-        assert!(requires_approval_default("knowledge", "edit_confidential"), "confidential edit is gated");
-        assert!(!requires_approval_default("knowledge", "draft"), "draft is reversible → NOT gated");
-        assert!(!requires_approval_default("knowledge", "comment"), "comment is reversible → NOT gated");
+        assert!(
+            requires_approval_default("knowledge", "publish"),
+            "publish is gated (consequential)"
+        );
+        assert!(
+            requires_approval_default("knowledge", "edit_confidential"),
+            "confidential edit is gated"
+        );
+        assert!(
+            !requires_approval_default("knowledge", "draft"),
+            "draft is reversible → NOT gated"
+        );
+        assert!(
+            !requires_approval_default("knowledge", "comment"),
+            "comment is reversible → NOT gated"
+        );
 
         // Chat — post/react = no.
-        assert!(!requires_approval_default("chat", "post_message"), "post_message is reversible → NOT gated");
-        assert!(!requires_approval_default("chat", "react"), "react is reversible → NOT gated");
+        assert!(
+            !requires_approval_default("chat", "post_message"),
+            "post_message is reversible → NOT gated"
+        );
+        assert!(
+            !requires_approval_default("chat", "react"),
+            "react is reversible → NOT gated"
+        );
     }
 
     /// **An unrecognised `(subsystem, tool)` is GATED by default (fail-closed — gated > un-gated for
@@ -324,8 +375,14 @@ mod tests {
     /// un-gated at runtime.
     #[test]
     fn an_unknown_action_is_gated_fail_closed() {
-        assert!(requires_approval_default("ci", "nuke_prod"), "an unknown action is gated (fail-closed)");
-        assert!(requires_approval_default("brand_new_subsystem", "anything"), "unknown subsystem → gated");
+        assert!(
+            requires_approval_default("ci", "nuke_prod"),
+            "an unknown action is gated (fail-closed)"
+        );
+        assert!(
+            requires_approval_default("brand_new_subsystem", "anything"),
+            "unknown subsystem → gated"
+        );
     }
 
     /// **The cross-subsystem rule (§6.3 last row) — a Chat-invoked effect inherits the LANDING
@@ -359,7 +416,10 @@ mod tests {
         // a git.merge def registered (wrongly) as un-gated is SEEDED back to gated.
         let wrong = tool_def("git", "merge", /* requires_approval */ false);
         let seeded = seed_requires_approval(wrong);
-        assert!(seeded.requires_approval, "git.merge is seeded gated regardless of the input value");
+        assert!(
+            seeded.requires_approval,
+            "git.merge is seeded gated regardless of the input value"
+        );
 
         // an open_pr def registered (wrongly) as gated is SEEDED back to NOT gated.
         let wrong_pr = tool_def("git", "open_pr", true);
@@ -368,7 +428,10 @@ mod tests {
 
         // idempotent: seeding an already-correct def is a no-op.
         let already = tool_def("git", "merge", true);
-        assert_eq!(seed_requires_approval(already.clone()), seed_requires_approval(already));
+        assert_eq!(
+            seed_requires_approval(already.clone()),
+            seed_requires_approval(already)
+        );
     }
 
     /// **The GATE fixture — a registration that LOOSENS a frozen `yes → no` WITHOUT a written

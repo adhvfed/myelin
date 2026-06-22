@@ -82,7 +82,10 @@ fn fragment(object_type: &str, relations: &[&str], permissions: &[&str]) -> Name
     NamespaceFragment {
         object_type: ObjectType(object_type.to_string()),
         relations: relations.iter().map(|r| RelName(r.to_string())).collect(),
-        permissions: permissions.iter().map(|p| Permission(p.to_string())).collect(),
+        permissions: permissions
+            .iter()
+            .map(|p| Permission(p.to_string()))
+            .collect(),
     }
 }
 
@@ -101,12 +104,7 @@ fn fragment(object_type: &str, relations: &[&str], permissions: &[&str]) -> Name
 pub fn page_write_fragment() -> NamespaceFragment {
     fragment(
         object_types::PAGE,
-        &[
-            "direct_writer",
-            "parent_page",
-            "parent_space",
-            "watcher",
-        ],
+        &["direct_writer", "parent_page", "parent_space", "watcher"],
         &[PUBLISH, EDIT, DRAFT, COMMENT, READ],
     )
 }
@@ -162,7 +160,11 @@ mod tests {
     fn no_kn_write_name_smuggles_an_object_id() {
         let mints = |s: &str| s.contains(':') || s.contains('/') || s.contains('#');
         for f in knowledge_write_fragment() {
-            assert!(!mints(&f.object_type.0), "type `{}` is a bare identifier", f.object_type.0);
+            assert!(
+                !mints(&f.object_type.0),
+                "type `{}` is a bare identifier",
+                f.object_type.0
+            );
             for r in &f.relations {
                 assert!(!mints(&r.0), "relation `{}` is a bare identifier", r.0);
             }

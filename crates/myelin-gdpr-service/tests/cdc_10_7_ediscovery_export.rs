@@ -25,11 +25,11 @@ use myelin_events::{
     Timestamp, Visibility,
 };
 use myelin_gdpr::{EraseScope, SubjectRef};
+use myelin_gdpr_service::DsrKind;
 use myelin_gdpr_service::{
     verify_inclusion, AuditAuthority, CellSigningKey, EDiscoveryBundle, EDiscoveryExporter,
     EDiscoveryScope, HoldVerdict, LegalHoldRegistry, SigningKey,
 };
-use myelin_gdpr_service::DsrKind;
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_tenancy::{ArtifactRef, TenantId};
 
@@ -86,25 +86,41 @@ fn provider_exports_a_scope_and_the_auditor_consumer_verifies_the_chain_of_custo
     let holds = LegalHoldRegistry::new();
 
     // Seed the per-tenant audit log: 3 actions about subject-A, 2 about subject-B.
-    authority.consumer().handle(&action("1", "acme", "myelin://acme/subj/A", "r-1"));
-    authority.consumer().handle(&action("2", "acme", "myelin://acme/subj/B", "r-2"));
-    authority.consumer().handle(&action("3", "acme", "myelin://acme/subj/A", "r-3"));
-    authority.consumer().handle(&action("4", "acme", "myelin://acme/subj/A", "r-4"));
-    authority.consumer().handle(&action("5", "acme", "myelin://acme/subj/B", "r-5"));
+    authority
+        .consumer()
+        .handle(&action("1", "acme", "myelin://acme/subj/A", "r-1"));
+    authority
+        .consumer()
+        .handle(&action("2", "acme", "myelin://acme/subj/B", "r-2"));
+    authority
+        .consumer()
+        .handle(&action("3", "acme", "myelin://acme/subj/A", "r-3"));
+    authority
+        .consumer()
+        .handle(&action("4", "acme", "myelin://acme/subj/A", "r-4"));
+    authority
+        .consumer()
+        .handle(&action("5", "acme", "myelin://acme/subj/B", "r-5"));
 
     let exporter = EDiscoveryExporter::new(&authority, &holds);
     let scope = EDiscoveryScope::Subject {
         tenant: TenantId("acme".into()),
         subject: ArtifactRef("myelin://acme/subj/A".into()),
     };
-    let bundle = exporter.export(&scope, "2026-06-20T01:00:00Z").expect("a non-empty export");
+    let bundle = exporter
+        .export(&scope, "2026-06-20T01:00:00Z")
+        .expect("a non-empty export");
 
     // CONSUMER (the legal/auditor): verifies the chain of custody with only the bundle + the key.
     assert!(
         auditor_verifies(&bundle, authority.key()),
         "the auditor verifies the export was not altered (content-addressed + inclusion-proof-bearing)"
     );
-    assert_eq!(bundle.record_count(), 3, "every subject-A record is in the production");
+    assert_eq!(
+        bundle.record_count(),
+        3,
+        "every subject-A record is in the production"
+    );
 }
 
 #[test]
@@ -112,9 +128,15 @@ fn the_auditor_consumer_rejects_a_tampered_or_forged_bundle() {
     let key = CellSigningKey::from_seed("cell:fr-par:audit-key");
     let authority = AuditAuthority::new(key);
     let holds = LegalHoldRegistry::new();
-    authority.consumer().handle(&action("1", "acme", "myelin://acme/subj/A", "r-1"));
-    authority.consumer().handle(&action("2", "acme", "myelin://acme/subj/A", "r-2"));
-    authority.consumer().handle(&action("3", "acme", "myelin://acme/subj/A", "r-3"));
+    authority
+        .consumer()
+        .handle(&action("1", "acme", "myelin://acme/subj/A", "r-1"));
+    authority
+        .consumer()
+        .handle(&action("2", "acme", "myelin://acme/subj/A", "r-2"));
+    authority
+        .consumer()
+        .handle(&action("3", "acme", "myelin://acme/subj/A", "r-3"));
 
     let exporter = EDiscoveryExporter::new(&authority, &holds);
     let bundle = exporter
@@ -123,16 +145,25 @@ fn the_auditor_consumer_rejects_a_tampered_or_forged_bundle() {
             "2026-06-20T01:00:00Z",
         )
         .expect("a non-empty export");
-    assert!(auditor_verifies(&bundle, authority.key()), "the honest production verifies");
+    assert!(
+        auditor_verifies(&bundle, authority.key()),
+        "the honest production verifies"
+    );
 
     // A DROPPED record (the producer tried to omit one) → the content-address no longer matches.
     let mut dropped = bundle.clone();
     dropped.records.pop();
-    assert!(!auditor_verifies(&dropped, authority.key()), "the auditor rejects a dropped record");
+    assert!(
+        !auditor_verifies(&dropped, authority.key()),
+        "the auditor rejects a dropped record"
+    );
 
     // A FORGED STH (signed by a different cell key) → the signature check fails.
     let forged_key = CellSigningKey::from_seed("an-attackers-key");
-    assert!(!auditor_verifies(&bundle, &forged_key), "the auditor rejects a forged STH");
+    assert!(
+        !auditor_verifies(&bundle, &forged_key),
+        "the auditor rejects a forged STH"
+    );
 }
 
 #[test]
@@ -142,7 +173,9 @@ fn the_export_is_legal_hold_frozen_so_a_concurrent_erase_is_deferred() {
     let key = CellSigningKey::from_seed("cell:fr-par:audit-key");
     let authority = AuditAuthority::new(key);
     let holds = LegalHoldRegistry::new();
-    authority.consumer().handle(&action("1", "acme", "u-A", "r-1"));
+    authority
+        .consumer()
+        .handle(&action("1", "acme", "u-A", "r-1"));
 
     let principal = Principal::stub(
         PrincipalId("u-A".into()),
@@ -154,7 +187,10 @@ fn the_export_is_legal_hold_frozen_so_a_concurrent_erase_is_deferred() {
         tenant: TenantId("acme".into()),
     };
     // Before the export, a DSR erase over the subject would PROCEED.
-    assert_eq!(holds.verdict(DsrKind::Erasure, &erase_scope), HoldVerdict::Proceed);
+    assert_eq!(
+        holds.verdict(DsrKind::Erasure, &erase_scope),
+        HoldVerdict::Proceed
+    );
 
     let exporter = EDiscoveryExporter::new(&authority, &holds);
     let scope = EDiscoveryScope::Subject {

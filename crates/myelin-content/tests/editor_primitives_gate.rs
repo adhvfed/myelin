@@ -15,8 +15,8 @@
 //! integrated editor + the browser-drive KN-D2 re-run is the IMMEDIATE follow-on KN-P09.
 
 use myelin_content::corpus::{corpus_pass_rate, CORPUS};
-use myelin_content::editor::{canonicalize, dom_to_offset, offset_to_dom, segments, split_at};
 use myelin_content::editor::offset::SegmentKind;
+use myelin_content::editor::{canonicalize, dom_to_offset, offset_to_dom, segments, split_at};
 use myelin_content::inline::{InlineNode, OBJ};
 use myelin_events::ArtifactRef;
 
@@ -25,7 +25,10 @@ use myelin_events::ArtifactRef;
 #[test]
 fn kn_d2_standalone_leg_serializer_primitive_100_percent() {
     let (passed, total) = corpus_pass_rate();
-    assert_eq!(passed, total, "KN-D2 standalone leg: corpus-pass-rate must be 100% ({passed}/{total})");
+    assert_eq!(
+        passed, total,
+        "KN-D2 standalone leg: corpus-pass-rate must be 100% ({passed}/{total})"
+    );
     assert!(total >= 18, "the frozen corpus must not be shrunk to pass");
 }
 
@@ -58,13 +61,24 @@ fn offset_dom_bridge_zero_off_by_one_over_corpus() {
         for s in segments(md) {
             if s.kind == SegmentKind::Node {
                 structured_nodes_crossed += 1;
-                assert_eq!(s.len(), 1, "[{}] a structured node must be exactly one caret position", f.name);
+                assert_eq!(
+                    s.len(),
+                    1,
+                    "[{}] a structured node must be exactly one caret position",
+                    f.name
+                );
             }
         }
     }
-    assert_eq!(off_by_one, 0, "offset/DOM bridge off-by-one count must be 0 (was {off_by_one})");
+    assert_eq!(
+        off_by_one, 0,
+        "offset/DOM bridge off-by-one count must be 0 (was {off_by_one})"
+    );
     // the corpus DOES exercise structured nodes (the gate is not vacuous)
-    assert!(structured_nodes_crossed >= 4, "the offset gate must cross structured nodes (crossed {structured_nodes_crossed})");
+    assert!(
+        structured_nodes_crossed >= 4,
+        "the offset gate must cross structured nodes (crossed {structured_nodes_crossed})"
+    );
 }
 
 /// GATE 2b — the CARET-PLACEMENT counter: Enter-split places the caret at the START of the
@@ -88,14 +102,39 @@ fn enter_split_caret_placement_counter_is_green() {
             // the run and each half re-canonicalises independently — so `left ++ right`
             // need NOT equal `md` mid-delimiter (that is correct editor behaviour, not a
             // loss). The fixed-point + node-routing invariants are the real bars.
-            assert_eq!(canonicalize(&s.left, &s.left_nodes).0, s.left, "[{}] split {off} left not canonical", f.name);
-            assert_eq!(canonicalize(&s.right, &s.right_nodes).0, s.right, "[{}] split {off} right not canonical", f.name);
+            assert_eq!(
+                canonicalize(&s.left, &s.left_nodes).0,
+                s.left,
+                "[{}] split {off} left not canonical",
+                f.name
+            );
+            assert_eq!(
+                canonicalize(&s.right, &s.right_nodes).0,
+                s.right,
+                "[{}] split {off} right not canonical",
+                f.name
+            );
             // each half carries exactly its own structured nodes (node count == OBJ count) —
             // no node lost or duplicated across the split.
-            assert_eq!(s.left.chars().filter(|&c| c == OBJ).count(), s.left_nodes.len(), "[{}] split {off} left node mismatch", f.name);
-            assert_eq!(s.right.chars().filter(|&c| c == OBJ).count(), s.right_nodes.len(), "[{}] split {off} right node mismatch", f.name);
+            assert_eq!(
+                s.left.chars().filter(|&c| c == OBJ).count(),
+                s.left_nodes.len(),
+                "[{}] split {off} left node mismatch",
+                f.name
+            );
+            assert_eq!(
+                s.right.chars().filter(|&c| c == OBJ).count(),
+                s.right_nodes.len(),
+                "[{}] split {off} right node mismatch",
+                f.name
+            );
             // total structured nodes conserved across the split (none lost).
-            assert_eq!(s.left_nodes.len() + s.right_nodes.len(), nodes.len(), "[{}] split {off} dropped a structured node", f.name);
+            assert_eq!(
+                s.left_nodes.len() + s.right_nodes.len(),
+                nodes.len(),
+                "[{}] split {off} dropped a structured node",
+                f.name
+            );
         }
     }
     assert_eq!(caret_at_start, total_splits, "caret-placement: every split must land at the start of the new block ({caret_at_start}/{total_splits})");

@@ -59,7 +59,7 @@
 //!   tuned by the connection-storm drill in **M5 (P-S33)**. The discipline (presence sheds first,
 //!   humans last, every budget bounded) is the contract and is tested here.
 
-use crate::firehose::{Frame, FrameBuffer, FrameClass, FirehoseScope, PushOutcome};
+use crate::firehose::{FirehoseScope, Frame, FrameBuffer, FrameClass, PushOutcome};
 use std::collections::HashMap;
 
 /// **A bounded scope selector — `board:`/`doc:`/`channel:`, NEVER `*` (§7.7, contract 3.5).**
@@ -175,7 +175,10 @@ impl BoundedSelector {
             "inbox" => SelectorKind::Inbox,
             other => return Err(SelectorError::UnknownKind(other.to_string())),
         };
-        Ok(BoundedSelector { kind, id: id.to_string() })
+        Ok(BoundedSelector {
+            kind,
+            id: id.to_string(),
+        })
     }
 
     /// The selector kind (`board`/`doc`/`channel`).
@@ -244,7 +247,11 @@ impl ScopeWindow {
     /// A window of `len` visible rows starting at `start`, with a `margin` of prefetch rows on each
     /// side. A `len` of 0 is raised to 1 (a window always contains at least its first row).
     pub fn new(start: u64, len: u64, margin: u64) -> ScopeWindow {
-        ScopeWindow { start, len: len.max(1), margin }
+        ScopeWindow {
+            start,
+            len: len.max(1),
+            margin,
+        }
     }
 
     /// The inclusive lower bound of the delivered row range (`start - margin`, saturating at 0).
@@ -254,7 +261,9 @@ impl ScopeWindow {
 
     /// The exclusive upper bound of the delivered row range (`start + len + margin`).
     pub fn upper(&self) -> u64 {
-        self.start.saturating_add(self.len).saturating_add(self.margin)
+        self.start
+            .saturating_add(self.len)
+            .saturating_add(self.margin)
     }
 
     /// The total number of rows the window delivers (`upper - lower`) — the BOUND on this connection's
@@ -342,7 +351,11 @@ impl FrameShedBudget {
     /// otherwise it is [`FrameBudgetVerdict::OverBudget`] (shed, counted). Does NOT take a slot — the
     /// caller takes the per-connection buffer slot on a buffered outcome and calls [`Self::admitted`].
     pub fn consult(&mut self, class: FrameClass) -> FrameBudgetVerdict {
-        let ceiling = self.class_ceiling.get(&class).copied().unwrap_or(self.capacity);
+        let ceiling = self
+            .class_ceiling
+            .get(&class)
+            .copied()
+            .unwrap_or(self.capacity);
         let in_flight = self.class_in_flight.get(&class).copied().unwrap_or(0);
         if in_flight < ceiling {
             FrameBudgetVerdict::WithinBudget
@@ -372,7 +385,10 @@ impl FrameShedBudget {
 
     /// The per-class ceiling (the §7.6 budget fraction for `class`).
     pub fn ceiling(&self, class: FrameClass) -> u32 {
-        self.class_ceiling.get(&class).copied().unwrap_or(self.capacity)
+        self.class_ceiling
+            .get(&class)
+            .copied()
+            .unwrap_or(self.capacity)
     }
 
     /// The current per-class in-flight.
@@ -557,12 +573,21 @@ mod tests {
         // the headline: `*` is an unbounded subscription → rejected.
         assert_eq!(BoundedSelector::parse("*"), Err(SelectorError::Wildcard));
         // a `*`-containing selector (board:*) is also unbounded → rejected (not a board id of "*").
-        assert_eq!(BoundedSelector::parse("board:*"), Err(SelectorError::Wildcard));
-        assert_eq!(BoundedSelector::parse("doc:a*"), Err(SelectorError::Wildcard));
+        assert_eq!(
+            BoundedSelector::parse("board:*"),
+            Err(SelectorError::Wildcard)
+        );
+        assert_eq!(
+            BoundedSelector::parse("doc:a*"),
+            Err(SelectorError::Wildcard)
+        );
         // empty / un-prefixed / unknown-kind are rejected too.
         assert_eq!(BoundedSelector::parse(""), Err(SelectorError::Empty));
         assert_eq!(BoundedSelector::parse("   "), Err(SelectorError::Empty));
-        assert_eq!(BoundedSelector::parse("12345"), Err(SelectorError::Unprefixed));
+        assert_eq!(
+            BoundedSelector::parse("12345"),
+            Err(SelectorError::Unprefixed)
+        );
         assert_eq!(BoundedSelector::parse("board:"), Err(SelectorError::Empty));
         assert_eq!(
             BoundedSelector::parse("tenant:acme"),
@@ -574,8 +599,14 @@ mod tests {
         assert_eq!(b.kind(), SelectorKind::Board);
         assert_eq!(b.id(), "123");
         assert_eq!(b.as_str(), "board:123");
-        assert_eq!(BoundedSelector::parse("doc:abc").unwrap().kind(), SelectorKind::Doc);
-        assert_eq!(BoundedSelector::parse("channel:eng").unwrap().kind(), SelectorKind::Channel);
+        assert_eq!(
+            BoundedSelector::parse("doc:abc").unwrap().kind(),
+            SelectorKind::Doc
+        );
+        assert_eq!(
+            BoundedSelector::parse("channel:eng").unwrap().kind(),
+            SelectorKind::Channel
+        );
         // it lowers to the FirehoseScope survival-signal key (one telemetry set).
         assert_eq!(b.scope(), FirehoseScope("board:123".to_string()));
     }
@@ -589,7 +620,11 @@ mod tests {
         // visible rows 10_000..10_100 (a 100-row viewport) + a 50-row margin each side.
         let window = ScopeWindow::new(10_000, 100, 50);
         // the delivered span is bounded (200 rows) — independent of the 50_000-row board.
-        assert_eq!(window.delivered_span(), 200, "the window bounds memory, not the board size");
+        assert_eq!(
+            window.delivered_span(),
+            200,
+            "the window bounds memory, not the board size"
+        );
         let mut sel = FrameSelector::new("kn-ops", &sel, 8, 32, window);
 
         // a frame on a visible row (10_050) is delivered.
@@ -609,10 +644,18 @@ mod tests {
         );
         assert_eq!(sel.offer(human(4), Some(49_999)), FrameOutcome::OutOfWindow);
         // a whole-scope frame (no row — e.g. a board-level summary) is always delivered.
-        assert_eq!(sel.offer(human(5), None), FrameOutcome::Buffered, "a whole-scope frame is delivered");
+        assert_eq!(
+            sel.offer(human(5), None),
+            FrameOutcome::Buffered,
+            "a whole-scope frame is delivered"
+        );
 
         // exactly the in-window frames entered the buffer (3 buffered: rows 10_050, 9_960, and None).
-        assert_eq!(sel.buffer().buffered_frames(), 3, "only in-window frames consume buffer memory");
+        assert_eq!(
+            sel.buffer().buffered_frames(),
+            3,
+            "only in-window frames consume buffer memory"
+        );
     }
 
     #[test]
@@ -679,7 +722,11 @@ mod tests {
             "a human frame is shed only when the WHOLE buffer is full (true saturation, shed last)"
         );
         // the human class itself never hit a class-budget shed (it is shed LAST, by the cap not the class).
-        assert_eq!(sel.budget().shed_count(FrameClass::HumanDelivery), 0, "humans shed last");
+        assert_eq!(
+            sel.budget().shed_count(FrameClass::HumanDelivery),
+            0,
+            "humans shed last"
+        );
     }
 
     #[test]
@@ -688,16 +735,31 @@ mod tests {
         let p = b.ceiling(FrameClass::Presence);
         let a = b.ceiling(FrameClass::AgentDelivery);
         let h = b.ceiling(FrameClass::HumanDelivery);
-        assert!(p <= a, "presence budget ≤ agent budget (presence sheds first)");
-        assert!(a <= h, "agent budget ≤ human budget (agents shed before humans)");
+        assert!(
+            p <= a,
+            "presence budget ≤ agent budget (presence sheds first)"
+        );
+        assert!(
+            a <= h,
+            "agent budget ≤ human budget (agents shed before humans)"
+        );
         assert_eq!(h, 16, "humans use the whole buffer (shed last)");
-        assert!(p >= 1, "even a small buffer admits at least one presence frame before shedding");
+        assert!(
+            p >= 1,
+            "even a small buffer admits at least one presence frame before shedding"
+        );
     }
 
     #[test]
     fn delivering_a_frame_frees_its_class_budget() {
         let sel = BoundedSelector::parse("channel:x").unwrap();
-        let mut sel = FrameSelector::new("chat-live", &sel, 8, 1_000, ScopeWindow::new(0, 1, u64::MAX));
+        let mut sel = FrameSelector::new(
+            "chat-live",
+            &sel,
+            8,
+            1_000,
+            ScopeWindow::new(0, 1, u64::MAX),
+        );
         // fill the presence budget (2) and shed the 3rd.
         sel.offer(presence(1), None);
         sel.offer(presence(2), None);
@@ -728,11 +790,25 @@ mod tests {
                 dropped = true;
             }
         }
-        assert!(dropped, "a stalled consumer is dropped to resync_required through the selector");
-        assert!(sel.buffer().resync_required(), "the connection is in the *.snapshot cold-rebuild path");
-        assert_eq!(sel.buffer().buffered_frames(), 0, "the buffer is released (bounded memory)");
+        assert!(
+            dropped,
+            "a stalled consumer is dropped to resync_required through the selector"
+        );
+        assert!(
+            sel.buffer().resync_required(),
+            "the connection is in the *.snapshot cold-rebuild path"
+        );
+        assert_eq!(
+            sel.buffer().buffered_frames(),
+            0,
+            "the buffer is released (bounded memory)"
+        );
         // the per-class accounting was released on the drop (no stale class in-flight).
-        assert_eq!(sel.budget().in_flight(FrameClass::HumanDelivery), 0, "class accounting released on drop");
+        assert_eq!(
+            sel.budget().in_flight(FrameClass::HumanDelivery),
+            0,
+            "class accounting released on drop"
+        );
     }
 
     /// An out-of-window frame never reaches the buffer OR the class budget — it is filtered first, so a
@@ -741,12 +817,27 @@ mod tests {
     fn an_out_of_window_frame_costs_no_buffer_and_no_class_budget() {
         let sel = BoundedSelector::parse("board:huge").unwrap();
         let mut sel = FrameSelector::new("kn-ops", &sel, 4, 8, ScopeWindow::new(100, 10, 5)); // [95,115)
-        // 50 off-screen presence frames: all OutOfWindow, none touch the buffer or the presence budget.
+                                                                                              // 50 off-screen presence frames: all OutOfWindow, none touch the buffer or the presence budget.
         for seq in 1..=50u64 {
-            assert_eq!(sel.offer(presence(seq), Some(1_000 + seq)), FrameOutcome::OutOfWindow);
+            assert_eq!(
+                sel.offer(presence(seq), Some(1_000 + seq)),
+                FrameOutcome::OutOfWindow
+            );
         }
-        assert_eq!(sel.buffer().buffered_frames(), 0, "off-window frames never buffer");
-        assert_eq!(sel.budget().in_flight(FrameClass::Presence), 0, "off-window frames cost no class budget");
-        assert_eq!(sel.budget().shed_count(FrameClass::Presence), 0, "off-window is not a class shed");
+        assert_eq!(
+            sel.buffer().buffered_frames(),
+            0,
+            "off-window frames never buffer"
+        );
+        assert_eq!(
+            sel.budget().in_flight(FrameClass::Presence),
+            0,
+            "off-window frames cost no class budget"
+        );
+        assert_eq!(
+            sel.budget().shed_count(FrameClass::Presence),
+            0,
+            "off-window is not a class shed"
+        );
     }
 }

@@ -236,7 +236,8 @@ mod tests {
         registry.register_drill(DrillScenario::new("counts-its-runs", move |ctx| {
             runs_in.fetch_add(1, Ordering::SeqCst);
             ctx.signals.set_scalar(SignalName::OutboxDepth, 0);
-            ctx.signals.assert_signal(SignalName::OutboxDepth, Predicate::Eq(0))
+            ctx.signals
+                .assert_signal(SignalName::OutboxDepth, Predicate::Eq(0))
         }));
         assert_eq!(registry.len(), 1);
 
@@ -245,7 +246,11 @@ mod tests {
         let second = registry.run_all();
         assert!(first[0].is_pass());
         assert!(second[0].is_pass());
-        assert_eq!(runs.load(Ordering::SeqCst), 2, "the scenario re-runs on each run_all");
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            2,
+            "the scenario re-runs on each run_all"
+        );
     }
 
     /// A registered drill whose property is BROKEN fails loudly (a red verdict, not a
@@ -256,10 +261,14 @@ mod tests {
         registry.register_drill(DrillScenario::new("broken-outbox", |ctx| {
             // simulate silent data loss: outbox never drained
             ctx.signals.set_scalar(SignalName::OutboxDepth, 5);
-            ctx.signals.assert_signal(SignalName::OutboxDepth, Predicate::Eq(0))
+            ctx.signals
+                .assert_signal(SignalName::OutboxDepth, Predicate::Eq(0))
         }));
         let results = registry.run_all();
-        assert!(!results[0].is_pass(), "a broken property must FAIL the drill");
+        assert!(
+            !results[0].is_pass(),
+            "a broken property must FAIL the drill"
+        );
         assert!(!registry.all_green(), "one red drill fails the whole suite");
     }
 

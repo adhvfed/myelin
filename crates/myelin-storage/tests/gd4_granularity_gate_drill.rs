@@ -17,8 +17,9 @@
 
 use myelin_gdpr::ErasureMethod;
 use myelin_storage::{
-    assert_gd4_table_complete, assert_no_local_residual_statement, key_choice_granularity, DataClass,
-    KekId, KeyGranularity, KmsEngine, StructuralErasureFloor, SubjectId, RESIDUAL_POSTURE_REF,
+    assert_gd4_table_complete, assert_no_local_residual_statement, key_choice_granularity,
+    DataClass, KekId, KeyGranularity, KmsEngine, StructuralErasureFloor, SubjectId,
+    RESIDUAL_POSTURE_REF,
 };
 use myelin_tenancy::{Region, TenantId};
 
@@ -37,7 +38,11 @@ fn gd4_granularity_gate_zero_misrouted_classes_and_structural_floor_holds() {
     );
     assert!(table.is_green());
     // The complete table is present (all six §5.1 classes), not a partial subset.
-    assert_eq!(table.routed.len(), 6, "the §5.1 table must be COMPLETE (all six classes)");
+    assert_eq!(
+        table.routed.len(),
+        6,
+        "the §5.1 table must be COMPLETE (all six classes)"
+    );
 
     // Per-class key-granularity assertion (the telemetry) — each class at its §5.1 granularity.
     for (class, granularity) in &table.routed {
@@ -82,7 +87,10 @@ fn gd4_granularity_gate_zero_misrouted_classes_and_structural_floor_holds() {
          reach backups by construction, §7.5 — threshold 0, NOT weakened)"
     );
     assert!(report.pseudonym_shred_is_the_id_step);
-    assert!(report.is_green(), "the structural GDPR floor holds (all three guarantees)");
+    assert!(
+        report.is_green(),
+        "the structural GDPR floor holds (all three guarantees)"
+    );
 
     // ── (3) The residual handled BY REFERENCE to X-7 — NO Storage-local residual statement. ──
     let residual = assert_no_local_residual_statement();

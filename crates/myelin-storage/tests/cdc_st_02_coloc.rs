@@ -52,7 +52,11 @@ impl IssuesService {
         EmitContextBase {
             tenant: TenantId(tenant.into()),
             region: Region("eu-west".into()),
-            actor: Actor(Principal::stub(PrincipalId("u1".into()), PrincipalKind::Human, TenantId(tenant.into()))),
+            actor: Actor(Principal::stub(
+                PrincipalId("u1".into()),
+                PrincipalKind::Human,
+                TenantId(tenant.into()),
+            )),
             schema_ver: 1,
             occurred_at: Timestamp("2026-06-19T00:00:00Z".into()),
             recorded_at: Timestamp("2026-06-19T00:00:01Z".into()),
@@ -63,7 +67,10 @@ impl IssuesService {
     /// Create an issue: stage the state write AND emit `issues.issue.created` in ONE co-located
     /// transaction — the provider honours the 2.2/2.3 co-commit shape.
     fn create_issue(&self, tenant: &str, key: &str) {
-        let mut tx = self.db.begin(self.ctx(tenant)).expect("a connection is available");
+        let mut tx = self
+            .db
+            .begin(self.ctx(tenant))
+            .expect("a connection is available");
         tx.stage_state(format!("INSERT issue {key}"));
         tx.emit(
             EventDraft {
@@ -79,7 +86,8 @@ impl IssuesService {
             None,
         )
         .expect("emit on the co-located tx");
-        tx.commit().expect("the co-located tx commits state + outbox atomically");
+        tx.commit()
+            .expect("the co-located tx commits state + outbox atomically");
     }
 }
 
@@ -92,21 +100,34 @@ fn cdc_st_02_coloc_emit_then_relay_consume() {
     issues.create_issue("acme", "PROJ-1");
 
     // The co-committed event is durable + unsent (the cross-seam cursor row).
-    assert_eq!(issues.db.outbox_depth(), 1, "the co-committed event is parked in the outbox");
+    assert_eq!(
+        issues.db.outbox_depth(),
+        1,
+        "the co-committed event is parked in the outbox"
+    );
 
     // The consumer side: a relay drains the SAME co-located outbox to an in-process broker.
     let bus = InProcessBus::new();
-    let relay = Relay::new(
-        issues.db.outbox().clone(),
-        bus.clone(),
-        || Timestamp("2026-06-19T00:00:02Z".into()),
-    );
+    let relay = Relay::new(issues.db.outbox().clone(), bus.clone(), || {
+        Timestamp("2026-06-19T00:00:02Z".into())
+    });
     let report = relay.drain_to_empty();
 
     // Exactly one event delivered (no ghost, no loss), and the outbox drained to 0.
-    assert_eq!(report.published, 1, "exactly the one committed event is delivered");
-    assert_eq!(bus.delivered_count(), 1, "the broker received exactly one event");
-    assert_eq!(issues.db.outbox_depth(), 0, "outbox_depth → 0 after the relay drains");
+    assert_eq!(
+        report.published, 1,
+        "exactly the one committed event is delivered"
+    );
+    assert_eq!(
+        bus.delivered_count(),
+        1,
+        "the broker received exactly one event"
+    );
+    assert_eq!(
+        issues.db.outbox_depth(),
+        0,
+        "outbox_depth → 0 after the relay drains"
+    );
 
     // The downstream consumer reads the delivered envelope — the round-trip the cursor depends on.
     let delivered = bus.consume("myelin://acme/issues");

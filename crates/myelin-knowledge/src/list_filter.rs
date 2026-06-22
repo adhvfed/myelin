@@ -443,7 +443,11 @@ pub fn compose_db_count_query(
 /// Render the lowered JOINs into the ` JOIN …` suffix the `FROM` carries (deduplicated upstream — one
 /// per distinct `(viewer, relation)`).
 fn render_joins(lowered: &LoweredFilter) -> String {
-    lowered.joins.iter().map(|j| format!(" {}", j.clause)).collect()
+    lowered
+        .joins
+        .iter()
+        .map(|j| format!(" {}", j.clause))
+        .collect()
 }
 
 /// Prepend the bound `(tenant, db_id)` scope params to the lowered filter's params (the scope

@@ -96,12 +96,14 @@ impl SubState {
     pub fn into_outcome(self) -> ProjectOutcome {
         match self {
             SubState::Live(p) => ProjectOutcome::Live(OwnerProjection { flag: None, ..p }),
-            SubState::Moved(p) => {
-                ProjectOutcome::Live(OwnerProjection { flag: Some(ProjectionFlag::Moved), ..p })
-            }
-            SubState::Outdated(p) => {
-                ProjectOutcome::Live(OwnerProjection { flag: Some(ProjectionFlag::Outdated), ..p })
-            }
+            SubState::Moved(p) => ProjectOutcome::Live(OwnerProjection {
+                flag: Some(ProjectionFlag::Moved),
+                ..p
+            }),
+            SubState::Outdated(p) => ProjectOutcome::Live(OwnerProjection {
+                flag: Some(ProjectionFlag::Outdated),
+                ..p
+            }),
             // GONE: the root resolves, the sub does not ⇒ Tombstone{ sub_gone, root } (the root is
             // carried by the chokepoint — the embed shows the parent, never a hard 404).
             SubState::Gone => ProjectOutcome::SubGone,
@@ -194,7 +196,10 @@ impl MintedLineRange {
     /// Fingerprint a line (BLAKE3) — the content-anchor identity. The resolver matches on these
     /// fingerprints, so it never holds the raw third-party line body (erasure-safe; §4.6 / X-7).
     pub fn fingerprint(line: &str) -> String {
-        format!("blake3:{}", hex::encode(blake3::hash(line.as_bytes()).as_bytes()))
+        format!(
+            "blake3:{}",
+            hex::encode(blake3::hash(line.as_bytes()).as_bytes())
+        )
     }
 
     /// Mint a line-range anchor from the current blob lines for the 1-based `[start, end]` range.
@@ -207,7 +212,10 @@ impl MintedLineRange {
             .take((end.saturating_sub(start) + 1) as usize)
             .map(|l| Self::fingerprint(l))
             .collect();
-        MintedLineRange { blob_oid: blob_oid.to_string(), anchored }
+        MintedLineRange {
+            blob_oid: blob_oid.to_string(),
+            anchored,
+        }
     }
 }
 
@@ -220,7 +228,11 @@ impl MintedLineRange {
 /// - none survive → `ContentGone`.
 ///
 /// This is the algorithm Git's owner `project` runs (REF-P17 feeds it real blobs). PURE — no I/O.
-pub fn resolve_line_range(minted: &MintedLineRange, current_oid: &str, current_lines: &[&str]) -> LineRangeState {
+pub fn resolve_line_range(
+    minted: &MintedLineRange,
+    current_oid: &str,
+    current_lines: &[&str],
+) -> LineRangeState {
     // 1. exact — the blob oid matches → the minted range is live as-is.
     if minted.blob_oid == current_oid {
         return LineRangeState::Exact;
@@ -231,7 +243,10 @@ pub fn resolve_line_range(minted: &MintedLineRange, current_oid: &str, current_l
         return LineRangeState::ContentGone;
     }
 
-    let current_fps: Vec<String> = current_lines.iter().map(|l| MintedLineRange::fingerprint(l)).collect();
+    let current_fps: Vec<String> = current_lines
+        .iter()
+        .map(|l| MintedLineRange::fingerprint(l))
+        .collect();
 
     // 2. rebased — the WHOLE anchored block is found contiguously at a shifted position (3-way context
     //    match: the exact fingerprint sequence appears somewhere in the current blob).
@@ -248,7 +263,10 @@ pub fn resolve_line_range(minted: &MintedLineRange, current_oid: &str, current_l
         if let Some(offset) = find_subsequence(&current_fps, &minted.anchored[..keep]) {
             let surviving_start = (offset + 1) as u64;
             let surviving_end = (offset + keep) as u64;
-            return LineRangeState::Partial { surviving_start, surviving_end };
+            return LineRangeState::Partial {
+                surviving_start,
+                surviving_end,
+            };
         }
     }
 
@@ -262,7 +280,8 @@ fn find_subsequence(haystack: &[String], needle: &[String]) -> Option<usize> {
     if needle.is_empty() || needle.len() > haystack.len() {
         return None;
     }
-    (0..=haystack.len() - needle.len()).find(|&start| haystack[start..start + needle.len()] == *needle)
+    (0..=haystack.len() - needle.len())
+        .find(|&start| haystack[start..start + needle.len()] == *needle)
 }
 
 /// **A synthetic owner sub-anchor resolver (the M2 floor) — the SubState per FULL `#sub` ref, scripted.**

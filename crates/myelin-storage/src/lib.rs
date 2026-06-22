@@ -441,8 +441,8 @@ pub mod cdn;
 // of the same content address from a replica. FLOORS NAMED: object-backed pack/delta + smart
 // transport → M5 P-ST-31 (a backing swap by the trait's design, trigger GIT-D4); the within-EU CDN
 // clone/bundle class (C3) → sibling P-ST-23.
-pub mod gitpack;
 pub mod git_shred;
+pub mod gitpack;
 // The outbound push-mirror residency gate SEAM (C6, P-ST-25 / P-255, contract 10.5 consumed + 12.4):
 // Storage FLAGS the residency-boundary crossing of a Git push-mirror — it (a) keeps mirror-source
 // blobs content-addressed + encrypted (REUSES blob + DekContentWrap — never a new store), and (b)
@@ -453,8 +453,8 @@ pub mod git_shred;
 // GDPR `transfer_allowed` (10.5) + the control plane's `mirror_allowed` (deny-by-default, P-251);
 // the CDC pair proves Storage's flag reaches that gate. REUSES blob (P-047) + residency (P-102) +
 // the control-plane gate (P-251) — never a parallel store or a second mirror policy (EI-01 §7).
-pub mod mirror;
 pub mod encryption;
+pub mod mirror;
 // The T3 firehose-archive seam (P-ST-20 / P-147, M2, contract 11.8 sealing + per-tenant-DEK half):
 // the DURABLE archive of the firehose (storage.md §3.3). It RIDES the 3.5 resume-cursor transport
 // (`myelin_events::Firehose`, P-141) — consuming the SAME `Frame`s a live viewer subscribes to —
@@ -466,8 +466,8 @@ pub mod encryption;
 // `T3FirehoseArchive` store class. Validated on a NON-CI firehose (a synthetic op-stream). FLOORS
 // NAMED: the CI `(job,step,byte-range)` index (C2) is P-ST-26 (M4); the per-subject CI-log DEK (C1)
 // is P-ST-27 (M4) — a key-class swap on the same DekContentWrap seam.
-pub mod firehose_archive;
 pub mod erase;
+pub mod firehose_archive;
 pub mod gd4;
 // The minimal cache seam (Stage 1 / infra — NEW). No cache trait existed before; this is the
 // one-line-swap Cache trait (in-memory floor + Valkey/Redis backing behind `integration`).
@@ -532,53 +532,51 @@ pub mod rls;
 //   - pg::PgStore          backs the OLTP + outbox/relay + ReBAC tuple store on real Postgres
 // The `backend` module is the config-selection seam (real-vs-in-memory from MyelinConfig).
 #[cfg(feature = "integration")]
+pub mod pg;
+#[cfg(feature = "integration")]
 pub mod s3blob;
 #[cfg(feature = "integration")]
 pub mod valkey;
-#[cfg(feature = "integration")]
-pub mod pg;
 // The OLTP-co-located outbox relay (the one legitimate broker-publish site, BUS-2) — kept in its
 // own module so the broker-publish call is isolated to a single named relay file (the same
 // posture as myelin-events/src/relay.rs).
 #[cfg(feature = "integration")]
-pub mod pgrelay;
-#[cfg(feature = "integration")]
 pub mod backend;
+#[cfg(feature = "integration")]
+pub mod pgrelay;
 
+pub use agent_run_gate::{AgentRunGate, AgentRunGateSignal, DispatchError, InFlightRun, RunKind};
 pub use backup::{
-    BackupError, BackupSet, BaseBackup, ContinuousArchiver, EpochSecs, LogTierSeal, ObjectTierBackup,
-    ObjectVersion, StoreTier, WalOffset, WalSegment,
+    BackupError, BackupSet, BaseBackup, ContinuousArchiver, EpochSecs, LogTierSeal,
+    ObjectTierBackup, ObjectVersion, StoreTier, WalOffset, WalSegment,
 };
 pub use blob::{
-    BlobError, BlobMeta, BlobStore, BlobTelemetry, ContentHash, ContentWrap, FsBlobStore,
-    HashAlgo, IdentityWrap,
+    BlobError, BlobMeta, BlobStore, BlobTelemetry, ContentHash, ContentWrap, FsBlobStore, HashAlgo,
+    IdentityWrap,
 };
 pub use cache::{Cache, CacheError, InMemoryCache};
 pub use cdn::{CdnCloneClass, CdnEdgePop, CdnEdgeSet};
-pub use gitpack::{
-    git_object_address, GitObjectKind, GitPackError, GitPackTier, PackManifest, PlacementError,
-    RepoGitPlacement, RepoId, RepoPlacementStatus, StorageGroup,
-};
 pub use coloc::{ColocError, ColocatedOltp, ColocatedTx, COLOCATED_OUTBOX_MIGRATION};
 pub use encryption::{
     key_class_for, ColumnCryptor, DekContentWrap, EncryptedColumn, KeyChoiceError, SubjectId,
-};
-pub use firehose_archive::{
-    segment_pointer_draft, ArchiveError, ArchiveTelemetry, FirehoseArchiver, SealedSegment,
-    SegmentBytes,
 };
 pub use erase::{
     BlobShredReach, BusErase, CryptoShredErase, EpochMillis, EraseError, EraseHolders,
     ErasureLedgerSink, ErasureReceipt, PseudonymShred, RefsTombstone, SearchPurge,
 };
-pub use git_shred::{
-    GitCryptoShredReach, GitResidual, GitShredReceipt, GitShreddable,
+pub use firehose_archive::{
+    segment_pointer_draft, ArchiveError, ArchiveTelemetry, FirehoseArchiver, SealedSegment,
+    SegmentBytes,
 };
-pub use mirror::{MirrorTelemetry, PushMirrorClass, PushMirrorTarget};
 pub use gd4::{
     assert_gd4_table_complete, assert_no_local_residual_statement, granularity_of_key_class,
     key_choice_granularity, structural_reach_uses_erase_seams, DataClass, Gd4TableReport,
     KeyGranularity, StructuralErasureFloor, StructuralFloorReport, RESIDUAL_POSTURE_REF,
+};
+pub use git_shred::{GitCryptoShredReach, GitResidual, GitShredReceipt, GitShreddable};
+pub use gitpack::{
+    git_object_address, GitObjectKind, GitPackError, GitPackTier, PackManifest, PlacementError,
+    RepoGitPlacement, RepoId, RepoPlacementStatus, StorageGroup,
 };
 pub use holder::{register_holder, BlobStoreHolder, OltpHolderRegistration, OltpStoreHolder};
 pub use key_origin::{
@@ -586,20 +584,21 @@ pub use key_origin::{
     KeyOriginError, KeyOriginKind, KeyOriginTelemetry, PlatformManaged,
 };
 pub use kms::{
-    CellRoot, DekHandle, DekId, KeyClass, KekId, KmsAdapter, KmsEngine, KmsError, PiiKeyRef,
+    CellRoot, DekHandle, DekId, KekId, KeyClass, KmsAdapter, KmsEngine, KmsError, PiiKeyRef,
     WrappedDek, KEY_LEN, NONCE_LEN,
 };
 pub use kms_failstatic::{
     KmsFailStaticSignals, KmsReadError, KmsReadPath, KmsReadResult, KmsReadiness,
 };
-pub use migration_under_load::{
-    lock_cost_ms, LockBudget, LockClass, MigrationLoadArtifact, MigrationLoadFailure,
-    MigrationLoadVerdict, MigrationUnderLoad, StepLockMeasure, WriteLoad,
-};
 pub use migration::{
     is_blocking_alter, is_destructive, HotTables, Migration, MigrationError, MigrationPhase,
     Migrations, OnlineMigrationRunner, PhaseProgress,
 };
+pub use migration_under_load::{
+    lock_cost_ms, LockBudget, LockClass, MigrationLoadArtifact, MigrationLoadFailure,
+    MigrationLoadVerdict, MigrationUnderLoad, StepLockMeasure, WriteLoad,
+};
+pub use mirror::{MirrorTelemetry, PushMirrorClass, PushMirrorTarget};
 pub use olap::{
     OlapApply, OlapDoc, OlapEvent, OlapFrameSignal, OlapIngestError, OlapReadStore, OlapStoreHolder,
 };
@@ -609,14 +608,11 @@ pub use olap_feed::{
 pub use oltp::{OltpConfig, OltpError, OltpPool, PermitGuard};
 pub use reerase::{
     CellKillRestore, CellKillRtoReport, ErasureRecord, InMemoryPostPitLedger,
-    PostRestoreErasureLedger, ReErasePass, ReErasedSubject, ReEraseReport, RtoGrain,
+    PostRestoreErasureLedger, ReErasePass, ReEraseReport, ReErasedSubject, RtoGrain,
 };
 pub use reserve_settle::{
-    CostEvent, CostLedger, MeteredUnit, MinorUnits, Reservation, ReservationState,
-    ReserveError, ReserveSettleSignal, RunId, SettleError, SettleOutcome,
-};
-pub use agent_run_gate::{
-    AgentRunGate, AgentRunGateSignal, DispatchError, InFlightRun, RunKind,
+    CostEvent, CostLedger, MeteredUnit, MinorUnits, Reservation, ReservationState, ReserveError,
+    ReserveSettleSignal, RunId, SettleError, SettleOutcome,
 };
 pub use residency::{
     verify_region_pinning, RegionPinnedStore, RegionPinningAttestation, ResidencyStoreClass,

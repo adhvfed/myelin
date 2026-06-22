@@ -384,11 +384,7 @@ impl SignalEngine {
                             sig.state = SignalState::Resolved;
                             sig.last_seen = envelope.recorded_at.0.clone();
                             drafts.push(PublishDraft {
-                                subject: publish_subject(
-                                    &sig.tenant,
-                                    sig.severity,
-                                    &sig.rule_id,
-                                ),
+                                subject: publish_subject(&sig.tenant, sig.severity, &sig.rule_id),
                                 signal: sig.clone(),
                                 kind: PublishKind::Resolved,
                             });
@@ -614,7 +610,10 @@ mod tests {
 
         let key = DedupKey("ci.run.failed:myelin://t1/ci/run/42".into());
         let sig = engine.signal(&TenantId("t1".into()), &key).unwrap();
-        assert_eq!(sig.count, 10, "N=10 identical failures → one Signal count=10");
+        assert_eq!(
+            sig.count, 10,
+            "N=10 identical failures → one Signal count=10"
+        );
         assert_eq!(sig.state, SignalState::Open);
         // The publish subject is the frozen sig.<tenant>.<severity>.<rule>.
         assert_eq!(
@@ -640,7 +639,11 @@ mod tests {
             &see_all,
         );
         assert_eq!(a[0].kind, PublishKind::Opened);
-        assert_eq!(b[0].kind, PublishKind::Opened, "a different run is a new incident");
+        assert_eq!(
+            b[0].kind,
+            PublishKind::Opened,
+            "a different run is a new incident"
+        );
     }
 
     /// **Severity-ranking ordering is correct: `info < notice < warning < error < critical`.**
@@ -808,7 +811,13 @@ mod tests {
     #[test]
     fn ingest_is_replay_deterministic() {
         let stream: Vec<EventEnvelope> = (0..5)
-            .map(|i| envelope_at("ci.run.failed", "42", &format!("2026-06-20T00:00:{:02}Z", i)))
+            .map(|i| {
+                envelope_at(
+                    "ci.run.failed",
+                    "42",
+                    &format!("2026-06-20T00:00:{:02}Z", i),
+                )
+            })
             .collect();
         let run = || {
             let mut e = SignalEngine::new();
@@ -819,7 +828,11 @@ mod tests {
             }
             all
         };
-        assert_eq!(run(), run(), "the same stream → the same drafts (deterministic)");
+        assert_eq!(
+            run(),
+            run(),
+            "the same stream → the same drafts (deterministic)"
+        );
     }
 
     /// **`SignalRule` round-trips stably (the wire contract — the durable `signal_rule` row).**

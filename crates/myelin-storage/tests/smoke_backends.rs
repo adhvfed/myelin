@@ -42,7 +42,11 @@ async fn s3_blobstore_put_get_head_delete() {
 
     // put → content address (BLAKE3 of plaintext).
     let addr = tokio::task::block_in_place(|| store.put(&tenant, &bytes)).expect("put");
-    assert_eq!(addr, ContentHash::blake3(&bytes), "address is the plaintext BLAKE3 hash");
+    assert_eq!(
+        addr,
+        ContentHash::blake3(&bytes),
+        "address is the plaintext BLAKE3 hash"
+    );
 
     // get → exact bytes back (re-hash-on-read passed).
     let got = tokio::task::block_in_place(|| store.get(&tenant, &addr)).expect("get");
@@ -81,7 +85,10 @@ async fn valkey_cache_set_get_expire_delete() {
     // a DIFFERENT tenant must MISS the same key (per-tenant namespacing).
     let other = TenantId(format!("globex-{}", std::process::id()));
     let cross = tokio::task::block_in_place(|| cache.get(&other, key)).expect("cross get");
-    assert_eq!(cross, None, "another tenant must not read this tenant's cached value");
+    assert_eq!(
+        cross, None,
+        "another tenant must not read this tenant's cached value"
+    );
 
     // expire: a short TTL set, then a miss after it lapses.
     tokio::task::block_in_place(|| cache.set(&tenant, "ephem", b"x", Duration::from_secs(1)))
@@ -127,13 +134,25 @@ async fn pg_rebac_tuple_store_reverse_index() {
     let store = PgStore::connect(&admin_url(&cfg), &cfg.region, 4)
         .await
         .expect("connect Postgres");
-    store.migrate().await.expect("run migrations (outbox + rebac_tuple + RLS)");
+    store
+        .migrate()
+        .await
+        .expect("run migrations (outbox + rebac_tuple + RLS)");
 
     let tenant = format!("acme-{}", std::process::id());
     // alice is reader on doc1 + doc2; bob on doc3 (must not match alice's lookup).
-    store.put_tuple(&tenant, "doc1", "reader", "user:alice").await.expect("put doc1");
-    store.put_tuple(&tenant, "doc2", "reader", "user:alice").await.expect("put doc2");
-    store.put_tuple(&tenant, "doc3", "reader", "user:bob").await.expect("put doc3");
+    store
+        .put_tuple(&tenant, "doc1", "reader", "user:alice")
+        .await
+        .expect("put doc1");
+    store
+        .put_tuple(&tenant, "doc2", "reader", "user:alice")
+        .await
+        .expect("put doc2");
+    store
+        .put_tuple(&tenant, "doc3", "reader", "user:bob")
+        .await
+        .expect("put doc3");
 
     // The S8 reverse-index lookup, RLS-scoped to this tenant.
     let objs = store
@@ -153,7 +172,11 @@ async fn pg_rebac_tuple_store_reverse_index() {
 // ---- PgStore: the outbox + relay (real FOR UPDATE SKIP LOCKED) drained THROUGH BusTransport --
 
 fn principal() -> Principal {
-    Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId("acme".into()))
+    Principal::stub(
+        PrincipalId("p".into()),
+        PrincipalKind::Human,
+        TenantId("acme".into()),
+    )
 }
 
 fn envelope(id: &str, subject: &str, aggregate: &str) -> EventEnvelope {

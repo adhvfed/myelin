@@ -12,11 +12,11 @@
 //! breaks this drift test at once. This file carries BOTH sides so the contract-coverage scanner
 //! (P-037) admits row 13.3 as a real provider+consumer pair.
 
+use myelin_identity::Literal;
 use myelin_query::{
     parse_query, CmpOp, EvalContext, Expr, FieldId, FieldType, Predicate, QueryAst, SortDir,
     SortSpec, ViewKind, ViewSpec,
 };
-use myelin_identity::Literal;
 
 // ── PROVIDER side (13.3): Knowledge freezes the shared FieldType/ViewSpec/QueryAst ──
 
@@ -39,7 +39,10 @@ fn provider_view() -> ViewSpec {
         kind: ViewKind::Board,
         filter: provider_compiles_filter("status == 'open' AND severity >= 3"),
         group_by: Some(FieldId::new("status")),
-        sort: vec![SortSpec { field: FieldId::new("priority"), dir: SortDir::Desc }],
+        sort: vec![SortSpec {
+            field: FieldId::new("priority"),
+            dir: SortDir::Desc,
+        }],
         visible: vec![FieldId::new("title"), FieldId::new("assignee")],
         order_field: FieldId::new("order_key"),
     }
@@ -66,10 +69,22 @@ fn cdc_13_3_provider_freezes_primitive_consumers_build_to_identical_shapes() {
     // ── PROVIDER + Search CONSUMER: the FieldType wire-id set is byte-identical ──
     let provider_ids = provider_field_type_wire_ids();
     let search_ids = search_consumes_field_types();
-    assert_eq!(provider_ids, search_ids, "Search's compiler reads the SAME frozen FieldType set");
+    assert_eq!(
+        provider_ids, search_ids,
+        "Search's compiler reads the SAME frozen FieldType set"
+    );
     assert_eq!(
         provider_ids,
-        ["text", "int", "bool", "date", "select", "relation", "principal", "order_key"],
+        [
+            "text",
+            "int",
+            "bool",
+            "date",
+            "select",
+            "relation",
+            "principal",
+            "order_key"
+        ],
         "the frozen FieldType wire-id set (X-3 anti-drift anchor)"
     );
 
@@ -78,7 +93,11 @@ fn cdc_13_3_provider_freezes_primitive_consumers_build_to_identical_shapes() {
     let ctx = EvalContext::new()
         .bind("status", Literal::Str("open".into()))
         .bind("severity", Literal::Int(4));
-    assert_eq!(filter.eval(&ctx), Ok(true), "the parsed filter evaluates through the ONE engine");
+    assert_eq!(
+        filter.eval(&ctx),
+        Ok(true),
+        "the parsed filter evaluates through the ONE engine"
+    );
 
     // The parsed tree is the SAME shape a directly-built consumer tree is (no second grammar).
     let directly_built = QueryAst::compiled(Predicate::And(vec![
@@ -111,5 +130,8 @@ fn cdc_13_3_provider_freezes_primitive_consumers_build_to_identical_shapes() {
 
     // The consumer round-trips the SAME bytes back into the SAME shape (no divergence).
     let back: ViewSpec = serde_json::from_value(json).unwrap();
-    assert_eq!(back, view, "the consumer reconstructs the provider's exact view-model");
+    assert_eq!(
+        back, view,
+        "the consumer reconstructs the provider's exact view-model"
+    );
 }

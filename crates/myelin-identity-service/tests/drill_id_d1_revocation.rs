@@ -98,7 +98,13 @@ fn id_d1_scim_disable_denies_every_surface_within_bound() {
     // Sanity: BEFORE the disable every surface honours alice (the grant is live).
     for surface in SURFACES {
         assert_eq!(
-            svc.check(&subject("p:alice"), &Permission("view".into()), &obj, &at_latest(), None),
+            svc.check(
+                &subject("p:alice"),
+                &Permission("view".into()),
+                &obj,
+                &at_latest(),
+                None
+            ),
             Ok(Decision::Allow),
             "surface {surface} honours alice before the disable"
         );
@@ -119,8 +125,13 @@ fn id_d1_scim_disable_denies_every_surface_within_bound() {
     let mut stale_regrant_count: i64 = 0;
     let mut worst_deny_latency_secs: i64 = 0;
     for surface in SURFACES {
-        let decision =
-            svc.check(&subject("p:alice"), &Permission("view".into()), &obj, &at_latest(), None);
+        let decision = svc.check(
+            &subject("p:alice"),
+            &Permission("view".into()),
+            &obj,
+            &at_latest(),
+            None,
+        );
         if decision == Ok(Decision::Allow) {
             // A surface that still honoured the revoked user — the F8 failure.
             stale_regrant_count += 1;
@@ -193,9 +204,19 @@ fn id_d1_revoke_is_idempotent_across_a_crash() {
     let s7 = svc.revocations().clone();
 
     // Disable alice; she is denied.
-    svc.disable_principal_in(&acme, &PrincipalId("p:alice".into()), Timestamp("2026-06-19T01:00:00Z".into()));
+    svc.disable_principal_in(
+        &acme,
+        &PrincipalId("p:alice".into()),
+        Timestamp("2026-06-19T01:00:00Z".into()),
+    );
     assert_eq!(
-        svc.check(&subject("p:alice"), &Permission("view".into()), &obj, &at_latest(), None),
+        svc.check(
+            &subject("p:alice"),
+            &Permission("view".into()),
+            &obj,
+            &at_latest(),
+            None
+        ),
         Ok(Decision::Deny),
         "alice is denied after the disable"
     );
@@ -204,13 +225,23 @@ fn id_d1_revoke_is_idempotent_across_a_crash() {
     // mirror — the revocation survives (a revoke is never lost on crash).
     s7.recover_from_mirror();
     assert_eq!(
-        svc.check(&subject("p:alice"), &Permission("view".into()), &obj, &at_latest(), None),
+        svc.check(
+            &subject("p:alice"),
+            &Permission("view".into()),
+            &obj,
+            &at_latest(),
+            None
+        ),
         Ok(Decision::Deny),
         "the revoke survived the crash (rebuilt from the durable mirror)"
     );
 
     // A re-revoke across the crash is a no-op (idempotent even on crash) — the count stays 1.
-    svc.disable_principal_in(&acme, &PrincipalId("p:alice".into()), Timestamp("2026-06-19T09:00:00Z".into()));
+    svc.disable_principal_in(
+        &acme,
+        &PrincipalId("p:alice".into()),
+        Timestamp("2026-06-19T09:00:00Z".into()),
+    );
     assert_eq!(
         s7.revocation_count(&acme),
         1,

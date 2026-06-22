@@ -101,9 +101,9 @@ impl LoadPrincipalKind {
                 runtime_ref: RuntimeRef("harness://load-agent".into()),
                 on_behalf_of: None,
             },
-            LoadPrincipalKind::Service
-            | LoadPrincipalKind::Ci
-            | LoadPrincipalKind::ExternalMcp => PrincipalKind::Service,
+            LoadPrincipalKind::Service | LoadPrincipalKind::Ci | LoadPrincipalKind::ExternalMcp => {
+                PrincipalKind::Service
+            }
         }
     }
 
@@ -564,7 +564,11 @@ mod tests {
         // weights [1,1,1,1,1] over 1003 requests: ideal 200.6 each → 201,201,201,200,200.
         let mix = PrincipalMix::balanced();
         let counts = mix.apportion(1003);
-        assert_eq!(counts.iter().sum::<u64>(), 1003, "no request lost or ghosted");
+        assert_eq!(
+            counts.iter().sum::<u64>(),
+            1003,
+            "no request lost or ghosted"
+        );
         let ideal = 1003.0 / 5.0;
         for &c in &counts {
             let diff = (c as f64 - ideal).abs();
@@ -593,7 +597,11 @@ mod tests {
         let mut uniq = surfaces.clone();
         uniq.sort_by_key(|s| format!("{s:?}"));
         uniq.dedup();
-        assert_eq!(uniq.len(), 4, "the four storm profiles drive four distinct surfaces");
+        assert_eq!(
+            uniq.len(),
+            4,
+            "the four storm profiles drive four distinct surfaces"
+        );
         // The driven request carries the profile's surface + frame shape.
         let gen = LoadGenerator::new(
             10,
@@ -640,10 +648,16 @@ mod tests {
         );
         assert_eq!(LoadPrincipalKind::Service.run_class(), RunClass::Service);
         // All five run classes are distinct.
-        let classes: Vec<RunClass> = LoadPrincipalKind::ALL.iter().map(|k| k.run_class()).collect();
+        let classes: Vec<RunClass> = LoadPrincipalKind::ALL
+            .iter()
+            .map(|k| k.run_class())
+            .collect();
         for i in 0..classes.len() {
             for j in (i + 1)..classes.len() {
-                assert_ne!(classes[i], classes[j], "run classes must be distinct per kind");
+                assert_ne!(
+                    classes[i], classes[j],
+                    "run classes must be distinct per kind"
+                );
             }
         }
     }
@@ -687,8 +701,16 @@ mod tests {
         .unwrap();
         let mut sink = RecordingSink::default();
         gen.drive(&mut sink);
-        let acme = sink.received.iter().filter(|r| r.tenant == tenant("acme")).count();
-        let globex = sink.received.iter().filter(|r| r.tenant == tenant("globex")).count();
+        let acme = sink
+            .received
+            .iter()
+            .filter(|r| r.tenant == tenant("acme"))
+            .count();
+        let globex = sink
+            .received
+            .iter()
+            .filter(|r| r.tenant == tenant("globex"))
+            .count();
         assert_eq!(acme, 5);
         assert_eq!(globex, 5);
     }
@@ -697,8 +719,14 @@ mod tests {
     /// multiplier, an all-zero mix, and an empty tenant list all return `None`.
     #[test]
     fn misspecification_is_loud_not_silent() {
-        assert!(Multiplier::custom(0).is_none(), "0x is a mis-specified surge");
-        assert!(Multiplier::custom(50).is_some(), "a custom 50x soak is valid");
+        assert!(
+            Multiplier::custom(0).is_none(),
+            "0x is a mis-specified surge"
+        );
+        assert!(
+            Multiplier::custom(50).is_some(),
+            "a custom 50x soak is valid"
+        );
         assert!(
             PrincipalMix::from_weights([0, 0, 0, 0, 0]).is_none(),
             "an all-zero mix has no traffic"

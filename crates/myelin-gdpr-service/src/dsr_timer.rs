@@ -175,7 +175,10 @@ pub enum TimerError {
     /// `rearm_extension` was called with a new deadline that is NOT later than the current one (an
     /// extension must EXTEND — Art. 12(3) extends to 3 months, never shortens). Carries
     /// (current_deadline, requested_deadline).
-    ExtensionNotLater { current_secs: u64, requested_secs: u64 },
+    ExtensionNotLater {
+        current_secs: u64,
+        requested_secs: u64,
+    },
 }
 
 impl std::fmt::Display for TimerError {
@@ -223,7 +226,9 @@ pub struct DsrTimerWheel {
 impl DsrTimerWheel {
     /// An empty wheel.
     pub fn new() -> DsrTimerWheel {
-        DsrTimerWheel { armed: BTreeMap::new() }
+        DsrTimerWheel {
+            armed: BTreeMap::new(),
+        }
     }
 
     /// **`sleep_until` (contract 9.3) — arm a deadline-warning entry.** Lands the entry in the
@@ -244,7 +249,13 @@ impl DsrTimerWheel {
         }
         self.armed.insert(
             dsr_id.clone(),
-            TimerEntry { dsr_id, tenant, fire_at_secs, deadline_secs, extension_reason },
+            TimerEntry {
+                dsr_id,
+                tenant,
+                fire_at_secs,
+                deadline_secs,
+                extension_reason,
+            },
         );
         Ok(())
     }
@@ -268,7 +279,10 @@ impl DsrTimerWheel {
             .collect();
         let mut fired = Vec::with_capacity(due.len());
         for id in due {
-            let e = self.armed.remove(&id).expect("due entry was just observed present");
+            let e = self
+                .armed
+                .remove(&id)
+                .expect("due entry was just observed present");
             // the margin is deadline − now, floored at 0 (the warning fires before the deadline, so
             // this is positive in the happy path; a tick that runs PAST the deadline still reports a
             // 0 margin rather than underflowing).
@@ -297,7 +311,10 @@ impl DsrTimerWheel {
         new_deadline_secs: u64,
         reason: String,
     ) -> Result<(), TimerError> {
-        let current = self.armed.get(dsr_id).ok_or_else(|| TimerError::NotArmed(dsr_id.clone()))?;
+        let current = self
+            .armed
+            .get(dsr_id)
+            .ok_or_else(|| TimerError::NotArmed(dsr_id.clone()))?;
         if new_deadline_secs <= current.deadline_secs {
             return Err(TimerError::ExtensionNotLater {
                 current_secs: current.deadline_secs,
@@ -307,8 +324,14 @@ impl DsrTimerWheel {
         let tenant = current.tenant.clone();
         // disarm the old entry, then arm the new one (the §4.6 cheap disarm/re-arm).
         self.armed.remove(dsr_id);
-        self.arm(dsr_id.clone(), tenant, new_fire_at_secs, new_deadline_secs, Some(reason))
-            .expect("just disarmed — cannot be already-armed");
+        self.arm(
+            dsr_id.clone(),
+            tenant,
+            new_fire_at_secs,
+            new_deadline_secs,
+            Some(reason),
+        )
+        .expect("just disarmed — cannot be already-armed");
         Ok(())
     }
 
@@ -338,7 +361,9 @@ impl DsrTimerWheel {
 
     /// The recorded extension reason for an armed DSR (Art. 12(3)), if it was re-armed.
     pub fn extension_reason_for(&self, dsr_id: &DsrId) -> Option<String> {
-        self.armed.get(dsr_id).and_then(|e| e.extension_reason.clone())
+        self.armed
+            .get(dsr_id)
+            .and_then(|e| e.extension_reason.clone())
     }
 
     /// **Snapshot the wheel state (the durable `dsr_timer` rows).** The restart-survival model: the
@@ -403,7 +428,11 @@ impl<C: Clock> DsrDeadlineTimer<C> {
     /// `thresholds.toml`). Production wires [`myelin_substrate::SystemClock`] + the loaded
     /// thresholds; the drills wire [`myelin_substrate::TestClock`] + the default thresholds.
     pub fn new(clock: C, thresholds: DsrDeadline) -> DsrDeadlineTimer<C> {
-        DsrDeadlineTimer { clock, thresholds, wheel: DsrTimerWheel::new() }
+        DsrDeadlineTimer {
+            clock,
+            thresholds,
+            wheel: DsrTimerWheel::new(),
+        }
     }
 
     /// **Arm the durable deadline timer on submit (gdpr §4.1 step 6).** Computes the statutory
@@ -425,9 +454,11 @@ impl<C: Clock> DsrDeadlineTimer<C> {
         let deadline_secs = submitted_at_secs + self.thresholds.deadline_secs;
         // the warning fires `warning_margin` BEFORE the deadline (the nearing-deadline point).
         // saturating at submitted_at: a margin wider than the window fires early, never never.
-        let warning_at_secs =
-            deadline_secs.saturating_sub(self.thresholds.warning_margin_secs).max(submitted_at_secs);
-        self.wheel.arm(dsr_id, tenant, warning_at_secs, deadline_secs, None)?;
+        let warning_at_secs = deadline_secs
+            .saturating_sub(self.thresholds.warning_margin_secs)
+            .max(submitted_at_secs);
+        self.wheel
+            .arm(dsr_id, tenant, warning_at_secs, deadline_secs, None)?;
         Ok(deadline_secs)
     }
 
@@ -445,7 +476,8 @@ impl<C: Clock> DsrDeadlineTimer<C> {
         let new_warning_at_secs = new_deadline_secs
             .saturating_sub(self.thresholds.warning_margin_secs)
             .max(submitted_at_secs);
-        self.wheel.rearm_extension(dsr_id, new_warning_at_secs, new_deadline_secs, reason)?;
+        self.wheel
+            .rearm_extension(dsr_id, new_warning_at_secs, new_deadline_secs, reason)?;
         Ok(new_deadline_secs)
     }
 
@@ -546,16 +578,26 @@ mod tests {
         let to_advance = warning_at - t0;
         timer.advance_for_test(to_advance);
         let fired = timer.tick();
-        assert_eq!(fired.len(), 1, "the warning fires at the nearing-deadline point");
+        assert_eq!(
+            fired.len(),
+            1,
+            "the warning fires at the nearing-deadline point"
+        );
         let w = &fired[0];
         assert_eq!(w.dsr_id, dsr(0));
         assert_eq!(w.tenant, tenant());
         assert_eq!(w.deadline_secs, deadline);
         // the warning fires BEFORE the deadline — the margin is positive (~1 week).
-        assert!(w.margin_remaining_secs > 0, "the warning fires before the deadline");
+        assert!(
+            w.margin_remaining_secs > 0,
+            "the warning fires before the deadline"
+        );
         assert_eq!(w.margin_remaining_secs, 7 * 24 * 60 * 60);
         // fire-once: the entry is gone after firing.
-        assert!(!timer.wheel().is_armed(&dsr(0)), "the warning fired once and is disarmed");
+        assert!(
+            !timer.wheel().is_armed(&dsr(0)),
+            "the warning fired once and is disarmed"
+        );
         assert_eq!(timer.wheel().armed_count(), 0);
     }
 
@@ -569,18 +611,29 @@ mod tests {
 
         // CRASH: snapshot the durable wheel state, then drop the orchestrator entirely.
         let durable_rows = timer.wheel().snapshot();
-        assert_eq!(durable_rows.len(), 1, "the armed timer is durable state, not in-process state");
+        assert_eq!(
+            durable_rows.len(),
+            1,
+            "the armed timer is durable state, not in-process state"
+        );
         drop(timer);
 
         // RESTART: a fresh orchestrator (a fresh clock) restores the wheel from the durable rows.
         let warning_at = deadline - 7 * 24 * 60 * 60;
         let mut restarted = DsrDeadlineTimer::new(TestClock::at(warning_at), thresholds());
         restarted.restore_wheel(DsrTimerWheel::restore(durable_rows));
-        assert!(restarted.wheel().is_armed(&dsr(0)), "the timer survived the restart");
+        assert!(
+            restarted.wheel().is_armed(&dsr(0)),
+            "the timer survived the restart"
+        );
 
         // the timer STILL fires (0 silent misses — the GA-D4 restart leg).
         let fired = restarted.tick();
-        assert_eq!(fired.len(), 1, "the restored timer fires — the restart did not lose it");
+        assert_eq!(
+            fired.len(),
+            1,
+            "the restored timer fires — the restart did not lose it"
+        );
         assert_eq!(fired[0].dsr_id, dsr(0));
     }
 
@@ -601,7 +654,10 @@ mod tests {
         assert!(three_months > one_month);
         // the warning re-armed LATER (3-month warning point > 1-month warning point).
         let three_month_warning = timer.wheel().fire_at_for(&dsr(0)).unwrap();
-        assert!(three_month_warning > one_month_warning, "the warning re-armed later");
+        assert!(
+            three_month_warning > one_month_warning,
+            "the warning re-armed later"
+        );
         assert_eq!(three_month_warning, three_months - 7 * 24 * 60 * 60);
         // the reason is RECORDED on the entry (Art. 12(3)).
         assert_eq!(timer.wheel().extension_reason_for(&dsr(0)), Some(reason));
@@ -609,9 +665,13 @@ mod tests {
         assert_eq!(timer.wheel().armed_count(), 1);
 
         // the OLD (1-month) warning point no longer fires (a tick at it fires nothing).
-        let mut at_old_warning = DsrDeadlineTimer::new(TestClock::at(one_month_warning), thresholds());
+        let mut at_old_warning =
+            DsrDeadlineTimer::new(TestClock::at(one_month_warning), thresholds());
         at_old_warning.restore_wheel(DsrTimerWheel::restore(timer.wheel().snapshot()));
-        assert!(at_old_warning.tick().is_empty(), "the old warning point is disarmed by the extension");
+        assert!(
+            at_old_warning.tick().is_empty(),
+            "the old warning point is disarmed by the extension"
+        );
     }
 
     // ───────────── an extension must EXTEND, never shorten (Art. 12(3)) ─────────
@@ -620,10 +680,20 @@ mod tests {
     fn an_extension_that_does_not_extend_is_a_loud_error() {
         let t0 = 1_700_000_000;
         let mut wheel = DsrTimerWheel::new();
-        wheel.arm(dsr(0), tenant(), t0 + 100, t0 + 200, None).unwrap();
+        wheel
+            .arm(dsr(0), tenant(), t0 + 100, t0 + 200, None)
+            .unwrap();
         // a re-arm to an EARLIER deadline is rejected (an extension extends).
-        let err = wheel.rearm_extension(&dsr(0), t0 + 50, t0 + 150, "x".into()).unwrap_err();
-        assert_eq!(err, TimerError::ExtensionNotLater { current_secs: t0 + 200, requested_secs: t0 + 150 });
+        let err = wheel
+            .rearm_extension(&dsr(0), t0 + 50, t0 + 150, "x".into())
+            .unwrap_err();
+        assert_eq!(
+            err,
+            TimerError::ExtensionNotLater {
+                current_secs: t0 + 200,
+                requested_secs: t0 + 150
+            }
+        );
         // the original entry is untouched (the rejected re-arm did not pollute the wheel).
         assert_eq!(wheel.fire_at_for(&dsr(0)), Some(t0 + 100));
     }
@@ -644,10 +714,15 @@ mod tests {
     fn rearming_or_disarming_an_unarmed_dsr_is_a_loud_error() {
         let mut wheel = DsrTimerWheel::new();
         assert_eq!(
-            wheel.rearm_extension(&dsr(9), 100, 200, "x".into()).unwrap_err(),
+            wheel
+                .rearm_extension(&dsr(9), 100, 200, "x".into())
+                .unwrap_err(),
             TimerError::NotArmed(dsr(9))
         );
-        assert_eq!(wheel.disarm(&dsr(9)).unwrap_err(), TimerError::NotArmed(dsr(9)));
+        assert_eq!(
+            wheel.disarm(&dsr(9)).unwrap_err(),
+            TimerError::NotArmed(dsr(9))
+        );
     }
 
     // ───────────── the minute-bucket fire boundary is inclusive (≤, not <) ─────────
@@ -658,11 +733,18 @@ mod tests {
         // arm at second 600 (minute bucket 10), deadline 660.
         wheel.arm(dsr(0), tenant(), 600, 660, None).unwrap();
         // a tick at second 599 (minute bucket 9) does NOT fire (the bucket is not yet reached).
-        assert!(wheel.tick(599).is_empty(), "minute bucket 9 < 10: not yet due");
+        assert!(
+            wheel.tick(599).is_empty(),
+            "minute bucket 9 < 10: not yet due"
+        );
         assert!(wheel.is_armed(&dsr(0)), "still armed");
         // a tick at second 600 (minute bucket 10) FIRES (the boundary is inclusive — ≤).
         let fired = wheel.tick(600);
-        assert_eq!(fired.len(), 1, "minute bucket 10 == 10: due (inclusive boundary)");
+        assert_eq!(
+            fired.len(),
+            1,
+            "minute bucket 10 == 10: due (inclusive boundary)"
+        );
         assert_eq!(fired[0].dsr_id, dsr(0));
     }
 
@@ -675,7 +757,10 @@ mod tests {
         // tick well PAST the deadline (second 1000 > deadline 660).
         let fired = wheel.tick(1000);
         assert_eq!(fired.len(), 1);
-        assert_eq!(fired[0].margin_remaining_secs, 0, "past-deadline margin is 0, never an underflow");
+        assert_eq!(
+            fired[0].margin_remaining_secs, 0,
+            "past-deadline margin is 0, never an underflow"
+        );
     }
 
     // ───────────── disarm on completion (the certificate sealed before the warning) ─────────
@@ -704,6 +789,10 @@ mod tests {
         wheel.arm(dsr(1), tenant(), 600, 660, None).unwrap();
         let fired = wheel.tick(600);
         let ids: Vec<&str> = fired.iter().map(|w| w.dsr_id.0.as_str()).collect();
-        assert_eq!(ids, vec!["dsr:0", "dsr:1", "dsr:2"], "deterministic id order");
+        assert_eq!(
+            ids,
+            vec!["dsr:0", "dsr:1", "dsr:2"],
+            "deterministic id order"
+        );
     }
 }

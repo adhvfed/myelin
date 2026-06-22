@@ -47,7 +47,10 @@ fn viewer(id: &str) -> Principal {
     Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant())
 }
 fn strong(zk: &str) -> Consistency {
-    Consistency { at_least: Zookie(zk.into()), mode: ConsistencyMode::Strong }
+    Consistency {
+        at_least: Zookie(zk.into()),
+        mode: ConsistencyMode::Strong,
+    }
 }
 fn subj(root: &str) -> ArtifactRef {
     ArtifactRef(root.into())
@@ -56,7 +59,12 @@ fn subj(root: &str) -> ArtifactRef {
 fn seeded_markers() -> AmbientMarkerStore {
     let store = AmbientMarkerStore::new();
     for r in ["root/a", "root/b", "root/c"] {
-        store.record(&tenant(), &subj(r), myelin_notif::Reason::Watched, &ArtifactRef(format!("myelin://acme/bus/event/{r}")));
+        store.record(
+            &tenant(),
+            &subj(r),
+            myelin_notif::Reason::Watched,
+            &ArtifactRef(format!("myelin://acme/bus/event/{r}")),
+        );
     }
     store
 }
@@ -82,9 +90,19 @@ impl WatcherResolvePort for IdentityProvider {
         at: &Consistency,
     ) -> AuthzResult<ListObjectsResult> {
         // The CONSUMER calls with the frozen (watch, subject_root) shape — assert the wire.
-        assert_eq!(permission.0, WATCH_PERMISSION, "Notif lists for the frozen `watch` permission (4.3)");
-        assert_eq!(ty.0, SUBJECT_ROOT_TYPE, "Notif lists over its own subject_root id space");
-        assert_eq!(at.mode, ConsistencyMode::Strong, "a security-sensitive read is Strong (4.10)");
+        assert_eq!(
+            permission.0, WATCH_PERMISSION,
+            "Notif lists for the frozen `watch` permission (4.3)"
+        );
+        assert_eq!(
+            ty.0, SUBJECT_ROOT_TYPE,
+            "Notif lists over its own subject_root id space"
+        );
+        assert_eq!(
+            at.mode,
+            ConsistencyMode::Strong,
+            "a security-sensitive read is Strong (4.10)"
+        );
         assert_eq!(subject.tenant, tenant());
         // The S8 PUSHED-DOWN path: the relational watcher Filter (the 50k-density answer) + the zookie.
         Ok(ListObjectsResult::Filter {
@@ -104,14 +122,30 @@ impl WatcherResolvePort for IdentityProvider {
     ) -> AuthzResult<ReverseIndexAnswer> {
         // The CONSUMER resolves ONE relational leaf — the watcher relation, keyed by Notif's own col.
         match leaf {
-            RelationalLeaf::InRelation { relation, via_column } => {
-                assert_eq!(relation.0, WATCHER_RELATION, "the leaf is the frozen `watcher` relation (4.9)");
-                assert_eq!(*via_column, ColRef { table: "notif_inbox_item".into(), column: "subject_root".into() }, "the JOIN is keyed by Notif's OWN subject_root column (§3.5, no N+1)");
+            RelationalLeaf::InRelation {
+                relation,
+                via_column,
+            } => {
+                assert_eq!(
+                    relation.0, WATCHER_RELATION,
+                    "the leaf is the frozen `watcher` relation (4.9)"
+                );
+                assert_eq!(
+                    *via_column,
+                    ColRef {
+                        table: "notif_inbox_item".into(),
+                        column: "subject_root".into()
+                    },
+                    "the JOIN is keyed by Notif's OWN subject_root column (§3.5, no N+1)"
+                );
             }
             RelationalLeaf::TupleSet { .. } => {}
         }
         // The index serves at its current revision; the watermark gate (4.10) is the CONSUMER's.
-        assert!(required.0 <= self.revision || required.0 == 0, "the CONSUMER passes the watermark it requires");
+        assert!(
+            required.0 <= self.revision || required.0 == 0,
+            "the CONSUMER passes the watermark it requires"
+        );
         Ok(ReverseIndexAnswer {
             subject_roots: self.watched.iter().cloned().collect(),
             revision: RevisionWatermark(self.revision),
@@ -125,10 +159,17 @@ impl WatcherResolvePort for IdentityProvider {
 #[test]
 fn cdc_4_3_setexpr_pushdown_lowers_to_the_join_over_notifs_own_column() {
     let store = seeded_markers();
-    let provider = IdentityProvider { watched: vec!["root/a".into(), "root/c".into()], revision: 7 };
+    let provider = IdentityProvider {
+        watched: vec!["root/a".into(), "root/c".into()],
+        revision: 7,
+    };
     let slice = read_fanout(&viewer("u1"), &store, &provider, &strong("zk-7")).unwrap();
     let roots: Vec<&str> = slice.iter().map(|m| m.subject_root.as_str()).collect();
-    assert_eq!(roots, vec!["root/a", "root/c"], "the SetExpr JOIN materialised exactly the watched slice (no post-filter over all 3)");
+    assert_eq!(
+        roots,
+        vec!["root/a", "root/c"],
+        "the SetExpr JOIN materialised exactly the watched slice (no post-filter over all 3)"
+    );
 }
 
 /// **CONSUMER honours the 4.10 zookie watermark: a stale reverse-index revision is REJECTED (held,
@@ -196,7 +237,10 @@ fn cdc_4_3_consumer_holds_not_leaks_on_unavailable_provider() {
     }
     let store = seeded_markers();
     let err = read_fanout(&viewer("u1"), &store, &DownProvider, &strong("zk-1")).unwrap_err();
-    assert!(matches!(err, ReadFanoutError::Unavailable(_)), "an unavailable provider holds, never falls open");
+    assert!(
+        matches!(err, ReadFanoutError::Unavailable(_)),
+        "an unavailable provider holds, never falls open"
+    );
 }
 
 /// **The bounded (4.3 S4) `Ids` materialised path: a viewer with a small watched set is returned
@@ -230,5 +274,9 @@ fn cdc_4_3_s4_ids_path_makes_zero_join_calls() {
     let store = seeded_markers();
     let slice = read_fanout(&viewer("u1"), &store, &S4Provider, &strong("zk-1")).unwrap();
     let roots: Vec<&str> = slice.iter().map(|m| m.subject_root.as_str()).collect();
-    assert_eq!(roots, vec!["root/b"], "the bounded Ids watch set materialised directly (S4, no JOIN)");
+    assert_eq!(
+        roots,
+        vec!["root/b"],
+        "the bounded Ids watch set materialised directly (S4, no JOIN)"
+    );
 }

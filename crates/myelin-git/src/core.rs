@@ -571,7 +571,10 @@ mod tests {
         assert_eq!(Service::UploadPack.git_subcommand(), "upload-pack");
         assert_eq!(Service::ReceivePack.git_subcommand(), "receive-pack");
         assert_eq!(Maintenance::Repack.git_subcommand(), "repack");
-        assert_eq!(Maintenance::WriteCommitGraph.git_subcommand(), "commit-graph");
+        assert_eq!(
+            Maintenance::WriteCommitGraph.git_subcommand(),
+            "commit-graph"
+        );
     }
 
     /// A recording executor proves the wire backend routes through the [`WireExecutor`] port (NOT a
@@ -664,12 +667,7 @@ mod tests {
         ) -> Result<Vec<DiffLine>, GitCoreError> {
             Ok(Vec::new())
         }
-        fn blame(
-            &self,
-            _r: &RepoLoc,
-            _p: &str,
-            _a: &Oid,
-        ) -> Result<Vec<BlameHunk>, GitCoreError> {
+        fn blame(&self, _r: &RepoLoc, _p: &str, _a: &Oid) -> Result<Vec<BlameHunk>, GitCoreError> {
             Ok(Vec::new())
         }
     }
@@ -720,17 +718,27 @@ mod tests {
         let core = RoutedGitCore::new(OkExec, StubRead);
         let repo = RepoLoc::new("acme", "fr-par", "widgets");
 
-        assert_eq!(core.route(GitOp::Serve(Service::UploadPack)), Backend::Shell);
+        assert_eq!(
+            core.route(GitOp::Serve(Service::UploadPack)),
+            Backend::Shell
+        );
         assert_eq!(core.route(GitOp::Read(ReadOp::Diff)), Backend::Gix);
 
         // Wire op succeeds through the shell backend.
         assert_eq!(
-            core.serve(&repo, Service::ReceivePack, vec![]).unwrap().stdout,
+            core.serve(&repo, Service::ReceivePack, vec![])
+                .unwrap()
+                .stdout,
             b"ok"
         );
         // Read op succeeds through the in-process backend.
         assert_eq!(core.read_blob(&repo, &Oid::new("abc")).unwrap(), b"blob");
-        assert_eq!(core.diff_blobs(&repo, &Oid::new("a"), &Oid::new("b")).unwrap().len(), 1);
+        assert_eq!(
+            core.diff_blobs(&repo, &Oid::new("a"), &Oid::new("b"))
+                .unwrap()
+                .len(),
+            1
+        );
         assert_eq!(core.blame(&repo, "f", &Oid::new("c")).unwrap().len(), 1);
     }
 }

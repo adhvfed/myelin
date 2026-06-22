@@ -36,16 +36,20 @@ use myelin_harness::{
     SignalName, SignalSource,
 };
 use myelin_identity::{Consistency, ConsistencyMode, Decision, Zookie};
-use myelin_substrate::{
-    AuthzServed, FailStaticAuthz, ServeError, TestClock, Thresholds,
-};
+use myelin_substrate::{AuthzServed, FailStaticAuthz, ServeError, TestClock, Thresholds};
 use myelin_tenancy::TenantId;
 
 fn bounded_stale() -> Consistency {
-    Consistency { at_least: Zookie(String::new()), mode: ConsistencyMode::BoundedStale }
+    Consistency {
+        at_least: Zookie(String::new()),
+        mode: ConsistencyMode::BoundedStale,
+    }
 }
 fn strong(z: &str) -> Consistency {
-    Consistency { at_least: Zookie(z.into()), mode: ConsistencyMode::Strong }
+    Consistency {
+        at_least: Zookie(z.into()),
+        mode: ConsistencyMode::Strong,
+    }
 }
 
 /// The authoritative authz source, driven by the **P-S03 injector**: it returns `Ok(Allow)` while
@@ -105,8 +109,14 @@ fn run_sub_d4_sequence() -> (SignalSource, FailStaticAuthz<TestClock>, i64) {
     // ── STEP 1 (authenticate, healthy): a default-consistency read is served FRESH + cached. ──
     let src = injector_source(&breaker, &scope);
     let healthy = fs.serve(key, &bounded_stale(), false, &src);
-    assert!(matches!(healthy.served, AuthzServed::Fresh), "healthy read is fresh + caches");
-    assert!(healthy.is_allow(), "alice's grant is allowed and the coarse answer is cached");
+    assert!(
+        matches!(healthy.served, AuthzServed::Fresh),
+        "healthy read is fresh + caches"
+    );
+    assert!(
+        healthy.is_allow(),
+        "alice's grant is allowed and the coarse answer is cached"
+    );
 
     // ── STEP 2 (the Id dependency BREAKS — the hiccup): a default-consistency read survives STATIC. ──
     breaker.break_dependency(Dependency::Identity, scope.clone());
@@ -121,7 +131,10 @@ fn run_sub_d4_sequence() -> (SignalSource, FailStaticAuthz<TestClock>, i64) {
         matches!(survived.served, AuthzServed::Static),
         "during the Id hiccup the default-consistency read survives on the coarse fail-static cache"
     );
-    assert!(survived.is_allow(), "authenticated traffic SURVIVES the hiccup (still Allow)");
+    assert!(
+        survived.is_allow(),
+        "authenticated traffic SURVIVES the hiccup (still Allow)"
+    );
 
     // ── STEP 3 (the zookie-bypass): a Strong read during the SAME hiccup fails CLOSED, not stale. ──
     let strong_during_hiccup = fs.serve(key, &strong("z-strong"), false, &src);
@@ -154,16 +167,23 @@ fn run_sub_d4_sequence() -> (SignalSource, FailStaticAuthz<TestClock>, i64) {
         } else {
             // before the window closes the deny is `Revoked`; after it could be `Revoked` (the
             // revoke gate fires first) — either way it must be a DENY.
-            if !matches!(d.served, AuthzServed::Revoked) && !matches!(d.served, AuthzServed::Closed) {
+            if !matches!(d.served, AuthzServed::Revoked) && !matches!(d.served, AuthzServed::Closed)
+            {
                 revoked_after_window_denied = false;
             }
         }
     }
-    assert!(revoked_after_window_denied, "every post-revoke read denied (revoked OR window-closed)");
+    assert!(
+        revoked_after_window_denied,
+        "every post-revoke read denied (revoked OR window-closed)"
+    );
 
     // ── STEP 5 (HEAL): restore the dependency so a re-run starts clean (reversibility). ──
     breaker.restore_dependency(Dependency::Identity, scope.clone());
-    assert!(!breaker.is_broken(&Dependency::Identity, &scope), "the injector restored to working");
+    assert!(
+        !breaker.is_broken(&Dependency::Identity, &scope),
+        "the injector restored to working"
+    );
 
     // ── Record the survival signals into the harness telemetry-assertion library (P-S04). ──
     let sig = fs.signals();
@@ -176,7 +196,10 @@ fn run_sub_d4_sequence() -> (SignalSource, FailStaticAuthz<TestClock>, i64) {
         sig.stale as i64,
     );
     // (2) the staleness age never exceeds static_max (≤ the revocation SLA).
-    signals.set_scalar(SignalName::FailStaticStalenessSecs, sig.last_staleness_secs as i64);
+    signals.set_scalar(
+        SignalName::FailStaticStalenessSecs,
+        sig.last_staleness_secs as i64,
+    );
     // (3) the revoked-after-cache leak count — must be 0 (0 successful authz for a revoked actor).
     //     Reuse CrossTenantCount as the zero-leak assertion channel (as ID-D2 / the harness do).
     signals.set_scalar(SignalName::CrossTenantCount, allowed_after_revoke);
@@ -228,7 +251,10 @@ fn sub_d4_fail_static_survives_hiccup_and_denies_revoked() {
 
     // The fresh/stale/closed answer ratio is OBSERVABLE (observability is part of the pass, EI-01 §3).
     assert!(sig.fresh >= 1, "≥ 1 fresh answer (the live authenticate)");
-    assert!(sig.stale >= 1, "≥ 1 stale answer (the hiccup survival rung)");
+    assert!(
+        sig.stale >= 1,
+        "≥ 1 stale answer (the hiccup survival rung)"
+    );
 
     println!(
         "[P-087 DRILL GREEN 2026-06-19] SUB-D4 Id-hiccup / fail-static: tenant=acme subject=p:alice \
@@ -250,12 +276,15 @@ fn sub_d4_fail_static_survives_hiccup_and_denies_revoked() {
 #[test]
 fn sub_d4_registers_in_the_drill_registry_and_reruns_green() {
     let mut registry = DrillRegistry::new();
-    registry.register_drill(DrillScenario::new("sub-d4-fail-static-vs-identity-hiccup", |_ctx| {
-        // Re-run the full chained sequence (it owns its own injector + cache so it is reproducible),
-        // then assert the survival signal off the harness telemetry library.
-        let (signals, _fs, _allowed) = run_sub_d4_sequence();
-        signals.assert_signal(SignalName::CrossTenantCount, Predicate::Eq(0))
-    }));
+    registry.register_drill(DrillScenario::new(
+        "sub-d4-fail-static-vs-identity-hiccup",
+        |_ctx| {
+            // Re-run the full chained sequence (it owns its own injector + cache so it is reproducible),
+            // then assert the survival signal off the harness telemetry library.
+            let (signals, _fs, _allowed) = run_sub_d4_sequence();
+            signals.assert_signal(SignalName::CrossTenantCount, Predicate::Eq(0))
+        },
+    ));
     assert_eq!(registry.len(), 1);
 
     // run twice to prove "re-runs forever".
@@ -267,6 +296,9 @@ fn sub_d4_registers_in_the_drill_registry_and_reruns_green() {
 
     // the dated green-artifact row (observability is part of the pass).
     let row = first[0].artifact_row("2026-06-19");
-    assert!(row.contains("sub-d4-fail-static-vs-identity-hiccup"), "the dated artifact names the drill");
+    assert!(
+        row.contains("sub-d4-fail-static-vs-identity-hiccup"),
+        "the dated artifact names the drill"
+    );
     println!("{row}");
 }

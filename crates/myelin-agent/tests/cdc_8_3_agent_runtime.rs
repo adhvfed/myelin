@@ -14,9 +14,7 @@
 //! - the **CONSUMER** is the platform loop (`Agent::handle`): it builds the `Conversation` and reads
 //!   the `StepOutcome` — `UseTools` (call these tools, step me again) or `Submit` (final answer).
 
-use myelin_agent::{
-    AgentRuntime, Conversation, StepOutcome, Submission, ToolCall, ToolName,
-};
+use myelin_agent::{AgentRuntime, Conversation, StepOutcome, Submission, ToolCall, ToolName};
 
 /// **PROVIDER side of 8.3 (a runtime).** A deterministic scripted brain — the `--use-mock` shape:
 /// `step` is a pure function of the conversation; the platform owns history, the runtime is
@@ -50,6 +48,8 @@ fn cdc_8_3_step_is_a_pure_function_of_the_conversation() {
     let mut later = Conversation::default();
     later
         .turns
-        .push(myelin_agent::Turn::Model(StepOutcome::Submit(Submission("x".into()))));
+        .push(myelin_agent::Turn::Model(StepOutcome::Submit(Submission(
+            "x".into(),
+        ))));
     assert!(matches!(provider.step(&later), StepOutcome::Submit(_)));
 }

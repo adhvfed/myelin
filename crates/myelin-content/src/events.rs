@@ -211,15 +211,17 @@ pub const KNOWLEDGE_PRESENCE_UPDATED: &str = "knowledge.presence.updated";
 /// The complete FIREHOSE-only `knowledge.*` list (the collab op-streams — NEVER the durable bus,
 /// ADR-04.5). These come online over the EB-21 transport (KN-D1); the durable bus carries only the
 /// pointer events above.
-pub const KNOWLEDGE_FIREHOSE_TOKENS: &[&str] =
-    &[KNOWLEDGE_BLOCK_OP, KNOWLEDGE_PRESENCE_UPDATED];
+pub const KNOWLEDGE_FIREHOSE_TOKENS: &[&str] = &[KNOWLEDGE_BLOCK_OP, KNOWLEDGE_PRESENCE_UPDATED];
 
 /// Register Knowledge's complete `knowledge.*` list (durable + firehose) against the Bus grammar
 /// (contract 2.9). Returns `Ok(())` iff EVERY registered token parses the §6.1 grammar via the one
 /// Bus validator; otherwise the first offending token + its [`myelin_events::TaxonomyError`] (LOUD).
 /// Knowledge REGISTERS its list against the grammar it does not own.
 pub fn register_knowledge_tokens() -> Result<(), (&'static str, myelin_events::TaxonomyError)> {
-    for &tok in KNOWLEDGE_DURABLE_TOKENS.iter().chain(KNOWLEDGE_FIREHOSE_TOKENS) {
+    for &tok in KNOWLEDGE_DURABLE_TOKENS
+        .iter()
+        .chain(KNOWLEDGE_FIREHOSE_TOKENS)
+    {
         validate_event_type(tok).map_err(|e| (tok, e))?;
     }
     Ok(())
@@ -233,7 +235,10 @@ mod tests {
     /// (durable + firehose) parses the Bus §6.1/§6.2 grammar via the one Bus validator.
     #[test]
     fn every_knowledge_token_parses_the_bus_grammar() {
-        for &tok in KNOWLEDGE_DURABLE_TOKENS.iter().chain(KNOWLEDGE_FIREHOSE_TOKENS) {
+        for &tok in KNOWLEDGE_DURABLE_TOKENS
+            .iter()
+            .chain(KNOWLEDGE_FIREHOSE_TOKENS)
+        {
             assert!(
                 validate_event_type(tok).is_ok(),
                 "registered knowledge token `{tok}` is UNGRAMMATICAL: {:?}",
@@ -246,7 +251,10 @@ mod tests {
     /// Every registered token carries the canonical `knowledge` subsystem prefix (§6.2).
     #[test]
     fn every_knowledge_token_carries_the_knowledge_prefix() {
-        for &tok in KNOWLEDGE_DURABLE_TOKENS.iter().chain(KNOWLEDGE_FIREHOSE_TOKENS) {
+        for &tok in KNOWLEDGE_DURABLE_TOKENS
+            .iter()
+            .chain(KNOWLEDGE_FIREHOSE_TOKENS)
+        {
             assert_eq!(tok.split('.').next().unwrap(), "knowledge");
         }
         assert!(myelin_events::SUBSYSTEM_TOKENS.contains(&"knowledge"));
@@ -268,16 +276,28 @@ mod tests {
     #[test]
     fn the_knowledge_list_has_no_duplicates() {
         let mut seen = std::collections::BTreeSet::new();
-        for &tok in KNOWLEDGE_DURABLE_TOKENS.iter().chain(KNOWLEDGE_FIREHOSE_TOKENS) {
-            assert!(seen.insert(tok), "knowledge token `{tok}` registered more than once");
+        for &tok in KNOWLEDGE_DURABLE_TOKENS
+            .iter()
+            .chain(KNOWLEDGE_FIREHOSE_TOKENS)
+        {
+            assert!(
+                seen.insert(tok),
+                "knowledge token `{tok}` registered more than once"
+            );
         }
     }
 
     /// Knowledge registers no foreign-subsystem token (the acyclic-producer invariant, EI-02 §3).
     #[test]
     fn knowledge_registers_no_foreign_subsystem_tokens() {
-        for &tok in KNOWLEDGE_DURABLE_TOKENS.iter().chain(KNOWLEDGE_FIREHOSE_TOKENS) {
-            assert!(tok.starts_with("knowledge."), "foreign-subsystem token `{tok}`");
+        for &tok in KNOWLEDGE_DURABLE_TOKENS
+            .iter()
+            .chain(KNOWLEDGE_FIREHOSE_TOKENS)
+        {
+            assert!(
+                tok.starts_with("knowledge."),
+                "foreign-subsystem token `{tok}`"
+            );
         }
     }
 }

@@ -35,24 +35,40 @@ async fn flow_shell_migration_set_applies_against_live_postgres() {
     // The owner/migration role runs the DDL (production migrations run as the owner).
     let admin = sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)
-        .connect(&cfg.database_url.replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw"))
+        .connect(
+            &cfg.database_url
+                .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw"),
+        )
         .await
         .expect("connect as admin (is the dev stack up?)");
 
     // The EXACT migration set the shell's AppSpec wires (no second schema — same `migrations()`).
     let spec = flow_app_spec(Config::default());
     assert_eq!(spec.name, SERVICE_NAME);
-    assert_eq!(spec.migrations.0.len(), 6, "the six-table P-FLOW-01 set the shell migrates over");
+    assert_eq!(
+        spec.migrations.0.len(),
+        6,
+        "the six-table P-FLOW-01 set the shell migrates over"
+    );
 
     // A per-process schema so concurrent test runs isolate + cleanup is a single DROP SCHEMA. All
     // DDL + the existence checks run on ONE pinned connection (the search_path is connection-local).
     let schema = format!("flow_shell_probe_{}", std::process::id());
     let mut conn = admin.acquire().await.unwrap();
-    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).execute(&mut *conn).await.unwrap();
-    sqlx::query(&format!("CREATE SCHEMA {schema}")).execute(&mut *conn).await.unwrap();
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&mut *conn)
+        .await
+        .unwrap();
     // Route unqualified table names into the probe schema; keep `public` so
     // `myelin_make_tenant_scoped` (defined in public by pg-init) resolves.
-    sqlx::query(&format!("SET search_path TO {schema}, public")).execute(&mut *conn).await.unwrap();
+    sqlx::query(&format!("SET search_path TO {schema}, public"))
+        .execute(&mut *conn)
+        .await
+        .unwrap();
 
     // Apply each migration's DDL (it is one-or-more `;`-separated statements: CREATE TABLE [+ index]
     // [+ RLS-scope call]) against live Postgres — exactly what boot's migrate phase runs.
@@ -65,7 +81,12 @@ async fn flow_shell_migration_set_applies_against_live_postgres() {
             sqlx::query(stmt)
                 .execute(&mut *conn)
                 .await
-                .unwrap_or_else(|e| panic!("migration `{}` statement failed live: {e}\nSQL: {stmt}", migration.id));
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "migration `{}` statement failed live: {e}\nSQL: {stmt}",
+                        migration.id
+                    )
+                });
         }
     }
 
@@ -79,8 +100,14 @@ async fn flow_shell_migration_set_applies_against_live_postgres() {
         .fetch_one(&mut *conn)
         .await
         .unwrap();
-        assert!(exists, "the shell's migrate phase created `{table}` in Postgres");
+        assert!(
+            exists,
+            "the shell's migrate phase created `{table}` in Postgres"
+        );
     }
 
-    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE")).execute(&mut *conn).await.unwrap();
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&mut *conn)
+        .await
+        .unwrap();
 }

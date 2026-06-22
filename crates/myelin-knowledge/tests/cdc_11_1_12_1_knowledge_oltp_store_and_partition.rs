@@ -62,7 +62,11 @@ fn consumer_knowledge_store_opens_its_own_bounded_oltp_pool() {
     let permit = store.pool().acquire(&acme).expect("acquire a permit");
     assert_eq!(store.pool().in_flight(), 1);
     drop(permit);
-    assert_eq!(store.pool().in_flight(), 0, "dropping the permit releases it");
+    assert_eq!(
+        store.pool().in_flight(),
+        0,
+        "dropping the permit releases it"
+    );
 }
 
 /// **CONSUMER side of 11.1/12.1 — every Knowledge query carries its `(tenant, region)` predicate.**
@@ -137,8 +141,7 @@ fn drill_kn_d13_cross_tenant_path_spoof_is_rejected_zero_cross_tenant() {
     let store = KnowledgeStore::open(cfg()).expect("open");
     let q = store.query(scope, KnowledgeTable::Page);
     assert!(
-        q.predicate_sql().contains("tenant = 'acme'")
-            && !q.predicate_sql().contains("evil-corp"),
+        q.predicate_sql().contains("tenant = 'acme'") && !q.predicate_sql().contains("evil-corp"),
         "KN-D13: the resolved page query is pinned to the token tenant, never the spoofed path"
     );
 }

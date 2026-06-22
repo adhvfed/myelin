@@ -316,7 +316,8 @@ mod tests {
     use crate::effect_api::{ApplyError, EffectCost, PipelineSignals, PipelineStep};
     use crate::mock::MockAgentRuntime;
     use myelin_agent::{
-        BudgetView, EffectKind, EventId, StepOutcome, Submission, SystemContext, ToolDef, ToolSchema,
+        BudgetView, EffectKind, EventId, StepOutcome, Submission, SystemContext, ToolDef,
+        ToolSchema,
     };
     use myelin_identity::{
         CaveatContext, Consistency, Decision, EffectivePolicy, Permission, Principal, PrincipalId,
@@ -429,7 +430,8 @@ mod tests {
             name: ToolName(name.into()),
             subsystem: subsystem.into(),
             version: 1,
-            input_schema: r#"{"type":"object","required":["x"],"properties":{"x":{"type":"string"}}}"#.into(),
+            input_schema:
+                r#"{"type":"object","required":["x"],"properties":{"x":{"type":"string"}}}"#.into(),
             required_caps: caps.iter().map(|c| c.to_string()).collect(),
             effect_kind: EffectKind::Mutate,
             side_effecting: true,
@@ -458,7 +460,10 @@ mod tests {
     fn merge_then_post_script() -> MockScript {
         MockScript::new(
             SystemContext("you are agent-7".into()),
-            vec![ToolSchema("git.merge".into()), ToolSchema("chat.post_message".into())],
+            vec![
+                ToolSchema("git.merge".into()),
+                ToolSchema("chat.post_message".into()),
+            ],
             BudgetView(100),
             vec![
                 StepOutcome::UseTools(vec![ToolCall(ToolName("git.merge".into()))]),
@@ -481,7 +486,12 @@ mod tests {
         Catalogue {
             defs: vec![
                 tool_def("git", "git.merge", &["git.merge"], /* gated */ true),
-                tool_def("chat", "chat.post_message", &["chat.post"], /* gated */ false),
+                tool_def(
+                    "chat",
+                    "chat.post_message",
+                    &["chat.post"],
+                    /* gated */ false,
+                ),
             ],
         }
     }
@@ -519,7 +529,9 @@ mod tests {
     fn dry_run_returns_the_plan_with_zero_applies_and_zero_meter() {
         let cat = catalogue();
         let check = Checker {
-            allow: ["git.merge".to_string(), "chat.post".to_string()].into_iter().collect(),
+            allow: ["git.merge".to_string(), "chat.post".to_string()]
+                .into_iter()
+                .collect(),
         };
         let del = Delegator {
             policy: vec!["git.merge".into(), "chat.post".into()],
@@ -528,7 +540,15 @@ mod tests {
         let endpoint = NeverApply;
         let mut budget = ReadOnlyBudget { remaining: 100 };
         let mut signals = PipelineSignals::new();
-        let p = pipeline(&cat, &check, &del, &tenant, &endpoint, &mut budget, &mut signals);
+        let p = pipeline(
+            &cat,
+            &check,
+            &del,
+            &tenant,
+            &endpoint,
+            &mut budget,
+            &mut signals,
+        );
 
         let script = merge_then_post_script();
         let brain = MockAgentRuntime::new(script.clone());
@@ -537,17 +557,33 @@ mod tests {
         // the PLAN: two proposed effects, in order (git.merge, chat.post_message). 0 mutation reached.
         let plan = planner.plan(&brain, &script);
         assert_eq!(plan.len(), 2, "the run proposed two effects (merge, post)");
-        assert_eq!(plan[0], crate::effect_api::encode_proposed(&planned("git.merge", "git.merge")));
-        assert_eq!(plan[1], crate::effect_api::encode_proposed(&planned("chat.post_message", "agent.effect")));
+        assert_eq!(
+            plan[0],
+            crate::effect_api::encode_proposed(&planned("git.merge", "git.merge"))
+        );
+        assert_eq!(
+            plan[1],
+            crate::effect_api::encode_proposed(&planned("chat.post_message", "agent.effect"))
+        );
 
         // the verdicts: git.merge WOULD GATE (requires_approval); chat.post_message WOULD APPLY.
         let entries = planner.plan_with_verdicts(&brain, &script);
-        assert!(matches!(entries[0].verdict, PlanVerdict::WouldGate(_)), "merge WOULD gate (AG-8)");
-        assert_eq!(entries[1].verdict, PlanVerdict::WouldApply, "post WOULD apply");
+        assert!(
+            matches!(entries[0].verdict, PlanVerdict::WouldGate(_)),
+            "merge WOULD gate (AG-8)"
+        );
+        assert_eq!(
+            entries[1].verdict,
+            PlanVerdict::WouldApply,
+            "post WOULD apply"
+        );
 
         // the GATE: the wallet is UNCHANGED (0 applies, 0 meters; the endpoint/meter panic-guards
         // never fired). The signals never recorded an apply or a meter (a dry-run is observational).
-        assert_eq!(budget.remaining, 100, "the reserve balance is UNCHANGED after a dry-run");
+        assert_eq!(
+            budget.remaining, 100,
+            "the reserve balance is UNCHANGED after a dry-run"
+        );
         assert_eq!(signals.applied(), 0, "0 applies");
         assert_eq!(signals.metered_total(), 0, "0 metered effects");
         assert_eq!(signals.privileged_fallback(), 0);
@@ -563,13 +599,22 @@ mod tests {
 
         let first = proposed_effect_sequence(&brain, &script, &effect_for, MOCK_MAX_STEPS);
         let second = proposed_effect_sequence(&brain, &script, &effect_for, MOCK_MAX_STEPS);
-        assert_eq!(first, second, "AG-D9: two runs produce byte-identical proposed-effect sequences");
+        assert_eq!(
+            first, second,
+            "AG-D9: two runs produce byte-identical proposed-effect sequences"
+        );
 
         // the sequence is exactly the two routed effects, in order (merge, post). read/compute calls
         // would NOT appear (they don't route through EffectApi).
         assert_eq!(first.len(), 2);
-        assert_eq!(first[0], crate::effect_api::encode_proposed(&planned("git.merge", "git.merge")));
-        assert_eq!(first[1], crate::effect_api::encode_proposed(&planned("chat.post_message", "agent.effect")));
+        assert_eq!(
+            first[0],
+            crate::effect_api::encode_proposed(&planned("git.merge", "git.merge"))
+        );
+        assert_eq!(
+            first[1],
+            crate::effect_api::encode_proposed(&planned("chat.post_message", "agent.effect"))
+        );
 
         // byte-identity is literal: the carriers are equal strings.
         assert_eq!(first[0].0, second[0].0, "the carrier bytes are identical");
@@ -592,8 +637,15 @@ mod tests {
         );
         let brain = MockAgentRuntime::new(script.clone());
         let seq = proposed_effect_sequence(&brain, &script, &effect_for, MOCK_MAX_STEPS);
-        assert_eq!(seq.len(), 1, "only the mutate call (git.merge) is a proposed effect");
-        assert_eq!(seq[0], crate::effect_api::encode_proposed(&planned("git.merge", "git.merge")));
+        assert_eq!(
+            seq.len(),
+            1,
+            "only the mutate call (git.merge) is a proposed effect"
+        );
+        assert_eq!(
+            seq[0],
+            crate::effect_api::encode_proposed(&planned("git.merge", "git.merge"))
+        );
     }
 
     /// **A dry-run plan surfaces a would-DENY without mutating (the plan shows the deny verdict).** A
@@ -605,12 +657,22 @@ mod tests {
             allow: ["git.merge".to_string()].into_iter().collect(),
         };
         // delegation ∩ does NOT include git.merge → would-deny at step 3 (delegation).
-        let del = Delegator { policy: vec!["chat.post".into()] };
+        let del = Delegator {
+            policy: vec!["chat.post".into()],
+        };
         let tenant = Tenant;
         let endpoint = NeverApply;
         let mut budget = ReadOnlyBudget { remaining: 100 };
         let mut signals = PipelineSignals::new();
-        let p = pipeline(&cat, &check, &del, &tenant, &endpoint, &mut budget, &mut signals);
+        let p = pipeline(
+            &cat,
+            &check,
+            &del,
+            &tenant,
+            &endpoint,
+            &mut budget,
+            &mut signals,
+        );
 
         let script = MockScript::new(
             SystemContext("s".into()),
@@ -628,11 +690,17 @@ mod tests {
         assert_eq!(entries.len(), 1);
         match &entries[0].verdict {
             PlanVerdict::WouldDeny(PipelineStep::Delegation, reason) => {
-                assert!(reason.contains("intersection"), "the deny verdict names the ∩: {reason}")
+                assert!(
+                    reason.contains("intersection"),
+                    "the deny verdict names the ∩: {reason}"
+                )
             }
             other => panic!("expected a would-deny at delegation, got {other:?}"),
         }
-        assert_eq!(budget.remaining, 100, "a would-deny dry-run still mutates/meters NOTHING");
+        assert_eq!(
+            budget.remaining, 100,
+            "a would-deny dry-run still mutates/meters NOTHING"
+        );
     }
 
     /// **`dry_run_plan` (the default-bounded convenience) returns the same plan.** The common entry a
@@ -641,7 +709,9 @@ mod tests {
     fn dry_run_plan_convenience_returns_the_plan() {
         let cat = catalogue();
         let check = Checker {
-            allow: ["git.merge".to_string(), "chat.post".to_string()].into_iter().collect(),
+            allow: ["git.merge".to_string(), "chat.post".to_string()]
+                .into_iter()
+                .collect(),
         };
         let del = Delegator {
             policy: vec!["git.merge".into(), "chat.post".into()],
@@ -650,11 +720,22 @@ mod tests {
         let endpoint = NeverApply;
         let mut budget = ReadOnlyBudget { remaining: 100 };
         let mut signals = PipelineSignals::new();
-        let p = pipeline(&cat, &check, &del, &tenant, &endpoint, &mut budget, &mut signals);
+        let p = pipeline(
+            &cat,
+            &check,
+            &del,
+            &tenant,
+            &endpoint,
+            &mut budget,
+            &mut signals,
+        );
 
         let script = merge_then_post_script();
         let plan = dry_run_plan(&p, &script, effect_for);
         assert_eq!(plan.len(), 2);
-        assert_eq!(budget.remaining, 100, "the convenience is side-effect-free too");
+        assert_eq!(
+            budget.remaining, 100,
+            "the convenience is side-effect-free too"
+        );
     }
 }

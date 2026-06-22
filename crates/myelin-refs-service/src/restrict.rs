@@ -42,7 +42,10 @@ impl RestrictSet {
     /// Is `subject_id` restricted? The indexer / backlink read / agent-use consult this to suppress a
     /// restricted subject's references (GA-D7). A non-restricted subject is `false` (the common path).
     pub fn is_restricted(&self, subject_id: &str) -> bool {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).contains(subject_id)
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(subject_id)
     }
 
     /// The count of restricted subjects (observability — how many subjects are under restriction).
@@ -69,7 +72,10 @@ mod tests {
         s.set("p-opaque-1", true);
         assert!(s.is_restricted("p-opaque-1"), "restrict on → suppressed");
         s.set("p-opaque-1", false);
-        assert!(!s.is_restricted("p-opaque-1"), "restrict off → re-enabled (not deleted)");
+        assert!(
+            !s.is_restricted("p-opaque-1"),
+            "restrict off → re-enabled (not deleted)"
+        );
     }
 
     /// **Idempotent: setting twice is one entry; clearing an absent one is a no-op.**
@@ -105,6 +111,9 @@ mod tests {
         let writer = RestrictSet::new();
         let reader = writer.clone();
         writer.set("p-9", true);
-        assert!(reader.is_restricted("p-9"), "the reader sees the holder's restriction");
+        assert!(
+            reader.is_restricted("p-9"),
+            "the reader sees the holder's restriction"
+        );
     }
 }

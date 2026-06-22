@@ -91,7 +91,9 @@ impl CellSigningKey {
     /// from the KMS, P-ST-06). Distinct seeds produce distinct signatures (a forged STH signed by a
     /// different key is rejected).
     pub fn from_seed(seed: &str) -> CellSigningKey {
-        CellSigningKey { key: *blake3::hash(seed.as_bytes()).as_bytes() }
+        CellSigningKey {
+            key: *blake3::hash(seed.as_bytes()).as_bytes(),
+        }
     }
 }
 
@@ -336,7 +338,12 @@ impl<K: SigningKey> AuditAuthority<K> {
     /// **`consistency_proof(t1, t2) → Proof` (contract 10.6).** The RFC-6962 consistency path
     /// proving the tree of size `first` is an append-only prefix of the tree of size `second`.
     /// `None` if the sizes are out of range or `first > second`.
-    pub fn consistency_proof(&self, tenant: &TenantId, first: u64, second: u64) -> Option<ConsistencyProof> {
+    pub fn consistency_proof(
+        &self,
+        tenant: &TenantId,
+        first: u64,
+        second: u64,
+    ) -> Option<ConsistencyProof> {
         let leaves = self.consumer.log().leaf_digests(tenant);
         consistency_proof_over(&leaves, first, second)
     }
@@ -344,7 +351,11 @@ impl<K: SigningKey> AuditAuthority<K> {
     /// **Anchor an STH to an independent witness (gdpr §6.3).** The witness sees ONLY the opaque
     /// root + size (no PII — residency-safe) and countersigns. The returned attestation is the
     /// fixed point a later tampered tree cannot match.
-    pub fn anchor_to_witness(&self, sth: &SignedTreeHead, witness: &dyn Witness) -> WitnessAttestation {
+    pub fn anchor_to_witness(
+        &self,
+        sth: &SignedTreeHead,
+        witness: &dyn Witness,
+    ) -> WitnessAttestation {
         witness.anchor(&sth.tenant, sth.tree_size, &sth.root_hash)
     }
 
@@ -389,11 +400,15 @@ impl<K: SigningKey> AuditAuthority<K> {
     /// evidence guarantee: erasing a person never breaks the log (the real identity lived in Id's
     /// erasable pseudonym map, never in the entry).
     pub fn carve_out_erase(&self, tenant: &TenantId, signed_at: &str) -> bool {
-        let root_before = self.signed_tree_head(tenant, signed_at).map(|s| s.root_hash);
+        let root_before = self
+            .signed_tree_head(tenant, signed_at)
+            .map(|s| s.root_hash);
         // The carve-out is a NO-OP on the chain (retain, never rewrite). The audit log holds only
         // the minimised opaque pseudonym; the subject's identity is shredded in Id's pseudonym map
         // (a different store), NOT here. So nothing in the tree changes.
-        let root_after = self.signed_tree_head(tenant, signed_at).map(|s| s.root_hash);
+        let root_after = self
+            .signed_tree_head(tenant, signed_at)
+            .map(|s| s.root_hash);
         self.consumer.log().verify_chain(tenant) && root_before == root_after
     }
 
@@ -526,7 +541,11 @@ pub fn verify_inclusion(proof: &InclusionProof, sth: &SignedTreeHead) -> bool {
 /// carries the two roots + the `first`-prefix subtree path; verification ([`verify_consistency`])
 /// recomputes the `first` root from the prefix of the `second` tree's leaves and confirms it
 /// matches the old STH (proving append-only — no fork/rewrite). `None` if out of range.
-pub fn consistency_proof_over(leaves: &[[u8; 32]], first: u64, second: u64) -> Option<ConsistencyProof> {
+pub fn consistency_proof_over(
+    leaves: &[[u8; 32]],
+    first: u64,
+    second: u64,
+) -> Option<ConsistencyProof> {
     let n = leaves.len() as u64;
     if first == 0 || first > second || second > n {
         return None;
@@ -552,7 +571,11 @@ pub fn consistency_proof_over(leaves: &[[u8; 32]], first: u64, second: u64) -> O
 /// `first_root`, and that the new STH matches the proof's `second_root`. A log that was forked or
 /// rewritten between the two STHs FAILS: the recomputed prefix root no longer matches the old STH's
 /// committed root. This is the second independent GA-D3 detection.
-pub fn verify_consistency(proof: &ConsistencyProof, old_sth: &SignedTreeHead, new_sth: &SignedTreeHead) -> bool {
+pub fn verify_consistency(
+    proof: &ConsistencyProof,
+    old_sth: &SignedTreeHead,
+    new_sth: &SignedTreeHead,
+) -> bool {
     if old_sth.tree_size != proof.first || new_sth.tree_size != proof.second {
         return false;
     }
@@ -573,7 +596,10 @@ pub fn verify_consistency(proof: &ConsistencyProof, old_sth: &SignedTreeHead, ne
 /// [`MerkleProvenBundle::merkle_inclusion`] (a verifiable, PII-free string the certificate carries).
 fn serialize_inclusion(p: &InclusionProof) -> String {
     let path = p.audit_path.join("|");
-    format!("{}@{}:{}|{}->{}", p.leaf_index, p.tree_size, p.leaf_hash, path, p.root_hash)
+    format!(
+        "{}@{}:{}|{}->{}",
+        p.leaf_index, p.tree_size, p.leaf_hash, path, p.root_hash
+    )
 }
 
 /// Serialise an STH to the compact `size@root@signed_at` commitment string (the chain-of-custody
@@ -690,17 +716,27 @@ mod tests {
             let auth = authority();
             append_n(&auth, "acme", n);
             let tenant = TenantId("acme".into());
-            let sth = auth.signed_tree_head(&tenant, "2026-06-20T00:00:00Z").expect("STH for a non-empty tree");
+            let sth = auth
+                .signed_tree_head(&tenant, "2026-06-20T00:00:00Z")
+                .expect("STH for a non-empty tree");
             assert_eq!(sth.tree_size, n as u64, "the STH commits the tree size");
-            assert!(sth.verify_signature(auth.key()), "the STH signature verifies in-cell");
+            assert!(
+                sth.verify_signature(auth.key()),
+                "the STH signature verifies in-cell"
+            );
             for seq in 0..n as u64 {
-                let proof = auth.inclusion_proof(&tenant, seq).expect("a proof for an in-range leaf");
+                let proof = auth
+                    .inclusion_proof(&tenant, seq)
+                    .expect("a proof for an in-range leaf");
                 assert!(
                     verify_inclusion(&proof, &sth),
                     "leaf {seq} of a size-{n} tree verifies against the STH root"
                 );
             }
-            assert!(auth.inclusion_proof(&tenant, n as u64).is_none(), "out-of-range seq → no proof");
+            assert!(
+                auth.inclusion_proof(&tenant, n as u64).is_none(),
+                "out-of-range seq → no proof"
+            );
         }
     }
 
@@ -717,19 +753,29 @@ mod tests {
         // Tamper a sibling node → verification fails.
         let mut tampered = good.clone();
         if let Some(first) = tampered.audit_path.first_mut() {
-            *first = "blake3:0000000000000000000000000000000000000000000000000000000000000000".into();
+            *first =
+                "blake3:0000000000000000000000000000000000000000000000000000000000000000".into();
         }
-        assert!(!verify_inclusion(&tampered, &sth), "a tampered audit path fails");
+        assert!(
+            !verify_inclusion(&tampered, &sth),
+            "a tampered audit path fails"
+        );
 
         // Claim the leaf at the wrong index → fails.
         let mut wrong_index = good.clone();
         wrong_index.leaf_index = 3;
-        assert!(!verify_inclusion(&wrong_index, &sth), "a wrong leaf index fails");
+        assert!(
+            !verify_inclusion(&wrong_index, &sth),
+            "a wrong leaf index fails"
+        );
 
         // A proof against a DIFFERENT (later) STH fails (the tree size / root differ).
         append_n(&auth, "acme", 1);
         let later = auth.signed_tree_head(&tenant, "t2").unwrap();
-        assert!(!verify_inclusion(&good, &later), "a proof against a later STH fails (size differs)");
+        assert!(
+            !verify_inclusion(&good, &later),
+            "a proof against a later STH fails (size differs)"
+        );
     }
 
     /// The `verify_inclusion` STH-match guard checks BOTH fields INDEPENDENTLY (kills the `||`→`&&`
@@ -748,12 +794,18 @@ mod tests {
         // Right root, WRONG size → fail (size-only mismatch).
         let mut wrong_size = sth.clone();
         wrong_size.tree_size = 99;
-        assert!(!verify_inclusion(&proof, &wrong_size), "a size-only mismatch is rejected");
+        assert!(
+            !verify_inclusion(&proof, &wrong_size),
+            "a size-only mismatch is rejected"
+        );
 
         // Right size, WRONG root → fail (root-only mismatch).
         let mut wrong_root = sth.clone();
         wrong_root.root_hash = "blake3:deadbeef".into();
-        assert!(!verify_inclusion(&proof, &wrong_root), "a root-only mismatch is rejected");
+        assert!(
+            !verify_inclusion(&proof, &wrong_root),
+            "a root-only mismatch is rejected"
+        );
     }
 
     /// The `verify_consistency` STH-match guards check each field INDEPENDENTLY (kills the `||`→`&&`
@@ -768,24 +820,39 @@ mod tests {
         append_n(&auth, "acme", 2);
         let new = auth.signed_tree_head(&tenant, "t2").unwrap();
         let proof = auth.consistency_proof(&tenant, 3, 5).unwrap();
-        assert!(verify_consistency(&proof, &old, &new), "the honest proof verifies");
+        assert!(
+            verify_consistency(&proof, &old, &new),
+            "the honest proof verifies"
+        );
 
         // A WRONG old size (the new is right) → fail.
         let mut bad_old_size = old.clone();
         bad_old_size.tree_size = 2;
-        assert!(!verify_consistency(&proof, &bad_old_size, &new), "a wrong old size is rejected");
+        assert!(
+            !verify_consistency(&proof, &bad_old_size, &new),
+            "a wrong old size is rejected"
+        );
         // A WRONG new size (the old is right) → fail.
         let mut bad_new_size = new.clone();
         bad_new_size.tree_size = 9;
-        assert!(!verify_consistency(&proof, &old, &bad_new_size), "a wrong new size is rejected");
+        assert!(
+            !verify_consistency(&proof, &old, &bad_new_size),
+            "a wrong new size is rejected"
+        );
         // A WRONG old root (sizes right) → fail.
         let mut bad_old_root = old.clone();
         bad_old_root.root_hash = "blake3:deadbeef".into();
-        assert!(!verify_consistency(&proof, &bad_old_root, &new), "a wrong old root is rejected");
+        assert!(
+            !verify_consistency(&proof, &bad_old_root, &new),
+            "a wrong old root is rejected"
+        );
         // A WRONG new root (sizes right) → fail.
         let mut bad_new_root = new.clone();
         bad_new_root.root_hash = "blake3:deadbeef".into();
-        assert!(!verify_consistency(&proof, &old, &bad_new_root), "a wrong new root is rejected");
+        assert!(
+            !verify_consistency(&proof, &old, &bad_new_root),
+            "a wrong new root is rejected"
+        );
     }
 
     /// The STH SIGNATURE binds the (tree_size, root) — two DIFFERENT trees produce DIFFERENT
@@ -805,8 +872,14 @@ mod tests {
             "distinct (size, root) produce distinct STH signatures — the preimage binds them"
         );
         // Splicing sth2's signature onto sth5's body does NOT verify (the signature is over the body).
-        let spliced = SignedTreeHead { signature: sth2.signature.clone(), ..sth5.clone() };
-        assert!(!spliced.verify_signature(auth.key()), "a spliced signature does not verify");
+        let spliced = SignedTreeHead {
+            signature: sth2.signature.clone(),
+            ..sth5.clone()
+        };
+        assert!(
+            !spliced.verify_signature(auth.key()),
+            "a spliced signature does not verify"
+        );
     }
 
     /// `consistency_proof` verifies between two STHs of an APPEND-ONLY log.
@@ -819,13 +892,21 @@ mod tests {
         append_n(&auth, "acme", 4); // now 7 leaves — the old tree is a prefix.
         let new = auth.signed_tree_head(&tenant, "t2").unwrap();
 
-        let proof = auth.consistency_proof(&tenant, 3, 7).expect("a consistency proof");
+        let proof = auth
+            .consistency_proof(&tenant, 3, 7)
+            .expect("a consistency proof");
         assert!(
             verify_consistency(&proof, &old, &new),
             "the size-3 tree is an append-only prefix of the size-7 tree"
         );
-        assert!(auth.consistency_proof(&tenant, 7, 3).is_none(), "first>second → no proof");
-        assert!(auth.consistency_proof(&tenant, 3, 99).is_none(), "second>size → no proof");
+        assert!(
+            auth.consistency_proof(&tenant, 7, 3).is_none(),
+            "first>second → no proof"
+        );
+        assert!(
+            auth.consistency_proof(&tenant, 3, 99).is_none(),
+            "second>size → no proof"
+        );
     }
 
     /// **GA-D3 (1 of 3 / the consistency detection): a retroactive edit makes the consistency proof
@@ -867,12 +948,20 @@ mod tests {
         let witness = NotaryWitness::new(CellSigningKey::from_seed("notary:cell-b"));
         let attestation = auth.anchor_to_witness(&sth, &witness);
         // The witness saw NO PII — only the root + size.
-        assert_eq!(attestation.witnessed_root, sth.root_hash, "the witness pins the opaque root");
+        assert_eq!(
+            attestation.witnessed_root, sth.root_hash,
+            "the witness pins the opaque root"
+        );
         assert_eq!(attestation.tree_size, 5);
 
         // The honest current root at that size matches the attestation.
-        let honest_root = render(&audit::merkle_root(&auth.consumer().log().leaf_digests(&tenant)));
-        assert!(attestation.matches(&honest_root), "the honest tree matches the witness");
+        let honest_root = render(&audit::merkle_root(
+            &auth.consumer().log().leaf_digests(&tenant),
+        ));
+        assert!(
+            attestation.matches(&honest_root),
+            "the honest tree matches the witness"
+        );
 
         // A tampered tree's root at that size DIFFERS → the witness mismatches.
         let mut leaves = auth.consumer().log().leaf_digests(&tenant);
@@ -891,12 +980,19 @@ mod tests {
     fn the_witness_sees_only_an_opaque_root_no_pii() {
         let auth = authority();
         let tenant = TenantId("acme".into());
-        auth.consumer().handle(&action_event("01J-1", "acme", "myelin://acme/SENSITIVE-SUBJECT"));
+        auth.consumer().handle(&action_event(
+            "01J-1",
+            "acme",
+            "myelin://acme/SENSITIVE-SUBJECT",
+        ));
         let sth = auth.signed_tree_head(&tenant, "t1").unwrap();
         let witness = NotaryWitness::new(CellSigningKey::from_seed("notary"));
         let attestation = auth.anchor_to_witness(&sth, &witness);
         // The attestation carries the opaque root + size + tenant — never an entry subject/actor.
-        assert!(attestation.witnessed_root.starts_with("blake3:"), "the witness sees an opaque hash");
+        assert!(
+            attestation.witnessed_root.starts_with("blake3:"),
+            "the witness sees an opaque hash"
+        );
         assert!(
             !attestation.witnessed_root.contains("SENSITIVE-SUBJECT"),
             "no entry subject content reaches the witness (residency-safe)"
@@ -916,26 +1012,53 @@ mod tests {
         let bundle = MerkleProvenBundle {
             dsr_id: DsrId("dsr-1".into()),
             receipts: vec!["blake3:aa".into(), "blake3:bb".into()],
-            bundle_digest: "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into(),
+            bundle_digest:
+                "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into(),
             merkle_inclusion: None,
         };
-        assert!(bundle.merkle_inclusion.is_none(), "unsealed bundle has no inclusion proof");
+        assert!(
+            bundle.merkle_inclusion.is_none(),
+            "unsealed bundle has no inclusion proof"
+        );
 
         let sealed = auth.seal_dsr_certificate(&tenant, &region, &bundle, "2026-06-20T01:00:00Z");
-        let inclusion_str = sealed.merkle_inclusion.clone().expect("the sealed bundle carries the proof");
-        assert_eq!(sealed.bundle_digest, bundle.bundle_digest, "the digest is preserved");
+        let inclusion_str = sealed
+            .merkle_inclusion
+            .clone()
+            .expect("the sealed bundle carries the proof");
+        assert_eq!(
+            sealed.bundle_digest, bundle.bundle_digest,
+            "the digest is preserved"
+        );
         // The serialised inclusion is the real `seq@size:leaf|path->root` form (kills the
         // `serialize_inclusion -> ""` mutant): it carries the leaf index, the tree size, and the
         // root-reduction arrow over real `blake3:` nodes.
-        assert!(inclusion_str.starts_with("3@4:"), "serialised proof = leaf 3 @ size 4");
-        assert!(inclusion_str.contains("->blake3:"), "serialised proof reduces to a blake3 root");
-        assert!(inclusion_str.contains("blake3:"), "serialised proof carries blake3 nodes");
+        assert!(
+            inclusion_str.starts_with("3@4:"),
+            "serialised proof = leaf 3 @ size 4"
+        );
+        assert!(
+            inclusion_str.contains("->blake3:"),
+            "serialised proof reduces to a blake3 root"
+        );
+        assert!(
+            inclusion_str.contains("blake3:"),
+            "serialised proof carries blake3 nodes"
+        );
 
         // The seal appended ONE leaf (the certificate-sealed action) → tree size grew by 1.
         let sth = auth.signed_tree_head(&tenant, "t").unwrap();
-        assert_eq!(sth.tree_size, 4, "the seal is leaf 3 (after the 3 prior actions)");
-        let proof = auth.inclusion_proof(&tenant, 3).expect("a proof for the seal leaf");
-        assert!(verify_inclusion(&proof, &sth), "the seal leaf is provably in the tree");
+        assert_eq!(
+            sth.tree_size, 4,
+            "the seal is leaf 3 (after the 3 prior actions)"
+        );
+        let proof = auth
+            .inclusion_proof(&tenant, 3)
+            .expect("a proof for the seal leaf");
+        assert!(
+            verify_inclusion(&proof, &sth),
+            "the seal leaf is provably in the tree"
+        );
         // The chain still verifies (the seal is an ordinary append, not a rewrite).
         assert!(auth.consumer().log().verify_chain(&tenant));
     }
@@ -948,10 +1071,19 @@ mod tests {
         let tenant = TenantId("acme".into());
         append_n(&auth, "acme", 4);
         let root_before = auth.signed_tree_head(&tenant, "t").unwrap().root_hash;
-        assert!(auth.carve_out_erase(&tenant, "t"), "the carve-out holds (chain intact + root unchanged)");
+        assert!(
+            auth.carve_out_erase(&tenant, "t"),
+            "the carve-out holds (chain intact + root unchanged)"
+        );
         let root_after = auth.signed_tree_head(&tenant, "t").unwrap().root_hash;
-        assert_eq!(root_before, root_after, "the carve-out NEVER rewrites an entry (root unchanged)");
-        assert!(auth.consumer().log().verify_chain(&tenant), "the chain still verifies after the carve-out");
+        assert_eq!(
+            root_before, root_after,
+            "the carve-out NEVER rewrites an entry (root unchanged)"
+        );
+        assert!(
+            auth.consumer().log().verify_chain(&tenant),
+            "the chain still verifies after the carve-out"
+        );
     }
 
     /// The STH signature is forge-resistant: an STH signed by one key does NOT verify under a
@@ -962,9 +1094,15 @@ mod tests {
         let tenant = TenantId("acme".into());
         append_n(&auth, "acme", 2);
         let sth = auth.signed_tree_head(&tenant, "t").unwrap();
-        assert!(sth.verify_signature(auth.key()), "verifies under the right key");
+        assert!(
+            sth.verify_signature(auth.key()),
+            "verifies under the right key"
+        );
         let other = CellSigningKey::from_seed("a-different-cell-key");
-        assert!(!sth.verify_signature(&other), "does NOT verify under a different key");
+        assert!(
+            !sth.verify_signature(&other),
+            "does NOT verify under a different key"
+        );
     }
 
     /// An empty chain has no STH and no proof (nothing to commit).
@@ -988,6 +1126,10 @@ mod tests {
         append_n(&auth, "acme", 1);
         auth.signed_tree_head(&tenant, "t1");
         auth.signed_tree_head(&tenant, "t2");
-        assert_eq!(auth.sth_publish_age(&tenant), 1, "two publications → counter advanced");
+        assert_eq!(
+            auth.sth_publish_age(&tenant),
+            1,
+            "two publications → counter advanced"
+        );
     }
 }

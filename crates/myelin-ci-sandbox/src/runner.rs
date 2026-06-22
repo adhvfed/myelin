@@ -616,8 +616,11 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter> RunnerAgent<'a
         // here we ship `frames` frames so the runner's stream → `ci.log.available` pointer path is
         // exercised. Re-heartbeat once mid-stream (a long job renews its lease so it does not lapse).
         for _ in 0..frames {
-            self.firehose
-                .ship_frame(&job.run_id, &job.job_id, b"<redacted log frame (CI-P20 stub)>");
+            self.firehose.ship_frame(
+                &job.run_id,
+                &job.job_id,
+                b"<redacted log frame (CI-P20 stub)>",
+            );
         }
         self.leases.heartbeat(
             &self.worker_id,
@@ -714,7 +717,9 @@ mod tests {
             limits(),
             WorkspaceSpec::default(),
             TrustTier::Trusted,
-            RunTokenRef { jti: "jti-1".into() },
+            RunTokenRef {
+                jti: "jti-1".into(),
+            },
             MeterTarget {
                 reserve_id: "res-1".into(),
             },
@@ -971,7 +976,10 @@ mod tests {
         // the firehose streamed 5 frames (the CI-P20 stub observable).
         assert_eq!(firehose.frames_shipped(), 5);
         // the lease was settled (the claimed row removed).
-        assert!(q.get(&tenant(), "job-1").is_none(), "the lease is settled on terminal");
+        assert!(
+            q.get(&tenant(), "job-1").is_none(),
+            "the lease is settled on terminal"
+        );
         // the engine buffered EXACTLY ONE job.done for the run.
         assert_eq!(ex.signals().count_for_run(&tenant(), &run.0), 1);
     }
@@ -1125,7 +1133,11 @@ mod tests {
             )
             .expect_err("an empty queue surfaces NoWork");
         assert!(matches!(err, RunnerError::NoWork));
-        assert_eq!(backend.launches.load(Ordering::SeqCst), 0, "nothing launched on NoWork");
+        assert_eq!(
+            backend.launches.load(Ordering::SeqCst),
+            0,
+            "nothing launched on NoWork"
+        );
     }
 
     /// **The claimable-depth signal counts in-region label-eligible free leases (the long-poll / the
@@ -1134,12 +1146,33 @@ mod tests {
     #[test]
     fn claimable_depth_counts_free_eligible_leases() {
         let q = JobLeaseStore::new();
-        q.enqueue(QueuedJob::new(tenant(), region(), "r", "j1", vec!["linux".into()], ci_spec("a")));
-        q.enqueue(QueuedJob::new(tenant(), region(), "r", "j2", vec!["linux".into()], ci_spec("b")));
+        q.enqueue(QueuedJob::new(
+            tenant(),
+            region(),
+            "r",
+            "j1",
+            vec!["linux".into()],
+            ci_spec("a"),
+        ));
+        q.enqueue(QueuedJob::new(
+            tenant(),
+            region(),
+            "r",
+            "j2",
+            vec!["linux".into()],
+            ci_spec("b"),
+        ));
         assert_eq!(q.claimable_depth(&["linux".into()], &region(), 1000), 2);
 
         // claim one → claimable depth drops to 1 (the live lease no longer counts).
-        q.claim_for_labels("w1", &["linux".into()], &[TrustTier::Trusted], &region(), 1000, 30);
+        q.claim_for_labels(
+            "w1",
+            &["linux".into()],
+            &[TrustTier::Trusted],
+            &region(),
+            1000,
+            30,
+        );
         assert_eq!(q.claimable_depth(&["linux".into()], &region(), 1010), 1);
         // once that lease expires it counts again (reclaimable).
         assert_eq!(q.claimable_depth(&["linux".into()], &region(), 2000), 2);
@@ -1193,8 +1226,14 @@ mod tests {
             .get(&tenant(), &run.0, JOB_DONE_SIGNAL, &idem)
             .expect("the job.done buffered under the echoed idem_token");
         // references-not-payloads: the marker + the result ref, no log bytes / PII body.
-        assert_eq!(row.payload[0], ArtifactRef("myelin://job-done/passed-false".into()));
-        assert_eq!(row.payload[1], ArtifactRef("myelin://acme/ci/run/run-1#step-2".into()));
+        assert_eq!(
+            row.payload[0],
+            ArtifactRef("myelin://job-done/passed-false".into())
+        );
+        assert_eq!(
+            row.payload[1],
+            ArtifactRef("myelin://acme/ci/run/run-1#step-2".into())
+        );
         assert_eq!(row.payload_key_ref, None, "no inline PII payload");
     }
 }

@@ -34,8 +34,10 @@ fn sub_d7_idor_scenario() -> DrillScenario {
     DrillScenario::new("sub-d7-cross-tenant-idor", |ctx| {
         // (inject) the gateway's identity dependency is under stress for `globex` — the realistic
         // condition an attacker probes under. The structural defence must hold regardless.
-        ctx.breaker
-            .break_dependency(Dependency::Identity, Scope::Tenant(TenantId("globex".into())));
+        ctx.breaker.break_dependency(
+            Dependency::Identity,
+            Scope::Tenant(TenantId("globex".into())),
+        );
 
         // The public surface the lifecycle opens (tenant-from-token + IDOR reject/audit).
         let surface = PublicSurface::default();
@@ -48,7 +50,11 @@ fn sub_d7_idor_scenario() -> DrillScenario {
         for _ in 0..30 {
             // honest acme request → served against acme (the token's tenant).
             let r = surface.resolve_tenant(&acme, &TenantId("acme".into()));
-            assert_eq!(r, Ok(TenantId("acme".into())), "honest same-tenant request is served");
+            assert_eq!(
+                r,
+                Ok(TenantId("acme".into())),
+                "honest same-tenant request is served"
+            );
 
             // adversarial: acme token tries to read globex via the path → rejected + audited.
             match surface.resolve_tenant(&acme, &TenantId("globex".into())) {
@@ -72,15 +78,21 @@ fn sub_d7_idor_scenario() -> DrillScenario {
         }
 
         // restore the injected fault (a re-run starts clean).
-        ctx.breaker
-            .restore_dependency(Dependency::Identity, Scope::Tenant(TenantId("globex".into())));
+        ctx.breaker.restore_dependency(
+            Dependency::Identity,
+            Scope::Tenant(TenantId("globex".into())),
+        );
 
         // (assert) the SUB-D7 zero, read off the live surface's misroute_count AND the locally
         // observed served-cross-tenant tally (belt-and-braces: both must be 0).
         assert_eq!(served_cross_tenant, 0, "no spoof was served (local tally)");
         let misroute = surface.misroute_count() as i64;
         // 60 spoof attempts (2 per iteration × 30) were all rejected + audited.
-        assert_eq!(surface.audit().count(), 60, "every spoof attempt was audited (PII-free)");
+        assert_eq!(
+            surface.audit().count(),
+            60,
+            "every spoof attempt was audited (PII-free)"
+        );
 
         // Populate the harness telemetry-assertion library with the CrossTenantCount projection
         // and assert it is green (== 0). This is the typed, never-swallowed verdict.
@@ -91,7 +103,11 @@ fn sub_d7_idor_scenario() -> DrillScenario {
 }
 
 fn stub(id: &str, tenant: &str) -> Principal {
-    Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, TenantId(tenant.into()))
+    Principal::stub(
+        PrincipalId(id.into()),
+        PrincipalKind::Human,
+        TenantId(tenant.into()),
+    )
 }
 
 /// **THE SUB-D7 drill — the dated green artifact.** Runs the scenario once and asserts it PASSES:
@@ -107,8 +123,14 @@ fn sub_d7_cross_tenant_idor_drill_is_green() {
     );
     // The dated green-artifact row (EI-01 §3: a passing drill emits a visible, dated row).
     let row = result.artifact_row("2026-06-19");
-    assert!(row.contains("PASS"), "the artifact row records a PASS: {row}");
-    assert!(row.contains("sub-d7-cross-tenant-idor"), "names the drill: {row}");
+    assert!(
+        row.contains("PASS"),
+        "the artifact row records a PASS: {row}"
+    );
+    assert!(
+        row.contains("sub-d7-cross-tenant-idor"),
+        "names the drill: {row}"
+    );
     println!("{row}");
 }
 
@@ -118,7 +140,10 @@ fn sub_d7_cross_tenant_idor_drill_is_green() {
 fn sub_d7_drill_reruns_green() {
     let drill = sub_d7_idor_scenario();
     for _ in 0..3 {
-        assert!(matches!(drill.run_once(), DrillResult::Pass { .. }), "SUB-D7 re-runs green");
+        assert!(
+            matches!(drill.run_once(), DrillResult::Pass { .. }),
+            "SUB-D7 re-runs green"
+        );
     }
 }
 
@@ -132,11 +157,18 @@ fn sub_d7_gate_is_not_vacuous_a_nonzero_misroute_reads_red() {
     // drive one honest + one spoof; the real surface stays at 0.
     let id = InjectedIdentity::new(stub("p", "acme"));
     let _ = surface.resolve_tenant(&id, &TenantId("globex".into()));
-    assert_eq!(surface.misroute_count(), 0, "the real surface never serves a cross-tenant read");
+    assert_eq!(
+        surface.misroute_count(),
+        0,
+        "the real surface never serves a cross-tenant read"
+    );
 
     // model a regression: a non-zero misroute count must read RED against the == 0 predicate.
     let mut src = SignalSource::new();
     src.set_scalar(SignalName::CrossTenantCount, 1);
     let verdict = src.assert_signal(SignalName::CrossTenantCount, Predicate::Eq(0));
-    assert!(!verdict.is_green(), "a served cross-tenant read (misroute > 0) MUST read RED — the gate is real");
+    assert!(
+        !verdict.is_green(),
+        "a served cross-tenant read (misroute > 0) MUST read RED — the gate is real"
+    );
 }

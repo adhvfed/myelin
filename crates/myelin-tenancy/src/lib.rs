@@ -503,8 +503,8 @@ mod tests {
         let relocated = Region::new("eu-north");
         assert_ne!(original, relocated);
         assert_eq!(original.as_str(), "eu-west"); // original is unchanged.
-        // There is intentionally no `original.set_region(..)` / `*original.0 = ..` API: the
-        // type carries no in-place mutator, so immutability is structural, not by convention.
+                                                  // There is intentionally no `original.set_region(..)` / `*original.0 = ..` API: the
+                                                  // type carries no in-place mutator, so immutability is structural, not by convention.
     }
 
     /// **CDC pair for 12.1 (provider + consumer).** The provider side is this crate exporting

@@ -190,7 +190,11 @@ impl InboxFilter {
     pub fn git_review_requests() -> InboxFilter {
         InboxFilter {
             subsystems: Some([Subsystem::Git].into_iter().collect()),
-            reasons: Some([Reason::ReviewRequested, Reason::Mentioned].into_iter().collect()),
+            reasons: Some(
+                [Reason::ReviewRequested, Reason::Mentioned]
+                    .into_iter()
+                    .collect(),
+            ),
         }
     }
 
@@ -250,7 +254,10 @@ impl Default for Page {
     /// The default page: the first page, bounded to 50 items (a sensible inbox page; the read is
     /// never unbounded).
     fn default() -> Page {
-        Page { after: None, limit: 50 }
+        Page {
+            after: None,
+            limit: 50,
+        }
     }
 }
 
@@ -443,7 +450,10 @@ mod tests {
         Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant())
     }
     fn strong() -> Consistency {
-        Consistency { at_least: Zookie("zk-1".into()), mode: ConsistencyMode::Strong }
+        Consistency {
+            at_least: Zookie("zk-1".into()),
+            mode: ConsistencyMode::Strong,
+        }
     }
 
     /// Build a routed inbox row addressed to `recipient`, about `subject`, with `reason`.
@@ -468,14 +478,44 @@ mod tests {
     fn seeded_inbox(me: &str) -> InboxProjection {
         let inbox = InboxProjection::new();
         // Issues — in "My Work" (assigned) + one NOT in it (state_changed).
-        inbox.upsert_for_test(item(me, "itm-iss-assigned", "myelin://acme/issue/issue/PROJ-1", Reason::Assigned));
-        inbox.upsert_for_test(item(me, "itm-iss-state", "myelin://acme/issue/issue/PROJ-2", Reason::StateChanged));
+        inbox.upsert_for_test(item(
+            me,
+            "itm-iss-assigned",
+            "myelin://acme/issue/issue/PROJ-1",
+            Reason::Assigned,
+        ));
+        inbox.upsert_for_test(item(
+            me,
+            "itm-iss-state",
+            "myelin://acme/issue/issue/PROJ-2",
+            Reason::StateChanged,
+        ));
         // Chat — in "Activity" (mentioned) + one NOT (state_changed).
-        inbox.upsert_for_test(item(me, "itm-chat-ment", "myelin://acme/chat/thread/T1", Reason::Mentioned));
-        inbox.upsert_for_test(item(me, "itm-chat-state", "myelin://acme/chat/thread/T2", Reason::StateChanged));
+        inbox.upsert_for_test(item(
+            me,
+            "itm-chat-ment",
+            "myelin://acme/chat/thread/T1",
+            Reason::Mentioned,
+        ));
+        inbox.upsert_for_test(item(
+            me,
+            "itm-chat-state",
+            "myelin://acme/chat/thread/T2",
+            Reason::StateChanged,
+        ));
         // Git — in "Review requests" (review_requested) + one NOT (watched).
-        inbox.upsert_for_test(item(me, "itm-git-review", "myelin://acme/git/pr/9", Reason::ReviewRequested));
-        inbox.upsert_for_test(item(me, "itm-git-watched", "myelin://acme/git/pr/10", Reason::Watched));
+        inbox.upsert_for_test(item(
+            me,
+            "itm-git-review",
+            "myelin://acme/git/pr/9",
+            Reason::ReviewRequested,
+        ));
+        inbox.upsert_for_test(item(
+            me,
+            "itm-git-watched",
+            "myelin://acme/git/pr/10",
+            Reason::Watched,
+        ));
         inbox
     }
 
@@ -490,16 +530,43 @@ mod tests {
     /// or defaults an unknown ref into a known subsystem is caught.
     #[test]
     fn subsystem_is_derived_from_the_subject_ref_unknown_is_not_a_known_subsystem() {
-        assert_eq!(subsystem_of(&ArtifactRef("myelin://acme/issue/issue/PROJ-1".into())), Subsystem::Issue);
-        assert_eq!(subsystem_of(&ArtifactRef("myelin://acme/issues/issue/PROJ-1".into())), Subsystem::Issue);
-        assert_eq!(subsystem_of(&ArtifactRef("myelin://acme/chat/thread/T1".into())), Subsystem::Chat);
-        assert_eq!(subsystem_of(&ArtifactRef("myelin://acme/git/pr/9".into())), Subsystem::Git);
-        assert_eq!(subsystem_of(&ArtifactRef("myelin://acme/kn/doc/D1".into())), Subsystem::Knowledge);
-        assert_eq!(subsystem_of(&ArtifactRef("myelin://acme/ci/run/42".into())), Subsystem::Ci);
+        assert_eq!(
+            subsystem_of(&ArtifactRef("myelin://acme/issue/issue/PROJ-1".into())),
+            Subsystem::Issue
+        );
+        assert_eq!(
+            subsystem_of(&ArtifactRef("myelin://acme/issues/issue/PROJ-1".into())),
+            Subsystem::Issue
+        );
+        assert_eq!(
+            subsystem_of(&ArtifactRef("myelin://acme/chat/thread/T1".into())),
+            Subsystem::Chat
+        );
+        assert_eq!(
+            subsystem_of(&ArtifactRef("myelin://acme/git/pr/9".into())),
+            Subsystem::Git
+        );
+        assert_eq!(
+            subsystem_of(&ArtifactRef("myelin://acme/kn/doc/D1".into())),
+            Subsystem::Knowledge
+        );
+        assert_eq!(
+            subsystem_of(&ArtifactRef("myelin://acme/ci/run/42".into())),
+            Subsystem::Ci
+        );
         // an unknown subsystem / a malformed ref → Unknown (never silently a known one).
-        assert_eq!(subsystem_of(&ArtifactRef("myelin://acme/mystery/x/1".into())), Subsystem::Unknown);
-        assert_eq!(subsystem_of(&ArtifactRef("not-a-ref".into())), Subsystem::Unknown);
-        assert_eq!(subsystem_of(&ArtifactRef("myelin://acme".into())), Subsystem::Unknown);
+        assert_eq!(
+            subsystem_of(&ArtifactRef("myelin://acme/mystery/x/1".into())),
+            Subsystem::Unknown
+        );
+        assert_eq!(
+            subsystem_of(&ArtifactRef("not-a-ref".into())),
+            Subsystem::Unknown
+        );
+        assert_eq!(
+            subsystem_of(&ArtifactRef("myelin://acme".into())),
+            Subsystem::Unknown
+        );
     }
 
     // --- THE C-9 INVARIANT: every scoped view ⊆ the unfiltered inbox (a view is a filter) ---
@@ -513,11 +580,25 @@ mod tests {
         let me = "u1";
         let inbox = seeded_inbox(me);
         let p = principal(me);
-        let big = Page { after: None, limit: 1000 };
+        let big = Page {
+            after: None,
+            limit: 1000,
+        };
 
-        let full = list_inbox(&inbox, &p, &InboxFilter::all(), &big, &AllowAllAuthorize, &strong());
+        let full = list_inbox(
+            &inbox,
+            &p,
+            &InboxFilter::all(),
+            &big,
+            &AllowAllAuthorize,
+            &strong(),
+        );
         let full_ids = ids(&full);
-        assert_eq!(full_ids.len(), 6, "the unfiltered inbox is the ONE inbox (all 6 rows for u1)");
+        assert_eq!(
+            full_ids.len(),
+            6,
+            "the unfiltered inbox is the ONE inbox (all 6 rows for u1)"
+        );
 
         for view in [
             InboxFilter::issues_my_work(),
@@ -531,8 +612,14 @@ mod tests {
                 view_ids.is_subset(&full_ids),
                 "C-9: the view {view:?} is a SUBSET of the unfiltered inbox"
             );
-            assert!(!view_ids.is_empty(), "the seeded batch put ≥1 row in every view");
-            assert!(view_ids.len() < full_ids.len(), "a scoped view is STRICTLY smaller than the ONE inbox");
+            assert!(
+                !view_ids.is_empty(),
+                "the seeded batch put ≥1 row in every view"
+            );
+            assert!(
+                view_ids.len() < full_ids.len(),
+                "a scoped view is STRICTLY smaller than the ONE inbox"
+            );
         }
     }
 
@@ -544,19 +631,58 @@ mod tests {
         let me = "u1";
         let inbox = seeded_inbox(me);
         let p = principal(me);
-        let big = Page { after: None, limit: 1000 };
+        let big = Page {
+            after: None,
+            limit: 1000,
+        };
 
-        let my_work = ids(&list_inbox(&inbox, &p, &InboxFilter::issues_my_work(), &big, &AllowAllAuthorize, &strong()));
-        assert!(my_work.contains("itm-iss-assigned"), "assigned is in My Work");
-        assert!(!my_work.contains("itm-iss-state"), "a state_changed issue is NOT in My Work");
+        let my_work = ids(&list_inbox(
+            &inbox,
+            &p,
+            &InboxFilter::issues_my_work(),
+            &big,
+            &AllowAllAuthorize,
+            &strong(),
+        ));
+        assert!(
+            my_work.contains("itm-iss-assigned"),
+            "assigned is in My Work"
+        );
+        assert!(
+            !my_work.contains("itm-iss-state"),
+            "a state_changed issue is NOT in My Work"
+        );
         // a chat row never leaks into the issues view (the subsystem clause is real).
-        assert!(!my_work.contains("itm-chat-ment"), "a chat mention is NOT in the Issues view (subsystem clause)");
+        assert!(
+            !my_work.contains("itm-chat-ment"),
+            "a chat mention is NOT in the Issues view (subsystem clause)"
+        );
 
-        let activity = ids(&list_inbox(&inbox, &p, &InboxFilter::chat_activity(), &big, &AllowAllAuthorize, &strong()));
-        assert_eq!(activity, ["itm-chat-ment".to_string()].into_iter().collect());
+        let activity = ids(&list_inbox(
+            &inbox,
+            &p,
+            &InboxFilter::chat_activity(),
+            &big,
+            &AllowAllAuthorize,
+            &strong(),
+        ));
+        assert_eq!(
+            activity,
+            ["itm-chat-ment".to_string()].into_iter().collect()
+        );
 
-        let reviews = ids(&list_inbox(&inbox, &p, &InboxFilter::git_review_requests(), &big, &AllowAllAuthorize, &strong()));
-        assert_eq!(reviews, ["itm-git-review".to_string()].into_iter().collect());
+        let reviews = ids(&list_inbox(
+            &inbox,
+            &p,
+            &InboxFilter::git_review_requests(),
+            &big,
+            &AllowAllAuthorize,
+            &strong(),
+        ));
+        assert_eq!(
+            reviews,
+            ["itm-git-review".to_string()].into_iter().collect()
+        );
     }
 
     /// **The `InboxFilter::matches` predicate only ever NARROWS** — the all-filter matches every
@@ -564,17 +690,33 @@ mod tests {
     /// property: a mutant that makes a filter ADMIT a non-matching row is caught.)
     #[test]
     fn filter_matches_only_narrows() {
-        let issue_assigned = item("u1", "a", "myelin://acme/issue/issue/PROJ-1", Reason::Assigned);
+        let issue_assigned = item(
+            "u1",
+            "a",
+            "myelin://acme/issue/issue/PROJ-1",
+            Reason::Assigned,
+        );
         let chat_mention = item("u1", "b", "myelin://acme/chat/thread/T1", Reason::Mentioned);
         // the all-filter admits everything.
         assert!(InboxFilter::all().matches(&issue_assigned));
         assert!(InboxFilter::all().matches(&chat_mention));
         // My Work admits the issue-assigned, rejects the chat (wrong subsystem).
         assert!(InboxFilter::issues_my_work().matches(&issue_assigned));
-        assert!(!InboxFilter::issues_my_work().matches(&chat_mention), "wrong subsystem → rejected");
+        assert!(
+            !InboxFilter::issues_my_work().matches(&chat_mention),
+            "wrong subsystem → rejected"
+        );
         // a right-subsystem / wrong-reason row is rejected (the reason clause bites).
-        let issue_state = item("u1", "c", "myelin://acme/issue/issue/PROJ-2", Reason::StateChanged);
-        assert!(!InboxFilter::issues_my_work().matches(&issue_state), "wrong reason → rejected");
+        let issue_state = item(
+            "u1",
+            "c",
+            "myelin://acme/issue/issue/PROJ-2",
+            Reason::StateChanged,
+        );
+        assert!(
+            !InboxFilter::issues_my_work().matches(&issue_state),
+            "wrong reason → rejected"
+        );
     }
 
     // --- recipient scope: an item NOT for me is never in my inbox ---
@@ -585,12 +727,32 @@ mod tests {
     #[test]
     fn list_inbox_is_recipient_scoped_others_items_are_not_returned() {
         let inbox = InboxProjection::new();
-        inbox.upsert_for_test(item("u1", "mine", "myelin://acme/issue/issue/P1", Reason::Assigned));
-        inbox.upsert_for_test(item("u2", "theirs", "myelin://acme/issue/issue/P2", Reason::Assigned));
-        let page = list_inbox(&inbox, &principal("u1"), &InboxFilter::all(), &Page::default(), &AllowAllAuthorize, &strong());
+        inbox.upsert_for_test(item(
+            "u1",
+            "mine",
+            "myelin://acme/issue/issue/P1",
+            Reason::Assigned,
+        ));
+        inbox.upsert_for_test(item(
+            "u2",
+            "theirs",
+            "myelin://acme/issue/issue/P2",
+            Reason::Assigned,
+        ));
+        let page = list_inbox(
+            &inbox,
+            &principal("u1"),
+            &InboxFilter::all(),
+            &Page::default(),
+            &AllowAllAuthorize,
+            &strong(),
+        );
         let got = ids(&page);
         assert!(got.contains("mine"), "my item is returned");
-        assert!(!got.contains("theirs"), "another principal's item is NEVER in my inbox (recipient scope)");
+        assert!(
+            !got.contains("theirs"),
+            "another principal's item is NEVER in my inbox (recipient scope)"
+        );
         assert_eq!(got.len(), 1);
     }
 
@@ -616,11 +778,28 @@ mod tests {
     fn denied_item_is_not_returned() {
         let me = "u1";
         let inbox = seeded_inbox(me);
-        let deny = DenySubjects(["myelin://acme/issue/issue/PROJ-1".to_string()].into_iter().collect());
-        let big = Page { after: None, limit: 1000 };
-        let page = list_inbox(&inbox, &principal(me), &InboxFilter::all(), &big, &deny, &strong());
+        let deny = DenySubjects(
+            ["myelin://acme/issue/issue/PROJ-1".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        let big = Page {
+            after: None,
+            limit: 1000,
+        };
+        let page = list_inbox(
+            &inbox,
+            &principal(me),
+            &InboxFilter::all(),
+            &big,
+            &deny,
+            &strong(),
+        );
         let got = ids(&page);
-        assert!(!got.contains("itm-iss-assigned"), "the denied subject's item is HELD, not leaked (ADR-03)");
+        assert!(
+            !got.contains("itm-iss-assigned"),
+            "the denied subject's item is HELD, not leaked (ADR-03)"
+        );
         assert_eq!(got.len(), 5, "the other 5 visible items surface");
     }
 
@@ -635,8 +814,18 @@ mod tests {
             }
         }
         let inbox = seeded_inbox("u1");
-        let page = list_inbox(&inbox, &principal("u1"), &InboxFilter::all(), &Page::default(), &AlwaysConditional, &strong());
-        assert!(page.items.is_empty(), "a Conditional check is fail-closed (deny-when-unsure, ADR-03)");
+        let page = list_inbox(
+            &inbox,
+            &principal("u1"),
+            &InboxFilter::all(),
+            &Page::default(),
+            &AlwaysConditional,
+            &strong(),
+        );
+        assert!(
+            page.items.is_empty(),
+            "a Conditional check is fail-closed (deny-when-unsure, ADR-03)"
+        );
     }
 
     // --- stable order + paging ---
@@ -660,12 +849,18 @@ mod tests {
         let mut guard = 0;
         loop {
             guard += 1;
-            assert!(guard <= 8, "paging must terminate within the page bound (the cursor advances)");
+            assert!(
+                guard <= 8,
+                "paging must terminate within the page bound (the cursor advances)"
+            );
             let page = list_inbox(
                 &inbox,
                 &p,
                 &InboxFilter::all(),
-                &Page { after: after.clone(), limit: 2 },
+                &Page {
+                    after: after.clone(),
+                    limit: 2,
+                },
                 &AllowAllAuthorize,
                 &strong(),
             );
@@ -683,7 +878,10 @@ mod tests {
             &inbox,
             &p,
             &InboxFilter::all(),
-            &Page { after: None, limit: 1000 },
+            &Page {
+                after: None,
+                limit: 1000,
+            },
             &AllowAllAuthorize,
             &strong(),
         )
@@ -706,7 +904,10 @@ mod tests {
         assert_eq!(seen.len(), 6, "paging visited every item once (no skip)");
         let unique: BTreeSet<_> = seen.iter().cloned().collect();
         assert_eq!(unique.len(), 6, "paging never returned a duplicate");
-        assert_eq!(seen, expected, "the page order is the RANKED order (priority DESC, item_id ASC)");
+        assert_eq!(
+            seen, expected,
+            "the page order is the RANKED order (priority DESC, item_id ASC)"
+        );
     }
 
     /// **`list_inbox_ranked` exposes the per-item priority + the explain-trace (NOTIF-2) and ranks
@@ -725,7 +926,10 @@ mod tests {
             &inbox,
             &p,
             &InboxFilter::all(),
-            &Page { after: None, limit: 100 },
+            &Page {
+                after: None,
+                limit: 100,
+            },
             &AllowAllAuthorize,
             &strong(),
             &ranker,
@@ -733,8 +937,14 @@ mod tests {
         assert_eq!(page.items.len(), 6, "all 6 visible items are ranked");
         // every item carries a complete, deterministic trace (the NOTIF-2 100%-trace gate).
         for r in &page.items {
-            assert_eq!(r.priority, r.trace.final_priority, "the trace's final == the priority");
-            assert!(!r.trace.render().is_empty(), "every rank carries a non-empty explain-trace");
+            assert_eq!(
+                r.priority, r.trace.final_priority,
+                "the trace's final == the priority"
+            );
+            assert!(
+                !r.trace.render().is_empty(),
+                "every rank carries a non-empty explain-trace"
+            );
         }
         // the order is priority-descending (the first item's priority ≥ the last's).
         let priorities: Vec<u8> = page.items.iter().map(|r| r.priority).collect();
@@ -742,18 +952,28 @@ mod tests {
         sorted.sort_by(|a, b| b.cmp(a));
         assert_eq!(priorities, sorted, "ranked page is priority-descending");
         // a denied item is dropped BEFORE ranking (authorize never skipped on the ranked surface).
-        let deny = DenySubjects(["myelin://acme/issue/issue/PROJ-1".to_string()].into_iter().collect());
+        let deny = DenySubjects(
+            ["myelin://acme/issue/issue/PROJ-1".to_string()]
+                .into_iter()
+                .collect(),
+        );
         let denied_page = list_inbox_ranked(
             &inbox,
             &p,
             &InboxFilter::all(),
-            &Page { after: None, limit: 100 },
+            &Page {
+                after: None,
+                limit: 100,
+            },
             &deny,
             &strong(),
             &ranker,
         );
         assert!(
-            !denied_page.items.iter().any(|r| r.item.item_id == "itm-iss-assigned"),
+            !denied_page
+                .items
+                .iter()
+                .any(|r| r.item.item_id == "itm-iss-assigned"),
             "the denied subject's item is held, not ranked (authorize before rank)"
         );
         assert_eq!(denied_page.items.len(), 5);
@@ -768,12 +988,22 @@ mod tests {
             &inbox,
             &principal("u1"),
             &InboxFilter::all(),
-            &Page { after: None, limit: 2 },
+            &Page {
+                after: None,
+                limit: 2,
+            },
             &AllowAllAuthorize,
             &strong(),
         );
-        assert_eq!(page.items.len(), 2, "the page is bounded to the limit (never unbounded)");
-        assert!(page.cursor.0.is_some(), "there are more rows → a forward cursor");
+        assert_eq!(
+            page.items.len(),
+            2,
+            "the page is bounded to the limit (never unbounded)"
+        );
+        assert!(
+            page.cursor.0.is_some(),
+            "there are more rows → a forward cursor"
+        );
     }
 
     /// **A page that EXACTLY exhausts the inbox reports NO forward cursor** (`end == len` → `None`,
@@ -783,17 +1013,24 @@ mod tests {
     #[test]
     fn page_that_exactly_exhausts_reports_no_cursor() {
         let inbox = seeded_inbox("u1"); // 6 items for u1.
-        // limit exactly == the item count → the last page, no dangling cursor.
+                                        // limit exactly == the item count → the last page, no dangling cursor.
         let page = list_inbox(
             &inbox,
             &principal("u1"),
             &InboxFilter::all(),
-            &Page { after: None, limit: 6 },
+            &Page {
+                after: None,
+                limit: 6,
+            },
             &AllowAllAuthorize,
             &strong(),
         );
         assert_eq!(page.items.len(), 6, "all 6 items on the page");
-        assert_eq!(page.cursor, Cursor(None), "an exactly-exhausting page has NO forward cursor (end == len)");
+        assert_eq!(
+            page.cursor,
+            Cursor(None),
+            "an exactly-exhausting page has NO forward cursor (end == len)"
+        );
 
         // and a SECOND page after the last item is empty with no cursor (the cursor did not dangle).
         let last_id = page.items.last().unwrap().item_id.clone();
@@ -801,7 +1038,10 @@ mod tests {
             &inbox,
             &principal("u1"),
             &InboxFilter::all(),
-            &Page { after: Some(last_id), limit: 6 },
+            &Page {
+                after: Some(last_id),
+                limit: 6,
+            },
             &AllowAllAuthorize,
             &strong(),
         );
@@ -813,7 +1053,14 @@ mod tests {
     #[test]
     fn empty_inbox_returns_empty_page_no_cursor() {
         let inbox = InboxProjection::new();
-        let page = list_inbox(&inbox, &principal("nobody"), &InboxFilter::all(), &Page::default(), &AllowAllAuthorize, &strong());
+        let page = list_inbox(
+            &inbox,
+            &principal("nobody"),
+            &InboxFilter::all(),
+            &Page::default(),
+            &AllowAllAuthorize,
+            &strong(),
+        );
         assert!(page.items.is_empty());
         assert_eq!(page.cursor, Cursor(None), "no more rows → no cursor");
     }
@@ -824,7 +1071,11 @@ mod tests {
     fn allow_all_authorize_allows() {
         let port = AllowAllAuthorize;
         assert_eq!(
-            port.can_read(&principal("u1"), &ArtifactRef("myelin://acme/issue/issue/P1".into()), &strong()),
+            port.can_read(
+                &principal("u1"),
+                &ArtifactRef("myelin://acme/issue/issue/P1".into()),
+                &strong()
+            ),
             Decision::Allow
         );
     }

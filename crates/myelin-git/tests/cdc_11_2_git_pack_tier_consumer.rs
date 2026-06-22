@@ -66,18 +66,29 @@ fn git_consumer_persists_and_resolves_objects_through_the_trait() {
 fn receive_pack_migration_round_trips_byte_identical_through_the_consumer() {
     let db = boot("acme", "fr-par", "monorepo");
     let input = vec![
-        QuarantineObject { oid: Oid::new("a1"), bytes: b"obj-a".to_vec() },
-        QuarantineObject { oid: Oid::new("b2"), bytes: vec![0, 255, 7, 7, 0] },
+        QuarantineObject {
+            oid: Oid::new("a1"),
+            bytes: b"obj-a".to_vec(),
+        },
+        QuarantineObject {
+            oid: Oid::new("b2"),
+            bytes: vec![0, 255, 7, 7, 0],
+        },
     ];
     PackTierMigration::new(&db)
         .migrate(&input)
         .expect("accept migration acked durable through the trait");
 
     let tips: Vec<Oid> = input.iter().map(|o| o.oid.clone()).collect();
-    let served = db.serve_clone(&tips).expect("clone served from the pack tier");
+    let served = db
+        .serve_clone(&tips)
+        .expect("clone served from the pack tier");
     for (got, want) in served.iter().zip(&input) {
         assert_eq!(got.0, want.oid);
-        assert_eq!(got.1, want.bytes, "byte-identical clone round-trip (0 corruption)");
+        assert_eq!(
+            got.1, want.bytes,
+            "byte-identical clone round-trip (0 corruption)"
+        );
     }
 }
 
@@ -93,19 +104,37 @@ fn consumer_placement_is_region_pinned_relocatable_never_node_pinned() {
 
     // Store an object, record an acceleration artifact, then relocate within-region.
     let oid = Oid::new("deadc0de");
-    let addr_before = db.put_object(GitObjectKind::Tree, &oid, b"tree").expect("put");
-    db.record_maintenance(AccelKind::CommitGraph, b"cg-bytes").expect("maint");
+    let addr_before = db
+        .put_object(GitObjectKind::Tree, &oid, b"tree")
+        .expect("put");
+    db.record_maintenance(AccelKind::CommitGraph, b"cg-bytes")
+        .expect("maint");
 
     db.tier()
-        .relocate(db.repo(), StorageGroup::from_token("pack-7"), &Region::new("fr-par"))
+        .relocate(
+            db.repo(),
+            StorageGroup::from_token("pack-7"),
+            &Region::new("fr-par"),
+        )
         .expect("same-region relocation admitted");
 
     // The object's address is unchanged + still served (the consumer is never node-pinned).
-    assert_eq!(db.address_of(&oid), Some(addr_before), "relocation does not re-address an object");
-    assert_eq!(db.read_object(&oid).expect("served after relocation"), b"tree");
+    assert_eq!(
+        db.address_of(&oid),
+        Some(addr_before),
+        "relocation does not re-address an object"
+    );
+    assert_eq!(
+        db.read_object(&oid).expect("served after relocation"),
+        b"tree"
+    );
     // A cross-region relocation is REFUSED by the provider (the residency pin holds at repo grain).
     assert!(db
         .tier()
-        .relocate(db.repo(), StorageGroup::from_token("pack-x"), &Region::new("eu-north"))
+        .relocate(
+            db.repo(),
+            StorageGroup::from_token("pack-x"),
+            &Region::new("eu-north")
+        )
         .is_err());
 }

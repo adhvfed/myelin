@@ -56,8 +56,8 @@ const EXCLUDED_SUBSTRINGS: &[&str] = &[
     "myelin-harness/src/bin/m2-scorecard.rs", // the M2 reactive-shared-layer exit-gate runner (M2→M3): same legitimate host-exec site (spawns `cargo test`/`cargo run` per drill; AG-D4 with MYELIN_REQUIRE_KVM=1 so a real microVM must boot).
     "myelin-ci-sandbox/src/firecracker.rs", // the Firecracker default backend (CI-P2 → P-237): the ONE legitimate VMM-spawn site — spawning `firecracker --no-api --config-file` IS how the unified-sandbox boundary is CREATED (the seam's enforcement mechanism), not a bypass of it. Exactly analogous to the relay's broker-publish site. NAMED, LOUD (see firecracker.rs); the routing split (mutation→EffectApi) is unweakened.
     "myelin-ci-sandbox/src/gvisor.rs", // the gVisor `runsc` named-second backend (CI-P2 → P-237): the ONE legitimate runtime-spawn site — same posture as firecracker.rs (the seam's mechanism, not a bypass). NAMED, LOUD.
-    "myelin-lints/", // this crate: scanners + fixtures carry the tokens as data.
-    "/tests/",       // test fixtures deliberately contain red samples.
+    "myelin-lints/",                   // this crate: scanners + fixtures carry the tokens as data.
+    "/tests/",                         // test fixtures deliberately contain red samples.
     "/fixtures/",
 ];
 

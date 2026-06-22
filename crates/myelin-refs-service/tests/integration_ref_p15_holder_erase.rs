@@ -27,17 +27,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use myelin_events::{
-    Actor, AggregateKey, ArtifactRef, CorrelationId, DataRole, EventEnvelope, EventHandler, EventId,
-    EventType, Timestamp, Visibility,
+    Actor, AggregateKey, ArtifactRef, CorrelationId, DataRole, EventEnvelope, EventHandler,
+    EventId, EventType, Timestamp, Visibility,
 };
 use myelin_gdpr::{EraseScope, PersonalDataHolder, SubjectRef, TenantId as GdprTenantId};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_refs_service::{
-    EdgeProjection, Projection, ProjectionCacheRead, R2ProjectionCache, RefsCacheHolder, RefsDekPin,
-    RefsEdgeBuilder,
+    EdgeProjection, Projection, ProjectionCacheRead, R2ProjectionCache, RefsCacheHolder,
+    RefsDekPin, RefsEdgeBuilder,
 };
 use myelin_storage::valkey::ValkeyCache;
-use myelin_storage::{KmsEngine};
+use myelin_storage::KmsEngine;
 use myelin_tenancy::{Region, TenantId};
 
 fn redis_url() -> String {
@@ -55,7 +55,11 @@ fn gtenant(t: &TenantId) -> GdprTenantId {
     t.clone()
 }
 fn subject(id: &str, t: &TenantId) -> SubjectRef {
-    SubjectRef::new(Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, t.clone()))
+    SubjectRef::new(Principal::stub(
+        PrincipalId(id.into()),
+        PrincipalKind::Human,
+        t.clone(),
+    ))
 }
 fn principal(id: &str, t: &TenantId) -> Principal {
     Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, t.clone())
@@ -118,35 +122,54 @@ async fn holder_erase_purges_cache_pii_on_real_valkey_zero_recoverable() {
 
     // warm the subject's cached title (a name) into REAL Valkey, sealed under the per-tenant DEK.
     cache
-        .fill(&t, &region(), &ArtifactRef(src.into()), &projection(src, "Alice Smith"))
+        .fill(
+            &t,
+            &region(),
+            &ArtifactRef(src.into()),
+            &projection(src, "Alice Smith"),
+        )
         .expect("warm the cached title in Valkey");
     assert!(
-        cache.read(&t, &region(), &ArtifactRef(src.into())).is_some(),
+        cache
+            .read(&t, &region(), &ArtifactRef(src.into()))
+            .is_some(),
         "the cached title (a name) is present in live Valkey before erase"
     );
 
     // a DIFFERENT tenant's cached title — must be untouched by the erase (tenant isolation).
     let t_other = ttenant("other");
     cache
-        .fill(&t_other, &region(), &ArtifactRef(src.into()), &projection(src, "Bob Other"))
+        .fill(
+            &t_other,
+            &region(),
+            &ArtifactRef(src.into()),
+            &projection(src, "Bob Other"),
+        )
         .expect("warm the other tenant's title");
 
     // REF-P15: the holder erase drives the §4.6 purge through the live Valkey (the ONE eviction path).
     let holder = RefsCacheHolder::with_cache(cache.clone(), projection_handle);
     let receipt = holder
-        .erase(EraseScope::Subject { subject: subject("p-erase-me", &t), tenant: gtenant(&t) })
+        .erase(EraseScope::Subject {
+            subject: subject("p-erase-me", &t),
+            tenant: gtenant(&t),
+        })
         .expect("holder erase succeeds");
     assert_eq!(receipt.receipt.operation, "erase");
 
     // 0 recoverable PII: the subject's cached title is GONE from live Valkey (a read MISSES → re-resolve,
     // never the stale name).
     assert!(
-        cache.read(&t, &region(), &ArtifactRef(src.into())).is_none(),
+        cache
+            .read(&t, &region(), &ArtifactRef(src.into()))
+            .is_none(),
         "0 recoverable PII: the subject's cached title is purged from live Valkey"
     );
     // tenant isolation: the OTHER tenant's title is untouched.
     assert!(
-        cache.read(&t_other, &region(), &ArtifactRef(src.into())).is_some(),
+        cache
+            .read(&t_other, &region(), &ArtifactRef(src.into()))
+            .is_some(),
         "tenant isolation: another tenant's cached title is untouched by the erase"
     );
 }

@@ -48,7 +48,10 @@ fn latest_attestation() -> Option<(PathBuf, EscapeAttestation)> {
 fn the_fabric_gate_admits_on_the_real_p239_attestation_or_is_fail_closed_without_one() {
     match latest_attestation() {
         Some((path, att)) => {
-            println!("[AG-D4] consuming REAL attestation artifact: {}", path.display());
+            println!(
+                "[AG-D4] consuming REAL attestation artifact: {}",
+                path.display()
+            );
             // The gate's required production identity is taken FROM the attestation the real drill
             // produced (the runner's pinned images / corpus). Admitting against this identity proves
             // the Fabric exec path is gated on the REAL green attestation, end-to-end.

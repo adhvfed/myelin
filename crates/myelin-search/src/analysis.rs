@@ -199,7 +199,9 @@ impl Analyzer {
 
     /// Build the analyzer for a `lang` tag (the query-time path reads the stored tag).
     pub fn for_tag(tag: &str) -> Analyzer {
-        Analyzer { lang: Language::from_tag(tag) }
+        Analyzer {
+            lang: Language::from_tag(tag),
+        }
     }
 
     /// The field-language this analyzer runs.
@@ -231,7 +233,11 @@ impl Analyzer {
 /// The natural-language word chain: UAX#29-style segmentation → lowercase → diacritic-fold →
 /// stopword removal → light stemming.
 fn analyze_words(text: &str, lang: Language) -> Vec<Token> {
-    let stops = if lang.is_natural() { stopwords(lang) } else { &[] };
+    let stops = if lang.is_natural() {
+        stopwords(lang)
+    } else {
+        &[]
+    };
     let mut out = Vec::new();
     for raw in segment(text) {
         let lowered = raw.to_lowercase();
@@ -243,7 +249,11 @@ fn analyze_words(text: &str, lang: Language) -> Vec<Token> {
         if stops.contains(&folded.as_str()) {
             continue;
         }
-        let stemmed = if lang.is_natural() { stem(&folded, lang) } else { folded };
+        let stemmed = if lang.is_natural() {
+            stem(&folded, lang)
+        } else {
+            folded
+        };
         if !stemmed.is_empty() {
             out.push(stemmed);
         }
@@ -464,9 +474,15 @@ fn stem(word: &str, lang: Language) -> String {
         Language::English => &["ingly", "edly", "ing", "ed", "ly", "es", "s"],
         Language::German => &["ungen", "lich", "isch", "ung", "en", "er", "es", "e", "s"],
         Language::French => &["ement", "ment", "ions", "eux", "es", "er", "e", "s"],
-        Language::Spanish => &["mente", "ciones", "cion", "ando", "endo", "os", "as", "es", "a", "o", "s"],
-        Language::Italian => &["mente", "zione", "ando", "endo", "are", "ere", "ire", "i", "e", "o", "a"],
-        Language::Portuguese => &["mente", "coes", "cao", "ando", "endo", "os", "as", "es", "a", "o", "s"],
+        Language::Spanish => &[
+            "mente", "ciones", "cion", "ando", "endo", "os", "as", "es", "a", "o", "s",
+        ],
+        Language::Italian => &[
+            "mente", "zione", "ando", "endo", "are", "ere", "ire", "i", "e", "o", "a",
+        ],
+        Language::Portuguese => &[
+            "mente", "coes", "cao", "ando", "endo", "os", "as", "es", "a", "o", "s",
+        ],
         Language::Dutch => &["heid", "ing", "lijk", "en", "er", "je", "s"],
         _ => return word.to_string(),
     };
@@ -476,7 +492,9 @@ fn stem(word: &str, lang: Language) -> String {
             // English Porter undoubling: after stripping -ing/-ed, a stem ending in a doubled
             // consonant (not l/s/z) collapses to one (`running`→`runn`→`run`, `hopped`→`hopp`→`hop`).
             // This is what makes `running`/`runs`/`run` share a stem — the parity the GATE needs.
-            if lang == Language::English && (*suf == "ing" || *suf == "ed" || *suf == "ingly" || *suf == "edly") {
+            if lang == Language::English
+                && (*suf == "ing" || *suf == "ed" || *suf == "ingly" || *suf == "edly")
+            {
                 undouble_english(&mut stemmed);
             }
             return stemmed;
@@ -509,16 +527,16 @@ fn undouble_english(stem: &mut String) {
 fn stopwords(lang: Language) -> &'static [&'static str] {
     match lang {
         Language::English => &[
-            "the", "a", "an", "and", "or", "but", "of", "to", "in", "on", "is", "are", "was",
-            "be", "by", "for", "with", "as", "at", "it", "this", "that",
+            "the", "a", "an", "and", "or", "but", "of", "to", "in", "on", "is", "are", "was", "be",
+            "by", "for", "with", "as", "at", "it", "this", "that",
         ],
         Language::German => &[
             "der", "die", "das", "und", "oder", "aber", "von", "zu", "in", "auf", "ist", "sind",
             "ein", "eine", "mit", "fur", "den", "dem", "des",
         ],
         Language::French => &[
-            "le", "la", "les", "et", "ou", "de", "du", "des", "un", "une", "a", "en", "est", "sont",
-            "dans", "pour", "avec", "sur", "ce", "que",
+            "le", "la", "les", "et", "ou", "de", "du", "des", "un", "une", "a", "en", "est",
+            "sont", "dans", "pour", "avec", "sur", "ce", "que",
         ],
         Language::Spanish => &[
             "el", "la", "los", "las", "y", "o", "de", "del", "un", "una", "a", "en", "es", "son",
@@ -579,7 +597,11 @@ mod tests {
         // The query-time path resolves the analyzer from the stored `lang` TAG (the real flow).
         let qry = Analyzer::for_tag(lang.tag()).analyze_set(text);
         assert_eq!(idx, qry, "analyzer drift for {:?} on {text:?}", lang);
-        assert!(!idx.is_empty(), "the chain produced no tokens for {:?} on {text:?}", lang);
+        assert!(
+            !idx.is_empty(),
+            "the chain produced no tokens for {:?} on {text:?}",
+            lang
+        );
     }
 
     #[test]
@@ -607,17 +629,26 @@ mod tests {
         let idx = a.analyze_set("the fox runs daily");
         let q = a.analyze("running");
         assert_eq!(q.len(), 1);
-        assert!(idx.contains(&q[0]), "stem parity: 'running' must hit indexed 'runs' → {idx:?}");
+        assert!(
+            idx.contains(&q[0]),
+            "stem parity: 'running' must hit indexed 'runs' → {idx:?}"
+        );
 
         // French diacritic-fold: a query "elements" (no accent) hits indexed "éléments".
         let fr = Analyzer::for_language(Language::French);
         let fidx = fr.analyze_set("les éléments du système");
         let fq = fr.analyze("elements");
-        assert!(fidx.contains(&fq[0]), "diacritic-fold: 'elements' must hit 'éléments' → {fidx:?}");
+        assert!(
+            fidx.contains(&fq[0]),
+            "diacritic-fold: 'elements' must hit 'éléments' → {fidx:?}"
+        );
 
         // German stopword parity: 'der'/'die'/'das' are dropped both sides (not a spurious match key).
         let de = Analyzer::for_language(Language::German);
-        assert!(de.analyze("der die das").is_empty(), "German stopwords are removed");
+        assert!(
+            de.analyze("der die das").is_empty(),
+            "German stopwords are removed"
+        );
     }
 
     // -------------------------------------------------------------------------------------------
@@ -669,7 +700,10 @@ mod tests {
         let a = Analyzer::for_language(Language::Cjk);
         let body = a.analyze_set("東京都");
         let q = a.analyze("京都");
-        assert!(q.iter().all(|t| body.contains(t)), "CJK n-gram match: {body:?} ⊇ {q:?}");
+        assert!(
+            q.iter().all(|t| body.contains(t)),
+            "CJK n-gram match: {body:?} ⊇ {q:?}"
+        );
     }
 
     #[test]
@@ -712,7 +746,10 @@ mod tests {
     #[test]
     fn detect_language_by_script_and_stopwords() {
         assert_eq!(detect_language("東京都"), Language::Cjk);
-        assert_eq!(detect_language("the quick brown fox and the dog"), Language::English);
+        assert_eq!(
+            detect_language("the quick brown fox and the dog"),
+            Language::English
+        );
         assert_eq!(detect_language("der die das und ein"), Language::German);
         // No signal ⇒ und (never a wrong confident guess).
         assert_eq!(detect_language("xyz123 qwop"), Language::Unknown);
@@ -733,7 +770,11 @@ mod tests {
             Language::Code,
             Language::Unknown,
         ] {
-            assert_eq!(Language::from_tag(lang.tag()), lang, "tag roundtrip for {lang:?}");
+            assert_eq!(
+                Language::from_tag(lang.tag()),
+                lang,
+                "tag roundtrip for {lang:?}"
+            );
         }
     }
 
@@ -741,7 +782,10 @@ mod tests {
     fn unknown_is_segment_and_fold_no_stem() {
         let a = Analyzer::for_language(Language::Unknown);
         // No stemming, no stopwords — just segment + fold.
-        assert_eq!(a.analyze("Running THE café"), vec!["running", "the", "cafe"]);
+        assert_eq!(
+            a.analyze("Running THE café"),
+            vec!["running", "the", "cafe"]
+        );
     }
 
     // -------------------------------------------------------------------------------------------
@@ -847,14 +891,21 @@ mod tests {
         }
         // A content word is NOT a stopword (the stoplist is not "everything"); German `apfel` has
         // no stripped suffix so it survives the chain whole.
-        assert_eq!(Analyzer::for_language(Language::German).analyze("apfel"), vec!["apfel"]);
+        assert_eq!(
+            Analyzer::for_language(Language::German).analyze("apfel"),
+            vec!["apfel"]
+        );
     }
 
     #[test]
     fn stopwords_are_per_language_not_shared() {
         // `der` is a German stopword but NOT an English one — English keeps it (folded, un-stemmed).
         let en = Analyzer::for_language(Language::English).analyze("der");
-        assert_eq!(en, vec!["der"], "English does not drop the German stopword 'der'");
+        assert_eq!(
+            en,
+            vec!["der"],
+            "English does not drop the German stopword 'der'"
+        );
     }
 
     // -------------------------------------------------------------------------------------------

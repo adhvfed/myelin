@@ -173,7 +173,10 @@ pub fn pseudonym_actor_lines_pass_the_prerequisite(actor_lines: &[&str]) -> bool
     // A real commit carries an author AND a committer line — both must hold only the pseudonym. An
     // EMPTY input is not a passing commit (a commit has at least an author actor); reject it so a
     // `-> true` constant mutant of the "all pass" roll-up is killed by the empty case.
-    !actor_lines.is_empty() && actor_lines.iter().all(|a| commit_actor_holds_only_pseudonym(a))
+    !actor_lines.is_empty()
+        && actor_lines
+            .iter()
+            .all(|a| commit_actor_holds_only_pseudonym(a))
 }
 
 #[cfg(test)]
@@ -188,7 +191,10 @@ mod tests {
     #[test]
     fn the_git_instance_references_the_posture_and_does_not_restate() {
         assert_eq!(GIT_INSTANCE.subsystem, "git");
-        assert_eq!(GIT_INSTANCE.cited_anchor, POSTURE_ANCHOR, "the Git instance cites the ONE anchor");
+        assert_eq!(
+            GIT_INSTANCE.cited_anchor, POSTURE_ANCHOR,
+            "the Git instance cites the ONE anchor"
+        );
         assert!(
             git_section_references_posture(),
             "the Git erasure section is a valid BY-REFERENCE instantiation (cites + does not restate)"
@@ -229,11 +235,15 @@ mod tests {
     /// observably false, not a constant.
     #[test]
     fn section_references_posture_is_observable_on_both_polarities() {
-        assert!(section_references_posture(&GIT_INSTANCE), "the real Git instance is accepted");
+        assert!(
+            section_references_posture(&GIT_INSTANCE),
+            "the real Git instance is accepted"
+        );
         let restating = SubsystemReference {
             subsystem: "git",
             cited_anchor: POSTURE_ANCHOR,
-            section_text: "Git erasure: per-subject DEK crypto-shred renders messages unrecoverable ...",
+            section_text:
+                "Git erasure: per-subject DEK crypto-shred renders messages unrecoverable ...",
         };
         assert!(
             !section_references_posture(&restating),
@@ -294,8 +304,8 @@ mod tests {
             "Ada Lovelace <ada@example.com>",
             "ada@example.com",
             "Ada Lovelace",
-            "psn-7f3a@acme.com",   // pseudonym-local but routable domain (wrong suffix)
-            "psn-7f3a@acme",       // missing the .noreply suffix
+            "psn-7f3a@acme.com", // pseudonym-local but routable domain (wrong suffix)
+            "psn-7f3a@acme",     // missing the .noreply suffix
         ] {
             assert!(
                 !pseudonym_actor_lines_pass_the_prerequisite(&[&good, bad]),

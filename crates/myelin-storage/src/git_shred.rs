@@ -283,7 +283,11 @@ impl<'a> GitCryptoShredReach<'a> {
 /// destroy. The seam returns a loud [`EraseError`] only if the post-condition is NOT met (a backup
 /// still holds a recoverable git structure) — a verified-not-assumed reach, never a silent claim.
 impl BlobShredReach for GitCryptoShredReach<'_> {
-    fn shred_blob_tier(&self, _subject: &crate::encryption::SubjectId, tenant: &TenantId) -> Result<(), EraseError> {
+    fn shred_blob_tier(
+        &self,
+        _subject: &crate::encryption::SubjectId,
+        tenant: &TenantId,
+    ) -> Result<(), EraseError> {
         let receipt = self.shred_git_structures(tenant);
         if receipt.is_green() {
             Ok(())
@@ -320,16 +324,23 @@ mod tests {
         let kms = Arc::new(KmsEngine::new());
         kms.ensure_kek(&KekId::new(tenant.clone(), r()));
         // Provision the per-tenant blob DEK (KeyClass::Blob) — what git structures seal under.
-        kms.ensure_dek(tenant, &r(), KeyClass::Blob).expect("blob dek");
+        kms.ensure_dek(tenant, &r(), KeyClass::Blob)
+            .expect("blob dek");
         kms
     }
 
     /// Seal a git structure's bytes under the per-tenant blob DEK (`KeyClass::Blob`) — exactly how
     /// reflog/bitmap/pack-tier-backup ciphertext rides the blob tier. Returns the `(key_ref, nonce,
     /// ciphertext)` an at-rest git structure (or its backup) holds.
-    fn seal_git_structure(engine: &KmsEngine, tenant: &TenantId, bytes: &[u8]) -> (PiiKeyRef, [u8; 12], Vec<u8>) {
+    fn seal_git_structure(
+        engine: &KmsEngine,
+        tenant: &TenantId,
+        bytes: &[u8],
+    ) -> (PiiKeyRef, [u8; 12], Vec<u8>) {
         let key_ref = PiiKeyRef::new(tenant.clone(), 0, KeyClass::Blob);
-        let dek = engine.resolve_dek(&key_ref, &r()).expect("resolve blob dek");
+        let dek = engine
+            .resolve_dek(&key_ref, &r())
+            .expect("resolve blob dek");
         let (nonce, ct) = dek.seal(bytes);
         (key_ref, nonce, ct)
     }
@@ -343,8 +354,13 @@ mod tests {
         // shred. The ciphertext is what the live reflog AND its pack-tier backup hold (§7.5).
         let reflog = b"refs/heads/main 0000 abcd <pseudonym>@acme.noreply pushed";
         let (key_ref, nonce, ct) = seal_git_structure(&engine, &tenant, reflog);
-        let dek_before = engine.resolve_dek(&key_ref, &r()).expect("blob dek resolves before shred");
-        assert_eq!(dek_before.open(&nonce, &ct).expect("decrypts before shred"), reflog);
+        let dek_before = engine
+            .resolve_dek(&key_ref, &r())
+            .expect("blob dek resolves before shred");
+        assert_eq!(
+            dek_before.open(&nonce, &ct).expect("decrypts before shred"),
+            reflog
+        );
 
         // The per-tenant blob DEK is present in the backup snapshot BEFORE the shred.
         let blob_dek = DekId::new(tenant.clone(), KeyClass::Blob);
@@ -358,8 +374,14 @@ mod tests {
         let receipt = reach.shred_git_structures(&tenant);
 
         // The blob DEK was destroyed this call; 0 recoverable in backup; residual is the posture.
-        assert!(receipt.blob_dek_destroyed_now, "the per-tenant blob DEK was destroyed");
-        assert_eq!(receipt.recoverable_in_backup, 0, "GIT-D2: 0 git structures recoverable in backup");
+        assert!(
+            receipt.blob_dek_destroyed_now,
+            "the per-tenant blob DEK was destroyed"
+        );
+        assert_eq!(
+            receipt.recoverable_in_backup, 0,
+            "GIT-D2: 0 git structures recoverable in backup"
+        );
         assert_eq!(receipt.residual, GitResidual::PseudonymousByDefault);
         assert!(receipt.is_green(), "GIT-D2 (storage half) green");
 
@@ -388,7 +410,9 @@ mod tests {
         assert_eq!(receipt.structures_reached, GitShreddable::ALL.to_vec());
         assert!(receipt.structures_reached.contains(&GitShreddable::Reflog));
         assert!(receipt.structures_reached.contains(&GitShreddable::Bitmap));
-        assert!(receipt.structures_reached.contains(&GitShreddable::PackTierBackup));
+        assert!(receipt
+            .structures_reached
+            .contains(&GitShreddable::PackTierBackup));
         // The commit-object residual is the documented posture (pseudonymous-by-default), NOT a
         // byte-mutation — there is no "commit-bytes" variant on GitShreddable.
         assert_eq!(receipt.residual, GitResidual::PseudonymousByDefault);
@@ -401,12 +425,18 @@ mod tests {
         let reach = GitCryptoShredReach::new(&engine, r());
 
         let r1 = reach.shred_git_structures(&tenant);
-        assert!(r1.blob_dek_destroyed_now, "first shred destroys the blob DEK");
+        assert!(
+            r1.blob_dek_destroyed_now,
+            "first shred destroys the blob DEK"
+        );
         assert!(r1.is_green());
 
         // Second shred of the same tenant: a no-op SUCCESS (the DEK is already gone).
         let r2 = reach.shred_git_structures(&tenant);
-        assert!(!r2.blob_dek_destroyed_now, "the blob DEK was already destroyed (idempotent re-run)");
+        assert!(
+            !r2.blob_dek_destroyed_now,
+            "the blob DEK was already destroyed (idempotent re-run)"
+        );
         assert_eq!(r2.recoverable_in_backup, 0, "still 0 recoverable in backup");
         assert!(r2.is_green());
     }
@@ -441,8 +471,14 @@ mod tests {
         };
         assert!(green.is_green());
         // A recoverable backup structure is RED.
-        let red = GitShredReceipt { recoverable_in_backup: 1, ..green.clone() };
-        assert!(!red.is_green(), "a recoverable git structure in backup is RED");
+        let red = GitShredReceipt {
+            recoverable_in_backup: 1,
+            ..green.clone()
+        };
+        assert!(
+            !red.is_green(),
+            "a recoverable git structure in backup is RED"
+        );
         // A dropped structure is RED.
         let dropped = GitShredReceipt {
             structures_reached: vec![GitShreddable::Reflog],
@@ -460,7 +496,10 @@ mod tests {
         // The residual is handled BY REFERENCE (10.9), never a Storage-local restatement.
         assert!(GitResidual::RESIDUAL_POSTURE_REF.contains("10.9"));
         assert!(GitResidual::RESIDUAL_POSTURE_REF.contains("pseudonymous-by-default"));
-        assert!(GitResidual::RESIDUAL_POSTURE_REF.contains("10.6"), "names the history-rewrite follow-on");
+        assert!(
+            GitResidual::RESIDUAL_POSTURE_REF.contains("10.6"),
+            "names the history-rewrite follow-on"
+        );
     }
 
     #[test]

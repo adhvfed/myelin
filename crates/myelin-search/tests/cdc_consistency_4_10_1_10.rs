@@ -31,13 +31,23 @@ use myelin_search::{
 };
 
 fn strong(rev: u64) -> Consistency {
-    Consistency { at_least: Zookie(format!("z@{rev}")), mode: ConsistencyMode::Strong }
+    Consistency {
+        at_least: Zookie(format!("z@{rev}")),
+        mode: ConsistencyMode::Strong,
+    }
 }
 fn bounded(rev: u64) -> Consistency {
-    Consistency { at_least: Zookie(format!("z@{rev}")), mode: ConsistencyMode::BoundedStale }
+    Consistency {
+        at_least: Zookie(format!("z@{rev}")),
+        mode: ConsistencyMode::BoundedStale,
+    }
 }
 fn subject() -> Principal {
-    Principal::stub(PrincipalId("p:alice".into()), PrincipalKind::Human, TenantId("acme".into()))
+    Principal::stub(
+        PrincipalId("p:alice".into()),
+        PrincipalKind::Human,
+        TenantId("acme".into()),
+    )
 }
 
 /// **CONSUMER (4.10): a zookie-stamped STRONG read bypasses the fail-static cache; a
@@ -81,7 +91,11 @@ fn cdc_consumer_4_10_zookie_revision_watermark() {
     };
     let (fresh, stale) = stale_candidates(["fresh", "stale"], "z@9", anchor);
     assert_eq!(fresh, vec!["fresh".to_string()]);
-    assert_eq!(stale, vec!["stale".to_string()], "ONLY the affected candidate is re-validated");
+    assert_eq!(
+        stale,
+        vec!["stale".to_string()],
+        "ONLY the affected candidate is re-validated"
+    );
 }
 
 /// **CONSUMER (4.2): the bounded `check` re-validation — a denying check excludes the stale
@@ -103,15 +117,25 @@ fn cdc_consumer_4_2_bounded_check_admit_or_exclude() {
             Ok(object.0 != self.revoked)
         }
     }
-    let port = Port { revoked: "acme/issue/SECRET-9" };
+    let port = Port {
+        revoked: "acme/issue/SECRET-9",
+    };
     let at = strong(9);
     let perm = Permission("read".into());
     assert!(
-        port.check(&subject(), &perm, &ObjectId("acme/issue/PUB-1".into()), &at).unwrap(),
+        port.check(&subject(), &perm, &ObjectId("acme/issue/PUB-1".into()), &at)
+            .unwrap(),
         "a still-granted object re-validates ALLOW (surface it)"
     );
     assert!(
-        !port.check(&subject(), &perm, &ObjectId("acme/issue/SECRET-9".into()), &at).unwrap(),
+        !port
+            .check(
+                &subject(),
+                &perm,
+                &ObjectId("acme/issue/SECRET-9".into()),
+                &at
+            )
+            .unwrap(),
         "the revoked object re-validates DENY (exclude the new-enemy)"
     );
 }
@@ -124,7 +148,10 @@ fn cdc_consumer_4_2_bounded_check_admit_or_exclude() {
 fn cdc_consumer_1_10_fail_static_degrade_not_cascade() {
     // static_max = 300 (== revocation SLA), agent-token-ttl = 60 (the lower bound). The mechanism
     // serves the last known-good cached coarse grant during a hiccup, NEVER fails open.
-    let bound = StalenessBound { revocation_sla_secs: 300, agent_token_ttl_secs: 60 };
+    let bound = StalenessBound {
+        revocation_sla_secs: 300,
+        agent_token_ttl_secs: 60,
+    };
     let fs = FailStatic::<u8>::try_new(30, 300, bound).expect("a valid fail-static window");
     // A fresh read caches the coarse grant.
     assert_eq!(fs.get("acl:alice", || Ok(1u8)), Answer::Fresh(1));
@@ -136,7 +163,13 @@ fn cdc_consumer_1_10_fail_static_degrade_not_cascade() {
     );
     // A hiccup with NO cached value fails CLOSED (never open) — the deny-when-unsure default.
     let cold = fs.get("acl:bob", || Err(ServeError("identity hiccup".into())));
-    assert!(cold.is_closed(), "no cached coarse grant → fail CLOSED, never open (ADR-03)");
+    assert!(
+        cold.is_closed(),
+        "no cached coarse grant → fail CLOSED, never open (ADR-03)"
+    );
     // The staleness budget is bounded by the revocation SLA (1.10: static_max ≤ revocation SLA).
-    assert!(fs.static_max() <= 300, "the fail-static window never outlives the revocation SLA");
+    assert!(
+        fs.static_max() <= 300,
+        "the fail-static window never outlives the revocation SLA"
+    );
 }

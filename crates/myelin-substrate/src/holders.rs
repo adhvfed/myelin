@@ -132,13 +132,17 @@ impl HolderRegistry {
 
     /// The set of PII-free holder ids registered (for the data-map / DSR fan-out address book).
     pub fn holder_ids(&self) -> BTreeSet<String> {
-        self.registrations.iter().map(HolderRegistration::holder_id).collect()
+        self.registrations
+            .iter()
+            .map(HolderRegistration::holder_id)
+            .collect()
     }
 
     /// Whether a given store (kind, name) was registered (the assertion the architecture test
     /// makes per known store — "this store did not escape registration").
     pub fn is_registered(&self, kind: StoreKind, name: &'static str) -> bool {
-        self.registrations.contains(&HolderRegistration { kind, name })
+        self.registrations
+            .contains(&HolderRegistration { kind, name })
     }
 
     /// How many stores were auto-registered (the count the holder-registered test asserts is the
@@ -163,7 +167,13 @@ mod tests {
     fn opening_a_store_registers_it_as_a_holder() {
         let mut reg = HolderRegistry::new();
         let receipt = reg.open(StoreKind::Oltp, "issue_oltp");
-        assert_eq!(receipt, HolderRegistration { kind: StoreKind::Oltp, name: "issue_oltp" });
+        assert_eq!(
+            receipt,
+            HolderRegistration {
+                kind: StoreKind::Oltp,
+                name: "issue_oltp"
+            }
+        );
         assert!(reg.is_registered(StoreKind::Oltp, "issue_oltp"));
         assert_eq!(reg.len(), 1);
     }
@@ -200,7 +210,10 @@ mod tests {
     /// The holder id is PII-free + stable (`<kind>:<name>`) — the address the DSR fan-out uses.
     #[test]
     fn holder_id_is_pii_free_and_stable() {
-        let r = HolderRegistration { kind: StoreKind::Cache, name: "edge_cache" };
+        let r = HolderRegistration {
+            kind: StoreKind::Cache,
+            name: "edge_cache",
+        };
         assert_eq!(r.holder_id(), "cache:edge_cache");
     }
 

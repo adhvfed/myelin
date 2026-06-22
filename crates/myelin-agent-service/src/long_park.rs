@@ -600,10 +600,24 @@ mod tests {
         .expect("a compute tool builds a long-park job")
         .expect("dispatch + park");
 
-        assert!(out.is_parked(), "the long-park returns Parked (the worker is freed): {out:?}");
-        assert!(ctx.parked_on_signal(), "the run is waiting on job.done (holds NO runtime)");
-        assert_eq!(backend.calls.load(Ordering::SeqCst), 1, "the job was dispatched exactly once");
-        assert_eq!(ctx.consumed_signals().len(), 0, "nothing consumed — the job is still running");
+        assert!(
+            out.is_parked(),
+            "the long-park returns Parked (the worker is freed): {out:?}"
+        );
+        assert!(
+            ctx.parked_on_signal(),
+            "the run is waiting on job.done (holds NO runtime)"
+        );
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            1,
+            "the job was dispatched exactly once"
+        );
+        assert_eq!(
+            ctx.consumed_signals().len(),
+            0,
+            "nothing consumed — the job is still running"
+        );
     }
 
     /// **The dispatched spec carries the engine's DETERMINISTIC idem_token (the §4.9 no-coordination
@@ -662,9 +676,21 @@ mod tests {
         // the runner already finished a fast-ish job: job.done buffered under the deterministic token —
         // DELIVERED TWICE (at-least-once). The PK dedups to ONE buffered row.
         let token = job_idem_token("R1", "agent.run:0");
-        deliver_job_done(&signals, &token, vec![ArtifactRef("myelin://acme/agent/trace/ok".into())]);
-        deliver_job_done(&signals, &token, vec![ArtifactRef("myelin://acme/agent/trace/ok".into())]);
-        assert_eq!(signals.buffered_depth(), 1, "the double delivery deduped to ONE buffered row");
+        deliver_job_done(
+            &signals,
+            &token,
+            vec![ArtifactRef("myelin://acme/agent/trace/ok".into())],
+        );
+        deliver_job_done(
+            &signals,
+            &token,
+            vec![ArtifactRef("myelin://acme/agent/trace/ok".into())],
+        );
+        assert_eq!(
+            signals.buffered_depth(),
+            1,
+            "the double delivery deduped to ONE buffered row"
+        );
 
         let mut ctx = begin(&outbox, journal, signals.clone());
         let out = dispatch_long_compute(
@@ -682,12 +708,23 @@ mod tests {
         match out {
             LongParkOutcome::Completed { idem_token, result } => {
                 assert_eq!(idem_token, token, "the runner echoed the dispatch token");
-                assert_eq!(result, vec![ArtifactRef("myelin://acme/agent/trace/ok".into())]);
+                assert_eq!(
+                    result,
+                    vec![ArtifactRef("myelin://acme/agent/trace/ok".into())]
+                );
             }
             other => panic!("expected Completed, got {other:?}"),
         }
-        assert_eq!(ctx.consumed_signals().len(), 1, "EXACTLY ONE wake per job (the double-delivery deduped)");
-        assert_eq!(signals.buffered_depth(), 0, "the one buffered row is consumed once");
+        assert_eq!(
+            ctx.consumed_signals().len(),
+            1,
+            "EXACTLY ONE wake per job (the double-delivery deduped)"
+        );
+        assert_eq!(
+            signals.buffered_depth(),
+            0,
+            "the one buffered row is consumed once"
+        );
     }
 
     // ───────────────────── gate #3: re-mint on wake after a long park ────────────────────────────
@@ -735,8 +772,8 @@ mod tests {
 
         // DRIVE 1: dispatch + park (no job.done yet). A run-identity lease is wired so a resume
         // re-mints. The cold first drive PARKS — it does NOT re-mint (nothing resumed yet).
-        let mut c1 = begin(&outbox, journal.clone(), signals.clone())
-            .with_run_identity(lease.clone());
+        let mut c1 =
+            begin(&outbox, journal.clone(), signals.clone()).with_run_identity(lease.clone());
         let out1 = dispatch_long_compute(
             &mut c1,
             green_gate(),
@@ -749,13 +786,22 @@ mod tests {
         .expect("build")
         .expect("dispatch + park");
         assert!(out1.is_parked(), "drive 1 parks holding no runtime");
-        assert_eq!(c1.reminted_tokens(), 0, "the cold dispatch drive does NOT re-mint (nothing resumed)");
-        c1.commit().expect("co-commit the dispatch + the park marker");
+        assert_eq!(
+            c1.reminted_tokens(),
+            0,
+            "the cold dispatch drive does NOT re-mint (nothing resumed)"
+        );
+        c1.commit()
+            .expect("co-commit the dispatch + the park marker");
         let history = journal.history_for(&tenant(), "R1");
 
         // ... HOURS later the runner delivers job.done (the long compute finished) ...
         let token = job_idem_token("R1", "agent.run:0");
-        deliver_job_done(&signals, &token, vec![ArtifactRef("myelin://acme/agent/trace/ok".into())]);
+        deliver_job_done(
+            &signals,
+            &token,
+            vec![ArtifactRef("myelin://acme/agent/trace/ok".into())],
+        );
 
         // DRIVE 2 (the wake): resume on the arriving job.done. The engine's wait-resume leg RE-MINTS
         // the per-run token BEFORE the resumed body runs.
@@ -783,17 +829,34 @@ mod tests {
         )
         .expect("build")
         .expect("the wake drive");
-        assert!(out2.is_completed(), "drive 2 completes on the arrived job.done: {out2:?}");
-        assert_eq!(c2.reminted_tokens(), 1, "the wake RE-MINTED a fresh per-run token (gate #3)");
+        assert!(
+            out2.is_completed(),
+            "drive 2 completes on the arrived job.done: {out2:?}"
+        );
+        assert_eq!(
+            c2.reminted_tokens(),
+            1,
+            "the wake RE-MINTED a fresh per-run token (gate #3)"
+        );
 
         // the re-mint was a SHORT-LIVED attenuated per-run token (token life == activity life).
         let calls = mint.calls.lock().unwrap();
         assert_eq!(calls.len(), 1, "exactly one re-mint on the wake");
         let (agent, cav, ttl) = calls[0].clone();
         assert_eq!(agent, "psn:agent-7");
-        assert_eq!(ttl, RunTokenLease::DEFAULT_TTL_SECS, "short-lived (the fail-static W, not the workflow life)");
-        assert!(cav.0.contains(&"run:R1".to_string()), "attenuated per-run (cannot act outside R1)");
-        assert!(cav.0.contains(&"delegated:human-x".to_string()), "the SAME grant chain (attenuate-only)");
+        assert_eq!(
+            ttl,
+            RunTokenLease::DEFAULT_TTL_SECS,
+            "short-lived (the fail-static W, not the workflow life)"
+        );
+        assert!(
+            cav.0.contains(&"run:R1".to_string()),
+            "attenuated per-run (cannot act outside R1)"
+        );
+        assert!(
+            cav.0.contains(&"delegated:human-x".to_string()),
+            "the SAME grant chain (attenuate-only)"
+        );
     }
 
     // ───────────────────── the vanished-runner SLA bound + the routing split ─────────────────────
@@ -811,8 +874,8 @@ mod tests {
         let backend = RecordingAsyncBackend::default();
 
         // DRIVE 1 at clock=1000 with a 3600s SLA → dispatch + park (deadline 4600 not reached).
-        let mut c1 = begin(&outbox, journal.clone(), signals.clone())
-            .with_timers(timers.clone(), 0, 1000);
+        let mut c1 =
+            begin(&outbox, journal.clone(), signals.clone()).with_timers(timers.clone(), 0, 1000);
         let out1 = dispatch_long_compute(
             &mut c1,
             green_gate(),
@@ -824,7 +887,10 @@ mod tests {
         )
         .expect("build")
         .expect("dispatch + park");
-        assert!(out1.is_parked(), "dispatched, parked on job.done with an SLA timer");
+        assert!(
+            out1.is_parked(),
+            "dispatched, parked on job.done with an SLA timer"
+        );
         c1.commit().expect("co-commit the dispatch + the SLA timer");
         let history = journal.history_for(&tenant(), "R1");
 
@@ -853,7 +919,10 @@ mod tests {
         )
         .expect("build")
         .expect("the timeout drive");
-        assert!(out2.is_timed_out(), "the SLA fired before the runner reported → TimedOut: {out2:?}");
+        assert!(
+            out2.is_timed_out(),
+            "the SLA fired before the runner reported → TimedOut: {out2:?}"
+        );
         assert_eq!(
             backend.calls.load(Ordering::SeqCst),
             1,
@@ -898,7 +967,11 @@ mod tests {
             matches!(err, RoutingError::NotComputeBound { ref tool, .. } if tool == "issue.create"),
             "a non-compute tool is REFUSED LOUD (the routing split): {err:?}"
         );
-        assert_eq!(backend.calls.load(Ordering::SeqCst), 0, "nothing was dispatched (0 mutate-via-exec)");
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            0,
+            "nothing was dispatched (0 mutate-via-exec)"
+        );
     }
 
     // ───────────────────────────── value-type mutation floor ─────────────────────────────────────
@@ -954,6 +1027,9 @@ mod tests {
         )
         .unwrap();
         let target = long_job_target(&job);
-        assert_eq!(target, "agent-job:agent-idem", "a machine handle naming the job, no PII body");
+        assert_eq!(
+            target, "agent-job:agent-idem",
+            "a machine handle naming the job, no PII body"
+        );
     }
 }

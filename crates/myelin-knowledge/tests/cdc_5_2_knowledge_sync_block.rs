@@ -62,9 +62,12 @@ fn source_root() -> ArtifactRef {
 /// A source page tree with a `head` block whose subtree is the synced content.
 fn source_tree() -> BlockTree {
     let mut t = BlockTree::new(PageId("handbook".into()));
-    t.insert_root(bid("page-root"), "paragraph", jit(0, 0)).unwrap();
-    t.insert_block(bid("head"), &bid("page-root"), "heading", jit(0, 1)).unwrap();
-    t.insert_block(bid("policy"), &bid("head"), "paragraph", jit(0, 0)).unwrap();
+    t.insert_root(bid("page-root"), "paragraph", jit(0, 0))
+        .unwrap();
+    t.insert_block(bid("head"), &bid("page-root"), "heading", jit(0, 1))
+        .unwrap();
+    t.insert_block(bid("policy"), &bid("head"), "paragraph", jit(0, 0))
+        .unwrap();
     t
 }
 
@@ -90,13 +93,25 @@ fn provider_sync_block_render_is_permission_first() {
     let denied = render_sync_block(&DenyAll, &Viewer("p-anon".into()), &live_source(&tree));
     match &denied {
         SyncBlockRender::Tombstone(t) => {
-            assert_eq!(t.reason, TombstoneReason::Denied, "step-1 denied (permission-first)");
-            assert_eq!(t.root, source_root(), "the tombstone carries the root (§4.6)");
+            assert_eq!(
+                t.reason,
+                TombstoneReason::Denied,
+                "step-1 denied (permission-first)"
+            );
+            assert_eq!(
+                t.root,
+                source_root(),
+                "the tombstone carries the root (§4.6)"
+            );
         }
         SyncBlockRender::Projection(_) => panic!("a denied viewer must NEVER get a projection"),
     }
     // THE LEAK GATE: 0 source blocks reach a denied viewer (structurally — a tombstone holds none).
-    assert_eq!(denied.leaked_blocks(), 0, "sync_block_leak == 0 (the M3 leak gate)");
+    assert_eq!(
+        denied.leaked_blocks(),
+        0,
+        "sync_block_leak == 0 (the M3 leak gate)"
+    );
 
     // A viewer who CAN read → the LIVE source subtree projection.
     let allowed = render_sync_block(&AllowAll, &Viewer("p-alice".into()), &live_source(&tree));
@@ -104,7 +119,11 @@ fn provider_sync_block_render_is_permission_first() {
         SyncBlockRender::Projection(p) => {
             assert_eq!(p.source, source_root());
             let ids: Vec<&str> = p.subtree.iter().map(|r| r.block_id.as_str()).collect();
-            assert_eq!(ids, vec!["head", "policy"], "the permitted viewer gets the live subtree");
+            assert_eq!(
+                ids,
+                vec!["head", "policy"],
+                "the permitted viewer gets the live subtree"
+            );
         }
         SyncBlockRender::Tombstone(_) => panic!("a permitted, resolvable source projects"),
     }
@@ -124,7 +143,8 @@ fn provider_projection_is_live_reflects_source_edit() {
     assert_eq!(first_ids, vec!["head", "policy"]);
 
     // A SOURCE edit: append `addendum` under `head`.
-    tree.insert_block(bid("addendum"), &bid("head"), "paragraph", jit(0, 1)).unwrap();
+    tree.insert_block(bid("addendum"), &bid("head"), "paragraph", jit(0, 1))
+        .unwrap();
 
     let second = render_sync_block(&AllowAll, &Viewer("p-alice".into()), &live_source(&tree));
     let second_ids: Vec<String> = match &second {
@@ -155,7 +175,11 @@ fn consumer_renders_projection_or_degrades_tombstone() {
             SyncBlockRender::Tombstone(t) => {
                 // The consumer degrades to "referenced *<root>* (unavailable)" — NO content, the
                 // frozen reason label drives the UI affordance (the one C-2 vocabulary).
-                format!("[referenced {} — unavailable: {}]", t.root.0, t.reason.label())
+                format!(
+                    "[referenced {} — unavailable: {}]",
+                    t.root.0,
+                    t.reason.label()
+                )
             }
         }
     }
@@ -167,18 +191,19 @@ fn consumer_renders_projection_or_degrades_tombstone() {
     let denied = render_sync_block(&DenyAll, &Viewer("p-anon".into()), &live_source(&tree));
     let denied_view = render_for_display(&denied);
     assert_eq!(
-        denied_view,
-        "[referenced myelin://acme/knowledge/page/handbook — unavailable: denied]",
+        denied_view, "[referenced myelin://acme/knowledge/page/handbook — unavailable: denied]",
         "the consumer degrades to a content-free notice on deny"
     );
-    assert!(!denied_view.contains("policy"), "the consumer NEVER renders source content on deny");
+    assert!(
+        !denied_view.contains("policy"),
+        "the consumer NEVER renders source content on deny"
+    );
 
     // Permitted → the consumer renders the live subtree.
     let allowed = render_sync_block(&AllowAll, &Viewer("p-alice".into()), &live_source(&tree));
     let allowed_view = render_for_display(&allowed);
     assert_eq!(
-        allowed_view,
-        "[synced from myelin://acme/knowledge/page/handbook] head,policy",
+        allowed_view, "[synced from myelin://acme/knowledge/page/handbook] head,policy",
         "the consumer renders the live subtree on a projection"
     );
 }
@@ -200,7 +225,10 @@ fn consumer_sees_the_full_frozen_ladder_vocabulary() {
             freshness: ProjectionFreshness::Live,
         },
     );
-    assert_eq!(root_gone.tombstone_reason(), Some(TombstoneReason::RootGone));
+    assert_eq!(
+        root_gone.tombstone_reason(),
+        Some(TombstoneReason::RootGone)
+    );
     assert_eq!(root_gone.leaked_blocks(), 0);
 
     // sub_gone: the root resolves but the source block was deleted.
@@ -232,5 +260,9 @@ fn consumer_sees_the_full_frozen_ladder_vocabulary() {
         },
     );
     assert_eq!(erased.tombstone_reason(), Some(TombstoneReason::Erased));
-    assert_eq!(erased.leaked_blocks(), 0, "an erased source renders NO content");
+    assert_eq!(
+        erased.leaked_blocks(),
+        0,
+        "an erased source renders NO content"
+    );
 }

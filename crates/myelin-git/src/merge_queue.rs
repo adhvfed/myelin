@@ -123,7 +123,13 @@ where
         endorsed_contexts: Vec<CheckContext>,
         merge_fn: F,
     ) -> GitMergePerformer<'a, F> {
-        GitMergePerformer { projection, head_oid, policy, endorsed_contexts, merge_fn }
+        GitMergePerformer {
+            projection,
+            head_oid,
+            policy,
+            endorsed_contexts,
+            merge_fn,
+        }
     }
 
     /// **Git's authoritative merge gate over its OWN projection (§6.2 + §6.3).** Returns
@@ -144,7 +150,10 @@ where
     /// Reuses [`is_acceptable_satisfaction`] (§6.3) over the projection row — never recomputes trust.
     /// The per-context primitive the gate folds over; exposed for a targeted drill assertion.
     pub fn context_satisfied(&self, context: &CheckContext) -> bool {
-        let key = CheckKey { commit_oid: self.head_oid.clone(), context: context.clone() };
+        let key = CheckKey {
+            commit_oid: self.head_oid.clone(),
+            context: context.clone(),
+        };
         match self.projection.current(&key) {
             None => false, // a missing required context never satisfies (fail-closed).
             Some(row) => is_acceptable_satisfaction(row, self.endorsed_contexts.contains(context)),
@@ -221,7 +230,10 @@ mod tests {
             run_attempt: attempt,
             trust_tier: trust,
             details_ref: ArtifactRef(format!("myelin://acme/ci/run/{attempt}#step-2")),
-            summary: HumanisedRef { template_key: "ci.check.updated".into(), args: BTreeMap::new() },
+            summary: HumanisedRef {
+                template_key: "ci.check.updated".into(),
+                args: BTreeMap::new(),
+            },
             started_at: Timestamp("2026-06-22T00:00:00Z".into()),
             completed_at: Some(Timestamp("2026-06-22T00:01:00Z".into())),
             cost_settled: true,
@@ -251,16 +263,10 @@ mod tests {
         proj.apply(&fact("test", 1, CheckState::Success, TrustTier::Trusted));
 
         let merges = Cell::new(0u32);
-        let perf = GitMergePerformer::new(
-            &proj,
-            GitOid(HEAD.into()),
-            policy(),
-            vec![],
-            |r| {
-                merges.set(merges.get() + 1);
-                Ok(format!("merged-{}", r.speculative_commit_oid))
-            },
-        );
+        let perf = GitMergePerformer::new(&proj, GitOid(HEAD.into()), policy(), vec![], |r| {
+            merges.set(merges.get() + 1);
+            Ok(format!("merged-{}", r.speculative_commit_oid))
+        });
         assert!(matches!(perf.gate_outcome(), MergeGateOutcome::Admitted));
         let oid = perf.merge(&request()).expect("admitted → merge");
         assert_eq!(oid, "merged-deadbeefcafe");
@@ -276,7 +282,12 @@ mod tests {
         let mut proj = CheckStatusProjection::new();
         proj.apply(&fact("build", 1, CheckState::Success, TrustTier::Trusted));
         // `test` rolled up green but the run was an untrusted fork — NEUTRAL until endorsed.
-        proj.apply(&fact("test", 1, CheckState::Success, TrustTier::UntrustedFork));
+        proj.apply(&fact(
+            "test",
+            1,
+            CheckState::Success,
+            TrustTier::UntrustedFork,
+        ));
 
         let merges = Cell::new(0u32);
         let perf = GitMergePerformer::new(
@@ -289,11 +300,28 @@ mod tests {
                 Ok("should-not-run".into())
             },
         );
-        assert!(matches!(perf.gate_outcome(), MergeGateOutcome::Blocked { .. }));
-        let err = perf.merge(&request()).expect_err("an un-endorsed fork success must refuse the merge");
-        assert!(err.0.contains("the merge gate did not admit"), "humanised: {}", err.0);
-        assert!(err.0.contains("ci/test"), "names the unmet context: {}", err.0);
-        assert!(!err.0.contains("Blocked"), "no raw gate struct in the reason: {}", err.0);
+        assert!(matches!(
+            perf.gate_outcome(),
+            MergeGateOutcome::Blocked { .. }
+        ));
+        let err = perf
+            .merge(&request())
+            .expect_err("an un-endorsed fork success must refuse the merge");
+        assert!(
+            err.0.contains("the merge gate did not admit"),
+            "humanised: {}",
+            err.0
+        );
+        assert!(
+            err.0.contains("ci/test"),
+            "names the unmet context: {}",
+            err.0
+        );
+        assert!(
+            !err.0.contains("Blocked"),
+            "no raw gate struct in the reason: {}",
+            err.0
+        );
         assert_eq!(merges.get(), 0, "0 forks self-green their gate at merge");
     }
 
@@ -303,7 +331,12 @@ mod tests {
     fn endorsed_fork_success_admits_and_merges() {
         let mut proj = CheckStatusProjection::new();
         proj.apply(&fact("build", 1, CheckState::Success, TrustTier::Trusted));
-        proj.apply(&fact("test", 1, CheckState::Success, TrustTier::UntrustedFork));
+        proj.apply(&fact(
+            "test",
+            1,
+            CheckState::Success,
+            TrustTier::UntrustedFork,
+        ));
 
         let merges = Cell::new(0u32);
         let perf = GitMergePerformer::new(
@@ -317,7 +350,8 @@ mod tests {
             },
         );
         assert!(matches!(perf.gate_outcome(), MergeGateOutcome::Admitted));
-        perf.merge(&request()).expect("an endorsed fork success admits");
+        perf.merge(&request())
+            .expect("an endorsed fork success admits");
         assert_eq!(merges.get(), 1, "the endorsed fork context merges once");
     }
 
@@ -330,16 +364,21 @@ mod tests {
         // only `build` reported — `test` (required) is missing.
         proj.apply(&fact("build", 1, CheckState::Success, TrustTier::Trusted));
 
-        let perf = GitMergePerformer::new(
-            &proj,
-            GitOid(HEAD.into()),
-            policy(),
-            vec![],
-            |_r| panic!("must not merge with a missing required context"),
+        let perf = GitMergePerformer::new(&proj, GitOid(HEAD.into()), policy(), vec![], |_r| {
+            panic!("must not merge with a missing required context")
+        });
+        assert!(
+            !perf.context_satisfied(&CheckContext::ci("test")),
+            "missing → unsatisfied"
         );
-        assert!(!perf.context_satisfied(&CheckContext::ci("test")), "missing → unsatisfied");
-        let err = perf.merge(&request()).expect_err("a missing required context must refuse the merge");
-        assert!(err.0.contains("ci/test"), "names the missing context: {}", err.0);
+        let err = perf
+            .merge(&request())
+            .expect_err("a missing required context must refuse the merge");
+        assert!(
+            err.0.contains("ci/test"),
+            "names the missing context: {}",
+            err.0
+        );
     }
 
     /// **The actual-merge closure surfaces a conflict as an [`ActivityError`] (the gate admitted but the
@@ -351,13 +390,9 @@ mod tests {
         proj.apply(&fact("build", 1, CheckState::Success, TrustTier::Trusted));
         proj.apply(&fact("test", 1, CheckState::Success, TrustTier::Trusted));
 
-        let perf = GitMergePerformer::new(
-            &proj,
-            GitOid(HEAD.into()),
-            policy(),
-            vec![],
-            |_r| Err(ActivityError("merge conflict".into())),
-        );
+        let perf = GitMergePerformer::new(&proj, GitOid(HEAD.into()), policy(), vec![], |_r| {
+            Err(ActivityError("merge conflict".into()))
+        });
         let err = perf.merge(&request()).expect_err("the conflict propagates");
         assert_eq!(err.0, "merge conflict");
     }
@@ -368,20 +403,32 @@ mod tests {
     fn context_satisfied_reads_trust_off_the_fact() {
         let mut proj = CheckStatusProjection::new();
         proj.apply(&fact("build", 1, CheckState::Success, TrustTier::Trusted));
-        proj.apply(&fact("fork", 1, CheckState::Success, TrustTier::UntrustedFork));
+        proj.apply(&fact(
+            "fork",
+            1,
+            CheckState::Success,
+            TrustTier::UntrustedFork,
+        ));
 
-        let unendorsed = GitMergePerformer::new(
-            &proj, GitOid(HEAD.into()), policy(), vec![], |_r| Ok(String::new()),
+        let unendorsed =
+            GitMergePerformer::new(&proj, GitOid(HEAD.into()), policy(), vec![], |_r| {
+                Ok(String::new())
+            });
+        assert!(
+            unendorsed.context_satisfied(&CheckContext::ci("build")),
+            "trusted success satisfies"
         );
-        assert!(unendorsed.context_satisfied(&CheckContext::ci("build")), "trusted success satisfies");
         assert!(
             !unendorsed.context_satisfied(&CheckContext::ci("fork")),
             "an un-endorsed fork success does not satisfy"
         );
 
         let endorsed = GitMergePerformer::new(
-            &proj, GitOid(HEAD.into()), policy(),
-            vec![CheckContext::ci("fork")], |_r| Ok(String::new()),
+            &proj,
+            GitOid(HEAD.into()),
+            policy(),
+            vec![CheckContext::ci("fork")],
+            |_r| Ok(String::new()),
         );
         assert!(
             endorsed.context_satisfied(&CheckContext::ci("fork")),

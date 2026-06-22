@@ -22,9 +22,7 @@ use myelin_events::{
     HandleOutcome, IdMinter, InProcessBus, Message, MonotonicMinter, OutboxStore, OutboxTx,
     PrefetchBound, Relay, SubjectPattern, Subscription, Timestamp, Visibility,
 };
-use myelin_harness::{
-    Dependency, DependencyBreaker, Predicate, Scope, SignalName, SignalSource,
-};
+use myelin_harness::{Dependency, DependencyBreaker, Predicate, Scope, SignalName, SignalSource};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_tenancy::{Region, TenantId};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -40,7 +38,11 @@ fn ctx_base() -> EmitContextBase {
     EmitContextBase {
         tenant: TenantId("acme".into()),
         region: Region("eu-west".into()),
-        actor: Actor(Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId("acme".into()))),
+        actor: Actor(Principal::stub(
+            PrincipalId("p".into()),
+            PrincipalKind::Human,
+            TenantId("acme".into()),
+        )),
         schema_ver: 1,
         occurred_at: Timestamp("2026-06-19T00:00:00Z".into()),
         recorded_at: Timestamp("2026-06-19T00:00:01Z".into()),
@@ -98,8 +100,12 @@ impl EventHandler for RecordingHandler {
 }
 
 fn sub() -> Subscription {
-    Subscription::bind(ConsumerName("indexer".into()), &[SUBJECT_PREFIX], PrefetchBound::DEFAULT)
-        .unwrap()
+    Subscription::bind(
+        ConsumerName("indexer".into()),
+        &[SUBJECT_PREFIX],
+        PrefetchBound::DEFAULT,
+    )
+    .unwrap()
 }
 
 /// Pull every envelope the broker has delivered (the consumer's read of the durable stream) and
@@ -140,7 +146,11 @@ fn drill_sub_d2_drop_broker_mid_stream_zero_lost_zero_dup() {
 
     // === Connection 1: relay publishes, consumer processes SOME, then the broker DROPS. ===
     relay.drain_to_empty(); // every committed event is now on the broker.
-    assert_eq!(bus.delivered_count(), 6, "relay published all 6 (at-least-once available)");
+    assert_eq!(
+        bus.delivered_count(),
+        6,
+        "relay published all 6 (at-least-once available)"
+    );
 
     // The first consumer processes the first 3 of the 6 delivered, then the broker drops.
     let processed_before;
@@ -152,7 +162,10 @@ fn drill_sub_d2_drop_broker_mid_stream_zero_lost_zero_dup() {
             assert_eq!(c1.deliver(&Message { subject, envelope }), Delivered::Acked);
         }
         processed_before = c1.dedup().len();
-        assert_eq!(processed_before, 3, "consumer 1 durably handled 3 before the drop");
+        assert_eq!(
+            processed_before, 3,
+            "consumer 1 durably handled 3 before the drop"
+        );
 
         // (1) INJECT: drop the broker mid-stream (the SUB-D2 fault). The remaining 3 were never
         //     delivered to a consumer.
@@ -175,23 +188,43 @@ fn drill_sub_d2_drop_broker_mid_stream_zero_lost_zero_dup() {
 
     // 0 DUP: the 3 already-handled events are DEDUPLICATED (the ledger absorbed the redelivery);
     // the 3 not-yet-handled are ACKED (0 lost).
-    let deduped = outcomes.iter().filter(|o| **o == Delivered::Deduplicated).count();
+    let deduped = outcomes
+        .iter()
+        .filter(|o| **o == Delivered::Deduplicated)
+        .count();
     let acked = outcomes.iter().filter(|o| **o == Delivered::Acked).count();
-    assert_eq!(deduped, 3, "the 3 already-handled events were deduped (0 dup)");
-    assert_eq!(acked, 3, "the 3 surviving events were handled after reconnect (0 lost)");
+    assert_eq!(
+        deduped, 3,
+        "the 3 already-handled events were deduped (0 dup)"
+    );
+    assert_eq!(
+        acked, 3,
+        "the 3 surviving events were handled after reconnect (0 lost)"
+    );
 
     // The handler on c2 ran EXACTLY 3 times (only the not-yet-handled events) — no double-process.
-    assert_eq!(c2.handler().runs.load(Ordering::SeqCst), 3, "no event processed twice (0 dup)");
+    assert_eq!(
+        c2.handler().runs.load(Ordering::SeqCst),
+        3,
+        "no event processed twice (0 dup)"
+    );
 
     // 0 LOST: across the WHOLE sequence, every committed event was handled exactly once. The
     // ledger now holds exactly the committed set.
-    assert_eq!(ledger.len(), 6, "all 6 committed events are durably handled (0 lost)");
+    assert_eq!(
+        ledger.len(),
+        6,
+        "all 6 committed events are durably handled (0 lost)"
+    );
     let handled: std::collections::HashSet<_> = ids
         .iter()
         .filter(|id| ledger.is_handled(c2.name(), id))
         .cloned()
         .collect();
-    assert_eq!(handled, committed, "the handled set == the committed set (0 lost, 0 dup)");
+    assert_eq!(
+        handled, committed,
+        "the handled set == the committed set (0 lost, 0 dup)"
+    );
 
     // consumer_lag recovers to 0 (the P-S04 survival signal; no HoL stall — all subjects drained).
     let mut signals = SignalSource::new();
@@ -245,9 +278,21 @@ fn drill_sub_d2_slow_subject_does_not_block_fast_subject() {
 
     // The slow subject retries (stays pending, lag on it rises); the fast subject ACKs regardless.
     assert_eq!(c.deliver(&slow), Delivered::Retried(30));
-    assert_eq!(c.deliver(&fast), Delivered::Acked, "fast subject not blocked by the slow one");
-    assert_eq!(c.lag_on("myelin://acme/slow/x"), 1, "the slow subject carries the lag");
-    assert_eq!(c.lag_on("myelin://acme/fast/y"), 0, "the fast subject drained (no HoL stall)");
+    assert_eq!(
+        c.deliver(&fast),
+        Delivered::Acked,
+        "fast subject not blocked by the slow one"
+    );
+    assert_eq!(
+        c.lag_on("myelin://acme/slow/x"),
+        1,
+        "the slow subject carries the lag"
+    );
+    assert_eq!(
+        c.lag_on("myelin://acme/fast/y"),
+        0,
+        "the fast subject drained (no HoL stall)"
+    );
 
     // The P-S04 signal reads the slow subject's lag is non-zero while the fast lane is clear — a
     // drill asserts the fast lane held (its lag == 0).
@@ -264,7 +309,9 @@ fn drill_sub_d2_slow_subject_does_not_block_fast_subject() {
             Predicate::Eq(0),
         )
         .expect_green();
-    println!("[2026-06-19] PASS  drill=SUB-D2  no-HoL-stall: fast lane lag==0 while slow lane retries");
+    println!(
+        "[2026-06-19] PASS  drill=SUB-D2  no-HoL-stall: fast lane lag==0 while slow lane retries"
+    );
 }
 
 fn envelope(id: &str, subject: &str) -> EventEnvelope {
@@ -275,7 +322,11 @@ fn envelope(id: &str, subject: &str) -> EventEnvelope {
         schema_ver: 1,
         tenant: TenantId("acme".into()),
         region: Region("eu-west".into()),
-        actor: Actor(Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId("acme".into()))),
+        actor: Actor(Principal::stub(
+            PrincipalId("p".into()),
+            PrincipalKind::Human,
+            TenantId("acme".into()),
+        )),
         subject: ArtifactRef(subject.into()),
         aggregate: AggregateKey("a:1".into()),
         causation_id: None,
@@ -311,7 +362,10 @@ fn cdc_2_4_2_5_consumer_reads_relayed_envelope_and_dedups() {
     // The consumer reads exactly the relayed envelopes (provider→consumer 2.4 pair) and processes
     // each once.
     let first = pump(&c, &bus);
-    assert!(first.iter().all(|o| *o == Delivered::Acked), "every relayed event processed once");
+    assert!(
+        first.iter().all(|o| *o == Delivered::Acked),
+        "every relayed event processed once"
+    );
     assert_eq!(
         c.handler().processed.lock().unwrap().clone(),
         ids.iter().map(|i| i.0.clone()).collect::<Vec<_>>(),
@@ -320,8 +374,15 @@ fn cdc_2_4_2_5_consumer_reads_relayed_envelope_and_dedups() {
 
     // 2.5: a redelivery of the same stream is fully deduped (the `(consumer, event_id)` PK).
     let again = pump(&c, &bus);
-    assert!(again.iter().all(|o| *o == Delivered::Deduplicated), "redelivery is deduped (2.5)");
-    assert_eq!(c.handler().runs.load(Ordering::SeqCst), 2, "the handler still ran only twice");
+    assert!(
+        again.iter().all(|o| *o == Delivered::Deduplicated),
+        "redelivery is deduped (2.5)"
+    );
+    assert_eq!(
+        c.handler().runs.load(Ordering::SeqCst),
+        2,
+        "the handler still ran only twice"
+    );
 }
 
 /// SUB-D2 registers into the P-S04 every-incident-adds-a-drill registry so it re-runs forever
@@ -351,7 +412,8 @@ fn sub_d2_registers_into_the_permanent_drill_suite() {
                 let subject = envelope.subject.0.clone();
                 c1.deliver(&Message { subject, envelope });
             }
-            ctx.breaker.break_dependency(Dependency::Broker, scope.clone());
+            ctx.breaker
+                .break_dependency(Dependency::Broker, scope.clone());
             if ctx.breaker.is_broken(&Dependency::Broker, &scope) {
                 bus.sever();
             }
@@ -363,20 +425,36 @@ fn sub_d2_registers_into_the_permanent_drill_suite() {
         let outcomes = pump(&c2, &bus);
 
         let acked = outcomes.iter().filter(|o| **o == Delivered::Acked).count();
-        let deduped = outcomes.iter().filter(|o| **o == Delivered::Deduplicated).count();
+        let deduped = outcomes
+            .iter()
+            .filter(|o| **o == Delivered::Deduplicated)
+            .count();
         assert_eq!(acked, 2, "the 2 survivors handled after reconnect (0 lost)");
         assert_eq!(deduped, 2, "the 2 already-handled deduped (0 dup)");
         assert_eq!(ledger.len(), 4, "all 4 committed handled exactly once");
-        assert_eq!(c2.handler().runs.load(Ordering::SeqCst), 2, "no double-process");
+        assert_eq!(
+            c2.handler().runs.load(Ordering::SeqCst),
+            2,
+            "no double-process"
+        );
         let _ = ids;
 
         // the asserted survival signal: consumer_lag recovered to 0.
-        ctx.signals.set_scalar(SignalName::ConsumerLag, c2.lag() as i64);
-        ctx.signals.assert_signal(SignalName::ConsumerLag, Predicate::Eq(0))
+        ctx.signals
+            .set_scalar(SignalName::ConsumerLag, c2.lag() as i64);
+        ctx.signals
+            .assert_signal(SignalName::ConsumerLag, Predicate::Eq(0))
     }));
 
     let results = registry.run_all();
-    assert!(results[0].is_pass(), "SUB-D2 drill must read green: {:?}", results[0]);
-    assert!(registry.all_green(), "re-runs forever (a regression re-reds it)");
+    assert!(
+        results[0].is_pass(),
+        "SUB-D2 drill must read green: {:?}",
+        results[0]
+    );
+    assert!(
+        registry.all_green(),
+        "re-runs forever (a regression re-reds it)"
+    );
     println!("{}", results[0].artifact_row("2026-06-19"));
 }

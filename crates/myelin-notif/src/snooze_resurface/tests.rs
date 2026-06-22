@@ -62,13 +62,28 @@ fn state_of(inbox: &InboxProjection, recipient: &str, item_id: &str) -> Option<S
 #[test]
 fn snooze_timer_key_is_namespaced_and_deterministic() {
     let k = snooze_timer_key(&tenant(), "u1", "iss-1");
-    assert!(k.starts_with(SNOOZE_TIMER_NS), "the key is namespaced under `snooze:`");
-    assert_eq!(k, "snooze:acme:u1:iss-1", "deterministic from (tenant, recipient, item_id)");
+    assert!(
+        k.starts_with(SNOOZE_TIMER_NS),
+        "the key is namespaced under `snooze:`"
+    );
+    assert_eq!(
+        k, "snooze:acme:u1:iss-1",
+        "deterministic from (tenant, recipient, item_id)"
+    );
     // Distinct rows → distinct keys (no collision on the shared wheel).
-    assert_ne!(snooze_timer_key(&tenant(), "u1", "iss-1"), snooze_timer_key(&tenant(), "u1", "iss-2"));
-    assert_ne!(snooze_timer_key(&tenant(), "u1", "iss-1"), snooze_timer_key(&tenant(), "u2", "iss-1"));
+    assert_ne!(
+        snooze_timer_key(&tenant(), "u1", "iss-1"),
+        snooze_timer_key(&tenant(), "u1", "iss-2")
+    );
+    assert_ne!(
+        snooze_timer_key(&tenant(), "u1", "iss-1"),
+        snooze_timer_key(&tenant(), "u2", "iss-1")
+    );
     // It does NOT collide with a raw escalation run_id of the same shape (escalation keys are raw).
-    assert_ne!(snooze_timer_key(&tenant(), "u1", "iss-1"), "iss-1".to_string());
+    assert_ne!(
+        snooze_timer_key(&tenant(), "u1", "iss-1"),
+        "iss-1".to_string()
+    );
 }
 
 // --- arm: the durable re-surface timer is armed on the SHARED wheel (no in-process sleep) ---
@@ -80,9 +95,15 @@ fn snooze_timer_key_is_namespaced_and_deterministic() {
 fn arm_schedules_a_durable_timer_on_the_shared_wheel() {
     let wheel = InMemoryWheel::new();
     let r = SnoozeResurfacer::new(wheel);
-    assert!(!r.has_timer(&tenant(), "u1", "iss-1"), "no timer before arming");
+    assert!(
+        !r.has_timer(&tenant(), "u1", "iss-1"),
+        "no timer before arming"
+    );
     r.arm(&tenant(), "u1", "iss-1", 30);
-    assert!(r.has_timer(&tenant(), "u1", "iss-1"), "the durable re-surface timer is armed");
+    assert!(
+        r.has_timer(&tenant(), "u1", "iss-1"),
+        "the durable re-surface timer is armed"
+    );
     // A DIFFERENT item has no timer (arming is per-item).
     assert!(!r.has_timer(&tenant(), "u1", "iss-2"));
 }
@@ -95,11 +116,17 @@ fn re_arm_replaces_the_prior_handle() {
     let r = SnoozeResurfacer::new(wheel);
     r.arm(&tenant(), "u1", "iss-1", 30);
     r.arm(&tenant(), "u1", "iss-1", 60); // re-snooze → replace.
-    assert!(r.has_timer(&tenant(), "u1", "iss-1"), "still exactly one live handle");
+    assert!(
+        r.has_timer(&tenant(), "u1", "iss-1"),
+        "still exactly one live handle"
+    );
     // Firing it once consumes the single handle; a second fire is a no-op.
     let key = snooze_timer_key(&tenant(), "u1", "iss-1");
     assert!(r.wheel().fire_due(&key), "the one handle fires once");
-    assert!(!r.wheel().fire_due(&key), "no second handle (re-arm replaced, did not stack)");
+    assert!(
+        !r.wheel().fire_due(&key),
+        "no second handle (re-arm replaced, did not stack)"
+    );
 }
 
 // --- resurface_due: effectively-once flip snoozed → unread ---
@@ -116,11 +143,18 @@ fn resurface_due_flips_snoozed_to_unread_exactly_once() {
 
     // snooze + arm the durable timer.
     snooze_and_arm(&inbox, &r, &p, "iss-1", "2026-06-25T09:00:00Z", 30).unwrap();
-    assert_eq!(state_of(&inbox, "u1", "iss-1").unwrap(), "snoozed", "parked after snooze");
+    assert_eq!(
+        state_of(&inbox, "u1", "iss-1").unwrap(),
+        "snoozed",
+        "parked after snooze"
+    );
 
     // suppressed from the active inbox while snoozed.
     let active = active_inbox(inbox.snapshot_for_tenant(&tenant()));
-    assert!(!active.iter().any(|x| x.item_id == "iss-1"), "snoozed item absent from active inbox");
+    assert!(
+        !active.iter().any(|x| x.item_id == "iss-1"),
+        "snoozed item absent from active inbox"
+    );
 
     // the timer fires at the until → re-surface EXACTLY ONCE.
     assert_eq!(
@@ -128,13 +162,23 @@ fn resurface_due_flips_snoozed_to_unread_exactly_once() {
         ResurfaceOutcome::Resurfaced,
         "the first fire re-surfaces the item"
     );
-    let row = inbox.snapshot_for_tenant(&tenant()).into_iter().find(|x| x.item_id == "iss-1").unwrap();
+    let row = inbox
+        .snapshot_for_tenant(&tenant())
+        .into_iter()
+        .find(|x| x.item_id == "iss-1")
+        .unwrap();
     assert_eq!(row.state, "unread", "snoozed → unread");
-    assert!(row.snooze_until.is_none(), "the snooze_until is cleared on re-surface");
+    assert!(
+        row.snooze_until.is_none(),
+        "the snooze_until is cleared on re-surface"
+    );
 
     // back in the active inbox.
     let active = active_inbox(inbox.snapshot_for_tenant(&tenant()));
-    assert!(active.iter().any(|x| x.item_id == "iss-1"), "the re-surfaced item is back in the active inbox");
+    assert!(
+        active.iter().any(|x| x.item_id == "iss-1"),
+        "the re-surfaced item is back in the active inbox"
+    );
 
     // 0 DUPLICATE: a replayed fire (the effectively-once handle is consumed) re-surfaces NOTHING.
     assert_eq!(
@@ -165,7 +209,11 @@ fn resurface_due_leaves_a_manually_unsnoozed_row_alone() {
         ResurfaceOutcome::NoOp,
         "a cancelled timer never fires (and a non-snoozed row is never flipped)"
     );
-    assert_eq!(state_of(&inbox, "u1", "iss-1").unwrap(), "read", "the user's read state is preserved");
+    assert_eq!(
+        state_of(&inbox, "u1", "iss-1").unwrap(),
+        "read",
+        "the user's read state is preserved"
+    );
 }
 
 /// **The guard inside `resurface_due` (state == snoozed) protects a non-snoozed row even if the
@@ -187,7 +235,11 @@ fn resurface_due_state_guard_protects_a_read_row_without_cancel() {
         ResurfaceOutcome::NoOp,
         "the state guard leaves a no-longer-snoozed row alone (no resurrection)"
     );
-    assert_eq!(state_of(&inbox, "u1", "iss-1").unwrap(), "read", "the read state is preserved");
+    assert_eq!(
+        state_of(&inbox, "u1", "iss-1").unwrap(),
+        "read",
+        "the read state is preserved"
+    );
 }
 
 /// **`resurface_due` is recipient-scoped: it never re-surfaces another principal's item.** u2's fire
@@ -202,8 +254,15 @@ fn resurface_due_is_recipient_scoped() {
     snooze_and_arm(&inbox, &r, &p1, "iss-1", "2026-06-25T09:00:00Z", 30).unwrap();
 
     // u2 has no timer for u1's item (the key is per-recipient) → no-op, u1's row untouched.
-    assert_eq!(r.resurface_due(&inbox, &tenant(), "u2", "iss-1"), ResurfaceOutcome::NoOp);
-    assert_eq!(state_of(&inbox, "u1", "iss-1").unwrap(), "snoozed", "u1's snooze is untouched by u2");
+    assert_eq!(
+        r.resurface_due(&inbox, &tenant(), "u2", "iss-1"),
+        ResurfaceOutcome::NoOp
+    );
+    assert_eq!(
+        state_of(&inbox, "u1", "iss-1").unwrap(),
+        "snoozed",
+        "u1's snooze is untouched by u2"
+    );
 }
 
 // --- cancel: a manual un-snooze disarms the timer ---
@@ -220,7 +279,10 @@ fn cancel_disarms_the_resurface_timer() {
     assert!(r.has_timer(&tenant(), "u1", "iss-1"), "armed");
 
     r.cancel(&tenant(), "u1", "iss-1");
-    assert!(!r.has_timer(&tenant(), "u1", "iss-1"), "cancel disarmed the timer");
+    assert!(
+        !r.has_timer(&tenant(), "u1", "iss-1"),
+        "cancel disarmed the timer"
+    );
     // cancel is idempotent (cancelling again is a no-op).
     r.cancel(&tenant(), "u1", "iss-1");
     assert_eq!(
@@ -239,10 +301,24 @@ fn snooze_and_arm_not_for_me_arms_no_orphan_timer() {
     let inbox = seeded("u1");
     let wheel = InMemoryWheel::new();
     let r = SnoozeResurfacer::new(wheel);
-    let res = snooze_and_arm(&inbox, &r, &principal("u2"), "iss-1", "2026-06-25T09:00:00Z", 30);
+    let res = snooze_and_arm(
+        &inbox,
+        &r,
+        &principal("u2"),
+        "iss-1",
+        "2026-06-25T09:00:00Z",
+        30,
+    );
     assert!(res.is_err(), "u2 cannot snooze u1's item");
-    assert!(!r.has_timer(&tenant(), "u2", "iss-1"), "no orphan timer armed for the refused snooze");
-    assert_eq!(state_of(&inbox, "u1", "iss-1").unwrap(), "unread", "u1's row untouched");
+    assert!(
+        !r.has_timer(&tenant(), "u2", "iss-1"),
+        "no orphan timer armed for the refused snooze"
+    );
+    assert_eq!(
+        state_of(&inbox, "u1", "iss-1").unwrap(),
+        "unread",
+        "u1's row untouched"
+    );
 }
 
 // --- THE CHAINED DURABILITY TEST (EI-01 §4): kill before the until → exactly one re-surface ---
@@ -261,8 +337,15 @@ fn chained_snooze_kill_before_until_resurfaces_exactly_once() {
     // === snooze on worker A: record the until + arm the durable re-surface timer ===
     let worker_a = SnoozeResurfacer::new(wheel.clone());
     snooze_and_arm(&inbox, &worker_a, &p, "iss-1", "2026-06-25T09:00:00Z", 30).unwrap();
-    assert!(worker_a.has_timer(&tenant(), "u1", "iss-1"), "the durable re-surface timer is armed");
-    assert_eq!(state_of(&inbox, "u1", "iss-1").unwrap(), "snoozed", "parked");
+    assert!(
+        worker_a.has_timer(&tenant(), "u1", "iss-1"),
+        "the durable re-surface timer is armed"
+    );
+    assert_eq!(
+        state_of(&inbox, "u1", "iss-1").unwrap(),
+        "snoozed",
+        "parked"
+    );
 
     // === THE KILL: drop worker A BEFORE the until. The wheel + the inbox row survive. ===
     drop(worker_a);
@@ -270,7 +353,10 @@ fn chained_snooze_kill_before_until_resurfaces_exactly_once() {
     // === resume on worker B over the SAME durable wheel (re-hydrate from the persisted handle) ===
     let worker_b = SnoozeResurfacer::new(wheel.clone());
     // 0 MISSED: the durable timer survived the kill — the handle is still live on the shared wheel.
-    assert!(worker_b.has_timer(&tenant(), "u1", "iss-1"), "the timer SURVIVED the kill (0 missed)");
+    assert!(
+        worker_b.has_timer(&tenant(), "u1", "iss-1"),
+        "the timer SURVIVED the kill (0 missed)"
+    );
 
     // === the re-surface timer fires at the until → re-surface EXACTLY ONCE ===
     assert_eq!(
@@ -278,7 +364,11 @@ fn chained_snooze_kill_before_until_resurfaces_exactly_once() {
         ResurfaceOutcome::Resurfaced,
         "the resumed worker re-surfaces the item (NOT zero — the durable handle resumed)"
     );
-    assert_eq!(state_of(&inbox, "u1", "iss-1").unwrap(), "unread", "the item re-surfaced (snoozed → unread)");
+    assert_eq!(
+        state_of(&inbox, "u1", "iss-1").unwrap(),
+        "unread",
+        "the item re-surfaced (snoozed → unread)"
+    );
 
     // 0 DUPLICATE: a second restart over the already-fired timer re-surfaces NOTHING.
     let worker_c = SnoozeResurfacer::new(wheel.clone());
@@ -287,7 +377,11 @@ fn chained_snooze_kill_before_until_resurfaces_exactly_once() {
         ResurfaceOutcome::NoOp,
         "a replayed fire after the re-surface is a no-op (0 duplicate)"
     );
-    assert_eq!(state_of(&inbox, "u1", "iss-1").unwrap(), "unread", "still exactly one re-surface");
+    assert_eq!(
+        state_of(&inbox, "u1", "iss-1").unwrap(),
+        "unread",
+        "still exactly one re-surface"
+    );
 
     // GREEN: 0 missed re-surface, 0 duplicate re-surface across the kill. No threshold weakened.
     let _ = &wheel;

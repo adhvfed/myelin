@@ -226,7 +226,9 @@ impl<'a> CdnCloneClass<'a> {
 mod tests {
     use super::*;
     use crate::blob::FsBlobStore;
-    use crate::residency::{verify_region_pinning, RegionPinnedStore, ResidencyStoreClass, StoreSet};
+    use crate::residency::{
+        verify_region_pinning, RegionPinnedStore, ResidencyStoreClass, StoreSet,
+    };
 
     fn tenant() -> TenantId {
         TenantId::from_token("01J0ACME")
@@ -257,12 +259,21 @@ mod tests {
 
         // Serve by content-address: the bytes are re-hash-verified and exact.
         let served = cdn.bundle(&addr).expect("serve bundle by content-address");
-        assert_eq!(served, bundle_bytes, "the served bundle is the exact requested content");
+        assert_eq!(
+            served, bundle_bytes,
+            "the served bundle is the exact requested content"
+        );
 
         // A tampered bundle is REFUSED (the content-address is the validity check — no staleness).
-        assert!(store.corrupt_for_drill(&tenant(), &addr), "bundle present to corrupt");
         assert!(
-            matches!(cdn.bundle(&addr), Err(crate::blob::BlobError::IntegrityFail { .. })),
+            store.corrupt_for_drill(&tenant(), &addr),
+            "bundle present to corrupt"
+        );
+        assert!(
+            matches!(
+                cdn.bundle(&addr),
+                Err(crate::blob::BlobError::IntegrityFail { .. })
+            ),
             "a tampered bundle MUST be refused — the content-address is the cache-validity check"
         );
     }
@@ -277,7 +288,11 @@ mod tests {
 
         let eligible = cdn.eligible_edges(&candidates);
         // Exactly the two within-EU POPs — the extra-EU `iad-1` is excluded.
-        assert_eq!(eligible.len(), 2, "an EU tenant's eligible edge set excludes extra-EU POPs");
+        assert_eq!(
+            eligible.len(),
+            2,
+            "an EU tenant's eligible edge set excludes extra-EU POPs"
+        );
         assert!(
             eligible.iter().all(|pop| pop.within_eu),
             "every eligible POP for an EU tenant is within-EU — no PII-bearing bundle reaches an extra-EU edge"
@@ -296,7 +311,11 @@ mod tests {
         let candidates = eu_pops();
         // tenant_is_eu = false → all candidates are eligible (no within-EU filter applies).
         let eligible = CdnEdgeSet.eligible_for(false, &candidates);
-        assert_eq!(eligible.len(), candidates.len(), "a non-EU tenant has no within-EU restriction");
+        assert_eq!(
+            eligible.len(),
+            candidates.len(),
+            "a non-EU tenant has no within-EU restriction"
+        );
     }
 
     /// **The residency attestation INCLUDES the CDN edge set (extends `residency_verify`, 12.4).** The
@@ -340,8 +359,9 @@ mod tests {
         };
         let mut reports = StoreSet::for_cell(&region).reports_for(&tenant());
         reports.push(bad_cdn);
-        let err = verify_region_pinning(&tenant(), &region, &reports)
-            .expect_err("a CDN edge in the wrong region FAILs the attestation (0 cross-region egress)");
+        let err = verify_region_pinning(&tenant(), &region, &reports).expect_err(
+            "a CDN edge in the wrong region FAILs the attestation (0 cross-region egress)",
+        );
         assert!(
             err.to_string().contains("no-global-pool"),
             "the CDN cross-region breach is caught by the SAME aggregation: {err}"
@@ -374,10 +394,13 @@ mod tests {
     fn the_cdn_store_class_label_is_stable() {
         assert_eq!(ResidencyStoreClass::CdnEdgeSet.label(), "cdn_edge_set");
         // It is NOT in the M1 set (a named follow-on variant, not a redefinition of M1).
-        assert!(!RegionPinnedStore::pinned_to(ResidencyStoreClass::CdnEdgeSet, Region::new("fr-par"))
-            .region()
-            .as_str()
-            .is_empty());
+        assert!(!RegionPinnedStore::pinned_to(
+            ResidencyStoreClass::CdnEdgeSet,
+            Region::new("fr-par")
+        )
+        .region()
+        .as_str()
+        .is_empty());
         assert!(!ResidencyStoreClass::M1_SET.contains(&ResidencyStoreClass::CdnEdgeSet));
     }
 }

@@ -60,10 +60,17 @@ fn cdc_8_3_mock_runtime_is_a_pure_function_of_the_conversation() {
     // CONSUMER (the loop): after the search step was appended (one model turn) → step[1] (read).
     let mut conv = Conversation::default();
     conv.turns
-        .push(Turn::Model(StepOutcome::UseTools(vec![ToolCall(ToolName("search".into()))])));
-    conv.turns
-        .push(Turn::ToolResults(vec![ToolResult("tool:search:result".into())]));
-    assert_eq!(model_turns_taken(&conv), 1, "one model turn taken (the tool-result turn does not count)");
+        .push(Turn::Model(StepOutcome::UseTools(vec![ToolCall(
+            ToolName("search".into()),
+        )])));
+    conv.turns.push(Turn::ToolResults(vec![ToolResult(
+        "tool:search:result".into(),
+    )]));
+    assert_eq!(
+        model_turns_taken(&conv),
+        1,
+        "one model turn taken (the tool-result turn does not count)"
+    );
     assert_eq!(
         provider.step(&conv),
         StepOutcome::UseTools(vec![ToolCall(ToolName("read".into()))]),
@@ -72,9 +79,12 @@ fn cdc_8_3_mock_runtime_is_a_pure_function_of_the_conversation() {
 
     // CONSUMER (the loop): after the read step → step[2] (the terminal Submit).
     conv.turns
-        .push(Turn::Model(StepOutcome::UseTools(vec![ToolCall(ToolName("read".into()))])));
-    conv.turns
-        .push(Turn::ToolResults(vec![ToolResult("tool:read:result".into())]));
+        .push(Turn::Model(StepOutcome::UseTools(vec![ToolCall(
+            ToolName("read".into()),
+        )])));
+    conv.turns.push(Turn::ToolResults(vec![ToolResult(
+        "tool:read:result".into(),
+    )]));
     assert!(
         matches!(provider.step(&conv), StepOutcome::Submit(_)),
         "after two model turns the brain submits (it only ever PROPOSES — plan-then-apply survives)"
@@ -90,7 +100,10 @@ fn ag_d9_golden_replay_is_byte_identical_across_runs() {
     let s = script();
     let first = replay(&s);
     let second = replay(&s);
-    assert_eq!(first, second, "AG-D9: two replays of the same script are byte-identical");
+    assert_eq!(
+        first, second,
+        "AG-D9: two replays of the same script are byte-identical"
+    );
 
     // the golden StepOutcome stream IS the script, in order, terminated by the Submit.
     assert_eq!(
@@ -102,7 +115,10 @@ fn ag_d9_golden_replay_is_byte_identical_across_runs() {
         ],
         "the golden StepOutcome stream is the scripted queue, in order"
     );
-    assert!(first.terminated, "a well-formed script terminates the bounded loop");
+    assert!(
+        first.terminated,
+        "a well-formed script terminates the bounded loop"
+    );
     assert_eq!(first.submission, Some(Submission("the answer".into())));
 }
 
@@ -130,13 +146,34 @@ fn cdc_8_3_use_mock_flag_is_a_real_flag_on_the_same_seam() {
 fn cdc_8_3_build_conversation_reconstructs_from_platform_history() {
     let s = script();
     let mut history = TraceHistory::new();
-    history.push_model(StepOutcome::UseTools(vec![ToolCall(ToolName("search".into()))]));
+    history.push_model(StepOutcome::UseTools(vec![ToolCall(ToolName(
+        "search".into(),
+    ))]));
     history.push_tool_results(vec![ToolResult("tool:search:result".into())]);
 
     let conv = build_conversation(&s, &history);
-    assert_eq!(conv.system, SystemContext("you are agent-7; you are labelled as an agent".into()));
-    assert_eq!(conv.tools.len(), 2, "the scoped tool list is rebuilt from the script");
-    assert_eq!(conv.budget, BudgetView(100), "the budget view is rebuilt from the script");
-    assert_eq!(conv.turns.len(), 2, "the transcript is the model step + its routed tool result");
-    assert_eq!(build_conversation(&s, &history), conv, "the reconstruction is deterministic");
+    assert_eq!(
+        conv.system,
+        SystemContext("you are agent-7; you are labelled as an agent".into())
+    );
+    assert_eq!(
+        conv.tools.len(),
+        2,
+        "the scoped tool list is rebuilt from the script"
+    );
+    assert_eq!(
+        conv.budget,
+        BudgetView(100),
+        "the budget view is rebuilt from the script"
+    );
+    assert_eq!(
+        conv.turns.len(),
+        2,
+        "the transcript is the model step + its routed tool result"
+    );
+    assert_eq!(
+        build_conversation(&s, &history),
+        conv,
+        "the reconstruction is deterministic"
+    );
 }

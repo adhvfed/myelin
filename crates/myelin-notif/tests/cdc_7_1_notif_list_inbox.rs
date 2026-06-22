@@ -24,7 +24,9 @@ use myelin_identity::{
     Consistency, ConsistencyMode, Decision, Principal, PrincipalId, PrincipalKind, Zookie,
 };
 use myelin_notif::cli::{inbox_list, inbox_show, CliView};
-use myelin_notif::list_inbox::{list_inbox, AllowAllAuthorize, InboxFilter, Page, ReadAuthorizePort};
+use myelin_notif::list_inbox::{
+    list_inbox, AllowAllAuthorize, InboxFilter, Page, ReadAuthorizePort,
+};
 use myelin_notif::router::{InboxProjection, RoutedInboxItem};
 use myelin_notif::{Class, Reason};
 use myelin_tenancy::{Region, TenantId};
@@ -36,7 +38,10 @@ fn principal(id: &str) -> Principal {
     Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant())
 }
 fn strong() -> Consistency {
-    Consistency { at_least: Zookie("zk-7.1".into()), mode: ConsistencyMode::Strong }
+    Consistency {
+        at_least: Zookie("zk-7.1".into()),
+        mode: ConsistencyMode::Strong,
+    }
 }
 
 fn item(recipient: &str, id: &str, subject: &str, reason: Reason) -> RoutedInboxItem {
@@ -59,11 +64,36 @@ fn item(recipient: &str, id: &str, subject: &str, reason: Reason) -> RoutedInbox
 /// A mixed batch for `me` across the three subsystems — some rows in each scoped view, some not.
 fn seeded(me: &str) -> InboxProjection {
     let inbox = InboxProjection::new();
-    inbox.upsert_for_test(item(me, "iss-assigned", "myelin://acme/issue/issue/PROJ-1", Reason::Assigned));
-    inbox.upsert_for_test(item(me, "iss-state", "myelin://acme/issue/issue/PROJ-2", Reason::StateChanged));
-    inbox.upsert_for_test(item(me, "chat-ment", "myelin://acme/chat/thread/T1", Reason::Mentioned));
-    inbox.upsert_for_test(item(me, "git-review", "myelin://acme/git/pr/9", Reason::ReviewRequested));
-    inbox.upsert_for_test(item(me, "git-watched", "myelin://acme/git/pr/10", Reason::Watched));
+    inbox.upsert_for_test(item(
+        me,
+        "iss-assigned",
+        "myelin://acme/issue/issue/PROJ-1",
+        Reason::Assigned,
+    ));
+    inbox.upsert_for_test(item(
+        me,
+        "iss-state",
+        "myelin://acme/issue/issue/PROJ-2",
+        Reason::StateChanged,
+    ));
+    inbox.upsert_for_test(item(
+        me,
+        "chat-ment",
+        "myelin://acme/chat/thread/T1",
+        Reason::Mentioned,
+    ));
+    inbox.upsert_for_test(item(
+        me,
+        "git-review",
+        "myelin://acme/git/pr/9",
+        Reason::ReviewRequested,
+    ));
+    inbox.upsert_for_test(item(
+        me,
+        "git-watched",
+        "myelin://acme/git/pr/10",
+        Reason::Watched,
+    ));
     inbox
 }
 
@@ -80,11 +110,25 @@ fn list_inbox_scoped_views_are_strict_subsets_of_the_one_inbox() {
     let me = "u1";
     let inbox = seeded(me);
     let p = principal(me);
-    let big = Page { after: None, limit: 1000 };
+    let big = Page {
+        after: None,
+        limit: 1000,
+    };
 
-    let full = list_inbox(&inbox, &p, &InboxFilter::all(), &big, &AllowAllAuthorize, &strong());
+    let full = list_inbox(
+        &inbox,
+        &p,
+        &InboxFilter::all(),
+        &big,
+        &AllowAllAuthorize,
+        &strong(),
+    );
     let full_ids = id_set(&full.items);
-    assert_eq!(full_ids.len(), 5, "the unfiltered inbox is the ONE inbox (all 5 rows for u1)");
+    assert_eq!(
+        full_ids.len(),
+        5,
+        "the unfiltered inbox is the ONE inbox (all 5 rows for u1)"
+    );
 
     for view in [
         InboxFilter::issues_my_work(),
@@ -93,12 +137,21 @@ fn list_inbox_scoped_views_are_strict_subsets_of_the_one_inbox() {
     ] {
         let v = list_inbox(&inbox, &p, &view, &big, &AllowAllAuthorize, &strong());
         let view_ids = id_set(&v.items);
-        assert!(view_ids.is_subset(&full_ids), "C-9: the view {view:?} ⊆ the unfiltered inbox");
-        assert!(view_ids.len() < full_ids.len(), "a scoped view is STRICTLY smaller (a filter, not the store)");
+        assert!(
+            view_ids.is_subset(&full_ids),
+            "C-9: the view {view:?} ⊆ the unfiltered inbox"
+        );
+        assert!(
+            view_ids.len() < full_ids.len(),
+            "a scoped view is STRICTLY smaller (a filter, not the store)"
+        );
         // every view row carries the SAME read-state row identity as the unfiltered inbox (one
         // store → one read-state truth): the item_id in the view is the item_id in the full inbox.
         for vid in &view_ids {
-            assert!(full_ids.contains(vid), "the view row {vid} is the SAME row as the unfiltered inbox (no second store)");
+            assert!(
+                full_ids.contains(vid),
+                "the view row {vid} is the SAME row as the unfiltered inbox (no second store)"
+            );
         }
     }
 }
@@ -111,19 +164,59 @@ fn cli_views_read_the_contract_filtered_views() {
     let me = "u1";
     let inbox = seeded(me);
     let p = principal(me);
-    let big = Page { after: None, limit: 1000 };
+    let big = Page {
+        after: None,
+        limit: 1000,
+    };
 
-    let my_work = id_set(&inbox_list(&inbox, &p, CliView::MyWork, &big, &AllowAllAuthorize, &strong()).items);
+    let my_work = id_set(
+        &inbox_list(
+            &inbox,
+            &p,
+            CliView::MyWork,
+            &big,
+            &AllowAllAuthorize,
+            &strong(),
+        )
+        .items,
+    );
     assert_eq!(my_work, ["iss-assigned".to_string()].into_iter().collect());
 
-    let activity = id_set(&inbox_list(&inbox, &p, CliView::Activity, &big, &AllowAllAuthorize, &strong()).items);
+    let activity = id_set(
+        &inbox_list(
+            &inbox,
+            &p,
+            CliView::Activity,
+            &big,
+            &AllowAllAuthorize,
+            &strong(),
+        )
+        .items,
+    );
     assert_eq!(activity, ["chat-ment".to_string()].into_iter().collect());
 
-    let reviews = id_set(&inbox_list(&inbox, &p, CliView::ReviewRequests, &big, &AllowAllAuthorize, &strong()).items);
+    let reviews = id_set(
+        &inbox_list(
+            &inbox,
+            &p,
+            CliView::ReviewRequests,
+            &big,
+            &AllowAllAuthorize,
+            &strong(),
+        )
+        .items,
+    );
     assert_eq!(reviews, ["git-review".to_string()].into_iter().collect());
 
     // the default CLI view is the ONE inbox.
-    let all = inbox_list(&inbox, &p, CliView::All, &big, &AllowAllAuthorize, &strong());
+    let all = inbox_list(
+        &inbox,
+        &p,
+        CliView::All,
+        &big,
+        &AllowAllAuthorize,
+        &strong(),
+    );
     assert_eq!(all.items.len(), 5, "the default CLI view is the ONE inbox");
 }
 
@@ -147,15 +240,24 @@ fn list_inbox_obeys_step0_authorize_held_not_leaked() {
     let inbox = seeded(me);
     let p = principal(me);
     let deny = DenyOne("myelin://acme/issue/issue/PROJ-1".into());
-    let big = Page { after: None, limit: 1000 };
+    let big = Page {
+        after: None,
+        limit: 1000,
+    };
 
     let page = list_inbox(&inbox, &p, &InboxFilter::all(), &big, &deny, &strong());
     let got = id_set(&page.items);
-    assert!(!got.contains("iss-assigned"), "the denied item is HELD, not leaked (ADR-03)");
+    assert!(
+        !got.contains("iss-assigned"),
+        "the denied item is HELD, not leaked (ADR-03)"
+    );
     assert_eq!(got.len(), 4, "the other 4 visible items surface");
 
     // the CLI `show` of the denied item is None (no back-door read through show).
-    assert!(inbox_show(&inbox, &p, "iss-assigned", &deny, &strong()).is_none(), "show obeys the same authorize");
+    assert!(
+        inbox_show(&inbox, &p, "iss-assigned", &deny, &strong()).is_none(),
+        "show obeys the same authorize"
+    );
 }
 
 /// **The 7.1 wire is recipient-scoped: another principal's items are never returned.** The provider
@@ -163,9 +265,30 @@ fn list_inbox_obeys_step0_authorize_held_not_leaked() {
 #[test]
 fn list_inbox_is_recipient_scoped() {
     let inbox = InboxProjection::new();
-    inbox.upsert_for_test(item("u1", "mine", "myelin://acme/issue/issue/P1", Reason::Assigned));
-    inbox.upsert_for_test(item("u2", "theirs", "myelin://acme/issue/issue/P2", Reason::Assigned));
-    let page = list_inbox(&inbox, &principal("u1"), &InboxFilter::all(), &Page::default(), &AllowAllAuthorize, &strong());
+    inbox.upsert_for_test(item(
+        "u1",
+        "mine",
+        "myelin://acme/issue/issue/P1",
+        Reason::Assigned,
+    ));
+    inbox.upsert_for_test(item(
+        "u2",
+        "theirs",
+        "myelin://acme/issue/issue/P2",
+        Reason::Assigned,
+    ));
+    let page = list_inbox(
+        &inbox,
+        &principal("u1"),
+        &InboxFilter::all(),
+        &Page::default(),
+        &AllowAllAuthorize,
+        &strong(),
+    );
     let got = id_set(&page.items);
-    assert_eq!(got, ["mine".to_string()].into_iter().collect(), "only the caller's items (recipient scope)");
+    assert_eq!(
+        got,
+        ["mine".to_string()].into_iter().collect(),
+        "only the caller's items (recipient scope)"
+    );
 }

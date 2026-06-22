@@ -58,11 +58,18 @@ fn schema() -> FieldSchema {
 }
 
 fn viewer() -> Principal {
-    Principal::stub(PrincipalId("p:alice".into()), PrincipalKind::Human, TenantId("acme".into()))
+    Principal::stub(
+        PrincipalId("p:alice".into()),
+        PrincipalKind::Human,
+        TenantId("acme".into()),
+    )
 }
 
 fn consistency() -> Consistency {
-    Consistency { at_least: Zookie("z0".into()), mode: ConsistencyMode::BoundedStale }
+    Consistency {
+        at_least: Zookie("z0".into()),
+        mode: ConsistencyMode::BoundedStale,
+    }
 }
 
 fn ast(p: Predicate) -> QueryAst {
@@ -83,8 +90,10 @@ fn corpus() -> TantivyBackend {
             .with_field("status", FieldValue::Select("open".into()))
             .with_field(ORDER_KEY_FIELD, FieldValue::OrderKey(k.clone()))
     };
-    be.upsert(&doc("acme/issue/PUB-1", "deadlock in the scheduler")).unwrap();
-    be.upsert(&doc("acme/issue/SECRET-9", "deadlock secret incident")).unwrap();
+    be.upsert(&doc("acme/issue/PUB-1", "deadlock in the scheduler"))
+        .unwrap();
+    be.upsert(&doc("acme/issue/SECRET-9", "deadlock secret incident"))
+        .unwrap();
     be
 }
 
@@ -113,7 +122,9 @@ impl ListObjectsPort for IdsAuthz {
         _f: &RelationalLeaf,
         _r: &RevisionWatermark,
     ) -> AuthzResult<ReverseIndexAnswer> {
-        Err(myelin_identity::AuthzError::Unavailable("Ids path has no reverse index".into()))
+        Err(myelin_identity::AuthzError::Unavailable(
+            "Ids path has no reverse index".into(),
+        ))
     }
 }
 
@@ -134,7 +145,9 @@ impl ListObjectsPort for FilterAuthz {
     ) -> AuthzResult<ListObjectsResult> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         Ok(ListObjectsResult::Filter {
-            set_expr: SetExpr::TupleSet { index: AuthzIndexRef("authz_visible".into()) },
+            set_expr: SetExpr::TupleSet {
+                index: AuthzIndexRef("authz_visible".into()),
+            },
             zookie: Zookie("z@10".into()),
         })
     }
@@ -159,11 +172,28 @@ fn drive_two_filter_modes() -> QueryStats {
     let eng = ScopedEngine::new(&be, "acme", "eu-west", schema());
     let stats = QueryStats::new();
     let ty = ObjectType("issue".into());
-    let q = ast(Predicate::Cmp { op: CmpOp::Eq, lhs: var(FT_BODY_FIELD), rhs: lit("deadlock") });
+    let q = ast(Predicate::Cmp {
+        op: CmpOp::Eq,
+        lhs: var(FT_BODY_FIELD),
+        rhs: lit("deadlock"),
+    });
 
     // (1) Ids mode — a materialised allow-set.
-    let ids = IdsAuthz { visible: vec!["acme/issue/PUB-1".into()], calls: AtomicU64::new(0) };
-    query(&eng, &ids, &q, &viewer(), &ty, &consistency(), Page::FIRST, &stats).expect("Ids query");
+    let ids = IdsAuthz {
+        visible: vec!["acme/issue/PUB-1".into()],
+        calls: AtomicU64::new(0),
+    };
+    query(
+        &eng,
+        &ids,
+        &q,
+        &viewer(),
+        &ty,
+        &consistency(),
+        Page::FIRST,
+        &stats,
+    )
+    .expect("Ids query");
 
     // (2) Filter/TupleSet mode — the pushed-down relational reverse-index JOIN.
     let filter = FilterAuthz {
@@ -171,8 +201,17 @@ fn drive_two_filter_modes() -> QueryStats {
         calls: AtomicU64::new(0),
         resolve_calls: AtomicU64::new(0),
     };
-    query(&eng, &filter, &q, &viewer(), &ty, &consistency(), Page::FIRST, &stats)
-        .expect("Filter query");
+    query(
+        &eng,
+        &filter,
+        &q,
+        &viewer(),
+        &ty,
+        &consistency(),
+        Page::FIRST,
+        &stats,
+    )
+    .expect("Filter query");
 
     stats
 }
@@ -199,7 +238,11 @@ fn full_snapshot() -> SearchTelemetry {
 
     // The labelled live gauges the metrics-health port emits.
     t.record_red(
-        myelin_search::RedLabels { kind: "human", tenant: "acme", surface: "ft" },
+        myelin_search::RedLabels {
+            kind: "human",
+            tenant: "acme",
+            surface: "ft",
+        },
         2,
         0,
         5,
@@ -233,15 +276,25 @@ fn every_4_11_signal_is_emitted_and_readable_by_the_assertion_library() {
     src.set_scalar(SignalName::ConsumerLag, t.scalar(sig::INDEX_LAG).unwrap());
     // list_objects rate — the no-N+1 invariant: exactly ONE call per query (we ran 2 queries → 2).
     let lo_rate = t.scalar(sig::LIST_OBJECTS_RATE).unwrap();
-    assert_eq!(lo_rate, 2, "exactly one list_objects per query (no N+1): 2 queries → 2 calls");
+    assert_eq!(
+        lo_rate, 2,
+        "exactly one list_objects per query (no N+1): 2 queries → 2 calls"
+    );
     src.set_scalar(SignalName::RequestRate, lo_rate);
 
     // the FILTER-MODE SPLIT (Ids vs Filter/TupleSet) — the load-bearing 1.8 split.
     let ids_mode = t.scalar(sig::FILTER_MODE_IDS).unwrap();
     let filter_mode = t.scalar(sig::FILTER_MODE_FILTER).unwrap();
     assert_eq!(ids_mode, 1, "one query used the materialised Ids mode");
-    assert_eq!(filter_mode, 1, "one query used the pushed-down Filter/TupleSet mode");
-    src.set_labelled(SignalName::RequestRate, vec![Label::new("filter_mode", "ids")], ids_mode);
+    assert_eq!(
+        filter_mode, 1,
+        "one query used the pushed-down Filter/TupleSet mode"
+    );
+    src.set_labelled(
+        SignalName::RequestRate,
+        vec![Label::new("filter_mode", "ids")],
+        ids_mode,
+    );
     src.set_labelled(
         SignalName::RequestRate,
         vec![Label::new("filter_mode", "filter")],
@@ -251,31 +304,56 @@ fn every_4_11_signal_is_emitted_and_readable_by_the_assertion_library() {
     // cache hit ratio — present + readable (here the absent sentinel: no cacheable read in this test;
     // the signal is still EMITTED, which is what the gate requires — a fabricated 100 is forbidden).
     let ratio = t.scalar(sig::CACHE_HIT_RATIO_PCT).unwrap();
-    assert_eq!(ratio, CACHE_RATIO_ABSENT, "no cacheable read → the absent sentinel, never a fake 100");
+    assert_eq!(
+        ratio, CACHE_RATIO_ABSENT,
+        "no cacheable read → the absent sentinel, never a fake 100"
+    );
 
     // the ZERO-ESCAPE counters (the SRCH-D1/D2/D3 green-artifact source).
     let bypass = t.scalar(sig::ZERO_ESCAPE_ZOOKIE_BYPASS).unwrap();
     let excluded = t.scalar(sig::ZERO_ESCAPE_STALE_EXCLUDED).unwrap();
     assert_eq!(bypass, 1, "one strong-read fail-static bypass recorded");
-    assert_eq!(excluded, 1, "one stale candidate EXCLUDED (the new-enemy kept out)");
+    assert_eq!(
+        excluded, 1,
+        "one stale candidate EXCLUDED (the new-enemy kept out)"
+    );
     src.set_scalar(SignalName::CrossTenantCount, 0); // the cardinal zero-escape zero (SRCH-D3).
 
     // reindex parity hash + erase receipts — the SHAPE is emitted now (SRCH-P15/P16 producers).
-    assert_eq!(t.scalar(sig::REINDEX_PARITY_HASH), Some(0), "parity hash emitted (0 = no reindex yet)");
-    assert_eq!(t.scalar(sig::ERASE_RECEIPTS), Some(0), "erase-receipt count emitted (0 until SRCH-P15)");
+    assert_eq!(
+        t.scalar(sig::REINDEX_PARITY_HASH),
+        Some(0),
+        "parity hash emitted (0 = no reindex yet)"
+    );
+    assert_eq!(
+        t.scalar(sig::ERASE_RECEIPTS),
+        Some(0),
+        "erase-receipt count emitted (0 until SRCH-P15)"
+    );
 
     // --- the assertions (each via the harness telemetry-assertion library) --
     // index lag returns to 0 in steady state.
-    src.assert_signal(SignalName::ConsumerLag, P::Eq(0)).expect_green();
+    src.assert_signal(SignalName::ConsumerLag, P::Eq(0))
+        .expect_green();
     // the list_objects rate is observable (> 0 — the queries ran).
-    src.assert_signal(SignalName::RequestRate, P::Gte(1)).expect_green();
+    src.assert_signal(SignalName::RequestRate, P::Gte(1))
+        .expect_green();
     // the filter-mode split — BOTH legs readable, each == 1.
-    src.assert_labelled(SignalName::RequestRate, vec![Label::new("filter_mode", "ids")], P::Eq(1))
-        .expect_green();
-    src.assert_labelled(SignalName::RequestRate, vec![Label::new("filter_mode", "filter")], P::Eq(1))
-        .expect_green();
+    src.assert_labelled(
+        SignalName::RequestRate,
+        vec![Label::new("filter_mode", "ids")],
+        P::Eq(1),
+    )
+    .expect_green();
+    src.assert_labelled(
+        SignalName::RequestRate,
+        vec![Label::new("filter_mode", "filter")],
+        P::Eq(1),
+    )
+    .expect_green();
     // the cardinal zero-escape zero (SRCH-D1/D3 green artifact).
-    src.assert_signal(SignalName::CrossTenantCount, P::Eq(0)).expect_green();
+    src.assert_signal(SignalName::CrossTenantCount, P::Eq(0))
+        .expect_green();
 
     // --- labelled live gauges ----------------------------------------------
     // RED per {kind, tenant, surface}: the human lane HOLDS (errors == 0).
@@ -297,11 +375,15 @@ fn every_4_11_signal_is_emitted_and_readable_by_the_assertion_library() {
         )
         .expect("RED errors emitted per {kind,tenant,surface}");
     src.set_labelled(SignalName::RequestErrors, red_labels(), err);
-    src.assert_labelled(SignalName::RequestErrors, red_labels(), P::Eq(0)).expect_green();
+    src.assert_labelled(SignalName::RequestErrors, red_labels(), P::Eq(0))
+        .expect_green();
 
     // consumer lag (num_pending) — drained to 0.
     let consumer_lag = t
-        .labelled_value(sig::CONSUMER_LAG, &[("consumer".into(), "search-indexer".into())])
+        .labelled_value(
+            sig::CONSUMER_LAG,
+            &[("consumer".into(), "search-indexer".into())],
+        )
         .expect("consumer lag emitted");
     src.set_labelled(
         SignalName::ConsumerLag,
@@ -319,17 +401,27 @@ fn every_4_11_signal_is_emitted_and_readable_by_the_assertion_library() {
     let shed = t
         .labelled_value(sig::SHED_COUNT, &[("tenant".into(), "acme".into())])
         .expect("shed count emitted");
-    src.set_labelled(SignalName::ShedCount, vec![Label::new("tenant", "acme")], shed);
-    src.assert_labelled(SignalName::ShedCount, vec![Label::new("tenant", "acme")], P::Eq(0))
-        .expect_green();
+    src.set_labelled(
+        SignalName::ShedCount,
+        vec![Label::new("tenant", "acme")],
+        shed,
+    );
+    src.assert_labelled(
+        SignalName::ShedCount,
+        vec![Label::new("tenant", "acme")],
+        P::Eq(0),
+    )
+    .expect_green();
 
     // --- the EXHAUSTIVENESS gate: EVERY §4.11 name is present in the snapshot --
     // A missing §4.11 signal fails the gate (observability is part of the pass). Read each name —
     // a scalar reads via `scalar`, a labelled signal via `labelled_value` under its key.
     for name in sig::ALL {
-        let present = t.scalar(name).is_some()
-            || t.labelled.iter().any(|s| s.name == name);
-        assert!(present, "§4.11 signal `{name}` is MISSING from the metrics-health snapshot");
+        let present = t.scalar(name).is_some() || t.labelled.iter().any(|s| s.name == name);
+        assert!(
+            present,
+            "§4.11 signal `{name}` is MISSING from the metrics-health snapshot"
+        );
     }
 }
 
@@ -344,15 +436,26 @@ fn vector_compaction_lag_signal_is_emitted_and_clears_on_compact() {
     src.set_labelled(
         SignalName::PoolSaturation,
         vec![Label::new("tenant", "acme")],
-        t.labelled_value(sig::VECTOR_COMPACTION_LAG, &[("tenant".into(), "acme".into())]).unwrap(),
+        t.labelled_value(
+            sig::VECTOR_COMPACTION_LAG,
+            &[("tenant".into(), "acme".into())],
+        )
+        .unwrap(),
     );
     // present + non-zero before compaction.
-    src.assert_labelled(SignalName::PoolSaturation, vec![Label::new("tenant", "acme")], P::Gte(1))
-        .expect_green();
+    src.assert_labelled(
+        SignalName::PoolSaturation,
+        vec![Label::new("tenant", "acme")],
+        P::Gte(1),
+    )
+    .expect_green();
     // a compact clears it → lag 0.
     t.set_vector_compaction_lag("acme", 0);
     assert_eq!(
-        t.labelled_value(sig::VECTOR_COMPACTION_LAG, &[("tenant".into(), "acme".into())]),
+        t.labelled_value(
+            sig::VECTOR_COMPACTION_LAG,
+            &[("tenant".into(), "acme".into())]
+        ),
         Some(0),
         "compaction-lag returns to 0 after a compact (no orphan embedding survives)"
     );

@@ -71,19 +71,29 @@ fn p147_gate_firehose_segment_seals_content_addressed_under_tenant_dek() {
         segment.content_hash, expected_address,
         "GATE leg 1: the segment is content-addressed (its hash IS the BLAKE3 of its bytes)"
     );
-    assert!(segment.content_hash.to_multihash_string().starts_with("blake3:"));
+    assert!(segment
+        .content_hash
+        .to_multihash_string()
+        .starts_with("blake3:"));
     assert!(
         arch.telemetry().segment_content_addressed(),
         "GATE leg 1: segment_content_addressed == true"
     );
-    assert_eq!((segment.first_seq, segment.last_seq), (3, 6), "the segment range aligns with the cursor");
+    assert_eq!(
+        (segment.first_seq, segment.last_seq),
+        (3, 6),
+        "the segment range aligns with the cursor"
+    );
 
     // ── leg 2: encrypted under the per-tenant DEK (ciphertext-at-rest). ──
     let stored_len = arch
         .read_segment(&segment.content_hash)
         .map(|f| f.len())
         .expect("the segment decrypts back to its frames");
-    assert_eq!(stored_len, 4, "the sealed segment round-trips back to its 4 frames (cold == live)");
+    assert_eq!(
+        stored_len, 4,
+        "the sealed segment round-trips back to its 4 frames (cold == live)"
+    );
     assert_eq!(
         arch.read_segment(&segment.content_hash).expect("read"),
         live_frames,
@@ -92,8 +102,15 @@ fn p147_gate_firehose_segment_seals_content_addressed_under_tenant_dek() {
 
     // ── leg 3: the telemetry the GATE asserts — 0 unencrypted segments. ──
     let unencrypted = arch.telemetry().unencrypted_segment_count();
-    assert_eq!(unencrypted, 0, "GATE leg 3: unencrypted_segment_count == 0 (no plaintext-write path)");
-    assert_eq!(arch.telemetry().sealed_segment_count(), 1, "the archive sealed exactly one segment");
+    assert_eq!(
+        unencrypted, 0,
+        "GATE leg 3: unencrypted_segment_count == 0 (no plaintext-write path)"
+    );
+    assert_eq!(
+        arch.telemetry().sealed_segment_count(),
+        1,
+        "the archive sealed exactly one segment"
+    );
 
     println!(
         "[P-147 DRILL GREEN 2026-06-20] T3 firehose-archive seal: rode the 3.5 transport \
@@ -121,17 +138,26 @@ fn p147_gate_destroyed_tenant_dek_crypto_shreds_the_segment_live_and_in_backups(
         .seal_from_firehose(&firehose, "oplog", &scope, 1, 1)
         .expect("seal")
         .expect("held");
-    assert!(arch.read_segment(&segment.content_hash).is_ok(), "the segment reads before the shred");
+    assert!(
+        arch.read_segment(&segment.content_hash).is_ok(),
+        "the segment reads before the shred"
+    );
 
     // Crypto-shred the per-tenant DEK the segment is sealed under.
     let destroyed = eng.destroy_dek(&DekId::new(tenant(), KeyClass::Tenant));
-    assert!(destroyed, "the tenant DEK was destroyed (the crypto-shred lever)");
+    assert!(
+        destroyed,
+        "the tenant DEK was destroyed (the crypto-shred lever)"
+    );
 
     // LIVE: the segment is now unrecoverable — a LOUD failure, never a silent serve.
     let live = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         arch.read_segment(&segment.content_hash)
     }));
-    assert!(live.is_err(), "live: a crypto-shredded segment is unrecoverable (LOUD), never served");
+    assert!(
+        live.is_err(),
+        "live: a crypto-shredded segment is unrecoverable (LOUD), never served"
+    );
 
     // IN BACKUPS: the destroyed DEK is EXCLUDED from the KMS backup snapshot (§7.5) — a restore
     // resurrects no shredded segment (the STOR-D1 erasure-held invariant this archive inherits).

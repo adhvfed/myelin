@@ -149,7 +149,9 @@ pub struct RefsReindexSource {
 impl RefsReindexSource {
     /// A fresh, empty Refs reindex source.
     pub fn new() -> RefsReindexSource {
-        RefsReindexSource { truth: BTreeMap::new() }
+        RefsReindexSource {
+            truth: BTreeMap::new(),
+        }
     }
 
     /// **Record/update one edge in the owner's source of truth (the live producer write).** Keyed by
@@ -278,7 +280,9 @@ impl From<BusReindexError> for ReindexError {
 impl From<MirrorError> for ReindexError {
     fn from(e: MirrorError) -> ReindexError {
         match e {
-            MirrorError::UnknownRel(r) => ReindexError::Mirror(format!("unknown lifecycle rel `{r}`")),
+            MirrorError::UnknownRel(r) => {
+                ReindexError::Mirror(format!("unknown lifecycle rel `{r}`"))
+            }
         }
     }
 }
@@ -304,7 +308,10 @@ impl RefsReindexer {
 
     /// Build a reindexer over `builder` (the ONE ingest path it re-drives).
     pub fn new(builder: RefsEdgeBuilder) -> RefsReindexer {
-        RefsReindexer { builder, reindex_parity: Arc::new(AtomicU64::new(1)) }
+        RefsReindexer {
+            builder,
+            reindex_parity: Arc::new(AtomicU64::new(1)),
+        }
     }
 
     /// The builder this reindexer re-drives (read access for the parity comparison / tests).
@@ -368,9 +375,9 @@ impl RefsReindexer {
         let mut ingested = 0usize;
         for draft in &drafts {
             let id = snapshot_event_id(&draft.aggregate, draft.version);
-            let row = outbox
-                .row(&id)
-                .ok_or_else(|| ReindexError::Bus(format!("snapshot row {} absent after emit", id.0)))?;
+            let row = outbox.row(&id).ok_or_else(|| {
+                ReindexError::Bus(format!("snapshot row {} absent after emit", id.0))
+            })?;
             // The SAME `handle` the live consumer runs — `handle` routes the `.snapshot` type to
             // `apply_created` (cold == live). A poison snapshot surfaces LOUDLY (fail-closed).
             match self.builder.handle(&row.envelope) {
@@ -430,16 +437,12 @@ impl RefsReindexer {
     /// `reindex_parity` signal to `1` on match, `0` on drift (a failed recovery is LOUD + observable,
     /// never a silent partial rebuild). The comparison is the §4.7 "the rebuilt index byte-matches the
     /// live index" equality.
-    pub fn verify_parity(
-        &self,
-        live: &EdgeProjection,
-        tenant: &TenantId,
-        region: &Region,
-    ) -> bool {
+    pub fn verify_parity(&self, live: &EdgeProjection, tenant: &TenantId, region: &Region) -> bool {
         let rebuilt = self.projection().parity_hash(tenant, region);
         let reference = live.parity_hash(tenant, region);
         let matched = rebuilt == reference;
-        self.reindex_parity.store(u64::from(matched), Ordering::SeqCst);
+        self.reindex_parity
+            .store(u64::from(matched), Ordering::SeqCst);
         matched
     }
 }

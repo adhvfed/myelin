@@ -153,12 +153,20 @@ impl KnowledgeReindexSource {
             let aggregate = format!("{page_aggregate}#block-{block_id}");
             subtree.insert(
                 (*block_id).to_string(),
-                BlockTruth { aggregate, version: *version, payload: stamp_version(payload, *version) },
+                BlockTruth {
+                    aggregate,
+                    version: *version,
+                    payload: stamp_version(payload, *version),
+                },
             );
         }
         self.pages.insert(
             page_id.to_string(),
-            PageTruth { page_aggregate, page_version, blocks: subtree },
+            PageTruth {
+                page_aggregate,
+                page_version,
+                blocks: subtree,
+            },
         );
     }
 
@@ -168,7 +176,11 @@ impl KnowledgeReindexSource {
         let aggregate = format!("myelin://acme/knowledge/row/{row_id}");
         self.rows.insert(
             row_id.to_string(),
-            RowTruth { aggregate, version, payload: stamp_version(&props, version) },
+            RowTruth {
+                aggregate,
+                version,
+                payload: stamp_version(&props, version),
+            },
         );
     }
 
@@ -215,14 +227,17 @@ impl KnowledgeReindexSource {
     /// reindex (X-7).
     pub fn erase_row(&mut self, row_id: &str) -> bool {
         let row_urn = format!("myelin://acme/knowledge/row/{row_id}");
-        self.edges.retain(|_, e| e.source != row_urn && e.target != row_urn);
+        self.edges
+            .retain(|_, e| e.source != row_urn && e.target != row_urn);
         self.rows.remove(row_id).is_some()
     }
 
     /// Remove a TE-7 typed edge (an unrelate / re-parent removes the old edge) — a subsequent replay
     /// does NOT re-emit it (the removed edge stays removed; the typed table is truth, §3.1).
     pub fn remove_edge(&mut self, source: &str, target: &str) -> bool {
-        self.edges.remove(&format!("edge:{source}->{target}")).is_some()
+        self.edges
+            .remove(&format!("edge:{source}->{target}"))
+            .is_some()
     }
 
     /// Parse a `page:<id>` (or `page:all`) selector into the page id target. The whole-platform
@@ -391,13 +406,33 @@ mod tests {
             "home",
             5,
             &[
-                ("b1", 2, serde_json::json!({ "kind": "heading", "text_ref": "r1" })),
-                ("b2", 7, serde_json::json!({ "kind": "paragraph", "text_ref": "r2" })),
-                ("b3", 1, serde_json::json!({ "kind": "code", "text_ref": "r3" })),
+                (
+                    "b1",
+                    2,
+                    serde_json::json!({ "kind": "heading", "text_ref": "r1" }),
+                ),
+                (
+                    "b2",
+                    7,
+                    serde_json::json!({ "kind": "paragraph", "text_ref": "r2" }),
+                ),
+                (
+                    "b3",
+                    1,
+                    serde_json::json!({ "kind": "code", "text_ref": "r3" }),
+                ),
             ],
         );
-        s.upsert_row("row-1", 3, serde_json::json!({ "title": "Task A", "status": "open" }));
-        s.upsert_row("row-2", 1, serde_json::json!({ "title": "Task B", "status": "done" }));
+        s.upsert_row(
+            "row-1",
+            3,
+            serde_json::json!({ "title": "Task A", "status": "open" }),
+        );
+        s.upsert_row(
+            "row-2",
+            1,
+            serde_json::json!({ "title": "Task B", "status": "done" }),
+        );
         // page_parent (the TE-7 `parent` typed edge) + a db_relation (`relates`).
         s.upsert_edge(
             "myelin://acme/knowledge/page/home",
@@ -453,9 +488,16 @@ mod tests {
             KNOWLEDGE_ROW_SNAPSHOT,
             REFS_EDGE_SNAPSHOT,
         ] {
-            assert!(validate_event_type(t).is_ok(), "`{t}` must be grammatical: {:?}", validate_event_type(t));
+            assert!(
+                validate_event_type(t).is_ok(),
+                "`{t}` must be grammatical: {:?}",
+                validate_event_type(t)
+            );
         }
-        assert_eq!(REFS_EDGE_SNAPSHOT, "refs.edge.snapshot", "the frozen Refs snapshot token");
+        assert_eq!(
+            REFS_EDGE_SNAPSHOT, "refs.edge.snapshot",
+            "the frozen Refs snapshot token"
+        );
     }
 
     /// **`replay(page:home)` is block-granular: page snapshot + one block snapshot per block.**
@@ -463,10 +505,19 @@ mod tests {
     fn replay_page_scope_is_block_granular() {
         let s = source();
         let drafts = s.replay(&SnapshotScope::new("knowledge", "page:home"), None);
-        let pages = drafts.iter().filter(|d| d.type_.0 == KNOWLEDGE_PAGE_SNAPSHOT).count();
-        let blocks = drafts.iter().filter(|d| d.type_.0 == KNOWLEDGE_BLOCK_SNAPSHOT).count();
+        let pages = drafts
+            .iter()
+            .filter(|d| d.type_.0 == KNOWLEDGE_PAGE_SNAPSHOT)
+            .count();
+        let blocks = drafts
+            .iter()
+            .filter(|d| d.type_.0 == KNOWLEDGE_BLOCK_SNAPSHOT)
+            .count();
         assert_eq!(pages, 1, "one page snapshot");
-        assert_eq!(blocks, 3, "one snapshot per block (block granularity, contract 2.6)");
+        assert_eq!(
+            blocks, 3,
+            "one snapshot per block (block granularity, contract 2.6)"
+        );
         assert!(drafts.iter().all(|d| d.aggregate.0.contains("page/home")));
     }
 
@@ -503,7 +554,8 @@ mod tests {
         assert!(rels.contains(&"relates"), "the db_relation typed edge");
         assert!(drafts
             .iter()
-            .all(|d| d.payload.get("rel_class").and_then(|v| v.as_str()) == Some(REL_CLASS_LIFECYCLE)));
+            .all(|d| d.payload.get("rel_class").and_then(|v| v.as_str())
+                == Some(REL_CLASS_LIFECYCLE)));
     }
 
     /// **A REMOVED typed edge is NOT re-emitted (the typed table wins — a stale projected edge with
@@ -517,7 +569,9 @@ mod tests {
         ));
         let drafts = s.drift_correct_edges(None);
         assert_eq!(drafts.len(), 1, "only the surviving typed edge re-emits");
-        assert!(drafts.iter().all(|d| d.payload.get("rel").and_then(|v| v.as_str()) == Some("parent")));
+        assert!(drafts
+            .iter()
+            .all(|d| d.payload.get("rel").and_then(|v| v.as_str()) == Some("parent")));
     }
 
     /// **`since` is the incremental cursor across ALL legs (block/row/edge granular).**
@@ -537,7 +591,11 @@ mod tests {
             .filter(|d| d.type_.0 == KNOWLEDGE_ROW_SNAPSHOT)
             .map(|d| d.aggregate.0.as_str())
             .collect();
-        assert_eq!(row_aggs, vec!["myelin://acme/knowledge/row/row-1"], "only row past the cursor");
+        assert_eq!(
+            row_aggs,
+            vec!["myelin://acme/knowledge/row/row-1"],
+            "only row past the cursor"
+        );
     }
 
     /// An ERASED page / row is SKIPPED — its derived state stays erased across a reindex (X-7).
@@ -547,17 +605,34 @@ mod tests {
         assert!(s.erase_page("home"));
         assert!(s.erase_row("row-2"));
         let drafts = s.replay(&SnapshotScope::new("knowledge", "all"), None);
-        assert!(drafts.iter().all(|d| !d.aggregate.0.contains("page/home")), "erased page skipped");
-        assert!(drafts.iter().all(|d| !d.aggregate.0.contains("row/row-2")), "erased row skipped");
-        assert!(drafts.iter().any(|d| d.aggregate.0.contains("row/row-1")), "surviving row replays");
+        assert!(
+            drafts.iter().all(|d| !d.aggregate.0.contains("page/home")),
+            "erased page skipped"
+        );
+        assert!(
+            drafts.iter().all(|d| !d.aggregate.0.contains("row/row-2")),
+            "erased row skipped"
+        );
+        assert!(
+            drafts.iter().any(|d| d.aggregate.0.contains("row/row-1")),
+            "surviving row replays"
+        );
     }
 
     /// **The deterministic snapshot `event_id` from `(aggregate, version)` (contract 2.6).**
     #[test]
     fn snapshot_event_id_is_deterministic() {
         let a = AggregateKey("myelin://acme/knowledge/row/row-1".into());
-        assert_eq!(snapshot_event_id(&a, 3), snapshot_event_id(&a, 3), "same inputs → same id");
-        assert_ne!(snapshot_event_id(&a, 3), snapshot_event_id(&a, 4), "version bumps the id");
+        assert_eq!(
+            snapshot_event_id(&a, 3),
+            snapshot_event_id(&a, 3),
+            "same inputs → same id"
+        );
+        assert_ne!(
+            snapshot_event_id(&a, 3),
+            snapshot_event_id(&a, 4),
+            "version bumps the id"
+        );
     }
 
     /// KN-D6 cold == live and idempotent re-run (the headline drill, block/row/edge granular). Build
@@ -584,7 +659,9 @@ mod tests {
         let mut outbox = OutboxStore::new();
         reindex(&scope, None, sources, &mut outbox, ctx_base()).expect("full-surface reindex");
         for draft in s.replay(&scope, None) {
-            let row = outbox.row(&draft.event_id()).expect("snapshot row present (live path only)");
+            let row = outbox
+                .row(&draft.event_id())
+                .expect("snapshot row present (live path only)");
             cold.ingest(&row.envelope);
         }
 
@@ -597,8 +674,14 @@ mod tests {
 
         // Idempotent re-run: every snapshot's deterministic id is already in the outbox → 0 new.
         let r = reindex(&scope, None, sources, &mut outbox, ctx_base()).expect("re-reindex");
-        assert_eq!(r.snapshots_emitted, 0, "a re-run emits 0 NEW (idempotent — deterministic ids)");
-        assert!(r.snapshots_skipped_duplicate > 0, "the duplicates are reported, not re-emitted");
+        assert_eq!(
+            r.snapshots_emitted, 0,
+            "a re-run emits 0 NEW (idempotent — deterministic ids)"
+        );
+        assert!(
+            r.snapshots_skipped_duplicate > 0,
+            "the duplicates are reported, not re-emitted"
+        );
     }
 
     /// **The drift-correction re-emit goes through the LIVE outbox→consumer path + is idempotent.**
@@ -611,17 +694,27 @@ mod tests {
 
         // A wiped/diverged Refs projection rebuilt ONLY from the typed-edge re-emit.
         let mut refs_projection = DerivedStore::new();
-        let r1 = reindex(&edge_scope, None, sources, &mut outbox, ctx_base()).expect("drift reindex");
+        let r1 =
+            reindex(&edge_scope, None, sources, &mut outbox, ctx_base()).expect("drift reindex");
         assert_eq!(r1.snapshots_emitted, 2, "both typed edges re-emitted");
         for draft in s.drift_correct_edges(None) {
-            let row = outbox.row(&draft.event_id()).expect("edge snapshot present");
+            let row = outbox
+                .row(&draft.event_id())
+                .expect("edge snapshot present");
             assert!(row.envelope.type_.0 == REFS_EDGE_SNAPSHOT);
             refs_projection.ingest(&row.envelope);
         }
-        assert_eq!(refs_projection.len(), 2, "Refs reconverged to the two typed edges");
+        assert_eq!(
+            refs_projection.len(),
+            2,
+            "Refs reconverged to the two typed edges"
+        );
 
         // Re-run → idempotent (0 new).
         let r2 = reindex(&edge_scope, None, sources, &mut outbox, ctx_base()).expect("re-run");
-        assert_eq!(r2.snapshots_emitted, 0, "drift-correction re-run is idempotent");
+        assert_eq!(
+            r2.snapshots_emitted, 0,
+            "drift-correction re-run is idempotent"
+        );
     }
 }

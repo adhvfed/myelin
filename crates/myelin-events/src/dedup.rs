@@ -173,10 +173,23 @@ mod tests {
         let c = consumer("indexer");
         let id = EventId("01J-1".into());
 
-        assert!(ledger.mark_handled(&c, &id), "first delivery is FRESH → the handler runs");
-        assert!(!ledger.mark_handled(&c, &id), "redelivery is a DUPLICATE → the handler is skipped");
-        assert!(!ledger.mark_handled(&c, &id), "and again — still a duplicate");
-        assert_eq!(ledger.len(), 1, "exactly ONE (consumer, event_id) pair recorded");
+        assert!(
+            ledger.mark_handled(&c, &id),
+            "first delivery is FRESH → the handler runs"
+        );
+        assert!(
+            !ledger.mark_handled(&c, &id),
+            "redelivery is a DUPLICATE → the handler is skipped"
+        );
+        assert!(
+            !ledger.mark_handled(&c, &id),
+            "and again — still a duplicate"
+        );
+        assert_eq!(
+            ledger.len(),
+            1,
+            "exactly ONE (consumer, event_id) pair recorded"
+        );
         assert!(ledger.is_handled(&c, &id), "the pair is durably handled");
     }
 
@@ -192,14 +205,26 @@ mod tests {
         let id = EventId("01J-1".into());
 
         assert!(ledger.mark_handled(&a, &id), "fresh for consumer A");
-        assert!(ledger.mark_handled(&b, &id), "ALSO fresh for consumer B (different PK)");
+        assert!(
+            ledger.mark_handled(&b, &id),
+            "ALSO fresh for consumer B (different PK)"
+        );
         // and a redelivery to either is now a duplicate.
-        assert!(!ledger.mark_handled(&a, &id), "redelivery to A is a duplicate");
-        assert!(!ledger.mark_handled(&b, &id), "redelivery to B is a duplicate");
+        assert!(
+            !ledger.mark_handled(&a, &id),
+            "redelivery to A is a duplicate"
+        );
+        assert!(
+            !ledger.mark_handled(&b, &id),
+            "redelivery to B is a duplicate"
+        );
         assert_eq!(ledger.len(), 2, "two distinct (consumer, event_id) pairs");
         // each consumer sees only its OWN handled state.
         assert!(ledger.is_handled(&a, &id) && ledger.is_handled(&b, &id));
-        assert!(!ledger.is_handled(&consumer("other"), &id), "a third consumer has not handled it");
+        assert!(
+            !ledger.is_handled(&consumer("other"), &id),
+            "a third consumer has not handled it"
+        );
     }
 
     /// `is_empty` / `is_handled` track state precisely: empty before any mark, non-empty +
@@ -219,7 +244,10 @@ mod tests {
 
         // a Retry reverts the speculative mark → unhandled again (a redelivery must re-run).
         ledger.revert(&c, &id);
-        assert!(!ledger.is_handled(&c, &id), "after revert the pair is unhandled (a retry re-runs)");
+        assert!(
+            !ledger.is_handled(&c, &id),
+            "after revert the pair is unhandled (a retry re-runs)"
+        );
         assert!(ledger.is_empty(), "revert removed the only pair");
     }
 
@@ -230,8 +258,14 @@ mod tests {
         assert!(CONSUMER_DEDUP_MIGRATION.contains("CREATE TABLE IF NOT EXISTS consumer_dedup"));
         assert!(CONSUMER_DEDUP_MIGRATION.contains("PRIMARY KEY (consumer, event_id)"));
         for col in ["consumer", "event_id", "recorded_at"] {
-            assert!(CONSUMER_DEDUP_MIGRATION.contains(col), "missing column {col}");
+            assert!(
+                CONSUMER_DEDUP_MIGRATION.contains(col),
+                "missing column {col}"
+            );
         }
-        assert!(!CONSUMER_DEDUP_MIGRATION.contains("DROP TABLE"), "forward-only: no destructive down");
+        assert!(
+            !CONSUMER_DEDUP_MIGRATION.contains("DROP TABLE"),
+            "forward-only: no destructive down"
+        );
     }
 }

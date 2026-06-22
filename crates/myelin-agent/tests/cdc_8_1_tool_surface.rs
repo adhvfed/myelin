@@ -66,5 +66,7 @@ fn cdc_8_1_register_then_resolve_round_trips_the_tool_def_field_list() {
     assert_eq!(resolved, &consumer);
 
     // An unknown name resolves to None (the catalogue does not invent tools).
-    assert!(catalogue.resolve(&ToolName("does.not.exist".into())).is_none());
+    assert!(catalogue
+        .resolve(&ToolName("does.not.exist".into()))
+        .is_none());
 }

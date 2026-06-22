@@ -15,8 +15,8 @@
 //! (the full skip drill D-S10 lands with those subsystems; this pins the seam they call).
 
 use myelin_storage::{
-    Byok, Dek, DekHandle, Hyok, HyokKeyService, HyokServiceDenied, IndexAdmission, KekId, KeyOrigin,
-    KmsEngine, PlatformManaged, WrappedDek, KEY_LEN,
+    Byok, Dek, DekHandle, Hyok, HyokKeyService, HyokServiceDenied, IndexAdmission, KekId,
+    KeyOrigin, KmsEngine, PlatformManaged, WrappedDek, KEY_LEN,
 };
 use myelin_tenancy::{Region, TenantId};
 
@@ -27,7 +27,11 @@ impl HyokKeyService for CustomerKeyService {
     fn wrap(&self, dek: &Dek) -> Result<WrappedDek, HyokServiceDenied> {
         // Stand-in wrap (the real KMIP adapter is the [OPEN → P6/LEGAL] follow-on).
         let _ = dek;
-        Ok(WrappedDek { nonce: [0u8; 12], wrapped: vec![0u8; KEY_LEN], kek_epoch: 0 })
+        Ok(WrappedDek {
+            nonce: [0u8; 12],
+            wrapped: vec![0u8; KEY_LEN],
+            kek_epoch: 0,
+        })
     }
     fn unwrap(&self, _w: &WrappedDek) -> Result<DekHandle, HyokServiceDenied> {
         Ok(DekHandle::from_raw([3u8; KEY_LEN]))
@@ -43,7 +47,10 @@ struct IndexBuilder {
 }
 impl IndexBuilder {
     fn new() -> Self {
-        IndexBuilder { indexed: Vec::new(), skipped_hyok: Vec::new() }
+        IndexBuilder {
+            indexed: Vec::new(),
+            skipped_hyok: Vec::new(),
+        }
     }
     /// Try to build a plaintext-derived index over `class_name`, governed by its `origin`. A HYOK
     /// origin is skipped BY CONSTRUCTION (the consumer cannot bypass it — it has no decrypt path).
@@ -58,7 +65,10 @@ impl IndexBuilder {
 #[test]
 fn cdc_11_3_index_builder_consults_can_derive_plaintext_index() {
     let engine = KmsEngine::new();
-    engine.ensure_kek(&KekId::new(TenantId("acme".into()), Region("eu-west".into())));
+    engine.ensure_kek(&KekId::new(
+        TenantId("acme".into()),
+        Region("eu-west".into()),
+    ));
 
     let platform = PlatformManaged::new(&engine, Region("eu-west".into()));
     let byok = Byok::new(&engine, Region("eu-west".into()), "kms-customer://acme/k1");
@@ -71,7 +81,10 @@ fn cdc_11_3_index_builder_consults_can_derive_plaintext_index() {
     builder.build_index("repo_contents_hyok", &hyok);
 
     // The contract: platform + BYOK classes ARE indexed; the HYOK class is structurally skipped.
-    assert_eq!(builder.indexed, vec!["issue_fields_platform", "profile_bio_byok"]);
+    assert_eq!(
+        builder.indexed,
+        vec!["issue_fields_platform", "profile_bio_byok"]
+    );
     assert_eq!(builder.skipped_hyok, vec!["repo_contents_hyok"]);
 
     // The HYOK class NEVER ended up in the indexed set — cross-check the no-leak property.
@@ -87,13 +100,27 @@ fn cdc_11_3_byok_wraps_under_customer_path_full_capability() {
     // The provider property the consumer (a BYOK tenant's search) depends on: BYOK is
     // full-capability while the key is live, wrapping under the customer key path.
     let engine = KmsEngine::new();
-    engine.ensure_kek(&KekId::new(TenantId("acme".into()), Region("eu-west".into())));
-    let byok = Byok::new(&engine, Region("eu-west".into()), "kms-customer://acme/master");
+    engine.ensure_kek(&KekId::new(
+        TenantId("acme".into()),
+        Region("eu-west".into()),
+    ));
+    let byok = Byok::new(
+        &engine,
+        Region("eu-west".into()),
+        "kms-customer://acme/master",
+    );
 
     assert_eq!(byok.customer_key_path(), "kms-customer://acme/master");
-    assert!(byok.can_derive_plaintext_index(), "BYOK: full capability while the key is live");
+    assert!(
+        byok.can_derive_plaintext_index(),
+        "BYOK: full capability while the key is live"
+    );
 
     let dek = Dek::generate();
-    let wrapped = byok.wrap(&dek, TenantId("acme".into())).expect("byok wrap under customer path");
-    let _handle = byok.unwrap(&wrapped, TenantId("acme".into())).expect("byok unwrap (key live)");
+    let wrapped = byok
+        .wrap(&dek, TenantId("acme".into()))
+        .expect("byok wrap under customer path");
+    let _handle = byok
+        .unwrap(&wrapped, TenantId("acme".into()))
+        .expect("byok unwrap (key live)");
 }

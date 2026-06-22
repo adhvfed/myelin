@@ -255,7 +255,11 @@ impl std::fmt::Display for GitPackError {
 impl std::fmt::Display for PlacementError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PlacementError::CrossRegion { repo, pinned, target } => write!(
+            PlacementError::CrossRegion {
+                repo,
+                pinned,
+                target,
+            } => write!(
                 f,
                 "repo `{}` is pinned to region `{}` — a relocation to `{}` is REFUSED (a repo's \
                  git packs never leave their region; the residency pin holds at repo grain)",
@@ -338,14 +342,21 @@ impl<B: BlobStore> GitPackTier<B> {
     /// never out of it. The placement carries NO node id — the repo's packs are content-addressed,
     /// so relocation is a stored-fact flip, not an object move.
     pub fn place_repo(&self, repo: RepoId, placement: RepoGitPlacement) {
-        self.placements.lock().expect("placement mutex").insert(repo, placement);
+        self.placements
+            .lock()
+            .expect("placement mutex")
+            .insert(repo, placement);
     }
 
     /// **`placement_of(repo) → RepoGitPlacement` (the storage face of contract 12.2).** Returns the
     /// repo's region-pinned, relocatable placement, or `None` for an unregistered repo (never a
     /// fabricated answer — fail-closed). It is a placement answer, never an authz answer.
     pub fn placement_of(&self, repo: &RepoId) -> Option<RepoGitPlacement> {
-        self.placements.lock().expect("placement mutex").get(repo).cloned()
+        self.placements
+            .lock()
+            .expect("placement mutex")
+            .get(repo)
+            .cloned()
     }
 
     /// **Relocate a repo to a DIFFERENT storage group WITHIN its region (relocatable, NEVER
@@ -416,14 +427,18 @@ impl<B: BlobStore> GitPackTier<B> {
     /// re-hashing the framed bytes under SHA-256 — a corrupt object is **refused**
     /// ([`BlobError::IntegrityFail`] → [`GitPackError::Blob`], 0 silent serve), `blob_integrity_fail`
     /// increments (STOR-D7 on git packs).
-    pub fn get_object(&self, repo: &RepoId, address: &ContentHash) -> Result<Vec<u8>, GitPackError> {
+    pub fn get_object(
+        &self,
+        repo: &RepoId,
+        address: &ContentHash,
+    ) -> Result<Vec<u8>, GitPackError> {
         self.require_placed(repo)?;
-        let native = self
-            .native_for_sha(repo, address)
-            .ok_or_else(|| GitPackError::Blob(BlobError::NotFound {
+        let native = self.native_for_sha(repo, address).ok_or_else(|| {
+            GitPackError::Blob(BlobError::NotFound {
                 tenant: self.tenant.clone(),
                 hash: address.clone(),
-            }))?;
+            })
+        })?;
         // Serve the framed bytes through the trait. The BlobStore re-hashes on read on the NATIVE
         // (BLAKE3) address and refuses a corrupt blob FIRST (incrementing `blob_integrity_fail`,
         // 0 silent serve — STOR-D7 on packs). We THEN re-verify under the git SHA so the git-world
@@ -479,7 +494,11 @@ impl<B: BlobStore> GitPackTier<B> {
 
     /// **Get a packfile blob by its content address (re-hash-on-read integrity).** A corrupt
     /// packfile is detected by the BlobStore's re-hash-on-read and **refused** (0 silent serve).
-    pub fn get_pack(&self, repo: &RepoId, pack_hash: &ContentHash) -> Result<Vec<u8>, GitPackError> {
+    pub fn get_pack(
+        &self,
+        repo: &RepoId,
+        pack_hash: &ContentHash,
+    ) -> Result<Vec<u8>, GitPackError> {
         self.require_placed(repo)?;
         Ok(self.blobs.get(&self.tenant, pack_hash)?)
     }
@@ -488,7 +507,12 @@ impl<B: BlobStore> GitPackTier<B> {
 
     /// Fail-closed: a pack operation on an unregistered repo is refused (no fabricated placement).
     fn require_placed(&self, repo: &RepoId) -> Result<(), GitPackError> {
-        if self.placements.lock().expect("placement mutex").contains_key(repo) {
+        if self
+            .placements
+            .lock()
+            .expect("placement mutex")
+            .contains_key(repo)
+        {
             Ok(())
         } else {
             Err(GitPackError::RepoNotPlaced { repo: repo.clone() })
@@ -573,7 +597,9 @@ mod tests {
     fn git_object_is_addressed_through_the_trait_and_round_trips() {
         let (tier, repo) = placed_tier();
         let content = b"fn main() {}\n";
-        let address = tier.put_object(&repo, GitObjectKind::Blob, content).expect("put");
+        let address = tier
+            .put_object(&repo, GitObjectKind::Blob, content)
+            .expect("put");
 
         // The address is the git SHA-256 of the framed object (the git identity), self-describing.
         assert_eq!(address.algo, crate::blob::HashAlgo::Sha256);
@@ -582,7 +608,10 @@ mod tests {
 
         // get by the git SHA address returns the EXACT object content (re-hash-on-read verified).
         let got = tier.get_object(&repo, &address).expect("get");
-        assert_eq!(got, content, "the exact object content round-trips through the trait");
+        assert_eq!(
+            got, content,
+            "the exact object content round-trips through the trait"
+        );
     }
 
     /// **`placement_of(repo)` returns the region-pinned, relocatable placement; an unregistered
@@ -606,22 +635,36 @@ mod tests {
     fn relocation_does_not_recompute_an_address() {
         let (tier, repo) = placed_tier();
         let content = b"tree content";
-        let before = tier.put_object(&repo, GitObjectKind::Tree, content).expect("put");
+        let before = tier
+            .put_object(&repo, GitObjectKind::Tree, content)
+            .expect("put");
 
         // Relocate to a different group, SAME region.
-        tier.relocate(&repo, StorageGroup::from_token("pack-7"), &Region::new("eu-west"))
-            .expect("a same-region relocation is admitted");
+        tier.relocate(
+            &repo,
+            StorageGroup::from_token("pack-7"),
+            &Region::new("eu-west"),
+        )
+        .expect("a same-region relocation is admitted");
 
         // The placement flipped the group; the region is unchanged.
         let p = tier.placement_of(&repo).unwrap();
         assert_eq!(p.group.as_str(), "pack-7", "only the stored group flipped");
-        assert_eq!(p.region.as_str(), "eu-west", "region unchanged (same-region move)");
+        assert_eq!(
+            p.region.as_str(),
+            "eu-west",
+            "region unchanged (same-region move)"
+        );
 
         // The object's address is byte-identical AND still resolvable — no re-address, no move.
         let after_addr = git_object_address(GitObjectKind::Tree, content);
-        assert_eq!(before, after_addr, "the object's content address is unchanged by relocation");
         assert_eq!(
-            tier.get_object(&repo, &before).expect("served after relocation"),
+            before, after_addr,
+            "the object's content address is unchanged by relocation"
+        );
+        assert_eq!(
+            tier.get_object(&repo, &before)
+                .expect("served after relocation"),
             content,
             "the object is still served by the SAME address after relocation (never node-pinned)"
         );
@@ -634,15 +677,26 @@ mod tests {
     fn cross_region_relocation_is_refused() {
         let (tier, repo) = placed_tier();
         let e = tier
-            .relocate(&repo, StorageGroup::from_token("pack-n"), &Region::new("eu-north"))
+            .relocate(
+                &repo,
+                StorageGroup::from_token("pack-n"),
+                &Region::new("eu-north"),
+            )
             .expect_err("a cross-region relocation target is refused (the residency pin)");
         assert!(
-            matches!(e, GitPackError::Placement(PlacementError::CrossRegion { .. })),
+            matches!(
+                e,
+                GitPackError::Placement(PlacementError::CrossRegion { .. })
+            ),
             "{e}"
         );
         // The repo did NOT move — still on pack-0 in eu-west.
         let p = tier.placement_of(&repo).unwrap();
-        assert_eq!(p.group.as_str(), "pack-0", "the rejected relocation did not move the repo");
+        assert_eq!(
+            p.group.as_str(),
+            "pack-0",
+            "the rejected relocation did not move the repo"
+        );
         assert_eq!(p.region.as_str(), "eu-west");
     }
 
@@ -653,7 +707,9 @@ mod tests {
     fn corrupt_object_is_detected_and_refused_zero_silent_serve() {
         let (tier, repo) = placed_tier();
         let content = b"commit content to corrupt";
-        let address = tier.put_object(&repo, GitObjectKind::Commit, content).expect("put");
+        let address = tier
+            .put_object(&repo, GitObjectKind::Commit, content)
+            .expect("put");
 
         // Clean read serves the object and does not signal.
         assert_eq!(tier.get_object(&repo, &address).expect("clean"), content);
@@ -661,7 +717,10 @@ mod tests {
 
         // Corrupt the stored object at its NATIVE blob address (bit-rot / tamper).
         let native = tier.native_for_sha(&repo, &address).expect("linked");
-        assert!(tier.blobs().corrupt_for_drill(&tenant(), &native), "object present to corrupt");
+        assert!(
+            tier.blobs().corrupt_for_drill(&tenant(), &native),
+            "object present to corrupt"
+        );
 
         // Re-hash-on-read REFUSES — 0 silent serve.
         match tier.get_object(&repo, &address) {
@@ -694,9 +753,16 @@ mod tests {
         );
 
         let content = b"the authoritative object bytes";
-        let address = primary.put_object(&repo, GitObjectKind::Blob, content).expect("primary put");
-        let replica_addr = replica.put_object(&repo, GitObjectKind::Blob, content).expect("replica put");
-        assert_eq!(address, replica_addr, "the same content has the same address on both backings");
+        let address = primary
+            .put_object(&repo, GitObjectKind::Blob, content)
+            .expect("primary put");
+        let replica_addr = replica
+            .put_object(&repo, GitObjectKind::Blob, content)
+            .expect("replica put");
+        assert_eq!(
+            address, replica_addr,
+            "the same content has the same address on both backings"
+        );
 
         // Corrupt the PRIMARY's copy.
         let native = primary.native_for_sha(&repo, &address).unwrap();
@@ -707,8 +773,15 @@ mod tests {
         let recovered = primary
             .get_object_with_recovery(&repo, &address, &replica)
             .expect("recovered from the replica by content address");
-        assert_eq!(recovered, content, "the good replica copy recovers the corrupt object");
-        assert_eq!(primary.blobs().telemetry().blob_integrity_fail(), 1, "the corrupt primary was detected");
+        assert_eq!(
+            recovered, content,
+            "the good replica copy recovers the corrupt object"
+        );
+        assert_eq!(
+            primary.blobs().telemetry().blob_integrity_fail(),
+            1,
+            "the corrupt primary was detected"
+        );
     }
 
     /// **Fail-closed: a pack operation on an UNREGISTERED repo is refused** (no fabricated
@@ -737,15 +810,24 @@ mod tests {
         let obj_addr = git_object_address(GitObjectKind::Blob, b"member");
         let packfile = b"PACK\0\0\0\x02...opaque packfile bytes...";
         let manifest = tier
-            .put_pack(&repo, packfile, vec![(GitObjectKind::Blob, obj_addr.clone())])
+            .put_pack(
+                &repo,
+                packfile,
+                vec![(GitObjectKind::Blob, obj_addr.clone())],
+            )
             .expect("put pack");
         assert_eq!(manifest.objects, vec![(GitObjectKind::Blob, obj_addr)]);
 
         // The packfile round-trips by its content address.
-        assert_eq!(tier.get_pack(&repo, &manifest.pack_hash).expect("get pack"), packfile);
+        assert_eq!(
+            tier.get_pack(&repo, &manifest.pack_hash).expect("get pack"),
+            packfile
+        );
 
         // Corrupt the packfile blob → re-hash-on-read refuses it (0 silent serve).
-        assert!(tier.blobs().corrupt_for_drill(&tenant(), &manifest.pack_hash));
+        assert!(tier
+            .blobs()
+            .corrupt_for_drill(&tenant(), &manifest.pack_hash));
         assert!(matches!(
             tier.get_pack(&repo, &manifest.pack_hash),
             Err(GitPackError::Blob(BlobError::IntegrityFail { .. }))
@@ -760,7 +842,10 @@ mod tests {
         let framed = frame_git_object(GitObjectKind::Blob, content);
         assert_eq!(&framed[..7], b"blob 5\0");
         assert_eq!(unframe_git_object(&framed), content);
-        assert_eq!(git_object_address(GitObjectKind::Blob, content), ContentHash::sha256(&framed));
+        assert_eq!(
+            git_object_address(GitObjectKind::Blob, content),
+            ContentHash::sha256(&framed)
+        );
         // The four kinds carry distinct headers.
         assert_eq!(GitObjectKind::Commit.header_keyword(), "commit");
         assert_eq!(GitObjectKind::Tree.header_keyword(), "tree");
@@ -779,7 +864,9 @@ mod tests {
         assert!(s.contains("eu-west") && s.contains("eu-north"), "{s}");
         assert!(s.contains("never leave their region"), "{s}");
 
-        let not_placed = GitPackError::RepoNotPlaced { repo: RepoId::from_token("ghost") };
+        let not_placed = GitPackError::RepoNotPlaced {
+            repo: RepoId::from_token("ghost"),
+        };
         assert!(not_placed.to_string().contains("not placed"));
         // The repo id is rendered verbatim in the error (kills the `as_str` mutants — the loud,
         // diagnosable error must name the exact repo, never an empty/constant string).

@@ -134,7 +134,10 @@ impl CacheTtl {
         revocation_sla_secs: Seconds,
     ) -> Result<CacheTtl, TtlExceedsRevocationSla> {
         if ttl_secs > revocation_sla_secs {
-            return Err(TtlExceedsRevocationSla { ttl_secs, revocation_sla_secs });
+            return Err(TtlExceedsRevocationSla {
+                ttl_secs,
+                revocation_sla_secs,
+            });
         }
         Ok(CacheTtl { ttl_secs })
     }
@@ -327,7 +330,13 @@ impl FilterCache {
     /// Build the S5 filter cache against an injected clock (the TTL boundary drills advance a
     /// [`myelin_substrate::TestClock`] exactly at the TTL edge).
     pub fn with_clock(ttl: CacheTtl, dek: SearchDekPin, clock: Box<dyn Clock>) -> FilterCache {
-        FilterCache { ttl, dek, clock, entries: Mutex::new(HashMap::new()), stats: CacheStats::new() }
+        FilterCache {
+            ttl,
+            dek,
+            clock,
+            entries: Mutex::new(HashMap::new()),
+            stats: CacheStats::new(),
+        }
     }
 
     /// The cache's telemetry counters (consumed by SRCH-P14).
@@ -399,7 +408,14 @@ impl FilterCache {
         self.entries
             .lock()
             .expect("S5 filter cache poisoned")
-            .insert(key, SealedEntry { nonce, ciphertext, cached_at_secs: now });
+            .insert(
+                key,
+                SealedEntry {
+                    nonce,
+                    ciphertext,
+                    cached_at_secs: now,
+                },
+            );
         Ok(result)
     }
 
@@ -580,8 +596,14 @@ impl ResultCache {
         // computes; a CONCURRENT arrival blocks here, then re-reads the now-populated entry below
         // (a coalesced hit — the engine ran once).
         let gate = {
-            let mut inflight = self.inflight.lock().expect("result cache inflight poisoned");
-            inflight.entry(key.clone()).or_insert_with(|| std::sync::Arc::new(Mutex::new(()))).clone()
+            let mut inflight = self
+                .inflight
+                .lock()
+                .expect("result cache inflight poisoned");
+            inflight
+                .entry(key.clone())
+                .or_insert_with(|| std::sync::Arc::new(Mutex::new(())))
+                .clone()
         };
         let _held = gate.lock().expect("result cache coalesce gate poisoned");
 
@@ -599,14 +621,21 @@ impl ResultCache {
         let plaintext = encode_results(&results);
         let (nonce, ciphertext) = seal_under_dek(&self.dek, key_ref, region, &plaintext)?;
         let now = self.clock.now_secs();
-        self.entries
-            .lock()
-            .expect("result cache poisoned")
-            .insert(key.clone(), SealedEntry { nonce, ciphertext, cached_at_secs: now });
+        self.entries.lock().expect("result cache poisoned").insert(
+            key.clone(),
+            SealedEntry {
+                nonce,
+                ciphertext,
+                cached_at_secs: now,
+            },
+        );
 
         // Release the in-flight slot (the gate guard drops at end of scope; clear the map entry so
         // a later cold miss re-coalesces afresh).
-        self.inflight.lock().expect("result cache inflight poisoned").remove(&key);
+        self.inflight
+            .lock()
+            .expect("result cache inflight poisoned")
+            .remove(&key);
         Ok(results)
     }
 
@@ -728,7 +757,11 @@ fn decode_results(bytes: &[u8]) -> RankedResults {
     for _ in 0..n_fields {
         post_fetch_fields.push(take_str(bytes, &mut cur));
     }
-    RankedResults { hits, zookie, post_fetch_fields }
+    RankedResults {
+        hits,
+        zookie,
+        post_fetch_fields,
+    }
 }
 
 #[cfg(test)]
@@ -746,16 +779,26 @@ mod tests {
         Region("fr-par".into())
     }
     fn subject() -> Principal {
-        Principal::stub(PrincipalId("p:alice".into()), PrincipalKind::Human, tenant())
+        Principal::stub(
+            PrincipalId("p:alice".into()),
+            PrincipalKind::Human,
+            tenant(),
+        )
     }
     fn ty() -> ObjectType {
         ObjectType("issue".into())
     }
     fn strong(zookie: &str) -> Consistency {
-        Consistency { at_least: Zookie(zookie.into()), mode: ConsistencyMode::Strong }
+        Consistency {
+            at_least: Zookie(zookie.into()),
+            mode: ConsistencyMode::Strong,
+        }
     }
     fn bounded(zookie: &str) -> Consistency {
-        Consistency { at_least: Zookie(zookie.into()), mode: ConsistencyMode::BoundedStale }
+        Consistency {
+            at_least: Zookie(zookie.into()),
+            mode: ConsistencyMode::BoundedStale,
+        }
     }
 
     /// A fresh KMS engine + a reserved per-tenant index DEK, returning the pin + the key ref. The
@@ -763,13 +806,18 @@ mod tests {
     fn pin_with_dek() -> (SearchDekPin, PiiKeyRef) {
         let kms = Arc::new(KmsEngine::new());
         let pin = SearchDekPin::new(kms);
-        let key_ref = pin.reserve(&tenant(), &region()).expect("reserve index DEK");
+        let key_ref = pin
+            .reserve(&tenant(), &region())
+            .expect("reserve index DEK");
         (pin, key_ref)
     }
 
     fn ids_result(ids: &[&str], zookie: &str) -> ListObjectsResult {
         ListObjectsResult::Ids {
-            ids: ids.iter().map(|s| myelin_identity::ObjectId((*s).into())).collect(),
+            ids: ids
+                .iter()
+                .map(|s| myelin_identity::ObjectId((*s).into()))
+                .collect(),
             zookie: Zookie(zookie.into()),
         }
     }
@@ -786,7 +834,13 @@ mod tests {
         assert!(CacheTtl::bounded(300, 300).is_ok());
         // TTL one second over the SLA: REJECTED.
         let err = CacheTtl::bounded(301, 300).expect_err("TTL > revocation SLA must be rejected");
-        assert_eq!(err, TtlExceedsRevocationSla { ttl_secs: 301, revocation_sla_secs: 300 });
+        assert_eq!(
+            err,
+            TtlExceedsRevocationSla {
+                ttl_secs: 301,
+                revocation_sla_secs: 300
+            }
+        );
     }
 
     // ─────────────────────────── zookie bucketing + bypass ───────────────────────────
@@ -798,14 +852,24 @@ mod tests {
         assert_eq!(zookie_bucket("z@5"), 5);
         assert_eq!(zookie_bucket("z@9"), 9);
         assert_eq!(zookie_bucket("z-no-suffix"), 0);
-        assert_ne!(zookie_bucket("z@5"), zookie_bucket("z@9"), "different buckets, different entries");
+        assert_ne!(
+            zookie_bucket("z@5"),
+            zookie_bucket("z@9"),
+            "different buckets, different entries"
+        );
     }
 
     /// **A zookie-stamped strong read bypasses BOTH caches; a default-consistency read does not.**
     #[test]
     fn strong_reads_bypass_the_cache() {
-        assert!(should_bypass(&strong("z@7")), "a strong read bypasses the cache");
-        assert!(!should_bypass(&bounded("z@7")), "a bounded read may use the cache");
+        assert!(
+            should_bypass(&strong("z@7")),
+            "a strong read bypasses the cache"
+        );
+        assert!(
+            !should_bypass(&bounded("z@7")),
+            "a bounded read may use the cache"
+        );
     }
 
     // ─────────────────────────── S5 FilterCache: hit / bypass / TTL / zookie ───────────────
@@ -827,13 +891,25 @@ mod tests {
             .get_or_compute(&tenant(), &region(), &subject(), &ty(), &at, &key_ref, run)
             .unwrap();
         let r2 = cache
-            .get_or_compute(&tenant(), &region(), &subject(), &ty(), &at, &key_ref, || {
-                computed.fetch_add(1, Ordering::SeqCst);
-                ids_result(&["UNEXPECTED"], "z@5")
-            })
+            .get_or_compute(
+                &tenant(),
+                &region(),
+                &subject(),
+                &ty(),
+                &at,
+                &key_ref,
+                || {
+                    computed.fetch_add(1, Ordering::SeqCst);
+                    ids_result(&["UNEXPECTED"], "z@5")
+                },
+            )
             .unwrap();
         assert_eq!(r1, r2, "the cached result is byte-identical");
-        assert_eq!(computed.load(Ordering::SeqCst), 1, "computed exactly once (the second was a hit)");
+        assert_eq!(
+            computed.load(Ordering::SeqCst),
+            1,
+            "computed exactly once (the second was a hit)"
+        );
         assert_eq!(cache.stats().hits(), 1);
         assert_eq!(cache.stats().misses(), 1);
     }
@@ -847,9 +923,15 @@ mod tests {
 
         // A strong read computes directly and does NOT cache.
         let r = cache
-            .get_or_compute(&tenant(), &region(), &subject(), &ty(), &strong("z@5"), &key_ref, || {
-                ids_result(&["fresh"], "z@5")
-            })
+            .get_or_compute(
+                &tenant(),
+                &region(),
+                &subject(),
+                &ty(),
+                &strong("z@5"),
+                &key_ref,
+                || ids_result(&["fresh"], "z@5"),
+            )
             .unwrap();
         assert_eq!(r, ids_result(&["fresh"], "z@5"));
         assert_eq!(cache.stats().bypasses(), 1);
@@ -869,20 +951,44 @@ mod tests {
 
         // Cache at bucket @5 (a pre-revocation answer that still names SECRET-9).
         cache
-            .get_or_compute(&tenant(), &region(), &subject(), &ty(), &bounded("z@5"), &key_ref, || {
-                computed.fetch_add(1, Ordering::SeqCst);
-                ids_result(&["PUB-1", "SECRET-9"], "z@5")
-            })
+            .get_or_compute(
+                &tenant(),
+                &region(),
+                &subject(),
+                &ty(),
+                &bounded("z@5"),
+                &key_ref,
+                || {
+                    computed.fetch_add(1, Ordering::SeqCst);
+                    ids_result(&["PUB-1", "SECRET-9"], "z@5")
+                },
+            )
             .unwrap();
         // A read at bucket @9 (post-revocation) is a MISS — it recomputes (SECRET-9 now gone).
         let r = cache
-            .get_or_compute(&tenant(), &region(), &subject(), &ty(), &bounded("z@9"), &key_ref, || {
-                computed.fetch_add(1, Ordering::SeqCst);
-                ids_result(&["PUB-1"], "z@9")
-            })
+            .get_or_compute(
+                &tenant(),
+                &region(),
+                &subject(),
+                &ty(),
+                &bounded("z@9"),
+                &key_ref,
+                || {
+                    computed.fetch_add(1, Ordering::SeqCst);
+                    ids_result(&["PUB-1"], "z@9")
+                },
+            )
             .unwrap();
-        assert_eq!(r, ids_result(&["PUB-1"], "z@9"), "the newer bucket recomputed (no bleed)");
-        assert_eq!(computed.load(Ordering::SeqCst), 2, "both buckets computed — no cross-bucket hit");
+        assert_eq!(
+            r,
+            ids_result(&["PUB-1"], "z@9"),
+            "the newer bucket recomputed (no bleed)"
+        );
+        assert_eq!(
+            computed.load(Ordering::SeqCst),
+            2,
+            "both buckets computed — no cross-bucket hit"
+        );
     }
 
     /// **An entry older than the TTL is EXPIRED (a revoked grant cannot be served past the TTL ≤
@@ -900,9 +1006,15 @@ mod tests {
 
         // Cache at t=1000.
         cache
-            .get_or_compute(&tenant(), &region(), &subject(), &ty(), &at, &key_ref, || {
-                ids_result(&["d1"], "z@5")
-            })
+            .get_or_compute(
+                &tenant(),
+                &region(),
+                &subject(),
+                &ty(),
+                &at,
+                &key_ref,
+                || ids_result(&["d1"], "z@5"),
+            )
             .unwrap();
         assert!(cache
             .probe_recoverable(&tenant(), &region(), &subject(), &ty(), "z@5", &key_ref)
@@ -912,22 +1024,46 @@ mod tests {
         clock.advance(60);
         let computed = AtomicU64::new(0);
         cache
-            .get_or_compute(&tenant(), &region(), &subject(), &ty(), &at, &key_ref, || {
-                computed.fetch_add(1, Ordering::SeqCst);
-                ids_result(&["UNEXPECTED"], "z@5")
-            })
+            .get_or_compute(
+                &tenant(),
+                &region(),
+                &subject(),
+                &ty(),
+                &at,
+                &key_ref,
+                || {
+                    computed.fetch_add(1, Ordering::SeqCst);
+                    ids_result(&["UNEXPECTED"], "z@5")
+                },
+            )
             .unwrap();
-        assert_eq!(computed.load(Ordering::SeqCst), 0, "age == TTL is still fresh (inclusive)");
+        assert_eq!(
+            computed.load(Ordering::SeqCst),
+            0,
+            "age == TTL is still fresh (inclusive)"
+        );
 
         // Advance one second past the TTL (age == 61 > 60): expired → recompute.
         clock.advance(1);
         cache
-            .get_or_compute(&tenant(), &region(), &subject(), &ty(), &at, &key_ref, || {
-                computed.fetch_add(1, Ordering::SeqCst);
-                ids_result(&["d1-fresh"], "z@5")
-            })
+            .get_or_compute(
+                &tenant(),
+                &region(),
+                &subject(),
+                &ty(),
+                &at,
+                &key_ref,
+                || {
+                    computed.fetch_add(1, Ordering::SeqCst);
+                    ids_result(&["d1-fresh"], "z@5")
+                },
+            )
             .unwrap();
-        assert_eq!(computed.load(Ordering::SeqCst), 1, "expired past the TTL → recomputed");
+        assert_eq!(
+            computed.load(Ordering::SeqCst),
+            1,
+            "expired past the TTL → recomputed"
+        );
         assert_eq!(cache.stats().expired(), 1, "the expiry is recorded");
     }
 
@@ -941,16 +1077,25 @@ mod tests {
 
         // Cache an entry, then prove it is recoverable.
         cache
-            .get_or_compute(&tenant(), &region(), &subject(), &ty(), &at, &key_ref, || {
-                ids_result(&["d1"], "z@5")
-            })
+            .get_or_compute(
+                &tenant(),
+                &region(),
+                &subject(),
+                &ty(),
+                &at,
+                &key_ref,
+                || ids_result(&["d1"], "z@5"),
+            )
             .unwrap();
         assert!(cache
             .probe_recoverable(&tenant(), &region(), &subject(), &ty(), "z@5", &key_ref)
             .unwrap());
 
         // Tenant-decommission crypto-shred: destroy the per-tenant index DEK.
-        assert!(pin.destroy_tenant_index_dek(&tenant(), &region()), "the index DEK was present");
+        assert!(
+            pin.destroy_tenant_index_dek(&tenant(), &region()),
+            "the index DEK was present"
+        );
 
         // The cached entry is now UNRECOVERABLE — probe surfaces the loud KmsError.
         let err = cache
@@ -973,9 +1118,19 @@ mod tests {
                 ids_result(&["d1"], "z@5")
             },
         );
-        assert!(recompute.is_err(), "a destroyed DEK makes the re-seal fail loudly (no plaintext at rest)");
-        assert_eq!(computed.load(Ordering::SeqCst), 1, "the value was still computed from source");
-        assert!(cache.stats().shredded() >= 1, "the crypto-shred is recorded");
+        assert!(
+            recompute.is_err(),
+            "a destroyed DEK makes the re-seal fail loudly (no plaintext at rest)"
+        );
+        assert_eq!(
+            computed.load(Ordering::SeqCst),
+            1,
+            "the value was still computed from source"
+        );
+        assert!(
+            cache.stats().shredded() >= 1,
+            "the crypto-shred is recorded"
+        );
     }
 
     // ─────────────────────────── ResultCache: coalesce / hit / zookie / shred ───────────────
@@ -984,7 +1139,10 @@ mod tests {
         RankedResults {
             hits: docs
                 .iter()
-                .map(|(d, s)| RankedResult { doc_id: (*d).into(), score: *s })
+                .map(|(d, s)| RankedResult {
+                    doc_id: (*d).into(),
+                    score: *s,
+                })
                 .collect(),
             zookie: zookie.into(),
             post_fetch_fields: vec!["rollup:total".into()],
@@ -1009,16 +1167,32 @@ mod tests {
         let at = bounded("z@5");
 
         let r1 = cache
-            .get_or_compute(&tenant(), &region(), &subject(), 0xABCD, &at, &key_ref, || {
-                computed.fetch_add(1, Ordering::SeqCst);
-                ranked(&[("d1", 2.0)], "z@5")
-            })
+            .get_or_compute(
+                &tenant(),
+                &region(),
+                &subject(),
+                0xABCD,
+                &at,
+                &key_ref,
+                || {
+                    computed.fetch_add(1, Ordering::SeqCst);
+                    ranked(&[("d1", 2.0)], "z@5")
+                },
+            )
             .unwrap();
         let r2 = cache
-            .get_or_compute(&tenant(), &region(), &subject(), 0xABCD, &at, &key_ref, || {
-                computed.fetch_add(1, Ordering::SeqCst);
-                ranked(&[("UNEXPECTED", 9.0)], "z@5")
-            })
+            .get_or_compute(
+                &tenant(),
+                &region(),
+                &subject(),
+                0xABCD,
+                &at,
+                &key_ref,
+                || {
+                    computed.fetch_add(1, Ordering::SeqCst);
+                    ranked(&[("UNEXPECTED", 9.0)], "z@5")
+                },
+            )
             .unwrap();
         assert_eq!(r1, r2);
         assert_eq!(computed.load(Ordering::SeqCst), 1, "the engine ran once");
@@ -1046,12 +1220,20 @@ mod tests {
                     barrier.wait(); // release all threads simultaneously
                     let at = bounded("z@5");
                     cache
-                        .get_or_compute(&tenant(), &region(), &subject(), 0x1234, &at, &key_ref, || {
-                            engine_runs.fetch_add(1, Ordering::SeqCst);
-                            // simulate a slow engine query so the herd piles up on the gate.
-                            std::thread::sleep(std::time::Duration::from_millis(20));
-                            ranked(&[("d1", 1.0)], "z@5")
-                        })
+                        .get_or_compute(
+                            &tenant(),
+                            &region(),
+                            &subject(),
+                            0x1234,
+                            &at,
+                            &key_ref,
+                            || {
+                                engine_runs.fetch_add(1, Ordering::SeqCst);
+                                // simulate a slow engine query so the herd piles up on the gate.
+                                std::thread::sleep(std::time::Duration::from_millis(20));
+                                ranked(&[("d1", 1.0)], "z@5")
+                            },
+                        )
                         .unwrap();
                 });
             }
@@ -1062,7 +1244,10 @@ mod tests {
             1,
             "the engine ran exactly once for N concurrent identical requests (coalesced)"
         );
-        assert!(cache.stats().coalesced() >= 1, "at least one request coalesced onto the first");
+        assert!(
+            cache.stats().coalesced() >= 1,
+            "at least one request coalesced onto the first"
+        );
     }
 
     /// **The result cache is zookie-bucketed (no cross-zookie bleed) and bypassed for strong reads.**
@@ -1074,26 +1259,54 @@ mod tests {
 
         // Cache at bucket @5.
         cache
-            .get_or_compute(&tenant(), &region(), &subject(), 7, &bounded("z@5"), &key_ref, || {
-                computed.fetch_add(1, Ordering::SeqCst);
-                ranked(&[("d1", 1.0)], "z@5")
-            })
+            .get_or_compute(
+                &tenant(),
+                &region(),
+                &subject(),
+                7,
+                &bounded("z@5"),
+                &key_ref,
+                || {
+                    computed.fetch_add(1, Ordering::SeqCst);
+                    ranked(&[("d1", 1.0)], "z@5")
+                },
+            )
             .unwrap();
         // A read at bucket @9 misses (no bleed).
         cache
-            .get_or_compute(&tenant(), &region(), &subject(), 7, &bounded("z@9"), &key_ref, || {
-                computed.fetch_add(1, Ordering::SeqCst);
-                ranked(&[("d1", 1.0)], "z@9")
-            })
+            .get_or_compute(
+                &tenant(),
+                &region(),
+                &subject(),
+                7,
+                &bounded("z@9"),
+                &key_ref,
+                || {
+                    computed.fetch_add(1, Ordering::SeqCst);
+                    ranked(&[("d1", 1.0)], "z@9")
+                },
+            )
             .unwrap();
-        assert_eq!(computed.load(Ordering::SeqCst), 2, "different buckets, different entries");
+        assert_eq!(
+            computed.load(Ordering::SeqCst),
+            2,
+            "different buckets, different entries"
+        );
 
         // A strong read bypasses entirely.
         cache
-            .get_or_compute(&tenant(), &region(), &subject(), 7, &strong("z@5"), &key_ref, || {
-                computed.fetch_add(1, Ordering::SeqCst);
-                ranked(&[("d1", 1.0)], "z@5")
-            })
+            .get_or_compute(
+                &tenant(),
+                &region(),
+                &subject(),
+                7,
+                &strong("z@5"),
+                &key_ref,
+                || {
+                    computed.fetch_add(1, Ordering::SeqCst);
+                    ranked(&[("d1", 1.0)], "z@5")
+                },
+            )
             .unwrap();
         assert_eq!(cache.stats().bypasses(), 1, "the strong read bypassed");
     }
@@ -1132,7 +1345,11 @@ mod tests {
         s.record_hit();
         s.record_miss();
         s.record_bypass(); // a bypass is not a hit OR a miss.
-        assert_eq!(s.hit_ratio_pct(), Some(75), "3 hits / 4 reads = 75% (the bypass is excluded)");
+        assert_eq!(
+            s.hit_ratio_pct(),
+            Some(75),
+            "3 hits / 4 reads = 75% (the bypass is excluded)"
+        );
     }
 
     // ── test clock plumbing: a shareable Clock wrapper so a drill can advance time from outside ──

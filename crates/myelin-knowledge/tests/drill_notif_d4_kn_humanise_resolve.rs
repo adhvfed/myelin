@@ -30,16 +30,24 @@ use myelin_identity::{
 };
 use myelin_knowledge::refs_glue::{PageMeta, PageStore, Projector};
 use myelin_knowledge::KnowledgeRefResolver;
-use myelin_notif::humanise::{humanise, Channel, RefResolution, RefResolvePort, TemplateStore, DEFAULT_LOCALE};
+use myelin_notif::humanise::{
+    humanise, Channel, RefResolution, RefResolvePort, TemplateStore, DEFAULT_LOCALE,
+};
 use myelin_notif::{reason_template_key, Reason};
 use myelin_refs::ArtifactRef;
 use myelin_tenancy::{Region, TenantId};
 
 /// The secret page title (the leak target — must NEVER appear for a denied viewer).
-const SECRET_PAGE_TITLE: &str = "Incident PROJECT-NIGHTFALL: signing-key rotation before the acquisition";
+const SECRET_PAGE_TITLE: &str =
+    "Incident PROJECT-NIGHTFALL: signing-key rotation before the acquisition";
 
 /// Every KN reason → its humanise template key; the leak property must hold for ALL of them.
-const KN_REASONS: &[Reason] = &[Reason::Mentioned, Reason::Comments, Reason::Shared, Reason::Watched];
+const KN_REASONS: &[Reason] = &[
+    Reason::Mentioned,
+    Reason::Comments,
+    Reason::Shared,
+    Reason::Watched,
+];
 
 fn acme() -> TenantId {
     TenantId("acme".into())
@@ -51,7 +59,10 @@ fn viewer(id: &str) -> Principal {
     Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, acme())
 }
 fn strong(zk: &str) -> Consistency {
-    Consistency { at_least: Zookie(zk.into()), mode: ConsistencyMode::Strong }
+    Consistency {
+        at_least: Zookie(zk.into()),
+        mode: ConsistencyMode::Strong,
+    }
 }
 fn confidential_page() -> ArtifactRef {
     ArtifactRef("myelin://acme/knowledge/page/runbook9".into())
@@ -73,13 +84,21 @@ struct MutableId {
 }
 impl MutableId {
     fn new() -> Self {
-        Self { allow: Mutex::new(HashSet::new()) }
+        Self {
+            allow: Mutex::new(HashSet::new()),
+        }
     }
     fn grant_read(&self, object: &ArtifactRef) {
-        self.allow.lock().unwrap().insert(format!("read@{}", object.0));
+        self.allow
+            .lock()
+            .unwrap()
+            .insert(format!("read@{}", object.0));
     }
     fn revoke_read(&self, object: &ArtifactRef) {
-        self.allow.lock().unwrap().remove(&format!("read@{}", object.0));
+        self.allow
+            .lock()
+            .unwrap()
+            .remove(&format!("read@{}", object.0));
     }
 }
 impl IdentityService for MutableId {
@@ -95,7 +114,11 @@ impl IdentityService for MutableId {
         _caveat: Option<&CaveatContext>,
     ) -> IdResult<Decision> {
         let key = format!("{}@{}", permission.0, object.0);
-        Ok(if self.allow.lock().unwrap().contains(&key) { Decision::Allow } else { Decision::Deny })
+        Ok(if self.allow.lock().unwrap().contains(&key) {
+            Decision::Allow
+        } else {
+            Decision::Deny
+        })
     }
     fn list_objects(
         &self,
@@ -106,7 +129,12 @@ impl IdentityService for MutableId {
     ) -> IdResult<ListObjectsResult> {
         Err(AuthzError::NotYetImplemented("n/a"))
     }
-    fn list_subjects(&self, _o: &ObjectId, _p: &Permission, _at: &Consistency) -> IdResult<SubjectTree> {
+    fn list_subjects(
+        &self,
+        _o: &ObjectId,
+        _p: &Permission,
+        _at: &Consistency,
+    ) -> IdResult<SubjectTree> {
         Err(AuthzError::NotYetImplemented("n/a"))
     }
     fn explain(
@@ -118,7 +146,11 @@ impl IdentityService for MutableId {
     ) -> IdResult<RewriteTrace> {
         Err(AuthzError::NotYetImplemented("n/a"))
     }
-    fn delegation(&self, _a: &Principal, _t: &Principal) -> IdResult<myelin_identity::EffectivePolicy> {
+    fn delegation(
+        &self,
+        _a: &Principal,
+        _t: &Principal,
+    ) -> IdResult<myelin_identity::EffectivePolicy> {
         Err(AuthzError::NotYetImplemented("n/a"))
     }
     fn write_tuples(
@@ -158,7 +190,10 @@ fn resolver_with(id: MutableId) -> KnowledgeRefResolver<MutableId> {
     let mut store = PageStore::new();
     store.put_root(
         &confidential_page(),
-        PageMeta { title: SECRET_PAGE_TITLE.into(), state: "published".into() },
+        PageMeta {
+            title: SECRET_PAGE_TITLE.into(),
+            state: "published".into(),
+        },
     );
     KnowledgeRefResolver::new(Projector::new(id, store))
 }
@@ -201,7 +236,10 @@ fn notif_d4_zero_leak_on_real_kn_confidential_page() {
                 if h.text.contains("a restricted page") {
                     tombstone_present += 1;
                 }
-                assert!(h.links.is_empty(), "a denied KN subject yields no click-route link");
+                assert!(
+                    h.links.is_empty(),
+                    "a denied KN subject yields no click-route link"
+                );
             }
         }
     }
@@ -240,8 +278,15 @@ fn notif_d4_permitted_kn_viewer_sees_the_page_title() {
         &strong("zk-1"),
         Channel::Cli,
     );
-    assert!(h.text.contains(SECRET_PAGE_TITLE), "the permitted maintainer sees the page title");
-    assert_eq!(h.links, vec![confidential_page().0], "the allowed branch yields the click-route link");
+    assert!(
+        h.text.contains(SECRET_PAGE_TITLE),
+        "the permitted maintainer sees the page title"
+    );
+    assert_eq!(
+        h.links,
+        vec![confidential_page().0],
+        "the allowed branch yields the click-route link"
+    );
 }
 
 /// **Always-current (the chained-mutation property, EI-01 §4): a permission REVOKE between two renders
@@ -256,7 +301,13 @@ fn notif_d4_revoke_flips_title_to_tombstone_no_rewrite() {
     let subject = confidential_page();
 
     // (1) with access: the title resolves.
-    match resolver.resolve_display(&acme(), &region(), &subject, &viewer("alice"), &strong("zk-1")) {
+    match resolver.resolve_display(
+        &acme(),
+        &region(),
+        &subject,
+        &viewer("alice"),
+        &strong("zk-1"),
+    ) {
         RefResolution::Projection(p) => assert_eq!(p.title, SECRET_PAGE_TITLE),
         RefResolution::Tombstone(_) => panic!("alice has read → must project the title"),
     }
@@ -280,7 +331,16 @@ fn notif_d4_revoke_flips_title_to_tombstone_no_rewrite() {
         &strong("zk-2"),
         Channel::Cli,
     );
-    assert!(h.text.contains("a restricted page"), "after revoke the slot is a tombstone");
-    assert!(!contains_leak(&h.text), "the title never leaks after revoke (0 leak, no re-write)");
-    assert!(h.links.is_empty(), "a revoked subject yields no click-route link");
+    assert!(
+        h.text.contains("a restricted page"),
+        "after revoke the slot is a tombstone"
+    );
+    assert!(
+        !contains_leak(&h.text),
+        "the title never leaks after revoke (0 leak, no re-write)"
+    );
+    assert!(
+        h.links.is_empty(),
+        "a revoked subject yields no click-route link"
+    );
 }

@@ -171,7 +171,10 @@ impl LineRange {
         if start <= end {
             LineRange { start, end }
         } else {
-            LineRange { start: end, end: start }
+            LineRange {
+                start: end,
+                end: start,
+            }
         }
     }
 
@@ -363,13 +366,18 @@ pub fn resolve(
     //    (anchored lines + context window matched as a contiguous run) — a position-independent match
     //    on the BLAKE3 fingerprint, so a block that merely shifted is matched reliably, not guessed.
     let block_len = anchor.range.len() as usize;
-    if let Some(new_start_idx) = find_fingerprint_match(&new_lines, &anchor.anchor_fingerprint, block_len)
+    if let Some(new_start_idx) =
+        find_fingerprint_match(&new_lines, &anchor.anchor_fingerprint, block_len)
     {
         // The fingerprinted block sits at new_start_idx (0-based) — the shifted ANCHORED range is the
         // block_len lines starting there (the context window is matched but not part of the range).
         let start_line = (new_start_idx + 1) as u64;
         let end_line = start_line + block_len as u64 - 1;
-        return base(AnchorState::Moved, Some(LineRange::new(start_line, end_line)), None);
+        return base(
+            AnchorState::Moved,
+            Some(LineRange::new(start_line, end_line)),
+            None,
+        );
     }
 
     // ── Rung 3 / 4: PARTIAL (Outdated) vs GONE. No full-block match — scan which anchored lines still
@@ -550,7 +558,10 @@ mod tests {
     }
 
     fn oid(tag: &str) -> String {
-        format!("blake3:{}", hex::encode(blake3::hash(tag.as_bytes()).as_bytes()))
+        format!(
+            "blake3:{}",
+            hex::encode(blake3::hash(tag.as_bytes()).as_bytes())
+        )
     }
 
     fn pr() -> ArtifactRef {
@@ -560,14 +571,14 @@ mod tests {
     /// A canonical fixture file + an anchor on lines 4..=5 (the body of `fn charge`).
     fn fixture() -> (Vec<u8>, LineAnchor) {
         let old = blob(&[
-            "use crate::ledger;",        // 1
-            "",                          // 2
-            "fn charge(amount: u64) {",  // 3
-            "    let fee = amount / 10;",// 4
-            "    ledger::debit(fee);",   // 5
-            "}",                         // 6
-            "",                          // 7
-            "fn refund() {}",            // 8
+            "use crate::ledger;",         // 1
+            "",                           // 2
+            "fn charge(amount: u64) {",   // 3
+            "    let fee = amount / 10;", // 4
+            "    ledger::debit(fee);",    // 5
+            "}",                          // 6
+            "",                           // 7
+            "fn refund() {}",             // 8
         ]);
         let anchor = LineAnchor::mint(
             &old,
@@ -591,7 +602,10 @@ mod tests {
         let r = resolve(&anchor, &old, &anchor.anchor_blob_oid, &pr());
         assert_eq!(r.state, AnchorState::Live);
         assert_eq!(r.resolved_range, Some(LineRange::new(4, 5)));
-        assert!(r.original_context().is_none(), "a Live anchor has no 'original context' elsewhere");
+        assert!(
+            r.original_context().is_none(),
+            "a Live anchor has no 'original context' elsewhere"
+        );
         assert_eq!(r.state_token(), "live");
     }
 
@@ -615,23 +629,29 @@ mod tests {
         let (_, anchor) = fixture();
         // prepend 3 lines → the `fn charge` body (lines 4-5) shifts to lines 7-8.
         let new = blob(&[
-            "// new top-of-file license header",  // 1
-            "// SPDX: MIT",                        // 2
-            "",                                    // 3
-            "use crate::ledger;",                  // 4
-            "",                                    // 5
-            "fn charge(amount: u64) {",            // 6
-            "    let fee = amount / 10;",          // 7  <- anchored
-            "    ledger::debit(fee);",             // 8  <- anchored
-            "}",                                   // 9
-            "",                                    // 10
-            "fn refund() {}",                      // 11
+            "// new top-of-file license header", // 1
+            "// SPDX: MIT",                      // 2
+            "",                                  // 3
+            "use crate::ledger;",                // 4
+            "",                                  // 5
+            "fn charge(amount: u64) {",          // 6
+            "    let fee = amount / 10;",        // 7  <- anchored
+            "    ledger::debit(fee);",           // 8  <- anchored
+            "}",                                 // 9
+            "",                                  // 10
+            "fn refund() {}",                    // 11
         ]);
         let r = resolve(&anchor, &new, &oid("new-blob"), &pr());
-        assert_eq!(r.state, AnchorState::Moved, "a shifted intact block must be MOVED, not outdated");
+        assert_eq!(
+            r.state,
+            AnchorState::Moved,
+            "a shifted intact block must be MOVED, not outdated"
+        );
         assert_eq!(r.resolved_range, Some(LineRange::new(7, 8)));
         // never silently wrong: the moved anchor offers "view in original context" at the OLD range.
-        let ctx = r.original_context().expect("a Moved anchor offers original context");
+        let ctx = r
+            .original_context()
+            .expect("a Moved anchor offers original context");
         assert_eq!(ctx.range, LineRange::new(4, 5));
         assert_eq!(ctx.state, AnchorState::Moved);
         assert_eq!(ctx.blob_oid, anchor.anchor_blob_oid);
@@ -658,10 +678,16 @@ mod tests {
             "}",                           // 7
         ]);
         let r = resolve(&anchor, &new, &oid("new-blob"), &pr());
-        assert_eq!(r.state, AnchorState::Outdated, "partial survival is OUTDATED");
+        assert_eq!(
+            r.state,
+            AnchorState::Outdated,
+            "partial survival is OUTDATED"
+        );
         // the surviving sub-range spans only the surviving anchored line (`ledger::debit(fee);` at 5).
         assert_eq!(r.resolved_range, Some(LineRange::new(5, 5)));
-        let ctx = r.original_context().expect("an Outdated anchor offers original context");
+        let ctx = r
+            .original_context()
+            .expect("an Outdated anchor offers original context");
         assert_eq!(ctx.range, LineRange::new(4, 5));
         assert_eq!(r.state_token(), "outdated");
     }
@@ -681,9 +707,14 @@ mod tests {
         let r = resolve(&anchor, &new, &oid("new-blob"), &pr());
         assert_eq!(r.state, AnchorState::Gone);
         assert_eq!(r.resolved_range, None);
-        assert!(r.tombstone.is_some(), "a Gone anchor carries a content_gone tombstone");
+        assert!(
+            r.tombstone.is_some(),
+            "a Gone anchor carries a content_gone tombstone"
+        );
         // never silently wrong: even a gone anchor remembers where it was written.
-        let ctx = r.original_context().expect("a Gone anchor still offers original context");
+        let ctx = r
+            .original_context()
+            .expect("a Gone anchor still offers original context");
         assert_eq!(ctx.range, LineRange::new(4, 5));
         assert_eq!(ctx.commit_oid, anchor.anchored_commit_oid);
         assert_eq!(r.state_token(), "gone");
@@ -728,8 +759,8 @@ mod tests {
             .map(String::from)
             .collect();
         let fp = fingerprint_block(&lines, 3, 4); // block = TARGET1,TARGET2 (idx 3,4)
-        // the SAME block WITH its full context window shifted down by 4 (the context travels with it —
-        // a real rebase moves the surrounding lines too).
+                                                  // the SAME block WITH its full context window shifted down by 4 (the context travels with it —
+                                                  // a real rebase moves the surrounding lines too).
         let shifted: Vec<String> = vec![
             "x1", "x2", "x3", "x4", "h1", "h2", "h3", "TARGET1", "TARGET2", "t1", "t2", "t3",
         ]
@@ -748,9 +779,15 @@ mod tests {
     #[test]
     fn surviving_subrange_spans_first_to_last_survivor() {
         let anchored = vec!["A".to_string(), "B".to_string(), "C".to_string()];
-        let new: Vec<String> = vec!["x", "A", "y", "C", "z"].into_iter().map(String::from).collect();
+        let new: Vec<String> = vec!["x", "A", "y", "C", "z"]
+            .into_iter()
+            .map(String::from)
+            .collect();
         // A at idx1 (line2), C at idx3 (line4) survive; B gone → span 2..=4.
-        assert_eq!(surviving_subrange(&anchored, &new), Some(LineRange::new(2, 4)));
+        assert_eq!(
+            surviving_subrange(&anchored, &new),
+            Some(LineRange::new(2, 4))
+        );
         // nothing survives → None.
         let gone: Vec<String> = vec!["x", "y", "z"].into_iter().map(String::from).collect();
         assert_eq!(surviving_subrange(&anchored, &gone), None);
@@ -777,7 +814,15 @@ mod tests {
     #[test]
     fn out_of_bounds_mint_is_rejected() {
         let b = blob(&["one", "two"]);
-        assert!(LineAnchor::mint(&b, "f.rs", DiffSide::New, LineRange::new(5, 6), oid("o"), oid("c")).is_none());
+        assert!(LineAnchor::mint(
+            &b,
+            "f.rs",
+            DiffSide::New,
+            LineRange::new(5, 6),
+            oid("o"),
+            oid("c")
+        )
+        .is_none());
     }
 
     // ════════ boundary / guard pins (the mandatory-core mutation floor — kills the edge mutants) ════════
@@ -788,7 +833,10 @@ mod tests {
     #[test]
     fn range_to_indices_is_loud_at_every_boundary() {
         // valid interior: 1-based (2,4) over a 5-line file → 0-based (1,3).
-        assert_eq!(range_to_indices(LineRange { start: 2, end: 4 }, 5), Some((1, 3)));
+        assert_eq!(
+            range_to_indices(LineRange { start: 2, end: 4 }, 5),
+            Some((1, 3))
+        );
         // a 0 start (would be index -1) → None. (kills `||`→`&&`: with `&&`, start=0,end=2 would pass)
         assert_eq!(range_to_indices(LineRange { start: 0, end: 2 }, 5), None);
         // a 0 end → None.
@@ -796,9 +844,15 @@ mod tests {
         // end past the file (line 6 of a 5-line file) → None. (kills the `>=` bound)
         assert_eq!(range_to_indices(LineRange { start: 5, end: 6 }, 5), None);
         // the last line exactly is in-bounds.
-        assert_eq!(range_to_indices(LineRange { start: 5, end: 5 }, 5), Some((4, 4)));
+        assert_eq!(
+            range_to_indices(LineRange { start: 5, end: 5 }, 5),
+            Some((4, 4))
+        );
         // a single-line file, line 1 → (0,0).
-        assert_eq!(range_to_indices(LineRange { start: 1, end: 1 }, 1), Some((0, 0)));
+        assert_eq!(
+            range_to_indices(LineRange { start: 1, end: 1 }, 1),
+            Some((0, 0))
+        );
     }
 
     /// `find_fingerprint_match` rejects an over-long block (block_len > file) and a zero block, and
@@ -828,14 +882,27 @@ mod tests {
     /// report line 2, the last at idx 3 must report line 4.
     #[test]
     fn surviving_subrange_reports_exact_one_based_positions() {
-        let anchored = vec!["keepA".to_string(), "dropB".to_string(), "keepC".to_string()];
-        let new: Vec<String> = vec!["x", "keepA", "y", "keepC"].into_iter().map(String::from).collect();
+        let anchored = vec![
+            "keepA".to_string(),
+            "dropB".to_string(),
+            "keepC".to_string(),
+        ];
+        let new: Vec<String> = vec!["x", "keepA", "y", "keepC"]
+            .into_iter()
+            .map(String::from)
+            .collect();
         // keepA at idx1 → line 2; keepC at idx3 → line 4.
-        assert_eq!(surviving_subrange(&anchored, &new), Some(LineRange { start: 2, end: 4 }));
+        assert_eq!(
+            surviving_subrange(&anchored, &new),
+            Some(LineRange { start: 2, end: 4 })
+        );
         // a single survivor at idx 0 → line 1..=1 (the `+1` is exact, not `+0`/`*1`-ambiguous).
         let one = vec!["solo".to_string()];
         let newone: Vec<String> = vec!["solo", "z"].into_iter().map(String::from).collect();
-        assert_eq!(surviving_subrange(&one, &newone), Some(LineRange { start: 1, end: 1 }));
+        assert_eq!(
+            surviving_subrange(&one, &newone),
+            Some(LineRange { start: 1, end: 1 })
+        );
     }
 
     /// `is_survival_evidence` distinguishes substantive lines from blank + structural-only lines — the

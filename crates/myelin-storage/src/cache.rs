@@ -45,8 +45,13 @@ pub trait Cache: Send + Sync {
     fn get(&self, tenant: &TenantId, key: &str) -> Result<Option<Vec<u8>>, CacheError>;
 
     /// Cache `value` under `key` in `tenant`'s namespace for `ttl`. Overwrites any prior value.
-    fn set(&self, tenant: &TenantId, key: &str, value: &[u8], ttl: Duration)
-        -> Result<(), CacheError>;
+    fn set(
+        &self,
+        tenant: &TenantId,
+        key: &str,
+        value: &[u8],
+        ttl: Duration,
+    ) -> Result<(), CacheError>;
 
     /// Invalidate `key` in `tenant`'s namespace (a no-op if absent).
     fn delete(&self, tenant: &TenantId, key: &str) -> Result<(), CacheError>;
@@ -111,10 +116,7 @@ impl Cache for InMemoryCache {
 
     fn delete(&self, tenant: &TenantId, key: &str) -> Result<(), CacheError> {
         let k = Self::ns_key(tenant, key);
-        self.inner
-            .lock()
-            .expect("cache mutex poisoned")
-            .remove(&k);
+        self.inner.lock().expect("cache mutex poisoned").remove(&k);
         Ok(())
     }
 }
@@ -130,7 +132,8 @@ mod tests {
     #[test]
     fn set_then_get_hits() {
         let c = InMemoryCache::new();
-        c.set(&tenant("t1"), "k", b"v", Duration::from_secs(60)).unwrap();
+        c.set(&tenant("t1"), "k", b"v", Duration::from_secs(60))
+            .unwrap();
         assert_eq!(c.get(&tenant("t1"), "k").unwrap(), Some(b"v".to_vec()));
     }
 
@@ -143,7 +146,8 @@ mod tests {
     #[test]
     fn tenants_are_isolated() {
         let c = InMemoryCache::new();
-        c.set(&tenant("t1"), "k", b"a", Duration::from_secs(60)).unwrap();
+        c.set(&tenant("t1"), "k", b"a", Duration::from_secs(60))
+            .unwrap();
         // A DIFFERENT tenant must not read t1's value.
         assert_eq!(c.get(&tenant("t2"), "k").unwrap(), None);
     }
@@ -151,7 +155,8 @@ mod tests {
     #[test]
     fn expired_entry_is_a_miss() {
         let c = InMemoryCache::new();
-        c.set(&tenant("t1"), "k", b"v", Duration::from_millis(0)).unwrap();
+        c.set(&tenant("t1"), "k", b"v", Duration::from_millis(0))
+            .unwrap();
         // TTL of 0 means the deadline is already past on the next get.
         assert_eq!(c.get(&tenant("t1"), "k").unwrap(), None);
     }
@@ -159,7 +164,8 @@ mod tests {
     #[test]
     fn delete_invalidates() {
         let c = InMemoryCache::new();
-        c.set(&tenant("t1"), "k", b"v", Duration::from_secs(60)).unwrap();
+        c.set(&tenant("t1"), "k", b"v", Duration::from_secs(60))
+            .unwrap();
         c.delete(&tenant("t1"), "k").unwrap();
         assert_eq!(c.get(&tenant("t1"), "k").unwrap(), None);
     }

@@ -102,25 +102,43 @@ fn provider_wfctx_journals_and_emits_through_the_one_outbox_path() {
         Ok(vec![ArtifactRef("myelin://acme/agent/effect/e1".into())])
     })
     .expect("the activity runs");
-    let emitted = ctx.emit(step_draft(), None).expect("emit through the outbox");
+    let emitted = ctx
+        .emit(step_draft(), None)
+        .expect("emit through the outbox");
     ctx.commit().expect("the journal + outbox co-commit");
 
     // PROVIDER promise #1: exactly one journal row under the deterministic command_id (§3.2).
     let hist = journal.history_for(&tenant(), "R1");
     assert_eq!(hist.len(), 1, "one history row journaled");
-    assert_eq!(hist[0].command_id, "agent.run:0", "deterministic command_id from position");
+    assert_eq!(
+        hist[0].command_id, "agent.run:0",
+        "deterministic command_id from position"
+    );
     assert_eq!(hist[0].kind, history_kind::ACTIVITY_COMPLETED);
 
     // PROVIDER promise #2: the emit went through the ONE outbox path with the frozen envelope shape.
-    let row = outbox.row(&emitted).expect("the emitted event is a committed outbox row");
-    assert_eq!(row.envelope.type_, EventType("agent.run.step".into()), "the caller's type carries");
+    let row = outbox
+        .row(&emitted)
+        .expect("the emitted event is a committed outbox row");
+    assert_eq!(
+        row.envelope.type_,
+        EventType("agent.run.step".into()),
+        "the caller's type carries"
+    );
     assert_eq!(
         row.subject,
         EvArtifactRef("myelin://acme/agent/run/R1".into()),
         "the caller's subject carries (hoisted for the broker subject)"
     );
-    assert_eq!(row.aggregate, AggregateKey("run:R1".into()), "the per-aggregate ordering key carries");
-    assert_eq!(row.seq, 0, "first event for the aggregate is seq 0 (per-aggregate order)");
+    assert_eq!(
+        row.aggregate,
+        AggregateKey("run:R1".into()),
+        "the per-aggregate ordering key carries"
+    );
+    assert_eq!(
+        row.seq, 0,
+        "first event for the aggregate is seq 0 (per-aggregate order)"
+    );
 }
 
 /// **CONSUMER side of 9.2 (a sibling subsystem receives the emitted event).** A consumer fixture
@@ -144,7 +162,11 @@ fn consumer_receives_the_emitted_event_with_carriage_and_causality() {
 
     // carriage the provider authored.
     assert_eq!(envelope.type_, EventType("agent.run.step".into()));
-    assert_eq!(envelope.tenant, tenant(), "the (tenant, region) partition key carries");
+    assert_eq!(
+        envelope.tenant,
+        tenant(),
+        "the (tenant, region) partition key carries"
+    );
     assert_eq!(envelope.region, Region("fr-par".into()));
     // causality derived correct-by-construction (a ROOT emit): carries its own correlation, depth 0.
     assert_eq!(envelope.depth, 0, "a root emit is depth 0 (BUS-5)");
@@ -176,12 +198,18 @@ fn caused_emit_inherits_provenance_from_the_parent() {
     let mut ctx2 = begin_with(&outbox, WfJournal::new(), minter);
     let mut child_draft = step_draft();
     child_draft.type_ = EventType("agent.run.step.child".into());
-    let child_id = ctx2.emit(child_draft, Some(&root_env)).expect("caused emit");
+    let child_id = ctx2
+        .emit(child_draft, Some(&root_env))
+        .expect("caused emit");
     ctx2.commit().expect("co-commit the child");
     let child_env = outbox.row(&child_id).expect("child row").envelope;
 
     assert_eq!(child_env.depth, 1, "caused event is depth parent+1");
-    assert_eq!(child_env.causation_id, Some(root_id), "the immediate parent is the causation");
+    assert_eq!(
+        child_env.causation_id,
+        Some(root_id),
+        "the immediate parent is the causation"
+    );
     assert_eq!(
         child_env.correlation_id, root_env.correlation_id,
         "the ROOT correlation carries through the chain unchanged"

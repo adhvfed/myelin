@@ -375,9 +375,7 @@ pub enum WakeOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        Actor, CorrelationId, DataRole as DR, EventId, Timestamp, Visibility as Vis,
-    };
+    use crate::{Actor, CorrelationId, DataRole as DR, EventId, Timestamp, Visibility as Vis};
     use myelin_identity::{Principal, PrincipalId, PrincipalKind};
     use myelin_tenancy::{Region, TenantId};
 
@@ -435,8 +433,7 @@ mod tests {
         );
         assert_eq!(draft.type_.0, "ci.check.updated");
         assert_eq!(
-            draft.subject.0,
-            "myelin://acme/git/repo/core#commit-abc123/check-build",
+            draft.subject.0, "myelin://acme/git/repo/core#commit-abc123/check-build",
             "subject = repo#commit-<oid>/check-<context> (§4.12)"
         );
         assert_eq!(
@@ -455,8 +452,14 @@ mod tests {
         let a_build = check_aggregate("repo:core", "deadbeef");
         let a_test = check_aggregate("repo:core", "deadbeef");
         let a_other_commit = check_aggregate("repo:core", "cafef00d");
-        assert_eq!(a_build, a_test, "build + test of one commit → one aggregate");
-        assert_ne!(a_build, a_other_commit, "a different commit → a different aggregate");
+        assert_eq!(
+            a_build, a_test,
+            "build + test of one commit → one aggregate"
+        );
+        assert_ne!(
+            a_build, a_other_commit,
+            "a different commit → a different aggregate"
+        );
     }
 
     /// **D-11 core: interleaved + LATE arrivals stay per-aggregate ordered.** Emit
@@ -483,7 +486,11 @@ mod tests {
 
         // The CONSUMED order is the per-aggregate seq order (1,2,3,4) — NOT the arrival order.
         let seqs: Vec<u64> = order.in_order().iter().map(|c| c.seq).collect();
-        assert_eq!(seqs, vec![1, 2, 3, 4], "consumed in per-aggregate seq order, not arrival order");
+        assert_eq!(
+            seqs,
+            vec![1, 2, 3, 4],
+            "consumed in per-aggregate seq order, not arrival order"
+        );
         assert_eq!(order.ordering_gap(), 0, "contiguous: no gap, fully ordered");
 
         // Because the order is preserved, Git's monotonic run_attempt supersession is well-defined:
@@ -496,7 +503,11 @@ mod tests {
             .filter(|c| c.subject.0.ends_with("check-build"))
             .map(|c| c.check_status["run_attempt"].as_u64().unwrap())
             .collect();
-        assert_eq!(build_attempts, vec![1, 2], "build attempts appear in monotonic order");
+        assert_eq!(
+            build_attempts,
+            vec![1, 2],
+            "build attempts appear in monotonic order"
+        );
     }
 
     /// **D-11: a stale lower-attempt re-delivery is DROPPABLE — the aggregate order is preserved.**
@@ -514,10 +525,17 @@ mod tests {
 
         // The at-least-once transport RE-DELIVERS the stale lower attempt (seq 1) AFTER the higher
         // one. The ordering layer absorbs it (no-op) — the consumed order is unchanged.
-        assert!(!order.ingest(&build1, 1).unwrap(), "the stale re-delivery is a duplicate, absorbed");
+        assert!(
+            !order.ingest(&build1, 1).unwrap(),
+            "the stale re-delivery is a duplicate, absorbed"
+        );
 
         let seqs: Vec<u64> = order.in_order().iter().map(|c| c.seq).collect();
-        assert_eq!(seqs, vec![1, 2], "order preserved across the stale re-delivery (droppable)");
+        assert_eq!(
+            seqs,
+            vec![1, 2],
+            "order preserved across the stale re-delivery (droppable)"
+        );
         assert_eq!(order.ordering_gap(), 0);
     }
 
@@ -529,12 +547,25 @@ mod tests {
     fn ordering_gap_counts_in_flight_seqs() {
         let mut order = CheckSeamOrder::new("repo:core", "deadbeef");
         // seqs 1 and 3 delivered; 2 is still in flight.
-        order.ingest(&check_env("repo:core", "deadbeef", "build", 1, "success"), 1).unwrap();
-        order.ingest(&check_env("repo:core", "deadbeef", "lint", 1, "success"), 3).unwrap();
+        order
+            .ingest(
+                &check_env("repo:core", "deadbeef", "build", 1, "success"),
+                1,
+            )
+            .unwrap();
+        order
+            .ingest(&check_env("repo:core", "deadbeef", "lint", 1, "success"), 3)
+            .unwrap();
         assert_eq!(order.ordering_gap(), 1, "seq 2 in flight → gap of 1");
         // the in-flight op arrives — the gap closes (0 lost).
-        order.ingest(&check_env("repo:core", "deadbeef", "test", 1, "success"), 2).unwrap();
-        assert_eq!(order.ordering_gap(), 0, "every op delivered → contiguous, 0 gap");
+        order
+            .ingest(&check_env("repo:core", "deadbeef", "test", 1, "success"), 2)
+            .unwrap();
+        assert_eq!(
+            order.ordering_gap(),
+            0,
+            "every op delivered → contiguous, 0 gap"
+        );
         assert_eq!(order.observed_seqs(), vec![1, 2, 3]);
     }
 
@@ -567,7 +598,11 @@ mod tests {
         let idem = "merge-attempt-42";
 
         // The merge-queue workflow parks: wait_for_signal("ci.result", idem_key) — pending.
-        assert_eq!(sub.wait_for_signal(idem), None, "no signal yet → genuinely pending");
+        assert_eq!(
+            sub.wait_for_signal(idem),
+            None,
+            "no signal yet → genuinely pending"
+        );
         assert!(!sub.is_resolved(idem));
 
         let result = CiResult {
@@ -578,13 +613,25 @@ mod tests {
         };
 
         // CI delivers the rollup — the waiter WOKE.
-        assert_eq!(sub.deliver(result.clone()), WakeOutcome::Woke, "first delivery wakes");
+        assert_eq!(
+            sub.deliver(result.clone()),
+            WakeOutcome::Woke,
+            "first delivery wakes"
+        );
         // The at-least-once transport DOUBLY delivers the SAME rollup — absorbed, NOT a second wake.
-        assert_eq!(sub.deliver(result.clone()), WakeOutcome::Duplicate, "re-delivery is one wake");
+        assert_eq!(
+            sub.deliver(result.clone()),
+            WakeOutcome::Duplicate,
+            "re-delivery is one wake"
+        );
         // And a THIRD redelivery is still absorbed.
         assert_eq!(sub.deliver(result.clone()), WakeOutcome::Duplicate);
 
-        assert_eq!(sub.wake_count(idem), 1, "EXACTLY ONE wake on a doubly-delivered ci.result");
+        assert_eq!(
+            sub.wake_count(idem),
+            1,
+            "EXACTLY ONE wake on a doubly-delivered ci.result"
+        );
         assert!(sub.is_resolved(idem));
         // A subsequent park returns the delivered result (the workflow re-leases + reads it).
         assert_eq!(sub.wait_for_signal(idem), Some(result));
@@ -611,7 +658,11 @@ mod tests {
         assert_eq!(sub.deliver(r2), WakeOutcome::Woke);
         assert_eq!(sub.wake_count("attempt-1"), 1);
         assert_eq!(sub.wake_count("attempt-2"), 1);
-        assert_eq!(sub.wake_count("attempt-3"), 0, "an unparked key has no wake");
+        assert_eq!(
+            sub.wake_count("attempt-3"),
+            0,
+            "an unparked key has no wake"
+        );
     }
 
     /// The substrate's signal name is the NAMED `ci.result` token (the workflow waits on this).
@@ -632,7 +683,10 @@ mod tests {
         };
         let v = serde_json::to_value(&result).unwrap();
         assert_eq!(v["commit_oid"], "deadbeef");
-        assert_eq!(v["overall"], "success", "overall is snake_case success|failure");
+        assert_eq!(
+            v["overall"], "success",
+            "overall is snake_case success|failure"
+        );
         assert_eq!(v["contexts"], serde_json::json!(["build", "test"]));
         assert_eq!(v["idem_token"], "merge-7");
         // Round-trip.

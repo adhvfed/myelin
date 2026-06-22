@@ -73,7 +73,9 @@ fn ten_activity_body(executed: Arc<Mutex<Vec<usize>>>) -> Box<WorkflowBody> {
             let ex = executed.clone();
             ctx.activity(RetryPolicy::default_policy(), move |_idem, _attempt| {
                 ex.lock().unwrap().push(k);
-                Ok(vec![ArtifactRef(format!("myelin://acme/agent/effect/e{k}"))])
+                Ok(vec![ArtifactRef(format!(
+                    "myelin://acme/agent/effect/e{k}"
+                ))])
             })
             .map_err(|e| format!("{e:?}"))?;
         }
@@ -107,11 +109,14 @@ fn crash_after_journaling(
         let ex2 = ex.clone();
         ctx.activity(RetryPolicy::default_policy(), move |_idem, _attempt| {
             ex2.lock().unwrap().push(k);
-            Ok(vec![ArtifactRef(format!("myelin://acme/agent/effect/e{k}"))])
+            Ok(vec![ArtifactRef(format!(
+                "myelin://acme/agent/effect/e{k}"
+            ))])
         })
         .expect("the activity runs");
     }
-    ctx.commit().expect("the first steps co-commit (durable before the crash)");
+    ctx.commit()
+        .expect("the first steps co-commit (durable before the crash)");
     // the worker bumped the cursor as it journaled, then DIED before settling the terminal state.
     let mut r = runs.get(&tenant(), "R1").expect("run");
     r.cursor = up_to as i64;
@@ -135,25 +140,53 @@ fn drill_flow_d1_replay_resume_at_6_zero_double_effect() {
     let outbox = OutboxStore::new();
     let journal = WfJournal::new();
     let tele = FlowTelemetry::new();
-    runs.put(RunRow::new_runnable(tenant(), region(), "R1", "agent.run", 0));
+    runs.put(RunRow::new_runnable(
+        tenant(),
+        region(),
+        "R1",
+        "agent.run",
+        0,
+    ));
 
     // (1) INJECT the fault: the worker crashes at activity 5 of 10. The first 5 steps co-commit
     //     (durable), then the worker dies — the run is left runnable from cursor 5.
     breaker.break_dependency(Dependency::Broker, scope.clone());
-    assert!(breaker.is_broken(&Dependency::Broker, &scope), "the worker-crash fault is injected");
+    assert!(
+        breaker.is_broken(&Dependency::Broker, &scope),
+        "the worker-crash fault is injected"
+    );
     let ran_before_crash = crash_after_journaling(&outbox, &journal, &runs, 5);
-    assert_eq!(ran_before_crash, vec![0, 1, 2, 3, 4], "the crashed worker ran activities 0..=4");
-    assert_eq!(journal.history_for(&tenant(), "R1").len(), 5, "5 journaled at the crash point");
-    assert_eq!(runs.get(&tenant(), "R1").unwrap().state, run_state::RUNNING, "the run survives runnable");
+    assert_eq!(
+        ran_before_crash,
+        vec![0, 1, 2, 3, 4],
+        "the crashed worker ran activities 0..=4"
+    );
+    assert_eq!(
+        journal.history_for(&tenant(), "R1").len(),
+        5,
+        "5 journaled at the crash point"
+    );
+    assert_eq!(
+        runs.get(&tenant(), "R1").unwrap().state,
+        run_state::RUNNING,
+        "the run survives runnable"
+    );
 
     // (2) RESTORE: another worker re-leases the run (the dead worker's lease lapsed) and re-drives.
     breaker.restore_dependency(Dependency::Broker, scope.clone());
-    assert!(!breaker.is_broken(&Dependency::Broker, &scope), "the fault is restored");
+    assert!(
+        !breaker.is_broken(&Dependency::Broker, &scope),
+        "the fault is restored"
+    );
     let leased = runs
         .lease_runnable(0, "worker-2", 1000, 30)
         .expect("worker-2 re-leases the runnable run");
     assert_eq!(leased.cursor, 5, "the re-leased run resumes from cursor 5");
-    assert_eq!(leased.lease_owner.as_deref(), Some("worker-2"), "a fresh worker holds the lease");
+    assert_eq!(
+        leased.lease_owner.as_deref(),
+        Some("worker-2"),
+        "a fresh worker holds the lease"
+    );
 
     let executed = Arc::new(Mutex::new(Vec::new()));
     let body = ten_activity_body(executed.clone());
@@ -178,9 +211,20 @@ fn drill_flow_d1_replay_resume_at_6_zero_double_effect() {
         vec![5, 6, 7, 8, 9],
         "resumed at step 6 — only activities 5..=9 ran; 0..=4 replayed (0 re-execution)"
     );
-    assert!(matches!(outcome, DriveOutcome::Completed(_)), "the run completed after recovery");
-    assert_eq!(journal.history_for(&tenant(), "R1").len(), 10, "10 journaled, 0 lost progress");
-    assert_eq!(runs.get(&tenant(), "R1").unwrap().state, run_state::COMPLETED, "settled completed");
+    assert!(
+        matches!(outcome, DriveOutcome::Completed(_)),
+        "the run completed after recovery"
+    );
+    assert_eq!(
+        journal.history_for(&tenant(), "R1").len(),
+        10,
+        "10 journaled, 0 lost progress"
+    );
+    assert_eq!(
+        runs.get(&tenant(), "R1").unwrap().state,
+        run_state::COMPLETED,
+        "settled completed"
+    );
 
     // The 0-double-effect counter on the metrics port — the FLOW-D1 green artifact (exactly-once).
     let mut signals = SignalSource::new();
@@ -188,11 +232,23 @@ fn drill_flow_d1_replay_resume_at_6_zero_double_effect() {
     signals
         .assert_signal(SignalName::OutboxDepth, Predicate::Eq(0))
         .expect_green();
-    assert_eq!(tele.double_effect_count(), 0, "0 re-executed side effects (exactly-once-in-effect)");
+    assert_eq!(
+        tele.double_effect_count(),
+        0,
+        "0 re-executed side effects (exactly-once-in-effect)"
+    );
 
     // The replay-rate signal is emitted: drive 2 replayed 5 commands, executed 5 → 5000 bps.
-    assert_eq!(tele.commands_replayed(), 5, "the 5 journaled commands replayed (short-circuited)");
-    assert_eq!(tele.replay_rate_bps(), 5000, "the replay-rate signal is emitted (the green artifact)");
+    assert_eq!(
+        tele.commands_replayed(),
+        5,
+        "the 5 journaled commands replayed (short-circuited)"
+    );
+    assert_eq!(
+        tele.replay_rate_bps(),
+        5000,
+        "the replay-rate signal is emitted (the green artifact)"
+    );
 
     // teardown: no leaked break.
     assert_eq!(breaker.broken_count(), 0, "no leaked dependency break");
@@ -211,14 +267,28 @@ fn drill_flow_d1_full_replay_re_executes_zero() {
     let outbox = OutboxStore::new();
     let journal = WfJournal::new();
     let tele = FlowTelemetry::new();
-    runs.put(RunRow::new_runnable(tenant(), region(), "R1", "agent.run", 0));
+    runs.put(RunRow::new_runnable(
+        tenant(),
+        region(),
+        "R1",
+        "agent.run",
+        0,
+    ));
 
     // drive 1: complete the run (10 journaled commands).
     let body = ten_activity_body(Arc::new(Mutex::new(Vec::new())));
     let run = runs.get(&tenant(), "R1").unwrap();
     drive(
-        &runs, &outbox, &journal, &tele, minter(), ctx_base(), &run,
-        "2026-06-21T00:00:00Z", 7, body.as_ref(),
+        &runs,
+        &outbox,
+        &journal,
+        &tele,
+        minter(),
+        ctx_base(),
+        &run,
+        "2026-06-21T00:00:00Z",
+        7,
+        body.as_ref(),
     );
     assert_eq!(journal.history_for(&tenant(), "R1").len(), 10);
 
@@ -227,12 +297,32 @@ fn drill_flow_d1_full_replay_re_executes_zero() {
     let body2 = ten_activity_body(executed.clone());
     let again = runs.get(&tenant(), "R1").unwrap();
     drive(
-        &runs, &outbox, &journal, &tele, minter(), ctx_base(), &again,
-        "2026-06-21T00:00:00Z", 7, body2.as_ref(),
+        &runs,
+        &outbox,
+        &journal,
+        &tele,
+        minter(),
+        ctx_base(),
+        &again,
+        "2026-06-21T00:00:00Z",
+        7,
+        body2.as_ref(),
     );
-    assert_eq!(executed.lock().unwrap().len(), 0, "a full replay re-executes 0 side effects");
-    assert_eq!(tele.double_effect_count(), 0, "0 double-effect under redelivery (exactly-once)");
-    assert_eq!(journal.history_for(&tenant(), "R1").len(), 10, "no duplicate journal rows");
+    assert_eq!(
+        executed.lock().unwrap().len(),
+        0,
+        "a full replay re-executes 0 side effects"
+    );
+    assert_eq!(
+        tele.double_effect_count(),
+        0,
+        "0 double-effect under redelivery (exactly-once)"
+    );
+    assert_eq!(
+        journal.history_for(&tenant(), "R1").len(),
+        10,
+        "no duplicate journal rows"
+    );
     println!("[2026-06-21] PASS  drill=FLOW-D1  full_replay  re_executed=0 double_effect=0");
 }
 
@@ -249,28 +339,58 @@ fn flow_d1_registers_into_the_permanent_drill_suite() {
         let outbox = OutboxStore::new();
         let journal = WfJournal::new();
         let tele = FlowTelemetry::new();
-        runs.put(RunRow::new_runnable(tenant(), region(), "R1", "agent.run", 0));
+        runs.put(RunRow::new_runnable(
+            tenant(),
+            region(),
+            "R1",
+            "agent.run",
+            0,
+        ));
 
         // inject the worker-crash fault, journal 5 steps, restore, re-lease, replay.
-        ctx.breaker.break_dependency(Dependency::Broker, scope.clone());
+        ctx.breaker
+            .break_dependency(Dependency::Broker, scope.clone());
         crash_after_journaling(&outbox, &journal, &runs, 5);
         ctx.breaker.restore_dependency(Dependency::Broker, scope);
-        let leased = runs.lease_runnable(0, "worker-2", 1000, 30).expect("re-lease");
+        let leased = runs
+            .lease_runnable(0, "worker-2", 1000, 30)
+            .expect("re-lease");
         let executed = Arc::new(Mutex::new(Vec::new()));
         let body = ten_activity_body(executed.clone());
         drive(
-            &runs, &outbox, &journal, &tele, minter(), ctx_base(), &leased,
-            "2026-06-21T00:00:00Z", 7, body.as_ref(),
+            &runs,
+            &outbox,
+            &journal,
+            &tele,
+            minter(),
+            ctx_base(),
+            &leased,
+            "2026-06-21T00:00:00Z",
+            7,
+            body.as_ref(),
         );
-        assert_eq!(executed.lock().unwrap().clone(), vec![5, 6, 7, 8, 9], "resumed at 6");
+        assert_eq!(
+            executed.lock().unwrap().clone(),
+            vec![5, 6, 7, 8, 9],
+            "resumed at 6"
+        );
 
         // the 0-double-effect counter is the asserted survival signal.
-        ctx.signals.set_scalar(SignalName::OutboxDepth, tele.double_effect_count() as i64);
-        ctx.signals.assert_signal(SignalName::OutboxDepth, Predicate::Eq(0))
+        ctx.signals
+            .set_scalar(SignalName::OutboxDepth, tele.double_effect_count() as i64);
+        ctx.signals
+            .assert_signal(SignalName::OutboxDepth, Predicate::Eq(0))
     }));
 
     let results = registry.run_all();
-    assert!(results[0].is_pass(), "FLOW-D1 drill must read green: {:?}", results[0]);
-    assert!(registry.all_green(), "the permanent suite re-runs FLOW-D1 green forever");
+    assert!(
+        results[0].is_pass(),
+        "FLOW-D1 drill must read green: {:?}",
+        results[0]
+    );
+    assert!(
+        registry.all_green(),
+        "the permanent suite re-runs FLOW-D1 green forever"
+    );
     println!("{}", results[0].artifact_row("2026-06-21"));
 }

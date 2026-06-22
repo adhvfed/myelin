@@ -35,12 +35,12 @@
 //! 4. **erasure stays erased (X-7):** an erased page/row is not re-snapshotted, so a rebuild never
 //!    resurrects shredded derived state.
 
-use myelin_knowledge::replay::KnowledgeReindexSource;
 use myelin_events::{
     reindex, Actor, CorrelationId, DerivedStore, EmitContextBase, EventEnvelope, OutboxStore,
     Region, ReindexSource, SnapshotDraft, SnapshotScope, TenantId, Timestamp,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
+use myelin_knowledge::replay::KnowledgeReindexSource;
 
 fn ctx_base() -> EmitContextBase {
     EmitContextBase {
@@ -93,14 +93,38 @@ fn drill_source() -> KnowledgeReindexSource {
         "runbook",
         6,
         &[
-            ("b1", 4, serde_json::json!({ "kind": "heading", "text_ref": "h" })),
-            ("b2", 8, serde_json::json!({ "kind": "paragraph", "text_ref": "p" })),
-            ("b3", 2, serde_json::json!({ "kind": "code", "text_ref": "c" })),
+            (
+                "b1",
+                4,
+                serde_json::json!({ "kind": "heading", "text_ref": "h" }),
+            ),
+            (
+                "b2",
+                8,
+                serde_json::json!({ "kind": "paragraph", "text_ref": "p" }),
+            ),
+            (
+                "b3",
+                2,
+                serde_json::json!({ "kind": "code", "text_ref": "c" }),
+            ),
         ],
     );
-    s.upsert_page("notes", 1, &[("n1", 1, serde_json::json!({ "kind": "paragraph" }))]);
-    s.upsert_row("inc-1", 3, serde_json::json!({ "title": "Incident", "sev": 1 }));
-    s.upsert_row("inc-2", 7, serde_json::json!({ "title": "Follow-up", "sev": 3 }));
+    s.upsert_page(
+        "notes",
+        1,
+        &[("n1", 1, serde_json::json!({ "kind": "paragraph" }))],
+    );
+    s.upsert_row(
+        "inc-1",
+        3,
+        serde_json::json!({ "title": "Incident", "sev": 1 }),
+    );
+    s.upsert_row(
+        "inc-2",
+        7,
+        serde_json::json!({ "title": "Follow-up", "sev": 3 }),
+    );
     s.upsert_edge(
         "myelin://acme/knowledge/page/runbook",
         "myelin://acme/knowledge/page/space",
@@ -138,7 +162,10 @@ fn kn_d6_wipe_replay_cold_equals_live() {
 
     // Wipe the derived store to empty (the F4 failure: a derived store is lost).
     let mut cold = DerivedStore::new();
-    assert!(cold.is_empty(), "the derived store is wiped before the rebuild");
+    assert!(
+        cold.is_empty(),
+        "the derived store is wiped before the rebuild"
+    );
 
     // Rebuild ONLY from the reindex re-emit through the outbox (no owner-DB read).
     let sources: &[&dyn ReindexSource] = &[&s];
@@ -181,7 +208,10 @@ fn kn_d6_crash_mid_rebuild_then_resume_converges_idempotently() {
         store.ingest(&row.envelope);
     }
     let after_crash_len = store.len();
-    assert!(after_crash_len <= live.len(), "a partial rebuild has at most the live count");
+    assert!(
+        after_crash_len <= live.len(),
+        "a partial rebuild has at most the live count"
+    );
 
     // Resume: re-replay the WHOLE scope. The already-applied snapshots are no-ops (idempotent on the
     // deterministic id); the rest fill in. 0 double-apply.
@@ -192,7 +222,10 @@ fn kn_d6_crash_mid_rebuild_then_resume_converges_idempotently() {
             reapplied_no_ops += 1;
         }
     }
-    assert!(reapplied_no_ops >= half, "the already-applied snapshots are idempotent no-ops on resume");
+    assert!(
+        reapplied_no_ops >= half,
+        "the already-applied snapshots are idempotent no-ops on resume"
+    );
     assert_eq!(
         store.parity_bytes(),
         live.parity_bytes(),
@@ -208,7 +241,10 @@ fn kn_d6_rebuild_does_not_resurrect_erased_state() {
     let mut s = drill_source();
     let scope = SnapshotScope::new("knowledge", "all");
 
-    assert!(s.erase_page("notes"), "the page is erased (its derived state shredded)");
+    assert!(
+        s.erase_page("notes"),
+        "the page is erased (its derived state shredded)"
+    );
     assert!(s.erase_row("inc-2"), "the row is erased");
 
     let live = build_live(&s, &scope);
@@ -222,12 +258,25 @@ fn kn_d6_rebuild_does_not_resurrect_erased_state() {
         cold.ingest(&row.envelope);
     }
 
-    assert_eq!(cold.parity_bytes(), live.parity_bytes(), "cold == live AFTER erasure too");
+    assert_eq!(
+        cold.parity_bytes(),
+        live.parity_bytes(),
+        "cold == live AFTER erasure too"
+    );
     let bytes = String::from_utf8_lossy(&cold.parity_bytes()).to_string();
-    assert!(!bytes.contains("page/notes"), "the erased page is not resurrected by the rebuild");
-    assert!(!bytes.contains("row/inc-2"), "the erased row is not resurrected by the rebuild");
+    assert!(
+        !bytes.contains("page/notes"),
+        "the erased page is not resurrected by the rebuild"
+    );
+    assert!(
+        !bytes.contains("row/inc-2"),
+        "the erased row is not resurrected by the rebuild"
+    );
     // The surviving aggregates ARE rebuilt.
-    assert!(bytes.contains("page/runbook"), "the surviving page rebuilds");
+    assert!(
+        bytes.contains("page/runbook"),
+        "the surviving page rebuilds"
+    );
     assert!(bytes.contains("row/inc-1"), "the surviving row rebuilds");
 }
 
@@ -250,17 +299,30 @@ fn kn_d6_te7_drift_correction_typed_table_wins() {
     // edges are. (We model "the projection reconverges to exactly the typed edges".)
     let sources: &[&dyn ReindexSource] = &[&s];
     let mut outbox = OutboxStore::new();
-    let receipt = reindex(&edge_scope, None, sources, &mut outbox, ctx_base()).expect("drift reindex");
-    assert_eq!(receipt.snapshots_emitted, 2, "both typed edges re-emitted as refs.edge.snapshot");
+    let receipt =
+        reindex(&edge_scope, None, sources, &mut outbox, ctx_base()).expect("drift reindex");
+    assert_eq!(
+        receipt.snapshots_emitted, 2,
+        "both typed edges re-emitted as refs.edge.snapshot"
+    );
 
     let mut refs_projection = DerivedStore::new();
     for draft in s.drift_correct_edges(None) {
-        let row = outbox.row(&draft.event_id()).expect("edge snapshot present");
+        let row = outbox
+            .row(&draft.event_id())
+            .expect("edge snapshot present");
         refs_projection.ingest(&row.envelope);
     }
-    assert_eq!(refs_projection.len(), 2, "Refs reconverged to exactly the typed edges (typed wins)");
+    assert_eq!(
+        refs_projection.len(),
+        2,
+        "Refs reconverged to exactly the typed edges (typed wins)"
+    );
 
     // Idempotent re-run of the drift-correction.
     let r2 = reindex(&edge_scope, None, sources, &mut outbox, ctx_base()).expect("re-run");
-    assert_eq!(r2.snapshots_emitted, 0, "the drift-correction re-run is idempotent");
+    assert_eq!(
+        r2.snapshots_emitted, 0,
+        "the drift-correction re-run is idempotent"
+    );
 }

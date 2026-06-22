@@ -387,7 +387,14 @@ impl Traverse {
         // ── ONE `list_objects` post-filter over the COLLECTED node set (§4.5 — NOT per-hop). A node ──
         //    the viewer cannot `view` is dropped, and any node reachable ONLY through a dropped node
         //    is pruned too (the branch-prune — the traversal is not a side-channel).
-        let nodes = apply_post_filter(&discovered, list_objects, &self.authz, viewer, tenant, region);
+        let nodes = apply_post_filter(
+            &discovered,
+            list_objects,
+            &self.authz,
+            viewer,
+            tenant,
+            region,
+        );
 
         TraverseResult {
             nodes,
@@ -450,14 +457,7 @@ pub fn apply_post_filter(
             continue; // the whole branch under an unreadable ancestor is pruned.
         }
         // (a) the permission post-filter: the viewer may `view` this discovered artifact.
-        let readable = set_expr_admits(
-            &set_expr,
-            authz,
-            viewer,
-            tenant,
-            region,
-            &node.artifact,
-        );
+        let readable = set_expr_admits(&set_expr, authz, viewer, tenant, region, &node.artifact);
         if !readable {
             // The node is NOT admitted AND it is NOT recorded as reachable — so its own children
             // (deeper nodes whose parent is THIS node) are pruned (the branch-prune root).

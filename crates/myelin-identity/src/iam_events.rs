@@ -210,7 +210,10 @@ mod tests {
                 3,
                 "token `{tok}` must be <subsystem>.<artifact_type>.<event_name>"
             );
-            assert_eq!(parts[0], "iam", "token `{tok}` must carry the `iam` subsystem prefix");
+            assert_eq!(
+                parts[0], "iam",
+                "token `{tok}` must carry the `iam` subsystem prefix"
+            );
             for seg in &parts {
                 assert!(!seg.is_empty(), "token `{tok}` has an empty segment");
                 assert!(
@@ -243,7 +246,10 @@ mod tests {
         assert_eq!(tw.type_, IAM_TUPLE_WRITTEN);
         assert_eq!(tw.actor_principal_id, PrincipalId("p-admin".into()));
         assert!(matches!(tw.subject, IamSubjectRef::Object(_)));
-        assert!(!tw.contains_personal_data, "an iam.* event never carries inline PII");
+        assert!(
+            !tw.contains_personal_data,
+            "an iam.* event never carries inline PII"
+        );
 
         // iam.role_granted: subject is a principal-as-subject (the grantee), opaque id only.
         let rg = IamEventProjection::new(
@@ -321,8 +327,13 @@ mod tests {
         let src = include_str!("iam_events.rs");
         // Walk only the projection type definitions (their `{ ... }` bodies). We scan for
         // `<ident>:` field declarations and assert none is a PII field name.
-        for marker in ["pub struct IamEventProjection {", "pub enum IamSubjectRef {"] {
-            let start = src.find(marker).expect("projection type is defined in this module");
+        for marker in [
+            "pub struct IamEventProjection {",
+            "pub enum IamSubjectRef {",
+        ] {
+            let start = src
+                .find(marker)
+                .expect("projection type is defined in this module");
             let body = &src[start..];
             let end = body.find('}').expect("type body is brace-closed");
             for line in body[..end].lines() {

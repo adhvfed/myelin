@@ -454,7 +454,10 @@ impl ObjectTierBackup {
     /// The full version history of `address` (every retained version — versioning means an
     /// overwritten value is still recoverable). Empty if the address is unknown.
     pub fn version_history(&self, address: &str) -> &[ObjectVersion] {
-        self.versions.get(address).map(|v| v.as_slice()).unwrap_or(&[])
+        self.versions
+            .get(address)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// `true` iff every retained version of every object is durably replicated (`replicas ≥
@@ -592,13 +595,26 @@ mod tests {
     #[test]
     fn tier_classification_backs_records_and_rebuilds_derived() {
         // Systems of record — backed up.
-        for t in [StoreTier::Oltp, StoreTier::Object, StoreTier::Log, StoreTier::Kms] {
-            assert!(t.is_backed_up(), "{} is a system of record and must be backed up", t.label());
+        for t in [
+            StoreTier::Oltp,
+            StoreTier::Object,
+            StoreTier::Log,
+            StoreTier::Kms,
+        ] {
+            assert!(
+                t.is_backed_up(),
+                "{} is a system of record and must be backed up",
+                t.label()
+            );
             assert!(!t.is_rebuilt_from_source());
         }
         // Derived stores — NOT backed up, rebuilt from source.
         for t in [StoreTier::Olap, StoreTier::Cache, StoreTier::DerivedIndex] {
-            assert!(!t.is_backed_up(), "{} is derived and must NOT be backed up", t.label());
+            assert!(
+                !t.is_backed_up(),
+                "{} is derived and must NOT be backed up",
+                t.label()
+            );
             assert!(t.is_rebuilt_from_source());
         }
     }
@@ -610,14 +626,19 @@ mod tests {
         let kms = KmsEngine::new();
         let mut set = BackupSet::new(0, &kms);
         for derived in [StoreTier::Olap, StoreTier::Cache, StoreTier::DerivedIndex] {
-            let err = set.snapshot_tier(derived).expect_err("a derived tier must be rejected");
+            let err = set
+                .snapshot_tier(derived)
+                .expect_err("a derived tier must be rejected");
             assert_eq!(err, BackupError::DerivedTierNotBacked { tier: derived });
         }
         // ...while a system of record is admitted.
         set.snapshot_tier(StoreTier::Oltp).unwrap();
         set.snapshot_tier(StoreTier::Object).unwrap();
         assert!(set.backed_tiers().contains(&StoreTier::Oltp));
-        assert!(!set.backed_tiers().contains(&StoreTier::Olap), "no derived tier in the set");
+        assert!(
+            !set.backed_tiers().contains(&StoreTier::Olap),
+            "no derived tier in the set"
+        );
     }
 
     // ───────── continuous WAL archiving + the RPO measurement ─────────
@@ -632,21 +653,39 @@ mod tests {
         // The primary commits up to offset 100 at t=600.
         arch.record_commit(100, 600);
         // The archiver ships the WAL segment covering offset 100, freshness t=590 (10 s of lag).
-        arch.archive_segment(WalSegment { end_offset: 100, committed_at: 590 }).unwrap();
+        arch.archive_segment(WalSegment {
+            end_offset: 100,
+            committed_at: 590,
+        })
+        .unwrap();
         let rpo = arch.measure_rpo();
-        assert_eq!(rpo, 0, "the archived tail reached the committed offset → 0 data at risk");
+        assert_eq!(
+            rpo, 0,
+            "the archived tail reached the committed offset → 0 data at risk"
+        );
 
         // Now a NEW commit lands (offset 130 at t=700) that the archiver has not yet shipped.
         arch.record_commit(130, 700);
         // The archived tail is still freshness t=590 (the last shipped segment). The un-archived
         // window is t=700 − t=590 = 110 s — still within the 300 s bound.
         let rpo = arch.measure_rpo();
-        assert_eq!(rpo, 110, "RPO is the freshness gap between commit and the archived tail");
+        assert_eq!(
+            rpo, 110,
+            "RPO is the freshness gap between commit and the archived tail"
+        );
         assert!(rpo <= 300, "RPO {rpo}s must be within the 5-min bound");
 
         // The archiver catches up: ship the segment covering offset 130 at freshness t=698.
-        arch.archive_segment(WalSegment { end_offset: 130, committed_at: 698 }).unwrap();
-        assert_eq!(arch.measure_rpo(), 0, "once caught up the RPO is 0 — no data at risk");
+        arch.archive_segment(WalSegment {
+            end_offset: 130,
+            committed_at: 698,
+        })
+        .unwrap();
+        assert_eq!(
+            arch.measure_rpo(),
+            0,
+            "once caught up the RPO is 0 — no data at risk"
+        );
     }
 
     /// With committed data but NOTHING archived yet, the ENTIRE committed history is at risk — the
@@ -656,7 +695,11 @@ mod tests {
     fn rpo_is_the_full_window_when_nothing_is_archived() {
         let mut arch = ContinuousArchiver::new();
         arch.record_commit(50, 300);
-        assert_eq!(arch.measure_rpo(), 300, "un-archived committed data is fully at risk");
+        assert_eq!(
+            arch.measure_rpo(),
+            300,
+            "un-archived committed data is fully at risk"
+        );
     }
 
     /// WAL archiving is strictly forward — an out-of-order (rewound) segment is REJECTED. PITR
@@ -665,13 +708,30 @@ mod tests {
     #[test]
     fn wal_archiving_rejects_an_out_of_order_segment() {
         let mut arch = ContinuousArchiver::new();
-        arch.archive_segment(WalSegment { end_offset: 100, committed_at: 10 }).unwrap();
+        arch.archive_segment(WalSegment {
+            end_offset: 100,
+            committed_at: 10,
+        })
+        .unwrap();
         let err = arch
-            .archive_segment(WalSegment { end_offset: 80, committed_at: 20 })
+            .archive_segment(WalSegment {
+                end_offset: 80,
+                committed_at: 20,
+            })
             .expect_err("a rewound WAL segment must be rejected");
-        assert_eq!(err, BackupError::WalArchivedOutOfOrder { last: 100, attempted: 80 });
+        assert_eq!(
+            err,
+            BackupError::WalArchivedOutOfOrder {
+                last: 100,
+                attempted: 80
+            }
+        );
         // The forward direction is admitted.
-        arch.archive_segment(WalSegment { end_offset: 120, committed_at: 30 }).unwrap();
+        arch.archive_segment(WalSegment {
+            end_offset: 120,
+            committed_at: 30,
+        })
+        .unwrap();
         assert_eq!(arch.archived_segment_count(), 2);
     }
 
@@ -681,12 +741,21 @@ mod tests {
     #[test]
     fn pitr_is_reachable_only_within_base_plus_wal_tail() {
         let mut arch = ContinuousArchiver::new();
-        arch.archive_segment(WalSegment { end_offset: 100, committed_at: 10 }).unwrap();
+        arch.archive_segment(WalSegment {
+            end_offset: 100,
+            committed_at: 10,
+        })
+        .unwrap();
         arch.take_base_backup(11); // base at offset 100
-        arch.archive_segment(WalSegment { end_offset: 200, committed_at: 20 }).unwrap();
+        arch.archive_segment(WalSegment {
+            end_offset: 200,
+            committed_at: 20,
+        })
+        .unwrap();
 
         // In-window: offset 150 (≥ base 100, ≤ archived tail 200).
-        arch.pitr_reachable(150).expect("a target within base+tail is reachable");
+        arch.pitr_reachable(150)
+            .expect("a target within base+tail is reachable");
         // Past the archived tail: unreachable.
         assert!(matches!(
             arch.pitr_reachable(250),
@@ -723,7 +792,10 @@ mod tests {
     /// survives no disk loss.
     #[test]
     fn object_tier_rejects_a_single_copy() {
-        assert!(ObjectTierBackup::new(1).is_err(), "a single-copy object tier is not a backup");
+        assert!(
+            ObjectTierBackup::new(1).is_err(),
+            "a single-copy object tier is not a backup"
+        );
         assert!(ObjectTierBackup::new(2).is_ok());
     }
 
@@ -759,7 +831,8 @@ mod tests {
         kms.ensure_kek(&live_kek);
         kms.ensure_kek(&shredded_kek);
         kms.ensure_dek(&live, &region(), KeyClass::Tenant).unwrap();
-        kms.ensure_dek(&shredded, &region(), KeyClass::Tenant).unwrap();
+        kms.ensure_dek(&shredded, &region(), KeyClass::Tenant)
+            .unwrap();
 
         // A backup taken NOW holds both tenants' keys.
         let before = BackupSet::new(100, &kms);
@@ -771,7 +844,10 @@ mod tests {
 
         // A FRESH backup EXCLUDES the shredded tenant — it stays dead across a restore.
         let after = BackupSet::new(200, &kms);
-        assert!(after.contains_key_for_tenant(&live), "the live tenant's key is still backed up");
+        assert!(
+            after.contains_key_for_tenant(&live),
+            "the live tenant's key is still backed up"
+        );
         assert!(
             !after.contains_key_for_tenant(&shredded),
             "a CRYPTO-SHREDDED tenant's key MUST be excluded from backup (§7.5) — it must stay dead"
@@ -782,12 +858,20 @@ mod tests {
     /// each error names exactly what is wrong, never a bare/empty message.
     #[test]
     fn backup_error_display_is_loud() {
-        let e = BackupError::DerivedTierNotBacked { tier: StoreTier::Olap };
+        let e = BackupError::DerivedTierNotBacked {
+            tier: StoreTier::Olap,
+        };
         let m = e.to_string();
-        assert!(m.contains("DERIVED"), "must name the derived-tier rule: {m}");
+        assert!(
+            m.contains("DERIVED"),
+            "must name the derived-tier rule: {m}"
+        );
         assert!(m.contains("t4-olap"), "must name the offending tier: {m}");
-        assert!(!BackupError::WalArchivedOutOfOrder { last: 5, attempted: 3 }
-            .to_string()
-            .is_empty());
+        assert!(!BackupError::WalArchivedOutOfOrder {
+            last: 5,
+            attempted: 3
+        }
+        .to_string()
+        .is_empty());
     }
 }

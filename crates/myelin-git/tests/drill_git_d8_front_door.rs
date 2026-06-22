@@ -23,15 +23,13 @@ use myelin_git::core::{
     Backend, BlameHunk, DiffLine, GitCore, GitCoreError, GitOp, Maintenance, Oid, RepoLoc, Service,
     WireOutput,
 };
-use myelin_git::front_door::{
-    FrontDoor, FrontDoorError, GitAction, GitRequest, PlacementResolver,
-};
+use myelin_git::front_door::{FrontDoor, FrontDoorError, GitAction, GitRequest, PlacementResolver};
 use myelin_identity::{
     AuthzError, CaveatContext, Consistency, Credential, DataRole, Decision, DelegationCaveats,
     EffectivePolicy, FailStaticBound, FragmentAdmit, IdentityService, ListObjectsResult,
     NamespaceFragment, ObjectId, ObjectType, Permission, Precondition, Principal, PrincipalId,
-    PrincipalKind, PrincipalStatus, Result as IdResult, RevokeTarget, RewriteTrace, RunId, RunToken,
-    SubjectTree, TupleDelta, Zookie,
+    PrincipalKind, PrincipalStatus, Result as IdResult, RevokeTarget, RewriteTrace, RunId,
+    RunToken, SubjectTree, TupleDelta, Zookie,
 };
 use myelin_storage::{
     FsBlobStore, GitPackTier, RepoGitPlacement, RepoId, RepoPlacementStatus, StorageGroup,
@@ -148,11 +146,7 @@ impl IdentityService for DrillId {
     fn delegation(&self, _a: &Principal, _t: &Principal) -> IdResult<EffectivePolicy> {
         Err(AuthzError::NotYetImplemented("n/a"))
     }
-    fn write_tuples(
-        &self,
-        _d: &[TupleDelta],
-        _p: Option<&Precondition>,
-    ) -> IdResult<Zookie> {
+    fn write_tuples(&self, _d: &[TupleDelta], _p: Option<&Precondition>) -> IdResult<Zookie> {
         Err(AuthzError::NotYetImplemented("n/a"))
     }
     fn mint_run_token(
@@ -254,20 +248,10 @@ impl GitCore for RecCore {
     fn read_blob(&self, _r: &RepoLoc, _o: &Oid) -> Result<Vec<u8>, GitCoreError> {
         unreachable!()
     }
-    fn diff_blobs(
-        &self,
-        _r: &RepoLoc,
-        _a: &Oid,
-        _b: &Oid,
-    ) -> Result<Vec<DiffLine>, GitCoreError> {
+    fn diff_blobs(&self, _r: &RepoLoc, _a: &Oid, _b: &Oid) -> Result<Vec<DiffLine>, GitCoreError> {
         unreachable!()
     }
-    fn blame(
-        &self,
-        _r: &RepoLoc,
-        _p: &str,
-        _a: &Oid,
-    ) -> Result<Vec<BlameHunk>, GitCoreError> {
+    fn blame(&self, _r: &RepoLoc, _p: &str, _a: &Oid) -> Result<Vec<BlameHunk>, GitCoreError> {
         unreachable!()
     }
 }
@@ -301,8 +285,8 @@ fn git_d8_cross_tenant_front_door_isolation_zero_reads() {
     let id = DrillId::new()
         .cred("pat", "acme-token", "acme", PrincipalKind::Human)
         .grant("acme-token", "pull"); // the token's subject; the door never even reaches the check.
-    // globex DOES host the secret repo here (so the only thing standing between the acme token and
-    // globex's data is the front-door cross-tenant guard — exactly what GIT-D8 measures).
+                                      // globex DOES host the secret repo here (so the only thing standing between the acme token and
+                                      // globex's data is the front-door cross-tenant guard — exactly what GIT-D8 measures).
     let placement = placed_tier(
         "globex",
         &[("globex/secret", "fr-par", RepoPlacementStatus::Active)],
@@ -322,7 +306,10 @@ fn git_d8_cross_tenant_front_door_isolation_zero_reads() {
     );
     // THE GREEN ARTIFACT (measured): cross-tenant-read-count == 0.
     let served = serve_count(&door);
-    assert_eq!(served, 0, "GIT-D8: 0 cross-tenant read (door streamed nothing)");
+    assert_eq!(
+        served, 0,
+        "GIT-D8: 0 cross-tenant read (door streamed nothing)"
+    );
     // Defence in depth: the door never even ran a `check` against globex's repo object.
     assert_eq!(
         checks_count(&door),
@@ -384,7 +371,10 @@ fn chained_e2e_ssh_clone_push_check_gate_residency() {
     let clone = door
         .route(&req("ssh", "reader", "acme", "widgets", GitAction::Fetch))
         .expect("clone granted");
-    assert!(clone.stdout.starts_with(b"PACK"), "the clone streamed a pack");
+    assert!(
+        clone.stdout.starts_with(b"PACK"),
+        "the clone streamed a pack"
+    );
 
     // LEG 2 — SSH push (writer holds push): authenticate → check(push) → placement → stream.
     let push = door
@@ -399,7 +389,13 @@ fn chained_e2e_ssh_clone_push_check_gate_residency() {
         .unwrap_err();
     // The deploy key resolves (4.1) but has no push grant in `acme` → check Deny (4.2).
     assert!(
-        matches!(denied, FrontDoorError::AuthzDenied { decision: Decision::Deny, .. }),
+        matches!(
+            denied,
+            FrontDoorError::AuthzDenied {
+                decision: Decision::Deny,
+                ..
+            }
+        ),
         "the check gate denied the un-granted push: {denied}"
     );
 
@@ -473,7 +469,10 @@ fn cdc_4_2_per_action_gate_pull_vs_push() {
         .unwrap_err();
     assert!(matches!(
         push_err,
-        FrontDoorError::AuthzDenied { decision: Decision::Deny, .. }
+        FrontDoorError::AuthzDenied {
+            decision: Decision::Deny,
+            ..
+        }
     ));
 }
 
@@ -501,7 +500,12 @@ fn cdc_12_2_placement_of_drives_region_pinning() {
     let err = door
         .authorize(&req("ssh", "k", "acme", "ghost", GitAction::Fetch))
         .unwrap_err();
-    assert_eq!(err, FrontDoorError::NoPlacement { repo: "ghost".into() });
+    assert_eq!(
+        err,
+        FrontDoorError::NoPlacement {
+            repo: "ghost".into()
+        }
+    );
 }
 
 // ── small introspection helpers on the door's recording backends (the drill assertions read these).

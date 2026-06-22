@@ -444,7 +444,11 @@ mod tests {
             },
         ];
         let outcome = handle.settle(&mut ledger, &units).expect("the run settles");
-        assert_eq!(outcome.cost_events.len(), 2, "one cost event per metered unit");
+        assert_eq!(
+            outcome.cost_events.len(),
+            2,
+            "one cost event per metered unit"
+        );
         assert_ne!(
             outcome.cost_events[0].wholesale, outcome.cost_events[0].markup,
             "wholesale ≠ markup recorded distinctly"
@@ -565,7 +569,10 @@ mod tests {
         }
         .to_string();
         assert!(e.contains("no balance, no run"), "must cite the floor: {e}");
-        assert!(e.contains("NEVER started"), "must say the run never started: {e}");
+        assert!(
+            e.contains("NEVER started"),
+            "must say the run never started: {e}"
+        );
         assert!(!DispatchError::AlreadyDispatched.to_string().is_empty());
         assert!(!DispatchError::AmountOverflow.to_string().is_empty());
     }
@@ -586,9 +593,21 @@ mod tests {
         // A duplicate dispatch must NOT be counted as a no-balance reserve refusal.
         let mut gate = AgentRunGate::new();
         let mut ledger = CostLedger::new();
-        gate.dispatch(&mut ledger, tenant(), run(1), MinorUnits(100), MinorUnits(1_000))
-            .unwrap();
-        let _ = gate.dispatch(&mut ledger, tenant(), run(1), MinorUnits(100), MinorUnits(1_000));
+        gate.dispatch(
+            &mut ledger,
+            tenant(),
+            run(1),
+            MinorUnits(100),
+            MinorUnits(1_000),
+        )
+        .unwrap();
+        let _ = gate.dispatch(
+            &mut ledger,
+            tenant(),
+            run(1),
+            MinorUnits(100),
+            MinorUnits(1_000),
+        );
         assert_eq!(
             gate.reserve_refusals(),
             0,
@@ -624,8 +643,16 @@ mod tests {
         }
 
         // Exactly 3 runs were fronted; the other 3 were refused (the loop stopped at the wallet).
-        assert_eq!(gate.runs_dispatched(), 3, "only the funded runs were fronted");
-        assert_eq!(gate.reserve_refusals(), 3, "the over-budget runs were refused");
+        assert_eq!(
+            gate.runs_dispatched(),
+            3,
+            "only the funded runs were fronted"
+        );
+        assert_eq!(
+            gate.reserve_refusals(),
+            3,
+            "the over-budget runs were refused"
+        );
         // The in-flight runs were NEVER interrupted by the refusals.
         assert_eq!(ledger.inflight_interrupt_count(), 0);
         for h in &live_handles {
@@ -668,9 +695,21 @@ mod tests {
                 spent = spent.checked_add(per_run).unwrap();
             }
         }
-        assert_eq!(gate.runs_dispatched(), 10, "exactly the funded runs admitted");
-        assert_eq!(gate.reserve_refusals(), 20, "the surge over budget was shed");
-        assert_eq!(ledger.inflight_interrupt_count(), 0, "0 interrupts under surge");
+        assert_eq!(
+            gate.runs_dispatched(),
+            10,
+            "exactly the funded runs admitted"
+        );
+        assert_eq!(
+            gate.reserve_refusals(),
+            20,
+            "the surge over budget was shed"
+        );
+        assert_eq!(
+            ledger.inflight_interrupt_count(),
+            0,
+            "0 interrupts under surge"
+        );
 
         let signal = AgentRunGateSignal {
             tenant: tenant(),
@@ -694,7 +733,10 @@ mod tests {
             reserve_refusals: 0,
             inflight_interrupt_count: 1,
         };
-        assert!(!interrupted.is_green(), "an in-flight interrupt must read RED");
+        assert!(
+            !interrupted.is_green(),
+            "an in-flight interrupt must read RED"
+        );
 
         let vanished = AgentRunGateSignal {
             tenant: tenant(),

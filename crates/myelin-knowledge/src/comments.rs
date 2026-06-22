@@ -121,7 +121,10 @@ pub fn mint_thread(
     page_id: &str,
     thread_id: &str,
 ) -> Result<ArtifactRef, ParseError> {
-    mint(&page_root(tenant, page_id)?, Sub::Thread(thread_id.to_string()))
+    mint(
+        &page_root(tenant, page_id)?,
+        Sub::Thread(thread_id.to_string()),
+    )
 }
 
 /// Mint a **comment** sub-URN `…/knowledge/page/<page_id>#comment-<comment_id>` (contract 5.7, the
@@ -133,7 +136,10 @@ pub fn mint_comment(
     page_id: &str,
     comment_id: &str,
 ) -> Result<ArtifactRef, ParseError> {
-    mint(&page_root(tenant, page_id)?, Sub::Comment(comment_id.to_string()))
+    mint(
+        &page_root(tenant, page_id)?,
+        Sub::Comment(comment_id.to_string()),
+    )
 }
 
 // ════════════════════════════════════════════════════════════════════════════════════════════════
@@ -178,7 +184,11 @@ impl CommentAnchor {
     /// Construct a text-range anchor, validating `start < end` (an empty/inverted range is not a
     /// range). Returns `None` if the bounds are degenerate — a comment must anchor to ≥ 1 character.
     pub fn range(block_id: BlockId, start: usize, end: usize) -> Option<Self> {
-        (start < end).then_some(CommentAnchor::Range { block_id, start, end })
+        (start < end).then_some(CommentAnchor::Range {
+            block_id,
+            start,
+            end,
+        })
     }
 }
 
@@ -253,7 +263,10 @@ impl std::fmt::Display for CommentError {
             CommentError::DuplicateThread(t) => write!(f, "thread_id already live: {t}"),
             CommentError::NoSuchThread(t) => write!(f, "no such thread: {t}"),
             CommentError::DegenerateRange { start, end } => {
-                write!(f, "degenerate text-range anchor: start {start} >= end {end}")
+                write!(
+                    f,
+                    "degenerate text-range anchor: start {start} >= end {end}"
+                )
             }
         }
     }
@@ -276,7 +289,10 @@ impl CommentStore {
     /// query returns the SAME threads before and after a move, because it keys on the stable
     /// `block_id`, never the block's position).
     pub fn threads_on_block(&self, block_id: &BlockId) -> Vec<&CommentThread> {
-        self.threads.values().filter(|t| t.anchored_block() == block_id).collect()
+        self.threads
+            .values()
+            .filter(|t| t.anchored_block() == block_id)
+            .collect()
     }
 
     /// **Create a KB-native comment thread anchored to a block/range, with its root comment** — the
@@ -304,7 +320,10 @@ impl CommentStore {
             .map_err(|e| CommentError::Ungrammatical(e.to_string()))?;
         if let CommentAnchor::Range { start, end, .. } = &anchor {
             if start >= end {
-                return Err(CommentError::DegenerateRange { start: *start, end: *end });
+                return Err(CommentError::DegenerateRange {
+                    start: *start,
+                    end: *end,
+                });
             }
         }
         if self.threads.contains_key(&thread_id) {
@@ -380,8 +399,10 @@ pub fn create_comment(
         .create_thread(tenant, page_id, thread_id, comment_id.clone(), anchor, body)
         .map_err(CommentOpError::Store)?;
     // (2) the event, BUFFERED into the caller's open tx (co-commits with the store write).
-    let change =
-        KnowledgeChange::CommentCreated { page_id: page_id.to_string(), comment_id };
+    let change = KnowledgeChange::CommentCreated {
+        page_id: page_id.to_string(),
+        comment_id,
+    };
     emit_change(tx, tenant, &change, None).map_err(CommentOpError::Bus)
 }
 
@@ -403,7 +424,9 @@ pub fn resolve_comment(
     thread_id: &str,
     root_comment_id: String,
 ) -> Result<EventId, CommentOpError> {
-    store.resolve_thread(thread_id).map_err(CommentOpError::Store)?;
+    store
+        .resolve_thread(thread_id)
+        .map_err(CommentOpError::Store)?;
     let change = KnowledgeChange::CommentResolved {
         page_id: page_id.to_string(),
         comment_id: root_comment_id,

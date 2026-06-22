@@ -358,7 +358,11 @@ mod tests {
     fn closes_trailer_is_line_leading_not_mid_sentence() {
         let msg = "Fix the charge bug\n\nThis closes a long-standing race.\nCloses ENG-1\n";
         let keys = parse_closes_trailers(msg);
-        assert_eq!(keys, vec!["ENG-1".to_string()], "only the trailer line, not the prose `closes`");
+        assert_eq!(
+            keys,
+            vec!["ENG-1".to_string()],
+            "only the trailer line, not the prose `closes`"
+        );
     }
 
     /// The `Closes:` colon form + case-insensitivity + multiple keys on one line + de-duplication.
@@ -368,7 +372,11 @@ mod tests {
         let keys = parse_closes_trailers(msg);
         assert_eq!(
             keys,
-            vec!["ENG-1".to_string(), "ENG-2".to_string(), "ENG-3".to_string()],
+            vec![
+                "ENG-1".to_string(),
+                "ENG-2".to_string(),
+                "ENG-3".to_string()
+            ],
             "colon/caseless/multikey parsed; the duplicate ENG-2 is de-duplicated (0 dup)"
         );
     }
@@ -377,8 +385,14 @@ mod tests {
     /// keyword.** The keyword must be delimited and followed by at least one key.
     #[test]
     fn closes_without_key_or_undelimited_is_not_a_trailer() {
-        assert!(parse_closes_trailers("Closes\n").is_empty(), "a bare `Closes` yields no key");
-        assert!(parse_closes_trailers("Closes   \n").is_empty(), "`Closes` + whitespace only, no key");
+        assert!(
+            parse_closes_trailers("Closes\n").is_empty(),
+            "a bare `Closes` yields no key"
+        );
+        assert!(
+            parse_closes_trailers("Closes   \n").is_empty(),
+            "`Closes` + whitespace only, no key"
+        );
         assert!(
             parse_closes_trailers("Closesthebug now\n").is_empty(),
             "an undelimited `Closesthebug` is NOT the trailer keyword"
@@ -395,7 +409,11 @@ mod tests {
         let closes = vec![issue("ENG-1"), issue("ENG-2")];
         let relates = vec![crate::project::git_pr_ref("acme", "repo7", 7)];
         let edges = extract_lifecycle_edges(&src, &closes, &relates);
-        assert_eq!(edges.len(), 3, "2 trailers + 1 PR-link → exactly 3 lifecycle edges");
+        assert_eq!(
+            edges.len(),
+            3,
+            "2 trailers + 1 PR-link → exactly 3 lifecycle edges"
+        );
 
         // the closes edges come first, PR→issue, rel=closes.
         assert_eq!(edges[0].rel, LifecycleRel::Closes);
@@ -409,7 +427,10 @@ mod tests {
         assert_eq!(edges[2].rel, LifecycleRel::Relates);
         assert_eq!(edges[2].rel.as_str(), "relates");
         assert_eq!(edges[2].source, src);
-        assert_eq!(edges[2].target, crate::project::git_pr_ref("acme", "repo7", 7));
+        assert_eq!(
+            edges[2].target,
+            crate::project::git_pr_ref("acme", "repo7", 7)
+        );
     }
 
     /// **A merged PR with no trailers and no PR-links yields ZERO lifecycle edges** (the no-op case —
@@ -417,7 +438,10 @@ mod tests {
     #[test]
     fn merged_pr_without_linkage_yields_zero_edges() {
         let edges = extract_lifecycle_edges(&pr_source(), &[], &[]);
-        assert!(edges.is_empty(), "a plain merge with no trailer/link produces 0 lifecycle edges");
+        assert!(
+            edges.is_empty(),
+            "a plain merge with no trailer/link produces 0 lifecycle edges"
+        );
     }
 
     /// **The edge event draft is `refs.edge.created` with the references-not-payloads triple + the shared
@@ -427,16 +451,26 @@ mod tests {
     fn edge_event_draft_is_refs_edge_created_lifecycle_class() {
         let src = pr_source();
         let target = issue("ENG-1");
-        let edge = LifecycleEdge { source: src.clone(), target: target.clone(), rel: LifecycleRel::Closes };
+        let edge = LifecycleEdge {
+            source: src.clone(),
+            target: target.clone(),
+            rel: LifecycleRel::Closes,
+        };
         let draft = edge_event_draft(&edge);
         assert_eq!(draft.type_.0, "refs.edge.created");
         assert_eq!(draft.subject, src, "the subject is the referencing PR");
         assert_eq!(draft.payload["source"], src.0);
         assert_eq!(draft.payload["target"], target.0);
         assert_eq!(draft.payload["rel"], "closes");
-        assert_eq!(draft.payload["rel_class"], "lifecycle", "a lifecycle mirror edge is lifecycle-class");
+        assert_eq!(
+            draft.payload["rel_class"], "lifecycle",
+            "a lifecycle mirror edge is lifecycle-class"
+        );
         assert_eq!(draft.aggregate.0, format!("edge:{}->{}", src.0, target.0));
-        assert!(!draft.contains_personal_data, "references-not-payloads: no inline PII");
+        assert!(
+            !draft.contains_personal_data,
+            "references-not-payloads: no inline PII"
+        );
         assert!(draft.pii_key_ref.is_none());
         assert_eq!(draft.data_role, DataRole::Controller);
     }

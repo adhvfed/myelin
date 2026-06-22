@@ -159,7 +159,9 @@ fn runner_echoes_idem_token_engine_wakes_exactly_once() {
         passed: true,
         result_refs: vec![ArtifactRef("myelin://acme/ci/run/run/log".into())],
     };
-    let out = agent.run_one(1000, 2, report.clone()).expect("the runner runs + reports");
+    let out = agent
+        .run_one(1000, 2, report.clone())
+        .expect("the runner runs + reports");
     assert_eq!(
         out.signal_outcome,
         SignalOutcome::Buffered,
@@ -170,7 +172,11 @@ fn runner_echoes_idem_token_engine_wakes_exactly_once() {
     let again = agent
         .report_done_again(&run.0, &idem, &report)
         .expect("re-delivery is the idempotency working");
-    assert_eq!(again, SignalOutcome::Duplicate, "the runner's SECOND job.done is a no-op");
+    assert_eq!(
+        again,
+        SignalOutcome::Duplicate,
+        "the runner's SECOND job.done is a no-op"
+    );
 
     // EXACTLY ONE buffered job.done row — the agreement: same idem_token, engine wakes once.
     assert_eq!(
@@ -212,7 +218,10 @@ fn the_provider_keys_job_done_on_the_frozen_consumer_tuple() {
         .get(&tenant(), &run.0, JOB_DONE_SIGNAL, &idem)
         .expect("the job.done is addressable by the frozen consumer dedup tuple");
     assert_eq!(row.signal_name, JOB_DONE_SIGNAL);
-    assert_eq!(row.idem_key, idem, "keyed on the echoed idem_token (no coordination round-trip)");
+    assert_eq!(
+        row.idem_key, idem,
+        "keyed on the echoed idem_token (no coordination round-trip)"
+    );
 
     // and the same SignalSpec re-delivered (what the engine's signal CONSUMER sees) is a duplicate —
     // proving the runner's path IS the engine's signal path (no second mechanism).

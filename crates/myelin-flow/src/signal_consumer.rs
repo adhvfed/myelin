@@ -92,8 +92,9 @@ impl<E: DurableExecutor> FlowSignalConsumer<E> {
     /// strings, is a [`DeliverError::Malformed`] poison.
     fn deliver(&self, ev: &EventEnvelope) -> Result<crate::SignalOutcome, DeliverError> {
         // The run id is the tail of the subject ArtifactRef (`myelin://<tenant>/flow/run/<run_id>`).
-        let run_id = run_id_of(&ev.subject)
-            .ok_or_else(|| DeliverError::Malformed(format!("no run id in subject {}", ev.subject.0)))?;
+        let run_id = run_id_of(&ev.subject).ok_or_else(|| {
+            DeliverError::Malformed(format!("no run id in subject {}", ev.subject.0))
+        })?;
 
         let obj = ev
             .payload
@@ -103,13 +104,17 @@ impl<E: DurableExecutor> FlowSignalConsumer<E> {
             .get("signal_name")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| DeliverError::Malformed("signal payload has no non-empty signal_name".into()))?
+            .ok_or_else(|| {
+                DeliverError::Malformed("signal payload has no non-empty signal_name".into())
+            })?
             .to_string();
         let idem_key = obj
             .get("idem_key")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| DeliverError::Malformed("signal payload has no non-empty idem_key".into()))?
+            .ok_or_else(|| {
+                DeliverError::Malformed("signal payload has no non-empty idem_key".into())
+            })?
             .to_string();
         // references-not-payloads: the body is an array of ArtifactRef strings (never a PII body).
         let payload: Vec<ArtifactRef> = match obj.get("payload") {
@@ -118,17 +123,18 @@ impl<E: DurableExecutor> FlowSignalConsumer<E> {
                 let mut refs = Vec::with_capacity(arr.len());
                 for v in arr {
                     let s = v.as_str().ok_or_else(|| {
-                        DeliverError::Malformed("signal payload body is not an array of refs".into())
+                        DeliverError::Malformed(
+                            "signal payload body is not an array of refs".into(),
+                        )
                     })?;
                     refs.push(ArtifactRef(s.to_string()));
                 }
                 refs
             }
-            Some(_) => {
-                return Err(DeliverError::Malformed(
-                    "signal payload body must be an array of ArtifactRefs (references-not-payloads)".into(),
-                ))
-            }
+            Some(_) => return Err(DeliverError::Malformed(
+                "signal payload body must be an array of ArtifactRefs (references-not-payloads)"
+                    .into(),
+            )),
         };
         let payload_key_ref = obj
             .get("payload_key_ref")
@@ -209,8 +215,8 @@ mod tests {
     use super::*;
     use crate::{FlowExecutor, RunBudget, SignalOutcome, StartSpec};
     use myelin_events::{
-        Actor, AggregateKey, CorrelationId, DataRole, EventId, EventType, MonotonicMinter, IdMinter,
-        Timestamp, Visibility,
+        Actor, AggregateKey, CorrelationId, DataRole, EventId, EventType, IdMinter,
+        MonotonicMinter, Timestamp, Visibility,
     };
     use myelin_identity::{Principal, PrincipalId, PrincipalKind};
     use myelin_tenancy::{Region, TenantId};
@@ -252,7 +258,11 @@ mod tests {
             schema_ver: 1,
             tenant: tenant(),
             region: region(),
-            actor: Actor(Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, tenant())),
+            actor: Actor(Principal::stub(
+                PrincipalId("p".into()),
+                PrincipalKind::Human,
+                tenant(),
+            )),
             subject: ArtifactRef(format!("myelin://acme/flow/run/{}", run.0)),
             aggregate: AggregateKey(format!("flow/run/{}", run.0)),
             causation_id: None,
@@ -283,9 +293,21 @@ mod tests {
         let consumer = FlowSignalConsumer::new(ex.clone(), subjects());
 
         let ev = signal_event(&run, "job.done", "tok-1", "evt-1");
-        assert_eq!(consumer.handle(&ev), HandleOutcome::Done, "a good signal acks Done");
-        assert_eq!(ex.signals().count_for_run(&tenant(), &run.0), 1, "one buffered row");
-        assert_eq!(ex.telemetry().signal_buffer_depth(), 1, "signal-buffer-depth reads 1");
+        assert_eq!(
+            consumer.handle(&ev),
+            HandleOutcome::Done,
+            "a good signal acks Done"
+        );
+        assert_eq!(
+            ex.signals().count_for_run(&tenant(), &run.0),
+            1,
+            "one buffered row"
+        );
+        assert_eq!(
+            ex.telemetry().signal_buffer_depth(),
+            1,
+            "signal-buffer-depth reads 1"
+        );
     }
 
     /// **A DOUBLE-delivered signal (different bus `event_id`, SAME per-effect key) buffers ONCE — the
@@ -302,13 +324,21 @@ mod tests {
         let first = consumer.handle(&signal_event(&run, "job.done", "tok-1", "evt-1"));
         let second = consumer.handle(&signal_event(&run, "job.done", "tok-1", "evt-2"));
         assert_eq!(first, HandleOutcome::Done);
-        assert_eq!(second, HandleOutcome::Done, "the duplicate is the idempotency working, not an error");
+        assert_eq!(
+            second,
+            HandleOutcome::Done,
+            "the duplicate is the idempotency working, not an error"
+        );
         assert_eq!(
             ex.signals().count_for_run(&tenant(), &run.0),
             1,
             "the wf_signal PK buffered it ONCE (the workflow wakes once) — even past the event_id guard"
         );
-        assert_eq!(ex.telemetry().signal_buffer_depth(), 1, "the signal-buffer-depth stayed 1 (truthful)");
+        assert_eq!(
+            ex.telemetry().signal_buffer_depth(),
+            1,
+            "the signal-buffer-depth stayed 1 (truthful)"
+        );
     }
 
     /// **A malformed signal event is a non-retryable POISON (dead-lettered, never a head-of-line
@@ -326,7 +356,11 @@ mod tests {
             matches!(consumer.handle(&ev), HandleOutcome::NonRetryable(_)),
             "a malformed signal is non-retryable poison (dead-lettered, no silent drop)"
         );
-        assert_eq!(ex.signals().count_for_run(&tenant(), &run.0), 0, "nothing buffered for a poison event");
+        assert_eq!(
+            ex.signals().count_for_run(&tenant(), &run.0),
+            0,
+            "nothing buffered for a poison event"
+        );
     }
 
     /// **A signal to an UNKNOWN run is surfaced (dead-lettered, never a silent drop, EI-02 §4).** The
@@ -350,9 +384,21 @@ mod tests {
         let ex = executor();
         let run = start_a_run(&ex);
         let consumer = FlowSignalConsumer::new(ex.clone(), subjects());
-        let first = consumer.deliver(&signal_event(&run, "approval", "card-7", "e1")).unwrap();
-        let second = consumer.deliver(&signal_event(&run, "approval", "card-7", "e2")).unwrap();
-        assert_eq!(first, SignalOutcome::Buffered, "the first delivery buffered");
-        assert_eq!(second, SignalOutcome::Duplicate, "the re-delivery is a no-op duplicate");
+        let first = consumer
+            .deliver(&signal_event(&run, "approval", "card-7", "e1"))
+            .unwrap();
+        let second = consumer
+            .deliver(&signal_event(&run, "approval", "card-7", "e2"))
+            .unwrap();
+        assert_eq!(
+            first,
+            SignalOutcome::Buffered,
+            "the first delivery buffered"
+        );
+        assert_eq!(
+            second,
+            SignalOutcome::Duplicate,
+            "the re-delivery is a no-op duplicate"
+        );
     }
 }

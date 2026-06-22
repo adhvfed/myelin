@@ -199,23 +199,36 @@ impl DataMapDiff {
     pub fn summary(&self) -> String {
         let mut lines = Vec::new();
         for e in &self.added_fields {
-            lines.push(format!("+ field {} ({} @ {})", e.field_path, e.holder_id, e.region));
+            lines.push(format!(
+                "+ field {} ({} @ {})",
+                e.field_path, e.holder_id, e.region
+            ));
         }
         for e in &self.removed_fields {
-            lines.push(format!("- field {} ({} @ {})", e.field_path, e.holder_id, e.region));
+            lines.push(format!(
+                "- field {} ({} @ {})",
+                e.field_path, e.holder_id, e.region
+            ));
         }
         for r in &self.reclassifications {
             lines.push(format!(
                 "~ reclassified {}: role {}→{}, category {}→{}, basis {}→{}, retention {}→{}, \
                  erasure {}→{}, holder {}→{}, region {}→{}",
                 r.field_path,
-                r.before.role, r.after.role,
-                r.before.category, r.after.category,
-                r.before.basis, r.after.basis,
-                r.before.retention, r.after.retention,
-                r.before.erasure, r.after.erasure,
-                r.before.holder_id, r.after.holder_id,
-                r.before.region, r.after.region,
+                r.before.role,
+                r.after.role,
+                r.before.category,
+                r.after.category,
+                r.before.basis,
+                r.after.basis,
+                r.before.retention,
+                r.after.retention,
+                r.before.erasure,
+                r.after.erasure,
+                r.before.holder_id,
+                r.after.holder_id,
+                r.before.region,
+                r.after.region,
             ));
         }
         for h in &self.added_holders {
@@ -476,7 +489,10 @@ mod tests {
 
     fn principal_schema() -> HolderSchema {
         HolderSchema::from_schema::<PrincipalRow>(
-            HolderRegistration { kind: StoreKind::Oltp, name: "identity_oltp" },
+            HolderRegistration {
+                kind: StoreKind::Oltp,
+                name: "identity_oltp",
+            },
             Holder::H15Identity,
             region(),
         )
@@ -484,7 +500,10 @@ mod tests {
 
     fn index_schema() -> HolderSchema {
         HolderSchema::from_schema::<OpaqueIndexRow>(
-            HolderRegistration { kind: StoreKind::SearchIndex, name: "search_index" },
+            HolderRegistration {
+                kind: StoreKind::SearchIndex,
+                name: "search_index",
+            },
             Holder::H7SearchIndex,
             region(),
         )
@@ -505,7 +524,11 @@ mod tests {
         // ── UNCHANGED: regenerate the SAME map → green (the build passes). ──────────────────────
         let same = data_map(&[principal_schema(), index_schema()]);
         let verdict = check_against_baseline(&base, &same);
-        assert_eq!(verdict, GateVerdict::Unchanged, "an unchanged map passes the gate");
+        assert_eq!(
+            verdict,
+            GateVerdict::Unchanged,
+            "an unchanged map passes the gate"
+        );
         assert!(verdict.is_green());
         assert!(verdict.diff().is_none());
 
@@ -516,11 +539,17 @@ mod tests {
         let d = verdict.diff().expect("the diff is surfaced for a DPO");
         assert!(!d.is_clean());
         // the zero-PII index holder was removed.
-        assert_eq!(d.removed_holders, vec!["search_index:search_index".to_string()]);
+        assert_eq!(
+            d.removed_holders,
+            vec!["search_index:search_index".to_string()]
+        );
         assert!(d.added_holders.is_empty());
         // no field change (the index carried no PII field) — the holder removal is the diff.
         assert!(d.added_fields.is_empty() && d.removed_fields.is_empty());
-        assert!(!d.requires_dpia(), "no special-category flow appeared — no DPIA obligation");
+        assert!(
+            !d.requires_dpia(),
+            "no special-category flow appeared — no DPIA obligation"
+        );
         assert!(d.summary().contains("- holder search_index:search_index"));
     }
 
@@ -529,17 +558,25 @@ mod tests {
     #[test]
     fn a_new_pii_field_fails_the_gate_with_the_field_surfaced() {
         let base = CommittedBaseline::seal(data_map(&[index_schema()])); // baseline: only the zero-PII index.
-        // The principal store (two PII fields) is now registered → two new fields appear.
+                                                                         // The principal store (two PII fields) is now registered → two new fields appear.
         let current = data_map(&[principal_schema(), index_schema()]);
         let verdict = check_against_baseline(&base, &current);
 
         let d = verdict.diff().expect("changed");
-        let added: Vec<&str> = d.added_fields.iter().map(|e| e.field_path.as_str()).collect();
+        let added: Vec<&str> = d
+            .added_fields
+            .iter()
+            .map(|e| e.field_path.as_str())
+            .collect();
         assert_eq!(added, vec!["PrincipalRow.email", "PrincipalRow.handle"]);
         assert_eq!(d.added_holders, vec!["oltp:identity_oltp".to_string()]);
         assert!(d.removed_fields.is_empty());
         // the new email field carries its facts into the diff (a DPO reads them).
-        let email = d.added_fields.iter().find(|e| e.field_path == "PrincipalRow.email").unwrap();
+        let email = d
+            .added_fields
+            .iter()
+            .find(|e| e.field_path == "PrincipalRow.email")
+            .unwrap();
         assert_eq!(email.role, "TenantContent");
         assert_eq!(email.category, "ContactInfo");
         assert!(d.summary().contains("+ field PrincipalRow.email"));
@@ -554,14 +591,20 @@ mod tests {
     fn a_field_path_change_is_surfaced_as_remove_plus_add() {
         // baseline: PrincipalRow.email is role = TenantContent.
         let base = CommittedBaseline::seal(data_map(&[HolderSchema::from_schema::<PrincipalRow>(
-            HolderRegistration { kind: StoreKind::Oltp, name: "identity_oltp" },
+            HolderRegistration {
+                kind: StoreKind::Oltp,
+                name: "identity_oltp",
+            },
             Holder::H15Identity,
             region(),
         )]));
         // current: the email field now lives on PrincipalRowReclassified at role = PlatformOperational
         // (the owning struct — hence the field PATH — changed).
         let current = data_map(&[HolderSchema::from_schema::<PrincipalRowReclassified>(
-            HolderRegistration { kind: StoreKind::Oltp, name: "identity_oltp" },
+            HolderRegistration {
+                kind: StoreKind::Oltp,
+                name: "identity_oltp",
+            },
             Holder::H15Identity,
             region(),
         )]);
@@ -638,11 +681,17 @@ mod tests {
     fn a_new_special_category_flow_routes_into_the_dpia_gate() {
         // baseline: the principal store (ordinary-category fields only) — no DPIA marker.
         let base = CommittedBaseline::seal(data_map(&[principal_schema()]));
-        assert!(base.inventory.dpia_markers.is_empty(), "baseline carries no special-category flow");
+        assert!(
+            base.inventory.dpia_markers.is_empty(),
+            "baseline carries no special-category flow"
+        );
 
         // current: a Profile store with a health (special-category) field is now registered.
         let profile = HolderSchema::from_schema::<ProfileRow>(
-            HolderRegistration { kind: StoreKind::Oltp, name: "profile_oltp" },
+            HolderRegistration {
+                kind: StoreKind::Oltp,
+                name: "profile_oltp",
+            },
             Holder::H15Identity,
             region(),
         );
@@ -653,17 +702,25 @@ mod tests {
         // the diff fails the gate…
         assert!(!d.is_clean());
         // …AND routes into the DPIA gate (the new special-category flow is an Art. 35 obligation).
-        assert!(d.requires_dpia(), "a new special-category flow requires a DPIA");
+        assert!(
+            d.requires_dpia(),
+            "a new special-category flow requires a DPIA"
+        );
         assert_eq!(d.dpia_verdicts.len(), 1);
         match &d.dpia_verdicts[0] {
             DpiaVerdict::Required { marker, reason } => {
                 assert_eq!(marker.field_path, "ProfileRow.health_note");
                 assert_eq!(marker.special_category_kind, "health");
                 assert!(reason.contains("DPIA required"));
-                assert!(reason.contains("DPO"), "surfaced for a DPO, never auto-decided");
+                assert!(
+                    reason.contains("DPO"),
+                    "surfaced for a DPO, never auto-decided"
+                );
             }
         }
-        assert!(d.summary().contains("! DPIA REQUIRED ProfileRow.health_note"));
+        assert!(d
+            .summary()
+            .contains("! DPIA REQUIRED ProfileRow.health_note"));
     }
 
     /// An ORDINARY-category addition fails the diff gate but does NOT route into the DPIA gate (the
@@ -673,9 +730,15 @@ mod tests {
     fn an_ordinary_category_addition_does_not_require_a_dpia() {
         let base = CommittedBaseline::seal(data_map(&[index_schema()]));
         let current = data_map(&[principal_schema(), index_schema()]); // ContactInfo + Identifier — ordinary.
-        let d = check_against_baseline(&base, &current).diff().expect("changed").clone();
+        let d = check_against_baseline(&base, &current)
+            .diff()
+            .expect("changed")
+            .clone();
         assert!(!d.is_clean(), "an added field fails the gate");
-        assert!(!d.requires_dpia(), "but an ordinary-category field is not a DPIA obligation");
+        assert!(
+            !d.requires_dpia(),
+            "but an ordinary-category field is not a DPIA obligation"
+        );
         assert!(d.dpia_verdicts.is_empty());
     }
 
@@ -691,7 +754,10 @@ mod tests {
         let verdict = check_against_baseline(&base, &current);
         assert_eq!(verdict, GateVerdict::CorruptBaseline);
         assert!(!verdict.is_green());
-        assert!(verdict.diff().is_none(), "a corrupt baseline surfaces no content diff");
+        assert!(
+            verdict.diff().is_none(),
+            "a corrupt baseline surfaces no content diff"
+        );
     }
 
     /// Re-baselining: after a DPO reviews a diff and accepts it, sealing the new inventory makes the
@@ -701,12 +767,22 @@ mod tests {
     fn re_sealing_the_baseline_after_review_makes_the_gate_green() {
         let base = baseline();
         // a holder is added (the gate would fail)…
-        let changed = data_map(&[principal_schema(), index_schema(),
+        let changed = data_map(&[
+            principal_schema(),
+            index_schema(),
             HolderSchema::from_schema::<ProfileRow>(
-                HolderRegistration { kind: StoreKind::Oltp, name: "profile_oltp" },
-                Holder::H15Identity, region(),
-            )]);
-        assert!(!check_against_baseline(&base, &changed).is_green(), "the change fails the gate");
+                HolderRegistration {
+                    kind: StoreKind::Oltp,
+                    name: "profile_oltp",
+                },
+                Holder::H15Identity,
+                region(),
+            ),
+        ]);
+        assert!(
+            !check_against_baseline(&base, &changed).is_green(),
+            "the change fails the gate"
+        );
         // …a DPO reviews + re-seals the new inventory as the baseline → the next build is green.
         let re_sealed = CommittedBaseline::seal(changed.clone());
         assert!(re_sealed.is_self_consistent());

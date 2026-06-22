@@ -65,7 +65,9 @@
 
 use std::sync::Arc;
 
-use myelin_storage::{DekId, IndexAdmission, KekId, KeyClass, KeyOrigin, KmsEngine, KmsError, PiiKeyRef};
+use myelin_storage::{
+    DekId, IndexAdmission, KekId, KeyClass, KeyOrigin, KmsEngine, KmsError, PiiKeyRef,
+};
 use myelin_tenancy::{Region, TenantId};
 
 /// The Search index-DEK pin — reserves the Search key classes in the cell's one [`KmsEngine`]
@@ -125,10 +127,12 @@ impl SearchDekPin {
     /// the index is encrypted-from-birth and the tenant-offboard lever is in place from day one.
     pub fn reserve(&self, tenant: &TenantId, region: &Region) -> Result<PiiKeyRef, KmsError> {
         // L1: provision the per-(tenant, region) KEK (idempotent — never rotates an existing one).
-        self.kms.ensure_kek(&KekId::new(tenant.clone(), region.clone()));
+        self.kms
+            .ensure_kek(&KekId::new(tenant.clone(), region.clone()));
         // L2: reserve the PER-TENANT INDEX DEK under it — the Search tenant-decommission shred unit.
         // The returned ref is what the SRCH-P03 index layout keys on (encrypted-from-birth).
-        self.kms.ensure_dek(tenant, region, Self::tenant_index_dek_class())
+        self.kms
+            .ensure_dek(tenant, region, Self::tenant_index_dek_class())
     }
 
     /// **Reserve the per-subject source-DEK backstop for a subject (§4.8 / 11.4 ADDITIONAL
@@ -143,8 +147,10 @@ impl SearchDekPin {
         region: &Region,
         subject_id: &str,
     ) -> Result<PiiKeyRef, KmsError> {
-        self.kms.ensure_kek(&KekId::new(tenant.clone(), region.clone()));
-        self.kms.ensure_dek(tenant, region, Self::subject_source_dek_class(subject_id))
+        self.kms
+            .ensure_kek(&KekId::new(tenant.clone(), region.clone()));
+        self.kms
+            .ensure_dek(tenant, region, Self::subject_source_dek_class(subject_id))
     }
 
     /// **Tenant-decommission crypto-shred (destroy is callable on the per-tenant index key class).**
@@ -157,7 +163,8 @@ impl SearchDekPin {
     /// over real index data incl. vectors (SRCH-D4, 0 recoverable) is SRCH-P15 — it cannot be proven
     /// here because no index data exists yet (named floor).
     pub fn destroy_tenant_index_dek(&self, tenant: &TenantId, region: &Region) -> bool {
-        self.kms.destroy_kek(&KekId::new(tenant.clone(), region.clone()))
+        self.kms
+            .destroy_kek(&KekId::new(tenant.clone(), region.clone()))
     }
 
     /// **Per-subject source crypto-shred (destroy is callable on the per-subject backstop class).**
@@ -165,7 +172,10 @@ impl SearchDekPin {
     /// unrecoverable while the tenant index DEK + every other subject is untouched (the GD-4
     /// individual lever). Returns `true` if the backstop DEK was present to destroy.
     pub fn destroy_subject_backstop(&self, tenant: &TenantId, subject_id: &str) -> bool {
-        self.kms.destroy_dek(&DekId::new(tenant.clone(), Self::subject_source_dek_class(subject_id)))
+        self.kms.destroy_dek(&DekId::new(
+            tenant.clone(),
+            Self::subject_source_dek_class(subject_id),
+        ))
     }
 
     /// Resolve the per-tenant index DEK named by `key_ref` (the read-path key-resolution step the
@@ -191,7 +201,9 @@ impl SearchDekPin {
 impl std::fmt::Debug for SearchDekPin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The engine redacts all key material; this only names the pin (never key bytes).
-        f.debug_struct("SearchDekPin").field("kms", &self.kms).finish()
+        f.debug_struct("SearchDekPin")
+            .field("kms", &self.kms)
+            .finish()
     }
 }
 
@@ -294,13 +306,25 @@ mod tests {
     #[test]
     fn per_tenant_index_dek_is_reserved_and_resolvable() {
         let pin = SearchDekPin::new(kms());
-        let key_ref = pin.reserve(&t(), &r()).expect("reserve the per-tenant Search index DEK");
-        assert_eq!(key_ref.class, KeyClass::Tenant, "the Search index class is per-tenant");
-        assert_eq!(key_ref.to_uri(), "kms://acme/0/tenant", "the encrypted-from-birth key ref");
+        let key_ref = pin
+            .reserve(&t(), &r())
+            .expect("reserve the per-tenant Search index DEK");
+        assert_eq!(
+            key_ref.class,
+            KeyClass::Tenant,
+            "the Search index class is per-tenant"
+        );
+        assert_eq!(
+            key_ref.to_uri(),
+            "kms://acme/0/tenant",
+            "the encrypted-from-birth key ref"
+        );
 
         // The reserved DEK is a REAL key: a payload sealed under it round-trips (encrypted-from-birth
         // is not a stub — the key is usable from the moment the index lands).
-        let dek = pin.resolve(&key_ref, &r()).expect("resolve the reserved per-tenant index DEK");
+        let dek = pin
+            .resolve(&key_ref, &r())
+            .expect("resolve the reserved per-tenant index DEK");
         let (nonce, ct) = dek.seal(b"a future index segment's encrypted body");
         assert_eq!(
             dek.open(&nonce, &ct).as_deref(),
@@ -316,7 +340,10 @@ mod tests {
         let pin = SearchDekPin::new(kms());
         let a = pin.reserve(&t(), &r()).expect("first reserve");
         let b = pin.reserve(&t(), &r()).expect("second reserve");
-        assert_eq!(a, b, "re-reserving returns the same per-tenant index DEK ref (no silent rotation)");
+        assert_eq!(
+            a, b,
+            "re-reserving returns the same per-tenant index DEK ref (no silent rotation)"
+        );
     }
 
     /// **The per-subject source backstop is a DISTINCT key from the per-tenant index DEK (§4.8 /
@@ -331,7 +358,10 @@ mod tests {
         let sk = pin
             .reserve_subject_source_backstop(&t(), &r(), "u-1")
             .expect("subject source backstop");
-        assert_ne!(tk, sk, "the per-subject source backstop is a distinct key ref");
+        assert_ne!(
+            tk, sk,
+            "the per-subject source backstop is a distinct key ref"
+        );
         assert_eq!(sk.class, KeyClass::Subject("u-1".into()));
 
         let tdek = pin.resolve(&tk, &r()).expect("resolve tenant index dek");
@@ -352,15 +382,27 @@ mod tests {
     fn destroy_tenant_index_dek_is_callable_and_renders_the_key_unrecoverable() {
         let pin = SearchDekPin::new(kms());
         let key_ref = pin.reserve(&t(), &r()).expect("reserve");
-        assert!(pin.resolve(&key_ref, &r()).is_ok(), "resolvable before the shred");
+        assert!(
+            pin.resolve(&key_ref, &r()).is_ok(),
+            "resolvable before the shred"
+        );
 
         // The structural proof: destroy fires exactly once on a present key class.
-        assert!(pin.destroy_tenant_index_dek(&t(), &r()), "destroy is callable + a key was present");
-        assert!(!pin.destroy_tenant_index_dek(&t(), &r()), "a second destroy reports nothing left");
+        assert!(
+            pin.destroy_tenant_index_dek(&t(), &r()),
+            "destroy is callable + a key was present"
+        );
+        assert!(
+            !pin.destroy_tenant_index_dek(&t(), &r()),
+            "a second destroy reports nothing left"
+        );
 
         // Post-shred the key is unrecoverable — LOUD failure, never plaintext-without-key.
         assert!(
-            matches!(pin.resolve(&key_ref, &r()), Err(KmsError::KekUnavailable(_))),
+            matches!(
+                pin.resolve(&key_ref, &r()),
+                Err(KmsError::KekUnavailable(_))
+            ),
             "a crypto-shredded per-tenant index DEK resolves to a LOUD error, never a plaintext"
         );
     }
@@ -371,10 +413,17 @@ mod tests {
     fn tenant_decommission_shreds_every_subject_backstop() {
         let pin = SearchDekPin::new(kms());
         let tk = pin.reserve(&t(), &r()).expect("tenant index dek");
-        let s1 = pin.reserve_subject_source_backstop(&t(), &r(), "u-1").expect("s1");
-        let s2 = pin.reserve_subject_source_backstop(&t(), &r(), "u-2").expect("s2");
+        let s1 = pin
+            .reserve_subject_source_backstop(&t(), &r(), "u-1")
+            .expect("s1");
+        let s2 = pin
+            .reserve_subject_source_backstop(&t(), &r(), "u-2")
+            .expect("s2");
 
-        assert!(pin.destroy_tenant_index_dek(&t(), &r()), "tenant KEK destroyed");
+        assert!(
+            pin.destroy_tenant_index_dek(&t(), &r()),
+            "tenant KEK destroyed"
+        );
 
         for kr in [&tk, &s1, &s2] {
             assert!(
@@ -391,15 +440,34 @@ mod tests {
     fn destroy_subject_backstop_is_individual_grained() {
         let pin = SearchDekPin::new(kms());
         let tk = pin.reserve(&t(), &r()).expect("tenant index dek");
-        let s1 = pin.reserve_subject_source_backstop(&t(), &r(), "u-1").expect("s1");
-        let s2 = pin.reserve_subject_source_backstop(&t(), &r(), "u-2").expect("s2");
+        let s1 = pin
+            .reserve_subject_source_backstop(&t(), &r(), "u-1")
+            .expect("s1");
+        let s2 = pin
+            .reserve_subject_source_backstop(&t(), &r(), "u-2")
+            .expect("s2");
 
-        assert!(pin.destroy_subject_backstop(&t(), "u-1"), "subject backstop present to destroy");
-        assert!(!pin.destroy_subject_backstop(&t(), "u-1"), "a second destroy finds nothing");
+        assert!(
+            pin.destroy_subject_backstop(&t(), "u-1"),
+            "subject backstop present to destroy"
+        );
+        assert!(
+            !pin.destroy_subject_backstop(&t(), "u-1"),
+            "a second destroy finds nothing"
+        );
 
-        assert!(pin.resolve(&s1, &r()).is_err(), "u-1's source backstop key is shredded");
-        assert!(pin.resolve(&tk, &r()).is_ok(), "the tenant index DEK is untouched");
-        assert!(pin.resolve(&s2, &r()).is_ok(), "u-2's backstop is untouched");
+        assert!(
+            pin.resolve(&s1, &r()).is_err(),
+            "u-1's source backstop key is shredded"
+        );
+        assert!(
+            pin.resolve(&tk, &r()).is_ok(),
+            "the tenant index DEK is untouched"
+        );
+        assert!(
+            pin.resolve(&s2, &r()).is_ok(),
+            "u-2's backstop is untouched"
+        );
     }
 
     /// **A crypto-shredded Search tenant is excluded from the KMS backup snapshot** (§7.5 / STOR-D3
@@ -414,10 +482,16 @@ mod tests {
         pin.reserve(&live, &r()).expect("live");
         pin.reserve(&dead, &r()).expect("dead");
 
-        assert!(pin.destroy_tenant_index_dek(&dead, &r()), "offboard the dead tenant");
+        assert!(
+            pin.destroy_tenant_index_dek(&dead, &r()),
+            "offboard the dead tenant"
+        );
 
         let snap = kms.backup_snapshot();
-        assert!(snap.iter().any(|(d, _)| d.tenant == live), "live tenant index DEK backed up");
+        assert!(
+            snap.iter().any(|(d, _)| d.tenant == live),
+            "live tenant index DEK backed up"
+        );
         assert!(
             !snap.iter().any(|(d, _)| d.tenant == dead),
             "a crypto-shredded Search tenant is EXCLUDED from backup (stays dead across restore)"
@@ -436,7 +510,10 @@ mod tests {
             kms.resolve_dek(&key_ref, &r()).is_ok(),
             "the shared cell engine resolves the DEK the Search pin reserved (one hierarchy)"
         );
-        assert!(Arc::ptr_eq(pin.engine(), &kms), "the pin holds the very same cell engine");
+        assert!(
+            Arc::ptr_eq(pin.engine(), &kms),
+            "the pin holds the very same cell engine"
+        );
     }
 
     /// **The HYOK structural skip holds by reference (§4.8): a HYOK class is NOT indexed.** A
@@ -466,9 +543,18 @@ mod tests {
         let byok = Byok::new(&engine, r(), "kms-customer://acme/k1");
         let hyok = Hyok::new(DenyAllHyok);
 
-        assert!(!hyok_skips_index(&platform), "platform-managed class IS indexed (full search)");
-        assert!(!hyok_skips_index(&byok), "BYOK class IS indexed (plaintext reachable while live)");
-        assert!(hyok_skips_index(&hyok), "a HYOK class is structurally SKIPPED — no plaintext index");
+        assert!(
+            !hyok_skips_index(&platform),
+            "platform-managed class IS indexed (full search)"
+        );
+        assert!(
+            !hyok_skips_index(&byok),
+            "BYOK class IS indexed (plaintext reachable while live)"
+        );
+        assert!(
+            hyok_skips_index(&hyok),
+            "a HYOK class is structurally SKIPPED — no plaintext index"
+        );
     }
 
     /// **The SRCH-P03 inherited-gate precondition list is complete + names the load-bearing gates
@@ -479,11 +565,20 @@ mod tests {
     fn srch_p03_inherited_gates_name_every_precondition() {
         let gates = srch_p03_inherited_gates();
         let ids: Vec<&str> = gates.iter().map(|g| g.id).collect();
-        for required in ["STOR-D1", "STOR-D2", "ID-D3", "ID-D2", "ID-D1", "CP-D2", "CP-D3"] {
-            assert!(ids.contains(&required), "the SRCH-P03 precondition list names {required}");
+        for required in [
+            "STOR-D1", "STOR-D2", "ID-D3", "ID-D2", "ID-D1", "CP-D2", "CP-D3",
+        ] {
+            assert!(
+                ids.contains(&required),
+                "the SRCH-P03 precondition list names {required}"
+            );
         }
         for g in &gates {
-            assert!(!g.guarantees.is_empty(), "gate {} states what it guarantees", g.id);
+            assert!(
+                !g.guarantees.is_empty(),
+                "gate {} states what it guarantees",
+                g.id
+            );
         }
     }
 }

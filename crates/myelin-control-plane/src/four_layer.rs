@@ -70,8 +70,8 @@ use std::sync::Arc;
 
 use myelin_tenancy::{Region, TenantId};
 
-use crate::placement_of::{GatewayReject, PlacementOf};
 use crate::placement_of::CellGateway;
+use crate::placement_of::{GatewayReject, PlacementOf};
 use crate::registry::{PlacementError, Registry};
 use crate::schema::TenantPlacement;
 
@@ -184,7 +184,10 @@ impl std::fmt::Debug for ResidencyWriteBoundary {
         // PII-free Debug: the cell region + the aggregate zero, never a row's data.
         f.debug_struct("ResidencyWriteBoundary")
             .field("cell_region", &self.cell_region.as_str())
-            .field("out_of_region_writes_admitted", &self.out_of_region_writes_admitted())
+            .field(
+                "out_of_region_writes_admitted",
+                &self.out_of_region_writes_admitted(),
+            )
             .finish()
     }
 }
@@ -271,12 +274,12 @@ impl<'a> FourLayerEnforcement<'a> {
         // (a) Layer 4: the cell must HOME this tenant (accept the request) — else routing this
         //     tenant here would itself be the cross-cell path. A served tenant is in the cell's
         //     region (the placement invariant + region immutability guarantee it, layers 1+2).
-        let placement = self.route(tenant_id).map_err(|reject| {
-            CrossRegionPathError::TenantNotServedHere {
-                tenant: tenant_id.clone(),
-                reject: Box::new(reject),
-            }
-        })?;
+        let placement =
+            self.route(tenant_id)
+                .map_err(|reject| CrossRegionPathError::TenantNotServedHere {
+                    tenant: tenant_id.clone(),
+                    reject: Box::new(reject),
+                })?;
         if placement.region != self.cell_region {
             // A served tenant whose region of record is not the cell's region would be a layer-1/2
             // breach — the placement invariant must have prevented it. Assert it loudly.
@@ -290,7 +293,9 @@ impl<'a> FourLayerEnforcement<'a> {
         // (b) Layer 3: a write in the cell's region IS admitted (the served tenant's data lands
         //     in-region).
         self.admit_write(&self.cell_region).map_err(|_| {
-            CrossRegionPathError::InRegionWriteRejected { cell_region: self.cell_region.clone() }
+            CrossRegionPathError::InRegionWriteRejected {
+                cell_region: self.cell_region.clone(),
+            }
         })?;
 
         // (c) Layer 3: a write in ANY OTHER region is REJECTED at the boundary (the served tenant's
@@ -431,7 +436,11 @@ mod tests {
             region: Region::new(region),
             status: CellStatus::Active,
             isolation_kind: IsolationKind::Pool,
-            capacity: Capacity { tenants_max: 1000, write_qps_max: 5000, storage_bytes_max: 1 << 40 },
+            capacity: Capacity {
+                tenants_max: 1000,
+                write_qps_max: 5000,
+                storage_bytes_max: 1 << 40,
+            },
             utilisation: 10,
             version: 1,
             endpoint: format!("cell.{region}.{id}.myelin.eu"),
@@ -468,7 +477,11 @@ mod tests {
         boundary
             .check_write(&Region::new("eu-west"))
             .expect("an in-region write is admitted");
-        assert_eq!(boundary.out_of_region_writes_admitted(), 0, "0 out-of-region writes admitted");
+        assert_eq!(
+            boundary.out_of_region_writes_admitted(),
+            0,
+            "0 out-of-region writes admitted"
+        );
         assert_eq!(boundary.cell_region().as_str(), "eu-west");
     }
 
@@ -489,9 +502,19 @@ mod tests {
             }
         );
         // The zero holds — the rejected write was NOT admitted.
-        assert_eq!(boundary.out_of_region_writes_admitted(), 0, "the out-of-region write was rejected, not admitted");
-        assert!(rejected.to_string().contains("REJECTED"), "loud: {rejected}");
-        assert!(rejected.to_string().contains("no cross-region query path"), "loud: {rejected}");
+        assert_eq!(
+            boundary.out_of_region_writes_admitted(),
+            0,
+            "the out-of-region write was rejected, not admitted"
+        );
+        assert!(
+            rejected.to_string().contains("REJECTED"),
+            "loud: {rejected}"
+        );
+        assert!(
+            rejected.to_string().contains("no cross-region query path"),
+            "loud: {rejected}"
+        );
     }
 
     /// The write boundary has NO setter for its region (region immutability, layer 1) — the cell's
@@ -512,7 +535,10 @@ mod tests {
         let _ = boundary.check_write(&Region::new("eu-north"));
         let dbg = format!("{boundary:?}");
         assert!(dbg.contains("eu-west"), "shows the cell region: {dbg}");
-        assert!(dbg.contains("out_of_region_writes_admitted"), "shows the zero: {dbg}");
+        assert!(
+            dbg.contains("out_of_region_writes_admitted"),
+            "shows the zero: {dbg}"
+        );
     }
 
     // ----- The four-layer wiring end-to-end -----
@@ -531,10 +557,16 @@ mod tests {
                 &TenantId::from_token("01J0ACME"),
                 &Region::new("eu-north"),
             )
-            .expect("the home cell serves ACME and ACME's data stays in eu-west (no cross-region path)");
+            .expect(
+                "the home cell serves ACME and ACME's data stays in eu-west (no cross-region path)",
+            );
 
         // 0 cross-cell reads (layer 4) + 0 out-of-region writes admitted (layer 3).
-        assert_eq!(enforcement.gateway().cross_tenant_reads(), 0, "0 cross-tenant/cross-cell reads (layer 4)");
+        assert_eq!(
+            enforcement.gateway().cross_tenant_reads(),
+            0,
+            "0 cross-tenant/cross-cell reads (layer 4)"
+        );
         assert_eq!(
             enforcement.write_boundary().out_of_region_writes_admitted(),
             0,
@@ -556,8 +588,13 @@ mod tests {
                 &TenantId::from_token("01J0ACME"),
                 &Region::new("eu-north"),
             )
-            .expect_err("cell-w-2 does not home ACME → the assertion fails (it must not hold ACME's data)");
-        assert!(matches!(err, CrossRegionPathError::TenantNotServedHere { .. }));
+            .expect_err(
+                "cell-w-2 does not home ACME → the assertion fails (it must not hold ACME's data)",
+            );
+        assert!(matches!(
+            err,
+            CrossRegionPathError::TenantNotServedHere { .. }
+        ));
         assert!(err.to_string().contains("does not home"), "loud: {err}");
         // The gateway rejected the misroute (layer 4 fired) — 1 misroute, 0 cross-cell reads.
         assert_eq!(enforcement.gateway().misroute_count(), 1);
@@ -582,7 +619,10 @@ mod tests {
                 &Region::new("eu-west"), // NOT foreign.
             )
             .expect_err("a non-foreign region cannot exercise the rejection half → caught");
-        assert!(matches!(err, CrossRegionPathError::ForeignRegionNotForeign { .. }));
+        assert!(matches!(
+            err,
+            CrossRegionPathError::ForeignRegionNotForeign { .. }
+        ));
     }
 
     /// **Layers 1+2 still hold in the wiring: a cross-region member cell is rejected at placement.**
@@ -601,7 +641,10 @@ mod tests {
                 isolation_tier: IsolationKind::Pool,
                 slug: "acme".into(),
                 status: PlacementStatus::Active,
-                member_cells: vec![CellId::from_token("cell-w-1"), CellId::from_token("cell-n-1")],
+                member_cells: vec![
+                    CellId::from_token("cell-w-1"),
+                    CellId::from_token("cell-n-1"),
+                ],
             },
         )
         .expect_err("a cross-region member cell is rejected (layers 1+2)");

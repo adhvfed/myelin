@@ -62,7 +62,8 @@ fn provider_emits_action(actor: Principal, subject: &str) -> OutboxStore {
         pii_key_ref: None,
     };
     tx.stage_state_change("tuple org:acme#member@p:alice written");
-    tx.emit(draft, None).expect("the action emits via the outbox");
+    tx.emit(draft, None)
+        .expect("the action emits via the outbox");
     tx.commit().expect("the action + its state co-commit");
     outbox
 }
@@ -80,49 +81,93 @@ fn cdc_10_6_provider_emits_via_outbox_consumer_appends_minimised_hash_chained_en
 
     // PROVIDER: the action-taking service emits via the outbox (the one emit path).
     let outbox = provider_emits_action(actor, "myelin://acme/iam/tuple/t1");
-    assert_eq!(outbox.outbox_depth(), 1, "exactly one event for the one committed action");
+    assert_eq!(
+        outbox.outbox_depth(),
+        1,
+        "exactly one event for the one committed action"
+    );
 
     // The relay publishes the committed event onto the bus (the audit consumer's subscription).
     let bus = InProcessBus::new();
     let relay = Relay::new(outbox.clone(), bus.clone(), || Timestamp("t".into()));
     relay.drain_to_empty();
     let published = bus.consume("");
-    assert_eq!(published.len(), 1, "the relay published exactly the one action event");
+    assert_eq!(
+        published.len(),
+        1,
+        "the relay published exactly the one action event"
+    );
     assert_eq!(published[0].type_.0, IAM_TUPLE_WRITTEN);
 
     // CONSUMER: the audit consumer (the outbox subscription) appends the delivered action.
     let audit = AuditConsumer::new();
-    assert_eq!(audit.handle(&published[0]), HandleOutcome::Done, "the audit consumer appends + acks");
+    assert_eq!(
+        audit.handle(&published[0]),
+        HandleOutcome::Done,
+        "the audit consumer appends + acks"
+    );
 
     // The appended entry: minimised actor, a hash-chain link + a Merkle leaf, carried causality.
     let tenant = TenantId("acme".into());
     let entries = audit.log().entries_for(&tenant);
-    assert_eq!(entries.len(), 1, "one delivered action → one appended audit entry");
+    assert_eq!(
+        entries.len(),
+        1,
+        "one delivered action → one appended audit entry"
+    );
     let e = &entries[0];
 
     // Minimised: the frozen `<pseudonym>@<tenant>.noreply` grammar over the PII-free principal_id.
-    assert_eq!(e.actor.actor, "u-42@acme.noreply", "actor is the minimised pseudonym grammar (4.8)");
+    assert_eq!(
+        e.actor.actor, "u-42@acme.noreply",
+        "actor is the minimised pseudonym grammar (4.8)"
+    );
     assert_eq!(e.actor.actor_kind, "human");
     // The action is the dotted type token; the subject is an ArtifactRef (an id), never content.
     assert_eq!(e.action, IAM_TUPLE_WRITTEN);
     assert_eq!(e.subject, ArtifactRef("myelin://acme/iam/tuple/t1".into()));
     // Hash-chain link + Merkle leaf both present (the construction the proofs prove over).
-    assert!(e.prev_hash.starts_with("blake3:"), "hash-chain link present");
+    assert!(
+        e.prev_hash.starts_with("blake3:"),
+        "hash-chain link present"
+    );
     assert!(e.leaf_hash.starts_with("blake3:"), "Merkle leaf present");
     // Causality carried (the why-walk anchor): this action is its own root.
-    assert_eq!(e.correlation_id, published[0].correlation_id.0, "correlation (root) carried verbatim");
-    assert_eq!(e.causation_id, None, "a root action has no immediate parent");
+    assert_eq!(
+        e.correlation_id, published[0].correlation_id.0,
+        "correlation (root) carried verbatim"
+    );
+    assert_eq!(
+        e.causation_id, None,
+        "a root action has no immediate parent"
+    );
 
     // Minimisation is structural: the action's NAME/email payload reaches the entry NOWHERE.
     let serialized = serde_json::to_string(e).expect("entry serialises");
-    assert!(!serialized.contains("Alice Example"), "no real name reaches the audit entry");
-    assert!(!serialized.contains("alice@example.test"), "no email reaches the audit entry");
+    assert!(
+        !serialized.contains("Alice Example"),
+        "no real name reaches the audit entry"
+    );
+    assert!(
+        !serialized.contains("alice@example.test"),
+        "no email reaches the audit entry"
+    );
 
     // The chain verifies intact (the tamper-evidence the construction guarantees).
-    assert!(audit.log().verify_chain(&tenant), "the appended chain verifies intact");
+    assert!(
+        audit.log().verify_chain(&tenant),
+        "the appended chain verifies intact"
+    );
     // The per-tenant Merkle root exists (what the STH signs, P-GA-20).
-    assert!(audit.log().root(&tenant).is_some(), "a per-tenant Merkle root exists (the STH input)");
+    assert!(
+        audit.log().root(&tenant).is_some(),
+        "a per-tenant Merkle root exists (the STH input)"
+    );
 
     // The audit_append_lag SLO reads green after the synchronous append.
-    assert_eq!(audit.append_lag(), 0, "audit_append_lag reads green (0) after the append");
+    assert_eq!(
+        audit.append_lag(),
+        0,
+        "audit_append_lag reads green (0) after the append"
+    );
 }

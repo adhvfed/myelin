@@ -23,12 +23,12 @@
 //! `resolve(ref, viewer, mode)` 4-step tombstone LADDER (over ALL subsystems) is the P-159 Refs
 //! resolver; THIS pair ships the GIT-OWNED `project()` half rows 5.2/5.6 assign to git.
 
-use myelin_git::project::{
-    git_commit_ref, git_pr_ref, ArtifactStore, CommitMeta, Projected, Projector,
-};
 use myelin_git::body::Body;
 use myelin_git::check_status::GateOutcome;
 use myelin_git::lifecycle::PullRequest;
+use myelin_git::project::{
+    git_commit_ref, git_pr_ref, ArtifactStore, CommitMeta, Projected, Projector,
+};
 use myelin_identity::{
     AuthzError, CaveatContext, Consistency, Credential, DataRole, Decision, IdentityService,
     ListObjectsResult, ObjectId, ObjectType, Permission, Principal, PrincipalId, PrincipalKind,
@@ -46,7 +46,10 @@ use std::collections::HashSet;
 /// through the ONE Refs codec, and the `#n` display is render-time only (0 stored display keys).
 fn provider_canonical_keys() -> Vec<(ArtifactRef, &'static str)> {
     vec![
-        (git_pr_ref("acme", "payments", 1421), "myelin://acme/git/pr/payments:1421"),
+        (
+            git_pr_ref("acme", "payments", 1421),
+            "myelin://acme/git/pr/payments:1421",
+        ),
         (
             git_commit_ref("acme", "payments", "blake3:deadbeefcafe"),
             "myelin://acme/git/commit/payments:blake3:deadbeefcafe",
@@ -76,10 +79,14 @@ struct StubId {
 }
 impl StubId {
     fn allowing(objects: &[&ArtifactRef]) -> Self {
-        Self { allow: objects.iter().map(|o| format!("view@{}", o.0)).collect() }
+        Self {
+            allow: objects.iter().map(|o| format!("view@{}", o.0)).collect(),
+        }
     }
     fn denying_all() -> Self {
-        Self { allow: HashSet::new() }
+        Self {
+            allow: HashSet::new(),
+        }
     }
 }
 impl IdentityService for StubId {
@@ -95,7 +102,11 @@ impl IdentityService for StubId {
         _c: Option<&CaveatContext>,
     ) -> IdResult<Decision> {
         let key = format!("{}@{}", permission.0, object.0);
-        Ok(if self.allow.contains(&key) { Decision::Allow } else { Decision::Deny })
+        Ok(if self.allow.contains(&key) {
+            Decision::Allow
+        } else {
+            Decision::Deny
+        })
     }
     fn list_objects(
         &self,
@@ -179,10 +190,22 @@ fn seeded_projector(authorized: bool) -> (Projector<StubId>, ArtifactRef, Artifa
     let pr_ref = git_pr_ref("acme", "payments", 1421);
     let commit_ref = git_commit_ref("acme", "payments", "blake3:deadbeefcafe");
     let mut store = ArtifactStore::new();
-    let mut pr = PullRequest::open(1421, "refs/heads/main", "refs/heads/feature", "psn:alice", false);
+    let mut pr = PullRequest::open(
+        1421,
+        "refs/heads/main",
+        "refs/heads/feature",
+        "psn:alice",
+        false,
+    );
     pr.body = Body::new("Harden the retry path", vec![]);
     store.put_pr(&pr_ref, pr, GateOutcome::AllRequiredGreen, 1, 1);
-    store.put_commit(&commit_ref, CommitMeta { subject: "Fix the leak".into(), verified: true });
+    store.put_commit(
+        &commit_ref,
+        CommitMeta {
+            subject: "Fix the leak".into(),
+            verified: true,
+        },
+    );
     let id = if authorized {
         StubId::allowing(&[&pr_ref, &commit_ref])
     } else {
@@ -195,9 +218,15 @@ fn seeded_projector(authorized: bool) -> (Projector<StubId>, ArtifactRef, Artifa
 fn provider_project_is_permission_first_deny_yields_a_tombstone_with_no_title() {
     // PROVIDER: a denied viewer's projection is a tombstone that never read the title (0 leak).
     let (projector, pr_ref, _commit) = seeded_projector(/*authorized*/ false);
-    let got = projector.project(&pr_ref, &viewer("mallory"), Zookie("z".into())).unwrap();
+    let got = projector
+        .project(&pr_ref, &viewer("mallory"), Zookie("z".into()))
+        .unwrap();
     assert!(got.is_tombstone());
-    assert_eq!(got.title(), None, "the provider's deny path never reads the title (0 leak)");
+    assert_eq!(
+        got.title(),
+        None,
+        "the provider's deny path never reads the title (0 leak)"
+    );
 }
 
 // ════════════════════════════════════════════════════════════════════════════════════════════════
@@ -236,7 +265,10 @@ fn consumer_gets_a_content_free_tombstone_for_an_unauthorized_viewer() {
     let (projector, pr_ref, _commit) = seeded_projector(/*authorized*/ false);
     // the consumer holds the canonical ref + the viewer; the ONLY thing it can learn is "(not available)".
     let rendered = consumer_render(&projector, &pr_ref, &viewer("mallory"));
-    assert_eq!(rendered, "(not available)", "0 leak — the consumer never sees the title");
+    assert_eq!(
+        rendered, "(not available)",
+        "0 leak — the consumer never sees the title"
+    );
     assert!(
         !rendered.contains("Harden"),
         "the title must NOT appear anywhere in a consumer's tombstone render"

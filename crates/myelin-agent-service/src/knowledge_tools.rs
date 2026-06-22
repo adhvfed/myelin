@@ -288,7 +288,10 @@ mod tests {
             (publish_tool_def(), PUBLISH_TOOL),
             (edit_confidential_tool_def(), EDIT_CONFIDENTIAL_TOOL),
         ] {
-            assert!(def.requires_approval, "knowledge.{tool} is HITL-gated (§6.3 — consequential)");
+            assert!(
+                def.requires_approval,
+                "knowledge.{tool} is HITL-gated (§6.3 — consequential)"
+            );
             assert_eq!(
                 def.requires_approval,
                 requires_approval_default(KNOWLEDGE_SUBSYSTEM, tool),
@@ -304,8 +307,14 @@ mod tests {
     /// seeded, not hand-set.** They apply DIRECTLY through the pipeline (no HITL gate).
     #[test]
     fn draft_and_comment_are_not_gated_by_the_frozen_default() {
-        for (def, tool) in [(draft_tool_def(), DRAFT_TOOL), (comment_tool_def(), COMMENT_TOOL)] {
-            assert!(!def.requires_approval, "knowledge.{tool} is reversible → NOT gated (§6.3)");
+        for (def, tool) in [
+            (draft_tool_def(), DRAFT_TOOL),
+            (comment_tool_def(), COMMENT_TOOL),
+        ] {
+            assert!(
+                !def.requires_approval,
+                "knowledge.{tool} is reversible → NOT gated (§6.3)"
+            );
             assert_eq!(
                 def.requires_approval,
                 requires_approval_default(KNOWLEDGE_SUBSYSTEM, tool),
@@ -322,10 +331,22 @@ mod tests {
     /// rename breaks this test (no silent drift — the KN parallel to the Git CDC).
     #[test]
     fn required_caps_are_the_kn_rebac_fragment_permissions() {
-        assert_eq!(publish_tool_def().required_caps, vec!["page.publish".to_string()]);
-        assert_eq!(edit_confidential_tool_def().required_caps, vec!["page.edit".to_string()]);
-        assert_eq!(draft_tool_def().required_caps, vec!["page.draft".to_string()]);
-        assert_eq!(comment_tool_def().required_caps, vec!["page.comment".to_string()]);
+        assert_eq!(
+            publish_tool_def().required_caps,
+            vec!["page.publish".to_string()]
+        );
+        assert_eq!(
+            edit_confidential_tool_def().required_caps,
+            vec!["page.edit".to_string()]
+        );
+        assert_eq!(
+            draft_tool_def().required_caps,
+            vec!["page.draft".to_string()]
+        );
+        assert_eq!(
+            comment_tool_def().required_caps,
+            vec!["page.comment".to_string()]
+        );
         // the object-type half IS the canonical KN ReBAC name (4.9), not a local string.
         assert_eq!(kn_objects::PAGE, "page");
     }
@@ -337,9 +358,15 @@ mod tests {
     fn register_knowledge_tools_registers_all_four_into_the_one_surface() {
         let mut cat = Catalogue { defs: vec![] };
         let registered = register_knowledge_tools(&mut cat).expect("seeded defs always admit");
-        assert_eq!(registered.len(), 4, "publish + edit_confidential + draft + comment");
+        assert_eq!(
+            registered.len(),
+            4,
+            "publish + edit_confidential + draft + comment"
+        );
 
-        let publish = cat.resolve(&ToolName(PUBLISH_TOOL.into())).expect("publish registered");
+        let publish = cat
+            .resolve(&ToolName(PUBLISH_TOOL.into()))
+            .expect("publish registered");
         assert_eq!(publish.subsystem, KNOWLEDGE_SUBSYSTEM);
         assert!(publish.requires_approval, "the registered publish is gated");
         assert_eq!(publish.required_caps, vec!["page.publish".to_string()]);
@@ -347,17 +374,32 @@ mod tests {
         let edit = cat
             .resolve(&ToolName(EDIT_CONFIDENTIAL_TOOL.into()))
             .expect("edit_confidential registered");
-        assert!(edit.requires_approval, "the registered edit_confidential is gated");
+        assert!(
+            edit.requires_approval,
+            "the registered edit_confidential is gated"
+        );
 
-        let draft = cat.resolve(&ToolName(DRAFT_TOOL.into())).expect("draft registered");
-        assert!(!draft.requires_approval, "the registered draft is NOT gated");
+        let draft = cat
+            .resolve(&ToolName(DRAFT_TOOL.into()))
+            .expect("draft registered");
+        assert!(
+            !draft.requires_approval,
+            "the registered draft is NOT gated"
+        );
         assert_eq!(draft.required_caps, vec!["page.draft".to_string()]);
 
-        let comment = cat.resolve(&ToolName(COMMENT_TOOL.into())).expect("comment registered");
-        assert!(!comment.requires_approval, "the registered comment is NOT gated");
+        let comment = cat
+            .resolve(&ToolName(COMMENT_TOOL.into()))
+            .expect("comment registered");
+        assert!(
+            !comment.requires_approval,
+            "the registered comment is NOT gated"
+        );
 
         // a tool NOT registered resolves to None (the catalogue is exactly these four).
-        assert!(cat.resolve(&ToolName("knowledge.delete_space".into())).is_none());
+        assert!(cat
+            .resolve(&ToolName("knowledge.delete_space".into()))
+            .is_none());
     }
 
     /// **The no-silent-loosening guard (VISION §3) protects the registration path.** A `publish` def
@@ -404,7 +446,13 @@ mod tests {
         }
         // the gated set (publish, edit_confidential) and the un-gated set (draft, comment) split on
         // the frozen consequential line.
-        assert!(defs[0].requires_approval && defs[1].requires_approval, "publish + edit gated");
-        assert!(!defs[2].requires_approval && !defs[3].requires_approval, "draft + comment not gated");
+        assert!(
+            defs[0].requires_approval && defs[1].requires_approval,
+            "publish + edit gated"
+        );
+        assert!(
+            !defs[2].requires_approval && !defs[3].requires_approval,
+            "draft + comment not gated"
+        );
     }
 }

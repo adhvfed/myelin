@@ -21,7 +21,11 @@ use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_tenancy::{Region, TenantId};
 
 fn principal() -> Principal {
-    Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId("acme".into()))
+    Principal::stub(
+        PrincipalId("p".into()),
+        PrincipalKind::Human,
+        TenantId("acme".into()),
+    )
 }
 
 fn envelope(id: &str, subject: &str) -> EventEnvelope {
@@ -86,7 +90,11 @@ async fn nats_bus_put_consume_ack() {
 
     // 3. consume: the durable PULL consumer delivers exactly the one stored message.
     let consumed = bus.consume(&subject_root);
-    assert_eq!(consumed.len(), 1, "exactly one message must be delivered (dedup suppressed the 2nd)");
+    assert_eq!(
+        consumed.len(),
+        1,
+        "exactly one message must be delivered (dedup suppressed the 2nd)"
+    );
     assert_eq!(consumed[0].event_id, env.event_id);
     assert_eq!(consumed[0].subject, subject);
 

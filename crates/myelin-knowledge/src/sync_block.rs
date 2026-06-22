@@ -351,10 +351,14 @@ mod tests {
     /// A source page tree: a `head` source block with two children (the synced subtree).
     fn source_tree() -> BlockTree {
         let mut t = BlockTree::new(PageId("src-page".into()));
-        t.insert_root(bid("page-root"), "paragraph", jit(0, 0)).unwrap();
-        t.insert_block(bid("head"), &bid("page-root"), "heading", jit(0, 1)).unwrap();
-        t.insert_block(bid("a"), &bid("head"), "paragraph", jit(0, 0)).unwrap();
-        t.insert_block(bid("b"), &bid("head"), "paragraph", jit(0, 1)).unwrap();
+        t.insert_root(bid("page-root"), "paragraph", jit(0, 0))
+            .unwrap();
+        t.insert_block(bid("head"), &bid("page-root"), "heading", jit(0, 1))
+            .unwrap();
+        t.insert_block(bid("a"), &bid("head"), "paragraph", jit(0, 0))
+            .unwrap();
+        t.insert_block(bid("b"), &bid("head"), "paragraph", jit(0, 1))
+            .unwrap();
         t
     }
 
@@ -391,12 +395,20 @@ mod tests {
             SyncBlockRender::Tombstone(t) => {
                 assert_eq!(t.reason, TombstoneReason::Denied, "step-1 denied");
                 assert_eq!(t.reason.label(), "denied");
-                assert_eq!(t.root, source_root(), "the tombstone carries the root (§4.6)");
+                assert_eq!(
+                    t.root,
+                    source_root(),
+                    "the tombstone carries the root (§4.6)"
+                );
             }
             SyncBlockRender::Projection(_) => panic!("a denied viewer must NEVER get a projection"),
         }
         // THE GATE: 0 blocks leaked — the denied viewer learned nothing of the source body.
-        assert_eq!(render.leaked_blocks(), 0, "sync_block_leak == 0 (no content to a denied viewer)");
+        assert_eq!(
+            render.leaked_blocks(),
+            0,
+            "sync_block_leak == 0 (no content to a denied viewer)"
+        );
         assert!(
             matches!(render, SyncBlockRender::Tombstone(_)),
             "a denied render is structurally a tombstone (carries no BlockRow)"
@@ -418,10 +430,15 @@ mod tests {
             }
             SyncBlockRender::Tombstone(_) => panic!("a permitted viewer gets a projection"),
         };
-        assert_eq!(first_ids, vec!["head", "a", "b"], "the initial live subtree");
+        assert_eq!(
+            first_ids,
+            vec!["head", "a", "b"],
+            "the initial live subtree"
+        );
 
         // EDIT the source: append a new block `c` under `head` (a source-side edit).
-        tree.insert_block(bid("c"), &bid("head"), "paragraph", jit(0, 2)).unwrap();
+        tree.insert_block(bid("c"), &bid("head"), "paragraph", jit(0, 2))
+            .unwrap();
 
         // Second render reads the CURRENT tree — the edit reflects (live, not a stale copy).
         let second = render_sync_block(&AllowAll, &viewer(), &live_source(&tree, "head"));
@@ -484,7 +501,11 @@ mod tests {
         let render = render_sync_block(&AllowAll, &viewer(), &src);
         match &render {
             SyncBlockRender::Tombstone(t) => {
-                assert_eq!(t.reason, TombstoneReason::SubGone, "the block is gone, the root resolves");
+                assert_eq!(
+                    t.reason,
+                    TombstoneReason::SubGone,
+                    "the block is gone, the root resolves"
+                );
                 assert_eq!(t.root, source_root(), "the root is still carried");
             }
             SyncBlockRender::Projection(_) => panic!("a gone source block is a tombstone"),
@@ -507,7 +528,11 @@ mod tests {
         };
         let render = render_sync_block(&AllowAll, &viewer(), &src);
         assert_eq!(render.tombstone_reason(), Some(TombstoneReason::Erased));
-        assert_eq!(render.leaked_blocks(), 0, "an erased source renders NO content");
+        assert_eq!(
+            render.leaked_blocks(),
+            0,
+            "an erased source renders NO content"
+        );
     }
 
     /// **The MOVED freshness flag rides the live projection (the stable block_id kept resolving).** A
@@ -519,7 +544,8 @@ mod tests {
         let mut tree = source_tree();
         // Move the source head under page-root's other position (an order_key rewrite; id is stable).
         // The block_id keeps resolving, so the projection LIVES — flagged Moved by the anchor resolver.
-        tree.move_block(&bid("head"), &bid("page-root"), None, None, jit(2, 2)).unwrap();
+        tree.move_block(&bid("head"), &bid("page-root"), None, None, jit(2, 2))
+            .unwrap();
         let src = SyncSource {
             root: source_root(),
             tree: Some(&tree),
@@ -530,9 +556,17 @@ mod tests {
         let render = render_sync_block(&AllowAll, &viewer(), &src);
         match render {
             SyncBlockRender::Projection(p) => {
-                assert_eq!(p.freshness, ProjectionFreshness::Moved, "the move is flagged, not lost");
+                assert_eq!(
+                    p.freshness,
+                    ProjectionFreshness::Moved,
+                    "the move is flagged, not lost"
+                );
                 let ids: Vec<&str> = p.subtree.iter().map(|r| r.block_id.as_str()).collect();
-                assert_eq!(ids, vec!["head", "a", "b"], "the moved source still renders its subtree");
+                assert_eq!(
+                    ids,
+                    vec!["head", "a", "b"],
+                    "the moved source still renders its subtree"
+                );
             }
             SyncBlockRender::Tombstone(_) => {
                 panic!("a moved source LIVES (stable block_id), it is not a tombstone")
@@ -548,8 +582,14 @@ mod tests {
         let tree = source_tree();
         let denied = render_sync_block(&DenyAll, &viewer(), &live_source(&tree, "head"));
         let allowed = render_sync_block(&AllowAll, &viewer(), &live_source(&tree, "head"));
-        assert!(matches!(denied, SyncBlockRender::Tombstone(_)), "denied viewer → tombstone");
-        assert!(matches!(allowed, SyncBlockRender::Projection(_)), "permitted viewer → projection");
+        assert!(
+            matches!(denied, SyncBlockRender::Tombstone(_)),
+            "denied viewer → tombstone"
+        );
+        assert!(
+            matches!(allowed, SyncBlockRender::Projection(_)),
+            "permitted viewer → projection"
+        );
         // Both report 0 leaked blocks (the denied one structurally; the permitted one legitimately).
         assert_eq!(denied.leaked_blocks(), 0);
         assert_eq!(allowed.leaked_blocks(), 0);

@@ -100,7 +100,11 @@ async fn kn_d10_read_time_rollup_permission_filtered_conjoin_zero_leak() {
         .await
         .expect("seed a rollup_source edge");
     }
-    let viewer = Principal::stub(PrincipalId("p:viewer".into()), PrincipalKind::Human, TenantId("acme".into()));
+    let viewer = Principal::stub(
+        PrincipalId("p:viewer".into()),
+        PrincipalKind::Human,
+        TenantId("acme".into()),
+    );
     for object in ["t:1", "t:2"] {
         sqlx::query(&format!(
             "INSERT INTO {av_tbl} (tenant, subject, relation, object_id) VALUES ('acme', 'p:viewer', 'read', $1)"
@@ -114,10 +118,17 @@ async fn kn_d10_read_time_rollup_permission_filtered_conjoin_zero_leak() {
     // ── 3. The REAL lowered SetExpr ACL (InRelation{read} → the authz_visible JOIN over db_row.id) —
     //       the SAME lowering RollupResolver conjoins. Rebind onto the suffixed test tables. ──────────
     let lowered_acl = lower_over_db_row_id(
-        &SetExpr::InRelation { relation: RelName("read".into()), via_column: db_row_id_colref() },
+        &SetExpr::InRelation {
+            relation: RelName("read".into()),
+            via_column: db_row_id_colref(),
+        },
         &viewer,
     );
-    assert_eq!(lowered_acl.joins.len(), 1, "the InRelation lowers to ONE JOIN (no N+1 over the related set)");
+    assert_eq!(
+        lowered_acl.joins.len(),
+        1,
+        "the InRelation lowers to ONE JOIN (no N+1 over the related set)"
+    );
     let join_clause = lowered_acl.joins[0]
         .clause
         .replace(AUTHZ_VISIBLE_TABLE, &av_tbl)
@@ -147,9 +158,18 @@ async fn kn_d10_read_time_rollup_permission_filtered_conjoin_zero_leak() {
     let hi: i64 = row.get("hi");
 
     // ── 5. PROVE 0 rollup leak: the aggregate reflects ONLY the visible targets. ───────────────────
-    assert_eq!(n, 2, "0 rollup leak: COUNT = 2 (the visible targets), NOT 3 (t:secret uncounted)");
-    assert_eq!(total, 30, "0 rollup leak: SUM = 30 (10+20), NOT 100030 (t:secret unsummed)");
-    assert_eq!(hi, 20, "0 rollup leak: MAX = 20 (visible), NOT 100000 (t:secret's value not disclosed)");
+    assert_eq!(
+        n, 2,
+        "0 rollup leak: COUNT = 2 (the visible targets), NOT 3 (t:secret uncounted)"
+    );
+    assert_eq!(
+        total, 30,
+        "0 rollup leak: SUM = 30 (10+20), NOT 100030 (t:secret unsummed)"
+    );
+    assert_eq!(
+        hi, 20,
+        "0 rollup leak: MAX = 20 (visible), NOT 100000 (t:secret's value not disclosed)"
+    );
 
     // ── 6. The authorized viewer (granted all three) sees the full aggregate — per-viewer conjoin,
     //       not a blanket hide. ─────────────────────────────────────────────────────────────────────
@@ -176,8 +196,15 @@ async fn kn_d10_read_time_rollup_permission_filtered_conjoin_zero_leak() {
          WHERE e.tenant = 'acme' AND e.src_row = 'src:1' AND e.rel = 'rollup_source' \
            AND ({acl_pred})"
     );
-    let admin_total: i64 = sqlx::query(&admin_sql).fetch_one(&admin).await.expect("admin rollup runs").get("total");
-    assert_eq!(admin_total, 100_030, "the authorized viewer sees the full SUM (per-viewer conjoin, not a blanket hide)");
+    let admin_total: i64 = sqlx::query(&admin_sql)
+        .fetch_one(&admin)
+        .await
+        .expect("admin rollup runs")
+        .get("total");
+    assert_eq!(
+        admin_total, 100_030,
+        "the authorized viewer sees the full SUM (per-viewer conjoin, not a blanket hide)"
+    );
 
     println!(
         "[P-308 INTEGRATION GREEN] KN-D10 read-time rollup PROVEN against live Postgres: a SUM/COUNT/MAX \
@@ -189,7 +216,16 @@ async fn kn_d10_read_time_rollup_permission_filtered_conjoin_zero_leak() {
     );
 
     // ── 7. Cleanup (forward teardown). ───────────────────────────────────────────────────────────
-    sqlx::query(&format!("DROP TABLE {row_tbl}")).execute(&admin).await.unwrap();
-    sqlx::query(&format!("DROP TABLE {rel_tbl}")).execute(&admin).await.unwrap();
-    sqlx::query(&format!("DROP TABLE {av_tbl}")).execute(&admin).await.unwrap();
+    sqlx::query(&format!("DROP TABLE {row_tbl}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    sqlx::query(&format!("DROP TABLE {rel_tbl}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    sqlx::query(&format!("DROP TABLE {av_tbl}"))
+        .execute(&admin)
+        .await
+        .unwrap();
 }

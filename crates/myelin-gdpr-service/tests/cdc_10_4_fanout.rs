@@ -44,11 +44,18 @@ fn tenant() -> TenantId {
 }
 
 fn subject(id: &str) -> SubjectRef {
-    SubjectRef::new(Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant()))
+    SubjectRef::new(Principal::stub(
+        PrincipalId(id.into()),
+        PrincipalKind::Human,
+        tenant(),
+    ))
 }
 
 fn subject_scope(s: &str) -> EraseScope {
-    EraseScope::Subject { subject: subject(s), tenant: tenant() }
+    EraseScope::Subject {
+        subject: subject(s),
+        tenant: tenant(),
+    }
 }
 
 fn kms_with_all_holder_keys(t: &TenantId) -> InMemoryShredKms {
@@ -65,7 +72,10 @@ fn kms_with_all_holder_keys(t: &TenantId) -> InMemoryShredKms {
     .enumerate()
     {
         kms.provision(
-            ShredKeyHandle { tenant: t.clone(), class: ShredKeyClass::Subject((*id).to_string()) },
+            ShredKeyHandle {
+                tenant: t.clone(),
+                class: ShredKeyClass::Subject((*id).to_string()),
+            },
             100 + i as u64,
         );
     }
@@ -82,7 +92,12 @@ fn seam_holders(kms: &InMemoryShredKms) -> Vec<(&'static str, SeamHolder<'_>)> {
         holder_ids::BACKUP,
     ]
     .into_iter()
-    .map(|id| (id, SeamHolder::new(id, ShredKeyClass::Subject(id.to_string()), kms)))
+    .map(|id| {
+        (
+            id,
+            SeamHolder::new(id, ShredKeyClass::Subject(id.to_string()), kms),
+        )
+    })
     .collect()
 }
 
@@ -121,7 +136,10 @@ fn cdc_10_4_driver_fans_out_data_map_driven_and_seals_a_verifiable_receipt() {
     let holders = seam_holders(&kms);
     // provider: the upstream holder orchestrator + the DSR spine + the legal-hold gate.
     let upstream = UpstreamHolderOrchestrator::register_m1_upstream(
-        holders.iter().map(|(id, h)| (*id, h as &dyn PersonalDataHolder)).collect(),
+        holders
+            .iter()
+            .map(|(id, h)| (*id, h as &dyn PersonalDataHolder))
+            .collect(),
     );
     let dsr = DsrOrchestrator::new(TestClock::at(1_700_000_000));
     let holds = LegalHoldRegistry::new();
@@ -136,11 +154,16 @@ fn cdc_10_4_driver_fans_out_data_map_driven_and_seals_a_verifiable_receipt() {
         Posture::Controller,
         Initiator::Myelin,
     );
-    assert!(dsr.validate(&id).unwrap(), "controller erase admitted by the posture gate");
+    assert!(
+        dsr.validate(&id).unwrap(),
+        "controller erase admitted by the posture gate"
+    );
 
     // the driver fans it out (resolve from map → gate → fan-out → verify → complete).
     let checklist = EraseChecklist::new();
-    let outcome = driver.drive(&id, &inventory(), &upstream, &checklist).unwrap();
+    let outcome = driver
+        .drive(&id, &inventory(), &upstream, &checklist)
+        .unwrap();
 
     // the DSR reached Completed via the total + ordered state machine.
     assert_eq!(dsr.state_of(&id).unwrap(), DsrState::Completed);
@@ -157,9 +180,20 @@ fn cdc_10_4_driver_fans_out_data_map_driven_and_seals_a_verifiable_receipt() {
         other => panic!("expected Erased, got {other:?}"),
     };
     assert_eq!(receipt.outcome, "erased");
-    assert_eq!(receipt.holder_receipts.len(), 6, "all six upstream holders receipted in order");
-    assert_eq!(receipt.holder_receipts[0].holder_id, holder_ids::IDENTITY, "Identity FIRST (§4.1)");
-    assert!(receipt.content_hash.starts_with("blake3:"), "content-addressed (§4.2)");
+    assert_eq!(
+        receipt.holder_receipts.len(),
+        6,
+        "all six upstream holders receipted in order"
+    );
+    assert_eq!(
+        receipt.holder_receipts[0].holder_id,
+        holder_ids::IDENTITY,
+        "Identity FIRST (§4.1)"
+    );
+    assert!(
+        receipt.content_hash.starts_with("blake3:"),
+        "content-addressed (§4.2)"
+    );
     for hr in &receipt.holder_receipts {
         assert!(
             hr.receipt.receipt.key_epoch_destroyed.is_some(),
@@ -170,7 +204,10 @@ fn cdc_10_4_driver_fans_out_data_map_driven_and_seals_a_verifiable_receipt() {
     // the DSR certificate seals the same per-holder receipts (the Merkle inclusion is P-GA-20).
     let cert = dsr.dsr_certificate(&id).unwrap();
     assert_eq!(cert.receipts.len(), 6);
-    assert!(cert.merkle_inclusion.is_none(), "the Merkle seal is P-GA-20 → P-119");
+    assert!(
+        cert.merkle_inclusion.is_none(),
+        "the Merkle seal is P-GA-20 → P-119"
+    );
 }
 
 /// PROVIDER + CONSUMER — the legal-hold gate (§4.1 step 3): a subject under an active hold has its
@@ -182,11 +219,20 @@ fn cdc_10_4_legal_hold_defers_an_erase_but_a_read_right_proceeds() {
     let kms = kms_with_all_holder_keys(&t);
     let holders = seam_holders(&kms);
     let upstream = UpstreamHolderOrchestrator::register_m1_upstream(
-        holders.iter().map(|(id, h)| (*id, h as &dyn PersonalDataHolder)).collect(),
+        holders
+            .iter()
+            .map(|(id, h)| (*id, h as &dyn PersonalDataHolder))
+            .collect(),
     );
     let dsr = DsrOrchestrator::new(TestClock::at(0));
     let holds = LegalHoldRegistry::new();
-    holds.set(HoldScope::Subject { tenant: "acme".into(), subject: "held".into() }, true);
+    holds.set(
+        HoldScope::Subject {
+            tenant: "acme".into(),
+            subject: "held".into(),
+        },
+        true,
+    );
     let driver = FanOutDriver::new(&dsr, &holds);
 
     // an ERASE under the hold is DEFERRED — no holder is driven.
@@ -200,11 +246,24 @@ fn cdc_10_4_legal_hold_defers_an_erase_but_a_read_right_proceeds() {
     );
     dsr.validate(&erase).unwrap();
     let checklist = EraseChecklist::new();
-    let outcome = driver.drive(&erase, &inventory(), &upstream, &checklist).unwrap();
-    assert!(matches!(outcome, FanOutOutcome::DeferredUnderHold(_)), "erase deferred under hold");
+    let outcome = driver
+        .drive(&erase, &inventory(), &upstream, &checklist)
+        .unwrap();
+    assert!(
+        matches!(outcome, FanOutOutcome::DeferredUnderHold(_)),
+        "erase deferred under hold"
+    );
     assert_eq!(outcome.receipt().outcome, "deferred:legal_hold");
-    assert_eq!(dsr.state_of(&erase).unwrap(), DsrState::AwaitingHolders, "parked, not completed");
-    assert_eq!(upstream.fanout_coverage(&checklist), 0.0, "0 holders driven under hold");
+    assert_eq!(
+        dsr.state_of(&erase).unwrap(),
+        DsrState::AwaitingHolders,
+        "parked, not completed"
+    );
+    assert_eq!(
+        upstream.fanout_coverage(&checklist),
+        0.0,
+        "0 holders driven under hold"
+    );
 
     // a READ RIGHT for the held subject is NEVER suspended — it completes.
     let access = dsr.dsr_submit(
@@ -216,13 +275,26 @@ fn cdc_10_4_legal_hold_defers_an_erase_but_a_read_right_proceeds() {
         Initiator::Myelin,
     );
     dsr.validate(&access).unwrap();
-    let read_outcome = driver.drive(&access, &inventory(), &upstream, &EraseChecklist::new()).unwrap();
-    assert!(matches!(read_outcome, FanOutOutcome::ReadRightServed(_)), "access proceeds under hold");
+    let read_outcome = driver
+        .drive(&access, &inventory(), &upstream, &EraseChecklist::new())
+        .unwrap();
+    assert!(
+        matches!(read_outcome, FanOutOutcome::ReadRightServed(_)),
+        "access proceeds under hold"
+    );
     assert_eq!(dsr.state_of(&access).unwrap(), DsrState::Completed);
 
     // clear the hold and RE-DRIVE the erase — it resumes to completion (resumable checklist).
-    holds.set(HoldScope::Subject { tenant: "acme".into(), subject: "held".into() }, false);
-    let resumed = driver.drive(&erase, &inventory(), &upstream, &checklist).unwrap();
+    holds.set(
+        HoldScope::Subject {
+            tenant: "acme".into(),
+            subject: "held".into(),
+        },
+        false,
+    );
+    let resumed = driver
+        .drive(&erase, &inventory(), &upstream, &checklist)
+        .unwrap();
     assert!(matches!(resumed, FanOutOutcome::Erased(_)));
     assert_eq!(dsr.state_of(&erase).unwrap(), DsrState::Completed);
     assert_eq!(upstream.fanout_coverage(&checklist), 1.0);

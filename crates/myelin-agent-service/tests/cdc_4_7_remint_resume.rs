@@ -87,28 +87,56 @@ fn remint_on_resume_keeps_a_multi_day_pause_attributed_within_ttl() {
     // Dispatch a long-lived run (3-day life) at t=1000. Token life == min(W, run life) == W (300).
     id.mint_at_dispatch(1000, 259_200).expect("dispatch mint");
     let dispatch_jti = id.current().unwrap().jti.clone();
-    assert_eq!(id.current().unwrap().ttl_secs, FAIL_STATIC_W_SECS, "dispatch token TTL == W");
+    assert_eq!(
+        id.current().unwrap().ttl_secs,
+        FAIL_STATIC_W_SECS,
+        "dispatch token TTL == W"
+    );
 
     // PARK ~2 days (the dispatch token's 300s TTL expired harmlessly while the run held no thread),
     // then RESUME. The driver re-mints a fresh token BEFORE the resumed work runs.
     let resume_at = 1000 + 172_800; // +2 days.
-    let resumed = id.remint_on_resume(resume_at).expect("re-mint on resume").clone();
-    assert_ne!(resumed.jti, dispatch_jti, "the re-mint is a FRESH token (not the dispatch one)");
+    let resumed = id
+        .remint_on_resume(resume_at)
+        .expect("re-mint on resume")
+        .clone();
+    assert_ne!(
+        resumed.jti, dispatch_jti,
+        "the re-mint is a FRESH token (not the dispatch one)"
+    );
     // remaining = (1000 + 259200) - 173800 = 86400 (1 day) > W → clamp to W (attributed within bound).
-    assert!(resumed.ttl_secs <= FAIL_STATIC_W_SECS, "re-mint TTL within the W bound");
+    assert!(
+        resumed.ttl_secs <= FAIL_STATIC_W_SECS,
+        "re-mint TTL within the W bound"
+    );
 
     // SAME caveats on re-mint (attenuate-only — a resume never widens the grant).
     let calls = provider.calls.lock().unwrap();
-    assert_eq!(calls.len(), 2, "one mint at dispatch + one re-mint on resume");
+    assert_eq!(
+        calls.len(),
+        2,
+        "one mint at dispatch + one re-mint on resume"
+    );
     let (_, _, cav, _) = calls[1].clone();
-    assert!(cav.0.contains(&"run:R1".to_string()), "per-run attenuation re-carried on resume");
-    assert!(cav.0.contains(&"delegated:human-x".to_string()), "SAME delegation grant on resume");
+    assert!(
+        cav.0.contains(&"run:R1".to_string()),
+        "per-run attenuation re-carried on resume"
+    );
+    assert!(
+        cav.0.contains(&"delegated:human-x".to_string()),
+        "SAME delegation grant on resume"
+    );
     drop(calls);
 
     // 0 UNATTRIBUTED WINDOW across the pause: every executing instant opened a live segment.
-    assert!(!id.attribution_window().has_unattributed_gap(), "0 unattributed window across the pause");
-    assert!(id.attribution_window().max_segment_width() <= FAIL_STATIC_W_SECS,
-        "no token widened the attribution window beyond W");
+    assert!(
+        !id.attribution_window().has_unattributed_gap(),
+        "0 unattributed window across the pause"
+    );
+    assert!(
+        id.attribution_window().max_segment_width() <= FAIL_STATIC_W_SECS,
+        "no token widened the attribution window beyond W"
+    );
     assert_eq!(id.reminted(), 1, "exactly one re-mint on the resume");
 }
 
@@ -129,10 +157,21 @@ fn revoke_after_resume_is_idempotent_even_on_crash() {
         ttl_w: FAIL_STATIC_W_SECS as i64,
     };
     // first teardown: revoke the CURRENT (re-minted) token (lag 0 — teardown == now).
-    assert_eq!(id.revoke_on_teardown(&revoker, 2100, 2100), 0, "first revoke lands");
-    assert!(revoker.is_dead(&fresh_jti, 2100), "the fresh token is dead after revoke");
+    assert_eq!(
+        id.revoke_on_teardown(&revoker, 2100, 2100),
+        0,
+        "first revoke lands"
+    );
+    assert!(
+        revoker.is_dead(&fresh_jti, 2100),
+        "the fresh token is dead after revoke"
+    );
     // a SECOND teardown (a crash-recovery sweep) is a no-op — idempotent even on crash.
-    assert_eq!(id.revoke_on_teardown(&revoker, 2105, 2100), 0, "a re-revoke is a no-op (idempotent)");
+    assert_eq!(
+        id.revoke_on_teardown(&revoker, 2105, 2100),
+        0,
+        "a re-revoke is a no-op (idempotent)"
+    );
 
     // belt-and-suspenders: even ABSENT the explicit revoke, the token auto-expires within W.
     let other = IdentityRevokeProvider {
@@ -140,8 +179,14 @@ fn revoke_after_resume_is_idempotent_even_on_crash() {
         minted_at: 2000,
         ttl_w: FAIL_STATIC_W_SECS as i64,
     };
-    assert!(!other.is_dead("jti:never", 2000), "not yet expired before W");
-    assert!(other.is_dead("jti:never", 2000 + FAIL_STATIC_W_SECS as i64), "auto-expires by minted_at + W");
+    assert!(
+        !other.is_dead("jti:never", 2000),
+        "not yet expired before W"
+    );
+    assert!(
+        other.is_dead("jti:never", 2000 + FAIL_STATIC_W_SECS as i64),
+        "auto-expires by minted_at + W"
+    );
 }
 
 /// **A resume PAST the run deadline is refused LOUD (never widen attribution past run life, §5.7).**
@@ -152,6 +197,11 @@ fn remint_past_the_run_deadline_is_refused() {
     let provider = Arc::new(IdentityMintProvider::default());
     let mut id = RunIdentity::new(provider, "psn:agent-7", "R3", caveats());
     id.mint_at_dispatch(1000, 300).expect("dispatch"); // deadline 1300.
-    let err = id.remint_on_resume(1400).expect_err("resume past the deadline is refused");
-    assert!(err.to_string().contains("no remaining life"), "refused LOUD: {err}");
+    let err = id
+        .remint_on_resume(1400)
+        .expect_err("resume past the deadline is refused");
+    assert!(
+        err.to_string().contains("no remaining life"),
+        "refused LOUD: {err}"
+    );
 }

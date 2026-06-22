@@ -52,7 +52,10 @@ async fn fork_cache_confinement_holds_on_real_valkey() {
     // ── 0 fork writes in the trusted scope (the poisoned-cache defence on the REAL server) ──
     // A fork run derives fork:<pr_id> from its CI-stamped trust tier — NEVER trusted.
     let fork_scope = TrustScope::for_run(TrustTier::UntrustedFork, "42");
-    assert!(!fork_scope.is_trusted(), "a fork run is structurally never the trusted scope");
+    assert!(
+        !fork_scope.is_trusted(),
+        "a fork run is structurally never the trusted scope"
+    );
     let fork = ScopedCache::new(&valkey, fork_scope);
     fork.set(&t, "dep-graph", b"attacker-controlled", ttl)
         .expect("fork write to the real Valkey");

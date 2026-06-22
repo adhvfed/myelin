@@ -37,21 +37,33 @@ fn stor_d5_residency_pinning_zero_cross_region_egress() {
     let att = set
         .residency_verify(&tenant, &region)
         .expect("residency verify attests the tenant's single region");
-    assert_eq!(att.region.as_str(), "fr-par", "the attestation pins the tenant's single region");
+    assert_eq!(
+        att.region.as_str(),
+        "fr-par",
+        "the attestation pins the tenant's single region"
+    );
     assert_eq!(
         att.store_regions.len(),
         ResidencyStoreClass::M1_SET.len(),
         "every M1 store (OLTP/blob/index/KMS) reported its region"
     );
     for (class, r) in &att.store_regions {
-        assert_eq!(r.as_str(), "fr-par", "store `{}` is region-pinned to the tenant's region", class.label());
+        assert_eq!(
+            r.as_str(),
+            "fr-par",
+            "store `{}` is region-pinned to the tenant's region",
+            class.label()
+        );
     }
     let green = ResidencyVerifySignal::green(&att);
     assert_eq!(
         green.cross_region_egress, 0,
         "STOR-D5 GATE: 0 cross-region PII egress (the headline zero)"
     );
-    assert_eq!(green.stores_attested, ResidencyStoreClass::M1_SET.len() as u32);
+    assert_eq!(
+        green.stores_attested,
+        ResidencyStoreClass::M1_SET.len() as u32
+    );
 
     // ── (2) THE WRITE BOUNDARY: an out-of-region write is REJECTED in-process (no source to
     //        replicate). The partition key carries the region; the residency-pin boundary rejects.

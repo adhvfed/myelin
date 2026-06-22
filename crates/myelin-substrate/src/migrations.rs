@@ -85,7 +85,12 @@ pub struct Migration {
 impl Migration {
     /// A plain forward migration (non-hot table; no phase discipline required).
     pub fn plain(id: &'static str, ddl: &'static str) -> Migration {
-        Migration { id, ddl, phase: MigrationPhase::Plain, table: None }
+        Migration {
+            id,
+            ddl,
+            phase: MigrationPhase::Plain,
+            table: None,
+        }
     }
 
     /// A phased migration on a (possibly hot) table — the runner checks it against the hot-table
@@ -96,7 +101,12 @@ impl Migration {
         phase: MigrationPhase,
         table: &'static str,
     ) -> Migration {
-        Migration { id, ddl, phase, table: Some(table) }
+        Migration {
+            id,
+            ddl,
+            phase,
+            table: Some(table),
+        }
     }
 }
 
@@ -110,7 +120,12 @@ impl Migrations {
     /// Register PLAIN migrations from `(id, ddl)` pairs (ordered) — the ergonomic path for
     /// ordinary forward migrations (new tables, cold-table nullable adds).
     pub fn new(items: impl IntoIterator<Item = (&'static str, &'static str)>) -> Migrations {
-        Migrations(items.into_iter().map(|(id, ddl)| Migration::plain(id, ddl)).collect())
+        Migrations(
+            items
+                .into_iter()
+                .map(|(id, ddl)| Migration::plain(id, ddl))
+                .collect(),
+        )
     }
 
     /// Register an explicit migration list (so a hot-table change can carry its phase + table).
@@ -137,7 +152,9 @@ pub struct HotTables {
 impl HotTables {
     /// No hot tables declared (the default for a service with no high-write table yet).
     pub fn none() -> HotTables {
-        HotTables { tables: BTreeSet::new() }
+        HotTables {
+            tables: BTreeSet::new(),
+        }
     }
 
     /// Declare a service's hot tables (§9.4) — measured-not-predicted per subsystem.
@@ -181,8 +198,7 @@ pub fn is_blocking_alter(ddl: &str) -> bool {
         && lower.contains("not null")
         && !lower.contains("default");
     let alter_column_inplace = lower.contains("alter table") && lower.contains("alter column");
-    let non_concurrent_index =
-        lower.contains("create index") && !lower.contains("concurrently");
+    let non_concurrent_index = lower.contains("create index") && !lower.contains("concurrently");
     add_not_null || alter_column_inplace || non_concurrent_index
 }
 
@@ -197,7 +213,9 @@ pub struct MigrationRunner {
 impl MigrationRunner {
     /// A fresh runner (nothing applied yet).
     pub fn new() -> MigrationRunner {
-        MigrationRunner { applied: Vec::new() }
+        MigrationRunner {
+            applied: Vec::new(),
+        }
     }
 
     /// Apply each migration in order, against the service's [`HotTables`] declaration (§9.4).
@@ -280,8 +298,13 @@ mod tests {
             ),
         ]);
         let mut runner = MigrationRunner::new();
-        runner.run(&migrations, &hot).expect("expand→backfill→contract is admitted on a hot table");
-        assert_eq!(runner.applied(), &["0010_expand", "0011_backfill", "0012_contract"]);
+        runner
+            .run(&migrations, &hot)
+            .expect("expand→backfill→contract is admitted on a hot table");
+        assert_eq!(
+            runner.applied(),
+            &["0010_expand", "0011_backfill", "0012_contract"]
+        );
     }
 
     /// A destructive (DROP) migration is REJECTED at boot — forward-only is structural (§9.1).
@@ -289,8 +312,14 @@ mod tests {
     fn destructive_migration_is_rejected() {
         let migrations = Migrations::of([Migration::plain("0010_bad", "DROP TABLE issue")]);
         let mut runner = MigrationRunner::new();
-        let e = runner.run(&migrations, &HotTables::none()).expect_err("DROP must be rejected");
-        assert!(e.0.contains("forward-only"), "the error names forward-only: {}", e.0);
+        let e = runner
+            .run(&migrations, &HotTables::none())
+            .expect_err("DROP must be rejected");
+        assert!(
+            e.0.contains("forward-only"),
+            "the error names forward-only: {}",
+            e.0
+        );
     }
 
     /// A blocking `ALTER` on a DECLARED-HOT table is REJECTED (§9.4) — a hot-table change must be
@@ -305,9 +334,19 @@ mod tests {
             "issue",
         )]);
         let mut runner = MigrationRunner::new();
-        let e = runner.run(&migrations, &hot).expect_err("a blocking ALTER on a hot table is rejected");
-        assert!(e.0.contains("declared-HOT"), "the error names the hot-table rule: {}", e.0);
-        assert!(e.0.contains("issue"), "the error names the offending table: {}", e.0);
+        let e = runner
+            .run(&migrations, &hot)
+            .expect_err("a blocking ALTER on a hot table is rejected");
+        assert!(
+            e.0.contains("declared-HOT"),
+            "the error names the hot-table rule: {}",
+            e.0
+        );
+        assert!(
+            e.0.contains("issue"),
+            "the error names the offending table: {}",
+            e.0
+        );
     }
 
     /// The SAME blocking `ALTER` on a NON-hot table is ADMITTED — the per-table tightening only
@@ -323,7 +362,9 @@ mod tests {
             "audit_archive",
         )]);
         let mut runner = MigrationRunner::new();
-        runner.run(&migrations, &cold).expect("a blocking ALTER on a non-hot table is admitted");
+        runner
+            .run(&migrations, &cold)
+            .expect("a blocking ALTER on a non-hot table is admitted");
         assert_eq!(runner.applied(), &["0010_cold"]);
     }
 
@@ -334,10 +375,16 @@ mod tests {
         assert!(is_destructive("DROP TABLE issue"));
         assert!(is_destructive("ALTER TABLE issue DROP COLUMN body"));
         assert!(!is_destructive("ALTER TABLE issue ADD COLUMN x INT"));
-        assert!(is_blocking_alter("ALTER TABLE issue ADD COLUMN x TEXT NOT NULL"));
-        assert!(is_blocking_alter("ALTER TABLE issue ALTER COLUMN x TYPE BIGINT"));
+        assert!(is_blocking_alter(
+            "ALTER TABLE issue ADD COLUMN x TEXT NOT NULL"
+        ));
+        assert!(is_blocking_alter(
+            "ALTER TABLE issue ALTER COLUMN x TYPE BIGINT"
+        ));
         assert!(is_blocking_alter("CREATE INDEX idx ON issue (x)"));
-        assert!(!is_blocking_alter("CREATE INDEX CONCURRENTLY idx ON issue (x)"));
+        assert!(!is_blocking_alter(
+            "CREATE INDEX CONCURRENTLY idx ON issue (x)"
+        ));
         assert!(!is_blocking_alter("ALTER TABLE issue ADD COLUMN x TEXT")); // nullable add = expand.
     }
 
@@ -349,6 +396,9 @@ mod tests {
         assert!(hot.is_hot("block"));
         assert!(hot.is_hot("doc_op"));
         assert!(!hot.is_hot("audit_archive"));
-        assert_eq!(hot.tables().collect::<Vec<_>>(), vec!["block", "db_row", "doc_op"]);
+        assert_eq!(
+            hot.tables().collect::<Vec<_>>(),
+            vec!["block", "db_row", "doc_op"]
+        );
     }
 }

@@ -115,7 +115,9 @@ impl PgRelay {
         .execute(&mut *tx)
         .await
         .map_err(|e| PgError::Query(e.to_string()))?;
-        tx.commit().await.map_err(|e| PgError::Query(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| PgError::Query(e.to_string()))?;
         Ok(())
     }
 
@@ -170,7 +172,9 @@ impl PgRelay {
             published += 1;
         }
 
-        tx.commit().await.map_err(|e| PgError::Query(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| PgError::Query(e.to_string()))?;
         Ok(published)
     }
 

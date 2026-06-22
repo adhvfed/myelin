@@ -589,12 +589,26 @@ mod tests {
         let eng = engine_with(&s, &[add("repo:core", "reader", "p:alice")]);
         // bob has no grant; a different relation also denies.
         assert_eq!(
-            eng.check(&s, &subject("p:bob"), &RelName("reader".into()), &ArtifactRef("repo:core".into()), &latest(), None),
+            eng.check(
+                &s,
+                &subject("p:bob"),
+                &RelName("reader".into()),
+                &ArtifactRef("repo:core".into()),
+                &latest(),
+                None
+            ),
             Decision::Deny,
             "no tuple for bob ⇒ deny"
         );
         assert_eq!(
-            eng.check(&s, &subject("p:alice"), &RelName("writer".into()), &ArtifactRef("repo:core".into()), &latest(), None),
+            eng.check(
+                &s,
+                &subject("p:alice"),
+                &RelName("writer".into()),
+                &ArtifactRef("repo:core".into()),
+                &latest(),
+                None
+            ),
             Decision::Deny,
             "alice has reader, not writer ⇒ deny"
         );
@@ -622,10 +636,21 @@ mod tests {
             &latest(),
             None,
         );
-        assert_eq!(d, Decision::Allow, "alice inherits reader via org membership (userset rewrite)");
+        assert_eq!(
+            d,
+            Decision::Allow,
+            "alice inherits reader via org membership (userset rewrite)"
+        );
         // bob is NOT a member ⇒ does not inherit ⇒ deny.
         assert_eq!(
-            eng.check(&s, &subject("p:bob"), &RelName("reader".into()), &ArtifactRef("repo:core".into()), &latest(), None),
+            eng.check(
+                &s,
+                &subject("p:bob"),
+                &RelName("reader".into()),
+                &ArtifactRef("repo:core".into()),
+                &latest(),
+                None
+            ),
             Decision::Deny,
             "a non-member does not inherit"
         );
@@ -639,13 +664,27 @@ mod tests {
         let eng = engine_with(&s, &[add("repo:core", "reader", "p:alice")]);
         // Empty object ref → uncertainty → Deny.
         assert_eq!(
-            eng.check(&s, &subject("p:alice"), &RelName("reader".into()), &ArtifactRef("   ".into()), &latest(), None),
+            eng.check(
+                &s,
+                &subject("p:alice"),
+                &RelName("reader".into()),
+                &ArtifactRef("   ".into()),
+                &latest(),
+                None
+            ),
             Decision::Deny,
             "an unparseable object ref fails closed"
         );
         // Empty permission → malformed → Deny.
         assert_eq!(
-            eng.check(&s, &subject("p:alice"), &RelName("".into()), &ArtifactRef("repo:core".into()), &latest(), None),
+            eng.check(
+                &s,
+                &subject("p:alice"),
+                &RelName("".into()),
+                &ArtifactRef("repo:core".into()),
+                &latest(),
+                None
+            ),
             Decision::Deny,
             "an empty permission fails closed"
         );
@@ -660,7 +699,14 @@ mod tests {
         let mut suspended = subject("p:alice");
         suspended.status = PrincipalStatus::Disabled;
         assert_eq!(
-            eng.check(&s, &suspended, &RelName("reader".into()), &ArtifactRef("repo:core".into()), &latest(), None),
+            eng.check(
+                &s,
+                &suspended,
+                &RelName("reader".into()),
+                &ArtifactRef("repo:core".into()),
+                &latest(),
+                None
+            ),
             Decision::Deny,
             "a disabled subject is denied despite the grant (ID-D1)"
         );
@@ -678,19 +724,40 @@ mod tests {
         let z0 = store.current_zookie();
         // z1: grant alice reader on repo:core.
         let z1 = store
-            .write_tuples(&s, &actor, &[add("repo:core", "reader", "p:alice")], None, None, now())
+            .write_tuples(
+                &s,
+                &actor,
+                &[add("repo:core", "reader", "p:alice")],
+                None,
+                None,
+                now(),
+            )
             .expect("grant");
         let eng = CheckEngine::new(store);
 
         // At the OLD snapshot z0, the newer tuple (written at z1 > z0) is invisible ⇒ Deny.
         assert_eq!(
-            eng.check(&s, &subject("p:alice"), &RelName("reader".into()), &ArtifactRef("repo:core".into()), &at(&z0.0), None),
+            eng.check(
+                &s,
+                &subject("p:alice"),
+                &RelName("reader".into()),
+                &ArtifactRef("repo:core".into()),
+                &at(&z0.0),
+                None
+            ),
             Decision::Deny,
             "a check at the pre-grant zookie does not see the grant written after it"
         );
         // At the grant's snapshot z1 (at-or-after), the tuple is visible ⇒ Allow.
         assert_eq!(
-            eng.check(&s, &subject("p:alice"), &RelName("reader".into()), &ArtifactRef("repo:core".into()), &at(&z1.0), None),
+            eng.check(
+                &s,
+                &subject("p:alice"),
+                &RelName("reader".into()),
+                &ArtifactRef("repo:core".into()),
+                &at(&z1.0),
+                None
+            ),
             Decision::Allow,
             "a check at-or-after the grant zookie sees the grant"
         );
@@ -708,7 +775,11 @@ mod tests {
         let n = MAX_REWRITE_DEPTH + 4;
         let mut deltas: Vec<TupleDelta> = Vec::new();
         for i in 0..n {
-            deltas.push(add(&format!("level_{i}"), "m", &format!("level_{}#m", i + 1)));
+            deltas.push(add(
+                &format!("level_{i}"),
+                "m",
+                &format!("level_{}#m", i + 1),
+            ));
         }
         // The concrete grant is at the FAR end (depth n) — beyond the bound.
         deltas.push(add(&format!("level_{n}"), "m", "p:deep"));
@@ -744,7 +815,11 @@ mod tests {
             &latest(),
             None,
         );
-        assert_eq!(d, Decision::Deny, "a userset cycle denies (bounded) rather than diverging");
+        assert_eq!(
+            d,
+            Decision::Deny,
+            "a userset cycle denies (bounded) rather than diverging"
+        );
     }
 
     /// **Memoised-per-request: the same subproblem is computed once.** A diamond
@@ -767,7 +842,14 @@ mod tests {
         );
         // Correctness: alice reaches `top` through both arms.
         assert_eq!(
-            eng.check(&s, &subject("p:alice"), &RelName("m".into()), &ArtifactRef("top".into()), &latest(), None),
+            eng.check(
+                &s,
+                &subject("p:alice"),
+                &RelName("m".into()),
+                &ArtifactRef("top".into()),
+                &latest(),
+                None
+            ),
             Decision::Allow,
             "the diamond resolves to Allow"
         );
@@ -811,7 +893,14 @@ mod tests {
             attrs: ok,
         };
         assert_eq!(
-            eng.check(&s, &subject("p:alice"), &RelName("view_field".into()), &ArtifactRef("issue:PROJ-1".into()), &latest(), Some(&cav_ok)),
+            eng.check(
+                &s,
+                &subject("p:alice"),
+                &RelName("view_field".into()),
+                &ArtifactRef("issue:PROJ-1".into()),
+                &latest(),
+                Some(&cav_ok)
+            ),
             Decision::Allow,
             "a satisfied literal caveat keeps the Allow"
         );
@@ -828,7 +917,14 @@ mod tests {
             attrs: bad,
         };
         assert_eq!(
-            eng.check(&s, &subject("p:alice"), &RelName("view_field".into()), &ArtifactRef("issue:PROJ-1".into()), &latest(), Some(&cav_bad)),
+            eng.check(
+                &s,
+                &subject("p:alice"),
+                &RelName("view_field".into()),
+                &ArtifactRef("issue:PROJ-1".into()),
+                &latest(),
+                Some(&cav_bad)
+            ),
             Decision::Deny,
             "a violated literal caveat denies (redacts the field)"
         );
@@ -863,7 +959,11 @@ mod tests {
             Decision::Conditional,
             "a caveat needing missing context is Conditional, NEVER a silent Allow"
         );
-        assert_ne!(d, Decision::Allow, "the missing-context branch is mandatory-core: it must not Allow");
+        assert_ne!(
+            d,
+            Decision::Allow,
+            "the missing-context branch is mandatory-core: it must not Allow"
+        );
     }
 
     // ------------------------------------------------------------------------------------------
@@ -1049,7 +1149,14 @@ mod tests {
             attrs: ok,
         };
         assert_eq!(
-            eng.check(&s, &subject("p:bob"), &RelName("view_field".into()), &ArtifactRef("issue:PROJ-1".into()), &latest(), Some(&cav)),
+            eng.check(
+                &s,
+                &subject("p:bob"),
+                &RelName("view_field".into()),
+                &ArtifactRef("issue:PROJ-1".into()),
+                &latest(),
+                Some(&cav)
+            ),
             Decision::Deny,
             "a satisfied caveat cannot grant access without the underlying relation"
         );
@@ -1059,9 +1166,20 @@ mod tests {
     /// → `PROJ-1`) and a `#sub` anchor addresses the same root object.
     #[test]
     fn object_id_extracted_from_urn_and_sub_anchor() {
-        assert_eq!(object_id_of(&ArtifactRef("myelin://acme/issues/issue/PROJ-1".into())), Some("PROJ-1".into()));
-        assert_eq!(object_id_of(&ArtifactRef("repo:core".into())), Some("repo:core".into()));
-        assert_eq!(object_id_of(&ArtifactRef("myelin://acme/issues/issue/PROJ-1#comment-7".into())), Some("PROJ-1".into()));
+        assert_eq!(
+            object_id_of(&ArtifactRef("myelin://acme/issues/issue/PROJ-1".into())),
+            Some("PROJ-1".into())
+        );
+        assert_eq!(
+            object_id_of(&ArtifactRef("repo:core".into())),
+            Some("repo:core".into())
+        );
+        assert_eq!(
+            object_id_of(&ArtifactRef(
+                "myelin://acme/issues/issue/PROJ-1#comment-7".into()
+            )),
+            Some("PROJ-1".into())
+        );
         assert_eq!(object_id_of(&ArtifactRef("  ".into())), None);
     }
 
@@ -1073,17 +1191,38 @@ mod tests {
         let globex = scope("globex");
         let store = TupleStore::new(OutboxStore::new());
         store
-            .write_tuples(&acme, &subject("p-admin"), &[add("repo:core", "reader", "p:alice")], None, None, now())
+            .write_tuples(
+                &acme,
+                &subject("p-admin"),
+                &[add("repo:core", "reader", "p:alice")],
+                None,
+                None,
+                now(),
+            )
             .expect("acme grant");
         let eng = CheckEngine::new(store);
         // Under acme: allow.
         assert_eq!(
-            eng.check(&acme, &subject("p:alice"), &RelName("reader".into()), &ArtifactRef("repo:core".into()), &latest(), None),
+            eng.check(
+                &acme,
+                &subject("p:alice"),
+                &RelName("reader".into()),
+                &ArtifactRef("repo:core".into()),
+                &latest(),
+                None
+            ),
             Decision::Allow
         );
         // Under globex: the acme grant is invisible ⇒ deny (no cross-tenant query path).
         assert_eq!(
-            eng.check(&globex, &subject("p:alice"), &RelName("reader".into()), &ArtifactRef("repo:core".into()), &latest(), None),
+            eng.check(
+                &globex,
+                &subject("p:alice"),
+                &RelName("reader".into()),
+                &ArtifactRef("repo:core".into()),
+                &latest(),
+                None
+            ),
             Decision::Deny,
             "a grant in one tenant does not allow a check in another"
         );

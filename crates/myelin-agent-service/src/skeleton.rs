@@ -128,7 +128,9 @@ impl AgentRuntime for SkeletonAgentRuntime {
     /// trace deterministically (the SAME code path the mock/LLM brains hit; only the decision
     /// differs).
     fn step(&self, _conv: &Conversation) -> StepOutcome {
-        StepOutcome::Submit(Submission("skeleton: no model, no tools — immediate submit".into()))
+        StepOutcome::Submit(Submission(
+            "skeleton: no model, no tools — immediate submit".into(),
+        ))
     }
 }
 
@@ -585,10 +587,7 @@ impl SkeletonAgent {
             .settle(sub.ledger, &[])
             .expect("a freshly-reserved in-flight run always settles (it was reserved this run)");
         // settled == billed_total + refunded == the reservation (the balanced-ledger gate).
-        let settled_total = settle
-            .billed_total
-            .0
-            .saturating_add(settle.refunded.0);
+        let settled_total = settle.billed_total.0.saturating_add(settle.refunded.0);
         telemetry.record_settle(settled_total);
 
         // (7) TEARDOWN: revoke the per-run token idempotently (even on crash), belt-and-suspenders
@@ -600,7 +599,10 @@ impl SkeletonAgent {
         let _ = submission; // the SKELETON's submission is content-free; the trace is the artifact.
         Ok(RunOutcome(format!(
             "completed: run={} trace={} reserved={} settled={} token-revoked",
-            sub.run_id, trace_ref, in_flight.reserved().0, settled_total
+            sub.run_id,
+            trace_ref,
+            in_flight.reserved().0,
+            settled_total
         )))
     }
 
@@ -639,7 +641,10 @@ impl Agent for SkeletonAgent {
         // wired dispatch consumer calls with a RunSubstrate built from `inbox`. A SKELETON step is
         // terminal (immediate Submit), so the bounded loop is one turn.
         let _ = runtime.step(&Conversation::default());
-        RunOutcome(format!("skeleton handle: delivered={} (chained path → handle_run)", inbox.0))
+        RunOutcome(format!(
+            "skeleton handle: delivered={} (chained path → handle_run)",
+            inbox.0
+        ))
     }
 }
 
@@ -785,23 +790,45 @@ mod tests {
         let outbox = myelin_events::OutboxStore::new();
         let mut tele = SkeletonTelemetry::new();
         let mut sub = substrate(
-            "R1", &revoker, &mut gate, &mut ledger, &outbox, /* avail */ 100,
-            /* est */ 10, /* now */ 1000,
+            "R1",
+            &revoker,
+            &mut gate,
+            &mut ledger,
+            &outbox,
+            /* avail */ 100,
+            /* est */ 10,
+            /* now */ 1000,
         );
 
         let out = agent_loop
             .handle_run(&rt, &mut sub, &mut tele, RunOutcomeKind::Completed)
             .expect("the SKELETON chain completes");
-        assert!(out.0.contains("completed"), "the run completed the chain: {out:?}");
+        assert!(
+            out.0.contains("completed"),
+            "the run completed the chain: {out:?}"
+        );
 
         // one trace row written (the trace_ref is non-empty).
         assert_eq!(tele.traces_written(), 1, "exactly one trace row written");
         // the ledger is BALANCED: reserved == settled (a SKELETON bills 0, refunds the reservation).
-        assert!(tele.ledger_balanced(), "reserved {} == settled {}", tele.reserved(), tele.settled());
+        assert!(
+            tele.ledger_balanced(),
+            "reserved {} == settled {}",
+            tele.reserved(),
+            tele.settled()
+        );
         assert_eq!(tele.reserved(), 10, "reserved the estimate");
-        assert_eq!(tele.settled(), 10, "settled (billed 0 + refunded 10) == reserved");
+        assert_eq!(
+            tele.settled(),
+            10,
+            "settled (billed 0 + refunded 10) == reserved"
+        );
         // the token was revoked on teardown (attribution closed).
-        assert_eq!(tele.tokens_revoked(), 1, "the per-run token revoked on teardown");
+        assert_eq!(
+            tele.tokens_revoked(),
+            1,
+            "the per-run token revoked on teardown"
+        );
         assert_eq!(tele.runs_completed(), 1);
         assert_eq!(tele.runs_killed(), 0);
         // ATTRIBUTION: the run principal == the per-run token's principal (the jti is bound to the
@@ -812,8 +839,14 @@ mod tests {
             .minter_token
             .mint_run_token(&sub.agent_id, "R1", &caveats, sub.token_ttl_secs)
             .unwrap();
-        assert_eq!(token.jti, "jti:psn:agent-7:R1", "the token jti is bound to (agent, run)");
-        assert_eq!(sub.agent_id, "psn:agent-7", "the run's agent principal == the token's principal");
+        assert_eq!(
+            token.jti, "jti:psn:agent-7:R1",
+            "the token jti is bound to (agent, run)"
+        );
+        assert_eq!(
+            sub.agent_id, "psn:agent-7",
+            "the run's agent principal == the token's principal"
+        );
     }
 
     /// **AG-D8 (no-tool leg) — kill the run mid-flight → the per-run token is revoked on teardown AND
@@ -835,36 +868,76 @@ mod tests {
         let outbox = myelin_events::OutboxStore::new();
         let mut tele = SkeletonTelemetry::new();
         let mut sub = substrate(
-            "R2", &revoker, &mut gate, &mut ledger, &outbox, 100, 10, minted_at,
+            "R2",
+            &revoker,
+            &mut gate,
+            &mut ledger,
+            &outbox,
+            100,
+            10,
+            minted_at,
         );
 
         let out = agent_loop
             .handle_run(&rt, &mut sub, &mut tele, RunOutcomeKind::KilledMidFlight)
             .expect("a killed run still tears down cleanly");
-        assert!(out.0.contains("killed-mid-flight"), "the run was killed: {out:?}");
+        assert!(
+            out.0.contains("killed-mid-flight"),
+            "the run was killed: {out:?}"
+        );
 
         // the per-run token was revoked on teardown (even though the run never completed).
-        assert_eq!(tele.tokens_revoked(), 1, "killed run STILL revoked its token on teardown");
+        assert_eq!(
+            tele.tokens_revoked(),
+            1,
+            "killed run STILL revoked its token on teardown"
+        );
         assert_eq!(tele.runs_killed(), 1);
         // 0 trace written + reservation left in-flight (never interrupted — the gate has no
         // tear-down-in-flight API; the run was killed, the reservation was NOT settled).
-        assert_eq!(tele.traces_written(), 0, "a killed run wrote no trace (0 ghost — co-commit abandoned)");
+        assert_eq!(
+            tele.traces_written(),
+            0,
+            "a killed run wrote no trace (0 ghost — co-commit abandoned)"
+        );
 
         // the token is DEAD: revoked-on-teardown (now) AND auto-expires by minted_at + W.
         let jti = "jti:psn:agent-7:R2";
-        assert!(revoker.is_dead(jti, minted_at), "revoked-on-teardown → dead now");
+        assert!(
+            revoker.is_dead(jti, minted_at),
+            "revoked-on-teardown → dead now"
+        );
         // even ABSENT the explicit revoke, it auto-expires ≤ W (belt-and-suspenders).
-        let fresh = FakeRevoker { ttl_w: w, minted_at, ..Default::default() };
+        let fresh = FakeRevoker {
+            ttl_w: w,
+            minted_at,
+            ..Default::default()
+        };
         assert!(!fresh.is_dead(jti, minted_at), "not yet expired before W");
-        assert!(fresh.is_dead(jti, minted_at + w), "auto-expires by minted_at + W (≤ W window)");
+        assert!(
+            fresh.is_dead(jti, minted_at + w),
+            "auto-expires by minted_at + W (≤ W window)"
+        );
 
         // 0 SHARED token leaked into the child env (the anti-leak unset, §5.7).
         let child = ChildEnv::for_run(jti);
-        assert!(!child.leaked_shared_token(), "0 shared platform token leaked into the child env");
-        assert_eq!(child.shared_platform_token, None, "the child env's shared-token slot is UNSET");
-        assert_eq!(child.run_token_jti, jti, "the child's ONLY credential is the per-run jti");
+        assert!(
+            !child.leaked_shared_token(),
+            "0 shared platform token leaked into the child env"
+        );
+        assert_eq!(
+            child.shared_platform_token, None,
+            "the child env's shared-token slot is UNSET"
+        );
+        assert_eq!(
+            child.run_token_jti, jti,
+            "the child's ONLY credential is the per-run jti"
+        );
         // the revocation lag is within bound (teardown == now in this run → lag 0 ≤ W).
-        assert!(tele.max_revocation_lag() <= w as u64, "revocation lag within bound W");
+        assert!(
+            tele.max_revocation_lag() <= w as u64,
+            "revocation lag within bound W"
+        );
     }
 
     /// **No balance → no run (11.7 / AG-D11).** A dispatch against an exhausted wallet is REFUSED;
@@ -874,7 +947,11 @@ mod tests {
     fn no_balance_no_run_but_token_still_torn_down() {
         let rt = SkeletonAgentRuntime::new();
         let agent_loop = SkeletonAgent::new();
-        let revoker = FakeRevoker { ttl_w: 300, minted_at: 1000, ..Default::default() };
+        let revoker = FakeRevoker {
+            ttl_w: 300,
+            minted_at: 1000,
+            ..Default::default()
+        };
         let mut gate = AgentRunGate::new();
         let mut ledger = CostLedger::new();
         let outbox = myelin_events::OutboxStore::new();
@@ -885,14 +962,29 @@ mod tests {
         let err = agent_loop
             .handle_run(&rt, &mut sub, &mut tele, RunOutcomeKind::Completed)
             .expect_err("an unfunded dispatch is refused");
-        assert!(matches!(err, SkeletonError::DispatchRefused(_)), "no balance → no run: {err}");
+        assert!(
+            matches!(err, SkeletonError::DispatchRefused(_)),
+            "no balance → no run: {err}"
+        );
         // the run never started: 0 trace, 0 reserve recorded, 0 settle.
         assert_eq!(tele.traces_written(), 0);
-        assert_eq!(tele.reserved(), 0, "nothing reserved (the reserve was refused)");
+        assert_eq!(
+            tele.reserved(),
+            0,
+            "nothing reserved (the reserve was refused)"
+        );
         assert_eq!(tele.settled(), 0);
         // but the token was STILL torn down (the teardown is unconditional).
-        assert_eq!(tele.tokens_revoked(), 1, "the minted token is torn down even on a refused dispatch");
-        assert_eq!(gate.reserve_refusals(), 1, "the gate counted the refusal (AG-D11 telemetry)");
+        assert_eq!(
+            tele.tokens_revoked(),
+            1,
+            "the minted token is torn down even on a refused dispatch"
+        );
+        assert_eq!(
+            gate.reserve_refusals(),
+            1,
+            "the gate counted the refusal (AG-D11 telemetry)"
+        );
     }
 
     /// **The frozen 8.5 `Agent::handle` shape drives the brain through the `&dyn` seam.** The trait
@@ -903,7 +995,10 @@ mod tests {
         let agent_loop = SkeletonAgent::new();
         let rt = SkeletonAgentRuntime::new();
         let out = agent_loop.handle(InboxEvent("issue.created".into()), &rt);
-        assert!(out.0.contains("skeleton handle"), "the frozen 8.5 shape returns the loop outcome");
+        assert!(
+            out.0.contains("skeleton handle"),
+            "the frozen 8.5 shape returns the loop outcome"
+        );
     }
 
     /// **The balanced-ledger predicate is exact (mutation-floor support).** reserved == settled is
@@ -939,12 +1034,28 @@ mod tests {
         t.record_trace();
         t.runs_completed = 2;
         t.runs_killed = 5;
-        assert_eq!(t.tokens_revoked(), 3, "tokens_revoked counts every revoke (kills -> 1)");
-        assert_eq!(t.max_revocation_lag(), 9, "max lag is the MAXIMUM (7, then 3 ignored, then 9)");
+        assert_eq!(
+            t.tokens_revoked(),
+            3,
+            "tokens_revoked counts every revoke (kills -> 1)"
+        );
+        assert_eq!(
+            t.max_revocation_lag(),
+            9,
+            "max lag is the MAXIMUM (7, then 3 ignored, then 9)"
+        );
         assert_eq!(t.traces_written(), 1, "traces_written counts each trace");
-        assert_eq!(t.runs_completed(), 2, "runs_completed returns its field (kills -> 1)");
+        assert_eq!(
+            t.runs_completed(),
+            2,
+            "runs_completed returns its field (kills -> 1)"
+        );
         assert_eq!(t.runs_killed(), 5, "runs_killed returns its field");
-        assert_eq!(t.reserved(), 0, "reserved is independent (kills cross-field constant mutants)");
+        assert_eq!(
+            t.reserved(),
+            0,
+            "reserved is independent (kills cross-field constant mutants)"
+        );
     }
 
     /// **`record_revoke` keeps the MAX lag (kills the `>` comparator mutants).** A larger lag raises
@@ -967,13 +1078,19 @@ mod tests {
     #[test]
     fn child_env_leak_predicate_is_exact() {
         let clean = ChildEnv::for_run("jti:R1");
-        assert!(!clean.leaked_shared_token(), "a clean child env does not leak (the anti-leak unset)");
+        assert!(
+            !clean.leaked_shared_token(),
+            "a clean child env does not leak (the anti-leak unset)"
+        );
         // a (hypothetical) leaked env: leaked_shared_token must return TRUE (kills `-> false`).
         let leaked = ChildEnv {
             run_token_jti: "jti:R1".into(),
             shared_platform_token: Some("PLATFORM-TOKEN".into()),
         };
-        assert!(leaked.leaked_shared_token(), "a leaked shared token IS a leak (kills -> false)");
+        assert!(
+            leaked.leaked_shared_token(),
+            "a leaked shared token IS a leak (kills -> false)"
+        );
     }
 
     /// **`SkeletonError` Display is non-empty + distinct per variant (kills the `fmt -> Ok(default)`
@@ -984,11 +1101,23 @@ mod tests {
         let refused = SkeletonError::DispatchRefused("no balance".into()).to_string();
         let mint = SkeletonError::MintFailed("id down".into()).to_string();
         let cc = SkeletonError::CoCommit("journal".into()).to_string();
-        assert!(refused.contains("dispatch refused"), "Display renders the refusal: {refused}");
-        assert!(mint.contains("mint failed"), "Display renders the mint failure: {mint}");
-        assert!(cc.contains("co-commit failed"), "Display renders the co-commit failure: {cc}");
+        assert!(
+            refused.contains("dispatch refused"),
+            "Display renders the refusal: {refused}"
+        );
+        assert!(
+            mint.contains("mint failed"),
+            "Display renders the mint failure: {mint}"
+        );
+        assert!(
+            cc.contains("co-commit failed"),
+            "Display renders the co-commit failure: {cc}"
+        );
         assert_ne!(refused, mint);
         assert_ne!(mint, cc);
-        assert!(!refused.is_empty(), "the error message is non-empty (kills fmt -> Ok(default))");
+        assert!(
+            !refused.is_empty(),
+            "the error message is non-empty (kills fmt -> Ok(default))"
+        );
     }
 }

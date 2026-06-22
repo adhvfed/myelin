@@ -15,9 +15,7 @@
 
 use myelin_events::{OutboxStore, Timestamp};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind, PseudonymHandle};
-use myelin_identity_service::{
-    PseudonymEraseError, StoreBackedCheck, TupleStore,
-};
+use myelin_identity_service::{PseudonymEraseError, StoreBackedCheck, TupleStore};
 use myelin_storage::{KeyClass, TenantScope};
 use myelin_tenancy::{Region, TenantId};
 
@@ -54,13 +52,22 @@ fn resolve_pseudonym_round_trips_for_a_live_subject() {
     let s = scope("acme");
     let subject = PrincipalId("p:alice".into());
     let h = handle("anon-7f3a", "acme");
-    slot.pseudonyms().put_mapping(&s, &subject, h.clone()).unwrap();
+    slot.pseudonyms()
+        .put_mapping(&s, &subject, h.clone())
+        .unwrap();
 
     let resolved = slot
         .resolve_pseudonym_in(&s, &subject)
         .expect("a live subject resolves");
-    assert_eq!(resolved, h, "the live subject resolves to its public pseudonym handle");
-    assert_eq!(resolved.render(), "anon-7f3a@acme.noreply", "the frozen grammar");
+    assert_eq!(
+        resolved, h,
+        "the live subject resolves to its public pseudonym handle"
+    );
+    assert_eq!(
+        resolved.render(),
+        "anon-7f3a@acme.noreply",
+        "the frozen grammar"
+    );
 }
 
 /// **`erase_in` destroys the per-subject DEK AND shreds the pseudonym-map row (the crypto-shred
@@ -76,9 +83,15 @@ fn erase_destroys_the_dek_and_shreds_the_row_and_records_the_ledger() {
         .unwrap();
 
     let receipt = slot.erase_in(&s, &subject, now());
-    assert!(receipt.dek_destroyed, "the per-subject DEK was destroyed (crypto-shred)");
+    assert!(
+        receipt.dek_destroyed,
+        "the per-subject DEK was destroyed (crypto-shred)"
+    );
     assert!(receipt.row_shredded, "the pseudonym-map row was shredded");
-    assert_eq!(receipt.shredded_dek_class, "subject:p:alice", "the destroyed key is named");
+    assert_eq!(
+        receipt.shredded_dek_class, "subject:p:alice",
+        "the destroyed key is named"
+    );
 
     // The map row is gone.
     assert!(
@@ -190,7 +203,8 @@ fn crypto_shred_is_unrecoverable_in_backups() {
     // Before erase: the subject's DEK is present in a backup.
     let pre = slot.kms().backup_snapshot();
     assert!(
-        pre.iter().any(|(id, _)| id.class == dek_class && id.tenant == *s.tenant()),
+        pre.iter()
+            .any(|(id, _)| id.class == dek_class && id.tenant == *s.tenant()),
         "the subject's DEK is in the backup BEFORE erase"
     );
 
@@ -199,7 +213,9 @@ fn crypto_shred_is_unrecoverable_in_backups() {
     // After erase: the destroyed DEK is EXCLUDED from the backup (crypto-shred reaches backups).
     let post = slot.kms().backup_snapshot();
     assert!(
-        !post.iter().any(|(id, _)| id.class == dek_class && id.tenant == *s.tenant()),
+        !post
+            .iter()
+            .any(|(id, _)| id.class == dek_class && id.tenant == *s.tenant()),
         "the crypto-shredded DEK is unrecoverable in backups (STOR-D4): 0 recoverable"
     );
 }
@@ -218,7 +234,10 @@ fn re_erase_of_an_already_shredded_subject_is_a_noop_but_recorded() {
     assert!(first.dek_destroyed && first.row_shredded);
 
     let second = slot.erase_in(&s, &subject, now());
-    assert!(!second.dek_destroyed, "the DEK was already destroyed (no-op)");
+    assert!(
+        !second.dek_destroyed,
+        "the DEK was already destroyed (no-op)"
+    );
     assert!(!second.row_shredded, "the row was already shredded (no-op)");
     assert!(
         slot.erasure_ledger().is_erased(&s, &subject),
@@ -243,7 +262,10 @@ fn erase_is_tenant_scoped() {
 
     slot.erase_in(&acme, &subject, now());
 
-    assert!(slot.pseudonyms().mapping_of(&acme, &subject).is_none(), "acme's mapping is erased");
+    assert!(
+        slot.pseudonyms().mapping_of(&acme, &subject).is_none(),
+        "acme's mapping is erased"
+    );
     assert!(
         slot.pseudonyms().mapping_of(&globex, &subject).is_some(),
         "globex's identically-named subject is untouched (the erase is tenant-scoped)"

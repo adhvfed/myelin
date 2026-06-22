@@ -115,10 +115,24 @@ fn provider_skeleton_loop_drives_the_chained_substrate_path() {
     // CONSUMER side of 8.5 (the dispatch tier): reads the run outcome — the run completed, a trace
     // was written, and the ledger is balanced (reserved == settled). Observability is part of the
     // pass (a path that emits no signal has failed the drill).
-    assert!(out.0.contains("completed"), "the dispatch tier reads a completed RunOutcome: {out:?}");
-    assert_eq!(tele.traces_written(), 1, "the loop wrote exactly one trace row");
-    assert!(tele.ledger_balanced(), "reserved == settled (the balanced-ledger gate)");
-    assert_eq!(tele.tokens_revoked(), 1, "the per-run token was revoked on teardown");
+    assert!(
+        out.0.contains("completed"),
+        "the dispatch tier reads a completed RunOutcome: {out:?}"
+    );
+    assert_eq!(
+        tele.traces_written(),
+        1,
+        "the loop wrote exactly one trace row"
+    );
+    assert!(
+        tele.ledger_balanced(),
+        "reserved == settled (the balanced-ledger gate)"
+    );
+    assert_eq!(
+        tele.tokens_revoked(),
+        1,
+        "the per-run token was revoked on teardown"
+    );
 }
 
 /// **CONSUMER side of 8.5 — the brain is dynamically dispatched + swappable (the strategy seam).**
@@ -164,6 +178,12 @@ fn consumer_loop_drives_any_runtime_through_the_dyn_seam() {
     let out = agent_loop
         .handle_run(dyn_rt, &mut sub, &mut tele, RunOutcomeKind::Completed)
         .expect("the loop drives a different brain through the seam");
-    assert!(out.0.contains("completed"), "the loop is brain-agnostic — only the decision differs");
-    assert!(tele.ledger_balanced(), "the substrate path is identical for any brain");
+    assert!(
+        out.0.contains("completed"),
+        "the loop is brain-agnostic — only the decision differs"
+    );
+    assert!(
+        tele.ledger_balanced(),
+        "the substrate path is identical for any brain"
+    );
 }

@@ -35,7 +35,10 @@ async fn flow_d1_lease_crash_recovery_and_replay_short_circuit_in_real_postgres(
     let cfg = MyelinConfig::dev();
     let admin = sqlx::postgres::PgPoolOptions::new()
         .max_connections(4)
-        .connect(&cfg.database_url.replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw"))
+        .connect(
+            &cfg.database_url
+                .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw"),
+        )
         .await
         .expect("connect as admin to dev Postgres (is the stack up?)");
 
@@ -49,10 +52,19 @@ async fn flow_d1_lease_crash_recovery_and_replay_short_circuit_in_real_postgres(
     let run_create = WORKFLOW_RUN_DDL.replacen("workflow_run", &run_tbl, 1);
     let hist_create = WF_HISTORY_DDL.replacen("wf_history", &hist_tbl, 1);
     for tbl in [&run_tbl, &hist_tbl] {
-        sqlx::query(&format!("DROP TABLE IF EXISTS {tbl}")).execute(&admin).await.unwrap();
+        sqlx::query(&format!("DROP TABLE IF EXISTS {tbl}"))
+            .execute(&admin)
+            .await
+            .unwrap();
     }
-    sqlx::query(&run_create).execute(&admin).await.expect("the workflow_run DDL applies");
-    sqlx::query(&hist_create).execute(&admin).await.expect("the wf_history DDL applies");
+    sqlx::query(&run_create)
+        .execute(&admin)
+        .await
+        .expect("the workflow_run DDL applies");
+    sqlx::query(&hist_create)
+        .execute(&admin)
+        .await
+        .expect("the wf_history DDL applies");
 
     // Seed a runnable run (state running, cursor 0, UNLEASED) + journal its first 5 of 10 activities
     // (the crash point — a worker journaled 5 steps then died, the journal is the source of truth).
@@ -93,7 +105,11 @@ async fn flow_d1_lease_crash_recovery_and_replay_short_circuit_in_real_postgres(
     .await
     .expect("worker-2 re-leases the runnable run (FOR UPDATE SKIP LOCKED)");
     assert_eq!(leased.get::<String, _>("run_id"), "R1");
-    assert_eq!(leased.get::<i64, _>("cursor"), 5, "the re-leased run resumes from cursor 5");
+    assert_eq!(
+        leased.get::<i64, _>("cursor"),
+        5,
+        "the re-leased run resumes from cursor 5"
+    );
 
     // a SECOND worker cannot steal the LIVE-leased run (the lease has not expired) — skip-locked.
     let steal_blocked = sqlx::query(&format!(
@@ -105,7 +121,10 @@ async fn flow_d1_lease_crash_recovery_and_replay_short_circuit_in_real_postgres(
     .await
     .unwrap()
     .get::<i64, _>("c");
-    assert_eq!(steal_blocked, 0, "the live-leased run is not re-leasable (skip-locked, no double-drive)");
+    assert_eq!(
+        steal_blocked, 0,
+        "the live-leased run is not re-leasable (skip-locked, no double-drive)"
+    );
 
     // (2) DETERMINISTIC REPLAY SHORT-CIRCUIT (§4.1). The re-driving worker reads wf_history ordered
     //     by seq; for each of the 10 commands the body issues, it checks whether the command_id is
@@ -120,7 +139,11 @@ async fn flow_d1_lease_crash_recovery_and_replay_short_circuit_in_real_postgres(
     .iter()
     .map(|r| r.get::<String, _>("command_id"))
     .collect();
-    assert_eq!(journaled.len(), 5, "5 commands journaled at the crash point");
+    assert_eq!(
+        journaled.len(),
+        5,
+        "5 commands journaled at the crash point"
+    );
 
     let mut executed = Vec::new();
     for k in 0..10i64 {
@@ -141,7 +164,11 @@ async fn flow_d1_lease_crash_recovery_and_replay_short_circuit_in_real_postgres(
         .expect("journal the resumed live command");
     }
     // THE FLOW-D1 ASSERTION: only 5..=9 executed (0..=4 replayed) — resumed at step 6, 0 re-execution.
-    assert_eq!(executed, vec![5, 6, 7, 8, 9], "resumed at step 6 — only 5..=9 ran; 0..=4 replayed");
+    assert_eq!(
+        executed,
+        vec![5, 6, 7, 8, 9],
+        "resumed at step 6 — only 5..=9 ran; 0..=4 replayed"
+    );
 
     // 0 lost progress + 0 duplicate journal rows: exactly 10 history rows (the UNIQUE key held).
     let total: i64 = sqlx::query(&format!(
@@ -151,7 +178,10 @@ async fn flow_d1_lease_crash_recovery_and_replay_short_circuit_in_real_postgres(
     .await
     .unwrap()
     .get::<i64, _>("c");
-    assert_eq!(total, 10, "10 journaled, 0 lost progress, 0 duplicate (the UNIQUE(command_id) key)");
+    assert_eq!(
+        total, 10,
+        "10 journaled, 0 lost progress, 0 duplicate (the UNIQUE(command_id) key)"
+    );
 
     // the UNIQUE(tenant_id, run_id, command_id) replay key BITES — a re-journal of a replayed command
     // is rejected (the silent-double-effect floor under replay, §3.2).
@@ -161,7 +191,10 @@ async fn flow_d1_lease_crash_recovery_and_replay_short_circuit_in_real_postgres(
     ))
     .execute(&admin)
     .await;
-    assert!(dup.is_err(), "the UNIQUE replay key rejects a re-journal of a replayed command (§3.2)");
+    assert!(
+        dup.is_err(),
+        "the UNIQUE replay key rejects a re-journal of a replayed command (§3.2)"
+    );
 
     // settle the run completed + release the lease (the drive finished).
     sqlx::query(&format!(
@@ -174,7 +207,10 @@ async fn flow_d1_lease_crash_recovery_and_replay_short_circuit_in_real_postgres(
 
     // cleanup
     for tbl in [&run_tbl, &hist_tbl] {
-        sqlx::query(&format!("DROP TABLE IF EXISTS {tbl}")).execute(&admin).await.unwrap();
+        sqlx::query(&format!("DROP TABLE IF EXISTS {tbl}"))
+            .execute(&admin)
+            .await
+            .unwrap();
     }
     println!(
         "[2026-06-21] PASS  drill=FLOW-D1(live-PG)  kill@5/10 resume@6  re_executed=0 lost=0  lease=skip-locked replay=short-circuit  (real Postgres FOR UPDATE SKIP LOCKED + UNIQUE replay key)"
@@ -189,10 +225,10 @@ async fn flow_d1_lease_crash_recovery_and_replay_short_circuit_in_real_postgres(
 /// against the live state-CHECK (a state the CHECK rejected would error the UPDATE — the floor).
 #[tokio::test]
 async fn flow_d2_divergence_guard_dead_letters_nondeterministic_in_real_postgres() {
-    use myelin_events::{
-        Actor, EmitContextBase, MonotonicMinter, OutboxStore, Timestamp,
+    use myelin_events::{Actor, EmitContextBase, MonotonicMinter, OutboxStore, Timestamp};
+    use myelin_flow::engine::{
+        drive_versioned, run_state, DriveOutcome, FlowTelemetry, RunRow, RunStore, WorkflowBody,
     };
-    use myelin_flow::engine::{drive_versioned, run_state, FlowTelemetry, RunRow, RunStore, DriveOutcome, WorkflowBody};
     use myelin_flow::wfctx::{RetryPolicy, WfCtx, WfJournal};
     use myelin_identity::{Principal, PrincipalId, PrincipalKind};
     use myelin_refs::ArtifactRef;
@@ -203,15 +239,24 @@ async fn flow_d2_divergence_guard_dead_letters_nondeterministic_in_real_postgres
     let cfg = MyelinConfig::dev();
     let admin = sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)
-        .connect(&cfg.database_url.replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw"))
+        .connect(
+            &cfg.database_url
+                .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw"),
+        )
         .await
         .expect("connect as admin to dev Postgres (is the stack up?)");
 
     let pid = std::process::id();
     let run_tbl = format!("workflow_run_divergence_{pid}");
     let run_create = WORKFLOW_RUN_DDL.replacen("workflow_run", &run_tbl, 1);
-    sqlx::query(&format!("DROP TABLE IF EXISTS {run_tbl}")).execute(&admin).await.unwrap();
-    sqlx::query(&run_create).execute(&admin).await.expect("the workflow_run DDL applies");
+    sqlx::query(&format!("DROP TABLE IF EXISTS {run_tbl}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    sqlx::query(&run_create)
+        .execute(&admin)
+        .await
+        .expect("the workflow_run DDL applies");
 
     // Seed a runnable run pinned to wf_version=1 in real Postgres.
     sqlx::query(&format!(
@@ -228,7 +273,11 @@ async fn flow_d2_divergence_guard_dead_letters_nondeterministic_in_real_postgres
     let ctx_base = EmitContextBase {
         tenant: TenantId("acme".into()),
         region: Region("fr-par".into()),
-        actor: Actor(Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId("acme".into()))),
+        actor: Actor(Principal::stub(
+            PrincipalId("p".into()),
+            PrincipalKind::Human,
+            TenantId("acme".into()),
+        )),
         schema_ver: 1,
         occurred_at: Timestamp("2026-06-21T00:00:00Z".into()),
         recorded_at: Timestamp("2026-06-21T00:00:01Z".into()),
@@ -236,7 +285,12 @@ async fn flow_d2_divergence_guard_dead_letters_nondeterministic_in_real_postgres
     };
     let runs = RunStore::new();
     runs.put(RunRow::new_runnable_versioned(
-        TenantId("acme".into()), Region("fr-par".into()), "RD", "agent.run", 1, 0,
+        TenantId("acme".into()),
+        Region("fr-par".into()),
+        "RD",
+        "agent.run",
+        1,
+        0,
     ));
     let outbox = OutboxStore::new();
     let journal = WfJournal::new();
@@ -251,15 +305,36 @@ async fn flow_d2_divergence_guard_dead_letters_nondeterministic_in_real_postgres
     });
     let run = runs.get(&TenantId("acme".into()), "RD").unwrap();
     let outcome = drive_versioned(
-        &runs, &outbox, &journal, &tele, minter, ctx_base, &run,
-        "2026-06-21T00:00:00Z", 7, body.as_ref(), 1, 2,
+        &runs,
+        &outbox,
+        &journal,
+        &tele,
+        minter,
+        ctx_base,
+        &run,
+        "2026-06-21T00:00:00Z",
+        7,
+        body.as_ref(),
+        1,
+        2,
     );
-    assert!(matches!(outcome, DriveOutcome::Nondeterministic(_)), "the version mismatch halts");
-    assert_eq!(tele.nondeterministic_halt_count(), 1, "the nondeterministic-halt count incremented by exactly 1");
+    assert!(
+        matches!(outcome, DriveOutcome::Nondeterministic(_)),
+        "the version mismatch halts"
+    );
+    assert_eq!(
+        tele.nondeterministic_halt_count(),
+        1,
+        "the nondeterministic-halt count incremented by exactly 1"
+    );
 
     // PERSIST the dead-letter to REAL Postgres — the state CHECK MUST admit 'nondeterministic'.
     let settled = runs.get(&TenantId("acme".into()), "RD").unwrap();
-    assert_eq!(settled.state, run_state::NONDETERMINISTIC, "the in-memory run is dead-lettered");
+    assert_eq!(
+        settled.state,
+        run_state::NONDETERMINISTIC,
+        "the in-memory run is dead-lettered"
+    );
     sqlx::query(&format!(
         "UPDATE {run_tbl} SET state=$1, lease_owner=NULL, lease_expires=NULL \
          WHERE tenant_id='acme' AND run_id='RD'"
@@ -275,7 +350,10 @@ async fn flow_d2_divergence_guard_dead_letters_nondeterministic_in_real_postgres
         .await
         .unwrap()
         .get("state");
-    assert_eq!(st, "nondeterministic", "the dead-letter row persists in real Postgres");
+    assert_eq!(
+        st, "nondeterministic",
+        "the dead-letter row persists in real Postgres"
+    );
     // it is NOT runnable (the partial wf_runnable index covers only state IN ('running')).
     let runnable: i64 = sqlx::query(&format!(
         "SELECT count(*) AS c FROM {run_tbl} WHERE partition=0 AND state='running'"
@@ -284,9 +362,15 @@ async fn flow_d2_divergence_guard_dead_letters_nondeterministic_in_real_postgres
     .await
     .unwrap()
     .get("c");
-    assert_eq!(runnable, 0, "the dead-lettered run is no longer runnable (the divergence parked it)");
+    assert_eq!(
+        runnable, 0,
+        "the dead-lettered run is no longer runnable (the divergence parked it)"
+    );
 
-    sqlx::query(&format!("DROP TABLE IF EXISTS {run_tbl}")).execute(&admin).await.unwrap();
+    sqlx::query(&format!("DROP TABLE IF EXISTS {run_tbl}"))
+        .execute(&admin)
+        .await
+        .unwrap();
     println!(
         "[2026-06-21] PASS  drill=FLOW-D2(live-PG)  divergent/wrong-version replay -> halt nondeterministic + dead-letter  nondeterministic_halt=1 silent_divergence=0  (real Postgres state CHECK admits 'nondeterministic')"
     );

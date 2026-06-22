@@ -79,8 +79,16 @@ fn agent_service_migrations() -> Migrations {
     let tables: [(&'static str, &str, &str); 5] = [
         ("0001_create_agent_run", RUN_DDL, "agent_run"),
         ("0002_create_agent_tool_def", TOOL_DEF_DDL, "agent_tool_def"),
-        ("0003_create_agent_proposed_effect", PROPOSED_EFFECT_DDL, "agent_proposed_effect"),
-        ("0004_create_agent_hitl_gate", HITL_GATE_DDL, "agent_hitl_gate"),
+        (
+            "0003_create_agent_proposed_effect",
+            PROPOSED_EFFECT_DDL,
+            "agent_proposed_effect",
+        ),
+        (
+            "0004_create_agent_hitl_gate",
+            HITL_GATE_DDL,
+            "agent_hitl_gate",
+        ),
         ("0005_create_agent_trace", TRACE_DDL, "agent_trace"),
     ];
     Migrations::of(tables.into_iter().map(|(id, create_ddl, table)| {
@@ -254,11 +262,23 @@ mod tests {
             MetricsHealthSurface::new(CriticalDependencies::new(["oltp"]), HealthTable::new());
         assert_eq!(surface.startup(), Startup::Booting);
         let r = surface.readiness();
-        assert_eq!(r.verdict, Readiness::NotReady, "readiness FALSE until migrate completes");
+        assert_eq!(
+            r.verdict,
+            Readiness::NotReady,
+            "readiness FALSE until migrate completes"
+        );
         assert!(r.sheds(), "a not-ready instance sheds new traffic");
-        assert_eq!(surface.liveness(), Liveness::Up, "liveness ≠ readiness: booting is not-killed");
+        assert_eq!(
+            surface.liveness(),
+            Liveness::Up,
+            "liveness ≠ readiness: booting is not-killed"
+        );
         surface.mark_started();
-        assert_eq!(surface.readiness().verdict, Readiness::Ready, "migrate-complete lifts readiness");
+        assert_eq!(
+            surface.readiness().verdict,
+            Readiness::Ready,
+            "migrate-complete lifts readiness"
+        );
     }
 
     /// **A booted instance is ready only AFTER migrate completes (contract 1.3).** The harness flips
@@ -285,10 +305,17 @@ mod tests {
     fn shell_wires_the_five_table_migration_set_and_empty_consumer_seam() {
         let spec = agent_app_spec(Config::default());
         assert_eq!(spec.name, SERVICE_NAME);
-        assert!(spec.consumers.is_empty(), "the dispatch consumer is wired per-tenant (empty bare seam)");
+        assert!(
+            spec.consumers.is_empty(),
+            "the dispatch consumer is wired per-tenant (empty bare seam)"
+        );
         // the migrate phase wires EXACTLY the AG-P2 five tables (one schema, two type-carriers) — no
         // second schema: the substrate set carries the same five ids in the same order, each scoped.
-        assert_eq!(spec.migrations.0.len(), 5, "the AppSpec wires the AG-P2 five-table data model");
+        assert_eq!(
+            spec.migrations.0.len(),
+            5,
+            "the AppSpec wires the AG-P2 five-table data model"
+        );
         let ids: Vec<&str> = spec.migrations.0.iter().map(|m| m.id).collect();
         assert_eq!(
             ids,
@@ -311,11 +338,16 @@ mod tests {
         use myelin_events::DedupLedger;
         use myelin_tenancy::TenantId;
         let tenant = TenantId("acme".into());
-        let reg = agent_dispatch_consumer_reg(&tenant, DedupLedger::new())
-            .expect("the agent.dispatch.acme. whitelist binds through the sanctioned consume (never `*`)");
+        let reg = agent_dispatch_consumer_reg(&tenant, DedupLedger::new()).expect(
+            "the agent.dispatch.acme. whitelist binds through the sanctioned consume (never `*`)",
+        );
         let mut spec = agent_app_spec(Config::default());
         spec.consumers = vec![reg];
-        assert_eq!(spec.consumers.len(), 1, "the dispatch consumer occupies the consumer slot (3.6)");
+        assert_eq!(
+            spec.consumers.len(),
+            1,
+            "the dispatch consumer occupies the consumer slot (3.6)"
+        );
     }
 
     /// **The agent OLTP + trace stores auto-register as `PersonalDataHolder`s at boot (§3.4, AG-P3
@@ -325,7 +357,9 @@ mod tests {
         use myelin_substrate::StoreKind;
         let handle = boot_agent(Config::default()).expect("boot");
         assert!(
-            handle.holder_registry().is_registered(StoreKind::Oltp, SERVICE_NAME),
+            handle
+                .holder_registry()
+                .is_registered(StoreKind::Oltp, SERVICE_NAME),
             "the agent OLTP store auto-registered as a holder at boot"
         );
         assert!(
@@ -378,7 +412,11 @@ mod tests {
             schema_ver: 1,
             tenant: tenant.clone(),
             region: Region("fr-par".into()),
-            actor: Actor(Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, tenant)),
+            actor: Actor(Principal::stub(
+                PrincipalId("p".into()),
+                PrincipalKind::Human,
+                tenant,
+            )),
             subject: ArtifactRef("myelin://acme/chat/msg/1".into()),
             aggregate: AggregateKey("conv:1".into()),
             causation_id: None,

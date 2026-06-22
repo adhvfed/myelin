@@ -45,7 +45,7 @@ use myelin_harness::telemetry::{Predicate, SignalName, SignalSource};
 use myelin_identity::{
     ColRef, Consistency, ConsistencyMode, Decision, IdentityService, ListObjectsResult, ObjectId,
     ObjectType, Permission, Principal, PrincipalId, PrincipalKind, RelName, RelationTuple,
-    RuntimeRef, RevokeTarget, SetExpr, TupleDelta, Zookie,
+    RevokeTarget, RuntimeRef, SetExpr, TupleDelta, Zookie,
 };
 use myelin_identity_service::{
     lower,
@@ -71,7 +71,11 @@ fn scope(tenant: &str) -> TenantScope {
 }
 
 fn subject(id: &str, tenant: &str) -> Principal {
-    let mut p = Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, TenantId(tenant.into()));
+    let mut p = Principal::stub(
+        PrincipalId(id.into()),
+        PrincipalKind::Human,
+        TenantId(tenant.into()),
+    );
     p.region = Region("eu-west".into());
     p
 }
@@ -229,9 +233,9 @@ impl EffectApi for IdBackedEffectApi<'_> {
         match decision {
             Decision::Allow => EffectResult::Applied(myelin_agent::EventId(format!("ev:{object}"))),
             // Outside the intersection (or no object relation) → denied, never applied (no mutation).
-            Decision::Deny | Decision::Conditional => {
-                EffectResult::Denied(format!("outside agent ∩ delegation ∩ tenant: {required_grant}"))
-            }
+            Decision::Deny | Decision::Conditional => EffectResult::Denied(format!(
+                "outside agent ∩ delegation ∩ tenant: {required_grant}"
+            )),
         }
     }
 }
@@ -305,7 +309,9 @@ fn id_d5_rerun_and_srch_ref_notif_rides_as_composed() {
         EffectResult::Denied(_) | EffectResult::Gated(_) => { /* correct: refused, no mutation */ }
     }
     // A second escape probe: an effect for a grant NO conjunct holds (#admin) is also refused.
-    if let EffectResult::Applied(_) = effect_api.apply(&run, id_effect("repo:secret#admin", "repo:secret")) {
+    if let EffectResult::Applied(_) =
+        effect_api.apply(&run, id_effect("repo:secret#admin", "repo:secret"))
+    {
         escapes += 1;
     }
 
@@ -344,14 +350,15 @@ fn id_d5_rerun_and_srch_ref_notif_rides_as_composed() {
     // model the Refs backlink-source filter as the SAME list_objects pre-filter Refs applies to the
     // edges' source roots — repo:secret (the confidential source) must not be in the visible set, so
     // its backlink edge is dropped. (Refs' own resolver body is REF-P11; this verifies Id's half.)
-    let visible_sources: Vec<String> = match id.list_objects(&intruder, &read, &repo_ty, &at_latest()) {
-        Ok(ListObjectsResult::Ids { ids, .. }) => ids.into_iter().map(|o| o.0).collect(),
-        Ok(ListObjectsResult::Filter { set_expr, .. }) => {
-            // Materialise the visible source set from the lowered JOIN (the edges Refs would keep).
-            visible_via_join(&index, &s, &intruder, &set_expr)
-        }
-        Err(e) => panic!("list_objects must serve the Refs filter: {e:?}"),
-    };
+    let visible_sources: Vec<String> =
+        match id.list_objects(&intruder, &read, &repo_ty, &at_latest()) {
+            Ok(ListObjectsResult::Ids { ids, .. }) => ids.into_iter().map(|o| o.0).collect(),
+            Ok(ListObjectsResult::Filter { set_expr, .. }) => {
+                // Materialise the visible source set from the lowered JOIN (the edges Refs would keep).
+                visible_via_join(&index, &s, &intruder, &set_expr)
+            }
+            Err(e) => panic!("list_objects must serve the Refs filter: {e:?}"),
+        };
     if visible_sources.iter().any(|src| src == "repo:secret") {
         leaks += 1; // a confidential backlink source leaked into the Refs-visible edge set
     }
@@ -387,7 +394,11 @@ fn id_d5_rerun_and_srch_ref_notif_rides_as_composed() {
     // the consumer's post-revoke read is denied within W (the S8 watermark / the cross-surface deny).
     // We disable the principal (the authoritative revoke path) and re-check that alice's `check`
     // denies (the cross-surface deny every list/expand consumer inherits).
-    id.revoke_in(&s, &RevokeTarget::Principal(PrincipalId("p:alice".into())), now());
+    id.revoke_in(
+        &s,
+        &RevokeTarget::Principal(PrincipalId("p:alice".into())),
+        now(),
+    );
     // alice's own list_objects now sees nothing (the disabled-subject fail-closed at the list path —
     // ID-D1 composed: every consumer's pre-filter for a revoked subject is empty within W).
     let alice = subject("p:alice", "acme");
@@ -397,7 +408,8 @@ fn id_d5_rerun_and_srch_ref_notif_rides_as_composed() {
                 leaks += 1; // a revoked subject still saw objects (the post-revoke read was not denied)
             }
         }
-        Ok(ListObjectsResult::Filter { .. }) => { /* a disabled subject never lists above the cap */ }
+        Ok(ListObjectsResult::Filter { .. }) => { /* a disabled subject never lists above the cap */
+        }
         Err(e) => panic!("a revoked subject's list_objects must serve (empty), not error: {e:?}"),
     }
     // And the cross-surface deny: alice's `check` for the read denies post-revoke (within W).
@@ -420,7 +432,10 @@ fn id_d5_rerun_and_srch_ref_notif_rides_as_composed() {
     signals
         .assert_signal(SignalName::CrossTenantCount, Predicate::Eq(0))
         .expect_green();
-    assert_eq!(escapes, 0, "ID-D5 re-run: 0 effects outside agent ∩ delegation ∩ tenant via the EffectApi");
+    assert_eq!(
+        escapes, 0,
+        "ID-D5 re-run: 0 effects outside agent ∩ delegation ∩ tenant via the EffectApi"
+    );
 
     // (b) the SRCH/REF/NOTIF zero-leak counter: 0 leaked objects across the composed consumers.
     let mut leak_signals = SignalSource::new();
@@ -428,7 +443,10 @@ fn id_d5_rerun_and_srch_ref_notif_rides_as_composed() {
     leak_signals
         .assert_signal(SignalName::CrossTenantCount, Predicate::Eq(0))
         .expect_green();
-    assert_eq!(leaks, 0, "0 leaked objects across the Search/Refs/Notif composition + the post-revoke read");
+    assert_eq!(
+        leaks, 0,
+        "0 leaked objects across the Search/Refs/Notif composition + the post-revoke read"
+    );
 
     println!(
         "[P-134 DRILL GREEN 2026-06-20] ID-D5 re-run + SRCH/REF/NOTIF rides as composed by the M2 \
@@ -481,7 +499,10 @@ fn visible_via_join_inner(
     subject: &Principal,
     set_expr: &SetExpr,
 ) -> Vec<String> {
-    let via = ColRef { table: "repo".into(), column: "id".into() };
+    let via = ColRef {
+        table: "repo".into(),
+        column: "id".into(),
+    };
     let lowered = lower(set_expr, subject, &via);
     assert!(
         lowered.depends_on_reverse_index(),
@@ -489,7 +510,12 @@ fn visible_via_join_inner(
     );
     let mut out: Vec<String> = Vec::new();
     for rel in ["read", "reader", "writer"] {
-        for o in index.objects_for(scope, &ObjectType("repo".into()), &subject.principal_id, &RelName(rel.into())) {
+        for o in index.objects_for(
+            scope,
+            &ObjectType("repo".into()),
+            &subject.principal_id,
+            &RelName(rel.into()),
+        ) {
             out.push(o.0);
         }
     }

@@ -465,9 +465,7 @@ pub trait PersonalDataHolder {
 /// written); the registry-entry emission is P-GA-04 / P-GA-07. This is a fixture (a compile-surface
 /// witness), not a real holder — the real M1 stores carry their own tagged fields.
 pub mod classify_fixture {
-    use super::{
-        DataCategory, DataRole, ErasureMethod, LawfulBasis, PersonalData, RetentionClass,
-    };
+    use super::{DataCategory, DataRole, ErasureMethod, LawfulBasis, PersonalData, RetentionClass};
 
     /// A toy contact record proving the `#[derive(PersonalData)]` derive + the `#[personal_data(...)]`
     /// helper + each of the five tag enums compile when applied/referenced by a store. The `email`
@@ -642,23 +640,51 @@ mod tests {
     #[test]
     fn content_addressed_receipt_is_deterministic_and_records_the_key_epoch() {
         let r1 = Receipt::content_addressed(
-            "erase", "oltp:dsr_request", "u-1", "acme", "crypto_shred", Some(7), 1_000,
+            "erase",
+            "oltp:dsr_request",
+            "u-1",
+            "acme",
+            "crypto_shred",
+            Some(7),
+            1_000,
         );
         let r2 = Receipt::content_addressed(
-            "erase", "oltp:dsr_request", "u-1", "acme", "crypto_shred", Some(7), 1_000,
+            "erase",
+            "oltp:dsr_request",
+            "u-1",
+            "acme",
+            "crypto_shred",
+            Some(7),
+            1_000,
         );
         // Deterministic: same inputs → same content-address (so a re-erase returns the same receipt).
         assert_eq!(r1, r2);
         assert!(r1.content_hash.starts_with("blake3:"));
-        assert_eq!(r1.key_epoch_destroyed, Some(7), "the destroyed key epoch is recorded");
+        assert_eq!(
+            r1.key_epoch_destroyed,
+            Some(7),
+            "the destroyed key epoch is recorded"
+        );
         // A different destroyed epoch is a DIFFERENT receipt (the epoch is folded into the address).
         let r3 = Receipt::content_addressed(
-            "erase", "oltp:dsr_request", "u-1", "acme", "crypto_shred", Some(8), 1_000,
+            "erase",
+            "oltp:dsr_request",
+            "u-1",
+            "acme",
+            "crypto_shred",
+            Some(8),
+            1_000,
         );
         assert_ne!(r1.content_hash, r3.content_hash);
         // A non-shredding op records no epoch.
         let loc = Receipt::content_addressed(
-            "locate", "oltp:dsr_request", "u-1", "acme", "located", None, 5,
+            "locate",
+            "oltp:dsr_request",
+            "u-1",
+            "acme",
+            "located",
+            None,
+            5,
         );
         assert_eq!(loc.key_epoch_destroyed, None);
         assert_ne!(loc.content_hash, r1.content_hash);
@@ -820,7 +846,11 @@ mod tests {
         }
 
         let fields = EveryTag::personal_data_fields();
-        assert_eq!(fields.len(), 3, "one entry per TAGGED field, the non-PII field has none");
+        assert_eq!(
+            fields.len(),
+            3,
+            "one entry per TAGGED field, the non-PII field has none"
+        );
 
         // The owning struct + field path is captured on every entry.
         assert!(fields.iter().all(|f| f.owning_struct == "EveryTag"));
@@ -844,7 +874,10 @@ mod tests {
         assert_eq!(sensitive.tags.retention, "Fixed(90d)"); // `90d` is NOT a Rust expr — captured as text.
         assert_eq!(sensitive.tags.erasure, "CryptoShred(subject_dek)");
         // The GD-4 key choice + the DPIA route are structural off the captured text.
-        assert_eq!(sensitive.erasure_key_class(), Some(ErasureKeyClass::SubjectDek));
+        assert_eq!(
+            sensitive.erasure_key_class(),
+            Some(ErasureKeyClass::SubjectDek)
+        );
         assert_eq!(
             sensitive.is_special_category(),
             Some(SpecialCategoryFlag { kind: "health" })

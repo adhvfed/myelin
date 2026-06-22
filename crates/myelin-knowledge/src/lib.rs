@@ -116,8 +116,10 @@ pub use database::{
     PageBound, PropertyBag, RelationEdgeEvent, RelationKind, RelationStore, SchemaError, ViewError,
     ViewQuery, FACET_PROMOTION_THRESHOLD,
 };
-pub use editor::{
-    Document, EditOp, Editor, EditorBlock, SecondViewer, BROWSER_DRIVE_EVIDENCE,
+pub use editor::{Document, EditOp, Editor, EditorBlock, SecondViewer, BROWSER_DRIVE_EVIDENCE};
+pub use emit::{
+    block_ref, database_ref, emit_change, page_ref, row_ref, KnowledgeChange,
+    KnowledgeLivingDocHandler, KNOWLEDGE_LIVING_DOC_TRIGGERS,
 };
 pub use export::{
     export_rows_to_csv, import_adf, AdfImportResult, ExportBlock, ExportDoc, ExportError,
@@ -128,18 +130,11 @@ pub use gdpr::{
     LocatedLocus, RectifyOutcome, RestrictSuppressor, RestrictionRegistry, RestrictionSink,
     SinkVerdict, HOLDER_ID as KNOWLEDGE_HOLDER_ID,
 };
-pub use subs::{
-    mint_block, mint_heading, register_knowledge_sub_kinds, KNOWLEDGE_OWNED_SUB_KINDS,
-    KNOWLEDGE_SUBSYSTEM,
-};
-pub use emit::{
-    block_ref, database_ref, emit_change, page_ref, row_ref, KnowledgeChange,
-    KnowledgeLivingDocHandler, KNOWLEDGE_LIVING_DOC_TRIGGERS,
-};
 pub use list_filter::{
-    compose_db_count_query, compose_db_view_query, db_row_id_colref, lower_over, lower_over_db_row_id,
-    lower_over_page_id, page_id_colref, AuthzJoin, AuthzVisibleIndex, BoundParam, ComposedQuery,
-    FilterMode, LoweredFilter, AUTHZ_VISIBLE_TABLE, PAGE_ID_COLUMN, PAGE_TABLE,
+    compose_db_count_query, compose_db_view_query, db_row_id_colref, lower_over,
+    lower_over_db_row_id, lower_over_page_id, page_id_colref, AuthzJoin, AuthzVisibleIndex,
+    BoundParam, ComposedQuery, FilterMode, LoweredFilter, AUTHZ_VISIBLE_TABLE, PAGE_ID_COLUMN,
+    PAGE_TABLE,
 };
 pub use merge::{
     cas_update_sql, BlockState, CasError, CasOutcome, CasStore, ConflictMeter, OfflineQueue,
@@ -147,8 +142,13 @@ pub use merge::{
     CAS_CONFLICT_RATE_METRIC,
 };
 pub use rebac_fragment::{
-    block_read_fragment, database_row_read_fragment, field_view_permission, knowledge_read_fragment,
-    page_read_fragment, page_read_override, row_reader_set_expr, space_read_fragment,
+    block_read_fragment, database_row_read_fragment, field_view_permission,
+    knowledge_read_fragment, page_read_fragment, page_read_override, row_reader_set_expr,
+    space_read_fragment,
+};
+pub use subs::{
+    mint_block, mint_heading, register_knowledge_sub_kinds, KNOWLEDGE_OWNED_SUB_KINDS,
+    KNOWLEDGE_SUBSYSTEM,
 };
 // The Refs glue (KN-P19 / P-309): the inline-node `refs.edge.created` producer (5.4), the TE-7
 // typed-edge mirror (5.5), and the `project(ref, viewer)` 4-step tombstone ladder (5.6 / 5.7). The
@@ -158,8 +158,9 @@ pub use rebac_fragment::{
 // The non-clashing producer/mirror surface is re-exported here.
 pub use refs_glue::{
     edge_aggregate_key, emit_content_edges, emit_page_parent_set, emit_relation_edge,
-    KnowledgeLifecycleRel, LadderRung, PageMeta, PageStore, Projected, Projector, SubAnchor, SubState,
-    ProjectError as RefsProjectError, REFS_EDGE_CREATED, REL_CLASS_LIFECYCLE, REL_CLASS_REFERENCE,
+    KnowledgeLifecycleRel, LadderRung, PageMeta, PageStore, ProjectError as RefsProjectError,
+    Projected, Projector, SubAnchor, SubState, REFS_EDGE_CREATED, REL_CLASS_LIFECYCLE,
+    REL_CLASS_REFERENCE,
 };
 // The notif/humanise glue (KN-P22 / P-312): the Knowledge-side `RefResolvePort` that feeds the
 // per-viewer project Display projection into the ONE humanise templating surface (7.3 / 5.2) — a
@@ -186,12 +187,10 @@ pub use search_feed::{
     page_search_projection, register_kn_index_specs, FeedGrain, SearchAclFilter,
     KN_READ_PERMISSION, KN_SEARCH_OBJECT_TYPE,
 };
-pub use store::{
-    knowledge_scope, knowledge_store_migrations, KnowledgeStore, KnowledgeTable,
-};
+pub use store::{knowledge_scope, knowledge_store_migrations, KnowledgeStore, KnowledgeTable};
 pub use sync_block::{
-    render_sync_block, AllowAll, DenyAll, ProjectionFreshness, SourceReadCheck, SyncBlockProjection,
-    SyncBlockRender, SyncSource, Tombstone, TombstoneReason, Viewer,
+    render_sync_block, AllowAll, DenyAll, ProjectionFreshness, SourceReadCheck,
+    SyncBlockProjection, SyncBlockRender, SyncSource, Tombstone, TombstoneReason, Viewer,
 };
 pub use transport::{
     doc_scope, knowledge_stream, AllowAllAuthority, AuthAction, CollabTransport, Connected, DocOp,
@@ -199,11 +198,11 @@ pub use transport::{
     SendOutcome, TransportError,
 };
 
+use myelin_events::{consume, ConsumerName, ConsumerSpec, DedupLedger, InProcessBus, OutboxStore};
 use myelin_identity::{
     AuthzError, CaveatContext, Consistency, Decision, IdentityService, ListObjectsResult,
     ObjectType, Permission, Principal,
 };
-use myelin_events::{consume, ConsumerName, ConsumerSpec, DedupLedger, InProcessBus, OutboxStore};
 use myelin_substrate::{
     boot, AppSpec, Authorizer, Config, ConsumerReg, CriticalDependencies, HotTables, InternalRpc,
     Migration, Migrations, OutboxSpec, PublicRoutes, ServeError, ServeHandle, StoreManifest,
@@ -750,7 +749,10 @@ mod tests {
         let surface = myelin_substrate::InternalSurface::new(entrypoint_authorizer());
         let r = surface.handle(&principal(), "knowledge.write");
         assert!(
-            matches!(r, Err(myelin_substrate::InternalReject::Unauthorized { .. })),
+            matches!(
+                r,
+                Err(myelin_substrate::InternalReject::Unauthorized { .. })
+            ),
             "the entrypoint call is re-authorized against the fail-closed check and denied"
         );
     }
@@ -815,7 +817,11 @@ mod tests {
             Config::default(),
             &["myelin://acme/issues/", "myelin://acme/ci/"],
         );
-        assert_eq!(spec.consumers.len(), 1, "exactly the one living-doc consumer is wired");
+        assert_eq!(
+            spec.consumers.len(),
+            1,
+            "exactly the one living-doc consumer is wired"
+        );
         assert_eq!(
             serve(spec),
             Ok(()),
@@ -835,7 +841,11 @@ mod tests {
             spec.consumers.is_empty(),
             "a `*` subject is rejected at registration → no consumer wired (never silently widened)"
         );
-        assert_eq!(serve(spec), Ok(()), "the shell still boots + drains without the bad consumer");
+        assert_eq!(
+            serve(spec),
+            Ok(()),
+            "the shell still boots + drains without the bad consumer"
+        );
     }
 
     /// **A failed boot returns non-zero (§3.1).** A config that fails boot-time validation aborts

@@ -75,7 +75,7 @@ use std::sync::Mutex;
 
 use myelin_gdpr::{
     EraseReceipt, EraseScope, LocateReport, Patch, PersonalDataHolder, PortableBundle, Receipt,
-    RectifyReceipt, Result as DsrResult, RestrictReceipt, SubjectRef, TenantId,
+    RectifyReceipt, RestrictReceipt, Result as DsrResult, SubjectRef, TenantId,
 };
 
 use crate::structural_floor::RestrictRegistry;
@@ -293,7 +293,13 @@ impl PersonalDataHolder for DerivedStoreHolder<'_> {
         };
         Ok(LocateReport {
             receipt: Receipt::content_addressed(
-                "locate", self.store.holder_id(), &sid, &tenant.0, outcome, None, 0,
+                "locate",
+                self.store.holder_id(),
+                &sid,
+                &tenant.0,
+                outcome,
+                None,
+                0,
             ),
         })
     }
@@ -302,7 +308,13 @@ impl PersonalDataHolder for DerivedStoreHolder<'_> {
         let sid = subject.principal.principal_id.0.clone();
         Ok(PortableBundle {
             receipt: Receipt::content_addressed(
-                "export", self.store.holder_id(), &sid, &tenant.0, "exported", None, 0,
+                "export",
+                self.store.holder_id(),
+                &sid,
+                &tenant.0,
+                "exported",
+                None,
+                0,
             ),
         })
     }
@@ -311,8 +323,13 @@ impl PersonalDataHolder for DerivedStoreHolder<'_> {
         let sid = subject.principal.principal_id.0.clone();
         Ok(RectifyReceipt {
             receipt: Receipt::content_addressed(
-                "rectify", self.store.holder_id(), &sid, "*",
-                "rectified:reindex_from_source", None, 0,
+                "rectify",
+                self.store.holder_id(),
+                &sid,
+                "*",
+                "rectified:reindex_from_source",
+                None,
+                0,
             ),
         })
     }
@@ -325,12 +342,24 @@ impl PersonalDataHolder for DerivedStoreHolder<'_> {
         // Set the ONE shared flag through the registry — every derived store's processing chokepoint
         // then honours it. (The orchestrator drives the fan-out via `RestrictFanOutDriver`; a single
         // holder's `restrict` sets the shared flag, so the call is idempotent across the five stores.)
-        self.store.restrict.set(subject, &subject.principal.tenant, on);
+        self.store
+            .restrict
+            .set(subject, &subject.principal.tenant, on);
         let sid = subject.principal.principal_id.0.clone();
-        let outcome = if on { "restricted:set:processing_suppressed" } else { "restricted:clear:processing_resumed" };
+        let outcome = if on {
+            "restricted:set:processing_suppressed"
+        } else {
+            "restricted:clear:processing_resumed"
+        };
         Ok(RestrictReceipt {
             receipt: Receipt::content_addressed(
-                "restrict", self.store.holder_id(), &sid, &subject.principal.tenant.0, outcome, None, 0,
+                "restrict",
+                self.store.holder_id(),
+                &sid,
+                &subject.principal.tenant.0,
+                outcome,
+                None,
+                0,
             ),
         })
     }
@@ -346,8 +375,13 @@ impl PersonalDataHolder for DerivedStoreHolder<'_> {
         };
         Ok(EraseReceipt {
             receipt: Receipt::content_addressed(
-                "erase", self.store.holder_id(), &sid, &tenant,
-                "erased:derived_row_purged", None, 0,
+                "erase",
+                self.store.holder_id(),
+                &sid,
+                &tenant,
+                "erased:derived_row_purged",
+                None,
+                0,
             ),
         })
     }
@@ -486,7 +520,11 @@ mod tests {
     }
 
     fn subject(id: &str) -> SubjectRef {
-        SubjectRef::new(Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, t("acme")))
+        SubjectRef::new(Principal::stub(
+            PrincipalId(id.into()),
+            PrincipalKind::Human,
+            t("acme"),
+        ))
     }
 
     /// Build the five derived-store models over ONE shared restrict registry, each seeded with the
@@ -565,7 +603,10 @@ mod tests {
         assert_eq!(olap.holder_id(), restrict_holder_ids::OLAP_READ_STORE);
 
         // Unrestricted: OLAP analyses the subject's rows.
-        assert!(matches!(olap.process(&subj, &tenant), DerivedProcessed::Processed(_)));
+        assert!(matches!(
+            olap.process(&subj, &tenant),
+            DerivedProcessed::Processed(_)
+        ));
         // Restricted: OLAP SUPPRESSES analytics (no analytics for a restricted subject — 11.6).
         restrict.set(&subj, &tenant, true);
         assert_eq!(olap.process(&subj, &tenant), DerivedProcessed::Suppressed);
@@ -587,7 +628,10 @@ mod tests {
         // unrestricted ⇒ Processed (the false branch). The projection names the op token.
         match search.process(&subj, &tenant) {
             DerivedProcessed::Processed(out) => {
-                assert!(out.starts_with("search_index:"), "the processed projection names the op");
+                assert!(
+                    out.starts_with("search_index:"),
+                    "the processed projection names the op"
+                );
             }
             other => panic!("expected Processed, got {other:?}"),
         }
@@ -654,38 +698,72 @@ mod tests {
         for s in &stores {
             s.seed_row(&subj, &tenant);
         }
-        let holders: Vec<DerivedStoreHolder> =
-            stores.iter().map(DerivedStoreHolder::new).collect();
+        let holders: Vec<DerivedStoreHolder> = stores.iter().map(DerivedStoreHolder::new).collect();
         let store_refs: [&DerivedStore; 5] =
             [&stores[0], &stores[1], &stores[2], &stores[3], &stores[4]];
         let holder_refs: [&dyn PersonalDataHolder; 5] = [
-            &holders[0], &holders[1], &holders[2], &holders[3], &holders[4],
+            &holders[0],
+            &holders[1],
+            &holders[2],
+            &holders[3],
+            &holders[4],
         ];
 
         // SET the restriction across all five.
-        let set = RestrictFanOutDriver::fan_out_restrict(
-            &subj, &tenant, true, &store_refs, &holder_refs,
-        )
-        .unwrap();
-        assert!(set.all_suppressed(), "0 processing of the restricted subject across all five (GA-D7)");
-        assert_eq!(set.processed_count(), 0, "0 derived stores processed the restricted subject");
-        assert!(set.all_rows_retained(), "every derived row RETAINED while restricted (§4.4)");
-        assert_eq!(set.verdicts.len(), 5, "Search + Refs + Notif + Agents + OLAP");
-        assert_eq!(set.holder_receipts.len(), 5, "one restrict receipt per derived store");
+        let set =
+            RestrictFanOutDriver::fan_out_restrict(&subj, &tenant, true, &store_refs, &holder_refs)
+                .unwrap();
+        assert!(
+            set.all_suppressed(),
+            "0 processing of the restricted subject across all five (GA-D7)"
+        );
+        assert_eq!(
+            set.processed_count(),
+            0,
+            "0 derived stores processed the restricted subject"
+        );
+        assert!(
+            set.all_rows_retained(),
+            "every derived row RETAINED while restricted (§4.4)"
+        );
+        assert_eq!(
+            set.verdicts.len(),
+            5,
+            "Search + Refs + Notif + Agents + OLAP"
+        );
+        assert_eq!(
+            set.holder_receipts.len(),
+            5,
+            "one restrict receipt per derived store"
+        );
         assert!(set.restricted, "the outcome records the restriction is SET");
 
         // CLEAR the restriction (reversible) — processing resumes across all five.
         let clear = RestrictFanOutDriver::fan_out_restrict(
-            &subj, &tenant, false, &store_refs, &holder_refs,
+            &subj,
+            &tenant,
+            false,
+            &store_refs,
+            &holder_refs,
         )
         .unwrap();
-        assert!(!clear.all_suppressed(), "processing resumes after the restriction is lifted");
+        assert!(
+            !clear.all_suppressed(),
+            "processing resumes after the restriction is lifted"
+        );
         assert_eq!(
-            clear.verdicts.iter().filter(|v| matches!(v.outcome, DerivedProcessed::Processed(_))).count(),
+            clear
+                .verdicts
+                .iter()
+                .filter(|v| matches!(v.outcome, DerivedProcessed::Processed(_)))
+                .count(),
             5,
             "all five derived stores process again (reversible)"
         );
-        assert!(!clear.restricted, "the outcome records the restriction is CLEARED");
+        assert!(
+            !clear.restricted,
+            "the outcome records the restriction is CLEARED"
+        );
     }
 
     /// **`processed_count` / `all_suppressed` / `all_rows_retained` are NOT vacuous (the GA-D7
@@ -703,22 +781,36 @@ mod tests {
         for s in stores.iter().take(4) {
             s.seed_row(&subj, &tenant);
         }
-        let holders: Vec<DerivedStoreHolder> =
-            stores.iter().map(DerivedStoreHolder::new).collect();
+        let holders: Vec<DerivedStoreHolder> = stores.iter().map(DerivedStoreHolder::new).collect();
         let store_refs: [&DerivedStore; 5] =
             [&stores[0], &stores[1], &stores[2], &stores[3], &stores[4]];
         let holder_refs: [&dyn PersonalDataHolder; 5] = [
-            &holders[0], &holders[1], &holders[2], &holders[3], &holders[4],
+            &holders[0],
+            &holders[1],
+            &holders[2],
+            &holders[3],
+            &holders[4],
         ];
 
         // UNRESTRICTED fan-out: the four rows PROCESS → processed_count == 4 (NOT 0), not all
         // suppressed; the fifth is NoRow. This kills a `processed_count -> 0` constant mutant.
         let out = RestrictFanOutDriver::fan_out_restrict(
-            &subj, &tenant, false, &store_refs, &holder_refs,
+            &subj,
+            &tenant,
+            false,
+            &store_refs,
+            &holder_refs,
         )
         .unwrap();
-        assert_eq!(out.processed_count(), 4, "four rows processed (processed_count is not constant 0)");
-        assert!(!out.all_suppressed(), "not all suppressed (a processing store exists)");
+        assert_eq!(
+            out.processed_count(),
+            4,
+            "four rows processed (processed_count is not constant 0)"
+        );
+        assert!(
+            !out.all_suppressed(),
+            "not all suppressed (a processing store exists)"
+        );
         // The fifth store has no row ⇒ not every verdict is row-retained (kills `all_rows_retained -> true`).
         assert!(
             !out.all_rows_retained(),
@@ -741,8 +833,14 @@ mod tests {
         // A's row is present; B's is not; the SAME id in a different tenant is not (kills a key that
         // ignores the tenant or the subject component).
         assert!(store.has_row(&a, &tenant), "A's row is present");
-        assert!(!store.has_row(&b, &tenant), "B has no row (distinct subject key)");
-        assert!(!store.has_row(&a, &other), "A's id in a different tenant has no row (tenant in the key)");
+        assert!(
+            !store.has_row(&b, &tenant),
+            "B has no row (distinct subject key)"
+        );
+        assert!(
+            !store.has_row(&a, &other),
+            "A's id in a different tenant has no row (tenant in the key)"
+        );
         // A restriction on A suppresses A but B (had B a row) would still process — the key isolates.
         restrict.set(&a, &tenant, true);
         assert_eq!(store.process(&a, &tenant), DerivedProcessed::Suppressed);
@@ -754,11 +852,26 @@ mod tests {
     #[test]
     fn the_fan_out_covers_exactly_the_five_section_4_4_derived_stores() {
         assert_eq!(DerivedProcessing::all().len(), 5);
-        assert_eq!(DerivedProcessing::SearchIndex.holder_id(), restrict_holder_ids::SEARCH_INDEX);
-        assert_eq!(DerivedProcessing::RefsProject.holder_id(), restrict_holder_ids::REFS_GRAPH);
-        assert_eq!(DerivedProcessing::NotifNotify.holder_id(), restrict_holder_ids::NOTIF_HISTORY);
-        assert_eq!(DerivedProcessing::AgentRead.holder_id(), restrict_holder_ids::AGENT_RUNTIME);
-        assert_eq!(DerivedProcessing::OlapAnalyse.holder_id(), restrict_holder_ids::OLAP_READ_STORE);
+        assert_eq!(
+            DerivedProcessing::SearchIndex.holder_id(),
+            restrict_holder_ids::SEARCH_INDEX
+        );
+        assert_eq!(
+            DerivedProcessing::RefsProject.holder_id(),
+            restrict_holder_ids::REFS_GRAPH
+        );
+        assert_eq!(
+            DerivedProcessing::NotifNotify.holder_id(),
+            restrict_holder_ids::NOTIF_HISTORY
+        );
+        assert_eq!(
+            DerivedProcessing::AgentRead.holder_id(),
+            restrict_holder_ids::AGENT_RUNTIME
+        );
+        assert_eq!(
+            DerivedProcessing::OlapAnalyse.holder_id(),
+            restrict_holder_ids::OLAP_READ_STORE
+        );
         // The tokens are stable (receipt / telemetry anchors).
         assert_eq!(DerivedProcessing::SearchIndex.token(), "search_index");
         assert_eq!(DerivedProcessing::OlapAnalyse.token(), "olap_analyse");
@@ -776,12 +889,21 @@ mod tests {
         let holder = DerivedStoreHolder::new(&store);
 
         let set = holder.restrict(&subj, true).unwrap();
-        assert!(restrict.is_restricted(&subj, &tenant), "the holder restrict op SET the shared flag");
+        assert!(
+            restrict.is_restricted(&subj, &tenant),
+            "the holder restrict op SET the shared flag"
+        );
         assert_eq!(set.receipt.operation, "restrict");
-        assert!(set.receipt.content_hash.starts_with("blake3:"), "the restrict receipt is content-addressed");
+        assert!(
+            set.receipt.content_hash.starts_with("blake3:"),
+            "the restrict receipt is content-addressed"
+        );
 
         let clear = holder.restrict(&subj, false).unwrap();
-        assert!(!restrict.is_restricted(&subj, &tenant), "the holder restrict op CLEARED the shared flag");
+        assert!(
+            !restrict.is_restricted(&subj, &tenant),
+            "the holder restrict op CLEARED the shared flag"
+        );
         assert_eq!(clear.receipt.operation, "restrict");
         // The set/clear receipts differ (distinct outcomes → distinct content hashes).
         assert_ne!(set.receipt.content_hash, clear.receipt.content_hash);

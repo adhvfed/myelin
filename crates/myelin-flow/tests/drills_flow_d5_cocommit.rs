@@ -25,9 +25,7 @@ use myelin_events::{
     Visibility,
 };
 use myelin_flow::{ActivityError, RetryPolicy, WfCtx, WfJournal};
-use myelin_harness::{
-    Dependency, DependencyBreaker, Predicate, Scope, SignalName, SignalSource,
-};
+use myelin_harness::{Dependency, DependencyBreaker, Predicate, Scope, SignalName, SignalSource};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_refs::ArtifactRef;
 use myelin_tenancy::{Region, TenantId};
@@ -90,7 +88,8 @@ fn run_step(outbox: &OutboxStore, journal: &WfJournal, crash_before_commit: bool
     })
     .expect("the activity runs");
     // ...and emit its event (into the SAME transaction).
-    ctx.emit(draft(), None).expect("emit buffers into the co-commit txn");
+    ctx.emit(draft(), None)
+        .expect("emit buffers into the co-commit txn");
     if crash_before_commit {
         // CRASH: drop the WfCtx between journal and emit — neither becomes durable.
         drop(ctx);
@@ -124,11 +123,22 @@ fn drill_flow_d5_journal_outbox_co_commit() {
     // (2) READ the survival signals while crashed: NEITHER — 0 journal rows, 0 outbox rows. The
     //     co-commit is atomic: an aborted step is fully journaled-and-emitted or NEITHER (here
     //     neither). 0 ghost (no emit without journal), 0 lost (no journal without emit).
-    assert_eq!(journal.history_len(), 0, "0 lost: the crashed step journaled nothing");
-    assert_eq!(journal.attempt_len(), 0, "0 lost: the attempt ledger is unwritten too");
+    assert_eq!(
+        journal.history_len(),
+        0,
+        "0 lost: the crashed step journaled nothing"
+    );
+    assert_eq!(
+        journal.attempt_len(),
+        0,
+        "0 lost: the attempt ledger is unwritten too"
+    );
     let mut signals = SignalSource::new();
     signals.set_scalar(SignalName::OutboxDepth, outbox.outbox_depth() as i64);
-    signals.set_scalar(SignalName::DeadLetterCount, outbox.dead_letter_count() as i64);
+    signals.set_scalar(
+        SignalName::DeadLetterCount,
+        outbox.dead_letter_count() as i64,
+    );
     signals
         .assert_signal(SignalName::OutboxDepth, Predicate::Eq(0))
         .expect_green();
@@ -144,8 +154,16 @@ fn drill_flow_d5_journal_outbox_co_commit() {
     run_step(&outbox, &journal, !healthy);
 
     // BOTH durable, together: one journal row + one outbox row (0 ghost, 0 lost).
-    assert_eq!(journal.history_len(), 1, "co-commit: exactly one journal row");
-    assert_eq!(journal.attempt_len(), 1, "co-commit: exactly one attempt ledger row");
+    assert_eq!(
+        journal.history_len(),
+        1,
+        "co-commit: exactly one journal row"
+    );
+    assert_eq!(
+        journal.attempt_len(),
+        1,
+        "co-commit: exactly one attempt ledger row"
+    );
     let mut after = SignalSource::new();
     after.set_scalar(SignalName::OutboxDepth, outbox.outbox_depth() as i64);
     after
@@ -156,7 +174,11 @@ fn drill_flow_d5_journal_outbox_co_commit() {
     let bus = InProcessBus::new();
     let relay = Relay::new(outbox.clone(), bus.clone(), clock);
     relay.drain_to_empty();
-    assert_eq!(bus.delivered_count(), 1, "exactly-once: the co-committed event is delivered once");
+    assert_eq!(
+        bus.delivered_count(),
+        1,
+        "exactly-once: the co-committed event is delivered once"
+    );
     let mut drained = SignalSource::new();
     drained.set_scalar(SignalName::OutboxDepth, outbox.outbox_depth() as i64);
     drained
@@ -203,7 +225,11 @@ fn drill_flow_d5_emit_failure_writes_neither() {
         drop(ctx);
     }
     assert_eq!(journal.history_len(), 0, "no journal row on the crash path");
-    assert_eq!(outbox.committed_count(), 0, "no committed outbox row on the crash path");
+    assert_eq!(
+        outbox.committed_count(),
+        0,
+        "no committed outbox row on the crash path"
+    );
     assert_eq!(outbox.outbox_depth(), 0, "0 ghost");
     println!("[2026-06-21] PASS  drill=FLOW-D5  emit_path_abort=neither  (0 ghost, 0 lost)");
 }
@@ -223,7 +249,8 @@ fn flow_d5_registers_into_the_permanent_drill_suite() {
         let journal = WfJournal::new();
 
         // inject via the scenario's own breaker (the harness drains it on teardown): crash the step.
-        ctx.breaker.break_dependency(Dependency::Broker, scope.clone());
+        ctx.breaker
+            .break_dependency(Dependency::Broker, scope.clone());
         let crashing = ctx.breaker.is_broken(&Dependency::Broker, &scope);
         run_step(&outbox, &journal, crashing);
         // crashed: neither journal nor outbox row.
@@ -233,16 +260,28 @@ fn flow_d5_registers_into_the_permanent_drill_suite() {
         // restore + co-commit → one journal row + one outbox row (0 ghost, 0 lost).
         ctx.breaker.restore_dependency(Dependency::Broker, scope);
         run_step(&outbox, &journal, false);
-        assert_eq!(journal.history_len(), 1, "co-commit journals exactly one row");
+        assert_eq!(
+            journal.history_len(),
+            1,
+            "co-commit journals exactly one row"
+        );
 
-        ctx.signals.set_scalar(SignalName::OutboxDepth, outbox.outbox_depth() as i64);
+        ctx.signals
+            .set_scalar(SignalName::OutboxDepth, outbox.outbox_depth() as i64);
         ctx.signals
             .assert_signal(SignalName::OutboxDepth, Predicate::Eq(1))
     }));
 
     let results = registry.run_all();
-    assert!(results[0].is_pass(), "FLOW-D5 drill must read green: {:?}", results[0]);
-    assert!(registry.all_green(), "the permanent suite re-runs FLOW-D5 green forever");
+    assert!(
+        results[0].is_pass(),
+        "FLOW-D5 drill must read green: {:?}",
+        results[0]
+    );
+    assert!(
+        registry.all_green(),
+        "the permanent suite re-runs FLOW-D5 green forever"
+    );
     println!("{}", results[0].artifact_row("2026-06-21"));
 }
 
@@ -271,6 +310,14 @@ fn drill_flow_d5_failed_activity_no_ghost_emit() {
     assert!(matches!(err, myelin_flow::WfError::ActivityExhausted(_)));
     ctx.commit().expect("the failure co-commits");
     // the failure journaled, but no event ghosted (the activity emitted none on the error path).
-    assert_eq!(outbox.outbox_depth(), 0, "0 ghost: a failed activity emitted nothing");
-    assert_eq!(journal.history_len(), 1, "the activity_failed row IS journaled (0 lost)");
+    assert_eq!(
+        outbox.outbox_depth(),
+        0,
+        "0 ghost: a failed activity emitted nothing"
+    );
+    assert_eq!(
+        journal.history_len(),
+        1,
+        "the activity_failed row IS journaled (0 lost)"
+    );
 }

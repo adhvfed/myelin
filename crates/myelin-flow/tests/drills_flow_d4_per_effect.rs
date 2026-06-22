@@ -29,9 +29,7 @@
 //! 1, recorded as a withhold with NO emit), `apply` (effect 2) — and the outbox holds the card request +
 //! exactly TWO effect-applied emits.
 
-use myelin_events::{
-    Actor, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Timestamp,
-};
+use myelin_events::{Actor, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Timestamp};
 use myelin_flow::{
     apply_approved_effects, run_state, ApprovalCard, ApprovalDecision, DurableExecutor,
     EffectOutcome, FlowDispatcher, FlowExecutor, FlowTelemetry, GatedEffect, RunStore, SignalSpec,
@@ -57,7 +55,11 @@ fn ctx_base() -> EmitContextBase {
     EmitContextBase {
         tenant: tenant(),
         region: region(),
-        actor: Actor(Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, tenant())),
+        actor: Actor(Principal::stub(
+            PrincipalId("p".into()),
+            PrincipalKind::Human,
+            tenant(),
+        )),
         schema_ver: 1,
         occurred_at: Timestamp("2026-06-21T00:00:00Z".into()),
         recorded_at: Timestamp("2026-06-21T00:00:01Z".into()),
@@ -165,7 +167,9 @@ fn gated_multi_effect_body(
             // the auto-deny window elapsed → the whole card is withheld (0 mutation across all effects).
             WaitOutcome::TimedOut => {
                 for eff in &three_effect_card(ctx.run_id()).effects {
-                    ledger.borrow_mut().push(LedgerEntry::Decline(eff.effect_ref.0.clone()));
+                    ledger
+                        .borrow_mut()
+                        .push(LedgerEntry::Decline(eff.effect_ref.0.clone()));
                 }
                 return Ok(vec![]);
             }
@@ -190,7 +194,9 @@ fn gated_multi_effect_body(
             let eff_ref = card.effects[idx].effect_ref.0.clone();
             match outcome {
                 Some(Ok(EffectOutcome::Applied(_))) => {
-                    ledger.borrow_mut().push(LedgerEntry::Apply(eff_ref.clone()));
+                    ledger
+                        .borrow_mut()
+                        .push(LedgerEntry::Apply(eff_ref.clone()));
                     ctx.emit(
                         myelin_events::EventDraft {
                             type_: myelin_events::EventType(EFFECT_APPLIED_EVENT.into()),
@@ -279,7 +285,9 @@ fn approve(ex: &FlowExecutor, run: &myelin_flow::RunId, idx: usize) {
         run: run.clone(),
         signal_name: APPROVAL_SIGNAL_NAME.into(),
         idem_key: key,
-        payload: vec![ArtifactRef(format!("myelin://acme/agent/effect/{CARD_ID}-{idx}"))],
+        payload: vec![ArtifactRef(format!(
+            "myelin://acme/agent/effect/{CARD_ID}-{idx}"
+        ))],
         payload_key_ref: None,
     })
     .expect("approve");
@@ -344,7 +352,14 @@ fn flow_d4_per_effect_partial_approval_across_restart_and_deploy_double_click() 
     let id_source = minter();
 
     // WORKER 1 ticks: the body emits the three-effect card request + PARKS (state=waiting holds no runtime).
-    let w1 = fresh_worker(&sub, "worker-1", part, ledger.clone(), apply_count.clone(), id_source.clone());
+    let w1 = fresh_worker(
+        &sub,
+        "worker-1",
+        part,
+        ledger.clone(),
+        apply_count.clone(),
+        id_source.clone(),
+    );
     let o1 = w1
         .tick(1_000, "2026-06-21T00:00:00Z", 7)
         .expect("worker-1 drives the run");
@@ -364,7 +379,11 @@ fn flow_d4_per_effect_partial_approval_across_restart_and_deploy_double_click() 
         "the agent.approval.requested card (gating 3 effects) was emitted once"
     );
     // nothing applied yet — the partial approval has not arrived.
-    assert_eq!(*apply_count.borrow(), 0, "no effect applied while the run is parked");
+    assert_eq!(
+        *apply_count.borrow(),
+        0,
+        "no effect applied while the run is parked"
+    );
 
     // --- WORKER 1 CRASHES (restart) + the service is REDEPLOYED while the run is parked (days pass). ---
     drop(w1);
@@ -400,7 +419,14 @@ fn flow_d4_per_effect_partial_approval_across_restart_and_deploy_double_click() 
     sub.runs.wake(&tenant(), &run.0);
 
     // --- WORKER 2 (the redeployed process) re-leases + resumes the run DAYS later. ---
-    let w2 = fresh_worker(&sub, "worker-2", part, ledger.clone(), apply_count.clone(), id_source.clone());
+    let w2 = fresh_worker(
+        &sub,
+        "worker-2",
+        part,
+        ledger.clone(),
+        apply_count.clone(),
+        id_source.clone(),
+    );
     let o2 = w2
         .tick(7 * 86_400 + 2_000, "2026-06-28T00:00:00Z", 7)
         .expect("worker-2 resumes the run");
@@ -446,7 +472,9 @@ fn flow_d4_per_effect_partial_approval_across_restart_and_deploy_double_click() 
          0 MUTATION (AG-8); no third effect-applied row"
     );
     assert!(
-        !ledger.contains(&LedgerEntry::Apply("myelin://acme/agent/effect/merge-b".into())),
+        !ledger.contains(&LedgerEntry::Apply(
+            "myelin://acme/agent/effect/merge-b".into()
+        )),
         "the DECLINED effect 1 was NEVER applied — 0 mutation on decline across the restart (AG-8)"
     );
 
@@ -508,7 +536,11 @@ fn partial_approval_ledger_has_exactly_three_entries() {
     );
     assert!(matches!(outcomes[2], Some(Ok(EffectOutcome::Applied(_)))));
     // the ledger has three entries; exactly two are applies.
-    assert_eq!(*applies.borrow(), 2, "exactly two applies (effects 0 and 2)");
+    assert_eq!(
+        *applies.borrow(),
+        2,
+        "exactly two applies (effects 0 and 2)"
+    );
 }
 
 /// **Unit: the double-click adds NO fourth apply.** Re-sending the same per-effect approve keys buffers no

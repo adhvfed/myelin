@@ -40,7 +40,13 @@ fn ruleset() -> BranchProtectionRuleset {
 #[test]
 fn open_review_resolve_merge_chains_end_to_end() {
     // 1) open a DRAFT PR targeting the protected main.
-    let mut pr = PullRequest::open(101, "refs/heads/main", "refs/heads/feat/charge", "psn:dev", true);
+    let mut pr = PullRequest::open(
+        101,
+        "refs/heads/main",
+        "refs/heads/feat/charge",
+        "psn:dev",
+        true,
+    );
     assert_eq!(pr.state, PrState::Draft);
 
     // 2) the branch-protection ruleset protects main (the base ref).
@@ -50,10 +56,17 @@ fn open_review_resolve_merge_chains_end_to_end() {
     // 3) the PR touches /src/payments/charge.rs → resolve its CODEOWNERS reviewers.
     let co = CodeOwners::parse(CODEOWNERS).expect("valid CODEOWNERS");
     let owners = co.owners_for("src/payments/charge.rs");
-    assert_eq!(owners, &["@acme/payments".to_string()], "payments owns the path (last match wins)");
+    assert_eq!(
+        owners,
+        &["@acme/payments".to_string()],
+        "payments owns the path (last match wins)"
+    );
 
     // 4) mark the draft ready for review.
-    assert_eq!(pr.transition(PrTransition::MarkReady, false).unwrap(), PrState::Open);
+    assert_eq!(
+        pr.transition(PrTransition::MarkReady, false).unwrap(),
+        PrState::Open
+    );
 
     // 5) request a review from the resolved CODEOWNER, then submit an approval.
     let mut review = Review::request(owners[0].clone(), /*is_agent*/ false);
@@ -64,7 +77,11 @@ fn open_review_resolve_merge_chains_end_to_end() {
     // 6) an inline thread on the diff is opened, discussed, and resolved.
     let mut thread = Thread::open(
         1,
-        DiffAnchor { path: "src/payments/charge.rs".into(), start_line: 20, end_line: 24 },
+        DiffAnchor {
+            path: "src/payments/charge.rs".into(),
+            start_line: 20,
+            end_line: 24,
+        },
         Comment {
             id: 500,
             author_pseudonym: "psn:reviewer".into(),
@@ -91,10 +108,17 @@ fn open_review_resolve_merge_chains_end_to_end() {
         outstanding_conversations: if thread.is_outstanding() { 1 } else { 0 },
     };
     let gate = evaluate_ruleset(&rs, &ctx);
-    assert!(gate.is_satisfied(), "all conditions met → the gate is satisfied: {gate:?}");
+    assert!(
+        gate.is_satisfied(),
+        "all conditions met → the gate is satisfied: {gate:?}"
+    );
 
     // 8) the merge lands (the gate guard admits it).
-    assert_eq!(pr.transition(PrTransition::Merge, gate.is_satisfied()).unwrap(), PrState::Merged);
+    assert_eq!(
+        pr.transition(PrTransition::Merge, gate.is_satisfied())
+            .unwrap(),
+        PrState::Merged
+    );
     assert!(pr.state.is_terminal());
 }
 
@@ -103,7 +127,13 @@ fn open_review_resolve_merge_chains_end_to_end() {
 /// gate is unsatisfied — then the PR is closed (a legal terminal-ish state) without ever landing.
 #[test]
 fn blocked_merge_is_refused_then_pr_is_closed() {
-    let mut pr = PullRequest::open(102, "refs/heads/main", "refs/heads/feat/x", "psn:dev", false);
+    let mut pr = PullRequest::open(
+        102,
+        "refs/heads/main",
+        "refs/heads/feat/x",
+        "psn:dev",
+        false,
+    );
     let rs = ruleset();
 
     // a reviewer requests changes; a context is red; a thread is still open.
@@ -129,5 +159,8 @@ fn blocked_merge_is_refused_then_pr_is_closed() {
     assert_eq!(pr.state, PrState::Open, "a blocked merge does not land");
 
     // the author closes the PR instead — a legal transition.
-    assert_eq!(pr.transition(PrTransition::Close, false).unwrap(), PrState::Closed);
+    assert_eq!(
+        pr.transition(PrTransition::Close, false).unwrap(),
+        PrState::Closed
+    );
 }

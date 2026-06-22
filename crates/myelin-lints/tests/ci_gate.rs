@@ -18,8 +18,7 @@ fn fixtures_dir() -> PathBuf {
 /// CI-wiring test runs the SAME `lint-gate` binary CI runs over them, so the "the lint rejects the
 /// red and admits the green" proof is end-to-end (the binary exit code, not just a unit assertion).
 fn flow_fixtures_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../myelin-flow/tests/fixtures")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../myelin-flow/tests/fixtures")
 }
 
 /// Run the compiled `lint-gate` binary over `--no-exclude PATH` and return its exit status code.
@@ -31,7 +30,9 @@ fn run_gate_over(path: &Path) -> i32 {
         .arg(path)
         .status()
         .expect("the lint-gate binary must run");
-    status.code().expect("lint-gate exits with a code, not a signal")
+    status
+        .code()
+        .expect("lint-gate exits with a code, not a signal")
 }
 
 #[test]
@@ -41,7 +42,10 @@ fn ci_gate_fails_loudly_on_the_no_raw_publish_red_fixture() {
     // true`-swallowed because the exit code IS the gate.
     let red = fixtures_dir().join("no_raw_publish.red.rs.txt");
     let code = run_gate_over(&red);
-    assert_ne!(code, 0, "lint-gate MUST exit non-zero on the no-raw-publish red fixture");
+    assert_ne!(
+        code, 0,
+        "lint-gate MUST exit non-zero on the no-raw-publish red fixture"
+    );
 }
 
 #[test]
@@ -50,7 +54,10 @@ fn ci_gate_passes_on_the_no_raw_publish_green_fixture() {
     // lint does not over-reject (both fixtures are the EB-07 pass condition).
     let green = fixtures_dir().join("no_raw_publish.green.rs.txt");
     let code = run_gate_over(&green);
-    assert_eq!(code, 0, "lint-gate MUST exit zero on the no-raw-publish green fixture");
+    assert_eq!(
+        code, 0,
+        "lint-gate MUST exit zero on the no-raw-publish green fixture"
+    );
 }
 
 #[test]
@@ -62,7 +69,10 @@ fn ci_gate_fails_loudly_on_the_eb08_write_path_red_fixture() {
     // CI loud-never-swallowed.
     let red = fixtures_dir().join("no_cross_sync_cycle.eb08.red.rs.txt");
     let code = run_gate_over(&red);
-    assert_ne!(code, 0, "lint-gate MUST exit non-zero on the EB-08 write-path red fixture");
+    assert_ne!(
+        code, 0,
+        "lint-gate MUST exit non-zero on the EB-08 write-path red fixture"
+    );
 }
 
 #[test]
@@ -72,7 +82,10 @@ fn ci_gate_passes_on_the_eb08_write_path_green_fixture() {
     // condition).
     let green = fixtures_dir().join("no_cross_sync_cycle.eb08.green.rs.txt");
     let code = run_gate_over(&green);
-    assert_eq!(code, 0, "lint-gate MUST exit zero on the EB-08 write-path green fixture");
+    assert_eq!(
+        code, 0,
+        "lint-gate MUST exit zero on the EB-08 write-path green fixture"
+    );
 }
 
 #[test]
@@ -83,7 +96,10 @@ fn ci_gate_fails_loudly_on_the_eb09_stream_scope_red_fixture() {
     // (EI-01 §5). This is the dated green proof that the EB-09 leg is wired into CI loud-never-swallowed.
     let red = fixtures_dir().join("tenant_predicate.eb09.red.rs.txt");
     let code = run_gate_over(&red);
-    assert_ne!(code, 0, "lint-gate MUST exit non-zero on the EB-09 stream-scope red fixture");
+    assert_ne!(
+        code, 0,
+        "lint-gate MUST exit non-zero on the EB-09 stream-scope red fixture"
+    );
 }
 
 #[test]
@@ -92,7 +108,10 @@ fn ci_gate_passes_on_the_eb09_stream_scope_green_fixture() {
     // exit zero — proving the lint does not over-reject (both fixtures are the EB-09 pass condition).
     let green = fixtures_dir().join("tenant_predicate.eb09.green.rs.txt");
     let code = run_gate_over(&green);
-    assert_eq!(code, 0, "lint-gate MUST exit zero on the EB-09 stream-scope green fixture");
+    assert_eq!(
+        code, 0,
+        "lint-gate MUST exit zero on the EB-09 stream-scope green fixture"
+    );
 }
 
 #[test]
@@ -104,7 +123,10 @@ fn ci_gate_fails_loudly_on_the_flow_determinism_red_fixture() {
     // proof the flow-determinism lint REJECTS the red, wired into CI loud-never-swallowed.
     let red = flow_fixtures_dir().join("flow_determinism.flow.red.rs.txt");
     let code = run_gate_over(&red);
-    assert_ne!(code, 0, "lint-gate MUST exit non-zero on the flow-determinism red fixture");
+    assert_ne!(
+        code, 0,
+        "lint-gate MUST exit non-zero on the flow-determinism red fixture"
+    );
 }
 
 #[test]
@@ -115,7 +137,10 @@ fn ci_gate_passes_on_the_flow_determinism_green_fixture() {
     // by `myelin-flow`'s `lint_fixtures::green_compiles` test (the "admits" half is an artifact).
     let green = flow_fixtures_dir().join("flow_determinism.flow.green.rs.txt");
     let code = run_gate_over(&green);
-    assert_eq!(code, 0, "lint-gate MUST exit zero on the flow-determinism green fixture");
+    assert_eq!(
+        code, 0,
+        "lint-gate MUST exit zero on the flow-determinism green fixture"
+    );
 }
 
 #[test]
@@ -123,6 +148,11 @@ fn ci_gate_is_clean_over_the_real_workspace() {
     // Belt-and-braces: the gate run with no args (the workspace `crates/*/src` tree, exclusions
     // honoured) exits zero — the live CI job is green on real code, not just fixtures.
     let bin = env!("CARGO_BIN_EXE_lint-gate");
-    let status = Command::new(bin).status().expect("lint-gate runs with no args");
-    assert!(status.success(), "lint-gate MUST be clean over the real workspace source");
+    let status = Command::new(bin)
+        .status()
+        .expect("lint-gate runs with no args");
+    assert!(
+        status.success(),
+        "lint-gate MUST be clean over the real workspace source"
+    );
 }

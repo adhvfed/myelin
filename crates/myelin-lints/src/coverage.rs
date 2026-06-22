@@ -269,7 +269,10 @@ pub fn parse_manifest(toml: &str) -> Result<Vec<ManifestEntry>, String> {
             continue;
         }
         let Some((key, value)) = line.split_once('=') else {
-            return Err(format!("line {}: not a key = value pair: {line}", lineno + 1));
+            return Err(format!(
+                "line {}: not a key = value pair: {line}",
+                lineno + 1
+            ));
         };
         let key = key.trim();
         let value = value.trim();
@@ -349,7 +352,12 @@ fn unquote(value: &str, lineno: usize) -> Result<String, String> {
     v.strip_prefix('"')
         .and_then(|v| v.strip_suffix('"'))
         .map(|s| s.to_string())
-        .ok_or_else(|| format!("line {}: expected a quoted string, got `{value}`", lineno + 1))
+        .ok_or_else(|| {
+            format!(
+                "line {}: expected a quoted string, got `{value}`",
+                lineno + 1
+            )
+        })
 }
 
 fn parse_string_array(value: &str, lineno: usize) -> Result<Vec<String>, String> {
@@ -357,7 +365,12 @@ fn parse_string_array(value: &str, lineno: usize) -> Result<Vec<String>, String>
     let inner = v
         .strip_prefix('[')
         .and_then(|v| v.strip_suffix(']'))
-        .ok_or_else(|| format!("line {}: expected an array `[...]`, got `{value}`", lineno + 1))?;
+        .ok_or_else(|| {
+            format!(
+                "line {}: expected an array `[...]`, got `{value}`",
+                lineno + 1
+            )
+        })?;
     let mut out = Vec::new();
     for part in inner.split(',') {
         let p = part.trim();
@@ -724,9 +737,7 @@ landing = \"P-070\"\n";
         let manifest = vec![ManifestEntry {
             row: RowId::parse("4.3").unwrap(),
             title: "list_objects".into(),
-            coverage: Coverage::Deferred {
-                landing: "".into(),
-            },
+            coverage: Coverage::Deferred { landing: "".into() },
         }];
         let report = scan(&rows(&["4.3"]), &manifest, &FakeCdc(Default::default()));
         assert!(matches!(
@@ -747,10 +758,9 @@ landing = \"P-070\"\n";
         }];
         let report = scan(&rows(&["1.1"]), &manifest, &FakeCdc(Default::default()));
         // 1.1 missing from manifest + 99.1 stale = two distinct loud failures.
-        assert!(report
-            .errors
-            .iter()
-            .any(|e| matches!(e, CoverageError::StaleManifestEntry { row } if row.to_string() == "99.1")));
+        assert!(report.errors.iter().any(
+            |e| matches!(e, CoverageError::StaleManifestEntry { row } if row.to_string() == "99.1")
+        ));
         assert!(report
             .errors
             .iter()

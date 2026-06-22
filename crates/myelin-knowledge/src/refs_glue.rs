@@ -77,8 +77,8 @@ use myelin_content::events::{
 };
 use myelin_content::inline::InlineNode;
 use myelin_events::{
-    AggregateKey, ArtifactRef, DataRole, EventDraft, EventEnvelope, EventId, EventType,
-    OutboxTx, Result as BusResult, Visibility,
+    AggregateKey, ArtifactRef, DataRole, EventDraft, EventEnvelope, EventId, EventType, OutboxTx,
+    Result as BusResult, Visibility,
 };
 use myelin_identity::{
     Consistency, ConsistencyMode, Decision, IdentityService, Permission, Principal, Zookie,
@@ -540,14 +540,17 @@ enum KnArtifactType {
 /// Classify a parsed Knowledge `ArtifactRef` to its [`KnArtifactType`] (reading the `<subsystem>`/
 /// `<type>` scope segments — never a render-time display form).
 fn classify(r: &ArtifactRef) -> Result<KnArtifactType, ProjectError> {
-    let rest = r
-        .0
-        .strip_prefix("myelin://")
-        .ok_or_else(|| ProjectError::NotAKnowledgeArtifact { reference: r.0.clone() })?;
+    let rest =
+        r.0.strip_prefix("myelin://")
+            .ok_or_else(|| ProjectError::NotAKnowledgeArtifact {
+                reference: r.0.clone(),
+            })?;
     let scope = rest.split('#').next().unwrap_or(rest);
     let segments: Vec<&str> = scope.split('/').collect();
     if segments.len() != 4 || segments[1] != "knowledge" {
-        return Err(ProjectError::NotAKnowledgeArtifact { reference: r.0.clone() });
+        return Err(ProjectError::NotAKnowledgeArtifact {
+            reference: r.0.clone(),
+        });
     }
     match segments[2] {
         "page" => Ok(KnArtifactType::Page),
@@ -555,7 +558,9 @@ fn classify(r: &ArtifactRef) -> Result<KnArtifactType, ProjectError> {
         "database" => Ok(KnArtifactType::Database),
         "row" => Ok(KnArtifactType::Row),
         "view" => Ok(KnArtifactType::View),
-        other => Err(ProjectError::UnknownKnowledgeType { ty: other.to_string() }),
+        other => Err(ProjectError::UnknownKnowledgeType {
+            ty: other.to_string(),
+        }),
     }
 }
 
@@ -692,7 +697,10 @@ impl<I: IdentityService> Projector<I> {
 
         // ── STEP 1: PERMISSION FIRST (the 0-leak gate, root-keyed). A Deny / Conditional / Id-error
         //    ALL fail closed to a `Denied` tombstone carrying the ROOT, with NO artifact field read.
-        let at = Consistency { at_least: zookie, mode: ConsistencyMode::Strong };
+        let at = Consistency {
+            at_least: zookie,
+            mode: ConsistencyMode::Strong,
+        };
         let permission = Permission(READ.to_string());
         match self.id.check(viewer, &permission, &root, &at, None) {
             Ok(Decision::Allow) => { /* authorised — descend the ladder */ }

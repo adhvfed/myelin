@@ -30,17 +30,17 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use myelin_search::{
-    git_blob_search_projection, git_code_projection_spec, trigram_query, AclFilter,
-    GitBlobProjectionInput, IncrementalIndexer, MockEmbeddingAdapter, ProjectFetchError,
-    ProjectFetcher, SearchProjection, GIT_FACET_LANGUAGE, GIT_FACET_PATH,
-};
 use myelin_events::{
     Actor, AggregateKey, CorrelationId, DataRole, EventEnvelope, EventId, EventType, Timestamp,
     Visibility,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_query::FieldValue;
+use myelin_search::{
+    git_blob_search_projection, git_code_projection_spec, trigram_query, AclFilter,
+    GitBlobProjectionInput, IncrementalIndexer, MockEmbeddingAdapter, ProjectFetchError,
+    ProjectFetcher, SearchProjection, GIT_FACET_LANGUAGE, GIT_FACET_PATH,
+};
 use myelin_tenancy::{ArtifactRef, Region, TenantId};
 
 // ----------------------------------------------------------------------------------------------
@@ -54,7 +54,11 @@ fn region() -> Region {
     Region("fr-par".into())
 }
 fn viewer(id: &str, t: &str) -> Principal {
-    Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, TenantId(t.into()))
+    Principal::stub(
+        PrincipalId(id.into()),
+        PrincipalKind::Human,
+        TenantId(t.into()),
+    )
 }
 
 /// A scripted [`ProjectFetcher`] over a `ref → SearchProjection` map — the owner's `project(ref,
@@ -158,32 +162,66 @@ fn git_code_search_v1_symbol_path_literal_commit_trigram() {
     fetcher.put(py_ref, git_blob_search_projection(&parser_blob()));
     let ix = git_indexer(fetcher);
 
-    ix.index(&git_event("e-rust", "git.blob.indexed", rust_ref, "acme")).expect("index rust blob");
-    ix.index(&git_event("e-py", "git.blob.indexed", py_ref, "acme")).expect("index python blob");
-    assert_eq!(ix.live_count(&tenant(), &region()), 2, "both Git blobs are live");
+    ix.index(&git_event("e-rust", "git.blob.indexed", rust_ref, "acme"))
+        .expect("index rust blob");
+    ix.index(&git_event("e-py", "git.blob.indexed", py_ref, "acme"))
+        .expect("index python blob");
+    assert_eq!(
+        ix.live_count(&tenant(), &region()),
+        2,
+        "both Git blobs are live"
+    );
 
     let acl = AclFilter::ids([rust_ref, py_ref]);
 
     // SYMBOL (camel/snake split): `deadlock` is a camel part of `detectDeadlock` → the Rust blob.
-    let sym = ix.search_ft(&tenant(), &region(), &acl, "deadlock", 10).expect("symbol search");
-    assert!(sym.iter().any(|h| h.doc_id == rust_ref), "the symbol part `deadlock` finds the Rust blob");
-    assert!(!sym.iter().any(|h| h.doc_id == py_ref), "the symbol does not find the unrelated Python blob");
+    let sym = ix
+        .search_ft(&tenant(), &region(), &acl, "deadlock", 10)
+        .expect("symbol search");
+    assert!(
+        sym.iter().any(|h| h.doc_id == rust_ref),
+        "the symbol part `deadlock` finds the Rust blob"
+    );
+    assert!(
+        !sym.iter().any(|h| h.doc_id == py_ref),
+        "the symbol does not find the unrelated Python blob"
+    );
 
     // EXACT identifier: the whole lowercased identifier `detectdeadlock` hits.
-    let exact = ix.search_ft(&tenant(), &region(), &acl, "detectdeadlock", 10).expect("exact-id search");
-    assert!(exact.iter().any(|h| h.doc_id == rust_ref), "the whole identifier `detectdeadlock` hits");
+    let exact = ix
+        .search_ft(&tenant(), &region(), &acl, "detectdeadlock", 10)
+        .expect("exact-id search");
+    assert!(
+        exact.iter().any(|h| h.doc_id == rust_ref),
+        "the whole identifier `detectdeadlock` hits"
+    );
 
     // PATH: a path segment `tokenizer` (and the snake symbol `parse_html`) → the Python blob.
-    let path_hit = ix.search_ft(&tenant(), &region(), &acl, "tokenizer", 10).expect("path search");
-    assert!(path_hit.iter().any(|h| h.doc_id == py_ref), "the path segment `tokenizer` finds the Python blob");
+    let path_hit = ix
+        .search_ft(&tenant(), &region(), &acl, "tokenizer", 10)
+        .expect("path search");
+    assert!(
+        path_hit.iter().any(|h| h.doc_id == py_ref),
+        "the path segment `tokenizer` finds the Python blob"
+    );
 
     // LITERAL: the string literal "cycle detected" → the Rust blob.
-    let lit = ix.search_ft(&tenant(), &region(), &acl, "cycle", 10).expect("literal search");
-    assert!(lit.iter().any(|h| h.doc_id == rust_ref), "the string-literal token `cycle` finds the Rust blob");
+    let lit = ix
+        .search_ft(&tenant(), &region(), &acl, "cycle", 10)
+        .expect("literal search");
+    assert!(
+        lit.iter().any(|h| h.doc_id == rust_ref),
+        "the string-literal token `cycle` finds the Rust blob"
+    );
 
     // COMMIT MESSAGE: `resolve` is from the Rust blob's commit message.
-    let commit = ix.search_ft(&tenant(), &region(), &acl, "resolve", 10).expect("commit-message search");
-    assert!(commit.iter().any(|h| h.doc_id == rust_ref), "the commit-message token `resolve` finds the Rust blob");
+    let commit = ix
+        .search_ft(&tenant(), &region(), &acl, "resolve", 10)
+        .expect("commit-message search");
+    assert!(
+        commit.iter().any(|h| h.doc_id == rust_ref),
+        "the commit-message token `resolve` finds the Rust blob"
+    );
 
     // STRUCTURED PATH FACET (GF-3 "find this path"): an exact path equality returns just that blob.
     let path_facet = ix
@@ -201,7 +239,14 @@ fn git_code_search_v1_symbol_path_literal_commit_trigram() {
 
     // STRUCTURED LANGUAGE FACET: language == python → just the Python blob.
     let lang_facet = ix
-        .search_structured(&tenant(), &region(), &acl, GIT_FACET_LANGUAGE, &FieldValue::Text("python".into()), 10)
+        .search_structured(
+            &tenant(),
+            &region(),
+            &acl,
+            GIT_FACET_LANGUAGE,
+            &FieldValue::Text("python".into()),
+            10,
+        )
         .expect("language facet scan");
     assert_eq!(lang_facet.len(), 1, "exactly the python blob");
     assert_eq!(lang_facet[0].doc_id, py_ref);
@@ -211,8 +256,14 @@ fn git_code_search_v1_symbol_path_literal_commit_trigram() {
     // the FT body for the trigram conjunction (every trigram MUST be present — `+` is Tantivy MUST).
     let q = trigram_query("adlo");
     assert!(!q.is_empty(), "a 4-char substring yields trigrams");
-    let conjunction = q.iter().map(|t| format!("+\"{t}\"")).collect::<Vec<_>>().join(" ");
-    let tri = ix.search_ft(&tenant(), &region(), &acl, &conjunction, 10).expect("trigram search");
+    let conjunction = q
+        .iter()
+        .map(|t| format!("+\"{t}\""))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let tri = ix
+        .search_ft(&tenant(), &region(), &acl, &conjunction, 10)
+        .expect("trigram search");
     assert!(
         tri.iter().any(|h| h.doc_id == rust_ref),
         "the trigram substring candidate filter admits the Rust blob: q={conjunction}"
@@ -252,24 +303,45 @@ fn srch_d1_private_git_blob_never_leaks() {
     fetcher.put(private, git_blob_search_projection(&secret_blob));
 
     let ix = git_indexer(fetcher);
-    ix.index(&git_event("v", "git.blob.indexed", visible, "acme")).expect("index visible");
-    ix.index(&git_event("p", "git.blob.indexed", private, "acme")).expect("index private");
-    assert_eq!(ix.live_count(&tenant(), &region()), 2, "both blobs are indexed");
+    ix.index(&git_event("v", "git.blob.indexed", visible, "acme"))
+        .expect("index visible");
+    ix.index(&git_event("p", "git.blob.indexed", private, "acme"))
+        .expect("index private");
+    assert_eq!(
+        ix.live_count(&tenant(), &region()),
+        2,
+        "both blobs are indexed"
+    );
 
     // The unauthorized viewer's reachable set is JUST the visible repo's blob (the private repo is NOT
     // in it — git ACL is repo-granular, and the viewer is not a member of secret-repo).
     let acl_unauth = AclFilter::ids([visible]);
 
     // FT: the shared rare symbol `zarquonreactor` — only the visible blob surfaces; private never does.
-    let hits = ix.search_ft(&tenant(), &region(), &acl_unauth, "zarquonreactor", 10).expect("ft");
-    assert_eq!(hits.len(), 1, "0 count-leak: exactly the one visible blob (hidden blob never counted)");
+    let hits = ix
+        .search_ft(&tenant(), &region(), &acl_unauth, "zarquonreactor", 10)
+        .expect("ft");
+    assert_eq!(
+        hits.len(),
+        1,
+        "0 count-leak: exactly the one visible blob (hidden blob never counted)"
+    );
     assert_eq!(hits[0].doc_id, visible);
-    assert!(!hits.iter().any(|h| h.doc_id == private), "0 leak: the private blob never surfaces");
+    assert!(
+        !hits.iter().any(|h| h.doc_id == private),
+        "0 leak: the private blob never surfaces"
+    );
 
     // Even a trigram substring of the SECRET-only content never surfaces the private blob.
     let q = trigram_query("classified");
-    let conjunction = q.iter().map(|t| format!("+\"{t}\"")).collect::<Vec<_>>().join(" ");
-    let tri = ix.search_ft(&tenant(), &region(), &acl_unauth, &conjunction, 10).expect("trigram ft");
+    let conjunction = q
+        .iter()
+        .map(|t| format!("+\"{t}\""))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let tri = ix
+        .search_ft(&tenant(), &region(), &acl_unauth, &conjunction, 10)
+        .expect("trigram ft");
     assert!(
         !tri.iter().any(|h| h.doc_id == private),
         "0 leak: a substring unique to the private blob never surfaces it for an unauthorized viewer"
@@ -277,9 +349,18 @@ fn srch_d1_private_git_blob_never_leaks() {
 
     // The chained grant: the viewer is now a member of secret-repo → the private blob becomes visible.
     let acl_granted = AclFilter::ids([visible, private]);
-    let granted = ix.search_ft(&tenant(), &region(), &acl_granted, "zarquonreactor", 10).expect("ft granted");
-    assert_eq!(granted.len(), 2, "after the grant BOTH blobs surface (the rejection was the ACL, not a deny)");
-    assert!(granted.iter().any(|h| h.doc_id == private), "the granted private blob now appears");
+    let granted = ix
+        .search_ft(&tenant(), &region(), &acl_granted, "zarquonreactor", 10)
+        .expect("ft granted");
+    assert_eq!(
+        granted.len(),
+        2,
+        "after the grant BOTH blobs surface (the rejection was the ACL, not a deny)"
+    );
+    assert!(
+        granted.iter().any(|h| h.doc_id == private),
+        "the granted private blob now appears"
+    );
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -298,28 +379,57 @@ fn srch_d3_cross_tenant_git_blobs_do_not_leak() {
     fetcher.put(acme_blob, git_blob_search_projection(&scheduler_blob()));
     fetcher.put(evil_blob, git_blob_search_projection(&scheduler_blob()));
     let ix = git_indexer(fetcher);
-    ix.index(&git_event("a", "git.blob.indexed", acme_blob, "acme")).expect("index acme");
-    ix.index(&git_event("e", "git.blob.indexed", evil_blob, "evil")).expect("index evil");
+    ix.index(&git_event("a", "git.blob.indexed", acme_blob, "acme"))
+        .expect("index acme");
+    ix.index(&git_event("e", "git.blob.indexed", evil_blob, "evil"))
+        .expect("index evil");
 
     let acme_t = TenantId("acme".into());
     let evil_t = TenantId("evil".into());
 
     // Positive control: acme's viewer querying acme's index sees acme's blob.
     let acme_hits = ix
-        .search_ft(&acme_t, &region(), &AclFilter::ids([acme_blob]), "deadlock", 10)
+        .search_ft(
+            &acme_t,
+            &region(),
+            &AclFilter::ids([acme_blob]),
+            "deadlock",
+            10,
+        )
         .expect("acme search");
-    assert!(acme_hits.iter().any(|h| h.doc_id == acme_blob), "acme sees its own blob");
+    assert!(
+        acme_hits.iter().any(|h| h.doc_id == acme_blob),
+        "acme sees its own blob"
+    );
 
     // The cross-tenant attack: even with an allow-set NAMING the evil blob's doc-id, querying ACME's
     // partition returns 0 — the evil blob lives in a DIFFERENT (tenant, region) index entirely.
     let cross = ix
-        .search_ft(&acme_t, &region(), &AclFilter::ids([evil_blob]), "deadlock", 10)
+        .search_ft(
+            &acme_t,
+            &region(),
+            &AclFilter::ids([evil_blob]),
+            "deadlock",
+            10,
+        )
         .expect("cross-tenant search");
-    assert!(cross.is_empty(), "0 cross-tenant: acme's index holds none of evil's blobs");
+    assert!(
+        cross.is_empty(),
+        "0 cross-tenant: acme's index holds none of evil's blobs"
+    );
 
     // And the evil tenant's index, conversely, holds only evil's blob.
     let evil_hits = ix
-        .search_ft(&evil_t, &region(), &AclFilter::ids([acme_blob]), "deadlock", 10)
+        .search_ft(
+            &evil_t,
+            &region(),
+            &AclFilter::ids([acme_blob]),
+            "deadlock",
+            10,
+        )
         .expect("evil search");
-    assert!(evil_hits.is_empty(), "0 cross-tenant: evil's index holds none of acme's blobs");
+    assert!(
+        evil_hits.is_empty(),
+        "0 cross-tenant: evil's index holds none of acme's blobs"
+    );
 }

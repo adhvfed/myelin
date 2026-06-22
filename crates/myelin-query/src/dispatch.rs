@@ -380,10 +380,7 @@ impl CostGate for InMemoryCostGate {
         // Idempotent on run_ref: a redelivery returns the SAME reservation, never double-charges.
         {
             let inflight = self.in_flight.borrow();
-            if inflight
-                .get(tenant)
-                .is_some_and(|s| s.contains(run_ref))
-            {
+            if inflight.get(tenant).is_some_and(|s| s.contains(run_ref)) {
                 return Some(Reservation {
                     run_ref: run_ref.to_string(),
                     reserved_units: self.cost_per_run,
@@ -776,7 +773,8 @@ impl<T: DispatchTarget, G: CostGate> DispatchTier<T, G> {
         // tripwire on this dispatch); the action is still delivered (the trip bounds the NEXT
         // dispatch, this one completes — halts ≤ threshold, not below it).
         let was_open_before = self.breaker.is_open(&ev.tenant);
-        self.breaker.record_and_check(&ev.tenant, &ev.correlation_id);
+        self.breaker
+            .record_and_check(&ev.tenant, &ev.correlation_id);
         let tripwire_fired = !was_open_before && self.breaker.is_open(&ev.tenant);
 
         let action = derive_dispatched_action(ev, &req.run_ref, mint_event_id(), now);
@@ -913,9 +911,7 @@ mod tests {
         move || EventId(id)
     }
 
-    fn tier_with_balance(
-        balance: u64,
-    ) -> DispatchTier<RecordingTarget, InMemoryCostGate> {
+    fn tier_with_balance(balance: u64) -> DispatchTier<RecordingTarget, InMemoryCostGate> {
         let gate = InMemoryCostGate::new(1);
         gate.credit(&TenantId("t1".into()), balance);
         DispatchTier::new(RecordingTarget::new(), gate)
@@ -937,7 +933,11 @@ mod tests {
     fn nested_causality_dispatched_action_is_parent_plus_one_correlation_carried() {
         let mut tier = tier_with_balance(10);
         let ev = event("human", "myelin://t1/chat/message/1", 3, "root-A");
-        let disp = tier.dispatch(&auto_req(ev.clone(), "agentX", "run-1"), minter("act-1"), &now());
+        let disp = tier.dispatch(
+            &auto_req(ev.clone(), "agentX", "run-1"),
+            minter("act-1"),
+            &now(),
+        );
         match disp {
             Disposition::Delivered { action } => {
                 // NESTED, not flat: the action's immediate parent is the trigger; the root carries.
@@ -991,7 +991,11 @@ mod tests {
         let disp = tier.dispatch(&auto_req(ev, "agentX", "run-1"), minter("act-1"), &now());
         assert_eq!(disp, Disposition::SelfGuardDropped);
         assert_eq!(tier.telemetry().self_guard_dropped, 1);
-        assert_eq!(tier.target().delivered_count(), 0, "0 dispatch on a self-event");
+        assert_eq!(
+            tier.target().delivered_count(),
+            0,
+            "0 dispatch on a self-event"
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -1023,17 +1027,36 @@ mod tests {
     fn depth_ceiling_parks_at_twelve() {
         let mut tier = tier_with_balance(10);
         // A trigger already AT the ceiling (12): the dispatched action would be 13 > ceiling.
-        let ev = event("human", "myelin://t1/chat/message/1", CAUSAL_DEPTH_CEILING, "root-A");
+        let ev = event(
+            "human",
+            "myelin://t1/chat/message/1",
+            CAUSAL_DEPTH_CEILING,
+            "root-A",
+        );
         let disp = tier.dispatch(&auto_req(ev, "agentX", "run-1"), minter("act-1"), &now());
-        assert_eq!(disp, Disposition::DepthCeilingParked { depth: CAUSAL_DEPTH_CEILING });
+        assert_eq!(
+            disp,
+            Disposition::DepthCeilingParked {
+                depth: CAUSAL_DEPTH_CEILING
+            }
+        );
         assert_eq!(tier.telemetry().depth_ceiling_parked, 1);
-        assert_eq!(tier.target().delivered_count(), 0, "the chain halts ≤ ceiling");
+        assert_eq!(
+            tier.target().delivered_count(),
+            0,
+            "the chain halts ≤ ceiling"
+        );
     }
 
     #[test]
     fn depth_below_ceiling_dispatches() {
         let mut tier = tier_with_balance(10);
-        let ev = event("human", "myelin://t1/chat/message/1", CAUSAL_DEPTH_CEILING - 1, "root-A");
+        let ev = event(
+            "human",
+            "myelin://t1/chat/message/1",
+            CAUSAL_DEPTH_CEILING - 1,
+            "root-A",
+        );
         let disp = tier.dispatch(&auto_req(ev, "agentX", "run-1"), minter("act-1"), &now());
         assert!(matches!(disp, Disposition::Delivered { .. }));
     }
@@ -1051,11 +1074,22 @@ mod tests {
         // K=3 dispatches on ONE root succeed; the 4th crosses the tripwire (count > K).
         for i in 0..4 {
             let ev = event("human", &format!("myelin://t1/chat/message/{i}"), 1, root);
-            let _ = tier.dispatch(&auto_req(ev, "agentX", &format!("run-{i}")), minter(&format!("a{i}")), &now());
+            let _ = tier.dispatch(
+                &auto_req(ev, "agentX", &format!("run-{i}")),
+                minter(&format!("a{i}")),
+                &now(),
+            );
         }
-        assert!(tier.breaker_open(&t1), "the breaker tripped on the over-K root");
+        assert!(
+            tier.breaker_open(&t1),
+            "the breaker tripped on the over-K root"
+        );
         assert!(tier.root_count(&t1, &CorrelationId(root.into())) > SHARED_ROOT_TRIPWIRE_K.min(3));
-        assert_eq!(tier.telemetry().tripwire_firings, 1, "exactly one trip recorded");
+        assert_eq!(
+            tier.telemetry().tripwire_firings,
+            1,
+            "exactly one trip recorded"
+        );
         // After the trip, a further dispatch on the tenant is shed (breaker open).
         let ev = event("human", "myelin://t1/chat/message/99", 1, root);
         let disp = tier.dispatch(&auto_req(ev, "agentX", "run-99"), minter("a99"), &now());
@@ -1082,7 +1116,11 @@ mod tests {
         let disp = tier.dispatch(&req, minter("act-1"), &now());
         assert_eq!(disp, Disposition::NotifiedOnly);
         assert_eq!(tier.telemetry().notified_only, 1);
-        assert_eq!(tier.target().delivered_count(), 0, "a mention auto-spawns 0 runs (CHAT-1)");
+        assert_eq!(
+            tier.target().delivered_count(),
+            0,
+            "a mention auto-spawns 0 runs (CHAT-1)"
+        );
         assert_eq!(tier.telemetry().delivered, 0);
     }
 
@@ -1096,7 +1134,11 @@ mod tests {
         let disp = tier.dispatch(&auto_req(ev, "agentX", "run-1"), minter("act-1"), &now());
         assert_eq!(disp, Disposition::NoBalanceRefused);
         assert_eq!(tier.telemetry().no_balance_refused, 1);
-        assert_eq!(tier.target().delivered_count(), 0, "no balance → no execution (11.7)");
+        assert_eq!(
+            tier.target().delivered_count(),
+            0,
+            "no balance → no execution (11.7)"
+        );
     }
 
     #[test]
@@ -1106,9 +1148,15 @@ mod tests {
         let t1 = TenantId("t1".into());
         gate.credit(&t1, 1); // exactly one run's worth of balance
         assert!(gate.reserve(&t1, "run-1").is_some());
-        assert!(gate.reserve(&t1, "run-1").is_some(), "redelivery re-reserves, no double-charge");
+        assert!(
+            gate.reserve(&t1, "run-1").is_some(),
+            "redelivery re-reserves, no double-charge"
+        );
         // A DIFFERENT run with no remaining balance is refused.
-        assert!(gate.reserve(&t1, "run-2").is_none(), "balance exhausted → refused");
+        assert!(
+            gate.reserve(&t1, "run-2").is_none(),
+            "balance exhausted → refused"
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -1173,7 +1221,11 @@ mod tests {
             minter("a1"),
             &now(),
         );
-        assert_eq!(disp, Disposition::NotifiedOnly, "a resolving Signal closes, never dispatches");
+        assert_eq!(
+            disp,
+            Disposition::NotifiedOnly,
+            "a resolving Signal closes, never dispatches"
+        );
         assert_eq!(tier.target().delivered_count(), 0);
     }
 }

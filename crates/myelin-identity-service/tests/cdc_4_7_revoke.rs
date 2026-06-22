@@ -128,7 +128,12 @@ fn cdc_4_7_revoked_principal_refused_across_surfaces() {
     let obj = ArtifactRef("repo:core".into());
 
     // Before revoke: honoured.
-    assert!(surface_honours_session(&svc, &subject("p:alice"), "view", &obj));
+    assert!(surface_honours_session(
+        &svc,
+        &subject("p:alice"),
+        "view",
+        &obj
+    ));
 
     // PROVIDER: revoke alice (the SCIM-disable path).
     svc.disable_principal_in(

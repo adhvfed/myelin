@@ -96,9 +96,7 @@ impl ConformanceStep {
     /// produced-vs-`expect` mismatch.
     pub fn run(&self) -> OrderKey {
         match self.op {
-            RankOp::First { jitter } => {
-                OrderKey::rank_first(jit(jitter))
-            }
+            RankOp::First { jitter } => OrderKey::rank_first(jit(jitter)),
             RankOp::Last { after, jitter } => {
                 let after = after.map(parse_key);
                 OrderKey::rank_last(after.as_ref(), jit(jitter))
@@ -279,7 +277,10 @@ mod tests {
         assert!(prepend < first, "prepend {prepend} < first {first}");
         assert!(first < last, "first {first} < last {last}");
         // F22 < between(M33) < U00 — the strictly-between key sits in its gap.
-        assert!(prepend < between && between < first, "{prepend} < {between} < {first}");
+        assert!(
+            prepend < between && between < first,
+            "{prepend} < {between} < {first}"
+        );
     }
 
     /// **The concurrent same-gap collision produces DISTINCT keys** (the jitter's whole reason for
@@ -298,7 +299,11 @@ mod tests {
             .find(|s| s.label.starts_with("concurrent same-gap insert B"))
             .unwrap()
             .run();
-        assert_ne!(a.as_str(), b.as_str(), "the 2-char jitter makes same-gap inserts DISTINCT");
+        assert_ne!(
+            a.as_str(),
+            b.as_str(),
+            "the 2-char jitter makes same-gap inserts DISTINCT"
+        );
         // Both share the un-jittered midpoint body but differ in the jitter suffix.
         assert_eq!(&a.as_str()[..1], &b.as_str()[..1], "same midpoint body");
         // Both are strictly between the gap bounds F22 and U00.
@@ -315,9 +320,15 @@ mod tests {
     fn rebalance_triggers_at_48_chars() {
         // The boundary: a key one char below the trigger does NOT trip; AT the trigger it does.
         let just_below = OrderKey::parse("V".repeat(LEXORANK_REBALANCE_LEN - 1)).unwrap();
-        assert!(!just_below.needs_rebalance(), "one char below the 48-char trigger does NOT trip");
+        assert!(
+            !just_below.needs_rebalance(),
+            "one char below the 48-char trigger does NOT trip"
+        );
         let at_trigger = OrderKey::parse("V".repeat(LEXORANK_REBALANCE_LEN)).unwrap();
-        assert!(at_trigger.needs_rebalance(), "a {LEXORANK_REBALANCE_LEN}-char key trips rebalance");
+        assert!(
+            at_trigger.needs_rebalance(),
+            "a {LEXORANK_REBALANCE_LEN}-char key trips rebalance"
+        );
         // The free-function form mirrors the method (the contract name `needs_rebalance(rank)`).
         assert!(OrderKey::needs_rebalance_key(&at_trigger));
         assert!(!OrderKey::needs_rebalance_key(&just_below));
@@ -333,8 +344,14 @@ mod tests {
             let s = k.as_str();
             let (head, last) = s.split_at(s.len() - 1);
             let last_byte = last.as_bytes()[0];
-            let pos = LEXORANK_ALPHABET.iter().position(|&b| b == last_byte).unwrap();
-            assert!(pos + 1 < LEXORANK_ALPHABET.len(), "successor stays in-alphabet");
+            let pos = LEXORANK_ALPHABET
+                .iter()
+                .position(|&b| b == last_byte)
+                .unwrap();
+            assert!(
+                pos + 1 < LEXORANK_ALPHABET.len(),
+                "successor stays in-alphabet"
+            );
             let bumped = LEXORANK_ALPHABET[pos + 1] as char;
             OrderKey::parse(format!("{head}{bumped}")).unwrap()
         };
@@ -344,8 +361,14 @@ mod tests {
         for _ in 0..400 {
             let hi = succ(&lo); // the immediate successor: an adjacent gap, no digit fits between
             let mid = OrderKey::bisect(Some(&lo), Some(&hi));
-            assert!(lo < mid && mid < hi, "stays strictly between while growing: {lo} < {mid} < {hi}");
-            assert!(mid.as_str().len() > lo.as_str().len(), "an adjacent-gap bisection grows the key");
+            assert!(
+                lo < mid && mid < hi,
+                "stays strictly between while growing: {lo} < {mid} < {hi}"
+            );
+            assert!(
+                mid.as_str().len() > lo.as_str().len(),
+                "an adjacent-gap bisection grows the key"
+            );
             max_len = max_len.max(mid.as_str().len());
             if mid.needs_rebalance() {
                 assert!(mid.as_str().len() >= LEXORANK_REBALANCE_LEN);
@@ -368,13 +391,27 @@ mod tests {
         let k = OrderKey::parse("M00").unwrap();
         // Same key, different created_at: earlier created_at sorts first.
         assert_eq!(
-            tiebreak(&k, "2026-06-21T10:00:00Z", "01A", &k, "2026-06-21T11:00:00Z", "01B"),
+            tiebreak(
+                &k,
+                "2026-06-21T10:00:00Z",
+                "01A",
+                &k,
+                "2026-06-21T11:00:00Z",
+                "01B"
+            ),
             Ordering::Less,
             "equal key → earlier created_at wins"
         );
         // Same key + same created_at: the ULID id breaks it (lexicographic == time-ordered).
         assert_eq!(
-            tiebreak(&k, "2026-06-21T10:00:00Z", "01A", &k, "2026-06-21T10:00:00Z", "01B"),
+            tiebreak(
+                &k,
+                "2026-06-21T10:00:00Z",
+                "01A",
+                &k,
+                "2026-06-21T10:00:00Z",
+                "01B"
+            ),
             Ordering::Less,
             "equal key + equal created_at → ULID id breaks it"
         );

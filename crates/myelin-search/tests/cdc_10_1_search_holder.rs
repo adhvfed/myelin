@@ -61,7 +61,10 @@ impl<'a> DsrOrchestratorConsumer<'a> {
     fn fan_out_locate(&self, subject: &SubjectRef, tenant: TenantId) -> Vec<LocateReport> {
         self.holders
             .iter()
-            .map(|h| h.locate(subject, tenant.clone()).expect("a Search holder locate succeeds (stub)"))
+            .map(|h| {
+                h.locate(subject, tenant.clone())
+                    .expect("a Search holder locate succeeds (stub)")
+            })
             .collect()
     }
 
@@ -87,11 +90,21 @@ fn dsr_orchestrator_fans_locate_and_erase_out_to_the_search_holder_via_the_contr
 
     // locate: the holder responds with a content-addressed receipt over its (empty) surface.
     let reports = consumer.fan_out_locate(&subj, tenant());
-    assert_eq!(reports.len(), 1, "the Search holder responded to locate via the contract");
+    assert_eq!(
+        reports.len(),
+        1,
+        "the Search holder responded to locate via the contract"
+    );
     for r in &reports {
         assert_eq!(r.receipt.operation, "locate");
-        assert!(r.receipt.content_hash.starts_with("blake3:"), "content-addressed receipt");
-        assert!(r.receipt.key_epoch_destroyed.is_none(), "locate shreds no key");
+        assert!(
+            r.receipt.content_hash.starts_with("blake3:"),
+            "content-addressed receipt"
+        );
+        assert!(
+            r.receipt.key_epoch_destroyed.is_none(),
+            "locate shreds no key"
+        );
     }
 
     // erase: the holder is a well-defined no-op now (nothing to purge) — never a panic.

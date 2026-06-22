@@ -129,20 +129,27 @@
 /// thin `ToolDef` registration lives in `myelin_agent_service::git_tools` (the §2.9 DAG — git is a
 /// leaf), keyed on this module's identity constants.
 pub mod agent_author;
+/// The **content-anchored inline-thread line-range resolver: the `#sub` 4-state ladder** (GIT-P24 /
+/// P-286, M3-G4 — GIT-D7). The mint half ([`subs::mint_blob_line_range`], GIT-P4) ships the
+/// grammatical `#L<a>-L<b>` sub-URN; this module is the RESOLVER the Refs ladder calls in its
+/// sub-resolve step. A [`anchor::LineAnchor`] stores the mint-time blob oid + path + side + range +
+/// commit + the **BLAKE3 fingerprint** of the anchored lines + a [`anchor::CONTEXT_WINDOW`] context
+/// window; [`anchor::resolve`] resolves it against the head blob through the frozen 4-state ladder —
+/// **EXACT→Live / REBASED→Moved / PARTIAL→Outdated / GONE→content_gone** (contract 5.7 / X-4 / arch
+/// §5.1) — and ALWAYS carries the state + the "view in original context" position so a relocated/lost
+/// anchor is **never silently wrong** (EI-01 §3; GIT-D7 = 0 mis-anchored). Floor named: **GF-5** —
+/// patch-id-chain carry-over across a multi-commit rebase is the **GIT-P33 / M5** follow-on; v1 does
+/// the per-pair blob-diff fingerprint remap.
+pub mod anchor;
 pub mod body;
 pub mod check_status;
-/// The **code-executing git tools on the unified sandbox** (GIT-P27 / P-283, M3-G6 — the AG-D4
-/// gate): the audited, tamper-evident, **rate-limited** [`code_tools::HistoryRewriteTool`] erasure
-/// op (contract 10.6 / recon §9) with the **fork/mirror/clone-cache invalidation fan-out** (the
-/// trust-scoped cache namespaces, 11.2 C4), and the [`code_tools::ScipIndexJob`] SCIP-indexing
-/// compute descriptor. Both ride git's [`core::WireExecutor`] no-host-exec sandbox seam (= the CI
-/// `kind=agent` job the AG-D4 escape drill gates), inheriting the FOUR uniform sandbox guarantees
-/// BY CONSTRUCTION. The Fabric `ToolDef` registration that catalogues them (`git.history_rewrite`
-/// gated, `git.scip_index` compute) lives in `myelin_agent_service::git_tools` (the §2.9 DAG — git
-/// is a leaf), keyed on [`code_tools`]'s identity constants. Floors: GF-9 (`exposed_over_mcp=false`,
-/// the external MCP server is GIT-P33/P6); the erasure SEMANTICS complete at GIT-P29;
-/// agents-as-authors is GIT-P28.
-pub mod code_tools;
+/// The **STORE-BACKED `check_status` projection** (GIT-P20 / P-281, M3): the LIVE Postgres binding of
+/// the in-memory [`check_status::CheckStatusProjection`] — the real table + migration + the same-tx
+/// idempotent-on-`event_id` + monotonic `run_attempt` supersession apply (contract 5.9 / X-1 / §6.1).
+/// Compiled ONLY under `--features integration` (the default build stays DB-free); the GIT-D10
+/// part-(a) green artifact is proven against the dev Postgres stack.
+#[cfg(feature = "integration")]
+pub mod check_status_store;
 /// The **code-projection EMITTER for Search** (GIT-P25 / P-287, M3-G5 — the §9 TE-27 code
 /// projection). The receive-pack post-commit hook that, on a `git.ref.updated` to an indexed ref,
 /// diffs `new_tip ∖ last_indexed_oid` ([`code_projection::CodeProjectionCursor`]) and emits ONE
@@ -157,13 +164,18 @@ pub mod code_tools;
 /// (GIT-D11) that conjoins this per viewer is **GIT-P26/P-288**; the production tree-walk/blob read
 /// rides the [`gix_backend`]/[`core`] seam (GIT-P13).
 pub mod code_projection;
-/// The **STORE-BACKED `check_status` projection** (GIT-P20 / P-281, M3): the LIVE Postgres binding of
-/// the in-memory [`check_status::CheckStatusProjection`] — the real table + migration + the same-tx
-/// idempotent-on-`event_id` + monotonic `run_attempt` supersession apply (contract 5.9 / X-1 / §6.1).
-/// Compiled ONLY under `--features integration` (the default build stays DB-free); the GIT-D10
-/// part-(a) green artifact is proven against the dev Postgres stack.
-#[cfg(feature = "integration")]
-pub mod check_status_store;
+/// The **code-executing git tools on the unified sandbox** (GIT-P27 / P-283, M3-G6 — the AG-D4
+/// gate): the audited, tamper-evident, **rate-limited** [`code_tools::HistoryRewriteTool`] erasure
+/// op (contract 10.6 / recon §9) with the **fork/mirror/clone-cache invalidation fan-out** (the
+/// trust-scoped cache namespaces, 11.2 C4), and the [`code_tools::ScipIndexJob`] SCIP-indexing
+/// compute descriptor. Both ride git's [`core::WireExecutor`] no-host-exec sandbox seam (= the CI
+/// `kind=agent` job the AG-D4 escape drill gates), inheriting the FOUR uniform sandbox guarantees
+/// BY CONSTRUCTION. The Fabric `ToolDef` registration that catalogues them (`git.history_rewrite`
+/// gated, `git.scip_index` compute) lives in `myelin_agent_service::git_tools` (the §2.9 DAG — git
+/// is a leaf), keyed on [`code_tools`]'s identity constants. Floors: GF-9 (`exposed_over_mcp=false`,
+/// the external MCP server is GIT-P33/P6); the erasure SEMANTICS complete at GIT-P29;
+/// agents-as-authors is GIT-P28.
+pub mod code_tools;
 pub mod commit;
 /// The **GitCore layered seam** (GIT-P8 / P-269, M3-G1): the strategy trait + router that sends
 /// wire/maintenance ops to sandboxed canonical `git` (the [`core::WireExecutor`] port) and read
@@ -172,6 +184,20 @@ pub mod commit;
 /// OQ-1 gix-ward floor (GIT-P33).
 pub mod core;
 pub mod events;
+/// The **fork / trust-tier endorsement gate** (GIT-P22 / P-284, M3-G4 — the poisoned-pipeline defence).
+/// Closes the [`merge_gate`] floor by shipping the two halves the merge gate consumed as explicit
+/// inputs in GIT-P21: (A) the LIVE endorsement RESOLVER ([`fork_gate::EndorsementResolver`]) that runs
+/// the maintainer's `check(subject, approve_untrusted_ci, repo)` through the LIVE
+/// [`live_check::GitCheckGate`] (GIT-P14) for each required context whose CURRENT row is an un-endorsed
+/// `untrusted_fork` success, PRODUCING the `endorsed_contexts` set [`merge_gate::evaluate_merge_gate`]
+/// consumes (a fork can never self-green — the subject is the maintainer who holds the relation, never
+/// the fork author); and (B) the **`fork:<pr_id>` trust-scoped cache confinement**
+/// ([`fork_gate::TrustScope`] + [`fork_gate::ScopedCache`], contract 11.2 C4 / recon §8) — a scope-key
+/// convention over the per-tenant [`myelin_storage::Cache`] so an `UntrustedFork` write can NEVER reach
+/// the `trusted:` cache scope (0 fork writes in the trusted scope; the scope is DERIVED from the
+/// CI-stamped trust tier, never caller-chosen). Floor: the merge queue (durable workflow, exactly-once
+/// merge, the `ci.result` rollup wait) is GIT-P23.
+pub mod fork_gate;
 /// The **stateless Git front door / router** (GIT-P13 / P-274, M3-G2 — FIRST RUNNABLE): the one
 /// pipeline every SSH (`russh`) + smart-HTTP-v2 (`axum`/`hyper`) entrypoint funnels through —
 /// `authenticate` (Id 4.1) → `check` + `CaveatContext` (Id 4.2) → `placement_of(repo)` (12.2) →
@@ -182,6 +208,17 @@ pub mod events;
 /// FailStatic degrade-not-cascade bound; GIT-P15 lands the protected-human-lane shed order + the
 /// CDN bundle-URI accelerated-clone. See [`front_door::FrontDoor`].
 pub mod front_door;
+/// **Git `resolve(ref, viewer, Display)` for unfurls, wired through Notif's humanise** (GIT-P31 /
+/// P-292, M3-G8 — the notifications + humanise half). [`git_resolve::GitRefResolver`] implements
+/// Notif's frozen [`myelin_notif::RefResolvePort`] (contract 5.2 — the resolve seam humanise consumes)
+/// by delegating to Git's REAL [`project::Projector`] (contract 5.6): a confidential PR/commit subject
+/// resolves to a **humanised tombstone, the TITLE NEVER LEAKS** (NOTIF-D4-class, threshold 0). This
+/// PROMOTES the GIT-P19 test-local resolve stand-in to a real producer-crate seam (EI-01 §7) — the
+/// leak property is now exercised over Git's real permission-first projection. Review-requests are a
+/// FILTER over the ONE inbox ([`git_resolve::git_review_requests_filter`], contract 7.1), never a second
+/// store. Floors: the Web-UI/CLI render is GIT-P32; the live OLTP store is GIT-P20; cross-cell resolve
+/// is single-home (contract 5.2 / OQ-I).
+pub mod git_resolve;
 /// The in-process read backend ([`gix_backend::GixCore`]) over `git2` (libgit2 — the
 /// architecture-named fallback; gix-preferred is the OQ-1 floor, GIT-P33). Read/diff/blame with no
 /// `git` fork (no-host-exec by construction).
@@ -203,28 +240,6 @@ pub mod gix_backend;
 /// (parallel/Legal, NOT a code gate). The reindex-from-cold parity (GIT-D3) is GIT-P30.
 pub mod holder;
 pub mod holder_intent;
-/// The Git ReBAC fragment wired LIVE + the FailStatic bound on the Id dependency (GIT-P14 / P-275,
-/// M3-G2): the [`live_check::GitCheckGate`] runs the front door's `pull`/`push` + the push-policy
-/// `protected_push` + the merge gate's `merge` + the X-1 `approve_untrusted_ci` fork-endorsement +
-/// CODEOWNERS `list_subjects` against the live fragment (contract 4.9), with the git→Id `check`
-/// bounded by the shared `myelin_substrate::FailStaticAuthz` (1.10/4.11) so an Id hiccup DEGRADES
-/// (bounded-stale coarse grant) instead of cascading, a just-revoked subject is still denied, and a
-/// zookie read bypasses the cache (4.10 read-your-writes).
-pub mod live_check;
-/// The **leak-free `list_objects` `SetExpr` push-down for repo/PR lists + the code-search pre-filter**
-/// (GIT-P26 / P-288, M3-G5 — the GIT-D11 gate). The git-SIDE consumer of the frozen contract-4.3
-/// push-down: [`list_filter::lower_over_repo_id`] / [`list_filter::lower_over_pr_id`] lower the
-/// returned `SetExpr` into a SQL predicate + `authz_visible` JOIN over Git's OWN id column
-/// (`repo.id` / `pr.id`, §5.3 / §7.3) — **one query, no N+1, no post-filter**;
-/// [`list_filter::compose_repo_list_query`] / [`list_filter::compose_pr_list_query`] conjoin it into
-/// the ONE leak-free list statement (the ACL pre-filter BEFORE pagination, the tenant predicate
-/// always emitted); [`list_filter::code_search_pre_filter`] is the 6.1 code-search pre-filter (the
-/// blob doc's ACL object is the parent `repo`, GIT-P5) the `search-requires-acl-filter` lint requires
-/// conjoined before scoring. [`list_filter::AuthzVisibleIndex`] models the per-tenant residency-pinned
-/// reverse index + the new-enemy zookie guard for the DB-free unit/CDC drills; the live one-query/
-/// 0-leak/revoke-reflected GIT-D11 proof is the `--features integration` test against the dev-stack
-/// Postgres. Git's code projection is asserted leak-free in the shared SRCH-D1/D3 here. No new floor.
-pub mod list_filter;
 /// The **PR/review/inline-thread lifecycle + branch-protection rulesets + the CODEOWNERS resolver**
 /// (GIT-P16 / P-277, M3-G3 — the domain-entities half): the hosting-layer entities not in git itself
 /// (00-overview §1.1). [`lifecycle::PullRequest`] + [`lifecycle::PrState`] are the PR lifecycle state
@@ -239,6 +254,28 @@ pub mod list_filter;
 /// line-anchor 4-state resolver is GIT-P23/GIT-P24; the live OLTP store + per-ref ruleset persistence
 /// (+ the `write_tuples` CODEOWNERS tuple write) is GIT-P20/GIT-P22.
 pub mod lifecycle;
+/// The **leak-free `list_objects` `SetExpr` push-down for repo/PR lists + the code-search pre-filter**
+/// (GIT-P26 / P-288, M3-G5 — the GIT-D11 gate). The git-SIDE consumer of the frozen contract-4.3
+/// push-down: [`list_filter::lower_over_repo_id`] / [`list_filter::lower_over_pr_id`] lower the
+/// returned `SetExpr` into a SQL predicate + `authz_visible` JOIN over Git's OWN id column
+/// (`repo.id` / `pr.id`, §5.3 / §7.3) — **one query, no N+1, no post-filter**;
+/// [`list_filter::compose_repo_list_query`] / [`list_filter::compose_pr_list_query`] conjoin it into
+/// the ONE leak-free list statement (the ACL pre-filter BEFORE pagination, the tenant predicate
+/// always emitted); [`list_filter::code_search_pre_filter`] is the 6.1 code-search pre-filter (the
+/// blob doc's ACL object is the parent `repo`, GIT-P5) the `search-requires-acl-filter` lint requires
+/// conjoined before scoring. [`list_filter::AuthzVisibleIndex`] models the per-tenant residency-pinned
+/// reverse index + the new-enemy zookie guard for the DB-free unit/CDC drills; the live one-query/
+/// 0-leak/revoke-reflected GIT-D11 proof is the `--features integration` test against the dev-stack
+/// Postgres. Git's code projection is asserted leak-free in the shared SRCH-D1/D3 here. No new floor.
+pub mod list_filter;
+/// The Git ReBAC fragment wired LIVE + the FailStatic bound on the Id dependency (GIT-P14 / P-275,
+/// M3-G2): the [`live_check::GitCheckGate`] runs the front door's `pull`/`push` + the push-policy
+/// `protected_push` + the merge gate's `merge` + the X-1 `approve_untrusted_ci` fork-endorsement +
+/// CODEOWNERS `list_subjects` against the live fragment (contract 4.9), with the git→Id `check`
+/// bounded by the shared `myelin_substrate::FailStaticAuthz` (1.10/4.11) so an Id hiccup DEGRADES
+/// (bounded-stale coarse grant) instead of cascading, a just-revoked subject is still denied, and a
+/// zookie read bypasses the cache (4.10 read-your-writes).
+pub mod live_check;
 /// The **merge gate + the required-set policy** (GIT-P21 / P-282, M3-G4 — "Git owns what is allowed to
 /// land"). The bridge the merge gate fires across: it parses a `base_ref`'s branch-protection
 /// [`lifecycle::BranchProtectionRuleset`] `required_contexts` strings into typed
@@ -253,20 +290,6 @@ pub mod lifecycle;
 /// confinement is GIT-P22; the merge queue (durable workflow, exactly-once merge, the `ci.result`
 /// rollup wait) is GIT-P23.
 pub mod merge_gate;
-/// The **fork / trust-tier endorsement gate** (GIT-P22 / P-284, M3-G4 — the poisoned-pipeline defence).
-/// Closes the [`merge_gate`] floor by shipping the two halves the merge gate consumed as explicit
-/// inputs in GIT-P21: (A) the LIVE endorsement RESOLVER ([`fork_gate::EndorsementResolver`]) that runs
-/// the maintainer's `check(subject, approve_untrusted_ci, repo)` through the LIVE
-/// [`live_check::GitCheckGate`] (GIT-P14) for each required context whose CURRENT row is an un-endorsed
-/// `untrusted_fork` success, PRODUCING the `endorsed_contexts` set [`merge_gate::evaluate_merge_gate`]
-/// consumes (a fork can never self-green — the subject is the maintainer who holds the relation, never
-/// the fork author); and (B) the **`fork:<pr_id>` trust-scoped cache confinement**
-/// ([`fork_gate::TrustScope`] + [`fork_gate::ScopedCache`], contract 11.2 C4 / recon §8) — a scope-key
-/// convention over the per-tenant [`myelin_storage::Cache`] so an `UntrustedFork` write can NEVER reach
-/// the `trusted:` cache scope (0 fork writes in the trusted scope; the scope is DERIVED from the
-/// CI-stamped trust tier, never caller-chosen). Floor: the merge queue (durable workflow, exactly-once
-/// merge, the `ci.result` rollup wait) is GIT-P23.
-pub mod fork_gate;
 /// The **merge queue as a durable workflow** (GIT-P23 / P-285, M3-G4 — parks on `ci.result`,
 /// exactly-once merge, GIT-D10 part (d) + the full GIT-D10 aggregate). The Git-side COMPOSITION of the
 /// generic durable merge-queue body ([`myelin_flow::WfCtx::run_merge_attempt`], contract 9.4 — already
@@ -282,17 +305,6 @@ pub mod fork_gate;
 /// M4 co-gate GIT-D10 / CI-D8; here the `ci.result` rollup is the synthetic
 /// [`myelin_flow::MockCiResultProducer`]).
 pub mod merge_queue;
-/// **Git `resolve(ref, viewer, Display)` for unfurls, wired through Notif's humanise** (GIT-P31 /
-/// P-292, M3-G8 — the notifications + humanise half). [`git_resolve::GitRefResolver`] implements
-/// Notif's frozen [`myelin_notif::RefResolvePort`] (contract 5.2 — the resolve seam humanise consumes)
-/// by delegating to Git's REAL [`project::Projector`] (contract 5.6): a confidential PR/commit subject
-/// resolves to a **humanised tombstone, the TITLE NEVER LEAKS** (NOTIF-D4-class, threshold 0). This
-/// PROMOTES the GIT-P19 test-local resolve stand-in to a real producer-crate seam (EI-01 §7) — the
-/// leak property is now exercised over Git's real permission-first projection. Review-requests are a
-/// FILTER over the ONE inbox ([`git_resolve::git_review_requests_filter`], contract 7.1), never a second
-/// store. Floors: the Web-UI/CLI render is GIT-P32; the live OLTP store is GIT-P20; cross-cell resolve
-/// is single-home (contract 5.2 / OQ-I).
-pub mod git_resolve;
 pub mod notif_rules;
 /// The git **PACK TIER on the local-NVMe `BlobStore` floor** (GIT-P11 / P-272, M3-G1): the git-side
 /// object-DB migration THROUGH the [`myelin_storage::GitPackTier`] (closing the receive-pack
@@ -333,18 +345,6 @@ pub mod search_projection;
 /// clone (the full within-EU CDN class hardens in GIT-P33).
 pub mod shed_clone;
 pub mod subs;
-/// The **content-anchored inline-thread line-range resolver: the `#sub` 4-state ladder** (GIT-P24 /
-/// P-286, M3-G4 — GIT-D7). The mint half ([`subs::mint_blob_line_range`], GIT-P4) ships the
-/// grammatical `#L<a>-L<b>` sub-URN; this module is the RESOLVER the Refs ladder calls in its
-/// sub-resolve step. A [`anchor::LineAnchor`] stores the mint-time blob oid + path + side + range +
-/// commit + the **BLAKE3 fingerprint** of the anchored lines + a [`anchor::CONTEXT_WINDOW`] context
-/// window; [`anchor::resolve`] resolves it against the head blob through the frozen 4-state ladder —
-/// **EXACT→Live / REBASED→Moved / PARTIAL→Outdated / GONE→content_gone** (contract 5.7 / X-4 / arch
-/// §5.1) — and ALWAYS carries the state + the "view in original context" position so a relocated/lost
-/// anchor is **never silently wrong** (EI-01 §3; GIT-D7 = 0 mis-anchored). Floor named: **GF-5** —
-/// patch-id-chain carry-over across a multi-commit rebase is the **GIT-P33 / M5** follow-on; v1 does
-/// the per-pair blob-diff fingerprint remap.
-pub mod anchor;
 /// The **typed-edge mirror: PR-link / commit-trailer lifecycle edges into the Refs projection**
 /// (GIT-P19 / P-280, M3-G3 — the typed-edge-mirror half). As the PR lifecycle advances, a Git PR emits
 /// **lifecycle edges** (`closes`/`relates`, `rel_class='lifecycle'`) via the outbox — DISTINCT from the

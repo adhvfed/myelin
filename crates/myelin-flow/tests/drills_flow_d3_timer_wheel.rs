@@ -97,7 +97,8 @@ fn drill_flow_d3_timer_wheel_100k_floor_within_budget_zero_lost_zero_dup() {
     }
     // (2) ARM the one-minute burst — 5k timers ALL due in the same minute (bucket 0).
     for i in 0..BURST_COUNT {
-        let mut run = RunRow::new_runnable(tenant(), region(), format!("R-burst-{i}"), "sla.run", 0);
+        let mut run =
+            RunRow::new_runnable(tenant(), region(), format!("R-burst-{i}"), "sla.run", 0);
         run.state = run_state::WAITING.into();
         runs.put(run);
         timers.arm(burst_timer(i));
@@ -107,13 +108,24 @@ fn drill_flow_d3_timer_wheel_100k_floor_within_budget_zero_lost_zero_dup() {
         FAR_FUTURE_COUNT + BURST_COUNT,
         "100k far-future + 5k burst armed (six figures outstanding)"
     );
-    assert_eq!(timers.unfired_count(), FAR_FUTURE_COUNT + BURST_COUNT, "none fired yet");
+    assert_eq!(
+        timers.unfired_count(),
+        FAR_FUTURE_COUNT + BURST_COUNT,
+        "none fired yet"
+    );
     let scanned_before = timers.rows_scanned();
 
     // (3) The wheel ticks at now = second 30 (bucket 0): the burst (bucket 0) is due; the far-future
     //     fleet (bucket >= 1440) is NOT due → NEVER scanned. The wheel fires the burst over a few ticks
     //     (the bounded per-tick batch), draining the lag to 0 within the tick budget.
-    let wheel = TimerWheel::new(timers.clone(), journal.clone(), runs.clone(), tele.clone(), 0, /* batch */ 4_096);
+    let wheel = TimerWheel::new(
+        timers.clone(),
+        journal.clone(),
+        runs.clone(),
+        tele.clone(),
+        0,
+        /* batch */ 4_096,
+    );
     // before the wheel runs: the lag is exactly the burst (the far-future fleet is NOT lag — SC-11).
     assert_eq!(
         timers.wheel_lag(0, 30),
@@ -131,13 +143,20 @@ fn drill_flow_d3_timer_wheel_100k_floor_within_budget_zero_lost_zero_dup() {
         if timers.wheel_lag(0, 30) == 0 {
             break;
         }
-        assert!(ticks < 100, "the burst must drain within a bounded tick window (the budget)");
+        assert!(
+            ticks < 100,
+            "the burst must drain within a bounded tick window (the budget)"
+        );
     }
 
     // THE FLOW-D3 ASSERTIONS:
     // (a) the due burst fired WITHIN the tick budget — the timer-wheel-lag drained to 0.
     assert_eq!(total_fired, BURST_COUNT, "all 5k due timers fired");
-    assert_eq!(tele.timer_wheel_lag(), LAG_BUDGET, "the timer-wheel-lag drained to budget (0) — within budget");
+    assert_eq!(
+        tele.timer_wheel_lag(),
+        LAG_BUDGET,
+        "the timer-wheel-lag drained to budget (0) — within budget"
+    );
     // (b) FAR-FUTURE COST ~NOTHING: the scan touched ONLY the due burst, never the 100k far-future
     //     fleet (the SC-11 partial-index range read — indexed, not full-scan). The rows the scan
     //     touched is bounded by the burst, NOT the 100k+5k table.
@@ -160,18 +179,28 @@ fn drill_flow_d3_timer_wheel_100k_floor_within_budget_zero_lost_zero_dup() {
         run_state::WAITING,
         "a far-future run is untouched (still waiting — cost nothing)"
     );
-    assert!(!timers.get(&tenant(), "far/0").unwrap().fired, "a far-future timer is unfired (never scanned)");
+    assert!(
+        !timers.get(&tenant(), "far/0").unwrap().fired,
+        "a far-future timer is unfired (never scanned)"
+    );
 
     // (4) THE CRASH RE-FIRE PROPERTY (0 lost / 0 double-fire): re-fire EVERY burst timer (modeling a
     //     crash that re-delivered the whole due set) — each is ALREADY fired, so every re-fire is a
     //     no-op (effectively-once). 0 double-fire; the journal already holds exactly one row per timer.
     let mut double_fires = 0usize;
     for i in 0..BURST_COUNT {
-        if wheel.timers().fire(&tenant(), &format!("burst/{i}"), &journal, &runs) == FireOutcome::Fired {
+        if wheel
+            .timers()
+            .fire(&tenant(), &format!("burst/{i}"), &journal, &runs)
+            == FireOutcome::Fired
+        {
             double_fires += 1; // a second fire of an already-fired timer would be a double-fire.
         }
     }
-    assert_eq!(double_fires, 0, "0 double-fire: a crash re-fire of the already-fired burst is a no-op (effectively-once)");
+    assert_eq!(
+        double_fires, 0,
+        "0 double-fire: a crash re-fire of the already-fired burst is a no-op (effectively-once)"
+    );
     // 0 LOST: every due burst timer is fired + journaled exactly once (one timer_fired row per run).
     let mut lost = 0usize;
     for i in 0..BURST_COUNT {
@@ -184,7 +213,10 @@ fn drill_flow_d3_timer_wheel_100k_floor_within_budget_zero_lost_zero_dup() {
             lost += 1; // not exactly one fire → lost (0) or duplicated (>1).
         }
     }
-    assert_eq!(lost, 0, "0 lost: every due timer fired + journaled EXACTLY once (effectively-once)");
+    assert_eq!(
+        lost, 0,
+        "0 lost: every due timer fired + journaled EXACTLY once (effectively-once)"
+    );
 
     // the dated SCHED green artifact (the timer-wheel-lag-within-budget + 0-lost/0-dup counter).
     println!(

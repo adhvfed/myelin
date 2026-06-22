@@ -90,14 +90,16 @@ fn git_d2_erase_commit_author_residual_matches_posture() {
     // (3) the opaque principal_id still attributes the commit for authz after erase.
     assert_eq!(attribution.commit, commit.oid());
     let bytes = String::from_utf8(commit.canonical_bytes()).unwrap();
-    assert!(!bytes.contains("principal:opaque-9e2"), "the opaque id is out-of-band, not in the bytes");
+    assert!(
+        !bytes.contains("principal:opaque-9e2"),
+        "the opaque id is out-of-band, not in the bytes"
+    );
 
     // Emit the dated green artifact (the drill witness).
     println!(
         "[2026-06-21] GIT-D2 PASS — pseudonymous residual == posture; \
          recoverable_real_identity={:?}; pseudonymous_residual={}",
-        residual.recoverable_real_identity,
-        residual.pseudonymous_residual
+        residual.recoverable_real_identity, residual.pseudonymous_residual
     );
 }
 

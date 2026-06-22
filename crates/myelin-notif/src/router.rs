@@ -85,19 +85,21 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use myelin_content::InlineNode;
 use myelin_events::{
     consume, AggregateKey, ArtifactRef, Consumer, ConsumerName, ConsumerSpec, DataRole,
-    DedupLedger, EmitContextBase, EventDraft, EventEnvelope, EventHandler, EventType, HandleOutcome,
-    IdMinter, MonotonicMinter, OutboxStore, OutboxTx, Reason as BusReason, SubjectPattern,
-    SubscribeError, Visibility,
+    DedupLedger, EmitContextBase, EventDraft, EventEnvelope, EventHandler, EventType,
+    HandleOutcome, IdMinter, MonotonicMinter, OutboxStore, OutboxTx, Reason as BusReason,
+    SubjectPattern, SubscribeError, Visibility,
 };
-use myelin_content::InlineNode;
 use myelin_identity::Principal;
 use myelin_query::signals::{Severity, Signal};
 use myelin_tenancy::{Region, TenantId};
 
 use crate::prefs::QuietHours;
-use crate::storm_control::{subject_root_of, RateConfig, StormContext, StormControl, StormDecision};
+use crate::storm_control::{
+    subject_root_of, RateConfig, StormContext, StormControl, StormDecision,
+};
 use crate::write_fanout::{extract_mentions, CapVerdict, HotSubjectCap};
 use crate::{Class, Reason};
 
@@ -224,7 +226,11 @@ impl InboxProjection {
     /// [`InboxProjection::contains`] BEFORE this UPSERT), so the router can surface the N→1 collapse +
     /// the dedup-collapse-ratio for the NOTIF-D2 drill; this method performs the write either way.
     fn upsert(&self, mut item: RoutedInboxItem) {
-        let key = (item.tenant.0.clone(), item.recipient.clone(), item.dedup_key.clone());
+        let key = (
+            item.tenant.0.clone(),
+            item.recipient.clone(),
+            item.dedup_key.clone(),
+        );
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         match guard.get_mut(&key) {
             Some(existing) => {
@@ -266,15 +272,28 @@ impl InboxProjection {
         self.inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains_key(&(tenant.0.clone(), recipient.to_string(), dedup_key.to_string()))
+            .contains_key(&(
+                tenant.0.clone(),
+                recipient.to_string(),
+                dedup_key.to_string(),
+            ))
     }
 
     /// Read one row by `(tenant, recipient, dedup_key)` (for tests / a drill).
-    pub fn get(&self, tenant: &TenantId, recipient: &str, dedup_key: &str) -> Option<RoutedInboxItem> {
+    pub fn get(
+        &self,
+        tenant: &TenantId,
+        recipient: &str,
+        dedup_key: &str,
+    ) -> Option<RoutedInboxItem> {
         self.inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&(tenant.0.clone(), recipient.to_string(), dedup_key.to_string()))
+            .get(&(
+                tenant.0.clone(),
+                recipient.to_string(),
+                dedup_key.to_string(),
+            ))
             .cloned()
     }
 
@@ -313,7 +332,13 @@ impl InboxProjection {
     /// selects — and ONLY rows addressed to `recipient` (never another principal's inbox). Returns
     /// the count mutated. In the OLTP binding this is one set-based
     /// `UPDATE notif_inbox_item SET state = 'read' WHERE tenant_id = $1 AND recipient = $2 AND <filter>`.
-    pub fn mutate_matching<S, F>(&self, tenant: &TenantId, recipient: &str, select: S, mut f: F) -> usize
+    pub fn mutate_matching<S, F>(
+        &self,
+        tenant: &TenantId,
+        recipient: &str,
+        select: S,
+        mut f: F,
+    ) -> usize
     where
         S: Fn(&RoutedInboxItem) -> bool,
         F: FnMut(&mut RoutedInboxItem),
@@ -375,8 +400,14 @@ impl RoutedInboxItem {
     /// mutation of these columns — the structural references-not-payloads property (§3.9, C7).
     pub fn references_subject(&self, subject_id: &str) -> bool {
         self.recipient == subject_id
-            || self.subject.0.ends_with(&format!("/principal/{subject_id}"))
-            || self.origin_event.0.ends_with(&format!("/principal/{subject_id}"))
+            || self
+                .subject
+                .0
+                .ends_with(&format!("/principal/{subject_id}"))
+            || self
+                .origin_event
+                .0
+                .ends_with(&format!("/principal/{subject_id}"))
     }
 }
 
@@ -531,7 +562,10 @@ impl SignalRouter {
             &signal.tenant,
             &signal.subject,
             Reason::Watched,
-            &ArtifactRef(format!("myelin://{}/bus/event/{}", signal_event.tenant.0, signal_event.event_id.0)),
+            &ArtifactRef(format!(
+                "myelin://{}/bus/event/{}",
+                signal_event.tenant.0, signal_event.event_id.0
+            )),
         );
 
         // (2) Derive the SKELETON ambient inbox row (the real per-reason/per-recipient routing is
@@ -628,7 +662,9 @@ impl SignalRouter {
         // (3) Co-commit: open a tx, UPSERT the inbox row, emit notif.item.created, COMMIT. The
         // tx's ambient context is the INCOMING Signal's (tenant/region/actor/clock) so the emitted
         // notif.item.created is partitioned to the SAME (tenant, region) and attributed correctly.
-        let mut tx = self.outbox.begin(self.minter.clone(), emit_base_from(signal_event));
+        let mut tx = self
+            .outbox
+            .begin(self.minter.clone(), emit_base_from(signal_event));
 
         // The inbox UPSERT — the (tenant, recipient, dedup_key) write-time collapse (§3.2). Staged
         // into the SAME transaction as the emit (the co-commit: the inbox row and the
@@ -801,7 +837,9 @@ impl EventHandler for SignalRouter {
             Err(RouteError::MalformedSignal(why)) => HandleOutcome::NonRetryable(BusReason(why)),
             // A TRANSIENT outbox hiccup retries (0 lost — the runtime redelivers, reverts the dedup
             // mark, re-runs). A good Signal is NEVER dead-lettered on an infra failure.
-            Err(RouteError::EmitFailed(_why)) => HandleOutcome::Retry(myelin_events::Backoff { seconds: 2 }),
+            Err(RouteError::EmitFailed(_why)) => {
+                HandleOutcome::Retry(myelin_events::Backoff { seconds: 2 })
+            }
         }
     }
 }
@@ -829,16 +867,14 @@ pub fn build_router(
     // (the binding set is fixed for the life of the consumer pool — bounded, never per-event).
     let subjects: &'static [SubjectPattern] =
         Box::leak(vec![SubjectPattern(prefix.clone())].into_boxed_slice());
-    let router = SignalRouter::new(
-        inbox,
-        outbox,
-        Arc::new(MonotonicMinter::new()),
-        subjects,
-    );
+    let router = SignalRouter::new(inbox, outbox, Arc::new(MonotonicMinter::new()), subjects);
     // The ONE sanctioned consumer entry-point — `consume` validates the spec (rule 3: rejects a
     // `*`/empty subject LOUDLY) and constructs the [`Consumer`] with all seven rules wired.
     consume(
-        ConsumerSpec::new(ConsumerName(ROUTER_CONSUMER_NAME.into()), &[prefix.as_str()]),
+        ConsumerSpec::new(
+            ConsumerName(ROUTER_CONSUMER_NAME.into()),
+            &[prefix.as_str()],
+        ),
         router,
         dedup,
     )
@@ -918,7 +954,7 @@ fn emit_base_from(env: &EventEnvelope) -> EmitContextBase {
 mod tests {
     use super::*;
     use myelin_events::{
-        Actor, BusTransport, CorrelationId, Delivered, DedupLedger, EventId, InProcessBus, Message,
+        Actor, BusTransport, CorrelationId, DedupLedger, Delivered, EventId, InProcessBus, Message,
         Relay, Timestamp,
     };
     use myelin_identity::{Principal, PrincipalId, PrincipalKind};
@@ -931,7 +967,11 @@ mod tests {
         Region("fr-par".into())
     }
     fn principal() -> Principal {
-        Principal::stub(PrincipalId("p-opaque-1".into()), PrincipalKind::Human, tenant())
+        Principal::stub(
+            PrincipalId("p-opaque-1".into()),
+            PrincipalKind::Human,
+            tenant(),
+        )
     }
 
     /// A curated Signal (the shape the engine, P-138, publishes). `count`/`state` are the live
@@ -954,7 +994,12 @@ mod tests {
     /// dispatch tier publishes; the router consumes it). `id` is the broker event_id (the
     /// consumer_dedup key).
     fn signal_envelope(id: &str, sig: &Signal) -> EventEnvelope {
-        let subject = format!("sig.{}.{}.{}", sig.tenant.0, sig.severity.token(), sig.rule_id.0);
+        let subject = format!(
+            "sig.{}.{}.{}",
+            sig.tenant.0,
+            sig.severity.token(),
+            sig.rule_id.0
+        );
         EventEnvelope {
             event_id: EventId(id.into()),
             type_: EventType("signal.opened".into()),
@@ -981,7 +1026,10 @@ mod tests {
     /// The broker [`Message`] for a Signal envelope (subject = the envelope subject).
     fn signal_msg(id: &str, sig: &Signal) -> Message {
         let env = signal_envelope(id, sig);
-        Message { subject: env.subject.0.clone(), envelope: env }
+        Message {
+            subject: env.subject.0.clone(),
+            envelope: env,
+        }
     }
 
     fn router_over(outbox: &OutboxStore) -> (Consumer<SignalRouter>, InboxProjection) {
@@ -999,7 +1047,11 @@ mod tests {
     #[test]
     fn signal_subject_prefix_is_per_tenant_never_wildcard() {
         assert_eq!(signal_subject_prefix(&tenant()), Some("sig.acme.".into()));
-        assert_eq!(signal_subject_prefix(&TenantId("".into())), None, "empty tenant refused");
+        assert_eq!(
+            signal_subject_prefix(&TenantId("".into())),
+            None,
+            "empty tenant refused"
+        );
         assert_eq!(
             signal_subject_prefix(&TenantId("a.b".into())),
             None,
@@ -1024,7 +1076,10 @@ mod tests {
         );
         // a Signal for THIS tenant matches; another tenant's does not.
         assert!(is_signal_subject("sig.acme.error.ci_run_failed", &tenant()));
-        assert!(!is_signal_subject("sig.other.error.ci_run_failed", &tenant()));
+        assert!(!is_signal_subject(
+            "sig.other.error.ci_run_failed",
+            &tenant()
+        ));
     }
 
     /// **An over-broad / malformed tenant cannot construct a router (rule 3).** An empty tenant →
@@ -1037,7 +1092,10 @@ mod tests {
             OutboxStore::new(),
             DedupLedger::new(),
         );
-        assert!(matches!(r, Err(SubscribeError::WildcardSubject(_))), "an empty tenant is refused");
+        assert!(
+            matches!(r, Err(SubscribeError::WildcardSubject(_))),
+            "an empty tenant is refused"
+        );
     }
 
     // --- The skeleton body: UPSERT an inbox item + emit notif.item.created via the outbox ---
@@ -1050,19 +1108,45 @@ mod tests {
     fn signal_upserts_one_item_and_emits_notif_item_created() {
         let outbox = OutboxStore::new();
         let (consumer, inbox) = router_over(&outbox);
-        let sig = signal("ci_run_failed", Severity::Error, "myelin://acme/ci/run/42", "run-42");
+        let sig = signal(
+            "ci_run_failed",
+            Severity::Error,
+            "myelin://acme/ci/run/42",
+            "run-42",
+        );
 
-        assert_eq!(consumer.deliver(&signal_msg("evt-1", &sig)), Delivered::Acked);
+        assert_eq!(
+            consumer.deliver(&signal_msg("evt-1", &sig)),
+            Delivered::Acked
+        );
         assert_eq!(inbox.len(), 1, "one inbox row UPSERTed");
 
         // exactly one notif.item.created was emitted through the outbox (the co-commit).
-        assert_eq!(outbox.committed_count(), 1, "one event committed (the emit)");
+        assert_eq!(
+            outbox.committed_count(),
+            1,
+            "one event committed (the emit)"
+        );
         let row = inbox
-            .get(&tenant(), "psn:watcher:ci_run_failed", "ci_run_failed:run-42")
+            .get(
+                &tenant(),
+                "psn:watcher:ci_run_failed",
+                "ci_run_failed:run-42",
+            )
             .expect("the UPSERTed row exists at its (tenant, recipient, dedup_key) key");
-        assert_eq!(row.coalesce_count, 1, "a fresh row starts at coalesce_count = 1");
-        assert_eq!(row.state, "unread", "a fresh inbox row is unread (the ONE read-state column)");
-        assert_eq!(row.class, Class::Direct, "an `error` Signal maps to the Direct class");
+        assert_eq!(
+            row.coalesce_count, 1,
+            "a fresh row starts at coalesce_count = 1"
+        );
+        assert_eq!(
+            row.state, "unread",
+            "a fresh inbox row is unread (the ONE read-state column)"
+        );
+        assert_eq!(
+            row.class,
+            Class::Direct,
+            "an `error` Signal maps to the Direct class"
+        );
         // refs-not-payloads: the subject is a ref, never a rendered string.
         assert_eq!(row.subject.0, "myelin://acme/ci/run/42");
     }
@@ -1074,9 +1158,17 @@ mod tests {
     fn emitted_event_is_notif_item_created_refs_not_payloads_caused_by_signal() {
         let outbox = OutboxStore::new();
         let (consumer, _) = router_over(&outbox);
-        let sig = signal("ci_run_failed", Severity::Critical, "myelin://acme/ci/run/7", "run-7");
+        let sig = signal(
+            "ci_run_failed",
+            Severity::Critical,
+            "myelin://acme/ci/run/7",
+            "run-7",
+        );
         let env = signal_envelope("evt-c1", &sig);
-        consumer.deliver(&Message { subject: env.subject.0.clone(), envelope: env.clone() });
+        consumer.deliver(&Message {
+            subject: env.subject.0.clone(),
+            envelope: env.clone(),
+        });
 
         // The relay-facing read: drain the committed emit to the in-process bus and read it back.
         let bus = InProcessBus::new();
@@ -1088,15 +1180,26 @@ mod tests {
         assert_eq!(published.len(), 1, "exactly one notif.item.created emitted");
         let emitted = &published[0];
         assert_eq!(emitted.type_.0, NOTIF_ITEM_CREATED);
-        assert!(!emitted.contains_personal_data, "references-not-payloads: no inline PII");
+        assert!(
+            !emitted.contains_personal_data,
+            "references-not-payloads: no inline PII"
+        );
         assert!(emitted.pii_key_ref.is_none());
         // caused-by the Signal: the correlation root carries + depth+1 (the loop-guard stamp).
         assert_eq!(
             emitted.correlation_id, env.correlation_id,
             "the correlation root carries from the Signal"
         );
-        assert_eq!(emitted.causation_id, Some(env.event_id.clone()), "causation = the Signal");
-        assert_eq!(emitted.depth, env.depth + 1, "depth+1 (the loop-guard stamp)");
+        assert_eq!(
+            emitted.causation_id,
+            Some(env.event_id.clone()),
+            "causation = the Signal"
+        );
+        assert_eq!(
+            emitted.depth,
+            env.depth + 1,
+            "depth+1 (the loop-guard stamp)"
+        );
         // partitioned to the SAME (tenant, region) as the Signal.
         assert_eq!(emitted.tenant, env.tenant);
         assert_eq!(emitted.region, env.region);
@@ -1111,14 +1214,35 @@ mod tests {
     fn redelivered_signal_is_deduped_one_row_one_emit() {
         let outbox = OutboxStore::new();
         let (consumer, inbox) = router_over(&outbox);
-        let sig = signal("ci_run_failed", Severity::Error, "myelin://acme/ci/run/42", "run-42");
+        let sig = signal(
+            "ci_run_failed",
+            Severity::Error,
+            "myelin://acme/ci/run/42",
+            "run-42",
+        );
         let m = signal_msg("evt-dup", &sig);
 
-        assert_eq!(consumer.deliver(&m), Delivered::Acked, "first delivery routes + acks");
-        assert_eq!(consumer.deliver(&m), Delivered::Deduplicated, "redelivery is deduped (0 dup)");
+        assert_eq!(
+            consumer.deliver(&m),
+            Delivered::Acked,
+            "first delivery routes + acks"
+        );
+        assert_eq!(
+            consumer.deliver(&m),
+            Delivered::Deduplicated,
+            "redelivery is deduped (0 dup)"
+        );
         assert_eq!(consumer.deliver(&m), Delivered::Deduplicated, "and again");
-        assert_eq!(inbox.len(), 1, "exactly one inbox row (the redelivery did not double-notify)");
-        assert_eq!(outbox.committed_count(), 1, "exactly one emit (the redelivery emitted nothing)");
+        assert_eq!(
+            inbox.len(),
+            1,
+            "exactly one inbox row (the redelivery did not double-notify)"
+        );
+        assert_eq!(
+            outbox.committed_count(),
+            1,
+            "exactly one emit (the redelivery emitted nothing)"
+        );
     }
 
     /// **Two DISTINCT Signals rendering to the SAME `(tenant, recipient, dedup_key)` COLLAPSE into
@@ -1130,15 +1254,37 @@ mod tests {
         let outbox = OutboxStore::new();
         let (consumer, inbox) = router_over(&outbox);
         // Two DISTINCT broker events (distinct event_id) for the SAME rule+dedup_key (same incident).
-        let sig = signal("ci_run_failed", Severity::Error, "myelin://acme/ci/run/42", "run-42");
-        assert_eq!(consumer.deliver(&signal_msg("evt-a", &sig)), Delivered::Acked);
-        assert_eq!(consumer.deliver(&signal_msg("evt-b", &sig)), Delivered::Acked);
+        let sig = signal(
+            "ci_run_failed",
+            Severity::Error,
+            "myelin://acme/ci/run/42",
+            "run-42",
+        );
+        assert_eq!(
+            consumer.deliver(&signal_msg("evt-a", &sig)),
+            Delivered::Acked
+        );
+        assert_eq!(
+            consumer.deliver(&signal_msg("evt-b", &sig)),
+            Delivered::Acked
+        );
 
-        assert_eq!(inbox.len(), 1, "same (tenant, recipient, dedup_key) → ONE row (collapse, §3.2)");
+        assert_eq!(
+            inbox.len(),
+            1,
+            "same (tenant, recipient, dedup_key) → ONE row (collapse, §3.2)"
+        );
         let row = inbox
-            .get(&tenant(), "psn:watcher:ci_run_failed", "ci_run_failed:run-42")
+            .get(
+                &tenant(),
+                "psn:watcher:ci_run_failed",
+                "ci_run_failed:run-42",
+            )
             .unwrap();
-        assert_eq!(row.coalesce_count, 2, "the second same-key Signal bumped coalesce_count to 2");
+        assert_eq!(
+            row.coalesce_count, 2,
+            "the second same-key Signal bumped coalesce_count to 2"
+        );
     }
 
     /// **Distinct dedup keys open distinct inbox rows** (the collapse is by `(recipient, dedup_key)`,
@@ -1147,11 +1293,25 @@ mod tests {
     fn distinct_keys_open_distinct_rows() {
         let outbox = OutboxStore::new();
         let (consumer, inbox) = router_over(&outbox);
-        let a = signal("ci_run_failed", Severity::Error, "myelin://acme/ci/run/1", "run-1");
-        let b = signal("ci_run_failed", Severity::Error, "myelin://acme/ci/run/2", "run-2");
+        let a = signal(
+            "ci_run_failed",
+            Severity::Error,
+            "myelin://acme/ci/run/1",
+            "run-1",
+        );
+        let b = signal(
+            "ci_run_failed",
+            Severity::Error,
+            "myelin://acme/ci/run/2",
+            "run-2",
+        );
         consumer.deliver(&signal_msg("evt-1", &a));
         consumer.deliver(&signal_msg("evt-2", &b));
-        assert_eq!(inbox.len(), 2, "two distinct runs → two distinct inbox rows");
+        assert_eq!(
+            inbox.len(),
+            2,
+            "two distinct runs → two distinct inbox rows"
+        );
     }
 
     // --- NOTIF-D10: a poison Signal terminates, does not stall, lag stays bounded ---
@@ -1170,27 +1330,58 @@ mod tests {
             subject: "sig.acme.error.broken_rule".into(),
             envelope: EventEnvelope {
                 payload: serde_json::json!({ "not": "a signal" }),
-                ..signal_envelope("evt-poison", &signal("x", Severity::Error, "myelin://acme/ci/run/0", "k"))
+                ..signal_envelope(
+                    "evt-poison",
+                    &signal("x", Severity::Error, "myelin://acme/ci/run/0", "k"),
+                )
             },
         };
         // A GOOD Signal on a sibling subject (different rule → different subject segment).
-        let good = signal("ci_run_failed", Severity::Error, "myelin://acme/ci/run/42", "run-42");
+        let good = signal(
+            "ci_run_failed",
+            Severity::Error,
+            "myelin://acme/ci/run/42",
+            "run-42",
+        );
         let good_msg = signal_msg("evt-good", &good);
 
         // The poison terminates IMMEDIATELY (dead-letter, rule 5) — not a Retry, not a stall.
         let out = consumer.deliver(&poison);
-        assert!(matches!(out, Delivered::DeadLettered(_)), "the poison terminates (NonRetryable)");
-        assert_eq!(consumer.dead_letters().len(), 1, "the poison is SURFACED, not silently dropped");
+        assert!(
+            matches!(out, Delivered::DeadLettered(_)),
+            "the poison terminates (NonRetryable)"
+        );
+        assert_eq!(
+            consumer.dead_letters().len(),
+            1,
+            "the poison is SURFACED, not silently dropped"
+        );
 
         // The GOOD Signal still routes — the poison did NOT head-of-line-block it (0 stalls).
-        assert_eq!(consumer.deliver(&good_msg), Delivered::Acked, "the good Signal is not blocked");
-        assert_eq!(inbox.len(), 1, "the good Signal UPSERTed its row (the poison wrote none)");
+        assert_eq!(
+            consumer.deliver(&good_msg),
+            Delivered::Acked,
+            "the good Signal is not blocked"
+        );
+        assert_eq!(
+            inbox.len(),
+            1,
+            "the good Signal UPSERTed its row (the poison wrote none)"
+        );
 
         // Consumer lag stays BOUNDED at 0 (the dead-letter is terminal; the good Signal acked).
         // The lag-alarm reads `consumer.lag()` (contract 1.8); 0 is below any threshold default.
-        assert_eq!(consumer.lag(), 0, "NOTIF-D10: 0 head-of-line stalls; lag recovered to 0");
+        assert_eq!(
+            consumer.lag(),
+            0,
+            "NOTIF-D10: 0 head-of-line stalls; lag recovered to 0"
+        );
         // The poison wrote NO inbox row and emitted NOTHING (a poison is not a half-write).
-        assert_eq!(outbox.committed_count(), 1, "only the good Signal emitted (the poison did not)");
+        assert_eq!(
+            outbox.committed_count(),
+            1,
+            "only the good Signal emitted (the poison did not)"
+        );
     }
 
     /// **A poison redelivery is deduped, not re-poisoned** (its dead-letter mark is terminal; a
@@ -1203,12 +1394,26 @@ mod tests {
             subject: "sig.acme.error.broken".into(),
             envelope: EventEnvelope {
                 payload: serde_json::json!({ "bad": true }),
-                ..signal_envelope("evt-p", &signal("x", Severity::Error, "myelin://acme/ci/run/0", "k"))
+                ..signal_envelope(
+                    "evt-p",
+                    &signal("x", Severity::Error, "myelin://acme/ci/run/0", "k"),
+                )
             },
         };
-        assert!(matches!(consumer.deliver(&poison), Delivered::DeadLettered(_)));
-        assert_eq!(consumer.deliver(&poison), Delivered::Deduplicated, "a re-delivered poison dedups");
-        assert_eq!(consumer.dead_letters().len(), 1, "still exactly one dead-letter (not re-poisoned)");
+        assert!(matches!(
+            consumer.deliver(&poison),
+            Delivered::DeadLettered(_)
+        ));
+        assert_eq!(
+            consumer.deliver(&poison),
+            Delivered::Deduplicated,
+            "a re-delivered poison dedups"
+        );
+        assert_eq!(
+            consumer.dead_letters().len(),
+            1,
+            "still exactly one dead-letter (not re-poisoned)"
+        );
     }
 
     // --- The skeleton mappings (the mutation-floor decision logic) ---
@@ -1231,9 +1436,21 @@ mod tests {
     fn item_id_is_deterministic_and_field_unambiguous() {
         let t = tenant();
         let a = item_id_for(&t, "psn:alice", "k1");
-        assert_eq!(a, item_id_for(&t, "psn:alice", "k1"), "the same tuple → the same id (idempotent)");
-        assert_ne!(a, item_id_for(&t, "psn:alice", "k2"), "a different dedup_key → a different id");
-        assert_ne!(a, item_id_for(&t, "psn:bob", "k1"), "a different recipient → a different id");
+        assert_eq!(
+            a,
+            item_id_for(&t, "psn:alice", "k1"),
+            "the same tuple → the same id (idempotent)"
+        );
+        assert_ne!(
+            a,
+            item_id_for(&t, "psn:alice", "k2"),
+            "a different dedup_key → a different id"
+        );
+        assert_ne!(
+            a,
+            item_id_for(&t, "psn:bob", "k1"),
+            "a different recipient → a different id"
+        );
         assert_ne!(
             a,
             item_id_for(&TenantId("other".into()), "psn:alice", "k1"),
@@ -1259,12 +1476,23 @@ mod tests {
         // the router's `inbox()` is the SAME projection (not a fresh default).
         assert!(consumer.handler().inbox().is_empty());
 
-        let sig = signal("ci_run_failed", Severity::Error, "myelin://acme/ci/run/42", "run-42");
+        let sig = signal(
+            "ci_run_failed",
+            Severity::Error,
+            "myelin://acme/ci/run/42",
+            "run-42",
+        );
         consumer.deliver(&signal_msg("evt-1", &sig));
-        assert!(!inbox.is_empty(), "after a route the projection is NOT empty");
+        assert!(
+            !inbox.is_empty(),
+            "after a route the projection is NOT empty"
+        );
         assert_eq!(inbox.len(), 1);
         // the router's `inbox()` accessor observes the SAME row (a fresh default would be empty).
-        assert!(!consumer.handler().inbox().is_empty(), "router.inbox() is the live projection");
+        assert!(
+            !consumer.handler().inbox().is_empty(),
+            "router.inbox() is the live projection"
+        );
         assert_eq!(consumer.handler().inbox().len(), 1);
     }
 
@@ -1286,13 +1514,18 @@ mod tests {
     /// Notif reads the structured node, never free text — AG-6).
     fn signal_msg_with_mentions(id: &str, sig: &Signal, mentions: &[Principal]) -> Message {
         let mut env = signal_envelope(id, sig);
-        let nodes: Vec<InlineNode> =
-            mentions.iter().cloned().map(InlineNode::Mention).collect();
+        let nodes: Vec<InlineNode> = mentions.iter().cloned().map(InlineNode::Mention).collect();
         // The Signal payload is an object; add the structured `mentions` array beside it.
         if let serde_json::Value::Object(map) = &mut env.payload {
-            map.insert(SIGNAL_MENTIONS_KEY.into(), serde_json::to_value(&nodes).unwrap());
+            map.insert(
+                SIGNAL_MENTIONS_KEY.into(),
+                serde_json::to_value(&nodes).unwrap(),
+            );
         }
-        Message { subject: env.subject.0.clone(), envelope: env }
+        Message {
+            subject: env.subject.0.clone(),
+            envelope: env,
+        }
     }
 
     fn mentioned(id: &str) -> Principal {
@@ -1307,8 +1540,17 @@ mod tests {
     fn write_fanout_materialises_one_item_per_mentioned_recipient() {
         let outbox = OutboxStore::new();
         let (consumer, inbox) = router_over(&outbox);
-        let sig = signal("pr_review", Severity::Info, "myelin://acme/git/pr/9", "pr-9");
-        let mentions = [mentioned("p-alice"), mentioned("p-bob"), mentioned("p-carol")];
+        let sig = signal(
+            "pr_review",
+            Severity::Info,
+            "myelin://acme/git/pr/9",
+            "pr-9",
+        );
+        let mentions = [
+            mentioned("p-alice"),
+            mentioned("p-bob"),
+            mentioned("p-carol"),
+        ];
 
         assert_eq!(
             consumer.deliver(&signal_msg_with_mentions("evt-m1", &sig, &mentions)),
@@ -1322,14 +1564,29 @@ mod tests {
             let row = inbox
                 .get(&tenant(), &p.principal_id.0, &dedup)
                 .unwrap_or_else(|| panic!("a mention row for {}", p.principal_id.0));
-            assert_eq!(row.reason, Reason::Mentioned, "a mention → reason Mentioned");
-            assert_eq!(row.class, Class::Direct, "a mention is directly addressed → Direct");
-            assert_eq!(row.recipient, p.principal_id.0, "the recipient is the mentioned principal");
+            assert_eq!(
+                row.reason,
+                Reason::Mentioned,
+                "a mention → reason Mentioned"
+            );
+            assert_eq!(
+                row.class,
+                Class::Direct,
+                "a mention is directly addressed → Direct"
+            );
+            assert_eq!(
+                row.recipient, p.principal_id.0,
+                "the recipient is the mentioned principal"
+            );
             // refs-not-payloads: the subject is a ref, the recipient an opaque id (no name stored).
             assert_eq!(row.subject.0, "myelin://acme/git/pr/9");
         }
         // 3 mention rows + 1 ambient skeleton row = 4 distinct rows.
-        assert_eq!(inbox.len(), 4, "one row per mentioned recipient (3) + the ambient row (1)");
+        assert_eq!(
+            inbox.len(),
+            4,
+            "one row per mentioned recipient (3) + the ambient row (1)"
+        );
     }
 
     /// **A redelivered / repeated mention COLLAPSES — one row per recipient, never a duplicate.** The
@@ -1340,7 +1597,12 @@ mod tests {
     fn write_fanout_repeat_mention_collapses_one_row_per_recipient() {
         let outbox = OutboxStore::new();
         let (consumer, inbox) = router_over(&outbox);
-        let sig = signal("pr_review", Severity::Info, "myelin://acme/git/pr/9", "pr-9");
+        let sig = signal(
+            "pr_review",
+            Severity::Info,
+            "myelin://acme/git/pr/9",
+            "pr-9",
+        );
         let mentions = [mentioned("p-alice")];
 
         consumer.deliver(&signal_msg_with_mentions("evt-a", &sig, &mentions));
@@ -1348,14 +1610,20 @@ mod tests {
 
         let dedup = "mention:pr_review:pr-9:p-alice";
         let row = inbox.get(&tenant(), "p-alice", dedup).unwrap();
-        assert_eq!(row.coalesce_count, 2, "the repeated mention collapsed (one row, count 2)");
+        assert_eq!(
+            row.coalesce_count, 2,
+            "the repeated mention collapsed (one row, count 2)"
+        );
         // alice has exactly ONE mention row (the ambient skeleton row is the only other row).
         let alice_rows = inbox
             .snapshot_for_tenant(&tenant())
             .into_iter()
             .filter(|r| r.recipient == "p-alice")
             .count();
-        assert_eq!(alice_rows, 1, "exactly one row for the mentioned recipient (no duplicate)");
+        assert_eq!(
+            alice_rows, 1,
+            "exactly one row for the mentioned recipient (no duplicate)"
+        );
     }
 
     /// **A Signal with NO structured mention nodes fans out NOTHING (no free-text parse).** A
@@ -1366,10 +1634,19 @@ mod tests {
     fn no_mention_nodes_means_no_write_fanout() {
         let outbox = OutboxStore::new();
         let (consumer, inbox) = router_over(&outbox);
-        let sig = signal("ci_run_failed", Severity::Error, "myelin://acme/ci/run/42", "run-42");
+        let sig = signal(
+            "ci_run_failed",
+            Severity::Error,
+            "myelin://acme/ci/run/42",
+            "run-42",
+        );
         // The plain Signal envelope carries NO `mentions` key (only the serialized Signal).
         consumer.deliver(&signal_msg("evt-1", &sig));
-        assert_eq!(inbox.len(), 1, "only the ambient skeleton row — 0 mention write-fanout rows");
+        assert_eq!(
+            inbox.len(),
+            1,
+            "only the ambient skeleton row — 0 mention write-fanout rows"
+        );
     }
 
     /// **The hot-subject-cap check (NOTIF-P12 GATE / NOTIF-D2): past the cap, a mention-storm on a hot
@@ -1391,7 +1668,12 @@ mod tests {
         router.hot_cap = HotSubjectCap::with_cap(5);
 
         // A mention-storm: 50 DISTINCT recipients mentioned on ONE hot subject_root.
-        let sig = signal("mention_spray", Severity::Info, "myelin://acme/chat/thread/hot", "spray");
+        let sig = signal(
+            "mention_spray",
+            Severity::Info,
+            "myelin://acme/chat/thread/hot",
+            "spray",
+        );
         let storm: Vec<Principal> = (0..50).map(|i| mentioned(&format!("p-{i}"))).collect();
         let _ = router.route(&signal_envelope("evt-storm", &sig));
 
@@ -1401,7 +1683,10 @@ mod tests {
             let mut e = signal_envelope("evt-storm-2", &sig);
             let nodes: Vec<InlineNode> = storm.iter().cloned().map(InlineNode::Mention).collect();
             if let serde_json::Value::Object(map) = &mut e.payload {
-                map.insert(SIGNAL_MENTIONS_KEY.into(), serde_json::to_value(&nodes).unwrap());
+                map.insert(
+                    SIGNAL_MENTIONS_KEY.into(),
+                    serde_json::to_value(&nodes).unwrap(),
+                );
             }
             e
         };
@@ -1425,7 +1710,10 @@ mod tests {
             .into_iter()
             .filter(|r| r.reason == Reason::Mentioned)
             .count();
-        assert_eq!(mention_rows, 5, "exactly `cap` mention rows materialised (bounded write-fanout)");
+        assert_eq!(
+            mention_rows, 5,
+            "exactly `cap` mention rows materialised (bounded write-fanout)"
+        );
     }
 
     /// **`SIGNAL_MENTIONS_KEY` is the frozen wire key** — the named constant the CDC pins (producer +

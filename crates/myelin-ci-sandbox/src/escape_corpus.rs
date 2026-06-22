@@ -147,17 +147,50 @@ pub struct AttackMarker {
 /// [`build_corpus_script`] MUST stay in lockstep (a unit test asserts every catalogued id appears in
 /// the generated script).
 pub const CORPUS: &[AttackMarker] = &[
-    AttackMarker { id: "K1_module", family: AttackFamily::KernelExploit },
-    AttackMarker { id: "K2_devmem", family: AttackFamily::KernelExploit },
-    AttackMarker { id: "K3_ioport", family: AttackFamily::KernelExploit },
-    AttackMarker { id: "K4_mount", family: AttackFamily::KernelExploit },
-    AttackMarker { id: "M1_metadata_ssrf", family: AttackFamily::CloudMetadataSsrf },
-    AttackMarker { id: "C1_controlplane", family: AttackFamily::ControlPlaneReach },
-    AttackMarker { id: "T1_crosstenant", family: AttackFamily::CrossTenant },
-    AttackMarker { id: "E1_secret_exfil", family: AttackFamily::SecretExfil },
-    AttackMarker { id: "F1_forkbomb", family: AttackFamily::ForkBomb },
-    AttackMarker { id: "D1_root_readonly", family: AttackFamily::DiskFill },
-    AttackMarker { id: "D2_diskfill", family: AttackFamily::DiskFill },
+    AttackMarker {
+        id: "K1_module",
+        family: AttackFamily::KernelExploit,
+    },
+    AttackMarker {
+        id: "K2_devmem",
+        family: AttackFamily::KernelExploit,
+    },
+    AttackMarker {
+        id: "K3_ioport",
+        family: AttackFamily::KernelExploit,
+    },
+    AttackMarker {
+        id: "K4_mount",
+        family: AttackFamily::KernelExploit,
+    },
+    AttackMarker {
+        id: "M1_metadata_ssrf",
+        family: AttackFamily::CloudMetadataSsrf,
+    },
+    AttackMarker {
+        id: "C1_controlplane",
+        family: AttackFamily::ControlPlaneReach,
+    },
+    AttackMarker {
+        id: "T1_crosstenant",
+        family: AttackFamily::CrossTenant,
+    },
+    AttackMarker {
+        id: "E1_secret_exfil",
+        family: AttackFamily::SecretExfil,
+    },
+    AttackMarker {
+        id: "F1_forkbomb",
+        family: AttackFamily::ForkBomb,
+    },
+    AttackMarker {
+        id: "D1_root_readonly",
+        family: AttackFamily::DiskFill,
+    },
+    AttackMarker {
+        id: "D2_diskfill",
+        family: AttackFamily::DiskFill,
+    },
 ];
 
 /// Build the in-guest bash corpus script (run as PID1 in the hardened microVM via
@@ -601,7 +634,10 @@ mod tests {
         let report = parse_console(&console);
         assert_eq!(report.did_not_run(), 1);
         assert_eq!(report.escapes(), 0);
-        assert!(!report.is_green(), "a property not drilled is not proven ⇒ RED");
+        assert!(
+            !report.is_green(),
+            "a property not drilled is not proven ⇒ RED"
+        );
     }
 
     #[test]
@@ -611,7 +647,10 @@ mod tests {
         console = console.replace(&format!("{END_MARKER}\n"), "");
         let report = parse_console(&console);
         assert!(!report.corpus_completed);
-        assert!(!report.is_green(), "no END marker ⇒ corpus did not complete ⇒ RED");
+        assert!(
+            !report.is_green(),
+            "no END marker ⇒ corpus did not complete ⇒ RED"
+        );
     }
 
     #[test]
@@ -619,7 +658,10 @@ mod tests {
         // The per-family attestation count map keys on these; they must be non-empty + distinct
         // (a mutant returning "" or a duplicate would collapse the count map).
         let keys: Vec<&str> = AttackFamily::all().iter().map(|f| f.key()).collect();
-        assert!(keys.iter().all(|k| !k.is_empty()), "every family key is non-empty");
+        assert!(
+            keys.iter().all(|k| !k.is_empty()),
+            "every family key is non-empty"
+        );
         let mut sorted = keys.clone();
         sorted.sort_unstable();
         sorted.dedup();
@@ -698,7 +740,9 @@ mod tests {
                 BackendRun {
                     backend: Backend::GvisorRunsc,
                     exercised: false,
-                    residual_note: Some("runsc requires privileges this host lacks (no sudo)".into()),
+                    residual_note: Some(
+                        "runsc requires privileges this host lacks (no sudo)".into(),
+                    ),
                 },
             ],
             Backend::FirecrackerMicrovm,
@@ -711,15 +755,23 @@ mod tests {
         assert_eq!(att.corpus_version, CORPUS_VERSION);
         assert_eq!(att.gate_backend, Backend::FirecrackerMicrovm);
         // Firecracker exercised; gVisor recorded as a NAMED residual (not faked).
-        assert!(att.backends.iter().any(|b| b.backend == Backend::FirecrackerMicrovm && b.exercised));
         assert!(att
             .backends
             .iter()
-            .any(|b| b.backend == Backend::GvisorRunsc && !b.exercised && b.residual_note.is_some()));
+            .any(|b| b.backend == Backend::FirecrackerMicrovm && b.exercised));
+        assert!(att
+            .backends
+            .iter()
+            .any(|b| b.backend == Backend::GvisorRunsc
+                && !b.exercised
+                && b.residual_note.is_some()));
         // The named residuals are carried in writing (the no-floor / permanent-gate posture).
         assert!(att.residuals.iter().any(|r| r.contains("PERMANENT GATE")));
         assert!(att.residuals.iter().any(|r| r.contains("CI-P28")));
-        assert!(att.residuals.iter().any(|r| r.contains("CI-P27") || r.contains("P-348")));
+        assert!(att
+            .residuals
+            .iter()
+            .any(|r| r.contains("CI-P27") || r.contains("P-348")));
         // The green line + JSON serialize.
         assert!(att.green_line().starts_with("[AG-D4 GREEN]"));
         assert!(att.green_line().contains("total-escapes=0"));
@@ -735,7 +787,11 @@ mod tests {
             "2026-06-21",
             &report,
             vec![
-                BackendRun { backend: Backend::FirecrackerMicrovm, exercised: true, residual_note: None },
+                BackendRun {
+                    backend: Backend::FirecrackerMicrovm,
+                    exercised: true,
+                    residual_note: None,
+                },
                 BackendRun {
                     backend: Backend::GvisorRunsc,
                     exercised: false,
@@ -743,11 +799,16 @@ mod tests {
                 },
             ],
             Backend::FirecrackerMicrovm,
-            "r", "k", "6.1.168",
+            "r",
+            "k",
+            "6.1.168",
         )
         .unwrap();
         let line = att.green_line();
         assert!(line.contains("firecracker"));
-        assert!(!line.contains("gvisor"), "a non-exercised backend must not be claimed green");
+        assert!(
+            !line.contains("gvisor"),
+            "a non-exercised backend must not be claimed green"
+        );
     }
 }

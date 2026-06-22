@@ -64,8 +64,14 @@ fn cdc_6_5_producer_git_emits_the_section_9_shape_per_changed_blob() {
     let e = CodeProjectionEmitter::new("core", "main", ctx_base(), &outbox, minter, &cursor, &r);
 
     let tree = Tree::empty()
-        .with("src/lib.rs", Blob::new("oid-lib", b"pub fn parseHttpResponse() {}".to_vec()))
-        .with("src/util.rs", Blob::new("oid-util", b"fn max_retries() -> i64 { 42 }".to_vec()));
+        .with(
+            "src/lib.rs",
+            Blob::new("oid-lib", b"pub fn parseHttpResponse() {}".to_vec()),
+        )
+        .with(
+            "src/util.rs",
+            Blob::new("oid-util", b"fn max_retries() -> i64 { 42 }".to_vec()),
+        );
     let emit = e
         .emit_for_push("refs/heads/main", "tip-1", &Tree::empty(), &tree, "initial")
         .unwrap()
@@ -81,8 +87,20 @@ fn cdc_6_5_producer_git_emits_the_section_9_shape_per_changed_blob() {
         assert_eq!(row.envelope.type_.0, GIT_BLOB_SNAPSHOT);
         let pl = &row.envelope.payload;
         // The §9 fields are all present.
-        for field in ["op", "artifact_ref", "path", "language", "symbols", "literals", "text", "blob_oid"] {
-            assert!(pl.get(field).is_some(), "the §9 projection field `{field}` must be present");
+        for field in [
+            "op",
+            "artifact_ref",
+            "path",
+            "language",
+            "symbols",
+            "literals",
+            "text",
+            "blob_oid",
+        ] {
+            assert!(
+                pl.get(field).is_some(),
+                "the §9 projection field `{field}` must be present"
+            );
         }
         // The doc's ACL object type is the parent repo (the GIT-P5 spec's acl_object_type).
         assert_eq!(pl["acl_object_type"], serde_json::json!("repo"));
@@ -115,7 +133,10 @@ fn cdc_6_5_consumer_doc_facets_match_the_registered_6_3_spec() {
     doc_keys.sort();
     let mut spec_keys: Vec<&String> = spec.struct_fields.keys().collect();
     spec_keys.sort();
-    assert_eq!(doc_keys, spec_keys, "the emitted doc's facets match the declared 6.3 spec facets");
+    assert_eq!(
+        doc_keys, spec_keys,
+        "the emitted doc's facets match the declared 6.3 spec facets"
+    );
 
     // ...and each facet's VALUE type matches the spec's declared FieldType (all Text).
     for (k, v) in &sp.fields {
@@ -127,9 +148,18 @@ fn cdc_6_5_consumer_doc_facets_match_the_registered_6_3_spec() {
         assert_eq!(spec.struct_fields[k], FieldType::Text);
     }
     // The concrete facets carry the §9 values.
-    assert_eq!(sp.fields.get(FACET_PATH), Some(&FieldValue::Text("src/lib.rs".into())));
-    assert_eq!(sp.fields.get(FACET_LANGUAGE), Some(&FieldValue::Text("rust".into())));
-    assert_eq!(sp.fields.get(FACET_BLOB_OID), Some(&FieldValue::Text("oid-lib".into())));
+    assert_eq!(
+        sp.fields.get(FACET_PATH),
+        Some(&FieldValue::Text("src/lib.rs".into()))
+    );
+    assert_eq!(
+        sp.fields.get(FACET_LANGUAGE),
+        Some(&FieldValue::Text("rust".into()))
+    );
+    assert_eq!(
+        sp.fields.get(FACET_BLOB_OID),
+        Some(&FieldValue::Text("oid-lib".into()))
+    );
 }
 
 /// **The two sides agree (the round-trip): an emitted doc's facets are exactly what the spec declares

@@ -206,10 +206,7 @@ impl KnowledgeStore {
     /// `attempted_path_mismatch == true` iff the path tried (and failed) to spoof a different
     /// tenant. This is the Knowledge entrypoint's call onto the storage RLS guard's
     /// [`TenantScope::resolve`] — Knowledge does not re-derive the rule, it consumes the one floor.
-    pub fn resolve_tenant(
-        scope: &TenantScope,
-        path_tenant: Option<&TenantId>,
-    ) -> ResolvedTenant {
+    pub fn resolve_tenant(scope: &TenantScope, path_tenant: Option<&TenantId>) -> ResolvedTenant {
         scope.resolve(path_tenant)
     }
 }
@@ -389,7 +386,10 @@ mod tests {
         assert_eq!(store.pool().config(), cfg());
         // The fs BlobStore is wired + usable (media + CRDT snapshots, K6).
         let acme = TenantId("acme".into());
-        let h = store.blobs().put(&acme, b"a snapshot blob").expect("blob put");
+        let h = store
+            .blobs()
+            .put(&acme, b"a snapshot blob")
+            .expect("blob put");
         assert_eq!(
             store.blobs().get(&acme, &h).expect("blob get"),
             b"a snapshot blob",
@@ -422,7 +422,12 @@ mod tests {
                 "{} query must target its own table: {sql}",
                 table.name()
             );
-            assert_eq!(q.validate(), Ok(()), "{} query is well-formed", table.name());
+            assert_eq!(
+                q.validate(),
+                Ok(()),
+                "{} query is well-formed",
+                table.name()
+            );
         }
     }
 
@@ -459,7 +464,10 @@ mod tests {
         let matching = KnowledgeStore::resolve_tenant(&scope, Some(&TenantId("acme".into())));
         assert_eq!(matching.tenant, TenantId("acme".into()));
         assert!(!matching.path_derived);
-        assert!(!matching.attempted_path_mismatch, "matching tenants are not a spoof");
+        assert!(
+            !matching.attempted_path_mismatch,
+            "matching tenants are not a spoof"
+        );
 
         let internal = KnowledgeStore::resolve_tenant(&scope, None);
         assert_eq!(internal.tenant, TenantId("acme".into()));
@@ -534,7 +542,8 @@ mod tests {
         for m in &knowledge_store_migrations().0 {
             if m.ddl.contains("CREATE TABLE") {
                 assert!(
-                    m.ddl.contains("tenant text NOT NULL") && m.ddl.contains("region text NOT NULL"),
+                    m.ddl.contains("tenant text NOT NULL")
+                        && m.ddl.contains("region text NOT NULL"),
                     "table migration {} must declare the (tenant, region) partition columns",
                     m.id
                 );
@@ -551,6 +560,10 @@ mod tests {
             .iter()
             .filter(|m| m.ddl.contains("CREATE TABLE"))
             .count();
-        assert_eq!(creates, KnowledgeTable::ALL.len(), "exactly the 9 v1 Knowledge tables");
+        assert_eq!(
+            creates,
+            KnowledgeTable::ALL.len(),
+            "exactly the 9 v1 Knowledge tables"
+        );
     }
 }

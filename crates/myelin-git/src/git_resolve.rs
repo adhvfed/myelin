@@ -75,7 +75,9 @@
 //!   projection; only the rendered projection crosses).
 
 use myelin_identity::{Consistency, IdentityService, Principal, Zookie};
-use myelin_notif::humanise::{RefProjection, RefResolution, RefResolvePort, Tombstone, TombstoneReason};
+use myelin_notif::humanise::{
+    RefProjection, RefResolution, RefResolvePort, Tombstone, TombstoneReason,
+};
 use myelin_refs::ArtifactRef;
 use myelin_tenancy::{Region, TenantId};
 
@@ -85,7 +87,8 @@ use crate::project::{Projected, Projector, TombstoneReason as GitTombstoneReason
 /// Review-requests are NOT a second store: the scoped view is `list_inbox(principal, filter =
 /// reason:review_requested + subject-prefix git/)`. Named here so the view + the inbox agree on the
 /// filter by NAME (X-5), never a literal.
-pub const GIT_REVIEW_REQUESTS_FILTER_REASON: myelin_notif::Reason = myelin_notif::Reason::ReviewRequested;
+pub const GIT_REVIEW_REQUESTS_FILTER_REASON: myelin_notif::Reason =
+    myelin_notif::Reason::ReviewRequested;
 
 /// The `subject` prefix the "Review requests" filter conjoins (so the scoped view shows ONLY git
 /// review-requests, not every cross-subsystem review-request). The git subsystem token of the canonical
@@ -237,7 +240,9 @@ mod tests {
     }
     impl StubId {
         fn new() -> Self {
-            Self { allow: HashSet::new() }
+            Self {
+                allow: HashSet::new(),
+            }
         }
         fn allow_view(mut self, object: &ArtifactRef) -> Self {
             self.allow.insert(format!("view@{}", object.0));
@@ -257,7 +262,11 @@ mod tests {
             _caveat: Option<&CaveatContext>,
         ) -> IdResult<Decision> {
             let key = format!("{}@{}", permission.0, object.0);
-            Ok(if self.allow.contains(&key) { Decision::Allow } else { Decision::Deny })
+            Ok(if self.allow.contains(&key) {
+                Decision::Allow
+            } else {
+                Decision::Deny
+            })
         }
         fn list_objects(
             &self,
@@ -344,10 +353,19 @@ mod tests {
         )
     }
     fn strong(zk: &str) -> Consistency {
-        Consistency { at_least: Zookie(zk.into()), mode: ConsistencyMode::Strong }
+        Consistency {
+            at_least: Zookie(zk.into()),
+            mode: ConsistencyMode::Strong,
+        }
     }
     fn secret_pr() -> PullRequest {
-        let mut pr = PullRequest::open(9, "refs/heads/main", "refs/heads/feature", "psn:alice", false);
+        let mut pr = PullRequest::open(
+            9,
+            "refs/heads/main",
+            "refs/heads/feature",
+            "psn:alice",
+            false,
+        );
         pr.body = Body::new(SECRET_TITLE, vec![]);
         pr
     }
@@ -358,7 +376,11 @@ mod tests {
         let pr_ref = git_pr_ref("acme", "repo7", 9);
         let mut store = ArtifactStore::new();
         store.put_pr(&pr_ref, secret_pr(), GateOutcome::AllRequiredGreen, 0, 0);
-        let id = if grant_view { StubId::new().allow_view(&pr_ref) } else { StubId::new() };
+        let id = if grant_view {
+            StubId::new().allow_view(&pr_ref)
+        } else {
+            StubId::new()
+        };
         (GitRefResolver::new(Projector::new(id, store)), pr_ref)
     }
 
@@ -368,13 +390,24 @@ mod tests {
     #[test]
     fn denied_viewer_resolves_to_a_tombstone_no_title() {
         let (resolver, pr_ref) = private_pr_resolver(false); // nobody granted
-        let r = resolver.resolve_display(&acme(), &region(), &pr_ref, &viewer("ex-contractor"), &strong("zk-1"));
+        let r = resolver.resolve_display(
+            &acme(),
+            &region(),
+            &pr_ref,
+            &viewer("ex-contractor"),
+            &strong("zk-1"),
+        );
         match r {
             RefResolution::Tombstone(t) => {
-                assert_eq!(t.root, pr_ref, "the opaque root crosses (for `a restricted pr`)");
+                assert_eq!(
+                    t.root, pr_ref,
+                    "the opaque root crosses (for `a restricted pr`)"
+                );
                 assert_eq!(t.reason, TombstoneReason::Denied);
             }
-            RefResolution::Projection(_) => panic!("a denied viewer must NOT get a projection (leak!)"),
+            RefResolution::Projection(_) => {
+                panic!("a denied viewer must NOT get a projection (leak!)")
+            }
         }
     }
 
@@ -384,11 +417,20 @@ mod tests {
     #[test]
     fn permitted_viewer_resolves_to_a_projection_with_the_title() {
         let (resolver, pr_ref) = private_pr_resolver(true);
-        let r = resolver.resolve_display(&acme(), &region(), &pr_ref, &viewer("maintainer"), &strong("zk-1"));
+        let r = resolver.resolve_display(
+            &acme(),
+            &region(),
+            &pr_ref,
+            &viewer("maintainer"),
+            &strong("zk-1"),
+        );
         match r {
             RefResolution::Projection(p) => {
                 assert_eq!(p.ref_, pr_ref);
-                assert_eq!(p.title, SECRET_TITLE, "the permitted viewer sees the PR title");
+                assert_eq!(
+                    p.title, SECRET_TITLE,
+                    "the permitted viewer sees the PR title"
+                );
                 assert_eq!(p.icon, "pr");
             }
             RefResolution::Tombstone(_) => panic!("the permitted viewer must see the projection"),
@@ -424,21 +466,42 @@ mod tests {
                 if h.text.contains(SECRET_TITLE) || h.text.to_lowercase().contains("nightfall") {
                     leaks += 1;
                 }
-                assert!(h.text.contains("a restricted pr"), "the denied render is a tombstone");
-                assert!(h.links.is_empty(), "a denied unfurl yields no click-route link");
+                assert!(
+                    h.text.contains("a restricted pr"),
+                    "the denied render is a tombstone"
+                );
+                assert!(
+                    h.links.is_empty(),
+                    "a denied unfurl yields no click-route link"
+                );
             }
         }
-        assert_eq!(leaks, 0, "NOTIF-D4-class: 0 title leak over {renders} denied renders (threshold 0)");
+        assert_eq!(
+            leaks, 0,
+            "NOTIF-D4-class: 0 title leak over {renders} denied renders (threshold 0)"
+        );
     }
 
     /// **The Git tombstone-reason mapping is total + PII-free** (every Git reason maps to a Notif
     /// content-free reason; never a free-text leak).
     #[test]
     fn tombstone_reason_mapping_is_total_and_pii_free() {
-        assert_eq!(map_tombstone_reason(GitTombstoneReason::Unauthorized), TombstoneReason::Denied);
-        assert_eq!(map_tombstone_reason(GitTombstoneReason::Restricted), TombstoneReason::Denied);
-        assert_eq!(map_tombstone_reason(GitTombstoneReason::Erased), TombstoneReason::Erased);
-        assert_eq!(map_tombstone_reason(GitTombstoneReason::ContentGone), TombstoneReason::SubGone);
+        assert_eq!(
+            map_tombstone_reason(GitTombstoneReason::Unauthorized),
+            TombstoneReason::Denied
+        );
+        assert_eq!(
+            map_tombstone_reason(GitTombstoneReason::Restricted),
+            TombstoneReason::Denied
+        );
+        assert_eq!(
+            map_tombstone_reason(GitTombstoneReason::Erased),
+            TombstoneReason::Erased
+        );
+        assert_eq!(
+            map_tombstone_reason(GitTombstoneReason::ContentGone),
+            TombstoneReason::SubGone
+        );
     }
 
     /// **A malformed / non-git ref degrades to a non-leaking `RootGone` tombstone (never a panic).**
@@ -446,7 +509,13 @@ mod tests {
     fn an_unprojectable_ref_degrades_to_a_non_leaking_tombstone() {
         let (resolver, _) = private_pr_resolver(false);
         let not_git = ArtifactRef("myelin://acme/issue/issue/ENG-1".into());
-        let r = resolver.resolve_display(&acme(), &region(), &not_git, &viewer("alice"), &strong("zk-1"));
+        let r = resolver.resolve_display(
+            &acme(),
+            &region(),
+            &not_git,
+            &viewer("alice"),
+            &strong("zk-1"),
+        );
         match r {
             RefResolution::Tombstone(t) => assert_eq!(t.reason, TombstoneReason::RootGone),
             RefResolution::Projection(_) => panic!("a non-git ref must not project a title"),
@@ -463,11 +532,17 @@ mod tests {
 
         let git_pr = git_pr_ref("acme", "repo7", 9);
         // a review-request ON a git PR matches the scoped view.
-        assert!(matches_review_requests_view(Reason::ReviewRequested, &git_pr));
+        assert!(matches_review_requests_view(
+            Reason::ReviewRequested,
+            &git_pr
+        ));
         // a MENTION on a git PR does NOT (the filter is review-requests only).
         assert!(!matches_review_requests_view(Reason::Mentioned, &git_pr));
         // a review-request on a NON-git subject does NOT (the prefix conjunct rejects it).
         let issue = ArtifactRef("myelin://acme/issue/issue/ENG-1".into());
-        assert!(!matches_review_requests_view(Reason::ReviewRequested, &issue));
+        assert!(!matches_review_requests_view(
+            Reason::ReviewRequested,
+            &issue
+        ));
     }
 }

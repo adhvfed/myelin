@@ -49,23 +49,27 @@
 //!   `pg_restore` binding is the named storage floor, not a GDPR-owned DB contract).
 
 use myelin_gdpr::{EraseScope, PersonalDataHolder, SubjectRef};
+use myelin_gdpr_service::holders::{
+    CryptoShredKms, InMemoryShredKms, ShredKeyClass, ShredKeyHandle,
+};
+use myelin_gdpr_service::orchestration::{
+    holder_ids, EraseChecklist, SeamHolder, UpstreamHolderOrchestrator,
+};
 use myelin_gdpr_service::{
     DsrKind, DsrOrchestrator, DsrState, ErasureLedger, ErasureLedgerEntry, FanOutDriver,
-    FanOutOutcome, Initiator, LegalHoldRegistry, Posture, PostPitRecord,
+    FanOutOutcome, Initiator, LegalHoldRegistry, PostPitRecord, Posture,
 };
-use myelin_gdpr_service::holders::{CryptoShredKms, InMemoryShredKms, ShredKeyClass, ShredKeyHandle};
-use myelin_gdpr_service::orchestration::{holder_ids, EraseChecklist, SeamHolder, UpstreamHolderOrchestrator};
 
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_substrate::TestClock;
 
-use myelin_storage::{
-    BlobPresence, BusErase, ColumnCryptor, ContinuousArchiver, DekId, EpochMillis, EraseError,
-    EraseHolders, ErasureLedgerSink, ErasureRecord, KekId, KeyClass, KmsEngine, PostRestoreErasureLedger,
-    PseudonymShred, ReErasePass, RefsTombstone, SearchPurge, SourceLog, SubjectId, WalSegment,
-    restore_to_offset,
-};
 use myelin_gdpr::ErasureMethod;
+use myelin_storage::{
+    restore_to_offset, BlobPresence, BusErase, ColumnCryptor, ContinuousArchiver, DekId,
+    EpochMillis, EraseError, EraseHolders, ErasureLedgerSink, ErasureRecord, KekId, KeyClass,
+    KmsEngine, PostRestoreErasureLedger, PseudonymShred, ReErasePass, RefsTombstone, SearchPurge,
+    SourceLog, SubjectId, WalSegment,
+};
 use myelin_tenancy::{Region, TenantId as StorageTenantId};
 
 use std::cell::RefCell;
@@ -119,11 +123,18 @@ fn storage_tenant() -> StorageTenantId {
 }
 
 fn subject_ref(id: &str) -> SubjectRef {
-    SubjectRef::new(Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, gdpr_tenant()))
+    SubjectRef::new(Principal::stub(
+        PrincipalId(id.into()),
+        PrincipalKind::Human,
+        gdpr_tenant(),
+    ))
 }
 
 fn subject_scope(s: &str) -> EraseScope {
-    EraseScope::Subject { subject: subject_ref(s), tenant: gdpr_tenant() }
+    EraseScope::Subject {
+        subject: subject_ref(s),
+        tenant: gdpr_tenant(),
+    }
 }
 
 /// A KMS (GDPR holder seam) seeded with one per-subject key per upstream holder.
@@ -161,7 +172,12 @@ fn gdpr_seam_holders(kms: &InMemoryShredKms) -> Vec<(&'static str, SeamHolder<'_
         holder_ids::BACKUP,
     ]
     .into_iter()
-    .map(|id| (id, SeamHolder::new(id, ShredKeyClass::Subject(id.to_string()), kms)))
+    .map(|id| {
+        (
+            id,
+            SeamHolder::new(id, ShredKeyClass::Subject(id.to_string()), kms),
+        )
+    })
     .collect()
 }
 
@@ -199,7 +215,10 @@ fn complete_an_erase_and_record_to_ledger(
     let kms = seed_gdpr_kms(base_epoch);
     let holders = gdpr_seam_holders(&kms);
     let upstream = UpstreamHolderOrchestrator::register_m1_upstream(
-        holders.iter().map(|(id, h)| (*id, h as &dyn PersonalDataHolder)).collect(),
+        holders
+            .iter()
+            .map(|(id, h)| (*id, h as &dyn PersonalDataHolder))
+            .collect(),
     );
     let dsr = DsrOrchestrator::new(TestClock::at(clock_secs));
     let holds = LegalHoldRegistry::new();
@@ -214,10 +233,14 @@ fn complete_an_erase_and_record_to_ledger(
         Initiator::Myelin,
     );
     assert!(dsr.validate(&id).unwrap());
-    let outcome = driver.drive(&id, &inventory(), &upstream, &EraseChecklist::new()).unwrap();
+    let outcome = driver
+        .drive(&id, &inventory(), &upstream, &EraseChecklist::new())
+        .unwrap();
     assert!(matches!(outcome, FanOutOutcome::Erased(_)));
     assert_eq!(dsr.state_of(&id).unwrap(), DsrState::Completed);
-    ledger.entry(&id).expect("the completion wrote a ledger entry")
+    ledger
+        .entry(&id)
+        .expect("the completion wrote a ledger entry")
 }
 
 // ── the cross-holder re-erasure seams (the §7.5 re-purge / re-tombstone / re-emit), recorded ──
@@ -257,9 +280,17 @@ impl ErasureLedgerSink for Seams {
 
 fn reachable_archiver(tail: u64) -> ContinuousArchiver {
     let mut arch = ContinuousArchiver::new();
-    arch.archive_segment(WalSegment { end_offset: 0, committed_at: 0 }).unwrap();
+    arch.archive_segment(WalSegment {
+        end_offset: 0,
+        committed_at: 0,
+    })
+    .unwrap();
     arch.take_base_backup(1);
-    arch.archive_segment(WalSegment { end_offset: tail, committed_at: 10 }).unwrap();
+    arch.archive_segment(WalSegment {
+        end_offset: tail,
+        committed_at: 10,
+    })
+    .unwrap();
     arch
 }
 
@@ -294,27 +325,49 @@ fn cdc_gdpr_erasure_ledger_drives_storage_post_restore_reerase() {
     // PROVIDER: a completed GDPR erase records a ledger entry at completion offset 140.
     let ledger = ErasureLedger::new();
     let entry = complete_an_erase_and_record_to_ledger(&ledger, subject_id, 140, 1000);
-    assert_eq!(entry.subject_token, subject_id, "the entry holds the opaque subject token (no PII)");
+    assert_eq!(
+        entry.subject_token, subject_id,
+        "the entry holds the opaque subject token (no PII)"
+    );
     assert_eq!(entry.completed_at_offset, 140);
 
     // The seam (control-plane wiring) presents the ledger's post-PIT records as Storage ErasureRecords.
     let seam = GdprErasureLedgerSeam { ledger: &ledger };
     let post_pit = seam.erasures_completed_after(100); // a restore to PIT T=100 (BEFORE the erasure).
-    assert_eq!(post_pit.len(), 1, "the seam reads ONE post-PIT erasure from the GDPR ledger");
-    assert_eq!(post_pit[0].subject, SubjectId::new(subject_id), "subject copied 1:1");
+    assert_eq!(
+        post_pit.len(),
+        1,
+        "the seam reads ONE post-PIT erasure from the GDPR ledger"
+    );
+    assert_eq!(
+        post_pit[0].subject,
+        SubjectId::new(subject_id),
+        "subject copied 1:1"
+    );
     assert_eq!(post_pit[0].completed_at_offset, 140, "offset copied 1:1");
 
     // CONSUMER: Storage re-erases the resurrected subject from the seam → 0 resurrected.
     let storage_subject = SubjectId::new(subject_id);
     let kms = storage_kms_with_subject(&storage_subject);
-    let subject_dek = DekId::new(storage_tenant(), KeyClass::Subject(storage_subject.0.clone()));
+    let subject_dek = DekId::new(
+        storage_tenant(),
+        KeyClass::Subject(storage_subject.0.clone()),
+    );
     assert!(
         kms.backup_snapshot().iter().any(|(d, _)| *d == subject_dek),
         "the restore of T=100 RESURRECTED the subject's DEK (it was live at the older backup PIT)"
     );
 
     let arch = reachable_archiver(300);
-    let report = restore_to_offset(&arch, 100, &[], &BlobPresence::new(), &SourceLog::new(), &kms).unwrap();
+    let report = restore_to_offset(
+        &arch,
+        100,
+        &[],
+        &BlobPresence::new(),
+        &SourceLog::new(),
+        &kms,
+    )
+    .unwrap();
 
     let seams = Seams::default();
     let holders = EraseHolders {
@@ -331,7 +384,10 @@ fn cdc_gdpr_erasure_ledger_drives_storage_post_restore_reerase() {
 
     assert!(rep.is_green(), "0 resurrected → the restore is safe");
     assert_eq!(rep.resurrected_count, 0);
-    assert!(rep.re_erased_subject(&storage_subject, &storage_tenant()), "the post-PIT subject was re-erased FROM the ledger");
+    assert!(
+        rep.re_erased_subject(&storage_subject, &storage_tenant()),
+        "the post-PIT subject was re-erased FROM the ledger"
+    );
     assert!(
         !kms.backup_snapshot().iter().any(|(d, _)| *d == subject_dek),
         "the resurrected DEK is re-destroyed by the pass"
@@ -352,7 +408,10 @@ fn stor_d4_ga_face_erase_yields_zero_recoverable_in_backups() {
     let kms = seed_gdpr_kms(2000);
     let holders = gdpr_seam_holders(&kms);
     let upstream = UpstreamHolderOrchestrator::register_m1_upstream(
-        holders.iter().map(|(id, h)| (*id, h as &dyn PersonalDataHolder)).collect(),
+        holders
+            .iter()
+            .map(|(id, h)| (*id, h as &dyn PersonalDataHolder))
+            .collect(),
     );
     let dsr = DsrOrchestrator::new(TestClock::at(500));
     let holds = LegalHoldRegistry::new();
@@ -378,7 +437,9 @@ fn stor_d4_ga_face_erase_yields_zero_recoverable_in_backups() {
         Initiator::Myelin,
     );
     assert!(dsr.validate(&id).unwrap());
-    driver.drive(&id, &inventory(), &upstream, &EraseChecklist::new()).unwrap();
+    driver
+        .drive(&id, &inventory(), &upstream, &EraseChecklist::new())
+        .unwrap();
     assert_eq!(dsr.state_of(&id).unwrap(), DsrState::Completed);
 
     // STOR-D4-GA-face: 0 recoverable PII in any backup snapshot over EVERY driven holder.
@@ -402,7 +463,11 @@ fn stor_d4_ga_face_erase_yields_zero_recoverable_in_backups() {
     }
 
     // The erasure ledger recorded the completion (the source that drives STOR-D3 re-erasure).
-    assert_eq!(ledger.len(), 1, "the erasure ledger recorded the completed erase");
+    assert_eq!(
+        ledger.len(),
+        1,
+        "the erasure ledger recorded the completed erase"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -425,7 +490,10 @@ fn stor_d3_id_d8_ga_face_restore_older_backup_re_erases_zero_resurrected() {
     // The storage copy holds the subject's pre-erasure DEK alive (resurrected by a restore of T=100).
     let storage_subject = SubjectId::new(subject_id);
     let kms = storage_kms_with_subject(&storage_subject);
-    let subject_dek = DekId::new(storage_tenant(), KeyClass::Subject(storage_subject.0.clone()));
+    let subject_dek = DekId::new(
+        storage_tenant(),
+        KeyClass::Subject(storage_subject.0.clone()),
+    );
     assert!(
         kms.backup_snapshot().iter().any(|(d, _)| *d == subject_dek),
         "the restore of the OLDER backup resurrected the subject's DEK"
@@ -433,7 +501,15 @@ fn stor_d3_id_d8_ga_face_restore_older_backup_re_erases_zero_resurrected() {
 
     // Restore the OLDER backup (PIT T=100, BEFORE the erasure).
     let arch = reachable_archiver(300);
-    let report = restore_to_offset(&arch, 100, &[], &BlobPresence::new(), &SourceLog::new(), &kms).unwrap();
+    let report = restore_to_offset(
+        &arch,
+        100,
+        &[],
+        &BlobPresence::new(),
+        &SourceLog::new(),
+        &kms,
+    )
+    .unwrap();
 
     // Post-restore re-erasure runs FROM the GDPR erasure ledger (the seam drives it).
     let seam = GdprErasureLedgerSeam { ledger: &ledger };
@@ -451,15 +527,28 @@ fn stor_d3_id_d8_ga_face_restore_older_backup_re_erases_zero_resurrected() {
         .expect("the post-restore re-erasure pass succeeds");
 
     // STOR-D3/ID-D8-GA-face: the subject is STILL ERASED — 0 resurrected; the re-erasure receipt is green.
-    assert!(rep.is_green(), "0 resurrected after restoring the older backup");
-    assert_eq!(rep.resurrected_count, 0, "STOR-D3/ID-D8-GA-face: 0 resurrected subjects");
-    assert_eq!(rep.re_erased_count(), 1, "exactly the one post-PIT subject was re-erased");
+    assert!(
+        rep.is_green(),
+        "0 resurrected after restoring the older backup"
+    );
+    assert_eq!(
+        rep.resurrected_count, 0,
+        "STOR-D3/ID-D8-GA-face: 0 resurrected subjects"
+    );
+    assert_eq!(
+        rep.re_erased_count(),
+        1,
+        "exactly the one post-PIT subject was re-erased"
+    );
     assert!(
         rep.re_erased[0].was_resurrected_before_reapply,
         "the subject WAS resurrected by the restore, then re-killed (the re-erasure receipt)"
     );
     assert!(rep.re_erased_subject(&storage_subject, &storage_tenant()));
-    assert!(seams.is_erased(&storage_subject, &storage_tenant()), "the re-erasure re-recorded the erasure");
+    assert!(
+        seams.is_erased(&storage_subject, &storage_tenant()),
+        "the re-erasure re-recorded the erasure"
+    );
     // the resurrected DEK is gone from the restored copy.
     assert!(
         !kms.backup_snapshot().iter().any(|(d, _)| *d == subject_dek),
@@ -481,7 +570,11 @@ fn the_erasure_ledger_survives_its_own_subjects_erase_and_still_drives_re_erasur
     // Erase the subject THROUGH the recursive ledger holder (the per-tenant crypto-shred fan-out
     // would reach the ledger as a registered holder). The ledger RETAINS the record (non-shred-erasable).
     ledger.erase(subject_scope(subject_id)).unwrap();
-    assert_eq!(ledger.len(), 1, "the ledger erase RETAINED the PII-free record (non-shred-erasable)");
+    assert_eq!(
+        ledger.len(),
+        1,
+        "the ledger erase RETAINED the PII-free record (non-shred-erasable)"
+    );
 
     // The retained record STILL drives re-erasure on a restore to before the erasure.
     let seam = GdprErasureLedgerSeam { ledger: &ledger };

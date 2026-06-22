@@ -219,7 +219,10 @@ fn provider_refuses_to_start_when_the_cost_gate_is_exhausted() {
         isolation_floor: Box::new(|_s| Ok(())),
     };
     let r = provider.launch(&consumer_builds_ci_spec(), &hooks);
-    assert!(r.is_err(), "an exhausted wallet must refuse-to-start (11.7)");
+    assert!(
+        r.is_err(),
+        "an exhausted wallet must refuse-to-start (11.7)"
+    );
     assert_eq!(fired.load(Ordering::SeqCst), 0, "the job must never start");
 }
 

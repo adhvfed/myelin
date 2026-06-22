@@ -54,8 +54,11 @@ fn cdc_1_4_live_harness_opened_store_is_in_the_exhaustive_h_list() {
     // the auto-registration mechanism produced the receipts for the opened stores.
     let opened = handle.registered_holders();
     // the service declares its OLTP store's H-holder (gdpr §3.2 — the per-subsystem assignment).
-    let classifier =
-        StoreClassifier::of([StoreHolder::new(StoreKind::Oltp, "issue_oltp", Holder::H3Issues)]);
+    let classifier = StoreClassifier::of([StoreHolder::new(
+        StoreKind::Oltp,
+        "issue_oltp",
+        Holder::H3Issues,
+    )]);
 
     assert_eq!(
         assert_holder_completeness(opened, &classifier),
@@ -82,7 +85,10 @@ fn cdc_1_4_live_orphaned_store_fails_the_completeness_assertion() {
     let orphans = holder_completeness(opened, &classifier);
     assert_eq!(
         orphans,
-        vec![OrphanStore { kind: StoreKind::Oltp, name: "rogue_oltp".into() }],
+        vec![OrphanStore {
+            kind: StoreKind::Oltp,
+            name: "rogue_oltp".into()
+        }],
         "the OLTP store opened with no declared holder is the orphan"
     );
     let err = assert_holder_completeness(opened, &classifier)
@@ -104,17 +110,29 @@ fn cdc_1_4_all_four_store_kinds_classify_into_the_exhaustive_list() {
     reg.open(StoreKind::Blob, "svc_blobs");
     reg.open(StoreKind::Cache, "svc_cache");
     reg.open(StoreKind::SearchIndex, "svc_index");
-    let classifier =
-        StoreClassifier::of([StoreHolder::new(StoreKind::Oltp, "svc_oltp", Holder::H4Knowledge)]);
+    let classifier = StoreClassifier::of([StoreHolder::new(
+        StoreKind::Oltp,
+        "svc_oltp",
+        Holder::H4Knowledge,
+    )]);
 
     assert_eq!(
         assert_holder_completeness(reg.registrations(), &classifier),
         Ok(()),
         "all four §3.4 store kinds classify into the H1–H18 set — no orphan"
     );
-    assert_eq!(classify_store(StoreKind::Blob, "svc_blobs", &classifier), Some(Holder::H6BlobStore));
-    assert_eq!(classify_store(StoreKind::Cache, "svc_cache", &classifier), Some(Holder::H9Caches));
-    assert_eq!(classify_store(StoreKind::SearchIndex, "svc_index", &classifier), Some(Holder::H7SearchIndex));
+    assert_eq!(
+        classify_store(StoreKind::Blob, "svc_blobs", &classifier),
+        Some(Holder::H6BlobStore)
+    );
+    assert_eq!(
+        classify_store(StoreKind::Cache, "svc_cache", &classifier),
+        Some(Holder::H9Caches)
+    );
+    assert_eq!(
+        classify_store(StoreKind::SearchIndex, "svc_index", &classifier),
+        Some(Holder::H7SearchIndex)
+    );
 }
 
 /// **CDC 1.4 — the catalog is EXHAUSTIVE (eighteen holders, the drift guard).** The substrate
@@ -122,8 +140,17 @@ fn cdc_1_4_all_four_store_kinds_classify_into_the_exhaustive_list() {
 /// without a §3.2 co-edit is a loud failure, so the two can never silently diverge.
 #[test]
 fn cdc_1_4_catalog_is_exhaustive_eighteen() {
-    assert_eq!(Holder::ALL.len(), 18, "the §3.2 holder list is exhaustive: H1–H18");
+    assert_eq!(
+        Holder::ALL.len(),
+        18,
+        "the §3.2 holder list is exhaustive: H1–H18"
+    );
     for (i, h) in Holder::ALL.iter().enumerate() {
-        assert_eq!(h.tag(), format!("H{}", i + 1), "the catalog names H{} in order", i + 1);
+        assert_eq!(
+            h.tag(),
+            format!("H{}", i + 1),
+            "the catalog names H{} in order",
+            i + 1
+        );
     }
 }

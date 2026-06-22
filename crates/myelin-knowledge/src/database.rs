@@ -69,7 +69,9 @@ use myelin_identity::{Principal, SetExpr};
 use myelin_query::{FieldId, FieldType, FieldValue, OrderKey, Predicate, QueryAst, ViewSpec};
 use myelin_tenancy::{ArtifactRef, TenantId};
 
-use crate::list_filter::{compose_db_count_query, compose_db_view_query, BoundParam, ComposedQuery};
+use crate::list_filter::{
+    compose_db_count_query, compose_db_view_query, BoundParam, ComposedQuery,
+};
 use crate::rebac_fragment::DB_ROW_TABLE;
 
 /// The frozen `> 5%` facet-promotion threshold (contract 6.3 / OQ-C, architecture §1.2): a facet
@@ -191,7 +193,10 @@ impl FieldSchema {
 
     /// Look up a field's declared type (`None` if the schema does not declare it).
     pub fn field_type(&self, field: &FieldId) -> Option<FieldType> {
-        self.defs.iter().find(|d| &d.field_id == field).map(|d| d.field_type)
+        self.defs
+            .iter()
+            .find(|d| &d.field_id == field)
+            .map(|d| d.field_type)
     }
 
     /// **Type-check a row's property bag against the declared field types (the typed-`FieldType`
@@ -383,7 +388,11 @@ impl FilterLowerCtx<'_> {
     fn facet_access(&mut self, field: &str) -> String {
         let field_id = FieldId::new(field);
         let is_hot = self.hot_facets.iter().any(|h| h.as_str() == field);
-        let path = if is_hot { FacetPath::GeneratedColumn } else { FacetPath::GinScan };
+        let path = if is_hot {
+            FacetPath::GeneratedColumn
+        } else {
+            FacetPath::GinScan
+        };
         self.facet_paths.insert(field_id, path);
         if is_hot {
             // The measured-hot generated/expression-column index (KN-P31 provisions the column; the
@@ -482,7 +491,10 @@ fn literal_text(lit: &myelin_identity::Literal) -> String {
 /// reach the SQL string unsanitised; the literal VALUES are always bound, this guards the column
 /// IDENTIFIER). Keeps `[A-Za-z0-9_]`; anything else is dropped.
 fn sanitize_ident(field: &str) -> String {
-    field.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').collect()
+    field
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect()
 }
 
 // ───────────────────────────── the VIEW_QUERY executor (§4.1) ─────────────────────────────────────
@@ -530,7 +542,10 @@ pub struct PageBound {
 
 impl PageBound {
     /// The default page bound: 50 rows, a 5 s statement timeout (the §4.1 row-cap + timeout floor).
-    pub const DEFAULT: PageBound = PageBound { limit: 50, statement_timeout_ms: 5_000 };
+    pub const DEFAULT: PageBound = PageBound {
+        limit: 50,
+        statement_timeout_ms: 5_000,
+    };
     /// The hard maximum page size — a request for more is clamped to this (never an unbounded scan).
     pub const MAX: u32 = 500;
 
@@ -590,12 +605,19 @@ pub fn execute_view_query(
     hot_facets: &[FieldId],
     page: PageBound,
 ) -> Result<ViewQuery, ViewError> {
-    let lowered = lower_view_filter(&view.filter, hot_facets).ok_or(ViewError::FilterNotCompiled)?;
+    let lowered =
+        lower_view_filter(&view.filter, hot_facets).ok_or(ViewError::FilterNotCompiled)?;
     // The ACL composer builds the tenant + db_id scope + the lowered SetExpr ACL over `db_row.id`
     // (one query, no N+1) — we reuse it (EI-01 §7, one primitive) and SPLICE the view filter +
     // ORDER BY in, so the ACL and the view filter are conjoined into the SAME WHERE.
     let acl_query = compose_db_view_query(acl, viewer, scope_tenant, db_id);
-    let sql = splice_view_filter(&acl_query, &lowered, &order_by_clause(view), page.limit, false);
+    let sql = splice_view_filter(
+        &acl_query,
+        &lowered,
+        &order_by_clause(view),
+        page.limit,
+        false,
+    );
     let params = merge_params(acl_query.params, lowered.params);
     Ok(ViewQuery {
         sql,
@@ -619,7 +641,8 @@ pub fn execute_view_count(
     db_id: &str,
     hot_facets: &[FieldId],
 ) -> Result<ViewQuery, ViewError> {
-    let lowered = lower_view_filter(&view.filter, hot_facets).ok_or(ViewError::FilterNotCompiled)?;
+    let lowered =
+        lower_view_filter(&view.filter, hot_facets).ok_or(ViewError::FilterNotCompiled)?;
     let acl_query = compose_db_count_query(acl, viewer, scope_tenant, db_id);
     let sql = splice_view_filter(&acl_query, &lowered, "", 0, true);
     let params = merge_params(acl_query.params, lowered.params);
@@ -646,7 +669,10 @@ fn order_by_clause(view: &ViewSpec) -> String {
             };
             // A sort field reads its property-bag value (the GIN-covered path); the order_field
             // tiebreak reads the dedicated order_key column.
-            format!("{DB_ROW_TABLE}.props ->> '{}' {dir}", sanitize_ident(s.field.as_str()))
+            format!(
+                "{DB_ROW_TABLE}.props ->> '{}' {dir}",
+                sanitize_ident(s.field.as_str())
+            )
         })
         .collect();
     // The always-present last-resort tiebreak: the manual drag-order LexoRank column.
@@ -686,7 +712,10 @@ fn splice_view_filter(
 
 /// Merge the ACL composer's bound params with the view-filter's bound params (both bound, never
 /// interpolated — the merged set is what the driver binds for the one query).
-fn merge_params(mut acl_params: Vec<BoundParam>, filter_params: Vec<BoundParam>) -> Vec<BoundParam> {
+fn merge_params(
+    mut acl_params: Vec<BoundParam>,
+    filter_params: Vec<BoundParam>,
+) -> Vec<BoundParam> {
     acl_params.extend(filter_params);
     acl_params
 }
@@ -721,7 +750,9 @@ pub fn row_matches_filter(
 fn field_value_to_literal(value: &FieldValue) -> Option<myelin_identity::Literal> {
     use myelin_identity::Literal;
     Some(match value {
-        FieldValue::Text(s) | FieldValue::Date(s) | FieldValue::Select(s) => Literal::Str(s.clone()),
+        FieldValue::Text(s) | FieldValue::Date(s) | FieldValue::Select(s) => {
+            Literal::Str(s.clone())
+        }
         FieldValue::Relation(r) => Literal::Str(r.clone()),
         FieldValue::Principal(p) => Literal::Str(p.clone()),
         FieldValue::OrderKey(k) => Literal::Str(k.as_str().to_string()),
@@ -824,12 +855,15 @@ impl RelationStore {
         if exists {
             return false;
         }
-        rows.push(ScopedRelation { tenant: tenant.0.clone(), relation: relation.clone() });
+        rows.push(ScopedRelation {
+            tenant: tenant.0.clone(),
+            relation: relation.clone(),
+        });
         drop(rows);
-        self.edge_events
-            .lock()
-            .unwrap()
-            .push(RelationEdgeEvent { created: true, relation });
+        self.edge_events.lock().unwrap().push(RelationEdgeEvent {
+            created: true,
+            relation,
+        });
         true
     }
 
@@ -859,10 +893,10 @@ impl RelationStore {
         let did_remove = rows.len() != before;
         drop(rows);
         if let Some(relation) = removed {
-            self.edge_events
-                .lock()
-                .unwrap()
-                .push(RelationEdgeEvent { created: false, relation });
+            self.edge_events.lock().unwrap().push(RelationEdgeEvent {
+                created: false,
+                relation,
+            });
         }
         did_remove
     }
@@ -880,7 +914,9 @@ impl RelationStore {
             .lock()
             .unwrap()
             .iter()
-            .filter(|r| r.tenant == tenant.0 && r.relation.src_row == src_row && r.relation.rel == rel)
+            .filter(|r| {
+                r.tenant == tenant.0 && r.relation.src_row == src_row && r.relation.rel == rel
+            })
             .map(|r| r.relation.clone())
             .collect()
     }
@@ -944,7 +980,11 @@ impl FacetTelemetry {
         let c = self.counters.lock().unwrap();
         match c.get(db_id) {
             Some(counters) if counters.total > 0 => {
-                let uses = counters.facet_uses.get(facet.as_str()).copied().unwrap_or(0);
+                let uses = counters
+                    .facet_uses
+                    .get(facet.as_str())
+                    .copied()
+                    .unwrap_or(0);
                 uses as f64 / counters.total as f64
             }
             _ => 0.0,

@@ -55,12 +55,19 @@ pub enum Span {
     /// A maximal run of text under one set of marks. `text` is the raw run content with
     /// markdown escapes already resolved; `marks` is the active mark set (innermost
     /// last is irrelevant — marks are a set).
-    Text { text: String, marks: Vec<Mark>, link: Option<String> },
+    Text {
+        text: String,
+        marks: Vec<Mark>,
+        link: Option<String>,
+    },
     /// A structured node placeholder. Serializes to a single [`OBJ`] code point; the
     /// payload lives in the positional [`Inline::nodes`] array. It carries the mark/link
     /// context it sits inside (a `**￼**` mention keeps its bold), so the node is one
     /// caret position WITHIN formatted text (architecture 02 §8.2).
-    Node { marks: Vec<Mark>, link: Option<String> },
+    Node {
+        marks: Vec<Mark>,
+        link: Option<String>,
+    },
 }
 
 /// The five markdown-subset marks (§2.2). `Link` carries no data in the mark set (the
@@ -471,7 +478,11 @@ mod tests {
 
     fn rt(md: &str, nodes: &[InlineNode]) {
         let parsed = parse_inline(md, nodes);
-        assert_eq!(serialize_inline(&parsed), md, "round-trip mismatch for {md:?}");
+        assert_eq!(
+            serialize_inline(&parsed),
+            md,
+            "round-trip mismatch for {md:?}"
+        );
         assert_eq!(parsed.nodes, nodes, "node array not preserved for {md:?}");
     }
 
@@ -510,14 +521,24 @@ mod tests {
             .spans
             .iter()
             .filter_map(|s| match s {
-                Span::Text { text, link: Some(u), .. } => Some((text.clone(), u.clone())),
+                Span::Text {
+                    text,
+                    link: Some(u),
+                    ..
+                } => Some((text.clone(), u.clone())),
                 _ => None,
             })
             .collect();
         assert_eq!(link_runs, vec![("t".to_string(), "u".to_string())]);
         // the surrounding text runs carry NO link
-        assert!(p.spans.iter().any(|s| matches!(s, Span::Text { text, link: None, .. } if text == "a ")));
-        assert!(p.spans.iter().any(|s| matches!(s, Span::Text { text, link: None, .. } if text == " b")));
+        assert!(p
+            .spans
+            .iter()
+            .any(|s| matches!(s, Span::Text { text, link: None, .. } if text == "a ")));
+        assert!(p
+            .spans
+            .iter()
+            .any(|s| matches!(s, Span::Text { text, link: None, .. } if text == " b")));
     }
 
     /// Links with marks inside, escaped delimiters in the text, and escaped chars in the
@@ -526,11 +547,11 @@ mod tests {
     #[test]
     fn link_edge_cases_roundtrip() {
         rt("[**bold link**](https://x.test/p)", &[]);
-        rt(r"[a \* b](u)", &[]);          // escaped delimiter inside link text
+        rt(r"[a \* b](u)", &[]); // escaped delimiter inside link text
         rt(r"[t](https://x.test/a\)b)", &[]); // an escaped `)` inside the url
-        rt("before [t](u) after", &[]);    // link not at string start
-        rt("[t](u)", &[]);                 // link is the whole string (boundary)
-        rt("[t](path/with*star)", &[]);    // `*` in a url is verbatim, not a delimiter
+        rt("before [t](u) after", &[]); // link not at string start
+        rt("[t](u)", &[]); // link is the whole string (boundary)
+        rt("[t](path/with*star)", &[]); // `*` in a url is verbatim, not a delimiter
     }
 
     /// A `[` whose `]` runs to (or off) the end of the string is NOT a link — exercises
@@ -541,7 +562,9 @@ mod tests {
         for raw in [r"[no close", r"[trailing backslash \", r"[abc"] {
             let p = parse_inline(raw, &[]);
             assert!(
-                p.spans.iter().all(|s| matches!(s, Span::Text { link: None, .. })),
+                p.spans
+                    .iter()
+                    .all(|s| matches!(s, Span::Text { link: None, .. })),
                 "{raw:?} must not parse as a link"
             );
             // serialize is idempotent (the canonical form re-parses to the same string)
@@ -559,14 +582,20 @@ mod tests {
     fn malformed_links_fall_back_to_literal() {
         // `]` not followed by `(` → not a link; the bare `[` canonicalises to `\[`
         let p = parse_inline("[text] no paren", &[]);
-        assert!(p.spans.iter().all(|s| matches!(s, Span::Text { link: None, .. })));
+        assert!(p
+            .spans
+            .iter()
+            .all(|s| matches!(s, Span::Text { link: None, .. })));
         let canon = serialize_inline(&p);
         assert_eq!(canon, r"\[text] no paren");
         rt(&canon, &[]); // and the canonical form is a fixed point
 
         // unterminated url → not a link, the `[` is literal then canonicalises
         let p2 = parse_inline("[text](unterminated", &[]);
-        assert!(p2.spans.iter().all(|s| matches!(s, Span::Text { link: None, .. })));
+        assert!(p2
+            .spans
+            .iter()
+            .all(|s| matches!(s, Span::Text { link: None, .. })));
         assert_eq!(serialize_inline(&p2), r"\[text](unterminated");
     }
 
@@ -595,7 +624,11 @@ mod tests {
         let parsed = parse_inline(&md, &nodes);
         assert_eq!(serialize_inline(&parsed), md);
         // one OBJ ⇒ one Span::Node ⇒ binds nodes[0]
-        let node_count = parsed.spans.iter().filter(|s| matches!(s, Span::Node { .. })).count();
+        let node_count = parsed
+            .spans
+            .iter()
+            .filter(|s| matches!(s, Span::Node { .. }))
+            .count();
         assert_eq!(node_count, 1);
         assert_eq!(parsed.structured_nodes().len(), 1);
     }

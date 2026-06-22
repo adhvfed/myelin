@@ -29,9 +29,7 @@
 //!   evaluator tests below (`not_ids_deny_set_*`, `intersect_all_with_not_ids_*`, `union_admits_*`).
 
 use super::*;
-use myelin_identity::{
-    AuthzIndexRef, ObjectId, PrincipalId, PrincipalKind, RelName, SetExpr,
-};
+use myelin_identity::{AuthzIndexRef, ObjectId, PrincipalId, PrincipalKind, RelName, SetExpr};
 
 fn viewer(id: &str) -> Principal {
     Principal::stub(
@@ -74,8 +72,14 @@ fn ids_lowers_to_in_with_bound_params_over_db_row_id() {
     assert_eq!(
         l.params,
         vec![
-            BoundParam { placeholder: ":id_0".into(), value: "row:1".into() },
-            BoundParam { placeholder: ":id_1".into(), value: "row:2".into() },
+            BoundParam {
+                placeholder: ":id_0".into(),
+                value: "row:1".into()
+            },
+            BoundParam {
+                placeholder: ":id_1".into(),
+                value: "row:2".into()
+            },
         ],
         "the ids are BOUND params over the FROZEN db_row.id column, never interpolated"
     );
@@ -100,7 +104,10 @@ fn not_ids_lowers_to_not_in() {
     );
     assert_eq!(l.sql_predicate, "db_row.id NOT IN (:id_0)");
     let empty = lower_over(&SetExpr::NotIds(vec![]), &viewer("p:a"), &db_via());
-    assert_eq!(empty.sql_predicate, "TRUE", "an empty deny-set excludes nothing");
+    assert_eq!(
+        empty.sql_predicate, "TRUE",
+        "an empty deny-set excludes nothing"
+    );
 }
 
 /// **`InRelation{row_reader, db_row.id}` → the `authz_visible` JOIN keyed on `db_row.id` (§4.1
@@ -119,15 +126,30 @@ fn in_relation_row_reader_lowers_to_authz_visible_join_over_db_row_id() {
     assert_eq!(l.joins.len(), 1, "exactly one reverse-index JOIN (no N+1)");
     let j = &l.joins[0];
     assert!(
-        j.clause.contains("JOIN authz_visible av0 ON av0.object_id = db_row.id"),
+        j.clause
+            .contains("JOIN authz_visible av0 ON av0.object_id = db_row.id"),
         "the JOIN keys on the FROZEN db_row.id column: {}",
         j.clause
     );
-    assert!(j.clause.contains("av0.subject = :subject_0"), "binds the subject: {}", j.clause);
-    assert!(j.clause.contains("av0.relation = :rel_for_read"), "binds the relation: {}", j.clause);
+    assert!(
+        j.clause.contains("av0.subject = :subject_0"),
+        "binds the subject: {}",
+        j.clause
+    );
+    assert!(
+        j.clause.contains("av0.relation = :rel_for_read"),
+        "binds the relation: {}",
+        j.clause
+    );
     assert_eq!(l.sql_predicate, "av0.object_id IS NOT NULL");
-    assert!(l.params.iter().any(|p| p.placeholder == ":subject_0" && p.value == "p:alice"));
-    assert!(l.depends_on_reverse_index(), "an InRelation lowering depends on the watermark");
+    assert!(l
+        .params
+        .iter()
+        .any(|p| p.placeholder == ":subject_0" && p.value == "p:alice"));
+    assert!(
+        l.depends_on_reverse_index(),
+        "an InRelation lowering depends on the watermark"
+    );
     assert_eq!(l.filter_mode(), FilterMode::PushedDown);
 }
 
@@ -135,12 +157,16 @@ fn in_relation_row_reader_lowers_to_authz_visible_join_over_db_row_id() {
 #[test]
 fn tuple_set_lowers_to_authz_visible_join() {
     let l = lower_over(
-        &SetExpr::TupleSet { index: AuthzIndexRef("row_reader".into()) },
+        &SetExpr::TupleSet {
+            index: AuthzIndexRef("row_reader".into()),
+        },
         &viewer("p:alice"),
         &db_via(),
     );
     assert_eq!(l.joins.len(), 1);
-    assert!(l.joins[0].clause.contains("av0.relation = :rel_for_row_reader"));
+    assert!(l.joins[0]
+        .clause
+        .contains("av0.relation = :rel_for_row_reader"));
     assert!(l.depends_on_reverse_index());
 }
 
@@ -155,10 +181,16 @@ fn boolean_composition_lowers_to_or_and_and_not() {
         &viewer("p:a"),
         &db_via(),
     );
-    assert_eq!(u.sql_predicate, "(db_row.id IN (:id_0) OR db_row.id IN (:id_1))");
+    assert_eq!(
+        u.sql_predicate,
+        "(db_row.id IN (:id_0) OR db_row.id IN (:id_1))"
+    );
 
     let i = lower_over(
-        &SetExpr::Intersect(vec![SetExpr::All, SetExpr::NotIds(vec![ObjectId("row:x".into())])]),
+        &SetExpr::Intersect(vec![
+            SetExpr::All,
+            SetExpr::NotIds(vec![ObjectId("row:x".into())]),
+        ]),
         &viewer("p:a"),
         &db_via(),
     );
@@ -180,24 +212,44 @@ fn boolean_composition_lowers_to_or_and_and_not() {
 fn repeated_relation_emits_one_join_no_n_plus_1() {
     let l = lower_over(
         &SetExpr::Union(vec![
-            SetExpr::InRelation { relation: RelName("read".into()), via_column: db_via() },
-            SetExpr::InRelation { relation: RelName("read".into()), via_column: db_via() },
+            SetExpr::InRelation {
+                relation: RelName("read".into()),
+                via_column: db_via(),
+            },
+            SetExpr::InRelation {
+                relation: RelName("read".into()),
+                via_column: db_via(),
+            },
         ]),
         &viewer("p:alice"),
         &db_via(),
     );
-    assert_eq!(l.joins.len(), 1, "the same (viewer, relation) JOIN is emitted once — no N+1");
-    assert_eq!(l.sql_predicate, "(av0.object_id IS NOT NULL OR av0.object_id IS NOT NULL)");
+    assert_eq!(
+        l.joins.len(),
+        1,
+        "the same (viewer, relation) JOIN is emitted once — no N+1"
+    );
+    assert_eq!(
+        l.sql_predicate,
+        "(av0.object_id IS NOT NULL OR av0.object_id IS NOT NULL)"
+    );
 }
 
 /// **The page-tree list lowers over `page.id`** (the §5 inherited-with-overrides node).
 #[test]
 fn page_list_lowers_over_page_id() {
     let l = lower_over_page_id(
-        &SetExpr::InRelation { relation: RelName("read".into()), via_column: page_id_colref() },
+        &SetExpr::InRelation {
+            relation: RelName("read".into()),
+            via_column: page_id_colref(),
+        },
         &viewer("p:a"),
     );
-    assert!(l.joins[0].clause.contains("av0.object_id = page.id"), "{}", l.joins[0].clause);
+    assert!(
+        l.joins[0].clause.contains("av0.object_id = page.id"),
+        "{}",
+        l.joins[0].clause
+    );
 }
 
 // ───────────────────────────── the composed ONE query (view + COUNT) ──────────────────────────────
@@ -207,22 +259,52 @@ fn page_list_lowers_over_page_id() {
 #[test]
 fn view_query_is_one_statement_acl_pre_filtered_tenant_and_db_confined() {
     let q = compose_db_view_query(
-        &SetExpr::InRelation { relation: RelName("read".into()), via_column: db_via() },
+        &SetExpr::InRelation {
+            relation: RelName("read".into()),
+            via_column: db_via(),
+        },
         &viewer("p:alice"),
         &TenantId("acme".into()),
         "db:projects",
     );
-    assert_eq!(q.statement_count(), 1, "ONE query (no N+1, no post-filter second pass)");
-    assert!(q.sql.contains("JOIN authz_visible av0 ON av0.object_id = db_row.id"), "{}", q.sql);
+    assert_eq!(
+        q.statement_count(),
+        1,
+        "ONE query (no N+1, no post-filter second pass)"
+    );
+    assert!(
+        q.sql
+            .contains("JOIN authz_visible av0 ON av0.object_id = db_row.id"),
+        "{}",
+        q.sql
+    );
     // The tenant + db_id predicates are ALWAYS present (the lints) and the ACL is BEFORE ORDER BY.
-    assert!(q.sql.contains("db_row.tenant = :tenant"), "tenant predicate present: {}", q.sql);
-    assert!(q.sql.contains("db_row.db_id = :db_id"), "db_id (no-cross-db) predicate present: {}", q.sql);
+    assert!(
+        q.sql.contains("db_row.tenant = :tenant"),
+        "tenant predicate present: {}",
+        q.sql
+    );
+    assert!(
+        q.sql.contains("db_row.db_id = :db_id"),
+        "db_id (no-cross-db) predicate present: {}",
+        q.sql
+    );
     let acl_pos = q.sql.find("av0.object_id IS NOT NULL").unwrap();
     let order_pos = q.sql.find("ORDER BY").unwrap();
-    assert!(acl_pos < order_pos, "the ACL is conjoined BEFORE ORDER BY/LIMIT — pre-filter: {}", q.sql);
+    assert!(
+        acl_pos < order_pos,
+        "the ACL is conjoined BEFORE ORDER BY/LIMIT — pre-filter: {}",
+        q.sql
+    );
     assert!(!q.is_count);
-    assert!(q.params.iter().any(|p| p.placeholder == ":tenant" && p.value == "acme"));
-    assert!(q.params.iter().any(|p| p.placeholder == ":db_id" && p.value == "db:projects"));
+    assert!(q
+        .params
+        .iter()
+        .any(|p| p.placeholder == ":tenant" && p.value == "acme"));
+    assert!(q
+        .params
+        .iter()
+        .any(|p| p.placeholder == ":db_id" && p.value == "db:projects"));
 }
 
 /// **The COUNT query conjoins the ACL INSIDE the aggregate (the KN-D5 count-leak-closed shape).** The
@@ -230,18 +312,38 @@ fn view_query_is_one_statement_acl_pre_filtered_tenant_and_db_confined() {
 #[test]
 fn count_query_conjoins_acl_inside_the_aggregate() {
     let q = compose_db_count_query(
-        &SetExpr::InRelation { relation: RelName("read".into()), via_column: db_via() },
+        &SetExpr::InRelation {
+            relation: RelName("read".into()),
+            via_column: db_via(),
+        },
         &viewer("p:alice"),
         &TenantId("acme".into()),
         "db:projects",
     );
     assert_eq!(q.statement_count(), 1);
     assert!(q.is_count);
-    assert!(q.sql.starts_with("SELECT COUNT(*) FROM db_row"), "an aggregate COUNT: {}", q.sql);
+    assert!(
+        q.sql.starts_with("SELECT COUNT(*) FROM db_row"),
+        "an aggregate COUNT: {}",
+        q.sql
+    );
     // The ACL JOIN + predicate are INSIDE the COUNT query (the count-leak is closed by construction).
-    assert!(q.sql.contains("JOIN authz_visible av0 ON av0.object_id = db_row.id"), "{}", q.sql);
-    assert!(q.sql.contains("AND (av0.object_id IS NOT NULL)"), "the ACL is conjoined into the COUNT: {}", q.sql);
-    assert!(!q.sql.contains("ORDER BY"), "a COUNT has no ORDER BY/LIMIT: {}", q.sql);
+    assert!(
+        q.sql
+            .contains("JOIN authz_visible av0 ON av0.object_id = db_row.id"),
+        "{}",
+        q.sql
+    );
+    assert!(
+        q.sql.contains("AND (av0.object_id IS NOT NULL)"),
+        "the ACL is conjoined into the COUNT: {}",
+        q.sql
+    );
+    assert!(
+        !q.sql.contains("ORDER BY"),
+        "a COUNT has no ORDER BY/LIMIT: {}",
+        q.sql
+    );
 }
 
 // ───────────────────────────── the in-memory leak / COUNT proof (KN-D5 nucleus) ───────────────────
@@ -255,11 +357,39 @@ fn region() -> Region {
 fn row_restricted_scenario() -> (AuthzVisibleIndex, Vec<&'static str>) {
     let idx = AuthzVisibleIndex::new();
     let candidates = vec!["row:1", "row:2", "row:secret", "row:3"];
-    idx.grant(&TenantId("acme".into()), &region(), "p:viewer", "read", "row:1", "zk-0000000001");
-    idx.grant(&TenantId("acme".into()), &region(), "p:viewer", "read", "row:2", "zk-0000000002");
+    idx.grant(
+        &TenantId("acme".into()),
+        &region(),
+        "p:viewer",
+        "read",
+        "row:1",
+        "zk-0000000001",
+    );
+    idx.grant(
+        &TenantId("acme".into()),
+        &region(),
+        "p:viewer",
+        "read",
+        "row:2",
+        "zk-0000000002",
+    );
     // row:secret + row:3 are granted to OTHER subjects (the leak witnesses).
-    idx.grant(&TenantId("acme".into()), &region(), "p:other", "read", "row:secret", "zk-0000000003");
-    idx.grant(&TenantId("acme".into()), &region(), "p:other", "read", "row:3", "zk-0000000004");
+    idx.grant(
+        &TenantId("acme".into()),
+        &region(),
+        "p:other",
+        "read",
+        "row:secret",
+        "zk-0000000003",
+    );
+    idx.grant(
+        &TenantId("acme".into()),
+        &region(),
+        "p:other",
+        "read",
+        "row:3",
+        "zk-0000000004",
+    );
     (idx, candidates)
 }
 
@@ -271,17 +401,46 @@ fn kn_d5_row_restricted_view_and_count_zero_leak_zero_count_leak() {
     let (idx, candidates) = row_restricted_scenario();
     let v = viewer("p:viewer");
     let lowered = lower_over_db_row_id(
-        &SetExpr::InRelation { relation: RelName("read".into()), via_column: db_via() },
+        &SetExpr::InRelation {
+            relation: RelName("read".into()),
+            via_column: db_via(),
+        },
         &v,
     );
 
-    let visible = idx.evaluate(&TenantId("acme".into()), &region(), &v, &lowered, &candidates);
-    assert_eq!(visible, vec!["row:1".to_string(), "row:2".to_string()], "0 leak: only the granted rows");
-    assert!(!visible.iter().any(|r| r == "row:secret"), "the confidential row is ABSENT");
+    let visible = idx.evaluate(
+        &TenantId("acme".into()),
+        &region(),
+        &v,
+        &lowered,
+        &candidates,
+    );
+    assert_eq!(
+        visible,
+        vec!["row:1".to_string(), "row:2".to_string()],
+        "0 leak: only the granted rows"
+    );
+    assert!(
+        !visible.iter().any(|r| r == "row:secret"),
+        "the confidential row is ABSENT"
+    );
 
-    let count = idx.count_visible(&TenantId("acme".into()), &region(), &v, &lowered, &candidates);
-    assert_eq!(count, 2, "0 count-leak: the COUNT is 2 (the granted rows), NOT 4 — the hidden rows are uncounted");
-    assert_eq!(count, visible.len(), "the COUNT equals the listed cardinality — no second path can diverge");
+    let count = idx.count_visible(
+        &TenantId("acme".into()),
+        &region(),
+        &v,
+        &lowered,
+        &candidates,
+    );
+    assert_eq!(
+        count, 2,
+        "0 count-leak: the COUNT is 2 (the granted rows), NOT 4 — the hidden rows are uncounted"
+    );
+    assert_eq!(
+        count,
+        visible.len(),
+        "the COUNT equals the listed cardinality — no second path can diverge"
+    );
 }
 
 /// **An unauthorized viewer (no grants) sees an EMPTY view and a COUNT of 0** — `InRelation` with no
@@ -291,12 +450,30 @@ fn unauthorized_viewer_sees_nothing_and_counts_zero() {
     let (idx, candidates) = row_restricted_scenario();
     let stranger = viewer("p:stranger");
     let lowered = lower_over_db_row_id(
-        &SetExpr::InRelation { relation: RelName("read".into()), via_column: db_via() },
+        &SetExpr::InRelation {
+            relation: RelName("read".into()),
+            via_column: db_via(),
+        },
         &stranger,
     );
-    let visible = idx.evaluate(&TenantId("acme".into()), &region(), &stranger, &lowered, &candidates);
-    assert!(visible.is_empty(), "an ungranted viewer sees no rows: {visible:?}");
-    let count = idx.count_visible(&TenantId("acme".into()), &region(), &stranger, &lowered, &candidates);
+    let visible = idx.evaluate(
+        &TenantId("acme".into()),
+        &region(),
+        &stranger,
+        &lowered,
+        &candidates,
+    );
+    assert!(
+        visible.is_empty(),
+        "an ungranted viewer sees no rows: {visible:?}"
+    );
+    let count = idx.count_visible(
+        &TenantId("acme".into()),
+        &region(),
+        &stranger,
+        &lowered,
+        &candidates,
+    );
     assert_eq!(count, 0, "0 count-leak: an ungranted viewer counts 0");
 }
 
@@ -308,8 +485,25 @@ fn none_deny_set_empties_view_and_count() {
     let v = viewer("p:viewer");
     let lowered = lower_over_db_row_id(&SetExpr::None, &v);
     assert_eq!(lowered.sql_predicate, "FALSE");
-    assert!(idx.evaluate(&TenantId("acme".into()), &region(), &v, &lowered, &candidates).is_empty());
-    assert_eq!(idx.count_visible(&TenantId("acme".into()), &region(), &v, &lowered, &candidates), 0);
+    assert!(idx
+        .evaluate(
+            &TenantId("acme".into()),
+            &region(),
+            &v,
+            &lowered,
+            &candidates
+        )
+        .is_empty());
+    assert_eq!(
+        idx.count_visible(
+            &TenantId("acme".into()),
+            &region(),
+            &v,
+            &lowered,
+            &candidates
+        ),
+        0
+    );
 }
 
 /// **`Ids` allow-set: exactly the inlined rows survive (view + COUNT).** The materialised path.
@@ -321,10 +515,33 @@ fn ids_allow_set_admits_exactly_those_rows() {
         &SetExpr::Ids(vec![ObjectId("row:2".into()), ObjectId("row:3".into())]),
         &v,
     );
-    let visible = idx.evaluate(&TenantId("acme".into()), &region(), &v, &lowered, &candidates);
-    assert_eq!(visible, vec!["row:2".to_string(), "row:3".to_string()], "exactly the allow-set");
-    assert_eq!(idx.count_visible(&TenantId("acme".into()), &region(), &v, &lowered, &candidates), 2);
-    assert_eq!(lowered.filter_mode(), FilterMode::Ids, "a materialised Ids set is the Ids mode");
+    let visible = idx.evaluate(
+        &TenantId("acme".into()),
+        &region(),
+        &v,
+        &lowered,
+        &candidates,
+    );
+    assert_eq!(
+        visible,
+        vec!["row:2".to_string(), "row:3".to_string()],
+        "exactly the allow-set"
+    );
+    assert_eq!(
+        idx.count_visible(
+            &TenantId("acme".into()),
+            &region(),
+            &v,
+            &lowered,
+            &candidates
+        ),
+        2
+    );
+    assert_eq!(
+        lowered.filter_mode(),
+        FilterMode::Ids,
+        "a materialised Ids set is the Ids mode"
+    );
 }
 
 /// **`Difference(All, Ids[secret])`: the otherwise-visible space MINUS an explicit deny — the secret
@@ -340,10 +557,28 @@ fn difference_excludes_the_overridden_row_from_view_and_count() {
         ),
         &v,
     );
-    let visible = idx.evaluate(&TenantId("acme".into()), &region(), &v, &lowered, &candidates);
-    assert!(!visible.iter().any(|r| r == "row:secret"), "the overridden row is excluded: {visible:?}");
+    let visible = idx.evaluate(
+        &TenantId("acme".into()),
+        &region(),
+        &v,
+        &lowered,
+        &candidates,
+    );
+    assert!(
+        !visible.iter().any(|r| r == "row:secret"),
+        "the overridden row is excluded: {visible:?}"
+    );
     assert_eq!(visible.len(), 3, "All minus the one denied row");
-    assert_eq!(idx.count_visible(&TenantId("acme".into()), &region(), &v, &lowered, &candidates), 3);
+    assert_eq!(
+        idx.count_visible(
+            &TenantId("acme".into()),
+            &region(),
+            &v,
+            &lowered,
+            &candidates
+        ),
+        3
+    );
 }
 
 /// **`NotIds` deny-set evaluated through the in-memory model: exactly the NON-denied candidates
@@ -358,18 +593,39 @@ fn not_ids_deny_set_excludes_exactly_the_denied_rows_view_and_count() {
     // Deny row:secret + row:3 directly via a NOT IN leaf (the otherwise-visible space is All-modelled
     // by the candidate universe here — NotIds alone evaluates membership of the deny-set per row).
     let lowered = lower_over_db_row_id(
-        &SetExpr::NotIds(vec![ObjectId("row:secret".into()), ObjectId("row:3".into())]),
+        &SetExpr::NotIds(vec![
+            ObjectId("row:secret".into()),
+            ObjectId("row:3".into()),
+        ]),
         &v,
     );
     assert_eq!(lowered.sql_predicate, "db_row.id NOT IN (:id_0, :id_1)");
-    let visible = idx.evaluate(&TenantId("acme".into()), &region(), &v, &lowered, &candidates);
+    let visible = idx.evaluate(
+        &TenantId("acme".into()),
+        &region(),
+        &v,
+        &lowered,
+        &candidates,
+    );
     assert_eq!(
         visible,
         vec!["row:1".to_string(), "row:2".to_string()],
         "exactly the NON-denied rows survive the NOT IN leaf (a flipped membership would leak row:secret)"
     );
-    assert!(!visible.iter().any(|r| r == "row:secret"), "the explicitly-denied row never survives NOT IN");
-    assert_eq!(idx.count_visible(&TenantId("acme".into()), &region(), &v, &lowered, &candidates), 2);
+    assert!(
+        !visible.iter().any(|r| r == "row:secret"),
+        "the explicitly-denied row never survives NOT IN"
+    );
+    assert_eq!(
+        idx.count_visible(
+            &TenantId("acme".into()),
+            &region(),
+            &v,
+            &lowered,
+            &candidates
+        ),
+        2
+    );
 }
 
 /// **`Intersect(All, NotIds[secret])` through the model: the `AND` composition denies the secret row
@@ -387,10 +643,28 @@ fn intersect_all_with_not_ids_denies_and_counts_correctly() {
         &v,
     );
     assert_eq!(lowered.sql_predicate, "(TRUE AND db_row.id NOT IN (:id_0))");
-    let visible = idx.evaluate(&TenantId("acme".into()), &region(), &v, &lowered, &candidates);
-    assert!(!visible.iter().any(|r| r == "row:secret"), "the AND-denied row is excluded: {visible:?}");
+    let visible = idx.evaluate(
+        &TenantId("acme".into()),
+        &region(),
+        &v,
+        &lowered,
+        &candidates,
+    );
+    assert!(
+        !visible.iter().any(|r| r == "row:secret"),
+        "the AND-denied row is excluded: {visible:?}"
+    );
     assert_eq!(visible.len(), 3, "All AND NOT secret = 3 rows");
-    assert_eq!(idx.count_visible(&TenantId("acme".into()), &region(), &v, &lowered, &candidates), 3);
+    assert_eq!(
+        idx.count_visible(
+            &TenantId("acme".into()),
+            &region(),
+            &v,
+            &lowered,
+            &candidates
+        ),
+        3
+    );
 }
 
 /// **`Union(Ids[1], Ids[3])` through the model: the `OR` composition admits EITHER set (view +
@@ -408,14 +682,32 @@ fn union_admits_either_id_set_view_and_count() {
         ]),
         &v,
     );
-    assert_eq!(lowered.sql_predicate, "(db_row.id IN (:id_0) OR db_row.id IN (:id_1))");
-    let visible = idx.evaluate(&TenantId("acme".into()), &region(), &v, &lowered, &candidates);
+    assert_eq!(
+        lowered.sql_predicate,
+        "(db_row.id IN (:id_0) OR db_row.id IN (:id_1))"
+    );
+    let visible = idx.evaluate(
+        &TenantId("acme".into()),
+        &region(),
+        &v,
+        &lowered,
+        &candidates,
+    );
     assert_eq!(
         visible,
         vec!["row:1".to_string(), "row:3".to_string()],
         "the union admits EITHER set (a `|| -> &&` mutation would wrongly intersect to the empty set)"
     );
-    assert_eq!(idx.count_visible(&TenantId("acme".into()), &region(), &v, &lowered, &candidates), 2);
+    assert_eq!(
+        idx.count_visible(
+            &TenantId("acme".into()),
+            &region(),
+            &v,
+            &lowered,
+            &candidates
+        ),
+        2
+    );
 }
 
 /// **`statement_count()` is exactly 1 for a JOIN-bearing composed query (not a hardcoded return).**
@@ -425,7 +717,10 @@ fn union_admits_either_id_set_view_and_count() {
 #[test]
 fn statement_count_is_a_real_count_not_a_constant() {
     let one = compose_db_view_query(
-        &SetExpr::InRelation { relation: RelName("read".into()), via_column: db_via() },
+        &SetExpr::InRelation {
+            relation: RelName("read".into()),
+            via_column: db_via(),
+        },
         &viewer("p:a"),
         &TenantId("acme".into()),
         "db:projects",
@@ -439,7 +734,11 @@ fn statement_count_is_a_real_count_not_a_constant() {
         filter_mode: FilterMode::Ids,
         is_count: false,
     };
-    assert_eq!(two.statement_count(), 2, "statement_count is a real `;`-split count, never a constant 1");
+    assert_eq!(
+        two.statement_count(),
+        2,
+        "statement_count is a real `;`-split count, never a constant 1"
+    );
 }
 
 // ───────────────────────────── the read-your-writes / new-enemy watermark ─────────────────────────
@@ -452,20 +751,55 @@ fn just_revoked_grant_drops_from_view_and_count_read_your_writes() {
     let (idx, candidates) = row_restricted_scenario();
     let v = viewer("p:viewer");
     let lowered = lower_over_db_row_id(
-        &SetExpr::InRelation { relation: RelName("read".into()), via_column: db_via() },
+        &SetExpr::InRelation {
+            relation: RelName("read".into()),
+            via_column: db_via(),
+        },
         &v,
     );
     // Before: rows 1+2 visible, count 2.
-    assert_eq!(idx.count_visible(&TenantId("acme".into()), &region(), &v, &lowered, &candidates), 2);
+    assert_eq!(
+        idx.count_visible(
+            &TenantId("acme".into()),
+            &region(),
+            &v,
+            &lowered,
+            &candidates
+        ),
+        2
+    );
 
     // Revoke row:1 (a knowledge.access.* change writes tuples; the reverse index projects it,
     // advancing the watermark — the page.acl_zookie the read carries is at-or-after this revision).
-    idx.revoke(&TenantId("acme".into()), &region(), "p:viewer", "read", "row:1", "zk-0000000099");
+    idx.revoke(
+        &TenantId("acme".into()),
+        &region(),
+        "p:viewer",
+        "read",
+        "row:1",
+        "zk-0000000099",
+    );
 
-    let after = idx.evaluate(&TenantId("acme".into()), &region(), &v, &lowered, &candidates);
-    assert_eq!(after, vec!["row:2".to_string()], "the just-revoked row:1 is gone (read-your-writes)");
+    let after = idx.evaluate(
+        &TenantId("acme".into()),
+        &region(),
+        &v,
+        &lowered,
+        &candidates,
+    );
     assert_eq!(
-        idx.count_visible(&TenantId("acme".into()), &region(), &v, &lowered, &candidates),
+        after,
+        vec!["row:2".to_string()],
+        "the just-revoked row:1 is gone (read-your-writes)"
+    );
+    assert_eq!(
+        idx.count_visible(
+            &TenantId("acme".into()),
+            &region(),
+            &v,
+            &lowered,
+            &candidates
+        ),
         1,
         "the COUNT decremented — a revoked grant cannot be counted stale"
     );
@@ -478,11 +812,23 @@ fn watermark_serves_at_or_after_else_behind() {
     let idx = AuthzVisibleIndex::new();
     idx.advance_watermark(&TenantId("acme".into()), &region(), "zk-0000000005");
     // A read requiring rev 3 (<= 5) → the JOIN serves.
-    assert!(idx.serves(&TenantId("acme".into()), &region(), &Zookie("zk-0000000003".into())));
+    assert!(idx.serves(
+        &TenantId("acme".into()),
+        &region(),
+        &Zookie("zk-0000000003".into())
+    ));
     // Exactly rev 5 → still serves (at-or-after is inclusive).
-    assert!(idx.serves(&TenantId("acme".into()), &region(), &Zookie("zk-0000000005".into())));
+    assert!(idx.serves(
+        &TenantId("acme".into()),
+        &region(),
+        &Zookie("zk-0000000005".into())
+    ));
     // Rev 7 (> 5) → behind → do NOT serve (fall back to per-row check).
-    assert!(!idx.serves(&TenantId("acme".into()), &region(), &Zookie("zk-0000000007".into())));
+    assert!(!idx.serves(
+        &TenantId("acme".into()),
+        &region(),
+        &Zookie("zk-0000000007".into())
+    ));
     // No pinned revision → always serves (default-consistency, no freshness floor).
     assert!(idx.serves(&TenantId("acme".into()), &region(), &Zookie(String::new())));
 }
@@ -493,9 +839,15 @@ fn watermark_is_monotone_stale_never_regresses() {
     let idx = AuthzVisibleIndex::new();
     idx.advance_watermark(&TenantId("acme".into()), &region(), "zk-0000000005");
     idx.advance_watermark(&TenantId("acme".into()), &region(), "zk-0000000002"); // stale — ignored
-    assert_eq!(idx.watermark(&TenantId("acme".into()), &region()), Zookie("zk-0000000005".into()));
+    assert_eq!(
+        idx.watermark(&TenantId("acme".into()), &region()),
+        Zookie("zk-0000000005".into())
+    );
     idx.advance_watermark(&TenantId("acme".into()), &region(), "zk-0000000009"); // newer — advances
-    assert_eq!(idx.watermark(&TenantId("acme".into()), &region()), Zookie("zk-0000000009".into()));
+    assert_eq!(
+        idx.watermark(&TenantId("acme".into()), &region()),
+        Zookie("zk-0000000009".into())
+    );
 }
 
 /// **Tenant isolation: a viewer's grant in tenant acme is INVISIBLE under tenant evilcorp** (no
@@ -505,11 +857,29 @@ fn tenant_isolation_no_cross_tenant_read() {
     let (idx, candidates) = row_restricted_scenario();
     let v = viewer("p:viewer");
     let lowered = lower_over_db_row_id(
-        &SetExpr::InRelation { relation: RelName("read".into()), via_column: db_via() },
+        &SetExpr::InRelation {
+            relation: RelName("read".into()),
+            via_column: db_via(),
+        },
         &v,
     );
     // The viewer's acme grants do NOT carry over to evilcorp — 0 rows, 0 count.
-    let cross = idx.evaluate(&TenantId("evilcorp".into()), &region(), &v, &lowered, &candidates);
+    let cross = idx.evaluate(
+        &TenantId("evilcorp".into()),
+        &region(),
+        &v,
+        &lowered,
+        &candidates,
+    );
     assert!(cross.is_empty(), "no cross-tenant read: {cross:?}");
-    assert_eq!(idx.count_visible(&TenantId("evilcorp".into()), &region(), &v, &lowered, &candidates), 0);
+    assert_eq!(
+        idx.count_visible(
+            &TenantId("evilcorp".into()),
+            &region(),
+            &v,
+            &lowered,
+            &candidates
+        ),
+        0
+    );
 }

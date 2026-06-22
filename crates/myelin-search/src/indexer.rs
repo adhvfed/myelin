@@ -284,7 +284,10 @@ impl MockEmbeddingAdapter {
     /// A mock adapter pinned to an explicit `model_ref` (so a test can prove a model SWAP changes the
     /// pinned ref — a different ref triggers a re-embed reindex, never a silent mixed-model index).
     pub fn with_model(model_ref: impl Into<ModelRef>, dim: usize) -> MockEmbeddingAdapter {
-        MockEmbeddingAdapter { model_ref: model_ref.into(), dim: dim.max(1) }
+        MockEmbeddingAdapter {
+            model_ref: model_ref.into(),
+            dim: dim.max(1),
+        }
     }
 }
 
@@ -341,7 +344,10 @@ type HashMapBackends = std::collections::HashMap<PartKey, TantivyBackend>;
 
 impl IndexRegistry {
     fn new(facets: BTreeMap<String, FieldType>) -> IndexRegistry {
-        IndexRegistry { indices: Mutex::new(std::collections::HashMap::new()), facets }
+        IndexRegistry {
+            indices: Mutex::new(std::collections::HashMap::new()),
+            facets,
+        }
     }
 
     /// Run `f` over the per-tenant backend for `(tenant, region)`, opening it on first use. Tenant-first
@@ -352,7 +358,10 @@ impl IndexRegistry {
         region: &Region,
         f: impl FnOnce(&mut TantivyBackend) -> Result<T, crate::engine::IndexError>,
     ) -> Result<T, crate::engine::IndexError> {
-        let pk = PartKey { tenant: tenant.clone(), region: region.clone() };
+        let pk = PartKey {
+            tenant: tenant.clone(),
+            region: region.clone(),
+        };
         let mut guard = self.indices.lock().unwrap_or_else(|e| e.into_inner());
         if !guard.contains_key(&pk) {
             let be = TantivyBackend::open(&self.facets)?;
@@ -364,7 +373,10 @@ impl IndexRegistry {
 
     /// The live doc count in the `(tenant, region)` index (the freshness/idempotency check reads this).
     fn live_count(&self, tenant: &TenantId, region: &Region) -> u64 {
-        let pk = PartKey { tenant: tenant.clone(), region: region.clone() };
+        let pk = PartKey {
+            tenant: tenant.clone(),
+            region: region.clone(),
+        };
         let mut guard = self.indices.lock().unwrap_or_else(|e| e.into_inner());
         match guard.get_mut(&pk) {
             Some(be) => be.snapshot().unwrap_or(0),
@@ -381,7 +393,10 @@ impl IndexRegistry {
         region: &Region,
         matcher: &crate::engine::SubjectMatcher,
     ) -> Vec<String> {
-        let pk = PartKey { tenant: tenant.clone(), region: region.clone() };
+        let pk = PartKey {
+            tenant: tenant.clone(),
+            region: region.clone(),
+        };
         let guard = self.indices.lock().unwrap_or_else(|e| e.into_inner());
         match guard.get(&pk) {
             Some(be) => be.locate_subject(matcher),
@@ -394,7 +409,10 @@ impl IndexRegistry {
     /// tombstoned embedding (0 orphan embedding survives) and merges the Tantivy segments. An absent
     /// partition is a no-op. Tenant-first.
     fn compact(&self, tenant: &TenantId, region: &Region) -> Result<(), crate::engine::IndexError> {
-        let pk = PartKey { tenant: tenant.clone(), region: region.clone() };
+        let pk = PartKey {
+            tenant: tenant.clone(),
+            region: region.clone(),
+        };
         let mut guard = self.indices.lock().unwrap_or_else(|e| e.into_inner());
         match guard.get_mut(&pk) {
             Some(be) => be.merge(),
@@ -409,7 +427,10 @@ impl IndexRegistry {
     /// after which the ONLY way docs re-enter is the live [`with_backend`] upsert the indexer drives from
     /// the bus re-emit. An absent partition is a no-op. Tenant-first (no cross-tenant handle).
     fn wipe(&self, tenant: &TenantId, region: &Region) {
-        let pk = PartKey { tenant: tenant.clone(), region: region.clone() };
+        let pk = PartKey {
+            tenant: tenant.clone(),
+            region: region.clone(),
+        };
         let mut guard = self.indices.lock().unwrap_or_else(|e| e.into_inner());
         guard.remove(&pk);
     }
@@ -417,7 +438,10 @@ impl IndexRegistry {
     /// Whether the `(tenant, region)` index has ANY orphan (tombstoned-until-compact) embedding — the
     /// 0-orphan-after-compact GATE reads this. An absent partition has none.
     fn has_orphan_embedding(&self, tenant: &TenantId, region: &Region) -> bool {
-        let pk = PartKey { tenant: tenant.clone(), region: region.clone() };
+        let pk = PartKey {
+            tenant: tenant.clone(),
+            region: region.clone(),
+        };
         let guard = self.indices.lock().unwrap_or_else(|e| e.into_inner());
         match guard.get(&pk) {
             Some(be) => be.vectors().has_orphan_embedding(),
@@ -521,8 +545,9 @@ impl IncrementalIndexer {
         text_query: &str,
         limit: usize,
     ) -> Result<Vec<crate::engine::Hit>, crate::engine::IndexError> {
-        self.registry
-            .with_backend(tenant, region, |be| be.search(acl_filter, text_query, limit))
+        self.registry.with_backend(tenant, region, |be| {
+            be.search(acl_filter, text_query, limit)
+        })
     }
 
     /// **Search the `(tenant, region)` structured/columnar shape on a typed facet equality, ACL-filtered
@@ -544,8 +569,9 @@ impl IncrementalIndexer {
         limit: usize,
     ) -> Result<Vec<crate::engine::Hit>, crate::engine::IndexError> {
         use crate::engine::IndexBackend;
-        self.registry
-            .with_backend(tenant, region, |be| be.search_structured(acl_filter, field, value, limit))
+        self.registry.with_backend(tenant, region, |be| {
+            be.search_structured(acl_filter, field, value, limit)
+        })
     }
 
     /// **Semantic (vector) k-NN over the `(tenant, region)` co-located HNSW shape, ACL-filtered.** The
@@ -595,7 +621,11 @@ impl IncrementalIndexer {
     /// **Compact the `(tenant, region)` index (§3.3) — physically remove every tombstoned embedding
     /// (0 orphan after compact) + merge segments.** The erase path calls this after the `*.erased`
     /// purge soft-deletes the affected docs' vectors. Tenant-first.
-    pub fn compact(&self, tenant: &TenantId, region: &Region) -> Result<(), crate::engine::IndexError> {
+    pub fn compact(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+    ) -> Result<(), crate::engine::IndexError> {
         self.registry.compact(tenant, region)
     }
 
@@ -683,7 +713,10 @@ impl IncrementalIndexer {
     fn apply_upsert(&self, ev: &EventEnvelope) -> Result<(), IndexEventError> {
         let ref_ = &ev.subject;
         let (subsystem, type_) = Self::subsystem_type_of(ref_).ok_or_else(|| {
-            IndexEventError::Malformed(format!("event subject `{}` is not a myelin:// artifact ref", ref_.0))
+            IndexEventError::Malformed(format!(
+                "event subject `{}` is not a myelin:// artifact ref",
+                ref_.0
+            ))
         })?;
 
         // The IndexSpec for (subsystem, type) — a type with no registered spec is a NO-OP (Search does
@@ -700,7 +733,9 @@ impl IncrementalIndexer {
         // hiccup is RETRYABLE (0 lost); a GONE artifact is a clean removal.
         let projection = match self.fetcher.project(&ev.tenant, &ev.region, ref_) {
             Ok(p) => p,
-            Err(ProjectFetchError::Unavailable(why)) => return Err(IndexEventError::Transient(why)),
+            Err(ProjectFetchError::Unavailable(why)) => {
+                return Err(IndexEventError::Transient(why))
+            }
             Err(ProjectFetchError::Gone) => {
                 // The artifact no longer projects (deleted/erased at the owner) → remove its doc.
                 return self.remove_doc(&ev.tenant, &ev.region, &ref_.0);
@@ -712,14 +747,16 @@ impl IncrementalIndexer {
         // index-time detector ([`Self::detect_lang`]) selects the field-language. The `lang` TAG is
         // carried as the `lang` index-doc field (stored alongside the staleness anchor) so the
         // query-time path selects the IDENTICAL chain — the no-analyzer-mismatch-miss parity invariant.
-        let lang = projection.lang.clone().unwrap_or_else(|| Self::detect_lang(&projection.text));
+        let lang = projection
+            .lang
+            .clone()
+            .unwrap_or_else(|| Self::detect_lang(&projection.text));
         // Run the ONE chain over the body at index time (the analyzed term set is what a query-time
         // analysis of the SAME language must match — proven in `crate::analysis`'s parity gate). The
         // analyzed terms inform the inverted shape; the Tantivy `TEXT` field carries the body so the
         // round-trip + re-stamp path (§4.1 tail) keeps it. (The custom-tokenizer engine registration is
         // the downstream integration; the analyzer SEMANTICS — the load-bearing correctness — are here.)
-        let _analyzed_terms =
-            crate::analysis::Analyzer::for_tag(&lang).analyze(&projection.text);
+        let _analyzed_terms = crate::analysis::Analyzer::for_tag(&lang).analyze(&projection.text);
 
         // Build the IndexDocument (§3.1): doc_id = the ArtifactRef key (sub-precise), acl_object = the
         // #sub-stripped parent (the ACL pre-filter key, §3.1). For a sub-artifact doc (a `#sub`-anchored
@@ -767,7 +804,9 @@ impl IncrementalIndexer {
         // Upsert S1/S2 atomically per doc_id (idempotent on doc_id — a replay/redelivery is one doc).
         // The indexed_zookie/version stamp rides the engine's stored fields.
         self.registry
-            .with_backend(&ev.tenant, &ev.region, |be| be.upsert_stamped(&doc, &zookie, version))
+            .with_backend(&ev.tenant, &ev.region, |be| {
+                be.upsert_stamped(&doc, &zookie, version)
+            })
             .map_err(|e| IndexEventError::Engine(e.to_string()))
     }
 
@@ -778,7 +817,12 @@ impl IncrementalIndexer {
         self.remove_doc(&ev.tenant, &ev.region, &doc_id)
     }
 
-    fn remove_doc(&self, tenant: &TenantId, region: &Region, doc_id: &str) -> Result<(), IndexEventError> {
+    fn remove_doc(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+        doc_id: &str,
+    ) -> Result<(), IndexEventError> {
         self.registry
             .with_backend(tenant, region, |be| be.delete(doc_id))
             .map_err(|e| IndexEventError::Engine(e.to_string()))
@@ -828,7 +872,10 @@ impl IncrementalIndexer {
     }
 
     fn str_field(payload: &serde_json::Value, key: &str) -> Option<String> {
-        payload.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+        payload
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
     }
 
     fn u64_field(payload: &serde_json::Value, key: &str) -> Option<u64> {
@@ -837,7 +884,9 @@ impl IncrementalIndexer {
 
     fn str_array_field(payload: &serde_json::Value, key: &str) -> Option<Vec<String>> {
         payload.get(key).and_then(|v| v.as_array()).map(|arr| {
-            arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect()
+            arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
         })
     }
 }
@@ -886,7 +935,11 @@ mod tests {
         Region("fr-par".into())
     }
     fn principal() -> Principal {
-        Principal::stub(PrincipalId("p-opaque-1".into()), PrincipalKind::Human, tenant())
+        Principal::stub(
+            PrincipalId("p-opaque-1".into()),
+            PrincipalKind::Human,
+            tenant(),
+        )
     }
 
     /// A scripted [`ProjectFetcher`] over an in-memory map of `ref → projection`, with a per-ref
@@ -910,7 +963,10 @@ mod tests {
             self.projections.lock().unwrap().insert(ref_.to_string(), p);
         }
         fn set_flaky(&self, ref_: &str, fail_times: u32) {
-            self.flaky.lock().unwrap().insert(ref_.to_string(), fail_times);
+            self.flaky
+                .lock()
+                .unwrap()
+                .insert(ref_.to_string(), fail_times);
         }
         fn call_count(&self, ref_: &str) -> u32 {
             self.calls.lock().unwrap().get(ref_).copied().unwrap_or(0)
@@ -923,12 +979,19 @@ mod tests {
             _region: &Region,
             ref_: &ArtifactRef,
         ) -> Result<SearchProjection, ProjectFetchError> {
-            *self.calls.lock().unwrap().entry(ref_.0.clone()).or_insert(0) += 1;
+            *self
+                .calls
+                .lock()
+                .unwrap()
+                .entry(ref_.0.clone())
+                .or_insert(0) += 1;
             // The transient-hiccup injection: fail Unavailable until the countdown drains.
             if let Some(n) = self.flaky.lock().unwrap().get_mut(&ref_.0) {
                 if *n > 0 {
                     *n -= 1;
-                    return Err(ProjectFetchError::Unavailable("owner transiently down".into()));
+                    return Err(ProjectFetchError::Unavailable(
+                        "owner transiently down".into(),
+                    ));
                 }
             }
             match self.projections.lock().unwrap().get(&ref_.0) {
@@ -939,11 +1002,19 @@ mod tests {
     }
 
     fn proj(text: &str) -> SearchProjection {
-        SearchProjection { text: text.into(), fields: BTreeMap::new(), lang: None }
+        SearchProjection {
+            text: text.into(),
+            fields: BTreeMap::new(),
+            lang: None,
+        }
     }
 
     fn proj_with(text: &str, fields: BTreeMap<String, FieldValue>) -> SearchProjection {
-        SearchProjection { text: text.into(), fields, lang: None }
+        SearchProjection {
+            text: text.into(),
+            fields,
+            lang: None,
+        }
     }
 
     /// An issue IndexSpec (non-semantic) with a `status` facet.
@@ -997,15 +1068,27 @@ mod tests {
         let r = "myelin://acme/issue/issue/ENG-1";
         let mut fields = BTreeMap::new();
         fields.insert("status".to_string(), FieldValue::Select("open".into()));
-        let fetcher = Arc::new(FakeFetcher::with(r, proj_with("deadlock in the scheduler", fields)));
+        let fetcher = Arc::new(FakeFetcher::with(
+            r,
+            proj_with("deadlock in the scheduler", fields),
+        ));
         let ix = indexer_with(vec![issue_spec()], fetcher.clone());
 
-        let ev = event("01J-1", "issue.issue.created", r, serde_json::json!({ "zookie": "zk-7", "version": 3 }));
+        let ev = event(
+            "01J-1",
+            "issue.issue.created",
+            r,
+            serde_json::json!({ "zookie": "zk-7", "version": 3 }),
+        );
         assert_eq!(ix.handle(&ev), HandleOutcome::Done);
 
         // The owner's project was fetched (NOT a DB read — the no-cross-db floor; this is the only
         // ingest path).
-        assert_eq!(fetcher.call_count(r), 1, "the owner projection was fetched once (5.6)");
+        assert_eq!(
+            fetcher.call_count(r),
+            1,
+            "the owner projection was fetched once (5.6)"
+        );
 
         // The doc is searchable (the freshness property — SRCH-D7) under an allow-set ACL filter.
         let hits = ix
@@ -1013,10 +1096,17 @@ mod tests {
             .expect("search");
         assert_eq!(hits.len(), 1, "the indexed doc is searchable");
         assert_eq!(hits[0].doc_id, r);
-        assert_eq!(ix.live_count(&tenant(), &region()), 1, "exactly one live doc");
+        assert_eq!(
+            ix.live_count(&tenant(), &region()),
+            1,
+            "exactly one live doc"
+        );
 
         // The staleness anchor was stamped from the event (the indexed_zookie + version, §3.1).
-        assert_eq!(ix.indexed_zookie_of(&tenant(), &region(), r).as_deref(), Some("zk-7"));
+        assert_eq!(
+            ix.indexed_zookie_of(&tenant(), &region(), r).as_deref(),
+            Some("zk-7")
+        );
     }
 
     /// **Idempotent indexing: replaying the SAME event twice upserts ONE IndexDocument (idempotent on
@@ -1027,16 +1117,27 @@ mod tests {
         let r = "myelin://acme/issue/issue/ENG-1";
         let fetcher = Arc::new(FakeFetcher::with(r, proj("body text")));
         let ix = indexer_with(vec![issue_spec()], fetcher.clone());
-        let ev = event("01J-1", "issue.issue.created", r, serde_json::json!({ "zookie": "z1" }));
+        let ev = event(
+            "01J-1",
+            "issue.issue.created",
+            r,
+            serde_json::json!({ "zookie": "z1" }),
+        );
 
         // index() directly twice ⇒ still one doc (idempotent on doc_id at the engine).
         assert_eq!(ix.index(&ev), Ok(()));
         assert_eq!(ix.index(&ev), Ok(()));
-        assert_eq!(ix.live_count(&tenant(), &region()), 1, "idempotent on doc_id: one doc, not two");
+        assert_eq!(
+            ix.live_count(&tenant(), &region()),
+            1,
+            "idempotent on doc_id: one doc, not two"
+        );
 
         // Through the runtime, a redelivered event_id is a handler no-op (the consumer_dedup outer
         // guard, rule 1) — the indexer never re-projects.
-        use myelin_events::{ConsumerName, DedupLedger, Subscription, PrefetchBound, Consumer, Message};
+        use myelin_events::{
+            Consumer, ConsumerName, DedupLedger, Message, PrefetchBound, Subscription,
+        };
         let sub = Subscription::bind(
             ConsumerName(INDEXER_CONSUMER.into()),
             &["myelin://acme/issue/"],
@@ -1044,11 +1145,22 @@ mod tests {
         )
         .unwrap();
         let consumer = Consumer::new(ix.clone(), sub, DedupLedger::new());
-        let msg = Message { subject: r.to_string(), envelope: ev.clone() };
+        let msg = Message {
+            subject: r.to_string(),
+            envelope: ev.clone(),
+        };
         assert_eq!(consumer.deliver(&msg), myelin_events::Delivered::Acked);
         let before = fetcher.call_count(r);
-        assert_eq!(consumer.deliver(&msg), myelin_events::Delivered::Deduplicated, "redelivery deduped");
-        assert_eq!(fetcher.call_count(r), before, "the deduped redelivery never re-fetched/re-indexed");
+        assert_eq!(
+            consumer.deliver(&msg),
+            myelin_events::Delivered::Deduplicated,
+            "redelivery deduped"
+        );
+        assert_eq!(
+            fetcher.call_count(r),
+            before,
+            "the deduped redelivery never re-fetched/re-indexed"
+        );
     }
 
     /// **A type with NO registered IndexSpec is a NO-OP (not indexed, not poisoned).** Search does not
@@ -1060,7 +1172,11 @@ mod tests {
         let ix = indexer_with(vec![issue_spec()], fetcher.clone()); // only `issue/issue` registered.
         let ev = event("01J-x", "chat.message.created", r, serde_json::json!({}));
         assert_eq!(ix.index(&ev), Ok(()), "unregistered type → no-op");
-        assert_eq!(fetcher.call_count(r), 0, "no projection fetched for an unindexed type");
+        assert_eq!(
+            fetcher.call_count(r),
+            0,
+            "no projection fetched for an unindexed type"
+        );
         assert_eq!(ix.live_count(&tenant(), &region()), 0);
     }
 
@@ -1070,9 +1186,16 @@ mod tests {
     fn malformed_subject_is_a_nonretryable_poison() {
         let fetcher = Arc::new(FakeFetcher::default());
         let ix = indexer_with(vec![issue_spec()], fetcher);
-        let ev = event("01J-bad", "issue.issue.created", "not-a-ref", serde_json::json!({}));
+        let ev = event(
+            "01J-bad",
+            "issue.issue.created",
+            "not-a-ref",
+            serde_json::json!({}),
+        );
         match ix.handle(&ev) {
-            HandleOutcome::NonRetryable(Reason(r)) => assert!(r.contains("not a myelin"), "names it: {r}"),
+            HandleOutcome::NonRetryable(Reason(r)) => {
+                assert!(r.contains("not a myelin"), "names it: {r}")
+            }
             other => panic!("expected a non-retryable poison, got {other:?}"),
         }
     }
@@ -1088,7 +1211,9 @@ mod tests {
         let ix = indexer_with(vec![issue_spec()], fetcher);
         let ev = event("01J-1", "issue.issue.created", r, serde_json::json!({}));
         match ix.handle(&ev) {
-            HandleOutcome::NonRetryable(Reason(m)) => assert!(m.contains("severity"), "names the facet: {m}"),
+            HandleOutcome::NonRetryable(Reason(m)) => {
+                assert!(m.contains("severity"), "names the facet: {m}")
+            }
             other => panic!("expected a poison, got {other:?}"),
         }
     }
@@ -1102,21 +1227,37 @@ mod tests {
         let r = "myelin://acme/knowledge/page/42";
         let fetcher = Arc::new(FakeFetcher::with(r, proj("distributed consensus and raft")));
         let ix = indexer_with(vec![page_spec()], fetcher);
-        let ev = event("01J-p", "knowledge.page.created", r, serde_json::json!({ "zookie": "z" }));
+        let ev = event(
+            "01J-p",
+            "knowledge.page.created",
+            r,
+            serde_json::json!({ "zookie": "z" }),
+        );
         assert_eq!(ix.handle(&ev), HandleOutcome::Done);
 
         // The doc carries a vector under the SAME doc_id (one doc-id space, §3.2): a semantic query for
         // the SAME text returns it (the mock embed is deterministic, so the doc's own text is its
         // nearest neighbour).
-        let query = MockEmbeddingAdapter::new(8).embed("distributed consensus and raft").unwrap();
+        let query = MockEmbeddingAdapter::new(8)
+            .embed("distributed consensus and raft")
+            .unwrap();
         let hits = ix
             .registry
-            .with_backend(&tenant(), &region(), |be| be.semantic(&AclFilter::ids([r]), &query, 1))
+            .with_backend(&tenant(), &region(), |be| {
+                be.semantic(&AclFilter::ids([r]), &query, 1)
+            })
             .expect("semantic");
-        assert_eq!(hits.len(), 1, "the semantically-indexed doc is reachable by k-NN");
+        assert_eq!(
+            hits.len(),
+            1,
+            "the semantically-indexed doc is reachable by k-NN"
+        );
         assert_eq!(hits[0].doc_id, r);
         // The model_ref is the pinned mock model (a swap re-embeds, never a silent mixed-model index).
-        assert_eq!(hits[0].model_ref, ModelRef(MockEmbeddingAdapter::DEFAULT_MODEL.into()));
+        assert_eq!(
+            hits[0].model_ref,
+            ModelRef(MockEmbeddingAdapter::DEFAULT_MODEL.into())
+        );
     }
 
     /// **The mock embedding is DETERMINISTIC (the same text → the same vector → an idempotent
@@ -1127,12 +1268,23 @@ mod tests {
         let a = MockEmbeddingAdapter::new(8);
         let v1 = a.embed("alpha beta").unwrap();
         let v2 = a.embed("alpha beta").unwrap();
-        assert_eq!(v1.0, v2.0, "the same text embeds to the same vector (deterministic, idempotent)");
-        assert_ne!(a.embed("gamma").unwrap().0, v1.0, "different text → different vector");
+        assert_eq!(
+            v1.0, v2.0,
+            "the same text embeds to the same vector (deterministic, idempotent)"
+        );
+        assert_ne!(
+            a.embed("gamma").unwrap().0,
+            v1.0,
+            "different text → different vector"
+        );
         assert!(a.embed("   ").is_none(), "empty text gets no embedding");
         // A different model_ref pins a different model (the swap signal).
         let b = MockEmbeddingAdapter::with_model("eu-model-v2", 8);
-        assert_ne!(a.model_ref(), b.model_ref(), "a model swap is a distinct model_ref");
+        assert_ne!(
+            a.model_ref(),
+            b.model_ref(),
+            "a model swap is a distinct model_ref"
+        );
     }
 
     // --- ACL state is indexed (the permission-change path, §4.1 tail) ---
@@ -1146,9 +1298,17 @@ mod tests {
         let ix = indexer_with(vec![issue_spec()], fetcher.clone());
 
         // Index the doc with an initial zookie.
-        let create = event("01J-1", "issue.issue.created", r, serde_json::json!({ "zookie": "zk-1" }));
+        let create = event(
+            "01J-1",
+            "issue.issue.created",
+            r,
+            serde_json::json!({ "zookie": "zk-1" }),
+        );
         assert_eq!(ix.handle(&create), HandleOutcome::Done);
-        assert_eq!(ix.indexed_zookie_of(&tenant(), &region(), r).as_deref(), Some("zk-1"));
+        assert_eq!(
+            ix.indexed_zookie_of(&tenant(), &region(), r).as_deref(),
+            Some("zk-1")
+        );
         let fetches_before = fetcher.call_count(r);
 
         // A permission change names the affected object in `refs` + carries the new zookie.
@@ -1161,10 +1321,20 @@ mod tests {
         assert_eq!(ix.handle(&perm), HandleOutcome::Done);
 
         // The doc's indexed_zookie ADVANCED — and the body was NOT re-fetched (same content, new token).
-        assert_eq!(ix.indexed_zookie_of(&tenant(), &region(), r).as_deref(), Some("zk-2"), "zookie advanced");
-        assert_eq!(fetcher.call_count(r), fetches_before, "the body was NOT re-fetched on a permission change");
+        assert_eq!(
+            ix.indexed_zookie_of(&tenant(), &region(), r).as_deref(),
+            Some("zk-2"),
+            "zookie advanced"
+        );
+        assert_eq!(
+            fetcher.call_count(r),
+            fetches_before,
+            "the body was NOT re-fetched on a permission change"
+        );
         // The doc is still searchable (the re-stamp preserved the body).
-        let hits = ix.search_ft(&tenant(), &region(), &AclFilter::ids([r]), "body", 10).expect("search");
+        let hits = ix
+            .search_ft(&tenant(), &region(), &AclFilter::ids([r]), "body", 10)
+            .expect("search");
         assert_eq!(hits.len(), 1, "the re-stamped doc still has its body");
     }
 
@@ -1180,7 +1350,11 @@ mod tests {
             "myelin://acme/issue/issue/NONE",
             serde_json::json!({ "zookie": "zk-2", "refs": ["myelin://acme/issue/issue/NONE"] }),
         );
-        assert_eq!(ix.handle(&perm), HandleOutcome::Done, "a perm change on an un-indexed object is a no-op");
+        assert_eq!(
+            ix.handle(&perm),
+            HandleOutcome::Done,
+            "a perm change on an un-indexed object is a no-op"
+        );
     }
 
     /// **A permission-change event with no `zookie`/`refs` is a LOUD poison (a malformed ACL event must
@@ -1189,8 +1363,16 @@ mod tests {
     fn malformed_permission_change_is_a_poison() {
         let fetcher = Arc::new(FakeFetcher::default());
         let ix = indexer_with(vec![issue_spec()], fetcher);
-        let perm = event("01J-perm", "authz.tuple.permission.changed", "myelin://acme/issue/issue/X", serde_json::json!({}));
-        assert!(matches!(ix.handle(&perm), HandleOutcome::NonRetryable(_)), "missing zookie/refs → poison");
+        let perm = event(
+            "01J-perm",
+            "authz.tuple.permission.changed",
+            "myelin://acme/issue/issue/X",
+            serde_json::json!({}),
+        );
+        assert!(
+            matches!(ix.handle(&perm), HandleOutcome::NonRetryable(_)),
+            "missing zookie/refs → poison"
+        );
     }
 
     // --- Removal / gone path ---
@@ -1202,13 +1384,27 @@ mod tests {
         let r = "myelin://acme/issue/issue/ENG-1";
         let fetcher = Arc::new(FakeFetcher::with(r, proj("body")));
         let ix = indexer_with(vec![issue_spec()], fetcher);
-        ix.handle(&event("01J-1", "issue.issue.created", r, serde_json::json!({})));
+        ix.handle(&event(
+            "01J-1",
+            "issue.issue.created",
+            r,
+            serde_json::json!({}),
+        ));
         assert_eq!(ix.live_count(&tenant(), &region()), 1);
 
         // A `*.erased` removes it (the erasure path, through the live consumer).
-        let erased = event("01J-e", "issue.issue.erased", r, serde_json::json!({ "ref": r }));
+        let erased = event(
+            "01J-e",
+            "issue.issue.erased",
+            r,
+            serde_json::json!({ "ref": r }),
+        );
         assert_eq!(ix.handle(&erased), HandleOutcome::Done);
-        assert_eq!(ix.live_count(&tenant(), &region()), 0, "the erased doc is removed from the index");
+        assert_eq!(
+            ix.live_count(&tenant(), &region()),
+            0,
+            "the erased doc is removed from the index"
+        );
     }
 
     /// **An upsert event whose artifact PROJECTS AS GONE removes the doc (a clean removal, not a
@@ -1218,13 +1414,30 @@ mod tests {
         let r = "myelin://acme/issue/issue/ENG-1";
         let fetcher = Arc::new(FakeFetcher::with(r, proj("body")));
         let ix = indexer_with(vec![issue_spec()], fetcher.clone());
-        ix.handle(&event("01J-1", "issue.issue.created", r, serde_json::json!({})));
+        ix.handle(&event(
+            "01J-1",
+            "issue.issue.created",
+            r,
+            serde_json::json!({}),
+        ));
         assert_eq!(ix.live_count(&tenant(), &region()), 1);
 
         // The owner now projects GONE (the artifact was deleted) — a re-index removes the doc.
         fetcher.projections.lock().unwrap().remove(r);
-        assert_eq!(ix.handle(&event("01J-2", "issue.issue.updated", r, serde_json::json!({}))), HandleOutcome::Done);
-        assert_eq!(ix.live_count(&tenant(), &region()), 0, "a gone projection removes the doc");
+        assert_eq!(
+            ix.handle(&event(
+                "01J-2",
+                "issue.issue.updated",
+                r,
+                serde_json::json!({})
+            )),
+            HandleOutcome::Done
+        );
+        assert_eq!(
+            ix.live_count(&tenant(), &region()),
+            0,
+            "a gone projection removes the doc"
+        );
     }
 
     // --- The sub-artifact (#sub) path (5.7) ---
@@ -1238,15 +1451,27 @@ mod tests {
         let parent = "myelin://acme/knowledge/page/42";
         let fetcher = Arc::new(FakeFetcher::with(sub_ref, proj("a block of prose")));
         let ix = indexer_with(vec![page_spec()], fetcher);
-        let ev = event("01J-b", "knowledge.page.created", sub_ref, serde_json::json!({}));
+        let ev = event(
+            "01J-b",
+            "knowledge.page.created",
+            sub_ref,
+            serde_json::json!({}),
+        );
         assert_eq!(ix.handle(&ev), HandleOutcome::Done);
 
         // The doc is keyed by the full sub-URN; the ACL clause that admits it pins on the PARENT.
         let by_parent = ix
             .search_ft(&tenant(), &region(), &AclFilter::ids([parent]), "prose", 10)
             .expect("search by parent acl");
-        assert_eq!(by_parent.len(), 1, "the sub-artifact doc is admitted by the PARENT's ACL (5.7/§3.1)");
-        assert_eq!(by_parent[0].doc_id, sub_ref, "but keyed by the full sub-precise doc_id");
+        assert_eq!(
+            by_parent.len(),
+            1,
+            "the sub-artifact doc is admitted by the PARENT's ACL (5.7/§3.1)"
+        );
+        assert_eq!(
+            by_parent[0].doc_id, sub_ref,
+            "but keyed by the full sub-precise doc_id"
+        );
     }
 
     // --- Chained mutation: index → permission-change → re-index across a consumer restart (EI-01 §4) ---
@@ -1265,13 +1490,30 @@ mod tests {
         let ix = indexer_with(vec![issue_spec()], fetcher.clone());
         let ledger = DedupLedger::new();
         let bind = || {
-            Subscription::bind(ConsumerName(INDEXER_CONSUMER.into()), &["myelin://acme/"], PrefetchBound::DEFAULT)
-                .unwrap()
+            Subscription::bind(
+                ConsumerName(INDEXER_CONSUMER.into()),
+                &["myelin://acme/"],
+                PrefetchBound::DEFAULT,
+            )
+            .unwrap()
         };
-        let msg = |ev: &EventEnvelope| Message { subject: r.to_string(), envelope: ev.clone() };
+        let msg = |ev: &EventEnvelope| Message {
+            subject: r.to_string(),
+            envelope: ev.clone(),
+        };
 
-        let e_index = event("01J-1", "issue.issue.created", r, serde_json::json!({ "zookie": "zk-1" }));
-        let e_perm = event("01J-2", "authz.tuple.permission.changed", r, serde_json::json!({ "zookie": "zk-2", "refs": [r] }));
+        let e_index = event(
+            "01J-1",
+            "issue.issue.created",
+            r,
+            serde_json::json!({ "zookie": "zk-1" }),
+        );
+        let e_perm = event(
+            "01J-2",
+            "authz.tuple.permission.changed",
+            r,
+            serde_json::json!({ "zookie": "zk-2", "refs": [r] }),
+        );
 
         // First connection: index, then permission-change. Then the broker "drops".
         {
@@ -1279,26 +1521,62 @@ mod tests {
             assert_eq!(c.deliver(&msg(&e_index)), Delivered::Acked);
             assert_eq!(c.deliver(&msg(&e_perm)), Delivered::Acked);
         }
-        assert_eq!(ix.indexed_zookie_of(&tenant(), &region(), r).as_deref(), Some("zk-2"), "perm change advanced zookie");
+        assert_eq!(
+            ix.indexed_zookie_of(&tenant(), &region(), r).as_deref(),
+            Some("zk-2"),
+            "perm change advanced zookie"
+        );
 
         // The owner's body changes (a real re-index event re-fetches the fresh body).
         fetcher.put(r, proj("second body"));
-        let e_reindex = event("01J-3", "issue.issue.updated", r, serde_json::json!({ "zookie": "zk-3" }));
+        let e_reindex = event(
+            "01J-3",
+            "issue.issue.updated",
+            r,
+            serde_json::json!({ "zookie": "zk-3" }),
+        );
 
         // Reconnect: a FRESH consumer re-binds the SAME ledger. The broker redelivers ALL three
         // (at-least-once); the two already-handled are deduped (0 dup), the new one re-indexes.
         let c2 = Consumer::new(ix.clone(), bind(), ledger.clone());
-        assert_eq!(c2.deliver(&msg(&e_index)), Delivered::Deduplicated, "e_index already handled → 0 dup");
-        assert_eq!(c2.deliver(&msg(&e_perm)), Delivered::Deduplicated, "e_perm already handled → 0 dup");
-        assert_eq!(c2.deliver(&msg(&e_reindex)), Delivered::Acked, "the new re-index is handled → 0 lost");
+        assert_eq!(
+            c2.deliver(&msg(&e_index)),
+            Delivered::Deduplicated,
+            "e_index already handled → 0 dup"
+        );
+        assert_eq!(
+            c2.deliver(&msg(&e_perm)),
+            Delivered::Deduplicated,
+            "e_perm already handled → 0 dup"
+        );
+        assert_eq!(
+            c2.deliver(&msg(&e_reindex)),
+            Delivered::Acked,
+            "the new re-index is handled → 0 lost"
+        );
 
         // EXACTLY-ONCE-IN-EFFECT: one doc, the fresh body, the latest zookie.
-        assert_eq!(ix.live_count(&tenant(), &region()), 1, "exactly one doc (no dupe across restart)");
-        let fresh = ix.search_ft(&tenant(), &region(), &AclFilter::ids([r]), "second", 10).expect("search");
+        assert_eq!(
+            ix.live_count(&tenant(), &region()),
+            1,
+            "exactly one doc (no dupe across restart)"
+        );
+        let fresh = ix
+            .search_ft(&tenant(), &region(), &AclFilter::ids([r]), "second", 10)
+            .expect("search");
         assert_eq!(fresh.len(), 1, "the re-index applied the fresh body");
-        let stale = ix.search_ft(&tenant(), &region(), &AclFilter::ids([r]), "first", 10).expect("search");
-        assert!(stale.is_empty(), "the old body was replaced (delete-then-add upsert)");
-        assert_eq!(ix.indexed_zookie_of(&tenant(), &region(), r).as_deref(), Some("zk-3"), "latest zookie stamped");
+        let stale = ix
+            .search_ft(&tenant(), &region(), &AclFilter::ids([r]), "first", 10)
+            .expect("search");
+        assert!(
+            stale.is_empty(),
+            "the old body was replaced (delete-then-add upsert)"
+        );
+        assert_eq!(
+            ix.indexed_zookie_of(&tenant(), &region(), r).as_deref(),
+            Some("zk-3"),
+            "latest zookie stamped"
+        );
     }
 
     // --- The transient-hiccup Retry path (0 lost) ---
@@ -1315,11 +1593,26 @@ mod tests {
         let ev = event("01J-1", "issue.issue.created", r, serde_json::json!({}));
 
         // First handle: the owner is down → Retry (NOT a poison, NOT a fabricated empty doc).
-        assert!(matches!(ix.handle(&ev), HandleOutcome::Retry(_)), "a transient hiccup retries");
-        assert_eq!(ix.live_count(&tenant(), &region()), 0, "nothing indexed on the hiccup (no fabrication)");
+        assert!(
+            matches!(ix.handle(&ev), HandleOutcome::Retry(_)),
+            "a transient hiccup retries"
+        );
+        assert_eq!(
+            ix.live_count(&tenant(), &region()),
+            0,
+            "nothing indexed on the hiccup (no fabrication)"
+        );
         // Redelivery: the owner is back → Done, the doc indexes (0 lost).
-        assert_eq!(ix.handle(&ev), HandleOutcome::Done, "the redelivery succeeds");
-        assert_eq!(ix.live_count(&tenant(), &region()), 1, "0 lost: the doc indexed on the redelivery");
+        assert_eq!(
+            ix.handle(&ev),
+            HandleOutcome::Done,
+            "the redelivery succeeds"
+        );
+        assert_eq!(
+            ix.live_count(&tenant(), &region()),
+            1,
+            "0 lost: the doc indexed on the redelivery"
+        );
     }
 
     // --- Telemetry (contract 1.8 / §4.11) ---
@@ -1332,9 +1625,22 @@ mod tests {
         let fetcher = Arc::new(FakeFetcher::with(r, proj("body")));
         let ix = indexer_with(vec![issue_spec()], fetcher);
         assert_eq!(ix.index_lag(), 0, "a fresh indexer has no lag");
-        ix.handle(&event("01J-1", "issue.issue.created", r, serde_json::json!({})));
-        assert_eq!(ix.index_lag(), 0, "index_lag returns to 0 after projection (synchronous apply)");
-        assert_eq!(IncrementalIndexer::INDEX_LAG_SIGNAL, "search.index_lag", "the contract-1.8 signal name");
+        ix.handle(&event(
+            "01J-1",
+            "issue.issue.created",
+            r,
+            serde_json::json!({}),
+        ));
+        assert_eq!(
+            ix.index_lag(),
+            0,
+            "index_lag returns to 0 after projection (synchronous apply)"
+        );
+        assert_eq!(
+            IncrementalIndexer::INDEX_LAG_SIGNAL,
+            "search.index_lag",
+            "the contract-1.8 signal name"
+        );
     }
 
     /// **The IndexSpec shape is the synthetic-producer surface (6.3): semantic flag + the structured
@@ -1344,9 +1650,15 @@ mod tests {
         let s = issue_spec();
         assert_eq!(s.subsystem, "issue");
         assert_eq!(s.type_, "issue");
-        assert_eq!(s.acl_object_type, "issue", "acl_object_type defaults to the type");
+        assert_eq!(
+            s.acl_object_type, "issue",
+            "acl_object_type defaults to the type"
+        );
         assert!(!s.semantic, "issue is not semantically indexed");
-        assert!(page_spec().semantic, "knowledge/page is semantically indexed");
+        assert!(
+            page_spec().semantic,
+            "knowledge/page is semantically indexed"
+        );
         assert!(s.struct_fields.contains_key("status"));
     }
 }

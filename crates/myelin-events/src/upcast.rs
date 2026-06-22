@@ -80,7 +80,11 @@ pub enum RegisterError {
     /// A hop must advance the version by EXACTLY one (`from + 1 == to`). A backwards hop
     /// (`to <= from`) is a rollback (forbidden, forward-only); a skipping hop (`to > from + 1`)
     /// hides a missing intermediate. Both are registration errors.
-    NotAdjacentForwardHop { type_: EventType, from: u32, to: u32 },
+    NotAdjacentForwardHop {
+        type_: EventType,
+        from: u32,
+        to: u32,
+    },
     /// Two upcasters were registered for the same `(type, from)` hop. The chain must be
     /// unambiguous (one function per hop), so a duplicate is a programming error, rejected.
     DuplicateHop { type_: EventType, from: u32 },
@@ -93,7 +97,12 @@ pub enum UpcastError {
     /// No registered chain bridges `(type, from_ver)` up to the current version — a missing hop.
     /// The event is term'd (dead-lettered), NEVER passed to a handler at the wrong shape and
     /// NEVER silently dropped. Carries the version it got stuck at so the gap is diagnosable.
-    UnbridgeableGap { type_: EventType, from_ver: u32, stuck_at: u32, target: u32 },
+    UnbridgeableGap {
+        type_: EventType,
+        from_ver: u32,
+        stuck_at: u32,
+        target: u32,
+    },
 }
 
 impl UpcastError {
@@ -125,7 +134,9 @@ impl UpcasterRegistry {
     /// A registry with no upcasters: every event is already at its current shape (the identity
     /// case). A subsystem registers its evolution hops onto this.
     pub fn new() -> Self {
-        UpcasterRegistry { hops: HashMap::new() }
+        UpcasterRegistry {
+            hops: HashMap::new(),
+        }
     }
 
     /// Register the upcaster for ONE adjacent forward hop `(type, from) → (from + 1)`. Returns
@@ -225,7 +236,9 @@ impl UpcasterRegistry {
     /// ([`crate::consumer::Consumer::with_upcaster`]). It runs BEFORE `handle`: on success the
     /// handler sees the current shape; on a gap it returns the [`Reason`] the runtime turns into
     /// a [`crate::HandleOutcome::NonRetryable`] (DLQ), never a silent drop.
-    pub fn into_hook(self) -> impl Fn(EventEnvelope) -> Result<EventEnvelope, Reason> + Send + Sync {
+    pub fn into_hook(
+        self,
+    ) -> impl Fn(EventEnvelope) -> Result<EventEnvelope, Reason> + Send + Sync {
         move |env| self.upcast(env).map_err(UpcastError::into_reason)
     }
 }
@@ -240,7 +253,11 @@ mod tests {
     use myelin_tenancy::{Region, TenantId};
 
     fn principal() -> Principal {
-        Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId("acme".into()))
+        Principal::stub(
+            PrincipalId("p".into()),
+            PrincipalKind::Human,
+            TenantId("acme".into()),
+        )
     }
 
     /// An envelope of `type` at `schema_ver`, with an empty-object payload so an upcaster can add
@@ -299,19 +316,34 @@ mod tests {
         let r = registry_v1_to_v3();
         assert_eq!(r.current_ver(&EventType("issues.issue.created".into())), 3);
 
-        let out = r.upcast(env("issues.issue.created", 1)).expect("v1 bridges to v3");
-        assert_eq!(out.schema_ver, 3, "the chain lifted v1 all the way to the current v3");
+        let out = r
+            .upcast(env("issues.issue.created", 1))
+            .expect("v1 bridges to v3");
+        assert_eq!(
+            out.schema_ver, 3,
+            "the chain lifted v1 all the way to the current v3"
+        );
         let p = out.payload.as_object().unwrap();
-        assert_eq!(p.get("priority").unwrap(), "normal", "v1->v2 added priority");
+        assert_eq!(
+            p.get("priority").unwrap(),
+            "normal",
+            "v1->v2 added priority"
+        );
         assert_eq!(p.get("severity").unwrap(), "info", "v2->v3 added severity");
-        assert_eq!(p.get("title").unwrap(), "old", "the original field is preserved");
+        assert_eq!(
+            p.get("title").unwrap(),
+            "old",
+            "the original field is preserved"
+        );
     }
 
     /// A mid-chain event (v2) is bridged the remaining hop(s) to current (v3).
     #[test]
     fn mid_chain_event_is_bridged_the_rest_of_the_way() {
         let r = registry_v1_to_v3();
-        let out = r.upcast(env("issues.issue.created", 2)).expect("v2 bridges to v3");
+        let out = r
+            .upcast(env("issues.issue.created", 2))
+            .expect("v2 bridges to v3");
         assert_eq!(out.schema_ver, 3);
         assert!(out.payload.as_object().unwrap().contains_key("severity"));
     }
@@ -333,8 +365,13 @@ mod tests {
     fn newer_event_is_not_downcast() {
         let r = registry_v1_to_v3();
         let input = env("issues.issue.created", 4);
-        let out = r.upcast(input.clone()).expect("forward-compatible newer event");
-        assert_eq!(out.schema_ver, 4, "no down-cast — the newer event is read as-is");
+        let out = r
+            .upcast(input.clone())
+            .expect("forward-compatible newer event");
+        assert_eq!(
+            out.schema_ver, 4,
+            "no down-cast — the newer event is read as-is"
+        );
         assert_eq!(out, input);
     }
 
@@ -351,9 +388,16 @@ mod tests {
         .unwrap();
         assert_eq!(r.current_ver(&EventType("issues.issue.created".into())), 3);
 
-        let err = r.upcast(env("issues.issue.created", 1)).expect_err("v1 has no upcaster — loud gap");
+        let err = r
+            .upcast(env("issues.issue.created", 1))
+            .expect_err("v1 has no upcaster — loud gap");
         match err {
-            UpcastError::UnbridgeableGap { from_ver, stuck_at, target, .. } => {
+            UpcastError::UnbridgeableGap {
+                from_ver,
+                stuck_at,
+                target,
+                ..
+            } => {
                 assert_eq!(from_ver, 1);
                 assert_eq!(stuck_at, 1, "stuck at v1 — there is no v1->v2 hop");
                 assert_eq!(target, 3);
@@ -369,7 +413,10 @@ mod tests {
         let input = env("issues.issue.created", 1);
         let a = r.upcast(input.clone()).unwrap();
         let b = r.upcast(input.clone()).unwrap();
-        assert_eq!(a, b, "same input -> same output (deterministic, no hidden state)");
+        assert_eq!(
+            a, b,
+            "same input -> same output (deterministic, no hidden state)"
+        );
         // The registry holds no per-call mutable state, so a third call still matches.
         let c = r.upcast(input.clone()).unwrap();
         assert_eq!(a, c);
@@ -436,6 +483,10 @@ mod tests {
         assert!(hook(env("issues.issue.created", 2)).is_ok());
         // an unbridgeable one yields a Reason (the DLQ surface), never panics
         let err = hook(env("issues.issue.created", 1)).expect_err("v1 has no hop");
-        assert!(err.0.contains("unbridgeable schema gap"), "the reason names the gap: {}", err.0);
+        assert!(
+            err.0.contains("unbridgeable schema gap"),
+            "the reason names the gap: {}",
+            err.0
+        );
     }
 }

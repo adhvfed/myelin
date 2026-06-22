@@ -66,8 +66,8 @@
 
 use crate::outbox::{EmitContextBase, IdMinter, OutboxStore};
 use crate::{
-    Actor, AggregateKey, ArtifactRef, DataRole, EventDraft, EventEnvelope, EventType, HandleOutcome,
-    OutboxTx, PiiKeyRef, Region, TenantId, Timestamp, Visibility,
+    Actor, AggregateKey, ArtifactRef, DataRole, EventDraft, EventEnvelope, EventType,
+    HandleOutcome, OutboxTx, PiiKeyRef, Region, TenantId, Timestamp, Visibility,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -119,7 +119,11 @@ impl std::fmt::Display for ShredError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ShredError::KmsUnavailable(k) => {
-                write!(f, "crypto-shred: KMS unavailable for {} — erase INCOMPLETE, retry", k.0)
+                write!(
+                    f,
+                    "crypto-shred: KMS unavailable for {} — erase INCOMPLETE, retry",
+                    k.0
+                )
             }
         }
     }
@@ -150,28 +154,45 @@ impl InMemoryShredder {
     /// Seal (register) a DEK as live — what the producer's envelope-encryption step did when it
     /// minted the `pii_key_ref` (storage `ensure_dek`). The holder's `is_live` reads this.
     pub fn seal(&self, key_ref: &PiiKeyRef) {
-        self.live.lock().expect("shredder live poisoned").insert(key_ref.0.clone());
+        self.live
+            .lock()
+            .expect("shredder live poisoned")
+            .insert(key_ref.0.clone());
     }
 
     /// Mark a key as unreachable (the KMS-outage drill): a subsequent `destroy_key` fails LOUDLY.
     pub fn make_unreachable(&self, key_ref: &PiiKeyRef) {
-        self.unreachable.lock().expect("shredder unreachable poisoned").insert(key_ref.0.clone());
+        self.unreachable
+            .lock()
+            .expect("shredder unreachable poisoned")
+            .insert(key_ref.0.clone());
     }
 }
 
 impl InlinePiiShredder for InMemoryShredder {
     fn destroy_key(&self, key_ref: &PiiKeyRef) -> Result<(), ShredError> {
-        if self.unreachable.lock().expect("shredder unreachable poisoned").contains(&key_ref.0) {
+        if self
+            .unreachable
+            .lock()
+            .expect("shredder unreachable poisoned")
+            .contains(&key_ref.0)
+        {
             // Loud failure — the erase is INCOMPLETE; the holder must retry (never "assume erased").
             return Err(ShredError::KmsUnavailable(key_ref.clone()));
         }
         // Idempotent: removing an absent key is a no-op success (re-erasure after a restore, EB-16).
-        self.live.lock().expect("shredder live poisoned").remove(&key_ref.0);
+        self.live
+            .lock()
+            .expect("shredder live poisoned")
+            .remove(&key_ref.0);
         Ok(())
     }
 
     fn is_live(&self, key_ref: &PiiKeyRef) -> bool {
-        self.live.lock().expect("shredder live poisoned").contains(&key_ref.0)
+        self.live
+            .lock()
+            .expect("shredder live poisoned")
+            .contains(&key_ref.0)
     }
 }
 
@@ -294,7 +315,11 @@ pub struct BusHolder<S: InlinePiiShredder> {
 impl<S: InlinePiiShredder> BusHolder<S> {
     /// Construct the holder for one `(tenant, region)` cell over a crypto-shred seam.
     pub fn new(tenant: TenantId, region: Region, shredder: S) -> Self {
-        BusHolder { tenant, region, shredder }
+        BusHolder {
+            tenant,
+            region,
+            shredder,
+        }
     }
 
     /// `locate(subject)` (Bus §5.7) → the subject's inline-PII events + tombstone status. Walks the
@@ -319,7 +344,10 @@ impl<S: InlinePiiShredder> BusHolder<S> {
                 tombstoned: log.is_tombstoned(&env.event_id.0),
             });
         }
-        LocateReport { subject: subject.to_string(), inline_pii_events }
+        LocateReport {
+            subject: subject.to_string(),
+            inline_pii_events,
+        }
     }
 
     /// `erase(subject)` (Bus §4.8 / §5.7) → crypto-shred the subject's inline-PII keys + emit
@@ -348,7 +376,9 @@ impl<S: InlinePiiShredder> BusHolder<S> {
         // destroyed key once (a per-subject DEK may seal several events).
         let mut distinct_keys: BTreeMap<String, PiiKeyRef> = BTreeMap::new();
         for ev in &report.inline_pii_events {
-            distinct_keys.entry(ev.pii_key_ref.0.clone()).or_insert_with(|| ev.pii_key_ref.clone());
+            distinct_keys
+                .entry(ev.pii_key_ref.0.clone())
+                .or_insert_with(|| ev.pii_key_ref.clone());
         }
         for key_ref in distinct_keys.values() {
             // Loud on failure: a key we cannot destroy aborts the erase as INCOMPLETE. We have not
@@ -373,7 +403,10 @@ impl<S: InlinePiiShredder> BusHolder<S> {
         }
         // Stage a state-change marker so the tombstones co-commit with the erase bookkeeping
         // (emit-iff-committed: the tombstones are durable iff THIS commits).
-        otx.stage_state_change(format!("bus.erase subject={subject} keys={}", distinct_keys.len()));
+        otx.stage_state_change(format!(
+            "bus.erase subject={subject} keys={}",
+            distinct_keys.len()
+        ));
         otx.commit().map_err(|_| {
             ShredError::KmsUnavailable(
                 report
@@ -457,7 +490,10 @@ impl<S: InlinePiiShredder> BusHolder<S> {
     fn erased_tombstone_draft(&self, subject: &str, erased_event_id: &str) -> EventDraft {
         EventDraft {
             type_: EventType(BUS_ERASED_TYPE.into()),
-            subject: ArtifactRef(format!("myelin://{}/bus/event/{erased_event_id}", self.tenant.0)),
+            subject: ArtifactRef(format!(
+                "myelin://{}/bus/event/{erased_event_id}",
+                self.tenant.0
+            )),
             aggregate: AggregateKey(format!("bus.event:{erased_event_id}")),
             // References-not-payloads: the erased event's id + the subject discriminator, NEVER the
             // erased content (which is now unrecoverable ciphertext).
@@ -533,7 +569,11 @@ mod tests {
     }
 
     fn actor_for(id: &str) -> Actor {
-        Actor(Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant()))
+        Actor(Principal::stub(
+            PrincipalId(id.into()),
+            PrincipalKind::Human,
+            tenant(),
+        ))
     }
 
     /// Build a retained envelope in the log. `pii` = Some(subject) means an inline-PII event sealed
@@ -597,11 +637,18 @@ mod tests {
         let (log, shredder) = seeded_log_and_shredder();
         let holder = BusHolder::new(tenant(), region(), shredder);
         let report = holder.locate("u42", &log);
-        assert_eq!(report.inline_pii_events.len(), 1, "only the one inline-PII event for u42");
+        assert_eq!(
+            report.inline_pii_events.len(),
+            1,
+            "only the one inline-PII event for u42"
+        );
         assert_eq!(report.inline_pii_events[0].event_id, "01J-1");
         assert!(!report.inline_pii_events[0].tombstoned);
         // u99's inline-PII event is NOT in u42's locate.
-        assert!(report.inline_pii_events.iter().all(|e| e.event_id != "01J-2"));
+        assert!(report
+            .inline_pii_events
+            .iter()
+            .all(|e| e.event_id != "01J-2"));
     }
 
     /// Unit (the BUS-D8 live-store core): `erase(subject)` destroys the pii_key_ref DEK and renders
@@ -617,16 +664,25 @@ mod tests {
         let mut outbox = OutboxStore::new();
         let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
 
-        let receipt = holder.erase("u42", &mut log, &mut outbox, minter).expect("erase succeeds");
+        let receipt = holder
+            .erase("u42", &mut log, &mut outbox, minter)
+            .expect("erase succeeds");
 
         // The DEK is destroyed → the inline-PII payload is unrecoverable in the LIVE log.
         assert!(!shredder.is_live(&key_u42), "u42's DEK is crypto-shredded");
         // Gate threshold: 0 recoverable inline-PII for the subject.
-        assert_eq!(receipt.recoverable_remaining, 0, "0 recoverable inline-PII after erase");
+        assert_eq!(
+            receipt.recoverable_remaining, 0,
+            "0 recoverable inline-PII after erase"
+        );
         assert_eq!(receipt.keys_shredded, 1);
         // Tombstones present (emitted via the outbox; durable after commit).
         assert_eq!(receipt.tombstones_emitted, 1, "one *.erased tombstone");
-        assert_eq!(outbox.committed_count(), 1, "the tombstone committed through the outbox");
+        assert_eq!(
+            outbox.committed_count(),
+            1,
+            "the tombstone committed through the outbox"
+        );
         // The erased event is tombstoned in the log (the consumer-degrade signal).
         assert!(log.is_tombstoned("01J-1"));
         // u99's DEK is UNTOUCHED (per-subject granularity, GD-4).
@@ -640,7 +696,9 @@ mod tests {
         let holder = BusHolder::new(tenant(), region(), shredder);
         let mut outbox = OutboxStore::new();
         let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
-        holder.erase("u42", &mut log, &mut outbox, minter).expect("erase");
+        holder
+            .erase("u42", &mut log, &mut outbox, minter)
+            .expect("erase");
 
         // The relay would publish the tombstone; a consumer sees it and degrades gracefully.
         let tombstone = retained_tombstone();
@@ -683,14 +741,21 @@ mod tests {
         // u42 acted on 01J-1 (actor + pii) and 01J-3 (actor only).
         assert!(before.iter().any(|e| e.event_id == "01J-1"));
         assert!(before.iter().any(|e| e.event_id == "01J-3"));
-        assert!(before.iter().all(|e| e.payload != serde_json::json!({ "status": "erased" })));
+        assert!(before
+            .iter()
+            .all(|e| e.payload != serde_json::json!({ "status": "erased" })));
 
         // After erase: the tombstoned event exports the erased marker, not the payload.
         let mut outbox = OutboxStore::new();
         let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
-        holder.erase("u42", &mut log, &mut outbox, minter).expect("erase");
+        holder
+            .erase("u42", &mut log, &mut outbox, minter)
+            .expect("erase");
         let after = holder.export("u42", &log);
-        let erased = after.iter().find(|e| e.event_id == "01J-1").expect("still present");
+        let erased = after
+            .iter()
+            .find(|e| e.event_id == "01J-1")
+            .expect("still present");
         assert_eq!(erased.payload, serde_json::json!({ "status": "erased" }));
     }
 
@@ -705,11 +770,20 @@ mod tests {
         let mut outbox = OutboxStore::new();
         let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
 
-        let err = holder.erase("u42", &mut log, &mut outbox, minter).expect_err("must be loud");
+        let err = holder
+            .erase("u42", &mut log, &mut outbox, minter)
+            .expect_err("must be loud");
         assert_eq!(err, ShredError::KmsUnavailable(key_u42.clone()));
         // The erase aborted BEFORE tombstoning/committing — nothing committed, key state unchanged.
-        assert_eq!(outbox.committed_count(), 0, "no tombstone on a failed erase");
-        assert!(!log.is_tombstoned("01J-1"), "the event is not tombstoned on a failed erase");
+        assert_eq!(
+            outbox.committed_count(),
+            0,
+            "no tombstone on a failed erase"
+        );
+        assert!(
+            !log.is_tombstoned("01J-1"),
+            "the event is not tombstoned on a failed erase"
+        );
         // (is_live still true — the key was never reached; the DSR retries.)
         assert!(shredder.is_live(&key_u42));
     }
@@ -730,8 +804,13 @@ mod tests {
         assert_eq!(first.recoverable_remaining, 0);
 
         // Re-erase (post-restore re-erasure, EB-16) — idempotent: still 0 recoverable, no panic.
-        let second = holder.erase("u42", &mut log, &mut outbox, minter).expect("re-erase");
-        assert_eq!(second.recoverable_remaining, 0, "key stays destroyed across a re-erase");
+        let second = holder
+            .erase("u42", &mut log, &mut outbox, minter)
+            .expect("re-erase");
+        assert_eq!(
+            second.recoverable_remaining, 0,
+            "key stays destroyed across a re-erase"
+        );
     }
 
     /// CDC (provider side of 2.7): the Bus's owned crypto-shred/tombstone contract — `erase`
@@ -744,7 +823,9 @@ mod tests {
         let mut outbox = OutboxStore::new();
         let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
 
-        let receipt = holder.erase("u42", &mut log, &mut outbox, minter).expect("erase");
+        let receipt = holder
+            .erase("u42", &mut log, &mut outbox, minter)
+            .expect("erase");
         // The provider-side promise: key destroyed, tombstone emitted, 0 recoverable.
         assert_eq!(receipt.recoverable_remaining, 0);
         assert!(receipt.keys_shredded >= 1);

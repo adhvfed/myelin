@@ -77,7 +77,11 @@ pub struct RegisteredToken {
 impl RegisteredToken {
     /// A references-only token at `schema_ver = 1` (the platform default — the common case).
     pub fn references_only(name: impl Into<String>) -> RegisteredToken {
-        RegisteredToken { name: name.into(), current_schema_ver: 1, shape: PayloadShape::ReferencesOnly }
+        RegisteredToken {
+            name: name.into(),
+            current_schema_ver: 1,
+            shape: PayloadShape::ReferencesOnly,
+        }
     }
 
     /// A token carrying inline personal data (crypto-shreddable behind a per-subject key).
@@ -91,7 +95,11 @@ impl RegisteredToken {
 
     /// A firehose-only token (ephemeral — never the durable bus).
     pub fn firehose(name: impl Into<String>) -> RegisteredToken {
-        RegisteredToken { name: name.into(), current_schema_ver: 1, shape: PayloadShape::EphemeralFirehose }
+        RegisteredToken {
+            name: name.into(),
+            current_schema_ver: 1,
+            shape: PayloadShape::EphemeralFirehose,
+        }
     }
 
     /// Set the current schema_ver lineage tip (a name whose payload has evolved past v1).
@@ -120,7 +128,10 @@ impl SubsystemTokenList {
     /// [`RegisteredToken`]s. The list is NOT validated here — [`TokenListHarness::register`] is the
     /// gate (so a malformed list is rejected at registration, with the offending token named).
     pub fn new(subsystem: impl Into<String>, tokens: Vec<RegisteredToken>) -> SubsystemTokenList {
-        SubsystemTokenList { subsystem: subsystem.into(), tokens }
+        SubsystemTokenList {
+            subsystem: subsystem.into(),
+            tokens,
+        }
     }
 
     /// Build a references-only list for `subsystem` from a slice of dotted names (the common case:
@@ -128,7 +139,10 @@ impl SubsystemTokenList {
     pub fn references_only(subsystem: impl Into<String>, names: &[&str]) -> SubsystemTokenList {
         SubsystemTokenList {
             subsystem: subsystem.into(),
-            tokens: names.iter().map(|n| RegisteredToken::references_only(*n)).collect(),
+            tokens: names
+                .iter()
+                .map(|n| RegisteredToken::references_only(*n))
+                .collect(),
         }
     }
 }
@@ -182,7 +196,11 @@ pub enum HarnessError {
 impl std::fmt::Display for HarnessError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            HarnessError::UngrammaticalToken { subsystem, token, cause } => write!(
+            HarnessError::UngrammaticalToken {
+                subsystem,
+                token,
+                cause,
+            } => write!(
                 f,
                 "subsystem `{subsystem}`: registered token `{token}` is ungrammatical: {cause}"
             ),
@@ -239,7 +257,9 @@ impl TokenListHarness {
     pub fn register(&mut self, list: &SubsystemTokenList) -> Result<usize, HarnessError> {
         // The leading token must itself be a canonical §6.2 subsystem token.
         if !taxonomy::SUBSYSTEM_TOKENS.contains(&list.subsystem.as_str()) {
-            return Err(HarnessError::UnknownSubsystem { subsystem: list.subsystem.clone() });
+            return Err(HarnessError::UnknownSubsystem {
+                subsystem: list.subsystem.clone(),
+            });
         }
         // Validate the WHOLE list FIRST (all-or-nothing — never a partial registration), tracking
         // intra-list duplicates as we go.
@@ -283,7 +303,8 @@ impl TokenListHarness {
         }
         // Every token passed — ADMIT the whole list (now infallible; the validation above is total).
         for tok in &list.tokens {
-            self.by_name.insert(tok.name.clone(), (list.subsystem.clone(), tok.clone()));
+            self.by_name
+                .insert(tok.name.clone(), (list.subsystem.clone(), tok.clone()));
         }
         Ok(list.tokens.len())
     }
@@ -292,7 +313,10 @@ impl TokenListHarness {
     /// addition" half of the 2.9 gate). Same validation as [`register`](Self::register); a malformed
     /// addition is rejected LOUDLY and the harness is unchanged.
     pub fn add(&mut self, subsystem: &str, tok: RegisteredToken) -> Result<(), HarnessError> {
-        let list = SubsystemTokenList { subsystem: subsystem.to_string(), tokens: vec![tok] };
+        let list = SubsystemTokenList {
+            subsystem: subsystem.to_string(),
+            tokens: vec![tok],
+        };
         self.register(&list).map(|_| ())
     }
 
@@ -345,7 +369,12 @@ mod tests {
     fn git_list() -> SubsystemTokenList {
         SubsystemTokenList::references_only(
             "git",
-            &["git.ref.updated", "git.pr.opened", "git.pr.merged", "git.repo.snapshot"],
+            &[
+                "git.ref.updated",
+                "git.pr.opened",
+                "git.pr.merged",
+                "git.repo.snapshot",
+            ],
         )
     }
 
@@ -353,7 +382,11 @@ mod tests {
     fn kn_list() -> SubsystemTokenList {
         SubsystemTokenList::references_only(
             "knowledge",
-            &["knowledge.page.created", "knowledge.page.updated", "knowledge.page.snapshot"],
+            &[
+                "knowledge.page.created",
+                "knowledge.page.updated",
+                "knowledge.page.snapshot",
+            ],
         )
     }
 
@@ -361,8 +394,16 @@ mod tests {
     #[test]
     fn harness_admits_a_full_well_formed_list() {
         let mut h = TokenListHarness::new();
-        assert_eq!(h.register(&git_list()).unwrap(), 4, "the whole git list is admitted");
-        assert_eq!(h.register(&kn_list()).unwrap(), 3, "the whole KN list is admitted");
+        assert_eq!(
+            h.register(&git_list()).unwrap(),
+            4,
+            "the whole git list is admitted"
+        );
+        assert_eq!(
+            h.register(&kn_list()).unwrap(),
+            3,
+            "the whole KN list is admitted"
+        );
         assert!(h.is_registered("git.ref.updated"));
         assert!(h.is_registered("knowledge.page.snapshot"));
         assert_eq!(h.len(), 7);
@@ -378,15 +419,25 @@ mod tests {
         // present-tense verb
         assert!(matches!(
             h.add("git", RegisteredToken::references_only("git.pr.open")),
-            Err(HarnessError::UngrammaticalToken { cause: TaxonomyError::PresentTenseVerb { .. }, .. })
+            Err(HarnessError::UngrammaticalToken {
+                cause: TaxonomyError::PresentTenseVerb { .. },
+                ..
+            })
         ));
         // uppercase token
         assert!(matches!(
             h.add("git", RegisteredToken::references_only("git.PR.opened")),
-            Err(HarnessError::UngrammaticalToken { cause: TaxonomyError::BadToken { .. }, .. })
+            Err(HarnessError::UngrammaticalToken {
+                cause: TaxonomyError::BadToken { .. },
+                ..
+            })
         ));
         // The harness is UNCHANGED after the rejected additions (all-or-nothing).
-        assert_eq!(h.len(), 4, "a rejected addition leaves the harness unchanged");
+        assert_eq!(
+            h.len(),
+            4,
+            "a rejected addition leaves the harness unchanged"
+        );
         assert!(!h.is_registered("git.pr.open"));
     }
 
@@ -401,7 +452,10 @@ mod tests {
             Err(HarnessError::ForeignPrefix { subsystem, token })
                 if subsystem == "git" && token == "ci.check.updated"
         ));
-        assert!(h.is_empty(), "a list with a foreign-prefix name registers NOTHING (all-or-nothing)");
+        assert!(
+            h.is_empty(),
+            "a list with a foreign-prefix name registers NOTHING (all-or-nothing)"
+        );
     }
 
     /// A non-canonical leading subsystem token is rejected (the leading token must be a §6.2 token).
@@ -409,23 +463,42 @@ mod tests {
     fn an_unknown_subsystem_is_rejected() {
         let mut h = TokenListHarness::new();
         let bad = SubsystemTokenList::references_only("billing", &["billing.invoice.created"]);
-        assert!(matches!(h.register(&bad), Err(HarnessError::UnknownSubsystem { .. })));
+        assert!(matches!(
+            h.register(&bad),
+            Err(HarnessError::UnknownSubsystem { .. })
+        ));
     }
 
     /// No two subsystems (nor one list twice) may register the same name — each name is minted once.
     #[test]
     fn a_cross_subsystem_name_collision_is_rejected() {
         let mut h = TokenListHarness::new();
-        h.register(&SubsystemTokenList::references_only("git", &["git.ref.updated"])).unwrap();
+        h.register(&SubsystemTokenList::references_only(
+            "git",
+            &["git.ref.updated"],
+        ))
+        .unwrap();
         // The same name registered again (even by the same subsystem) is a duplicate.
         assert!(matches!(
-            h.register(&SubsystemTokenList::references_only("git", &["git.ref.updated"])),
+            h.register(&SubsystemTokenList::references_only(
+                "git",
+                &["git.ref.updated"]
+            )),
             Err(HarnessError::DuplicateToken { .. })
         ));
         // An intra-list duplicate is caught too.
-        let dup = SubsystemTokenList::references_only("knowledge", &["knowledge.page.created", "knowledge.page.created"]);
-        assert!(matches!(h.register(&dup), Err(HarnessError::DuplicateToken { .. })));
-        assert!(h.names_for("knowledge").is_empty(), "the duplicate list registered nothing");
+        let dup = SubsystemTokenList::references_only(
+            "knowledge",
+            &["knowledge.page.created", "knowledge.page.created"],
+        );
+        assert!(matches!(
+            h.register(&dup),
+            Err(HarnessError::DuplicateToken { .. })
+        ));
+        assert!(
+            h.names_for("knowledge").is_empty(),
+            "the duplicate list registered nothing"
+        );
     }
 
     /// The schema_ver lineage is held + must be ≥ 1; a `0` is a registration bug.
@@ -439,14 +512,20 @@ mod tests {
         h.register(&list).unwrap();
         let (sub, tok) = h.lookup("knowledge.page.updated").unwrap();
         assert_eq!(sub, "knowledge");
-        assert_eq!(tok.current_schema_ver, 3, "the schema_ver lineage tip is held");
+        assert_eq!(
+            tok.current_schema_ver, 3,
+            "the schema_ver lineage tip is held"
+        );
 
         // schema_ver 0 is rejected.
         let bad = SubsystemTokenList::new(
             "knowledge",
             vec![RegisteredToken::references_only("knowledge.row.updated").at_schema_ver(0)],
         );
-        assert!(matches!(h.register(&bad), Err(HarnessError::ZeroSchemaVer { .. })));
+        assert!(matches!(
+            h.register(&bad),
+            Err(HarnessError::ZeroSchemaVer { .. })
+        ));
     }
 
     /// The payload-shape descriptor is held per name (references-only / inline-PII / firehose).
@@ -461,7 +540,13 @@ mod tests {
             ],
         );
         h.register(&list).unwrap();
-        assert_eq!(h.lookup("chat.message.created").unwrap().1.shape, PayloadShape::ReferencesOnly);
-        assert_eq!(h.lookup("chat.message.typing").unwrap().1.shape, PayloadShape::EphemeralFirehose);
+        assert_eq!(
+            h.lookup("chat.message.created").unwrap().1.shape,
+            PayloadShape::ReferencesOnly
+        );
+        assert_eq!(
+            h.lookup("chat.message.typing").unwrap().1.shape,
+            PayloadShape::EphemeralFirehose
+        );
     }
 }

@@ -31,9 +31,7 @@ use myelin_events::{
     DedupLedger, Delivered, EventEnvelope, EventHandler, EventId, EventType, InProcessBus, Message,
     OutboxStore, Relay, SubjectPattern, Timestamp, Visibility,
 };
-use myelin_identity::{
-    Literal, ObjectType, Principal, PrincipalId, PrincipalKind, SetExpr,
-};
+use myelin_identity::{Literal, ObjectType, Principal, PrincipalId, PrincipalKind, SetExpr};
 use myelin_notif::{build_router, InboxProjection, NOTIF_ITEM_CREATED, ROUTER_CONSUMER_NAME};
 use myelin_query::signals::{
     define_signal_rule, DedupKeyTpl, DedupWindow, PublishDraft, PublishKind, RuleId, Severity,
@@ -49,7 +47,11 @@ fn region() -> Region {
     Region("fr-par".into())
 }
 fn principal() -> Principal {
-    Principal::stub(PrincipalId("p-opaque-1".into()), PrincipalKind::Human, tenant())
+    Principal::stub(
+        PrincipalId("p-opaque-1".into()),
+        PrincipalKind::Human,
+        tenant(),
+    )
 }
 
 /// An `event.type == <type>` matcher (the selector a signal rule binds — contract 4.5/3.1).
@@ -148,7 +150,11 @@ fn provider_curates_signal_consumer_routes_it_to_inbox_and_emits() {
     let drafts = engine.ingest(&domain_event("evt-dom-1", "42"), &SetExpr::All, &see_all);
     assert_eq!(drafts.len(), 1, "the rule curated one Signal");
     let draft = &drafts[0];
-    assert_eq!(draft.kind, PublishKind::Opened, "the first failure opened the Signal");
+    assert_eq!(
+        draft.kind,
+        PublishKind::Opened,
+        "the first failure opened the Signal"
+    );
     // THE WIRE (provider side): the publish subject is sig.<tenant>.<severity>.<rule>.
     assert_eq!(draft.subject, "sig.acme.error.ci_run_failed");
 
@@ -172,20 +178,40 @@ fn provider_curates_signal_consumer_routes_it_to_inbox_and_emits() {
         "the engine's publish subject is on the router's whitelist (the seam agrees)"
     );
 
-    let msg = Message { subject: published.subject.0.clone(), envelope: published.clone() };
-    assert_eq!(consumer.deliver(&msg), Delivered::Acked, "the router routed the curated Signal");
+    let msg = Message {
+        subject: published.subject.0.clone(),
+        envelope: published.clone(),
+    };
+    assert_eq!(
+        consumer.deliver(&msg),
+        Delivered::Acked,
+        "the router routed the curated Signal"
+    );
 
     // The router UPSERTed exactly one inbox item (refs-not-payloads) ...
-    assert_eq!(inbox.len(), 1, "one inbox item UPSERTed from the curated Signal");
+    assert_eq!(
+        inbox.len(),
+        1,
+        "one inbox item UPSERTed from the curated Signal"
+    );
 
     // ... and emitted exactly one notif.item.created via the outbox (2.2 — the ONLY emit path).
     let bus = InProcessBus::new();
-    let relay = Relay::new(outbox.clone(), bus.clone(), || Timestamp("2026-06-20T00:00:04Z".into()));
+    let relay = Relay::new(outbox.clone(), bus.clone(), || {
+        Timestamp("2026-06-20T00:00:04Z".into())
+    });
     relay.drain_to_empty();
     let emitted = bus.consume("");
-    assert_eq!(emitted.len(), 1, "exactly one notif.item.created emitted via OutboxTx::emit");
+    assert_eq!(
+        emitted.len(),
+        1,
+        "exactly one notif.item.created emitted via OutboxTx::emit"
+    );
     assert_eq!(emitted[0].type_.0, NOTIF_ITEM_CREATED);
-    assert!(!emitted[0].contains_personal_data, "references-not-payloads: no inline PII");
+    assert!(
+        !emitted[0].contains_personal_data,
+        "references-not-payloads: no inline PII"
+    );
     // Causality correct-by-construction: caused by the Signal (root carries, depth+1).
     assert_eq!(emitted[0].correlation_id, published.correlation_id);
     assert_eq!(emitted[0].causation_id, Some(published.event_id.clone()));
@@ -205,10 +231,21 @@ fn redelivered_curated_signal_is_deduped() {
     let inbox = InboxProjection::new();
     let consumer =
         build_router(&tenant(), inbox.clone(), outbox.clone(), DedupLedger::new()).unwrap();
-    let msg = Message { subject: published.subject.0.clone(), envelope: published };
+    let msg = Message {
+        subject: published.subject.0.clone(),
+        envelope: published,
+    };
 
-    assert_eq!(consumer.deliver(&msg), Delivered::Acked, "first delivery routes");
-    assert_eq!(consumer.deliver(&msg), Delivered::Deduplicated, "redelivery dedups (2.5)");
+    assert_eq!(
+        consumer.deliver(&msg),
+        Delivered::Acked,
+        "first delivery routes"
+    );
+    assert_eq!(
+        consumer.deliver(&msg),
+        Delivered::Deduplicated,
+        "redelivery dedups (2.5)"
+    );
     assert_eq!(inbox.len(), 1, "0 dup: exactly one inbox row");
     assert_eq!(outbox.committed_count(), 1, "0 dup: exactly one emit");
     assert_eq!(consumer.name(), &ConsumerName(ROUTER_CONSUMER_NAME.into()));
@@ -233,15 +270,34 @@ fn engine_collapse_count_rides_the_wire_router_consumes_it() {
         last = Some(drafts[0].clone());
     }
     let draft = last.unwrap();
-    assert_eq!(draft.signal.count, 3, "N=3 failures → one Signal count=3 (the wire carries it)");
+    assert_eq!(
+        draft.signal.count, 3,
+        "N=3 failures → one Signal count=3 (the wire carries it)"
+    );
 
     // The router consumes the curated Signal (the skeleton routes it; the wire/Signal is stable).
     let published = published_signal_envelope("evt-sig-3", &draft);
-    let consumer = build_router(&tenant(), InboxProjection::new(), OutboxStore::new(), DedupLedger::new())
-        .unwrap();
-    let msg = Message { subject: published.subject.0.clone(), envelope: published };
-    assert_eq!(consumer.deliver(&msg), Delivered::Acked, "the router consumed the count=3 Signal");
+    let consumer = build_router(
+        &tenant(),
+        InboxProjection::new(),
+        OutboxStore::new(),
+        DedupLedger::new(),
+    )
+    .unwrap();
+    let msg = Message {
+        subject: published.subject.0.clone(),
+        envelope: published,
+    };
+    assert_eq!(
+        consumer.deliver(&msg),
+        Delivered::Acked,
+        "the router consumed the count=3 Signal"
+    );
     // Round-trip the Signal shape (the wire contract): the count survives serde.
-    let round: Signal = serde_json::from_value(serde_json::to_value(&draft.signal).unwrap()).unwrap();
-    assert_eq!(round.count, 3, "the Signal shape round-trips (the wire is stable)");
+    let round: Signal =
+        serde_json::from_value(serde_json::to_value(&draft.signal).unwrap()).unwrap();
+    assert_eq!(
+        round.count, 3,
+        "the Signal shape round-trips (the wire is stable)"
+    );
 }

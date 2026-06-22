@@ -39,9 +39,9 @@
 //! corpus (the escape surface is the kernel, not the rootfs — but the git tool image's rootfs ships
 //! `git` + `scip-index`, so it is re-drilled as its own identity).
 
+use myelin_agent::EffectKind;
 use myelin_agent_service::escape_gate::{AgentExecGate, GateRefusal, ProductionBackendId};
 use myelin_agent_service::{git_scip_index_tool_def, git_tool_defs};
-use myelin_agent::EffectKind;
 use myelin_ci_sandbox::escape_corpus::{BEGIN_MARKER, END_MARKER};
 use myelin_ci_sandbox::{
     parse_console, Backend, BackendRun, EscapeAttestation, CORPUS, CORPUS_VERSION,
@@ -55,8 +55,7 @@ const GIT_TOOL_IMAGE_ROOTFS_SHA: &str =
 
 /// The shared unified-sandbox kernel digest (the escape surface IS the kernel; the git tool image
 /// runs on the SAME hardened kernel the base runner does).
-const SHARED_KERNEL_SHA: &str =
-    "467367e6b8e88323dd23dedae3119ade9c9fca6a102a84fc2155e3ef1bec00eb";
+const SHARED_KERNEL_SHA: &str = "467367e6b8e88323dd23dedae3119ade9c9fca6a102a84fc2155e3ef1bec00eb";
 
 /// The base (non-git) runner image rootfs digest — used to prove the git tool image is a DISTINCT
 /// identity (a green attestation for the base image must NOT admit the git tool image).
@@ -125,7 +124,10 @@ fn no_code_executing_git_tool_runs_without_a_green_attestation_for_the_git_tool_
 #[test]
 fn a_red_drill_on_the_git_tool_image_mints_no_attestation() {
     let minted = attestation_for(GIT_TOOL_IMAGE_ROOTFS_SHA, /* escaped */ true);
-    assert!(minted.is_err(), "a red drill on the git tool image mints NO green attestation");
+    assert!(
+        minted.is_err(),
+        "a red drill on the git tool image mints NO green attestation"
+    );
     assert_eq!(
         AgentExecGate::admit(None, &git_tool_image_id()).unwrap_err(),
         GateRefusal::NoAttestation
@@ -200,16 +202,34 @@ fn the_code_executing_git_tools_are_the_two_section_7_tools() {
     let defs = git_tool_defs();
     // SCIP indexing is a Compute tool (the ONLY kind that touches the bare sandbox — AG-D4 gated).
     let scip = git_scip_index_tool_def();
-    assert_eq!(scip.effect_kind, EffectKind::Compute, "SCIP indexing rides the bare sandbox");
-    assert!(defs.iter().any(|d| d.name.0 == "scip_index" && d.effect_kind == EffectKind::Compute));
+    assert_eq!(
+        scip.effect_kind,
+        EffectKind::Compute,
+        "SCIP indexing rides the bare sandbox"
+    );
+    assert!(defs
+        .iter()
+        .any(|d| d.name.0 == "scip_index" && d.effect_kind == EffectKind::Compute));
     // history-rewrite is a GATED Mutate (plan-then-apply — never an un-gated sandbox bypass).
-    let hr = defs.iter().find(|d| d.name.0 == "history_rewrite").expect("history_rewrite registered");
+    let hr = defs
+        .iter()
+        .find(|d| d.name.0 == "history_rewrite")
+        .expect("history_rewrite registered");
     assert_eq!(hr.effect_kind, EffectKind::Mutate);
-    assert!(hr.requires_approval, "history-rewrite is HITL-gated (the audited erasure-admin op)");
+    assert!(
+        hr.requires_approval,
+        "history-rewrite is HITL-gated (the audited erasure-admin op)"
+    );
     // exactly ONE Compute (sandbox-bound) git tool — the SCIP indexer (so the AG-D4 git-image gate
     // is the prerequisite of exactly the SCIP code-executing path among the git tools).
-    let compute_count = defs.iter().filter(|d| d.effect_kind == EffectKind::Compute).count();
-    assert_eq!(compute_count, 1, "only SCIP indexing reaches the bare sandbox among git tools");
+    let compute_count = defs
+        .iter()
+        .filter(|d| d.effect_kind == EffectKind::Compute)
+        .count();
+    assert_eq!(
+        compute_count, 1,
+        "only SCIP indexing reaches the bare sandbox among git tools"
+    );
 }
 
 // ───────────────────────── (5) the REAL artifact (integration-gated) ─────────────────────────────

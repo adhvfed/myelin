@@ -203,9 +203,15 @@ mod tests {
     /// compile/test break here.
     #[test]
     fn review_authoring_caps_are_the_frozen_pull_request_review_permission() {
-        assert_eq!(review_authoring_required_caps(), vec!["pull_request.review".to_string()]);
+        assert_eq!(
+            review_authoring_required_caps(),
+            vec!["pull_request.review".to_string()]
+        );
         // the object-type half IS the canonical Git ReBAC name (4.9), not a local string.
-        assert_eq!(crate::rebac_fragment::object_types::PULL_REQUEST, "pull_request");
+        assert_eq!(
+            crate::rebac_fragment::object_types::PULL_REQUEST,
+            "pull_request"
+        );
     }
 
     /// **The frozen `pull_request` ReBAC fragment actually DECLARES the `review` permission the agent
@@ -215,9 +221,7 @@ mod tests {
     fn the_pull_request_fragment_declares_the_review_permission() {
         let frag = crate::rebac_fragment::pull_request_fragment();
         assert!(
-            frag.permissions
-                .iter()
-                .any(|p| p.0 == "review"),
+            frag.permissions.iter().any(|p| p.0 == "review"),
             "the Git `pull_request` fragment declares the `review` permission (4.9) the agent \
              reviewer/commenter is governed by"
         );
@@ -235,20 +239,39 @@ mod tests {
             "run:R1",
             "addresses the failing test in src/foo.rs",
         ));
-        assert!(authored.is_agent(), "an agent author is legibly flagged (is_agent)");
-        let prov = authored.agent_provenance().expect("agent provenance is REQUIRED (AI-Act)");
-        assert_eq!(prov.agent_pseudonym, "psn:agent-7", "which agent (opaque pseudonym)");
-        assert_eq!(prov.run_id, "run:R1", "which run (the traceable provenance link)");
-        assert!(prov.rationale.contains("failing test"), "the why (the rendered rationale)");
+        assert!(
+            authored.is_agent(),
+            "an agent author is legibly flagged (is_agent)"
+        );
+        let prov = authored
+            .agent_provenance()
+            .expect("agent provenance is REQUIRED (AI-Act)");
+        assert_eq!(
+            prov.agent_pseudonym, "psn:agent-7",
+            "which agent (opaque pseudonym)"
+        );
+        assert_eq!(
+            prov.run_id, "run:R1",
+            "which run (the traceable provenance link)"
+        );
+        assert!(
+            prov.rationale.contains("failing test"),
+            "the why (the rendered rationale)"
+        );
     }
 
     /// **A human-authored artifact is NOT flagged agent + carries NO agent provenance** — the closed
     /// enum makes human XOR agent unambiguous (no third "maybe agent" state to disguise an agent as).
     #[test]
     fn a_human_author_is_not_agent_and_has_no_agent_provenance() {
-        let human = Authorship::Human { author_pseudonym: "psn:human-x".into() };
+        let human = Authorship::Human {
+            author_pseudonym: "psn:human-x".into(),
+        };
         assert!(!human.is_agent(), "a human author is NOT flagged agent");
-        assert!(human.agent_provenance().is_none(), "a human author carries no agent provenance");
+        assert!(
+            human.agent_provenance().is_none(),
+            "a human author carries no agent provenance"
+        );
     }
 
     /// **Legibility ties to the git lifecycle `is_agent` bit** — an agent-submitted review rides
@@ -257,13 +280,19 @@ mod tests {
     #[test]
     fn authorship_is_agent_drives_the_lifecycle_review_is_agent_flag() {
         let agent = Authorship::Agent(AgentAuthorship::new("psn:agent-7", "run:R1", "lgtm"));
-        let human = Authorship::Human { author_pseudonym: "psn:human-x".into() };
+        let human = Authorship::Human {
+            author_pseudonym: "psn:human-x".into(),
+        };
         // a review request stamped from the authorship carries the matching is_agent bit.
-        let agent_review =
-            crate::lifecycle::Review::request("psn:agent-7", agent.is_agent());
-        let human_review =
-            crate::lifecycle::Review::request("psn:human-x", human.is_agent());
-        assert!(agent_review.is_agent, "an agent reviewer rides is_agent = true (legibility)");
-        assert!(!human_review.is_agent, "a human reviewer rides is_agent = false");
+        let agent_review = crate::lifecycle::Review::request("psn:agent-7", agent.is_agent());
+        let human_review = crate::lifecycle::Review::request("psn:human-x", human.is_agent());
+        assert!(
+            agent_review.is_agent,
+            "an agent reviewer rides is_agent = true (legibility)"
+        );
+        assert!(
+            !human_review.is_agent,
+            "a human reviewer rides is_agent = false"
+        );
     }
 }

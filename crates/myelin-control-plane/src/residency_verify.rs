@@ -122,7 +122,10 @@ pub struct StoreRegionReport {
 impl StoreRegionReport {
     /// Build a region report for a store class.
     pub fn new(store_class: ResidencyStoreClass, region: Region) -> StoreRegionReport {
-        StoreRegionReport { store_class, region }
+        StoreRegionReport {
+            store_class,
+            region,
+        }
     }
 }
 
@@ -221,7 +224,9 @@ impl ResidencySigningKey {
 impl std::fmt::Debug for ResidencySigningKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The key is a secret — the Debug surface redacts it (never logs key material).
-        f.debug_struct("ResidencySigningKey").field("key", &"<redacted>").finish()
+        f.debug_struct("ResidencySigningKey")
+            .field("key", &"<redacted>")
+            .finish()
     }
 }
 
@@ -383,7 +388,11 @@ impl ResidencyAttestationSignal {
     /// → `region_mismatches >= 1`, reads RED). A `MissingStoreReport` is reported with 0 mismatches
     /// but `stores_attested < M1_SET.len()` — the drill asserts BOTH the mismatch zero AND the full
     /// store-set coverage, so a missing store is not a silent green.
-    pub fn red(tenant_id: TenantId, region: Region, region_mismatches: u32) -> ResidencyAttestationSignal {
+    pub fn red(
+        tenant_id: TenantId,
+        region: Region,
+        region_mismatches: u32,
+    ) -> ResidencyAttestationSignal {
         ResidencyAttestationSignal {
             tenant_id,
             region,
@@ -422,11 +431,23 @@ mod tests {
         // Every M1 store class is present (store-class-ordered).
         assert_eq!(att.store_regions.len(), ResidencyStoreClass::M1_SET.len());
         for (class, r) in &att.store_regions {
-            assert_eq!(r.as_str(), "fr-par", "store `{}` reported the tenant's region", class.label());
+            assert_eq!(
+                r.as_str(),
+                "fr-par",
+                "store `{}` reported the tenant's region",
+                class.label()
+            );
         }
         // The attestation is SIGNED (a keyed MAC) and verifies under the key.
-        assert!(att.signature.starts_with("blake3-mac:"), "the attestation is signed: {}", att.signature);
-        assert!(att.verify(&key()), "the attestation verifies under the signing key");
+        assert!(
+            att.signature.starts_with("blake3-mac:"),
+            "the attestation is signed: {}",
+            att.signature
+        );
+        assert!(
+            att.verify(&key()),
+            "the attestation verifies under the signing key"
+        );
     }
 
     /// **THE FAIL-ON-MISMATCH LEG (no silent pass, EI-01 §3): a store reporting a region ≠ the
@@ -450,8 +471,14 @@ mod tests {
                 store_region: Region::new("eu-north"),
             }
         );
-        assert!(err.to_string().contains("no-global-pool"), "loud reason: {err}");
-        assert!(err.to_string().contains("not a silent pass"), "loud reason: {err}");
+        assert!(
+            err.to_string().contains("no-global-pool"),
+            "loud reason: {err}"
+        );
+        assert!(
+            err.to_string().contains("not a silent pass"),
+            "loud reason: {err}"
+        );
     }
 
     /// **A missing M1 store report FAILS fail-closed (a silently-absent store is the global-pool).**
@@ -474,7 +501,10 @@ mod tests {
                 store_class: ResidencyStoreClass::Kms,
             }
         );
-        assert!(err.to_string().contains("fail-closed"), "loud reason: {err}");
+        assert!(
+            err.to_string().contains("fail-closed"),
+            "loud reason: {err}"
+        );
     }
 
     /// **The attestation is signed + PII-free: a TAMPERED attestation fails verification.** Changing
@@ -489,7 +519,10 @@ mod tests {
         assert!(att.verify(&key()), "the genuine attestation verifies");
         // Tamper: claim a different region while keeping the old signature.
         att.region = Region::new("eu-north");
-        assert!(!att.verify(&key()), "a tampered region MUST fail verification (the MAC binds it)");
+        assert!(
+            !att.verify(&key()),
+            "a tampered region MUST fail verification (the MAC binds it)"
+        );
         // Tamper: a forged signature does not verify.
         let mut forged = residency_verify(&tenant, &region, &all_in_region("fr-par"), &key())
             .expect("a signed attestation");
@@ -499,7 +532,10 @@ mod tests {
         let other = ResidencySigningKey::from_bytes([9u8; 32]);
         let genuine = residency_verify(&tenant, &region, &all_in_region("fr-par"), &key())
             .expect("a signed attestation");
-        assert!(!genuine.verify(&other), "a different key does not verify the attestation");
+        assert!(
+            !genuine.verify(&other),
+            "a different key does not verify the attestation"
+        );
     }
 
     /// **The attestation body is PII-free** — it carries only opaque ids / region codes / store-class
@@ -527,7 +563,10 @@ mod tests {
         }
         // The signing key Debug redacts the secret (never logs key material).
         let dbg = format!("{:?}", key());
-        assert!(dbg.contains("<redacted>"), "the signing key Debug redacts the secret: {dbg}");
+        assert!(
+            dbg.contains("<redacted>"),
+            "the signing key Debug redacts the secret: {dbg}"
+        );
         assert!(!dbg.contains("7"), "the key bytes are not logged: {dbg}");
     }
 
@@ -540,8 +579,14 @@ mod tests {
         let att = residency_verify(&tenant, &region, &all_in_region("fr-par"), &key())
             .expect("a signed attestation");
         let green = ResidencyAttestationSignal::green(&att);
-        assert_eq!(green.stores_attested, ResidencyStoreClass::M1_SET.len() as u32);
-        assert_eq!(green.region_mismatches, 0, "the green artifact is 0 mismatches");
+        assert_eq!(
+            green.stores_attested,
+            ResidencyStoreClass::M1_SET.len() as u32
+        );
+        assert_eq!(
+            green.region_mismatches, 0,
+            "the green artifact is 0 mismatches"
+        );
         assert_eq!(green.region.as_str(), "fr-par");
 
         let red = ResidencyAttestationSignal::red(tenant, region, 1);
@@ -552,8 +597,15 @@ mod tests {
     /// pins the M1 coverage so the P-CP-17 follow-on is a visible EXTENSION, not a silent redefinition.
     #[test]
     fn the_m1_store_set_is_oltp_blob_index_kms() {
-        assert_eq!(ResidencyStoreClass::M1_SET.len(), 4, "the M1 set is OLTP/blob/index/KMS");
-        let labels: Vec<&str> = ResidencyStoreClass::M1_SET.iter().map(|c| c.label()).collect();
+        assert_eq!(
+            ResidencyStoreClass::M1_SET.len(),
+            4,
+            "the M1 set is OLTP/blob/index/KMS"
+        );
+        let labels: Vec<&str> = ResidencyStoreClass::M1_SET
+            .iter()
+            .map(|c| c.label())
+            .collect();
         assert_eq!(labels, vec!["oltp", "blob", "index_search", "kms"]);
         // CI surfaces are NOT in the M1 set (they are the P-CP-17 follow-on) — there is no CI variant
         // here, so this is structurally pinned: adding CI coverage is a deliberate edit in P-CP-17.
@@ -581,7 +633,10 @@ mod tests {
             verified: bool,
         }
         impl AuditorVerdict {
-            fn from_attestation(att: &SignedAttestation, key: &ResidencySigningKey) -> AuditorVerdict {
+            fn from_attestation(
+                att: &SignedAttestation,
+                key: &ResidencySigningKey,
+            ) -> AuditorVerdict {
                 AuditorVerdict {
                     tenant: att.tenant_id.as_str().to_string(),
                     region: att.region.as_str().to_string(),
@@ -600,6 +655,9 @@ mod tests {
         assert_eq!(verdict.tenant, "01J0ACME");
         assert_eq!(verdict.region, "fr-par");
         assert_eq!(verdict.stores_attested, ResidencyStoreClass::M1_SET.len());
-        assert!(verdict.verified, "the auditor verifies the no-global-pool attestation");
+        assert!(
+            verdict.verified,
+            "the auditor verifies the no-global-pool attestation"
+        );
     }
 }

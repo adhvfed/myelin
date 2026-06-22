@@ -207,16 +207,25 @@ pub struct StoreClassifier {
 impl StoreClassifier {
     /// An empty classifier (no OLTP holder assignment declared yet).
     pub fn new() -> StoreClassifier {
-        StoreClassifier { declarations: Vec::new() }
+        StoreClassifier {
+            declarations: Vec::new(),
+        }
     }
 
     /// Build a classifier from a set of OLTP store→holder assignments.
     pub fn of(decls: impl IntoIterator<Item = StoreHolder>) -> StoreClassifier {
-        StoreClassifier { declarations: decls.into_iter().collect() }
+        StoreClassifier {
+            declarations: decls.into_iter().collect(),
+        }
     }
 
     /// Declare an OLTP store's H-holder.
-    pub fn declare(&mut self, kind: StoreKind, name: &'static str, holder: Holder) -> &mut StoreClassifier {
+    pub fn declare(
+        &mut self,
+        kind: StoreKind,
+        name: &'static str,
+        holder: Holder,
+    ) -> &mut StoreClassifier {
         self.declarations.push(StoreHolder::new(kind, name, holder));
         self
     }
@@ -238,11 +247,7 @@ impl StoreClassifier {
 /// - **search index** → always [`Holder::H7SearchIndex`] (the single search-index holder);
 /// - **OLTP** → the subsystem-specific holder the [`StoreClassifier`] declares for that store name
 ///   (H1 Git / H3 Issues / H15 Identity / …). An OLTP store with NO declared holder is the orphan.
-pub fn classify_store(
-    kind: StoreKind,
-    name: &str,
-    classifier: &StoreClassifier,
-) -> Option<Holder> {
+pub fn classify_store(kind: StoreKind, name: &str, classifier: &StoreClassifier) -> Option<Holder> {
     match kind {
         // The three non-OLTP kinds map structurally to their single platform-wide holder — the
         // SAME holder regardless of which subsystem opens them (gdpr §3.2 lists ONE object store,
@@ -307,7 +312,10 @@ pub fn holder_completeness(
     opened
         .iter()
         .filter(|reg| classify_store(reg.kind, reg.name, classifier).is_none())
-        .map(|reg| OrphanStore { kind: reg.kind, name: reg.name.to_string() })
+        .map(|reg| OrphanStore {
+            kind: reg.kind,
+            name: reg.name.to_string(),
+        })
         .collect()
 }
 
@@ -340,12 +348,19 @@ mod tests {
     /// failure, so the substrate catalog can never silently diverge from the GDPR-owned list.
     #[test]
     fn catalog_is_exhaustive_eighteen() {
-        assert_eq!(Holder::ALL.len(), 18, "the §3.2 holder list is exhaustive: H1–H18");
+        assert_eq!(
+            Holder::ALL.len(),
+            18,
+            "the §3.2 holder list is exhaustive: H1–H18"
+        );
         // every H-tag is distinct H1..H18 (no duplicate / no gap).
         let tags: BTreeSet<&str> = Holder::ALL.iter().map(|h| h.tag()).collect();
         assert_eq!(tags.len(), 18, "the eighteen H-tags are distinct");
         for n in 1..=18 {
-            assert!(tags.contains(format!("H{n}").as_str()), "the catalog names H{n}");
+            assert!(
+                tags.contains(format!("H{n}").as_str()),
+                "the catalog names H{n}"
+            );
         }
     }
 
@@ -378,10 +393,22 @@ mod tests {
             "the holder-completeness assertion passes — no store outside the exhaustive list"
         );
         // the four classify to exactly their §3.2 holders.
-        assert_eq!(classify_store(StoreKind::Oltp, "issue_oltp", &classifier), Some(Holder::H3Issues));
-        assert_eq!(classify_store(StoreKind::Blob, "issue_blobs", &classifier), Some(Holder::H6BlobStore));
-        assert_eq!(classify_store(StoreKind::Cache, "issue_cache", &classifier), Some(Holder::H9Caches));
-        assert_eq!(classify_store(StoreKind::SearchIndex, "issue_index", &classifier), Some(Holder::H7SearchIndex));
+        assert_eq!(
+            classify_store(StoreKind::Oltp, "issue_oltp", &classifier),
+            Some(Holder::H3Issues)
+        );
+        assert_eq!(
+            classify_store(StoreKind::Blob, "issue_blobs", &classifier),
+            Some(Holder::H6BlobStore)
+        );
+        assert_eq!(
+            classify_store(StoreKind::Cache, "issue_cache", &classifier),
+            Some(Holder::H9Caches)
+        );
+        assert_eq!(
+            classify_store(StoreKind::SearchIndex, "issue_index", &classifier),
+            Some(Holder::H7SearchIndex)
+        );
     }
 
     /// **The RED verdict (a deliberately-orphaned store fails).** A service opens an OLTP store but
@@ -397,7 +424,10 @@ mod tests {
         let orphans = holder_completeness(reg.registrations(), &classifier);
         assert_eq!(
             orphans,
-            vec![OrphanStore { kind: StoreKind::Oltp, name: "rogue_oltp".into() }],
+            vec![OrphanStore {
+                kind: StoreKind::Oltp,
+                name: "rogue_oltp".into()
+            }],
             "the OLTP store with no declared holder is the orphan"
         );
         let err = assert_holder_completeness(reg.registrations(), &classifier)
@@ -418,12 +448,25 @@ mod tests {
         reg.open(StoreKind::Oltp, "issue_oltp"); // declared.
         reg.open(StoreKind::Oltp, "shadow_oltp"); // NOT declared → orphan.
         reg.open(StoreKind::Blob, "issue_blobs"); // structural H6.
-        let classifier =
-            StoreClassifier::of([StoreHolder::new(StoreKind::Oltp, "issue_oltp", Holder::H3Issues)]);
+        let classifier = StoreClassifier::of([StoreHolder::new(
+            StoreKind::Oltp,
+            "issue_oltp",
+            Holder::H3Issues,
+        )]);
 
         let orphans = holder_completeness(reg.registrations(), &classifier);
-        assert_eq!(orphans.len(), 1, "exactly the one undeclared OLTP store is the orphan");
-        assert_eq!(orphans[0], OrphanStore { kind: StoreKind::Oltp, name: "shadow_oltp".into() });
+        assert_eq!(
+            orphans.len(),
+            1,
+            "exactly the one undeclared OLTP store is the orphan"
+        );
+        assert_eq!(
+            orphans[0],
+            OrphanStore {
+                kind: StoreKind::Oltp,
+                name: "shadow_oltp".into()
+            }
+        );
     }
 
     /// The real M1 holders' OLTP stores classify to their §3.2 H-holders (the confirmation against
@@ -460,7 +503,10 @@ mod tests {
         for d in classifier.declarations() {
             reg.open(d.kind, d.name);
         }
-        assert_eq!(assert_holder_completeness(reg.registrations(), &classifier), Ok(()));
+        assert_eq!(
+            assert_holder_completeness(reg.registrations(), &classifier),
+            Ok(())
+        );
     }
 
     /// An empty harness (no store opened) trivially passes — no opened store ⇒ no orphan.

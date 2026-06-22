@@ -92,7 +92,11 @@ fn def(name: &str, subsystem: &str) -> ToolDef {
 #[test]
 fn consumer_scopes_over_tool_def_in_one_call_and_carries_the_zookie() {
     let cat = Catalogue {
-        defs: vec![def("merge", "git"), def("close", "issues"), def("deploy", "ci")],
+        defs: vec![
+            def("merge", "git"),
+            def("close", "issues"),
+            def("deploy", "ci"),
+        ],
     };
     let provider = ListObjectsProvider {
         // The provider push-down admits exactly the git/merge and issues/close tools (the S8 path).
@@ -112,7 +116,11 @@ fn consumer_scopes_over_tool_def_in_one_call_and_carries_the_zookie() {
     let scoped = build_scoped_tool_list(&cat, &provider, "psn:agent-7", &Zookie("z-run".into()));
 
     // ONE list_objects call (no N+1 — the consumer never calls per-tool check).
-    assert_eq!(provider.calls.get(), 1, "the consumer issues ONE list_objects call");
+    assert_eq!(
+        provider.calls.get(),
+        1,
+        "the consumer issues ONE list_objects call"
+    );
     assert_eq!(scoped.query_count, 1);
     // The consumer scoped over the `tool_def` object type with the `tool.use` permission (4.3).
     assert_eq!(

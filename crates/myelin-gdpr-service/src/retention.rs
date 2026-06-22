@@ -370,10 +370,7 @@ impl<'a> RetentionEngine<'a> {
         // §5.1 — the legal-hold gate. A retention-expiry IS an erase (it deletes data), so it is
         // gated as an erasure: an active hold (or an un-readable registry, fail-safe-to-suspend)
         // DEFERS the deletion. We do NOT run a single holder under a hold (0 held-scope deletions).
-        match self
-            .holds
-            .verdict(crate::dsr::DsrKind::Erasure, scope)
-        {
+        match self.holds.verdict(crate::dsr::DsrKind::Erasure, scope) {
             HoldVerdict::Deferred => Ok(ExpiryOutcome::DeferredUnderHold),
             HoldVerdict::Proceed => {
                 // No hold bars the scope — run the §3 erasure mechanisms via the EXISTING
@@ -399,7 +396,9 @@ pub enum ExpiryError {
 impl core::fmt::Display for ExpiryError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            ExpiryError::HolderFanOut(e) => write!(f, "retention-expiry holder fan-out failed: {e}"),
+            ExpiryError::HolderFanOut(e) => {
+                write!(f, "retention-expiry holder fan-out failed: {e}")
+            }
         }
     }
 }
@@ -425,7 +424,10 @@ pub fn tenant_delete_immediately() -> RetentionInput {
 /// Convenience: a [`RetentionInput`] for a legal-retention floor of `d` (a lawful MINIMUM retention —
 /// a 6-month security-log floor; the §6.4 audit carve-out).
 pub fn legal_floor(d: Duration) -> RetentionInput {
-    RetentionInput::new(RetentionClass::AuditCarveOut(d), RetentionSource::LegalFloor)
+    RetentionInput::new(
+        RetentionClass::AuditCarveOut(d),
+        RetentionSource::LegalFloor,
+    )
 }
 
 #[cfg(test)]
@@ -433,7 +435,9 @@ mod tests {
     use super::*;
     use crate::fanout::HoldScope;
     use crate::holders::{InMemoryShredKms, ShredKeyClass, ShredKeyHandle};
-    use crate::orchestration::{holder_ids, EraseChecklist, SeamHolder, UpstreamHolderOrchestrator};
+    use crate::orchestration::{
+        holder_ids, EraseChecklist, SeamHolder, UpstreamHolderOrchestrator,
+    };
     use myelin_gdpr::{PersonalDataHolder, SubjectRef, TenantId};
     use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 
@@ -444,11 +448,18 @@ mod tests {
     }
 
     fn subject(id: &str) -> SubjectRef {
-        SubjectRef::new(Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, t("acme")))
+        SubjectRef::new(Principal::stub(
+            PrincipalId(id.into()),
+            PrincipalKind::Human,
+            t("acme"),
+        ))
     }
 
     fn subject_scope(s: &str) -> EraseScope {
-        EraseScope::Subject { subject: subject(s), tenant: t("acme") }
+        EraseScope::Subject {
+            subject: subject(s),
+            tenant: t("acme"),
+        }
     }
 
     fn kms_with_all_holder_keys(tenant: &TenantId, base_epoch: u64) -> InMemoryShredKms {
@@ -465,7 +476,10 @@ mod tests {
         .enumerate()
         {
             kms.provision(
-                ShredKeyHandle { tenant: tenant.clone(), class: ShredKeyClass::Subject((*id).to_string()) },
+                ShredKeyHandle {
+                    tenant: tenant.clone(),
+                    class: ShredKeyClass::Subject((*id).to_string()),
+                },
                 base_epoch + i as u64,
             );
         }
@@ -482,7 +496,12 @@ mod tests {
             holder_ids::BACKUP,
         ]
         .into_iter()
-        .map(|id| (id, SeamHolder::new(id, ShredKeyClass::Subject(id.to_string()), kms)))
+        .map(|id| {
+            (
+                id,
+                SeamHolder::new(id, ShredKeyClass::Subject(id.to_string()), kms),
+            )
+        })
         .collect()
     }
 
@@ -490,7 +509,10 @@ mod tests {
         holders: &'a [(&'static str, SeamHolder<'a>)],
     ) -> UpstreamHolderOrchestrator<'a> {
         UpstreamHolderOrchestrator::register_m1_upstream(
-            holders.iter().map(|(id, h)| (*id, h as &dyn PersonalDataHolder)).collect(),
+            holders
+                .iter()
+                .map(|(id, h)| (*id, h as &dyn PersonalDataHolder))
+                .collect(),
         )
     }
 
@@ -506,8 +528,16 @@ mod tests {
             platform_default(Duration::from_secs(90 * DAY)),
             tenant_window(Duration::from_secs(30 * DAY)),
         ]);
-        assert_eq!(eff.window_secs(), 30 * DAY, "the tenant's 30 days (most restrictive) wins");
-        assert_eq!(eff.winning_source, RetentionSource::TenantPolicy, "recorded: the tenant won");
+        assert_eq!(
+            eff.window_secs(),
+            30 * DAY,
+            "the tenant's 30 days (most restrictive) wins"
+        );
+        assert_eq!(
+            eff.winning_source,
+            RetentionSource::TenantPolicy,
+            "recorded: the tenant won"
+        );
         assert!(!eff.floor_clamped, "no floor involved");
     }
 
@@ -523,9 +553,20 @@ mod tests {
             tenant_delete_immediately(),
             legal_floor(Duration::from_secs(six_months)),
         ]);
-        assert_eq!(eff.window_secs(), six_months, "the legal floor clamps the effective window UP");
-        assert_eq!(eff.winning_source, RetentionSource::LegalFloor, "recorded: the floor won");
-        assert!(eff.floor_clamped, "the floor clamped the tenant delete-immediately UP");
+        assert_eq!(
+            eff.window_secs(),
+            six_months,
+            "the legal floor clamps the effective window UP"
+        );
+        assert_eq!(
+            eff.winning_source,
+            RetentionSource::LegalFloor,
+            "recorded: the floor won"
+        );
+        assert!(
+            eff.floor_clamped,
+            "the floor clamped the tenant delete-immediately UP"
+        );
     }
 
     /// **A floor that is SHORTER than the tenant's window does NOT change the result** (the floor is
@@ -538,9 +579,16 @@ mod tests {
             tenant_window(Duration::from_secs(365 * DAY)), // tenant retains a year
             legal_floor(Duration::from_secs(30 * DAY)),    // a 30-day minimum
         ]);
-        assert_eq!(eff.window_secs(), 365 * DAY, "the tenant year exceeds the floor — tenant wins");
+        assert_eq!(
+            eff.window_secs(),
+            365 * DAY,
+            "the tenant year exceeds the floor — tenant wins"
+        );
         assert_eq!(eff.winning_source, RetentionSource::TenantPolicy);
-        assert!(!eff.floor_clamped, "the floor did not clamp (tenant > floor)");
+        assert!(
+            !eff.floor_clamped,
+            "the floor did not clamp (tenant > floor)"
+        );
     }
 
     /// **No inputs ⇒ retain (open-ended), never auto-delete** (§2 stop-the-bleeding: never delete
@@ -550,8 +598,15 @@ mod tests {
         let holds = LegalHoldRegistry::new();
         let engine = RetentionEngine::new(&holds);
         let eff = engine.effective_retention(&[]);
-        assert_eq!(eff.window_secs(), u64::MAX, "open-ended — retain, never auto-delete");
-        assert!(!eff.has_elapsed(0, u64::MAX), "an open-ended window never elapses");
+        assert_eq!(
+            eff.window_secs(),
+            u64::MAX,
+            "open-ended — retain, never auto-delete"
+        );
+        assert!(
+            !eff.has_elapsed(0, u64::MAX),
+            "an open-ended window never elapses"
+        );
     }
 
     /// **A tenant policy beats an EQUAL-length platform default** (the tie breaks toward the tenant —
@@ -565,7 +620,11 @@ mod tests {
             tenant_window(Duration::from_secs(30 * DAY)),
         ]);
         assert_eq!(eff.window_secs(), 30 * DAY);
-        assert_eq!(eff.winning_source, RetentionSource::TenantPolicy, "tie → the tenant won");
+        assert_eq!(
+            eff.winning_source,
+            RetentionSource::TenantPolicy,
+            "tie → the tenant won"
+        );
     }
 
     /// **`has_elapsed` is deterministic over the clock** — a field stored at `t0` with a 30-day
@@ -577,8 +636,14 @@ mod tests {
             winning_source: RetentionSource::TenantPolicy,
             floor_clamped: false,
         };
-        assert!(!eff.has_elapsed(1000, 1000 + 29 * DAY), "29 days < 30-day window — not elapsed");
-        assert!(eff.has_elapsed(1000, 1000 + 30 * DAY), "30 days reaches the window — elapsed");
+        assert!(
+            !eff.has_elapsed(1000, 1000 + 29 * DAY),
+            "29 days < 30-day window — not elapsed"
+        );
+        assert!(
+            eff.has_elapsed(1000, 1000 + 30 * DAY),
+            "30 days reaches the window — elapsed"
+        );
     }
 
     // ───────────── the legal-hold-aware suspend-don't-delete expiry (§5.1, GA-D6) ─────────────
@@ -595,29 +660,60 @@ mod tests {
         let engine = RetentionEngine::new(&holds);
 
         // Set a hold over the subject — the engine MUST suspend the expiry.
-        holds.set(HoldScope::Subject { tenant: "acme".into(), subject: "u-held".into() }, true);
+        holds.set(
+            HoldScope::Subject {
+                tenant: "acme".into(),
+                subject: "u-held".into(),
+            },
+            true,
+        );
         let scope = subject_scope("u-held");
         let checklist = EraseChecklist::new();
 
         let outcome = engine.expire(&scope, &upstream, &checklist).unwrap();
-        assert_eq!(outcome, ExpiryOutcome::DeferredUnderHold, "suspend-don't-delete under the hold");
+        assert_eq!(
+            outcome,
+            ExpiryOutcome::DeferredUnderHold,
+            "suspend-don't-delete under the hold"
+        );
         assert!(!outcome.ran_deletion(), "0 held-scope deletions");
         // NOT A SINGLE HOLDER was erased under the hold (the silent-data-loss invariant, §2).
         assert_eq!(checklist.done_count(), 0, "no holder driven under the hold");
         for (_, h) in &holders {
-            assert_eq!(h.erase_call_count(), 0, "0 held-scope deletions — no holder called");
+            assert_eq!(
+                h.erase_call_count(),
+                0,
+                "0 held-scope deletions — no holder called"
+            );
         }
 
         // LIFT the hold and re-`expire`: the deferred deletion RESUMES (the fan-out now runs).
-        holds.set(HoldScope::Subject { tenant: "acme".into(), subject: "u-held".into() }, false);
+        holds.set(
+            HoldScope::Subject {
+                tenant: "acme".into(),
+                subject: "u-held".into(),
+            },
+            false,
+        );
         let outcome2 = engine.expire(&scope, &upstream, &checklist).unwrap();
-        assert!(outcome2.ran_deletion(), "the deferred deletion resumes on hold-lift");
+        assert!(
+            outcome2.ran_deletion(),
+            "the deferred deletion resumes on hold-lift"
+        );
         let receipts = match outcome2 {
             ExpiryOutcome::Expired(r) => r,
             other => panic!("expected Expired on resume, got {other:?}"),
         };
-        assert_eq!(receipts.len(), 6, "every holder fanned on resume (the §3 mechanisms)");
-        assert_eq!(receipts[0].holder_id, holder_ids::IDENTITY, "Identity FIRST (canonical order)");
+        assert_eq!(
+            receipts.len(),
+            6,
+            "every holder fanned on resume (the §3 mechanisms)"
+        );
+        assert_eq!(
+            receipts[0].holder_id,
+            holder_ids::IDENTITY,
+            "Identity FIRST (canonical order)"
+        );
         // Every receipt records its destroyed key epoch (the §3 crypto-shred mechanism, auditable).
         for hr in &receipts {
             assert!(hr.receipt.receipt.key_epoch_destroyed.is_some());
@@ -636,7 +732,11 @@ mod tests {
         let engine = RetentionEngine::new(&holds);
 
         let outcome = engine
-            .expire(&subject_scope("u-expire"), &upstream, &EraseChecklist::new())
+            .expire(
+                &subject_scope("u-expire"),
+                &upstream,
+                &EraseChecklist::new(),
+            )
             .unwrap();
         assert!(outcome.ran_deletion());
         let receipts = match outcome {
@@ -661,7 +761,11 @@ mod tests {
         let outcome = engine
             .expire(&subject_scope("anyone"), &upstream, &EraseChecklist::new())
             .unwrap();
-        assert_eq!(outcome, ExpiryOutcome::DeferredUnderHold, "the tenant hold suspends the expiry");
+        assert_eq!(
+            outcome,
+            ExpiryOutcome::DeferredUnderHold,
+            "the tenant hold suspends the expiry"
+        );
         for (_, h) in &holders {
             assert_eq!(h.erase_call_count(), 0, "0 held-scope deletions");
         }
@@ -689,7 +793,11 @@ mod tests {
             "an un-readable registry fails safe to suspend (never auto-deletes)"
         );
         for (_, h) in &holders {
-            assert_eq!(h.erase_call_count(), 0, "fail-safe-to-suspend — no holder called");
+            assert_eq!(
+                h.erase_call_count(),
+                0,
+                "fail-safe-to-suspend — no holder called"
+            );
         }
     }
 
@@ -705,20 +813,30 @@ mod tests {
             RetentionClass::Fixed(Duration::from_secs(180 * DAY)),
             RetentionSource::LegalFloor,
         );
-        assert!(by_source.is_legal_floor(), "LegalFloor source alone makes it a floor");
+        assert!(
+            by_source.is_legal_floor(),
+            "LegalFloor source alone makes it a floor"
+        );
         // an AuditCarveOut policy + a non-LegalFloor source — a floor by POLICY alone.
         let by_policy = RetentionInput::new(
             RetentionClass::AuditCarveOut(Duration::from_secs(180 * DAY)),
             RetentionSource::PlatformDefault,
         );
-        assert!(by_policy.is_legal_floor(), "AuditCarveOut policy alone makes it a floor");
+        assert!(
+            by_policy.is_legal_floor(),
+            "AuditCarveOut policy alone makes it a floor"
+        );
 
         // and the merge HONOURS a source-named floor: a tenant "delete immediately" is clamped UP by
         // a Fixed-window floor named only by its LegalFloor source (the `||` is load-bearing here).
         let holds = LegalHoldRegistry::new();
         let engine = RetentionEngine::new(&holds);
         let eff = engine.effective_retention(&[tenant_delete_immediately(), by_source]);
-        assert_eq!(eff.window_secs(), 180 * DAY, "the source-named floor clamps the tenant UP");
+        assert_eq!(
+            eff.window_secs(),
+            180 * DAY,
+            "the source-named floor clamps the tenant UP"
+        );
         assert_eq!(eff.winning_source, RetentionSource::LegalFloor);
     }
 
@@ -735,13 +853,20 @@ mod tests {
             tenant_window(Duration::from_secs(thirty)),
             legal_floor(Duration::from_secs(thirty)), // floor == pick, exactly.
         ]);
-        assert_eq!(eff.window_secs(), thirty, "equal windows — the window is the same either way");
+        assert_eq!(
+            eff.window_secs(),
+            thirty,
+            "equal windows — the window is the same either way"
+        );
         assert_eq!(
             eff.winning_source,
             RetentionSource::TenantPolicy,
             "at floor == pick the TENANT wins (the clamp is strict `>`, not `>=`)"
         );
-        assert!(!eff.floor_clamped, "the floor did not clamp (it equals, not exceeds, the pick)");
+        assert!(
+            !eff.floor_clamped,
+            "the floor did not clamp (it equals, not exceeds, the pick)"
+        );
     }
 
     /// **Only-floors inputs yield the longest floor** (the lawful minimum, recorded as the floor
@@ -754,7 +879,11 @@ mod tests {
             legal_floor(Duration::from_secs(30 * DAY)),
             legal_floor(Duration::from_secs(180 * DAY)),
         ]);
-        assert_eq!(eff.window_secs(), 180 * DAY, "the longest floor is the lawful minimum");
+        assert_eq!(
+            eff.window_secs(),
+            180 * DAY,
+            "the longest floor is the lawful minimum"
+        );
         assert_eq!(eff.winning_source, RetentionSource::LegalFloor);
         assert!(eff.floor_clamped);
     }

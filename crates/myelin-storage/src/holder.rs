@@ -15,7 +15,7 @@
 
 use myelin_gdpr::{
     DsrError, EraseReceipt, EraseScope, LocateReport, Patch, PersonalDataHolder, PortableBundle,
-    RectifyReceipt, Result as DsrResult, RestrictReceipt, SubjectRef, TenantId,
+    RectifyReceipt, RestrictReceipt, Result as DsrResult, SubjectRef, TenantId,
 };
 
 /// The typed receipt that an OLTP store was registered as a [`PersonalDataHolder`] — proof
@@ -165,7 +165,12 @@ mod tests {
     #[test]
     fn store_holder_registers_itself() {
         let holder = OltpStoreHolder::new("worklog_oltp");
-        assert_eq!(holder.register(), OltpHolderRegistration { store: "worklog_oltp" });
+        assert_eq!(
+            holder.register(),
+            OltpHolderRegistration {
+                store: "worklog_oltp"
+            }
+        );
     }
 
     /// The BlobStore (P-ST-03) auto-registers as a holder — the blob-store half of "every
@@ -175,7 +180,9 @@ mod tests {
         let holder = BlobStoreHolder::new("git_pack_blobs");
         assert_eq!(
             holder.register(),
-            OltpHolderRegistration { store: "git_pack_blobs" }
+            OltpHolderRegistration {
+                store: "git_pack_blobs"
+            }
         );
         let _s = subject();
         // The frozen shape compiles + the erase body is the named crypto-shred floor.
@@ -198,13 +205,14 @@ mod tests {
         let holder = OltpStoreHolder::new("issue_oltp");
         let s = subject();
         assert!(holder.locate(&s, tenant()).is_err());
-        assert!(holder
-            .erase(EraseScope::Tenant(tenant()))
-            .is_err());
+        assert!(holder.erase(EraseScope::Tenant(tenant())).is_err());
         // the floor marker names where the real body lands.
         match holder.export(&s, tenant()) {
             Err(DsrError(msg)) => {
-                assert!(msg.contains("GDPR M1"), "floor must name its follow-on: {msg}")
+                assert!(
+                    msg.contains("GDPR M1"),
+                    "floor must name its follow-on: {msg}"
+                )
             }
             Ok(_) => panic!("export body must be the GDPR-M1 floor on P-ST-01"),
         }

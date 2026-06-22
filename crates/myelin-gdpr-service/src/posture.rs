@@ -392,19 +392,31 @@ mod tests {
     #[test]
     fn render_is_the_single_source_text() {
         let doc = CANONICAL_POSTURE.render();
-        assert!(doc.contains(POSTURE_ANCHOR), "the render cites the canonical anchor");
-        assert!(doc.contains("[OPEN — LEGAL]"), "the render carries the one [OPEN — LEGAL] tag");
+        assert!(
+            doc.contains(POSTURE_ANCHOR),
+            "the render cites the canonical anchor"
+        );
+        assert!(
+            doc.contains("[OPEN — LEGAL]"),
+            "the render carries the one [OPEN — LEGAL] tag"
+        );
         assert!(
             doc.to_ascii_lowercase().contains("by reference"),
             "the render states the by-reference instantiation rule"
         );
         // Every structural-floor lever statement appears once.
         for lever in StructuralLever::all() {
-            assert!(doc.contains(lever.statement()), "the render states lever {lever:?}");
+            assert!(
+                doc.contains(lever.statement()),
+                "the render states lever {lever:?}"
+            );
         }
         // The marker phrases are real, load-bearing canonical text (present in the ONE artifact).
         for marker in restatement_markers() {
-            assert!(doc.contains(marker), "marker {marker:?} is canonical text in the render");
+            assert!(
+                doc.contains(marker),
+                "marker {marker:?} is canonical text in the render"
+            );
         }
     }
 
@@ -418,8 +430,7 @@ mod tests {
         let git_like = SubsystemReference {
             subsystem: "git",
             cited_anchor: POSTURE_ANCHOR,
-            section_text:
-                "Free-text / immutable-content erasure follows the platform posture in \
+            section_text: "Free-text / immutable-content erasure follows the platform posture in \
                  00-reconciliation-decisions.md §X-7 / gdpr-and-audit.md §7 (contract 10.9). \
                  Git commits are pseudonymous-by-default; the immutable hash holds only the \
                  pseudonym form.",

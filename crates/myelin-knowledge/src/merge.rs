@@ -102,7 +102,11 @@ impl BlockState {
     /// A fresh block at `version = 1` (the first write; the [`crate::store`] DDL's `version bigint NOT
     /// NULL` is seeded to 1 at insert — a `version = 0` would mean "never written").
     pub fn new(inline: impl Into<String>, props: impl Into<String>) -> BlockState {
-        BlockState { inline: inline.into(), props: props.into(), version: 1 }
+        BlockState {
+            inline: inline.into(),
+            props: props.into(),
+            version: 1,
+        }
     }
 }
 
@@ -161,7 +165,11 @@ impl std::fmt::Display for CasError {
         match self {
             CasError::NoSuchBlock(b) => write!(f, "no content row for block {}", b.as_str()),
             CasError::DuplicateBlock(b) => {
-                write!(f, "content row for block {} already exists (insert once)", b.as_str())
+                write!(
+                    f,
+                    "content row for block {} already exists (insert once)",
+                    b.as_str()
+                )
             }
         }
     }
@@ -205,7 +213,8 @@ impl CasStore {
         if self.blocks.contains_key(&block_id) {
             return Err(CasError::DuplicateBlock(block_id));
         }
-        self.blocks.insert(block_id.clone(), BlockState::new(inline, props));
+        self.blocks
+            .insert(block_id.clone(), BlockState::new(inline, props));
         Ok(self.blocks.get(&block_id).expect("just inserted"))
     }
 
@@ -237,7 +246,10 @@ impl CasStore {
         new_inline: impl Into<String>,
         new_props: impl Into<String>,
     ) -> Result<CasOutcome, CasError> {
-        let current = self.blocks.get_mut(block_id).ok_or_else(|| CasError::NoSuchBlock(block_id.clone()))?;
+        let current = self
+            .blocks
+            .get_mut(block_id)
+            .ok_or_else(|| CasError::NoSuchBlock(block_id.clone()))?;
         // ── THE CAS GUARD (the WHERE version = expected_version precondition) ──────────────────────
         if current.version == expected_version {
             // The CAS held → rows_affected == 1. Write the new content + bump the version by exactly 1.
@@ -263,7 +275,10 @@ impl CasStore {
     /// # Errors
     /// [`CasError::NoSuchBlock`] if the block has no content row.
     pub fn snapshot_block(&self, block_id: &BlockId) -> Result<BlockState, CasError> {
-        self.blocks.get(block_id).cloned().ok_or_else(|| CasError::NoSuchBlock(block_id.clone()))
+        self.blocks
+            .get(block_id)
+            .cloned()
+            .ok_or_else(|| CasError::NoSuchBlock(block_id.clone()))
     }
 
     /// **Restore a block to a previously-[`Self::snapshot_block`]ed state THROUGH the CAS guard
@@ -281,7 +296,12 @@ impl CasStore {
         expected_version: u64,
         snapshot: &BlockState,
     ) -> Result<CasOutcome, CasError> {
-        self.edit_block(block_id, expected_version, snapshot.inline.clone(), snapshot.props.clone())
+        self.edit_block(
+            block_id,
+            expected_version,
+            snapshot.inline.clone(),
+            snapshot.props.clone(),
+        )
     }
 
     /// The CAS-conflict-rate meter (the CRDT-promotion trigger metric, §3.4 / KQ-1).
@@ -363,7 +383,12 @@ impl SoftLockTable {
     /// Release the advisory soft-lock IFF `client_id` holds it (a client cannot release another's
     /// lock). Releasing a lock one does not hold is a no-op (advisory — never an error).
     pub fn release(&mut self, block_id: &BlockId, client_id: &str) {
-        if self.locks.get(block_id).map(|h| h == client_id).unwrap_or(false) {
+        if self
+            .locks
+            .get(block_id)
+            .map(|h| h == client_id)
+            .unwrap_or(false)
+        {
             self.locks.remove(block_id);
         }
     }
@@ -561,7 +586,10 @@ impl SimultaneousPresence {
 
     /// Record that `client_id` is present (cursor/selection) on `block_id` (an awareness frame).
     pub fn enter(&mut self, block_id: &BlockId, client_id: &str) {
-        self.present.entry(block_id.clone()).or_default().insert(client_id.to_string());
+        self.present
+            .entry(block_id.clone())
+            .or_default()
+            .insert(client_id.to_string());
     }
 
     /// Record that `client_id` left `block_id` (presence is ephemeral; a drop is fine).
@@ -577,7 +605,10 @@ impl SimultaneousPresence {
     /// **`true` iff `block_id` has 2+ simultaneous authors present (the multi-author trigger
     /// condition, §3.4).** KN-P29 watches this alongside [`ConflictMeter::conflict_rate`].
     pub fn is_contended(&self, block_id: &BlockId) -> bool {
-        self.present.get(block_id).map(|s| s.len() >= 2).unwrap_or(false)
+        self.present
+            .get(block_id)
+            .map(|s| s.len() >= 2)
+            .unwrap_or(false)
     }
 }
 
@@ -602,12 +633,24 @@ mod tests {
     #[test]
     fn cas_winner_commits_and_bumps_version() {
         let (mut s, b) = store_with_block();
-        assert_eq!(s.get(&b).unwrap().version, 1, "a fresh block is at version 1");
+        assert_eq!(
+            s.get(&b).unwrap().version,
+            1,
+            "a fresh block is at version 1"
+        );
         let out = s.edit_block(&b, 1, "hello world", "{}").unwrap();
         assert!(out.committed(), "the CAS at the current version commits");
         assert_eq!(out.state().version, 2, "the version bumped by exactly 1");
-        assert_eq!(out.state().inline, "hello world", "the new content was written");
-        assert_eq!(s.get(&b).unwrap().version, 2, "the store reflects the committed write");
+        assert_eq!(
+            out.state().inline,
+            "hello world",
+            "the new content was written"
+        );
+        assert_eq!(
+            s.get(&b).unwrap().version,
+            2,
+            "the store reflects the committed write"
+        );
     }
 
     /// **THE NAMED-FLOOR PROPERTY: the loser is rejected with current state, NEVER silently
@@ -622,11 +665,20 @@ mod tests {
         assert!(a.committed());
         // Writer B ALSO read v1 (before A landed), now tries to write at expected_version = 1 → STALE.
         let bout = s.edit_block(&b, 1, "B's edit", "{}").unwrap();
-        assert!(bout.is_conflict(), "the stale writer LOSES the CAS (rows_affected == 0)");
+        assert!(
+            bout.is_conflict(),
+            "the stale writer LOSES the CAS (rows_affected == 0)"
+        );
         match &bout {
             CasOutcome::Conflict { current } => {
-                assert_eq!(current.version, 2, "the loser is handed the CURRENT server version");
-                assert_eq!(current.inline, "A's edit", "the loser sees the WINNER's content to reconcile");
+                assert_eq!(
+                    current.version, 2,
+                    "the loser is handed the CURRENT server version"
+                );
+                assert_eq!(
+                    current.inline, "A's edit",
+                    "the loser sees the WINNER's content to reconcile"
+                );
             }
             other => panic!("expected Conflict, got {other:?}"),
         }
@@ -636,7 +688,11 @@ mod tests {
             "A's edit",
             "B's edit was REJECTED, not silently applied — 0 silent overwrites"
         );
-        assert_eq!(s.get(&b).unwrap().version, 2, "the version did NOT advance on the conflict");
+        assert_eq!(
+            s.get(&b).unwrap().version,
+            2,
+            "the version did NOT advance on the conflict"
+        );
     }
 
     /// **After a conflict, the loser RECONCILES by re-reading and re-applying at the current version
@@ -651,9 +707,18 @@ mod tests {
             other => panic!("expected conflict, got {other:?}"),
         };
         // B reconciles: re-bases its edit on the current state + version, re-submits.
-        let reconciled = s.edit_block(&b, current.version, "A's edit + B's reconciled edit", "{}").unwrap();
-        assert!(reconciled.committed(), "the reconciled edit at the current version now commits");
-        assert_eq!(reconciled.state().version, 3, "the reconciled commit bumps to v3");
+        let reconciled = s
+            .edit_block(&b, current.version, "A's edit + B's reconciled edit", "{}")
+            .unwrap();
+        assert!(
+            reconciled.committed(),
+            "the reconciled edit at the current version now commits"
+        );
+        assert_eq!(
+            reconciled.state().version,
+            3,
+            "the reconciled commit bumps to v3"
+        );
     }
 
     // ── per-block independence: different blocks no false conflict ────────────────────────────────
@@ -670,11 +735,18 @@ mod tests {
         let x = s.edit_block(&b1, 1, "one edited", "{}").unwrap();
         let y = s.edit_block(&b2, 1, "two edited", "{}").unwrap();
         assert!(x.committed(), "b1's edit commits");
-        assert!(y.committed(), "b2's edit commits — NO false conflict with b1");
+        assert!(
+            y.committed(),
+            "b2's edit commits — NO false conflict with b1"
+        );
         assert_eq!(s.get(&b1).unwrap().inline, "one edited");
         assert_eq!(s.get(&b2).unwrap().inline, "two edited");
         // 0 conflicts recorded — both were independent commits.
-        assert_eq!(s.meter().conflicted(), 0, "different-block edits produce 0 false conflicts");
+        assert_eq!(
+            s.meter().conflicted(),
+            0,
+            "different-block edits produce 0 false conflicts"
+        );
         assert_eq!(s.meter().committed(), 2, "both committed");
     }
 
@@ -692,7 +764,10 @@ mod tests {
     #[test]
     fn duplicate_content_insert_refused() {
         let (mut s, b) = store_with_block();
-        assert_eq!(s.insert_block(b.clone(), "x", "{}").unwrap_err(), CasError::DuplicateBlock(b));
+        assert_eq!(
+            s.insert_block(b.clone(), "x", "{}").unwrap_err(),
+            CasError::DuplicateBlock(b)
+        );
     }
 
     // ── the soft-lock advisory ───────────────────────────────────────────────────────────────────
@@ -703,22 +778,40 @@ mod tests {
     fn soft_lock_is_advisory_not_mandatory() {
         let mut locks = SoftLockTable::new();
         let b = bid("b1");
-        assert_eq!(locks.acquire(&b, "client-A"), SoftLock::Acquired, "A takes the advisory lock");
-        assert_eq!(locks.holder(&b), Some(&"client-A".to_string()), "A is the advisory holder");
+        assert_eq!(
+            locks.acquire(&b, "client-A"),
+            SoftLock::Acquired,
+            "A takes the advisory lock"
+        );
+        assert_eq!(
+            locks.holder(&b),
+            Some(&"client-A".to_string()),
+            "A is the advisory holder"
+        );
         // B sees A is editing — but is NOT prevented from editing (advisory).
         assert_eq!(
             locks.acquire(&b, "client-B"),
-            SoftLock::Held { by: "client-A".into() },
+            SoftLock::Held {
+                by: "client-A".into()
+            },
             "B sees A editing (the UX courtesy) but is not blocked"
         );
         // A re-acquiring its own lock is idempotent.
         assert_eq!(locks.acquire(&b, "client-A"), SoftLock::Acquired);
         // A releases; B can now take it.
         locks.release(&b, "client-A");
-        assert_eq!(locks.acquire(&b, "client-B"), SoftLock::Acquired, "after release B acquires");
+        assert_eq!(
+            locks.acquire(&b, "client-B"),
+            SoftLock::Acquired,
+            "after release B acquires"
+        );
         // B cannot release A-held… (B holds it now). A trying to release B's lock is a no-op.
         locks.release(&b, "client-A");
-        assert_eq!(locks.holder(&b), Some(&"client-B".to_string()), "A cannot release B's lock");
+        assert_eq!(
+            locks.holder(&b),
+            Some(&"client-B".to_string()),
+            "A cannot release B's lock"
+        );
     }
 
     /// **A soft-lock does NOT change the CAS outcome — even WITHOUT a lock, the CAS guard is the real
@@ -729,7 +822,10 @@ mod tests {
         // No soft-lock at all: the CAS still protects against a silent overwrite.
         s.edit_block(&b, 1, "A", "{}").unwrap();
         let conflict = s.edit_block(&b, 1, "B", "{}").unwrap();
-        assert!(conflict.is_conflict(), "the CAS guard protects regardless of any soft-lock");
+        assert!(
+            conflict.is_conflict(),
+            "the CAS guard protects regardless of any soft-lock"
+        );
     }
 
     // ── snapshot / restore ───────────────────────────────────────────────────────────────────────
@@ -744,16 +840,31 @@ mod tests {
         // Edit forward a couple of revisions.
         s.edit_block(&b, 1, "edited once", "{}").unwrap(); // v2
         s.edit_block(&b, 2, "edited twice", "{}").unwrap(); // v3
-        // Restore at the CURRENT version (v3) → commits, content reverts to the snapshot, version → v4.
+                                                            // Restore at the CURRENT version (v3) → commits, content reverts to the snapshot, version → v4.
         let restored = s.restore_block(&b, 3, &snap).unwrap();
-        assert!(restored.committed(), "a restore at the current version commits");
-        assert_eq!(restored.state().inline, "hello", "the content reverted to the snapshot");
-        assert_eq!(restored.state().version, 4, "the restore is a new revision (v4), not a counter rewind");
+        assert!(
+            restored.committed(),
+            "a restore at the current version commits"
+        );
+        assert_eq!(
+            restored.state().inline,
+            "hello",
+            "the content reverted to the snapshot"
+        );
+        assert_eq!(
+            restored.state().version,
+            4,
+            "the restore is a new revision (v4), not a counter rewind"
+        );
 
         // A restore at a STALE version (someone edited since) conflicts — never a silent clobber.
-        s.edit_block(&b, 4, "live edit after restore", "{}").unwrap(); // v5
+        s.edit_block(&b, 4, "live edit after restore", "{}")
+            .unwrap(); // v5
         let stale_restore = s.restore_block(&b, 4, &snap).unwrap();
-        assert!(stale_restore.is_conflict(), "a restore racing a live edit conflicts, never clobbers");
+        assert!(
+            stale_restore.is_conflict(),
+            "a restore racing a live edit conflicts, never clobbers"
+        );
         assert_eq!(
             s.get(&b).unwrap().inline,
             "live edit after restore",
@@ -776,7 +887,10 @@ mod tests {
         let results = q.reconcile(&mut s);
         assert_eq!(results.len(), 1);
         let r = results[0].as_ref().unwrap();
-        assert!(r.outcome.committed(), "the offline edit committed (base version still held)");
+        assert!(
+            r.outcome.committed(),
+            "the offline edit committed (base version still held)"
+        );
         assert_eq!(s.get(&b).unwrap().inline, "offline edit");
         assert!(q.is_empty(), "the queue drained on reconcile");
     }
@@ -790,11 +904,15 @@ mod tests {
         // The client went offline at v1.
         q.queue(b.clone(), 1, "offline edit", "{}");
         // Meanwhile ANOTHER client edited the block online → v2.
-        s.edit_block(&b, 1, "online edit while peer offline", "{}").unwrap();
+        s.edit_block(&b, 1, "online edit while peer offline", "{}")
+            .unwrap();
         // Reconnect: the offline edit's base (v1) is stale → conflict, not a silent clobber.
         let results = q.reconcile(&mut s);
         let r = results[0].as_ref().unwrap();
-        assert!(r.outcome.is_conflict(), "the stale offline edit conflicts (reconcile, not overwrite)");
+        assert!(
+            r.outcome.is_conflict(),
+            "the stale offline edit conflicts (reconcile, not overwrite)"
+        );
         assert_eq!(
             s.get(&b).unwrap().inline,
             "online edit while peer offline",
@@ -809,7 +927,10 @@ mod tests {
         let mut q = OfflineQueue::new();
         q.queue(bid("gone"), 1, "x", "{}");
         let results = q.reconcile(&mut s);
-        assert_eq!(results[0].as_ref().unwrap_err(), &CasError::NoSuchBlock(bid("gone")));
+        assert_eq!(
+            results[0].as_ref().unwrap_err(),
+            &CasError::NoSuchBlock(bid("gone"))
+        );
     }
 
     // ── the conflict-rate metric (the CRDT-promotion trigger) ─────────────────────────────────────
@@ -820,7 +941,11 @@ mod tests {
     #[test]
     fn conflict_rate_metric_is_emitted() {
         let (mut s, b) = store_with_block();
-        assert_eq!(s.meter().conflict_rate(), 0.0, "a fresh doc has 0 conflict rate (no divide-by-zero)");
+        assert_eq!(
+            s.meter().conflict_rate(),
+            0.0,
+            "a fresh doc has 0 conflict rate (no divide-by-zero)"
+        );
         // 3 commits (A, then reconciled B twice) and 1 conflict.
         s.edit_block(&b, 1, "a", "{}").unwrap(); // commit → v2
         s.edit_block(&b, 1, "stale", "{}").unwrap(); // CONFLICT (stale v1)
@@ -829,9 +954,15 @@ mod tests {
         assert_eq!(s.meter().conflicted(), 1);
         assert_eq!(s.meter().attempts(), 3);
         // rate = 1 / 3.
-        assert!((s.meter().conflict_rate() - (1.0 / 3.0)).abs() < 1e-9, "the conflict rate is 1/3");
+        assert!(
+            (s.meter().conflict_rate() - (1.0 / 3.0)).abs() < 1e-9,
+            "the conflict rate is 1/3"
+        );
         let (name, rate) = s.meter().telemetry_sample();
-        assert_eq!(name, "knowledge.cas_conflict_rate", "the canonical CRDT-promotion-trigger metric name");
+        assert_eq!(
+            name, "knowledge.cas_conflict_rate",
+            "the canonical CRDT-promotion-trigger metric name"
+        );
         assert!((rate - (1.0 / 3.0)).abs() < 1e-9);
     }
 
@@ -844,9 +975,15 @@ mod tests {
         p.enter(&b, "A");
         assert!(!p.is_contended(&b), "one author present is not contended");
         p.enter(&b, "B");
-        assert!(p.is_contended(&b), "two simultaneous authors → contended (the CRDT-promotion signal)");
+        assert!(
+            p.is_contended(&b),
+            "two simultaneous authors → contended (the CRDT-promotion signal)"
+        );
         p.leave(&b, "A");
-        assert!(!p.is_contended(&b), "back to one author → no longer contended");
+        assert!(
+            !p.is_contended(&b),
+            "back to one author → no longer contended"
+        );
     }
 
     /// **The lowered CAS SQL has the `WHERE version = expected_version` optimistic guard + the
@@ -854,9 +991,18 @@ mod tests {
     #[test]
     fn cas_sql_carries_the_optimistic_guard() {
         let sql = cas_update_sql();
-        assert!(sql.contains("version = version + 1"), "the version is bumped: {sql}");
-        assert!(sql.contains("WHERE tenant = $1 AND block_id = $2 AND version = $3"), "the CAS guard: {sql}");
+        assert!(
+            sql.contains("version = version + 1"),
+            "the version is bumped: {sql}"
+        );
+        assert!(
+            sql.contains("WHERE tenant = $1 AND block_id = $2 AND version = $3"),
+            "the CAS guard: {sql}"
+        );
         // a single-row PK probe (tenant, block_id) + the version precondition — never a scan.
-        assert!(!sql.contains("WHERE TRUE"), "the write is a bounded single-row CAS, never unguarded");
+        assert!(
+            !sql.contains("WHERE TRUE"),
+            "the write is a bounded single-row CAS, never unguarded"
+        );
     }
 }

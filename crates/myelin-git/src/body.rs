@@ -146,7 +146,11 @@ impl Body {
     /// The caller supplies the canonical `md` (e.g. the editor's serialised form) + the `nodes` array;
     /// the round-trip invariant ([`Body::round_trips`]) holds iff `md` is canonical.
     pub fn new(md: impl Into<String>, nodes: Vec<InlineNode>) -> Body {
-        Body { md: md.into(), nodes, revision: 0 }
+        Body {
+            md: md.into(),
+            nodes,
+            revision: 0,
+        }
     }
 
     /// An empty body (revision 0) — a PR/comment opened with no description yet. Round-trips trivially
@@ -196,7 +200,10 @@ impl Body {
         nodes: Vec<InlineNode>,
     ) -> Result<u64, CasConflict> {
         if expected_revision != self.revision {
-            return Err(CasConflict { expected: expected_revision, actual: self.revision });
+            return Err(CasConflict {
+                expected: expected_revision,
+                actual: self.revision,
+            });
         }
         self.md = md.into();
         self.nodes = nodes;
@@ -280,7 +287,10 @@ pub fn edge_aggregate_key(source: &ArtifactRef, target: &ArtifactRef) -> Aggrega
 /// `principal_id` as an `ArtifactRef`, NEVER the name — so a mention edge is erasure-safe (the name
 /// lives behind Identity's pseudonym map). Byte-identical to the Refs seam's `principal_member_ref`.
 fn principal_member_ref(p: &Principal) -> ArtifactRef {
-    ArtifactRef(format!("myelin://{}/identity/member/{}", p.tenant.0, p.principal_id.0))
+    ArtifactRef(format!(
+        "myelin://{}/identity/member/{}",
+        p.tenant.0, p.principal_id.0
+    ))
 }
 
 /// **Extract one reference edge per structured ref node (the contract-5.4 producer; structured, NOT
@@ -305,11 +315,17 @@ pub fn extract_body_edges(source: &ArtifactRef, nodes: &[InlineNode]) -> Vec<Bod
         .iter()
         .map(|node| {
             let (target, rel) = match node {
-                InlineNode::Mention(principal) => (principal_member_ref(principal), EdgeRel::Mentions),
+                InlineNode::Mention(principal) => {
+                    (principal_member_ref(principal), EdgeRel::Mentions)
+                }
                 InlineNode::ArtifactRefNode(target) => (target.clone(), EdgeRel::Links),
                 InlineNode::Embed(target) => (target.clone(), EdgeRel::Embeds),
             };
-            BodyEdge { source: source.clone(), target, rel }
+            BodyEdge {
+                source: source.clone(),
+                target,
+                rel,
+            }
         })
         .collect()
 }
@@ -403,7 +419,11 @@ mod tests {
     }
 
     fn alice() -> Principal {
-        Principal::stub(PrincipalId("p-opaque-alice".into()), PrincipalKind::Human, tenant())
+        Principal::stub(
+            PrincipalId("p-opaque-alice".into()),
+            PrincipalKind::Human,
+            tenant(),
+        )
     }
 
     // ── 1. round-trip: render(parse(md)) === md on git bodies (contract 13.1) ──────────────────────
@@ -437,9 +457,19 @@ mod tests {
         // `a*b` — a single `*` that opens no mark; the serializer re-emits it escaped as `a\*b`, so the
         // raw (non-canonical) `md` does NOT round-trip. The canonical `a\*b` DOES.
         let non_canonical = Body::new("a*b", vec![]);
-        assert!(!non_canonical.round_trips(), "a non-canonical body must NOT round-trip");
-        assert_eq!(non_canonical.render(), "a\\*b", "the serializer canonicalises the literal `*`");
-        assert!(Body::new("a\\*b", vec![]).round_trips(), "the canonical form IS a fixed point");
+        assert!(
+            !non_canonical.round_trips(),
+            "a non-canonical body must NOT round-trip"
+        );
+        assert_eq!(
+            non_canonical.render(),
+            "a\\*b",
+            "the serializer canonicalises the literal `*`"
+        );
+        assert!(
+            Body::new("a\\*b", vec![]).round_trips(),
+            "the canonical form IS a fixed point"
+        );
     }
 
     /// **The CAS-conflict Display names the conflicting revisions** (the loud, auditable surface — a
@@ -447,9 +477,19 @@ mod tests {
     /// `fmt -> Ok(default)` mutant.
     #[test]
     fn cas_conflict_display_names_the_revisions() {
-        let msg = CasConflict { expected: 0, actual: 3 }.to_string();
-        assert!(msg.contains('0') && msg.contains('3'), "the message names both revisions: {msg}");
-        assert!(msg.to_lowercase().contains("cas"), "the message is the CAS-conflict surface: {msg}");
+        let msg = CasConflict {
+            expected: 0,
+            actual: 3,
+        }
+        .to_string();
+        assert!(
+            msg.contains('0') && msg.contains('3'),
+            "the message names both revisions: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("cas"),
+            "the message is the CAS-conflict surface: {msg}"
+        );
     }
 
     /// **Single-author CAS: a stale edit is rejected loudly (no last-writer-wins).** An edit against the
@@ -463,8 +503,17 @@ mod tests {
         assert_eq!(body.md, "v1");
         // a stale edit (still expecting revision 0) is rejected — body unchanged.
         let conflict = body.cas_edit(0, "v2-stale", vec![]).unwrap_err();
-        assert_eq!(conflict, CasConflict { expected: 0, actual: 1 });
-        assert_eq!(body.md, "v1", "a rejected CAS edit does NOT mutate the body");
+        assert_eq!(
+            conflict,
+            CasConflict {
+                expected: 0,
+                actual: 1
+            }
+        );
+        assert_eq!(
+            body.md, "v1",
+            "a rejected CAS edit does NOT mutate the body"
+        );
         assert_eq!(body.revision, 1);
     }
 
@@ -514,7 +563,10 @@ mod tests {
         let body = Body::new("Closes ENG-1 and fixes the bug.", vec![]);
         assert!(body.round_trips());
         let edges = extract_body_edges(&comment_source(), body.structured_nodes());
-        assert!(edges.is_empty(), "a prose `Closes` is NOT a content edge (that is GIT-P19's mirror)");
+        assert!(
+            edges.is_empty(),
+            "a prose `Closes` is NOT a content edge (that is GIT-P19's mirror)"
+        );
     }
 
     /// **The edge event draft is `refs.edge.created` with the references-not-payloads triple + the shared
@@ -524,7 +576,11 @@ mod tests {
     fn edge_event_draft_is_refs_edge_created_with_the_triple() {
         let src = comment_source();
         let target = ArtifactRef("myelin://acme/knowledge/page/7c2#block-3".into());
-        let edge = BodyEdge { source: src.clone(), target: target.clone(), rel: EdgeRel::Embeds };
+        let edge = BodyEdge {
+            source: src.clone(),
+            target: target.clone(),
+            rel: EdgeRel::Embeds,
+        };
         let draft = edge_event_draft(&edge);
         assert_eq!(draft.type_.0, "refs.edge.created");
         assert_eq!(draft.subject, src, "the subject is the referencing body");
@@ -533,7 +589,10 @@ mod tests {
         assert_eq!(draft.payload["rel"], "embeds");
         assert_eq!(draft.payload["rel_class"], "reference");
         assert_eq!(draft.aggregate.0, format!("edge:{}->{}", src.0, target.0));
-        assert!(!draft.contains_personal_data, "references-not-payloads: no inline PII");
+        assert!(
+            !draft.contains_personal_data,
+            "references-not-payloads: no inline PII"
+        );
         assert!(draft.pii_key_ref.is_none());
         assert_eq!(draft.data_role, DataRole::Controller);
     }

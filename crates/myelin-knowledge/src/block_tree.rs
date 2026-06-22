@@ -53,7 +53,9 @@ use std::collections::BTreeMap;
 /// `b<id>`/`h<id>` `#sub` target, 5.7). Minted ONCE at [`BlockTree::insert_block`]; a move or an edit
 /// NEVER re-mints it. Opaque: the bytes carry no positional meaning (it is NOT a Vec index — that is
 /// the editor floor [`crate::editor`] this tree replaces).
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct BlockId(pub String);
 
 impl BlockId {
@@ -65,7 +67,9 @@ impl BlockId {
 
 /// A **stable opaque page id** (§2.6 — `page.page_id`; the independently-addressable root of a
 /// root-block subtree, the `knowledge/page/<page_id>` `#sub` root).
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct PageId(pub String);
 
 impl PageId {
@@ -114,7 +118,11 @@ impl std::fmt::Display for TreeError {
                 write!(f, "block_id already live (ids mint once): {}", b.as_str())
             }
             TreeError::WouldCycle(b) => {
-                write!(f, "move would make block {} its own ancestor (cycle)", b.as_str())
+                write!(
+                    f,
+                    "move would make block {} its own ancestor (cycle)",
+                    b.as_str()
+                )
             }
             TreeError::CrossPageParent { block, parent } => write!(
                 f,
@@ -147,7 +155,10 @@ impl BlockTree {
     /// Open an empty tree for a page (the page-root block is inserted by the first
     /// [`BlockTree::insert_root`]).
     pub fn new(page_id: PageId) -> BlockTree {
-        BlockTree { page_id, rows: BTreeMap::new() }
+        BlockTree {
+            page_id,
+            rows: BTreeMap::new(),
+        }
     }
 
     /// This tree's page id.
@@ -326,17 +337,24 @@ impl BlockTree {
         // full tiebreak adds created_at — the tree model carries order_key + id, the created_at
         // tiebreak lands with the row's full timestamp columns).
         kids.sort_by(|a, b| {
-            a.order_key.cmp(&b.order_key).then_with(|| a.block_id.cmp(&b.block_id))
+            a.order_key
+                .cmp(&b.order_key)
+                .then_with(|| a.block_id.cmp(&b.block_id))
         });
         kids
     }
 
     /// The page-root blocks (top-level, `parent_id == None`), in `order_key` order.
     pub fn roots(&self) -> Vec<&BlockRow> {
-        let mut roots: Vec<&BlockRow> =
-            self.rows.values().filter(|r| r.parent_id.is_none()).collect();
+        let mut roots: Vec<&BlockRow> = self
+            .rows
+            .values()
+            .filter(|r| r.parent_id.is_none())
+            .collect();
         roots.sort_by(|a, b| {
-            a.order_key.cmp(&b.order_key).then_with(|| a.block_id.cmp(&b.block_id))
+            a.order_key
+                .cmp(&b.order_key)
+                .then_with(|| a.block_id.cmp(&b.block_id))
         });
         roots
     }
@@ -373,7 +391,10 @@ impl BlockTree {
 
     /// Whether `maybe_descendant` is in the subtree rooted at `ancestor` (the cycle guard for a move).
     fn is_descendant_of(&self, maybe_descendant: &BlockId, ancestor: &BlockId) -> bool {
-        let mut cur = self.rows.get(maybe_descendant).and_then(|r| r.parent_id.clone());
+        let mut cur = self
+            .rows
+            .get(maybe_descendant)
+            .and_then(|r| r.parent_id.clone());
         while let Some(p) = cur {
             if &p == ancestor {
                 return true;
@@ -549,9 +570,12 @@ mod tests {
     fn three_child_tree() -> BlockTree {
         let mut t = BlockTree::new(PageId("p1".into()));
         t.insert_root(bid("root"), "paragraph", jit(0, 0)).unwrap();
-        t.insert_block(bid("c1"), &bid("root"), "paragraph", jit(0, 1)).unwrap();
-        t.insert_block(bid("c2"), &bid("root"), "paragraph", jit(0, 2)).unwrap();
-        t.insert_block(bid("c3"), &bid("root"), "paragraph", jit(0, 3)).unwrap();
+        t.insert_block(bid("c1"), &bid("root"), "paragraph", jit(0, 1))
+            .unwrap();
+        t.insert_block(bid("c2"), &bid("root"), "paragraph", jit(0, 2))
+            .unwrap();
+        t.insert_block(bid("c3"), &bid("root"), "paragraph", jit(0, 3))
+            .unwrap();
         t
     }
 
@@ -559,12 +583,26 @@ mod tests {
     #[test]
     fn append_children_are_order_key_sorted() {
         let t = three_child_tree();
-        let kids: Vec<&str> = t.children(&bid("root")).iter().map(|r| r.block_id.as_str()).collect();
-        assert_eq!(kids, vec!["c1", "c2", "c3"], "appended children read back in insert order");
+        let kids: Vec<&str> = t
+            .children(&bid("root"))
+            .iter()
+            .map(|r| r.block_id.as_str())
+            .collect();
+        assert_eq!(
+            kids,
+            vec!["c1", "c2", "c3"],
+            "appended children read back in insert order"
+        );
         // Each child's order_key strictly increases (the frozen rank_last append).
-        let keys: Vec<&str> =
-            t.children(&bid("root")).iter().map(|r| r.order_key.as_str()).collect();
-        assert!(keys.windows(2).all(|w| w[0] < w[1]), "order_keys strictly increase: {keys:?}");
+        let keys: Vec<&str> = t
+            .children(&bid("root"))
+            .iter()
+            .map(|r| r.order_key.as_str())
+            .collect();
+        assert!(
+            keys.windows(2).all(|w| w[0] < w[1]),
+            "order_keys strictly increase: {keys:?}"
+        );
     }
 
     /// **A between-insert lands strictly between its bounds (the LexoRank midpoint bisection).**
@@ -572,11 +610,25 @@ mod tests {
     fn between_insert_lands_in_the_gap() {
         let mut t = three_child_tree();
         // Insert c1.5 between c1 and c2.
-        t.insert_between(bid("c1_5"), &bid("root"), Some(&bid("c1")), Some(&bid("c2")), "paragraph", jit(1, 1))
-            .unwrap();
-        let kids: Vec<&str> =
-            t.children(&bid("root")).iter().map(|r| r.block_id.as_str()).collect();
-        assert_eq!(kids, vec!["c1", "c1_5", "c2", "c3"], "the between-insert lands in the gap");
+        t.insert_between(
+            bid("c1_5"),
+            &bid("root"),
+            Some(&bid("c1")),
+            Some(&bid("c2")),
+            "paragraph",
+            jit(1, 1),
+        )
+        .unwrap();
+        let kids: Vec<&str> = t
+            .children(&bid("root"))
+            .iter()
+            .map(|r| r.block_id.as_str())
+            .collect();
+        assert_eq!(
+            kids,
+            vec!["c1", "c1_5", "c2", "c3"],
+            "the between-insert lands in the gap"
+        );
     }
 
     /// **Two concurrent same-gap inserts get DISTINCT keys (the 2-char jitter, §2.5).** Both land
@@ -588,7 +640,11 @@ mod tests {
         let hi = t.get(&bid("c2")).unwrap().order_key.clone();
         let a = OrderKey::rank_between(Some(&lo), Some(&hi), jit(5, 5));
         let b = OrderKey::rank_between(Some(&lo), Some(&hi), jit(6, 6));
-        assert_ne!(a.as_str(), b.as_str(), "the 2-char jitter makes same-gap inserts distinct");
+        assert_ne!(
+            a.as_str(),
+            b.as_str(),
+            "the 2-char jitter makes same-gap inserts distinct"
+        );
         assert!(lo < a && a < hi, "A in the gap");
         assert!(lo < b && b < hi, "B in the gap");
     }
@@ -600,27 +656,43 @@ mod tests {
     fn moved_block_keeps_its_id_zero_dangles() {
         let mut t = three_child_tree();
         // Add a nested child under c1, then a second parent c3 to move it under.
-        t.insert_block(bid("nested"), &bid("c1"), "paragraph", jit(0, 0)).unwrap();
+        t.insert_block(bid("nested"), &bid("c1"), "paragraph", jit(0, 0))
+            .unwrap();
 
         // The embed: a #sub onto `nested` (the b<id> the editor stored before any move).
-        let before = t.resolve_sub(&bid("nested")).expect("embed resolves before move").clone();
+        let before = t
+            .resolve_sub(&bid("nested"))
+            .expect("embed resolves before move")
+            .clone();
         let id_before = before.block_id.clone();
         let key_before = before.order_key.clone();
         let parent_before = before.parent_id.clone();
 
         // MOVE `nested` from under c1 to be the first child of c3. order_key + parent_id change.
-        t.move_block(&bid("nested"), &bid("c3"), None, None, jit(2, 2)).unwrap();
+        t.move_block(&bid("nested"), &bid("c3"), None, None, jit(2, 2))
+            .unwrap();
 
-        let after = t.resolve_sub(&bid("nested")).expect("embed STILL resolves after move");
+        let after = t
+            .resolve_sub(&bid("nested"))
+            .expect("embed STILL resolves after move");
         // 0 dangles: the SAME stable id resolves.
-        assert_eq!(after.block_id, id_before, "the block_id is STABLE across the move (0 dangles)");
+        assert_eq!(
+            after.block_id, id_before,
+            "the block_id is STABLE across the move (0 dangles)"
+        );
         // The move changed exactly the tree position (parent_id + order_key), nothing else.
         assert_eq!(after.parent_id, Some(bid("c3")), "the parent changed");
         assert_ne!(after.parent_id, parent_before, "the parent actually moved");
-        assert_ne!(after.order_key, key_before, "the order_key was rewritten by the move");
+        assert_ne!(
+            after.order_key, key_before,
+            "the order_key was rewritten by the move"
+        );
         // And `nested` now reads back as a child of c3.
-        let c3_kids: Vec<&str> =
-            t.children(&bid("c3")).iter().map(|r| r.block_id.as_str()).collect();
+        let c3_kids: Vec<&str> = t
+            .children(&bid("c3"))
+            .iter()
+            .map(|r| r.block_id.as_str())
+            .collect();
         assert_eq!(c3_kids, vec!["nested"], "nested is now under c3");
         // …and no longer under c1.
         assert!(t.children(&bid("c1")).is_empty(), "nested left c1");
@@ -630,13 +702,17 @@ mod tests {
     #[test]
     fn move_into_own_subtree_is_refused() {
         let mut t = three_child_tree();
-        t.insert_block(bid("grandchild"), &bid("c1"), "paragraph", jit(0, 0)).unwrap();
+        t.insert_block(bid("grandchild"), &bid("c1"), "paragraph", jit(0, 0))
+            .unwrap();
         // Moving c1 under its own grandchild would make c1 its own ancestor — refused.
-        let err = t.move_block(&bid("c1"), &bid("grandchild"), None, None, jit(0, 0)).unwrap_err();
+        let err = t
+            .move_block(&bid("c1"), &bid("grandchild"), None, None, jit(0, 0))
+            .unwrap_err();
         assert_eq!(err, TreeError::WouldCycle(bid("c1")));
         // Moving a block under itself is likewise refused.
         assert_eq!(
-            t.move_block(&bid("c1"), &bid("c1"), None, None, jit(0, 0)).unwrap_err(),
+            t.move_block(&bid("c1"), &bid("c1"), None, None, jit(0, 0))
+                .unwrap_err(),
             TreeError::WouldCycle(bid("c1"))
         );
     }
@@ -647,21 +723,35 @@ mod tests {
     fn recursive_subtree_walk_returns_whole_subtree() {
         let mut t = three_child_tree();
         // Deepen: c1 → g1 → gg1 (a 3-level subtree to force the recursion).
-        t.insert_block(bid("g1"), &bid("c1"), "paragraph", jit(0, 0)).unwrap();
-        t.insert_block(bid("gg1"), &bid("g1"), "paragraph", jit(0, 0)).unwrap();
+        t.insert_block(bid("g1"), &bid("c1"), "paragraph", jit(0, 0))
+            .unwrap();
+        t.insert_block(bid("gg1"), &bid("g1"), "paragraph", jit(0, 0))
+            .unwrap();
 
-        let walk: Vec<&str> =
-            t.subtree_walk_cte(&bid("root")).iter().map(|r| r.block_id.as_str()).collect();
+        let walk: Vec<&str> = t
+            .subtree_walk_cte(&bid("root"))
+            .iter()
+            .map(|r| r.block_id.as_str())
+            .collect();
         // root, then c1's subtree (c1, g1, gg1) depth-first, then c2, c3.
         assert_eq!(walk, vec!["root", "c1", "g1", "gg1", "c2", "c3"]);
 
         // The lowered deep-walk SQL is a single recursive CTE (the query-plan artifact).
         let sql = recursive_subtree_cte_sql(&bid("root"));
-        assert!(sql.contains("WITH RECURSIVE"), "the deep walk is a recursive CTE: {sql}");
-        assert!(sql.contains("JOIN subtree"), "the recursive arm joins on parent_id: {sql}");
+        assert!(
+            sql.contains("WITH RECURSIVE"),
+            "the deep walk is a recursive CTE: {sql}"
+        );
+        assert!(
+            sql.contains("JOIN subtree"),
+            "the recursive arm joins on parent_id: {sql}"
+        );
         // A subtree of a non-root block is just that block's subtree.
-        let sub: Vec<&str> =
-            t.subtree_walk_cte(&bid("c1")).iter().map(|r| r.block_id.as_str()).collect();
+        let sub: Vec<&str> = t
+            .subtree_walk_cte(&bid("c1"))
+            .iter()
+            .map(|r| r.block_id.as_str())
+            .collect();
         assert_eq!(sub, vec!["c1", "g1", "gg1"]);
     }
 
@@ -672,16 +762,35 @@ mod tests {
     fn subtree_read_is_an_index_range_not_a_scan() {
         let sql = BlockTree::subtree_read_is_index_range(&bid("root"));
         // Equality probe on the index-leading columns (tenant, page_id, parent_id) — an index range.
-        assert!(sql.contains("parent_id = 'root'"), "equality on parent_id (index range): {sql}");
-        assert!(sql.contains("ORDER BY order_key"), "ordered by the index's order_key column: {sql}");
-        assert!(sql.contains("tenant = $1 AND page_id = $2"), "leading partition columns pinned: {sql}");
+        assert!(
+            sql.contains("parent_id = 'root'"),
+            "equality on parent_id (index range): {sql}"
+        );
+        assert!(
+            sql.contains("ORDER BY order_key"),
+            "ordered by the index's order_key column: {sql}"
+        );
+        assert!(
+            sql.contains("tenant = $1 AND page_id = $2"),
+            "leading partition columns pinned: {sql}"
+        );
         // A full scan would lack the parent_id equality — assert we did NOT emit an unbounded read.
-        assert!(!sql.contains("WHERE TRUE"), "the read is bounded, never a full scan");
+        assert!(
+            !sql.contains("WHERE TRUE"),
+            "the read is bounded, never a full scan"
+        );
         // The in-memory children read returns the SAME rows in the SAME (index) order.
         let t = three_child_tree();
-        let ordered: Vec<&str> =
-            t.children(&bid("root")).iter().map(|r| r.block_id.as_str()).collect();
-        assert_eq!(ordered, vec!["c1", "c2", "c3"], "the children read is order_key-ordered");
+        let ordered: Vec<&str> = t
+            .children(&bid("root"))
+            .iter()
+            .map(|r| r.block_id.as_str())
+            .collect();
+        assert_eq!(
+            ordered,
+            vec!["c1", "c2", "c3"],
+            "the children read is order_key-ordered"
+        );
     }
 
     /// **The page hierarchy: sub-pages nest folder-like; ancestry is the breadcrumb walk.**
@@ -690,25 +799,43 @@ mod tests {
         let mut pages = PageTree::new();
         // root → team → project (a 3-level folder nesting).
         pages
-            .set_parent(PageId("team".into()), PageId("root".into()), OrderKey::rank_first(jit(0, 0)))
+            .set_parent(
+                PageId("team".into()),
+                PageId("root".into()),
+                OrderKey::rank_first(jit(0, 0)),
+            )
             .unwrap();
         pages
-            .set_parent(PageId("project".into()), PageId("team".into()), OrderKey::rank_first(jit(0, 0)))
+            .set_parent(
+                PageId("project".into()),
+                PageId("team".into()),
+                OrderKey::rank_first(jit(0, 0)),
+            )
             .unwrap();
         // A second sub-page under team, ranked after `project`.
         pages
-            .set_parent(PageId("wiki".into()), PageId("team".into()), OrderKey::rank_last(None, jit(1, 0)))
+            .set_parent(
+                PageId("wiki".into()),
+                PageId("team".into()),
+                OrderKey::rank_last(None, jit(1, 0)),
+            )
             .unwrap();
 
-        assert_eq!(pages.parent_of(&PageId("project".into())), Some(&PageId("team".into())));
+        assert_eq!(
+            pages.parent_of(&PageId("project".into())),
+            Some(&PageId("team".into()))
+        );
         // Ancestry is root-first: [root, team] for `project`.
         assert_eq!(
             pages.ancestry(&PageId("project".into())),
             vec![PageId("root".into()), PageId("team".into())]
         );
         // team's sub-pages list (folder listing) in order_key order.
-        let subs: Vec<String> =
-            pages.sub_pages(&PageId("team".into())).iter().map(|p| p.0.clone()).collect();
+        let subs: Vec<String> = pages
+            .sub_pages(&PageId("team".into()))
+            .iter()
+            .map(|p| p.0.clone())
+            .collect();
         assert_eq!(subs, vec!["project".to_string(), "wiki".to_string()]);
     }
 
@@ -717,11 +844,19 @@ mod tests {
     fn page_cycle_is_refused() {
         let mut pages = PageTree::new();
         pages
-            .set_parent(PageId("b".into()), PageId("a".into()), OrderKey::rank_first(jit(0, 0)))
+            .set_parent(
+                PageId("b".into()),
+                PageId("a".into()),
+                OrderKey::rank_first(jit(0, 0)),
+            )
             .unwrap();
         // Making `a` a child of `b` would cycle.
         let err = pages
-            .set_parent(PageId("a".into()), PageId("b".into()), OrderKey::rank_first(jit(0, 0)))
+            .set_parent(
+                PageId("a".into()),
+                PageId("b".into()),
+                OrderKey::rank_first(jit(0, 0)),
+            )
             .unwrap_err();
         assert!(matches!(err, TreeError::WouldCycle(_)));
     }
@@ -732,11 +867,13 @@ mod tests {
     fn duplicate_and_unknown_parent_refused() {
         let mut t = three_child_tree();
         assert_eq!(
-            t.insert_block(bid("c1"), &bid("root"), "paragraph", jit(0, 0)).unwrap_err(),
+            t.insert_block(bid("c1"), &bid("root"), "paragraph", jit(0, 0))
+                .unwrap_err(),
             TreeError::DuplicateBlockId(bid("c1"))
         );
         assert_eq!(
-            t.insert_block(bid("new"), &bid("ghost"), "paragraph", jit(0, 0)).unwrap_err(),
+            t.insert_block(bid("new"), &bid("ghost"), "paragraph", jit(0, 0))
+                .unwrap_err(),
             TreeError::NoSuchBlock(bid("ghost"))
         );
     }

@@ -31,8 +31,9 @@ use std::time::{Duration, Instant};
 
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_knowledge::{
-    compute_row, AuthzVisibleIndex, CellValue, DbRelation, FormulaExpr, FormulaField, FormulaSchema,
-    PropertyBag, RelationKind, RelationStore, RollupFn, RollupLatencyTelemetry, RollupResolver,
+    compute_row, AuthzVisibleIndex, CellValue, DbRelation, FormulaExpr, FormulaField,
+    FormulaSchema, PropertyBag, RelationKind, RelationStore, RollupFn, RollupLatencyTelemetry,
+    RollupResolver,
 };
 use myelin_query::{FieldId, FieldValue};
 use myelin_substrate::Thresholds;
@@ -45,7 +46,11 @@ const TENANTS: usize = 8;
 const TARGETS_PER_SOURCE: usize = 2_000;
 
 fn p(id: &str, tenant: &str) -> Principal {
-    Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, TenantId(tenant.into()))
+    Principal::stub(
+        PrincipalId(id.into()),
+        PrincipalKind::Human,
+        TenantId(tenant.into()),
+    )
 }
 
 #[test]
@@ -53,7 +58,10 @@ fn kn_d10_read_time_rollup_within_budget_zero_leak_materialisation_trigger_measu
     // ── 0. Read the rollup p99 budget from the canonical thresholds file (NOT hardcoded). ──────────
     let thresholds = Thresholds::load_canonical().expect("the canonical thresholds file must load");
     let budget_ms = thresholds.flex_db.rollup_read_p99_max_ms;
-    assert!(budget_ms > 0, "the KN-D10 rollup p99 budget is a positive number read from thresholds.toml");
+    assert!(
+        budget_ms > 0,
+        "the KN-D10 rollup p99 budget is a positive number read from thresholds.toml"
+    );
 
     let region = Region::new("fr-par");
 
@@ -61,15 +69,24 @@ fn kn_d10_read_time_rollup_within_budget_zero_leak_materialisation_trigger_measu
     let schema = FormulaSchema::of([
         FormulaField {
             field: FieldId::new("total"),
-            expr: FormulaExpr::Rollup { func: RollupFn::Sum, target: FieldId::new("amount") },
+            expr: FormulaExpr::Rollup {
+                func: RollupFn::Sum,
+                target: FieldId::new("amount"),
+            },
         },
         FormulaField {
             field: FieldId::new("n"),
-            expr: FormulaExpr::Rollup { func: RollupFn::Count, target: FieldId::new("amount") },
+            expr: FormulaExpr::Rollup {
+                func: RollupFn::Count,
+                target: FieldId::new("amount"),
+            },
         },
         FormulaField {
             field: FieldId::new("hi"),
-            expr: FormulaExpr::Rollup { func: RollupFn::Max, target: FieldId::new("amount") },
+            expr: FormulaExpr::Rollup {
+                func: RollupFn::Max,
+                target: FieldId::new("amount"),
+            },
         },
     ])
     .unwrap();
@@ -99,7 +116,11 @@ fn kn_d10_read_time_rollup_within_budget_zero_leak_materialisation_trigger_measu
             let id = format!("t:{t}:{n}");
             // A deterministic amount; the SECOND half carries a deliberately HUGE amount so a leak
             // would be a glaring value disclosure (proving 0 leak, not ACL-luck).
-            let amount = if n < TARGETS_PER_SOURCE / 2 { (n % 50) as i64 } else { 1_000_000 + n as i64 };
+            let amount = if n < TARGETS_PER_SOURCE / 2 {
+                (n % 50) as i64
+            } else {
+                1_000_000 + n as i64
+            };
             relations.relate(
                 &tenant,
                 DbRelation {
@@ -113,7 +134,14 @@ fn kn_d10_read_time_rollup_within_budget_zero_leak_materialisation_trigger_measu
             props.insert(FieldId::new("amount"), FieldValue::Int(amount));
             target_props.insert(id.clone(), props);
             if n < TARGETS_PER_SOURCE / 2 {
-                authz.grant(&tenant, &region, &viewer.principal_id.0, "read", &id, "zk-0000000001");
+                authz.grant(
+                    &tenant,
+                    &region,
+                    &viewer.principal_id.0,
+                    "read",
+                    &id,
+                    "zk-0000000001",
+                );
                 expected_sum += amount;
                 expected_count += 1;
                 expected_max = expected_max.max(amount);
@@ -137,16 +165,31 @@ fn kn_d10_read_time_rollup_within_budget_zero_leak_materialisation_trigger_measu
             // 0 rollup leak: the aggregate reflects ONLY the granted half — never the hidden amounts.
             match field {
                 "total" => {
-                    assert_eq!(out, CellValue::Int(expected_sum), "SUM reflects only the granted half (0 rollup leak)");
+                    assert_eq!(
+                        out,
+                        CellValue::Int(expected_sum),
+                        "SUM reflects only the granted half (0 rollup leak)"
+                    );
                     if let CellValue::Int(v) = out {
                         // If a hidden target leaked, the value would be far larger than the visible sum.
                         total_leaked_value += v - expected_sum;
                     }
                 }
-                "n" => assert_eq!(out, CellValue::Int(expected_count), "COUNT = the granted half (0 rollup leak)"),
+                "n" => assert_eq!(
+                    out,
+                    CellValue::Int(expected_count),
+                    "COUNT = the granted half (0 rollup leak)"
+                ),
                 "hi" => {
-                    assert_eq!(out, CellValue::Int(expected_max), "MAX = the visible max, NOT the hidden 1M+ (0 value-disclosure leak)");
-                    assert!(hidden_max > expected_max, "the drill's hidden targets are genuinely higher (a real leak witness)");
+                    assert_eq!(
+                        out,
+                        CellValue::Int(expected_max),
+                        "MAX = the visible max, NOT the hidden 1M+ (0 value-disclosure leak)"
+                    );
+                    assert!(
+                        hidden_max > expected_max,
+                        "the drill's hidden targets are genuinely higher (a real leak witness)"
+                    );
                 }
                 _ => unreachable!(),
             }
@@ -156,14 +199,18 @@ fn kn_d10_read_time_rollup_within_budget_zero_leak_materialisation_trigger_measu
     // ── 3. THE GATE. ─────────────────────────────────────────────────────────────────────────────
     // (a) read-time rollup p99 within budget (read from the file).
     per_read_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let p99 = per_read_ms[((per_read_ms.len() as f64 * 0.99).ceil() as usize - 1).min(per_read_ms.len() - 1)];
+    let p99 = per_read_ms
+        [((per_read_ms.len() as f64 * 0.99).ceil() as usize - 1).min(per_read_ms.len() - 1)];
     assert!(
         p99 <= budget_ms as f64,
         "KN-D10: read-time rollup recompute p99 {p99:.3} ms must be within the {budget_ms} ms budget (from thresholds.toml)"
     );
 
     // (b) 0 rollup leak across the row-restricted related set (no hidden target contributed).
-    assert_eq!(total_leaked_value, 0, "KN-D10 / KN-D5: 0 rollup leak across the whole multi-tenant scale set");
+    assert_eq!(
+        total_leaked_value, 0,
+        "KN-D10 / KN-D5: 0 rollup leak across the whole multi-tenant scale set"
+    );
 
     // (c) the materialisation trigger is MEASURED (not acted on): no within-budget rollup is a
     //     candidate; the telemetry reports the per-rollup p99 so KN-P31 can act. To PROVE the
@@ -173,13 +220,20 @@ fn kn_d10_read_time_rollup_within_budget_zero_leak_materialisation_trigger_measu
     assert!(
         live_candidates.is_empty(),
         "the live scale rollups are within budget — none is a materialisation candidate yet: {:?}",
-        live_candidates.iter().map(|c| (&c.db_id, c.field.to_string(), c.measured_p99_ms)).collect::<Vec<_>>()
+        live_candidates
+            .iter()
+            .map(|c| (&c.db_id, c.field.to_string(), c.measured_p99_ms))
+            .collect::<Vec<_>>()
     );
     // The measured-slow case (the §4.2 / KQ-4 promotion trigger): a rollup whose read-time recompute
     // p99 crosses the budget is flagged for KN-P31's materialised-aggregate promotion.
     let slow_field = FieldId::new("slow_rollup");
     for _ in 0..100 {
-        tel.record("db:measured-slow", &slow_field, Duration::from_millis(budget_ms + 200));
+        tel.record(
+            "db:measured-slow",
+            &slow_field,
+            Duration::from_millis(budget_ms + 200),
+        );
     }
     let candidates = tel.materialisation_candidates(budget_ms);
     let slow = candidates
@@ -187,7 +241,10 @@ fn kn_d10_read_time_rollup_within_budget_zero_leak_materialisation_trigger_measu
         .find(|c| c.field == slow_field)
         .expect("a rollup whose read-time recompute p99 crosses the budget is a materialisation candidate (KN-P31)");
     assert_eq!(slow.db_id, "db:measured-slow");
-    assert!(slow.measured_p99_ms > budget_ms, "the hint carries the measured p99 that crossed the budget (the KN-P31 trigger)");
+    assert!(
+        slow.measured_p99_ms > budget_ms,
+        "the hint carries the measured p99 that crossed the budget (the KN-P31 trigger)"
+    );
 
     println!(
         "[P-308 KN-D10 GREEN] read-time rollup engine at scale ({} tenants × {} related rows): \

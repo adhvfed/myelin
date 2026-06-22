@@ -73,9 +73,7 @@ use crate::edge_builder::{EdgeProjection, EdgeRow};
 use crate::emit::{emit_edges, EdgeDraft};
 use crate::ladder::SubState;
 use crate::mirror::{mirror_edges, reconverge, LifecycleRel, MirrorError, SyntheticTypedEvent};
-use crate::resolve::{
-    OwnerProjection, ProjectApi, ProjectApiError, ProjectOutcome, ResolveMode,
-};
+use crate::resolve::{OwnerProjection, ProjectApi, ProjectApiError, ProjectOutcome, ResolveMode};
 use crate::SubAnchorResolver;
 
 /// The canonical Knowledge subsystem token (the §6.1 grammar prefix Knowledge owns; re-exported from
@@ -210,14 +208,28 @@ impl KnOwner {
         KnOwner::default()
     }
 
-    fn acl_key(tenant: &TenantId, region: &Region, viewer: &Principal, root: &ArtifactRef) -> String {
-        format!("{}|{}|{}|{}", tenant.0, region.0, viewer.principal_id.0, root.0)
+    fn acl_key(
+        tenant: &TenantId,
+        region: &Region,
+        viewer: &Principal,
+        root: &ArtifactRef,
+    ) -> String {
+        format!(
+            "{}|{}|{}|{}",
+            tenant.0, region.0, viewer.principal_id.0, root.0
+        )
     }
 
     /// Grant a viewer the `view` permission on a KN root (the recorded ACL — the KN ReBAC fragment's
     /// page-tree `view` grant, modelled here; production is Identity's `check` over the page-tree
     /// override + row + field caveat, REF-P249).
-    pub fn grant_view(&self, tenant: &TenantId, region: &Region, viewer: &Principal, root: &ArtifactRef) {
+    pub fn grant_view(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+        viewer: &Principal,
+        root: &ArtifactRef,
+    ) {
         self.acl
             .lock()
             .unwrap()
@@ -257,7 +269,10 @@ impl KnOwner {
             None => SubState::Live(projection),
             // The KN sub-anchor kinds — the recorded §4.6 state. A block/heading/row/field id is a
             // STABLE opaque id, so an edited block is OUTDATED (id survives), a deleted block is GONE.
-            Some(Sub::Block(_)) | Some(Sub::Heading(_)) | Some(Sub::Row(_)) | Some(Sub::Field(_)) => {
+            Some(Sub::Block(_))
+            | Some(Sub::Heading(_))
+            | Some(Sub::Row(_))
+            | Some(Sub::Field(_)) => {
                 self.anchors
                     .lock()
                     .unwrap()
@@ -448,7 +463,14 @@ pub fn reconverge_page_tree(
         }
         typed.push(ev.as_typed_event());
     }
-    reconverge(proj, tenant, region, &typed, covered_children, reindex_event_id)
+    reconverge(
+        proj,
+        tenant,
+        region,
+        &typed,
+        covered_children,
+        reindex_event_id,
+    )
 }
 
 // =================================================================================================

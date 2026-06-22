@@ -66,7 +66,7 @@ use myelin_events::{
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_search::{
-    git_code_projection_spec, git_blob_search_projection, AclFilter, EmbeddingAdapter,
+    git_blob_search_projection, git_code_projection_spec, AclFilter, EmbeddingAdapter,
     GitBlobProjectionInput, IncrementalIndexer, MockEmbeddingAdapter, ProjectFetchError,
     ProjectFetcher, ReindexJob, SearchProjection, SearchReindexer,
 };
@@ -86,7 +86,11 @@ fn region() -> Region {
     Region("fr-par".into())
 }
 fn principal() -> Principal {
-    Principal::stub(PrincipalId("platform".into()), PrincipalKind::Service, tenant())
+    Principal::stub(
+        PrincipalId("platform".into()),
+        PrincipalKind::Service,
+        tenant(),
+    )
 }
 fn ctx_base() -> EmitContextBase {
     EmitContextBase {
@@ -147,8 +151,7 @@ fn corpus() -> Vec<CorpusBlob> {
         .into_iter()
         .enumerate()
         .map(|(i, (path, lang, text, literals, msg, oid))| {
-            let blob_ref =
-                format!("myelin://acme/git/blob/core:refs/heads/main:{path}");
+            let blob_ref = format!("myelin://acme/git/blob/core:refs/heads/main:{path}");
             CorpusBlob {
                 aggregate: blob_ref.clone(),
                 blob_ref,
@@ -290,7 +293,10 @@ fn search_code_index_cold_rebuild_byte_matches_live() {
             live_ix.index(&row.envelope).expect("live index");
         }
     }
-    assert_eq!(live_ix.live_count(&tenant(), &region()), corpus.len() as u64);
+    assert_eq!(
+        live_ix.live_count(&tenant(), &region()),
+        corpus.len() as u64
+    );
     let live_digest = index_digest(&live_ix, &corpus);
 
     // ── COLD: a FRESH indexer, wiped + rebuilt via SearchReindexer.reindex (the §4.9 ONLY rebuild
@@ -307,7 +313,10 @@ fn search_code_index_cold_rebuild_byte_matches_live() {
     let job = reindexer
         .reindex(&tenant(), &scope, None, sources, &mut outbox, ctx_base())
         .expect("reindex returns a job");
-    assert!(matches!(job, ReindexJob::Done(_)), "the rebuild completes under the batch cap");
+    assert!(
+        matches!(job, ReindexJob::Done(_)),
+        "the rebuild completes under the batch cap"
+    );
     assert_eq!(
         job.progress().snapshots_emitted,
         corpus.len(),
@@ -348,7 +357,11 @@ fn search_code_index_reindex_is_idempotent() {
     let corpus = corpus();
     let fetcher = Arc::new(GitProjectFetcher::with_corpus(&corpus));
     let embedder: Arc<dyn EmbeddingAdapter> = Arc::new(MockEmbeddingAdapter::new(8));
-    let ix = Arc::new(IncrementalIndexer::new(vec![git_blob_spec()], fetcher, embedder));
+    let ix = Arc::new(IncrementalIndexer::new(
+        vec![git_blob_spec()],
+        fetcher,
+        embedder,
+    ));
     let reindexer = SearchReindexer::new(ix.clone(), region());
     let src = git_source(&corpus);
     let scope = SnapshotScope::new("git", "blob:all");
@@ -365,15 +378,28 @@ fn search_code_index_reindex_is_idempotent() {
         .reindex(&tenant(), &scope, None, sources, &mut outbox, ctx_base())
         .expect("second reindex");
     let after_second = index_digest(&ix, &corpus);
-    assert_eq!(after_first, after_second, "a re-run is idempotent (cold == live, no double-index)");
-    assert_eq!(ix.live_count(&tenant(), &region()), corpus.len() as u64, "no duplicate docs");
+    assert_eq!(
+        after_first, after_second,
+        "a re-run is idempotent (cold == live, no double-index)"
+    );
+    assert_eq!(
+        ix.live_count(&tenant(), &region()),
+        corpus.len() as u64,
+        "no duplicate docs"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 // 2. THE check_status PROJECTION — rebuilds from CI's ci.check.updated re-emit (the §4 "other way")
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 
-fn check_fact(commit: &str, name: &str, attempt: u32, state: CheckState, trust: TrustTier) -> CheckStatus {
+fn check_fact(
+    commit: &str,
+    name: &str,
+    attempt: u32,
+    state: CheckState,
+    trust: TrustTier,
+) -> CheckStatus {
     CheckStatus {
         tenant: tenant(),
         repo: TenancyArtifactRef("myelin://acme/git/repo/core".into()),
@@ -384,8 +410,13 @@ fn check_fact(commit: &str, name: &str, attempt: u32, state: CheckState, trust: 
         run: TenancyArtifactRef(format!("myelin://acme/ci/run/{commit}-{name}-{attempt}")),
         run_attempt: attempt,
         trust_tier: trust,
-        details_ref: TenancyArtifactRef(format!("myelin://acme/ci/run/{commit}-{name}-{attempt}#step-1")),
-        summary: HumanisedRef { template_key: "ci.check.updated".into(), args: BTreeMap::new() },
+        details_ref: TenancyArtifactRef(format!(
+            "myelin://acme/ci/run/{commit}-{name}-{attempt}#step-1"
+        )),
+        summary: HumanisedRef {
+            template_key: "ci.check.updated".into(),
+            args: BTreeMap::new(),
+        },
         started_at: CsTimestamp("2026-06-22T00:00:00Z".into()),
         completed_at: Some(CsTimestamp("2026-06-22T00:01:00Z".into())),
         cost_settled: true,
@@ -415,12 +446,22 @@ fn check_status_projection_rebuilds_from_ci_reemit_byte_identical() {
             check_fact("c1", "build", 2, CheckState::Success, TrustTier::Trusted),
             check_fact("c1", "test", 1, CheckState::Success, TrustTier::Trusted),
             // a fork run on a second commit, neutral-until-endorsed (recorded current row).
-            check_fact("c2", "build", 1, CheckState::Success, TrustTier::UntrustedFork),
+            check_fact(
+                "c2",
+                "build",
+                1,
+                CheckState::Success,
+                TrustTier::UntrustedFork,
+            ),
         ] {
             p.apply(&fact);
             // record CI's truth at the CURRENT (high-water) fact per key — what CI's replay re-emits.
             let agg = format!("ci.check:{}:{}", fact.commit_oid.0, fact.context.name);
-            ci.upsert(&agg, fact.run_attempt as u64, serde_json::to_value(&fact).unwrap());
+            ci.upsert(
+                &agg,
+                fact.run_attempt as u64,
+                serde_json::to_value(&fact).unwrap(),
+            );
         }
         p
     };
@@ -437,7 +478,10 @@ fn check_status_projection_rebuilds_from_ci_reemit_byte_identical() {
     let receipt = bus_reindex(&scope, None, sources, &mut outbox, ctx_base()).expect("ci reindex");
     // CI re-emits ONE current fact per (commit,context) key (the high-water attempt; the failing
     // attempt-1 of c1 is NOT re-emitted — the LWW row CI holds is attempt-2).
-    assert_eq!(receipt.snapshots_emitted, 3, "one current fact per (commit,context) key re-emitted");
+    assert_eq!(
+        receipt.snapshots_emitted, 3,
+        "one current fact per (commit,context) key re-emitted"
+    );
 
     let mut cold_proj = CheckStatusProjection::new();
     for draft in ci.replay(&scope, None) {
@@ -462,7 +506,10 @@ fn check_status_projection_rebuilds_from_ci_reemit_byte_identical() {
         context: CheckContext::ci("build"),
     };
     let row = cold_proj.current(&key).expect("c1/build current");
-    assert_eq!(row.run_attempt, 2, "the re-run supersession survived the rebuild");
+    assert_eq!(
+        row.run_attempt, 2,
+        "the re-run supersession survived the rebuild"
+    );
     assert_eq!(row.state, CheckState::Success);
 }
 
@@ -488,13 +535,23 @@ fn serialize_projection(p: &CheckStatusProjection) -> BTreeMap<String, serde_jso
 /// A minimal edge projection (the Refs-mirror-side derived store, modeled): `edge:<source>-><target>`
 /// → the `(source, target, rel, rel_class)` payload. Rebuilt from `refs.edge.created` re-emits; the
 /// real Refs mirror also projects the inverse — here we compare the FORWARD edge set Git produces.
-fn edge_projection_from_rows(outbox: &OutboxStore, ids: &[myelin_events::EventId]) -> BTreeMap<String, serde_json::Value> {
+fn edge_projection_from_rows(
+    outbox: &OutboxStore,
+    ids: &[myelin_events::EventId],
+) -> BTreeMap<String, serde_json::Value> {
     let mut out: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     for id in ids {
         let row = outbox.row(id).expect("edge row");
-        assert_eq!(row.envelope.type_.0, REFS_EDGE_CREATED, "a lifecycle edge is a refs.edge.created");
+        assert_eq!(
+            row.envelope.type_.0, REFS_EDGE_CREATED,
+            "a lifecycle edge is a refs.edge.created"
+        );
         let pl = &row.envelope.payload;
-        let key = format!("{}->{}", pl["source"].as_str().unwrap_or(""), pl["target"].as_str().unwrap_or(""));
+        let key = format!(
+            "{}->{}",
+            pl["source"].as_str().unwrap_or(""),
+            pl["target"].as_str().unwrap_or("")
+        );
         out.insert(key, pl.clone());
     }
     out
@@ -552,7 +609,10 @@ fn refs_lifecycle_edges_cold_rebuild_byte_matches_live() {
     // THE GREEN ARTIFACT: the forward lifecycle edge set byte-matches (cold == live).
     let live_bytes = serde_json::to_value(&live_edges).unwrap();
     let cold_bytes = serde_json::to_value(&cold_edges).unwrap();
-    assert_eq!(cold_bytes, live_bytes, "the lifecycle edge set rebuilds byte-identically (GIT-D3)");
+    assert_eq!(
+        cold_bytes, live_bytes,
+        "the lifecycle edge set rebuilds byte-identically (GIT-D3)"
+    );
 
     // The edge set is exactly { closes PR->issue, relates PR->linked } (the producer vocabulary).
     assert!(cold_edges.contains_key(&format!("{}->{}", pr.0, issue.0)));
@@ -605,7 +665,11 @@ fn an_erased_blob_does_not_resurrect_on_reindex() {
 
     let fetcher = Arc::new(GitProjectFetcher::with_corpus(&corpus));
     let embedder: Arc<dyn EmbeddingAdapter> = Arc::new(MockEmbeddingAdapter::new(8));
-    let ix = Arc::new(IncrementalIndexer::new(vec![git_blob_spec()], fetcher, embedder));
+    let ix = Arc::new(IncrementalIndexer::new(
+        vec![git_blob_spec()],
+        fetcher,
+        embedder,
+    ));
     let reindexer = SearchReindexer::new(ix.clone(), region());
 
     // First a normal reindex: all blobs present.
@@ -620,12 +684,16 @@ fn an_erased_blob_does_not_resurrect_on_reindex() {
     }
     assert_eq!(ix.live_count(&tenant(), &region()), corpus.len() as u64);
     assert!(
-        ix.indexed_zookie_of(&tenant(), &region(), &erased_ref).is_some(),
+        ix.indexed_zookie_of(&tenant(), &region(), &erased_ref)
+            .is_some(),
         "the blob is indexed before erasure"
     );
 
     // ERASE the blob at the owner (the *.erased tombstone removes it from the source of truth).
-    assert!(src.erase(&erased_ref), "the blob was present and is now erased");
+    assert!(
+        src.erase(&erased_ref),
+        "the blob was present and is now erased"
+    );
 
     // Reindex again (a cold rebuild wipes + replays). The erased blob is SKIPPED — it does NOT come back.
     let mut outbox = OutboxStore::new();
@@ -644,6 +712,10 @@ fn an_erased_blob_does_not_resurrect_on_reindex() {
         "the erased blob's doc is ABSENT after reindex (0 resurrected PII; the ONE posture residual)"
     );
     // The other blobs are still present (the erasure was surgical, not a wipe of the corpus).
-    assert!(ix.indexed_zookie_of(&tenant(), &region(), &corpus[0].blob_ref).is_some());
-    assert!(ix.indexed_zookie_of(&tenant(), &region(), &corpus[2].blob_ref).is_some());
+    assert!(ix
+        .indexed_zookie_of(&tenant(), &region(), &corpus[0].blob_ref)
+        .is_some());
+    assert!(ix
+        .indexed_zookie_of(&tenant(), &region(), &corpus[2].blob_ref)
+        .is_some());
 }

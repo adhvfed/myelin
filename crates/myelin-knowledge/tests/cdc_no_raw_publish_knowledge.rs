@@ -38,9 +38,14 @@ fn read_fixture(name: &str) -> String {
 fn knowledge_red_fixture_is_rejected_only_by_no_raw_publish() {
     let red = read_fixture("no_raw_publish.knowledge.red.rs.txt");
     let violations = no_raw_publish().run(&red);
-    assert!(!violations.is_empty(), "the KN red fixture MUST be rejected by no-raw-publish");
     assert!(
-        violations.iter().all(|v| v.lint == LintId("no-raw-publish")),
+        !violations.is_empty(),
+        "the KN red fixture MUST be rejected by no-raw-publish"
+    );
+    assert!(
+        violations
+            .iter()
+            .all(|v| v.lint == LintId("no-raw-publish")),
         "every violation carries the no-raw-publish id"
     );
 
@@ -50,7 +55,11 @@ fn knowledge_red_fixture_is_rejected_only_by_no_raw_publish() {
         .filter(|l| !l.run(&red).is_empty())
         .map(|l| l.id)
         .collect();
-    assert_eq!(firing, vec![LintId("no-raw-publish")], "exactly no-raw-publish trips, no other");
+    assert_eq!(
+        firing,
+        vec![LintId("no-raw-publish")],
+        "exactly no-raw-publish trips, no other"
+    );
 }
 
 /// **The KNOWLEDGE green fixture (every `knowledge.*` event emitted via `OutboxTx::emit` in the same

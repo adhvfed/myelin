@@ -462,12 +462,12 @@ impl<I: IdentityService, P: PlacementResolver, C: GitCore> FrontDoor<I, P, C> {
 
         // 5. placement_of (12.2) — resolve the repo's region-pinned placement.
         let repo_id = RepoId::from_token(repo_placement_key(&token_tenant, &req.url_repo));
-        let placement = self
-            .placement
-            .placement_of(&repo_id)
-            .ok_or_else(|| FrontDoorError::NoPlacement {
-                repo: req.url_repo.clone(),
-            })?;
+        let placement =
+            self.placement
+                .placement_of(&repo_id)
+                .ok_or_else(|| FrontDoorError::NoPlacement {
+                    repo: req.url_repo.clone(),
+                })?;
         if placement.status == RepoPlacementStatus::Offboarding {
             return Err(FrontDoorError::RepoOffboarding {
                 repo: req.url_repo.clone(),
@@ -735,13 +735,13 @@ mod tests {
     }
     impl PlacementResolver for StubPlacement {
         fn placement_of(&self, repo: &RepoId) -> Option<RepoGitPlacement> {
-            self.placements.get(repo.as_str()).map(|(region, status)| {
-                RepoGitPlacement {
+            self.placements
+                .get(repo.as_str())
+                .map(|(region, status)| RepoGitPlacement {
                     group: myelin_storage::gitpack::StorageGroup::from_token("g1"),
                     region: Region(region.clone()),
                     status: *status,
-                }
-            })
+                })
         }
     }
 
@@ -761,11 +761,7 @@ mod tests {
         fn route(&self, op: GitOp) -> Backend {
             crate::core::backend_for(op)
         }
-        fn advertise_refs(
-            &self,
-            repo: &RepoLoc,
-            svc: Service,
-        ) -> Result<WireOutput, GitCoreError> {
+        fn advertise_refs(&self, repo: &RepoLoc, svc: Service) -> Result<WireOutput, GitCoreError> {
             self.served.borrow_mut().push((repo.clone(), svc));
             Ok(WireOutput {
                 stdout: b"refs-adv".to_vec(),
@@ -863,8 +859,7 @@ mod tests {
     #[test]
     fn git_d8_cross_tenant_token_is_refused_at_the_door_zero_reads() {
         // The token authenticates to `acme`; the URL path addresses `globex`.
-        let id =
-            StubId::new().with_principal("pat:stolen", "acme", PrincipalStatus::Active);
+        let id = StubId::new().with_principal("pat:stolen", "acme", PrincipalStatus::Active);
         // globex DOES host a repo here — but the acme principal must never reach it.
         let placement =
             StubPlacement::new().with("globex/secret", "fr-par", RepoPlacementStatus::Active);
@@ -894,8 +889,7 @@ mod tests {
     // ── 3. residency reject: a repo pinned to another region is an out-of-region route → refused. ──
     #[test]
     fn out_of_region_route_is_refused_at_the_door() {
-        let id =
-            StubId::new().with_principal("ssh:k", "acme", PrincipalStatus::Active);
+        let id = StubId::new().with_principal("ssh:k", "acme", PrincipalStatus::Active);
         // repo pinned to eu-central, but THIS replica serves fr-par → out-of-region.
         let placement =
             StubPlacement::new().with("acme/widgets", "eu-central", RepoPlacementStatus::Active);
@@ -916,7 +910,11 @@ mod tests {
                 target: "fr-par".into(),
             }
         );
-        assert_eq!(d.core.served.borrow().len(), 0, "0 out-of-region routes admitted");
+        assert_eq!(
+            d.core.served.borrow().len(),
+            0,
+            "0 out-of-region routes admitted"
+        );
     }
 
     // ── 4. authz deny: a principal without `push` is denied the push action (fail-closed). ──
@@ -938,7 +936,10 @@ mod tests {
         let err = d.authorize(&req).unwrap_err();
         assert!(matches!(
             err,
-            FrontDoorError::AuthzDenied { decision: Decision::Deny, .. }
+            FrontDoorError::AuthzDenied {
+                decision: Decision::Deny,
+                ..
+            }
         ));
         assert_eq!(d.core.served.borrow().len(), 0);
     }
@@ -958,7 +959,9 @@ mod tests {
         };
         assert_eq!(
             d.authorize(&req).unwrap_err(),
-            FrontDoorError::Unauthenticated { scheme: "ssh".into() }
+            FrontDoorError::Unauthenticated {
+                scheme: "ssh".into()
+            }
         );
     }
 
@@ -978,7 +981,9 @@ mod tests {
         };
         assert_eq!(
             d.authorize(&req).unwrap_err(),
-            FrontDoorError::PrincipalNotActive { status: PrincipalStatus::Disabled }
+            FrontDoorError::PrincipalNotActive {
+                status: PrincipalStatus::Disabled
+            }
         );
     }
 
@@ -997,7 +1002,9 @@ mod tests {
         };
         assert_eq!(
             d.authorize(&req).unwrap_err(),
-            FrontDoorError::NoPlacement { repo: "widgets".into() }
+            FrontDoorError::NoPlacement {
+                repo: "widgets".into()
+            }
         );
     }
 
@@ -1005,11 +1012,8 @@ mod tests {
     #[test]
     fn offboarding_repo_is_refused() {
         let id = StubId::new().with_principal("ssh:k", "acme", PrincipalStatus::Active);
-        let placement = StubPlacement::new().with(
-            "acme/widgets",
-            "fr-par",
-            RepoPlacementStatus::Offboarding,
-        );
+        let placement =
+            StubPlacement::new().with("acme/widgets", "fr-par", RepoPlacementStatus::Offboarding);
         let d = door(id, placement, RecCore::new(), "fr-par");
         let req = GitRequest {
             credential: cred("ssh", "k"),
@@ -1020,7 +1024,9 @@ mod tests {
         };
         assert_eq!(
             d.authorize(&req).unwrap_err(),
-            FrontDoorError::RepoOffboarding { repo: "widgets".into() }
+            FrontDoorError::RepoOffboarding {
+                repo: "widgets".into()
+            }
         );
     }
 
@@ -1086,7 +1092,12 @@ mod tests {
         // An Id that is not wired (the floor) → not ready, but STILL alive.
         let mut unavailable_id = StubId::new();
         unavailable_id.authn_unavailable = true;
-        let d2 = door(unavailable_id, StubPlacement::new(), RecCore::new(), "fr-par");
+        let d2 = door(
+            unavailable_id,
+            StubPlacement::new(),
+            RecCore::new(),
+            "fr-par",
+        );
         assert!(d2.liveness(), "liveness stays up even when Id is down");
         assert!(
             !d2.readiness(&cred("probe", "p"), &RepoId::from_token("sys/_probe")),
@@ -1133,7 +1144,11 @@ mod tests {
             d.advertise_refs(&req).unwrap_err(),
             FrontDoorError::CrossTenant { .. }
         ));
-        assert_eq!(d.core.served.borrow().len(), 0, "no ref adv to a foreign tenant");
+        assert_eq!(
+            d.core.served.borrow().len(),
+            0,
+            "no ref adv to a foreign tenant"
+        );
     }
 
     // ── 13. the action → permission/service map is the one source of truth. ──

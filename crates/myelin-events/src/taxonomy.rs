@@ -42,8 +42,15 @@
 /// leading segment of every well-formed event `type` is one of these. CLI aliases (`repo`/`doc`
 /// /…) are a render-time projection only and are intentionally NOT here — Refs is the validator,
 /// not a second authority.
-pub const SUBSYSTEM_TOKENS: &[&str] =
-    &["git", "ci", "issue", "knowledge", "chat", "identity", "refs"];
+pub const SUBSYSTEM_TOKENS: &[&str] = &[
+    "git",
+    "ci",
+    "issue",
+    "knowledge",
+    "chat",
+    "identity",
+    "refs",
+];
 
 /// The canonical singular **artifact-type** tokens that appear in the seed (Bus §6.2 + §6.4),
 /// **including the new `initiative`** type token (the sanctioned §6.2 extension, recon §2 — a
@@ -53,18 +60,34 @@ pub const ARTIFACT_TYPE_TOKENS: &[&str] = &[
     // git (EB-24: git's full canonical-root type list — `repo`/`commit`/`blob` complete the
     // architecture §2 root table the #sub mints attach to: pr/comment+thread, blob/L<a>-L<b>,
     // commit/review canonical roots; GIT-P4 / P-230)
-    "pr", "ref", "review", "comment", "repo", "commit", "blob", // ci
-    "run", "check", "log", "artifact", // issue
-    "issue", "initiative", // NEW type token (recon §2 / §6.2)
-    "relation", // knowledge
-    "page", "doc", "row", // chat
+    "pr",
+    "ref",
+    "review",
+    "comment",
+    "repo",
+    "commit",
+    "blob", // ci
+    "run",
+    "check",
+    "log",
+    "artifact", // issue
+    "issue",
+    "initiative", // NEW type token (recon §2 / §6.2)
+    "relation",   // knowledge
+    "page",
+    "doc",
+    "row", // chat
     // chat's three canonical-root type tokens (architecture chat §2:
     // `myelin://<tenant>/chat/{channel|message|thread}/<id>`). `message` was already present (it
     // is also an identity type); `channel`/`thread` are added here so chat's `#sub` mints
     // (`message-`/`thread-`) attach to a parsing URN root (CHAT-P2 / P-244, mirroring git's
     // EB-24 `repo`/`commit`/`blob` extension for the same reason).
-    "channel", "message", "thread", "read_state", // identity
-    "permission", "member", // refs
+    "channel",
+    "message",
+    "thread",
+    "read_state", // identity
+    "permission",
+    "member", // refs
     "edge",
 ];
 
@@ -167,7 +190,10 @@ impl std::fmt::Display for TaxonomyError {
                 "`{name}`: {segments} segments — the grammar is at most 3 (<sub>.<type>.<event>)"
             ),
             TaxonomyError::EmptySegment { name } => {
-                write!(f, "`{name}`: has an empty segment (a leading/trailing/doubled dot)")
+                write!(
+                    f,
+                    "`{name}`: has an empty segment (a leading/trailing/doubled dot)"
+                )
             }
             TaxonomyError::BadToken { name, token } => write!(
                 f,
@@ -210,9 +236,27 @@ fn token_is_well_formed(token: &str) -> bool {
 /// passes. The full per-subsystem list is each subsystem's EB-24 responsibility.
 fn looks_present_tense(token: &str) -> bool {
     const PRESENT_VERBS: &[&str] = &[
-        "create", "update", "delete", "merge", "close", "reopen", "open", "start", "pass",
-        "fail", "cancel", "submit", "transition", "grant", "revoke", "add", "remove", "erase",
-        "publish", "snapshot", "invoke",
+        "create",
+        "update",
+        "delete",
+        "merge",
+        "close",
+        "reopen",
+        "open",
+        "start",
+        "pass",
+        "fail",
+        "cancel",
+        "submit",
+        "transition",
+        "grant",
+        "revoke",
+        "add",
+        "remove",
+        "erase",
+        "publish",
+        "snapshot",
+        "invoke",
     ];
     // `snapshot`/`publish` are the noun-form seed names; only treat a token as present-tense if
     // it is EXACTLY a bare verb AND not one of the legitimate noun/past seed tokens. The seed
@@ -434,7 +478,15 @@ mod tests {
     fn subsystem_token_set_is_the_frozen_canonical_set() {
         assert_eq!(
             SUBSYSTEM_TOKENS,
-            &["git", "ci", "issue", "knowledge", "chat", "identity", "refs"]
+            &[
+                "git",
+                "ci",
+                "issue",
+                "knowledge",
+                "chat",
+                "identity",
+                "refs"
+            ]
         );
     }
 }

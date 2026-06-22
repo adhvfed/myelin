@@ -396,7 +396,10 @@ impl BusSignals {
     /// signal to assert against"). The labelled signals (consumer lag, per-tenant in-flight)
     /// emit one sample per label set; the rest are scalars.
     pub fn emit_to<S: MetricsSink>(&self, sink: &mut S) {
-        sink.emit(MetricSample::scalar(BusSignal::OutboxDepth, self.outbox_depth));
+        sink.emit(MetricSample::scalar(
+            BusSignal::OutboxDepth,
+            self.outbox_depth,
+        ));
         sink.emit(MetricSample::scalar(
             BusSignal::OutboxAgeSecs,
             self.outbox_age_secs,
@@ -463,8 +466,13 @@ fn age_seconds(recorded_at: &Timestamp, now: &Timestamp) -> i64 {
 fn epoch_secs(ts: &str) -> Option<i64> {
     // YYYY-MM-DDTHH:MM:SSZ  →  exactly 20 chars, fixed separators.
     let b = ts.as_bytes();
-    if b.len() != 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':'
-        || b[16] != b':' || b[19] != b'Z'
+    if b.len() != 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+        || b[19] != b'Z'
     {
         return None;
     }
@@ -546,7 +554,11 @@ mod tests {
         let ctx = EmitContextBase {
             tenant: TenantId("acme".into()),
             region: Region("eu-west".into()),
-            actor: Actor(Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId("acme".into()))),
+            actor: Actor(Principal::stub(
+                PrincipalId("p".into()),
+                PrincipalKind::Human,
+                TenantId("acme".into()),
+            )),
             schema_ver: 1,
             occurred_at: Timestamp("2026-06-19T00:00:00Z".into()),
             // the row's recorded_at — the age is measured against `now` below.
@@ -677,7 +689,10 @@ mod tests {
         );
         // a garbled timestamp yields 0 (fresh, never fabricated-stale)
         assert_eq!(
-            age_seconds(&Timestamp("not-a-timestamp".into()), &Timestamp("2026-06-19T00:00:00Z".into())),
+            age_seconds(
+                &Timestamp("not-a-timestamp".into()),
+                &Timestamp("2026-06-19T00:00:00Z".into())
+            ),
             0
         );
     }

@@ -105,9 +105,7 @@ pub fn extract_mentions(nodes: &[InlineNode]) -> Vec<Principal> {
         // ONLY the structured Mention node fans out (AG-6). ArtifactRefNode/Embed are not mentions.
         if let InlineNode::Mention(principal) = node {
             // Dedup by principal_id: the SAME person mentioned twice in one body is ONE recipient.
-            let already = out
-                .iter()
-                .any(|p| p.principal_id == principal.principal_id);
+            let already = out.iter().any(|p| p.principal_id == principal.principal_id);
             if !already {
                 out.push(principal.clone());
             }
@@ -167,7 +165,10 @@ impl HotSubjectCap {
     /// A hot-subject cap with an explicit cap (a drill drives a small cap to exercise the overflow
     /// without materialising thousands of rows).
     pub fn with_cap(cap: u32) -> HotSubjectCap {
-        HotSubjectCap { cap, admitted: Arc::new(Mutex::new(HashMap::new())) }
+        HotSubjectCap {
+            cap,
+            admitted: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     /// The configured cap (so a drill / a test reads the bound it asserts against).

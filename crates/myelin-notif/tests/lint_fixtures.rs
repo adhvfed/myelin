@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 use myelin_lints::{no_untagged_personal_data, residency_pin, tenant_predicate};
 
 fn fixture(name: &str) -> String {
-    let path: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name);
+    let path: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read fixture {name}: {e}"))
 }
 

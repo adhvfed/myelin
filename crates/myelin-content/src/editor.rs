@@ -71,7 +71,10 @@ pub(crate) fn obj_count(md: &str) -> usize {
 /// receive the nodes whose U+FFFC falls before/at-or-after `obj_split` (the count of
 /// U+FFFC characters in the left half). Used by the Enter-split so each resulting block
 /// carries exactly its own structured nodes.
-pub(crate) fn split_nodes(nodes: &[InlineNode], obj_split: usize) -> (Vec<InlineNode>, Vec<InlineNode>) {
+pub(crate) fn split_nodes(
+    nodes: &[InlineNode],
+    obj_split: usize,
+) -> (Vec<InlineNode>, Vec<InlineNode>) {
     let k = obj_split.min(nodes.len());
     (nodes[..k].to_vec(), nodes[k..].to_vec())
 }

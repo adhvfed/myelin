@@ -102,7 +102,10 @@ fn the_structural_floor_is_proven_end_to_end_on_the_m1_stores() {
         }
         // Storage RETAINED while restricted (suppression ≠ delete).
         assert!(
-            matches!(h.fetch_stored(&subj, &tenant), Some(StoredContent::Recoverable(_))),
+            matches!(
+                h.fetch_stored(&subj, &tenant),
+                Some(StoredContent::Recoverable(_))
+            ),
             "{} retains storage while restricted",
             h.id()
         );
@@ -112,7 +115,10 @@ fn the_structural_floor_is_proven_end_to_end_on_the_m1_stores() {
     // Reversible — clearing the flag resumes processing across every holder.
     restrict.set(&subj, &tenant, false);
     for h in m1_holders {
-        assert!(matches!(run(h, Processing::Index, &subj, &tenant), Processed::Processed(_)));
+        assert!(matches!(
+            run(h, Processing::Index, &subj, &tenant),
+            Processed::Processed(_)
+        ));
     }
 
     // ─────── LEVER 2: pseudonym-map shred leaves only the frozen grammar ───────
@@ -126,7 +132,11 @@ fn the_structural_floor_is_proven_end_to_end_on_the_m1_stores() {
 
     // ─────── LEVER 1: erase crypto-shreds the per-subject DEK → 0 recoverable across all holders ──
     let destroyed = chat.erase_self_authored(&subj, &tenant);
-    assert_eq!(destroyed, Some(11), "the DEK shred records the destroyed epoch (the audit trail)");
+    assert_eq!(
+        destroyed,
+        Some(11),
+        "the DEK shred records the destroyed epoch (the audit trail)"
+    );
     let mut zero_recoverable_holders = 0u32;
     for h in m1_holders {
         assert_eq!(
@@ -137,7 +147,10 @@ fn the_structural_floor_is_proven_end_to_end_on_the_m1_stores() {
         );
         zero_recoverable_holders += 1;
     }
-    assert_eq!(zero_recoverable_holders, 3, "0 recoverable PII across all 3 M1 holders");
+    assert_eq!(
+        zero_recoverable_holders, 3,
+        "0 recoverable PII across all 3 M1 holders"
+    );
     // 0 recoverable in the backup snapshot (§7.5: destroyed AND excluded from backup).
     assert_eq!(
         kms.recoverable_in_backup(&M1Store::dek_handle(&subj, &tenant)),
@@ -154,7 +167,10 @@ fn the_structural_floor_is_proven_end_to_end_on_the_m1_stores() {
         LeverCoverage::RestrictSuppressOnly,
         "the residual is restrict-suppress-only — the documented limit, not crypto-shredded (§7.2)"
     );
-    assert_eq!(classify_residual(Authorship::SelfAuthored), LeverCoverage::CryptoShred);
+    assert_eq!(
+        classify_residual(Authorship::SelfAuthored),
+        LeverCoverage::CryptoShred
+    );
 }
 
 /// Run one processing op on a holder (the §4.4 four-op set).

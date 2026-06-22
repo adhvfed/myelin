@@ -40,7 +40,11 @@ fn cell(id: &str, region: &str) -> Cell {
         region: Region::new(region),
         status: CellStatus::Active,
         isolation_kind: IsolationKind::Pool,
-        capacity: Capacity { tenants_max: 1000, write_qps_max: 5000, storage_bytes_max: 1 << 40 },
+        capacity: Capacity {
+            tenants_max: 1000,
+            write_qps_max: 5000,
+            storage_bytes_max: 1 << 40,
+        },
         utilisation: 10,
         version: 1,
         endpoint: format!("cell.{region}.{id}.myelin.eu"),
@@ -68,10 +72,16 @@ fn four_layer_region_pinning_end_to_end() {
             isolation_tier: IsolationKind::Pool,
             slug: "cross".into(),
             status: PlacementStatus::Active,
-            member_cells: vec![CellId::from_token("cell-fr-1"), CellId::from_token("cell-de-1")],
+            member_cells: vec![
+                CellId::from_token("cell-fr-1"),
+                CellId::from_token("cell-de-1"),
+            ],
         },
     );
-    assert!(cross_region.is_err(), "layers 1+2: a cross-region member cell is rejected at placement");
+    assert!(
+        cross_region.is_err(),
+        "layers 1+2: a cross-region member cell is rejected at placement"
+    );
 
     // GREEN (layers 1+2): a single-region placement is admitted.
     FourLayerEnforcement::place(
@@ -107,7 +117,10 @@ fn four_layer_region_pinning_end_to_end() {
             row_region: Region::new("eu-central"),
         }
     );
-    assert!(rejected.to_string().contains("no cross-region query path"), "loud: {rejected}");
+    assert!(
+        rejected.to_string().contains("no cross-region query path"),
+        "loud: {rejected}"
+    );
 
     // ── Layer 4 (CP-D2 e2e): cell-fr-1 serves its OWN tenant (ACME); cell-fr-2 REJECTS a request
     //    for ACME (a misroute) — redirected, audited, 0 cross-cell read. ──
@@ -124,40 +137,75 @@ fn four_layer_region_pinning_end_to_end() {
     let misroute = wrong
         .route(&TenantId::from_token("01J0ACME"))
         .expect_err("layer 4: cell-fr-2 does not host ACME → REJECTED (CP-D2)");
-    assert!(misroute.to_string().contains("REJECTED"), "loud misroute: {misroute}");
-    assert_eq!(wrong.gateway().misroute_count(), 1, "the misroute is counted");
-    assert_eq!(wrong.gateway().cross_tenant_reads(), 0, "0 cross-tenant/cross-cell reads (the CP-D2 zero)");
+    assert!(
+        misroute.to_string().contains("REJECTED"),
+        "loud misroute: {misroute}"
+    );
+    assert_eq!(
+        wrong.gateway().misroute_count(),
+        1,
+        "the misroute is counted"
+    );
+    assert_eq!(
+        wrong.gateway().cross_tenant_reads(),
+        0,
+        "0 cross-tenant/cross-cell reads (the CP-D2 zero)"
+    );
 
     // ── THE HEADLINE PROPERTY: no cross-region query path for personal data. The cell serves ACME
     //    (layer 4) AND ACME's data can ONLY be written in fr-par (layer 3) — a write in any other
     //    region is rejected. ──
     enforcement
-        .assert_no_cross_region_query_path(&TenantId::from_token("01J0ACME"), &Region::new("eu-central"))
+        .assert_no_cross_region_query_path(
+            &TenantId::from_token("01J0ACME"),
+            &Region::new("eu-central"),
+        )
         .expect("NO cross-region query path: ACME is served here and its data stays in fr-par");
 
     // The two go/no-go zeros hold end-to-end.
-    let out_of_region_writes_admitted = enforcement.write_boundary().out_of_region_writes_admitted();
+    let out_of_region_writes_admitted =
+        enforcement.write_boundary().out_of_region_writes_admitted();
     let cross_tenant_reads = enforcement.gateway().cross_tenant_reads();
-    assert_eq!(out_of_region_writes_admitted, 0, "0 out-of-region writes admitted (layer 3 / STOR-D5)");
-    assert_eq!(cross_tenant_reads, 0, "0 cross-tenant/cross-cell reads (layer 4 / CP-D2)");
+    assert_eq!(
+        out_of_region_writes_admitted, 0,
+        "0 out-of-region writes admitted (layer 3 / STOR-D5)"
+    );
+    assert_eq!(
+        cross_tenant_reads, 0,
+        "0 cross-tenant/cross-cell reads (layer 4 / CP-D2)"
+    );
 
     // ── residency_verify attestation PASSES for the in-region tenant (the green CP-D3 artifact). ──
-    use myelin_control_plane::{residency_verify, ResidencySigningKey, ResidencyStoreClass, StoreRegionReport};
+    use myelin_control_plane::{
+        residency_verify, ResidencySigningKey, ResidencyStoreClass, StoreRegionReport,
+    };
     let key = ResidencySigningKey::from_bytes([0x12u8; 32]);
     let reports: Vec<StoreRegionReport> = ResidencyStoreClass::M1_SET
         .iter()
         .map(|c| StoreRegionReport::new(*c, Region::new("fr-par")))
         .collect();
-    let attestation = residency_verify(&TenantId::from_token("01J0ACME"), &Region::new("fr-par"), &reports, &key)
-        .expect("residency_verify attestation PASSES for in-region writes (the green CP-D3 artifact)");
-    assert!(attestation.verify(&key), "the attestation is signed + verifies");
+    let attestation = residency_verify(
+        &TenantId::from_token("01J0ACME"),
+        &Region::new("fr-par"),
+        &reports,
+        &key,
+    )
+    .expect("residency_verify attestation PASSES for in-region writes (the green CP-D3 artifact)");
+    assert!(
+        attestation.verify(&key),
+        "the attestation is signed + verifies"
+    );
 
     // ── Emit the gate result on the SAME SignalSource every drill uses (observability is part of
     //    the pass, EI-01 §3): the CrossTenantCount projection carries the headline zero — here the
     //    SUM of the two go/no-go zeros (0 out-of-region writes + 0 cross-cell reads == 0). ──
     let mut sig = SignalSource::new();
-    sig.set_scalar(SignalName::CrossTenantCount, (out_of_region_writes_admitted + cross_tenant_reads) as i64);
-    sig.assert_signal(SignalName::CrossTenantCount, Predicate::Eq(0)).expect_green();
+    sig.set_scalar(
+        SignalName::CrossTenantCount,
+        (out_of_region_writes_admitted + cross_tenant_reads) as i64,
+    );
+    sig.assert_signal(SignalName::CrossTenantCount, Predicate::Eq(0))
+        .expect_green();
 
     println!(
         "[P-096 P-CP-12 GREEN 2026-06-19] four-layer region-pinning enforced end-to-end \
@@ -188,7 +236,8 @@ fn cp_d3_runtime_gate_is_not_vacuous() {
     let mut sig = SignalSource::new();
     sig.set_scalar(SignalName::CrossTenantCount, 1); // 1 out-of-region write admitted (the breach).
     assert!(
-        !sig.assert_signal(SignalName::CrossTenantCount, Predicate::Eq(0)).is_green(),
+        !sig.assert_signal(SignalName::CrossTenantCount, Predicate::Eq(0))
+            .is_green(),
         "an admitted out-of-region write MUST read RED — the STOR-D5 zero is a real tripwire"
     );
 }
@@ -221,7 +270,13 @@ fn assertion_catches_a_cell_that_does_not_home_the_tenant() {
         Region::new("fr-par"),
     );
     let err = enforcement
-        .assert_no_cross_region_query_path(&TenantId::from_token("01J0ACME"), &Region::new("eu-central"))
+        .assert_no_cross_region_query_path(
+            &TenantId::from_token("01J0ACME"),
+            &Region::new("eu-central"),
+        )
         .expect_err("cell-fr-2 does not home ACME → the assertion fails");
-    assert!(matches!(err, CrossRegionPathError::TenantNotServedHere { .. }), "loud: {err}");
+    assert!(
+        matches!(err, CrossRegionPathError::TenantNotServedHere { .. }),
+        "loud: {err}"
+    );
 }

@@ -81,7 +81,14 @@ fn wired(cap: usize, scope: &TenantScope, grants: &[TupleDelta]) -> (ListObjects
     }
 
     store
-        .write_tuples(scope, &principal(&scope.tenant().0, "p-admin"), grants, None, None, now())
+        .write_tuples(
+            scope,
+            &principal(&scope.tenant().0, "p-admin"),
+            grants,
+            None,
+            None,
+            now(),
+        )
         .expect("seed grants");
     let bus = InProcessBus::new();
     let relay = Relay::new(outbox.clone(), bus.clone(), || Timestamp("t".into()));
@@ -90,7 +97,10 @@ fn wired(cap: usize, scope: &TenantScope, grants: &[TupleDelta]) -> (ListObjects
         consumer.handle(&env);
     }
 
-    (ListObjects::with_cap(store, namespace, index.clone(), cap), index)
+    (
+        ListObjects::with_cap(store, namespace, index.clone(), cap),
+        index,
+    )
 }
 
 fn now() -> Timestamp {
@@ -117,7 +127,11 @@ fn git_d11_partial_visibility_100k_pr_list_one_query_zero_leak() {
     const VISIBLE: usize = 12;
     let mut grants: Vec<TupleDelta> = Vec::with_capacity(VISIBLE);
     for i in 0..VISIBLE {
-        grants.push(add(&format!("pull_request:pr-{i:06}"), "reviewer", "p:viewer"));
+        grants.push(add(
+            &format!("pull_request:pr-{i:06}"),
+            "reviewer",
+            "p:viewer",
+        ));
     }
     // A PR the viewer must NOT see (granted to someone else) — the leak witness.
     grants.push(add("pull_request:pr-secret", "reviewer", "p:other"));
@@ -134,7 +148,9 @@ fn git_d11_partial_visibility_100k_pr_list_one_query_zero_leak() {
     );
     let set_expr = match r {
         ListObjectsResult::Filter { set_expr, .. } => set_expr,
-        ListObjectsResult::Ids { .. } => panic!("above the cap the 100k-PR list must push down to Filter"),
+        ListObjectsResult::Ids { .. } => {
+            panic!("above the cap the 100k-PR list must push down to Filter")
+        }
     };
     // ONE query: the Filter lowers to a SINGLE consumer-composable Lowered triple (one sql_predicate +
     // one JOIN set against authz_visible over pr.id) — no N+1, no post-filter (§7.3, GIT-D11).
@@ -149,7 +165,10 @@ fn git_d11_partial_visibility_100k_pr_list_one_query_zero_leak() {
         matches!(set_expr, SetExpr::InRelation { .. }),
         "the push-down is the InRelation JOIN shape (the consumer conjoins its own pr.id, §7.3)"
     );
-    assert!(!lowered.sql_predicate.is_empty(), "the lowering produced exactly one SQL predicate");
+    assert!(
+        !lowered.sql_predicate.is_empty(),
+        "the lowering produced exactly one SQL predicate"
+    );
     assert!(
         lowered.joins.len() <= 1,
         "ONE query: at most one authz_visible JOIN (no N+1) — got {} JOINs",
@@ -167,15 +186,31 @@ fn git_d11_partial_visibility_100k_pr_list_one_query_zero_leak() {
     );
     let ids = match r2 {
         ListObjectsResult::Ids { ids, .. } => ids,
-        ListObjectsResult::Filter { .. } => panic!("under the cap the visible slice materialises as Ids"),
+        ListObjectsResult::Filter { .. } => {
+            panic!("under the cap the visible slice materialises as Ids")
+        }
     };
-    assert_eq!(ids.len(), VISIBLE, "exactly the {VISIBLE} visible PRs materialise");
+    assert_eq!(
+        ids.len(),
+        VISIBLE,
+        "exactly the {VISIBLE} visible PRs materialise"
+    );
     // 0 LEAK: the secret PR (granted to p:other) NEVER appears in the viewer's list.
-    let leaked = ids.iter().filter(|o| o.0 == "pull_request:pr-secret").count();
-    assert_eq!(leaked, 0, "0 leaked PRs — a PR the viewer cannot see never appears (GIT-D11)");
+    let leaked = ids
+        .iter()
+        .filter(|o| o.0 == "pull_request:pr-secret")
+        .count();
+    assert_eq!(
+        leaked, 0,
+        "0 leaked PRs — a PR the viewer cannot see never appears (GIT-D11)"
+    );
     // And every materialised id IS one of the viewer's visible PRs (no spurious row).
     for o in &ids {
-        assert!(o.0.starts_with("pull_request:pr-0"), "only the viewer's visible PRs: {}", o.0);
+        assert!(
+            o.0.starts_with("pull_request:pr-0"),
+            "only the viewer's visible PRs: {}",
+            o.0
+        );
     }
 
     // (C) REVOKE reflected (zookie): remove the viewer's grant on pr-000000 from the S8 projection at a
@@ -207,7 +242,11 @@ fn git_d11_partial_visibility_100k_pr_list_one_query_zero_leak() {
         !ids_after.iter().any(|o| o.0 == "pull_request:pr-000000"),
         "the just-revoked PR is reflected — it drops out of the list (zookie, GIT-D11)"
     );
-    assert_eq!(ids_after.len(), VISIBLE - 1, "exactly one PR (the revoked one) dropped out");
+    assert_eq!(
+        ids_after.len(),
+        VISIBLE - 1,
+        "exactly one PR (the revoked one) dropped out"
+    );
 
     println!(
         "[P-247 DRILL GREEN 2026-06-21] GIT-D11 partial-visibility PR list: \

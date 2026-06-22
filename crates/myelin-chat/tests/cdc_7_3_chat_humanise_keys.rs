@@ -19,7 +19,9 @@ use myelin_chat::glue::{
     chat_humanise_templates, register_chat_humanise_templates, TPL_CHAT_AGENT_MESSAGE,
     TPL_CHAT_CARD, TPL_CHAT_MENTIONED,
 };
-use myelin_notif::{render_message, HumaniseTemplate, TemplateStore, DEFAULT_LOCALE, PLATFORM_DEFAULT_TENANT};
+use myelin_notif::{
+    render_message, HumaniseTemplate, TemplateStore, DEFAULT_LOCALE, PLATFORM_DEFAULT_TENANT,
+};
 
 /// **PROVIDER side of 7.3** — chat registers exactly its three humanise keys (card / agent-message /
 /// mentioned) as rows in the ONE templating surface. The provider's promise: chat holds no private
@@ -46,7 +48,11 @@ fn consumer_admits_and_serves(rows: &[HumaniseTemplate]) -> TemplateStore {
 #[test]
 fn cdc_7_3_chat_provider_registers_keys_consumer_admits_and_serves() {
     let rows = provider_chat_humanise_rows();
-    assert_eq!(rows.len(), 3, "chat registers exactly the three humanise surfaces");
+    assert_eq!(
+        rows.len(),
+        3,
+        "chat registers exactly the three humanise surfaces"
+    );
 
     let store = consumer_admits_and_serves(&rows);
     for key in [TPL_CHAT_CARD, TPL_CHAT_AGENT_MESSAGE, TPL_CHAT_MENTIONED] {
@@ -55,13 +61,18 @@ fn cdc_7_3_chat_provider_registers_keys_consumer_admits_and_serves() {
             .unwrap_or_else(|| panic!("Notif's ONE templating surface must serve chat's `{key}`"));
         assert_eq!(served.template_key, key);
         // every chat string binds the {0} per-viewer subject slot (permission/erasure-safe by ctor).
-        assert!(served.body.contains("{0}"), "`{key}` must bind the {{0}} subject slot");
+        assert!(
+            served.body.contains("{0}"),
+            "`{key}` must bind the {{0}} subject slot"
+        );
     }
 
     // the fluent register helper agrees (the production registration call).
     let mut store2 = TemplateStore::with_platform_defaults();
     register_chat_humanise_templates(&mut store2);
-    assert!(store2.lookup(PLATFORM_DEFAULT_TENANT, TPL_CHAT_MENTIONED, DEFAULT_LOCALE).is_some());
+    assert!(store2
+        .lookup(PLATFORM_DEFAULT_TENANT, TPL_CHAT_MENTIONED, DEFAULT_LOCALE)
+        .is_some());
 }
 
 /// The CONSUMER renders a chat key through the ONE Notif ICU-subset formatter — chat does NOT render
@@ -70,7 +81,13 @@ fn cdc_7_3_chat_provider_registers_keys_consumer_admits_and_serves() {
 #[test]
 fn cdc_7_3_consumer_renders_chat_key_through_the_one_formatter() {
     let rows = provider_chat_humanise_rows();
-    let card = rows.iter().find(|r| r.template_key == TPL_CHAT_CARD).expect("the chat card key");
+    let card = rows
+        .iter()
+        .find(|r| r.template_key == TPL_CHAT_CARD)
+        .expect("the chat card key");
     let bound = render_message(&card.body, &["#incidents".to_string()]);
-    assert!(bound.contains("#incidents"), "the ONE formatter binds the subject: `{bound}`");
+    assert!(
+        bound.contains("#incidents"),
+        "the ONE formatter binds the subject: `{bound}`"
+    );
 }

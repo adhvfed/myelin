@@ -35,13 +35,15 @@ use myelin_events::{
     EventEnvelope, EventId, EventType, Message, OutboxStore, Timestamp, Visibility,
 };
 use myelin_harness::telemetry::{Label, Predicate, SignalName, SignalSource};
+use myelin_identity::{
+    Consistency, ConsistencyMode, PrincipalId as IdPrincipalId, PrincipalKind as IdPrincipalKind,
+};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_notif::read_fanout::{read_fanout, SyntheticReverseIndex};
 use myelin_notif::{
     build_router, dedup_collapse_ratio_bps, InboxProjection, Reason, DEFAULT_HOT_SUBJECT_WRITE_CAP,
     ROUTER_CONSUMER_NAME, SIGNAL_MENTIONS_KEY,
 };
-use myelin_identity::{Consistency, ConsistencyMode, PrincipalId as IdPrincipalId, PrincipalKind as IdPrincipalKind};
 use myelin_query::signals::{DedupKey, RuleId, Severity, Signal, SignalState};
 use myelin_tenancy::{Region, TenantId};
 
@@ -53,7 +55,11 @@ fn region() -> Region {
 }
 /// The CI bot — the actor of the failure Signals (NOT the recipient, so they are NOT self-suppressed).
 fn ci_bot() -> Principal {
-    Principal::stub(PrincipalId("p-ci-bot".into()), PrincipalKind::Service, tenant())
+    Principal::stub(
+        PrincipalId("p-ci-bot".into()),
+        PrincipalKind::Service,
+        tenant(),
+    )
 }
 
 fn signal(rule: &str, severity: Severity, subject: &str, dedup: &str) -> Signal {
@@ -72,7 +78,12 @@ fn signal(rule: &str, severity: Severity, subject: &str, dedup: &str) -> Signal 
 
 /// A `sig.<tenant>.…` envelope carrying `sig` as payload, attributed to `actor`, with broker `id`.
 fn envelope(id: &str, sig: &Signal, actor: Principal) -> EventEnvelope {
-    let subject = format!("sig.{}.{}.{}", sig.tenant.0, sig.severity.token(), sig.rule_id.0);
+    let subject = format!(
+        "sig.{}.{}.{}",
+        sig.tenant.0,
+        sig.severity.token(),
+        sig.rule_id.0
+    );
     EventEnvelope {
         event_id: EventId(id.into()),
         type_: EventType("signal.opened".into()),
@@ -98,7 +109,10 @@ fn envelope(id: &str, sig: &Signal, actor: Principal) -> EventEnvelope {
 
 fn msg(id: &str, sig: &Signal, actor: Principal) -> Message {
     let env = envelope(id, sig, actor);
-    Message { subject: env.subject.0.clone(), envelope: env }
+    Message {
+        subject: env.subject.0.clone(),
+        envelope: env,
+    }
 }
 
 /// **NOTIF-D2: 1000 near-identical CI failures → ONE row (coalesce_count 1000); measured
@@ -114,18 +128,34 @@ fn notif_d2_storm_collapses_to_one_row_ratio_measured() {
     // broker event_ids (so the consumer-dedup ledger does NOT short-circuit — these are distinct
     // deliveries that storm-control collapses at the inbox-row level).
     let inbound = 1000u64;
-    let sig = signal("ci_run_failed", Severity::Error, "myelin://acme/ci/run/42", "run-42");
+    let sig = signal(
+        "ci_run_failed",
+        Severity::Error,
+        "myelin://acme/ci/run/42",
+        "run-42",
+    );
     for i in 0..inbound {
         let out = consumer.deliver(&msg(&format!("evt-{i}"), &sig, ci_bot()));
         assert_eq!(out, Delivered::Acked, "every Signal acks (none stalls)");
     }
 
     // (1) N → 1: the 1000 near-identical failures collapsed to ONE inbox row.
-    assert_eq!(inbox.len(), 1, "NOTIF-D2: 1000 near-identical CI failures → ONE inbox row (N→1)");
+    assert_eq!(
+        inbox.len(),
+        1,
+        "NOTIF-D2: 1000 near-identical CI failures → ONE inbox row (N→1)"
+    );
     let row = inbox
-        .get(&tenant(), "psn:watcher:ci_run_failed", "ci_run_failed:run-42")
+        .get(
+            &tenant(),
+            "psn:watcher:ci_run_failed",
+            "ci_run_failed:run-42",
+        )
         .expect("the one collapsed row");
-    assert_eq!(row.coalesce_count, 1000, "the +N more counter is the full incident count (1000)");
+    assert_eq!(
+        row.coalesce_count, 1000,
+        "the +N more counter is the full incident count (1000)"
+    );
 
     // (4) The audit untouched: storm-control suppressed DELIVERY (only ONE notif.item.created emit —
     // the opened row — not 1000). Every underlying Signal still exists on the bus (it was acked, not
@@ -169,16 +199,36 @@ fn notif_d2_self_burst_produces_zero_items() {
     // The skeleton router routes to recipient `psn:watcher:<rule>`. To exercise self-suppression we
     // make the actor's opaque principal id EQUAL that recipient pseudonym (the action's author IS the
     // watcher). 30 distinct deliveries (distinct event_ids), same incident.
-    let self_recipient =
-        Principal::stub(PrincipalId("psn:watcher:my_change".into()), PrincipalKind::Human, tenant());
-    let sig = signal("my_change", Severity::Warning, "myelin://acme/chat/thread/T1", "t1");
+    let self_recipient = Principal::stub(
+        PrincipalId("psn:watcher:my_change".into()),
+        PrincipalKind::Human,
+        tenant(),
+    );
+    let sig = signal(
+        "my_change",
+        Severity::Warning,
+        "myelin://acme/chat/thread/T1",
+        "t1",
+    );
     for i in 0..30 {
         let out = consumer.deliver(&msg(&format!("self-{i}"), &sig, self_recipient.clone()));
-        assert_eq!(out, Delivered::Acked, "a self-action acks (terminal, not a stall)");
+        assert_eq!(
+            out,
+            Delivered::Acked,
+            "a self-action acks (terminal, not a stall)"
+        );
     }
 
-    assert_eq!(inbox.len(), 0, "NOTIF-D2: a 30-event self-burst → 0 inbox items (0 self-notifications)");
-    assert_eq!(outbox.committed_count(), 0, "0 emits (a self-action pushes no delivery)");
+    assert_eq!(
+        inbox.len(),
+        0,
+        "NOTIF-D2: a 30-event self-burst → 0 inbox items (0 self-notifications)"
+    );
+    assert_eq!(
+        outbox.committed_count(),
+        0,
+        "0 emits (a self-action pushes no delivery)"
+    );
 }
 
 /// **NOTIF-D2: a 30-comment PR burst is bounded (not 30 separate pushes), and the audit is
@@ -193,28 +243,54 @@ fn notif_d2_30_comment_pr_burst_is_bounded() {
 
     // 30 DISTINCT comments on the same PR (the same rule + dedup_key for the skeleton router → they
     // collapse onto ONE row; a richer per-comment dedup_key would coalesce — either way BOUNDED).
-    let sig = signal("pr_comment", Severity::Info, "myelin://acme/git/pr/9", "pr-9");
+    let sig = signal(
+        "pr_comment",
+        Severity::Info,
+        "myelin://acme/git/pr/9",
+        "pr-9",
+    );
     for i in 0..30 {
         consumer.deliver(&msg(&format!("c-{i}"), &sig, ci_bot()));
     }
 
     // Bounded: ONE row (the comments collapsed), and the pushes are bounded (one opened row → one
     // emit, the rest collapsed without re-pushing). NOT 30 separate notifications.
-    assert_eq!(inbox.len(), 1, "the 30-comment burst collapsed to ONE inbox row (bounded)");
-    let row = inbox.get(&tenant(), "psn:watcher:pr_comment", "pr_comment:pr-9").unwrap();
-    assert_eq!(row.coalesce_count, 30, "+N more = 30 (the full comment count, bounded into one row)");
-    assert_eq!(outbox.committed_count(), 1, "bounded pushes (1, not 30) — the audit (30 Signals) untouched");
+    assert_eq!(
+        inbox.len(),
+        1,
+        "the 30-comment burst collapsed to ONE inbox row (bounded)"
+    );
+    let row = inbox
+        .get(&tenant(), "psn:watcher:pr_comment", "pr_comment:pr-9")
+        .unwrap();
+    assert_eq!(
+        row.coalesce_count, 30,
+        "+N more = 30 (the full comment count, bounded into one row)"
+    );
+    assert_eq!(
+        outbox.committed_count(),
+        1,
+        "bounded pushes (1, not 30) — the audit (30 Signals) untouched"
+    );
 }
 
 /// A `sig.<tenant>.…` envelope carrying the Signal + the STRUCTURED `mention(Principal)` nodes under
 /// the frozen wire key (the dispatch tier stamps them; Notif reads the structured node, never free
 /// text — AG-6). The actor is the CI bot (not a mentioned recipient, so not self-suppressed).
 fn mention_msg(id: &str, sig: &Signal, mentions: &[Principal]) -> Message {
-    let subject = format!("sig.{}.{}.{}", sig.tenant.0, sig.severity.token(), sig.rule_id.0);
+    let subject = format!(
+        "sig.{}.{}.{}",
+        sig.tenant.0,
+        sig.severity.token(),
+        sig.rule_id.0
+    );
     let nodes: Vec<InlineNode> = mentions.iter().cloned().map(InlineNode::Mention).collect();
     let mut payload = serde_json::to_value(sig).unwrap();
     if let serde_json::Value::Object(map) = &mut payload {
-        map.insert(SIGNAL_MENTIONS_KEY.into(), serde_json::to_value(&nodes).unwrap());
+        map.insert(
+            SIGNAL_MENTIONS_KEY.into(),
+            serde_json::to_value(&nodes).unwrap(),
+        );
     }
     Message {
         subject: subject.clone(),
@@ -261,13 +337,28 @@ fn notif_d2_mention_storm_write_fanout_is_bounded_by_the_hot_subject_cap() {
 
     // A mention-storm: 200 DISTINCT recipients mentioned on ONE hot subject (a @here on a big channel).
     let storm_size = 200usize;
-    let sig = signal("mention_spray", Severity::Info, "myelin://acme/chat/thread/hot", "spray");
+    let sig = signal(
+        "mention_spray",
+        Severity::Info,
+        "myelin://acme/chat/thread/hot",
+        "spray",
+    );
     let mentions: Vec<Principal> = (0..storm_size)
-        .map(|i| Principal::stub(PrincipalId(format!("p-{i}")), PrincipalKind::Human, tenant()))
+        .map(|i| {
+            Principal::stub(
+                PrincipalId(format!("p-{i}")),
+                PrincipalKind::Human,
+                tenant(),
+            )
+        })
         .collect();
 
     let out = consumer.deliver(&mention_msg("evt-mention-storm", &sig, &mentions));
-    assert_eq!(out, Delivered::Acked, "the mention-storm Signal routes + acks");
+    assert_eq!(
+        out,
+        Delivered::Acked,
+        "the mention-storm Signal routes + acks"
+    );
 
     // BOUNDED: exactly `cap` DISTINCT mention rows materialised on the hot subject_root — NOT 200.
     let subject_root = "myelin://acme/chat/thread/hot";
@@ -313,7 +404,10 @@ fn notif_d2_ratio_alarm_fires_on_a_collapse_regression() {
         vec![Label::new("consumer", ROUTER_CONSUMER_NAME)],
         Predicate::Gte(9000),
     );
-    assert!(!verdict.is_green(), "ratio 0 against `>= 9000` is RED — the alarm fires on a collapse regression");
+    assert!(
+        !verdict.is_green(),
+        "ratio 0 against `>= 9000` is RED — the alarm fires on a collapse regression"
+    );
 }
 
 // ===========================================================================================
@@ -345,7 +439,12 @@ fn notif_d2_read_fanout_50k_watcher_subject_zero_write_amplification() {
     // enters the write path). DISTINCT broker event_ids so the consumer-dedup ledger does not
     // short-circuit; the SAME subject so the read-fanout coalesces into ONE marker.
     let storm = 500u64;
-    let sig = signal("pr_activity", Severity::Info, "myelin://acme/git/pr/celebrity", "pr-celeb");
+    let sig = signal(
+        "pr_activity",
+        Severity::Info,
+        "myelin://acme/git/pr/celebrity",
+        "pr-celeb",
+    );
     for i in 0..storm {
         let out = consumer.deliver(&msg(&format!("amb-{i}"), &sig, ci_bot()));
         assert_eq!(out, Delivered::Acked, "every ambient event routes + acks");
@@ -360,8 +459,13 @@ fn notif_d2_read_fanout_50k_watcher_subject_zero_write_amplification() {
         1,
         "NOTIF-D2: a 50k-watcher subject hit 500 times → ONE coalesced marker (0 write amplification)"
     );
-    let m = markers.get(&tenant(), "myelin://acme/git/pr/celebrity").unwrap();
-    assert_eq!(m.count, storm, "the +N more counter is the full activity count (preserved, never lost)");
+    let m = markers
+        .get(&tenant(), "myelin://acme/git/pr/celebrity")
+        .unwrap();
+    assert_eq!(
+        m.count, storm,
+        "the +N more counter is the full activity count (preserved, never lost)"
+    );
 }
 
 /// **NOTIF-D2 (read-fanout, NOTIF-P13): the per-viewer slice is materialised LAZILY on inbox open via
@@ -387,7 +491,11 @@ fn notif_d2_read_fanout_lazy_materialise_join_and_zookie_watermark() {
         }
     }
     let markers = consumer.handler().ambient();
-    assert_eq!(markers.marker_count(&tenant()), 2, "two hot subjects → two coalesced markers (not 100 rows)");
+    assert_eq!(
+        markers.marker_count(&tenant()),
+        2,
+        "two hot subjects → two coalesced markers (not 100 rows)"
+    );
 
     // The viewer watches BOTH hot subjects (the synthetic reverse index stands in for the real
     // watcher ReBAC fragment — the named floor; the real fragments land in NOTIF-P19..P22).

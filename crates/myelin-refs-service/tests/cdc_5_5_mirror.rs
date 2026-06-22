@@ -35,7 +35,11 @@ fn region() -> Region {
     Region("fr-par".into())
 }
 fn viewer() -> Principal {
-    Principal::stub(PrincipalId("p-viewer".into()), PrincipalKind::Human, tenant())
+    Principal::stub(
+        PrincipalId("p-viewer".into()),
+        PrincipalKind::Human,
+        tenant(),
+    )
 }
 
 fn typed(source: &str, target: &str, rel: LifecycleRel) -> SyntheticTypedEvent {
@@ -58,7 +62,13 @@ fn cdc_blocks_event_is_traversable_in_both_directions() {
     let proj = EdgeProjection::new();
     let eng1 = "myelin://acme/issue/issue/ENG-1";
     let eng2 = "myelin://acme/issue/issue/ENG-2";
-    project_typed_event(&proj, &tenant(), &region(), &typed(eng1, eng2, LifecycleRel::Blocks)).unwrap();
+    project_typed_event(
+        &proj,
+        &tenant(),
+        &region(),
+        &typed(eng1, eng2, LifecycleRel::Blocks),
+    )
+    .unwrap();
 
     let t = Traverse::with_default_bounds(proj, AuthzVisibleIndex::new());
 
@@ -85,7 +95,11 @@ fn cdc_blocks_event_is_traversable_in_both_directions() {
         TRAVERSE_DEPTH_CEILING,
         &ids_result(&[eng1], "zk-1"),
     );
-    assert_eq!(inv.nodes.len(), 1, "ENG-2 is blocked_by exactly ENG-1 (the inverse direction)");
+    assert_eq!(
+        inv.nodes.len(),
+        1,
+        "ENG-2 is blocked_by exactly ENG-1 (the inverse direction)"
+    );
     assert_eq!(inv.nodes[0].artifact.0, eng1);
 }
 
@@ -101,8 +115,20 @@ fn chained_epic_tree_inverse_pairing_across_hops() {
     let task = "myelin://acme/issue/issue/ENG-TASK";
 
     // synthetic typed lifecycle events: epic is the parent of story; story is the parent of task.
-    project_typed_event(&proj, &tenant(), &region(), &typed(epic, story, LifecycleRel::Parent)).unwrap();
-    project_typed_event(&proj, &tenant(), &region(), &typed(story, task, LifecycleRel::Parent)).unwrap();
+    project_typed_event(
+        &proj,
+        &tenant(),
+        &region(),
+        &typed(epic, story, LifecycleRel::Parent),
+    )
+    .unwrap();
+    project_typed_event(
+        &proj,
+        &tenant(),
+        &region(),
+        &typed(story, task, LifecycleRel::Parent),
+    )
+    .unwrap();
 
     let t = Traverse::with_default_bounds(proj, AuthzVisibleIndex::new());
 
@@ -120,7 +146,11 @@ fn chained_epic_tree_inverse_pairing_across_hops() {
     );
     let mut down_ids: Vec<String> = down.nodes.iter().map(|n| n.artifact.0.clone()).collect();
     down_ids.sort();
-    assert_eq!(down_ids, vec![story.to_string(), task.to_string()], "parent walk descends the whole tree");
+    assert_eq!(
+        down_ids,
+        vec![story.to_string(), task.to_string()],
+        "parent walk descends the whole tree"
+    );
 
     // UP the tree: a `child` walk from the task ascends task→story→epic (the inverse `child` edges
     // the mirror projected — task is the child of story, story is the child of epic).
@@ -135,7 +165,11 @@ fn chained_epic_tree_inverse_pairing_across_hops() {
     );
     let mut up_ids: Vec<String> = up.nodes.iter().map(|n| n.artifact.0.clone()).collect();
     up_ids.sort();
-    assert_eq!(up_ids, vec![epic.to_string(), story.to_string()], "child walk ascends to the epic");
+    assert_eq!(
+        up_ids,
+        vec![epic.to_string(), story.to_string()],
+        "child walk ascends to the epic"
+    );
 }
 
 /// **The TE-7 drift-reconvergence half of REF-D4: a synthetic drift reconverges to the typed table
@@ -149,22 +183,50 @@ fn te7_drift_reconverges_to_the_typed_table() {
     let stale = "myelin://acme/issue/issue/ENG-STALE";
 
     // DRIFT: the projection holds a stale ENG-STALE blocks ENG-2 the typed table no longer backs.
-    project_typed_event(&proj, &tenant(), &region(), &typed(stale, eng2, LifecycleRel::Blocks)).unwrap();
+    project_typed_event(
+        &proj,
+        &tenant(),
+        &region(),
+        &typed(stale, eng2, LifecycleRel::Blocks),
+    )
+    .unwrap();
     let before = proj.inbound_live(&tenant(), &region(), &ArtifactRef(eng2.into()));
-    assert!(before.iter().any(|r| r.source.0 == stale), "the drifted edge is live before reindex");
+    assert!(
+        before.iter().any(|r| r.source.0 == stale),
+        "the drifted edge is live before reindex"
+    );
 
     // the AUTHORITATIVE typed snapshot for target ENG-2: ENG-1 blocks ENG-2 (NOT ENG-STALE).
     let snapshot = vec![typed(eng1, eng2, LifecycleRel::Blocks)];
     let covered = vec![ArtifactRef(eng2.into())];
-    let (reprojected, tombstoned) =
-        reconverge(&proj, &tenant(), &region(), &snapshot, &covered, "01J-reindex").unwrap();
+    let (reprojected, tombstoned) = reconverge(
+        &proj,
+        &tenant(),
+        &region(),
+        &snapshot,
+        &covered,
+        "01J-reindex",
+    )
+    .unwrap();
 
-    assert_eq!(reprojected, 2, "the typed snapshot re-projects both directions of ENG-1 blocks ENG-2");
-    assert_eq!(tombstoned, 1, "the drifted ENG-STALE edge is tombstoned (typed wins)");
+    assert_eq!(
+        reprojected, 2,
+        "the typed snapshot re-projects both directions of ENG-1 blocks ENG-2"
+    );
+    assert_eq!(
+        tombstoned, 1,
+        "the drifted ENG-STALE edge is tombstoned (typed wins)"
+    );
 
     let after = proj.inbound_live(&tenant(), &region(), &ArtifactRef(eng2.into()));
-    assert!(after.iter().any(|r| r.source.0 == eng1), "the typed truth is live after reconvergence");
-    assert!(!after.iter().any(|r| r.source.0 == stale), "the drift is gone — the typed table wins");
+    assert!(
+        after.iter().any(|r| r.source.0 == eng1),
+        "the typed truth is live after reconvergence"
+    );
+    assert!(
+        !after.iter().any(|r| r.source.0 == stale),
+        "the drift is gone — the typed table wins"
+    );
 }
 
 /// **The mirror discipline rejects an unknown lifecycle token (REF-3 — never guesses).** This guards
@@ -182,12 +244,22 @@ fn mirror_rejects_unknown_lifecycle_token() {
 fn every_mirror_edge_is_lifecycle_class() {
     for &rel in LifecycleRel::FORWARD_VOCABULARY {
         let rows = mirror_edges(&tenant(), &typed("s", "t", rel));
-        assert!(rows.iter().all(|r| r.rel_class == RelClass::Lifecycle), "{} mirrors lifecycle-class", rel.as_str());
+        assert!(
+            rows.iter().all(|r| r.rel_class == RelClass::Lifecycle),
+            "{} mirrors lifecycle-class",
+            rel.as_str()
+        );
         // the row count matches the inverse shape: Paired/Symmetric → 2, None → 1.
         let expected = match rel.inverse() {
             Inverse::Paired(_) | Inverse::Symmetric => 2,
             Inverse::None => 1,
         };
-        assert_eq!(rows.len(), expected, "{} projects {} edge(s)", rel.as_str(), expected);
+        assert_eq!(
+            rows.len(),
+            expected,
+            "{} projects {} edge(s)",
+            rel.as_str(),
+            expected
+        );
     }
 }

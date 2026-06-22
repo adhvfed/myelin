@@ -47,7 +47,10 @@ fn schema() -> FieldSchema {
         .with(FT_BODY_FIELD, FieldDecl::stored(FieldType::Text))
         .with("status", FieldDecl::stored(FieldType::Select))
         .with("severity", FieldDecl::stored(FieldType::Int))
-        .with(myelin_search::ORDER_KEY_FIELD, FieldDecl::stored(FieldType::OrderKey))
+        .with(
+            myelin_search::ORDER_KEY_FIELD,
+            FieldDecl::stored(FieldType::OrderKey),
+        )
         .with("progress", FieldDecl::read_time(FieldType::Int))
 }
 
@@ -58,8 +61,16 @@ fn schema() -> FieldSchema {
 fn search_compiles_the_same_frozen_queryast_as_the_eventmatcher() {
     // ONE frozen predicate, consumed by BOTH the matcher (provider 3.4) and Search's compiler.
     let predicate = QueryAst::compiled(Predicate::And(vec![
-        Predicate::Cmp { op: CmpOp::Eq, lhs: var(FT_BODY_FIELD), rhs: s("deadlock") },
-        Predicate::Cmp { op: CmpOp::Eq, lhs: var("status"), rhs: s("open") },
+        Predicate::Cmp {
+            op: CmpOp::Eq,
+            lhs: var(FT_BODY_FIELD),
+            rhs: s("deadlock"),
+        },
+        Predicate::Cmp {
+            op: CmpOp::Eq,
+            lhs: var("status"),
+            rhs: s("open"),
+        },
     ]))
     .expect("the frozen AST is within the cost bounds");
 
@@ -74,7 +85,13 @@ fn search_compiles_the_same_frozen_queryast_as_the_eventmatcher() {
 
     // Search's compiler lowers it to the FT + structured shapes.
     let plan = compile(&predicate, &schema()).expect("Search compiles the frozen AST");
-    assert_eq!(plan.ft, vec![FtClause { field: "text".into(), query: "deadlock".into() }]);
+    assert_eq!(
+        plan.ft,
+        vec![FtClause {
+            field: "text".into(),
+            query: "deadlock".into()
+        }]
+    );
     assert_eq!(
         plan.structured,
         vec![StructuredClause::Cmp {
@@ -94,7 +111,16 @@ fn field_type_taxonomy_is_byte_identical_frozen() {
     let wire_ids: Vec<&str> = FieldType::all().iter().map(|t| t.wire_id()).collect();
     assert_eq!(
         wire_ids,
-        ["text", "int", "bool", "date", "select", "relation", "principal", "order_key"],
+        [
+            "text",
+            "int",
+            "bool",
+            "date",
+            "select",
+            "relation",
+            "principal",
+            "order_key"
+        ],
         "the frozen FieldType taxonomy (byte-identical across Search / EventMatcher / Issues / KN)"
     );
     // The discriminants are pinned (the byte-identical wire encoding).
@@ -107,8 +133,9 @@ fn field_type_taxonomy_is_byte_identical_frozen() {
 /// even constructs (the frozen `QueryAst` rejects it); a within-bounds AST compiles.
 #[test]
 fn bounded_cost_guard_rejects_crafted_ast() {
-    let big: Vec<Predicate> =
-        (0..(myelin_query::MAX_PREDICATE_NODES + 10)).map(|_| Predicate::True).collect();
+    let big: Vec<Predicate> = (0..(myelin_query::MAX_PREDICATE_NODES + 10))
+        .map(|_| Predicate::True)
+        .collect();
     assert!(
         QueryAst::compiled(Predicate::And(big)).is_err(),
         "an oversized AST is rejected by the cost guard before it can reach Search's compiler"
@@ -120,13 +147,24 @@ fn bounded_cost_guard_rejects_crafted_ast() {
 #[test]
 fn read_time_rollup_is_post_fetch_not_indexed() {
     let plan = compile(
-        &QueryAst::compiled(Predicate::Cmp { op: CmpOp::Ge, lhs: var("progress"), rhs: i(80) })
-            .unwrap(),
+        &QueryAst::compiled(Predicate::Cmp {
+            op: CmpOp::Ge,
+            lhs: var("progress"),
+            rhs: i(80),
+        })
+        .unwrap(),
         &schema(),
     )
     .expect("compile");
-    assert!(plan.structured.is_empty() && plan.ft.is_empty(), "no stored clause over a derived value");
-    assert_eq!(plan.post_fetch.len(), 1, "the rollup is a post-fetch predicate");
+    assert!(
+        plan.structured.is_empty() && plan.ft.is_empty(),
+        "no stored clause over a derived value"
+    );
+    assert_eq!(
+        plan.post_fetch.len(),
+        1,
+        "the rollup is a post-fetch predicate"
+    );
     assert_eq!(plan.post_fetch[0].field, "progress");
 }
 
@@ -135,15 +173,22 @@ fn read_time_rollup_is_post_fetch_not_indexed() {
 #[test]
 fn compiled_plan_is_inert_until_the_acl_conjoin_seam() {
     let plan = compile(
-        &QueryAst::compiled(Predicate::Cmp { op: CmpOp::Eq, lhs: var("status"), rhs: s("open") })
-            .unwrap(),
+        &QueryAst::compiled(Predicate::Cmp {
+            op: CmpOp::Eq,
+            lhs: var("status"),
+            rhs: s("open"),
+        })
+        .unwrap(),
         &schema(),
     )
     .expect("compile");
     // The only path to an executable plan demands the ACL clause (here a marker for the SRCH-P08
     // AclFilter lowering of list_objects).
     let conjoined = plan.with_acl("acl_clause(list_objects(viewer, read, issue))");
-    assert_eq!(conjoined.acl, "acl_clause(list_objects(viewer, read, issue))");
+    assert_eq!(
+        conjoined.acl,
+        "acl_clause(list_objects(viewer, read, issue))"
+    );
 }
 
 /// **CONTRACT: render(compile(ast)) is the canonical form (one renderer) — an agent and the UI emit
@@ -151,13 +196,28 @@ fn compiled_plan_is_inert_until_the_acl_conjoin_seam() {
 #[test]
 fn render_is_the_one_canonical_form() {
     let p = Predicate::And(vec![
-        Predicate::Cmp { op: CmpOp::Eq, lhs: var("status"), rhs: s("open") },
-        Predicate::Cmp { op: CmpOp::Eq, lhs: var(SORT_FIELD), rhs: s(myelin_search::ORDER_KEY_FIELD) },
+        Predicate::Cmp {
+            op: CmpOp::Eq,
+            lhs: var("status"),
+            rhs: s("open"),
+        },
+        Predicate::Cmp {
+            op: CmpOp::Eq,
+            lhs: var(SORT_FIELD),
+            rhs: s(myelin_search::ORDER_KEY_FIELD),
+        },
     ]);
     let ui = compile(&QueryAst::compiled(p.clone()).unwrap(), &schema()).expect("ui");
     let agent = compile(&QueryAst::compiled(p).unwrap(), &schema()).expect("agent");
-    assert_eq!(ui, agent, "the identical AST compiles to the identical plan");
-    assert_eq!(render(&ui), render(&agent), "the ONE canonical rendered form");
+    assert_eq!(
+        ui, agent,
+        "the identical AST compiles to the identical plan"
+    );
+    assert_eq!(
+        render(&ui),
+        render(&agent),
+        "the ONE canonical rendered form"
+    );
     assert_eq!(ui.sort, Some(Sort::OrderKeyAsc));
 }
 
@@ -181,16 +241,24 @@ fn semantic_request_lowers_to_the_vector_branch() {
 #[test]
 fn undeclared_or_mismatched_is_a_loud_compile_error() {
     let undeclared = compile(
-        &QueryAst::compiled(Predicate::Cmp { op: CmpOp::Eq, lhs: var("ghost"), rhs: s("x") })
-            .unwrap(),
+        &QueryAst::compiled(Predicate::Cmp {
+            op: CmpOp::Eq,
+            lhs: var("ghost"),
+            rhs: s("x"),
+        })
+        .unwrap(),
         &schema(),
     )
     .expect_err("undeclared");
     assert!(matches!(undeclared, CompileError::UndeclaredField { .. }));
 
     let mismatch = compile(
-        &QueryAst::compiled(Predicate::Cmp { op: CmpOp::Eq, lhs: var("severity"), rhs: s("hi") })
-            .unwrap(),
+        &QueryAst::compiled(Predicate::Cmp {
+            op: CmpOp::Eq,
+            lhs: var("severity"),
+            rhs: s("hi"),
+        })
+        .unwrap(),
         &schema(),
     )
     .expect_err("mismatch");

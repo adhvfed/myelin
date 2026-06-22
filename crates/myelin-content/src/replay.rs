@@ -97,12 +97,20 @@ impl KnowledgeReindexSource {
             let aggregate = format!("{page_aggregate}#block-{block_id}");
             subtree.insert(
                 (*block_id).to_string(),
-                BlockTruth { aggregate, version: *version, payload },
+                BlockTruth {
+                    aggregate,
+                    version: *version,
+                    payload,
+                },
             );
         }
         self.pages.insert(
             page_id.to_string(),
-            PageTruth { page_aggregate, page_version, blocks: subtree },
+            PageTruth {
+                page_aggregate,
+                page_version,
+                blocks: subtree,
+            },
         );
     }
 
@@ -194,12 +202,28 @@ mod tests {
             "home",
             5,
             &[
-                ("b1", 2, serde_json::json!({ "kind": "heading", "text_ref": "r1" })),
-                ("b2", 7, serde_json::json!({ "kind": "paragraph", "text_ref": "r2" })),
-                ("b3", 1, serde_json::json!({ "kind": "code", "text_ref": "r3" })),
+                (
+                    "b1",
+                    2,
+                    serde_json::json!({ "kind": "heading", "text_ref": "r1" }),
+                ),
+                (
+                    "b2",
+                    7,
+                    serde_json::json!({ "kind": "paragraph", "text_ref": "r2" }),
+                ),
+                (
+                    "b3",
+                    1,
+                    serde_json::json!({ "kind": "code", "text_ref": "r3" }),
+                ),
             ],
         );
-        s.upsert_page("notes", 1, &[("n1", 1, serde_json::json!({ "kind": "paragraph" }))]);
+        s.upsert_page(
+            "notes",
+            1,
+            &[("n1", 1, serde_json::json!({ "kind": "paragraph" }))],
+        );
         s
     }
 
@@ -211,8 +235,14 @@ mod tests {
         let drafts = s.replay(&SnapshotScope::new("knowledge", "page:home"), None);
         // 1 page snapshot + 3 block snapshots.
         assert_eq!(drafts.len(), 4);
-        let page = drafts.iter().filter(|d| d.type_.0 == "knowledge.page.snapshot").count();
-        let blocks = drafts.iter().filter(|d| d.type_.0 == "knowledge.block.snapshot").count();
+        let page = drafts
+            .iter()
+            .filter(|d| d.type_.0 == "knowledge.page.snapshot")
+            .count();
+        let blocks = drafts
+            .iter()
+            .filter(|d| d.type_.0 == "knowledge.block.snapshot")
+            .count();
         assert_eq!(page, 1, "one page snapshot");
         assert_eq!(blocks, 3, "one snapshot per block (block granularity)");
         // Only the home page (not notes) — the scope is page-specific.
@@ -230,7 +260,11 @@ mod tests {
             .filter(|d| d.type_.0 == "knowledge.block.snapshot")
             .map(|d| d.version)
             .collect();
-        assert_eq!(block_versions, vec![7], "only the block past the cursor replays");
+        assert_eq!(
+            block_versions,
+            vec![7],
+            "only the block past the cursor replays"
+        );
     }
 
     /// An ERASED page is SKIPPED — its whole block subtree stays erased across a reindex (X-7).
@@ -269,7 +303,11 @@ mod tests {
             let row = outbox.row(&draft.event_id()).expect("snapshot row present");
             cold.ingest(&row.envelope);
         }
-        assert_eq!(cold.parity_bytes(), live.parity_bytes(), "cold == live (byte-identical)");
+        assert_eq!(
+            cold.parity_bytes(),
+            live.parity_bytes(),
+            "cold == live (byte-identical)"
+        );
 
         let r2 = reindex(&scope, None, sources, &mut outbox, ctx_base()).expect("re-reindex");
         assert_eq!(r2.snapshots_emitted, 0, "a re-run emits 0 new (idempotent)");

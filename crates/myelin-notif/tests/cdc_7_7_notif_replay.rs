@@ -40,7 +40,11 @@ fn tenant() -> TenantId {
 }
 
 fn principal() -> Principal {
-    Principal::stub(PrincipalId("platform".into()), PrincipalKind::Service, tenant())
+    Principal::stub(
+        PrincipalId("platform".into()),
+        PrincipalKind::Service,
+        tenant(),
+    )
 }
 
 fn ctx_base() -> EmitContextBase {
@@ -72,7 +76,9 @@ fn signal(rule: &str, severity: Severity, subject: &str, dedup: &str) -> Signal 
 /// A live `sig.<tenant>.<sev>.<rule>` broker message carrying a curated Signal (the steady-state
 /// ingest path — what live delivery looks like through the SAME router).
 fn live_msg(id: &str, sig: &Signal) -> myelin_events::Message {
-    use myelin_events::{AggregateKey, CorrelationId, EventEnvelope, EventId, EventType, Visibility};
+    use myelin_events::{
+        AggregateKey, CorrelationId, EventEnvelope, EventId, EventType, Visibility,
+    };
     let subject = signal_snapshot_subject(sig);
     let env = EventEnvelope {
         event_id: EventId(id.into()),
@@ -95,12 +101,16 @@ fn live_msg(id: &str, sig: &Signal) -> myelin_events::Message {
         recorded_at: Timestamp("2026-06-20T00:00:01Z".into()),
         payload: serde_json::to_value(sig).unwrap(),
     };
-    myelin_events::Message { subject, envelope: env }
+    myelin_events::Message {
+        subject,
+        envelope: env,
+    }
 }
 
 fn live_router(outbox: &OutboxStore) -> (Consumer<SignalRouter>, InboxProjection) {
     let inbox = InboxProjection::new();
-    let consumer = build_router(&tenant(), inbox.clone(), outbox.clone(), DedupLedger::new()).unwrap();
+    let consumer =
+        build_router(&tenant(), inbox.clone(), outbox.clone(), DedupLedger::new()).unwrap();
     (consumer, inbox)
 }
 
@@ -110,20 +120,43 @@ fn live_router(outbox: &OutboxStore) -> (Consumer<SignalRouter>, InboxProjection
 #[test]
 fn provider_replays_notif_owned_snapshots_on_the_whitelisted_subject() {
     let mut src = SignalReindexSource::new();
-    src.upsert(signal("ci_run_failed", Severity::Error, "myelin://acme/ci/run/1", "run-1"), 1);
-    src.upsert(signal("deploy_ok", Severity::Info, "myelin://acme/ci/run/2", "run-2"), 1);
+    src.upsert(
+        signal(
+            "ci_run_failed",
+            Severity::Error,
+            "myelin://acme/ci/run/1",
+            "run-1",
+        ),
+        1,
+    );
+    src.upsert(
+        signal(
+            "deploy_ok",
+            Severity::Info,
+            "myelin://acme/ci/run/2",
+            "run-2",
+        ),
+        1,
+    );
 
     // The source owns the `notif` §6.2 token (the bus dispatches `scope.owner == "notif"` to it).
-    assert_eq!(<SignalReindexSource as ReindexSource>::owner_token(&src), NOTIF_OWNER_TOKEN);
+    assert_eq!(
+        <SignalReindexSource as ReindexSource>::owner_token(&src),
+        NOTIF_OWNER_TOKEN
+    );
 
     let drafts = src.replay(&notif_scope("inbox:all"), None);
     assert_eq!(drafts.len(), 2, "the provider replays both curated Signals");
     // Each snapshot rides the `sig.<tenant>.*` whitelist subject (so the SAME router re-ingests it).
     for d in &drafts {
-        assert!(d.subject.0.starts_with("sig.acme."), "snapshot on the whitelisted subject");
+        assert!(
+            d.subject.0.starts_with("sig.acme."),
+            "snapshot on the whitelisted subject"
+        );
         assert_eq!(d.type_.0, "notif.signal.snapshot");
         // The payload round-trips to the SAME curated Signal (cold == live).
-        let _: Signal = serde_json::from_value(d.payload.clone()).expect("snapshot carries the Signal");
+        let _: Signal =
+            serde_json::from_value(d.payload.clone()).expect("snapshot carries the Signal");
     }
 }
 
@@ -135,9 +168,24 @@ fn provider_replays_notif_owned_snapshots_on_the_whitelisted_subject() {
 #[test]
 fn pair_replay_reindex_rebuilds_inbox_cold_equals_live() {
     let signals = [
-        signal("ci_run_failed", Severity::Error, "myelin://acme/ci/run/1", "run-1"),
-        signal("ci_run_failed", Severity::Error, "myelin://acme/ci/run/2", "run-2"),
-        signal("deploy_ok", Severity::Info, "myelin://acme/ci/run/3", "run-3"),
+        signal(
+            "ci_run_failed",
+            Severity::Error,
+            "myelin://acme/ci/run/1",
+            "run-1",
+        ),
+        signal(
+            "ci_run_failed",
+            Severity::Error,
+            "myelin://acme/ci/run/2",
+            "run-2",
+        ),
+        signal(
+            "deploy_ok",
+            Severity::Info,
+            "myelin://acme/ci/run/3",
+            "run-3",
+        ),
     ];
     let outbox_router = OutboxStore::new();
     let (consumer, inbox) = live_router(&outbox_router);
@@ -163,9 +211,19 @@ fn pair_replay_reindex_rebuilds_inbox_cold_equals_live() {
     let mut outbox = OutboxStore::new();
     let sources: &[&dyn ReindexSource] = &[&provider];
     let receipt = reindexer
-        .reindex(&tenant(), &notif_scope("inbox:all"), None, sources, &mut outbox, ctx_base())
+        .reindex(
+            &tenant(),
+            &notif_scope("inbox:all"),
+            None,
+            sources,
+            &mut outbox,
+            ctx_base(),
+        )
         .expect("reindex");
-    assert_eq!(receipt.signals_replayed, 3, "the consumer re-ingested three through the live router");
+    assert_eq!(
+        receipt.signals_replayed, 3,
+        "the consumer re-ingested three through the live router"
+    );
 
     // cold == live (the 7.7 replay-half artifact).
     assert_eq!(inbox.len(), 3, "the rebuilt inbox holds the three rows");
@@ -196,11 +254,20 @@ fn consumer_reindex_of_unknown_owner_is_loud() {
 #[test]
 fn reindex_seam_2_6_is_reachable() {
     let mut provider = SignalReindexSource::new();
-    provider.upsert(signal("r", Severity::Error, "myelin://acme/ci/run/1", "k"), 1);
+    provider.upsert(
+        signal("r", Severity::Error, "myelin://acme/ci/run/1", "k"),
+        1,
+    );
     let mut outbox = OutboxStore::new();
     let sources: &[&dyn ReindexSource] = &[&provider];
     // The raw 2.6 bus re-emit (the seam the NotifReindexer drives) is callable with the frozen shape.
-    let r = myelin_events::reindex::reindex(&notif_scope("inbox:all"), None, sources, &mut outbox, ctx_base())
-        .expect("the 2.6 bus re-emit seam");
+    let r = myelin_events::reindex::reindex(
+        &notif_scope("inbox:all"),
+        None,
+        sources,
+        &mut outbox,
+        ctx_base(),
+    )
+    .expect("the 2.6 bus re-emit seam");
     assert_eq!(r.snapshots_emitted, 1);
 }

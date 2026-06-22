@@ -180,10 +180,7 @@ impl AttestationVerifier for StructuralAttestationVerifier {
         // (2) The material must carry the well-formed provisioning-signed envelope
         //     `provsig:<tenant>:<nonce>` with a NON-empty nonce and the tenant segment matching the
         //     bound tenant. An absent (empty) or malformed envelope is forged/absent ⇒ refused.
-        let Some(rest) = attestation
-            .material
-            .strip_prefix(Self::ENVELOPE_PREFIX)
-        else {
+        let Some(rest) = attestation.material.strip_prefix(Self::ENVELOPE_PREFIX) else {
             return false; // absent / wrong-scheme envelope ⇒ forged.
         };
         let Some((tenant_seg, nonce)) = rest.split_once(':') else {
@@ -458,7 +455,10 @@ mod tests {
         let verifier = StructuralAttestationVerifier::new();
         let att = Attestation {
             tenant: tenant("acme"),
-            material: StructuralAttestationVerifier::provisioned_material(&tenant("acme"), "nonce-1"),
+            material: StructuralAttestationVerifier::provisioned_material(
+                &tenant("acme"),
+                "nonce-1",
+            ),
         };
         assert_eq!(runner.attest(&att, &verifier), AttestState::Attested);
         // The attested runner MAY claim its own tenant's SelfHosted job in its region.
@@ -538,7 +538,11 @@ mod tests {
         // CROSS-TENANT (another tenant's SelfHosted job) — refused.
         assert!(!runner.may_claim(TrustTier::SelfHosted, &tenant("globex"), &region()));
         // out-of-REGION (residency — no cross-region claim) — refused.
-        assert!(!runner.may_claim(TrustTier::SelfHosted, &tenant("acme"), &Region("de-fra".into())));
+        assert!(!runner.may_claim(
+            TrustTier::SelfHosted,
+            &tenant("acme"),
+            &Region("de-fra".into())
+        ));
     }
 
     // ─────────────────── the tenant-scoped token mint (4.7) — cross-tenant refused ────────────────

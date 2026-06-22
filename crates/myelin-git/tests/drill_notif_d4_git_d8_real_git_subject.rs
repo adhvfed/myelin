@@ -35,7 +35,8 @@ use std::sync::Mutex;
 
 /// The secret PR title of the REAL private Git repo (the leak target — must NEVER appear for a denied
 /// or cross-tenant viewer).
-const SECRET_PR_TITLE: &str = "fix: rotate the PROJECT-NIGHTFALL signing key before the acquisition";
+const SECRET_PR_TITLE: &str =
+    "fix: rotate the PROJECT-NIGHTFALL signing key before the acquisition";
 
 fn acme() -> TenantId {
     TenantId("acme".into())
@@ -49,7 +50,10 @@ fn viewer_in(id: &str, tenant: TenantId) -> Principal {
     Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant)
 }
 fn strong(zk: &str) -> Consistency {
-    Consistency { at_least: Zookie(zk.into()), mode: ConsistencyMode::Strong }
+    Consistency {
+        at_least: Zookie(zk.into()),
+        mode: ConsistencyMode::Strong,
+    }
 }
 
 /// A REAL Git PR subject in acme's PRIVATE repo (`myelin://acme/git/pr/<n>`). Its parent repo is
@@ -103,9 +107,10 @@ impl RefResolvePort for GitRepoResolver {
             });
         }
         // Same-tenant: allowed iff the viewer holds `pull` on the private repo backing the PR.
-        let allowed = self.allowed.lock().unwrap().iter().any(|(t, v, x)| {
-            t == &viewer.tenant.0 && v == &viewer.principal_id.0 && x == &ref_.0
-        });
+        let allowed =
+            self.allowed.lock().unwrap().iter().any(|(t, v, x)| {
+                t == &viewer.tenant.0 && v == &viewer.principal_id.0 && x == &ref_.0
+            });
         if allowed {
             RefResolution::Projection(RefProjection {
                 ref_: ref_.clone(),
@@ -172,7 +177,10 @@ fn notif_d4_zero_leak_on_real_git_private_repo() {
                 if h.text.contains("a restricted pr") {
                     tombstone_present += 1;
                 }
-                assert!(h.links.is_empty(), "a denied Git subject yields no click-route link");
+                assert!(
+                    h.links.is_empty(),
+                    "a denied Git subject yields no click-route link"
+                );
             }
         }
     }
@@ -210,8 +218,15 @@ fn notif_d4_permitted_git_viewer_sees_the_pr_title() {
         &strong("zk-1"),
         Channel::Cli,
     );
-    assert!(h.text.contains(SECRET_PR_TITLE), "the permitted maintainer sees the PR title");
-    assert_eq!(h.links, vec![subject.0], "the allowed branch yields the click-route link");
+    assert!(
+        h.text.contains(SECRET_PR_TITLE),
+        "the permitted maintainer sees the PR title"
+    );
+    assert_eq!(
+        h.links,
+        vec![subject.0],
+        "the allowed branch yields the click-route link"
+    );
 }
 
 /// **GIT-D8 — cross-tenant repo access denied, with Notif's humanise path exercised (0 cross-tenant
@@ -223,8 +238,8 @@ fn notif_d4_permitted_git_viewer_sees_the_pr_title() {
 fn git_d8_cross_tenant_repo_access_denied_via_humanise() {
     let resolver = GitRepoResolver::default();
     let subject = private_git_pr(); // home tenant: acme
-    // an acme principal "spy" WOULD be allowed pull (same id) — but the cross-tenant token below is a
-    // DIFFERENT tenant, so the same id from evilcorp must still be denied (token tenant decides).
+                                    // an acme principal "spy" WOULD be allowed pull (same id) — but the cross-tenant token below is a
+                                    // DIFFERENT tenant, so the same id from evilcorp must still be denied (token tenant decides).
     resolver.grant_pull(&acme(), "spy", &subject);
 
     let cross_tenant = viewer_in("spy", TenantId("evilcorp".into()));
@@ -247,10 +262,19 @@ fn git_d8_cross_tenant_repo_access_denied_via_humanise() {
             if contains_leak(&h.text) {
                 leak += 1;
             }
-            assert!(h.text.contains("a restricted pr"), "cross-tenant render is a tombstone");
-            assert!(h.links.is_empty(), "no click-route leaks across the tenant boundary");
+            assert!(
+                h.text.contains("a restricted pr"),
+                "cross-tenant render is a tombstone"
+            );
+            assert!(
+                h.links.is_empty(),
+                "no click-route leaks across the tenant boundary"
+            );
         }
     }
-    assert_eq!(leak, 0, "GIT-D8: 0 cross-tenant leak — the token tenant decides, the title never crosses");
+    assert_eq!(
+        leak, 0,
+        "GIT-D8: 0 cross-tenant leak — the token tenant decides, the title never crosses"
+    );
     eprintln!("GIT-D8 GREEN (2026-06-21): cross-tenant viewer, cross-tenant-leak-count = {leak} (threshold 0)");
 }

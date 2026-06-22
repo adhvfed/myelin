@@ -64,13 +64,19 @@ impl OltpConfig {
     /// boots with a bad pool config fails fast rather than starting with an unbounded pool.
     pub fn validate(&self) -> Result<(), OltpError> {
         if self.max_pool_size == 0 {
-            return Err(OltpError::InvalidConfig("max_pool_size must be >= 1 (no unbounded pool)"));
+            return Err(OltpError::InvalidConfig(
+                "max_pool_size must be >= 1 (no unbounded pool)",
+            ));
         }
         if self.statement_timeout_ms == 0 {
-            return Err(OltpError::InvalidConfig("statement_timeout_ms must be >= 1"));
+            return Err(OltpError::InvalidConfig(
+                "statement_timeout_ms must be >= 1",
+            ));
         }
         if self.per_tenant_in_flight_cap == 0 {
-            return Err(OltpError::InvalidConfig("per_tenant_in_flight_cap must be >= 1"));
+            return Err(OltpError::InvalidConfig(
+                "per_tenant_in_flight_cap must be >= 1",
+            ));
         }
         if self.per_tenant_in_flight_cap > self.max_pool_size {
             return Err(OltpError::InvalidConfig(
@@ -180,7 +186,10 @@ impl OltpPool {
             return Err(OltpError::PoolSaturated);
         }
         state.global_in_flight += 1;
-        *state.per_tenant_in_flight.entry(tenant.clone()).or_insert(0) += 1;
+        *state
+            .per_tenant_in_flight
+            .entry(tenant.clone())
+            .or_insert(0) += 1;
         Ok(PermitGuard {
             state: Arc::clone(&self.state),
             tenant: tenant.clone(),
@@ -191,14 +200,20 @@ impl OltpPool {
     /// The current count of in-flight permits (across all tenants) — the `PoolSaturation`
     /// USE-utilisation signal value.
     pub fn in_flight(&self) -> u32 {
-        self.state.lock().expect("OLTP pool mutex poisoned").global_in_flight
+        self.state
+            .lock()
+            .expect("OLTP pool mutex poisoned")
+            .global_in_flight
     }
 
     /// The cumulative count of saturation/cap rejections — the `PoolSaturation` survival
     /// signal a bounded-pool drill asserts is non-zero after the pool was driven to its
     /// bound (proving it fast-failed rather than blocking).
     pub fn saturation_rejections(&self) -> u64 {
-        self.state.lock().expect("OLTP pool mutex poisoned").saturation_rejections
+        self.state
+            .lock()
+            .expect("OLTP pool mutex poisoned")
+            .saturation_rejections
     }
 }
 
@@ -255,7 +270,10 @@ mod tests {
     /// Boot-time validation fast-fails an unbounded (zero) pool — never start unbounded.
     #[test]
     fn zero_pool_size_is_rejected_at_boot() {
-        let c = OltpConfig { max_pool_size: 0, ..cfg() };
+        let c = OltpConfig {
+            max_pool_size: 0,
+            ..cfg()
+        };
         assert!(matches!(c.validate(), Err(OltpError::InvalidConfig(_))));
         assert!(OltpPool::open(c).is_err());
     }
@@ -263,17 +281,29 @@ mod tests {
     /// A zero statement timeout is a config error (every statement must be time-bounded).
     #[test]
     fn zero_statement_timeout_is_rejected() {
-        let c = OltpConfig { statement_timeout_ms: 0, ..cfg() };
+        let c = OltpConfig {
+            statement_timeout_ms: 0,
+            ..cfg()
+        };
         assert!(matches!(c.validate(), Err(OltpError::InvalidConfig(_))));
     }
 
     /// A per-tenant cap of zero, or one exceeding the pool size, is a config error.
     #[test]
     fn nonsensical_per_tenant_cap_is_rejected() {
-        let zero = OltpConfig { per_tenant_in_flight_cap: 0, ..cfg() };
+        let zero = OltpConfig {
+            per_tenant_in_flight_cap: 0,
+            ..cfg()
+        };
         assert!(matches!(zero.validate(), Err(OltpError::InvalidConfig(_))));
-        let too_big = OltpConfig { per_tenant_in_flight_cap: 99, ..cfg() };
-        assert!(matches!(too_big.validate(), Err(OltpError::InvalidConfig(_))));
+        let too_big = OltpConfig {
+            per_tenant_in_flight_cap: 99,
+            ..cfg()
+        };
+        assert!(matches!(
+            too_big.validate(),
+            Err(OltpError::InvalidConfig(_))
+        ));
     }
 
     /// Acquire/drop accounts permits correctly: in-flight rises on acquire, falls on drop.
@@ -285,7 +315,11 @@ mod tests {
             let _g = pool.acquire(&t("acme")).unwrap();
             assert_eq!(pool.in_flight(), 1);
         }
-        assert_eq!(pool.in_flight(), 0, "dropping the guard releases the permit");
+        assert_eq!(
+            pool.in_flight(),
+            0,
+            "dropping the guard releases the permit"
+        );
     }
 
     /// **The bounded-pool fast-fail (the drill's mechanism).** Driving the pool to its
@@ -303,7 +337,11 @@ mod tests {
         // a third tenant hits the GLOBAL bound — rejected, not blocked.
         let rejected = pool.acquire(&t("gamma"));
         assert!(matches!(rejected, Err(OltpError::PoolSaturated)));
-        assert_eq!(pool.saturation_rejections(), 1, "the PoolSaturation signal fired");
+        assert_eq!(
+            pool.saturation_rejections(),
+            1,
+            "the PoolSaturation signal fired"
+        );
     }
 
     /// **The per-tenant noisy-neighbour bound.** A single tenant cannot exceed its
@@ -315,7 +353,10 @@ mod tests {
         let _a2 = pool.acquire(&t("acme")).unwrap();
         // acme is at its cap (2) though only 2/4 global permits are used.
         let rejected = pool.acquire(&t("acme"));
-        assert!(matches!(rejected, Err(OltpError::TenantInFlightCapExceeded)));
+        assert!(matches!(
+            rejected,
+            Err(OltpError::TenantInFlightCapExceeded)
+        ));
         // another tenant still gets a permit (global headroom remains) — isolation holds.
         let _b1 = pool.acquire(&t("beta")).unwrap();
         assert_eq!(pool.in_flight(), 3);

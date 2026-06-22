@@ -73,7 +73,7 @@ pub use escape_corpus::{
 };
 
 pub use self_hosted::{
-    mint_self_hosted_token, self_hosted_grant, Attestation, AttestState, AttestationVerifier,
+    mint_self_hosted_token, self_hosted_grant, AttestState, Attestation, AttestationVerifier,
     SelfHostedMintError, SelfHostedRunner, StructuralAttestationVerifier, TenantScopedToken,
     SELFHOSTED_GRANT_PREFIX,
 };
@@ -205,9 +205,7 @@ impl ImageRef {
         let Some((algo, digest)) = after_at.split_once(':') else {
             return false;
         };
-        !algo.is_empty()
-            && !digest.is_empty()
-            && digest.chars().all(|c| c.is_ascii_hexdigit())
+        !algo.is_empty() && !digest.is_empty() && digest.chars().all(|c| c.is_ascii_hexdigit())
     }
 }
 
@@ -536,7 +534,8 @@ pub struct RunnerHooks {
 /// Guarantee #1a hook type (contract 11.7 reserve_budget): reserve at dispatch, `Err` == exhausted.
 pub type ReserveHook = Box<dyn Fn(&MeterTarget) -> Result<ReserveHandle, HookError> + Send + Sync>;
 /// Guarantee #1b hook type (contract 11.7 settle_budget): settle on completion.
-pub type SettleHook = Box<dyn Fn(&ReserveHandle, ResourceUsage) -> Result<(), HookError> + Send + Sync>;
+pub type SettleHook =
+    Box<dyn Fn(&ReserveHandle, ResourceUsage) -> Result<(), HookError> + Send + Sync>;
 /// Guarantee #2 hook type (contract 4.7 mint_run_token): per-run attenuated-token attribution.
 pub type AttributeHook = Box<dyn Fn(&RunTokenRef) -> Result<(), HookError> + Send + Sync>;
 /// Guarantee #4 hook type (arch 02 §5.3): apply + verify the mandatory hardening profile.
@@ -668,7 +667,9 @@ mod tests {
             limits(),
             WorkspaceSpec::default(),
             TrustTier::Trusted,
-            RunTokenRef { jti: "jti-1".into() },
+            RunTokenRef {
+                jti: "jti-1".into(),
+            },
             MeterTarget {
                 reserve_id: "res-1".into(),
             },
@@ -861,7 +862,7 @@ mod tests {
             (hooks.isolation_floor)(spec)?; // #4 isolation floor
             (hooks.attribute)(&spec.run_token)?; // #2 attribution
             let res = (hooks.reserve)(&spec.meter_to)?; // #1a cost gate (reserve)
-            // ... the guest would run here (a real backend launches the hardened VM) ...
+                                                        // ... the guest would run here (a real backend launches the hardened VM) ...
             (hooks.settle)(
                 &res,
                 ResourceUsage {
@@ -957,7 +958,9 @@ mod tests {
     fn fleet_provider_shape_compiles_and_is_region_pinned() {
         let fleet = NoopFleet;
         let region = Region("fr-par".into());
-        let hosts = fleet.provision(RunnerClass("ci".into()), 2, region.clone()).unwrap();
+        let hosts = fleet
+            .provision(RunnerClass("ci".into()), 2, region.clone())
+            .unwrap();
         assert_eq!(hosts.len(), 2);
         assert!(hosts.iter().all(|h| h.region == region));
         fleet.deprovision(&hosts).unwrap();

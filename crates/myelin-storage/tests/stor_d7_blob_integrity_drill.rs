@@ -44,7 +44,10 @@ fn stor_d7_corrupt_blob_is_detected_zero_silent_serve() {
     // (the `Ok` arm) `panic!`s immediately — so reaching the assertions below IS the "0 silent
     // serves" proof (silent_serves stays 0 by construction).
     for (h, _original) in &handles {
-        assert!(store.corrupt_for_drill(&tenant, h), "object present to corrupt");
+        assert!(
+            store.corrupt_for_drill(&tenant, h),
+            "object present to corrupt"
+        );
         match store.get(&tenant, h) {
             Err(BlobError::IntegrityFail { requested, actual }) => {
                 assert_eq!(&requested, h);

@@ -59,16 +59,23 @@ fn sub_d9_liveness_readiness_scenario() -> DrillScenario {
         // The metrics-health surface declaring `identity` critical, with its readiness probe wired
         // to the harness injector. Booted (startup gate complete) so readiness is governed purely
         // by dependency health.
-        let health = InjectorHealth { breaker: ctx.breaker.clone() };
+        let health = InjectorHealth {
+            breaker: ctx.breaker.clone(),
+        };
         let mh = MetricsHealthSurface::new(CriticalDependencies::new(["identity"]), health);
         mh.mark_started();
 
         // healthy baseline: ready (gauge 1), liveness up, no churn.
-        assert_eq!(mh.readiness().verdict.gauge(), 1, "healthy baseline is ready");
+        assert_eq!(
+            mh.readiness().verdict.gauge(),
+            1,
+            "healthy baseline is ready"
+        );
         assert!(!mh.liveness().should_restart(), "healthy baseline is live");
 
         // (inject) hard-down the CRITICAL dependency (a sustained outage, §8.3).
-        ctx.breaker.break_dependency(Dependency::Identity, Scope::Global);
+        ctx.breaker
+            .break_dependency(Dependency::Identity, Scope::Global);
 
         // (load) the orchestrator scrapes both probes repeatedly across the outage. Track the
         // readiness gauge + count any liveness restart that fired (must stay 0).
@@ -85,13 +92,21 @@ fn sub_d9_liveness_readiness_scenario() -> DrillScenario {
             }
         }
         // during the outage: not-ready + shedding.
-        assert_eq!(readiness_gauge_during_outage, 0, "readiness flipped to not-ready during the outage");
+        assert_eq!(
+            readiness_gauge_during_outage, 0,
+            "readiness flipped to not-ready during the outage"
+        );
         assert!(shed_observed, "the not-ready instance shed new traffic");
         let liveness_restarts = mh.liveness_restart_count() as i64;
 
         // (heal) restore the dependency; readiness recovers (proves the flip tracks live truth).
-        ctx.breaker.restore_dependency(Dependency::Identity, Scope::Global);
-        assert_eq!(mh.readiness().verdict.gauge(), 1, "readiness recovers when the dependency heals");
+        ctx.breaker
+            .restore_dependency(Dependency::Identity, Scope::Global);
+        assert_eq!(
+            mh.readiness().verdict.gauge(),
+            1,
+            "readiness recovers when the dependency heals"
+        );
 
         // (assert) the two SUB-D9 survival signals, read off the harness telemetry-assertion
         // library — typed, never-swallowed verdicts.
@@ -100,7 +115,8 @@ fn sub_d9_liveness_readiness_scenario() -> DrillScenario {
         src.set_scalar(SignalName::LivenessRestartCount, liveness_restarts); // 0 — no churn
 
         // readiness flipped to not-ready (gauge == 0) during the outage.
-        src.assert_signal(SignalName::Readiness, Predicate::Eq(0)).expect_green();
+        src.assert_signal(SignalName::Readiness, Predicate::Eq(0))
+            .expect_green();
         // no restart-storm: liveness churn stayed 0.
         src.assert_signal(SignalName::LivenessRestartCount, Predicate::Eq(0))
     })
@@ -118,8 +134,14 @@ fn sub_d9_liveness_readiness_drill_is_green() {
         result.artifact_row("2026-06-19")
     );
     let row = result.artifact_row("2026-06-19");
-    assert!(row.contains("PASS"), "the artifact row records a PASS: {row}");
-    assert!(row.contains("sub-d9-liveness-not-readiness"), "names the drill: {row}");
+    assert!(
+        row.contains("PASS"),
+        "the artifact row records a PASS: {row}"
+    );
+    assert!(
+        row.contains("sub-d9-liveness-not-readiness"),
+        "names the drill: {row}"
+    );
     println!("{row}");
 }
 
@@ -129,7 +151,10 @@ fn sub_d9_liveness_readiness_drill_is_green() {
 fn sub_d9_drill_reruns_green() {
     let drill = sub_d9_liveness_readiness_scenario();
     for _ in 0..3 {
-        assert!(matches!(drill.run_once(), DrillResult::Pass { .. }), "SUB-D9 re-runs green");
+        assert!(
+            matches!(drill.run_once(), DrillResult::Pass { .. }),
+            "SUB-D9 re-runs green"
+        );
     }
 }
 
@@ -167,12 +192,26 @@ fn sub_d9_gate_is_not_vacuous_a_regression_reads_red() {
 #[test]
 fn readiness_reads_the_real_injector_severance() {
     let breaker = DependencyBreaker::new();
-    let health = InjectorHealth { breaker: breaker.clone() };
+    let health = InjectorHealth {
+        breaker: breaker.clone(),
+    };
     let mh = MetricsHealthSurface::new(CriticalDependencies::new(["identity"]), health);
     mh.mark_started();
-    assert_eq!(mh.readiness().verdict.gauge(), 1, "ready while the injector has nothing broken");
+    assert_eq!(
+        mh.readiness().verdict.gauge(),
+        1,
+        "ready while the injector has nothing broken"
+    );
     breaker.break_dependency(Dependency::Identity, Scope::Global);
-    assert_eq!(mh.readiness().verdict.gauge(), 0, "not-ready once the injector severs the dep");
+    assert_eq!(
+        mh.readiness().verdict.gauge(),
+        0,
+        "not-ready once the injector severs the dep"
+    );
     breaker.restore_dependency(Dependency::Identity, Scope::Global);
-    assert_eq!(mh.readiness().verdict.gauge(), 1, "ready again once restored");
+    assert_eq!(
+        mh.readiness().verdict.gauge(),
+        1,
+        "ready again once restored"
+    );
 }

@@ -33,7 +33,9 @@
 
 use myelin_git::body::Body;
 use myelin_git::check_status::GateOutcome;
-use myelin_git::git_resolve::{git_review_requests_filter, matches_review_requests_view, GitRefResolver};
+use myelin_git::git_resolve::{
+    git_review_requests_filter, matches_review_requests_view, GitRefResolver,
+};
 use myelin_git::lifecycle::PullRequest;
 use myelin_git::project::{git_pr_ref, ArtifactStore, Projector};
 use myelin_identity::{
@@ -68,7 +70,10 @@ fn viewer(id: &str) -> Principal {
     )
 }
 fn strong(zk: &str) -> Consistency {
-    Consistency { at_least: Zookie(zk.into()), mode: ConsistencyMode::Strong }
+    Consistency {
+        at_least: Zookie(zk.into()),
+        mode: ConsistencyMode::Strong,
+    }
 }
 
 struct StubId {
@@ -76,7 +81,9 @@ struct StubId {
 }
 impl StubId {
     fn new() -> Self {
-        Self { allow: HashSet::new() }
+        Self {
+            allow: HashSet::new(),
+        }
     }
     fn allow_view(mut self, o: &ArtifactRef) -> Self {
         self.allow.insert(format!("view@{}", o.0));
@@ -110,7 +117,12 @@ impl IdentityService for StubId {
     ) -> IdResult<ListObjectsResult> {
         Err(AuthzError::NotYetImplemented("n/a"))
     }
-    fn list_subjects(&self, _o: &ObjectId, _p: &Permission, _at: &Consistency) -> IdResult<SubjectTree> {
+    fn list_subjects(
+        &self,
+        _o: &ObjectId,
+        _p: &Permission,
+        _at: &Consistency,
+    ) -> IdResult<SubjectTree> {
         Err(AuthzError::NotYetImplemented("n/a"))
     }
     fn explain(
@@ -122,7 +134,11 @@ impl IdentityService for StubId {
     ) -> IdResult<RewriteTrace> {
         Err(AuthzError::NotYetImplemented("n/a"))
     }
-    fn delegation(&self, _a: &Principal, _t: &Principal) -> IdResult<myelin_identity::EffectivePolicy> {
+    fn delegation(
+        &self,
+        _a: &Principal,
+        _t: &Principal,
+    ) -> IdResult<myelin_identity::EffectivePolicy> {
         Err(AuthzError::NotYetImplemented("n/a"))
     }
     fn write_tuples(
@@ -161,10 +177,20 @@ impl IdentityService for StubId {
 fn resolver(granted: bool) -> (GitRefResolver<StubId>, ArtifactRef) {
     let pr_ref = git_pr_ref("acme", "repo7", 9);
     let mut store = ArtifactStore::new();
-    let mut pr = PullRequest::open(9, "refs/heads/main", "refs/heads/feature", "psn:alice", false);
+    let mut pr = PullRequest::open(
+        9,
+        "refs/heads/main",
+        "refs/heads/feature",
+        "psn:alice",
+        false,
+    );
     pr.body = Body::new(SECRET_TITLE, vec![]);
     store.put_pr(&pr_ref, pr, GateOutcome::AllRequiredGreen, 0, 0);
-    let id = if granted { StubId::new().allow_view(&pr_ref) } else { StubId::new() };
+    let id = if granted {
+        StubId::new().allow_view(&pr_ref)
+    } else {
+        StubId::new()
+    };
     (GitRefResolver::new(Projector::new(id, store)), pr_ref)
 }
 
@@ -178,13 +204,25 @@ fn resolver(granted: bool) -> (GitRefResolver<StubId>, ArtifactRef) {
 #[test]
 fn provider_git_resolver_returns_projection_or_tombstone() {
     let (denied_resolver, pr_ref) = resolver(false);
-    match denied_resolver.resolve_display(&acme(), &region(), &pr_ref, &viewer("nobody"), &strong("zk-1")) {
+    match denied_resolver.resolve_display(
+        &acme(),
+        &region(),
+        &pr_ref,
+        &viewer("nobody"),
+        &strong("zk-1"),
+    ) {
         RefResolution::Tombstone(t) => assert_eq!(t.root, pr_ref),
         RefResolution::Projection(_) => panic!("a denied viewer must get a tombstone (5.2)"),
     }
 
     let (ok_resolver, pr_ref) = resolver(true);
-    match ok_resolver.resolve_display(&acme(), &region(), &pr_ref, &viewer("maintainer"), &strong("zk-1")) {
+    match ok_resolver.resolve_display(
+        &acme(),
+        &region(),
+        &pr_ref,
+        &viewer("maintainer"),
+        &strong("zk-1"),
+    ) {
         RefResolution::Projection(p) => assert_eq!(p.title, SECRET_TITLE),
         RefResolution::Tombstone(_) => panic!("a permitted viewer must get a projection (5.2)"),
     }
@@ -212,8 +250,14 @@ fn consumer_humanise_renders_denied_git_subject_as_tombstone() {
         &strong("zk-1"),
         Channel::Cli,
     );
-    assert!(!h.text.contains(SECRET_TITLE), "0 title leak (7.3 over Git's resolver)");
-    assert!(h.text.contains("a restricted pr"), "the denied slot binds the PII-free tombstone");
+    assert!(
+        !h.text.contains(SECRET_TITLE),
+        "0 title leak (7.3 over Git's resolver)"
+    );
+    assert!(
+        h.text.contains("a restricted pr"),
+        "the denied slot binds the PII-free tombstone"
+    );
     assert!(h.links.is_empty(), "no click-route for a denied subject");
 }
 
@@ -234,8 +278,15 @@ fn consumer_humanise_renders_permitted_git_subject_with_title() {
         &strong("zk-1"),
         Channel::Cli,
     );
-    assert!(h.text.contains(SECRET_TITLE), "the permitted viewer sees the title (7.3)");
-    assert_eq!(h.links, vec![pr_ref.0], "the allowed branch yields the click-route (7.3)");
+    assert!(
+        h.text.contains(SECRET_TITLE),
+        "the permitted viewer sees the title (7.3)"
+    );
+    assert_eq!(
+        h.links,
+        vec![pr_ref.0],
+        "the allowed branch yields the click-route (7.3)"
+    );
 }
 
 // ===========================================================================
@@ -252,8 +303,14 @@ fn review_requests_is_a_filter_over_the_one_inbox() {
     assert_eq!(prefix, "git/");
 
     let git_pr = git_pr_ref("acme", "repo7", 9);
-    assert!(matches_review_requests_view(Reason::ReviewRequested, &git_pr), "a git review-request matches");
-    assert!(!matches_review_requests_view(Reason::Mentioned, &git_pr), "a mention is not a review-request");
+    assert!(
+        matches_review_requests_view(Reason::ReviewRequested, &git_pr),
+        "a git review-request matches"
+    );
+    assert!(
+        !matches_review_requests_view(Reason::Mentioned, &git_pr),
+        "a mention is not a review-request"
+    );
     let issue = ArtifactRef("myelin://acme/issue/issue/ENG-1".into());
     assert!(
         !matches_review_requests_view(Reason::ReviewRequested, &issue),

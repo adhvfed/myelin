@@ -28,12 +28,20 @@ fn chat_humanise_keys_are_registered_into_the_one_templating_surface() {
     let by_key: BTreeMap<&str, &HumaniseTemplate> =
         rows.iter().map(|r| (r.template_key.as_str(), r)).collect();
     for key in [TPL_CHAT_CARD, TPL_CHAT_AGENT_MESSAGE, TPL_CHAT_MENTIONED] {
-        let row = by_key.get(key).unwrap_or_else(|| panic!("chat must register `{key}`"));
+        let row = by_key
+            .get(key)
+            .unwrap_or_else(|| panic!("chat must register `{key}`"));
         // each is a platform-default NULL-tenant `en` row (a tenant overrides; chat never renders).
-        assert_eq!(row.tenant, PLATFORM_DEFAULT_TENANT, "`{key}` is a platform-default row");
+        assert_eq!(
+            row.tenant, PLATFORM_DEFAULT_TENANT,
+            "`{key}` is a platform-default row"
+        );
         assert_eq!(row.locale, myelin_notif::DEFAULT_LOCALE);
         // the body carries the `{0}` SUBJECT slot (resolved per-viewer → title|tombstone).
-        assert!(row.body.contains("{0}"), "`{key}` body must bind the {{0}} subject slot");
+        assert!(
+            row.body.contains("{0}"),
+            "`{key}` body must bind the {{0}} subject slot"
+        );
         assert!(!row.body.is_empty());
     }
 }
@@ -63,7 +71,10 @@ fn chat_humanise_keys_register_and_look_up_through_notif() {
 #[test]
 fn chat_mentioned_renders_through_the_one_notif_formatter() {
     let rows = chat_humanise_templates();
-    let mentioned = rows.iter().find(|r| r.template_key == TPL_CHAT_MENTIONED).expect("mentioned");
+    let mentioned = rows
+        .iter()
+        .find(|r| r.template_key == TPL_CHAT_MENTIONED)
+        .expect("mentioned");
     // the ONE Notif ICU-subset formatter binds {0} — chat does not render strings itself.
     let bound = myelin_notif::render_message(&mentioned.body, &["#eng".to_string()]);
     assert_eq!(bound, "You were mentioned in #eng");
@@ -86,19 +97,37 @@ fn chat_notif_rules_are_the_four_chat_reasons_at_their_bands() {
 
     let m = by_key.get(RULE_KEY_MENTIONED).expect("mentioned");
     assert_eq!(m.reason, Reason::Mentioned);
-    assert_eq!(m.default_class, Class::Direct, "@mention is a direct address");
+    assert_eq!(
+        m.default_class,
+        Class::Direct,
+        "@mention is a direct address"
+    );
 
     let r = by_key.get(RULE_KEY_REPLIED).expect("replied");
     assert_eq!(r.reason, Reason::Replied);
-    assert_eq!(r.default_class, Class::Participating, "a reply is participation");
+    assert_eq!(
+        r.default_class,
+        Class::Participating,
+        "a reply is participation"
+    );
 
     let tw = by_key.get(RULE_KEY_THREAD_WATCHED).expect("thread_watched");
     assert_eq!(tw.reason, Reason::ThreadWatched);
-    assert_eq!(tw.default_class, Class::Watching, "a watched thread is ambient");
+    assert_eq!(
+        tw.default_class,
+        Class::Watching,
+        "a watched thread is ambient"
+    );
 
-    let a = by_key.get(RULE_KEY_APPROVAL_REQUESTED).expect("approval_requested");
+    let a = by_key
+        .get(RULE_KEY_APPROVAL_REQUESTED)
+        .expect("approval_requested");
     assert_eq!(a.reason, Reason::ApprovalRequested);
-    assert_eq!(a.default_class, Class::Critical, "an HITL approval pierces (critical)");
+    assert_eq!(
+        a.default_class,
+        Class::Critical,
+        "an HITL approval pierces (critical)"
+    );
 }
 
 /// **Each `define_notif_rule` round-trips its dedup template + default class (the prompt's TESTS
@@ -114,7 +143,10 @@ fn each_chat_rule_round_trips_its_dedup_template_and_default_class() {
             dk.contains("psn:alice") && dk.contains("myelin://acme/chat/channel/eng"),
             "rule `{key}` dedup key must bind (recipient, subject): got `{dk}`"
         );
-        assert!(dk.starts_with("chat."), "rule `{key}` dedup key is chat-namespaced: `{dk}`");
+        assert!(
+            dk.starts_with("chat."),
+            "rule `{key}` dedup key is chat-namespaced: `{dk}`"
+        );
         // the default_class is the §3.1 table band for the reason (the table owns the band).
         assert_eq!(
             rule.default_class,
@@ -134,13 +166,23 @@ fn chat_notif_rules_register_and_classify_through_notif() {
     let mut reg = NotifRuleRegistry::platform_default();
     let before = reg.len();
     register_chat_notif_rules(&mut reg);
-    assert_eq!(reg.len(), before + 4, "the four chat rules accreted (no Notif change)");
+    assert_eq!(
+        reg.len(),
+        before + 4,
+        "the four chat rules accreted (no Notif change)"
+    );
 
     let c = reg.classify(RULE_KEY_MENTIONED, "psn:alice", &subject());
     assert_eq!(c.reason, Reason::Mentioned);
     assert_eq!(c.default_class, Class::Direct);
-    assert!(c.from_registered_rule, "the registered chat rule took effect");
-    assert_eq!(c.dedup_key, "chat.mentioned:psn:alice:myelin://acme/chat/channel/eng");
+    assert!(
+        c.from_registered_rule,
+        "the registered chat rule took effect"
+    );
+    assert_eq!(
+        c.dedup_key,
+        "chat.mentioned:psn:alice:myelin://acme/chat/channel/eng"
+    );
 
     let c = reg.classify(RULE_KEY_APPROVAL_REQUESTED, "psn:bob", &subject());
     assert_eq!(c.reason, Reason::ApprovalRequested);
@@ -159,7 +201,10 @@ fn chat_cannot_smuggle_a_reason_into_the_wrong_band() {
         Class::Watching,
     )
     .expect_err("approval_requested must register at the critical band the §3.1 table owns");
-    assert!(matches!(err, myelin_notif::DefineRuleError::ClassMismatch { .. }));
+    assert!(matches!(
+        err,
+        myelin_notif::DefineRuleError::ClassMismatch { .. }
+    ));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -176,7 +221,10 @@ fn fanout_class_is_total_over_the_chat_durable_tokens() {
         "the fanout-class must be total over chat's durable tokens"
     );
     for t in CHAT_DURABLE_TOKENS {
-        assert!(fanout_class(t).is_some(), "durable token `{t}` must classify into a fanout class");
+        assert!(
+            fanout_class(t).is_some(),
+            "durable token `{t}` must classify into a fanout class"
+        );
     }
     // a non-chat / unregistered token does not classify.
     assert_eq!(fanout_class("git.pr.opened"), None);
@@ -190,7 +238,10 @@ fn fanout_class_is_total_over_the_chat_durable_tokens() {
 #[test]
 fn write_fanout_is_the_bounded_high_signal_set_rest_is_read_fanout() {
     // the bounded high-signal write-fanout set (per-recipient inbox items).
-    assert_eq!(fanout_class(CHAT_MESSAGE_MENTIONED), Some(FanoutClass::WriteFanout));
+    assert_eq!(
+        fanout_class(CHAT_MESSAGE_MENTIONED),
+        Some(FanoutClass::WriteFanout)
+    );
     assert_eq!(
         fanout_class(crate::events::CHAT_THREAD_REPLIED),
         Some(FanoutClass::WriteFanout)
@@ -211,7 +262,11 @@ fn write_fanout_is_the_bounded_high_signal_set_rest_is_read_fanout() {
     }
     // the firehose ephemeral frames are ambient read-fanout (never per-recipient writes).
     for fh in CHAT_FIREHOSE_TOKENS {
-        assert_eq!(fanout_class(fh), Some(FanoutClass::ReadFanout), "firehose `{fh}` is ambient");
+        assert_eq!(
+            fanout_class(fh),
+            Some(FanoutClass::ReadFanout),
+            "firehose `{fh}` is ambient"
+        );
     }
 }
 
@@ -224,7 +279,10 @@ fn the_write_fanout_set_is_a_bounded_subset_of_the_durable_tokens() {
         .iter()
         .filter(|t| fanout_class(t) == Some(FanoutClass::WriteFanout))
         .count();
-    assert!(write_fanout_count >= 1, "at least the mention producer is write-fanout");
+    assert!(
+        write_fanout_count >= 1,
+        "at least the mention producer is write-fanout"
+    );
     assert!(
         write_fanout_count < CHAT_DURABLE_TOKENS.len(),
         "write-fanout must be a STRICT subset (the unbounded ambient set never write-amplifies)"
@@ -243,9 +301,17 @@ fn the_write_fanout_set_is_a_bounded_subset_of_the_durable_tokens() {
 #[test]
 fn chat_firehose_scope_is_bounded_channel_never_star() {
     let scope = chat_channel_scope("eng").expect("a bounded channel scope parses");
-    assert_eq!(scope.kind(), ScopeKind::Channel, "chat's per-view scope is channel:<id>");
+    assert_eq!(
+        scope.kind(),
+        ScopeKind::Channel,
+        "chat's per-view scope is channel:<id>"
+    );
     assert_eq!(scope.id(), "eng");
-    assert_eq!(scope.selector(), "channel:eng", "the channel scope round-trips its selector");
+    assert_eq!(
+        scope.selector(),
+        "channel:eng",
+        "the channel scope round-trips its selector"
+    );
 }
 
 /// **An unbounded / `*` chat scope is REJECTED at the chokepoint (0 unbounded-scope declarations).**
@@ -255,14 +321,19 @@ fn chat_firehose_scope_is_bounded_channel_never_star() {
 fn an_unbounded_chat_scope_is_rejected() {
     for bad in ["*", "", "*all"] {
         let r = chat_channel_scope(bad);
-        assert!(r.is_err(), "an unbounded channel scope `channel:{bad}` must be rejected, got {r:?}");
+        assert!(
+            r.is_err(),
+            "an unbounded channel scope `channel:{bad}` must be rejected, got {r:?}"
+        );
         assert!(
             r.unwrap_err().is_over_broad_scope(),
             "`channel:{bad}` is an over-broad-scope rejection (scope is never *)"
         );
     }
     // a bare `channel:` (no id) is also over-broad (the chokepoint rejects an empty resource id).
-    assert!(FirehoseScope::parse("channel:").unwrap_err().is_over_broad_scope());
+    assert!(FirehoseScope::parse("channel:")
+        .unwrap_err()
+        .is_over_broad_scope());
     // and the raw `*` scope through the chokepoint is rejected.
     assert!(FirehoseScope::parse("*").unwrap_err().is_over_broad_scope());
 }
@@ -273,13 +344,20 @@ fn an_unbounded_chat_scope_is_rejected() {
 /// firehose frame (the cold rebuild rides the durable outbox, arch §6).
 #[test]
 fn the_resync_snapshot_fallback_names_chat_durable_snapshots() {
-    assert_eq!(CHAT_RESYNC_SNAPSHOT_TOKENS.len(), 3, "channel/message/thread snapshots");
+    assert_eq!(
+        CHAT_RESYNC_SNAPSHOT_TOKENS.len(),
+        3,
+        "channel/message/thread snapshots"
+    );
     for snap in CHAT_RESYNC_SNAPSHOT_TOKENS {
         assert!(
             CHAT_DURABLE_TOKENS.contains(snap),
             "the resync fallback snapshot `{snap}` must be a DURABLE token (rides the outbox)"
         );
-        assert!(snap.ends_with(".snapshot"), "`{snap}` is a *.snapshot reindex-from-source token");
+        assert!(
+            snap.ends_with(".snapshot"),
+            "`{snap}` is a *.snapshot reindex-from-source token"
+        );
     }
 }
 
@@ -293,14 +371,27 @@ fn the_resync_snapshot_fallback_names_chat_durable_snapshots() {
 /// CHAT-P26).
 #[test]
 fn te21_pin_is_rust_and_the_harness_shim_is_a_no_op() {
-    assert_eq!(Te21LanguagePin::PINNED, Te21LanguagePin::Rust, "the M2-C0 pin is Rust");
-    assert!(Te21LanguagePin::Rust.is_no_op(), "the all-Rust default makes the shim a no-op");
+    assert_eq!(
+        Te21LanguagePin::PINNED,
+        Te21LanguagePin::Rust,
+        "the M2-C0 pin is Rust"
+    );
+    assert!(
+        Te21LanguagePin::Rust.is_no_op(),
+        "the all-Rust default makes the shim a no-op"
+    );
     // the recorded obligation returns the pinned Rust no-op.
     let recorded = te21_harness_shim_obligation();
     assert_eq!(recorded, Te21LanguagePin::Rust);
-    assert!(recorded.is_no_op(), "the recorded TE-21 obligation is a no-op against the 1.7 shim");
+    assert!(
+        recorded.is_no_op(),
+        "the recorded TE-21 obligation is a no-op against the 1.7 shim"
+    );
 
     // the BEAM hatch is written-but-CLOSED: it exists as a variant but is NOT a no-op (its
     // cross-language harness-shim obligations bind when selected — CHAT-P26).
-    assert!(!Te21LanguagePin::Beam.is_no_op(), "the BEAM hatch carries the shim obligation (CHAT-P26)");
+    assert!(
+        !Te21LanguagePin::Beam.is_no_op(),
+        "the BEAM hatch carries the shim obligation (CHAT-P26)"
+    );
 }

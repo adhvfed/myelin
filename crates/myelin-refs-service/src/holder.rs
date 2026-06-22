@@ -48,7 +48,7 @@ use std::sync::Arc;
 
 use myelin_gdpr::{
     EraseReceipt, EraseScope, LocateReport, Patch, PersonalDataHolder, PortableBundle, Receipt,
-    RectifyReceipt, Result as DsrResult, RestrictReceipt, SubjectRef, TenantId as GdprTenantId,
+    RectifyReceipt, RestrictReceipt, Result as DsrResult, SubjectRef, TenantId as GdprTenantId,
 };
 use myelin_refs::ArtifactRef;
 use myelin_substrate::{Holder, HolderRegistration, HolderRegistry, StoreClassifier, StoreKind};
@@ -114,13 +114,19 @@ impl EdgeBacking {
     /// Wire the edge holder over a live edge projection (the REF-P15 real body). The restrict set is
     /// fresh (empty) — `restrict(subject, true)` adds to it.
     pub fn new(projection: EdgeProjection) -> EdgeBacking {
-        EdgeBacking { projection, restrict: RestrictSet::new() }
+        EdgeBacking {
+            projection,
+            restrict: RestrictSet::new(),
+        }
     }
 
     /// Wire the edge holder over a live projection AND a shared restrict-suppression set (so the
     /// suppression a holder records is the SAME set the indexer/backlink read consults).
     pub fn with_restrict(projection: EdgeProjection, restrict: RestrictSet) -> EdgeBacking {
-        EdgeBacking { projection, restrict }
+        EdgeBacking {
+            projection,
+            restrict,
+        }
     }
 
     /// The shared restrict-suppression set (the indexer/backlink read reads it to suppress a
@@ -146,7 +152,9 @@ impl RefsEdgeHolder {
     /// edge keeps the opaque id) + the `*.erased` tombstoning (REF-P7, NO backdoor); `restrict`
     /// suppresses the subject's references.
     pub fn with_backing(backing: EdgeBacking) -> RefsEdgeHolder {
-        RefsEdgeHolder { backing: Some(backing) }
+        RefsEdgeHolder {
+            backing: Some(backing),
+        }
     }
 
     /// Register this holder through the substrate registry (the `serve`-called auto-registration
@@ -180,9 +188,19 @@ impl PersonalDataHolder for RefsEdgeHolder {
             }
             None => 0,
         };
-        let outcome = format!("located {count} edges naming the pseudonymous origin_actor (references-not-payloads)");
+        let outcome = format!(
+            "located {count} edges naming the pseudonymous origin_actor (references-not-payloads)"
+        );
         Ok(LocateReport {
-            receipt: Receipt::content_addressed("locate", REFS_EDGE_STORE, &sid, &tenant.0, &outcome, None, 0),
+            receipt: Receipt::content_addressed(
+                "locate",
+                REFS_EDGE_STORE,
+                &sid,
+                &tenant.0,
+                &outcome,
+                None,
+                0,
+            ),
         })
     }
 
@@ -204,7 +222,9 @@ impl PersonalDataHolder for RefsEdgeHolder {
                 REFS_EDGE_STORE,
                 &sid,
                 &tenant.0,
-                &format!("references-not-payloads bundle: {count} opaque-actor edges, no free-text body"),
+                &format!(
+                    "references-not-payloads bundle: {count} opaque-actor edges, no free-text body"
+                ),
                 None,
                 0,
             ),
@@ -246,7 +266,15 @@ impl PersonalDataHolder for RefsEdgeHolder {
             format!("restrict={on} no-op (no live index; suppression GA-D7)")
         };
         Ok(RestrictReceipt {
-            receipt: Receipt::content_addressed("restrict", REFS_EDGE_STORE, &sid, "", &outcome, None, 0),
+            receipt: Receipt::content_addressed(
+                "restrict",
+                REFS_EDGE_STORE,
+                &sid,
+                "",
+                &outcome,
+                None,
+                0,
+            ),
         })
     }
 
@@ -258,7 +286,9 @@ impl PersonalDataHolder for RefsEdgeHolder {
         // here (no erasure backdoor). So the holder erase RELIES on Identity's shred + reports the
         // surface it covers; it does not itself destroy a key (the cache holder destroys the cache DEK).
         let (sid, tenant) = match &scope {
-            EraseScope::Subject { subject, tenant } => (Self::subject_id(subject), tenant.0.clone()),
+            EraseScope::Subject { subject, tenant } => {
+                (Self::subject_id(subject), tenant.0.clone())
+            }
             EraseScope::Tenant(t) => (String::new(), t.0.clone()),
         };
         // Count the edges the subject touches (the surface the erasure covers; the edges themselves
@@ -277,7 +307,15 @@ impl PersonalDataHolder for RefsEdgeHolder {
         Ok(EraseReceipt {
             // No KEY destroyed at the EDGE holder (the edge is opaque-id-only; the crypto-shred is the
             // cache DEK, RefsCacheHolder + the per-tenant DEK, REF-P4). key_epoch_destroyed = None here.
-            receipt: Receipt::content_addressed("erase", REFS_EDGE_STORE, &sid, &tenant, &outcome, None, 0),
+            receipt: Receipt::content_addressed(
+                "erase",
+                REFS_EDGE_STORE,
+                &sid,
+                &tenant,
+                &outcome,
+                None,
+                0,
+            ),
         })
     }
 }
@@ -301,8 +339,14 @@ impl RefsCacheHolder {
     /// the only place a name-in-a-title lands. Driven through the cache's `invalidate` (the SAME
     /// eviction the `*.erased` invalidator drives — one purge path, no backdoor). The per-tenant DEK
     /// (REF-P4) additionally makes the whole cache crypto-shred-able on tenant offboard.
-    pub fn with_cache(cache: Arc<R2ProjectionCache>, projection: EdgeProjection) -> RefsCacheHolder {
-        RefsCacheHolder { cache: Some(cache), projection: Some(projection) }
+    pub fn with_cache(
+        cache: Arc<R2ProjectionCache>,
+        projection: EdgeProjection,
+    ) -> RefsCacheHolder {
+        RefsCacheHolder {
+            cache: Some(cache),
+            projection: Some(projection),
+        }
     }
 
     /// Register the cache through the substrate registry (a cache namespace, §3.4), returning the
@@ -329,7 +373,12 @@ impl RefsCacheHolder {
         let mut purged = 0usize;
         let mut seen: Vec<ArtifactRef> = Vec::new();
         for edge in projection.edges_by_actor(&t, &r, subject_id) {
-            for ref_ in [edge.source.clone(), edge.source_root.clone(), edge.target.clone(), edge.target_root.clone()] {
+            for ref_ in [
+                edge.source.clone(),
+                edge.source_root.clone(),
+                edge.target.clone(),
+                edge.target_root.clone(),
+            ] {
                 if !seen.contains(&ref_) {
                     cache.invalidate(&t, &r, &ref_);
                     seen.push(ref_);
@@ -409,7 +458,9 @@ impl PersonalDataHolder for RefsCacheHolder {
         // backdoor). The per-tenant DEK (REF-P4) makes the whole cache crypto-shred-able on a TENANT
         // erase (destroy the DEK → every cached title unrecoverable, even in backups).
         let (sid, tenant) = match &scope {
-            EraseScope::Subject { subject, tenant } => (subject.principal.principal_id.0.clone(), tenant.0.clone()),
+            EraseScope::Subject { subject, tenant } => {
+                (subject.principal.principal_id.0.clone(), tenant.0.clone())
+            }
             EraseScope::Tenant(t) => (String::new(), t.0.clone()),
         };
         let purged = match &scope {
@@ -427,7 +478,15 @@ impl PersonalDataHolder for RefsCacheHolder {
             }
         };
         Ok(EraseReceipt {
-            receipt: Receipt::content_addressed("erase", REFS_CACHE_STORE, &sid, &tenant, &outcome, None, 0),
+            receipt: Receipt::content_addressed(
+                "erase",
+                REFS_CACHE_STORE,
+                &sid,
+                &tenant,
+                &outcome,
+                None,
+                0,
+            ),
         })
     }
 }

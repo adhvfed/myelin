@@ -106,7 +106,10 @@ fn cdc_4_9_id_compiled_knowledge_fragment_admits() {
     let svc = provider(&s, &[]);
     let ns = svc.namespace();
     for ty in ["space", "page", "block", "database_row"] {
-        assert!(ns.object_types().contains(&ty.to_string()), "`{ty}` admitted into the cell schema");
+        assert!(
+            ns.object_types().contains(&ty.to_string()),
+            "`{ty}` admitted into the cell schema"
+        );
     }
     // page.read (the page-tree-with-overrides) + database_row.read (the row ACL) are compiled.
     assert!(ns.resolve_permission("page", "read").is_some());
@@ -133,13 +136,28 @@ fn cdc_4_9_page_tree_inheritance_resolves() {
     let child = ArtifactRef("page:child".into());
     let can_read = |actor: &Principal| {
         matches!(
-            svc.check(actor, &Permission("read".into()), &child, &at_latest(), None),
+            svc.check(
+                actor,
+                &Permission("read".into()),
+                &child,
+                &at_latest(),
+                None
+            ),
             Ok(Decision::Allow)
         )
     };
-    assert!(can_read(&subject("p:alice")), "a parent-page reader inherits the child (parent_page->read)");
-    assert!(can_read(&subject("p:bob")), "a direct reader of the child reads it");
-    assert!(!can_read(&subject("p:carol")), "an outsider cannot read (fail-closed)");
+    assert!(
+        can_read(&subject("p:alice")),
+        "a parent-page reader inherits the child (parent_page->read)"
+    );
+    assert!(
+        can_read(&subject("p:bob")),
+        "a direct reader of the child reads it"
+    );
+    assert!(
+        !can_read(&subject("p:carol")),
+        "an outsider cannot read (fail-closed)"
+    );
 }
 
 /// **CONSUMER → PROVIDER: an OVERRIDE (`direct_block`) narrows inherited access (§5, the headline
@@ -169,14 +187,20 @@ fn cdc_4_9_direct_block_override_narrows_inherited_access() {
         )
     };
     // alice reads the PARENT (she is a direct reader there)...
-    assert!(can_read(&subject("p:alice"), &parent), "alice reads the parent (direct_reader)");
+    assert!(
+        can_read(&subject("p:alice"), &parent),
+        "alice reads the parent (direct_reader)"
+    );
     // ...but the child's `- direct_block` OVERRIDE removes her from the child's read set.
     assert!(
         !can_read(&subject("p:alice"), &child),
         "the - direct_block override narrows alice's inherited access (she does NOT read the sub-page)"
     );
     // bob is not blocked → he still inherits read on the child.
-    assert!(can_read(&subject("p:bob"), &child), "an un-blocked inheriting reader still reads the child");
+    assert!(
+        can_read(&subject("p:bob"), &child),
+        "an un-blocked inheriting reader still reads the child"
+    );
 }
 
 /// **CONSUMER → PROVIDER: the row-level ACL conjoins via `list_objects` (`database_row.read`).** A
@@ -222,12 +246,21 @@ fn cdc_4_9_row_level_acl_conjoins_via_list_objects() {
 fn cdc_4_9_field_caveat_hides_a_column() {
     let s = scope("acme");
     // The row itself is readable by the viewer (the row ACL); the field caveat gates a column on top.
-    let svc = provider(&s, &[add("database_row:emp-1", "direct_reader", "p:viewer")]);
+    let svc = provider(
+        &s,
+        &[add("database_row:emp-1", "direct_reader", "p:viewer")],
+    );
     let row = ArtifactRef("database_row:emp-1".into());
 
     // Sanity: the viewer reads the ROW (the row ACL holds).
     assert_eq!(
-        svc.check(&subject("p:viewer"), &Permission("read".into()), &row, &at_latest(), None),
+        svc.check(
+            &subject("p:viewer"),
+            &Permission("read".into()),
+            &row,
+            &at_latest(),
+            None
+        ),
         Ok(Decision::Allow),
         "the viewer reads the row (the row-level ACL); the field caveat gates a column on top"
     );
@@ -242,7 +275,13 @@ fn cdc_4_9_field_caveat_hides_a_column() {
         &[("clearance", Literal::Int(5))],
     );
     assert_eq!(
-        svc.check(&subject("p:viewer"), &Permission("view_field".into()), &row, &at_latest(), Some(&cleared)),
+        svc.check(
+            &subject("p:viewer"),
+            &Permission("view_field".into()),
+            &row,
+            &at_latest(),
+            Some(&cleared)
+        ),
         Ok(Decision::Allow),
         "a cleared viewer sees the salary column"
     );
@@ -256,7 +295,13 @@ fn cdc_4_9_field_caveat_hides_a_column() {
         &[("clearance", Literal::Int(1))],
     );
     assert_eq!(
-        svc.check(&subject("p:viewer"), &Permission("view_field".into()), &row, &at_latest(), Some(&under)),
+        svc.check(
+            &subject("p:viewer"),
+            &Permission("view_field".into()),
+            &row,
+            &at_latest(),
+            Some(&under)
+        ),
         Ok(Decision::Deny),
         "an under-cleared viewer's salary column is redacted (Deny) — absent, not a post-filter"
     );
@@ -270,7 +315,13 @@ fn cdc_4_9_field_caveat_hides_a_column() {
         &[],
     );
     assert_eq!(
-        svc.check(&subject("p:viewer"), &Permission("view_field".into()), &row, &at_latest(), Some(&missing)),
+        svc.check(
+            &subject("p:viewer"),
+            &Permission("view_field".into()),
+            &row,
+            &at_latest(),
+            Some(&missing)
+        ),
         Ok(Decision::Conditional),
         "a field caveat needing missing context is Conditional, never a silent allow (§8.6)"
     );

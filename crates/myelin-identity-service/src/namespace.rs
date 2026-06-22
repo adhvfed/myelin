@@ -184,7 +184,11 @@ impl FragmentDef {
         NamespaceFragment {
             object_type: self.object_type.clone(),
             relations: self.relations.clone(),
-            permissions: self.permissions.iter().map(|r| r.permission.clone()).collect(),
+            permissions: self
+                .permissions
+                .iter()
+                .map(|r| r.permission.clone())
+                .collect(),
         }
     }
 
@@ -223,9 +227,15 @@ pub enum AdmitReject {
     /// type/relation/permission name.
     NameMintsObjectId { name: String, kind: &'static str },
     /// A permission's rewrite references a relation this fragment did not declare.
-    UndeclaredRelation { permission: String, relation: String },
+    UndeclaredRelation {
+        permission: String,
+        relation: String,
+    },
     /// A tuple-to-userset names a `tupleset` relation this fragment did not declare as a relation.
-    UndeclaredTupleset { permission: String, tupleset: String },
+    UndeclaredTupleset {
+        permission: String,
+        tupleset: String,
+    },
     /// A permission's rewrite is self-referential (a permission referencing its own name as a
     /// relation, or a duplicate permission name) — a schema cycle.
     PermissionCycle { permission: String },
@@ -240,25 +250,37 @@ impl core::fmt::Display for AdmitReject {
         match self {
             AdmitReject::EmptyObjectType => write!(f, "the object type name is empty"),
             AdmitReject::DuplicateObjectType { object_type } => {
-                write!(f, "object type `{object_type}` is already admitted (duplicate definition)")
+                write!(
+                    f,
+                    "object type `{object_type}` is already admitted (duplicate definition)"
+                )
             }
             AdmitReject::NameMintsObjectId { name, kind } => write!(
                 f,
                 "the {kind} name `{name}` carries an object-id form (`:`/`/`/`#`) — Id never \
                  invents object ids; a fragment declares types/relations/permissions, never ids"
             ),
-            AdmitReject::UndeclaredRelation { permission, relation } => write!(
+            AdmitReject::UndeclaredRelation {
+                permission,
+                relation,
+            } => write!(
                 f,
                 "permission `{permission}` references relation `{relation}`, which this fragment \
                  did not declare"
             ),
-            AdmitReject::UndeclaredTupleset { permission, tupleset } => write!(
+            AdmitReject::UndeclaredTupleset {
+                permission,
+                tupleset,
+            } => write!(
                 f,
                 "permission `{permission}` inherits via tupleset `{tupleset}`, which this fragment \
                  did not declare as a relation"
             ),
             AdmitReject::PermissionCycle { permission } => {
-                write!(f, "permission `{permission}` is self-referential (a schema cycle)")
+                write!(
+                    f,
+                    "permission `{permission}` is self-referential (a schema cycle)"
+                )
             }
             AdmitReject::RuleTooDeep { permission } => write!(
                 f,
@@ -266,7 +288,10 @@ impl core::fmt::Display for AdmitReject {
                  an unbounded schema"
             ),
             AdmitReject::DuplicatePermission { permission } => {
-                write!(f, "permission `{permission}` is declared twice in this fragment")
+                write!(
+                    f,
+                    "permission `{permission}` is declared twice in this fragment"
+                )
             }
         }
     }
@@ -599,7 +624,16 @@ impl NamespaceEngine {
         object: &ArtifactRef,
         at: &myelin_identity::Consistency,
     ) -> bool {
-        self.eval(engine, scope, subject, object_type, permission, object, at, 0)
+        self.eval(
+            engine,
+            scope,
+            subject,
+            object_type,
+            permission,
+            object,
+            at,
+            0,
+        )
     }
 
     /// Resolve a `permission`/relation on `object` (of `object_type`) for `subject`, permission-
@@ -626,12 +660,17 @@ impl NamespaceEngine {
         }
         match self.resolve_permission(object_type, permission) {
             // A compiled permission → walk its rewrite over the four operators.
-            Some(rewrite) => {
-                self.eval_userset(engine, scope, subject, object, at, &rewrite, depth)
-            }
+            Some(rewrite) => self.eval_userset(engine, scope, subject, object, at, &rewrite, depth),
             // Not a compiled permission → a direct relation check (the raw-tuple floor P-ID-09).
             None => matches!(
-                engine.check(scope, subject, &RelName(permission.to_string()), object, at, None),
+                engine.check(
+                    scope,
+                    subject,
+                    &RelName(permission.to_string()),
+                    object,
+                    at,
+                    None
+                ),
                 myelin_identity::Decision::Allow
             ),
         }
@@ -664,17 +703,15 @@ impl NamespaceEngine {
                     myelin_identity::Decision::Allow
                 )
             }
-            Userset::Union(arms) => arms.iter().any(|a| {
-                self.eval_userset(engine, scope, subject, object, at, a, depth + 1)
-            }),
-            Userset::Intersect(arms) => arms.iter().all(|a| {
-                self.eval_userset(engine, scope, subject, object, at, a, depth + 1)
-            }),
+            Userset::Union(arms) => arms
+                .iter()
+                .any(|a| self.eval_userset(engine, scope, subject, object, at, a, depth + 1)),
+            Userset::Intersect(arms) => arms
+                .iter()
+                .all(|a| self.eval_userset(engine, scope, subject, object, at, a, depth + 1)),
             Userset::Exclusion { base, subtracted } => {
                 self.eval_userset(engine, scope, subject, object, at, base, depth + 1)
-                    && !self.eval_userset(
-                        engine, scope, subject, object, at, subtracted, depth + 1,
-                    )
+                    && !self.eval_userset(engine, scope, subject, object, at, subtracted, depth + 1)
             }
             Userset::TupleToUserset { tupleset, computed } => {
                 // Inheritance (`parent_team->view`): read the parent objects named by `tupleset`
@@ -824,7 +861,7 @@ mod tests {
     use super::*;
     use myelin_events::{OutboxStore, Timestamp};
     use myelin_identity::{
-        ConsistencyMode, Consistency, ObjectId, PrincipalId, PrincipalKind, RelationTuple,
+        Consistency, ConsistencyMode, ObjectId, PrincipalId, PrincipalKind, RelationTuple,
         TupleDelta, Zookie,
     };
     use myelin_storage::TenantScope;
@@ -1010,16 +1047,48 @@ mod tests {
         let obj1 = ArtifactRef("doc:1".into());
 
         // UNION read = reader ∪ editor: alice (both) and bob (reader) both read.
-        assert!(ns.permits(&eng, &s, &subject("p:alice"), "doc", "read", &obj1, &latest()));
+        assert!(ns.permits(
+            &eng,
+            &s,
+            &subject("p:alice"),
+            "doc",
+            "read",
+            &obj1,
+            &latest()
+        ));
         assert!(ns.permits(&eng, &s, &subject("p:bob"), "doc", "read", &obj1, &latest()));
 
         // INTERSECT review = reader ∩ editor: only alice (both); bob is reader-only → deny.
-        assert!(ns.permits(&eng, &s, &subject("p:alice"), "doc", "review", &obj1, &latest()));
-        assert!(!ns.permits(&eng, &s, &subject("p:bob"), "doc", "review", &obj1, &latest()));
+        assert!(ns.permits(
+            &eng,
+            &s,
+            &subject("p:alice"),
+            "doc",
+            "review",
+            &obj1,
+            &latest()
+        ));
+        assert!(!ns.permits(
+            &eng,
+            &s,
+            &subject("p:bob"),
+            "doc",
+            "review",
+            &obj1,
+            &latest()
+        ));
 
         // EXCLUSION view = reader − blocked: alice (reader, not blocked) allows; bob (reader BUT
         // blocked) denies (the confidential-disappears-by-construction crux).
-        assert!(ns.permits(&eng, &s, &subject("p:alice"), "doc", "view", &obj1, &latest()));
+        assert!(ns.permits(
+            &eng,
+            &s,
+            &subject("p:alice"),
+            "doc",
+            "view",
+            &obj1,
+            &latest()
+        ));
         assert!(
             !ns.permits(&eng, &s, &subject("p:bob"), "doc", "view", &obj1, &latest()),
             "exclusion: a blocked reader is excluded (− blocked)"
@@ -1042,7 +1111,9 @@ mod tests {
                 ]),
             }],
         };
-        assert!(matches!(ns.admit(&ok), FragmentAdmit::Admitted { fragment_id } if fragment_id == "repo"));
+        assert!(
+            matches!(ns.admit(&ok), FragmentAdmit::Admitted { fragment_id } if fragment_id == "repo")
+        );
 
         // malformed: a permission references an UNDECLARED relation → Rejected.
         let bad = FragmentDef {
@@ -1056,7 +1127,10 @@ mod tests {
         };
         match ns.admit(&bad) {
             FragmentAdmit::Rejected { reason } => {
-                assert!(reason.contains("reader"), "the rejection names the undeclared relation: {reason}");
+                assert!(
+                    reason.contains("reader"),
+                    "the rejection names the undeclared relation: {reason}"
+                );
             }
             FragmentAdmit::Admitted { .. } => panic!("a malformed fragment must be rejected"),
         }
@@ -1102,8 +1176,12 @@ mod tests {
             }],
         };
         match ns.admit(&cyclic) {
-            FragmentAdmit::Rejected { reason } => assert!(reason.contains("cycle") || reason.contains("self")),
-            FragmentAdmit::Admitted { .. } => panic!("a self-referential permission must be rejected"),
+            FragmentAdmit::Rejected { reason } => {
+                assert!(reason.contains("cycle") || reason.contains("self"))
+            }
+            FragmentAdmit::Admitted { .. } => {
+                panic!("a self-referential permission must be rejected")
+            }
         }
     }
 
@@ -1157,14 +1235,37 @@ mod tests {
         let globex = scope("globex");
         let store = TupleStore::new(OutboxStore::new());
         store
-            .write_tuples(&acme, &subject("p-admin"), &[add("project:web", "reader", "p:alice")], None, None, now())
+            .write_tuples(
+                &acme,
+                &subject("p-admin"),
+                &[add("project:web", "reader", "p:alice")],
+                None,
+                None,
+                now(),
+            )
             .expect("acme grant");
         let eng = CheckEngine::new(store);
         // Under acme: allow.
-        assert!(ns.permits(&eng, &acme, &subject("p:alice"), "project", "view", &ArtifactRef("project:web".into()), &latest()));
+        assert!(ns.permits(
+            &eng,
+            &acme,
+            &subject("p:alice"),
+            "project",
+            "view",
+            &ArtifactRef("project:web".into()),
+            &latest()
+        ));
         // Under globex: the acme grant is invisible → deny (0 cross-tenant tuples).
         assert!(
-            !ns.permits(&eng, &globex, &subject("p:alice"), "project", "view", &ArtifactRef("project:web".into()), &latest()),
+            !ns.permits(
+                &eng,
+                &globex,
+                &subject("p:alice"),
+                "project",
+                "view",
+                &ArtifactRef("project:web".into()),
+                &latest()
+            ),
             "a grant in one tenant does not permit a resolution in another (ID-D3)"
         );
     }
@@ -1182,7 +1283,10 @@ mod tests {
             permissions: vec![],
         }
         .watchable();
-        assert!(frag.is_watchable(), "the fragment declares the watcher relation");
+        assert!(
+            frag.is_watchable(),
+            "the fragment declares the watcher relation"
+        );
         assert!(matches!(ns.admit(&frag), FragmentAdmit::Admitted { .. }));
         // The admitted type is watchable + the `watcher` relation is an ordinary declared relation.
         assert!(ns.is_watchable("channel"));
@@ -1211,8 +1315,15 @@ mod tests {
         }
         .watchable()
         .watchable();
-        let watcher_count = frag.relations.iter().filter(|r| r.0 == WATCHER_RELATION).count();
-        assert_eq!(watcher_count, 1, "watcher is declared exactly once (idempotent)");
+        let watcher_count = frag
+            .relations
+            .iter()
+            .filter(|r| r.0 == WATCHER_RELATION)
+            .count();
+        assert_eq!(
+            watcher_count, 1,
+            "watcher is declared exactly once (idempotent)"
+        );
         assert!(frag.is_watchable());
     }
 
@@ -1225,14 +1336,22 @@ mod tests {
         // project is admitted (core hierarchy) but not yet watchable.
         assert!(!ns.is_watchable("project"));
         let admit = ns.declare_watchable("project");
-        assert!(matches!(admit, FragmentAdmit::Admitted { fragment_id } if fragment_id == "project"));
+        assert!(
+            matches!(admit, FragmentAdmit::Admitted { fragment_id } if fragment_id == "project")
+        );
         assert!(ns.is_watchable("project"), "project is now watchable");
         // Idempotent: re-declaring is a no-op success (not a duplicate-relation error).
-        assert!(matches!(ns.declare_watchable("project"), FragmentAdmit::Admitted { .. }));
+        assert!(matches!(
+            ns.declare_watchable("project"),
+            FragmentAdmit::Admitted { .. }
+        ));
         // An unknown type cannot be made watchable (Id never invents a type for the relation).
         match ns.declare_watchable("nonexistent_type") {
             FragmentAdmit::Rejected { reason } => {
-                assert!(reason.contains("not an admitted object type"), "rejection names why: {reason}")
+                assert!(
+                    reason.contains("not an admitted object type"),
+                    "rejection names why: {reason}"
+                )
             }
             FragmentAdmit::Admitted { .. } => panic!("an unknown type must not be made watchable"),
         }

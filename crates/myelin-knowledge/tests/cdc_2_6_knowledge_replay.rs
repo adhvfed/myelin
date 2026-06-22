@@ -14,13 +14,13 @@
 //! `(aggregate, version)` id; (d) the `refs.edge.snapshot` token is the FROZEN wire string the Refs
 //! reindexer ingests.
 
-use myelin_knowledge::replay::{KnowledgeReindexSource, REFS_EDGE_SNAPSHOT};
 use myelin_events::{
     reindex, snapshot_event_id, validate_event_type, Actor, AggregateKey, CorrelationId,
-    DerivedStore, EmitContextBase, EventEnvelope, OutboxStore, Region, ReindexSource, SnapshotDraft,
-    SnapshotScope, TenantId, Timestamp,
+    DerivedStore, EmitContextBase, EventEnvelope, OutboxStore, Region, ReindexSource,
+    SnapshotDraft, SnapshotScope, TenantId, Timestamp,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
+use myelin_knowledge::replay::{KnowledgeReindexSource, REFS_EDGE_SNAPSHOT};
 
 fn ctx_base() -> EmitContextBase {
     EmitContextBase {
@@ -73,12 +73,28 @@ fn full_source() -> KnowledgeReindexSource {
         "home",
         4,
         &[
-            ("b1", 3, serde_json::json!({ "kind": "heading", "text_ref": "h1" })),
-            ("b2", 9, serde_json::json!({ "kind": "paragraph", "text_ref": "p1" })),
+            (
+                "b1",
+                3,
+                serde_json::json!({ "kind": "heading", "text_ref": "h1" }),
+            ),
+            (
+                "b2",
+                9,
+                serde_json::json!({ "kind": "paragraph", "text_ref": "p1" }),
+            ),
         ],
     );
-    s.upsert_row("task-1", 2, serde_json::json!({ "title": "Ship KN-P20", "status": "open" }));
-    s.upsert_row("task-2", 5, serde_json::json!({ "title": "Wire replay", "status": "done" }));
+    s.upsert_row(
+        "task-1",
+        2,
+        serde_json::json!({ "title": "Ship KN-P20", "status": "open" }),
+    );
+    s.upsert_row(
+        "task-2",
+        5,
+        serde_json::json!({ "title": "Wire replay", "status": "done" }),
+    );
     s.upsert_edge(
         "myelin://acme/knowledge/page/home",
         "myelin://acme/knowledge/page/space",
@@ -115,11 +131,16 @@ fn cdc_2_6_full_surface_rebuilds_cold_equals_live_via_the_live_consumer_only() {
     reindex(&scope, None, sources, &mut outbox, ctx_base()).expect("reindex");
     let mut cold = DerivedStore::new();
     for draft in s.replay(&scope, None) {
-        let row = outbox.row(&draft.event_id()).expect("snapshot row present in the outbox");
+        let row = outbox
+            .row(&draft.event_id())
+            .expect("snapshot row present in the outbox");
         cold.ingest(&row.envelope);
     }
 
-    assert!(live.len() >= 5, "page + 2 blocks + 2 rows + 2 edges materialised");
+    assert!(
+        live.len() >= 5,
+        "page + 2 blocks + 2 rows + 2 edges materialised"
+    );
     assert_eq!(
         cold.parity_bytes(),
         live.parity_bytes(),
@@ -143,8 +164,15 @@ fn cdc_2_6_reindex_rerun_is_idempotent() {
 
     let r2 = reindex(&scope, None, sources, &mut outbox, ctx_base()).expect("re-run");
     assert_eq!(r2.snapshots_emitted, 0, "a re-run emits 0 NEW (idempotent)");
-    assert_eq!(r2.snapshots_skipped_duplicate, r1.snapshots_emitted, "all reported as duplicate");
-    assert_eq!(outbox.committed_count(), after_first, "no duplicate effect in the outbox");
+    assert_eq!(
+        r2.snapshots_skipped_duplicate, r1.snapshots_emitted,
+        "all reported as duplicate"
+    );
+    assert_eq!(
+        outbox.committed_count(),
+        after_first,
+        "no duplicate effect in the outbox"
+    );
 }
 
 /// **CDC 2.6 (c): the `refs.edge.snapshot` TE-7 drift-correction token is the FROZEN wire string the
@@ -154,8 +182,14 @@ fn cdc_2_6_reindex_rerun_is_idempotent() {
 /// precedent; this CDC pins the byte-equivalence.)
 #[test]
 fn cdc_2_6_refs_edge_snapshot_token_is_the_frozen_wire_string() {
-    assert_eq!(REFS_EDGE_SNAPSHOT, "refs.edge.snapshot", "the frozen Refs snapshot wire token");
-    assert!(validate_event_type(REFS_EDGE_SNAPSHOT).is_ok(), "grammatical under the Bus §6 grammar");
+    assert_eq!(
+        REFS_EDGE_SNAPSHOT, "refs.edge.snapshot",
+        "the frozen Refs snapshot wire token"
+    );
+    assert!(
+        validate_event_type(REFS_EDGE_SNAPSHOT).is_ok(),
+        "grammatical under the Bus §6 grammar"
+    );
 
     // The drift-correction re-emits the typed edges under this exact token.
     let s = full_source();
@@ -173,6 +207,13 @@ fn cdc_2_6_refs_edge_snapshot_token_is_the_frozen_wire_string() {
 fn cdc_2_6_snapshot_id_is_deterministic_matching_the_bus_seam() {
     let a = AggregateKey("myelin://acme/knowledge/row/task-1".into());
     assert_eq!(snapshot_event_id(&a, 2), snapshot_event_id(&a, 2));
-    assert_ne!(snapshot_event_id(&a, 2), snapshot_event_id(&a, 3), "a row edit re-snapshots");
-    assert!(snapshot_event_id(&a, 2).0.starts_with("snap-"), "the snapshot id is prefixed");
+    assert_ne!(
+        snapshot_event_id(&a, 2),
+        snapshot_event_id(&a, 3),
+        "a row edit re-snapshots"
+    );
+    assert!(
+        snapshot_event_id(&a, 2).0.starts_with("snap-"),
+        "the snapshot id is prefixed"
+    );
 }

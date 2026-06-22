@@ -202,15 +202,21 @@ impl<B: BlobStore> PackObjectDb<B> {
     /// object is REFUSED, 0 silent serve — STOR-D7 inherited). The handle is the git oid the ref
     /// graph carries; this resolves it to the stored content address.
     pub fn read_object(&self, oid: &Oid) -> Result<Vec<u8>, GitPackError> {
-        let address = self.address_of(oid).ok_or_else(|| GitPackError::RepoNotPlaced {
-            repo: self.repo.clone(),
-        })?;
+        let address = self
+            .address_of(oid)
+            .ok_or_else(|| GitPackError::RepoNotPlaced {
+                repo: self.repo.clone(),
+            })?;
         self.tier.get_object(&self.repo, &address)
     }
 
     /// The storage content address a git oid resolves to (relocation-stable; `None` if not stored).
     pub fn address_of(&self, oid: &Oid) -> Option<ContentHash> {
-        self.oid_index.lock().expect("oid index mutex").get(&oid.0).cloned()
+        self.oid_index
+            .lock()
+            .expect("oid index mutex")
+            .get(&oid.0)
+            .cloned()
     }
 
     /// **Run a maintenance op: produce + record the acceleration artifact, fresh at the current
@@ -404,7 +410,9 @@ mod tests {
         let db = placed_db();
         let oid = Oid::new("aaaa1111");
         let content = b"fn main() { println!(\"hi\"); }\n";
-        let address = db.put_object(GitObjectKind::Blob, &oid, content).expect("put");
+        let address = db
+            .put_object(GitObjectKind::Blob, &oid, content)
+            .expect("put");
         assert!(address.to_multihash_string().starts_with("sha256:"));
 
         // read by the git oid returns the EXACT bytes (re-hash-on-read verified).
@@ -421,9 +429,18 @@ mod tests {
         let db = placed_db();
         // The receive-pack input: a set of quarantine objects (oid + bytes).
         let input = vec![
-            QuarantineObject { oid: Oid::new("c0ffee01"), bytes: b"tree-bytes-1".to_vec() },
-            QuarantineObject { oid: Oid::new("c0ffee02"), bytes: b"commit-bytes-2".to_vec() },
-            QuarantineObject { oid: Oid::new("c0ffee03"), bytes: vec![0u8, 1, 2, 3, 255, 254] },
+            QuarantineObject {
+                oid: Oid::new("c0ffee01"),
+                bytes: b"tree-bytes-1".to_vec(),
+            },
+            QuarantineObject {
+                oid: Oid::new("c0ffee02"),
+                bytes: b"commit-bytes-2".to_vec(),
+            },
+            QuarantineObject {
+                oid: Oid::new("c0ffee03"),
+                bytes: vec![0u8, 1, 2, 3, 255, 254],
+            },
         ];
 
         // Accept → migrate through the real pack tier (closing the receive_pack GIT-P11 floor).
@@ -438,7 +455,10 @@ mod tests {
         assert_eq!(served.len(), input.len());
         for (got, want) in served.iter().zip(input.iter()) {
             assert_eq!(got.0, want.oid, "the same oid is served");
-            assert_eq!(got.1, want.bytes, "byte-identical clone round-trip (0 corruption)");
+            assert_eq!(
+                got.1, want.bytes,
+                "byte-identical clone round-trip (0 corruption)"
+            );
         }
     }
 
@@ -452,7 +472,10 @@ mod tests {
         let db = PackObjectDb::new(tier, RepoId::from_token("ghost"));
         let migration = PackTierMigration::new(&db);
         let err = migration
-            .migrate(&[QuarantineObject { oid: Oid::new("x"), bytes: vec![1] }])
+            .migrate(&[QuarantineObject {
+                oid: Oid::new("x"),
+                bytes: vec![1],
+            }])
             .expect_err("an unplaced repo aborts the migration (fail-closed)");
         assert!(err.contains("pack-tier migration failed"), "{err}");
     }
@@ -464,10 +487,15 @@ mod tests {
         let db = placed_db();
         let oid = Oid::new("deadbeef");
         let content = b"authoritative object bytes";
-        let address = db.put_object(GitObjectKind::Blob, &oid, content).expect("put");
+        let address = db
+            .put_object(GitObjectKind::Blob, &oid, content)
+            .expect("put");
 
         // Clean clone serves the bytes.
-        assert_eq!(db.serve_clone(std::slice::from_ref(&oid)).unwrap()[0].1, content);
+        assert_eq!(
+            db.serve_clone(std::slice::from_ref(&oid)).unwrap()[0].1,
+            content
+        );
         assert_eq!(db.tier().blobs().telemetry().blob_integrity_fail(), 0);
 
         // Corrupt the stored object at its native blob address.
@@ -475,7 +503,10 @@ mod tests {
             .tier()
             .native_addr_for_test(&db.repo, &address)
             .expect("linked native address");
-        assert!(db.tier().blobs().corrupt_for_drill(db.tier().tenant(), &native));
+        assert!(db
+            .tier()
+            .blobs()
+            .corrupt_for_drill(db.tier().tenant(), &native));
 
         // The clone REFUSES the corrupt object (never a silent wrong-bytes clone).
         match db.serve_clone(&[oid]) {
@@ -507,16 +538,26 @@ mod tests {
         for k in AccelKind::all() {
             assert!(!db.is_stale(k), "after maintenance {k:?} is fresh");
             let a = db.accel_artifact(k).expect("built");
-            assert_eq!(a.fresh_at_fence, db.generation(), "fresh at the current generation");
+            assert_eq!(
+                a.fresh_at_fence,
+                db.generation(),
+                "fresh at the current generation"
+            );
         }
 
         // A NEW push (an object migration) advances the generation → the artifacts are stale again.
         let gen_before = db.generation();
         db.put_object(GitObjectKind::Commit, &Oid::new("newtip"), b"new commit")
             .expect("put");
-        assert!(db.generation() > gen_before, "a push advances the object-DB generation");
+        assert!(
+            db.generation() > gen_before,
+            "a push advances the object-DB generation"
+        );
         for k in AccelKind::all() {
-            assert!(db.is_stale(k), "the ref-update burst marked {k:?} stale (the §8 signal)");
+            assert!(
+                db.is_stale(k),
+                "the ref-update burst marked {k:?} stale (the §8 signal)"
+            );
         }
 
         // A maintenance re-run refreshes the fence (the artifacts are fresh again).
@@ -544,8 +585,14 @@ mod tests {
             AccelKind::CommitGraph.producing_maintenance(),
             Maintenance::WriteCommitGraph
         );
-        assert_eq!(AccelKind::Bitmaps.producing_maintenance(), Maintenance::WriteBitmaps);
-        assert_eq!(AccelKind::Midx.producing_maintenance(), Maintenance::WriteMidx);
+        assert_eq!(
+            AccelKind::Bitmaps.producing_maintenance(),
+            Maintenance::WriteBitmaps
+        );
+        assert_eq!(
+            AccelKind::Midx.producing_maintenance(),
+            Maintenance::WriteMidx
+        );
     }
 
     /// **The acceleration artifact is content-addressed + relocation-stable: relocating the repo
@@ -561,14 +608,25 @@ mod tests {
 
         // Relocate the repo within its region (the group flips; no address recompute).
         db.tier()
-            .relocate(&db.repo, StorageGroup::from_token("pack-9"), &Region::new("fr-par"))
+            .relocate(
+                &db.repo,
+                StorageGroup::from_token("pack-9"),
+                &Region::new("fr-par"),
+            )
             .expect("same-region relocation admitted");
 
         // The artifact is still served by the SAME content address (relocation-stable).
-        let after = db.accel_artifact(AccelKind::CommitGraph).expect("still present");
-        assert_eq!(after.blob, artifact.blob, "the artifact's address is unchanged by relocation");
+        let after = db
+            .accel_artifact(AccelKind::CommitGraph)
+            .expect("still present");
         assert_eq!(
-            db.tier().get_pack(&db.repo, &after.blob).expect("served after relocation"),
+            after.blob, artifact.blob,
+            "the artifact's address is unchanged by relocation"
+        );
+        assert_eq!(
+            db.tier()
+                .get_pack(&db.repo, &after.blob)
+                .expect("served after relocation"),
             b"commit-graph bytes"
         );
     }
@@ -623,7 +681,9 @@ mod tests {
     /// The violation errors render loud + specific (a refusal is diagnosable — EI-01 §3).
     #[test]
     fn residency_pin_violations_display_loud() {
-        assert!(ResidencyPinViolation::NoRegion.to_string().contains("region"));
+        assert!(ResidencyPinViolation::NoRegion
+            .to_string()
+            .contains("region"));
         assert!(ResidencyPinViolation::NoRelocationGroup
             .to_string()
             .contains("relocatable"));

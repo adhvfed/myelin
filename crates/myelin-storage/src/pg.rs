@@ -296,7 +296,10 @@ impl PgStore {
         .fetch_all(&mut *conn)
         .await
         .map_err(|e| PgError::Query(e.to_string()))?;
-        Ok(rows.iter().map(|r| r.get::<String, _>("object_id")).collect())
+        Ok(rows
+            .iter()
+            .map(|r| r.get::<String, _>("object_id"))
+            .collect())
     }
 
     /// **check (contract 4.2) — the per-action fail-closed gate, one tuple existence query.**
@@ -382,7 +385,8 @@ impl PgStore {
         conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
         tenant: &str,
     ) -> Result<(), PgError> {
-        self.set_session_scope_in_region(conn, tenant, &self.region).await
+        self.set_session_scope_in_region(conn, tenant, &self.region)
+            .await
     }
 
     /// Set the `(tenant, region)` session GUCs to an EXPLICIT region (a test-support seam for the
@@ -422,7 +426,8 @@ impl PgStore {
             .acquire()
             .await
             .map_err(|e| PgError::Query(e.to_string()))?;
-        self.set_session_scope_in_region(&mut conn, acting_tenant, region).await?;
+        self.set_session_scope_in_region(&mut conn, acting_tenant, region)
+            .await?;
         Ok(conn)
     }
 
@@ -443,7 +448,8 @@ impl PgStore {
             .acquire()
             .await
             .map_err(|e| PgError::Query(e.to_string()))?;
-        self.set_session_scope_in_region(&mut conn, tenant, region).await?;
+        self.set_session_scope_in_region(&mut conn, tenant, region)
+            .await?;
         self.authz_queries
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // The query threads the tenant predicate (defence in depth); the REGION is enforced by the
@@ -458,7 +464,10 @@ impl PgStore {
         .fetch_all(&mut *conn)
         .await
         .map_err(|e| PgError::Query(e.to_string()))?;
-        Ok(rows.iter().map(|r| r.get::<String, _>("object_id")).collect())
+        Ok(rows
+            .iter()
+            .map(|r| r.get::<String, _>("object_id"))
+            .collect())
     }
 
     // ---- Outbox + relay (the real FOR UPDATE SKIP LOCKED claim) -----------------------------

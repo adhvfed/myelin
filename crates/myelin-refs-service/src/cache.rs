@@ -156,7 +156,11 @@ impl R2ProjectionCache {
     /// Build the cache with an explicit TTL (the bound). A TTL of `0` rounds up to the backing's
     /// minimum (the Valkey backing floors at 1s) — the entry still self-evicts; there is no unbounded
     /// write.
-    pub fn with_ttl(backing: Arc<dyn Cache>, dek: Arc<RefsDekPin>, ttl: Duration) -> R2ProjectionCache {
+    pub fn with_ttl(
+        backing: Arc<dyn Cache>,
+        dek: Arc<RefsDekPin>,
+        ttl: Duration,
+    ) -> R2ProjectionCache {
         R2ProjectionCache {
             backing,
             dek,
@@ -313,7 +317,13 @@ impl ProjectionCacheRead for R2ProjectionCache {
     /// Populate the cache after a resolve MISS (the §4.2 post-miss fill — the live override of the
     /// trait's no-op default). Best-effort: a fill error (backing/DEK) is swallowed (the cache is
     /// derived; the next read re-resolves). Delegates to the inherent [`R2ProjectionCache::fill`].
-    fn fill(&self, tenant: &TenantId, region: &Region, ref_: &ArtifactRef, projection: &Projection) {
+    fn fill(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+        ref_: &ArtifactRef,
+        projection: &Projection,
+    ) {
         let _ = R2ProjectionCache::fill(self, tenant, region, ref_, projection);
     }
 }
@@ -403,10 +413,15 @@ mod tests {
     /// backing's `{tenant}:{key}` namespacing (asserted in `tenants_are_isolated`).
     #[test]
     fn cache_key_is_prefixed_per_ref() {
-        let k = R2ProjectionCache::cache_key(&ArtifactRef("myelin://acme/issue/issue/ENG-1".into()));
+        let k =
+            R2ProjectionCache::cache_key(&ArtifactRef("myelin://acme/issue/issue/ENG-1".into()));
         assert_eq!(k, "refs:proj:myelin://acme/issue/issue/ENG-1");
-        let sub = R2ProjectionCache::cache_key(&ArtifactRef("myelin://acme/kn/page/7c2#block-9".into()));
-        assert_eq!(sub, "refs:proj:myelin://acme/kn/page/7c2#block-9", "the FULL #sub ref is the key");
+        let sub =
+            R2ProjectionCache::cache_key(&ArtifactRef("myelin://acme/kn/page/7c2#block-9".into()));
+        assert_eq!(
+            sub, "refs:proj:myelin://acme/kn/page/7c2#block-9",
+            "the FULL #sub ref is the key"
+        );
     }
 
     /// **fill → read round-trips the projection through the DEK seal (the cache HITs warm).** The blob
@@ -417,9 +432,12 @@ mod tests {
         let c = cache();
         let ref_ = ArtifactRef("myelin://acme/issue/issue/ENG-1".into());
         let p = projection(&ref_.0, "TOP SECRET acquisition plan");
-        c.fill(&tenant(), &region(), &ref_, &p).expect("fill seals + writes");
+        c.fill(&tenant(), &region(), &ref_, &p)
+            .expect("fill seals + writes");
 
-        let got = c.read(&tenant(), &region(), &ref_).expect("warm entry HITs");
+        let got = c
+            .read(&tenant(), &region(), &ref_)
+            .expect("warm entry HITs");
         assert_eq!(got, p, "the read decrypts to the exact projection");
         assert_eq!(c.counters(), (1, 0, 1), "one hit, zero misses, one fill");
     }
@@ -431,15 +449,23 @@ mod tests {
         let backing = Arc::new(InMemoryCache::new());
         let c = R2ProjectionCache::new(backing.clone(), pin());
         let ref_ = ArtifactRef("myelin://acme/issue/issue/ENG-1".into());
-        c.fill(&tenant(), &region(), &ref_, &projection(&ref_.0, "Alice Liddell's salary review"))
-            .expect("fill");
+        c.fill(
+            &tenant(),
+            &region(),
+            &ref_,
+            &projection(&ref_.0, "Alice Liddell's salary review"),
+        )
+        .expect("fill");
         // The blob in the backing store must NOT contain the plaintext name.
         let blob = backing
             .get(&tenant(), &R2ProjectionCache::cache_key(&ref_))
             .expect("backing get")
             .expect("a blob was written");
         let as_text = String::from_utf8_lossy(&blob);
-        assert!(!as_text.contains("Alice Liddell"), "the cached title is sealed, never plaintext");
+        assert!(
+            !as_text.contains("Alice Liddell"),
+            "the cached title is sealed, never plaintext"
+        );
         assert!(blob.len() > NONCE_LEN, "the blob is nonce || ciphertext");
     }
 
@@ -447,7 +473,11 @@ mod tests {
     #[test]
     fn cold_read_misses() {
         let c = cache();
-        let r = c.read(&tenant(), &region(), &ArtifactRef("myelin://acme/issue/issue/none".into()));
+        let r = c.read(
+            &tenant(),
+            &region(),
+            &ArtifactRef("myelin://acme/issue/issue/none".into()),
+        );
         assert!(r.is_none(), "a cold read misses (falls through to project)");
         assert_eq!(c.counters(), (0, 1, 0), "one miss");
     }
@@ -459,8 +489,17 @@ mod tests {
     fn bust_evicts_and_next_read_re_resolves() {
         let c = cache();
         let ref_ = ArtifactRef("myelin://acme/kn/page/7c2".into());
-        c.fill(&tenant(), &region(), &ref_, &projection(&ref_.0, "v1 title")).expect("fill");
-        assert!(c.read(&tenant(), &region(), &ref_).is_some(), "warm HIT before the bust");
+        c.fill(
+            &tenant(),
+            &region(),
+            &ref_,
+            &projection(&ref_.0, "v1 title"),
+        )
+        .expect("fill");
+        assert!(
+            c.read(&tenant(), &region(), &ref_).is_some(),
+            "warm HIT before the bust"
+        );
 
         // a *.updated busts the entry (the invalidator drives THIS now).
         c.invalidate(&tenant(), &region(), &ref_);
@@ -477,12 +516,24 @@ mod tests {
     fn erasure_bust_never_serves_stale() {
         let c = cache();
         let ref_ = ArtifactRef("myelin://acme/issue/issue/ENG-secret".into());
-        c.fill(&tenant(), &region(), &ref_, &projection(&ref_.0, "SECRET soon-erased")).expect("fill");
-        assert!(c.read(&tenant(), &region(), &ref_).is_some(), "warm before erase");
+        c.fill(
+            &tenant(),
+            &region(),
+            &ref_,
+            &projection(&ref_.0, "SECRET soon-erased"),
+        )
+        .expect("fill");
+        assert!(
+            c.read(&tenant(), &region(), &ref_).is_some(),
+            "warm before erase"
+        );
 
         c.invalidate(&tenant(), &region(), &ref_); // the *.erased bust
         let after = c.read(&tenant(), &region(), &ref_);
-        assert!(after.is_none(), "on erasure the cache re-resolves — never serves the stale title");
+        assert!(
+            after.is_none(),
+            "on erasure the cache re-resolves — never serves the stale title"
+        );
     }
 
     /// **Busting is idempotent — deleting an absent/already-busted entry is a no-op (the invalidator's
@@ -492,10 +543,14 @@ mod tests {
         let c = cache();
         let ref_ = ArtifactRef("myelin://acme/issue/issue/E2".into());
         c.invalidate(&tenant(), &region(), &ref_); // absent
-        c.fill(&tenant(), &region(), &ref_, &projection(&ref_.0, "t")).expect("fill");
+        c.fill(&tenant(), &region(), &ref_, &projection(&ref_.0, "t"))
+            .expect("fill");
         c.invalidate(&tenant(), &region(), &ref_); // present
         c.invalidate(&tenant(), &region(), &ref_); // already busted
-        assert!(c.read(&tenant(), &region(), &ref_).is_none(), "idempotent bust → miss");
+        assert!(
+            c.read(&tenant(), &region(), &ref_).is_none(),
+            "idempotent bust → miss"
+        );
     }
 
     /// **Crypto-shred: destroying the per-tenant DEK makes a cached title UNRECOVERABLE — a read of the
@@ -508,38 +563,85 @@ mod tests {
         let backing = Arc::new(InMemoryCache::new());
         let c = R2ProjectionCache::new(backing, dek.clone());
         let ref_ = ArtifactRef("myelin://acme/issue/issue/ENG-1".into());
-        c.fill(&tenant(), &region(), &ref_, &projection(&ref_.0, "a name in a title")).expect("fill");
-        assert!(c.read(&tenant(), &region(), &ref_).is_some(), "decrypts while the DEK lives");
+        c.fill(
+            &tenant(),
+            &region(),
+            &ref_,
+            &projection(&ref_.0, "a name in a title"),
+        )
+        .expect("fill");
+        assert!(
+            c.read(&tenant(), &region(), &ref_).is_some(),
+            "decrypts while the DEK lives"
+        );
 
         // tenant offboard: destroy the per-tenant DEK (crypto-shred). The blob may still be in the
         // backing store, but it can no longer decrypt.
-        assert!(dek.destroy_tenant_dek(&tenant(), &region()), "the per-tenant DEK is shredded");
+        assert!(
+            dek.destroy_tenant_dek(&tenant(), &region()),
+            "the per-tenant DEK is shredded"
+        );
         let after = c.read(&tenant(), &region(), &ref_);
-        assert!(after.is_none(), "a crypto-shredded title is unrecoverable — a MISS, never plaintext");
+        assert!(
+            after.is_none(),
+            "a crypto-shredded title is unrecoverable — a MISS, never plaintext"
+        );
     }
 
     /// **Every write carries the TTL (the §3.6 bound — the cache self-evicts).** A 0-TTL entry is gone
     /// on the next read (the in-memory floor's deadline is already past), proving the write is bounded.
     #[test]
     fn writes_are_ttl_bounded() {
-        let c = R2ProjectionCache::with_ttl(Arc::new(InMemoryCache::new()), pin(), Duration::from_millis(0));
+        let c = R2ProjectionCache::with_ttl(
+            Arc::new(InMemoryCache::new()),
+            pin(),
+            Duration::from_millis(0),
+        );
         assert_eq!(c.ttl(), Duration::from_millis(0));
         let ref_ = ArtifactRef("myelin://acme/issue/issue/ttl".into());
-        c.fill(&tenant(), &region(), &ref_, &projection(&ref_.0, "ephemeral")).expect("fill");
-        assert!(c.read(&tenant(), &region(), &ref_).is_none(), "a 0-TTL entry self-evicts (bounded)");
-        assert_eq!(R2_DEFAULT_TTL, Duration::from_secs(600), "the default bound is 10 minutes");
+        c.fill(
+            &tenant(),
+            &region(),
+            &ref_,
+            &projection(&ref_.0, "ephemeral"),
+        )
+        .expect("fill");
+        assert!(
+            c.read(&tenant(), &region(), &ref_).is_none(),
+            "a 0-TTL entry self-evicts (bounded)"
+        );
+        assert_eq!(
+            R2_DEFAULT_TTL,
+            Duration::from_secs(600),
+            "the default bound is 10 minutes"
+        );
     }
 
     /// **A non-default (non-zero) TTL is carried verbatim (the bound is the configured value, not a
     /// `Default`).** Pins [`R2ProjectionCache::ttl`] against a mutant that returns `Default::default()`.
     #[test]
     fn ttl_is_the_configured_value_not_default() {
-        let c = R2ProjectionCache::with_ttl(Arc::new(InMemoryCache::new()), pin(), Duration::from_secs(42));
-        assert_eq!(c.ttl(), Duration::from_secs(42), "the configured TTL is carried verbatim");
-        assert_ne!(c.ttl(), Duration::default(), "the TTL is not the Default (0)");
+        let c = R2ProjectionCache::with_ttl(
+            Arc::new(InMemoryCache::new()),
+            pin(),
+            Duration::from_secs(42),
+        );
+        assert_eq!(
+            c.ttl(),
+            Duration::from_secs(42),
+            "the configured TTL is carried verbatim"
+        );
+        assert_ne!(
+            c.ttl(),
+            Duration::default(),
+            "the TTL is not the Default (0)"
+        );
         // the default constructor carries the named 10-minute bound (a real, non-zero TTL).
         assert_eq!(cache().ttl(), R2_DEFAULT_TTL);
-        assert!(cache().ttl() > Duration::ZERO, "the default bound is a real non-zero TTL");
+        assert!(
+            cache().ttl() > Duration::ZERO,
+            "the default bound is a real non-zero TTL"
+        );
     }
 
     /// **A truncated blob (shorter than the nonce) is a clean MISS, never a panic/plaintext.** Pins the
@@ -554,16 +656,32 @@ mod tests {
         // a blob SHORTER than NONCE_LEN (can't even hold a nonce) → decode returns None at the length
         // guard, never indexing past the slice.
         backing
-            .set(&tenant(), &R2ProjectionCache::cache_key(&ref_), &[0u8; NONCE_LEN - 1], Duration::from_secs(60))
+            .set(
+                &tenant(),
+                &R2ProjectionCache::cache_key(&ref_),
+                &[0u8; NONCE_LEN - 1],
+                Duration::from_secs(60),
+            )
             .expect("write a short blob");
-        assert!(c.read(&tenant(), &region(), &ref_).is_none(), "a sub-nonce blob is a clean MISS");
+        assert!(
+            c.read(&tenant(), &region(), &ref_).is_none(),
+            "a sub-nonce blob is a clean MISS"
+        );
 
         // a blob EXACTLY NONCE_LEN (a nonce + empty ciphertext) is also a MISS (an empty ct never
         // authenticates) — but it must reach `open`, not the length guard, and still not panic.
         backing
-            .set(&tenant(), &R2ProjectionCache::cache_key(&ref_), &[0u8; NONCE_LEN], Duration::from_secs(60))
+            .set(
+                &tenant(),
+                &R2ProjectionCache::cache_key(&ref_),
+                &[0u8; NONCE_LEN],
+                Duration::from_secs(60),
+            )
             .expect("write an exact-nonce blob");
-        assert!(c.read(&tenant(), &region(), &ref_).is_none(), "an exact-nonce (empty-ct) blob is a MISS");
+        assert!(
+            c.read(&tenant(), &region(), &ref_).is_none(),
+            "an exact-nonce (empty-ct) blob is a MISS"
+        );
     }
 
     /// **The fill error renders a loud, descriptive message (Display is real, not a `Default`).**
@@ -571,8 +689,14 @@ mod tests {
     fn cache_fill_error_display_is_loud() {
         let e = CacheFillError("cache set: unreachable".into());
         let s = format!("{e}");
-        assert!(s.contains("R2 cache fill error"), "the error names itself: {s}");
-        assert!(s.contains("unreachable"), "the error carries the cause: {s}");
+        assert!(
+            s.contains("R2 cache fill error"),
+            "the error names itself: {s}"
+        );
+        assert!(
+            s.contains("unreachable"),
+            "the error carries the cause: {s}"
+        );
     }
 
     /// **Tenants are isolated — tenant B never reads tenant A's cached projection (the
@@ -581,7 +705,13 @@ mod tests {
     fn tenants_are_isolated() {
         let c = cache();
         let ref_ = ArtifactRef("myelin://acme/issue/issue/shared".into());
-        c.fill(&TenantId("a".into()), &region(), &ref_, &projection(&ref_.0, "a's title")).expect("fill");
+        c.fill(
+            &TenantId("a".into()),
+            &region(),
+            &ref_,
+            &projection(&ref_.0, "a's title"),
+        )
+        .expect("fill");
         // tenant B, SAME ref → a MISS (no cross-tenant cache path).
         assert!(
             c.read(&TenantId("b".into()), &region(), &ref_).is_none(),
@@ -595,13 +725,25 @@ mod tests {
     fn hit_ratio_is_true_division() {
         let c = cache();
         let ref_ = ArtifactRef("myelin://acme/issue/issue/r".into());
-        c.fill(&tenant(), &region(), &ref_, &projection(&ref_.0, "t")).expect("fill");
+        c.fill(&tenant(), &region(), &ref_, &projection(&ref_.0, "t"))
+            .expect("fill");
         c.read(&tenant(), &region(), &ref_); // hit
         c.read(&tenant(), &region(), &ref_); // hit
-        c.read(&tenant(), &region(), &ArtifactRef("myelin://acme/issue/issue/absent".into())); // miss
+        c.read(
+            &tenant(),
+            &region(),
+            &ArtifactRef("myelin://acme/issue/issue/absent".into()),
+        ); // miss
         assert_eq!(c.counters(), (2, 1, 1));
-        assert_eq!(c.hit_ratio(), Some(2.0 / 3.0), "the ratio is the true division");
-        assert_eq!(R2ProjectionCache::HIT_RATIO_SIGNAL, "resolve_cache_hit_ratio");
+        assert_eq!(
+            c.hit_ratio(),
+            Some(2.0 / 3.0),
+            "the ratio is the true division"
+        );
+        assert_eq!(
+            R2ProjectionCache::HIT_RATIO_SIGNAL,
+            "resolve_cache_hit_ratio"
+        );
     }
 
     /// **A sub-anchored projection (flag = Moved) round-trips intact (the §4.6 flag survives the
@@ -614,7 +756,11 @@ mod tests {
         p.sub_anchor = Some("block-9".into());
         p.flag = Some(ProjectionFlag::Moved);
         c.fill(&tenant(), &region(), &ref_, &p).expect("fill");
-        assert_eq!(c.read(&tenant(), &region(), &ref_), Some(p), "the #sub + flag survive the codec");
+        assert_eq!(
+            c.read(&tenant(), &region(), &ref_),
+            Some(p),
+            "the #sub + flag survive the codec"
+        );
     }
 
     /// **The live cache plugs into the REF-P7 invalidator UNCHANGED (the shim swap).** The invalidator
@@ -624,7 +770,8 @@ mod tests {
     fn live_cache_plugs_into_the_ref_p7_invalidator() {
         let c = cache();
         let ref_ = ArtifactRef("myelin://acme/issue/issue/ENG-1".into());
-        c.fill(&tenant(), &region(), &ref_, &projection(&ref_.0, "v1")).expect("fill");
+        c.fill(&tenant(), &region(), &ref_, &projection(&ref_.0, "v1"))
+            .expect("fill");
 
         // the SAME invalidator from REF-P7, now over the LIVE cache (not the shim).
         use myelin_events::EventHandler;
@@ -635,6 +782,9 @@ mod tests {
             myelin_events::HandleOutcome::Done,
             "the invalidator busts the live entry"
         );
-        assert!(c.read(&tenant(), &region(), &ref_).is_none(), "the live entry was busted, not recorded");
+        assert!(
+            c.read(&tenant(), &region(), &ref_).is_none(),
+            "the live entry was busted, not recorded"
+        );
     }
 }

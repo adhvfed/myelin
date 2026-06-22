@@ -158,7 +158,10 @@ impl std::fmt::Display for CallError {
                 message,
                 retry_after_ms,
             } => match retry_after_ms {
-                Some(ms) => write!(f, "resilient-client: downstream error ({message}); retry-after {ms}ms"),
+                Some(ms) => write!(
+                    f,
+                    "resilient-client: downstream error ({message}); retry-after {ms}ms"
+                ),
                 None => write!(f, "resilient-client: downstream error ({message})"),
             },
         }
@@ -936,8 +939,7 @@ mod tests {
             self.now.load(Ordering::SeqCst)
         }
         fn sleep(&self, dur: Duration) {
-            self.now
-                .fetch_add(dur.as_millis() as u64, Ordering::SeqCst);
+            self.now.fetch_add(dur.as_millis() as u64, Ordering::SeqCst);
         }
     }
 
@@ -1031,7 +1033,11 @@ mod tests {
         });
         // First attempt fails and trips the breaker; every remaining "retry" is refused by
         // the open breaker, so the downstream is invoked EXACTLY once despite max_attempts=5.
-        assert_eq!(calls.get(), 1, "retry must not pass through the tripped breaker");
+        assert_eq!(
+            calls.get(),
+            1,
+            "retry must not pass through the tripped breaker"
+        );
         assert!(res.is_err());
     }
 
@@ -1055,7 +1061,11 @@ mod tests {
                 retry_after_ms: None,
             })
         });
-        assert_eq!(calls.get(), 1, "a NonIdempotent call must be attempted exactly once");
+        assert_eq!(
+            calls.get(),
+            1,
+            "a NonIdempotent call must be attempted exactly once"
+        );
         assert!(res.is_err());
     }
 
@@ -1080,7 +1090,11 @@ mod tests {
                 retry_after_ms: None,
             })
         });
-        assert_eq!(calls.get(), 3, "an Idempotent call retries up to max_attempts");
+        assert_eq!(
+            calls.get(),
+            3,
+            "an Idempotent call retries up to max_attempts"
+        );
         assert!(res.is_err());
     }
 
@@ -1130,7 +1144,9 @@ mod tests {
         let inner_result = Cell::new(None);
         let _ = client.call_op(&target, Idempotency::NonIdempotent, || {
             // While this op runs, the outer call holds the single permit.
-            let r = client.call_op(&target, Idempotency::NonIdempotent, || Ok::<(), CallError>(()));
+            let r = client.call_op(&target, Idempotency::NonIdempotent, || {
+                Ok::<(), CallError>(())
+            });
             inner_result.set(Some(r));
             Ok::<(), CallError>(())
         });
@@ -1168,7 +1184,10 @@ mod tests {
                 retry_after_ms: Some(5_000),
             }),
         );
-        assert!(floored >= 5_000, "Retry-After is the backoff floor ({floored})");
+        assert!(
+            floored >= 5_000,
+            "Retry-After is the backoff floor ({floored})"
+        );
     }
 
     // ---- Primitive (2): the breaker recovers via a half-open probe. ----
@@ -1201,7 +1220,9 @@ mod tests {
         // Advance past the open window so the half-open probe is admitted.
         clock_handle.set(2_000);
         // A successful probe closes the breaker.
-        let res = client.call_op(&target, Idempotency::NonIdempotent, || Ok::<(), CallError>(()));
+        let res = client.call_op(&target, Idempotency::NonIdempotent, || {
+            Ok::<(), CallError>(())
+        });
         assert!(res.is_ok());
         assert_eq!(client.breaker_state(&target), BreakerState::Closed);
     }
@@ -1267,7 +1288,11 @@ mod tests {
             0x6E78_9E6A_A1B9_65F4,
             0x06C4_5D18_8009_454F,
         ];
-        assert_eq!(got, expected.to_vec(), "splitmix64 must match the canonical stream");
+        assert_eq!(
+            got,
+            expected.to_vec(),
+            "splitmix64 must match the canonical stream"
+        );
     }
 
     // ---- Breaker (2): the rolling window is bounded and old outcomes age out. ----
@@ -1292,7 +1317,9 @@ mod tests {
         // closed. If bounded to 4, the last 4 are [ok, ok, fail, fail] = 0.5 < 0.75 → still
         // closed. Either way the count of failures the ratio sees must be window-bounded.
         for _ in 0..10 {
-            let _ = client.call_op(&target, Idempotency::NonIdempotent, || Ok::<(), CallError>(()));
+            let _ = client.call_op(&target, Idempotency::NonIdempotent, || {
+                Ok::<(), CallError>(())
+            });
         }
         for _ in 0..2 {
             let _ = client.call_op(&target, Idempotency::NonIdempotent, || {
@@ -1375,7 +1402,11 @@ mod tests {
             clock_handle.set(200);
             Ok(())
         });
-        assert_eq!(res, Err(CallError::Timeout), "an Ok that overran the deadline is a Timeout");
+        assert_eq!(
+            res,
+            Err(CallError::Timeout),
+            "an Ok that overran the deadline is a Timeout"
+        );
     }
 
     // ---- Retry (4): backoff happens BETWEEN attempts and the cap widens per retry. ----
@@ -1427,7 +1458,11 @@ mod tests {
         // 4 attempts → 3 backoffs (one between each pair of attempts). If the backoff block
         // were skipped (attempts_done>0 flipped), there would be ZERO sleeps.
         let recorded = sleeps.lock().unwrap().clone();
-        assert_eq!(recorded.len(), 3, "exactly one backoff between each pair of attempts");
+        assert_eq!(
+            recorded.len(),
+            3,
+            "exactly one backoff between each pair of attempts"
+        );
         // The cap widens: retry 0 → base*1, retry 1 → base*2, retry 2 → base*4 (the
         // attempts_done-1 index feeds the exponent; a wrong index breaks this progression).
         assert_eq!(recorded, vec![10, 20, 40]);
@@ -1513,18 +1548,40 @@ mod tests {
         assert_eq!(parse_retry_after(Some("120")), RetryAfter::DeltaMs(120_000));
         assert_eq!(parse_retry_after(Some("0")), RetryAfter::DeltaMs(0));
         // Surrounding whitespace (a wire header often carries it) is trimmed.
-        assert_eq!(parse_retry_after(Some("  30 ")), RetryAfter::DeltaMs(30_000));
+        assert_eq!(
+            parse_retry_after(Some("  30 ")),
+            RetryAfter::DeltaMs(30_000)
+        );
         assert!(RetryAfter::DeltaMs(30_000).is_present());
         assert_eq!(RetryAfter::DeltaMs(30_000).floor_ms(9_999), 30_000);
 
         // An HTTP-date / malformed / signed / empty value → Unparseable: PRESENT but unresolved
         // (never silently dropped to "no floor"). It floors at the WHOLE open window (the
         // conservative, never-fail-open choice — back off MORE on an ambiguous signal).
-        for bad in ["Wed, 21 Oct 2026 07:28:00 GMT", "-5", "+5", "12.5", "soon", "", "  "] {
+        for bad in [
+            "Wed, 21 Oct 2026 07:28:00 GMT",
+            "-5",
+            "+5",
+            "12.5",
+            "soon",
+            "",
+            "  ",
+        ] {
             let ra = parse_retry_after(Some(bad));
-            assert_eq!(ra, RetryAfter::Unparseable, "{bad:?} must be Unparseable, not honoured-as-zero");
-            assert!(ra.is_present(), "an Unparseable Retry-After is PRESENT (a non-zero floor)");
-            assert_eq!(ra.floor_ms(7_000), 7_000, "Unparseable floors at the whole open window");
+            assert_eq!(
+                ra,
+                RetryAfter::Unparseable,
+                "{bad:?} must be Unparseable, not honoured-as-zero"
+            );
+            assert!(
+                ra.is_present(),
+                "an Unparseable Retry-After is PRESENT (a non-zero floor)"
+            );
+            assert_eq!(
+                ra.floor_ms(7_000),
+                7_000,
+                "Unparseable floors at the whole open window"
+            );
         }
         // A colossal all-digit value saturates rather than dropping the floor.
         assert_eq!(
@@ -1581,7 +1638,10 @@ mod tests {
         let recorded = sleeps.lock().unwrap().clone();
         assert_eq!(recorded.len(), 2, "3 attempts → 2 backoffs");
         for s in &recorded {
-            assert!(*s >= 5_000, "every backoff is floored at the Retry-After (5000ms), got {s}");
+            assert!(
+                *s >= 5_000,
+                "every backoff is floored at the Retry-After (5000ms), got {s}"
+            );
         }
         // The honour was recorded on the producer signal (the SUB-D5 issuance/honour signal).
         // EXACT count (3 attempts → 2 floored backoffs): pins the counter to a value != 1, so
@@ -1600,7 +1660,7 @@ mod tests {
     #[test]
     fn tripped_breaker_with_retry_after_fails_fast_no_amplification() {
         let cfg = ResilientConfig {
-            max_attempts: 5,           // would retry 5× if unguarded — the amplifier
+            max_attempts: 5, // would retry 5× if unguarded — the amplifier
             breaker_min_requests: 1,
             breaker_failure_ratio: 1.0,
             breaker_window: 4,
@@ -1622,7 +1682,11 @@ mod tests {
         });
         // The first attempt fails and trips the breaker; every "retry" is refused by the open
         // breaker — the downstream is invoked EXACTLY once despite max_attempts=5.
-        assert_eq!(calls.get(), 1, "no retry passes through the tripped breaker");
+        assert_eq!(
+            calls.get(),
+            1,
+            "no retry passes through the tripped breaker"
+        );
         assert!(matches!(res, Err(CallError::BreakerOpen { .. })) || res.is_err());
         assert_eq!(client.breaker_state(&target), BreakerState::Open);
         // THE no-amplification invariant: zero retries reached the downstream through the open
@@ -1695,9 +1759,19 @@ mod tests {
         // then the breaker tripped and stopped further retries — the downstream was hit only
         // until the breaker opened, NEVER the full max_attempts (no amplification).
         let hits = HITS.with(|c| c.get());
-        assert!(hits <= 2, "the consumer must not amplify load past the breaker trip (hits={hits})");
-        assert!(client.retry_after_honoured() >= 1, "the consumer honoured the issued Retry-After");
-        assert_eq!(client.retry_through_tripped(), 0, "no retry through the tripped breaker");
+        assert!(
+            hits <= 2,
+            "the consumer must not amplify load past the breaker trip (hits={hits})"
+        );
+        assert!(
+            client.retry_after_honoured() >= 1,
+            "the consumer honoured the issued Retry-After"
+        );
+        assert_eq!(
+            client.retry_through_tripped(),
+            0,
+            "no retry through the tripped breaker"
+        );
     }
 
     // ---- A FIRST-attempt breaker refusal is NOT a retry refusal (`attempts_done > 0`). ----
@@ -1767,7 +1841,13 @@ mod tests {
             retry_after_of(&Some(CallError::BreakerOpen { retry_after_ms: 9 })),
             RetryAfter::Absent
         );
-        assert_eq!(retry_after_of(&Some(CallError::BulkheadFull)), RetryAfter::Absent);
-        assert_eq!(retry_after_of(&Some(CallError::Timeout)), RetryAfter::Absent);
+        assert_eq!(
+            retry_after_of(&Some(CallError::BulkheadFull)),
+            RetryAfter::Absent
+        );
+        assert_eq!(
+            retry_after_of(&Some(CallError::Timeout)),
+            RetryAfter::Absent
+        );
     }
 }

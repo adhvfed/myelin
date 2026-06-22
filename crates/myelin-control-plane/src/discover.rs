@@ -180,8 +180,14 @@ impl<C: Clock> std::fmt::Debug for DiscoveryCache<C> {
         // Mirrors `FailStatic`'s Debug discipline: print the signal counters + the inner window, but
         // NEVER the cached routes (they are routing facts, kept off the log surface).
         f.debug_struct("DiscoveryCache")
-            .field("discovery_cache_hit", &self.discovery_cache_hit.load(Ordering::SeqCst))
-            .field("misroute_count", &self.misroute_count.load(Ordering::SeqCst))
+            .field(
+                "discovery_cache_hit",
+                &self.discovery_cache_hit.load(Ordering::SeqCst),
+            )
+            .field(
+                "misroute_count",
+                &self.misroute_count.load(Ordering::SeqCst),
+            )
             .field("inner", &self.inner)
             .finish()
     }
@@ -265,7 +271,9 @@ impl<C: Clock> DiscoveryCache<C> {
             // DIFFERENT key — and record the misroute below.
             Ok(None) => {
                 reached_upstream.set(true);
-                Err(ServeError("misroute: unknown tenant/slug (no route)".into()))
+                Err(ServeError(
+                    "misroute: unknown tenant/slug (no route)".into(),
+                ))
             }
             // The CP is unreachable → a routing hiccup (fail-static covers it).
             Err(e) => Err(e),
@@ -306,14 +314,19 @@ impl<C: Clock> DiscoveryCache<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{Capacity, Cell, CellStatus, IsolationKind, PlacementStatus, TenantPlacement};
+    use crate::schema::{
+        Capacity, Cell, CellStatus, IsolationKind, PlacementStatus, TenantPlacement,
+    };
     use myelin_substrate::TestClock;
 
     /// The bound the discovery-cache drills construct against: agent-token TTL = 60s (lower),
     /// revocation SLA = 300s (upper). The discovery `fresh_ttl` (the route TTL) and `static_max` (the
     /// routing staleness budget) sit inside it.
     fn drill_bound() -> StalenessBound {
-        StalenessBound { revocation_sla_secs: 300, agent_token_ttl_secs: 60 }
+        StalenessBound {
+            revocation_sla_secs: 300,
+            agent_token_ttl_secs: 60,
+        }
     }
 
     fn cell(id: &str, region: &str) -> Cell {
@@ -322,7 +335,11 @@ mod tests {
             region: Region::new(region),
             status: CellStatus::Active,
             isolation_kind: IsolationKind::Pool,
-            capacity: Capacity { tenants_max: 1000, write_qps_max: 5000, storage_bytes_max: 1 << 40 },
+            capacity: Capacity {
+                tenants_max: 1000,
+                write_qps_max: 5000,
+                storage_bytes_max: 1 << 40,
+            },
             utilisation: 10,
             version: 1,
             endpoint: format!("cell.{region}.myelin.eu"),
@@ -374,21 +391,34 @@ mod tests {
         let by_id = reg
             .discover(&DiscoverKey::TenantId(TenantId::from_token("01J0ACME")), 30)
             .expect("the opaque id resolves to a route");
-        assert_eq!(by_slug, by_id, "the slug and the tenant id resolve the SAME route");
+        assert_eq!(
+            by_slug, by_id,
+            "the slug and the tenant id resolve the SAME route"
+        );
     }
 
     /// An unknown tenant/slug resolves to NO route (the caller treats this as a misroute).
     #[test]
     fn discover_unknown_key_returns_none() {
         let reg = placed_registry();
-        assert!(reg.discover(&DiscoverKey::TenantId(TenantId::from_token("01J0GHOST")), 30).is_none());
-        assert!(reg.discover(&DiscoverKey::Slug("ghost".into()), 30).is_none());
+        assert!(reg
+            .discover(
+                &DiscoverKey::TenantId(TenantId::from_token("01J0GHOST")),
+                30
+            )
+            .is_none());
+        assert!(reg
+            .discover(&DiscoverKey::Slug("ghost".into()), 30)
+            .is_none());
     }
 
     /// **The key KIND is reported PII-free** (the telemetry logs the kind, never the value).
     #[test]
     fn discover_key_kind_is_pii_free() {
-        assert_eq!(DiscoverKey::TenantId(TenantId::from_token("01J0ACME")).kind(), "tenant_id");
+        assert_eq!(
+            DiscoverKey::TenantId(TenantId::from_token("01J0ACME")).kind(),
+            "tenant_id"
+        );
         assert_eq!(DiscoverKey::Slug("acme".into()).kind(), "slug");
     }
 
@@ -401,14 +431,19 @@ mod tests {
     fn cache_serves_fresh_within_ttl_and_increments_cache_hit() {
         let reg = placed_registry();
         let key = DiscoverKey::TenantId(TenantId::from_token("01J0ACME"));
-        let cache = DiscoveryCache::try_new_with_clock(30, 300, drill_bound(), TestClock::at(1_000))
-            .expect("valid bound");
+        let cache =
+            DiscoveryCache::try_new_with_clock(30, 300, drill_bound(), TestClock::at(1_000))
+                .expect("valid bound");
 
         // First resolve: the CP is reached (fresh upstream read) → NOT a cache hit.
         let cp = |k: &DiscoverKey| Ok(reg.discover(k, 30));
         let a = cache.resolve(&key, cp);
         assert!(a.is_fresh());
-        assert_eq!(cache.signals().discovery_cache_hit, 0, "the first read is authoritative, not a hit");
+        assert_eq!(
+            cache.signals().discovery_cache_hit,
+            0,
+            "the first read is authoritative, not a hit"
+        );
 
         // Within fresh_ttl: serve fresh-from-cache WITHOUT reaching the CP (the CP is now unreachable
         // — but the cached route is still fresh, so routing does not even need the CP). → a cache hit.
@@ -416,7 +451,11 @@ mod tests {
         let unreachable = |_: &DiscoverKey| Err(ServeError("control plane unreachable".into()));
         let b = cache.resolve(&key, unreachable);
         assert!(b.is_fresh(), "within the TTL the cached route is fresh");
-        assert_eq!(cache.signals().discovery_cache_hit, 1, "a fresh-from-cache serve is a cache hit");
+        assert_eq!(
+            cache.signals().discovery_cache_hit,
+            1,
+            "a fresh-from-cache serve is a cache hit"
+        );
     }
 
     /// **THE FAIL-STATIC ROUTING LEG (architecture §7.3; contract 1.10; the CP-D4 re-confirm seed):**
@@ -439,16 +478,30 @@ mod tests {
         clock_advance(&cache, 100);
         let unreachable = |_: &DiscoverKey| Err(ServeError("control plane hard-down".into()));
         let stale = cache.resolve(&key, unreachable);
-        assert!(stale.is_degraded(), "a CP outage serves the route fail-static (degraded), not closed");
+        assert!(
+            stale.is_degraded(),
+            "a CP outage serves the route fail-static (degraded), not closed"
+        );
         if let Answer::Static(route) = &stale {
-            assert_eq!(route.cell_id.as_str(), "cell-w-1", "the last-known-good route is served");
+            assert_eq!(
+                route.cell_id.as_str(),
+                "cell-w-1",
+                "the last-known-good route is served"
+            );
         }
-        assert_eq!(cache.signals().discovery_cache_hit, 1, "the fail-static serve is a cache hit");
+        assert_eq!(
+            cache.signals().discovery_cache_hit,
+            1,
+            "the fail-static serve is a cache hit"
+        );
 
         // Past the staleness budget (age 301 > static_max 300): fail CLOSED — the route is genuinely
         // unknown now and the client must re-discover. NEVER a fabricated route, NEVER fail-open.
         clock_advance(&cache, 201);
-        assert!(cache.resolve(&key, unreachable).is_closed(), "past the budget routing fails closed");
+        assert!(
+            cache.resolve(&key, unreachable).is_closed(),
+            "past the budget routing fails closed"
+        );
     }
 
     /// **A misroute (the CP authoritatively says "no such tenant/slug") increments `misroute_count`
@@ -463,9 +516,20 @@ mod tests {
             .expect("valid bound");
         // The CP is reached and answers "unknown" (None) → a misroute, no route served.
         let answer = cache.resolve(&key, |k| Ok(reg.discover(k, 30)));
-        assert!(answer.is_closed(), "an unknown tenant has no route (closed, never fabricated)");
-        assert_eq!(cache.signals().misroute_count, 1, "the CP-said-unknown case is a misroute");
-        assert_eq!(cache.signals().discovery_cache_hit, 0, "a misroute is not a cache hit");
+        assert!(
+            answer.is_closed(),
+            "an unknown tenant has no route (closed, never fabricated)"
+        );
+        assert_eq!(
+            cache.signals().misroute_count,
+            1,
+            "the CP-said-unknown case is a misroute"
+        );
+        assert_eq!(
+            cache.signals().discovery_cache_hit,
+            0,
+            "a misroute is not a cache hit"
+        );
     }
 
     /// A `Closed` answer when the CP is UNREACHABLE and the cache is empty/expired is NOT a misroute
@@ -480,7 +544,11 @@ mod tests {
         // CP never authoritatively said "unknown", so it is NOT a misroute.
         let unreachable = |_: &DiscoverKey| Err(ServeError("cp down".into()));
         assert!(cache.resolve(&key, unreachable).is_closed());
-        assert_eq!(cache.signals().misroute_count, 0, "an unreachable CP is not a misroute");
+        assert_eq!(
+            cache.signals().misroute_count,
+            0,
+            "an unreachable CP is not a misroute"
+        );
         assert_eq!(cache.signals().discovery_cache_hit, 0);
     }
 
@@ -491,7 +559,13 @@ mod tests {
     fn cache_rejects_a_staleness_budget_over_the_revocation_sla() {
         let err = DiscoveryCache::try_new(30, 301, drill_bound())
             .expect_err("static_max 301 > revocation SLA 300 is rejected");
-        assert_eq!(err, FailStaticError::ExceedsRevocationSla { static_max: 301, revocation_sla: 300 });
+        assert_eq!(
+            err,
+            FailStaticError::ExceedsRevocationSla {
+                static_max: 301,
+                revocation_sla: 300
+            }
+        );
     }
 
     /// Helper: advance the discovery cache's `TestClock` across a boundary.

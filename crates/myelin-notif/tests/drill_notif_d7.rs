@@ -82,9 +82,16 @@ fn notif_d7_kill_mid_ack_window_pages_next_step_exactly_once_then_ack_halts() {
             false,
         )
         .expect("page starts the chain");
-    assert_eq!(first.principal, pid("psn:alice"), "the first page reaches the on-call AT FIRE TIME");
+    assert_eq!(
+        first.principal,
+        pid("psn:alice"),
+        "the first page reaches the on-call AT FIRE TIME"
+    );
     assert_eq!(first.walk, 0);
-    assert!(wheel.has_timer(&run_id), "the ack_window DURABLE timer is armed");
+    assert!(
+        wheel.has_timer(&run_id),
+        "the ack_window DURABLE timer is armed"
+    );
 
     // === THE KILL: drop engine A mid-ack_window (no ack yet). The wheel + outbox + run row survive. ===
     drop(eng_a);
@@ -108,35 +115,64 @@ fn notif_d7_kill_mid_ack_window_pages_next_step_exactly_once_then_ack_halts() {
         .advance(&run_id, Some(&schedule()), 600, &never_quiet, false)
         .expect("advance ok")
         .expect("the resumed chain pages the next step (NOT zero)");
-    assert_eq!(next.principal, pid("psn:lead"), "the next step (the secondary lead)");
+    assert_eq!(
+        next.principal,
+        pid("psn:lead"),
+        "the next step (the secondary lead)"
+    );
     assert_eq!(next.walk, 1);
 
     // 0 DUPLICATE: a replayed fire (a second restart over the already-fired timer) pages NOTHING.
     let replay = eng_b
         .advance(&run_id, Some(&schedule()), 600, &never_quiet, false)
         .expect("advance ok");
-    assert_eq!(replay, None, "a replayed timer fire is a no-op — 0 duplicate page (NOTIF-D7)");
+    assert_eq!(
+        replay, None,
+        "a replayed timer fire is a no-op — 0 duplicate page (NOTIF-D7)"
+    );
 
     // exactly-once: the page log holds EXACTLY two entries (step 0, step 1) — 0 missed, 0 duplicate.
     let run = eng_b.run(&run_id).expect("run present");
-    assert_eq!(run.pages.len(), 2, "exactly two pages across the kill/resume — 0 missed, 0 duplicate");
+    assert_eq!(
+        run.pages.len(),
+        2,
+        "exactly two pages across the kill/resume — 0 missed, 0 duplicate"
+    );
 
     // === the ack HALTS the chain (ack-as-event via the outbox; the signal-wait resolves) ===
     let acked = Timestamp("2026-06-20T12:15:00Z".into());
-    assert!(eng_b.ack(&run_id, pid("psn:lead"), acked.clone()).expect("ack ok"), "the ack halts");
+    assert!(
+        eng_b
+            .ack(&run_id, pid("psn:lead"), acked.clone())
+            .expect("ack ok"),
+        "the ack halts"
+    );
     let run = eng_b.run(&run_id).expect("run present");
     assert_eq!(run.state, RunState::Acked, "the chain HALTED on the ack");
-    assert!(!eng_b.wheel().has_timer(&run_id), "the ack cancelled the durable timer");
+    assert!(
+        !eng_b.wheel().has_timer(&run_id),
+        "the ack cancelled the durable timer"
+    );
 
     // ack-halt: a subsequent timer fire after the ack pages NOTHING (the chain is halted).
     let after_ack = eng_b
         .advance(&run_id, Some(&schedule()), 600, &never_quiet, false)
         .expect("advance ok");
-    assert_eq!(after_ack, None, "no page after the ack — the chain is stopped");
-    assert_eq!(eng_b.run(&run_id).unwrap().pages.len(), 2, "still exactly two pages (ack-halt)");
+    assert_eq!(
+        after_ack, None,
+        "no page after the ack — the chain is stopped"
+    );
+    assert_eq!(
+        eng_b.run(&run_id).unwrap().pages.len(),
+        2,
+        "still exactly two pages (ack-halt)"
+    );
 
     // idempotent ack: a double-ack acks ONCE — exactly ONE notif.escalation.acked committed.
-    assert!(!eng_b.ack(&run_id, pid("psn:other"), acked).expect("ack ok"), "the re-ack is a no-op");
+    assert!(
+        !eng_b.ack(&run_id, pid("psn:other"), acked).expect("ack ok"),
+        "the re-ack is a no-op"
+    );
     assert_eq!(
         outbox.committed_count(),
         1,

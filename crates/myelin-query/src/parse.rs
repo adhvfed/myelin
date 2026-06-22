@@ -79,11 +79,16 @@ impl std::fmt::Display for ParseError {
                 write!(f, "expected {what}, found {found:?}")
             }
             ParseError::UnexpectedEof => write!(f, "unexpected end of input"),
-            ParseError::TrailingInput { rest } => write!(f, "trailing input after expression: {rest:?}"),
+            ParseError::TrailingInput { rest } => {
+                write!(f, "trailing input after expression: {rest:?}")
+            }
             ParseError::UnterminatedString => write!(f, "unterminated string literal"),
             ParseError::BadInt { text } => write!(f, "integer literal out of range: {text:?}"),
             ParseError::TooDeep => {
-                write!(f, "expression nesting exceeds the parse-depth ceiling ({MAX_PARSE_DEPTH})")
+                write!(
+                    f,
+                    "expression nesting exceeds the parse-depth ceiling ({MAX_PARSE_DEPTH})"
+                )
             }
             ParseError::Oversized(e) => write!(f, "parsed predicate is over budget: {e}"),
         }
@@ -109,11 +114,19 @@ pub fn parse_query(src: &str) -> Result<QueryAst, ParseError> {
 /// retaining the source). Used by [`parse_query`] and exposed for callers that want the tree.
 pub fn parse_predicate(src: &str) -> Result<Predicate, ParseError> {
     let tokens = lex(src)?;
-    let mut p = Parser { tokens: &tokens, pos: 0, depth: 0 };
+    let mut p = Parser {
+        tokens: &tokens,
+        pos: 0,
+        depth: 0,
+    };
     let pred = p.parse_or()?;
     if p.pos != p.tokens.len() {
         return Err(ParseError::TrailingInput {
-            rest: p.tokens[p.pos..].iter().map(|t| t.text()).collect::<Vec<_>>().join(" "),
+            rest: p.tokens[p.pos..]
+                .iter()
+                .map(|t| t.text())
+                .collect::<Vec<_>>()
+                .join(" "),
         });
     }
     Ok(pred)
@@ -186,7 +199,10 @@ fn lex(src: &str) -> Result<Vec<Tok>, ParseError> {
                     out.push(Tok::Eq);
                     i += 2;
                 } else {
-                    return Err(ParseError::Expected { what: "`==`", found: "=".into() });
+                    return Err(ParseError::Expected {
+                        what: "`==`",
+                        found: "=".into(),
+                    });
                 }
             }
             b'!' => {
@@ -306,10 +322,15 @@ fn lex_int(src: &str, bytes: &[u8], start: usize) -> Result<(i64, usize), ParseE
     }
     if i == digits_start {
         // A lone `-` with no digits.
-        return Err(ParseError::Expected { what: "an integer", found: "-".into() });
+        return Err(ParseError::Expected {
+            what: "an integer",
+            found: "-".into(),
+        });
     }
     let text = &src[start..i];
-    let n = text.parse::<i64>().map_err(|_| ParseError::BadInt { text: text.into() })?;
+    let n = text
+        .parse::<i64>()
+        .map_err(|_| ParseError::BadInt { text: text.into() })?;
     Ok((n, i))
 }
 
@@ -568,8 +589,14 @@ mod tests {
 
     #[test]
     fn parses_not_and_bang() {
-        assert_eq!(parse_query("NOT status == 'closed'").unwrap().eval(&ctx()), Ok(true));
-        assert_eq!(parse_query("!(severity > 10)").unwrap().eval(&ctx()), Ok(true));
+        assert_eq!(
+            parse_query("NOT status == 'closed'").unwrap().eval(&ctx()),
+            Ok(true)
+        );
+        assert_eq!(
+            parse_query("!(severity > 10)").unwrap().eval(&ctx()),
+            Ok(true)
+        );
     }
 
     #[test]
@@ -581,8 +608,14 @@ mod tests {
 
     #[test]
     fn parses_true_false_constants() {
-        assert_eq!(parse_query("true").unwrap().eval(&EvalContext::new()), Ok(true));
-        assert_eq!(parse_query("false").unwrap().eval(&EvalContext::new()), Ok(false));
+        assert_eq!(
+            parse_query("true").unwrap().eval(&EvalContext::new()),
+            Ok(true)
+        );
+        assert_eq!(
+            parse_query("false").unwrap().eval(&EvalContext::new()),
+            Ok(false)
+        );
     }
 
     #[test]
@@ -598,26 +631,37 @@ mod tests {
         let ast = parse_query("status == 'open'").unwrap();
         assert_eq!(
             ast.eval(&EvalContext::new()),
-            Err(EvalError::MissingContext { name: "status".into() })
+            Err(EvalError::MissingContext {
+                name: "status".into()
+            })
         );
     }
 
     #[test]
     fn rejects_trailing_input() {
         let err = parse_query("status == 'open' garbage").unwrap_err();
-        assert!(matches!(err, ParseError::TrailingInput { .. }), "got {err:?}");
+        assert!(
+            matches!(err, ParseError::TrailingInput { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]
     fn rejects_unterminated_string() {
-        assert_eq!(parse_query("status == 'open").unwrap_err(), ParseError::UnterminatedString);
+        assert_eq!(
+            parse_query("status == 'open").unwrap_err(),
+            ParseError::UnterminatedString
+        );
     }
 
     #[test]
     fn rejects_unexpected_char() {
         let err = parse_query("status == 'open' & flag").unwrap_err();
         // `&` alone is not a token (only `&&` would be, which we do not accept — use AND).
-        assert!(matches!(err, ParseError::UnexpectedChar { ch: '&', .. }), "got {err:?}");
+        assert!(
+            matches!(err, ParseError::UnexpectedChar { ch: '&', .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -652,10 +696,14 @@ mod tests {
     fn oversized_flat_expression_rejected_after_parse() {
         // A long flat OR chain that blows the node budget but stays shallow (so the depth guard
         // does NOT catch it — only the node re-validation does).
-        let chain =
-            std::iter::repeat_n("status == 'x'", crate::MAX_PREDICATE_NODES).collect::<Vec<_>>().join(" OR ");
+        let chain = std::iter::repeat_n("status == 'x'", crate::MAX_PREDICATE_NODES)
+            .collect::<Vec<_>>()
+            .join(" OR ");
         let err = parse_query(&chain).unwrap_err();
-        assert!(matches!(err, ParseError::Oversized(PredicateError::TooLarge { .. })), "got {err:?}");
+        assert!(
+            matches!(err, ParseError::Oversized(PredicateError::TooLarge { .. })),
+            "got {err:?}"
+        );
 
         // The green half: a handful of conjoined comparisons parses + validates fine.
         let ok = "status == 'open' AND severity >= 1 AND flag == true";

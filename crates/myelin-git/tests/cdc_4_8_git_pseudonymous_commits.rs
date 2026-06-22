@@ -89,11 +89,8 @@ fn cdc_4_8_provider_consumer_pseudonymous_commit_erase_residual() {
     let tenant = "acme";
 
     // PROVIDER: mint the pseudonymous-by-default commit + its out-of-band authz attribution.
-    let commit = provider_mints_pseudonymous_commit(
-        pseudonym,
-        tenant,
-        "feat: paginate the ref list\n",
-    );
+    let commit =
+        provider_mints_pseudonymous_commit(pseudonym, tenant, "feat: paginate the ref list\n");
     let attribution = provider_attribution(&commit, pseudonym, tenant);
 
     // The bytes carry EXACTLY the frozen grammar for both author and committer (one rendering).

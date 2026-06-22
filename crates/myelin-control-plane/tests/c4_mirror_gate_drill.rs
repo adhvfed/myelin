@@ -64,7 +64,11 @@ fn cell(id: &str, region: &str) -> Cell {
         region: Region::new(region),
         status: CellStatus::Active,
         isolation_kind: IsolationKind::Pool,
-        capacity: Capacity { tenants_max: 1000, write_qps_max: 5000, storage_bytes_max: 1 << 40 },
+        capacity: Capacity {
+            tenants_max: 1000,
+            write_qps_max: 5000,
+            storage_bytes_max: 1 << 40,
+        },
         utilisation: 10,
         version: 1,
         endpoint: format!("cell.{region}.{id}.myelin.eu"),
@@ -91,7 +95,9 @@ struct MirrorProducer {
 }
 impl MirrorProducer {
     fn new() -> MirrorProducer {
-        MirrorProducer { pushes_to_foreign: 0 }
+        MirrorProducer {
+            pushes_to_foreign: 0,
+        }
     }
     fn attempt(
         &mut self,
@@ -141,22 +147,30 @@ fn c4_mirror_gate_drill() {
 
     // ── GREEN leg 1 — a SAME-REGION mirror (fr-par → fr-par): no crossing, allowed. ──
     let same = MirrorTarget::new("git.acme.internal.fr", Region::new("fr-par"));
-    assert!(producer.attempt(&mut gate, &reg, &acme, &same, "fr-par", &policy).is_allowed());
+    assert!(producer
+        .attempt(&mut gate, &reg, &acme, &same, "fr-par", &policy)
+        .is_allowed());
 
     // ── GREEN leg 2 — a WITHIN-EU cross-region mirror (fr-par → nl-ams): a crossing, but lawful
     //    (within-EU acceleration, §5.3) → allowed via the policy. This IS a foreign-region push, but a
     //    LAWFUL one — it is NOT an unauthorised cross-residency push. ──
     let within_eu = MirrorTarget::new("mirror.nl.example", Region::new("nl-ams"));
-    assert!(producer.attempt(&mut gate, &reg, &acme, &within_eu, "fr-par", &policy).is_allowed());
+    assert!(producer
+        .attempt(&mut gate, &reg, &acme, &within_eu, "fr-par", &policy)
+        .is_allowed());
 
     // ── RED leg 2 — a SECOND extra-EU target (ap-tokyo) with no entry → denied. ──
     let extra_eu_2 = MirrorTarget::new("git.ap.example", Region::new("ap-tokyo"));
-    assert!(!producer.attempt(&mut gate, &reg, &acme, &extra_eu_2, "fr-par", &policy).is_allowed());
+    assert!(!producer
+        .attempt(&mut gate, &reg, &acme, &extra_eu_2, "fr-par", &policy)
+        .is_allowed());
 
     // ── GREEN leg 3 — record the `[OPEN — LEGAL]` ratified entry for ap-tokyo → the SAME target flips
     //    to allowed (the gate consults the registry, not a blanket block). ──
     policy.record("ap-tokyo");
-    assert!(producer.attempt(&mut gate, &reg, &acme, &extra_eu_2, "fr-par", &policy).is_allowed());
+    assert!(producer
+        .attempt(&mut gate, &reg, &acme, &extra_eu_2, "fr-par", &policy)
+        .is_allowed());
 
     // The C-4 zero: the ONLY foreign-region pushes the producer made were LAWFUL ones (within-EU +
     // the now-ratified ap-tokyo). 0 UNAUTHORISED cross-residency pushes reached the wire.
@@ -171,7 +185,8 @@ fn c4_mirror_gate_drill() {
     //    CrossTenantCount projection — the load-bearing cross-boundary zero; EI-01 §3). ──
     let mut sig = SignalSource::new();
     sig.set_scalar(SignalName::CrossTenantCount, unauthorised_pushes as i64);
-    sig.assert_signal(SignalName::CrossTenantCount, Predicate::Eq(0)).expect_green();
+    sig.assert_signal(SignalName::CrossTenantCount, Predicate::Eq(0))
+        .expect_green();
 
     println!(
         "[P-251 C-4 mirror-gate GREEN 2026-06-21] mirror_allowed deny-by-default LIVE: an extra-EU host \

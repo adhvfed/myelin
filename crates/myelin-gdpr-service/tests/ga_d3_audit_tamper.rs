@@ -79,33 +79,54 @@ fn ga_d3_a_retroactive_edit_is_detected_three_independent_ways() {
     // The M1 audit surface: a run of real actions across the chain.
     const N: usize = 12;
     for i in 0..N {
-        let outcome = auth
-            .consumer()
-            .handle(&audit_action(&format!("01J-{i}"), "acme", &format!("myelin://acme/x/{i}")));
+        let outcome = auth.consumer().handle(&audit_action(
+            &format!("01J-{i}"),
+            "acme",
+            &format!("myelin://acme/x/{i}"),
+        ));
         assert_eq!(outcome, myelin_events::HandleOutcome::Done);
     }
 
     // Publish an STH over the pristine tree and anchor it to an INDEPENDENT witness (its own key —
     // a different cell's notary). The witness sees ONLY the opaque root (no PII crosses).
-    let published = auth.signed_tree_head(&tenant, "2026-06-20T00:00:00Z").expect("an STH");
-    assert!(published.verify_signature(auth.key()), "the published STH verifies in-cell");
+    let published = auth
+        .signed_tree_head(&tenant, "2026-06-20T00:00:00Z")
+        .expect("an STH");
+    assert!(
+        published.verify_signature(auth.key()),
+        "the published STH verifies in-cell"
+    );
     let witness = NotaryWitness::new(CellSigningKey::from_seed("notary:cell-b"));
     let attestation = auth.anchor_to_witness(&published, &witness);
-    assert_eq!(attestation.witnessed_root, published.root_hash, "the witness pinned the opaque root");
+    assert_eq!(
+        attestation.witnessed_root, published.root_hash,
+        "the witness pinned the opaque root"
+    );
 
     // The pristine chain passes all three checks (the baseline — proves the detections are not
     // trivially-always-true).
-    assert!(auth.consumer().log().verify_chain(&tenant), "baseline: the chain verifies intact");
+    assert!(
+        auth.consumer().log().verify_chain(&tenant),
+        "baseline: the chain verifies intact"
+    );
     let honest_consistency = auth.consistency_proof(&tenant, N as u64, N as u64).unwrap();
     use myelin_gdpr_service::verify_consistency;
     assert!(
         verify_consistency(&honest_consistency, &published, &published),
         "baseline: the consistency proof against the published STH holds"
     );
-    let honest_leaves: Vec<[u8; 32]> =
-        auth.consumer().log().entries_for(&tenant).iter().map(leaf_of).collect();
+    let honest_leaves: Vec<[u8; 32]> = auth
+        .consumer()
+        .log()
+        .entries_for(&tenant)
+        .iter()
+        .map(leaf_of)
+        .collect();
     let honest_root = format!("blake3:{}", hex::encode(audit_merkle_root(&honest_leaves)));
-    assert!(attestation.matches(&honest_root), "baseline: the witness matches the honest tree");
+    assert!(
+        attestation.matches(&honest_root),
+        "baseline: the witness matches the honest tree"
+    );
 
     // ───────────────── THE TAMPER: a retroactive edit to entry 5's subject ─────────────────
     // The chain store is crate-private (no service can edit it through the API — the tamper is a
@@ -125,7 +146,8 @@ fn ga_d3_a_retroactive_edit_is_detected_three_independent_ways() {
     // way the store would now serve it (with entry 5 tampered) and build a consistency proof; it no
     // longer reconciles to the published STH root.
     let tampered_leaves: Vec<[u8; 32]> = entries.iter().map(leaf_of).collect();
-    let tampered_consistency = consistency_proof_over(&tampered_leaves, N as u64, N as u64).unwrap();
+    let tampered_consistency =
+        consistency_proof_over(&tampered_leaves, N as u64, N as u64).unwrap();
     assert!(
         !verify_consistency(&tampered_consistency, &published, &published),
         "GA-D3 detection 2/3: the consistency proof against the published STH fails"
@@ -133,7 +155,10 @@ fn ga_d3_a_retroactive_edit_is_detected_three_independent_ways() {
 
     // DETECTION 3 — the independent witness mismatches. The tampered tree's root at the witnessed
     // size differs from what the witness countersigned.
-    let tampered_root = format!("blake3:{}", hex::encode(audit_merkle_root(&tampered_leaves)));
+    let tampered_root = format!(
+        "blake3:{}",
+        hex::encode(audit_merkle_root(&tampered_leaves))
+    );
     assert!(
         !attestation.matches(&tampered_root),
         "GA-D3 detection 3/3: the independent witness mismatches the tampered tree"
@@ -149,8 +174,11 @@ fn ga_d3_a_deleted_entry_is_detected() {
     let auth = AuditAuthority::new(CellSigningKey::from_seed("cell:fr-par:audit"));
     let tenant = TenantId("acme".into());
     for i in 0..8 {
-        auth.consumer()
-            .handle(&audit_action(&format!("01J-{i}"), "acme", &format!("myelin://acme/x/{i}")));
+        auth.consumer().handle(&audit_action(
+            &format!("01J-{i}"),
+            "acme",
+            &format!("myelin://acme/x/{i}"),
+        ));
     }
     let published = auth.signed_tree_head(&tenant, "t").unwrap();
 
@@ -164,7 +192,10 @@ fn ga_d3_a_deleted_entry_is_detected() {
     );
     // The witnessed STH committed to tree_size 8; the tampered tree has only 7 leaves — a size the
     // published STH does not match.
-    assert_eq!(published.tree_size, 8, "the STH committed the original size");
+    assert_eq!(
+        published.tree_size, 8,
+        "the STH committed the original size"
+    );
     assert_eq!(entries.len(), 7, "the tampered store has one fewer entry");
 }
 

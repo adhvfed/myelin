@@ -334,7 +334,13 @@ impl TimerStore {
     /// timer; the journal UNIQUE makes the second journal a no-op — fired ONCE in effect (0 double-fire).
     /// A re-fire of an ALREADY-fired timer is [`FireOutcome::AlreadyFired`] (a no-op). `journal` is the
     /// run's history (the `timer_fired` row lands there); `runs` is the run store (the run is woken).
-    pub fn fire(&self, tenant: &TenantId, timer_id: &str, journal: &WfJournal, runs: &RunStore) -> FireOutcome {
+    pub fn fire(
+        &self,
+        tenant: &TenantId,
+        timer_id: &str,
+        journal: &WfJournal,
+        runs: &RunStore,
+    ) -> FireOutcome {
         // (a) set fired, atomically — the partial-index pivot. A re-fire of an already-fired timer is a
         // no-op (effectively-once). We snapshot the row under the lock so the journal/wake use it.
         let row = {
@@ -374,7 +380,10 @@ impl TimerStore {
 
     /// Read a timer by its frozen PK `(tenant, timer_id)`.
     pub fn get(&self, tenant: &TenantId, timer_id: &str) -> Option<TimerRow> {
-        self.lock().timers.get(&(tenant.0.clone(), timer_id.to_string())).cloned()
+        self.lock()
+            .timers
+            .get(&(tenant.0.clone(), timer_id.to_string()))
+            .cloned()
     }
 
     /// **The timer-wheel LAG (the SC-11 health signal, contract 1.8 / §5.4): the count of DUE timers
@@ -477,7 +486,11 @@ pub mod sla {
         /// Bind the call helper to the timer store + the `(tenant, timer_id)` the producer keys on
         /// (derive `timer_id` via [`sla_timer_id`] / [`trigger_stale_timer_id`] — never by hand).
         pub fn new(timers: &'a TimerStore, tenant: TenantId, timer_id: impl Into<String>) -> Self {
-            Self { timers, tenant, timer_id: timer_id.into() }
+            Self {
+                timers,
+                tenant,
+                timer_id: timer_id.into(),
+            }
         }
 
         /// The `timer_id` this call helper targets (the stable handle — read by a test/audit).
@@ -493,7 +506,8 @@ pub mod sla {
         /// merge-queue/wheel scan is NEVER touched — re-arming N timers is N row updates (the SC-11
         /// churn property holds under the real call sites).
         pub fn re_arm(&self, new_fire_at: i64) -> ReArmOutcome {
-            self.timers.re_arm(&self.tenant, &self.timer_id, new_fire_at)
+            self.timers
+                .re_arm(&self.tenant, &self.timer_id, new_fire_at)
         }
 
         /// **Disarm the SLA/`stale_after` timer — one cheap row op, the timer never fires (§6.6).** The
@@ -546,7 +560,14 @@ impl TimerWheel {
         partition: i16,
         batch: usize,
     ) -> Self {
-        Self { timers, journal, runs, telemetry, partition, batch }
+        Self {
+            timers,
+            journal,
+            runs,
+            telemetry,
+            partition,
+            batch,
+        }
     }
 
     /// **One wheel tick (§4.2): scan the due bucket, fire each due timer effectively-once, refresh the
@@ -558,7 +579,11 @@ impl TimerWheel {
         let due = self.timers.scan_due(self.partition, now_secs, self.batch);
         let mut fired = 0usize;
         for t in &due {
-            if self.timers.fire(&t.tenant, &t.timer_id, &self.journal, &self.runs) == FireOutcome::Fired {
+            if self
+                .timers
+                .fire(&t.tenant, &t.timer_id, &self.journal, &self.runs)
+                == FireOutcome::Fired
+            {
                 fired += 1;
             }
         }
@@ -635,8 +660,16 @@ mod tests {
         assert_eq!(epoch_minute(60), 1, "second 60 rolls into minute 1");
         assert_eq!(epoch_minute(3600), 60, "one hour is bucket 60");
         // a 30-day timer sits in a far-future bucket (never scanned until its minute).
-        assert_eq!(epoch_minute(30 * 24 * 3600), 43_200, "30 days is bucket 43200");
-        assert_eq!(epoch_minute(-5), 0, "a pre-epoch deadline floors to bucket 0 (immediately due)");
+        assert_eq!(
+            epoch_minute(30 * 24 * 3600),
+            43_200,
+            "30 days is bucket 43200"
+        );
+        assert_eq!(
+            epoch_minute(-5),
+            0,
+            "a pre-epoch deadline floors to bucket 0 (immediately due)"
+        );
     }
 
     /// **Arming a timer is idempotent on the deterministic `timer_id` (§3.3) — a re-arm is a no-op.** A
@@ -645,13 +678,21 @@ mod tests {
     #[test]
     fn arming_is_idempotent_on_the_deterministic_timer_id() {
         let store = TimerStore::new();
-        assert_eq!(store.arm(timer("t1", "R1", 600, 3)), ArmOutcome::Armed, "the first arm lands the row");
+        assert_eq!(
+            store.arm(timer("t1", "R1", 600, 3)),
+            ArmOutcome::Armed,
+            "the first arm lands the row"
+        );
         assert_eq!(
             store.arm(timer("t1", "R1", 600, 3)),
             ArmOutcome::AlreadyArmed,
             "a re-arm of the SAME timer_id is a no-op (a replayed sleep never double-arms)"
         );
-        assert_eq!(store.armed_count(), 1, "exactly one timer on the wheel (the re-arm was a no-op)");
+        assert_eq!(
+            store.armed_count(),
+            1,
+            "exactly one timer on the wheel (the re-arm was a no-op)"
+        );
     }
 
     /// **The wheel scan reads ONLY the due bucket — a far-future timer is NEVER touched (the SC-11
@@ -664,19 +705,36 @@ mod tests {
         // one timer due now (bucket 0), 100 timers due in 30 days (a far-future bucket).
         store.arm(timer("due", "R-due", 0, 0));
         for i in 0..100 {
-            store.arm(timer(&format!("far{i}"), &format!("R-far{i}"), 30 * 24 * 3600, 0));
+            store.arm(timer(
+                &format!("far{i}"),
+                &format!("R-far{i}"),
+                30 * 24 * 3600,
+                0,
+            ));
         }
         assert_eq!(store.armed_count(), 101, "101 timers armed");
 
         // scan at now = second 30 (bucket 0): ONLY the due timer is returned.
         let due = store.scan_due(0, 30, 1000);
-        assert_eq!(due.len(), 1, "exactly the ONE due timer (the 100 far-future are not in the due bucket)");
+        assert_eq!(
+            due.len(),
+            1,
+            "exactly the ONE due timer (the 100 far-future are not in the due bucket)"
+        );
         assert_eq!(due[0].timer_id, "due");
         // the partial-index probe: the scan TOUCHED only the one due row — the far-future fleet cost
         // nothing (a far-future timer is never read until its minute, §7.3).
-        assert_eq!(store.rows_scanned(), 1, "the scan touched ONLY the due row (indexed, not full-scan)");
+        assert_eq!(
+            store.rows_scanned(),
+            1,
+            "the scan touched ONLY the due row (indexed, not full-scan)"
+        );
         // the wheel lag is 1 (one due timer awaiting firing); the far-future timers are NOT lag.
-        assert_eq!(store.wheel_lag(0, 30), 1, "the lag counts only the due timer, not the far-future fleet");
+        assert_eq!(
+            store.wheel_lag(0, 30),
+            1,
+            "the lag counts only the due timer, not the far-future fleet"
+        );
     }
 
     /// **Firing a due timer is effectively-once: set `fired`, journal `timer_fired`, wake the run; a
@@ -695,12 +753,22 @@ mod tests {
         store.arm(timer("t1", "R1", 0, 0));
 
         // FIRST fire: set fired + journal + wake.
-        assert_eq!(store.fire(&tenant(), "t1", &journal, &runs), FireOutcome::Fired, "the first fire fires");
-        assert!(store.get(&tenant(), "t1").unwrap().fired, "the timer is fired (the partial-index pivot)");
+        assert_eq!(
+            store.fire(&tenant(), "t1", &journal, &runs),
+            FireOutcome::Fired,
+            "the first fire fires"
+        );
+        assert!(
+            store.get(&tenant(), "t1").unwrap().fired,
+            "the timer is fired (the partial-index pivot)"
+        );
         let hist = journal.history_for(&tenant(), "R1");
         assert_eq!(hist.len(), 1, "exactly one timer_fired journal row");
         assert_eq!(hist[0].kind, history_kind::TIMER_FIRED);
-        assert_eq!(hist[0].command_id, "agent.run:t1", "the fire journals under the timer's command_id");
+        assert_eq!(
+            hist[0].command_id, "agent.run:t1",
+            "the fire journals under the timer's command_id"
+        );
         assert_eq!(
             runs.get(&tenant(), "R1").unwrap().state,
             run_state::RUNNING,
@@ -738,14 +806,26 @@ mod tests {
         let claim_a = store.scan_due(0, 30, 100);
         let claim_b = store.scan_due(0, 30, 100);
         assert_eq!(claim_a.len(), 1);
-        assert_eq!(claim_b.len(), 1, "both claims see the unfired timer (the SQL SKIP LOCKED would gate to one)");
+        assert_eq!(
+            claim_b.len(),
+            1,
+            "both claims see the unfired timer (the SQL SKIP LOCKED would gate to one)"
+        );
 
         // both fire — but the effectively-once guard makes only ONE actually fire.
         let a = store.fire(&tenant(), "t1", &journal, &runs);
         let b = store.fire(&tenant(), "t1", &journal, &runs);
         assert_eq!(a, FireOutcome::Fired, "worker A fires the timer");
-        assert_eq!(b, FireOutcome::AlreadyFired, "worker B's claim is a no-op (0 double-fire)");
-        assert_eq!(journal.history_for(&tenant(), "R1").len(), 1, "ONE timer_fired row (fired once in effect)");
+        assert_eq!(
+            b,
+            FireOutcome::AlreadyFired,
+            "worker B's claim is a no-op (0 double-fire)"
+        );
+        assert_eq!(
+            journal.history_for(&tenant(), "R1").len(),
+            1,
+            "ONE timer_fired row (fired once in effect)"
+        );
     }
 
     /// **A crash re-fires only the UNFIRED timers (§4.2 — the FLOW-D3 crash property).** Arm three due
@@ -758,20 +838,34 @@ mod tests {
         let journal = WfJournal::new();
         let runs = RunStore::new();
         for id in ["a", "b", "c"] {
-            let mut run = RunRow::new_runnable(tenant(), region(), format!("R-{id}"), "agent.run", 0);
+            let mut run =
+                RunRow::new_runnable(tenant(), region(), format!("R-{id}"), "agent.run", 0);
             run.state = run_state::WAITING.into();
             runs.put(run);
             store.arm(timer(id, &format!("R-{id}"), 0, 0));
         }
         // fire timer `a` (it sets fired + journals), then the worker CRASHES before firing b/c.
-        assert_eq!(store.fire(&tenant(), "a", &journal, &runs), FireOutcome::Fired);
+        assert_eq!(
+            store.fire(&tenant(), "a", &journal, &runs),
+            FireOutcome::Fired
+        );
 
         // a NEW worker re-scans the due bucket after the crash: only b/c (still unfired) come back.
         let after_crash = store.scan_due(0, 30, 100);
         let ids: Vec<&str> = after_crash.iter().map(|t| t.timer_id.as_str()).collect();
-        assert_eq!(after_crash.len(), 2, "only the two UNFIRED timers are re-scanned (a is excluded by WHERE NOT fired)");
-        assert!(!ids.contains(&"a"), "the already-fired timer `a` is NOT re-fired (0 double-fire)");
-        assert!(ids.contains(&"b") && ids.contains(&"c"), "the unfired b/c are re-fired (0 lost)");
+        assert_eq!(
+            after_crash.len(),
+            2,
+            "only the two UNFIRED timers are re-scanned (a is excluded by WHERE NOT fired)"
+        );
+        assert!(
+            !ids.contains(&"a"),
+            "the already-fired timer `a` is NOT re-fired (0 double-fire)"
+        );
+        assert!(
+            ids.contains(&"b") && ids.contains(&"c"),
+            "the unfired b/c are re-fired (0 lost)"
+        );
     }
 
     /// **The `TimerWheel::tick` fires every due timer and refreshes the timer-wheel-lag (the SC-11
@@ -793,20 +887,41 @@ mod tests {
         }
         store.arm(timer("far", "R-far", 30 * 24 * 3600, 0));
 
-        let wheel = TimerWheel::new(store.clone(), journal.clone(), runs.clone(), tele.clone(), 0, 1000);
+        let wheel = TimerWheel::new(
+            store.clone(),
+            journal.clone(),
+            runs.clone(),
+            tele.clone(),
+            0,
+            1000,
+        );
         // before the tick: the lag is 5 (five due timers awaiting firing); the far-future is not lag.
-        assert_eq!(store.wheel_lag(0, 30), 5, "five due timers are the lag (the far-future is not)");
+        assert_eq!(
+            store.wheel_lag(0, 30),
+            5,
+            "five due timers are the lag (the far-future is not)"
+        );
 
         let fired = wheel.tick(30);
         assert_eq!(fired, 5, "the tick fired all five due timers");
         // every parked run woke (waiting → running).
         for i in 0..5 {
-            assert_eq!(runs.get(&tenant(), &format!("R{i}")).unwrap().state, run_state::RUNNING);
+            assert_eq!(
+                runs.get(&tenant(), &format!("R{i}")).unwrap().state,
+                run_state::RUNNING
+            );
         }
         // the timer-wheel-lag drove back to 0 (the FLOW-D3 green artifact: lag within budget) — the
         // far-future timer is still unfired but NOT due, so it does not count as lag.
-        assert_eq!(tele.timer_wheel_lag(), 0, "the timer-wheel-lag is 0 after the tick (the SC-11 health signal)");
-        assert!(!store.get(&tenant(), "far").unwrap().fired, "the far-future timer is untouched");
+        assert_eq!(
+            tele.timer_wheel_lag(),
+            0,
+            "the timer-wheel-lag is 0 after the tick (the SC-11 health signal)"
+        );
+        assert!(
+            !store.get(&tenant(), "far").unwrap().fired,
+            "the far-future timer is untouched"
+        );
     }
 
     /// **A re-arm is a SINGLE row UPDATE of `fire_at` + `bucket` — no new row, no wheel rescan
@@ -821,19 +936,45 @@ mod tests {
         store.arm(timer("sla", "R1", 600, 0));
         assert_eq!(store.armed_count(), 1);
         assert_eq!(store.get(&tenant(), "sla").unwrap().bucket, 10);
-        assert_eq!(store.rows_scanned(), 0, "no scan yet — the re-arm must not rescan the wheel");
+        assert_eq!(
+            store.rows_scanned(),
+            0,
+            "no scan yet — the re-arm must not rescan the wheel"
+        );
 
         // re-arm forward to minute 30 (fire_at = 1800s, bucket 30) — a SINGLE row update.
-        assert_eq!(store.re_arm(&tenant(), "sla", 1800), ReArmOutcome::ReArmed, "the re-arm updates the row");
+        assert_eq!(
+            store.re_arm(&tenant(), "sla", 1800),
+            ReArmOutcome::ReArmed,
+            "the re-arm updates the row"
+        );
         let row = store.get(&tenant(), "sla").unwrap();
-        assert_eq!(row.fire_at, 1800, "fire_at slid forward (the cheap row update)");
-        assert_eq!(row.bucket, epoch_minute(1800), "the derived bucket was recomputed");
+        assert_eq!(
+            row.fire_at, 1800,
+            "fire_at slid forward (the cheap row update)"
+        );
+        assert_eq!(
+            row.bucket,
+            epoch_minute(1800),
+            "the derived bucket was recomputed"
+        );
         assert_eq!(row.bucket, 30, "the new minute bucket");
-        assert_eq!(store.armed_count(), 1, "STILL one row — a re-arm is an UPDATE, not a new INSERT (no wheel pollution)");
-        assert_eq!(store.rows_scanned(), 0, "the re-arm did NOT scan the wheel (row-update cost, not wheel-scan cost)");
+        assert_eq!(
+            store.armed_count(),
+            1,
+            "STILL one row — a re-arm is an UPDATE, not a new INSERT (no wheel pollution)"
+        );
+        assert_eq!(
+            store.rows_scanned(),
+            0,
+            "the re-arm did NOT scan the wheel (row-update cost, not wheel-scan cost)"
+        );
 
         // a scan at minute 15 (now = 900s) finds NOTHING — the timer moved to minute 30 (far-future).
-        assert!(store.scan_due(0, 900, 100).is_empty(), "the re-armed timer is no longer due at the old time");
+        assert!(
+            store.scan_due(0, 900, 100).is_empty(),
+            "the re-armed timer is no longer due at the old time"
+        );
     }
 
     /// **A re-arm RE-OPENS a fired timer at its NEW deadline (§6.6).** A timer that already fired is
@@ -848,18 +989,31 @@ mod tests {
         run.state = run_state::WAITING.into();
         runs.put(run);
         store.arm(timer("sla", "R1", 0, 0));
-        assert_eq!(store.fire(&tenant(), "sla", &journal, &runs), FireOutcome::Fired);
-        assert!(store.get(&tenant(), "sla").unwrap().fired, "the timer fired");
+        assert_eq!(
+            store.fire(&tenant(), "sla", &journal, &runs),
+            FireOutcome::Fired
+        );
+        assert!(
+            store.get(&tenant(), "sla").unwrap().fired,
+            "the timer fired"
+        );
 
         // re-arm re-opens it at a new (future) deadline.
         assert_eq!(store.re_arm(&tenant(), "sla", 1800), ReArmOutcome::ReArmed);
         let row = store.get(&tenant(), "sla").unwrap();
-        assert!(!row.fired, "the re-arm re-opened the fired timer (fired = false)");
+        assert!(
+            !row.fired,
+            "the re-arm re-opened the fired timer (fired = false)"
+        );
         assert_eq!(row.fire_at, 1800);
         assert_eq!(row.bucket, 30);
 
         // re-arming a timer that was never armed is Absent (UPDATE … touched 0 rows).
-        assert_eq!(store.re_arm(&tenant(), "ghost", 1800), ReArmOutcome::Absent, "no row to re-arm");
+        assert_eq!(
+            store.re_arm(&tenant(), "ghost", 1800),
+            ReArmOutcome::Absent,
+            "no row to re-arm"
+        );
     }
 
     /// **Re-arming N timers is N row updates, NOT a wheel rescan (§6.6 — the SC-11 churn property).**
@@ -876,10 +1030,21 @@ mod tests {
 
         // re-arm all 1000 forward — each is a single row update.
         for i in 0..1000 {
-            assert_eq!(store.re_arm(&tenant(), &format!("sla{i}"), 1800 + i as i64), ReArmOutcome::ReArmed);
+            assert_eq!(
+                store.re_arm(&tenant(), &format!("sla{i}"), 1800 + i as i64),
+                ReArmOutcome::ReArmed
+            );
         }
-        assert_eq!(store.armed_count(), 1000, "STILL 1000 rows (no duplicates — every re-arm was an in-place UPDATE)");
-        assert_eq!(store.rows_scanned(), 0, "1000 re-arms scanned the wheel ZERO times (row-update cost, not wheel-scan cost)");
+        assert_eq!(
+            store.armed_count(),
+            1000,
+            "STILL 1000 rows (no duplicates — every re-arm was an in-place UPDATE)"
+        );
+        assert_eq!(
+            store.rows_scanned(),
+            0,
+            "1000 re-arms scanned the wheel ZERO times (row-update cost, not wheel-scan cost)"
+        );
     }
 
     /// **A disarm (`fired = true`) makes the timer NEVER fire — excluded by the partial index (§6.6).**
@@ -897,22 +1062,63 @@ mod tests {
         store.arm(timer("sla", "R1", 0, 0)); // due now.
 
         // disarm: a single row op — sets fired = true.
-        assert_eq!(store.disarm(&tenant(), "sla"), DisarmOutcome::Disarmed, "the disarm sets fired");
-        assert!(store.get(&tenant(), "sla").unwrap().fired, "the disarmed timer's partial-index pivot is set");
+        assert_eq!(
+            store.disarm(&tenant(), "sla"),
+            DisarmOutcome::Disarmed,
+            "the disarm sets fired"
+        );
+        assert!(
+            store.get(&tenant(), "sla").unwrap().fired,
+            "the disarmed timer's partial-index pivot is set"
+        );
         // the row REMAINS on the table (the audit trail) but is invisible to the wheel.
-        assert_eq!(store.armed_count(), 1, "the disarmed row stays (excluded from the wheel by WHERE NOT fired)");
+        assert_eq!(
+            store.armed_count(),
+            1,
+            "the disarmed row stays (excluded from the wheel by WHERE NOT fired)"
+        );
 
         // the wheel never sees it: the due-scan excludes the disarmed (fired) timer.
         let due = store.scan_due(0, 30, 100);
-        assert!(due.is_empty(), "the disarmed timer is NOT in the due scan (WHERE NOT fired excludes it)");
-        let wheel = TimerWheel::new(store.clone(), journal.clone(), runs.clone(), FlowTelemetry::new(), 0, 100);
-        assert_eq!(wheel.tick(30), 0, "the wheel fires NOTHING — the disarmed timer never fires");
-        assert_eq!(journal.history_for(&tenant(), "R1").len(), 0, "no timer_fired row — the disarm cancelled the fire");
-        assert_eq!(runs.get(&tenant(), "R1").unwrap().state, run_state::WAITING, "the parked run was never woken");
+        assert!(
+            due.is_empty(),
+            "the disarmed timer is NOT in the due scan (WHERE NOT fired excludes it)"
+        );
+        let wheel = TimerWheel::new(
+            store.clone(),
+            journal.clone(),
+            runs.clone(),
+            FlowTelemetry::new(),
+            0,
+            100,
+        );
+        assert_eq!(
+            wheel.tick(30),
+            0,
+            "the wheel fires NOTHING — the disarmed timer never fires"
+        );
+        assert_eq!(
+            journal.history_for(&tenant(), "R1").len(),
+            0,
+            "no timer_fired row — the disarm cancelled the fire"
+        );
+        assert_eq!(
+            runs.get(&tenant(), "R1").unwrap().state,
+            run_state::WAITING,
+            "the parked run was never woken"
+        );
 
         // a disarm of an already-disarmed (fired) timer is a no-op; an absent timer too.
-        assert_eq!(store.disarm(&tenant(), "sla"), DisarmOutcome::Absent, "re-disarm of a fired timer is a no-op");
-        assert_eq!(store.disarm(&tenant(), "ghost"), DisarmOutcome::Absent, "disarm of an absent timer is a no-op");
+        assert_eq!(
+            store.disarm(&tenant(), "sla"),
+            DisarmOutcome::Absent,
+            "re-disarm of a fired timer is a no-op"
+        );
+        assert_eq!(
+            store.disarm(&tenant(), "ghost"),
+            DisarmOutcome::Absent,
+            "disarm of an absent timer is a no-op"
+        );
     }
 
     /// **The DELETE variant of disarm removes the row entirely (§6.6).** `disarm_delete` deletes the
@@ -924,12 +1130,30 @@ mod tests {
         store.arm(timer("sla", "R1", 0, 0));
         assert_eq!(store.armed_count(), 1);
 
-        assert_eq!(store.disarm_delete(&tenant(), "sla"), DisarmOutcome::Disarmed, "the row is deleted");
-        assert_eq!(store.armed_count(), 0, "the row is gone (the no-trace cancel)");
-        assert!(store.get(&tenant(), "sla").is_none(), "the timer no longer exists");
-        assert!(store.scan_due(0, 30, 100).is_empty(), "nothing to fire — the timer was deleted");
+        assert_eq!(
+            store.disarm_delete(&tenant(), "sla"),
+            DisarmOutcome::Disarmed,
+            "the row is deleted"
+        );
+        assert_eq!(
+            store.armed_count(),
+            0,
+            "the row is gone (the no-trace cancel)"
+        );
+        assert!(
+            store.get(&tenant(), "sla").is_none(),
+            "the timer no longer exists"
+        );
+        assert!(
+            store.scan_due(0, 30, 100).is_empty(),
+            "nothing to fire — the timer was deleted"
+        );
 
-        assert_eq!(store.disarm_delete(&tenant(), "sla"), DisarmOutcome::Absent, "a re-delete is a no-op");
+        assert_eq!(
+            store.disarm_delete(&tenant(), "sla"),
+            DisarmOutcome::Absent,
+            "a re-delete is a no-op"
+        );
     }
 
     /// **The SLA/`stale_after` call-site helper derives a STABLE deterministic `timer_id` per producer
@@ -940,8 +1164,16 @@ mod tests {
     #[test]
     fn the_call_site_helper_derives_stable_per_producer_timer_ids() {
         use super::sla::{sla_timer_id, trigger_stale_timer_id};
-        assert_eq!(sla_timer_id("acme/proj#7"), "sla/acme/proj#7", "Issues SLA key is sla/<issue_key>");
-        assert_eq!(sla_timer_id("acme/proj#7"), sla_timer_id("acme/proj#7"), "the same issue → the same key");
+        assert_eq!(
+            sla_timer_id("acme/proj#7"),
+            "sla/acme/proj#7",
+            "Issues SLA key is sla/<issue_key>"
+        );
+        assert_eq!(
+            sla_timer_id("acme/proj#7"),
+            sla_timer_id("acme/proj#7"),
+            "the same issue → the same key"
+        );
         assert_eq!(
             trigger_stale_timer_id("u-42", "issue/acme/proj#7"),
             "trigger/u-42/issue/acme/proj#7",
@@ -969,35 +1201,85 @@ mod tests {
         // the producer arms the breach ONCE (issue opened; due in 4h = 14_400s, bucket 240).
         store.arm(timer(&id, "R-sla-7", 14_400, 0));
         assert_eq!(store.armed_count(), 1);
-        assert_eq!(store.rows_scanned(), 0, "no scan yet — the call site must not rescan the wheel");
+        assert_eq!(
+            store.rows_scanned(),
+            0,
+            "no scan yet — the call site must not rescan the wheel"
+        );
 
         let call = SlaTimerCall::new(&store, tenant(), id.clone());
         assert_eq!(call.timer_id(), "sla/acme/proj#7");
         // the issue is touched → the call site SLIDES the deadline forward (one row update).
-        assert_eq!(call.re_arm(28_800), ReArmOutcome::ReArmed, "the call-site re-arm updates the row");
+        assert_eq!(
+            call.re_arm(28_800),
+            ReArmOutcome::ReArmed,
+            "the call-site re-arm updates the row"
+        );
         let row = store.get(&tenant(), &id).unwrap();
-        assert_eq!(row.fire_at, 28_800, "fire_at slid forward at the call boundary");
-        assert_eq!(row.bucket, epoch_minute(28_800), "the derived bucket was recomputed");
-        assert_eq!(store.armed_count(), 1, "STILL one row — the call-site re-arm is an UPDATE, not a new arm");
-        assert_eq!(store.rows_scanned(), 0, "the call-site re-arm did NOT scan the wheel (row-update cost)");
+        assert_eq!(
+            row.fire_at, 28_800,
+            "fire_at slid forward at the call boundary"
+        );
+        assert_eq!(
+            row.bucket,
+            epoch_minute(28_800),
+            "the derived bucket was recomputed"
+        );
+        assert_eq!(
+            store.armed_count(),
+            1,
+            "STILL one row — the call-site re-arm is an UPDATE, not a new arm"
+        );
+        assert_eq!(
+            store.rows_scanned(),
+            0,
+            "the call-site re-arm did NOT scan the wheel (row-update cost)"
+        );
         // resolution → the call site disarms the breach (one row op, the timer never fires).
-        assert_eq!(call.disarm(), DisarmOutcome::Disarmed, "the call-site disarm is one row op");
-        assert!(store.get(&tenant(), &id).unwrap().fired, "the disarmed breach's partial-index pivot is set");
-        assert_eq!(call.disarm(), DisarmOutcome::Absent, "a re-disarm at the call site is idempotent (0 rows)");
+        assert_eq!(
+            call.disarm(),
+            DisarmOutcome::Disarmed,
+            "the call-site disarm is one row op"
+        );
+        assert!(
+            store.get(&tenant(), &id).unwrap().fired,
+            "the disarmed breach's partial-index pivot is set"
+        );
+        assert_eq!(
+            call.disarm(),
+            DisarmOutcome::Absent,
+            "a re-disarm at the call site is idempotent (0 rows)"
+        );
 
         // --- Trigger stale_after call site (the SAME documented path) ---
         let trig_id = trigger_stale_timer_id("u-42", "issue/acme/proj#7");
         store.arm(timer(&trig_id, "R-trig", 600, 0));
         let trig_call = SlaTimerCall::new(&store, tenant(), trig_id.clone());
         // the trigger is touched → stale_after RESET (the IDENTICAL re-arm row op as the SLA slide).
-        assert_eq!(trig_call.re_arm(7_200), ReArmOutcome::ReArmed, "the stale_after reset is the same re-arm path");
+        assert_eq!(
+            trig_call.re_arm(7_200),
+            ReArmOutcome::ReArmed,
+            "the stale_after reset is the same re-arm path"
+        );
         assert_eq!(store.get(&tenant(), &trig_id).unwrap().fire_at, 7_200);
-        assert_eq!(store.armed_count(), 2, "two timers on the wheel (Issues SLA + Trigger), each one row");
-        assert_eq!(store.rows_scanned(), 0, "no producer touched the wheel scan — all re-arms were row updates");
+        assert_eq!(
+            store.armed_count(),
+            2,
+            "two timers on the wheel (Issues SLA + Trigger), each one row"
+        );
+        assert_eq!(
+            store.rows_scanned(),
+            0,
+            "no producer touched the wheel scan — all re-arms were row updates"
+        );
 
         // re-arming an ABSENT key at the call site is Absent (the producer arms first).
         let ghost = SlaTimerCall::new(&store, tenant(), sla_timer_id("never-armed"));
-        assert_eq!(ghost.re_arm(9_999), ReArmOutcome::Absent, "re-arm of an unarmed key is Absent (0 rows)");
+        assert_eq!(
+            ghost.re_arm(9_999),
+            ReArmOutcome::Absent,
+            "re-arm of an unarmed key is Absent (0 rows)"
+        );
     }
 
     /// **A late timer fire on a TERMINAL run is a harmless no-op (the wake never resurrects).** A
@@ -1013,7 +1295,11 @@ mod tests {
         runs.put(run);
         store.arm(timer("t1", "R1", 0, 0));
 
-        assert_eq!(store.fire(&tenant(), "t1", &journal, &runs), FireOutcome::Fired, "the timer fires (journals)");
+        assert_eq!(
+            store.fire(&tenant(), "t1", &journal, &runs),
+            FireOutcome::Fired,
+            "the timer fires (journals)"
+        );
         assert_eq!(
             runs.get(&tenant(), "R1").unwrap().state,
             run_state::TERMINATED,

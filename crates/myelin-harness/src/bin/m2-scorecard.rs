@@ -36,7 +36,9 @@ fn main() -> ExitCode {
     let date = today_iso();
     let mut card = Scorecard::new(Band::M2Reactive);
 
-    println!("== M2 reactive-shared-layer exit-gate scorecard ({date}) — re-running every M2 drill ==");
+    println!(
+        "== M2 reactive-shared-layer exit-gate scorecard ({date}) — re-running every M2 drill =="
+    );
     println!("   (AG-D4 runs --features integration with MYELIN_REQUIRE_KVM=1: a real microVM MUST boot — no vacuous green)\n");
     for row in m2_required_rows() {
         let require_kvm = row.id == "AG-D4";
@@ -133,5 +135,7 @@ fn scorecard_path() -> PathBuf {
         .and_then(|p| p.parent())
         .unwrap_or(&crate_dir)
         .to_path_buf();
-    root.join("testing").join("scorecards").join("m2-reactive.md")
+    root.join("testing")
+        .join("scorecards")
+        .join("m2-reactive.md")
 }

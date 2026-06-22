@@ -60,7 +60,10 @@ fn region() -> Region {
 
 fn principal() -> HolderSchema {
     HolderSchema::from_schema::<PrincipalRow>(
-        HolderRegistration { kind: StoreKind::Oltp, name: "identity_oltp" },
+        HolderRegistration {
+            kind: StoreKind::Oltp,
+            name: "identity_oltp",
+        },
         Holder::H15Identity,
         region(),
     )
@@ -68,7 +71,10 @@ fn principal() -> HolderSchema {
 
 fn profile() -> HolderSchema {
     HolderSchema::from_schema::<ProfileRow>(
-        HolderRegistration { kind: StoreKind::Oltp, name: "profile_oltp" },
+        HolderRegistration {
+            kind: StoreKind::Oltp,
+            name: "profile_oltp",
+        },
         Holder::H15Identity,
         region(),
     )
@@ -97,7 +103,10 @@ fn cdc_10_3_diff_gate_passes_unchanged_and_fails_a_changed_map_with_the_diff() {
 
     // the new health field + the new holder are surfaced.
     assert_eq!(
-        d.added_fields.iter().map(|e| e.field_path.as_str()).collect::<Vec<_>>(),
+        d.added_fields
+            .iter()
+            .map(|e| e.field_path.as_str())
+            .collect::<Vec<_>>(),
         vec!["ProfileRow.health_note"],
     );
     assert_eq!(d.added_holders, vec!["oltp:profile_oltp".to_string()]);
@@ -108,7 +117,9 @@ fn cdc_10_3_diff_gate_passes_unchanged_and_fails_a_changed_map_with_the_diff() {
         &d.dpia_verdicts[0],
         DpiaVerdict::Required { marker, .. } if marker.field_path == "ProfileRow.health_note"
     ));
-    assert!(d.summary().contains("! DPIA REQUIRED ProfileRow.health_note"));
+    assert!(d
+        .summary()
+        .contains("! DPIA REQUIRED ProfileRow.health_note"));
 }
 
 /// Re-baselining (the ratchet moves forward only with a DPO re-seal): after the gate fails, sealing
@@ -121,5 +132,8 @@ fn cdc_10_3_re_sealing_after_dpo_review_makes_the_gate_green() {
 
     // a DPO reviews + re-seals the new inventory → the next build passes.
     let re_sealed = CommittedBaseline::seal(changed.clone());
-    assert_eq!(check_against_baseline(&re_sealed, &changed), GateVerdict::Unchanged);
+    assert_eq!(
+        check_against_baseline(&re_sealed, &changed),
+        GateVerdict::Unchanged
+    );
 }

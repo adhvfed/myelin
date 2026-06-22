@@ -33,7 +33,10 @@ async fn flow_p13_timer_wheel_bucketed_scan_and_effectively_once_fire_in_real_po
     let cfg = MyelinConfig::dev();
     let admin = sqlx::postgres::PgPoolOptions::new()
         .max_connections(4)
-        .connect(&cfg.database_url.replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw"))
+        .connect(
+            &cfg.database_url
+                .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw"),
+        )
         .await
         .expect("connect as admin to dev Postgres (is the stack up?)");
 
@@ -46,9 +49,18 @@ async fn flow_p13_timer_wheel_bucketed_scan_and_effectively_once_fire_in_real_po
     let idx = WF_TIMER_DUE_IDX
         .replacen("wf_timer_due", &format!("{tbl}_due"), 1)
         .replacen("ON wf_timer", &format!("ON {tbl}"), 1);
-    sqlx::query(&format!("DROP TABLE IF EXISTS {tbl}")).execute(&admin).await.unwrap();
-    sqlx::query(&create).execute(&admin).await.expect("the wf_timer DDL applies");
-    sqlx::query(&idx).execute(&admin).await.expect("the wf_timer_due partial index applies");
+    sqlx::query(&format!("DROP TABLE IF EXISTS {tbl}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    sqlx::query(&create)
+        .execute(&admin)
+        .await
+        .expect("the wf_timer DDL applies");
+    sqlx::query(&idx)
+        .execute(&admin)
+        .await
+        .expect("the wf_timer_due partial index applies");
 
     // Arm ONE due timer (fire_at now, bucket 0) + 50_000 FAR-FUTURE timers (30 days out — a far-future
     // bucket). The far-future fleet sits in a far-future bucket; the partial index NEVER reads it until
@@ -73,7 +85,10 @@ async fn flow_p13_timer_wheel_bucketed_scan_and_effectively_once_fire_in_real_po
     .expect("the 50k far-future fleet arms");
 
     // ANALYZE so the planner has stats (the partial index choice is plan-dependent).
-    sqlx::query(&format!("ANALYZE {tbl}")).execute(&admin).await.unwrap();
+    sqlx::query(&format!("ANALYZE {tbl}"))
+        .execute(&admin)
+        .await
+        .unwrap();
 
     // (1) THE BUCKETED DUE-SCAN uses the PARTIAL INDEX — the EXPLAIN over the due-scan reads the
     //     `_due` index, NOT a sequential scan of the 50k+1 fleet (the SC-11 indexed-not-full-scan).
@@ -106,15 +121,32 @@ async fn flow_p13_timer_wheel_bucketed_scan_and_effectively_once_fire_in_real_po
         .iter()
         .map(|r| r.get::<String, _>("timer_id"))
         .collect();
-    assert_eq!(due, vec!["t-due".to_string()], "the due-scan returned ONLY the due timer (far-future untouched)");
+    assert_eq!(
+        due,
+        vec!["t-due".to_string()],
+        "the due-scan returned ONLY the due timer (far-future untouched)"
+    );
 
     // (3) EFFECTIVELY-ONCE FIRE: `UPDATE … SET fired = true WHERE NOT fired` flips it ONCE; a re-fire
     //     (the crash-re-fire) updates 0 rows (0 double-fire).
-    let fire = format!("UPDATE {tbl} SET fired = true WHERE tenant_id='acme' AND timer_id='t-due' AND NOT fired");
-    let first = sqlx::query(&fire).execute(&admin).await.expect("the first fire").rows_affected();
+    let fire = format!(
+        "UPDATE {tbl} SET fired = true WHERE tenant_id='acme' AND timer_id='t-due' AND NOT fired"
+    );
+    let first = sqlx::query(&fire)
+        .execute(&admin)
+        .await
+        .expect("the first fire")
+        .rows_affected();
     assert_eq!(first, 1, "the first fire flips the timer (1 row updated)");
-    let second = sqlx::query(&fire).execute(&admin).await.expect("the re-fire").rows_affected();
-    assert_eq!(second, 0, "the re-fire updates 0 rows (0 double-fire — effectively-once)");
+    let second = sqlx::query(&fire)
+        .execute(&admin)
+        .await
+        .expect("the re-fire")
+        .rows_affected();
+    assert_eq!(
+        second, 0,
+        "the re-fire updates 0 rows (0 double-fire — effectively-once)"
+    );
 
     // after the fire the due-scan returns NOTHING (the partial index excludes the now-fired timer).
     let after: Vec<String> = sqlx::query(&due_scan)
@@ -124,7 +156,10 @@ async fn flow_p13_timer_wheel_bucketed_scan_and_effectively_once_fire_in_real_po
         .iter()
         .map(|r| r.get::<String, _>("timer_id"))
         .collect();
-    assert!(after.is_empty(), "the fired timer is excluded by the partial index `WHERE NOT fired`");
+    assert!(
+        after.is_empty(),
+        "the fired timer is excluded by the partial index `WHERE NOT fired`"
+    );
 
     // the far-future fleet is STILL unfired (never touched — cost nothing).
     let far_unfired: i64 = sqlx::query(&format!(
@@ -134,9 +169,15 @@ async fn flow_p13_timer_wheel_bucketed_scan_and_effectively_once_fire_in_real_po
     .await
     .unwrap()
     .get("c");
-    assert_eq!(far_unfired, 50_000, "the 50k far-future fleet is untouched (never scanned, never fired)");
+    assert_eq!(
+        far_unfired, 50_000,
+        "the 50k far-future fleet is untouched (never scanned, never fired)"
+    );
 
-    sqlx::query(&format!("DROP TABLE IF EXISTS {tbl}")).execute(&admin).await.unwrap();
+    sqlx::query(&format!("DROP TABLE IF EXISTS {tbl}"))
+        .execute(&admin)
+        .await
+        .unwrap();
     println!(
         "[2026-06-21] PASS  drill=FLOW-D3(live-PG)  armed=50001 (far-future=50000 + due=1)  \
          due-scan->[t-due] (partial-index, NO seq-scan)  fire: 1 row, re-fire: 0 rows (0 double-fire)  \

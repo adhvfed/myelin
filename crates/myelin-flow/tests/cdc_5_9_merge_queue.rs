@@ -56,7 +56,11 @@ fn ctx_base() -> EmitContextBase {
     EmitContextBase {
         tenant: tenant(),
         region: region(),
-        actor: Actor(Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, tenant())),
+        actor: Actor(Principal::stub(
+            PrincipalId("p".into()),
+            PrincipalKind::Human,
+            tenant(),
+        )),
         schema_ver: 1,
         occurred_at: Timestamp("2026-06-21T00:00:00Z".into()),
         recorded_at: Timestamp("2026-06-21T00:00:01Z".into()),
@@ -120,7 +124,10 @@ fn provider_ci_result_shape_is_the_ci_owned_shape() {
     // CI's shape opaquely; it does not own its fields).
     let refs = encode_ci_result(&rollup);
     let back = decode_ci_result(&refs, &rollup.idem_token).expect("decodable");
-    assert_eq!(back, rollup, "the engine consumes CI's CiResult shape, never a redefinition");
+    assert_eq!(
+        back, rollup,
+        "the engine consumes CI's CiResult shape, never a redefinition"
+    );
 }
 
 /// **CONSUMER side (5.9 / 9.4): the merge queue dispatches under a deterministic merge_attempt_id +
@@ -137,7 +144,12 @@ fn consumer_and_provider_agree_on_the_merge_attempt_id_without_coordination() {
     // deliver the rollup keyed on it — exactly what CI does in M4, WITHOUT coordinating with the run.
     let producer = MockCiResultProducer::new(&signals, tenant(), region(), "R1");
     let attempt = merge_attempt_id("R1", "merge.queue:0");
-    producer.deliver(&attempt, "deadbeef", CiOverall::Success, vec!["build".into(), "test".into()]);
+    producer.deliver(
+        &attempt,
+        "deadbeef",
+        CiOverall::Success,
+        vec!["build".into(), "test".into()],
+    );
 
     // CONSUMER side (the merge queue): dispatch + consume + merge.
     let mut ctx = begin(&outbox, journal, signals);
@@ -145,13 +157,20 @@ fn consumer_and_provider_agree_on_the_merge_attempt_id_without_coordination() {
         .run_merge_attempt(&request(), &OkCi, &OkMerger, None, MinorUnits(0), vec![])
         .expect("merge");
     match out {
-        MergeOutcome::Merged { merge_attempt_id: id, .. } => assert_eq!(
+        MergeOutcome::Merged {
+            merge_attempt_id: id,
+            ..
+        } => assert_eq!(
             id, attempt,
             "RECONCILE: the consumer keyed on the SAME id the producer echoed (no coordination)"
         ),
         other => panic!("expected Merged, got {other:?}"),
     }
-    assert_eq!(ctx.staged_emit_len(), 1, "the consumer emitted git.pr.merged once");
+    assert_eq!(
+        ctx.staged_emit_len(),
+        1,
+        "the consumer emitted git.pr.merged once"
+    );
 }
 
 /// **CONSUMER reliance (9.4 / X-1): a DOUBLE-delivered `ci.result` wakes the merge queue ONCE.** The
@@ -165,10 +184,23 @@ fn a_double_delivered_ci_result_wakes_the_merge_queue_once() {
 
     let producer = MockCiResultProducer::new(&signals, tenant(), region(), "R1");
     let attempt = merge_attempt_id("R1", "merge.queue:0");
-    let first = producer.deliver(&attempt, "deadbeef", CiOverall::Success, vec!["build".into(), "test".into()]);
-    let second = producer.deliver(&attempt, "deadbeef", CiOverall::Success, vec!["build".into(), "test".into()]);
+    let first = producer.deliver(
+        &attempt,
+        "deadbeef",
+        CiOverall::Success,
+        vec!["build".into(), "test".into()],
+    );
+    let second = producer.deliver(
+        &attempt,
+        "deadbeef",
+        CiOverall::Success,
+        vec!["build".into(), "test".into()],
+    );
     assert!(first, "first delivery is new");
-    assert!(!second, "the at-least-once double-delivery deduped on the merge_attempt_id");
+    assert!(
+        !second,
+        "the at-least-once double-delivery deduped on the merge_attempt_id"
+    );
     assert_eq!(signals.buffered_depth(), 1, "ONE buffered ci.result");
 
     let mut ctx = begin(&outbox, journal, signals.clone());
@@ -176,8 +208,16 @@ fn a_double_delivered_ci_result_wakes_the_merge_queue_once() {
         .run_merge_attempt(&request(), &OkCi, &OkMerger, None, MinorUnits(0), vec![])
         .expect("merge");
     assert!(matches!(out, MergeOutcome::Merged { .. }));
-    assert_eq!(ctx.consumed_signals().len(), 1, "the consumer woke ONCE on the double-delivered rollup");
-    assert_eq!(ctx.staged_emit_len(), 1, "ONE git.pr.merged (0 double-merge)");
+    assert_eq!(
+        ctx.consumed_signals().len(),
+        1,
+        "the consumer woke ONCE on the double-delivered rollup"
+    );
+    assert_eq!(
+        ctx.staged_emit_len(),
+        1,
+        "ONE git.pr.merged (0 double-merge)"
+    );
 }
 
 /// **RECONCILE on FAILURE (5.9 / 7.3): a `failure` rollup → the consumer dequeues with a humanised
@@ -191,7 +231,12 @@ fn a_failure_rollup_reconciles_to_a_humanised_dequeue() {
 
     let producer = MockCiResultProducer::new(&signals, tenant(), region(), "R1");
     let attempt = merge_attempt_id("R1", "merge.queue:0");
-    producer.deliver(&attempt, "deadbeef", CiOverall::Failure, vec!["build".into(), "test".into()]);
+    producer.deliver(
+        &attempt,
+        "deadbeef",
+        CiOverall::Failure,
+        vec!["build".into(), "test".into()],
+    );
 
     let mut ctx = begin(&outbox, journal, signals);
     let out = ctx
@@ -199,12 +244,22 @@ fn a_failure_rollup_reconciles_to_a_humanised_dequeue() {
         .expect("dequeue");
     match out {
         MergeOutcome::Dequeued { reason } => {
-            assert!(reason.contains("CI failed"), "humanised (contract 7.3): {reason}");
-            assert!(!reason.contains("ActivityError"), "no raw error code: {reason}");
+            assert!(
+                reason.contains("CI failed"),
+                "humanised (contract 7.3): {reason}"
+            );
+            assert!(
+                !reason.contains("ActivityError"),
+                "no raw error code: {reason}"
+            );
         }
         other => panic!("expected Dequeued, got {other:?}"),
     }
-    assert_eq!(ctx.staged_emit_len(), 0, "no git.pr.merged on a failure rollup");
+    assert_eq!(
+        ctx.staged_emit_len(),
+        0,
+        "no git.pr.merged on a failure rollup"
+    );
 }
 
 /// **The signal NAME both ends agree on is the NAMED `ci.result` token.** The consumer parks on

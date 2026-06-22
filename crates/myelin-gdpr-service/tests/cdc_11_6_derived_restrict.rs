@@ -63,23 +63,39 @@ fn cdc_11_6_olap_honours_the_restriction_flag_no_analytics() {
     let consumer: &dyn PersonalDataHolder = &provider;
 
     // Unrestricted: OLAP analyses the subject's rows.
-    assert!(matches!(olap.process(&subj, &tenant), DerivedProcessed::Processed(_)));
+    assert!(matches!(
+        olap.process(&subj, &tenant),
+        DerivedProcessed::Processed(_)
+    ));
 
     // SET the restriction through the contract ⇒ OLAP suppresses analytics (11.6).
-    let set = consumer.restrict(&subj, true).expect("OLAP restrict honours 11.6");
+    let set = consumer
+        .restrict(&subj, true)
+        .expect("OLAP restrict honours 11.6");
     assert_eq!(set.receipt.operation, "restrict");
-    assert!(set.receipt.content_hash.starts_with("blake3:"), "11.6: the restrict receipt is content-addressed");
+    assert!(
+        set.receipt.content_hash.starts_with("blake3:"),
+        "11.6: the restrict receipt is content-addressed"
+    );
     assert_eq!(
         olap.process(&subj, &tenant),
         DerivedProcessed::Suppressed,
         "11.6: no analytics for a restricted subject"
     );
     // Storage retained (the OLAP row survives the restriction).
-    assert!(olap.has_row(&subj, &tenant), "11.6: storage retained while restricted");
+    assert!(
+        olap.has_row(&subj, &tenant),
+        "11.6: storage retained while restricted"
+    );
 
     // CLEAR the restriction through the contract ⇒ analytics resume (reversible).
-    consumer.restrict(&subj, false).expect("OLAP un-restrict honours 11.6");
-    assert!(matches!(olap.process(&subj, &tenant), DerivedProcessed::Processed(_)), "11.6: analytics resume (reversible)");
+    consumer
+        .restrict(&subj, false)
+        .expect("OLAP un-restrict honours 11.6");
+    assert!(
+        matches!(olap.process(&subj, &tenant), DerivedProcessed::Processed(_)),
+        "11.6: analytics resume (reversible)"
+    );
 }
 
 /// **10.1 (Search/Refs/Notif/Agent faces): each derived store honours `restrict` through the
@@ -104,23 +120,37 @@ fn cdc_10_1_search_refs_notif_agent_honour_restrict() {
 
         // Unrestricted: the store processes.
         assert!(
-            matches!(store.process(&subj, &tenant), DerivedProcessed::Processed(_)),
+            matches!(
+                store.process(&subj, &tenant),
+                DerivedProcessed::Processed(_)
+            ),
             "{} processes before restriction",
             kind.holder_id()
         );
         // SET via the contract ⇒ suppressed, row retained.
-        consumer.restrict(&subj, true).expect("derived restrict honours 10.1");
+        consumer
+            .restrict(&subj, true)
+            .expect("derived restrict honours 10.1");
         assert_eq!(
             store.process(&subj, &tenant),
             DerivedProcessed::Suppressed,
             "{}: processing suppressed for the restricted subject (§4.4)",
             kind.holder_id()
         );
-        assert!(store.has_row(&subj, &tenant), "{}: storage retained", kind.holder_id());
-        // CLEAR via the contract ⇒ resumes (reversible).
-        consumer.restrict(&subj, false).expect("derived un-restrict honours 10.1");
         assert!(
-            matches!(store.process(&subj, &tenant), DerivedProcessed::Processed(_)),
+            store.has_row(&subj, &tenant),
+            "{}: storage retained",
+            kind.holder_id()
+        );
+        // CLEAR via the contract ⇒ resumes (reversible).
+        consumer
+            .restrict(&subj, false)
+            .expect("derived un-restrict honours 10.1");
+        assert!(
+            matches!(
+                store.process(&subj, &tenant),
+                DerivedProcessed::Processed(_)
+            ),
             "{}: processing resumes (reversible)",
             kind.holder_id()
         );
@@ -153,9 +183,17 @@ fn cdc_restrict_fan_out_zero_processing_across_all_five() {
 
     let set = RestrictFanOutDriver::fan_out_restrict(&subj, &tenant, true, &stores, &holders)
         .expect("the restrict fan-out honours 10.1 / 11.6");
-    assert_eq!(set.processed_count(), 0, "0 processing of a restricted subject across all five");
+    assert_eq!(
+        set.processed_count(),
+        0,
+        "0 processing of a restricted subject across all five"
+    );
     assert!(set.all_rows_retained(), "every derived row retained (§4.4)");
-    assert_eq!(set.holder_receipts.len(), 5, "one restrict receipt per derived store provider");
+    assert_eq!(
+        set.holder_receipts.len(),
+        5,
+        "one restrict receipt per derived store provider"
+    );
 
     let clear = RestrictFanOutDriver::fan_out_restrict(&subj, &tenant, false, &stores, &holders)
         .expect("the un-restrict fan-out honours 10.1 / 11.6");

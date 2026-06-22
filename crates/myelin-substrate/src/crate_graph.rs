@@ -117,12 +117,7 @@ impl Crate {
             // the verified token), events (the co-located outbox), and gdpr
             // (PersonalDataHolder — the auto-registered holder). Mirrors
             // crates/myelin-storage/Cargo.toml. It must NOT depend on -client or -substrate.
-            Crate::Storage => &[
-                Crate::Tenancy,
-                Crate::Identity,
-                Crate::Events,
-                Crate::Gdpr,
-            ],
+            Crate::Storage => &[Crate::Tenancy, Crate::Identity, Crate::Events, Crate::Gdpr],
             // Root-last: the harness depends on everything (incl. the storage substrate it
             // wires); nothing depends on it.
             Crate::Substrate => &[
@@ -198,7 +193,10 @@ mod tests {
     /// (architecture §2.9); P-S10 ships the real source-scanning lint.
     #[test]
     fn crate_graph_acyclic() {
-        assert!(is_acyclic(), "the crate dependency DAG must be acyclic (§2.9)");
+        assert!(
+            is_acyclic(),
+            "the crate dependency DAG must be acyclic (§2.9)"
+        );
         assert!(
             identity_is_sink(),
             "myelin-identity must depend on nothing above myelin-tenancy (§2.9, identity is a sink)"

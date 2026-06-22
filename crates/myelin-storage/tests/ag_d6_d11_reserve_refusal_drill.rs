@@ -78,8 +78,16 @@ fn ag_d11_runaway_loop_stops_at_the_wallet() {
     }
 
     // Exactly the funded prefix ran; the rest were refused.
-    assert_eq!(gate.runs_dispatched(), 5, "only the funded runs were fronted");
-    assert_eq!(gate.reserve_refusals(), 45, "the runaway over-budget runs were refused");
+    assert_eq!(
+        gate.runs_dispatched(),
+        5,
+        "only the funded runs were fronted"
+    );
+    assert_eq!(
+        gate.reserve_refusals(),
+        45,
+        "the runaway over-budget runs were refused"
+    );
     // NOT ONE in-flight run was interrupted by the refusals.
     assert_eq!(ledger.inflight_interrupt_count(), 0);
     for h in &live {
@@ -133,9 +141,21 @@ fn ag_d6_surge_sheds_over_budget_runs_others_unaffected() {
         }
     }
 
-    assert_eq!(gate.runs_dispatched(), 10, "exactly the funded runs admitted");
-    assert_eq!(gate.reserve_refusals(), 20, "the 30× surge over budget was shed");
-    assert_eq!(ledger.inflight_interrupt_count(), 0, "0 interrupts under surge");
+    assert_eq!(
+        gate.runs_dispatched(),
+        10,
+        "exactly the funded runs admitted"
+    );
+    assert_eq!(
+        gate.reserve_refusals(),
+        20,
+        "the 30× surge over budget was shed"
+    );
+    assert_eq!(
+        ledger.inflight_interrupt_count(),
+        0,
+        "0 interrupts under surge"
+    );
 
     // The fronted runs are unaffected — each settles to one cost event per metered unit.
     for h in &live {
@@ -149,9 +169,17 @@ fn ag_d6_surge_sheds_over_budget_runs_others_unaffected() {
                 }],
             )
             .expect("a fronted run settles");
-        assert_eq!(outcome.cost_events.len(), 1, "one cost event per metered unit");
+        assert_eq!(
+            outcome.cost_events.len(),
+            1,
+            "one cost event per metered unit"
+        );
         assert_eq!(outcome.billed_total, MinorUnits(75));
-        assert_eq!(outcome.refunded, MinorUnits(25), "the over-reservation refunds");
+        assert_eq!(
+            outcome.refunded,
+            MinorUnits(25),
+            "the over-reservation refunds"
+        );
     }
 
     let signal = AgentRunGateSignal {
@@ -175,21 +203,39 @@ fn schedule_and_run_job_fronted_by_the_same_gate() {
     let mut ledger = CostLedger::new();
 
     let handle = gate
-        .schedule_and_run_job(&mut ledger, tenant(), run(1), MinorUnits(400), MinorUnits(1_000))
+        .schedule_and_run_job(
+            &mut ledger,
+            tenant(),
+            run(1),
+            MinorUnits(400),
+            MinorUnits(1_000),
+        )
         .expect("a funded scheduled job is fronted");
     assert_eq!(handle.kind(), RunKind::ScheduleAndRunJob);
 
     // Over-budget scheduled job: not scheduled (no balance → no run).
     let err = gate
-        .schedule_and_run_job(&mut ledger, tenant(), run(2), MinorUnits(9_000), MinorUnits(50))
+        .schedule_and_run_job(
+            &mut ledger,
+            tenant(),
+            run(2),
+            MinorUnits(9_000),
+            MinorUnits(50),
+        )
         .expect_err("an over-budget scheduled job is refused");
     assert!(matches!(err, DispatchError::NoBalance { .. }));
-    assert!(ledger.state_of(&tenant(), &run(2)).is_none(), "the job was never scheduled");
+    assert!(
+        ledger.state_of(&tenant(), &run(2)).is_none(),
+        "the job was never scheduled"
+    );
 
     // The fronted job is in-flight and cannot be torn down.
     assert!(ledger.cancel_unstarted(&tenant(), &run(1)).is_err());
     assert_eq!(ledger.inflight_interrupt_count(), 0);
     // It settles normally on its completion signal (the long-park settle).
     handle.settle(&mut ledger, &[]).unwrap();
-    assert_eq!(ledger.state_of(&tenant(), &run(1)), Some(ReservationState::Settled));
+    assert_eq!(
+        ledger.state_of(&tenant(), &run(1)),
+        Some(ReservationState::Settled)
+    );
 }

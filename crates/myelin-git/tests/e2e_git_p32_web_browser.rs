@@ -25,9 +25,11 @@ use myelin_git::check_status::{
     CheckContext, CheckState, CheckStatus, CheckStatusRow, GitOid, HumanisedRef, Timestamp,
     TrustTier,
 };
-use myelin_git::merge_gate::{MergeGateOutcome, UnmetContext, UnmetReason};
-use myelin_git::project::{ChecksSummary, Projected, Projection, RenderHint, Tombstone, TombstoneReason};
 use myelin_git::lifecycle::PrState;
+use myelin_git::merge_gate::{MergeGateOutcome, UnmetContext, UnmetReason};
+use myelin_git::project::{
+    ChecksSummary, Projected, Projection, RenderHint, Tombstone, TombstoneReason,
+};
 use myelin_git::web::{
     page, CheckRowView, ChecksPanel, ForkTrustBadge, MergeReadiness, PrOverviewPage, RepoHome,
     WebEditForm,
@@ -55,7 +57,10 @@ fn row(state: CheckState, trust: TrustTier, ctx: &str, attempt: u32) -> CheckSta
         run_attempt: attempt,
         trust_tier: trust,
         details_ref: ArtifactRef("myelin://acme/ci/run/9#step-2".into()),
-        summary: HumanisedRef { template_key: "ci.check.updated".into(), args: BTreeMap::new() },
+        summary: HumanisedRef {
+            template_key: "ci.check.updated".into(),
+            args: BTreeMap::new(),
+        },
         started_at: Timestamp("2026-06-22T00:00:00Z".into()),
         completed_at: None,
         cost_settled: true,
@@ -72,8 +77,18 @@ fn write_page(name: &str, title: &str, body: &str) -> PathBuf {
 
 /// Locate a headless chromium binary on PATH (the host has `chromium`).
 fn chromium() -> Option<String> {
-    for bin in ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable"] {
-        if Command::new(bin).arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
+    for bin in [
+        "chromium",
+        "chromium-browser",
+        "google-chrome",
+        "google-chrome-stable",
+    ] {
+        if Command::new(bin)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
             return Some(bin.to_string());
         }
     }
@@ -124,7 +139,11 @@ fn git_p32_web_ui_driven_in_a_browser_switch_test_rehearsal() {
     let repo_home = RepoHome::Populated {
         slug: "acme/core".into(),
         readme_excerpt: "# core\nThe platform core.".into(),
-        entries: vec![("src".into(), true), ("README.md".into(), false), ("Cargo.toml".into(), false)],
+        entries: vec![
+            ("src".into(), true),
+            ("README.md".into(), false),
+            ("Cargo.toml".into(), false),
+        ],
         clone_url: "git@myelin.eu:acme/core.git".into(),
     }
     .render();
@@ -133,9 +152,11 @@ fn git_p32_web_ui_driven_in_a_browser_switch_test_rehearsal() {
     let p1 = write_page("repo_home", "acme/core", &repo_home);
 
     // --- Surface 2: repo home (empty — onboarding-forward) ----------------------------------------
-    let repo_empty =
-        RepoHome::Empty { slug: "acme/new".into(), clone_url: "git@myelin.eu:acme/new.git".into() }
-            .render();
+    let repo_empty = RepoHome::Empty {
+        slug: "acme/new".into(),
+        clone_url: "git@myelin.eu:acme/new.git".into(),
+    }
+    .render();
     assert!(repo_empty.contains("no commits yet"));
     let p2 = write_page("repo_empty", "acme/new", &repo_empty);
 
@@ -148,7 +169,10 @@ fn git_p32_web_ui_driven_in_a_browser_switch_test_rehearsal() {
     }
     .render();
     assert!(web_edit.contains("Commit change"));
-    assert!(web_edit.contains("refused"), "the GF-6 no-silent-overwrite note is present");
+    assert!(
+        web_edit.contains("refused"),
+        "the GF-6 no-silent-overwrite note is present"
+    );
     let p3 = write_page("web_edit", "Edit src/lib.rs", &web_edit);
 
     // --- Surface 4: PR overview with the checks panel + fork-trust badge --------------------------
@@ -175,7 +199,9 @@ fn git_p32_web_ui_driven_in_a_browser_switch_test_rehearsal() {
             unmet: vec![
                 UnmetContext {
                     context: CheckContext::ci("test"),
-                    reason: UnmetReason::NotGreen { state: CheckState::Failure },
+                    reason: UnmetReason::NotGreen {
+                        state: CheckState::Failure,
+                    },
                 },
                 UnmetContext {
                     context: CheckContext::ci("e2e"),
@@ -204,21 +230,32 @@ fn git_p32_web_ui_driven_in_a_browser_switch_test_rehearsal() {
     .render();
     assert!(pr_page.contains("Fix the receive-pack CAS race"));
     assert!(pr_page.contains("checks-panel"));
-    assert!(pr_page.contains("neutral until trusted"), "the fork-trust badge copy renders");
-    assert!(pr_page.contains("Trust this run"), "the maintainer endorse action renders");
+    assert!(
+        pr_page.contains("neutral until trusted"),
+        "the fork-trust badge copy renders"
+    );
+    assert!(
+        pr_page.contains("Trust this run"),
+        "the maintainer endorse action renders"
+    );
     assert!(pr_page.contains("merge-readiness"));
     let p4 = write_page("pr_overview", "PR #1421", &pr_page);
 
     // --- Surface 5: PR overview tombstone (0-leak permission state) -------------------------------
     let pr_tombstone = PrOverviewPage {
-        projected: Projected::Tombstoned(Tombstone { reason: TombstoneReason::Unauthorized }),
+        projected: Projected::Tombstoned(Tombstone {
+            reason: TombstoneReason::Unauthorized,
+        }),
         pr_state: PrState::Open,
         checks: ChecksPanel::Empty,
         merge: MergeReadiness::Queued { position: 1 },
     }
     .render();
     assert!(pr_tombstone.contains("not available to you"));
-    assert!(!pr_tombstone.contains("pr-title"), "a tombstone NEVER leaks a title");
+    assert!(
+        !pr_tombstone.contains("pr-title"),
+        "a tombstone NEVER leaks a title"
+    );
     let p5 = write_page("pr_tombstone", "PR", &pr_tombstone);
 
     // --- Drive each surface in the real browser ---------------------------------------------------
@@ -248,12 +285,18 @@ fn git_p32_web_ui_driven_in_a_browser_switch_test_rehearsal() {
                     }
                     record.push((name, "yes (browser-driven, DOM-asserted, screenshot)"));
                 }
-                None => record.push((name, "partial (rendered + source-asserted; browser run failed)")),
+                None => record.push((
+                    name,
+                    "partial (rendered + source-asserted; browser run failed)",
+                )),
             }
         }
     } else {
         for (name, _path, _marker) in surfaces {
-            record.push((name, "partial (rendered + source-asserted; chromium absent)"));
+            record.push((
+                name,
+                "partial (rendered + source-asserted; chromium absent)",
+            ));
         }
     }
 
@@ -268,7 +311,9 @@ fn git_p32_web_ui_driven_in_a_browser_switch_test_rehearsal() {
 
     // Every surface rendered + was asserted (yes or partial — never silently skipped).
     assert_eq!(record.len(), 5);
-    assert!(record.iter().all(|(_, s)| s.starts_with("yes") || s.starts_with("partial")));
+    assert!(record
+        .iter()
+        .all(|(_, s)| s.starts_with("yes") || s.starts_with("partial")));
 }
 
 #[test]
@@ -276,21 +321,42 @@ fn git_p32_cli_and_api_surface_the_existing_handlers() {
     // The CLI/API surfaces the EXISTING handlers (no new handler). A representative drive of the
     // `myelin …` git CLI + the HTTP catalogue, asserting each maps to an already-built handler and
     // every write is Id.check-gated (BUS-2).
-    assert_eq!(parse_cli(&["pr", "merge", "1421", "--auto"]).unwrap().handler(), Handler::MergeGate);
     assert_eq!(
-        parse_cli(&["pr", "endorse-fork-ci", "1421"]).unwrap().handler(),
+        parse_cli(&["pr", "merge", "1421", "--auto"])
+            .unwrap()
+            .handler(),
+        Handler::MergeGate
+    );
+    assert_eq!(
+        parse_cli(&["pr", "endorse-fork-ci", "1421"])
+            .unwrap()
+            .handler(),
         Handler::ForkEndorse
     );
-    assert_eq!(parse_cli(&["pr", "checks", "1421"]).unwrap().handler(), Handler::CheckStatus);
-    assert_eq!(parse_cli(&["search", "code", "needle"]).unwrap().handler(), Handler::CodeSearch);
+    assert_eq!(
+        parse_cli(&["pr", "checks", "1421"]).unwrap().handler(),
+        Handler::CheckStatus
+    );
+    assert_eq!(
+        parse_cli(&["search", "code", "needle"]).unwrap().handler(),
+        Handler::CodeSearch
+    );
 
     let cat = http_catalogue();
-    assert!(cat.iter().all(|e| !e.method.is_write() || e.id_checked), "every write is Id.check-gated");
-    assert!(cat.iter().any(|e| e.method == Method::Post && e.path.ends_with("/merge")));
+    assert!(
+        cat.iter().all(|e| !e.method.is_write() || e.id_checked),
+        "every write is Id.check-gated"
+    );
+    assert!(cat
+        .iter()
+        .any(|e| e.method == Method::Post && e.path.ends_with("/merge")));
 
     // The frozen agent-tool default: git.merge is the ONLY HITL-gated git tool.
-    let gated: Vec<&str> =
-        agent_tools().iter().filter(|t| t.requires_approval).map(|t| t.name).collect();
+    let gated: Vec<&str> = agent_tools()
+        .iter()
+        .filter(|t| t.requires_approval)
+        .map(|t| t.name)
+        .collect();
     assert_eq!(gated, vec!["git.merge"]);
 }
 
@@ -315,11 +381,29 @@ fn confirm_m3_band_exit_aggregate_rests_on_dated_green_artifacts() {
     // crate. The truth-up is structural: the named files exist (a renamed/removed drill fails here,
     // loud), and they are green in the same workspace test run (the orchestrator's gate).
     let legs: [(&str, &[&str]); 5] = [
-        ("GIT-D9", &["drills_git_d9_receive_pack.rs", "drills_git_d9_check_seam_consumer_leg.rs"]),
+        (
+            "GIT-D9",
+            &[
+                "drills_git_d9_receive_pack.rs",
+                "drills_git_d9_check_seam_consumer_leg.rs",
+            ],
+        ),
         ("GIT-D8", &["drill_git_d8_front_door.rs"]),
-        ("GIT-D11", &["cdc_4_3_git_list_pushdown.rs", "integration_git_p26_list_pushdown.rs"]),
+        (
+            "GIT-D11",
+            &[
+                "cdc_4_3_git_list_pushdown.rs",
+                "integration_git_p26_list_pushdown.rs",
+            ],
+        ),
         ("GIT-D7", &["e2e_git_d7_anchor_resolution.rs"]),
-        ("GIT-D2", &["drills_git_d2_erase_reaches_every_holder.rs", "drills_git_d2_pseudonymous_residual.rs"]),
+        (
+            "GIT-D2",
+            &[
+                "drills_git_d2_erase_reaches_every_holder.rs",
+                "drills_git_d2_pseudonymous_residual.rs",
+            ],
+        ),
     ];
     let tests_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests");
     println!("\n=== M3 producer-band exit aggregate (GIT-D9/D8/D11/D7/D2) — truth-up ===");
@@ -333,5 +417,7 @@ fn confirm_m3_band_exit_aggregate_rests_on_dated_green_artifacts() {
             println!("  {drill:<8} rests on tests/{artifact}");
         }
     }
-    println!("=== M3 git band-exit aggregate confirmed (all legs green-and-dated, 2026-06-22) ===\n");
+    println!(
+        "=== M3 git band-exit aggregate confirmed (all legs green-and-dated, 2026-06-22) ===\n"
+    );
 }

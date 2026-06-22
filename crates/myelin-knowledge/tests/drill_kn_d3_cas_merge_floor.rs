@@ -62,7 +62,9 @@ fn kn_d3_two_clients_same_block_loser_rejected_zero_silent_overwrites() {
     let mut silent_overwrites = 0u32;
 
     // alice writes at her base v1.
-    let alice_out = store.edit_block(&block, alice.base_version, "alice's paragraph", "{}").unwrap();
+    let alice_out = store
+        .edit_block(&block, alice.base_version, "alice's paragraph", "{}")
+        .unwrap();
     match alice_out {
         CasOutcome::Committed(s) => {
             commits += 1;
@@ -74,7 +76,9 @@ fn kn_d3_two_clients_same_block_loser_rejected_zero_silent_overwrites() {
     }
 
     // bob writes at his STILL-v1 base (he never saw alice's write — the concurrent edit).
-    let bob_out = store.edit_block(&block, bob.base_version, "bob's paragraph", "{}").unwrap();
+    let bob_out = store
+        .edit_block(&block, bob.base_version, "bob's paragraph", "{}")
+        .unwrap();
     match bob_out {
         CasOutcome::Committed(_) => {
             commits += 1;
@@ -89,14 +93,23 @@ fn kn_d3_two_clients_same_block_loser_rejected_zero_silent_overwrites() {
             // bob is handed the CURRENT state (alice's) to reconcile — the loser is rejected, not
             // silently overwritten.
             assert_eq!(current.version, 2, "the loser sees the current version");
-            assert_eq!(current.inline, "alice's paragraph", "the loser sees the winner's content to reconcile");
+            assert_eq!(
+                current.inline, "alice's paragraph",
+                "the loser sees the winner's content to reconcile"
+            );
             bob.base_version = current.version; // bob re-bases for his reconcile
         }
     }
 
     // EXACTLY one of the two interleaved same-block writers committed.
-    assert_eq!(commits, 1, "exactly one concurrent same-block writer commits");
-    assert_eq!(conflicts, 1, "the other is rejected with a conflict (the loser reconciles)");
+    assert_eq!(
+        commits, 1,
+        "exactly one concurrent same-block writer commits"
+    );
+    assert_eq!(
+        conflicts, 1,
+        "the other is rejected with a conflict (the loser reconciles)"
+    );
     // THE QUANTIFIED GATE: 0 silent overwrites.
     assert_eq!(silent_overwrites, 0, "KN-D3: 0 silent overwrites");
     // The store holds the WINNER's bytes (alice's), not the loser's.
@@ -108,14 +121,33 @@ fn kn_d3_two_clients_same_block_loser_rejected_zero_silent_overwrites() {
 
     // ── the loser RECONCILES: bob re-bases on the current state (v2) and re-submits → now commits. ─
     let bob_reconciled = store
-        .edit_block(&block, bob.base_version, "alice's paragraph + bob's reconciled addition", "{}")
+        .edit_block(
+            &block,
+            bob.base_version,
+            "alice's paragraph + bob's reconciled addition",
+            "{}",
+        )
         .unwrap();
-    assert!(bob_reconciled.committed(), "after reconciling at the current version, the loser commits");
-    assert_eq!(store.get(&block).unwrap().version, 3, "the reconciled commit advances to v3");
+    assert!(
+        bob_reconciled.committed(),
+        "after reconciling at the current version, the loser commits"
+    );
+    assert_eq!(
+        store.get(&block).unwrap().version,
+        3,
+        "the reconciled commit advances to v3"
+    );
 
     // the conflict-rate metric (the CRDT-promotion trigger, KQ-1) recorded the contention.
-    assert_eq!(store.meter().conflicted(), 1, "the conflict-rate metric recorded the 1 conflict");
-    assert!(store.meter().conflict_rate() > 0.0, "the CAS-conflict-rate (the CRDT trigger) is emitted");
+    assert_eq!(
+        store.meter().conflicted(),
+        1,
+        "the conflict-rate metric recorded the 1 conflict"
+    );
+    assert!(
+        store.meter().conflict_rate() > 0.0,
+        "the CAS-conflict-rate (the CRDT trigger) is emitted"
+    );
 }
 
 /// **KN-D3 (second half): different blocks edit in parallel with NO false conflict.**
@@ -131,18 +163,34 @@ fn kn_d3_different_blocks_parallel_no_false_conflict() {
     // Ten clients each edit a DIFFERENT block, all at v1, interleaved (round-robin).
     let mut all_committed = true;
     for (i, b) in blocks.iter().enumerate() {
-        let out = store.edit_block(b, 1, format!("edited by client {i}"), "{}").unwrap();
+        let out = store
+            .edit_block(b, 1, format!("edited by client {i}"), "{}")
+            .unwrap();
         if !out.committed() {
             all_committed = false;
         }
     }
-    assert!(all_committed, "every different-block edit commits — no false conflict");
+    assert!(
+        all_committed,
+        "every different-block edit commits — no false conflict"
+    );
     // 0 conflicts: different blocks are independent (the per-block CAS guard).
-    assert_eq!(store.meter().conflicted(), 0, "KN-D3: 0 false conflicts across different blocks");
-    assert_eq!(store.meter().committed(), 10, "all ten parallel different-block edits committed");
+    assert_eq!(
+        store.meter().conflicted(),
+        0,
+        "KN-D3: 0 false conflicts across different blocks"
+    );
+    assert_eq!(
+        store.meter().committed(),
+        10,
+        "all ten parallel different-block edits committed"
+    );
     // each block holds its own client's content (no cross-block clobber).
     for (i, b) in blocks.iter().enumerate() {
-        assert_eq!(store.get(b).unwrap().inline, format!("edited by client {i}"));
+        assert_eq!(
+            store.get(b).unwrap().inline,
+            format!("edited by client {i}")
+        );
     }
 }
 
@@ -163,9 +211,15 @@ fn kn_d3_chained_interleave_zero_silent_overwrites_over_many_writers() {
     for i in 0..50u64 {
         let current_version = store.get(&block).unwrap().version;
         // even writers read fresh (will commit); odd writers present a stale base (will conflict).
-        let base = if i % 2 == 0 { current_version } else { current_version.saturating_sub(1) };
+        let base = if i % 2 == 0 {
+            current_version
+        } else {
+            current_version.saturating_sub(1)
+        };
         let proposed = format!("write-{i}");
-        let out = store.edit_block(&block, base, proposed.clone(), "{}").unwrap();
+        let out = store
+            .edit_block(&block, base, proposed.clone(), "{}")
+            .unwrap();
         match out {
             CasOutcome::Committed(_) => {
                 // a commit must have held the CAS — verify the store reflects it (else a silent
@@ -178,7 +232,10 @@ fn kn_d3_chained_interleave_zero_silent_overwrites_over_many_writers() {
             CasOutcome::Conflict { current } => {
                 // the loser is handed the current state — and the store STILL holds the last legit
                 // commit, never the loser's bytes.
-                assert_eq!(current.inline, last_committed_inline, "the loser sees the current committed state");
+                assert_eq!(
+                    current.inline, last_committed_inline,
+                    "the loser sees the current committed state"
+                );
                 assert_eq!(
                     store.get(&block).unwrap().inline,
                     last_committed_inline,
@@ -189,10 +246,24 @@ fn kn_d3_chained_interleave_zero_silent_overwrites_over_many_writers() {
     }
 
     // THE QUANTIFIED GATE across the whole chain: 0 silent overwrites.
-    assert_eq!(silent_overwrites, 0, "KN-D3: 0 silent overwrites across the chained interleave");
+    assert_eq!(
+        silent_overwrites, 0,
+        "KN-D3: 0 silent overwrites across the chained interleave"
+    );
     // every odd writer (stale base) conflicted; every even writer committed.
-    assert_eq!(store.meter().conflicted(), 25, "the 25 stale writers all conflicted (rejected, reconciled)");
-    assert_eq!(store.meter().committed(), 25, "the 25 fresh writers all committed");
+    assert_eq!(
+        store.meter().conflicted(),
+        25,
+        "the 25 stale writers all conflicted (rejected, reconciled)"
+    );
+    assert_eq!(
+        store.meter().committed(),
+        25,
+        "the 25 fresh writers all committed"
+    );
     // the conflict-rate metric reflects the 50/50 contention (the CRDT-promotion trigger reads this).
-    assert!((store.meter().conflict_rate() - 0.5).abs() < 1e-9, "the conflict rate is 0.5 (high contention)");
+    assert!(
+        (store.meter().conflict_rate() - 0.5).abs() < 1e-9,
+        "the conflict rate is 0.5 (high contention)"
+    );
 }

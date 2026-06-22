@@ -129,7 +129,11 @@ async fn kn_d5_db_row_list_and_count_setexpr_join_zero_leak_zero_count_leak_revo
         },
         &viewer,
     );
-    assert_eq!(lowered.joins.len(), 1, "the InRelation lowers to ONE JOIN (no N+1)");
+    assert_eq!(
+        lowered.joins.len(),
+        1,
+        "the InRelation lowers to ONE JOIN (no N+1)"
+    );
     // Rebind the lowered JOIN clause onto the suffixed test tables + bind the viewer subject/relation
     // (in production the table names are canonical + the driver binds the params; the SHAPE under
     // test is the lowering's clause verbatim — `db_row.id` → the test table, `authz_visible` → av).
@@ -156,10 +160,23 @@ async fn kn_d5_db_row_list_and_count_setexpr_join_zero_leak_zero_count_leak_revo
     // ── 6. PROVE leak-free VIEW: exactly the TWO authorized rows; row:secret + cross-db + cross-tenant
     //       ABSENT. ──────────────────────────────────────────────────────────────────────────────
     let ids: Vec<String> = rows.iter().map(|r| r.get::<String, _>("id")).collect();
-    assert_eq!(ids, vec!["row:1".to_string(), "row:2".to_string()], "exactly the 2 visible rows (0 leak): {ids:?}");
-    assert!(!ids.iter().any(|i| i == "row:secret"), "0 leak: the confidential row is ABSENT (the SetExpr JOIN excluded it)");
-    assert!(!ids.iter().any(|i| i == "row:otherdb"), "no-cross-db: the db_id predicate excluded the other db's row (despite a grant)");
-    assert!(!ids.iter().any(|i| i == "row:x"), "0 cross-tenant: the tenant predicate excluded evilcorp's row");
+    assert_eq!(
+        ids,
+        vec!["row:1".to_string(), "row:2".to_string()],
+        "exactly the 2 visible rows (0 leak): {ids:?}"
+    );
+    assert!(
+        !ids.iter().any(|i| i == "row:secret"),
+        "0 leak: the confidential row is ABSENT (the SetExpr JOIN excluded it)"
+    );
+    assert!(
+        !ids.iter().any(|i| i == "row:otherdb"),
+        "no-cross-db: the db_id predicate excluded the other db's row (despite a grant)"
+    );
+    assert!(
+        !ids.iter().any(|i| i == "row:x"),
+        "0 cross-tenant: the tenant predicate excluded evilcorp's row"
+    );
 
     // ── 7. THE KN-D5 HEADLINE — the permission-correct COUNT(*): the SAME ACL JOIN + predicate INSIDE
     //       the aggregate. The count is the surviving cardinality, NOT a post-count over a wider scan
@@ -190,17 +207,25 @@ async fn kn_d5_db_row_list_and_count_setexpr_join_zero_leak_zero_count_leak_revo
         .fetch_all(&admin)
         .await
         .expect("EXPLAIN the db-list query");
-    let plan_text: String = plan.iter().map(|r| r.get::<String, _>(0)).collect::<Vec<_>>().join("\n");
+    let plan_text: String = plan
+        .iter()
+        .map(|r| r.get::<String, _>(0))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        plan_text.to_lowercase().contains("join") || plan_text.to_lowercase().contains("nested loop"),
+        plan_text.to_lowercase().contains("join")
+            || plan_text.to_lowercase().contains("nested loop"),
         "the read is ONE join query (no per-row check loop): {plan_text}"
     );
     let count_plan = sqlx::query(&format!("EXPLAIN (FORMAT TEXT) {count_sql}"))
         .fetch_all(&admin)
         .await
         .expect("EXPLAIN the COUNT query");
-    let count_plan_text: String =
-        count_plan.iter().map(|r| r.get::<String, _>(0)).collect::<Vec<_>>().join("\n");
+    let count_plan_text: String = count_plan
+        .iter()
+        .map(|r| r.get::<String, _>(0))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         count_plan_text.to_lowercase().contains("aggregate"),
         "the COUNT is a single aggregate over the JOINed/filtered set (ACL inside the aggregate): {count_plan_text}"
@@ -215,9 +240,19 @@ async fn kn_d5_db_row_list_and_count_setexpr_join_zero_leak_zero_count_leak_revo
     .execute(&admin)
     .await
     .expect("revoke read of row:1");
-    let rows_after = sqlx::query(&list_sql).fetch_all(&admin).await.expect("re-run the list after revoke");
-    let ids_after: Vec<String> = rows_after.iter().map(|r| r.get::<String, _>("id")).collect();
-    assert_eq!(ids_after, vec!["row:2".to_string()], "the just-revoked row:1 drops out (read-your-writes): {ids_after:?}");
+    let rows_after = sqlx::query(&list_sql)
+        .fetch_all(&admin)
+        .await
+        .expect("re-run the list after revoke");
+    let ids_after: Vec<String> = rows_after
+        .iter()
+        .map(|r| r.get::<String, _>("id"))
+        .collect();
+    assert_eq!(
+        ids_after,
+        vec!["row:2".to_string()],
+        "the just-revoked row:1 drops out (read-your-writes): {ids_after:?}"
+    );
     let count_after: i64 = sqlx::query(&count_sql)
         .fetch_one(&admin)
         .await
@@ -234,6 +269,12 @@ async fn kn_d5_db_row_list_and_count_setexpr_join_zero_leak_zero_count_leak_revo
     );
 
     // ── 10. Cleanup (forward teardown). ─────────────────────────────────────────────────────────
-    sqlx::query(&format!("DROP TABLE {row_tbl}")).execute(&admin).await.unwrap();
-    sqlx::query(&format!("DROP TABLE {av_tbl}")).execute(&admin).await.unwrap();
+    sqlx::query(&format!("DROP TABLE {row_tbl}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    sqlx::query(&format!("DROP TABLE {av_tbl}"))
+        .execute(&admin)
+        .await
+        .unwrap();
 }

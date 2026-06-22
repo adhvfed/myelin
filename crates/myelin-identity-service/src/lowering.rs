@@ -160,11 +160,10 @@ impl<'a> LowerCtx<'a> {
     /// boolean predicate fragment `<alias>.object_id IS NOT NULL` the boolean tree composes.
     fn authz_join_predicate(&mut self, relation: &str) -> String {
         // Reuse an existing alias for the same relation (the subject is constant for the whole call).
-        if let Some(existing) = self
-            .joins
-            .iter()
-            .find(|j| j.clause.contains(&format!("relation = :rel_for_{relation}")))
-        {
+        if let Some(existing) = self.joins.iter().find(|j| {
+            j.clause
+                .contains(&format!("relation = :rel_for_{relation}"))
+        }) {
             return format!("{}.object_id IS NOT NULL", existing.alias);
         }
         let alias = format!("av{}", self.joins.len());
@@ -221,8 +220,7 @@ fn lower_expr(expr: &SetExpr, ctx: &mut LowerCtx<'_>) -> String {
             if ids.is_empty() {
                 return "FALSE".to_string();
             }
-            let placeholders: Vec<String> =
-                ids.iter().map(|id| ctx.bind("id", &id.0)).collect();
+            let placeholders: Vec<String> = ids.iter().map(|id| ctx.bind("id", &id.0)).collect();
             format!("{} IN ({})", ctx.via_sql, placeholders.join(", "))
         }
         // An explicit deny-set over an otherwise-visible space → `<col> NOT IN (…)`. An empty
@@ -231,8 +229,7 @@ fn lower_expr(expr: &SetExpr, ctx: &mut LowerCtx<'_>) -> String {
             if ids.is_empty() {
                 return "TRUE".to_string();
             }
-            let placeholders: Vec<String> =
-                ids.iter().map(|id| ctx.bind("id", &id.0)).collect();
+            let placeholders: Vec<String> = ids.iter().map(|id| ctx.bind("id", &id.0)).collect();
             format!("{} NOT IN ({})", ctx.via_sql, placeholders.join(", "))
         }
         // The reverse-index JOIN keyed on the consumer's own id column (§7.2) — the SpiceDB
@@ -454,12 +451,21 @@ mod tests {
         assert_eq!(
             l.params,
             vec![
-                BoundParam { placeholder: ":id_0".into(), value: "repo:a".into() },
-                BoundParam { placeholder: ":id_1".into(), value: "repo:b".into() },
+                BoundParam {
+                    placeholder: ":id_0".into(),
+                    value: "repo:a".into()
+                },
+                BoundParam {
+                    placeholder: ":id_1".into(),
+                    value: "repo:b".into()
+                },
             ],
             "the ids are BOUND params, never interpolated into the SQL"
         );
-        assert!(l.joins.is_empty(), "an Ids lowering needs no reverse-index JOIN");
+        assert!(
+            l.joins.is_empty(),
+            "an Ids lowering needs no reverse-index JOIN"
+        );
     }
 
     /// **An empty `Ids` is `FALSE`** (the empty allow-set sees nothing — never `IN ()`, never a
@@ -473,10 +479,17 @@ mod tests {
     /// **`NotIds` → `<col> NOT IN (…)`**; an empty deny-set is `TRUE`.
     #[test]
     fn not_ids_lowers_to_not_in() {
-        let l = lower(&SetExpr::NotIds(vec![ObjectId("repo:secret".into())]), &subject("p:a"), &via());
+        let l = lower(
+            &SetExpr::NotIds(vec![ObjectId("repo:secret".into())]),
+            &subject("p:a"),
+            &via(),
+        );
         assert_eq!(l.sql_predicate, "repo.id NOT IN (:id_0)");
         let empty = lower(&SetExpr::NotIds(vec![]), &subject("p:a"), &via());
-        assert_eq!(empty.sql_predicate, "TRUE", "an empty deny-set excludes nothing");
+        assert_eq!(
+            empty.sql_predicate, "TRUE",
+            "an empty deny-set excludes nothing"
+        );
     }
 
     /// **`InRelation` → the `authz_visible` JOIN keyed on the consumer's own id column (§7.2).**
@@ -493,13 +506,32 @@ mod tests {
         );
         assert_eq!(l.joins.len(), 1, "exactly one reverse-index JOIN (no N+1)");
         let j = &l.joins[0];
-        assert!(j.clause.contains("JOIN authz_visible av0 ON av0.object_id = repo.id"), "the JOIN keys on the consumer's own id column: {}", j.clause);
-        assert!(j.clause.contains("av0.subject = :subject_0"), "the JOIN binds the subject: {}", j.clause);
-        assert!(j.clause.contains("av0.relation = :rel_for_read"), "the JOIN binds the relation: {}", j.clause);
+        assert!(
+            j.clause
+                .contains("JOIN authz_visible av0 ON av0.object_id = repo.id"),
+            "the JOIN keys on the consumer's own id column: {}",
+            j.clause
+        );
+        assert!(
+            j.clause.contains("av0.subject = :subject_0"),
+            "the JOIN binds the subject: {}",
+            j.clause
+        );
+        assert!(
+            j.clause.contains("av0.relation = :rel_for_read"),
+            "the JOIN binds the relation: {}",
+            j.clause
+        );
         assert_eq!(l.sql_predicate, "av0.object_id IS NOT NULL");
         // The subject is a BOUND param (injection-safe).
-        assert!(l.params.iter().any(|p| p.placeholder == ":subject_0" && p.value == "p:alice"));
-        assert!(l.depends_on_reverse_index(), "an InRelation lowering depends on the S8 watermark");
+        assert!(l
+            .params
+            .iter()
+            .any(|p| p.placeholder == ":subject_0" && p.value == "p:alice"));
+        assert!(
+            l.depends_on_reverse_index(),
+            "an InRelation lowering depends on the S8 watermark"
+        );
     }
 
     /// **`TupleSet` → the same `authz_visible` JOIN** (the big-result materialised path; the index
@@ -507,12 +539,16 @@ mod tests {
     #[test]
     fn tuple_set_lowers_to_the_authz_visible_join() {
         let l = lower(
-            &SetExpr::TupleSet { index: AuthzIndexRef("watcher".into()) },
+            &SetExpr::TupleSet {
+                index: AuthzIndexRef("watcher".into()),
+            },
             &subject("p:alice"),
             &via(),
         );
         assert_eq!(l.joins.len(), 1);
-        assert!(l.joins[0].clause.contains("av0.relation = :rel_for_watcher"));
+        assert!(l.joins[0]
+            .clause
+            .contains("av0.relation = :rel_for_watcher"));
         assert!(l.depends_on_reverse_index());
     }
 
@@ -527,10 +563,16 @@ mod tests {
             &subject("p:a"),
             &via(),
         );
-        assert_eq!(u.sql_predicate, "(repo.id IN (:id_0) OR repo.id IN (:id_1))");
+        assert_eq!(
+            u.sql_predicate,
+            "(repo.id IN (:id_0) OR repo.id IN (:id_1))"
+        );
 
         let i = lower(
-            &SetExpr::Intersect(vec![SetExpr::All, SetExpr::NotIds(vec![ObjectId("repo:x".into())])]),
+            &SetExpr::Intersect(vec![
+                SetExpr::All,
+                SetExpr::NotIds(vec![ObjectId("repo:x".into())]),
+            ]),
             &subject("p:a"),
             &via(),
         );
@@ -553,8 +595,14 @@ mod tests {
     fn repeated_relation_emits_one_join_no_n_plus_1() {
         let l = lower(
             &SetExpr::Union(vec![
-                SetExpr::InRelation { relation: RelName("read".into()), via_column: via() },
-                SetExpr::InRelation { relation: RelName("read".into()), via_column: via() },
+                SetExpr::InRelation {
+                    relation: RelName("read".into()),
+                    via_column: via(),
+                },
+                SetExpr::InRelation {
+                    relation: RelName("read".into()),
+                    via_column: via(),
+                },
             ]),
             &subject("p:alice"),
             &via(),
@@ -565,7 +613,10 @@ mod tests {
             "the same (subject, relation) JOIN is emitted once, however nested — no N+1"
         );
         // Both branches reference the one alias.
-        assert_eq!(l.sql_predicate, "(av0.object_id IS NOT NULL OR av0.object_id IS NOT NULL)");
+        assert_eq!(
+            l.sql_predicate,
+            "(av0.object_id IS NOT NULL OR av0.object_id IS NOT NULL)"
+        );
     }
 
     /// **Two DISTINCT relations emit two distinct JOINs** (one per `(subject, relation)`).
@@ -573,24 +624,43 @@ mod tests {
     fn distinct_relations_emit_distinct_joins() {
         let l = lower(
             &SetExpr::Union(vec![
-                SetExpr::InRelation { relation: RelName("read".into()), via_column: via() },
-                SetExpr::InRelation { relation: RelName("write".into()), via_column: via() },
+                SetExpr::InRelation {
+                    relation: RelName("read".into()),
+                    via_column: via(),
+                },
+                SetExpr::InRelation {
+                    relation: RelName("write".into()),
+                    via_column: via(),
+                },
             ]),
             &subject("p:alice"),
             &via(),
         );
         assert_eq!(l.joins.len(), 2, "two distinct relations → two JOINs");
-        assert_eq!(l.sql_predicate, "(av0.object_id IS NOT NULL OR av1.object_id IS NOT NULL)");
+        assert_eq!(
+            l.sql_predicate,
+            "(av0.object_id IS NOT NULL OR av1.object_id IS NOT NULL)"
+        );
     }
 
     /// **A watermark AT-OR-AFTER the required revision → the JOIN serves.**
     #[test]
     fn watermark_at_or_after_serves_the_join() {
         let index = ReverseIndex::new();
-        let scope = TenantScope::from_verified_token(&subject("p-admin"), myelin_tenancy::Region("eu-west".into()));
+        let scope = TenantScope::from_verified_token(
+            &subject("p-admin"),
+            myelin_tenancy::Region("eu-west".into()),
+        );
         // Advance the watermark to rev 5.
         index.advance_watermark_only(&scope, &Zookie("zk-00000000000000000005".into()));
-        let lowered = lower(&SetExpr::InRelation { relation: RelName("read".into()), via_column: via() }, &subject("p:alice"), &via());
+        let lowered = lower(
+            &SetExpr::InRelation {
+                relation: RelName("read".into()),
+                via_column: via(),
+            },
+            &subject("p:alice"),
+            &via(),
+        );
         // A scan requiring rev 3 (<= watermark 5) → the JOIN serves.
         let v = watermark_verdict(&index, &scope, &lowered, &pinned("zk-00000000000000000003"));
         assert_eq!(v, WatermarkVerdict::JoinServes);
@@ -603,14 +673,30 @@ mod tests {
     #[test]
     fn watermark_behind_falls_back_to_check() {
         let index = ReverseIndex::new();
-        let scope = TenantScope::from_verified_token(&subject("p-admin"), myelin_tenancy::Region("eu-west".into()));
+        let scope = TenantScope::from_verified_token(
+            &subject("p-admin"),
+            myelin_tenancy::Region("eu-west".into()),
+        );
         index.advance_watermark_only(&scope, &Zookie("zk-00000000000000000003".into()));
-        let lowered = lower(&SetExpr::InRelation { relation: RelName("read".into()), via_column: via() }, &subject("p:alice"), &via());
+        let lowered = lower(
+            &SetExpr::InRelation {
+                relation: RelName("read".into()),
+                via_column: via(),
+            },
+            &subject("p:alice"),
+            &via(),
+        );
         // A scan requiring rev 7 (> watermark 3) → fall back to per-row check (never serve stale).
         let v = watermark_verdict(&index, &scope, &lowered, &pinned("zk-00000000000000000007"));
-        assert!(is_fall_back(&v), "a behind index must fall back to check, not serve stale: {v:?}");
+        assert!(
+            is_fall_back(&v),
+            "a behind index must fall back to check, not serve stale: {v:?}"
+        );
         match v {
-            WatermarkVerdict::FallBackToCheck { required, watermark } => {
+            WatermarkVerdict::FallBackToCheck {
+                required,
+                watermark,
+            } => {
                 assert_eq!(required, Zookie("zk-00000000000000000007".into()));
                 assert_eq!(watermark, Zookie("zk-00000000000000000003".into()));
             }
@@ -623,14 +709,36 @@ mod tests {
     #[test]
     fn default_consistency_and_pure_ids_always_serve() {
         let index = ReverseIndex::new();
-        let scope = TenantScope::from_verified_token(&subject("p-admin"), myelin_tenancy::Region("eu-west".into()));
-        let join_lowered = lower(&SetExpr::InRelation { relation: RelName("read".into()), via_column: via() }, &subject("p:a"), &via());
+        let scope = TenantScope::from_verified_token(
+            &subject("p-admin"),
+            myelin_tenancy::Region("eu-west".into()),
+        );
+        let join_lowered = lower(
+            &SetExpr::InRelation {
+                relation: RelName("read".into()),
+                via_column: via(),
+            },
+            &subject("p:a"),
+            &via(),
+        );
         // No pinned revision → serve.
-        assert_eq!(watermark_verdict(&index, &scope, &join_lowered, &latest()), WatermarkVerdict::JoinServes);
-        // A pure-Ids lowering with a pinned revision → still serves (no reverse-index dependency).
-        let ids_lowered = lower(&SetExpr::Ids(vec![ObjectId("repo:a".into())]), &subject("p:a"), &via());
         assert_eq!(
-            watermark_verdict(&index, &scope, &ids_lowered, &pinned("zk-00000000000000000099")),
+            watermark_verdict(&index, &scope, &join_lowered, &latest()),
+            WatermarkVerdict::JoinServes
+        );
+        // A pure-Ids lowering with a pinned revision → still serves (no reverse-index dependency).
+        let ids_lowered = lower(
+            &SetExpr::Ids(vec![ObjectId("repo:a".into())]),
+            &subject("p:a"),
+            &via(),
+        );
+        assert_eq!(
+            watermark_verdict(
+                &index,
+                &scope,
+                &ids_lowered,
+                &pinned("zk-00000000000000000099")
+            ),
             WatermarkVerdict::JoinServes,
             "a materialised Ids set is watermark-independent"
         );

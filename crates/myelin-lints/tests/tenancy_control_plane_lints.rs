@@ -57,7 +57,9 @@ fn control_plane_pii_free_rejects_the_tenancy_frame_red_fixture() {
         "control-plane-pii-free MUST reject its tenancy frame red fixture `{RED}`"
     );
     assert!(
-        violations.iter().all(|v| v.lint == LintId("control-plane-pii-free")),
+        violations
+            .iter()
+            .all(|v| v.lint == LintId("control-plane-pii-free")),
         "every violation on the tenancy red fixture must carry the control-plane-pii-free id"
     );
 }
@@ -158,7 +160,10 @@ fn the_lint_guards_the_real_frozen_cross_cell_pointer_frame() {
             && green.contains("home_cell: CellId"),
         "the green fixture must be the real frozen four-field CrossCellPointer frame"
     );
-    assert!(control_plane_pii_free().run(&green).is_empty(), "the four-field frame must admit");
+    assert!(
+        control_plane_pii_free().run(&green).is_empty(),
+        "the four-field frame must admit"
+    );
     assert!(
         !control_plane_pii_free().run(&read_fixture(RED)).is_empty(),
         "the frame + an is_personal=true fifth field must be rejected"
@@ -181,6 +186,14 @@ fn ci_gate_exits_non_zero_on_the_tenancy_red_fixture_and_zero_on_green() {
             .code()
             .expect("lint-gate exits with a code, not a signal")
     };
-    assert_ne!(run_over(RED), 0, "lint-gate MUST exit non-zero on the tenancy frame red fixture");
-    assert_eq!(run_over(GREEN), 0, "lint-gate MUST exit zero on the tenancy frame green fixture");
+    assert_ne!(
+        run_over(RED),
+        0,
+        "lint-gate MUST exit non-zero on the tenancy frame red fixture"
+    );
+    assert_eq!(
+        run_over(GREEN),
+        0,
+        "lint-gate MUST exit zero on the tenancy frame green fixture"
+    );
 }

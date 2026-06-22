@@ -79,7 +79,10 @@ fn a_by_reference_consumer_cites_the_anchor_and_is_accepted() {
 /// `references-it-never-restates` assertion now fires over the first REAL subsystem doc.
 #[test]
 fn the_real_git_instance_completes_the_10_9_consumer_half() {
-    assert_eq!(GIT_INSTANCE.cited_anchor, POSTURE_ANCHOR, "the real Git instance cites the ONE anchor");
+    assert_eq!(
+        GIT_INSTANCE.cited_anchor, POSTURE_ANCHOR,
+        "the real Git instance cites the ONE anchor"
+    );
     assert!(
         git_section_references_posture(),
         "the REAL Git erasure section references the posture (does not restate it) — P-GA-28"

@@ -40,21 +40,33 @@ fn region() -> Region {
     Region("fr-par".into())
 }
 fn subject() -> Principal {
-    Principal::stub(PrincipalId("p:alice".into()), PrincipalKind::Human, tenant())
+    Principal::stub(
+        PrincipalId("p:alice".into()),
+        PrincipalKind::Human,
+        tenant(),
+    )
 }
 fn ty() -> ObjectType {
     ObjectType("issue".into())
 }
 fn bounded(rev: u64) -> Consistency {
-    Consistency { at_least: Zookie(format!("z@{rev}")), mode: ConsistencyMode::BoundedStale }
+    Consistency {
+        at_least: Zookie(format!("z@{rev}")),
+        mode: ConsistencyMode::BoundedStale,
+    }
 }
 fn strong(rev: u64) -> Consistency {
-    Consistency { at_least: Zookie(format!("z@{rev}")), mode: ConsistencyMode::Strong }
+    Consistency {
+        at_least: Zookie(format!("z@{rev}")),
+        mode: ConsistencyMode::Strong,
+    }
 }
 
 fn pin_with_dek() -> (SearchDekPin, myelin_storage::PiiKeyRef) {
     let pin = SearchDekPin::new(Arc::new(KmsEngine::new()));
-    let key_ref = pin.reserve(&tenant(), &region()).expect("reserve per-tenant index DEK");
+    let key_ref = pin
+        .reserve(&tenant(), &region())
+        .expect("reserve per-tenant index DEK");
     (pin, key_ref)
 }
 
@@ -72,14 +84,31 @@ fn cdc_s5_caches_the_typed_list_objects_result() {
         zookie: Zookie("z@5".into()),
     };
     let got = cache
-        .get_or_compute(&tenant(), &region(), &subject(), &ty(), &bounded(5), &key_ref, || ids.clone())
+        .get_or_compute(
+            &tenant(),
+            &region(),
+            &subject(),
+            &ty(),
+            &bounded(5),
+            &key_ref,
+            || ids.clone(),
+        )
         .unwrap();
-    assert_eq!(got, ids, "the S5 cache round-trips the typed Ids ListObjectsResult");
+    assert_eq!(
+        got, ids,
+        "the S5 cache round-trips the typed Ids ListObjectsResult"
+    );
     // Second read is a hit returning the byte-exact typed object (NOT an opaque blob).
     let hit = cache
-        .get_or_compute(&tenant(), &region(), &subject(), &ty(), &bounded(5), &key_ref, || {
-            panic!("must be a hit — the typed object was cached")
-        })
+        .get_or_compute(
+            &tenant(),
+            &region(),
+            &subject(),
+            &ty(),
+            &bounded(5),
+            &key_ref,
+            || panic!("must be a hit — the typed object was cached"),
+        )
         .unwrap();
     assert_eq!(hit, ids);
 
@@ -90,11 +119,20 @@ fn cdc_s5_caches_the_typed_list_objects_result() {
     };
     let other_ty = ObjectType("doc".into());
     let got = cache
-        .get_or_compute(&tenant(), &region(), &subject(), &other_ty, &bounded(5), &key_ref, || {
-            filter.clone()
-        })
+        .get_or_compute(
+            &tenant(),
+            &region(),
+            &subject(),
+            &other_ty,
+            &bounded(5),
+            &key_ref,
+            || filter.clone(),
+        )
         .unwrap();
-    assert_eq!(got, filter, "the S5 cache round-trips the typed Filter{{set_expr}} ListObjectsResult");
+    assert_eq!(
+        got, filter,
+        "the S5 cache round-trips the typed Filter{{set_expr}} ListObjectsResult"
+    );
 }
 
 /// **CONSUMER (4.10): the S5 cache is bypassed for a zookie-stamped strong read + zookie-bucketed
@@ -104,11 +142,21 @@ fn cdc_s5_caches_the_typed_list_objects_result() {
 #[test]
 fn cdc_s5_zookie_bypass_and_bucketing() {
     // The consumer's bypass decision is the frozen 4.10 mode split.
-    assert!(should_bypass(&strong(7)), "a strong read bypasses (4.10 read-your-writes)");
-    assert!(!should_bypass(&bounded(7)), "a bounded read may use the cache (degrade-not-cascade)");
+    assert!(
+        should_bypass(&strong(7)),
+        "a strong read bypasses (4.10 read-your-writes)"
+    );
+    assert!(
+        !should_bypass(&bounded(7)),
+        "a bounded read may use the cache (degrade-not-cascade)"
+    );
     // The bucket is the zookie's monotone revision suffix (the no-cross-zookie-bleed key partition).
     assert_eq!(zookie_bucket("z@7"), 7);
-    assert_ne!(zookie_bucket("z@7"), zookie_bucket("z@8"), "different buckets, different entries");
+    assert_ne!(
+        zookie_bucket("z@7"),
+        zookie_bucket("z@8"),
+        "different buckets, different entries"
+    );
 }
 
 /// **CONSUMER (4.10 / 1.10): `TTL ≤ revocation SLA` is a structural construct-time bound — a TTL
@@ -117,7 +165,10 @@ fn cdc_s5_zookie_bypass_and_bucketing() {
 /// applied to the Search caches.
 #[test]
 fn cdc_cache_ttl_bounded_by_revocation_sla() {
-    assert!(CacheTtl::bounded(300, 300).is_ok(), "TTL == SLA is the inclusive boundary");
+    assert!(
+        CacheTtl::bounded(300, 300).is_ok(),
+        "TTL == SLA is the inclusive boundary"
+    );
     assert!(
         CacheTtl::bounded(301, 300).is_err(),
         "TTL > revocation SLA must be rejected (no stale-allow past N)"
@@ -136,16 +187,28 @@ fn cdc_caches_crypto_shred_under_the_index_dek() {
 
     // Cache an S5 filter entry + a result entry.
     filter_cache
-        .get_or_compute(&tenant(), &region(), &subject(), &ty(), &bounded(5), &key_ref, || {
-            ListObjectsResult::Ids { ids: vec![ObjectId("d1".into())], zookie: Zookie("z@5".into()) }
-        })
+        .get_or_compute(
+            &tenant(),
+            &region(),
+            &subject(),
+            &ty(),
+            &bounded(5),
+            &key_ref,
+            || ListObjectsResult::Ids {
+                ids: vec![ObjectId("d1".into())],
+                zookie: Zookie("z@5".into()),
+            },
+        )
         .unwrap();
     assert!(filter_cache
         .probe_recoverable(&tenant(), &region(), &subject(), &ty(), "z@5", &key_ref)
         .unwrap());
 
     // Tenant-decommission crypto-shred: destroy the per-tenant index DEK (11.3 / §3.4).
-    assert!(pin.destroy_tenant_index_dek(&tenant(), &region()), "the index DEK was present");
+    assert!(
+        pin.destroy_tenant_index_dek(&tenant(), &region()),
+        "the index DEK was present"
+    );
 
     // The cached S5 entry is now UNRECOVERABLE — a loud KmsError, never a silent plaintext.
     assert!(

@@ -22,7 +22,10 @@ fn principal(id: &str) -> Principal {
     Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant())
 }
 fn strong() -> Consistency {
-    Consistency { at_least: Zookie("zk".into()), mode: ConsistencyMode::Strong }
+    Consistency {
+        at_least: Zookie("zk".into()),
+        mode: ConsistencyMode::Strong,
+    }
 }
 
 // ---- the frozen (stream, scope) names + the bounded-scope rule -------------------------------
@@ -32,9 +35,17 @@ fn strong() -> Consistency {
 #[test]
 fn the_inbox_stream_and_scope_are_the_frozen_bounded_names() {
     let p = principal("p-opaque-1");
-    assert_eq!(inbox_stream(&p), "fan.acme.inbox", "the stream is the per-tenant fan subject");
+    assert_eq!(
+        inbox_stream(&p),
+        "fan.acme.inbox",
+        "the stream is the per-tenant fan subject"
+    );
     let scope = inbox_scope(&p).expect("a real principal makes a bounded inbox scope");
-    assert_eq!(scope.selector(), "inbox:p-opaque-1", "the scope is the bounded inbox: selector");
+    assert_eq!(
+        scope.selector(),
+        "inbox:p-opaque-1",
+        "the scope is the bounded inbox: selector"
+    );
 }
 
 /// **An inbox scope is a BOUNDED selector, never `*` (the whitelist-not-`*` rule, BUS-3 generalised).**
@@ -50,12 +61,19 @@ fn an_inbox_scope_is_always_bounded() {
     let mut fh = Firehose::new();
     for raw in ["inbox:*", "*", "inbox:", "inbox"] {
         let r = fh.subscribe_raw("fan.acme.inbox", raw, None);
-        assert!(r.is_err(), "an unbounded inbox scope `{raw}` must be rejected, got {r:?}");
-        assert!(r.unwrap_err().is_over_broad_scope(), "`{raw}` is an over-broad-scope rejection");
+        assert!(
+            r.is_err(),
+            "an unbounded inbox scope `{raw}` must be rejected, got {r:?}"
+        );
+        assert!(
+            r.unwrap_err().is_over_broad_scope(),
+            "`{raw}` is an over-broad-scope rejection"
+        );
     }
     // a bounded inbox scope subscribes fine (the positive control).
     assert!(
-        fh.subscribe_raw("fan.acme.inbox", "inbox:p-1", None).is_ok(),
+        fh.subscribe_raw("fan.acme.inbox", "inbox:p-1", None)
+            .is_ok(),
         "a bounded inbox: scope subscribes"
     );
 }
@@ -72,14 +90,24 @@ fn watch_open_starts_live_from_now() {
     publish_inbox_frame(&mut fh, &me, "itm-old-1").unwrap();
     publish_inbox_frame(&mut fh, &me, "itm-old-2").unwrap();
 
-    let watch = watch_open(&mut fh, &me).unwrap().into_live().expect("live watch");
-    assert!(watch.drain().is_empty(), "a None-cursor watch has no backfill (live from now)");
+    let watch = watch_open(&mut fh, &me)
+        .unwrap()
+        .into_live()
+        .expect("live watch");
+    assert!(
+        watch.drain().is_empty(),
+        "a None-cursor watch has no backfill (live from now)"
+    );
 
     // only frames published after the watch opened arrive.
     publish_inbox_frame(&mut fh, &me, "itm-new-3").unwrap();
     publish_inbox_frame(&mut fh, &me, "itm-new-4").unwrap();
     let live: Vec<String> = watch.drain().into_iter().map(|f| f.item_id).collect();
-    assert_eq!(live, vec!["itm-new-3", "itm-new-4"], "a fresh watch receives only post-open frames");
+    assert_eq!(
+        live,
+        vec!["itm-new-3", "itm-new-4"],
+        "a fresh watch receives only post-open frames"
+    );
 }
 
 /// **THE D-N11 CORE (resume-cursor math): a reconnect backfills `(last_seq, now]` then live, losing
@@ -100,20 +128,38 @@ fn resume_backfills_the_gap_then_goes_live_losing_zero_items() {
     publish_inbox_frame(&mut fh, &me, "itm-5").unwrap();
 
     // reconnect with last_seq = 2 → backfill (2, now] = {3,4,5}.
-    let watch = watch_resume(&mut fh, &me, 2).unwrap().into_live().expect("in-window resume");
-    let backfilled: Vec<(u64, String)> =
-        watch.drain().into_iter().map(|f| (f.seq, f.item_id)).collect();
+    let watch = watch_resume(&mut fh, &me, 2)
+        .unwrap()
+        .into_live()
+        .expect("in-window resume");
+    let backfilled: Vec<(u64, String)> = watch
+        .drain()
+        .into_iter()
+        .map(|f| (f.seq, f.item_id))
+        .collect();
     assert_eq!(
         backfilled,
-        vec![(3, "itm-3".into()), (4, "itm-4".into()), (5, "itm-5".into())],
+        vec![
+            (3, "itm-3".into()),
+            (4, "itm-4".into()),
+            (5, "itm-5".into())
+        ],
         "the gap (last_seq, now] is replayed in order — ZERO items lost"
     );
-    assert_eq!(watch.last_seq(), 5, "the resume cursor advanced to the head");
+    assert_eq!(
+        watch.last_seq(),
+        5,
+        "the resume cursor advanced to the head"
+    );
 
     // a live frame published now is delivered with NO gap and NO duplicate.
     publish_inbox_frame(&mut fh, &me, "itm-6").unwrap();
     let live: Vec<String> = watch.drain().into_iter().map(|f| f.item_id).collect();
-    assert_eq!(live, vec!["itm-6"], "live continues gap-free after the backfill");
+    assert_eq!(
+        live,
+        vec!["itm-6"],
+        "live continues gap-free after the backfill"
+    );
 }
 
 /// **The chained reconnect property (EI-01 §4): subscribe → 1..k → DROP → k+1..m (disconnected) →
@@ -130,7 +176,11 @@ fn chained_subscribe_drop_reconnect_loses_zero_and_duplicates_zero() {
         publish_inbox_frame(&mut fh, &me, &format!("itm-{i}")).unwrap();
     }
     let seen_before: Vec<String> = first.drain().into_iter().map(|f| f.item_id).collect();
-    assert_eq!(seen_before, vec!["itm-1", "itm-2", "itm-3"], "received 1..k before the drop");
+    assert_eq!(
+        seen_before,
+        vec!["itm-1", "itm-2", "itm-3"],
+        "received 1..k before the drop"
+    );
     let k = first.last_seq();
     assert_eq!(k, 3, "the cursor at the drop is k = 3");
     // "drop" — the first watch handle is dropped (the connection died).
@@ -142,7 +192,10 @@ fn chained_subscribe_drop_reconnect_loses_zero_and_duplicates_zero() {
     }
 
     // reconnect with last_seq = k → backfill k+1..m then live.
-    let again = watch_resume(&mut fh, &me, k).unwrap().into_live().expect("in-window resume");
+    let again = watch_resume(&mut fh, &me, k)
+        .unwrap()
+        .into_live()
+        .expect("in-window resume");
     let backfilled: Vec<String> = again.drain().into_iter().map(|f| f.item_id).collect();
     assert_eq!(
         backfilled,
@@ -170,9 +223,15 @@ fn resume_at_head_is_a_no_op_not_a_resync() {
         publish_inbox_frame(&mut fh, &me, &format!("itm-{i}")).unwrap();
     }
     let out = watch_resume(&mut fh, &me, 4).unwrap();
-    assert!(!out.is_resync_required(), "a caught-up resume is NOT a resync");
+    assert!(
+        !out.is_resync_required(),
+        "a caught-up resume is NOT a resync"
+    );
     let watch = out.into_live().expect("live");
-    assert!(watch.drain().is_empty(), "a caught-up resume backfills nothing");
+    assert!(
+        watch.drain().is_empty(),
+        "a caught-up resume backfills nothing"
+    );
 }
 
 // ---- the resync_required boundary at the retention-window edge -------------------------------
@@ -194,18 +253,35 @@ fn over_old_cursor_yields_resync_required_at_the_exact_window_boundary() {
 
     // a watcher at last_seq = 2 needs op 3 first — but 3 was evicted → resync_required.
     let out = watch_resume(&mut fh, &me, 2).unwrap();
-    assert!(out.is_resync_required(), "an over-old cursor RAISES resync_required (NAMED)");
-    if let WatchOutcome::ResyncRequired { last_seq, window_floor } = out {
+    assert!(
+        out.is_resync_required(),
+        "an over-old cursor RAISES resync_required (NAMED)"
+    );
+    if let WatchOutcome::ResyncRequired {
+        last_seq,
+        window_floor,
+    } = out
+    {
         assert_eq!(last_seq, 2);
-        assert_eq!(window_floor, 4, "the window floor is the oldest held seq (4)");
+        assert_eq!(
+            window_floor, 4,
+            "the window floor is the oldest held seq (4)"
+        );
     } else {
         panic!("expected ResyncRequired");
     }
 
     // the EXACT boundary: last_seq = 3 → first-missing op = 4 == floor → IN-WINDOW (backfills {4,5,6}).
-    let watch = watch_resume(&mut fh, &me, 3).unwrap().into_live().expect("first-missing == floor");
+    let watch = watch_resume(&mut fh, &me, 3)
+        .unwrap()
+        .into_live()
+        .expect("first-missing == floor");
     let ids: Vec<String> = watch.drain().into_iter().map(|f| f.item_id).collect();
-    assert_eq!(ids, vec!["itm-4", "itm-5", "itm-6"], "the boundary cursor backfills exactly");
+    assert_eq!(
+        ids,
+        vec!["itm-4", "itm-5", "itm-6"],
+        "the boundary cursor backfills exactly"
+    );
 }
 
 /// **The `resync_required` → cold-rebuild recovery loses ZERO items end-to-end (§7).** After an
@@ -226,9 +302,15 @@ fn resync_required_falls_back_to_a_full_cold_rebuild_zero_lost() {
     for id in ["itm-a", "itm-b", "itm-c"] {
         publish_inbox_frame(&mut fh, &me, id).unwrap();
     }
-    let out = watch_resume(&mut fh, &me, 0 /* never saw anything but the window rolled */).unwrap();
+    let out = watch_resume(
+        &mut fh, &me, 0, /* never saw anything but the window rolled */
+    )
+    .unwrap();
     // last_seq 0 with an evicted head (window holds {2,3}, floor 2; first-missing 1 < 2) → resync.
-    assert!(out.is_resync_required(), "an evicted-head fresh cursor resyncs");
+    assert!(
+        out.is_resync_required(),
+        "an evicted-head fresh cursor resyncs"
+    );
 
     // the NAMED cold-rebuild: rebuild from source via list_inbox — recovers the FULL inbox.
     let auth = AllowAllAuthorize;
@@ -240,10 +322,16 @@ fn resync_required_falls_back_to_a_full_cold_rebuild_zero_lost() {
     );
 
     // after the rebuild the client re-opens a live watch from now (the recovery completes).
-    let live = watch_open(&mut fh, &me).unwrap().into_live().expect("re-open live");
+    let live = watch_open(&mut fh, &me)
+        .unwrap()
+        .into_live()
+        .expect("re-open live");
     publish_inbox_frame(&mut fh, &me, "itm-d").unwrap();
     assert_eq!(
-        live.drain().into_iter().map(|f| f.item_id).collect::<Vec<_>>(),
+        live.drain()
+            .into_iter()
+            .map(|f| f.item_id)
+            .collect::<Vec<_>>(),
         vec!["itm-d"],
         "the re-opened watch resumes live delivery"
     );
@@ -266,14 +354,31 @@ fn a_slow_watcher_is_dropped_to_resync_required_with_bounded_memory() {
     for i in 1..=3 {
         publish_inbox_frame(&mut fh, &me, &format!("itm-{i}")).unwrap();
     }
-    assert_eq!(watch.ready_len(), 3, "the in-flight queue filled to the cap");
-    assert!(!watch.resync_required(), "not dropped yet (at the cap, not over it)");
+    assert_eq!(
+        watch.ready_len(),
+        3,
+        "the in-flight queue filled to the cap"
+    );
+    assert!(
+        !watch.resync_required(),
+        "not dropped yet (at the cap, not over it)"
+    );
 
     // the 4th frame is OVER the cap → the slow watcher is DROPPED to resync_required.
     publish_inbox_frame(&mut fh, &me, "itm-over").unwrap();
-    assert!(watch.resync_required(), "a slow watcher is dropped to resync_required (NAMED)");
-    assert_eq!(watch.ready_len(), 0, "the buffer is RELEASED — memory bounded, the gap NOT buffered");
-    assert!(watch.next().is_none(), "a dropped watch delivers nothing until it cold-rebuilds");
+    assert!(
+        watch.resync_required(),
+        "a slow watcher is dropped to resync_required (NAMED)"
+    );
+    assert_eq!(
+        watch.ready_len(),
+        0,
+        "the buffer is RELEASED — memory bounded, the gap NOT buffered"
+    );
+    assert!(
+        watch.next().is_none(),
+        "a dropped watch delivers nothing until it cold-rebuilds"
+    );
 }
 
 /// A watcher that KEEPS UP is never dropped: it pulls each frame as it arrives, so the in-flight
@@ -285,11 +390,19 @@ fn a_keeping_up_watcher_is_never_dropped() {
     let watch = watch_open(&mut fh, &me).unwrap().into_live().expect("live");
     for i in 1..=50u64 {
         publish_inbox_frame(&mut fh, &me, &format!("itm-{i}")).unwrap();
-        let f = watch.next().expect("a keeping-up watcher always has its frame");
+        let f = watch
+            .next()
+            .expect("a keeping-up watcher always has its frame");
         assert_eq!(f.seq, i, "delivered in order");
-        assert!(watch.ready_len() <= 1, "in-flight stays bounded for a keeping-up watcher");
+        assert!(
+            watch.ready_len() <= 1,
+            "in-flight stays bounded for a keeping-up watcher"
+        );
     }
-    assert!(!watch.resync_required(), "a keeping-up watcher is never dropped");
+    assert!(
+        !watch.resync_required(),
+        "a keeping-up watcher is never dropped"
+    );
 }
 
 // ---- fan-out + the pointer-only frame body --------------------------------------------------
@@ -302,8 +415,14 @@ fn a_frame_carries_only_the_item_id_pointer() {
     let mut fh = Firehose::new();
     let me = principal("p-me");
     let frame = publish_inbox_frame(&mut fh, &me, "itm-pointer").unwrap();
-    assert_eq!(frame.item_id, "itm-pointer", "the frame body is the item_id pointer, never a payload");
-    assert_eq!(frame.seq, 1, "the transport assigns the per-(stream,scope) monotone seq (1)");
+    assert_eq!(
+        frame.item_id, "itm-pointer",
+        "the frame body is the item_id pointer, never a payload"
+    );
+    assert_eq!(
+        frame.seq, 1,
+        "the transport assigns the per-(stream,scope) monotone seq (1)"
+    );
 }
 
 /// Two watchers on the SAME inbox both receive every live frame (the fan-out property) — e.g. the
@@ -315,7 +434,10 @@ fn publish_fans_out_to_every_open_watch_on_the_inbox() {
     let a = watch_open(&mut fh, &me).unwrap().into_live().expect("a");
     let b = watch_open(&mut fh, &me).unwrap().into_live().expect("b");
     publish_inbox_frame(&mut fh, &me, "itm-fanout").unwrap();
-    assert_eq!(a.drain().into_iter().map(|f| f.item_id).collect::<Vec<_>>(), vec!["itm-fanout"]);
+    assert_eq!(
+        a.drain().into_iter().map(|f| f.item_id).collect::<Vec<_>>(),
+        vec!["itm-fanout"]
+    );
     assert_eq!(
         b.drain().into_iter().map(|f| f.item_id).collect::<Vec<_>>(),
         vec!["itm-fanout"],
@@ -330,19 +452,30 @@ fn different_principals_have_independent_inbox_slices() {
     let mut fh = Firehose::new();
     let alice = principal("p-alice");
     let bob = principal("p-bob");
-    let alice_watch = watch_open(&mut fh, &alice).unwrap().into_live().expect("alice");
+    let alice_watch = watch_open(&mut fh, &alice)
+        .unwrap()
+        .into_live()
+        .expect("alice");
     let bob_watch = watch_open(&mut fh, &bob).unwrap().into_live().expect("bob");
 
     publish_inbox_frame(&mut fh, &alice, "itm-for-alice").unwrap();
     publish_inbox_frame(&mut fh, &bob, "itm-for-bob").unwrap();
 
     assert_eq!(
-        alice_watch.drain().into_iter().map(|f| f.item_id).collect::<Vec<_>>(),
+        alice_watch
+            .drain()
+            .into_iter()
+            .map(|f| f.item_id)
+            .collect::<Vec<_>>(),
         vec!["itm-for-alice"],
         "alice's watch sees ONLY alice's inbox slice"
     );
     assert_eq!(
-        bob_watch.drain().into_iter().map(|f| f.item_id).collect::<Vec<_>>(),
+        bob_watch
+            .drain()
+            .into_iter()
+            .map(|f| f.item_id)
+            .collect::<Vec<_>>(),
         vec!["itm-for-bob"],
         "bob's watch sees ONLY bob's inbox slice — never alice's"
     );

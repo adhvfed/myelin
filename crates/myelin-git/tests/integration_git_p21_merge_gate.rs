@@ -48,7 +48,10 @@ fn fact(context: &str, attempt: u32, state: CheckState, trust: TrustTier) -> Che
         run_attempt: attempt,
         trust_tier: trust,
         details_ref: ArtifactRef(format!("myelin://{TENANT}/ci/run/{attempt}#step-2")),
-        summary: HumanisedRef { template_key: "ci.check.updated".into(), args },
+        summary: HumanisedRef {
+            template_key: "ci.check.updated".into(),
+            args,
+        },
         started_at: Timestamp("2026-06-22T00:00:00Z".into()),
         completed_at: Some(Timestamp("2026-06-22T00:01:00Z".into())),
         cost_settled: true,
@@ -87,9 +90,12 @@ async fn merge_gate_blocks_until_required_set_complete_over_postgres() {
     let policy = MergeGatePolicy::from_required_contexts(&["ci/build", "ci/test"]).unwrap();
 
     // partial: build green; test MISSING.
-    proj.apply("p21-build-1", &fact("build", 1, CheckState::Success, TrustTier::Trusted))
-        .await
-        .unwrap();
+    proj.apply(
+        "p21-build-1",
+        &fact("build", 1, CheckState::Success, TrustTier::Trusted),
+    )
+    .await
+    .unwrap();
 
     // the gate BLOCKS over the live table — test is missing (0 under-gated merges).
     match proj.merge_gate(TENANT, &head, &policy, &[]).await.unwrap() {
@@ -102,9 +108,12 @@ async fn merge_gate_blocks_until_required_set_complete_over_postgres() {
     }
 
     // complete the set: test green.
-    proj.apply("p21-test-1", &fact("test", 1, CheckState::Success, TrustTier::Trusted))
-        .await
-        .unwrap();
+    proj.apply(
+        "p21-test-1",
+        &fact("test", 1, CheckState::Success, TrustTier::Trusted),
+    )
+    .await
+    .unwrap();
 
     // the gate is ADMITTED.
     assert_eq!(
@@ -126,29 +135,39 @@ async fn fork_gate_neutral_until_endorsed_over_postgres() {
     let policy = MergeGatePolicy::from_required_contexts(&["ci/build"]).unwrap();
 
     // the fork self-greens build — untrusted_fork.
-    proj.apply("p21-fork-1", &fact("build", 1, CheckState::Success, TrustTier::UntrustedFork))
-        .await
-        .unwrap();
+    proj.apply(
+        "p21-fork-1",
+        &fact("build", 1, CheckState::Success, TrustTier::UntrustedFork),
+    )
+    .await
+    .unwrap();
 
     // un-endorsed → neutral → block.
     match proj.merge_gate(TENANT, &head, &policy, &[]).await.unwrap() {
         MergeGateOutcome::Blocked { unmet } => {
             assert_eq!(unmet[0].reason, UnmetReason::UntrustedForkNeutral);
         }
-        MergeGateOutcome::Admitted => panic!("an un-endorsed fork success must block over Postgres"),
+        MergeGateOutcome::Admitted => {
+            panic!("an un-endorsed fork success must block over Postgres")
+        }
     }
 
     // endorsed (the GIT-P22 input) → admit.
     assert_eq!(
-        proj.merge_gate(TENANT, &head, &policy, &[CheckContext::ci("build")]).await.unwrap(),
+        proj.merge_gate(TENANT, &head, &policy, &[CheckContext::ci("build")])
+            .await
+            .unwrap(),
         MergeGateOutcome::Admitted,
         "a maintainer-endorsed fork success admits over Postgres"
     );
 
     // a trusted re-run (attempt 2) supersedes the fork fact IN SQL → now admits with NO endorsement.
-    proj.apply("p21-rerun-2", &fact("build", 2, CheckState::Success, TrustTier::Trusted))
-        .await
-        .unwrap();
+    proj.apply(
+        "p21-rerun-2",
+        &fact("build", 2, CheckState::Success, TrustTier::Trusted),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         proj.merge_gate(TENANT, &head, &policy, &[]).await.unwrap(),
         MergeGateOutcome::Admitted,
@@ -166,17 +185,32 @@ async fn superseding_failure_reblocks_over_postgres() {
     let head = GitOid(HEAD.into());
     let policy = MergeGatePolicy::from_required_contexts(&["ci/build"]).unwrap();
 
-    proj.apply("p21-ok-1", &fact("build", 1, CheckState::Success, TrustTier::Trusted)).await.unwrap();
+    proj.apply(
+        "p21-ok-1",
+        &fact("build", 1, CheckState::Success, TrustTier::Trusted),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         proj.merge_gate(TENANT, &head, &policy, &[]).await.unwrap(),
         MergeGateOutcome::Admitted
     );
 
     // a re-run FAILS (attempt 2) — supersedes in SQL → re-blocked.
-    proj.apply("p21-fail-2", &fact("build", 2, CheckState::Failure, TrustTier::Trusted)).await.unwrap();
+    proj.apply(
+        "p21-fail-2",
+        &fact("build", 2, CheckState::Failure, TrustTier::Trusted),
+    )
+    .await
+    .unwrap();
     match proj.merge_gate(TENANT, &head, &policy, &[]).await.unwrap() {
         MergeGateOutcome::Blocked { unmet } => {
-            assert_eq!(unmet[0].reason, UnmetReason::NotGreen { state: CheckState::Failure });
+            assert_eq!(
+                unmet[0].reason,
+                UnmetReason::NotGreen {
+                    state: CheckState::Failure
+                }
+            );
         }
         MergeGateOutcome::Admitted => panic!("a superseding failure must re-block over Postgres"),
     }

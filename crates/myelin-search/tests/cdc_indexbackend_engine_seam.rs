@@ -41,7 +41,9 @@ impl QueryStandIn<'_> {
         // Step 1 (mocked here): list_objects(viewer, read, T) → the allow-set.
         let acl_filter = AclFilter::ids(reachable.iter().copied());
         // Step 4: engine.search WITH the composed filter (pre-filter, never post-filter).
-        self.engine.search(&acl_filter, text, 50).expect("engine search")
+        self.engine
+            .search(&acl_filter, text, 50)
+            .expect("engine search")
     }
 }
 
@@ -72,7 +74,8 @@ fn indexbackend_seam_answers_a_pre_filtered_query() {
 
     // The viewer's reachable set EXCLUDES ENG-3 (the secret runbook).
     let consumer = QueryStandIn { engine: &engine };
-    let hits = consumer.permission_aware_search(&["acme/issue/ENG-1", "acme/issue/ENG-2"], "deadlock");
+    let hits =
+        consumer.permission_aware_search(&["acme/issue/ENG-1", "acme/issue/ENG-2"], "deadlock");
 
     let ids: std::collections::BTreeSet<String> = hits.into_iter().map(|h| h.doc_id).collect();
     assert_eq!(
@@ -103,7 +106,12 @@ fn indexbackend_structured_seam_round_trips() {
     let acl_filter = AclFilter::ids(["d1", "d2", "d3"]);
     let engine_ref: &dyn IndexBackend = &engine;
     let open = engine_ref
-        .search_structured(&acl_filter, "status", &FieldValue::Select("open".into()), 50)
+        .search_structured(
+            &acl_filter,
+            "status",
+            &FieldValue::Select("open".into()),
+            50,
+        )
         .expect("structured search");
     let ids: std::collections::BTreeSet<String> = open.into_iter().map(|h| h.doc_id).collect();
     assert_eq!(ids, ["d1", "d3"].iter().map(|s| s.to_string()).collect());
@@ -125,5 +133,9 @@ fn indexbackend_merge_snapshot_seam() {
     assert_eq!(engine.snapshot().expect("snapshot"), 4);
     engine.delete("d1").expect("delete");
     engine.merge().expect("merge");
-    assert_eq!(engine.snapshot().expect("snapshot after merge"), 3, "the deleted doc is gone");
+    assert_eq!(
+        engine.snapshot().expect("snapshot after merge"),
+        3,
+        "the deleted doc is gone"
+    );
 }

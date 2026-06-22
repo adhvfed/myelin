@@ -36,7 +36,11 @@ fn tenant() -> TenantId {
 }
 
 fn subject(id: &str) -> SubjectRef {
-    SubjectRef::new(Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant()))
+    SubjectRef::new(Principal::stub(
+        PrincipalId(id.into()),
+        PrincipalKind::Human,
+        tenant(),
+    ))
 }
 
 /// **The `transfer_allowed` gate (the provider) ⇄ a transfer caller (the consumer).** The §5.3
@@ -56,10 +60,17 @@ fn cdc_10_5_transfer_allowed_denies_extra_eu_by_default() {
 
     // consumer (the future real-LLM adapter): an extra-EU target is DENIED by default.
     let verdict = gate.transfer_allowed(&Region::new("us-east"));
-    assert_eq!(verdict, TransferVerdict::Denied, "deny extra-EU by default (§5.2)");
+    assert_eq!(
+        verdict,
+        TransferVerdict::Denied,
+        "deny extra-EU by default (§5.2)"
+    );
     // the caller HONOURS the deny — it must not move PII when the gate says Denied.
     let pii_moved = if verdict.is_allowed() { 1 } else { 0 };
-    assert_eq!(pii_moved, 0, "0 default extra-EU PII transfers slip through");
+    assert_eq!(
+        pii_moved, 0,
+        "0 default extra-EU PII transfers slip through"
+    );
 
     // record a valid transfer mechanism — now the extra-EU target is ADMITTED (the adapter path).
     gate.record_transfer_mechanism(Region::new("us-east"));
@@ -70,7 +81,11 @@ fn cdc_10_5_transfer_allowed_denies_extra_eu_by_default() {
     );
 
     // the green artifact: the by-default extra-EU deny was counted (the one above, before recording).
-    assert_eq!(gate.extra_eu_denial_count(), 1, "the deny-by-default is observable");
+    assert_eq!(
+        gate.extra_eu_denial_count(),
+        1,
+        "the deny-by-default is observable"
+    );
 }
 
 /// **The consent registry (the provider) ⇄ a consent caller (the consumer).** A controller-posture
@@ -97,7 +112,10 @@ fn cdc_10_5_consent_withdrawal_propagates_with_erase_scope() {
         2000,
     );
     // the path is STOPPED.
-    assert!(!reg.in_force(&s, &t, "marketing-emails"), "the consent-path is stopped");
+    assert!(
+        !reg.in_force(&s, &t, "marketing-emails"),
+        "the consent-path is stopped"
+    );
     // the withdrawal TRIGGERS DELETION — the caller consumes the erase scope.
     let scope = match effect {
         WithdrawalEffect::StoppedAndTriggersDeletion(scope) => scope,
@@ -106,7 +124,10 @@ fn cdc_10_5_consent_withdrawal_propagates_with_erase_scope() {
     // the consumer drives the EXISTING erase fan-out over this scope (the seam, here asserted shape).
     match scope {
         EraseScope::Subject { subject, tenant } => {
-            assert_eq!(subject.principal.principal_id.0, "u-cdc", "the erase scope is the subject");
+            assert_eq!(
+                subject.principal.principal_id.0, "u-cdc",
+                "the erase scope is the subject"
+            );
             assert_eq!(tenant.0, "acme");
         }
         other => panic!("expected a Subject erase scope, got {other:?}"),
@@ -125,12 +146,22 @@ fn cdc_10_5_subprocessor_registry_versioned_region_dpa_objection() {
     assert_eq!(v, 1);
 
     // consumer (the objection workflow): a tenant objects.
-    assert!(reg.object(&tenant(), "eu-llm-adapter"), "the objection is recorded");
+    assert!(
+        reg.object(&tenant(), "eu-llm-adapter"),
+        "the objection is recorded"
+    );
 
     // consumer (the change-notification surface): read the list — version + region + DPA + objection.
     let entry = reg.get("eu-llm-adapter").expect("registered");
     assert_eq!(entry.region, Region::new("fr-par"), "region surfaced");
     assert_eq!(entry.dpa_ref, "DPA-2026-001", "DPA ref surfaced");
-    assert_eq!(entry.version, 1, "version surfaced (the change-notification delta)");
-    assert_eq!(entry.objections, vec!["acme".to_string()], "the objection is surfaced");
+    assert_eq!(
+        entry.version, 1,
+        "version surfaced (the change-notification delta)"
+    );
+    assert_eq!(
+        entry.objections,
+        vec!["acme".to_string()],
+        "the objection is surfaced"
+    );
 }

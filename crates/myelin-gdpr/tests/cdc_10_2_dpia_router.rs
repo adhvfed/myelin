@@ -59,7 +59,11 @@ struct ProfileRow {
 fn dpia_provider_emits_the_marker_the_router_consumes() {
     // PROVIDER: the derive's registry → the special-category marker set (the data-map contribution).
     let current: BTreeSet<DpiaMarker> = dpia_markers::<ProfileRow>();
-    assert_eq!(current.len(), 1, "exactly the one special-category field emits a marker");
+    assert_eq!(
+        current.len(),
+        1,
+        "exactly the one special-category field emits a marker"
+    );
     let marker = current.iter().next().unwrap();
     assert_eq!(marker.field_path, "ProfileRow.health_note");
     assert_eq!(marker.special_category_kind, "health");
@@ -67,7 +71,11 @@ fn dpia_provider_emits_the_marker_the_router_consumes() {
     // CONSUMER: the DPIA router routes the new flow (prior = empty: a fresh data map) into the gate.
     let router = DpiaRouter::new();
     let verdicts = router.route(&BTreeSet::new(), &current);
-    assert_eq!(verdicts.len(), 1, "the new special-category flow fires the DPIA gate");
+    assert_eq!(
+        verdicts.len(),
+        1,
+        "the new special-category flow fires the DPIA gate"
+    );
     match &verdicts[0] {
         DpiaVerdict::Required { marker, reason } => {
             assert_eq!(marker.field_path, "ProfileRow.health_note");

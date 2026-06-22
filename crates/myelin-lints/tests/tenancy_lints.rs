@@ -117,8 +117,14 @@ fn residency_pin_reads_the_cell_region_from_the_harness_not_a_request_field() {
         green.contains("region: ctx.region"),
         "the green fixture's region source is the harness-threaded cell handle (correct)"
     );
-    assert!(!residency_pin().run(&red).is_empty(), "request-sourced region must reject");
-    assert!(residency_pin().run(&green).is_empty(), "cell-sourced region must admit");
+    assert!(
+        !residency_pin().run(&red).is_empty(),
+        "request-sourced region must reject"
+    );
+    assert!(
+        residency_pin().run(&green).is_empty(),
+        "cell-sourced region must admit"
+    );
 }
 
 #[test]

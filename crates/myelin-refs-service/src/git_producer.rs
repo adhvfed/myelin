@@ -75,9 +75,7 @@ use myelin_tenancy::{Region, TenantId};
 
 use crate::emit::{emit_edges, EdgeDraft};
 use crate::ladder::{resolve_line_range, LineRangeState, MintedLineRange, SubState};
-use crate::resolve::{
-    OwnerProjection, ProjectApi, ProjectApiError, ProjectOutcome, ResolveMode,
-};
+use crate::resolve::{OwnerProjection, ProjectApi, ProjectApiError, ProjectOutcome, ResolveMode};
 use crate::SubAnchorResolver;
 
 /// **The Git reference-edge producer (contract 5.4 EMIT side — the REAL Git producer, no longer
@@ -231,13 +229,27 @@ impl GitOwner {
         GitOwner::default()
     }
 
-    fn acl_key(tenant: &TenantId, region: &Region, viewer: &Principal, root: &ArtifactRef) -> String {
-        format!("{}|{}|{}|{}", tenant.0, region.0, viewer.principal_id.0, root.0)
+    fn acl_key(
+        tenant: &TenantId,
+        region: &Region,
+        viewer: &Principal,
+        root: &ArtifactRef,
+    ) -> String {
+        format!(
+            "{}|{}|{}|{}",
+            tenant.0, region.0, viewer.principal_id.0, root.0
+        )
     }
 
     /// Grant a viewer the `view` permission on a Git root (the recorded ACL — the GIT-D11 / 4.9
     /// fragment's `repo->pull` grant, modelled here; production is Identity's `check`).
-    pub fn grant_view(&self, tenant: &TenantId, region: &Region, viewer: &Principal, root: &ArtifactRef) {
+    pub fn grant_view(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+        viewer: &Principal,
+        root: &ArtifactRef,
+    ) {
         self.acl
             .lock()
             .unwrap()
@@ -304,9 +316,9 @@ impl GitOwner {
             // The content-anchored line range — the §3.5 classifier (exact/rebased/partial/content_gone).
             Some(Sub::LineRange { .. }) => match self.line_ranges.lock().unwrap().get(&ref_.0) {
                 Some(anchor) => {
-                    let current: Vec<&str> = anchor.current_lines.iter().map(String::as_str).collect();
-                    let state =
-                        resolve_line_range(&anchor.minted, &anchor.current_oid, &current);
+                    let current: Vec<&str> =
+                        anchor.current_lines.iter().map(String::as_str).collect();
+                    let state = resolve_line_range(&anchor.minted, &anchor.current_oid, &current);
                     // Carry the (shift-adjusted) range onto the renderable arms so the projection
                     // reflects the resolved position (MOVED/OUTDATED), never a stale raw line number.
                     let mut p = projection;
@@ -352,7 +364,10 @@ impl GitOwner {
             LineRangeState::Rebased { new_start, new_end } => {
                 format!("{}#L{new_start}-L{new_end}", root.0)
             }
-            LineRangeState::Partial { surviving_start, surviving_end } => {
+            LineRangeState::Partial {
+                surviving_start,
+                surviving_end,
+            } => {
                 format!("{}#L{surviving_start}-L{surviving_end}", root.0)
             }
             // content_gone carries no anchor (the tombstone carries the root, the chokepoint's job).

@@ -155,10 +155,15 @@ pub trait ListObjectsPort {
 pub enum RelationalLeaf {
     /// `InRelation{relation, via_column}` — objects where the doc_id is the object of `relation`
     /// for the subject, JOINed by the consumer's own `via_column`.
-    InRelation { relation: RelName, via_column: ColRef },
+    InRelation {
+        relation: RelName,
+        via_column: ColRef,
+    },
     /// `TupleSet{index}` — a server-materialised `(subject, relation, object_id)` tuple set to
     /// JOIN/semijoin against (the big-result path).
-    TupleSet { index: myelin_identity::AuthzIndexRef },
+    TupleSet {
+        index: myelin_identity::AuthzIndexRef,
+    },
 }
 
 /// **The authz reverse-index revision watermark (contract 4.10, §4.2.3).** A monotone revision the
@@ -210,7 +215,12 @@ impl<'a, B: IndexBackend> ScopedEngine<'a, B> {
         region: impl Into<String>,
         schema: FieldSchema,
     ) -> ScopedEngine<'a, B> {
-        ScopedEngine { backend, tenant: tenant.into(), region: region.into(), schema }
+        ScopedEngine {
+            backend,
+            tenant: tenant.into(),
+            region: region.into(),
+            schema,
+        }
     }
 
     /// The tenant this engine is scoped to (the partition key half the viewer is checked against).
@@ -269,7 +279,10 @@ impl Page {
     pub const MAX_LIMIT: usize = 1_000;
 
     /// The default first page (offset 0, 50 rows).
-    pub const FIRST: Page = Page { offset: 0, limit: 50 };
+    pub const FIRST: Page = Page {
+        offset: 0,
+        limit: 50,
+    };
 
     /// The clamped effective limit (`min(limit, MAX_LIMIT)`, at least 1).
     fn effective_limit(self) -> usize {
@@ -365,14 +378,21 @@ pub enum QueryError {
     /// cross-tenant query attempt. REJECTED (cross-tenant 0, SRCH-D3): the engine is the wrong
     /// tenant's index. (The tenant is from the verified token, never a path — this catches a
     /// mis-wired caller, never a spoofable path parameter.)
-    TenantMismatch { viewer_tenant: String, engine_tenant: String },
+    TenantMismatch {
+        viewer_tenant: String,
+        engine_tenant: String,
+    },
     /// **The authz reverse-index JOIN read a revision STALER than the required watermark (SRCH-P09 /
     /// contract 4.10).** A relational `SetExpr` leaf resolved to a reverse-index answer whose
     /// revision is BELOW the watermark the `list_objects` zookie required — the JOIN refuses to
     /// compose a stale reverse-index revision (a stale revision could re-admit a just-revoked grant,
     /// the new-enemy problem). Surfaced loudly here; the full no-stale-grant + fail-static bounded
     /// re-check is SRCH-P10. NEVER served stale-allow.
-    StaleReverseIndex { required: u64, served: u64, form: &'static str },
+    StaleReverseIndex {
+        required: u64,
+        served: u64,
+        form: &'static str,
+    },
 }
 
 impl std::fmt::Display for QueryError {
@@ -381,13 +401,20 @@ impl std::fmt::Display for QueryError {
             QueryError::Compile(e) => write!(f, "query did not compile: {e}"),
             QueryError::Engine(e) => write!(f, "search engine error: {e}"),
             QueryError::Authz(e) => write!(f, "list_objects (authz) failed: {e:?}"),
-            QueryError::TenantMismatch { viewer_tenant, engine_tenant } => write!(
+            QueryError::TenantMismatch {
+                viewer_tenant,
+                engine_tenant,
+            } => write!(
                 f,
                 "cross-tenant query rejected: viewer tenant `{viewer_tenant}` != engine tenant \
                  `{engine_tenant}` (SRCH-D3 — tenant from the verified token, the engine is the \
                  wrong tenant's index)"
             ),
-            QueryError::StaleReverseIndex { required, served, form } => write!(
+            QueryError::StaleReverseIndex {
+                required,
+                served,
+                form,
+            } => write!(
                 f,
                 "the authz reverse-index JOIN for the relational form `{form}` served revision \
                  {served} but the list_objects watermark requires >= {required} (contract 4.10) — \
@@ -452,7 +479,11 @@ fn lower_acl(
             stats.ids_mode_count.fetch_add(1, Ordering::Relaxed);
             let ids: Vec<String> = ids.iter().map(|o| o.0.clone()).collect();
             // An empty materialised allow-set is `None` (the viewer can see nothing of this type).
-            let filter = if ids.is_empty() { AclFilter::None } else { AclFilter::Ids(ids) };
+            let filter = if ids.is_empty() {
+                AclFilter::None
+            } else {
+                AclFilter::Ids(ids)
+            };
             Ok((filter, zookie.0.clone()))
         }
         ListObjectsResult::Filter { set_expr, zookie } => {
@@ -485,16 +516,27 @@ fn lower_set_expr(
         SetExpr::Ids(ids) => {
             let ids: Vec<String> = ids.iter().map(|o| o.0.clone()).collect();
             // An explicit empty allow-set is deny (nothing visible) — `None`, never `All`.
-            Ok(if ids.is_empty() { AclFilter::None } else { AclFilter::Ids(ids) })
+            Ok(if ids.is_empty() {
+                AclFilter::None
+            } else {
+                AclFilter::Ids(ids)
+            })
         }
         SetExpr::NotIds(ids) => {
             let ids: Vec<String> = ids.iter().map(|o| o.0.clone()).collect();
             // An empty deny-set excludes nothing ⇒ everything of this type is visible (`All`).
-            Ok(if ids.is_empty() { AclFilter::All } else { AclFilter::NotIds(ids) })
+            Ok(if ids.is_empty() {
+                AclFilter::All
+            } else {
+                AclFilter::NotIds(ids)
+            })
         }
         // **THE RELATIONAL REVERSE-INDEX JOIN (SRCH-P09).** Resolve the relational leaf to the
         // co-located visible-id set via the per-tenant authz reverse index, honouring the watermark.
-        SetExpr::InRelation { relation, via_column } => resolve_relational_leaf(
+        SetExpr::InRelation {
+            relation,
+            via_column,
+        } => resolve_relational_leaf(
             &RelationalLeaf::InRelation {
                 relation: relation.clone(),
                 via_column: via_column.clone(),
@@ -506,7 +548,9 @@ fn lower_set_expr(
             stats,
         ),
         SetExpr::TupleSet { index } => resolve_relational_leaf(
-            &RelationalLeaf::TupleSet { index: index.clone() },
+            &RelationalLeaf::TupleSet {
+                index: index.clone(),
+            },
             "TupleSet",
             subject,
             identity,
@@ -770,8 +814,7 @@ fn query_consistent_with_vector<B: IndexBackend>(
 
     // **STEP 2 — compile the frozen AST** to the FT/structured/vector branches (SRCH-P07).
     let plan = compiler::compile(ast, &engine.schema)?;
-    let post_fetch_fields: Vec<String> =
-        plan.post_fetch.iter().map(|p| p.field.clone()).collect();
+    let post_fetch_fields: Vec<String> = plan.post_fetch.iter().map(|p| p.field.clone()).collect();
 
     // **STEP 3 — CONJOIN.** The ACL filter is attached via the seam; the engine is unreachable
     // without it (the search-requires-acl-filter ratchet, structural). `None` short-circuits to an
@@ -779,7 +822,11 @@ fn query_consistent_with_vector<B: IndexBackend>(
     let conjoined: crate::compiler::ConjoinedPlan<AclFilter> = plan.with_acl(acl);
     if matches!(conjoined.acl, AclFilter::None) {
         // The viewer sees nothing of this type — short-circuit (the engine is never queried).
-        return Ok(RankedResults { hits: Vec::new(), zookie, post_fetch_fields });
+        return Ok(RankedResults {
+            hits: Vec::new(),
+            zookie,
+            post_fetch_fields,
+        });
     }
 
     // **STEP 4 — execute EVERY branch under the SAME conjoined ACL filter** (the pre-filter, §4.2.1).
@@ -810,7 +857,13 @@ fn query_consistent_with_vector<B: IndexBackend>(
     // here we slice the page window (over the post-revalidation visible set).
     let paged = paginate(hits, page);
     Ok(RankedResults {
-        hits: paged.into_iter().map(|h| RankedResult { doc_id: h.doc_id, score: h.score }).collect(),
+        hits: paged
+            .into_iter()
+            .map(|h| RankedResult {
+                doc_id: h.doc_id,
+                score: h.score,
+            })
+            .collect(),
         zookie,
         post_fetch_fields,
     })
@@ -855,8 +908,9 @@ fn revalidate_stale_candidates<B: IndexBackend>(
                     Some(port) => {
                         cstats.record_revalidation();
                         let object = ObjectId(hit.doc_id.clone());
-                        let still_allowed =
-                            port.check(subject, permission, &object, at).map_err(QueryError::Authz)?;
+                        let still_allowed = port
+                            .check(subject, permission, &object, at)
+                            .map_err(QueryError::Authz)?;
                         if still_allowed {
                             // The grant survives the demanded snapshot — surface it.
                             out.push(hit);
@@ -888,7 +942,10 @@ pub enum VectorQuery<'a> {
     Vec(crate::vector::Embedding),
     /// Query text to embed through the adapter at query time (the `text` form) — the SAME adapter
     /// that embedded the corpus, so the query and the docs live in one vector space (§3.3).
-    Text { text: String, embedder: &'a dyn crate::indexer::EmbeddingAdapter },
+    Text {
+        text: String,
+        embedder: &'a dyn crate::indexer::EmbeddingAdapter,
+    },
 }
 
 impl VectorQuery<'_> {
@@ -973,8 +1030,9 @@ fn execute<B: IndexBackend>(
     // lists — fusion holds no ACL state, so no hidden doc is introduced (leak-safe by construction).
     let mut fusion_inputs: Vec<crate::fusion::RankedList> = Vec::new();
     if !ft_ranked.is_empty() {
-        fusion_inputs
-            .push(crate::fusion::RankedList::from_ranked(ft_ranked.iter().map(|h| h.doc_id.clone())));
+        fusion_inputs.push(crate::fusion::RankedList::from_ranked(
+            ft_ranked.iter().map(|h| h.doc_id.clone()),
+        ));
     }
     if !vector_ranked.is_empty() {
         fusion_inputs.push(crate::fusion::RankedList::from_ranked(
@@ -1001,20 +1059,38 @@ fn execute<B: IndexBackend>(
         }
     };
     // The fused relevance hits (FT + vector via RRF).
-    record(fused.into_iter().map(|f| Hit { doc_id: f.doc_id, score: f.score }).collect());
+    record(
+        fused
+            .into_iter()
+            .map(|f| Hit {
+                doc_id: f.doc_id,
+                score: f.score,
+            })
+            .collect(),
+    );
 
     // The structured branch(es) — each conjoins the SAME ACL clause first (exact-match equality).
     for sc in &plan.structured {
         match sc {
             crate::compiler::StructuredClause::Cmp { field, value, .. } => {
-                record(backend.search_structured(acl_filter, field, &to_field_value(value), fetch)?);
+                record(backend.search_structured(
+                    acl_filter,
+                    field,
+                    &to_field_value(value),
+                    fetch,
+                )?);
                 stats.engine_branches.fetch_add(1, Ordering::Relaxed);
             }
             crate::compiler::StructuredClause::In { field, values, .. } => {
                 // An `In` is the disjunction of equalities over one field — run each value as a
                 // structured branch under the SAME ACL filter and union the hits.
                 for v in values {
-                    record(backend.search_structured(acl_filter, field, &to_field_value(v), fetch)?);
+                    record(backend.search_structured(
+                        acl_filter,
+                        field,
+                        &to_field_value(v),
+                        fetch,
+                    )?);
                     stats.engine_branches.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -1034,8 +1110,10 @@ fn execute<B: IndexBackend>(
 
     // Sort by score desc, then doc_id asc (a stable deterministic order — the RRF fusion is applied
     // above; the tuned re-rank is SRCH-P26).
-    let mut hits: Vec<Hit> =
-        merged.into_iter().map(|(doc_id, score)| Hit { doc_id, score }).collect();
+    let mut hits: Vec<Hit> = merged
+        .into_iter()
+        .map(|(doc_id, score)| Hit { doc_id, score })
+        .collect();
     hits.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
@@ -1047,7 +1125,10 @@ fn execute<B: IndexBackend>(
 
 /// Slice the page window (`offset..offset+limit`) off the ranked, deduped hit list.
 fn paginate(hits: Vec<Hit>, page: Page) -> Vec<Hit> {
-    hits.into_iter().skip(page.offset).take(page.effective_limit()).collect()
+    hits.into_iter()
+        .skip(page.offset)
+        .take(page.effective_limit())
+        .collect()
 }
 
 /// Map the compiler's [`myelin_identity::Literal`] operand to the engine's
@@ -1072,9 +1153,7 @@ fn to_field_value(value: &myelin_identity::Literal) -> myelin_query::FieldValue 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use myelin_identity::{
-        ConsistencyMode, Literal, ObjectId, PrincipalId, PrincipalKind, Zookie,
-    };
+    use myelin_identity::{ConsistencyMode, Literal, ObjectId, PrincipalId, PrincipalKind, Zookie};
     use myelin_query::{CmpOp, Expr, FieldType, FieldValue, OrderKey, Predicate};
     use myelin_tenancy::TenantId;
 
@@ -1109,11 +1188,18 @@ mod tests {
     }
 
     fn viewer(tenant: &str) -> Principal {
-        Principal::stub(PrincipalId("p:alice".into()), PrincipalKind::Human, TenantId(tenant.into()))
+        Principal::stub(
+            PrincipalId("p:alice".into()),
+            PrincipalKind::Human,
+            TenantId(tenant.into()),
+        )
     }
 
     fn consistency() -> Consistency {
-        Consistency { at_least: Zookie("z0".into()), mode: ConsistencyMode::BoundedStale }
+        Consistency {
+            at_least: Zookie("z0".into()),
+            mode: ConsistencyMode::BoundedStale,
+        }
     }
 
     fn ast(p: Predicate) -> QueryAst {
@@ -1141,7 +1227,12 @@ mod tests {
     }
     impl FakeAuthz {
         fn new(answer: ListObjectsResult) -> FakeAuthz {
-            FakeAuthz { answer, calls: AtomicU64::new(0), reverse: None, resolve_calls: AtomicU64::new(0) }
+            FakeAuthz {
+                answer,
+                calls: AtomicU64::new(0),
+                reverse: None,
+                resolve_calls: AtomicU64::new(0),
+            }
         }
         fn ids(ids: &[&str]) -> FakeAuthz {
             FakeAuthz::new(ListObjectsResult::Ids {
@@ -1150,13 +1241,19 @@ mod tests {
             })
         }
         fn filter(set_expr: SetExpr) -> FakeAuthz {
-            FakeAuthz::new(ListObjectsResult::Filter { set_expr, zookie: Zookie("z-acl".into()) })
+            FakeAuthz::new(ListObjectsResult::Filter {
+                set_expr,
+                zookie: Zookie("z-acl".into()),
+            })
         }
         /// A `Filter{set_expr, zookie}` answer with an explicit zookie (carrying a `@<rev>` suffix
         /// so the watermark can be exercised) + a canned reverse-index JOIN answer.
         fn filter_with(set_expr: SetExpr, zookie: &str, reverse: ReverseIndexAnswer) -> FakeAuthz {
             FakeAuthz {
-                answer: ListObjectsResult::Filter { set_expr, zookie: Zookie(zookie.into()) },
+                answer: ListObjectsResult::Filter {
+                    set_expr,
+                    zookie: Zookie(zookie.into()),
+                },
                 calls: AtomicU64::new(0),
                 reverse: Some(reverse),
                 resolve_calls: AtomicU64::new(0),
@@ -1189,9 +1286,22 @@ mod tests {
 
     fn corpus() -> TantivyBackend {
         let mut be = TantivyBackend::open(&facet_decl()).expect("open");
-        be.upsert(&doc("acme/issue/PUB-1", "deadlock in the scheduler", "open", 5)).unwrap();
-        be.upsert(&doc("acme/issue/SECRET-9", "deadlock secret incident", "open", 9)).unwrap();
-        be.upsert(&doc("acme/issue/OTHER-2", "typo in readme", "closed", 1)).unwrap();
+        be.upsert(&doc(
+            "acme/issue/PUB-1",
+            "deadlock in the scheduler",
+            "open",
+            5,
+        ))
+        .unwrap();
+        be.upsert(&doc(
+            "acme/issue/SECRET-9",
+            "deadlock secret incident",
+            "open",
+            9,
+        ))
+        .unwrap();
+        be.upsert(&doc("acme/issue/OTHER-2", "typo in readme", "closed", 1))
+            .unwrap();
         be
     }
 
@@ -1205,7 +1315,13 @@ mod tests {
     fn lower_bounded(set_expr: &SetExpr) -> Result<AclFilter, QueryError> {
         let v = viewer("acme");
         let authz = no_reverse();
-        lower_set_expr(set_expr, &v, &authz, &RevisionWatermark(0), &QueryStats::new())
+        lower_set_expr(
+            set_expr,
+            &v,
+            &authz,
+            &RevisionWatermark(0),
+            &QueryStats::new(),
+        )
     }
 
     /// **`SetExpr::All` → `AclFilter::All` (no clause); `None` → `AclFilter::None` (short-circuit).**
@@ -1218,11 +1334,17 @@ mod tests {
     /// **`SetExpr::Ids` → an allow-set; an EMPTY `Ids` → `None` (deny), never `All`.**
     #[test]
     fn lower_ids_and_empty_ids() {
-        let f = lower_bounded(&SetExpr::Ids(vec![ObjectId("a".into()), ObjectId("b".into())]))
-            .unwrap();
+        let f = lower_bounded(&SetExpr::Ids(vec![
+            ObjectId("a".into()),
+            ObjectId("b".into()),
+        ]))
+        .unwrap();
         assert_eq!(f, AclFilter::Ids(vec!["a".into(), "b".into()]));
         // An explicit empty allow-set is DENY (the viewer sees nothing), never a silent widen.
-        assert_eq!(lower_bounded(&SetExpr::Ids(vec![])).unwrap(), AclFilter::None);
+        assert_eq!(
+            lower_bounded(&SetExpr::Ids(vec![])).unwrap(),
+            AclFilter::None
+        );
     }
 
     /// **`SetExpr::NotIds` → a bounded deny-set; an EMPTY `NotIds` → `All` (excludes nothing).**
@@ -1230,7 +1352,10 @@ mod tests {
     fn lower_not_ids_and_empty_not_ids() {
         let f = lower_bounded(&SetExpr::NotIds(vec![ObjectId("x".into())])).unwrap();
         assert_eq!(f, AclFilter::NotIds(vec!["x".into()]));
-        assert_eq!(lower_bounded(&SetExpr::NotIds(vec![])).unwrap(), AclFilter::All);
+        assert_eq!(
+            lower_bounded(&SetExpr::NotIds(vec![])).unwrap(),
+            AclFilter::All
+        );
     }
 
     // ---- SRCH-P09: the relational reverse-index JOIN + boolean composition --
@@ -1250,7 +1375,10 @@ mod tests {
         let authz = FakeAuthz::filter_with(
             SetExpr::InRelation {
                 relation: RelName("reader".into()),
-                via_column: ColRef { table: "issue".into(), column: "id".into() },
+                via_column: ColRef {
+                    table: "issue".into(),
+                    column: "id".into(),
+                },
             },
             "z@7",
             rev_answer(&["acme/issue/PUB-1", "acme/issue/PUB-2"], 7),
@@ -1264,7 +1392,11 @@ mod tests {
             "the JOIN resolves to the visible-id set as an Ids membership clause (not All)"
         );
         assert_eq!(z, "z@7", "the list_objects zookie is threaded through");
-        assert_eq!(stats.reverse_index_joins(), 1, "exactly ONE reverse-index JOIN (no N+1)");
+        assert_eq!(
+            stats.reverse_index_joins(),
+            1,
+            "exactly ONE reverse-index JOIN (no N+1)"
+        );
     }
 
     /// **`TupleSet` lowers via the reverse-index JOIN; an EMPTY resolved set is `None` (the subject
@@ -1273,13 +1405,19 @@ mod tests {
     fn relational_tuple_set_empty_resolved_is_deny_not_widen() {
         use myelin_identity::AuthzIndexRef;
         let authz = FakeAuthz::filter_with(
-            SetExpr::TupleSet { index: AuthzIndexRef("authz_visible".into()) },
+            SetExpr::TupleSet {
+                index: AuthzIndexRef("authz_visible".into()),
+            },
             "z@3",
             rev_answer(&[], 3), // the subject reaches NOTHING
         );
         let v = viewer("acme");
         let (f, _) = lower_acl(&authz.answer.clone(), &v, &authz, &QueryStats::new()).unwrap();
-        assert_eq!(f, AclFilter::None, "an empty resolved set ⇒ deny, never widened to All");
+        assert_eq!(
+            f,
+            AclFilter::None,
+            "an empty resolved set ⇒ deny, never widened to All"
+        );
     }
 
     /// **THE REVISION WATERMARK (contract 4.10): a reverse-index revision BELOW the watermark is a
@@ -1289,7 +1427,9 @@ mod tests {
         use myelin_identity::AuthzIndexRef;
         // The list_objects zookie requires watermark 9; the reverse index serves only revision 4.
         let authz = FakeAuthz::filter_with(
-            SetExpr::TupleSet { index: AuthzIndexRef("ix".into()) },
+            SetExpr::TupleSet {
+                index: AuthzIndexRef("ix".into()),
+            },
             "z@9",
             rev_answer(&["acme/issue/PUB-1"], 4),
         );
@@ -1297,7 +1437,9 @@ mod tests {
         let err = lower_acl(&authz.answer.clone(), &v, &authz, &QueryStats::new())
             .expect_err("a stale reverse-index revision is refused");
         match err {
-            QueryError::StaleReverseIndex { required, served, .. } => {
+            QueryError::StaleReverseIndex {
+                required, served, ..
+            } => {
                 assert_eq!(required, 9);
                 assert_eq!(served, 4);
             }
@@ -1311,13 +1453,19 @@ mod tests {
     fn relational_revision_at_watermark_is_accepted() {
         use myelin_identity::AuthzIndexRef;
         let authz = FakeAuthz::filter_with(
-            SetExpr::TupleSet { index: AuthzIndexRef("ix".into()) },
+            SetExpr::TupleSet {
+                index: AuthzIndexRef("ix".into()),
+            },
             "z@5",
             rev_answer(&["acme/issue/PUB-1"], 5), // exactly at the watermark
         );
         let v = viewer("acme");
         let (f, _) = lower_acl(&authz.answer.clone(), &v, &authz, &QueryStats::new()).unwrap();
-        assert_eq!(f, AclFilter::Ids(vec!["acme/issue/PUB-1".into()]), "revision == watermark is fresh");
+        assert_eq!(
+            f,
+            AclFilter::Ids(vec!["acme/issue/PUB-1".into()]),
+            "revision == watermark is fresh"
+        );
     }
 
     /// **`Union`/`Intersect`/`Difference` compose into `Or`/`And`/(`And` + `Not`) over the lowered
@@ -1332,7 +1480,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             u,
-            AclFilter::Or(vec![AclFilter::Ids(vec!["a".into()]), AclFilter::Ids(vec!["b".into()])])
+            AclFilter::Or(vec![
+                AclFilter::Ids(vec!["a".into()]),
+                AclFilter::Ids(vec!["b".into()])
+            ])
         );
 
         // Intersect(All, NotIds[x]) → And([All, NotIds[x]]).
@@ -1341,7 +1492,10 @@ mod tests {
             SetExpr::NotIds(vec![ObjectId("x".into())]),
         ]))
         .unwrap();
-        assert_eq!(i, AclFilter::And(vec![AclFilter::All, AclFilter::NotIds(vec!["x".into()])]));
+        assert_eq!(
+            i,
+            AclFilter::And(vec![AclFilter::All, AclFilter::NotIds(vec!["x".into()])])
+        );
 
         // Difference(All, Ids[secret]) → And([All, Not(Ids[secret])]) = everything EXCEPT secret.
         let d = lower_bounded(&SetExpr::Difference(
@@ -1366,14 +1520,19 @@ mod tests {
         let authz = no_reverse(); // no reverse index
         let v = viewer("acme");
         let err = lower_set_expr(
-            &SetExpr::TupleSet { index: AuthzIndexRef("ix".into()) },
+            &SetExpr::TupleSet {
+                index: AuthzIndexRef("ix".into()),
+            },
             &v,
             &authz,
             &RevisionWatermark(0),
             &QueryStats::new(),
         )
         .expect_err("no reverse index ⇒ fail closed, never widen");
-        assert!(matches!(err, QueryError::Authz(_)), "unavailable surfaces, never widens to All");
+        assert!(
+            matches!(err, QueryError::Authz(_)),
+            "unavailable surfaces, never widens to All"
+        );
     }
 
     /// **`ListObjectsResult::Ids` (the materialised S4 path) lowers to an allow-set; the threaded
@@ -1384,7 +1543,10 @@ mod tests {
         let authz = no_reverse();
         let stats = QueryStats::new();
         let (f, z) = lower_acl(
-            &ListObjectsResult::Ids { ids: vec![ObjectId("d1".into())], zookie: Zookie("zX".into()) },
+            &ListObjectsResult::Ids {
+                ids: vec![ObjectId("d1".into())],
+                zookie: Zookie("zX".into()),
+            },
             &v,
             &authz,
             &stats,
@@ -1393,7 +1555,10 @@ mod tests {
         assert_eq!(f, AclFilter::Ids(vec!["d1".into()]));
         assert_eq!(z, "zX");
         let (empty, _) = lower_acl(
-            &ListObjectsResult::Ids { ids: vec![], zookie: Zookie("z".into()) },
+            &ListObjectsResult::Ids {
+                ids: vec![],
+                zookie: Zookie("z".into()),
+            },
             &v,
             &authz,
             &stats,
@@ -1415,7 +1580,11 @@ mod tests {
         let res = query(
             &eng,
             &authz,
-            &ast(Predicate::Cmp { op: CmpOp::Eq, lhs: var(FT_BODY_FIELD), rhs: s("deadlock") }),
+            &ast(Predicate::Cmp {
+                op: CmpOp::Eq,
+                lhs: var(FT_BODY_FIELD),
+                rhs: s("deadlock"),
+            }),
             &viewer("acme"),
             &ObjectType("issue".into()),
             &consistency(),
@@ -1423,15 +1592,36 @@ mod tests {
             &stats,
         )
         .expect("query");
-        assert_eq!(stats.list_objects_calls(), 1, "EXACTLY one list_objects per query (no N+1)");
-        assert_eq!(authz.calls.load(Ordering::Relaxed), 1, "the port saw exactly one call");
+        assert_eq!(
+            stats.list_objects_calls(),
+            1,
+            "EXACTLY one list_objects per query (no N+1)"
+        );
+        assert_eq!(
+            authz.calls.load(Ordering::Relaxed),
+            1,
+            "the port saw exactly one call"
+        );
         // A BOUNDED-SET query issues ZERO reverse-index JOINs (the JOIN is only for the relational
         // forms) — distinguishes the join counter's 0 from the relational path's 1 (kills the
         // constant-`1` accessor mutant).
-        assert_eq!(stats.reverse_index_joins(), 0, "a bounded-set (Ids) query does NO reverse-index JOIN");
+        assert_eq!(
+            stats.reverse_index_joins(),
+            0,
+            "a bounded-set (Ids) query does NO reverse-index JOIN"
+        );
         // Only PUB-1 is both in the allow-set AND matches `deadlock` (SECRET-9 is excluded by ACL).
-        assert_eq!(res.hits.iter().map(|h| h.doc_id.as_str()).collect::<Vec<_>>(), ["acme/issue/PUB-1"]);
-        assert_eq!(res.zookie, "z-acl", "the list_objects zookie is threaded onto the result");
+        assert_eq!(
+            res.hits
+                .iter()
+                .map(|h| h.doc_id.as_str())
+                .collect::<Vec<_>>(),
+            ["acme/issue/PUB-1"]
+        );
+        assert_eq!(
+            res.zookie, "z-acl",
+            "the list_objects zookie is threaded onto the result"
+        );
     }
 
     /// **THE CONJOIN-INTO-EVERY-BRANCH GATE + the chained grant test: index a public + a confidential
@@ -1442,24 +1632,53 @@ mod tests {
     fn acl_conjoins_into_branch_unauthorized_then_granted() {
         let be = corpus();
         let eng = ScopedEngine::new(&be, "acme", "eu-west", schema());
-        let q = ast(Predicate::Cmp { op: CmpOp::Eq, lhs: var(FT_BODY_FIELD), rhs: s("deadlock") });
+        let q = ast(Predicate::Cmp {
+            op: CmpOp::Eq,
+            lhs: var(FT_BODY_FIELD),
+            rhs: s("deadlock"),
+        });
 
         // UNAUTHORIZED: the allow-set excludes SECRET-9 — it does NOT surface even though it matches.
         let unauth = FakeAuthz::ids(&["acme/issue/PUB-1"]);
         let stats = QueryStats::new();
-        let res = query(&eng, &unauth, &q, &viewer("acme"), &ObjectType("issue".into()),
-            &consistency(), Page::FIRST, &stats).expect("q");
+        let res = query(
+            &eng,
+            &unauth,
+            &q,
+            &viewer("acme"),
+            &ObjectType("issue".into()),
+            &consistency(),
+            Page::FIRST,
+            &stats,
+        )
+        .expect("q");
         let ids: Vec<&str> = res.hits.iter().map(|h| h.doc_id.as_str()).collect();
-        assert_eq!(ids, ["acme/issue/PUB-1"], "the confidential doc is excluded (pre-filter, no leak)");
+        assert_eq!(
+            ids,
+            ["acme/issue/PUB-1"],
+            "the confidential doc is excluded (pre-filter, no leak)"
+        );
 
         // GRANTED: the allow-set now includes SECRET-9 — re-query, it is visible.
         let granted = FakeAuthz::ids(&["acme/issue/PUB-1", "acme/issue/SECRET-9"]);
         let stats2 = QueryStats::new();
-        let res2 = query(&eng, &granted, &q, &viewer("acme"), &ObjectType("issue".into()),
-            &consistency(), Page::FIRST, &stats2).expect("q2");
+        let res2 = query(
+            &eng,
+            &granted,
+            &q,
+            &viewer("acme"),
+            &ObjectType("issue".into()),
+            &consistency(),
+            Page::FIRST,
+            &stats2,
+        )
+        .expect("q2");
         let ids2: std::collections::BTreeSet<&str> =
             res2.hits.iter().map(|h| h.doc_id.as_str()).collect();
-        assert!(ids2.contains("acme/issue/SECRET-9"), "after grant the confidential doc is visible");
+        assert!(
+            ids2.contains("acme/issue/SECRET-9"),
+            "after grant the confidential doc is visible"
+        );
         assert!(ids2.contains("acme/issue/PUB-1"));
     }
 
@@ -1474,7 +1693,11 @@ mod tests {
         let res = query(
             &eng,
             &authz,
-            &ast(Predicate::Cmp { op: CmpOp::Eq, lhs: var(FT_BODY_FIELD), rhs: s("deadlock") }),
+            &ast(Predicate::Cmp {
+                op: CmpOp::Eq,
+                lhs: var(FT_BODY_FIELD),
+                rhs: s("deadlock"),
+            }),
             &viewer("acme"),
             &ObjectType("issue".into()),
             &consistency(),
@@ -1483,8 +1706,16 @@ mod tests {
         )
         .expect("query");
         assert!(res.hits.is_empty(), "None ⇒ empty result");
-        assert_eq!(stats.engine_branches(), 0, "no engine branch ran (short-circuit, no count leak)");
-        assert_eq!(stats.list_objects_calls(), 1, "still exactly one list_objects call");
+        assert_eq!(
+            stats.engine_branches(),
+            0,
+            "no engine branch ran (short-circuit, no count leak)"
+        );
+        assert_eq!(
+            stats.list_objects_calls(),
+            1,
+            "still exactly one list_objects call"
+        );
     }
 
     /// **`SetExpr::All` (admin) → no ACL clause: every matching doc surfaces.**
@@ -1497,7 +1728,11 @@ mod tests {
         let res = query(
             &eng,
             &authz,
-            &ast(Predicate::Cmp { op: CmpOp::Eq, lhs: var(FT_BODY_FIELD), rhs: s("deadlock") }),
+            &ast(Predicate::Cmp {
+                op: CmpOp::Eq,
+                lhs: var(FT_BODY_FIELD),
+                rhs: s("deadlock"),
+            }),
             &viewer("acme"),
             &ObjectType("issue".into()),
             &consistency(),
@@ -1505,9 +1740,12 @@ mod tests {
             &stats,
         )
         .expect("query");
-        let ids: std::collections::BTreeSet<&str> = res.hits.iter().map(|h| h.doc_id.as_str()).collect();
-        assert!(ids.contains("acme/issue/PUB-1") && ids.contains("acme/issue/SECRET-9"),
-            "admin sees both `deadlock` docs: {ids:?}");
+        let ids: std::collections::BTreeSet<&str> =
+            res.hits.iter().map(|h| h.doc_id.as_str()).collect();
+        assert!(
+            ids.contains("acme/issue/PUB-1") && ids.contains("acme/issue/SECRET-9"),
+            "admin sees both `deadlock` docs: {ids:?}"
+        );
     }
 
     /// **`SetExpr::NotIds` (the bounded deny-set) hides exactly the denied docs (`WHERE NOT IN`).**
@@ -1516,12 +1754,18 @@ mod tests {
         let be = corpus();
         let eng = ScopedEngine::new(&be, "acme", "eu-west", schema());
         // Deny SECRET-9 only — PUB-1 still matches `deadlock`.
-        let authz = FakeAuthz::filter(SetExpr::NotIds(vec![ObjectId("acme/issue/SECRET-9".into())]));
+        let authz = FakeAuthz::filter(SetExpr::NotIds(vec![ObjectId(
+            "acme/issue/SECRET-9".into(),
+        )]));
         let stats = QueryStats::new();
         let res = query(
             &eng,
             &authz,
-            &ast(Predicate::Cmp { op: CmpOp::Eq, lhs: var(FT_BODY_FIELD), rhs: s("deadlock") }),
+            &ast(Predicate::Cmp {
+                op: CmpOp::Eq,
+                lhs: var(FT_BODY_FIELD),
+                rhs: s("deadlock"),
+            }),
             &viewer("acme"),
             &ObjectType("issue".into()),
             &consistency(),
@@ -1530,7 +1774,11 @@ mod tests {
         )
         .expect("query");
         let ids: Vec<&str> = res.hits.iter().map(|h| h.doc_id.as_str()).collect();
-        assert_eq!(ids, ["acme/issue/PUB-1"], "the denied doc is excluded, the rest surface");
+        assert_eq!(
+            ids,
+            ["acme/issue/PUB-1"],
+            "the denied doc is excluded, the rest surface"
+        );
     }
 
     /// **A structured-facet query conjoins the ACL filter too (every branch, not just FT).**
@@ -1544,7 +1792,11 @@ mod tests {
         let res = query(
             &eng,
             &authz,
-            &ast(Predicate::Cmp { op: CmpOp::Eq, lhs: var("status"), rhs: s("open") }),
+            &ast(Predicate::Cmp {
+                op: CmpOp::Eq,
+                lhs: var("status"),
+                rhs: s("open"),
+            }),
             &viewer("acme"),
             &ObjectType("issue".into()),
             &consistency(),
@@ -1552,8 +1804,14 @@ mod tests {
             &stats,
         )
         .expect("query");
-        assert_eq!(res.hits.iter().map(|h| h.doc_id.as_str()).collect::<Vec<_>>(), ["acme/issue/PUB-1"],
-            "the structured branch excludes the ACL-denied doc");
+        assert_eq!(
+            res.hits
+                .iter()
+                .map(|h| h.doc_id.as_str())
+                .collect::<Vec<_>>(),
+            ["acme/issue/PUB-1"],
+            "the structured branch excludes the ACL-denied doc"
+        );
         assert!(stats.engine_branches() >= 1, "a structured branch ran");
     }
 
@@ -1567,20 +1825,50 @@ mod tests {
         use myelin_identity::AuthzIndexRef;
         let be = corpus();
         let eng = ScopedEngine::new(&be, "acme", "eu-west", schema());
-        let q = ast(Predicate::Cmp { op: CmpOp::Eq, lhs: var(FT_BODY_FIELD), rhs: s("deadlock") });
-        let tuple_set = SetExpr::TupleSet { index: AuthzIndexRef("authz_visible".into()) };
+        let q = ast(Predicate::Cmp {
+            op: CmpOp::Eq,
+            lhs: var(FT_BODY_FIELD),
+            rhs: s("deadlock"),
+        });
+        let tuple_set = SetExpr::TupleSet {
+            index: AuthzIndexRef("authz_visible".into()),
+        };
 
         // UNAUTHORIZED: the reverse-index JOIN resolves to ONLY PUB-1 (SECRET-9 unreachable) at
         // revision 5; the watermark from `z@5` is 5 — fresh enough.
-        let unauth =
-            FakeAuthz::filter_with(tuple_set.clone(), "z@5", rev_answer(&["acme/issue/PUB-1"], 5));
+        let unauth = FakeAuthz::filter_with(
+            tuple_set.clone(),
+            "z@5",
+            rev_answer(&["acme/issue/PUB-1"], 5),
+        );
         let stats = QueryStats::new();
-        let res = query(&eng, &unauth, &q, &viewer("acme"), &ObjectType("issue".into()),
-            &consistency(), Page::FIRST, &stats).expect("q");
+        let res = query(
+            &eng,
+            &unauth,
+            &q,
+            &viewer("acme"),
+            &ObjectType("issue".into()),
+            &consistency(),
+            Page::FIRST,
+            &stats,
+        )
+        .expect("q");
         let ids: Vec<&str> = res.hits.iter().map(|h| h.doc_id.as_str()).collect();
-        assert_eq!(ids, ["acme/issue/PUB-1"], "the confidential doc is excluded (no leak, big-result path)");
-        assert_eq!(stats.reverse_index_joins(), 1, "exactly ONE reverse-index JOIN (no N+1)");
-        assert_eq!(stats.list_objects_calls(), 1, "and exactly one list_objects");
+        assert_eq!(
+            ids,
+            ["acme/issue/PUB-1"],
+            "the confidential doc is excluded (no leak, big-result path)"
+        );
+        assert_eq!(
+            stats.reverse_index_joins(),
+            1,
+            "exactly ONE reverse-index JOIN (no N+1)"
+        );
+        assert_eq!(
+            stats.list_objects_calls(),
+            1,
+            "and exactly one list_objects"
+        );
 
         // GRANTED: the JOIN now resolves SECRET-9 too (at a fresher revision 6, zookie z@6).
         let granted = FakeAuthz::filter_with(
@@ -1589,11 +1877,23 @@ mod tests {
             rev_answer(&["acme/issue/PUB-1", "acme/issue/SECRET-9"], 6),
         );
         let stats2 = QueryStats::new();
-        let res2 = query(&eng, &granted, &q, &viewer("acme"), &ObjectType("issue".into()),
-            &consistency(), Page::FIRST, &stats2).expect("q2");
+        let res2 = query(
+            &eng,
+            &granted,
+            &q,
+            &viewer("acme"),
+            &ObjectType("issue".into()),
+            &consistency(),
+            Page::FIRST,
+            &stats2,
+        )
+        .expect("q2");
         let ids2: std::collections::BTreeSet<&str> =
             res2.hits.iter().map(|h| h.doc_id.as_str()).collect();
-        assert!(ids2.contains("acme/issue/SECRET-9"), "after grant the confidential doc is visible");
+        assert!(
+            ids2.contains("acme/issue/SECRET-9"),
+            "after grant the confidential doc is visible"
+        );
         assert!(ids2.contains("acme/issue/PUB-1"));
     }
 
@@ -1605,20 +1905,39 @@ mod tests {
         use myelin_identity::AuthzIndexRef;
         let be = corpus();
         let eng = ScopedEngine::new(&be, "acme", "eu-west", schema());
-        let q = ast(Predicate::Cmp { op: CmpOp::Eq, lhs: var(FT_BODY_FIELD), rhs: s("deadlock") });
+        let q = ast(Predicate::Cmp {
+            op: CmpOp::Eq,
+            lhs: var(FT_BODY_FIELD),
+            rhs: s("deadlock"),
+        });
         // Difference(All, TupleSet) — everything EXCEPT what the relation reaches; the relation
         // reaches SECRET-9, so SECRET-9 is excluded and PUB-1 (which matches `deadlock`) surfaces.
         let set_expr = SetExpr::Difference(
             Box::new(SetExpr::All),
-            Box::new(SetExpr::TupleSet { index: AuthzIndexRef("blocked".into()) }),
+            Box::new(SetExpr::TupleSet {
+                index: AuthzIndexRef("blocked".into()),
+            }),
         );
         let authz =
             FakeAuthz::filter_with(set_expr, "z@2", rev_answer(&["acme/issue/SECRET-9"], 2));
         let stats = QueryStats::new();
-        let res = query(&eng, &authz, &q, &viewer("acme"), &ObjectType("issue".into()),
-            &consistency(), Page::FIRST, &stats).expect("q");
+        let res = query(
+            &eng,
+            &authz,
+            &q,
+            &viewer("acme"),
+            &ObjectType("issue".into()),
+            &consistency(),
+            Page::FIRST,
+            &stats,
+        )
+        .expect("q");
         let ids: Vec<&str> = res.hits.iter().map(|h| h.doc_id.as_str()).collect();
-        assert_eq!(ids, ["acme/issue/PUB-1"], "the relation-reached doc is excluded by the Difference");
+        assert_eq!(
+            ids,
+            ["acme/issue/PUB-1"],
+            "the relation-reached doc is excluded by the Difference"
+        );
     }
 
     // ---- cross-tenant 0 (SRCH-D3) ------------------------------------------
@@ -1638,7 +1957,11 @@ mod tests {
         let err = query(
             &eng,
             &authz,
-            &ast(Predicate::Cmp { op: CmpOp::Eq, lhs: var(FT_BODY_FIELD), rhs: s("deadlock") }),
+            &ast(Predicate::Cmp {
+                op: CmpOp::Eq,
+                lhs: var(FT_BODY_FIELD),
+                rhs: s("deadlock"),
+            }),
             &evil,
             &ObjectType("issue".into()),
             &consistency(),
@@ -1646,12 +1969,22 @@ mod tests {
             &stats,
         )
         .expect_err("a cross-tenant query is rejected (SRCH-D3)");
-        assert!(matches!(err, QueryError::TenantMismatch { .. }), "cross-tenant ⇒ TenantMismatch");
+        assert!(
+            matches!(err, QueryError::TenantMismatch { .. }),
+            "cross-tenant ⇒ TenantMismatch"
+        );
         // 0 engine branches ran AND 0 list_objects calls — the cross-tenant query never reaches the
         // engine or even the authz dependency (rejected at the partition-key check).
         assert_eq!(stats.engine_branches(), 0, "0 cross-tenant engine touches");
-        assert_eq!(stats.list_objects_calls(), 0, "rejected before any authz/engine work");
-        assert!(err.to_string().contains("SRCH-D3"), "the error names the drill");
+        assert_eq!(
+            stats.list_objects_calls(),
+            0,
+            "rejected before any authz/engine work"
+        );
+        assert!(
+            err.to_string().contains("SRCH-D3"),
+            "the error names the drill"
+        );
     }
 
     /// **A same-tenant viewer is accepted (the partition-key check admits the right tenant).**
@@ -1664,7 +1997,11 @@ mod tests {
         let res = query(
             &eng,
             &authz,
-            &ast(Predicate::Cmp { op: CmpOp::Eq, lhs: var(FT_BODY_FIELD), rhs: s("deadlock") }),
+            &ast(Predicate::Cmp {
+                op: CmpOp::Eq,
+                lhs: var(FT_BODY_FIELD),
+                rhs: s("deadlock"),
+            }),
             &viewer("acme"),
             &ObjectType("issue".into()),
             &consistency(),
@@ -1701,8 +2038,11 @@ mod tests {
             &stats,
         )
         .expect("query");
-        assert_eq!(res.post_fetch_fields, vec!["progress".to_string()],
-            "the read-time predicate is carried for post-fetch evaluation by the view");
+        assert_eq!(
+            res.post_fetch_fields,
+            vec!["progress".to_string()],
+            "the read-time predicate is carried for post-fetch evaluation by the view"
+        );
     }
 
     /// **An authz failure SURFACES (deny-when-unsure), never degrades to an unfiltered query.**
@@ -1726,7 +2066,11 @@ mod tests {
         let err = query(
             &eng,
             &FailingAuthz,
-            &ast(Predicate::Cmp { op: CmpOp::Eq, lhs: var(FT_BODY_FIELD), rhs: s("deadlock") }),
+            &ast(Predicate::Cmp {
+                op: CmpOp::Eq,
+                lhs: var(FT_BODY_FIELD),
+                rhs: s("deadlock"),
+            }),
             &viewer("acme"),
             &ObjectType("issue".into()),
             &consistency(),
@@ -1734,23 +2078,46 @@ mod tests {
             &stats,
         )
         .expect_err("an authz failure is surfaced, not widened");
-        assert!(matches!(err, QueryError::Authz(_)), "the authz error surfaces loudly");
-        assert_eq!(stats.engine_branches(), 0, "no engine query ran on an authz failure");
+        assert!(
+            matches!(err, QueryError::Authz(_)),
+            "the authz error surfaces loudly"
+        );
+        assert_eq!(
+            stats.engine_branches(),
+            0,
+            "no engine query ran on an authz failure"
+        );
     }
 
     /// **Pagination slices the window and clamps a crafted huge `limit` (no unbounded top-k).**
     #[test]
     fn pagination_slices_and_clamps_limit() {
         let hits: Vec<Hit> = (0..10)
-            .map(|i| Hit { doc_id: format!("d{i:02}"), score: (10 - i) as f32 })
+            .map(|i| Hit {
+                doc_id: format!("d{i:02}"),
+                score: (10 - i) as f32,
+            })
             .collect();
-        let page = Page { offset: 2, limit: 3 };
+        let page = Page {
+            offset: 2,
+            limit: 3,
+        };
         let sliced = paginate(hits.clone(), page);
-        assert_eq!(sliced.iter().map(|h| h.doc_id.clone()).collect::<Vec<_>>(),
-            ["d02", "d03", "d04"], "the page window is offset..offset+limit");
+        assert_eq!(
+            sliced.iter().map(|h| h.doc_id.clone()).collect::<Vec<_>>(),
+            ["d02", "d03", "d04"],
+            "the page window is offset..offset+limit"
+        );
         // A crafted huge limit is clamped to MAX_LIMIT (not honoured verbatim).
-        let huge = Page { offset: 0, limit: usize::MAX };
-        assert_eq!(huge.effective_limit(), Page::MAX_LIMIT, "a crafted limit is clamped");
+        let huge = Page {
+            offset: 0,
+            limit: usize::MAX,
+        };
+        assert_eq!(
+            huge.effective_limit(),
+            Page::MAX_LIMIT,
+            "a crafted limit is clamped"
+        );
     }
 
     /// **`ScopedEngine::tenant`/`region` expose the partition key they were opened for (kills the
@@ -1759,8 +2126,16 @@ mod tests {
     fn scoped_engine_exposes_its_partition_key() {
         let be = corpus();
         let eng = ScopedEngine::new(&be, "acme", "eu-west", schema());
-        assert_eq!(eng.tenant(), "acme", "the tenant accessor returns the opened tenant verbatim");
-        assert_eq!(eng.region(), "eu-west", "the region accessor returns the opened region verbatim");
+        assert_eq!(
+            eng.tenant(),
+            "acme",
+            "the tenant accessor returns the opened tenant verbatim"
+        );
+        assert_eq!(
+            eng.region(),
+            "eu-west",
+            "the region accessor returns the opened region verbatim"
+        );
     }
 
     /// **THE FUSION KEEPS THE MAX SCORE across branches (one doc-id space, §3.2): a doc hit by TWO
@@ -1779,8 +2154,16 @@ mod tests {
             &eng,
             &authz,
             &ast(Predicate::And(vec![
-                Predicate::Cmp { op: CmpOp::Eq, lhs: var(FT_BODY_FIELD), rhs: s("deadlock") },
-                Predicate::Cmp { op: CmpOp::Eq, lhs: var("status"), rhs: s("open") },
+                Predicate::Cmp {
+                    op: CmpOp::Eq,
+                    lhs: var(FT_BODY_FIELD),
+                    rhs: s("deadlock"),
+                },
+                Predicate::Cmp {
+                    op: CmpOp::Eq,
+                    lhs: var("status"),
+                    rhs: s("open"),
+                },
             ])),
             &viewer("acme"),
             &ObjectType("issue".into()),
@@ -1789,13 +2172,20 @@ mod tests {
             &stats,
         )
         .expect("query");
-        let pub1 = res.hits.iter().find(|h| h.doc_id == "acme/issue/PUB-1").expect("PUB-1 surfaces");
+        let pub1 = res
+            .hits
+            .iter()
+            .find(|h| h.doc_id == "acme/issue/PUB-1")
+            .expect("PUB-1 surfaces");
         assert!(
             pub1.score > 0.0,
             "the fused score is the MAX (the BM25 FT score), not the structured branch's 0.0: {}",
             pub1.score
         );
-        assert!(stats.engine_branches() >= 2, "both the FT and structured branches ran");
+        assert!(
+            stats.engine_branches() >= 2,
+            "both the FT and structured branches ran"
+        );
     }
 
     // ---- SRCH-P11 (P-174): hybrid + vector — RRF fusion + filter-during-traversal --------------
@@ -1837,8 +2227,16 @@ mod tests {
     /// A hybrid AST: an FT clause AND a semantic clause over ONE compiled plan (one doc-id space).
     fn hybrid_ast(ft_text: &str, semantic_text: &str) -> QueryAst {
         ast(Predicate::And(vec![
-            Predicate::Cmp { op: CmpOp::Eq, lhs: var(FT_BODY_FIELD), rhs: s(ft_text) },
-            Predicate::Cmp { op: CmpOp::Eq, lhs: var(SEMANTIC_FIELD), rhs: s(semantic_text) },
+            Predicate::Cmp {
+                op: CmpOp::Eq,
+                lhs: var(FT_BODY_FIELD),
+                rhs: s(ft_text),
+            },
+            Predicate::Cmp {
+                op: CmpOp::Eq,
+                lhs: var(SEMANTIC_FIELD),
+                rhs: s(semantic_text),
+            },
         ]))
     }
 
@@ -1853,7 +2251,10 @@ mod tests {
         let be = embedded_corpus(&embedder);
         let eng = ScopedEngine::new(&be, "acme", "eu-west", schema());
         // The query is the EXACT text of the secret doc — so SECRET-9 is its nearest vector.
-        let vq = VectorQuery::Text { text: "deadlock secret ops runbook".into(), embedder: &embedder };
+        let vq = VectorQuery::Text {
+            text: "deadlock secret ops runbook".into(),
+            embedder: &embedder,
+        };
         let q = semantic_ast("deadlock secret ops runbook");
 
         // UNAUTHORIZED: the allow-set EXCLUDES SECRET-9 (its nearest neighbour).
@@ -1861,27 +2262,63 @@ mod tests {
         let stats = QueryStats::new();
         let cstats = crate::consistency::ConsistencyStats::new();
         let res = semantic(
-            &eng, &unauth, None, &q, &viewer("acme"), &ObjectType("issue".into()),
-            &consistency(), &vq, Page::FIRST, &stats, &cstats,
-        ).expect("semantic");
-        let ids: std::collections::BTreeSet<&str> = res.hits.iter().map(|h| h.doc_id.as_str()).collect();
+            &eng,
+            &unauth,
+            None,
+            &q,
+            &viewer("acme"),
+            &ObjectType("issue".into()),
+            &consistency(),
+            &vq,
+            Page::FIRST,
+            &stats,
+            &cstats,
+        )
+        .expect("semantic");
+        let ids: std::collections::BTreeSet<&str> =
+            res.hits.iter().map(|h| h.doc_id.as_str()).collect();
         assert!(
             !ids.contains("acme/issue/SECRET-9"),
             "the confidential doc NEVER surfaces in the semantic/RAG result (SRCH-D1 vector half: 0 leak)"
         );
-        assert!(ids.contains("acme/issue/PUB-1") && ids.contains("acme/issue/PUB-2"), "visible neighbours");
-        assert_eq!(stats.list_objects_calls(), 1, "exactly ONE list_objects (no N+1 on the semantic path)");
+        assert!(
+            ids.contains("acme/issue/PUB-1") && ids.contains("acme/issue/PUB-2"),
+            "visible neighbours"
+        );
+        assert_eq!(
+            stats.list_objects_calls(),
+            1,
+            "exactly ONE list_objects (no N+1 on the semantic path)"
+        );
 
         // GRANT SECRET-9 → re-search: now it is one of the visible neighbours (the nearest, in fact).
-        let granted = FakeAuthz::ids(&["acme/issue/PUB-1", "acme/issue/PUB-2", "acme/issue/SECRET-9"]);
+        let granted = FakeAuthz::ids(&[
+            "acme/issue/PUB-1",
+            "acme/issue/PUB-2",
+            "acme/issue/SECRET-9",
+        ]);
         let stats2 = QueryStats::new();
         let cstats2 = crate::consistency::ConsistencyStats::new();
         let res2 = semantic(
-            &eng, &granted, None, &q, &viewer("acme"), &ObjectType("issue".into()),
-            &consistency(), &vq, Page::FIRST, &stats2, &cstats2,
-        ).expect("semantic after grant");
-        let ids2: std::collections::BTreeSet<&str> = res2.hits.iter().map(|h| h.doc_id.as_str()).collect();
-        assert!(ids2.contains("acme/issue/SECRET-9"), "after grant the doc is in the visible neighbours");
+            &eng,
+            &granted,
+            None,
+            &q,
+            &viewer("acme"),
+            &ObjectType("issue".into()),
+            &consistency(),
+            &vq,
+            Page::FIRST,
+            &stats2,
+            &cstats2,
+        )
+        .expect("semantic after grant");
+        let ids2: std::collections::BTreeSet<&str> =
+            res2.hits.iter().map(|h| h.doc_id.as_str()).collect();
+        assert!(
+            ids2.contains("acme/issue/SECRET-9"),
+            "after grant the doc is in the visible neighbours"
+        );
     }
 
     /// **The `vec` form of contract 6.2: a directly-supplied query vector is searched
@@ -1901,10 +2338,23 @@ mod tests {
         let stats = QueryStats::new();
         let cstats = crate::consistency::ConsistencyStats::new();
         let res = semantic(
-            &eng, &authz, None, &q, &viewer("acme"), &ObjectType("issue".into()),
-            &consistency(), &vq, Page::FIRST, &stats, &cstats,
-        ).expect("semantic");
-        assert_eq!(res.hits[0].doc_id, "acme/issue/PUB-1", "the exact-text doc is the nearest visible vector");
+            &eng,
+            &authz,
+            None,
+            &q,
+            &viewer("acme"),
+            &ObjectType("issue".into()),
+            &consistency(),
+            &vq,
+            Page::FIRST,
+            &stats,
+            &cstats,
+        )
+        .expect("semantic");
+        assert_eq!(
+            res.hits[0].doc_id, "acme/issue/PUB-1",
+            "the exact-text doc is the nearest visible vector"
+        );
     }
 
     /// **RRF fusion of a HYBRID query introduces no hidden doc + fuses the lexical + semantic ranked
@@ -1916,7 +2366,10 @@ mod tests {
         let be = embedded_corpus(&embedder);
         let eng = ScopedEngine::new(&be, "acme", "eu-west", schema());
         // FT "deadlock" matches all three; semantic "deadlock in the scheduler" is nearest PUB-1.
-        let vq = VectorQuery::Text { text: "deadlock in the scheduler".into(), embedder: &embedder };
+        let vq = VectorQuery::Text {
+            text: "deadlock in the scheduler".into(),
+            embedder: &embedder,
+        };
         let q = hybrid_ast("deadlock", "deadlock in the scheduler");
 
         // Allow-set EXCLUDES SECRET-9 — it is in NEITHER branch's list, so RRF cannot fuse it in.
@@ -1924,17 +2377,41 @@ mod tests {
         let stats = QueryStats::new();
         let cstats = crate::consistency::ConsistencyStats::new();
         let res = semantic(
-            &eng, &authz, None, &q, &viewer("acme"), &ObjectType("issue".into()),
-            &consistency(), &vq, Page::FIRST, &stats, &cstats,
-        ).expect("hybrid");
-        let ids: std::collections::BTreeSet<&str> = res.hits.iter().map(|h| h.doc_id.as_str()).collect();
-        assert!(!ids.contains("acme/issue/SECRET-9"), "RRF introduces no hidden doc (SRCH-D1 vector half)");
+            &eng,
+            &authz,
+            None,
+            &q,
+            &viewer("acme"),
+            &ObjectType("issue".into()),
+            &consistency(),
+            &vq,
+            Page::FIRST,
+            &stats,
+            &cstats,
+        )
+        .expect("hybrid");
+        let ids: std::collections::BTreeSet<&str> =
+            res.hits.iter().map(|h| h.doc_id.as_str()).collect();
+        assert!(
+            !ids.contains("acme/issue/SECRET-9"),
+            "RRF introduces no hidden doc (SRCH-D1 vector half)"
+        );
         // PUB-1 is rank-high in BOTH the FT and the vector branch (exact semantic match) — the RRF
         // agreement boost ranks it first.
-        assert_eq!(res.hits[0].doc_id, "acme/issue/PUB-1", "the doc both branches rank fuses to the top (RRF)");
+        assert_eq!(
+            res.hits[0].doc_id, "acme/issue/PUB-1",
+            "the doc both branches rank fuses to the top (RRF)"
+        );
         // Both branches ran (FT + vector) plus the list_objects is still exactly one.
-        assert!(stats.engine_branches() >= 2, "the FT and the vector branch both executed");
-        assert_eq!(stats.list_objects_calls(), 1, "ONE list_objects for the hybrid query (no N+1)");
+        assert!(
+            stats.engine_branches() >= 2,
+            "the FT and the vector branch both executed"
+        );
+        assert_eq!(
+            stats.list_objects_calls(),
+            1,
+            "ONE list_objects for the hybrid query (no N+1)"
+        );
     }
 
     /// **The semantic surface reuses the SRCH-P10 zookie path (no-stale-grant for RAG too).** A
@@ -1957,7 +2434,10 @@ mod tests {
         be.upsert_stamped(&d, "z@1", 1).unwrap();
         let eng = ScopedEngine::new(&be, "acme", "eu-west", schema());
 
-        let vq = VectorQuery::Text { text: "deadlock in the scheduler".into(), embedder: &embedder };
+        let vq = VectorQuery::Text {
+            text: "deadlock in the scheduler".into(),
+            embedder: &embedder,
+        };
         let q = semantic_ast("deadlock in the scheduler");
         let authz = FakeAuthz::ids(&["acme/issue/PUB-1"]);
         // A STRONG read demanding zookie rev 9 — newer than the doc's indexed rev 1 (stale).
@@ -1969,9 +2449,19 @@ mod tests {
         let cstats = crate::consistency::ConsistencyStats::new();
         // NO bounded-check port → the stale candidate is EXCLUDED (fail closed) — RAG serves nothing stale.
         let res = semantic(
-            &eng, &authz, None, &q, &viewer("acme"), &ObjectType("issue".into()),
-            &strong, &vq, Page::FIRST, &stats, &cstats,
-        ).expect("semantic strong");
+            &eng,
+            &authz,
+            None,
+            &q,
+            &viewer("acme"),
+            &ObjectType("issue".into()),
+            &strong,
+            &vq,
+            Page::FIRST,
+            &stats,
+            &cstats,
+        )
+        .expect("semantic strong");
         assert!(
             res.hits.is_empty(),
             "the stale-indexed vector candidate is excluded pending re-index (no-stale-grant for RAG; fail closed)"
@@ -1988,9 +2478,19 @@ mod tests {
         };
         let s = tm.to_string();
         assert!(s.contains("evil") && s.contains("acme") && s.contains("SRCH-D3"));
-        let stale = QueryError::StaleReverseIndex { required: 9, served: 4, form: "TupleSet" };
+        let stale = QueryError::StaleReverseIndex {
+            required: 9,
+            served: 4,
+            form: "TupleSet",
+        };
         let sm = stale.to_string();
-        assert!(sm.contains("TupleSet") && sm.contains("SRCH-P09"), "the stale-revision error is loud");
-        assert!(sm.contains('9') && sm.contains('4'), "it names the required + served revisions");
+        assert!(
+            sm.contains("TupleSet") && sm.contains("SRCH-P09"),
+            "the stale-revision error is loud"
+        );
+        assert!(
+            sm.contains('9') && sm.contains('4'),
+            "it names the required + served revisions"
+        );
     }
 }

@@ -133,7 +133,9 @@ pub struct RetentionWindow {
 
 impl Default for RetentionWindow {
     fn default() -> RetentionWindow {
-        RetentionWindow { days: DEFAULT_RETENTION_DAYS }
+        RetentionWindow {
+            days: DEFAULT_RETENTION_DAYS,
+        }
     }
 }
 
@@ -256,8 +258,11 @@ impl<'a> NotifReindexer<'a> {
         // subject the router whitelists) through the outbox (the SAME outbox→bus→live-consumer path;
         // no backdoor). A LOUD error if the scope's owner is unregistered (never a silent empty
         // rebuild).
-        let BusReindexReceipt { snapshots_emitted, snapshots_skipped_duplicate, owners_replayed } =
-            bus_reindex(scope, since, sources, outbox, ctx_base).map_err(map_bus_err)?;
+        let BusReindexReceipt {
+            snapshots_emitted,
+            snapshots_skipped_duplicate,
+            owners_replayed,
+        } = bus_reindex(scope, since, sources, outbox, ctx_base).map_err(map_bus_err)?;
 
         // (2) Drain the snapshot rows from the outbox IN THE REPLAY'S DETERMINISTIC ORDER and feed
         // each through the LIVE `Consumer::deliver` step (the EXACT live step a `sig.*` Signal takes).
@@ -286,7 +291,9 @@ impl<'a> NotifReindexer<'a> {
                 // recipient, dedup_key) UPSERT. An INCREMENTAL backfill keeps the dedup marks (a
                 // redelivered snapshot above the cursor IS a no-op — no resurrection).
                 if full_rebuild {
-                    self.consumer.dedup().forget(self.consumer.name(), &event_id);
+                    self.consumer
+                        .dedup()
+                        .forget(self.consumer.name(), &event_id);
                 }
                 // Read the snapshot row back from the outbox (it lands at its deterministic id) and
                 // feed its envelope through the LIVE consumer — the SAME `Consumer::deliver` a live

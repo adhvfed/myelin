@@ -155,7 +155,10 @@ impl std::fmt::Display for LifecycleError {
                 write!(f, "illegal PR transition {transition:?} from {from:?}")
             }
             LifecycleError::MergeGateNotSatisfied => {
-                write!(f, "merge refused: the branch-protection gate is not satisfied")
+                write!(
+                    f,
+                    "merge refused: the branch-protection gate is not satisfied"
+                )
             }
             LifecycleError::IllegalReviewTransition { from } => {
                 write!(f, "illegal review transition from {from:?}")
@@ -362,7 +365,10 @@ impl Review {
 
     /// Is this review CURRENTLY blocking (a live request-changes)? Blocks the merge gate.
     pub fn is_blocking(&self) -> bool {
-        matches!(self.state, ReviewState::Submitted(ReviewVerdict::RequestChanges))
+        matches!(
+            self.state,
+            ReviewState::Submitted(ReviewVerdict::RequestChanges)
+        )
     }
 }
 
@@ -456,9 +462,7 @@ impl Thread {
                 self.state = ThreadState::Open;
                 Ok(self.state)
             }
-            ThreadState::Open => {
-                Err(LifecycleError::IllegalThreadTransition { from: self.state })
-            }
+            ThreadState::Open => Err(LifecycleError::IllegalThreadTransition { from: self.state }),
         }
     }
 
@@ -595,10 +599,7 @@ pub enum BlockReason {
 /// 3. if `require_codeowner_review`, then `codeowner_review_satisfied`;
 /// 4. no `has_blocking_review` (a live request-changes blocks);
 /// 5. if `require_conversation_resolution`, then `outstanding_conversations == 0`.
-pub fn evaluate_ruleset(
-    ruleset: &BranchProtectionRuleset,
-    ctx: &MergeContext,
-) -> RulesetOutcome {
+pub fn evaluate_ruleset(ruleset: &BranchProtectionRuleset, ctx: &MergeContext) -> RulesetOutcome {
     let mut reasons: Vec<BlockReason> = Vec::new();
 
     // 1. required contexts — Git's required-set policy (X-1). Each required context must be green.
@@ -628,7 +629,9 @@ pub fn evaluate_ruleset(
 
     // 5. conversation resolution.
     if ruleset.require_conversation_resolution && ctx.outstanding_conversations > 0 {
-        reasons.push(BlockReason::OutstandingConversations(ctx.outstanding_conversations));
+        reasons.push(BlockReason::OutstandingConversations(
+            ctx.outstanding_conversations,
+        ));
     }
 
     if reasons.is_empty() {
@@ -882,7 +885,13 @@ mod tests {
 
     // ── helpers ──────────────────────────────────────────────────────────────────────────────────
     fn a_pr(draft: bool) -> PullRequest {
-        PullRequest::open(42, "refs/heads/main", "refs/heads/feature", "psn:alice", draft)
+        PullRequest::open(
+            42,
+            "refs/heads/main",
+            "refs/heads/feature",
+            "psn:alice",
+            draft,
+        )
     }
 
     fn satisfied_ctx() -> MergeContext {
@@ -913,18 +922,33 @@ mod tests {
         let mut pr = a_pr(true);
         assert_eq!(pr.state, PrState::Draft);
         // draft → ready.
-        assert_eq!(pr.transition(PrTransition::MarkReady, false).unwrap(), PrState::Open);
+        assert_eq!(
+            pr.transition(PrTransition::MarkReady, false).unwrap(),
+            PrState::Open
+        );
         // open → merged (gate satisfied).
-        assert_eq!(pr.transition(PrTransition::Merge, true).unwrap(), PrState::Merged);
+        assert_eq!(
+            pr.transition(PrTransition::Merge, true).unwrap(),
+            PrState::Merged
+        );
         assert_eq!(pr.state, PrState::Merged);
     }
 
     #[test]
     fn pr_close_then_reopen_then_close_is_well_formed() {
         let mut pr = a_pr(false); // opens Open.
-        assert_eq!(pr.transition(PrTransition::Close, false).unwrap(), PrState::Closed);
-        assert_eq!(pr.transition(PrTransition::Reopen, false).unwrap(), PrState::Open);
-        assert_eq!(pr.transition(PrTransition::Close, false).unwrap(), PrState::Closed);
+        assert_eq!(
+            pr.transition(PrTransition::Close, false).unwrap(),
+            PrState::Closed
+        );
+        assert_eq!(
+            pr.transition(PrTransition::Reopen, false).unwrap(),
+            PrState::Open
+        );
+        assert_eq!(
+            pr.transition(PrTransition::Close, false).unwrap(),
+            PrState::Closed
+        );
     }
 
     #[test]
@@ -940,10 +964,17 @@ mod tests {
             PrTransition::Reopen,
         ] {
             assert!(
-                matches!(pr.transition(t, true), Err(LifecycleError::IllegalTransition { .. })),
+                matches!(
+                    pr.transition(t, true),
+                    Err(LifecycleError::IllegalTransition { .. })
+                ),
                 "{t:?} from Merged must be illegal"
             );
-            assert_eq!(pr.state, PrState::Merged, "an illegal transition does NOT mutate state");
+            assert_eq!(
+                pr.state,
+                PrState::Merged,
+                "an illegal transition does NOT mutate state"
+            );
         }
     }
 
@@ -953,13 +984,19 @@ mod tests {
         let mut open = a_pr(false);
         assert!(matches!(
             open.transition(PrTransition::MarkReady, false),
-            Err(LifecycleError::IllegalTransition { from: PrState::Open, .. })
+            Err(LifecycleError::IllegalTransition {
+                from: PrState::Open,
+                ..
+            })
         ));
         // Reopen on a Draft (never closed) is illegal.
         let mut draft = a_pr(true);
         assert!(matches!(
             draft.transition(PrTransition::Reopen, false),
-            Err(LifecycleError::IllegalTransition { from: PrState::Draft, .. })
+            Err(LifecycleError::IllegalTransition {
+                from: PrState::Draft,
+                ..
+            })
         ));
         // Reopen on an Open PR is illegal.
         let mut open2 = a_pr(false);
@@ -977,7 +1014,11 @@ mod tests {
             pr.transition(PrTransition::Merge, /*gate_satisfied*/ false),
             Err(LifecycleError::MergeGateNotSatisfied)
         );
-        assert_eq!(pr.state, PrState::Open, "a refused merge does NOT land (0 unprotected merges)");
+        assert_eq!(
+            pr.state,
+            PrState::Open,
+            "a refused merge does NOT land (0 unprotected merges)"
+        );
     }
 
     // ════════ 2. REVIEW LIFECYCLE ════════
@@ -1005,34 +1046,53 @@ mod tests {
         let mut r = Review::request("psn:bob", false);
         assert!(matches!(
             r.dismiss(),
-            Err(LifecycleError::IllegalReviewTransition { from: ReviewState::Requested })
+            Err(LifecycleError::IllegalReviewTransition {
+                from: ReviewState::Requested
+            })
         ));
         // submit on a dismissed review is illegal.
         r.submit(ReviewVerdict::Approve).unwrap();
         r.dismiss().unwrap();
         assert!(matches!(
             r.submit(ReviewVerdict::Approve),
-            Err(LifecycleError::IllegalReviewTransition { from: ReviewState::Dismissed })
+            Err(LifecycleError::IllegalReviewTransition {
+                from: ReviewState::Dismissed
+            })
         ));
         // dismiss an already-dismissed review is illegal.
-        assert!(matches!(r.dismiss(), Err(LifecycleError::IllegalReviewTransition { .. })));
+        assert!(matches!(
+            r.dismiss(),
+            Err(LifecycleError::IllegalReviewTransition { .. })
+        ));
     }
 
     #[test]
     fn agent_reviewer_is_legible() {
         let r = Review::request("psn:agent-x", true);
-        assert!(r.is_agent, "an agent reviewer carries is_agent (ADR-08 legibility — never disguised)");
+        assert!(
+            r.is_agent,
+            "an agent reviewer carries is_agent (ADR-08 legibility — never disguised)"
+        );
     }
 
     // ════════ 3. THREAD LIFECYCLE ════════
 
     fn a_comment(id: u128) -> Comment {
-        Comment { id, author_pseudonym: "psn:alice".into(), body: Body::empty(), is_agent: false }
+        Comment {
+            id,
+            author_pseudonym: "psn:alice".into(),
+            body: Body::empty(),
+            is_agent: false,
+        }
     }
 
     #[test]
     fn thread_open_reply_resolve_reopen_is_well_formed() {
-        let anchor = DiffAnchor { path: "src/lib.rs".into(), start_line: 10, end_line: 12 };
+        let anchor = DiffAnchor {
+            path: "src/lib.rs".into(),
+            start_line: 10,
+            end_line: 12,
+        };
         let mut t = Thread::open(1, anchor, a_comment(100));
         assert_eq!(t.state, ThreadState::Open);
         assert!(t.is_outstanding());
@@ -1050,13 +1110,17 @@ mod tests {
         // reopen an OPEN thread is illegal.
         assert!(matches!(
             t.reopen(),
-            Err(LifecycleError::IllegalThreadTransition { from: ThreadState::Open })
+            Err(LifecycleError::IllegalThreadTransition {
+                from: ThreadState::Open
+            })
         ));
         // resolve, then a second resolve is illegal.
         t.resolve().unwrap();
         assert!(matches!(
             t.resolve(),
-            Err(LifecycleError::IllegalThreadTransition { from: ThreadState::Resolved })
+            Err(LifecycleError::IllegalThreadTransition {
+                from: ThreadState::Resolved
+            })
         ));
     }
 
@@ -1114,7 +1178,10 @@ mod tests {
         // a protected base_ref + an UNMET ruleset → the lifecycle Merge transition is refused.
         let rs = strict_ruleset();
         let mut pr = a_pr(false);
-        assert!(rs.matches(&pr.base_ref), "the ruleset protects refs/heads/main");
+        assert!(
+            rs.matches(&pr.base_ref),
+            "the ruleset protects refs/heads/main"
+        );
 
         let mut ctx = satisfied_ctx();
         ctx.current_approvals = 0; // a fresh PR with 0 approvals.
@@ -1131,13 +1198,20 @@ mod tests {
         // now satisfy the gate → the merge lands.
         let gate = evaluate_ruleset(&rs, &satisfied_ctx());
         assert!(gate.is_satisfied());
-        assert_eq!(pr.transition(PrTransition::Merge, gate.is_satisfied()).unwrap(), PrState::Merged);
+        assert_eq!(
+            pr.transition(PrTransition::Merge, gate.is_satisfied())
+                .unwrap(),
+            PrState::Merged
+        );
     }
 
     #[test]
     fn unprotected_ref_has_no_ruleset_match() {
         let rs = strict_ruleset(); // protects refs/heads/main.
-        assert!(!rs.matches("refs/heads/scratch"), "an unprotected ref is not gated by this ruleset");
+        assert!(
+            !rs.matches("refs/heads/scratch"),
+            "an unprotected ref is not gated by this ruleset"
+        );
     }
 
     #[test]
@@ -1146,7 +1220,10 @@ mod tests {
         assert!(PrState::Merged.is_terminal());
         assert!(!PrState::Draft.is_terminal());
         assert!(!PrState::Open.is_terminal());
-        assert!(!PrState::Closed.is_terminal(), "Closed reopens — it is NOT terminal");
+        assert!(
+            !PrState::Closed.is_terminal(),
+            "Closed reopens — it is NOT terminal"
+        );
     }
 
     #[test]
@@ -1164,7 +1241,10 @@ mod tests {
         assert!(glob_match("a*c*e", "axxcyye"));
         assert!(!glob_match("a*c*e", "abcdf"), "no trailing e → no match");
         // A single `*` must NOT cross `/` (the backtrack `/` guard) even mid-pattern.
-        assert!(!glob_match("refs/*", "refs/heads/main"), "single * stops at /");
+        assert!(
+            !glob_match("refs/*", "refs/heads/main"),
+            "single * stops at /"
+        );
         // `**` crosses `/` (the double-star branch, `p += 2`).
         assert!(glob_match("refs/**", "refs/heads/main"));
         // A `*` that should NOT match (text longer, pattern exhausted with a literal mismatch).
@@ -1176,14 +1256,26 @@ mod tests {
         // a leading `/` anchors at root; a bare glob matches the basename at any depth; `**` under an
         // anchored dir crosses `/`. These exercise codeowners_path_match's three branches + the
         // wildcard internals from the CODEOWNERS side.
-        let co = CodeOwners::parse(
-            "/build/    @a\n*.lock      @b\n/deep/**    @c\n",
-        )
-        .unwrap();
-        assert_eq!(co.owners_for("build/out.o"), &["@a".to_string()], "anchored dir prefix");
-        assert_eq!(co.owners_for("a/b/Cargo.lock"), &["@b".to_string()], "basename glob at depth");
-        assert_eq!(co.owners_for("deep/a/b/c.txt"), &["@c".to_string()], "anchored ** crosses /");
-        assert!(co.owners_for("Cargo.toml").is_empty(), "no rule matches → unowned");
+        let co = CodeOwners::parse("/build/    @a\n*.lock      @b\n/deep/**    @c\n").unwrap();
+        assert_eq!(
+            co.owners_for("build/out.o"),
+            &["@a".to_string()],
+            "anchored dir prefix"
+        );
+        assert_eq!(
+            co.owners_for("a/b/Cargo.lock"),
+            &["@b".to_string()],
+            "basename glob at depth"
+        );
+        assert_eq!(
+            co.owners_for("deep/a/b/c.txt"),
+            &["@c".to_string()],
+            "anchored ** crosses /"
+        );
+        assert!(
+            co.owners_for("Cargo.toml").is_empty(),
+            "no rule matches → unowned"
+        );
     }
 
     #[test]
@@ -1193,7 +1285,10 @@ mod tests {
             ..strict_ruleset()
         };
         assert!(rs.matches("refs/heads/release/1.0"));
-        assert!(!rs.matches("refs/heads/release/1.0/hotfix"), "single * does not cross /");
+        assert!(
+            !rs.matches("refs/heads/release/1.0/hotfix"),
+            "single * does not cross /"
+        );
         let rs2 = BranchProtectionRuleset {
             ref_pattern: "refs/heads/release/**".into(),
             ..strict_ruleset()
@@ -1230,7 +1325,10 @@ mod tests {
     fn codeowners_resolves_paths_last_match_wins_zero_mis_resolved() {
         let co = CodeOwners::parse(FIXTURE).unwrap();
         // default catch-all.
-        assert_eq!(co.owners_for("README.adoc"), &["@acme/core-team".to_string()]);
+        assert_eq!(
+            co.owners_for("README.adoc"),
+            &["@acme/core-team".to_string()]
+        );
         // *.ts overrides the catch-all (later rule wins).
         assert_eq!(co.owners_for("web/app.ts"), &["@acme/frontend".to_string()]);
         // the payments dir overrides BOTH the catch-all and *.ts for a .ts under it (last match wins:
@@ -1245,15 +1343,24 @@ mod tests {
             &["@acme/payments".to_string(), "@alice".to_string()]
         );
         // docs glob.
-        assert_eq!(co.owners_for("docs/guide/intro.md"), &["@acme/writers".to_string()]);
+        assert_eq!(
+            co.owners_for("docs/guide/intro.md"),
+            &["@acme/writers".to_string()]
+        );
         // a .rs file not under payments → only the catch-all (NOT *.ts, NOT payments).
-        assert_eq!(co.owners_for("src/core/lib.rs"), &["@acme/core-team".to_string()]);
+        assert_eq!(
+            co.owners_for("src/core/lib.rs"),
+            &["@acme/core-team".to_string()]
+        );
     }
 
     #[test]
     fn codeowners_rejects_malformed_lines_loudly() {
         // a pattern with no owners.
-        assert_eq!(CodeOwners::parse("*.rs\n"), Err(CodeOwnersError::NoOwners(1)));
+        assert_eq!(
+            CodeOwners::parse("*.rs\n"),
+            Err(CodeOwnersError::NoOwners(1))
+        );
         // a non-@ owner token.
         assert!(matches!(
             CodeOwners::parse("*.rs alice@example.com\n"),
@@ -1272,7 +1379,10 @@ mod tests {
             match d {
                 TupleDelta::Add(t) => {
                     assert_eq!(t.relation.0, crate::live_check::perm::CODE_OWNER);
-                    assert!(t.object.0.starts_with("ref:7::"), "ref-pattern-scoped object");
+                    assert!(
+                        t.object.0.starts_with("ref:7::"),
+                        "ref-pattern-scoped object"
+                    );
                     assert!(t.subject.0.starts_with('@'), "owner handle subject");
                     assert!(t.caveat.is_none());
                 }
@@ -1283,7 +1393,9 @@ mod tests {
         let payments: Vec<&str> = deltas
             .iter()
             .filter_map(|d| match d {
-                TupleDelta::Add(t) if t.object.0 == "ref:7::/src/payments/" => Some(t.subject.0.as_str()),
+                TupleDelta::Add(t) if t.object.0 == "ref:7::/src/payments/" => {
+                    Some(t.subject.0.as_str())
+                }
                 _ => None,
             })
             .collect();

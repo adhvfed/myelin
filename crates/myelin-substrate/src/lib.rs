@@ -281,7 +281,7 @@ pub use fail_static_authz::{
     AuthzDecision, AuthzServed, CoarseAuthz, FailStaticAuthz, AUTHZ_FRESH_TTL_SECS,
 };
 pub use firehose::{
-    Frame, FrameBuffer, FrameClass, FrameLagSample, FirehoseScope, FirehoseSignals, PushOutcome,
+    FirehoseScope, FirehoseSignals, Frame, FrameBuffer, FrameClass, FrameLagSample, PushOutcome,
 };
 pub use firehose_selector::{
     BoundedSelector, FrameBudgetVerdict, FrameOutcome, FrameSelector, FrameShedBudget, ScopeWindow,
@@ -392,7 +392,10 @@ mod tests {
     fn fail_static_shape_and_units_are_frozen() {
         // seconds (the frozen unit); the value is the engineering seed — the real bound is
         // DPO-ratified (L-1), not a default set here. The constructor enforces the §8.2 bound.
-        let bound = StalenessBound { revocation_sla_secs: 300, agent_token_ttl_secs: 60 };
+        let bound = StalenessBound {
+            revocation_sla_secs: 300,
+            agent_token_ttl_secs: 60,
+        };
         let fs: FailStatic<u8> = FailStatic::try_new(30, 300, bound).expect("valid bound");
         assert_eq!(fs.fresh_ttl(), 30u64);
         assert_eq!(fs.static_max(), 300u64);

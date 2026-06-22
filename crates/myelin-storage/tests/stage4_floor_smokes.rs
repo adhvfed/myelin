@@ -38,9 +38,7 @@ use myelin_events::{
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_tenancy::{Region, TenantId};
 
-use myelin_harness::load_generator::{
-    LoadGenerator, Multiplier, PrincipalMix, Sink, StormProfile,
-};
+use myelin_harness::load_generator::{LoadGenerator, Multiplier, PrincipalMix, Sink, StormProfile};
 
 // ----------------------------------------------------------------------------------------------
 // shared helpers (mirrors stage3_drills.rs — admin role for DDL/seed)
@@ -52,7 +50,11 @@ fn admin_url(cfg: &MyelinConfig) -> String {
 }
 
 fn principal() -> Principal {
-    Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId("acme".into()))
+    Principal::stub(
+        PrincipalId("p".into()),
+        PrincipalKind::Human,
+        TenantId("acme".into()),
+    )
 }
 
 fn envelope(id: &str, tenant: &TenantId, aggregate: &str) -> EventEnvelope {
@@ -117,7 +119,10 @@ fn sandbox_escape_containerized_smoke() {
         .args(["pull", "alpine:3"])
         .output()
         .expect("spawn docker pull");
-    assert!(pull.status.success(), "could not pull alpine:3 for the hardened-container smoke");
+    assert!(
+        pull.status.success(),
+        "could not pull alpine:3 for the hardened-container smoke"
+    );
 
     // (a) EGRESS-DENY: with --network=none the container has NO route off-box. A connect to a
     //     public address MUST fail. (We use a TCP connect with a short timeout; success here
@@ -128,7 +133,10 @@ fn sandbox_escape_containerized_smoke() {
         "wget -T 2 -q -O /dev/null http://1.1.1.1/ 2>&1; echo EXIT=$?",
     );
     // The container ran (docker exited 0) but the egress attempt inside MUST have failed.
-    assert!(egress_ok, "the hardened container itself must run; output: {egress_out}");
+    assert!(
+        egress_ok,
+        "the hardened container itself must run; output: {egress_out}"
+    );
     assert!(
         egress_out.contains("EXIT=") && !egress_out.contains("EXIT=0"),
         "EGRESS-DENY breached: a request escaped a --network=none container; output: {egress_out}"
@@ -140,7 +148,10 @@ fn sandbox_escape_containerized_smoke() {
         &["--read-only", "--network=none"],
         "touch /should-not-write 2>&1; echo EXIT=$?",
     );
-    assert!(roroot_ok, "the hardened container itself must run; output: {roroot_out}");
+    assert!(
+        roroot_ok,
+        "the hardened container itself must run; output: {roroot_out}"
+    );
     assert!(
         roroot_out.contains("EXIT=") && !roroot_out.contains("EXIT=0"),
         "READ-ONLY-ROOT breached: a write to / succeeded in a --read-only container; output: {roroot_out}"
@@ -159,7 +170,10 @@ fn sandbox_escape_containerized_smoke() {
         ],
         "touch /tmp/f 2>&1; chown 0:0 /tmp/f 2>&1; echo EXIT=$?",
     );
-    assert!(caps_ok, "the hardened container itself must run; output: {caps_out}");
+    assert!(
+        caps_ok,
+        "the hardened container itself must run; output: {caps_out}"
+    );
     assert!(
         caps_out.contains("EXIT=") && !caps_out.contains("EXIT=0"),
         "DROPPED-CAPS breached: a cap-gated chown succeeded with --cap-drop=ALL; output: {caps_out}"
@@ -229,8 +243,15 @@ async fn load_10x_containerized_smoke() {
     let mut sink = CollectingSink::default();
     gen.drive(&mut sink);
     let total = gen.total_requests() as usize;
-    assert_eq!(sink.issued.len(), total, "the generator issued exactly base*10 requests");
-    assert_eq!(total, 200, "10× of base=20 is 200 requests (the containerized burst)");
+    assert_eq!(
+        sink.issued.len(),
+        total,
+        "the generator issued exactly base*10 requests"
+    );
+    assert_eq!(
+        total, 200,
+        "10× of base=20 is 200 requests (the containerized burst)"
+    );
 
     // Co-commit ONE outbox event per issued request, in the SAME tx as a domain state change
     // (emit-iff-committed). The aggregate is per (tenant) so the outbox `seq` is monotonic per
@@ -275,7 +296,10 @@ async fn load_10x_containerized_smoke() {
     // Drain in batches until the outbox is empty (a few passes for 200 rows at batch 64).
     let mut published_total = 0usize;
     for _ in 0..16 {
-        let n = relay.relay_once(&bus, 64).await.expect("relay drain pass under load");
+        let n = relay
+            .relay_once(&bus, 64)
+            .await
+            .expect("relay drain pass under load");
         published_total += n as usize;
         if relay.outbox_depth().await.expect("depth") == 0 {
             break;
@@ -309,7 +333,10 @@ async fn load_10x_containerized_smoke() {
         "0 lost under 10× load: the delivered set equals exactly the committed set"
     );
     for (id, count) in &delivered {
-        assert_eq!(*count, 1, "0 ghost under 10× load: {id:?} delivered exactly once");
+        assert_eq!(
+            *count, 1,
+            "0 ghost under 10× load: {id:?} delivered exactly once"
+        );
     }
 
     println!(

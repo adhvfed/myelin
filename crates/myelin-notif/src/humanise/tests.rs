@@ -27,10 +27,16 @@ fn viewer(id: &str) -> Principal {
     Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant())
 }
 fn bounded_stale() -> Consistency {
-    Consistency { at_least: Zookie(String::new()), mode: ConsistencyMode::BoundedStale }
+    Consistency {
+        at_least: Zookie(String::new()),
+        mode: ConsistencyMode::BoundedStale,
+    }
 }
 fn strong(zk: &str) -> Consistency {
-    Consistency { at_least: Zookie(zk.into()), mode: ConsistencyMode::Strong }
+    Consistency {
+        at_least: Zookie(zk.into()),
+        mode: ConsistencyMode::Strong,
+    }
 }
 /// The canonical NOTIF-D4 confidential subject — a private issue whose TITLE must never leak.
 fn confidential_issue() -> ArtifactRef {
@@ -65,7 +71,10 @@ impl SyntheticResolver {
         s
     }
     fn allow(&self, viewer_id: &str, ref_: &ArtifactRef) {
-        self.allowed.lock().unwrap().push((viewer_id.into(), ref_.0.clone()));
+        self.allowed
+            .lock()
+            .unwrap()
+            .push((viewer_id.into(), ref_.0.clone()));
     }
     fn revoke(&self, viewer_id: &str, ref_: &ArtifactRef) {
         self.allowed
@@ -150,7 +159,9 @@ fn notif_d4_denied_viewer_gets_tombstone_zero_title_leak() {
     );
     // 0 LEAK: the secret title is absent from EVERY field of the output.
     assert!(
-        !h.text.contains(SECRET_TITLE) && !h.text.contains("SECRET") && !h.text.contains("acquisition"),
+        !h.text.contains(SECRET_TITLE)
+            && !h.text.contains("SECRET")
+            && !h.text.contains("acquisition"),
         "NOTIF-D4: the title must NEVER appear for a denied viewer, got text=`{}`",
         h.text
     );
@@ -161,7 +172,11 @@ fn notif_d4_denied_viewer_gets_tombstone_zero_title_leak() {
         h.text
     );
     // no click-route link to a denied ref (a denied ref is never routable — never leak a route).
-    assert!(h.links.is_empty(), "a denied ref yields no link, got {:?}", h.links);
+    assert!(
+        h.links.is_empty(),
+        "a denied ref yields no link, got {:?}",
+        h.links
+    );
 }
 
 /// **NOTIF-D4 across the inbox-item overload + all three channel projections — 0 leak everywhere.**
@@ -209,10 +224,21 @@ fn allowed_viewer_sees_title_and_link_and_icon() {
         &strong("z1"),
         Channel::Cli,
     );
-    assert!(h.text.contains(SECRET_TITLE), "the allowed viewer sees the title, got `{}`", h.text);
+    assert!(
+        h.text.contains(SECRET_TITLE),
+        "the allowed viewer sees the title, got `{}`",
+        h.text
+    );
     assert_eq!(h.text, "Review requested on TOP SECRET acquisition plan");
-    assert_eq!(h.links, vec![subject.0.clone()], "the allowed branch yields the click-route link");
-    assert_eq!(h.icon, "lock", "the subject's projection icon (slot 0) drives the item icon");
+    assert_eq!(
+        h.links,
+        vec![subject.0.clone()],
+        "the allowed branch yields the click-route link"
+    );
+    assert_eq!(
+        h.icon, "lock",
+        "the subject's projection icon (slot 0) drives the item icon"
+    );
 }
 
 // ════════════════════════════════════════════════════════════════════════════════════════════
@@ -230,25 +256,49 @@ fn chained_revoke_between_renders_flips_title_to_tombstone() {
 
     // render 1 — WITH access: the title is shown.
     let before = humanise(
-        &resolver, &tenant(), &region(), &templates(), "review_requested",
-        std::slice::from_ref(&subject), &viewer("alice"), DEFAULT_LOCALE, &strong("z1"), Channel::Cli,
+        &resolver,
+        &tenant(),
+        &region(),
+        &templates(),
+        "review_requested",
+        std::slice::from_ref(&subject),
+        &viewer("alice"),
+        DEFAULT_LOCALE,
+        &strong("z1"),
+        Channel::Cli,
     );
-    assert!(before.text.contains(SECRET_TITLE), "before revoke: the title is shown, got `{}`", before.text);
+    assert!(
+        before.text.contains(SECRET_TITLE),
+        "before revoke: the title is shown, got `{}`",
+        before.text
+    );
 
     // REVOKE (a new zookie marks the consistency snapshot).
     resolver.revoke("alice", &subject);
 
     // render 2 — WITHOUT access: the SAME item re-renders to a tombstone, NO title.
     let after = humanise(
-        &resolver, &tenant(), &region(), &templates(), "review_requested",
-        std::slice::from_ref(&subject), &viewer("alice"), DEFAULT_LOCALE, &strong("z2"), Channel::Cli,
+        &resolver,
+        &tenant(),
+        &region(),
+        &templates(),
+        "review_requested",
+        std::slice::from_ref(&subject),
+        &viewer("alice"),
+        DEFAULT_LOCALE,
+        &strong("z2"),
+        Channel::Cli,
     );
     assert!(
         !after.text.contains(SECRET_TITLE),
         "after revoke: the title must NOT leak (the per-viewer property under a permission change), got `{}`",
         after.text
     );
-    assert!(after.text.contains("a restricted issue"), "after revoke: a tombstone, got `{}`", after.text);
+    assert!(
+        after.text.contains("a restricted issue"),
+        "after revoke: a tombstone, got `{}`",
+        after.text
+    );
 }
 
 // ════════════════════════════════════════════════════════════════════════════════════════════
@@ -265,10 +315,21 @@ fn erased_actor_humanises_to_erased_user() {
     resolver.allow("bob", &actor); // even an allowed viewer sees the erased display
     resolver.mark_erased(&actor);
     let h = humanise(
-        &resolver, &tenant(), &region(), &templates(), "mentioned",
-        &[actor], &viewer("bob"), DEFAULT_LOCALE, &strong("z1"), Channel::Cli,
+        &resolver,
+        &tenant(),
+        &region(),
+        &templates(),
+        "mentioned",
+        &[actor],
+        &viewer("bob"),
+        DEFAULT_LOCALE,
+        &strong("z1"),
+        Channel::Cli,
     );
-    assert_eq!(h.text, "You were mentioned in [erased user]", "an erased actor → [erased user]");
+    assert_eq!(
+        h.text, "You were mentioned in [erased user]",
+        "an erased actor → [erased user]"
+    );
     assert!(h.links.is_empty(), "an erased ref is not routable");
 }
 
@@ -278,7 +339,10 @@ fn erased_actor_humanises_to_erased_user() {
 
 #[test]
 fn icu_positional_slot_substitution() {
-    assert_eq!(render_message("Hello {0} and {1}", &["Alice".into(), "Bob".into()]), "Hello Alice and Bob");
+    assert_eq!(
+        render_message("Hello {0} and {1}", &["Alice".into(), "Bob".into()]),
+        "Hello Alice and Bob"
+    );
 }
 
 #[test]
@@ -301,8 +365,14 @@ fn icu_select_by_value() {
 fn icu_nested_slot_inside_plural_branch() {
     // `#` is the count; a nested `{1}` still binds.
     let body = "{0, plural, one {# review for {1}} other {# reviews for {1}}}";
-    assert_eq!(render_message(body, &["1".into(), "ENG-1".into()]), "1 review for ENG-1");
-    assert_eq!(render_message(body, &["2".into(), "ENG-1".into()]), "2 reviews for ENG-1");
+    assert_eq!(
+        render_message(body, &["1".into(), "ENG-1".into()]),
+        "1 review for ENG-1"
+    );
+    assert_eq!(
+        render_message(body, &["2".into(), "ENG-1".into()]),
+        "2 reviews for ENG-1"
+    );
 }
 
 #[test]
@@ -327,10 +397,21 @@ fn locale_override_renders_localised_body() {
     let subject = confidential_issue();
     resolver.allow("insider", &subject);
     let h = humanise(
-        &resolver, &tenant(), &region(), &store, "review_requested",
-        &[subject], &viewer("insider"), "fr", &strong("z1"), Channel::Cli,
+        &resolver,
+        &tenant(),
+        &region(),
+        &store,
+        "review_requested",
+        &[subject],
+        &viewer("insider"),
+        "fr",
+        &strong("z1"),
+        Channel::Cli,
     );
-    assert_eq!(h.text, "Revue demandée sur TOP SECRET acquisition plan", "the fr override renders");
+    assert_eq!(
+        h.text, "Revue demandée sur TOP SECRET acquisition plan",
+        "the fr override renders"
+    );
 }
 
 /// **Adjacent placeholders + a placeholder at the very start/end of the body bind exactly (the
@@ -369,7 +450,11 @@ fn icu_commas_inside_branch_do_not_split_the_placeholder() {
 fn icu_select_missing_key_and_no_other_is_empty() {
     let body = "{0, select, a {AA}}";
     assert_eq!(render_message(body, &["a".into()]), "AA");
-    assert_eq!(render_message(body, &["z".into()]), "", "no match, no other → empty");
+    assert_eq!(
+        render_message(body, &["z".into()]),
+        "",
+        "no match, no other → empty"
+    );
 }
 
 // ════════════════════════════════════════════════════════════════════════════════════════════
@@ -420,10 +505,19 @@ fn markdown_unterminated_and_empty_delimiters_are_literal() {
 fn markdown_link_at_eof_and_malformed_link_literal() {
     // a well-formed link ending exactly at EOF.
     let doc = parse_markdown("[l](u)");
-    assert_eq!(doc.spans, vec![Span::Link { label: "l".into(), url: "u".into() }]);
+    assert_eq!(
+        doc.spans,
+        vec![Span::Link {
+            label: "l".into(),
+            url: "u".into()
+        }]
+    );
     assert_eq!(render_markdown(&doc), "[l](u)");
     // malformed: a `[label]` with no `(url)` → literal text (round-trips).
-    assert_eq!(render_markdown(&parse_markdown("[just a label]")), "[just a label]");
+    assert_eq!(
+        render_markdown(&parse_markdown("[just a label]")),
+        "[just a label]"
+    );
     // malformed: `[label](url` with no closing paren → literal.
     assert_eq!(render_markdown(&parse_markdown("[l](u")), "[l](u");
     // malformed: a bare `[` at EOF → literal.
@@ -439,7 +533,10 @@ fn markdown_text_after_link_is_preserved() {
         doc.spans,
         vec![
             Span::Text("see ".into()),
-            Span::Link { label: "l".into(), url: "u".into() },
+            Span::Link {
+                label: "l".into(),
+                url: "u".into()
+            },
             Span::Text(" now".into()),
         ]
     );
@@ -488,9 +585,18 @@ fn markdown_parses_exact_span_structure() {
 fn html_projection_escapes_and_renders_structure() {
     let doc = parse_markdown("a **bold** & [x](http://h?a=1&b=2)");
     let html = render_html(&doc);
-    assert!(html.contains("<strong>bold</strong>"), "bold → <strong>, got `{html}`");
-    assert!(html.contains("&amp;"), "the ampersand is escaped, got `{html}`");
-    assert!(!html.contains(" & "), "a raw ampersand must never leak, got `{html}`");
+    assert!(
+        html.contains("<strong>bold</strong>"),
+        "bold → <strong>, got `{html}`"
+    );
+    assert!(
+        html.contains("&amp;"),
+        "the ampersand is escaped, got `{html}`"
+    );
+    assert!(
+        !html.contains(" & "),
+        "a raw ampersand must never leak, got `{html}`"
+    );
 }
 
 /// **The plain projection strips structure (the CLI/in-app channel).**
@@ -513,10 +619,22 @@ fn humanise_resolves_each_ref_arg_per_viewer() {
     resolver.allow("v", &a);
     resolver.allow("v", &b);
     let _ = humanise(
-        &resolver, &tenant(), &region(), &templates(), "mentioned",
-        &[a, b], &viewer("v"), DEFAULT_LOCALE, &strong("z1"), Channel::Cli,
+        &resolver,
+        &tenant(),
+        &region(),
+        &templates(),
+        "mentioned",
+        &[a, b],
+        &viewer("v"),
+        DEFAULT_LOCALE,
+        &strong("z1"),
+        Channel::Cli,
     );
-    assert_eq!(resolver.call_count(), 2, "each of the two ref args is resolved per-viewer");
+    assert_eq!(
+        resolver.call_count(),
+        2,
+        "each of the two ref args is resolved per-viewer"
+    );
 }
 
 /// **An UNREGISTERED template key degrades to a stable fallback — still leak-free (slot 0 is the
@@ -527,11 +645,27 @@ fn unregistered_key_falls_back_without_leaking() {
     let store = TemplateStore::new(); // no templates registered
     let subject = confidential_issue();
     let h = humanise(
-        &resolver, &tenant(), &region(), &store, "some.unknown.key",
-        &[subject], &viewer("intruder"), DEFAULT_LOCALE, &strong("z1"), Channel::Cli,
+        &resolver,
+        &tenant(),
+        &region(),
+        &store,
+        "some.unknown.key",
+        &[subject],
+        &viewer("intruder"),
+        DEFAULT_LOCALE,
+        &strong("z1"),
+        Channel::Cli,
     );
-    assert!(!h.text.contains(SECRET_TITLE), "the fallback must not leak a title, got `{}`", h.text);
-    assert!(h.text.contains("a restricted issue"), "the fallback binds the per-viewer tombstone, got `{}`", h.text);
+    assert!(
+        !h.text.contains(SECRET_TITLE),
+        "the fallback must not leak a title, got `{}`",
+        h.text
+    );
+    assert!(
+        h.text.contains("a restricted issue"),
+        "the fallback binds the per-viewer tombstone, got `{}`",
+        h.text
+    );
 }
 
 /// **The §2.5 fallback ladder: a tenant override shadows the platform default at the same key.**
@@ -545,11 +679,21 @@ fn template_store_tenant_override_shadows_default() {
         body: "ACME wants your review on {0}".into(),
         icon: "review".into(),
     });
-    let found = store.lookup(&tenant().0, "review_requested", DEFAULT_LOCALE).unwrap();
-    assert_eq!(found.body, "ACME wants your review on {0}", "the tenant override wins");
+    let found = store
+        .lookup(&tenant().0, "review_requested", DEFAULT_LOCALE)
+        .unwrap();
+    assert_eq!(
+        found.body, "ACME wants your review on {0}",
+        "the tenant override wins"
+    );
     // a different tenant still gets the platform default.
-    let other = store.lookup("other-tenant", "review_requested", DEFAULT_LOCALE).unwrap();
-    assert_eq!(other.body, "Review requested on {0}", "another tenant gets the platform default");
+    let other = store
+        .lookup("other-tenant", "review_requested", DEFAULT_LOCALE)
+        .unwrap();
+    assert_eq!(
+        other.body, "Review requested on {0}",
+        "another tenant gets the platform default"
+    );
 }
 
 /// **The fallback body for an unregistered key: with NO args it is the bare key (no `{0}` slot to
@@ -562,18 +706,41 @@ fn fallback_body_arg_count_boundary() {
     let store = TemplateStore::new();
     // ZERO ref args → the fallback is the bare key, no slot.
     let h0 = humanise(
-        &resolver, &tenant(), &region(), &store, "no.args.key",
-        &[], &viewer("v"), DEFAULT_LOCALE, &strong("z1"), Channel::Cli,
+        &resolver,
+        &tenant(),
+        &region(),
+        &store,
+        "no.args.key",
+        &[],
+        &viewer("v"),
+        DEFAULT_LOCALE,
+        &strong("z1"),
+        Channel::Cli,
     );
-    assert_eq!(h0.text, "no.args.key", "zero args → the bare key (no dangling slot)");
+    assert_eq!(
+        h0.text, "no.args.key",
+        "zero args → the bare key (no dangling slot)"
+    );
     // ONE allowed arg → the fallback carries the bound title.
     let subject = confidential_issue();
     resolver.allow("v", &subject);
     let h1 = humanise(
-        &resolver, &tenant(), &region(), &store, "one.arg.key",
-        std::slice::from_ref(&subject), &viewer("v"), DEFAULT_LOCALE, &strong("z1"), Channel::Cli,
+        &resolver,
+        &tenant(),
+        &region(),
+        &store,
+        "one.arg.key",
+        std::slice::from_ref(&subject),
+        &viewer("v"),
+        DEFAULT_LOCALE,
+        &strong("z1"),
+        Channel::Cli,
     );
-    assert_eq!(h1.text, format!("one.arg.key: {SECRET_TITLE}"), "one arg → key + bound slot");
+    assert_eq!(
+        h1.text,
+        format!("one.arg.key: {SECRET_TITLE}"),
+        "one arg → key + bound slot"
+    );
 }
 
 /// **`shared_platform_templates()` carries the platform defaults (NOT an empty store).** Pins the
@@ -585,7 +752,10 @@ fn shared_platform_templates_has_the_defaults() {
     let t = store
         .lookup(PLATFORM_DEFAULT_TENANT, "review_requested", DEFAULT_LOCALE)
         .expect("the shared store carries the platform defaults");
-    assert_eq!(t.body, "Review requested on {0}", "the default template body is present");
+    assert_eq!(
+        t.body, "Review requested on {0}",
+        "the default template body is present"
+    );
 }
 
 /// **The tombstone display is kind-shaped from the OPAQUE root URN, never from content.** A page
@@ -621,8 +791,16 @@ fn cdc_7_3_provider_contract_shape_and_leak_invariant() {
     let subject = confidential_issue();
     resolver.allow("insider", &subject);
     let h = humanise(
-        &resolver, &tenant(), &region(), &templates(), "assigned",
-        std::slice::from_ref(&subject), &viewer("insider"), DEFAULT_LOCALE, &strong("z1"), Channel::Cli,
+        &resolver,
+        &tenant(),
+        &region(),
+        &templates(),
+        "assigned",
+        std::slice::from_ref(&subject),
+        &viewer("insider"),
+        DEFAULT_LOCALE,
+        &strong("z1"),
+        Channel::Cli,
     );
     // the frozen three-field shape.
     assert_eq!(h.text, "You were assigned TOP SECRET acquisition plan");
@@ -630,10 +808,21 @@ fn cdc_7_3_provider_contract_shape_and_leak_invariant() {
     assert_eq!(h.icon, "lock");
     // the contract's leak clause: a denied viewer of the SAME subject gets a tombstone, never the title.
     let denied = humanise(
-        &resolver, &tenant(), &region(), &templates(), "assigned",
-        &[subject], &viewer("outsider"), DEFAULT_LOCALE, &strong("z1"), Channel::Cli,
+        &resolver,
+        &tenant(),
+        &region(),
+        &templates(),
+        "assigned",
+        &[subject],
+        &viewer("outsider"),
+        DEFAULT_LOCALE,
+        &strong("z1"),
+        Channel::Cli,
     );
-    assert!(!denied.text.contains(SECRET_TITLE), "the 7.3 contract: a denied viewer never sees the title");
+    assert!(
+        !denied.text.contains(SECRET_TITLE),
+        "the 7.3 contract: a denied viewer never sees the title"
+    );
 }
 
 /// **CDC — the 7.3 CONSUMER contract: a delivery/inbox consumer calls humanise via the item
@@ -641,15 +830,33 @@ fn cdc_7_3_provider_contract_shape_and_leak_invariant() {
 /// consumer never reaches around humanise for a raw title (the ONE templating surface).
 #[test]
 fn cdc_7_3_consumer_mode_is_display_and_uses_one_surface() {
-    assert_eq!(HUMANISE_RESOLVE_MODE, "Display", "humanise always resolves refs in Display mode (5.2)");
+    assert_eq!(
+        HUMANISE_RESOLVE_MODE, "Display",
+        "humanise always resolves refs in Display mode (5.2)"
+    );
     let resolver = SyntheticResolver::new();
     let subject = confidential_issue();
     resolver.allow("insider", &subject);
     let item = routed_item(Reason::Mentioned, subject);
-    let h = humanise_item(&resolver, &templates(), &item, &viewer("insider"), DEFAULT_LOCALE, &bounded_stale(), Channel::Cli);
+    let h = humanise_item(
+        &resolver,
+        &templates(),
+        &item,
+        &viewer("insider"),
+        DEFAULT_LOCALE,
+        &bounded_stale(),
+        Channel::Cli,
+    );
     // the consumer reads the rendered shape — never a stored string.
-    assert!(h.text.contains(SECRET_TITLE), "the allowed consumer renders the title through humanise");
-    assert_eq!(reason_template_key(Reason::Mentioned), "mentioned", "the item overload keys on the reason");
+    assert!(
+        h.text.contains(SECRET_TITLE),
+        "the allowed consumer renders the title through humanise"
+    );
+    assert_eq!(
+        reason_template_key(Reason::Mentioned),
+        "mentioned",
+        "the item overload keys on the reason"
+    );
 }
 
 // ── A RoutedInboxItem fixture (the inbox-item overload's input). ─────────────────────────────

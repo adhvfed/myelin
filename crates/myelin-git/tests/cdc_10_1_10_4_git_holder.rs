@@ -24,14 +24,14 @@
 //! recoverable PII in any backup and the residual == the ONE platform posture (10.9 / X-7). If 10.1's
 //! body shape drifts, this stops compiling/passing — that is the contract.
 
+use myelin_gdpr::{EraseScope, LocateReport, PersonalDataHolder, SubjectRef, TenantId};
 use myelin_git::code_tools::{CacheInvalidator, CacheNamespace};
 use myelin_git::core::{GitCoreError, RepoLoc};
 use myelin_git::holder::{GitHolder, GitPersonalDataHolder, GitResidualPosture};
-use myelin_gdpr::{EraseScope, LocateReport, PersonalDataHolder, SubjectRef, TenantId};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_storage::encryption::SubjectId;
 use myelin_storage::erase::{
-    BusErase, EraseError, EraseHolders, EpochMillis, ErasureLedgerSink, PseudonymShred,
+    BusErase, EpochMillis, EraseError, EraseHolders, ErasureLedgerSink, PseudonymShred,
     RefsTombstone, SearchPurge,
 };
 use myelin_storage::git_shred::GitCryptoShredReach;
@@ -126,7 +126,8 @@ fn engine() -> KmsEngine {
     let kms = KmsEngine::new();
     let (t, r) = (tenant(), region());
     kms.ensure_kek(&KekId::new(t.clone(), r.clone()));
-    kms.ensure_dek(&t, &r, KeyClass::Subject("p-opaque-ada".into())).expect("subject dek");
+    kms.ensure_dek(&t, &r, KeyClass::Subject("p-opaque-ada".into()))
+        .expect("subject dek");
     kms.ensure_dek(&t, &r, KeyClass::Blob).expect("blob dek");
     kms
 }
@@ -142,7 +143,10 @@ impl<'a> DsrOrchestrator<'a> {
     fn fan_out_locate(&self, subject: &SubjectRef, tenant: TenantId) -> Vec<LocateReport> {
         self.holders
             .iter()
-            .map(|h| h.locate(subject, tenant.clone()).expect("H1 locate via the contract"))
+            .map(|h| {
+                h.locate(subject, tenant.clone())
+                    .expect("H1 locate via the contract")
+            })
             .collect()
     }
 }
@@ -154,15 +158,33 @@ impl<'a> DsrOrchestrator<'a> {
 #[test]
 fn dsr_orchestrator_fans_locate_out_to_the_git_h1_holder_via_the_contract() {
     let eng = engine();
-    let holder = GitPersonalDataHolder::new(&eng, region(), Inv { seen: RefCell::new(vec![]) });
-    let consumer = DsrOrchestrator { holders: vec![&holder] };
+    let holder = GitPersonalDataHolder::new(
+        &eng,
+        region(),
+        Inv {
+            seen: RefCell::new(vec![]),
+        },
+    );
+    let consumer = DsrOrchestrator {
+        holders: vec![&holder],
+    };
 
     let reports = consumer.fan_out_locate(&subject(), tenant());
-    assert_eq!(reports.len(), 1, "the git H1 holder responded to locate via the contract");
+    assert_eq!(
+        reports.len(),
+        1,
+        "the git H1 holder responded to locate via the contract"
+    );
     let r = &reports[0];
     assert_eq!(r.receipt.operation, "locate");
-    assert!(r.receipt.content_hash.starts_with("blake3:"), "content-addressed receipt");
-    assert!(r.receipt.key_epoch_destroyed.is_none(), "locate shreds no key");
+    assert!(
+        r.receipt.content_hash.starts_with("blake3:"),
+        "content-addressed receipt"
+    );
+    assert!(
+        r.receipt.key_epoch_destroyed.is_none(),
+        "locate shreds no key"
+    );
 }
 
 /// **The contract-shaped `erase(EraseScope)` REFUSES loud (the documented EI-01 §1 deviation), never
@@ -171,12 +193,27 @@ fn dsr_orchestrator_fans_locate_out_to_the_git_h1_holder_via_the_contract() {
 #[test]
 fn the_contract_erase_refuses_loud_and_points_at_the_real_fan_out() {
     let eng = engine();
-    let holder = GitPersonalDataHolder::new(&eng, region(), Inv { seen: RefCell::new(vec![]) });
+    let holder = GitPersonalDataHolder::new(
+        &eng,
+        region(),
+        Inv {
+            seen: RefCell::new(vec![]),
+        },
+    );
     let err = holder
-        .erase(EraseScope::Subject { subject: subject(), tenant: tenant() })
+        .erase(EraseScope::Subject {
+            subject: subject(),
+            tenant: tenant(),
+        })
         .expect_err("the contract-shaped erase refuses without wired seams");
-    assert!(err.0.contains("wired cross-holder seams"), "loud refusal names the requirement");
-    assert!(err.0.contains("erase_fanout"), "points the caller at the real §6.1 fan-out");
+    assert!(
+        err.0.contains("wired cross-holder seams"),
+        "loud refusal names the requirement"
+    );
+    assert!(
+        err.0.contains("erase_fanout"),
+        "points the caller at the real §6.1 fan-out"
+    );
 }
 
 /// **The REAL §6.1 DSR fan-out reaches EVERY git holder (GIT-D2 complete) via the wired seams.** This
@@ -187,10 +224,20 @@ fn the_contract_erase_refuses_loud_and_points_at_the_real_fan_out() {
 fn the_real_dsr_fan_out_reaches_every_git_holder_git_d2_complete() {
     let eng = engine();
     let git_reach = GitCryptoShredReach::new(&eng, region());
-    let (pseudonym, search, refs, bus) =
-        (OkSeam::default(), OkSeam::default(), OkSeam::default(), OkSeam::default());
+    let (pseudonym, search, refs, bus) = (
+        OkSeam::default(),
+        OkSeam::default(),
+        OkSeam::default(),
+        OkSeam::default(),
+    );
     let ledger = Ledger::default();
-    let holder = GitPersonalDataHolder::new(&eng, region(), Inv { seen: RefCell::new(vec![]) });
+    let holder = GitPersonalDataHolder::new(
+        &eng,
+        region(),
+        Inv {
+            seen: RefCell::new(vec![]),
+        },
+    );
     let bundle = EraseHolders {
         pseudonym: &pseudonym,
         search: &search,
@@ -205,15 +252,34 @@ fn the_real_dsr_fan_out_reaches_every_git_holder_git_d2_complete() {
         .expect("the real git DSR fan-out is GIT-D2-green");
 
     // GIT-D2: every holder hit, residual == the posture, backups shredded.
-    assert!(receipt.is_green(), "GIT-D2: erase reaches every holder + backups shredded");
-    assert!(receipt.missed_holders().is_empty(), "0 holders missed (a missed holder is a breach)");
-    assert_eq!(receipt.holders_hit.len(), GitHolder::ALL.len(), "all 8 git holders hit");
-    assert_eq!(receipt.recoverable_in_backup, 0, "0 recoverable PII in any backup");
-    assert_eq!(receipt.cache_namespaces_invalidated.len(), CacheNamespace::ALL.len());
+    assert!(
+        receipt.is_green(),
+        "GIT-D2: erase reaches every holder + backups shredded"
+    );
+    assert!(
+        receipt.missed_holders().is_empty(),
+        "0 holders missed (a missed holder is a breach)"
+    );
+    assert_eq!(
+        receipt.holders_hit.len(),
+        GitHolder::ALL.len(),
+        "all 8 git holders hit"
+    );
+    assert_eq!(
+        receipt.recoverable_in_backup, 0,
+        "0 recoverable PII in any backup"
+    );
+    assert_eq!(
+        receipt.cache_namespaces_invalidated.len(),
+        CacheNamespace::ALL.len()
+    );
     assert_eq!(receipt.residual, GitResidualPosture::OnePlatformPosture);
     // The §6.1 cross-holder seams actually ran (the fan-out is real).
     assert!(pseudonym.did_run() && search.did_run() && refs.did_run() && bus.did_run());
-    assert!(ledger.is_erased(&subject_id(), &tenant()), "the erasure ledger recorded the subject");
+    assert!(
+        ledger.is_erased(&subject_id(), &tenant()),
+        "the erasure ledger recorded the subject"
+    );
     // The audit receipt is content-addressed (the hash-link; the Merkle seal is P-GA-20).
     assert_eq!(receipt.audit_receipt.operation, "erase");
     assert!(receipt.audit_receipt.content_hash.starts_with("blake3:"));
@@ -224,7 +290,13 @@ fn the_real_dsr_fan_out_reaches_every_git_holder_git_d2_complete() {
 #[test]
 fn git_holder_export_rectify_restrict_return_content_addressed_receipts() {
     let eng = engine();
-    let holder = GitPersonalDataHolder::new(&eng, region(), Inv { seen: RefCell::new(vec![]) });
+    let holder = GitPersonalDataHolder::new(
+        &eng,
+        region(),
+        Inv {
+            seen: RefCell::new(vec![]),
+        },
+    );
 
     let exp = holder.export(&subject(), tenant()).expect("export");
     assert_eq!(exp.receipt.operation, "export");

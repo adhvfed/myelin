@@ -40,7 +40,10 @@ async fn notif_holder_structural_erase_mutates_zero_pii_columns_yet_tombstones_f
         .expect("connect to dev Postgres as the app role (is the stack up?)");
     let admin = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
-        .connect(&cfg.database_url.replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw"))
+        .connect(
+            &cfg.database_url
+                .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw"),
+        )
         .await
         .expect("connect as admin");
 
@@ -49,13 +52,22 @@ async fn notif_holder_structural_erase_mutates_zero_pii_columns_yet_tombstones_f
     let tbl = format!("notif_holder_erase_probe_{}", std::process::id());
     let create = INBOX_ITEM_DDL.replacen("notif_inbox_item", &tbl, 1);
 
-    sqlx::query(&format!("DROP TABLE IF EXISTS {tbl}")).execute(&admin).await.unwrap();
-    sqlx::query(&create).execute(&admin).await.expect("the inbox_item DDL applies");
+    sqlx::query(&format!("DROP TABLE IF EXISTS {tbl}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    sqlx::query(&create)
+        .execute(&admin)
+        .await
+        .expect("the inbox_item DDL applies");
     sqlx::query(&rls_scope_sql(&tbl))
         .execute(&admin)
         .await
         .expect("myelin_make_tenant_scoped installs the (tenant_id, region) RLS policy");
-    sqlx::query(&format!("GRANT ALL ON {tbl} TO myelin_app")).execute(&admin).await.unwrap();
+    sqlx::query(&format!("GRANT ALL ON {tbl} TO myelin_app"))
+        .execute(&admin)
+        .await
+        .unwrap();
 
     // The subject to erase (an OPAQUE pseudonym, 4.8) + a referenced-actor ref naming the subject.
     let subject_pseudonym = "psn:u-erase";
@@ -68,7 +80,13 @@ async fn notif_holder_structural_erase_mutates_zero_pii_columns_yet_tombstones_f
     //   3. a CONTROL row naming a different person (must be untouched + not match the subject).
     let seed: [(&str, &str, &str, &str, &str); 3] = [
         // (item_id, recipient, subject_ref, origin_event_ref, template_args_json)
-        ("itm-own", subject_pseudonym, "myelin://acme/issues/issue/PROJ-1", "myelin://acme/event/e1", "[]"),
+        (
+            "itm-own",
+            subject_pseudonym,
+            "myelin://acme/issues/issue/PROJ-1",
+            "myelin://acme/event/e1",
+            "[]",
+        ),
         (
             "itm-byref",
             "psn:u-bob",
@@ -77,12 +95,24 @@ async fn notif_holder_structural_erase_mutates_zero_pii_columns_yet_tombstones_f
             // the subject named BY REFERENCE (an ArtifactRef in the ref-array), never a rendered name.
             "[\"myelin://acme/identity/principal/u-erase\"]",
         ),
-        ("itm-control", "psn:u-carol", "myelin://acme/issues/issue/PROJ-3", "myelin://acme/event/e3", "[]"),
+        (
+            "itm-control",
+            "psn:u-carol",
+            "myelin://acme/issues/issue/PROJ-3",
+            "myelin://acme/event/e3",
+            "[]",
+        ),
     ];
     for (item_id, recipient, subject_ref, origin, targs) in seed {
         let mut conn = admin.acquire().await.unwrap();
-        sqlx::query("SELECT set_config('myelin.tenant_id', 'acme', false)").execute(&mut *conn).await.unwrap();
-        sqlx::query("SELECT set_config('myelin.region', 'fr-par', false)").execute(&mut *conn).await.unwrap();
+        sqlx::query("SELECT set_config('myelin.tenant_id', 'acme', false)")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query("SELECT set_config('myelin.region', 'fr-par', false)")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
         sqlx::query(&format!(
             "INSERT INTO {tbl} \
                (tenant_id, region, item_id, recipient, subject, subject_root, reason, class, \
@@ -104,8 +134,14 @@ async fn notif_holder_structural_erase_mutates_zero_pii_columns_yet_tombstones_f
     // the structural erase. The `locate` predicate (the holder's references-not-payloads predicate):
     // recipient = the subject pseudonym OR a stored ref names the subject's principal id.
     let mut conn = app.acquire().await.unwrap();
-    sqlx::query("SELECT set_config('myelin.tenant_id', 'acme', false)").execute(&mut *conn).await.unwrap();
-    sqlx::query("SELECT set_config('myelin.region', 'fr-par', false)").execute(&mut *conn).await.unwrap();
+    sqlx::query("SELECT set_config('myelin.tenant_id', 'acme', false)")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query("SELECT set_config('myelin.region', 'fr-par', false)")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
 
     let locate_sql = format!(
         "SELECT item_id, recipient, subject, origin_event, template_args_json::text AS targs, state \
@@ -121,7 +157,11 @@ async fn notif_holder_structural_erase_mutates_zero_pii_columns_yet_tombstones_f
         .fetch_all(&mut *conn)
         .await
         .unwrap();
-    assert_eq!(before.len(), 2, "locate finds BOTH the subject's appearances (own + by-ref) — 0 false matches");
+    assert_eq!(
+        before.len(),
+        2,
+        "locate finds BOTH the subject's appearances (own + by-ref) — 0 false matches"
+    );
 
     let total_before: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {tbl}"))
         .fetch_one(&mut *conn)
@@ -143,7 +183,11 @@ async fn notif_holder_structural_erase_mutates_zero_pii_columns_yet_tombstones_f
         .fetch_all(&mut *conn)
         .await
         .unwrap();
-    assert_eq!(after.len(), 2, "0 rows deleted — the appearance stays (no erasure backdoor; only resolution changes)");
+    assert_eq!(
+        after.len(),
+        2,
+        "0 rows deleted — the appearance stays (no erasure backdoor; only resolution changes)"
+    );
 
     for (b, a) in before.iter().zip(after.iter()) {
         assert_eq!(b.get::<String, _>("item_id"), a.get::<String, _>("item_id"));
@@ -168,14 +212,25 @@ async fn notif_holder_structural_erase_mutates_zero_pii_columns_yet_tombstones_f
         .fetch_one(&mut *conn)
         .await
         .unwrap();
-    assert_eq!(total_after, 3, "no row deleted by the structural erase — the appearance tombstones in place");
+    assert_eq!(
+        total_after, 3,
+        "no row deleted by the structural erase — the appearance tombstones in place"
+    );
 
     // The CONTROL row (naming a different person) is unaffected + never matched the subject locate.
-    let control_recipient: String = sqlx::query_scalar(&format!("SELECT recipient FROM {tbl} WHERE item_id = 'itm-control'"))
-        .fetch_one(&mut *conn)
+    let control_recipient: String = sqlx::query_scalar(&format!(
+        "SELECT recipient FROM {tbl} WHERE item_id = 'itm-control'"
+    ))
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap();
+    assert_eq!(
+        control_recipient, "psn:u-carol",
+        "the control row is untouched"
+    );
+
+    sqlx::query(&format!("DROP TABLE {tbl}"))
+        .execute(&admin)
         .await
         .unwrap();
-    assert_eq!(control_recipient, "psn:u-carol", "the control row is untouched");
-
-    sqlx::query(&format!("DROP TABLE {tbl}")).execute(&admin).await.unwrap();
 }

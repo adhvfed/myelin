@@ -352,7 +352,9 @@ pub fn git_tool_defs() -> Vec<ToolDef> {
 /// Returns the registered defs on success (so the caller can assert the catalogue), or the first
 /// [`LooseningViolation`] if any def silently loosened a frozen gate (it never does for the seeded
 /// defs — the guard is the ratchet, not a runtime branch).
-pub fn register_git_tools<S: ToolSurface>(surface: &mut S) -> Result<Vec<ToolDef>, LooseningViolation> {
+pub fn register_git_tools<S: ToolSurface>(
+    surface: &mut S,
+) -> Result<Vec<ToolDef>, LooseningViolation> {
     let defs = git_tool_defs();
     // The guard runs with NO deviations (the strict default): the seeded defs always pass; a
     // hand-loosened def would be rejected LOUD here.
@@ -390,7 +392,10 @@ mod tests {
     #[test]
     fn git_merge_is_gated_by_the_frozen_default() {
         let def = git_merge_tool_def();
-        assert!(def.requires_approval, "git.merge is HITL-gated (§6.3 / AG-8)");
+        assert!(
+            def.requires_approval,
+            "git.merge is HITL-gated (§6.3 / AG-8)"
+        );
         assert_eq!(
             def.requires_approval,
             requires_approval_default(GIT_SUBSYSTEM, GIT_MERGE_TOOL),
@@ -406,7 +411,10 @@ mod tests {
     #[test]
     fn open_pr_is_not_gated_by_the_frozen_default() {
         let def = open_pr_tool_def();
-        assert!(!def.requires_approval, "open_pr is reversible → NOT gated (§6.3)");
+        assert!(
+            !def.requires_approval,
+            "open_pr is reversible → NOT gated (§6.3)"
+        );
         assert_eq!(
             def.requires_approval,
             requires_approval_default(GIT_SUBSYSTEM, OPEN_PR_TOOL),
@@ -421,8 +429,14 @@ mod tests {
     /// `myelin-git` object-type constants, so a fragment rename breaks this test (no silent drift).
     #[test]
     fn required_caps_are_the_git_rebac_fragment_permissions() {
-        assert_eq!(git_merge_tool_def().required_caps, vec!["pull_request.merge".to_string()]);
-        assert_eq!(open_pr_tool_def().required_caps, vec!["repo.push".to_string()]);
+        assert_eq!(
+            git_merge_tool_def().required_caps,
+            vec!["pull_request.merge".to_string()]
+        );
+        assert_eq!(
+            open_pr_tool_def().required_caps,
+            vec!["repo.push".to_string()]
+        );
         // the object-type halves ARE the canonical Git ReBAC names (4.9), not local strings.
         assert_eq!(git_objects::PULL_REQUEST, "pull_request");
         assert_eq!(git_objects::REPO, "repo");
@@ -442,12 +456,16 @@ mod tests {
              suggest_change + resolve_thread"
         );
 
-        let merge = cat.resolve(&ToolName(GIT_MERGE_TOOL.into())).expect("git.merge registered");
+        let merge = cat
+            .resolve(&ToolName(GIT_MERGE_TOOL.into()))
+            .expect("git.merge registered");
         assert_eq!(merge.subsystem, GIT_SUBSYSTEM);
         assert!(merge.requires_approval, "the registered git.merge is gated");
         assert_eq!(merge.required_caps, vec!["pull_request.merge".to_string()]);
 
-        let pr = cat.resolve(&ToolName(OPEN_PR_TOOL.into())).expect("open_pr registered");
+        let pr = cat
+            .resolve(&ToolName(OPEN_PR_TOOL.into()))
+            .expect("open_pr registered");
         assert_eq!(pr.subsystem, GIT_SUBSYSTEM);
         assert!(!pr.requires_approval, "the registered open_pr is NOT gated");
         assert_eq!(pr.required_caps, vec!["repo.push".to_string()]);
@@ -471,7 +489,10 @@ mod tests {
         assert_eq!(def.effect_kind, EffectKind::Mutate);
         assert!(def.side_effecting);
         // GATED — and it IS the frozen §6.3 seed (the named consequential erasure-admin row).
-        assert!(def.requires_approval, "history-rewrite is HITL-gated (the §6.3 consequential row)");
+        assert!(
+            def.requires_approval,
+            "history-rewrite is HITL-gated (the §6.3 consequential row)"
+        );
         assert_eq!(
             def.requires_approval,
             requires_approval_default(GIT_SUBSYSTEM, myelin_git::code_tools::HISTORY_REWRITE_TOOL),
@@ -480,7 +501,10 @@ mod tests {
         // admin-scoped tenant op cap (recon §9), from the canonical git constants.
         assert_eq!(def.required_caps, vec!["repo.administer".to_string()]);
         // GF-9: not MCP-exposed at v1.
-        assert!(!def.exposed_over_mcp, "GF-9: no external MCP endpoint at v1");
+        assert!(
+            !def.exposed_over_mcp,
+            "GF-9: no external MCP endpoint at v1"
+        );
     }
 
     /// **`git.scip_index` is a `Compute` tool → the unified sandbox (`ToolHands::exec`), NOT gated
@@ -494,11 +518,20 @@ mod tests {
         assert_eq!(def.name.0, myelin_git::code_tools::SCIP_INDEX_TOOL);
         // Compute ⇒ the sandbox (the only kind that touches the kernel — gated by AG-D4).
         assert_eq!(def.effect_kind, EffectKind::Compute);
-        assert!(!def.side_effecting, "a read-only index build is not a mutation");
+        assert!(
+            !def.side_effecting,
+            "a read-only index build is not a mutation"
+        );
         // NOT gated (a reversible/advisory read-only artifact) — and it IS the frozen seed.
-        assert!(!def.requires_approval, "a read-only index build is NOT gated");
+        assert!(
+            !def.requires_approval,
+            "a read-only index build is NOT gated"
+        );
         assert_eq!(def.required_caps, vec!["repo.pull".to_string()]);
-        assert!(!def.exposed_over_mcp, "GF-9: no external MCP endpoint at v1");
+        assert!(
+            !def.exposed_over_mcp,
+            "GF-9: no external MCP endpoint at v1"
+        );
     }
 
     // ───────────── the AGENT AUTHOR/REVIEWER tools (GIT-P28 → P-289, M3-G6) ──────────────────────
@@ -513,10 +546,19 @@ mod tests {
         for def in git_author_tool_defs() {
             assert_eq!(def.subsystem, GIT_SUBSYSTEM);
             // Mutate ⇒ EffectApi (plan-then-apply), never a direct write.
-            assert_eq!(def.effect_kind, EffectKind::Mutate, "{} routes through EffectApi", def.name.0);
+            assert_eq!(
+                def.effect_kind,
+                EffectKind::Mutate,
+                "{} routes through EffectApi",
+                def.name.0
+            );
             assert!(def.side_effecting);
             // NOT gated — and it IS the frozen §6.3 seed (reversible authoring).
-            assert!(!def.requires_approval, "{} is reversible authoring → NOT gated", def.name.0);
+            assert!(
+                !def.requires_approval,
+                "{} is reversible authoring → NOT gated",
+                def.name.0
+            );
             assert_eq!(
                 def.requires_approval,
                 requires_approval_default(GIT_SUBSYSTEM, &def.name.0),
@@ -534,8 +576,19 @@ mod tests {
             assert!(!def.exposed_over_mcp);
         }
         // the four author tools are exactly the §7 comment/review/suggest/resolve quartet.
-        let names: Vec<String> = git_author_tool_defs().iter().map(|d| d.name.0.clone()).collect();
-        assert_eq!(names, vec!["comment", "submit_review", "suggest_change", "resolve_thread"]);
+        let names: Vec<String> = git_author_tool_defs()
+            .iter()
+            .map(|d| d.name.0.clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "comment",
+                "submit_review",
+                "suggest_change",
+                "resolve_thread"
+            ]
+        );
     }
 
     /// **The catalogue carries ALL FOUR Git producer tools, seeded from the frozen §6.3 defaults
@@ -585,7 +638,11 @@ mod tests {
             .filter(|d| d.effect_kind == EffectKind::Compute)
             .map(|d| d.name.0.as_str())
             .collect();
-        assert_eq!(compute, vec!["scip_index"], "only SCIP indexing reaches the bare sandbox");
+        assert_eq!(
+            compute,
+            vec!["scip_index"],
+            "only SCIP indexing reaches the bare sandbox"
+        );
     }
 
     /// **The no-silent-loosening guard (VISION §3) protects the registration path.** A `git.merge`

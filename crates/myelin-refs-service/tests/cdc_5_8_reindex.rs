@@ -102,9 +102,19 @@ fn reindex_scope_rebuilds_byte_parity_cold_equals_live() {
         .expect("reindex");
     assert_eq!(receipt.snapshots_emitted, 3);
     assert_eq!(receipt.ingested, 3);
-    assert!(reindexer.verify_parity(&live_proj, &tenant(), &region()), "byte-parity (cold == live)");
-    assert_eq!(receipt.parity_hash, live_proj.parity_hash(&tenant(), &region()));
-    assert_eq!(reindexer.reindex_parity(), 1, "the reindex_parity telemetry reads 1");
+    assert!(
+        reindexer.verify_parity(&live_proj, &tenant(), &region()),
+        "byte-parity (cold == live)"
+    );
+    assert_eq!(
+        receipt.parity_hash,
+        live_proj.parity_hash(&tenant(), &region())
+    );
+    assert_eq!(
+        reindexer.reindex_parity(),
+        1,
+        "the reindex_parity telemetry reads 1"
+    );
 }
 
 /// Build the live `refs.edge.created` envelope that corresponds to the i-th source edge (the SAME
@@ -156,8 +166,13 @@ fn reindex_snapshots_ingest_through_the_real_consumer_runtime_deduped() {
         .expect("reindex emits the snapshot");
 
     let snap_id = snapshot_event_id(&myelin_events::AggregateKey("refs.edge:1".into()), 1);
-    let row = outbox.row(&snap_id).expect("snapshot row in the outbox at its deterministic id");
-    assert_eq!(row.envelope.type_.0, REFS_EDGE_SNAPSHOT_TYPE, "the snapshot type");
+    let row = outbox
+        .row(&snap_id)
+        .expect("snapshot row in the outbox at its deterministic id");
+    assert_eq!(
+        row.envelope.type_.0, REFS_EDGE_SNAPSHOT_TYPE,
+        "the snapshot type"
+    );
 
     // Drive the snapshot envelope through the REAL Consumer runtime over a FRESH projection.
     let projection = EdgeProjection::new();
@@ -165,13 +180,32 @@ fn reindex_snapshots_ingest_through_the_real_consumer_runtime_deduped() {
         ConsumerName("refs-edge-builder".into()),
         EDGE_BUILDER_SUBJECT_PREFIXES,
     );
-    let consumer = consume(spec, RefsEdgeBuilder::new(projection.clone()), DedupLedger::new())
-        .expect("bind the builder");
-    let msg = Message { subject: "refs.edge.snapshot".into(), envelope: row.envelope.clone() };
+    let consumer = consume(
+        spec,
+        RefsEdgeBuilder::new(projection.clone()),
+        DedupLedger::new(),
+    )
+    .expect("bind the builder");
+    let msg = Message {
+        subject: "refs.edge.snapshot".into(),
+        envelope: row.envelope.clone(),
+    };
 
-    assert_eq!(consumer.deliver(&msg), Delivered::Acked, "the snapshot projects the edge");
-    assert_eq!(consumer.deliver(&msg), Delivered::Deduplicated, "a redelivered snapshot is deduped");
-    assert_eq!(projection.live_count(&tenant(), &region()), 1, "exactly one row (idempotent rebuild)");
+    assert_eq!(
+        consumer.deliver(&msg),
+        Delivered::Acked,
+        "the snapshot projects the edge"
+    );
+    assert_eq!(
+        consumer.deliver(&msg),
+        Delivered::Deduplicated,
+        "a redelivered snapshot is deduped"
+    );
+    assert_eq!(
+        projection.live_count(&tenant(), &region()),
+        1,
+        "exactly one row (idempotent rebuild)"
+    );
 }
 
 /// **REF-D4 (TE-7 half): a scoped reindex reconverges Refs to the typed table — typed wins.** A
@@ -207,10 +241,17 @@ fn scoped_reindex_reconverges_te7_drift_typed_wins() {
         .reconverge_typed(&tenant(), &region(), &typed, &covered, "reindex-1")
         .expect("reconverge");
     assert_eq!(reprojected, 2, "forward + inverse (blocks + blocked_by)");
-    assert_eq!(tombstoned, 1, "the spurious drift is tombstoned (typed wins)");
+    assert_eq!(
+        tombstoned, 1,
+        "the spurious drift is tombstoned (typed wins)"
+    );
 
     let inbound = proj.inbound_live(&tenant(), &region(), &covered[0]);
-    assert_eq!(inbound.len(), 1, "exactly the typed-backed inbound edge survives");
+    assert_eq!(
+        inbound.len(),
+        1,
+        "exactly the typed-backed inbound edge survives"
+    );
     assert_eq!(inbound[0].source.0, "myelin://acme/issue/issue/ENG-1");
 }
 
@@ -220,14 +261,20 @@ fn erased_aggregate_stays_erased_across_reindex_x7() {
     let mut truth = RefsReindexSource::new();
     truth.record(source_edge("refs.edge:keep", 1, "s1", "t1", "mentions"));
     truth.record(source_edge("refs.edge:gone", 1, "s2", "t2", "embeds"));
-    assert!(truth.erase("refs.edge:gone"), "erase the aggregate from the source of truth");
+    assert!(
+        truth.erase("refs.edge:gone"),
+        "erase the aggregate from the source of truth"
+    );
 
     let reindexer = RefsReindexer::new(RefsEdgeBuilder::new(EdgeProjection::new()));
     let mut outbox = OutboxStore::new();
     let receipt = reindexer
         .reindex(&scope(), None, &truth, &mut outbox, ctx_base())
         .expect("reindex");
-    assert_eq!(receipt.snapshots_emitted, 1, "only the kept aggregate is re-snapshotted");
+    assert_eq!(
+        receipt.snapshots_emitted, 1,
+        "only the kept aggregate is re-snapshotted"
+    );
     assert_eq!(
         reindexer.projection().live_count(&tenant(), &region()),
         1,

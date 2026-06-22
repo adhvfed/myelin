@@ -24,7 +24,11 @@ use myelin_storage::{OltpConfig, OltpError, OltpPool, TenantQuery, TenantScope, 
 use myelin_tenancy::{Region, TenantId};
 
 fn principal(tenant: &str) -> Principal {
-    Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId(tenant.into()))
+    Principal::stub(
+        PrincipalId("p".into()),
+        PrincipalKind::Human,
+        TenantId(tenant.into()),
+    )
 }
 
 /// **DRILL 1 — the scoped IDOR drill (storage §1.1 IDOR floor).**

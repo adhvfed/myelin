@@ -328,9 +328,11 @@ impl PseudonymStore {
         self.kms.ensure_kek(&kek_id);
         // L2: the PER-SUBJECT DEK (GD-4) — distinct from the per-tenant DEK. THIS is the key the
         // subject's Art. 17 erasure destroys (one destroy = that person's mapping unrecoverable).
-        let key_ref =
-            self.kms
-                .ensure_dek(scope.tenant(), scope.region(), Self::subject_dek_class(subject))?;
+        let key_ref = self.kms.ensure_dek(
+            scope.tenant(),
+            scope.region(),
+            Self::subject_dek_class(subject),
+        )?;
         let dek = self.kms.resolve_dek(&key_ref, scope.region())?;
         let (nonce, ciphertext) = dek.seal(subject.0.as_bytes());
         Ok((key_ref, SealedRealIdentity { nonce, ciphertext }))
@@ -380,7 +382,11 @@ impl PseudonymStore {
                 Some(s) => s.clone(),
                 None => return Ok(None),
             };
-            let row = match inner.by_subject.get(&part_key).and_then(|p| p.get(&subject_id)) {
+            let row = match inner
+                .by_subject
+                .get(&part_key)
+                .and_then(|p| p.get(&subject_id))
+            {
                 Some(r) => r.clone(),
                 None => return Ok(None),
             };
@@ -417,8 +423,14 @@ impl PseudonymStore {
         let part_key = Self::part_key(scope);
         let (key_ref, sealed) = {
             let inner = self.lock();
-            let row = inner.by_subject.get(&part_key).and_then(|p| p.get(&subject.0))?;
-            let sealed = inner.sealed.get(&part_key).and_then(|p| p.get(&subject.0))?;
+            let row = inner
+                .by_subject
+                .get(&part_key)
+                .and_then(|p| p.get(&subject.0))?;
+            let sealed = inner
+                .sealed
+                .get(&part_key)
+                .and_then(|p| p.get(&subject.0))?;
             (row.real_id_key_ref.clone(), sealed.clone())
         };
         // Open under the per-subject DEK. A destroyed DEK (crypto-shred) ⇒ Err ⇒ None (erased): never
@@ -546,7 +558,10 @@ mod tests {
         let read = store
             .mapping_of(&s, &PrincipalId("p:alice".into()))
             .expect("the row round-trips under the same scope");
-        assert_eq!(read, written, "the S2 row round-trips byte-for-byte under RLS");
+        assert_eq!(
+            read, written,
+            "the S2 row round-trips byte-for-byte under RLS"
+        );
 
         // The reverse direction (pseudonym → subject) resolves the real-identity link.
         let subject = store
@@ -577,7 +592,9 @@ mod tests {
 
         // globex sees NOTHING acme wrote.
         assert!(
-            store.mapping_of(&globex, &PrincipalId("p:alice".into())).is_none(),
+            store
+                .mapping_of(&globex, &PrincipalId("p:alice".into()))
+                .is_none(),
             "no cross-tenant read path: globex cannot see acme's mapping"
         );
         // globex cannot resolve acme's pseudonym (the reverse index is per-partition too).
@@ -586,7 +603,10 @@ mod tests {
             None,
             "globex cannot resolve acme's pseudonym"
         );
-        assert!(store.mappings_in(&globex).is_empty(), "globex's partition is empty");
+        assert!(
+            store.mappings_in(&globex).is_empty(),
+            "globex's partition is empty"
+        );
         assert_eq!(store.mappings_in(&acme).len(), 1);
     }
 
@@ -599,10 +619,16 @@ mod tests {
         let eu = scope_region("acme", "eu-west");
         let us = scope_region("acme", "us-east");
         store
-            .put_mapping(&eu, &PrincipalId("p:alice".into()), handle("anon-7f3a", "acme"))
+            .put_mapping(
+                &eu,
+                &PrincipalId("p:alice".into()),
+                handle("anon-7f3a", "acme"),
+            )
             .expect("eu write");
         assert!(
-            store.mapping_of(&us, &PrincipalId("p:alice".into())).is_none(),
+            store
+                .mapping_of(&us, &PrincipalId("p:alice".into()))
+                .is_none(),
             "residency partition: the us-east partition cannot see the eu-west mapping"
         );
         assert_eq!(store.mappings_in(&eu).len(), 1);
@@ -622,8 +648,12 @@ mod tests {
             .put_mapping(&s, &PrincipalId("p:bob".into()), handle("anon-b", "acme"))
             .unwrap();
 
-        let alice_ref = store.shred_key_for(&s, &PrincipalId("p:alice".into())).unwrap();
-        let bob_ref = store.shred_key_for(&s, &PrincipalId("p:bob".into())).unwrap();
+        let alice_ref = store
+            .shred_key_for(&s, &PrincipalId("p:alice".into()))
+            .unwrap();
+        let bob_ref = store
+            .shred_key_for(&s, &PrincipalId("p:bob".into()))
+            .unwrap();
 
         // Each names the PER-SUBJECT key class, NOT the per-tenant key.
         assert_eq!(alice_ref.class, KeyClass::Subject("p:alice".into()));
@@ -633,7 +663,10 @@ mod tests {
             "the real-identity link is keyed under the PER-SUBJECT DEK, not the per-tenant DEK"
         );
         // Distinct subjects ⇒ distinct keys (GD-4).
-        assert_ne!(alice_ref.class, bob_ref.class, "distinct subjects get distinct per-subject DEKs");
+        assert_ne!(
+            alice_ref.class, bob_ref.class,
+            "distinct subjects get distinct per-subject DEKs"
+        );
     }
 
     /// **The per-subject-key boundary (mutation-tested mandatory-core): subject A's real-identity
@@ -650,16 +683,26 @@ mod tests {
         store
             .put_mapping(&s, &PrincipalId("p:bob".into()), handle("anon-b", "acme"))
             .unwrap();
-        let bob_ref = store.shred_key_for(&s, &PrincipalId("p:bob".into())).unwrap();
+        let bob_ref = store
+            .shred_key_for(&s, &PrincipalId("p:bob".into()))
+            .unwrap();
 
         // Pull alice's sealed link directly and try to open it under BOB's DEK — it must NOT open.
         let inner = store.lock();
         let part = (s.tenant().0.clone(), s.region().0.clone());
-        let alice_sealed = inner.sealed.get(&part).unwrap().get("p:alice").unwrap().clone();
+        let alice_sealed = inner
+            .sealed
+            .get(&part)
+            .unwrap()
+            .get("p:alice")
+            .unwrap()
+            .clone();
         drop(inner);
         let bob_dek = store.kms.resolve_dek(&bob_ref, s.region()).unwrap();
         assert!(
-            bob_dek.open(&alice_sealed.nonce, &alice_sealed.ciphertext).is_none(),
+            bob_dek
+                .open(&alice_sealed.nonce, &alice_sealed.ciphertext)
+                .is_none(),
             "bob's per-subject DEK must NOT open alice's real-identity link (the GD-4 boundary)"
         );
     }
@@ -680,9 +723,14 @@ mod tests {
             .unwrap();
 
         // Destroy alice's per-subject DEK (the crypto-shred lever — the erase BODY is P-ID-20).
-        let key_ref = store.shred_key_for(&s, &PrincipalId("p:alice".into())).unwrap();
+        let key_ref = store
+            .shred_key_for(&s, &PrincipalId("p:alice".into()))
+            .unwrap();
         let dek_id = myelin_storage::DekId::new(key_ref.tenant.clone(), key_ref.class.clone());
-        assert!(store.kms.destroy_dek(&dek_id), "the per-subject DEK is destroyed (crypto-shred)");
+        assert!(
+            store.kms.destroy_dek(&dek_id),
+            "the per-subject DEK is destroyed (crypto-shred)"
+        );
 
         // The resolve now fails LOUDLY (the key is gone) — never plaintext-without-key.
         let r = store.resolve(&s, &h);
@@ -693,7 +741,9 @@ mod tests {
         // The PUBLIC pseudonym row SURVIVES the shred (the EI-04 §1 immutable-attribution split:
         // the public handle stays, only the real-identity link is erased).
         assert!(
-            store.mapping_of(&s, &PrincipalId("p:alice".into())).is_some(),
+            store
+                .mapping_of(&s, &PrincipalId("p:alice".into()))
+                .is_some(),
             "the public pseudonym row survives the crypto-shred (historic attribution intact)"
         );
     }
@@ -713,7 +763,9 @@ mod tests {
             "a handle whose tenant label != the verified tenant is refused"
         );
         assert!(
-            store.mapping_of(&s, &PrincipalId("p:alice".into())).is_none(),
+            store
+                .mapping_of(&s, &PrincipalId("p:alice".into()))
+                .is_none(),
             "nothing was written on rejection (no partial write)"
         );
     }
@@ -760,11 +812,20 @@ mod tests {
             (&mismatch, "grammar"),
         ] {
             assert!(!msg.is_empty(), "the error renders a non-empty message");
-            assert!(msg.contains(needle), "the error names its cause ({needle}): {msg}");
+            assert!(
+                msg.contains(needle),
+                "the error names its cause ({needle}): {msg}"
+            );
         }
         // The Kms variant carries the underlying reason; the mismatch names the offending handle.
-        assert!(kms.contains("dek destroyed"), "the KMS error carries the underlying reason");
-        assert!(mismatch.contains("anon@globex.noreply"), "the mismatch names the offending handle");
+        assert!(
+            kms.contains("dek destroyed"),
+            "the KMS error carries the underlying reason"
+        );
+        assert!(
+            mismatch.contains("anon@globex.noreply"),
+            "the mismatch names the offending handle"
+        );
     }
 
     /// **The S2 store auto-registers as a `PersonalDataHolder` (§1.1, GD-3, contract 10.1) — the
@@ -774,8 +835,15 @@ mod tests {
     #[test]
     fn s2_store_registers_as_a_personal_data_holder() {
         let store = PseudonymStore::new(kms());
-        assert_eq!(store.holder().store, S2_HOLDER, "the S2 store registered under its holder name");
+        assert_eq!(
+            store.holder().store,
+            S2_HOLDER,
+            "the S2 store registered under its holder name"
+        );
         let receipt = store.register_holder();
-        assert_eq!(receipt.store, S2_HOLDER, "the holder receipt names S2 (it appears in the list)");
+        assert_eq!(
+            receipt.store, S2_HOLDER,
+            "the holder receipt names S2 (it appears in the list)"
+        );
     }
 }

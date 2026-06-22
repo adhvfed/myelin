@@ -90,7 +90,10 @@ fn cdc_2_9_provider_seed_names_all_admitted_by_consumer() {
 fn cdc_2_9_consumer_rejects_a_malformed_type_loudly() {
     // An uppercase / present-tense / unknown-subsystem name — three distinct providers' mistakes.
     let bad = provider_emits_typed_draft("CI.Run.Started");
-    assert!(!consumer_admits(&bad), "validator must reject `CI.Run.Started`");
+    assert!(
+        !consumer_admits(&bad),
+        "validator must reject `CI.Run.Started`"
+    );
 
     let present = provider_emits_typed_draft("ci.run.start");
     assert!(matches!(
@@ -111,6 +114,14 @@ fn cdc_2_9_consumer_rejects_a_malformed_type_loudly() {
 fn cdc_2_9_subsystem_token_set_is_the_shared_anchor() {
     assert_eq!(
         SUBSYSTEM_TOKENS,
-        &["git", "ci", "issue", "knowledge", "chat", "identity", "refs"]
+        &[
+            "git",
+            "ci",
+            "issue",
+            "knowledge",
+            "chat",
+            "identity",
+            "refs"
+        ]
     );
 }

@@ -123,9 +123,7 @@ pub use skeleton::{
 // balance (reserved == settled; a Mock bills 0 → the reservation refunds). NO FLOOR in the gate
 // mechanism — real per-model-call cost metering arrives with LlmAgentRuntime (AG-P25, post-M5); the
 // Mock metering ZERO is correct (the limiter is brain-independent).
-pub use cost_gate::{
-    runaway_brain, AgentFabricCostSignal, RunawaySelfLimiter, RunawayStep,
-};
+pub use cost_gate::{runaway_brain, AgentFabricCostSignal, RunawaySelfLimiter, RunawayStep};
 
 // Per-run identity COMPLETED (AG-P13 → P-225): mint at dispatch (token life == run life), scrub the
 // shared platform token in the child env, revoke idempotently on teardown even on crash, and RE-MINT
@@ -151,9 +149,9 @@ pub use mock::{
 // consumer seams (4.2 check / 4.5 delegation / tenant / 11.7 budget / subsystem public-endpoint
 // apply) + the AG-D2 denial signals (0 privileged fallback by construction).
 pub use effect_api::{
-    decode_proposed, encode_proposed, validate_schema, ApplyError, CapabilityCheck, DelegationLookup,
-    EffectApiBridge, EffectBudget, EffectCost, PipelineSignals, PipelineStep, PlanThenApply,
-    PlanVerdict, PlannedEffect, SubsystemApply, TenantGuard,
+    decode_proposed, encode_proposed, validate_schema, ApplyError, CapabilityCheck,
+    DelegationLookup, EffectApiBridge, EffectBudget, EffectCost, PipelineSignals, PipelineStep,
+    PlanThenApply, PlanVerdict, PlannedEffect, SubsystemApply, TenantGuard,
 };
 
 // ToolHands::exec on the unified sandbox (AG-P15 → P-226, M2-C, contract 8.4 — the Fabric half): the
@@ -213,10 +211,10 @@ pub use defaults::{
 // SAME pull_request.review cap (4.9) a human reviewer is. NO new engine — registration data.
 pub use git_tools::{
     git_author_tool_defs, git_comment_tool_def, git_history_rewrite_tool_def,
-    git_merge_required_caps, git_merge_tool_def, git_resolve_thread_tool_def, git_scip_index_tool_def,
-    git_submit_review_tool_def, git_suggest_change_tool_def, git_tool_defs, open_pr_required_caps,
-    open_pr_tool_def, register_git_tools, GIT_MERGE_TOOL, GIT_SUBSYSTEM, GIT_TOOL_VERSION,
-    OPEN_PR_TOOL,
+    git_merge_required_caps, git_merge_tool_def, git_resolve_thread_tool_def,
+    git_scip_index_tool_def, git_submit_review_tool_def, git_suggest_change_tool_def,
+    git_tool_defs, open_pr_required_caps, open_pr_tool_def, register_git_tools, GIT_MERGE_TOOL,
+    GIT_SUBSYSTEM, GIT_TOOL_VERSION, OPEN_PR_TOOL,
 };
 
 // The per-producer KNOWLEDGE ToolDefs (AG-P19 → P-268, M3): publish + edit_confidential (the
@@ -230,9 +228,9 @@ pub use git_tools::{
 // Git producer tools, AG-P18 — the compounding-payoff reuse).
 pub use knowledge_tools::{
     comment_required_caps, comment_tool_def, draft_required_caps, draft_tool_def,
-    edit_confidential_required_caps, edit_confidential_tool_def, knowledge_tool_defs, publish_required_caps,
-    publish_tool_def, register_knowledge_tools, COMMENT_TOOL, DRAFT_TOOL, EDIT_CONFIDENTIAL_TOOL,
-    KNOWLEDGE_SUBSYSTEM, KNOWLEDGE_TOOL_VERSION, PUBLISH_TOOL,
+    edit_confidential_required_caps, edit_confidential_tool_def, knowledge_tool_defs,
+    publish_required_caps, publish_tool_def, register_knowledge_tools, COMMENT_TOOL, DRAFT_TOOL,
+    EDIT_CONFIDENTIAL_TOOL, KNOWLEDGE_SUBSYSTEM, KNOWLEDGE_TOOL_VERSION, PUBLISH_TOOL,
 };
 
 // The agent-trace HOLDER seam (AG-P19 → P-268, M3, AG-7 / contract 8.8): the execution trace is a
@@ -262,9 +260,9 @@ pub use dry_run::{
 // guarantee is structural (the loop opens the gate but never applies). Floors: per-effect resume
 // idempotency AG-P10 (→ P-222); humanise card text AG-P11 (→ P-223); auto-dispatch L-3 AG-P20.
 pub use hitl::{
-    derive_approver_set, gate_id_of, live_cost_estimate, run_hitl_loop, surface_card, ApprovedTools,
-    ApproverSet, Halted, HitlCard, HitlGate, HitlGateState, HitlOutcome, HitlWait, InvalidTransition,
-    RiskSummary, WaitDecision,
+    derive_approver_set, gate_id_of, live_cost_estimate, run_hitl_loop, surface_card,
+    ApprovedTools, ApproverSet, Halted, HitlCard, HitlGate, HitlGateState, HitlOutcome, HitlWait,
+    InvalidTransition, RiskSummary, WaitDecision,
 };
 
 // The AG-P11 (→ P-223) card-text path (C9/OQ-L): the HITL card text + every agent-authored message

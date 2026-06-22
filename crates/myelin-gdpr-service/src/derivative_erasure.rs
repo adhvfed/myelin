@@ -101,7 +101,7 @@ use std::sync::Mutex;
 
 use myelin_gdpr::{
     EraseReceipt, EraseScope, LocateReport, Patch, PersonalDataHolder, PortableBundle, Receipt,
-    RectifyReceipt, Result as DsrResult, RestrictReceipt, SubjectRef, TenantId,
+    RectifyReceipt, RestrictReceipt, Result as DsrResult, SubjectRef, TenantId,
 };
 
 use crate::orchestration::{CanonicalErasePhase, RegisteredHolder};
@@ -191,14 +191,22 @@ impl SearchIndexModel {
     pub fn index_from_source(&self, subject_token: &str, source_value: &str) {
         self.docs.lock().unwrap_or_else(|e| e.into_inner()).insert(
             subject_token.to_string(),
-            SearchDoc { projection: source_value.to_string(), embedding_present: true },
+            SearchDoc {
+                projection: source_value.to_string(),
+                embedding_present: true,
+            },
         );
     }
 
     /// How many docs CONTAINING the subject's value would a query match (the search-hit count). 0
     /// after a purge (the doc is gone), >0 while indexed.
     pub fn hits(&self, subject_token: &str) -> usize {
-        usize::from(self.docs.lock().unwrap_or_else(|e| e.into_inner()).contains_key(subject_token))
+        usize::from(
+            self.docs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(subject_token),
+        )
     }
 
     /// **The re-identification probe (the purge-not-hide GATE reading).** How many embeddings in the
@@ -232,7 +240,11 @@ impl SearchIndexModel {
     fn erase(&self, subject_token: &str) -> bool {
         *self.erase_calls.lock().unwrap_or_else(|e| e.into_inner()) += 1;
         // Remove the doc AND its embedding in one act (purge-not-hide — no soft-delete flag left).
-        self.docs.lock().unwrap_or_else(|e| e.into_inner()).remove(subject_token).is_some()
+        self.docs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(subject_token)
+            .is_some()
     }
 }
 
@@ -257,10 +269,20 @@ impl<'a> SearchIndexHolder<'a> {
 impl PersonalDataHolder for SearchIndexHolder<'_> {
     fn locate(&self, subject: &SubjectRef, tenant: TenantId) -> DsrResult<LocateReport> {
         let sid = subject.principal.principal_id.0.clone();
-        let outcome = if self.model.hits(&sid) > 0 { "located:indexed" } else { "located:0-recoverable" };
+        let outcome = if self.model.hits(&sid) > 0 {
+            "located:indexed"
+        } else {
+            "located:0-recoverable"
+        };
         Ok(LocateReport {
             receipt: Receipt::content_addressed(
-                "locate", derivative_holder_ids::SEARCH_INDEX, &sid, &tenant.0, outcome, None, 0,
+                "locate",
+                derivative_holder_ids::SEARCH_INDEX,
+                &sid,
+                &tenant.0,
+                outcome,
+                None,
+                0,
             ),
         })
     }
@@ -269,7 +291,13 @@ impl PersonalDataHolder for SearchIndexHolder<'_> {
         let sid = subject.principal.principal_id.0.clone();
         Ok(PortableBundle {
             receipt: Receipt::content_addressed(
-                "export", derivative_holder_ids::SEARCH_INDEX, &sid, &tenant.0, "exported", None, 0,
+                "export",
+                derivative_holder_ids::SEARCH_INDEX,
+                &sid,
+                &tenant.0,
+                "exported",
+                None,
+                0,
             ),
         })
     }
@@ -281,8 +309,13 @@ impl PersonalDataHolder for SearchIndexHolder<'_> {
         let sid = subject.principal.principal_id.0.clone();
         Ok(RectifyReceipt {
             receipt: Receipt::content_addressed(
-                "rectify", derivative_holder_ids::SEARCH_INDEX, &sid, "*",
-                "rectified:reindex_from_source", None, 0,
+                "rectify",
+                derivative_holder_ids::SEARCH_INDEX,
+                &sid,
+                "*",
+                "rectified:reindex_from_source",
+                None,
+                0,
             ),
         })
     }
@@ -291,10 +324,20 @@ impl PersonalDataHolder for SearchIndexHolder<'_> {
         // The honoured-into-derived `restrict` PROOF is M2 P-GA-25 (GA-D7); here the holder records
         // the verdict (the derived store suppresses indexing/RAG/analytics while restricted).
         let sid = subject.principal.principal_id.0.clone();
-        let outcome = if on { "restricted:set" } else { "restricted:clear" };
+        let outcome = if on {
+            "restricted:set"
+        } else {
+            "restricted:clear"
+        };
         Ok(RestrictReceipt {
             receipt: Receipt::content_addressed(
-                "restrict", derivative_holder_ids::SEARCH_INDEX, &sid, "*", outcome, None, 0,
+                "restrict",
+                derivative_holder_ids::SEARCH_INDEX,
+                &sid,
+                "*",
+                outcome,
+                None,
+                0,
             ),
         })
     }
@@ -307,8 +350,13 @@ impl PersonalDataHolder for SearchIndexHolder<'_> {
         // purge-incl-embeddings outcome (the green artifact: embeddings purged, not hidden).
         Ok(EraseReceipt {
             receipt: Receipt::content_addressed(
-                "erase", derivative_holder_ids::SEARCH_INDEX, &sid, &tenant,
-                "purge_and_reindex:embeddings_purged_not_hidden", None, 0,
+                "erase",
+                derivative_holder_ids::SEARCH_INDEX,
+                &sid,
+                &tenant,
+                "purge_and_reindex:embeddings_purged_not_hidden",
+                None,
+                0,
             ),
         })
     }
@@ -359,17 +407,30 @@ impl RefsGraphModel {
             .unwrap_or_else(|e| e.into_inner())
             .insert(subject_token.to_string(), target.to_string());
         // Re-adding from source clears a prior tombstone (a reindex rebuilds the projection).
-        self.tombstoned.lock().unwrap_or_else(|e| e.into_inner()).remove(subject_token);
+        self.tombstoned
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(subject_token);
     }
 
     /// **Resolve a subject's ref (the no-resolve-500 GATE reading).** A tombstoned subject resolves
     /// to [`RefsResolve::Tombstone`] (0 recoverable PII), NEVER an error (REF-D5). A live edge
     /// resolves to its target; an unknown subject is [`RefsResolve::Missing`].
     pub fn resolve(&self, subject_token: &str) -> RefsResolve {
-        if self.tombstoned.lock().unwrap_or_else(|e| e.into_inner()).contains(subject_token) {
+        if self
+            .tombstoned
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(subject_token)
+        {
             return RefsResolve::Tombstone;
         }
-        match self.edges.lock().unwrap_or_else(|e| e.into_inner()).get(subject_token) {
+        match self
+            .edges
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(subject_token)
+        {
             Some(target) => RefsResolve::Live(target.clone()),
             None => RefsResolve::Missing,
         }
@@ -377,7 +438,12 @@ impl RefsGraphModel {
 
     /// How many edges still recover the subject's PII (0 after a tombstone — the edge is gone).
     pub fn recoverable_edges(&self, subject_token: &str) -> usize {
-        usize::from(self.edges.lock().unwrap_or_else(|e| e.into_inner()).contains_key(subject_token))
+        usize::from(
+            self.edges
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(subject_token),
+        )
     }
 
     /// How many times `erase` was actually CALLED (the resumability witness).
@@ -390,8 +456,14 @@ impl RefsGraphModel {
     /// never a 500. Idempotent: a re-erase re-tombstones (no-op).
     fn erase(&self, subject_token: &str) {
         *self.erase_calls.lock().unwrap_or_else(|e| e.into_inner()) += 1;
-        self.edges.lock().unwrap_or_else(|e| e.into_inner()).remove(subject_token);
-        self.tombstoned.lock().unwrap_or_else(|e| e.into_inner()).insert(subject_token.to_string());
+        self.edges
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(subject_token);
+        self.tombstoned
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(subject_token.to_string());
     }
 }
 
@@ -421,7 +493,13 @@ impl PersonalDataHolder for RefsGraphHolder<'_> {
         };
         Ok(LocateReport {
             receipt: Receipt::content_addressed(
-                "locate", derivative_holder_ids::REFS_GRAPH, &sid, &tenant.0, outcome, None, 0,
+                "locate",
+                derivative_holder_ids::REFS_GRAPH,
+                &sid,
+                &tenant.0,
+                outcome,
+                None,
+                0,
             ),
         })
     }
@@ -430,7 +508,13 @@ impl PersonalDataHolder for RefsGraphHolder<'_> {
         let sid = subject.principal.principal_id.0.clone();
         Ok(PortableBundle {
             receipt: Receipt::content_addressed(
-                "export", derivative_holder_ids::REFS_GRAPH, &sid, &tenant.0, "exported", None, 0,
+                "export",
+                derivative_holder_ids::REFS_GRAPH,
+                &sid,
+                &tenant.0,
+                "exported",
+                None,
+                0,
             ),
         })
     }
@@ -439,18 +523,33 @@ impl PersonalDataHolder for RefsGraphHolder<'_> {
         let sid = subject.principal.principal_id.0.clone();
         Ok(RectifyReceipt {
             receipt: Receipt::content_addressed(
-                "rectify", derivative_holder_ids::REFS_GRAPH, &sid, "*",
-                "rectified:reindex_from_source", None, 0,
+                "rectify",
+                derivative_holder_ids::REFS_GRAPH,
+                &sid,
+                "*",
+                "rectified:reindex_from_source",
+                None,
+                0,
             ),
         })
     }
 
     fn restrict(&self, subject: &SubjectRef, on: bool) -> DsrResult<RestrictReceipt> {
         let sid = subject.principal.principal_id.0.clone();
-        let outcome = if on { "restricted:set" } else { "restricted:clear" };
+        let outcome = if on {
+            "restricted:set"
+        } else {
+            "restricted:clear"
+        };
         Ok(RestrictReceipt {
             receipt: Receipt::content_addressed(
-                "restrict", derivative_holder_ids::REFS_GRAPH, &sid, "*", outcome, None, 0,
+                "restrict",
+                derivative_holder_ids::REFS_GRAPH,
+                &sid,
+                "*",
+                outcome,
+                None,
+                0,
             ),
         })
     }
@@ -460,8 +559,13 @@ impl PersonalDataHolder for RefsGraphHolder<'_> {
         self.model.erase(&sid);
         Ok(EraseReceipt {
             receipt: Receipt::content_addressed(
-                "erase", derivative_holder_ids::REFS_GRAPH, &sid, &tenant,
-                "tombstone:0_recoverable:no_resolve_500", None, 0,
+                "erase",
+                derivative_holder_ids::REFS_GRAPH,
+                &sid,
+                &tenant,
+                "tombstone:0_recoverable:no_resolve_500",
+                None,
+                0,
             ),
         })
     }
@@ -506,7 +610,12 @@ impl NotifHistoryModel {
     pub fn render_mention(&self, item_id: &str) -> Option<String> {
         let items = self.items.lock().unwrap_or_else(|e| e.into_inner());
         let mentioned = items.get(item_id)?;
-        if self.erased.lock().unwrap_or_else(|e| e.into_inner()).contains(mentioned) {
+        if self
+            .erased
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(mentioned)
+        {
             Some(ERASED_USER.to_string())
         } else {
             Some(mentioned.clone())
@@ -523,7 +632,10 @@ impl NotifHistoryModel {
     /// a re-erase re-marks (no-op).
     fn erase(&self, subject_token: &str) {
         *self.erase_calls.lock().unwrap_or_else(|e| e.into_inner()) += 1;
-        self.erased.lock().unwrap_or_else(|e| e.into_inner()).insert(subject_token.to_string());
+        self.erased
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(subject_token.to_string());
     }
 }
 
@@ -548,8 +660,13 @@ impl PersonalDataHolder for NotifHistoryHolder<'_> {
         let sid = subject.principal.principal_id.0.clone();
         Ok(LocateReport {
             receipt: Receipt::content_addressed(
-                "locate", derivative_holder_ids::NOTIF_HISTORY, &sid, &tenant.0,
-                "located:inbox-read-models", None, 0,
+                "locate",
+                derivative_holder_ids::NOTIF_HISTORY,
+                &sid,
+                &tenant.0,
+                "located:inbox-read-models",
+                None,
+                0,
             ),
         })
     }
@@ -558,7 +675,13 @@ impl PersonalDataHolder for NotifHistoryHolder<'_> {
         let sid = subject.principal.principal_id.0.clone();
         Ok(PortableBundle {
             receipt: Receipt::content_addressed(
-                "export", derivative_holder_ids::NOTIF_HISTORY, &sid, &tenant.0, "exported", None, 0,
+                "export",
+                derivative_holder_ids::NOTIF_HISTORY,
+                &sid,
+                &tenant.0,
+                "exported",
+                None,
+                0,
             ),
         })
     }
@@ -567,18 +690,33 @@ impl PersonalDataHolder for NotifHistoryHolder<'_> {
         let sid = subject.principal.principal_id.0.clone();
         Ok(RectifyReceipt {
             receipt: Receipt::content_addressed(
-                "rectify", derivative_holder_ids::NOTIF_HISTORY, &sid, "*",
-                "rectified:reindex_from_source", None, 0,
+                "rectify",
+                derivative_holder_ids::NOTIF_HISTORY,
+                &sid,
+                "*",
+                "rectified:reindex_from_source",
+                None,
+                0,
             ),
         })
     }
 
     fn restrict(&self, subject: &SubjectRef, on: bool) -> DsrResult<RestrictReceipt> {
         let sid = subject.principal.principal_id.0.clone();
-        let outcome = if on { "restricted:set" } else { "restricted:clear" };
+        let outcome = if on {
+            "restricted:set"
+        } else {
+            "restricted:clear"
+        };
         Ok(RestrictReceipt {
             receipt: Receipt::content_addressed(
-                "restrict", derivative_holder_ids::NOTIF_HISTORY, &sid, "*", outcome, None, 0,
+                "restrict",
+                derivative_holder_ids::NOTIF_HISTORY,
+                &sid,
+                "*",
+                outcome,
+                None,
+                0,
             ),
         })
     }
@@ -588,8 +726,13 @@ impl PersonalDataHolder for NotifHistoryHolder<'_> {
         self.model.erase(&sid);
         Ok(EraseReceipt {
             receipt: Receipt::content_addressed(
-                "erase", derivative_holder_ids::NOTIF_HISTORY, &sid, &tenant,
-                "purge_read_models:humanise_to_erased_user", None, 0,
+                "erase",
+                derivative_holder_ids::NOTIF_HISTORY,
+                &sid,
+                &tenant,
+                "purge_read_models:humanise_to_erased_user",
+                None,
+                0,
             ),
         })
     }
@@ -649,8 +792,9 @@ impl DerivativeErasureDriver {
         holders
             .into_iter()
             .map(|(id, holder)| {
-                let phase = derivative_phase_of(id)
-                    .unwrap_or_else(|| panic!("derivative holder `{id}` has no canonical erase phase"));
+                let phase = derivative_phase_of(id).unwrap_or_else(|| {
+                    panic!("derivative holder `{id}` has no canonical erase phase")
+                });
                 RegisteredHolder { id, phase, holder }
             })
             .collect()
@@ -761,11 +905,18 @@ mod tests {
     }
 
     fn subject(id: &str) -> SubjectRef {
-        SubjectRef::new(Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, t("acme")))
+        SubjectRef::new(Principal::stub(
+            PrincipalId(id.into()),
+            PrincipalKind::Human,
+            t("acme"),
+        ))
     }
 
     fn subject_scope(s: &str) -> EraseScope {
-        EraseScope::Subject { subject: subject(s), tenant: t("acme") }
+        EraseScope::Subject {
+            subject: subject(s),
+            tenant: t("acme"),
+        }
     }
 
     // ───────── Search (H7): purge incl. embeddings — NOT hidden (GA-D2 / SRCH-D4) ─────────
@@ -778,14 +929,22 @@ mod tests {
         let model = SearchIndexModel::new();
         model.index_from_source("u-1", "alice@example.com");
         assert_eq!(model.hits("u-1"), 1, "indexed before erase");
-        assert_eq!(model.reidentify_hits("u-1"), 1, "the embedding re-identifies before erase");
+        assert_eq!(
+            model.reidentify_hits("u-1"),
+            1,
+            "the embedding re-identifies before erase"
+        );
 
         let holder = SearchIndexHolder::new(&model);
         let receipt = holder.erase(subject_scope("u-1")).unwrap();
 
         // 0 hits AND 0 re-identification — the embedding was PURGED, not hidden.
         assert_eq!(model.hits("u-1"), 0, "doc purged (0 hits)");
-        assert_eq!(model.reidentify_hits("u-1"), 0, "embedding purged — 0 re-identification (GA-D2)");
+        assert_eq!(
+            model.reidentify_hits("u-1"),
+            0,
+            "embedding purged — 0 re-identification (GA-D2)"
+        );
         assert_eq!(
             receipt.receipt.operation, "erase",
             "the erase receipt names the op"
@@ -803,7 +962,9 @@ mod tests {
         let model = SearchIndexModel::new();
         model.index_from_source("u-hide", "secret");
         // The ONLY mutation that drops the doc is `erase` (a real purge). After it, 0 re-identification.
-        SearchIndexHolder::new(&model).erase(subject_scope("u-hide")).unwrap();
+        SearchIndexHolder::new(&model)
+            .erase(subject_scope("u-hide"))
+            .unwrap();
         assert_eq!(model.reidentify_hits("u-hide"), 0);
         assert_eq!(model.hits("u-hide"), 0);
     }
@@ -824,8 +985,16 @@ mod tests {
         holder.erase(subject_scope("u-2")).unwrap();
 
         // The resolve returns a TOMBSTONE (not a 500), 0 recoverable PII (REF-D5).
-        assert_eq!(model.resolve("u-2"), RefsResolve::Tombstone, "resolve returns the tombstone, not a 500");
-        assert_eq!(model.recoverable_edges("u-2"), 0, "0 recoverable edges after tombstone");
+        assert_eq!(
+            model.resolve("u-2"),
+            RefsResolve::Tombstone,
+            "resolve returns the tombstone, not a 500"
+        );
+        assert_eq!(
+            model.recoverable_edges("u-2"),
+            0,
+            "0 recoverable edges after tombstone"
+        );
     }
 
     /// **A resolve of a tombstoned ref does NOT 500 — it is a well-defined tombstone.** (`resolve`
@@ -836,7 +1005,9 @@ mod tests {
         // Unknown subject: Missing (not a 500).
         assert_eq!(model.resolve("nobody"), RefsResolve::Missing);
         // Tombstoned subject: Tombstone (not a 500).
-        RefsGraphHolder::new(&model).erase(subject_scope("u-gone")).unwrap();
+        RefsGraphHolder::new(&model)
+            .erase(subject_scope("u-gone"))
+            .unwrap();
         assert_eq!(model.resolve("u-gone"), RefsResolve::Tombstone);
     }
 
@@ -850,14 +1021,31 @@ mod tests {
         let model = NotifHistoryModel::new();
         model.add_item_from_source("inbox-1", "u-3");
         model.add_item_from_source("inbox-2", "u-other");
-        assert_eq!(model.render_mention("inbox-1").as_deref(), Some("u-3"), "renders the token before erase");
+        assert_eq!(
+            model.render_mention("inbox-1").as_deref(),
+            Some("u-3"),
+            "renders the token before erase"
+        );
 
-        NotifHistoryHolder::new(&model).erase(subject_scope("u-3")).unwrap();
+        NotifHistoryHolder::new(&model)
+            .erase(subject_scope("u-3"))
+            .unwrap();
 
         // The mention of the erased subject humanises to `[erased user]`; other mentions are untouched.
-        assert_eq!(model.render_mention("inbox-1").as_deref(), Some(ERASED_USER), "humanised to [erased user]");
-        assert_eq!(model.render_mention("inbox-1").as_deref(), Some("[erased user]"));
-        assert_eq!(model.render_mention("inbox-2").as_deref(), Some("u-other"), "other mentions untouched");
+        assert_eq!(
+            model.render_mention("inbox-1").as_deref(),
+            Some(ERASED_USER),
+            "humanised to [erased user]"
+        );
+        assert_eq!(
+            model.render_mention("inbox-1").as_deref(),
+            Some("[erased user]")
+        );
+        assert_eq!(
+            model.render_mention("inbox-2").as_deref(),
+            Some("u-other"),
+            "other mentions untouched"
+        );
     }
 
     // ───────── reindex-from-source rectification — rebuild, never patch (§4.4) ─────────
@@ -875,12 +1063,24 @@ mod tests {
 
         // Art. 16: the source is corrected → the derived stores REBUILD from source.
         let outcome = DerivativeErasureDriver::rectify_via_reindex_from_source(
-            "u-4", "new name", "new-target", &search, &refs,
+            "u-4",
+            "new name",
+            "new-target",
+            &search,
+            &refs,
         );
 
         // The derived projection equals the REBUILT (corrected-source) value — drift = 0.
-        assert_eq!(outcome.search_projection.as_deref(), Some("new name"), "Search reindexed from source");
-        assert_eq!(outcome.refs_target.as_deref(), Some("new-target"), "Refs rebuilt from source");
+        assert_eq!(
+            outcome.search_projection.as_deref(),
+            Some("new name"),
+            "Search reindexed from source"
+        );
+        assert_eq!(
+            outcome.refs_target.as_deref(),
+            Some("new-target"),
+            "Refs rebuilt from source"
+        );
         assert_eq!(search.projection("u-4").as_deref(), Some("new name"));
         // The Refs edge resolves Live to the rebuilt target (a rebuild clears any prior tombstone).
         assert_eq!(refs.resolve("u-4"), RefsResolve::Live("new-target".into()));
@@ -905,16 +1105,38 @@ mod tests {
         let nh = NotifHistoryHolder::new(&notif);
 
         let receipt = DerivativeErasureDriver::fan_out_erase(
-            &subject_scope("u-5"), &search, &sh, &refs, &rh, &notif, &nh,
+            &subject_scope("u-5"),
+            &search,
+            &sh,
+            &refs,
+            &rh,
+            &notif,
+            &nh,
         )
         .unwrap();
 
-        assert!(receipt.embeddings_purged, "Search embeddings purged, not hidden (GA-D2)");
-        assert!(receipt.refs_tombstoned, "Refs tombstoned, 0 recoverable, no resolve-500 (REF-D5)");
-        assert!(receipt.notif_humanised, "Notif humanised mentions (NOTIF-D6)");
-        assert_eq!(receipt.holder_receipts.len(), 3, "Search + Refs + Notif receipts");
+        assert!(
+            receipt.embeddings_purged,
+            "Search embeddings purged, not hidden (GA-D2)"
+        );
+        assert!(
+            receipt.refs_tombstoned,
+            "Refs tombstoned, 0 recoverable, no resolve-500 (REF-D5)"
+        );
+        assert!(
+            receipt.notif_humanised,
+            "Notif humanised mentions (NOTIF-D6)"
+        );
+        assert_eq!(
+            receipt.holder_receipts.len(),
+            3,
+            "Search + Refs + Notif receipts"
+        );
         // The Notif mention now humanises to `[erased user]`.
-        assert_eq!(notif.render_mention("inbox-x").as_deref(), Some(ERASED_USER));
+        assert_eq!(
+            notif.render_mention("inbox-x").as_deref(),
+            Some(ERASED_USER)
+        );
         // 0 recoverable across the derived stores.
         assert_eq!(search.reidentify_hits("u-5"), 0);
         assert_eq!(refs.recoverable_edges("u-5"), 0);
@@ -942,7 +1164,8 @@ mod tests {
         assert_eq!(derivative_phase_of("not_a_derivative"), None);
         // Search/Refs purge/tombstone BEFORE Notif's trailing humanise (the phase order).
         assert!(
-            CanonicalErasePhase::PurgeAndTombstoneDerived < CanonicalErasePhase::CachesAndDerivedCopies
+            CanonicalErasePhase::PurgeAndTombstoneDerived
+                < CanonicalErasePhase::CachesAndDerivedCopies
         );
     }
 
@@ -957,14 +1180,26 @@ mod tests {
         let rh = RefsGraphHolder::new(&refs);
         let nh = NotifHistoryHolder::new(&notif);
         let registered = DerivativeErasureDriver::register_derivatives(vec![
-            (derivative_holder_ids::SEARCH_INDEX, &sh as &dyn PersonalDataHolder),
+            (
+                derivative_holder_ids::SEARCH_INDEX,
+                &sh as &dyn PersonalDataHolder,
+            ),
             (derivative_holder_ids::REFS_GRAPH, &rh),
             (derivative_holder_ids::NOTIF_HISTORY, &nh),
         ]);
         assert_eq!(registered.len(), 3);
-        let search_reg = registered.iter().find(|r| r.id == derivative_holder_ids::SEARCH_INDEX).unwrap();
-        assert_eq!(search_reg.phase, CanonicalErasePhase::PurgeAndTombstoneDerived);
-        let notif_reg = registered.iter().find(|r| r.id == derivative_holder_ids::NOTIF_HISTORY).unwrap();
+        let search_reg = registered
+            .iter()
+            .find(|r| r.id == derivative_holder_ids::SEARCH_INDEX)
+            .unwrap();
+        assert_eq!(
+            search_reg.phase,
+            CanonicalErasePhase::PurgeAndTombstoneDerived
+        );
+        let notif_reg = registered
+            .iter()
+            .find(|r| r.id == derivative_holder_ids::NOTIF_HISTORY)
+            .unwrap();
         assert_eq!(notif_reg.phase, CanonicalErasePhase::CachesAndDerivedCopies);
     }
 
@@ -974,8 +1209,13 @@ mod tests {
     fn derivative_erase_carries_no_destroyed_key_epoch() {
         let search = SearchIndexModel::new();
         search.index_from_source("u-6", "x");
-        let r = SearchIndexHolder::new(&search).erase(subject_scope("u-6")).unwrap();
-        assert_eq!(r.receipt.key_epoch_destroyed, None, "a derived purge destroys no key (plaintext-derived)");
+        let r = SearchIndexHolder::new(&search)
+            .erase(subject_scope("u-6"))
+            .unwrap();
+        assert_eq!(
+            r.receipt.key_epoch_destroyed, None,
+            "a derived purge destroys no key (plaintext-derived)"
+        );
     }
 
     /// The holder ids + the `[erased user]` sentinel + the telemetry name are stable (the data-map /
@@ -986,7 +1226,10 @@ mod tests {
         assert_eq!(derivative_holder_ids::REFS_GRAPH, "refs_graph");
         assert_eq!(derivative_holder_ids::NOTIF_HISTORY, "notif_history");
         assert_eq!(ERASED_USER, "[erased user]");
-        assert_eq!(DERIVATIVE_ERASE_FANOUT_COVERAGE.0, "gdpr.derivative_erase_fanout_coverage");
+        assert_eq!(
+            DERIVATIVE_ERASE_FANOUT_COVERAGE.0,
+            "gdpr.derivative_erase_fanout_coverage"
+        );
         assert_eq!(DERIVATIVE_ERASE_FANOUT_COVERAGE.1, "ratio");
     }
 
@@ -1007,21 +1250,47 @@ mod tests {
         notif.add_item_from_source("i", "u-pol");
         // Before any erase: the embedding re-identifies (probe > 0 ⇒ NOT purged), the edge resolves
         // Live (NOT a tombstone), no notif erase ran (call count 0).
-        assert_eq!(search.reidentify_hits("u-pol"), 1, "embedding re-identifies ⇒ embeddings_purged would be FALSE");
-        assert!(!matches!(refs.resolve("u-pol"), RefsResolve::Tombstone), "Live ⇒ refs_tombstoned would be FALSE");
-        assert_eq!(notif.erase_call_count(), 0, "no erase ⇒ notif_humanised would be FALSE");
+        assert_eq!(
+            search.reidentify_hits("u-pol"),
+            1,
+            "embedding re-identifies ⇒ embeddings_purged would be FALSE"
+        );
+        assert!(
+            !matches!(refs.resolve("u-pol"), RefsResolve::Tombstone),
+            "Live ⇒ refs_tombstoned would be FALSE"
+        );
+        assert_eq!(
+            notif.erase_call_count(),
+            0,
+            "no erase ⇒ notif_humanised would be FALSE"
+        );
 
         // ── the ERASED polarity: fan out, every flag TRUE.
         let sh = SearchIndexHolder::new(&search);
         let rh = RefsGraphHolder::new(&refs);
         let nh = NotifHistoryHolder::new(&notif);
         let receipt = DerivativeErasureDriver::fan_out_erase(
-            &subject_scope("u-pol"), &search, &sh, &refs, &rh, &notif, &nh,
+            &subject_scope("u-pol"),
+            &search,
+            &sh,
+            &refs,
+            &rh,
+            &notif,
+            &nh,
         )
         .unwrap();
-        assert!(receipt.embeddings_purged, "after erase: embeddings_purged TRUE (probe == 0)");
-        assert!(receipt.refs_tombstoned, "after erase: refs_tombstoned TRUE (resolve is Tombstone)");
-        assert!(receipt.notif_humanised, "after erase: notif_humanised TRUE (erase ran)");
+        assert!(
+            receipt.embeddings_purged,
+            "after erase: embeddings_purged TRUE (probe == 0)"
+        );
+        assert!(
+            receipt.refs_tombstoned,
+            "after erase: refs_tombstoned TRUE (resolve is Tombstone)"
+        );
+        assert!(
+            receipt.notif_humanised,
+            "after erase: notif_humanised TRUE (erase ran)"
+        );
     }
 
     /// **`locate` distinguishes the indexed/edges-present verdict from the 0-recoverable verdict**
@@ -1043,15 +1312,53 @@ mod tests {
         rh.erase(subject_scope("u-loc")).unwrap();
         let s_zero = sh.locate(&subject("u-loc"), t("acme")).unwrap().receipt;
         let r_zero = rh.locate(&subject("u-loc"), t("acme")).unwrap().receipt;
-        assert_ne!(s_present.content_hash, s_zero.content_hash, "Search locate verdict differs present vs 0-recoverable");
-        assert_ne!(r_present.content_hash, r_zero.content_hash, "Refs locate verdict differs present vs 0-recoverable");
+        assert_ne!(
+            s_present.content_hash, s_zero.content_hash,
+            "Search locate verdict differs present vs 0-recoverable"
+        );
+        assert_ne!(
+            r_present.content_hash, r_zero.content_hash,
+            "Refs locate verdict differs present vs 0-recoverable"
+        );
         // Pin the EXACT verdict strings (catches a `> 0` inversion that swaps the two outcomes).
-        let s_expect_present = Receipt::content_addressed("locate", derivative_holder_ids::SEARCH_INDEX, "u-loc", "acme", "located:indexed", None, 0);
-        let s_expect_zero = Receipt::content_addressed("locate", derivative_holder_ids::SEARCH_INDEX, "u-loc", "acme", "located:0-recoverable", None, 0);
+        let s_expect_present = Receipt::content_addressed(
+            "locate",
+            derivative_holder_ids::SEARCH_INDEX,
+            "u-loc",
+            "acme",
+            "located:indexed",
+            None,
+            0,
+        );
+        let s_expect_zero = Receipt::content_addressed(
+            "locate",
+            derivative_holder_ids::SEARCH_INDEX,
+            "u-loc",
+            "acme",
+            "located:0-recoverable",
+            None,
+            0,
+        );
         assert_eq!(s_present, s_expect_present);
         assert_eq!(s_zero, s_expect_zero);
-        let r_expect_present = Receipt::content_addressed("locate", derivative_holder_ids::REFS_GRAPH, "u-loc", "acme", "located:edges-present", None, 0);
-        let r_expect_zero = Receipt::content_addressed("locate", derivative_holder_ids::REFS_GRAPH, "u-loc", "acme", "located:0-recoverable", None, 0);
+        let r_expect_present = Receipt::content_addressed(
+            "locate",
+            derivative_holder_ids::REFS_GRAPH,
+            "u-loc",
+            "acme",
+            "located:edges-present",
+            None,
+            0,
+        );
+        let r_expect_zero = Receipt::content_addressed(
+            "locate",
+            derivative_holder_ids::REFS_GRAPH,
+            "u-loc",
+            "acme",
+            "located:0-recoverable",
+            None,
+            0,
+        );
         assert_eq!(r_present, r_expect_present);
         assert_eq!(r_zero, r_expect_zero);
     }

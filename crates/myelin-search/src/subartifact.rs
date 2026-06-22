@@ -126,9 +126,10 @@ impl SubGrain {
             Some(Sub::Heading(id)) => SubGrain::Heading(id),
             Some(Sub::Row(id)) => SubGrain::Row(id),
             Some(Sub::Field(id)) => SubGrain::Field(id),
-            Some(Sub::LineRange { start, end }) => {
-                SubGrain::LineRange { minted_start: start, minted_end: end }
-            }
+            Some(Sub::LineRange { start, end }) => SubGrain::LineRange {
+                minted_start: start,
+                minted_end: end,
+            },
             // The frozen vocabulary's other kinds: the M4 producer corpus (Chat/Issues/CI). The grammar
             // is frozen now; the grain classifier carries the kind so M4 is a builder add (the floor).
             Some(other) => SubGrain::M4Producer(other.kind()),
@@ -240,9 +241,16 @@ pub fn db_row_subdoc_projection(
 ) -> SearchProjection {
     let mut out: BTreeMap<String, FieldValue> = fields.clone();
     if let Some(ok) = order_key {
-        out.insert(crate::engine::ORDER_KEY_FIELD.to_string(), FieldValue::OrderKey(ok));
+        out.insert(
+            crate::engine::ORDER_KEY_FIELD.to_string(),
+            FieldValue::OrderKey(ok),
+        );
     }
-    SearchProjection { text: full_text.to_string(), fields: out, lang: None }
+    SearchProjection {
+        text: full_text.to_string(),
+        fields: out,
+        lang: None,
+    }
 }
 
 /// **Build a Knowledge DB FIELD sub-doc projection (`field-<id>`, the field grain).** The owner
@@ -257,7 +265,11 @@ pub fn db_field_subdoc_projection(
 ) -> SearchProjection {
     let mut fields: BTreeMap<String, FieldValue> = BTreeMap::new();
     fields.insert(field_name.to_string(), value);
-    SearchProjection { text: rendered_text.to_string(), fields, lang: None }
+    SearchProjection {
+        text: rendered_text.to_string(),
+        fields,
+        lang: None,
+    }
 }
 
 /// **Build a Git CONTENT-ANCHORED line-range sub-doc projection (`L<a>-L<b>`, §3.1/§4.9).** The owner's
@@ -379,14 +391,19 @@ mod tests {
         );
         // A field (field-<id>) → the field grain.
         assert_eq!(
-            SubGrain::classify(&ref_("myelin://acme/knowledge/db_row/tasks:r7#field-priority")),
+            SubGrain::classify(&ref_(
+                "myelin://acme/knowledge/db_row/tasks:r7#field-priority"
+            )),
             SubGrain::Field("priority".into())
         );
         // A Git CONTENT-ANCHORED line range (L<a>-L<b>) → carries the MINTED endpoints (the resolve
         // request), NOT a stored indexed line.
         assert_eq!(
             SubGrain::classify(&ref_("myelin://acme/git/blob/repo:main:src/x.rs#L42-L88")),
-            SubGrain::LineRange { minted_start: 42, minted_end: 88 }
+            SubGrain::LineRange {
+                minted_start: 42,
+                minted_end: 88
+            }
         );
     }
 
@@ -400,21 +417,33 @@ mod tests {
             ("myelin://acme/knowledge/page/1#hx", SubKind::Heading),
             ("myelin://acme/knowledge/db_row/d:r#row-r", SubKind::Row),
             ("myelin://acme/knowledge/db_row/d:r#field-f", SubKind::Field),
-            ("myelin://acme/git/blob/repo:main:x.rs#L1-L9", SubKind::LineRange),
+            (
+                "myelin://acme/git/blob/repo:main:x.rs#L1-L9",
+                SubKind::LineRange,
+            ),
         ] {
             let g = SubGrain::classify(&ref_(r));
             assert_eq!(g.sub_kind(), Some(kind), "{r} reports its frozen SubKind");
-            assert!(g.is_m3_exercised(), "{r} is an M3-exercised grain (Git + KN)");
+            assert!(
+                g.is_m3_exercised(),
+                "{r} is an M3-exercised grain (Git + KN)"
+            );
         }
 
         // A Chat message / CI step sub-anchor: the grammar admits it (frozen vocabulary) but it is the
         // NAMED M4 producer follow-on — classify carries the kind, not index-exercised at M3.
         let chat = SubGrain::classify(&ref_("myelin://acme/chat/channel/c#message-m1"));
         assert_eq!(chat, SubGrain::M4Producer(SubKind::Message));
-        assert!(!chat.is_m3_exercised(), "a Chat message sub-anchor is the M4 floor (named)");
+        assert!(
+            !chat.is_m3_exercised(),
+            "a Chat message sub-anchor is the M4 floor (named)"
+        );
         let ci = SubGrain::classify(&ref_("myelin://acme/ci/run/r#step-3"));
         assert_eq!(ci, SubGrain::M4Producer(SubKind::Step));
-        assert!(!ci.is_m3_exercised(), "a CI step sub-anchor is the M4 floor (named)");
+        assert!(
+            !ci.is_m3_exercised(),
+            "a CI step sub-anchor is the M4 floor (named)"
+        );
     }
 
     /// **A doc-block sub-doc projects ONE block at block granularity (contract 2.6) — its text + its
@@ -430,7 +459,10 @@ mod tests {
             ),
         };
         let p = block_subdoc_projection(&block, Some("en"));
-        assert!(p.text.contains("deadlock fix"), "the block's prose is the searchable body");
+        assert!(
+            p.text.contains("deadlock fix"),
+            "the block's prose is the searchable body"
+        );
         assert_eq!(p.lang.as_deref(), Some("en"));
         // The structured inline-node facet is extracted at block grain (the node-array walk).
         assert_eq!(
@@ -457,30 +489,39 @@ mod tests {
     fn db_row_subdoc_projects_the_row_grain() {
         let mut fields: BTreeMap<String, FieldValue> = BTreeMap::new();
         fields.insert("priority".into(), FieldValue::Select("P0".into()));
-        fields.insert("owner".into(), FieldValue::Principal("u-1-pseudonym".into()));
+        fields.insert(
+            "owner".into(),
+            FieldValue::Principal("u-1-pseudonym".into()),
+        );
         let ok = OrderKey::parse("hzzzzz").expect("a base-62 LexoRank key");
         let p = db_row_subdoc_projection(&fields, "the row about a P0 incident", Some(ok.clone()));
-        assert_eq!(p.fields.get("priority"), Some(&FieldValue::Select("P0".into())));
+        assert_eq!(
+            p.fields.get("priority"),
+            Some(&FieldValue::Select("P0".into()))
+        );
         assert!(p.fields.contains_key("owner"));
         assert_eq!(
             p.fields.get(crate::engine::ORDER_KEY_FIELD),
             Some(&FieldValue::OrderKey(ok)),
             "the columnar sort key is carried (13.3)"
         );
-        assert!(p.text.contains("P0 incident"), "the row's full-text is searchable");
+        assert!(
+            p.text.contains("P0 incident"),
+            "the row's full-text is searchable"
+        );
     }
 
     /// **A KN db FIELD sub-doc projects exactly one field + its rendered text (the field grain — the
     /// finest KN sub-grain).**
     #[test]
     fn db_field_subdoc_projects_the_field_grain() {
-        let p = db_field_subdoc_projection(
-            "priority",
-            FieldValue::Select("P0".into()),
-            "priority: P0",
-        );
+        let p =
+            db_field_subdoc_projection("priority", FieldValue::Select("P0".into()), "priority: P0");
         assert_eq!(p.fields.len(), 1, "exactly the one resolved field");
-        assert_eq!(p.fields.get("priority"), Some(&FieldValue::Select("P0".into())));
+        assert_eq!(
+            p.fields.get("priority"),
+            Some(&FieldValue::Select("P0".into()))
+        );
         assert!(p.text.contains("P0"));
     }
 
@@ -508,13 +549,25 @@ mod tests {
         // The span is code-tokenized like a whole blob (camel split + whole identifier + operator).
         assert!(toks.contains("detect"), "the span is code-tokenized");
         assert!(toks.contains("deadlock"));
-        assert!(toks.contains("detectdeadlock"), "whole identifier kept (exact-identifier hit)");
+        assert!(
+            toks.contains("detectdeadlock"),
+            "whole identifier kept (exact-identifier hit)"
+        );
         assert!(toks.contains("->"), "the operator survives at span grain");
         assert_eq!(p.lang.as_deref(), Some("code"));
         // The RE-DERIVED endpoints are stamped as facets — the owner's resolve, NOT a raw line number.
-        assert_eq!(p.fields.get(FACET_LINE_START), Some(&FieldValue::Text("42".into())));
-        assert_eq!(p.fields.get(FACET_LINE_END), Some(&FieldValue::Text("45".into())));
-        assert_eq!(p.fields.get(FACET_ANCHOR_STATE), Some(&FieldValue::Text("exact".into())));
+        assert_eq!(
+            p.fields.get(FACET_LINE_START),
+            Some(&FieldValue::Text("42".into()))
+        );
+        assert_eq!(
+            p.fields.get(FACET_LINE_END),
+            Some(&FieldValue::Text("45".into()))
+        );
+        assert_eq!(
+            p.fields.get(FACET_ANCHOR_STATE),
+            Some(&FieldValue::Text("exact".into()))
+        );
         // The whole-blob facets are present too (path/language/blob_oid).
         assert_eq!(
             p.fields.get(FACET_PATH),
@@ -530,7 +583,10 @@ mod tests {
     fn force_push_rebase_re_derives_the_span_never_a_stale_line() {
         // BEFORE: the span anchored at lines 42–45 (the minted position).
         let before = line_range_subdoc_projection(&exact_span());
-        assert_eq!(before.fields.get(FACET_LINE_START), Some(&FieldValue::Text("42".into())));
+        assert_eq!(
+            before.fields.get(FACET_LINE_START),
+            Some(&FieldValue::Text("42".into()))
+        );
 
         // A force-push moved the fingerprinted block to lines 60–63 (the owner's `resolve_line_range`
         // returned `Rebased { new_start: 60, .. }`). The owner re-derived the span; Search re-indexes it.
@@ -550,17 +606,26 @@ mod tests {
             Some(&FieldValue::Text("60".into())),
             "the span re-derives to the shifted position (content-anchored, not positional)"
         );
-        assert_eq!(after.fields.get(FACET_LINE_END), Some(&FieldValue::Text("63".into())));
+        assert_eq!(
+            after.fields.get(FACET_LINE_END),
+            Some(&FieldValue::Text("63".into()))
+        );
         assert_eq!(
             after.fields.get(FACET_ANCHOR_STATE),
             Some(&FieldValue::Text("rebased".into())),
             "the hit renders the `moved` flag from the CURRENT resolve"
         );
         // The blob oid is the NEW blob (the force-push target) — the index tracks the current blob.
-        assert_eq!(after.fields.get(FACET_BLOB_OID), Some(&FieldValue::Text("oid-v2-after-force-push".into())));
+        assert_eq!(
+            after.fields.get(FACET_BLOB_OID),
+            Some(&FieldValue::Text("oid-v2-after-force-push".into()))
+        );
         // The searchable code body is still correct (the same identifiers, re-derived).
         let toks: std::collections::BTreeSet<&str> = after.text.split(' ').collect();
-        assert!(toks.contains("detectdeadlock"), "the span content is still searchable post-rebase");
+        assert!(
+            toks.contains("detectdeadlock"),
+            "the span content is still searchable post-rebase"
+        );
     }
 
     /// **A PARTIAL (outdated) span re-derives to the surviving sub-range, flagged `partial`.** Some
@@ -575,8 +640,14 @@ mod tests {
             ..exact_span()
         };
         let p = line_range_subdoc_projection(&partial);
-        assert_eq!(p.fields.get(FACET_LINE_END), Some(&FieldValue::Text("43".into())));
-        assert_eq!(p.fields.get(FACET_ANCHOR_STATE), Some(&FieldValue::Text("partial".into())));
+        assert_eq!(
+            p.fields.get(FACET_LINE_END),
+            Some(&FieldValue::Text("43".into()))
+        );
+        assert_eq!(
+            p.fields.get(FACET_ANCHOR_STATE),
+            Some(&FieldValue::Text("partial".into()))
+        );
     }
 
     /// **The line-range facet union is the whole-blob facets + the re-derived line-range facets.** A
@@ -584,10 +655,25 @@ mod tests {
     #[test]
     fn line_range_facet_union_is_blob_plus_re_derived_line_facets() {
         let f = line_range_subdoc_facets();
-        for facet in [FACET_PATH, FACET_LANGUAGE, FACET_BLOB_OID, FACET_LINE_START, FACET_LINE_END, FACET_ANCHOR_STATE] {
-            assert_eq!(f.get(facet), Some(&FieldType::Text), "`{facet}` is a typed columnar facet");
+        for facet in [
+            FACET_PATH,
+            FACET_LANGUAGE,
+            FACET_BLOB_OID,
+            FACET_LINE_START,
+            FACET_LINE_END,
+            FACET_ANCHOR_STATE,
+        ] {
+            assert_eq!(
+                f.get(facet),
+                Some(&FieldType::Text),
+                "`{facet}` is a typed columnar facet"
+            );
         }
-        assert_eq!(f.len(), 6, "exactly the blob facets + the three re-derived line-range facets");
+        assert_eq!(
+            f.len(),
+            6,
+            "exactly the blob facets + the three re-derived line-range facets"
+        );
     }
 
     /// The named floor marker is constructible (the greppable gap-report entry).

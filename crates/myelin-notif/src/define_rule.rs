@@ -224,7 +224,11 @@ pub fn define_notif_rule(
             table: table_class,
         });
     }
-    Ok(NotifRule { reason, dedup_tpl, default_class })
+    Ok(NotifRule {
+        reason,
+        dedup_tpl,
+        default_class,
+    })
 }
 
 /// Why a [`define_notif_rule`] registration was rejected. The seam fails LOUDLY at registration
@@ -247,7 +251,11 @@ pub enum DefineRuleError {
 impl std::fmt::Display for DefineRuleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DefineRuleError::ClassMismatch { reason, supplied, table } => write!(
+            DefineRuleError::ClassMismatch {
+                reason,
+                supplied,
+                table,
+            } => write!(
                 f,
                 "define_notif_rule: reason {reason:?} must register default_class {table:?} \
                  (the §3.1 ranking-table band), not {supplied:?}"
@@ -455,14 +463,20 @@ mod tests {
             "myelin://acme/issues/issue/PROJ-1}"
         );
         // a template with no placeholder renders verbatim.
-        assert_eq!(DedupTpl("static-key".into()).render("r", &subject(), Reason::Fyi), "static-key");
+        assert_eq!(
+            DedupTpl("static-key".into()).render("r", &subject(), Reason::Fyi),
+            "static-key"
+        );
     }
 
     /// **The `{reason}` placeholder renders the snake-case wire token (one vocabulary with the
     /// serde wire form).** A mutant that mis-maps a reason token is caught.
     #[test]
     fn reason_token_is_the_snake_case_wire_form() {
-        assert_eq!(reason_token(Reason::ApprovalRequested), "approval_requested");
+        assert_eq!(
+            reason_token(Reason::ApprovalRequested),
+            "approval_requested"
+        );
         assert_eq!(reason_token(Reason::ReviewRequested), "review_requested");
         assert_eq!(reason_token(Reason::ThreadWatched), "thread_watched");
         assert_eq!(reason_token(Reason::StateChanged), "state_changed");
@@ -490,12 +504,8 @@ mod tests {
         assert_eq!(rule.default_class, Class::Direct);
 
         // a MISMATCHED class (mentioned → fyi) is rejected loudly (never silently re-banded).
-        let err = define_notif_rule(
-            Reason::Mentioned,
-            DedupTpl("{subject}".into()),
-            Class::Fyi,
-        )
-        .expect_err("a class that disagrees with the table band is rejected");
+        let err = define_notif_rule(Reason::Mentioned, DedupTpl("{subject}".into()), Class::Fyi)
+            .expect_err("a class that disagrees with the table band is rejected");
         assert_eq!(
             err,
             DefineRuleError::ClassMismatch {
@@ -506,10 +516,17 @@ mod tests {
         );
         // the error renders a PII-free, actionable message (names the reason + the required band).
         let msg = err.to_string();
-        assert!(msg.contains("Mentioned") && msg.contains("Direct") && msg.contains("Fyi"), "{msg}");
+        assert!(
+            msg.contains("Mentioned") && msg.contains("Direct") && msg.contains("Fyi"),
+            "{msg}"
+        );
         // the critical-band reasons reconcile too (sla → critical).
-        assert!(define_notif_rule(Reason::Sla, DedupTpl("{subject}".into()), Class::Critical).is_ok());
-        assert!(define_notif_rule(Reason::Sla, DedupTpl("{subject}".into()), Class::Direct).is_err());
+        assert!(
+            define_notif_rule(Reason::Sla, DedupTpl("{subject}".into()), Class::Critical).is_ok()
+        );
+        assert!(
+            define_notif_rule(Reason::Sla, DedupTpl("{subject}".into()), Class::Direct).is_err()
+        );
     }
 
     /// **`NotifRule::dedup_key` renders the rule's template for a `(recipient, subject)`** (the
@@ -551,14 +568,27 @@ mod tests {
         let c = reg.classify("issue_mentioned", "psn:bob", &subject());
         assert_eq!(c.reason, Reason::Mentioned);
         assert_eq!(c.default_class, Class::Direct);
-        assert_eq!(c.dedup_key, "mention:psn:bob:myelin://acme/issues/issue/PROJ-1");
-        assert!(c.from_registered_rule, "a registered key classifies through its rule");
+        assert_eq!(
+            c.dedup_key,
+            "mention:psn:bob:myelin://acme/issues/issue/PROJ-1"
+        );
+        assert!(
+            c.from_registered_rule,
+            "a registered key classifies through its rule"
+        );
 
         // an UNREGISTERED key → the platform default (ambient watching), NOT a panic / drop.
         let d = reg.classify("never_registered", "psn:bob", &subject());
-        assert_eq!(d.reason, Reason::StateChanged, "the platform-default ambient reason");
+        assert_eq!(
+            d.reason,
+            Reason::StateChanged,
+            "the platform-default ambient reason"
+        );
         assert_eq!(d.default_class, Class::Watching);
-        assert!(!d.from_registered_rule, "an unregistered key uses the platform default");
+        assert!(
+            !d.from_registered_rule,
+            "an unregistered key uses the platform default"
+        );
         assert!(
             d.dedup_key.starts_with("never_registered:"),
             "the default key namespaces by rule_key so distinct unregistered rules do not collide"
@@ -585,7 +615,10 @@ mod tests {
             let c = reg.classify(key, "psn:x", &subject());
             // the classified default_class is EXACTLY the §3.1 ranking-table band for the reason.
             assert_eq!(c.default_class, reason_base_class(reason).1);
-            assert_eq!(c.default_class, class, "the registered band drives the rank");
+            assert_eq!(
+                c.default_class, class,
+                "the registered band drives the rank"
+            );
         }
     }
 
@@ -599,14 +632,23 @@ mod tests {
     fn platform_default_is_stubbed_and_accretes_without_notif_change() {
         // a FRESH registry is empty (the `is_empty` true branch — a mutant stubbing it to a constant
         // false is caught here).
-        assert!(NotifRuleRegistry::new().is_empty(), "a fresh registry is empty");
+        assert!(
+            NotifRuleRegistry::new().is_empty(),
+            "a fresh registry is empty"
+        );
         assert_eq!(NotifRuleRegistry::new().len(), 0);
 
         let reg = NotifRuleRegistry::platform_default();
-        assert_eq!(reg.len(), 1, "the stubbed default set is exactly the one platform-default rule");
+        assert_eq!(
+            reg.len(),
+            1,
+            "the stubbed default set is exactly the one platform-default rule"
+        );
         assert!(!reg.is_empty(), "the seeded default set is NOT empty");
         // the seed rule is the ambient state_changed → watching fallback.
-        let seed = reg.rule("state_changed").expect("the state_changed default rule is seeded");
+        let seed = reg
+            .rule("state_changed")
+            .expect("the state_changed default rule is seeded");
         assert_eq!(seed.reason, Reason::StateChanged);
         assert_eq!(seed.default_class, Class::Watching);
 
@@ -614,10 +656,18 @@ mod tests {
         let mut reg = reg;
         reg.register(
             "git_review_requested",
-            define_notif_rule(Reason::ReviewRequested, DedupTpl("{subject}".into()), Class::Direct)
-                .unwrap(),
+            define_notif_rule(
+                Reason::ReviewRequested,
+                DedupTpl("{subject}".into()),
+                Class::Direct,
+            )
+            .unwrap(),
         );
-        assert_eq!(reg.len(), 2, "the per-subsystem rule accreted (no Notif enum/match edit)");
+        assert_eq!(
+            reg.len(),
+            2,
+            "the per-subsystem rule accreted (no Notif enum/match edit)"
+        );
     }
 
     /// **THE INVERSE-SIGNAL PROPERTY (EI-01 §1): a synthetic subsystem registers a brand-new rule
@@ -646,8 +696,14 @@ mod tests {
         let c = reg.classify("synthetic.thing_happened", "psn:carol", &subject());
         assert_eq!(c.reason, Reason::Assigned);
         assert_eq!(c.default_class, Class::Direct);
-        assert!(c.from_registered_rule, "the synthetic registration took effect (0 Notif change)");
-        assert_eq!(c.dedup_key, "synthetic:psn:carol:myelin://acme/issues/issue/PROJ-1");
+        assert!(
+            c.from_registered_rule,
+            "the synthetic registration took effect (0 Notif change)"
+        );
+        assert_eq!(
+            c.dedup_key,
+            "synthetic:psn:carol:myelin://acme/issues/issue/PROJ-1"
+        );
     }
 
     /// **A re-registration is last-write-wins (idempotent on a reconnect; the rule set is
@@ -658,15 +714,31 @@ mod tests {
         let mut reg = NotifRuleRegistry::new();
         reg.register(
             "k",
-            define_notif_rule(Reason::Assigned, DedupTpl("v1:{subject}".into()), Class::Direct)
-                .unwrap(),
+            define_notif_rule(
+                Reason::Assigned,
+                DedupTpl("v1:{subject}".into()),
+                Class::Direct,
+            )
+            .unwrap(),
         );
         reg.register(
             "k",
-            define_notif_rule(Reason::Mentioned, DedupTpl("v2:{subject}".into()), Class::Direct)
-                .unwrap(),
+            define_notif_rule(
+                Reason::Mentioned,
+                DedupTpl("v2:{subject}".into()),
+                Class::Direct,
+            )
+            .unwrap(),
         );
-        assert_eq!(reg.len(), 1, "the same key is one rule (last-write-wins, idempotent)");
-        assert_eq!(reg.rule("k").unwrap().reason, Reason::Mentioned, "the latest registration wins");
+        assert_eq!(
+            reg.len(),
+            1,
+            "the same key is one rule (last-write-wins, idempotent)"
+        );
+        assert_eq!(
+            reg.rule("k").unwrap().reason,
+            Reason::Mentioned,
+            "the latest registration wins"
+        );
     }
 }

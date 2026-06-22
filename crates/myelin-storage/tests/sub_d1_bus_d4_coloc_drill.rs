@@ -27,7 +27,7 @@ use myelin_events::{
 };
 use myelin_harness::telemetry::{Predicate, SignalName, SignalSource};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
-use myelin_storage::{ColocatedOltp, ColocError, OltpConfig};
+use myelin_storage::{ColocError, ColocatedOltp, OltpConfig};
 
 fn db() -> ColocatedOltp {
     let config = OltpConfig {
@@ -35,15 +35,22 @@ fn db() -> ColocatedOltp {
         statement_timeout_ms: 3_000,
         per_tenant_in_flight_cap: 8,
     };
-    ColocatedOltp::open(config, Arc::new(MonotonicMinter::new()) as Arc<dyn IdMinter>)
-        .expect("co-located OLTP store opens")
+    ColocatedOltp::open(
+        config,
+        Arc::new(MonotonicMinter::new()) as Arc<dyn IdMinter>,
+    )
+    .expect("co-located OLTP store opens")
 }
 
 fn ctx() -> EmitContextBase {
     EmitContextBase {
         tenant: TenantId("acme".into()),
         region: Region("eu-west".into()),
-        actor: Actor(Principal::stub(PrincipalId("u1".into()), PrincipalKind::Human, TenantId("acme".into()))),
+        actor: Actor(Principal::stub(
+            PrincipalId("u1".into()),
+            PrincipalKind::Human,
+            TenantId("acme".into()),
+        )),
         schema_ver: 1,
         occurred_at: Timestamp("2026-06-19T00:00:00Z".into()),
         recorded_at: Timestamp("2026-06-19T00:00:01Z".into()),
@@ -83,7 +90,11 @@ fn sub_d1_kill_between_commit_and_publish_zero_ghost_zero_lost() {
         tx.commit().unwrap();
         committed.insert(id);
     }
-    assert_eq!(db.outbox_depth(), N, "all committed events are parked in the co-located outbox");
+    assert_eq!(
+        db.outbox_depth(),
+        N,
+        "all committed events are parked in the co-located outbox"
+    );
 
     // The relay drains the co-located outbox to the broker.
     let bus = InProcessBus::new();
@@ -96,22 +107,44 @@ fn sub_d1_kill_between_commit_and_publish_zero_ghost_zero_lost() {
     bus.sever();
     let severed = relay.drain_once();
     assert_eq!(severed.published, 0, "a severed broker delivers nothing");
-    assert_eq!(db.outbox_depth(), N, "0 lost — the committed rows are still parked, not dropped");
+    assert_eq!(
+        db.outbox_depth(),
+        N,
+        "0 lost — the committed rows are still parked, not dropped"
+    );
 
     // HEAL (the producer/relay restarts after the crash) and drain to empty.
     bus.heal();
     let drained = relay.drain_to_empty();
-    assert_eq!(drained.published, N, "every committed event is delivered after the heal (0 lost)");
+    assert_eq!(
+        drained.published, N,
+        "every committed event is delivered after the heal (0 lost)"
+    );
 
     // 0 ghost: the delivered set equals EXACTLY the committed set (no duplicate, no invented row).
-    assert_eq!(bus.delivered_ids(), committed, "delivered set == committed set (0 ghost, 0 lost)");
-    assert_eq!(bus.delivered_count(), N, "exactly-once delivery — no double-publish");
+    assert_eq!(
+        bus.delivered_ids(),
+        committed,
+        "delivered set == committed set (0 ghost, 0 lost)"
+    );
+    assert_eq!(
+        bus.delivered_count(),
+        N,
+        "exactly-once delivery — no double-publish"
+    );
 
     // The survival signals: outbox drained to 0, nothing dead-lettered.
     signals.set_scalar(SignalName::OutboxDepth, db.outbox_depth() as i64);
-    signals.set_scalar(SignalName::DeadLetterCount, db.outbox().dead_letter_count() as i64);
-    signals.assert_signal(SignalName::OutboxDepth, Predicate::Eq(0)).expect_green();
-    signals.assert_signal(SignalName::DeadLetterCount, Predicate::Eq(0)).expect_green();
+    signals.set_scalar(
+        SignalName::DeadLetterCount,
+        db.outbox().dead_letter_count() as i64,
+    );
+    signals
+        .assert_signal(SignalName::OutboxDepth, Predicate::Eq(0))
+        .expect_green();
+    signals
+        .assert_signal(SignalName::DeadLetterCount, Predicate::Eq(0))
+        .expect_green();
 
     println!(
         "[P-016 DRILL GREEN 2026-06-19] SUB-D1 (OLTP/outbox co-location half): \
@@ -139,7 +172,11 @@ fn bus_d4_emit_iff_committed_both_directions() {
         tx.emit(draft("CRASH"), None).unwrap();
         // dropped here WITHOUT commit — the crash point.
     }
-    assert_eq!(db.outbox_depth(), 0, "a dropped tx emits no event (no event without state)");
+    assert_eq!(
+        db.outbox_depth(),
+        0,
+        "a dropped tx emits no event (no event without state)"
+    );
 
     // (2) Injected mid-tx state failure: both roll back.
     {
@@ -149,21 +186,40 @@ fn bus_d4_emit_iff_committed_both_directions() {
         let r = tx.commit_with_state_fault("disk full");
         assert!(matches!(r, Err(ColocError::CommitRolledBack(_))));
     }
-    assert_eq!(db.outbox_depth(), 0, "a rolled-back state write emits no event (no state without event)");
+    assert_eq!(
+        db.outbox_depth(),
+        0,
+        "a rolled-back state write emits no event (no state without event)"
+    );
 
     // (3) A committed tx writes BOTH — exactly one event becomes durable.
     let mut tx = db.begin(ctx()).unwrap();
     tx.stage_state("INSERT issue OK");
     tx.emit(draft("OK"), None).unwrap();
     tx.commit().unwrap();
-    assert_eq!(db.outbox_depth(), 1, "emit-iff-committed: exactly the one committed event");
-    assert_eq!(db.outbox().committed_count(), 1, "no ghost from the two aborted txs");
+    assert_eq!(
+        db.outbox_depth(),
+        1,
+        "emit-iff-committed: exactly the one committed event"
+    );
+    assert_eq!(
+        db.outbox().committed_count(),
+        1,
+        "no ghost from the two aborted txs"
+    );
 
     // The survival signal: depth reflects exactly the committed events (1), 0 dead-letters.
     signals.set_scalar(SignalName::OutboxDepth, db.outbox_depth() as i64);
-    signals.set_scalar(SignalName::DeadLetterCount, db.outbox().dead_letter_count() as i64);
-    signals.assert_signal(SignalName::OutboxDepth, Predicate::Eq(1)).expect_green();
-    signals.assert_signal(SignalName::DeadLetterCount, Predicate::Eq(0)).expect_green();
+    signals.set_scalar(
+        SignalName::DeadLetterCount,
+        db.outbox().dead_letter_count() as i64,
+    );
+    signals
+        .assert_signal(SignalName::OutboxDepth, Predicate::Eq(1))
+        .expect_green();
+    signals
+        .assert_signal(SignalName::DeadLetterCount, Predicate::Eq(0))
+        .expect_green();
 
     println!(
         "[P-016 DRILL GREEN 2026-06-19] BUS-D4 (OLTP/outbox co-location half): \

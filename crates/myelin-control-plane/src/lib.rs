@@ -154,16 +154,23 @@ pub mod schema;
 pub mod self_host;
 
 pub use cp_outage::{
-    cp_outage_bound, ControlPlane, CpOutageReport, DataPlane, DegradeScope, Served, ServeFailure,
+    cp_outage_bound, ControlPlane, CpOutageReport, DataPlane, DegradeScope, ServeFailure, Served,
     SignupDegraded, SignupPlane,
 };
 pub use discover::{DiscoverKey, DiscoveryCache, DiscoverySignals, RouteTuple};
 pub use four_layer::{
     CrossRegionPathError, FourLayerEnforcement, ResidencyWriteBoundary, ResidencyWriteRejected,
 };
+pub use holder::{
+    assert_no_personal_columns, control_plane_data_map, ColumnClassification, ControlPlaneHolder,
+    CONTROL_PLANE_STORE,
+};
 pub use isolation::{partition_key, IsolationTier, PartitionKey, PoolStore};
 pub use mirror_allowed::{
     MirrorAllowReason, MirrorDecision, MirrorDenyReason, MirrorGate, MirrorTarget, TransferPolicy,
+};
+pub use place::{
+    CounterMinter, PlaceError, PlacementAnswer, PlacementService, PlacementSignals, TokenMinter,
 };
 pub use placement_of::{
     CellGateway, GatewayReject, Misroute, MisrouteAudit, MisrouteAuditRecord, PlacementOf,
@@ -173,15 +180,7 @@ pub use provision::{
     ProvisionFailure, ProvisionVerdict, ProvisioningGate, ProvisioningSignals, STEP_ACTIVATE,
     STEP_READINESS, STEP_RESTORE_VERIFY,
 };
-pub use place::{
-    CounterMinter, PlaceError, PlacementAnswer, PlacementService, PlacementSignals, TokenMinter,
-};
-pub use holder::{
-    assert_no_personal_columns, control_plane_data_map, ColumnClassification, ControlPlaneHolder,
-    CONTROL_PLANE_STORE,
-};
 pub use registry::{PlacementError, Registry};
-pub use self_host::DegenerateControlPlane;
 pub use residency_verify::{
     residency_verify, ResidencyAttestationSignal, ResidencyMismatch, ResidencySigningKey,
     ResidencyStoreClass, SignedAttestation, StoreRegionReport,
@@ -190,6 +189,7 @@ pub use schema::{
     Capacity, Cell, CellProvisioning, CellStatus, IsolationKind, LocalTenant, PlacementStatus,
     ProvisioningOutcome, TenantPlacement,
 };
+pub use self_host::DegenerateControlPlane;
 
 use myelin_substrate::{AppSpec, Config, Migration, Migrations, StoreKind, StoreManifest};
 
@@ -341,9 +341,17 @@ mod tests {
     #[test]
     fn migrations_are_forward_only_and_pii_free() {
         let migrations = control_plane_migrations();
-        assert_eq!(migrations.0.len(), 5, "cell + placement + provisioning + directory + trigger");
+        assert_eq!(
+            migrations.0.len(),
+            5,
+            "cell + placement + provisioning + directory + trigger"
+        );
         for m in &migrations.0 {
-            assert!(!is_destructive(m.ddl), "migration {} must be forward-only (no DROP)", m.id);
+            assert!(
+                !is_destructive(m.ddl),
+                "migration {} must be forward-only (no DROP)",
+                m.id
+            );
             let lower = m.ddl.to_ascii_lowercase();
             for pii in ["email", "full_name", " name ", "phone", "address", "body"] {
                 assert!(
@@ -366,7 +374,9 @@ mod tests {
             .find(|m| m.id == "0005_placement_invariant")
             .expect("the placement-invariant trigger migration exists");
         assert!(trigger.ddl.contains("CREATE TRIGGER"));
-        assert!(trigger.ddl.contains("BEFORE INSERT OR UPDATE ON tenant_placement"));
+        assert!(trigger
+            .ddl
+            .contains("BEFORE INSERT OR UPDATE ON tenant_placement"));
         assert!(trigger.ddl.contains("RAISE EXCEPTION"));
     }
 
@@ -380,7 +390,10 @@ mod tests {
         assert_eq!(spec.migrations.0.len(), 5);
         // The control-plane registry store is declared (so opening it = registering it).
         let ids = spec.stores.holder_ids();
-        assert!(ids.contains("oltp:control_plane_registry"), "registry store declared: {ids:?}");
+        assert!(
+            ids.contains("oltp:control_plane_registry"),
+            "registry store declared: {ids:?}"
+        );
         // The migration runner admits the registry DDL (no hot table, all forward-only).
         let mut runner = myelin_substrate::MigrationRunner::new();
         runner
@@ -400,9 +413,11 @@ mod tests {
             registry.open(store.kind, store.name);
         }
         // No declared store escaped registration (the holder-registered architecture test verdict).
-        let violations =
-            myelin_substrate::holder_registered(&manifest, &registry);
-        assert!(violations.is_empty(), "every declared store auto-registers: {violations:?}");
+        let violations = myelin_substrate::holder_registered(&manifest, &registry);
+        assert!(
+            violations.is_empty(),
+            "every declared store auto-registers: {violations:?}"
+        );
         assert!(registry.is_registered(StoreKind::Oltp, CONTROL_PLANE_STORE_NAME));
     }
 
@@ -502,7 +517,9 @@ mod tests {
             .expect("the registry admits the single-region placement");
 
         // CONSUMER: read the placement back through the frozen registry-schema shape.
-        let row = registry.placement(&tenant).expect("the placement is stored");
+        let row = registry
+            .placement(&tenant)
+            .expect("the placement is stored");
         let answer = PlacementOfAnswer::from_row(row);
         assert_eq!(answer.region.as_str(), "eu-west");
         assert_eq!(answer.home_cell.as_str(), "cell-w-1");
@@ -586,7 +603,10 @@ mod tests {
         let by_slug = registry
             .discover(&DiscoverKey::Slug("acme".into()), 30)
             .expect("the slug resolves to a route");
-        assert_eq!(GatewayRoute::from_route(&by_slug).target_endpoint, "cell.eu-west.myelin.eu");
+        assert_eq!(
+            GatewayRoute::from_route(&by_slug).target_endpoint,
+            "cell.eu-west.myelin.eu"
+        );
     }
 
     /// **CDC pair for the `placement_of` half of 12.3 (provider + consumer) — P-CP-08.** The PROVIDER
@@ -634,7 +654,11 @@ mod tests {
             region: Region::new("eu-west"),
             status: CellStatus::Active,
             isolation_kind: IsolationKind::Pool,
-            capacity: Capacity { tenants_max: 1000, write_qps_max: 5000, storage_bytes_max: 1 << 40 },
+            capacity: Capacity {
+                tenants_max: 1000,
+                write_qps_max: 5000,
+                storage_bytes_max: 1 << 40,
+            },
             utilisation: 5,
             version: 1,
             endpoint: "cell.eu-west.cell-w-1.myelin.eu".into(),
@@ -657,11 +681,21 @@ mod tests {
             .expect("the placed tenant resolves to a placement_of answer");
         let decision = GatewayHostsDecision::from_answer(&answer);
         assert_eq!(decision.region.as_str(), "eu-west");
-        assert_eq!(decision.member_cells.len(), 1, "v1 member_cells single-element");
+        assert_eq!(
+            decision.member_cells.len(),
+            1,
+            "v1 member_cells single-element"
+        );
         assert_eq!(decision.isolation_tier, IsolationKind::Pool);
         assert_eq!(decision.status, PlacementStatus::Active);
         // The home cell hosts; a different cell does NOT (the layer-4 decision, off routing only).
-        assert!(decision.this_cell_hosts(&CellId::from_token("cell-w-1")), "the home cell hosts");
-        assert!(!decision.this_cell_hosts(&CellId::from_token("cell-w-2")), "a different cell misroutes");
+        assert!(
+            decision.this_cell_hosts(&CellId::from_token("cell-w-1")),
+            "the home cell hosts"
+        );
+        assert!(
+            !decision.this_cell_hosts(&CellId::from_token("cell-w-2")),
+            "a different cell misroutes"
+        );
     }
 }

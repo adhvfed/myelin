@@ -86,17 +86,17 @@
 //! `git_d2_git_crypto_shred_drill`). So `cargo build --workspace` stays DB-free.
 
 use myelin_gdpr::{
-    DsrError, EraseReceipt, EraseScope, LocateReport, PersonalDataHolder, PortableBundle, Patch,
+    DsrError, EraseReceipt, EraseScope, LocateReport, Patch, PersonalDataHolder, PortableBundle,
     Receipt, RectifyReceipt, RestrictReceipt, Result as DsrResult, SubjectRef, TenantId,
 };
 use myelin_storage::encryption::SubjectId;
-use myelin_storage::erase::{CryptoShredErase, EraseError, EraseHolders, EpochMillis};
+use myelin_storage::erase::{CryptoShredErase, EpochMillis, EraseError, EraseHolders};
 use myelin_storage::kms::KmsEngine;
 use myelin_tenancy::Region;
 
 use crate::code_tools::{
-    CacheInvalidator, CacheNamespace, HistoryRewriteError, HistoryRewritePlan, HistoryRewriteReceipt,
-    HistoryRewriteTool, RewriteRateLimiter,
+    CacheInvalidator, CacheNamespace, HistoryRewriteError, HistoryRewritePlan,
+    HistoryRewriteReceipt, HistoryRewriteTool, RewriteRateLimiter,
 };
 use crate::core::WireExecutor;
 use crate::holder_intent::HOLDER_ID;
@@ -277,8 +277,16 @@ pub struct GitPersonalDataHolder<'a, I: CacheInvalidator> {
 impl<'a, I: CacheInvalidator> GitPersonalDataHolder<'a, I> {
     /// Build the H1 holder body over the KMS engine, the tenant region, and git's cache-invalidation
     /// fan-out seam.
-    pub fn new(engine: &'a KmsEngine, region: Region, invalidator: I) -> GitPersonalDataHolder<'a, I> {
-        GitPersonalDataHolder { engine, region, invalidator }
+    pub fn new(
+        engine: &'a KmsEngine,
+        region: Region,
+        invalidator: I,
+    ) -> GitPersonalDataHolder<'a, I> {
+        GitPersonalDataHolder {
+            engine,
+            region,
+            invalidator,
+        }
     }
 
     /// The stable holder id this body answers DSRs under (always [`HOLDER_ID`] = `"H1"` for git).
@@ -369,7 +377,9 @@ impl<'a, I: CacheInvalidator> GitPersonalDataHolder<'a, I> {
             ),
             // The destroyed key epoch — Some when the per-subject DEK was destroyed THIS call (the
             // crypto-shred lever's audit trail); None on an idempotent re-run (already destroyed).
-            storage_receipt.dek_destroyed_now.then_some(storage_receipt.completed_at),
+            storage_receipt
+                .dek_destroyed_now
+                .then_some(storage_receipt.completed_at),
             now,
         );
 
@@ -478,7 +488,10 @@ impl std::fmt::Display for GitDsrError {
                 missing.len(),
                 missing.iter().map(|n| n.label()).collect::<Vec<_>>(),
             ),
-            GitDsrError::NotGreen { missed_holders, recoverable_in_backup } => write!(
+            GitDsrError::NotGreen {
+                missed_holders,
+                recoverable_in_backup,
+            } => write!(
                 f,
                 "git DSR erase is NOT green (GIT-D2 RED): {} holder(s) missed ({:?}), {} \
                  per-subject DEK(s) still recoverable in backup — the erase is INCOMPLETE, never \
@@ -610,10 +623,14 @@ impl<I: CacheInvalidator> PersonalDataHolder for GitPersonalDataHolder<'_, I> {
     /// at [`erase_fanout`](Self::erase_fanout). This keeps "never claim a green you did not earn".
     fn erase(&self, scope: EraseScope) -> DsrResult<EraseReceipt> {
         let (subject_label, tenant_label) = match &scope {
-            EraseScope::Subject { subject, tenant } => {
-                (subject.principal.principal_id.0.clone(), tenant.as_str().to_string())
-            }
-            EraseScope::Tenant(tenant) => ("<tenant-offboarding>".to_string(), tenant.as_str().to_string()),
+            EraseScope::Subject { subject, tenant } => (
+                subject.principal.principal_id.0.clone(),
+                tenant.as_str().to_string(),
+            ),
+            EraseScope::Tenant(tenant) => (
+                "<tenant-offboarding>".to_string(),
+                tenant.as_str().to_string(),
+            ),
         };
         Err(DsrError(format!(
             "git erase(scope) for subject `{subject_label}` in tenant `{tenant_label}` requires the \
@@ -651,7 +668,11 @@ mod tests {
     /// A subject (a commit/PR/comment author) — keyed on the opaque, stable principal_id (pseudonymous,
     /// never real-identity PII).
     fn subject_ref() -> SubjectRef {
-        let p = Principal::stub(PrincipalId("p-opaque-ada".into()), PrincipalKind::Human, tenant());
+        let p = Principal::stub(
+            PrincipalId("p-opaque-ada".into()),
+            PrincipalKind::Human,
+            tenant(),
+        );
         SubjectRef::new(p)
     }
     fn subject_id() -> SubjectId {
@@ -668,10 +689,16 @@ mod tests {
     }
     impl RecordingSeam {
         fn ok() -> RecordingSeam {
-            RecordingSeam { ran: Mutex::new(false), fail: false }
+            RecordingSeam {
+                ran: Mutex::new(false),
+                fail: false,
+            }
         }
         fn failing() -> RecordingSeam {
-            RecordingSeam { ran: Mutex::new(false), fail: true }
+            RecordingSeam {
+                ran: Mutex::new(false),
+                fail: true,
+            }
         }
         fn did_run(&self) -> bool {
             *self.ran.lock().unwrap()
@@ -729,10 +756,16 @@ mod tests {
     }
     impl RecordingInvalidator {
         fn all_ok() -> RecordingInvalidator {
-            RecordingInvalidator { fail: None, seen: RefCell::new(vec![]) }
+            RecordingInvalidator {
+                fail: None,
+                seen: RefCell::new(vec![]),
+            }
         }
         fn failing(ns: CacheNamespace) -> RecordingInvalidator {
-            RecordingInvalidator { fail: Some(ns), seen: RefCell::new(vec![]) }
+            RecordingInvalidator {
+                fail: Some(ns),
+                seen: RefCell::new(vec![]),
+            }
         }
     }
     impl CacheInvalidator for RecordingInvalidator {
@@ -743,7 +776,10 @@ mod tests {
             namespace: CacheNamespace,
         ) -> Result<usize, GitCoreError> {
             if self.fail == Some(namespace) {
-                return Err(GitCoreError::Wire(format!("cache `{}` unreachable", namespace.label())));
+                return Err(GitCoreError::Wire(format!(
+                    "cache `{}` unreachable",
+                    namespace.label()
+                )));
             }
             self.seen.borrow_mut().push(namespace);
             Ok(1)
@@ -757,7 +793,8 @@ mod tests {
         let kms = KmsEngine::new();
         let (t, r) = (tenant(), region());
         kms.ensure_kek(&KekId::new(t.clone(), r.clone()));
-        kms.ensure_dek(&t, &r, KeyClass::Subject("p-opaque-ada".into())).expect("subject dek");
+        kms.ensure_dek(&t, &r, KeyClass::Subject("p-opaque-ada".into()))
+            .expect("subject dek");
         kms.ensure_dek(&t, &r, KeyClass::Blob).expect("blob dek");
         kms
     }
@@ -798,7 +835,11 @@ mod tests {
             GitHolder::CacheCdn,
             GitHolder::ErasureLedger,
         ] {
-            assert!(GitHolder::ALL.contains(&h), "{} must be in the DSR fan-out", h.label());
+            assert!(
+                GitHolder::ALL.contains(&h),
+                "{} must be in the DSR fan-out",
+                h.label()
+            );
         }
         // labels are stable + PII-free.
         assert_eq!(GitHolder::PseudonymMap.label(), "pseudonym-map");
@@ -816,41 +857,74 @@ mod tests {
 
         // BEFORE: a PR-comment body sealed under the subject DEK decrypts; the subject DEK + blob DEK
         // are in the backup snapshot (the at-rest ciphertext + its backup).
-        let subject_dek_ref =
-            myelin_storage::kms::PiiKeyRef::new(t.clone(), 0, KeyClass::Subject("p-opaque-ada".into()));
+        let subject_dek_ref = myelin_storage::kms::PiiKeyRef::new(
+            t.clone(),
+            0,
+            KeyClass::Subject("p-opaque-ada".into()),
+        );
         let body = b"PR comment authored by the subject: please review";
-        let dek = engine.resolve_dek(&subject_dek_ref, &region()).expect("subject dek resolves");
+        let dek = engine
+            .resolve_dek(&subject_dek_ref, &region())
+            .expect("subject dek resolves");
         let (nonce, ct) = dek.seal(body);
-        assert_eq!(dek.open(&nonce, &ct).unwrap(), body, "the body decrypts BEFORE erase");
+        assert_eq!(
+            dek.open(&nonce, &ct).unwrap(),
+            body,
+            "the body decrypts BEFORE erase"
+        );
 
         // The git-structure reach (§2b) over the SAME engine.
         let git_reach = GitCryptoShredReach::new(&engine, region());
 
         // Wire the cross-holder seams + git's cache fan-out.
-        let (pseudonym, search, refs, bus) =
-            (RecordingSeam::ok(), RecordingSeam::ok(), RecordingSeam::ok(), RecordingSeam::ok());
+        let (pseudonym, search, refs, bus) = (
+            RecordingSeam::ok(),
+            RecordingSeam::ok(),
+            RecordingSeam::ok(),
+            RecordingSeam::ok(),
+        );
         let ledger = RecordingLedger::default();
         let inv = RecordingInvalidator::all_ok();
         let holder = GitPersonalDataHolder::new(&engine, region(), inv);
         let bundle = holders(&pseudonym, &search, &refs, &bus, &ledger, &git_reach);
 
         // ERASE: drive the §6.1 fan-out.
-        let receipt = holder.erase_fanout(&sid, &t, &bundle, 1_000).expect("the git DSR erase is green");
+        let receipt = holder
+            .erase_fanout(&sid, &t, &bundle, 1_000)
+            .expect("the git DSR erase is green");
 
         // GIT-D2 GREEN: every holder hit, 0 recoverable in backup, every cache namespace, the posture.
-        assert!(receipt.is_green(), "GIT-D2: the erase reaches every holder + backups shredded");
-        assert!(receipt.missed_holders().is_empty(), "0 holders missed (a missed holder is a breach)");
+        assert!(
+            receipt.is_green(),
+            "GIT-D2: the erase reaches every holder + backups shredded"
+        );
+        assert!(
+            receipt.missed_holders().is_empty(),
+            "0 holders missed (a missed holder is a breach)"
+        );
         assert_eq!(receipt.holders_hit.len(), GitHolder::ALL.len());
-        assert_eq!(receipt.recoverable_in_backup, 0, "GIT-D2: 0 recoverable PII in any backup");
-        assert_eq!(receipt.cache_namespaces_invalidated.len(), CacheNamespace::ALL.len());
+        assert_eq!(
+            receipt.recoverable_in_backup, 0,
+            "GIT-D2: 0 recoverable PII in any backup"
+        );
+        assert_eq!(
+            receipt.cache_namespaces_invalidated.len(),
+            CacheNamespace::ALL.len()
+        );
         assert_eq!(receipt.residual, GitResidualPosture::OnePlatformPosture);
 
         // Every cross-holder seam ran (the fan-out is real, not asserted).
-        assert!(pseudonym.did_run(), "step 1: pseudonym-map shred ran (Id.erase)");
+        assert!(
+            pseudonym.did_run(),
+            "step 1: pseudonym-map shred ran (Id.erase)"
+        );
         assert!(search.did_run(), "step 3: search purge+reindex ran");
         assert!(refs.did_run(), "step 4: refs tombstone ran");
         assert!(bus.did_run(), "step 5: bus erase ran");
-        assert!(ledger.is_erased(&sid, &t), "step 6: the erasure ledger recorded the subject");
+        assert!(
+            ledger.is_erased(&sid, &t),
+            "step 6: the erasure ledger recorded the subject"
+        );
 
         // AFTER: the subject DEK is gone — the PR-comment body ciphertext is UNRECOVERABLE (live), and
         // the subject DEK + the per-tenant blob DEK are ABSENT from the backup snapshot (§7.5).
@@ -858,17 +932,27 @@ mod tests {
             engine.resolve_dek(&subject_dek_ref, &region()).is_err(),
             "the body is unrecoverable after erase (live): the per-subject DEK is destroyed"
         );
-        let subject_dek = myelin_storage::kms::DekId::new(t.clone(), KeyClass::Subject("p-opaque-ada".into()));
+        let subject_dek =
+            myelin_storage::kms::DekId::new(t.clone(), KeyClass::Subject("p-opaque-ada".into()));
         let blob_dek = myelin_storage::kms::DekId::new(t.clone(), KeyClass::Blob);
         let backup = engine.backup_snapshot();
-        assert!(!backup.iter().any(|(d, _)| *d == subject_dek), "subject DEK absent from backup");
-        assert!(!backup.iter().any(|(d, _)| *d == blob_dek), "blob DEK (reflog/bitmap/pack) absent from backup");
+        assert!(
+            !backup.iter().any(|(d, _)| *d == subject_dek),
+            "subject DEK absent from backup"
+        );
+        assert!(
+            !backup.iter().any(|(d, _)| *d == blob_dek),
+            "blob DEK (reflog/bitmap/pack) absent from backup"
+        );
 
         // The audit receipt is content-addressed (the audit-ledger hash-link; the Merkle seal is
         // P-GA-20) and names the destroyed key epoch (the crypto-shred lever's audit trail).
         assert_eq!(receipt.audit_receipt.operation, "erase");
         assert!(receipt.audit_receipt.content_hash.starts_with("blake3:"));
-        assert!(receipt.audit_receipt.key_epoch_destroyed.is_some(), "the destroyed key epoch is named");
+        assert!(
+            receipt.audit_receipt.key_epoch_destroyed.is_some(),
+            "the destroyed key epoch is named"
+        );
     }
 
     /// **A missed cross-holder step is a LOUD failure — the erase is NEVER recorded as complete.** If
@@ -878,16 +962,28 @@ mod tests {
     fn a_failed_holder_step_aborts_loud_never_recorded_as_erased() {
         let engine = engine_with_subject_and_git_keys();
         let git_reach = GitCryptoShredReach::new(&engine, region());
-        let (pseudonym, search, refs, bus) =
-            (RecordingSeam::failing(), RecordingSeam::ok(), RecordingSeam::ok(), RecordingSeam::ok());
+        let (pseudonym, search, refs, bus) = (
+            RecordingSeam::failing(),
+            RecordingSeam::ok(),
+            RecordingSeam::ok(),
+            RecordingSeam::ok(),
+        );
         let ledger = RecordingLedger::default();
         let holder = GitPersonalDataHolder::new(&engine, region(), RecordingInvalidator::all_ok());
         let bundle = holders(&pseudonym, &search, &refs, &bus, &ledger, &git_reach);
 
-        let err = holder.erase_fanout(&subject_id(), &tenant(), &bundle, 1).unwrap_err();
-        assert!(matches!(err, GitDsrError::FanOut(EraseError::PseudonymShred(_))));
+        let err = holder
+            .erase_fanout(&subject_id(), &tenant(), &bundle, 1)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            GitDsrError::FanOut(EraseError::PseudonymShred(_))
+        ));
         // The ledger NEVER recorded the subject as erased (a partial erase is a loud retry).
-        assert!(!ledger.is_erased(&subject_id(), &tenant()), "an incomplete erase is NEVER recorded");
+        assert!(
+            !ledger.is_erased(&subject_id(), &tenant()),
+            "an incomplete erase is NEVER recorded"
+        );
     }
 
     /// **An incomplete cache/CDN (H9) fan-out is RED — a fork/mirror/CDN could resurrect the derived
@@ -897,14 +993,23 @@ mod tests {
     fn an_incomplete_cache_fan_out_aborts_loud() {
         let engine = engine_with_subject_and_git_keys();
         let git_reach = GitCryptoShredReach::new(&engine, region());
-        let (pseudonym, search, refs, bus) =
-            (RecordingSeam::ok(), RecordingSeam::ok(), RecordingSeam::ok(), RecordingSeam::ok());
+        let (pseudonym, search, refs, bus) = (
+            RecordingSeam::ok(),
+            RecordingSeam::ok(),
+            RecordingSeam::ok(),
+            RecordingSeam::ok(),
+        );
         let ledger = RecordingLedger::default();
-        let holder =
-            GitPersonalDataHolder::new(&engine, region(), RecordingInvalidator::failing(CacheNamespace::CloneCache));
+        let holder = GitPersonalDataHolder::new(
+            &engine,
+            region(),
+            RecordingInvalidator::failing(CacheNamespace::CloneCache),
+        );
         let bundle = holders(&pseudonym, &search, &refs, &bus, &ledger, &git_reach);
 
-        let err = holder.erase_fanout(&subject_id(), &tenant(), &bundle, 1).unwrap_err();
+        let err = holder
+            .erase_fanout(&subject_id(), &tenant(), &bundle, 1)
+            .unwrap_err();
         match err {
             GitDsrError::IncompleteCacheFanOut { missing } => {
                 assert_eq!(missing, vec![CacheNamespace::CloneCache]);
@@ -919,8 +1024,12 @@ mod tests {
     #[test]
     fn an_unwired_git_structure_reach_is_refused_fail_closed() {
         let engine = engine_with_subject_and_git_keys();
-        let (pseudonym, search, refs, bus) =
-            (RecordingSeam::ok(), RecordingSeam::ok(), RecordingSeam::ok(), RecordingSeam::ok());
+        let (pseudonym, search, refs, bus) = (
+            RecordingSeam::ok(),
+            RecordingSeam::ok(),
+            RecordingSeam::ok(),
+            RecordingSeam::ok(),
+        );
         let ledger = RecordingLedger::default();
         let holder = GitPersonalDataHolder::new(&engine, region(), RecordingInvalidator::all_ok());
         // The bundle has NO git_reach (None) — the §2b holder is unwired.
@@ -932,10 +1041,15 @@ mod tests {
             ledger: &ledger,
             git_reach: None,
         };
-        let err = holder.erase_fanout(&subject_id(), &tenant(), &bundle, 1).unwrap_err();
+        let err = holder
+            .erase_fanout(&subject_id(), &tenant(), &bundle, 1)
+            .unwrap_err();
         assert_eq!(err, GitDsrError::GitStructureReachNotWired);
         // Fail-closed: NO step ran (the pseudonym shred never fired).
-        assert!(!pseudonym.did_run(), "refused before any step ran (fail-closed)");
+        assert!(
+            !pseudonym.did_run(),
+            "refused before any step ran (fail-closed)"
+        );
     }
 
     /// **The erase is idempotent — a re-erase is a no-op success (flagged `re_run`).** The subject is
@@ -944,20 +1058,31 @@ mod tests {
     fn a_re_erase_is_an_idempotent_no_op_success() {
         let engine = engine_with_subject_and_git_keys();
         let git_reach = GitCryptoShredReach::new(&engine, region());
-        let (pseudonym, search, refs, bus) =
-            (RecordingSeam::ok(), RecordingSeam::ok(), RecordingSeam::ok(), RecordingSeam::ok());
+        let (pseudonym, search, refs, bus) = (
+            RecordingSeam::ok(),
+            RecordingSeam::ok(),
+            RecordingSeam::ok(),
+            RecordingSeam::ok(),
+        );
         let ledger = RecordingLedger::default();
         let holder = GitPersonalDataHolder::new(&engine, region(), RecordingInvalidator::all_ok());
         let bundle = holders(&pseudonym, &search, &refs, &bus, &ledger, &git_reach);
 
-        let first = holder.erase_fanout(&subject_id(), &tenant(), &bundle, 1).expect("first erase green");
+        let first = holder
+            .erase_fanout(&subject_id(), &tenant(), &bundle, 1)
+            .expect("first erase green");
         assert!(!first.re_run, "the first erase is not a re-run");
         assert!(first.is_green());
 
         // Second erase: idempotent no-op success (the subject is already in the ledger).
-        let second = holder.erase_fanout(&subject_id(), &tenant(), &bundle, 2).expect("re-erase green");
+        let second = holder
+            .erase_fanout(&subject_id(), &tenant(), &bundle, 2)
+            .expect("re-erase green");
         assert!(second.re_run, "the re-erase is flagged as a re-run");
-        assert!(second.is_green(), "the re-erase re-affirms every holder + 0 recoverable");
+        assert!(
+            second.is_green(),
+            "the re-erase re-affirms every holder + 0 recoverable"
+        );
         assert_eq!(second.recoverable_in_backup, 0);
     }
 
@@ -985,14 +1110,20 @@ mod tests {
         assert!(!dropped.is_green(), "a missed holder is a breach (RED)");
         assert_eq!(dropped.missed_holders().len(), GitHolder::ALL.len() - 1);
         // A recoverable backup is RED.
-        let recoverable = GitDsrReceipt { recoverable_in_backup: 1, ..green.clone() };
+        let recoverable = GitDsrReceipt {
+            recoverable_in_backup: 1,
+            ..green.clone()
+        };
         assert!(!recoverable.is_green(), "a recoverable backup is RED");
         // A dropped cache namespace is RED.
         let dropped_cache = GitDsrReceipt {
             cache_namespaces_invalidated: vec![CacheNamespace::Fork],
             ..green.clone()
         };
-        assert!(!dropped_cache.is_green(), "a dropped cache namespace is RED");
+        assert!(
+            !dropped_cache.is_green(),
+            "a dropped cache namespace is RED"
+        );
     }
 
     /// **Each `GitDsrError` renders LOUD + self-describing (never a swallowed empty string).** Kills
@@ -1006,17 +1137,28 @@ mod tests {
         assert!(GitDsrError::FanOut(EraseError::PseudonymShred("x".into()))
             .to_string()
             .contains("INCOMPLETE"));
-        assert!(GitDsrError::IncompleteCacheFanOut { missing: vec![CacheNamespace::Mirror] }
-            .to_string()
-            .contains("INCOMPLETE"));
+        assert!(GitDsrError::IncompleteCacheFanOut {
+            missing: vec![CacheNamespace::Mirror]
+        }
+        .to_string()
+        .contains("INCOMPLETE"));
         let not_green = GitDsrError::NotGreen {
             missed_holders: vec![GitHolder::SubjectBodies],
             recoverable_in_backup: 2,
         }
         .to_string();
-        assert!(not_green.contains("NOT green"), "names the RED reading: {not_green}");
-        assert!(not_green.contains("subject-bodies-dek"), "names the missed holder: {not_green}");
-        assert!(not_green.contains('2'), "names the recoverable-in-backup count: {not_green}");
+        assert!(
+            not_green.contains("NOT green"),
+            "names the RED reading: {not_green}"
+        );
+        assert!(
+            not_green.contains("subject-bodies-dek"),
+            "names the missed holder: {not_green}"
+        );
+        assert!(
+            not_green.contains('2'),
+            "names the recoverable-in-backup count: {not_green}"
+        );
     }
 
     // ───────────────────────── the residual is the ONE posture, by reference ─────────────────────
@@ -1027,11 +1169,23 @@ mod tests {
         // ONE platform posture (10.9 / X-7) + the history-rewrite follow-on (10.6) + the lawful-basis
         // residual (R-7, parallel/Legal).
         let r = GitResidualPosture::RESIDUAL_POSTURE_REF;
-        assert!(r.contains("10.9"), "names the ONE platform posture contract");
+        assert!(
+            r.contains("10.9"),
+            "names the ONE platform posture contract"
+        );
         assert!(r.contains("X-7"), "names the X-7 reconciliation decision");
-        assert!(r.contains("10.6"), "names the on-demand history-rewrite follow-on");
-        assert!(r.contains("R-7"), "names the lawful-basis residual (parallel/Legal, NOT a code gate)");
-        assert!(r.contains("pseudonymous-by-default") || r.contains("Id 4.8"), "names the structural floor");
+        assert!(
+            r.contains("10.6"),
+            "names the on-demand history-rewrite follow-on"
+        );
+        assert!(
+            r.contains("R-7"),
+            "names the lawful-basis residual (parallel/Legal, NOT a code gate)"
+        );
+        assert!(
+            r.contains("pseudonymous-by-default") || r.contains("Id 4.8"),
+            "names the structural floor"
+        );
     }
 
     // ───────────────────────── the history-rewrite erasure semantics (10.6) ──────────────────────
@@ -1040,7 +1194,10 @@ mod tests {
     struct OkWire;
     impl WireExecutor for OkWire {
         fn run(&self, _inv: &WireInvocation) -> Result<WireOutput, GitCoreError> {
-            Ok(WireOutput { stdout: vec![], status: 0 })
+            Ok(WireOutput {
+                stdout: vec![],
+                status: 0,
+            })
         }
     }
 
@@ -1063,8 +1220,13 @@ mod tests {
             target_refs: vec!["refs/heads/main".into()],
             reason_code: "dsr-body".into(), // the X-7 residual body-expunge reason.
         };
-        let receipt = holder.expunge_body(&tool, &plan, &mut limiter, 2_000).expect("the expunge is green");
-        assert!(receipt.is_complete(), "the invalidation fan-out reached every namespace");
+        let receipt = holder
+            .expunge_body(&tool, &plan, &mut limiter, 2_000)
+            .expect("the expunge is green");
+        assert!(
+            receipt.is_complete(),
+            "the invalidation fan-out reached every namespace"
+        );
         assert_eq!(receipt.receipt.operation, "git.history_rewrite");
     }
 
@@ -1083,7 +1245,9 @@ mod tests {
         let exp = holder.export(&s, tenant()).expect("export");
         assert_eq!(exp.receipt.operation, "export");
 
-        let rec = holder.rectify(&s, Patch("title: redacted".into())).expect("rectify");
+        let rec = holder
+            .rectify(&s, Patch("title: redacted".into()))
+            .expect("rectify");
         assert_eq!(rec.receipt.operation, "rectify");
 
         let on = holder.restrict(&s, true).expect("restrict on");
@@ -1103,10 +1267,21 @@ mod tests {
     fn the_trait_erase_refuses_loud_without_wired_seams() {
         let engine = KmsEngine::new();
         let holder = GitPersonalDataHolder::new(&engine, region(), RecordingInvalidator::all_ok());
-        let scope = EraseScope::Subject { subject: subject_ref(), tenant: tenant() };
+        let scope = EraseScope::Subject {
+            subject: subject_ref(),
+            tenant: tenant(),
+        };
         let err = holder.erase(scope).unwrap_err();
-        assert!(err.0.contains("requires the wired cross-holder seams"), "loud refusal: {}", err.0);
-        assert!(err.0.contains("erase_fanout"), "points the caller at the real fan-out: {}", err.0);
+        assert!(
+            err.0.contains("requires the wired cross-holder seams"),
+            "loud refusal: {}",
+            err.0
+        );
+        assert!(
+            err.0.contains("erase_fanout"),
+            "points the caller at the real fan-out: {}",
+            err.0
+        );
         // A tenant-offboarding scope is also a loud refusal (never a false 'erased').
         let tenant_scope = EraseScope::Tenant(tenant());
         assert!(holder.erase(tenant_scope).is_err());

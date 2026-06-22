@@ -37,7 +37,9 @@ use myelin_identity::{
 };
 use myelin_knowledge::refs_glue::{PageMeta, PageStore, Projector};
 use myelin_knowledge::KnowledgeRefResolver;
-use myelin_notif::humanise::{humanise, Channel, RefResolution, RefResolvePort, TemplateStore, DEFAULT_LOCALE};
+use myelin_notif::humanise::{
+    humanise, Channel, RefResolution, RefResolvePort, TemplateStore, DEFAULT_LOCALE,
+};
 use myelin_notif::{reason_template_key, Reason};
 use myelin_refs::ArtifactRef;
 use myelin_tenancy::{Region, TenantId};
@@ -55,7 +57,10 @@ fn viewer(id: &str) -> Principal {
     Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, acme())
 }
 fn strong(zk: &str) -> Consistency {
-    Consistency { at_least: Zookie(zk.into()), mode: ConsistencyMode::Strong }
+    Consistency {
+        at_least: Zookie(zk.into()),
+        mode: ConsistencyMode::Strong,
+    }
 }
 
 /// A deterministic Id: a `read@object` allow-list (absent ⇒ Deny, fail-closed).
@@ -64,7 +69,9 @@ struct StubId {
 }
 impl StubId {
     fn new() -> Self {
-        Self { allow: HashSet::new() }
+        Self {
+            allow: HashSet::new(),
+        }
     }
     fn allow_read(mut self, object: &ArtifactRef) -> Self {
         self.allow.insert(format!("read@{}", object.0));
@@ -84,7 +91,11 @@ impl IdentityService for StubId {
         _caveat: Option<&CaveatContext>,
     ) -> IdResult<Decision> {
         let key = format!("{}@{}", permission.0, object.0);
-        Ok(if self.allow.contains(&key) { Decision::Allow } else { Decision::Deny })
+        Ok(if self.allow.contains(&key) {
+            Decision::Allow
+        } else {
+            Decision::Deny
+        })
     }
     fn list_objects(
         &self,
@@ -95,7 +106,12 @@ impl IdentityService for StubId {
     ) -> IdResult<ListObjectsResult> {
         Err(AuthzError::NotYetImplemented("n/a"))
     }
-    fn list_subjects(&self, _o: &ObjectId, _p: &Permission, _at: &Consistency) -> IdResult<SubjectTree> {
+    fn list_subjects(
+        &self,
+        _o: &ObjectId,
+        _p: &Permission,
+        _at: &Consistency,
+    ) -> IdResult<SubjectTree> {
         Err(AuthzError::NotYetImplemented("n/a"))
     }
     fn explain(
@@ -107,7 +123,11 @@ impl IdentityService for StubId {
     ) -> IdResult<RewriteTrace> {
         Err(AuthzError::NotYetImplemented("n/a"))
     }
-    fn delegation(&self, _a: &Principal, _t: &Principal) -> IdResult<myelin_identity::EffectivePolicy> {
+    fn delegation(
+        &self,
+        _a: &Principal,
+        _t: &Principal,
+    ) -> IdResult<myelin_identity::EffectivePolicy> {
         Err(AuthzError::NotYetImplemented("n/a"))
     }
     fn write_tuples(
@@ -149,8 +169,18 @@ fn page() -> ArtifactRef {
 
 fn resolver(grant_read: bool) -> KnowledgeRefResolver<StubId> {
     let mut store = PageStore::new();
-    store.put_root(&page(), PageMeta { title: SECRET_TITLE.into(), state: "published".into() });
-    let id = if grant_read { StubId::new().allow_read(&page()) } else { StubId::new() };
+    store.put_root(
+        &page(),
+        PageMeta {
+            title: SECRET_TITLE.into(),
+            state: "published".into(),
+        },
+    );
+    let id = if grant_read {
+        StubId::new().allow_read(&page())
+    } else {
+        StubId::new()
+    };
     KnowledgeRefResolver::new(Projector::new(id, store))
 }
 
@@ -161,7 +191,13 @@ fn resolver(grant_read: bool) -> KnowledgeRefResolver<StubId> {
 fn provider_knowledge_resolve_is_projection_or_tombstone_permission_first() {
     // allowed → Projection with the title + the click-route ref.
     let allowed = resolver(true);
-    match allowed.resolve_display(&acme(), &region(), &page(), &viewer("editor"), &strong("zk-1")) {
+    match allowed.resolve_display(
+        &acme(),
+        &region(),
+        &page(),
+        &viewer("editor"),
+        &strong("zk-1"),
+    ) {
         RefResolution::Projection(p) => {
             assert_eq!(p.ref_, page());
             assert_eq!(p.title, SECRET_TITLE);
@@ -171,7 +207,13 @@ fn provider_knowledge_resolve_is_projection_or_tombstone_permission_first() {
     }
     // denied → Tombstone carrying the opaque root, NEVER the title.
     let denied = resolver(false);
-    match denied.resolve_display(&acme(), &region(), &page(), &viewer("contractor"), &strong("zk-1")) {
+    match denied.resolve_display(
+        &acme(),
+        &region(),
+        &page(),
+        &viewer("contractor"),
+        &strong("zk-1"),
+    ) {
         RefResolution::Tombstone(t) => assert_eq!(t.root, page()),
         RefResolution::Projection(_) => panic!("a denied viewer must NOT project a title (leak!)"),
     }
@@ -200,8 +242,15 @@ fn consumer_humanise_renders_the_kn_display_projection_per_viewer() {
         &strong("zk-1"),
         Channel::Cli,
     );
-    assert!(h.text.contains(SECRET_TITLE), "the allowed viewer's humanised string shows the title");
-    assert_eq!(h.links, vec![page().0], "the allowed branch carries the click-route link");
+    assert!(
+        h.text.contains(SECRET_TITLE),
+        "the allowed viewer's humanised string shows the title"
+    );
+    assert_eq!(
+        h.links,
+        vec![page().0],
+        "the allowed branch carries the click-route link"
+    );
 
     // denied viewer → the PII-free tombstone, the SAME reason template (the ONE surface, no 2nd engine).
     let denied = resolver(false);
@@ -217,9 +266,18 @@ fn consumer_humanise_renders_the_kn_display_projection_per_viewer() {
         &strong("zk-1"),
         Channel::Cli,
     );
-    assert!(h.text.contains("a restricted page"), "the denied viewer sees the PII-free tombstone");
-    assert!(!h.text.contains(SECRET_TITLE), "the title never leaks to the denied viewer");
-    assert!(h.links.is_empty(), "a denied subject yields no click-route link");
+    assert!(
+        h.text.contains("a restricted page"),
+        "the denied viewer sees the PII-free tombstone"
+    );
+    assert!(
+        !h.text.contains(SECRET_TITLE),
+        "the title never leaks to the denied viewer"
+    );
+    assert!(
+        h.links.is_empty(),
+        "a denied subject yields no click-route link"
+    );
 }
 
 /// **The 7.3 render keys on the SAME KN reason vocabulary the 7.6 registration (NOTIF-P20) declares —
@@ -244,7 +302,12 @@ fn the_kn_reason_vocabulary_agrees_between_7_6_registration_and_7_3_render() {
     let reasons: Vec<Reason> = rules.iter().map(|(_, r)| r.reason).collect();
     assert_eq!(
         reasons,
-        vec![Reason::Mentioned, Reason::Comments, Reason::Shared, Reason::Watched],
+        vec![
+            Reason::Mentioned,
+            Reason::Comments,
+            Reason::Shared,
+            Reason::Watched
+        ],
         "the KN reason set the 7.3 render covers"
     );
 }
@@ -256,7 +319,12 @@ fn the_kn_reason_vocabulary_agrees_between_7_6_registration_and_7_3_render() {
 fn notif_d4_zero_title_leak_over_every_kn_reason_and_channel() {
     let denied = resolver(false);
     let templates = TemplateStore::with_platform_defaults();
-    let reasons = [Reason::Mentioned, Reason::Comments, Reason::Shared, Reason::Watched];
+    let reasons = [
+        Reason::Mentioned,
+        Reason::Comments,
+        Reason::Shared,
+        Reason::Watched,
+    ];
     let mut renders = 0u64;
     let mut leaks = 0u64;
     for &reason in &reasons {
@@ -277,9 +345,15 @@ fn notif_d4_zero_title_leak_over_every_kn_reason_and_channel() {
             if h.text.contains(SECRET_TITLE) || h.text.to_lowercase().contains("layoffs") {
                 leaks += 1;
             }
-            assert!(h.text.contains("a restricted page"), "every denied render is a tombstone");
+            assert!(
+                h.text.contains("a restricted page"),
+                "every denied render is a tombstone"
+            );
         }
     }
-    assert_eq!(leaks, 0, "NOTIF-D4 (KN slice): 0 title leak over {renders} denied renders (threshold 0)");
+    assert_eq!(
+        leaks, 0,
+        "NOTIF-D4 (KN slice): 0 title leak over {renders} denied renders (threshold 0)"
+    );
     eprintln!("NOTIF-D4 KN 7.3 slice GREEN (2026-06-22): {renders} renders, leak-count = {leaks}");
 }

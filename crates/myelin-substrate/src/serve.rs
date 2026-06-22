@@ -64,9 +64,7 @@
 //!   the in-memory models of the SQL `outbox` / `consumer_dedup` tables (P-S07/P-S08); the real
 //!   binding inside the caller's DB transaction lands when the driver does.
 
-use crate::holder_registered::{
-    assert_all_holders_registered, HolderViolation, StoreManifest,
-};
+use crate::holder_registered::{assert_all_holders_registered, HolderViolation, StoreManifest};
 use crate::holders::{HolderRegistration, HolderRegistry, StoreKind};
 use crate::metrics_health::{CriticalDependencies, HealthTable, MetricsHealthSurface};
 use crate::migrations::{HotTables, Migration, MigrationRunner, Migrations};
@@ -238,7 +236,10 @@ impl Default for PortOpener {
             public: PublicSurface::default(),
             // No critical deps declared on the bare default (a service declares its set at boot,
             // §4.3); `open_all` rebuilds with the service's declared critical set.
-            metrics_health: MetricsHealthSurface::new(CriticalDependencies::default(), health.clone()),
+            metrics_health: MetricsHealthSurface::new(
+                CriticalDependencies::default(),
+                health.clone(),
+            ),
             health,
         }
     }
@@ -333,12 +334,18 @@ impl Telemetry {
 
     /// The exported `outbox_depth` signal value (contract 1.8, §10.2 row 4).
     pub fn outbox_depth(&self) -> i64 {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).outbox_depth
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .outbox_depth
     }
 
     /// The exported `dead_letter_count` signal value (contract 1.8, §10.2 row 4).
     pub fn dead_letter_count(&self) -> i64 {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).dead_letter_count
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .dead_letter_count
     }
 
     /// The exported `consumer_lag` signal value for a consumer (contract 1.8, §10.2 row 3),
@@ -440,7 +447,8 @@ fn oltp_config_from(config: &Config) -> Result<OltpConfig, ServeError> {
         statement_timeout_ms: 5_000,
         per_tenant_in_flight_cap: 8,
     };
-    cfg.validate().map_err(|e| ServeError(format!("OLTP pool config invalid at boot: {e}")))?;
+    cfg.validate()
+        .map_err(|e| ServeError(format!("OLTP pool config invalid at boot: {e}")))?;
     Ok(cfg)
 }
 
@@ -574,7 +582,9 @@ impl ServeHandle {
                     // Retried / DeadLettered / Throttled (per-tenant fairness, EB-05) are NOT a
                     // completed terminal handle — they stay pending (lag, not loss) or were
                     // surfaced; the next drain re-offers a Retried/Throttled message.
-                    Delivered::DeadLettered(_) | Delivered::Retried(_) | Delivered::Throttled(_) => {}
+                    Delivered::DeadLettered(_)
+                    | Delivered::Retried(_)
+                    | Delivered::Throttled(_) => {}
                 }
             }
             delivered.push((c.name(), count));
@@ -646,7 +656,10 @@ pub fn boot(spec: AppSpec) -> Result<ServeHandle, ServeError> {
     let mut runner = MigrationRunner::new();
     let mut full_migrations = Migrations(vec![
         Migration::plain("0000_outbox", myelin_events::OUTBOX_MIGRATION),
-        Migration::plain("0001_consumer_dedup", myelin_events::CONSUMER_DEDUP_MIGRATION),
+        Migration::plain(
+            "0001_consumer_dedup",
+            myelin_events::CONSUMER_DEDUP_MIGRATION,
+        ),
     ]);
     full_migrations.0.extend(migrations.0);
     runner.run(&full_migrations, &hot_tables)?;
@@ -685,12 +698,13 @@ pub fn boot(spec: AppSpec) -> Result<ServeHandle, ServeError> {
 
     // (3) relay — start the outbox relay automatically (§3.3, BUS-2). The relay's `published_at`
     //     clock is the boot clock; the real wall-clock source lands with the driver (P-S15).
-    let OutboxSpec { store: outbox_store, transport } = outbox;
-    let relay = Relay::new(
-        outbox_store.clone(),
+    let OutboxSpec {
+        store: outbox_store,
         transport,
-        || Timestamp("1970-01-01T00:00:00Z".into()),
-    );
+    } = outbox;
+    let relay = Relay::new(outbox_store.clone(), transport, || {
+        Timestamp("1970-01-01T00:00:00Z".into())
+    });
 
     // (6) ports — open the three surfaces (§4). The tenant-from-token public surface (SUB-D7) is
     //     P-S13; liveness≠readiness on the metrics-health surface (SUB-D9, P-S14) is opened over
@@ -768,7 +782,11 @@ mod tests {
     use std::sync::atomic::AtomicU32;
 
     fn principal() -> Principal {
-        Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId("acme".into()))
+        Principal::stub(
+            PrincipalId("p".into()),
+            PrincipalKind::Human,
+            TenantId("acme".into()),
+        )
     }
 
     fn ctx_base() -> EmitContextBase {
@@ -837,7 +855,10 @@ mod tests {
         let spec = AppSpec {
             name: "hello",
             config: Config::default(),
-            migrations: Migrations::new([("0010_hello", "CREATE TABLE IF NOT EXISTS hello (id TEXT)")]),
+            migrations: Migrations::new([(
+                "0010_hello",
+                "CREATE TABLE IF NOT EXISTS hello (id TEXT)",
+            )]),
             hot_tables: HotTables::none(),
             public: PublicRoutes::default(),
             internal: InternalRpc::default(),
@@ -859,11 +880,16 @@ mod tests {
         );
         assert_eq!(
             handle.registered_holders(),
-            &[HolderRegistration { kind: StoreKind::Oltp, name: "hello" }],
+            &[HolderRegistration {
+                kind: StoreKind::Oltp,
+                name: "hello"
+            }],
             "the OLTP store auto-registered as a holder (§3.4)"
         );
         assert!(
-            handle.holder_registry().is_registered(StoreKind::Oltp, "hello"),
+            handle
+                .holder_registry()
+                .is_registered(StoreKind::Oltp, "hello"),
             "no store escaped registration (opening IS registering)"
         );
 
@@ -873,13 +899,29 @@ mod tests {
         tx.stage_state_change("hello created");
         tx.emit(draft("issues.issue.created"), None).unwrap();
         tx.commit().unwrap();
-        assert_eq!(handle.outbox().outbox_depth(), 1, "one committed-but-unsent event");
+        assert_eq!(
+            handle.outbox().outbox_depth(),
+            1,
+            "one committed-but-unsent event"
+        );
 
         // (serve) one steady-state tick: relay publishes the event, the consumer processes it.
         let delivered = handle.tick();
-        assert_eq!(delivered, vec![(ConsumerName("indexer".into()), 1)], "the consumer saw 1 event");
-        assert_eq!(runs.load(Ordering::SeqCst), 1, "the handler ran exactly once");
-        assert_eq!(handle.outbox().outbox_depth(), 0, "the relay drained the outbox");
+        assert_eq!(
+            delivered,
+            vec![(ConsumerName("indexer".into()), 1)],
+            "the consumer saw 1 event"
+        );
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "the handler ran exactly once"
+        );
+        assert_eq!(
+            handle.outbox().outbox_depth(),
+            0,
+            "the relay drained the outbox"
+        );
 
         // the producer telemetry exports outbox_depth == 0 / dead_letter == 0 / lag == 0.
         let t = handle.telemetry();
@@ -890,7 +932,11 @@ mod tests {
         // (graceful drain) — finishes in-flight, leaves depth 0.
         handle.signal_drain();
         let final_t = handle.drain();
-        assert_eq!(final_t.outbox_depth(), 0, "graceful drain leaves outbox_depth == 0");
+        assert_eq!(
+            final_t.outbox_depth(),
+            0,
+            "graceful drain leaves outbox_depth == 0"
+        );
     }
 
     /// `serve` runs the whole lifecycle end-to-end and returns Ok on a clean drain (the CDC
@@ -953,14 +999,26 @@ mod tests {
         tx.emit(draft("issues.issue.created"), None).unwrap();
         tx.emit(draft("issues.issue.updated"), None).unwrap();
         tx.commit().unwrap();
-        assert_eq!(handle.outbox().outbox_depth(), 2, "two in-flight events at drain time");
+        assert_eq!(
+            handle.outbox().outbox_depth(),
+            2,
+            "two in-flight events at drain time"
+        );
 
         handle.signal_drain();
         assert!(handle.is_draining(), "intake is stopped");
         let final_t = handle.drain();
         // in-flight finished: both events published + delivered, depth 0.
-        assert_eq!(final_t.outbox_depth(), 0, "drain finished the in-flight events");
-        assert_eq!(runs.load(Ordering::SeqCst), 2, "both in-flight events were delivered before exit");
+        assert_eq!(
+            final_t.outbox_depth(),
+            0,
+            "drain finished the in-flight events"
+        );
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            2,
+            "both in-flight events were delivered before exit"
+        );
     }
 
     /// A redelivery during the lifecycle is deduped (the consumer runtime's idempotency, P-S08,
@@ -993,7 +1051,11 @@ mod tests {
 
         handle.tick(); // first delivery: handler runs once.
         handle.tick(); // the same published event is re-delivered → deduped, handler does NOT re-run.
-        assert_eq!(runs.load(Ordering::SeqCst), 1, "the redelivery was deduped (handler ran once)");
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "the redelivery was deduped (handler ran once)"
+        );
     }
 
     /// The forward-only migration runner REJECTS a destructive (DROP) migration at boot —
@@ -1015,7 +1077,10 @@ mod tests {
             critical: CriticalDependencies::default(),
         };
         match boot(spec) {
-            Err(e) => assert!(e.0.contains("forward-only"), "the error names the forward-only rule"),
+            Err(e) => assert!(
+                e.0.contains("forward-only"),
+                "the error names the forward-only rule"
+            ),
             Ok(_) => panic!("a destructive migration must fail boot"),
         }
     }
@@ -1027,11 +1092,17 @@ mod tests {
         let mut runner = MigrationRunner::new();
         let migrations = Migrations::of([
             Migration::plain("0000_outbox", myelin_events::OUTBOX_MIGRATION),
-            Migration::plain("0001_consumer_dedup", myelin_events::CONSUMER_DEDUP_MIGRATION),
+            Migration::plain(
+                "0001_consumer_dedup",
+                myelin_events::CONSUMER_DEDUP_MIGRATION,
+            ),
             Migration::plain("0010_svc", "CREATE TABLE IF NOT EXISTS svc (id TEXT)"),
         ]);
         runner.run(&migrations, &HotTables::none()).unwrap();
-        assert_eq!(runner.applied(), &["0000_outbox", "0001_consumer_dedup", "0010_svc"]);
+        assert_eq!(
+            runner.applied(),
+            &["0000_outbox", "0001_consumer_dedup", "0010_svc"]
+        );
     }
 
     /// A poison event during the lifecycle dead-letters (the consumer runtime, P-S08, wired
@@ -1083,8 +1154,16 @@ mod tests {
         // the tick delivers the poison; it dead-letters (terminal) but the lifecycle continues +
         // drains cleanly (the relay still drained the outbox to 0).
         handle.tick();
-        assert_eq!(runs.load(Ordering::SeqCst), 1, "the handler poisoned exactly once");
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "the handler poisoned exactly once"
+        );
         let final_t = handle.drain();
-        assert_eq!(final_t.outbox_depth(), 0, "the outbox drained even though the consumer poisoned");
+        assert_eq!(
+            final_t.outbox_depth(),
+            0,
+            "the outbox drained even though the consumer poisoned"
+        );
     }
 }

@@ -55,16 +55,30 @@ fn cdc_10_4_deadline_timer_arm_fire_warning_signal() {
     // ── provider fires the warning Signal at the nearing-deadline point. ──
     let warning_at = deadline - thr.warning_margin_secs;
     let fired: Vec<DsrDeadlineWarning> = timer.tick_at(warning_at);
-    assert_eq!(fired.len(), 1, "the warning Signal fires at the nearing-deadline point");
+    assert_eq!(
+        fired.len(),
+        1,
+        "the warning Signal fires at the nearing-deadline point"
+    );
 
     // ── consumer: the warning-Signal consumer reads the PII-free fields. ──
     let w = &fired[0];
-    assert_eq!(w.dsr_id, dsr(0), "the opaque DSR id (the consumer resolves the subject behind it)");
+    assert_eq!(
+        w.dsr_id,
+        dsr(0),
+        "the opaque DSR id (the consumer resolves the subject behind it)"
+    );
     assert_eq!(w.tenant, tenant(), "the PII-free tenant token");
-    assert_eq!(w.deadline_secs, deadline, "the deadline the warning is racing");
+    assert_eq!(
+        w.deadline_secs, deadline,
+        "the deadline the warning is racing"
+    );
     // the `dsr_deadline_margin` (§1.8) — positive: the warning fires BEFORE the deadline.
     assert_eq!(w.margin_remaining_secs, thr.warning_margin_secs);
-    assert!(w.margin_remaining_secs > 0, "0 silent misses: the warning fires before the deadline");
+    assert!(
+        w.margin_remaining_secs > 0,
+        "0 silent misses: the warning fires before the deadline"
+    );
 
     // the signal NAME + UNIT are the frozen §1.8 anchor (the consumer keys telemetry off it).
     assert_eq!(DSR_DEADLINE_MARGIN, ("gdpr.dsr_deadline_margin", "secs"));
@@ -89,7 +103,11 @@ fn cdc_10_4_deadline_timer_survives_a_restart() {
     let mut restarted = DsrDeadlineTimer::new(TestClock::at(warning_at), thr);
     restarted.restore_wheel(DsrTimerWheel::restore(rows));
     let fired = restarted.tick();
-    assert_eq!(fired.len(), 1, "the restored timer fires — the restart lost nothing");
+    assert_eq!(
+        fired.len(),
+        1,
+        "the restored timer fires — the restart lost nothing"
+    );
     assert_eq!(fired[0].dsr_id, dsr(0));
 }
 
@@ -104,7 +122,11 @@ fn cdc_10_4_deadline_timer_extension_records_a_reason() {
 
     let reason = "complex: multi-jurisdiction member iteration".to_string();
     let extended = timer.extend_deadline(&dsr(0), t0, reason.clone()).unwrap();
-    assert_eq!(extended, t0 + thr.extension_total_secs, "extended to the 3-month total");
+    assert_eq!(
+        extended,
+        t0 + thr.extension_total_secs,
+        "extended to the 3-month total"
+    );
     // the recorded reason is on the entry (Art. 12(3) — extension reasons are recorded).
     assert_eq!(timer.wheel().extension_reason_for(&dsr(0)), Some(reason));
 }

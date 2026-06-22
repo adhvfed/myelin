@@ -58,7 +58,10 @@ fn viewer(id: &str) -> Principal {
     Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant())
 }
 fn strong(zk: &str) -> Consistency {
-    Consistency { at_least: Zookie(zk.into()), mode: ConsistencyMode::Strong }
+    Consistency {
+        at_least: Zookie(zk.into()),
+        mode: ConsistencyMode::Strong,
+    }
 }
 fn confidential_issue() -> ArtifactRef {
     ArtifactRef("myelin://acme/issue/issue/ENG-secret".into())
@@ -74,7 +77,10 @@ struct DrillResolver {
 }
 impl DrillResolver {
     fn allow(&self, viewer_id: &str, r: &ArtifactRef) {
-        self.allowed.lock().unwrap().push((viewer_id.into(), r.0.clone()));
+        self.allowed
+            .lock()
+            .unwrap()
+            .push((viewer_id.into(), r.0.clone()));
     }
     fn erase(&self, r: &ArtifactRef) {
         self.erased.lock().unwrap().push(r.0.clone());
@@ -181,7 +187,10 @@ fn notif_d4_zero_title_leak_across_viewers_channels_reasons() {
                     tombstone_present += 1;
                 }
                 // a denied ref is never routable — no link to leak a route.
-                assert!(h.links.is_empty(), "a denied subject yields no link (reason={key}, channel={channel:?})");
+                assert!(
+                    h.links.is_empty(),
+                    "a denied subject yields no link (reason={key}, channel={channel:?})"
+                );
             }
         }
     }
@@ -220,8 +229,15 @@ fn notif_d4_permitted_viewer_sees_the_title() {
         &strong("z1"),
         Channel::Cli,
     );
-    assert!(h.text.contains(SECRET_TITLE), "the permitted viewer sees the title (the gate is real)");
-    assert_eq!(h.links, vec![subject.0], "the allowed branch yields the click-route link");
+    assert!(
+        h.text.contains(SECRET_TITLE),
+        "the permitted viewer sees the title (the gate is real)"
+    );
+    assert_eq!(
+        h.links,
+        vec![subject.0],
+        "the allowed branch yields the click-route link"
+    );
 }
 
 /// **An erased actor → `[erased user]` (0 PII leak; the erasure-safe property — references not
@@ -244,7 +260,11 @@ fn notif_d4_erased_actor_is_erased_user_zero_pii() {
         &strong("z1"),
         Channel::Email,
     );
-    assert!(h.text.contains("[erased user]"), "an erased actor renders [erased user], got `{}`", h.text);
+    assert!(
+        h.text.contains("[erased user]"),
+        "an erased actor renders [erased user], got `{}`",
+        h.text
+    );
     assert!(h.links.is_empty(), "an erased ref is not routable");
 }
 

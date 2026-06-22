@@ -462,7 +462,11 @@ mod tests {
 
         // A BoundedStale read routes to the replica…
         let route = s5.route(&bounded_stale());
-        assert_eq!(route, ReadRoute::Replica, "a default-consistency read is served from S5");
+        assert_eq!(
+            route,
+            ReadRoute::Replica,
+            "a default-consistency read is served from S5"
+        );
         assert!(route.is_replica());
         // …and the row is served off S5.
         assert_eq!(
@@ -484,7 +488,11 @@ mod tests {
 
         // A Strong read does NOT route to the replica — it routes to the primary (bypass).
         let route = s5.route(&strong());
-        assert_eq!(route, ReadRoute::Primary, "a zookie-stamped read bypasses S5");
+        assert_eq!(
+            route,
+            ReadRoute::Primary,
+            "a zookie-stamped read bypasses S5"
+        );
         assert!(route.is_primary());
         // The bypass is the load-bearing decision: the caller runs the authoritative primary read on
         // `Primary` and never consults S5's (possibly stale) row. (We assert the route, not a stale
@@ -497,7 +505,10 @@ mod tests {
     fn s5_is_read_only_a_write_attempt_errors() {
         let s5 = AuthzReadReplica::new();
         let r = s5.reject_write();
-        assert!(r.is_err(), "a direct write to S5 is rejected (read-only replica)");
+        assert!(
+            r.is_err(),
+            "a direct write to S5 is rejected (read-only replica)"
+        );
         assert_eq!(r.unwrap_err(), ReplicaWriteRejected);
     }
 
@@ -518,7 +529,11 @@ mod tests {
 
         // Replicate a remove → the row is tombstoned (the JOIN/read stops returning it).
         s5.replicate(&acme, "remove", row("p:alice", "active"), 6);
-        assert_eq!(s5.read(&acme, "p:alice"), None, "a removed grant is gone from the replica");
+        assert_eq!(
+            s5.read(&acme, "p:alice"),
+            None,
+            "a removed grant is gone from the replica"
+        );
     }
 
     /// **The replication apply is idempotent + the applied offset advances monotonically.** A
@@ -530,14 +545,22 @@ mod tests {
         s5.replicate(&acme, "add", row("p:alice", "active"), 5);
         s5.replicate(&acme, "add", row("p:alice", "active"), 5); // re-apply
         assert_eq!(s5.row_count(&acme), 1, "a re-add is idempotent (one row)");
-        assert_eq!(s5.applied_offset(&acme), 5, "the offset is at the latest applied delta");
+        assert_eq!(
+            s5.applied_offset(&acme),
+            5,
+            "the offset is at the latest applied delta"
+        );
 
         // A later delta advances the offset…
         s5.replicate(&acme, "add", row("p:bob", "active"), 7);
         assert_eq!(s5.applied_offset(&acme), 7);
         // …an older redelivery never moves it backward.
         s5.replicate(&acme, "add", row("p:carol", "active"), 3);
-        assert_eq!(s5.applied_offset(&acme), 7, "an older redelivery never regresses the offset");
+        assert_eq!(
+            s5.applied_offset(&acme),
+            7,
+            "an older redelivery never regresses the offset"
+        );
     }
 
     /// **No cross-tenant query path — S5 inherits the primary's RLS partitioning.** A row replicated
@@ -551,8 +574,16 @@ mod tests {
         s5.replicate(&acme, "add", row("p:alice", "active"), 5);
 
         assert_eq!(s5.row_count(&globex), 0, "0 cross-tenant replica rows");
-        assert_eq!(s5.read(&globex, "p:alice"), None, "no cross-tenant replica read path");
-        assert_eq!(s5.applied_offset(&globex), 0, "globex's offset is untouched by acme's replication");
+        assert_eq!(
+            s5.read(&globex, "p:alice"),
+            None,
+            "no cross-tenant replica read path"
+        );
+        assert_eq!(
+            s5.applied_offset(&globex),
+            0,
+            "globex's offset is untouched by acme's replication"
+        );
         // acme sees its own row.
         assert_eq!(s5.row_count(&acme), 1);
     }
@@ -563,7 +594,11 @@ mod tests {
     #[test]
     fn s5_auto_registers_as_a_personal_data_holder() {
         let s5 = AuthzReadReplica::new();
-        assert_eq!(s5.holder().store, S5_HOLDER, "S5 registered under its holder name");
+        assert_eq!(
+            s5.holder().store,
+            S5_HOLDER,
+            "S5 registered under its holder name"
+        );
         let receipt = s5.holder().register();
         assert_eq!(receipt.store, S5_HOLDER);
     }
@@ -578,8 +613,16 @@ mod tests {
         let _ = s5.route(&bounded_stale());
         let _ = s5.route(&strong());
         let t = s5.telemetry();
-        assert_eq!(t.served_from_replica(), 2, "two default-consistency reads served from S5");
-        assert_eq!(t.routed_to_primary(), 1, "one zookie read bypassed to the primary");
+        assert_eq!(
+            t.served_from_replica(),
+            2,
+            "two default-consistency reads served from S5"
+        );
+        assert_eq!(
+            t.routed_to_primary(),
+            1,
+            "one zookie read bypassed to the primary"
+        );
     }
 
     /// **The world-scale tunables floor is recorded (→ P-ID-31).** The replication-lag staleness
@@ -588,7 +631,8 @@ mod tests {
     #[test]
     fn world_scale_lag_tunable_is_the_named_default_to_beat() {
         assert_eq!(
-            AuthzReadReplica::DEFAULT_MAX_REPLICATION_LAG_SECS, 30,
+            AuthzReadReplica::DEFAULT_MAX_REPLICATION_LAG_SECS,
+            30,
             "the replication-lag staleness budget is the engineering seed (re-measured at P-ID-31)"
         );
     }

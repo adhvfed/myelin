@@ -245,7 +245,11 @@ impl ErasureLedger {
 
     /// The completion entry for a DSR, if recorded (a read-only snapshot).
     pub fn entry(&self, dsr_id: &DsrId) -> Option<ErasureLedgerEntry> {
-        self.entries.lock().unwrap_or_else(|e| e.into_inner()).get(dsr_id).cloned()
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(dsr_id)
+            .cloned()
     }
 
     /// The number of completed-erasure records held (the `erasure_ledger_entries` telemetry signal).
@@ -255,7 +259,10 @@ impl ErasureLedger {
 
     /// `true` iff the ledger holds no records.
     pub fn is_empty(&self) -> bool {
-        self.entries.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
     }
 
     /// **The re-erasure-trigger read (§4.4 / GD-14) — every erasure completed AFTER `pit`.**
@@ -350,7 +357,11 @@ impl PersonalDataHolder for ErasureLedger {
     fn restrict(&self, _subject: &SubjectRef, on: bool) -> DsrResult<RestrictReceipt> {
         // A PII-free record has no PII to suppress; the restrict op is a no-op acknowledgement (it
         // never indexes/agent-reads the record, so there is nothing to restrict).
-        let outcome = if on { "restricted:noop-pii-free" } else { "restricted:clear-noop" };
+        let outcome = if on {
+            "restricted:noop-pii-free"
+        } else {
+            "restricted:clear-noop"
+        };
         Ok(RestrictReceipt {
             receipt: Receipt::content_addressed(
                 "restrict",
@@ -401,11 +412,18 @@ mod tests {
     }
 
     fn subject_ref(id: &str) -> SubjectRef {
-        SubjectRef::new(Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant()))
+        SubjectRef::new(Principal::stub(
+            PrincipalId(id.into()),
+            PrincipalKind::Human,
+            tenant(),
+        ))
     }
 
     fn epoch(holder: &str, e: Option<u64>) -> DestroyedKeyEpoch {
-        DestroyedKeyEpoch { holder_id: holder.into(), key_epoch_destroyed: e }
+        DestroyedKeyEpoch {
+            holder_id: holder.into(),
+            key_epoch_destroyed: e,
+        }
     }
 
     // ───────────── the ledger schema is PII-FREE (the architecture test) ─────────────
@@ -433,7 +451,10 @@ mod tests {
         };
         // The subject is an opaque token — there is no SubjectRef/Principal/email/name field to leak.
         assert_eq!(entry.subject_token, "p-opaque-123");
-        assert!(!entry.subject_token.contains('@'), "no email form in the subject token");
+        assert!(
+            !entry.subject_token.contains('@'),
+            "no email form in the subject token"
+        );
         // The exhaustive field list (this destructure FAILS TO COMPILE if a new field is added —
         // forcing a reviewer to confirm any new field is PII-free).
         let ErasureLedgerEntry {
@@ -458,7 +479,10 @@ mod tests {
             "p-7".into(),
             "acme".into(),
             vec!["oltp:identity_oltp".into(), "blob:blob_store".into()],
-            vec![epoch("oltp:identity_oltp", Some(7)), epoch("blob:blob_store", Some(9))],
+            vec![
+                epoch("oltp:identity_oltp", Some(7)),
+                epoch("blob:blob_store", Some(9)),
+            ],
             140,
             1_700_000_000,
         );
@@ -484,19 +508,42 @@ mod tests {
         let ledger = ErasureLedger::new();
         let id = DsrId("dsr:2".into());
         assert!(ledger.record_completion(
-            id.clone(), "p-9".into(), "acme".into(),
-            vec!["a".into()], vec![epoch("a", Some(1))], 100, 500,
+            id.clone(),
+            "p-9".into(),
+            "acme".into(),
+            vec!["a".into()],
+            vec![epoch("a", Some(1))],
+            100,
+            500,
         ));
         // A re-completion (restart) with DIFFERENT later facts is a NO-OP (returns false; original kept).
-        assert!(!ledger.record_completion(
-            id.clone(), "p-9".into(), "acme".into(),
-            vec!["a".into(), "b".into()], vec![epoch("a", Some(1)), epoch("b", Some(2))], 200, 999,
-        ), "a duplicate completion is a no-op");
+        assert!(
+            !ledger.record_completion(
+                id.clone(),
+                "p-9".into(),
+                "acme".into(),
+                vec!["a".into(), "b".into()],
+                vec![epoch("a", Some(1)), epoch("b", Some(2))],
+                200,
+                999,
+            ),
+            "a duplicate completion is a no-op"
+        );
         assert_eq!(ledger.len(), 1, "no duplicate entry");
         let e = ledger.entry(&id).unwrap();
-        assert_eq!(e.completed_at_offset, 100, "the FIRST completion's offset is retained");
-        assert_eq!(e.completed_at_secs, 500, "the FIRST completion's time is retained");
-        assert_eq!(e.holders_erased, vec!["a".to_string()], "the first holder set is retained");
+        assert_eq!(
+            e.completed_at_offset, 100,
+            "the FIRST completion's offset is retained"
+        );
+        assert_eq!(
+            e.completed_at_secs, 500,
+            "the FIRST completion's time is retained"
+        );
+        assert_eq!(
+            e.holders_erased,
+            vec!["a".to_string()],
+            "the first holder set is retained"
+        );
     }
 
     // ───────────── the re-erasure-trigger read: ONLY post-PIT erasures ─────────────
@@ -508,10 +555,42 @@ mod tests {
     #[test]
     fn post_pit_records_selects_only_post_pit_erasures() {
         let ledger = ErasureLedger::new();
-        ledger.record_completion(DsrId("dsr:a".into()), "pre".into(), "acme".into(), vec![], vec![], 50, 0);
-        ledger.record_completion(DsrId("dsr:b".into()), "at".into(), "acme".into(), vec![], vec![], 100, 0);
-        ledger.record_completion(DsrId("dsr:c".into()), "post".into(), "acme".into(), vec![], vec![], 140, 0);
-        ledger.record_completion(DsrId("dsr:d".into()), "later".into(), "acme".into(), vec![], vec![], 200, 0);
+        ledger.record_completion(
+            DsrId("dsr:a".into()),
+            "pre".into(),
+            "acme".into(),
+            vec![],
+            vec![],
+            50,
+            0,
+        );
+        ledger.record_completion(
+            DsrId("dsr:b".into()),
+            "at".into(),
+            "acme".into(),
+            vec![],
+            vec![],
+            100,
+            0,
+        );
+        ledger.record_completion(
+            DsrId("dsr:c".into()),
+            "post".into(),
+            "acme".into(),
+            vec![],
+            vec![],
+            140,
+            0,
+        );
+        ledger.record_completion(
+            DsrId("dsr:d".into()),
+            "later".into(),
+            "acme".into(),
+            vec![],
+            vec![],
+            200,
+            0,
+        );
 
         let after = ledger.post_pit_records_after(100);
         let subjects: Vec<&str> = after.iter().map(|r| r.subject.as_str()).collect();
@@ -528,20 +607,55 @@ mod tests {
     #[test]
     fn a_tenant_offboarding_is_not_a_per_subject_post_pit_record() {
         let ledger = ErasureLedger::new();
-        ledger.record_completion(DsrId("dsr:off".into()), "*".into(), "acme".into(), vec![], vec![], 140, 0);
-        ledger.record_completion(DsrId("dsr:sub".into()), "p-1".into(), "acme".into(), vec![], vec![], 140, 0);
-        assert_eq!(ledger.len(), 2, "both are recorded (the offboarding IS in the ledger for audit)");
+        ledger.record_completion(
+            DsrId("dsr:off".into()),
+            "*".into(),
+            "acme".into(),
+            vec![],
+            vec![],
+            140,
+            0,
+        );
+        ledger.record_completion(
+            DsrId("dsr:sub".into()),
+            "p-1".into(),
+            "acme".into(),
+            vec![],
+            vec![],
+            140,
+            0,
+        );
+        assert_eq!(
+            ledger.len(),
+            2,
+            "both are recorded (the offboarding IS in the ledger for audit)"
+        );
         let after = ledger.post_pit_records_after(100);
         let subjects: Vec<&str> = after.iter().map(|r| r.subject.as_str()).collect();
-        assert_eq!(subjects, vec!["p-1"], "only the per-subject erasure is a re-erasure target");
+        assert_eq!(
+            subjects,
+            vec!["p-1"],
+            "only the per-subject erasure is a re-erasure target"
+        );
     }
 
     /// A subject erased BEFORE the backup is NOT in the post-PIT set (already dead by construction).
     #[test]
     fn a_pre_pit_erasure_is_not_a_re_erasure_target() {
         let ledger = ErasureLedger::new();
-        ledger.record_completion(DsrId("dsr:pre".into()), "p-pre".into(), "acme".into(), vec![], vec![], 60, 0);
-        assert!(ledger.post_pit_records_after(100).is_empty(), "a pre-PIT erasure is not re-applied");
+        ledger.record_completion(
+            DsrId("dsr:pre".into()),
+            "p-pre".into(),
+            "acme".into(),
+            vec![],
+            vec![],
+            60,
+            0,
+        );
+        assert!(
+            ledger.post_pit_records_after(100).is_empty(),
+            "a pre-PIT erasure is not re-applied"
+        );
     }
 
     /// The len/is_empty accessors are exact (they feed the telemetry + drill assertions).
@@ -550,7 +664,15 @@ mod tests {
         let ledger = ErasureLedger::new();
         assert!(ledger.is_empty());
         assert_eq!(ledger.len(), 0);
-        ledger.record_completion(DsrId("dsr:1".into()), "p".into(), "acme".into(), vec![], vec![], 10, 0);
+        ledger.record_completion(
+            DsrId("dsr:1".into()),
+            "p".into(),
+            "acme".into(),
+            vec![],
+            vec![],
+            10,
+            0,
+        );
         assert!(!ledger.is_empty());
         assert_eq!(ledger.len(), 1);
     }
@@ -565,7 +687,10 @@ mod tests {
     fn the_ledger_erase_is_a_non_shred_erasable_carve_out() {
         let ledger = ErasureLedger::new();
         let receipt = ledger
-            .erase(EraseScope::Subject { subject: subject_ref("p-1"), tenant: tenant() })
+            .erase(EraseScope::Subject {
+                subject: subject_ref("p-1"),
+                tenant: tenant(),
+            })
             .unwrap();
         assert_eq!(
             receipt.receipt.key_epoch_destroyed, None,
@@ -573,9 +698,26 @@ mod tests {
         );
         assert_eq!(receipt.receipt.operation, "erase");
         // and a record written BEFORE the erase still survives the erase (the record is retained).
-        ledger.record_completion(DsrId("dsr:1".into()), "p-1".into(), "acme".into(), vec![], vec![], 140, 0);
-        ledger.erase(EraseScope::Subject { subject: subject_ref("p-1"), tenant: tenant() }).unwrap();
-        assert_eq!(ledger.len(), 1, "the erase RETAINS the record (it drives re-erasure)");
+        ledger.record_completion(
+            DsrId("dsr:1".into()),
+            "p-1".into(),
+            "acme".into(),
+            vec![],
+            vec![],
+            140,
+            0,
+        );
+        ledger
+            .erase(EraseScope::Subject {
+                subject: subject_ref("p-1"),
+                tenant: tenant(),
+            })
+            .unwrap();
+        assert_eq!(
+            ledger.len(),
+            1,
+            "the erase RETAINS the record (it drives re-erasure)"
+        );
         assert!(
             !ledger.post_pit_records_after(100).is_empty(),
             "the retained record STILL drives re-erasure after the subject's erase"
@@ -590,11 +732,28 @@ mod tests {
         let loc = ledger.locate(&subject_ref("p-1"), tenant()).unwrap();
         assert_eq!(
             loc.receipt.content_hash,
-            Receipt::content_addressed("locate", ERASURE_LEDGER_STORE, "*", "acme", "located:0-recoverable", None, 0).content_hash,
+            Receipt::content_addressed(
+                "locate",
+                ERASURE_LEDGER_STORE,
+                "*",
+                "acme",
+                "located:0-recoverable",
+                None,
+                0
+            )
+            .content_hash,
         );
         assert!(ledger.export(&subject_ref("p-1"), tenant()).is_ok());
-        assert!(ledger.rectify(&subject_ref("p-1"), Patch("x".into())).is_err(), "the ledger is NEVER rectified");
-        assert!(ledger.restrict(&subject_ref("p-1"), true).is_ok(), "restrict is a no-op ack");
+        assert!(
+            ledger
+                .rectify(&subject_ref("p-1"), Patch("x".into()))
+                .is_err(),
+            "the ledger is NEVER rectified"
+        );
+        assert!(
+            ledger.restrict(&subject_ref("p-1"), true).is_ok(),
+            "restrict is a no-op ack"
+        );
     }
 
     /// The telemetry signal name + unit are pinned (the `erasure_ledger_entries` SLO).

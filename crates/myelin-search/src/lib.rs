@@ -145,7 +145,7 @@ pub use consistency::{
     disposition, fail_static_bypass, stale_candidates, BoundedCheckPort, CandidateDisposition,
     ConsistencyStats,
 };
-pub use dek::{srch_p03_inherited_gates, hyok_skips_index, InheritedGate, SearchDekPin};
+pub use dek::{hyok_skips_index, srch_p03_inherited_gates, InheritedGate, SearchDekPin};
 pub use engine::{
     AclFilter, Hit, IndexBackend, IndexDocument, IndexError, SubjectMatcher, TantivyBackend,
     DEFAULT_SUBJECT_LOCATOR_FACETS, ORDER_KEY_FIELD,
@@ -154,20 +154,20 @@ pub use erase::{EraseOutcome, SearchEraseHolder, SEARCH_ERASE_EVENT_TYPE};
 pub use erasure_posture::{erasure_posture, ErasurePosture};
 pub use fusion::{fuse_with_k, reciprocal_rank_fusion, FusedHit, RankedList, RRF_K};
 pub use git_code_projection::{
-    git_blob_search_projection, git_code_projection_spec, git_index_specs, register_git_index_specs,
-    trigram_query, trigrams, GitBlobProjectionInput, ScipLsifFindUsagesFloor,
-    FACET_BLOB_OID as GIT_FACET_BLOB_OID, FACET_LANGUAGE as GIT_FACET_LANGUAGE,
-    FACET_PATH as GIT_FACET_PATH, GIT_BLOB_ACL_OBJECT_TYPE, GIT_BLOB_TYPE, GIT_SUBSYSTEM,
-    TRIGRAM_N,
+    git_blob_search_projection, git_code_projection_spec, git_index_specs,
+    register_git_index_specs, trigram_query, trigrams, GitBlobProjectionInput,
+    ScipLsifFindUsagesFloor, FACET_BLOB_OID as GIT_FACET_BLOB_OID,
+    FACET_LANGUAGE as GIT_FACET_LANGUAGE, FACET_PATH as GIT_FACET_PATH, GIT_BLOB_ACL_OBJECT_TYPE,
+    GIT_BLOB_TYPE, GIT_SUBSYSTEM, TRIGRAM_N,
+};
+pub use holder::{
+    register_search_holder, search_index_holder, SearchHolderRegistration, SearchIndexHolder,
+    SEARCH_INDEX_STORE,
 };
 pub use indexer::{
     EmbeddingAdapter, IncrementalIndexer, IndexEventError, IndexSpec, MockEmbeddingAdapter,
     ProjectFetchError, ProjectFetcher, SearchProjection, INDEXER_CONSUMER,
     INDEXER_SUBJECT_PREFIXES,
-};
-pub use holder::{
-    register_search_holder, search_index_holder, SearchHolderRegistration, SearchIndexHolder,
-    SEARCH_INDEX_STORE,
 };
 pub use kn_projection::{
     kn_db_row_index_spec, kn_index_specs, kn_page_index_spec, page_search_projection,
@@ -180,8 +180,8 @@ pub use layout::{
 };
 pub use pipeline::{
     query, query_consistent, semantic, ListObjectsPort, Page, QueryError, QueryStats, RankedResult,
-    RankedResults, RelationalLeaf, ReverseIndexAnswer, RevisionWatermark, ScopedEngine, VectorQuery,
-    READ_PERMISSION,
+    RankedResults, RelationalLeaf, ReverseIndexAnswer, RevisionWatermark, ScopedEngine,
+    VectorQuery, READ_PERMISSION,
 };
 pub use reindex::{
     ReindexCursorStore, ReindexError, ReindexJob, ReindexProgress, SearchReindexer,
@@ -294,9 +294,7 @@ mod tests {
     /// a value (a rename of a struct field stops this constructor compiling — the names/units
     /// drift is caught at compile time, the value-level assertions catch a wire/serde rename).
     fn sample_envelope() -> EventEnvelope {
-        use myelin_events::{
-            Actor, AggregateKey, CorrelationId, EventId, EventType, Timestamp,
-        };
+        use myelin_events::{Actor, AggregateKey, CorrelationId, EventId, EventType, Timestamp};
         use myelin_identity::{Principal, PrincipalId, PrincipalKind};
         EventEnvelope {
             event_id: EventId("01J0".into()),
@@ -304,7 +302,11 @@ mod tests {
             schema_ver: 1,
             tenant: TenantId("acme".into()),
             region: Region("eu-west".into()),
-            actor: Actor(Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId("acme".into()))),
+            actor: Actor(Principal::stub(
+                PrincipalId("p".into()),
+                PrincipalKind::Human,
+                TenantId("acme".into()),
+            )),
             subject: ArtifactRef("myelin://acme/issues/issue/ENG-1421".into()),
             aggregate: AggregateKey("issue:ENG-1421".into()),
             causation_id: None,
@@ -358,7 +360,9 @@ mod tests {
         let subject = &env.subject;
         assert_eq!(
             subject.0,
-            obj["subject"].as_str().expect("subject serialises as a string"),
+            obj["subject"]
+                .as_str()
+                .expect("subject serialises as a string"),
             "doc_id is the ArtifactRef key string verbatim (architecture §3.1)"
         );
 
@@ -378,7 +382,11 @@ mod tests {
     fn the_named_anchor_set_is_the_prompt_enumerated_core() {
         // doc_id / tenant / region / indexed_zookie / version / lang + the three always-present
         // GDPR routing fields = the nine the prompt's TESTS field names.
-        assert_eq!(INDEX_DOC_ANCHORS.len(), 9, "the named-anchor core is exactly nine");
+        assert_eq!(
+            INDEX_DOC_ANCHORS.len(),
+            9,
+            "the named-anchor core is exactly nine"
+        );
         let mut sorted = INDEX_DOC_ANCHORS.to_vec();
         sorted.sort_unstable();
         sorted.dedup();

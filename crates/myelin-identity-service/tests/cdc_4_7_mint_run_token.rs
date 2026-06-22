@@ -120,7 +120,12 @@ fn cdc_4_7_minted_token_honoured_within_run_life() {
             &RunId("run-1".into()),
             &agent("p:agent", "acme"),
             &human("p:human", "acme"),
-            &input(&["repo:acme/web#read"], &["repo:acme/web#read"], &["repo:acme/web#read"], &["repo:acme/web#read"]),
+            &input(
+                &["repo:acme/web#read"],
+                &["repo:acme/web#read"],
+                &["repo:acme/web#read"],
+                &["repo:acme/web#read"],
+            ),
             &caveats(&["repo:acme/web#read"]),
             MachineKind::Agent,
             &ttl(300),
@@ -184,7 +189,12 @@ fn cdc_4_7_self_hosted_runner_token_is_one_tenant_scoped() {
         &RunId("run-1".into()),
         &agent("svc:runner", "acme"),
         &human("p:human", "acme"),
-        &input(&["selfhosted:acme"], &["selfhosted:acme"], &["selfhosted:acme"], &["selfhosted:acme"]),
+        &input(
+            &["selfhosted:acme"],
+            &["selfhosted:acme"],
+            &["selfhosted:acme"],
+            &["selfhosted:acme"],
+        ),
         &caveats(&["selfhosted:acme"]),
         MachineKind::PerJob,
         &ttl(300),
@@ -198,7 +208,12 @@ fn cdc_4_7_self_hosted_runner_token_is_one_tenant_scoped() {
         &RunId("run-2".into()),
         &agent("svc:runner", "acme"),
         &human("p:human", "acme"),
-        &input(&["selfhosted:globex"], &["selfhosted:globex"], &["selfhosted:globex"], &["selfhosted:globex"]),
+        &input(
+            &["selfhosted:globex"],
+            &["selfhosted:globex"],
+            &["selfhosted:globex"],
+            &["selfhosted:globex"],
+        ),
         &caveats(&["selfhosted:globex"]),
         MachineKind::PerJob,
         &ttl(300),
@@ -223,22 +238,49 @@ fn cdc_4_7_re_mint_on_resume_yields_a_fresh_token() {
 
     let dispatch = svc
         .mint_run_token_in(
-            &s, &agent_id, &run, &agent("p:agent", "acme"), &human("p:human", "acme"),
-            &input(&["g:read", "g:write"], &["g:read", "g:write"], &["g:read", "g:write"], &["g:read", "g:write"]),
-            &caveats(&["g:read", "g:write"]), MachineKind::Agent, &ttl(300), &ts("2026-06-19T00:00:00Z"),
+            &s,
+            &agent_id,
+            &run,
+            &agent("p:agent", "acme"),
+            &human("p:human", "acme"),
+            &input(
+                &["g:read", "g:write"],
+                &["g:read", "g:write"],
+                &["g:read", "g:write"],
+                &["g:read", "g:write"],
+            ),
+            &caveats(&["g:read", "g:write"]),
+            MachineKind::Agent,
+            &ttl(300),
+            &ts("2026-06-19T00:00:00Z"),
         )
         .expect("dispatch mint");
 
     // Days later the workflow resumes; the delegator lost g:write in the interim.
     let resumed = svc
         .re_mint_run_token_in(
-            &s, &agent_id, &run, &agent("p:agent", "acme"), &human("p:human", "acme"),
-            &input(&["g:read", "g:write"], &["g:read", "g:write"], &["g:read", "g:write"], &["g:read"]),
-            &caveats(&["g:read", "g:write"]), MachineKind::Agent, &ttl(300), &ts("2026-06-22T09:00:00Z"),
+            &s,
+            &agent_id,
+            &run,
+            &agent("p:agent", "acme"),
+            &human("p:human", "acme"),
+            &input(
+                &["g:read", "g:write"],
+                &["g:read", "g:write"],
+                &["g:read", "g:write"],
+                &["g:read"],
+            ),
+            &caveats(&["g:read", "g:write"]),
+            MachineKind::Agent,
+            &ttl(300),
+            &ts("2026-06-22T09:00:00Z"),
         )
         .expect("re-mint on resume");
 
-    assert_ne!(resumed.jti, dispatch.jti, "the re-mint is a fresh token (distinct jti — its own life)");
+    assert_ne!(
+        resumed.jti, dispatch.jti,
+        "the re-mint is a fresh token (distinct jti — its own life)"
+    );
     assert!(resumed.token.contains("g:read"));
     assert!(
         !resumed.token.contains("g:write"),
@@ -255,15 +297,26 @@ fn cdc_4_7_teardown_and_auto_expire_refuse_the_token() {
     let svc = provider();
     let token = svc
         .mint_run_token_in(
-            &s, &PrincipalId("p:agent".into()), &RunId("run-1".into()),
-            &agent("p:agent", "acme"), &human("p:human", "acme"),
-            &input(&["g"], &["g"], &["g"], &["g"]), &caveats(&["g"]),
-            MachineKind::Agent, &ttl(300), &ts("2026-06-19T00:00:00Z"),
+            &s,
+            &PrincipalId("p:agent".into()),
+            &RunId("run-1".into()),
+            &agent("p:agent", "acme"),
+            &human("p:human", "acme"),
+            &input(&["g"], &["g"], &["g"], &["g"]),
+            &caveats(&["g"]),
+            MachineKind::Agent,
+            &ttl(300),
+            &ts("2026-06-19T00:00:00Z"),
         )
         .expect("mint");
 
     // Live mid-run → honoured.
-    assert!(dispatch_under_token_is_honoured(&svc, &s, &token, &ts("2026-06-19T00:01:00Z")));
+    assert!(dispatch_under_token_is_honoured(
+        &svc,
+        &s,
+        &token,
+        &ts("2026-06-19T00:01:00Z")
+    ));
 
     // PROVIDER tears it down (the run ended) → CONSUMER refuses immediately.
     svc.tear_down_run_token_in(&s, &token, &ts("2026-06-19T00:01:30Z"));
@@ -275,10 +328,16 @@ fn cdc_4_7_teardown_and_auto_expire_refuse_the_token() {
     // And the auto-expire leg: a SECOND run whose teardown is SKIPPED still dies at run-life.
     let token2 = svc
         .mint_run_token_in(
-            &s, &PrincipalId("p:agent".into()), &RunId("run-2".into()),
-            &agent("p:agent", "acme"), &human("p:human", "acme"),
-            &input(&["g"], &["g"], &["g"], &["g"]), &caveats(&["g"]),
-            MachineKind::Agent, &ttl(300), &ts("2026-06-19T00:00:00Z"),
+            &s,
+            &PrincipalId("p:agent".into()),
+            &RunId("run-2".into()),
+            &agent("p:agent", "acme"),
+            &human("p:human", "acme"),
+            &input(&["g"], &["g"], &["g"], &["g"]),
+            &caveats(&["g"]),
+            MachineKind::Agent,
+            &ttl(300),
+            &ts("2026-06-19T00:00:00Z"),
         )
         .expect("mint run-2");
     // No teardown — but past run-life the consumer refuses (the auto-expire defence-in-depth).

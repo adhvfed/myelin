@@ -25,10 +25,8 @@
 //! BOTH halves over the SAME `QuietHours`, no second decision path.
 
 use myelin_notif::escalation::notify_for;
-use myelin_notif::prefs::{
-    route, Channel, NotifPrefs, QuietHours, QuietWindow, RoutingRule, Tz,
-};
 use myelin_notif::list_inbox::Subsystem;
+use myelin_notif::prefs::{route, Channel, NotifPrefs, QuietHours, QuietWindow, RoutingRule, Tz};
 use myelin_notif::{Class, Reason};
 use myelin_query::{Predicate, QueryAst};
 
@@ -41,7 +39,11 @@ fn always() -> QueryAst {
 fn dnd_quiet() -> QuietHours {
     QuietHours {
         tz: Tz::from_offset_minutes(0),
-        windows: vec![QuietWindow { from: 0, to: 1440, days: vec![] }],
+        windows: vec![QuietWindow {
+            from: 0,
+            to: 1440,
+            days: vec![],
+        }],
         // The DEFAULT pierce set — critical pierces (you cannot silence an on-call page). The drill
         // asserts the default holds; a config that dropped Critical from pierce_classes would FAIL.
         pierce_classes: vec![Class::Critical],
@@ -53,8 +55,12 @@ fn dnd_quiet() -> QuietHours {
 fn notif_d8_critical_escalation_pierces_dnd_watching_suppressed() {
     let quiet = dnd_quiet();
     // The recipient is IN a quiet window at this instant (DND covers all day).
-    let recipient_in_quiet = quiet.is_quiet_at(/* utc_minute_of_day */ 600, /* weekday */ 2);
-    assert!(recipient_in_quiet, "the recipient is in DND (the quiet window covers the instant)");
+    let recipient_in_quiet =
+        quiet.is_quiet_at(/* utc_minute_of_day */ 600, /* weekday */ 2);
+    assert!(
+        recipient_in_quiet,
+        "the recipient is in DND (the quiet window covers the instant)"
+    );
 
     // === 1) CRITICAL escalation PIERCES quiet-hours — pages every step channel despite DND ===
     let step_channels = vec![Channel::InApp, Channel::WebPush, Channel::MobilePush];
@@ -65,15 +71,24 @@ fn notif_d8_critical_escalation_pierces_dnd_watching_suppressed() {
     );
     // quiet_hours_pierce_count (§1.8): the count of off-cell channels that pierced (here all but in-app).
     let pierce_count = paged.iter().filter(|c| **c != Channel::InApp).count();
-    assert!(pierce_count >= 1, "quiet_hours_pierce_count incremented — the page pierced off-cell");
+    assert!(
+        pierce_count >= 1,
+        "quiet_hours_pierce_count incremented — the page pierced off-cell"
+    );
 
     // === 2) a WATCHING item is SUPPRESSED off-cell by the SAME quiet window (router-side route) ===
     // The recipient routes a `watching` reason to in-app + email (off-cell). Inside DND, route
     // suppresses the off-cell push and keeps ONLY the in-cell in-app (the inbox row is never lost).
     let prefs = NotifPrefs {
         routing: vec![
-            RoutingRule { channel: Channel::InApp, matcher: always() },
-            RoutingRule { channel: Channel::Email, matcher: always() },
+            RoutingRule {
+                channel: Channel::InApp,
+                matcher: always(),
+            },
+            RoutingRule {
+                channel: Channel::Email,
+                matcher: always(),
+            },
         ],
         digest: Default::default(),
     };

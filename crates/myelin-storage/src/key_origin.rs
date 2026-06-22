@@ -203,7 +203,9 @@ impl<'a> PlatformManaged<'a> {
 
 impl KeyOrigin for PlatformManaged<'_> {
     fn wrap(&self, dek: &Dek, tenant: TenantId) -> Result<WrappedDek, KeyOriginError> {
-        Ok(self.engine.wrap_dek_material(&tenant, &self.region, dek.as_bytes())?)
+        Ok(self
+            .engine
+            .wrap_dek_material(&tenant, &self.region, dek.as_bytes())?)
     }
 
     fn unwrap(&self, w: &WrappedDek, tenant: TenantId) -> Result<DekHandle, KeyOriginError> {
@@ -240,8 +242,16 @@ pub struct Byok<'a> {
 
 impl<'a> Byok<'a> {
     /// Front the engine under a customer key path.
-    pub fn new(engine: &'a KmsEngine, region: Region, customer_key_path: impl Into<String>) -> Self {
-        Byok { engine, region, customer_key_path: customer_key_path.into() }
+    pub fn new(
+        engine: &'a KmsEngine,
+        region: Region,
+        customer_key_path: impl Into<String>,
+    ) -> Self {
+        Byok {
+            engine,
+            region,
+            customer_key_path: customer_key_path.into(),
+        }
     }
 
     /// The customer key path a BYOK wrap is recorded under (the §6 "under the customer key path"
@@ -255,7 +265,9 @@ impl KeyOrigin for Byok<'_> {
     fn wrap(&self, dek: &Dek, tenant: TenantId) -> Result<WrappedDek, KeyOriginError> {
         // BYOK wraps under the customer's KEK, which is live in the engine — same engine path,
         // customer-key provenance (the customer_key_path names whose key sealed it).
-        Ok(self.engine.wrap_dek_material(&tenant, &self.region, dek.as_bytes())?)
+        Ok(self
+            .engine
+            .wrap_dek_material(&tenant, &self.region, dek.as_bytes())?)
     }
 
     fn unwrap(&self, w: &WrappedDek, tenant: TenantId) -> Result<DekHandle, KeyOriginError> {
@@ -334,18 +346,22 @@ impl<S: HyokKeyService> Hyok<S> {
 impl<S: HyokKeyService> KeyOrigin for Hyok<S> {
     fn wrap(&self, dek: &Dek, _tenant: TenantId) -> Result<WrappedDek, KeyOriginError> {
         // The wrap happens at the customer's service — Myelin never holds the key.
-        self.service.wrap(dek).map_err(|_| KeyOriginError::HyokDenied {
-            tenant: _tenant,
-            region: Region(String::new()),
-        })
+        self.service
+            .wrap(dek)
+            .map_err(|_| KeyOriginError::HyokDenied {
+                tenant: _tenant,
+                region: Region(String::new()),
+            })
     }
 
     fn unwrap(&self, w: &WrappedDek, tenant: TenantId) -> Result<DekHandle, KeyOriginError> {
         // THE CALL OUT — may deny. Myelin holds no plaintext key; it asks the customer's service.
-        self.service.unwrap(w).map_err(|_| KeyOriginError::HyokDenied {
-            tenant,
-            region: Region(String::new()),
-        })
+        self.service
+            .unwrap(w)
+            .map_err(|_| KeyOriginError::HyokDenied {
+                tenant,
+                region: Region(String::new()),
+            })
     }
 
     fn can_derive_plaintext_index(&self) -> bool {
@@ -448,7 +464,10 @@ mod tests {
     }
     impl MockHyokKeyService {
         fn new() -> Self {
-            MockHyokKeyService { revoked: std::cell::Cell::new(false), key: [7u8; KEY_LEN] }
+            MockHyokKeyService {
+                revoked: std::cell::Cell::new(false),
+                key: [7u8; KEY_LEN],
+            }
         }
     }
     impl HyokKeyService for MockHyokKeyService {
@@ -462,7 +481,11 @@ mod tests {
             for (b, k) in wrapped.iter_mut().zip(self.key.iter()) {
                 *b ^= *k;
             }
-            Ok(WrappedDek { nonce: [0u8; 12], wrapped, kek_epoch: 0 })
+            Ok(WrappedDek {
+                nonce: [0u8; 12],
+                wrapped,
+                kek_epoch: 0,
+            })
         }
         fn unwrap(&self, _w: &WrappedDek) -> Result<DekHandle, HyokServiceDenied> {
             if self.revoked.get() {
@@ -487,9 +510,18 @@ mod tests {
         let hyok = Hyok::new(MockHyokKeyService::new());
 
         // THE HEADLINE ASSERTION (the GATE): platform/BYOK = true, HYOK = false.
-        assert!(platform.can_derive_plaintext_index(), "platform-managed CAN derive a plaintext index");
-        assert!(byok.can_derive_plaintext_index(), "BYOK CAN derive while the key is live");
-        assert!(!hyok.can_derive_plaintext_index(), "HYOK can NEVER derive a plaintext index (structural)");
+        assert!(
+            platform.can_derive_plaintext_index(),
+            "platform-managed CAN derive a plaintext index"
+        );
+        assert!(
+            byok.can_derive_plaintext_index(),
+            "BYOK CAN derive while the key is live"
+        );
+        assert!(
+            !hyok.can_derive_plaintext_index(),
+            "HYOK can NEVER derive a plaintext index (structural)"
+        );
     }
 
     #[test]
@@ -506,8 +538,10 @@ mod tests {
         assert_eq!(IndexAdmission::for_origin(&hyok), IndexAdmission::SkipHyok);
 
         assert!(IndexAdmission::for_origin(&platform).may_index());
-        assert!(!IndexAdmission::for_origin(&hyok).may_index(),
-            "a HYOK class cannot have a plaintext index built — enforced by code");
+        assert!(
+            !IndexAdmission::for_origin(&hyok).may_index(),
+            "a HYOK class cannot have a plaintext index built — enforced by code"
+        );
     }
 
     #[test]
@@ -518,7 +552,9 @@ mod tests {
 
         let dek = Dek::generate();
         let wrapped = platform.wrap(&dek, t("acme")).expect("platform wrap");
-        let handle = platform.unwrap(&wrapped, t("acme")).expect("platform unwrap");
+        let handle = platform
+            .unwrap(&wrapped, t("acme"))
+            .expect("platform unwrap");
 
         // The unwrapped handle is the same key: seal/open round-trips.
         let (nonce, ct) = handle.seal(b"some pii");
@@ -537,7 +573,9 @@ mod tests {
         let dek = Dek::generate();
         let wrapped = byok.wrap(&dek, t("acme")).expect("byok wrap");
         // BYOK is full-capability while the key is live: unwrap succeeds.
-        let handle = byok.unwrap(&wrapped, t("acme")).expect("byok unwrap (key live)");
+        let handle = byok
+            .unwrap(&wrapped, t("acme"))
+            .expect("byok unwrap (key live)");
         let (nonce, ct) = handle.seal(b"bio");
         assert_eq!(handle.open(&nonce, &ct).as_deref(), Some(&b"bio"[..]));
     }
@@ -548,18 +586,27 @@ mod tests {
         let dek = Dek::generate();
 
         // The wrap/unwrap route through the CALL OUT, not a Myelin-held key.
-        let wrapped = hyok.wrap(&dek, t("acme")).expect("hyok wrap (customer service)");
-        let handle = hyok.unwrap(&wrapped, t("acme")).expect("hyok unwrap granted");
+        let wrapped = hyok
+            .wrap(&dek, t("acme"))
+            .expect("hyok wrap (customer service)");
+        let handle = hyok
+            .unwrap(&wrapped, t("acme"))
+            .expect("hyok unwrap granted");
         let (nonce, ct) = handle.seal(b"x");
         assert_eq!(handle.open(&nonce, &ct).as_deref(), Some(&b"x"[..]));
 
         // The customer crypto-shreds (destroy). Now the unwrap CALL OUT DENIES — loudly, never a
         // plaintext fall-through.
-        hyok.destroy(KeyId::new(t("acme"), crate::kms::KeyClass::Subject("alice".into())))
-            .expect("destroy is the customer-initiated shred");
+        hyok.destroy(KeyId::new(
+            t("acme"),
+            crate::kms::KeyClass::Subject("alice".into()),
+        ))
+        .expect("destroy is the customer-initiated shred");
         let denied = hyok.unwrap(&wrapped, t("acme"));
-        assert!(matches!(denied, Err(KeyOriginError::HyokDenied { .. })),
-            "after the customer revokes, a HYOK unwrap DENIES (no plaintext to Myelin)");
+        assert!(
+            matches!(denied, Err(KeyOriginError::HyokDenied { .. })),
+            "after the customer revokes, a HYOK unwrap DENIES (no plaintext to Myelin)"
+        );
 
         // And it STILL cannot derive a plaintext index — the structural limit is permanent.
         assert!(!hyok.can_derive_plaintext_index());
@@ -575,9 +622,15 @@ mod tests {
         let byok = Byok::new(&engine, r("eu-west"), "kms-customer://acme/k");
         let hyok = Hyok::new(MockHyokKeyService::new());
 
-        assert!(platform.destroy(KeyId::new(t("acme"), crate::kms::KeyClass::Tenant)).is_ok());
-        assert!(byok.destroy(KeyId::new(t("acme"), crate::kms::KeyClass::Tenant)).is_ok());
-        assert!(hyok.destroy(KeyId::new(t("acme"), crate::kms::KeyClass::Tenant)).is_ok());
+        assert!(platform
+            .destroy(KeyId::new(t("acme"), crate::kms::KeyClass::Tenant))
+            .is_ok());
+        assert!(byok
+            .destroy(KeyId::new(t("acme"), crate::kms::KeyClass::Tenant))
+            .is_ok());
+        assert!(hyok
+            .destroy(KeyId::new(t("acme"), crate::kms::KeyClass::Tenant))
+            .is_ok());
     }
 
     #[test]

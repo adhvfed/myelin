@@ -69,9 +69,7 @@ use myelin_events::{
     EventDraft, EventType, IdMinter, MonotonicMinter, OutboxStore, OutboxTx, Timestamp, Visibility,
 };
 use myelin_identity::iam_events::IAM_TUPLE_WRITTEN;
-use myelin_identity::{
-    DataRole, Precondition, Principal, RelationTuple, TupleDelta, Zookie,
-};
+use myelin_identity::{DataRole, Precondition, Principal, RelationTuple, TupleDelta, Zookie};
 use myelin_storage::{OltpStoreHolder, TenantQuery, TenantScope, TenantTable};
 use myelin_tenancy::{Region, TenantId};
 use std::collections::HashMap;
@@ -124,7 +122,10 @@ impl core::fmt::Display for WriteError {
                  tuple and no cross-tenant query path, identity §6)"
             ),
             WriteError::CommitFailed(why) => {
-                write!(f, "write_tuples outbox co-commit failed (the write did NOT happen): {why}")
+                write!(
+                    f,
+                    "write_tuples outbox co-commit failed (the write did NOT happen): {why}"
+                )
             }
         }
     }
@@ -473,7 +474,8 @@ impl TupleStore {
         // The PII-free subject ArtifactRef for the object (myelin://<tenant>/iam/tuple/<object>).
         let subject = EvArtifactRef(format!(
             "myelin://{}/iam/tuple/{}",
-            scope.tenant().0, object
+            scope.tenant().0,
+            object
         ));
         // Per-object ordering: the aggregate is the object, so all tuple-writes about one object
         // are sequenced (the relay drains an aggregate in seq order).
@@ -641,7 +643,10 @@ mod tests {
             )
             .expect("second write");
 
-        assert!(z1.0 > z0.0, "the zookie advances monotonically: {z1:?} must sort after {z0:?}");
+        assert!(
+            z1.0 > z0.0,
+            "the zookie advances monotonically: {z1:?} must sort after {z0:?}"
+        );
         // Both tuples are durable in the partition (the atomic write applied them).
         let tuples = store.tuples_in(&s);
         assert_eq!(tuples.len(), 2, "both adds are durable");
@@ -677,7 +682,9 @@ mod tests {
                 &s,
                 &actor(),
                 &[TupleDelta::Add(tuple("repo:core", "writer", "p:bob"))],
-                Some(&Precondition { expected_zookie: Some(stale.clone()) }),
+                Some(&Precondition {
+                    expected_zookie: Some(stale.clone()),
+                }),
                 None,
                 now(),
             )
@@ -685,12 +692,19 @@ mod tests {
         match err {
             WriteError::PreconditionFailed { expected, actual } => {
                 assert_eq!(expected, stale);
-                assert_eq!(actual, z0, "the actual zookie is the object's current revision");
+                assert_eq!(
+                    actual, z0,
+                    "the actual zookie is the object's current revision"
+                );
             }
             other => panic!("expected PreconditionFailed, got {other:?}"),
         }
         // Nothing changed: the writer tuple was NOT added, and NO new event was emitted.
-        assert_eq!(store.tuples_in(&s).len(), 1, "the aborted write added no tuple");
+        assert_eq!(
+            store.tuples_in(&s).len(),
+            1,
+            "the aborted write added no tuple"
+        );
         assert_eq!(
             store.outbox.outbox_depth(),
             depth_before,
@@ -719,7 +733,9 @@ mod tests {
                 &s,
                 &actor(),
                 &[TupleDelta::Add(tuple("repo:core", "writer", "p:bob"))],
-                Some(&Precondition { expected_zookie: Some(z0.clone()) }),
+                Some(&Precondition {
+                    expected_zookie: Some(z0.clone()),
+                }),
                 None,
                 now(),
             )
@@ -750,18 +766,36 @@ mod tests {
             .expect("write");
 
         // Exactly one unsent outbox row (the iam.tuple_written event) — emit-iff-committed.
-        assert_eq!(outbox.outbox_depth(), 1, "the committed write emitted exactly one event");
+        assert_eq!(
+            outbox.outbox_depth(),
+            1,
+            "the committed write emitted exactly one event"
+        );
         // Drain the relay (what `serve` does) and assert the published event is iam.tuple.written
         // carrying the write's zookie + opaque-id attribution + no PII.
         let bus = InProcessBus::new();
         let relay = Relay::new(outbox.clone(), bus.clone(), || Timestamp("t".into()));
         relay.drain_to_empty();
         let published = bus.consume("");
-        assert_eq!(published.len(), 1, "the relay published exactly the one event (no ghost)");
+        assert_eq!(
+            published.len(),
+            1,
+            "the relay published exactly the one event (no ghost)"
+        );
         let env = &published[0];
-        assert_eq!(env.type_.0, IAM_TUPLE_WRITTEN, "the only emit is iam.tuple.written");
-        assert!(!env.contains_personal_data, "the iam.* event carries no inline PII");
-        assert_eq!(env.payload["zookie"], serde_json::json!(z.0), "the event carries the S8 watermark");
+        assert_eq!(
+            env.type_.0, IAM_TUPLE_WRITTEN,
+            "the only emit is iam.tuple.written"
+        );
+        assert!(
+            !env.contains_personal_data,
+            "the iam.* event carries no inline PII"
+        );
+        assert_eq!(
+            env.payload["zookie"],
+            serde_json::json!(z.0),
+            "the event carries the S8 watermark"
+        );
         // Attribution is by opaque principal_id only (the actor) — never the erasable profile.
         assert_eq!(env.actor.0.principal_id, PrincipalId("p-admin".into()));
         assert_eq!(outbox.outbox_depth(), 0, "the relay drained the outbox");
@@ -792,7 +826,9 @@ mod tests {
             &s,
             &actor(),
             &[TupleDelta::Add(tuple("a", "writer", "p:x"))],
-            Some(&Precondition { expected_zookie: Some(Zookie("zk-nope".into())) }),
+            Some(&Precondition {
+                expected_zookie: Some(Zookie("zk-nope".into())),
+            }),
             None,
             now(),
         );
@@ -825,7 +861,11 @@ mod tests {
             .into_iter()
             .find(|t| t.tuple.object.0 == "run:R1")
             .expect("the grant is stored");
-        assert_eq!(grant.expires_at, Some(deadline), "a per-run grant auto-expires (== run life)");
+        assert_eq!(
+            grant.expires_at,
+            Some(deadline),
+            "a per-run grant auto-expires (== run life)"
+        );
         // An ordinary grant (no deadline) does NOT auto-expire.
         store
             .write_tuples(
@@ -842,7 +882,10 @@ mod tests {
             .into_iter()
             .find(|t| t.tuple.object.0 == "repo:core")
             .expect("the durable grant is stored");
-        assert_eq!(durable.expires_at, None, "an ordinary grant is durable (no expiry)");
+        assert_eq!(
+            durable.expires_at, None,
+            "an ordinary grant is durable (no expiry)"
+        );
     }
 
     /// **No cross-tenant tuple / no cross-tenant query path.** A write under tenant `acme` is
@@ -866,7 +909,10 @@ mod tests {
             .expect("acme write");
 
         // globex sees NOTHING acme wrote (the partition is keyed by the verified scope).
-        assert!(store.tuples_in(&globex).is_empty(), "no cross-tenant read path");
+        assert!(
+            store.tuples_in(&globex).is_empty(),
+            "no cross-tenant read path"
+        );
         // acme sees its own tuple.
         assert_eq!(store.tuples_in(&acme).len(), 1);
     }
@@ -877,7 +923,11 @@ mod tests {
     #[test]
     fn s3_store_registers_as_a_personal_data_holder() {
         let store = TupleStore::new(OutboxStore::new());
-        assert_eq!(store.holder().store, S3_HOLDER, "the S3 store registered under its holder name");
+        assert_eq!(
+            store.holder().store,
+            S3_HOLDER,
+            "the S3 store registered under its holder name"
+        );
         // The holder implements the frozen PersonalDataHolder shape (the DSR bodies are the floor).
         let receipt = store.holder().register();
         assert_eq!(receipt.store, S3_HOLDER);
@@ -911,7 +961,11 @@ mod tests {
                 now(),
             )
             .unwrap();
-        assert_eq!(store.tuples_in(&s).len(), 1, "re-adding the same edge is idempotent");
+        assert_eq!(
+            store.tuples_in(&s).len(),
+            1,
+            "re-adding the same edge is idempotent"
+        );
         // remove it → gone.
         store
             .write_tuples(
@@ -923,7 +977,10 @@ mod tests {
                 now(),
             )
             .unwrap();
-        assert!(store.tuples_in(&s).is_empty(), "the remove deleted the edge");
+        assert!(
+            store.tuples_in(&s).is_empty(),
+            "the remove deleted the edge"
+        );
     }
 
     /// The object-id-hash partition bucket is stable + deterministic (the §6 inner partition key).
@@ -948,7 +1005,11 @@ mod tests {
     fn per_tenant_dek_class_is_pinned_by_reference() {
         let store = TupleStore::new(OutboxStore::new());
         let s = scope("acme");
-        assert_eq!(store.dek_class(&s), "kms://acme/tenant", "the store pins the per-tenant DEK class");
+        assert_eq!(
+            store.dek_class(&s),
+            "kms://acme/tenant",
+            "the store pins the per-tenant DEK class"
+        );
     }
 
     /// **The CDC consumer half of 4.6:** a `write_tuples` caller (the role-compile path) writes a

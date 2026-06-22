@@ -244,7 +244,10 @@ impl Expand {
             }
             return;
         }
-        match self.namespace.resolve_permission(&object_type.0, permission) {
+        match self
+            .namespace
+            .resolve_permission(&object_type.0, permission)
+        {
             // A compiled permission → expand its four-operator rewrite.
             Some(rewrite) => {
                 if !trace.is_empty() {
@@ -310,7 +313,14 @@ impl Expand {
         match rewrite {
             Userset::Relation(r) => {
                 self.expand_direct_relation(
-                    scope, object_id, object_type, &r.0, at, depth, members, trace,
+                    scope,
+                    object_id,
+                    object_type,
+                    &r.0,
+                    at,
+                    depth,
+                    members,
+                    trace,
                 );
             }
             Userset::Union(arms) => {
@@ -319,7 +329,14 @@ impl Expand {
                 }
                 for arm in arms {
                     self.expand_userset(
-                        scope, object_id, object_type, at, arm, depth + 1, members, trace,
+                        scope,
+                        object_id,
+                        object_type,
+                        at,
+                        arm,
+                        depth + 1,
+                        members,
+                        trace,
                     );
                 }
             }
@@ -452,9 +469,7 @@ impl Expand {
         // (1) The CONCRETE direct subjects — the S8 density lookup (`subjects_for`). This is the
         // read-fanout case served at 50k density: an indexed reverse lookup of `object#relation`'s
         // direct principal subjects.
-        let direct = self
-            .index
-            .subjects_for(scope, object_type, object_id, &rel);
+        let direct = self.index.subjects_for(scope, object_type, object_id, &rel);
         let direct_count = direct.len();
         for s in direct {
             members.insert(s.0);
@@ -471,16 +486,7 @@ impl Expand {
             if let Some((obj2, rel2)) = crate::check_engine::parse_userset(&s) {
                 userset_count += 1;
                 let obj2_type = ObjectType(type_of_object_id(obj2));
-                self.expand_into(
-                    scope,
-                    obj2,
-                    &obj2_type,
-                    rel2,
-                    at,
-                    depth + 1,
-                    members,
-                    trace,
-                );
+                self.expand_into(scope, obj2, &obj2_type, rel2, at, depth + 1, members, trace);
             }
             // A concrete-principal snapshot subject is already covered by the S8 lookup above (S8 is
             // the projection of exactly those direct grants); we do not double-count.
@@ -502,14 +508,24 @@ fn describe_userset(u: &Userset) -> String {
         Userset::Relation(r) => r.0.clone(),
         Userset::Union(arms) => format!(
             "({})",
-            arms.iter().map(describe_userset).collect::<Vec<_>>().join(" ∪ ")
+            arms.iter()
+                .map(describe_userset)
+                .collect::<Vec<_>>()
+                .join(" ∪ ")
         ),
         Userset::Intersect(arms) => format!(
             "({})",
-            arms.iter().map(describe_userset).collect::<Vec<_>>().join(" ∩ ")
+            arms.iter()
+                .map(describe_userset)
+                .collect::<Vec<_>>()
+                .join(" ∩ ")
         ),
         Userset::Exclusion { base, subtracted } => {
-            format!("({} − {})", describe_userset(base), describe_userset(subtracted))
+            format!(
+                "({} − {})",
+                describe_userset(base),
+                describe_userset(subtracted)
+            )
         }
         Userset::TupleToUserset { tupleset, computed } => {
             format!("{}->{}", tupleset.0, computed.0)
@@ -531,10 +547,10 @@ mod tests {
     use super::*;
     use crate::namespace::NamespaceEngine;
     use crate::reverse_index::{ReverseIndexConsumer, ReverseRow};
-    use myelin_events::{BusTransport, EventHandler as _, InProcessBus, OutboxStore, Relay, Timestamp};
-    use myelin_identity::{
-        ConsistencyMode, Principal, PrincipalKind, RelationTuple, TupleDelta,
+    use myelin_events::{
+        BusTransport, EventHandler as _, InProcessBus, OutboxStore, Relay, Timestamp,
     };
+    use myelin_identity::{ConsistencyMode, Principal, PrincipalKind, RelationTuple, TupleDelta};
     use myelin_tenancy::{Region, TenantId};
 
     fn scope(tenant: &str) -> TenantScope {
@@ -585,7 +601,14 @@ mod tests {
         let index = ReverseIndex::new();
         let consumer = ReverseIndexConsumer::new(index.clone());
         store
-            .write_tuples(scope, &actor_in(&scope.tenant().0), deltas, None, None, now())
+            .write_tuples(
+                scope,
+                &actor_in(&scope.tenant().0),
+                deltas,
+                None,
+                None,
+                now(),
+            )
             .expect("seed write");
         let bus = InProcessBus::new();
         let relay = Relay::new(outbox.clone(), bus.clone(), || Timestamp("t".into()));
@@ -656,8 +679,14 @@ mod tests {
             &latest(),
         );
         let got: BTreeSet<String> = tree.members.iter().map(|m| m.0.clone()).collect();
-        assert!(got.contains("p:reader"), "the direct reader is a view subject");
-        assert!(got.contains("p:writer"), "the direct writer is a view subject");
+        assert!(
+            got.contains("p:reader"),
+            "the direct reader is a view subject"
+        );
+        assert!(
+            got.contains("p:writer"),
+            "the direct writer is a view subject"
+        );
         assert!(
             got.contains("p:teammember"),
             "the parent-team member inherits view (parent_team->view) and is a subject"
@@ -719,7 +748,10 @@ mod tests {
             &latest(),
         );
         let got: BTreeSet<String> = tree.members.iter().map(|m| m.0.clone()).collect();
-        assert!(got.contains("p:alice"), "an un-blocked reader is a view subject");
+        assert!(
+            got.contains("p:alice"),
+            "an un-blocked reader is a view subject"
+        );
         assert!(
             !got.contains("p:bob"),
             "a blocked reader is excluded (view = reader − blocked)"
@@ -755,7 +787,10 @@ mod tests {
         );
         // The trace records the inheritance edge (the rewrite path the inspector reads).
         assert!(
-            trace.steps.iter().any(|st| st.contains("parent_team->view")),
+            trace
+                .steps
+                .iter()
+                .any(|st| st.contains("parent_team->view")),
             "the trace records the parent_team->view inheritance edge: {:?}",
             trace.steps
         );
@@ -795,10 +830,7 @@ mod tests {
     #[test]
     fn no_cross_tenant_list_subjects() {
         let acme = scope("acme");
-        let (store, index, ns) = seed(
-            &acme,
-            &[add("channel:general", "watcher", "p:alice")],
-        );
+        let (store, index, ns) = seed(&acme, &[add("channel:general", "watcher", "p:alice")]);
         let expand = Expand::new(store, ns, index);
         let globex = scope("globex");
         let tree = expand.list_subjects(
@@ -907,7 +939,10 @@ mod tests {
             &latest(),
         );
         let joined = trace.steps.join("\n");
-        assert!(joined.contains("union of"), "the trace names the union operator: {joined}");
+        assert!(
+            joined.contains("union of"),
+            "the trace names the union operator: {joined}"
+        );
         assert!(
             joined.contains("parent_team->view"),
             "the trace names the inheritance edge: {joined}"

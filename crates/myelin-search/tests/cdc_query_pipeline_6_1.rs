@@ -37,8 +37,8 @@ use myelin_tenancy::TenantId;
 
 use myelin_search::{
     query, FieldDecl, FieldSchema, IndexBackend, IndexDocument, ListObjectsPort, Page, QueryError,
-    QueryStats, RelationalLeaf, ReverseIndexAnswer, RevisionWatermark, ScopedEngine, TantivyBackend,
-    FT_BODY_FIELD, ORDER_KEY_FIELD,
+    QueryStats, RelationalLeaf, ReverseIndexAnswer, RevisionWatermark, ScopedEngine,
+    TantivyBackend, FT_BODY_FIELD, ORDER_KEY_FIELD,
 };
 
 fn var(name: &str) -> Expr {
@@ -71,22 +71,35 @@ fn doc(id: &str, text: &str) -> IndexDocument {
 
 fn corpus() -> TantivyBackend {
     let mut be = TantivyBackend::open(&facet_decl()).expect("open");
-    be.upsert(&doc("acme/issue/PUB-1", "shared deadlock note")).unwrap();
-    be.upsert(&doc("acme/issue/SECRET-9", "private deadlock note")).unwrap();
+    be.upsert(&doc("acme/issue/PUB-1", "shared deadlock note"))
+        .unwrap();
+    be.upsert(&doc("acme/issue/SECRET-9", "private deadlock note"))
+        .unwrap();
     be
 }
 
 fn viewer(tenant: &str) -> Principal {
-    Principal::stub(PrincipalId("p:alice".into()), PrincipalKind::Human, TenantId(tenant.into()))
+    Principal::stub(
+        PrincipalId("p:alice".into()),
+        PrincipalKind::Human,
+        TenantId(tenant.into()),
+    )
 }
 
 fn consistency() -> Consistency {
-    Consistency { at_least: Zookie("z0".into()), mode: ConsistencyMode::BoundedStale }
+    Consistency {
+        at_least: Zookie("z0".into()),
+        mode: ConsistencyMode::BoundedStale,
+    }
 }
 
 fn ast() -> QueryAst {
-    QueryAst::compiled(Predicate::Cmp { op: CmpOp::Eq, lhs: var(FT_BODY_FIELD), rhs: s("deadlock") })
-        .expect("within cost bounds")
+    QueryAst::compiled(Predicate::Cmp {
+        op: CmpOp::Eq,
+        lhs: var(FT_BODY_FIELD),
+        rhs: s("deadlock"),
+    })
+    .expect("within cost bounds")
 }
 
 /// A scripted [`ListObjectsPort`] returning a canned answer + counting calls (the 4.3 consumer CDC
@@ -101,7 +114,12 @@ struct ScriptedAuthz {
 }
 impl ScriptedAuthz {
     fn new(answer: ListObjectsResult) -> ScriptedAuthz {
-        ScriptedAuthz { answer, calls: AtomicU64::new(0), reverse: None, resolve_calls: AtomicU64::new(0) }
+        ScriptedAuthz {
+            answer,
+            calls: AtomicU64::new(0),
+            reverse: None,
+            resolve_calls: AtomicU64::new(0),
+        }
     }
     fn with_reverse(answer: ListObjectsResult, reverse: ReverseIndexAnswer) -> ScriptedAuthz {
         ScriptedAuthz {
@@ -122,8 +140,16 @@ impl ListObjectsPort for ScriptedAuthz {
     ) -> AuthzResult<ListObjectsResult> {
         // **The 4.3 consumer-side contract:** Search asks for `read` over the object type — pin it so
         // an Id-side rename of the permission/type shape breaks this CDC now.
-        assert_eq!(permission, &Permission("read".into()), "Search lists objects under `read`");
-        assert_eq!(ty, &ObjectType("issue".into()), "the object type is forwarded verbatim");
+        assert_eq!(
+            permission,
+            &Permission("read".into()),
+            "Search lists objects under `read`"
+        );
+        assert_eq!(
+            ty,
+            &ObjectType("issue".into()),
+            "the object type is forwarded verbatim"
+        );
         self.calls.fetch_add(1, Ordering::Relaxed);
         Ok(self.answer.clone())
     }
@@ -144,7 +170,11 @@ fn run(
     be: &TantivyBackend,
     answer: ListObjectsResult,
     v: &Principal,
-) -> (Result<myelin_search::RankedResults, QueryError>, u64, QueryStats) {
+) -> (
+    Result<myelin_search::RankedResults, QueryError>,
+    u64,
+    QueryStats,
+) {
     let eng = ScopedEngine::new(be, "acme", "eu-west", schema());
     let authz = ScriptedAuthz::new(answer);
     let stats = QueryStats::new();
@@ -173,11 +203,17 @@ fn cdc_6_1_ids_mode_filters_and_no_n_plus_1() {
     let (res, calls, stats) = run(&be, answer, &viewer("acme"));
     let res = res.expect("query");
     assert_eq!(
-        res.hits.iter().map(|h| h.doc_id.as_str()).collect::<Vec<_>>(),
+        res.hits
+            .iter()
+            .map(|h| h.doc_id.as_str())
+            .collect::<Vec<_>>(),
         ["acme/issue/PUB-1"],
         "only the allow-set doc surfaces (the confidential one is pre-filtered out)"
     );
-    assert_eq!(res.zookie, "z-ids", "the list_objects zookie is threaded onto the result (6.1)");
+    assert_eq!(
+        res.zookie, "z-ids",
+        "the list_objects zookie is threaded onto the result (6.1)"
+    );
     assert_eq!(calls, 1, "EXACTLY one list_objects (no N+1)");
     assert_eq!(stats.list_objects_calls(), 1);
 }
@@ -186,12 +222,21 @@ fn cdc_6_1_ids_mode_filters_and_no_n_plus_1() {
 #[test]
 fn cdc_4_3_filter_all_mode_admits_all() {
     let be = corpus();
-    let (res, calls, _) =
-        run(&be, ListObjectsResult::Filter { set_expr: SetExpr::All, zookie: Zookie("z".into()) }, &viewer("acme"));
+    let (res, calls, _) = run(
+        &be,
+        ListObjectsResult::Filter {
+            set_expr: SetExpr::All,
+            zookie: Zookie("z".into()),
+        },
+        &viewer("acme"),
+    );
     let res = res.expect("query");
-    let ids: std::collections::BTreeSet<&str> = res.hits.iter().map(|h| h.doc_id.as_str()).collect();
-    assert!(ids.contains("acme/issue/PUB-1") && ids.contains("acme/issue/SECRET-9"),
-        "All ⇒ every matching doc surfaces: {ids:?}");
+    let ids: std::collections::BTreeSet<&str> =
+        res.hits.iter().map(|h| h.doc_id.as_str()).collect();
+    assert!(
+        ids.contains("acme/issue/PUB-1") && ids.contains("acme/issue/SECRET-9"),
+        "All ⇒ every matching doc surfaces: {ids:?}"
+    );
     assert_eq!(calls, 1);
 }
 
@@ -199,11 +244,21 @@ fn cdc_4_3_filter_all_mode_admits_all() {
 #[test]
 fn cdc_4_3_filter_none_mode_short_circuits() {
     let be = corpus();
-    let (res, _, stats) =
-        run(&be, ListObjectsResult::Filter { set_expr: SetExpr::None, zookie: Zookie("z".into()) }, &viewer("acme"));
+    let (res, _, stats) = run(
+        &be,
+        ListObjectsResult::Filter {
+            set_expr: SetExpr::None,
+            zookie: Zookie("z".into()),
+        },
+        &viewer("acme"),
+    );
     let res = res.expect("query");
     assert!(res.hits.is_empty(), "None ⇒ empty");
-    assert_eq!(stats.engine_branches(), 0, "the engine is never queried on None (no count leak)");
+    assert_eq!(
+        stats.engine_branches(),
+        0,
+        "the engine is never queried on None (no count leak)"
+    );
 }
 
 /// **CONSUMER 4.3 (Filter{NotIds} mode): the bounded deny-set hides exactly the denied doc.**
@@ -217,7 +272,10 @@ fn cdc_4_3_filter_not_ids_mode_denies_bounded() {
     let (res, _, _) = run(&be, answer, &viewer("acme"));
     let res = res.expect("query");
     assert_eq!(
-        res.hits.iter().map(|h| h.doc_id.as_str()).collect::<Vec<_>>(),
+        res.hits
+            .iter()
+            .map(|h| h.doc_id.as_str())
+            .collect::<Vec<_>>(),
         ["acme/issue/PUB-1"],
         "the denied doc is excluded; the rest surface"
     );
@@ -228,11 +286,20 @@ fn cdc_4_3_filter_not_ids_mode_denies_bounded() {
 #[test]
 fn cdc_6_1_cross_tenant_zero() {
     let be = corpus();
-    let (res, calls, stats) =
-        run(&be, ListObjectsResult::Filter { set_expr: SetExpr::All, zookie: Zookie("z".into()) }, &viewer("evil"));
+    let (res, calls, stats) = run(
+        &be,
+        ListObjectsResult::Filter {
+            set_expr: SetExpr::All,
+            zookie: Zookie("z".into()),
+        },
+        &viewer("evil"),
+    );
     let err = res.expect_err("a cross-tenant query is rejected (SRCH-D3)");
     assert!(matches!(err, QueryError::TenantMismatch { .. }));
-    assert_eq!(calls, 0, "the wrong-tenant query never reaches list_objects");
+    assert_eq!(
+        calls, 0,
+        "the wrong-tenant query never reaches list_objects"
+    );
     assert_eq!(stats.engine_branches(), 0, "0 cross-tenant engine touches");
 }
 
@@ -247,7 +314,9 @@ fn cdc_4_3_relational_tuple_set_joins_the_reverse_index() {
     // The reverse-index JOIN resolves ONLY PUB-1 at revision 4; the watermark from `z@4` is 4.
     let authz = ScriptedAuthz::with_reverse(
         ListObjectsResult::Filter {
-            set_expr: SetExpr::TupleSet { index: AuthzIndexRef("authz_visible".into()) },
+            set_expr: SetExpr::TupleSet {
+                index: AuthzIndexRef("authz_visible".into()),
+            },
             zookie: Zookie("z@4".into()),
         },
         ReverseIndexAnswer {
@@ -256,15 +325,35 @@ fn cdc_4_3_relational_tuple_set_joins_the_reverse_index() {
         },
     );
     let stats = QueryStats::new();
-    let res = query(&eng, &authz, &ast(), &viewer("acme"), &ObjectType("issue".into()),
-        &consistency(), Page::FIRST, &stats).expect("the relational JOIN resolves");
+    let res = query(
+        &eng,
+        &authz,
+        &ast(),
+        &viewer("acme"),
+        &ObjectType("issue".into()),
+        &consistency(),
+        Page::FIRST,
+        &stats,
+    )
+    .expect("the relational JOIN resolves");
     assert_eq!(
-        res.hits.iter().map(|h| h.doc_id.as_str()).collect::<Vec<_>>(),
+        res.hits
+            .iter()
+            .map(|h| h.doc_id.as_str())
+            .collect::<Vec<_>>(),
         ["acme/issue/PUB-1"],
         "the JOIN resolves to the visible-id set; the confidential doc never surfaces"
     );
-    assert_eq!(authz.resolve_calls.load(Ordering::Relaxed), 1, "exactly ONE reverse-index JOIN (no N+1)");
-    assert_eq!(authz.calls.load(Ordering::Relaxed), 1, "and exactly one list_objects");
+    assert_eq!(
+        authz.resolve_calls.load(Ordering::Relaxed),
+        1,
+        "exactly ONE reverse-index JOIN (no N+1)"
+    );
+    assert_eq!(
+        authz.calls.load(Ordering::Relaxed),
+        1,
+        "and exactly one list_objects"
+    );
 }
 
 /// **CONSUMER 4.3 / contract 4.10 (the revision watermark): a reverse-index revision STALER than the
@@ -278,7 +367,9 @@ fn cdc_4_10_stale_reverse_index_revision_is_refused() {
     // The zookie requires watermark 9; the reverse index serves a stale revision 3.
     let authz = ScriptedAuthz::with_reverse(
         ListObjectsResult::Filter {
-            set_expr: SetExpr::TupleSet { index: AuthzIndexRef("ix".into()) },
+            set_expr: SetExpr::TupleSet {
+                index: AuthzIndexRef("ix".into()),
+            },
             zookie: Zookie("z@9".into()),
         },
         ReverseIndexAnswer {
@@ -287,9 +378,23 @@ fn cdc_4_10_stale_reverse_index_revision_is_refused() {
         },
     );
     let stats = QueryStats::new();
-    let res = query(&eng, &authz, &ast(), &viewer("acme"), &ObjectType("issue".into()),
-        &consistency(), Page::FIRST, &stats);
+    let res = query(
+        &eng,
+        &authz,
+        &ast(),
+        &viewer("acme"),
+        &ObjectType("issue".into()),
+        &consistency(),
+        Page::FIRST,
+        &stats,
+    );
     let err = res.expect_err("a stale reverse-index revision is refused (4.10)");
-    assert!(matches!(err, QueryError::StaleReverseIndex { .. }), "the stale revision is loud");
-    assert!(err.to_string().contains("4.10"), "the error names the watermark contract");
+    assert!(
+        matches!(err, QueryError::StaleReverseIndex { .. }),
+        "the stale revision is loud"
+    );
+    assert!(
+        err.to_string().contains("4.10"),
+        "the error names the watermark contract"
+    );
 }

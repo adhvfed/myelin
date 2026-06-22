@@ -15,15 +15,15 @@
 //! tools the catalogue registers (NOT a bespoke test fixture — `git_tool_defs()` IS the SUT).
 
 use myelin_agent::{EffectKind, EffectResult, EventId, ToolDef, ToolName, ToolSurface};
+use myelin_agent_service::HitlGate;
+use myelin_agent_service::HitlWait;
 use myelin_agent_service::{
     gate_id_of, git_merge_required_caps, git_merge_tool_def, git_tool_defs, open_pr_required_caps,
-    open_pr_tool_def, register_git_tools, run_hitl_loop, ApplyError, ApprovedTools, CapabilityCheck,
-    DelegationLookup, EffectBudget, EffectCost, HitlOutcome, PipelineSignals, PlanThenApply,
-    PlannedEffect, RiskSummary, SubsystemApply, TenantGuard, WaitDecision, GIT_MERGE_TOOL,
-    GIT_SUBSYSTEM, OPEN_PR_TOOL,
+    open_pr_tool_def, register_git_tools, run_hitl_loop, ApplyError, ApprovedTools,
+    CapabilityCheck, DelegationLookup, EffectBudget, EffectCost, HitlOutcome, PipelineSignals,
+    PlanThenApply, PlannedEffect, RiskSummary, SubsystemApply, TenantGuard, WaitDecision,
+    GIT_MERGE_TOOL, GIT_SUBSYSTEM, OPEN_PR_TOOL,
 };
-use myelin_agent_service::HitlWait;
-use myelin_agent_service::HitlGate;
 use myelin_identity::{
     CaveatContext, Consistency, Decision, EffectivePolicy, Permission, Principal, PrincipalId,
     PrincipalKind, RuntimeRef, Zookie,
@@ -73,7 +73,9 @@ struct Delegate {
 }
 impl DelegationLookup for Delegate {
     fn delegation(&self, _a: &Principal, _t: &Principal) -> EffectivePolicy {
-        EffectivePolicy { caveats: self.caps.clone() }
+        EffectivePolicy {
+            caveats: self.caps.clone(),
+        }
     }
 }
 
@@ -136,12 +138,19 @@ impl HitlWait for ScriptedWait {
 fn agent() -> Principal {
     Principal::stub(
         PrincipalId("psn:agent-7".into()),
-        PrincipalKind::Agent { runtime_ref: RuntimeRef("mock".into()), on_behalf_of: None },
+        PrincipalKind::Agent {
+            runtime_ref: RuntimeRef("mock".into()),
+            on_behalf_of: None,
+        },
         TenantId("acme".into()),
     )
 }
 fn human() -> Principal {
-    Principal::stub(PrincipalId("psn:human-x".into()), PrincipalKind::Human, TenantId("acme".into()))
+    Principal::stub(
+        PrincipalId("psn:human-x".into()),
+        PrincipalKind::Human,
+        TenantId("acme".into()),
+    )
 }
 
 /// A catalogue holding the REGISTERED Git producer ToolDefs (the SUT — register_git_tools is the
@@ -159,7 +168,11 @@ fn merge_plan() -> PlannedEffect {
         input_json: r#"{"pull_request":"repo7:42","strategy":"squash"}"#.into(),
         field: None,
         transition: None,
-        cost: EffectCost { unit: "git.merge", wholesale: 30, markup: 20 },
+        cost: EffectCost {
+            unit: "git.merge",
+            wholesale: 30,
+            markup: 20,
+        },
     }
 }
 
@@ -167,10 +180,15 @@ fn open_pr_plan() -> PlannedEffect {
     PlannedEffect {
         tool: ToolName(OPEN_PR_TOOL.into()),
         object: ArtifactRef("myelin://acme/git/repo/repo7".into()),
-        input_json: r#"{"repo":"repo7","source_ref":"feat/x","target_ref":"main","title":"x"}"#.into(),
+        input_json: r#"{"repo":"repo7","source_ref":"feat/x","target_ref":"main","title":"x"}"#
+            .into(),
         field: None,
         transition: None,
-        cost: EffectCost { unit: "git.open_pr", wholesale: 5, markup: 5 },
+        cost: EffectCost {
+            unit: "git.open_pr",
+            wholesale: 5,
+            markup: 5,
+        },
     }
 }
 
@@ -183,10 +201,17 @@ fn apply_once(
     allowed_caps: &[&str],
     approved: BTreeSet<String>,
 ) -> (EffectResult, usize) {
-    let check = AllowCaps { allow: allowed_caps.iter().map(|c| c.to_string()).collect() };
-    let del = Delegate { caps: allowed_caps.iter().map(|c| c.to_string()).collect() };
+    let check = AllowCaps {
+        allow: allowed_caps.iter().map(|c| c.to_string()).collect(),
+    };
+    let del = Delegate {
+        caps: allowed_caps.iter().map(|c| c.to_string()).collect(),
+    };
     let tenant = PermitAll;
-    let mut budget = Budget { remaining: 1_000, settles: 0 };
+    let mut budget = Budget {
+        remaining: 1_000,
+        settles: 0,
+    };
     let mut signals = PipelineSignals::new();
     let mut p = PlanThenApply {
         catalogue: cat,
@@ -216,15 +241,33 @@ fn apply_once(
 fn git_tools_register_with_the_frozen_6_3_defaults() {
     let cat = git_catalogue();
 
-    let merge = cat.resolve(&ToolName(GIT_MERGE_TOOL.into())).expect("git.merge registered");
+    let merge = cat
+        .resolve(&ToolName(GIT_MERGE_TOOL.into()))
+        .expect("git.merge registered");
     assert_eq!(merge.subsystem, GIT_SUBSYSTEM);
-    assert!(merge.requires_approval, "git.merge carries requires_approval = yes (§6.3 / AG-8)");
-    assert_eq!(merge.effect_kind, EffectKind::Mutate, "git.merge routes through EffectApi");
+    assert!(
+        merge.requires_approval,
+        "git.merge carries requires_approval = yes (§6.3 / AG-8)"
+    );
+    assert_eq!(
+        merge.effect_kind,
+        EffectKind::Mutate,
+        "git.merge routes through EffectApi"
+    );
     assert_eq!(merge.required_caps, git_merge_required_caps());
-    assert_eq!(merge.required_caps, vec!["pull_request.merge".to_string()], "4.9 cap");
+    assert_eq!(
+        merge.required_caps,
+        vec!["pull_request.merge".to_string()],
+        "4.9 cap"
+    );
 
-    let pr = cat.resolve(&ToolName(OPEN_PR_TOOL.into())).expect("open_pr registered");
-    assert!(!pr.requires_approval, "open_pr carries requires_approval = no (§6.3 — reversible)");
+    let pr = cat
+        .resolve(&ToolName(OPEN_PR_TOOL.into()))
+        .expect("open_pr registered");
+    assert!(
+        !pr.requires_approval,
+        "open_pr carries requires_approval = no (§6.3 — reversible)"
+    );
     assert_eq!(pr.effect_kind, EffectKind::Mutate);
     assert_eq!(pr.required_caps, open_pr_required_caps());
     assert_eq!(pr.required_caps, vec!["repo.push".to_string()], "4.9 cap");
@@ -240,17 +283,29 @@ fn git_tools_register_with_the_frozen_6_3_defaults() {
 #[test]
 fn knd11_git_merge_is_governed_zero_ungoverned_zero_double_apply() {
     let cat = git_catalogue();
-    let endpoint = Endpoint { applied: RefCell::new(vec![]) };
+    let endpoint = Endpoint {
+        applied: RefCell::new(vec![]),
+    };
     let caps = ["pull_request.merge"];
 
     // 1. WITHHOLD — a fresh run (empty `approved`) proposes the registered git.merge → GATED.
     let (result, muts_before) = apply_once(&cat, &endpoint, &merge_plan(), &caps, BTreeSet::new());
-    let gate_id = gate_id_of(&result).expect("git.merge is requires_approval → it GATES (0 ungoverned)");
-    assert!(matches!(result, EffectResult::Gated(_)), "the registered git.merge WITHHOLDS: {result:?}");
-    assert_eq!(muts_before, 0, "0 MUTATIONS before approval (KN-D11 — the merge did NOT apply)");
+    let gate_id =
+        gate_id_of(&result).expect("git.merge is requires_approval → it GATES (0 ungoverned)");
+    assert!(
+        matches!(result, EffectResult::Gated(_)),
+        "the registered git.merge WITHHOLDS: {result:?}"
+    );
+    assert_eq!(
+        muts_before, 0,
+        "0 MUTATIONS before approval (KN-D11 — the merge did NOT apply)"
+    );
 
     // 2 + 3 + 4. PARK on the durable wait (9.4) → APPROVE (days later) → thread into `approved`.
-    let wait = ScriptedWait { decision: WaitDecision::Approve, parked: RefCell::new(0) };
+    let wait = ScriptedWait {
+        decision: WaitDecision::Approve,
+        parked: RefCell::new(0),
+    };
     let mut approved = ApprovedTools::new();
     let outcome = run_hitl_loop(
         gate_id,
@@ -262,20 +317,38 @@ fn knd11_git_merge_is_governed_zero_ungoverned_zero_double_apply() {
         &wait,
         &mut approved,
     );
-    assert_eq!(*wait.parked.borrow(), 1, "the run PARKED on the durable wait (state=waiting, no runtime)");
-    assert!(matches!(outcome, HitlOutcome::Approved(_)), "approval resumes: {outcome:?}");
+    assert_eq!(
+        *wait.parked.borrow(),
+        1,
+        "the run PARKED on the durable wait (state=waiting, no runtime)"
+    );
+    assert!(
+        matches!(outcome, HitlOutcome::Approved(_)),
+        "approval resumes: {outcome:?}"
+    );
 
     // a DOUBLE-CLICK on approve is ONE approval — admitting the same approved gate twice is idempotent
     // (the set is the truth, not the click count).
     if let HitlOutcome::Approved(ref gate) = outcome {
         approved.admit(gate); // re-admit (the double-click) — the gate is already in the set.
-        assert_eq!(approved.as_set().len(), 1, "a double-click is ONE approval (the set holds one tool)");
+        assert_eq!(
+            approved.as_set().len(),
+            1,
+            "a double-click is ONE approval (the set holds one tool)"
+        );
     }
 
     // 5. RESUME — the re-run with the populated `approved` set passes step 6 → APPLIES EXACTLY ONCE.
-    let (result2, muts_after) = apply_once(&cat, &endpoint, &merge_plan(), &caps, approved.as_set());
-    assert!(matches!(result2, EffectResult::Applied(_)), "the approved merge APPLIES on resume: {result2:?}");
-    assert_eq!(muts_after, 1, "the merge applied EXACTLY ONCE (0 double-apply, after approval, never before)");
+    let (result2, muts_after) =
+        apply_once(&cat, &endpoint, &merge_plan(), &caps, approved.as_set());
+    assert!(
+        matches!(result2, EffectResult::Applied(_)),
+        "the approved merge APPLIES on resume: {result2:?}"
+    );
+    assert_eq!(
+        muts_after, 1,
+        "the merge applied EXACTLY ONCE (0 double-apply, after approval, never before)"
+    );
 }
 
 /// **KN-D11 (rejection leg): a registered `git.merge` REJECTED never applies — 0 mutation across the
@@ -283,7 +356,9 @@ fn knd11_git_merge_is_governed_zero_ungoverned_zero_double_apply() {
 #[test]
 fn knd11_git_merge_rejected_never_applies_zero_mutation() {
     let cat = git_catalogue();
-    let endpoint = Endpoint { applied: RefCell::new(vec![]) };
+    let endpoint = Endpoint {
+        applied: RefCell::new(vec![]),
+    };
     let caps = ["pull_request.merge"];
 
     let (result, _) = apply_once(&cat, &endpoint, &merge_plan(), &caps, BTreeSet::new());
@@ -304,11 +379,20 @@ fn knd11_git_merge_rejected_never_applies_zero_mutation() {
         &wait,
         &mut approved,
     );
-    assert!(matches!(outcome, HitlOutcome::Halted(_)), "rejection halts: {outcome:?}");
-    assert!(!approved.contains(GIT_MERGE_TOOL), "a rejected merge never approves the tool (AG-8)");
+    assert!(
+        matches!(outcome, HitlOutcome::Halted(_)),
+        "rejection halts: {outcome:?}"
+    );
+    assert!(
+        !approved.contains(GIT_MERGE_TOOL),
+        "a rejected merge never approves the tool (AG-8)"
+    );
 
     let (result2, muts) = apply_once(&cat, &endpoint, &merge_plan(), &caps, approved.as_set());
-    assert!(matches!(result2, EffectResult::Gated(_)), "a rejected merge still GATES — never applies");
+    assert!(
+        matches!(result2, EffectResult::Gated(_)),
+        "a rejected merge still GATES — never applies"
+    );
     assert_eq!(muts, 0, "0 MUTATIONS across the entire reject flow (AG-8)");
 }
 
@@ -321,14 +405,30 @@ fn knd11_git_merge_rejected_never_applies_zero_mutation() {
 #[test]
 fn open_pr_applies_directly_no_hitl_gate() {
     let cat = git_catalogue();
-    let endpoint = Endpoint { applied: RefCell::new(vec![]) };
+    let endpoint = Endpoint {
+        applied: RefCell::new(vec![]),
+    };
 
     // a FRESH run (empty `approved`) — open_pr applies on the FIRST call (no withhold).
-    let (result, muts) =
-        apply_once(&cat, &endpoint, &open_pr_plan(), &["repo.push"], BTreeSet::new());
-    assert!(matches!(result, EffectResult::Applied(_)), "open_pr applies directly: {result:?}");
-    assert!(gate_id_of(&result).is_none(), "open_pr NEVER opens an HITL gate (it is reversible)");
-    assert_eq!(muts, 1, "open_pr mutated once, directly, with NO prior approval");
+    let (result, muts) = apply_once(
+        &cat,
+        &endpoint,
+        &open_pr_plan(),
+        &["repo.push"],
+        BTreeSet::new(),
+    );
+    assert!(
+        matches!(result, EffectResult::Applied(_)),
+        "open_pr applies directly: {result:?}"
+    );
+    assert!(
+        gate_id_of(&result).is_none(),
+        "open_pr NEVER opens an HITL gate (it is reversible)"
+    );
+    assert_eq!(
+        muts, 1,
+        "open_pr mutated once, directly, with NO prior approval"
+    );
 }
 
 // ───────────────────────── the consumer CDC for 4.9 (the Git ReBAC fragment supplies caps) ────────
@@ -344,14 +444,14 @@ fn cdc_4_9_required_caps_are_the_git_rebac_fragment_permissions() {
     // PROVIDER (4.9): git.merge's cap is the `pull_request.merge` permission the fragment declares.
     let pr_frag = pull_request_fragment();
     assert!(
-        pr_frag
-            .permissions
-            .iter()
-            .any(|p| p.0 == "merge"),
+        pr_frag.permissions.iter().any(|p| p.0 == "merge"),
         "the Git ReBAC `pull_request` fragment declares the `merge` permission (4.9)"
     );
     // CONSUMER: the registered git.merge ToolDef's required_cap is exactly `<object_type>.merge`.
-    assert_eq!(git_merge_tool_def().required_caps, vec!["pull_request.merge".to_string()]);
+    assert_eq!(
+        git_merge_tool_def().required_caps,
+        vec!["pull_request.merge".to_string()]
+    );
 
     // PROVIDER (4.9): open_pr's cap is the `repo.push` permission the fragment declares.
     let repo_frag = repo_fragment();
@@ -360,7 +460,10 @@ fn cdc_4_9_required_caps_are_the_git_rebac_fragment_permissions() {
         "the Git ReBAC `repo` fragment declares the `push` permission (4.9)"
     );
     // CONSUMER: the registered open_pr ToolDef's required_cap is exactly `<object_type>.push`.
-    assert_eq!(open_pr_tool_def().required_caps, vec!["repo.push".to_string()]);
+    assert_eq!(
+        open_pr_tool_def().required_caps,
+        vec!["repo.push".to_string()]
+    );
 }
 
 /// **NO-NEW-ENGINE check (EI-03 §4 / EI-01 §7): the whole Git producer surface is `git_tool_defs()`.**
@@ -375,13 +478,33 @@ fn cdc_4_9_required_caps_are_the_git_rebac_fragment_permissions() {
 fn git_producer_surface_is_a_projection() {
     let defs = git_tool_defs();
     // the two producer MUTATIONS route through EffectApi (plan-then-apply).
-    let merge = defs.iter().find(|d| d.name.0 == "merge").expect("git.merge registered");
-    let open_pr = defs.iter().find(|d| d.name.0 == "open_pr").expect("open_pr registered");
-    assert_eq!(merge.effect_kind, EffectKind::Mutate, "git.merge routes through EffectApi");
-    assert_eq!(open_pr.effect_kind, EffectKind::Mutate, "open_pr routes through EffectApi");
+    let merge = defs
+        .iter()
+        .find(|d| d.name.0 == "merge")
+        .expect("git.merge registered");
+    let open_pr = defs
+        .iter()
+        .find(|d| d.name.0 == "open_pr")
+        .expect("open_pr registered");
+    assert_eq!(
+        merge.effect_kind,
+        EffectKind::Mutate,
+        "git.merge routes through EffectApi"
+    );
+    assert_eq!(
+        open_pr.effect_kind,
+        EffectKind::Mutate,
+        "open_pr routes through EffectApi"
+    );
     assert!(merge.requires_approval, "git.merge gated");
     assert!(!open_pr.requires_approval, "open_pr not gated");
     // the code-executing tools (P-283) are registered into the SAME surface (no second registry).
-    assert!(defs.iter().any(|d| d.name.0 == "history_rewrite"), "git.history_rewrite registered");
-    assert!(defs.iter().any(|d| d.name.0 == "scip_index"), "git.scip_index registered");
+    assert!(
+        defs.iter().any(|d| d.name.0 == "history_rewrite"),
+        "git.history_rewrite registered"
+    );
+    assert!(
+        defs.iter().any(|d| d.name.0 == "scip_index"),
+        "git.scip_index registered"
+    );
 }

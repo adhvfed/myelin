@@ -484,7 +484,10 @@ pub(crate) fn interior_node(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
 /// single leaf is its own root. Crate-private so the STH ([`super::audit_proofs`]) signs exactly
 /// the root the tree computes.
 pub(crate) fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
-    debug_assert!(!leaves.is_empty(), "merkle_root is only called for a non-empty chain");
+    debug_assert!(
+        !leaves.is_empty(),
+        "merkle_root is only called for a non-empty chain"
+    );
     let mut level: Vec<[u8; 32]> = leaves.to_vec();
     while level.len() > 1 {
         let mut next = Vec::with_capacity(level.len().div_ceil(2));
@@ -636,7 +639,11 @@ mod tests {
     use myelin_identity::{PrincipalId, PrincipalKind, RuntimeRef};
 
     fn human(id: &str, tenant: &str) -> Principal {
-        Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, TenantId(tenant.into()))
+        Principal::stub(
+            PrincipalId(id.into()),
+            PrincipalKind::Human,
+            TenantId(tenant.into()),
+        )
     }
 
     fn agent(id: &str, on_behalf: &str, tenant: &str) -> Principal {
@@ -705,17 +712,37 @@ mod tests {
 
         let tenant = TenantId("acme".into());
         let entries = c.log().entries_for(&tenant);
-        assert_eq!(entries.len(), 1, "one delivered action → one appended entry");
+        assert_eq!(
+            entries.len(),
+            1,
+            "one delivered action → one appended entry"
+        );
         let e = &entries[0];
         assert_eq!(e.seq, 0, "the genesis entry of acme's chain is seq 0");
         // The hash-chain link (prev_hash) is present and is a blake3 multihash.
-        assert!(e.prev_hash.starts_with("blake3:"), "prev_hash is the chain link");
+        assert!(
+            e.prev_hash.starts_with("blake3:"),
+            "prev_hash is the chain link"
+        );
         // The Merkle leaf is present and is a blake3 multihash of the body.
-        assert!(e.leaf_hash.starts_with("blake3:"), "leaf_hash is the Merkle leaf");
-        assert_ne!(e.prev_hash, e.leaf_hash, "the chain link and the leaf are distinct hashes");
+        assert!(
+            e.leaf_hash.starts_with("blake3:"),
+            "leaf_hash is the Merkle leaf"
+        );
+        assert_ne!(
+            e.prev_hash, e.leaf_hash,
+            "the chain link and the leaf are distinct hashes"
+        );
         // A per-tenant Merkle root exists (what the STH will sign, P-GA-20).
-        assert!(c.log().root(&tenant).is_some(), "a per-tenant Merkle root exists");
-        assert_eq!(c.log().len_for(&tenant), 1, "tree size 1 (the STH signs this)");
+        assert!(
+            c.log().root(&tenant).is_some(),
+            "a per-tenant Merkle root exists"
+        );
+        assert_eq!(
+            c.log().len_for(&tenant),
+            1,
+            "tree size 1 (the STH signs this)"
+        );
     }
 
     /// **GATE (2/4): the actor is the minimised `<pseudonym>@<tenant>.noreply` form, never a
@@ -737,15 +764,24 @@ mod tests {
         let e = &c.log().entries_for(&TenantId("acme".into()))[0];
 
         // The frozen pseudonym grammar `<pseudonym>@<tenant>.noreply` (contract 4.8).
-        assert_eq!(e.actor.actor, "u-42@acme.noreply", "actor is the frozen pseudonym grammar");
+        assert_eq!(
+            e.actor.actor, "u-42@acme.noreply",
+            "actor is the frozen pseudonym grammar"
+        );
         assert_eq!(e.actor.actor_kind, "human");
         assert!(e.actor.on_behalf_of.is_none(), "a human acts for nobody");
 
         // The minimisation is structural: serialise the WHOLE entry and assert the PII bodies from
         // the event payload are absent (the entry has no field that could carry them).
         let serialized = serde_json::to_string(e).expect("entry serialises");
-        assert!(!serialized.contains("Alice Example"), "no real name reaches the audit entry");
-        assert!(!serialized.contains("alice@example.test"), "no email reaches the audit entry");
+        assert!(
+            !serialized.contains("Alice Example"),
+            "no real name reaches the audit entry"
+        );
+        assert!(
+            !serialized.contains("alice@example.test"),
+            "no email reaches the audit entry"
+        );
         // The subject is an ArtifactRef (an id), never content.
         assert_eq!(e.subject, ArtifactRef("myelin://acme/iam/tuple/t1".into()));
     }
@@ -790,7 +826,10 @@ mod tests {
         );
         c.handle(&ev);
         let e = &c.log().entries_for(&TenantId("acme".into()))[0];
-        assert_eq!(e.correlation_id, "01J-root", "the causal root is carried (the why-walk anchor)");
+        assert_eq!(
+            e.correlation_id, "01J-root",
+            "the causal root is carried (the why-walk anchor)"
+        );
         assert_eq!(
             e.causation_id.as_deref(),
             Some("01J-parent"),
@@ -810,7 +849,11 @@ mod tests {
     fn no_service_writes_the_audit_log_except_the_outbox_consumer() {
         let c = AuditConsumer::new();
         // The ONLY way to write the log: deliver an event through the consumer (the bus path).
-        assert_eq!(c.log().len_for(&TenantId("acme".into())), 0, "empty before any delivery");
+        assert_eq!(
+            c.log().len_for(&TenantId("acme".into())),
+            0,
+            "empty before any delivery"
+        );
         let ev = action_event(
             "01J-1",
             human("u-1", "acme"),
@@ -836,9 +879,30 @@ mod tests {
     #[test]
     fn the_hash_chain_is_per_tenant() {
         let c = AuditConsumer::new();
-        c.handle(&action_event("01J-a1", human("u", "acme"), "iam.tuple_written", "myelin://acme/x", "r1", None));
-        c.handle(&action_event("01J-b1", human("u", "globex"), "iam.tuple_written", "myelin://globex/x", "r2", None));
-        c.handle(&action_event("01J-a2", human("u", "acme"), "iam.tuple_written", "myelin://acme/y", "r3", None));
+        c.handle(&action_event(
+            "01J-a1",
+            human("u", "acme"),
+            "iam.tuple_written",
+            "myelin://acme/x",
+            "r1",
+            None,
+        ));
+        c.handle(&action_event(
+            "01J-b1",
+            human("u", "globex"),
+            "iam.tuple_written",
+            "myelin://globex/x",
+            "r2",
+            None,
+        ));
+        c.handle(&action_event(
+            "01J-a2",
+            human("u", "acme"),
+            "iam.tuple_written",
+            "myelin://acme/y",
+            "r3",
+            None,
+        ));
 
         let acme = c.log().entries_for(&TenantId("acme".into()));
         let globex = c.log().entries_for(&TenantId("globex".into()));
@@ -871,8 +935,14 @@ mod tests {
         let entries = c.log().entries_for(&tenant);
         // The pristine chain verifies intact (kills a `verify_entries -> true`-always mutant only
         // because the tampered case below verifies false — the two together pin the boolean).
-        assert!(c.log().verify_chain(&tenant), "the freshly-built chain verifies intact");
-        assert!(verify_entries(&entries), "the verifier core agrees the pristine chain is intact");
+        assert!(
+            c.log().verify_chain(&tenant),
+            "the freshly-built chain verifies intact"
+        );
+        assert!(
+            verify_entries(&entries),
+            "the verifier core agrees the pristine chain is intact"
+        );
 
         // Tamper with one entry in the middle (re-point its subject) and verify the chain FAILS:
         // the recomputed leaf no longer matches the stored `leaf_hash`, breaking the chain. The
@@ -887,11 +957,17 @@ mod tests {
         // And a re-ordered chain (swap two entries) also fails (seq no longer dense / links break).
         let mut reordered = entries.clone();
         reordered.swap(1, 3);
-        assert!(!verify_entries(&reordered), "a re-ordered chain fails verification");
+        assert!(
+            !verify_entries(&reordered),
+            "a re-ordered chain fails verification"
+        );
         // A dropped entry fails too (the seq sequence is no longer dense 0..n).
         let mut dropped = entries.clone();
         dropped.remove(2);
-        assert!(!verify_entries(&dropped), "a dropped entry fails verification (seq gap)");
+        assert!(
+            !verify_entries(&dropped),
+            "a dropped entry fails verification (seq gap)"
+        );
     }
 
     /// The `Outcome` wire spelling (§6.2 `outcome`) is frozen — each variant serialises to its
@@ -937,20 +1013,47 @@ mod tests {
     fn merkle_root_is_deterministic_and_changes_on_append() {
         let mk = || {
             let c = AuditConsumer::new();
-            c.handle(&action_event("01J-1", human("u", "acme"), "iam.tuple_written", "myelin://acme/x", "r", None));
-            c.handle(&action_event("01J-2", human("u", "acme"), "iam.tuple_written", "myelin://acme/y", "r", None));
+            c.handle(&action_event(
+                "01J-1",
+                human("u", "acme"),
+                "iam.tuple_written",
+                "myelin://acme/x",
+                "r",
+                None,
+            ));
+            c.handle(&action_event(
+                "01J-2",
+                human("u", "acme"),
+                "iam.tuple_written",
+                "myelin://acme/y",
+                "r",
+                None,
+            ));
             c
         };
         let tenant = TenantId("acme".into());
         let root_a = mk().log().root(&tenant);
         let root_b = mk().log().root(&tenant);
-        assert_eq!(root_a, root_b, "the same leaf set produces the same Merkle root (deterministic)");
+        assert_eq!(
+            root_a, root_b,
+            "the same leaf set produces the same Merkle root (deterministic)"
+        );
 
         let c = mk();
         let before = c.log().root(&tenant);
-        c.handle(&action_event("01J-3", human("u", "acme"), "iam.tuple_written", "myelin://acme/z", "r", None));
+        c.handle(&action_event(
+            "01J-3",
+            human("u", "acme"),
+            "iam.tuple_written",
+            "myelin://acme/z",
+            "r",
+            None,
+        ));
         let after = c.log().root(&tenant);
-        assert_ne!(before, after, "appending an entry changes the Merkle root (the STH advances)");
+        assert_ne!(
+            before, after,
+            "appending an entry changes the Merkle root (the STH advances)"
+        );
     }
 
     /// The `audit_append_lag` SLO measurement (rule 7 / contract 1.8) reads 0 in steady state on
@@ -958,10 +1061,24 @@ mod tests {
     /// The signal NAME + UNIT are the pinned `AUDIT_APPEND_LAG`.
     #[test]
     fn audit_append_lag_signal_is_named_and_reads_green() {
-        assert_eq!(AUDIT_APPEND_LAG.0, "audit.audit_append_lag", "the SLO signal name is pinned");
+        assert_eq!(
+            AUDIT_APPEND_LAG.0, "audit.audit_append_lag",
+            "the SLO signal name is pinned"
+        );
         assert_eq!(AUDIT_APPEND_LAG.1, "events", "the SLO unit is pinned");
         let c = AuditConsumer::new();
-        c.handle(&action_event("01J-1", human("u", "acme"), "iam.tuple_written", "myelin://acme/x", "r", None));
-        assert_eq!(c.append_lag(), 0, "append_lag reads green (0) in steady state after a synchronous append");
+        c.handle(&action_event(
+            "01J-1",
+            human("u", "acme"),
+            "iam.tuple_written",
+            "myelin://acme/x",
+            "r",
+            None,
+        ));
+        assert_eq!(
+            c.append_lag(),
+            0,
+            "append_lag reads green (0) in steady state after a synchronous append"
+        );
     }
 }

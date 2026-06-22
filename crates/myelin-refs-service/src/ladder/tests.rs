@@ -12,7 +12,7 @@ use myelin_tenancy::{CellId, Region, TenantId};
 use super::*;
 use crate::resolve::{
     bounded_stale, NoOpCacheRead, OwnerProjection, ProjectApi, ProjectApiError, ProjectOutcome,
-    ProjectionFlag, ResolveMode, ResolveService, Resolution, TombstoneReason,
+    ProjectionFlag, Resolution, ResolveMode, ResolveService, TombstoneReason,
 };
 
 fn tenant() -> TenantId {
@@ -85,33 +85,59 @@ fn live_clears_a_stale_flag_to_none() {
 #[test]
 fn find_subsequence_is_exact_at_boundaries() {
     let blob = ["fn a", "  body", "}", "tail"];
-    let minted = MintedLineRange { blob_oid: "x".into(), anchored: vec![
-        MintedLineRange::fingerprint("}"), MintedLineRange::fingerprint("tail"),
-    ]};
+    let minted = MintedLineRange {
+        blob_oid: "x".into(),
+        anchored: vec![
+            MintedLineRange::fingerprint("}"),
+            MintedLineRange::fingerprint("tail"),
+        ],
+    };
     // the anchored pair is found at the END of the blob (offset 2) → rebased to lines 3-4.
     let state = resolve_line_range(&minted, "y", &blob);
-    assert_eq!(state, LineRangeState::Rebased { new_start: 3, new_end: 4 }, "end-of-blob contiguous match");
+    assert_eq!(
+        state,
+        LineRangeState::Rebased {
+            new_start: 3,
+            new_end: 4
+        },
+        "end-of-blob contiguous match"
+    );
 
     // a needle longer than the haystack: the WHOLE block cannot match (the over-long guard in
     // find_subsequence returns None), but a surviving prefix [a,b] is found → Partial (the prefix
     // search drives the result). This exercises the `needle.len() > haystack.len()` guard on the whole
     // block AND the prefix fall-through.
-    let mostly_gone = MintedLineRange { blob_oid: "x".into(), anchored: vec![
-        MintedLineRange::fingerprint("a"), MintedLineRange::fingerprint("b"),
-        MintedLineRange::fingerprint("c"), MintedLineRange::fingerprint("d"),
-        MintedLineRange::fingerprint("e"),
-    ]};
+    let mostly_gone = MintedLineRange {
+        blob_oid: "x".into(),
+        anchored: vec![
+            MintedLineRange::fingerprint("a"),
+            MintedLineRange::fingerprint("b"),
+            MintedLineRange::fingerprint("c"),
+            MintedLineRange::fingerprint("d"),
+            MintedLineRange::fingerprint("e"),
+        ],
+    };
     assert_eq!(
         resolve_line_range(&mostly_gone, "y", &["a", "b"]),
-        LineRangeState::Partial { surviving_start: 1, surviving_end: 2 },
+        LineRangeState::Partial {
+            surviving_start: 1,
+            surviving_end: 2
+        },
         "the surviving a-b prefix (the rest of the anchor is gone)"
     );
 
     // NONE survive → content_gone (the whole block AND every prefix fail).
-    let all_gone = MintedLineRange { blob_oid: "x".into(), anchored: vec![
-        MintedLineRange::fingerprint("x"), MintedLineRange::fingerprint("y"),
-    ]};
-    assert_eq!(resolve_line_range(&all_gone, "y", &["totally", "different"]), LineRangeState::ContentGone);
+    let all_gone = MintedLineRange {
+        blob_oid: "x".into(),
+        anchored: vec![
+            MintedLineRange::fingerprint("x"),
+            MintedLineRange::fingerprint("y"),
+        ],
+    };
+    assert_eq!(
+        resolve_line_range(&all_gone, "y", &["totally", "different"]),
+        LineRangeState::ContentGone
+    );
 }
 
 /// **A single-line anchor matched at the very last line of a longer blob (offset == len - 1).** Pins
@@ -119,9 +145,19 @@ fn find_subsequence_is_exact_at_boundaries() {
 /// or flips the over-long guard, is caught).
 #[test]
 fn single_line_anchor_matches_at_last_position() {
-    let minted = MintedLineRange { blob_oid: "x".into(), anchored: vec![MintedLineRange::fingerprint("last")] };
+    let minted = MintedLineRange {
+        blob_oid: "x".into(),
+        anchored: vec![MintedLineRange::fingerprint("last")],
+    };
     let state = resolve_line_range(&minted, "y", &["a", "b", "last"]);
-    assert_eq!(state, LineRangeState::Rebased { new_start: 3, new_end: 3 }, "matched at the final line");
+    assert_eq!(
+        state,
+        LineRangeState::Rebased {
+            new_start: 3,
+            new_end: 3
+        },
+        "matched at the final line"
+    );
 }
 
 /// **MOVED → a projection flagged `moved` (Git rebased range; KN block moved).** The anchor still
@@ -166,7 +202,11 @@ fn git_line_range_exact_when_oid_matches() {
     let minted = MintedLineRange::mint("oid-1", &lines, 1, 3);
     let state = resolve_line_range(&minted, "oid-1", &lines);
     assert_eq!(state, LineRangeState::Exact);
-    assert_eq!(state.into_sub_state(proj()), SubState::Live(proj()), "exact → LIVE");
+    assert_eq!(
+        state.into_sub_state(proj()),
+        SubState::Live(proj()),
+        "exact → LIVE"
+    );
 }
 
 /// **rebased — the fingerprinted lines moved to a shifted position (3-way context) → MOVED.** Two
@@ -178,7 +218,14 @@ fn git_line_range_rebased_when_block_shifts() {
     // a newer blob: two lines inserted above → the anchored block now starts at line 3.
     let current = ["// header", "// added", "fn a() {", "  body", "}"];
     let state = resolve_line_range(&minted, "oid-2", &current);
-    assert_eq!(state, LineRangeState::Rebased { new_start: 3, new_end: 5 }, "block shifted to 3-5");
+    assert_eq!(
+        state,
+        LineRangeState::Rebased {
+            new_start: 3,
+            new_end: 5
+        },
+        "block shifted to 3-5"
+    );
     match state.into_sub_state(proj()) {
         SubState::Moved(_) => {}
         other => panic!("rebased → MOVED, got {other:?}"),
@@ -196,7 +243,10 @@ fn git_line_range_partial_when_some_lines_survive() {
     let state = resolve_line_range(&minted, "oid-2", &current);
     assert_eq!(
         state,
-        LineRangeState::Partial { surviving_start: 1, surviving_end: 2 },
+        LineRangeState::Partial {
+            surviving_start: 1,
+            surviving_end: 2
+        },
         "the surviving A-B prefix"
     );
     match state.into_sub_state(proj()) {
@@ -213,7 +263,11 @@ fn git_line_range_content_gone_when_nothing_survives() {
     let current = ["entirely", "rewritten", "file"];
     let state = resolve_line_range(&minted, "oid-2", &current);
     assert_eq!(state, LineRangeState::ContentGone);
-    assert_eq!(state.into_sub_state(proj()), SubState::Gone, "content_gone → GONE → sub_gone");
+    assert_eq!(
+        state.into_sub_state(proj()),
+        SubState::Gone,
+        "content_gone → GONE → sub_gone"
+    );
 }
 
 /// **A fingerprint is BLAKE3 over the line content (content-anchored, not positional / not the raw
@@ -222,8 +276,16 @@ fn git_line_range_content_gone_when_nothing_survives() {
 fn line_fingerprint_is_blake3_content_anchored() {
     let a = MintedLineRange::fingerprint("fn a() {");
     assert!(a.starts_with("blake3:"), "the ONE multihash convention");
-    assert_eq!(a, MintedLineRange::fingerprint("fn a() {"), "stable on the same content");
-    assert_ne!(a, MintedLineRange::fingerprint("fn b() {"), "different content → different fp");
+    assert_eq!(
+        a,
+        MintedLineRange::fingerprint("fn a() {"),
+        "stable on the same content"
+    );
+    assert_ne!(
+        a,
+        MintedLineRange::fingerprint("fn b() {"),
+        "different content → different fp"
+    );
 }
 
 // ── End-to-end through the chokepoint: the root is ALWAYS carried; 0 dangling/404/leak (REF-D9) ──
@@ -260,7 +322,12 @@ impl ProjectApi for LadderOwner {
 }
 
 fn svc(sub: Arc<SyntheticSubResolver>) -> ResolveService {
-    ResolveService::new(authz(), Arc::new(NoOpCacheRead), Arc::new(LadderOwner { sub }), cell())
+    ResolveService::new(
+        authz(),
+        Arc::new(NoOpCacheRead),
+        Arc::new(LadderOwner { sub }),
+        cell(),
+    )
 }
 
 fn resolve(svc: &ResolveService, ref_: &ArtifactRef) -> Resolution {
@@ -288,10 +355,17 @@ fn ref_d9_deleted_doc_block_tombstones_sub_gone_carrying_root() {
     let svc = svc(sub);
 
     let r = resolve(&svc, &aref(block));
-    assert_eq!(r.tombstone_reason(), Some(TombstoneReason::SubGone), "deleted block → sub_gone");
+    assert_eq!(
+        r.tombstone_reason(),
+        Some(TombstoneReason::SubGone),
+        "deleted block → sub_gone"
+    );
     if let Resolution::Tombstone(t) = &r {
         // the ROOT is carried (the page) — the embed degrades to "this referenced <page 7c2>".
-        assert_eq!(t.root.0, "myelin://acme/knowledge/page/7c2", "the tombstone carries the root");
+        assert_eq!(
+            t.root.0, "myelin://acme/knowledge/page/7c2",
+            "the tombstone carries the root"
+        );
     } else {
         panic!("a deleted block must tombstone, not render");
     }
@@ -319,11 +393,17 @@ fn ref_d9_deleted_chat_message_tombstones_carrying_root() {
 fn ref_d9_rebased_git_range_renders_moved_not_tombstone() {
     let sub = Arc::new(SyntheticSubResolver::new());
     let range = "myelin://acme/git/ref/main#L42-L88";
-    sub.set_state(range, SubState::Moved(SyntheticSubResolver::default_projection()));
+    sub.set_state(
+        range,
+        SubState::Moved(SyntheticSubResolver::default_projection()),
+    );
     let svc = svc(sub);
 
     let r = resolve(&svc, &aref(range));
-    assert!(r.is_projection(), "a rebased range still renders (graceful), not a tombstone");
+    assert!(
+        r.is_projection(),
+        "a rebased range still renders (graceful), not a tombstone"
+    );
     if let Resolution::Projection(p) = &r {
         assert_eq!(p.flag, Some(ProjectionFlag::Moved), "flagged moved");
     }
@@ -334,7 +414,10 @@ fn ref_d9_rebased_git_range_renders_moved_not_tombstone() {
 fn ref_d9_partial_git_range_renders_outdated() {
     let sub = Arc::new(SyntheticSubResolver::new());
     let range = "myelin://acme/git/ref/main#L42-L88";
-    sub.set_state(range, SubState::Outdated(SyntheticSubResolver::default_projection()));
+    sub.set_state(
+        range,
+        SubState::Outdated(SyntheticSubResolver::default_projection()),
+    );
     let svc = svc(sub);
 
     let r = resolve(&svc, &aref(range));
@@ -353,9 +436,16 @@ fn ref_d9_erased_sub_tombstones_erased_carrying_root() {
     let svc = svc(sub);
 
     let r = resolve(&svc, &aref(block));
-    assert_eq!(r.tombstone_reason(), Some(TombstoneReason::Erased), "erased sub → erased");
+    assert_eq!(
+        r.tombstone_reason(),
+        Some(TombstoneReason::Erased),
+        "erased sub → erased"
+    );
     if let Resolution::Tombstone(t) = &r {
-        assert_eq!(t.root.0, "myelin://acme/knowledge/page/7c2", "the root is still carried");
+        assert_eq!(
+            t.root.0, "myelin://acme/knowledge/page/7c2",
+            "the root is still carried"
+        );
     }
 }
 

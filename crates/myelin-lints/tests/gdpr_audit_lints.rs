@@ -53,7 +53,9 @@ fn the_gdpr_red_fixture_is_rejected() {
         "no-untagged-personal-data MUST reject the GDPR red fixture (untagged PII), but found 0"
     );
     assert!(
-        violations.iter().all(|v| v.lint == LintId("no-untagged-personal-data")),
+        violations
+            .iter()
+            .all(|v| v.lint == LintId("no-untagged-personal-data")),
         "every GDPR red-fixture violation must carry the no-untagged-personal-data id"
     );
 }

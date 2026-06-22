@@ -30,9 +30,10 @@ use myelin_identity::{
     PrincipalId, PrincipalKind, RelName, RelationTuple, SetExpr, TupleDelta, Zookie,
 };
 use myelin_identity_service::{
-    lower, namespace::{FragmentDef, PermissionRule, Userset},
-    watermark_verdict, ListObjects, NamespaceEngine, ReverseIndex, ReverseIndexConsumer, TupleStore,
-    WatermarkVerdict,
+    lower,
+    namespace::{FragmentDef, PermissionRule, Userset},
+    watermark_verdict, ListObjects, NamespaceEngine, ReverseIndex, ReverseIndexConsumer,
+    TupleStore, WatermarkVerdict,
 };
 use myelin_storage::TenantScope;
 use myelin_tenancy::{Region, TenantId};
@@ -50,7 +51,11 @@ fn scope(tenant: &str) -> TenantScope {
 }
 
 fn subject(id: &str, tenant: &str) -> Principal {
-    Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, TenantId(tenant.into()))
+    Principal::stub(
+        PrincipalId(id.into()),
+        PrincipalKind::Human,
+        TenantId(tenant.into()),
+    )
 }
 
 fn add(object: &str, relation: &str, subj: &str) -> TupleDelta {
@@ -104,7 +109,10 @@ fn wired(cap: usize, scope: &TenantScope, grants: &[TupleDelta]) -> (ListObjects
     for env in bus.consume("") {
         consumer.handle(&env);
     }
-    (ListObjects::with_cap(store.clone(), namespace, index.clone(), cap), index)
+    (
+        ListObjects::with_cap(store.clone(), namespace, index.clone(), cap),
+        index,
+    )
 }
 
 /// Run the lowered `Filter` JOIN against the live S8 projection for `subject` + `relation`, returning
@@ -177,9 +185,15 @@ fn id_d4_confidential_object_absent_from_every_list_path() {
         ListObjectsResult::Filter { set_expr, .. } => {
             // Lower the Filter to the SQL JOIN (the no-N+1 §7.2 lowering) and evaluate it against the
             // live reverse index for the intruder + the `read` relation.
-            let via = myelin_identity::ColRef { table: "repo".into(), column: "id".into() };
+            let via = myelin_identity::ColRef {
+                table: "repo".into(),
+                column: "id".into(),
+            };
             let lowered = lower(&set_expr, &intruder, &via);
-            assert!(lowered.depends_on_reverse_index(), "the Filter lowers to an S8 JOIN");
+            assert!(
+                lowered.depends_on_reverse_index(),
+                "the Filter lowers to an S8 JOIN"
+            );
             // The JOIN keys on the PERMISSION relation; the `read` permission is `reader ∪ writer`,
             // so the leak-free JOIN must return none of repo:secret for the intruder under EITHER
             // underlying relation.
@@ -210,9 +224,15 @@ fn id_d4_confidential_object_absent_from_every_list_path() {
     // Also confirm the lowered Filter under the stale pin yields the FallBackToCheck verdict (the
     // guard engaged — it did not silently serve the stale JOIN).
     {
-        let via = myelin_identity::ColRef { table: "repo".into(), column: "id".into() };
+        let via = myelin_identity::ColRef {
+            table: "repo".into(),
+            column: "id".into(),
+        };
         let join_lowered = lower(
-            &SetExpr::InRelation { relation: RelName("read".into()), via_column: via.clone() },
+            &SetExpr::InRelation {
+                relation: RelName("read".into()),
+                via_column: via.clone(),
+            },
             &intruder,
             &via,
         );
@@ -230,7 +250,10 @@ fn id_d4_confidential_object_absent_from_every_list_path() {
     signals
         .assert_signal(SignalName::CrossTenantCount, Predicate::Eq(0))
         .expect_green();
-    assert_eq!(escapes, 0, "0 confidential-object escapes across Ids + Filter + staleness (ID-D4)");
+    assert_eq!(
+        escapes, 0,
+        "0 confidential-object escapes across Ids + Filter + staleness (ID-D4)"
+    );
 
     println!(
         "[P-070 DRILL GREEN 2026-06-19] ID-D4 zero-escape list_objects leak: \

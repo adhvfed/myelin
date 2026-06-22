@@ -26,7 +26,10 @@ fn fully_green() -> Scorecard {
 #[test]
 fn baseline_all_proven_is_green() {
     let card = fully_green();
-    assert!(card.is_green(), "every required Id-M1 row proven ⇒ GREEN (M2 may start)");
+    assert!(
+        card.is_green(),
+        "every required Id-M1 row proven ⇒ GREEN (M2 may start)"
+    );
     assert!(card.missing_required().is_empty());
     assert!(card.not_proven().is_empty());
     let md = card.render_markdown("2026-06-19");
@@ -43,9 +46,20 @@ fn baseline_all_proven_is_green() {
 fn all_eight_id_drills_plus_coverage_are_required() {
     let ids: Vec<&str> = id_m1_required_rows().iter().map(|r| r.id).collect();
     for must in [
-        "ID-D1", "ID-D2", "ID-D3", "ID-D4", "ID-D5", "ID-D6", "ID-D7", "ID-D8", "contract-coverage",
+        "ID-D1",
+        "ID-D2",
+        "ID-D3",
+        "ID-D4",
+        "ID-D5",
+        "ID-D6",
+        "ID-D7",
+        "ID-D8",
+        "contract-coverage",
     ] {
-        assert!(ids.contains(&must), "Id-M1 gate is missing required row {must}");
+        assert!(
+            ids.contains(&must),
+            "Id-M1 gate is missing required row {must}"
+        );
     }
     assert_eq!(ids.len(), 9);
 }
@@ -56,7 +70,10 @@ fn all_eight_id_drills_plus_coverage_are_required() {
 fn dropping_any_single_row_reds_the_gate() {
     for dropped in id_m1_required_rows() {
         let mut card = Scorecard::new(Band::M1Identity);
-        for r in id_m1_required_rows().into_iter().filter(|r| r.id != dropped.id) {
+        for r in id_m1_required_rows()
+            .into_iter()
+            .filter(|r| r.id != dropped.id)
+        {
             card.record(RowResult::pass(r.id, "[2026-06-19] PASS", "2026-06-19"));
         }
         assert_eq!(
@@ -94,7 +111,9 @@ fn any_claimed_not_proven_row_reds_the_gate() {
             !card.is_green(),
             "a claimed-not-proven {red_id} row must block M2 (the gate invariant)"
         );
-        assert!(card.render_markdown("2026-06-19").contains("RED — M2 is BLOCKED"));
+        assert!(card
+            .render_markdown("2026-06-19")
+            .contains("RED — M2 is BLOCKED"));
     }
 }
 

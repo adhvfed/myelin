@@ -312,7 +312,10 @@ impl CostLedger {
         amount: MinorUnits,
         available: MinorUnits,
     ) -> Result<Reservation, ReserveError> {
-        if self.reservations.contains_key(&(tenant.clone(), run.clone())) {
+        if self
+            .reservations
+            .contains_key(&(tenant.clone(), run.clone()))
+        {
             return Err(ReserveError::DuplicateReservation);
         }
         // No balance → no run. The strict comparison is the floor: `available == amount` is
@@ -329,8 +332,7 @@ impl CostLedger {
             reserved: amount,
             state: ReservationState::Reserved,
         };
-        self.reservations
-            .insert((tenant, run), reservation.clone());
+        self.reservations.insert((tenant, run), reservation.clone());
         Ok(reservation)
     }
 
@@ -809,7 +811,10 @@ mod tests {
         assert!(r.contains("no balance, no run"), "must cite the floor: {r}");
         assert!(!r.is_empty());
         let s = SettleError::NoSuchReservation.to_string();
-        assert!(s.contains("never invents a charge"), "must be specific: {s}");
+        assert!(
+            s.contains("never invents a charge"),
+            "must be specific: {s}"
+        );
     }
 
     /// **THE SYNTHETIC-RUN INVARIANT DRILL (the P-ST-16 GATE artifact).** A full
@@ -848,7 +853,10 @@ mod tests {
             markup_total,
         };
 
-        assert!(signal.is_green(), "the synthetic-run drill must be GREEN: {signal:?}");
+        assert!(
+            signal.is_green(),
+            "the synthetic-run drill must be GREEN: {signal:?}"
+        );
         assert_eq!(signal.cost_events, 2);
         assert_eq!(signal.metered_units, 2);
         assert_eq!(signal.inflight_interrupt_count, 0);
@@ -873,7 +881,11 @@ mod tests {
             wholesale: MinorUnits(u64::MAX),
             markup: MinorUnits(1),
         };
-        assert_eq!(overflow.total(), None, "an overflowing unit total is a loud None");
+        assert_eq!(
+            overflow.total(),
+            None,
+            "an overflowing unit total is a loud None"
+        );
     }
 
     /// **The settle cap boundary** (`billed > reserved` is the cap, `billed == reserved` is
@@ -920,7 +932,12 @@ mod tests {
         // bleed into run A's recorded outcome (the `&&` tenant+run filter).
         let run_b = RunId::new("01J0RUN_B");
         ledger
-            .reserve(tenant(), run_b.clone(), MinorUnits(1_000), MinorUnits(9_000))
+            .reserve(
+                tenant(),
+                run_b.clone(),
+                MinorUnits(1_000),
+                MinorUnits(9_000),
+            )
             .unwrap();
         ledger.begin(&tenant(), &run_b).unwrap();
         let units_b = vec![MeteredUnit {
@@ -956,7 +973,11 @@ mod tests {
             markup: MinorUnits(0),
         }];
         let first = ledger.settle(&tenant(), &run(), &units).unwrap();
-        assert_eq!(first.billed_total, MinorUnits(100), "first settle clamps to reserved");
+        assert_eq!(
+            first.billed_total,
+            MinorUnits(100),
+            "first settle clamps to reserved"
+        );
 
         // Re-settle: the rebuild reconstructs raw billed = 1000 from the log, then clamps to
         // the 100 reservation (refund 0). If the cap used `>=`/`==` instead of `>`, the raw
@@ -1005,13 +1026,19 @@ mod tests {
             (tenant(), run_b.clone(), 200),
             (other_tenant.clone(), run(), 300),
         ] {
-            ledger.reserve(t.clone(), r.clone(), MinorUnits(1_000), MinorUnits(9_000)).unwrap();
+            ledger
+                .reserve(t.clone(), r.clone(), MinorUnits(1_000), MinorUnits(9_000))
+                .unwrap();
             ledger.begin(&t, &r).unwrap();
             ledger
                 .settle(
                     &t,
                     &r,
-                    &[MeteredUnit { unit: "u", wholesale: MinorUnits(w), markup: MinorUnits(0) }],
+                    &[MeteredUnit {
+                        unit: "u",
+                        wholesale: MinorUnits(w),
+                        markup: MinorUnits(0),
+                    }],
                 )
                 .unwrap();
         }
@@ -1055,6 +1082,9 @@ mod tests {
             wholesale_total: MinorUnits(320),
             markup_total: MinorUnits(80),
         };
-        assert!(!red_mismatch.is_green(), "a cost-event mismatch must read RED");
+        assert!(
+            !red_mismatch.is_green(),
+            "a cost-event mismatch must read RED"
+        );
     }
 }

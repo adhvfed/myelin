@@ -129,7 +129,10 @@ fn fragment(object_type: &str, relations: &[&str], permissions: &[&str]) -> Name
     NamespaceFragment {
         object_type: ObjectType(object_type.to_string()),
         relations: relations.iter().map(|r| RelName(r.to_string())).collect(),
-        permissions: permissions.iter().map(|p| Permission(p.to_string())).collect(),
+        permissions: permissions
+            .iter()
+            .map(|p| Permission(p.to_string()))
+            .collect(),
     }
 }
 
@@ -152,7 +155,13 @@ pub fn space_read_fragment() -> NamespaceFragment {
 pub fn page_read_fragment() -> NamespaceFragment {
     fragment(
         object_types::PAGE,
-        &[PARENT_PAGE, PARENT_SPACE, DIRECT_READER, DIRECT_BLOCK, WATCHER],
+        &[
+            PARENT_PAGE,
+            PARENT_SPACE,
+            DIRECT_READER,
+            DIRECT_BLOCK,
+            WATCHER,
+        ],
         &[READ, COMMENT, EDIT],
     )
 }
@@ -274,7 +283,11 @@ mod tests {
     fn the_read_vocabulary_is_frozen() {
         let frags = knowledge_read_fragment();
         let types: Vec<&str> = frags.iter().map(|f| f.object_type.0.as_str()).collect();
-        assert_eq!(types, ["space", "page", "block", "database_row"], "parent-before-child order");
+        assert_eq!(
+            types,
+            ["space", "page", "block", "database_row"],
+            "parent-before-child order"
+        );
 
         let page = page_read_fragment();
         for p in [READ, COMMENT, EDIT] {
@@ -284,12 +297,24 @@ mod tests {
             );
         }
         // the page declares the override + inheritance relations.
-        for r in [PARENT_PAGE, PARENT_SPACE, DIRECT_READER, DIRECT_BLOCK, WATCHER] {
-            assert!(page.relations.iter().any(|rel| rel.0 == r), "page declares `{r}`");
+        for r in [
+            PARENT_PAGE,
+            PARENT_SPACE,
+            DIRECT_READER,
+            DIRECT_BLOCK,
+            WATCHER,
+        ] {
+            assert!(
+                page.relations.iter().any(|rel| rel.0 == r),
+                "page declares `{r}`"
+            );
         }
         // the row declares row_reader + view_field (the row ACL + the field gate).
         let row = database_row_read_fragment();
-        assert!(row.relations.iter().any(|r| r.0 == ROW_READER), "database_row declares row_reader");
+        assert!(
+            row.relations.iter().any(|r| r.0 == ROW_READER),
+            "database_row declares row_reader"
+        );
         assert!(
             row.permissions.iter().any(|p| p.0 == VIEW_FIELD),
             "database_row declares view_field (the field gate)"
@@ -312,8 +337,14 @@ mod tests {
         assert_eq!(object_types::BLOCK, "block");
         assert_eq!(object_types::DATABASE_ROW, "database_row");
         // and they match the write-side carrier in myelin-content (one source of truth).
-        assert_eq!(object_types::PAGE, myelin_content::rebac_fragment::object_types::PAGE);
-        assert_eq!(object_types::SPACE, myelin_content::rebac_fragment::object_types::SPACE);
+        assert_eq!(
+            object_types::PAGE,
+            myelin_content::rebac_fragment::object_types::PAGE
+        );
+        assert_eq!(
+            object_types::SPACE,
+            myelin_content::rebac_fragment::object_types::SPACE
+        );
     }
 
     /// **The page.read override formula: `direct_block` REMOVES a narrowed sub-page from a viewer's
@@ -327,8 +358,14 @@ mod tests {
             &[],               // no direct grant on the sub-page
             &["alice"],        // the sub-page BLOCKS alice (the override)
         );
-        assert!(!resolved.contains("alice"), "the - direct_block override removes the inheriting alice");
-        assert!(resolved.contains("bob"), "an un-blocked inheriting reader stays");
+        assert!(
+            !resolved.contains("alice"),
+            "the - direct_block override removes the inheriting alice"
+        );
+        assert!(
+            resolved.contains("bob"),
+            "an un-blocked inheriting reader stays"
+        );
     }
 
     /// **The page.read override formula: a `direct_reader` ADDS a sub-page (the `+ direct_reader`
@@ -336,11 +373,14 @@ mod tests {
     #[test]
     fn direct_reader_adds_a_sub_page() {
         let resolved = page_read_override(
-            &["alice"],  // only alice inherits
-            &["carol"],  // carol is granted directly on the sub-page
+            &["alice"], // only alice inherits
+            &["carol"], // carol is granted directly on the sub-page
             &[],
         );
-        assert!(resolved.contains("carol"), "the + direct_reader arm adds carol");
+        assert!(
+            resolved.contains("carol"),
+            "the + direct_reader arm adds carol"
+        );
         assert!(resolved.contains("alice"), "the inheriting alice stays");
     }
 
@@ -350,9 +390,9 @@ mod tests {
     #[test]
     fn direct_block_overrides_even_a_direct_grant() {
         let resolved = page_read_override(
-            &[],            // no inheritance
-            &["mallory"],   // directly granted...
-            &["mallory"],   // ...AND blocked → the override wins
+            &[],          // no inheritance
+            &["mallory"], // directly granted...
+            &["mallory"], // ...AND blocked → the override wins
         );
         assert!(
             !resolved.contains("mallory"),
@@ -368,7 +408,10 @@ mod tests {
     fn inheritance_only_is_the_inherited_set() {
         let resolved = page_read_override(&["alice", "bob"], &[], &[]);
         let expect: BTreeSet<String> = ["alice", "bob"].iter().map(|s| s.to_string()).collect();
-        assert_eq!(resolved, expect, "with no override, read is the inherited set");
+        assert_eq!(
+            resolved, expect,
+            "with no override, read is the inherited set"
+        );
     }
 
     /// **The row-level `SetExpr` push-down shape is the frozen `InRelation { row_reader, db_row.id }`
@@ -378,10 +421,19 @@ mod tests {
     #[test]
     fn row_reader_push_down_is_inrelation_over_db_row_id() {
         match row_reader_set_expr() {
-            SetExpr::InRelation { relation, via_column } => {
-                assert_eq!(relation.0, "row_reader", "the row-level group grant relation");
+            SetExpr::InRelation {
+                relation,
+                via_column,
+            } => {
+                assert_eq!(
+                    relation.0, "row_reader",
+                    "the row-level group grant relation"
+                );
                 assert_eq!(via_column.table, "db_row", "the conjoin table");
-                assert_eq!(via_column.column, "id", "the via_column the JOIN keys on (no N+1)");
+                assert_eq!(
+                    via_column.column, "id",
+                    "the via_column the JOIN keys on (no N+1)"
+                );
             }
             other => panic!("the row push-down must be an InRelation, got {other:?}"),
         }
@@ -402,7 +454,11 @@ mod tests {
     fn no_read_name_smuggles_an_object_id() {
         let mints = |s: &str| s.contains(':') || s.contains('/') || s.contains('#');
         for f in knowledge_read_fragment() {
-            assert!(!mints(&f.object_type.0), "type `{}` is a bare identifier", f.object_type.0);
+            assert!(
+                !mints(&f.object_type.0),
+                "type `{}` is a bare identifier",
+                f.object_type.0
+            );
             for r in &f.relations {
                 assert!(!mints(&r.0), "relation `{}` is a bare identifier", r.0);
             }

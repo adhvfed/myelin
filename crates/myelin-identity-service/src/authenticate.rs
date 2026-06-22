@@ -61,9 +61,9 @@ use crate::principal_store::PrincipalStore;
 use myelin_identity::{
     iam_events::signals, AuthzError, CaveatContext, Consistency, Credential, Decision,
     DelegationCaveats, EffectivePolicy, FailStaticBound, FragmentAdmit, IdentityService,
-    ListObjectsResult, NamespaceFragment, ObjectId, ObjectType, Permission, Precondition, Principal,
-    PrincipalId, PrincipalStatus, RevokeTarget, RewriteTrace, RunId, RunToken, SubjectTree,
-    TupleDelta, Zookie,
+    ListObjectsResult, NamespaceFragment, ObjectId, ObjectType, Permission, Precondition,
+    Principal, PrincipalId, PrincipalStatus, RevokeTarget, RewriteTrace, RunId, RunToken,
+    SubjectTree, TupleDelta, Zookie,
 };
 use myelin_storage::TenantScope;
 use myelin_tenancy::{ArtifactRef, Region, TenantId};
@@ -257,7 +257,8 @@ impl IdorCounters {
     /// IDOR floor). `pub(crate)` so the machine-identity body shares the SAME counter primitive (one
     /// IDOR seam, never two; EI-01 §7).
     pub(crate) fn count_path_derived(&self) {
-        self.path_derived_tenant_count.fetch_add(1, Ordering::Relaxed);
+        self.path_derived_tenant_count
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Count a rejected path/credential tenant mismatch (the guard held; the effective tenant was
@@ -412,7 +413,10 @@ impl HumanSsoAuthenticator {
     /// Delegates to the path-aware [`Self::authenticate`] with `path_tenant = None`; the IDOR floor
     /// is unchanged (tenant is still the credential's). Kept separate so the richer gateway-facing
     /// form can COUNT a path mismatch while the bare ABI form stays the frozen signature.
-    pub fn authenticate_trait(&self, credential: &Credential) -> myelin_identity::Result<Principal> {
+    pub fn authenticate_trait(
+        &self,
+        credential: &Credential,
+    ) -> myelin_identity::Result<Principal> {
         self.authenticate(credential, None)
     }
 
@@ -465,7 +469,9 @@ impl IdentityService for HumanSsoAuthenticator {
         _ty: &ObjectType,
         _at: &Consistency,
     ) -> myelin_identity::Result<ListObjectsResult> {
-        Err(AuthzError::NotYetImplemented("list_objects → P-ID-11/12 (M1)"))
+        Err(AuthzError::NotYetImplemented(
+            "list_objects → P-ID-11/12 (M1)",
+        ))
     }
 
     fn list_subjects(
@@ -474,7 +480,9 @@ impl IdentityService for HumanSsoAuthenticator {
         _permission: &Permission,
         _at: &Consistency,
     ) -> myelin_identity::Result<SubjectTree> {
-        Err(AuthzError::NotYetImplemented("list_subjects → P-ID-13 (M1)"))
+        Err(AuthzError::NotYetImplemented(
+            "list_subjects → P-ID-13 (M1)",
+        ))
     }
 
     fn explain(
@@ -510,7 +518,9 @@ impl IdentityService for HumanSsoAuthenticator {
         _delegation_caveats: &DelegationCaveats,
         _ttl: &FailStaticBound,
     ) -> myelin_identity::Result<RunToken> {
-        Err(AuthzError::NotYetImplemented("mint_run_token → P-ID-18 (M1)"))
+        Err(AuthzError::NotYetImplemented(
+            "mint_run_token → P-ID-18 (M1)",
+        ))
     }
 
     fn revoke(&self, _target: &RevokeTarget) -> myelin_identity::Result<()> {
@@ -522,7 +532,9 @@ impl IdentityService for HumanSsoAuthenticator {
         _subject: &PrincipalId,
         _tenant: &TenantId,
     ) -> myelin_identity::Result<String> {
-        Err(AuthzError::NotYetImplemented("resolve_pseudonym → P-ID-19 (M1)"))
+        Err(AuthzError::NotYetImplemented(
+            "resolve_pseudonym → P-ID-19 (M1)",
+        ))
     }
 
     fn erase(&self, _subject: &PrincipalId) -> myelin_identity::Result<()> {
@@ -533,7 +545,9 @@ impl IdentityService for HumanSsoAuthenticator {
         &self,
         _fragment: &NamespaceFragment,
     ) -> myelin_identity::Result<FragmentAdmit> {
-        Err(AuthzError::NotYetImplemented("admit_fragment → P-ID-10 (M1)"))
+        Err(AuthzError::NotYetImplemented(
+            "admit_fragment → P-ID-10 (M1)",
+        ))
     }
 }
 
@@ -613,7 +627,11 @@ mod tests {
                 )
                 .unwrap_or_else(|e| panic!("scheme `{s}` should resolve: {e:?}"));
             assert_eq!(p.principal_id, PrincipalId("p:alice".into()), "scheme {s}");
-            assert_eq!(p.tenant, TenantId("acme".into()), "scheme {s} tenant from credential");
+            assert_eq!(
+                p.tenant,
+                TenantId("acme".into()),
+                "scheme {s} tenant from credential"
+            );
             assert_eq!(p.region, Region("eu-west".into()), "scheme {s} region");
             assert_eq!(p.kind, PrincipalKind::Human, "scheme {s} polymorphic kind");
         }
@@ -705,8 +723,13 @@ mod tests {
             None,
         )
         .unwrap();
-        st.link_credential(&acme, scheme::OIDC, "subj-1", &PrincipalId("p:alice".into()))
-            .unwrap();
+        st.link_credential(
+            &acme,
+            scheme::OIDC,
+            "subj-1",
+            &PrincipalId("p:alice".into()),
+        )
+        .unwrap();
         let auth = HumanSsoAuthenticator::new(st);
 
         // A credential VERIFIED for globex (a different tenant) presenting the same subject key
@@ -777,7 +800,11 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(auth.telemetry().decision_count(), 1, "success emits one observation");
+        assert_eq!(
+            auth.telemetry().decision_count(),
+            1,
+            "success emits one observation"
+        );
         // A FAILURE (unknown subject) STILL emits — every decision is observed.
         let _ = auth.authenticate(
             &Credential {

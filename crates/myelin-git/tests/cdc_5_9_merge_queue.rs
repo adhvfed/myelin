@@ -56,15 +56,25 @@ fn producer_rollup(overall: CiOverall, contexts: Vec<String>, attempt: &str) -> 
 #[test]
 fn cdc_5_9_ci_result_rollup_round_trips_through_the_signal_codec() {
     let attempt = merge_attempt_id(RUN, "merge.queue:0");
-    let rollup = producer_rollup(CiOverall::Success, vec!["ci/build".into(), "ci/test".into()], &attempt);
+    let rollup = producer_rollup(
+        CiOverall::Success,
+        vec!["ci/build".into(), "ci/test".into()],
+        &attempt,
+    );
 
     // PRODUCER encodes the rollup into the signal's references-not-payloads body.
     let refs = encode_ci_result(&rollup);
-    assert!(refs.iter().all(|r| r.0.starts_with("ci.result:")), "machine tokens only (no inline PII)");
+    assert!(
+        refs.iter().all(|r| r.0.starts_with("ci.result:")),
+        "machine tokens only (no inline PII)"
+    );
 
     // CONSUMER decodes it — `idem_token` is the signal envelope's idem_key (the merge_attempt_id).
     let decoded = decode_ci_result(&refs, &attempt).expect("the rollup decodes");
-    assert_eq!(decoded, rollup, "the producer rollup round-trips to EXACTLY the consumer's CiResult");
+    assert_eq!(
+        decoded, rollup,
+        "the producer rollup round-trips to EXACTLY the consumer's CiResult"
+    );
 }
 
 /// **THE CDC: a doubly-delivered `ci.result` under the same `merge_attempt_id` is ONE buffered row (one
@@ -80,8 +90,15 @@ fn cdc_5_9_doubly_delivered_ci_result_is_one_buffered_row() {
     let second = producer.deliver(&attempt, HEAD, CiOverall::Success, vec!["ci/build".into()]);
 
     assert!(first, "the first delivery is new");
-    assert!(!second, "the at-least-once double-delivery deduped (ON CONFLICT DO NOTHING on the wf_signal PK)");
-    assert_eq!(signals.buffered_depth(), 1, "ONE buffered ci.result row — the workflow wakes ONCE");
+    assert!(
+        !second,
+        "the at-least-once double-delivery deduped (ON CONFLICT DO NOTHING on the wf_signal PK)"
+    );
+    assert_eq!(
+        signals.buffered_depth(),
+        1,
+        "ONE buffered ci.result row — the workflow wakes ONCE"
+    );
 }
 
 /// **THE CDC: the producer + consumer agree on the `merge_attempt_id` WITHOUT coordination.** The
@@ -93,7 +110,10 @@ fn cdc_5_9_producer_and_consumer_agree_on_the_merge_attempt_id() {
     let consumer_key = merge_attempt_id(RUN, "merge.queue:0");
     // The producer (CI) derives the SAME id independently — the no-coordination agreement.
     let producer_key = merge_attempt_id(RUN, "merge.queue:0");
-    assert_eq!(consumer_key, producer_key, "producer and consumer derive the same merge_attempt_id");
+    assert_eq!(
+        consumer_key, producer_key,
+        "producer and consumer derive the same merge_attempt_id"
+    );
     assert_eq!(consumer_key, "R1/merge.queue:0/merge");
 }
 
@@ -104,5 +124,9 @@ fn cdc_5_9_failure_rollup_decodes_to_failure() {
     let attempt = merge_attempt_id(RUN, "merge.queue:0");
     let rollup = producer_rollup(CiOverall::Failure, vec!["ci/build".into()], &attempt);
     let decoded = decode_ci_result(&encode_ci_result(&rollup), &attempt).expect("decodes");
-    assert_eq!(decoded.overall, CiOverall::Failure, "a failure rollup decodes to Failure");
+    assert_eq!(
+        decoded.overall,
+        CiOverall::Failure,
+        "a failure rollup decodes to Failure"
+    );
 }

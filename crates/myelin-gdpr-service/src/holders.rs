@@ -73,7 +73,7 @@ use std::sync::Mutex;
 
 use myelin_gdpr::{
     DsrError, EraseReceipt, EraseScope, LocateReport, Patch, PersonalDataHolder, PortableBundle,
-    Receipt, RectifyReceipt, Result as DsrResult, RestrictReceipt, SubjectRef, TenantId,
+    Receipt, RectifyReceipt, RestrictReceipt, Result as DsrResult, SubjectRef, TenantId,
 };
 
 // ───────────────────────────── the crypto-shred KMS seam (11.3/11.4) ─────────────────────────────
@@ -298,7 +298,11 @@ impl PersonalDataHolder for GdprOwnStoreHolder<'_> {
         // honoured-everywhere proof over the derived stores is M2 P-GA-25; here the GDPR-owned
         // holder records the restriction verdict.
         let sid = Self::subject_id(subject);
-        let outcome = if on { "restricted:set" } else { "restricted:clear" };
+        let outcome = if on {
+            "restricted:set"
+        } else {
+            "restricted:clear"
+        };
         Ok(RestrictReceipt {
             receipt: Receipt::content_addressed(
                 "restrict",
@@ -451,7 +455,11 @@ impl PersonalDataHolder for AuditCarveOutHolder<'_> {
 
     fn restrict(&self, subject: &SubjectRef, on: bool) -> DsrResult<RestrictReceipt> {
         let sid = subject.principal.principal_id.0.clone();
-        let outcome = if on { "restricted:set" } else { "restricted:clear" };
+        let outcome = if on {
+            "restricted:set"
+        } else {
+            "restricted:clear"
+        };
         Ok(RestrictReceipt {
             receipt: Receipt::content_addressed(
                 "restrict",
@@ -521,7 +529,9 @@ impl PersonalDataHolder for AuditCarveOutHolder<'_> {
 /// telemetry over THIS set reads 100% on the floor; GA-D1's "0 holders missed" over the WHOLE
 /// data map is the M5 gate (P-GA-32). PII-free holder ids.
 pub fn gdpr_owned_holder_ids() -> BTreeSet<&'static str> {
-    [GDPR_OWN_STORE, AUDIT_CARVE_OUT_STORE].into_iter().collect()
+    [GDPR_OWN_STORE, AUDIT_CARVE_OUT_STORE]
+        .into_iter()
+        .collect()
 }
 
 #[cfg(test)]
@@ -542,7 +552,11 @@ mod tests {
     }
 
     /// Seed a KMS with a subject's consent DEK present (live + in backup) at an epoch.
-    fn kms_with_subject_dek(subject: &SubjectRef, tenant: &TenantId, epoch: u64) -> InMemoryShredKms {
+    fn kms_with_subject_dek(
+        subject: &SubjectRef,
+        tenant: &TenantId,
+        epoch: u64,
+    ) -> InMemoryShredKms {
         let kms = InMemoryShredKms::new();
         kms.provision(
             ShredKeyHandle {
@@ -588,7 +602,10 @@ mod tests {
             tenant: tenant.clone(),
             class: ShredKeyClass::Subject(subj.principal.principal_id.0.clone()),
         };
-        assert!(!kms.is_present(&handle), "the consent DEK is destroyed (live)");
+        assert!(
+            !kms.is_present(&handle),
+            "the consent DEK is destroyed (live)"
+        );
         assert_eq!(
             kms.recoverable_in_backup(&handle),
             0,
@@ -661,7 +678,10 @@ mod tests {
         };
         let r1 = holder.erase(scope()).unwrap();
         let r2 = holder.erase(scope()).unwrap();
-        assert_eq!(r1.receipt, r2.receipt, "an idempotent re-erase returns the SAME receipt");
+        assert_eq!(
+            r1.receipt, r2.receipt,
+            "an idempotent re-erase returns the SAME receipt"
+        );
         assert_eq!(r1.receipt.key_epoch_destroyed, Some(9));
     }
 
@@ -683,7 +703,11 @@ mod tests {
             tenant: tenant.clone(),
             class: ShredKeyClass::Tenant,
         };
-        assert_eq!(kms.recoverable_in_backup(&handle), 0, "tenant register DEK gone");
+        assert_eq!(
+            kms.recoverable_in_backup(&handle),
+            0,
+            "tenant register DEK gone"
+        );
     }
 
     #[test]
@@ -698,8 +722,15 @@ mod tests {
             holder.rectify(&subj, Patch("p".into())).unwrap().receipt,
             holder.restrict(&subj, true).unwrap().receipt,
         ] {
-            assert!(r.content_hash.starts_with("blake3:"), "{} is content-addressed", r.operation);
-            assert_eq!(r.key_epoch_destroyed, None, "a non-erase op destroys no key");
+            assert!(
+                r.content_hash.starts_with("blake3:"),
+                "{} is content-addressed",
+                r.operation
+            );
+            assert_eq!(
+                r.key_epoch_destroyed, None,
+                "a non-erase op destroys no key"
+            );
         }
     }
 
@@ -759,7 +790,11 @@ mod tests {
             tenant: tenant.clone(),
             class: ShredKeyClass::AuditKey,
         };
-        assert_eq!(kms.recoverable_in_backup(&handle), 0, "audit-key shredded at retention end");
+        assert_eq!(
+            kms.recoverable_in_backup(&handle),
+            0,
+            "audit-key shredded at retention end"
+        );
     }
 
     /// The floor gate reading [`CryptoShredKms::recoverable_in_backup`] is NOT vacuously 0: a
@@ -773,11 +808,23 @@ mod tests {
             class: ShredKeyClass::Subject("u-present".into()),
         };
         kms.provision(handle.clone(), 1);
-        assert_eq!(kms.recoverable_in_backup(&handle), 1, "a present key IS recoverable in backup");
+        assert_eq!(
+            kms.recoverable_in_backup(&handle),
+            1,
+            "a present key IS recoverable in backup"
+        );
         assert!(kms.is_present(&handle));
         // After destroy: 0 recoverable (the post-condition the floor proves).
-        assert_eq!(kms.destroy(&handle), Some(1), "destroy returns the destroyed epoch");
-        assert_eq!(kms.recoverable_in_backup(&handle), 0, "destroyed ⇒ 0 recoverable");
+        assert_eq!(
+            kms.destroy(&handle),
+            Some(1),
+            "destroy returns the destroyed epoch"
+        );
+        assert_eq!(
+            kms.recoverable_in_backup(&handle),
+            0,
+            "destroyed ⇒ 0 recoverable"
+        );
         assert!(!kms.is_present(&handle));
     }
 
@@ -810,8 +857,15 @@ mod tests {
         // would swap the two outcomes). A PRESENT key must yield the `located:present` verdict; an
         // ERASED key must yield `located:0-recoverable` — compared against the canonical receipts.
         let sid = subj.principal.principal_id.0.clone();
-        let expect_present =
-            Receipt::content_addressed("locate", GDPR_OWN_STORE, &sid, &tenant.0, "located:present", None, 0);
+        let expect_present = Receipt::content_addressed(
+            "locate",
+            GDPR_OWN_STORE,
+            &sid,
+            &tenant.0,
+            "located:present",
+            None,
+            0,
+        );
         let expect_zero = Receipt::content_addressed(
             "locate",
             GDPR_OWN_STORE,
@@ -821,8 +875,14 @@ mod tests {
             None,
             0,
         );
-        assert_eq!(present, expect_present, "a present DEK ⇒ the `located:present` verdict");
-        assert_eq!(after, expect_zero, "an erased DEK ⇒ the `located:0-recoverable` verdict");
+        assert_eq!(
+            present, expect_present,
+            "a present DEK ⇒ the `located:present` verdict"
+        );
+        assert_eq!(
+            after, expect_zero,
+            "an erased DEK ⇒ the `located:0-recoverable` verdict"
+        );
     }
 
     /// The PII-free key-class token + the holder names are stable (the data-map / fan-out address
@@ -835,8 +895,14 @@ mod tests {
         let kms = InMemoryShredKms::new();
         assert_eq!(GdprOwnStoreHolder::new(&kms).store_name(), GDPR_OWN_STORE);
         assert_eq!(GdprOwnStoreHolder::new(&kms).store_name(), "gdpr_own_store");
-        assert_eq!(AuditCarveOutHolder::new(&kms).store_name(), AUDIT_CARVE_OUT_STORE);
-        assert_eq!(AuditCarveOutHolder::new(&kms).store_name(), "audit_log_carve_out");
+        assert_eq!(
+            AuditCarveOutHolder::new(&kms).store_name(),
+            AUDIT_CARVE_OUT_STORE
+        );
+        assert_eq!(
+            AuditCarveOutHolder::new(&kms).store_name(),
+            "audit_log_carve_out"
+        );
     }
 
     // ───────── the GDPR-owned holder set ─────────
@@ -844,9 +910,19 @@ mod tests {
     #[test]
     fn the_gdpr_owned_holder_set_is_h18_and_h16() {
         let ids = gdpr_owned_holder_ids();
-        assert!(ids.contains(GDPR_OWN_STORE), "H18 (GDPR own stores) is covered");
-        assert!(ids.contains(AUDIT_CARVE_OUT_STORE), "H16 (audit carve-out) is covered");
-        assert_eq!(ids.len(), 2, "P-GA-05 covers exactly the GDPR-OWNED holders (H18 + H16)");
+        assert!(
+            ids.contains(GDPR_OWN_STORE),
+            "H18 (GDPR own stores) is covered"
+        );
+        assert!(
+            ids.contains(AUDIT_CARVE_OUT_STORE),
+            "H16 (audit carve-out) is covered"
+        );
+        assert_eq!(
+            ids.len(),
+            2,
+            "P-GA-05 covers exactly the GDPR-OWNED holders (H18 + H16)"
+        );
     }
 
     #[test]

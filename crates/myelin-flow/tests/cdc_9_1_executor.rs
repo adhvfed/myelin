@@ -81,7 +81,9 @@ impl QueryDurableExecutor for FlowExecutorAdapter {
         let spec = StartSpec {
             wf_type: workflow_ref.0.clone(),
             input: input_refs,
-            budget: Some(RunBudget { minor_units: 10_000 }),
+            budget: Some(RunBudget {
+                minor_units: 10_000,
+            }),
             idem_key: idem_key.to_string(),
         };
         let run_id = self
@@ -115,7 +117,10 @@ fn provider_flow_executor_starts_describes_and_cancels() {
     // start is idempotent on idem_key (a re-start returns the SAME run).
     let r1 = ex.start(spec.clone()).expect("start");
     let r2 = ex.start(spec).expect("re-start");
-    assert_eq!(r1, r2, "PROVIDER promise: start is idempotent on idem_key (one run)");
+    assert_eq!(
+        r1, r2,
+        "PROVIDER promise: start is idempotent on idem_key (one run)"
+    );
 
     // describe returns the run's status.
     let status = ex.describe(&r1).expect("describe");
@@ -141,7 +146,8 @@ fn consumer_start_through_the_adapter_is_idempotent_on_idem_key() {
     let idem = "rule-7:evt-42";
 
     let h1 = QueryDurableExecutor::start(&adapter, &wf, &input, idem).expect("start");
-    let h2 = QueryDurableExecutor::start(&adapter, &wf, &input, idem).expect("re-start (redelivery)");
+    let h2 =
+        QueryDurableExecutor::start(&adapter, &wf, &input, idem).expect("re-start (redelivery)");
     assert_eq!(
         h1, h2,
         "CONSUMER reliance: a redelivered firing returns the SAME handle (one durable run, not two)"
@@ -151,7 +157,10 @@ fn consumer_start_through_the_adapter_is_idempotent_on_idem_key() {
     let total: usize = (0..PARTITION_COUNT as i16)
         .map(|p| adapter.inner.runs().runnable_lag(p, i64::MAX))
         .sum();
-    assert_eq!(total, 1, "the provider seeded exactly one run (the redelivery delegated to a no-op)");
+    assert_eq!(
+        total, 1,
+        "the provider seeded exactly one run (the redelivery delegated to a no-op)"
+    );
 }
 
 /// **The two seam shapes RECONCILE — the consumer's `InMemoryExecutor` floor and the provider-backed

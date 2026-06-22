@@ -36,7 +36,11 @@ use std::sync::Arc;
 const SUBJECT: &str = "myelin://acme/issues/issue/PROJ-1";
 
 fn principal() -> Principal {
-    Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId("acme".into()))
+    Principal::stub(
+        PrincipalId("p".into()),
+        PrincipalKind::Human,
+        TenantId("acme".into()),
+    )
 }
 
 /// **PROVIDER side of 2.8** — a producer on an EARLIER deploy emits the event at an OLD
@@ -95,7 +99,12 @@ impl EventHandler for CurrentShapeHandler {
     }
     fn handle(&self, ev: &EventEnvelope) -> HandleOutcome {
         self.seen_ver.store(ev.schema_ver, Ordering::SeqCst);
-        if ev.payload.as_object().map(|m| m.contains_key("priority")).unwrap_or(false) {
+        if ev
+            .payload
+            .as_object()
+            .map(|m| m.contains_key("priority"))
+            .unwrap_or(false)
+        {
             self.saw_priority.store(1, Ordering::SeqCst);
         }
         HandleOutcome::Done
@@ -118,7 +127,10 @@ fn subscription() -> Subscription {
 fn cdc_2_8_old_event_is_upcast_to_current_before_handle() {
     let seen_ver = Arc::new(AtomicU32::new(0));
     let saw_priority = Arc::new(AtomicU32::new(0));
-    let handler = CurrentShapeHandler { seen_ver: seen_ver.clone(), saw_priority: saw_priority.clone() };
+    let handler = CurrentShapeHandler {
+        seen_ver: seen_ver.clone(),
+        saw_priority: saw_priority.clone(),
+    };
 
     let c = Consumer::new(handler, subscription(), DedupLedger::new())
         .with_upcaster(consumer_registry().into_hook());
@@ -126,12 +138,26 @@ fn cdc_2_8_old_event_is_upcast_to_current_before_handle() {
     // The provider's OLD (v1) event arrives at the consumer.
     let old = provider_emits_old_version(1);
     assert_eq!(old.schema_ver, 1, "provider emitted the old version");
-    assert!(old.payload.as_object().unwrap().get("priority").is_none(), "old shape has no priority");
+    assert!(
+        old.payload.as_object().unwrap().get("priority").is_none(),
+        "old shape has no priority"
+    );
 
-    let out = c.deliver(&Message { subject: SUBJECT.into(), envelope: old });
+    let out = c.deliver(&Message {
+        subject: SUBJECT.into(),
+        envelope: old,
+    });
     assert_eq!(out, Delivered::Acked, "the upcasted event handles cleanly");
-    assert_eq!(seen_ver.load(Ordering::SeqCst), 2, "the handler saw the CURRENT schema_ver");
-    assert_eq!(saw_priority.load(Ordering::SeqCst), 1, "the handler saw the forward-added field");
+    assert_eq!(
+        seen_ver.load(Ordering::SeqCst),
+        2,
+        "the handler saw the CURRENT schema_ver"
+    );
+    assert_eq!(
+        saw_priority.load(Ordering::SeqCst),
+        1,
+        "the handler saw the forward-added field"
+    );
 }
 
 /// **CDC 2.8 — an un-upcastable `schema_ver` is term'd to the DLQ, never silently dropped.** The
@@ -152,14 +178,28 @@ fn cdc_2_8_unbridgeable_version_is_dead_lettered_never_silently_dropped() {
     let mut ancient = provider_emits_old_version(0);
     ancient.event_id = EventId("01J-ancient".into());
 
-    let out = c.deliver(&Message { subject: SUBJECT.into(), envelope: ancient });
+    let out = c.deliver(&Message {
+        subject: SUBJECT.into(),
+        envelope: ancient,
+    });
 
     match out {
         Delivered::DeadLettered(Reason(msg)) => {
-            assert!(msg.contains("unbridgeable schema gap"), "the DLQ reason names the gap: {msg}");
+            assert!(
+                msg.contains("unbridgeable schema gap"),
+                "the DLQ reason names the gap: {msg}"
+            );
         }
         other => panic!("an unbridgeable version must dead-letter, got {other:?}"),
     }
-    assert_eq!(seen_ver.load(Ordering::SeqCst), 0, "the handler NEVER saw the un-upcastable shape");
-    assert_eq!(c.dead_letters().len(), 1, "term'd to the DLQ — surfaced, 0 silently dropped");
+    assert_eq!(
+        seen_ver.load(Ordering::SeqCst),
+        0,
+        "the handler NEVER saw the un-upcastable shape"
+    );
+    assert_eq!(
+        c.dead_letters().len(),
+        1,
+        "term'd to the DLQ — surfaced, 0 silently dropped"
+    );
 }

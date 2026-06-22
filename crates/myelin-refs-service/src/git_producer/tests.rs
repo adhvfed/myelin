@@ -94,7 +94,10 @@ fn commit_trailer_reference_sources_from_the_commit_root() {
     ))];
     let edges = producer.git_edges(&source, &body);
     assert_eq!(edges.len(), 1);
-    assert_eq!(edges[0].source.0, "myelin://acme-eu/git/commit/repo7:abc123def");
+    assert_eq!(
+        edges[0].source.0,
+        "myelin://acme-eu/git/commit/repo7:abc123def"
+    );
     assert_eq!(edges[0].target.0, "myelin://acme-eu/issue/issue/ENG-7");
 }
 
@@ -110,13 +113,18 @@ fn commit_trailer_reference_sources_from_the_commit_root() {
 #[test]
 fn force_pushed_line_range_resolves_moved_with_shifted_anchor() {
     let owner = GitOwner::new();
-    let ref_ = myelin_git::subs::mint_blob_line_range("acme-eu", "repo7", "main", "src/lib.rs", 42, 44)
-        .expect("grammatical line-range mint");
+    let ref_ =
+        myelin_git::subs::mint_blob_line_range("acme-eu", "repo7", "main", "src/lib.rs", 42, 44)
+            .expect("grammatical line-range mint");
 
     // Mint-time blob: the anchored lines at 42..=44 of the ORIGINAL blob.
     let original = [
-        "// header", "use std::fmt;", "", // 1..3
-        "fn answer() -> u32 {", "    let x = 40;", "    x + 2", // 4..6
+        "// header",
+        "use std::fmt;",
+        "", // 1..3
+        "fn answer() -> u32 {",
+        "    let x = 40;",
+        "    x + 2", // 4..6
     ];
     // We anchor 3 real lines; build the mint over a blob where those lines sit at 42..=44 by padding.
     let mut padded: Vec<&str> = (0..41).map(|_| "// pad").collect();
@@ -138,7 +146,10 @@ fn force_pushed_line_range_resolves_moved_with_shifted_anchor() {
             );
             // The anchor reflects the SHIFTED position (45..=47 — moved down by the 3 prepended lines),
             // never the stale raw L42-L44.
-            assert_eq!(p.sub_anchor.as_deref().unwrap(), "myelin://acme-eu/git/blob/repo7:main:src%2Flib.rs#L45-L47");
+            assert_eq!(
+                p.sub_anchor.as_deref().unwrap(),
+                "myelin://acme-eu/git/blob/repo7:main:src%2Flib.rs#L45-L47"
+            );
         }
         other => panic!("expected MOVED Live, got {other:?}"),
     }
@@ -161,7 +172,10 @@ fn partially_edited_line_range_resolves_outdated() {
     match outcome {
         ProjectOutcome::Live(p) => {
             assert_eq!(p.flag, Some(crate::resolve::ProjectionFlag::Outdated));
-            assert_eq!(p.sub_anchor.as_deref().unwrap(), "myelin://acme-eu/git/blob/repo7:main:f.rs#L1-L2");
+            assert_eq!(
+                p.sub_anchor.as_deref().unwrap(),
+                "myelin://acme-eu/git/blob/repo7:main:f.rs#L1-L2"
+            );
         }
         other => panic!("expected OUTDATED Live, got {other:?}"),
     }
@@ -226,12 +240,12 @@ fn exact_line_range_resolves_live() {
 #[test]
 fn git_comment_and_thread_anchors_degrade_through_the_ladder() {
     let owner = GitOwner::new();
-    let comment = myelin_git::subs::mint_pr_comment("acme-eu", "repo7", 4291, "cAbc")
-        .expect("grammatical");
-    let thread = myelin_git::subs::mint_pr_thread("acme-eu", "repo7", 4291, "tXyz")
-        .expect("grammatical");
-    let deleted = myelin_git::subs::mint_pr_comment("acme-eu", "repo7", 4291, "cDel")
-        .expect("grammatical");
+    let comment =
+        myelin_git::subs::mint_pr_comment("acme-eu", "repo7", 4291, "cAbc").expect("grammatical");
+    let thread =
+        myelin_git::subs::mint_pr_thread("acme-eu", "repo7", 4291, "tXyz").expect("grammatical");
+    let deleted =
+        myelin_git::subs::mint_pr_comment("acme-eu", "repo7", 4291, "cDel").expect("grammatical");
 
     owner.record_comment(&comment, CommentState::Moved);
     owner.record_comment(&thread, CommentState::Resolved);
@@ -243,11 +257,16 @@ fn git_comment_and_thread_anchors_degrade_through_the_ladder() {
         other => panic!("comment moved → MOVED Live, got {other:?}"),
     }
     match resolve_sub_outcome(&owner, &thread) {
-        ProjectOutcome::Live(p) => assert_eq!(p.flag, Some(crate::resolve::ProjectionFlag::Outdated)),
+        ProjectOutcome::Live(p) => {
+            assert_eq!(p.flag, Some(crate::resolve::ProjectionFlag::Outdated))
+        }
         other => panic!("thread resolved → OUTDATED, got {other:?}"),
     }
     // A deleted comment → sub-gone (the root PR is carried by the chokepoint).
-    assert_eq!(resolve_sub_outcome(&owner, &deleted), ProjectOutcome::SubGone);
+    assert_eq!(
+        resolve_sub_outcome(&owner, &deleted),
+        ProjectOutcome::SubGone
+    );
 }
 
 /// **The CI `check-`/`step-` kinds are USED (not built) — they resolve through the SAME ladder (C-6).**
@@ -265,7 +284,10 @@ fn ci_check_and_step_sub_anchors_resolve_through_the_same_ladder() {
     owner.record_check(&check, CommentState::Live); // a live check status
     owner.record_check(&step, CommentState::Gone); // a pruned run → sub-gone
 
-    assert!(matches!(resolve_sub_outcome(&owner, &check), ProjectOutcome::Live(_)));
+    assert!(matches!(
+        resolve_sub_outcome(&owner, &check),
+        ProjectOutcome::Live(_)
+    ));
     assert_eq!(resolve_sub_outcome(&owner, &step), ProjectOutcome::SubGone);
     // Both are first-class #sub kinds in the one grammar (C-6).
     assert!(sub_kind(&check).is_some());
@@ -354,7 +376,11 @@ fn ref_d2_cross_tenant_git_backlink_read_returns_nothing() {
             10,
         )
         .expect("backlink read");
-    assert_eq!(page.edges.len(), 0, "no cross-tenant Git backlink is visible (REF-D2)");
+    assert_eq!(
+        page.edges.len(),
+        0,
+        "no cross-tenant Git backlink is visible (REF-D2)"
+    );
 }
 
 /// **The Git ReBAC fragment flows through `list_objects` (4.9 / GIT-D11): a viewer outside the
@@ -369,7 +395,10 @@ fn git_fragment_flows_through_list_objects_leak_free() {
     let edges = EdgeProjection::new();
     // Two Git PRs link a shared issue. PR-public is readable; PR-secret is not.
     let issue = "myelin://acme-eu/issue/issue/ENG-1";
-    for pr in ["myelin://acme-eu/git/pr/repo:public", "myelin://acme-eu/git/pr/repo:secret"] {
+    for pr in [
+        "myelin://acme-eu/git/pr/repo:public",
+        "myelin://acme-eu/git/pr/repo:secret",
+    ] {
         let id = edge_id(&t, pr, issue, "links");
         edges.upsert(
             &t,
@@ -393,14 +422,31 @@ fn git_fragment_flows_through_list_objects_leak_free() {
     let v = viewer("dev", &t);
     // The Git fragment's `repo->pull` allow-set (list_objects) admits ONLY the public PR.
     let allowed = ListObjectsResult::Ids {
-        ids: vec![myelin_identity::ObjectId("myelin://acme-eu/git/pr/repo:public".into())],
+        ids: vec![myelin_identity::ObjectId(
+            "myelin://acme-eu/git/pr/repo:public".into(),
+        )],
         zookie: myelin_identity::Zookie("zk-1".into()),
     };
     let page = read
-        .backlinks(&t, &region(), &ArtifactRef(issue.into()), &v, &allowed, &bounded_stale(), 10)
+        .backlinks(
+            &t,
+            &region(),
+            &ArtifactRef(issue.into()),
+            &v,
+            &allowed,
+            &bounded_stale(),
+            10,
+        )
         .expect("backlink read");
-    assert_eq!(page.edges.len(), 1, "only the repo->pull-admitted PR is visible");
-    assert_eq!(page.edges[0].source.0, "myelin://acme-eu/git/pr/repo:public");
+    assert_eq!(
+        page.edges.len(),
+        1,
+        "only the repo->pull-admitted PR is visible"
+    );
+    assert_eq!(
+        page.edges[0].source.0,
+        "myelin://acme-eu/git/pr/repo:public"
+    );
 }
 
 // ===========================================================================
@@ -412,13 +458,22 @@ fn git_fragment_flows_through_list_objects_leak_free() {
 /// selector matches the grain Git's `replay` parses ([`myelin_git::replay::GitReplayKind`]).
 #[test]
 fn git_replay_scope_is_sub_artifact_granular() {
-    assert_eq!(git_replay_scope(GitReplayGrain::Repo("core".into())), "repo:core");
     assert_eq!(
-        git_replay_scope(GitReplayGrain::Blob { repo: "core".into(), oid: "abc".into() }),
+        git_replay_scope(GitReplayGrain::Repo("core".into())),
+        "repo:core"
+    );
+    assert_eq!(
+        git_replay_scope(GitReplayGrain::Blob {
+            repo: "core".into(),
+            oid: "abc".into()
+        }),
         "blob:core/abc"
     );
     assert_eq!(
-        git_replay_scope(GitReplayGrain::Pr { repo: "core".into(), number: 42 }),
+        git_replay_scope(GitReplayGrain::Pr {
+            repo: "core".into(),
+            number: 42
+        }),
         "pr:core/42"
     );
     // The grain is the one Git's producer owns (the token, never a literal).
@@ -434,8 +489,16 @@ fn ref_d4_git_edge_reindex_byte_parity() {
     let t = tenant();
     // A Git edge corpus: a PR links an issue, a commit links an issue, a line-range embeds a blob.
     let corpus = [
-        ("myelin://acme-eu/git/pr/repo:9", "myelin://acme-eu/issue/issue/ENG-1", "links"),
-        ("myelin://acme-eu/git/commit/repo:abc", "myelin://acme-eu/issue/issue/ENG-2", "links"),
+        (
+            "myelin://acme-eu/git/pr/repo:9",
+            "myelin://acme-eu/issue/issue/ENG-1",
+            "links",
+        ),
+        (
+            "myelin://acme-eu/git/commit/repo:abc",
+            "myelin://acme-eu/issue/issue/ENG-2",
+            "links",
+        ),
         (
             "myelin://acme-eu/git/blob/repo:main:src%2Flib.rs#L1-L9",
             "myelin://acme-eu/git/blob/repo:main:src%2Flib.rs",

@@ -217,7 +217,9 @@ impl RunStore {
 
     /// Read a run by `(tenant, run_id)`.
     pub fn get(&self, tenant: &TenantId, run_id: &str) -> Option<RunRow> {
-        self.lock().get(&(tenant.0.clone(), run_id.to_string())).cloned()
+        self.lock()
+            .get(&(tenant.0.clone(), run_id.to_string()))
+            .cloned()
     }
 
     /// **Run a mutation `f` over the `(tenant, run_id)` run row under the store lock — the seam the
@@ -225,7 +227,12 @@ impl RunStore {
     /// `None` (without calling `f`) if the run is absent. The lock is held for the duration of `f` so
     /// the wake is atomic (the dispatcher's lease scan sees the woken state). Used by
     /// [`RunStore::wake`] (`crate::timer`) to flip a parked run runnable in place.
-    pub fn with_run_mut<R>(&self, tenant: &TenantId, run_id: &str, f: impl FnOnce(&mut RunRow) -> R) -> Option<R> {
+    pub fn with_run_mut<R>(
+        &self,
+        tenant: &TenantId,
+        run_id: &str,
+        f: impl FnOnce(&mut RunRow) -> R,
+    ) -> Option<R> {
         let mut runs = self.lock();
         runs.get_mut(&(tenant.0.clone(), run_id.to_string())).map(f)
     }
@@ -686,7 +693,9 @@ impl FlowTelemetry {
         let t = self.lock();
         let total = t.commands_replayed + t.commands_executed;
         // `checked_div` returns None on a zero denominator (nothing driven yet) → 0, no panic.
-        (10_000 * t.commands_replayed).checked_div(total).unwrap_or(0)
+        (10_000 * t.commands_replayed)
+            .checked_div(total)
+            .unwrap_or(0)
     }
 
     /// The **0-double-effect counter** (the FLOW-D1 green artifact). MUST be 0 — a replay that
@@ -955,8 +964,20 @@ pub fn drive_versioned(
     // body would error loudly — WfCtx::sleep_until requires a wheel). The timer-aware path is
     // `drive_with_timers` (the dispatcher supplies the wheel + the live clock for the park decision).
     drive_with_timers(
-        runs, outbox, journal, telemetry, minter, ctx_base, run, now_clock, rand_seed, body,
-        run_version, replay_version, None, 0,
+        runs,
+        outbox,
+        journal,
+        telemetry,
+        minter,
+        ctx_base,
+        run,
+        now_clock,
+        rand_seed,
+        body,
+        run_version,
+        replay_version,
+        None,
+        0,
     )
 }
 
@@ -986,8 +1007,21 @@ pub fn drive_with_timers(
     now_secs: i64,
 ) -> DriveOutcome {
     drive_full(
-        runs, outbox, journal, telemetry, minter, ctx_base, run, now_clock, rand_seed, body,
-        run_version, replay_version, timers, None, now_secs,
+        runs,
+        outbox,
+        journal,
+        telemetry,
+        minter,
+        ctx_base,
+        run,
+        now_clock,
+        rand_seed,
+        body,
+        run_version,
+        replay_version,
+        timers,
+        None,
+        now_secs,
     )
 }
 
@@ -1258,9 +1292,9 @@ impl FlowDispatcher {
     /// `now` is the worker's clock (epoch seconds) for the lease deadline + the live side-markers.
     /// Returns the [`DriveOutcome`] if a run was driven, `None` if no runnable work awaited.
     pub fn tick(&self, now: i64, now_clock: &str, rand_seed: u64) -> Option<DriveOutcome> {
-        let run = self
-            .runs
-            .lease_runnable(self.partition, &self.worker, now, self.lease_ttl_secs)?;
+        let run =
+            self.runs
+                .lease_runnable(self.partition, &self.worker, now, self.lease_ttl_secs)?;
         let body = self.bodies.get(&run.wf_type)?;
         // **The version-divergence leg (§4.6):** drive with the run's PINNED `wf_version` against the
         // version the engine is RUNNING for this `wf_type`. A mismatch (a deploy bumped the body while
@@ -1361,7 +1395,9 @@ mod tests {
                 let ex = executed.clone();
                 ctx.activity(RetryPolicy::default_policy(), move |_idem, _attempt| {
                     ex.lock().unwrap().push(k);
-                    Ok(vec![ArtifactRef(format!("myelin://acme/agent/effect/e{k}"))])
+                    Ok(vec![ArtifactRef(format!(
+                        "myelin://acme/agent/effect/e{k}"
+                    ))])
                 })
                 .map_err(|e| format!("{e:?}"))?;
             }
@@ -1384,19 +1420,48 @@ mod tests {
         let executed = Arc::new(Mutex::new(Vec::new()));
         let body = n_activity_body(10, executed.clone());
         let outcome = drive(
-            &runs, &outbox, &journal, &tele, minter(), ctx_base(), &run,
-            "2026-06-21T00:00:00Z", 7, body.as_ref(),
+            &runs,
+            &outbox,
+            &journal,
+            &tele,
+            minter(),
+            ctx_base(),
+            &run,
+            "2026-06-21T00:00:00Z",
+            7,
+            body.as_ref(),
         );
 
-        assert!(matches!(outcome, DriveOutcome::Completed(_)), "the run completed");
-        assert_eq!(executed.lock().unwrap().len(), 10, "all 10 activities ran live (cold)");
-        assert_eq!(journal.history_for(&tenant(), "R1").len(), 10, "10 history rows journaled");
+        assert!(
+            matches!(outcome, DriveOutcome::Completed(_)),
+            "the run completed"
+        );
+        assert_eq!(
+            executed.lock().unwrap().len(),
+            10,
+            "all 10 activities ran live (cold)"
+        );
+        assert_eq!(
+            journal.history_for(&tenant(), "R1").len(),
+            10,
+            "10 history rows journaled"
+        );
         let settled = runs.get(&tenant(), "R1").expect("run row");
         assert_eq!(settled.state, run_state::COMPLETED, "the run is completed");
-        assert_eq!(settled.cursor, 10, "the cursor advanced to the journal depth");
-        assert!(settled.lease_owner.is_none(), "the lease is released on settle");
+        assert_eq!(
+            settled.cursor, 10,
+            "the cursor advanced to the journal depth"
+        );
+        assert!(
+            settled.lease_owner.is_none(),
+            "the lease is released on settle"
+        );
         assert_eq!(tele.commands_executed(), 10, "10 live executions recorded");
-        assert_eq!(tele.commands_replayed(), 0, "nothing replayed on a cold drive");
+        assert_eq!(
+            tele.commands_replayed(),
+            0,
+            "nothing replayed on a cold drive"
+        );
         assert_eq!(tele.double_effect_count(), 0, "0 double-effect");
     }
 
@@ -1424,19 +1489,35 @@ mod tests {
             // a WfCtx that journals the 5 activities and co-commits — but the worker never settles
             // the run (it crashed). We commit the journal directly to model the durable 5 steps.
             let mut crash_ctx = WfCtx::begin(
-                &outbox, minter(), journal.clone(), ctx_base(), "R1", "agent.run",
-                "2026-06-21T00:00:00Z", 7,
+                &outbox,
+                minter(),
+                journal.clone(),
+                ctx_base(),
+                "R1",
+                "agent.run",
+                "2026-06-21T00:00:00Z",
+                7,
             );
             body1(&mut crash_ctx).expect("the 5 activities run");
-            crash_ctx.commit().expect("the 5 steps co-commit (durable before the crash)");
+            crash_ctx
+                .commit()
+                .expect("the 5 steps co-commit (durable before the crash)");
             // the worker bumped the cursor to 5 as it journaled, but DIED before settling state — the
             // run is left `running` (NOT completed), unleased (the lease lapsed on the dead worker).
             let mut r = runs.get(&tenant(), "R1").expect("run");
             r.cursor = 5;
             runs.put(r);
         }
-        assert_eq!(executed1.lock().unwrap().len(), 5, "drive 1 ran activities 0..=4");
-        assert_eq!(journal.history_for(&tenant(), "R1").len(), 5, "5 journaled at the crash point");
+        assert_eq!(
+            executed1.lock().unwrap().len(),
+            5,
+            "drive 1 ran activities 0..=4"
+        );
+        assert_eq!(
+            journal.history_for(&tenant(), "R1").len(),
+            5,
+            "5 journaled at the crash point"
+        );
 
         // DRIVE 2 — another worker re-leases and re-drives with the FULL 10-activity body. Commands
         // 0..=4 REPLAY (short-circuit, no re-execution); 5..=9 execute live.
@@ -1447,17 +1528,40 @@ mod tests {
         let executed2 = Arc::new(Mutex::new(Vec::new()));
         let body2 = n_activity_body(10, executed2.clone());
         let outcome = drive(
-            &runs, &outbox, &journal, &tele, minter(), ctx_base(), &leased,
-            "2026-06-21T00:00:00Z", 7, body2.as_ref(),
+            &runs,
+            &outbox,
+            &journal,
+            &tele,
+            minter(),
+            ctx_base(),
+            &leased,
+            "2026-06-21T00:00:00Z",
+            7,
+            body2.as_ref(),
         );
 
         // THE FLOW-D1 ASSERTIONS: only 5..=9 executed (0 re-execution of 0..=4); the run completed.
         let ran = executed2.lock().unwrap().clone();
-        assert_eq!(ran, vec![5, 6, 7, 8, 9], "resumed at step 6 — activities 5..=9 ran, 0..=4 replayed");
-        assert!(matches!(outcome, DriveOutcome::Completed(_)), "the run completed after recovery");
-        assert_eq!(journal.history_for(&tenant(), "R1").len(), 10, "10 journaled, 0 lost progress");
+        assert_eq!(
+            ran,
+            vec![5, 6, 7, 8, 9],
+            "resumed at step 6 — activities 5..=9 ran, 0..=4 replayed"
+        );
+        assert!(
+            matches!(outcome, DriveOutcome::Completed(_)),
+            "the run completed after recovery"
+        );
+        assert_eq!(
+            journal.history_for(&tenant(), "R1").len(),
+            10,
+            "10 journaled, 0 lost progress"
+        );
         // 0 DOUBLE-EFFECT — the journaled commands were NOT re-executed (the FLOW-D1 floor).
-        assert_eq!(tele.double_effect_count(), 0, "0 re-executed side effects (exactly-once-in-effect)");
+        assert_eq!(
+            tele.double_effect_count(),
+            0,
+            "0 re-executed side effects (exactly-once-in-effect)"
+        );
         // the replay rate: drive 2 replayed 5 commands and executed 5 live → 5/(5+5) = 5000 bps. The
         // crash drive 1 used its own WfCtx (not `drive`), so only drive 2's accounting is recorded.
         assert_eq!(
@@ -1465,7 +1569,11 @@ mod tests {
             5,
             "drive 2 replayed the 5 journaled commands (short-circuited, 0 re-execution)"
         );
-        assert_eq!(tele.commands_executed(), 5, "drive 2 executed 5 new commands live");
+        assert_eq!(
+            tele.commands_executed(),
+            5,
+            "drive 2 executed 5 new commands live"
+        );
         assert_eq!(
             tele.replay_rate_bps(),
             5000,
@@ -1487,20 +1595,48 @@ mod tests {
 
         let body = n_activity_body(10, Arc::new(Mutex::new(Vec::new())));
         drive(
-            &runs, &outbox, &journal, &tele, minter(), ctx_base(), &run,
-            "2026-06-21T00:00:00Z", 7, body.as_ref(),
+            &runs,
+            &outbox,
+            &journal,
+            &tele,
+            minter(),
+            ctx_base(),
+            &run,
+            "2026-06-21T00:00:00Z",
+            7,
+            body.as_ref(),
         );
         // re-drive the same journal: everything replays.
         let executed = Arc::new(Mutex::new(Vec::new()));
         let body2 = n_activity_body(10, executed.clone());
         let again = runs.get(&tenant(), "R1").expect("run");
         drive(
-            &runs, &outbox, &journal, &tele, minter(), ctx_base(), &again,
-            "2026-06-21T00:00:00Z", 7, body2.as_ref(),
+            &runs,
+            &outbox,
+            &journal,
+            &tele,
+            minter(),
+            ctx_base(),
+            &again,
+            "2026-06-21T00:00:00Z",
+            7,
+            body2.as_ref(),
         );
-        assert_eq!(executed.lock().unwrap().len(), 0, "a full replay re-executes 0 side effects");
-        assert_eq!(journal.history_for(&tenant(), "R1").len(), 10, "no duplicate journal rows");
-        assert_eq!(tele.double_effect_count(), 0, "0 double-effect on a full replay");
+        assert_eq!(
+            executed.lock().unwrap().len(),
+            0,
+            "a full replay re-executes 0 side effects"
+        );
+        assert_eq!(
+            journal.history_for(&tenant(), "R1").len(),
+            10,
+            "no duplicate journal rows"
+        );
+        assert_eq!(
+            tele.double_effect_count(),
+            0,
+            "0 double-effect on a full replay"
+        );
     }
 
     /// **A lease expiry re-leases to ANOTHER worker (crash recovery, §4.7).** Worker-1 leases a
@@ -1509,10 +1645,18 @@ mod tests {
     #[test]
     fn lease_expiry_re_leases_to_another_worker() {
         let runs = RunStore::new();
-        runs.put(RunRow::new_runnable(tenant(), region(), "R1", "agent.run", 0));
+        runs.put(RunRow::new_runnable(
+            tenant(),
+            region(),
+            "R1",
+            "agent.run",
+            0,
+        ));
 
         // worker-1 leases at t=1000 with a 30s TTL → lease_expires = 1030.
-        let l1 = runs.lease_runnable(0, "worker-1", 1000, 30).expect("worker-1 leases");
+        let l1 = runs
+            .lease_runnable(0, "worker-1", 1000, 30)
+            .expect("worker-1 leases");
         assert_eq!(l1.lease_owner.as_deref(), Some("worker-1"));
         assert_eq!(l1.lease_expires, Some(1030));
 
@@ -1523,8 +1667,14 @@ mod tests {
         );
 
         // AFTER expiry (t=1031): worker-2 re-leases (the crashed worker's lease lapsed → recovery).
-        let l2 = runs.lease_runnable(0, "worker-2", 1031, 30).expect("worker-2 re-leases after expiry");
-        assert_eq!(l2.lease_owner.as_deref(), Some("worker-2"), "the run re-leased to worker-2");
+        let l2 = runs
+            .lease_runnable(0, "worker-2", 1031, 30)
+            .expect("worker-2 re-leases after expiry");
+        assert_eq!(
+            l2.lease_owner.as_deref(),
+            Some("worker-2"),
+            "the run re-leased to worker-2"
+        );
         assert_eq!(l2.lease_expires, Some(1061), "a fresh lease deadline");
     }
 
@@ -1533,18 +1683,39 @@ mod tests {
     #[test]
     fn lease_is_partition_scoped_and_skips_non_runnable() {
         let runs = RunStore::new();
-        runs.put(RunRow::new_runnable(tenant(), region(), "R-p0", "agent.run", 0));
-        runs.put(RunRow::new_runnable(tenant(), region(), "R-p1", "agent.run", 1));
+        runs.put(RunRow::new_runnable(
+            tenant(),
+            region(),
+            "R-p0",
+            "agent.run",
+            0,
+        ));
+        runs.put(RunRow::new_runnable(
+            tenant(),
+            region(),
+            "R-p1",
+            "agent.run",
+            1,
+        ));
         // a waiting run in partition 0 is not runnable.
         let mut waiting = RunRow::new_runnable(tenant(), region(), "R-wait", "agent.run", 0);
         waiting.state = run_state::WAITING.into();
         runs.put(waiting);
 
         // partition 0's worker leases R-p0 (not R-p1, not the waiting run).
-        let leased = runs.lease_runnable(0, "w", 1, 30).expect("a runnable run in partition 0");
-        assert_eq!(leased.run_id, "R-p0", "the partition-0 runnable run is leased");
+        let leased = runs
+            .lease_runnable(0, "w", 1, 30)
+            .expect("a runnable run in partition 0");
+        assert_eq!(
+            leased.run_id, "R-p0",
+            "the partition-0 runnable run is leased"
+        );
         // the runnable-lag for partition 0 was 1 (R-p0); partition 1's lag is 1 (R-p1).
-        assert_eq!(runs.runnable_lag(1, 1), 1, "partition 1 has its own runnable run");
+        assert_eq!(
+            runs.runnable_lag(1, 1),
+            1,
+            "partition 1 has its own runnable run"
+        );
     }
 
     /// **The runnable-run-lag telemetry counts runnable, unleased (or expired-lease) runs (§1.8).**
@@ -1554,14 +1725,32 @@ mod tests {
     fn runnable_lag_counts_unleased_and_expired() {
         let runs = RunStore::new();
         for i in 0..3 {
-            runs.put(RunRow::new_runnable(tenant(), region(), format!("R{i}"), "agent.run", 0));
+            runs.put(RunRow::new_runnable(
+                tenant(),
+                region(),
+                format!("R{i}"),
+                "agent.run",
+                0,
+            ));
         }
-        assert_eq!(runs.runnable_lag(0, 1000), 3, "three runnable runs await a lease");
+        assert_eq!(
+            runs.runnable_lag(0, 1000),
+            3,
+            "three runnable runs await a lease"
+        );
         // lease one at t=1000 (TTL 30) → live lag drops to 2 at t=1000.
         runs.lease_runnable(0, "w", 1000, 30).expect("lease one");
-        assert_eq!(runs.runnable_lag(0, 1000), 2, "a live-leased run is not runnable-lag");
+        assert_eq!(
+            runs.runnable_lag(0, 1000),
+            2,
+            "a live-leased run is not runnable-lag"
+        );
         // after the lease expires (t=1031) the run counts again (crash recovery makes it runnable).
-        assert_eq!(runs.runnable_lag(0, 1031), 3, "the expired-lease run re-enters the runnable set");
+        assert_eq!(
+            runs.runnable_lag(0, 1031),
+            3,
+            "the expired-lease run re-enters the runnable set"
+        );
     }
 
     /// **A drive whose body FAILS an un-handled activity exhaustion settles the run `failed` (§4.1).**
@@ -1583,15 +1772,34 @@ mod tests {
             Ok(vec![])
         });
         let outcome = drive(
-            &runs, &outbox, &journal, &tele, minter(), ctx_base(), &run,
-            "2026-06-21T00:00:00Z", 7, body.as_ref(),
+            &runs,
+            &outbox,
+            &journal,
+            &tele,
+            minter(),
+            ctx_base(),
+            &run,
+            "2026-06-21T00:00:00Z",
+            7,
+            body.as_ref(),
         );
         assert!(matches!(outcome, DriveOutcome::Failed(_)), "the run failed");
         let settled = runs.get(&tenant(), "R1").expect("run");
-        assert_eq!(settled.state, run_state::FAILED, "the run is settled failed");
-        assert!(settled.lease_owner.is_none(), "the lease is released even on failure");
+        assert_eq!(
+            settled.state,
+            run_state::FAILED,
+            "the run is settled failed"
+        );
+        assert!(
+            settled.lease_owner.is_none(),
+            "the lease is released even on failure"
+        );
         // the activity_failed row IS journaled (0 lost — the failure is durable).
-        assert_eq!(journal.history_for(&tenant(), "R1").len(), 1, "the failure is journaled");
+        assert_eq!(
+            journal.history_for(&tenant(), "R1").len(),
+            1,
+            "the failure is journaled"
+        );
     }
 
     /// **FLOW-D2 CORE (P-FLOW-07): a divergent replay HALTS the run as `nondeterministic` +
@@ -1607,13 +1815,25 @@ mod tests {
         let outbox = OutboxStore::new();
         let journal = WfJournal::new();
         let tele = FlowTelemetry::new();
-        runs.put(RunRow::new_runnable(tenant(), region(), "R1", "agent.run", 0));
+        runs.put(RunRow::new_runnable(
+            tenant(),
+            region(),
+            "R1",
+            "agent.run",
+            0,
+        ));
 
         // journal a side-marker (a now()) at position 0, leave the run runnable at cursor 1.
         {
             let mut ctx = WfCtx::begin(
-                &outbox, minter(), journal.clone(), ctx_base(), "R1", "agent.run",
-                "2026-06-21T00:00:00Z", 7,
+                &outbox,
+                minter(),
+                journal.clone(),
+                ctx_base(),
+                "R1",
+                "agent.run",
+                "2026-06-21T00:00:00Z",
+                7,
             );
             let _ = ctx.now();
             ctx.commit().expect("co-commit the marker");
@@ -1629,14 +1849,24 @@ mod tests {
             let ran3 = ran2.clone();
             ctx.activity(RetryPolicy::default_policy(), move |_i, _a| {
                 *ran3.lock().unwrap() = true; // would flip IF the divergent activity ran live.
-                Ok(vec![ArtifactRef("myelin://acme/agent/effect/SHOULD-NOT-RUN".into())])
+                Ok(vec![ArtifactRef(
+                    "myelin://acme/agent/effect/SHOULD-NOT-RUN".into(),
+                )])
             })
             .map_err(|e| format!("{e:?}"))?;
             Ok(vec![])
         });
         let outcome = drive(
-            &runs, &outbox, &journal, &tele, minter(), ctx_base(), &run,
-            "2026-06-21T00:00:00Z", 7, body.as_ref(),
+            &runs,
+            &outbox,
+            &journal,
+            &tele,
+            minter(),
+            ctx_base(),
+            &run,
+            "2026-06-21T00:00:00Z",
+            7,
+            body.as_ref(),
         );
 
         // THE FLOW-D2 ASSERTIONS:
@@ -1644,23 +1874,39 @@ mod tests {
             matches!(outcome, DriveOutcome::Nondeterministic(_)),
             "the drive halts as Nondeterministic, got {outcome:?}"
         );
-        assert!(!*ran.lock().unwrap(), "the divergent activity did NOT run live (the guard halted it)");
+        assert!(
+            !*ran.lock().unwrap(),
+            "the divergent activity did NOT run live (the guard halted it)"
+        );
         let settled = runs.get(&tenant(), "R1").expect("run row");
         assert_eq!(
             settled.state,
             run_state::NONDETERMINISTIC,
             "the run is dead-lettered as nondeterministic (terminal)"
         );
-        assert!(run_state::is_terminal(&settled.state), "nondeterministic is terminal — never re-driven");
-        assert!(settled.lease_owner.is_none(), "the lease is released on the halt");
-        assert_eq!(settled.cursor, 1, "the cursor is UNCHANGED (the guard rewrote no journal)");
+        assert!(
+            run_state::is_terminal(&settled.state),
+            "nondeterministic is terminal — never re-driven"
+        );
+        assert!(
+            settled.lease_owner.is_none(),
+            "the lease is released on the halt"
+        );
+        assert_eq!(
+            settled.cursor, 1,
+            "the cursor is UNCHANGED (the guard rewrote no journal)"
+        );
         // the divergent drive's partial journal was DISCARDED — only the original marker row survives.
         assert_eq!(
             journal.history_for(&tenant(), "R1").len(),
             1,
             "the journal is unchanged (the divergent drive committed NOTHING — 0 corruption)"
         );
-        assert_eq!(tele.double_effect_count(), 0, "0 double-effect — the divergence is a halt, not a re-exec");
+        assert_eq!(
+            tele.double_effect_count(),
+            0,
+            "0 double-effect — the divergence is a halt, not a re-exec"
+        );
         // THE GREEN ARTIFACT: the nondeterministic-halt count incremented by EXACTLY 1.
         assert_eq!(
             tele.nondeterministic_halt_count(),
@@ -1680,7 +1926,13 @@ mod tests {
         let outbox = OutboxStore::new();
         let journal = WfJournal::new();
         let tele = FlowTelemetry::new();
-        runs.put(RunRow::new_runnable(tenant(), region(), "R1", "agent.run", 0));
+        runs.put(RunRow::new_runnable(
+            tenant(),
+            region(),
+            "R1",
+            "agent.run",
+            0,
+        ));
 
         // a body whose activity would run IF the version guard did not halt first.
         let ran = std::sync::Arc::new(Mutex::new(false));
@@ -1697,30 +1949,70 @@ mod tests {
         });
         // the run was pinned to v1 at start; the engine is replaying with v2 — a version divergence.
         let outcome = drive_versioned(
-            &runs, &outbox, &journal, &tele, minter(), ctx_base(), &run,
-            "2026-06-21T00:00:00Z", 7, body.as_ref(), 1, 2,
+            &runs,
+            &outbox,
+            &journal,
+            &tele,
+            minter(),
+            ctx_base(),
+            &run,
+            "2026-06-21T00:00:00Z",
+            7,
+            body.as_ref(),
+            1,
+            2,
         );
         assert!(
             matches!(outcome, DriveOutcome::Nondeterministic(ref r) if r.contains("wf_version")),
             "the version mismatch halts as Nondeterministic naming the version pin, got {outcome:?}"
         );
-        assert!(!*ran.lock().unwrap(), "the body did NOT run a command (the version guard halted first)");
+        assert!(
+            !*ran.lock().unwrap(),
+            "the body did NOT run a command (the version guard halted first)"
+        );
         assert_eq!(
             runs.get(&tenant(), "R1").unwrap().state,
             run_state::NONDETERMINISTIC,
             "the wrong-version run is dead-lettered"
         );
-        assert_eq!(tele.nondeterministic_halt_count(), 1, "the version-divergence halt counted once");
+        assert_eq!(
+            tele.nondeterministic_halt_count(),
+            1,
+            "the version-divergence halt counted once"
+        );
         // a MATCHING version (v1 == v1) drives normally (the version leg does NOT false-positive).
-        runs.put(RunRow::new_runnable(tenant(), region(), "R2", "agent.run", 0));
+        runs.put(RunRow::new_runnable(
+            tenant(),
+            region(),
+            "R2",
+            "agent.run",
+            0,
+        ));
         let run2 = runs.get(&tenant(), "R2").unwrap();
         let ok_body = n_activity_body(1, std::sync::Arc::new(Mutex::new(Vec::new())));
         let outcome2 = drive_versioned(
-            &runs, &outbox, &journal, &tele, minter(), ctx_base(), &run2,
-            "2026-06-21T00:00:00Z", 7, ok_body.as_ref(), 1, 1,
+            &runs,
+            &outbox,
+            &journal,
+            &tele,
+            minter(),
+            ctx_base(),
+            &run2,
+            "2026-06-21T00:00:00Z",
+            7,
+            ok_body.as_ref(),
+            1,
+            1,
         );
-        assert!(matches!(outcome2, DriveOutcome::Completed(_)), "a matching version drives normally");
-        assert_eq!(tele.nondeterministic_halt_count(), 1, "no false-positive halt on a matching version");
+        assert!(
+            matches!(outcome2, DriveOutcome::Completed(_)),
+            "a matching version drives normally"
+        );
+        assert_eq!(
+            tele.nondeterministic_halt_count(),
+            1,
+            "no false-positive halt on a matching version"
+        );
     }
 
     /// **FLOW-D2: 0 SILENT divergence — a DETERMINISTIC replay never trips the guard.** A clean
@@ -1734,20 +2026,45 @@ mod tests {
         let outbox = OutboxStore::new();
         let journal = WfJournal::new();
         let tele = FlowTelemetry::new();
-        runs.put(RunRow::new_runnable(tenant(), region(), "R1", "agent.run", 0));
+        runs.put(RunRow::new_runnable(
+            tenant(),
+            region(),
+            "R1",
+            "agent.run",
+            0,
+        ));
 
         // a full deterministic drive of 3 activities, then a clean re-drive of the SAME body.
         let run = runs.get(&tenant(), "R1").unwrap();
         drive(
-            &runs, &outbox, &journal, &tele, minter(), ctx_base(), &run,
-            "2026-06-21T00:00:00Z", 7, n_activity_body(3, std::sync::Arc::new(Mutex::new(Vec::new()))).as_ref(),
+            &runs,
+            &outbox,
+            &journal,
+            &tele,
+            minter(),
+            ctx_base(),
+            &run,
+            "2026-06-21T00:00:00Z",
+            7,
+            n_activity_body(3, std::sync::Arc::new(Mutex::new(Vec::new()))).as_ref(),
         );
         let again = runs.get(&tenant(), "R1").unwrap();
         let outcome = drive(
-            &runs, &outbox, &journal, &tele, minter(), ctx_base(), &again,
-            "2026-06-21T00:00:00Z", 7, n_activity_body(3, std::sync::Arc::new(Mutex::new(Vec::new()))).as_ref(),
+            &runs,
+            &outbox,
+            &journal,
+            &tele,
+            minter(),
+            ctx_base(),
+            &again,
+            "2026-06-21T00:00:00Z",
+            7,
+            n_activity_body(3, std::sync::Arc::new(Mutex::new(Vec::new()))).as_ref(),
         );
-        assert!(matches!(outcome, DriveOutcome::Completed(_)), "the deterministic re-drive completes");
+        assert!(
+            matches!(outcome, DriveOutcome::Completed(_)),
+            "the deterministic re-drive completes"
+        );
         assert_eq!(
             tele.nondeterministic_halt_count(),
             0,
@@ -1765,29 +2082,77 @@ mod tests {
         let outbox = OutboxStore::new();
         let journal = WfJournal::new();
         let tele = FlowTelemetry::new();
-        runs.put(RunRow::new_runnable(tenant(), region(), "R1", "agent.run", 0));
-        runs.put(RunRow::new_runnable(tenant(), region(), "R2", "agent.run", 0));
+        runs.put(RunRow::new_runnable(
+            tenant(),
+            region(),
+            "R1",
+            "agent.run",
+            0,
+        ));
+        runs.put(RunRow::new_runnable(
+            tenant(),
+            region(),
+            "R2",
+            "agent.run",
+            0,
+        ));
         // before any drive the gauge reads its default 0.
-        assert_eq!(tele.runnable_run_lag(), 0, "no drive yet → the lag gauge default is 0");
+        assert_eq!(
+            tele.runnable_run_lag(),
+            0,
+            "no drive yet → the lag gauge default is 0"
+        );
 
         let run1 = runs.get(&tenant(), "R1").unwrap();
         drive(
-            &runs, &outbox, &journal, &tele, minter(), ctx_base(), &run1,
-            "2026-06-21T00:00:00Z", 7, n_activity_body(3, Arc::new(Mutex::new(Vec::new()))).as_ref(),
+            &runs,
+            &outbox,
+            &journal,
+            &tele,
+            minter(),
+            ctx_base(),
+            &run1,
+            "2026-06-21T00:00:00Z",
+            7,
+            n_activity_body(3, Arc::new(Mutex::new(Vec::new()))).as_ref(),
         );
         // after drive 1: 3 commands executed; R2 still runnable → lag gauge reads 1.
         assert_eq!(tele.commands_executed(), 3, "drive 1 executed 3 commands");
-        assert_eq!(tele.runnable_run_lag(), 1, "R2 is still runnable (the lag gauge is set from the store)");
+        assert_eq!(
+            tele.runnable_run_lag(),
+            1,
+            "R2 is still runnable (the lag gauge is set from the store)"
+        );
 
         let run2 = runs.get(&tenant(), "R2").unwrap();
         drive(
-            &runs, &outbox, &journal, &tele, minter(), ctx_base(), &run2,
-            "2026-06-21T00:00:00Z", 7, n_activity_body(3, Arc::new(Mutex::new(Vec::new()))).as_ref(),
+            &runs,
+            &outbox,
+            &journal,
+            &tele,
+            minter(),
+            ctx_base(),
+            &run2,
+            "2026-06-21T00:00:00Z",
+            7,
+            n_activity_body(3, Arc::new(Mutex::new(Vec::new()))).as_ref(),
         );
         // after drive 2: the counter ACCUMULATED to 6 (the `+=` is real); both runs completed → lag 0.
-        assert_eq!(tele.commands_executed(), 6, "the executed counter accumulated across drives (6)");
-        assert_eq!(tele.runnable_run_lag(), 0, "both runs completed → the runnable-run-lag drops to 0");
-        assert_eq!(tele.double_effect_count(), 0, "0 double-effect across both drives");
+        assert_eq!(
+            tele.commands_executed(),
+            6,
+            "the executed counter accumulated across drives (6)"
+        );
+        assert_eq!(
+            tele.runnable_run_lag(),
+            0,
+            "both runs completed → the runnable-run-lag drops to 0"
+        );
+        assert_eq!(
+            tele.double_effect_count(),
+            0,
+            "0 double-effect across both drives"
+        );
     }
 
     /// **`resume` continues the history `seq` PAST the journaled rows (the cursor floor §3.1).** A run
@@ -1799,17 +2164,31 @@ mod tests {
         let outbox = OutboxStore::new();
         let journal = WfJournal::new();
         let tele = FlowTelemetry::new();
-        runs.put(RunRow::new_runnable(tenant(), region(), "R1", "agent.run", 0));
+        runs.put(RunRow::new_runnable(
+            tenant(),
+            region(),
+            "R1",
+            "agent.run",
+            0,
+        ));
 
         // crash after 3 journaled commands (seq 0,1,2), run left runnable at cursor 3.
         {
             let mut ctx = WfCtx::begin(
-                &outbox, minter(), journal.clone(), ctx_base(), "R1", "agent.run",
-                "2026-06-21T00:00:00Z", 7,
+                &outbox,
+                minter(),
+                journal.clone(),
+                ctx_base(),
+                "R1",
+                "agent.run",
+                "2026-06-21T00:00:00Z",
+                7,
             );
             for k in 0..3 {
                 ctx.activity(RetryPolicy::default_policy(), move |_i, _a| {
-                    Ok(vec![ArtifactRef(format!("myelin://acme/agent/effect/e{k}"))])
+                    Ok(vec![ArtifactRef(format!(
+                        "myelin://acme/agent/effect/e{k}"
+                    ))])
                 })
                 .expect("activity");
             }
@@ -1822,11 +2201,27 @@ mod tests {
         // re-drive a 4-command body: 0..=2 replay, command 3 journals at seq 3 (past the journal).
         let run = runs.get(&tenant(), "R1").unwrap();
         drive(
-            &runs, &outbox, &journal, &tele, minter(), ctx_base(), &run,
-            "2026-06-21T00:00:00Z", 7, n_activity_body(4, Arc::new(Mutex::new(Vec::new()))).as_ref(),
+            &runs,
+            &outbox,
+            &journal,
+            &tele,
+            minter(),
+            ctx_base(),
+            &run,
+            "2026-06-21T00:00:00Z",
+            7,
+            n_activity_body(4, Arc::new(Mutex::new(Vec::new()))).as_ref(),
         );
-        let seqs: Vec<i64> = journal.history_for(&tenant(), "R1").iter().map(|r| r.seq).collect();
-        assert_eq!(seqs, vec![0, 1, 2, 3], "the resumed command journaled at seq 3 (past the journal, no overwrite)");
+        let seqs: Vec<i64> = journal
+            .history_for(&tenant(), "R1")
+            .iter()
+            .map(|r| r.seq)
+            .collect();
+        assert_eq!(
+            seqs,
+            vec![0, 1, 2, 3],
+            "the resumed command journaled at seq 3 (past the journal, no overwrite)"
+        );
     }
 
     /// **The dispatcher tick loop leases + drives a runnable run, then drains (§4.7).** Two runnable
@@ -1838,22 +2233,63 @@ mod tests {
         let outbox = OutboxStore::new();
         let journal = WfJournal::new();
         let tele = FlowTelemetry::new();
-        runs.put(RunRow::new_runnable(tenant(), region(), "R1", "agent.run", 0));
-        runs.put(RunRow::new_runnable(tenant(), region(), "R2", "agent.run", 0));
+        runs.put(RunRow::new_runnable(
+            tenant(),
+            region(),
+            "R1",
+            "agent.run",
+            0,
+        ));
+        runs.put(RunRow::new_runnable(
+            tenant(),
+            region(),
+            "R2",
+            "agent.run",
+            0,
+        ));
 
         let mut disp = FlowDispatcher::new(
-            runs.clone(), outbox.clone(), journal.clone(), tele.clone(), minter(),
-            ctx_base(), 0, "worker-1", 30,
+            runs.clone(),
+            outbox.clone(),
+            journal.clone(),
+            tele.clone(),
+            minter(),
+            ctx_base(),
+            0,
+            "worker-1",
+            30,
         );
-        disp.register("agent.run", n_activity_body(3, Arc::new(Mutex::new(Vec::new()))));
+        disp.register(
+            "agent.run",
+            n_activity_body(3, Arc::new(Mutex::new(Vec::new()))),
+        );
 
         // tick 1 + tick 2 drive the two runnable runs to completion; tick 3 finds nothing.
-        assert!(matches!(disp.tick(1000, "2026-06-21T00:00:00Z", 7), Some(DriveOutcome::Completed(_))));
-        assert!(matches!(disp.tick(1001, "2026-06-21T00:00:00Z", 7), Some(DriveOutcome::Completed(_))));
-        assert!(disp.tick(1002, "2026-06-21T00:00:00Z", 7).is_none(), "no runnable work left");
-        assert_eq!(runs.get(&tenant(), "R1").unwrap().state, run_state::COMPLETED);
-        assert_eq!(runs.get(&tenant(), "R2").unwrap().state, run_state::COMPLETED);
-        assert_eq!(disp.telemetry().double_effect_count(), 0, "0 double-effect across the loop");
+        assert!(matches!(
+            disp.tick(1000, "2026-06-21T00:00:00Z", 7),
+            Some(DriveOutcome::Completed(_))
+        ));
+        assert!(matches!(
+            disp.tick(1001, "2026-06-21T00:00:00Z", 7),
+            Some(DriveOutcome::Completed(_))
+        ));
+        assert!(
+            disp.tick(1002, "2026-06-21T00:00:00Z", 7).is_none(),
+            "no runnable work left"
+        );
+        assert_eq!(
+            runs.get(&tenant(), "R1").unwrap().state,
+            run_state::COMPLETED
+        );
+        assert_eq!(
+            runs.get(&tenant(), "R2").unwrap().state,
+            run_state::COMPLETED
+        );
+        assert_eq!(
+            disp.telemetry().double_effect_count(),
+            0,
+            "0 double-effect across the loop"
+        );
     }
 
     /// **A dispatcher tick on a run whose worker crashed mid-drive re-leases + resumes (§4.7).** A run
@@ -1865,17 +2301,31 @@ mod tests {
         let outbox = OutboxStore::new();
         let journal = WfJournal::new();
         let tele = FlowTelemetry::new();
-        runs.put(RunRow::new_runnable(tenant(), region(), "R1", "agent.run", 0));
+        runs.put(RunRow::new_runnable(
+            tenant(),
+            region(),
+            "R1",
+            "agent.run",
+            0,
+        ));
 
         // a worker journals 3 steps then crashes (leaves the run running, cursor 3, lease expired).
         {
             let mut ctx = WfCtx::begin(
-                &outbox, minter(), journal.clone(), ctx_base(), "R1", "agent.run",
-                "2026-06-21T00:00:00Z", 7,
+                &outbox,
+                minter(),
+                journal.clone(),
+                ctx_base(),
+                "R1",
+                "agent.run",
+                "2026-06-21T00:00:00Z",
+                7,
             );
             for k in 0..3 {
                 ctx.activity(RetryPolicy::default_policy(), move |_i, _a| {
-                    Ok(vec![ArtifactRef(format!("myelin://acme/agent/effect/e{k}"))])
+                    Ok(vec![ArtifactRef(format!(
+                        "myelin://acme/agent/effect/e{k}"
+                    ))])
                 })
                 .expect("activity");
             }
@@ -1889,19 +2339,47 @@ mod tests {
 
         let executed = Arc::new(Mutex::new(Vec::new()));
         let mut disp = FlowDispatcher::new(
-            runs.clone(), outbox.clone(), journal.clone(), tele.clone(), minter(),
-            ctx_base(), 0, "worker-2", 30,
+            runs.clone(),
+            outbox.clone(),
+            journal.clone(),
+            tele.clone(),
+            minter(),
+            ctx_base(),
+            0,
+            "worker-2",
+            30,
         );
         disp.register("agent.run", n_activity_body(5, executed.clone()));
         // tick at now=1000 (> 500, the dead lease expired): worker-2 re-leases + resumes.
-        let outcome = disp.tick(1000, "2026-06-21T00:00:00Z", 7).expect("a runnable run was re-leased");
-        assert!(matches!(outcome, DriveOutcome::Completed(_)), "resumed to completion");
-        assert_eq!(executed.lock().unwrap().clone(), vec![3, 4], "resumed at step 4 — only 3,4 ran");
-        assert_eq!(tele.double_effect_count(), 0, "0 re-executed side effects on re-lease");
+        let outcome = disp
+            .tick(1000, "2026-06-21T00:00:00Z", 7)
+            .expect("a runnable run was re-leased");
+        assert!(
+            matches!(outcome, DriveOutcome::Completed(_)),
+            "resumed to completion"
+        );
+        assert_eq!(
+            executed.lock().unwrap().clone(),
+            vec![3, 4],
+            "resumed at step 4 — only 3,4 ran"
+        );
+        assert_eq!(
+            tele.double_effect_count(),
+            0,
+            "0 re-executed side effects on re-lease"
+        );
         // the dispatcher's telemetry handle reports the REAL replay accounting (3 replayed, 2
         // executed → 3/5 = 6000 bps) — pins `FlowDispatcher::telemetry` returns the live handle.
-        assert_eq!(disp.telemetry().commands_replayed(), 3, "the dispatcher's telemetry recorded 3 replays");
-        assert_eq!(disp.telemetry().replay_rate_bps(), 6000, "the live telemetry handle reports 6000 bps");
+        assert_eq!(
+            disp.telemetry().commands_replayed(),
+            3,
+            "the dispatcher's telemetry recorded 3 replays"
+        );
+        assert_eq!(
+            disp.telemetry().replay_rate_bps(),
+            6000,
+            "the live telemetry handle reports 6000 bps"
+        );
     }
 
     /// **An emit on the drive co-commits with the journal (FLOW-D5 preserved under the engine).** A
@@ -1927,19 +2405,47 @@ mod tests {
             })
         };
         drive(
-            &runs, &outbox, &journal, &tele, minter(), ctx_base(), &run,
-            "2026-06-21T00:00:00Z", 7, make_body().as_ref(),
+            &runs,
+            &outbox,
+            &journal,
+            &tele,
+            minter(),
+            ctx_base(),
+            &run,
+            "2026-06-21T00:00:00Z",
+            7,
+            make_body().as_ref(),
         );
-        assert_eq!(outbox.committed_count(), 1, "the emit co-committed with the journal");
+        assert_eq!(
+            outbox.committed_count(),
+            1,
+            "the emit co-committed with the journal"
+        );
 
         // re-drive: the activity replays (no re-execution); the run completes again. The emit is a
         // LIVE command after the replayed activity — but the activity short-circuit means 0 re-exec.
         let again = runs.get(&tenant(), "R1").expect("run");
         drive(
-            &runs, &outbox, &journal, &tele, minter(), ctx_base(), &again,
-            "2026-06-21T00:00:00Z", 7, make_body().as_ref(),
+            &runs,
+            &outbox,
+            &journal,
+            &tele,
+            minter(),
+            ctx_base(),
+            &again,
+            "2026-06-21T00:00:00Z",
+            7,
+            make_body().as_ref(),
         );
-        assert_eq!(tele.double_effect_count(), 0, "0 double-effect on the re-drive");
-        assert_eq!(journal.history_for(&tenant(), "R1").len(), 1, "no duplicate journal row");
+        assert_eq!(
+            tele.double_effect_count(),
+            0,
+            "0 double-effect on the re-drive"
+        );
+        assert_eq!(
+            journal.history_for(&tenant(), "R1").len(),
+            1,
+            "no duplicate journal row"
+        );
     }
 }

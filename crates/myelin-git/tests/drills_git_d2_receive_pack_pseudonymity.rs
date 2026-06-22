@@ -32,8 +32,8 @@ use myelin_events::{
 };
 use myelin_git::commit::NonPseudonymousIdentity;
 use myelin_git::receive_pack::{
-    CrashPoint, InMemoryObjectDb, Oid, ProposedRefUpdate, PushOutcome, PushSession, Pusher, RefName,
-    RefStore, RejectReason,
+    CrashPoint, InMemoryObjectDb, Oid, ProposedRefUpdate, PushOutcome, PushSession, Pusher,
+    RefName, RefStore, RejectReason,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind, PseudonymHandle};
 use std::sync::Arc;
@@ -78,7 +78,10 @@ fn commit_push(ref_name: &str, identity_line: &str) -> PushSession {
             oid: Oid::new("c0"),
             bytes,
         }],
-        pusher: Pusher { pseudonym: "psn-7@acme.noreply".into(), is_agent: false },
+        pusher: Pusher {
+            pseudonym: "psn-7@acme.noreply".into(),
+            is_agent: false,
+        },
     }
 }
 
@@ -115,7 +118,11 @@ fn git_d2_git1_half_zero_cleartext_pii_admitted_at_receive_pack() {
         ),
         "a raw name/email commit must be rejected at receive-pack"
     );
-    assert_eq!(store.tip(&RefName::new("refs/heads/raw")), None, "the raw-identity ref never moved");
+    assert_eq!(
+        store.tip(&RefName::new("refs/heads/raw")),
+        None,
+        "the raw-identity ref never moved"
+    );
 
     // A tenant-pseudonym commit → ACCEPTED (the cooperative path); the reflog records the pseudonym.
     let good = commit_push(

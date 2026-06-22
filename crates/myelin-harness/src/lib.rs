@@ -119,15 +119,15 @@ pub mod telemetry;
 
 pub use dependency_break::{BreakOutcome, Dependency, DependencyBreaker, Scope};
 pub use drills::{DrillContext, DrillRegistry, DrillResult, DrillScenario};
+pub use load_generator::{
+    LoadGenerator, LoadPrincipalKind, Multiplier, PrincipalMix, Request, RunClass, Sink,
+    StormProfile, Surface,
+};
 pub use restore::{
     BlobAddr, CrossSeamMismatch, CrossSeamReport, IndexDoc, Offset, OltpRow, RestoreOutcome,
     RestoredSnapshot, RestoredSnapshotBuilder, RtoGrain,
 };
 pub use scorecard::{Band, GateRow, RowResult, RowVerdict, Scorecard};
-pub use load_generator::{
-    LoadGenerator, LoadPrincipalKind, Multiplier, PrincipalMix, Request, RunClass, Sink,
-    StormProfile, Surface,
-};
 pub use telemetry::{
     AssertedSignal, Assertion, Label, Predicate, RejectReason, SignalName, SignalSource,
 };

@@ -173,9 +173,7 @@ impl DependencyBreaker {
     /// or [`BreakOutcome::NoChange`] if it was already broken for this exact pair (the
     /// double-break no-op — the idempotence guarantee, observably).
     pub fn break_dependency(&self, dependency: Dependency, scope: Scope) -> BreakOutcome {
-        let inserted = self
-            .lock()
-            .insert((dependency, scope));
+        let inserted = self.lock().insert((dependency, scope));
         if inserted {
             BreakOutcome::Changed
         } else {
@@ -190,9 +188,7 @@ impl DependencyBreaker {
     /// double-restore no-op). A restored pair leaves no residual state — the set returns to
     /// exactly the shape it had before the matching break (reversibility).
     pub fn restore_dependency(&self, dependency: Dependency, scope: Scope) -> BreakOutcome {
-        let removed = self
-            .lock()
-            .remove(&(dependency, scope));
+        let removed = self.lock().remove(&(dependency, scope));
         if removed {
             BreakOutcome::Changed
         } else {

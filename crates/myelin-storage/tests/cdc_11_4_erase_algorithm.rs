@@ -94,7 +94,11 @@ fn cdc_11_4_dsr_orchestrator_calls_erase_and_the_six_steps_run_in_order() {
     // The DSR orchestrator wires ONE struct as all five seams and calls erase.
     let wiring = OrchestratorWiring::default();
     let holders = EraseHolders {
-        pseudonym: &wiring, search: &wiring, refs: &wiring, bus: &wiring, ledger: &wiring,
+        pseudonym: &wiring,
+        search: &wiring,
+        refs: &wiring,
+        bus: &wiring,
+        ledger: &wiring,
         git_reach: None,
     };
     let receipt = eraser
@@ -107,8 +111,14 @@ fn cdc_11_4_dsr_orchestrator_calls_erase_and_the_six_steps_run_in_order() {
         ["1:pseudonym", "3:search", "4:refs", "5:bus", "6:ledger"],
         "the six steps run in §5.2 order"
     );
-    assert!(receipt.dek_destroyed_now, "step 2 destroyed the per-subject DEK");
-    assert_eq!(receipt.recoverable_in_backup, 0, "STOR-D4: 0 recoverable in backup");
+    assert!(
+        receipt.dek_destroyed_now,
+        "step 2 destroyed the per-subject DEK"
+    );
+    assert_eq!(
+        receipt.recoverable_in_backup, 0,
+        "STOR-D4: 0 recoverable in backup"
+    );
     assert!(receipt.is_green());
 }
 
@@ -122,11 +132,17 @@ fn cdc_11_4_erase_is_idempotent_for_the_orchestrator() {
     let eraser = CryptoShredErase::new(&kms, region());
     let wiring = OrchestratorWiring::default();
     let holders = EraseHolders {
-        pseudonym: &wiring, search: &wiring, refs: &wiring, bus: &wiring, ledger: &wiring,
+        pseudonym: &wiring,
+        search: &wiring,
+        refs: &wiring,
+        bus: &wiring,
+        ledger: &wiring,
         git_reach: None,
     };
 
-    let r1 = eraser.erase(&subject, &tenant, &holders, 1).expect("first erase");
+    let r1 = eraser
+        .erase(&subject, &tenant, &holders, 1)
+        .expect("first erase");
     let r2 = eraser
         .erase(&subject, &tenant, &holders, 2)
         .expect("re-erase is a no-op SUCCESS");

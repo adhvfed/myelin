@@ -12,8 +12,8 @@
 //! `git.ref.updated` payload is the frozen, round-tripping shape (no drift between emit + consume).
 
 use myelin_events::{
-    Actor, CausedBy, EmitContextBase, EventEnvelope, IdMinter, MonotonicMinter, OutboxStore, Region,
-    TenantId, Timestamp,
+    Actor, CausedBy, EmitContextBase, EventEnvelope, IdMinter, MonotonicMinter, OutboxStore,
+    Region, TenantId, Timestamp,
 };
 use myelin_git::events::GIT_REF_UPDATED;
 use myelin_git::receive_pack::{
@@ -45,13 +45,21 @@ impl RefUpdatedView {
             return Err(format!("not a git.ref.updated event: {}", env.type_.0));
         }
         let p = &env.payload;
-        let s = |k: &str| p.get(k).and_then(|v| v.as_str()).map(|s| s.to_string()).ok_or_else(|| format!("missing string field {k}"));
+        let s = |k: &str| {
+            p.get(k)
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .ok_or_else(|| format!("missing string field {k}"))
+        };
         Ok(RefUpdatedView {
             repo: s("repo")?,
             ref_name: s("ref")?,
             old_oid: s("old_oid")?,
             new_oid: s("new_oid")?,
-            forced: p.get("forced").and_then(|v| v.as_bool()).ok_or("missing forced")?,
+            forced: p
+                .get("forced")
+                .and_then(|v| v.as_bool())
+                .ok_or("missing forced")?,
             commit_oids: p
                 .get("commit_oids")
                 .and_then(|v| v.as_array())
@@ -60,7 +68,10 @@ impl RefUpdatedView {
                 .map(|v| v.as_str().unwrap_or_default().to_string())
                 .collect(),
             pusher_pseudonym: s("pusher_pseudonym")?,
-            update_seq: p.get("update_seq").and_then(|v| v.as_u64()).ok_or("missing update_seq")?,
+            update_seq: p
+                .get("update_seq")
+                .and_then(|v| v.as_u64())
+                .ok_or("missing update_seq")?,
         })
     }
 }
@@ -100,8 +111,14 @@ fn git_ref_updated_provider_consumer_wire_shape_round_trips() {
             forced: false,
             commit_oids: vec![Oid::new("abc123"), Oid::new("def456")],
         }],
-        quarantine: vec![QuarantineObject { oid: Oid::new("abc123"), bytes: b"commit".to_vec() }],
-        pusher: Pusher { pseudonym: "anon-9@acme.noreply".into(), is_agent: false },
+        quarantine: vec![QuarantineObject {
+            oid: Oid::new("abc123"),
+            bytes: b"commit".to_vec(),
+        }],
+        pusher: Pusher {
+            pseudonym: "anon-9@acme.noreply".into(),
+            is_agent: false,
+        },
     };
 
     let id = match store.receive(&push, &db, CrashPoint::None).unwrap() {
@@ -134,9 +151,18 @@ fn git_ref_updated_provider_consumer_wire_shape_round_trips() {
     // The envelope's own frozen fields are the 2.1/2.3 contract: type, per-ref aggregate, and the
     // pseudonymous payload carries NO inline PII (references-not-payloads).
     assert_eq!(env.type_.0, GIT_REF_UPDATED);
-    assert_eq!(env.aggregate.0, "core:refs/heads/main", "the per-ref aggregate (2.3)");
-    assert!(!env.contains_personal_data, "the pusher pseudonym is not inline PII (4.8)");
-    assert_eq!(row.seq, 0, "first event on the per-ref aggregate is outbox seq 0 (2.3)");
+    assert_eq!(
+        env.aggregate.0, "core:refs/heads/main",
+        "the per-ref aggregate (2.3)"
+    );
+    assert!(
+        !env.contains_personal_data,
+        "the pusher pseudonym is not inline PII (4.8)"
+    );
+    assert_eq!(
+        row.seq, 0,
+        "first event on the per-ref aggregate is outbox seq 0 (2.3)"
+    );
 }
 
 /// **2.3 per-aggregate ordering across the CDC boundary: successive pushes to one ref carry
@@ -164,7 +190,10 @@ fn git_ref_updated_per_ref_ordering_is_consumed_in_order() {
                 commit_oids: vec![new],
             }],
             quarantine: vec![],
-            pusher: Pusher { pseudonym: "anon-1@acme.noreply".into(), is_agent: false },
+            pusher: Pusher {
+                pseudonym: "anon-1@acme.noreply".into(),
+                is_agent: false,
+            },
         };
         match store.receive(&p, &db, CrashPoint::None).unwrap() {
             PushOutcome::Accepted { emitted, .. } => ids.push(emitted[0].clone()),
@@ -176,12 +205,20 @@ fn git_ref_updated_per_ref_ordering_is_consumed_in_order() {
     let mut rows: Vec<_> = ids.iter().map(|id| outbox.row(id).unwrap()).collect();
     rows.sort_by_key(|r| r.seq);
     let seqs: Vec<u64> = rows.iter().map(|r| r.seq).collect();
-    assert_eq!(seqs, vec![0, 1, 2], "contiguous per-aggregate outbox seqs (2.3, gap-free)");
+    assert_eq!(
+        seqs,
+        vec![0, 1, 2],
+        "contiguous per-aggregate outbox seqs (2.3, gap-free)"
+    );
     let update_seqs: Vec<u64> = rows
         .iter()
         .map(|r| RefUpdatedView::decode(&r.envelope).unwrap().update_seq)
         .collect();
-    assert_eq!(update_seqs, vec![1, 2, 3], "the consumer reads update_seq in per-ref order");
+    assert_eq!(
+        update_seqs,
+        vec![1, 2, 3],
+        "the consumer reads update_seq in per-ref order"
+    );
 }
 
 /// **2.3 per-ref ordering UNDER A HOT-REF BURST (GIT-P10 / GIT-D1): a concurrent burst on one ref
@@ -219,7 +256,10 @@ fn git_ref_updated_per_ref_ordering_survives_a_concurrent_burst() {
                         commit_oids: vec![new],
                     }],
                     quarantine: vec![],
-                    pusher: Pusher { pseudonym: "anon-1@acme.noreply".into(), is_agent: false },
+                    pusher: Pusher {
+                        pseudonym: "anon-1@acme.noreply".into(),
+                        is_agent: false,
+                    },
                 };
                 barrier.wait();
                 store.receive(&p, &db, CrashPoint::None).unwrap()
@@ -228,7 +268,10 @@ fn git_ref_updated_per_ref_ordering_survives_a_concurrent_burst() {
         let mut winner: Option<(Oid, myelin_events::EventId)> = None;
         for h in handles {
             if let PushOutcome::Accepted { moved, emitted } = h.join().unwrap() {
-                assert!(winner.is_none(), "round {round}: two winners — a lost update!");
+                assert!(
+                    winner.is_none(),
+                    "round {round}: two winners — a lost update!"
+                );
                 winner = Some((moved[0].1.clone(), emitted[0].clone()));
             }
         }
@@ -238,10 +281,17 @@ fn git_ref_updated_per_ref_ordering_survives_a_concurrent_burst() {
     }
 
     // The consumer reads the per-aggregate rows in `seq` order → contiguous `update_seq` 1..=k.
-    let mut rows: Vec<_> = committed_ids.iter().map(|id| outbox.row(id).unwrap()).collect();
+    let mut rows: Vec<_> = committed_ids
+        .iter()
+        .map(|id| outbox.row(id).unwrap())
+        .collect();
     rows.sort_by_key(|r| r.seq);
     let seqs: Vec<u64> = rows.iter().map(|r| r.seq).collect();
-    assert_eq!(seqs, (0..k).collect::<Vec<_>>(), "per-aggregate outbox seq is gap-free under burst (2.3)");
+    assert_eq!(
+        seqs,
+        (0..k).collect::<Vec<_>>(),
+        "per-aggregate outbox seq is gap-free under burst (2.3)"
+    );
     let update_seqs: Vec<u64> = rows
         .iter()
         .map(|r| RefUpdatedView::decode(&r.envelope).unwrap().update_seq)

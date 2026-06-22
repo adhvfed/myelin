@@ -279,7 +279,10 @@ impl KnowledgeWatcherIndex {
     pub fn unwatch(&self, tenant: &TenantId, principal: &str, subject_root: &str) -> Zookie {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.revision += 1;
-        if let Some(set) = g.watches.get_mut(&(tenant.0.clone(), principal.to_string())) {
+        if let Some(set) = g
+            .watches
+            .get_mut(&(tenant.0.clone(), principal.to_string()))
+        {
             set.remove(subject_root);
         }
         Zookie(format!("zk-{}", g.revision))
@@ -293,7 +296,10 @@ impl KnowledgeWatcherIndex {
 
     /// Make the index report UNAVAILABLE (an Identity hiccup) — exercises Notif's held-not-leaked path.
     pub fn set_unavailable(&self, on: bool) {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).unavailable = on;
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unavailable = on;
     }
 }
 
@@ -381,7 +387,12 @@ mod tests {
         let keys: Vec<&str> = rules.iter().map(|(k, _)| *k).collect();
         assert_eq!(
             keys,
-            vec![KN_MENTIONED_RULE, KN_COMMENTS_RULE, KN_SHARED_RULE, KN_WATCHED_RULE]
+            vec![
+                KN_MENTIONED_RULE,
+                KN_COMMENTS_RULE,
+                KN_SHARED_RULE,
+                KN_WATCHED_RULE
+            ]
         );
         for (key, rule) in &rules {
             // the registered default_class is EXACTLY the §3.1 ranking-table band for the reason.
@@ -412,7 +423,11 @@ mod tests {
         let mut reg = NotifRuleRegistry::platform_default();
         let before = reg.len();
         register_knowledge_notif_rules(&mut reg).expect("kn's set registers");
-        assert_eq!(reg.len(), before + 4, "kn's four rules accreted (no Notif enum/match edit)");
+        assert_eq!(
+            reg.len(),
+            before + 4,
+            "kn's four rules accreted (no Notif enum/match edit)"
+        );
 
         // the router classifies a KN mention Signal through KN's registered rule + collapses by
         // (recipient, subject).
@@ -420,8 +435,14 @@ mod tests {
         let m = reg.classify(KN_MENTIONED_RULE, "psn:bob", &subject);
         assert_eq!(m.reason, Reason::Mentioned);
         assert_eq!(m.default_class, Class::Direct);
-        assert!(m.from_registered_rule, "the KN registration took effect (0 Notif change)");
-        assert_eq!(m.dedup_key, "kn-mention:psn:bob:myelin://acme/knowledge/page/9");
+        assert!(
+            m.from_registered_rule,
+            "the KN registration took effect (0 Notif change)"
+        );
+        assert_eq!(
+            m.dedup_key,
+            "kn-mention:psn:bob:myelin://acme/knowledge/page/9"
+        );
 
         // a KN comments Signal classifies into the participating band + collapses by subject.
         let c = reg.classify(KN_COMMENTS_RULE, "psn:alice", &subject);
@@ -442,7 +463,11 @@ mod tests {
         let mut reg = NotifRuleRegistry::new();
         register_knowledge_notif_rules(&mut reg).unwrap();
         register_knowledge_notif_rules(&mut reg).unwrap();
-        assert_eq!(reg.len(), 4, "re-registering KN's set keeps four rules (idempotent)");
+        assert_eq!(
+            reg.len(),
+            4,
+            "re-registering KN's set keeps four rules (idempotent)"
+        );
     }
 
     /// **The watcher relation Knowledge wires the reverse index over IS the frozen relation KN's ReBAC
@@ -454,10 +479,19 @@ mod tests {
         // the read-fanout consumer reads the SAME name.
         assert_eq!(KN_WATCHER_RELATION, myelin_notif::WATCHER_RELATION);
         // the watchable types are exactly the fragment's watchable KN types.
-        assert_eq!(knowledge_watchable_object_types(), ["space", "page", "database_row"]);
+        assert_eq!(
+            knowledge_watchable_object_types(),
+            ["space", "page", "database_row"]
+        );
         // and the fragment really declares `watcher` on all three (the producer half); block is NOT.
-        assert!(crate::knowledge_fragment::space_fragment().is_watchable(), "space is watchable");
-        assert!(crate::knowledge_fragment::page_fragment().is_watchable(), "page is watchable");
+        assert!(
+            crate::knowledge_fragment::space_fragment().is_watchable(),
+            "space is watchable"
+        );
+        assert!(
+            crate::knowledge_fragment::page_fragment().is_watchable(),
+            "page is watchable"
+        );
         assert!(
             crate::knowledge_fragment::database_row_fragment().is_watchable(),
             "database_row is watchable"
@@ -509,13 +543,19 @@ mod tests {
         let answer = idx
             .resolve_relation(&viewer("psn:alice"), &leaf, RevisionWatermark(0))
             .expect("available");
-        assert!(answer.subject_roots.contains(page), "alice watches the page");
+        assert!(
+            answer.subject_roots.contains(page),
+            "alice watches the page"
+        );
 
         // a principal who watches nothing → empty (never a widen).
         let none = idx
             .resolve_relation(&viewer("psn:nobody"), &leaf, RevisionWatermark(0))
             .expect("available");
-        assert!(none.subject_roots.is_empty(), "a non-watcher reaches nothing");
+        assert!(
+            none.subject_roots.is_empty(),
+            "a non-watcher reaches nothing"
+        );
     }
 
     /// **A different relation than `watcher` resolves to the empty set (never a widen).** The KN index
@@ -531,7 +571,10 @@ mod tests {
         let answer = idx
             .resolve_relation(&viewer("psn:alice"), &other, RevisionWatermark(0))
             .expect("available");
-        assert!(answer.subject_roots.is_empty(), "a non-watcher relation reaches nothing (no widen)");
+        assert!(
+            answer.subject_roots.is_empty(),
+            "a non-watcher relation reaches nothing (no widen)"
+        );
     }
 
     fn strong(zk: &str) -> Consistency {

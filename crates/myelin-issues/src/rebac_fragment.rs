@@ -94,7 +94,10 @@ fn fragment(object_type: &str, relations: &[&str], permissions: &[&str]) -> Name
     NamespaceFragment {
         object_type: ObjectType(object_type.to_string()),
         relations: relations.iter().map(|r| RelName(r.to_string())).collect(),
-        permissions: permissions.iter().map(|p| Permission(p.to_string())).collect(),
+        permissions: permissions
+            .iter()
+            .map(|p| Permission(p.to_string()))
+            .collect(),
     }
 }
 
@@ -209,7 +212,9 @@ mod tests {
             "`confidential` (the SUBTRACTED arm of `view`) must be declared (§6.1)"
         );
         assert!(
-            issue.relations.contains(&RelName("confidential_grant".into())),
+            issue
+                .relations
+                .contains(&RelName("confidential_grant".into())),
             "`confidential_grant` (the explicit re-admit arm) must be declared (§6.1)"
         );
     }
@@ -219,7 +224,9 @@ mod tests {
     #[test]
     fn watcher_is_declared_on_the_watchable_issue_type() {
         assert!(
-            issue_fragment().relations.contains(&RelName("watcher".into())),
+            issue_fragment()
+                .relations
+                .contains(&RelName("watcher".into())),
             "the `issue` watchable type declares `watcher` (Notif read-fanout)"
         );
     }

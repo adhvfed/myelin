@@ -42,7 +42,11 @@ struct BreakableId {
 
 impl BreakableId {
     fn new(inner: StoreBackedCheck, scope: TenantScope) -> Self {
-        Self { inner, scope, broken: Cell::new(false) }
+        Self {
+            inner,
+            scope,
+            broken: Cell::new(false),
+        }
     }
     fn set_broken(&self, on: bool) {
         self.broken.set(on);
@@ -63,7 +67,9 @@ impl IdentityService for BreakableId {
     ) -> myelin_identity::Result<Decision> {
         if self.broken.get() {
             // The forced break: the authoritative engine is unreachable (a transient hiccup).
-            return Err(myelin_identity::AuthzError::Unavailable("forced Id break (drill)".into()));
+            return Err(myelin_identity::AuthzError::Unavailable(
+                "forced Id break (drill)".into(),
+            ));
         }
         self.inner.check(subject, permission, object, at, caveat)
     }
@@ -83,11 +89,15 @@ impl IdentityService for BreakableId {
         at: &Consistency,
     ) -> myelin_identity::Result<SubjectTree> {
         if self.broken.get() {
-            return Err(myelin_identity::AuthzError::Unavailable("forced Id break (drill)".into()));
+            return Err(myelin_identity::AuthzError::Unavailable(
+                "forced Id break (drill)".into(),
+            ));
         }
         // The ABI trait method cannot carry the (tenant, region) scope; delegate to the scoped
         // `list_subjects_in` over the fixed test scope (the CODEOWNERS Expand path).
-        Ok(self.inner.list_subjects_in(&self.scope, object, permission, at))
+        Ok(self
+            .inner
+            .list_subjects_in(&self.scope, object, permission, at))
     }
     fn explain(
         &self,
@@ -124,11 +134,7 @@ impl IdentityService for BreakableId {
     fn revoke(&self, t: &myelin_identity::RevokeTarget) -> myelin_identity::Result<()> {
         self.inner.revoke(t)
     }
-    fn resolve_pseudonym(
-        &self,
-        s: &PrincipalId,
-        t: &TenantId,
-    ) -> myelin_identity::Result<String> {
+    fn resolve_pseudonym(&self, s: &PrincipalId, t: &TenantId) -> myelin_identity::Result<String> {
         self.inner.resolve_pseudonym(s, t)
     }
     fn erase(&self, s: &PrincipalId) -> myelin_identity::Result<()> {
@@ -232,12 +238,30 @@ fn cdc_4_9_live_fragment_is_enforced_at_the_check() {
     let pull = Permission(perm::PULL.into());
 
     // alice (a real repo admin) pulls — the live fragment resolves pull = reader∪writer∪admin∪….
-    let d = gate.front_door_check(&subject("p:alice", "acme"), &pull, &repo, Zookie(String::new()), false);
-    assert!(is_allow(&d), "a repo admin pulls through the LIVE fragment (0 unauthorized denied)");
+    let d = gate.front_door_check(
+        &subject("p:alice", "acme"),
+        &pull,
+        &repo,
+        Zookie(String::new()),
+        false,
+    );
+    assert!(
+        is_allow(&d),
+        "a repo admin pulls through the LIVE fragment (0 unauthorized denied)"
+    );
 
     // an outsider is denied (fail-closed — no resolved grant).
-    let d = gate.front_door_check(&subject("p:bob", "acme"), &pull, &repo, Zookie(String::new()), false);
-    assert!(!is_allow(&d), "an outsider is denied (0 unauthorized action admitted)");
+    let d = gate.front_door_check(
+        &subject("p:bob", "acme"),
+        &pull,
+        &repo,
+        Zookie(String::new()),
+        false,
+    );
+    assert!(
+        !is_allow(&d),
+        "an outsider is denied (0 unauthorized action admitted)"
+    );
 }
 
 /// **CDC 4.9 — the X-1 fork-endorsement relation is a plain `check` (not bespoke logic).** A
@@ -258,10 +282,26 @@ fn cdc_4_9_fork_endorsement_relation_is_enforced_live() {
 
     // The zookie is the read-your-writes fence; an empty zookie reads at latest (no prior write to
     // fence on — the endorsement relation was seeded, not written through this gate's `grant_relation`).
-    let d = gate.fork_endorsement_check(&subject("p:maint", "acme"), &repo, Zookie(String::new()), false);
-    assert!(is_allow(&d), "a maintainer with approve_untrusted_ci endorses (X-1, live)");
-    let d = gate.fork_endorsement_check(&subject("p:bob", "acme"), &repo, Zookie(String::new()), false);
-    assert!(!is_allow(&d), "an outsider cannot endorse (X-1, fail-closed)");
+    let d = gate.fork_endorsement_check(
+        &subject("p:maint", "acme"),
+        &repo,
+        Zookie(String::new()),
+        false,
+    );
+    assert!(
+        is_allow(&d),
+        "a maintainer with approve_untrusted_ci endorses (X-1, live)"
+    );
+    let d = gate.fork_endorsement_check(
+        &subject("p:bob", "acme"),
+        &repo,
+        Zookie(String::new()),
+        false,
+    );
+    assert!(
+        !is_allow(&d),
+        "an outsider cannot endorse (X-1, fail-closed)"
+    );
 }
 
 // ───────────────────────────── the CHAINED e2e (the GIT-P14 gate) ────────────────────────────────
@@ -298,11 +338,17 @@ fn chained_grant_read_your_writes_break_degrade_revoked_denied() {
             Timestamp("2026-06-21T00:00:00Z".into()),
         )
         .expect("grant alice admin");
-    assert!(!zookie.0.is_empty(), "the grant returns a read-your-writes zookie fence");
+    assert!(
+        !zookie.0.is_empty(),
+        "the grant returns a read-your-writes zookie fence"
+    );
 
     let svc = StoreBackedCheck::new(store);
     for admit in svc.admit_git_fragment() {
-        assert!(matches!(admit, myelin_identity::FragmentAdmit::Admitted { .. }));
+        assert!(matches!(
+            admit,
+            myelin_identity::FragmentAdmit::Admitted { .. }
+        ));
     }
     let gate = GitCheckGate::try_new_with_clock(
         BreakableId::new(svc, s.clone()),
@@ -319,8 +365,15 @@ fn chained_grant_read_your_writes_break_degrade_revoked_denied() {
     // 2. READ-YOUR-WRITES within the zookie — the just-granted admin grant is visible NOW. The
     //    front-door read (bounded-stale) caches the coarse ALLOW (and is fresh — the engine is up).
     let d = gate.front_door_check(&alice, &pull, &repo, zookie.clone(), false);
-    assert!(is_allow(&d), "read-your-writes: the just-granted admin pulls immediately (4.10)");
-    assert_eq!(d.served, AuthzServed::Fresh, "served fresh from the live engine");
+    assert!(
+        is_allow(&d),
+        "read-your-writes: the just-granted admin pulls immediately (4.10)"
+    );
+    assert_eq!(
+        d.served,
+        AuthzServed::Fresh,
+        "served fresh from the live engine"
+    );
 
     // 3. BREAK Id (the forced, reversible, scoped dependency break).
     gate.id_ref().set_broken(true);
@@ -329,12 +382,21 @@ fn chained_grant_read_your_writes_break_degrade_revoked_denied() {
     //    the last coarse grant STATIC (the availability win), NOT a fail-closed cascade.
     gate.clock().advance(31);
     let d = gate.front_door_check(&alice, &pull, &repo, Zookie(String::new()), false);
-    assert!(d.is_degraded(), "the BoundedStale read DEGRADES (served STATIC) during the Id break");
-    assert!(is_allow(&d), "the degraded answer is the cached ALLOW — already-authorised survives");
+    assert!(
+        d.is_degraded(),
+        "the BoundedStale read DEGRADES (served STATIC) during the Id break"
+    );
+    assert!(
+        is_allow(&d),
+        "the degraded answer is the cached ALLOW — already-authorised survives"
+    );
 
     // observability is part of the pass (EI-01 §3): a stale answer was observed; its age ≤ static_max.
     let sig = gate.signals();
-    assert!(sig.stale >= 1, "the degrade is observable (fresh/stale/closed ratio signal)");
+    assert!(
+        sig.stale >= 1,
+        "the degrade is observable (fresh/stale/closed ratio signal)"
+    );
     assert!(
         sig.last_staleness_secs <= gate.static_max(),
         "staleness age ≤ static_max ≤ revocation SLA (a degrade never outlives the bound)"
@@ -342,14 +404,31 @@ fn chained_grant_read_your_writes_break_degrade_revoked_denied() {
 
     // 5. JUST-REVOKED DENIED — alice is revoked. Even with a cached ALLOW + the Id still broken (so a
     //    fresh re-check is impossible), the revocation consult denies her THROUGH the stale cache.
-    let d = gate.front_door_check(&alice, &pull, &repo, Zookie(String::new()), /*revoked*/ true);
-    assert_eq!(d.served, AuthzServed::Revoked, "a revoked subject is denied through the cache");
-    assert!(!is_allow(&d), "the cached ALLOW does NOT override the revoke (0 stale escalation)");
+    let d = gate.front_door_check(
+        &alice,
+        &pull,
+        &repo,
+        Zookie(String::new()),
+        /*revoked*/ true,
+    );
+    assert_eq!(
+        d.served,
+        AuthzServed::Revoked,
+        "a revoked subject is denied through the cache"
+    );
+    assert!(
+        !is_allow(&d),
+        "the cached ALLOW does NOT override the revoke (0 stale escalation)"
+    );
 
     // 6. RECOVER (reversible) → the next read is fresh again (the break left no cascade behind).
     gate.id_ref().set_broken(false);
     let d = gate.front_door_check(&alice, &pull, &repo, Zookie(String::new()), false);
-    assert_eq!(d.served, AuthzServed::Fresh, "recovered → fresh again (the degrade was bounded)");
+    assert_eq!(
+        d.served,
+        AuthzServed::Fresh,
+        "recovered → fresh again (the degrade was bounded)"
+    );
 }
 
 // ───────────────────────────── CDC 4.11: the FailStatic bound (degrade-not-cascade) ──────────────
@@ -366,7 +445,11 @@ fn cdc_4_11_strong_merge_read_bypasses_cache_fails_closed_on_break() {
         &s,
         &[
             add("repo:core", "admin", "p:alice"),
-            add("pull_request:core:42", "parent_repo", "repo:core#protected_push"),
+            add(
+                "pull_request:core:42",
+                "parent_repo",
+                "repo:core#protected_push",
+            ),
         ],
     );
     let gate = GitCheckGate::try_new_with_clock(
@@ -382,14 +465,28 @@ fn cdc_4_11_strong_merge_read_bypasses_cache_fails_closed_on_break() {
     // healthy: the strong merge read serves the authoritative engine directly (cache bypassed). The
     // empty zookie reads at latest (the merge gate would carry the grant's zookie for read-your-writes).
     let d = gate.merge_check(&alice, &pr, Zookie(String::new()), false);
-    assert_eq!(d.served, AuthzServed::SourceBypass, "a Strong merge read bypasses the cache");
-    assert!(is_allow(&d), "alice (admin → protected_push → merge) may merge");
+    assert_eq!(
+        d.served,
+        AuthzServed::SourceBypass,
+        "a Strong merge read bypasses the cache"
+    );
+    assert!(
+        is_allow(&d),
+        "alice (admin → protected_push → merge) may merge"
+    );
 
     // BREAK Id: the strong read fails CLOSED (never serves stale) — the new-enemy guard.
     gate.id_ref().set_broken(true);
     let d = gate.merge_check(&alice, &pr, Zookie(String::new()), false);
-    assert_eq!(d.served, AuthzServed::BypassClosed, "a Strong read fails CLOSED on a break");
-    assert!(!is_allow(&d), "a security-sensitive merge read never serves stale (4.10)");
+    assert_eq!(
+        d.served,
+        AuthzServed::BypassClosed,
+        "a Strong read fails CLOSED on a break"
+    );
+    assert!(
+        !is_allow(&d),
+        "a security-sensitive merge read never serves stale (4.10)"
+    );
 }
 
 /// **CDC 4.11 — `static_max ≤ revocation SLA` is structural.** A thresholds row whose `static_max`
@@ -414,7 +511,10 @@ fn cdc_4_11_static_max_over_revocation_sla_does_not_construct() {
         TestClock::at(0),
     );
     assert!(
-        matches!(built, Err(myelin_substrate::FailStaticError::ExceedsRevocationSla { .. })),
+        matches!(
+            built,
+            Err(myelin_substrate::FailStaticError::ExceedsRevocationSla { .. })
+        ),
         "a static_max > revocation SLA must NOT construct (4.11, the §8.2 bound is structural)"
     );
 }
@@ -437,10 +537,20 @@ fn cdc_4_11_past_static_max_sustained_break_fails_closed() {
     let pull = Permission(perm::PULL.into());
     let alice = subject("p:alice", "acme");
 
-    assert!(is_allow(&gate.front_door_check(&alice, &pull, &repo, Zookie(String::new()), false)));
+    assert!(is_allow(&gate.front_door_check(
+        &alice,
+        &pull,
+        &repo,
+        Zookie(String::new()),
+        false
+    )));
     gate.id_ref().set_broken(true);
     gate.clock().advance(301); // past static_max (300)
     let d = gate.front_door_check(&alice, &pull, &repo, Zookie(String::new()), false);
-    assert_eq!(d.served, AuthzServed::Closed, "past static_max → Closed (deny is correct), never open");
+    assert_eq!(
+        d.served,
+        AuthzServed::Closed,
+        "past static_max → Closed (deny is correct), never open"
+    );
     assert!(!is_allow(&d));
 }

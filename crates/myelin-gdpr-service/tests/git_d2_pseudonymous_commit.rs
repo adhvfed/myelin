@@ -50,11 +50,18 @@ fn tenant() -> TenantId {
 }
 
 fn subject(id: &str) -> SubjectRef {
-    SubjectRef::new(Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant()))
+    SubjectRef::new(Principal::stub(
+        PrincipalId(id.into()),
+        PrincipalKind::Human,
+        tenant(),
+    ))
 }
 
 fn subject_dek(subject_token: &str) -> ShredKeyHandle {
-    ShredKeyHandle { tenant: tenant(), class: ShredKeyClass::Subject(subject_token.to_string()) }
+    ShredKeyHandle {
+        tenant: tenant(),
+        class: ShredKeyClass::Subject(subject_token.to_string()),
+    }
 }
 
 /// Build a REAL Git commit whose author + committer are the frozen pseudonym (GIT-P25 — the commit
@@ -128,21 +135,36 @@ fn git_d2_erase_leaves_zero_recoverable_real_identity_and_the_one_residual() {
     // The H1 inline-body crypto-shred reaches backups: erase destroys the per-subject DEK.
     let kms = InMemoryShredKms::new();
     kms.provision(subject_dek("u-author"), 4242);
-    assert!(kms.is_present(&subject_dek("u-author")), "the inline-body DEK is live before erase");
+    assert!(
+        kms.is_present(&subject_dek("u-author")),
+        "the inline-body DEK is live before erase"
+    );
 
     let git_holder = GitDbHolder::new(&kms);
     let receipt = git_holder
-        .erase(EraseScope::Subject { subject: subject("u-author"), tenant: tenant() })
+        .erase(EraseScope::Subject {
+            subject: subject("u-author"),
+            tenant: tenant(),
+        })
         .unwrap();
 
-    assert!(!kms.is_present(&subject_dek("u-author")), "the inline-body DEK is crypto-shredded");
+    assert!(
+        !kms.is_present(&subject_dek("u-author")),
+        "the inline-body DEK is crypto-shredded"
+    );
     assert_eq!(
         kms.recoverable_in_backup(&subject_dek("u-author")),
         0,
         "GIT-D2: 0 recoverable in backups (crypto-shred reaches backups)"
     );
-    assert!(receipt.receipt.key_epoch_destroyed.is_some(), "the destroyed key epoch is recorded");
-    assert!(receipt.receipt.content_hash.starts_with("blake3:"), "the erase receipt is content-addressed");
+    assert!(
+        receipt.receipt.key_epoch_destroyed.is_some(),
+        "the destroyed key epoch is recorded"
+    );
+    assert!(
+        receipt.receipt.content_hash.starts_with("blake3:"),
+        "the erase receipt is content-addressed"
+    );
 
     // The residual == the ONE platform-posture residual (confirmed equal, never re-described).
     assert!(
@@ -157,11 +179,17 @@ fn git_d2_erase_leaves_zero_recoverable_real_identity_and_the_one_residual() {
 /// anti-pattern is structurally absent).
 #[test]
 fn the_git_instance_completes_the_10_9_by_reference_pair() {
-    assert_eq!(GIT_INSTANCE.cited_anchor, POSTURE_ANCHOR, "Git cites the ONE canonical anchor");
+    assert_eq!(
+        GIT_INSTANCE.cited_anchor, POSTURE_ANCHOR,
+        "Git cites the ONE canonical anchor"
+    );
     assert_eq!(GIT_INSTANCE.cited_anchor, CANONICAL_POSTURE.anchor);
     assert!(
         git_section_references_posture(),
         "the Git erasure section is a valid BY-REFERENCE instantiation (cites + does not restate)"
     );
-    assert_eq!(CANONICAL_POSTURE.contract_row, "10.9", "the by-reference instance owns row 10.9");
+    assert_eq!(
+        CANONICAL_POSTURE.contract_row, "10.9",
+        "the by-reference instance owns row 10.9"
+    );
 }

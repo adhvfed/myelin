@@ -114,7 +114,9 @@ pub fn disposition(
 ) -> CandidateDisposition {
     let required = watermark_from_zookie(passed_zookie).0;
     // An absent anchor is the oldest possible revision (0) — conservatively re-validated.
-    let indexed = candidate_indexed_zookie.map(watermark_from_zookie).map_or(0, |w| w.0);
+    let indexed = candidate_indexed_zookie
+        .map(watermark_from_zookie)
+        .map_or(0, |w| w.0);
     if indexed < required {
         CandidateDisposition::StaleNeedsRevalidation
     } else {
@@ -230,35 +232,57 @@ mod tests {
     use myelin_tenancy::TenantId;
 
     fn strong(zookie: &str) -> Consistency {
-        Consistency { at_least: Zookie(zookie.into()), mode: ConsistencyMode::Strong }
+        Consistency {
+            at_least: Zookie(zookie.into()),
+            mode: ConsistencyMode::Strong,
+        }
     }
     fn bounded(zookie: &str) -> Consistency {
-        Consistency { at_least: Zookie(zookie.into()), mode: ConsistencyMode::BoundedStale }
+        Consistency {
+            at_least: Zookie(zookie.into()),
+            mode: ConsistencyMode::BoundedStale,
+        }
     }
     fn subject() -> Principal {
-        Principal::stub(PrincipalId("p:alice".into()), PrincipalKind::Human, TenantId("acme".into()))
+        Principal::stub(
+            PrincipalId("p:alice".into()),
+            PrincipalKind::Human,
+            TenantId("acme".into()),
+        )
     }
 
     /// **A candidate indexed STRICTLY BEFORE the passed zookie is stale; at-or-after is fresh.**
     #[test]
     fn disposition_is_stale_iff_indexed_revision_is_below_passed() {
         // indexed @5 vs passed @9 → stale (the index projection predates the demanded snapshot).
-        assert_eq!(disposition(Some("z@5"), "z@9"), CandidateDisposition::StaleNeedsRevalidation);
+        assert_eq!(
+            disposition(Some("z@5"), "z@9"),
+            CandidateDisposition::StaleNeedsRevalidation
+        );
         // indexed @9 vs passed @9 → fresh (indexed AT the snapshot — its ACL state reflects it).
         assert_eq!(disposition(Some("z@9"), "z@9"), CandidateDisposition::Fresh);
         // indexed @11 vs passed @9 → fresh (indexed AFTER — strictly newer).
-        assert_eq!(disposition(Some("z@11"), "z@9"), CandidateDisposition::Fresh);
+        assert_eq!(
+            disposition(Some("z@11"), "z@9"),
+            CandidateDisposition::Fresh
+        );
     }
 
     /// **An ABSENT candidate anchor is conservatively STALE (the oldest possible revision) — a doc
     /// with no recorded staleness anchor is re-validated, never assumed fresh.**
     #[test]
     fn absent_anchor_is_conservatively_stale() {
-        assert_eq!(disposition(None, "z@1"), CandidateDisposition::StaleNeedsRevalidation);
+        assert_eq!(
+            disposition(None, "z@1"),
+            CandidateDisposition::StaleNeedsRevalidation
+        );
         // ...except when the passed zookie carries NO watermark (rev 0): nothing can be below 0, so
         // an absent anchor (treated as 0) is fresh — a default-consistency query with no zookie
         // does not re-validate every hit (that would be the N+1 the pre-filter avoids).
-        assert_eq!(disposition(None, "z-no-suffix"), CandidateDisposition::Fresh);
+        assert_eq!(
+            disposition(None, "z-no-suffix"),
+            CandidateDisposition::Fresh
+        );
     }
 
     /// **`stale_candidates` partitions into (fresh, stale) by the no-stale-grant rule, preserving
@@ -272,17 +296,27 @@ mod tests {
             "OTHER-2" => Some("z@9".to_string()),
             _ => None,
         };
-        let (fresh, stale) =
-            stale_candidates(["PUB-1", "SECRET-9", "OTHER-2"], "z@9", anchor);
-        assert_eq!(fresh, vec!["PUB-1".to_string(), "OTHER-2".to_string()], "fresh kept in order");
-        assert_eq!(stale, vec!["SECRET-9".to_string()], "ONLY the stale candidate is re-validated");
+        let (fresh, stale) = stale_candidates(["PUB-1", "SECRET-9", "OTHER-2"], "z@9", anchor);
+        assert_eq!(
+            fresh,
+            vec!["PUB-1".to_string(), "OTHER-2".to_string()],
+            "fresh kept in order"
+        );
+        assert_eq!(
+            stale,
+            vec!["SECRET-9".to_string()],
+            "ONLY the stale candidate is re-validated"
+        );
     }
 
     /// **A zookie-stamped STRONG read BYPASSES the fail-static cache; a default-consistency
     /// BoundedStale read does NOT (it may degrade-not-cascade).** (contract 4.10/1.10).
     #[test]
     fn strong_bypasses_fail_static_bounded_does_not() {
-        assert!(fail_static_bypass(&strong("z@7")), "a strong zookie read bypasses the stale cache");
+        assert!(
+            fail_static_bypass(&strong("z@7")),
+            "a strong zookie read bypasses the stale cache"
+        );
         assert!(
             !fail_static_bypass(&bounded("z@7")),
             "a default-consistency read may use the stale cache (degrade-not-cascade)"
@@ -309,7 +343,9 @@ mod tests {
                 Ok(object.0 != self.revoked)
             }
         }
-        let port = Revoker { revoked: "acme/issue/SECRET-9" };
+        let port = Revoker {
+            revoked: "acme/issue/SECRET-9",
+        };
         let at = strong("z@9");
         let perm = Permission("read".into());
         // The still-granted object is admitted.
@@ -318,7 +354,12 @@ mod tests {
             .unwrap());
         // The just-revoked object is EXCLUDED (the new-enemy is kept out under the zookie).
         assert!(!port
-            .check(&subject(), &perm, &ObjectId("acme/issue/SECRET-9".into()), &at)
+            .check(
+                &subject(),
+                &perm,
+                &ObjectId("acme/issue/SECRET-9".into()),
+                &at
+            )
             .unwrap());
     }
 
@@ -334,8 +375,20 @@ mod tests {
         s.record_fail_static_served();
         s.record_fail_static_served();
         assert_eq!(s.revalidated(), 2, "two bounded re-validations");
-        assert_eq!(s.excluded_stale(), 1, "one stale candidate excluded (zero-escape counter)");
-        assert_eq!(s.fail_static_bypassed(), 1, "one fail-static bypass (strong read)");
-        assert_eq!(s.fail_static_served(), 2, "two fail-static serves (degrade-not-cascade)");
+        assert_eq!(
+            s.excluded_stale(),
+            1,
+            "one stale candidate excluded (zero-escape counter)"
+        );
+        assert_eq!(
+            s.fail_static_bypassed(),
+            1,
+            "one fail-static bypass (strong read)"
+        );
+        assert_eq!(
+            s.fail_static_served(),
+            2,
+            "two fail-static serves (degrade-not-cascade)"
+        );
     }
 }

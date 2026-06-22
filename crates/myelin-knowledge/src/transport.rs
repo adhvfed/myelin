@@ -95,9 +95,7 @@
 // not claimed at 100% (the telemetry accessors / Display arms are not core); the IDEMPOTENT-APPLY
 // PATH is — that is the property KN-D1 gates and the floor the prompt names.
 
-use myelin_events::{
-    Firehose, FirehoseError, FirehoseScope, FrameDraft,
-};
+use myelin_events::{Firehose, FirehoseError, FirehoseScope, FrameDraft};
 use myelin_identity::Principal;
 use myelin_tenancy::TenantId;
 use std::collections::HashMap;
@@ -134,7 +132,10 @@ pub struct OpId {
 impl OpId {
     /// A fresh `op_id` for `client_id` at `lamport`.
     pub fn new(client_id: impl Into<String>, lamport: u64) -> OpId {
-        OpId { client_id: client_id.into(), lamport }
+        OpId {
+            client_id: client_id.into(),
+            lamport,
+        }
     }
 
     /// The canonical wire/db form (`<client_id>:<lamport>`) — the `op_id` text column (01 §3) + the
@@ -215,8 +216,19 @@ pub struct DocOp {
 
 impl DocOp {
     /// A CAS-floor op (the v1 path): `kind` + opaque CAS `payload` bytes, no inline PII.
-    pub fn cas(op_id: OpId, actor: impl Into<String>, kind: OpKind, payload: impl Into<Vec<u8>>) -> DocOp {
-        DocOp { op_id, actor: actor.into(), kind, payload: payload.into(), pii_key_ref: None }
+    pub fn cas(
+        op_id: OpId,
+        actor: impl Into<String>,
+        kind: OpKind,
+        payload: impl Into<Vec<u8>>,
+    ) -> DocOp {
+        DocOp {
+            op_id,
+            actor: actor.into(),
+            kind,
+            payload: payload.into(),
+            pii_key_ref: None,
+        }
     }
 }
 
@@ -303,7 +315,10 @@ impl DocOpLog {
             return SendOutcome::Duplicate(existing);
         }
         self.last_seq += 1;
-        let persisted = PersistedOp { op_seq: self.last_seq, op };
+        let persisted = PersistedOp {
+            op_seq: self.last_seq,
+            op,
+        };
         self.by_op_id.insert(wire, self.last_seq);
         self.ops.push(persisted.clone());
         SendOutcome::Applied(persisted)
@@ -313,7 +328,11 @@ impl DocOpLog {
     /// This is the `(last_seq, now]` backfill `RECONNECT` replays — every op the client missed,
     /// exactly once, none lost. A caught-up client (`last_seq >= self.last_seq`) gets nothing.
     pub fn ops_since(&self, last_seq: u64) -> Vec<PersistedOp> {
-        self.ops.iter().filter(|p| p.op_seq > last_seq).cloned().collect()
+        self.ops
+            .iter()
+            .filter(|p| p.op_seq > last_seq)
+            .cloned()
+            .collect()
     }
 
     /// The highest assigned `op_seq` (the live head; the resume cursor a caught-up client holds).
@@ -326,7 +345,11 @@ impl DocOpLog {
     /// state up to (and including) the snapshot boundary. After a GC pruned rows ≤ a watermark, this
     /// returns only the RETAINED ops ≤ `up_to` (the snapshot carries the pruned remainder).
     pub fn ops_up_to(&self, up_to: u64) -> Vec<PersistedOp> {
-        self.ops.iter().filter(|p| p.op_seq <= up_to).cloned().collect()
+        self.ops
+            .iter()
+            .filter(|p| p.op_seq <= up_to)
+            .cloned()
+            .collect()
     }
 
     /// **The ops in `(from, to]`, in `op_seq` order (the tail a version-history reconstruct appends on
@@ -443,7 +466,10 @@ impl core::fmt::Display for TransportError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             TransportError::OverBroadScope(s) => {
-                write!(f, "collab transport rejects over-broad doc scope `{s}` (never `*`)")
+                write!(
+                    f,
+                    "collab transport rejects over-broad doc scope `{s}` (never `*`)"
+                )
             }
             TransportError::Unauthorized { page_id } => {
                 write!(f, "collab op denied by Layer-2 authority on page `{page_id}` (no op without authz)")
@@ -524,7 +550,10 @@ pub struct Presence {
 impl Presence {
     /// A presence frame for `client_id` carrying the opaque `awareness` payload.
     pub fn new(client_id: impl Into<String>, awareness: impl Into<String>) -> Presence {
-        Presence { client_id: client_id.into(), awareness: awareness.into() }
+        Presence {
+            client_id: client_id.into(),
+            awareness: awareness.into(),
+        }
     }
 }
 
@@ -555,7 +584,10 @@ impl CollabTransport<FailClosedAuthority> {
     /// **Open the transport for a doc with the FAIL-CLOSED Layer-2 authority (the production default,
     /// arch §3.1 — no op without authz, deny until KN-P14 wires the real `Id.check`).** Rejects an
     /// over-broad scope at open (a `page_id` that is not a bounded doc selector).
-    pub fn open(tenant: TenantId, page_id: &str) -> Result<CollabTransport<FailClosedAuthority>, TransportError> {
+    pub fn open(
+        tenant: TenantId,
+        page_id: &str,
+    ) -> Result<CollabTransport<FailClosedAuthority>, TransportError> {
         CollabTransport::open_with_authority(tenant, page_id, FailClosedAuthority)
     }
 }
@@ -569,7 +601,8 @@ impl<A: OpAuthority> CollabTransport<A> {
         page_id: &str,
         authority: A,
     ) -> Result<CollabTransport<A>, TransportError> {
-        let scope = doc_scope(page_id).map_err(|_| TransportError::OverBroadScope(format!("doc:{page_id}")))?;
+        let scope = doc_scope(page_id)
+            .map_err(|_| TransportError::OverBroadScope(format!("doc:{page_id}")))?;
         let stream = knowledge_stream(&tenant);
         Ok(CollabTransport {
             tenant,
@@ -651,7 +684,9 @@ impl<A: OpAuthority> CollabTransport<A> {
     ) -> Result<Connected, TransportError> {
         // Step 1 — AUTHORIZE (Layer 2, arch §2): no op (and no backfill of ops) without authz.
         if !self.authority.authorize(principal, &self.page_id, action) {
-            return Err(TransportError::Unauthorized { page_id: self.page_id.clone() });
+            return Err(TransportError::Unauthorized {
+                page_id: self.page_id.clone(),
+            });
         }
 
         let last_seq = cursor.unwrap_or(0);
@@ -680,7 +715,9 @@ impl<A: OpAuthority> CollabTransport<A> {
             }
             // The firehose `resume` only errors with `OverBroadScope` (unreachable — the scope is a
             // typed bounded `FirehoseScope`) or `ResyncRequired` (handled). Any other is a bug.
-            Err(_) => Ok(Connected::Resumed { backfill: self.log.ops_since(last_seq) }),
+            Err(_) => Ok(Connected::Resumed {
+                backfill: self.log.ops_since(last_seq),
+            }),
         }
     }
 
@@ -711,7 +748,11 @@ impl<A: OpAuthority> CollabTransport<A> {
             let _frame = self.firehose.publish(
                 &self.stream,
                 &self.scope,
-                FrameDraft::new(format!("{}@{}", persisted.op.op_id.wire(), persisted.op_seq)),
+                FrameDraft::new(format!(
+                    "{}@{}",
+                    persisted.op.op_id.wire(),
+                    persisted.op_seq
+                )),
             );
             // Step 6 — coalesce → `knowledge.doc.updated` via the OUTBOX is the call site's job (the
             // debounced emit through `crate::emit::emit_change`, NEVER per-op on the durable bus). The
@@ -738,7 +779,10 @@ impl<A: OpAuthority> CollabTransport<A> {
     /// CONNECT). Frames published by [`Self::send_op`] fan out to it (the live delivery). A bounded
     /// scope is guaranteed (the transport's scope is typed). `cursor = None` is live-from-now;
     /// `Some(seq)` backfills `(seq, now]` from the firehose window first.
-    pub fn subscribe(&mut self, cursor: Option<u64>) -> Result<myelin_events::FirehoseSubscription, FirehoseError> {
+    pub fn subscribe(
+        &mut self,
+        cursor: Option<u64>,
+    ) -> Result<myelin_events::FirehoseSubscription, FirehoseError> {
         self.firehose.subscribe(&self.stream, &self.scope, cursor)
     }
 
@@ -777,7 +821,11 @@ mod tests {
     }
 
     fn principal() -> Principal {
-        Principal::stub(PrincipalId("p-opaque".into()), PrincipalKind::Human, tenant())
+        Principal::stub(
+            PrincipalId("p-opaque".into()),
+            PrincipalKind::Human,
+            tenant(),
+        )
     }
 
     fn open() -> CollabTransport<AllowAllAuthority> {
@@ -785,7 +833,12 @@ mod tests {
     }
 
     fn op(client: &str, lamport: u64, kind: OpKind) -> DocOp {
-        DocOp::cas(OpId::new(client, lamport), "actor-1", kind, format!("cas:{client}:{lamport}").into_bytes())
+        DocOp::cas(
+            OpId::new(client, lamport),
+            "actor-1",
+            kind,
+            format!("cas:{client}:{lamport}").into_bytes(),
+        )
     }
 
     // ---- op_seq monotonicity --------------------------------------------------------------------
@@ -800,9 +853,16 @@ mod tests {
         let c = t.send_op(op("c2", 1, OpKind::Insert));
         assert_eq!(a.persisted().op_seq, 1);
         assert_eq!(b.persisted().op_seq, 2);
-        assert_eq!(c.persisted().op_seq, 3, "monotone across clients (one per-doc cursor)");
+        assert_eq!(
+            c.persisted().op_seq,
+            3,
+            "monotone across clients (one per-doc cursor)"
+        );
         assert_eq!(t.head_seq(), 3);
-        assert!(a.applied() && b.applied() && c.applied(), "all three are fresh applies");
+        assert!(
+            a.applied() && b.applied() && c.applied(),
+            "all three are fresh applies"
+        );
     }
 
     // ---- the idempotent ON CONFLICT apply (a re-delivered op is a no-op) -------------------------
@@ -820,15 +880,29 @@ mod tests {
 
         // the SAME (client_id, lamport) is re-delivered (an at-least-once retransmit).
         let redelivered = t.send_op(op("c1", 7, OpKind::Insert));
-        assert!(!redelivered.applied(), "a re-delivered op did NOT freshly apply");
-        assert!(matches!(redelivered, SendOutcome::Duplicate(_)), "it is reported a Duplicate no-op");
+        assert!(
+            !redelivered.applied(),
+            "a re-delivered op did NOT freshly apply"
+        );
+        assert!(
+            matches!(redelivered, SendOutcome::Duplicate(_)),
+            "it is reported a Duplicate no-op"
+        );
         assert_eq!(
             redelivered.persisted().op_seq,
             1,
             "the duplicate resolves to the FIRST op_seq (no new seq assigned)"
         );
-        assert_eq!(t.head_seq(), 1, "the head did NOT advance (0 duplicate effect)");
-        assert_eq!(t.op_count(), 1, "exactly one op in the log (the duplicate was a no-op)");
+        assert_eq!(
+            t.head_seq(),
+            1,
+            "the head did NOT advance (0 duplicate effect)"
+        );
+        assert_eq!(
+            t.op_count(),
+            1,
+            "exactly one op in the log (the duplicate was a no-op)"
+        );
     }
 
     // ---- the resync_required → snapshot path ----------------------------------------------------
@@ -844,7 +918,10 @@ mod tests {
             .expect("opens");
         // a compaction minted a snapshot up to op_seq 2 (the cold seed; the op-log cursor advances
         // to 2, modelling GC having pruned doc_op rows <= snap_seq).
-        t.install_snapshot(PageSnapshot { snap_seq: 2, blob_hash: "blake3:snap".into() });
+        t.install_snapshot(PageSnapshot {
+            snap_seq: 2,
+            blob_hash: "blake3:snap".into(),
+        });
         // publish 6 ops → op_seq runs 3..8 (past the snapshot); the firehose window holds the last 3.
         for i in 1..=6 {
             t.send_op(op("c1", i, OpKind::Insert));
@@ -856,10 +933,17 @@ mod tests {
             .expect("connect succeeds via the cold path");
         match connected {
             Connected::ResyncFromSnapshot { snapshot, tail } => {
-                assert_eq!(snapshot.snap_seq, 2, "the cold path loads the installed snapshot");
+                assert_eq!(
+                    snapshot.snap_seq, 2,
+                    "the cold path loads the installed snapshot"
+                );
                 // the tail after the snapshot is (snap_seq, now] = ops with op_seq > 2 = {3..8}.
                 let seqs: Vec<u64> = tail.iter().map(|p| p.op_seq).collect();
-                assert_eq!(seqs, vec![3, 4, 5, 6, 7, 8], "the live tail after the snapshot, 0 ops lost");
+                assert_eq!(
+                    seqs,
+                    vec![3, 4, 5, 6, 7, 8],
+                    "the live tail after the snapshot, 0 ops lost"
+                );
             }
             other => panic!("expected ResyncFromSnapshot, got {other:?}"),
         }
@@ -875,7 +959,9 @@ mod tests {
             t.send_op(op("c1", i, OpKind::Insert));
         }
         // last_seq = 4 (its next-missing op 5 is still in the window) → warm resume backfills {5,6}.
-        let connected = t.connect(&principal(), AuthAction::Edit, Some(4)).expect("warm resume");
+        let connected = t
+            .connect(&principal(), AuthAction::Edit, Some(4))
+            .expect("warm resume");
         match connected {
             Connected::Resumed { backfill } => {
                 assert_eq!(
@@ -899,7 +985,10 @@ mod tests {
         // `doc:<page_id>` they would form is unbounded → rejected (the whitelist-not-`*` rule).
         for bad in ["*", "page*", "", "  "] {
             let r = CollabTransport::open(tenant(), bad);
-            assert!(r.is_err(), "an over-broad page scope `{bad}` must be rejected at open");
+            assert!(
+                r.is_err(),
+                "an over-broad page scope `{bad}` must be rejected at open"
+            );
             assert!(
                 matches!(r, Err(TransportError::OverBroadScope(_))),
                 "`{bad}` is an over-broad-scope rejection"
@@ -907,7 +996,10 @@ mod tests {
         }
         // a bounded (opaque) page id opens fine — page ids are opaque, so a `:` in one is admitted
         // (it is part of the bounded `doc:<page_id>` resource id, not a second scope separator).
-        assert!(CollabTransport::open(tenant(), "page-abc-123").is_ok(), "a bounded page scope opens");
+        assert!(
+            CollabTransport::open(tenant(), "page-abc-123").is_ok(),
+            "a bounded page scope opens"
+        );
     }
 
     // ---- the Layer-2 authority gate (CONNECT authorizes; fail-closed by default) -----------------
@@ -932,10 +1024,16 @@ mod tests {
         let mut t = open();
         t.send_op(op("c1", 1, OpKind::Insert));
         t.send_op(op("c1", 2, OpKind::Insert));
-        let connected = t.connect(&principal(), AuthAction::Edit, None).expect("authorized connect");
+        let connected = t
+            .connect(&principal(), AuthAction::Edit, None)
+            .expect("authorized connect");
         match connected {
             Connected::Resumed { backfill } => {
-                assert_eq!(backfill.len(), 2, "a fresh authorized connect backfills the whole tail");
+                assert_eq!(
+                    backfill.len(),
+                    2,
+                    "a fresh authorized connect backfills the whole tail"
+                );
             }
             other => panic!("expected Resumed, got {other:?}"),
         }
@@ -957,8 +1055,16 @@ mod tests {
         for i in 0..50 {
             t.publish_presence(&Presence::new("c1", format!("caret:{i}")));
         }
-        assert_eq!(t.head_seq(), head_before, "presence did NOT advance the op-log cursor");
-        assert_eq!(t.op_count(), ops_before, "presence is NEVER persisted to the op-log (arch §2.3)");
+        assert_eq!(
+            t.head_seq(),
+            head_before,
+            "presence did NOT advance the op-log cursor"
+        );
+        assert_eq!(
+            t.op_count(),
+            ops_before,
+            "presence is NEVER persisted to the op-log (arch §2.3)"
+        );
     }
 
     // ---- the live fan-out (a second connection sees an edit live) --------------------------------
@@ -973,8 +1079,16 @@ mod tests {
         // a peer sends an op → the live subscriber receives its frame.
         let sent = t.send_op(op("c2", 1, OpKind::Insert));
         let frames = sub.drain_ready();
-        assert_eq!(frames.len(), 1, "the live subscriber received the published frame");
-        assert_eq!(frames[0].seq, sent.persisted().op_seq, "the live frame seq == the op_seq");
+        assert_eq!(
+            frames.len(),
+            1,
+            "the live subscriber received the published frame"
+        );
+        assert_eq!(
+            frames[0].seq,
+            sent.persisted().op_seq,
+            "the live frame seq == the op_seq"
+        );
     }
 
     // ---- op kind structural classification (the coalescer's choice, not the transport's) ---------
@@ -991,8 +1105,14 @@ mod tests {
         assert!(!OpKind::Format.is_structural());
         // every kind has a stable wire token (the op_kind column, 01 §3).
         for k in [
-            OpKind::Insert, OpKind::Delete, OpKind::Format, OpKind::Move,
-            OpKind::SetProp, OpKind::BlockIns, OpKind::BlockDel, OpKind::EnginePromote,
+            OpKind::Insert,
+            OpKind::Delete,
+            OpKind::Format,
+            OpKind::Move,
+            OpKind::SetProp,
+            OpKind::BlockIns,
+            OpKind::BlockDel,
+            OpKind::EnginePromote,
         ] {
             assert!(!k.as_str().is_empty());
         }
@@ -1025,9 +1145,17 @@ mod tests {
     fn ops_up_to_is_inclusive() {
         let log = log_seq(5);
         let seqs: Vec<u64> = log.ops_up_to(3).iter().map(|p| p.op_seq).collect();
-        assert_eq!(seqs, vec![1, 2, 3], "ops_up_to(3) includes op_seq 3 (inclusive prefix)");
+        assert_eq!(
+            seqs,
+            vec![1, 2, 3],
+            "ops_up_to(3) includes op_seq 3 (inclusive prefix)"
+        );
         assert!(log.ops_up_to(0).is_empty(), "ops_up_to(0) is empty");
-        assert_eq!(log.ops_up_to(5).len(), 5, "ops_up_to(head) is the whole log");
+        assert_eq!(
+            log.ops_up_to(5).len(),
+            5,
+            "ops_up_to(head) is the whole log"
+        );
     }
 
     /// **`ops_in_range(from, to)` is `(from, to]` — `from` EXCLUSIVE, `to` INCLUSIVE (the tail boundary
@@ -1056,7 +1184,11 @@ mod tests {
         let mut log = log_seq(5);
         assert_eq!(log.lowest_seq(), 1, "the lowest retained op is op_seq 1");
         log.gc_below(2); // prune ≤ 2
-        assert_eq!(log.lowest_seq(), 3, "after GC ≤ 2 the floor rises to op_seq 3");
+        assert_eq!(
+            log.lowest_seq(),
+            3,
+            "after GC ≤ 2 the floor rises to op_seq 3"
+        );
         log.gc_below(99); // prune everything retained
         assert_eq!(log.lowest_seq(), 0, "an empty log's floor is 0");
     }
@@ -1070,8 +1202,16 @@ mod tests {
         let pruned = log.gc_below(3); // prune op_seq ≤ 3, keep 4,5,6
         assert_eq!(pruned, 3, "exactly op_seq 1,2,3 (≤ watermark) pruned");
         let kept: Vec<u64> = log.ops_up_to(6).iter().map(|p| p.op_seq).collect();
-        assert_eq!(kept, vec![4, 5, 6], "op_seq AT the watermark (3) is pruned; ABOVE it is kept");
-        assert_eq!(log.head_seq(), 6, "the monotone op_seq counter survives the prune");
+        assert_eq!(
+            kept,
+            vec![4, 5, 6],
+            "op_seq AT the watermark (3) is pruned; ABOVE it is kept"
+        );
+        assert_eq!(
+            log.head_seq(),
+            6,
+            "the monotone op_seq counter survives the prune"
+        );
         // The idempotent index is pruned in lock-step with the SAME watermark boundary: a RETAINED
         // op's op_id stays in the index (a re-delivery is still a Duplicate resolving to its kept
         // op_seq), while a PRUNED op's op_id leaves the index (a re-delivery becomes a fresh Apply).
@@ -1081,7 +1221,11 @@ mod tests {
             matches!(redelivered_kept, SendOutcome::Duplicate(_)),
             "a retained op's op_id stays in the index → its re-delivery is an idempotent Duplicate"
         );
-        assert_eq!(redelivered_kept.persisted().op_seq, 4, "resolves to the kept op_seq (4)");
+        assert_eq!(
+            redelivered_kept.persisted().op_seq,
+            4,
+            "resolves to the kept op_seq (4)"
+        );
         let redelivered_pruned = log.persist(op("c1", 2, OpKind::Insert)); // op_seq 2 was PRUNED (≤ 3)
         assert!(
             redelivered_pruned.applied(),
@@ -1099,7 +1243,11 @@ mod tests {
         // op_seq 4 was a no-op) → 7 (pruned op_seq 2 re-applied) → 8 (op_seq 3 re-applied), so the
         // next fresh op is op_seq 9.
         let next = log.persist(op("c1", 7, OpKind::Insert));
-        assert_eq!(next.persisted().op_seq, 9, "a fresh op continues head+1 after GC + the re-applies");
+        assert_eq!(
+            next.persisted().op_seq,
+            9,
+            "a fresh op continues head+1 after GC + the re-applies"
+        );
         // gc_below(0) is a no-op (nothing at-or-below 0).
         let mut log2 = log_seq(3);
         assert_eq!(log2.gc_below(0), 0, "gc_below(0) prunes nothing");

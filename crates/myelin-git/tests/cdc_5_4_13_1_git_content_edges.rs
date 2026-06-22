@@ -75,7 +75,10 @@ struct DecodedEdge {
 /// deterministic `edge_id` from `(tenant, source, target, rel)` — exactly what the Refs edge-builder
 /// does on `*.created`. Returns `Err(field)` if a required field is missing (fail-closed).
 fn consumer_decode(env: &EventEnvelope) -> Result<DecodedEdge, String> {
-    assert_eq!(env.type_.0, "refs.edge.created", "the consumer only ingests refs.edge.created here");
+    assert_eq!(
+        env.type_.0, "refs.edge.created",
+        "the consumer only ingests refs.edge.created here"
+    );
     let p = &env.payload;
     let get = |k: &str| p.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
     let source = get("source").ok_or_else(|| "source".to_string())?;
@@ -83,7 +86,13 @@ fn consumer_decode(env: &EventEnvelope) -> Result<DecodedEdge, String> {
     let rel = get("rel").ok_or_else(|| "rel".to_string())?;
     let rel_class = get("rel_class").ok_or_else(|| "rel_class".to_string())?;
     let edge_id = consumer_edge_id(&env.tenant.0, &source, &target, &rel);
-    Ok(DecodedEdge { edge_id, source, target, rel, rel_class })
+    Ok(DecodedEdge {
+        edge_id,
+        source,
+        target,
+        rel,
+        rel_class,
+    })
 }
 
 fn ctx_base() -> EmitContextBase {
@@ -103,7 +112,11 @@ fn ctx_base() -> EmitContextBase {
 }
 
 fn alice() -> Principal {
-    Principal::stub(PrincipalId("p-alice".into()), PrincipalKind::Human, TenantId("acme".into()))
+    Principal::stub(
+        PrincipalId("p-alice".into()),
+        PrincipalKind::Human,
+        TenantId("acme".into()),
+    )
 }
 
 /// The body's `git.comment.created` content event (the CAUSE) — constructed directly (the comment write
@@ -166,13 +179,23 @@ fn git_body_edges_decode_through_the_refs_consumer_with_the_right_edge_id() {
     for (id, p_edge) in ids.iter().zip(provider_edges.iter()) {
         let env = outbox.row(id).unwrap().envelope;
         let decoded = consumer_decode(&env).expect("the consumer decodes the Git edge");
-        assert_eq!(decoded.rel_class, "reference", "content-node edges are reference-class");
-        assert_eq!(decoded.rel, p_edge.rel.as_str(), "the provider rel == the consumer-decoded rel");
+        assert_eq!(
+            decoded.rel_class, "reference",
+            "content-node edges are reference-class"
+        );
+        assert_eq!(
+            decoded.rel,
+            p_edge.rel.as_str(),
+            "the provider rel == the consumer-decoded rel"
+        );
         assert_eq!(decoded.source, source.0);
         assert_eq!(decoded.target, p_edge.target.0);
         // the consumer-derived edge_id matches the provider triple → idempotent ingest, no drift.
         let expected = consumer_edge_id("acme", &source.0, &p_edge.target.0, p_edge.rel.as_str());
-        assert_eq!(decoded.edge_id, expected, "the deterministic edge_id is provider/consumer-stable");
+        assert_eq!(
+            decoded.edge_id, expected,
+            "the deterministic edge_id is provider/consumer-stable"
+        );
     }
 }
 
@@ -206,7 +229,11 @@ fn the_three_node_kinds_map_to_the_frozen_rels() {
         let ids = emit_body_edges(&mut tx, &source, std::slice::from_ref(&node), &ce).unwrap();
         tx.commit().unwrap();
         let env = outbox.row(&ids[0]).unwrap().envelope;
-        assert_eq!(consumer_decode(&env).unwrap().rel, wire, "{node:?} → `{wire}`");
+        assert_eq!(
+            consumer_decode(&env).unwrap().rel,
+            wire,
+            "{node:?} → `{wire}`"
+        );
     }
 }
 
@@ -221,9 +248,14 @@ fn the_three_node_kinds_map_to_the_frozen_rels() {
 fn git_body_is_the_frozen_content_subset_and_round_trips() {
     let body = Body::new(
         format!("**ship it** — see {OBJ} and `cargo test` per [doc](https://x.test/d)"),
-        vec![InlineNode::Embed(ArtifactRef("myelin://acme/knowledge/page/7c2".into()))],
+        vec![InlineNode::Embed(ArtifactRef(
+            "myelin://acme/knowledge/page/7c2".into(),
+        ))],
     );
-    assert!(body.round_trips(), "render(parse(md)) === md (the 13.1 gate on git bodies)");
+    assert!(
+        body.round_trips(),
+        "render(parse(md)) === md (the 13.1 gate on git bodies)"
+    );
     // the structured node is preserved positionally (one OBJ ⇒ one node).
     assert_eq!(body.parse().nodes.len(), 1);
 }

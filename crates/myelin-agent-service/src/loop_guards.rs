@@ -397,8 +397,12 @@ impl AgentLoopGuards {
         let (verdict, reason) = self.causal.admit_child(correlation_id, parent_depth);
         match verdict {
             LoopVerdict::Admit => GuardVerdict::Admit,
-            LoopVerdict::Drop => GuardVerdict::Drop(reason.expect("a drop carries a reason").into()),
-            LoopVerdict::Park => GuardVerdict::Park(reason.expect("a park carries a reason").into()),
+            LoopVerdict::Drop => {
+                GuardVerdict::Drop(reason.expect("a drop carries a reason").into())
+            }
+            LoopVerdict::Park => {
+                GuardVerdict::Park(reason.expect("a park carries a reason").into())
+            }
         }
     }
 
@@ -410,8 +414,12 @@ impl AgentLoopGuards {
         let (verdict, reason) = self.causal.admit_activity();
         match verdict {
             LoopVerdict::Admit => GuardVerdict::Admit,
-            LoopVerdict::Drop => GuardVerdict::Drop(reason.expect("a drop carries a reason").into()),
-            LoopVerdict::Park => GuardVerdict::Park(reason.expect("a park carries a reason").into()),
+            LoopVerdict::Drop => {
+                GuardVerdict::Drop(reason.expect("a drop carries a reason").into())
+            }
+            LoopVerdict::Park => {
+                GuardVerdict::Park(reason.expect("a park carries a reason").into())
+            }
         }
     }
 
@@ -568,8 +576,9 @@ mod tests {
     fn composed_gate_halts_self_feeding_loop_at_ceiling() {
         let telemetry = FlowTelemetry::new();
         // small ceiling so the loop hits it fast; a generous tripwire/pool so ONLY depth fires.
-        let guards = AgentLoopGuards::with_caps(PrincipalId("agent-alice".into()), 12, 10_000, 10_000)
-            .with_telemetry(telemetry.clone());
+        let guards =
+            AgentLoopGuards::with_caps(PrincipalId("agent-alice".into()), 12, 10_000, 10_000)
+                .with_telemetry(telemetry.clone());
         let other = Actor(human_principal("user-bob")); // not the agent → self-guard passes.
         let node = artifact_ref_node(); // a structured ref → reference gate passes.
         let root = "corr-loop";
@@ -593,15 +602,26 @@ mod tests {
             }
         }
 
-        assert_eq!(admitted, 12, "admitted exactly up to the ceiling (children 1..=12)");
+        assert_eq!(
+            admitted, 12,
+            "admitted exactly up to the ceiling (children 1..=12)"
+        );
         assert_eq!(dropped, 1, "the hop past the ceiling was dropped");
         assert!(
             telemetry.causal_depth_max() <= guards.ceiling(),
             "the causal-depth max never exceeds the ceiling — halted AT it",
         );
-        assert_eq!(telemetry.causal_depth_max(), 12, "deepest admitted child at the ceiling");
+        assert_eq!(
+            telemetry.causal_depth_max(),
+            12,
+            "deepest admitted child at the ceiling"
+        );
         assert_eq!(telemetry.depth_ceiling_hits(), 1, "the ceiling fired once");
-        assert_eq!(telemetry.fork_count(), 0, "NEVER forked — the headline invariant");
+        assert_eq!(
+            telemetry.fork_count(),
+            0,
+            "NEVER forked — the headline invariant"
+        );
     }
 
     /// **The shared-root tripwire trips the per-tenant breaker on a wide same-root loop (§5.5, AG-D7).**
@@ -611,8 +631,9 @@ mod tests {
     fn composed_gate_trips_shared_root_breaker_on_wide_loop() {
         let telemetry = FlowTelemetry::new();
         // generous depth so ONLY the tripwire can stop this loop.
-        let guards = AgentLoopGuards::with_caps(PrincipalId("agent-alice".into()), 10_000, 3, 10_000)
-            .with_telemetry(telemetry.clone());
+        let guards =
+            AgentLoopGuards::with_caps(PrincipalId("agent-alice".into()), 10_000, 3, 10_000)
+                .with_telemetry(telemetry.clone());
         let other = Actor(human_principal("user-bob"));
         let node = artifact_ref_node();
         let root = "corr-shared";
@@ -631,10 +652,23 @@ mod tests {
             }
         }
 
-        assert_eq!(admitted, 3, "the first 3 same-root dispatches admitted (the window cap)");
-        assert_eq!(tripped, 7, "every same-root dispatch past the cap tripped the breaker");
-        assert_eq!(telemetry.depth_ceiling_hits(), 0, "depth NEVER fired (the loop stayed shallow)");
-        assert!(telemetry.shared_root_tripwire_firings() >= 1, "the breaker tripped");
+        assert_eq!(
+            admitted, 3,
+            "the first 3 same-root dispatches admitted (the window cap)"
+        );
+        assert_eq!(
+            tripped, 7,
+            "every same-root dispatch past the cap tripped the breaker"
+        );
+        assert_eq!(
+            telemetry.depth_ceiling_hits(),
+            0,
+            "depth NEVER fired (the loop stayed shallow)"
+        );
+        assert!(
+            telemetry.shared_root_tripwire_firings() >= 1,
+            "the breaker tripped"
+        );
         assert_eq!(telemetry.fork_count(), 0, "NEVER forked");
     }
 
@@ -643,8 +677,9 @@ mod tests {
     #[test]
     fn composed_gate_bounds_dispatch_pool_never_forks() {
         let telemetry = FlowTelemetry::new();
-        let guards = AgentLoopGuards::with_caps(PrincipalId("agent-alice".into()), 10_000, 10_000, 2)
-            .with_telemetry(telemetry.clone());
+        let guards =
+            AgentLoopGuards::with_caps(PrincipalId("agent-alice".into()), 10_000, 10_000, 2)
+                .with_telemetry(telemetry.clone());
 
         assert_eq!(guards.admit_dispatch_pool(), GuardVerdict::Admit);
         assert_eq!(guards.admit_dispatch_pool(), GuardVerdict::Admit);
@@ -657,7 +692,11 @@ mod tests {
 
         guards.release_dispatch();
         assert_eq!(guards.dispatches_in_flight(), 1);
-        assert_eq!(guards.admit_dispatch_pool(), GuardVerdict::Admit, "a freed slot admits");
+        assert_eq!(
+            guards.admit_dispatch_pool(),
+            GuardVerdict::Admit,
+            "a freed slot admits"
+        );
         assert_eq!(telemetry.fork_count(), 0, "NEVER forked");
     }
 
@@ -673,9 +712,17 @@ mod tests {
         let node = artifact_ref_node(); // even a STRUCTURED ref does not save it.
 
         let v = guards.admit_dispatch(&own, &node, "corr", 0);
-        assert_eq!(v, GuardVerdict::Drop(GuardRefusal::SelfTrigger), "self-guard pre-empts");
+        assert_eq!(
+            v,
+            GuardVerdict::Drop(GuardRefusal::SelfTrigger),
+            "self-guard pre-empts"
+        );
         // the causal guard was never consulted → no depth observed, no fork.
-        assert_eq!(telemetry.causal_depth_max(), 0, "depth never observed (self-guard pre-empted)");
+        assert_eq!(
+            telemetry.causal_depth_max(),
+            0,
+            "depth never observed (self-guard pre-empted)"
+        );
         assert_eq!(telemetry.fork_count(), 0);
     }
 
@@ -715,7 +762,11 @@ mod tests {
     #[test]
     fn default_agent_ceiling_is_twelve() {
         let guards = AgentLoopGuards::new(PrincipalId("agent-alice".into()));
-        assert_eq!(guards.ceiling(), 12, "the agent-lane ceiling default is 12 (AG-D7)");
+        assert_eq!(
+            guards.ceiling(),
+            12,
+            "the agent-lane ceiling default is 12 (AG-D7)"
+        );
         assert_eq!(AGENT_CEILING, 12);
     }
 }

@@ -67,7 +67,9 @@
 use myelin_identity::Principal;
 use myelin_storage::blob::{BlobError, ContentHash};
 use myelin_storage::cdn::CdnCloneClass;
-use myelin_substrate::shed::{RunClass, RunClassHeader, ShedDecision, ShedLane, Surface, SurfaceBudget};
+use myelin_substrate::shed::{
+    RunClass, RunClassHeader, ShedDecision, ShedLane, Surface, SurfaceBudget,
+};
 use myelin_substrate::thresholds::Thresholds;
 use myelin_tenancy::TenantId;
 
@@ -338,11 +340,17 @@ mod tests {
     #[test]
     fn the_git_front_door_shed_budget_is_read_from_the_thresholds_file() {
         let thresholds = Thresholds::load_canonical().expect("load thresholds.toml");
-        let gate = GitFrontDoorShed::from_thresholds(&thresholds).expect("GitFrontDoor budget present");
+        let gate =
+            GitFrontDoorShed::from_thresholds(&thresholds).expect("GitFrontDoor budget present");
         // the gate opened (a missing row would have been a loud error). Its budget is the file's.
-        let file_budget = thresholds.shed_budget(Surface::GitFrontDoor).expect("present");
+        let file_budget = thresholds
+            .shed_budget(Surface::GitFrontDoor)
+            .expect("present");
         assert!(file_budget.per_tenant_in_flight_cap > 0, "bounded (§7.1)");
-        assert!(file_budget.human_lane_reservation > 0, "the human lane is reserved");
+        assert!(
+            file_budget.human_lane_reservation > 0,
+            "the human lane is reserved"
+        );
         // and the lane is wired to GitFrontDoor (not some other surface).
         assert_eq!(gate.lane.surface(), Surface::GitFrontDoor);
     }
@@ -364,18 +372,28 @@ mod tests {
             );
         }
         // the agent lane now SHEDS with 429 + Retry-After.
-        let shed = gate.admit_for(&a, None).expect_err("the agent clone storm sheds");
+        let shed = gate
+            .admit_for(&a, None)
+            .expect_err("the agent clone storm sheds");
         assert_eq!(shed.lane, RunClass::Agent);
-        assert_eq!(shed.retry_after_secs, 5, "the shed carries a Retry-After (clients honour it)");
+        assert_eq!(
+            shed.retry_after_secs, 5,
+            "the shed carries a Retry-After (clients honour it)"
+        );
 
         // THE GATE: the HUMAN's interactive fetch is STILL SERVED (the protected lane, shed last).
         assert_eq!(
-            gate.admit_for(&h, None).expect("the human is served while the agent sheds"),
+            gate.admit_for(&h, None)
+                .expect("the human is served while the agent sheds"),
             RunClass::Human
         );
 
         // the green-artifact signal: the human lane has 0 shed, the agent lane has shed.
-        assert_eq!(gate.shed_count(RunClass::Human), 0, "human lane: 0 shed (served)");
+        assert_eq!(
+            gate.shed_count(RunClass::Human),
+            0,
+            "human lane: 0 shed (served)"
+        );
         assert!(gate.shed_count(RunClass::Agent) >= 1, "agent lane: sheds");
     }
 
@@ -387,23 +405,40 @@ mod tests {
         let t = tenant("acme");
         // fill non-human in-flight to 2 with agents (under every non-human ceiling).
         for _ in 0..2 {
-            gate.admit_class(&t, RunClass::Agent).expect("agent admitted");
+            gate.admit_class(&t, RunClass::Agent)
+                .expect("agent admitted");
         }
         // non_human == 2 == speculative ceiling → speculative sheds FIRST.
-        assert!(gate.admit_class(&t, RunClass::Speculative).is_err(), "speculative sheds first");
+        assert!(
+            gate.admit_class(&t, RunClass::Speculative).is_err(),
+            "speculative sheds first"
+        );
         // batch/ci still admitted (ceiling 3).
-        gate.admit_class(&t, RunClass::BatchCi).expect("batch admitted"); // non_human → 3
-        // non_human == 3 == batch ceiling → batch sheds, agent still admitted (ceiling 4).
-        assert!(gate.admit_class(&t, RunClass::BatchCi).is_err(), "batch/ci sheds next");
-        gate.admit_class(&t, RunClass::Agent).expect("agent admitted"); // non_human → 4
-        // non_human == 4 == agent ceiling → agent sheds, but the HUMAN is admitted (shed last).
-        assert!(gate.admit_class(&t, RunClass::Agent).is_err(), "agent sheds before the human");
-        gate.admit_class(&t, RunClass::Human).expect("human served — shed last");
+        gate.admit_class(&t, RunClass::BatchCi)
+            .expect("batch admitted"); // non_human → 3
+                                       // non_human == 3 == batch ceiling → batch sheds, agent still admitted (ceiling 4).
+        assert!(
+            gate.admit_class(&t, RunClass::BatchCi).is_err(),
+            "batch/ci sheds next"
+        );
+        gate.admit_class(&t, RunClass::Agent)
+            .expect("agent admitted"); // non_human → 4
+                                       // non_human == 4 == agent ceiling → agent sheds, but the HUMAN is admitted (shed last).
+        assert!(
+            gate.admit_class(&t, RunClass::Agent).is_err(),
+            "agent sheds before the human"
+        );
+        gate.admit_class(&t, RunClass::Human)
+            .expect("human served — shed last");
 
         assert_eq!(gate.shed_count(RunClass::Speculative), 1);
         assert_eq!(gate.shed_count(RunClass::BatchCi), 1);
         assert_eq!(gate.shed_count(RunClass::Agent), 1);
-        assert_eq!(gate.shed_count(RunClass::Human), 0, "the human lane is never shed here");
+        assert_eq!(
+            gate.shed_count(RunClass::Human),
+            0,
+            "the human lane is never shed here"
+        );
     }
 
     /// **Per-tenant: one tenant's clone storm NEVER sheds another tenant's human (blast-radius).**
@@ -417,15 +452,27 @@ mod tests {
         for _ in 0..4 {
             gate.admit_for(&noisy, None).expect("noisy agent admitted");
         }
-        assert!(gate.admit_for(&noisy, None).is_err(), "noisy agent lane sheds");
+        assert!(
+            gate.admit_for(&noisy, None).is_err(),
+            "noisy agent lane sheds"
+        );
 
         // the noisy tenant's in-flight reflects the admitted machine fetches (kills the
         // `in_flight -> 0` mutant: the accessor reports the real per-tenant count, not a constant).
-        assert_eq!(gate.in_flight(&tenant("noisy")), 4, "the noisy tenant has 4 in-flight machine fetches");
-        // the QUIET tenant is untouched — its human is served, its budget independent.
-        assert_eq!(gate.in_flight(&tenant("quiet")), 0, "the quiet tenant's budget is independent");
         assert_eq!(
-            gate.admit_for(&quiet_human, None).expect("the quiet human is served"),
+            gate.in_flight(&tenant("noisy")),
+            4,
+            "the noisy tenant has 4 in-flight machine fetches"
+        );
+        // the QUIET tenant is untouched — its human is served, its budget independent.
+        assert_eq!(
+            gate.in_flight(&tenant("quiet")),
+            0,
+            "the quiet tenant's budget is independent"
+        );
+        assert_eq!(
+            gate.admit_for(&quiet_human, None)
+                .expect("the quiet human is served"),
             RunClass::Human,
             "the noisy clone storm must NEVER shed another tenant's human",
         );
@@ -442,7 +489,8 @@ mod tests {
         // a header DOWN-classes a human-issued prefetch (a human declaring speculative).
         let h = human("acme");
         assert_eq!(
-            gate.admit_for(&h, Some(RunClassHeader::Speculative)).expect("admitted"),
+            gate.admit_for(&h, Some(RunClassHeader::Speculative))
+                .expect("admitted"),
             RunClass::Speculative,
             "a human-issued prefetch may down-class itself (sheds earlier)",
         );
@@ -459,9 +507,13 @@ mod tests {
         let t = tenant("acme");
         gate.admit_class(&t, RunClass::Agent).expect("admitted"); // non_human 1
         gate.admit_class(&t, RunClass::Agent).expect("admitted"); // non_human 2 == cap-reserved
-        assert!(gate.admit_class(&t, RunClass::Agent).is_err(), "agent sheds at cap-reserved");
+        assert!(
+            gate.admit_class(&t, RunClass::Agent).is_err(),
+            "agent sheds at cap-reserved"
+        );
         gate.release(&t, RunClass::Agent);
-        gate.admit_class(&t, RunClass::Agent).expect("a released slot is reusable");
+        gate.admit_class(&t, RunClass::Agent)
+            .expect("a released slot is reusable");
     }
 
     // ───────────────────────── the CDN bundle-URI accelerated-clone ─────────────────────────
@@ -481,14 +533,21 @@ mod tests {
 
         // the serving tier's precomputed clone bundle for a hot repo at a ref-snapshot.
         let bundle_bytes = b"PACK\0clone-bundle-of-hot-repo@deadbeef";
-        let uri = path.publish_bundle(bundle_bytes).expect("publish bundle → bundle-URI");
+        let uri = path
+            .publish_bundle(bundle_bytes)
+            .expect("publish bundle → bundle-URI");
         // the URI carries the content-address (the CDN cache key the front door advertises).
         assert_eq!(uri.content_hash, ContentHash::blake3(bundle_bytes));
         assert_eq!(uri.tenant, tenant("acme"));
 
         // the cloning client fetches by the advertised bundle-URI → the exact bytes (valid clone).
-        let cloned = path.clone_via_bundle_uri(&uri).expect("clone via bundle-URI");
-        assert_eq!(cloned, bundle_bytes, "the bundle-URI clone round-trips the exact repo bytes");
+        let cloned = path
+            .clone_via_bundle_uri(&uri)
+            .expect("clone via bundle-URI");
+        assert_eq!(
+            cloned, bundle_bytes,
+            "the bundle-URI clone round-trips the exact repo bytes"
+        );
     }
 
     /// **A tampered bundle is REFUSED — the content-address IS the cache-validity check (0 silent
@@ -500,9 +559,17 @@ mod tests {
         let uri = path.publish_bundle(b"valid-clone-bundle").expect("publish");
 
         // corrupt the bundle at rest (a tampered edge cache entry).
-        assert!(store.corrupt_for_drill(&tenant("acme"), &uri.content_hash), "bundle present");
-        let err = path.clone_via_bundle_uri(&uri).expect_err("a tampered bundle MUST be refused");
-        assert!(matches!(err, BundleCloneError::Fetch { .. }), "0 silent serve: {err}");
+        assert!(
+            store.corrupt_for_drill(&tenant("acme"), &uri.content_hash),
+            "bundle present"
+        );
+        let err = path
+            .clone_via_bundle_uri(&uri)
+            .expect_err("a tampered bundle MUST be refused");
+        assert!(
+            matches!(err, BundleCloneError::Fetch { .. }),
+            "0 silent serve: {err}"
+        );
     }
 
     /// **A bundle-URI naming a foreign tenant is refused** (the bundle keyspace is per-tenant —
@@ -516,7 +583,9 @@ mod tests {
             tenant: tenant("globex"),
             content_hash: ContentHash::blake3(b"whatever"),
         };
-        let err = path.clone_via_bundle_uri(&foreign).expect_err("a foreign-tenant URI is refused");
+        let err = path
+            .clone_via_bundle_uri(&foreign)
+            .expect_err("a foreign-tenant URI is refused");
         assert!(matches!(err, BundleCloneError::CrossTenant { .. }), "{err}");
     }
 

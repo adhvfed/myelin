@@ -116,7 +116,10 @@ pub fn history_rewrite_required_caps() -> Vec<String> {
 /// The `required_caps` for `git.scip_index` — building a code-intelligence index reads the repo
 /// objects, governed by `repo.pull` (the read permission; a compute artifact over readable bytes).
 pub fn scip_index_required_caps() -> Vec<String> {
-    vec![format!("{}.pull", crate::rebac_fragment::object_types::REPO)]
+    vec![format!(
+        "{}.pull",
+        crate::rebac_fragment::object_types::REPO
+    )]
 }
 
 // ───────────────────────── the trust-scoped cache namespaces (the fan-out surface, 11.2 C4) ───────
@@ -237,7 +240,10 @@ impl RewriteRateLimiter {
     /// `max_per_window == 0` tenant is always refused (rewrites disabled). Public so the per-tenant
     /// budget arithmetic (the `remaining` countdown) is directly testable.
     pub fn try_consume(&mut self, tenant: &TenantId) -> Option<u32> {
-        let used = self.consumed.entry(tenant.as_str().to_string()).or_insert(0);
+        let used = self
+            .consumed
+            .entry(tenant.as_str().to_string())
+            .or_insert(0);
         if *used >= self.max_per_window {
             return None;
         }
@@ -538,16 +544,25 @@ mod tests {
     }
     impl RecordingWire {
         fn ok() -> RecordingWire {
-            RecordingWire { status: 0, ran: RefCell::new(vec![]) }
+            RecordingWire {
+                status: 0,
+                ran: RefCell::new(vec![]),
+            }
         }
         fn failing() -> RecordingWire {
-            RecordingWire { status: 1, ran: RefCell::new(vec![]) }
+            RecordingWire {
+                status: 1,
+                ran: RefCell::new(vec![]),
+            }
         }
     }
     impl WireExecutor for RecordingWire {
         fn run(&self, inv: &WireInvocation) -> Result<WireOutput, GitCoreError> {
             self.ran.borrow_mut().push(inv.argv.clone());
-            Ok(WireOutput { stdout: vec![], status: self.status })
+            Ok(WireOutput {
+                stdout: vec![],
+                status: self.status,
+            })
         }
     }
 
@@ -558,10 +573,16 @@ mod tests {
     }
     impl RecordingInvalidator {
         fn all_ok() -> RecordingInvalidator {
-            RecordingInvalidator { fail: None, seen: RefCell::new(vec![]) }
+            RecordingInvalidator {
+                fail: None,
+                seen: RefCell::new(vec![]),
+            }
         }
         fn failing(ns: CacheNamespace) -> RecordingInvalidator {
-            RecordingInvalidator { fail: Some(ns), seen: RefCell::new(vec![]) }
+            RecordingInvalidator {
+                fail: Some(ns),
+                seen: RefCell::new(vec![]),
+            }
         }
     }
     impl CacheInvalidator for RecordingInvalidator {
@@ -572,7 +593,10 @@ mod tests {
             namespace: CacheNamespace,
         ) -> Result<usize, GitCoreError> {
             if self.fail == Some(namespace) {
-                return Err(GitCoreError::Wire(format!("cache `{}` unreachable", namespace.label())));
+                return Err(GitCoreError::Wire(format!(
+                    "cache `{}` unreachable",
+                    namespace.label()
+                )));
             }
             self.seen.borrow_mut().push(namespace);
             Ok(2) // two cached entries dropped per namespace (the shape stub).
@@ -614,11 +638,16 @@ mod tests {
         let tool = HistoryRewriteTool::new(wire, inv);
         let mut limiter = RewriteRateLimiter::new(5);
 
-        let receipt = tool.rewrite(&plan(), &mut limiter, 1000).expect("the rewrite is green");
+        let receipt = tool
+            .rewrite(&plan(), &mut limiter, 1000)
+            .expect("the rewrite is green");
 
         // The fan-out reached EVERY trust-scoped namespace (complete — no resurrection path).
         assert!(receipt.is_complete(), "the fan-out reached every namespace");
-        assert_eq!(receipt.namespaces_invalidated.len(), CacheNamespace::ALL.len());
+        assert_eq!(
+            receipt.namespaces_invalidated.len(),
+            CacheNamespace::ALL.len()
+        );
         assert_eq!(receipt.entries_invalidated, 8, "2 entries × 4 namespaces");
         // The audited receipt is content-addressed (the 10.6 hash-chain link; Merkle seal = P-GA-20).
         assert_eq!(receipt.receipt.operation, "git.history_rewrite");
@@ -639,7 +668,10 @@ mod tests {
         let ran = tool.wire.ran.borrow();
         assert_eq!(ran.len(), 1, "exactly one sandboxed invocation");
         assert_eq!(ran[0][0], "filter-repo", "a filter-repo-class rewrite");
-        assert!(ran[0].iter().any(|a| a == "refs/heads/main"), "targets the planned ref");
+        assert!(
+            ran[0].iter().any(|a| a == "refs/heads/main"),
+            "targets the planned ref"
+        );
     }
 
     // ───────────────────────── rate-limited tenant op (recon §9) ────────────────────────────────
@@ -652,11 +684,23 @@ mod tests {
         let tool = HistoryRewriteTool::new(wire, RecordingInvalidator::all_ok());
         let mut limiter = RewriteRateLimiter::new(1);
 
-        assert!(tool.rewrite(&plan(), &mut limiter, 1).is_ok(), "first rewrite admitted");
+        assert!(
+            tool.rewrite(&plan(), &mut limiter, 1).is_ok(),
+            "first rewrite admitted"
+        );
         let err = tool.rewrite(&plan(), &mut limiter, 2).unwrap_err();
-        assert_eq!(err, HistoryRewriteError::RateLimited { tenant: "acme".into() });
+        assert_eq!(
+            err,
+            HistoryRewriteError::RateLimited {
+                tenant: "acme".into()
+            }
+        );
         // The refused op did NOT run a second sandbox invocation.
-        assert_eq!(tool.wire.ran.borrow().len(), 1, "the refused rewrite never reached the sandbox");
+        assert_eq!(
+            tool.wire.ran.borrow().len(),
+            1,
+            "the refused rewrite never reached the sandbox"
+        );
         // The budget was consumed exactly once (the refusal did not consume).
         assert_eq!(limiter.consumed_by(&tenant()), 1);
     }
@@ -668,7 +712,11 @@ mod tests {
         let mut limiter = RewriteRateLimiter::new(0);
         let err = tool.rewrite(&plan(), &mut limiter, 1).unwrap_err();
         assert!(matches!(err, HistoryRewriteError::RateLimited { .. }));
-        assert_eq!(tool.wire.ran.borrow().len(), 0, "rewrites disabled — nothing ran");
+        assert_eq!(
+            tool.wire.ran.borrow().len(),
+            0,
+            "rewrites disabled — nothing ran"
+        );
     }
 
     // ───────────────────────── fail-closed: an incomplete fan-out is RED ────────────────────────
@@ -701,7 +749,10 @@ mod tests {
         let err = tool.rewrite(&plan(), &mut limiter, 1).unwrap_err();
         assert!(matches!(err, HistoryRewriteError::SandboxFailed(_)));
         // The fan-out never ran (the invalidator saw nothing).
-        assert!(tool.invalidator.seen.borrow().is_empty(), "no fan-out on a failed rewrite");
+        assert!(
+            tool.invalidator.seen.borrow().is_empty(),
+            "no fan-out on a failed rewrite"
+        );
     }
 
     #[test]
@@ -711,7 +762,10 @@ mod tests {
         let mut limiter = RewriteRateLimiter::new(5);
         let mut p = plan();
         p.target_refs.clear();
-        assert_eq!(tool.rewrite(&p, &mut limiter, 1).unwrap_err(), HistoryRewriteError::EmptyPlan);
+        assert_eq!(
+            tool.rewrite(&p, &mut limiter, 1).unwrap_err(),
+            HistoryRewriteError::EmptyPlan
+        );
         // An empty plan is rejected BEFORE the rate-limit — it consumes no budget and runs nothing.
         assert_eq!(limiter.consumed_by(&tenant()), 0);
         assert_eq!(tool.wire.ran.borrow().len(), 0);
@@ -721,7 +775,15 @@ mod tests {
     fn the_receipt_is_complete_only_when_every_namespace_is_invalidated() {
         // Kills the `is_complete -> true` mutant: completeness requires every trust-scoped namespace.
         let full = HistoryRewriteReceipt {
-            receipt: Receipt::content_addressed("git.history_rewrite", "git", "r", "acme", "ok", None, 1),
+            receipt: Receipt::content_addressed(
+                "git.history_rewrite",
+                "git",
+                "r",
+                "acme",
+                "ok",
+                None,
+                1,
+            ),
             namespaces_invalidated: CacheNamespace::ALL.to_vec(),
             entries_invalidated: 8,
         };
@@ -730,7 +792,10 @@ mod tests {
             namespaces_invalidated: vec![CacheNamespace::Fork, CacheNamespace::Mirror],
             ..full.clone()
         };
-        assert!(!partial.is_complete(), "a missed namespace is RED (a fork/mirror could resurrect)");
+        assert!(
+            !partial.is_complete(),
+            "a missed namespace is RED (a fork/mirror could resurrect)"
+        );
     }
 
     // ───────────────────────── the code-tool identity (the registration keys) ───────────────────
@@ -742,7 +807,10 @@ mod tests {
         assert_eq!(SCIP_INDEX_TOOL, "scip_index");
         // the required_caps are built from the canonical Git ReBAC object types (4.9) — a rename
         // there is a compile/test break here, never a silent drift.
-        assert_eq!(history_rewrite_required_caps(), vec!["repo.administer".to_string()]);
+        assert_eq!(
+            history_rewrite_required_caps(),
+            vec!["repo.administer".to_string()]
+        );
         assert_eq!(scip_index_required_caps(), vec!["repo.pull".to_string()]);
     }
 
@@ -752,35 +820,61 @@ mod tests {
         // remaining budget (3 → 2 → 1 → 0), then refuses.
         let mut limiter = RewriteRateLimiter::new(3);
         let t = tenant();
-        assert_eq!(limiter.try_consume(&t), Some(2), "after the 1st of 3, 2 remain");
+        assert_eq!(
+            limiter.try_consume(&t),
+            Some(2),
+            "after the 1st of 3, 2 remain"
+        );
         assert_eq!(limiter.try_consume(&t), Some(1), "after the 2nd, 1 remains");
         assert_eq!(limiter.try_consume(&t), Some(0), "after the 3rd, 0 remain");
-        assert_eq!(limiter.try_consume(&t), None, "the 4th is refused (budget exhausted)");
-        assert_eq!(limiter.consumed_by(&t), 3, "exactly 3 consumed (the refusal did not consume)");
+        assert_eq!(
+            limiter.try_consume(&t),
+            None,
+            "the 4th is refused (budget exhausted)"
+        );
+        assert_eq!(
+            limiter.consumed_by(&t),
+            3,
+            "exactly 3 consumed (the refusal did not consume)"
+        );
     }
 
     #[test]
     fn the_history_rewrite_errors_render_loud_and_self_describing() {
         // Kills the `Display::fmt -> Ok(default)` mutant: each error renders a non-empty, descriptive
         // message (never a swallowed empty string).
-        assert!(HistoryRewriteError::EmptyPlan.to_string().contains("no refs"));
-        assert!(HistoryRewriteError::RateLimited { tenant: "acme".into() }
+        assert!(HistoryRewriteError::EmptyPlan
             .to_string()
-            .contains("rate limit"));
-        assert!(HistoryRewriteError::SandboxFailed(GitCoreError::Wire("boom".into()))
-            .to_string()
-            .contains("ABORTED"));
-        assert!(HistoryRewriteError::IncompleteFanOut { missing: vec![CacheNamespace::Mirror] }
-            .to_string()
-            .contains("INCOMPLETE"));
+            .contains("no refs"));
+        assert!(HistoryRewriteError::RateLimited {
+            tenant: "acme".into()
+        }
+        .to_string()
+        .contains("rate limit"));
+        assert!(
+            HistoryRewriteError::SandboxFailed(GitCoreError::Wire("boom".into()))
+                .to_string()
+                .contains("ABORTED")
+        );
+        assert!(HistoryRewriteError::IncompleteFanOut {
+            missing: vec![CacheNamespace::Mirror]
+        }
+        .to_string()
+        .contains("INCOMPLETE"));
     }
 
     #[test]
     fn a_scip_index_job_builds_a_sandboxed_indexer_argv_no_host_exec() {
-        let job = ScipIndexJob { repo: repo(), commit_oid: "deadbeef".into() };
+        let job = ScipIndexJob {
+            repo: repo(),
+            commit_oid: "deadbeef".into(),
+        };
         let argv = job.index_argv();
         assert_eq!(argv[0], "scip-index");
-        assert!(argv.iter().any(|a| a == "deadbeef"), "indexes at the planned commit");
+        assert!(
+            argv.iter().any(|a| a == "deadbeef"),
+            "indexes at the planned commit"
+        );
         // It rides the sandbox (a compute job); the argv is built here, run by ToolHands::exec.
     }
 }

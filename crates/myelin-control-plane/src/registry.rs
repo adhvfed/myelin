@@ -185,7 +185,8 @@ impl Registry {
         // {home_cell} ∪ member_cells — the home cell is always part of the set the invariant covers
         // (a multi-cell tenant's home_cell may or may not appear in member_cells; checking it
         // explicitly means the invariant holds even when member_cells is the v1 single element).
-        let cells_to_check = std::iter::once(&placement.home_cell).chain(placement.member_cells.iter());
+        let cells_to_check =
+            std::iter::once(&placement.home_cell).chain(placement.member_cells.iter());
         for cell_id in cells_to_check {
             let Some(cell) = self.cells.get(cell_id.as_str()) else {
                 return Err(PlacementError::UnknownCell {
@@ -286,7 +287,11 @@ impl Registry {
 
     /// Upsert a `local_tenant` directory entry in a cell's directory (the cell-local mirror of the
     /// global placement record — which tenants this cell homes). Returns the prior entry if any.
-    pub fn upsert_local_tenant(&mut self, cell_id: &CellId, entry: LocalTenant) -> Option<LocalTenant> {
+    pub fn upsert_local_tenant(
+        &mut self,
+        cell_id: &CellId,
+        entry: LocalTenant,
+    ) -> Option<LocalTenant> {
         self.local_tenants
             .entry(cell_id.as_str().to_string())
             .or_default()
@@ -345,9 +350,10 @@ mod tests {
         reg.insert_cell(cell("cell-w-1", "eu-west"));
         reg.insert_cell(cell("cell-w-2", "eu-west"));
         assert_eq!(reg.cell_count(), 2); // both cells are in the inventory.
-        // home + a member cell, both in eu-west, tenant in eu-west — admitted.
+                                         // home + a member cell, both in eu-west, tenant in eu-west — admitted.
         let p = placement("01J0ACME", "eu-west", "cell-w-1", &["cell-w-1"]);
-        reg.place_tenant(p).expect("a single-region placement is admitted");
+        reg.place_tenant(p)
+            .expect("a single-region placement is admitted");
         assert_eq!(reg.placement_count(), 1);
     }
 
@@ -374,7 +380,10 @@ mod tests {
         );
         // The rejected placement was NOT stored (the trigger refuses the write).
         assert_eq!(reg.placement_count(), 0);
-        assert!(e.to_string().contains("single-region by construction"), "loud reason: {e}");
+        assert!(
+            e.to_string().contains("single-region by construction"),
+            "loud reason: {e}"
+        );
     }
 
     /// The HOME cell being cross-region is also rejected (the invariant covers `{home_cell} ∪
@@ -384,7 +393,9 @@ mod tests {
         let mut reg = Registry::new();
         reg.insert_cell(cell("cell-n-1", "eu-north")); // home, WRONG region.
         let p = placement("01J0ACME", "eu-west", "cell-n-1", &[]);
-        let e = reg.place_tenant(p).expect_err("a cross-region home cell is rejected");
+        let e = reg
+            .place_tenant(p)
+            .expect_err("a cross-region home cell is rejected");
         assert!(matches!(e, PlacementError::CrossRegionMemberCell { .. }));
         assert_eq!(reg.placement_count(), 0);
     }
@@ -395,7 +406,9 @@ mod tests {
     fn rejects_an_unknown_cell_fail_closed() {
         let mut reg = Registry::new();
         let p = placement("01J0ACME", "eu-west", "cell-ghost", &[]);
-        let e = reg.place_tenant(p).expect_err("an unknown cell is refused fail-closed");
+        let e = reg
+            .place_tenant(p)
+            .expect_err("an unknown cell is refused fail-closed");
         assert_eq!(
             e,
             PlacementError::UnknownCell {
@@ -414,8 +427,14 @@ mod tests {
         reg.insert_cell(cell("cell-w-1", "eu-west"));
         let p = placement("01J0ACME", "eu-west", "cell-w-1", &["cell-w-1"]);
         reg.place_tenant(p).expect("v1 single-element placement");
-        let stored = reg.placement(&TenantId::from_token("01J0ACME")).expect("placed");
-        assert_eq!(stored.member_cells.len(), 1, "v1 member_cells is single-element");
+        let stored = reg
+            .placement(&TenantId::from_token("01J0ACME"))
+            .expect("placed");
+        assert_eq!(
+            stored.member_cells.len(),
+            1,
+            "v1 member_cells is single-element"
+        );
     }
 
     /// **Region immutability (architecture §5.3 layer 1): there is NO update path for `region`.** A
@@ -431,8 +450,20 @@ mod tests {
         // A region "change" is a NEW cell — never a mutation of cell-w-1's region.
         reg.insert_cell(cell("cell-n-1", "eu-north"));
         // The original cell's region is unchanged (there is no API that could have changed it).
-        assert_eq!(reg.cell(&CellId::from_token("cell-w-1")).unwrap().region.as_str(), "eu-west");
-        assert_eq!(reg.cell(&CellId::from_token("cell-n-1")).unwrap().region.as_str(), "eu-north");
+        assert_eq!(
+            reg.cell(&CellId::from_token("cell-w-1"))
+                .unwrap()
+                .region
+                .as_str(),
+            "eu-west"
+        );
+        assert_eq!(
+            reg.cell(&CellId::from_token("cell-n-1"))
+                .unwrap()
+                .region
+                .as_str(),
+            "eu-north"
+        );
         // Compile-level proof of the discipline: there is no `reg.update_cell_region(..)` /
         // `reg.update_placement_region(..)` method to call — uncommenting either would fail to
         // compile (the method does not exist). Their ABSENCE is the structural immutability proof.
@@ -457,7 +488,10 @@ mod tests {
         });
         assert_eq!(reg.provisioning_log().len(), 2);
         assert_eq!(reg.provisioning_log()[0].step, "restore_verify");
-        assert_eq!(reg.provisioning_log()[1].outcome, ProvisioningOutcome::Running);
+        assert_eq!(
+            reg.provisioning_log()[1].outcome,
+            ProvisioningOutcome::Running
+        );
     }
 
     /// The per-cell `local_tenant` directory maps a cell's OWN tenants (the cell-local mirror).
@@ -484,6 +518,8 @@ mod tests {
         let dir = reg.local_tenants(&cell_id);
         assert_eq!(dir.len(), 2);
         // A different cell's directory is empty (each cell maps only its own tenants).
-        assert!(reg.local_tenants(&CellId::from_token("cell-w-2")).is_empty());
+        assert!(reg
+            .local_tenants(&CellId::from_token("cell-w-2"))
+            .is_empty());
     }
 }

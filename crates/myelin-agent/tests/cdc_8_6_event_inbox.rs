@@ -40,6 +40,10 @@ fn cdc_8_6_deliver_lands_the_matched_event_explicit_first() {
     inbox.deliver(InboxEvent("issue.mention".into()));
 
     let got = inbox.delivered.borrow();
-    assert_eq!(got.len(), 1, "explicit-first: deliver notifies exactly once");
+    assert_eq!(
+        got.len(),
+        1,
+        "explicit-first: deliver notifies exactly once"
+    );
     assert_eq!(got[0], InboxEvent("issue.mention".into()));
 }

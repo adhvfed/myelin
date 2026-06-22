@@ -113,8 +113,14 @@ fn ids_lowers_to_in_over_source_root_with_bound_params() {
     assert_eq!(
         l.params,
         vec![
-            BoundParam { placeholder: ":id_0".into(), value: "s:a".into() },
-            BoundParam { placeholder: ":id_1".into(), value: "s:b".into() },
+            BoundParam {
+                placeholder: ":id_0".into(),
+                value: "s:a".into()
+            },
+            BoundParam {
+                placeholder: ":id_1".into(),
+                value: "s:b".into()
+            },
         ],
         "the ids are BOUND params over source_root, never interpolated"
     );
@@ -129,37 +135,60 @@ fn empty_ids_lowers_to_false() {
 
 #[test]
 fn not_ids_lowers_to_not_in_over_source_root() {
-    let l = lower_over_source_root(&SetExpr::NotIds(vec![ObjectId("s:secret".into())]), &viewer("p:a"));
+    let l = lower_over_source_root(
+        &SetExpr::NotIds(vec![ObjectId("s:secret".into())]),
+        &viewer("p:a"),
+    );
     assert_eq!(l.sql_predicate, "edge.source_root NOT IN (:id_0)");
     let empty = lower_over_source_root(&SetExpr::NotIds(vec![]), &viewer("p:a"));
-    assert_eq!(empty.sql_predicate, "TRUE", "an empty deny-set excludes nothing");
+    assert_eq!(
+        empty.sql_predicate, "TRUE",
+        "an empty deny-set excludes nothing"
+    );
 }
 
 #[test]
 fn in_relation_lowers_to_authz_visible_join_keyed_on_source_root() {
     let l = lower_over_source_root(
-        &SetExpr::InRelation { relation: RelName("view".into()), via_column: source_root_colref() },
+        &SetExpr::InRelation {
+            relation: RelName("view".into()),
+            via_column: source_root_colref(),
+        },
         &viewer("p:alice"),
     );
     assert_eq!(l.joins.len(), 1, "exactly one reverse-index JOIN (no N+1)");
     let j = &l.joins[0];
     assert!(
-        j.clause.contains("JOIN authz_visible av0 ON av0.object_id = edge.source_root"),
+        j.clause
+            .contains("JOIN authz_visible av0 ON av0.object_id = edge.source_root"),
         "the JOIN keys on edge.source_root (the C-4 filter column): {}",
         j.clause
     );
-    assert!(j.clause.contains("av0.subject = :subject_0"), "binds the viewer: {}", j.clause);
-    assert!(j.clause.contains("av0.relation = :rel_for_view"), "binds the relation: {}", j.clause);
+    assert!(
+        j.clause.contains("av0.subject = :subject_0"),
+        "binds the viewer: {}",
+        j.clause
+    );
+    assert!(
+        j.clause.contains("av0.relation = :rel_for_view"),
+        "binds the relation: {}",
+        j.clause
+    );
     assert_eq!(l.sql_predicate, "av0.object_id IS NOT NULL");
     assert_eq!(j.relation, "view");
-    assert!(l.params.iter().any(|p| p.placeholder == ":subject_0" && p.value == "p:alice"));
+    assert!(l
+        .params
+        .iter()
+        .any(|p| p.placeholder == ":subject_0" && p.value == "p:alice"));
     assert!(l.depends_on_reverse_index());
 }
 
 #[test]
 fn tuple_set_lowers_to_authz_visible_join() {
     let l = lower_over_source_root(
-        &SetExpr::TupleSet { index: AuthzIndexRef("view".into()) },
+        &SetExpr::TupleSet {
+            index: AuthzIndexRef("view".into()),
+        },
         &viewer("p:alice"),
     );
     assert_eq!(l.joins.len(), 1);
@@ -176,13 +205,22 @@ fn boolean_composition_lowers_to_or_and_and_not() {
         ]),
         &viewer("p:a"),
     );
-    assert_eq!(u.sql_predicate, "(edge.source_root IN (:id_0) OR edge.source_root IN (:id_1))");
+    assert_eq!(
+        u.sql_predicate,
+        "(edge.source_root IN (:id_0) OR edge.source_root IN (:id_1))"
+    );
 
     let i = lower_over_source_root(
-        &SetExpr::Intersect(vec![SetExpr::All, SetExpr::NotIds(vec![ObjectId("s:x".into())])]),
+        &SetExpr::Intersect(vec![
+            SetExpr::All,
+            SetExpr::NotIds(vec![ObjectId("s:x".into())]),
+        ]),
         &viewer("p:a"),
     );
-    assert_eq!(i.sql_predicate, "(TRUE AND edge.source_root NOT IN (:id_0))");
+    assert_eq!(
+        i.sql_predicate,
+        "(TRUE AND edge.source_root NOT IN (:id_0))"
+    );
 
     let d = lower_over_source_root(
         &SetExpr::Difference(
@@ -191,20 +229,36 @@ fn boolean_composition_lowers_to_or_and_and_not() {
         ),
         &viewer("p:a"),
     );
-    assert_eq!(d.sql_predicate, "(TRUE AND NOT edge.source_root IN (:id_0))");
+    assert_eq!(
+        d.sql_predicate,
+        "(TRUE AND NOT edge.source_root IN (:id_0))"
+    );
 }
 
 #[test]
 fn repeated_relation_emits_one_join_no_n_plus_1() {
     let l = lower_over_source_root(
         &SetExpr::Union(vec![
-            SetExpr::InRelation { relation: RelName("view".into()), via_column: source_root_colref() },
-            SetExpr::InRelation { relation: RelName("view".into()), via_column: source_root_colref() },
+            SetExpr::InRelation {
+                relation: RelName("view".into()),
+                via_column: source_root_colref(),
+            },
+            SetExpr::InRelation {
+                relation: RelName("view".into()),
+                via_column: source_root_colref(),
+            },
         ]),
         &viewer("p:alice"),
     );
-    assert_eq!(l.joins.len(), 1, "the same (viewer, relation) JOIN is emitted once, however nested");
-    assert_eq!(l.sql_predicate, "(av0.object_id IS NOT NULL OR av0.object_id IS NOT NULL)");
+    assert_eq!(
+        l.joins.len(),
+        1,
+        "the same (viewer, relation) JOIN is emitted once, however nested"
+    );
+    assert_eq!(
+        l.sql_predicate,
+        "(av0.object_id IS NOT NULL OR av0.object_id IS NOT NULL)"
+    );
 }
 
 // ─────────────────────────────── admit: every SetExpr form (the conjoined predicate) ──────────────
@@ -213,8 +267,22 @@ fn repeated_relation_emits_one_join_no_n_plus_1() {
 fn admit_all_and_none() {
     let authz = AuthzVisibleIndex::new();
     let v = viewer("p:a");
-    assert!(set_expr_admits(&SetExpr::All, &authz, &v, &tenant(), &region(), &public_source()));
-    assert!(!set_expr_admits(&SetExpr::None, &authz, &v, &tenant(), &region(), &public_source()));
+    assert!(set_expr_admits(
+        &SetExpr::All,
+        &authz,
+        &v,
+        &tenant(),
+        &region(),
+        &public_source()
+    ));
+    assert!(!set_expr_admits(
+        &SetExpr::None,
+        &authz,
+        &v,
+        &tenant(),
+        &region(),
+        &public_source()
+    ));
 }
 
 #[test]
@@ -222,18 +290,56 @@ fn admit_ids_and_not_ids() {
     let authz = AuthzVisibleIndex::new();
     let v = viewer("p:a");
     let allow = SetExpr::Ids(vec![ObjectId(public_source().0)]);
-    assert!(set_expr_admits(&allow, &authz, &v, &tenant(), &region(), &public_source()));
-    assert!(!set_expr_admits(&allow, &authz, &v, &tenant(), &region(), &secret_source()));
+    assert!(set_expr_admits(
+        &allow,
+        &authz,
+        &v,
+        &tenant(),
+        &region(),
+        &public_source()
+    ));
+    assert!(!set_expr_admits(
+        &allow,
+        &authz,
+        &v,
+        &tenant(),
+        &region(),
+        &secret_source()
+    ));
     let deny = SetExpr::NotIds(vec![ObjectId(secret_source().0)]);
-    assert!(set_expr_admits(&deny, &authz, &v, &tenant(), &region(), &public_source()));
-    assert!(!set_expr_admits(&deny, &authz, &v, &tenant(), &region(), &secret_source()));
+    assert!(set_expr_admits(
+        &deny,
+        &authz,
+        &v,
+        &tenant(),
+        &region(),
+        &public_source()
+    ));
+    assert!(!set_expr_admits(
+        &deny,
+        &authz,
+        &v,
+        &tenant(),
+        &region(),
+        &secret_source()
+    ));
 }
 
 #[test]
 fn admit_in_relation_reads_the_reverse_index() {
     let authz = AuthzVisibleIndex::new();
-    authz.grant(&tenant(), &region(), "p:a", "view", &public_source().0, "zk-00000000000000000005");
-    let expr = SetExpr::InRelation { relation: RelName("view".into()), via_column: source_root_colref() };
+    authz.grant(
+        &tenant(),
+        &region(),
+        "p:a",
+        "view",
+        &public_source().0,
+        "zk-00000000000000000005",
+    );
+    let expr = SetExpr::InRelation {
+        relation: RelName("view".into()),
+        via_column: source_root_colref(),
+    };
     let v = viewer("p:a");
     assert!(
         set_expr_admits(&expr, &authz, &v, &tenant(), &region(), &public_source()),
@@ -254,8 +360,22 @@ fn admit_difference_a_except_b() {
         Box::new(SetExpr::All),
         Box::new(SetExpr::Ids(vec![ObjectId(secret_source().0)])),
     );
-    assert!(set_expr_admits(&expr, &authz, &v, &tenant(), &region(), &public_source()));
-    assert!(!set_expr_admits(&expr, &authz, &v, &tenant(), &region(), &secret_source()));
+    assert!(set_expr_admits(
+        &expr,
+        &authz,
+        &v,
+        &tenant(),
+        &region(),
+        &public_source()
+    ));
+    assert!(!set_expr_admits(
+        &expr,
+        &authz,
+        &v,
+        &tenant(),
+        &region(),
+        &secret_source()
+    ));
 }
 
 // ─────────────────────────────── REF-D1: backlink leak half (the cardinal sin) ────────────────────
@@ -269,19 +389,45 @@ fn ref_d1_confidential_referrer_absent_for_unauthorized_viewer() {
     // The viewer may view ONLY the public source. Grant view of the public source through the read's
     // own reverse index (the Filter/InRelation pushed-down mode reads it).
     let read = seeded_read();
-    read.authz.grant(&tenant(), &region(), "p:viewer", "view", &public_source().0, "zk-00000000000000000003");
+    read.authz.grant(
+        &tenant(),
+        &region(),
+        "p:viewer",
+        "view",
+        &public_source().0,
+        "zk-00000000000000000003",
+    );
 
     // Pushed-down (Filter/InRelation) mode: list_objects returns the SetExpr; Refs lowers + conjoins.
     let lo = ListObjectsResult::Filter {
-        set_expr: SetExpr::InRelation { relation: RelName("view".into()), via_column: source_root_colref() },
+        set_expr: SetExpr::InRelation {
+            relation: RelName("view".into()),
+            via_column: source_root_colref(),
+        },
         zookie: Zookie("zk-00000000000000000003".into()),
     };
     let page = read
-        .backlinks(&tenant(), &region(), &target_root(), &viewer("p:viewer"), &lo, &pinned("zk-00000000000000000003"), 50)
+        .backlinks(
+            &tenant(),
+            &region(),
+            &target_root(),
+            &viewer("p:viewer"),
+            &lo,
+            &pinned("zk-00000000000000000003"),
+            50,
+        )
         .expect("read succeeds");
 
-    assert_eq!(page.edges.len(), 1, "exactly the ONE authorized (public) backlink is returned");
-    assert_eq!(page.edges[0].source, public_source(), "the public backlink is present");
+    assert_eq!(
+        page.edges.len(),
+        1,
+        "exactly the ONE authorized (public) backlink is returned"
+    );
+    assert_eq!(
+        page.edges[0].source,
+        public_source(),
+        "the public backlink is present"
+    );
     // 0 unauthorized backlinks: the SECRET referrer must be ABSENT.
     assert!(
         !page.edges.iter().any(|b| b.source == secret_source()),
@@ -291,7 +437,11 @@ fn ref_d1_confidential_referrer_absent_for_unauthorized_viewer() {
         !format!("{:?}", page.edges).contains("SECRET"),
         "0 leak: the secret source URN must not appear anywhere in the result"
     );
-    assert_eq!(page.mode, FilterMode::PushedDown, "the InRelation drove the pushed-down filter mode");
+    assert_eq!(
+        page.mode,
+        FilterMode::PushedDown,
+        "the InRelation drove the pushed-down filter mode"
+    );
 }
 
 /// **REF-D1 also holds in `Ids` (materialised) mode**: the small-result allow-set inlines as
@@ -302,21 +452,47 @@ fn ref_d1_holds_in_ids_filter_mode() {
     // list_objects materialised the allow-set as just the public source.
     let lo = ids_result(&[&public_source().0], "zk-1");
     let page = read
-        .backlinks(&tenant(), &region(), &target_root(), &viewer("p:viewer"), &lo, &latest(), 50)
+        .backlinks(
+            &tenant(),
+            &region(),
+            &target_root(),
+            &viewer("p:viewer"),
+            &lo,
+            &latest(),
+            50,
+        )
         .expect("read succeeds");
     assert_eq!(page.edges.len(), 1);
     assert_eq!(page.edges[0].source, public_source());
-    assert!(!page.edges.iter().any(|b| b.source == secret_source()), "0 leak in Ids mode");
-    assert_eq!(page.mode, FilterMode::Ids, "the Ids result drove the materialised filter mode");
+    assert!(
+        !page.edges.iter().any(|b| b.source == secret_source()),
+        "0 leak in Ids mode"
+    );
+    assert_eq!(
+        page.mode,
+        FilterMode::Ids,
+        "the Ids result drove the materialised filter mode"
+    );
 }
 
 /// **`None` denies everything (a viewer with no grants sees 0 backlinks).**
 #[test]
 fn none_denies_all_backlinks() {
     let read = seeded_read();
-    let lo = ListObjectsResult::Filter { set_expr: SetExpr::None, zookie: Zookie("zk-1".into()) };
+    let lo = ListObjectsResult::Filter {
+        set_expr: SetExpr::None,
+        zookie: Zookie("zk-1".into()),
+    };
     let page = read
-        .backlinks(&tenant(), &region(), &target_root(), &viewer("p:nobody"), &lo, &latest(), 50)
+        .backlinks(
+            &tenant(),
+            &region(),
+            &target_root(),
+            &viewer("p:nobody"),
+            &lo,
+            &latest(),
+            50,
+        )
         .expect("read succeeds");
     assert_eq!(page.edges.len(), 0, "None → 0 backlinks (WHERE false)");
 }
@@ -325,9 +501,20 @@ fn none_denies_all_backlinks() {
 #[test]
 fn all_admits_every_backlink() {
     let read = seeded_read();
-    let lo = ListObjectsResult::Filter { set_expr: SetExpr::All, zookie: Zookie("zk-1".into()) };
+    let lo = ListObjectsResult::Filter {
+        set_expr: SetExpr::All,
+        zookie: Zookie("zk-1".into()),
+    };
     let page = read
-        .backlinks(&tenant(), &region(), &target_root(), &viewer("p:admin"), &lo, &latest(), 50)
+        .backlinks(
+            &tenant(),
+            &region(),
+            &target_root(),
+            &viewer("p:admin"),
+            &lo,
+            &latest(),
+            50,
+        )
         .expect("read succeeds");
     assert_eq!(page.edges.len(), 2, "All → every backlink (admin)");
 }
@@ -361,11 +548,26 @@ fn ref_d2_cross_tenant_edge_is_not_readable() {
     );
     let read = BacklinkRead::new(edges, AuthzVisibleIndex::new());
     // A tenant-A viewer reads with an All filter — the tenant-B edge is in a DIFFERENT partition.
-    let lo = ListObjectsResult::Filter { set_expr: SetExpr::All, zookie: Zookie("zk-1".into()) };
+    let lo = ListObjectsResult::Filter {
+        set_expr: SetExpr::All,
+        zookie: Zookie("zk-1".into()),
+    };
     let page = read
-        .backlinks(&tenant(), &region(), &target_root(), &viewer("p:a"), &lo, &latest(), 50)
+        .backlinks(
+            &tenant(),
+            &region(),
+            &target_root(),
+            &viewer("p:a"),
+            &lo,
+            &latest(),
+            50,
+        )
         .expect("read succeeds");
-    assert_eq!(page.edges.len(), 0, "0 cross-tenant edge readable (no cross-tenant query path, ID-3)");
+    assert_eq!(
+        page.edges.len(),
+        0,
+        "0 cross-tenant edge readable (no cross-tenant query path, ID-3)"
+    );
 }
 
 // ─────────────────────────────── REF-D6: new-enemy (the chained test) ─────────────────────────────
@@ -397,26 +599,66 @@ fn ref_d6_new_enemy_grant_read_revoke_reread_absent() {
     let authz = AuthzVisibleIndex::new();
     let read = BacklinkRead::new(edges, authz.clone());
     let lo = ListObjectsResult::Filter {
-        set_expr: SetExpr::InRelation { relation: RelName("view".into()), via_column: source_root_colref() },
+        set_expr: SetExpr::InRelation {
+            relation: RelName("view".into()),
+            via_column: source_root_colref(),
+        },
         zookie: Zookie("zk-00000000000000000005".into()),
     };
 
     // 1. GRANT: the viewer may view the secret source (at revision 5).
-    authz.grant(&tenant(), &region(), "p:enemy", "view", &secret_source().0, "zk-00000000000000000005");
+    authz.grant(
+        &tenant(),
+        &region(),
+        "p:enemy",
+        "view",
+        &secret_source().0,
+        "zk-00000000000000000005",
+    );
     let visible = read
-        .backlinks(&tenant(), &region(), &target_root(), &viewer("p:enemy"), &lo, &pinned("zk-00000000000000000005"), 50)
+        .backlinks(
+            &tenant(),
+            &region(),
+            &target_root(),
+            &viewer("p:enemy"),
+            &lo,
+            &pinned("zk-00000000000000000005"),
+            50,
+        )
         .expect("read succeeds");
     assert_eq!(visible.edges.len(), 1, "post-grant the backlink is visible");
-    assert!(!visible.fell_back_to_check, "the index is at-or-after the read revision → JOIN serves");
+    assert!(
+        !visible.fell_back_to_check,
+        "the index is at-or-after the read revision → JOIN serves"
+    );
 
     // 2. REVOKE with a NEWER zookie (revision 9) — the grant is gone, the watermark advances.
-    authz.revoke(&tenant(), &region(), "p:enemy", "view", &secret_source().0, "zk-00000000000000000009");
+    authz.revoke(
+        &tenant(),
+        &region(),
+        "p:enemy",
+        "view",
+        &secret_source().0,
+        "zk-00000000000000000009",
+    );
 
     // 3. RE-READ with the post-revoke zookie (revision 9): the backlink is ABSENT (no stale allow).
     let absent = read
-        .backlinks(&tenant(), &region(), &target_root(), &viewer("p:enemy"), &lo, &pinned("zk-00000000000000000009"), 50)
+        .backlinks(
+            &tenant(),
+            &region(),
+            &target_root(),
+            &viewer("p:enemy"),
+            &lo,
+            &pinned("zk-00000000000000000009"),
+            50,
+        )
         .expect("read succeeds");
-    assert_eq!(absent.edges.len(), 0, "post-revoke the just-revoked grant does NOT read stale (no stale allow)");
+    assert_eq!(
+        absent.edges.len(),
+        0,
+        "post-revoke the just-revoked grant does NOT read stale (no stale allow)"
+    );
 }
 
 /// **The watermark fall-back fires when the reverse index is BEHIND the carried zookie.** A read
@@ -426,16 +668,37 @@ fn ref_d6_new_enemy_grant_read_revoke_reread_absent() {
 #[test]
 fn watermark_behind_falls_back_to_check_branch_observable() {
     let read = seeded_read();
-    read.authz.grant(&tenant(), &region(), "p:viewer", "view", &public_source().0, "zk-00000000000000000003");
+    read.authz.grant(
+        &tenant(),
+        &region(),
+        "p:viewer",
+        "view",
+        &public_source().0,
+        "zk-00000000000000000003",
+    );
     let lo = ListObjectsResult::Filter {
-        set_expr: SetExpr::InRelation { relation: RelName("view".into()), via_column: source_root_colref() },
+        set_expr: SetExpr::InRelation {
+            relation: RelName("view".into()),
+            via_column: source_root_colref(),
+        },
         zookie: Zookie("zk-00000000000000000007".into()),
     };
     // The read requires rev 7; the index watermark is at 3 → fall back to check (the BRANCH).
     let page = read
-        .backlinks(&tenant(), &region(), &target_root(), &viewer("p:viewer"), &lo, &pinned("zk-00000000000000000007"), 50)
+        .backlinks(
+            &tenant(),
+            &region(),
+            &target_root(),
+            &viewer("p:viewer"),
+            &lo,
+            &pinned("zk-00000000000000000007"),
+            50,
+        )
         .expect("read succeeds");
-    assert!(page.fell_back_to_check, "a behind index falls back to per-source check, never serves stale");
+    assert!(
+        page.fell_back_to_check,
+        "a behind index falls back to per-source check, never serves stale"
+    );
     // still leak-free: only the public backlink (the viewer was granted that one).
     assert_eq!(page.edges.len(), 1);
     assert_eq!(page.edges[0].source, public_source());
@@ -443,9 +706,20 @@ fn watermark_behind_falls_back_to_check_branch_observable() {
     // A pure-Ids read pinned to a high revision is watermark-INDEPENDENT (it carries its own set).
     let ids = ids_result(&[&public_source().0], "zk-00000000000000000007");
     let ids_page = read
-        .backlinks(&tenant(), &region(), &target_root(), &viewer("p:viewer"), &ids, &pinned("zk-00000000000000000099"), 50)
+        .backlinks(
+            &tenant(),
+            &region(),
+            &target_root(),
+            &viewer("p:viewer"),
+            &ids,
+            &pinned("zk-00000000000000000099"),
+            50,
+        )
         .expect("read succeeds");
-    assert!(!ids_page.fell_back_to_check, "a materialised Ids set is watermark-independent — JOIN-serves");
+    assert!(
+        !ids_page.fell_back_to_check,
+        "a materialised Ids set is watermark-independent — JOIN-serves"
+    );
 }
 
 // ─────────────────────────────── no-N+1, telemetry, pagination ────────────────────────────────────
@@ -456,17 +730,46 @@ fn watermark_behind_falls_back_to_check_branch_observable() {
 #[test]
 fn no_n_plus_1_one_query_and_filter_mode_split_fires() {
     let read = seeded_read();
-    read.authz.grant(&tenant(), &region(), "p:a", "view", &public_source().0, "zk-1");
-    read.authz.grant(&tenant(), &region(), "p:a", "view", &secret_source().0, "zk-1");
+    read.authz.grant(
+        &tenant(),
+        &region(),
+        "p:a",
+        "view",
+        &public_source().0,
+        "zk-1",
+    );
+    read.authz.grant(
+        &tenant(),
+        &region(),
+        "p:a",
+        "view",
+        &secret_source().0,
+        "zk-1",
+    );
 
     let lo = ListObjectsResult::Filter {
-        set_expr: SetExpr::InRelation { relation: RelName("view".into()), via_column: source_root_colref() },
+        set_expr: SetExpr::InRelation {
+            relation: RelName("view".into()),
+            via_column: source_root_colref(),
+        },
         zookie: Zookie("zk-1".into()),
     };
     let page = read
-        .backlinks(&tenant(), &region(), &target_root(), &viewer("p:a"), &lo, &latest(), 50)
+        .backlinks(
+            &tenant(),
+            &region(),
+            &target_root(),
+            &viewer("p:a"),
+            &lo,
+            &latest(),
+            50,
+        )
         .expect("read succeeds");
-    assert_eq!(page.edges.len(), 2, "both authorized backlinks (2 inbound edges)");
+    assert_eq!(
+        page.edges.len(),
+        2,
+        "both authorized backlinks (2 inbound edges)"
+    );
     // ONE scan, NOT one check per inbound edge.
     assert_eq!(read.query_count(), 1, "the read issues ONE query (no N+1)");
     // the pushed-down split fired (1 pushed-down read, 0 Ids reads so far).
@@ -475,10 +778,22 @@ fn no_n_plus_1_one_query_and_filter_mode_split_fires() {
     // a second read in Ids mode bumps the Ids side of the split (still one query each).
     let ids = ids_result(&[&public_source().0], "zk-1");
     let _ = read
-        .backlinks(&tenant(), &region(), &target_root(), &viewer("p:a"), &ids, &latest(), 50)
+        .backlinks(
+            &tenant(),
+            &region(),
+            &target_root(),
+            &viewer("p:a"),
+            &ids,
+            &latest(),
+            50,
+        )
         .expect("read succeeds");
     assert_eq!(read.query_count(), 2, "the second read is also ONE query");
-    assert_eq!(read.filter_mode_split(), (1, 1), "the Ids vs pushed-down split is observable");
+    assert_eq!(
+        read.filter_mode_split(),
+        (1, 1),
+        "the Ids vs pushed-down split is observable"
+    );
 }
 
 /// **Always paginated: a page size of 0 is a malformed request (fail loud — never an unbounded
@@ -486,17 +801,40 @@ fn no_n_plus_1_one_query_and_filter_mode_split_fires() {
 #[test]
 fn pagination_zero_page_rejected_and_limit_applied() {
     let read = seeded_read();
-    let lo = ListObjectsResult::Filter { set_expr: SetExpr::All, zookie: Zookie("zk-1".into()) };
+    let lo = ListObjectsResult::Filter {
+        set_expr: SetExpr::All,
+        zookie: Zookie("zk-1".into()),
+    };
     // page 0 → InvalidPage (always paginated; no unbounded scan).
     let err = read
-        .backlinks(&tenant(), &region(), &target_root(), &viewer("p:a"), &lo, &latest(), 0)
+        .backlinks(
+            &tenant(),
+            &region(),
+            &target_root(),
+            &viewer("p:a"),
+            &lo,
+            &latest(),
+            0,
+        )
         .unwrap_err();
     assert_eq!(err, BacklinkError::InvalidPage);
     // page 1 → LIMIT 1 (the most-recent admitted backlink only).
     let page = read
-        .backlinks(&tenant(), &region(), &target_root(), &viewer("p:a"), &lo, &latest(), 1)
+        .backlinks(
+            &tenant(),
+            &region(),
+            &target_root(),
+            &viewer("p:a"),
+            &lo,
+            &latest(),
+            1,
+        )
         .expect("read succeeds");
-    assert_eq!(page.edges.len(), 1, "LIMIT :page bounds the result (hot-artifact safety)");
+    assert_eq!(
+        page.edges.len(),
+        1,
+        "LIMIT :page bounds the result (hot-artifact safety)"
+    );
 }
 
 /// **`edges(ref, viewer)` is the same permission-filtered read as `backlinks` (the contract names
@@ -506,7 +844,15 @@ fn edges_is_the_same_permission_filtered_read() {
     let read = seeded_read();
     let lo = ids_result(&[&public_source().0], "zk-1");
     let page = read
-        .edges(&tenant(), &region(), &target_root(), &viewer("p:a"), &lo, &latest(), 50)
+        .edges(
+            &tenant(),
+            &region(),
+            &target_root(),
+            &viewer("p:a"),
+            &lo,
+            &latest(),
+            50,
+        )
         .expect("read succeeds");
     assert_eq!(page.edges.len(), 1);
     assert_eq!(page.edges[0].source, public_source());
@@ -520,7 +866,10 @@ fn edges_is_the_same_permission_filtered_read() {
 fn watermark_advances_monotonically_stale_never_regresses() {
     let authz = AuthzVisibleIndex::new();
     authz.advance_watermark(&tenant(), &region(), "zk-00000000000000000005");
-    assert_eq!(authz.watermark(&tenant(), &region()), "zk-00000000000000000005");
+    assert_eq!(
+        authz.watermark(&tenant(), &region()),
+        "zk-00000000000000000005"
+    );
     // a STALER revision must NOT regress the watermark (monotone).
     authz.advance_watermark(&tenant(), &region(), "zk-00000000000000000003");
     assert_eq!(
@@ -530,17 +879,26 @@ fn watermark_advances_monotonically_stale_never_regresses() {
     );
     // an EQUAL revision is a no-op (still 5).
     authz.advance_watermark(&tenant(), &region(), "zk-00000000000000000005");
-    assert_eq!(authz.watermark(&tenant(), &region()), "zk-00000000000000000005");
+    assert_eq!(
+        authz.watermark(&tenant(), &region()),
+        "zk-00000000000000000005"
+    );
     // a NEWER revision advances it.
     authz.advance_watermark(&tenant(), &region(), "zk-00000000000000000009");
-    assert_eq!(authz.watermark(&tenant(), &region()), "zk-00000000000000000009");
+    assert_eq!(
+        authz.watermark(&tenant(), &region()),
+        "zk-00000000000000000009"
+    );
 }
 
 /// **`BacklinkError::InvalidPage` renders a non-empty, descriptive message (Display).**
 #[test]
 fn backlink_error_display_is_descriptive() {
     let msg = format!("{}", BacklinkError::InvalidPage);
-    assert!(msg.contains("paginated"), "the error explains the pagination requirement: {msg}");
+    assert!(
+        msg.contains("paginated"),
+        "the error explains the pagination requirement: {msg}"
+    );
     assert!(!msg.is_empty());
 }
 
@@ -567,16 +925,37 @@ fn accessors_return_the_live_stores_the_read_scans() {
             tombstoned: false,
         },
     );
-    read.authz_index()
-        .grant(&tenant(), &region(), "p:a", "view", &public_source().0, "zk-1");
+    read.authz_index().grant(
+        &tenant(),
+        &region(),
+        "p:a",
+        "view",
+        &public_source().0,
+        "zk-1",
+    );
     let lo = ListObjectsResult::Filter {
-        set_expr: SetExpr::InRelation { relation: RelName("view".into()), via_column: source_root_colref() },
+        set_expr: SetExpr::InRelation {
+            relation: RelName("view".into()),
+            via_column: source_root_colref(),
+        },
         zookie: Zookie("zk-1".into()),
     };
     let page = read
-        .backlinks(&tenant(), &region(), &target_root(), &viewer("p:a"), &lo, &latest(), 50)
+        .backlinks(
+            &tenant(),
+            &region(),
+            &target_root(),
+            &viewer("p:a"),
+            &lo,
+            &latest(),
+            50,
+        )
         .expect("read succeeds");
-    assert_eq!(page.edges.len(), 1, "the accessor-seeded edge + grant are observed by the read");
+    assert_eq!(
+        page.edges.len(),
+        1,
+        "the accessor-seeded edge + grant are observed by the read"
+    );
 }
 
 /// **The `target_root` rolls up sub-artifact backlinks: a backlink to `target#sub` is keyed on the
@@ -606,10 +985,25 @@ fn sub_artifact_backlinks_roll_up_to_the_root() {
         },
     );
     let read = BacklinkRead::new(edges, AuthzVisibleIndex::new());
-    let lo = ListObjectsResult::Filter { set_expr: SetExpr::All, zookie: Zookie("zk-1".into()) };
+    let lo = ListObjectsResult::Filter {
+        set_expr: SetExpr::All,
+        zookie: Zookie("zk-1".into()),
+    };
     // reading the ROOT finds the backlink to the sub-artifact (rolled up via target_root).
     let page = read
-        .backlinks(&tenant(), &region(), &target_root(), &viewer("p:a"), &lo, &latest(), 50)
+        .backlinks(
+            &tenant(),
+            &region(),
+            &target_root(),
+            &viewer("p:a"),
+            &lo,
+            &latest(),
+            50,
+        )
         .expect("read succeeds");
-    assert_eq!(page.edges.len(), 1, "a backlink to target#sub is found by the parent root");
+    assert_eq!(
+        page.edges.len(),
+        1,
+        "a backlink to target#sub is found by the parent root"
+    );
 }

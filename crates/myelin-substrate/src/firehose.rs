@@ -453,13 +453,29 @@ mod tests {
         assert_eq!(buf.offer(human(3)), PushOutcome::Buffered);
         assert_eq!(buf.buffered_frames(), 3, "the buffer is at its cap");
         // the next frame is OVER cap → it sheds in the firehose's own bounded queue (memory bounded).
-        assert_eq!(buf.offer(human(4)), PushOutcome::Shed, "an over-cap frame sheds, never buffers");
-        assert_eq!(buf.buffered_frames(), 3, "buffered frames NEVER exceed the cap (Little's Law)");
-        assert_eq!(buf.shed_count(), 1, "the shed is counted (the bounded-streaming signal)");
+        assert_eq!(
+            buf.offer(human(4)),
+            PushOutcome::Shed,
+            "an over-cap frame sheds, never buffers"
+        );
+        assert_eq!(
+            buf.buffered_frames(),
+            3,
+            "buffered frames NEVER exceed the cap (Little's Law)"
+        );
+        assert_eq!(
+            buf.shed_count(),
+            1,
+            "the shed is counted (the bounded-streaming signal)"
+        );
         // delivering a frame frees a slot → a new frame can buffer (the buffer recovers).
         buf.deliver(human(1));
         assert_eq!(buf.buffered_frames(), 2, "delivery freed a slot");
-        assert_eq!(buf.offer(human(5)), PushOutcome::Buffered, "a freed slot is reusable");
+        assert_eq!(
+            buf.offer(human(5)),
+            PushOutcome::Buffered,
+            "a freed slot is reusable"
+        );
     }
 
     // ---- (b) slow-consumer drop to resync_required: bounded memory, NAMED cold rebuild -------------
@@ -481,18 +497,48 @@ mod tests {
                 "below the slow-consumer ceiling a frame buffers or sheds, never drops yet: seq={seq} {out:?}"
             );
         }
-        assert!(!buf.resync_required(), "not dropped yet (lag 7 < ceiling 8)");
-        assert_eq!(buf.frame_lag(), 7, "the frame-lag tracks the producer-vs-consumer gap");
-        assert_eq!(buf.buffered_frames(), 4, "memory bounded at the cap even as the lag climbs");
+        assert!(
+            !buf.resync_required(),
+            "not dropped yet (lag 7 < ceiling 8)"
+        );
+        assert_eq!(
+            buf.frame_lag(),
+            7,
+            "the frame-lag tracks the producer-vs-consumer gap"
+        );
+        assert_eq!(
+            buf.buffered_frames(),
+            4,
+            "memory bounded at the cap even as the lag climbs"
+        );
 
         // frame 8: the lag reaches the ceiling (8) → the SLOW CONSUMER is dropped to resync_required.
         let out = buf.offer(human(8));
-        assert_eq!(out, PushOutcome::ResyncRequired, "a slow consumer is dropped to resync_required");
-        assert!(buf.resync_required(), "the connection is dropped (the cold-rebuild path, NAMED)");
+        assert_eq!(
+            out,
+            PushOutcome::ResyncRequired,
+            "a slow consumer is dropped to resync_required"
+        );
+        assert!(
+            buf.resync_required(),
+            "the connection is dropped (the cold-rebuild path, NAMED)"
+        );
         // MEMORY IS BOUNDED: the dropped buffer holds NOTHING (it did not buffer the gap).
-        assert_eq!(buf.buffered_frames(), 0, "a dropped connection releases its buffer (bounded memory)");
-        assert_eq!(buf.frame_lag(), 0, "a dropped connection holds no gap (it is in *.snapshot replay)");
-        assert_eq!(buf.resync_required_count(), 1, "the resync_required count is accurate (one drop)");
+        assert_eq!(
+            buf.buffered_frames(),
+            0,
+            "a dropped connection releases its buffer (bounded memory)"
+        );
+        assert_eq!(
+            buf.frame_lag(),
+            0,
+            "a dropped connection holds no gap (it is in *.snapshot replay)"
+        );
+        assert_eq!(
+            buf.resync_required_count(),
+            1,
+            "the resync_required count is accurate (one drop)"
+        );
     }
 
     /// Once dropped, the connection STAYS dropped (every subsequent offer reads `resync_required`) and
@@ -509,7 +555,11 @@ mod tests {
         // NOT re-increment the count (one drop per connection life).
         assert_eq!(buf.offer(human(4)), PushOutcome::ResyncRequired);
         assert_eq!(buf.offer(human(5)), PushOutcome::ResyncRequired);
-        assert_eq!(buf.resync_required_count(), 1, "the drop is counted EXACTLY once per connection");
+        assert_eq!(
+            buf.resync_required_count(),
+            1,
+            "the drop is counted EXACTLY once per connection"
+        );
         assert_eq!(buf.buffered_frames(), 0, "memory stays released");
         // a delivery on a dropped connection is a no-op (the consumer is in *.snapshot replay).
         buf.deliver(human(2));
@@ -523,11 +573,21 @@ mod tests {
     fn a_keeping_up_consumer_is_never_dropped_and_lag_stays_bounded() {
         let mut buf = FrameBuffer::new("chat-live", scope("channel:eng"), 4, 8);
         for seq in 1..=100u64 {
-            assert_eq!(buf.offer(human(seq)), PushOutcome::Buffered, "a keeping-up consumer never sheds");
+            assert_eq!(
+                buf.offer(human(seq)),
+                PushOutcome::Buffered,
+                "a keeping-up consumer never sheds"
+            );
             buf.deliver(human(seq));
-            assert!(buf.frame_lag() <= 1, "lag stays bounded (~0) for a keeping-up consumer");
+            assert!(
+                buf.frame_lag() <= 1,
+                "lag stays bounded (~0) for a keeping-up consumer"
+            );
         }
-        assert!(!buf.resync_required(), "a keeping-up consumer is never dropped");
+        assert!(
+            !buf.resync_required(),
+            "a keeping-up consumer is never dropped"
+        );
         assert_eq!(buf.resync_required_count(), 0);
         assert_eq!(buf.shed_count(), 0, "no shed on the happy path");
     }
@@ -543,9 +603,16 @@ mod tests {
         let mut buf = FrameBuffer::new("kn-ops", scope("doc:x"), 5, 1);
         // lag 1..4 (< raised ceiling 5) → the first four frames buffer, no pre-drop.
         for seq in 1..=4u64 {
-            assert_eq!(buf.offer(human(seq)), PushOutcome::Buffered, "seq {seq} must buffer, not pre-drop");
+            assert_eq!(
+                buf.offer(human(seq)),
+                PushOutcome::Buffered,
+                "seq {seq} must buffer, not pre-drop"
+            );
         }
-        assert!(!buf.resync_required(), "a healthy connection filling its cap is NOT 'slow'");
+        assert!(
+            !buf.resync_required(),
+            "a healthy connection filling its cap is NOT 'slow'"
+        );
         // seq 5: lag reaches the raised ceiling (5 == cap) → the drop fires — never BEFORE the cap.
         assert_eq!(
             buf.offer(human(5)),
@@ -578,12 +645,22 @@ mod tests {
         let sig = FirehoseSignals::snapshot([&fast, &slow]);
         // the frame-lag signal carries one (stream,scope) row per buffer, both BOUNDED.
         assert_eq!(sig.frame_lag.len(), 2);
-        assert!(sig.max_frame_lag() <= 8, "every (stream,scope) frame-lag is BOUNDED by the ceiling");
+        assert!(
+            sig.max_frame_lag() <= 8,
+            "every (stream,scope) frame-lag is BOUNDED by the ceiling"
+        );
         // the fast row reads ~0; the slow row reads 0 (dropped → no gap held).
-        let fast_row = sig.frame_lag.iter().find(|r| r.scope == "channel:fast").unwrap();
+        let fast_row = sig
+            .frame_lag
+            .iter()
+            .find(|r| r.scope == "channel:fast")
+            .unwrap();
         assert!(fast_row.lag <= 1, "the keeping-up scope's lag is ~0");
         // the resync_required count is accurate: exactly one drop across the two buffers.
-        assert_eq!(sig.resync_required_count, 1, "the resync_required count is accurate + NAMED");
+        assert_eq!(
+            sig.resync_required_count, 1,
+            "the resync_required count is accurate + NAMED"
+        );
     }
 
     /// The accessor surface reads back exactly what the buffer holds — the `(stream, scope)` key, the
@@ -594,13 +671,27 @@ mod tests {
         let mut buf = FrameBuffer::new("ci-logs", scope("board:7"), 5, 9);
         // the (stream, scope) key + the cap read back exactly.
         assert_eq!(buf.stream(), "ci-logs", "the stream key reads back exactly");
-        assert_eq!(buf.scope().selector(), "board:7", "the scope selector reads back exactly");
-        assert_eq!(buf.capacity(), 5, "the per-connection cap reads back exactly");
+        assert_eq!(
+            buf.scope().selector(),
+            "board:7",
+            "the scope selector reads back exactly"
+        );
+        assert_eq!(
+            buf.capacity(),
+            5,
+            "the per-connection cap reads back exactly"
+        );
 
         // is_buffered / is_resync_required reflect the outcome precisely.
         let buffered = buf.offer(human(1));
-        assert!(buffered.is_buffered(), "a buffered frame reads is_buffered() == true");
-        assert!(!buffered.is_resync_required(), "a buffered frame is NOT resync_required");
+        assert!(
+            buffered.is_buffered(),
+            "a buffered frame reads is_buffered() == true"
+        );
+        assert!(
+            !buffered.is_resync_required(),
+            "a buffered frame is NOT resync_required"
+        );
 
         // drive a drop and assert the resync predicate flips (and is_buffered does not).
         for seq in 2..=9u64 {
@@ -608,11 +699,18 @@ mod tests {
         }
         assert!(buf.resync_required(), "the buffer dropped to resync");
         let dropped = buf.offer(human(10));
-        assert!(dropped.is_resync_required(), "a dropped offer reads is_resync_required() == true");
+        assert!(
+            dropped.is_resync_required(),
+            "a dropped offer reads is_resync_required() == true"
+        );
         assert!(!dropped.is_buffered(), "a dropped offer is NOT buffered");
 
         // max_frame_lag folds the rows to the largest lag (0 when empty, the max otherwise).
-        assert_eq!(FirehoseSignals::default().max_frame_lag(), 0, "an empty signal set has 0 max lag");
+        assert_eq!(
+            FirehoseSignals::default().max_frame_lag(),
+            0,
+            "an empty signal set has 0 max lag"
+        );
         let mut a = FrameBuffer::new("s", scope("doc:a"), 8, 16);
         let mut b = FrameBuffer::new("s", scope("doc:b"), 8, 16);
         for seq in 1..=3u64 {
@@ -621,7 +719,11 @@ mod tests {
         b.offer(human(1));
         b.deliver(human(1)); // b lags 0
         let sig = FirehoseSignals::snapshot([&a, &b]);
-        assert_eq!(sig.max_frame_lag(), 3, "max_frame_lag is the LARGEST (stream,scope) lag, not 0/1");
+        assert_eq!(
+            sig.max_frame_lag(),
+            3,
+            "max_frame_lag is the LARGEST (stream,scope) lag, not 0/1"
+        );
     }
 
     /// The frame shed CLASS order is presence → agent → human (a lower class sheds first; the P-S29

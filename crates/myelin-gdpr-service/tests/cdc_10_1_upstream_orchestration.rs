@@ -66,12 +66,20 @@ fn orchestrator_fans_erase_out_to_the_upstream_holders_in_canonical_order() {
     // The PROVIDERS: the six upstream-store holder seams.
     let holders: Vec<(&'static str, SeamHolder)> = ids
         .iter()
-        .map(|id| (*id, SeamHolder::new(id, ShredKeyClass::Subject(id.to_string()), &kms)))
+        .map(|id| {
+            (
+                *id,
+                SeamHolder::new(id, ShredKeyClass::Subject(id.to_string()), &kms),
+            )
+        })
         .collect();
 
     // The CONSUMER: the orchestrator fans out via `dyn PersonalDataHolder`, never into a store.
     let orch = UpstreamHolderOrchestrator::register_m1_upstream(
-        holders.iter().map(|(id, h)| (*id, h as &dyn PersonalDataHolder)).collect(),
+        holders
+            .iter()
+            .map(|(id, h)| (*id, h as &dyn PersonalDataHolder))
+            .collect(),
     );
     let checklist = EraseChecklist::new();
     let receipts = orch
@@ -85,9 +93,21 @@ fn orchestrator_fans_erase_out_to_the_upstream_holders_in_canonical_order() {
         .expect("the canonical fan-out succeeds");
 
     // The fan-out reached all six holders, Identity FIRST, backups LAST (the canonical order).
-    assert_eq!(receipts.len(), 6, "the fan-out reached every M1 upstream holder");
-    assert_eq!(receipts[0].holder_id, holder_ids::IDENTITY, "Identity (pseudonym map) erased FIRST");
-    assert_eq!(receipts.last().unwrap().holder_id, holder_ids::BACKUP, "backups erased LAST");
+    assert_eq!(
+        receipts.len(),
+        6,
+        "the fan-out reached every M1 upstream holder"
+    );
+    assert_eq!(
+        receipts[0].holder_id,
+        holder_ids::IDENTITY,
+        "Identity (pseudonym map) erased FIRST"
+    );
+    assert_eq!(
+        receipts.last().unwrap().holder_id,
+        holder_ids::BACKUP,
+        "backups erased LAST"
+    );
 
     // Every receipt is content-addressed + records the destroyed key epoch (independently checkable).
     for r in &receipts {
@@ -105,7 +125,11 @@ fn orchestrator_fans_erase_out_to_the_upstream_holders_in_canonical_order() {
             tenant: tenant.clone(),
             class: ShredKeyClass::Subject(id.to_string()),
         };
-        assert_eq!(kms.recoverable_in_backup(&handle), 0, "{id}: 0 recoverable after erase");
+        assert_eq!(
+            kms.recoverable_in_backup(&handle),
+            0,
+            "{id}: 0 recoverable after erase"
+        );
     }
 }
 
@@ -117,16 +141,30 @@ fn re_driving_the_fan_out_is_idempotent_for_the_consumer() {
     let kms = InMemoryShredKms::new();
     let id = holder_ids::BLOB;
     kms.provision(
-        ShredKeyHandle { tenant: tenant.clone(), class: ShredKeyClass::Subject(id.into()) },
+        ShredKeyHandle {
+            tenant: tenant.clone(),
+            class: ShredKeyClass::Subject(id.into()),
+        },
         7,
     );
     let h = SeamHolder::new(id, ShredKeyClass::Subject(id.into()), &kms);
-    let orch = UpstreamHolderOrchestrator::register_m1_upstream(vec![(id, &h as &dyn PersonalDataHolder)]);
+    let orch =
+        UpstreamHolderOrchestrator::register_m1_upstream(vec![(id, &h as &dyn PersonalDataHolder)]);
     let checklist = EraseChecklist::new();
-    let scope = EraseScope::Subject { subject: subject("u-idem-cdc"), tenant: tenant.clone() };
+    let scope = EraseScope::Subject {
+        subject: subject("u-idem-cdc"),
+        tenant: tenant.clone(),
+    };
 
     let first = orch.fan_out_erase(&scope, &checklist).unwrap();
     let second = orch.fan_out_erase(&scope, &checklist).unwrap();
-    assert_eq!(first, second, "an idempotent re-drive returns the SAME receipts");
-    assert_eq!(h.erase_call_count(), 1, "the already-receipted holder is NOT re-called");
+    assert_eq!(
+        first, second,
+        "an idempotent re-drive returns the SAME receipts"
+    );
+    assert_eq!(
+        h.erase_call_count(),
+        1,
+        "the already-receipted holder is NOT re-called"
+    );
 }

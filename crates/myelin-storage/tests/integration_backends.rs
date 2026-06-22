@@ -222,11 +222,11 @@ async fn rustfs_s3_blob_roundtrip() {
 ///     (0 silent serve) — proven by overwriting the underlying S3 object with wrong bytes.
 #[tokio::test]
 async fn git_pack_tier_over_real_object_store_roundtrips_and_detects_corruption() {
+    use myelin_storage::s3blob::S3BlobStore;
     use myelin_storage::{
         BlobError, GitObjectKind, GitPackError, GitPackTier, RepoGitPlacement, RepoId,
         RepoPlacementStatus, StorageGroup,
     };
-    use myelin_storage::s3blob::S3BlobStore;
     use myelin_tenancy::{Region, TenantId};
 
     let cfg = MyelinConfig::dev();
@@ -235,7 +235,11 @@ async fn git_pack_tier_over_real_object_store_roundtrips_and_detects_corruption(
     // A raw client for the corruption step (overwrite the stored object's bytes out-of-band).
     let raw = {
         let creds = aws_sdk_s3::config::Credentials::new(
-            &cfg.s3.access_key, &cfg.s3.secret_key, None, None, "myelin-dev",
+            &cfg.s3.access_key,
+            &cfg.s3.secret_key,
+            None,
+            None,
+            "myelin-dev",
         );
         let conf = aws_sdk_s3::config::Builder::new()
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
@@ -264,7 +268,10 @@ async fn git_pack_tier_over_real_object_store_roundtrips_and_detects_corruption(
         let bucket = bucket.clone();
         let raw = raw.clone();
         tokio::task::spawn_blocking(move || {
-            let tier = GitPackTier::new(tenant.clone(), S3BlobStore::connect(&cfg.s3, handle.clone()));
+            let tier = GitPackTier::new(
+                tenant.clone(),
+                S3BlobStore::connect(&cfg.s3, handle.clone()),
+            );
             tier.place_repo(
                 repo.clone(),
                 RepoGitPlacement {
@@ -274,12 +281,19 @@ async fn git_pack_tier_over_real_object_store_roundtrips_and_detects_corruption(
                 },
             );
             // (1) put + (2) get THROUGH the trait against the REAL bucket.
-            let address = tier.put_object(&repo, GitObjectKind::Blob, &content).expect("put object");
+            let address = tier
+                .put_object(&repo, GitObjectKind::Blob, &content)
+                .expect("put object");
             let got = tier.get_object(&repo, &address).expect("get object");
-            assert_eq!(got, content, "git object round-trips through the real object store");
+            assert_eq!(
+                got, content,
+                "git object round-trips through the real object store"
+            );
 
             // The native (BLAKE3) key the framed object is stored under; reconstruct its S3 key.
-            let native = tier.native_addr_for_test(&repo, &address).expect("native addr");
+            let native = tier
+                .native_addr_for_test(&repo, &address)
+                .expect("native addr");
             let dh = &native.digest_hex;
             let (fan, rest) = dh.split_at(2);
             let native_key = format!("{}/{}/{}/{}", tenant.0, native.algo.tag(), fan, rest);
@@ -291,7 +305,9 @@ async fn git_pack_tier_over_real_object_store_roundtrips_and_detects_corruption(
                 raw.put_object()
                     .bucket(&bucket)
                     .key(&native_key)
-                    .body(aws_sdk_s3::primitives::ByteStream::from(b"corrupted bytes".to_vec()))
+                    .body(aws_sdk_s3::primitives::ByteStream::from(
+                        b"corrupted bytes".to_vec(),
+                    ))
                     .send()
                     .await
                     .expect("overwrite the stored object with corrupt bytes");
@@ -311,5 +327,10 @@ async fn git_pack_tier_over_real_object_store_roundtrips_and_detects_corruption(
     );
 
     // Clean up the probe object.
-    let _ = raw.delete_object().bucket(&bucket).key(&native_key).send().await;
+    let _ = raw
+        .delete_object()
+        .bucket(&bucket)
+        .key(&native_key)
+        .send()
+        .await;
 }

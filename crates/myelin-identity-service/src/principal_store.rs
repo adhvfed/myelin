@@ -64,11 +64,11 @@
 //!   the 11.1/§2 contract. The seam shape does not change when the binding lands.
 
 use myelin_gdpr::PersonalData;
+use myelin_identity::{PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_storage::{
     KeyClass, KmsEngine, KmsError, OltpHolderRegistration, OltpStoreHolder, PiiKeyRef, TenantQuery,
     TenantScope, TenantTable,
 };
-use myelin_identity::{PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_tenancy::{Region, TenantId};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -435,7 +435,11 @@ impl PrincipalStore {
     /// Built through a [`TenantQuery`] so the access carries its `(tenant, region)` predicate; a
     /// read for one tenant structurally cannot reach another's partition. `None` if no such
     /// principal in the verified scope.
-    pub fn get_principal(&self, scope: &TenantScope, principal_id: &PrincipalId) -> Option<PrincipalRow> {
+    pub fn get_principal(
+        &self,
+        scope: &TenantScope,
+        principal_id: &PrincipalId,
+    ) -> Option<PrincipalRow> {
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S1_TABLE));
         let inner = self.lock();
         inner
@@ -475,7 +479,11 @@ impl PrincipalStore {
                 Some(pr) => pr.key_ref,
                 None => return Ok(None), // a principal with no profile (e.g. a machine principal)
             };
-            let enc = match inner.profiles.get(&part_key).and_then(|p| p.get(&principal_id.0)) {
+            let enc = match inner
+                .profiles
+                .get(&part_key)
+                .and_then(|p| p.get(&principal_id.0))
+            {
                 Some(e) => e.clone(),
                 None => return Ok(None),
             };
@@ -495,7 +503,11 @@ impl PrincipalStore {
     /// backups + immutable logs while the opaque `principal_id` attribution survives. Exposed so
     /// the erase fan-out keys on the one structural lever the store builds. The destroy CALL is the
     /// named floor (P-078 / P-117); the lever is real now.
-    pub fn profile_shred_key(&self, scope: &TenantScope, principal_id: &PrincipalId) -> Option<PiiKeyRef> {
+    pub fn profile_shred_key(
+        &self,
+        scope: &TenantScope,
+        principal_id: &PrincipalId,
+    ) -> Option<PiiKeyRef> {
         self.get_principal(scope, principal_id)
             .and_then(|r| r.profile_ref.map(|pr| pr.key_ref))
     }
@@ -622,7 +634,10 @@ impl PrincipalStore {
         if cursor != bytes.len() {
             return Err(PrincipalError::CorruptProfile);
         }
-        Ok(PrincipalProfile { email, display_name })
+        Ok(PrincipalProfile {
+            email,
+            display_name,
+        })
     }
 
     /// The `(tenant, region)` partition key for a verified scope (the OUTER partition; 12.1). A
@@ -674,7 +689,10 @@ mod tests {
         // — and stays — tagged). This is the SAME pattern git's P-063 schema.rs uses.
         let email = email_addr.to_string();
         let display_name = name.to_string();
-        PrincipalProfile { email, display_name }
+        PrincipalProfile {
+            email,
+            display_name,
+        }
     }
 
     /// **An S1 row round-trips under RLS scoped to `(tenant, region)` (11.1 + 12.1).** A principal
@@ -695,12 +713,18 @@ mod tests {
             )
             .expect("write");
         assert_eq!(written.principal_id, PrincipalId("p:alice".into()));
-        assert!(written.profile_ref.is_some(), "a profiled principal has an erasable profile_ref");
+        assert!(
+            written.profile_ref.is_some(),
+            "a profiled principal has an erasable profile_ref"
+        );
 
         let read = store
             .get_principal(&s, &PrincipalId("p:alice".into()))
             .expect("the row round-trips under the same scope");
-        assert_eq!(read, written, "the S1 row round-trips byte-for-byte under RLS");
+        assert_eq!(
+            read, written,
+            "the S1 row round-trips byte-for-byte under RLS"
+        );
         assert_eq!(read.kind, PrincipalKind::Human);
         assert_eq!(read.status, PrincipalStatus::Active);
     }
@@ -728,10 +752,15 @@ mod tests {
 
         // globex sees NOTHING acme wrote (the partition is keyed by the verified scope).
         assert!(
-            store.get_principal(&globex, &PrincipalId("p:alice".into())).is_none(),
+            store
+                .get_principal(&globex, &PrincipalId("p:alice".into()))
+                .is_none(),
             "no cross-tenant read path: globex cannot see acme's principal"
         );
-        assert!(store.principals_in(&globex).is_empty(), "globex's partition is empty");
+        assert!(
+            store.principals_in(&globex).is_empty(),
+            "globex's partition is empty"
+        );
         // acme sees its own.
         assert_eq!(store.principals_in(&acme).len(), 1);
     }
@@ -755,7 +784,9 @@ mod tests {
             )
             .expect("eu write");
         assert!(
-            store.get_principal(&us, &PrincipalId("p:alice".into())).is_none(),
+            store
+                .get_principal(&us, &PrincipalId("p:alice".into()))
+                .is_none(),
             "residency partition: the us-east partition cannot see the eu-west principal"
         );
         assert_eq!(store.principals_in(&eu).len(), 1);
@@ -784,7 +815,11 @@ mod tests {
             .get_profile(&s, &PrincipalId("p:alice".into()))
             .expect("profile read succeeds")
             .expect("a profile exists");
-        assert_eq!(got, profile("alice@acme.test", "Alice"), "the profile decrypts correctly");
+        assert_eq!(
+            got,
+            profile("alice@acme.test", "Alice"),
+            "the profile decrypts correctly"
+        );
 
         // The profile_ref names the PER-SUBJECT key class (subject:<id>), NOT the per-tenant key —
         // this is the GD-4 individual crypto-shred lever (the mutation-tested boundary).
@@ -836,20 +871,33 @@ mod tests {
                 Some(&profile("bob@acme.test", "Bob")),
             )
             .unwrap();
-        let bob_ref = store.profile_shred_key(&s, &PrincipalId("p:bob".into())).unwrap();
+        let bob_ref = store
+            .profile_shred_key(&s, &PrincipalId("p:bob".into()))
+            .unwrap();
 
         // The keys are DISTINCT (GD-4) — different subject id ⇒ different DEK class.
-        assert_ne!(alice_ref.class, bob_ref.class, "distinct subjects get distinct per-subject DEKs");
+        assert_ne!(
+            alice_ref.class, bob_ref.class,
+            "distinct subjects get distinct per-subject DEKs"
+        );
 
         // Defence-in-depth: try to open alice's ciphertext under BOB's DEK directly — it must NOT
         // open (distinct AEAD keys), proving the boundary is cryptographic, not just a string id.
         let inner = store.lock();
         let part = (s.tenant().0.clone(), s.region().0.clone());
-        let alice_ct = inner.profiles.get(&part).unwrap().get("p:alice").unwrap().clone();
+        let alice_ct = inner
+            .profiles
+            .get(&part)
+            .unwrap()
+            .get("p:alice")
+            .unwrap()
+            .clone();
         drop(inner);
         let bob_dek = store.kms.resolve_dek(&bob_ref, s.region()).unwrap();
         assert!(
-            bob_dek.open(&alice_ct.nonce, &alice_ct.ciphertext).is_none(),
+            bob_dek
+                .open(&alice_ct.nonce, &alice_ct.ciphertext)
+                .is_none(),
             "bob's per-subject DEK must NOT open alice's profile ciphertext (the GD-4 boundary)"
         );
     }
@@ -874,9 +922,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(machine.principal_id, PrincipalId("svc:deploy".into()));
-        assert!(machine.profile_ref.is_none(), "a no-PII principal has no erasable profile_ref");
         assert!(
-            store.get_profile(&s, &PrincipalId("svc:deploy".into())).unwrap().is_none(),
+            machine.profile_ref.is_none(),
+            "a no-PII principal has no erasable profile_ref"
+        );
+        assert!(
+            store
+                .get_profile(&s, &PrincipalId("svc:deploy".into()))
+                .unwrap()
+                .is_none(),
             "no profile to read for a machine principal"
         );
 
@@ -915,7 +969,10 @@ mod tests {
         );
         // The updated profile reads back.
         assert_eq!(
-            store.get_profile(&s, &PrincipalId("p:alice".into())).unwrap().unwrap(),
+            store
+                .get_profile(&s, &PrincipalId("p:alice".into()))
+                .unwrap()
+                .unwrap(),
             profile("alice2@acme.test", "Alice A."),
             "the profile update is durable"
         );
@@ -942,9 +999,14 @@ mod tests {
             .unwrap();
         // Destroy alice's per-subject DEK (the crypto-shred lever — the erase BODY is P-ID-20; the
         // lever is real now). We call the KMS destroy directly to model the shred.
-        let key_ref = store.profile_shred_key(&s, &PrincipalId("p:alice".into())).unwrap();
+        let key_ref = store
+            .profile_shred_key(&s, &PrincipalId("p:alice".into()))
+            .unwrap();
         let dek_id = myelin_storage::DekId::new(key_ref.tenant.clone(), key_ref.class.clone());
-        assert!(store.kms.destroy_dek(&dek_id), "the per-subject DEK is destroyed (crypto-shred)");
+        assert!(
+            store.kms.destroy_dek(&dek_id),
+            "the per-subject DEK is destroyed (crypto-shred)"
+        );
 
         // The profile read now fails LOUDLY (the key is gone) — never plaintext-without-key.
         let r = store.get_profile(&s, &PrincipalId("p:alice".into()));
@@ -954,7 +1016,9 @@ mod tests {
         );
         // The opaque principal_id attribution SURVIVES (the immutable half of the §X-7 split).
         assert!(
-            store.get_principal(&s, &PrincipalId("p:alice".into())).is_some(),
+            store
+                .get_principal(&s, &PrincipalId("p:alice".into()))
+                .is_some(),
             "the opaque principal_id row survives the profile shred (immutable attribution)"
         );
     }
@@ -965,7 +1029,11 @@ mod tests {
     #[test]
     fn s1_store_registers_as_a_personal_data_holder() {
         let store = PrincipalStore::new(kms());
-        assert_eq!(store.holder().store, S1_HOLDER, "the S1 store registered under its holder name");
+        assert_eq!(
+            store.holder().store,
+            S1_HOLDER,
+            "the S1 store registered under its holder name"
+        );
         let receipt = store.register_holder();
         assert_eq!(receipt.store, S1_HOLDER);
     }
@@ -999,8 +1067,14 @@ mod tests {
             )
             .unwrap();
         let rows = store.principals_in(&s);
-        assert_eq!(rows.len(), 2, "the org-principal and the human principal coexist in S1");
-        assert!(rows.iter().any(|r| r.principal_id == PrincipalId("org:acme".into())));
+        assert_eq!(
+            rows.len(),
+            2,
+            "the org-principal and the human principal coexist in S1"
+        );
+        assert!(rows
+            .iter()
+            .any(|r| r.principal_id == PrincipalId("org:acme".into())));
     }
 
     /// **A corrupt/truncated profile buffer is REFUSED (never silently coerced).** The
@@ -1023,7 +1097,10 @@ mod tests {
         let two_empty = vec![0u8, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(
             PrincipalStore::profile_from_bytes(&two_empty),
-            Ok(PrincipalProfile { email: String::new(), display_name: String::new() }),
+            Ok(PrincipalProfile {
+                email: String::new(),
+                display_name: String::new()
+            }),
             "a buffer ending exactly at the last header boundary parses (the == boundary succeeds)"
         );
         // A declared field length that overruns the buffer → refused (the second bounds check).
@@ -1062,7 +1139,10 @@ mod tests {
         // live scan green without weakening the lint.
         let email = "alice@acme.test".to_string();
         let display_name = "Alice".to_string();
-        let p = PrincipalProfile { email, display_name };
+        let p = PrincipalProfile {
+            email,
+            display_name,
+        };
         assert_eq!(p.email, "alice@acme.test");
         assert_eq!(p.display_name, "Alice");
     }

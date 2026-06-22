@@ -151,7 +151,7 @@ pub fn band_floor(class: Class) -> u8 {
 /// capped at [`PRIORITY_MAX`] = 100, the only open-topped band).
 pub fn band_ceiling(class: Class) -> u8 {
     match class {
-        Class::Critical => PRIORITY_MAX,        // 100 — the top band, open to the ceiling.
+        Class::Critical => PRIORITY_MAX, // 100 — the top band, open to the ceiling.
         Class::Direct => band_floor(Class::Critical) - 1, // 89 — just below critical's floor.
         Class::Participating => band_floor(Class::Direct) - 1, // 69 — just below direct's floor.
         Class::Watching => band_floor(Class::Participating) - 1, // 54 — just below participating.
@@ -189,7 +189,11 @@ impl ExplainTrace {
     pub fn render(&self) -> String {
         format!(
             "reason={:?} class={:?} base={} +affinity={} +role={} = priority {}",
-            self.reason, self.class, self.base, self.affinity_bonus, self.role_bonus,
+            self.reason,
+            self.class,
+            self.base,
+            self.affinity_bonus,
+            self.role_bonus,
             self.final_priority
         )
     }
@@ -272,7 +276,9 @@ impl Default for DeterministicV1<NeutralAffinity> {
     /// The v1 default — deterministic scoring with the [`NeutralAffinity`] seam (0 bonus). The
     /// within-band order is the pure stable `(base, item_id)` order until the live affinity wires in.
     fn default() -> Self {
-        DeterministicV1 { affinity: NeutralAffinity }
+        DeterministicV1 {
+            affinity: NeutralAffinity,
+        }
     }
 }
 
@@ -329,7 +335,11 @@ pub fn rank_and_order(
         .into_iter()
         .map(|item| {
             let (priority, trace) = strategy.score(viewer, &item);
-            RankedItem { item, priority, trace }
+            RankedItem {
+                item,
+                priority,
+                trace,
+            }
         })
         .collect();
     // (priority DESC, item_id ASC) — the ranked order with the stable deterministic tiebreak.
@@ -379,19 +389,34 @@ mod tests {
     #[test]
     fn reason_base_class_table_is_exact() {
         // 90 / critical
-        assert_eq!(reason_base_class(Reason::ApprovalRequested), (90, Class::Critical));
+        assert_eq!(
+            reason_base_class(Reason::ApprovalRequested),
+            (90, Class::Critical)
+        );
         assert_eq!(reason_base_class(Reason::Escalated), (90, Class::Critical));
         assert_eq!(reason_base_class(Reason::Sla), (90, Class::Critical));
         // 70 / direct
-        assert_eq!(reason_base_class(Reason::ReviewRequested), (70, Class::Direct));
+        assert_eq!(
+            reason_base_class(Reason::ReviewRequested),
+            (70, Class::Direct)
+        );
         assert_eq!(reason_base_class(Reason::Assigned), (70, Class::Direct));
         assert_eq!(reason_base_class(Reason::Mentioned), (70, Class::Direct));
         // 55 / participating
-        assert_eq!(reason_base_class(Reason::Replied), (55, Class::Participating));
-        assert_eq!(reason_base_class(Reason::AgentProposal), (55, Class::Participating));
+        assert_eq!(
+            reason_base_class(Reason::Replied),
+            (55, Class::Participating)
+        );
+        assert_eq!(
+            reason_base_class(Reason::AgentProposal),
+            (55, Class::Participating)
+        );
         // 35 / watching
         assert_eq!(reason_base_class(Reason::Watched), (35, Class::Watching));
-        assert_eq!(reason_base_class(Reason::StateChanged), (35, Class::Watching));
+        assert_eq!(
+            reason_base_class(Reason::StateChanged),
+            (35, Class::Watching)
+        );
         // 15 / fyi
         assert_eq!(reason_base_class(Reason::Fyi), (15, Class::Fyi));
     }
@@ -410,8 +435,16 @@ mod tests {
             Reason::Fyi,
         ] {
             let (base, class) = reason_base_class(reason);
-            assert_eq!(base_priority(reason), base, "base_priority == the table base for {reason:?}");
-            assert_eq!(class_for(reason), class, "class_for == the table class for {reason:?}");
+            assert_eq!(
+                base_priority(reason),
+                base,
+                "base_priority == the table base for {reason:?}"
+            );
+            assert_eq!(
+                class_for(reason),
+                class,
+                "class_for == the table class for {reason:?}"
+            );
         }
         // the distinct bands give distinct bases (a constant-stub mutant cannot satisfy this).
         assert_eq!(base_priority(Reason::Sla), 90);
@@ -538,9 +571,15 @@ mod tests {
     /// stay in the direct band. A mutant that ignores a bonus is caught.
     #[test]
     fn bonuses_narrow_within_band_order() {
-        let with_affinity = DeterministicV1::new(FixedAffinity { affinity: 5, role: 3 });
+        let with_affinity = DeterministicV1::new(FixedAffinity {
+            affinity: 5,
+            role: 3,
+        });
         let (p, t) = with_affinity.score(&viewer(), &item("x", Reason::Assigned));
-        assert_eq!(p, 78, "70 base + 5 affinity + 3 role = 78 (within the direct band)");
+        assert_eq!(
+            p, 78,
+            "70 base + 5 affinity + 3 role = 78 (within the direct band)"
+        );
         assert_eq!(t.affinity_bonus, 5);
         assert_eq!(t.role_bonus, 3);
         // still strictly within the direct band (70..=89).
@@ -553,19 +592,38 @@ mod tests {
     /// A mutant that removes the band clamp (letting a bonus cross a band) is caught.
     #[test]
     fn band_clamp_holds_under_saturating_affinity() {
-        let huge = DeterministicV1::new(FixedAffinity { affinity: 255, role: 255 });
+        let huge = DeterministicV1::new(FixedAffinity {
+            affinity: 255,
+            role: 255,
+        });
         // an fyi item with a saturating affinity is still capped at the fyi ceiling.
         let (fyi_p, _) = huge.score(&viewer(), &item("fyi", Reason::Fyi));
-        assert_eq!(fyi_p, band_ceiling(Class::Fyi), "fyi clamps to its band ceiling (34)");
-        assert!(fyi_p < band_floor(Class::Direct), "an fyi NEVER reaches the direct floor");
-        assert!(fyi_p < band_floor(Class::Critical), "an fyi NEVER reaches the critical floor");
+        assert_eq!(
+            fyi_p,
+            band_ceiling(Class::Fyi),
+            "fyi clamps to its band ceiling (34)"
+        );
+        assert!(
+            fyi_p < band_floor(Class::Direct),
+            "an fyi NEVER reaches the direct floor"
+        );
+        assert!(
+            fyi_p < band_floor(Class::Critical),
+            "an fyi NEVER reaches the critical floor"
+        );
         // a critical with NO affinity still outranks the saturated fyi.
         let plain = DeterministicV1::default();
         let (crit_p, _) = plain.score(&viewer(), &item("crit", Reason::Sla));
-        assert!(crit_p > fyi_p, "a plain critical (90) outranks a saturated fyi (34)");
+        assert!(
+            crit_p > fyi_p,
+            "a plain critical (90) outranks a saturated fyi (34)"
+        );
         // and the clamp never exceeds 100.
         let (crit_huge, _) = huge.score(&viewer(), &item("crit2", Reason::Sla));
-        assert_eq!(crit_huge, PRIORITY_MAX, "critical saturates at the 0..100 ceiling (100)");
+        assert_eq!(
+            crit_huge, PRIORITY_MAX,
+            "critical saturates at the 0..100 ceiling (100)"
+        );
     }
 
     // --- the ordering (priority DESC, item_id ASC) ---
@@ -577,10 +635,10 @@ mod tests {
     #[test]
     fn rank_and_order_orders_by_priority_then_item_id_with_trace_on_every_item() {
         let candidates = vec![
-            item("z-fyi", Reason::Fyi),            // 15
-            item("a-crit", Reason::Sla),           // 90
-            item("b-direct", Reason::Assigned),    // 70
-            item("a-direct", Reason::Mentioned),   // 70 — ties b-direct on priority; item_id breaks
+            item("z-fyi", Reason::Fyi),          // 15
+            item("a-crit", Reason::Sla),         // 90
+            item("b-direct", Reason::Assigned),  // 70
+            item("a-direct", Reason::Mentioned), // 70 — ties b-direct on priority; item_id breaks
         ];
         let ranker = DeterministicV1::default();
         let ordered = rank_and_order(candidates, &viewer(), &ranker);
@@ -589,8 +647,14 @@ mod tests {
         assert_eq!(order, vec!["a-crit", "a-direct", "b-direct", "z-fyi"]);
         // every ranked item carries a deterministic, complete explain-trace (NOTIF-2 / the gate).
         for r in &ordered {
-            assert_eq!(r.priority, r.trace.final_priority, "the trace's final == the rank");
-            assert!(!r.trace.render().is_empty(), "every rank carries a non-empty trace");
+            assert_eq!(
+                r.priority, r.trace.final_priority,
+                "the trace's final == the rank"
+            );
+            assert!(
+                !r.trace.render().is_empty(),
+                "every rank carries a non-empty trace"
+            );
         }
     }
 
@@ -650,6 +714,9 @@ mod tests {
         // all 50 → ordered by item_id ASC (the stable tiebreak), proving the swap took effect.
         let order: Vec<&str> = ordered.iter().map(|r| r.item.item_id.as_str()).collect();
         assert_eq!(order, vec!["a", "b"]);
-        assert!(ordered.iter().all(|r| r.priority == 50), "the swapped strategy is in effect");
+        assert!(
+            ordered.iter().all(|r| r.priority == 50),
+            "the swapped strategy is in effect"
+        );
     }
 }

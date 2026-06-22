@@ -89,7 +89,10 @@ fn cdc_11_6_bus_feeder_projects_off_the_stream_idempotently() {
     let mut feeder = OlapBusFeeder::boot(region());
 
     // Fed off the durable bus event stream — NOT an OLTP scan.
-    assert_eq!(feeder.feed(&envelope("01J-1", "issue:PROJ-1")), OlapApply::Fresh);
+    assert_eq!(
+        feeder.feed(&envelope("01J-1", "issue:PROJ-1")),
+        OlapApply::Fresh
+    );
     // A redelivery of the same event_id is absorbed (effectively-once).
     assert_eq!(
         feeder.feed(&envelope("01J-1", "issue:PROJ-1")),
@@ -103,7 +106,11 @@ fn cdc_11_6_bus_feeder_projects_off_the_stream_idempotently() {
         0,
         "the OLAP read model is fed off the bus stream only — no OLTP-scan backdoor (§3.4)"
     );
-    assert_eq!(feeder.store.doc_count(), 1, "exactly one projected analytics doc");
+    assert_eq!(
+        feeder.store.doc_count(),
+        1,
+        "exactly one projected analytics doc"
+    );
     assert_eq!(
         feeder.store.doc("issue:PROJ-1").unwrap().last_event_id,
         "01J-1"
@@ -123,12 +130,14 @@ fn cdc_11_6_reindex_from_source_is_the_only_rebuild_path() {
 
     // Cold rebuild from the durable source log (the ONLY rebuild path — no OLTP-scan).
     let mut source = SourceLog::new();
-    source
-        .append(1, "issue:A")
-        .append(2, "issue:B");
+    source.append(1, "issue:A").append(2, "issue:B");
     let cold = OlapReadStore::reindex_from_source(region(), &source, 2);
 
-    assert_eq!(cold.doc_count(), live_docs, "cold reindex == live projection (cold == live)");
+    assert_eq!(
+        cold.doc_count(),
+        live_docs,
+        "cold reindex == live projection (cold == live)"
+    );
     assert_eq!(
         cold.oltp_scan_path_count(),
         0,
@@ -159,7 +168,7 @@ fn cdc_11_6_olap_store_is_a_registered_holder() {
 #[test]
 fn cdc_11_6_olap_store_is_fed_by_the_bus_and_reindexes_byte_matching_live() {
     use myelin_events::{
-        EmitContextBase, InProcessBus, OutboxStore, Relay, ReindexSource, SnapshotScope, Timestamp,
+        EmitContextBase, InProcessBus, OutboxStore, ReindexSource, Relay, SnapshotScope, Timestamp,
     };
     use myelin_storage::{reindex_olap_from_bus, OlapAnalyticsSource, OlapBusConsumer};
 
@@ -175,8 +184,16 @@ fn cdc_11_6_olap_store_is_fed_by_the_bus_and_reindexes_byte_matching_live() {
         // The live event carries the same aggregate as the snapshot (the projection key).
         let _ = live.ingest(&env);
     }
-    assert_eq!(live.store().doc_count(), 2, "two facts projected live off the bus");
-    assert_eq!(live.store().oltp_scan_path_count(), 0, "fed off the bus — no OLTP-scan backdoor");
+    assert_eq!(
+        live.store().doc_count(),
+        2,
+        "two facts projected live off the bus"
+    );
+    assert_eq!(
+        live.store().oltp_scan_path_count(),
+        0,
+        "fed off the bus — no OLTP-scan backdoor"
+    );
 
     // COLD: reindex(scope) rebuilds through the REAL outbox→relay→bus→consumer path.
     let outbox_handle = OutboxStore::new();
@@ -200,12 +217,27 @@ fn cdc_11_6_olap_store_is_fed_by_the_bus_and_reindexes_byte_matching_live() {
         recorded_at: Timestamp("2026-06-20T00:00:00Z".into()),
         caused_by: None,
     };
-    let (cold, receipt) =
-        reindex_olap_from_bus(region(), &scope, &sources, &mut outbox, &bus, &relay, ctx, "")
-            .expect("the OLAP reindex-from-bus succeeds");
+    let (cold, receipt) = reindex_olap_from_bus(
+        region(),
+        &scope,
+        &sources,
+        &mut outbox,
+        &bus,
+        &relay,
+        ctx,
+        "",
+    )
+    .expect("the OLAP reindex-from-bus succeeds");
 
-    assert_eq!(receipt.snapshots_emitted, 2, "two snapshots re-emitted (the rebuild)");
-    assert_eq!(cold.store().doc_count(), 2, "the cold rebuild projected both");
+    assert_eq!(
+        receipt.snapshots_emitted, 2,
+        "two snapshots re-emitted (the rebuild)"
+    );
+    assert_eq!(
+        cold.store().doc_count(),
+        2,
+        "the cold rebuild projected both"
+    );
     assert_eq!(
         cold.store().oltp_scan_path_count(),
         0,

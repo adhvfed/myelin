@@ -30,12 +30,12 @@
 //! composed `EffectivePolicy` gates a real plan-then-apply effect); this drill proves the algebra in
 //! isolation at M1.
 
+use myelin_events::OutboxStore;
 use myelin_harness::telemetry::{Predicate, SignalName, SignalSource};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind, RuntimeRef};
 use myelin_identity_service::{
     authority_of, Authority, DelegationInput, IntersectionProof, StoreBackedCheck, TupleStore,
 };
-use myelin_events::OutboxStore;
 use myelin_tenancy::{Region, TenantId};
 
 fn agent(id: &str) -> Principal {
@@ -202,7 +202,10 @@ fn id_d5_adversarial_delegation_zero_escapes_with_intersection_proof() {
     signals
         .assert_signal(SignalName::CrossTenantCount, Predicate::Eq(0))
         .expect_green();
-    assert_eq!(escape_count, 0, "0 effects outside the intersection (the ID-D5 F9 floor)");
+    assert_eq!(
+        escape_count, 0,
+        "0 effects outside the intersection (the ID-D5 F9 floor)"
+    );
 
     // (2) the intersection proof emitted for EACH adversarial case (the recorded green artifact).
     assert_eq!(
@@ -211,7 +214,10 @@ fn id_d5_adversarial_delegation_zero_escapes_with_intersection_proof() {
         "an intersection proof was recorded for every adversarial case"
     );
     for (name, proof) in &proofs {
-        assert!(proof.holds(), "case {name}: the recorded intersection proof holds");
+        assert!(
+            proof.holds(),
+            "case {name}: the recorded intersection proof holds"
+        );
     }
 
     // The dated green artifact (the intersection proof, printed so the gate's evidence is in the CI

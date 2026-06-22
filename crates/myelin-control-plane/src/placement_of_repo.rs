@@ -235,19 +235,27 @@ impl Registry {
         repo: &ArtifactRef,
         group: StorageGroup,
     ) -> Result<(), RepoPlacementError> {
-        let (tenant, _id) =
-            parse_repo_ref(repo).ok_or_else(|| RepoPlacementError::NotARepoRef { repo: repo.clone() })?;
-        let placement = self
-            .placement(&tenant)
-            .ok_or_else(|| RepoPlacementError::TenantNotPlaced { repo: repo.clone(), tenant: tenant.clone() })?;
+        let (tenant, _id) = parse_repo_ref(repo)
+            .ok_or_else(|| RepoPlacementError::NotARepoRef { repo: repo.clone() })?;
+        let placement =
+            self.placement(&tenant)
+                .ok_or_else(|| RepoPlacementError::TenantNotPlaced {
+                    repo: repo.clone(),
+                    tenant: tenant.clone(),
+                })?;
         let home_cell = placement.home_cell.clone();
         let region = placement.region.clone();
         // The residency pin at repo grain: the repo's home cell MUST be in the tenant's region. (On a
         // register this is the tenant's own home cell, which the tenant placement invariant already
         // verified; we re-assert it so register + relocate share one residency check.)
         self.assert_cell_in_region(&home_cell, &region, repo)?;
-        self.repo_placements
-            .insert(repo.0.clone(), RepoPlacementRow { cell_id: home_cell, group });
+        self.repo_placements.insert(
+            repo.0.clone(),
+            RepoPlacementRow {
+                cell_id: home_cell,
+                group,
+            },
+        );
         Ok(())
     }
 
@@ -270,18 +278,26 @@ impl Registry {
         target_cell: CellId,
         target_group: StorageGroup,
     ) -> Result<(), RepoPlacementError> {
-        let (tenant, _id) =
-            parse_repo_ref(repo).ok_or_else(|| RepoPlacementError::NotARepoRef { repo: repo.clone() })?;
-        let placement = self
-            .placement(&tenant)
-            .ok_or_else(|| RepoPlacementError::TenantNotPlaced { repo: repo.clone(), tenant: tenant.clone() })?;
+        let (tenant, _id) = parse_repo_ref(repo)
+            .ok_or_else(|| RepoPlacementError::NotARepoRef { repo: repo.clone() })?;
+        let placement =
+            self.placement(&tenant)
+                .ok_or_else(|| RepoPlacementError::TenantNotPlaced {
+                    repo: repo.clone(),
+                    tenant: tenant.clone(),
+                })?;
         let region = placement.region.clone();
         // The residency pin: the relocation TARGET must be in the repo's tenant's region. A cross-region
         // target is refused — a repo cannot leave its region (§5.2). This is a STORED-FACT update; no
         // node hash is consulted or recomputed.
         self.assert_cell_in_region(&target_cell, &region, repo)?;
-        self.repo_placements
-            .insert(repo.0.clone(), RepoPlacementRow { cell_id: target_cell, group: target_group });
+        self.repo_placements.insert(
+            repo.0.clone(),
+            RepoPlacementRow {
+                cell_id: target_cell,
+                group: target_group,
+            },
+        );
         Ok(())
     }
 
@@ -326,16 +342,16 @@ impl Registry {
                     .unwrap_or_else(|| TenantId::from_token(repo.0.clone())),
                 cell: cell_id.clone(),
             })),
-            Some(cell) if &cell.region != region => {
-                Err(RepoPlacementError::Invariant(PlacementError::CrossRegionMemberCell {
+            Some(cell) if &cell.region != region => Err(RepoPlacementError::Invariant(
+                PlacementError::CrossRegionMemberCell {
                     tenant: parse_repo_ref(repo)
                         .map(|(t, _)| t)
                         .unwrap_or_else(|| TenantId::from_token(repo.0.clone())),
                     tenant_region: region.clone(),
                     cell: cell_id.clone(),
                     cell_region: cell.region.clone(),
-                }))
-            }
+                },
+            )),
             Some(_) => Ok(()),
         }
     }
@@ -398,7 +414,9 @@ impl CellGateway {
     /// The repo's tenant (opaque id) for a PII-free reject/audit record — falls back to the whole ref
     /// string only if the ref is unparseable (still opaque, still PII-free; a repo ref carries no PII).
     fn repo_tenant_or_placeholder(&self, repo: &ArtifactRef) -> TenantId {
-        parse_repo_ref(repo).map(|(t, _)| t).unwrap_or_else(|| TenantId::from_token(repo.0.clone()))
+        parse_repo_ref(repo)
+            .map(|(t, _)| t)
+            .unwrap_or_else(|| TenantId::from_token(repo.0.clone()))
     }
 
     /// Record a repo-grain misroute (loud, never swallowed) + bump `misroute_count`. Shares the SAME
@@ -422,7 +440,9 @@ impl CellGateway {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{Capacity, Cell, CellStatus, IsolationKind, PlacementStatus, TenantPlacement};
+    use crate::schema::{
+        Capacity, Cell, CellStatus, IsolationKind, PlacementStatus, TenantPlacement,
+    };
 
     fn cell(id: &str, region: &str) -> Cell {
         Cell {
@@ -430,7 +450,11 @@ mod tests {
             region: Region::new(region),
             status: CellStatus::Active,
             isolation_kind: IsolationKind::Pool,
-            capacity: Capacity { tenants_max: 1000, write_qps_max: 5000, storage_bytes_max: 1 << 40 },
+            capacity: Capacity {
+                tenants_max: 1000,
+                write_qps_max: 5000,
+                storage_bytes_max: 1 << 40,
+            },
             utilisation: 10,
             version: 1,
             endpoint: format!("cell.{region}.{id}.myelin.eu"),
@@ -474,9 +498,17 @@ mod tests {
         let answer = reg
             .placement_of_repo(&repo("01J0ACME", "web"))
             .expect("a registered repo resolves to a placement_of_repo answer");
-        assert_eq!(answer.cell_id.as_str(), "cell-w-1", "cell_id defaults to the tenant home cell");
+        assert_eq!(
+            answer.cell_id.as_str(),
+            "cell-w-1",
+            "cell_id defaults to the tenant home cell"
+        );
         assert_eq!(answer.group.as_str(), "pack-0");
-        assert_eq!(answer.region.as_str(), "eu-west", "region is the TENANT's region (the pin)");
+        assert_eq!(
+            answer.region.as_str(),
+            "eu-west",
+            "region is the TENANT's region (the pin)"
+        );
         assert_eq!(answer.status, PlacementStatus::Active);
     }
 
@@ -491,8 +523,12 @@ mod tests {
     #[test]
     fn placement_of_repo_malformed_ref_is_none() {
         let reg = registry_with_repo();
-        assert!(reg.placement_of_repo(&ArtifactRef("myelin://01J0ACME/git/blob/web".into())).is_none());
-        assert!(reg.placement_of_repo(&ArtifactRef("not-a-ref".into())).is_none());
+        assert!(reg
+            .placement_of_repo(&ArtifactRef("myelin://01J0ACME/git/blob/web".into()))
+            .is_none());
+        assert!(reg
+            .placement_of_repo(&ArtifactRef("not-a-ref".into()))
+            .is_none());
     }
 
     /// **`register_repo` REJECTS a ref with an EMPTY tenant or EMPTY repo-id segment** (each guard in
@@ -530,9 +566,15 @@ mod tests {
         let mut reg = Registry::new();
         reg.insert_cell(cell("cell-w-1", "eu-west"));
         let e = reg
-            .register_repo(&repo("01J0GHOST", "web"), StorageGroup::from_token("pack-0"))
+            .register_repo(
+                &repo("01J0GHOST", "web"),
+                StorageGroup::from_token("pack-0"),
+            )
             .expect_err("a repo for an unplaced tenant is refused");
-        assert!(matches!(e, RepoPlacementError::TenantNotPlaced { .. }), "{e}");
+        assert!(
+            matches!(e, RepoPlacementError::TenantNotPlaced { .. }),
+            "{e}"
+        );
     }
 
     /// **A non-repo ref is refused** (`NotARepoRef`).
@@ -540,7 +582,10 @@ mod tests {
     fn register_repo_non_repo_ref_is_refused() {
         let mut reg = registry_with_repo();
         let e = reg
-            .register_repo(&ArtifactRef("myelin://01J0ACME/git/blob/web".into()), StorageGroup::from_token("g"))
+            .register_repo(
+                &ArtifactRef("myelin://01J0ACME/git/blob/web".into()),
+                StorageGroup::from_token("g"),
+            )
             .expect_err("a non-repo ref is refused");
         assert!(matches!(e, RepoPlacementError::NotARepoRef { .. }), "{e}");
     }
@@ -558,17 +603,38 @@ mod tests {
         assert_eq!(before.cell_id.as_str(), "cell-w-1");
 
         // Relocate the repo to cell-w-2 (same region) — a stored-fact update.
-        reg.relocate_repo(&r, CellId::from_token("cell-w-2"), StorageGroup::from_token("pack-7"))
-            .expect("a same-region relocation is admitted");
+        reg.relocate_repo(
+            &r,
+            CellId::from_token("cell-w-2"),
+            StorageGroup::from_token("pack-7"),
+        )
+        .expect("a same-region relocation is admitted");
 
-        let after = reg.placement_of_repo(&r).expect("still placed after relocation");
-        assert_eq!(after.cell_id.as_str(), "cell-w-2", "only the stored cell_id flipped");
-        assert_eq!(after.group.as_str(), "pack-7", "the group moved to the target cell's group");
-        assert_eq!(after.region.as_str(), "eu-west", "region UNCHANGED — same-region move (the pin)");
+        let after = reg
+            .placement_of_repo(&r)
+            .expect("still placed after relocation");
+        assert_eq!(
+            after.cell_id.as_str(),
+            "cell-w-2",
+            "only the stored cell_id flipped"
+        );
+        assert_eq!(
+            after.group.as_str(),
+            "pack-7",
+            "the group moved to the target cell's group"
+        );
+        assert_eq!(
+            after.region.as_str(),
+            "eu-west",
+            "region UNCHANGED — same-region move (the pin)"
+        );
         // The repo's IDENTITY (its ArtifactRef / clone URL) is byte-identical — the cell is NOT a node
         // pin: the URL did not change, only the discovered cell.
         let r_after = repo("01J0ACME", "web");
-        assert_eq!(r, r_after, "the repo's clone URL identity is unchanged by relocation");
+        assert_eq!(
+            r, r_after,
+            "the repo's clone URL identity is unchanged by relocation"
+        );
     }
 
     /// **THE REPO RESIDENCY PIN: relocating a repo to a CROSS-REGION cell is REJECTED.** A repo can only
@@ -579,15 +645,28 @@ mod tests {
         let r = repo("01J0ACME", "web");
         // cell-n-1 is in eu-north; ACME is pinned to eu-west.
         let e = reg
-            .relocate_repo(&r, CellId::from_token("cell-n-1"), StorageGroup::from_token("g"))
-            .expect_err("a cross-region relocation target is rejected (the residency pin at repo grain)");
+            .relocate_repo(
+                &r,
+                CellId::from_token("cell-n-1"),
+                StorageGroup::from_token("g"),
+            )
+            .expect_err(
+                "a cross-region relocation target is rejected (the residency pin at repo grain)",
+            );
         assert!(
-            matches!(e, RepoPlacementError::Invariant(PlacementError::CrossRegionMemberCell { .. })),
+            matches!(
+                e,
+                RepoPlacementError::Invariant(PlacementError::CrossRegionMemberCell { .. })
+            ),
             "{e}"
         );
         // The repo did NOT move — it is still on cell-w-1, still in eu-west.
         let still = reg.placement_of_repo(&r).expect("still placed");
-        assert_eq!(still.cell_id.as_str(), "cell-w-1", "the rejected relocation did not move the repo");
+        assert_eq!(
+            still.cell_id.as_str(),
+            "cell-w-1",
+            "the rejected relocation did not move the repo"
+        );
         assert_eq!(still.region.as_str(), "eu-west");
     }
 
@@ -596,9 +675,19 @@ mod tests {
     fn relocate_repo_unknown_cell_is_rejected() {
         let mut reg = registry_with_repo();
         let e = reg
-            .relocate_repo(&repo("01J0ACME", "web"), CellId::from_token("cell-ghost"), StorageGroup::from_token("g"))
+            .relocate_repo(
+                &repo("01J0ACME", "web"),
+                CellId::from_token("cell-ghost"),
+                StorageGroup::from_token("g"),
+            )
             .expect_err("an unknown target cell is refused");
-        assert!(matches!(e, RepoPlacementError::Invariant(PlacementError::UnknownCell { .. })), "{e}");
+        assert!(
+            matches!(
+                e,
+                RepoPlacementError::Invariant(PlacementError::UnknownCell { .. })
+            ),
+            "{e}"
+        );
     }
 
     // ----- the repo-grain gateway misroute redirect (GIT residency leg, CP-D2/CP-D3) -----
@@ -626,8 +715,12 @@ mod tests {
         let mut reg = registry_with_repo();
         let r = repo("01J0ACME", "web");
         // The repo is relocated cell-w-1 -> cell-w-2 (same region).
-        reg.relocate_repo(&r, CellId::from_token("cell-w-2"), StorageGroup::from_token("pack-7"))
-            .expect("same-region relocation");
+        reg.relocate_repo(
+            &r,
+            CellId::from_token("cell-w-2"),
+            StorageGroup::from_token("pack-7"),
+        )
+        .expect("same-region relocation");
 
         // A git-wire clone still pointing at cell-w-1 (the OLD cell) is a misroute.
         let old = CellGateway::new(CellId::from_token("cell-w-1"));
@@ -655,15 +748,31 @@ mod tests {
                 home_cell: Some(CellId::from_token("cell-w-2")),
             }
         );
-        assert_eq!(old.misroute_count(), 1, "misroute_count increments on a repo-grain misroute");
-        assert_eq!(old.cross_tenant_reads(), 0, "0 cross-tenant/cross-cell rows read (the GIT zero)");
+        assert_eq!(
+            old.misroute_count(),
+            1,
+            "misroute_count increments on a repo-grain misroute"
+        );
+        assert_eq!(
+            old.cross_tenant_reads(),
+            0,
+            "0 cross-tenant/cross-cell rows read (the GIT zero)"
+        );
 
         // The redirect is then SERVED by the CURRENT cell (a redirect, never a proxy).
-        let GatewayReject::Misroute(redirect) = reject else { panic!("expected a misroute") };
+        let GatewayReject::Misroute(redirect) = reject else {
+            panic!("expected a misroute")
+        };
         let current = CellGateway::new(redirect.correct_cell.clone());
-        let served = current.route_repo(&reg, &r).expect("the current cell serves the redirected clone");
+        let served = current
+            .route_repo(&reg, &r)
+            .expect("the current cell serves the redirected clone");
         assert_eq!(served.cell_id, redirect.correct_cell);
-        assert_eq!(current.misroute_count(), 0, "the current cell does not misroute its own repo");
+        assert_eq!(
+            current.misroute_count(),
+            0,
+            "the current cell does not misroute its own repo"
+        );
         assert_eq!(current.cross_tenant_reads(), 0);
     }
 
@@ -684,7 +793,8 @@ mod tests {
             member_cells: vec![CellId::from_token("cell-w-2")],
         })
         .expect("placed");
-        reg.register_repo(&repo("01J0BETA", "api"), StorageGroup::from_token("pack-0")).expect("repo");
+        reg.register_repo(&repo("01J0BETA", "api"), StorageGroup::from_token("pack-0"))
+            .expect("repo");
 
         // cell-w-2 (BETA's home) receives a request for ACME's repo (homed on cell-w-1) — a misroute.
         let gw = CellGateway::new(CellId::from_token("cell-w-2"));
@@ -692,7 +802,11 @@ mod tests {
             .route_repo(&reg, &repo("01J0ACME", "web"))
             .expect_err("cell-w-2 does not home ACME's repo → rejected, never served");
         assert!(matches!(reject, GatewayReject::Misroute(_)));
-        assert_eq!(gw.cross_tenant_reads(), 0, "0 cross-tenant repo content read (the GIT residency zero)");
+        assert_eq!(
+            gw.cross_tenant_reads(),
+            0,
+            "0 cross-tenant repo content read (the GIT residency zero)"
+        );
         assert_eq!(gw.misroute_count(), 1);
     }
 
@@ -704,9 +818,22 @@ mod tests {
         let reject = gw
             .route_repo(&reg, &repo("01J0ACME", "ghost"))
             .expect_err("an unregistered repo is rejected (no route)");
-        assert_eq!(reject, GatewayReject::NoSuchTenant { tenant_id: TenantId::from_token("01J0ACME") });
-        assert_eq!(gw.audit().count(), 1, "the unregistered-repo rejection is audited");
-        assert_eq!(gw.audit().records()[0].home_cell, None, "no redirect target for a stale clone URL");
+        assert_eq!(
+            reject,
+            GatewayReject::NoSuchTenant {
+                tenant_id: TenantId::from_token("01J0ACME")
+            }
+        );
+        assert_eq!(
+            gw.audit().count(),
+            1,
+            "the unregistered-repo rejection is audited"
+        );
+        assert_eq!(
+            gw.audit().records()[0].home_cell,
+            None,
+            "no redirect target for a stale clone URL"
+        );
         assert_eq!(gw.misroute_count(), 1);
         assert_eq!(gw.cross_tenant_reads(), 0);
     }

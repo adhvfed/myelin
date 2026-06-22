@@ -30,7 +30,7 @@ use myelin_tenancy::{CellId, Region, TenantId};
 
 use myelin_refs_service::{
     bounded_stale, NoOpCacheRead, OwnerProjection, ProjectApi, ProjectApiError, ProjectOutcome,
-    ResolveMode, ResolveService, Resolution, TombstoneReason,
+    Resolution, ResolveMode, ResolveService, TombstoneReason,
 };
 
 fn tenant() -> TenantId {
@@ -139,10 +139,19 @@ fn cdc_5_2_allowed_viewer_resolves_to_a_projection() {
     let ref_ = ArtifactRef("myelin://acme/issue/issue/ENG-secret".into());
     let root = ref_.clone();
     let r = svc.resolve(
-        &tenant(), &region(), &ref_, &root,
-        &viewer("insider"), ResolveMode::Live, &bounded_stale(), false,
+        &tenant(),
+        &region(),
+        &ref_,
+        &root,
+        &viewer("insider"),
+        ResolveMode::Live,
+        &bounded_stale(),
+        false,
     );
-    assert!(r.is_projection(), "PROVIDER: an allowed viewer resolves to a Projection");
+    assert!(
+        r.is_projection(),
+        "PROVIDER: an allowed viewer resolves to a Projection"
+    );
     // the CONSUMER renders the projection fields (the contract shape it depends on).
     let rendered = render_unfurl(&r);
     assert_eq!(rendered, "[lock] TOP SECRET acquisition plan (open)");
@@ -158,10 +167,19 @@ fn cdc_5_2_denied_viewer_resolves_to_a_tombstone_with_zero_content() {
     let ref_ = ArtifactRef("myelin://acme/issue/issue/ENG-secret".into());
     let root = ref_.clone();
     let r = svc.resolve(
-        &tenant(), &region(), &ref_, &root,
-        &viewer("intruder"), ResolveMode::Live, &bounded_stale(), false,
+        &tenant(),
+        &region(),
+        &ref_,
+        &root,
+        &viewer("intruder"),
+        ResolveMode::Live,
+        &bounded_stale(),
+        false,
     );
-    assert!(r.is_tombstone(), "PROVIDER: a denied viewer resolves to a Tombstone");
+    assert!(
+        r.is_tombstone(),
+        "PROVIDER: a denied viewer resolves to a Tombstone"
+    );
     assert_eq!(r.tombstone_reason(), Some(TombstoneReason::Denied));
     // the CONSUMER's rendered output (everything it can possibly show) carries NO secret content.
     let rendered = render_unfurl(&r);
@@ -170,7 +188,10 @@ fn cdc_5_2_denied_viewer_resolves_to_a_tombstone_with_zero_content() {
         "CONSUMER LEAK INVARIANT: the denied unfurl must not contain the secret title, got `{rendered}`"
     );
     // it DOES carry the opaque root so the embed degrades gracefully (§4.6 — "tombstone carries root").
-    assert!(rendered.contains("myelin://acme/issue/issue/ENG-secret"), "the tombstone carries the root");
+    assert!(
+        rendered.contains("myelin://acme/issue/issue/ENG-secret"),
+        "the tombstone carries the root"
+    );
 }
 
 /// **CDC 5.2 (provider/§4.6 ladder arms):** each non-LIVE owner outcome maps onto the contracted
@@ -187,10 +208,20 @@ fn cdc_5_2_sub_ladder_reasons_are_contracted() {
         let ref_ = ArtifactRef("myelin://acme/knowledge/page/7c2#b9".into());
         let root = ArtifactRef("myelin://acme/knowledge/page/7c2".into());
         let r = svc.resolve(
-            &tenant(), &region(), &ref_, &root,
-            &viewer("insider"), ResolveMode::Live, &bounded_stale(), false,
+            &tenant(),
+            &region(),
+            &ref_,
+            &root,
+            &viewer("insider"),
+            ResolveMode::Live,
+            &bounded_stale(),
+            false,
         );
-        assert_eq!(r.tombstone_reason(), Some(want), "PROVIDER: outcome {outcome:?} → {want:?}");
+        assert_eq!(
+            r.tombstone_reason(),
+            Some(want),
+            "PROVIDER: outcome {outcome:?} → {want:?}"
+        );
         // the consumer can render every tombstone reason without a content leak.
         let rendered = render_unfurl(&r);
         assert!(rendered.starts_with("referenced myelin://acme/knowledge/page/7c2"));
@@ -210,8 +241,14 @@ fn cdc_5_2_consumer_trusts_the_chokepoint_total_match() {
     let root = ref_.clone();
     for who in ["insider", "intruder"] {
         let r = svc.resolve(
-            &tenant(), &region(), &ref_, &root,
-            &viewer(who), ResolveMode::Live, &bounded_stale(), false,
+            &tenant(),
+            &region(),
+            &ref_,
+            &root,
+            &viewer(who),
+            ResolveMode::Live,
+            &bounded_stale(),
+            false,
         );
         // a total match — the consumer handles the full 5.2 response surface.
         let _rendered: String = match r {

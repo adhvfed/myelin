@@ -181,8 +181,14 @@ fn cdc_4_9_consumer_declares_a_fragment_and_gates_on_it() {
             Ok(Decision::Allow)
         )
     };
-    assert!(ship(&subject("p:alice")), "reader ∩ approver ships (alice is both)");
-    assert!(!ship(&subject("p:bob")), "a reader-only does not ship (the intersect denies)");
+    assert!(
+        ship(&subject("p:alice")),
+        "reader ∩ approver ships (alice is both)"
+    );
+    assert!(
+        !ship(&subject("p:bob")),
+        "a reader-only does not ship (the intersect denies)"
+    );
 }
 
 /// **The 4.9 ABI carrier round-trips: `admit_fragment` (names-only) admits a declared-relation
@@ -239,7 +245,13 @@ fn cdc_4_9_core_hierarchy_inheritance_resolves() {
     );
     // bob (no membership) → Deny.
     assert_eq!(
-        svc.check(&subject("p:bob"), &Permission("view".into()), &obj, &at_latest(), None),
+        svc.check(
+            &subject("p:bob"),
+            &Permission("view".into()),
+            &obj,
+            &at_latest(),
+            None
+        ),
         Ok(Decision::Deny),
         "a non-member does not inherit project view (fail-closed)"
     );

@@ -507,18 +507,26 @@ mod tests {
         // production image — it must be re-drilled.
         let att = green_attestation();
         let mut id = prod_id();
-        id.rootfs_sha256 = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef0".into();
+        id.rootfs_sha256 =
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef0".into();
         let r = AgentExecGate::admit(Some(&att), &id);
-        assert!(matches!(r.unwrap_err(), GateRefusal::IdentityMismatch { .. }));
+        assert!(matches!(
+            r.unwrap_err(),
+            GateRefusal::IdentityMismatch { .. }
+        ));
     }
 
     #[test]
     fn a_different_kernel_digest_must_be_redrilled() {
         let att = green_attestation();
         let mut id = prod_id();
-        id.kernel_sha256 = "cafef00dcafef00dcafef00dcafef00dcafef00dcafef00dcafef00dcafef00d0".into();
+        id.kernel_sha256 =
+            "cafef00dcafef00dcafef00dcafef00dcafef00dcafef00dcafef00dcafef00d0".into();
         let r = AgentExecGate::admit(Some(&att), &id);
-        assert!(matches!(r.unwrap_err(), GateRefusal::IdentityMismatch { .. }));
+        assert!(matches!(
+            r.unwrap_err(),
+            GateRefusal::IdentityMismatch { .. }
+        ));
     }
 
     #[test]
@@ -527,7 +535,10 @@ mod tests {
         let mut id = prod_id();
         id.corpus_version = CORPUS_VERSION + 1;
         let r = AgentExecGate::admit(Some(&att), &id);
-        assert!(matches!(r.unwrap_err(), GateRefusal::IdentityMismatch { .. }));
+        assert!(matches!(
+            r.unwrap_err(),
+            GateRefusal::IdentityMismatch { .. }
+        ));
     }
 
     #[test]

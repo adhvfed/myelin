@@ -114,7 +114,10 @@ pub struct SnapshotScope {
 impl SnapshotScope {
     /// Build a scope for `owner` + `selector`. Both are PII-free opaque tokens.
     pub fn new(owner: impl Into<String>, selector: impl Into<String>) -> SnapshotScope {
-        SnapshotScope { owner: owner.into(), selector: selector.into() }
+        SnapshotScope {
+            owner: owner.into(),
+            selector: selector.into(),
+        }
     }
 
     /// The wire form `<owner>:<selector>` (the telemetry key; PII-free).
@@ -204,7 +207,9 @@ struct PresetMinter {
 
 impl PresetMinter {
     fn new(ids: impl IntoIterator<Item = Ulid>) -> PresetMinter {
-        PresetMinter { ids: std::sync::Mutex::new(ids.into_iter().collect()) }
+        PresetMinter {
+            ids: std::sync::Mutex::new(ids.into_iter().collect()),
+        }
     }
 }
 
@@ -431,7 +436,10 @@ impl ReferenceReindexSource {
 
     /// The `*.snapshot` event type for this owner (`<owner>.<artifact>.snapshot`).
     pub fn snapshot_type(&self) -> EventType {
-        EventType(format!("{}.{}.{}", self.owner, self.artifact, SNAPSHOT_EVENT_NAME))
+        EventType(format!(
+            "{}.{}.{}",
+            self.owner, self.artifact, SNAPSHOT_EVENT_NAME
+        ))
     }
 }
 
@@ -491,10 +499,25 @@ mod tests {
     fn snapshot_event_id_is_deterministic_from_aggregate_and_version() {
         let a = AggregateKey("ci.run:42".into());
         let b = AggregateKey("ci.run:43".into());
-        assert_eq!(snapshot_event_id(&a, 1), snapshot_event_id(&a, 1), "same inputs → same id");
-        assert_ne!(snapshot_event_id(&a, 1), snapshot_event_id(&a, 2), "version bumps the id");
-        assert_ne!(snapshot_event_id(&a, 1), snapshot_event_id(&b, 1), "aggregate bumps the id");
-        assert!(snapshot_event_id(&a, 1).0.starts_with("snap-"), "snapshot ids are prefixed");
+        assert_eq!(
+            snapshot_event_id(&a, 1),
+            snapshot_event_id(&a, 1),
+            "same inputs → same id"
+        );
+        assert_ne!(
+            snapshot_event_id(&a, 1),
+            snapshot_event_id(&a, 2),
+            "version bumps the id"
+        );
+        assert_ne!(
+            snapshot_event_id(&a, 1),
+            snapshot_event_id(&b, 1),
+            "aggregate bumps the id"
+        );
+        assert!(
+            snapshot_event_id(&a, 1).0.starts_with("snap-"),
+            "snapshot ids are prefixed"
+        );
     }
 
     /// **Unit: `*.snapshot` idempotency on the deterministic id — a replayed snapshot produces ONE
@@ -519,7 +542,11 @@ mod tests {
         let r2 = reindex(&scope, None, sources, &mut outbox, ctx_base()).expect("second reindex");
         assert_eq!(r2.snapshots_emitted, 0, "a re-run emits 0 NEW (idempotent)");
         assert_eq!(r2.snapshots_skipped_duplicate, 2);
-        assert_eq!(outbox.committed_count(), 2, "still only 2 rows — no duplicate effect");
+        assert_eq!(
+            outbox.committed_count(),
+            2,
+            "still only 2 rows — no duplicate effect"
+        );
     }
 
     /// The snapshots land at their DETERMINISTIC ids in the outbox (not fresh ULIDs) — so a relay's
@@ -527,7 +554,11 @@ mod tests {
     #[test]
     fn emitted_snapshots_carry_the_deterministic_event_id() {
         let mut source = ReferenceReindexSource::new("knowledge", "page");
-        source.upsert("knowledge.page:home", 3, serde_json::json!({ "title_ref": "r1" }));
+        source.upsert(
+            "knowledge.page:home",
+            3,
+            serde_json::json!({ "title_ref": "r1" }),
+        );
         let sources: &[&dyn ReindexSource] = &[&source];
         let scope = SnapshotScope::new("knowledge", "page:home");
 
@@ -535,9 +566,14 @@ mod tests {
         reindex(&scope, None, sources, &mut outbox, ctx_base()).expect("reindex");
 
         let expected = snapshot_event_id(&AggregateKey("knowledge.page:home".into()), 3);
-        let row = outbox.row(&expected).expect("snapshot lands at its deterministic id");
+        let row = outbox
+            .row(&expected)
+            .expect("snapshot lands at its deterministic id");
         assert_eq!(row.envelope.type_.0, "knowledge.page.snapshot");
-        assert_eq!(row.envelope.depth, 0, "a snapshot is a ROOT re-emit (depth resets)");
+        assert_eq!(
+            row.envelope.depth, 0,
+            "a snapshot is a ROOT re-emit (depth resets)"
+        );
     }
 
     /// **Unit: the reference consumer rebuilds BYTE-IDENTICALLY from a `*.snapshot` replay (cold ==
@@ -573,7 +609,11 @@ mod tests {
 
         assert_eq!(live.len(), 3);
         assert_eq!(cold.len(), 3);
-        assert_eq!(cold.parity_bytes(), live.parity_bytes(), "cold == live (byte-identical)");
+        assert_eq!(
+            cold.parity_bytes(),
+            live.parity_bytes(),
+            "cold == live (byte-identical)"
+        );
     }
 
     /// A reindex of an UNKNOWN owner is a LOUD error (never a silent empty rebuild that would mask a
@@ -600,7 +640,10 @@ mod tests {
 
         let mut outbox = OutboxStore::new();
         let r = reindex(&scope, Some(3), sources, &mut outbox, ctx_base()).expect("incremental");
-        assert_eq!(r.snapshots_emitted, 1, "only the version-5 aggregate replays past since=3");
+        assert_eq!(
+            r.snapshots_emitted, 1,
+            "only the version-5 aggregate replays past since=3"
+        );
     }
 
     /// The derived store ingests idempotently on `event_id` (a redelivered snapshot is a no-op) AND
@@ -619,7 +662,10 @@ mod tests {
         };
         let env_v2 = snapshot_envelope(&draft_v2);
         assert!(store.ingest(&env_v2), "first ingest applies");
-        assert!(!store.ingest(&env_v2), "redelivery is a no-op (idempotent on event_id)");
+        assert!(
+            !store.ingest(&env_v2),
+            "redelivery is a no-op (idempotent on event_id)"
+        );
 
         // An OLDER-version snapshot of the same aggregate (distinct id) does NOT clobber the newer.
         let draft_v1 = SnapshotDraft {
@@ -628,7 +674,10 @@ mod tests {
             ..draft_v2.clone()
         };
         let env_v1 = snapshot_envelope(&draft_v1);
-        assert!(!store.ingest(&env_v1), "an older-version snapshot is LWW-rejected (no resurrection)");
+        assert!(
+            !store.ingest(&env_v1),
+            "an older-version snapshot is LWW-rejected (no resurrection)"
+        );
         let bytes = store.parity_bytes();
         assert!(
             String::from_utf8_lossy(&bytes).contains("new"),

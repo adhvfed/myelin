@@ -363,8 +363,8 @@ pub fn run_batch_hitl_loop<W: BatchHitlWait>(
             WaitDecision::Approve => {
                 gate.approve().expect("a freshly-opened gate is Waiting");
                 approved.admit(&gate); // thread the tool into `approved` (idempotent).
-                // record the apply under the per-effect key — EXACTLY ONCE (a double-click re-sends
-                // the same key → `record` returns false → no second apply; AG-D5 exactly-once).
+                                       // record the apply under the per-effect key — EXACTLY ONCE (a double-click re-sends
+                                       // the same key → `record` returns false → no second apply; AG-D5 exactly-once).
                 ledger.record(&idem_key);
                 EffectOutcome::Applied {
                     idem_key,
@@ -372,7 +372,9 @@ pub fn run_batch_hitl_loop<W: BatchHitlWait>(
                 }
             }
             WaitDecision::Reject(reason) => {
-                let halted = gate.reject(reason).expect("a freshly-opened gate is Waiting");
+                let halted = gate
+                    .reject(reason)
+                    .expect("a freshly-opened gate is Waiting");
                 // the declined effect is WITHHELD — never admitted, never recorded (0 mutation, AG-8).
                 EffectOutcome::Withheld { idem_key, halted }
             }
@@ -444,7 +446,11 @@ mod tests {
             input_json: format!(r#"{{"pr":{pr}}}"#),
             field: None,
             transition: None,
-            cost: EffectCost { unit: "git.merge", wholesale: 30, markup: 20 },
+            cost: EffectCost {
+                unit: "git.merge",
+                wholesale: 30,
+                markup: 20,
+            },
         }
     }
 
@@ -464,7 +470,10 @@ mod tests {
     }
 
     fn approvers() -> Vec<PrincipalId> {
-        vec![PrincipalId("psn:lead".into()), PrincipalId("psn:maintainer".into())]
+        vec![
+            PrincipalId("psn:lead".into()),
+            PrincipalId("psn:maintainer".into()),
+        ]
     }
 
     /// A three-effect batch card ("approve these 3 proposed merges").
@@ -513,7 +522,11 @@ mod tests {
         assert_eq!(multi.idem_key_for(1), "card-7:1");
         assert_eq!(multi.idem_key_for(2), "card-7:2");
         let single = single_effect_card();
-        assert_eq!(single.idem_key_for(0), "card-1", "single-effect card keys on the bare card id");
+        assert_eq!(
+            single.idem_key_for(0),
+            "card-1",
+            "single-effect card keys on the bare card id"
+        );
     }
 
     // ───────── the exactly-once apply ledger (AG-D5 exactly-once leg) ─────────
@@ -526,10 +539,20 @@ mod tests {
         assert_eq!(ledger.applies(), 0);
         assert!(ledger.record("card-7:0"), "first apply of a key proceeds");
         assert!(ledger.record("card-7:2"), "a distinct key applies");
-        assert!(!ledger.record("card-7:0"), "a RE-apply of the same key is a no-op (double-click)");
-        assert_eq!(ledger.applies(), 2, "exactly two distinct applies (the double-click did not count)");
+        assert!(
+            !ledger.record("card-7:0"),
+            "a RE-apply of the same key is a no-op (double-click)"
+        );
+        assert_eq!(
+            ledger.applies(),
+            2,
+            "exactly two distinct applies (the double-click did not count)"
+        );
         assert!(ledger.contains("card-7:0"));
-        assert!(!ledger.contains("card-7:1"), "the declined effect 1 never applied");
+        assert!(
+            !ledger.contains("card-7:1"),
+            "the declined effect 1 never applied"
+        );
     }
 
     // ───────── the batch loop: partial approval (2-of-3, 2 applies, 1 withheld) ─────────
@@ -544,7 +567,10 @@ mod tests {
         let mut script = DecisionScript::new();
         script
             .decide(card.idem_key_for(0), WaitDecision::Approve)
-            .decide(card.idem_key_for(1), WaitDecision::Reject("pr 41 fails checks".into()))
+            .decide(
+                card.idem_key_for(1),
+                WaitDecision::Reject("pr 41 fails checks".into()),
+            )
             .decide(card.idem_key_for(2), WaitDecision::Approve);
 
         let mut approved = ApprovedTools::new();
@@ -552,20 +578,37 @@ mod tests {
         let outcome = run_batch_hitl_loop(&card, &script, &mut approved, &mut ledger);
 
         // effect 0 + 2 applied, effect 1 withheld (the partial approval is well-defined).
-        assert!(matches!(outcome.effects[0], EffectOutcome::Applied { .. }), "effect 0 approved → applied");
+        assert!(
+            matches!(outcome.effects[0], EffectOutcome::Applied { .. }),
+            "effect 0 approved → applied"
+        );
         assert!(
             matches!(&outcome.effects[1], EffectOutcome::Withheld { halted: Halted::Rejected(r), .. } if r == "pr 41 fails checks"),
-            "effect 1 declined → WITHHELD with the reason (0 mutation, AG-8): {:?}", outcome.effects[1]
+            "effect 1 declined → WITHHELD with the reason (0 mutation, AG-8): {:?}",
+            outcome.effects[1]
         );
-        assert!(matches!(outcome.effects[2], EffectOutcome::Applied { .. }), "effect 2 approved → applied");
+        assert!(
+            matches!(outcome.effects[2], EffectOutcome::Applied { .. }),
+            "effect 2 approved → applied"
+        );
 
         // GATE: exactly 2 applies; the apply-counter == the approved-effect count (2); never more.
-        assert_eq!(outcome.ledger.applies(), 2, "exactly 2 applies (effects 0 and 2)");
+        assert_eq!(
+            outcome.ledger.applies(),
+            2,
+            "exactly 2 applies (effects 0 and 2)"
+        );
         assert_eq!(outcome.approved_effect_count(), 2);
-        assert!(outcome.exactly_once(), "the apply-counter == the approved-effect count (AG-D5)");
+        assert!(
+            outcome.exactly_once(),
+            "the apply-counter == the approved-effect count (AG-D5)"
+        );
         // the per-effect keys that applied are exactly card-7:0 and card-7:2 (NOT card-7:1).
         assert!(outcome.ledger.contains("card-7:0"));
-        assert!(!outcome.ledger.contains("card-7:1"), "the declined effect 1 made 0 mutation (AG-8)");
+        assert!(
+            !outcome.ledger.contains("card-7:1"),
+            "the declined effect 1 made 0 mutation (AG-8)"
+        );
         assert!(outcome.ledger.contains("card-7:2"));
     }
 
@@ -587,7 +630,11 @@ mod tests {
         let mut approved = ApprovedTools::new();
         let mut ledger = ApplyLedger::new();
         let first = run_batch_hitl_loop(&card, &script, &mut approved, &mut ledger);
-        assert_eq!(first.ledger.applies(), 3, "the first click applies all three effects");
+        assert_eq!(
+            first.ledger.applies(),
+            3,
+            "the first click applies all three effects"
+        );
 
         // DOUBLE-CLICK: re-send the SAME per-effect keys (the same script) → re-run with the SAME ledger.
         let second = run_batch_hitl_loop(&card, &script, &mut approved, &mut ledger);
@@ -598,7 +645,10 @@ mod tests {
             "a double-click on approve-all adds 0 applies (the per-effect keys dedup the apply)"
         );
         assert_eq!(second.approved_effect_count(), 3);
-        assert!(second.exactly_once(), "exactly 3 applies (1 per effect), NOT 6 — the double-click is one approval");
+        assert!(
+            second.exactly_once(),
+            "exactly 3 applies (1 per effect), NOT 6 — the double-click is one approval"
+        );
     }
 
     /// **A SINGLE-effect card keys on the bare `card_id`; a double-click is one approval (1 apply).**
@@ -614,11 +664,18 @@ mod tests {
         let mut ledger = ApplyLedger::new();
         let first = run_batch_hitl_loop(&card, &script, &mut approved, &mut ledger);
         assert_eq!(first.ledger.applies(), 1);
-        assert!(first.ledger.contains("card-1"), "the single effect keys on the bare card id");
+        assert!(
+            first.ledger.contains("card-1"),
+            "the single effect keys on the bare card id"
+        );
 
         // double-click: re-run → 0 new applies.
         let second = run_batch_hitl_loop(&card, &script, &mut approved, &mut ledger);
-        assert_eq!(second.ledger.applies(), 1, "a single-effect double-click is ONE apply");
+        assert_eq!(
+            second.ledger.applies(),
+            1,
+            "a single-effect double-click is ONE apply"
+        );
         assert!(second.exactly_once());
     }
 
@@ -634,11 +691,24 @@ mod tests {
         let mut approved = ApprovedTools::new();
         let mut ledger = ApplyLedger::new();
         let outcome = run_batch_hitl_loop(&card, &script, &mut approved, &mut ledger);
-        assert_eq!(outcome.ledger.applies(), 0, "0 applies — every effect declined (AG-8)");
+        assert_eq!(
+            outcome.ledger.applies(),
+            0,
+            "0 applies — every effect declined (AG-8)"
+        );
         assert_eq!(outcome.approved_effect_count(), 0);
-        assert!(outcome.exactly_once(), "0 applies == 0 approved effects (trivially exactly-once)");
-        assert!(outcome.effects.iter().all(|o| matches!(o, EffectOutcome::Withheld { .. })));
-        assert!(approved.as_set().is_empty(), "no tool admitted (0 mutation)");
+        assert!(
+            outcome.exactly_once(),
+            "0 applies == 0 approved effects (trivially exactly-once)"
+        );
+        assert!(outcome
+            .effects
+            .iter()
+            .all(|o| matches!(o, EffectOutcome::Withheld { .. })));
+        assert!(
+            approved.as_set().is_empty(),
+            "no tool admitted (0 mutation)"
+        );
     }
 
     /// **An undecided effect defaults to the auto-deny (Expired) → 0 mutation (never a
@@ -652,13 +722,33 @@ mod tests {
         let mut approved = ApprovedTools::new();
         let mut ledger = ApplyLedger::new();
         let outcome = run_batch_hitl_loop(&card, &script, &mut approved, &mut ledger);
-        assert!(matches!(outcome.effects[0], EffectOutcome::Applied { .. }), "effect 0 approved → applied");
         assert!(
-            matches!(&outcome.effects[1], EffectOutcome::Withheld { halted: Halted::Expired, .. }),
-            "effect 1 undecided → auto-deny (Expired), 0 mutation: {:?}", outcome.effects[1]
+            matches!(outcome.effects[0], EffectOutcome::Applied { .. }),
+            "effect 0 approved → applied"
         );
-        assert!(matches!(&outcome.effects[2], EffectOutcome::Withheld { halted: Halted::Expired, .. }));
-        assert_eq!(outcome.ledger.applies(), 1, "exactly 1 apply (only the decided-approve effect 0)");
+        assert!(
+            matches!(
+                &outcome.effects[1],
+                EffectOutcome::Withheld {
+                    halted: Halted::Expired,
+                    ..
+                }
+            ),
+            "effect 1 undecided → auto-deny (Expired), 0 mutation: {:?}",
+            outcome.effects[1]
+        );
+        assert!(matches!(
+            &outcome.effects[2],
+            EffectOutcome::Withheld {
+                halted: Halted::Expired,
+                ..
+            }
+        ));
+        assert_eq!(
+            outcome.ledger.applies(),
+            1,
+            "exactly 1 apply (only the decided-approve effect 0)"
+        );
         assert!(outcome.exactly_once());
     }
 

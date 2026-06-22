@@ -89,13 +89,10 @@ impl Cache for ValkeyCache {
         // self-evicts — it is never an unbounded source of truth.
         let secs = ttl.as_secs().max(1) as i64;
         let _: () = self
-            .block(self.client.set(
-                &k,
-                value.to_vec(),
-                Some(Expiration::EX(secs)),
-                None,
-                false,
-            ))
+            .block(
+                self.client
+                    .set(&k, value.to_vec(), Some(Expiration::EX(secs)), None, false),
+            )
             .map_err(|e| CacheError(format!("valkey SET: {e}")))?;
         Ok(())
     }

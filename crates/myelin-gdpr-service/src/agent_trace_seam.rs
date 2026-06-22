@@ -54,7 +54,7 @@
 
 use myelin_gdpr::{
     DsrError, EraseReceipt, EraseScope, LocateReport, Patch, PersonalDataHolder, PortableBundle,
-    RectifyReceipt, Result as DsrResult, RestrictReceipt, SubjectRef, TenantId,
+    RectifyReceipt, RestrictReceipt, Result as DsrResult, SubjectRef, TenantId,
 };
 use myelin_substrate::Holder;
 
@@ -70,7 +70,8 @@ pub const AGENT_TRACE_HOLDER_ID: &str = "agent_fabric_trace";
 
 /// The M3 prompt that fills the H17 trace holder BODY (the content-addressed trace write + the DSR
 /// fan-out over it). Named here so the floor's follow-on is in writing (VISION §3).
-pub const AGENT_TRACE_IMPL_PROMPT: &str = "P-GA-27 (M3) — the Knowledge instance + the H17 trace holder body";
+pub const AGENT_TRACE_IMPL_PROMPT: &str =
+    "P-GA-27 (M3) — the Knowledge instance + the H17 trace holder body";
 
 /// **The H17 canonical erase phase (§4.1 step 4).** The agent execution trace is a TRAILING derived
 /// copy — a run's reasoning record, crypto-shred-erasable — so it erases in
@@ -198,7 +199,10 @@ mod tests {
     /// guarantee: erasing a person's trace never touches the tamper-evident audit log.
     #[test]
     fn the_agent_trace_seam_is_distinct_from_the_audit_log() {
-        assert!(trace_is_distinct_from_audit(), "H17 trace is distinct from H16 audit");
+        assert!(
+            trace_is_distinct_from_audit(),
+            "H17 trace is distinct from H16 audit"
+        );
         assert_ne!(
             AGENT_TRACE_HOLDER_ID, AUDIT_CARVE_OUT_STORE,
             "the trace store id is not the audit carve-out store id"
@@ -217,8 +221,14 @@ mod tests {
         );
         // The polarity matters: trace = erasable, audit = NOT (the carve-out). Routed through
         // black_box so the check is a real runtime assertion, not a const-folded tautology.
-        assert!(core::hint::black_box(AGENT_TRACE_ERASABLE), "the trace is erasable");
-        assert!(!core::hint::black_box(AUDIT_LOG_ERASABLE), "the audit log is the retain carve-out");
+        assert!(
+            core::hint::black_box(AGENT_TRACE_ERASABLE),
+            "the trace is erasable"
+        );
+        assert!(
+            !core::hint::black_box(AUDIT_LOG_ERASABLE),
+            "the audit log is the retain carve-out"
+        );
     }
 
     /// **Each distinctness conjunct is load-bearing (mutation-core).** The pure predicate returns
@@ -228,15 +238,25 @@ mod tests {
     #[test]
     fn each_distinctness_conjunct_is_load_bearing() {
         // The honest case holds.
-        assert!(distinctness_holds("trace", "audit", "H17", "H16", true, false));
+        assert!(distinctness_holds(
+            "trace", "audit", "H17", "H16", true, false
+        ));
         // Falsify conjunct 1 (same id) → not distinct.
-        assert!(!distinctness_holds("same", "same", "H17", "H16", true, false));
+        assert!(!distinctness_holds(
+            "same", "same", "H17", "H16", true, false
+        ));
         // Falsify conjunct 2 (same H-number) → not distinct.
-        assert!(!distinctness_holds("trace", "audit", "H16", "H16", true, false));
+        assert!(!distinctness_holds(
+            "trace", "audit", "H16", "H16", true, false
+        ));
         // Falsify conjunct 3a (trace not erasable) → not distinct.
-        assert!(!distinctness_holds("trace", "audit", "H17", "H16", false, false));
+        assert!(!distinctness_holds(
+            "trace", "audit", "H17", "H16", false, false
+        ));
         // Falsify conjunct 3b (audit erasable) → not distinct.
-        assert!(!distinctness_holds("trace", "audit", "H17", "H16", true, true));
+        assert!(!distinctness_holds(
+            "trace", "audit", "H17", "H16", true, true
+        ));
     }
 
     /// The trace HOLDER ID is the SAME name the agent subsystem registers its trace store under (ONE
@@ -251,7 +271,10 @@ mod tests {
     /// the per-subject DEK are destroyed.
     #[test]
     fn the_agent_trace_phase_is_a_trailing_derived_copy() {
-        assert_eq!(agent_trace_phase(), CanonicalErasePhase::CachesAndDerivedCopies);
+        assert_eq!(
+            agent_trace_phase(),
+            CanonicalErasePhase::CachesAndDerivedCopies
+        );
         // It is AFTER the identity pseudonym-map (phase 0) and the per-subject DEK shred (phase 1).
         assert!(agent_trace_phase() > CanonicalErasePhase::IdentityPseudonymMap);
         assert!(agent_trace_phase() > CanonicalErasePhase::CryptoShredDek);
@@ -274,9 +297,16 @@ mod tests {
 
         // erase returns a LOUD error naming P-GA-27 (never a silent success receipt).
         let err = seam
-            .erase(EraseScope::Subject { subject: subject.clone(), tenant: tenant.clone() })
+            .erase(EraseScope::Subject {
+                subject: subject.clone(),
+                tenant: tenant.clone(),
+            })
             .expect_err("the H17 erase body is the M3 floor — loud, not a silent green");
-        assert!(err.0.contains("P-GA-27"), "the floor names its filling prompt: {}", err.0);
+        assert!(
+            err.0.contains("P-GA-27"),
+            "the floor names its filling prompt: {}",
+            err.0
+        );
         assert!(err.0.contains("H17"), "the error names the holder");
 
         // locate / export likewise defer loudly.

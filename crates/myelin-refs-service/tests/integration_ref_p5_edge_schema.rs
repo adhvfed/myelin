@@ -80,7 +80,10 @@ async fn edge_schema_applies_forward_only_with_rls_and_three_indexes() {
     // ── 1. Apply the REAL forward-only create-table DDL (the §3.2 shape), suffixed for isolation. ──
     // (`CREATE INDEX edge_inbound …` etc. embed the base name `edge`; rename them consistently.)
     let create = rename(CREATE_EDGE_TABLE_DDL, &tbl);
-    sqlx::query(&create).execute(&admin).await.expect("apply the edge CREATE TABLE forward-only");
+    sqlx::query(&create)
+        .execute(&admin)
+        .await
+        .expect("apply the edge CREATE TABLE forward-only");
 
     // ── 2. Apply the THREE indexes (the §3.2 inbound/outbound/by_rel with their WHERE predicates). ──
     for (name, idx_ddl) in CREATE_EDGE_INDEXES_DDL {
@@ -94,7 +97,10 @@ async fn edge_schema_applies_forward_only_with_rls_and_three_indexes() {
     // ── 3. Make it RLS-ready via the platform-wide convention helper (FORCE RLS + the (tenant_id, ──
     //       region) isolation policy). Refs does NOT fork the policy — it calls the one helper.
     let rls = rename(MAKE_EDGE_TENANT_SCOPED_DDL, &tbl);
-    sqlx::query(&rls).execute(&admin).await.expect("the edge table is made tenant-scoped (RLS)");
+    sqlx::query(&rls)
+        .execute(&admin)
+        .await
+        .expect("the edge table is made tenant-scoped (RLS)");
     // Grant the app role access (production grants ride ALTER DEFAULT PRIVILEGES; the test table is
     // created post-default-grant, so grant explicitly).
     sqlx::query(&format!("GRANT ALL ON {tbl} TO myelin_app"))
@@ -112,35 +118,56 @@ async fn edge_schema_applies_forward_only_with_rls_and_three_indexes() {
     .expect("read pg_indexes for the edge table");
     let defs: std::collections::HashMap<String, String> = idx_rows
         .iter()
-        .map(|r| (r.get::<String, _>("indexname"), r.get::<String, _>("indexdef")))
+        .map(|r| {
+            (
+                r.get::<String, _>("indexname"),
+                r.get::<String, _>("indexdef"),
+            )
+        })
         .collect();
 
     let inbound = rename(EDGE_INBOUND_INDEX, &tbl);
     let outbound = rename(EDGE_OUTBOUND_INDEX, &tbl);
     let by_rel = rename(EDGE_BY_REL_INDEX, &tbl);
 
-    let inbound_def = defs.get(&inbound).unwrap_or_else(|| panic!("edge_inbound index exists: {defs:?}"));
-    assert!(inbound_def.contains("target_root"), "edge_inbound keys target_root: {inbound_def}");
+    let inbound_def = defs
+        .get(&inbound)
+        .unwrap_or_else(|| panic!("edge_inbound index exists: {defs:?}"));
     assert!(
-        inbound_def.to_lowercase().contains("where (not tombstoned)")
+        inbound_def.contains("target_root"),
+        "edge_inbound keys target_root: {inbound_def}"
+    );
+    assert!(
+        inbound_def
+            .to_lowercase()
+            .contains("where (not tombstoned)")
             || inbound_def.to_lowercase().contains("where not tombstoned"),
         "edge_inbound is live-edges-only (WHERE NOT tombstoned): {inbound_def}"
     );
 
-    let outbound_def = defs.get(&outbound).unwrap_or_else(|| panic!("edge_outbound index exists: {defs:?}"));
-    assert!(outbound_def.contains("source_root"), "edge_outbound keys source_root: {outbound_def}");
+    let outbound_def = defs
+        .get(&outbound)
+        .unwrap_or_else(|| panic!("edge_outbound index exists: {defs:?}"));
+    assert!(
+        outbound_def.contains("source_root"),
+        "edge_outbound keys source_root: {outbound_def}"
+    );
     assert!(
         !outbound_def.to_lowercase().contains("where"),
         "edge_outbound has no partial predicate: {outbound_def}"
     );
 
-    let by_rel_def = defs.get(&by_rel).unwrap_or_else(|| panic!("edge_by_rel index exists: {defs:?}"));
+    let by_rel_def = defs
+        .get(&by_rel)
+        .unwrap_or_else(|| panic!("edge_by_rel index exists: {defs:?}"));
     assert!(
         by_rel_def.contains("target_root") && by_rel_def.contains("rel"),
         "edge_by_rel keys (target_root, rel): {by_rel_def}"
     );
     assert!(
-        by_rel_def.to_lowercase().contains("rel_class = 'lifecycle'"),
+        by_rel_def
+            .to_lowercase()
+            .contains("rel_class = 'lifecycle'"),
         "edge_by_rel is lifecycle-class only: {by_rel_def}"
     );
 
@@ -187,7 +214,11 @@ async fn edge_schema_applies_forward_only_with_rls_and_three_indexes() {
         .fetch_all(&mut *conn)
         .await
         .unwrap();
-    assert_eq!(rows.len(), 1, "RLS must hide the other tenant's edge (no cross-tenant query path)");
+    assert_eq!(
+        rows.len(),
+        1,
+        "RLS must hide the other tenant's edge (no cross-tenant query path)"
+    );
     assert_eq!(rows[0].get::<String, _>("tenant_id"), "tenantA");
     assert_eq!(rows[0].get::<String, _>("edge_id"), "e-aaa");
 
@@ -228,5 +259,8 @@ async fn edge_schema_applies_forward_only_with_rls_and_three_indexes() {
     );
 
     // Cleanup (a NEW forward operation, not a down-migration in the schema set — this is test teardown).
-    sqlx::query(&format!("DROP TABLE {tbl}")).execute(&admin).await.unwrap();
+    sqlx::query(&format!("DROP TABLE {tbl}"))
+        .execute(&admin)
+        .await
+        .unwrap();
 }

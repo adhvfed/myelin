@@ -56,7 +56,7 @@
 //!   userset inheritance into the repo's admin-only `protected_push` permission.
 
 use crate::namespace::{FragmentDef, PermissionRule, Userset};
-use myelin_identity::{ObjectType, Permission, RelName, RelationTuple, PrincipalId, ObjectId};
+use myelin_identity::{ObjectId, ObjectType, Permission, PrincipalId, RelName, RelationTuple};
 
 /// The four frozen Git object-type names (§5; mirrors `myelin_git::rebac_fragment::object_types`).
 /// Public so the CDC test + a live-wiring caller reference the SAME canonical strings.
@@ -141,7 +141,11 @@ pub fn repo_fragment() -> FragmentDef {
             ),
             perm(
                 "push",
-                Userset::Union(vec![rel("writer"), rel("admin"), ttu("parent_project", "view")]),
+                Userset::Union(vec![
+                    rel("writer"),
+                    rel("admin"),
+                    ttu("parent_project", "view"),
+                ]),
             ),
             perm(
                 "administer",
@@ -281,7 +285,10 @@ mod tests {
         }
         // The four Git types are now in the compiled vocabulary.
         for ty in ["repo", "ref", "pull_request", "pr_comment"] {
-            assert!(eng.object_types().contains(&ty.to_string()), "`{ty}` is admitted");
+            assert!(
+                eng.object_types().contains(&ty.to_string()),
+                "`{ty}` is admitted"
+            );
         }
         // protected_push resolves as a compiled (admin-only) permission on repo.
         assert!(eng.resolve_permission("repo", PROTECTED_PUSH).is_some());
@@ -313,12 +320,23 @@ mod tests {
     fn codeowners_glob_compiles_to_reviewer_tuples() {
         let rules = vec![CodeownersRule {
             path_glob: "/src/payments/**".into(),
-            owners: vec![PrincipalId("p:alice".into()), PrincipalId("team:payments".into())],
+            owners: vec![
+                PrincipalId("p:alice".into()),
+                PrincipalId("team:payments".into()),
+            ],
         }];
         let tuples = compile_codeowners("repo:core", &rules);
-        assert_eq!(tuples.len(), 2, "two owners → two reviewer-requirement tuples");
+        assert_eq!(
+            tuples.len(),
+            2,
+            "two owners → two reviewer-requirement tuples"
+        );
         for t in &tuples {
-            assert_eq!(t.relation, RelName(CODE_OWNER.into()), "each is a code_owner tuple");
+            assert_eq!(
+                t.relation,
+                RelName(CODE_OWNER.into()),
+                "each is a code_owner tuple"
+            );
             assert_eq!(
                 t.object,
                 ObjectId("ref:repo:core::/src/payments/**".into()),
@@ -337,7 +355,8 @@ mod tests {
     fn approve_untrusted_ci_is_a_plain_repo_relation() {
         let repo = repo_fragment();
         assert!(
-            repo.relations.contains(&RelName(APPROVE_UNTRUSTED_CI.into())),
+            repo.relations
+                .contains(&RelName(APPROVE_UNTRUSTED_CI.into())),
             "approve_untrusted_ci is a declared repo relation (X-1)"
         );
         // It is NOT a compiled permission (so check resolves it as a direct relation, the X-1 gate).
@@ -354,12 +373,20 @@ mod tests {
     fn no_git_name_smuggles_an_object_id() {
         let mints = |s: &str| s.contains(':') || s.contains('/') || s.contains('#');
         for f in git_fragment() {
-            assert!(!mints(&f.object_type.0), "type `{}` is a bare identifier", f.object_type.0);
+            assert!(
+                !mints(&f.object_type.0),
+                "type `{}` is a bare identifier",
+                f.object_type.0
+            );
             for r in &f.relations {
                 assert!(!mints(&r.0), "relation `{}` is a bare identifier", r.0);
             }
             for p in &f.permissions {
-                assert!(!mints(&p.permission.0), "permission `{}` is a bare identifier", p.permission.0);
+                assert!(
+                    !mints(&p.permission.0),
+                    "permission `{}` is a bare identifier",
+                    p.permission.0
+                );
             }
         }
     }

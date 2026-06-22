@@ -160,8 +160,7 @@ fn scan_tenant_predicate_bus_streams(src: &str) -> Vec<Violation> {
             // `= *` / `Scope::All` etc. are CODE, not string data — test the blanked form.
             blanked.contains(*w) || code.contains(*w)
         });
-        let has_wildcard_subject =
-            BUS_WILDCARD_SUBJECTS.iter().any(|w| raw_stmt.contains(*w));
+        let has_wildcard_subject = BUS_WILDCARD_SUBJECTS.iter().any(|w| raw_stmt.contains(*w));
         let is_scoped = BUS_SCOPE_BINDERS.iter().any(|b| code.contains(b));
         if has_wildcard_scope || has_wildcard_subject {
             out.push(Violation {
@@ -753,7 +752,10 @@ fn declared_hot_tables(src: &str) -> std::collections::BTreeSet<String> {
             .strip_prefix("-- @hot-table")
             .or_else(|| t.strip_prefix("@hot-table"))
         {
-            let name = rest.trim_start_matches([':', ' ']).split_whitespace().next();
+            let name = rest
+                .trim_start_matches([':', ' '])
+                .split_whitespace()
+                .next();
             if let Some(name) = name {
                 if !name.is_empty() {
                     hot.insert(name.to_ascii_lowercase());
@@ -1060,8 +1062,8 @@ fn scan_residency_pin(src: &str) -> Vec<Violation> {
     const STORE_SITES: &[&str] = &[
         "PgPool::connect(",
         "PgPoolOptions::",
-        "OltpPool::open(",       // the real OLTP pool constructor (myelin-storage, P-ST-01).
-        "ColocatedOltp::open(",  // the real co-located OLTP+outbox store constructor (P-ST-02).
+        "OltpPool::open(", // the real OLTP pool constructor (myelin-storage, P-ST-01).
+        "ColocatedOltp::open(", // the real co-located OLTP+outbox store constructor (P-ST-02).
         "BlobStore::open(",
         "IndexBackend::open(",
         "CacheClient::new(",
@@ -1110,7 +1112,9 @@ fn scan_residency_pin(src: &str) -> Vec<Violation> {
         // not leak its waiver downward.
         const WAIVER_LOOKBACK: usize = 8;
         let idx = line.saturating_sub(1);
-        let here = raw_lines.get(idx).is_some_and(|l| l.contains(WAIVER_MARKER));
+        let here = raw_lines
+            .get(idx)
+            .is_some_and(|l| l.contains(WAIVER_MARKER));
         let mut above = false;
         let mut i = idx;
         for _ in 0..WAIVER_LOOKBACK {
@@ -1218,9 +1222,8 @@ fn scan_residency_write_boundary(src: &str) -> Vec<Violation> {
         // marker) arms this site. Without the file marker, require a per-site marker so the leg never
         // fires on an unmarked statement.
         let idx = line.saturating_sub(1);
-        let site_armed = file_armed
-            || raw_lines.get(idx).is_some_and(|l| l.contains(WRITE_MARKER))
-            || {
+        let site_armed =
+            file_armed || raw_lines.get(idx).is_some_and(|l| l.contains(WRITE_MARKER)) || {
                 // look just above for the marker in an attached comment block.
                 let mut armed = false;
                 let mut i = idx;
@@ -1710,9 +1713,18 @@ mod tests {
         let red = "self.transport.put(subject, envelope, event_id).await?;";
         let red_bus = "bus.put(subject, envelope, event_id);";
         let red_broker = "broker.put(subject, envelope, event_id);";
-        assert!(!no_raw_publish().run(red).is_empty(), "transport.put( must be rejected");
-        assert!(!no_raw_publish().run(red_bus).is_empty(), "bus.put( must be rejected");
-        assert!(!no_raw_publish().run(red_broker).is_empty(), "broker.put( must be rejected");
+        assert!(
+            !no_raw_publish().run(red).is_empty(),
+            "transport.put( must be rejected"
+        );
+        assert!(
+            !no_raw_publish().run(red_bus).is_empty(),
+            "bus.put( must be rejected"
+        );
+        assert!(
+            !no_raw_publish().run(red_broker).is_empty(),
+            "broker.put( must be rejected"
+        );
     }
 
     #[test]
@@ -1721,8 +1733,14 @@ mod tests {
         // `.put(` — e.g. a byte-buffer `BufMut::put`, a cache `.put(k, v)` — is NOT flagged.
         let buf = "buf.put(&bytes[..]);";
         let cache = "cache.put(key, value);";
-        assert!(no_raw_publish().run(buf).is_empty(), "BufMut::put must be admitted");
-        assert!(no_raw_publish().run(cache).is_empty(), "an unrelated cache.put must be admitted");
+        assert!(
+            no_raw_publish().run(buf).is_empty(),
+            "BufMut::put must be admitted"
+        );
+        assert!(
+            no_raw_publish().run(cache).is_empty(),
+            "an unrelated cache.put must be admitted"
+        );
     }
 
     #[test]
@@ -1808,7 +1826,9 @@ mod tests {
         // (2) CREATE INDEX CONCURRENTLY (the expand step) is admitted even on a hot table.
         let hot_index_concurrent =
             "-- @hot-table issue\nCREATE INDEX CONCURRENTLY idx_issue_status ON issue (status);";
-        assert!(forward_only_migration().run(hot_index_concurrent).is_empty());
+        assert!(forward_only_migration()
+            .run(hot_index_concurrent)
+            .is_empty());
 
         // (3) The expand step (a NULLABLE add) is admitted even on a hot table.
         let hot_expand = "-- @hot-table issue\nALTER TABLE issue ADD COLUMN priority INT;";
@@ -1893,8 +1913,14 @@ mod tests {
         // admits; neither carries the write marker, so the write leg stays silent on them.
         let red = "let pool = PgPool::connect(url).await?;";
         let green = "let pool = PgPool::connect(url).region(Region::EuWest).await?;";
-        assert!(!residency_pin().run(red).is_empty(), "region-less open still fires");
-        assert!(residency_pin().run(green).is_empty(), "region-pinned open still admits");
+        assert!(
+            !residency_pin().run(red).is_empty(),
+            "region-less open still fires"
+        );
+        assert!(
+            residency_pin().run(green).is_empty(),
+            "region-pinned open still admits"
+        );
     }
 
     #[test]

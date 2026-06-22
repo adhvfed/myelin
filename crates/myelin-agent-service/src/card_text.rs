@@ -51,7 +51,9 @@
 
 use crate::hitl::{HitlCard, RiskSummary};
 use myelin_identity::{Consistency, Principal};
-use myelin_notif::{humanise, Channel, HumanisedString, HumaniseTemplate, RefResolvePort, TemplateStore};
+use myelin_notif::{
+    humanise, Channel, HumaniseTemplate, HumanisedString, RefResolvePort, TemplateStore,
+};
 use myelin_refs::ArtifactRef;
 use myelin_tenancy::{Region, TenantId};
 
@@ -80,7 +82,10 @@ impl AgentMessage {
     /// Build an agent message from a template key + its `(arg_name, ArtifactRef)` args. The ONLY
     /// constructor — there is deliberately no raw-string path (an agent cannot author a free string).
     pub fn new(template_key: impl Into<String>, args: Vec<(String, ArtifactRef)>) -> AgentMessage {
-        AgentMessage { template_key: template_key.into(), args }
+        AgentMessage {
+            template_key: template_key.into(),
+            args,
+        }
     }
 
     /// An agent message about a single object (the common one-arg shape).
@@ -132,7 +137,9 @@ impl std::error::Error for RawAgentString {}
 ///   SEPARATORS, never as sentence punctuation, so an interior `.` is fine but a trailing one is not;
 /// - every character is a token char (`a-z`, `0-9`, `.`, `_`, `-`).
 pub fn assert_no_raw_agent_surface(template_key: &str) -> Result<(), RawAgentString> {
-    let reject = || RawAgentString { offered: template_key.to_string() };
+    let reject = || RawAgentString {
+        offered: template_key.to_string(),
+    };
     if template_key.is_empty() {
         return Err(reject());
     }
@@ -171,15 +178,47 @@ pub fn assert_no_raw_agent_surface(template_key: &str) -> Result<(), RawAgentStr
 /// as a tombstone in `{0}` — the card text NEVER leaks a title.
 pub const AGENT_PLATFORM_DEFAULT_TEMPLATES: &[(&str, &str, &str)] = &[
     // The HITL risk-summary card bodies (the `agent.hitl.*` family — the risk shown on the card).
-    ("agent.hitl.merge_pr", "Merge {0} — this lands code on the default branch.", "merge"),
-    ("agent.hitl.deploy", "Deploy {0} — this changes a running environment.", "deploy"),
-    ("agent.hitl.delete", "Delete {0} — this is irreversible.", "delete"),
-    ("agent.hitl.transition", "Transition {0} — this changes its state.", "transition"),
-    ("agent.hitl.generic", "Approve the agent's action on {0}.", "approval"),
+    (
+        "agent.hitl.merge_pr",
+        "Merge {0} — this lands code on the default branch.",
+        "merge",
+    ),
+    (
+        "agent.hitl.deploy",
+        "Deploy {0} — this changes a running environment.",
+        "deploy",
+    ),
+    (
+        "agent.hitl.delete",
+        "Delete {0} — this is irreversible.",
+        "delete",
+    ),
+    (
+        "agent.hitl.transition",
+        "Transition {0} — this changes its state.",
+        "transition",
+    ),
+    (
+        "agent.hitl.generic",
+        "Approve the agent's action on {0}.",
+        "approval",
+    ),
     // The agent-authored message bodies (the `agent.msg.*` family).
-    ("agent.msg.proposed_effect", "The agent proposed an effect on {0}.", "agent"),
-    ("agent.msg.halted_rejected", "The agent run was halted: the action on {0} was rejected.", "halt"),
-    ("agent.msg.completed", "The agent completed its work on {0}.", "done"),
+    (
+        "agent.msg.proposed_effect",
+        "The agent proposed an effect on {0}.",
+        "agent",
+    ),
+    (
+        "agent.msg.halted_rejected",
+        "The agent run was halted: the action on {0} was rejected.",
+        "halt",
+    ),
+    (
+        "agent.msg.completed",
+        "The agent completed its work on {0}.",
+        "done",
+    ),
 ];
 
 /// **Register the agent-fabric platform-default templates into a Notif [`TemplateStore`] (the ONE
@@ -226,7 +265,16 @@ fn humanise_with_args(
     // Flatten `(name, ref)` to the ordered ref slots humanise binds to `{0}`, `{1}`, … per-viewer.
     let ref_args: Vec<ArtifactRef> = args.iter().map(|(_, r)| r.clone()).collect();
     Ok(humanise(
-        resolver, tenant, region, templates, template_key, &ref_args, viewer, locale, at, channel,
+        resolver,
+        tenant,
+        region,
+        templates,
+        template_key,
+        &ref_args,
+        viewer,
+        locale,
+        at,
+        channel,
     ))
 }
 
@@ -247,7 +295,15 @@ pub fn humanise_risk_summary(
     channel: Channel,
 ) -> Result<HumanisedString, RawAgentString> {
     humanise_with_args(
-        resolver, tenant, region, templates, &risk.template_key, &risk.args, viewer, locale, at,
+        resolver,
+        tenant,
+        region,
+        templates,
+        &risk.template_key,
+        &risk.args,
+        viewer,
+        locale,
+        at,
         channel,
     )
 }
@@ -267,7 +323,15 @@ pub fn humanise_agent_message(
     channel: Channel,
 ) -> Result<HumanisedString, RawAgentString> {
     humanise_with_args(
-        resolver, tenant, region, templates, &msg.template_key, &msg.args, viewer, locale, at,
+        resolver,
+        tenant,
+        region,
+        templates,
+        &msg.template_key,
+        &msg.args,
+        viewer,
+        locale,
+        at,
         channel,
     )
 }
@@ -310,7 +374,15 @@ pub fn humanise_card(
     channel: Channel,
 ) -> Result<RenderedCard, RawAgentString> {
     let risk_text = humanise_risk_summary(
-        resolver, tenant, region, templates, &card.risk_summary, viewer, locale, at, channel,
+        resolver,
+        tenant,
+        region,
+        templates,
+        &card.risk_summary,
+        viewer,
+        locale,
+        at,
+        channel,
     )?;
     Ok(RenderedCard {
         risk_text,

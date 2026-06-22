@@ -200,7 +200,11 @@ pub fn snooze(
 /// Only ALREADY-active rows are flipped (an already-snoozed/archived/done row is left parked — you
 /// do not un-snooze by marking-all-read). Returns the count flipped. It is recipient-scoped — it
 /// NEVER touches another principal's inbox.
-pub fn mark_all_read(inbox: &InboxProjection, principal: &Principal, filter: &InboxFilter) -> usize {
+pub fn mark_all_read(
+    inbox: &InboxProjection,
+    principal: &Principal,
+    filter: &InboxFilter,
+) -> usize {
     let recipient = principal.principal_id.0.as_str();
     inbox.mutate_matching(
         &principal.tenant,
@@ -221,7 +225,9 @@ pub fn mark_all_read(inbox: &InboxProjection, principal: &Principal, filter: &In
 /// active — an unknown token is shown, never silently suppressed; the closed vocabulary is enforced
 /// at write time by [`ReadState`]).
 fn row_is_active(row: &RoutedInboxItem) -> bool {
-    ReadState::parse(&row.state).map(ReadState::is_active).unwrap_or(true)
+    ReadState::parse(&row.state)
+        .map(ReadState::is_active)
+        .unwrap_or(true)
 }
 
 /// **`active_inbox` — the active-inbox view that SUPPRESSES parked (snoozed/archived/done) rows.**
@@ -249,7 +255,10 @@ mod tests {
         Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant())
     }
     fn strong() -> Consistency {
-        Consistency { at_least: Zookie("zk".into()), mode: ConsistencyMode::Strong }
+        Consistency {
+            at_least: Zookie("zk".into()),
+            mode: ConsistencyMode::Strong,
+        }
     }
 
     fn item(recipient: &str, item_id: &str, subject: &str, reason: Reason) -> RoutedInboxItem {
@@ -273,10 +282,30 @@ mod tests {
     /// issues row NOT in My Work — across the three subsystems.
     fn seeded(me: &str) -> InboxProjection {
         let inbox = InboxProjection::new();
-        inbox.upsert_for_test(item(me, "iss-assigned", "myelin://acme/issue/issue/PROJ-1", Reason::Assigned));
-        inbox.upsert_for_test(item(me, "iss-state", "myelin://acme/issue/issue/PROJ-2", Reason::StateChanged));
-        inbox.upsert_for_test(item(me, "chat-ment", "myelin://acme/chat/thread/T1", Reason::Mentioned));
-        inbox.upsert_for_test(item(me, "git-review", "myelin://acme/git/pr/9", Reason::ReviewRequested));
+        inbox.upsert_for_test(item(
+            me,
+            "iss-assigned",
+            "myelin://acme/issue/issue/PROJ-1",
+            Reason::Assigned,
+        ));
+        inbox.upsert_for_test(item(
+            me,
+            "iss-state",
+            "myelin://acme/issue/issue/PROJ-2",
+            Reason::StateChanged,
+        ));
+        inbox.upsert_for_test(item(
+            me,
+            "chat-ment",
+            "myelin://acme/chat/thread/T1",
+            Reason::Mentioned,
+        ));
+        inbox.upsert_for_test(item(
+            me,
+            "git-review",
+            "myelin://acme/git/pr/9",
+            Reason::ReviewRequested,
+        ));
         inbox
     }
 
@@ -302,15 +331,29 @@ mod tests {
             ReadState::Archived,
             ReadState::Done,
         ] {
-            assert_eq!(ReadState::parse(s.token()), Some(s), "{s:?} round-trips through its token");
+            assert_eq!(
+                ReadState::parse(s.token()),
+                Some(s),
+                "{s:?} round-trips through its token"
+            );
         }
-        assert_eq!(ReadState::parse("bogus"), None, "an unknown token is None (closed vocabulary)");
+        assert_eq!(
+            ReadState::parse("bogus"),
+            None,
+            "an unknown token is None (closed vocabulary)"
+        );
         // ACTIVE: unread/seen/read show in the inbox.
         assert!(ReadState::Unread.is_active());
         assert!(ReadState::Seen.is_active());
-        assert!(ReadState::Read.is_active(), "a read item stays in the inbox (read ≠ archived)");
+        assert!(
+            ReadState::Read.is_active(),
+            "a read item stays in the inbox (read ≠ archived)"
+        );
         // PARKED: snoozed/archived/done are suppressed.
-        assert!(!ReadState::Snoozed.is_active(), "a snoozed item is suppressed from the active inbox");
+        assert!(
+            !ReadState::Snoozed.is_active(),
+            "a snoozed item is suppressed from the active inbox"
+        );
         assert!(!ReadState::Archived.is_active());
         assert!(!ReadState::Done.is_active());
     }
@@ -329,17 +372,55 @@ mod tests {
         mark(&inbox, &p, "iss-assigned", ReadState::Read).expect("mark my own item");
 
         // read through the unified inbox.
-        let full = list_inbox(&inbox, &p, &InboxFilter::all(), &Page { after: None, limit: 100 }, &AllowAllAuthorize, &strong());
-        let in_full = full.items.iter().find(|r| r.item_id == "iss-assigned").unwrap();
-        assert_eq!(in_full.state, "read", "the item is read in the unified inbox");
+        let full = list_inbox(
+            &inbox,
+            &p,
+            &InboxFilter::all(),
+            &Page {
+                after: None,
+                limit: 100,
+            },
+            &AllowAllAuthorize,
+            &strong(),
+        );
+        let in_full = full
+            .items
+            .iter()
+            .find(|r| r.item_id == "iss-assigned")
+            .unwrap();
+        assert_eq!(
+            in_full.state, "read",
+            "the item is read in the unified inbox"
+        );
 
         // read through the My Work SCOPED view — the SAME row, same read-state (no second store).
-        let view = list_inbox(&inbox, &p, &InboxFilter::issues_my_work(), &Page { after: None, limit: 100 }, &AllowAllAuthorize, &strong());
-        let in_view = view.items.iter().find(|r| r.item_id == "iss-assigned").unwrap();
-        assert_eq!(in_view.state, "read", "the SAME row reads `read` in the scoped view too (C-9)");
+        let view = list_inbox(
+            &inbox,
+            &p,
+            &InboxFilter::issues_my_work(),
+            &Page {
+                after: None,
+                limit: 100,
+            },
+            &AllowAllAuthorize,
+            &strong(),
+        );
+        let in_view = view
+            .items
+            .iter()
+            .find(|r| r.item_id == "iss-assigned")
+            .unwrap();
+        assert_eq!(
+            in_view.state, "read",
+            "the SAME row reads `read` in the scoped view too (C-9)"
+        );
 
         // a DIFFERENT row was untouched (mark targets exactly one item).
-        assert_eq!(state_of(&inbox, me, "chat-ment").unwrap(), "unread", "other rows untouched");
+        assert_eq!(
+            state_of(&inbox, me, "chat-ment").unwrap(),
+            "unread",
+            "other rows untouched"
+        );
     }
 
     /// **`mark` is recipient-scoped: a principal can only flip the state of their OWN items.** u2
@@ -349,10 +430,20 @@ mod tests {
     fn mark_is_recipient_scoped_cannot_touch_anothers_item() {
         let inbox = seeded("u1");
         // u2 tries to mark u1's item — refused, and u1's row is UNCHANGED.
-        assert_eq!(mark(&inbox, &principal("u2"), "iss-assigned", ReadState::Read), Err(ReadStateError::NotFound));
-        assert_eq!(state_of(&inbox, "u1", "iss-assigned").unwrap(), "unread", "another principal did NOT flip my item");
+        assert_eq!(
+            mark(&inbox, &principal("u2"), "iss-assigned", ReadState::Read),
+            Err(ReadStateError::NotFound)
+        );
+        assert_eq!(
+            state_of(&inbox, "u1", "iss-assigned").unwrap(),
+            "unread",
+            "another principal did NOT flip my item"
+        );
         // a missing id is NotFound too (no leak of existence).
-        assert_eq!(mark(&inbox, &principal("u1"), "no-such", ReadState::Read), Err(ReadStateError::NotFound));
+        assert_eq!(
+            mark(&inbox, &principal("u1"), "no-such", ReadState::Read),
+            Err(ReadStateError::NotFound)
+        );
     }
 
     // --- snooze: records the until + suppresses from the active inbox ---
@@ -377,15 +468,38 @@ mod tests {
             .find(|r| r.item_id == "iss-assigned")
             .unwrap();
         assert_eq!(row.state, "snoozed");
-        assert_eq!(row.snooze_until.as_deref(), Some(until), "the until is persisted");
+        assert_eq!(
+            row.snooze_until.as_deref(),
+            Some(until),
+            "the until is persisted"
+        );
 
         // suppressed from the ACTIVE inbox (but still in the ONE store).
-        let full = list_inbox(&inbox, &p, &InboxFilter::all(), &Page { after: None, limit: 100 }, &AllowAllAuthorize, &strong());
-        assert!(full.items.iter().any(|r| r.item_id == "iss-assigned"), "the snoozed item is STILL in the store (not deleted)");
+        let full = list_inbox(
+            &inbox,
+            &p,
+            &InboxFilter::all(),
+            &Page {
+                after: None,
+                limit: 100,
+            },
+            &AllowAllAuthorize,
+            &strong(),
+        );
+        assert!(
+            full.items.iter().any(|r| r.item_id == "iss-assigned"),
+            "the snoozed item is STILL in the store (not deleted)"
+        );
         let active = active_inbox(full.items);
-        assert!(!active.iter().any(|r| r.item_id == "iss-assigned"), "the snoozed item is ABSENT from the active inbox (§2.1)");
+        assert!(
+            !active.iter().any(|r| r.item_id == "iss-assigned"),
+            "the snoozed item is ABSENT from the active inbox (§2.1)"
+        );
         // the other rows still show in the active inbox.
-        assert!(active.iter().any(|r| r.item_id == "chat-ment"), "an un-snoozed item still shows");
+        assert!(
+            active.iter().any(|r| r.item_id == "chat-ment"),
+            "an un-snoozed item still shows"
+        );
     }
 
     /// **`mark` to a non-snooze state CLEARS a previously-recorded snooze_until.** Snooze then mark
@@ -396,9 +510,16 @@ mod tests {
         let p = principal("u1");
         snooze(&inbox, &p, "iss-assigned", "2026-06-25T09:00:00Z").unwrap();
         mark(&inbox, &p, "iss-assigned", ReadState::Read).unwrap();
-        let row = inbox.snapshot_for_tenant(&tenant()).into_iter().find(|r| r.item_id == "iss-assigned").unwrap();
+        let row = inbox
+            .snapshot_for_tenant(&tenant())
+            .into_iter()
+            .find(|r| r.item_id == "iss-assigned")
+            .unwrap();
         assert_eq!(row.state, "read");
-        assert!(row.snooze_until.is_none(), "marking read cleared the stale snooze_until");
+        assert!(
+            row.snooze_until.is_none(),
+            "marking read cleared the stale snooze_until"
+        );
     }
 
     // --- mark_all_read(filter): flips EXACTLY the filtered rows ---
@@ -415,11 +536,27 @@ mod tests {
 
         let n = mark_all_read(&inbox, &p, &InboxFilter::issues_my_work());
         assert_eq!(n, 1, "exactly the one My Work row was flipped");
-        assert_eq!(state_of(&inbox, me, "iss-assigned").unwrap(), "read", "the My Work row is read");
+        assert_eq!(
+            state_of(&inbox, me, "iss-assigned").unwrap(),
+            "read",
+            "the My Work row is read"
+        );
         // everything NOT in My Work is untouched.
-        assert_eq!(state_of(&inbox, me, "iss-state").unwrap(), "unread", "a non-My-Work issue is untouched (reason clause)");
-        assert_eq!(state_of(&inbox, me, "chat-ment").unwrap(), "unread", "a chat row is untouched (subsystem clause)");
-        assert_eq!(state_of(&inbox, me, "git-review").unwrap(), "unread", "a git row is untouched");
+        assert_eq!(
+            state_of(&inbox, me, "iss-state").unwrap(),
+            "unread",
+            "a non-My-Work issue is untouched (reason clause)"
+        );
+        assert_eq!(
+            state_of(&inbox, me, "chat-ment").unwrap(),
+            "unread",
+            "a chat row is untouched (subsystem clause)"
+        );
+        assert_eq!(
+            state_of(&inbox, me, "git-review").unwrap(),
+            "unread",
+            "a git row is untouched"
+        );
     }
 
     /// **`mark_all_read(all)` flips the whole ACTIVE inbox; a snoozed (parked) row is left parked.**
@@ -433,8 +570,15 @@ mod tests {
         snooze(&inbox, &p, "git-review", "2026-06-25T09:00:00Z").unwrap();
 
         let n = mark_all_read(&inbox, &p, &InboxFilter::all());
-        assert_eq!(n, 3, "the three ACTIVE rows flipped (the snoozed one was skipped)");
-        assert_eq!(state_of(&inbox, me, "git-review").unwrap(), "snoozed", "mark_all_read did NOT un-snooze the parked row");
+        assert_eq!(
+            n, 3,
+            "the three ACTIVE rows flipped (the snoozed one was skipped)"
+        );
+        assert_eq!(
+            state_of(&inbox, me, "git-review").unwrap(),
+            "snoozed",
+            "mark_all_read did NOT un-snooze the parked row"
+        );
         assert_eq!(state_of(&inbox, me, "iss-assigned").unwrap(), "read");
     }
 
@@ -443,12 +587,26 @@ mod tests {
     #[test]
     fn mark_all_read_is_recipient_scoped() {
         let inbox = InboxProjection::new();
-        inbox.upsert_for_test(item("u1", "u1-iss", "myelin://acme/issue/issue/P1", Reason::Assigned));
-        inbox.upsert_for_test(item("u2", "u2-iss", "myelin://acme/issue/issue/P2", Reason::Assigned));
+        inbox.upsert_for_test(item(
+            "u1",
+            "u1-iss",
+            "myelin://acme/issue/issue/P1",
+            Reason::Assigned,
+        ));
+        inbox.upsert_for_test(item(
+            "u2",
+            "u2-iss",
+            "myelin://acme/issue/issue/P2",
+            Reason::Assigned,
+        ));
         let n = mark_all_read(&inbox, &principal("u1"), &InboxFilter::issues_my_work());
         assert_eq!(n, 1, "only u1's row flipped");
         assert_eq!(state_of(&inbox, "u1", "u1-iss").unwrap(), "read");
-        assert_eq!(state_of(&inbox, "u2", "u2-iss").unwrap(), "unread", "u2's inbox was NEVER touched");
+        assert_eq!(
+            state_of(&inbox, "u2", "u2-iss").unwrap(),
+            "unread",
+            "u2's inbox was NEVER touched"
+        );
     }
 
     /// **THE CHAINED PROPERTY (EI-01 §4): ingest a batch → mark_all_read(My Work view) → re-list both
@@ -465,17 +623,54 @@ mod tests {
         mark_all_read(&inbox, &p, &InboxFilter::issues_my_work());
 
         // re-list the My Work view: its row reads `read`.
-        let view = list_inbox(&inbox, &p, &InboxFilter::issues_my_work(), &Page { after: None, limit: 100 }, &AllowAllAuthorize, &strong());
+        let view = list_inbox(
+            &inbox,
+            &p,
+            &InboxFilter::issues_my_work(),
+            &Page {
+                after: None,
+                limit: 100,
+            },
+            &AllowAllAuthorize,
+            &strong(),
+        );
         for r in &view.items {
-            assert_eq!(r.state, "read", "every My Work row reads `read` after mark_all_read");
+            assert_eq!(
+                r.state, "read",
+                "every My Work row reads `read` after mark_all_read"
+            );
         }
 
         // re-list the FULL inbox: the SAME row reads `read` (no divergence); the others read `unread`.
-        let full = list_inbox(&inbox, &p, &InboxFilter::all(), &Page { after: None, limit: 100 }, &AllowAllAuthorize, &strong());
-        let assigned = full.items.iter().find(|r| r.item_id == "iss-assigned").unwrap();
-        assert_eq!(assigned.state, "read", "the My Work row reads `read` in the unified inbox too (0 divergence)");
-        let chat = full.items.iter().find(|r| r.item_id == "chat-ment").unwrap();
-        assert_eq!(chat.state, "unread", "a row outside the marked view stays unread in every view");
+        let full = list_inbox(
+            &inbox,
+            &p,
+            &InboxFilter::all(),
+            &Page {
+                after: None,
+                limit: 100,
+            },
+            &AllowAllAuthorize,
+            &strong(),
+        );
+        let assigned = full
+            .items
+            .iter()
+            .find(|r| r.item_id == "iss-assigned")
+            .unwrap();
+        assert_eq!(
+            assigned.state, "read",
+            "the My Work row reads `read` in the unified inbox too (0 divergence)"
+        );
+        let chat = full
+            .items
+            .iter()
+            .find(|r| r.item_id == "chat-ment")
+            .unwrap();
+        assert_eq!(
+            chat.state, "unread",
+            "a row outside the marked view stays unread in every view"
+        );
     }
 
     /// **Every [`ReadState`] token is a value the real `notif_inbox_item.state` CHECK constraint

@@ -164,7 +164,11 @@ impl BoundedQueue {
     /// floor); `0` is accepted but is the degenerate "always-shed" (== down) queue, not a "bounded"
     /// one — callers take their capacity from [`ShedBudgetTable`], which is always positive.
     pub fn new(capacity: u32) -> BoundedQueue {
-        BoundedQueue { in_flight: 0, capacity, shed_count: 0 }
+        BoundedQueue {
+            in_flight: 0,
+            capacity,
+            shed_count: 0,
+        }
     }
 
     /// Try to take a permit. Returns `true` if admitted (a permit was taken); `false` if the queue
@@ -265,33 +269,57 @@ impl ShedBudgetTable {
         // human slots, CI + agent share the wallet.
         rows.insert(
             Surface::CiDispatch,
-            SurfaceBudget { per_tenant_in_flight_cap: 64, human_lane_reservation: 0, retry_after_secs: 5 },
+            SurfaceBudget {
+                per_tenant_in_flight_cap: 64,
+                human_lane_reservation: 0,
+                retry_after_secs: 5,
+            },
         );
         // Collab op-stream: a fraction reserved for active editors (the human lane).
         rows.insert(
             Surface::CollabOpStream,
-            SurfaceBudget { per_tenant_in_flight_cap: 128, human_lane_reservation: 32, retry_after_secs: 2 },
+            SurfaceBudget {
+                per_tenant_in_flight_cap: 128,
+                human_lane_reservation: 32,
+                retry_after_secs: 2,
+            },
         );
         // Connection tier: reserved connection slots for interactive humans.
         rows.insert(
             Surface::ConnectionTier,
-            SurfaceBudget { per_tenant_in_flight_cap: 256, human_lane_reservation: 64, retry_after_secs: 3 },
+            SurfaceBudget {
+                per_tenant_in_flight_cap: 256,
+                human_lane_reservation: 64,
+                retry_after_secs: 3,
+            },
         );
         // Agent-mention: humans never queue behind agent runs (a reserved human fraction).
         rows.insert(
             Surface::AgentMention,
-            SurfaceBudget { per_tenant_in_flight_cap: 96, human_lane_reservation: 24, retry_after_secs: 10 },
+            SurfaceBudget {
+                per_tenant_in_flight_cap: 96,
+                human_lane_reservation: 24,
+                retry_after_secs: 10,
+            },
         );
         // Git front door (clone/push): the clone-storm read profile. A CI/agent clone storm sheds
         // before a human's interactive fetch — a reserved human fraction protects the human lane.
         rows.insert(
             Surface::GitFrontDoor,
-            SurfaceBudget { per_tenant_in_flight_cap: 128, human_lane_reservation: 32, retry_after_secs: 5 },
+            SurfaceBudget {
+                per_tenant_in_flight_cap: 128,
+                human_lane_reservation: 32,
+                retry_after_secs: 5,
+            },
         );
         // The generic HTTP intake (§7.1): every public surface reserves a human fraction.
         rows.insert(
             Surface::HttpIntake,
-            SurfaceBudget { per_tenant_in_flight_cap: 200, human_lane_reservation: 50, retry_after_secs: 5 },
+            SurfaceBudget {
+                per_tenant_in_flight_cap: 200,
+                human_lane_reservation: 50,
+                retry_after_secs: 5,
+            },
         );
         ShedBudgetTable { rows }
     }
@@ -356,7 +384,12 @@ impl ShedLane {
 
     /// Open a shed lane for a surface with an explicit budget (used by tests to drive the boundary).
     pub fn with_budget(surface: Surface, budget: SurfaceBudget) -> ShedLane {
-        ShedLane { surface, budget, tenants: HashMap::new(), shed_counts: HashMap::new() }
+        ShedLane {
+            surface,
+            budget,
+            tenants: HashMap::new(),
+            shed_counts: HashMap::new(),
+        }
     }
 
     /// **The admission decision (contract 1.11).** Reads the run-class (already derived from
@@ -401,7 +434,9 @@ impl ShedLane {
             ShedDecision::Admit
         } else {
             *self.shed_counts.entry(class).or_insert(0) += 1;
-            ShedDecision::Shed { retry_after_secs: self.budget.retry_after_secs }
+            ShedDecision::Shed {
+                retry_after_secs: self.budget.retry_after_secs,
+            }
         }
     }
 
@@ -430,7 +465,11 @@ impl ShedLane {
     /// The current per-tenant total in-flight (admitted not yet released) — for the per-tenant
     /// blast-radius assertions.
     pub fn in_flight(&self, tenant: &TenantId) -> u32 {
-        self.tenants.get(tenant).copied().unwrap_or_default().total()
+        self.tenants
+            .get(tenant)
+            .copied()
+            .unwrap_or_default()
+            .total()
     }
 
     /// The surface this lane fronts.
@@ -460,11 +499,17 @@ mod tests {
     #[test]
     fn derive_maps_kind_to_lane_and_never_up_classes() {
         // human with no header → the protected human lane.
-        assert_eq!(RunClass::derive(&PrincipalKind::Human, None), RunClass::Human);
+        assert_eq!(
+            RunClass::derive(&PrincipalKind::Human, None),
+            RunClass::Human
+        );
         // agent → agent lane.
         assert_eq!(RunClass::derive(&agent_kind(), None), RunClass::Agent);
         // service → batch/ci by default.
-        assert_eq!(RunClass::derive(&PrincipalKind::Service, None), RunClass::BatchCi);
+        assert_eq!(
+            RunClass::derive(&PrincipalKind::Service, None),
+            RunClass::BatchCi
+        );
 
         // a header may DOWN-class (a human-issued prefetch sheds early).
         assert_eq!(
@@ -519,22 +564,35 @@ mod tests {
             assert_eq!(lane.admit(&t, RunClass::Agent), ShedDecision::Admit);
         }
         // now non_human == 4: SPECULATIVE sheds first (ceiling 4, not < 4).
-        assert!(matches!(lane.admit(&t, RunClass::Speculative), ShedDecision::Shed { .. }));
+        assert!(matches!(
+            lane.admit(&t, RunClass::Speculative),
+            ShedDecision::Shed { .. }
+        ));
         // batch/ci still admitted (ceiling 5, 4 < 5).
         assert_eq!(lane.admit(&t, RunClass::BatchCi), ShedDecision::Admit); // non_human → 5
-        // now non_human == 5: batch/ci sheds (ceiling 5, not < 5), agent still admitted (ceiling 6).
-        assert!(matches!(lane.admit(&t, RunClass::BatchCi), ShedDecision::Shed { .. }));
+                                                                            // now non_human == 5: batch/ci sheds (ceiling 5, not < 5), agent still admitted (ceiling 6).
+        assert!(matches!(
+            lane.admit(&t, RunClass::BatchCi),
+            ShedDecision::Shed { .. }
+        ));
         assert_eq!(lane.admit(&t, RunClass::Agent), ShedDecision::Admit); // non_human → 6
-        // now non_human == 6 == cap-reserved: AGENT sheds (ceiling 6), but the HUMAN is still admitted
-        // — the human lane is protected, shed LAST.
-        assert!(matches!(lane.admit(&t, RunClass::Agent), ShedDecision::Shed { .. }));
+                                                                          // now non_human == 6 == cap-reserved: AGENT sheds (ceiling 6), but the HUMAN is still admitted
+                                                                          // — the human lane is protected, shed LAST.
+        assert!(matches!(
+            lane.admit(&t, RunClass::Agent),
+            ShedDecision::Shed { .. }
+        ));
         assert_eq!(lane.admit(&t, RunClass::Human), ShedDecision::Admit); // total 7, humans use reserved
 
         // the shed counts are exported per lane (contract-1.8) and follow the order.
         assert_eq!(lane.shed_count(RunClass::Speculative), 1);
         assert_eq!(lane.shed_count(RunClass::BatchCi), 1);
         assert_eq!(lane.shed_count(RunClass::Agent), 1);
-        assert_eq!(lane.shed_count(RunClass::Human), 0, "the human lane has NOT been shed");
+        assert_eq!(
+            lane.shed_count(RunClass::Human),
+            0,
+            "the human lane has NOT been shed"
+        );
     }
 
     /// **Human shed last: only in true saturation (every slot, reserved included, full).**
@@ -551,7 +609,10 @@ mod tests {
         for _ in 0..3 {
             assert_eq!(lane.admit(&t, RunClass::Agent), ShedDecision::Admit);
         }
-        assert!(matches!(lane.admit(&t, RunClass::Agent), ShedDecision::Shed { .. }), "agent shed at cap-reserved");
+        assert!(
+            matches!(lane.admit(&t, RunClass::Agent), ShedDecision::Shed { .. }),
+            "agent shed at cap-reserved"
+        );
         // humans keep being admitted into the reserved slots (total 3 → 4 → 5).
         assert_eq!(lane.admit(&t, RunClass::Human), ShedDecision::Admit);
         assert_eq!(lane.admit(&t, RunClass::Human), ShedDecision::Admit);
@@ -582,12 +643,25 @@ mod tests {
         for _ in 0..3 {
             assert_eq!(lane.admit(&noisy, RunClass::Agent), ShedDecision::Admit);
         }
-        assert!(matches!(lane.admit(&noisy, RunClass::Agent), ShedDecision::Shed { .. }));
+        assert!(matches!(
+            lane.admit(&noisy, RunClass::Agent),
+            ShedDecision::Shed { .. }
+        ));
         assert_eq!(lane.admit(&noisy, RunClass::Human), ShedDecision::Admit); // reserved slot, total 4
-        assert!(matches!(lane.admit(&noisy, RunClass::Human), ShedDecision::Shed { .. }), "noisy saturated");
+        assert!(
+            matches!(
+                lane.admit(&noisy, RunClass::Human),
+                ShedDecision::Shed { .. }
+            ),
+            "noisy saturated"
+        );
 
         // the QUIET tenant is COMPLETELY UNAFFECTED — its human is admitted, its budget untouched.
-        assert_eq!(lane.in_flight(&quiet), 0, "the quiet tenant's budget is independent");
+        assert_eq!(
+            lane.in_flight(&quiet),
+            0,
+            "the quiet tenant's budget is independent"
+        );
         assert_eq!(
             lane.admit(&quiet, RunClass::Human),
             ShedDecision::Admit,
@@ -608,9 +682,16 @@ mod tests {
         let t = tenant("acme");
         assert_eq!(lane.admit(&t, RunClass::Agent), ShedDecision::Admit);
         assert_eq!(lane.admit(&t, RunClass::Agent), ShedDecision::Admit); // non_human 2 == cap-reserved
-        assert!(matches!(lane.admit(&t, RunClass::Agent), ShedDecision::Shed { .. }));
+        assert!(matches!(
+            lane.admit(&t, RunClass::Agent),
+            ShedDecision::Shed { .. }
+        ));
         lane.release(&t, RunClass::Agent);
-        assert_eq!(lane.admit(&t, RunClass::Agent), ShedDecision::Admit, "a released slot is reusable");
+        assert_eq!(
+            lane.admit(&t, RunClass::Agent),
+            ShedDecision::Admit,
+            "a released slot is reusable"
+        );
     }
 
     // ---- bounded everything: every queue/pool fast-fails (never grows latency unboundedly) -------
@@ -621,9 +702,20 @@ mod tests {
         assert!(q.try_acquire(), "first permit");
         assert!(q.try_acquire(), "second permit");
         // full → fast-fail (shed), NOT queue: in_flight does NOT grow past the bound.
-        assert!(!q.try_acquire(), "a full bounded queue fast-fails (sheds), never grows latency");
-        assert_eq!(q.in_flight(), 2, "in-flight never exceeds the bound (Little's Law)");
-        assert_eq!(q.shed_count(), 1, "the shed is counted (the bounded-everything signal)");
+        assert!(
+            !q.try_acquire(),
+            "a full bounded queue fast-fails (sheds), never grows latency"
+        );
+        assert_eq!(
+            q.in_flight(),
+            2,
+            "in-flight never exceeds the bound (Little's Law)"
+        );
+        assert_eq!(
+            q.shed_count(),
+            1,
+            "the shed is counted (the bounded-everything signal)"
+        );
         // releasing makes a slot reusable.
         q.release();
         assert!(q.try_acquire(), "a released slot is reusable");
@@ -653,14 +745,20 @@ mod tests {
         ] {
             let b = table.budget(surface);
             // every surface is BOUNDED.
-            assert!(b.per_tenant_in_flight_cap > 0, "{surface:?} must be bounded (§7.1)");
+            assert!(
+                b.per_tenant_in_flight_cap > 0,
+                "{surface:?} must be bounded (§7.1)"
+            );
             // the reservation never exceeds the cap.
             assert!(
                 b.human_lane_reservation <= b.per_tenant_in_flight_cap,
                 "{surface:?} reservation within the cap"
             );
             // every surface advertises a Retry-After (clients honour it, P-S17).
-            assert!(b.retry_after_secs > 0, "{surface:?} sheds with a Retry-After");
+            assert!(
+                b.retry_after_secs > 0,
+                "{surface:?} sheds with a Retry-After"
+            );
         }
         // CI is the batch lane: no human reservation (the §7.6 row says n/a).
         assert_eq!(table.budget(Surface::CiDispatch).human_lane_reservation, 0);
@@ -689,7 +787,10 @@ mod tests {
         assert_eq!(c, RunClass::Agent);
         assert_eq!(lane.admit(&t, c), ShedDecision::Admit);
         assert_eq!(lane.admit(&t, c), ShedDecision::Admit);
-        assert!(matches!(lane.admit(&t, c), ShedDecision::Shed { .. }), "the agent lane sheds");
+        assert!(
+            matches!(lane.admit(&t, c), ShedDecision::Shed { .. }),
+            "the agent lane sheds"
+        );
         // a human (derived) is still admitted — humans never queue behind agent runs (§7.6).
         let h = RunClass::derive(&PrincipalKind::Human, None);
         assert_eq!(lane.admit(&t, h), ShedDecision::Admit);

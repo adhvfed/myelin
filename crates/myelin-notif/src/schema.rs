@@ -482,7 +482,10 @@ mod tests {
             locale: "en".into(),
             template_body: "{actor} merged {pr} into {base}".into(),
         };
-        assert!(template.tenant.is_none(), "the platform-default template has a NULL tenant (§2.5)");
+        assert!(
+            template.tenant.is_none(),
+            "the platform-default template has a NULL tenant (§2.5)"
+        );
 
         let mute = MuteRow {
             tenant: t(),

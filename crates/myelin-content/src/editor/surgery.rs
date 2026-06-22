@@ -89,7 +89,12 @@ pub fn normalize_paste(raw: &str, nodes: &[InlineNode]) -> (String, Vec<InlineNo
 /// inserted text. The inserted text is escaped-on-serialize through the render path so a
 /// literally-typed `*` stays literal until the user completes a delimiter pair. Used for
 /// the IME composition-end event (text lands at the caret).
-pub fn insert_text(md: &str, nodes: &[InlineNode], offset: usize, text: &str) -> (String, Vec<InlineNode>, usize) {
+pub fn insert_text(
+    md: &str,
+    nodes: &[InlineNode],
+    offset: usize,
+    text: &str,
+) -> (String, Vec<InlineNode>, usize) {
     let chars: Vec<char> = md.chars().collect();
     let at = offset.min(chars.len());
     let mut joined: String = chars[..at].iter().collect();
@@ -139,12 +144,22 @@ mod tests {
         let total = md.chars().count() + 1;
         for off in 0..=md.chars().count() {
             let s = split_at(md, &[], off);
-            assert_eq!(s.caret, 0, "caret must be at the START of the new block at split {off}");
+            assert_eq!(
+                s.caret, 0,
+                "caret must be at the START of the new block at split {off}"
+            );
             caret_at_zero += 1;
             // plain text (no delimiters) reconstructs exactly: left ++ right == md
-            assert_eq!(format!("{}{}", s.left, s.right), md, "split {off} lost/gained chars");
+            assert_eq!(
+                format!("{}{}", s.left, s.right),
+                md,
+                "split {off} lost/gained chars"
+            );
         }
-        assert_eq!(caret_at_zero, total, "every split placed the caret at start");
+        assert_eq!(
+            caret_at_zero, total,
+            "every split placed the caret at start"
+        );
     }
 
     /// A split mid-line preserves all chars across the two halves and is canonical on both.
@@ -167,14 +182,20 @@ mod tests {
     fn split_routes_structured_nodes_to_correct_half() {
         let nodes = vec![mention("alice"), aref(1), aref(2)];
         let md = format!("hi {OBJ} mid {OBJ} end {OBJ}"); // 3 OBJ
-        // split right after the first OBJ
+                                                          // split right after the first OBJ
         let first_obj = md.chars().position(|c| c == OBJ).unwrap();
         let s = split_at(&md, &nodes, first_obj + 1);
         assert_eq!(s.left_nodes, vec![mention("alice")]);
         assert_eq!(s.right_nodes, vec![aref(1), aref(2)]);
         // node counts match the OBJ counts in each half
-        assert_eq!(s.left.chars().filter(|&c| c == OBJ).count(), s.left_nodes.len());
-        assert_eq!(s.right.chars().filter(|&c| c == OBJ).count(), s.right_nodes.len());
+        assert_eq!(
+            s.left.chars().filter(|&c| c == OBJ).count(),
+            s.left_nodes.len()
+        );
+        assert_eq!(
+            s.right.chars().filter(|&c| c == OBJ).count(),
+            s.right_nodes.len()
+        );
         assert_eq!(s.caret, 0);
     }
 
@@ -197,9 +218,15 @@ mod tests {
     fn split_at_extremes() {
         let md = "abc";
         let s0 = split_at(md, &[], 0);
-        assert_eq!((s0.left.as_str(), s0.right.as_str(), s0.caret), ("", "abc", 0));
+        assert_eq!(
+            (s0.left.as_str(), s0.right.as_str(), s0.caret),
+            ("", "abc", 0)
+        );
         let sn = split_at(md, &[], md.chars().count());
-        assert_eq!((sn.left.as_str(), sn.right.as_str(), sn.caret), ("abc", "", 0));
+        assert_eq!(
+            (sn.left.as_str(), sn.right.as_str(), sn.caret),
+            ("abc", "", 0)
+        );
     }
 
     /// After a split, the caret (offset 0 of the right block) is a VALID offset-model
@@ -239,7 +266,7 @@ mod tests {
         let (out, _nodes, caret) = insert_text(md, &[], 3, "日本");
         assert_eq!(out, "ab 日本cd");
         assert_eq!(caret, 5); // 'a','b',' ','日','本' → 5 chars before the caret
-        // the caret is a valid offset-model position on the new line
+                              // the caret is a valid offset-model position on the new line
         assert!(caret < caret_count(&out));
         assert_eq!(dom_to_offset(&out, offset_to_dom(&out, caret)), caret);
     }

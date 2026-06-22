@@ -87,7 +87,10 @@ fn fragment(object_type: &str, relations: &[&str], permissions: &[&str]) -> Name
     NamespaceFragment {
         object_type: ObjectType(object_type.to_string()),
         relations: relations.iter().map(|r| RelName(r.to_string())).collect(),
-        permissions: permissions.iter().map(|p| Permission(p.to_string())).collect(),
+        permissions: permissions
+            .iter()
+            .map(|p| Permission(p.to_string()))
+            .collect(),
     }
 }
 
@@ -198,7 +201,9 @@ mod tests {
         // the three channel permissions are present (read / post / manage).
         for p in ["read", "post", "manage"] {
             assert!(
-                channel_fragment().permissions.contains(&Permission(p.into())),
+                channel_fragment()
+                    .permissions
+                    .contains(&Permission(p.into())),
                 "channel declares the `{p}` permission (§5)"
             );
         }

@@ -107,10 +107,12 @@ impl RefsDekPin {
     /// encrypted-from-birth and the tenant-offboard lever is in place from day one.
     pub fn reserve(&self, tenant: &TenantId, region: &Region) -> Result<PiiKeyRef, KmsError> {
         // L1: provision the per-(tenant, region) KEK (idempotent — never rotates an existing one).
-        self.kms.ensure_kek(&KekId::new(tenant.clone(), region.clone()));
+        self.kms
+            .ensure_kek(&KekId::new(tenant.clone(), region.clone()));
         // L2: reserve the PER-TENANT DEK under it — the Refs bulk crypto-shred unit. The returned
         // ref is what the REF-P5 edge table / REF-P12 cache key on (encrypted-from-birth).
-        self.kms.ensure_dek(tenant, region, Self::tenant_dek_class())
+        self.kms
+            .ensure_dek(tenant, region, Self::tenant_dek_class())
     }
 
     /// **Reserve the per-subject DEK backstop for a name landing in a cached title (§3.6 / 11.4).**
@@ -123,8 +125,10 @@ impl RefsDekPin {
         region: &Region,
         subject_id: &str,
     ) -> Result<PiiKeyRef, KmsError> {
-        self.kms.ensure_kek(&KekId::new(tenant.clone(), region.clone()));
-        self.kms.ensure_dek(tenant, region, Self::subject_dek_class(subject_id))
+        self.kms
+            .ensure_kek(&KekId::new(tenant.clone(), region.clone()));
+        self.kms
+            .ensure_dek(tenant, region, Self::subject_dek_class(subject_id))
     }
 
     /// **Tenant-decommission crypto-shred (destroy is callable on the per-tenant key class).**
@@ -136,7 +140,8 @@ impl RefsDekPin {
     /// over real Refs index data (REF-D5, 0 recoverable) is REF-P15 / REF-P25 — it cannot be proven
     /// here because no index data exists yet (named floor).
     pub fn destroy_tenant_dek(&self, tenant: &TenantId, region: &Region) -> bool {
-        self.kms.destroy_kek(&KekId::new(tenant.clone(), region.clone()))
+        self.kms
+            .destroy_kek(&KekId::new(tenant.clone(), region.clone()))
     }
 
     /// **Per-subject crypto-shred (destroy is callable on the per-subject backstop class).**
@@ -144,14 +149,21 @@ impl RefsDekPin {
     /// while the tenant DEK + every other subject is untouched (the GD-4 individual lever). Returns
     /// `true` if the backstop DEK was present to destroy.
     pub fn destroy_subject_backstop(&self, tenant: &TenantId, subject_id: &str) -> bool {
-        self.kms.destroy_dek(&DekId::new(tenant.clone(), Self::subject_dek_class(subject_id)))
+        self.kms.destroy_dek(&DekId::new(
+            tenant.clone(),
+            Self::subject_dek_class(subject_id),
+        ))
     }
 
     /// Resolve the per-tenant DEK named by `key_ref` (the read-path key-resolution step the REF-P5
     /// edge reads / REF-P12 cache reads will call). A destroyed-key / wrong-key resolve fails LOUDLY
     /// ([`KmsError`]) — **never** a plaintext-without-key fall-through (the 0-fail-open invariant the
     /// storage engine enforces). Exposed so the REF-P5 read path resolves through the SAME pin.
-    pub fn resolve(&self, key_ref: &PiiKeyRef, region: &Region) -> Result<myelin_storage::DekHandle, KmsError> {
+    pub fn resolve(
+        &self,
+        key_ref: &PiiKeyRef,
+        region: &Region,
+    ) -> Result<myelin_storage::DekHandle, KmsError> {
         self.kms.resolve_dek(key_ref, region)
     }
 
@@ -165,7 +177,9 @@ impl RefsDekPin {
 impl std::fmt::Debug for RefsDekPin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The engine redacts all key material; this only names the pin (never key bytes).
-        f.debug_struct("RefsDekPin").field("kms", &self.kms).finish()
+        f.debug_struct("RefsDekPin")
+            .field("kms", &self.kms)
+            .finish()
     }
 }
 
@@ -250,15 +264,30 @@ mod tests {
     #[test]
     fn per_tenant_dek_is_reserved_and_resolvable() {
         let pin = RefsDekPin::new(kms());
-        let key_ref = pin.reserve(&t(), &r()).expect("reserve the per-tenant Refs DEK");
-        assert_eq!(key_ref.class, KeyClass::Tenant, "the Refs bulk class is per-tenant");
-        assert_eq!(key_ref.to_uri(), "kms://acme/0/tenant", "the encrypted-from-birth key ref");
+        let key_ref = pin
+            .reserve(&t(), &r())
+            .expect("reserve the per-tenant Refs DEK");
+        assert_eq!(
+            key_ref.class,
+            KeyClass::Tenant,
+            "the Refs bulk class is per-tenant"
+        );
+        assert_eq!(
+            key_ref.to_uri(),
+            "kms://acme/0/tenant",
+            "the encrypted-from-birth key ref"
+        );
 
         // The reserved DEK is a REAL key: a payload sealed under it round-trips (encrypted-from-birth
         // is not a stub — the key is usable from the moment the index lands).
-        let dek = pin.resolve(&key_ref, &r()).expect("resolve the reserved per-tenant DEK");
+        let dek = pin
+            .resolve(&key_ref, &r())
+            .expect("resolve the reserved per-tenant DEK");
         let (nonce, ct) = dek.seal(b"a future edge row's bulk column");
-        assert_eq!(dek.open(&nonce, &ct).as_deref(), Some(&b"a future edge row's bulk column"[..]));
+        assert_eq!(
+            dek.open(&nonce, &ct).as_deref(),
+            Some(&b"a future edge row's bulk column"[..])
+        );
     }
 
     /// **Reserving the per-tenant DEK is idempotent** — `serve` re-running the reservation on a
@@ -269,7 +298,10 @@ mod tests {
         let pin = RefsDekPin::new(kms());
         let a = pin.reserve(&t(), &r()).expect("first reserve");
         let b = pin.reserve(&t(), &r()).expect("second reserve");
-        assert_eq!(a, b, "re-reserving returns the same per-tenant DEK ref (no silent rotation)");
+        assert_eq!(
+            a, b,
+            "re-reserving returns the same per-tenant DEK ref (no silent rotation)"
+        );
     }
 
     /// **The per-subject backstop is a DISTINCT key from the per-tenant DEK (§3.6 / GD-4).** A name
@@ -303,15 +335,27 @@ mod tests {
     fn destroy_tenant_dek_is_callable_and_renders_the_key_unrecoverable() {
         let pin = RefsDekPin::new(kms());
         let key_ref = pin.reserve(&t(), &r()).expect("reserve");
-        assert!(pin.resolve(&key_ref, &r()).is_ok(), "resolvable before the shred");
+        assert!(
+            pin.resolve(&key_ref, &r()).is_ok(),
+            "resolvable before the shred"
+        );
 
         // The structural proof: destroy fires exactly once on a present key class.
-        assert!(pin.destroy_tenant_dek(&t(), &r()), "destroy is callable + a key was present");
-        assert!(!pin.destroy_tenant_dek(&t(), &r()), "a second destroy reports nothing left");
+        assert!(
+            pin.destroy_tenant_dek(&t(), &r()),
+            "destroy is callable + a key was present"
+        );
+        assert!(
+            !pin.destroy_tenant_dek(&t(), &r()),
+            "a second destroy reports nothing left"
+        );
 
         // Post-shred the key is unrecoverable — LOUD failure, never plaintext-without-key.
         assert!(
-            matches!(pin.resolve(&key_ref, &r()), Err(KmsError::KekUnavailable(_))),
+            matches!(
+                pin.resolve(&key_ref, &r()),
+                Err(KmsError::KekUnavailable(_))
+            ),
             "a crypto-shredded per-tenant DEK resolves to a LOUD error, never a plaintext"
         );
     }
@@ -345,12 +389,27 @@ mod tests {
         let s1 = pin.reserve_subject_backstop(&t(), &r(), "u-1").expect("s1");
         let s2 = pin.reserve_subject_backstop(&t(), &r(), "u-2").expect("s2");
 
-        assert!(pin.destroy_subject_backstop(&t(), "u-1"), "subject backstop present to destroy");
-        assert!(!pin.destroy_subject_backstop(&t(), "u-1"), "a second destroy finds nothing");
+        assert!(
+            pin.destroy_subject_backstop(&t(), "u-1"),
+            "subject backstop present to destroy"
+        );
+        assert!(
+            !pin.destroy_subject_backstop(&t(), "u-1"),
+            "a second destroy finds nothing"
+        );
 
-        assert!(pin.resolve(&s1, &r()).is_err(), "u-1's cached-title key is shredded");
-        assert!(pin.resolve(&tk, &r()).is_ok(), "the tenant DEK is untouched");
-        assert!(pin.resolve(&s2, &r()).is_ok(), "u-2's backstop is untouched");
+        assert!(
+            pin.resolve(&s1, &r()).is_err(),
+            "u-1's cached-title key is shredded"
+        );
+        assert!(
+            pin.resolve(&tk, &r()).is_ok(),
+            "the tenant DEK is untouched"
+        );
+        assert!(
+            pin.resolve(&s2, &r()).is_ok(),
+            "u-2's backstop is untouched"
+        );
     }
 
     /// **A crypto-shredded Refs tenant is excluded from the KMS backup snapshot** (§7.5 / STOR-D3 by
@@ -365,10 +424,16 @@ mod tests {
         pin.reserve(&live, &r()).expect("live");
         pin.reserve(&dead, &r()).expect("dead");
 
-        assert!(pin.destroy_tenant_dek(&dead, &r()), "offboard the dead tenant");
+        assert!(
+            pin.destroy_tenant_dek(&dead, &r()),
+            "offboard the dead tenant"
+        );
 
         let snap = kms.backup_snapshot();
-        assert!(snap.iter().any(|(d, _)| d.tenant == live), "live tenant DEK backed up");
+        assert!(
+            snap.iter().any(|(d, _)| d.tenant == live),
+            "live tenant DEK backed up"
+        );
         assert!(
             !snap.iter().any(|(d, _)| d.tenant == dead),
             "a crypto-shredded Refs tenant is EXCLUDED from backup (stays dead across restore)"
@@ -388,7 +453,10 @@ mod tests {
             kms.resolve_dek(&key_ref, &r()).is_ok(),
             "the shared cell engine resolves the DEK the Refs pin reserved (one hierarchy)"
         );
-        assert!(Arc::ptr_eq(pin.engine(), &kms), "the pin holds the very same cell engine");
+        assert!(
+            Arc::ptr_eq(pin.engine(), &kms),
+            "the pin holds the very same cell engine"
+        );
     }
 
     /// **The REF-P5 inherited-gate precondition list is complete + names the load-bearing gates (the
@@ -399,12 +467,21 @@ mod tests {
     fn ref_p5_inherited_gates_name_every_precondition() {
         let gates = ref_p5_inherited_gates();
         let ids: Vec<&str> = gates.iter().map(|g| g.id).collect();
-        for required in ["STOR-D1", "STOR-D2", "ID-D3", "ID-D2", "ID-D1", "CP-D2", "CP-D3"] {
-            assert!(ids.contains(&required), "the REF-P5 precondition list names {required}");
+        for required in [
+            "STOR-D1", "STOR-D2", "ID-D3", "ID-D2", "ID-D1", "CP-D2", "CP-D3",
+        ] {
+            assert!(
+                ids.contains(&required),
+                "the REF-P5 precondition list names {required}"
+            );
         }
         // Every gate carries a non-empty guarantee (a named gate without its meaning is useless).
         for g in &gates {
-            assert!(!g.guarantees.is_empty(), "gate {} states what it guarantees", g.id);
+            assert!(
+                !g.guarantees.is_empty(),
+                "gate {} states what it guarantees",
+                g.id
+            );
         }
     }
 }

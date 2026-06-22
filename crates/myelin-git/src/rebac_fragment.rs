@@ -87,7 +87,10 @@ fn fragment(object_type: &str, relations: &[&str], permissions: &[&str]) -> Name
     NamespaceFragment {
         object_type: ObjectType(object_type.to_string()),
         relations: relations.iter().map(|r| RelName(r.to_string())).collect(),
-        permissions: permissions.iter().map(|p| Permission(p.to_string())).collect(),
+        permissions: permissions
+            .iter()
+            .map(|p| Permission(p.to_string()))
+            .collect(),
     }
 }
 

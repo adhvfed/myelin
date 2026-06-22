@@ -183,13 +183,22 @@ mod tests {
     fn the_prerequisite_is_recorded_as_a_git_m3_obligation() {
         let p = COMMIT_IDENTITY_PREREQUISITE;
         assert_eq!(p.contract_row, "10.9", "owns the prerequisite leg of 10.9");
-        assert_eq!(p.consumed_grammar_contract, "4.8", "consumes the frozen grammar (Identity owns)");
+        assert_eq!(
+            p.consumed_grammar_contract, "4.8",
+            "consumes the frozen grammar (Identity owns)"
+        );
         assert_eq!(
             p.required_actor_grammar, "<pseudonym>@<tenant>.noreply",
             "the recorded obligation references the frozen grammar, never restates it"
         );
-        assert_eq!(p.enforced_band, "M3", "satisfied in M3 (decided in M1, before the data model freezes)");
-        assert!(!p.recorded_on.is_empty(), "the recorded obligation is dated (a claim must not outlive its verification)");
+        assert_eq!(
+            p.enforced_band, "M3",
+            "satisfied in M3 (decided in M1, before the data model freezes)"
+        );
+        assert!(
+            !p.recorded_on.is_empty(),
+            "the recorded obligation is dated (a claim must not outlive its verification)"
+        );
         assert!(
             p.enforced_by_prompt.contains("P-GA-28") || p.enforced_by_prompt.contains("P-GA-27"),
             "the M3 enforcement follow-on is named in writing"
@@ -201,11 +210,20 @@ mod tests {
     #[test]
     fn the_recorded_obligation_renders_a_dated_note() {
         let note = COMMIT_IDENTITY_PREREQUISITE.render();
-        assert!(note.contains("<pseudonym>@<tenant>.noreply"), "the note references the frozen grammar");
-        assert!(note.contains("contract 10.9"), "the note records the contract row");
+        assert!(
+            note.contains("<pseudonym>@<tenant>.noreply"),
+            "the note references the frozen grammar"
+        );
+        assert!(
+            note.contains("contract 10.9"),
+            "the note records the contract row"
+        );
         assert!(note.contains("2026-06-20"), "the note is dated");
         assert!(note.contains("M3"), "the note records the enforcement band");
-        assert!(note.contains("critical-path obligation"), "the note states it is GDPR's ONE obligation");
+        assert!(
+            note.contains("critical-path obligation"),
+            "the note states it is GDPR's ONE obligation"
+        );
     }
 
     /// **The architecture-test scaffold's verdict: a fixture commit-actor in the frozen pseudonym
@@ -235,15 +253,18 @@ mod tests {
             "ada@example.com",                // a bare routable email
             "Ada Lovelace",                   // a bare real name
             "",                               // empty
-            "anon-7f3a@acme.com",             // pseudonym-LOCAL but ROUTABLE domain (wrong suffix) — must fail
-            "anon-7f3a@acme",                 // missing the .noreply suffix entirely
+            "anon-7f3a@acme.com", // pseudonym-LOCAL but ROUTABLE domain (wrong suffix) — must fail
+            "anon-7f3a@acme",     // missing the .noreply suffix entirely
         ];
         for form in real_identity_forms {
             assert!(
                 !commit_actor_holds_only_pseudonym(form),
                 "a real-identity / non-conforming commit actor {form:?} must FAIL the verdict (would bake PII)"
             );
-            assert!(!verdict_for(form).holds_only_pseudonym, "the verdict for {form:?} is a failure");
+            assert!(
+                !verdict_for(form).holds_only_pseudonym,
+                "the verdict for {form:?} is a failure"
+            );
         }
     }
 
@@ -253,6 +274,9 @@ mod tests {
     fn a_failing_verdict_names_the_offending_bytes() {
         let v = verdict_for("ada@example.com");
         assert!(!v.holds_only_pseudonym);
-        assert_eq!(v.actor_bytes, "ada@example.com", "the failing verdict names the rejected bytes");
+        assert_eq!(
+            v.actor_bytes, "ada@example.com",
+            "the failing verdict names the rejected bytes"
+        );
     }
 }

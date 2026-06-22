@@ -516,16 +516,16 @@ pub mod agent_trace_seam;
 pub mod audit;
 pub mod audit_proofs;
 pub mod commit_prerequisite;
-pub mod ediscovery;
-pub mod history_rewrite;
 pub mod datamap;
 pub mod derivative_erasure;
 pub mod diffgate;
 pub mod dsr;
-pub mod git_instance;
 pub mod dsr_timer;
+pub mod ediscovery;
 pub mod erasure_ledger;
 pub mod fanout;
+pub mod git_instance;
+pub mod history_rewrite;
 pub mod holders;
 pub mod orchestration;
 pub mod posture;
@@ -536,25 +536,15 @@ pub mod retention;
 pub mod structural_floor;
 pub mod tenant_ops;
 
-pub use audit::{
-    AuditConsumer, AuditEntry, AuditLog, Minimised, Outcome, AUDIT_APPEND_LAG,
-};
-pub use audit_proofs::{
-    serialize_sth_commitment, verify_consistency, verify_inclusion, AuditAuthority, CellSigningKey,
-    ConsistencyProof, InclusionProof, NotaryWitness, SignedTreeHead, SigningKey, Witness,
-    WitnessAttestation, DSR_SEAL_ACTION, STH_PUBLISH_AGE,
-};
 pub use agent_trace_seam::{
     agent_trace_phase, trace_is_distinct_from_audit, AgentTraceHolderSeam, AGENT_TRACE_ERASABLE,
     AGENT_TRACE_HOLDER_ID, AGENT_TRACE_IMPL_PROMPT, AUDIT_LOG_ERASABLE,
 };
-pub use ediscovery::{
-    EDiscoveryBundle, EDiscoveryExporter, EDiscoveryRecord, EDiscoveryScope,
-    EDISCOVERY_EXPORT_RECORDS,
-};
-pub use history_rewrite::{
-    HistoryRewriteActivity, HistoryRewriteReceipt, HistoryRewriteRequest, PhaseReceipt,
-    RewritePhase, HISTORY_REWRITE_ACTION, HISTORY_REWRITE_FIRST_CLASS_PROMPT,
+pub use audit::{AuditConsumer, AuditEntry, AuditLog, Minimised, Outcome, AUDIT_APPEND_LAG};
+pub use audit_proofs::{
+    serialize_sth_commitment, verify_consistency, verify_inclusion, AuditAuthority, CellSigningKey,
+    ConsistencyProof, InclusionProof, NotaryWitness, SignedTreeHead, SigningKey, Witness,
+    WitnessAttestation, DSR_SEAL_ACTION, STH_PUBLISH_AGE,
 };
 pub use commit_prerequisite::{
     commit_actor_holds_only_pseudonym, verdict_for, CommitActorVerdict, CommitIdentityPrerequisite,
@@ -568,7 +558,8 @@ pub use datamap::{
 pub use derivative_erasure::{
     derivative_holder_ids, derivative_phase_of, DerivativeEraseReceipt, DerivativeErasureDriver,
     NotifHistoryHolder, NotifHistoryModel, RectifyOutcome, RefsGraphHolder, RefsGraphModel,
-    RefsResolve, SearchIndexHolder, SearchIndexModel, DERIVATIVE_ERASE_FANOUT_COVERAGE, ERASED_USER,
+    RefsResolve, SearchIndexHolder, SearchIndexModel, DERIVATIVE_ERASE_FANOUT_COVERAGE,
+    ERASED_USER,
 };
 pub use diffgate::{
     check_against_baseline, diff, CommittedBaseline, DataMapDiff, GateVerdict, Reclassification,
@@ -583,6 +574,10 @@ pub use dsr_timer::{
     DsrDeadlineTimer, DsrDeadlineWarning, DsrTimerWheel, TimerEntrySnapshot, TimerError,
     DSR_DEADLINE_MARGIN,
 };
+pub use ediscovery::{
+    EDiscoveryBundle, EDiscoveryExporter, EDiscoveryRecord, EDiscoveryScope,
+    EDISCOVERY_EXPORT_RECORDS,
+};
 pub use erasure_ledger::{
     DestroyedKeyEpoch, ErasureLedger, ErasureLedgerEntry, PostPitRecord, ERASURE_LEDGER_ENTRIES,
     ERASURE_LEDGER_STORE,
@@ -595,6 +590,10 @@ pub use git_instance::{
     git_residual, git_residual_is_the_one_posture, git_section_references_posture,
     pseudonym_actor_lines_pass_the_prerequisite, residual_is_the_one_posture,
     section_references_posture, GIT_INSTANCE, GIT_SUBSYSTEM, HISTORY_REWRITE_FLOOR_PROMPT,
+};
+pub use history_rewrite::{
+    HistoryRewriteActivity, HistoryRewriteReceipt, HistoryRewriteRequest, PhaseReceipt,
+    RewritePhase, HISTORY_REWRITE_ACTION, HISTORY_REWRITE_FIRST_CLASS_PROMPT,
 };
 pub use holders::{
     gdpr_owned_holder_ids, AuditCarveOutHolder, CryptoShredKms, GdprOwnStoreHolder,
@@ -615,9 +614,9 @@ pub use producer_holders::{
     KnowledgeStoreModel, ProducerHolderRegistration,
 };
 pub use registries::{
-    is_eea_region, ConsentRecord, ConsentRegistry, SubProcessor, SubProcessorRegistry, TransferGate,
-    TransferVerdict, WithdrawalBasis, WithdrawalEffect, CONSENT_WITHDRAWALS, SUBPROCESSOR_OBJECTIONS,
-    TRANSFER_GATE_EXTRA_EU_DENIALS,
+    is_eea_region, ConsentRecord, ConsentRegistry, SubProcessor, SubProcessorRegistry,
+    TransferGate, TransferVerdict, WithdrawalBasis, WithdrawalEffect, CONSENT_WITHDRAWALS,
+    SUBPROCESSOR_OBJECTIONS, TRANSFER_GATE_EXTRA_EU_DENIALS,
 };
 pub use restrict_fanout::{
     restrict_holder_ids, DerivedProcessed, DerivedProcessing, DerivedRestrictVerdict, DerivedStore,

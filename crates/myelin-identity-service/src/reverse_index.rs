@@ -432,7 +432,9 @@ impl ReverseIndexConsumer {
             Some(z) => Zookie(z.to_string()),
             // A tuple-written event with no zookie is structurally malformed (S3 always stamps one)
             // → a non-retryable poison: never silently project a watermark-less delta.
-            None => return Err("iam.tuple_written event carries no zookie (the S8 watermark)".into()),
+            None => {
+                return Err("iam.tuple_written event carries no zookie (the S8 watermark)".into())
+            }
         };
 
         // The deltas (opaque object#relation@subject refs). A missing/empty deltas array is a no-op
@@ -455,7 +457,10 @@ impl ReverseIndexConsumer {
             // `(subject, relation, object)` projection — S8 projects the DIRECT subject grants the
             // JOIN keys on (a principal id, never a `#`-bearing userset). The userset-expansion
             // (list_subjects at density) is P-ID-13; the reverse index of DIRECT grants is here.
-            if subject.is_empty() || object.is_empty() || relation.is_empty() || subject.contains('#')
+            if subject.is_empty()
+                || object.is_empty()
+                || relation.is_empty()
+                || subject.contains('#')
             {
                 continue;
             }
@@ -479,8 +484,7 @@ impl ReverseIndexConsumer {
         // dummy partition apply at the `(tenant, region)` grain so the watermark advances independent
         // of whether a direct-grant row was projected.
         if !applied_any {
-            self.index
-                .advance_watermark_only(&scope, &zookie);
+            self.index.advance_watermark_only(&scope, &zookie);
         }
         Ok(())
     }
@@ -549,9 +553,7 @@ mod tests {
     use super::*;
     use crate::tuple_store::TupleStore;
     use myelin_events::{BusTransport, InProcessBus, OutboxStore, Relay, Timestamp};
-    use myelin_identity::{
-        Principal, PrincipalKind, RelationTuple, TupleDelta,
-    };
+    use myelin_identity::{Principal, PrincipalKind, RelationTuple, TupleDelta};
     use myelin_tenancy::{Region, TenantId};
 
     fn scope(tenant: &str) -> TenantScope {
@@ -591,7 +593,14 @@ mod tests {
         // The write actor's tenant matches the scope's tenant (one verified scope stamps both the
         // tuple partition and the event envelope), so the projected row lands in the right partition.
         let z = store
-            .write_tuples(scope, &actor_in(&scope.tenant().0), deltas, None, None, now())
+            .write_tuples(
+                scope,
+                &actor_in(&scope.tenant().0),
+                deltas,
+                None,
+                None,
+                now(),
+            )
             .expect("write");
         // Drain the relay (what `serve` does) and hand each published envelope to the S8 consumer.
         let bus = InProcessBus::new();
@@ -626,15 +635,28 @@ mod tests {
         );
 
         // The watermark advanced to the write's zookie (§8.7).
-        assert_eq!(index.watermark(&s), z, "the S8 watermark advances on each iam.tuple_written");
+        assert_eq!(
+            index.watermark(&s),
+            z,
+            "the S8 watermark advances on each iam.tuple_written"
+        );
         // The projection holds the (subject, relation, object_id) row.
         assert_eq!(
-            index.objects_for(&s, &ObjectType("repo".into()), &PrincipalId("p:alice".into()), &RelName("reader".into())),
+            index.objects_for(
+                &s,
+                &ObjectType("repo".into()),
+                &PrincipalId("p:alice".into()),
+                &RelName("reader".into())
+            ),
             vec![ObjectId("repo:core".into())],
             "S8 projects the direct grant into the reverse index"
         );
         // reverse_index_lag is 0 in steady state (the synchronous apply cleared it).
-        assert_eq!(consumer.lag(), 0, "reverse_index_lag returns to 0 after projection");
+        assert_eq!(
+            consumer.lag(),
+            0,
+            "reverse_index_lag returns to 0 after projection"
+        );
     }
 
     /// **The watermark advances monotonically across writes** (§8.7). Two sequential writes advance
@@ -647,14 +669,34 @@ mod tests {
         let consumer = ReverseIndexConsumer::new(index.clone());
         let s = scope("acme");
 
-        let z0 = feed_write(&store, &outbox, &consumer, &s, &[TupleDelta::Add(tuple("repo:a", "reader", "p:alice"))]);
-        let z1 = feed_write(&store, &outbox, &consumer, &s, &[TupleDelta::Add(tuple("repo:b", "reader", "p:bob"))]);
+        let z0 = feed_write(
+            &store,
+            &outbox,
+            &consumer,
+            &s,
+            &[TupleDelta::Add(tuple("repo:a", "reader", "p:alice"))],
+        );
+        let z1 = feed_write(
+            &store,
+            &outbox,
+            &consumer,
+            &s,
+            &[TupleDelta::Add(tuple("repo:b", "reader", "p:bob"))],
+        );
         assert!(z1.0 > z0.0, "the second write's zookie is newer");
-        assert_eq!(index.watermark(&s), z1, "the watermark is at the latest write");
+        assert_eq!(
+            index.watermark(&s),
+            z1,
+            "the watermark is at the latest write"
+        );
 
         // A redelivered OLDER event (z0's add again) must NOT regress the watermark.
         index.advance_watermark_only(&s, &z0);
-        assert_eq!(index.watermark(&s), z1, "an older redelivery never moves the watermark backward");
+        assert_eq!(
+            index.watermark(&s),
+            z1,
+            "an older redelivery never moves the watermark backward"
+        );
     }
 
     /// **A remove delta tombstones the reverse row (the JOIN stops returning it).** Add then remove
@@ -666,12 +708,29 @@ mod tests {
         let index = ReverseIndex::new();
         let consumer = ReverseIndexConsumer::new(index.clone());
         let s = scope("acme");
-        feed_write(&store, &outbox, &consumer, &s, &[TupleDelta::Add(tuple("repo:core", "reader", "p:alice"))]);
+        feed_write(
+            &store,
+            &outbox,
+            &consumer,
+            &s,
+            &[TupleDelta::Add(tuple("repo:core", "reader", "p:alice"))],
+        );
         assert_eq!(index.row_count(&s, &ObjectType("repo".into())), 1);
-        feed_write(&store, &outbox, &consumer, &s, &[TupleDelta::Remove(tuple("repo:core", "reader", "p:alice"))]);
+        feed_write(
+            &store,
+            &outbox,
+            &consumer,
+            &s,
+            &[TupleDelta::Remove(tuple("repo:core", "reader", "p:alice"))],
+        );
         assert!(
             index
-                .objects_for(&s, &ObjectType("repo".into()), &PrincipalId("p:alice".into()), &RelName("reader".into()))
+                .objects_for(
+                    &s,
+                    &ObjectType("repo".into()),
+                    &PrincipalId("p:alice".into()),
+                    &RelName("reader".into())
+                )
                 .is_empty(),
             "a removed grant is gone from the reverse index"
         );
@@ -690,9 +749,25 @@ mod tests {
             relation: RelName("reader".into()),
             object_id: ObjectId("repo:core".into()),
         };
-        index.apply_delta(&s, "add", &ObjectType("repo".into()), row.clone(), &Zookie("zk-00000000000000000001".into()));
-        index.apply_delta(&s, "add", &ObjectType("repo".into()), row, &Zookie("zk-00000000000000000001".into()));
-        assert_eq!(index.row_count(&s, &ObjectType("repo".into())), 1, "a re-add is idempotent (one row)");
+        index.apply_delta(
+            &s,
+            "add",
+            &ObjectType("repo".into()),
+            row.clone(),
+            &Zookie("zk-00000000000000000001".into()),
+        );
+        index.apply_delta(
+            &s,
+            "add",
+            &ObjectType("repo".into()),
+            row,
+            &Zookie("zk-00000000000000000001".into()),
+        );
+        assert_eq!(
+            index.row_count(&s, &ObjectType("repo".into())),
+            1,
+            "a re-add is idempotent (one row)"
+        );
         let _ = consumer; // the consumer drives apply_delta; the apply is exercised directly here.
     }
 
@@ -707,13 +782,28 @@ mod tests {
         let consumer = ReverseIndexConsumer::new(index.clone());
         let acme = scope("acme");
         let globex = scope("globex");
-        feed_write(&store, &outbox, &consumer, &acme, &[TupleDelta::Add(tuple("repo:core", "reader", "p:alice"))]);
+        feed_write(
+            &store,
+            &outbox,
+            &consumer,
+            &acme,
+            &[TupleDelta::Add(tuple("repo:core", "reader", "p:alice"))],
+        );
 
         // globex sees NOTHING acme projected (the partition is keyed by the verified scope).
-        assert_eq!(index.row_count(&globex, &ObjectType("repo".into())), 0, "0 cross-tenant S8 rows");
+        assert_eq!(
+            index.row_count(&globex, &ObjectType("repo".into())),
+            0,
+            "0 cross-tenant S8 rows"
+        );
         assert!(
             index
-                .objects_for(&globex, &ObjectType("repo".into()), &PrincipalId("p:alice".into()), &RelName("reader".into()))
+                .objects_for(
+                    &globex,
+                    &ObjectType("repo".into()),
+                    &PrincipalId("p:alice".into()),
+                    &RelName("reader".into())
+                )
                 .is_empty(),
             "no cross-tenant reverse lookup path"
         );
@@ -729,7 +819,11 @@ mod tests {
     #[test]
     fn s8_auto_registers_as_a_personal_data_holder() {
         let index = ReverseIndex::new();
-        assert_eq!(index.holder().store, S8_HOLDER, "S8 registered under its holder name");
+        assert_eq!(
+            index.holder().store,
+            S8_HOLDER,
+            "S8 registered under its holder name"
+        );
         let receipt = index.holder().register();
         assert_eq!(receipt.store, S8_HOLDER);
     }
@@ -750,12 +844,24 @@ mod tests {
             &outbox,
             &consumer,
             &s,
-            &[TupleDelta::Add(tuple("repo:core", "reader", "org:acme#member"))],
+            &[TupleDelta::Add(tuple(
+                "repo:core",
+                "reader",
+                "org:acme#member",
+            ))],
         );
         // No DIRECT row (the subject is a userset).
-        assert_eq!(index.row_count(&s, &ObjectType("repo".into())), 0, "a userset subject is not a direct row");
+        assert_eq!(
+            index.row_count(&s, &ObjectType("repo".into())),
+            0,
+            "a userset subject is not a direct row"
+        );
         // But the watermark advanced (the write is a valid revision).
-        assert_eq!(index.watermark(&s), z, "the watermark advances even for a userset-only write");
+        assert_eq!(
+            index.watermark(&s),
+            z,
+            "the watermark advances even for a userset-only write"
+        );
     }
 
     /// **A zookie-less `iam.tuple_written` is a non-retryable poison (never a silent corruption).**

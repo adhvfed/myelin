@@ -196,7 +196,10 @@ impl core::fmt::Display for CompactionError {
                 f,
                 "cannot compact up to op_seq {requested}: beyond the op-log head {head}"
             ),
-            CompactionError::UnreconstructableGap { target, lowest_available } => write!(
+            CompactionError::UnreconstructableGap {
+                target,
+                lowest_available,
+            } => write!(
                 f,
                 "cannot reconstruct version {target}: ops below {lowest_available} were GC'd \
                  (the snapshot the target needs was pruned) — refusing a non-exact reconstruction"
@@ -226,8 +229,16 @@ pub struct SnapshotCompactor<'b, B: BlobStore> {
 impl<'b, B: BlobStore> SnapshotCompactor<'b, B> {
     /// Open a compactor for one doc over `blobs` (the fs-backed-floor BlobStore on M1; the object
     /// store on KN-P31). The `page_id` is the doc (aggregate) the snapshot materialises.
-    pub fn new(tenant: TenantId, page_id: impl Into<String>, blobs: &'b B) -> SnapshotCompactor<'b, B> {
-        SnapshotCompactor { tenant, page_id: page_id.into(), blobs }
+    pub fn new(
+        tenant: TenantId,
+        page_id: impl Into<String>,
+        blobs: &'b B,
+    ) -> SnapshotCompactor<'b, B> {
+        SnapshotCompactor {
+            tenant,
+            page_id: page_id.into(),
+            blobs,
+        }
     }
 
     /// **Compact the op-log up to `up_to_seq` → a content-addressed snapshot (arch §3 / §3.4 step 1).**
@@ -250,7 +261,10 @@ impl<'b, B: BlobStore> SnapshotCompactor<'b, B> {
         named_label: Option<String>,
     ) -> Result<DocSnapshot, CompactionError> {
         if up_to_seq > log.head_seq() {
-            return Err(CompactionError::BeyondHead { requested: up_to_seq, head: log.head_seq() });
+            return Err(CompactionError::BeyondHead {
+                requested: up_to_seq,
+                head: log.head_seq(),
+            });
         }
         // (1) materialise the state from the ops up to (and including) up_to_seq — deterministic.
         let prefix = log.ops_up_to(up_to_seq);
@@ -390,15 +404,20 @@ impl<'b, B: BlobStore> SnapshotCompactor<'b, B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use myelin_storage::blob::FsBlobStore;
     use crate::transport::{DocOp, OpId, OpKind};
+    use myelin_storage::blob::FsBlobStore;
 
     fn tenant() -> TenantId {
         TenantId("acme".into())
     }
 
     fn op(client: &str, lamport: u64, kind: OpKind, payload: &str) -> DocOp {
-        DocOp::cas(OpId::new(client, lamport), "actor-1", kind, payload.as_bytes().to_vec())
+        DocOp::cas(
+            OpId::new(client, lamport),
+            "actor-1",
+            kind,
+            payload.as_bytes().to_vec(),
+        )
     }
 
     /// Build an op-log with `n` ops (op_seq 1..=n), each a distinct payload, and return it.
@@ -420,8 +439,14 @@ mod tests {
         let prefix = log.ops_up_to(5);
         let a = materialize(&prefix);
         let b = materialize(&prefix);
-        assert_eq!(a, b, "the same op sequence materialises to the same bytes (deterministic)");
-        assert!(!a.is_empty(), "a non-empty doc materialises to non-empty state");
+        assert_eq!(
+            a, b,
+            "the same op sequence materialises to the same bytes (deterministic)"
+        );
+        assert!(
+            !a.is_empty(),
+            "a non-empty doc materialises to non-empty state"
+        );
     }
 
     /// Distinct op sequences materialise to DISTINCT bytes (the framing is injective — no two states
@@ -432,7 +457,10 @@ mod tests {
         let log = log_with(5);
         let s3 = materialize(&log.ops_up_to(3));
         let s5 = materialize(&log.ops_up_to(5));
-        assert_ne!(s3, s5, "distinct versions materialise to distinct state bytes");
+        assert_ne!(
+            s3, s5,
+            "distinct versions materialise to distinct state bytes"
+        );
     }
 
     /// **The op CONTENT is in the materialised state (the framing must carry op_id/kind/payload, not
@@ -531,20 +559,36 @@ mod tests {
         // Compact up to op_seq 4 → a content-addressed snapshot; the live tail (5..=8) is KEPT.
         let snapshot = comp.compact(&log, 4, None).expect("compact up to 4");
         assert_eq!(snapshot.snap_seq, 4);
-        assert_eq!(log.head_seq(), 8, "compaction did NOT touch the op_seq counter");
-        assert_eq!(log.len(), 8, "compaction did NOT prune the op-log (that is GC)");
+        assert_eq!(
+            log.head_seq(),
+            8,
+            "compaction did NOT touch the op_seq counter"
+        );
+        assert_eq!(
+            log.len(),
+            8,
+            "compaction did NOT prune the op-log (that is GC)"
+        );
 
         // GC the compacted range with NO open clients → prune doc_op rows ≤ 4 (the whole range).
         let pruned = comp.gc(&mut log, 4, &[]);
         assert_eq!(pruned, 4, "the 4 compacted rows (op_seq 1..=4) were GC'd");
         assert_eq!(log.len(), 4, "only the live tail (op_seq 5..=8) remains");
-        assert_eq!(log.head_seq(), 8, "the op_seq counter SURVIVED the prune (monotone)");
+        assert_eq!(
+            log.head_seq(),
+            8,
+            "the op_seq counter SURVIVED the prune (monotone)"
+        );
 
         // Reconstruct version 4 from the snapshot + the (now-pruned) tail → byte-identical.
         let reconstructed = comp
             .reconstruct_at(&log, std::slice::from_ref(&snapshot), 4)
             .expect("reconstruct version 4 from snapshot + tail");
-        let mismatches = if reconstructed == pre_compaction_v4 { 0 } else { 1 };
+        let mismatches = if reconstructed == pre_compaction_v4 {
+            0
+        } else {
+            1
+        };
         assert_eq!(
             mismatches, 0,
             "COMPACTION-ROUND-TRIP: reconstructed version 4 is byte-identical to pre-compaction \
@@ -568,7 +612,10 @@ mod tests {
         let v7 = comp
             .reconstruct_at(&log, std::slice::from_ref(&snapshot), 7)
             .expect("reconstruct version 7");
-        assert_eq!(v7, pre_v7, "version 7 = snapshot(4) + tail(5..=7), byte-identical");
+        assert_eq!(
+            v7, pre_v7,
+            "version 7 = snapshot(4) + tail(5..=7), byte-identical"
+        );
     }
 
     /// **A GC'd range is reconstructable from the snapshot (the prompt's explicit TEST).** After GC,
@@ -583,13 +630,19 @@ mod tests {
 
         let snapshot = comp.compact(&log, 4, None).expect("compact 4");
         comp.gc(&mut log, 4, &[]);
-        assert!(log.ops_up_to(4).iter().all(|p| p.op_seq > 4), "the range ≤ 4 was pruned from the log");
+        assert!(
+            log.ops_up_to(4).iter().all(|p| p.op_seq > 4),
+            "the range ≤ 4 was pruned from the log"
+        );
 
         // Even though the op-log no longer holds ≤ 4, the snapshot reconstructs version 4 exactly.
         let v4 = comp
             .reconstruct_at(&log, std::slice::from_ref(&snapshot), 4)
             .expect("the GC'd range is reconstructable from the snapshot");
-        assert_eq!(v4, pre_v4, "a GC'd range reconstructs byte-identically from the snapshot");
+        assert_eq!(
+            v4, pre_v4,
+            "a GC'd range reconstructs byte-identically from the snapshot"
+        );
     }
 
     // ---- the GC watermark (the open-cursor rule that makes KD-1 survive compaction) -------------
@@ -607,14 +660,25 @@ mod tests {
 
         // An open client holds cursor 2 (it has applied up to op_seq 2). GC the compacted range ≤ 4.
         let pruned = comp.gc(&mut log, 4, &[2]);
-        assert_eq!(pruned, 2, "only rows ≤ 2 (below the open cursor) are pruned");
+        assert_eq!(
+            pruned, 2,
+            "only rows ≤ 2 (below the open cursor) are pruned"
+        );
         // rows 3, 4 are RETAINED (the open client at cursor 2 still needs (2, now]).
         let remaining: Vec<u64> = log.ops_up_to(8).iter().map(|p| p.op_seq).collect();
-        assert_eq!(remaining, vec![3, 4, 5, 6, 7, 8], "rows the open cursor trails are retained");
+        assert_eq!(
+            remaining,
+            vec![3, 4, 5, 6, 7, 8],
+            "rows the open cursor trails are retained"
+        );
 
         // The client at cursor 2 can still resume (2, now] = {3..8} — 0 ops lost across compaction.
         let resumed: Vec<u64> = log.ops_since(2).iter().map(|p| p.op_seq).collect();
-        assert_eq!(resumed, vec![3, 4, 5, 6, 7, 8], "the open client resumes with 0 ops lost (KD-1)");
+        assert_eq!(
+            resumed,
+            vec![3, 4, 5, 6, 7, 8],
+            "the open client resumes with 0 ops lost (KD-1)"
+        );
     }
 
     /// The LOWEST open cursor is the watermark (multiple clients): with cursors {5, 2, 6}, the
@@ -626,7 +690,10 @@ mod tests {
         let comp = SnapshotCompactor::new(tenant(), "page-1", &blobs);
         comp.compact(&log, 4, None).expect("compact 4");
         let pruned = comp.gc(&mut log, 4, &[5, 2, 6]);
-        assert_eq!(pruned, 2, "the lowest cursor (2) is the watermark — the most-behind client wins");
+        assert_eq!(
+            pruned, 2,
+            "the lowest cursor (2) is the watermark — the most-behind client wins"
+        );
     }
 
     /// With NO open clients the WHOLE compacted range (≤ snap_seq) is GC'd (no cursor to protect).
@@ -637,7 +704,10 @@ mod tests {
         let comp = SnapshotCompactor::new(tenant(), "page-1", &blobs);
         comp.compact(&log, 4, None).expect("compact 4");
         let pruned = comp.gc(&mut log, 4, &[]);
-        assert_eq!(pruned, 4, "no open client → the whole compacted range ≤ 4 is pruned");
+        assert_eq!(
+            pruned, 4,
+            "no open client → the whole compacted range ≤ 4 is pruned"
+        );
         assert_eq!(log.len(), 4, "the live tail 5..=8 remains");
     }
 
@@ -654,12 +724,23 @@ mod tests {
 
         // One BEYOND the head → loud error.
         let r = comp.compact(&log, 9, None);
-        assert!(matches!(r, Err(CompactionError::BeyondHead { requested: 9, head: 3 })));
+        assert!(matches!(
+            r,
+            Err(CompactionError::BeyondHead {
+                requested: 9,
+                head: 3
+            })
+        ));
 
         // EXACTLY at the head → succeeds (compact the whole doc up to op_seq 3). This pins the `>`
         // boundary: at-head is valid, not BeyondHead.
-        let at_head = comp.compact(&log, 3, None).expect("compacting exactly at head succeeds");
-        assert_eq!(at_head.snap_seq, 3, "the at-head snapshot covers the whole doc");
+        let at_head = comp
+            .compact(&log, 3, None)
+            .expect("compacting exactly at head succeeds");
+        assert_eq!(
+            at_head.snap_seq, 3,
+            "the at-head snapshot covers the whole doc"
+        );
         assert_eq!(
             at_head.blob_hash,
             content_address(&materialize(&log.ops_up_to(3))),
@@ -698,7 +779,10 @@ mod tests {
         comp.gc(&mut log, 4, &[]);
 
         // Corrupt the snapshot's stored object (bit-rot / tamper).
-        assert!(blobs.corrupt_for_drill(&tenant(), &snapshot.blob_hash), "snapshot blob present");
+        assert!(
+            blobs.corrupt_for_drill(&tenant(), &snapshot.blob_hash),
+            "snapshot blob present"
+        );
 
         let r = comp.reconstruct_at(&log, std::slice::from_ref(&snapshot), 4);
         assert!(
@@ -718,11 +802,20 @@ mod tests {
         let log = log_with(6);
         let blobs = FsBlobStore::new();
         let comp = SnapshotCompactor::new(tenant(), "page-1", &blobs);
-        let snapshot = comp.compact(&log, 4, Some("v1.0".into())).expect("named compact");
-        assert_eq!(snapshot.named_label.as_deref(), Some("v1.0"), "a named version (restore point)");
+        let snapshot = comp
+            .compact(&log, 4, Some("v1.0".into()))
+            .expect("named compact");
+        assert_eq!(
+            snapshot.named_label.as_deref(),
+            Some("v1.0"),
+            "a named version (restore point)"
+        );
 
         let seed = snapshot.as_page_snapshot();
-        assert_eq!(seed.snap_seq, 4, "the resync seed carries the snapshot's snap_seq");
+        assert_eq!(
+            seed.snap_seq, 4,
+            "the resync seed carries the snapshot's snap_seq"
+        );
         assert_eq!(
             seed.blob_hash,
             snapshot.blob_hash.to_multihash_string(),
@@ -733,12 +826,20 @@ mod tests {
     /// Errors render loud + specific (diagnosable, EI-01 §3).
     #[test]
     fn errors_display_loud_and_specific() {
-        assert!(CompactionError::BeyondHead { requested: 9, head: 3 }
+        assert!(CompactionError::BeyondHead {
+            requested: 9,
+            head: 3
+        }
+        .to_string()
+        .contains("beyond the op-log head"));
+        assert!(CompactionError::UnreconstructableGap {
+            target: 3,
+            lowest_available: 5
+        }
+        .to_string()
+        .contains("refusing a non-exact reconstruction"));
+        assert!(CompactionError::Blob("boom".into())
             .to_string()
-            .contains("beyond the op-log head"));
-        assert!(CompactionError::UnreconstructableGap { target: 3, lowest_available: 5 }
-            .to_string()
-            .contains("refusing a non-exact reconstruction"));
-        assert!(CompactionError::Blob("boom".into()).to_string().contains("snapshot blob error"));
+            .contains("snapshot blob error"));
     }
 }

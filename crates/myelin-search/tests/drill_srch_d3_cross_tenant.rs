@@ -58,19 +58,29 @@ fn tenant_index(tenant: &str) -> TantivyBackend {
     let mut be = TantivyBackend::open(&facet_decl()).expect("open");
     let k = OrderKey::bisect(None, None);
     be.upsert(
-        &IndexDocument::new(format!("{tenant}/issue/ENG-1"), "confidential deadlock note")
-            .with_field(ORDER_KEY_FIELD, FieldValue::OrderKey(k)),
+        &IndexDocument::new(
+            format!("{tenant}/issue/ENG-1"),
+            "confidential deadlock note",
+        )
+        .with_field(ORDER_KEY_FIELD, FieldValue::OrderKey(k)),
     )
     .unwrap();
     be
 }
 
 fn viewer(tenant: &str) -> Principal {
-    Principal::stub(PrincipalId("p:mallory".into()), PrincipalKind::Human, TenantId(tenant.into()))
+    Principal::stub(
+        PrincipalId("p:mallory".into()),
+        PrincipalKind::Human,
+        TenantId(tenant.into()),
+    )
 }
 
 fn consistency() -> Consistency {
-    Consistency { at_least: Zookie("z0".into()), mode: ConsistencyMode::BoundedStale }
+    Consistency {
+        at_least: Zookie("z0".into()),
+        mode: ConsistencyMode::BoundedStale,
+    }
 }
 
 fn ast() -> QueryAst {
@@ -96,7 +106,10 @@ impl ListObjectsPort for AllowAllAuthz {
         _a: &Consistency,
     ) -> AuthzResult<ListObjectsResult> {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        Ok(ListObjectsResult::Filter { set_expr: SetExpr::All, zookie: Zookie("z".into()) })
+        Ok(ListObjectsResult::Filter {
+            set_expr: SetExpr::All,
+            zookie: Zookie("z".into()),
+        })
     }
 }
 
@@ -109,7 +122,9 @@ fn srch_d3_cross_tenant_idor_is_zero() {
 
     // --- the attack: a viewer verified as tenant `evil` queries acme's index ---
     let mallory = viewer("evil");
-    let authz = AllowAllAuthz { calls: AtomicU64::new(0) };
+    let authz = AllowAllAuthz {
+        calls: AtomicU64::new(0),
+    };
     let stats = QueryStats::new();
     let res = query(
         &acme_engine,
@@ -122,16 +137,33 @@ fn srch_d3_cross_tenant_idor_is_zero() {
         &stats,
     );
     let err = res.expect_err("a cross-tenant query MUST be rejected (SRCH-D3)");
-    assert!(matches!(err, QueryError::TenantMismatch { .. }), "cross-tenant ⇒ TenantMismatch: {err}");
+    assert!(
+        matches!(err, QueryError::TenantMismatch { .. }),
+        "cross-tenant ⇒ TenantMismatch: {err}"
+    );
     // THE DRILL ARTIFACT: 0 cross-tenant results, AND the guard fired before any authz/engine work.
-    assert_eq!(authz.calls.load(Ordering::Relaxed), 0, "0 list_objects calls (rejected first)");
-    assert_eq!(stats.list_objects_calls(), 0, "the no-N+1 counter saw 0 (no authz consulted)");
-    assert_eq!(stats.engine_branches(), 0, "0 engine branches — acme's index is never touched");
+    assert_eq!(
+        authz.calls.load(Ordering::Relaxed),
+        0,
+        "0 list_objects calls (rejected first)"
+    );
+    assert_eq!(
+        stats.list_objects_calls(),
+        0,
+        "the no-N+1 counter saw 0 (no authz consulted)"
+    );
+    assert_eq!(
+        stats.engine_branches(),
+        0,
+        "0 engine branches — acme's index is never touched"
+    );
 
     // --- the positive control: the SAME id namespace, but a viewer of the RIGHT tenant sees it ---
     let evil = tenant_index("evil");
     let evil_engine = ScopedEngine::new(&evil, "evil", "eu-west", schema());
-    let authz2 = AllowAllAuthz { calls: AtomicU64::new(0) };
+    let authz2 = AllowAllAuthz {
+        calls: AtomicU64::new(0),
+    };
     let stats2 = QueryStats::new();
     let res2 = query(
         &evil_engine,

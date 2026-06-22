@@ -31,14 +31,30 @@ fn stor_d5_cdn_within_eu_zero_cross_region_egress() {
     let tenant = TenantId::from_token("tenant-d5-cdn");
     let region = Region::new("fr-par");
     let store = FsBlobStore::new();
-    let cdn = CdnCloneClass::over(tenant.clone(), region.clone(), /* tenant_is_eu */ true, &store);
+    let cdn = CdnCloneClass::over(
+        tenant.clone(),
+        region.clone(),
+        /* tenant_is_eu */ true,
+        &store,
+    );
 
     // ── (1) CONTENT-ADDRESS IS THE VALIDITY CHECK: publish + serve by content-address; tamper → refuse.
     let bundle = b"PACK\0clone-bundle\0hot-repo-objects";
     let address = cdn.publish_bundle(bundle).expect("publish a clone bundle");
-    assert_eq!(address, ContentHash::blake3(bundle), "the cache key IS the content-address");
-    assert_eq!(cdn.bundle(&address).expect("serve"), bundle, "serve by content-address is exact");
-    assert!(store.corrupt_for_drill(&tenant, &address), "bundle present to tamper");
+    assert_eq!(
+        address,
+        ContentHash::blake3(bundle),
+        "the cache key IS the content-address"
+    );
+    assert_eq!(
+        cdn.bundle(&address).expect("serve"),
+        bundle,
+        "serve by content-address is exact"
+    );
+    assert!(
+        store.corrupt_for_drill(&tenant, &address),
+        "bundle present to tamper"
+    );
     assert!(
         matches!(cdn.bundle(&address), Err(BlobError::IntegrityFail { .. })),
         "a tampered bundle is REFUSED — the content-address is the cache validity check (no staleness)"
@@ -51,7 +67,11 @@ fn stor_d5_cdn_within_eu_zero_cross_region_egress() {
         CdnEdgePop::new("iad-1", Region::new("us-east"), false), // extra-EU — must be excluded
     ];
     let eligible = cdn.eligible_edges(&candidates);
-    assert_eq!(eligible.len(), 2, "the extra-EU POP is excluded from an EU tenant's eligible edge set");
+    assert_eq!(
+        eligible.len(),
+        2,
+        "the extra-EU POP is excluded from an EU tenant's eligible edge set"
+    );
     assert!(
         eligible.iter().all(|p| p.within_eu),
         "STOR-D5 GATE: every eligible CDN edge is within-EU (no PII-bearing bundle reaches an extra-EU edge)"

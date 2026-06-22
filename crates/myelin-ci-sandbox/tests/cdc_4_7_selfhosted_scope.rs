@@ -25,7 +25,7 @@
 //! token for tenant A can never claim tenant B's job. CI REUSES the Identity mint; it never forks it.
 
 use myelin_ci_sandbox::{
-    mint_self_hosted_token, self_hosted_grant, Attestation, AttestState, SelfHostedMintError,
+    mint_self_hosted_token, self_hosted_grant, AttestState, Attestation, SelfHostedMintError,
     SelfHostedRunner, StructuralAttestationVerifier, TrustTier, SELFHOSTED_GRANT_PREFIX,
 };
 use myelin_flow::{DelegationCaveats, RunTokenError, RunTokenHandle, RunTokenMinter};
@@ -84,7 +84,10 @@ fn attested_runner(tenant: &str) -> SelfHostedRunner {
     let verifier = StructuralAttestationVerifier::new();
     let att = Attestation {
         tenant: TenantId(tenant.into()),
-        material: StructuralAttestationVerifier::provisioned_material(&TenantId(tenant.into()), "n"),
+        material: StructuralAttestationVerifier::provisioned_material(
+            &TenantId(tenant.into()),
+            "n",
+        ),
     };
     assert_eq!(r.attest(&att, &verifier), AttestState::Attested);
     r
@@ -103,7 +106,10 @@ fn ci_consumer_mints_own_tenant_scope_provider_accepts() {
         .expect("the own-tenant self-hosted token mints");
 
     // The CI consumer carried EXACTLY the own-tenant grant into the mint.
-    assert!(token.handle().token.contains(&self_hosted_grant(&TenantId("acme".into()))));
+    assert!(token
+        .handle()
+        .token
+        .contains(&self_hosted_grant(&TenantId("acme".into()))));
     assert!(!token.handle().token.contains("globex"));
     // The token admits its OWN tenant's SelfHosted job, refuses another tenant's.
     assert!(token.admits(TrustTier::SelfHosted, &TenantId("acme".into())));

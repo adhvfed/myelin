@@ -95,7 +95,11 @@ fn cdc_3_6_provider_derives_nested_envelope_and_8_6_consumer_reads_it() {
         run_ref: "run-7".into(),
         trigger: TriggerKind::Automation,
     };
-    let disp = tier.dispatch(&req, || EventId("action-7".into()), &Timestamp("2026-06-20T00:00:01Z".into()));
+    let disp = tier.dispatch(
+        &req,
+        || EventId("action-7".into()),
+        &Timestamp("2026-06-20T00:00:01Z".into()),
+    );
 
     // PROVIDER promise: the action is NESTED on the trigger (correct-by-construction).
     let action = match disp {
@@ -109,7 +113,10 @@ fn cdc_3_6_provider_derives_nested_envelope_and_8_6_consumer_reads_it() {
     // 8.6 CONSUMER promise: the inbox received exactly that envelope.
     let received = tier.target().received.borrow();
     assert_eq!(received.len(), 1);
-    assert_eq!(received[0], *action, "the 8.6 consumer reads the exact nested envelope");
+    assert_eq!(
+        received[0], *action,
+        "the 8.6 consumer reads the exact nested envelope"
+    );
 }
 
 #[test]
@@ -136,7 +143,15 @@ fn cdc_11_7_consumer_enforces_no_balance_no_execution_and_idempotent_reserve() {
         run_ref: "run-Z".into(),
         trigger: TriggerKind::Automation,
     };
-    let disp = tier.dispatch(&req, || EventId("a".into()), &Timestamp("2026-06-20T00:00:01Z".into()));
+    let disp = tier.dispatch(
+        &req,
+        || EventId("a".into()),
+        &Timestamp("2026-06-20T00:00:01Z".into()),
+    );
     assert_eq!(disp, Disposition::NoBalanceRefused);
-    assert_eq!(tier.target().received.borrow().len(), 0, "no balance → 0 delivered");
+    assert_eq!(
+        tier.target().received.borrow().len(),
+        0,
+        "no balance → 0 delivered"
+    );
 }

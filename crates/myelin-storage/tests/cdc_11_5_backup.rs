@@ -50,8 +50,10 @@ impl<'a> OpsBackupJob<'a> {
 
     /// Continuously archive the WAL tail up to `offset` (freshness `at`).
     fn archive_up_to(&mut self, offset: u64, at: u64) -> Result<(), BackupError> {
-        self.archiver
-            .archive_segment(WalSegment { end_offset: offset, committed_at: at })
+        self.archiver.archive_segment(WalSegment {
+            end_offset: offset,
+            committed_at: at,
+        })
     }
 
     /// Take a periodic base backup at the current archived tail.
@@ -97,14 +99,28 @@ fn ops_backup_job_archives_base_backs_and_snapshots_within_rpo() {
     job.base_backup(996);
 
     // The RPO is within the 5-min (300 s) bound (here 0 — the tail reached the committed offset).
-    assert!(job.measured_rpo() <= 300, "RPO must be within the 5-min bound");
+    assert!(
+        job.measured_rpo() <= 300,
+        "RPO must be within the 5-min bound"
+    );
 
     // Snapshot the systems-of-record tiers (T1/T2/T3/T5) — all admitted.
     let set = job
-        .snapshot(&[StoreTier::Oltp, StoreTier::Object, StoreTier::Log, StoreTier::Kms])
+        .snapshot(&[
+            StoreTier::Oltp,
+            StoreTier::Object,
+            StoreTier::Log,
+            StoreTier::Kms,
+        ])
         .expect("systems of record are backed up");
-    assert_eq!(set.at_offset, 500, "the backup is consistent at the archived cross-seam offset");
-    assert!(set.contains_key_for_tenant(&tenant), "the live tenant's key is in the backup");
+    assert_eq!(
+        set.at_offset, 500,
+        "the backup is consistent at the archived cross-seam offset"
+    );
+    assert!(
+        set.contains_key_for_tenant(&tenant),
+        "the live tenant's key is in the backup"
+    );
     assert_eq!(set.backed_tiers().len(), 4);
 }
 
@@ -119,7 +135,12 @@ fn ops_caller_cannot_back_up_a_derived_tier() {
     let err = job
         .snapshot(&[StoreTier::Oltp, StoreTier::Olap])
         .expect_err("a derived tier must be rejected from the backup set");
-    assert_eq!(err, BackupError::DerivedTierNotBacked { tier: StoreTier::Olap });
+    assert_eq!(
+        err,
+        BackupError::DerivedTierNotBacked {
+            tier: StoreTier::Olap
+        }
+    );
 }
 
 /// **The contract property the consumer depends on (2): a crypto-shredded key is excluded from a
@@ -137,7 +158,10 @@ fn ops_callers_backup_excludes_a_crypto_shredded_tenant() {
 
     let job = OpsBackupJob::boot(&kms);
     // Before shred: the tenant's key is backed up.
-    assert!(job.snapshot(&[StoreTier::Kms]).unwrap().contains_key_for_tenant(&gone));
+    assert!(job
+        .snapshot(&[StoreTier::Kms])
+        .unwrap()
+        .contains_key_for_tenant(&gone));
 
     // Crypto-shred (offboard).
     assert!(kms.destroy_kek(&gone_kek));

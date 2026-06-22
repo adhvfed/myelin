@@ -201,7 +201,9 @@ impl CausalGuard {
                 }
                 return (LoopVerdict::Drop, Some(RefusalReason::SharedRootTripwire));
             }
-            inner.root_starts.insert(correlation_id.to_string(), seen + 1);
+            inner
+                .root_starts
+                .insert(correlation_id.to_string(), seen + 1);
         }
 
         // ADMIT: observe the admitted child depth into the §5.4 histogram + advance the max.
@@ -244,7 +246,11 @@ impl CausalGuard {
     /// The number of starts seen for `correlation_id` in the window (the shared-root tripwire tally) —
     /// for the drill's tripwire assertion.
     pub fn root_starts(&self, correlation_id: &str) -> u32 {
-        self.lock().root_starts.get(correlation_id).copied().unwrap_or(0)
+        self.lock()
+            .root_starts
+            .get(correlation_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, GuardInner> {
@@ -267,7 +273,10 @@ mod tests {
     #[test]
     fn verdict_predicates_partition_admit_from_refused() {
         assert!(LoopVerdict::Admit.is_admit());
-        assert!(!LoopVerdict::Admit.is_refused(), "an admit is NOT a refusal");
+        assert!(
+            !LoopVerdict::Admit.is_refused(),
+            "an admit is NOT a refusal"
+        );
         assert!(!LoopVerdict::Drop.is_admit());
         assert!(LoopVerdict::Drop.is_refused(), "a drop IS a refusal");
         assert!(!LoopVerdict::Park.is_admit());
@@ -305,15 +314,30 @@ mod tests {
 
         // parent 0→child 1, …, parent 3→child 4 are admitted (4 hops); parent 4→child 5 > ceiling 4
         // is DROPPED. The depth never exceeds the ceiling.
-        assert_eq!(admitted, 4, "admitted exactly up to the ceiling (children 1..=4)");
+        assert_eq!(
+            admitted, 4,
+            "admitted exactly up to the ceiling (children 1..=4)"
+        );
         assert_eq!(dropped, 1, "the next hop past the ceiling was dropped");
         assert!(
             telemetry.causal_depth_max() <= guard.ceiling(),
             "the causal-depth max never exceeds the ceiling (it was stopped AT it)"
         );
-        assert_eq!(telemetry.causal_depth_max(), 4, "the deepest admitted child was at the ceiling");
-        assert_eq!(telemetry.depth_ceiling_hits(), 1, "the ceiling fired exactly once");
-        assert_eq!(telemetry.fork_count(), 0, "NEVER forked — the headline invariant");
+        assert_eq!(
+            telemetry.causal_depth_max(),
+            4,
+            "the deepest admitted child was at the ceiling"
+        );
+        assert_eq!(
+            telemetry.depth_ceiling_hits(),
+            1,
+            "the ceiling fired exactly once"
+        );
+        assert_eq!(
+            telemetry.fork_count(),
+            0,
+            "NEVER forked — the headline invariant"
+        );
     }
 
     /// **The shared-root tripwire detects a workflow→event→workflow loop (§6.2).** A loop that stays
@@ -341,11 +365,28 @@ mod tests {
             }
         }
 
-        assert_eq!(admitted, 3, "the first 3 same-root starts were admitted (the window cap)");
-        assert_eq!(tripped, 7, "every same-root start past the cap tripped the tripwire");
-        assert_eq!(telemetry.depth_ceiling_hits(), 0, "the depth ceiling NEVER fired (the loop stayed shallow)");
-        assert!(telemetry.shared_root_tripwire_firings() >= 1, "the tripwire fired");
-        assert_eq!(telemetry.shared_root_tripwire_firings(), 7, "fired once per over-cap start");
+        assert_eq!(
+            admitted, 3,
+            "the first 3 same-root starts were admitted (the window cap)"
+        );
+        assert_eq!(
+            tripped, 7,
+            "every same-root start past the cap tripped the tripwire"
+        );
+        assert_eq!(
+            telemetry.depth_ceiling_hits(),
+            0,
+            "the depth ceiling NEVER fired (the loop stayed shallow)"
+        );
+        assert!(
+            telemetry.shared_root_tripwire_firings() >= 1,
+            "the tripwire fired"
+        );
+        assert_eq!(
+            telemetry.shared_root_tripwire_firings(),
+            7,
+            "fired once per over-cap start"
+        );
         assert_eq!(telemetry.fork_count(), 0, "NEVER forked");
     }
 
@@ -372,7 +413,11 @@ mod tests {
         guard.release_activity();
         assert_eq!(guard.activities_in_flight(), 1);
         let (v4, _) = guard.admit_activity();
-        assert_eq!(v4, LoopVerdict::Admit, "a freed slot admits the next activity");
+        assert_eq!(
+            v4,
+            LoopVerdict::Admit,
+            "a freed slot admits the next activity"
+        );
         assert_eq!(telemetry.fork_count(), 0, "NEVER forked");
     }
 
@@ -384,9 +429,15 @@ mod tests {
         // root A: 2 admits then trip.
         assert!(guard.admit_child("A", 0).0.is_admit());
         assert!(guard.admit_child("A", 0).0.is_admit());
-        assert!(guard.admit_child("A", 0).0.is_refused(), "A tripped at its cap");
+        assert!(
+            guard.admit_child("A", 0).0.is_refused(),
+            "A tripped at its cap"
+        );
         // root B is untouched by A's tripwire.
-        assert!(guard.admit_child("B", 0).0.is_admit(), "B has its own window");
+        assert!(
+            guard.admit_child("B", 0).0.is_admit(),
+            "B has its own window"
+        );
         assert!(guard.admit_child("B", 0).0.is_admit());
         assert_eq!(guard.root_starts("A"), 2);
         assert_eq!(guard.root_starts("B"), 2);

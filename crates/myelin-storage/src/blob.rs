@@ -81,7 +81,9 @@ use myelin_tenancy::TenantId;
 /// BLAKE3 default. The content address IS the hash (Git/Venti/IPFS-CID model, storage.md §11)
 /// — it is computed from the **plaintext** bytes (address by plaintext hash, store
 /// ciphertext, §3.2), so it is stable across the encryption/rotation P-ST-08 adds.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct ContentHash {
     /// The hash algorithm tag (the self-describing multihash prefix). BLAKE3 is the default
     /// for new blobs; the tag is what lets SHA-256 blobs coexist (§3.2).
@@ -128,8 +130,8 @@ impl ContentHash {
         let (tag, hex_part) = s
             .split_once(':')
             .ok_or_else(|| BlobError::MalformedAddress(s.to_string()))?;
-        let algo = HashAlgo::from_tag(tag)
-            .ok_or_else(|| BlobError::UnknownAlgo(tag.to_string()))?;
+        let algo =
+            HashAlgo::from_tag(tag).ok_or_else(|| BlobError::UnknownAlgo(tag.to_string()))?;
         // Validate the digest is hex (so a corrupted address is caught at parse, not later).
         hex::decode(hex_part).map_err(|_| BlobError::MalformedAddress(s.to_string()))?;
         Ok(ContentHash {
@@ -144,7 +146,9 @@ impl ContentHash {
 /// blobs; SHA-256 is admitted as a tag so legacy/Git-imported blobs (which are SHA-1/SHA-256
 /// addressed) coexist without re-hashing — the tag, not a global config, decides how a given
 /// blob is verified on read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum HashAlgo {
     /// BLAKE3 — the default hash-on-write algorithm for all new blobs (storage.md §3.2/§11).
     Blake3,
@@ -248,7 +252,11 @@ impl std::fmt::Display for BlobError {
             BlobError::MalformedAddress(s) => write!(f, "malformed content address: {s}"),
             BlobError::UnknownAlgo(t) => write!(f, "unknown hash algorithm tag: {t}"),
             BlobError::AlgoNotVerifiable(a) => {
-                write!(f, "no on-floor verification for algorithm {} (→ P-ST-22)", a.tag())
+                write!(
+                    f,
+                    "no on-floor verification for algorithm {} (→ P-ST-22)",
+                    a.tag()
+                )
             }
         }
     }
@@ -440,10 +448,13 @@ impl BlobStore for FsBlobStore {
         let path = Self::key_path(tenant, hash);
         let stored = {
             let objects = self.objects.lock().expect("blob store mutex");
-            objects.get(&path).cloned().ok_or_else(|| BlobError::NotFound {
-                tenant: tenant.clone(),
-                hash: hash.clone(),
-            })?
+            objects
+                .get(&path)
+                .cloned()
+                .ok_or_else(|| BlobError::NotFound {
+                    tenant: tenant.clone(),
+                    hash: hash.clone(),
+                })?
         };
         // Unwrap (decrypt) the stored ciphertext back to plaintext (identity on the floor).
         let plaintext = self.wrap.unwrap(tenant, &stored);
@@ -577,7 +588,10 @@ mod tests {
             store.get(&acme, &h_acme),
             Err(BlobError::NotFound { .. })
         ));
-        assert_eq!(store.get(&globex, &h_globex).expect("globex survives"), bytes);
+        assert_eq!(
+            store.get(&globex, &h_globex).expect("globex survives"),
+            bytes
+        );
     }
 
     /// Per-tenant DEDUP within a tenant: putting the same bytes twice stores once.
@@ -603,11 +617,17 @@ mod tests {
         let h = store.put(&acme, b"trustworthy bytes").expect("put");
 
         // Sanity: a clean read serves the bytes and does NOT signal.
-        assert_eq!(store.get(&acme, &h).expect("clean read"), b"trustworthy bytes");
+        assert_eq!(
+            store.get(&acme, &h).expect("clean read"),
+            b"trustworthy bytes"
+        );
         assert_eq!(store.telemetry().blob_integrity_fail(), 0);
 
         // Corrupt the stored object (bit-rot / tamper), keeping its key.
-        assert!(store.corrupt_for_drill(&acme, &h), "object present to corrupt");
+        assert!(
+            store.corrupt_for_drill(&acme, &h),
+            "object present to corrupt"
+        );
 
         // Re-hash-on-read DETECTS the mismatch and REFUSES — 0 silent serve.
         match store.get(&acme, &h) {
@@ -699,7 +719,10 @@ mod tests {
         store.objects.lock().unwrap().insert(path, object.to_vec());
 
         // A correct SHA-256 object verifies + serves the exact bytes (no false positive).
-        assert_eq!(store.get(&acme, &h).expect("sha256 object verifies"), object);
+        assert_eq!(
+            store.get(&acme, &h).expect("sha256 object verifies"),
+            object
+        );
         assert_eq!(store.telemetry().blob_integrity_fail(), 0);
 
         // Corrupt it → re-hash-on-read (SHA-256) detects + refuses (0 silent serve).
@@ -707,7 +730,11 @@ mod tests {
         match store.get(&acme, &h) {
             Err(BlobError::IntegrityFail { requested, actual }) => {
                 assert_eq!(requested, h);
-                assert_eq!(actual.algo, HashAlgo::Sha256, "verified under the blob's own tag");
+                assert_eq!(
+                    actual.algo,
+                    HashAlgo::Sha256,
+                    "verified under the blob's own tag"
+                );
                 assert_ne!(actual, h);
             }
             other => panic!("a corrupt sha256 object must be refused, got {other:?}"),
@@ -761,7 +788,11 @@ mod tests {
         {
             let objects = store.objects.lock().unwrap();
             let stored = objects.values().next().expect("one object");
-            assert_ne!(stored.as_slice(), plaintext, "must store CIPHERTEXT, not plaintext");
+            assert_ne!(
+                stored.as_slice(),
+                plaintext,
+                "must store CIPHERTEXT, not plaintext"
+            );
         }
         // get unwraps + re-hash-verifies and returns the exact plaintext.
         assert_eq!(store.get(&acme, &h).expect("get"), plaintext);

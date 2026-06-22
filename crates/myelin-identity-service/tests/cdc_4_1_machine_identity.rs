@@ -40,7 +40,14 @@ fn scope(tenant: &str) -> TenantScope {
 }
 
 /// The frozen verified-token envelope `<tenant>|<region>|<subject_key>|<jti>|<dpop>|<grants>`.
-fn material(tenant: &str, region: &str, subject_key: &str, jti: &str, dpop: bool, grants: &[&str]) -> String {
+fn material(
+    tenant: &str,
+    region: &str,
+    subject_key: &str,
+    jti: &str,
+    dpop: bool,
+    grants: &[&str],
+) -> String {
     format!(
         "{tenant}|{region}|{subject_key}|{jti}|{}|{}",
         if dpop { "1" } else { "0" },
@@ -64,7 +71,12 @@ fn provider() -> CapabilityAuthenticator {
         )
         .expect("seed the runner principal");
     store
-        .link_credential(&s, machine_scheme::PER_JOB, "run-1", &PrincipalId("svc:runner".into()))
+        .link_credential(
+            &s,
+            machine_scheme::PER_JOB,
+            "run-1",
+            &PrincipalId("svc:runner".into()),
+        )
         .expect("link the per-job token record");
     CapabilityAuthenticator::new(store)
 }
@@ -89,7 +101,14 @@ fn cdc_4_1_machine_provider_resolves_consumer_trusts_machine_principal() {
         &provider,
         &Credential {
             scheme: machine_scheme::PER_JOB.into(),
-            material: material("acme", "eu-west", "run-1", "jti-1", false, &["selfhosted:acme"]),
+            material: material(
+                "acme",
+                "eu-west",
+                "run-1",
+                "jti-1",
+                false,
+                &["selfhosted:acme"],
+            ),
         },
     )
     .expect("the dispatcher resolves the verified per-job token to a machine Principal");
@@ -101,7 +120,11 @@ fn cdc_4_1_machine_provider_resolves_consumer_trusts_machine_principal() {
         "the consumer trusts the resolved tenant — the token's, the trust root"
     );
     assert_eq!(principal.region, Region("eu-west".into()));
-    assert_eq!(principal.kind, PrincipalKind::Service, "a machine identity → Service principal");
+    assert_eq!(
+        principal.kind,
+        PrincipalKind::Service,
+        "a machine identity → Service principal"
+    );
 
     // Observability is part of the pass: the decision emitted its auth_decision_latency signal.
     assert_eq!(
@@ -122,7 +145,14 @@ fn cdc_4_1_runner_token_cannot_cross_tenant() {
         &provider,
         &Credential {
             scheme: machine_scheme::PER_JOB.into(),
-            material: material("acme", "eu-west", "run-1", "jti-2", false, &["selfhosted:globex"]),
+            material: material(
+                "acme",
+                "eu-west",
+                "run-1",
+                "jti-2",
+                false,
+                &["selfhosted:globex"],
+            ),
         },
     );
     assert!(

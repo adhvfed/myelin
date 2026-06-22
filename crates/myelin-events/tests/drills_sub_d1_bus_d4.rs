@@ -21,9 +21,7 @@ use myelin_events::{
     Actor, AggregateKey, ArtifactRef, CausedBy, DataRole, EmitContextBase, EventDraft, EventType,
     IdMinter, InProcessBus, MonotonicMinter, OutboxStore, OutboxTx, Relay, Timestamp, Visibility,
 };
-use myelin_harness::{
-    Dependency, DependencyBreaker, Predicate, Scope, SignalName, SignalSource,
-};
+use myelin_harness::{Dependency, DependencyBreaker, Predicate, Scope, SignalName, SignalSource};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_tenancy::{Region, TenantId};
 use std::sync::Arc;
@@ -36,7 +34,11 @@ fn ctx_base(tenant: &str) -> EmitContextBase {
     EmitContextBase {
         tenant: TenantId(tenant.into()),
         region: Region("eu-west".into()),
-        actor: Actor(Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId(tenant.into()))),
+        actor: Actor(Principal::stub(
+            PrincipalId("p".into()),
+            PrincipalKind::Human,
+            TenantId(tenant.into()),
+        )),
         schema_ver: 1,
         occurred_at: Timestamp("2026-06-19T00:00:00Z".into()),
         recorded_at: Timestamp("2026-06-19T00:00:01Z".into()),
@@ -58,7 +60,12 @@ fn draft(i: usize, aggregate: &str) -> EventDraft {
 }
 
 /// Commit `n` events for one aggregate (the "state-commit" half), returning their ids.
-fn commit_n(store: &OutboxStore, minter: Arc<dyn IdMinter>, n: usize, aggregate: &str) -> Vec<myelin_events::EventId> {
+fn commit_n(
+    store: &OutboxStore,
+    minter: Arc<dyn IdMinter>,
+    n: usize,
+    aggregate: &str,
+) -> Vec<myelin_events::EventId> {
     let mut tx = store.begin(minter, ctx_base("acme"));
     tx.stage_state_change("issue created");
     let mut ids = Vec::new();
@@ -102,7 +109,10 @@ fn drill_sub_d1_kill_between_commit_and_publish() {
     //     the outbox (depth == the committed count), and 0 ghost (nothing delivered).
     let mut signals = SignalSource::new();
     signals.set_scalar(SignalName::OutboxDepth, store.outbox_depth() as i64);
-    signals.set_scalar(SignalName::DeadLetterCount, store.dead_letter_count() as i64);
+    signals.set_scalar(
+        SignalName::DeadLetterCount,
+        store.dead_letter_count() as i64,
+    );
     // depth is exactly the committed set: nothing lost, nothing ghosted away.
     signals
         .assert_signal(SignalName::OutboxDepth, Predicate::Eq(6))
@@ -110,7 +120,11 @@ fn drill_sub_d1_kill_between_commit_and_publish() {
     signals
         .assert_signal(SignalName::DeadLetterCount, Predicate::Eq(0))
         .expect_green();
-    assert_eq!(bus.delivered_count(), 0, "severed broker delivered nothing (0 ghost)");
+    assert_eq!(
+        bus.delivered_count(),
+        0,
+        "severed broker delivered nothing (0 ghost)"
+    );
 
     // (3) RESTORE the dependency + drain: the outbox-depth drains to 0 and every committed event
     //     is delivered EXACTLY ONCE (0 ghost, 0 lost).
@@ -122,7 +136,10 @@ fn drill_sub_d1_kill_between_commit_and_publish() {
 
     let mut after = SignalSource::new();
     after.set_scalar(SignalName::OutboxDepth, store.outbox_depth() as i64);
-    after.set_scalar(SignalName::DeadLetterCount, store.dead_letter_count() as i64);
+    after.set_scalar(
+        SignalName::DeadLetterCount,
+        store.dead_letter_count() as i64,
+    );
     // outbox-depth drains → 0 (SUB-D1).
     after
         .assert_signal(SignalName::OutboxDepth, Predicate::Eq(0))
@@ -131,7 +148,11 @@ fn drill_sub_d1_kill_between_commit_and_publish() {
     after
         .assert_signal(SignalName::DeadLetterCount, Predicate::Eq(0))
         .expect_green();
-    assert_eq!(bus.delivered_count(), 6, "exactly-once: 6 committed → 6 delivered");
+    assert_eq!(
+        bus.delivered_count(),
+        6,
+        "exactly-once: 6 committed → 6 delivered"
+    );
     assert_eq!(
         bus.delivered_ids(),
         ids.into_iter().collect(),
@@ -192,13 +213,19 @@ fn drill_bus_d4_emit_iff_committed() {
     after
         .assert_signal(SignalName::OutboxDepth, Predicate::Eq(0))
         .expect_green();
-    assert_eq!(bus.delivered_count(), 3, "only the committed events are delivered");
+    assert_eq!(
+        bus.delivered_count(),
+        3,
+        "only the committed events are delivered"
+    );
     assert_eq!(
         bus.delivered_ids(),
         committed_ids.into_iter().collect(),
         "emit-iff-committed: delivered set == committed set, the crashed events never appear"
     );
-    println!("[2026-06-19] PASS  drill=BUS-D4  emit_iff_committed=true  (inject → load → assert green)");
+    println!(
+        "[2026-06-19] PASS  drill=BUS-D4  emit_iff_committed=true  (inject → load → assert green)"
+    );
 }
 
 /// The drills also REGISTER into the P-S04 every-incident-adds-a-drill registry so they re-run
@@ -221,7 +248,8 @@ fn sub_d1_registers_into_the_permanent_drill_suite() {
         let relay = Relay::new(store.clone(), bus.clone(), clock);
 
         // inject via the scenario's own breaker (the harness drains it on teardown).
-        ctx.breaker.break_dependency(Dependency::Broker, scope.clone());
+        ctx.breaker
+            .break_dependency(Dependency::Broker, scope.clone());
         if ctx.breaker.is_broken(&Dependency::Broker, &scope) {
             bus.sever();
         }
@@ -231,7 +259,8 @@ fn sub_d1_registers_into_the_permanent_drill_suite() {
         bus.heal();
         relay.drain_to_empty();
 
-        ctx.signals.set_scalar(SignalName::OutboxDepth, store.outbox_depth() as i64);
+        ctx.signals
+            .set_scalar(SignalName::OutboxDepth, store.outbox_depth() as i64);
         // the asserted survival signal: the outbox drained (0 lost), exactly 4 delivered.
         assert_eq!(bus.delivered_count(), 4);
         ctx.signals
@@ -239,7 +268,11 @@ fn sub_d1_registers_into_the_permanent_drill_suite() {
     }));
 
     let results = registry.run_all();
-    assert!(results[0].is_pass(), "SUB-D1 drill must read green: {:?}", results[0]);
+    assert!(
+        results[0].is_pass(),
+        "SUB-D1 drill must read green: {:?}",
+        results[0]
+    );
     // re-runs forever (a regression re-reds it).
     assert!(registry.all_green());
     println!("{}", results[0].artifact_row("2026-06-19"));

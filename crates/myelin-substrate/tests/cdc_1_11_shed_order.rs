@@ -29,7 +29,10 @@ fn tenant(s: &str) -> TenantId {
 #[test]
 fn cdc_1_11_run_class_derives_from_principal_and_header_never_up_classes() {
     // a Service principal is batch/ci by default; a header can down-class it to speculative.
-    assert_eq!(RunClass::derive(&PrincipalKind::Service, None), RunClass::BatchCi);
+    assert_eq!(
+        RunClass::derive(&PrincipalKind::Service, None),
+        RunClass::BatchCi
+    );
     assert_eq!(
         RunClass::derive(&PrincipalKind::Service, Some(RunClassHeader::Speculative)),
         RunClass::Speculative,
@@ -37,9 +40,15 @@ fn cdc_1_11_run_class_derives_from_principal_and_header_never_up_classes() {
     );
     // an Agent → the agent lane; a verified Human → the protected human lane. A machine principal
     // can NEVER name itself human (there is no human header), so the human lane is unspoofable.
-    let agent = PrincipalKind::Agent { runtime_ref: RuntimeRef("rt".into()), on_behalf_of: None };
+    let agent = PrincipalKind::Agent {
+        runtime_ref: RuntimeRef("rt".into()),
+        on_behalf_of: None,
+    };
     assert_eq!(RunClass::derive(&agent, None), RunClass::Agent);
-    assert_eq!(RunClass::derive(&PrincipalKind::Human, None), RunClass::Human);
+    assert_eq!(
+        RunClass::derive(&PrincipalKind::Human, None),
+        RunClass::Human
+    );
 
     // the variant order IS the shed priority (a lower class sheds first).
     assert!(RunClass::Speculative < RunClass::BatchCi);
@@ -69,12 +78,22 @@ fn cdc_1_11_shed_order_protects_the_human_lane_with_retry_after() {
     }
     // batch/ci then agent shed as fill rises; the HUMAN is admitted throughout (shed last).
     assert_eq!(lane.admit(&t, RunClass::BatchCi), ShedDecision::Admit);
-    assert!(matches!(lane.admit(&t, RunClass::BatchCi), ShedDecision::Shed { .. }));
+    assert!(matches!(
+        lane.admit(&t, RunClass::BatchCi),
+        ShedDecision::Shed { .. }
+    ));
     assert_eq!(lane.admit(&t, RunClass::Agent), ShedDecision::Admit);
-    assert!(matches!(lane.admit(&t, RunClass::Agent), ShedDecision::Shed { .. }));
+    assert!(matches!(
+        lane.admit(&t, RunClass::Agent),
+        ShedDecision::Shed { .. }
+    ));
     // the human lane: NOT shed — it uses the reserved slots.
     assert_eq!(lane.admit(&t, RunClass::Human), ShedDecision::Admit);
-    assert_eq!(lane.shed_count(RunClass::Human), 0, "the human lane has not been shed");
+    assert_eq!(
+        lane.shed_count(RunClass::Human),
+        0,
+        "the human lane has not been shed"
+    );
     // the per-lane shed-count signals are exported (contract-1.8).
     assert!(lane.shed_count(RunClass::Speculative) >= 1);
     assert!(lane.total_shed_count() >= 3);
@@ -96,9 +115,15 @@ fn cdc_1_11_shedding_is_per_tenant() {
     for _ in 0..3 {
         assert_eq!(lane.admit(&noisy, RunClass::Agent), ShedDecision::Admit);
     }
-    assert!(matches!(lane.admit(&noisy, RunClass::Agent), ShedDecision::Shed { .. }));
+    assert!(matches!(
+        lane.admit(&noisy, RunClass::Agent),
+        ShedDecision::Shed { .. }
+    ));
     assert_eq!(lane.admit(&noisy, RunClass::Human), ShedDecision::Admit);
-    assert!(matches!(lane.admit(&noisy, RunClass::Human), ShedDecision::Shed { .. }));
+    assert!(matches!(
+        lane.admit(&noisy, RunClass::Human),
+        ShedDecision::Shed { .. }
+    ));
     // the quiet tenant is fully unaffected — its human is admitted.
     assert_eq!(
         lane.admit(&quiet, RunClass::Human),
@@ -116,7 +141,10 @@ fn cdc_1_11_bounded_queue_fast_fails() {
     assert!(q.try_acquire());
     assert!(q.try_acquire());
     assert!(q.try_acquire());
-    assert!(!q.try_acquire(), "a full bounded queue fast-fails (sheds), never grows");
+    assert!(
+        !q.try_acquire(),
+        "a full bounded queue fast-fails (sheds), never grows"
+    );
     assert_eq!(q.in_flight(), 3, "in-flight never exceeds the bound");
     assert_eq!(q.shed_count(), 1, "the shed is observable");
 }
@@ -131,7 +159,10 @@ fn cdc_1_11_v1_floor_table_is_bounded_with_a_reserved_human_lane() {
         let b = table.budget(surface);
         assert!(b.per_tenant_in_flight_cap > 0, "{surface:?} bounded");
         assert!(b.human_lane_reservation <= b.per_tenant_in_flight_cap);
-        assert!(b.retry_after_secs > 0, "{surface:?} sheds with a Retry-After (clients honour it)");
+        assert!(
+            b.retry_after_secs > 0,
+            "{surface:?} sheds with a Retry-After (clients honour it)"
+        );
         seen += 1;
     }
     assert_eq!(
@@ -139,6 +170,14 @@ fn cdc_1_11_v1_floor_table_is_bounded_with_a_reserved_human_lane() {
         "the v1 floor names the four §7.6 surfaces + the Git front door (GIT-P15) + the generic HTTP intake"
     );
     // CI is the batch lane — no human reservation; the human-facing surfaces reserve a lane.
-    assert_eq!(table.budget(ShedSurface::CiDispatch).human_lane_reservation, 0);
-    assert!(table.budget(ShedSurface::ConnectionTier).human_lane_reservation > 0);
+    assert_eq!(
+        table.budget(ShedSurface::CiDispatch).human_lane_reservation,
+        0
+    );
+    assert!(
+        table
+            .budget(ShedSurface::ConnectionTier)
+            .human_lane_reservation
+            > 0
+    );
 }

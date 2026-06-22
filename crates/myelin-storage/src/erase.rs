@@ -528,12 +528,22 @@ mod tests {
 
         let log = CallLog::default();
         let ledger = RecLedger::default();
-        let ps = RecPseudonym { log: &log, fail: false };
-        let se = RecSearch { log: &log, fail: false };
+        let ps = RecPseudonym {
+            log: &log,
+            fail: false,
+        };
+        let se = RecSearch {
+            log: &log,
+            fail: false,
+        };
         let rf = RecRefs { log: &log };
         let bu = RecBus { log: &log };
         let holders = EraseHolders {
-            pseudonym: &ps, search: &se, refs: &rf, bus: &bu, ledger: &ledger,
+            pseudonym: &ps,
+            search: &se,
+            refs: &rf,
+            bus: &bu,
+            ledger: &ledger,
             git_reach: None,
         };
         let receipt = eraser
@@ -542,16 +552,28 @@ mod tests {
 
         // The non-KMS seams ran in the §5.2 order (step 2 is KMS, owned directly — not in the seam log;
         // step 6 ledger is logged by RecLedger separately, asserted below).
-        assert_eq!(log.steps(), vec!["1:pseudonym", "3:search", "4:refs", "5:bus"]);
+        assert_eq!(
+            log.steps(),
+            vec!["1:pseudonym", "3:search", "4:refs", "5:bus"]
+        );
         // Step 6 recorded the erasure.
         assert_eq!(ledger.log.borrow().as_slice(), ["6:ledger"]);
-        assert!(ledger.is_erased(&subject, &tenant), "the ledger records the subject as erased");
+        assert!(
+            ledger.is_erased(&subject, &tenant),
+            "the ledger records the subject as erased"
+        );
 
         // Step 2 actually destroyed the per-subject DEK this call.
-        assert!(receipt.dek_destroyed_now, "the per-subject DEK was destroyed");
+        assert!(
+            receipt.dek_destroyed_now,
+            "the per-subject DEK was destroyed"
+        );
         // STOR-D4: 0 recoverable in backup.
         assert_eq!(receipt.recoverable_in_backup, 0);
-        assert!(receipt.is_green(), "STOR-D4 green: 0 recoverable PII in backup");
+        assert!(
+            receipt.is_green(),
+            "STOR-D4 green: 0 recoverable PII in backup"
+        );
         assert!(!receipt.re_run, "first erase is not a re-run");
         assert_eq!(receipt.completed_at, 1_000);
     }
@@ -586,18 +608,31 @@ mod tests {
         let eraser = CryptoShredErase::new(&kms, r());
         let log = CallLog::default();
         let ledger = RecLedger::default();
-        let ps = RecPseudonym { log: &log, fail: false };
-        let se = RecSearch { log: &log, fail: false };
+        let ps = RecPseudonym {
+            log: &log,
+            fail: false,
+        };
+        let se = RecSearch {
+            log: &log,
+            fail: false,
+        };
         let rf = RecRefs { log: &log };
         let bu = RecBus { log: &log };
         let holders = EraseHolders {
-            pseudonym: &ps, search: &se, refs: &rf, bus: &bu, ledger: &ledger,
+            pseudonym: &ps,
+            search: &se,
+            refs: &rf,
+            bus: &bu,
+            ledger: &ledger,
             git_reach: None,
         };
         eraser.erase(&subject, &tenant, &holders, 5).unwrap();
 
         // LIVE: the column is now unrecoverable (a loud error, never plaintext).
-        assert!(cryptor.decrypt(&col).is_err(), "column unrecoverable live after crypto-shred");
+        assert!(
+            cryptor.decrypt(&col).is_err(),
+            "column unrecoverable live after crypto-shred"
+        );
         // BACKUP: the subject's DEK is EXCLUDED from the backup snapshot (stays dead across restore).
         assert!(
             !kms.backup_snapshot().iter().any(|(d, _)| *d == subject_dek),
@@ -615,17 +650,29 @@ mod tests {
         let eraser = CryptoShredErase::new(&kms, r());
         let log = CallLog::default();
         let ledger = RecLedger::default();
-        let ps = RecPseudonym { log: &log, fail: false };
-        let se = RecSearch { log: &log, fail: false };
+        let ps = RecPseudonym {
+            log: &log,
+            fail: false,
+        };
+        let se = RecSearch {
+            log: &log,
+            fail: false,
+        };
         let rf = RecRefs { log: &log };
         let bu = RecBus { log: &log };
         let holders = EraseHolders {
-            pseudonym: &ps, search: &se, refs: &rf, bus: &bu, ledger: &ledger,
+            pseudonym: &ps,
+            search: &se,
+            refs: &rf,
+            bus: &bu,
+            ledger: &ledger,
             git_reach: None,
         };
 
         // First erase: destroys the DEK.
-        let r1 = eraser.erase(&subject, &tenant, &holders, 1).expect("first erase");
+        let r1 = eraser
+            .erase(&subject, &tenant, &holders, 1)
+            .expect("first erase");
         assert!(r1.dek_destroyed_now, "first erase destroys the DEK");
         assert!(!r1.re_run);
 
@@ -634,7 +681,10 @@ mod tests {
         let r2 = eraser
             .erase(&subject, &tenant, &holders, 2)
             .expect("re-erase is a no-op SUCCESS, never an error");
-        assert!(!r2.dek_destroyed_now, "the DEK was already destroyed (idempotent re-run)");
+        assert!(
+            !r2.dek_destroyed_now,
+            "the DEK was already destroyed (idempotent re-run)"
+        );
         assert!(r2.re_run, "the second erase is flagged as a re-run");
         assert_eq!(r2.recoverable_in_backup, 0, "still 0 recoverable in backup");
         assert!(r2.is_green());
@@ -652,12 +702,22 @@ mod tests {
         let ledger = RecLedger::default();
 
         // Step 1 (pseudonym shred) fails → the whole erase aborts LOUDLY before destroying anything.
-        let ps = RecPseudonym { log: &log, fail: true };
-        let se = RecSearch { log: &log, fail: false };
+        let ps = RecPseudonym {
+            log: &log,
+            fail: true,
+        };
+        let se = RecSearch {
+            log: &log,
+            fail: false,
+        };
         let rf = RecRefs { log: &log };
         let bu = RecBus { log: &log };
         let holders = EraseHolders {
-            pseudonym: &ps, search: &se, refs: &rf, bus: &bu, ledger: &ledger,
+            pseudonym: &ps,
+            search: &se,
+            refs: &rf,
+            bus: &bu,
+            ledger: &ledger,
             git_reach: None,
         };
         let err = eraser
@@ -665,7 +725,10 @@ mod tests {
             .expect_err("a step-1 failure is a loud error");
         assert!(matches!(err, EraseError::PseudonymShred(_)));
         // The erasure was NOT recorded (an incomplete erase is a retry, never 'assume erased').
-        assert!(!ledger.is_erased(&subject, &tenant), "an incomplete erase is NOT recorded");
+        assert!(
+            !ledger.is_erased(&subject, &tenant),
+            "an incomplete erase is NOT recorded"
+        );
         // The DEK was NOT destroyed (step 2 never ran).
         let subject_dek = DekId::new(tenant.clone(), KeyClass::Subject(subject.0.clone()));
         assert!(
@@ -685,19 +748,32 @@ mod tests {
         let log = CallLog::default();
         let ledger = RecLedger::default();
 
-        let ps = RecPseudonym { log: &log, fail: false };
-        let se = RecSearch { log: &log, fail: true };
+        let ps = RecPseudonym {
+            log: &log,
+            fail: false,
+        };
+        let se = RecSearch {
+            log: &log,
+            fail: true,
+        };
         let rf = RecRefs { log: &log };
         let bu = RecBus { log: &log };
         let holders = EraseHolders {
-            pseudonym: &ps, search: &se, refs: &rf, bus: &bu, ledger: &ledger,
+            pseudonym: &ps,
+            search: &se,
+            refs: &rf,
+            bus: &bu,
+            ledger: &ledger,
             git_reach: None,
         };
         let err = eraser
             .erase(&subject, &tenant, &holders, 1)
             .expect_err("a step-3 failure is a loud error");
         assert!(matches!(err, EraseError::SearchPurge(_)));
-        assert!(!ledger.is_erased(&subject, &tenant), "not recorded until every step succeeds");
+        assert!(
+            !ledger.is_erased(&subject, &tenant),
+            "not recorded until every step succeeds"
+        );
         // Steps 4/5/6 never ran.
         assert_eq!(log.steps(), vec!["1:pseudonym"]);
     }
@@ -714,12 +790,22 @@ mod tests {
         let ledger = RecLedger::default();
 
         // started=100, completed=140 → lag = 40ms (the clock is caller-supplied, deterministic).
-        let ps = RecPseudonym { log: &log, fail: false };
-        let se = RecSearch { log: &log, fail: false };
+        let ps = RecPseudonym {
+            log: &log,
+            fail: false,
+        };
+        let se = RecSearch {
+            log: &log,
+            fail: false,
+        };
         let rf = RecRefs { log: &log };
         let bu = RecBus { log: &log };
         let holders = EraseHolders {
-            pseudonym: &ps, search: &se, refs: &rf, bus: &bu, ledger: &ledger,
+            pseudonym: &ps,
+            search: &se,
+            refs: &rf,
+            bus: &bu,
+            ledger: &ledger,
             git_reach: None,
         };
         let receipt = eraser.erase(&subject, &tenant, &holders, 140).unwrap();
@@ -757,7 +843,10 @@ mod tests {
             completed_at: 0,
         };
         assert!(!red.is_green(), "non-zero recoverable is RED");
-        let green = ErasureReceipt { recoverable_in_backup: 0, ..red };
+        let green = ErasureReceipt {
+            recoverable_in_backup: 0,
+            ..red
+        };
         assert!(green.is_green(), "0 recoverable is GREEN");
     }
 

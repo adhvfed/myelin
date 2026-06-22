@@ -26,8 +26,8 @@
 
 use myelin_gdpr::{EraseScope, Patch, PersonalDataHolder, SubjectRef, TenantId};
 use myelin_gdpr_service::{
-    DerivativeErasureDriver, NotifHistoryHolder, NotifHistoryModel, RefsGraphHolder, RefsGraphModel,
-    RefsResolve, SearchIndexHolder, SearchIndexModel, ERASED_USER,
+    DerivativeErasureDriver, NotifHistoryHolder, NotifHistoryModel, RefsGraphHolder,
+    RefsGraphModel, RefsResolve, SearchIndexHolder, SearchIndexModel, ERASED_USER,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 
@@ -40,7 +40,10 @@ fn subject(id: &str) -> SubjectRef {
 }
 
 fn scope(id: &str) -> EraseScope {
-    EraseScope::Subject { subject: subject(id), tenant: TenantId::from_token("acme") }
+    EraseScope::Subject {
+        subject: subject(id),
+        tenant: TenantId::from_token("acme"),
+    }
 }
 
 /// **6.4 (provider Search ⇄ consumer driver): `erase` = purge + reindex incl. embeddings.** The
@@ -50,15 +53,25 @@ fn scope(id: &str) -> EraseScope {
 fn cdc_6_4_search_purge_reindex_incl_embeddings() {
     let search = SearchIndexModel::new();
     search.index_from_source("u-cdc-6-4", "alice");
-    assert_eq!(search.reidentify_hits("u-cdc-6-4"), 1, "re-identifiable before erase");
+    assert_eq!(
+        search.reidentify_hits("u-cdc-6-4"),
+        1,
+        "re-identifiable before erase"
+    );
 
     let provider = SearchIndexHolder::new(&search);
     // The CONSUMER calls the provider via `dyn PersonalDataHolder` — never into the store.
     let consumer: &dyn PersonalDataHolder = &provider;
-    let receipt = consumer.erase(scope("u-cdc-6-4")).expect("Search erase honours 6.4");
+    let receipt = consumer
+        .erase(scope("u-cdc-6-4"))
+        .expect("Search erase honours 6.4");
 
     assert_eq!(search.hits("u-cdc-6-4"), 0, "6.4: doc purged");
-    assert_eq!(search.reidentify_hits("u-cdc-6-4"), 0, "6.4: embedding purged (not hidden)");
+    assert_eq!(
+        search.reidentify_hits("u-cdc-6-4"),
+        0,
+        "6.4: embedding purged (not hidden)"
+    );
     assert_eq!(receipt.receipt.operation, "erase");
     assert!(receipt.receipt.content_hash.starts_with("blake3:"));
 }
@@ -74,9 +87,15 @@ fn cdc_5_8_refs_tombstone_no_resolve_500() {
 
     let provider = RefsGraphHolder::new(&refs);
     let consumer: &dyn PersonalDataHolder = &provider;
-    let receipt = consumer.erase(scope("u-cdc-5-8")).expect("Refs erase honours 5.8");
+    let receipt = consumer
+        .erase(scope("u-cdc-5-8"))
+        .expect("Refs erase honours 5.8");
 
-    assert_eq!(refs.resolve("u-cdc-5-8"), RefsResolve::Tombstone, "5.8: tombstone, not a 500");
+    assert_eq!(
+        refs.resolve("u-cdc-5-8"),
+        RefsResolve::Tombstone,
+        "5.8: tombstone, not a 500"
+    );
     assert_eq!(refs.recoverable_edges("u-cdc-5-8"), 0, "5.8: 0 recoverable");
     assert_eq!(receipt.receipt.operation, "erase");
 }
@@ -90,7 +109,9 @@ fn cdc_notif_humanise_to_erased_user() {
 
     let provider = NotifHistoryHolder::new(&notif);
     let consumer: &dyn PersonalDataHolder = &provider;
-    consumer.erase(scope("u-cdc-notif")).expect("Notif erase honours NOTIF-D6");
+    consumer
+        .erase(scope("u-cdc-notif"))
+        .expect("Notif erase honours NOTIF-D6");
 
     assert_eq!(notif.render_mention("inbox").as_deref(), Some(ERASED_USER));
 }
@@ -114,14 +135,26 @@ fn cdc_2_6_reindex_from_source_rectification() {
         &search,
         &refs,
     );
-    assert_eq!(outcome.search_projection.as_deref(), Some("fresh"), "2.6: Search rebuilt from source");
-    assert_eq!(outcome.refs_target.as_deref(), Some("fresh-target"), "2.6: Refs rebuilt from source");
+    assert_eq!(
+        outcome.search_projection.as_deref(),
+        Some("fresh"),
+        "2.6: Search rebuilt from source"
+    );
+    assert_eq!(
+        outcome.refs_target.as_deref(),
+        Some("fresh-target"),
+        "2.6: Refs rebuilt from source"
+    );
 
     // The providers' `rectify` receipts attest the reindex-from-source posture (never patch-in-place).
     let search_provider = SearchIndexHolder::new(&search);
     let refs_provider = RefsGraphHolder::new(&refs);
-    let sr = search_provider.rectify(&subject("u-cdc-2-6"), Patch("p".into())).unwrap();
-    let rr = refs_provider.rectify(&subject("u-cdc-2-6"), Patch("p".into())).unwrap();
+    let sr = search_provider
+        .rectify(&subject("u-cdc-2-6"), Patch("p".into()))
+        .unwrap();
+    let rr = refs_provider
+        .rectify(&subject("u-cdc-2-6"), Patch("p".into()))
+        .unwrap();
     assert_eq!(sr.receipt.operation, "rectify");
     assert_eq!(rr.receipt.operation, "rectify");
 }

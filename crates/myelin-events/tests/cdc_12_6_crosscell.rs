@@ -47,7 +47,10 @@ fn provider_emits_the_canonical_cross_cell_frame() {
         ["correlation_id", "home_cell", "subject", "type"],
         "the provider emits EXACTLY the four §6.1 fields — no payload/PII/authz state"
     );
-    assert!(obj.contains_key("type"), "the frozen wire field name is `type`");
+    assert!(
+        obj.contains_key("type"),
+        "the frozen wire field name is `type`"
+    );
     assert!(
         !obj.contains_key("r#type"),
         "the Rust keyword never leaks onto the wire"
@@ -75,5 +78,8 @@ fn consumer_reads_back_only_the_four_frozen_fields_and_routes_by_the_opaque_poin
     assert_eq!(consumer.home_cell().as_str(), "cell-fr-par-1");
 
     // The pair agrees both ways — the Bus re-export conforms to the frozen frame.
-    assert_eq!(consumer, provider, "the CDC wire shape is conformant both ways");
+    assert_eq!(
+        consumer, provider,
+        "the CDC wire shape is conformant both ways"
+    );
 }

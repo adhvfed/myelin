@@ -57,7 +57,7 @@
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
-use syn::{Data, DeriveInput, Fields, parse_macro_input};
+use syn::{parse_macro_input, Data, DeriveInput, Fields};
 
 /// The **`#[derive(PersonalData)]`** classify-derive (contract 10.2; gdpr §2.1 / §2.2). Apply it to
 /// a struct whose fields carry personal data; tag each PII field with the `#[personal_data(...)]`

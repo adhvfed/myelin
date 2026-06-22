@@ -105,7 +105,10 @@ pub enum PlaceError {
 impl std::fmt::Display for PlaceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PlaceError::NoEligibleCell { region, requested_tier } => write!(
+            PlaceError::NoEligibleCell {
+                region,
+                requested_tier,
+            } => write!(
                 f,
                 "place REFUSED: no Active cell in region `{}` serves isolation tier `{:?}` with \
                  headroom (region-first → tier-second → capacity-third found no eligible cell). \
@@ -268,7 +271,8 @@ impl<M: TokenMinter, C: Clock> PlacementService<M, C> {
 
         // Record PII-free telemetry: provision_latency (the span) + placement_count.
         let elapsed = self.clock.now_secs().saturating_sub(started);
-        self.provision_latency_secs.fetch_add(elapsed, Ordering::SeqCst);
+        self.provision_latency_secs
+            .fetch_add(elapsed, Ordering::SeqCst);
         self.placement_count.fetch_add(1, Ordering::SeqCst);
 
         Ok(PlacementAnswer {
@@ -308,8 +312,14 @@ impl<M: TokenMinter, C: Clock> std::fmt::Debug for PlacementService<M, C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // PII-free Debug: the aggregate signals only, never any tenant id / placement.
         f.debug_struct("PlacementService")
-            .field("placement_count", &self.placement_count.load(Ordering::SeqCst))
-            .field("provision_latency_secs", &self.provision_latency_secs.load(Ordering::SeqCst))
+            .field(
+                "placement_count",
+                &self.placement_count.load(Ordering::SeqCst),
+            )
+            .field(
+                "provision_latency_secs",
+                &self.provision_latency_secs.load(Ordering::SeqCst),
+            )
             .finish()
     }
 }
@@ -386,7 +396,11 @@ mod tests {
             region: Region::new(region),
             status,
             isolation_kind: kind,
-            capacity: Capacity { tenants_max: 1000, write_qps_max: 5000, storage_bytes_max: 1 << 40 },
+            capacity: Capacity {
+                tenants_max: 1000,
+                write_qps_max: 5000,
+                storage_bytes_max: 1 << 40,
+            },
             utilisation: util,
             version: 1,
             endpoint: format!("cell.{region}.{id}.myelin.eu"),
@@ -409,27 +423,51 @@ mod tests {
     /// isolation_tier, cell_endpoint}`) — no name/email anywhere.
     #[test]
     fn place_mints_pii_free_and_writes_a_sticky_placement() {
-        let mut reg = registry_with([cell("cell-w-1", "eu-west", IsolationKind::Pool, 5, CellStatus::Active)]);
+        let mut reg = registry_with([cell(
+            "cell-w-1",
+            "eu-west",
+            IsolationKind::Pool,
+            5,
+            CellStatus::Active,
+        )]);
         let svc = PlacementService::new(CounterMinter::new());
 
         let answer = svc
-            .place(&mut reg, &Region::new("eu-west"), IsolationKind::Pool, "acme")
+            .place(
+                &mut reg,
+                &Region::new("eu-west"),
+                IsolationKind::Pool,
+                "acme",
+            )
             .expect("a placeable region+tier mints + places");
 
         // The id is opaque + PII-free (an `01J0CP-` routing token — never a name/email).
-        assert!(answer.tenant_id.as_str().starts_with("01J0CP-"), "opaque minted id");
+        assert!(
+            answer.tenant_id.as_str().starts_with("01J0CP-"),
+            "opaque minted id"
+        );
         assert_eq!(answer.home_cell.as_str(), "cell-w-1");
         assert_eq!(answer.isolation_tier, IsolationKind::Pool);
         assert_eq!(answer.cell_endpoint, "cell.eu-west.cell-w-1.myelin.eu");
 
         // The sticky row is stored in the chosen region, Pending (phase 2 captures identity in-cell).
-        let row = reg.placement(&answer.tenant_id).expect("the placement is stored");
+        let row = reg
+            .placement(&answer.tenant_id)
+            .expect("the placement is stored");
         assert_eq!(row.region.as_str(), "eu-west");
         assert_eq!(row.home_cell.as_str(), "cell-w-1");
-        assert_eq!(row.status, PlacementStatus::Pending, "phase 2 (in-cell identity) not yet done");
+        assert_eq!(
+            row.status,
+            PlacementStatus::Pending,
+            "phase 2 (in-cell identity) not yet done"
+        );
 
         // Telemetry: placement_count increments.
-        assert_eq!(svc.signals().placement_count, 1, "placement_count increments on a placement");
+        assert_eq!(
+            svc.signals().placement_count,
+            1,
+            "placement_count increments on a placement"
+        );
     }
 
     /// **CP-D1 (place leg): the `place` write path declares 0 `is_personal=true` columns / two-phase
@@ -445,10 +483,21 @@ mod tests {
 
         // And a behavioural proof: place a tenant, then confirm the stored row exposes no PII —
         // every field is opaque id / region / tier / non-personal slug / status / member cells.
-        let mut reg = registry_with([cell("cell-w-1", "eu-west", IsolationKind::Pool, 5, CellStatus::Active)]);
+        let mut reg = registry_with([cell(
+            "cell-w-1",
+            "eu-west",
+            IsolationKind::Pool,
+            5,
+            CellStatus::Active,
+        )]);
         let svc = PlacementService::new(CounterMinter::new());
         let answer = svc
-            .place(&mut reg, &Region::new("eu-west"), IsolationKind::Pool, "acme")
+            .place(
+                &mut reg,
+                &Region::new("eu-west"),
+                IsolationKind::Pool,
+                "acme",
+            )
             .expect("placed");
         let row = reg.placement(&answer.tenant_id).expect("stored");
         // The slug is a non-personal routing label (never a name); there is no name/email field to
@@ -464,21 +513,55 @@ mod tests {
     fn assignment_is_region_first_tier_second_capacity_third_stability_always() {
         let reg = registry_with([
             // WRONG region (must never be chosen even though it is the least utilised).
-            cell("cell-n-1", "eu-north", IsolationKind::Pool, 1, CellStatus::Active),
+            cell(
+                "cell-n-1",
+                "eu-north",
+                IsolationKind::Pool,
+                1,
+                CellStatus::Active,
+            ),
             // right region, WRONG tier.
-            cell("cell-w-ded", "eu-west", IsolationKind::Dedicated, 2, CellStatus::Active),
+            cell(
+                "cell-w-ded",
+                "eu-west",
+                IsolationKind::Dedicated,
+                2,
+                CellStatus::Active,
+            ),
             // right region+tier, higher utilisation.
-            cell("cell-w-hi", "eu-west", IsolationKind::Pool, 80, CellStatus::Active),
+            cell(
+                "cell-w-hi",
+                "eu-west",
+                IsolationKind::Pool,
+                80,
+                CellStatus::Active,
+            ),
             // right region+tier, LOWEST utilisation → the stable pick.
-            cell("cell-w-lo", "eu-west", IsolationKind::Pool, 20, CellStatus::Active),
+            cell(
+                "cell-w-lo",
+                "eu-west",
+                IsolationKind::Pool,
+                20,
+                CellStatus::Active,
+            ),
             // right region+tier, same low utilisation as -lo → tie broken by opaque id (-lo < -tie).
-            cell("cell-w-tie", "eu-west", IsolationKind::Pool, 20, CellStatus::Active),
+            cell(
+                "cell-w-tie",
+                "eu-west",
+                IsolationKind::Pool,
+                20,
+                CellStatus::Active,
+            ),
         ]);
 
         let chosen = reg
             .assign_cell(&Region::new("eu-west"), IsolationKind::Pool)
             .expect("an eligible cell exists");
-        assert_eq!(chosen.as_str(), "cell-w-lo", "lowest-util in-region right-tier, tie by opaque id");
+        assert_eq!(
+            chosen.as_str(),
+            "cell-w-lo",
+            "lowest-util in-region right-tier, tie by opaque id"
+        );
 
         // The full deterministic order excludes the cross-region + wrong-tier cells entirely.
         let order: Vec<&str> = reg
@@ -496,11 +579,22 @@ mod tests {
     fn place_refuses_rather_than_cross_region() {
         let mut reg = registry_with([
             // a fine Pool cell, but in the WRONG region.
-            cell("cell-n-1", "eu-north", IsolationKind::Pool, 1, CellStatus::Active),
+            cell(
+                "cell-n-1",
+                "eu-north",
+                IsolationKind::Pool,
+                1,
+                CellStatus::Active,
+            ),
         ]);
         let svc = PlacementService::new(CounterMinter::new());
         let err = svc
-            .place(&mut reg, &Region::new("eu-west"), IsolationKind::Pool, "acme")
+            .place(
+                &mut reg,
+                &Region::new("eu-west"),
+                IsolationKind::Pool,
+                "acme",
+            )
             .expect_err("no eligible in-region cell ⇒ refused, never cross-region");
         assert_eq!(
             err,
@@ -511,7 +605,11 @@ mod tests {
         );
         // Nothing was placed (no PII-free id minted into a wrong-region cell).
         assert_eq!(svc.signals().placement_count, 0);
-        assert!(err.to_string().contains("NEVER places into a different region"), "loud: {err}");
+        assert!(
+            err.to_string()
+                .contains("NEVER places into a different region"),
+            "loud: {err}"
+        );
     }
 
     /// **Capacity-third: a FULLY-utilised cell (utilisation == 100) is NOT eligible** — it has no
@@ -519,35 +617,64 @@ mod tests {
     /// vector is §7.1 / P-CP-10). A cell at 99 is eligible; a cell at 100 is not (the boundary).
     #[test]
     fn place_skips_a_fully_utilised_cell() {
-        let mut reg = registry_with([
-            cell("cell-w-full", "eu-west", IsolationKind::Pool, 100, CellStatus::Active),
-        ]);
+        let mut reg = registry_with([cell(
+            "cell-w-full",
+            "eu-west",
+            IsolationKind::Pool,
+            100,
+            CellStatus::Active,
+        )]);
         let svc = PlacementService::new(CounterMinter::new());
         let err = svc
-            .place(&mut reg, &Region::new("eu-west"), IsolationKind::Pool, "acme")
+            .place(
+                &mut reg,
+                &Region::new("eu-west"),
+                IsolationKind::Pool,
+                "acme",
+            )
             .expect_err("a fully-utilised cell has no headroom");
         assert!(matches!(err, PlaceError::NoEligibleCell { .. }));
         assert!(
-            reg.cells_in_assignment_order(&Region::new("eu-west"), IsolationKind::Pool).is_empty(),
+            reg.cells_in_assignment_order(&Region::new("eu-west"), IsolationKind::Pool)
+                .is_empty(),
             "a 100%-utilised cell is excluded by capacity-third"
         );
 
         // A cell at 99 (one short of full) IS eligible — the boundary is strict (< 100).
-        reg.insert_cell(cell("cell-w-99", "eu-west", IsolationKind::Pool, 99, CellStatus::Active));
+        reg.insert_cell(cell(
+            "cell-w-99",
+            "eu-west",
+            IsolationKind::Pool,
+            99,
+            CellStatus::Active,
+        ));
         let chosen = reg.assign_cell(&Region::new("eu-west"), IsolationKind::Pool);
-        assert_eq!(chosen.as_ref().map(|c| c.as_str()), Some("cell-w-99"), "a 99% cell still has headroom");
+        assert_eq!(
+            chosen.as_ref().map(|c| c.as_str()),
+            Some("cell-w-99"),
+            "a 99% cell still has headroom"
+        );
     }
 
     /// A `Provisioning` (not-yet-`Active`) cell is NOT eligible — the provisioning gate (P-CP-11)
     /// means a tenant is only placed on an `Active` cell.
     #[test]
     fn place_skips_a_non_active_cell() {
-        let mut reg = registry_with([
-            cell("cell-w-prov", "eu-west", IsolationKind::Pool, 1, CellStatus::Provisioning),
-        ]);
+        let mut reg = registry_with([cell(
+            "cell-w-prov",
+            "eu-west",
+            IsolationKind::Pool,
+            1,
+            CellStatus::Provisioning,
+        )]);
         let svc = PlacementService::new(CounterMinter::new());
         let err = svc
-            .place(&mut reg, &Region::new("eu-west"), IsolationKind::Pool, "acme")
+            .place(
+                &mut reg,
+                &Region::new("eu-west"),
+                IsolationKind::Pool,
+                "acme",
+            )
             .expect_err("a Provisioning cell accepts no placements");
         assert!(matches!(err, PlaceError::NoEligibleCell { .. }));
     }
@@ -557,31 +684,84 @@ mod tests {
     /// ONCE at signup; thereafter the stored row is authoritative (a re-hash would have moved it).
     #[test]
     fn placement_is_a_sticky_stored_fact() {
-        let mut reg = registry_with([cell("cell-w-hi", "eu-west", IsolationKind::Pool, 70, CellStatus::Active)]);
+        let mut reg = registry_with([cell(
+            "cell-w-hi",
+            "eu-west",
+            IsolationKind::Pool,
+            70,
+            CellStatus::Active,
+        )]);
         let svc = PlacementService::new(CounterMinter::new());
         let answer = svc
-            .place(&mut reg, &Region::new("eu-west"), IsolationKind::Pool, "acme")
+            .place(
+                &mut reg,
+                &Region::new("eu-west"),
+                IsolationKind::Pool,
+                "acme",
+            )
             .expect("placed on the only cell");
         assert_eq!(answer.home_cell.as_str(), "cell-w-hi");
 
         // A much-better cell appears AFTER placement. A re-hash would re-route to it; a sticky stored
         // fact does not.
-        reg.insert_cell(cell("cell-w-lo", "eu-west", IsolationKind::Pool, 1, CellStatus::Active));
-        let sticky = svc.answer_for(&reg, &answer.tenant_id).expect("the placement is sticky");
-        assert_eq!(sticky.home_cell.as_str(), "cell-w-hi", "the placed cell is sticky, never re-hashed");
-        assert_eq!(sticky, answer, "the same routing answer is returned for the placed tenant");
+        reg.insert_cell(cell(
+            "cell-w-lo",
+            "eu-west",
+            IsolationKind::Pool,
+            1,
+            CellStatus::Active,
+        ));
+        let sticky = svc
+            .answer_for(&reg, &answer.tenant_id)
+            .expect("the placement is sticky");
+        assert_eq!(
+            sticky.home_cell.as_str(),
+            "cell-w-hi",
+            "the placed cell is sticky, never re-hashed"
+        );
+        assert_eq!(
+            sticky, answer,
+            "the same routing answer is returned for the placed tenant"
+        );
         // answer_for is a pure read — it mints nothing and increments no signal.
-        assert_eq!(svc.signals().placement_count, 1, "answer_for does not re-place");
+        assert_eq!(
+            svc.signals().placement_count,
+            1,
+            "answer_for does not re-place"
+        );
     }
 
     /// Each `place` mints a UNIQUE PII-free id (two tenants never collide onto one placement).
     #[test]
     fn each_place_mints_a_unique_id() {
-        let mut reg = registry_with([cell("cell-w-1", "eu-west", IsolationKind::Pool, 5, CellStatus::Active)]);
+        let mut reg = registry_with([cell(
+            "cell-w-1",
+            "eu-west",
+            IsolationKind::Pool,
+            5,
+            CellStatus::Active,
+        )]);
         let svc = PlacementService::new(CounterMinter::new());
-        let a = svc.place(&mut reg, &Region::new("eu-west"), IsolationKind::Pool, "acme").expect("a");
-        let b = svc.place(&mut reg, &Region::new("eu-west"), IsolationKind::Pool, "beta").expect("b");
-        assert_ne!(a.tenant_id, b.tenant_id, "each placement mints a unique opaque id");
+        let a = svc
+            .place(
+                &mut reg,
+                &Region::new("eu-west"),
+                IsolationKind::Pool,
+                "acme",
+            )
+            .expect("a");
+        let b = svc
+            .place(
+                &mut reg,
+                &Region::new("eu-west"),
+                IsolationKind::Pool,
+                "beta",
+            )
+            .expect("b");
+        assert_ne!(
+            a.tenant_id, b.tenant_id,
+            "each placement mints a unique opaque id"
+        );
         assert_eq!(svc.signals().placement_count, 2);
     }
 
@@ -604,17 +784,52 @@ mod tests {
         }
 
         let mut reg = registry_with([
-            cell("cell-w-1", "eu-west", IsolationKind::Pool, 5, CellStatus::Active),
-            cell("cell-w-2", "eu-west", IsolationKind::Pool, 6, CellStatus::Active),
+            cell(
+                "cell-w-1",
+                "eu-west",
+                IsolationKind::Pool,
+                5,
+                CellStatus::Active,
+            ),
+            cell(
+                "cell-w-2",
+                "eu-west",
+                IsolationKind::Pool,
+                6,
+                CellStatus::Active,
+            ),
         ]);
-        let clock = SteppingClock { now: AtomicU64::new(1_000), step: 3 };
+        let clock = SteppingClock {
+            now: AtomicU64::new(1_000),
+            step: 3,
+        };
         let svc = PlacementService::with_clock(CounterMinter::new(), clock);
 
-        svc.place(&mut reg, &Region::new("eu-west"), IsolationKind::Pool, "acme").expect("placed");
-        assert_eq!(svc.signals().provision_latency_secs, 3, "one place records a 3s span");
+        svc.place(
+            &mut reg,
+            &Region::new("eu-west"),
+            IsolationKind::Pool,
+            "acme",
+        )
+        .expect("placed");
+        assert_eq!(
+            svc.signals().provision_latency_secs,
+            3,
+            "one place records a 3s span"
+        );
 
-        svc.place(&mut reg, &Region::new("eu-west"), IsolationKind::Pool, "beta").expect("placed");
-        assert_eq!(svc.signals().provision_latency_secs, 6, "the span sums across placements");
+        svc.place(
+            &mut reg,
+            &Region::new("eu-west"),
+            IsolationKind::Pool,
+            "beta",
+        )
+        .expect("placed");
+        assert_eq!(
+            svc.signals().provision_latency_secs,
+            6,
+            "the span sums across placements"
+        );
     }
 
     /// **The `PlacementService` Debug is PII-free + aggregate-only.** It prints the aggregate
@@ -623,14 +838,31 @@ mod tests {
     /// reflects the count but leaks no minted id.
     #[test]
     fn placement_service_debug_is_pii_free_and_aggregate() {
-        let mut reg = registry_with([cell("cell-w-1", "eu-west", IsolationKind::Pool, 5, CellStatus::Active)]);
+        let mut reg = registry_with([cell(
+            "cell-w-1",
+            "eu-west",
+            IsolationKind::Pool,
+            5,
+            CellStatus::Active,
+        )]);
         let svc = PlacementService::new(CounterMinter::new());
         let answer = svc
-            .place(&mut reg, &Region::new("eu-west"), IsolationKind::Pool, "acme")
+            .place(
+                &mut reg,
+                &Region::new("eu-west"),
+                IsolationKind::Pool,
+                "acme",
+            )
             .expect("placed");
         let dbg = format!("{svc:?}");
-        assert!(dbg.contains("placement_count"), "the Debug shows the aggregate count: {dbg}");
-        assert!(dbg.contains("provision_latency_secs"), "the Debug shows the latency aggregate: {dbg}");
+        assert!(
+            dbg.contains("placement_count"),
+            "the Debug shows the aggregate count: {dbg}"
+        );
+        assert!(
+            dbg.contains("provision_latency_secs"),
+            "the Debug shows the latency aggregate: {dbg}"
+        );
         // The minted opaque tenant id is NOT in the Debug surface (PII-free log discipline).
         assert!(
             !dbg.contains(answer.tenant_id.as_str()),
@@ -642,9 +874,18 @@ mod tests {
     /// P-CP-10.
     #[test]
     fn serves_tier_is_exact_match_in_v1() {
-        assert!(Registry::serves_tier(IsolationKind::Pool, IsolationKind::Pool));
-        assert!(!Registry::serves_tier(IsolationKind::Pool, IsolationKind::Dedicated));
-        assert!(Registry::serves_tier(IsolationKind::Dedicated, IsolationKind::Dedicated));
+        assert!(Registry::serves_tier(
+            IsolationKind::Pool,
+            IsolationKind::Pool
+        ));
+        assert!(!Registry::serves_tier(
+            IsolationKind::Pool,
+            IsolationKind::Dedicated
+        ));
+        assert!(Registry::serves_tier(
+            IsolationKind::Dedicated,
+            IsolationKind::Dedicated
+        ));
     }
 
     // ----- CDC for the `place` half of 12.3 (provider + consumer) -----
@@ -686,19 +927,36 @@ mod tests {
         }
 
         // PROVIDER.
-        let mut reg = registry_with([cell("cell-w-1", "eu-west", IsolationKind::Pool, 5, CellStatus::Active)]);
+        let mut reg = registry_with([cell(
+            "cell-w-1",
+            "eu-west",
+            IsolationKind::Pool,
+            5,
+            CellStatus::Active,
+        )]);
         let svc = PlacementService::new(CounterMinter::new());
         let edge = SignupEdge { svc: &svc };
 
         // CONSUMER: phase 1 (PII-free placement), then phase 2 (identity in-cell).
         let answer = edge
-            .signup_phase1(&mut reg, &Region::new("eu-west"), IsolationKind::Pool, "acme")
+            .signup_phase1(
+                &mut reg,
+                &Region::new("eu-west"),
+                IsolationKind::Pool,
+                "acme",
+            )
             .expect("the signup edge places the tenant PII-free");
         let in_cell_endpoint = edge.signup_phase2_in_cell(&answer);
         assert_eq!(in_cell_endpoint, "cell.eu-west.cell-w-1.myelin.eu");
         // The control-plane placement carries NO identity — only the PII-free routing record.
-        let row = reg.placement(&answer.tenant_id).expect("the routing record is stored");
-        assert_eq!(row.status, PlacementStatus::Pending, "identity capture is phase 2, in-cell");
+        let row = reg
+            .placement(&answer.tenant_id)
+            .expect("the routing record is stored");
+        assert_eq!(
+            row.status,
+            PlacementStatus::Pending,
+            "identity capture is phase 2, in-cell"
+        );
         assert_eq!(row.region.as_str(), "eu-west");
     }
 }

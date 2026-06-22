@@ -39,7 +39,9 @@ fn rto_max_secs_from_thresholds(key: &str) -> u64 {
         .get("rpo_rto")
         .and_then(|t| t.get(key))
         .and_then(|v| v.as_integer())
-        .unwrap_or_else(|| panic!("rpo_rto.{key} must be present (a missing threshold is a LOUD error)"));
+        .unwrap_or_else(|| {
+            panic!("rpo_rto.{key} must be present (a missing threshold is a LOUD error)")
+        });
     assert!(mins > 0, "the RTO bound {key} must be a positive duration");
     (mins as u64) * 60
 }
@@ -131,8 +133,14 @@ fn stor_d2_cell_kill_rto_within_bounds() {
         cell_bound / 60,
     );
 
-    assert_eq!(report.rto_for(RtoGrain::Tenant), Some(tenant_recovery.rto_secs()));
-    assert_eq!(report.rto_for(RtoGrain::Cell), Some(cell_recovery.rto_secs()));
+    assert_eq!(
+        report.rto_for(RtoGrain::Tenant),
+        Some(tenant_recovery.rto_secs())
+    );
+    assert_eq!(
+        report.rto_for(RtoGrain::Cell),
+        Some(cell_recovery.rto_secs())
+    );
 }
 
 /// The drill must actually CATCH a too-slow recovery (the assertion is real, not vacuous): a cell

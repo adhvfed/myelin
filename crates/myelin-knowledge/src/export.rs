@@ -51,12 +51,12 @@
 
 use std::fmt::Write as _;
 
+use myelin_content::adf::mapping_for;
+use myelin_content::ImportReport;
 use myelin_content::{
     parse_inline, serialize_inline, AdfNode, AdfTarget, Block, CalloutTone, Cell, Column,
     EmbedDisplay, HeadingLevel, Inline, InlineNode, ListItem, Loss, TaskItem,
 };
-use myelin_content::adf::mapping_for;
-use myelin_content::ImportReport;
 use myelin_query::{FieldId, FieldValue};
 use serde::{Deserialize, Serialize};
 
@@ -117,7 +117,11 @@ pub struct ExportBlock {
 impl ExportBlock {
     /// A leaf export block (no children).
     pub fn leaf(id: impl Into<String>, block: Block) -> ExportBlock {
-        ExportBlock { id: BlockId(id.into()), block, children: Vec::new() }
+        ExportBlock {
+            id: BlockId(id.into()),
+            block,
+            children: Vec::new(),
+        }
     }
 
     /// An export block with children.
@@ -126,7 +130,11 @@ impl ExportBlock {
         block: Block,
         children: Vec<ExportBlock>,
     ) -> ExportBlock {
-        ExportBlock { id: BlockId(id.into()), block, children }
+        ExportBlock {
+            id: BlockId(id.into()),
+            block,
+            children,
+        }
     }
 
     /// Every block in this subtree, depth-first (the export-order walk).
@@ -231,7 +239,9 @@ impl ExportDoc {
     /// the stored inline, re-parsing it, and re-serialising must be a fixed point — the KN-D2 bar
     /// applied to every block's content.
     pub fn all_inlines_roundtrip(&self) -> bool {
-        self.all_blocks().iter().all(|b| inline_roundtrips(&b.block))
+        self.all_blocks()
+            .iter()
+            .all(|b| inline_roundtrips(&b.block))
     }
 
     // ── the multi-format exporters ─────────────────────────────────────────────────────────────
@@ -336,9 +346,10 @@ fn inline_roundtrips(block: &Block) -> bool {
         }
         Block::Table { columns, rows } => {
             columns.iter().all(|c| ok(&c.header))
-                && rows
-                    .iter()
-                    .all(|r| r.iter().all(|cell| cell.blocks.iter().all(inline_roundtrips)))
+                && rows.iter().all(|r| {
+                    r.iter()
+                        .all(|cell| cell.blocks.iter().all(inline_roundtrips))
+                })
         }
         Block::Image { caption, .. } => caption.as_ref().map(ok).unwrap_or(true),
         // No inline payload (code is raw; the structured/leaf nodes carry refs, not inline runs).
@@ -407,7 +418,10 @@ fn block_to_markdown(b: &ExportBlock, depth: usize, out: &mut String) {
             }
         }
         Block::Table { columns, rows } => {
-            let headers: Vec<String> = columns.iter().map(|c| serialize_inline(&c.header)).collect();
+            let headers: Vec<String> = columns
+                .iter()
+                .map(|c| serialize_inline(&c.header))
+                .collect();
             let _ = writeln!(out, "{indent}| {} |", headers.join(" | "));
             let _ = writeln!(
                 out,
@@ -432,7 +446,11 @@ fn block_to_markdown(b: &ExportBlock, depth: usize, out: &mut String) {
             let _ = writeln!(out, "{indent}[db_view: {}]", db.0);
         }
         Block::Toggle { summary, blocks } => {
-            let _ = writeln!(out, "{indent}<details><summary>{}</summary>", serialize_inline(summary));
+            let _ = writeln!(
+                out,
+                "{indent}<details><summary>{}</summary>",
+                serialize_inline(summary)
+            );
             for sub in blocks {
                 block_to_markdown(&ExportBlock::leaf("", sub.clone()), depth + 1, out);
             }
@@ -549,7 +567,11 @@ fn block_to_html(b: &ExportBlock, out: &mut String) {
             let _ = writeln!(out, "<pre><code{cls}>{}</code></pre>", html_escape(text));
         }
         Block::Callout { tone, blocks } => {
-            let _ = writeln!(out, "<div class=\"callout callout-{}\">", callout_tone_class(*tone));
+            let _ = writeln!(
+                out,
+                "<div class=\"callout callout-{}\">",
+                callout_tone_class(*tone)
+            );
             for sub in blocks {
                 block_to_html(&ExportBlock::leaf("", sub.clone()), out);
             }
@@ -583,10 +605,18 @@ fn block_to_html(b: &ExportBlock, out: &mut String) {
             );
         }
         Block::DbView { db, .. } => {
-            let _ = writeln!(out, "<div class=\"db-view\" data-db=\"{}\"></div>", html_escape(&db.0));
+            let _ = writeln!(
+                out,
+                "<div class=\"db-view\" data-db=\"{}\"></div>",
+                html_escape(&db.0)
+            );
         }
         Block::Toggle { summary, blocks } => {
-            let _ = writeln!(out, "<details><summary>{}</summary>", inline_to_html(summary));
+            let _ = writeln!(
+                out,
+                "<details><summary>{}</summary>",
+                inline_to_html(summary)
+            );
             for sub in blocks {
                 block_to_html(&ExportBlock::leaf("", sub.clone()), out);
             }
@@ -612,7 +642,10 @@ fn item_blocks_html(blocks: &[Block]) -> String {
     }
     // Unwrap a single paragraph so `<li><p>x</p></li>` reads `<li>x</li>` for the common case.
     let trimmed = s.trim();
-    if let Some(inner) = trimmed.strip_prefix("<p>").and_then(|t| t.strip_suffix("</p>")) {
+    if let Some(inner) = trimmed
+        .strip_prefix("<p>")
+        .and_then(|t| t.strip_suffix("</p>"))
+    {
         if !inner.contains("<p>") {
             return inner.to_string();
         }
@@ -674,7 +707,11 @@ fn inline_to_html(inline: &Inline) -> String {
                     .map(node_label)
                     .unwrap_or_else(|| "ref".to_string());
                 node_idx += 1;
-                let _ = write!(out, "<span class=\"inline-node\">{}</span>", html_escape(&label));
+                let _ = write!(
+                    out,
+                    "<span class=\"inline-node\">{}</span>",
+                    html_escape(&label)
+                );
             }
         }
     }
@@ -728,7 +765,11 @@ fn block_to_plain_text(b: &ExportBlock, lines: &mut Vec<String>) {
         }
         Block::OrderedList { items, start } => {
             for (i, it) in items.iter().enumerate() {
-                lines.push(format!("{}. {}", *start as usize + i, item_blocks_plain(&it.blocks)));
+                lines.push(format!(
+                    "{}. {}",
+                    *start as usize + i,
+                    item_blocks_plain(&it.blocks)
+                ));
             }
         }
         Block::TaskList { items } => {
@@ -748,9 +789,20 @@ fn block_to_plain_text(b: &ExportBlock, lines: &mut Vec<String>) {
             }
         }
         Block::Table { columns, rows } => {
-            lines.push(columns.iter().map(|c| inline_to_plain(&c.header)).collect::<Vec<_>>().join(" | "));
+            lines.push(
+                columns
+                    .iter()
+                    .map(|c| inline_to_plain(&c.header))
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+            );
             for row in rows {
-                lines.push(row.iter().map(|c| item_blocks_plain(&c.blocks)).collect::<Vec<_>>().join(" | "));
+                lines.push(
+                    row.iter()
+                        .map(|c| item_blocks_plain(&c.blocks))
+                        .collect::<Vec<_>>()
+                        .join(" | "),
+                );
             }
         }
         Block::Divider => lines.push("----".to_string()),
@@ -836,7 +888,11 @@ fn render_minimal_pdf(title: &str, body: &str) -> Vec<u8> {
     };
 
     // 1: Catalog
-    push_obj(&mut pdf, &mut offsets, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    push_obj(
+        &mut pdf,
+        &mut offsets,
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+    );
     // 2: Pages
     push_obj(
         &mut pdf,
@@ -983,12 +1039,20 @@ impl ParsedAdfNode {
     /// A node that resolves losslessly (the lossless branch of a conditional row, or a node whose
     /// row is unconditionally lossless).
     pub fn resolved(kind: AdfNode, text: impl Into<String>) -> ParsedAdfNode {
-        ParsedAdfNode { kind, text: text.into(), resolved: true }
+        ParsedAdfNode {
+            kind,
+            text: text.into(),
+            resolved: true,
+        }
     }
 
     /// A node that does NOT resolve (the degraded branch of a conditional row).
     pub fn unresolved(kind: AdfNode, text: impl Into<String>) -> ParsedAdfNode {
-        ParsedAdfNode { kind, text: text.into(), resolved: false }
+        ParsedAdfNode {
+            kind,
+            text: text.into(),
+            resolved: false,
+        }
     }
 }
 
@@ -1025,7 +1089,9 @@ pub fn import_adf(page_id: &str, title: &str, nodes: &[ParsedAdfNode]) -> AdfImp
                 report.record(node.kind, mapping.target, what.to_string());
                 mapping.target
             }
-            Loss::Conditional { what, degraded_to, .. } => {
+            Loss::Conditional {
+                what, degraded_to, ..
+            } => {
                 if node.resolved {
                     mapping.target
                 } else {
@@ -1059,17 +1125,26 @@ fn construct_block(target: AdfTarget, node: &ParsedAdfNode) -> Block {
         AdfTarget::Blockquote => Block::Blockquote {
             blocks: vec![para(parse_inline(&node.text, &[]))],
         },
-        AdfTarget::CodeBlock => Block::CodeBlock { lang: None, text: node.text.clone() },
+        AdfTarget::CodeBlock => Block::CodeBlock {
+            lang: None,
+            text: node.text.clone(),
+        },
         AdfTarget::Divider => Block::Divider,
         AdfTarget::BulletList => Block::BulletList {
-            items: vec![ListItem { blocks: vec![para(parse_inline(&node.text, &[]))] }],
+            items: vec![ListItem {
+                blocks: vec![para(parse_inline(&node.text, &[]))],
+            }],
         },
         AdfTarget::OrderedList => Block::OrderedList {
-            items: vec![ListItem { blocks: vec![para(parse_inline(&node.text, &[]))] }],
+            items: vec![ListItem {
+                blocks: vec![para(parse_inline(&node.text, &[]))],
+            }],
             start: 1,
         },
         AdfTarget::Table => Block::Table {
-            columns: vec![Column { header: parse_inline(&node.text, &[]) }],
+            columns: vec![Column {
+                header: parse_inline(&node.text, &[]),
+            }],
             rows: vec![],
         },
         AdfTarget::Image => Block::Image {
@@ -1078,7 +1153,10 @@ fn construct_block(target: AdfTarget, node: &ParsedAdfNode) -> Block {
             caption: None,
         },
         AdfTarget::TaskList | AdfTarget::TaskItem => Block::TaskList {
-            items: vec![TaskItem { checked: false, inline: parse_inline(&node.text, &[]) }],
+            items: vec![TaskItem {
+                checked: false,
+                inline: parse_inline(&node.text, &[]),
+            }],
         },
         AdfTarget::Callout => Block::Callout {
             // a macro (extension) degrades to a note callout carrying the body + the marker.
@@ -1107,7 +1185,10 @@ fn construct_block(target: AdfTarget, node: &ParsedAdfNode) -> Block {
         )),
         // ── the degraded targets (the loss is recorded; the content survives degraded) ──
         AdfTarget::PlainText => para(parse_inline(&escape_plain(&node.text), &[])),
-        AdfTarget::Link => para(parse_inline(&format!("[{}]({})", node.text, node.text), &[])),
+        AdfTarget::Link => para(parse_inline(
+            &format!("[{}]({})", node.text, node.text),
+            &[],
+        )),
         AdfTarget::InlineCode => para(parse_inline(&format!("`{}`", node.text), &[])),
         AdfTarget::UnicodeGlyph => para(parse_inline(&escape_plain(&node.text), &[])),
         AdfTarget::FlattenedBlocks => para(parse_inline(&escape_plain(&node.text), &[])),
@@ -1127,7 +1208,11 @@ fn escape_plain(text: &str) -> String {
     // active delimiters), so the text is a fixed point of the grammar.
     use myelin_content::{Mark, Span};
     let inline = Inline {
-        spans: vec![Span::Text { text: text.to_string(), marks: Vec::<Mark>::new(), link: None }],
+        spans: vec![Span::Text {
+            text: text.to_string(),
+            marks: Vec::<Mark>::new(),
+            link: None,
+        }],
         nodes: vec![],
     };
     serialize_inline(&inline)

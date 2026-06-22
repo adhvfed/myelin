@@ -228,7 +228,10 @@ impl DsrState {
     /// Whether this is a terminal state (no outgoing edges): `Completed` (success), `Refused`
     /// (the posture gate denied), or `Failed` (an upstream error).
     pub fn is_terminal(self) -> bool {
-        matches!(self, DsrState::Completed | DsrState::Refused | DsrState::Failed)
+        matches!(
+            self,
+            DsrState::Completed | DsrState::Refused | DsrState::Failed
+        )
     }
 
     /// The stable string form for the `dsr_state` telemetry signal (the §4.1 GATE — `dsr_state`
@@ -312,7 +315,10 @@ pub fn resolve_checklist_from_map(inventory: &Inventory) -> Vec<ChecklistItem> {
         .into_iter()
         .map(|(holder_id, mut field_mechanisms)| {
             field_mechanisms.sort();
-            ChecklistItem { holder_id, field_mechanisms }
+            ChecklistItem {
+                holder_id,
+                field_mechanisms,
+            }
         })
         .collect()
 }
@@ -500,7 +506,10 @@ impl<C: Clock> DsrOrchestrator<C> {
     /// Build an orchestrator over an injectable clock (the deadline base). Production wires
     /// [`myelin_substrate::SystemClock`]; the drills wire [`myelin_substrate::TestClock`].
     pub fn new(clock: C) -> DsrOrchestrator<C> {
-        DsrOrchestrator { clock, register: Mutex::new(DsrRegister::default()) }
+        DsrOrchestrator {
+            clock,
+            register: Mutex::new(DsrRegister::default()),
+        }
     }
 
     /// **`dsr_submit(kind, subject, scope, posture) → dsr_id` (§8.1 / contract 10.4).** Records a
@@ -559,7 +568,10 @@ impl<C: Clock> DsrOrchestrator<C> {
     /// makes it `MerkleProven` is wired in P-GA-20 (the `merkle_inclusion` field is `None` here).
     pub fn dsr_certificate(&self, id: &DsrId) -> Result<MerkleProvenBundle> {
         let reg = self.register.lock().unwrap_or_else(|e| e.into_inner());
-        let dsr = reg.dsrs.get(id).ok_or_else(|| DsrError::UnknownDsr(id.clone()))?;
+        let dsr = reg
+            .dsrs
+            .get(id)
+            .ok_or_else(|| DsrError::UnknownDsr(id.clone()))?;
         if !matches!(dsr.state, DsrState::Verified | DsrState::Completed) {
             return Err(DsrError::CertificateNotReady(dsr.state));
         }
@@ -582,7 +594,10 @@ impl<C: Clock> DsrOrchestrator<C> {
     /// is ADMITTED (the controller authorised it via Art. 28).
     pub fn validate(&self, id: &DsrId) -> Result<bool> {
         let mut reg = self.register.lock().unwrap_or_else(|e| e.into_inner());
-        let dsr = reg.dsrs.get_mut(id).ok_or_else(|| DsrError::UnknownDsr(id.clone()))?;
+        let dsr = reg
+            .dsrs
+            .get_mut(id)
+            .ok_or_else(|| DsrError::UnknownDsr(id.clone()))?;
         transition(dsr, DsrState::Validated)?;
         if Self::posture_gate_refuses(dsr) {
             transition(dsr, DsrState::Refused)?;
@@ -610,7 +625,10 @@ impl<C: Clock> DsrOrchestrator<C> {
     /// only RESOLVES + QUEUES it (the machine parks at `AwaitingHolders`).
     pub fn fan_out(&self, id: &DsrId, inventory: &Inventory) -> Result<Vec<ChecklistItem>> {
         let mut reg = self.register.lock().unwrap_or_else(|e| e.into_inner());
-        let dsr = reg.dsrs.get_mut(id).ok_or_else(|| DsrError::UnknownDsr(id.clone()))?;
+        let dsr = reg
+            .dsrs
+            .get_mut(id)
+            .ok_or_else(|| DsrError::UnknownDsr(id.clone()))?;
         transition(dsr, DsrState::FannedOut)?;
         dsr.checklist = resolve_checklist_from_map(inventory);
         // §4.1 — fanned-out THEN awaiting-holders; never skip awaiting-holders.
@@ -625,7 +643,10 @@ impl<C: Clock> DsrOrchestrator<C> {
     /// it).
     pub fn verify(&self, id: &DsrId, receipts: Vec<String>) -> Result<()> {
         let mut reg = self.register.lock().unwrap_or_else(|e| e.into_inner());
-        let dsr = reg.dsrs.get_mut(id).ok_or_else(|| DsrError::UnknownDsr(id.clone()))?;
+        let dsr = reg
+            .dsrs
+            .get_mut(id)
+            .ok_or_else(|| DsrError::UnknownDsr(id.clone()))?;
         transition(dsr, DsrState::Verified)?;
         dsr.receipts = receipts;
         Ok(())
@@ -636,7 +657,10 @@ impl<C: Clock> DsrOrchestrator<C> {
     /// the DSR done so `dsr_certificate` is final.
     pub fn complete(&self, id: &DsrId) -> Result<()> {
         let mut reg = self.register.lock().unwrap_or_else(|e| e.into_inner());
-        let dsr = reg.dsrs.get_mut(id).ok_or_else(|| DsrError::UnknownDsr(id.clone()))?;
+        let dsr = reg
+            .dsrs
+            .get_mut(id)
+            .ok_or_else(|| DsrError::UnknownDsr(id.clone()))?;
         transition(dsr, DsrState::Completed)
     }
 
@@ -644,14 +668,20 @@ impl<C: Clock> DsrOrchestrator<C> {
     /// non-terminal state; the resumable checklist re-drives from here (P-GA-12).
     pub fn fail(&self, id: &DsrId) -> Result<()> {
         let mut reg = self.register.lock().unwrap_or_else(|e| e.into_inner());
-        let dsr = reg.dsrs.get_mut(id).ok_or_else(|| DsrError::UnknownDsr(id.clone()))?;
+        let dsr = reg
+            .dsrs
+            .get_mut(id)
+            .ok_or_else(|| DsrError::UnknownDsr(id.clone()))?;
         transition(dsr, DsrState::Failed)
     }
 
     /// The current state of a DSR (for telemetry / tests). Errors on an unknown id.
     pub fn state_of(&self, id: &DsrId) -> Result<DsrState> {
         let reg = self.register.lock().unwrap_or_else(|e| e.into_inner());
-        reg.dsrs.get(id).map(|d| d.state).ok_or_else(|| DsrError::UnknownDsr(id.clone()))
+        reg.dsrs
+            .get(id)
+            .map(|d| d.state)
+            .ok_or_else(|| DsrError::UnknownDsr(id.clone()))
     }
 
     /// **The PII-free request view the P-GA-12 fan-out driver reads** (the request inputs the
@@ -661,7 +691,10 @@ impl<C: Clock> DsrOrchestrator<C> {
     /// the orchestrator itself never reaches into a store (the no-cross-store-read law, §3.1).
     pub fn request_view(&self, id: &DsrId) -> Result<DsrRequestView> {
         let reg = self.register.lock().unwrap_or_else(|e| e.into_inner());
-        let dsr = reg.dsrs.get(id).ok_or_else(|| DsrError::UnknownDsr(id.clone()))?;
+        let dsr = reg
+            .dsrs
+            .get(id)
+            .ok_or_else(|| DsrError::UnknownDsr(id.clone()))?;
         Ok(DsrRequestView {
             id: dsr.id.clone(),
             kind: dsr.kind,
@@ -705,7 +738,10 @@ pub struct DsrRequestView {
 /// never a silent skip. Mutates the DSR's state IFF the transition is legal.
 fn transition(dsr: &mut Dsr, to: DsrState) -> Result<()> {
     if !dsr.state.can_transition_to(to) {
-        return Err(DsrError::IllegalTransition { from: dsr.state, to });
+        return Err(DsrError::IllegalTransition {
+            from: dsr.state,
+            to,
+        });
     }
     dsr.state = to;
     Ok(())
@@ -730,7 +766,10 @@ mod tests {
     }
 
     fn subject_scope(s: &str) -> EraseScope {
-        EraseScope::Subject { subject: subject(s), tenant: tenant() }
+        EraseScope::Subject {
+            subject: subject(s),
+            tenant: tenant(),
+        }
     }
 
     fn orch_at(t0: u64) -> DsrOrchestrator<TestClock> {
@@ -777,13 +816,25 @@ mod tests {
     fn transition_guard_is_total_terminal_states_have_no_outgoing_edges() {
         use DsrState::*;
         let all = [
-            Received, Validated, FannedOut, AwaitingHolders, Verified, Completed, Refused, Failed,
+            Received,
+            Validated,
+            FannedOut,
+            AwaitingHolders,
+            Verified,
+            Completed,
+            Refused,
+            Failed,
         ];
         // Terminal states have ZERO outgoing edges (incl. Failed).
         for &t in &[Completed, Refused, Failed] {
             assert!(t.is_terminal());
             for &n in &all {
-                assert!(!t.can_transition_to(n), "{} → {} must be illegal", t.as_str(), n.as_str());
+                assert!(
+                    !t.can_transition_to(n),
+                    "{} → {} must be illegal",
+                    t.as_str(),
+                    n.as_str()
+                );
             }
         }
         // Every non-terminal is NOT terminal + CAN fail; every terminal IS terminal + canNOT.
@@ -823,14 +874,25 @@ mod tests {
     fn submitted_dsr_ids_are_distinct_monotonic_ordinals() {
         let o = orch_at(0);
         let a = o.dsr_submit(
-            DsrKind::Access, tenant(), subject("p1"), subject_scope("p1"),
-            Posture::Controller, Initiator::Myelin,
+            DsrKind::Access,
+            tenant(),
+            subject("p1"),
+            subject_scope("p1"),
+            Posture::Controller,
+            Initiator::Myelin,
         );
         let b = o.dsr_submit(
-            DsrKind::Access, tenant(), subject("p2"), subject_scope("p2"),
-            Posture::Controller, Initiator::Myelin,
+            DsrKind::Access,
+            tenant(),
+            subject("p2"),
+            subject_scope("p2"),
+            Posture::Controller,
+            Initiator::Myelin,
         );
-        assert_ne!(a, b, "each submit mints a distinct id (the ordinal advances)");
+        assert_ne!(
+            a, b,
+            "each submit mints a distinct id (the ordinal advances)"
+        );
         assert_eq!(a, DsrId("dsr:0".into()));
         assert_eq!(b, DsrId("dsr:1".into()));
     }
@@ -850,7 +912,10 @@ mod tests {
         let err = o.verify(&id, vec![]).unwrap_err();
         assert_eq!(
             err,
-            DsrError::IllegalTransition { from: DsrState::Received, to: DsrState::Verified }
+            DsrError::IllegalTransition {
+                from: DsrState::Received,
+                to: DsrState::Verified
+            }
         );
         // the DSR did NOT silently advance.
         assert_eq!(o.state_of(&id).unwrap(), DsrState::Received);
@@ -886,7 +951,10 @@ mod tests {
             Posture::Processor,          // tenant content
             Initiator::TenantInstructed, // the controller (the tenant) authorised it (Art. 28)
         );
-        assert!(o.validate(&id).unwrap(), "a tenant-instructed erase is ADMITTED");
+        assert!(
+            o.validate(&id).unwrap(),
+            "a tenant-instructed erase is ADMITTED"
+        );
         assert_eq!(o.state_of(&id).unwrap(), DsrState::Validated);
     }
 
@@ -901,7 +969,10 @@ mod tests {
             Posture::Processor,
             Initiator::Myelin, // even Myelin-initiated: offboarding IS authorised
         );
-        assert!(o.validate(&id).unwrap(), "a tenant offboarding is an authorised erase");
+        assert!(
+            o.validate(&id).unwrap(),
+            "a tenant offboarding is an authorised erase"
+        );
         assert_eq!(o.state_of(&id).unwrap(), DsrState::Validated);
     }
 
@@ -916,7 +987,10 @@ mod tests {
             Posture::Controller, // platform-operational data — Myelin is the controller
             Initiator::Myelin,
         );
-        assert!(o.validate(&id).unwrap(), "a controller-posture erase is admitted");
+        assert!(
+            o.validate(&id).unwrap(),
+            "a controller-posture erase is admitted"
+        );
     }
 
     #[test]
@@ -932,14 +1006,23 @@ mod tests {
                 Posture::Processor,
                 Initiator::Myelin,
             );
-            assert!(o.validate(&id).unwrap(), "{kind:?} proceeds under the processor posture");
+            assert!(
+                o.validate(&id).unwrap(),
+                "{kind:?} proceeds under the processor posture"
+            );
         }
     }
 
     #[test]
     fn posture_from_data_role_is_the_x5_anchor() {
-        assert_eq!(Posture::from_data_role(DataRole::TenantContent), Posture::Processor);
-        assert_eq!(Posture::from_data_role(DataRole::PlatformOperational), Posture::Controller);
+        assert_eq!(
+            Posture::from_data_role(DataRole::TenantContent),
+            Posture::Processor
+        );
+        assert_eq!(
+            Posture::from_data_role(DataRole::PlatformOperational),
+            Posture::Controller
+        );
     }
 
     // ───────────── the deadline is set coarse on submit (§4.1) ─────────────
@@ -1005,8 +1088,14 @@ mod tests {
         assert!(ids.contains(&"oltp:identity_oltp"));
         assert!(ids.contains(&"search_index:search_index"));
         // the identity holder's per-field mechanism is resolved OFF the map.
-        let identity = checklist.iter().find(|c| c.holder_id == "oltp:identity_oltp").unwrap();
-        assert_eq!(identity.field_mechanisms, vec!["PrincipalRow.email::CryptoShred(subject_dek)"]);
+        let identity = checklist
+            .iter()
+            .find(|c| c.holder_id == "oltp:identity_oltp")
+            .unwrap();
+        assert_eq!(
+            identity.field_mechanisms,
+            vec!["PrincipalRow.email::CryptoShred(subject_dek)"]
+        );
         // the status surfaces the same checklist.
         assert_eq!(o.dsr_status(&id).unwrap().checklist, checklist);
     }
@@ -1031,13 +1120,20 @@ mod tests {
         );
         o.validate(&id).unwrap();
         o.fan_out(&id, &Inventory::default()).unwrap();
-        o.verify(&id, vec!["receipt-a".into(), "receipt-b".into()]).unwrap();
+        o.verify(&id, vec!["receipt-a".into(), "receipt-b".into()])
+            .unwrap();
         let cert = o.dsr_certificate(&id).unwrap();
         assert_eq!(cert.dsr_id, id);
-        assert_eq!(cert.receipts, vec!["receipt-a".to_string(), "receipt-b".to_string()]);
+        assert_eq!(
+            cert.receipts,
+            vec!["receipt-a".to_string(), "receipt-b".to_string()]
+        );
         assert!(cert.bundle_digest.starts_with("blake3:"));
         // the Merkle seal is a named floor (P-GA-20) — None here.
-        assert!(cert.merkle_inclusion.is_none(), "the Merkle seal is P-GA-20");
+        assert!(
+            cert.merkle_inclusion.is_none(),
+            "the Merkle seal is P-GA-20"
+        );
         // deterministic: the same (id, receipts) content-addresses the same.
         let cert2 = o.dsr_certificate(&id).unwrap();
         assert_eq!(cert.bundle_digest, cert2.bundle_digest);
@@ -1047,7 +1143,13 @@ mod tests {
     fn unknown_dsr_id_is_a_loud_error_never_a_silent_empty() {
         let o = orch_at(0);
         let ghost = DsrId("dsr:999".into());
-        assert_eq!(o.dsr_status(&ghost).unwrap_err(), DsrError::UnknownDsr(ghost.clone()));
-        assert_eq!(o.dsr_certificate(&ghost).unwrap_err(), DsrError::UnknownDsr(ghost));
+        assert_eq!(
+            o.dsr_status(&ghost).unwrap_err(),
+            DsrError::UnknownDsr(ghost.clone())
+        );
+        assert_eq!(
+            o.dsr_certificate(&ghost).unwrap_err(),
+            DsrError::UnknownDsr(ghost)
+        );
     }
 }

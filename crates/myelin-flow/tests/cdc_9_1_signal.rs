@@ -74,7 +74,11 @@ fn signal_event(run: &RunId, signal_name: &str, idem_key: &str, ev_id: &str) -> 
         schema_ver: 1,
         tenant: tenant(),
         region: region(),
-        actor: Actor(Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, tenant())),
+        actor: Actor(Principal::stub(
+            PrincipalId("p".into()),
+            PrincipalKind::Human,
+            tenant(),
+        )),
         subject: ArtifactRef(format!("myelin://acme/flow/run/{}", run.0)),
         aggregate: AggregateKey(format!("flow/run/{}", run.0)),
         causation_id: None,
@@ -112,9 +116,21 @@ fn provider_flow_executor_buffers_a_signal_idempotently() {
     };
     let first = ex.signal(spec.clone()).expect("first delivery");
     let second = ex.signal(spec).expect("re-delivery");
-    assert_eq!(first, SignalOutcome::Buffered, "PROVIDER promise: the first delivery buffered");
-    assert_eq!(second, SignalOutcome::Duplicate, "PROVIDER promise: the re-delivery is a no-op (one buffered row)");
-    assert_eq!(ex.signals().count_for_run(&tenant(), &run.0), 1, "exactly one wf_signal row (the workflow wakes once)");
+    assert_eq!(
+        first,
+        SignalOutcome::Buffered,
+        "PROVIDER promise: the first delivery buffered"
+    );
+    assert_eq!(
+        second,
+        SignalOutcome::Duplicate,
+        "PROVIDER promise: the re-delivery is a no-op (one buffered row)"
+    );
+    assert_eq!(
+        ex.signals().count_for_run(&tenant(), &run.0),
+        1,
+        "exactly one wf_signal row (the workflow wakes once)"
+    );
 
     // a distinct per-effect key buffers distinctly (the multi-effect anchor, §6.4 / P-FLOW-10).
     ex.signal(SignalSpec {
@@ -125,7 +141,11 @@ fn provider_flow_executor_buffers_a_signal_idempotently() {
         payload_key_ref: None,
     })
     .expect("distinct key");
-    assert_eq!(ex.signals().count_for_run(&tenant(), &run.0), 2, "a distinct idem_key is a distinct buffered signal");
+    assert_eq!(
+        ex.signals().count_for_run(&tenant(), &run.0),
+        2,
+        "a distinct idem_key is a distinct buffered signal"
+    );
 }
 
 /// **CONSUMER side of 9.1 (signal): the bus inbound-signal handler DELEGATES to the provider's
@@ -141,8 +161,16 @@ fn consumer_inbound_signal_delegates_and_is_idempotent_past_the_event_id_guard()
 
     let first = consumer.handle(&signal_event(&run, "job.done", "tok-1", "evt-1"));
     let second = consumer.handle(&signal_event(&run, "job.done", "tok-1", "evt-2"));
-    assert_eq!(first, HandleOutcome::Done, "the bus consumer acks the first delivery Done");
-    assert_eq!(second, HandleOutcome::Done, "the duplicate is the idempotency working (acks Done), not an error");
+    assert_eq!(
+        first,
+        HandleOutcome::Done,
+        "the bus consumer acks the first delivery Done"
+    );
+    assert_eq!(
+        second,
+        HandleOutcome::Done,
+        "the duplicate is the idempotency working (acks Done), not an error"
+    );
     assert_eq!(
         ex.signals().count_for_run(&tenant(), &run.0),
         1,
@@ -168,21 +196,33 @@ fn the_bus_path_and_the_direct_path_produce_the_same_buffered_signal() {
             payload_key_ref: None,
         })
         .expect("direct deliver");
-    let direct = ex_direct.signals().get(&tenant(), &run_d.0, "approval", "card-7").expect("direct row");
+    let direct = ex_direct
+        .signals()
+        .get(&tenant(), &run_d.0, "approval", "card-7")
+        .expect("direct row");
 
     // bus path: the same approval arrives as a bus event the consumer translates.
     let ex_bus = executor();
     let run_b = start_a_run(&ex_bus);
     let consumer = FlowSignalConsumer::new(ex_bus.clone(), subjects());
     consumer.handle(&signal_event(&run_b, "approval", "card-7", "evt-1"));
-    let bus = ex_bus.signals().get(&tenant(), &run_b.0, "approval", "card-7").expect("bus row");
+    let bus = ex_bus
+        .signals()
+        .get(&tenant(), &run_b.0, "approval", "card-7")
+        .expect("bus row");
 
     // the buffered signal is identical up to the run id (same name, key, payload, unconsumed).
     assert_eq!(direct.signal_name, bus.signal_name);
     assert_eq!(direct.idem_key, bus.idem_key);
-    assert_eq!(direct.payload, bus.payload, "both paths buffer references-not-payloads");
+    assert_eq!(
+        direct.payload, bus.payload,
+        "both paths buffer references-not-payloads"
+    );
     assert_eq!(direct.consumed_seq, None);
-    assert_eq!(bus.consumed_seq, None, "both buffer unconsumed (the wait is P-FLOW-11)");
+    assert_eq!(
+        bus.consumed_seq, None,
+        "both buffer unconsumed (the wait is P-FLOW-11)"
+    );
 }
 
 /// **A malformed inbound signal is SURFACED through the consumer (dead-lettered, never a silent drop,
@@ -199,5 +239,9 @@ fn a_malformed_inbound_signal_is_surfaced_through_the_consumer_seam() {
         matches!(consumer.handle(&ev), HandleOutcome::NonRetryable(_)),
         "a malformed signal is non-retryable poison (dead-lettered), never a silent drop"
     );
-    assert_eq!(ex.signals().count_for_run(&tenant(), &run.0), 0, "a poison event buffers nothing");
+    assert_eq!(
+        ex.signals().count_for_run(&tenant(), &run.0),
+        0,
+        "a poison event buffers nothing"
+    );
 }

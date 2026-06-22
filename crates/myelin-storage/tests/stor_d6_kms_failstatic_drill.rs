@@ -19,7 +19,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use myelin_storage::{
-    DekHandle, KeyClass, KekId, KmsAdapter, KmsEngine, KmsError, KmsReadPath, KmsReadResult,
+    DekHandle, KekId, KeyClass, KmsAdapter, KmsEngine, KmsError, KmsReadPath, KmsReadResult,
     KmsReadiness, PiiKeyRef,
 };
 use myelin_tenancy::{Region, TenantId};
@@ -34,7 +34,10 @@ struct OutageInjectingKms {
 
 impl OutageInjectingKms {
     fn new(inner: KmsEngine) -> Self {
-        OutageInjectingKms { inner, down: AtomicBool::new(false) }
+        OutageInjectingKms {
+            inner,
+            down: AtomicBool::new(false),
+        }
     }
     fn inject_outage(&self) {
         self.down.store(true, Ordering::SeqCst);
@@ -47,7 +50,10 @@ impl OutageInjectingKms {
 impl KmsAdapter for OutageInjectingKms {
     fn resolve_dek(&self, key_ref: &PiiKeyRef, region: &Region) -> Result<DekHandle, KmsError> {
         if self.down.load(Ordering::SeqCst) {
-            Err(KmsError::KekUnavailable(KekId::new(key_ref.tenant.clone(), region.clone())))
+            Err(KmsError::KekUnavailable(KekId::new(
+                key_ref.tenant.clone(),
+                region.clone(),
+            )))
         } else {
             self.inner.resolve_dek(key_ref, region)
         }
@@ -90,7 +96,10 @@ fn stor_d6_kms_outage_fails_static_then_not_ready_zero_fail_open() {
     // 1) Warm every DEK with a fresh resolve (engine healthy).
     for kr in &refs {
         let out = path.resolve(kr, &region);
-        assert!(out.is_resolved() && !out.is_degraded(), "warm read is fresh");
+        assert!(
+            out.is_resolved() && !out.is_degraded(),
+            "warm read is fresh"
+        );
         assert_eq!(out.readiness(), KmsReadiness::Ready);
     }
 
@@ -106,12 +115,17 @@ fn stor_d6_kms_outage_fails_static_then_not_ready_zero_fail_open() {
             other => panic!("STOR-D6: expected degraded-survival within budget, got {other:?}"),
         }
     }
-    assert_eq!(survived, BATCH, "every resolved-DEK read survived the transient outage");
+    assert_eq!(
+        survived, BATCH,
+        "every resolved-DEK read survived the transient outage"
+    );
     // Snapshot the peak survival staleness while still inside the budget (the recovery read below
     // re-freshes and zeroes last_staleness, so capture it HERE for the honest green artifact).
     let peak_staleness = path.signals().last_staleness_secs;
-    assert!(peak_staleness > FRESH_TTL_SECS && peak_staleness <= STATIC_MAX_SECS,
-        "the survival was served STALE within the budget (peak staleness {peak_staleness}s)");
+    assert!(
+        peak_staleness > FRESH_TTL_SECS && peak_staleness <= STATIC_MAX_SECS,
+        "the survival was served STALE within the budget (peak staleness {peak_staleness}s)"
+    );
 
     // 3) SUSTAINED hard-down PAST the budget — every read sheds to NOT-READY. A read that returns
     //    a usable DEK here is a FAIL-OPEN floor breach and panics loudly.
@@ -132,14 +146,26 @@ fn stor_d6_kms_outage_fails_static_then_not_ready_zero_fail_open() {
     // 4) Recovery: the KMS comes back → reads are FRESH again (the hiccup degraded, did not cascade).
     path.engine().recover();
     let out = path.resolve(&refs[0], &region);
-    assert!(out.is_resolved() && !out.is_degraded(), "recovered → fresh again");
+    assert!(
+        out.is_resolved() && !out.is_degraded(),
+        "recovered → fresh again"
+    );
 
     // THE green artifact: the survival ratio + the load-bearing zeros.
     let s = path.signals();
     assert_eq!(s.fail_open, 0, "0 fail-open across the whole outage");
-    assert!(peak_staleness <= path.static_max(), "staleness never exceeded the budget");
-    assert!(s.stale >= BATCH as u64, "the transient survivals were counted");
-    assert!(s.not_ready >= BATCH as u64, "the past-budget sheds were counted");
+    assert!(
+        peak_staleness <= path.static_max(),
+        "staleness never exceeded the budget"
+    );
+    assert!(
+        s.stale >= BATCH as u64,
+        "the transient survivals were counted"
+    );
+    assert!(
+        s.not_ready >= BATCH as u64,
+        "the past-budget sheds were counted"
+    );
 
     println!(
         "[P-058 DRILL GREEN 2026-06-19] STOR-D6 KMS fail-static: batch={BATCH} per-subject DEKs; \

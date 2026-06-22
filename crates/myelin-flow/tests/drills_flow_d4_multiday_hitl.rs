@@ -15,13 +15,11 @@
 //! that DOES bump the version is the FLOW-D2 divergence guard, drilled at P-FLOW-07). The durability is
 //! the point: the approval arrives across both, days later, and is still consumed exactly once.
 
-use myelin_events::{
-    Actor, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Timestamp,
-};
+use myelin_events::{Actor, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Timestamp};
 use myelin_flow::{
     approval_wait_name, request_approval_and_wait, run_state, DurableExecutor, FlowDispatcher,
-    FlowExecutor, FlowTelemetry, RetryPolicy, RunStore, SignalSpec, SignalStore, WaitOutcome, WfCtx,
-    WfJournal, WorkflowBody, DECLINE_MARKER,
+    FlowExecutor, FlowTelemetry, RetryPolicy, RunStore, SignalSpec, SignalStore, WaitOutcome,
+    WfCtx, WfJournal, WorkflowBody, DECLINE_MARKER,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_refs::ArtifactRef;
@@ -41,7 +39,11 @@ fn ctx_base() -> EmitContextBase {
     EmitContextBase {
         tenant: tenant(),
         region: region(),
-        actor: Actor(Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, tenant())),
+        actor: Actor(Principal::stub(
+            PrincipalId("p".into()),
+            PrincipalKind::Human,
+            tenant(),
+        )),
         schema_ver: 1,
         occurred_at: Timestamp("2026-06-21T00:00:00Z".into()),
         recorded_at: Timestamp("2026-06-21T00:00:01Z".into()),
@@ -72,16 +74,18 @@ fn gated_merge_body() -> Box<WorkflowBody> {
         )
         .map_err(|e| format!("{e:?}"))?;
         match outcome {
-            WaitOutcome::Signalled { payload_key_ref, .. }
-                if payload_key_ref.as_deref() == Some(DECLINE_MARKER) =>
-            {
+            WaitOutcome::Signalled {
+                payload_key_ref, ..
+            } if payload_key_ref.as_deref() == Some(DECLINE_MARKER) => {
                 Ok(vec![]) // DENY → WITHHELD: 0 mutation (AG-8).
             }
             WaitOutcome::Signalled { .. } => {
                 // APPROVE → run the merge tool (one mutating activity → one effect).
                 let eff = ctx
                     .activity(RetryPolicy { max_attempts: 1 }, |_i, _a| {
-                        Ok(vec![ArtifactRef("myelin://acme/agent/effect/merged".into())])
+                        Ok(vec![ArtifactRef(
+                            "myelin://acme/agent/effect/merged".into(),
+                        )])
                     })
                     .map_err(|e| format!("{e:?}"))?;
                 Ok(eff)
@@ -156,14 +160,24 @@ fn flow_d4_multiday_hitl_approve_across_restart_and_deploy_consumes_once() {
     // WORKER 1 ticks: the body requests the approval card + PARKS (state=waiting holds no runtime).
     let part = partition_for(&run.0);
     let w1 = fresh_worker(&sub, "worker-1", part);
-    let o1 = w1.tick(1_000, "2026-06-21T00:00:00Z", 7).expect("worker-1 drives the run");
-    assert_eq!(o1, myelin_flow::DriveOutcome::Waiting, "the run PARKED on the approval wait");
+    let o1 = w1
+        .tick(1_000, "2026-06-21T00:00:00Z", 7)
+        .expect("worker-1 drives the run");
+    assert_eq!(
+        o1,
+        myelin_flow::DriveOutcome::Waiting,
+        "the run PARKED on the approval wait"
+    );
     assert_eq!(
         sub.runs.get(&tenant(), &run.0).unwrap().state,
         run_state::WAITING,
         "state=waiting — the multi-day HITL wait holds no runtime (FLOW-D4)"
     );
-    assert_eq!(sub.outbox.committed_count(), 1, "the agent.approval.requested card was emitted once");
+    assert_eq!(
+        sub.outbox.committed_count(),
+        1,
+        "the agent.approval.requested card was emitted once"
+    );
 
     // --- WORKER 1 CRASHES (restart) + the service is REDEPLOYED while the run is parked (days pass). ---
     drop(w1);
@@ -181,8 +195,16 @@ fn flow_d4_multiday_hitl_approve_across_restart_and_deploy_consumes_once() {
     };
     let first = approve();
     let second = approve(); // the DOUBLE-CLICK.
-    assert_eq!(first, myelin_flow::SignalOutcome::Buffered, "the first click buffered the approval");
-    assert_eq!(second, myelin_flow::SignalOutcome::Duplicate, "the double-click is a no-op (ON CONFLICT DO NOTHING)");
+    assert_eq!(
+        first,
+        myelin_flow::SignalOutcome::Buffered,
+        "the first click buffered the approval"
+    );
+    assert_eq!(
+        second,
+        myelin_flow::SignalOutcome::Duplicate,
+        "the double-click is a no-op (ON CONFLICT DO NOTHING)"
+    );
     assert_eq!(
         sub.signals.count_for_run(&tenant(), &run.0),
         1,
@@ -194,7 +216,9 @@ fn flow_d4_multiday_hitl_approve_across_restart_and_deploy_consumes_once() {
 
     // --- WORKER 2 (the redeployed process) re-leases + resumes the run DAYS later. ---
     let w2 = fresh_worker(&sub, "worker-2", part);
-    let o2 = w2.tick(7 * 86_400 + 2_000, "2026-06-28T00:00:00Z", 7).expect("worker-2 resumes the run");
+    let o2 = w2
+        .tick(7 * 86_400 + 2_000, "2026-06-28T00:00:00Z", 7)
+        .expect("worker-2 resumes the run");
     match o2 {
         myelin_flow::DriveOutcome::Completed(refs) => assert_eq!(
             refs,
@@ -211,7 +235,11 @@ fn flow_d4_multiday_hitl_approve_across_restart_and_deploy_consumes_once() {
         "the approval was consumed EXACTLY ONCE — the buffered depth dropped to 0 (FLOW-D4: 1 consume)"
     );
     // the card request was emitted exactly once across BOTH drives (NOT re-emitted on the resume).
-    assert_eq!(sub.outbox.committed_count(), 1, "the card request was emitted ONCE (no re-emit on resume)");
+    assert_eq!(
+        sub.outbox.committed_count(),
+        1,
+        "the card request was emitted ONCE (no re-emit on resume)"
+    );
     // the run is terminal (completed) — it will never be driven again.
     assert!(sub.runs.get(&tenant(), &run.0).unwrap().state == run_state::COMPLETED);
 
@@ -268,12 +296,18 @@ fn flow_d4_multiday_hitl_deny_withholds_zero_mutation() {
     };
     deny();
     deny(); // double-click → one buffered decline.
-    assert_eq!(sub.signals.count_for_run(&tenant(), &run.0), 1, "the double-click buffered one decline");
+    assert_eq!(
+        sub.signals.count_for_run(&tenant(), &run.0),
+        1,
+        "the double-click buffered one decline"
+    );
     sub.runs.wake(&tenant(), &run.0);
 
     // WORKER 2: resume + WITHHOLD (0 mutation).
     let w2 = fresh_worker(&sub, "worker-2", part);
-    let o2 = w2.tick(2_000, "2026-06-28T00:00:00Z", 7).expect("worker-2 resumes");
+    let o2 = w2
+        .tick(2_000, "2026-06-28T00:00:00Z", 7)
+        .expect("worker-2 resumes");
     assert_eq!(
         o2,
         myelin_flow::DriveOutcome::Completed(vec![]),
@@ -287,7 +321,11 @@ fn flow_d4_multiday_hitl_deny_withholds_zero_mutation() {
         emits_after_card,
         "the declined merge made 0 MUTATION — no effect emitted past the card request (AG-8)"
     );
-    assert_eq!(sub.signals.buffered_depth(), 0, "the decline was consumed EXACTLY once");
+    assert_eq!(
+        sub.signals.buffered_depth(),
+        0,
+        "the decline was consumed EXACTLY once"
+    );
 
     println!(
         "[2026-06-21] PASS  drill=FLOW-D4  multi-day HITL DENY across restart+deploy  \

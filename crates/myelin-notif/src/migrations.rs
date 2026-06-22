@@ -235,12 +235,32 @@ CREATE TABLE notif_mute (\
 const TABLE_DDLS: &[(&str, &str, &str)] = &[
     ("notif_0001_inbox_item", INBOX_ITEM_DDL, "notif_inbox_item"),
     ("notif_0002_pref", NOTIF_PREF_DDL, "notif_pref"),
-    ("notif_0003_quiet_hours", QUIET_HOURS_DDL, "notif_quiet_hours"),
+    (
+        "notif_0003_quiet_hours",
+        QUIET_HOURS_DDL,
+        "notif_quiet_hours",
+    ),
     ("notif_0004_delivery", DELIVERY_DDL, "notif_delivery"),
-    ("notif_0005_oncall_schedule", ONCALL_SCHEDULE_DDL, "notif_oncall_schedule"),
-    ("notif_0006_escalation_policy", ESCALATION_POLICY_DDL, "notif_escalation_policy"),
-    ("notif_0007_escalation_run", ESCALATION_RUN_DDL, "notif_escalation_run"),
-    ("notif_0008_humanise_template", HUMANISE_TEMPLATE_DDL, "notif_humanise_template"),
+    (
+        "notif_0005_oncall_schedule",
+        ONCALL_SCHEDULE_DDL,
+        "notif_oncall_schedule",
+    ),
+    (
+        "notif_0006_escalation_policy",
+        ESCALATION_POLICY_DDL,
+        "notif_escalation_policy",
+    ),
+    (
+        "notif_0007_escalation_run",
+        ESCALATION_RUN_DDL,
+        "notif_escalation_run",
+    ),
+    (
+        "notif_0008_humanise_template",
+        HUMANISE_TEMPLATE_DDL,
+        "notif_humanise_template",
+    ),
     ("notif_0009_mute", MUTE_DDL, "notif_mute"),
 ];
 
@@ -293,10 +313,16 @@ mod tests {
     #[test]
     fn the_nine_migrations_apply_forward_only_in_order() {
         let migrations = migrations();
-        assert_eq!(migrations.0.len(), 9, "the nine-table data model (§2.1..§2.6)");
+        assert_eq!(
+            migrations.0.len(),
+            9,
+            "the nine-table data model (§2.1..§2.6)"
+        );
         let mut runner = MigrationRunner::new();
         // The nine tables are brand-new `CREATE TABLE`s (cold at creation) — `none()` hot set.
-        runner.run(&migrations, &HotTables::none()).expect("the nine migrations apply forward-only");
+        runner
+            .run(&migrations, &HotTables::none())
+            .expect("the nine migrations apply forward-only");
         assert_eq!(
             runner.applied(),
             &[
@@ -354,8 +380,16 @@ mod tests {
     fn inbox_item_carries_the_2_1_invariants() {
         let ddl = INBOX_ITEM_DDL;
         // refs-not-payloads: the subject/root/origin are text URN refs (humanise resolves at read).
-        for col in ["subject text", "subject_root text", "origin_event text", "template_args_json jsonb"] {
-            assert!(ddl.contains(col), "the refs-not-payloads column `{col}` is declared");
+        for col in [
+            "subject text",
+            "subject_root text",
+            "origin_event text",
+            "template_args_json jsonb",
+        ] {
+            assert!(
+                ddl.contains(col),
+                "the refs-not-payloads column `{col}` is declared"
+            );
         }
         // EXACTLY ONE read-state column: `state` appears exactly once as a column declaration.
         assert_eq!(
@@ -368,8 +402,14 @@ mod tests {
             ddl.contains("UNIQUE (tenant_id, recipient, dedup_key)"),
             "the UNIQUE(tenant, recipient, dedup_key) write-time-collapse key (§3.2)"
         );
-        assert!(ddl.contains("coalesce_count integer"), "the +N-more counter (NOTIF-P11)");
-        assert!(ddl.contains("origin_event text"), "the NOTIF-2 origin_event provenance");
+        assert!(
+            ddl.contains("coalesce_count integer"),
+            "the +N-more counter (NOTIF-P11)"
+        );
+        assert!(
+            ddl.contains("origin_event text"),
+            "the NOTIF-2 origin_event provenance"
+        );
         assert!(ddl.contains("reason text"), "the NOTIF-2 reason provenance");
     }
 
@@ -382,7 +422,10 @@ mod tests {
             DELIVERY_DDL.contains("UNIQUE (tenant_id, idem_key)"),
             "delivery is idempotent on idem_key (at-least-once + dedup, §2.3)"
         );
-        assert!(DELIVERY_DDL.contains("redacted boolean"), "the off-cell PII-minimisation flag (§3.6)");
+        assert!(
+            DELIVERY_DDL.contains("redacted boolean"),
+            "the off-cell PII-minimisation flag (§3.6)"
+        );
     }
 
     /// Every table carries the per-row `dek_ref` (encrypted-from-birth under the per-tenant DEK,
@@ -392,7 +435,10 @@ mod tests {
     #[test]
     fn every_table_is_encrypted_from_birth() {
         for (_id, ddl, table) in TABLE_DDLS {
-            assert!(ddl.contains("dek_ref text"), "table `{table}` carries the per-row DEK ref: {ddl}");
+            assert!(
+                ddl.contains("dek_ref text"),
+                "table `{table}` carries the per-row DEK ref: {ddl}"
+            );
         }
     }
 
@@ -403,14 +449,21 @@ mod tests {
     fn each_table_gets_the_rls_scope_call() {
         let migrations = migrations();
         for (i, (_id, _ddl, table)) in TABLE_DDLS.iter().enumerate() {
-            assert_eq!(rls_scope_sql(table), format!("SELECT myelin_make_tenant_scoped('{table}')"));
+            assert_eq!(
+                rls_scope_sql(table),
+                format!("SELECT myelin_make_tenant_scoped('{table}')")
+            );
             let m = &migrations.0[i];
             assert!(
                 m.ddl.contains(&rls_scope_sql(table)),
                 "migration `{}` carries the RLS scoping for `{table}`",
                 m.id
             );
-            assert!(m.ddl.contains("CREATE TABLE"), "migration `{}` carries the create-table", m.id);
+            assert!(
+                m.ddl.contains("CREATE TABLE"),
+                "migration `{}` carries the create-table",
+                m.id
+            );
         }
         assert_eq!(TABLES.len(), 9, "the nine-table data model");
     }
@@ -420,14 +473,26 @@ mod tests {
     /// gate is LIVE over THIS crate's migrations, not vacuously green.
     #[test]
     fn a_destructive_notif_migration_is_refused() {
-        let bad = Migrations::of([Migration::plain("notif_9999_drop", "DROP TABLE notif_inbox_item")]);
+        let bad = Migrations::of([Migration::plain(
+            "notif_9999_drop",
+            "DROP TABLE notif_inbox_item",
+        )]);
         let mut runner = MigrationRunner::new();
-        let e = runner.run(&bad, &HotTables::none()).expect_err("a DROP must be refused");
-        assert!(e.0.contains("forward-only"), "the refusal names forward-only: {}", e.0);
+        let e = runner
+            .run(&bad, &HotTables::none())
+            .expect_err("a DROP must be refused");
+        assert!(
+            e.0.contains("forward-only"),
+            "the refusal names forward-only: {}",
+            e.0
+        );
         // the assembled real migration set is forward-only-legal (no DROP anywhere).
         for (_id, ddl, _table) in TABLE_DDLS {
             assert!(ddl_is_forward_only(ddl), "the real DDL is forward-only");
-            assert!(!ddl.to_ascii_uppercase().contains("DROP"), "no DROP in the data-model DDL");
+            assert!(
+                !ddl.to_ascii_uppercase().contains("DROP"),
+                "no DROP in the data-model DDL"
+            );
         }
     }
 }

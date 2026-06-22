@@ -292,7 +292,7 @@ impl Default for PushPolicy {
             // 50 MiB per object — git's default large-object guard order of magnitude.
             max_object_bytes: 50 * 1024 * 1024,
             secret_patterns: vec![
-                "AKIA".to_string(),        // an AWS access-key id prefix
+                "AKIA".to_string(), // an AWS access-key id prefix
                 "-----BEGIN PRIVATE KEY".to_string(),
                 "-----BEGIN RSA PRIVATE KEY".to_string(),
             ],
@@ -406,11 +406,17 @@ impl InMemoryObjectDb {
     }
     /// Whether an oid was migrated (promoted out of quarantine into the object DB).
     pub fn contains(&self, oid: &Oid) -> bool {
-        self.migrated.lock().unwrap_or_else(|e| e.into_inner()).contains(oid)
+        self.migrated
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(oid)
     }
     /// The number of migrated objects.
     pub fn len(&self) -> usize {
-        self.migrated.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.migrated
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
     /// Whether the object DB is empty.
     pub fn is_empty(&self) -> bool {
@@ -521,7 +527,6 @@ pub struct ReflogEntry {
 /// different refs advance in parallel. This is the reconciliation.)
 type RefCell = std::sync::Mutex<Option<RefRow>>;
 
-
 /// **The reftable-on-OLTP ref store + the receive-pack write path** (arch §2 / §3). The per-ref CAS
 /// is the linearisation point; the ref-update + the reflog insert + the `git.ref.updated` outbox emit
 /// commit in **ONE transaction** (BUS-2). Owns the repo locator + the shared [`OutboxStore`] (the
@@ -590,7 +595,10 @@ impl RefStore {
 
     /// The reflog (append-only; the per-ref history — used by the holder + the audit walk).
     pub fn reflog(&self) -> Vec<ReflogEntry> {
-        self.reflog.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.reflog
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// The per-ref aggregate key for the outbox (arch §2.2 / §3): `<repo>:<ref_name>`. The `:`
@@ -676,7 +684,8 @@ impl RefStore {
         let cells: Vec<Arc<RefCell>> = targets.iter().map(|r| self.cell(r)).collect();
         // Lock each cell in the sorted order (the deadlock-free discipline). The guards are held for
         // the whole CAS→commit→apply window — the per-ref linearisation point spans check + apply.
-        let mut guards: BTreeMap<RefName, std::sync::MutexGuard<'_, Option<RefRow>>> = BTreeMap::new();
+        let mut guards: BTreeMap<RefName, std::sync::MutexGuard<'_, Option<RefRow>>> =
+            BTreeMap::new();
         for (name, cell) in targets.iter().zip(cells.iter()) {
             guards.insert(name.clone(), cell.lock().unwrap_or_else(|e| e.into_inner()));
         }
@@ -775,7 +784,10 @@ impl RefStore {
                     // a fresh generation (matching the `git_ref` row being deleted).
                     **guard = None;
                 } else {
-                    **guard = Some(RefRow { target_oid: new_oid.clone(), update_seq: new_seq });
+                    **guard = Some(RefRow {
+                        target_oid: new_oid.clone(),
+                        update_seq: new_seq,
+                    });
                 }
                 reflog.push(ReflogEntry {
                     ref_name: ref_name.clone(),
@@ -855,7 +867,10 @@ mod tests {
                 oid: Oid::new("cafe"),
                 bytes: b"a normal commit blob".to_vec(),
             }],
-            pusher: Pusher { pseudonym: "anon-7@acme.noreply".into(), is_agent: false },
+            pusher: Pusher {
+                pseudonym: "anon-7@acme.noreply".into(),
+                is_agent: false,
+            },
         }
     }
 
@@ -880,13 +895,27 @@ mod tests {
             other => panic!("expected Accepted, got {other:?}"),
         }
         // The ref moved + the event is durable + unsent (depth 1).
-        assert_eq!(store.tip(&RefName::new("refs/heads/feature")), Some(Oid::new("aaaa")));
-        assert_eq!(outbox.outbox_depth(), 1, "one git.ref.updated row is durable + unsent");
+        assert_eq!(
+            store.tip(&RefName::new("refs/heads/feature")),
+            Some(Oid::new("aaaa"))
+        );
+        assert_eq!(
+            outbox.outbox_depth(),
+            1,
+            "one git.ref.updated row is durable + unsent"
+        );
         assert_eq!(outbox.committed_count(), 1);
         // The quarantine was migrated (promoted into the object DB).
         assert!(db.contains(&Oid::new("cafe")));
         // The emitted row is git.ref.updated on the per-ref aggregate `core:refs/heads/feature`.
-        let id = match store.receive(&human_push("refs/heads/x", Oid::zero(), Oid::new("bb")), &db, CrashPoint::None).unwrap() {
+        let id = match store
+            .receive(
+                &human_push("refs/heads/x", Oid::zero(), Oid::new("bb")),
+                &db,
+                CrashPoint::None,
+            )
+            .unwrap()
+        {
             PushOutcome::Accepted { emitted, .. } => emitted[0].clone(),
             o => panic!("{o:?}"),
         };
@@ -904,11 +933,24 @@ mod tests {
         let push = human_push("refs/heads/feature", Oid::zero(), Oid::new("aaaa"));
 
         let outcome = store.receive(&push, &db, CrashPoint::AfterPolicy).unwrap();
-        assert_eq!(outcome, PushOutcome::Crashed(InjectedCrash { at: CrashPoint::AfterPolicy }));
+        assert_eq!(
+            outcome,
+            PushOutcome::Crashed(InjectedCrash {
+                at: CrashPoint::AfterPolicy
+            })
+        );
         // 0 ghost: nothing committed.
-        assert_eq!(outbox.outbox_depth(), 0, "a crash before commit emits no event");
+        assert_eq!(
+            outbox.outbox_depth(),
+            0,
+            "a crash before commit emits no event"
+        );
         assert_eq!(outbox.committed_count(), 0);
-        assert_eq!(store.tip(&RefName::new("refs/heads/feature")), None, "the ref never moved");
+        assert_eq!(
+            store.tip(&RefName::new("refs/heads/feature")),
+            None,
+            "the ref never moved"
+        );
         assert!(db.is_empty(), "the quarantine was NOT promoted");
     }
 
@@ -922,13 +964,25 @@ mod tests {
         let push = human_push("refs/heads/feature", Oid::zero(), Oid::new("aaaa"));
 
         let outcome = store.receive(&push, &db, CrashPoint::BeforeCommit).unwrap();
-        assert_eq!(outcome, PushOutcome::Crashed(InjectedCrash { at: CrashPoint::BeforeCommit }));
+        assert_eq!(
+            outcome,
+            PushOutcome::Crashed(InjectedCrash {
+                at: CrashPoint::BeforeCommit
+            })
+        );
         // 0 ghost: the transaction never committed.
         assert_eq!(outbox.outbox_depth(), 0);
         assert_eq!(outbox.committed_count(), 0);
-        assert_eq!(store.tip(&RefName::new("refs/heads/feature")), None, "the ref never moved");
+        assert_eq!(
+            store.tip(&RefName::new("refs/heads/feature")),
+            None,
+            "the ref never moved"
+        );
         // The bytes ARE durable (migrated before the crash) — but that is harmless without the ref.
-        assert!(db.contains(&Oid::new("cafe")), "objects migrated before the kill (orphan, GC'd)");
+        assert!(
+            db.contains(&Oid::new("cafe")),
+            "objects migrated before the kill (orphan, GC'd)"
+        );
     }
 
     /// **emit-iff-committed: crash AFTER commit keeps BOTH the ref move AND the event (0 lost).** The
@@ -941,10 +995,22 @@ mod tests {
         let push = human_push("refs/heads/feature", Oid::zero(), Oid::new("aaaa"));
 
         let outcome = store.receive(&push, &db, CrashPoint::AfterCommit).unwrap();
-        assert_eq!(outcome, PushOutcome::Crashed(InjectedCrash { at: CrashPoint::AfterCommit }));
+        assert_eq!(
+            outcome,
+            PushOutcome::Crashed(InjectedCrash {
+                at: CrashPoint::AfterCommit
+            })
+        );
         // 0 lost: the ref moved AND the event survived.
-        assert_eq!(store.tip(&RefName::new("refs/heads/feature")), Some(Oid::new("aaaa")));
-        assert_eq!(outbox.outbox_depth(), 1, "the committed event is durable + awaiting the relay");
+        assert_eq!(
+            store.tip(&RefName::new("refs/heads/feature")),
+            Some(Oid::new("aaaa"))
+        );
+        assert_eq!(
+            outbox.outbox_depth(),
+            1,
+            "the committed event is durable + awaiting the relay"
+        );
         assert_eq!(outbox.committed_count(), 1);
     }
 
@@ -969,8 +1035,15 @@ mod tests {
             })
         );
         // The ref did NOT move past old1, and no new event was emitted.
-        assert_eq!(store.tip(&RefName::new("refs/heads/main")), Some(Oid::new("old1")));
-        assert_eq!(outbox.outbox_depth(), depth_before, "a rejected push emits nothing");
+        assert_eq!(
+            store.tip(&RefName::new("refs/heads/main")),
+            Some(Oid::new("old1"))
+        );
+        assert_eq!(
+            outbox.outbox_depth(),
+            depth_before,
+            "a rejected push emits nothing"
+        );
     }
 
     /// **Reject BEFORE the ref moves: a protected-ref deletion.** (delete = push to the zero oid.)
@@ -979,7 +1052,11 @@ mod tests {
         let (store, _outbox) = store();
         let db = InMemoryObjectDb::new();
         store
-            .receive(&human_push("refs/heads/main", Oid::zero(), Oid::new("t1")), &db, CrashPoint::None)
+            .receive(
+                &human_push("refs/heads/main", Oid::zero(), Oid::new("t1")),
+                &db,
+                CrashPoint::None,
+            )
             .unwrap();
         let del = PushSession {
             updates: vec![ProposedRefUpdate {
@@ -990,13 +1067,22 @@ mod tests {
                 commit_oids: vec![],
             }],
             quarantine: vec![],
-            pusher: Pusher { pseudonym: "anon-1@acme.noreply".into(), is_agent: false },
+            pusher: Pusher {
+                pseudonym: "anon-1@acme.noreply".into(),
+                is_agent: false,
+            },
         };
         assert_eq!(
             store.receive(&del, &db, CrashPoint::None).unwrap(),
-            PushOutcome::Rejected(RejectReason::DeleteProtected { ref_name: RefName::new("refs/heads/main") })
+            PushOutcome::Rejected(RejectReason::DeleteProtected {
+                ref_name: RefName::new("refs/heads/main")
+            })
         );
-        assert_eq!(store.tip(&RefName::new("refs/heads/main")), Some(Oid::new("t1")), "ref not deleted");
+        assert_eq!(
+            store.tip(&RefName::new("refs/heads/main")),
+            Some(Oid::new("t1")),
+            "ref not deleted"
+        );
     }
 
     /// **Reject BEFORE the ref moves: a secret in a quarantined object.** The secret never migrates
@@ -1017,7 +1103,10 @@ mod tests {
                 oid: Oid::new("bad"),
                 bytes: b"export AWS_KEY=AKIAIOSFODNN7EXAMPLE".to_vec(),
             }],
-            pusher: Pusher { pseudonym: "anon-1@acme.noreply".into(), is_agent: false },
+            pusher: Pusher {
+                pseudonym: "anon-1@acme.noreply".into(),
+                is_agent: false,
+            },
         };
         match store.receive(&push, &db, CrashPoint::None).unwrap() {
             PushOutcome::Rejected(RejectReason::SecretDetected { oid, pattern }) => {
@@ -1026,8 +1115,15 @@ mod tests {
             }
             o => panic!("expected SecretDetected, got {o:?}"),
         }
-        assert_eq!(store.tip(&RefName::new("refs/heads/feature")), None, "ref never moved");
-        assert!(db.is_empty(), "the secret object was NOT promoted out of quarantine");
+        assert_eq!(
+            store.tip(&RefName::new("refs/heads/feature")),
+            None,
+            "ref never moved"
+        );
+        assert!(
+            db.is_empty(),
+            "the secret object was NOT promoted out of quarantine"
+        );
         assert_eq!(outbox.outbox_depth(), 0);
     }
 
@@ -1040,7 +1136,9 @@ mod tests {
         push.pusher.is_agent = true;
         assert_eq!(
             store.receive(&push, &db, CrashPoint::None).unwrap(),
-            PushOutcome::Rejected(RejectReason::AgentNeedsHuman { ref_name: RefName::new("refs/heads/main") })
+            PushOutcome::Rejected(RejectReason::AgentNeedsHuman {
+                ref_name: RefName::new("refs/heads/main")
+            })
         );
     }
 
@@ -1062,8 +1160,14 @@ mod tests {
                 forced: false,
                 commit_oids: vec![Oid::new("c0")],
             }],
-            quarantine: vec![QuarantineObject { oid: Oid::new("c0"), bytes: commit_bytes }],
-            pusher: Pusher { pseudonym: "psn-7@acme.noreply".into(), is_agent: false },
+            quarantine: vec![QuarantineObject {
+                oid: Oid::new("c0"),
+                bytes: commit_bytes,
+            }],
+            pusher: Pusher {
+                pseudonym: "psn-7@acme.noreply".into(),
+                is_agent: false,
+            },
         }
     }
 
@@ -1092,9 +1196,16 @@ mod tests {
             o => panic!("expected NonPseudonymousCommit, got {o:?}"),
         }
         // 0 cleartext PII admitted: the ref never moved, nothing emitted, the commit not promoted.
-        assert_eq!(store.tip(&RefName::new("refs/heads/feature")), None, "the ref never moved");
+        assert_eq!(
+            store.tip(&RefName::new("refs/heads/feature")),
+            None,
+            "the ref never moved"
+        );
         assert_eq!(outbox.outbox_depth(), 0, "a rejected push emits nothing");
-        assert!(db.is_empty(), "the cleartext-PII commit was NOT promoted out of quarantine");
+        assert!(
+            db.is_empty(),
+            "the cleartext-PII commit was NOT promoted out of quarantine"
+        );
     }
 
     /// **GIT-P12 GATE — a pushed commit authored to the tenant pseudonym is ACCEPTED.** The
@@ -1112,9 +1223,19 @@ mod tests {
             store.receive(&push, &db, CrashPoint::None).unwrap(),
             PushOutcome::Accepted { .. }
         ));
-        assert_eq!(store.tip(&RefName::new("refs/heads/feature")), Some(Oid::new("aaaa")));
-        assert_eq!(outbox.outbox_depth(), 1, "the accepted push committed one git.ref.updated");
-        assert!(db.contains(&Oid::new("c0")), "the pseudonymous commit was promoted");
+        assert_eq!(
+            store.tip(&RefName::new("refs/heads/feature")),
+            Some(Oid::new("aaaa"))
+        );
+        assert_eq!(
+            outbox.outbox_depth(),
+            1,
+            "the accepted push committed one git.ref.updated"
+        );
+        assert!(
+            db.contains(&Oid::new("c0")),
+            "the pseudonymous commit was promoted"
+        );
     }
 
     /// **GIT-P12 GATE — a well-formed pseudonym for ANOTHER tenant is REJECTED (cross-tenant
@@ -1128,17 +1249,23 @@ mod tests {
             "psn-x@globex.noreply <psn-x@globex.noreply> 1700000000 +0000",
         );
         match store.receive(&push, &db, CrashPoint::None).unwrap() {
-            PushOutcome::Rejected(RejectReason::NonPseudonymousCommit { identity, .. }) => assert_eq!(
-                identity,
-                crate::commit::NonPseudonymousIdentity::WrongTenant {
-                    role: "author".into(),
-                    expected_tenant: "acme".into(),
-                    found_tenant: "globex".into(),
-                }
-            ),
+            PushOutcome::Rejected(RejectReason::NonPseudonymousCommit { identity, .. }) => {
+                assert_eq!(
+                    identity,
+                    crate::commit::NonPseudonymousIdentity::WrongTenant {
+                        role: "author".into(),
+                        expected_tenant: "acme".into(),
+                        found_tenant: "globex".into(),
+                    }
+                )
+            }
             o => panic!("expected WrongTenant NonPseudonymousCommit, got {o:?}"),
         }
-        assert_eq!(store.tip(&RefName::new("refs/heads/feature")), None, "the ref never moved");
+        assert_eq!(
+            store.tip(&RefName::new("refs/heads/feature")),
+            None,
+            "the ref never moved"
+        );
     }
 
     /// **GIT-P12: a non-commit object (a blob) is NOT subject to the pseudonymity rule.** A blob
@@ -1161,10 +1288,16 @@ mod tests {
                 oid: Oid::new("blob0"),
                 bytes: b"contact: ada@example.com for support\n".to_vec(),
             }],
-            pusher: Pusher { pseudonym: "psn-7@acme.noreply".into(), is_agent: false },
+            pusher: Pusher {
+                pseudonym: "psn-7@acme.noreply".into(),
+                is_agent: false,
+            },
         };
         assert!(
-            matches!(store.receive(&push, &db, CrashPoint::None).unwrap(), PushOutcome::Accepted { .. }),
+            matches!(
+                store.receive(&push, &db, CrashPoint::None).unwrap(),
+                PushOutcome::Accepted { .. }
+            ),
             "a blob is not gated by the commit pseudonymity rule"
         );
     }
@@ -1191,14 +1324,22 @@ mod tests {
         let db = InMemoryObjectDb::new();
         // The first push creates the ref at `v1`.
         store
-            .receive(&human_push("refs/heads/feature", Oid::zero(), Oid::new("v1")), &db, CrashPoint::None)
+            .receive(
+                &human_push("refs/heads/feature", Oid::zero(), Oid::new("v1")),
+                &db,
+                CrashPoint::None,
+            )
             .unwrap();
         assert_eq!(outbox.committed_count(), 1);
 
         // A second push believes the ref is STILL at zero (stale) → non-fast-forward reject.
         let stale = human_push("refs/heads/feature", Oid::zero(), Oid::new("v2"));
         match store.receive(&stale, &db, CrashPoint::None).unwrap() {
-            PushOutcome::Rejected(RejectReason::NonFastForward { ref_name, expected, actual }) => {
+            PushOutcome::Rejected(RejectReason::NonFastForward {
+                ref_name,
+                expected,
+                actual,
+            }) => {
                 assert_eq!(ref_name, RefName::new("refs/heads/feature"));
                 assert_eq!(expected, Oid::zero());
                 assert_eq!(actual, Oid::new("v1"));
@@ -1206,8 +1347,15 @@ mod tests {
             o => panic!("expected NonFastForward, got {o:?}"),
         }
         // The ref reflects only the first move; only one event committed (0 ghost from the reject).
-        assert_eq!(store.tip(&RefName::new("refs/heads/feature")), Some(Oid::new("v1")));
-        assert_eq!(outbox.committed_count(), 1, "the rejected stale push emitted nothing");
+        assert_eq!(
+            store.tip(&RefName::new("refs/heads/feature")),
+            Some(Oid::new("v1"))
+        );
+        assert_eq!(
+            outbox.committed_count(),
+            1,
+            "the rejected stale push emitted nothing"
+        );
     }
 
     /// **All-or-nothing per push: an atomic push of two refs where one CAS is stale rejects the
@@ -1219,7 +1367,11 @@ mod tests {
         let db = InMemoryObjectDb::new();
         // Seed refs/heads/a at v1 (so the atomic push's stale expected-old on `a` fails).
         store
-            .receive(&human_push("refs/heads/a", Oid::zero(), Oid::new("v1")), &db, CrashPoint::None)
+            .receive(
+                &human_push("refs/heads/a", Oid::zero(), Oid::new("v1")),
+                &db,
+                CrashPoint::None,
+            )
             .unwrap();
         let committed_before = outbox.committed_count();
 
@@ -1243,16 +1395,30 @@ mod tests {
                 },
             ],
             quarantine: vec![],
-            pusher: Pusher { pseudonym: "anon-1@acme.noreply".into(), is_agent: false },
+            pusher: Pusher {
+                pseudonym: "anon-1@acme.noreply".into(),
+                is_agent: false,
+            },
         };
         assert!(matches!(
             store.receive(&atomic, &db, CrashPoint::None).unwrap(),
             PushOutcome::Rejected(RejectReason::NonFastForward { .. })
         ));
         // NEITHER ref moved: `b` was never created, `a` stayed at v1; nothing new emitted.
-        assert_eq!(store.tip(&RefName::new("refs/heads/b")), None, "the fresh ref was NOT created");
-        assert_eq!(store.tip(&RefName::new("refs/heads/a")), Some(Oid::new("v1")));
-        assert_eq!(outbox.committed_count(), committed_before, "no partial emit");
+        assert_eq!(
+            store.tip(&RefName::new("refs/heads/b")),
+            None,
+            "the fresh ref was NOT created"
+        );
+        assert_eq!(
+            store.tip(&RefName::new("refs/heads/a")),
+            Some(Oid::new("v1"))
+        );
+        assert_eq!(
+            outbox.committed_count(),
+            committed_before,
+            "no partial emit"
+        );
     }
 
     /// **Per-ref ordering: successive pushes to one ref carry monotonic `update_seq` AND a
@@ -1262,17 +1428,35 @@ mod tests {
         let (store, outbox) = store();
         let db = InMemoryObjectDb::new();
         let mut ids = Vec::new();
-        for (old, new) in [(Oid::zero(), Oid::new("v1")), (Oid::new("v1"), Oid::new("v2")), (Oid::new("v2"), Oid::new("v3"))] {
-            match store.receive(&human_push("refs/heads/feature", old, new), &db, CrashPoint::None).unwrap() {
+        for (old, new) in [
+            (Oid::zero(), Oid::new("v1")),
+            (Oid::new("v1"), Oid::new("v2")),
+            (Oid::new("v2"), Oid::new("v3")),
+        ] {
+            match store
+                .receive(
+                    &human_push("refs/heads/feature", old, new),
+                    &db,
+                    CrashPoint::None,
+                )
+                .unwrap()
+            {
                 PushOutcome::Accepted { emitted, .. } => ids.push(emitted[0].clone()),
                 o => panic!("{o:?}"),
             }
         }
 
         // The ref tip + update_seq advanced monotonically.
-        assert_eq!(store.tip(&RefName::new("refs/heads/feature")), Some(Oid::new("v3")));
+        assert_eq!(
+            store.tip(&RefName::new("refs/heads/feature")),
+            Some(Oid::new("v3"))
+        );
         let log = store.reflog();
-        let seqs: Vec<u64> = log.iter().filter(|e| e.ref_name == RefName::new("refs/heads/feature")).map(|e| e.update_seq).collect();
+        let seqs: Vec<u64> = log
+            .iter()
+            .filter(|e| e.ref_name == RefName::new("refs/heads/feature"))
+            .map(|e| e.update_seq)
+            .collect();
         assert_eq!(seqs, vec![1, 2, 3], "update_seq is monotonic per ref");
         // The outbox carries three rows on the one per-ref aggregate, seqs 0,1,2 (per-aggregate order).
         let agg = AggregateKey("core:refs/heads/feature".into());
@@ -1280,12 +1464,19 @@ mod tests {
             .iter()
             .map(|id| {
                 let row = outbox.row(id).unwrap();
-                assert_eq!(row.aggregate, agg, "all three rows share the per-ref aggregate");
+                assert_eq!(
+                    row.aggregate, agg,
+                    "all three rows share the per-ref aggregate"
+                );
                 row.seq
             })
             .collect();
         agg_seqs.sort_unstable();
-        assert_eq!(agg_seqs, vec![0, 1, 2], "per-ref outbox ordering is gap-free");
+        assert_eq!(
+            agg_seqs,
+            vec![0, 1, 2],
+            "per-ref outbox ordering is gap-free"
+        );
     }
 
     // ───────────────────── GIT-P10 (GIT-D1): the per-ref CAS concurrency control ─────────────────
@@ -1318,17 +1509,40 @@ mod tests {
         }
         let outcomes: Vec<PushOutcome> = handles.into_iter().map(|h| h.join().unwrap()).collect();
 
-        let accepted = outcomes.iter().filter(|o| matches!(o, PushOutcome::Accepted { .. })).count();
+        let accepted = outcomes
+            .iter()
+            .filter(|o| matches!(o, PushOutcome::Accepted { .. }))
+            .count();
         let rejected = outcomes
             .iter()
-            .filter(|o| matches!(o, PushOutcome::Rejected(RejectReason::NonFastForward { .. })))
+            .filter(|o| {
+                matches!(
+                    o,
+                    PushOutcome::Rejected(RejectReason::NonFastForward { .. })
+                )
+            })
             .count();
-        assert_eq!(accepted, 1, "exactly one racer wins the create (per-ref linearisation)");
-        assert_eq!(rejected, n - 1, "every loser is a non-fast-forward reject (0 lost-update)");
-        // 0 ghost: exactly ONE event committed (only the winner emitted); the ref advanced by one.
-        assert_eq!(outbox.committed_count(), 1, "only the winner's git.ref.updated committed (0 ghost)");
         assert_eq!(
-            store.reflog().iter().filter(|e| e.ref_name == RefName::new("refs/heads/hot")).count(),
+            accepted, 1,
+            "exactly one racer wins the create (per-ref linearisation)"
+        );
+        assert_eq!(
+            rejected,
+            n - 1,
+            "every loser is a non-fast-forward reject (0 lost-update)"
+        );
+        // 0 ghost: exactly ONE event committed (only the winner emitted); the ref advanced by one.
+        assert_eq!(
+            outbox.committed_count(),
+            1,
+            "only the winner's git.ref.updated committed (0 ghost)"
+        );
+        assert_eq!(
+            store
+                .reflog()
+                .iter()
+                .filter(|e| e.ref_name == RefName::new("refs/heads/hot"))
+                .count(),
             1,
             "the ref advanced by exactly one generation"
         );
@@ -1352,7 +1566,11 @@ mod tests {
         for i in 1..=k {
             let new = Oid::new(format!("gen{i:03}"));
             match store
-                .receive(&human_push("refs/heads/hot", prev.clone(), new.clone()), &db, CrashPoint::None)
+                .receive(
+                    &human_push("refs/heads/hot", prev.clone(), new.clone()),
+                    &db,
+                    CrashPoint::None,
+                )
                 .unwrap()
             {
                 PushOutcome::Accepted { emitted, moved } => {
@@ -1369,7 +1587,10 @@ mod tests {
             .iter()
             .map(|id| {
                 let row = outbox.row(id).unwrap();
-                assert_eq!(row.aggregate, agg, "every burst event is on the one per-ref aggregate");
+                assert_eq!(
+                    row.aggregate, agg,
+                    "every burst event is on the one per-ref aggregate"
+                );
                 row.seq
             })
             .collect();
@@ -1402,7 +1623,10 @@ mod tests {
                 let ref_name = format!("refs/heads/r{i:02}");
                 let push = human_push(&ref_name, Oid::zero(), Oid::new(format!("t{i:02}")));
                 barrier.wait(); // all distinct-ref pushes fire at once → they must NOT serialise.
-                (ref_name, store.receive(&push, &db, CrashPoint::None).unwrap())
+                (
+                    ref_name,
+                    store.receive(&push, &db, CrashPoint::None).unwrap(),
+                )
             }));
         }
         let results: Vec<(String, PushOutcome)> =
@@ -1415,7 +1639,11 @@ mod tests {
                 "distinct ref {ref_name} must commit in parallel, got {outcome:?}"
             );
         }
-        assert_eq!(outbox.committed_count(), n, "all N distinct-ref events committed");
+        assert_eq!(
+            outbox.committed_count(),
+            n,
+            "all N distinct-ref events committed"
+        );
         // Each ref is at its own tip with update_seq 1 (one create each, independent generations).
         for i in 0..n {
             assert_eq!(
@@ -1426,13 +1654,15 @@ mod tests {
         }
         // The per-aggregate outbox seqs are each 0 (every ref is its own aggregate, first move).
         for row in (0..n).filter_map(|i| {
-            outbox
-                .row(&match &results[i].1 {
-                    PushOutcome::Accepted { emitted, .. } => emitted[0].clone(),
-                    _ => unreachable!(),
-                })
+            outbox.row(&match &results[i].1 {
+                PushOutcome::Accepted { emitted, .. } => emitted[0].clone(),
+                _ => unreachable!(),
+            })
         }) {
-            assert_eq!(row.seq, 0, "each distinct ref's first event is its own aggregate's seq 0");
+            assert_eq!(
+                row.seq, 0,
+                "each distinct ref's first event is its own aggregate's seq 0"
+            );
         }
     }
 
@@ -1443,7 +1673,13 @@ mod tests {
         let (store, outbox) = store();
         let db = InMemoryObjectDb::new();
         // create feature@v1 (seq 1), then delete it (seq 2), then re-create (seq 1 of a fresh row).
-        store.receive(&human_push("refs/heads/feature", Oid::zero(), Oid::new("v1")), &db, CrashPoint::None).unwrap();
+        store
+            .receive(
+                &human_push("refs/heads/feature", Oid::zero(), Oid::new("v1")),
+                &db,
+                CrashPoint::None,
+            )
+            .unwrap();
         let del = PushSession {
             updates: vec![ProposedRefUpdate {
                 ref_name: RefName::new("refs/heads/feature"),
@@ -1453,20 +1689,44 @@ mod tests {
                 commit_oids: vec![],
             }],
             quarantine: vec![],
-            pusher: Pusher { pseudonym: "anon-1@acme.noreply".into(), is_agent: false },
+            pusher: Pusher {
+                pseudonym: "anon-1@acme.noreply".into(),
+                is_agent: false,
+            },
         };
         assert!(matches!(
             store.receive(&del, &db, CrashPoint::None).unwrap(),
             PushOutcome::Accepted { .. }
         ));
-        assert_eq!(store.tip(&RefName::new("refs/heads/feature")), None, "the ref was deleted");
+        assert_eq!(
+            store.tip(&RefName::new("refs/heads/feature")),
+            None,
+            "the ref was deleted"
+        );
         // Re-create: a delete-from-zero CAS (the row is gone → expected-old is zero again).
-        match store.receive(&human_push("refs/heads/feature", Oid::zero(), Oid::new("v2")), &db, CrashPoint::None).unwrap() {
-            PushOutcome::Accepted { moved, .. } => assert_eq!(moved[0].2, 1, "the re-created row starts a fresh generation"),
+        match store
+            .receive(
+                &human_push("refs/heads/feature", Oid::zero(), Oid::new("v2")),
+                &db,
+                CrashPoint::None,
+            )
+            .unwrap()
+        {
+            PushOutcome::Accepted { moved, .. } => assert_eq!(
+                moved[0].2, 1,
+                "the re-created row starts a fresh generation"
+            ),
             o => panic!("re-create must be accepted, got {o:?}"),
         }
-        assert_eq!(store.tip(&RefName::new("refs/heads/feature")), Some(Oid::new("v2")));
-        assert_eq!(outbox.committed_count(), 3, "create + delete + re-create each emitted");
+        assert_eq!(
+            store.tip(&RefName::new("refs/heads/feature")),
+            Some(Oid::new("v2"))
+        );
+        assert_eq!(
+            outbox.committed_count(),
+            3,
+            "create + delete + re-create each emitted"
+        );
     }
 
     /// **H1 holder registration: opening the store auto-registers it (contract 1.4 / 10.1).** The
@@ -1475,7 +1735,10 @@ mod tests {
     fn opening_the_store_registers_holder_h1() {
         let (store, _outbox) = store();
         assert_eq!(store.holder().holder_id, crate::holder_intent::HOLDER_ID);
-        assert!(store.holder().registered, "the store auto-registered as H1 on open");
+        assert!(
+            store.holder().registered,
+            "the store auto-registered as H1 on open"
+        );
     }
 
     /// **`is_protected` distinguishes protected from feature refs** (kills the `-> true` mutant):
@@ -1484,21 +1747,39 @@ mod tests {
     fn protected_set_is_exactly_main_and_release() {
         assert!(RefName::new("refs/heads/main").is_protected());
         assert!(RefName::new("refs/heads/release/1.0").is_protected());
-        assert!(!RefName::new("refs/heads/feature").is_protected(), "a feature ref is NOT protected");
-        assert!(!RefName::new("refs/heads/mainline").is_protected(), "only exact `main` is protected");
+        assert!(
+            !RefName::new("refs/heads/feature").is_protected(),
+            "a feature ref is NOT protected"
+        );
+        assert!(
+            !RefName::new("refs/heads/mainline").is_protected(),
+            "only exact `main` is protected"
+        );
 
         // A FORCE-push to a non-protected feature ref is ACCEPTED (proving the protected gate is not
         // universally `true`): seed the ref, then force-update it.
         let (store, outbox) = store();
         let db = InMemoryObjectDb::new();
-        store.receive(&human_push("refs/heads/feature", Oid::zero(), Oid::new("a1")), &db, CrashPoint::None).unwrap();
+        store
+            .receive(
+                &human_push("refs/heads/feature", Oid::zero(), Oid::new("a1")),
+                &db,
+                CrashPoint::None,
+            )
+            .unwrap();
         let mut forced = human_push("refs/heads/feature", Oid::new("a1"), Oid::new("a2"));
         forced.updates[0].forced = true;
-        assert!(matches!(
-            store.receive(&forced, &db, CrashPoint::None).unwrap(),
-            PushOutcome::Accepted { .. }
-        ), "a force-push to a NON-protected ref is accepted");
-        assert_eq!(store.tip(&RefName::new("refs/heads/feature")), Some(Oid::new("a2")));
+        assert!(
+            matches!(
+                store.receive(&forced, &db, CrashPoint::None).unwrap(),
+                PushOutcome::Accepted { .. }
+            ),
+            "a force-push to a NON-protected ref is accepted"
+        );
+        assert_eq!(
+            store.tip(&RefName::new("refs/heads/feature")),
+            Some(Oid::new("a2"))
+        );
         assert_eq!(outbox.committed_count(), 2);
     }
 
@@ -1506,7 +1787,12 @@ mod tests {
     /// object EXACTLY at the limit is accepted; one byte over is rejected.
     #[test]
     fn object_size_limit_is_strict_greater_than() {
-        let policy = PushPolicy { max_object_bytes: 8, secret_patterns: vec![], protected_needs_human: true, tenant: "acme".into() };
+        let policy = PushPolicy {
+            max_object_bytes: 8,
+            secret_patterns: vec![],
+            protected_needs_human: true,
+            tenant: "acme".into(),
+        };
         let at_limit = PushSession {
             updates: vec![ProposedRefUpdate {
                 ref_name: RefName::new("refs/heads/f"),
@@ -1515,10 +1801,19 @@ mod tests {
                 forced: false,
                 commit_oids: vec![],
             }],
-            quarantine: vec![QuarantineObject { oid: Oid::new("x"), bytes: vec![0u8; 8] }],
-            pusher: Pusher { pseudonym: "p@acme.noreply".into(), is_agent: false },
+            quarantine: vec![QuarantineObject {
+                oid: Oid::new("x"),
+                bytes: vec![0u8; 8],
+            }],
+            pusher: Pusher {
+                pseudonym: "p@acme.noreply".into(),
+                is_agent: false,
+            },
         };
-        assert!(policy.evaluate(&at_limit).is_ok(), "an object exactly at the limit is accepted");
+        assert!(
+            policy.evaluate(&at_limit).is_ok(),
+            "an object exactly at the limit is accepted"
+        );
 
         let mut over = at_limit.clone();
         over.quarantine[0].bytes = vec![0u8; 9]; // one byte over.
@@ -1541,11 +1836,18 @@ mod tests {
         assert_eq!(db.len(), 0);
         assert!(!db.contains(&Oid::new("z")), "a fresh DB contains nothing");
 
-        db.migrate(&[QuarantineObject { oid: Oid::new("z"), bytes: vec![] }]).unwrap();
+        db.migrate(&[QuarantineObject {
+            oid: Oid::new("z"),
+            bytes: vec![],
+        }])
+        .unwrap();
         assert!(!db.is_empty(), "a migrated DB is not empty");
         assert_eq!(db.len(), 1);
         assert!(db.contains(&Oid::new("z")));
-        assert!(!db.contains(&Oid::new("other")), "it contains only what was migrated");
+        assert!(
+            !db.contains(&Oid::new("other")),
+            "it contains only what was migrated"
+        );
     }
 
     /// **`RefStore::outbox` returns the SHARED outbox the store emits into** (kills the
@@ -1555,9 +1857,23 @@ mod tests {
     fn outbox_accessor_returns_the_shared_store() {
         let (store, _outbox) = store();
         let db = InMemoryObjectDb::new();
-        assert_eq!(store.outbox().outbox_depth(), 0, "the shared outbox starts empty");
-        store.receive(&human_push("refs/heads/f", Oid::zero(), Oid::new("a")), &db, CrashPoint::None).unwrap();
-        assert_eq!(store.outbox().outbox_depth(), 1, "the accessor sees the committed event");
+        assert_eq!(
+            store.outbox().outbox_depth(),
+            0,
+            "the shared outbox starts empty"
+        );
+        store
+            .receive(
+                &human_push("refs/heads/f", Oid::zero(), Oid::new("a")),
+                &db,
+                CrashPoint::None,
+            )
+            .unwrap();
+        assert_eq!(
+            store.outbox().outbox_depth(),
+            1,
+            "the accessor sees the committed event"
+        );
     }
 
     /// The frozen `git_ref` migration carries the per-ref primary key + `update_seq` + the reflog,
@@ -1608,12 +1924,21 @@ mod tests {
 
         // receive-pack → policy → REAL migration → one-tx ref-CAS + outbox.
         let outcome = store.receive(&push, &migration, CrashPoint::None).unwrap();
-        assert!(matches!(outcome, PushOutcome::Accepted { .. }), "the push is accepted");
-        assert_eq!(outbox.outbox_depth(), 1, "one git.ref.updated committed (emit-iff-committed)");
+        assert!(
+            matches!(outcome, PushOutcome::Accepted { .. }),
+            "the push is accepted"
+        );
+        assert_eq!(
+            outbox.outbox_depth(),
+            1,
+            "one git.ref.updated committed (emit-iff-committed)"
+        );
 
         // The pushed object is durable + content-addressed in the pack tier — a clone serves it back
         // BYTE-IDENTICAL (0 corruption; the GIT-P11 round-trip GATE through the production migration).
-        let served = object_db.serve_clone(std::slice::from_ref(&pushed_oid)).expect("clone served");
+        let served = object_db
+            .serve_clone(std::slice::from_ref(&pushed_oid))
+            .expect("clone served");
         assert_eq!(served.len(), 1);
         assert_eq!(served[0].0, pushed_oid);
         assert_eq!(

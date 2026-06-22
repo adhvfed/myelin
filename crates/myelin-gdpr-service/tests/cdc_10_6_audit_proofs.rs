@@ -72,13 +72,17 @@ fn cdc_10_6_provider_serves_proofs_consumer_auditor_verifies() {
     let provider = AuditAuthority::new(CellSigningKey::from_seed("cell:fr-par:audit"));
     let tenant = TenantId("acme".into());
     for i in 0..6 {
-        provider
-            .consumer()
-            .handle(&action(&format!("01J-{i}"), "acme", &format!("myelin://acme/x/{i}")));
+        provider.consumer().handle(&action(
+            &format!("01J-{i}"),
+            "acme",
+            &format!("myelin://acme/x/{i}"),
+        ));
     }
 
     // The provider commits an STH (size 6) and serves an inclusion proof for leaf 4.
-    let sth_v1: SignedTreeHead = provider.signed_tree_head(&tenant, "2026-06-20T00:00:00Z").unwrap();
+    let sth_v1: SignedTreeHead = provider
+        .signed_tree_head(&tenant, "2026-06-20T00:00:00Z")
+        .unwrap();
     let inclusion = provider.inclusion_proof(&tenant, 4).unwrap();
 
     // The provider anchors the STH to an INDEPENDENT witness (a different cell's notary). The
@@ -88,11 +92,15 @@ fn cdc_10_6_provider_serves_proofs_consumer_auditor_verifies() {
 
     // More actions append; the provider commits a SECOND STH and serves a consistency proof.
     for i in 6..10 {
-        provider
-            .consumer()
-            .handle(&action(&format!("01J-{i}"), "acme", &format!("myelin://acme/x/{i}")));
+        provider.consumer().handle(&action(
+            &format!("01J-{i}"),
+            "acme",
+            &format!("myelin://acme/x/{i}"),
+        ));
     }
-    let sth_v2 = provider.signed_tree_head(&tenant, "2026-06-20T01:00:00Z").unwrap();
+    let sth_v2 = provider
+        .signed_tree_head(&tenant, "2026-06-20T01:00:00Z")
+        .unwrap();
     let consistency = provider.consistency_proof(&tenant, 6, 10).unwrap();
 
     // ── CONSUMER (the auditor): verify EVERYTHING with only PII-free, published material ──
@@ -100,11 +108,20 @@ fn cdc_10_6_provider_serves_proofs_consumer_auditor_verifies() {
     let auditor_key = CellSigningKey::from_seed("cell:fr-par:audit");
 
     // 1. The STH signature verifies (it was signed by the cell's audit key).
-    assert!(sth_v1.verify_signature(&auditor_key), "auditor: STH v1 signature verifies");
-    assert!(sth_v2.verify_signature(&auditor_key), "auditor: STH v2 signature verifies");
+    assert!(
+        sth_v1.verify_signature(&auditor_key),
+        "auditor: STH v1 signature verifies"
+    );
+    assert!(
+        sth_v2.verify_signature(&auditor_key),
+        "auditor: STH v2 signature verifies"
+    );
 
     // 2. The inclusion proof verifies against the committed STH ("this action IS in the log").
-    assert!(verify_inclusion(&inclusion, &sth_v1), "auditor: the inclusion proof verifies against the STH");
+    assert!(
+        verify_inclusion(&inclusion, &sth_v1),
+        "auditor: the inclusion proof verifies against the STH"
+    );
     assert_eq!(inclusion.tree_size, 6);
     assert_eq!(inclusion.leaf_index, 4);
 
@@ -122,22 +139,30 @@ fn cdc_10_6_provider_serves_proofs_consumer_auditor_verifies() {
 
     // The proofs carry NO PII (an auditor receives only roots, sizes, an audit path of hashes).
     assert!(inclusion.root_hash.starts_with("blake3:"));
-    assert!(inclusion.audit_path.iter().all(|n| n.starts_with("blake3:")));
+    assert!(inclusion
+        .audit_path
+        .iter()
+        .all(|n| n.starts_with("blake3:")));
     assert!(attestation.witnessed_root.starts_with("blake3:"));
 
     // ── the auditor REJECTS a forged STH + a tampered proof (the verification is real) ──
     // A forged STH signed by a DIFFERENT key fails the signature check.
     let forged = SignedTreeHead {
-        signature: CellSigningKey::from_seed("attacker-key")
-            .pipe_signature(&sth_v1),
+        signature: CellSigningKey::from_seed("attacker-key").pipe_signature(&sth_v1),
         ..sth_v1.clone()
     };
-    assert!(!forged.verify_signature(&auditor_key), "auditor: a forged STH is rejected");
+    assert!(
+        !forged.verify_signature(&auditor_key),
+        "auditor: a forged STH is rejected"
+    );
 
     // A tampered inclusion proof (wrong leaf index) fails.
     let mut bad = inclusion.clone();
     bad.leaf_index = 0;
-    assert!(!verify_inclusion(&bad, &sth_v1), "auditor: a tampered inclusion proof is rejected");
+    assert!(
+        !verify_inclusion(&bad, &sth_v1),
+        "auditor: a tampered inclusion proof is rejected"
+    );
 }
 
 /// A tiny extension trait so the forged-STH case in the CDC reads cleanly (sign a different key's

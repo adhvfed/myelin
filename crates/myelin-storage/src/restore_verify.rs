@@ -96,7 +96,9 @@ use myelin_tenancy::TenantId;
 use crate::backup::{ContinuousArchiver, WalOffset};
 use crate::blob::ContentHash;
 use crate::kms::KmsEngine;
-use crate::restore::{restore_to_offset, BlobPresence, RestoreError, RestoreReport, SourceLog, WalRow};
+use crate::restore::{
+    restore_to_offset, BlobPresence, RestoreError, RestoreReport, SourceLog, WalRow,
+};
 
 // ───────────────────────────── the clean restore target (the object bytes) ─────────────────────────────
 
@@ -695,9 +697,17 @@ mod tests {
     /// An archiver whose base + WAL tail makes every offset in `0..=tail` reachable.
     fn reachable_archiver(tail: WalOffset) -> ContinuousArchiver {
         let mut arch = ContinuousArchiver::new();
-        arch.archive_segment(WalSegment { end_offset: 0, committed_at: 0 }).unwrap();
+        arch.archive_segment(WalSegment {
+            end_offset: 0,
+            committed_at: 0,
+        })
+        .unwrap();
         arch.take_base_backup(1);
-        arch.archive_segment(WalSegment { end_offset: tail, committed_at: 10 }).unwrap();
+        arch.archive_segment(WalSegment {
+            end_offset: tail,
+            committed_at: 10,
+        })
+        .unwrap();
         arch
     }
 
@@ -718,13 +728,28 @@ mod tests {
         let t = tenant("acme");
         let kms = kms_with_tenant(&t);
         let arch = reachable_archiver(300);
-        let objects = vec![RestoredObject::integral(b"blob-90".to_vec()), RestoredObject::integral(b"blob-100".to_vec())];
+        let objects = vec![
+            RestoredObject::integral(b"blob-90".to_vec()),
+            RestoredObject::integral(b"blob-100".to_vec()),
+        ];
         let mut source = SourceLog::new();
         source.append(90, "r90").append(100, "r100");
         let rows = vec![
-            WalRow { id: "r90".into(), written_at: 90, blob_ref: Some(objects[0].content_address.clone()) },
-            WalRow { id: "r100".into(), written_at: 100, blob_ref: Some(objects[1].content_address.clone()) },
-            WalRow { id: "r-future".into(), written_at: 250, blob_ref: None }, // > T → dropped
+            WalRow {
+                id: "r90".into(),
+                written_at: 90,
+                blob_ref: Some(objects[0].content_address.clone()),
+            },
+            WalRow {
+                id: "r100".into(),
+                written_at: 100,
+                blob_ref: Some(objects[1].content_address.clone()),
+            },
+            WalRow {
+                id: "r-future".into(),
+                written_at: 250,
+                blob_ref: None,
+            }, // > T → dropped
         ];
         let ledger = ErasureLedger::new();
         let inputs = GateInputs {
@@ -738,12 +763,22 @@ mod tests {
         };
 
         let verdict = RestoreVerifyGate::new().run(&inputs);
-        assert!(verdict.is_green(), "a whole restore must GREEN, got {:?}", verdict.failure());
+        assert!(
+            verdict.is_green(),
+            "a whole restore must GREEN, got {:?}",
+            verdict.failure()
+        );
         let artifact = verdict.green_artifact().expect("green artifact present");
         assert_eq!(artifact.restored_to_offset, 100);
         assert_eq!(artifact.oltp_row_count, 2, "the future row was dropped");
-        assert_eq!(artifact.objects_verified, 2, "both referenced objects checksum-parity-verified");
-        assert_eq!(artifact.derived_doc_count, 2, "derived == source-replay to T");
+        assert_eq!(
+            artifact.objects_verified, 2,
+            "both referenced objects checksum-parity-verified"
+        );
+        assert_eq!(
+            artifact.derived_doc_count, 2,
+            "derived == source-replay to T"
+        );
         assert_eq!(artifact.dangling_ref_count, 0);
         assert_eq!(artifact.checksum_mismatches, 0);
         assert_eq!(artifact.cross_seam_mismatches, 0);
@@ -763,11 +798,20 @@ mod tests {
         let objects = vec![RestoredObject::integral(b"x".to_vec())];
         let mut source = SourceLog::new();
         source.append(50, "r1");
-        let rows = vec![WalRow { id: "r1".into(), written_at: 50, blob_ref: Some(objects[0].content_address.clone()) }];
+        let rows = vec![WalRow {
+            id: "r1".into(),
+            written_at: 50,
+            blob_ref: Some(objects[0].content_address.clone()),
+        }];
         let ledger = ErasureLedger::new();
         let inputs = GateInputs {
-            archiver: &arch, target: 100, rows: &rows, objects: &objects,
-            source: &source, kms: &kms, erasure_ledger: &ledger,
+            archiver: &arch,
+            target: 100,
+            rows: &rows,
+            objects: &objects,
+            source: &source,
+            kms: &kms,
+            erasure_ledger: &ledger,
         };
         let artifact = RestoreVerifyGate::new()
             .run_or_fail_ci(&inputs)
@@ -789,25 +833,48 @@ mod tests {
         // The object is stored under the address for "good-bytes", but the restore brought back
         // "CORRUPTED" bytes — present, but the bytes no longer hash to the address (silent corruption).
         let address = ContentHash::blake3(b"good-bytes");
-        let corrupt = RestoredObject { content_address: address.clone(), bytes: b"CORRUPTED".to_vec() };
+        let corrupt = RestoredObject {
+            content_address: address.clone(),
+            bytes: b"CORRUPTED".to_vec(),
+        };
         let objects = vec![corrupt];
         let source = SourceLog::new();
-        let rows = vec![WalRow { id: "r1".into(), written_at: 50, blob_ref: Some(address.clone()) }];
+        let rows = vec![WalRow {
+            id: "r1".into(),
+            written_at: 50,
+            blob_ref: Some(address.clone()),
+        }];
         let ledger = ErasureLedger::new();
         let inputs = GateInputs {
-            archiver: &arch, target: 100, rows: &rows, objects: &objects,
-            source: &source, kms: &kms, erasure_ledger: &ledger,
+            archiver: &arch,
+            target: 100,
+            rows: &rows,
+            objects: &objects,
+            source: &source,
+            kms: &kms,
+            erasure_ledger: &ledger,
         };
 
         let verdict = RestoreVerifyGate::new().run(&inputs);
-        assert!(!verdict.is_green(), "a corrupt restored object MUST FAIL the gate, not pass silently");
+        assert!(
+            !verdict.is_green(),
+            "a corrupt restored object MUST FAIL the gate, not pass silently"
+        );
         assert_eq!(
             verdict.failure(),
-            Some(&GateFailure::ChecksumMismatch { row_id: "r1".into(), content_address: address.clone() })
+            Some(&GateFailure::ChecksumMismatch {
+                row_id: "r1".into(),
+                content_address: address.clone()
+            })
         );
         // run_or_fail_ci FAILs CI on it (loud-never-swallowed).
-        let err = RestoreVerifyGate::new().run_or_fail_ci(&inputs).expect_err("must fail CI");
-        assert!(err.to_string().contains("CHECKSUM MISMATCH"), "loud + specific: {err}");
+        let err = RestoreVerifyGate::new()
+            .run_or_fail_ci(&inputs)
+            .expect_err("must fail CI");
+        assert!(
+            err.to_string().contains("CHECKSUM MISMATCH"),
+            "loud + specific: {err}"
+        );
     }
 
     /// **MANDATORY-CORE: a deliberately-CORRUPTED backup (a row → MISSING blob) makes the gate FAIL
@@ -826,23 +893,39 @@ mod tests {
         let objects = vec![present.clone()];
         let source = SourceLog::new();
         let rows = vec![
-            WalRow { id: "ok".into(), written_at: 50, blob_ref: Some(present.content_address.clone()) },
-            WalRow { id: "corrupt".into(), written_at: 90, blob_ref: Some(missing_addr) },
+            WalRow {
+                id: "ok".into(),
+                written_at: 50,
+                blob_ref: Some(present.content_address.clone()),
+            },
+            WalRow {
+                id: "corrupt".into(),
+                written_at: 90,
+                blob_ref: Some(missing_addr),
+            },
         ];
         let ledger = ErasureLedger::new();
         let inputs = GateInputs {
-            archiver: &arch, target: 100, rows: &rows, objects: &objects,
-            source: &source, kms: &kms, erasure_ledger: &ledger,
+            archiver: &arch,
+            target: 100,
+            rows: &rows,
+            objects: &objects,
+            source: &source,
+            kms: &kms,
+            erasure_ledger: &ledger,
         };
 
-        let err = RestoreVerifyGate::new()
-            .run_or_fail_ci(&inputs)
-            .expect_err("a corrupted backup (row → missing blob) MUST fail CI, never silently pass");
+        let err = RestoreVerifyGate::new().run_or_fail_ci(&inputs).expect_err(
+            "a corrupted backup (row → missing blob) MUST fail CI, never silently pass",
+        );
         assert!(
             matches!(&err, GateFailure::RestoreFailed(RestoreError::DanglingBlobRef { row_id, .. }) if row_id == "corrupt"),
             "the gate surfaces the restore's hard dangling-ref FAIL: {err}"
         );
-        assert!(err.to_string().contains("RESTORE-VERIFY FAIL"), "loud: {err}");
+        assert!(
+            err.to_string().contains("RESTORE-VERIFY FAIL"),
+            "loud: {err}"
+        );
     }
 
     // ───────── the cross-seam leg (one consistent point, derived == source) ─────────
@@ -862,12 +945,20 @@ mod tests {
         let rows: Vec<WalRow> = vec![]; // no rows restored → the derived "ghost" doc is an orphan
         let ledger = ErasureLedger::new();
         let inputs = GateInputs {
-            archiver: &arch, target: 100, rows: &rows, objects: &objects,
-            source: &source, kms: &kms, erasure_ledger: &ledger,
+            archiver: &arch,
+            target: 100,
+            rows: &rows,
+            objects: &objects,
+            source: &source,
+            kms: &kms,
+            erasure_ledger: &ledger,
         };
 
         let verdict = RestoreVerifyGate::new().run(&inputs);
-        assert!(!verdict.is_green(), "an orphan derived doc is a cross-seam mismatch");
+        assert!(
+            !verdict.is_green(),
+            "an orphan derived doc is a cross-seam mismatch"
+        );
         match verdict.failure() {
             Some(GateFailure::CrossSeamMismatch { count, .. }) => assert_eq!(*count, 1),
             other => panic!("expected a CrossSeamMismatch, got {other:?}"),
@@ -887,7 +978,8 @@ mod tests {
         kms.ensure_kek(&KekId::new(live.clone(), region()));
         kms.ensure_dek(&live, &region(), KeyClass::Tenant).unwrap();
         kms.ensure_kek(&KekId::new(shredded.clone(), region()));
-        kms.ensure_dek(&shredded, &region(), KeyClass::Tenant).unwrap();
+        kms.ensure_dek(&shredded, &region(), KeyClass::Tenant)
+            .unwrap();
         // Crypto-shred the second tenant BEFORE the backup (the erasure-before-the-backup case).
         assert!(kms.destroy_kek(&KekId::new(shredded.clone(), region())));
 
@@ -898,12 +990,21 @@ mod tests {
         let mut ledger = ErasureLedger::new();
         ledger.record_erased(shredded.clone());
         let inputs = GateInputs {
-            archiver: &arch, target: 100, rows: &rows, objects: &objects,
-            source: &source, kms: &kms, erasure_ledger: &ledger,
+            archiver: &arch,
+            target: 100,
+            rows: &rows,
+            objects: &objects,
+            source: &source,
+            kms: &kms,
+            erasure_ledger: &ledger,
         };
 
         let verdict = RestoreVerifyGate::new().run(&inputs);
-        assert!(verdict.is_green(), "an erased tenant must stay erased → green, got {:?}", verdict.failure());
+        assert!(
+            verdict.is_green(),
+            "an erased tenant must stay erased → green, got {:?}",
+            verdict.failure()
+        );
     }
 
     /// **MANDATORY-CORE: the erasure-held leg CATCHES a resurrected erased subject** — if the restore
@@ -924,18 +1025,33 @@ mod tests {
         let mut ledger = ErasureLedger::new();
         ledger.record_erased(resurrected.clone());
         let inputs = GateInputs {
-            archiver: &arch, target: 100, rows: &rows, objects: &objects,
-            source: &source, kms: &kms, erasure_ledger: &ledger,
+            archiver: &arch,
+            target: 100,
+            rows: &rows,
+            objects: &objects,
+            source: &source,
+            kms: &kms,
+            erasure_ledger: &ledger,
         };
 
         let verdict = RestoreVerifyGate::new().run(&inputs);
-        assert!(!verdict.is_green(), "a resurrected erased subject MUST fail the gate");
+        assert!(
+            !verdict.is_green(),
+            "a resurrected erased subject MUST fail the gate"
+        );
         assert_eq!(
             verdict.failure(),
-            Some(&GateFailure::ErasureResurrected { tenant: resurrected.clone() })
+            Some(&GateFailure::ErasureResurrected {
+                tenant: resurrected.clone()
+            })
         );
-        let err = RestoreVerifyGate::new().run_or_fail_ci(&inputs).expect_err("must fail CI");
-        assert!(err.to_string().contains("ERASURE RESURRECTED"), "loud + specific: {err}");
+        let err = RestoreVerifyGate::new()
+            .run_or_fail_ci(&inputs)
+            .expect_err("must fail CI");
+        assert!(
+            err.to_string().contains("ERASURE RESURRECTED"),
+            "loud + specific: {err}"
+        );
     }
 
     // ───────── checksum-parity-holds unit (the integrity primitive) ─────────
@@ -951,6 +1067,9 @@ mod tests {
             content_address: ContentHash::blake3(b"hello"),
             bytes: b"tampered".to_vec(),
         };
-        assert!(!corrupt.checksum_parity_holds(), "tampered bytes → parity broken");
+        assert!(
+            !corrupt.checksum_parity_holds(),
+            "tampered bytes → parity broken"
+        );
     }
 }

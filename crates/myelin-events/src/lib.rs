@@ -352,27 +352,6 @@ pub mod taxonomy;
 pub mod telemetry;
 pub mod upcast;
 
-pub use consumer::{
-    consume, Consumer, ConsumerName, ConsumerSpec, DeadLetter, Delivered, Message,
-    PerTenantInflight, PrefetchBound, SubscribeError, Subscription,
-};
-pub use dedup::{DedupLedger, CONSUMER_DEDUP_MIGRATION};
-/// The firehose resume-cursor subscription protocol (contract 3.5, the Bus-owned zero-loss-replay
-/// half — EB-21 / P-141, built FIRST per EI-04 §2.2). `Firehose::publish`/`tail`/`subscribe`/`resume`
-/// implement the §5.5 surface: a per-`(stream, scope)` monotonic `seq`, `(last_seq, now]` backfill on
-/// reconnect (loses ZERO ops), an out-of-window `last_seq` → `resync_required` → `*.snapshot` fallback
-/// (the cold-rebuild path, NAMED not silent — the rebuild itself is EB-22 / P-142), a bounded scope
-/// (`FirehoseScope` — never `*`; the transport rejects an over-broad scope), and a per-connection
-/// in-flight cap (a slow consumer drops to `resync_required`, never buffers unboundedly). FLOORS: the
-/// retention-window size per stream class is NAMED-not-numbered → MEASURED by D-10 in EB-30 / P-439;
-/// D-10 re-runs green across the KN CAS→CRDT `engine_promote` boundary (EB-30). The substrate's
-/// `FrameBuffer`/`BoundedSelector` (P-135/P-136) are the bounded-and-sheds half that RIDES this
-/// protocol at the connection tier (Chat M4) — events cannot depend on substrate, so the two halves
-/// compose at the connection tier (EI-01 §7 reconciliation noted in `firehose.rs`).
-pub use firehose::{
-    Firehose, FirehoseError, FirehoseScope, Frame, FrameDraft, FramePayload, RetentionWindow,
-    ScopeKind, SubStream, Subscription as FirehoseSubscription, DEFAULT_INFLIGHT_CAP,
-};
 /// The Git↔CI check-seam CARRIAGE (contract 5.9 the Bus's narrow half + 9.4 consumed, EB-24 /
 /// P-144). The Bus owns ONLY: envelope conformance ([`check_seam::check_updated_draft`] — the
 /// `ci.check.updated` subject `repo#commit-<oid>/check-<context>` + the `(repo, commit_oid)`
@@ -391,36 +370,9 @@ pub use check_seam::{
     check_aggregate, check_subject, check_updated_draft, CheckSeamError, CheckSeamOrder, CiOverall,
     CiResult, CiResultWaitSubstrate, OrderedCheck, WakeOutcome,
 };
-pub use taxonomy::{
-    validate as validate_event_type, TaxonomyError, ARTIFACT_TYPE_TOKENS, SEED_EVENT_NAMES,
-    SUBSYSTEM_TOKENS,
-};
-/// The per-subsystem token-list validation harness (contract 2.9, EB-26 / P-246, M3). Each
-/// subsystem registers its completed [`harness::SubsystemTokenList`] into a [`harness::TokenListHarness`]
-/// — the Bus admits the full list iff every name is §6.1-grammar-conformant + own-prefixed + unique,
-/// and rejects a malformed addition LOUDLY ([`harness::HarnessError`]). The Bus owns the grammar +
-/// harness; the subsystem owns its list (its own crate constant). FLOOR: CI/Issues/Chat register
-/// their M4 lists through this same harness in EB-27/P-?.
-pub use harness::{
-    HarnessError, PayloadShape, RegisteredToken, SubsystemTokenList, TokenListHarness,
-};
-pub use upcast::{RegisterError, UpcastError, UpcasterRegistry};
-pub use telemetry::{
-    BusObservations, BusSignal, BusSignals, MetricLabel, MetricRecorder, MetricSample, MetricsSink,
-};
-pub use outbox::{
-    EmitContextBase, IdMinter, MonotonicMinter, OutboxRow, OutboxStore, OutboxTransaction, Ulid,
-    OUTBOX_MIGRATION,
-};
-pub use relay::{
-    dlq_subject, BusTransport, DeadLetterAlert, Delivery, DrainReport, InProcessBus, Relay,
-    TransportError, MAX_PUBLISH_ATTEMPTS,
-};
-pub use partition::{
-    stream_name_for, PartitionKey, StreamSubject, SubjectError, SUBJECT_ROOT,
-};
-pub use residency::{
-    BusRegionReport, BusResidencySignal, BusStreamResidency, ResidencyError,
+pub use consumer::{
+    consume, Consumer, ConsumerName, ConsumerSpec, DeadLetter, Delivered, Message,
+    PerTenantInflight, PrefetchBound, SubscribeError, Subscription,
 };
 /// The cross-cell bridge FRAME (contract 12.6, EB-14 / P-091), PINNED from the Bus side. The four
 /// frozen frame types are re-exported on the frozen `myelin_events::*` path; their definition site
@@ -431,7 +383,55 @@ pub use crosscell::{
     assert_cell_agnostic, pointer_correlation, ArtifactType, CellId, CrossCellPointer,
     OpaqueSubjectId,
 };
+pub use dedup::{DedupLedger, CONSUMER_DEDUP_MIGRATION};
+/// The firehose resume-cursor subscription protocol (contract 3.5, the Bus-owned zero-loss-replay
+/// half — EB-21 / P-141, built FIRST per EI-04 §2.2). `Firehose::publish`/`tail`/`subscribe`/`resume`
+/// implement the §5.5 surface: a per-`(stream, scope)` monotonic `seq`, `(last_seq, now]` backfill on
+/// reconnect (loses ZERO ops), an out-of-window `last_seq` → `resync_required` → `*.snapshot` fallback
+/// (the cold-rebuild path, NAMED not silent — the rebuild itself is EB-22 / P-142), a bounded scope
+/// (`FirehoseScope` — never `*`; the transport rejects an over-broad scope), and a per-connection
+/// in-flight cap (a slow consumer drops to `resync_required`, never buffers unboundedly). FLOORS: the
+/// retention-window size per stream class is NAMED-not-numbered → MEASURED by D-10 in EB-30 / P-439;
+/// D-10 re-runs green across the KN CAS→CRDT `engine_promote` boundary (EB-30). The substrate's
+/// `FrameBuffer`/`BoundedSelector` (P-135/P-136) are the bounded-and-sheds half that RIDES this
+/// protocol at the connection tier (Chat M4) — events cannot depend on substrate, so the two halves
+/// compose at the connection tier (EI-01 §7 reconciliation noted in `firehose.rs`).
+pub use firehose::{
+    Firehose, FirehoseError, FirehoseScope, Frame, FrameDraft, FramePayload, RetentionWindow,
+    ScopeKind, SubStream, Subscription as FirehoseSubscription, DEFAULT_INFLIGHT_CAP,
+};
+/// The per-subsystem token-list validation harness (contract 2.9, EB-26 / P-246, M3). Each
+/// subsystem registers its completed [`harness::SubsystemTokenList`] into a [`harness::TokenListHarness`]
+/// — the Bus admits the full list iff every name is §6.1-grammar-conformant + own-prefixed + unique,
+/// and rejects a malformed addition LOUDLY ([`harness::HarnessError`]). The Bus owns the grammar +
+/// harness; the subsystem owns its list (its own crate constant). FLOOR: CI/Issues/Chat register
+/// their M4 lists through this same harness in EB-27/P-?.
+pub use harness::{
+    HarnessError, PayloadShape, RegisteredToken, SubsystemTokenList, TokenListHarness,
+};
+pub use outbox::{
+    EmitContextBase, IdMinter, MonotonicMinter, OutboxRow, OutboxStore, OutboxTransaction, Ulid,
+    OUTBOX_MIGRATION,
+};
+pub use partition::{stream_name_for, PartitionKey, StreamSubject, SubjectError, SUBJECT_ROOT};
+pub use relay::{
+    dlq_subject, BusTransport, DeadLetterAlert, Delivery, DrainReport, InProcessBus, Relay,
+    TransportError, MAX_PUBLISH_ATTEMPTS,
+};
+pub use residency::{BusRegionReport, BusResidencySignal, BusStreamResidency, ResidencyError};
+pub use taxonomy::{
+    validate as validate_event_type, TaxonomyError, ARTIFACT_TYPE_TOKENS, SEED_EVENT_NAMES,
+    SUBSYSTEM_TOKENS,
+};
+pub use telemetry::{
+    BusObservations, BusSignal, BusSignals, MetricLabel, MetricRecorder, MetricSample, MetricsSink,
+};
+pub use upcast::{RegisterError, UpcastError, UpcasterRegistry};
 
+pub use holder::{
+    degrade_on_tombstone, BusEventLog, BusHolder, EraseReceipt, ExportedEvent, InMemoryShredder,
+    InlinePiiShredder, LocateReport, LocatedEvent, ShredError, BUS_ERASED_TYPE, ERASED_EVENT_NAME,
+};
 /// The Bus as a `PersonalDataHolder` (contract 2.7 OWNED — the event-log half of erasure-vs-
 /// immutability) + the inline-PII crypto-shred to the KMS hierarchy (EB-15 / P-092). The §5.7
 /// `locate`/`erase`/`export` MECHANISM ([`holder::BusHolder`]) runs over the in-cell
@@ -444,10 +444,6 @@ pub use crosscell::{
 /// erasure ledger; [`holder::BusHolder::re_erase_after_restore`] replays it after a restore so the
 /// key STAYS destroyed across a restore ([`reerase::ReErasureReceipt`] proves 0 resurrected).
 pub use reerase::{BusErasureLedger, ErasedSubject, ReErasureReceipt};
-pub use holder::{
-    degrade_on_tombstone, BusEventLog, BusHolder, EraseReceipt, ExportedEvent, InMemoryShredder,
-    InlinePiiShredder, LocateReport, LocatedEvent, ShredError, BUS_ERASED_TYPE, ERASED_EVENT_NAME,
-};
 
 /// The reindex-from-source seam + the `*.snapshot` event schema (contract 2.6 OWNED, EB-22 / P-142).
 /// [`reindex::reindex`] is the §5.6 `events::reindex(scope)` surface: ask the OWNER of a
@@ -568,7 +564,11 @@ mod tests {
     use myelin_tenancy::{Region, TenantId};
 
     fn sample_principal() -> Principal {
-        Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId("acme".into()))
+        Principal::stub(
+            PrincipalId("p".into()),
+            PrincipalKind::Human,
+            TenantId("acme".into()),
+        )
     }
 
     /// Build an [`EmitContext`] for the emit-surface CDC tests: the ambient fields a real
@@ -620,19 +620,26 @@ mod tests {
             next: u32,
         }
         impl OutboxTx for Tx {
-            fn emit(&mut self, draft: EventDraft, cause: Option<&EventEnvelope>) -> Result<EventId> {
+            fn emit(
+                &mut self,
+                draft: EventDraft,
+                cause: Option<&EventEnvelope>,
+            ) -> Result<EventId> {
                 // A real implementer mints the id + ambient context, derives, then (P-S07)
                 // inserts the row in the same tx. Here we return the derived envelope's id.
                 let id = EventId(format!("01J-{}", self.next));
                 self.next += 1;
-                let env = derive_envelope(draft, ctx_for(id, Some(CausedBy("human:h".into()))), cause);
+                let env =
+                    derive_envelope(draft, ctx_for(id, Some(CausedBy("human:h".into()))), cause);
                 Ok(env.event_id)
             }
         }
 
         let mut tx = Tx { next: 0 };
         // A root emit through the trait.
-        let root_id = tx.emit(draft_for("issues.issue.created"), None).expect("root emits");
+        let root_id = tx
+            .emit(draft_for("issues.issue.created"), None)
+            .expect("root emits");
         assert_eq!(root_id, EventId("01J-0".into()));
 
         // Re-derive the root envelope to feed as the cause (P-S07 would read it back from
@@ -661,7 +668,11 @@ mod tests {
     fn outbox_has_only_emit_no_publish_now() {
         struct Stub;
         impl OutboxTx for Stub {
-            fn emit(&mut self, draft: EventDraft, cause: Option<&EventEnvelope>) -> Result<EventId> {
+            fn emit(
+                &mut self,
+                draft: EventDraft,
+                cause: Option<&EventEnvelope>,
+            ) -> Result<EventId> {
                 // The shape an implementer follows (P-S07 wraps this in the same-tx insert):
                 // pull the ambient context from `self`, derive the envelope, return the id.
                 let ctx = ctx_for(EventId("01J-stub".into()), None);

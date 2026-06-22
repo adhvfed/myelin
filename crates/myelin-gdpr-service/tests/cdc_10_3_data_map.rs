@@ -65,12 +65,18 @@ fn region() -> Region {
 fn holders() -> Vec<HolderSchema> {
     vec![
         HolderSchema::from_schema::<PrincipalRow>(
-            HolderRegistration { kind: StoreKind::Oltp, name: "identity_oltp" },
+            HolderRegistration {
+                kind: StoreKind::Oltp,
+                name: "identity_oltp",
+            },
             Holder::H15Identity,
             region(),
         ),
         HolderSchema::from_schema::<OpaqueIndexRow>(
-            HolderRegistration { kind: StoreKind::SearchIndex, name: "search_index" },
+            HolderRegistration {
+                kind: StoreKind::SearchIndex,
+                name: "search_index",
+            },
             Holder::H7SearchIndex,
             region(),
         ),
@@ -125,16 +131,34 @@ fn cdc_10_3_coverage_gate_is_green_for_mapped_holders_and_red_for_an_unmapped_on
 
     // green: the two holders that contributed are the two registered holders.
     let registered_ok = [
-        HolderRegistration { kind: StoreKind::Oltp, name: "identity_oltp" },
-        HolderRegistration { kind: StoreKind::SearchIndex, name: "search_index" },
+        HolderRegistration {
+            kind: StoreKind::Oltp,
+            name: "identity_oltp",
+        },
+        HolderRegistration {
+            kind: StoreKind::SearchIndex,
+            name: "search_index",
+        },
     ];
-    assert!(inv.coverage_gaps(&registered_ok).is_empty(), "0 holders absent — green");
+    assert!(
+        inv.coverage_gaps(&registered_ok).is_empty(),
+        "0 holders absent — green"
+    );
 
     // red: a THIRD store was registered (the harness opened it) but never contributed to the map.
     let registered_with_gap = [
-        HolderRegistration { kind: StoreKind::Oltp, name: "identity_oltp" },
-        HolderRegistration { kind: StoreKind::SearchIndex, name: "search_index" },
-        HolderRegistration { kind: StoreKind::Oltp, name: "ci_oltp" },
+        HolderRegistration {
+            kind: StoreKind::Oltp,
+            name: "identity_oltp",
+        },
+        HolderRegistration {
+            kind: StoreKind::SearchIndex,
+            name: "search_index",
+        },
+        HolderRegistration {
+            kind: StoreKind::Oltp,
+            name: "ci_oltp",
+        },
     ];
     assert_eq!(
         inv.coverage_gaps(&registered_with_gap),
@@ -152,7 +176,11 @@ fn cdc_10_3_map_is_deterministic_and_ropa_projects_it() {
     let mut reversed = holders();
     reversed.reverse();
     let b = data_map(&reversed);
-    assert_eq!(a.fingerprint(), b.fingerprint(), "deterministic, order-independent");
+    assert_eq!(
+        a.fingerprint(),
+        b.fingerprint(),
+        "deterministic, order-independent"
+    );
     assert_ne!(
         a.fingerprint(),
         data_map(&[]).fingerprint(),

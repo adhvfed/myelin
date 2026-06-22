@@ -47,12 +47,16 @@ impl GitObjectStore {
     /// Persist a git object through the trait, returning its git SHA address (the handle the ref
     /// graph points at).
     fn write_object(&self, kind: GitObjectKind, content: &[u8]) -> ContentHash {
-        self.tier.put_object(&self.repo, kind, content).expect("put through the pack tier")
+        self.tier
+            .put_object(&self.repo, kind, content)
+            .expect("put through the pack tier")
     }
 
     /// Resolve a git object by its SHA address (re-hash-on-read verified).
     fn read_object(&self, address: &ContentHash) -> Vec<u8> {
-        self.tier.get_object(&self.repo, address).expect("get through the pack tier")
+        self.tier
+            .get_object(&self.repo, address)
+            .expect("get through the pack tier")
     }
 }
 
@@ -71,7 +75,11 @@ fn cdc_11_2_git_object_store_writes_and_reads_through_the_trait() {
     assert!(address.to_multihash_string().starts_with("sha256:"));
 
     // Resolving the handle returns the exact object content (re-hash-on-read verified).
-    assert_eq!(store.read_object(&address), blob, "11.2: get by git SHA round-trips the object");
+    assert_eq!(
+        store.read_object(&address),
+        blob,
+        "11.2: get by git SHA round-trips the object"
+    );
 }
 
 /// The consumer relies on **relocatable, region-pinned placement** (contract 12.2): the Git
@@ -86,18 +94,30 @@ fn cdc_11_2_consumer_sees_relocatable_region_pinned_placement() {
     // The Git subsystem relocates the repo within its region (a stored-fact group flip).
     store
         .tier
-        .relocate(&store.repo, StorageGroup::from_token("pack-9"), &Region::new("eu-west"))
+        .relocate(
+            &store.repo,
+            StorageGroup::from_token("pack-9"),
+            &Region::new("eu-west"),
+        )
         .expect("a same-region relocation is admitted (relocatable, never node-pinned)");
 
     // The object's address is UNCHANGED and it is still served — the consumer's handles survive a
     // relocation (the local-disk → object-store backing swap is invisible to the consumer).
     assert_eq!(address, git_object_address(GitObjectKind::Commit, commit));
-    assert_eq!(store.read_object(&address), commit, "the object survives relocation by its address");
+    assert_eq!(
+        store.read_object(&address),
+        commit,
+        "the object survives relocation by its address"
+    );
 
     // The region pin holds: a cross-region relocation is refused (the consumer cannot move a repo
     // out of its region — 0 repos cross the boundary).
     assert!(store
         .tier
-        .relocate(&store.repo, StorageGroup::from_token("pack-n"), &Region::new("eu-north"))
+        .relocate(
+            &store.repo,
+            StorageGroup::from_token("pack-n"),
+            &Region::new("eu-north")
+        )
         .is_err());
 }

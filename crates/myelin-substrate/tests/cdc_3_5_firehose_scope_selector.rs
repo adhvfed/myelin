@@ -40,13 +40,28 @@ fn human(seq: u64) -> Frame {
 fn cdc_3_5_connection_tier_rejects_a_wildcard_subscription() {
     // the headline rejection: `*` is unbounded.
     assert_eq!(BoundedSelector::parse("*"), Err(SelectorError::Wildcard));
-    assert_eq!(BoundedSelector::parse("board:*"), Err(SelectorError::Wildcard));
+    assert_eq!(
+        BoundedSelector::parse("board:*"),
+        Err(SelectorError::Wildcard)
+    );
     // only the three bounded kinds are admitted.
-    assert_eq!(BoundedSelector::parse("board:42").unwrap().kind(), SelectorKind::Board);
-    assert_eq!(BoundedSelector::parse("doc:design").unwrap().kind(), SelectorKind::Doc);
-    assert_eq!(BoundedSelector::parse("channel:eng").unwrap().kind(), SelectorKind::Channel);
+    assert_eq!(
+        BoundedSelector::parse("board:42").unwrap().kind(),
+        SelectorKind::Board
+    );
+    assert_eq!(
+        BoundedSelector::parse("doc:design").unwrap().kind(),
+        SelectorKind::Doc
+    );
+    assert_eq!(
+        BoundedSelector::parse("channel:eng").unwrap().kind(),
+        SelectorKind::Channel
+    );
     // a bare id (no kind) is ambiguous → rejected.
-    assert!(matches!(BoundedSelector::parse("42"), Err(SelectorError::Unprefixed)));
+    assert!(matches!(
+        BoundedSelector::parse("42"),
+        Err(SelectorError::Unprefixed)
+    ));
 }
 
 /// **CDC 3.5 (a) — a 50k-row board delivers only its paginated slice's frames (§7.7).** The transport
@@ -56,14 +71,26 @@ fn cdc_3_5_connection_tier_rejects_a_wildcard_subscription() {
 fn cdc_3_5_a_50k_row_board_delivers_only_its_paginated_slice() {
     let sel = BoundedSelector::parse("board:huge").expect("a bounded board selector");
     let window = ScopeWindow::new(20_000, 100, 50); // delivers rows [19_950, 20_150)
-    assert_eq!(window.delivered_span(), 200, "the window bounds memory, not the 50k board");
+    assert_eq!(
+        window.delivered_span(),
+        200,
+        "the window bounds memory, not the 50k board"
+    );
     let mut sel = FrameSelector::new("kn-ops", &sel, 8, 64, window);
 
     // an in-window frame is delivered; an off-screen one is OutOfWindow (never buffers).
     assert_eq!(sel.offer(human(1), Some(20_050)), FrameOutcome::Buffered);
-    assert_eq!(sel.offer(human(2), Some(0)), FrameOutcome::OutOfWindow, "off-screen board row not delivered");
+    assert_eq!(
+        sel.offer(human(2), Some(0)),
+        FrameOutcome::OutOfWindow,
+        "off-screen board row not delivered"
+    );
     assert_eq!(sel.offer(human(3), Some(49_999)), FrameOutcome::OutOfWindow);
-    assert_eq!(sel.buffer().buffered_frames(), 1, "only the in-window frame consumes buffer memory");
+    assert_eq!(
+        sel.buffer().buffered_frames(),
+        1,
+        "only the in-window frame consumes buffer memory"
+    );
 }
 
 /// **CDC 3.5 (b) — presence/speculative frames shed before message delivery (§7.6).** The transport and
@@ -74,7 +101,13 @@ fn cdc_3_5_presence_frames_shed_before_message_delivery() {
     let sel = BoundedSelector::parse("channel:eng").unwrap();
     // cap 8 → presence budget 2; a wide window so the window never filters; a high lag ceiling so only
     // the class budget (not the slow-consumer drop) fires.
-    let mut sel = FrameSelector::new("chat-live", &sel, 8, 10_000, ScopeWindow::new(0, 1, u64::MAX));
+    let mut sel = FrameSelector::new(
+        "chat-live",
+        &sel,
+        8,
+        10_000,
+        ScopeWindow::new(0, 1, u64::MAX),
+    );
     assert_eq!(sel.offer(presence(1), None), FrameOutcome::Buffered);
     assert_eq!(sel.offer(presence(2), None), FrameOutcome::Buffered);
     // the presence budget (2) is reached → the 3rd presence frame sheds BY CLASS, though the buffer is
@@ -82,7 +115,11 @@ fn cdc_3_5_presence_frames_shed_before_message_delivery() {
     assert_eq!(sel.offer(presence(3), None), FrameOutcome::ShedByClass);
     assert_eq!(sel.budget().shed_count(FrameClass::Presence), 1);
     // a human (message) frame still buffers — message delivery is shed last.
-    assert_eq!(sel.offer(human(4), None), FrameOutcome::Buffered, "message frames are shed last");
+    assert_eq!(
+        sel.offer(human(4), None),
+        FrameOutcome::Buffered,
+        "message frames are shed last"
+    );
     assert_eq!(sel.budget().shed_count(FrameClass::HumanDelivery), 0);
 }
 

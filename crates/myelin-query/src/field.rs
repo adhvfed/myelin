@@ -399,12 +399,26 @@ mod tests {
         assert_eq!(all.len(), 8, "the closed frozen taxonomy is eight variants");
         // Discriminants are pinned 0..8 in declaration order (the byte-identical wire encoding).
         for (i, t) in all.iter().enumerate() {
-            assert_eq!(*t as u8, i as u8, "{} discriminant is pinned to {i}", t.wire_id());
+            assert_eq!(
+                *t as u8,
+                i as u8,
+                "{} discriminant is pinned to {i}",
+                t.wire_id()
+            );
         }
         let ids: Vec<&str> = all.iter().map(|t| t.wire_id()).collect();
         assert_eq!(
             ids,
-            ["text", "int", "bool", "date", "select", "relation", "principal", "order_key"],
+            [
+                "text",
+                "int",
+                "bool",
+                "date",
+                "select",
+                "relation",
+                "principal",
+                "order_key"
+            ],
             "the frozen wire-id set, in order"
         );
     }
@@ -416,10 +430,22 @@ mod tests {
         assert_eq!(FieldValue::Text("x".into()).field_type(), FieldType::Text);
         assert_eq!(FieldValue::Int(1).field_type(), FieldType::Int);
         assert_eq!(FieldValue::Bool(true).field_type(), FieldType::Bool);
-        assert_eq!(FieldValue::Date("2026-06-20".into()).field_type(), FieldType::Date);
-        assert_eq!(FieldValue::Select("opt".into()).field_type(), FieldType::Select);
-        assert_eq!(FieldValue::Relation("ref".into()).field_type(), FieldType::Relation);
-        assert_eq!(FieldValue::Principal("p".into()).field_type(), FieldType::Principal);
+        assert_eq!(
+            FieldValue::Date("2026-06-20".into()).field_type(),
+            FieldType::Date
+        );
+        assert_eq!(
+            FieldValue::Select("opt".into()).field_type(),
+            FieldType::Select
+        );
+        assert_eq!(
+            FieldValue::Relation("ref".into()).field_type(),
+            FieldType::Relation
+        );
+        assert_eq!(
+            FieldValue::Principal("p".into()).field_type(),
+            FieldType::Principal
+        );
         let k = OrderKey::bisect(None, None);
         assert_eq!(FieldValue::OrderKey(k).field_type(), FieldType::OrderKey);
     }
@@ -449,7 +475,10 @@ mod tests {
         assert_eq!(LEXORANK_ALPHABET.len(), 62);
         let mut sorted = *LEXORANK_ALPHABET;
         sorted.sort_unstable();
-        assert_eq!(&sorted, LEXORANK_ALPHABET, "the alphabet is already byte-sorted");
+        assert_eq!(
+            &sorted, LEXORANK_ALPHABET,
+            "the alphabet is already byte-sorted"
+        );
         // The blocks are in `0-9A-Za-z` order, so a position lookup confirms `'0' < 'A' < 'a'`
         // (the byte-compare = numeric-order property, checked against the actual array, not a
         // compile-time constant).
@@ -464,7 +493,10 @@ mod tests {
     #[test]
     fn parse_rejects_out_of_alphabet_keys() {
         assert!(OrderKey::parse("").is_none(), "empty is rejected");
-        assert!(OrderKey::parse("ab-cd").is_none(), "`-` is not in the alphabet");
+        assert!(
+            OrderKey::parse("ab-cd").is_none(),
+            "`-` is not in the alphabet"
+        );
         assert!(OrderKey::parse("V5").is_some(), "a base-62 key parses");
     }
 
@@ -475,7 +507,10 @@ mod tests {
         // First key (no neighbours): non-empty and a valid key.
         let first = OrderKey::bisect(None, None);
         assert!(!first.as_str().is_empty());
-        assert!(OrderKey::parse(first.as_str()).is_some(), "first key is in-alphabet");
+        assert!(
+            OrderKey::parse(first.as_str()).is_some(),
+            "first key is in-alphabet"
+        );
 
         // Append after `first`.
         let after = OrderKey::bisect(Some(&first), None);
@@ -495,7 +530,10 @@ mod tests {
         let lo2 = OrderKey::parse("V").unwrap();
         let hi2 = OrderKey::parse("W").unwrap();
         let mid2 = OrderKey::bisect(Some(&lo2), Some(&hi2));
-        assert!(lo2 < mid2 && mid2 < hi2, "adjacent descent: {lo2} < {mid2} < {hi2}");
+        assert!(
+            lo2 < mid2 && mid2 < hi2,
+            "adjacent descent: {lo2} < {mid2} < {hi2}"
+        );
     }
 
     /// Repeatedly bisecting between a fixed `lo` and the previous midpoint stays ordered and
@@ -527,11 +565,20 @@ mod tests {
 
         // needs_rebalance: false below the trigger, true at/above it.
         let short = OrderKey::parse("V").unwrap();
-        assert!(!short.needs_rebalance(), "a 1-char key is well below the rebalance trigger");
+        assert!(
+            !short.needs_rebalance(),
+            "a 1-char key is well below the rebalance trigger"
+        );
         let at_trigger = OrderKey::parse("V".repeat(LEXORANK_REBALANCE_LEN)).unwrap();
-        assert!(at_trigger.needs_rebalance(), "a {LEXORANK_REBALANCE_LEN}-char key trips it");
+        assert!(
+            at_trigger.needs_rebalance(),
+            "a {LEXORANK_REBALANCE_LEN}-char key trips it"
+        );
         let just_below = OrderKey::parse("V".repeat(LEXORANK_REBALANCE_LEN - 1)).unwrap();
-        assert!(!just_below.needs_rebalance(), "one char below the trigger does NOT trip");
+        assert!(
+            !just_below.needs_rebalance(),
+            "one char below the trigger does NOT trip"
+        );
     }
 
     /// `FieldValue` + `OrderKey` serialize/deserialize stably (the wire contract the three co-owners
@@ -557,14 +604,31 @@ mod tests {
     #[test]
     fn jitter_from_ranks_rejects_out_of_range() {
         // In-range: the lowest and the highest legal digits.
-        assert_eq!(Jitter::from_ranks(0, 0).unwrap().as_str(), "00", "rank 0 → '0'");
-        assert_eq!(Jitter::from_ranks(61, 61).unwrap().as_str(), "zz", "rank 61 → 'z'");
+        assert_eq!(
+            Jitter::from_ranks(0, 0).unwrap().as_str(),
+            "00",
+            "rank 0 → '0'"
+        );
+        assert_eq!(
+            Jitter::from_ranks(61, 61).unwrap().as_str(),
+            "zz",
+            "rank 61 → 'z'"
+        );
         assert_eq!(Jitter::from_ranks(1, 0).unwrap().as_str(), "10");
         // Out of range on the FIRST rank only (would survive a `||`→`&&` mutant — caught here).
-        assert!(Jitter::from_ranks(62, 0).is_none(), "first rank == BASE is rejected");
+        assert!(
+            Jitter::from_ranks(62, 0).is_none(),
+            "first rank == BASE is rejected"
+        );
         // Out of range on the SECOND rank only (the other half of the `||`).
-        assert!(Jitter::from_ranks(0, 62).is_none(), "second rank == BASE is rejected");
-        assert!(Jitter::from_ranks(99, 99).is_none(), "both out of range rejected");
+        assert!(
+            Jitter::from_ranks(0, 62).is_none(),
+            "second rank == BASE is rejected"
+        );
+        assert!(
+            Jitter::from_ranks(99, 99).is_none(),
+            "both out of range rejected"
+        );
     }
 
     /// **`Jitter::random` maps two arbitrary bytes into the alphabet by mod-62** (kills the `%`→`/`
@@ -576,11 +640,19 @@ mod tests {
         assert_eq!(Jitter::random([0, 0]).as_str(), "00");
         // 62 % 62 == 0 → '0' (a `%`→`/` mutant would give 1; a `%`→`+` would give 124 then panic
         // OOB — both differ from the correct '0').
-        assert_eq!(Jitter::random([62, 62]).as_str(), "00", "byte 62 wraps mod-62 to '0'");
+        assert_eq!(
+            Jitter::random([62, 62]).as_str(),
+            "00",
+            "byte 62 wraps mod-62 to '0'"
+        );
         // 61 → 'z' (the last digit), 1 → '1'.
         assert_eq!(Jitter::random([61, 1]).as_str(), "z1");
         // 124 == 2*62 → 0 → '0' (mod again).
-        assert_eq!(Jitter::random([124, 63]).as_str(), "01", "124%62=0 → '0', 63%62=1 → '1'");
+        assert_eq!(
+            Jitter::random([124, 63]).as_str(),
+            "01",
+            "124%62=0 → '0', 63%62=1 → '1'"
+        );
         // Every possible byte maps in-alphabet (no panic, always two valid digits).
         for b in 0u8..=255 {
             let j = Jitter::random([b, b]);
@@ -594,7 +666,11 @@ mod tests {
     /// **`Jitter::as_str` returns the exact two-digit suffix** (kills the `""`/`"xyzzy"` mutants).
     #[test]
     fn jitter_as_str_is_exact() {
-        assert_eq!(Jitter::from_ranks(36, 10).unwrap().as_str(), "aA", "rank 36='a', 10='A'");
+        assert_eq!(
+            Jitter::from_ranks(36, 10).unwrap().as_str(),
+            "aA",
+            "rank 36='a', 10='A'"
+        );
         assert_eq!(Jitter::ZERO.as_str(), "00", "the ZERO jitter is '00'");
     }
 
@@ -615,7 +691,10 @@ mod tests {
         );
         // The body order (F.. < U.. < k..) dominates the jitter — a < b even though a has the
         // higher jitter (a `with_jitter` that mis-ordered would fail here).
-        assert!(a < b, "the midpoint body dominates the jitter suffix: {a} < {b}");
+        assert!(
+            a < b,
+            "the midpoint body dominates the jitter suffix: {a} < {b}"
+        );
     }
 
     /// **`rank_last(None, …)` == `rank_first(…)`** (an empty list's last is its first) and
@@ -630,14 +709,20 @@ mod tests {
         );
         let a = OrderKey::parse("U00").unwrap();
         let last = OrderKey::rank_last(Some(&a), j);
-        assert!(a < last, "rank_last lands strictly after the prior tail: {a} < {last}");
+        assert!(
+            a < last,
+            "rank_last lands strictly after the prior tail: {a} < {last}"
+        );
     }
 
     /// **`rank_first` anchors at the frozen `"U"` body + the jitter** (kills the `rank_first` Default
     /// mutant and pins the initial-spacing constant).
     #[test]
     fn rank_first_anchors_at_u() {
-        assert_eq!(LEXORANK_FIRST, "U", "the frozen initial-spacing anchor is 'U'");
+        assert_eq!(
+            LEXORANK_FIRST, "U",
+            "the frozen initial-spacing anchor is 'U'"
+        );
         let k = OrderKey::rank_first(Jitter::from_ranks(0, 0).unwrap());
         assert_eq!(k.as_str(), "U00", "rank_first == 'U' ++ jitter");
         assert_eq!(&k.as_str()[..1], "U", "the body is the 'U' anchor");
@@ -654,7 +739,10 @@ mod tests {
     /// out-of-bounds — so the assertion below kills both without needing to reach the dead branch.
     #[test]
     fn base_midpoint_fallback_is_alphabet_centre() {
-        assert_eq!(BASE_MIDPOINT, 31, "BASE/2 == 31 (the centre of the 62-digit alphabet)");
+        assert_eq!(
+            BASE_MIDPOINT, 31,
+            "BASE/2 == 31 (the centre of the 62-digit alphabet)"
+        );
         assert_eq!(digit(BASE_MIDPOINT), b'V', "the centre digit is 'V'");
     }
 
@@ -664,9 +752,18 @@ mod tests {
     fn needs_rebalance_key_mirrors_method() {
         let short = OrderKey::parse("V").unwrap();
         let long = OrderKey::parse("V".repeat(LEXORANK_REBALANCE_LEN)).unwrap();
-        assert!(!OrderKey::needs_rebalance_key(&short), "short key does not need rebalance");
-        assert!(OrderKey::needs_rebalance_key(&long), "a 48-char key needs rebalance");
-        assert_eq!(OrderKey::needs_rebalance_key(&short), short.needs_rebalance());
+        assert!(
+            !OrderKey::needs_rebalance_key(&short),
+            "short key does not need rebalance"
+        );
+        assert!(
+            OrderKey::needs_rebalance_key(&long),
+            "a 48-char key needs rebalance"
+        );
+        assert_eq!(
+            OrderKey::needs_rebalance_key(&short),
+            short.needs_rebalance()
+        );
         assert_eq!(OrderKey::needs_rebalance_key(&long), long.needs_rebalance());
     }
 }

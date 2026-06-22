@@ -92,7 +92,12 @@ fn pr_root(tenant: &str, repo: &str, pr_number: u64) -> Result<ArtifactRef, Pars
 /// PR/commit/repo roots are unaffected (they carry no path). The GIT-P24 resolver decodes it back to
 /// the on-disk path. Escalation note: if a later prompt prefers a different blob-id encoding, it is a
 /// git-local change (Refs' grammar is untouched). Logged in the GIT-P4 report.
-fn blob_root(tenant: &str, repo: &str, git_ref: &str, path: &str) -> Result<ArtifactRef, ParseError> {
+fn blob_root(
+    tenant: &str,
+    repo: &str,
+    git_ref: &str,
+    path: &str,
+) -> Result<ArtifactRef, ParseError> {
     let encoded_path = encode_path_segment(path);
     myelin_refs::parse(&format!(
         "myelin://{tenant}/git/blob/{repo}:{git_ref}:{encoded_path}"

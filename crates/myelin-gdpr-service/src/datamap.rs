@@ -75,8 +75,8 @@
 //! unviable (non-compiling) — a 100% catch rate on the viable mutants of the generator + coverage +
 //! grouping core. No survivor (EI-01 §3 — stated, not hidden).
 
-use myelin_gdpr::{HasPersonalData, PersonalDataField};
 use myelin_gdpr::{dpia_markers_of, DpiaMarker};
+use myelin_gdpr::{HasPersonalData, PersonalDataField};
 use myelin_substrate::{Holder, HolderRegistration};
 use myelin_tenancy::Region;
 use serde::{Deserialize, Serialize};
@@ -388,7 +388,10 @@ impl ProcessingActivities {
 /// projection is over it (the per-tenant FILTER over a multi-tenant store is the live-OLTP floor
 /// named in the module doc — the SHAPE `ropa(tenant)` is frozen now, the `tenant` partition is
 /// threaded). Delegates to the pure [`ropa`] projection.
-pub fn ropa_for_tenant(_tenant: &myelin_tenancy::TenantId, inventory: &Inventory) -> ProcessingActivities {
+pub fn ropa_for_tenant(
+    _tenant: &myelin_tenancy::TenantId,
+    inventory: &Inventory,
+) -> ProcessingActivities {
     ropa(inventory)
 }
 
@@ -411,7 +414,9 @@ pub fn ropa(inventory: &Inventory) -> ProcessingActivities {
     let mut groups: BTreeMap<(String, String), Acc> = BTreeMap::new();
 
     for e in &inventory.entries {
-        let acc = groups.entry((e.role.clone(), e.category.clone())).or_default();
+        let acc = groups
+            .entry((e.role.clone(), e.category.clone()))
+            .or_default();
         acc.field_paths.insert(e.field_path.clone());
         acc.lawful_bases.insert(e.basis.clone());
         acc.retentions.insert(e.retention.clone());
@@ -490,7 +495,10 @@ mod tests {
 
     fn principal_schema() -> HolderSchema {
         HolderSchema::from_schema::<PrincipalRow>(
-            HolderRegistration { kind: StoreKind::Oltp, name: "identity_oltp" },
+            HolderRegistration {
+                kind: StoreKind::Oltp,
+                name: "identity_oltp",
+            },
             Holder::H15Identity,
             region(),
         )
@@ -498,7 +506,10 @@ mod tests {
 
     fn index_schema() -> HolderSchema {
         HolderSchema::from_schema::<OpaqueIndexRow>(
-            HolderRegistration { kind: StoreKind::SearchIndex, name: "search_index" },
+            HolderRegistration {
+                kind: StoreKind::SearchIndex,
+                name: "search_index",
+            },
             Holder::H7SearchIndex,
             region(),
         )
@@ -515,7 +526,11 @@ mod tests {
 
         // 0 fields absent: the entry count equals the tagged-field count, field-for-field.
         assert_eq!(inv.entry_count(), tagged_field_count(&holders));
-        assert_eq!(inv.entry_count(), 2, "PrincipalRow has 2 tagged fields; OpaqueIndexRow has 0");
+        assert_eq!(
+            inv.entry_count(),
+            2,
+            "PrincipalRow has 2 tagged fields; OpaqueIndexRow has 0"
+        );
 
         // The email entry carries every fact.
         let email = inv
@@ -538,7 +553,11 @@ mod tests {
             field_path: "PrincipalRow.health_note".into(),
             special_category_kind: "health".into(),
         }));
-        assert_eq!(inv.dpia_markers.len(), 1, "exactly the one special-category field");
+        assert_eq!(
+            inv.dpia_markers.len(),
+            1,
+            "exactly the one special-category field"
+        );
     }
 
     /// **The holder-coverage GATE (gdpr §2.2 — 0 holders absent from the map).** Every REGISTERED
@@ -556,8 +575,14 @@ mod tests {
 
         // The coverage gate is GREEN over exactly the holders that contributed.
         let registered = [
-            HolderRegistration { kind: StoreKind::Oltp, name: "identity_oltp" },
-            HolderRegistration { kind: StoreKind::SearchIndex, name: "search_index" },
+            HolderRegistration {
+                kind: StoreKind::Oltp,
+                name: "identity_oltp",
+            },
+            HolderRegistration {
+                kind: StoreKind::SearchIndex,
+                name: "search_index",
+            },
         ];
         assert!(
             inv.coverage_gaps(&registered).is_empty(),
@@ -576,8 +601,14 @@ mod tests {
         let inv = data_map(&[principal_schema()]);
         // …but the harness ALSO opened a CI store (registered) that never contributed to the map.
         let registered = [
-            HolderRegistration { kind: StoreKind::Oltp, name: "identity_oltp" },
-            HolderRegistration { kind: StoreKind::Oltp, name: "ci_oltp" }, // absent from the map!
+            HolderRegistration {
+                kind: StoreKind::Oltp,
+                name: "identity_oltp",
+            },
+            HolderRegistration {
+                kind: StoreKind::Oltp,
+                name: "ci_oltp",
+            }, // absent from the map!
         ];
         let gaps = inv.coverage_gaps(&registered);
         assert_eq!(
@@ -596,12 +627,20 @@ mod tests {
         // Reverse the holder registration order — the map (sorted entries + roster) is identical.
         let b = data_map(&[index_schema(), principal_schema()]);
         assert_eq!(a, b, "the map is order-independent (sorted)");
-        assert_eq!(a.fingerprint(), b.fingerprint(), "the fingerprint is deterministic");
+        assert_eq!(
+            a.fingerprint(),
+            b.fingerprint(),
+            "the fingerprint is deterministic"
+        );
         assert!(a.fingerprint().starts_with("blake3:"));
 
         // A CHANGED map (an added holder) has a DIFFERENT fingerprint — the diff gate fires.
         let c = data_map(&[principal_schema()]);
-        assert_ne!(a.fingerprint(), c.fingerprint(), "a changed inventory diffs");
+        assert_ne!(
+            a.fingerprint(),
+            c.fingerprint(),
+            "a changed inventory diffs"
+        );
     }
 
     /// **The RoPA projection groups by processing activity** (Art. 30; gdpr §2.2). The `(role,
@@ -627,14 +666,20 @@ mod tests {
         assert_eq!(contact.field_paths, vec!["PrincipalRow.email".to_string()]);
         assert_eq!(contact.lawful_bases, vec!["Contract".to_string()]);
         assert_eq!(contact.regions, vec!["fr-par".to_string()]);
-        assert!(!contact.special_category, "ContactInfo is not special-category");
+        assert!(
+            !contact.special_category,
+            "ContactInfo is not special-category"
+        );
 
         let health = activities
             .activities
             .iter()
             .find(|a| a.category.starts_with("SpecialCategory"))
             .expect("the special-category activity");
-        assert!(health.special_category, "the Art. 9 activity is flagged special-category");
+        assert!(
+            health.special_category,
+            "the Art. 9 activity is flagged special-category"
+        );
         assert_eq!(health.lawful_bases, vec!["Consent(c-1)".to_string()]);
     }
 
@@ -657,7 +702,10 @@ mod tests {
             phone: String,
         }
         let other = HolderSchema::from_schema::<OtherContact>(
-            HolderRegistration { kind: StoreKind::Oltp, name: "billing_oltp" },
+            HolderRegistration {
+                kind: StoreKind::Oltp,
+                name: "billing_oltp",
+            },
             Holder::H18GdprOwn,
             region(),
         );
@@ -672,7 +720,10 @@ mod tests {
         // BOTH ContactInfo fields collapse into the one activity.
         assert_eq!(
             contact.field_paths,
-            vec!["OtherContact.phone".to_string(), "PrincipalRow.email".to_string()]
+            vec![
+                "OtherContact.phone".to_string(),
+                "PrincipalRow.email".to_string()
+            ]
         );
         // The same basis from two fields deduplicates to one entry.
         assert_eq!(contact.lawful_bases, vec!["Contract".to_string()]);
@@ -722,8 +773,7 @@ mod tests {
     #[test]
     fn inventory_and_ropa_round_trip_serialize() {
         let inv = data_map(&[principal_schema(), index_schema()]);
-        let back: Inventory =
-            serde_json::from_str(&serde_json::to_string(&inv).unwrap()).unwrap();
+        let back: Inventory = serde_json::from_str(&serde_json::to_string(&inv).unwrap()).unwrap();
         assert_eq!(back, inv);
 
         let acts = ropa(&inv);
@@ -750,10 +800,16 @@ mod tests {
         assert_eq!(inv.holder_count(), 0);
         assert!(inv.coverage_gaps(&[]).is_empty());
         let acts = ropa(&inv);
-        assert!(acts.is_empty(), "an empty inventory projects to no activity");
+        assert!(
+            acts.is_empty(),
+            "an empty inventory projects to no activity"
+        );
         assert_eq!(acts.len(), 0);
         // A populated inventory is NOT empty (kills the `is_empty -> true` mutant).
         let populated = ropa(&data_map(&[principal_schema()]));
-        assert!(!populated.is_empty(), "a populated inventory has activities");
+        assert!(
+            !populated.is_empty(),
+            "a populated inventory has activities"
+        );
     }
 }

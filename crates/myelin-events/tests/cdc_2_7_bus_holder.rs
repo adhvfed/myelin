@@ -17,12 +17,12 @@
 //! reconciles row 2.7 `covered`. (Rows 10.1/11.3/11.4 are CONSUMED — the Bus calls them; their
 //! OWNED CDC pairs live in `myelin-gdpr` / `myelin-storage`.)
 
+use myelin_events::{Actor, AggregateKey, EmitContext, EventId};
 use myelin_events::{
     ArtifactRef, BusEventLog, BusHolder, DataRole, EraseReceipt, EventDraft, EventType, IdMinter,
     InMemoryShredder, InlinePiiShredder, MonotonicMinter, OutboxStore, PiiKeyRef, Timestamp,
     Visibility,
 };
-use myelin_events::{Actor, AggregateKey, EmitContext, EventId};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_tenancy::{Region, TenantId};
 use std::sync::Arc;
@@ -50,7 +50,11 @@ fn inline_pii_event(event_id: &str, subject: &str) -> myelin_events::EventEnvelo
         event_id: EventId(event_id.into()),
         tenant: tenant(),
         region: region(),
-        actor: Actor(Principal::stub(PrincipalId(subject.into()), PrincipalKind::Human, tenant())),
+        actor: Actor(Principal::stub(
+            PrincipalId(subject.into()),
+            PrincipalKind::Human,
+            tenant(),
+        )),
         schema_ver: 1,
         occurred_at: Timestamp("2026-06-19T00:00:00Z".into()),
         recorded_at: Timestamp("2026-06-19T00:00:00Z".into()),
@@ -73,8 +77,14 @@ fn provider_erase(subject: &str) -> (EraseReceipt, InMemoryShredder, PiiKeyRef) 
     let holder = BusHolder::new(tenant(), region(), shredder.clone());
     let mut outbox = OutboxStore::new();
     let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
-    let receipt = holder.erase(subject, &mut log, &mut outbox, minter).expect("provider erase");
-    assert_eq!(outbox.committed_count(), 1, "provider emitted the tombstone via the outbox");
+    let receipt = holder
+        .erase(subject, &mut log, &mut outbox, minter)
+        .expect("provider erase");
+    assert_eq!(
+        outbox.committed_count(),
+        1,
+        "provider emitted the tombstone via the outbox"
+    );
     (receipt, shredder, key)
 }
 
@@ -88,9 +98,18 @@ fn cdc_2_7_provider_crypto_shred_consumer_reads_zero_recoverable_receipt() {
 
     // CONSUMER (the DSR orchestrator, 10.1): reads the receipt + verifies the crypto-shred is real.
     assert_eq!(receipt.subject, "u42");
-    assert_eq!(receipt.recoverable_remaining, 0, "consumer requires 0 recoverable inline-PII");
+    assert_eq!(
+        receipt.recoverable_remaining, 0,
+        "consumer requires 0 recoverable inline-PII"
+    );
     assert_eq!(receipt.keys_shredded, 1);
-    assert!(receipt.tombstones_emitted >= 1, "consumer requires the tombstone present");
+    assert!(
+        receipt.tombstones_emitted >= 1,
+        "consumer requires the tombstone present"
+    );
     // The crypto-shred is REAL: the consumer confirms the DEK no longer resolves.
-    assert!(!shredder.is_live(&key), "consumer confirms the per-subject DEK is crypto-shredded");
+    assert!(
+        !shredder.is_live(&key),
+        "consumer confirms the per-subject DEK is crypto-shredded"
+    );
 }

@@ -36,7 +36,10 @@ async fn flow_d5_journal_and_outbox_co_commit_atomically_in_one_pg_transaction()
     let cfg = MyelinConfig::dev();
     let admin = sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)
-        .connect(&cfg.database_url.replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw"))
+        .connect(
+            &cfg.database_url
+                .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw"),
+        )
         .await
         .expect("connect as admin to dev Postgres (is the stack up?)");
 
@@ -51,9 +54,15 @@ async fn flow_d5_journal_and_outbox_co_commit_atomically_in_one_pg_transaction()
     let outbox_create = OUTBOX_MIGRATION.replace("outbox", &outbox_tbl);
 
     for tbl in [&hist_tbl, &outbox_tbl] {
-        sqlx::query(&format!("DROP TABLE IF EXISTS {tbl}")).execute(&admin).await.unwrap();
+        sqlx::query(&format!("DROP TABLE IF EXISTS {tbl}"))
+            .execute(&admin)
+            .await
+            .unwrap();
     }
-    sqlx::query(&hist_create).execute(&admin).await.expect("the wf_history DDL applies");
+    sqlx::query(&hist_create)
+        .execute(&admin)
+        .await
+        .expect("the wf_history DDL applies");
     // The outbox migration is a MULTI-statement DDL (CREATE TABLE + the unsent-row index + a
     // line comment); a prepared statement runs ONE command, so split on `;` and run each (skipping
     // blank/comment-only fragments). This applies the REAL frozen 2.3 outbox shape.
@@ -66,7 +75,10 @@ async fn flow_d5_journal_and_outbox_co_commit_atomically_in_one_pg_transaction()
         if s.trim().is_empty() {
             continue;
         }
-        sqlx::query(&s).execute(&admin).await.expect("the outbox DDL statement applies");
+        sqlx::query(&s)
+            .execute(&admin)
+            .await
+            .expect("the outbox DDL statement applies");
     }
 
     let count = |pool: sqlx::PgPool, tbl: String| async move {
@@ -95,10 +107,20 @@ async fn flow_d5_journal_and_outbox_co_commit_atomically_in_one_pg_transaction()
         .execute(&mut *tx)
         .await
         .expect("emit the outbox row in the SAME txn");
-        tx.commit().await.expect("co-commit: journal + outbox become durable together");
+        tx.commit()
+            .await
+            .expect("co-commit: journal + outbox become durable together");
     }
-    assert_eq!(count(admin.clone(), hist_tbl.clone()).await, 1, "one journal row durable");
-    assert_eq!(count(admin.clone(), outbox_tbl.clone()).await, 1, "one outbox row durable");
+    assert_eq!(
+        count(admin.clone(), hist_tbl.clone()).await,
+        1,
+        "one journal row durable"
+    );
+    assert_eq!(
+        count(admin.clone(), outbox_tbl.clone()).await,
+        1,
+        "one outbox row durable"
+    );
 
     // (2) The CRASH PATH (FLOW-D5): a transaction journals a SECOND step's history row AND emits
     //     its outbox row, then ROLLS BACK (the crash between journal and emit). NEITHER persists —
@@ -120,7 +142,9 @@ async fn flow_d5_journal_and_outbox_co_commit_atomically_in_one_pg_transaction()
         .await
         .expect("emit the second step in the SAME txn");
         // CRASH: roll back instead of commit — the crash between journal and emit durability.
-        tx.rollback().await.expect("the crash transaction rolls back");
+        tx.rollback()
+            .await
+            .expect("the crash transaction rolls back");
     }
     assert_eq!(
         count(admin.clone(), hist_tbl.clone()).await,
@@ -148,7 +172,10 @@ async fn flow_d5_journal_and_outbox_co_commit_atomically_in_one_pg_transaction()
 
     // cleanup
     for tbl in [&hist_tbl, &outbox_tbl] {
-        sqlx::query(&format!("DROP TABLE IF EXISTS {tbl}")).execute(&admin).await.unwrap();
+        sqlx::query(&format!("DROP TABLE IF EXISTS {tbl}"))
+            .execute(&admin)
+            .await
+            .unwrap();
     }
     println!(
         "[2026-06-21] PASS  drill=FLOW-D5(live-PG)  co_commit=atomic  ghost=0 lost=0  journal_rows=1 outbox_rows=1  (real Postgres txn)"

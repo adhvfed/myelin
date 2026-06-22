@@ -538,7 +538,10 @@ mod tests {
         let other = t("globex");
         restrict.set(&a, &acme, true);
         assert!(restrict.is_restricted(&a, &acme));
-        assert!(!restrict.is_restricted(&b, &acme), "a different subject is not restricted");
+        assert!(
+            !restrict.is_restricted(&b, &acme),
+            "a different subject is not restricted"
+        );
         assert!(
             !restrict.is_restricted(&a, &other),
             "the same subject id in a different tenant is not restricted (tenant-partitioned)"
@@ -574,7 +577,10 @@ mod tests {
             "the per-subject DEK shred renders the self-authored free-text unrecoverable"
         );
         // 0 recoverable in the backup snapshot (§7.5).
-        assert_eq!(kms.recoverable_in_backup(&M1Store::dek_handle(&subj, &tenant)), 0);
+        assert_eq!(
+            kms.recoverable_in_backup(&M1Store::dek_handle(&subj, &tenant)),
+            0
+        );
 
         // A processing op over erased content is Unrecoverable (there is nothing to process — and it
         // is NOT a reversible Suppressed; the distinction is load-bearing).
@@ -582,7 +588,10 @@ mod tests {
 
         // Idempotent re-erase: the DEK is already gone → None destroyed, still unrecoverable.
         assert_eq!(store.erase_self_authored(&subj, &tenant), None);
-        assert_eq!(store.fetch_stored(&subj, &tenant), Some(StoredContent::Unrecoverable));
+        assert_eq!(
+            store.fetch_stored(&subj, &tenant),
+            Some(StoredContent::Unrecoverable)
+        );
     }
 
     // ───────── lever 2: pseudonym-map shred leaves only <pseudonym>@<tenant>.noreply ─────────
@@ -643,7 +652,10 @@ mod tests {
         );
         // Erasing A's DEK leaves B's content recoverable (per-subject DEK isolation).
         assert_eq!(store.erase_self_authored(&a, &tenant), Some(1));
-        assert_eq!(store.fetch_stored(&a, &tenant), Some(StoredContent::Unrecoverable));
+        assert_eq!(
+            store.fetch_stored(&a, &tenant),
+            Some(StoredContent::Unrecoverable)
+        );
         assert_eq!(
             store.fetch_stored(&b, &tenant),
             Some(StoredContent::Recoverable("bob content".into())),
@@ -746,7 +758,10 @@ mod tests {
         // carries the op token + the holder id (pins `M1Store::id` against a `-> ""` mutant).
         match store.index(&subj, &tenant) {
             Processed::Processed(out) => {
-                assert!(out.starts_with("index:s:"), "the processed projection names op + holder id");
+                assert!(
+                    out.starts_with("index:s:"),
+                    "the processed projection names op + holder id"
+                );
             }
             other => panic!("expected Processed, got {other:?}"),
         }

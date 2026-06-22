@@ -26,8 +26,8 @@ use myelin_knowledge::search_feed::{
 };
 use myelin_query::{CmpOp, Expr, FieldType, FieldValue, OrderKey, Predicate, QueryAst};
 use myelin_search::{
-    ConsistencyStats, EmbeddingAdapter, FieldDecl, FieldSchema, IndexBackend, IndexDocument,
-    IndexSpec, IncrementalIndexer, ListObjectsPort, MockEmbeddingAdapter, Page, QueryStats,
+    ConsistencyStats, EmbeddingAdapter, FieldDecl, FieldSchema, IncrementalIndexer, IndexBackend,
+    IndexDocument, IndexSpec, ListObjectsPort, MockEmbeddingAdapter, Page, QueryStats,
     ScopedEngine, TantivyBackend, VectorQuery, FT_BODY_FIELD, ORDER_KEY_FIELD, SEMANTIC_FIELD,
 };
 use myelin_tenancy::TenantId;
@@ -37,11 +37,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 // ─────────────────────────── shared fixtures ───────────────────────────
 
 fn viewer() -> Principal {
-    Principal::stub(PrincipalId("p:alice".into()), PrincipalKind::Human, TenantId("acme".into()))
+    Principal::stub(
+        PrincipalId("p:alice".into()),
+        PrincipalKind::Human,
+        TenantId("acme".into()),
+    )
 }
 
 fn consistency() -> Consistency {
-    Consistency { at_least: Zookie("z0".into()), mode: ConsistencyMode::BoundedStale }
+    Consistency {
+        at_least: Zookie("z0".into()),
+        mode: ConsistencyMode::BoundedStale,
+    }
 }
 
 fn ast_body(term: &str) -> QueryAst {
@@ -113,10 +120,19 @@ fn schema() -> FieldSchema {
 fn provider_knowledge_declares_its_index_specs() {
     let specs: Vec<IndexSpec> = kn_declared_index_specs();
     assert_eq!(specs.len(), 2, "exactly the page + db_row spec TYPES");
-    assert!(specs.iter().any(|s| s.type_ == "page" && s.semantic), "the semantic page doc");
-    assert!(specs.iter().any(|s| s.type_ == "db_row" && !s.semantic), "the non-semantic db_row doc");
+    assert!(
+        specs.iter().any(|s| s.type_ == "page" && s.semantic),
+        "the semantic page doc"
+    );
+    assert!(
+        specs.iter().any(|s| s.type_ == "db_row" && !s.semantic),
+        "the non-semantic db_row doc"
+    );
     for s in &specs {
-        assert_eq!(s.subsystem, "knowledge", "owned under the knowledge subsystem token");
+        assert_eq!(
+            s.subsystem, "knowledge",
+            "owned under the knowledge subsystem token"
+        );
     }
 }
 
@@ -125,7 +141,11 @@ fn provider_knowledge_declares_its_index_specs() {
 #[test]
 fn consumer_search_admits_the_declared_specs() {
     let accepted = register_kn_index_specs();
-    assert_eq!(accepted, kn_declared_index_specs(), "Search admits exactly the declared KN specs");
+    assert_eq!(
+        accepted,
+        kn_declared_index_specs(),
+        "Search admits exactly the declared KN specs"
+    );
     // And a live indexer over the owned set opens (the facet union is consistent across the specs).
     let _ix = IncrementalIndexer::new(
         kn_declared_index_specs(),
@@ -165,8 +185,14 @@ fn kn_page_corpus() -> TantivyBackend {
         }
         be.upsert(&d).unwrap();
     };
-    upsert("myelin://acme/knowledge/page/PUB-1", "deadlock in the scheduler runbook");
-    upsert("myelin://acme/knowledge/page/SECRET-9", "deadlock secret incident postmortem");
+    upsert(
+        "myelin://acme/knowledge/page/PUB-1",
+        "deadlock in the scheduler runbook",
+    );
+    upsert(
+        "myelin://acme/knowledge/page/SECRET-9",
+        "deadlock secret incident postmortem",
+    );
     be
 }
 
@@ -179,12 +205,32 @@ fn consumer_knowledge_query_conjoins_filter_no_count_leak() {
     let eng = ScopedEngine::new(&be, "acme", "eu-west", schema());
     let unauth = FakeAuthz::ids(&["myelin://acme/knowledge/page/PUB-1"]);
     let stats = QueryStats::new();
-    let res = kn_search_query(&eng, &unauth, &ast_body("deadlock"), &viewer(), &consistency(), Page::FIRST, &stats)
-        .expect("query");
+    let res = kn_search_query(
+        &eng,
+        &unauth,
+        &ast_body("deadlock"),
+        &viewer(),
+        &consistency(),
+        Page::FIRST,
+        &stats,
+    )
+    .expect("query");
     let ids: Vec<&str> = res.hits.iter().map(|h| h.doc_id.as_str()).collect();
-    assert_eq!(ids, ["myelin://acme/knowledge/page/PUB-1"], "the confidential page is pre-filtered out");
-    assert_eq!(res.hits.len(), 1, "the COUNT reveals neither the existence nor the number of forbidden pages");
-    assert_eq!(unauth.calls.load(Ordering::Relaxed), 1, "exactly ONE list_objects (no N+1)");
+    assert_eq!(
+        ids,
+        ["myelin://acme/knowledge/page/PUB-1"],
+        "the confidential page is pre-filtered out"
+    );
+    assert_eq!(
+        res.hits.len(),
+        1,
+        "the COUNT reveals neither the existence nor the number of forbidden pages"
+    );
+    assert_eq!(
+        unauth.calls.load(Ordering::Relaxed),
+        1,
+        "exactly ONE list_objects (no N+1)"
+    );
 }
 
 /// **CONSUMER (6.2) — Knowledge drives `semantic`/RAG with the conjoin; the PROVIDER returns k
@@ -202,11 +248,20 @@ fn consumer_knowledge_semantic_conjoins_filter() {
             .with_embedding(v, embedder.model_ref());
         be.upsert(&d).unwrap();
     };
-    emb("myelin://acme/knowledge/page/PUB-1", "deadlock in the scheduler runbook");
-    emb("myelin://acme/knowledge/page/SECRET-9", "deadlock secret ops postmortem");
+    emb(
+        "myelin://acme/knowledge/page/PUB-1",
+        "deadlock in the scheduler runbook",
+    );
+    emb(
+        "myelin://acme/knowledge/page/SECRET-9",
+        "deadlock secret ops postmortem",
+    );
 
     let eng = ScopedEngine::new(&be, "acme", "eu-west", schema());
-    let vq = VectorQuery::Text { text: "deadlock secret ops postmortem".into(), embedder: &embedder };
+    let vq = VectorQuery::Text {
+        text: "deadlock secret ops postmortem".into(),
+        embedder: &embedder,
+    };
     let unauth = FakeAuthz::ids(&["myelin://acme/knowledge/page/PUB-1"]);
     let stats = QueryStats::new();
     let cstats = ConsistencyStats::new();
@@ -222,12 +277,17 @@ fn consumer_knowledge_semantic_conjoins_filter() {
         &cstats,
     )
     .expect("semantic");
-    let ids: std::collections::BTreeSet<&str> = res.hits.iter().map(|h| h.doc_id.as_str()).collect();
+    let ids: std::collections::BTreeSet<&str> =
+        res.hits.iter().map(|h| h.doc_id.as_str()).collect();
     assert!(
         !ids.contains("myelin://acme/knowledge/page/SECRET-9"),
         "the confidential page never surfaces through the semantic/RAG path (KN-D5: 0 leak)"
     );
-    assert_eq!(stats.list_objects_calls(), 1, "exactly ONE list_objects (no N+1 on the semantic path)");
+    assert_eq!(
+        stats.list_objects_calls(),
+        1,
+        "exactly ONE list_objects (no N+1 on the semantic path)"
+    );
 }
 
 /// **The CONSUMER pins the conjoin to the agreed (object-type, permission) the PROVIDER expects.**

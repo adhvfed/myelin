@@ -73,7 +73,9 @@ fn real_kn_page_body_extracts_one_edge_per_structured_ref_node() {
 
     // A page body: "See ENG-12 and the other page. /cc @alice" — structured nodes (not prose).
     let body = vec![
-        InlineNode::Embed(ArtifactRef("myelin://acme-eu/knowledge/page/sibling".into())),
+        InlineNode::Embed(ArtifactRef(
+            "myelin://acme-eu/knowledge/page/sibling".into(),
+        )),
         InlineNode::ArtifactRefNode(ArtifactRef("myelin://acme-eu/issue/issue/ENG-12".into())),
         InlineNode::Mention(viewer("alice", &tenant())),
     ];
@@ -207,7 +209,9 @@ fn kn_heading_row_field_anchors_degrade_through_the_ladder() {
     owner.record_anchor(&field, KnAnchorState::Live);
 
     match resolve_sub_outcome(&owner, &heading) {
-        ProjectOutcome::Live(p) => assert_eq!(p.flag, Some(crate::resolve::ProjectionFlag::Outdated)),
+        ProjectOutcome::Live(p) => {
+            assert_eq!(p.flag, Some(crate::resolve::ProjectionFlag::Outdated))
+        }
         other => panic!("edited heading → OUTDATED, got {other:?}"),
     }
     assert_eq!(resolve_sub_outcome(&owner, &row), ProjectOutcome::SubGone);
@@ -309,7 +313,11 @@ fn ref_d2_cross_tenant_kn_backlink_read_returns_nothing() {
             10,
         )
         .expect("backlink read");
-    assert_eq!(result_page.edges.len(), 0, "no cross-tenant KN backlink is visible (REF-D2)");
+    assert_eq!(
+        result_page.edges.len(),
+        0,
+        "no cross-tenant KN backlink is visible (REF-D2)"
+    );
 }
 
 /// **The KN ReBAC fragment flows through `list_objects` (4.9 / REF-P249): a viewer outside the
@@ -323,7 +331,10 @@ fn kn_fragment_flows_through_list_objects_leak_free() {
     let edges = EdgeProjection::new();
     // Two KN pages embed a shared page. page-public is readable; page-secret is not.
     let target = "myelin://acme-eu/knowledge/page/shared";
-    for page in ["myelin://acme-eu/knowledge/page/public", "myelin://acme-eu/knowledge/page/secret"] {
+    for page in [
+        "myelin://acme-eu/knowledge/page/public",
+        "myelin://acme-eu/knowledge/page/secret",
+    ] {
         let id = edge_id(&t, page, target, "embeds");
         edges.upsert(
             &t,
@@ -346,14 +357,31 @@ fn kn_fragment_flows_through_list_objects_leak_free() {
     let read = BacklinkRead::new(edges, AuthzVisibleIndex::new());
     let v = viewer("reader", &t);
     let allowed = ListObjectsResult::Ids {
-        ids: vec![myelin_identity::ObjectId("myelin://acme-eu/knowledge/page/public".into())],
+        ids: vec![myelin_identity::ObjectId(
+            "myelin://acme-eu/knowledge/page/public".into(),
+        )],
         zookie: myelin_identity::Zookie("zk-1".into()),
     };
     let page = read
-        .backlinks(&t, &region(), &ArtifactRef(target.into()), &v, &allowed, &bounded_stale(), 10)
+        .backlinks(
+            &t,
+            &region(),
+            &ArtifactRef(target.into()),
+            &v,
+            &allowed,
+            &bounded_stale(),
+            10,
+        )
         .expect("backlink read");
-    assert_eq!(page.edges.len(), 1, "only the page-tree-admitted page is visible");
-    assert_eq!(page.edges[0].source.0, "myelin://acme-eu/knowledge/page/public");
+    assert_eq!(
+        page.edges.len(),
+        1,
+        "only the page-tree-admitted page is visible"
+    );
+    assert_eq!(
+        page.edges[0].source.0,
+        "myelin://acme-eu/knowledge/page/public"
+    );
 }
 
 // ===========================================================================
@@ -382,13 +410,23 @@ fn page_parent_mirror_projects_both_inverse_paired_lifecycle_edges() {
     assert_eq!(rows.len(), 2, "parent + the frozen inverse child edge");
 
     // The forward edge: parent → child, rel = parent, lifecycle-class.
-    let fwd = rows.iter().find(|r| r.rel == "parent").expect("a parent edge");
+    let fwd = rows
+        .iter()
+        .find(|r| r.rel == "parent")
+        .expect("a parent edge");
     assert_eq!(fwd.source.0, "myelin://acme-eu/knowledge/page/root");
     assert_eq!(fwd.target.0, "myelin://acme-eu/knowledge/page/section");
-    assert_eq!(fwd.rel_class, RelClass::Lifecycle, "a mirror edge is ALWAYS lifecycle-class");
+    assert_eq!(
+        fwd.rel_class,
+        RelClass::Lifecycle,
+        "a mirror edge is ALWAYS lifecycle-class"
+    );
 
     // The inverse edge: child → parent, rel = child (the frozen §3.3 inverse direction), lifecycle.
-    let inv = rows.iter().find(|r| r.rel == "child").expect("the inverse child edge");
+    let inv = rows
+        .iter()
+        .find(|r| r.rel == "child")
+        .expect("the inverse child edge");
     assert_eq!(inv.source.0, "myelin://acme-eu/knowledge/page/section");
     assert_eq!(inv.target.0, "myelin://acme-eu/knowledge/page/root");
     assert_eq!(inv.rel_class, RelClass::Lifecycle);
@@ -409,7 +447,10 @@ fn page_parent_mirror_accepts_the_move_reparent_trigger() {
 fn page_parent_mirror_rejects_an_unrecognised_trigger() {
     let ev = page_parent_event("a", "b", "knowledge.page.archived");
     let err = mirror_page_parent(&tenant(), &ev).expect_err("not a re-parent trigger");
-    assert_eq!(err, MirrorError::UnknownRel("knowledge.page.archived".into()));
+    assert_eq!(
+        err,
+        MirrorError::UnknownRel("knowledge.page.archived".into())
+    );
 }
 
 /// **The page_parent mirror is idempotent — a replay is ONE edge pair, not duplicates (5.5).** The
@@ -425,7 +466,11 @@ fn page_parent_mirror_is_idempotent_on_replay() {
     let child = KnEdgeProducer::page_root("acme-eu", "section");
     let inbound = proj.inbound_live(&tenant(), &region(), &child);
     let parent_edges: Vec<_> = inbound.iter().filter(|r| r.rel == "parent").collect();
-    assert_eq!(parent_edges.len(), 1, "idempotent — one parent edge inbound to the child");
+    assert_eq!(
+        parent_edges.len(),
+        1,
+        "idempotent — one parent edge inbound to the child"
+    );
 }
 
 /// **REF-D4 TE-7 half — an out-of-band re-parent + a scoped reindex reconverges to the typed table
@@ -446,11 +491,23 @@ fn page_parent_reconverges_to_the_typed_table_typed_wins() {
     // "new-root". The covered child is the "section" page.
     let truth = page_parent_event("new-root", "section", KNOWLEDGE_PAGE_MOVED);
     let section = KnEdgeProducer::page_root("acme-eu", "section");
-    let (reprojected, tombstoned) =
-        reconverge_page_tree(&proj, &t, &r, &[truth], std::slice::from_ref(&section), "evt-reindex-1")
-            .expect("reconverge");
-    assert_eq!(reprojected, 2, "the typed truth's parent+child pair re-projected");
-    assert!(tombstoned >= 1, "the drifted old-root parent edge is tombstoned (typed wins)");
+    let (reprojected, tombstoned) = reconverge_page_tree(
+        &proj,
+        &t,
+        &r,
+        &[truth],
+        std::slice::from_ref(&section),
+        "evt-reindex-1",
+    )
+    .expect("reconverge");
+    assert_eq!(
+        reprojected, 2,
+        "the typed truth's parent+child pair re-projected"
+    );
+    assert!(
+        tombstoned >= 1,
+        "the drifted old-root parent edge is tombstoned (typed wins)"
+    );
 
     // The live inbound parent of "section" is now EXACTLY new-root (the typed table won).
     let inbound = proj.inbound_live(&t, &r, &section);
@@ -459,7 +516,11 @@ fn page_parent_reconverges_to_the_typed_table_typed_wins() {
         .filter(|r| r.rel == "parent")
         .map(|r| r.source.0.as_str())
         .collect();
-    assert_eq!(parents, vec!["myelin://acme-eu/knowledge/page/new-root"], "typed table wins");
+    assert_eq!(
+        parents,
+        vec!["myelin://acme-eu/knowledge/page/new-root"],
+        "typed table wins"
+    );
 }
 
 /// **reconverge rejects a non-trigger event in the typed snapshot BEFORE mutating the projection
@@ -470,7 +531,10 @@ fn reconverge_rejects_a_non_trigger_snapshot_event() {
     let bad = page_parent_event("a", "b", "knowledge.page.archived");
     let err = reconverge_page_tree(&proj, &tenant(), &region(), &[bad], &[], "evt-x")
         .expect_err("non-trigger snapshot event");
-    assert_eq!(err, MirrorError::UnknownRel("knowledge.page.archived".into()));
+    assert_eq!(
+        err,
+        MirrorError::UnknownRel("knowledge.page.archived".into())
+    );
 }
 
 // ===========================================================================
@@ -482,12 +546,21 @@ fn reconverge_rejects_a_non_trigger_snapshot_event() {
 /// scope the whole page. The selector matches the grain Knowledge's `replay` parses.
 #[test]
 fn kn_replay_scope_is_sub_artifact_granular() {
-    assert_eq!(kn_replay_scope(KnReplayGrain::Page("home".into())), "page:home");
     assert_eq!(
-        kn_replay_scope(KnReplayGrain::Block { page: "home".into(), id: "b7".into() }),
+        kn_replay_scope(KnReplayGrain::Page("home".into())),
+        "page:home"
+    );
+    assert_eq!(
+        kn_replay_scope(KnReplayGrain::Block {
+            page: "home".into(),
+            id: "b7".into()
+        }),
         "block:home/b7"
     );
-    assert_eq!(kn_replay_scope(KnReplayGrain::Subtree("root".into())), "subtree:root");
+    assert_eq!(
+        kn_replay_scope(KnReplayGrain::Subtree("root".into())),
+        "subtree:root"
+    );
     // The grain is the one Knowledge's producer owns (the token, never a literal).
     assert_eq!(KN_OWNER_TOKEN, "knowledge");
 }
@@ -504,8 +577,16 @@ fn ref_d4_kn_corpus_reindex_byte_parity_incl_page_parent_mirror() {
     // A KN corpus: a page embeds a sibling, a block links an issue (reference edges) + a page_parent
     // re-parent (the lifecycle mirror — both inverse directions).
     let ref_corpus = [
-        ("myelin://acme-eu/knowledge/page/a", "myelin://acme-eu/knowledge/page/b", "embeds"),
-        ("myelin://acme-eu/knowledge/block/blk-1", "myelin://acme-eu/issue/issue/ENG-1", "links"),
+        (
+            "myelin://acme-eu/knowledge/page/a",
+            "myelin://acme-eu/knowledge/page/b",
+            "embeds",
+        ),
+        (
+            "myelin://acme-eu/knowledge/block/blk-1",
+            "myelin://acme-eu/issue/issue/ENG-1",
+            "links",
+        ),
     ];
     let parent_ev = page_parent_event("root", "child", KNOWLEDGE_PAGE_CREATED);
 
@@ -567,5 +648,8 @@ fn kn_resolve_service(owner: &KnOwner) -> ResolveService {
 fn kn_block_ref_classifies_through_the_one_grammar() {
     let ref_ = block_ref("design-doc", "b1");
     assert!(sub_kind(&ref_).is_some());
-    assert_eq!(strip_sub(&ref_).0, "myelin://acme-eu/knowledge/page/design-doc");
+    assert_eq!(
+        strip_sub(&ref_).0,
+        "myelin://acme-eu/knowledge/page/design-doc"
+    );
 }

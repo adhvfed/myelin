@@ -101,11 +101,21 @@ fn dsr_orchestrator_fans_locate_and_erase_out_to_the_agent_holders_via_the_contr
 
     // locate: each holder responds with a content-addressed receipt over its (seam) surface.
     let reports = consumer.fan_out_locate(&subj, tenant());
-    assert_eq!(reports.len(), 2, "both Agent-Fabric holders responded to locate via the contract");
+    assert_eq!(
+        reports.len(),
+        2,
+        "both Agent-Fabric holders responded to locate via the contract"
+    );
     for r in &reports {
         assert_eq!(r.receipt.operation, "locate");
-        assert!(r.receipt.content_hash.starts_with("blake3:"), "content-addressed receipt");
-        assert!(r.receipt.key_epoch_destroyed.is_none(), "locate shreds no key");
+        assert!(
+            r.receipt.content_hash.starts_with("blake3:"),
+            "content-addressed receipt"
+        );
+        assert!(
+            r.receipt.key_epoch_destroyed.is_none(),
+            "locate shreds no key"
+        );
     }
 
     // erase: each holder is a well-defined no-op now (the seam) — never a panic.
@@ -113,7 +123,10 @@ fn dsr_orchestrator_fans_locate_and_erase_out_to_the_agent_holders_via_the_contr
         subject: subj.clone(),
         tenant: tenant(),
     });
-    assert_eq!(erased, 2, "both Agent-Fabric holders honoured the erase contract");
+    assert_eq!(
+        erased, 2,
+        "both Agent-Fabric holders honoured the erase contract"
+    );
 }
 
 /// **The provider registers + classifies (contract 1.4 + gdpr §3.2): 0 orphan Fabric stores.** The
@@ -162,7 +175,11 @@ fn an_unregistered_agent_store_fails_the_holder_registered_architecture_test() {
     rogue.open(StoreKind::Oltp, AGENT_OLTP_STORE);
     let err = assert_all_holders_registered(&manifest, &rogue)
         .expect_err("a Fabric store opened outside the harness must FAIL the architecture test");
-    assert_eq!(err.len(), 1, "exactly the unregistered trace store is the violation");
+    assert_eq!(
+        err.len(),
+        1,
+        "exactly the unregistered trace store is the violation"
+    );
     assert!(
         err[0].message().contains(AGENT_TRACE_STORE),
         "the failure names the escaped Fabric store: {}",

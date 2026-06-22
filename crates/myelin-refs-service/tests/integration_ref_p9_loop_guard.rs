@@ -29,8 +29,8 @@
 use myelin_content::InlineNode;
 use myelin_events::{
     Actor, AggregateKey, ArtifactRef, CausedBy, CorrelationId, DataRole, EmitContextBase,
-    EventEnvelope, EventId, EventType, IdMinter, MonotonicMinter, OutboxStore, OUTBOX_MIGRATION,
-    Region, TenantId, Timestamp, Visibility,
+    EventEnvelope, EventId, EventType, IdMinter, MonotonicMinter, OutboxStore, Region, TenantId,
+    Timestamp, Visibility, OUTBOX_MIGRATION,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_refs_service::{GuardDecision, RefsLoopGuard, CAUSAL_DEPTH_CEILING};
@@ -52,7 +52,11 @@ fn region() -> Region {
     Region("fr-par".into())
 }
 fn principal() -> Principal {
-    Principal::stub(PrincipalId("p-opaque-7".into()), PrincipalKind::Human, tenant())
+    Principal::stub(
+        PrincipalId("p-opaque-7".into()),
+        PrincipalKind::Human,
+        tenant(),
+    )
 }
 fn source_doc() -> ArtifactRef {
     ArtifactRef("myelin://tenantA/chat/message/m1".into())
@@ -110,7 +114,10 @@ fn three_node_doc() -> Vec<InlineNode> {
 fn guarded_rows(
     guard: &RefsLoopGuard,
     depth: u32,
-) -> (GuardDecision, Vec<(String, String, String, serde_json::Value)>) {
+) -> (
+    GuardDecision,
+    Vec<(String, String, String, serde_json::Value)>,
+) {
     let store = OutboxStore::new();
     let minter = Arc::new(MonotonicMinter::new()) as Arc<dyn IdMinter>;
     let content = content_event(depth);
@@ -162,10 +169,20 @@ async fn depth_stamp_lands_in_real_outbox_and_ceiling_parks_zero_on_real_postgre
     let outbox_ddl = OUTBOX_MIGRATION
         .replace("EXISTS outbox (", &format!("EXISTS {outbox} ("))
         .replace("ON outbox (", &format!("ON {outbox} ("))
-        .replace("outbox_event_id_unique", &format!("{outbox}_event_id_unique"))
-        .replace("outbox_aggregate_seq_unique", &format!("{outbox}_aggregate_seq_unique"))
+        .replace(
+            "outbox_event_id_unique",
+            &format!("{outbox}_event_id_unique"),
+        )
+        .replace(
+            "outbox_aggregate_seq_unique",
+            &format!("{outbox}_aggregate_seq_unique"),
+        )
         .replace("outbox_unsent_idx", &format!("{outbox}_unsent_idx"));
-    for stmt in outbox_ddl.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+    for stmt in outbox_ddl
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         sqlx::query(stmt)
             .execute(&admin)
             .await
@@ -194,7 +211,13 @@ async fn depth_stamp_lands_in_real_outbox_and_ceiling_parks_zero_on_real_postgre
     let guard = RefsLoopGuard::new();
     let (decision, rows) = guarded_rows(&guard, 3);
     assert!(
-        matches!(decision, GuardDecision::Emitted { stamped_depth: 4, .. }),
+        matches!(
+            decision,
+            GuardDecision::Emitted {
+                stamped_depth: 4,
+                ..
+            }
+        ),
         "below the ceiling → emitted, stamped at content.depth + 1 = 4"
     );
     assert_eq!(rows.len(), 3, "the 3-node document derives 3 edge events");
@@ -217,7 +240,9 @@ async fn depth_stamp_lands_in_real_outbox_and_ceiling_parks_zero_on_real_postgre
             .await
             .expect("emit the stamped edge row into the SAME tx");
     }
-    tx.commit().await.expect("commit the content + stamped edges together");
+    tx.commit()
+        .await
+        .expect("commit the content + stamped edges together");
 
     // Read the stamp BACK from the durable Postgres jsonb: every refs.edge.created carries depth 4.
     let n_at_depth_4: i64 = sqlx::query(&format!(
@@ -253,7 +278,11 @@ async fn depth_stamp_lands_in_real_outbox_and_ceiling_parks_zero_on_real_postgre
         "a content cause at the ceiling parks (the would-be edge is over the bound)"
     );
     assert!(parked_rows.is_empty(), "a parked emit stages 0 edge rows");
-    assert_eq!(guard.ceiling_tripwire_firings(), 1, "the tripwire fired before runaway");
+    assert_eq!(
+        guard.ceiling_tripwire_firings(),
+        1,
+        "the tripwire fired before runaway"
+    );
 
     // Nothing new lands in the real outbox for the parked hop (the chain halted ≤ ceiling).
     let mut tx2 = app.begin().await.expect("begin a parked-hop transaction");
@@ -274,7 +303,9 @@ async fn depth_stamp_lands_in_real_outbox_and_ceiling_parks_zero_on_real_postgre
             .await
             .expect("insert (there are none — parked)");
     }
-    tx2.commit().await.expect("commit the deep content (0 edges)");
+    tx2.commit()
+        .await
+        .expect("commit the deep content (0 edges)");
 
     // Still exactly the 3 stamped edges from step 1 — the parked hop added none (runaway bounded).
     let n_total: i64 = sqlx::query(&format!(
@@ -290,6 +321,12 @@ async fn depth_stamp_lands_in_real_outbox_and_ceiling_parks_zero_on_real_postgre
     );
 
     // Cleanup (a NEW forward operation — test teardown, not a down-migration).
-    sqlx::query(&format!("DROP TABLE {outbox}")).execute(&admin).await.unwrap();
-    sqlx::query(&format!("DROP TABLE {content_tbl}")).execute(&admin).await.unwrap();
+    sqlx::query(&format!("DROP TABLE {outbox}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    sqlx::query(&format!("DROP TABLE {content_tbl}"))
+        .execute(&admin)
+        .await
+        .unwrap();
 }
