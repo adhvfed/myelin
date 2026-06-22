@@ -544,6 +544,37 @@
 //! per-tenant fallback) + [`ci_instance::ci_phase_of`] + [`ci_instance::CiHolderRegistration::register_ci`]
 //! are the behavioral core; the `cargo mutants` score is in the commit body.
 
+//! ## P-GA-31 (→ P-334) — the worklog/productivity Behavioural classification (OQ-H) + the works-council trigger + the SpecialCategory→DPIA route (contract 10.2)
+//! [`worklog`] ships the **OQ-H worklog/productivity/estimate classification** (gdpr §2.4) — the
+//! LAST consumer-classification follow-on, after which **all H1–H18 holders exist** (the GA-D1
+//! precondition → M5 P-GA-32). Four structural parts, three composed from already-shipped seams +
+//! one genuinely new. FIRST, the **restricted-by-default classification is STRUCTURAL** — shipped in
+//! `myelin-gdpr` as the `data_role_default = Restricted` registry tag
+//! ([`myelin_gdpr::PersonalDataField::is_restricted_by_default`]), applied to the Issues
+//! `worklog_seconds` / `story_points` fields; the macro now CAPTURES it (was forward-compat-ignored).
+//! SECOND, **excluded from cross-individual analytics by default** — [`worklog::WorklogAnalyticsGate`]'s
+//! flipped default-DENY (a restricted-by-default field is denied cross-individual analytics/agent-use
+//! UNLESS an explicit per-subject opt-in is recorded; an ordinary field is allowed) — the GA-D7
+//! worklog face. THIRD, **per-individual rollups OFF by default + the works-council consultation
+//! trigger** — [`worklog::RollupEnablement`] (OFF by default; enabling surfaces a
+//! [`worklog::WorksCouncilTrigger`] — a SURFACED obligation, never an auto-decision, §8). FOURTH, the
+//! **SpecialCategory worklog field → DPIA route** — REUSES the [`myelin_gdpr::DpiaRouter`] (P-GA-08)
+//! verbatim. Plus the **build-data-as-LLM-training foreclosure** ([`worklog::BUILD_TRAINING_FORECLOSURE`]
+//! and the architecture test `worklog::tests::build_data_as_llm_training_has_no_code_path` — the
+//! foreclosure is the ABSENCE of a training-feed surface). **Floors named:** the worklog
+//! `basis = TBD_LEGAL` is the `[OPEN — LEGAL]` residual ([`worklog::WORKLOG_BASIS_RESIDUAL`] — counsel
+//! ratifies special-category vs elevated + the per-jurisdiction works-council trigger; the structural
+//! floor ships regardless); all H1–H18 now exist ([`worklog::ALL_HOLDERS_EXIST_FOR`] → M5 P-GA-32).
+//! It REUSES the data-map registry / the OLAP-restrict chokepoint / the DPIA router WHOLESALE (EI-01
+//! §7 — no second router, no re-detected "is this worklog?" by field name; the MAP drives it). **No
+//! `--features integration` leg owed:** this composes already-shipped in-memory seams + reads the
+//! compile-time registry and touches NO new DB / object-store / cache / bus contract. **Mutation
+//! floor (P-GA-31 TESTS — the restricted-by-default + the rollup-off-by-default + the
+//! works-council-trigger-surfacing paths are mandatory-core):** [`worklog::WorklogAnalyticsGate::
+//! cross_individual_allowed`] (both polarities), [`worklog::RollupEnablement::is_enabled`] (OFF
+//! default), and [`worklog::RollupEnablement::enable`]'s trigger emission; the `cargo mutants` score
+//! is in the commit body.
+
 pub mod agent_trace_seam;
 pub mod audit;
 pub mod audit_proofs;
@@ -569,6 +600,7 @@ pub mod restrict_fanout;
 pub mod retention;
 pub mod structural_floor;
 pub mod tenant_ops;
+pub mod worklog;
 
 pub use agent_trace_seam::{
     agent_trace_phase, trace_is_distinct_from_audit, AgentTraceHolderSeam, AGENT_TRACE_ERASABLE,
@@ -680,3 +712,8 @@ pub use structural_floor::{
     Processing, RestrictRegistry, ShreddedIdentity, StoredContent,
 };
 pub use tenant_ops::{OffboardingCertificate, TenantDsrError, TenantDsrSurface};
+pub use worklog::{
+    RollupEnablement, WorklogAnalyticsGate, WorksCouncilTrigger, ALL_HOLDERS_EXIST_FOR,
+    BUILD_TRAINING_FORECLOSURE, WORKLOG_BASIS_RESIDUAL, WORKLOG_CROSS_INDIVIDUAL_DENIED,
+    WORKS_COUNCIL_TRIGGERS_SURFACED,
+};

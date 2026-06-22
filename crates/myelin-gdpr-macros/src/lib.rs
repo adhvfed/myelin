@@ -50,9 +50,14 @@
 //!   UNIONS them is P-GA-09.
 //! - The **`SpecialCategory` → DPIA router** is **P-GA-08** (it consumes
 //!   `PersonalDataField::is_special_category`, emitted here).
-//! - The **worklog `Behavioural`/restricted-by-default extension** (OQ-H, `data_role_default`) lands
-//!   with Issues in **P-GA-31**; the macro accepts an unknown extra key (forward-compatible) so a
-//!   future tag does not need a macro change to compile.
+//! ## P-GA-31 / P-334 — the worklog `Behavioural`/restricted-by-default extension (OQ-H) is STRUCTURAL
+//! The OQ-H worklog/productivity/estimate posture (gdpr §2.4) tags a field
+//! `data_role_default = Restricted` (restricted-by-default in cross-individual processing). That key
+//! is now **captured into the registry entry** (`PersonalDataTags::data_role_default`) — the
+//! restricted-by-default fact is read OFF the data map (`PersonalDataField::is_restricted_by_default`),
+//! never inferred from the category. It is OPTIONAL (an ordinary field omits it → `"Default"`), so the
+//! extension is additive (no existing tag changes). Any OTHER unknown extra key is still accepted +
+//! ignored (forward-compat for a future tag without a macro change).
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -204,7 +209,9 @@ fn is_pii_field(name: &str) -> bool {
     PII_FIELDS.contains(&name)
 }
 
-/// The five captured tag texts + the subject locator, all as `String` (rendered token text).
+/// The five captured tag texts + the subject locator + the OQ-H `data_role_default`, all as
+/// `String` (rendered token text). `data_role_default` is the worklog/productivity extension
+/// (gdpr §2.4, P-GA-31): OPTIONAL (defaults to `"Default"`) so an ordinary field need not carry it.
 struct ParsedTags {
     category: String,
     role: String,
@@ -212,6 +219,9 @@ struct ParsedTags {
     retention: String,
     erasure: String,
     subject_locator: String,
+    /// `data_role_default` — `"Restricted"` for a restricted-by-default field (the OQ-H worklog
+    /// posture) or `"Default"` when the tag is absent (the additive extension; P-GA-31).
+    data_role_default: String,
 }
 
 /// Parse a `#[personal_data(category = .., role = .., basis = .., retention = .., erasure = ..,
@@ -222,8 +232,10 @@ struct ParsedTags {
 /// Tolerant by design — it does NOT type-check the variant names (that is the job of P-GA-09's
 /// typed re-parse and the five-tag enums); it only requires the five classification keys and the
 /// locator be PRESENT, so an incomplete tag is a loud compile error (a half-classified field is the
-/// bug class the registry must never carry). An unknown EXTRA key is accepted (forward-compat: the
-/// worklog `data_role_default` extension, P-GA-31, must compile without a macro change).
+/// bug class the registry must never carry). The OQ-H **`data_role_default`** key (gdpr §2.4,
+/// P-GA-31) is OPTIONAL and now STRUCTURAL — it is captured into the registry (the worklog
+/// restricted-by-default posture is read off the map, not inferred); an absent tag defaults to
+/// `"Default"`. Any OTHER unknown extra key is still accepted + ignored (forward-compat).
 fn parse_personal_data_tags(attr: &syn::Attribute) -> syn::Result<ParsedTags> {
     let mut category: Option<String> = None;
     let mut role: Option<String> = None;
@@ -231,6 +243,7 @@ fn parse_personal_data_tags(attr: &syn::Attribute) -> syn::Result<ParsedTags> {
     let mut retention: Option<String> = None;
     let mut erasure: Option<String> = None;
     let mut subject_locator: Option<String> = None;
+    let mut data_role_default: Option<String> = None;
 
     // `parse_nested_meta` walks the `key = value` (or `key(value)`) list inside the parentheses.
     attr.parse_nested_meta(|meta| {
@@ -271,9 +284,11 @@ fn parse_personal_data_tags(attr: &syn::Attribute) -> syn::Result<ParsedTags> {
             "retention" => retention = Some(text),
             "erasure" => erasure = Some(text),
             "subject_locator" => subject_locator = Some(text),
-            // Forward-compatible extra key (e.g. `data_role_default`, the OQ-H worklog extension,
-            // P-GA-31). Accepted + ignored by the macro body shipped here so a future tag compiles
-            // without a macro change; P-GA-31 / P-GA-09 give it meaning.
+            // The OQ-H worklog extension (gdpr §2.4, P-GA-31) — now STRUCTURAL: captured into the
+            // registry so the restricted-by-default posture is read off the data map, not inferred.
+            "data_role_default" => data_role_default = Some(text),
+            // Any OTHER unknown extra key is accepted + ignored (forward-compat: a future tag
+            // compiles without a macro change).
             _ => {}
         }
         Ok(())
@@ -299,6 +314,9 @@ fn parse_personal_data_tags(attr: &syn::Attribute) -> syn::Result<ParsedTags> {
         retention: require(retention, "retention")?,
         erasure: require(erasure, "erasure")?,
         subject_locator: require(subject_locator, "subject_locator")?,
+        // OPTIONAL — defaults to `"Default"` (no restriction) when the tag is absent (gdpr §2.4;
+        // the additive OQ-H extension, P-GA-31). A non-worklog field need not carry it.
+        data_role_default: data_role_default.unwrap_or_else(|| "Default".to_string()),
     })
 }
 
@@ -310,6 +328,7 @@ fn registry_entry(struct_name: &str, field_name: &str, tags: &ParsedTags) -> Tok
     let retention = &tags.retention;
     let erasure = &tags.erasure;
     let subject_locator = &tags.subject_locator;
+    let data_role_default = &tags.data_role_default;
     quote! {
         ::myelin_gdpr::PersonalDataField {
             owning_struct: #struct_name,
@@ -321,6 +340,7 @@ fn registry_entry(struct_name: &str, field_name: &str, tags: &ParsedTags) -> Tok
                 retention: #retention,
                 erasure: #erasure,
                 subject_locator: #subject_locator,
+                data_role_default: #data_role_default,
             },
         }
     }

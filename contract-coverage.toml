@@ -1496,11 +1496,20 @@ cdc = [
     "crates/myelin-knowledge/tests/cdc_13_2_10_1_knowledge_export_import.rs",
 ]
 
+# 10.2 — the classify-derive (five tags + subject_locator, P-GA-07) PLUS the OQ-H worklog extension
+# (P-GA-31 → P-334): the `data_role_default = Restricted` worklog tag is now STRUCTURAL (captured into
+# the generated registry), and its consumer (the worklog-analytics default-DENY) ships its CDC pair.
+# The worklog `basis = TBD_LEGAL` is the NAMED `[OPEN — LEGAL]` residual (counsel ratifies
+# special-category vs elevated + the per-jurisdiction works-council trigger; the structural floor ships
+# regardless). So the row stays `covered`.
 [[contract]]
 row = "10.2"
-title = "#[personal_data(...)] classify-derive"
+title = "#[personal_data(...)] classify-derive + the OQ-H worklog tag (data_role_default)"
 status = "covered"
-cdc = ["crates/myelin-gdpr/tests/cdc_10_2_classify_derive.rs"]
+cdc = [
+    "crates/myelin-gdpr/tests/cdc_10_2_classify_derive.rs",
+    "crates/myelin-gdpr/tests/cdc_10_2_worklog_tag.rs",
+]
 
 # 10.3 — the data-map / RoPA GENERATOR ships its provider+consumer CDC pair NOW (P-GA-09 → P-109):
 # the PROVIDER is `data_map() → Inventory` (the generator walking the `#[personal_data]` registry +

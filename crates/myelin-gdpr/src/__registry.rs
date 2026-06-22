@@ -68,6 +68,33 @@ impl PersonalDataField {
     pub fn is_special_category(&self) -> Option<SpecialCategoryFlag> {
         SpecialCategoryFlag::from_category_tag(self.tags.category)
     }
+
+    /// The `data_role_default` cross-individual-processing default for this field (the OQ-H worklog
+    /// extension — gdpr §2.4, contract 10.2; P-GA-31). A field tagged
+    /// `data_role_default = Restricted` is **restricted-by-default** in cross-individual processing
+    /// (excluded from cross-individual analytics / agent-use for a restricted subject unless an
+    /// explicit per-subject opt-in is recorded — the worklog/productivity/estimate posture). An
+    /// absent tag defaults to [`DataRoleDefault::Default`] (ordinary processing) — so the structural
+    /// fact is read off EVERY field uniformly, never inferred from the category.
+    pub fn data_role_default(&self) -> DataRoleDefault {
+        DataRoleDefault::from_tag(self.tags.data_role_default)
+    }
+
+    /// Whether this field is **restricted-by-default** (`data_role_default = Restricted`, gdpr §2.4
+    /// OQ-H) — the worklog/productivity/estimate posture: excluded from cross-individual analytics +
+    /// agent-use for a restricted subject by default. The structural fact the OLAP/analytics
+    /// chokepoint reads to decide a default-deny (P-GA-31; consumed by the worklog analytics gate).
+    pub fn is_restricted_by_default(&self) -> bool {
+        self.data_role_default() == DataRoleDefault::Restricted
+    }
+
+    /// Whether this field is `category = Behavioural` (gdpr §2.1 / §2.4) — the worklog/productivity/
+    /// observational category. The OQ-H posture pairs `Behavioural` with `data_role_default =
+    /// Restricted`; this reads the category half so the worklog classification gate can assert the
+    /// pairing (a behavioural field that is NOT restricted-by-default is the bug the gate catches).
+    pub fn is_behavioural(&self) -> bool {
+        self.tags.category == "Behavioural"
+    }
 }
 
 /// The five classification tags + `subject_locator`, captured as rendered token text (see the
@@ -89,6 +116,54 @@ pub struct PersonalDataTags {
     /// key off (gdpr §2.1: makes `locate` structural). The captured string LITERAL value, e.g.
     /// `"principal_id"`.
     pub subject_locator: &'static str,
+    /// `data_role_default` — the cross-individual-processing default (the OQ-H worklog extension,
+    /// gdpr §2.4; P-GA-31). `"Restricted"` for a restricted-by-default field (worklog/productivity/
+    /// estimate — excluded from cross-individual analytics/agent-use by default), or `"Default"`
+    /// (ordinary processing) when the tag is absent. Captured as token text like the other tags;
+    /// the typed read is [`DataRoleDefault::from_tag`] / [`PersonalDataField::data_role_default`].
+    ///
+    /// `#[serde(default = "default_data_role_default")]` keeps the frozen P-107 registry wire shape
+    /// stable: a registry entry serialised before this tag existed round-trips to `"Default"` (the
+    /// no-tag meaning), so the extension is additive — old maps stay valid.
+    #[serde(default = "default_data_role_default")]
+    pub data_role_default: &'static str,
+}
+
+/// The serde default for [`PersonalDataTags::data_role_default`] — `"Default"` (no restriction).
+/// A `const fn` so the derive can emit it for a field that carries no `data_role_default` tag, AND
+/// the serde `#[serde(default = ...)]` keeps an old (pre-P-GA-31) registry entry round-tripping to
+/// the same no-tag meaning. ONE source for the absent-tag value (the macro + serde agree).
+pub const fn default_data_role_default() -> &'static str {
+    "Default"
+}
+
+/// The `data_role_default` tag value (the OQ-H cross-individual-processing default — gdpr §2.4,
+/// contract 10.2; P-GA-31). It answers: *is this field restricted-by-default in cross-individual
+/// processing?* — the worklog/productivity/estimate posture. NOT the same axis as
+/// [`crate::DataRole`] (controller/processor): a field is `role = TenantContent` AND
+/// `data_role_default = Restricted` (the worklog case). Frozen to the §2.4 shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DataRoleDefault {
+    /// Ordinary processing — the field participates in cross-individual analytics/agent-use under
+    /// the normal lawful-basis + `restrict` rules. The absent-tag default.
+    Default,
+    /// **Restricted-by-default** (gdpr §2.4 OQ-H) — excluded from cross-individual analytics +
+    /// agent-use for a restricted subject by default; per-individual rollups OFF by default behind
+    /// an explicit tenant-admin enablement that surfaces the works-council consultation trigger. The
+    /// worklog/productivity/estimate posture (same per-subject DEK crypto-shred as other PII).
+    Restricted,
+}
+
+impl DataRoleDefault {
+    /// Parse the captured `data_role_default` tag text into the typed default. Unknown text falls
+    /// back to [`DataRoleDefault::Default`] (forward-compatible: an unrecognised value is the safe
+    /// non-restricted reading, never a panic — a new value lands with the data-map generator).
+    pub fn from_tag(text: &str) -> DataRoleDefault {
+        match text {
+            "Restricted" => DataRoleDefault::Restricted,
+            _ => DataRoleDefault::Default,
+        }
+    }
 }
 
 /// The crypto-shred key class an `erasure = CryptoShred(<class>)` tag names — the GD-4 lever's
