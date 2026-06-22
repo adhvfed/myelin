@@ -760,10 +760,24 @@ title = "TE-7 typed-edge mirror"
 # one-directional edge: `myelin-refs-service` depends on the producer crates; the CDC models the
 # consumer field reads locally). The block-granular replay that REBUILDS the Refs projection from the
 # typed table (the TE-7 drift-correction; cold == live) is KN-P20 / P-310 (named).
+# REF-P20 / P-336 (M4) lands the SECOND real TE-7 mirror — Issues `issue_relation`. The Refs CONSUMER
+# side projects a real `issue.relation.*` typed-lifecycle event into BOTH inverse-paired
+# `rel_class='lifecycle'` edges over the WHOLE lifecycle vocabulary
+# (`closes`/`blocks`/`blocked_by`/`depends_on`/`parent`/`assigns`/`relates`) via
+# `myelin_refs_service::issues_producer::{mirror_issue_relation, project_issue_relation,
+# reconverge_issue_relations}` — reusing the REF-P14 `mirror_edges`/`reconverge` (no second engine).
+# The consumer-side CDC pair (`cdc_5_5_issue_relation.rs`) proves both-directions traversal is ONE Refs
+# query; the lib unit drills (`src/issues_producer/tests.rs`) prove the inverse pairing on every shape
+# + the TE-7 SECOND-mirror reconvergence (typed wins; supports ISS-D6); the REAL Postgres proof (the
+# inverse-paired lifecycle edges + RLS isolation + reindex byte-parity + the typed-wins reconvergence)
+# is `crates/myelin-refs-service/tests/integration_ref_p20_issue_producer.rs` (the `integration`
+# feature, proven green against the live dev-stack). The `closes`/`depends_on`/`assigns` inverse token
+# stays the `Inverse::None` floor (the owning subsystem's mint).
 status = "covered"
 cdc = [
     "crates/myelin-git/tests/cdc_5_5_git_lifecycle_edges.rs",
     "crates/myelin-knowledge/tests/cdc_5_4_5_5_5_6_5_7_knowledge_refs_glue.rs",
+    "crates/myelin-refs-service/tests/cdc_5_5_issue_relation.rs",
 ]
 
 [[contract]]

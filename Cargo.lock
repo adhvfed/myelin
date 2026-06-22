@@ -2448,6 +2448,7 @@ dependencies = [
  "myelin-gdpr",
  "myelin-git",
  "myelin-identity",
+ "myelin-issues",
  "myelin-refs",
  "myelin-storage",
  "myelin-substrate",

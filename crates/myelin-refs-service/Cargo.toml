@@ -83,6 +83,15 @@ myelin-content = { path = "../myelin-content" }
 # graph's terminal leaf consumer. This is a CONSUMER edge (Refs consumes Git's producer surface),
 # the natural shape of "Refs wires to the real Git producer" (REF-P17 DELIVERABLE).
 myelin-git = { path = "../myelin-git" }
+# The REAL Issues producer (REF-P20 / P-336, M4 — the SECOND real TE-7 mirror). Refs WIRES to
+# Issues' owned `issue.relation.*` typed-lifecycle tokens + its `field-`/`row-` `#sub` kinds
+# (contracts 5.5/5.6/5.7) — Refs reuses Issues' canonical event tokens by NAME (the names anchor,
+# X-5) rather than re-deriving them (EI-01 §7 coherence — one token language). `myelin-issues` is a
+# SUBSYSTEM (producer) crate that depends on `myelin-refs` (the GLUE value-type crate), NOT on
+# `myelin-refs-service`, so this is acyclic and refs-service stays the graph's terminal leaf
+# consumer. This is a CONSUMER edge (Refs consumes Issues' producer surface), the natural shape of
+# "Refs wires to the real Issues producer" (REF-P20 DELIVERABLE).
+myelin-issues = { path = "../myelin-issues" }
 # BLAKE3 + hex — the content-anchored Git line-range fingerprint (REF-P15 / P-164, §3.5: a
 # `#L<a>-L<b>` carries a BLAKE3 fingerprint of the anchored lines so resolution is content-anchored,
 # not positional). The SAME `blake3:<hex>` multihash convention the BlobStore content-address + the
