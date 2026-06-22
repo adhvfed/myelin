@@ -1,0 +1,13 @@
+// GREEN fixture for `no-raw-publish` — the KNOWLEDGE slice (KN-P06 / P-296). The lint MUST admit this.
+//
+// Every Knowledge state change (a block/row/page write) emits its `knowledge.*` event through
+// `OutboxTx::emit` IN THE SAME TRANSACTION as the state mutation (emit-iff-committed, KN-D7 /
+// contract 2.2): the block row and its `knowledge.block.updated` event co-commit, so the event can
+// never land without its state and the state can never commit without its event. The relay is the
+// ONLY component on the broker publish side — there is no fire-and-forget publish path in Knowledge.
+pub async fn write_block(tx: &mut OutboxTx, change: &KnowledgeChange) -> Result<(), Error> {
+    tx.stage_block_write(change)?;
+    // OK: the knowledge.* event is emitted in-transaction via the outbox — co-committed with the block.
+    emit_change(tx, &tenant, change, None)?;
+    tx.commit().await
+}
