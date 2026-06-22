@@ -630,7 +630,15 @@ cdc = [
     "crates/myelin-refs/tests/cdc_5_1_artifactref.rs",
     "crates/myelin-git/tests/cdc_5_7_git_sub_mints.rs",
     "crates/myelin-chat/tests/cdc_5_7_chat_sub_mints.rs",
+    "crates/myelin-knowledge/tests/cdc_5_7_knowledge_stable_id_mint.rs",
 ]
+# KN-P10 / P-300 (M3) adds Knowledge's owned `b<id>` / `h<id>` stable block-id mints — the §2.3
+# stability obligation (the `block_id` is stable across edits/moves/collaboration; the move is an
+# `order_key` write, NEVER an id re-mint). The provider+consumer pair
+# (cdc_5_7_knowledge_stable_id_mint.rs) registers the kinds with Refs, classifies every mint to its
+# declared kind (0 ungrammatical), and PROVES the minted `#sub` is byte-identical across a real
+# `BlockTree::move_block` (the `moved_block_id_dangles == 0` stable-id gate). The `b`/`h`
+# `project(ref, viewer)` 4-step-ladder resolver is the KN-P19 follow-on (deferred, NAMED).
 
 [[contract]]
 row = "5.8"

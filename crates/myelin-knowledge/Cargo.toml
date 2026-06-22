@@ -56,8 +56,14 @@ myelin-events = { path = "../myelin-events" }
 myelin-content = { path = "../myelin-content" }
 # The FROZEN FieldType/ViewSpec/QueryAst/order_key shapes (contract 13.3). Knowledge co-owns it
 # (KN-P02/P03); the shell depends on it so the flexible-database executor (KN-P09+) compiles
-# against the frozen query shapes.
+# against the frozen query shapes. KN-P10 (P-300) CONSUMES the frozen LexoRank `OrderKey` for the
+# block-tree sibling ordering (it does NOT re-implement a parallel fractional index — EI-01 §7).
 myelin-query = { path = "../myelin-query" }
+# The Refs ONE `#sub` grammar + the 4-step tombstone ladder (contract 5.7). KN-P10 (P-300) registers
+# Knowledge's OWNED `b<id>`/`h<id>` stable-block-id `#sub` mints through this ONE codec (it does NOT
+# author the grammar — Refs owns it; Knowledge owns the stable opaque mint). The per-viewer
+# `project(ref, viewer)` resolver (the ladder calls) is the KN-P19 follow-on.
+myelin-refs = { path = "../myelin-refs" }
 # The Storage tier (KN-P05): the OLTP bounded pool (11.1, OltpPool), the (tenant, region)-first RLS
 # tenant-scoping guard (11.1/12.1, TenantScope/TenantQuery — the structural tenant-predicate floor),
 # and the fs-backed content-addressed BlobStore (11.2, the M1 media + CRDT-snapshot floor).
