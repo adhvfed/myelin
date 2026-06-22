@@ -53,8 +53,13 @@
 //!   The entrypoint slot ([`FailClosedEntrypoint`]) returns the fail-closed default `Deny` for
 //!   every `check` and `NotYetImplemented` for `list_objects` until those bodies land.
 
+pub mod emit;
 pub mod store;
 
+pub use emit::{
+    block_ref, database_ref, emit_change, page_ref, row_ref, KnowledgeChange,
+    KnowledgeLivingDocHandler, KNOWLEDGE_LIVING_DOC_TRIGGERS,
+};
 pub use store::{
     knowledge_scope, knowledge_store_migrations, KnowledgeStore, KnowledgeTable,
 };
@@ -63,9 +68,10 @@ use myelin_identity::{
     AuthzError, CaveatContext, Consistency, Decision, IdentityService, ListObjectsResult,
     ObjectType, Permission, Principal,
 };
+use myelin_events::{consume, ConsumerName, ConsumerSpec, DedupLedger, InProcessBus, OutboxStore};
 use myelin_substrate::{
-    boot, AppSpec, Authorizer, Config, CriticalDependencies, HotTables, InternalRpc, Migration,
-    Migrations, PublicRoutes, ServeError, ServeHandle, StoreManifest,
+    boot, AppSpec, Authorizer, Config, ConsumerReg, CriticalDependencies, HotTables, InternalRpc,
+    Migration, Migrations, OutboxSpec, PublicRoutes, ServeError, ServeHandle, StoreManifest,
 };
 use myelin_tenancy::ArtifactRef;
 
@@ -363,6 +369,50 @@ pub fn knowledge_app_spec(config: Config) -> AppSpec {
     }
 }
 
+/// The durable name of the Knowledge living-doc consumer (contract 2.4 rule 4 — bind-by-name; a
+/// reconnect re-binds the SAME name + dedup ledger so a redelivery is absorbed). A PII-free
+/// telemetry/trace label.
+pub const LIVING_DOC_CONSUMER: &str = "knowledge-living-doc";
+
+/// **The Knowledge AppSpec WIRED with the transactional outbox + relay + the living-doc consumer
+/// (KN-P06 → P-296).** The genuinely-new half of KN-P06: where [`knowledge_app_spec`] is the bare
+/// shell (empty consumer seam, default outbox), this wires the FULL emit-via-outbox-only path —
+/// the ONE [`OutboxStore`] the Knowledge emit seam ([`emit::emit_change`]) buffers into AND the
+/// relay drains (no second store, BUS-2), plus the [`KnowledgeLivingDocHandler`] registered through
+/// the sanctioned [`consume`] (rule 3: the `*`-free whitelist; rule 4: bind-by-name on
+/// [`LIVING_DOC_CONSUMER`] sharing the dedup ledger). The harness's lifecycle then runs
+/// boot → migrate → **relay** → **consumers** → ports → drain around it.
+///
+/// `subjects` is the curated cross-subsystem signal whitelist the living-doc consumer binds (the
+/// `sig.<tenant>.` / `myelin://<tenant>/issues/` &c. prefixes — NEVER `*`; `consume` rejects a
+/// wildcard LOUDLY). The relay's broker is the in-process bus on this floor (the real
+/// NATS-JetStream adapter is wired through the same [`OutboxSpec::new`] seam, EB-04).
+///
+/// **FLOOR named (VISION §3):** the living-doc handler BODY is the shell (acks + records the
+/// trigger); the concrete embedded-view / mention-preview projection is KN-P19/P20/P21, the
+/// Search/Notif/GDPR consumers KN-P25/P27. This prompt ships the WIRING (the relay + the `*`-free
+/// consumer template + the dedup discipline), not the reaction bodies.
+pub fn knowledge_app_spec_with_consumers(config: Config, subjects: &[&str]) -> AppSpec {
+    // The ONE outbox the emit seam buffers into AND the relay drains (BUS-2 — no second store).
+    let outbox = OutboxStore::new();
+    let dedup = DedupLedger::new();
+    let mut spec = knowledge_app_spec(config);
+
+    // Register the living-doc consumer through the sanctioned `consume` (rule 3 rejects `*`/empty;
+    // rule 4 binds the durable name). A malformed/over-broad subject is a LOUD registration error —
+    // the consumer is then simply not registered (the shell still boots), never silently narrowed.
+    if let Ok(consumer) = consume(
+        ConsumerSpec::new(ConsumerName(LIVING_DOC_CONSUMER.into()), subjects),
+        KnowledgeLivingDocHandler::new(),
+        dedup,
+    ) {
+        spec.consumers = vec![ConsumerReg::new(consumer)];
+    }
+    // The emit seam buffers into `outbox`; the relay must drain THAT store (not a fresh default).
+    spec.outbox = OutboxSpec::new(outbox, InProcessBus::new());
+    spec
+}
+
 /// The read/write-entrypoint re-authorization seam the harness's internal/public surfaces are
 /// opened over for the Knowledge service — the fail-closed `check` slot ([`FailClosedEntrypoint`])
 /// wrapped as a [`KnowledgeEntrypointAuthorizer`]. Until KN-P14 wires the per-op body, every
@@ -617,6 +667,40 @@ mod tests {
             Ok(()),
             "the knowledge service boots → … → drains cleanly"
         );
+    }
+
+    /// **The KN-P06 WIRED AppSpec carries the living-doc consumer + the shared outbox/relay.** The
+    /// `knowledge_app_spec_with_consumers` constructor registers exactly one consumer (the living-doc
+    /// handler, bound `*`-free) and serves → drains cleanly with the relay over the SAME outbox the
+    /// emit seam buffers into (BUS-2 — no second store). The empty-shell `knowledge_app_spec` keeps
+    /// the no-consumer property; this is the wired path.
+    #[test]
+    fn wired_appspec_registers_the_living_doc_consumer_and_drains() {
+        let spec = knowledge_app_spec_with_consumers(
+            Config::default(),
+            &["myelin://acme/issues/", "myelin://acme/ci/"],
+        );
+        assert_eq!(spec.consumers.len(), 1, "exactly the one living-doc consumer is wired");
+        assert_eq!(
+            serve(spec),
+            Ok(()),
+            "the wired knowledge service boots → migrates → relay → consumer → drains cleanly"
+        );
+        // the bare shell stays consumer-free (the empty seam is preserved).
+        assert!(knowledge_app_spec(Config::default()).consumers.is_empty());
+    }
+
+    /// **An over-broad consumer subject does NOT silently widen the wiring (rule 3).** A `*` subject
+    /// passed to the wired constructor is rejected at registration, so the consumer is simply not
+    /// wired (the shell still boots) — never a silently-narrowed over-broad subscription.
+    #[test]
+    fn wired_appspec_rejects_a_wildcard_consumer_subject() {
+        let spec = knowledge_app_spec_with_consumers(Config::default(), &["*"]);
+        assert!(
+            spec.consumers.is_empty(),
+            "a `*` subject is rejected at registration → no consumer wired (never silently widened)"
+        );
+        assert_eq!(serve(spec), Ok(()), "the shell still boots + drains without the bad consumer");
     }
 
     /// **A failed boot returns non-zero (§3.1).** A config that fails boot-time validation aborts

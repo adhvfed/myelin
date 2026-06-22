@@ -147,19 +147,37 @@ landing = "P-011"
 row = "2.2"
 title = "OutboxTx::emit(draft, cause) — the only emit path"
 status = "covered"
-cdc = ["crates/myelin-storage/tests/cdc_st_02_coloc.rs"]
+# KN-P06/P-296 (M3) adds the Knowledge OWNER emit seam (myelin_knowledge::emit) — every state change
+# emits via OutboxTx::emit ONLY (no-raw-publish), emit-iff-committed, PROVEN against the live dev-stack
+# Postgres outbox co-commit (tests/integration_kn_d7_outbox.rs).
+cdc = [
+    "crates/myelin-storage/tests/cdc_st_02_coloc.rs",
+    "crates/myelin-knowledge/tests/cdc_2_2_2_3_2_4_2_9_kn_d7_outbox.rs",
+]
 
 [[contract]]
 row = "2.3"
 title = "outbox table + FOR UPDATE SKIP LOCKED relay"
 status = "covered"
-cdc = ["crates/myelin-storage/tests/cdc_st_02_coloc.rs"]
+# KN-P06/P-296 (M3): the Knowledge emit seam stamps the aggregate = the doc/row/db (§4 ordering key);
+# per-doc events stay per-aggregate ordered (monotonic seq), proven in the same CDC + live integration.
+cdc = [
+    "crates/myelin-storage/tests/cdc_st_02_coloc.rs",
+    "crates/myelin-knowledge/tests/cdc_2_2_2_3_2_4_2_9_kn_d7_outbox.rs",
+]
 
 [[contract]]
 row = "2.4"
 title = "EventHandler consumer template"
-status = "deferred"
-landing = "P-043"
+status = "covered"
+# The one consumer template (the seven encoded rules) ships in myelin-events (P-S08/P-009) + its
+# SUB-D2/BUS-D2 drills. KN-P06/P-296 (M3) adds the Knowledge OWNER consumer-template instance: the
+# living-doc EventHandler with a `*`-free subjects() whitelist (rule 3) + idempotent-through-the-runtime
+# (rules 1/4), wired into the Knowledge AppSpec consumer seam (the relay + consumer in the boot hook).
+cdc = [
+    "crates/myelin-events/tests/drills_sub_d2_consumer.rs",
+    "crates/myelin-knowledge/tests/cdc_2_2_2_3_2_4_2_9_kn_d7_outbox.rs",
+]
 
 [[contract]]
 row = "2.5"
@@ -217,6 +235,10 @@ status = "covered"
 # COMPLETING its new `knowledge.*` list, durable-via-outbox vs firehose-only). (contract 2.9: "each
 # subsystem completes its list" — each subsystem registers, the Bus owns the grammar + the harness.)
 # Each file carries both a provider and a consumer marker.
+# KN-P06/P-296 (M3) EXTENDS the knowledge.* list IN PLACE (myelin_content::events) to the COMPLETE
+# architecture-03 §1 OWNER taxonomy (the page/block/database/view/row/comment/mention lifecycle +
+# access/DSR + the cross-cutting *.erased/*.snapshot) and proves every KnowledgeChange the emit seam
+# can produce maps to a registered, grammatical token (cdc_2_2_2_3_2_4_2_9_kn_d7_outbox.rs).
 cdc = [
     "crates/myelin-events/tests/cdc_2_9_taxonomy.rs",
     "crates/myelin-events/tests/cdc_2_9_token_list_harness.rs",
@@ -225,6 +247,7 @@ cdc = [
     "crates/myelin-chat/tests/cdc_2_9_chat_tokens.rs",
     "crates/myelin-issues/tests/cdc_2_9_issues_tokens.rs",
     "crates/myelin-content/tests/cdc_2_9_2_6_knowledge_tokens_and_replay.rs",
+    "crates/myelin-knowledge/tests/cdc_2_2_2_3_2_4_2_9_kn_d7_outbox.rs",
 ]
 
 # ──────────────── §3 Signals, Automations, Triggers & the firehose (Bus) ────────────────────────
