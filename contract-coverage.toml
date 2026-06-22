@@ -533,11 +533,22 @@ title = "per-subsystem ReBAC namespace fragment (engine + admit-contract + core 
 # — `direct_block` removes a narrowed sub-page, `direct_reader` adds it, the exclusion wins last) +
 # the row-level `SetExpr` push-down SHAPE (`InRelation { row_reader, db_row.id }`, the KN-P16 SQL
 # lowering target) + the no-cross-db lint green. The leak-critical SQL lowering itself is KN-P16/P-306.
+# The CI fragment SLICE (the `ci_project`/`environment`/`secret`/`run` namespace; `run.view =
+# parent_repo->pull`; `run.trigger = parent_repo->push`; the secret-non-inheritance invariant
+# `secret.read = direct_reader` — DIRECT NARROW, NOT a parent_ci_project inheritance, CI-1 §1; the
+# `read & !is_untrusted_fork` ABAC edge `run.read = run.view - is_untrusted_fork`, C7 §X-1) is
+# P-ID-27 / P-320 — Id's compiled CI fragment (PROVIDER) admits the four rich FragmentDefs into the
+# cell schema on top of the Git `repo` fragment (the `parent_repo->pull/push` inheritance terminates
+# there), and its rewrites resolve the two security-critical invariants: a `ci_project` reader/admin
+# gets 0 secret reads via inheritance (secret-non-inheritance), and a stamped untrusted-fork run's
+# output is gated by construction by the Exclusion. The Id-side compiled-fragment CDC co-owns the
+# PROVIDER half; the self-hosted-runner token SCOPE exercise against this fragment is P-ID-28 / P-321.
 status = "covered"
 cdc = [
     "crates/myelin-identity-service/tests/cdc_4_9_namespace_engine.rs",
     "crates/myelin-identity-service/tests/cdc_4_9_git_fragment.rs",
     "crates/myelin-identity-service/tests/cdc_4_9_knowledge_fragment.rs",
+    "crates/myelin-identity-service/tests/cdc_4_9_ci_fragment.rs",
     "crates/myelin-knowledge/tests/cdc_4_9_knowledge_rebac_fragment.rs",
     "crates/myelin-git/tests/cdc_4_9_git_fragment.rs",
     # The CODEOWNERS-as-relations RESOLVER slice (GIT-P16 / P-277, M3-G3): Git owns the CODEOWNERS
