@@ -354,7 +354,17 @@ title = "check (per-action gate, fail-closed)"
 # the compiled-permission namespace engine → P-068 (P-ID-10); the full QueryAst caveat core → P-133
 # (P-ID-22); the fail-static cache + zookie-bypass → P-073 (P-ID-15).
 status = "covered"
-cdc = ["crates/myelin-identity-service/tests/cdc_4_2_check.rs"]
+# KN-P14 / P-304 (M3) adds the KNOWLEDGE consumer half: the Layer-2 per-op authority
+# (myelin_knowledge::OpAuthorizer) gates EVERY collab op on `check(actor, edit|comment, page_ref,
+# Strong@page.acl_zookie)` before merge (architecture 02 §3.1) — applies ONLY on `Allow`, fail-closes
+# on Deny/Conditional/error, and reads at-or-after `page.acl_zookie` so a just-revoked editor's op is
+# rejected (the 4.10 new-enemy guard). The consumer CDC + the just-revoked drill (0 stale-grant
+# writes) + the schema-validation gate (0 invalid rows) ride here. The read-side list_objects SetExpr
+# push-down is the named KN-P16 follow-on.
+cdc = [
+  "crates/myelin-identity-service/tests/cdc_4_2_check.rs",
+  "crates/myelin-knowledge/tests/cdc_4_2_4_10_knowledge_per_op_authority.rs",
+]
 
 [[contract]]
 row = "4.3"
@@ -507,7 +517,16 @@ title = "Consistency / zookie semantics"
 # served static during a hiccup). The read-your-writes / S8-watermark half rides the 4.6 write-half
 # pair + P-070 (P-ID-12); this row's fail-static-bypass consumer+provider pair ships in the 4.11 CDC.
 status = "covered"
-cdc = ["crates/myelin-identity-service/tests/cdc_4_11_fail_static.rs"]
+# KN-P14 / P-304 (M3) adds the KNOWLEDGE read-your-writes consumer half: the Layer-2 per-op gate reads
+# `check` at a STRONG Consistency at-or-after the page's stamped `page.acl_zookie` (architecture 03
+# §3.3 the new-enemy guard), so a grant revoked at-or-after the stamp cannot be read stale — the
+# just-revoked editor's op is rejected (0 stale-grant writes). A stale client zookie cannot downgrade
+# the watermark (the read is at-or-after the page's CURRENT acl_zookie). The consumer CDC + drill ride
+# the 4.2 pair; this row cites the 4.10 read-your-writes half Knowledge consumes.
+cdc = [
+  "crates/myelin-identity-service/tests/cdc_4_11_fail_static.rs",
+  "crates/myelin-knowledge/tests/cdc_4_2_4_10_knowledge_per_op_authority.rs",
+]
 
 [[contract]]
 row = "4.11"
