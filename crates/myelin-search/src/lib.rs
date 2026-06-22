@@ -122,6 +122,7 @@ pub mod fusion;
 pub mod git_code_projection;
 pub mod holder;
 pub mod indexer;
+pub mod issues_projection;
 pub mod kn_projection;
 pub mod layout;
 pub mod pipeline;
@@ -168,6 +169,14 @@ pub use indexer::{
     EmbeddingAdapter, IncrementalIndexer, IndexEventError, IndexSpec, MockEmbeddingAdapter,
     ProjectFetchError, ProjectFetcher, SearchProjection, INDEXER_CONSUMER,
     INDEXER_SUBJECT_PREFIXES,
+};
+pub use issues_projection::{
+    issue_index_spec, issue_index_specs, issue_search_projection, register_issue_index_specs,
+    IssueGinScanProjectionFeederFloor, IssueProjectionInput,
+    FACET_ASSIGNEE as ISSUE_FACET_ASSIGNEE, FACET_CYCLE_ID as ISSUE_FACET_CYCLE_ID,
+    FACET_PRIORITY as ISSUE_FACET_PRIORITY, FACET_PROJECT_ID as ISSUE_FACET_PROJECT_ID,
+    FACET_STATE_CATEGORY as ISSUE_FACET_STATE_CATEGORY, FACET_TYPE_RANK as ISSUE_FACET_TYPE_RANK,
+    ISSUE_ACL_OBJECT_TYPE, ISSUE_PRODUCER_RANK_FACET, ISSUE_SUBSYSTEM, ISSUE_TYPE,
 };
 pub use kn_projection::{
     kn_db_row_index_spec, kn_index_specs, kn_page_index_spec, page_search_projection,
