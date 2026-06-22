@@ -37,6 +37,18 @@
 //! [`is_blocking_alter`]) deliberately mirror the substrate's so the two runners + the lint agree on
 //! what "forward-only" and "blocking" mean — divergence there would be a contract drift, flagged.
 //!
+//! ### SINGLE MIGRATION-CONTRACT AUTHORITY (de-dup, P-233 hardening)
+//! **`myelin-storage` is the single migration-contract authority.** The contract vocabulary —
+//! [`Migration`], [`Migrations`], [`MigrationPhase`], [`HotTables`], [`is_destructive`],
+//! [`is_blocking_alter`] — is defined ONCE, HERE. `myelin-substrate` **re-exports** these types
+//! (`pub use myelin_storage::migration::{…}`) rather than duplicating them: the substrate→storage
+//! edge already exists in the crate DAG, and the reverse edge is forbidden by the root-last DAG, so
+//! the canonical home is storage and substrate re-exports it. Consequently
+//! `myelin_substrate::migrations::Migration` and `myelin_storage::migration::Migration` are now the
+//! SAME type — every existing importer (via either path) keeps compiling unchanged. Substrate keeps
+//! its OWN `MigrationRunner` (the general forward-only boot-time validator that returns
+//! `ServeError`), now operating on these re-exported types.
+//!
 //! ## Floor named (STOR-D8 forward-dependency, in writing)
 //! - **STOR-D8 (online migration under load on the RESTORED copy)** — running an
 //!   expand→backfill→contract migration on a restored production-scale copy under load and asserting
@@ -145,6 +157,19 @@ impl Migration {
 pub struct Migrations(pub Vec<Migration>);
 
 impl Migrations {
+    /// Register PLAIN migrations from `(id, ddl)` pairs (ordered) — the ergonomic path for
+    /// ordinary forward migrations (new tables, cold-table nullable adds). Additive sibling of
+    /// [`Migrations::of`]; this is the constructor substrate's re-export keeps available to its
+    /// `(id, ddl)`-pair callers now that storage is the single migration-contract authority.
+    pub fn new(items: impl IntoIterator<Item = (&'static str, &'static str)>) -> Migrations {
+        Migrations(
+            items
+                .into_iter()
+                .map(|(id, ddl)| Migration::plain(id, ddl))
+                .collect(),
+        )
+    }
+
     /// Build from an explicit migration list (the order is the apply order the runner enforces).
     pub fn of(items: impl IntoIterator<Item = Migration>) -> Migrations {
         Migrations(items.into_iter().collect())
