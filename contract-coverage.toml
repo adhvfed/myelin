@@ -472,6 +472,15 @@ row = "4.7"
 title = "mint_run_token + revoke"
 status = "deferred"
 landing = "P-076"
+# The self-hosted-runner SCOPE side of 4.7 (§4 — a self-hosted runner token is scoped to ONE tenant's
+# `SelfHosted` jobs, cannot mint or act cross-tenant; the no-global-pool property at the identity
+# layer) is EXERCISED against the live CI fragment (4.9) by P-ID-28 / P-321. The mint-half ceiling
+# (the [`mint`] one-tenant `SelfHostedScopeViolation` on a `MachineKind::PerJob` mint) shipped at
+# P-076/P-ID-18; P-ID-28 proves it end-to-end against the CI namespace: 0 cross-tenant tokens minted
+# AND 0 cross-tenant job/secret reads by a self-hosted runner against the CI `run`/`secret` objects.
+# CDC: crates/myelin-identity-service/tests/cdc_4_7_self_hosted_ci_scope.rs (the CI-dispatch consumer ↔
+# Identity mint+check provider pair). Drill (CI-D10 scope side, dated green artifact):
+# crates/myelin-identity-service/tests/drill_ci_d10_self_hosted_scope.rs.
 
 [[contract]]
 row = "4.8"
@@ -542,7 +551,9 @@ title = "per-subsystem ReBAC namespace fragment (engine + admit-contract + core 
 # there), and its rewrites resolve the two security-critical invariants: a `ci_project` reader/admin
 # gets 0 secret reads via inheritance (secret-non-inheritance), and a stamped untrusted-fork run's
 # output is gated by construction by the Exclusion. The Id-side compiled-fragment CDC co-owns the
-# PROVIDER half; the self-hosted-runner token SCOPE exercise against this fragment is P-ID-28 / P-321.
+# PROVIDER half; the self-hosted-runner token SCOPE is exercised against this live fragment by P-ID-28
+# / P-321 (CI-D10 scope side — 0 cross-tenant job/secret reads by a self-hosted runner; see the 4.7
+# row note + drill_ci_d10_self_hosted_scope.rs).
 status = "covered"
 cdc = [
     "crates/myelin-identity-service/tests/cdc_4_9_namespace_engine.rs",

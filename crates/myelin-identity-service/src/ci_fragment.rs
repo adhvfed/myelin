@@ -25,8 +25,12 @@
 //! Zanzibar userset operators so `check`/`list_objects` resolve the CI permissions through the SAME
 //! engine the core hierarchy uses (one primitive — no bespoke CI check path, the §5 design rule). The
 //! CI data model (the pipeline/run tables themselves) is the CI-platform prompts'; this module ships
-//! only the Id-side authz content. The self-hosted-runner token SCOPE exercise against this fragment is
-//! P-ID-28 (P-321); this prompt ships the fragment.
+//! only the Id-side authz content. The self-hosted-runner token SCOPE is exercised AGAINST this live
+//! fragment by P-ID-28 (P-321) — see `tests/drill_ci_d10_self_hosted_scope.rs` (CI-D10 scope side: a
+//! self-hosted runner token is bounded to one tenant's `SelfHosted` jobs → 0 cross-tenant job/secret
+//! reads against this fragment) + `tests/cdc_4_7_self_hosted_ci_scope.rs` (the CI-dispatch consumer ↔
+//! Identity mint+check provider pair). The scope MECHANISM is the [`crate::mint`] one-tenant ceiling
+//! (P-ID-18); P-ID-28 proves it end-to-end against the CI namespace.
 //!
 //! ## Why the rich fragment lives HERE (not in `myelin-ci-*`)
 //! Same DAG discipline as [`crate::git_fragment`] / [`crate::knowledge_fragment`]:
