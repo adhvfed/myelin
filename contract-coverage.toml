@@ -517,8 +517,26 @@ title = "per-subsystem ReBAC namespace fragment (engine + admit-contract + core 
 # `watcher` + the field/transition ABAC sub-objects) is ISS-P01 / P-125 — its CDC declares the
 # Issues fragment (CONSUMER) + admits it through the real engine (PROVIDER), proving it COMPILES into
 # the cell schema (the ISS-P01 gate) AND that the `- confidential` set-difference resolves LEAK-FREE
-# (a confidential issue is absent from view for a non-grantee; the rewrites wired LIVE on Id's M2
-# CaveatContext/list_objects bodies, ISS-P11 / P-ID-*).
+# (a confidential issue is absent from view for a non-grantee). The Id-side COMPILED Issues fragment
+# (the rich FragmentDefs Id OWNS — the `issue`/`field`/`transition` types + the rewrites:
+# `view = (parent_project->view − confidential) ∪ confidential_grant`, `comment = view`,
+# `transition = assignee ∪ parent_project->view`, `manage = parent_project->view`,
+# `field.view_field = parent_issue->view`, `transition.perform_transition = parent_issue->transition`)
+# is P-ID-29 / P-322 (M4) — `issue_fragment.rs` (PROVIDER); its CDC
+# (cdc_4_9_issue_fragment.rs) admits the three rich FragmentDefs into the cell schema, proves the
+# confidential issue disappears for a normal reader BY CONSTRUCTION (the − confidential Exclusion, not
+# a post-filter), the board conjoins in ONE query (the issue.id Filter push-down, §7.3), and the
+# field/transition caveats hide a field / gate a transition OFF the hot path through the ONE QueryAst
+# core (a denied one Deny, a missing-context one Conditional, never a silent allow). The ISS-D3 authz
+# side is the dated green drill (drill_iss_d3_confidential_cross_tenant.rs): 0 confidential-issue
+# leaks to a fleet of project readers, 0 cross-tenant leaks, AND 0 leak under zookie staleness (the
+# watermark guard falls back to per-row check over authoritative S3 — the new-enemy guard).
+# RECONCILIATION (EI-01 §1): the §5 vocabulary names the sub-objects `field`/`transition` (the
+# canonical authz spelling Id owns); the Issues carrier (ISS-P01) names them `issue_field`/
+# `issue_transition` (a prefixed spelling) — the permission NAMES (`view_field`/`perform_transition`)
+# + the rewrite STRUCTURE match, which is what the CDC pins. The §5 `parent_project->read`/`->write`
+# inheritance edges resolve through the core hierarchy's single compiled `project.view` (the SAME
+# reconciliation the Git fragment makes for `repo.pull`/`repo.push`).
 # The CHAT fragment SLICE (the `channel` + `message` namespace; the frozen `channel.read = member +
 # parent_project->read` clause, recon §1; the `watcher` Notif read-fanout relation) is CHAT-P2 / P-244
 # — its CDC declares the Chat fragment (CONSUMER) + admits it through the real engine (PROVIDER),
@@ -560,6 +578,7 @@ cdc = [
     "crates/myelin-identity-service/tests/cdc_4_9_git_fragment.rs",
     "crates/myelin-identity-service/tests/cdc_4_9_knowledge_fragment.rs",
     "crates/myelin-identity-service/tests/cdc_4_9_ci_fragment.rs",
+    "crates/myelin-identity-service/tests/cdc_4_9_issue_fragment.rs",
     "crates/myelin-knowledge/tests/cdc_4_9_knowledge_rebac_fragment.rs",
     "crates/myelin-git/tests/cdc_4_9_git_fragment.rs",
     # The CODEOWNERS-as-relations RESOLVER slice (GIT-P16 / P-277, M3-G3): Git owns the CODEOWNERS
