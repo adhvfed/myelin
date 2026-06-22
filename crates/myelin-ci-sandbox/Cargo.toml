@@ -51,6 +51,11 @@ myelin-flow = { path = "../myelin-flow" }
 # The `job.done` signal payload is references-not-payloads `ArtifactRef`s (§3.4) — the terminal
 # report carries result refs (the `ci.log.available` pointer + artifact refs), never a PII body.
 myelin-refs = { path = "../myelin-refs" }
+# CI's `ci.*` event taxonomy (EB-27 / P-327, M4 — `events.rs` + `replay.rs`) registers its complete
+# token list against the Bus grammar + provides CI's `ReindexSource` body. NON-TEST code now, so
+# myelin-events is a real (not dev-only) dep. NO cycle: myelin-events has no edge back to
+# myelin-ci-sandbox, and myelin-refs (above) already pulls myelin-events transitively.
+myelin-events = { path = "../myelin-events" }
 serde.workspace = true
 # The escape-drill green-attestation artifact (CI-P5 → P-239) serializes to the JSON form AG-P17
 # (P-229) consumes — `EscapeAttestation::to_json` is non-test code, so serde_json is a real dep here
@@ -88,8 +93,7 @@ optional = true
 
 [dev-dependencies]
 serde_json.workspace = true
-# The `MonotonicMinter` (the `IdMinter` the unit tests build a `FlowExecutor` over to PROVE the
-# runner's `job.done` reports onto the ONE engine signal path). Dev-dep ONLY — the production runner
-# takes a caller-supplied executor; the minter is needed only to CONSTRUCT one in the unit tests.
-# NO cycle: nothing in the production DAG depends back on myelin-ci-sandbox.
-myelin-events = { path = "../myelin-events" }
+# Dev-dep ONLY: the reindex/replay unit tests (EB-27 / P-327) build an `Actor(Principal::stub(..))`
+# to drive `events::reindex` through the outbox. Production `replay.rs` takes refs only — it never
+# names `Principal` outside `#[cfg(test)]`. NO production DAG edge (test-only).
+myelin-identity = { path = "../myelin-identity" }

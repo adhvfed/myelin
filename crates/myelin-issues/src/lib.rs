@@ -112,4 +112,7 @@ pub mod events;
 pub mod holder_intent;
 pub mod query_coown;
 pub mod rebac_fragment;
+pub mod replay;
 pub mod schema;
+
+pub use replay::{IssueReindexSource, IssueReplayKind};

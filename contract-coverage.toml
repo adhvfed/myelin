@@ -200,8 +200,12 @@ status = "covered"
 # consumer proving cold == live (BUS-D5). EB-26/P-246 (M3) FILLED the two M3-owner `replay` bodies:
 # Git's per-repo/per-blob/per-PR replay (`myelin_git::replay::GitReindexSource`) + Knowledge's
 # page-subtree-at-BLOCK-granularity replay (`myelin_content::replay::KnowledgeReindexSource`) — both
-# proven cold == live + idempotent against THIS seam. FLOOR (M4 owners, EB-27): CI one-run, Issues/Chat,
-# Refs per-blob, Search full reindex land with those subsystems' M4 prompts.
+# proven cold == live + idempotent against THIS seam. EB-27/P-327 (M4) FILLED the M4-owner `replay`
+# bodies: CI's one-run replay (`myelin_ci_sandbox::replay::CiReindexSource` — run:/deployment:/pipeline:
+# granular) + Issues' replay (`myelin_issues::replay::IssueReindexSource` — issue/relation/comment/rollup)
+# + Chat's durable replay (`myelin_chat::replay::ChatReindexSource` — channel/message/thread; the
+# firehose-only frames recover via resume, not replay) — all proven cold == live + idempotent + erased-skip
+# (X-7). FLOOR (still owed): Refs per-blob, Search full reindex land with those subsystems' own prompts.
 # GIT-P30/P-291 (M3-G7) greens GIT-D3 (reindex-from-source PARITY): the end-to-end drill that wipes +
 # rebuilds ALL THREE Git-fed derived stores (Search code index, the check_status projection, the Refs
 # lifecycle edges) and proves the cold rebuild BYTE-MATCHES live (one code path, no drift) + the
@@ -255,9 +259,15 @@ status = "covered"
 # architecture-03 §1 OWNER taxonomy (the page/block/database/view/row/comment/mention lifecycle +
 # access/DSR + the cross-cutting *.erased/*.snapshot) and proves every KnowledgeChange the emit seam
 # can produce maps to a registered, grammatical token (cdc_2_2_2_3_2_4_2_9_kn_d7_outbox.rs).
+# EB-27/P-327 (M4) validates the M4 owners' lists (CI/Issues/Chat) through the SAME harness
+# (cdc_2_9_m4_token_lists.rs — admits each completed list in full + rejects a malformed addition
+# loudly); CI's complete `ci.*` list lands in `myelin_ci_sandbox::events` (the M4 names freeze, split
+# durable-via-outbox vs firehose-only ci.log.appended; the Δ1-superseded ci.status.updated /
+# ci.run.passed deliberately absent). Issues/Chat already completed their lists (ISS-P03 / CHAT-P1).
 cdc = [
     "crates/myelin-events/tests/cdc_2_9_taxonomy.rs",
     "crates/myelin-events/tests/cdc_2_9_token_list_harness.rs",
+    "crates/myelin-events/tests/cdc_2_9_m4_token_lists.rs",
     "crates/myelin-git/tests/cdc_2_9_git_tokens.rs",
     "crates/myelin-git/tests/cdc_2_9_git_token_list_harness.rs",
     "crates/myelin-chat/tests/cdc_2_9_chat_tokens.rs",
@@ -818,8 +828,7 @@ landing = "P-165"
 [[contract]]
 row = "5.9"
 title = "Git<->CI CheckStatus seam"
-status = "deferred"
-landing = "P-282"
+status = "covered"
 # GIT-P6/P-232 DECLARED the consumer half: the `check_status` projection-table schema keyed
 # (commit_oid, context), the monotonic `run_attempt` supersession rule, the `required`-set policy +
 # the gate outcome, and the typed `CheckStatus` consumer view that decodes the OPAQUE Bus payload
@@ -885,9 +894,30 @@ landing = "P-282"
 # `crates/myelin-git/tests/integration_git_p22_fork_cache_confinement.rs` (--features integration: 0 fork
 # writes in the trusted scope on the real server). The fork-gate mutation floor is MET (cargo-mutants on
 # `fork_gate.rs`: 18 caught / 0 missed / 5 unviable — 100% of viable mutants on the endorsement + cache-
-# confinement path). The row stays DEFERRED because the seam is not yet live END-TO-END (no real CI
-# PRODUCER until M4). The merge queue (durable workflow, exactly-once merge, the `ci.result` rollup wait)
-# is GIT-P23.
+# confinement path). The merge queue (durable workflow, exactly-once merge, the `ci.result` rollup wait)
+# is GIT-P23/P-285 (parks on ci.result, exactly-once merge — LANDED).
+# EB-27/P-327 (M4) LANDED THE PRODUCER LEG END-TO-END — the row flips to COVERED. CI's producer side
+# is `myelin_events::check_seam::{check_updated_draft, rollup_ci_result, ci_result_draft}` (the Bus's
+# narrow carriage half: CI emits `ci.check.updated` per (commit_oid, context) + derives + emits the
+# rollup `ci.result` the merge-queue waits on). With Git's consumer leg (EB-26), the merge gate +
+# fork endorsement (GIT-P21/P22), and the merge-queue durable workflow (GIT-P23/P-285) all live, the
+# X-1 seam is now END-TO-END. GIT-D10 / CI-D8 each GREEN in
+# `crates/myelin-events/tests/drills_eb27_check_seam_e2e.rs` (out-of-order/dup ci.check.updated →
+# run_attempt-monotonic supersession drops stale; fork self-green NEUTRAL until endorsed; a
+# doubly-delivered ci.result → the merge-queue wakes EXACTLY ONCE → 0 double-merge). The Bus's role
+# stays NARROW (envelope conformance + per-aggregate ordering + at-least-once + the idempotent
+# wait_for_signal substrate); CI/Git own the CheckStatus shape, supersession, trust gating, the merge
+# gate. The producer/consumer split was kept across bands (M4 producer DEPENDS-ON M3 consumer). The
+# producer-leg carriage is ALSO proven over the LIVE NATS JetStream stack in
+# `crates/myelin-events/tests/integration_eb27_check_seam_producer.rs` (envelope conformance for the
+# checks AND the rollup + broker-dedup of a re-published ci.result + per-aggregate ordering — run with
+# --features integration).
+cdc = [
+    # the Bus's carriage CDC (the narrow half — envelope + ordering + the wait substrate)
+    "crates/myelin-events/tests/cdc_5_9_check_seam_carriage.rs",
+    # Git's consumer leg (the projection over the ordered carriage — provider+consumer markers)
+    "crates/myelin-git/tests/cdc_5_9_check_status_consumer.rs",
+]
 
 # ──────────────── §6 Search (myelin-search) ─────────────────────────────────────────────────────
 

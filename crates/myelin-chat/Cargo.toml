@@ -49,6 +49,9 @@ myelin-notif = { path = "../myelin-notif" }
 # `channel:<id>` scope shape against the Bus-owned `myelin_events::FirehoseScope` (contract 3.5),
 # the `*`-rejecting chokepoint; no transport here, only that chat's scope shape fits the protocol.)
 serde.workspace = true
+# CHAT replay (EB-27 / P-327, M4): the `ChatReindexSource` snapshot payload is the references-only
+# `serde_json::Value` the Bus's `SnapshotDraft` carries (the durable channel/message/thread re-emit).
+serde_json.workspace = true
 
 [dev-dependencies]
 # The Identity namespace ENGINE — the CDC for contract 4.9 admits chat's RICH fragment (the

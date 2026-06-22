@@ -361,14 +361,16 @@ pub mod upcast;
 /// durable `wait_for_signal("ci.result", idem_key)` substrate
 /// ([`check_seam::CiResultWaitSubstrate`] — a doubly-delivered `ci.result` wakes EXACTLY once,
 /// contract 9.4). It does NOT own the `CheckStatus` shape, the supersession rule, trust-tier
-/// gating, or the merge gate (all CI/Git, contract 5.9). FLOORS: the CONSUMER leg (Git's
-/// `check_status` projection over this ordered carriage) is EB-26 / P-246 (M3); the PRODUCER leg
-/// (CI emits `ci.check.updated` + the rollup `ci.result`) is EB-27 (M4) — the seam goes end-to-end
-/// there; the real `myelin-flow` durable engine behind `wait_for_signal` is P-FLOW-04 (this is its
-/// in-cell signal substrate).
+/// gating, or the merge gate (all CI/Git, contract 5.9). The CONSUMER leg (Git's `check_status`
+/// projection over this ordered carriage) is LIVE as of EB-26 / P-246 (M3); the PRODUCER leg (CI
+/// emits `ci.check.updated` + the rollup `ci.result` via [`check_seam::ci_result_draft`] /
+/// [`check_seam::rollup_ci_result`]) is LIVE as of EB-27 / P-327 (M4) — the seam is now END-TO-END
+/// (GIT-D10 / CI-D8). FLOOR: the real `myelin-flow` durable engine behind `wait_for_signal` is
+/// P-FLOW-04 (this is its in-cell signal substrate, unchanged in shape when the engine lands).
 pub use check_seam::{
-    check_aggregate, check_subject, check_updated_draft, CheckSeamError, CheckSeamOrder, CiOverall,
-    CiResult, CiResultWaitSubstrate, OrderedCheck, WakeOutcome,
+    check_aggregate, check_subject, check_updated_draft, ci_result_draft, ci_result_subject,
+    rollup_ci_result, CheckSeamError, CheckSeamOrder, CiOverall, CiResult, CiResultWaitSubstrate,
+    OrderedCheck, WakeOutcome,
 };
 pub use consumer::{
     consume, Consumer, ConsumerName, ConsumerSpec, DeadLetter, Delivered, Message,

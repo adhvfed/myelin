@@ -2137,6 +2137,7 @@ dependencies = [
  "myelin-storage",
  "myelin-tenancy",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2146,6 +2147,7 @@ dependencies = [
  "myelin-config",
  "myelin-events",
  "myelin-flow",
+ "myelin-identity",
  "myelin-refs",
  "myelin-tenancy",
  "serde",
