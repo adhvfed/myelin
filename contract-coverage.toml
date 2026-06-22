@@ -492,11 +492,20 @@ title = "per-subsystem ReBAC namespace fragment (engine + admit-contract + core 
 # Knowledge fragment (PROVIDER) admits the four rich FragmentDefs into the cell schema and its
 # rewrites resolve the page-tree override LEAK-FREE (a `- direct_block` sub-page is absent from
 # list_objects INCLUDING the COUNT). The Id-side compiled-fragment CDCs co-own the PROVIDER half.
+# The KNOWLEDGE-side CONSUMER half (KN-P15 / P-305, M3) ships in `myelin-knowledge`: the read-side
+# names-only fragment carrier (`myelin_knowledge::rebac_fragment` — the `space`/`page`/`block`/
+# `database_row` types + the §5 read relations/permissions, the SAME canonical names the engine's
+# rich fragment resolves over, asserted against the write-side carrier + the §5 vocabulary) + the
+# page.read OVERRIDE-FORMULA gate (`page_read_override`: `(inherited ∪ direct_reader) − direct_block`
+# — `direct_block` removes a narrowed sub-page, `direct_reader` adds it, the exclusion wins last) +
+# the row-level `SetExpr` push-down SHAPE (`InRelation { row_reader, db_row.id }`, the KN-P16 SQL
+# lowering target) + the no-cross-db lint green. The leak-critical SQL lowering itself is KN-P16/P-306.
 status = "covered"
 cdc = [
     "crates/myelin-identity-service/tests/cdc_4_9_namespace_engine.rs",
     "crates/myelin-identity-service/tests/cdc_4_9_git_fragment.rs",
     "crates/myelin-identity-service/tests/cdc_4_9_knowledge_fragment.rs",
+    "crates/myelin-knowledge/tests/cdc_4_9_knowledge_rebac_fragment.rs",
     "crates/myelin-git/tests/cdc_4_9_git_fragment.rs",
     # The CODEOWNERS-as-relations RESOLVER slice (GIT-P16 / P-277, M3-G3): Git owns the CODEOWNERS
     # file PARSE + the path MATCHER (00-overview §1.1: "Git decides which glob a change matches"); the
