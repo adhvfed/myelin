@@ -1905,10 +1905,19 @@ title = "residency_verify -> SignedAttestation"
 # so an extra-EU mirror target FAILs residency_verify WITHOUT a code change; the cross-crate CDC
 # `cdc_10_5_mirror_crossing_flag.rs` proves Storage's flag and the control-plane `mirror_allowed` gate
 # agree on the crossing). The aggregation shape does not change for any of the three follow-ons.
+# The CI-STORE COVERAGE EXTENDS this same row in M4 (P-CP-17 / P-324 — LANDED: the control plane's
+# `residency_verify_ci` (RequiredStoreSet::M1AndCi) attests over the M1 stores AND the CI surfaces —
+# the CI runner pool / log tier (11.8) / artifact store / cache namespaces (11.2); a wrong-region or
+# absent CI store FAILs the SAME aggregation (residency_verify_over), closing the P-085 M1-only named
+# partial — the no-global-CI-pool property is attestable per-tenant. The CI-coverage CDC pair below
+# proves a CI-coverage attestation provider + an auditor consumer that DEMANDS CI coverage agree; the
+# CI-R3 drill (ci_r3_residency_verify_ci_drill.rs) proves the gate goes red on a wrong-region CI
+# runner/log/cache. The in-region runner-CLAIM enforcement is the sibling P-CP-18 / P-325.
 status = "covered"
 cdc = [
     "crates/myelin-storage/tests/cdc_12_4_storage_residency_report.rs",
     "crates/myelin-storage/tests/cdc_10_5_mirror_crossing_flag.rs",
+    "crates/myelin-control-plane/tests/cdc_12_4_residency_verify_ci_coverage.rs",
 ]
 
 [[contract]]

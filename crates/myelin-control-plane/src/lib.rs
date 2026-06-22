@@ -94,15 +94,19 @@
 //!   gateway accepts a request IFF the tenant's `home_cell` is THIS cell; the multi-cell resolution
 //!   path (a member cell serving a slice, the `CrossCellPointer` bridge) goes live in **M5
 //!   (P-CP-19 / P-CP-20)**.
-//! - **`residency_verify` over the M1 store set is LIVE (P-CP-09 / P-085, [`residency_verify`]).**
-//!   [`residency_verify::residency_verify`] aggregates every M1 store's region report
-//!   (OLTP/blob/index/KMS) into a signed, PII-free [`residency_verify::SignedAttestation`]
-//!   (`every_store_region == tenant.region`); a store reporting a wrong region — or a silently-absent
-//!   store — makes the attestation **FAIL** (not a silent pass). **NAMED PARTIAL:** the store set is
-//!   the **M1 stores only**; the **CI runner pool + log/artifact/cache coverage is the M4 follow-on
-//!   P-CP-17** (it extends this SAME `residency_verify` over the CI surfaces). The CP-D3 write-boundary
-//!   runtime drill + STOR-D5 cross-region egress ride the four-layer enforcement (P-CP-12), against
-//!   the live stack.
+//! - **`residency_verify` over the M1 store set AND the CI surfaces is LIVE (P-CP-09 / P-085 +
+//!   P-CP-17 / P-324, [`residency_verify`]).** [`residency_verify::residency_verify`] aggregates every
+//!   M1 store's region report (OLTP/blob/index/KMS) into a signed, PII-free
+//!   [`residency_verify::SignedAttestation`] (`every_store_region == tenant.region`);
+//!   [`residency_verify::residency_verify_ci`] (P-CP-17) extends the SAME mechanism over the **CI
+//!   runner pool + CI log tier + CI artifact store + CI cache namespaces**
+//!   ([`residency_verify::ResidencyStoreClass::CI_SET`]). A store — M1 or CI — reporting a wrong
+//!   region, or a silently-absent store, makes the attestation **FAIL** (not a silent pass). **The
+//!   P-CP-09 M1-only named partial is CLOSED:** the no-global-CI-pool property is now attestable
+//!   per-tenant (a CI runner that executed a tenant's job in the wrong region fails
+//!   `residency_verify`). The in-region runner-CLAIM enforcement is the sibling **P-CP-18**; the CP-D3
+//!   write-boundary runtime drill + STOR-D5 cross-region egress ride the four-layer enforcement
+//!   (P-CP-12), against the live stack.
 //! - **The GeoDNS/anycast discovery edge is `[OPEN → P4 (infra)]`** (architecture §7.3) — a latency
 //!   optimisation that fronts the PII-free discovery contract with a geo-routed edge. **v1 is
 //!   CP-lookup + client cache** ([`discover::DiscoveryCache`]); the edge is an infra follow-on, not a
@@ -182,8 +186,9 @@ pub use provision::{
 };
 pub use registry::{PlacementError, Registry};
 pub use residency_verify::{
-    residency_verify, ResidencyAttestationSignal, ResidencyMismatch, ResidencySigningKey,
-    ResidencyStoreClass, SignedAttestation, StoreRegionReport,
+    residency_verify, residency_verify_ci, residency_verify_over, RequiredStoreSet,
+    ResidencyAttestationSignal, ResidencyMismatch, ResidencySigningKey, ResidencyStoreClass,
+    SignedAttestation, StoreRegionReport,
 };
 pub use schema::{
     Capacity, Cell, CellProvisioning, CellStatus, IsolationKind, LocalTenant, PlacementStatus,
