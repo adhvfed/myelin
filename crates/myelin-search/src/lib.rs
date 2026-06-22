@@ -112,6 +112,7 @@
 
 pub mod analysis;
 pub mod cache;
+pub mod ci_log_projection;
 pub mod compiler;
 pub mod consistency;
 pub mod dek;
@@ -137,6 +138,13 @@ pub mod vector;
 pub use cache::{
     should_bypass, zookie_bucket, CacheStats, CacheTtl, FilterCache, ResultCache,
     TtlExceedsRevocationSla,
+};
+pub use ci_log_projection::{
+    ci_log_details_ref, ci_log_doc_ref, ci_log_index_spec, ci_log_index_specs,
+    ci_log_search_projection, parse_step_anchor, register_ci_log_index_specs,
+    CiLogDurableSegmentNotFirehoseFloor, CiLogProjectionInput, CiLogStepAnchor,
+    CI_LOG_ACL_OBJECT_TYPE, CI_LOG_TYPE, CI_SUBSYSTEM, FACET_JOB_ID as CI_LOG_FACET_JOB_ID,
+    FACET_RUN_ID as CI_LOG_FACET_RUN_ID, FACET_STEP_NO as CI_LOG_FACET_STEP_NO,
 };
 pub use compiler::{
     compile, render, CompileError, CompiledPlan, ConjoinedPlan, FieldDecl, FieldKind, FieldSchema,
