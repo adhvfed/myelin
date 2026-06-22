@@ -337,6 +337,7 @@
 
 pub mod backlinks;
 pub mod cache;
+pub mod chat_producer;
 pub mod ci_producer;
 pub mod dek;
 pub mod edge_builder;
@@ -364,6 +365,9 @@ pub use backlinks::{
     FILTER_MODE_SPLIT_SIGNAL, SOURCE_ROOT_COLUMN,
 };
 pub use cache::{CacheFillError, R2ProjectionCache, R2_DEFAULT_TTL, R2_KEY_PREFIX};
+pub use chat_producer::{
+    ChatAnchorState, ChatEdgeProducer, ChatOwner, CHAT_CHANNEL_TYPE, CHAT_OWNER_TOKEN,
+};
 pub use ci_producer::{CiOwner, StepAnchorResolver, StepResolution, CI_OWNER_TOKEN};
 pub use dek::{ref_p5_inherited_gates, InheritedGate, RefsDekPin};
 pub use edge_builder::{

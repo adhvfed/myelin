@@ -2443,6 +2443,7 @@ version = "0.0.0"
 dependencies = [
  "blake3",
  "hex",
+ "myelin-chat",
  "myelin-content",
  "myelin-events",
  "myelin-gdpr",

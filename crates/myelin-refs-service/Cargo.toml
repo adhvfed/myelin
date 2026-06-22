@@ -92,6 +92,17 @@ myelin-git = { path = "../myelin-git" }
 # consumer. This is a CONSUMER edge (Refs consumes Issues' producer surface), the natural shape of
 # "Refs wires to the real Issues producer" (REF-P20 DELIVERABLE).
 myelin-issues = { path = "../myelin-issues" }
+# The REAL Chat producer (REF-P21 / P-337, M4 — the maximal consumer; cross-subsystem traversal
+# complete). Chat is the FINAL producer: its mention/artifact_ref/embed nodes produce reference
+# edges (consuming `resolve` for every unfurl) and it owns the `message-`/`thread-` `#sub` mints
+# (contracts 5.4/5.6/5.7). Refs reuses Chat's canonical `message-`/`thread-` mint codecs
+# (`myelin_chat::subs::mint_message`/`mint_thread`) + its frozen ReBAC fragment names
+# (`channel.read = member + parent_project->read`, `myelin_chat::rebac_fragment`) by NAME (X-5),
+# never a literal. `myelin-chat` is a SUBSYSTEM (producer) crate that depends on `myelin-refs` (the
+# GLUE value-type crate), NOT on `myelin-refs-service`, so this is acyclic and refs-service stays the
+# graph's terminal leaf consumer. This is a CONSUMER edge (Refs consumes Chat's producer surface),
+# the natural shape of "Refs wires to the real Chat producer" (REF-P21 DELIVERABLE).
+myelin-chat = { path = "../myelin-chat" }
 # BLAKE3 + hex — the content-anchored Git line-range fingerprint (REF-P15 / P-164, §3.5: a
 # `#L<a>-L<b>` carries a BLAKE3 fingerprint of the anchored lines so resolution is content-anchored,
 # not positional). The SAME `blake3:<hex>` multihash convention the BlobStore content-address + the
