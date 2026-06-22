@@ -2369,6 +2369,7 @@ dependencies = [
  "myelin-lints",
  "myelin-query",
  "myelin-refs",
+ "myelin-search",
  "myelin-storage",
  "myelin-substrate",
  "myelin-tenancy",

@@ -825,14 +825,36 @@ landing = "P-282"
 [[contract]]
 row = "6.1"
 title = "query(ast, viewer, zookie?, page) -> RankedResults"
-status = "deferred"
-landing = "P-171"
+# SRCH-P08/P-171 ships the Search-owned PROVIDER half: the permission-aware query pipeline that
+# ALWAYS conjoins the `list_objects` `Filter` (the leak-free pre-filter lowered to an `AclFilter`
+# conjoined into every engine branch BEFORE scoring; the `search-requires-acl-filter` discipline;
+# exactly one `list_objects` per query — no N+1). Its provider+consumer pair is
+# crates/myelin-search/tests/cdc_query_pipeline_6_1.rs.
+# KN-P21/P-311 (M3) adds the KNOWLEDGE CONSUMER half: `myelin_knowledge::search_feed::kn_search_query`
+# drives `query` ALWAYS through the conjoining entry, pinned to the `page` object type — the KN-D5
+# re-confirm: a confidential page appears in NEITHER the result NOR the COUNT (0 leak incl. COUNT).
+status = "covered"
+cdc = [
+    "crates/myelin-search/tests/cdc_query_pipeline_6_1.rs",
+    "crates/myelin-knowledge/tests/cdc_6_3_6_1_6_2_knowledge_search_feed.rs",
+]
 
 [[contract]]
 row = "6.2"
 title = "semantic(text|vec, viewer, k, filter_ast?)"
-status = "deferred"
-landing = "P-174"
+# SRCH-P11/P-174 ships the Search-owned PROVIDER half: the hybrid/semantic query path
+# (filter-during-traversal — k VISIBLE neighbours; RRF fusion of the lexical + semantic lists; the
+# SAME conjoined ACL filter on both branches so fusion can never introduce a hidden doc). Its
+# provider+consumer pair is crates/myelin-search/tests/cdc_semantic_6_2.rs.
+# KN-P21/P-311 (M3) adds the KNOWLEDGE CONSUMER half: `myelin_knowledge::search_feed::kn_search_semantic`
+# drives `semantic`/RAG (an agent's delegated principal as viewer) ALWAYS through the conjoining
+# entry — the KN-D5 vector half re-confirmed over the KN corpus: a confidential page never enters
+# the visible-neighbour set (0 leak through the RAG path).
+status = "covered"
+cdc = [
+    "crates/myelin-search/tests/cdc_semantic_6_2.rs",
+    "crates/myelin-knowledge/tests/cdc_6_3_6_1_6_2_knowledge_search_feed.rs",
+]
 
 [[contract]]
 row = "6.3"
@@ -875,12 +897,20 @@ status = "covered"
 # thresholds-file value (one source of truth, `flex_db.facet_promotion_ratio`) and that the trigger
 # is STRICTLY >5% (a facet at exactly 5% does NOT promote — the frozen wording, never weakened). The
 # promotion ACT (provisioning the generated-column index off the bus) is the NAMED KN-P31 (M5) floor.
+# KN-P21 / P-311 (M3) RE-HOMES the Knowledge owned 6.3 surface into the Knowledge SERVICE crate (the
+# emitter-less SRCH-P17 model said "when the Knowledge service crate lands it re-homes the specs
+# verbatim; the SHAPE does not change"): `myelin_knowledge::search_feed` re-exports the page + db_row
+# specs (PROVIDER — Knowledge declares) and Search ADMITS them (CONSUMER), AND drives the `project`
+# feed (`feed_project`) + the 6.1/6.2 Filter conjoin (the KN-D5 re-confirm, 0 leak incl. COUNT across
+# the FT + semantic/RAG paths). The provider+consumer pair is
+# crates/myelin-knowledge/tests/cdc_6_3_6_1_6_2_knowledge_search_feed.rs.
 cdc = [
     "crates/myelin-git/tests/cdc_6_3_git_code_projection.rs",
     "crates/myelin-git/tests/cdc_6_5_git_code_projection_emitter.rs",
     "crates/myelin-issues/tests/cdc_6_3_issues_facets_projection.rs",
     "crates/myelin-search/tests/cdc_6_3_kn_index_specs.rs",
     "crates/myelin-knowledge/tests/cdc_13_3_6_3_knowledge_flex_db.rs",
+    "crates/myelin-knowledge/tests/cdc_6_3_6_1_6_2_knowledge_search_feed.rs",
 ]
 
 [[contract]]
