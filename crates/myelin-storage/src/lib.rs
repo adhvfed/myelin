@@ -468,6 +468,22 @@ pub mod mirror;
 // is P-ST-27 (M4) — a key-class swap on the same DekContentWrap seam.
 pub mod erase;
 pub mod firehose_archive;
+// The T3 CI log tier (C2, P-ST-26 / P-328, M4, contract 11.8 the (job,step,byte-range) index +
+// consumed 5.9 the CheckStatus.details_ref #step-<n> resolution): the CI-keyed instance of the
+// P-ST-20 FirehoseArchiver (the SEALING + per-tenant-DEK mechanism — REUSED wholesale, never a
+// second seal path). It adds the ONE M4 follow-on P-ST-20 named: the `(job, step, byte-range)`
+// index. A CI log frame carries `(job, step, chunk-bytes)`; sealing a batch flushes a
+// content-addressed T2 segment (inheriting T2 encryption + crypto-shred) AND records, per
+// `(job, step)`, the byte-range that chunk occupies in the reconstructed step log — the
+// `(job, step, byte-range) → (segment-blob, offset)` resolver. `resolve_step_anchor` parses the
+// X-1 `myelin://.../ci/run/<id>#step-<n>` jump-to-failure sub-anchor (5.9 / OQ-D) and reads ONLY
+// the indexed segment(s), slicing out EXACTLY the failing step's bytes. A `#step-<n>` for a step
+// the index never saw is a LOUD CiLogError::UnknownStep. REUSES firehose_archive (P-147) +
+// residency's T3FirehoseArchive class (a CI log segment IS a T3 firehose segment — no new
+// variant). FLOORS NAMED: the per-SUBJECT CI-log DEK (C1) is the sibling P-ST-27 (a key-class swap
+// on the same DekContentWrap seam); the real OLTP `ci_log_index` table (UNIQUE(job,step,seq)) is
+// the P-S12/P-S15 backing swap (the in-process map is the index SHAPE).
+pub mod ci_log_index;
 pub mod gd4;
 // The minimal cache seam (Stage 1 / infra — NEW). No cache trait existed before; this is the
 // one-line-swap Cache trait (in-memory floor + Valkey/Redis backing behind `integration`).
@@ -556,6 +572,9 @@ pub use blob::{
 };
 pub use cache::{Cache, CacheError, InMemoryCache};
 pub use cdn::{CdnCloneClass, CdnEdgePop, CdnEdgeSet};
+pub use ci_log_index::{
+    CiLogError, CiLogFrame, CiLogIndex, CiLogTier, StepAnchor, StepSpan, CI_LOG_STREAM,
+};
 pub use coloc::{ColocError, ColocatedOltp, ColocatedTx, COLOCATED_OUTBOX_MIGRATION};
 pub use encryption::{
     key_class_for, ColumnCryptor, DekContentWrap, EncryptedColumn, KeyChoiceError, SubjectId,
