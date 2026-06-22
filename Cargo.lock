@@ -2361,6 +2361,8 @@ dependencies = [
 name = "myelin-knowledge"
 version = "0.0.0"
 dependencies = [
+ "myelin-agent",
+ "myelin-agent-service",
  "myelin-content",
  "myelin-events",
  "myelin-gdpr",

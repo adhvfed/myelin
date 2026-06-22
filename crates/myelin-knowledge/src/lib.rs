@@ -59,6 +59,18 @@
 /// edits live. KN-D2 re-runs over the integrated path (every block a `serialize(parse(md))===md`
 /// fixed point). The block tree + stable ids is the follow-on KN-P10 (P-300); no merge engine
 /// (KN-P13/P29) and no perms beyond tenant isolation (KN-P14/P16).
+/// Knowledge agent governance (KN-P27 / P-317, M3 / KN-M3e — drill KN-D11): the KN slice of the ONE
+/// tool catalogue (8.1 — tool identity + `required_caps` from the frozen `myelin-content` ReBAC
+/// carrier + the frozen §6.3 consequential-gate classification, the SINGLE source of truth the Fabric
+/// registration [`myelin_agent_service::knowledge_tools`] consumes), the "suggested by agent" collab
+/// attribution ([`agent::EditAuthor`] — an agent edit rides the SAME `SEND_OP` path a human does, 02
+/// §9, never disguised as a human), the HITL-withhold gate ([`agent::KnowledgeEffectGate`] — a
+/// consequential edit returns `Denied` + does NOT mutate until approval, AG-8), the per-effect
+/// `idem_key` (OQ-F — a double-click is one approval), and the reserve/settle bookend (11.7). The
+/// [`agent::KnowledgeAgentRun`] chained drill emits the dated KN-D11 green ([`agent::KnD11Receipt`] —
+/// 0 ungoverned mutation, 0 mutation before approval, 0 double-apply). The mock runtime (`--use-mock`)
+/// is the platform floor; the AG-7 content-addressed agent-trace holder the run writes into is KN-P28.
+pub mod agent;
 pub mod authority;
 pub mod block_tree;
 pub mod comments;

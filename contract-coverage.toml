@@ -1140,9 +1140,18 @@ row = "8.1"
 # against the CONSUMER (a subsystem contributing a ToolDef). The persisted catalogue + the
 # per-subsystem requires_approval defaults SEED are AG-P8 (→ P-220); the migration is AG-P2
 # (→ P-131) — IMPL follow-ons, not contract-pair gaps; the 8.1 signature pair carries both sides NOW.
+#
+# KN-P27 (→ P-317, M3) adds the KNOWLEDGE-slice CDC: the KN-domain SOURCE OF TRUTH
+# (myelin_knowledge::agent — the tool identity + the required_caps from the frozen myelin-content ReBAC
+# carrier + the frozen §6.3 consequential-gate classification) is pinned AGAINST the Fabric ToolDef
+# registration (myelin_agent_service::knowledge_tools, AG-P19) — the registered defs MUST carry the
+# KN-domain caps + gate byte-for-byte (a rename/gate-drift on either side is a compile/test break).
 title = "ToolSurface::register_tool(ToolDef)"
 status = "covered"
-cdc = ["crates/myelin-agent/tests/cdc_8_1_tool_surface.rs"]
+cdc = [
+    "crates/myelin-agent/tests/cdc_8_1_tool_surface.rs",
+    "crates/myelin-knowledge/tests/cdc_8_1_knowledge_agent_tools.rs",
+]
 
 [[contract]]
 row = "8.2"
@@ -1151,9 +1160,21 @@ row = "8.2"
 # (plan-then-apply returns exactly one of three outcomes; a gated effect does NOT mutate, AG-8)
 # against the CONSUMER (the loop / external MCP / a workflow activity branching on the outcome). The
 # eight-step pipeline BODY (AG-D1/D2/D3) is AG-P6 (→ P-218) — an IMPL follow-on, not a pair gap.
+#
+# KN-P27 (→ P-317, M3) adds the KNOWLEDGE-slice CDC: the KN agent-governance HALF
+# (myelin_knowledge::agent — the HITL withhold (no mutation, AG-8) + the per-effect idem_key + the
+# reserve/settle bookend the KN public endpoint applies before threading an op through the collab
+# protocol with "suggested by agent" attribution) is pinned AGAINST the FROZEN Fabric rules: the
+# per-effect idem_key derivation AGREES with myelin_agent_service::hitl_batch::per_effect_idem_key
+# (OQ-F — a double-click is one approval), and the KN-D11 chained drill (plans → withheld → approve →
+# applied once across a double-click → reserve/settle) is the consumer (0 ungoverned/0 pre-approval/0
+# double-apply).
 title = "EffectApi::apply (plan-then-apply)"
 status = "covered"
-cdc = ["crates/myelin-agent/tests/cdc_8_2_effect_api.rs"]
+cdc = [
+    "crates/myelin-agent/tests/cdc_8_2_effect_api.rs",
+    "crates/myelin-knowledge/tests/cdc_8_2_knowledge_agent_governance.rs",
+]
 
 [[contract]]
 row = "8.3"
