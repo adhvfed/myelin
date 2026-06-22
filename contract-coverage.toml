@@ -576,7 +576,7 @@ landing = "P-165"
 row = "5.9"
 title = "Git<->CI CheckStatus seam"
 status = "deferred"
-landing = "P-281"
+landing = "P-282"
 # GIT-P6/P-232 DECLARED the consumer half: the `check_status` projection-table schema keyed
 # (commit_oid, context), the monotonic `run_attempt` supersession rule, the `required`-set policy +
 # the gate outcome, and the typed `CheckStatus` consumer view that decodes the OPAQUE Bus payload
@@ -602,8 +602,31 @@ landing = "P-281"
 # the seam is not yet live END-TO-END: the consumer leg runs against a SYNTHETIC `ci.check.updated`
 # emitter (the X-1 seam-floor) — no real CI PRODUCER yet. The real CI producer wiring (CI emits
 # `ci.check.updated` + the rollup `ci.result`) is the M4 co-gate (GIT-D10/CI-D8 end-to-end) — only
-# then is the full provider+consumer CDC pair closeable to `covered`. The merge gate that READS this
-# projection is GIT-P21; the fork-endorsement is GIT-P22; the merge queue is GIT-P23.
+# then is the full provider+consumer CDC pair closeable to `covered`.
+# GIT-P21/P-282 (M3-G4) LANDED THE MERGE GATE + THE REQUIRED-SET POLICY (the owned half of 5.9 — "Git
+# owns what is allowed to land"): `myelin_git::merge_gate` is the bridge the gate fires across — it
+# parses a base_ref's branch-protection ruleset `required_contexts` strings (the `provider/name`
+# grammar) into typed `CheckContext`s (`parse_required_context`), resolves each against Git's OWN
+# `check_status` projection for the PR head_oid, applies the fork-endorsement trust posture (reads
+# `trust_tier` OFF the fact, never recomputes; an un-endorsed `untrusted_fork` success is NEUTRAL for
+# gating — Δ3), and returns the typed `MergeGateOutcome` (the 0-under-gated-merges decision: a
+# missing/stale/un-endorsed required context ALWAYS blocks). It REUSES the per-context gate logic in
+# `check_status` (`is_acceptable_satisfaction`) — no duplicate gate (EI-01 §7). The required-set policy
+# is GIT's, NOT CI's `required` bool (CI reports facts; Git decides which contexts gate this base_ref) —
+# proven in the CDC `crates/myelin-git/tests/cdc_5_9_merge_gate_required_set.rs` (Git's policy overrides
+# the CI bool; every non-green posture blocks). The chained e2e
+# (`crates/myelin-git/tests/e2e_git_p21_merge_gate.rs`) drives configure → partial → BLOCK → complete →
+# ADMIT + the fork-neutral-until-endorsed branch. The LIVE-store gate read
+# (`PgCheckStatusProjection::merge_gate`) reads the REAL `check_status` table — proven against the dev
+# Postgres stack (0 under-gated merges; fork-neutral; superseding-failure re-block) in
+# `crates/myelin-git/tests/integration_git_p21_merge_gate.rs` (run with --features integration). The
+# merge-gate mutation floor is MET (cargo-mutants on `merge_gate.rs`: 18 caught / 0 missed / 5 unviable —
+# 100% of viable mutants on the gate-decision path).
+# The row stays DEFERRED because the seam is not yet live END-TO-END (no real CI PRODUCER until M4).
+# The LIVE fork-endorsement RESOLUTION (`check(subject, approve_untrusted_ci, repo)` + the `fork:<pr_id>`
+# trust-scoped cache confinement) is GIT-P22 — here the endorsement is the explicit gate input, and the
+# neutral-until-endorsed rule already holds. The merge queue (durable workflow, exactly-once merge, the
+# `ci.result` rollup wait) is GIT-P23.
 
 # ──────────────── §6 Search (myelin-search) ─────────────────────────────────────────────────────
 
