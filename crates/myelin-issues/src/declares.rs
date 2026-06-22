@@ -191,23 +191,60 @@ pub const RULE_KEY_UNBLOCKED: &str = "issue.trigger.unblocked";
 /// The stable `rule_key` Issues' approval-requested HITL Signal carries (the §1 `approval.requested`
 /// gate surface) → the registered [`Reason::ApprovalRequested`] rule.
 pub const RULE_KEY_APPROVAL_REQUESTED: &str = "issue.approval.requested";
+/// The stable `rule_key` Issues' assignment Signal carries (an issue assigned to a principal —
+/// `issue.issue.assigned`, [`crate::events::ISSUE_ASSIGNED`]) → the registered [`Reason::Assigned`]
+/// rule (the bounded DIRECT write-fanout set — an assignee is an explicit target, §3.5). The
+/// flagship "My Work" reason: an assigned issue is the first row a person sees in their filtered view.
+pub const RULE_KEY_ASSIGNED: &str = "issue.assigned";
+/// The stable `rule_key` Issues' "your issue is now blocked" Signal carries (a `blocks` relation
+/// edge landed on an issue you own/watch) → the registered [`Reason::Blocked`] rule (the ambient
+/// WATCHING band — a calm "this is now blocked", the mirror of the flagship `unblocked` re-surface).
+pub const RULE_KEY_BLOCKED: &str = "issue.blocked";
 
-/// Build Issues' **`define_notif_rule` reason set** (contract 7.6) — the deliverable of ISS-P04 /
-/// P-243. Returns the three `(rule_key, NotifRule)` pairs Issues registers: SLA-at-risk
-/// ([`Reason::Sla`]), unblocked ([`Reason::Unblocked`]), and approval-requested
-/// ([`Reason::ApprovalRequested`]). Each rule is built via the frozen [`define_notif_rule`] verb, so
-/// the supplied `default_class` is RECONCILED against Notif's §3.1 ranking table (Issues registers
-/// WHICH reason; the table owns the band) — a band that disagreed would fail loudly here, never
-/// silently mis-rank in prod.
+/// Build Issues' **`define_notif_rule` reason set** (contract 7.6) — the **FULL** Issues consumer
+/// set accreted at NOTIF-P21 (P-342): the six reasons the §1.3 "My Work" filtered view pins on —
+/// **assigned** ([`Reason::Assigned`] → [`Class::Direct`]), **blocked** ([`Reason::Blocked`] →
+/// [`Class::Watching`]), **needs-approval** ([`Reason::ApprovalRequested`] → [`Class::Critical`]),
+/// **overdue/SLA** ([`Reason::Sla`] → [`Class::Critical`]), **unblocked** ([`Reason::Unblocked`] →
+/// [`Class::Watching`], the flagship "remind me when unblocked" trigger). ISS-P04/P-243 shipped the
+/// SLA/unblocked/approval slice; NOTIF-P21 completes the set with `assigned` + `blocked` so the
+/// "My Work" view ([`InboxFilter::issues_my_work`](myelin_notif::InboxFilter::issues_my_work),
+/// `reason∈{assigned, mentioned, review_requested, sla, watched, blocked, approval_requested}`) is
+/// driven by a registered Issues rule for every reason Issues owns. Each rule is built via the frozen
+/// [`define_notif_rule`] verb, so the supplied `default_class` is RECONCILED against Notif's §3.1
+/// ranking table (Issues registers WHICH reason; the table owns the band) — a band that disagreed
+/// would fail loudly here, never silently mis-rank in prod.
 ///
 /// The dedup templates collapse a storm by `(recipient, subject)`: five SLA pings on one issue, or
 /// repeated unblock checks, collapse into ONE inbox row (the §3.2 write-time collapse).
 pub fn issue_notif_rules() -> Vec<(&'static str, NotifRule)> {
     vec![
         (
+            RULE_KEY_ASSIGNED,
+            // Assigned → the DIRECT band (the bounded write-fanout set — an assignee is an explicit
+            // target). One row per (recipient, issue) — a re-assign churn on the same issue collapses.
+            define_notif_rule(
+                Reason::Assigned,
+                DedupTpl("issue.assigned:{recipient}:{subject}".to_string()),
+                Class::Direct,
+            )
+            .expect("Reason::Assigned reconciles to Class::Direct in the §3.1 table"),
+        ),
+        (
+            RULE_KEY_BLOCKED,
+            // Blocked → the WATCHING (ambient) band — the calm mirror of the `unblocked` re-surface.
+            // One row per (recipient, issue) — repeated block edges on the same issue collapse.
+            define_notif_rule(
+                Reason::Blocked,
+                DedupTpl("issue.blocked:{recipient}:{subject}".to_string()),
+                Class::Watching,
+            )
+            .expect("Reason::Blocked reconciles to Class::Watching in the §3.1 table"),
+        ),
+        (
             RULE_KEY_SLA_AT_RISK,
-            // SLA at-risk → the CRITICAL band (pierces quiet-hours; the SLA timer fired). One row
-            // per (recipient, issue) — repeated at-risk pings on the same issue collapse.
+            // SLA at-risk / overdue → the CRITICAL band (pierces quiet-hours; the SLA timer fired).
+            // One row per (recipient, issue) — repeated at-risk pings on the same issue collapse.
             define_notif_rule(
                 Reason::Sla,
                 DedupTpl("issue.sla:{recipient}:{subject}".to_string()),
@@ -228,8 +265,8 @@ pub fn issue_notif_rules() -> Vec<(&'static str, NotifRule)> {
         ),
         (
             RULE_KEY_APPROVAL_REQUESTED,
-            // Approval-requested → the CRITICAL band (the HITL approval card; the human must act).
-            // One row per (recipient, issue) — a re-requested approval on the same issue collapses.
+            // Approval-requested (needs-approval) → the CRITICAL band (the HITL approval card; the
+            // human must act). One row per (recipient, issue) — a re-requested approval collapses.
             define_notif_rule(
                 Reason::ApprovalRequested,
                 DedupTpl("issue.approval:{recipient}:{subject}".to_string()),
@@ -378,19 +415,40 @@ mod tests {
 
     // --- §2: the define_notif_rule reason set ---
 
-    /// **The reason set IS the three frozen Issues reasons at their §3.1 bands.** SLA → critical,
-    /// unblocked → watching, approval-requested → critical. A re-band (a `define_notif_rule`
-    /// reconciliation drop) would have made the construction panic; this pins the accepted result.
+    /// **The reason set IS the six frozen Issues reasons at their §3.1 bands.** assigned → direct,
+    /// blocked → watching, SLA → critical, unblocked → watching, approval-requested → critical. A
+    /// re-band (a `define_notif_rule` reconciliation drop) would have made the construction panic;
+    /// this pins the accepted result.
     #[test]
-    fn notif_rules_are_the_three_issues_reasons_at_their_bands() {
+    fn notif_rules_are_the_issues_reasons_at_their_bands() {
         let rules = issue_notif_rules();
         assert_eq!(
             rules.len(),
-            3,
-            "exactly the three Issues reasons (SLA / unblocked / approval)"
+            5,
+            "the five distinct Issues consumer reasons (assigned / blocked / SLA / unblocked / approval)"
         );
 
         let by_key: BTreeMap<&str, &NotifRule> = rules.iter().map(|(k, r)| (*k, r)).collect();
+
+        let asg = by_key
+            .get(RULE_KEY_ASSIGNED)
+            .expect("assigned rule registered");
+        assert_eq!(asg.reason, Reason::Assigned);
+        assert_eq!(
+            asg.default_class,
+            Class::Direct,
+            "assigned is a direct target"
+        );
+
+        let blk = by_key
+            .get(RULE_KEY_BLOCKED)
+            .expect("blocked rule registered");
+        assert_eq!(blk.reason, Reason::Blocked);
+        assert_eq!(
+            blk.default_class,
+            Class::Watching,
+            "blocked re-surfaces calmly"
+        );
 
         let sla = by_key
             .get(RULE_KEY_SLA_AT_RISK)
@@ -437,9 +495,24 @@ mod tests {
         register_issue_notif_rules(&mut reg);
         assert_eq!(
             reg.len(),
-            before + 3,
-            "the three Issues rules accreted (no Notif change)"
+            before + 5,
+            "the five Issues rules accreted (no Notif change)"
         );
+
+        // assigned → direct.
+        let c = reg.classify(RULE_KEY_ASSIGNED, "psn:alice", &subject);
+        assert_eq!(c.reason, Reason::Assigned);
+        assert_eq!(c.default_class, Class::Direct);
+        assert!(
+            c.from_registered_rule,
+            "the registered Issues rule took effect"
+        );
+
+        // blocked → watching.
+        let c = reg.classify(RULE_KEY_BLOCKED, "psn:alice", &subject);
+        assert_eq!(c.reason, Reason::Blocked);
+        assert_eq!(c.default_class, Class::Watching);
+        assert!(c.from_registered_rule);
 
         // SLA at-risk → critical.
         let c = reg.classify(RULE_KEY_SLA_AT_RISK, "psn:alice", &subject);

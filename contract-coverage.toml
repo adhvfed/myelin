@@ -1183,8 +1183,17 @@ cdc = [
 row = "7.5"
 title = "oncall_now / page (escalation)"
 status = "covered"
+# The Notif machinery (the FROZEN §2.4 chain shape + oncall_now + page + the durable wheel) is owned +
+# frozen at NOTIF-P14/P-192 (cdc_7_5_notif_escalation.rs). NOTIF-P21/P-342 ships the ISSUES consumer
+# slice: Issues passes its REAL three-tier SLA escalation chain (team -> project -> org incident lead,
+# `myelin_issues::sla_escalation::issue_sla_escalation_policy`) which REPLACES the Notif-defined
+# `test_chain` floor. The CDC carries BOTH provider (Issues' real chain is the frozen 3-tier shape) +
+# consumer (Notif's EscalationEngine starts + walks it on the durable wheel, exactly-once) sides; the
+# ISS-D6 chain-start drill (drill_iss_d6_sla_escalation.rs) proves the breach starts the chain, walks
+# it across a kill exactly-once, and the ack halts it. ZERO Notif code change (the inverse-signal).
 cdc = [
     "crates/myelin-notif/tests/cdc_7_5_notif_escalation.rs",
+    "crates/myelin-issues/tests/cdc_7_5_4_9_issues_sla_escalation.rs",
 ]
 
 [[contract]]
@@ -1234,6 +1243,19 @@ cdc = [
     # watcher-relation slice for the read-fanout half (the fragment-admit slice stays
     # cdc_4_9_knowledge_fragment).
     "crates/myelin-identity-service/tests/cdc_7_6_4_9_knowledge_notif_rules.rs",
+    # ISSUES slice — issues (NOTIF-P21 / P-342, M4) declares the FULL consumer reason set (assigned->
+    # direct / blocked->watching / SLA->critical / unblocked->watching / approval_requested->critical,
+    # each via the frozen `define_notif_rule` verb reconciled against the §3.1 table —
+    # `myelin_issues::declares::issue_notif_rules`, extended from the ISS-P04 SLA/unblocked/approval
+    # slice) AND wires its REAL issue watcher reverse index behind the frozen `WatcherResolvePort`
+    # (4.3/4.10 — `myelin_issues::sla_escalation::IssueWatcherIndex`), over the `watcher` relation its
+    # frozen ReBAC fragment declares (4.9, on `issue`). Notif ADMITS + ROUTES the rules + READ-FANS-OUT a
+    # viewer's ambient "My Work" slice over the real watcher graph (replacing the NOTIF-P13 synthetic
+    # fixtures for Issues subjects) — zero Notif change, the THIRD consumer no harder than the first. The
+    # 7.6 reason-set CDC is cdc_7_6_issues_notif_rules.rs; the 4.9 watcher read-fanout half + the 7.5
+    # real-chain half are in cdc_7_5_4_9_issues_sla_escalation.rs (the C-9 "My Work" invariant is
+    # integration_issues_my_work_c9.rs; the ISS-D6 chain-start drill is drill_iss_d6_sla_escalation.rs).
+    "crates/myelin-issues/tests/cdc_7_5_4_9_issues_sla_escalation.rs",
 ]
 
 # 7.7 SPLIT: the HOLDER HALF (registration + locate/export/rectify/restrict + the structural

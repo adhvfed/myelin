@@ -29,8 +29,8 @@
 use std::collections::BTreeMap;
 
 use myelin_issues::declares::{
-    issue_notif_rules, register_issue_notif_rules, RULE_KEY_APPROVAL_REQUESTED,
-    RULE_KEY_SLA_AT_RISK, RULE_KEY_UNBLOCKED,
+    issue_notif_rules, register_issue_notif_rules, RULE_KEY_APPROVAL_REQUESTED, RULE_KEY_ASSIGNED,
+    RULE_KEY_BLOCKED, RULE_KEY_SLA_AT_RISK, RULE_KEY_UNBLOCKED,
 };
 use myelin_notif::{
     define_notif_rule, Class, DedupTpl, DefineRuleError, NotifRule, NotifRuleRegistry, Reason,
@@ -47,8 +47,20 @@ fn subject() -> ArtifactRef {
 #[test]
 fn producer_issues_declares_the_three_reasons_at_their_bands() {
     let rules = issue_notif_rules();
-    assert_eq!(rules.len(), 3, "exactly the three Issues reasons");
+    assert_eq!(
+        rules.len(),
+        5,
+        "the full Issues consumer reason set (NOTIF-P21)"
+    );
     let by_key: BTreeMap<&str, &NotifRule> = rules.iter().map(|(k, r)| (*k, r)).collect();
+
+    let asg = by_key.get(RULE_KEY_ASSIGNED).expect("assigned rule");
+    assert_eq!(asg.reason, Reason::Assigned);
+    assert_eq!(asg.default_class, Class::Direct);
+
+    let blk = by_key.get(RULE_KEY_BLOCKED).expect("blocked rule");
+    assert_eq!(blk.reason, Reason::Blocked);
+    assert_eq!(blk.default_class, Class::Watching);
 
     let sla = by_key.get(RULE_KEY_SLA_AT_RISK).expect("SLA rule");
     assert_eq!(sla.reason, Reason::Sla);
@@ -86,9 +98,19 @@ fn consumer_notif_admits_and_routes_the_reason_set() {
     register_issue_notif_rules(&mut reg);
     assert_eq!(
         reg.len(),
-        before + 3,
-        "Notif admits the three Issues rules (zero Notif change)"
+        before + 5,
+        "Notif admits the full Issues reason set (zero Notif change)"
     );
+
+    let c = reg.classify(RULE_KEY_ASSIGNED, "psn:alice", &subject());
+    assert_eq!(c.reason, Reason::Assigned);
+    assert_eq!(c.default_class, Class::Direct);
+    assert!(c.from_registered_rule);
+
+    let c = reg.classify(RULE_KEY_BLOCKED, "psn:alice", &subject());
+    assert_eq!(c.reason, Reason::Blocked);
+    assert_eq!(c.default_class, Class::Watching);
+    assert!(c.from_registered_rule);
 
     let c = reg.classify(RULE_KEY_SLA_AT_RISK, "psn:alice", &subject());
     assert_eq!(c.reason, Reason::Sla);

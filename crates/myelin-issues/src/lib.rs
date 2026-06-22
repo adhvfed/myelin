@@ -114,5 +114,6 @@ pub mod query_coown;
 pub mod rebac_fragment;
 pub mod replay;
 pub mod schema;
+pub mod sla_escalation;
 
 pub use replay::{IssueReindexSource, IssueReplayKind};
