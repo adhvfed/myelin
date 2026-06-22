@@ -492,11 +492,15 @@ fn id_drill_argv(target: &'static str) -> &'static [&'static str] {
 /// once its `--features integration` test emits a dated green artifact against the live stack
 /// (no DB-free run can flip it green; the proof command FAILS without Docker).
 ///
-/// Six rows:
+/// Ten rows:
 /// - **STOR-D-OUTBOX** — outbox-no-loss under crash (real PG + real NATS JetStream). FULL gate.
 /// - **STOR-D-RESTORE** — restore-verify cross-seam (real PG ⟷ real RustFS ⟷ bus offset). FULL.
 /// - **STOR-D-RLS** — (tenant, region) RLS isolation, DB-enforced via the NOBYPASSRLS app role.
 /// - **ID-D-REBAC** — ReBAC check/list_objects no-leak / no-N+1 (real PG tuple store). FULL.
+/// - **EB-D-PARTITION** — (tenant, region)-partitioned stream subject + per-tenant filter (real NATS). FULL.
+/// - **EB-D-RESIDENCY** — residency-pinned Bus streams, 0 cross-region read (real NATS). FULL.
+/// - **CP-D3/STOR-D5** — four-layer region-pin store leg, RLS WITH CHECK rejects out-of-region (real PG). FULL.
+/// - **SRCH-D-LAYOUT** — Search service-shell forward-only migration, per-(tenant, region) PK (real PG). FULL.
 /// - **SANDBOX-SMOKE** — the CONTAINERIZED hardened-container sandbox smoke (egress-deny +
 ///   read-only-root + dropped caps). Its `floor` NAMES the genuine deferral: the real-kernel
 ///   SANDBOX-ESCAPE gate (gVisor / microVM) needs a real isolation kernel, not Docker.
@@ -572,6 +576,71 @@ pub fn infra_required_rows() -> Vec<GateRow> {
                 "drill4_rebac_check_list_objects_no_leak_no_n_plus_1",
             ],
             permanent: false,
+            floor: None,
+        },
+        // The four REAL-backend FULL drills below were proven and dated in the committed
+        // `infra.md` (EB-12 partition, EB-13 residency, the store-layer region-pin leg, and the
+        // Search service-shell forward-only migration) but had drifted out of this required-row
+        // list, so a `--down` scorecard run silently rewrote the artifact with fewer rows. Restored
+        // here (the RUNNER was stale, not the artifact) so the gate cannot drop a proven row.
+        GateRow {
+            id: "EB-D-PARTITION",
+            title: "(EB-12) (tenant, region)-partitioned stream subject reaches the live broker; per-(tenant, subsystem) filter isolates one tenant's events (the bulkhead) — real NATS JetStream",
+            proof_command: &[
+                "test",
+                "-p",
+                "myelin-events",
+                "--features",
+                "integration",
+                "--test",
+                "integration_eb12_partition",
+            ],
+            permanent: true,
+            floor: None,
+        },
+        GateRow {
+            id: "EB-D-RESIDENCY",
+            title: "(EB-13) residency-pinned Bus streams → a stream provisioned in region A has 0 cross-region read path (CP-D3 / STOR-D5 Bus slice) — real NATS JetStream",
+            proof_command: &[
+                "test",
+                "-p",
+                "myelin-events",
+                "--features",
+                "integration",
+                "--test",
+                "integration_eb13_residency",
+            ],
+            permanent: true,
+            floor: None,
+        },
+        GateRow {
+            id: "CP-D3/STOR-D5",
+            title: "(P-CP-12) four-layer region-pin, store leg → an out-of-region write (row.region ≠ cell.region) REJECTED by the (tenant, region) RLS WITH CHECK; cross-region read = 0 rows (NOBYPASSRLS app role) — real PG",
+            proof_command: &[
+                "test",
+                "-p",
+                "myelin-storage",
+                "--features",
+                "integration",
+                "--test",
+                "stor_d5_cross_region_egress_drill",
+            ],
+            permanent: true,
+            floor: None,
+        },
+        GateRow {
+            id: "SRCH-D-LAYOUT",
+            title: "(SRCH-P03) Search service-shell forward-only migration → search_index_directory CREATE applies forward-only; (tenant, region) PRIMARY KEY keys per-tenant index dirs (duplicate rejected) — real PG",
+            proof_command: &[
+                "test",
+                "-p",
+                "myelin-search",
+                "--features",
+                "integration",
+                "--test",
+                "integration_srch_p03_index_directory",
+            ],
+            permanent: true,
             floor: None,
         },
         GateRow {
@@ -1692,13 +1761,17 @@ mod tests {
     /// floor smokes (frozen at 6 rows). The frozen-row ratchet asserts a future edit cannot
     /// silently shrink the proof set.
     #[test]
-    fn infra_required_rows_cover_the_four_drills_plus_two_floor_smokes() {
+    fn infra_required_rows_cover_the_eight_drills_plus_two_floor_smokes() {
         let ids: Vec<&str> = infra_required_rows().iter().map(|r| r.id).collect();
         for must in [
             "STOR-D-OUTBOX",
             "STOR-D-RESTORE",
             "STOR-D-RLS",
             "ID-D-REBAC",
+            "EB-D-PARTITION",
+            "EB-D-RESIDENCY",
+            "CP-D3/STOR-D5",
+            "SRCH-D-LAYOUT",
             "SANDBOX-SMOKE",
             "LOAD-10X-SMOKE",
         ] {
@@ -1709,8 +1782,8 @@ mod tests {
         }
         assert_eq!(
             ids.len(),
-            6,
-            "the Infra row set is frozen at 4 drills + 2 floor smokes = 6 rows"
+            10,
+            "the Infra row set is frozen at 8 FULL real-backend drills + 2 floor smokes = 10 rows"
         );
         assert_eq!(
             Band::Infra
