@@ -62,6 +62,7 @@
 pub mod authority;
 pub mod block_tree;
 pub mod compaction;
+pub mod database;
 pub mod editor;
 pub mod emit;
 pub mod list_filter;
@@ -83,6 +84,12 @@ pub use block_tree::{
 };
 pub use compaction::{
     content_address, materialize, CompactionError, DocSnapshot, SnapshotCompactor,
+};
+pub use database::{
+    execute_view_count, execute_view_query, lower_view_filter, row_matches_filter, DbRelation,
+    DbRow, FacetIndexHint, FacetPath, FacetTelemetry, FieldDef, FieldSchema, LoweredViewFilter,
+    PageBound, PropertyBag, RelationEdgeEvent, RelationKind, RelationStore, SchemaError, ViewError,
+    ViewQuery, FACET_PROMOTION_THRESHOLD,
 };
 pub use editor::{
     Document, EditOp, Editor, EditorBlock, SecondViewer, BROWSER_DRIVE_EVIDENCE,

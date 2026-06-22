@@ -66,7 +66,12 @@ impl std::fmt::Display for ThresholdError {
 impl std::error::Error for ThresholdError {}
 
 /// The whole parsed thresholds file (P-S22). Every Q32 default-to-beat as a named, dated row.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// NB: `Eq` is intentionally NOT derived — [`FlexDb::facet_promotion_ratio`] (and any future ratio
+/// threshold) is an `f64` (which is `PartialEq` but not `Eq`). The file is compared with
+/// `assert_eq!` in the round-trip test (`PartialEq` suffices); no consumer keys a map/set on a whole
+/// `Thresholds` value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Thresholds {
     /// The file's schema version (forward-only).
     pub version: u32,
@@ -104,6 +109,13 @@ pub struct Thresholds {
     /// file (pre-REF-P13) still parses (the bounds fall back to the §4.5 seed).
     #[serde(default)]
     pub refs_traverse: RefsTraverse,
+    /// The Knowledge flexible-database read budgets + the frozen `> 5%` facet-promotion threshold
+    /// (KN-P17 / KN-D9; contract 6.3 / OQ-C). The flex-DB view read p99 budget (the KN-D9 latency
+    /// gate) + the page row-cap + the facet-promotion ratio the telemetry measures the trigger
+    /// against. `#[serde(default)]` so an older thresholds file (pre-KN-P17) still parses (falls back
+    /// to the §4.1 / 6.3 seeds).
+    #[serde(default)]
+    pub flex_db: FlexDb,
     /// The scorecard: drills that came back red live here, never edited green (EI-01 §3).
     #[serde(default)]
     pub claimed_not_proven: Vec<ClaimedNotProven>,
@@ -271,6 +283,47 @@ impl Default for RefsTraverse {
         RefsTraverse {
             depth_ceiling: 16,
             max_nodes: 10_000,
+        }
+    }
+}
+
+/// The Knowledge flexible-database read budgets + the frozen `> 5%` facet-promotion threshold
+/// (KN-P17 / P-307; KN-D9; contract 6.3 / OQ-C, architecture 01 §1.2 / 02 §4.1).
+///
+/// `view_read_p99_max_ms` is the KN-D9 flex-DB latency gate: filter/sort/group a large multi-tenant
+/// database (JSONB + the GIN projection + the `SetExpr` conjoin) → the read-time p99 must stay
+/// within this budget. `page_row_cap` is the §4.1 step-5 row cap (a single view read is ALWAYS
+/// paginated/row-capped — never an unbounded scan). `facet_promotion_ratio` is the FROZEN
+/// Search-owned `> 5%` tunable (contract 6.3): a facet in MORE than this fraction of a collection's
+/// view executions over a rolling window promotes from a cold GIN scan to a per-facet generated
+/// index — MEASURED here (KN-P17, `FacetTelemetry`), ACTED on in KN-P31 (M5). `#[serde(default)]` +
+/// [`Default`] so an older file parses (the seeds). Mirrors
+/// `myelin_knowledge::{database::PageBound::MAX, FACET_PROMOTION_THRESHOLD}` (the seed constants);
+/// this file is their source of truth.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FlexDb {
+    /// The KN-D9 flex-DB view-read p99 budget, in milliseconds. The filter/sort/group read (JSONB +
+    /// GIN + the `SetExpr` conjoin) must stay within this at scale. Default-to-beat re-confirmed at
+    /// world scale in KN-P31 (M5).
+    pub view_read_p99_max_ms: u64,
+    /// The §4.1 step-5 page row cap (a single view read is ALWAYS row-capped — never unbounded).
+    pub page_row_cap: u32,
+    /// The frozen `> 5%` facet-promotion ratio (contract 6.3 / OQ-C): a facet in MORE than this
+    /// fraction of a collection's executions promotes to a generated index (measured here, acted on
+    /// in KN-P31). The trigger is STRICTLY greater-than (a facet at exactly the ratio does NOT
+    /// promote — the frozen wording).
+    pub facet_promotion_ratio: f64,
+}
+
+impl Default for FlexDb {
+    /// The §4.1 / 6.3 seeds: a 200 ms flex-DB view-read p99 budget (the KN-D9 default-to-beat,
+    /// re-confirmed at world scale in KN-P31), a 500-row page cap (`PageBound::MAX`), the frozen 5%
+    /// facet-promotion ratio.
+    fn default() -> Self {
+        FlexDb {
+            view_read_p99_max_ms: 200,
+            page_row_cap: 500,
+            facet_promotion_ratio: 0.05,
         }
     }
 }
