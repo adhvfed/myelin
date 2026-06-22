@@ -67,6 +67,7 @@
 
 pub mod authenticate;
 pub mod check_engine;
+pub mod ci_fragment;
 pub mod delegation;
 pub mod expand;
 pub mod failstatic_cache;
@@ -91,6 +92,10 @@ pub use authenticate::{
     StructuralVerifier, VerifiedAssertion,
 };
 pub use check_engine::{eval_caveat, eval_caveat_predicate, CheckEngine, MAX_REWRITE_DEPTH};
+pub use ci_fragment::{
+    ci_fragment, IS_UNTRUSTED_FORK, READ as CI_READ, SECRET_DIRECT_READER, TRIGGER as CI_TRIGGER,
+    VIEW as CI_VIEW,
+};
 pub use delegation::{
     authority_of, effective_policy_of, DelegationAlgebra, DelegationInput, IntersectionProof,
     EFFECTIVE_GRANT_CARRIER,
@@ -917,6 +922,34 @@ impl StoreBackedCheck {
     pub fn admit_knowledge_fragment(&self) -> Vec<myelin_identity::FragmentAdmit> {
         let mut ns = self.namespace.lock().unwrap_or_else(|e| e.into_inner());
         knowledge_fragment::knowledge_fragment()
+            .iter()
+            .map(|def| ns.admit(def))
+            .collect()
+    }
+
+    /// **Admit Id's compiled CI ReBAC namespace fragment into the cell schema (contract 4.9,
+    /// P-ID-27 / P-320) — the THIRD of the five per-subsystem fragments.** Admits the four rich
+    /// [`ci_fragment`] `FragmentDef`s (`ci_project` → `environment` → `secret` → `run`) on top of the
+    /// core org/team/project hierarchy + the Git `repo` fragment, so `check`/`list_objects` resolve the
+    /// CI permissions through the SAME four-operator engine the core hierarchy uses (one primitive — no
+    /// bespoke CI check path). The two security-critical invariants this fragment compiles:
+    /// - **`secret.read` is NON-inherited** (`secret.read = direct_reader`, NOT
+    ///   `∪ parent_ci_project->…`) — a secret is reachable ONLY by a direct grant, never via project-read
+    ///   inheritance (CI-1, §1). A project reader/admin gets NO secret read.
+    /// - **`run.read = run.view − is_untrusted_fork`** — the `read & !is_untrusted_fork` ABAC edge (C7):
+    ///   CI stamps an untrusted-fork run by writing `run#is_untrusted_fork@subject`, which the Exclusion
+    ///   operator subtracts; Git reads the stamped `trust_tier` off the §5.9 fact and Identity never
+    ///   recomputes trust.
+    ///
+    /// `run.view = parent_repo->pull` / `run.trigger = parent_repo->push` inherit the Git `repo`
+    /// fragment's compiled `pull`/`push`, so for those edges to resolve at check-time the Git fragment
+    /// must also be admitted into the same engine (the cross-fragment inheritance — admit the Git
+    /// fragment first, e.g. via [`StoreBackedCheck::admit_git_fragment`]). The self-hosted-runner token
+    /// SCOPE exercise against this fragment is P-ID-28 (P-321). Returns the per-type admit verdicts in
+    /// admit order; a malformed fragment is `Rejected{reason}` (loudly, never silently admitted).
+    pub fn admit_ci_fragment(&self) -> Vec<myelin_identity::FragmentAdmit> {
+        let mut ns = self.namespace.lock().unwrap_or_else(|e| e.into_inner());
+        ci_fragment::ci_fragment()
             .iter()
             .map(|def| ns.admit(def))
             .collect()
