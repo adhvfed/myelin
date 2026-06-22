@@ -334,3 +334,96 @@ async fn git_pack_tier_over_real_object_store_roundtrips_and_detects_corruption(
         .send()
         .await;
 }
+
+/// **P-ST-28 (P-330) LIVE integration: the C4 trust-scoped CI cache namespaces against the REAL
+/// object store (RustFS).**
+///
+/// The C4 namespace (`CiCacheNamespace`) rides the `BlobStore` trait, so the dev<->prod backing is a
+/// SWAP — the SAME write-scope refusal runs with the real `S3BlobStore` underneath, NO code change.
+/// This proves the poisoned-cache defence against the live RustFS dev stack (the binding policy: an
+/// object-store-touching contract ships a real integration test green against the live stack — NOT a
+/// mock):
+///  1. a trusted run writes a build-cache entry into the `trusted` scope — its bytes land in the real
+///     bucket (a content-addressed blob);
+///  2. an `untrusted_fork` run may READ that trusted entry (a cache hit is fine) — proven against the
+///     real store;
+///  3. the fork's WRITE to the `trusted` scope is REFUSED by the blob client BEFORE any byte reaches
+///     the real bucket (0 cross-scope landings on the real store; `cache_scope_violation` fires);
+///  4. the fork's write to its OWN `fork:<pr_id>` scope round-trips against the real bucket and is
+///     INVISIBLE to a trusted read of the same name (the confinement holds end-to-end).
+#[tokio::test]
+async fn c4_trust_scoped_cache_namespaces_over_real_object_store() {
+    use myelin_storage::s3blob::S3BlobStore;
+    use myelin_storage::{CacheScope, CacheScopeError, CiCacheNamespace, TrustTier};
+    use myelin_tenancy::TenantId;
+
+    let cfg = MyelinConfig::dev();
+    let handle = tokio::runtime::Handle::current();
+    let tenant = TenantId(format!("itest-c4-{}", std::process::id()));
+
+    // The whole flow runs on ONE blocking thread (the sync BlobStore trait drives the async SDK via
+    // block_in_place); the C4 namespace's in-memory scope index stays alive across the run.
+    tokio::task::spawn_blocking(move || {
+        let store = S3BlobStore::connect(&cfg.s3, handle.clone());
+        let cache = CiCacheNamespace::over(tenant.clone(), &store);
+
+        // (1) A trusted run populates the trusted build cache — lands in the REAL bucket.
+        cache
+            .put(
+                TrustTier::Trusted,
+                "main",
+                &CacheScope::Trusted,
+                "deps",
+                b"resolved-deps-over-real-object-store",
+            )
+            .expect("a trusted run writes the trusted scope (real bucket)");
+
+        // (2) A fork run READs the trusted scope — a cache hit is fine (read against the real store).
+        assert_eq!(
+            cache
+                .get(&CacheScope::Trusted, "deps")
+                .expect("a fork may read the trusted scope (real bucket)"),
+            b"resolved-deps-over-real-object-store"
+        );
+
+        // (3) The fork's WRITE to the trusted scope is REFUSED before any byte hits the bucket.
+        let poison = cache.put(
+            TrustTier::UntrustedFork,
+            "1337",
+            &CacheScope::Trusted,
+            "deps",
+            b"MALICIOUS-PAYLOAD",
+        );
+        assert!(
+            matches!(poison, Err(CacheScopeError::ForkWriteToTrusted { .. })),
+            "the fork write to the trusted scope MUST be refused, got {poison:?}"
+        );
+        assert_eq!(cache.telemetry().cache_scope_violation(), 1);
+        // 0 cross-scope landing: the trusted "deps" is STILL the trusted run's bytes on the real store.
+        assert_eq!(
+            cache.get(&CacheScope::Trusted, "deps").unwrap(),
+            b"resolved-deps-over-real-object-store"
+        );
+
+        // (4) The fork writes its OWN scope (real bucket) — confined; invisible as trusted.
+        let fork = CacheScope::Fork {
+            pr_id: "1337".to_string(),
+        };
+        cache
+            .put(
+                TrustTier::UntrustedFork,
+                "1337",
+                &fork,
+                "deps",
+                b"fork-deps",
+            )
+            .expect("a fork writes its own fork:<pr_id> scope (real bucket)");
+        assert_eq!(cache.get(&fork, "deps").unwrap(), b"fork-deps");
+        assert!(matches!(
+            cache.get(&CacheScope::Trusted, "deps"),
+            Ok(ref b) if b.as_slice() == b"resolved-deps-over-real-object-store"
+        ));
+    })
+    .await
+    .expect("blocking C4 cache task");
+}

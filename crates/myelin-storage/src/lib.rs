@@ -431,6 +431,17 @@ pub mod blob;
 // C6 outbound push-mirror target is the sibling P-ST-25 / P-255. REUSES blob (P-047) + residency
 // (P-102) — never a parallel store or a second residency shape.
 pub mod cdn;
+// The trust-scoped CI cache namespaces (C4, P-ST-28 / P-330, contract 11.2-C4): the scope-key
+// convention `<tenant>/ci/cache/<scope>/...` (`<scope> ∈ {trusted, fork:<pr_id>, branch:<name>}`)
+// over the UNCHANGED `BlobStore` trait (a namespace + a write-scope refusal, NOT a new store —
+// EI-01 §7). An `untrusted_fork` run may READ the `trusted` scope (cache hits are fine) but its
+// WRITE to `trusted` is REFUSED by the blob client (the poisoned-cache defence, the storage half of
+// X-1). The scope is stamped from the CI-stamped `trust_tier` (an INPUT — Storage ENFORCES, it does
+// NOT recompute trust). Wires `cache_scope_violation{tenant}` (D-S11, must be 0). SIBLING of the
+// GIT-side `fork_gate::ScopedCache` (T7 coordination cache) at the T2 BLOB tier — distinct, not a
+// duplicate. FLOOR NAMED: the C5 OLAP restriction-flag gate is the sibling P-ST-29 / P-331. REUSES
+// blob (P-047) — never a parallel store.
+pub mod ci_cache_scope;
 // The local-disk git pack/object tier behind the BlobStore trait (P-ST-22 / P-252, contract 11.2
 // git pack tier + 12.2 repo-granular relocatable placement): git packs + loose objects are
 // addressed THROUGH the content-addressed `BlobStore` trait (REUSES blob.rs — never a parallel
@@ -579,6 +590,9 @@ pub use blob::{
 };
 pub use cache::{Cache, CacheError, InMemoryCache};
 pub use cdn::{CdnCloneClass, CdnEdgePop, CdnEdgeSet};
+pub use ci_cache_scope::{
+    CacheScope, CacheScopeError, CacheScopeTelemetry, CiCacheNamespace, TrustTier,
+};
 pub use ci_log_index::{
     CiLogError, CiLogFrame, CiLogIndex, CiLogTier, SegmentKeying, StepAnchor, StepSpan,
     CI_LOG_STREAM,
