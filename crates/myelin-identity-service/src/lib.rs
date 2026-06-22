@@ -72,6 +72,7 @@ pub mod delegation;
 pub mod expand;
 pub mod failstatic_cache;
 pub mod git_fragment;
+pub mod issue_fragment;
 pub mod knowledge_fragment;
 pub mod knowledge_rules;
 pub mod list_objects;
@@ -107,6 +108,12 @@ pub use failstatic_cache::{
 pub use git_fragment::{
     compile_codeowners, git_fragment, CodeownersRule, APPROVE_UNTRUSTED_CI, CODE_OWNER,
     PROTECTED_PUSH,
+};
+pub use issue_fragment::{
+    field_view_caveat as issue_field_view_caveat, issue_fragment_defs, transition_caveat, APPROVER,
+    ASSIGNEE, CONFIDENTIAL, CONFIDENTIAL_GRANT, MANAGE as ISSUE_MANAGE,
+    PERFORM_TRANSITION as ISSUE_PERFORM_TRANSITION, TRANSITION_PERM as ISSUE_TRANSITION_PERM,
+    VIEW as ISSUE_VIEW, VIEW_FIELD as ISSUE_VIEW_FIELD,
 };
 pub use knowledge_fragment::{
     field_view_caveat, knowledge_fragment, DIRECT_BLOCK, DIRECT_READER, READ as KN_READ, VIEW_FIELD,
@@ -953,6 +960,30 @@ impl StoreBackedCheck {
     pub fn admit_ci_fragment(&self) -> Vec<myelin_identity::FragmentAdmit> {
         let mut ns = self.namespace.lock().unwrap_or_else(|e| e.into_inner());
         ci_fragment::ci_fragment()
+            .iter()
+            .map(|def| ns.admit(def))
+            .collect()
+    }
+
+    /// **Admit Id's compiled Issues ReBAC namespace fragment into the cell schema (contract 4.9,
+    /// P-ID-29 / P-322) — the FOURTH of the five per-subsystem fragments.** Admits the three rich
+    /// [`issue_fragment`] `FragmentDef`s (`issue` → `field` → `transition`, parent-before-child) on
+    /// top of the core org/team/project hierarchy, so `check`/`list_objects` resolve the Issues
+    /// permissions through the SAME four-operator engine the core hierarchy uses (one primitive — no
+    /// bespoke Issues check path). The headline rewrite is the **confidential-exclusion**
+    /// `issue.view = (parent_project->view − confidential) ∪ confidential_grant`: a confidential issue
+    /// disappears from a normal project-reader's `list_objects(subject, view, issue)` push-down (keyed
+    /// on `issue.id`, §7.3) BY CONSTRUCTION (the Exclusion removes it from the `view` set — never a
+    /// post-filter, never a count leak), and ONLY an explicit `issue#confidential_grant@subject`
+    /// re-admits. Field-level redaction + transition gating ride OFF the hot `list_objects` path as
+    /// `check`-time `CaveatContext` caveats over the ONE `QueryAst` core
+    /// ([`issue_fragment::field_view_caveat`] / [`issue_fragment::transition_caveat`], §8.6). Returns
+    /// the per-type admit verdicts in admit order; a malformed fragment is `Rejected{reason}` (loudly,
+    /// never silently admitted). This is the Id-side authz content of ISS-D3 (the 0-leak drill side);
+    /// the Issues data model is the Issues-subsystem prompts'.
+    pub fn admit_issue_fragment(&self) -> Vec<myelin_identity::FragmentAdmit> {
+        let mut ns = self.namespace.lock().unwrap_or_else(|e| e.into_inner());
+        issue_fragment::issue_fragment_defs()
             .iter()
             .map(|def| ns.admit(def))
             .collect()
