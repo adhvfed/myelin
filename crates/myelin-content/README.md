@@ -6,10 +6,46 @@ node type, X-2). The three structured inline nodes
 (`mention`/`artifact_ref`/`embed`) produce `refs.edge.created` **uniformly** across Chat,
 Issues, and Knowledge (contract 5.4).
 
-> This crate is a **FREEZE**, not a feature. It ships ONLY the shared shapes that
-> Chat / Issues / Search / Refs compile against — no store, no service, no editor. The
-> block tree, OLTP store, collab transport, and editor land in the Knowledge M3 prompts
-> (KN-P04+).
+> This crate is a **FREEZE + the editor PRIMITIVES**. It ships the shared shapes that
+> Chat / Issues / Search / Refs compile against (no store, no service) AND, since KN-P08
+> (P-298), the three editor primitives STANDALONE (`editor` module) — the offset model +
+> the DOM-surgery, both over the ONE frozen render path. The OLTP store, collab transport,
+> and the INTEGRATED editor land in the Knowledge M3 prompts (KN-P04+ / KN-P09).
+
+## The editor primitives (`editor` module, KN-P08 → P-298)
+
+The three primitives ship + unit-test **standalone before the integrated editor** (EI-05
+§2; design-system `02-components/block-editor.md` §2 rule 5 — *"Enter just inserts a
+newline" is the #1 'not a real editor' tell*):
+
+1. **The serializer** — already frozen in `inline` (`parse_inline`/`serialize_inline`); the
+   primitives REUSE it (no second renderer). Its standalone KN-D2 leg is in `corpus`.
+2. **The offset model** (`editor::offset`) — **the caret is a char offset into the
+   serialized markdown**, bridged to/from controlled-`contenteditable` DOM positions
+   (`offset_to_dom` / `dom_to_offset`). A serialized line tiles into a **segment grid**:
+   `Text` runs (each char a caret stop) interleaved with single-`OBJ` `Node` islands — a
+   **structured node is exactly one caret position**. The bridge is a total bijection on
+   `0..=char_len` with **0 off-by-one**.
+3. **The DOM-surgery** (`editor::surgery`) — **Enter-splits-a-block** (`split_at`) +
+   **caret-placement-after-split** (`BlockSplit::caret == 0` of the new block, always), and
+   the **paste/IME normalisation** seam (`normalize_paste` / `insert_text`) that re-parses
+   + re-serializes through the SAME render path (never injects raw). Char offsets, never
+   byte offsets (the CJK / accented-input obligation, G2).
+
+WASM-clean by construction (`std`-only + the frozen `inline` core), so the primitives
+compile native (server) AND to `wasm32-unknown-unknown` (the editor) from one source. The
+integrated single-doc editor over these + the KN-P07 transport (browser-drive, KN-D2
+re-run) is the **immediate follow-on KN-P09 (P-299)** — a green primitive here is NOT yet
+an editor.
+
+### The editor-primitives gates (CI — `tests/editor_primitives_gate.rs`)
+
+- **KN-D2 standalone leg** — `serialize_inline(parse_inline(md)) === md` 100% over the
+  frozen corpus on the serializer primitive (0 regressions).
+- **The offset/DOM-surgery property gate** — the caret round-trips DOM-position ↔
+  char-offset across **every structured node** in the corpus (**off-by-one count == 0**),
+  and the **caret-placement counter** is green (every Enter-split lands the caret at offset
+  0 of the new block).
 
 ## What's frozen here
 
@@ -66,9 +102,11 @@ makes the round-trip byte-stable.
 
 ## Mutation floor
 
-`myelin-content`'s parser/serializer is mandatory-core: the round-trip property must
-**survive mutation**. The cargo-mutants score floor for the `inline` module is **≥ 0.85**
-(≥85% of viable mutants caught by the round-trip + unit tests). Run:
+`myelin-content`'s parser/serializer AND the editor offset model + DOM-surgery are
+mandatory-core: their correctness properties must **survive mutation**. The cargo-mutants
+score floor is **≥ 0.85** (≥85% of viable mutants caught).
+
+**`inline` module** (the parser/serializer):
 
 ```
 cargo mutants -p myelin-content --file crates/myelin-content/src/inline.rs --timeout 30
@@ -77,5 +115,19 @@ cargo mutants -p myelin-content --file crates/myelin-content/src/inline.rs --tim
 **Measured 2026-06-21:** 163/184 viable mutants caught (incl. timeouts) = **0.886** —
 above the 0.85 floor. The residual survivors are loop-bound mutations in `parse_link`
 that produce equivalent behaviour or infinite loops (timeouts); the round-trip + boundary
-+ malformed-link tests pin the observable behaviour. This is the dated green artifact for
-the mutation floor.
++ malformed-link tests pin the observable behaviour.
+
+**`editor::offset` + `editor::surgery`** (the offset model + DOM-surgery, KN-P08):
+
+```
+cargo mutants -p myelin-content \
+  --file crates/myelin-content/src/editor/offset.rs \
+  --file crates/myelin-content/src/editor/surgery.rs --timeout 30
+```
+
+**Measured 2026-06-22:** **41/41 viable mutants caught = 1.000** — every viable mutant in
+the offset bridge + the Enter-split + the paste/IME normalisation is killed by the offset
+round-trip gate + the caret-placement counter + the targeted boundary tests (no dead
+defensive branch — the `offset_to_dom` fallthrough is an `unreachable!` documenting the
+tiled-grid invariant, not a behaviour-equivalent arithmetic branch a mutant can survive
+on). This is the dated green artifact for the editor-primitives mutation floor.
