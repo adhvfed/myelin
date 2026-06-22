@@ -206,9 +206,9 @@ pub use defaults::{
 // routing/gating/HITL are the existing plan-then-apply pipeline. The KNOWLEDGE producer ToolDefs +
 // the agent-trace holder seam (KN-D11/KN-D12) are AG-P19 (→ P-268) and reuse THIS registration pattern.
 pub use git_tools::{
-    git_merge_required_caps, git_merge_tool_def, git_tool_defs, open_pr_required_caps,
-    open_pr_tool_def, register_git_tools, GIT_MERGE_TOOL, GIT_SUBSYSTEM, GIT_TOOL_VERSION,
-    OPEN_PR_TOOL,
+    git_history_rewrite_tool_def, git_merge_required_caps, git_merge_tool_def,
+    git_scip_index_tool_def, git_tool_defs, open_pr_required_caps, open_pr_tool_def,
+    register_git_tools, GIT_MERGE_TOOL, GIT_SUBSYSTEM, GIT_TOOL_VERSION, OPEN_PR_TOOL,
 };
 
 // The per-producer KNOWLEDGE ToolDefs (AG-P19 → P-268, M3): publish + edit_confidential (the

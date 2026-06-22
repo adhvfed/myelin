@@ -71,6 +71,13 @@ pub fn requires_approval_default(subsystem: &str, tool: &str) -> bool {
         // ── Git (§6.3) ──
         ("git", "merge") => true,    // merge is the consequential gate (AG-8)
         ("git", "open_pr") => false, // reversible
+        // The CODE-EXECUTING git tools (GIT-P27 → P-283, §7). history_rewrite is the audited
+        // erasure-admin op — it changes every downstream hash (consequential, irreversible), so it is
+        // GATED (VISION §3). scip_index is a read-only code-intelligence index build (a `compute`
+        // artifact over readable bytes) — reversible/advisory, so NOT gated (it is governed by the
+        // routing split + the AG-D4 escape gate on the git tool image, not by HITL).
+        ("git", "history_rewrite") => true,
+        ("git", "scip_index") => false,
 
         // ── Issues (§6.3) ──
         ("issues", "forecast") => false,  // advisory (suggest)
@@ -258,6 +265,16 @@ mod tests {
         // Git — merge = yes, open_pr = no.
         assert!(requires_approval_default("git", "merge"), "git.merge is gated (AG-8)");
         assert!(!requires_approval_default("git", "open_pr"), "open_pr is reversible → NOT gated");
+        // Git code-executing tools (GIT-P27 → P-283) — history_rewrite = yes (consequential erasure
+        // -admin op), scip_index = no (read-only code-intelligence index build).
+        assert!(
+            requires_approval_default("git", "history_rewrite"),
+            "history-rewrite is gated (changes every downstream hash — consequential)"
+        );
+        assert!(
+            !requires_approval_default("git", "scip_index"),
+            "SCIP indexing is a read-only index build → NOT gated (governed by AG-D4, not HITL)"
+        );
 
         // Issues — forecast/triage/sla_draft = no (advisory); transition = gated (ABAC floor).
         assert!(!requires_approval_default("issues", "forecast"), "forecast is advisory → NOT gated");

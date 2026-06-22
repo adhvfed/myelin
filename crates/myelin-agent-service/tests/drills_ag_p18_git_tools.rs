@@ -363,17 +363,25 @@ fn cdc_4_9_required_caps_are_the_git_rebac_fragment_permissions() {
     assert_eq!(open_pr_tool_def().required_caps, vec!["repo.push".to_string()]);
 }
 
-/// **NO-NEW-ENGINE check (EI-03 §4 / EI-01 §7): the whole Git producer surface is `git_tool_defs()`
-/// — two `mutate` ToolDefs registered into the existing ToolSurface, differing ONLY in their frozen
-/// `requires_approval` seed. There is no second apply/gate path.**
+/// **NO-NEW-ENGINE check (EI-03 §4 / EI-01 §7): the whole Git producer surface is `git_tool_defs()`.**
+/// At AG-P18 (P-267) this was exactly two `mutate` ToolDefs (`git.merge`, `open_pr`). GIT-P27 (P-283)
+/// EXTENDED it with the two code-executing tools on the unified sandbox: `git.history_rewrite` (a
+/// gated `mutate` → EffectApi — the audited erasure-admin op, 10.6) and `git.scip_index` (a `compute`
+/// tool → the sandbox the AG-D4 escape drill gates). They are still PURE registration data (no second
+/// apply/gate engine) — the routing/gating/sandbox machinery is the existing pipeline. This test pins
+/// the two ORIGINAL producer mutations are present + correctly seeded; the full four-tool surface is
+/// pinned in `git_tools.rs`'s `all_four_git_tools_are_seeded_from_the_frozen_defaults`.
 #[test]
-fn git_producer_surface_is_a_projection_two_defs_only() {
+fn git_producer_surface_is_a_projection() {
     let defs = git_tool_defs();
-    assert_eq!(defs.len(), 2, "exactly git.merge + open_pr — no other Git producer tool at M3");
-    for d in &defs {
-        assert_eq!(d.effect_kind, EffectKind::Mutate, "every Git tool routes through EffectApi");
-        assert!(d.side_effecting);
-    }
-    assert!(defs[0].requires_approval, "git.merge gated");
-    assert!(!defs[1].requires_approval, "open_pr not gated");
+    // the two producer MUTATIONS route through EffectApi (plan-then-apply).
+    let merge = defs.iter().find(|d| d.name.0 == "merge").expect("git.merge registered");
+    let open_pr = defs.iter().find(|d| d.name.0 == "open_pr").expect("open_pr registered");
+    assert_eq!(merge.effect_kind, EffectKind::Mutate, "git.merge routes through EffectApi");
+    assert_eq!(open_pr.effect_kind, EffectKind::Mutate, "open_pr routes through EffectApi");
+    assert!(merge.requires_approval, "git.merge gated");
+    assert!(!open_pr.requires_approval, "open_pr not gated");
+    // the code-executing tools (P-283) are registered into the SAME surface (no second registry).
+    assert!(defs.iter().any(|d| d.name.0 == "history_rewrite"), "git.history_rewrite registered");
+    assert!(defs.iter().any(|d| d.name.0 == "scip_index"), "git.scip_index registered");
 }
