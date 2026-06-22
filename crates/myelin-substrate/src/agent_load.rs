@@ -125,7 +125,11 @@ impl DispatchPool {
     /// the thresholds file (P-038); `0` is the degenerate always-drop pool (== the dispatch tier is
     /// off), not a "bounded" one.
     pub fn new(capacity: u32) -> DispatchPool {
-        DispatchPool { capacity, in_flight: 0, drops: 0 }
+        DispatchPool {
+            capacity,
+            in_flight: 0,
+            drops: 0,
+        }
     }
 
     /// **Try to dispatch a reaction.** Returns [`DispatchAdmission::Admitted`] (a permit was taken) if
@@ -242,7 +246,12 @@ impl DepthCeiling {
     /// mis-configuration — the soft warning must come BEFORE the hard halt).
     pub fn new(soft: u32, hard: u32) -> DepthCeiling {
         debug_assert!(soft <= hard, "the soft ceiling must be <= the hard ceiling");
-        DepthCeiling { soft, hard, histogram: [0; Self::HIST_BUCKETS], halts: 0 }
+        DepthCeiling {
+            soft,
+            hard,
+            histogram: [0; Self::HIST_BUCKETS],
+            halts: 0,
+        }
     }
 
     /// **Evaluate a reaction's envelope against the ceiling (§5.3 — reads `EventEnvelope.depth`).**
@@ -494,7 +503,11 @@ impl PredicateGuard {
 
     /// A guard with explicit ceilings (used by drills to drive the boundary at small numbers).
     pub fn new(max_steps: u64, max_eval_micros: u64) -> PredicateGuard {
-        PredicateGuard { max_steps, max_eval_micros, rejections: 0 }
+        PredicateGuard {
+            max_steps,
+            max_eval_micros,
+            rejections: 0,
+        }
     }
 
     /// **Admit-or-reject a predicate by its STATIC cost (§7.5).** `steps` is the AST's static cost
@@ -733,10 +746,18 @@ mod tests {
             "an over-cap reaction is dropped, never forked into a new worker (§7.4)"
         );
         assert_eq!(pool.in_flight(), 2, "in-flight never exceeds the bound");
-        assert_eq!(pool.dispatch_pool_drops(), 1, "the drop is counted (contract-1.8)");
+        assert_eq!(
+            pool.dispatch_pool_drops(),
+            1,
+            "the drop is counted (contract-1.8)"
+        );
         // completing frees a permit.
         pool.complete();
-        assert_eq!(pool.try_dispatch(), DispatchAdmission::Admitted, "a completed permit is reusable");
+        assert_eq!(
+            pool.try_dispatch(),
+            DispatchAdmission::Admitted,
+            "a completed permit is reusable"
+        );
     }
 
     #[test]
@@ -760,8 +781,14 @@ mod tests {
         assert_eq!(ceiling.evaluate(&reaction(0, "r")), DepthVerdict::Admit);
         assert_eq!(ceiling.evaluate(&reaction(11, "r")), DepthVerdict::Admit);
         // at/over soft, below hard: admitted-but-flagged (the climb is visible before the kill).
-        assert_eq!(ceiling.evaluate(&reaction(12, "r")), DepthVerdict::AdmitFlagged);
-        assert_eq!(ceiling.evaluate(&reaction(15, "r")), DepthVerdict::AdmitFlagged);
+        assert_eq!(
+            ceiling.evaluate(&reaction(12, "r")),
+            DepthVerdict::AdmitFlagged
+        );
+        assert_eq!(
+            ceiling.evaluate(&reaction(15, "r")),
+            DepthVerdict::AdmitFlagged
+        );
         // at/over hard: HALTED (the loop is structurally stopped).
         assert_eq!(ceiling.evaluate(&reaction(16, "r")), DepthVerdict::Halt);
         assert_eq!(ceiling.evaluate(&reaction(20, "r")), DepthVerdict::Halt);
@@ -837,7 +864,11 @@ mod tests {
             assert_eq!(tw.record(&reaction(1, "cold-a")), TripwireVerdict::Admit);
             assert_eq!(tw.record(&reaction(1, "cold-b")), TripwireVerdict::Admit);
         }
-        assert_eq!(tw.tripwire_fired(), 0, "interleaved roots age out of the window");
+        assert_eq!(
+            tw.tripwire_fired(),
+            0,
+            "interleaved roots age out of the window"
+        );
     }
 
     // ---- (d) the bounded predicate guard: rejects a crafted over-cost matcher ----------------------
@@ -874,8 +905,15 @@ mod tests {
     fn composed_guard_halts_a_deep_chain_by_depth() {
         let mut guard = AgentLoadGuard::v1_floor(64);
         // a deep reaction is halted by depth WITHOUT taking a permit.
-        assert_eq!(guard.admit(&reaction(16, "deep")), GuardOutcome::HaltedByDepth);
-        assert_eq!(guard.pool.in_flight(), 0, "a depth-halted reaction takes no permit");
+        assert_eq!(
+            guard.admit(&reaction(16, "deep")),
+            GuardOutcome::HaltedByDepth
+        );
+        assert_eq!(
+            guard.pool.in_flight(),
+            0,
+            "a depth-halted reaction takes no permit"
+        );
         assert_eq!(guard.signals().causal_depth_halts, 1);
     }
 
@@ -893,9 +931,16 @@ mod tests {
             assert_eq!(guard.admit(&reaction(2, "fan")), GuardOutcome::Dispatch);
         }
         // the 4th trips the shared-root tripwire — halted, no permit taken for it.
-        assert_eq!(guard.admit(&reaction(2, "fan")), GuardOutcome::HaltedByTripwire);
+        assert_eq!(
+            guard.admit(&reaction(2, "fan")),
+            GuardOutcome::HaltedByTripwire
+        );
         assert_eq!(guard.signals().tripwire_fired, 1);
-        assert_eq!(guard.pool.in_flight(), 3, "the tripped reaction takes no permit");
+        assert_eq!(
+            guard.pool.in_flight(),
+            3,
+            "the tripped reaction takes no permit"
+        );
     }
 
     #[test]

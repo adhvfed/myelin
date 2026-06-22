@@ -85,7 +85,10 @@ async fn structured_subject_partitions_per_tenant_on_the_live_broker() {
     let subj_globex = StreamSubject::of(&env_globex).expect("globex subject");
 
     // The §2.2 grammar, exactly — the partition key the streams are keyed under (contract 12.1).
-    assert_eq!(subj_acme.to_subject(), "evt.acme.issue.issue.PROJ-1.created");
+    assert_eq!(
+        subj_acme.to_subject(),
+        "evt.acme.issue.issue.PROJ-1.created"
+    );
     assert_eq!(PartitionKey::of(&env_acme).tenant, TenantId("acme".into()));
     assert_eq!(PartitionKey::of(&env_acme).region, Region("fr-par".into()));
 
@@ -107,7 +110,10 @@ async fn structured_subject_partitions_per_tenant_on_the_live_broker() {
 
     // The cell stream stored both (one per tenant).
     let info = stream.get_info().await.expect("stream info");
-    assert_eq!(info.state.messages, 2, "both tenants' events landed in the cell stream");
+    assert_eq!(
+        info.state.messages, 2,
+        "both tenants' events landed in the cell stream"
+    );
 
     // The bulkhead property: a per-(tenant, subsystem) filter consumer for ACME sees ONLY acme.
     let acme_filter = format!("{root}.{}", subj_acme.stream_filter()); // ...evt.acme.issue.>
@@ -128,7 +134,10 @@ async fn structured_subject_partitions_per_tenant_on_the_live_broker() {
 
     // Symmetrically, globex's filter never captures acme.
     let globex_filter = format!("{root}.{}", subj_globex.stream_filter());
-    assert_ne!(acme_filter, globex_filter, "distinct tenants → distinct stream filters");
+    assert_ne!(
+        acme_filter, globex_filter,
+        "distinct tenants → distinct stream filters"
+    );
     let mut globex_consumer = stream
         .create_consumer(jetstream::consumer::pull::Config {
             durable_name: Some(format!("globex_{suffix}")),
@@ -138,7 +147,10 @@ async fn structured_subject_partitions_per_tenant_on_the_live_broker() {
         .await
         .expect("globex filtered consumer");
     let globex_info = globex_consumer.info().await.expect("globex consumer info");
-    assert_eq!(globex_info.num_pending, 1, "globex's filter captures exactly globex's one event");
+    assert_eq!(
+        globex_info.num_pending, 1,
+        "globex's filter captures exactly globex's one event"
+    );
 
     // Cleanup.
     js.delete_stream(&stream_name).await.expect("delete stream");

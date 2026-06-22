@@ -27,6 +27,7 @@
 //! (a verb that stops reconciling the band, a registry that becomes a hard-coded match) breaks THIS
 //! build.
 
+use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_notif::define_rule::{
     define_notif_rule, platform_default_reason, DedupTpl, DefineRuleError, NotifRuleRegistry,
 };
@@ -34,7 +35,6 @@ use myelin_notif::ranking::{reason_base_class, DeterministicV1, RankStrategy};
 use myelin_notif::router::RoutedInboxItem;
 use myelin_notif::{Class, Reason};
 use myelin_refs::ArtifactRef;
-use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_tenancy::{Region, TenantId};
 
 fn tenant() -> TenantId {
@@ -78,7 +78,12 @@ fn provider_registry_classifies_registered_then_default() {
     let mut reg = NotifRuleRegistry::new();
     reg.register(
         "iss_sla_breach",
-        define_notif_rule(Reason::Sla, DedupTpl("sla:{subject}".into()), Class::Critical).unwrap(),
+        define_notif_rule(
+            Reason::Sla,
+            DedupTpl("sla:{subject}".into()),
+            Class::Critical,
+        )
+        .unwrap(),
     );
 
     let c = reg.classify("iss_sla_breach", "psn:bob", &subject());
@@ -123,8 +128,12 @@ fn provider_registered_class_drives_the_ranking_band() {
     let mut reg = NotifRuleRegistry::new();
     reg.register(
         "git_review",
-        define_notif_rule(Reason::ReviewRequested, DedupTpl("{subject}".into()), Class::Direct)
-            .unwrap(),
+        define_notif_rule(
+            Reason::ReviewRequested,
+            DedupTpl("{subject}".into()),
+            Class::Direct,
+        )
+        .unwrap(),
     );
     let c = reg.classify("git_review", "psn:bob", &subject());
 
@@ -147,7 +156,11 @@ fn provider_registered_class_drives_the_ranking_band() {
     // the rank's class is the registered default_class, and the §3.1 table agrees.
     assert_eq!(trace.class, c.default_class);
     assert_eq!(trace.class, reason_base_class(c.reason).1);
-    assert_eq!(priority, reason_base_class(c.reason).0, "the base from the table drives the rank");
+    assert_eq!(
+        priority,
+        reason_base_class(c.reason).0,
+        "the base from the table drives the rank"
+    );
 }
 
 // ===========================================================================================
@@ -167,20 +180,36 @@ fn consumer_subsystem_registers_a_whole_set_with_zero_notif_change() {
     let before = reg.len();
     reg.register(
         "widgets.assigned",
-        define_notif_rule(Reason::Assigned, DedupTpl("w:assign:{subject}".into()), Class::Direct)
-            .unwrap(),
+        define_notif_rule(
+            Reason::Assigned,
+            DedupTpl("w:assign:{subject}".into()),
+            Class::Direct,
+        )
+        .unwrap(),
     )
     .register(
         "widgets.escalated",
-        define_notif_rule(Reason::Escalated, DedupTpl("w:esc:{subject}".into()), Class::Critical)
-            .unwrap(),
+        define_notif_rule(
+            Reason::Escalated,
+            DedupTpl("w:esc:{subject}".into()),
+            Class::Critical,
+        )
+        .unwrap(),
     )
     .register(
         "widgets.watched",
-        define_notif_rule(Reason::Watched, DedupTpl("w:watch:{recipient}".into()), Class::Watching)
-            .unwrap(),
+        define_notif_rule(
+            Reason::Watched,
+            DedupTpl("w:watch:{recipient}".into()),
+            Class::Watching,
+        )
+        .unwrap(),
     );
-    assert_eq!(reg.len(), before + 3, "three subsystem rules accreted (no Notif enum/match edit)");
+    assert_eq!(
+        reg.len(),
+        before + 3,
+        "three subsystem rules accreted (no Notif enum/match edit)"
+    );
 
     // the router classifies each of the synthetic Signals through the registered rules.
     let assigned = reg.classify("widgets.assigned", "psn:dana", &subject());
@@ -212,8 +241,14 @@ fn consumer_provider_round_trip_on_the_rule_wire() {
     reg.register("agent.approval", rule.clone());
 
     let c = reg.classify("agent.approval", "psn:agent-owner", &subject());
-    assert_eq!(c.reason, rule.reason, "the classified reason is the registered reason");
-    assert_eq!(c.default_class, rule.default_class, "the classified band is the registered band");
+    assert_eq!(
+        c.reason, rule.reason,
+        "the classified reason is the registered reason"
+    );
+    assert_eq!(
+        c.default_class, rule.default_class,
+        "the classified band is the registered band"
+    );
     assert_eq!(
         c.dedup_key,
         rule.dedup_key("psn:agent-owner", &subject()),

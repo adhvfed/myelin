@@ -169,8 +169,9 @@ impl FailStaticThreshold {
     /// LEGAL]`. A drill that needs the concrete W (not the seed) MUST go through here so an
     /// unratified value can never be silently read as a number.
     pub fn ratified_static_max_secs(&self) -> Result<u64, ThresholdError> {
-        self.static_max_secs
-            .ok_or_else(|| ThresholdError::OpenLegal(format!("fail_static.static_max_secs ({})", self.status)))
+        self.static_max_secs.ok_or_else(|| {
+            ThresholdError::OpenLegal(format!("fail_static.static_max_secs ({})", self.status))
+        })
     }
 }
 
@@ -573,7 +574,9 @@ mod tests {
             hard = 16
         "#;
         let t = Thresholds::from_toml(no_budgets).expect("parses (shed_budgets defaults empty)");
-        let err = t.shed_budget(Surface::HttpIntake).expect_err("no row → loud Missing");
+        let err = t
+            .shed_budget(Surface::HttpIntake)
+            .expect_err("no row → loud Missing");
         assert!(matches!(err, ThresholdError::Missing(_)), "got {err:?}");
     }
 
@@ -587,7 +590,10 @@ mod tests {
         assert!(t.fail_static.constraint.contains("agent-token-TTL"));
         assert_eq!(t.fail_static.status, "OPEN — LEGAL");
         // the value W is absent (unratified) → reading it as a number is a loud OpenLegal error.
-        let err = t.fail_static.ratified_static_max_secs().expect_err("W is [OPEN — LEGAL]");
+        let err = t
+            .fail_static
+            .ratified_static_max_secs()
+            .expect_err("W is [OPEN — LEGAL]");
         assert!(matches!(err, ThresholdError::OpenLegal(_)), "got {err:?}");
         // the engineering seed is readable and obeys the constraint (≤ revocation SLA in seconds).
         assert_eq!(t.fail_static.static_max_default_secs, 300);
@@ -617,7 +623,10 @@ mod tests {
             hard = 16
         "#;
         let t2 = Thresholds::from_toml(ratified).expect("parse");
-        assert_eq!(t2.fail_static.ratified_static_max_secs().expect("ratified"), 180);
+        assert_eq!(
+            t2.fail_static.ratified_static_max_secs().expect("ratified"),
+            180
+        );
     }
 
     /// The scorecard list is honest: empty at this commit (every shipped M0 drill is green at its

@@ -153,7 +153,10 @@ impl AuthZookie {
     /// the stamped revision OR later, bypassing any fail-static cache — so a just-revoked grant cannot
     /// be served stale (the new-enemy guard).
     pub fn consistency(&self) -> Consistency {
-        Consistency { at_least: self.0.clone(), mode: ConsistencyMode::Strong }
+        Consistency {
+            at_least: self.0.clone(),
+            mode: ConsistencyMode::Strong,
+        }
     }
 
     /// The underlying zookie.
@@ -204,7 +207,11 @@ impl AclZookieTable {
     /// The page's current `page.acl_zookie` (the revision a collab/read carries). An un-stamped page
     /// (no ACL change yet) is [`AuthZookie::empty`].
     pub fn current(&self, page_id: &str) -> AuthZookie {
-        self.stamps.get(page_id).cloned().map(AuthZookie::of).unwrap_or_else(AuthZookie::empty)
+        self.stamps
+            .get(page_id)
+            .cloned()
+            .map(AuthZookie::of)
+            .unwrap_or_else(AuthZookie::empty)
     }
 }
 
@@ -232,10 +239,16 @@ impl std::fmt::Display for RejectReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RejectReason::PermissionDenied { page_id } => {
-                write!(f, "Layer-2 permission denied on page `{page_id}` (no op without authz)")
+                write!(
+                    f,
+                    "Layer-2 permission denied on page `{page_id}` (no op without authz)"
+                )
             }
             RejectReason::SchemaViolation { detail } => {
-                write!(f, "Layer-2 schema validation rejected the db-row op: {detail}")
+                write!(
+                    f,
+                    "Layer-2 schema validation rejected the db-row op: {detail}"
+                )
             }
         }
     }
@@ -534,11 +547,7 @@ impl<S: IdentityService> OpAuthorizer<S> {
     /// [`AclZookieTable`] (the page's CURRENT revision) MAX'd with the op's carried zookie — so a
     /// client carrying a stale (older) zookie still reads at the page's current revision (it cannot
     /// downgrade the watermark to read a since-revoked grant).
-    pub fn authorize_op(
-        &mut self,
-        op: &IncomingOp,
-        schema: &CollectionSchema,
-    ) -> OpDecision {
+    pub fn authorize_op(&mut self, op: &IncomingOp, schema: &CollectionSchema) -> OpDecision {
         // 1. ERASURE (arch §3.1): erased content degrades regardless of permission — it is gone, and an
         //    op against it must neither apply nor resurrect it (X-7, the structural erasure posture).
         if self.erasures.is_erased(&op.object) {
@@ -551,7 +560,9 @@ impl<S: IdentityService> OpAuthorizer<S> {
         let page_zookie = self.effective_zookie(op);
         let at = page_zookie.consistency();
         let permission = op.permission.permission();
-        let decision = self.identity.check(&op.actor, &permission, &op.object, &at, None);
+        let decision = self
+            .identity
+            .check(&op.actor, &permission, &op.object, &at, None);
         match decision {
             Ok(Decision::Allow) => {
                 // The grant holds at-or-after the page's current ACL revision — authorized so far.
@@ -618,7 +629,11 @@ impl<S: IdentityService> OpAuthorizer<S> {
     /// drill asserts it stays 0), not merely an unobservable claim. A non-zero value is the failure the
     /// master M3→M4 gate catches.
     #[doc(hidden)]
-    pub fn audit_stale_grant_write_if_misapplied(&mut self, decision: &OpDecision, was_applied: bool) {
+    pub fn audit_stale_grant_write_if_misapplied(
+        &mut self,
+        decision: &OpDecision,
+        was_applied: bool,
+    ) {
         if was_applied && !decision.applied() {
             self.counter.record_stale_grant_write();
         }
@@ -631,8 +646,16 @@ impl<S: IdentityService> OpAuthorizer<S> {
 /// so the Layer-2 check evaluates the caveat. The full `QueryAst` caveat core is P-ID-22; this is the
 /// literal-attrs carrier Knowledge hands `check` for a caveated field write (the field-level ABAC the
 /// arch §3.1 schema/permission split allows for).
-pub fn field_caveat(object: ArtifactRef, attrs: BTreeMap<String, myelin_identity::Literal>) -> CaveatContext {
-    CaveatContext { object, field: None, transition: None, attrs }
+pub fn field_caveat(
+    object: ArtifactRef,
+    attrs: BTreeMap<String, myelin_identity::Literal>,
+) -> CaveatContext {
+    CaveatContext {
+        object,
+        field: None,
+        transition: None,
+        attrs,
+    }
 }
 
 #[cfg(test)]
@@ -684,7 +707,8 @@ mod tests {
             self.granted.insert(subject.to_string());
         }
         fn revoke_at(&mut self, subject: &str, revision: &str) {
-            self.revoked_at.insert(subject.to_string(), revision.to_string());
+            self.revoked_at
+                .insert(subject.to_string(), revision.to_string());
         }
     }
 
@@ -713,7 +737,9 @@ mod tests {
 
         // ── the rest of the ABI is not exercised by the Layer-2 op gate (errors loudly) ─────────────
         fn authenticate(&self, _c: &Credential) -> myelin_identity::Result<Principal> {
-            Err(AuthzError::NotYetImplemented("not used by the Layer-2 op gate"))
+            Err(AuthzError::NotYetImplemented(
+                "not used by the Layer-2 op gate",
+            ))
         }
         fn list_objects(
             &self,
@@ -777,10 +803,7 @@ mod tests {
         fn erase(&self, _s: &PrincipalId) -> myelin_identity::Result<()> {
             Err(AuthzError::NotYetImplemented("n/a"))
         }
-        fn admit_fragment(
-            &self,
-            _f: &NamespaceFragment,
-        ) -> myelin_identity::Result<FragmentAdmit> {
+        fn admit_fragment(&self, _f: &NamespaceFragment) -> myelin_identity::Result<FragmentAdmit> {
             Err(AuthzError::NotYetImplemented("n/a"))
         }
     }
@@ -805,10 +828,23 @@ mod tests {
         let mut id = ZookieAwareCheck::new();
         id.grant("alice");
         let mut auth = OpAuthorizer::new(id);
-        let op = op_for(actor("alice"), "p1", OpPermission::Edit, AuthZookie::empty());
+        let op = op_for(
+            actor("alice"),
+            "p1",
+            OpPermission::Edit,
+            AuthZookie::empty(),
+        );
         let decision = auth.authorize_op(&op, &CollectionSchema::new());
-        assert_eq!(decision, OpDecision::Apply, "a granted editor's op is authorized");
-        assert_eq!(auth.counter().stale_grant_writes(), 0, "0 stale-grant writes");
+        assert_eq!(
+            decision,
+            OpDecision::Apply,
+            "a granted editor's op is authorized"
+        );
+        assert_eq!(
+            auth.counter().stale_grant_writes(),
+            0,
+            "0 stale-grant writes"
+        );
     }
 
     /// **An ungranted actor's op is rejected (fail-closed): no grant → Deny → Rejected, never Apply.**
@@ -816,9 +852,17 @@ mod tests {
     fn ungranted_actor_op_is_rejected() {
         let id = ZookieAwareCheck::new(); // no grant for anyone
         let mut auth = OpAuthorizer::new(id);
-        let op = op_for(actor("mallory"), "p1", OpPermission::Edit, AuthZookie::empty());
+        let op = op_for(
+            actor("mallory"),
+            "p1",
+            OpPermission::Edit,
+            AuthZookie::empty(),
+        );
         let decision = auth.authorize_op(&op, &CollectionSchema::new());
-        assert!(decision.is_rejected(), "an ungranted op is rejected (fail-closed, ADR-03)");
+        assert!(
+            decision.is_rejected(),
+            "an ungranted op is rejected (fail-closed, ADR-03)"
+        );
     }
 
     // ── THE ZOOKIE NEW-ENEMY GUARD: the just-revoked-editor drill (0 stale-grant writes) ──────────
@@ -837,7 +881,12 @@ mod tests {
         let mut auth = OpAuthorizer::new(id);
 
         // Before the ACL change: the page is at the empty zookie, Alice's op is allowed.
-        let before = op_for(actor("alice"), "p1", OpPermission::Edit, AuthZookie::empty());
+        let before = op_for(
+            actor("alice"),
+            "p1",
+            OpPermission::Edit,
+            AuthZookie::empty(),
+        );
         assert_eq!(
             auth.authorize_op(&before, &CollectionSchema::new()),
             OpDecision::Apply,
@@ -851,7 +900,12 @@ mod tests {
         );
 
         // Alice's NEXT op now reads `check` at-or-after z5 (the page's stamped revision) → Deny.
-        let after = op_for(actor("alice"), "p1", OpPermission::Edit, AuthZookie::of(Zookie("z5".into())));
+        let after = op_for(
+            actor("alice"),
+            "p1",
+            OpPermission::Edit,
+            AuthZookie::of(Zookie("z5".into())),
+        );
         let decision = auth.authorize_op(&after, &CollectionSchema::new());
         assert!(
             decision.is_rejected(),
@@ -859,14 +913,20 @@ mod tests {
         );
         // A FAITHFUL caller applies only on Apply → the rejected op never reaches merge.
         let was_applied = auth.apply_if_authorized(&decision);
-        assert!(!was_applied, "the rejected op is NOT applied to the merge layer");
+        assert!(
+            !was_applied,
+            "the rejected op is NOT applied to the merge layer"
+        );
         auth.audit_stale_grant_write_if_misapplied(&decision, was_applied); // proves 0 even under audit
         assert_eq!(
             auth.counter().stale_grant_writes(),
             0,
             "0 STALE-GRANT WRITES — the new-enemy guard let nothing through"
         );
-        assert!(auth.counter().rejected_by_zookie() >= 1, "the zookie guard fired");
+        assert!(
+            auth.counter().rejected_by_zookie() >= 1,
+            "the zookie guard fired"
+        );
         let (name, n) = auth.counter().telemetry_sample();
         assert_eq!(name, "knowledge.stale_grant_writes");
         assert_eq!(n, 0, "the dated-green gate value");
@@ -880,13 +940,22 @@ mod tests {
     fn audit_lever_detects_a_misapplied_rejected_op() {
         let id = ZookieAwareCheck::new(); // no grant → every op is rejected
         let mut auth = OpAuthorizer::new(id);
-        let op = op_for(actor("mallory"), "p1", OpPermission::Edit, AuthZookie::empty());
+        let op = op_for(
+            actor("mallory"),
+            "p1",
+            OpPermission::Edit,
+            AuthZookie::empty(),
+        );
         let decision = auth.authorize_op(&op, &CollectionSchema::new());
         assert!(decision.is_rejected());
         // A faithful caller: applies only on Apply → no stale-grant write.
         assert!(!auth.apply_if_authorized(&decision));
         auth.audit_stale_grant_write_if_misapplied(&decision, false);
-        assert_eq!(auth.counter().stale_grant_writes(), 0, "the faithful path keeps the count 0");
+        assert_eq!(
+            auth.counter().stale_grant_writes(),
+            0,
+            "the faithful path keeps the count 0"
+        );
         // A BUGGY caller: applies a rejected op → the audit lever catches it (the count fires).
         auth.audit_stale_grant_write_if_misapplied(&decision, true);
         assert_eq!(
@@ -911,7 +980,12 @@ mod tests {
         // Alice's op carries the OLD pre-revoke zookie (she has not seen the ACL change) — a naive
         // implementation would read at the old revision and ALLOW. The guard reads at the page's
         // CURRENT z5 → Deny.
-        let op = op_for(actor("alice"), "p1", OpPermission::Edit, AuthZookie::of(Zookie("z1".into())));
+        let op = op_for(
+            actor("alice"),
+            "p1",
+            OpPermission::Edit,
+            AuthZookie::of(Zookie("z1".into())),
+        );
         let decision = auth.authorize_op(&op, &CollectionSchema::new());
         assert!(
             decision.is_rejected(),
@@ -924,12 +998,32 @@ mod tests {
     #[test]
     fn acl_zookie_stamp_monotonically_advances() {
         let mut table = AclZookieTable::new();
-        assert_eq!(table.current("p1"), AuthZookie::empty(), "an un-stamped page is at the empty zookie");
-        assert!(table.stamp("p1", Zookie("z2".into())), "first stamp advances");
-        assert!(table.stamp("p1", Zookie("z5".into())), "a later revision advances");
-        assert!(!table.stamp("p1", Zookie("z3".into())), "an OLDER revision is REFUSED (monotone)");
-        assert!(!table.stamp("p1", Zookie("z5".into())), "the SAME revision is refused (strictly later)");
-        assert_eq!(table.current("p1").zookie().0, "z5", "the watermark stays at the latest");
+        assert_eq!(
+            table.current("p1"),
+            AuthZookie::empty(),
+            "an un-stamped page is at the empty zookie"
+        );
+        assert!(
+            table.stamp("p1", Zookie("z2".into())),
+            "first stamp advances"
+        );
+        assert!(
+            table.stamp("p1", Zookie("z5".into())),
+            "a later revision advances"
+        );
+        assert!(
+            !table.stamp("p1", Zookie("z3".into())),
+            "an OLDER revision is REFUSED (monotone)"
+        );
+        assert!(
+            !table.stamp("p1", Zookie("z5".into())),
+            "the SAME revision is refused (strictly later)"
+        );
+        assert_eq!(
+            table.current("p1").zookie().0,
+            "z5",
+            "the watermark stays at the latest"
+        );
     }
 
     // ── the schema validation gate (0 invalid rows persisted) ─────────────────────────────────────
@@ -946,21 +1040,41 @@ mod tests {
             .declare("count", FieldType::Int);
 
         // A well-typed row: title=Text, count=Int → Apply.
-        let mut good = op_for(actor("alice"), "p1", OpPermission::Edit, AuthZookie::empty());
+        let mut good = op_for(
+            actor("alice"),
+            "p1",
+            OpPermission::Edit,
+            AuthZookie::empty(),
+        );
         good.db_row = vec![
             ("title".into(), FieldValue::Text("hi".into())),
             ("count".into(), FieldValue::Int(3)),
         ];
-        assert_eq!(auth.authorize_op(&good, &schema), OpDecision::Apply, "a well-typed db-row op applies");
+        assert_eq!(
+            auth.authorize_op(&good, &schema),
+            OpDecision::Apply,
+            "a well-typed db-row op applies"
+        );
 
         // A mismatched row: count given a Text value → SchemaViolation, rejected before merge.
-        let mut bad = op_for(actor("alice"), "p1", OpPermission::Edit, AuthZookie::empty());
+        let mut bad = op_for(
+            actor("alice"),
+            "p1",
+            OpPermission::Edit,
+            AuthZookie::empty(),
+        );
         bad.db_row = vec![("count".into(), FieldValue::Text("not-an-int".into()))];
         let decision = auth.authorize_op(&bad, &schema);
         match decision {
             OpDecision::Rejected(RejectReason::SchemaViolation { detail }) => {
-                assert!(detail.contains("count"), "the violation names the field: {detail}");
-                assert!(detail.contains("int"), "it names the declared type: {detail}");
+                assert!(
+                    detail.contains("count"),
+                    "the violation names the field: {detail}"
+                );
+                assert!(
+                    detail.contains("int"),
+                    "it names the declared type: {detail}"
+                );
             }
             other => panic!("expected a SchemaViolation, got {other:?}"),
         }
@@ -973,11 +1087,19 @@ mod tests {
         id.grant("alice");
         let mut auth = OpAuthorizer::new(id);
         let schema = CollectionSchema::new().declare("title", FieldType::Text);
-        let mut op = op_for(actor("alice"), "p1", OpPermission::Edit, AuthZookie::empty());
+        let mut op = op_for(
+            actor("alice"),
+            "p1",
+            OpPermission::Edit,
+            AuthZookie::empty(),
+        );
         op.db_row = vec![("ghost".into(), FieldValue::Text("x".into()))];
         let decision = auth.authorize_op(&op, &schema);
         assert!(
-            matches!(decision, OpDecision::Rejected(RejectReason::SchemaViolation { .. })),
+            matches!(
+                decision,
+                OpDecision::Rejected(RejectReason::SchemaViolation { .. })
+            ),
             "an undeclared field is rejected (the schema is closed)"
         );
     }
@@ -990,11 +1112,19 @@ mod tests {
         let id = ZookieAwareCheck::new(); // no grant
         let mut auth = OpAuthorizer::new(id);
         let schema = CollectionSchema::new().declare("title", FieldType::Text);
-        let mut op = op_for(actor("mallory"), "p1", OpPermission::Edit, AuthZookie::empty());
+        let mut op = op_for(
+            actor("mallory"),
+            "p1",
+            OpPermission::Edit,
+            AuthZookie::empty(),
+        );
         op.db_row = vec![("count".into(), FieldValue::Int(1))]; // also schema-invalid (undeclared)
         let decision = auth.authorize_op(&op, &schema);
         assert!(
-            matches!(decision, OpDecision::Rejected(RejectReason::PermissionDenied { .. })),
+            matches!(
+                decision,
+                OpDecision::Rejected(RejectReason::PermissionDenied { .. })
+            ),
             "an ungranted op is rejected on permission first"
         );
     }
@@ -1011,7 +1141,12 @@ mod tests {
         let obj = page_ref("p1");
         auth.erasures_mut().erase(&obj);
 
-        let op = op_for(actor("alice"), "p1", OpPermission::Edit, AuthZookie::empty());
+        let op = op_for(
+            actor("alice"),
+            "p1",
+            OpPermission::Edit,
+            AuthZookie::empty(),
+        );
         let decision = auth.authorize_op(&op, &CollectionSchema::new());
         assert_eq!(
             decision,
@@ -1019,7 +1154,10 @@ mod tests {
             "an op against erased content degrades (never applies, never resurrects)"
         );
         assert!(decision.is_degraded());
-        assert!(!decision.applied(), "a degraded op never reaches the merge layer");
+        assert!(
+            !decision.applied(),
+            "a degraded op never reaches the merge layer"
+        );
     }
 
     /// **Erasure is checked FIRST: even an UNGRANTED actor's op against erased content degrades (the
@@ -1031,7 +1169,12 @@ mod tests {
         let obj = page_ref("p1");
         auth.erasures_mut().erase(&obj);
         auth.erasures_mut().erase(&obj); // idempotent
-        let op = op_for(actor("mallory"), "p1", OpPermission::Edit, AuthZookie::empty());
+        let op = op_for(
+            actor("mallory"),
+            "p1",
+            OpPermission::Edit,
+            AuthZookie::empty(),
+        );
         assert_eq!(
             auth.authorize_op(&op, &CollectionSchema::new()),
             OpDecision::Degraded,
@@ -1042,7 +1185,10 @@ mod tests {
     /// **A comment op authorizes the `comment` permission token (not `edit`).**
     #[test]
     fn comment_op_authorizes_the_comment_permission() {
-        assert_eq!(OpPermission::Comment.permission(), Permission("comment".into()));
+        assert_eq!(
+            OpPermission::Comment.permission(),
+            Permission("comment".into())
+        );
         assert_eq!(OpPermission::Edit.permission(), Permission("edit".into()));
         assert_eq!(OpPermission::Comment.as_str(), "comment");
     }
@@ -1053,7 +1199,14 @@ mod tests {
     fn per_op_check_reads_at_strong_consistency() {
         let z = AuthZookie::of(Zookie("z5".into()));
         let at = z.consistency();
-        assert_eq!(at.mode, ConsistencyMode::Strong, "the per-op check is read-your-writes (4.10)");
-        assert_eq!(at.at_least.0, "z5", "at-or-after the page's stamped acl_zookie");
+        assert_eq!(
+            at.mode,
+            ConsistencyMode::Strong,
+            "the per-op check is read-your-writes (4.10)"
+        );
+        assert_eq!(
+            at.at_least.0, "z5",
+            "at-or-after the page's stamped acl_zookie"
+        );
     }
 }

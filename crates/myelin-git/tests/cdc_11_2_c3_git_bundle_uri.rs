@@ -39,13 +39,20 @@ fn cdc_11_2_c3_bundle_uri_clone_round_trips_a_valid_clone() {
     let path = BundleUriClone::new(eu_cdn(&store, "acme"));
 
     let bundle_bytes = b"PACK\0clone-bundle@refsnapshot";
-    let uri = path.publish_bundle(bundle_bytes).expect("publish the bundle → bundle-URI");
+    let uri = path
+        .publish_bundle(bundle_bytes)
+        .expect("publish the bundle → bundle-URI");
     // the URI carries the content-address (the CDN cache key, `transfer.bundleURI`).
     assert_eq!(uri.content_hash, ContentHash::blake3(bundle_bytes));
 
     // the accelerated clone: fetch by the bundle-URI → the exact repo bytes.
-    let cloned = path.clone_via_bundle_uri(&uri).expect("clone via the bundle-URI");
-    assert_eq!(cloned, bundle_bytes, "the bundle-URI clone round-trips the exact bytes");
+    let cloned = path
+        .clone_via_bundle_uri(&uri)
+        .expect("clone via the bundle-URI");
+    assert_eq!(
+        cloned, bundle_bytes,
+        "the bundle-URI clone round-trips the exact bytes"
+    );
 }
 
 /// **CDC: the bundle is content-addressed — the SAME base BlobStore backs the CDN serve (the CDN is
@@ -57,9 +64,13 @@ fn cdc_11_2_c3_the_bundle_rides_the_unchanged_content_addressed_store() {
     let cdn = eu_cdn(&store, "acme");
     // the git consumer publishes through its accelerated-clone path...
     let path = BundleUriClone::new(eu_cdn(&store, "acme"));
-    let uri = path.publish_bundle(b"shared-backing-bundle").expect("publish");
+    let uri = path
+        .publish_bundle(b"shared-backing-bundle")
+        .expect("publish");
     // ...and the SAME storage CDN class serves the SAME bytes by the SAME content-address.
-    let via_storage = cdn.bundle(&uri.content_hash).expect("the storage class has the bundle");
+    let via_storage = cdn
+        .bundle(&uri.content_hash)
+        .expect("the storage class has the bundle");
     assert_eq!(via_storage, b"shared-backing-bundle");
 }
 
@@ -70,7 +81,15 @@ fn cdc_11_2_c3_a_tampered_bundle_is_refused() {
     let path = BundleUriClone::new(eu_cdn(&store, "acme"));
     let uri = path.publish_bundle(b"valid-clone-bundle").expect("publish");
 
-    assert!(store.corrupt_for_drill(&tenant("acme"), &uri.content_hash), "bundle present to corrupt");
-    let err = path.clone_via_bundle_uri(&uri).expect_err("a tampered bundle MUST be refused");
-    assert!(matches!(err, BundleCloneError::Fetch { .. }), "0 silent serve: {err}");
+    assert!(
+        store.corrupt_for_drill(&tenant("acme"), &uri.content_hash),
+        "bundle present to corrupt"
+    );
+    let err = path
+        .clone_via_bundle_uri(&uri)
+        .expect_err("a tampered bundle MUST be refused");
+    assert!(
+        matches!(err, BundleCloneError::Fetch { .. }),
+        "0 silent serve: {err}"
+    );
 }

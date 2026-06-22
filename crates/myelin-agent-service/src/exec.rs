@@ -627,7 +627,12 @@ mod tests {
     #[test]
     fn external_and_read_effects_also_cannot_reach_exec() {
         for (name, kind, se, route) in [
-            ("ci.deploy", EffectKind::External, true, ToolRoute::EffectApi),
+            (
+                "ci.deploy",
+                EffectKind::External,
+                true,
+                ToolRoute::EffectApi,
+            ),
             ("issue.read", EffectKind::Read, false, ToolRoute::Direct),
         ] {
             let d = def(name, kind, se);
@@ -697,9 +702,7 @@ mod tests {
             EgressPolicy::deny_all(),
             limits(),
             TrustTier::UntrustedFork,
-            RunTokenRef {
-                jti: "jti".into(),
-            },
+            RunTokenRef { jti: "jti".into() },
             MeterTarget {
                 reserve_id: "res".into(),
             },
@@ -884,7 +887,10 @@ mod tests {
         }
     }
 
-    fn hands<'a>(backend: &'a RecordingBackend, hooks: RunnerHooks) -> SandboxToolHands<'a, RecordingBackend> {
+    fn hands<'a>(
+        backend: &'a RecordingBackend,
+        hooks: RunnerHooks,
+    ) -> SandboxToolHands<'a, RecordingBackend> {
         SandboxToolHands::new(
             green_gate(),
             backend,
@@ -968,7 +974,10 @@ mod tests {
         let hands = hands(&backend, hooks);
         let out = hands.exec(Command("sh".into()));
         assert!(out.0.starts_with("exec-refused:"), "{out:?}");
-        assert!(order.lock().unwrap().is_empty(), "no guarantee fired past the isolation floor");
+        assert!(
+            order.lock().unwrap().is_empty(),
+            "no guarantee fired past the isolation floor"
+        );
     }
 
     #[test]
@@ -1011,7 +1020,10 @@ mod tests {
             kills: Arc::new(AtomicU32::new(0)),
         };
         let hands = hands(&backend, working_hooks());
-        assert_eq!(hands.gate().backend_id().backend, Backend::FirecrackerMicrovm);
+        assert_eq!(
+            hands.gate().backend_id().backend,
+            Backend::FirecrackerMicrovm
+        );
         assert!(hands.gate().open_line().starts_with("[AG-D4 GATE OPEN]"));
     }
 

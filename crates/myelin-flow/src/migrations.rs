@@ -225,12 +225,27 @@ CREATE TABLE wf_definition (\
 /// one). `rls_scoped = true` rides a `myelin_make_tenant_scoped('<table>')` RLS-scope call on the
 /// same forward migration; `wf_definition` (the global registry) is `false` (no tenant column).
 const TABLE_DDLS: &[(&str, &str, &str, bool)] = &[
-    ("flow_0001_workflow_run", WORKFLOW_RUN_DDL, "workflow_run", true),
+    (
+        "flow_0001_workflow_run",
+        WORKFLOW_RUN_DDL,
+        "workflow_run",
+        true,
+    ),
     ("flow_0002_wf_history", WF_HISTORY_DDL, "wf_history", true),
     ("flow_0003_wf_timer", WF_TIMER_DDL, "wf_timer", true),
     ("flow_0004_wf_signal", WF_SIGNAL_DDL, "wf_signal", true),
-    ("flow_0005_wf_activity_attempt", WF_ACTIVITY_ATTEMPT_DDL, "wf_activity_attempt", true),
-    ("flow_0006_wf_definition", WF_DEFINITION_DDL, "wf_definition", false),
+    (
+        "flow_0005_wf_activity_attempt",
+        WF_ACTIVITY_ATTEMPT_DDL,
+        "wf_activity_attempt",
+        true,
+    ),
+    (
+        "flow_0006_wf_definition",
+        WF_DEFINITION_DDL,
+        "wf_definition",
+        false,
+    ),
 ];
 
 /// The dispatch indexes that ride their table's forward migration (§3.1/§3.3/§3.4 partial indexes).
@@ -259,27 +274,31 @@ pub fn rls_scope_sql(table: &str) -> String {
 /// (an empty fresh table; no hot-table lock). The DDL is held as `&str` constants (NOT mistaken for
 /// live Rust by the lint), then assembled + `'static`-leaked once at boot.
 pub fn migrations() -> Migrations {
-    Migrations::of(TABLE_DDLS.iter().map(|(id, create_ddl, table, rls_scoped)| {
-        let mut ddl = String::new();
-        ddl.push_str(create_ddl);
-        ddl.push(';');
-        for (idx_table, idx_ddl) in TABLE_INDEXES {
-            if idx_table == table {
-                ddl.push('\n');
-                ddl.push_str(idx_ddl);
+    Migrations::of(
+        TABLE_DDLS
+            .iter()
+            .map(|(id, create_ddl, table, rls_scoped)| {
+                let mut ddl = String::new();
+                ddl.push_str(create_ddl);
                 ddl.push(';');
-            }
-        }
-        if *rls_scoped {
-            ddl.push('\n');
-            ddl.push_str(&rls_scope_sql(table));
-            ddl.push(';');
-        }
-        // One-time, bounded leak — the migration set is built once at boot/serve; the substrate
-        // `Migration` holds `&'static str` (the same pattern `myelin-notif` uses).
-        let ddl: &'static str = Box::leak(ddl.into_boxed_str());
-        Migration::phased(id, ddl, MigrationPhase::Plain, table)
-    }))
+                for (idx_table, idx_ddl) in TABLE_INDEXES {
+                    if idx_table == table {
+                        ddl.push('\n');
+                        ddl.push_str(idx_ddl);
+                        ddl.push(';');
+                    }
+                }
+                if *rls_scoped {
+                    ddl.push('\n');
+                    ddl.push_str(&rls_scope_sql(table));
+                    ddl.push(';');
+                }
+                // One-time, bounded leak — the migration set is built once at boot/serve; the substrate
+                // `Migration` holds `&'static str` (the same pattern `myelin-notif` uses).
+                let ddl: &'static str = Box::leak(ddl.into_boxed_str());
+                Migration::phased(id, ddl, MigrationPhase::Plain, table)
+            }),
+    )
 }
 
 /// Whether `ddl` is forward-only-LEGAL (no destructive `DROP`, no down/rollback). The framework's
@@ -301,10 +320,16 @@ mod tests {
     #[test]
     fn the_six_migrations_apply_forward_only_in_order() {
         let migrations = migrations();
-        assert_eq!(migrations.0.len(), 6, "the six-table data model (§3.1..§3.6)");
+        assert_eq!(
+            migrations.0.len(),
+            6,
+            "the six-table data model (§3.1..§3.6)"
+        );
         let mut runner = MigrationRunner::new();
         // The six tables are brand-new `CREATE TABLE`s (cold at creation) — `none()` hot set.
-        runner.run(&migrations, &HotTables::none()).expect("the six migrations apply forward-only");
+        runner
+            .run(&migrations, &HotTables::none())
+            .expect("the six migrations apply forward-only");
         assert_eq!(
             runner.applied(),
             &[
@@ -328,12 +353,18 @@ mod tests {
         for (_id, ddl, table, rls_scoped) in TABLE_DDLS {
             if !rls_scoped {
                 // wf_definition: the global registry — PK (wf_type, version), no tenant column.
-                assert_eq!(*table, "wf_definition", "the only non-tenant table is wf_definition (§3.6)");
+                assert_eq!(
+                    *table, "wf_definition",
+                    "the only non-tenant table is wf_definition (§3.6)"
+                );
                 assert!(
                     ddl.contains("PRIMARY KEY (wf_type, version)"),
                     "wf_definition is keyed by (wf_type, version) — definitions are code, not tenant data"
                 );
-                assert!(!ddl.contains("tenant_id"), "wf_definition carries NO tenant column (§3.6)");
+                assert!(
+                    !ddl.contains("tenant_id"),
+                    "wf_definition carries NO tenant column (§3.6)"
+                );
                 continue;
             }
             let cols = ddl.split('(').nth(1).expect("a column list");
@@ -381,14 +412,20 @@ mod tests {
             "wf_history journaling is idempotent on (tenant, run_id, command_id) (§3.2)"
         );
         // command_id is a column (deterministic from the workflow position; the replay-match key).
-        assert!(WF_HISTORY_DDL.contains("command_id text NOT NULL"), "the deterministic replay-match key");
+        assert!(
+            WF_HISTORY_DDL.contains("command_id text NOT NULL"),
+            "the deterministic replay-match key"
+        );
         // append-only journal: the (tenant, region, run_id, seq) replay-order PK.
         assert!(
             WF_HISTORY_DDL.contains("PRIMARY KEY (tenant_id, region, run_id, seq)"),
             "the per-run monotonic seq is the replay order (§3.2)"
         );
         // the inline-PII crypto-shred lever (envelope-encryption key ref, §4.8).
-        assert!(WF_HISTORY_DDL.contains("result_key_ref text"), "the inline-PII crypto-shred key ref (§4.8)");
+        assert!(
+            WF_HISTORY_DDL.contains("result_key_ref text"),
+            "the inline-PII crypto-shred key ref (§4.8)"
+        );
     }
 
     /// The `wf_signal` PK `(tenant_id, run_id, signal_name, idem_key)` is EXACTLY what makes the
@@ -400,9 +437,15 @@ mod tests {
             WF_SIGNAL_DDL.contains("PRIMARY KEY (tenant_id, run_id, signal_name, idem_key)"),
             "the signal PK dedups a re-delivered signal by construction (§3.4 / §6.4 / §4.9)"
         );
-        assert!(WF_SIGNAL_DDL.contains("payload_key_ref text"), "the inline-PII crypto-shred key ref (§3.4)");
+        assert!(
+            WF_SIGNAL_DDL.contains("payload_key_ref text"),
+            "the inline-PII crypto-shred key ref (§3.4)"
+        );
         // payload is references-not-payloads (jsonb refs, never a PII body).
-        assert!(WF_SIGNAL_DDL.contains("payload jsonb NOT NULL"), "the signal payload is refs-not-payloads (§3.4)");
+        assert!(
+            WF_SIGNAL_DDL.contains("payload jsonb NOT NULL"),
+            "the signal payload is refs-not-payloads (§3.4)"
+        );
     }
 
     /// The `wf_timer` partial index `(bucket, partition) WHERE NOT fired` is the SC-11 world-scale
@@ -412,23 +455,38 @@ mod tests {
     #[test]
     fn wf_timer_partial_index_covers_bucket_partition_where_not_fired() {
         let m = migrations();
-        let timer = m.0.iter().find(|m| m.table == Some("wf_timer")).expect("the wf_timer migration");
+        let timer =
+            m.0.iter()
+                .find(|m| m.table == Some("wf_timer"))
+                .expect("the wf_timer migration");
         assert!(
-            timer.ddl.contains("CREATE INDEX wf_timer_due ON wf_timer (bucket, partition) WHERE NOT fired"),
+            timer.ddl.contains(
+                "CREATE INDEX wf_timer_due ON wf_timer (bucket, partition) WHERE NOT fired"
+            ),
             "the SC-11 partial index on (bucket, partition) WHERE NOT fired (§3.3): {}",
             timer.ddl
         );
-        assert!(WF_TIMER_DDL.contains("bucket integer NOT NULL"), "the epoch_minute(fire_at) coarse bucket (§3.3)");
-        assert!(WF_TIMER_DDL.contains("fired boolean NOT NULL DEFAULT false"), "the unfired flag the partial index pivots on");
+        assert!(
+            WF_TIMER_DDL.contains("bucket integer NOT NULL"),
+            "the epoch_minute(fire_at) coarse bucket (§3.3)"
+        );
+        assert!(
+            WF_TIMER_DDL.contains("fired boolean NOT NULL DEFAULT false"),
+            "the unfired flag the partial index pivots on"
+        );
     }
 
     /// The `wf_activity_attempt` ledger carries the `idem_token` bridge to BUS-2 (a retried emit is
     /// broker-deduped) keyed by `(tenant, region, run_id, command_id, attempt)` (§3.5).
     #[test]
     fn wf_activity_attempt_carries_the_bus2_idem_token() {
-        assert!(WF_ACTIVITY_ATTEMPT_DDL.contains("idem_token text NOT NULL"), "the BUS-2 dedup bridge token (§3.5)");
         assert!(
-            WF_ACTIVITY_ATTEMPT_DDL.contains("PRIMARY KEY (tenant_id, region, run_id, command_id, attempt)"),
+            WF_ACTIVITY_ATTEMPT_DDL.contains("idem_token text NOT NULL"),
+            "the BUS-2 dedup bridge token (§3.5)"
+        );
+        assert!(
+            WF_ACTIVITY_ATTEMPT_DDL
+                .contains("PRIMARY KEY (tenant_id, region, run_id, command_id, attempt)"),
             "the per-attempt ledger key (§3.5)"
         );
     }
@@ -440,21 +498,55 @@ mod tests {
     fn workflow_run_carries_the_3_1_lifecycle_invariants() {
         let ddl = WORKFLOW_RUN_DDL;
         // the frozen six-state lifecycle (§3.1) as a CHECK (forward-only extensible).
-        for s in ["running", "waiting", "completed", "failed", "nondeterministic", "terminated"] {
-            assert!(ddl.contains(s), "the lifecycle state `{s}` is in the CHECK (§3.1)");
+        for s in [
+            "running",
+            "waiting",
+            "completed",
+            "failed",
+            "nondeterministic",
+            "terminated",
+        ] {
+            assert!(
+                ddl.contains(s),
+                "the lifecycle state `{s}` is in the CHECK (§3.1)"
+            );
         }
-        assert!(ddl.contains("cursor bigint NOT NULL DEFAULT 0"), "the replay short-circuit cursor (§3.1)");
-        assert!(ddl.contains("budget jsonb"), "the owned RunBudget (§3.1; minor-units, not floats)");
+        assert!(
+            ddl.contains("cursor bigint NOT NULL DEFAULT 0"),
+            "the replay short-circuit cursor (§3.1)"
+        );
+        assert!(
+            ddl.contains("budget jsonb"),
+            "the owned RunBudget (§3.1; minor-units, not floats)"
+        );
         // the BUS-5 causality columns + the AG-6 loop-cap depth counter.
-        for c in ["correlation_id text", "causation_id text", "caused_by text", "depth integer"] {
-            assert!(ddl.contains(c), "the causality column `{c}` (§3.1, BUS-5/AG-6)");
+        for c in [
+            "correlation_id text",
+            "causation_id text",
+            "caused_by text",
+            "depth integer",
+        ] {
+            assert!(
+                ddl.contains(c),
+                "the causality column `{c}` (§3.1, BUS-5/AG-6)"
+            );
         }
         // the §4.7 sharded lease-dispatch handles.
-        for c in ["partition smallint", "lease_owner text", "lease_expires timestamptz"] {
-            assert!(ddl.contains(c), "the lease-dispatch column `{c}` (§3.1 / §4.7)");
+        for c in [
+            "partition smallint",
+            "lease_owner text",
+            "lease_expires timestamptz",
+        ] {
+            assert!(
+                ddl.contains(c),
+                "the lease-dispatch column `{c}` (§3.1 / §4.7)"
+            );
         }
         // input is references-not-payloads (jsonb refs, never a PII body — §3.1).
-        assert!(ddl.contains("input jsonb NOT NULL"), "the input is refs-not-payloads (§3.1)");
+        assert!(
+            ddl.contains("input jsonb NOT NULL"),
+            "the input is refs-not-payloads (§3.1)"
+        );
     }
 
     /// `wf_definition` (§3.6) is the GLOBAL versioned registry: definitions are CODE, not tenant
@@ -462,12 +554,24 @@ mod tests {
     /// NO PII. A run pins to its `wf_version` at start (§4.6).
     #[test]
     fn wf_definition_is_the_global_versioned_registry() {
-        assert!(WF_DEFINITION_DDL.contains("code_hash text NOT NULL"), "the code-hash drift-detector (§3.6)");
-        assert!(WF_DEFINITION_DDL.contains("PRIMARY KEY (wf_type, version)"), "the (wf_type, version) registry key (§3.6)");
+        assert!(
+            WF_DEFINITION_DDL.contains("code_hash text NOT NULL"),
+            "the code-hash drift-detector (§3.6)"
+        );
+        assert!(
+            WF_DEFINITION_DDL.contains("PRIMARY KEY (wf_type, version)"),
+            "the (wf_type, version) registry key (§3.6)"
+        );
         for s in ["active", "draining", "retired"] {
-            assert!(WF_DEFINITION_DDL.contains(s), "the definition status `{s}` (§3.6)");
+            assert!(
+                WF_DEFINITION_DDL.contains(s),
+                "the definition status `{s}` (§3.6)"
+            );
         }
-        assert!(!WF_DEFINITION_DDL.contains("tenant_id"), "the global registry carries NO tenant column (§3.6)");
+        assert!(
+            !WF_DEFINITION_DDL.contains("tenant_id"),
+            "the global registry carries NO tenant column (§3.6)"
+        );
     }
 
     /// Each tenant-scoped table's RLS-readiness step is the `myelin_make_tenant_scoped(<table>)`
@@ -479,9 +583,16 @@ mod tests {
         let migrations = migrations();
         for (i, (_id, _ddl, table, rls_scoped)) in TABLE_DDLS.iter().enumerate() {
             let m = &migrations.0[i];
-            assert!(m.ddl.contains("CREATE TABLE"), "migration `{}` carries the create-table", m.id);
+            assert!(
+                m.ddl.contains("CREATE TABLE"),
+                "migration `{}` carries the create-table",
+                m.id
+            );
             if *rls_scoped {
-                assert_eq!(rls_scope_sql(table), format!("SELECT myelin_make_tenant_scoped('{table}')"));
+                assert_eq!(
+                    rls_scope_sql(table),
+                    format!("SELECT myelin_make_tenant_scoped('{table}')")
+                );
                 assert!(
                     m.ddl.contains(&rls_scope_sql(table)),
                     "migration `{}` carries the RLS scoping for `{table}`",
@@ -495,7 +606,11 @@ mod tests {
             }
         }
         assert_eq!(TABLES.len(), 6, "the six-table data model");
-        assert_eq!(TENANT_SCOPED_TABLES.len(), 5, "five tenant-scoped tables + the global registry");
+        assert_eq!(
+            TENANT_SCOPED_TABLES.len(),
+            5,
+            "five tenant-scoped tables + the global registry"
+        );
     }
 
     /// The runner REFUSES a destructive (`DROP`) flow migration — forward-only is structural; a
@@ -503,14 +618,26 @@ mod tests {
     /// gate is LIVE over THIS crate's migrations, not vacuously green.
     #[test]
     fn a_destructive_flow_migration_is_refused() {
-        let bad = Migrations::of([Migration::plain("flow_9999_drop", "DROP TABLE workflow_run")]);
+        let bad = Migrations::of([Migration::plain(
+            "flow_9999_drop",
+            "DROP TABLE workflow_run",
+        )]);
         let mut runner = MigrationRunner::new();
-        let e = runner.run(&bad, &HotTables::none()).expect_err("a DROP must be refused");
-        assert!(e.0.contains("forward-only"), "the refusal names forward-only: {}", e.0);
+        let e = runner
+            .run(&bad, &HotTables::none())
+            .expect_err("a DROP must be refused");
+        assert!(
+            e.0.contains("forward-only"),
+            "the refusal names forward-only: {}",
+            e.0
+        );
         // the assembled real migration set is forward-only-legal (no DROP anywhere).
         for (_id, ddl, _table, _rls) in TABLE_DDLS {
             assert!(ddl_is_forward_only(ddl), "the real DDL is forward-only");
-            assert!(!ddl.to_ascii_uppercase().contains("DROP"), "no DROP in the data-model DDL");
+            assert!(
+                !ddl.to_ascii_uppercase().contains("DROP"),
+                "no DROP in the data-model DDL"
+            );
         }
     }
 }

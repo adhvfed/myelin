@@ -57,7 +57,10 @@ struct Wire {
 impl WireExecutor for Wire {
     fn run(&self, inv: &WireInvocation) -> Result<WireOutput, GitCoreError> {
         self.ran.borrow_mut().push(inv.argv.clone());
-        Ok(WireOutput { stdout: vec![], status: self.status })
+        Ok(WireOutput {
+            stdout: vec![],
+            status: self.status,
+        })
     }
 }
 
@@ -71,7 +74,13 @@ struct Inv {
 impl Inv {
     fn new(fail: Option<CacheNamespace>) -> (Inv, Rc<RefCell<Vec<CacheNamespace>>>) {
         let seen = Rc::new(RefCell::new(vec![]));
-        (Inv { fail, seen: seen.clone() }, seen)
+        (
+            Inv {
+                fail,
+                seen: seen.clone(),
+            },
+            seen,
+        )
     }
 }
 impl CacheInvalidator for Inv {
@@ -97,23 +106,37 @@ impl CacheInvalidator for Inv {
 #[test]
 fn the_history_rewrite_seals_a_content_addressed_audit_receipt() {
     let tool = HistoryRewriteTool::new(
-        Wire { status: 0, ran: RefCell::new(vec![]) },
+        Wire {
+            status: 0,
+            ran: RefCell::new(vec![]),
+        },
         Inv::new(None).0,
     );
     let mut limiter = RewriteRateLimiter::new(5);
-    let r = tool.rewrite(&plan(), &mut limiter, 1700000000000).expect("green rewrite");
+    let r = tool
+        .rewrite(&plan(), &mut limiter, 1700000000000)
+        .expect("green rewrite");
 
     // the audit hash-chain link: the ONE multihash convention the audit Merkle leaf uses.
     assert_eq!(r.receipt.operation, "git.history_rewrite");
-    assert!(r.receipt.content_hash.starts_with("blake3:"), "the audit hash-link is blake3:<hex>");
+    assert!(
+        r.receipt.content_hash.starts_with("blake3:"),
+        "the audit hash-link is blake3:<hex>"
+    );
     // deterministic: the SAME plan at the SAME time seals the SAME content-address (replay-safe).
     let tool2 = HistoryRewriteTool::new(
-        Wire { status: 0, ran: RefCell::new(vec![]) },
+        Wire {
+            status: 0,
+            ran: RefCell::new(vec![]),
+        },
         Inv::new(None).0,
     );
     let mut l2 = RewriteRateLimiter::new(5);
     let r2 = tool2.rewrite(&plan(), &mut l2, 1700000000000).unwrap();
-    assert_eq!(r.receipt.content_hash, r2.receipt.content_hash, "the audit link is deterministic");
+    assert_eq!(
+        r.receipt.content_hash, r2.receipt.content_hash,
+        "the audit link is deterministic"
+    );
 }
 
 // ───────────────────────── the fork/mirror/clone-cache invalidation fan-out ──────────────────────
@@ -124,12 +147,25 @@ fn the_history_rewrite_seals_a_content_addressed_audit_receipt() {
 #[test]
 fn the_invalidation_fan_out_reaches_fork_mirror_and_clone_cache() {
     let inv = Inv::new(None).0;
-    let tool = HistoryRewriteTool::new(Wire { status: 0, ran: RefCell::new(vec![]) }, inv);
+    let tool = HistoryRewriteTool::new(
+        Wire {
+            status: 0,
+            ran: RefCell::new(vec![]),
+        },
+        inv,
+    );
     let mut limiter = RewriteRateLimiter::new(5);
     let r = tool.rewrite(&plan(), &mut limiter, 1).unwrap();
 
-    assert!(r.is_complete(), "the fan-out reached every trust-scoped namespace");
-    for ns in [CacheNamespace::Fork, CacheNamespace::Mirror, CacheNamespace::CloneCache] {
+    assert!(
+        r.is_complete(),
+        "the fan-out reached every trust-scoped namespace"
+    );
+    for ns in [
+        CacheNamespace::Fork,
+        CacheNamespace::Mirror,
+        CacheNamespace::CloneCache,
+    ] {
         assert!(
             r.namespaces_invalidated.contains(&ns),
             "the {} cache was invalidated (recon §9 fan-out)",
@@ -142,12 +178,20 @@ fn the_invalidation_fan_out_reaches_fork_mirror_and_clone_cache() {
 #[test]
 fn an_incomplete_fan_out_is_a_loud_red() {
     let inv = Inv::new(Some(CacheNamespace::Mirror)).0;
-    let tool = HistoryRewriteTool::new(Wire { status: 0, ran: RefCell::new(vec![]) }, inv);
+    let tool = HistoryRewriteTool::new(
+        Wire {
+            status: 0,
+            ran: RefCell::new(vec![]),
+        },
+        inv,
+    );
     let mut limiter = RewriteRateLimiter::new(5);
     let err = tool.rewrite(&plan(), &mut limiter, 1).unwrap_err();
     assert_eq!(
         err,
-        HistoryRewriteError::IncompleteFanOut { missing: vec![CacheNamespace::Mirror] }
+        HistoryRewriteError::IncompleteFanOut {
+            missing: vec![CacheNamespace::Mirror]
+        }
     );
 }
 
@@ -159,7 +203,10 @@ fn an_incomplete_fan_out_is_a_loud_red() {
 #[test]
 fn the_op_is_rate_limited_and_runs_sandboxed_no_host_exec() {
     let tool = HistoryRewriteTool::new(
-        Wire { status: 0, ran: RefCell::new(vec![]) },
+        Wire {
+            status: 0,
+            ran: RefCell::new(vec![]),
+        },
         Inv::new(None).0,
     );
     let mut limiter = RewriteRateLimiter::new(1);
@@ -177,7 +224,13 @@ fn the_op_is_rate_limited_and_runs_sandboxed_no_host_exec() {
 #[test]
 fn a_failed_rewrite_runs_no_fan_out() {
     let (inv, seen) = Inv::new(None);
-    let tool = HistoryRewriteTool::new(Wire { status: 1, ran: RefCell::new(vec![]) }, inv);
+    let tool = HistoryRewriteTool::new(
+        Wire {
+            status: 1,
+            ran: RefCell::new(vec![]),
+        },
+        inv,
+    );
     let mut limiter = RewriteRateLimiter::new(5);
     assert!(matches!(
         tool.rewrite(&plan(), &mut limiter, 1).unwrap_err(),

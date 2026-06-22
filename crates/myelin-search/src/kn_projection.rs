@@ -130,7 +130,10 @@ pub fn kn_db_row_index_spec() -> IndexSpec {
     struct_fields.insert("owner".to_string(), FieldType::Principal);
     struct_fields.insert("due".to_string(), FieldType::Date);
     // The columnar sort key (the LexoRank fractional index, 13.3 — byte-identical to Issues'/KN's).
-    struct_fields.insert(crate::engine::ORDER_KEY_FIELD.to_string(), FieldType::OrderKey);
+    struct_fields.insert(
+        crate::engine::ORDER_KEY_FIELD.to_string(),
+        FieldType::OrderKey,
+    );
     // A row is NOT vector-embedded (it is a structured record; semantic search is over page prose).
     IndexSpec::new(KN_SUBSYSTEM, KN_DB_ROW_TYPE, struct_fields)
 }
@@ -195,7 +198,13 @@ pub fn page_search_projection(blocks: &[Block], lang: Option<&str>) -> SearchPro
     let mut embeds: Vec<String> = Vec::new();
 
     for block in blocks {
-        collect_block(block, &mut text, &mut mentions, &mut artifact_refs, &mut embeds);
+        collect_block(
+            block,
+            &mut text,
+            &mut mentions,
+            &mut artifact_refs,
+            &mut embeds,
+        );
     }
 
     let mut fields: BTreeMap<String, FieldValue> = BTreeMap::new();
@@ -208,13 +217,20 @@ pub fn page_search_projection(blocks: &[Block], lang: Option<&str>) -> SearchPro
         fields.insert(FACET_MENTION.to_string(), FieldValue::Relation(m.clone()));
     }
     if let Some(a) = artifact_refs.first() {
-        fields.insert(FACET_ARTIFACT_REF.to_string(), FieldValue::Relation(a.clone()));
+        fields.insert(
+            FACET_ARTIFACT_REF.to_string(),
+            FieldValue::Relation(a.clone()),
+        );
     }
     if let Some(e) = embeds.first() {
         fields.insert(FACET_EMBED.to_string(), FieldValue::Relation(e.clone()));
     }
 
-    SearchProjection { text, fields, lang: lang.map(|s| s.to_string()) }
+    SearchProjection {
+        text,
+        fields,
+        lang: lang.map(|s| s.to_string()),
+    }
 }
 
 /// Recursively collect a block's analyzable text + its structured inline-node references. `code_block`
@@ -346,8 +362,14 @@ mod tests {
         let s = kn_page_index_spec();
         assert_eq!(s.subsystem, "knowledge");
         assert_eq!(s.type_, "page");
-        assert_eq!(s.acl_object_type, "page", "a page's reachability is the page-tree's");
-        assert!(s.semantic, "a page is semantically indexed (vector-in-v1, §4.5)");
+        assert_eq!(
+            s.acl_object_type, "page",
+            "a page's reachability is the page-tree's"
+        );
+        assert!(
+            s.semantic,
+            "a page is semantically indexed (vector-in-v1, §4.5)"
+        );
         // The three structured inline-node reference facets (§3.1), all Relation.
         assert_eq!(s.struct_fields.len(), 3);
         for facet in [FACET_MENTION, FACET_ARTIFACT_REF, FACET_EMBED] {
@@ -367,7 +389,10 @@ mod tests {
         let s = kn_db_row_index_spec();
         assert_eq!(s.subsystem, "knowledge");
         assert_eq!(s.type_, "db_row");
-        assert!(!s.semantic, "a db row is a structured record, not vector-embedded prose");
+        assert!(
+            !s.semantic,
+            "a db row is a structured record, not vector-embedded prose"
+        );
         // The custom DB fields (the GIN-scan facets) + the order_key sort.
         assert_eq!(s.struct_fields.get("priority"), Some(&FieldType::Select));
         assert_eq!(s.struct_fields.get("owner"), Some(&FieldType::Principal));
@@ -387,7 +412,11 @@ mod tests {
     #[test]
     fn registration_is_accepted_by_search() {
         let accepted = register_kn_index_specs();
-        assert_eq!(accepted, kn_index_specs(), "Search accepts the declared KN specs verbatim");
+        assert_eq!(
+            accepted,
+            kn_index_specs(),
+            "Search accepts the declared KN specs verbatim"
+        );
         // And a live indexer over them opens (the facet union is consistent across the two specs).
         let _ix = IncrementalIndexer::new(
             kn_index_specs(),
@@ -410,18 +439,34 @@ mod tests {
             },
             Block::Paragraph {
                 inline: parse_inline(
-                    &format!("see {} and ping {}", myelin_content::OBJ, myelin_content::OBJ),
-                    &[InlineNode::ArtifactRefNode(referenced.clone()), mention("alice")],
+                    &format!(
+                        "see {} and ping {}",
+                        myelin_content::OBJ,
+                        myelin_content::OBJ
+                    ),
+                    &[
+                        InlineNode::ArtifactRefNode(referenced.clone()),
+                        mention("alice"),
+                    ],
                 ),
             },
-            Block::CodeBlock { lang: Some("rust".into()), text: "let x = scheduler_deadlock();".into() },
-            Block::Embed { reference: embedded.clone(), display: myelin_content::EmbedDisplay::Card },
+            Block::CodeBlock {
+                lang: Some("rust".into()),
+                text: "let x = scheduler_deadlock();".into(),
+            },
+            Block::Embed {
+                reference: embedded.clone(),
+                display: myelin_content::EmbedDisplay::Card,
+            },
         ];
         let p = page_search_projection(&blocks, Some("en"));
 
         // The full-text body carries the prose AND the raw code (X-2: code is verbatim).
         assert!(p.text.contains("Design Notes"));
-        assert!(p.text.contains("scheduler_deadlock"), "raw code body is indexed (X-2)");
+        assert!(
+            p.text.contains("scheduler_deadlock"),
+            "raw code body is indexed (X-2)"
+        );
         assert_eq!(p.lang.as_deref(), Some("en"));
 
         // The structured reference facets are extracted via the node-array walk.
@@ -444,10 +489,18 @@ mod tests {
     /// present references — an absent facet is not indexed as empty).
     #[test]
     fn page_with_no_nodes_has_no_reference_facets() {
-        let blocks = vec![Block::Paragraph { inline: parse_inline("plain prose only", &[]) }];
+        let blocks = vec![Block::Paragraph {
+            inline: parse_inline("plain prose only", &[]),
+        }];
         let p = page_search_projection(&blocks, None);
-        assert!(p.fields.is_empty(), "no structured nodes ⇒ no reference facets");
+        assert!(
+            p.fields.is_empty(),
+            "no structured nodes ⇒ no reference facets"
+        );
         assert!(p.text.contains("plain prose"));
-        assert!(p.lang.is_none(), "no source-declared lang ⇒ the indexer detects it (§4.7)");
+        assert!(
+            p.lang.is_none(),
+            "no source-declared lang ⇒ the indexer detects it (§4.7)"
+        );
     }
 }

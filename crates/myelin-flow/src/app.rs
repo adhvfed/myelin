@@ -148,7 +148,11 @@ pub fn flow_app_spec_with_engine(
     partition: i16,
     worker: impl Into<String>,
     lease_ttl_secs: i64,
-) -> (AppSpec, crate::engine::FlowDispatcher, crate::timer::TimerWheel) {
+) -> (
+    AppSpec,
+    crate::engine::FlowDispatcher,
+    crate::timer::TimerWheel,
+) {
     use myelin_events::{InProcessBus, OutboxStore};
     // The ONE outbox the engine drives co-commit into AND the relay drains (BUS-2): supply it to the
     // OutboxSpec so the drive → relay → bus path is the sanctioned one (no second store).
@@ -178,12 +182,7 @@ pub fn flow_app_spec_with_engine(
     // signal). The harness drives its tick on the wheel cadence (jittered ~1s, §4.2). The bounded
     // per-tick fire LIMIT is generous (a burst drains over a few ticks; the lag signal tracks it).
     let wheel = crate::timer::TimerWheel::new(
-        timers,
-        journal,
-        runs,
-        telemetry,
-        partition,
-        /* batch */ 4_096,
+        timers, journal, runs, telemetry, partition, /* batch */ 4_096,
     );
     let mut spec = flow_app_spec(config);
     // The engine drives co-commit into `outbox`; the relay must drain THAT store (the sanctioned
@@ -267,7 +266,10 @@ mod tests {
             Readiness::NotReady,
             "readiness is FALSE until the migrate-complete gate lifts"
         );
-        assert!(r.startup_incomplete, "the not-ready reason names the startup (pre-migrate) gate");
+        assert!(
+            r.startup_incomplete,
+            "the not-ready reason names the startup (pre-migrate) gate"
+        );
         assert!(r.sheds(), "a not-ready instance sheds new traffic");
         assert_eq!(
             surface.liveness(),
@@ -343,7 +345,11 @@ mod tests {
         // wire it into the slot — the P-FLOW-02 empty seam is now filled for the signal leg.
         let mut spec = flow_app_spec(Config::default());
         spec.consumers = vec![reg];
-        assert_eq!(spec.consumers.len(), 1, "the inbound-signal consumer occupies the consumer slot (P-FLOW-09)");
+        assert_eq!(
+            spec.consumers.len(),
+            1,
+            "the inbound-signal consumer occupies the consumer slot (P-FLOW-09)"
+        );
     }
 
     /// **The flow OLTP store auto-registers as a `PersonalDataHolder` at boot (§3.4, GD-3).** Even
@@ -354,7 +360,9 @@ mod tests {
         use myelin_substrate::StoreKind;
         let handle = boot_flow(Config::default()).expect("boot");
         assert!(
-            handle.holder_registry().is_registered(StoreKind::Oltp, SERVICE_NAME),
+            handle
+                .holder_registry()
+                .is_registered(StoreKind::Oltp, SERVICE_NAME),
             "the flow OLTP store auto-registered as a holder at boot (opening IS registering)"
         );
         assert!(
@@ -420,9 +428,7 @@ mod tests {
     fn engine_wired_spec_returns_a_driving_dispatcher() {
         use crate::engine::{run_state, DriveOutcome, RunRow};
         use crate::RetryPolicy;
-        use myelin_events::{
-            Actor, EmitContextBase, MonotonicMinter, Timestamp,
-        };
+        use myelin_events::{Actor, EmitContextBase, MonotonicMinter, Timestamp};
         use myelin_identity::{Principal, PrincipalId, PrincipalKind};
         use myelin_refs::ArtifactRef;
         use myelin_tenancy::{Region, TenantId};
@@ -452,7 +458,11 @@ mod tests {
             30,
         );
         // the six-table migrate phase is unchanged (the engine wiring does not add a second schema).
-        assert_eq!(spec.migrations.0.len(), 6, "the engine-wired spec still wires the six tables");
+        assert_eq!(
+            spec.migrations.0.len(),
+            6,
+            "the engine-wired spec still wires the six tables"
+        );
 
         // register a body + seed a runnable run; one tick drives it to completion.
         dispatcher.register(
@@ -465,17 +475,28 @@ mod tests {
                 Ok(vec![])
             }),
         );
-        dispatcher
-            .runs()
-            .put(RunRow::new_runnable(tenant.clone(), region, "R1", "agent.run", 0));
+        dispatcher.runs().put(RunRow::new_runnable(
+            tenant.clone(),
+            region,
+            "R1",
+            "agent.run",
+            0,
+        ));
         let outcome = dispatcher.tick(1000, "2026-06-21T00:00:00Z", 7);
-        assert!(matches!(outcome, Some(DriveOutcome::Completed(_))), "the dispatcher drove the run");
+        assert!(
+            matches!(outcome, Some(DriveOutcome::Completed(_))),
+            "the dispatcher drove the run"
+        );
         assert_eq!(
             dispatcher.runs().get(&tenant, "R1").unwrap().state,
             run_state::COMPLETED,
             "the seeded run completed under the engine-wired dispatcher"
         );
-        assert_eq!(dispatcher.telemetry().double_effect_count(), 0, "0 double-effect");
+        assert_eq!(
+            dispatcher.telemetry().double_effect_count(),
+            0,
+            "0 double-effect"
+        );
     }
 
     /// **The timer-wheel scan loop is wired into the consumer seam alongside the dispatcher
@@ -498,7 +519,11 @@ mod tests {
         let ctx_base = EmitContextBase {
             tenant: tenant.clone(),
             region: region.clone(),
-            actor: Actor(Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, tenant.clone())),
+            actor: Actor(Principal::stub(
+                PrincipalId("p".into()),
+                PrincipalKind::Human,
+                tenant.clone(),
+            )),
             schema_ver: 1,
             occurred_at: Timestamp("2026-06-21T00:00:00Z".into()),
             recorded_at: Timestamp("2026-06-21T00:00:01Z".into()),
@@ -519,35 +544,81 @@ mod tests {
             Box::new(|ctx: &mut crate::WfCtx| {
                 ctx.sleep_for(600).map_err(|e| format!("{e:?}"))?;
                 ctx.activity(crate::RetryPolicy::default_policy(), |_i, _a| {
-                    Ok(vec![ArtifactRef("myelin://acme/agent/effect/after-sleep".into())])
+                    Ok(vec![ArtifactRef(
+                        "myelin://acme/agent/effect/after-sleep".into(),
+                    )])
                 })
                 .map_err(|e| format!("{e:?}"))?;
                 Ok(vec![])
             }),
         );
-        dispatcher.runs().put(RunRow::new_runnable(tenant.clone(), region, "R1", "sla.run", 0));
+        dispatcher.runs().put(RunRow::new_runnable(
+            tenant.clone(),
+            region,
+            "R1",
+            "sla.run",
+            0,
+        ));
 
         // tick 1 (now=1000s): the body arms a 600s timer (fires at 1600s) + PARKS — the run is waiting.
         let o1 = dispatcher.tick(1000, "2026-06-21T00:00:00Z", 7);
-        assert!(matches!(o1, Some(DriveOutcome::Waiting)), "the sleep parked the run, got {o1:?}");
-        assert_eq!(dispatcher.runs().get(&tenant, "R1").unwrap().state, run_state::WAITING, "the run is waiting (no runtime)");
-        assert_eq!(wheel.timers().unfired_count(), 1, "one durable timer armed on the wheel");
+        assert!(
+            matches!(o1, Some(DriveOutcome::Waiting)),
+            "the sleep parked the run, got {o1:?}"
+        );
+        assert_eq!(
+            dispatcher.runs().get(&tenant, "R1").unwrap().state,
+            run_state::WAITING,
+            "the run is waiting (no runtime)"
+        );
+        assert_eq!(
+            wheel.timers().unfired_count(),
+            1,
+            "one durable timer armed on the wheel"
+        );
 
         // a wheel tick BEFORE the minute (now=1100s): the timer is far-future (bucket > now) → not fired.
-        assert_eq!(wheel.tick(1100), 0, "the not-yet-due timer is NOT fired (far-future bucket untouched)");
-        assert_eq!(dispatcher.runs().get(&tenant, "R1").unwrap().state, run_state::WAITING, "still waiting");
+        assert_eq!(
+            wheel.tick(1100),
+            0,
+            "the not-yet-due timer is NOT fired (far-future bucket untouched)"
+        );
+        assert_eq!(
+            dispatcher.runs().get(&tenant, "R1").unwrap().state,
+            run_state::WAITING,
+            "still waiting"
+        );
 
         // a wheel tick AT the minute (now=1600s): the timer fires → the run wakes (waiting → running).
         assert_eq!(wheel.tick(1600), 1, "the due timer fires at its minute");
-        assert_eq!(dispatcher.runs().get(&tenant, "R1").unwrap().state, run_state::RUNNING, "the wheel woke the run");
-        assert_eq!(wheel.telemetry().timer_wheel_lag(), 0, "the timer-wheel-lag is 0 after the fire (SC-11 health signal)");
+        assert_eq!(
+            dispatcher.runs().get(&tenant, "R1").unwrap().state,
+            run_state::RUNNING,
+            "the wheel woke the run"
+        );
+        assert_eq!(
+            wheel.telemetry().timer_wheel_lag(),
+            0,
+            "the timer-wheel-lag is 0 after the fire (SC-11 health signal)"
+        );
 
         // tick 2 (now=1601s): the dispatcher re-leases + re-drives — the sleep replays (no re-arm), the
         // post-sleep activity runs, the run completes.
         let o2 = dispatcher.tick(1601, "2026-06-21T00:00:01Z", 7);
-        assert!(matches!(o2, Some(DriveOutcome::Completed(_))), "the run completed past the sleep, got {o2:?}");
-        assert_eq!(dispatcher.runs().get(&tenant, "R1").unwrap().state, run_state::COMPLETED, "the run is completed");
-        assert_eq!(dispatcher.telemetry().double_effect_count(), 0, "0 double-effect (the sleep replayed, did not re-arm)");
+        assert!(
+            matches!(o2, Some(DriveOutcome::Completed(_))),
+            "the run completed past the sleep, got {o2:?}"
+        );
+        assert_eq!(
+            dispatcher.runs().get(&tenant, "R1").unwrap().state,
+            run_state::COMPLETED,
+            "the run is completed"
+        );
+        assert_eq!(
+            dispatcher.telemetry().double_effect_count(),
+            0,
+            "0 double-effect (the sleep replayed, did not re-arm)"
+        );
     }
 
     /// **Graceful drain leaves the outbox at depth 0 (contract 1.1 / §3.1).** A booted-then-drained
@@ -561,7 +632,15 @@ mod tests {
         // one tick finishes in-flight; the telemetry snapshot reports depth 0.
         handle.tick();
         let t = handle.telemetry();
-        assert_eq!(t.outbox_depth(), 0, "the graceful drain leaves outbox_depth == 0");
-        assert_eq!(t.dead_letter_count(), 0, "nothing dead-lettered on a clean shell drain");
+        assert_eq!(
+            t.outbox_depth(),
+            0,
+            "the graceful drain leaves outbox_depth == 0"
+        );
+        assert_eq!(
+            t.dead_letter_count(),
+            0,
+            "nothing dead-lettered on a clean shell drain"
+        );
     }
 }

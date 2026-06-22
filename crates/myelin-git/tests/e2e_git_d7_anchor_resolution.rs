@@ -23,7 +23,10 @@ fn blob(lines: &[&str]) -> Vec<u8> {
 }
 
 fn oid(tag: &str) -> String {
-    format!("blake3:{}", hex::encode(blake3::hash(tag.as_bytes()).as_bytes()))
+    format!(
+        "blake3:{}",
+        hex::encode(blake3::hash(tag.as_bytes()).as_bytes())
+    )
 }
 
 fn pr_root() -> ArtifactRef {
@@ -42,22 +45,22 @@ struct AnchorCase {
 /// The PRE-rebase file (the head the reviewer opened the threads against).
 fn pre_rebase() -> Vec<u8> {
     blob(&[
-        "use crate::ledger;",          // 1
-        "use crate::audit;",           // 2
-        "",                            // 3
-        "fn charge(amount: u64) {",    // 4
-        "    let fee = amount / 10;",  // 5
-        "    ledger::debit(fee);",     // 6
-        "    audit::record(fee);",     // 7
-        "}",                           // 8
-        "",                            // 9
-        "fn refund(id: u64) {",        // 10
-        "    ledger::credit(id);",     // 11
-        "}",                           // 12
-        "",                            // 13
-        "fn legacy_helper() {",        // 14
-        "    deprecated_call();",      // 15
-        "}",                           // 16
+        "use crate::ledger;",         // 1
+        "use crate::audit;",          // 2
+        "",                           // 3
+        "fn charge(amount: u64) {",   // 4
+        "    let fee = amount / 10;", // 5
+        "    ledger::debit(fee);",    // 6
+        "    audit::record(fee);",    // 7
+        "}",                          // 8
+        "",                           // 9
+        "fn refund(id: u64) {",       // 10
+        "    ledger::credit(id);",    // 11
+        "}",                          // 12
+        "",                           // 13
+        "fn legacy_helper() {",       // 14
+        "    deprecated_call();",     // 15
+        "}",                          // 16
     ])
 }
 
@@ -70,23 +73,23 @@ fn pre_rebase() -> Vec<u8> {
 /// - the `legacy_helper` function is DELETED entirely → GONE.
 fn post_rebase() -> Vec<u8> {
     blob(&[
-        "// Copyright 2026 Acme",      // 1  (prepended)
-        "// SPDX-License-Identifier",  // 2  (prepended)
-        "//",                          // 3  (prepended)
-        "",                            // 4  (prepended)
-        "use crate::ledger;",          // 5  (was 1)
-        "use crate::audit;",           // 6  (was 2)
-        "",                            // 7  (was 3)
-        "fn charge(amount: u64) {",    // 8  (was 4)
-        "    let fee = amount / 10;",  // 9  (was 5)
-        "    ledger::debit(fee);",     // 10 (was 6)
-        "    audit::record(fee);",     // 11 (was 7)
-        "}",                           // 12 (was 8)
-        "",                            // 13 (was 9)
-        "fn refund(id: u64) {",        // 14 (was 10)
-        "    ledger::refund(id);",     // 15 (was 11 — EDITED: credit → refund)
-        "}",                           // 16 (was 12)
-        // lines 13-16 of the old file (the legacy_helper block) are DELETED → GONE.
+        "// Copyright 2026 Acme",     // 1  (prepended)
+        "// SPDX-License-Identifier", // 2  (prepended)
+        "//",                         // 3  (prepended)
+        "",                           // 4  (prepended)
+        "use crate::ledger;",         // 5  (was 1)
+        "use crate::audit;",          // 6  (was 2)
+        "",                           // 7  (was 3)
+        "fn charge(amount: u64) {",   // 8  (was 4)
+        "    let fee = amount / 10;", // 9  (was 5)
+        "    ledger::debit(fee);",    // 10 (was 6)
+        "    audit::record(fee);",    // 11 (was 7)
+        "}",                          // 12 (was 8)
+        "",                           // 13 (was 9)
+        "fn refund(id: u64) {",       // 14 (was 10)
+        "    ledger::refund(id);",    // 15 (was 11 — EDITED: credit → refund)
+        "}",                          // 16 (was 12)
+                                      // lines 13-16 of the old file (the legacy_helper block) are DELETED → GONE.
     ])
 }
 
@@ -101,7 +104,11 @@ fn git_d7_rebase_corpus_resolves_every_anchor_with_0_mis_anchored() {
     // The corpus of open inline threads, each with its KNOWN expected post-rebase state.
     let cases = vec![
         // The `charge` body (old lines 5-7) shifts down 4 lines, intact + intact context → MOVED.
-        AnchorCase { name: "charge-body", range: LineRange::new(5, 7), expected: AnchorState::Moved },
+        AnchorCase {
+            name: "charge-body",
+            range: LineRange::new(5, 7),
+            expected: AnchorState::Moved,
+        },
         // The two `use` lines (old 1-2) shift to 5-6. They sit at the TOP of the old file, so their
         // mint-time context window clamps at the file start; after a prepend, their new context window
         // includes the inserted header lines ABOVE them, so the full-block fingerprint no longer
@@ -110,15 +117,31 @@ fn git_d7_rebase_corpus_resolves_every_anchor_with_0_mis_anchored() {
         // top-of-file anchor after a prepend cannot prove a clean MOVE, so it reports Outdated with
         // "view in original context" rather than guessing MOVED. (GF-5's patch-id-chain hardens this
         // top-of-file prepend case across a multi-commit rebase — GIT-P33.)
-        AnchorCase { name: "imports-top-of-file", range: LineRange::new(1, 2), expected: AnchorState::Outdated },
+        AnchorCase {
+            name: "imports-top-of-file",
+            range: LineRange::new(1, 2),
+            expected: AnchorState::Outdated,
+        },
         // The `refund` body (old line 11) had `credit` EDITED to `refund` → that line is gone, but the
         // anchored range was just that single line → GONE (the one anchored line no longer exists).
-        AnchorCase { name: "refund-edited-line", range: LineRange::new(11, 11), expected: AnchorState::Gone },
+        AnchorCase {
+            name: "refund-edited-line",
+            range: LineRange::new(11, 11),
+            expected: AnchorState::Gone,
+        },
         // A 2-line anchor over the `refund` block lines 10-11: line 10 (`fn refund(id: u64) {`)
         // survives, line 11 (`ledger::credit(id);`) was edited away → PARTIAL survival → OUTDATED.
-        AnchorCase { name: "refund-block-partial", range: LineRange::new(10, 11), expected: AnchorState::Outdated },
+        AnchorCase {
+            name: "refund-block-partial",
+            range: LineRange::new(10, 11),
+            expected: AnchorState::Outdated,
+        },
         // The `legacy_helper` body (old lines 14-16) was DELETED entirely → GONE.
-        AnchorCase { name: "legacy-gone", range: LineRange::new(14, 16), expected: AnchorState::Gone },
+        AnchorCase {
+            name: "legacy-gone",
+            range: LineRange::new(14, 16),
+            expected: AnchorState::Gone,
+        },
     ];
 
     let mut mis_anchored = 0usize;
@@ -158,12 +181,27 @@ fn git_d7_rebase_corpus_resolves_every_anchor_with_0_mis_anchored() {
                 );
             }
             _ => {
-                let ctx = resolution
-                    .original_context()
-                    .unwrap_or_else(|| panic!("`{}`: a non-LIVE anchor MUST render original context", case.name));
-                assert_eq!(ctx.range, case.range, "`{}`: original range preserved", case.name);
-                assert_eq!(ctx.blob_oid, pre_oid, "`{}`: original blob linked", case.name);
-                assert_eq!(ctx.commit_oid, commit, "`{}`: original commit linked", case.name);
+                let ctx = resolution.original_context().unwrap_or_else(|| {
+                    panic!(
+                        "`{}`: a non-LIVE anchor MUST render original context",
+                        case.name
+                    )
+                });
+                assert_eq!(
+                    ctx.range, case.range,
+                    "`{}`: original range preserved",
+                    case.name
+                );
+                assert_eq!(
+                    ctx.blob_oid, pre_oid,
+                    "`{}`: original blob linked",
+                    case.name
+                );
+                assert_eq!(
+                    ctx.commit_oid, commit,
+                    "`{}`: original commit linked",
+                    case.name
+                );
             }
         }
 
@@ -174,14 +212,21 @@ fn git_d7_rebase_corpus_resolves_every_anchor_with_0_mis_anchored() {
                 "`{}`: a GONE anchor must carry a content_gone tombstone",
                 case.name
             );
-            assert!(resolution.resolved_range.is_none(), "`{}`: GONE has no new-blob range", case.name);
+            assert!(
+                resolution.resolved_range.is_none(),
+                "`{}`: GONE has no new-blob range",
+                case.name
+            );
         }
     }
 
     // The dated GREEN ARTIFACT (GIT-D7): the per-anchor state distribution + the mis-anchored count.
     eprintln!("GIT-D7 rebase-corpus anchor-state distribution: {distribution:?}");
     eprintln!("GIT-D7 mis-anchored = {mis_anchored} / {}", cases.len());
-    assert_eq!(mis_anchored, 0, "GIT-D7 GATE: 0 mis-anchored across the rebase corpus");
+    assert_eq!(
+        mis_anchored, 0,
+        "GIT-D7 GATE: 0 mis-anchored across the rebase corpus"
+    );
 }
 
 /// The LIVE end of the chain on its own: an UNTOUCHED force-push (a no-op rebase that does not move the

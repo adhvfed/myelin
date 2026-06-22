@@ -70,7 +70,9 @@ pub struct TestClock {
 impl TestClock {
     /// A clock starting at `t0` seconds.
     pub fn at(t0: u64) -> Self {
-        TestClock { now: AtomicU64::new(t0) }
+        TestClock {
+            now: AtomicU64::new(t0),
+        }
     }
     /// Advance the clock by `secs` (the drill steps across a boundary).
     pub fn advance(&self, secs: u64) {
@@ -280,12 +282,18 @@ impl<A: KmsAdapter, C: Clock> KmsReadPath<A, C> {
                     let mut cache = self.cache.lock().expect("kms read cache poisoned");
                     cache.insert(
                         cache_key,
-                        Entry { handle: handle.clone(), resolved_at_secs: now },
+                        Entry {
+                            handle: handle.clone(),
+                            resolved_at_secs: now,
+                        },
                     );
                 }
                 self.fresh.fetch_add(1, Ordering::SeqCst);
                 self.last_staleness.store(0, Ordering::SeqCst);
-                KmsReadResult::Resolved { handle, degraded: false }
+                KmsReadResult::Resolved {
+                    handle,
+                    degraded: false,
+                }
             }
             Err(cause) => self.serve_from_cache(&cache_key, cause),
         }
@@ -309,13 +317,19 @@ impl<A: KmsAdapter, C: Clock> KmsReadPath<A, C> {
             drop(cache);
             self.fresh.fetch_add(1, Ordering::SeqCst);
             self.last_staleness.store(0, Ordering::SeqCst);
-            KmsReadResult::Resolved { handle, degraded: false }
+            KmsReadResult::Resolved {
+                handle,
+                degraded: false,
+            }
         } else if age <= self.static_max {
             let handle = entry.handle.clone();
             drop(cache);
             self.stale.fetch_add(1, Ordering::SeqCst);
             self.last_staleness.store(age, Ordering::SeqCst);
-            KmsReadResult::Resolved { handle, degraded: true }
+            KmsReadResult::Resolved {
+                handle,
+                degraded: true,
+            }
         } else {
             drop(cache);
             // Budget exhausted → not-ready + shed. Deny is correct. NEVER open.
@@ -340,7 +354,7 @@ impl<A: KmsAdapter, C: Clock> KmsReadPath<A, C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kms::{KeyClass, KekId, KmsEngine};
+    use crate::kms::{KekId, KeyClass, KmsEngine};
     use myelin_tenancy::{Region, TenantId};
     use std::sync::atomic::AtomicBool;
 
@@ -360,21 +374,23 @@ mod tests {
     }
     impl FlakyKms {
         fn new(inner: KmsEngine) -> Self {
-            FlakyKms { inner, down: AtomicBool::new(false) }
+            FlakyKms {
+                inner,
+                down: AtomicBool::new(false),
+            }
         }
         fn set_down(&self, down: bool) {
             self.down.store(down, Ordering::SeqCst);
         }
     }
     impl KmsAdapter for FlakyKms {
-        fn resolve_dek(
-            &self,
-            key_ref: &PiiKeyRef,
-            region: &Region,
-        ) -> Result<DekHandle, KmsError> {
+        fn resolve_dek(&self, key_ref: &PiiKeyRef, region: &Region) -> Result<DekHandle, KmsError> {
             if self.down.load(Ordering::SeqCst) {
                 // The KMS is "down" — a loud error, NEVER a fabricated key.
-                Err(KmsError::KekUnavailable(KekId::new(key_ref.tenant.clone(), region.clone())))
+                Err(KmsError::KekUnavailable(KekId::new(
+                    key_ref.tenant.clone(),
+                    region.clone(),
+                )))
             } else {
                 self.inner.resolve_dek(key_ref, region)
             }
@@ -385,7 +401,9 @@ mod tests {
         let kms = KmsEngine::new();
         let (tenant, region) = (t("acme"), r("eu-west"));
         kms.ensure_kek(&KekId::new(tenant.clone(), region.clone()));
-        let kr = kms.ensure_dek(&tenant, &region, KeyClass::Tenant).expect("dek");
+        let kr = kms
+            .ensure_dek(&tenant, &region, KeyClass::Tenant)
+            .expect("dek");
         (kms, kr, region)
     }
 
@@ -394,10 +412,17 @@ mod tests {
         let (kms, kr, region) = provisioned();
         let path = KmsReadPath::with_clock(FlakyKms::new(kms), 30, 300, TestClock::at(1_000));
         let out = path.resolve(&kr, &region);
-        assert!(out.is_resolved() && !out.is_degraded(), "fresh, not degraded");
+        assert!(
+            out.is_resolved() && !out.is_degraded(),
+            "fresh, not degraded"
+        );
         assert_eq!(out.readiness(), KmsReadiness::Ready);
         assert_eq!(path.signals().fresh, 1);
-        assert_eq!(path.signals().fail_open, 0, "no fail-open on the fresh path");
+        assert_eq!(
+            path.signals().fail_open,
+            0,
+            "no fail-open on the fresh path"
+        );
     }
 
     #[test]
@@ -412,17 +437,30 @@ mod tests {
         path.engine.set_down(true);
         path.clock().advance(30);
         let out = path.resolve(&kr, &region);
-        assert!(out.is_resolved() && !out.is_degraded(), "age == fresh_ttl is fresh");
+        assert!(
+            out.is_resolved() && !out.is_degraded(),
+            "age == fresh_ttl is fresh"
+        );
 
         // Past fresh_ttl but within static_max → degraded (the resolved-DEK SURVIVES the outage).
         path.clock().advance(100); // age 130 ≤ 300
         let out = path.resolve(&kr, &region);
-        assert!(out.is_resolved() && out.is_degraded(), "resolved-DEK survives the transient outage");
-        assert_eq!(out.readiness(), KmsReadiness::Ready, "degraded but still serving");
+        assert!(
+            out.is_resolved() && out.is_degraded(),
+            "resolved-DEK survives the transient outage"
+        );
+        assert_eq!(
+            out.readiness(),
+            KmsReadiness::Ready,
+            "degraded but still serving"
+        );
 
         let s = path.signals();
         assert!(s.stale >= 1, "the survival was counted");
-        assert!(s.last_staleness_secs <= path.static_max(), "staleness never exceeds the budget");
+        assert!(
+            s.last_staleness_secs <= path.static_max(),
+            "staleness never exceeds the budget"
+        );
         assert_eq!(s.fail_open, 0, "0 fail-open across the transient outage");
     }
 
@@ -443,7 +481,11 @@ mod tests {
             KmsReadResult::NotReady(KmsError::KekUnavailable(_)) => {}
             other => panic!("expected NotReady(KekUnavailable), got {other:?}"),
         }
-        assert_eq!(path.signals().fail_open, 0, "0 fail-open even hard-down past the budget");
+        assert_eq!(
+            path.signals().fail_open,
+            0,
+            "0 fail-open even hard-down past the budget"
+        );
     }
 
     #[test]
@@ -453,7 +495,10 @@ mod tests {
         // KMS is down BEFORE any successful resolve → no cache → not-ready (never a fabricated key).
         path.engine.set_down(true);
         let out = path.resolve(&kr, &region);
-        assert!(out.is_not_ready(), "cold outage with no cache → not-ready, never fail open");
+        assert!(
+            out.is_not_ready(),
+            "cold outage with no cache → not-ready, never fail open"
+        );
         assert_eq!(path.signals().fresh, 0);
         assert_eq!(path.signals().fail_open, 0);
     }
@@ -462,10 +507,23 @@ mod tests {
     fn signals_classify_and_ratio_is_absent_before_any_read() {
         let s = KmsFailStaticSignals::default();
         assert_eq!(s.total(), 0);
-        assert_eq!(s.stale_survival_pct(), None, "no ratio over zero reads (never fabricated)");
-        let s = KmsFailStaticSignals { fresh: 1, stale: 3, not_ready: 0, ..Default::default() };
+        assert_eq!(
+            s.stale_survival_pct(),
+            None,
+            "no ratio over zero reads (never fabricated)"
+        );
+        let s = KmsFailStaticSignals {
+            fresh: 1,
+            stale: 3,
+            not_ready: 0,
+            ..Default::default()
+        };
         assert_eq!(s.total(), 4);
-        assert_eq!(s.stale_survival_pct(), Some(75), "3/4 stale survival == 75%");
+        assert_eq!(
+            s.stale_survival_pct(),
+            Some(75),
+            "3/4 stale survival == 75%"
+        );
     }
 
     #[test]
@@ -484,8 +542,14 @@ mod tests {
         // cached DEK look infinitely fresh, defeating the staleness budget (a real fail-open risk).
         let c = SystemClock;
         let a = c.now_secs();
-        assert!(a > 1_577_836_800, "SystemClock reads real wall time (post-2020), got {a}");
-        assert!(c.now_secs() >= a, "wall time does not run backwards across two reads");
+        assert!(
+            a > 1_577_836_800,
+            "SystemClock reads real wall time (post-2020), got {a}"
+        );
+        assert!(
+            c.now_secs() >= a,
+            "wall time does not run backwards across two reads"
+        );
     }
 
     #[test]
@@ -513,7 +577,12 @@ mod tests {
     #[test]
     fn signals_total_is_additive_over_all_three_rungs() {
         // kills the `+ → -` mutant in total(): fresh + stale + not_ready, not a subtraction.
-        let s = KmsFailStaticSignals { fresh: 2, stale: 3, not_ready: 4, ..Default::default() };
+        let s = KmsFailStaticSignals {
+            fresh: 2,
+            stale: 3,
+            not_ready: 4,
+            ..Default::default()
+        };
         assert_eq!(s.total(), 9, "total sums all three rungs");
         assert_eq!(s.stale_survival_pct(), Some(33), "3/9 stale == 33%");
     }
@@ -524,7 +593,10 @@ mod tests {
         // posture + the underlying cause.
         let e = KmsReadError(KmsError::KekUnavailable(KekId::new(t("acme"), r("eu"))));
         let m = e.to_string();
-        assert!(m.contains("NOT served") && m.contains("NEVER fail open"), "got: {m}");
+        assert!(
+            m.contains("NOT served") && m.contains("NEVER fail open"),
+            "got: {m}"
+        );
         assert!(m.contains("acme"), "carries the cause: {m}");
     }
 
@@ -535,10 +607,16 @@ mod tests {
         assert!(path.resolve(&kr, &region).is_resolved());
         path.engine.set_down(true);
         path.clock().advance(100);
-        assert!(path.resolve(&kr, &region).is_degraded(), "served stale during the outage");
+        assert!(
+            path.resolve(&kr, &region).is_degraded(),
+            "served stale during the outage"
+        );
         // KMS recovers → the next read is FRESH again.
         path.engine.set_down(false);
         let out = path.resolve(&kr, &region);
-        assert!(out.is_resolved() && !out.is_degraded(), "recovered → fresh again");
+        assert!(
+            out.is_resolved() && !out.is_degraded(),
+            "recovered → fresh again"
+        );
     }
 }

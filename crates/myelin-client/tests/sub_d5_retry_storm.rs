@@ -227,5 +227,8 @@ fn sub_d5_drill_reruns_deterministically() {
     let first = scenario.run_once();
     let second = scenario.run_once();
     assert!(first.is_pass(), "first run green: {first:?}");
-    assert!(second.is_pass(), "re-run green (the drill reproduces forever): {second:?}");
+    assert!(
+        second.is_pass(),
+        "re-run green (the drill reproduces forever): {second:?}"
+    );
 }

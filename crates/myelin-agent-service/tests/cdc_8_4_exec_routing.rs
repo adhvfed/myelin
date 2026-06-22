@@ -163,7 +163,10 @@ fn green_gate() -> AgentExecGate {
 }
 
 /// **CONSUMER side (the agent fabric).** Build the run-scoped hands the platform loop uses.
-fn fabric_hands<'a>(backend: &'a RunnerSeam, hooks: RunnerHooks) -> SandboxToolHands<'a, RunnerSeam> {
+fn fabric_hands<'a>(
+    backend: &'a RunnerSeam,
+    hooks: RunnerHooks,
+) -> SandboxToolHands<'a, RunnerSeam> {
     SandboxToolHands::new(
         green_gate(),
         backend,
@@ -202,7 +205,11 @@ fn fabric_exec_dispatches_kind_agent_job_through_the_four_guarantees() {
         vec!["isolation_floor", "attribute", "reserve", "settle"],
         "the four uniform guarantees fire in the mandated order (X-6 §5.2)"
     );
-    assert_eq!(kills.load(Ordering::SeqCst), 1, "whole-guest kill on teardown (guarantee #4)");
+    assert_eq!(
+        kills.load(Ordering::SeqCst),
+        1,
+        "whole-guest kill on teardown (guarantee #4)"
+    );
 }
 
 /// The 11.7 consumer leg: a `ToolHands::exec` against an exhausted wallet refuses-to-start — the
@@ -217,7 +224,10 @@ fn fabric_exec_refuses_to_start_on_exhausted_reserve_11_7() {
     };
     let hands = fabric_hands(&backend, working_hooks());
     let out = hands.exec(Command("cargo test".into()));
-    assert!(out.0.starts_with("exec-refused:"), "refuse-to-start surfaces LOUD: {out:?}");
+    assert!(
+        out.0.starts_with("exec-refused:"),
+        "refuse-to-start surfaces LOUD: {out:?}"
+    );
     assert!(
         !order.lock().unwrap().contains(&"settle"),
         "the guest never ran — refuse-to-start (11.7), never interrupt in-flight's dual"

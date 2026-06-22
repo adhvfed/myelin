@@ -33,12 +33,16 @@ impl<B: BlobStore> AttachmentsService<B> {
 
     /// Store an attachment, returning the content address the service persists as the handle.
     fn store_attachment(&self, bytes: &[u8]) -> ContentHash {
-        self.blobs.put(&self.tenant, bytes).expect("put through the trait")
+        self.blobs
+            .put(&self.tenant, bytes)
+            .expect("put through the trait")
     }
 
     /// Resolve a stored attachment by its content address (re-hash-on-read verified).
     fn fetch_attachment(&self, handle: &ContentHash) -> Vec<u8> {
-        self.blobs.get(&self.tenant, handle).expect("get through the trait")
+        self.blobs
+            .get(&self.tenant, handle)
+            .expect("get through the trait")
     }
 }
 
@@ -58,7 +62,10 @@ fn cdc_11_2_blob_holding_service_puts_and_gets_through_the_trait() {
 
     // Resolving the handle returns the exact bytes (re-hash-on-read verified).
     let resolved = svc.fetch_attachment(&handle);
-    assert_eq!(resolved, original, "11.2: get by content address round-trips the bytes");
+    assert_eq!(
+        resolved, original,
+        "11.2: get by content address round-trips the bytes"
+    );
 
     // head returns metadata for the handle without serving the bytes.
     let meta = svc.blobs.head(&svc.tenant, &handle).expect("head");

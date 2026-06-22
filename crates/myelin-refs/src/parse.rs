@@ -355,9 +355,11 @@ fn format_sub(sub: &Sub) -> String {
 /// 3. `<subsystem>` ∈ Bus §6.2 [`SUBSYSTEM_TOKENS`]; `<type>` ∈ Bus §6.2 [`ARTIFACT_TYPE_TOKENS`];
 /// 4. if an `#sub` suffix is present, it is one of the frozen §3.5 kinds ([`Sub`]).
 pub fn parse(s: &str) -> Result<ArtifactRef, ParseError> {
-    let rest = s.strip_prefix(SCHEME).ok_or_else(|| ParseError::MissingScheme {
-        input: s.to_string(),
-    })?;
+    let rest = s
+        .strip_prefix(SCHEME)
+        .ok_or_else(|| ParseError::MissingScheme {
+            input: s.to_string(),
+        })?;
 
     // Split the `#sub` suffix off the id FIRST (the `#` is part of the id segment, not a scope `/`).
     let (scope, sub_text): (&str, Option<&str>) = match rest.split_once('#') {
@@ -503,7 +505,10 @@ mod tests {
                 Sub::Message("m3".into()),
             ),
             ("myelin://acme/knowledge/page/7#b9", Sub::Block("9".into())),
-            ("myelin://acme/knowledge/page/7#hIntro", Sub::Heading("Intro".into())),
+            (
+                "myelin://acme/knowledge/page/7#hIntro",
+                Sub::Heading("Intro".into()),
+            ),
             (
                 "myelin://acme/knowledge/row/7#row-r2",
                 Sub::Row("r2".into()),
@@ -631,10 +636,7 @@ mod tests {
     #[test]
     fn unknown_or_malformed_sub_kind_is_rejected() {
         // empty sub
-        assert_eq!(
-            parse("myelin://acme/git/pr/42#"),
-            Err(ParseError::EmptySub)
-        );
+        assert_eq!(parse("myelin://acme/git/pr/42#"), Err(ParseError::EmptySub));
         // a kind not in the frozen vocabulary
         assert!(matches!(
             parse("myelin://acme/git/pr/42#widget-9"),
@@ -674,7 +676,9 @@ mod tests {
     fn parse_error_display_is_loud_and_names_the_rule() {
         let cases: &[(ParseError, &str)] = &[
             (
-                ParseError::MissingScheme { input: "#42".into() },
+                ParseError::MissingScheme {
+                    input: "#42".into(),
+                },
                 "does not start with the canonical scheme",
             ),
             (
@@ -699,7 +703,9 @@ mod tests {
             ),
             (ParseError::EmptySub, "the sub-anchor is empty"),
             (
-                ParseError::UnknownSubKind { sub: "widget-9".into() },
+                ParseError::UnknownSubKind {
+                    sub: "widget-9".into(),
+                },
                 "unknown/ambiguous `#sub` kind `widget-9`",
             ),
         ];
@@ -784,7 +790,10 @@ mod tests {
     fn sub_kind_discriminator_and_label_are_frozen() {
         assert_eq!(Sub::Comment("x".into()).kind(), SubKind::Comment);
         assert_eq!(Sub::Thread("x".into()).kind(), SubKind::Thread);
-        assert_eq!(Sub::LineRange { start: 1, end: 2 }.kind(), SubKind::LineRange);
+        assert_eq!(
+            Sub::LineRange { start: 1, end: 2 }.kind(),
+            SubKind::LineRange
+        );
         assert_eq!(Sub::Step(3).kind(), SubKind::Step);
         assert_eq!(SubKind::Comment.label(), "comment-");
         assert_eq!(SubKind::LineRange.label(), "L<a>-L<b>");
@@ -805,16 +814,16 @@ mod tests {
 
         let schemes = ["myelin://", "https://", "", "myelin:/"];
         let bodies = [
-            "",                       // empty
-            "acme",                   // 1 seg
-            "acme/git",               // 2 seg
-            "acme/git/pr",            // 3 seg
-            "acme/git/pr/42",         // 4 seg, valid
-            "acme/git/pr/42/extra",   // 5 seg
-            "acme/billing/pr/42",     // bad subsystem
-            "acme/git/widget/42",     // bad type
-            "acme//pr/42",            // empty subsystem
-            "/git/pr/42",             // empty tenant
+            "",                     // empty
+            "acme",                 // 1 seg
+            "acme/git",             // 2 seg
+            "acme/git/pr",          // 3 seg
+            "acme/git/pr/42",       // 4 seg, valid
+            "acme/git/pr/42/extra", // 5 seg
+            "acme/billing/pr/42",   // bad subsystem
+            "acme/git/widget/42",   // bad type
+            "acme//pr/42",          // empty subsystem
+            "/git/pr/42",           // empty tenant
         ];
         let subs = [
             None,
@@ -866,7 +875,10 @@ mod tests {
             }
         }
 
-        assert_eq!(guessed_scopes, 0, "a display projection was guessed into a scope");
+        assert_eq!(
+            guessed_scopes, 0,
+            "a display projection was guessed into a scope"
+        );
         assert_eq!(round_trip_failures, 0, "a parsed URN failed to round-trip");
     }
 }

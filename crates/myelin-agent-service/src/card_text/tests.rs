@@ -30,7 +30,10 @@ fn viewer(id: &str) -> Principal {
     Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant())
 }
 fn at() -> Consistency {
-    Consistency { at_least: Zookie("z-1".into()), mode: ConsistencyMode::Strong }
+    Consistency {
+        at_least: Zookie("z-1".into()),
+        mode: ConsistencyMode::Strong,
+    }
 }
 /// The confidential PR the card is about — its TITLE must never leak to a denied viewer.
 fn confidential_pr() -> ArtifactRef {
@@ -52,7 +55,10 @@ impl SyntheticResolver {
         SyntheticResolver::default()
     }
     fn allow(&self, viewer_id: &str, ref_: &ArtifactRef) {
-        self.allowed.lock().unwrap().push((viewer_id.into(), ref_.0.clone()));
+        self.allowed
+            .lock()
+            .unwrap()
+            .push((viewer_id.into(), ref_.0.clone()));
     }
     fn mark_erased(&self, ref_: &ArtifactRef) {
         self.erased.lock().unwrap().push(ref_.0.clone());
@@ -113,14 +119,21 @@ fn card() -> HitlCard {
         input_json: r#"{"pr":42}"#.into(),
         field: None,
         transition: None,
-        cost: EffectCost { unit: "git.merge", wholesale: 30, markup: 20 },
+        cost: EffectCost {
+            unit: "git.merge",
+            wholesale: 30,
+            markup: 20,
+        },
     };
     let gate = HitlGate::open(
         GateId("gate:git.merge:pr42".into()),
         "R1",
         &plan,
         risk(),
-        vec![PrincipalId("psn:lead".into()), PrincipalId("psn:maintainer".into())],
+        vec![
+            PrincipalId("psn:lead".into()),
+            PrincipalId("psn:maintainer".into()),
+        ],
         "card:R1:0",
     );
     crate::hitl::surface_card(&gate)
@@ -138,12 +151,27 @@ fn risk_summary_resolves_through_humanise_for_an_authorised_viewer() {
     let r = SyntheticResolver::new();
     r.allow("lead", &confidential_pr());
     let out = humanise_risk_summary(
-        &r, &tenant(), &region(), &store(), &risk(), &viewer("lead"), "en", &at(), Channel::Cli,
+        &r,
+        &tenant(),
+        &region(),
+        &store(),
+        &risk(),
+        &viewer("lead"),
+        "en",
+        &at(),
+        Channel::Cli,
     )
     .expect("a stable template key humanises");
     // the authorised viewer sees the title bound into the agent.hitl.merge_pr body.
-    assert!(out.text.contains(SECRET_TITLE), "authorised viewer sees the title: {:?}", out.text);
-    assert!(out.text.starts_with("Merge "), "the card text came from the agent template body");
+    assert!(
+        out.text.contains(SECRET_TITLE),
+        "authorised viewer sees the title: {:?}",
+        out.text
+    );
+    assert!(
+        out.text.starts_with("Merge "),
+        "the card text came from the agent template body"
+    );
     // a click-route to the resolved ref rode through (the allowed branch yields a link).
     assert_eq!(out.links, vec![confidential_pr().0]);
 }
@@ -156,10 +184,21 @@ fn agent_message_resolves_through_humanise() {
     r.allow("lead", &confidential_pr());
     let msg = AgentMessage::about("agent.msg.proposed_effect", &confidential_pr());
     let out = humanise_agent_message(
-        &r, &tenant(), &region(), &store(), &msg, &viewer("lead"), "en", &at(), Channel::Cli,
+        &r,
+        &tenant(),
+        &region(),
+        &store(),
+        &msg,
+        &viewer("lead"),
+        "en",
+        &at(),
+        Channel::Cli,
     )
     .expect("a stable template key humanises");
-    assert!(out.text.contains(SECRET_TITLE), "the agent message bound the title per-viewer");
+    assert!(
+        out.text.contains(SECRET_TITLE),
+        "the agent message bound the title per-viewer"
+    );
     assert!(out.text.starts_with("The agent proposed an effect on"));
 }
 
@@ -178,11 +217,27 @@ fn same_card_renders_differently_for_two_viewers() {
     let c = card();
 
     let lead_card = humanise_card(
-        &r, &tenant(), &region(), &store(), &c, &viewer("lead"), "en", &at(), Channel::Cli,
+        &r,
+        &tenant(),
+        &region(),
+        &store(),
+        &c,
+        &viewer("lead"),
+        "en",
+        &at(),
+        Channel::Cli,
     )
     .unwrap();
     let bystander_card = humanise_card(
-        &r, &tenant(), &region(), &store(), &c, &viewer("bystander"), "en", &at(), Channel::Cli,
+        &r,
+        &tenant(),
+        &region(),
+        &store(),
+        &c,
+        &viewer("bystander"),
+        "en",
+        &at(),
+        Channel::Cli,
     )
     .unwrap();
 
@@ -192,7 +247,10 @@ fn same_card_renders_differently_for_two_viewers() {
         "the per-viewer gate makes the two renders differ"
     );
     // the authorised viewer sees the title.
-    assert!(lead_card.risk_text.text.contains(SECRET_TITLE), "lead sees the title");
+    assert!(
+        lead_card.risk_text.text.contains(SECRET_TITLE),
+        "lead sees the title"
+    );
     // the UNauthorised viewer sees a tombstone, NEVER the title (0 leak).
     assert!(
         !bystander_card.risk_text.text.contains(SECRET_TITLE),
@@ -205,7 +263,10 @@ fn same_card_renders_differently_for_two_viewers() {
         bystander_card.risk_text.text
     );
     // the bystander's render carries NO click-route to the denied ref (no route leaks either).
-    assert!(bystander_card.risk_text.links.is_empty(), "no link to a denied ref");
+    assert!(
+        bystander_card.risk_text.links.is_empty(),
+        "no link to a denied ref"
+    );
     // the structured (non-text) fields ride through unchanged for both viewers.
     assert_eq!(lead_card.cost_estimate, 50);
     assert_eq!(lead_card.action_tool, "git.merge");
@@ -221,11 +282,26 @@ fn erased_subject_humanises_to_erased_user() {
     r.allow("lead", &confidential_pr());
     r.mark_erased(&confidential_pr()); // erased takes precedence over the allow.
     let out = humanise_risk_summary(
-        &r, &tenant(), &region(), &store(), &risk(), &viewer("lead"), "en", &at(), Channel::Cli,
+        &r,
+        &tenant(),
+        &region(),
+        &store(),
+        &risk(),
+        &viewer("lead"),
+        "en",
+        &at(),
+        Channel::Cli,
     )
     .unwrap();
-    assert!(out.text.contains("[erased user]"), "erased subject → [erased user]: {:?}", out.text);
-    assert!(!out.text.contains(SECRET_TITLE), "an erased subject leaks no title");
+    assert!(
+        out.text.contains("[erased user]"),
+        "erased subject → [erased user]: {:?}",
+        out.text
+    );
+    assert!(
+        !out.text.contains(SECRET_TITLE),
+        "an erased subject leaks no title"
+    );
 }
 
 // ════════════════════════════════════════════════════════════════════════════════════════════
@@ -256,7 +332,9 @@ fn a_raw_agent_string_is_rejected() {
     // the rejection carries the offending candidate (observable in the audit).
     assert_eq!(
         assert_no_raw_agent_surface("Please review this PR!"),
-        Err(RawAgentString { offered: "Please review this PR!".into() })
+        Err(RawAgentString {
+            offered: "Please review this PR!".into()
+        })
     );
 }
 
@@ -273,11 +351,17 @@ fn a_stable_template_key_is_accepted() {
         "approval_requested",
         "agent-fabric.note",
     ] {
-        assert!(assert_no_raw_agent_surface(key).is_ok(), "the stable key `{key}` is accepted");
+        assert!(
+            assert_no_raw_agent_surface(key).is_ok(),
+            "the stable key `{key}` is accepted"
+        );
     }
     // every agent-fabric platform-default key passes the gate (no raw-string surface ships).
     for (key, _, _) in AGENT_PLATFORM_DEFAULT_TEMPLATES {
-        assert!(assert_no_raw_agent_surface(key).is_ok(), "platform-default key `{key}` is a token");
+        assert!(
+            assert_no_raw_agent_surface(key).is_ok(),
+            "platform-default key `{key}` is a token"
+        );
     }
 }
 
@@ -293,9 +377,20 @@ fn the_render_path_refuses_a_raw_key() {
         args: vec![("object".into(), confidential_pr())],
     };
     let res = humanise_risk_summary(
-        &r, &tenant(), &region(), &store(), &raw_risk, &viewer("lead"), "en", &at(), Channel::Cli,
+        &r,
+        &tenant(),
+        &region(),
+        &store(),
+        &raw_risk,
+        &viewer("lead"),
+        "en",
+        &at(),
+        Channel::Cli,
     );
-    assert!(res.is_err(), "a raw-string key is refused at the render boundary");
+    assert!(
+        res.is_err(),
+        "a raw-string key is refused at the render boundary"
+    );
 
     let raw_msg = AgentMessage {
         template_key: "The agent did a thing.".into(),
@@ -303,7 +398,14 @@ fn the_render_path_refuses_a_raw_key() {
     };
     assert!(
         humanise_agent_message(
-            &r, &tenant(), &region(), &store(), &raw_msg, &viewer("lead"), "en", &at(),
+            &r,
+            &tenant(),
+            &region(),
+            &store(),
+            &raw_msg,
+            &viewer("lead"),
+            "en",
+            &at(),
             Channel::Cli,
         )
         .is_err(),
@@ -323,11 +425,25 @@ fn the_tombstone_holds_across_every_channel() {
     let r = SyntheticResolver::new(); // bystander is denied on every channel.
     for channel in [Channel::Cli, Channel::Email, Channel::Markdown] {
         let out = humanise_risk_summary(
-            &r, &tenant(), &region(), &store(), &risk(), &viewer("bystander"), "en", &at(), channel,
+            &r,
+            &tenant(),
+            &region(),
+            &store(),
+            &risk(),
+            &viewer("bystander"),
+            "en",
+            &at(),
+            channel,
         )
         .unwrap();
-        assert!(!out.text.contains(SECRET_TITLE), "{channel:?} leaks no title");
-        assert!(out.text.contains("a restricted pr"), "{channel:?} shows the tombstone");
+        assert!(
+            !out.text.contains(SECRET_TITLE),
+            "{channel:?} leaks no title"
+        );
+        assert!(
+            out.text.contains("a restricted pr"),
+            "{channel:?} shows the tombstone"
+        );
     }
 }
 
@@ -343,11 +459,21 @@ fn agent_templates_register_into_the_one_store() {
     let s = store();
     // an agent key and a Notif platform-default key both resolve in the SAME store.
     assert!(
-        s.lookup(myelin_notif::PLATFORM_DEFAULT_TENANT, "agent.hitl.merge_pr", "en").is_some(),
+        s.lookup(
+            myelin_notif::PLATFORM_DEFAULT_TENANT,
+            "agent.hitl.merge_pr",
+            "en"
+        )
+        .is_some(),
         "the agent template is in the ONE store"
     );
     assert!(
-        s.lookup(myelin_notif::PLATFORM_DEFAULT_TENANT, "approval_requested", "en").is_some(),
+        s.lookup(
+            myelin_notif::PLATFORM_DEFAULT_TENANT,
+            "approval_requested",
+            "en"
+        )
+        .is_some(),
         "the Notif default is in the SAME store"
     );
 }

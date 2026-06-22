@@ -67,9 +67,21 @@ mod tests {
     #[test]
     fn refs_adds_no_new_open_legal_residual() {
         let p = erasure_posture();
-        assert!(p.origin_actor_is_pseudonymous, "origin_actor is an opaque pseudonym (§3.2/§4.6)");
-        assert!(p.holds_no_free_text_bodies, "references-not-payloads — no free-text bodies in Refs");
-        assert!(p.instantiates_x7_by_reference, "Refs uses the ONE platform posture (10.9), not a 2nd");
-        assert!(p.adds_no_new_open_legal_residual, "no new [OPEN — LEGAL] residual");
+        assert!(
+            p.origin_actor_is_pseudonymous,
+            "origin_actor is an opaque pseudonym (§3.2/§4.6)"
+        );
+        assert!(
+            p.holds_no_free_text_bodies,
+            "references-not-payloads — no free-text bodies in Refs"
+        );
+        assert!(
+            p.instantiates_x7_by_reference,
+            "Refs uses the ONE platform posture (10.9), not a 2nd"
+        );
+        assert!(
+            p.adds_no_new_open_legal_residual,
+            "no new [OPEN — LEGAL] residual"
+        );
     }
 }

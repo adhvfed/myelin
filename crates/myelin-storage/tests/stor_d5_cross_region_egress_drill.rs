@@ -36,7 +36,11 @@ fn admin_url(cfg: &MyelinConfig) -> String {
 /// A process-unique suffix so concurrent runs never collide.
 fn uniq() -> String {
     static N: AtomicU64 = AtomicU64::new(0);
-    format!("{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst))
+    format!(
+        "{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    )
 }
 
 /// **THE STOR-D5 / CP-D3 LIVE DRILL: the residency write boundary is enforced by Postgres.** A
@@ -49,7 +53,10 @@ fn uniq() -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stor_d5_cross_region_egress_impossible() {
     let cfg = MyelinConfig::dev();
-    assert_eq!(cfg.region, "fr-par", "the dev/prod region is fr-par (MYELIN_REGION)");
+    assert_eq!(
+        cfg.region, "fr-par",
+        "the dev/prod region is fr-par (MYELIN_REGION)"
+    );
 
     // The ADMIN (owner) store runs DDL only. RLS is enforced for the NOBYPASSRLS app role, NOT for
     // a superuser/owner — so every write-boundary PROBE below runs through the `myelin_app` store
@@ -58,7 +65,10 @@ async fn stor_d5_cross_region_egress_impossible() {
     let admin = PgStore::connect(&admin_url(&cfg), &cfg.region, 2)
         .await
         .expect("connect Postgres as admin (is the stack up?)");
-    admin.migrate().await.expect("migrate (rebac_tuple + (tenant,region) RLS WITH CHECK)");
+    admin
+        .migrate()
+        .await
+        .expect("migrate (rebac_tuple + (tenant,region) RLS WITH CHECK)");
 
     // The STORE under test: the NOBYPASSRLS `myelin_app` role, pinned to the CELL's region (fr-par)
     // — the residency pin the harness injects. RLS (incl. the WITH CHECK write boundary) is in force.
@@ -110,7 +120,10 @@ async fn stor_d5_cross_region_egress_impossible() {
             .expect("count eu-central rows");
         r.get::<i64, _>("n")
     };
-    assert_eq!(eu_rows, 0, "0 out-of-region writes admitted: no eu-central row for this tenant landed");
+    assert_eq!(
+        eu_rows, 0,
+        "0 out-of-region writes admitted: no eu-central row for this tenant landed"
+    );
     drop(eu_conn);
 
     // ── (3) STOR-D5: cross-region READ is impossible. A session scoped to a DIFFERENT region than

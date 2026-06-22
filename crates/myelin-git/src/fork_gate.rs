@@ -97,7 +97,10 @@ pub fn endorsement_need(
     head_oid: &GitOid,
     context: &CheckContext,
 ) -> EndorsementNeed {
-    let key = CheckKey { commit_oid: head_oid.clone(), context: context.clone() };
+    let key = CheckKey {
+        commit_oid: head_oid.clone(),
+        context: context.clone(),
+    };
     match projection.current(&key) {
         Some(row) => endorsement_need_for_row(row),
         None => EndorsementNeed::NotApplicable,
@@ -216,7 +219,10 @@ impl<'g, I: IdentityService, C: Clock> EndorsementResolver<'g, I, C> {
         context: &CheckContext,
         endorser: &Endorser<'_>,
     ) -> bool {
-        let key = CheckKey { commit_oid: head_oid.clone(), context: context.clone() };
+        let key = CheckKey {
+            commit_oid: head_oid.clone(),
+            context: context.clone(),
+        };
         let Some(row) = projection.current(&key) else {
             return false; // a missing required context never satisfies (fail-closed).
         };
@@ -273,7 +279,9 @@ impl TrustScope {
     pub fn for_run(trust_tier: TrustTier, pr_id: &str) -> TrustScope {
         match trust_tier {
             TrustTier::Trusted => TrustScope::Trusted,
-            TrustTier::UntrustedFork => TrustScope::Fork { pr_id: pr_id.to_string() },
+            TrustTier::UntrustedFork => TrustScope::Fork {
+                pr_id: pr_id.to_string(),
+            },
         }
     }
 
@@ -369,7 +377,7 @@ mod tests {
     use myelin_identity::{
         AuthzError, CaveatContext, Consistency, Credential, Decision, EffectivePolicy,
         IdentityService, ListObjectsResult, ObjectId, ObjectType, Permission, Precondition,
-        Principal, PrincipalId, PrincipalKind, RewriteTrace, Result as IdResult, SubjectTree,
+        Principal, PrincipalId, PrincipalKind, Result as IdResult, RewriteTrace, SubjectTree,
         TupleDelta, Zookie,
     };
     use myelin_storage::InMemoryCache;
@@ -397,7 +405,10 @@ mod tests {
             run_attempt: attempt,
             trust_tier: trust,
             details_ref: ArtifactRef("myelin://acme/ci/run/1#step-3".into()),
-            summary: HumanisedRef { template_key: "ci.check.updated".into(), args: BTreeMap::new() },
+            summary: HumanisedRef {
+                template_key: "ci.check.updated".into(),
+                args: BTreeMap::new(),
+            },
             started_at: Timestamp("2026-06-22T00:00:00Z".into()),
             completed_at: Some(Timestamp("2026-06-22T00:01:00Z".into())),
             cost_settled: true,
@@ -405,8 +416,11 @@ mod tests {
     }
 
     fn principal(id: &str) -> Principal {
-        let mut p =
-            Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, TenantId("acme".into()));
+        let mut p = Principal::stub(
+            PrincipalId(id.into()),
+            PrincipalKind::Human,
+            TenantId("acme".into()),
+        );
         p.region = Region("fr-par".into());
         p
     }
@@ -424,11 +438,15 @@ mod tests {
     }
     impl StubId {
         fn new() -> Self {
-            Self { endorsers: HashMap::new() }
+            Self {
+                endorsers: HashMap::new(),
+            }
         }
         fn allowing_endorser(mut self, principal_id: &str, repo: &str) -> Self {
-            self.endorsers
-                .insert(format!("approve_untrusted_ci@{principal_id}@{repo}"), Decision::Allow);
+            self.endorsers.insert(
+                format!("approve_untrusted_ci@{principal_id}@{repo}"),
+                Decision::Allow,
+            );
             self
         }
     }
@@ -446,7 +464,10 @@ mod tests {
         ) -> IdResult<Decision> {
             Ok(self
                 .endorsers
-                .get(&format!("{}@{}@{}", permission.0, s.principal_id.0, object.0))
+                .get(&format!(
+                    "{}@{}@{}",
+                    permission.0, s.principal_id.0, object.0
+                ))
                 .copied()
                 .unwrap_or(Decision::Deny))
         }
@@ -479,11 +500,7 @@ mod tests {
         fn delegation(&self, _a: &Principal, _t: &Principal) -> IdResult<EffectivePolicy> {
             Err(AuthzError::NotYetImplemented("n/a"))
         }
-        fn write_tuples(
-            &self,
-            _d: &[TupleDelta],
-            _p: Option<&Precondition>,
-        ) -> IdResult<Zookie> {
+        fn write_tuples(&self, _d: &[TupleDelta], _p: Option<&Precondition>) -> IdResult<Zookie> {
             Ok(Zookie("zk-1".into()))
         }
         fn mint_run_token(
@@ -538,7 +555,12 @@ mod tests {
     }
 
     fn endorser<'a>(subject: &'a Principal, repo: &'a ArtifactRef, revoked: bool) -> Endorser<'a> {
-        Endorser { subject, repo, zookie: zk(), subject_revoked: revoked }
+        Endorser {
+            subject,
+            repo,
+            zookie: zk(),
+            subject_revoked: revoked,
+        }
     }
 
     // ───────────────────────── PART A: the endorsement resolver ─────────────────────────
@@ -549,19 +571,43 @@ mod tests {
         let head = GitOid("h1".into());
         let build = CheckContext::ci("build");
         // A fork success → needs endorsement.
-        proj.apply(&fact("h1", build.clone(), 1, CheckState::Success, TrustTier::UntrustedFork));
+        proj.apply(&fact(
+            "h1",
+            build.clone(),
+            1,
+            CheckState::Success,
+            TrustTier::UntrustedFork,
+        ));
         assert_eq!(
             endorsement_need(&proj, &head, &build),
             EndorsementNeed::NeedsEndorsement
         );
         // A trusted success → not applicable (already satisfies).
         let test = CheckContext::ci("test");
-        proj.apply(&fact("h1", test.clone(), 1, CheckState::Success, TrustTier::Trusted));
-        assert_eq!(endorsement_need(&proj, &head, &test), EndorsementNeed::NotApplicable);
+        proj.apply(&fact(
+            "h1",
+            test.clone(),
+            1,
+            CheckState::Success,
+            TrustTier::Trusted,
+        ));
+        assert_eq!(
+            endorsement_need(&proj, &head, &test),
+            EndorsementNeed::NotApplicable
+        );
         // A fork FAILURE → not applicable (endorsing a failure changes nothing — fork must clear CI).
         let lint = CheckContext::ci("lint");
-        proj.apply(&fact("h1", lint.clone(), 1, CheckState::Failure, TrustTier::UntrustedFork));
-        assert_eq!(endorsement_need(&proj, &head, &lint), EndorsementNeed::NotApplicable);
+        proj.apply(&fact(
+            "h1",
+            lint.clone(),
+            1,
+            CheckState::Failure,
+            TrustTier::UntrustedFork,
+        ));
+        assert_eq!(
+            endorsement_need(&proj, &head, &lint),
+            EndorsementNeed::NotApplicable
+        );
         // A MISSING context → not applicable.
         assert_eq!(
             endorsement_need(&proj, &head, &CheckContext::ci("absent")),
@@ -579,7 +625,13 @@ mod tests {
         let mut proj = CheckStatusProjection::new();
         let head = GitOid("h1".into());
         let build = CheckContext::ci("build");
-        proj.apply(&fact("h1", build.clone(), 1, CheckState::Success, TrustTier::UntrustedFork));
+        proj.apply(&fact(
+            "h1",
+            build.clone(),
+            1,
+            CheckState::Success,
+            TrustTier::UntrustedFork,
+        ));
 
         let m = maintainer();
         let repo = repo_ref();
@@ -589,7 +641,11 @@ mod tests {
             &head,
             &endorser(&m, &repo, false),
         );
-        assert_eq!(endorsed, vec![build], "the maintainer endorsement resolves the fork context");
+        assert_eq!(
+            endorsed,
+            vec![build],
+            "the maintainer endorsement resolves the fork context"
+        );
     }
 
     #[test]
@@ -603,7 +659,13 @@ mod tests {
         let mut proj = CheckStatusProjection::new();
         let head = GitOid("h1".into());
         let build = CheckContext::ci("build");
-        proj.apply(&fact("h1", build.clone(), 1, CheckState::Success, TrustTier::UntrustedFork));
+        proj.apply(&fact(
+            "h1",
+            build.clone(),
+            1,
+            CheckState::Success,
+            TrustTier::UntrustedFork,
+        ));
 
         // The fork author principal (any non-endorser) tries to endorse.
         let fork_author = principal("fork-author");
@@ -614,7 +676,10 @@ mod tests {
             &head,
             &endorser(&fork_author, &repo, false),
         );
-        assert!(endorsed.is_empty(), "a non-maintainer cannot self-endorse the fork gate");
+        assert!(
+            endorsed.is_empty(),
+            "a non-maintainer cannot self-endorse the fork gate"
+        );
     }
 
     #[test]
@@ -629,17 +694,22 @@ mod tests {
         let head = GitOid("h1".into());
         let build = CheckContext::ci("build");
         let test = CheckContext::ci("test");
-        proj.apply(&fact("h1", build.clone(), 1, CheckState::Success, TrustTier::Trusted));
+        proj.apply(&fact(
+            "h1",
+            build.clone(),
+            1,
+            CheckState::Success,
+            TrustTier::Trusted,
+        ));
         // `test` is required but missing.
         let m = maintainer();
         let repo = repo_ref();
-        let endorsed = resolver.resolve_endorsed(
-            &[build, test],
-            &proj,
-            &head,
-            &endorser(&m, &repo, false),
+        let endorsed =
+            resolver.resolve_endorsed(&[build, test], &proj, &head, &endorser(&m, &repo, false));
+        assert!(
+            endorsed.is_empty(),
+            "no fork contexts → no endorsements minted"
         );
-        assert!(endorsed.is_empty(), "no fork contexts → no endorsements minted");
     }
 
     #[test]
@@ -653,7 +723,13 @@ mod tests {
         let mut proj = CheckStatusProjection::new();
         let head = GitOid("h1".into());
         let build = CheckContext::ci("build");
-        proj.apply(&fact("h1", build.clone(), 1, CheckState::Success, TrustTier::UntrustedFork));
+        proj.apply(&fact(
+            "h1",
+            build.clone(),
+            1,
+            CheckState::Success,
+            TrustTier::UntrustedFork,
+        ));
 
         let m = maintainer();
         let repo = repo_ref();
@@ -676,15 +752,22 @@ mod tests {
         let head = GitOid("h1".into());
         let build = CheckContext::ci("build");
         // An un-endorsed fork success: the resolver endorses it (maintainer) → satisfied.
-        proj.apply(&fact("h1", build.clone(), 1, CheckState::Success, TrustTier::UntrustedFork));
+        proj.apply(&fact(
+            "h1",
+            build.clone(),
+            1,
+            CheckState::Success,
+            TrustTier::UntrustedFork,
+        ));
         let m = maintainer();
         let repo = repo_ref();
-        assert!(resolver.context_satisfied(
-            &proj, &head, &build, &endorser(&m, &repo, false)
-        ));
+        assert!(resolver.context_satisfied(&proj, &head, &build, &endorser(&m, &repo, false)));
         // A missing context never satisfies.
         assert!(!resolver.context_satisfied(
-            &proj, &head, &CheckContext::ci("absent"), &endorser(&m, &repo, false)
+            &proj,
+            &head,
+            &CheckContext::ci("absent"),
+            &endorser(&m, &repo, false)
         ));
     }
 
@@ -693,13 +776,19 @@ mod tests {
     #[test]
     fn trust_scope_is_derived_from_the_run_never_caller_chosen() {
         // A trusted run → trusted scope; a fork run → fork:<pr_id> scope (NEVER trusted).
-        assert_eq!(TrustScope::for_run(TrustTier::Trusted, "42"), TrustScope::Trusted);
+        assert_eq!(
+            TrustScope::for_run(TrustTier::Trusted, "42"),
+            TrustScope::Trusted
+        );
         let fork = TrustScope::for_run(TrustTier::UntrustedFork, "42");
         assert_eq!(fork, TrustScope::Fork { pr_id: "42".into() });
         assert!(!fork.is_trusted(), "a fork run is NEVER the trusted scope");
         // The trusted scope IS trusted (the positive half — a mutant returning a constant `false`
         // would pass the fork assertion but fails here).
-        assert!(TrustScope::Trusted.is_trusted(), "the trusted scope is trusted");
+        assert!(
+            TrustScope::Trusted.is_trusted(),
+            "the trusted scope is trusted"
+        );
         assert!(TrustScope::for_run(TrustTier::Trusted, "ignored").is_trusted());
         assert_eq!(fork.key_prefix(), "fork:42");
         assert_eq!(TrustScope::Trusted.key_prefix(), "trusted");
@@ -725,7 +814,10 @@ mod tests {
         );
 
         // The fork run itself reads back its OWN write (confinement isolates, it does not lose data).
-        assert_eq!(fork.get(&tenant, "dep-graph").unwrap(), Some(b"poison".to_vec()));
+        assert_eq!(
+            fork.get(&tenant, "dep-graph").unwrap(),
+            Some(b"poison".to_vec())
+        );
     }
 
     #[test]
@@ -739,7 +831,11 @@ mod tests {
         let f42 = ScopedCache::new(&cache, TrustScope::for_run(TrustTier::UntrustedFork, "42"));
         let f99 = ScopedCache::new(&cache, TrustScope::for_run(TrustTier::UntrustedFork, "99"));
         f42.set(&tenant, "k", b"v42", ttl).unwrap();
-        assert_eq!(f99.get(&tenant, "k").unwrap(), None, "PR 99 cannot read PR 42's fork scope");
+        assert_eq!(
+            f99.get(&tenant, "k").unwrap(),
+            None,
+            "PR 99 cannot read PR 42's fork scope"
+        );
         assert_eq!(f42.get(&tenant, "k").unwrap(), Some(b"v42".to_vec()));
     }
 
@@ -769,6 +865,10 @@ mod tests {
         fork.set(&tenant, "k", b"v", ttl).unwrap();
         assert_eq!(fork.get(&tenant, "k").unwrap(), Some(b"v".to_vec()));
         fork.delete(&tenant, "k").unwrap();
-        assert_eq!(fork.get(&tenant, "k").unwrap(), None, "delete dropped the scoped key");
+        assert_eq!(
+            fork.get(&tenant, "k").unwrap(),
+            None,
+            "delete dropped the scoped key"
+        );
     }
 }

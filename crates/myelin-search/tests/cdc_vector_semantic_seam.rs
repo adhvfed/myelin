@@ -40,7 +40,9 @@ impl SemanticStandIn<'_> {
     /// SECOND. The k visible nearest passages — the shape an agent's RAG retrieval consumes.
     fn semantic(&self, reachable: &[&str], query: &Embedding, k: usize) -> Vec<VectorHit> {
         let acl_filter = AclFilter::ids(reachable.iter().copied());
-        self.engine.semantic(&acl_filter, query, k).expect("engine semantic")
+        self.engine
+            .semantic(&acl_filter, query, k)
+            .expect("engine semantic")
     }
 }
 
@@ -67,11 +69,26 @@ fn embedded(id: &str, body: &str, v: Vec<f32>) -> IndexDocument {
 fn vector_seam_answers_a_pre_filtered_semantic_query() {
     let mut engine = TantivyBackend::open(&corpus_facets()).expect("open the per-tenant index");
     // A corpus where `ENG-3` is the NEAREST to the query but is NOT in the viewer's reachable set.
-    engine.upsert(&embedded("acme/issue/ENG-1", "deadlock in the scheduler", vec![0.8, 0.2, 0.0]))
+    engine
+        .upsert(&embedded(
+            "acme/issue/ENG-1",
+            "deadlock in the scheduler",
+            vec![0.8, 0.2, 0.0],
+        ))
         .expect("u");
-    engine.upsert(&embedded("acme/issue/ENG-2", "deadlock in the indexer", vec![0.7, 0.3, 0.0]))
+    engine
+        .upsert(&embedded(
+            "acme/issue/ENG-2",
+            "deadlock in the indexer",
+            vec![0.7, 0.3, 0.0],
+        ))
         .expect("u");
-    engine.upsert(&embedded("acme/issue/ENG-3", "deadlock SECRET ops runbook", vec![1.0, 0.0, 0.0]))
+    engine
+        .upsert(&embedded(
+            "acme/issue/ENG-3",
+            "deadlock SECRET ops runbook",
+            vec![1.0, 0.0, 0.0],
+        ))
         .expect("u");
 
     let consumer = SemanticStandIn { engine: &engine };
@@ -92,7 +109,9 @@ fn vector_seam_answers_a_pre_filtered_semantic_query() {
         "the engine surfaces only the visible vectors; the nearest secret never enters the candidate set"
     );
     // Every hit carries its model_ref (§3.3) — a fused result can be checked for model consistency.
-    assert!(hits.iter().all(|h| h.model_ref == ModelRef("text-embed-3@1".into())));
+    assert!(hits
+        .iter()
+        .all(|h| h.model_ref == ModelRef("text-embed-3@1".into())));
 }
 
 /// **One-doc-id-space (no separate vector store): the SAME `doc_id` is reachable by FT, structured,
@@ -102,7 +121,11 @@ fn vector_seam_answers_a_pre_filtered_semantic_query() {
 fn vector_shares_the_one_doc_id_space_with_ft_and_structured() {
     let mut engine = TantivyBackend::open(&corpus_facets()).expect("open");
     engine
-        .upsert(&embedded("acme/page/7", "raft consensus protocol", vec![1.0, 0.0, 0.0]))
+        .upsert(&embedded(
+            "acme/page/7",
+            "raft consensus protocol",
+            vec![1.0, 0.0, 0.0],
+        ))
         .expect("u");
     let acl = AclFilter::ids(["acme/page/7"]);
 
@@ -110,7 +133,9 @@ fn vector_shares_the_one_doc_id_space_with_ft_and_structured() {
     let st = engine
         .search_structured(&acl, "status", &FieldValue::Select("open".into()), 5)
         .expect("structured");
-    let ve = engine.semantic(&acl, &Embedding::new(vec![0.99, 0.01, 0.0]), 1).expect("semantic");
+    let ve = engine
+        .semantic(&acl, &Embedding::new(vec![0.99, 0.01, 0.0]), 1)
+        .expect("semantic");
 
     assert_eq!(ft[0].doc_id, "acme/page/7");
     assert_eq!(st[0].doc_id, "acme/page/7");
@@ -125,15 +150,33 @@ fn vector_shares_the_one_doc_id_space_with_ft_and_structured() {
 #[test]
 fn vector_seam_soft_delete_then_compact_zero_orphan() {
     let mut engine = TantivyBackend::open(&corpus_facets()).expect("open");
-    engine.upsert(&embedded("keep", "alpha", vec![1.0, 0.0])).expect("u");
-    engine.upsert(&embedded("erase", "beta", vec![0.0, 1.0])).expect("u");
+    engine
+        .upsert(&embedded("keep", "alpha", vec![1.0, 0.0]))
+        .expect("u");
+    engine
+        .upsert(&embedded("erase", "beta", vec![0.0, 1.0]))
+        .expect("u");
 
-    engine.delete("erase").expect("delete erases the doc + soft-deletes its vector");
+    engine
+        .delete("erase")
+        .expect("delete erases the doc + soft-deletes its vector");
     let acl = AclFilter::ids(["keep", "erase"]);
-    let hits = engine.semantic(&acl, &Embedding::new(vec![0.0, 1.0]), 5).expect("semantic");
-    assert!(!hits.iter().any(|h| h.doc_id == "erase"), "the erased vector never surfaces");
+    let hits = engine
+        .semantic(&acl, &Embedding::new(vec![0.0, 1.0]), 5)
+        .expect("semantic");
+    assert!(
+        !hits.iter().any(|h| h.doc_id == "erase"),
+        "the erased vector never surfaces"
+    );
 
     engine.merge().expect("merge compacts");
-    assert!(!engine.vectors().has_orphan_embedding(), "0 orphan embedding after compaction");
-    assert_eq!(engine.vectors().live_len(), 1, "only the surviving vector remains");
+    assert!(
+        !engine.vectors().has_orphan_embedding(),
+        "0 orphan embedding after compaction"
+    );
+    assert_eq!(
+        engine.vectors().live_len(),
+        1,
+        "only the surviving vector remains"
+    );
 }

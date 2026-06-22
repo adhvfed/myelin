@@ -289,7 +289,10 @@ mod tests {
         let json = cfg.to_json();
         assert!(json.contains("\"readonly\": true"));
         assert!(json.contains("\"noNewPrivileges\": true"));
-        assert!(json.contains("SCMP_ACT_ERRNO"), "a seccomp profile is attached");
+        assert!(
+            json.contains("SCMP_ACT_ERRNO"),
+            "a seccomp profile is attached"
+        );
         assert!(
             json.contains("\"bounding\": []"),
             "all capabilities dropped"

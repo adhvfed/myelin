@@ -52,7 +52,7 @@
 
 use myelin_gdpr::{
     EraseReceipt, EraseScope, LocateReport, Patch, PersonalDataHolder, PortableBundle, Receipt,
-    RectifyReceipt, Result as DsrResult, RestrictReceipt, SubjectRef, TenantId,
+    RectifyReceipt, RestrictReceipt, Result as DsrResult, SubjectRef, TenantId,
 };
 use myelin_substrate::{Holder, HolderRegistration, HolderRegistry, StoreClassifier, StoreKind};
 
@@ -208,7 +208,9 @@ impl PersonalDataHolder for AgentOltpHolder {
                 AGENT_OLTP_STORE,
                 &Self::subject_id(subject),
                 "",
-                &format!("no-op on={on} (AG-P3 registration seam; suppression body AG-P23 → P-479)"),
+                &format!(
+                    "no-op on={on} (AG-P3 registration seam; suppression body AG-P23 → P-479)"
+                ),
                 None,
                 0,
             ),
@@ -221,7 +223,9 @@ impl PersonalDataHolder for AgentOltpHolder {
         // agent_principal/on_behalf_of attribution edges + tombstone (drill AG-D10) — lands in
         // AG-P23. The lever (per-subject DEK + pseudonym tags) already exists on crate::schema.
         let (subject_id, tenant) = match &scope {
-            EraseScope::Subject { subject, tenant } => (Self::subject_id(subject), tenant.0.clone()),
+            EraseScope::Subject { subject, tenant } => {
+                (Self::subject_id(subject), tenant.0.clone())
+            }
             EraseScope::Tenant(t) => (String::new(), t.0.clone()),
         };
         let _ = floor_note(AGENT_OLTP_STORE); // the floor is named in the receipt outcome below.
@@ -309,7 +313,9 @@ impl PersonalDataHolder for AgentTraceHolder {
                 AGENT_TRACE_STORE,
                 &Self::subject_id(subject),
                 "",
-                &format!("no-op on={on} (AG-P3 registration seam; suppression body AG-P23 → P-479)"),
+                &format!(
+                    "no-op on={on} (AG-P3 registration seam; suppression body AG-P23 → P-479)"
+                ),
                 None,
                 0,
             ),
@@ -322,7 +328,9 @@ impl PersonalDataHolder for AgentTraceHolder {
         // unrecoverable live + in backups (the AG-D10 "erasure reaches the trace" drill) — lands in
         // AG-P23, with the Knowledge content-addressed write/erasure in AG-P19.
         let (subject_id, tenant) = match &scope {
-            EraseScope::Subject { subject, tenant } => (Self::subject_id(subject), tenant.0.clone()),
+            EraseScope::Subject { subject, tenant } => {
+                (Self::subject_id(subject), tenant.0.clone())
+            }
             EraseScope::Tenant(t) => (String::new(), t.0.clone()),
         };
         let _ = floor_note(AGENT_TRACE_STORE);
@@ -372,7 +380,11 @@ mod tests {
         let registry = register_agent_holders();
         assert!(registry.is_registered(StoreKind::Oltp, AGENT_OLTP_STORE));
         assert!(registry.is_registered(StoreKind::Oltp, AGENT_TRACE_STORE));
-        assert_eq!(registry.len(), 2, "exactly the two Agent-Fabric stores registered");
+        assert_eq!(
+            registry.len(),
+            2,
+            "exactly the two Agent-Fabric stores registered"
+        );
     }
 
     /// **Re-registration is idempotent** — `serve` (AG-P4) re-running the registration on a restart
@@ -382,7 +394,11 @@ mod tests {
         let mut registry = register_agent_holders();
         AgentOltpHolder.register(&mut registry);
         AgentTraceHolder.register(&mut registry);
-        assert_eq!(registry.len(), 2, "re-opening the same Fabric stores does not double-register");
+        assert_eq!(
+            registry.len(),
+            2,
+            "re-opening the same Fabric stores does not double-register"
+        );
     }
 
     /// **The Fabric stores classify to their H-holders — 0 orphans (contract 1.4 + gdpr §3.2).** The
@@ -432,9 +448,14 @@ mod tests {
         // violation naming exactly the escaped store.
         let mut rogue = HolderRegistry::new();
         rogue.open(StoreKind::Oltp, AGENT_OLTP_STORE); // only the OLTP store went through the door.
-        let err = assert_all_holders_registered(&manifest, &rogue)
-            .expect_err("a Fabric store opened outside the harness must FAIL the architecture test");
-        assert_eq!(err.len(), 1, "exactly the unregistered trace store is the violation");
+        let err = assert_all_holders_registered(&manifest, &rogue).expect_err(
+            "a Fabric store opened outside the harness must FAIL the architecture test",
+        );
+        assert_eq!(
+            err.len(),
+            1,
+            "exactly the unregistered trace store is the violation"
+        );
         assert!(
             err[0].message().contains(AGENT_TRACE_STORE),
             "the failure names the escaped Fabric store: {}",
@@ -453,12 +474,19 @@ mod tests {
             &AgentTraceHolder as &dyn PersonalDataHolder,
         ] {
             let subj = subject("psn:agent-7");
-            let locate = holder.locate(&subj, tenant()).expect("locate over the seam succeeds");
+            let locate = holder
+                .locate(&subj, tenant())
+                .expect("locate over the seam succeeds");
             assert_eq!(locate.receipt.operation, "locate");
             assert!(locate.receipt.content_hash.starts_with("blake3:"));
-            assert!(locate.receipt.key_epoch_destroyed.is_none(), "locate shreds no key");
+            assert!(
+                locate.receipt.key_epoch_destroyed.is_none(),
+                "locate shreds no key"
+            );
 
-            let export = holder.export(&subj, tenant()).expect("export over the seam succeeds");
+            let export = holder
+                .export(&subj, tenant())
+                .expect("export over the seam succeeds");
             assert_eq!(export.receipt.operation, "export");
             assert!(export.receipt.content_hash.starts_with("blake3:"));
         }
@@ -473,11 +501,22 @@ mod tests {
             &AgentOltpHolder as &dyn PersonalDataHolder,
             &AgentTraceHolder as &dyn PersonalDataHolder,
         ] {
-            let scope = EraseScope::Subject { subject: subject("psn:agent-7"), tenant: tenant() };
-            let r1 = holder.erase(scope.clone()).expect("seam erase succeeds (no-op)");
+            let scope = EraseScope::Subject {
+                subject: subject("psn:agent-7"),
+                tenant: tenant(),
+            };
+            let r1 = holder
+                .erase(scope.clone())
+                .expect("seam erase succeeds (no-op)");
             let r2 = holder.erase(scope).expect("seam erase is idempotent");
-            assert_eq!(r1, r2, "the same erase scope yields the identical content-addressed receipt");
-            assert!(r1.receipt.key_epoch_destroyed.is_none(), "no DEK shredded (body is AG-P23)");
+            assert_eq!(
+                r1, r2,
+                "the same erase scope yields the identical content-addressed receipt"
+            );
+            assert!(
+                r1.receipt.key_epoch_destroyed.is_none(),
+                "no DEK shredded (body is AG-P23)"
+            );
             assert_eq!(r1.receipt.operation, "erase");
             assert!(r1.receipt.content_hash.starts_with("blake3:"));
         }
@@ -489,8 +528,14 @@ mod tests {
     #[test]
     fn floor_note_names_the_follow_on_prompts() {
         let note = floor_note(AGENT_OLTP_STORE);
-        assert!(note.contains("AG-P23"), "names the DSR fan-out follow-on: {note}");
-        assert!(note.contains("AG-P19"), "names the trace holder-body follow-on: {note}");
+        assert!(
+            note.contains("AG-P23"),
+            "names the DSR fan-out follow-on: {note}"
+        );
+        assert!(
+            note.contains("AG-P19"),
+            "names the trace holder-body follow-on: {note}"
+        );
         assert!(note.contains("AG-D10"), "names the erasure drill: {note}");
     }
 
@@ -502,7 +547,10 @@ mod tests {
             vec![Box::new(AgentOltpHolder), Box::new(AgentTraceHolder)];
         let subj = subject("psn:agent-9");
         for h in &holders {
-            assert!(h.locate(&subj, tenant()).is_ok(), "each holder responds to the contract");
+            assert!(
+                h.locate(&subj, tenant()).is_ok(),
+                "each holder responds to the contract"
+            );
         }
     }
 }

@@ -82,14 +82,20 @@ fn consumer_inverse(rel: &str) -> Option<&'static str> {
 /// inverse) the INVERSE edge with the endpoints swapped — exactly what `mirror_edges` does. Each row
 /// carries the deterministic `edge_id`. Returns `Err(field)` if a required field is missing (fail-closed).
 fn consumer_mirror(env: &EventEnvelope) -> Result<Vec<ProjectedEdge>, String> {
-    assert_eq!(env.type_.0, "refs.edge.created", "the mirror ingests refs.edge.created");
+    assert_eq!(
+        env.type_.0, "refs.edge.created",
+        "the mirror ingests refs.edge.created"
+    );
     let p = &env.payload;
     let get = |k: &str| p.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
     let source = get("source").ok_or_else(|| "source".to_string())?;
     let target = get("target").ok_or_else(|| "target".to_string())?;
     let rel = get("rel").ok_or_else(|| "rel".to_string())?;
     let rel_class = get("rel_class").ok_or_else(|| "rel_class".to_string())?;
-    assert_eq!(rel_class, "lifecycle", "a typed-edge mirror edge MUST be lifecycle-class");
+    assert_eq!(
+        rel_class, "lifecycle",
+        "a typed-edge mirror edge MUST be lifecycle-class"
+    );
 
     let tenant = &env.tenant.0;
     // Forward leg.
@@ -191,13 +197,20 @@ fn git_closes_edge_mirrors_through_the_refs_consumer_forward_only() {
     let env = outbox.row(&ids[0]).unwrap().envelope;
     let projected = consumer_mirror(&env).expect("the Refs mirror ingests the Git lifecycle edge");
     // FORWARD ONLY — closes has no frozen inverse (the floor).
-    assert_eq!(projected.len(), 1, "closes mirrors forward-only (no frozen inverse token yet)");
+    assert_eq!(
+        projected.len(),
+        1,
+        "closes mirrors forward-only (no frozen inverse token yet)"
+    );
     assert_eq!(projected[0].rel, "closes");
     assert_eq!(projected[0].rel_class, "lifecycle");
     assert_eq!(projected[0].source, source.0);
     assert_eq!(projected[0].target, issue("ENG-1").0);
     let expected = consumer_edge_id("acme", &source.0, &issue("ENG-1").0, "closes");
-    assert_eq!(projected[0].edge_id, expected, "the deterministic edge_id is provider/consumer-stable");
+    assert_eq!(
+        projected[0].edge_id, expected,
+        "the deterministic edge_id is provider/consumer-stable"
+    );
 }
 
 /// **A Git-emitted `relates` lifecycle edge mirrors through the Refs consumer to BOTH directions** (the
@@ -214,15 +227,24 @@ fn git_relates_edge_mirrors_to_both_directions_through_the_refs_consumer() {
     let ev = merged_event(&source);
     let mut tx = outbox.begin(Arc::clone(&minter), ctx_base());
     tx.stage_state_change("git pr 42 links pr 7");
-    let ids = emit_lifecycle_edges(&mut tx, &source, &[], std::slice::from_ref(&linked), &ev).unwrap();
+    let ids =
+        emit_lifecycle_edges(&mut tx, &source, &[], std::slice::from_ref(&linked), &ev).unwrap();
     tx.commit().unwrap();
 
     // Git emits exactly ONE forward event (the inverse is the Refs mirror's projection, not a second emit).
-    assert_eq!(ids.len(), 1, "Git emits ONE forward relates event; Refs mirrors the inverse");
+    assert_eq!(
+        ids.len(),
+        1,
+        "Git emits ONE forward relates event; Refs mirrors the inverse"
+    );
 
     let env = outbox.row(&ids[0]).unwrap().envelope;
     let projected = consumer_mirror(&env).expect("the Refs mirror ingests the relates edge");
-    assert_eq!(projected.len(), 2, "relates is symmetric → the mirror projects BOTH directions");
+    assert_eq!(
+        projected.len(),
+        2,
+        "relates is symmetric → the mirror projects BOTH directions"
+    );
 
     // forward: PR 42 → PR 7.
     assert_eq!(projected[0].rel, "relates");
@@ -233,9 +255,18 @@ fn git_relates_edge_mirrors_to_both_directions_through_the_refs_consumer() {
     assert_eq!(projected[1].source, linked.0);
     assert_eq!(projected[1].target, source.0);
     // both legs carry their own deterministic edge_id (distinct rows, idempotent rebuild).
-    assert_eq!(projected[0].edge_id, consumer_edge_id("acme", &source.0, &linked.0, "relates"));
-    assert_eq!(projected[1].edge_id, consumer_edge_id("acme", &linked.0, &source.0, "relates"));
-    assert_ne!(projected[0].edge_id, projected[1].edge_id, "the two legs are distinct edge rows");
+    assert_eq!(
+        projected[0].edge_id,
+        consumer_edge_id("acme", &source.0, &linked.0, "relates")
+    );
+    assert_eq!(
+        projected[1].edge_id,
+        consumer_edge_id("acme", &linked.0, &source.0, "relates")
+    );
+    assert_ne!(
+        projected[0].edge_id, projected[1].edge_id,
+        "the two legs are distinct edge rows"
+    );
 }
 
 /// **The frozen lifecycle tokens are exactly the Refs mirror wire tokens** (the names anchor X-5; no

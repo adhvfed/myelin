@@ -25,8 +25,9 @@
 //! consumer the per-owner reindexes will ride.
 
 use myelin_events::{
-    reindex, BusObservations, BusSignals, BusTransport, DerivedStore, EmitContextBase, InProcessBus,
-    OutboxStore, ReferenceReindexSource, ReindexSource, Relay, SnapshotScope, Timestamp,
+    reindex, BusObservations, BusSignals, BusTransport, DerivedStore, EmitContextBase,
+    InProcessBus, OutboxStore, ReferenceReindexSource, ReindexSource, Relay, SnapshotScope,
+    Timestamp,
 };
 use myelin_events::{Actor, Region, TenantId};
 use myelin_harness::{Predicate, SignalName, SignalSource};
@@ -65,9 +66,21 @@ fn ctx_base() -> EmitContextBase {
 /// scope — "CI one-run scope", contract 2.6).
 fn ci_runs() -> ReferenceReindexSource {
     let mut src = ReferenceReindexSource::new("ci", "run");
-    src.upsert("ci.run:1", 1, serde_json::json!({ "status": "success", "commit": "abc" }));
-    src.upsert("ci.run:2", 2, serde_json::json!({ "status": "failure", "commit": "def" }));
-    src.upsert("ci.run:3", 1, serde_json::json!({ "status": "running", "commit": "ghi" }));
+    src.upsert(
+        "ci.run:1",
+        1,
+        serde_json::json!({ "status": "success", "commit": "abc" }),
+    );
+    src.upsert(
+        "ci.run:2",
+        2,
+        serde_json::json!({ "status": "failure", "commit": "def" }),
+    );
+    src.upsert(
+        "ci.run:3",
+        1,
+        serde_json::json!({ "status": "running", "commit": "ghi" }),
+    );
     src
 }
 
@@ -95,7 +108,11 @@ fn live_envelope(draft: &myelin_events::SnapshotDraft) -> myelin_events::EventEn
         schema_ver: 1,
         tenant: tenant(),
         region: region(),
-        actor: Actor(Principal::stub(PrincipalId("platform".into()), PrincipalKind::Service, tenant())),
+        actor: Actor(Principal::stub(
+            PrincipalId("platform".into()),
+            PrincipalKind::Service,
+            tenant(),
+        )),
         subject: draft.subject.clone(),
         aggregate: AggregateKey(draft.aggregate.0.clone()),
         causation_id: None,
@@ -131,7 +148,10 @@ fn bus_d5_reindex_from_cold_is_byte_identical_to_live() {
     // (3) REINDEX through the REAL outbox→relay→bus→consumer path.
     let mut outbox = OutboxStore::new();
     let receipt = reindex(&scope, None, sources, &mut outbox, ctx_base()).expect("reindex");
-    assert_eq!(receipt.snapshots_emitted, 3, "reindex re-emitted all 3 aggregates as *.snapshot");
+    assert_eq!(
+        receipt.snapshots_emitted, 3,
+        "reindex re-emitted all 3 aggregates as *.snapshot"
+    );
 
     // The relay drains the *.snapshot rows to the broker (the SAME relay a live event rides).
     let bus = InProcessBus::new();
@@ -145,8 +165,16 @@ fn bus_d5_reindex_from_cold_is_byte_identical_to_live() {
     }
 
     // (4) cold == live: byte-identical.
-    assert_eq!(cold.len(), 3, "the cold rebuild materialized all 3 aggregates");
-    assert_eq!(cold.parity_bytes(), live_bytes, "BUS-D5: cold == live (byte-identical rebuild)");
+    assert_eq!(
+        cold.len(),
+        3,
+        "the cold rebuild materialized all 3 aggregates"
+    );
+    assert_eq!(
+        cold.parity_bytes(),
+        live_bytes,
+        "BUS-D5: cold == live (byte-identical rebuild)"
+    );
 
     // Bridge the Bus survival signals into the harness §10.2 library — a LOUD green: after the drain
     // nothing is lost (the outbox is empty, no snapshot dead-lettered).
@@ -163,8 +191,14 @@ fn bus_d5_reindex_from_cold_is_byte_identical_to_live() {
     }
     let depth_ok = signals.assert_signal(SignalName::OutboxDepth, Predicate::Eq(0));
     let dlq_ok = signals.assert_signal(SignalName::DeadLetterCount, Predicate::Eq(0));
-    assert!(depth_ok.is_green(), "outbox drained after the reindex: {depth_ok:?}");
-    assert!(dlq_ok.is_green(), "no snapshot dead-lettered during the reindex: {dlq_ok:?}");
+    assert!(
+        depth_ok.is_green(),
+        "outbox drained after the reindex: {depth_ok:?}"
+    );
+    assert!(
+        dlq_ok.is_green(),
+        "no snapshot dead-lettered during the reindex: {dlq_ok:?}"
+    );
 }
 
 /// **BUS-D5 idempotency leg: re-running the reindex emits 0 NEW snapshots and leaves cold == live
@@ -196,11 +230,21 @@ fn bus_d5_reindex_rerun_is_idempotent_and_byte_stable() {
     // Re-run: 0 NEW snapshots (deterministic ids already present), and re-ingesting the same
     // delivered set is a dedup no-op → the projection bytes do not change.
     let r2 = reindex(&scope, None, sources, &mut outbox, ctx_base()).expect("reindex 2");
-    assert_eq!(r2.snapshots_emitted, 0, "a re-run emits 0 NEW snapshots (idempotent)");
-    assert_eq!(r2.snapshots_skipped_duplicate, 3, "all 3 skipped as ON CONFLICT DO NOTHING");
+    assert_eq!(
+        r2.snapshots_emitted, 0,
+        "a re-run emits 0 NEW snapshots (idempotent)"
+    );
+    assert_eq!(
+        r2.snapshots_skipped_duplicate, 3,
+        "all 3 skipped as ON CONFLICT DO NOTHING"
+    );
     relay.drain_to_empty();
     for env in bus.consume("myelin://") {
         cold.ingest(&env);
     }
-    assert_eq!(cold.parity_bytes(), after_first, "byte-stable across a reindex re-run (no double effect)");
+    assert_eq!(
+        cold.parity_bytes(),
+        after_first,
+        "byte-stable across a reindex re-run (no double effect)"
+    );
 }

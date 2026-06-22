@@ -24,7 +24,10 @@ use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 #[test]
 fn cdc_2_9_knowledge_complete_list_admitted_by_the_bus_harness() {
     // KN self-registers against the grammar (the in-crate gate).
-    assert!(register_knowledge_tokens().is_ok(), "KN's list parses the §6.1 grammar");
+    assert!(
+        register_knowledge_tokens().is_ok(),
+        "KN's list parses the §6.1 grammar"
+    );
 
     // And the WHOLE list is admitted into the Bus's cross-subsystem harness.
     let mut harness = TokenListHarness::new();
@@ -46,11 +49,17 @@ fn cdc_2_9_knowledge_complete_list_admitted_by_the_bus_harness() {
 fn cdc_2_9_harness_rejects_a_malformed_knowledge_addition() {
     let mut harness = TokenListHarness::new();
     harness
-        .register(&SubsystemTokenList::references_only("knowledge", KNOWLEDGE_DURABLE_TOKENS))
+        .register(&SubsystemTokenList::references_only(
+            "knowledge",
+            KNOWLEDGE_DURABLE_TOKENS,
+        ))
         .unwrap();
     // plural artifact-type token (`pages` not `page`).
     assert!(matches!(
-        harness.add("knowledge", myelin_events::RegisteredToken::references_only("knowledge.pages.created")),
+        harness.add(
+            "knowledge",
+            myelin_events::RegisteredToken::references_only("knowledge.pages.created")
+        ),
         Err(HarnessError::UngrammaticalToken { .. })
     ));
 }
@@ -109,8 +118,16 @@ fn cdc_2_6_knowledge_replay_rebuilds_cold_equals_live_block_granular() {
         "home",
         4,
         &[
-            ("b1", 1, serde_json::json!({ "kind": "heading", "text_ref": "r1" })),
-            ("b2", 3, serde_json::json!({ "kind": "paragraph", "text_ref": "r2" })),
+            (
+                "b1",
+                1,
+                serde_json::json!({ "kind": "heading", "text_ref": "r1" }),
+            ),
+            (
+                "b2",
+                3,
+                serde_json::json!({ "kind": "paragraph", "text_ref": "r2" }),
+            ),
         ],
     );
     let scope = SnapshotScope::new("knowledge", "page:home");
@@ -126,12 +143,19 @@ fn cdc_2_6_knowledge_replay_rebuilds_cold_equals_live_block_granular() {
     let sources: &[&dyn ReindexSource] = &[&source];
     let mut outbox = OutboxStore::new();
     let r1 = reindex(&scope, None, sources, &mut outbox, ctx_base()).expect("reindex");
-    assert_eq!(r1.snapshots_emitted, 3, "1 page + 2 blocks (block granularity)");
+    assert_eq!(
+        r1.snapshots_emitted, 3,
+        "1 page + 2 blocks (block granularity)"
+    );
     for draft in source.replay(&scope, None) {
         let row = outbox.row(&draft.event_id()).expect("snapshot row present");
         cold.ingest(&row.envelope);
     }
-    assert_eq!(cold.parity_bytes(), live.parity_bytes(), "cold == live (byte-identical)");
+    assert_eq!(
+        cold.parity_bytes(),
+        live.parity_bytes(),
+        "cold == live (byte-identical)"
+    );
 
     // Idempotent re-run.
     let r2 = reindex(&scope, None, sources, &mut outbox, ctx_base()).expect("re-reindex");

@@ -35,13 +35,16 @@ fn scope(s: &str) -> FirehoseScope {
 /// Bridge the firehose's measured seq-gap + resync count into the FROZEN §10.2 harness assertion
 /// library (the DEVIATION bridge the Bus's other drills use, e.g. EB-11's telemetry self-test): the
 /// firehose protocol owns the *measurement*; the harness owns the *assertion* vocabulary.
-fn set_firehose_signals(src: &mut SignalSource, stream: &str, scope: &str, seq_gap: i64, resync: i64) {
+fn set_firehose_signals(
+    src: &mut SignalSource,
+    stream: &str,
+    scope: &str,
+    seq_gap: i64,
+    resync: i64,
+) {
     src.set_labelled(
         SignalName::FirehoseFrameLag,
-        vec![
-            Label::new("stream", stream),
-            Label::new("scope", scope),
-        ],
+        vec![Label::new("stream", stream), Label::new("scope", scope)],
         seq_gap,
     );
     src.set_scalar(SignalName::ResyncRequiredCount, resync);
@@ -57,7 +60,9 @@ fn d10_reconnect_backfills_then_live_loses_zero_ops() {
 
     // a connected client consumes live up to seq 3.
     let breaker = DependencyBreaker::new();
-    let sub = fh.subscribe(stream, &s, None).expect("bounded scope subscribes");
+    let sub = fh
+        .subscribe(stream, &s, None)
+        .expect("bounded scope subscribes");
     for _ in 0..3 {
         fh.publish(stream, &s, FrameDraft::new("op"));
     }
@@ -69,7 +74,10 @@ fn d10_reconnect_backfills_then_live_loses_zero_ops() {
     // DROP the firehose connection mid-stream (the catalogue's "drop a firehose connection" fault,
     // reversibly — P-S03). While down, the producer keeps publishing the gap 4,5,6,7.
     breaker.break_dependency(Dependency::Firehose, Scope::Global);
-    assert!(breaker.is_broken(&Dependency::Firehose, &Scope::Global), "the connection is down");
+    assert!(
+        breaker.is_broken(&Dependency::Firehose, &Scope::Global),
+        "the connection is down"
+    );
     for _ in 0..4 {
         fh.publish(stream, &s, FrameDraft::new("op"));
     }
@@ -77,20 +85,34 @@ fn d10_reconnect_backfills_then_live_loses_zero_ops() {
 
     // RECONNECT: resume(last_seq=3) → backfill (3, now] = {4,5,6,7}, then live.
     breaker.restore_dependency(Dependency::Firehose, Scope::Global);
-    let resumed = fh.resume(stream, &s, last_seq).expect("an in-window resume backfills the gap");
+    let resumed = fh
+        .resume(stream, &s, last_seq)
+        .expect("an in-window resume backfills the gap");
     let backfilled: Vec<u64> = resumed.drain_ready().iter().map(|f| f.seq).collect();
-    assert_eq!(backfilled, vec![4, 5, 6, 7], "the gap (last_seq, now] is replayed — 0 ops lost");
+    assert_eq!(
+        backfilled,
+        vec![4, 5, 6, 7],
+        "the gap (last_seq, now] is replayed — 0 ops lost"
+    );
 
     // a subsequent LIVE frame continues gap-free, no duplicate.
     fh.publish(stream, &s, FrameDraft::new("op"));
     let live: Vec<u64> = resumed.drain_ready().iter().map(|f| f.seq).collect();
-    assert_eq!(live, vec![8], "live continues contiguously — 0 duplicate across the boundary");
+    assert_eq!(
+        live,
+        vec![8],
+        "live continues contiguously — 0 duplicate across the boundary"
+    );
 
     // ZERO OPS LOST: across the whole reconnect the client saw 1..8, each exactly once.
     let mut total = seen;
     total.extend(backfilled);
     total.extend(live);
-    assert_eq!(total, (1..=8).collect::<Vec<u64>>(), "every op delivered exactly once: 0 lost, 0 dup");
+    assert_eq!(
+        total,
+        (1..=8).collect::<Vec<u64>>(),
+        "every op delivered exactly once: 0 lost, 0 dup"
+    );
 
     // the seq-gap survival signal reads 0 after the reconnect (no op outstanding) → assert it GREEN
     // through the frozen §10.2 library. resync count is 0 (this leg never went out-of-window).
@@ -101,7 +123,10 @@ fn d10_reconnect_backfills_then_live_loses_zero_ops() {
         .expect_green(); // no resync fired on the in-window reconnect leg
     src.assert_labelled(
         SignalName::FirehoseFrameLag,
-        vec![Label::new("stream", stream), Label::new("scope", s.selector())],
+        vec![
+            Label::new("stream", stream),
+            Label::new("scope", s.selector()),
+        ],
         Predicate::Eq(0),
     )
     .expect_green(); // 0 ops lost: the seq-gap is closed after the backfill
@@ -124,13 +149,25 @@ fn d10_out_of_window_resume_raises_resync_required() {
     for _ in 0..8 {
         fh.publish(stream, &s, FrameDraft::new("msg"));
     }
-    assert_eq!(fh.window_len(stream, &s), 3, "the retention window is bounded");
+    assert_eq!(
+        fh.window_len(stream, &s),
+        3,
+        "the retention window is bounded"
+    );
 
     // RECONNECT past the window → resync_required (NAMED, not a silent partial replay).
-    let err = fh.resume(stream, &s, last_seq).expect_err("out-of-window resume cannot backfill");
-    assert!(err.is_resync_required(), "an out-of-window cursor RAISES resync_required");
+    let err = fh
+        .resume(stream, &s, last_seq)
+        .expect_err("out-of-window resume cannot backfill");
+    assert!(
+        err.is_resync_required(),
+        "an out-of-window cursor RAISES resync_required"
+    );
     let resync_fired = if let FirehoseError::ResyncRequired { window_floor, .. } = err {
-        assert_eq!(window_floor, 6, "the window floor is the oldest held seq (6)");
+        assert_eq!(
+            window_floor, 6,
+            "the window floor is the oldest held seq (6)"
+        );
         1
     } else {
         0
@@ -154,7 +191,10 @@ fn d10_transport_rejects_an_over_broad_scope() {
     let err = fh
         .subscribe_raw("chat-live", "*", None)
         .expect_err("the transport rejects an over-broad scope");
-    assert!(err.is_over_broad_scope(), "scope = * is rejected (BUS-3 generalised)");
+    assert!(
+        err.is_over_broad_scope(),
+        "scope = * is rejected (BUS-3 generalised)"
+    );
     // a bounded scope through the same entry subscribes fine.
     assert!(
         fh.subscribe_raw("chat-live", "channel:eng", None).is_ok(),
@@ -171,7 +211,9 @@ fn d10_board_scope_reconnect_loses_zero_ops() {
     let stream = "issues";
     let s = scope("board:proj-42"); // a huge board (ISS) — the OQ-J co-designed case.
 
-    let sub = fh.subscribe(stream, &s, None).expect("a board scope subscribes");
+    let sub = fh
+        .subscribe(stream, &s, None)
+        .expect("a board scope subscribes");
     for _ in 0..10 {
         fh.publish(stream, &s, FrameDraft::new("row-edit"));
     }
@@ -182,16 +224,25 @@ fn d10_board_scope_reconnect_loses_zero_ops() {
     for _ in 0..10 {
         fh.publish(stream, &s, FrameDraft::new("row-edit"));
     }
-    let resumed = fh.resume(stream, &s, sub.last_seq()).expect("board resume backfills");
+    let resumed = fh
+        .resume(stream, &s, sub.last_seq())
+        .expect("board resume backfills");
     let gap: Vec<u64> = resumed.drain_ready().iter().map(|f| f.seq).collect();
-    assert_eq!(gap, (11..=20).collect::<Vec<u64>>(), "the whole edit-storm gap is replayed — 0 lost");
+    assert_eq!(
+        gap,
+        (11..=20).collect::<Vec<u64>>(),
+        "the whole edit-storm gap is replayed — 0 lost"
+    );
 
     let mut src = SignalSource::new();
     let remaining = (fh.head_seq(stream, &s) - resumed.last_seq()) as i64;
     set_firehose_signals(&mut src, stream, &s.selector(), remaining, 0);
     src.assert_labelled(
         SignalName::FirehoseFrameLag,
-        vec![Label::new("stream", stream), Label::new("scope", s.selector())],
+        vec![
+            Label::new("stream", stream),
+            Label::new("scope", s.selector()),
+        ],
         Predicate::Eq(0),
     )
     .expect_green(); // the board's seq-gap is closed after the backfill — 0 ops lost

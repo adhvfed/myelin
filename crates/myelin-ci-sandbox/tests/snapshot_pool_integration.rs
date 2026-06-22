@@ -148,7 +148,12 @@ fn pre_warmed_snapshot_restore_runs_the_restored_guest_on_real_silicon() {
         "machine-config",
         "{\"vcpu_count\":1,\"mem_size_mib\":256}",
     );
-    api(&sock1, "PUT", "actions", "{\"action_type\":\"InstanceStart\"}");
+    api(
+        &sock1,
+        "PUT",
+        "actions",
+        "{\"action_type\":\"InstanceStart\"}",
+    );
     // Let the guest boot to userspace before snapshotting.
     std::thread::sleep(Duration::from_millis(2500));
 

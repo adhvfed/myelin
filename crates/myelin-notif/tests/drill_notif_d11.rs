@@ -33,13 +33,15 @@
 //! firehose — the durable retention window keeps the gap across the outage.
 
 use myelin_events::firehose::{Firehose, DEFAULT_INFLIGHT_CAP};
-use myelin_harness::{Dependency, DependencyBreaker, Label, Predicate, Scope, SignalName, SignalSource};
+use myelin_harness::{
+    Dependency, DependencyBreaker, Label, Predicate, Scope, SignalName, SignalSource,
+};
 use myelin_identity::{
     Consistency, ConsistencyMode, Decision, Principal, PrincipalId, PrincipalKind, Zookie,
 };
 use myelin_notif::{
-    cold_rebuild_item_ids, inbox_scope, inbox_stream, publish_inbox_frame, watch_open, watch_resume,
-    AllowAllAuthorize, InboxProjection, RoutedInboxItem, WatchOutcome,
+    cold_rebuild_item_ids, inbox_scope, inbox_stream, publish_inbox_frame, watch_open,
+    watch_resume, AllowAllAuthorize, InboxProjection, RoutedInboxItem, WatchOutcome,
 };
 use myelin_refs::ArtifactRef;
 use myelin_tenancy::{Region, TenantId};
@@ -51,7 +53,10 @@ fn principal(id: &str) -> Principal {
     Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant())
 }
 fn strong() -> Consistency {
-    Consistency { at_least: Zookie("zk".into()), mode: ConsistencyMode::Strong }
+    Consistency {
+        at_least: Zookie("zk".into()),
+        mode: ConsistencyMode::Strong,
+    }
 }
 
 /// A `RoutedInboxItem` for the cold-rebuild source projection (`list_inbox` reads it).
@@ -104,19 +109,29 @@ fn d_n11_reconnect_loses_zero_items() {
 
     // a connected watcher consumes live up to seq 3 (items itm-1..itm-3).
     let breaker = DependencyBreaker::new();
-    let watch = watch_open(&mut fh, &me).unwrap().into_live().expect("live watch");
+    let watch = watch_open(&mut fh, &me)
+        .unwrap()
+        .into_live()
+        .expect("live watch");
     for i in 1..=3 {
         publish_inbox_frame(&mut fh, &me, &format!("itm-{i}")).unwrap();
     }
     let seen_before: Vec<String> = watch.drain().into_iter().map(|f| f.item_id).collect();
-    assert_eq!(seen_before, vec!["itm-1", "itm-2", "itm-3"], "the watcher saw 1..3 while connected");
+    assert_eq!(
+        seen_before,
+        vec!["itm-1", "itm-2", "itm-3"],
+        "the watcher saw 1..3 while connected"
+    );
     let last_seq = watch.last_seq();
     assert_eq!(last_seq, 3, "its resume cursor is the last delivered seq");
 
     // DROP the inbox watch connection mid-stream (reversibly, P-S03). While down, the producer keeps
     // mirroring inbox items (itm-4..itm-7) onto the firehose's bounded retention window.
     breaker.break_dependency(Dependency::Firehose, Scope::Global);
-    assert!(breaker.is_broken(&Dependency::Firehose, &Scope::Global), "the watch connection is down");
+    assert!(
+        breaker.is_broken(&Dependency::Firehose, &Scope::Global),
+        "the watch connection is down"
+    );
     drop(watch); // the old subscription is gone (the connection dropped); the window kept the gap.
     for i in 4..=7 {
         publish_inbox_frame(&mut fh, &me, &format!("itm-{i}")).unwrap();
@@ -138,18 +153,26 @@ fn d_n11_reconnect_loses_zero_items() {
     // a subsequent LIVE item continues gap-free, no duplicate.
     publish_inbox_frame(&mut fh, &me, "itm-8").unwrap();
     let live: Vec<String> = resumed.drain().into_iter().map(|f| f.item_id).collect();
-    assert_eq!(live, vec!["itm-8"], "live continues contiguously — 0 duplicate across the boundary");
+    assert_eq!(
+        live,
+        vec!["itm-8"],
+        "live continues contiguously — 0 duplicate across the boundary"
+    );
 
     // ZERO ITEMS LOST: across the whole reconnect the watcher saw itm-1..itm-8, each exactly once.
     let mut total = seen_before;
     total.extend(backfilled);
     total.extend(live);
     let expected: Vec<String> = (1..=8).map(|i| format!("itm-{i}")).collect();
-    assert_eq!(total, expected, "every item delivered exactly once across the reconnect: 0 lost, 0 dup");
+    assert_eq!(
+        total, expected,
+        "every item delivered exactly once across the reconnect: 0 lost, 0 dup"
+    );
 
     // the survival signals: the item-lag reads 0 after the backfill (no item outstanding); the
     // resync count is 0 on this in-window leg. GREEN through the frozen §10.2 library.
-    let remaining_lag = (fh.head_seq(&stream, &inbox_scope(&me).unwrap()) - resumed.last_seq()) as i64;
+    let remaining_lag =
+        (fh.head_seq(&stream, &inbox_scope(&me).unwrap()) - resumed.last_seq()) as i64;
     assert_eq!(remaining_lag, 0, "the seq-gap is closed after the backfill");
     assert_firehose_green(&stream, &scope, remaining_lag, 0);
 }
@@ -180,9 +203,15 @@ fn d_n11_over_old_cursor_resyncs_then_cold_rebuilds_zero_lost() {
     // RECONNECT past the window → resync_required (NAMED, not a silent partial replay).
     let out = watch_resume(&mut fh, &me, last_seq).expect("the resync verdict is non-fatal");
     let resync_fired = match out {
-        WatchOutcome::ResyncRequired { last_seq: ls, window_floor } => {
+        WatchOutcome::ResyncRequired {
+            last_seq: ls,
+            window_floor,
+        } => {
             assert_eq!(ls, 2);
-            assert_eq!(window_floor, 4, "the window floor is the oldest held seq (4)");
+            assert_eq!(
+                window_floor, 4,
+                "the window floor is the oldest held seq (4)"
+            );
             1
         }
         WatchOutcome::Live(_) => panic!("an over-old cursor MUST resync"),
@@ -191,7 +220,10 @@ fn d_n11_over_old_cursor_resyncs_then_cold_rebuilds_zero_lost() {
 
     // the NAMED cold rebuild: rebuild from SOURCE via list_inbox — recovers EVERY current item.
     let recovered = cold_rebuild_item_ids(&inbox, &me, &AllowAllAuthorize, &strong());
-    assert_eq!(recovered, all_items, "the cold rebuild recovers every item — 0 lost across the recovery");
+    assert_eq!(
+        recovered, all_items,
+        "the cold rebuild recovers every item — 0 lost across the recovery"
+    );
 
     // the survival signal: the resync count fired (>= 1). After the cold rebuild + re-open the
     // item-lag is 0 (the client is caught up via the snapshot). GREEN through the frozen §10.2 library.
@@ -207,7 +239,10 @@ fn d_n11_unbounded_scope_is_rejected() {
     let mut fh = Firehose::new();
     let me = principal("p-watcher");
     // the bounded inbox scope subscribes (the positive control).
-    assert!(watch_open(&mut fh, &me).is_ok(), "a bounded inbox: scope watch opens");
+    assert!(
+        watch_open(&mut fh, &me).is_ok(),
+        "a bounded inbox: scope watch opens"
+    );
     // EVERY unbounded form is rejected at the connection-tier subscribe entry: 0 accepted.
     let mut accepted_unbounded = 0;
     for raw in ["*", "inbox:*", "inbox:", "inbox", "", ">"] {
@@ -215,7 +250,10 @@ fn d_n11_unbounded_scope_is_rejected() {
             accepted_unbounded += 1;
         }
     }
-    assert_eq!(accepted_unbounded, 0, "0 unbounded scope accepted — the whitelist-not-* rule holds");
+    assert_eq!(
+        accepted_unbounded, 0,
+        "0 unbounded scope accepted — the whitelist-not-* rule holds"
+    );
 
     // a deny-by-default authorize ensures the principal id discipline holds end-to-end (a sanity
     // pin that the inbox scope is keyed to the OPAQUE pseudonym, never a free identifier).

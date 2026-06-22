@@ -54,11 +54,18 @@ fn schema() -> FieldSchema {
 }
 
 fn viewer() -> Principal {
-    Principal::stub(PrincipalId("agent:delegated".into()), PrincipalKind::Human, TenantId("acme".into()))
+    Principal::stub(
+        PrincipalId("agent:delegated".into()),
+        PrincipalKind::Human,
+        TenantId("acme".into()),
+    )
 }
 
 fn consistency() -> Consistency {
-    Consistency { at_least: Zookie("z0".into()), mode: ConsistencyMode::BoundedStale }
+    Consistency {
+        at_least: Zookie("z0".into()),
+        mode: ConsistencyMode::BoundedStale,
+    }
 }
 
 /// The PROVIDER-facing authz port: `list_objects` returns the viewer's reachable allow-set (the S4
@@ -75,7 +82,11 @@ impl ListObjectsPort for RagAuthz {
         ty: &ObjectType,
         _at: &Consistency,
     ) -> AuthzResult<ListObjectsResult> {
-        assert_eq!(permission, &Permission("read".into()), "RAG reads under `read`, never a wider perm");
+        assert_eq!(
+            permission,
+            &Permission("read".into()),
+            "RAG reads under `read`, never a wider perm"
+        );
         assert_eq!(ty, &ObjectType("issue".into()));
         self.calls.fetch_add(1, Ordering::Relaxed);
         Ok(ListObjectsResult::Ids {
@@ -99,7 +110,10 @@ fn rag_corpus(embedder: &MockEmbeddingAdapter) -> TantivyBackend {
     };
     emb("acme/issue/PUB-1", "how the scheduler avoids deadlock");
     emb("acme/issue/PUB-2", "indexer backpressure design");
-    emb("acme/issue/SECRET-PLAN", "confidential acquisition plan deadlock");
+    emb(
+        "acme/issue/SECRET-PLAN",
+        "confidential acquisition plan deadlock",
+    );
     be
 }
 
@@ -129,7 +143,9 @@ fn semantic_6_2_agent_rag_gets_only_visible_passages() {
     let q = ast(Predicate::Cmp {
         op: CmpOp::Eq,
         lhs: Expr::Var(SEMANTIC_FIELD.into()),
-        rhs: Expr::Lit(Literal::Str("confidential acquisition plan deadlock".into())),
+        rhs: Expr::Lit(Literal::Str(
+            "confidential acquisition plan deadlock".into(),
+        )),
     });
     let vq = VectorQuery::Text {
         text: "confidential acquisition plan deadlock".into(),
@@ -145,20 +161,31 @@ fn semantic_6_2_agent_rag_gets_only_visible_passages() {
         &ObjectType("issue".into()),
         &consistency(),
         &vq,
-        Page { offset: 0, limit: 10 },
+        Page {
+            offset: 0,
+            limit: 10,
+        },
         &stats,
         &cstats,
     )
     .expect("the 6.2 semantic entry answers");
 
-    let ids: std::collections::BTreeSet<&str> = res.hits.iter().map(|h| h.doc_id.as_str()).collect();
+    let ids: std::collections::BTreeSet<&str> =
+        res.hits.iter().map(|h| h.doc_id.as_str()).collect();
     assert!(
         !ids.contains("acme/issue/SECRET-PLAN"),
         "the confidential passage — though the NEAREST neighbour — never reaches the agent (6.2 RAG: 0 leak)"
     );
-    assert!(ids.contains("acme/issue/PUB-1") && ids.contains("acme/issue/PUB-2"), "the visible passages surface");
+    assert!(
+        ids.contains("acme/issue/PUB-1") && ids.contains("acme/issue/PUB-2"),
+        "the visible passages surface"
+    );
     // The viewer-driven ACL pre-filter is exactly ONE list_objects (no per-result authz, no N+1).
-    assert_eq!(authz.calls.load(Ordering::Relaxed), 1, "exactly one list_objects for the RAG retrieval");
+    assert_eq!(
+        authz.calls.load(Ordering::Relaxed),
+        1,
+        "exactly one list_objects for the RAG retrieval"
+    );
 }
 
 /// **6.2 honours `k`: the result is bounded by the requested k VISIBLE neighbours (the page limit
@@ -177,7 +204,10 @@ fn semantic_6_2_bounds_to_k_visible_neighbours() {
         lhs: Expr::Var(SEMANTIC_FIELD.into()),
         rhs: Expr::Lit(Literal::Str("how the scheduler avoids deadlock".into())),
     });
-    let vq = VectorQuery::Text { text: "how the scheduler avoids deadlock".into(), embedder: &embedder };
+    let vq = VectorQuery::Text {
+        text: "how the scheduler avoids deadlock".into(),
+        embedder: &embedder,
+    };
     let res = semantic(
         &eng,
         &authz,
@@ -187,11 +217,21 @@ fn semantic_6_2_bounds_to_k_visible_neighbours() {
         &ObjectType("issue".into()),
         &consistency(),
         &vq,
-        Page { offset: 0, limit: 1 }, // k = 1
+        Page {
+            offset: 0,
+            limit: 1,
+        }, // k = 1
         &QueryStats::new(),
         &ConsistencyStats::new(),
     )
     .expect("semantic k=1");
-    assert_eq!(res.hits.len(), 1, "k=1 ⇒ exactly the single nearest VISIBLE neighbour");
-    assert_eq!(res.hits[0].doc_id, "acme/issue/PUB-1", "the nearest visible passage to the query");
+    assert_eq!(
+        res.hits.len(),
+        1,
+        "k=1 ⇒ exactly the single nearest VISIBLE neighbour"
+    );
+    assert_eq!(
+        res.hits[0].doc_id, "acme/issue/PUB-1",
+        "the nearest visible passage to the query"
+    );
 }

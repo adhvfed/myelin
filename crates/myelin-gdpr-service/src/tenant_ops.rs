@@ -118,7 +118,10 @@ pub enum TenantDsrError {
 impl std::fmt::Display for TenantDsrError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TenantDsrError::CrossTenantSubject { calling_tenant, subject_tenant } => write!(
+            TenantDsrError::CrossTenantSubject {
+                calling_tenant,
+                subject_tenant,
+            } => write!(
                 f,
                 "Art. 28 cross-tenant DSR refused: tenant `{calling_tenant}` may only act for its \
                  own data subjects, but the subject lives under tenant `{subject_tenant}` (§4.4)"
@@ -188,7 +191,10 @@ pub struct TenantDsrSurface<'a, C: Clock> {
 impl<'a, C: Clock> TenantDsrSurface<'a, C> {
     /// Build a tenant-facing surface over the DSR spine + the legal-hold gate. The upstream holder
     /// orchestrator + the durable checklist are passed per-operation (they are per-fan-out state).
-    pub fn new(dsr: &'a DsrOrchestrator<C>, holds: &'a LegalHoldRegistry) -> TenantDsrSurface<'a, C> {
+    pub fn new(
+        dsr: &'a DsrOrchestrator<C>,
+        holds: &'a LegalHoldRegistry,
+    ) -> TenantDsrSurface<'a, C> {
         TenantDsrSurface { dsr, holds }
     }
 
@@ -226,13 +232,16 @@ impl<'a, C: Clock> TenantDsrSurface<'a, C> {
     ) -> Result<DsrId> {
         // §4.4 Art-28 scoping — the tenant may only act for its OWN subjects (cross-tenant refused).
         Self::art28_scope_ok(calling_tenant, &subject)?;
-        let scope = EraseScope::Subject { subject: subject.clone(), tenant: calling_tenant.clone() };
+        let scope = EraseScope::Subject {
+            subject: subject.clone(),
+            tenant: calling_tenant.clone(),
+        };
         let id = self.dsr.dsr_submit(
             kind,
             calling_tenant.clone(),
             subject,
             scope,
-            Posture::Processor,          // tenant content — the customer org is the controller.
+            Posture::Processor, // tenant content — the customer org is the controller.
             Initiator::TenantInstructed, // Art. 28 — the controller instructed the action.
         );
         Ok(id)
@@ -254,7 +263,10 @@ impl<'a, C: Clock> TenantDsrSurface<'a, C> {
         // `validate` returns `false` ONLY if the gate refused; a tenant-instructed request is never
         // refused, so a `false` here would be an invariant break we surface loudly.
         let admitted = self.dsr.validate(id)?;
-        debug_assert!(admitted, "a tenant-instructed (Art. 28) DSR is never posture-refused (§4.4)");
+        debug_assert!(
+            admitted,
+            "a tenant-instructed (Art. 28) DSR is never posture-refused (§4.4)"
+        );
         let driver = FanOutDriver::new(self.dsr, self.holds);
         Ok(driver.drive(id, inventory, upstream, checklist)?)
     }
@@ -289,10 +301,13 @@ impl<'a, C: Clock> TenantDsrSurface<'a, C> {
             tenant_subject(tenant),
             EraseScope::Tenant(tenant.clone()),
             Posture::Processor, // tenant content — the customer org is the controller.
-            Initiator::Myelin,  // an operator runs the offboarding (authorised: it IS an offboarding).
+            Initiator::Myelin, // an operator runs the offboarding (authorised: it IS an offboarding).
         );
         let admitted = self.dsr.validate(&id)?;
-        debug_assert!(admitted, "a tenant offboarding (EraseScope::Tenant) is an authorised erase (§4.4)");
+        debug_assert!(
+            admitted,
+            "a tenant offboarding (EraseScope::Tenant) is an authorised erase (§4.4)"
+        );
         let driver = FanOutDriver::new(self.dsr, self.holds);
         let outcome = driver.drive(&id, inventory, upstream, checklist)?;
         // The offboarding is an erase — the driver returns `Erased` (it is never a read right; a
@@ -300,7 +315,11 @@ impl<'a, C: Clock> TenantDsrSurface<'a, C> {
         // hold is the operator's pre-condition, surfaced by the driver's DeferredUnderHold outcome
         // we propagate faithfully rather than masking).
         let completion = outcome.receipt().clone();
-        Ok(OffboardingCertificate { tenant: tenant.clone(), dsr_id: id, completion })
+        Ok(OffboardingCertificate {
+            tenant: tenant.clone(),
+            dsr_id: id,
+            completion,
+        })
     }
 
     /// **Restriction (Art. 18/21) — route a `restrict` DSR through the orchestrator (§4.4).** A
@@ -389,7 +408,11 @@ mod tests {
     /// A subject whose HOME tenant is `tenant` (the Art-28 scoping anchor — the verified principal's
     /// tenant).
     fn subject_in(tenant: &TenantId, id: &str) -> SubjectRef {
-        SubjectRef::new(Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant.clone()))
+        SubjectRef::new(Principal::stub(
+            PrincipalId(id.into()),
+            PrincipalKind::Human,
+            tenant.clone(),
+        ))
     }
 
     /// A KMS seeded with one key per upstream holder (each holder shreds its OWN class).
@@ -407,7 +430,10 @@ mod tests {
         .enumerate()
         {
             kms.provision(
-                ShredKeyHandle { tenant: tenant.clone(), class: ShredKeyClass::Subject((*id).to_string()) },
+                ShredKeyHandle {
+                    tenant: tenant.clone(),
+                    class: ShredKeyClass::Subject((*id).to_string()),
+                },
                 base_epoch + i as u64,
             );
         }
@@ -424,7 +450,12 @@ mod tests {
             holder_ids::BACKUP,
         ]
         .into_iter()
-        .map(|id| (id, SeamHolder::new(id, ShredKeyClass::Subject(id.to_string()), kms)))
+        .map(|id| {
+            (
+                id,
+                SeamHolder::new(id, ShredKeyClass::Subject(id.to_string()), kms),
+            )
+        })
         .collect()
     }
 
@@ -462,7 +493,10 @@ mod tests {
         let kms = kms_with_all_holder_keys(&tenant, 100);
         let holders = seam_holders(&kms);
         let upstream = UpstreamHolderOrchestrator::register_m1_upstream(
-            holders.iter().map(|(id, h)| (*id, h as &dyn PersonalDataHolder)).collect(),
+            holders
+                .iter()
+                .map(|(id, h)| (*id, h as &dyn PersonalDataHolder))
+                .collect(),
         );
         let dsr = DsrOrchestrator::new(TestClock::at(1_700_000_000));
         let holds = LegalHoldRegistry::new();
@@ -478,9 +512,16 @@ mod tests {
             .unwrap();
 
         // the erase fanned out + completed (the tenant-instructed erase is ADMITTED, not refused).
-        assert!(matches!(outcome, FanOutOutcome::Erased(_)), "tenant-instructed erase admitted + driven");
+        assert!(
+            matches!(outcome, FanOutOutcome::Erased(_)),
+            "tenant-instructed erase admitted + driven"
+        );
         assert_eq!(dsr.state_of(&id).unwrap(), DsrState::Completed);
-        assert_eq!(upstream.fanout_coverage(&checklist), 1.0, "100% fan-out over the holder list");
+        assert_eq!(
+            upstream.fanout_coverage(&checklist),
+            1.0,
+            "100% fan-out over the holder list"
+        );
     }
 
     /// **The Art-28 scoping guard REFUSES a cross-tenant subject (§4.4 — the cross-tenant-IDOR
@@ -512,8 +553,14 @@ mod tests {
     #[test]
     fn art28_scope_ok_admits_same_tenant_refuses_different_tenant() {
         let acme = t("acme");
-        assert!(TenantDsrSurface::<TestClock>::art28_scope_ok(&acme, &subject_in(&acme, "u")).is_ok());
-        assert!(TenantDsrSurface::<TestClock>::art28_scope_ok(&acme, &subject_in(&t("other"), "u")).is_err());
+        assert!(
+            TenantDsrSurface::<TestClock>::art28_scope_ok(&acme, &subject_in(&acme, "u")).is_ok()
+        );
+        assert!(TenantDsrSurface::<TestClock>::art28_scope_ok(
+            &acme,
+            &subject_in(&t("other"), "u")
+        )
+        .is_err());
     }
 
     // ───────────── tenant offboarding = erase(EraseScope::Tenant) (§4.4) ─────────────
@@ -528,7 +575,10 @@ mod tests {
         let kms = kms_with_all_holder_keys(&tenant, 200);
         let holders = seam_holders(&kms);
         let upstream = UpstreamHolderOrchestrator::register_m1_upstream(
-            holders.iter().map(|(id, h)| (*id, h as &dyn PersonalDataHolder)).collect(),
+            holders
+                .iter()
+                .map(|(id, h)| (*id, h as &dyn PersonalDataHolder))
+                .collect(),
         );
         let dsr = DsrOrchestrator::new(TestClock::at(1_700_000_000));
         let holds = LegalHoldRegistry::new();
@@ -541,18 +591,39 @@ mod tests {
 
         // the offboarding is tenant-granularity (the scope token is the bare tenant — no subject).
         assert_eq!(cert.tenant, tenant);
-        assert_eq!(cert.completion.scope_token, "acme", "tenant-granularity offboarding (no subject)");
+        assert_eq!(
+            cert.completion.scope_token, "acme",
+            "tenant-granularity offboarding (no subject)"
+        );
         assert_eq!(cert.completion.outcome, "erased");
         // the fan-out hit EVERY holder in canonical order (Identity first) — 100% coverage.
-        assert_eq!(cert.completion.holder_receipts.len(), 6, "all six holders shredded for offboarding");
-        assert_eq!(cert.completion.holder_receipts[0].holder_id, holder_ids::IDENTITY, "Identity FIRST");
-        assert!(cert.completion.content_hash.starts_with("blake3:"), "content-addressed (§4.2)");
-        assert_eq!(upstream.fanout_coverage(&checklist), 1.0, "100% fan-out (the §4.4 GATE)");
+        assert_eq!(
+            cert.completion.holder_receipts.len(),
+            6,
+            "all six holders shredded for offboarding"
+        );
+        assert_eq!(
+            cert.completion.holder_receipts[0].holder_id,
+            holder_ids::IDENTITY,
+            "Identity FIRST"
+        );
+        assert!(
+            cert.completion.content_hash.starts_with("blake3:"),
+            "content-addressed (§4.2)"
+        );
+        assert_eq!(
+            upstream.fanout_coverage(&checklist),
+            1.0,
+            "100% fan-out (the §4.4 GATE)"
+        );
         // the DSR completed via the state machine.
         assert_eq!(dsr.state_of(&cert.dsr_id).unwrap(), DsrState::Completed);
         // every holder receipt records its destroyed key epoch (the tenant-KEK shred trail).
         for hr in &cert.completion.holder_receipts {
-            assert!(hr.receipt.receipt.key_epoch_destroyed.is_some(), "tenant-KEK shred recorded");
+            assert!(
+                hr.receipt.receipt.key_epoch_destroyed.is_some(),
+                "tenant-KEK shred recorded"
+            );
         }
     }
 
@@ -564,7 +635,10 @@ mod tests {
         let kms = kms_with_all_holder_keys(&tenant, 300);
         let holders = seam_holders(&kms);
         let upstream = UpstreamHolderOrchestrator::register_m1_upstream(
-            holders.iter().map(|(id, h)| (*id, h as &dyn PersonalDataHolder)).collect(),
+            holders
+                .iter()
+                .map(|(id, h)| (*id, h as &dyn PersonalDataHolder))
+                .collect(),
         );
         let dsr = DsrOrchestrator::new(TestClock::at(0));
         let holds = LegalHoldRegistry::new();
@@ -578,9 +652,16 @@ mod tests {
             .map(|(id, h)| (*id, h as &dyn PersonalDataHolder))
             .collect();
         let partial = UpstreamHolderOrchestrator::register_m1_upstream(first_two);
-        partial.fan_out_erase(&EraseScope::Tenant(tenant.clone()), &checklist).unwrap();
-        assert_eq!(checklist.done_count(), 2, "the crash left two holders receipted");
-        let calls_after_partial: Vec<u32> = holders.iter().map(|(_, h)| h.erase_call_count()).collect();
+        partial
+            .fan_out_erase(&EraseScope::Tenant(tenant.clone()), &checklist)
+            .unwrap();
+        assert_eq!(
+            checklist.done_count(),
+            2,
+            "the crash left two holders receipted"
+        );
+        let calls_after_partial: Vec<u32> =
+            holders.iter().map(|(_, h)| h.erase_call_count()).collect();
 
         // resume — only un-receipted holders are re-driven (0 double-shred).
         let cert = surface
@@ -594,10 +675,18 @@ mod tests {
                     "holder {id} already receipted ⇒ NOT re-shredded (0 double-shred)"
                 );
             } else {
-                assert_eq!(holders[i].1.erase_call_count(), 1, "holder {id} shredded on resume");
+                assert_eq!(
+                    holders[i].1.erase_call_count(),
+                    1,
+                    "holder {id} shredded on resume"
+                );
             }
         }
-        assert_eq!(cert.completion.holder_receipts.len(), 6, "the certificate has the complete holder set");
+        assert_eq!(
+            cert.completion.holder_receipts.len(),
+            6,
+            "the certificate has the complete holder set"
+        );
         assert_eq!(upstream.fanout_coverage(&checklist), 1.0);
     }
 
@@ -610,7 +699,10 @@ mod tests {
         let kms = kms_with_all_holder_keys(&tenant, 400);
         let holders = seam_holders(&kms);
         let upstream = UpstreamHolderOrchestrator::register_m1_upstream(
-            holders.iter().map(|(id, h)| (*id, h as &dyn PersonalDataHolder)).collect(),
+            holders
+                .iter()
+                .map(|(id, h)| (*id, h as &dyn PersonalDataHolder))
+                .collect(),
         );
         let dsr = DsrOrchestrator::new(TestClock::at(0));
         let holds = LegalHoldRegistry::new();
@@ -618,14 +710,24 @@ mod tests {
         let surface = TenantDsrSurface::new(&dsr, &holds);
         let checklist = EraseChecklist::new();
 
-        let cert = surface.offboard_tenant(&tenant, &inventory(), &upstream, &checklist).unwrap();
-        assert_eq!(cert.completion.outcome, "deferred:legal_hold", "offboarding deferred under hold");
-        assert!(cert.completion.holder_receipts.is_empty(), "no holder shredded under hold");
+        let cert = surface
+            .offboard_tenant(&tenant, &inventory(), &upstream, &checklist)
+            .unwrap();
+        assert_eq!(
+            cert.completion.outcome, "deferred:legal_hold",
+            "offboarding deferred under hold"
+        );
+        assert!(
+            cert.completion.holder_receipts.is_empty(),
+            "no holder shredded under hold"
+        );
         assert_eq!(upstream.fanout_coverage(&checklist), 0.0);
 
         // clear the hold + re-offboard the SAME tenant — it resumes to completion.
         holds.set(HoldScope::Tenant("acme".into()), false);
-        let cert2 = surface.offboard_tenant(&tenant, &inventory(), &upstream, &checklist).unwrap();
+        let cert2 = surface
+            .offboard_tenant(&tenant, &inventory(), &upstream, &checklist)
+            .unwrap();
         assert_eq!(cert2.completion.outcome, "erased");
         assert_eq!(upstream.fanout_coverage(&checklist), 1.0);
     }
@@ -642,7 +744,10 @@ mod tests {
         let kms = kms_with_all_holder_keys(&tenant, 500);
         let holders = seam_holders(&kms);
         let upstream = UpstreamHolderOrchestrator::register_m1_upstream(
-            holders.iter().map(|(id, h)| (*id, h as &dyn PersonalDataHolder)).collect(),
+            holders
+                .iter()
+                .map(|(id, h)| (*id, h as &dyn PersonalDataHolder))
+                .collect(),
         );
         let dsr = DsrOrchestrator::new(TestClock::at(0));
         // a hold is active — to prove a non-erasure right is NEVER suspended by it.
@@ -652,22 +757,46 @@ mod tests {
 
         // Restriction (Art. 18/21).
         let r = surface
-            .restrict_subject(&tenant, subject_in(&tenant, "u-r"), &inventory(), &upstream, &EraseChecklist::new())
+            .restrict_subject(
+                &tenant,
+                subject_in(&tenant, "u-r"),
+                &inventory(),
+                &upstream,
+                &EraseChecklist::new(),
+            )
             .unwrap();
-        assert!(matches!(r, FanOutOutcome::ReadRightServed(_)), "restriction is not an erase (not suspended)");
+        assert!(
+            matches!(r, FanOutOutcome::ReadRightServed(_)),
+            "restriction is not an erase (not suspended)"
+        );
         assert_eq!(r.receipt().outcome, "restriction");
 
         // Rectification (Art. 16).
         let rec = surface
-            .rectify_subject(&tenant, subject_in(&tenant, "u-rec"), &inventory(), &upstream, &EraseChecklist::new())
+            .rectify_subject(
+                &tenant,
+                subject_in(&tenant, "u-rec"),
+                &inventory(),
+                &upstream,
+                &EraseChecklist::new(),
+            )
             .unwrap();
         assert_eq!(rec.receipt().outcome, "rectification");
 
         // Portability (Art. 20).
         let p = surface
-            .portability_for_subject(&tenant, subject_in(&tenant, "u-p"), &inventory(), &upstream, &EraseChecklist::new())
+            .portability_for_subject(
+                &tenant,
+                subject_in(&tenant, "u-p"),
+                &inventory(),
+                &upstream,
+                &EraseChecklist::new(),
+            )
             .unwrap();
-        assert!(matches!(p, FanOutOutcome::ReadRightServed(_)), "portability is a read right (never suspended)");
+        assert!(
+            matches!(p, FanOutOutcome::ReadRightServed(_)),
+            "portability is a read right (never suspended)"
+        );
         assert_eq!(p.receipt().outcome, "portability");
     }
 
@@ -680,7 +809,10 @@ mod tests {
         let kms = kms_with_all_holder_keys(&acme, 600);
         let holders = seam_holders(&kms);
         let upstream = UpstreamHolderOrchestrator::register_m1_upstream(
-            holders.iter().map(|(id, h)| (*id, h as &dyn PersonalDataHolder)).collect(),
+            holders
+                .iter()
+                .map(|(id, h)| (*id, h as &dyn PersonalDataHolder))
+                .collect(),
         );
         let dsr = DsrOrchestrator::new(TestClock::at(0));
         let holds = LegalHoldRegistry::new();
@@ -688,15 +820,33 @@ mod tests {
 
         let victim = subject_in(&acme, "victim");
         assert!(matches!(
-            surface.restrict_subject(&evil, victim.clone(), &inventory(), &upstream, &EraseChecklist::new()),
+            surface.restrict_subject(
+                &evil,
+                victim.clone(),
+                &inventory(),
+                &upstream,
+                &EraseChecklist::new()
+            ),
             Err(TenantDsrError::CrossTenantSubject { .. })
         ));
         assert!(matches!(
-            surface.rectify_subject(&evil, victim.clone(), &inventory(), &upstream, &EraseChecklist::new()),
+            surface.rectify_subject(
+                &evil,
+                victim.clone(),
+                &inventory(),
+                &upstream,
+                &EraseChecklist::new()
+            ),
             Err(TenantDsrError::CrossTenantSubject { .. })
         ));
         assert!(matches!(
-            surface.portability_for_subject(&evil, victim, &inventory(), &upstream, &EraseChecklist::new()),
+            surface.portability_for_subject(
+                &evil,
+                victim,
+                &inventory(),
+                &upstream,
+                &EraseChecklist::new()
+            ),
             Err(TenantDsrError::CrossTenantSubject { .. })
         ));
     }

@@ -15,7 +15,11 @@ use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_tenancy::TenantId;
 
 fn alice() -> Principal {
-    Principal::stub(PrincipalId("p-alice".into()), PrincipalKind::Human, TenantId("acme".into()))
+    Principal::stub(
+        PrincipalId("p-alice".into()),
+        PrincipalKind::Human,
+        TenantId("acme".into()),
+    )
 }
 
 fn page() -> InlineNode {
@@ -55,7 +59,10 @@ fn corpus() -> Vec<(String, Vec<InlineNode>)> {
         // `snake_case` + `f(x)` pass through byte-stable (`_`/`(`/`)` are not delimiters).
         ("rename `do_thing` to `do_other` in f(x)".into(), vec![]),
         // a structured mention node.
-        (format!("cc {OBJ} for review"), vec![InlineNode::Mention(alice())]),
+        (
+            format!("cc {OBJ} for review"),
+            vec![InlineNode::Mention(alice())],
+        ),
         // a structured artifact-ref ("Closes" as a structured link).
         (format!("{OBJ} fixes the panic"), vec![issue()]),
         // a structured embed.
@@ -82,12 +89,19 @@ fn git_body_corpus_round_trips_at_100_percent() {
         let rendered = body.render();
         assert_eq!(&rendered, md, "round-trip mismatch for body {md:?}");
         // the structured-node array is preserved through parse (positional binding intact).
-        assert_eq!(body.parse().nodes, *nodes, "node array not preserved for {md:?}");
+        assert_eq!(
+            body.parse().nodes,
+            *nodes,
+            "node array not preserved for {md:?}"
+        );
         if body.round_trips() {
             passed += 1;
         }
     }
-    assert_eq!(passed, total, "git-body round-trip parity must be 100% ({passed}/{total})");
+    assert_eq!(
+        passed, total,
+        "git-body round-trip parity must be 100% ({passed}/{total})"
+    );
 }
 
 /// **The node-count → edge-count invariant over the corpus: N structured nodes → N edges (1 per node).**

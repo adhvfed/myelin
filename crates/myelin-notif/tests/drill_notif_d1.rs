@@ -58,7 +58,10 @@ fn me() -> Principal {
     Principal::stub(PrincipalId("u-week".into()), PrincipalKind::Human, tenant())
 }
 fn strong() -> Consistency {
-    Consistency { at_least: Zookie("zk-notif-d1".into()), mode: ConsistencyMode::Strong }
+    Consistency {
+        at_least: Zookie("zk-notif-d1".into()),
+        mode: ConsistencyMode::Strong,
+    }
 }
 
 /// One inbox row addressed to the viewer, about `subject`, with `reason` (the class is derived).
@@ -93,18 +96,54 @@ fn mixed_week() -> InboxProjection {
     inbox.upsert_for_test(item("a-fyi-4", "myelin://acme/issue/issue/F4", Reason::Fyi));
     inbox.upsert_for_test(item("a-fyi-5", "myelin://acme/ci/run/F5", Reason::Fyi));
     // the watching band.
-    inbox.upsert_for_test(item("b-watched", "myelin://acme/git/pr/W1", Reason::Watched));
-    inbox.upsert_for_test(item("b-state", "myelin://acme/issue/issue/W2", Reason::StateChanged));
+    inbox.upsert_for_test(item(
+        "b-watched",
+        "myelin://acme/git/pr/W1",
+        Reason::Watched,
+    ));
+    inbox.upsert_for_test(item(
+        "b-state",
+        "myelin://acme/issue/issue/W2",
+        Reason::StateChanged,
+    ));
     // the participating band.
-    inbox.upsert_for_test(item("c-replied", "myelin://acme/chat/thread/P1", Reason::Replied));
-    inbox.upsert_for_test(item("c-agent", "myelin://acme/issue/issue/P2", Reason::AgentProposal));
+    inbox.upsert_for_test(item(
+        "c-replied",
+        "myelin://acme/chat/thread/P1",
+        Reason::Replied,
+    ));
+    inbox.upsert_for_test(item(
+        "c-agent",
+        "myelin://acme/issue/issue/P2",
+        Reason::AgentProposal,
+    ));
     // the direct band.
-    inbox.upsert_for_test(item("d-review", "myelin://acme/git/pr/D1", Reason::ReviewRequested));
-    inbox.upsert_for_test(item("d-assigned", "myelin://acme/issue/issue/D2", Reason::Assigned));
-    inbox.upsert_for_test(item("d-mention", "myelin://acme/chat/thread/D3", Reason::Mentioned));
+    inbox.upsert_for_test(item(
+        "d-review",
+        "myelin://acme/git/pr/D1",
+        Reason::ReviewRequested,
+    ));
+    inbox.upsert_for_test(item(
+        "d-assigned",
+        "myelin://acme/issue/issue/D2",
+        Reason::Assigned,
+    ));
+    inbox.upsert_for_test(item(
+        "d-mention",
+        "myelin://acme/chat/thread/D3",
+        Reason::Mentioned,
+    ));
     // the critical band (the must-see-first).
-    inbox.upsert_for_test(item("e-approval", "myelin://acme/issue/issue/C1", Reason::ApprovalRequested));
-    inbox.upsert_for_test(item("e-escalated", "myelin://acme/ci/run/C2", Reason::Escalated));
+    inbox.upsert_for_test(item(
+        "e-approval",
+        "myelin://acme/issue/issue/C1",
+        Reason::ApprovalRequested,
+    ));
+    inbox.upsert_for_test(item(
+        "e-escalated",
+        "myelin://acme/ci/run/C2",
+        Reason::Escalated,
+    ));
     inbox.upsert_for_test(item("e-sla", "myelin://acme/issue/issue/C3", Reason::Sla));
     inbox
 }
@@ -119,12 +158,19 @@ fn notif_d1_important_never_buried_with_explain_trace_per_rank() {
         &inbox,
         &me(),
         &InboxFilter::all(),
-        &Page { after: None, limit: 1000 },
+        &Page {
+            after: None,
+            limit: 1000,
+        },
         &AllowAllAuthorize,
         &strong(),
         &ranker,
     );
-    assert_eq!(page.items.len(), 15, "the whole mixed week is read back (the ONE inbox)");
+    assert_eq!(
+        page.items.len(),
+        15,
+        "the whole mixed week is read back (the ONE inbox)"
+    );
 
     // (3) — EXPLAIN-TRACE PRESENT ON EVERY RANK (100%, NOTIF-2). Measure the coverage and assert it.
     let with_trace = page
@@ -133,7 +179,10 @@ fn notif_d1_important_never_buried_with_explain_trace_per_rank() {
         .filter(|r| !r.trace.render().is_empty() && r.trace.final_priority == r.priority)
         .count();
     let trace_coverage = with_trace as f64 / page.items.len() as f64;
-    assert_eq!(trace_coverage, 1.0, "100% of ranks carry a deterministic explain-trace (NOTIF-2)");
+    assert_eq!(
+        trace_coverage, 1.0,
+        "100% of ranks carry a deterministic explain-trace (NOTIF-2)"
+    );
 
     // (1) — IMPORTANT-BURIED-RATE = 0. For each critical/direct item, count how many fyis rank
     // ABOVE it (a lower index = higher rank). The buried count must be 0 (not one critical/direct
@@ -163,7 +212,10 @@ fn notif_d1_important_never_buried_with_explain_trace_per_rank() {
     );
     // the structural belt: the last important index is strictly before the first fyi index.
     if let (Some(li), Some(ff)) = (last_important, first_fyi) {
-        assert!(li < ff, "every critical/direct ranks above every fyi (the band invariant)");
+        assert!(
+            li < ff,
+            "every critical/direct ranks above every fyi (the band invariant)"
+        );
     }
 
     // (2) — FIRST-IMPORTANT LATENCY WITHIN BUDGET. The rank-position of the first critical/direct is
@@ -178,8 +230,14 @@ fn notif_d1_important_never_buried_with_explain_trace_per_rank() {
         .iter()
         .filter(|r| r.priority > page.items[first_important_pos].priority)
         .count();
-    assert_eq!(higher_ahead, 0, "first-important latency in budget: nothing outranks the first critical");
-    assert_eq!(first_important_pos, 0, "the first important item is at the TOP of the ranked inbox");
+    assert_eq!(
+        higher_ahead, 0,
+        "first-important latency in budget: nothing outranks the first critical"
+    );
+    assert_eq!(
+        first_important_pos, 0,
+        "the first important item is at the TOP of the ranked inbox"
+    );
     assert_eq!(
         page.items[0].trace.class,
         Class::Critical,
@@ -191,11 +249,20 @@ fn notif_d1_important_never_buried_with_explain_trace_per_rank() {
     let order: Vec<&str> = page.items.iter().map(|r| r.item.item_id.as_str()).collect();
     assert_eq!(
         &order[..6],
-        &["e-approval", "e-escalated", "e-sla", "d-assigned", "d-mention", "d-review"],
+        &[
+            "e-approval",
+            "e-escalated",
+            "e-sla",
+            "d-assigned",
+            "d-mention",
+            "d-review"
+        ],
         "the criticals (90) then the directs (70), each in stable item_id order"
     );
     assert!(
-        order[order.len() - 5..].iter().all(|id| id.starts_with("a-fyi-")),
+        order[order.len() - 5..]
+            .iter()
+            .all(|id| id.starts_with("a-fyi-")),
         "the five fyis (15) sink to the bottom of the ranked inbox"
     );
 }
@@ -219,7 +286,12 @@ fn signal(rule: &str, severity: Severity, subject: &str, dedup: &str) -> Signal 
 }
 
 fn signal_msg(id: &str, sig: &Signal) -> Message {
-    let subject = format!("sig.{}.{}.{}", sig.tenant.0, sig.severity.token(), sig.rule_id.0);
+    let subject = format!(
+        "sig.{}.{}.{}",
+        sig.tenant.0,
+        sig.severity.token(),
+        sig.rule_id.0
+    );
     let env = EventEnvelope {
         event_id: EventId(id.into()),
         type_: EventType("signal.opened".into()),
@@ -241,7 +313,10 @@ fn signal_msg(id: &str, sig: &Signal) -> Message {
         recorded_at: Timestamp("2026-06-20T00:00:01Z".into()),
         payload: serde_json::to_value(sig).unwrap(),
     };
-    Message { subject, envelope: env }
+    Message {
+        subject,
+        envelope: env,
+    }
 }
 
 /// **NOTIF-D1 (wire): the ranked read reads the SAME projection the live `SignalRouter` UPSERTs into
@@ -259,16 +334,38 @@ fn notif_d1_ranking_reads_the_routed_inbox_with_trace_per_rank() {
     // Three Signals on the SAME rule (→ the SAME opaque `psn:watcher:<rule>` recipient, NOTIF-P3
     // skeleton routing) but DISTINCT dedup keys (→ three distinct inbox rows, no write-time collapse).
     for (i, sig) in [
-        signal("ci_run_failed", Severity::Error, "myelin://acme/ci/run/1", "run-1"),
-        signal("ci_run_failed", Severity::Warning, "myelin://acme/git/pr/9", "pr-9"),
-        signal("ci_run_failed", Severity::Critical, "myelin://acme/issue/issue/PROJ-1", "sla-1"),
+        signal(
+            "ci_run_failed",
+            Severity::Error,
+            "myelin://acme/ci/run/1",
+            "run-1",
+        ),
+        signal(
+            "ci_run_failed",
+            Severity::Warning,
+            "myelin://acme/git/pr/9",
+            "pr-9",
+        ),
+        signal(
+            "ci_run_failed",
+            Severity::Critical,
+            "myelin://acme/issue/issue/PROJ-1",
+            "sla-1",
+        ),
     ]
     .iter()
     .enumerate()
     {
-        assert_eq!(consumer.deliver(&signal_msg(&format!("evt-{i}"), sig)), Delivered::Acked);
+        assert_eq!(
+            consumer.deliver(&signal_msg(&format!("evt-{i}"), sig)),
+            Delivered::Acked
+        );
     }
-    assert_eq!(inbox.len(), 3, "the router UPSERTed three rows into the ONE projection");
+    assert_eq!(
+        inbox.len(),
+        3,
+        "the router UPSERTed three rows into the ONE projection"
+    );
 
     // The router routes to an OPAQUE recipient (NOTIF-P3 skeleton). Read whoever it addressed.
     let recipient = inbox.snapshot_for_tenant(&tenant())[0].recipient.clone();
@@ -277,20 +374,36 @@ fn notif_d1_ranking_reads_the_routed_inbox_with_trace_per_rank() {
         &inbox,
         &viewer,
         &InboxFilter::all(),
-        &Page { after: None, limit: 1000 },
+        &Page {
+            after: None,
+            limit: 1000,
+        },
         &AllowAllAuthorize,
         &strong(),
         &DeterministicV1::default(),
     );
-    assert_eq!(page.items.len(), 3, "the ranked read reads the SAME projection the router wrote");
+    assert_eq!(
+        page.items.len(),
+        3,
+        "the ranked read reads the SAME projection the router wrote"
+    );
     // every routed item carries a deterministic, complete explain-trace (the 100%-trace gate, NOTIF-2).
     for r in &page.items {
-        assert_eq!(r.priority, r.trace.final_priority, "the trace IS the rank's provenance");
-        assert!(!r.trace.render().is_empty(), "every routed rank carries an explain-trace");
+        assert_eq!(
+            r.priority, r.trace.final_priority,
+            "the trace IS the rank's provenance"
+        );
+        assert!(
+            !r.trace.render().is_empty(),
+            "every routed rank carries an explain-trace"
+        );
     }
     // the order is priority-descending (deterministic).
     let priorities: Vec<u8> = page.items.iter().map(|r| r.priority).collect();
     let mut sorted = priorities.clone();
     sorted.sort_by(|a, b| b.cmp(a));
-    assert_eq!(priorities, sorted, "the ranked read is priority-descending end to end");
+    assert_eq!(
+        priorities, sorted,
+        "the ranked read is priority-descending end to end"
+    );
 }

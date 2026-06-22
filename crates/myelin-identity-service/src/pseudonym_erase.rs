@@ -397,7 +397,10 @@ mod tests {
             KeyClass::Subject("p:alice".into()),
             ts("2026-06-19T00:00:00Z"),
         );
-        assert!(ledger.is_erased(&s, &subject), "the ledger remembers the erasure");
+        assert!(
+            ledger.is_erased(&s, &subject),
+            "the ledger remembers the erasure"
+        );
         let entries = ledger.entries_in(&s);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].subject, subject);
@@ -413,10 +416,21 @@ mod tests {
         let globex = scope("globex", "eu-west");
         let acme_us = scope("acme", "us-east");
         let subject = PrincipalId("p:alice".into());
-        ledger.record(&acme, &subject, KeyClass::Subject("p:alice".into()), ts("t"));
+        ledger.record(
+            &acme,
+            &subject,
+            KeyClass::Subject("p:alice".into()),
+            ts("t"),
+        );
         assert!(ledger.is_erased(&acme, &subject));
-        assert!(!ledger.is_erased(&globex, &subject), "no cross-tenant ledger read");
-        assert!(!ledger.is_erased(&acme_us, &subject), "no cross-region ledger read");
+        assert!(
+            !ledger.is_erased(&globex, &subject),
+            "no cross-tenant ledger read"
+        );
+        assert!(
+            !ledger.is_erased(&acme_us, &subject),
+            "no cross-region ledger read"
+        );
         assert!(ledger.entries_in(&globex).is_empty());
     }
 
@@ -450,7 +464,11 @@ mod tests {
             ts("2026-06-19T00:00:00Z"),
         );
         assert_eq!(r.erased_at, ts("2026-06-19T00:00:00Z"), "dated");
-        assert!(r.content_hash.starts_with("blake3:"), "content-addressed: {}", r.content_hash);
+        assert!(
+            r.content_hash.starts_with("blake3:"),
+            "content-addressed: {}",
+            r.content_hash
+        );
         // Deterministic: the same erasure content-addresses identically.
         let r2 = ErasureReceipt::for_erase(
             PrincipalId("p:alice".into()),
@@ -461,7 +479,10 @@ mod tests {
             true,
             ts("2026-06-19T00:00:00Z"),
         );
-        assert_eq!(r.content_hash, r2.content_hash, "deterministic content-address");
+        assert_eq!(
+            r.content_hash, r2.content_hash,
+            "deterministic content-address"
+        );
         // A different subject ⇒ a different address (the digest covers the opaque id).
         let r3 = ErasureReceipt::for_erase(
             PrincipalId("p:bob".into()),
@@ -498,7 +519,10 @@ mod tests {
             resurrected: 1,
             ..green
         };
-        assert!(!red.is_green(), "a resurrected subject ⇒ RED (never softened)");
+        assert!(
+            !red.is_green(),
+            "a resurrected subject ⇒ RED (never softened)"
+        );
         assert!(red.summary().contains("RED"));
     }
 

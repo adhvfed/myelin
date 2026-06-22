@@ -110,6 +110,9 @@ mod tests {
         );
         let (passed, total) = corpus_pass_rate();
         assert_eq!(passed, total, "corpus-pass-rate must be 100%");
-        assert!(total >= 18, "corpus must not be shrunk below its frozen size");
+        assert!(
+            total >= 18,
+            "corpus must not be shrunk below its frozen size"
+        );
     }
 }

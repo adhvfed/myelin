@@ -96,7 +96,10 @@ fn cdc_4_8_erase_makes_de_pseudonymisation_fail_closed_but_attribution_stands() 
 
     // The DSR orchestrator drives erase (DSR step 1).
     let receipt = svc.erase_in(&s, &alice, ts("2026-06-19T12:00:00Z"));
-    assert!(receipt.dek_destroyed && receipt.row_shredded, "the provider crypto-shredded the subject");
+    assert!(
+        receipt.dek_destroyed && receipt.row_shredded,
+        "the provider crypto-shredded the subject"
+    );
 
     // The consumer can no longer de-pseudonymise the erased subject — resolve FAILS CLOSED.
     let r = git_attribution_for(&svc, &s, &alice);

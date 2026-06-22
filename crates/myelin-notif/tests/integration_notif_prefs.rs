@@ -39,7 +39,10 @@ async fn notif_prefs_upsert_round_trips_pierce_default_and_rls_denies_cross_tena
         .expect("connect to dev Postgres as the app role (is the stack up?)");
     let admin = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
-        .connect(&cfg.database_url.replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw"))
+        .connect(
+            &cfg.database_url
+                .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw"),
+        )
         .await
         .expect("connect as admin");
 
@@ -49,19 +52,40 @@ async fn notif_prefs_upsert_round_trips_pierce_default_and_rls_denies_cross_tena
     let quiet_ddl = QUIET_HOURS_DDL.replacen("notif_quiet_hours", &quiet_tbl, 1);
 
     for t in [&pref_tbl, &quiet_tbl] {
-        sqlx::query(&format!("DROP TABLE IF EXISTS {t}")).execute(&admin).await.unwrap();
+        sqlx::query(&format!("DROP TABLE IF EXISTS {t}"))
+            .execute(&admin)
+            .await
+            .unwrap();
     }
-    sqlx::query(&pref_ddl).execute(&admin).await.expect("the notif_pref DDL applies");
-    sqlx::query(&quiet_ddl).execute(&admin).await.expect("the notif_quiet_hours DDL applies");
+    sqlx::query(&pref_ddl)
+        .execute(&admin)
+        .await
+        .expect("the notif_pref DDL applies");
+    sqlx::query(&quiet_ddl)
+        .execute(&admin)
+        .await
+        .expect("the notif_quiet_hours DDL applies");
     for t in [&pref_tbl, &quiet_tbl] {
-        sqlx::query(&rls_scope_sql(t)).execute(&admin).await.expect("RLS policy installs");
-        sqlx::query(&format!("GRANT ALL ON {t} TO myelin_app")).execute(&admin).await.unwrap();
+        sqlx::query(&rls_scope_sql(t))
+            .execute(&admin)
+            .await
+            .expect("RLS policy installs");
+        sqlx::query(&format!("GRANT ALL ON {t} TO myelin_app"))
+            .execute(&admin)
+            .await
+            .unwrap();
     }
 
     // ---- (1) UPSERT round-trip: set_prefs twice for the SAME principal UPDATES in place ---------
     let mut conn = app.acquire().await.unwrap();
-    sqlx::query("SELECT set_config('myelin.tenant_id', 'tenantA', false)").execute(&mut *conn).await.unwrap();
-    sqlx::query("SELECT set_config('myelin.region', 'fr-par', false)").execute(&mut *conn).await.unwrap();
+    sqlx::query("SELECT set_config('myelin.tenant_id', 'tenantA', false)")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query("SELECT set_config('myelin.region', 'fr-par', false)")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
 
     let upsert = format!(
         "INSERT INTO {pref_tbl} (tenant_id, region, principal, routing, digest, dek_ref) \
@@ -83,15 +107,27 @@ async fn notif_prefs_upsert_round_trips_pierce_default_and_rls_denies_cross_tena
         .await
         .expect("second set_prefs UPSERT (UPDATE in place)");
 
-    let rows = sqlx::query(&format!("SELECT routing, digest FROM {pref_tbl} WHERE principal = 'psn:alice'"))
-        .fetch_all(&mut *conn)
-        .await
-        .unwrap();
-    assert_eq!(rows.len(), 1, "the per-principal row is UPSERTed (one row, not two)");
+    let rows = sqlx::query(&format!(
+        "SELECT routing, digest FROM {pref_tbl} WHERE principal = 'psn:alice'"
+    ))
+    .fetch_all(&mut *conn)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "the per-principal row is UPSERTed (one row, not two)"
+    );
     let routing: serde_json::Value = rows[0].get("routing");
-    assert_eq!(routing[0]["channel"], "mobile_push", "the second set_prefs UPDATED the routing in place");
+    assert_eq!(
+        routing[0]["channel"], "mobile_push",
+        "the second set_prefs UPDATED the routing in place"
+    );
     let digest: serde_json::Value = rows[0].get("digest");
-    assert_eq!(digest["cadence"], "daily", "the digest config round-trips (stored only — compose is the OQ5 floor)");
+    assert_eq!(
+        digest["cadence"], "daily",
+        "the digest config round-trips (stored only — compose is the OQ5 floor)"
+    );
 
     // ---- (2) the DDL default pierce_classes = {critical} (the on-call override is a real default) -
     sqlx::query(&format!(
@@ -107,13 +143,23 @@ async fn notif_prefs_upsert_round_trips_pierce_default_and_rls_denies_cross_tena
     .fetch_one(&mut *conn)
     .await
     .unwrap();
-    assert_eq!(pierce, vec!["critical".to_string()], "pierce_classes defaults to {{critical}} (you cannot silence on-call)");
+    assert_eq!(
+        pierce,
+        vec!["critical".to_string()],
+        "pierce_classes defaults to {{critical}} (you cannot silence on-call)"
+    );
 
     // ---- (3) RLS denies cross-tenant: seed tenant B, read as tenant A → 0 cross-tenant rows ------
     {
         let mut admin_conn = admin.acquire().await.unwrap();
-        sqlx::query("SELECT set_config('myelin.tenant_id', 'tenantB', false)").execute(&mut *admin_conn).await.unwrap();
-        sqlx::query("SELECT set_config('myelin.region', 'fr-par', false)").execute(&mut *admin_conn).await.unwrap();
+        sqlx::query("SELECT set_config('myelin.tenant_id', 'tenantB', false)")
+            .execute(&mut *admin_conn)
+            .await
+            .unwrap();
+        sqlx::query("SELECT set_config('myelin.region', 'fr-par', false)")
+            .execute(&mut *admin_conn)
+            .await
+            .unwrap();
         sqlx::query(&format!(
             "INSERT INTO {pref_tbl} (tenant_id, region, principal, routing, digest, dek_ref) \
              VALUES ('tenantB', 'fr-par', 'psn:bob', '[]'::jsonb, NULL, 'kms://acme/0/tenant')"
@@ -123,16 +169,31 @@ async fn notif_prefs_upsert_round_trips_pierce_default_and_rls_denies_cross_tena
         .unwrap();
     }
     // back as tenant A: the only visible prefs row is tenant A's.
-    let visible = sqlx::query(&format!("SELECT tenant_id FROM {pref_tbl}")).fetch_all(&mut *conn).await.unwrap();
-    assert_eq!(visible.len(), 1, "RLS hides tenant B's prefs — 0 cross-tenant rows");
-    assert_eq!(visible[0].get::<String, _>("tenant_id"), "tenantA");
-    let cross: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {pref_tbl} WHERE tenant_id = 'tenantB'"))
-        .fetch_one(&mut *conn)
+    let visible = sqlx::query(&format!("SELECT tenant_id FROM {pref_tbl}"))
+        .fetch_all(&mut *conn)
         .await
         .unwrap();
-    assert_eq!(cross, 0, "a tenant-A session reads 0 cross-tenant (tenantB) prefs rows");
+    assert_eq!(
+        visible.len(),
+        1,
+        "RLS hides tenant B's prefs — 0 cross-tenant rows"
+    );
+    assert_eq!(visible[0].get::<String, _>("tenant_id"), "tenantA");
+    let cross: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {pref_tbl} WHERE tenant_id = 'tenantB'"
+    ))
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap();
+    assert_eq!(
+        cross, 0,
+        "a tenant-A session reads 0 cross-tenant (tenantB) prefs rows"
+    );
 
     for t in [&pref_tbl, &quiet_tbl] {
-        sqlx::query(&format!("DROP TABLE {t}")).execute(&admin).await.unwrap();
+        sqlx::query(&format!("DROP TABLE {t}"))
+            .execute(&admin)
+            .await
+            .unwrap();
     }
 }

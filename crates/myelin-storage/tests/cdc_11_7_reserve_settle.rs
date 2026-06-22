@@ -160,16 +160,29 @@ fn gate_fronts_every_run_reserve_then_settle_through_the_handle() {
 
     // Reserve-at-dispatch mints the in-flight handle (the ONLY way to start a run).
     let handle = gate
-        .dispatch(&mut ledger, tenant.clone(), run.clone(), MinorUnits(1_000), MinorUnits(5_000))
+        .dispatch(
+            &mut ledger,
+            tenant.clone(),
+            run.clone(),
+            MinorUnits(1_000),
+            MinorUnits(5_000),
+        )
         .expect("a funded dispatch fronts the run");
     assert_eq!(handle.kind(), RunKind::AgentRun);
-    assert_eq!(ledger.state_of(&tenant, &run), Some(ReservationState::InFlight));
+    assert_eq!(
+        ledger.state_of(&tenant, &run),
+        Some(ReservationState::InFlight)
+    );
 
     // Settle-on-completion through the handle: one cost event per metered unit, wholesale ≠ markup.
     let outcome = handle
         .settle(
             &mut ledger,
-            &[MeteredUnit { unit: "llm.tokens", wholesale: MinorUnits(120), markup: MinorUnits(30) }],
+            &[MeteredUnit {
+                unit: "llm.tokens",
+                wholesale: MinorUnits(120),
+                markup: MinorUnits(30),
+            }],
         )
         .expect("the run settles through its handle");
     assert_eq!(outcome.cost_events.len(), 1);
@@ -188,7 +201,13 @@ fn gate_refuses_dispatch_on_no_balance_no_handle_minted() {
     let run = RunId::new("01J0RUN_BROKE");
 
     let err = gate
-        .dispatch(&mut ledger, tenant.clone(), run.clone(), MinorUnits(9_000), MinorUnits(100))
+        .dispatch(
+            &mut ledger,
+            tenant.clone(),
+            run.clone(),
+            MinorUnits(9_000),
+            MinorUnits(100),
+        )
         .expect_err("an unfunded dispatch is refused");
     assert!(matches!(err, DispatchError::NoBalance { .. }));
     assert!(

@@ -66,7 +66,10 @@ fn producer_opaque_payload(
         run_attempt: attempt,
         trust_tier: trust,
         details_ref: ArtifactRef("myelin://acme/ci/run/9#step-2".into()),
-        summary: HumanisedRef { template_key: "ci.check.updated".into(), args },
+        summary: HumanisedRef {
+            template_key: "ci.check.updated".into(),
+            args,
+        },
         started_at: Timestamp("2026-06-21T00:00:00Z".into()),
         completed_at: Some(Timestamp("2026-06-21T00:01:00Z".into())),
         cost_settled: true,
@@ -86,7 +89,13 @@ fn consumer_decode(opaque: serde_json::Value) -> CheckStatus {
 /// PRODUCER and CONSUMER agree on the ONE frozen 5.9 shape (the seam is well-typed across the bus).
 #[test]
 fn cdc_5_9_producer_opaque_payload_decodes_to_consumer_view() {
-    let opaque = producer_opaque_payload("abc123", "build", 1, CheckState::Success, TrustTier::Trusted);
+    let opaque = producer_opaque_payload(
+        "abc123",
+        "build",
+        1,
+        CheckState::Success,
+        TrustTier::Trusted,
+    );
     // The Bus carries the CheckStatus OPAQUE — it round-trips untouched as a serde_json::Value.
     assert_eq!(opaque["commit_oid"], "abc123");
     assert_eq!(opaque["context"]["name"], "build");
@@ -113,20 +122,37 @@ fn cdc_5_9_consumer_supersedes_and_gates() {
 
     // CI emits build attempt 1 (failure); Git decodes + applies.
     let a1 = consumer_decode(producer_opaque_payload(
-        "c1", "build", 1, CheckState::Failure, TrustTier::Trusted,
+        "c1",
+        "build",
+        1,
+        CheckState::Failure,
+        TrustTier::Trusted,
     ));
-    assert_eq!(proj.apply(&a1), ApplyOutcome::Superseded { current_attempt: 1 });
+    assert_eq!(
+        proj.apply(&a1),
+        ApplyOutcome::Superseded { current_attempt: 1 }
+    );
 
     // CI emits the re-run, build attempt 2 (success); Git supersedes.
     let a2 = consumer_decode(producer_opaque_payload(
-        "c1", "build", 2, CheckState::Success, TrustTier::Trusted,
+        "c1",
+        "build",
+        2,
+        CheckState::Success,
+        TrustTier::Trusted,
     ));
-    assert_eq!(proj.apply(&a2), ApplyOutcome::Superseded { current_attempt: 2 });
+    assert_eq!(
+        proj.apply(&a2),
+        ApplyOutcome::Superseded { current_attempt: 2 }
+    );
 
     // The at-least-once transport re-delivers the stale attempt 1 — the consumer DROPS it.
     assert_eq!(
         proj.apply(&a1),
-        ApplyOutcome::DroppedStale { incoming_attempt: 1, current_attempt: 2 },
+        ApplyOutcome::DroppedStale {
+            incoming_attempt: 1,
+            current_attempt: 2
+        },
         "a late lower attempt is dropped (supersession is monotonic, X-1)"
     );
 

@@ -93,7 +93,11 @@ async fn git_d11_pr_list_setexpr_join_one_query_zero_leak_tenant_scoped_revoke_r
         PrincipalKind::Human,
         TenantId("acme".into()),
     );
-    for (subject, object) in [("p:viewer", "pr:1"), ("p:viewer", "pr:2"), ("p:other", "pr:secret")] {
+    for (subject, object) in [
+        ("p:viewer", "pr:1"),
+        ("p:viewer", "pr:2"),
+        ("p:other", "pr:secret"),
+    ] {
         sqlx::query(&format!(
             "INSERT INTO {av_tbl} (tenant_id, subject, relation, object_id) \
              VALUES ('acme', $1, 'view', $2)"
@@ -113,7 +117,11 @@ async fn git_d11_pr_list_setexpr_join_one_query_zero_leak_tenant_scoped_revoke_r
         },
         &viewer,
     );
-    assert_eq!(lowered.joins.len(), 1, "the InRelation lowers to ONE JOIN (no N+1)");
+    assert_eq!(
+        lowered.joins.len(),
+        1,
+        "the InRelation lowers to ONE JOIN (no N+1)"
+    );
     // Rebind the lowered JOIN clause onto the suffixed test tables + bind the viewer subject/relation
     // (in production the table names are canonical + the driver binds the params; the SHAPE under test
     // is the lowering's clause verbatim).
@@ -139,9 +147,19 @@ async fn git_d11_pr_list_setexpr_join_one_query_zero_leak_tenant_scoped_revoke_r
 
     // ── 6. PROVE leak-free: exactly the TWO authorized PRs; pr:secret + the cross-tenant PR ABSENT. ──
     let ids: Vec<String> = rows.iter().map(|r| r.get::<String, _>("id")).collect();
-    assert_eq!(ids, vec!["pr:1".to_string(), "pr:2".to_string()], "exactly the 2 visible PRs (0 leak): {ids:?}");
-    assert!(!ids.iter().any(|i| i == "pr:secret"), "0 leak: the confidential PR is ABSENT (the SetExpr JOIN excluded it)");
-    assert!(!ids.iter().any(|i| i == "pr:x"), "0 cross-tenant: the tenant predicate excluded evilcorp's PR");
+    assert_eq!(
+        ids,
+        vec!["pr:1".to_string(), "pr:2".to_string()],
+        "exactly the 2 visible PRs (0 leak): {ids:?}"
+    );
+    assert!(
+        !ids.iter().any(|i| i == "pr:secret"),
+        "0 leak: the confidential PR is ABSENT (the SetExpr JOIN excluded it)"
+    );
+    assert!(
+        !ids.iter().any(|i| i == "pr:x"),
+        "0 cross-tenant: the tenant predicate excluded evilcorp's PR"
+    );
 
     // ── 7. PROVE one query / no post-filter / no N+1: the read is ONE statement (a JOIN), EXPLAIN
     //       confirms a single plan (no correlated per-row check subplan). ─────────────────────────────
@@ -149,9 +167,14 @@ async fn git_d11_pr_list_setexpr_join_one_query_zero_leak_tenant_scoped_revoke_r
         .fetch_all(&admin)
         .await
         .expect("EXPLAIN the PR-list query");
-    let plan_text: String = plan.iter().map(|r| r.get::<String, _>(0)).collect::<Vec<_>>().join("\n");
+    let plan_text: String = plan
+        .iter()
+        .map(|r| r.get::<String, _>(0))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        plan_text.to_lowercase().contains("join") || plan_text.to_lowercase().contains("nested loop"),
+        plan_text.to_lowercase().contains("join")
+            || plan_text.to_lowercase().contains("nested loop"),
         "the read is ONE join query (no per-row check loop): {plan_text}"
     );
 
@@ -163,9 +186,19 @@ async fn git_d11_pr_list_setexpr_join_one_query_zero_leak_tenant_scoped_revoke_r
     .execute(&admin)
     .await
     .expect("revoke view of pr:1");
-    let rows_after = sqlx::query(&list_sql).fetch_all(&admin).await.expect("re-run the list after revoke");
-    let ids_after: Vec<String> = rows_after.iter().map(|r| r.get::<String, _>("id")).collect();
-    assert_eq!(ids_after, vec!["pr:2".to_string()], "the just-revoked pr:1 drops out (revoke reflected): {ids_after:?}");
+    let rows_after = sqlx::query(&list_sql)
+        .fetch_all(&admin)
+        .await
+        .expect("re-run the list after revoke");
+    let ids_after: Vec<String> = rows_after
+        .iter()
+        .map(|r| r.get::<String, _>("id"))
+        .collect();
+    assert_eq!(
+        ids_after,
+        vec!["pr:2".to_string()],
+        "the just-revoked pr:1 drops out (revoke reflected): {ids_after:?}"
+    );
 
     println!(
         "[P-288 INTEGRATION GREEN] GIT-D11 PR-list SetExpr push-down PROVEN against live Postgres: \
@@ -174,6 +207,12 @@ async fn git_d11_pr_list_setexpr_join_one_query_zero_leak_tenant_scoped_revoke_r
     );
 
     // ── 9. Cleanup (forward teardown). ──────────────────────────────────────────────────────────────
-    sqlx::query(&format!("DROP TABLE {pr_tbl}")).execute(&admin).await.unwrap();
-    sqlx::query(&format!("DROP TABLE {av_tbl}")).execute(&admin).await.unwrap();
+    sqlx::query(&format!("DROP TABLE {pr_tbl}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    sqlx::query(&format!("DROP TABLE {av_tbl}"))
+        .execute(&admin)
+        .await
+        .unwrap();
 }

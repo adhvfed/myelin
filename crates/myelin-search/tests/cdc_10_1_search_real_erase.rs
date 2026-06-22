@@ -45,7 +45,11 @@ fn region() -> Region {
     Region(REGION.into())
 }
 fn subject(id: &str) -> SubjectRef {
-    SubjectRef::new(Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant()))
+    SubjectRef::new(Principal::stub(
+        PrincipalId(id.into()),
+        PrincipalKind::Human,
+        tenant(),
+    ))
 }
 
 struct Fetcher {
@@ -98,15 +102,23 @@ fn created_event(doc: &str) -> EventEnvelope {
 fn proj(text: &str, actor_id: &str) -> SearchProjection {
     let mut f = BTreeMap::new();
     f.insert("actor".to_string(), FieldValue::Principal(actor_id.into()));
-    SearchProjection { text: text.into(), fields: f, lang: None }
+    SearchProjection {
+        text: text.into(),
+        fields: f,
+        lang: None,
+    }
 }
 
 /// Build the PROVIDER: a [`SearchEraseHolder`] over a live index holding a doc authored by `u-cdc`.
 fn provider() -> (SearchEraseHolder, Arc<IncrementalIndexer>) {
     let r = "myelin://acme/knowledge/page/cdc";
     let map: std::collections::HashMap<String, SearchProjection> =
-        [(r.to_string(), proj("a page by the subject", "u-cdc"))].into_iter().collect();
-    let fetcher = Arc::new(Fetcher { map: std::sync::Mutex::new(map) });
+        [(r.to_string(), proj("a page by the subject", "u-cdc"))]
+            .into_iter()
+            .collect();
+    let fetcher = Arc::new(Fetcher {
+        map: std::sync::Mutex::new(map),
+    });
     let ix = Arc::new(IncrementalIndexer::new(
         vec![page_spec()],
         fetcher,
@@ -134,13 +146,19 @@ impl<'a> DsrOrchestratorConsumer<'a> {
     fn fan_out_locate(&self, subject: &SubjectRef, tenant: TenantId) -> Vec<LocateReport> {
         self.holders
             .iter()
-            .map(|h| h.locate(subject, tenant.clone()).expect("a Search holder locate succeeds"))
+            .map(|h| {
+                h.locate(subject, tenant.clone())
+                    .expect("a Search holder locate succeeds")
+            })
             .collect()
     }
     fn fan_out_erase(&self, scope: EraseScope) -> Vec<EraseReceipt> {
         self.holders
             .iter()
-            .map(|h| h.erase(scope.clone()).expect("a Search holder erase succeeds"))
+            .map(|h| {
+                h.erase(scope.clone())
+                    .expect("a Search holder erase succeeds")
+            })
             .collect()
     }
 }
@@ -157,26 +175,54 @@ fn dsr_orchestrator_fans_locate_and_real_erase_out_to_the_search_holder() {
 
     // locate: a content-addressed receipt over the located set (the doc referencing the subject).
     let reports = consumer.fan_out_locate(&subj, tenant());
-    assert_eq!(reports.len(), 1, "the Search holder responded to locate via the contract");
+    assert_eq!(
+        reports.len(),
+        1,
+        "the Search holder responded to locate via the contract"
+    );
     assert_eq!(reports[0].receipt.operation, "locate");
-    assert!(reports[0].receipt.content_hash.starts_with("blake3:"), "content-addressed receipt");
-    assert!(reports[0].receipt.key_epoch_destroyed.is_none(), "locate shreds no key");
+    assert!(
+        reports[0].receipt.content_hash.starts_with("blake3:"),
+        "content-addressed receipt"
+    );
+    assert!(
+        reports[0].receipt.key_epoch_destroyed.is_none(),
+        "locate shreds no key"
+    );
 
     // The doc exists before the erase (the provider really holds it).
-    assert_eq!(ix.live_count(&tenant(), &region()), 1, "the subject's doc is indexed before erase");
+    assert_eq!(
+        ix.live_count(&tenant(), &region()),
+        1,
+        "the subject's doc is indexed before erase"
+    );
 
     // erase: the real purge — the doc is GONE after, not hidden; a content-addressed receipt is returned.
-    let receipts = consumer.fan_out_erase(EraseScope::Subject { subject: subj.clone(), tenant: tenant() });
-    assert_eq!(receipts.len(), 1, "the Search holder honoured the erase contract");
+    let receipts = consumer.fan_out_erase(EraseScope::Subject {
+        subject: subj.clone(),
+        tenant: tenant(),
+    });
+    assert_eq!(
+        receipts.len(),
+        1,
+        "the Search holder honoured the erase contract"
+    );
     assert_eq!(receipts[0].receipt.operation, "erase");
-    assert!(receipts[0].receipt.content_hash.starts_with("blake3:"), "content-addressed receipt");
+    assert!(
+        receipts[0].receipt.content_hash.starts_with("blake3:"),
+        "content-addressed receipt"
+    );
     assert!(
         receipts[0].receipt.key_epoch_destroyed.is_none(),
         "a per-subject purge shreds no key (the primary mechanism is purge + reindex, not crypto-shred)"
     );
 
     // The contract is honoured for real: the subject's doc is purged (0 recoverable).
-    assert_eq!(ix.live_count(&tenant(), &region()), 0, "the subject's doc was purged via the contract");
+    assert_eq!(
+        ix.live_count(&tenant(), &region()),
+        0,
+        "the subject's doc was purged via the contract"
+    );
 }
 
 /// **A tenant offboard (`EraseScope::Tenant`) over the real holder is a crypto-shred recording the

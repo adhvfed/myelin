@@ -62,12 +62,26 @@ fn cp_d3_residency_verify_m1_store_set() {
         "the attestation aggregates ALL M1 stores (OLTP/blob/index/KMS) — none silently absent"
     );
     for (class, r) in &attestation.store_regions {
-        assert_eq!(r.as_str(), "fr-par", "store `{}` reported the tenant's region", class.label());
+        assert_eq!(
+            r.as_str(),
+            "fr-par",
+            "store `{}` reported the tenant's region",
+            class.label()
+        );
     }
-    assert!(attestation.signature.starts_with("blake3-mac:"), "the attestation is SIGNED");
-    assert!(attestation.verify(&key), "an auditor verifies the no-global-pool attestation");
+    assert!(
+        attestation.signature.starts_with("blake3-mac:"),
+        "the attestation is SIGNED"
+    );
+    assert!(
+        attestation.verify(&key),
+        "an auditor verifies the no-global-pool attestation"
+    );
     let green = ResidencyAttestationSignal::green(&attestation);
-    assert_eq!(green.region_mismatches, 0, "the green artifact is 0 region mismatches");
+    assert_eq!(
+        green.region_mismatches, 0,
+        "the green artifact is 0 region mismatches"
+    );
 
     // ── RED leg 1: the blob tier served the tenant's data in eu-north (the WRONG region) → the
     //    attestation FAILS (loud, never a silent pass). ──
@@ -84,7 +98,10 @@ fn cp_d3_residency_verify_m1_store_set() {
             store_region: Region::new("eu-north"),
         }
     );
-    assert!(breach.to_string().contains("not a silent pass"), "loud: {breach}");
+    assert!(
+        breach.to_string().contains("not a silent pass"),
+        "loud: {breach}"
+    );
 
     // ── RED leg 2: the KMS never reported its region → the attestation FAILS fail-closed (a
     //    silently-absent store is the global-pool the no-global-pool attestation must catch). ──
@@ -108,7 +125,8 @@ fn cp_d3_residency_verify_m1_store_set() {
     //    the residency-attestation's headline zero is the count of stores in the wrong region. ──
     let mut sig = SignalSource::new();
     sig.set_scalar(SignalName::CrossTenantCount, green.region_mismatches as i64);
-    sig.assert_signal(SignalName::CrossTenantCount, Predicate::Eq(0)).expect_green();
+    sig.assert_signal(SignalName::CrossTenantCount, Predicate::Eq(0))
+        .expect_green();
 
     println!(
         "[P-085 CP-D3 GREEN 2026-06-19] residency_verify over the M1 store set: tenant 01J0ACME \
@@ -136,7 +154,8 @@ fn cp_d3_gate_is_not_vacuous() {
     // A hypothetical residency breach: one store in the wrong region.
     sig.set_scalar(SignalName::CrossTenantCount, 1);
     assert!(
-        !sig.assert_signal(SignalName::CrossTenantCount, Predicate::Eq(0)).is_green(),
+        !sig.assert_signal(SignalName::CrossTenantCount, Predicate::Eq(0))
+            .is_green(),
         "a region mismatch MUST read RED — the residency-attestation zero is a real tripwire"
     );
 }

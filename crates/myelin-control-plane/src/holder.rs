@@ -19,7 +19,7 @@
 
 use myelin_gdpr::{
     DsrError, EraseReceipt, EraseScope, LocateReport, Patch, PersonalDataHolder, PortableBundle,
-    Receipt, RectifyReceipt, Result as DsrResult, RestrictReceipt, SubjectRef, TenantId,
+    Receipt, RectifyReceipt, RestrictReceipt, Result as DsrResult, SubjectRef, TenantId,
 };
 
 /// The PII-free receipt a control-plane DSR op produces: it attests the op ran against the
@@ -196,9 +196,16 @@ mod tests {
     fn cp_d1_registry_leg_zero_personal_columns() {
         let map = control_plane_data_map();
         // Sanity: the map covers the real schema (not a vacuous empty map).
-        assert!(map.len() >= 20, "the data-map covers every registry column ({} found)", map.len());
+        assert!(
+            map.len() >= 20,
+            "the data-map covers every registry column ({} found)",
+            map.len()
+        );
         // EVERY column is is_personal=false — the registry leg of CP-D1.
-        assert!(map.iter().all(|c| !c.is_personal), "control-plane registry must be PII-free");
+        assert!(
+            map.iter().all(|c| !c.is_personal),
+            "control-plane registry must be PII-free"
+        );
         assert_no_personal_columns().expect("0 is_personal=true columns on the control plane");
     }
 
@@ -207,7 +214,12 @@ mod tests {
     #[test]
     fn data_map_covers_all_four_tables() {
         let map = control_plane_data_map();
-        for table in ["cell", "tenant_placement", "cell_provisioning", "local_tenant"] {
+        for table in [
+            "cell",
+            "tenant_placement",
+            "cell_provisioning",
+            "local_tenant",
+        ] {
             assert!(
                 map.iter().any(|c| c.table == table),
                 "the data-map must cover the `{table}` table"
@@ -226,7 +238,11 @@ mod tests {
             is_personal: true,
         });
         let personal: Vec<_> = map.into_iter().filter(|c| c.is_personal).collect();
-        assert_eq!(personal.len(), 1, "a smuggled-in personal column is caught by the data-map");
+        assert_eq!(
+            personal.len(),
+            1,
+            "a smuggled-in personal column is caught by the data-map"
+        );
         assert_eq!(personal[0].column, "admin_email");
     }
 

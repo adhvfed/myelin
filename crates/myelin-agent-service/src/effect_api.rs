@@ -73,8 +73,8 @@
 //!   the BUDGET step reads the reserve balance (11.7); the runaway-loop drill is AG-P14's.
 
 use myelin_agent::{
-    EffectApi, EffectKind, EffectResult, EventId, GateId, ProposedEffect, RunCtx, ToolDef, ToolName,
-    ToolSurface,
+    EffectApi, EffectKind, EffectResult, EventId, GateId, ProposedEffect, RunCtx, ToolDef,
+    ToolName, ToolSurface,
 };
 use myelin_identity::{
     CaveatContext, Consistency, ConsistencyMode, Decision, EffectivePolicy, FieldId, Permission,
@@ -525,9 +525,7 @@ where
         // (3) DELEGATION — agent.policy ∩ delegation ∩ tenant.policy (intersection, never up). The
         //     required caps must be INSIDE the effective policy. A cap the agent's policy allows but
         //     the delegation/tenant forbids (and vice-versa) is confined to the intersection.
-        let policy: EffectivePolicy = self
-            .delegation
-            .delegation(&self.agent, &self.trigger_actor);
+        let policy: EffectivePolicy = self.delegation.delegation(&self.agent, &self.trigger_actor);
         for cap in &def.required_caps {
             if !policy.caveats.iter().any(|c| c == cap) {
                 return PlanVerdict::WouldDeny(
@@ -545,7 +543,10 @@ where
         if !self.tenant.permits(&self.agent, &plan.tool, &plan.object) {
             return PlanVerdict::WouldDeny(
                 PipelineStep::Tenant,
-                format!("tenant guardrails forbid {} on {}", plan.tool.0, plan.object.0),
+                format!(
+                    "tenant guardrails forbid {} on {}",
+                    plan.tool.0, plan.object.0
+                ),
             );
         }
 
@@ -590,7 +591,9 @@ where
 /// AG-P1). The structured [`apply_planned`](PlanThenApply::apply_planned) is the primary entry the
 /// dispatch tier calls; this bridge is the frozen-shape entry the external MCP / a workflow activity
 /// use.
-pub struct EffectApiBridge<'a, S, C, D, T, A, B>(core::cell::RefCell<PlanThenApply<'a, S, C, D, T, A, B>>)
+pub struct EffectApiBridge<'a, S, C, D, T, A, B>(
+    core::cell::RefCell<PlanThenApply<'a, S, C, D, T, A, B>>,
+)
 where
     S: ToolSurface,
     C: CapabilityCheck,
@@ -651,8 +654,8 @@ where
 /// later prompt if a tool ever needs it. The gate it provides is REAL: it forces the AG-D-schema
 /// failures (a wrong-typed / missing-required input is denied at step 1, not silently applied).
 pub fn validate_schema(input_schema: &str, input_json: &str) -> Result<(), String> {
-    let input: serde_json::Value = serde_json::from_str(input_json)
-        .map_err(|e| format!("input is not valid JSON: {e}"))?;
+    let input: serde_json::Value =
+        serde_json::from_str(input_json).map_err(|e| format!("input is not valid JSON: {e}"))?;
     let schema: serde_json::Value = serde_json::from_str(input_schema)
         .map_err(|e| format!("tool input_schema is not valid JSON: {e}"))?;
 
@@ -770,7 +773,10 @@ pub fn decode_proposed(effect: &ProposedEffect) -> Result<PlannedEffect, String>
             // intern the known dimensions; an unknown unit is denied (a cost dimension is frozen).
             "unit" => unit = Some(intern_unit(val)?),
             "wholesale" => {
-                wholesale = Some(val.parse::<u64>().map_err(|e| format!("bad wholesale: {e}"))?)
+                wholesale = Some(
+                    val.parse::<u64>()
+                        .map_err(|e| format!("bad wholesale: {e}"))?,
+                )
             }
             "markup" => markup = Some(val.parse::<u64>().map_err(|e| format!("bad markup: {e}"))?),
             "input" => input = Some(val.to_string()),
@@ -947,7 +953,9 @@ mod tests {
             name: ToolName(name.into()),
             subsystem: "issues".into(),
             version: 1,
-            input_schema: r#"{"type":"object","required":["title"],"properties":{"title":{"type":"string"}}}"#.into(),
+            input_schema:
+                r#"{"type":"object","required":["title"],"properties":{"title":{"type":"string"}}}"#
+                    .into(),
             required_caps: caps.iter().map(|c| c.to_string()).collect(),
             effect_kind: kind,
             side_effecting: true,
@@ -1013,29 +1021,67 @@ mod tests {
     #[test]
     fn pipeline_applies_an_allowed_effect_and_meters_it() {
         let cat = Catalogue {
-            defs: vec![tool_def("issue.create", &["issue.write"], false, EffectKind::Mutate)],
+            defs: vec![tool_def(
+                "issue.create",
+                &["issue.write"],
+                false,
+                EffectKind::Mutate,
+            )],
         };
         let check = allow_caps(&["issue.write"]);
-        let del = Delegator { policy: vec!["issue.write".into()] };
-        let tenant = Tenant { forbid: BTreeSet::new() };
-        let endpoint = Endpoint { fail: false, applied: RefCell::new(vec![]) };
-        let mut budget = Budget { remaining: 100, billed: 0, settles: 0 };
+        let del = Delegator {
+            policy: vec!["issue.write".into()],
+        };
+        let tenant = Tenant {
+            forbid: BTreeSet::new(),
+        };
+        let endpoint = Endpoint {
+            fail: false,
+            applied: RefCell::new(vec![]),
+        };
+        let mut budget = Budget {
+            remaining: 100,
+            billed: 0,
+            settles: 0,
+        };
         let mut signals = PipelineSignals::new();
-        let mut p = pipeline(&cat, &check, &del, &tenant, &endpoint, &mut budget, BTreeSet::new(), &mut signals);
+        let mut p = pipeline(
+            &cat,
+            &check,
+            &del,
+            &tenant,
+            &endpoint,
+            &mut budget,
+            BTreeSet::new(),
+            &mut signals,
+        );
 
         let out = p.apply_planned(&plan("issue.create", r#"{"title":"bug"}"#));
-        assert!(matches!(out, EffectResult::Applied(EventId(ref id)) if id == "evt:issue.create:myelin://acme/issues/i-1"));
+        assert!(
+            matches!(out, EffectResult::Applied(EventId(ref id)) if id == "evt:issue.create:myelin://acme/issues/i-1")
+        );
 
         // the mutation went through the subsystem's PUBLIC endpoint (the ONLY mutation path).
-        assert_eq!(endpoint.applied.borrow().len(), 1, "exactly one apply via the public endpoint");
+        assert_eq!(
+            endpoint.applied.borrow().len(),
+            1,
+            "exactly one apply via the public endpoint"
+        );
         // the meter settled exactly one cost event (wholesale 3 + markup 1 = 4).
-        assert_eq!(budget.settles, 1, "exactly one cost event settled (the METER step)");
+        assert_eq!(
+            budget.settles, 1,
+            "exactly one cost event settled (the METER step)"
+        );
         assert_eq!(budget.billed, 4, "billed wholesale 3 + markup 1");
         assert_eq!(budget.remaining, 96, "the reserve debited the bill");
         assert_eq!(signals.applied(), 1);
         assert_eq!(signals.metered_total(), 4);
         assert_eq!(signals.denied(), 0);
-        assert_eq!(signals.privileged_fallback(), 0, "AG-D2: NO privileged fallback EVER fires");
+        assert_eq!(
+            signals.privileged_fallback(),
+            0,
+            "AG-D2: NO privileged fallback EVER fires"
+        );
     }
 
     // ───────────────────────── step-by-step DENY legs (each step forces its failure) ─────────
@@ -1043,21 +1089,59 @@ mod tests {
     /// **Step 1 (SCHEMA) — a malformed input (missing the required `title`) is Denied; 0 mutation.**
     #[test]
     fn step1_schema_reject_denies_before_any_mutation() {
-        let cat = Catalogue { defs: vec![tool_def("issue.create", &["issue.write"], false, EffectKind::Mutate)] };
+        let cat = Catalogue {
+            defs: vec![tool_def(
+                "issue.create",
+                &["issue.write"],
+                false,
+                EffectKind::Mutate,
+            )],
+        };
         let check = allow_caps(&["issue.write"]);
-        let del = Delegator { policy: vec!["issue.write".into()] };
-        let tenant = Tenant { forbid: BTreeSet::new() };
-        let endpoint = Endpoint { fail: false, applied: RefCell::new(vec![]) };
-        let mut budget = Budget { remaining: 100, billed: 0, settles: 0 };
+        let del = Delegator {
+            policy: vec!["issue.write".into()],
+        };
+        let tenant = Tenant {
+            forbid: BTreeSet::new(),
+        };
+        let endpoint = Endpoint {
+            fail: false,
+            applied: RefCell::new(vec![]),
+        };
+        let mut budget = Budget {
+            remaining: 100,
+            billed: 0,
+            settles: 0,
+        };
         let mut signals = PipelineSignals::new();
-        let mut p = pipeline(&cat, &check, &del, &tenant, &endpoint, &mut budget, BTreeSet::new(), &mut signals);
+        let mut p = pipeline(
+            &cat,
+            &check,
+            &del,
+            &tenant,
+            &endpoint,
+            &mut budget,
+            BTreeSet::new(),
+            &mut signals,
+        );
 
         // input missing the required `title` field → Denied at step 1.
         let out = p.apply_planned(&plan("issue.create", r#"{"body":"x"}"#));
-        assert!(matches!(out, EffectResult::Denied(ref r) if r.contains("title")), "{out:?}");
-        assert_eq!(endpoint.applied.borrow().len(), 0, "schema reject → 0 mutation");
+        assert!(
+            matches!(out, EffectResult::Denied(ref r) if r.contains("title")),
+            "{out:?}"
+        );
+        assert_eq!(
+            endpoint.applied.borrow().len(),
+            0,
+            "schema reject → 0 mutation"
+        );
         assert_eq!(budget.settles, 0, "a denied effect is never metered");
-        assert_eq!(signals.denied(), 1, "the denial counter incremented (AG-D2)");
+        assert_eq!(
+            signals.denied(),
+            1,
+            "the denial counter incremented (AG-D2)"
+        );
         assert_eq!(signals.privileged_fallback(), 0);
     }
 
@@ -1065,140 +1149,387 @@ mod tests {
     /// transition ABAC: an SLA-bound transition with no approver context → Conditional → Denied.**
     #[test]
     fn step2_capability_deny_and_caveat_conditional_deny() {
-        let cat = Catalogue { defs: vec![tool_def("issue.transition", &["issue.transition"], false, EffectKind::Mutate)] };
+        let cat = Catalogue {
+            defs: vec![tool_def(
+                "issue.transition",
+                &["issue.transition"],
+                false,
+                EffectKind::Mutate,
+            )],
+        };
         // the cap is NOT allowed → Deny at step 2.
         let check = allow_caps(&[]);
-        let del = Delegator { policy: vec!["issue.transition".into()] };
-        let tenant = Tenant { forbid: BTreeSet::new() };
-        let endpoint = Endpoint { fail: false, applied: RefCell::new(vec![]) };
-        let mut budget = Budget { remaining: 100, billed: 0, settles: 0 };
+        let del = Delegator {
+            policy: vec!["issue.transition".into()],
+        };
+        let tenant = Tenant {
+            forbid: BTreeSet::new(),
+        };
+        let endpoint = Endpoint {
+            fail: false,
+            applied: RefCell::new(vec![]),
+        };
+        let mut budget = Budget {
+            remaining: 100,
+            billed: 0,
+            settles: 0,
+        };
         let mut signals = PipelineSignals::new();
         {
-            let mut p = pipeline(&cat, &check, &del, &tenant, &endpoint, &mut budget, BTreeSet::new(), &mut signals);
+            let mut p = pipeline(
+                &cat,
+                &check,
+                &del,
+                &tenant,
+                &endpoint,
+                &mut budget,
+                BTreeSet::new(),
+                &mut signals,
+            );
             let out = p.apply_planned(&plan("issue.transition", r#"{"title":"x"}"#));
-            assert!(matches!(out, EffectResult::Denied(ref r) if r.contains("capability")), "{out:?}");
+            assert!(
+                matches!(out, EffectResult::Denied(ref r) if r.contains("capability")),
+                "{out:?}"
+            );
         }
-        assert_eq!(endpoint.applied.borrow().len(), 0, "capability deny → 0 mutation");
+        assert_eq!(
+            endpoint.applied.borrow().len(),
+            0,
+            "capability deny → 0 mutation"
+        );
 
         // the OQ-E leg: the cap is allowed in general, but an SLA-bound transition caveat → Conditional → deny.
         let check2 = Checker {
             allow: ["issue.transition".to_string()].into_iter().collect(),
             conditional_on_transition: ["issue.transition".to_string()].into_iter().collect(),
         };
-        let mut budget2 = Budget { remaining: 100, billed: 0, settles: 0 };
+        let mut budget2 = Budget {
+            remaining: 100,
+            billed: 0,
+            settles: 0,
+        };
         let mut signals2 = PipelineSignals::new();
-        let mut p2 = pipeline(&cat, &check2, &del, &tenant, &endpoint, &mut budget2, BTreeSet::new(), &mut signals2);
+        let mut p2 = pipeline(
+            &cat,
+            &check2,
+            &del,
+            &tenant,
+            &endpoint,
+            &mut budget2,
+            BTreeSet::new(),
+            &mut signals2,
+        );
         let mut plan_t = plan("issue.transition", r#"{"title":"x"}"#);
         plan_t.transition = Some(TransitionId("to_done".into()));
         let out = p2.apply_planned(&plan_t);
-        assert!(matches!(out, EffectResult::Denied(_)), "Conditional (caveat unmet) is a DENY, never a silent allow: {out:?}");
-        assert_eq!(endpoint.applied.borrow().len(), 0, "the SLA-bound transition did NOT mutate");
+        assert!(
+            matches!(out, EffectResult::Denied(_)),
+            "Conditional (caveat unmet) is a DENY, never a silent allow: {out:?}"
+        );
+        assert_eq!(
+            endpoint.applied.borrow().len(),
+            0,
+            "the SLA-bound transition did NOT mutate"
+        );
     }
 
     /// **Step 3 (DELEGATION) — a cap the agent's `check` allows but the delegation ∩ FORBIDS is
     /// confined to the intersection → Denied (over-privilege blocked; AG-D3).**
     #[test]
     fn step3_delegation_intersection_confines_over_privilege() {
-        let cat = Catalogue { defs: vec![tool_def("issue.delete", &["issue.delete"], false, EffectKind::Mutate)] };
+        let cat = Catalogue {
+            defs: vec![tool_def(
+                "issue.delete",
+                &["issue.delete"],
+                false,
+                EffectKind::Mutate,
+            )],
+        };
         // check ALLOWS issue.delete (the agent.policy term), but the delegation ∩ does NOT grant it.
         let check = allow_caps(&["issue.delete"]);
-        let del = Delegator { policy: vec!["issue.write".into()] }; // delegation lacks issue.delete.
-        let tenant = Tenant { forbid: BTreeSet::new() };
-        let endpoint = Endpoint { fail: false, applied: RefCell::new(vec![]) };
-        let mut budget = Budget { remaining: 100, billed: 0, settles: 0 };
+        let del = Delegator {
+            policy: vec!["issue.write".into()],
+        }; // delegation lacks issue.delete.
+        let tenant = Tenant {
+            forbid: BTreeSet::new(),
+        };
+        let endpoint = Endpoint {
+            fail: false,
+            applied: RefCell::new(vec![]),
+        };
+        let mut budget = Budget {
+            remaining: 100,
+            billed: 0,
+            settles: 0,
+        };
         let mut signals = PipelineSignals::new();
-        let mut p = pipeline(&cat, &check, &del, &tenant, &endpoint, &mut budget, BTreeSet::new(), &mut signals);
+        let mut p = pipeline(
+            &cat,
+            &check,
+            &del,
+            &tenant,
+            &endpoint,
+            &mut budget,
+            BTreeSet::new(),
+            &mut signals,
+        );
 
         let out = p.apply_planned(&plan("issue.delete", r#"{"title":"x"}"#));
-        assert!(matches!(out, EffectResult::Denied(ref r) if r.contains("intersection")), "{out:?}");
-        assert_eq!(endpoint.applied.borrow().len(), 0, "over-privilege confined → 0 mutation (AG-D3)");
+        assert!(
+            matches!(out, EffectResult::Denied(ref r) if r.contains("intersection")),
+            "{out:?}"
+        );
+        assert_eq!(
+            endpoint.applied.borrow().len(),
+            0,
+            "over-privilege confined → 0 mutation (AG-D3)"
+        );
         assert_eq!(signals.denied(), 1);
     }
 
     /// **Step 4 (TENANT) — the tenant guardrails forbid the tool → Denied; 0 mutation.**
     #[test]
     fn step4_tenant_guard_denies() {
-        let cat = Catalogue { defs: vec![tool_def("issue.create", &["issue.write"], false, EffectKind::Mutate)] };
+        let cat = Catalogue {
+            defs: vec![tool_def(
+                "issue.create",
+                &["issue.write"],
+                false,
+                EffectKind::Mutate,
+            )],
+        };
         let check = allow_caps(&["issue.write"]);
-        let del = Delegator { policy: vec!["issue.write".into()] };
-        let tenant = Tenant { forbid: ["issue.create".to_string()].into_iter().collect() };
-        let endpoint = Endpoint { fail: false, applied: RefCell::new(vec![]) };
-        let mut budget = Budget { remaining: 100, billed: 0, settles: 0 };
+        let del = Delegator {
+            policy: vec!["issue.write".into()],
+        };
+        let tenant = Tenant {
+            forbid: ["issue.create".to_string()].into_iter().collect(),
+        };
+        let endpoint = Endpoint {
+            fail: false,
+            applied: RefCell::new(vec![]),
+        };
+        let mut budget = Budget {
+            remaining: 100,
+            billed: 0,
+            settles: 0,
+        };
         let mut signals = PipelineSignals::new();
-        let mut p = pipeline(&cat, &check, &del, &tenant, &endpoint, &mut budget, BTreeSet::new(), &mut signals);
+        let mut p = pipeline(
+            &cat,
+            &check,
+            &del,
+            &tenant,
+            &endpoint,
+            &mut budget,
+            BTreeSet::new(),
+            &mut signals,
+        );
 
         let out = p.apply_planned(&plan("issue.create", r#"{"title":"x"}"#));
-        assert!(matches!(out, EffectResult::Denied(ref r) if r.contains("tenant")), "{out:?}");
-        assert_eq!(endpoint.applied.borrow().len(), 0, "tenant deny → 0 mutation");
+        assert!(
+            matches!(out, EffectResult::Denied(ref r) if r.contains("tenant")),
+            "{out:?}"
+        );
+        assert_eq!(
+            endpoint.applied.borrow().len(),
+            0,
+            "tenant deny → 0 mutation"
+        );
     }
 
     /// **Step 5 (BUDGET) — an exhausted reserve refuses the effect → Denied; 0 mutation; NO
     /// privileged fallback (AG-5/AG-D2).**
     #[test]
     fn step5_budget_refusal_denies_with_no_fallback() {
-        let cat = Catalogue { defs: vec![tool_def("issue.create", &["issue.write"], false, EffectKind::Mutate)] };
+        let cat = Catalogue {
+            defs: vec![tool_def(
+                "issue.create",
+                &["issue.write"],
+                false,
+                EffectKind::Mutate,
+            )],
+        };
         let check = allow_caps(&["issue.write"]);
-        let del = Delegator { policy: vec!["issue.write".into()] };
-        let tenant = Tenant { forbid: BTreeSet::new() };
-        let endpoint = Endpoint { fail: false, applied: RefCell::new(vec![]) };
-        let mut budget = Budget { remaining: 1, billed: 0, settles: 0 }; // < cost (4).
+        let del = Delegator {
+            policy: vec!["issue.write".into()],
+        };
+        let tenant = Tenant {
+            forbid: BTreeSet::new(),
+        };
+        let endpoint = Endpoint {
+            fail: false,
+            applied: RefCell::new(vec![]),
+        };
+        let mut budget = Budget {
+            remaining: 1,
+            billed: 0,
+            settles: 0,
+        }; // < cost (4).
         let mut signals = PipelineSignals::new();
-        let mut p = pipeline(&cat, &check, &del, &tenant, &endpoint, &mut budget, BTreeSet::new(), &mut signals);
+        let mut p = pipeline(
+            &cat,
+            &check,
+            &del,
+            &tenant,
+            &endpoint,
+            &mut budget,
+            BTreeSet::new(),
+            &mut signals,
+        );
 
         let out = p.apply_planned(&plan("issue.create", r#"{"title":"x"}"#));
-        assert!(matches!(out, EffectResult::Denied(ref r) if r.contains("balance")), "{out:?}");
-        assert_eq!(endpoint.applied.borrow().len(), 0, "no balance → no mutation");
+        assert!(
+            matches!(out, EffectResult::Denied(ref r) if r.contains("balance")),
+            "{out:?}"
+        );
+        assert_eq!(
+            endpoint.applied.borrow().len(),
+            0,
+            "no balance → no mutation"
+        );
         assert_eq!(budget.settles, 0, "a budget-denied effect is never metered");
-        assert_eq!(signals.privileged_fallback(), 0, "AG-D2: 0 privileged fallback");
+        assert_eq!(
+            signals.privileged_fallback(),
+            0,
+            "AG-D2: 0 privileged fallback"
+        );
     }
 
     /// **Step 6 (HITL GATE) — a `requires_approval` tool not yet approved → Gated; the tool does NOT
     /// mutate (AG-8). Once approved → it Applies.**
     #[test]
     fn step6_hitl_gate_withholds_then_resumes() {
-        let cat = Catalogue { defs: vec![tool_def("git.merge", &["git.merge"], true, EffectKind::Mutate)] };
+        let cat = Catalogue {
+            defs: vec![tool_def(
+                "git.merge",
+                &["git.merge"],
+                true,
+                EffectKind::Mutate,
+            )],
+        };
         let check = allow_caps(&["git.merge"]);
-        let del = Delegator { policy: vec!["git.merge".into()] };
-        let tenant = Tenant { forbid: BTreeSet::new() };
-        let endpoint = Endpoint { fail: false, applied: RefCell::new(vec![]) };
+        let del = Delegator {
+            policy: vec!["git.merge".into()],
+        };
+        let tenant = Tenant {
+            forbid: BTreeSet::new(),
+        };
+        let endpoint = Endpoint {
+            fail: false,
+            applied: RefCell::new(vec![]),
+        };
 
         // not yet approved → Gated (no mutation).
-        let mut budget = Budget { remaining: 100, billed: 0, settles: 0 };
+        let mut budget = Budget {
+            remaining: 100,
+            billed: 0,
+            settles: 0,
+        };
         let mut signals = PipelineSignals::new();
         {
-            let mut p = pipeline(&cat, &check, &del, &tenant, &endpoint, &mut budget, BTreeSet::new(), &mut signals);
+            let mut p = pipeline(
+                &cat,
+                &check,
+                &del,
+                &tenant,
+                &endpoint,
+                &mut budget,
+                BTreeSet::new(),
+                &mut signals,
+            );
             let out = p.apply_planned(&plan("git.merge", r#"{"title":"x"}"#));
-            assert!(matches!(out, EffectResult::Gated(GateId(ref g)) if g.starts_with("gate:git.merge")), "{out:?}");
+            assert!(
+                matches!(out, EffectResult::Gated(GateId(ref g)) if g.starts_with("gate:git.merge")),
+                "{out:?}"
+            );
         }
-        assert_eq!(endpoint.applied.borrow().len(), 0, "a gated effect does NOT mutate (AG-8)");
-        assert_eq!(budget.settles, 0, "a gated effect is never metered (it didn't apply)");
+        assert_eq!(
+            endpoint.applied.borrow().len(),
+            0,
+            "a gated effect does NOT mutate (AG-8)"
+        );
+        assert_eq!(
+            budget.settles, 0,
+            "a gated effect is never metered (it didn't apply)"
+        );
         assert_eq!(signals.gated(), 1);
 
         // approved (the HITL resume, AG-P9, adds the tool name to `approved`) → Applies.
-        let mut budget2 = Budget { remaining: 100, billed: 0, settles: 0 };
+        let mut budget2 = Budget {
+            remaining: 100,
+            billed: 0,
+            settles: 0,
+        };
         let mut signals2 = PipelineSignals::new();
         let approved: BTreeSet<String> = ["git.merge".to_string()].into_iter().collect();
-        let mut p2 = pipeline(&cat, &check, &del, &tenant, &endpoint, &mut budget2, approved, &mut signals2);
+        let mut p2 = pipeline(
+            &cat,
+            &check,
+            &del,
+            &tenant,
+            &endpoint,
+            &mut budget2,
+            approved,
+            &mut signals2,
+        );
         let out = p2.apply_planned(&plan("git.merge", r#"{"title":"x"}"#));
-        assert!(matches!(out, EffectResult::Applied(_)), "an approved gated effect Applies: {out:?}");
-        assert_eq!(endpoint.applied.borrow().len(), 1, "the approved effect mutated once");
+        assert!(
+            matches!(out, EffectResult::Applied(_)),
+            "an approved gated effect Applies: {out:?}"
+        );
+        assert_eq!(
+            endpoint.applied.borrow().len(),
+            1,
+            "the approved effect mutated once"
+        );
     }
 
     /// **Step 7 (APPLY) — a subsystem endpoint failure is surfaced LOUD as Denied; the effect is NOT
     /// metered (a failed apply refunds the reserve; the meter settles only an applied effect).**
     #[test]
     fn step7_apply_failure_is_loud_and_unmetered() {
-        let cat = Catalogue { defs: vec![tool_def("issue.create", &["issue.write"], false, EffectKind::Mutate)] };
+        let cat = Catalogue {
+            defs: vec![tool_def(
+                "issue.create",
+                &["issue.write"],
+                false,
+                EffectKind::Mutate,
+            )],
+        };
         let check = allow_caps(&["issue.write"]);
-        let del = Delegator { policy: vec!["issue.write".into()] };
-        let tenant = Tenant { forbid: BTreeSet::new() };
-        let endpoint = Endpoint { fail: true, applied: RefCell::new(vec![]) }; // the endpoint errors.
-        let mut budget = Budget { remaining: 100, billed: 0, settles: 0 };
+        let del = Delegator {
+            policy: vec!["issue.write".into()],
+        };
+        let tenant = Tenant {
+            forbid: BTreeSet::new(),
+        };
+        let endpoint = Endpoint {
+            fail: true,
+            applied: RefCell::new(vec![]),
+        }; // the endpoint errors.
+        let mut budget = Budget {
+            remaining: 100,
+            billed: 0,
+            settles: 0,
+        };
         let mut signals = PipelineSignals::new();
-        let mut p = pipeline(&cat, &check, &del, &tenant, &endpoint, &mut budget, BTreeSet::new(), &mut signals);
+        let mut p = pipeline(
+            &cat,
+            &check,
+            &del,
+            &tenant,
+            &endpoint,
+            &mut budget,
+            BTreeSet::new(),
+            &mut signals,
+        );
 
         let out = p.apply_planned(&plan("issue.create", r#"{"title":"x"}"#));
-        assert!(matches!(out, EffectResult::Denied(ref r) if r.contains("apply failed")), "{out:?}");
+        assert!(
+            matches!(out, EffectResult::Denied(ref r) if r.contains("apply failed")),
+            "{out:?}"
+        );
         assert_eq!(budget.settles, 0, "a failed apply is NOT metered");
         assert_eq!(signals.applied(), 0);
         assert_eq!(signals.denied(), 1);
@@ -1218,24 +1549,58 @@ mod tests {
         };
         let check = allow_caps(&["issue.write", "issue.delete"]);
         // delegation grants write but NOT delete → the delete is confined out of the intersection.
-        let del = Delegator { policy: vec!["issue.write".into()] };
-        let tenant = Tenant { forbid: BTreeSet::new() };
-        let endpoint = Endpoint { fail: false, applied: RefCell::new(vec![]) };
-        let mut budget = Budget { remaining: 100, billed: 0, settles: 0 };
+        let del = Delegator {
+            policy: vec!["issue.write".into()],
+        };
+        let tenant = Tenant {
+            forbid: BTreeSet::new(),
+        };
+        let endpoint = Endpoint {
+            fail: false,
+            applied: RefCell::new(vec![]),
+        };
+        let mut budget = Budget {
+            remaining: 100,
+            billed: 0,
+            settles: 0,
+        };
         let mut signals = PipelineSignals::new();
-        let mut p = pipeline(&cat, &check, &del, &tenant, &endpoint, &mut budget, BTreeSet::new(), &mut signals);
+        let mut p = pipeline(
+            &cat,
+            &check,
+            &del,
+            &tenant,
+            &endpoint,
+            &mut budget,
+            BTreeSet::new(),
+            &mut signals,
+        );
 
         // effect 1: allowed → Applied + metered.
         let a = p.apply_planned(&plan("issue.create", r#"{"title":"new"}"#));
-        assert!(matches!(a, EffectResult::Applied(_)), "the allowed effect applies: {a:?}");
+        assert!(
+            matches!(a, EffectResult::Applied(_)),
+            "the allowed effect applies: {a:?}"
+        );
         // effect 2: disallowed (over-privilege) → Denied, in the SAME session.
         let d = p.apply_planned(&plan("issue.delete", r#"{"title":"x"}"#));
-        assert!(matches!(d, EffectResult::Denied(_)), "the disallowed effect is denied: {d:?}");
+        assert!(
+            matches!(d, EffectResult::Denied(_)),
+            "the disallowed effect is denied: {d:?}"
+        );
 
         assert_eq!(signals.applied(), 1, "exactly one applied");
         assert_eq!(signals.denied(), 1, "exactly one denied");
-        assert_eq!(endpoint.applied.borrow().len(), 1, "exactly one mutation reached a subsystem");
-        assert_eq!(signals.privileged_fallback(), 0, "AG-D2: 0 privileged fallback across the session");
+        assert_eq!(
+            endpoint.applied.borrow().len(),
+            1,
+            "exactly one mutation reached a subsystem"
+        );
+        assert_eq!(
+            signals.privileged_fallback(),
+            0,
+            "AG-D2: 0 privileged fallback across the session"
+        );
     }
 
     // ───────────────────────── the glue EffectApi (8.2) bridge via the opaque carrier ───────────
@@ -1245,23 +1610,59 @@ mod tests {
     /// pipeline; a malformed carrier is Denied.
     #[test]
     fn glue_effect_api_bridge_round_trips_the_carrier() {
-        let cat = Catalogue { defs: vec![tool_def("issue.create", &["issue.write"], false, EffectKind::Mutate)] };
+        let cat = Catalogue {
+            defs: vec![tool_def(
+                "issue.create",
+                &["issue.write"],
+                false,
+                EffectKind::Mutate,
+            )],
+        };
         let check = allow_caps(&["issue.write"]);
-        let del = Delegator { policy: vec!["issue.write".into()] };
-        let tenant = Tenant { forbid: BTreeSet::new() };
-        let endpoint = Endpoint { fail: false, applied: RefCell::new(vec![]) };
-        let mut budget = Budget { remaining: 100, billed: 0, settles: 0 };
+        let del = Delegator {
+            policy: vec!["issue.write".into()],
+        };
+        let tenant = Tenant {
+            forbid: BTreeSet::new(),
+        };
+        let endpoint = Endpoint {
+            fail: false,
+            applied: RefCell::new(vec![]),
+        };
+        let mut budget = Budget {
+            remaining: 100,
+            billed: 0,
+            settles: 0,
+        };
         let mut signals = PipelineSignals::new();
-        let p = pipeline(&cat, &check, &del, &tenant, &endpoint, &mut budget, BTreeSet::new(), &mut signals);
+        let p = pipeline(
+            &cat,
+            &check,
+            &del,
+            &tenant,
+            &endpoint,
+            &mut budget,
+            BTreeSet::new(),
+            &mut signals,
+        );
         let bridge = EffectApiBridge::new(p);
 
         let carrier = encode_proposed(&plan("issue.create", r#"{"title":"x"}"#));
         let out = bridge.apply(&RunCtx::default(), carrier);
-        assert!(matches!(out, EffectResult::Applied(_)), "the glue bridge applies: {out:?}");
+        assert!(
+            matches!(out, EffectResult::Applied(_)),
+            "the glue bridge applies: {out:?}"
+        );
 
         // a malformed carrier is Denied (fail-closed).
-        let bad = bridge.apply(&RunCtx::default(), ProposedEffect("garbage-no-fields".into()));
-        assert!(matches!(bad, EffectResult::Denied(ref r) if r.contains("malformed")), "{bad:?}");
+        let bad = bridge.apply(
+            &RunCtx::default(),
+            ProposedEffect("garbage-no-fields".into()),
+        );
+        assert!(
+            matches!(bad, EffectResult::Denied(ref r) if r.contains("malformed")),
+            "{bad:?}"
+        );
     }
 
     /// **`encode_proposed`/`decode_proposed` round-trip is exact + deterministic (the AG-P8
@@ -1274,7 +1675,10 @@ mod tests {
         original.transition = Some(TransitionId("to_done".into()));
         let c1 = encode_proposed(&original);
         let c2 = encode_proposed(&original);
-        assert_eq!(c1, c2, "the encoding is deterministic (byte-identical across calls)");
+        assert_eq!(
+            c1, c2,
+            "the encoding is deterministic (byte-identical across calls)"
+        );
         let back = decode_proposed(&c1).expect("round-trips");
         assert_eq!(back, original, "decode is the exact inverse of encode");
     }
@@ -1287,23 +1691,72 @@ mod tests {
     #[test]
     fn schema_validator_forces_each_failure() {
         let schema = r#"{"type":"object","required":["title"],"properties":{"title":{"type":"string"},"count":{"type":"integer"}}}"#;
-        assert!(validate_schema(schema, r#"{"title":"ok"}"#).is_ok(), "a valid input passes");
-        assert!(validate_schema(schema, r#"{"title":"ok","count":3}"#).is_ok(), "a typed optional field passes");
-        assert!(validate_schema(schema, r#"{"count":3}"#).is_err(), "a missing required field is rejected");
-        assert!(validate_schema(schema, r#"{"title":5}"#).is_err(), "a mistyped required field is rejected");
-        assert!(validate_schema(schema, r#"{"title":"ok","count":"x"}"#).is_err(), "a mistyped optional field is rejected");
-        assert!(validate_schema(schema, r#"[1,2,3]"#).is_err(), "a non-object input under a type:object schema is rejected");
-        assert!(validate_schema(schema, r#"not json"#).is_err(), "a non-JSON input is rejected");
+        assert!(
+            validate_schema(schema, r#"{"title":"ok"}"#).is_ok(),
+            "a valid input passes"
+        );
+        assert!(
+            validate_schema(schema, r#"{"title":"ok","count":3}"#).is_ok(),
+            "a typed optional field passes"
+        );
+        assert!(
+            validate_schema(schema, r#"{"count":3}"#).is_err(),
+            "a missing required field is rejected"
+        );
+        assert!(
+            validate_schema(schema, r#"{"title":5}"#).is_err(),
+            "a mistyped required field is rejected"
+        );
+        assert!(
+            validate_schema(schema, r#"{"title":"ok","count":"x"}"#).is_err(),
+            "a mistyped optional field is rejected"
+        );
+        assert!(
+            validate_schema(schema, r#"[1,2,3]"#).is_err(),
+            "a non-object input under a type:object schema is rejected"
+        );
+        assert!(
+            validate_schema(schema, r#"not json"#).is_err(),
+            "a non-JSON input is rejected"
+        );
         // an empty schema admits any valid JSON.
-        assert!(validate_schema("{}", r#"{"anything":true}"#).is_ok(), "an empty schema admits any valid JSON");
+        assert!(
+            validate_schema("{}", r#"{"anything":true}"#).is_ok(),
+            "an empty schema admits any valid JSON"
+        );
     }
 
     /// **`EffectCost::total` is saturating + exact (mutation-floor — a cost never silently wraps).**
     #[test]
     fn effect_cost_total_is_saturating_and_exact() {
-        assert_eq!(EffectCost { unit: "x", wholesale: 3, markup: 1 }.total(), 4);
-        assert_eq!(EffectCost { unit: "x", wholesale: u64::MAX, markup: 1 }.total(), u64::MAX, "saturates, never wraps");
-        assert_eq!(EffectCost { unit: "x", wholesale: 0, markup: 0 }.total(), 0);
+        assert_eq!(
+            EffectCost {
+                unit: "x",
+                wholesale: 3,
+                markup: 1
+            }
+            .total(),
+            4
+        );
+        assert_eq!(
+            EffectCost {
+                unit: "x",
+                wholesale: u64::MAX,
+                markup: 1
+            }
+            .total(),
+            u64::MAX,
+            "saturates, never wraps"
+        );
+        assert_eq!(
+            EffectCost {
+                unit: "x",
+                wholesale: 0,
+                markup: 0
+            }
+            .total(),
+            0
+        );
     }
 
     /// **The `PipelineSignals` accessors are exact (mutation-floor — the signals ARE the AG-D2 green
@@ -1324,7 +1777,11 @@ mod tests {
         assert_eq!(s.denied(), 3, "denied returns its field");
         assert_eq!(s.gated(), 4, "gated returns its field");
         assert_eq!(s.metered_total(), 11, "metered_total returns its field");
-        assert_eq!(s.privileged_fallback(), 0, "privileged_fallback is ALWAYS 0 (no fallback path)");
+        assert_eq!(
+            s.privileged_fallback(),
+            0,
+            "privileged_fallback is ALWAYS 0 (no fallback path)"
+        );
     }
 
     /// **`intern_unit` rejects an unknown metered-unit dimension (fail-closed — a cost is never
@@ -1332,7 +1789,10 @@ mod tests {
     #[test]
     fn intern_unit_rejects_unknown_dimension() {
         assert_eq!(intern_unit("issue.transition").unwrap(), "issue.transition");
-        assert!(intern_unit("made.up.unit").is_err(), "an unknown dimension is rejected");
+        assert!(
+            intern_unit("made.up.unit").is_err(),
+            "an unknown dimension is rejected"
+        );
     }
 
     /// **A bare `type:object` schema (no `required`/`properties`) rejects a non-object input at the
@@ -1342,11 +1802,20 @@ mod tests {
     #[test]
     fn bare_type_object_schema_rejects_non_object_input() {
         let schema = r#"{"type":"object"}"#;
-        assert!(validate_schema(schema, r#"{"any":1}"#).is_ok(), "a type:object schema admits an object");
-        assert!(validate_schema(schema, r#"[1,2,3]"#).is_err(), "a type:object schema rejects an array (line-604 check)");
+        assert!(
+            validate_schema(schema, r#"{"any":1}"#).is_ok(),
+            "a type:object schema admits an object"
+        );
+        assert!(
+            validate_schema(schema, r#"[1,2,3]"#).is_err(),
+            "a type:object schema rejects an array (line-604 check)"
+        );
         // a NON-object schema (no type:object) admits anything — proves the `Some(\"object\")` arm is exact.
         let no_type = r#"{"description":"free"}"#;
-        assert!(validate_schema(no_type, r#"[1,2,3]"#).is_ok(), "a schema without type:object admits an array");
+        assert!(
+            validate_schema(no_type, r#"[1,2,3]"#).is_ok(),
+            "a schema without type:object admits an array"
+        );
     }
 
     /// **`json_type_matches` is exact across EVERY primitive type (kills the per-arm delete + the
@@ -1363,15 +1832,39 @@ mod tests {
         assert!(json_type_matches("integer", &json!(7)));
         assert!(json_type_matches("null", &json!(null)));
         // and REJECTS a mismatched value (kills the per-arm `delete match arm` → fall-through-to-true).
-        assert!(!json_type_matches("object", &json!([1])), "object arm rejects an array");
-        assert!(!json_type_matches("array", &json!({"a":1})), "array arm rejects an object");
-        assert!(!json_type_matches("boolean", &json!(1)), "boolean arm rejects a number");
-        assert!(!json_type_matches("number", &json!("x")), "number arm rejects a string");
-        assert!(!json_type_matches("null", &json!(0)), "null arm rejects a number");
+        assert!(
+            !json_type_matches("object", &json!([1])),
+            "object arm rejects an array"
+        );
+        assert!(
+            !json_type_matches("array", &json!({"a":1})),
+            "array arm rejects an object"
+        );
+        assert!(
+            !json_type_matches("boolean", &json!(1)),
+            "boolean arm rejects a number"
+        );
+        assert!(
+            !json_type_matches("number", &json!("x")),
+            "number arm rejects a string"
+        );
+        assert!(
+            !json_type_matches("null", &json!(0)),
+            "null arm rejects a number"
+        );
         // integer: the `|| ` covers BOTH i64 and u64; a float is NOT an integer (kills `|| → &&`).
-        assert!(json_type_matches("integer", &json!(-3)), "a negative i64 is an integer");
-        assert!(json_type_matches("integer", &json!(u64::MAX)), "a large u64 is an integer");
-        assert!(!json_type_matches("integer", &json!(1.5)), "a float is NOT an integer");
+        assert!(
+            json_type_matches("integer", &json!(-3)),
+            "a negative i64 is an integer"
+        );
+        assert!(
+            json_type_matches("integer", &json!(u64::MAX)),
+            "a large u64 is an integer"
+        );
+        assert!(
+            !json_type_matches("integer", &json!(1.5)),
+            "a float is NOT an integer"
+        );
         // an unknown declared type conservatively admits (the documented bounded-type-set behaviour).
         assert!(json_type_matches("made-up-type", &json!("anything")));
     }
@@ -1404,12 +1897,32 @@ mod tests {
             ],
         };
         let check = allow_caps(&["issue.write", "git.merge", "issue.delete"]);
-        let del = Delegator { policy: vec!["issue.write".into(), "git.merge".into()] }; // no delete.
-        let tenant = Tenant { forbid: BTreeSet::new() };
-        let endpoint = Endpoint { fail: false, applied: RefCell::new(vec![]) };
-        let mut budget = Budget { remaining: 100, billed: 0, settles: 0 };
+        let del = Delegator {
+            policy: vec!["issue.write".into(), "git.merge".into()],
+        }; // no delete.
+        let tenant = Tenant {
+            forbid: BTreeSet::new(),
+        };
+        let endpoint = Endpoint {
+            fail: false,
+            applied: RefCell::new(vec![]),
+        };
+        let mut budget = Budget {
+            remaining: 100,
+            billed: 0,
+            settles: 0,
+        };
         let mut signals = PipelineSignals::new();
-        let mut p = pipeline(&cat, &check, &del, &tenant, &endpoint, &mut budget, BTreeSet::new(), &mut signals);
+        let mut p = pipeline(
+            &cat,
+            &check,
+            &del,
+            &tenant,
+            &endpoint,
+            &mut budget,
+            BTreeSet::new(),
+            &mut signals,
+        );
 
         let _ = p.apply_planned(&plan("issue.create", r#"{"title":"a"}"#)); // Applied
         let _ = p.apply_planned(&plan("git.merge", r#"{"title":"b"}"#)); // Gated
@@ -1418,6 +1931,10 @@ mod tests {
         assert_eq!(signals.gated(), 1);
         assert_eq!(signals.denied(), 1);
         // THE AG-D2 INVARIANT: across every outcome, the privileged-fallback counter is 0.
-        assert_eq!(signals.privileged_fallback(), 0, "AG-D2: 0 privileged fallback — there is NO fallback code path");
+        assert_eq!(
+            signals.privileged_fallback(),
+            0,
+            "AG-D2: 0 privileged fallback — there is NO fallback code path"
+        );
     }
 }

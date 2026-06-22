@@ -34,7 +34,9 @@ use myelin_notif::escalation::{
 };
 use myelin_notif::prefs::QuietHours;
 use myelin_notif::router::{InboxProjection, RoutedInboxItem};
-use myelin_notif::snooze_resurface::{snooze_and_arm, snooze_timer_key, ResurfaceOutcome, SnoozeResurfacer};
+use myelin_notif::snooze_resurface::{
+    snooze_and_arm, snooze_timer_key, ResurfaceOutcome, SnoozeResurfacer,
+};
 use myelin_notif::{Class, Reason};
 use myelin_tenancy::{Region, TenantId};
 
@@ -81,8 +83,15 @@ fn snooze_resurface_durability_kill_before_until_resurfaces_exactly_once() {
     let worker_a = SnoozeResurfacer::new(wheel.clone());
     snooze_and_arm(&inbox, &worker_a, &p, "iss-1", "2026-06-25T09:00:00Z", 30)
         .expect("snooze + arm the durable re-surface timer");
-    assert!(worker_a.has_timer(&tenant(), "u1", "iss-1"), "the durable re-surface timer is armed");
-    assert_eq!(state_of(&inbox, "u1", "iss-1").unwrap(), "snoozed", "the item is parked");
+    assert!(
+        worker_a.has_timer(&tenant(), "u1", "iss-1"),
+        "the durable re-surface timer is armed"
+    );
+    assert_eq!(
+        state_of(&inbox, "u1", "iss-1").unwrap(),
+        "snoozed",
+        "the item is parked"
+    );
 
     // === THE KILL: drop worker A BEFORE the until (no re-surface yet). Wheel + row survive. ===
     drop(worker_a);
@@ -90,7 +99,10 @@ fn snooze_resurface_durability_kill_before_until_resurfaces_exactly_once() {
     // === resume on worker B over the SAME durable wheel ===
     let worker_b = SnoozeResurfacer::new(wheel.clone());
     // 0 MISSED: the durable timer survived the kill (the persisted handle is still live).
-    assert!(worker_b.has_timer(&tenant(), "u1", "iss-1"), "the timer SURVIVED the kill (0 missed)");
+    assert!(
+        worker_b.has_timer(&tenant(), "u1", "iss-1"),
+        "the timer SURVIVED the kill (0 missed)"
+    );
 
     // === the re-surface timer fires at the until → re-surface EXACTLY ONCE ===
     assert_eq!(
@@ -98,7 +110,11 @@ fn snooze_resurface_durability_kill_before_until_resurfaces_exactly_once() {
         ResurfaceOutcome::Resurfaced,
         "the resumed worker re-surfaces the item (NOT zero — the durable handle resumed)"
     );
-    assert_eq!(state_of(&inbox, "u1", "iss-1").unwrap(), "unread", "snoozed → unread (re-surfaced)");
+    assert_eq!(
+        state_of(&inbox, "u1", "iss-1").unwrap(),
+        "unread",
+        "snoozed → unread (re-surfaced)"
+    );
 
     // 0 DUPLICATE: a second restart over the already-fired timer re-surfaces NOTHING.
     let worker_c = SnoozeResurfacer::new(wheel.clone());
@@ -107,7 +123,11 @@ fn snooze_resurface_durability_kill_before_until_resurfaces_exactly_once() {
         ResurfaceOutcome::NoOp,
         "a replayed fire after the re-surface is a no-op (0 duplicate)"
     );
-    assert_eq!(state_of(&inbox, "u1", "iss-1").unwrap(), "unread", "still exactly one re-surface");
+    assert_eq!(
+        state_of(&inbox, "u1", "iss-1").unwrap(),
+        "unread",
+        "still exactly one re-surface"
+    );
 
     // GREEN ARTIFACT (2026-06-21): 0 missed / 0 duplicate re-surface across the kill. No threshold weakened.
 }
@@ -134,7 +154,11 @@ fn snooze_and_escalation_share_one_durable_wheel_no_second_mechanism() {
     let eng = EscalationEngine::new(wheel.clone(), outbox);
     let schedule = OncallSchedule {
         schedule_id: "platform-oncall".into(),
-        rotation: vec![RotationWindow { from_minute: 0, to_minute: 1440, principal: PrincipalId("psn:alice".into()) }],
+        rotation: vec![RotationWindow {
+            from_minute: 0,
+            to_minute: 1440,
+            principal: PrincipalId("psn:alice".into()),
+        }],
     };
     let (run_id, _first) = eng
         .page(
@@ -152,14 +176,32 @@ fn snooze_and_escalation_share_one_durable_wheel_no_second_mechanism() {
 
     // BOTH timers live on the ONE wheel, with distinct keys (no collision).
     let snooze_key = snooze_timer_key(&tenant(), "u1", "iss-1");
-    assert!(wheel.has_timer(&snooze_key), "the snooze re-surface timer lives on the wheel");
-    assert!(wheel.has_timer(&run_id), "the escalation ack_window timer lives on the SAME wheel");
-    assert_ne!(snooze_key, run_id, "distinct keys on one substrate (no collision)");
-    assert!(snooze_key.starts_with("snooze:"), "the snooze timer is namespaced (one wheel, three uses)");
+    assert!(
+        wheel.has_timer(&snooze_key),
+        "the snooze re-surface timer lives on the wheel"
+    );
+    assert!(
+        wheel.has_timer(&run_id),
+        "the escalation ack_window timer lives on the SAME wheel"
+    );
+    assert_ne!(
+        snooze_key, run_id,
+        "distinct keys on one substrate (no collision)"
+    );
+    assert!(
+        snooze_key.starts_with("snooze:"),
+        "the snooze timer is namespaced (one wheel, three uses)"
+    );
 
     // Firing the snooze timer does NOT fire the escalation timer (they are independent handles on one wheel).
-    assert_eq!(resurfacer.resurface_due(&inbox, &tenant(), "u1", "iss-1"), ResurfaceOutcome::Resurfaced);
-    assert!(wheel.has_timer(&run_id), "the escalation timer is untouched by the snooze fire");
+    assert_eq!(
+        resurfacer.resurface_due(&inbox, &tenant(), "u1", "iss-1"),
+        ResurfaceOutcome::Resurfaced
+    );
+    assert!(
+        wheel.has_timer(&run_id),
+        "the escalation timer is untouched by the snooze fire"
+    );
 
     // ONE substrate, three uses (escalation + snooze proven; SLA is the NOTIF-P21 floor). No second mechanism.
 }

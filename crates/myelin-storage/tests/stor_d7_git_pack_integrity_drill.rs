@@ -48,9 +48,16 @@ fn stor_d7_corrupt_git_pack_object_is_detected_recovered_zero_silent_serve() {
     let mut addresses = Vec::with_capacity(BATCH);
     for i in 0..BATCH {
         let content = format!("commit object #{i} with trustworthy content").into_bytes();
-        let a = primary.put_object(&repo, GitObjectKind::Commit, &content).expect("primary put");
-        let b = replica.put_object(&repo, GitObjectKind::Commit, &content).expect("replica put");
-        assert_eq!(a, b, "the same git object has the same content address on both backings");
+        let a = primary
+            .put_object(&repo, GitObjectKind::Commit, &content)
+            .expect("primary put");
+        let b = replica
+            .put_object(&repo, GitObjectKind::Commit, &content)
+            .expect("replica put");
+        assert_eq!(
+            a, b,
+            "the same git object has the same content address on both backings"
+        );
         assert_eq!(primary.get_object(&repo, &a).expect("clean read"), content);
         addresses.push((a, content));
     }
@@ -62,8 +69,13 @@ fn stor_d7_corrupt_git_pack_object_is_detected_recovered_zero_silent_serve() {
 
     // Corrupt every object on the PRIMARY → detection + 0 silent serve + replica recovery.
     for (address, original) in &addresses {
-        let native = primary.native_addr_for_test(&repo, address).expect("linked native address");
-        assert!(primary.blobs().corrupt_for_drill(&tenant, &native), "object present to corrupt");
+        let native = primary
+            .native_addr_for_test(&repo, address)
+            .expect("linked native address");
+        assert!(
+            primary.blobs().corrupt_for_drill(&tenant, &native),
+            "object present to corrupt"
+        );
 
         // The corrupt PRIMARY read is REFUSED (a silent serve `panic!`s — so reaching past it IS
         // the "0 silent serves" proof).
@@ -89,7 +101,10 @@ fn stor_d7_corrupt_git_pack_object_is_detected_recovered_zero_silent_serve() {
         let recovered = replica
             .get_object(&repo, address)
             .expect("recovered from the replica by content address");
-        assert_eq!(&recovered, original, "the good replica copy recovers the corrupt object");
+        assert_eq!(
+            &recovered, original,
+            "the good replica copy recovers the corrupt object"
+        );
     }
 
     // Exactly BATCH detections from the per-object loop (one refusal per corrupt object, 0 silent
@@ -105,8 +120,12 @@ fn stor_d7_corrupt_git_pack_object_is_detected_recovered_zero_silent_serve() {
     // uses (it re-reads the primary once, hence not counted in the per-object BATCH tally above).
     {
         let extra = b"a final object to prove the recovery API end to end";
-        let a = primary.put_object(&repo, GitObjectKind::Blob, extra).expect("primary put");
-        replica.put_object(&repo, GitObjectKind::Blob, extra).expect("replica put");
+        let a = primary
+            .put_object(&repo, GitObjectKind::Blob, extra)
+            .expect("primary put");
+        replica
+            .put_object(&repo, GitObjectKind::Blob, extra)
+            .expect("replica put");
         let native = primary.native_addr_for_test(&repo, &a).unwrap();
         assert!(primary.blobs().corrupt_for_drill(&tenant, &native));
         let recovered = primary
@@ -119,12 +138,21 @@ fn stor_d7_corrupt_git_pack_object_is_detected_recovered_zero_silent_serve() {
     // trait too).
     let member = git_object_address(GitObjectKind::Blob, b"member");
     let manifest = primary
-        .put_pack(&repo, b"PACK\0\0\0\x02...opaque...", vec![(GitObjectKind::Blob, member)])
+        .put_pack(
+            &repo,
+            b"PACK\0\0\0\x02...opaque...",
+            vec![(GitObjectKind::Blob, member)],
+        )
         .expect("put pack");
-    assert!(primary.blobs().corrupt_for_drill(&tenant, &manifest.pack_hash));
+    assert!(primary
+        .blobs()
+        .corrupt_for_drill(&tenant, &manifest.pack_hash));
     match primary.get_pack(&repo, &manifest.pack_hash) {
         Err(GitPackError::Blob(BlobError::IntegrityFail { .. })) => {}
-        Ok(b) => panic!("STOR-D7 FLOOR BREACHED: corrupt packfile served {} bytes silently", b.len()),
+        Ok(b) => panic!(
+            "STOR-D7 FLOOR BREACHED: corrupt packfile served {} bytes silently",
+            b.len()
+        ),
         Err(other) => panic!("expected IntegrityFail on the corrupt packfile, got {other}"),
     }
 

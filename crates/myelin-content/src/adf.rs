@@ -361,7 +361,11 @@ impl ImportReport {
     /// degraded). The frozen [`mapping_for`] table tells the parser *whether* a node degraded; this
     /// records *that it did*.
     pub fn record(&mut self, node: AdfNode, degraded_to: AdfTarget, what: impl Into<String>) {
-        self.conversions.push(LossyConversion { node, degraded_to, what: what.into() });
+        self.conversions.push(LossyConversion {
+            node,
+            degraded_to,
+            what: what.into(),
+        });
     }
 
     /// `true` iff the import was fully lossless (no recorded conversions).
@@ -384,13 +388,31 @@ mod tests {
     #[test]
     fn map_covers_every_node_exactly_once() {
         let all = [
-            AdfNode::Paragraph, AdfNode::Heading, AdfNode::Blockquote, AdfNode::CodeBlock,
-            AdfNode::Rule, AdfNode::BulletList, AdfNode::OrderedList, AdfNode::Table,
-            AdfNode::MediaSingle, AdfNode::TaskList, AdfNode::TaskItem, AdfNode::Panel,
-            AdfNode::Mention, AdfNode::InlineCard, AdfNode::BlockCard, AdfNode::Emoji,
-            AdfNode::Status, AdfNode::Date, AdfNode::MediaGroup, AdfNode::Expand,
-            AdfNode::NestedExpand, AdfNode::Extension, AdfNode::BodiedExtension,
-            AdfNode::LayoutSection, AdfNode::LayoutColumn,
+            AdfNode::Paragraph,
+            AdfNode::Heading,
+            AdfNode::Blockquote,
+            AdfNode::CodeBlock,
+            AdfNode::Rule,
+            AdfNode::BulletList,
+            AdfNode::OrderedList,
+            AdfNode::Table,
+            AdfNode::MediaSingle,
+            AdfNode::TaskList,
+            AdfNode::TaskItem,
+            AdfNode::Panel,
+            AdfNode::Mention,
+            AdfNode::InlineCard,
+            AdfNode::BlockCard,
+            AdfNode::Emoji,
+            AdfNode::Status,
+            AdfNode::Date,
+            AdfNode::MediaGroup,
+            AdfNode::Expand,
+            AdfNode::NestedExpand,
+            AdfNode::Extension,
+            AdfNode::BodiedExtension,
+            AdfNode::LayoutSection,
+            AdfNode::LayoutColumn,
         ];
         assert_eq!(MAP.len(), all.len(), "the map has exactly one row per node");
         for node in all {
@@ -411,9 +433,21 @@ mod tests {
         assert_eq!(
             lossless,
             [
-                "paragraph", "heading", "blockquote", "codeBlock", "rule", "bulletList",
-                "orderedList", "table", "mediaSingle", "taskList", "taskItem", "panel",
-                "mediaGroup", "expand", "nestedExpand",
+                "paragraph",
+                "heading",
+                "blockquote",
+                "codeBlock",
+                "rule",
+                "bulletList",
+                "orderedList",
+                "table",
+                "mediaSingle",
+                "taskList",
+                "taskItem",
+                "panel",
+                "mediaGroup",
+                "expand",
+                "nestedExpand",
             ],
             "the frozen lossless set (X-2 'none' column)"
         );
@@ -423,11 +457,24 @@ mod tests {
     /// rows: mention / inlineCard / blockCard / emoji).
     #[test]
     fn conditional_rows_name_condition_and_degraded_target() {
-        for node in [AdfNode::Mention, AdfNode::InlineCard, AdfNode::BlockCard, AdfNode::Emoji] {
+        for node in [
+            AdfNode::Mention,
+            AdfNode::InlineCard,
+            AdfNode::BlockCard,
+            AdfNode::Emoji,
+        ] {
             let m = mapping_for(node);
             match &m.loss {
-                Loss::Conditional { condition, what, degraded_to } => {
-                    assert!(!condition.is_empty(), "{} names its lossless condition", node.wire_id());
+                Loss::Conditional {
+                    condition,
+                    what,
+                    degraded_to,
+                } => {
+                    assert!(
+                        !condition.is_empty(),
+                        "{} names its lossless condition",
+                        node.wire_id()
+                    );
                     assert!(!what.is_empty(), "{} names what is lost", node.wire_id());
                     let _ = degraded_to;
                 }
@@ -450,8 +497,13 @@ mod tests {
         ] {
             let m = mapping_for(node);
             match &m.loss {
-                Loss::Lossy { what } => assert!(!what.is_empty(), "{} names the loss", node.wire_id()),
-                other => panic!("{} should be unconditionally lossy, got {other:?}", node.wire_id()),
+                Loss::Lossy { what } => {
+                    assert!(!what.is_empty(), "{} names the loss", node.wire_id())
+                }
+                other => panic!(
+                    "{} should be unconditionally lossy, got {other:?}",
+                    node.wire_id()
+                ),
             }
         }
     }
@@ -465,7 +517,10 @@ mod tests {
 
         // Simulate an import that degraded an external mention + a Jira status lozenge.
         let mention = mapping_for(AdfNode::Mention);
-        if let Loss::Conditional { what, degraded_to, .. } = &mention.loss {
+        if let Loss::Conditional {
+            what, degraded_to, ..
+        } = &mention.loss
+        {
             report.record(AdfNode::Mention, *degraded_to, what.to_string());
         }
         let status = mapping_for(AdfNode::Status);

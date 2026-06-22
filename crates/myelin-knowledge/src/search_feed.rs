@@ -88,12 +88,12 @@
 //!   KN-D5 drill.
 
 use myelin_identity::{Consistency, ObjectType, Permission, Principal};
+use myelin_query::QueryAst;
 use myelin_search::{
     query as search_query, semantic as search_semantic, AclFilter, ConsistencyStats, IndexBackend,
     IndexSpec, ListObjectsPort, Page, QueryError, QueryStats, RankedResults, ScopedEngine,
     SearchProjection, VectorQuery, KN_PAGE_TYPE,
 };
-use myelin_query::QueryAst;
 
 // Re-home Knowledge's owned 6.3 surface VERBATIM from the Search crate that owns the `IndexSpec`
 // type (EI-01 §7 — one primitive, never a parallel second shape). These ARE Knowledge's owned
@@ -274,11 +274,18 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn viewer() -> Principal {
-        Principal::stub(PrincipalId("p:alice".into()), PrincipalKind::Human, TenantId("acme".into()))
+        Principal::stub(
+            PrincipalId("p:alice".into()),
+            PrincipalKind::Human,
+            TenantId("acme".into()),
+        )
     }
 
     fn consistency() -> Consistency {
-        Consistency { at_least: Zookie("z0".into()), mode: ConsistencyMode::BoundedStale }
+        Consistency {
+            at_least: Zookie("z0".into()),
+            mode: ConsistencyMode::BoundedStale,
+        }
     }
 
     fn ast_body(term: &str) -> QueryAst {
@@ -317,7 +324,10 @@ mod tests {
         }
         fn filter(set_expr: SetExpr) -> FakeAuthz {
             FakeAuthz {
-                answer: ListObjectsResult::Filter { set_expr, zookie: Zookie("z-acl".into()) },
+                answer: ListObjectsResult::Filter {
+                    set_expr,
+                    zookie: Zookie("z-acl".into()),
+                },
                 calls: AtomicU64::new(0),
             }
         }
@@ -339,15 +349,24 @@ mod tests {
         // The KN page spec's facets (the structured inline-node reference facets) + the order key.
         let mut m = BTreeMap::new();
         m.insert(FACET_MENTION.to_string(), myelin_query::FieldType::Relation);
-        m.insert(FACET_ARTIFACT_REF.to_string(), myelin_query::FieldType::Relation);
+        m.insert(
+            FACET_ARTIFACT_REF.to_string(),
+            myelin_query::FieldType::Relation,
+        );
         m.insert(FACET_EMBED.to_string(), myelin_query::FieldType::Relation);
-        m.insert(ORDER_KEY_FIELD.to_string(), myelin_query::FieldType::OrderKey);
+        m.insert(
+            ORDER_KEY_FIELD.to_string(),
+            myelin_query::FieldType::OrderKey,
+        );
         m
     }
 
     fn schema() -> myelin_search::FieldSchema {
         myelin_search::FieldSchema::new()
-            .with(FT_BODY_FIELD, myelin_search::FieldDecl::stored(myelin_query::FieldType::Text))
+            .with(
+                FT_BODY_FIELD,
+                myelin_search::FieldDecl::stored(myelin_query::FieldType::Text),
+            )
             .with(
                 ORDER_KEY_FIELD,
                 myelin_search::FieldDecl::stored(myelin_query::FieldType::OrderKey),
@@ -360,7 +379,9 @@ mod tests {
     fn kn_page_corpus() -> TantivyBackend {
         let mut be = TantivyBackend::open(&facet_decl()).expect("open");
         let mut upsert = |id: &str, body: &str| {
-            let blocks = vec![Block::Paragraph { inline: parse_inline(body, &[]) }];
+            let blocks = vec![Block::Paragraph {
+                inline: parse_inline(body, &[]),
+            }];
             let proj = feed_project(&blocks, FeedGrain::Page, Some("en"));
             let k = myelin_query::OrderKey::bisect(None, None);
             let mut d = IndexDocument::new(id, &proj.text)
@@ -370,8 +391,14 @@ mod tests {
             }
             be.upsert(&d).unwrap();
         };
-        upsert("myelin://acme/knowledge/page/PUB-1", "deadlock in the scheduler runbook");
-        upsert("myelin://acme/knowledge/page/SECRET-9", "deadlock secret incident postmortem");
+        upsert(
+            "myelin://acme/knowledge/page/PUB-1",
+            "deadlock in the scheduler runbook",
+        );
+        upsert(
+            "myelin://acme/knowledge/page/SECRET-9",
+            "deadlock secret incident postmortem",
+        );
         be
     }
 
@@ -381,15 +408,25 @@ mod tests {
     #[test]
     fn owned_6_3_specs_re_home_the_search_shapes_verbatim() {
         let specs = kn_declared_index_specs();
-        assert_eq!(specs, kn_index_specs(), "the re-homed owned set is byte-equal (no parallel shape)");
+        assert_eq!(
+            specs,
+            kn_index_specs(),
+            "the re-homed owned set is byte-equal (no parallel shape)"
+        );
         let page = kn_page_index_spec();
         assert_eq!(page.subsystem, KN_SUBSYSTEM);
         assert_eq!(page.type_, KN_PAGE_TYPE);
         assert_eq!(page.acl_object_type, "page");
-        assert!(page.semantic, "the page doc is semantically indexed (vector-in-v1, §6)");
+        assert!(
+            page.semantic,
+            "the page doc is semantically indexed (vector-in-v1, §6)"
+        );
         let row = kn_db_row_index_spec();
         assert_eq!(row.type_, KN_DB_ROW_TYPE);
-        assert!(!row.semantic, "a db row is a structured record, not vector-embedded prose");
+        assert!(
+            !row.semantic,
+            "a db row is a structured record, not vector-embedded prose"
+        );
         // Exactly two SPEC types (page + db_row); the block doc rides the page object type.
         assert_eq!(specs.len(), 2);
     }
@@ -399,7 +436,11 @@ mod tests {
     #[test]
     fn search_admits_the_declared_specs() {
         let accepted = register_kn_index_specs();
-        assert_eq!(accepted, kn_declared_index_specs(), "Search admits the declared KN specs verbatim");
+        assert_eq!(
+            accepted,
+            kn_declared_index_specs(),
+            "Search admits the declared KN specs verbatim"
+        );
     }
 
     /// **The `project` feed builds the page projection from block content (architecture §2.2/§6).**
@@ -435,7 +476,10 @@ mod tests {
 
         // The significant-block grain projects the single heading block (the jump target).
         let block = feed_project(&blocks[..1], FeedGrain::SignificantBlock, Some("en"));
-        assert!(block.text.contains("Design Notes"), "the block doc carries the heading prose");
+        assert!(
+            block.text.contains("Design Notes"),
+            "the block doc carries the heading prose"
+        );
     }
 
     /// **KN-D5 re-confirm — the FT `query` conjoin: a confidential page never appears in the result
@@ -450,9 +494,16 @@ mod tests {
         // UNAUTHORIZED: the allow-set excludes the confidential page.
         let unauth = FakeAuthz::ids(&["myelin://acme/knowledge/page/PUB-1"]);
         let stats = QueryStats::new();
-        let res =
-            kn_search_query(&eng, &unauth, &q, &viewer(), &consistency(), Page::FIRST, &stats)
-                .expect("query");
+        let res = kn_search_query(
+            &eng,
+            &unauth,
+            &q,
+            &viewer(),
+            &consistency(),
+            Page::FIRST,
+            &stats,
+        )
+        .expect("query");
         let ids: Vec<&str> = res.hits.iter().map(|h| h.doc_id.as_str()).collect();
         assert_eq!(
             ids,
@@ -461,8 +512,16 @@ mod tests {
         );
         // THE COUNT-LEAK CLOSE: the result count is the VISIBLE count only — the forbidden page is
         // not counted (KN-D5 0 leak incl. COUNT).
-        assert_eq!(res.hits.len(), 1, "the COUNT reveals neither the existence nor the number of forbidden pages");
-        assert_eq!(unauth.calls.load(Ordering::Relaxed), 1, "exactly ONE list_objects (no N+1)");
+        assert_eq!(
+            res.hits.len(),
+            1,
+            "the COUNT reveals neither the existence nor the number of forbidden pages"
+        );
+        assert_eq!(
+            unauth.calls.load(Ordering::Relaxed),
+            1,
+            "exactly ONE list_objects (no N+1)"
+        );
 
         // GRANTED: the allow-set now includes SECRET-9 → it surfaces on re-query.
         let granted = FakeAuthz::ids(&[
@@ -470,10 +529,21 @@ mod tests {
             "myelin://acme/knowledge/page/SECRET-9",
         ]);
         let stats2 = QueryStats::new();
-        let res2 =
-            kn_search_query(&eng, &granted, &q, &viewer(), &consistency(), Page::FIRST, &stats2)
-                .expect("query after grant");
-        assert_eq!(res2.hits.len(), 2, "after grant both pages are visible (and counted)");
+        let res2 = kn_search_query(
+            &eng,
+            &granted,
+            &q,
+            &viewer(),
+            &consistency(),
+            Page::FIRST,
+            &stats2,
+        )
+        .expect("query after grant");
+        assert_eq!(
+            res2.hits.len(),
+            2,
+            "after grant both pages are visible (and counted)"
+        );
     }
 
     /// **KN-D5 re-confirm — `SetExpr::None` short-circuits to an EMPTY result without touching the
@@ -485,11 +555,27 @@ mod tests {
         let eng = ScopedEngine::new(&be, "acme", "eu-west", schema());
         let authz = FakeAuthz::filter(SetExpr::None);
         let stats = QueryStats::new();
-        let res = kn_search_query(&eng, &authz, &ast_body("deadlock"), &viewer(), &consistency(), Page::FIRST, &stats)
-            .expect("query");
+        let res = kn_search_query(
+            &eng,
+            &authz,
+            &ast_body("deadlock"),
+            &viewer(),
+            &consistency(),
+            Page::FIRST,
+            &stats,
+        )
+        .expect("query");
         assert!(res.hits.is_empty(), "None ⇒ empty result");
-        assert_eq!(res.hits.len(), 0, "the COUNT is 0 — no forbidden page is revealed");
-        assert_eq!(stats.engine_branches(), 0, "no engine branch ran (short-circuit, no count leak)");
+        assert_eq!(
+            res.hits.len(),
+            0,
+            "the COUNT is 0 — no forbidden page is revealed"
+        );
+        assert_eq!(
+            stats.engine_branches(),
+            0,
+            "no engine branch ran (short-circuit, no count leak)"
+        );
     }
 
     /// **KN-D5 re-confirm — the semantic/RAG `semantic` conjoin: a confidential page NEVER enters the
@@ -509,12 +595,21 @@ mod tests {
                 .with_embedding(v, embedder.model_ref());
             be.upsert(&d).unwrap();
         };
-        emb("myelin://acme/knowledge/page/PUB-1", "deadlock in the scheduler runbook");
-        emb("myelin://acme/knowledge/page/SECRET-9", "deadlock secret ops postmortem");
+        emb(
+            "myelin://acme/knowledge/page/PUB-1",
+            "deadlock in the scheduler runbook",
+        );
+        emb(
+            "myelin://acme/knowledge/page/SECRET-9",
+            "deadlock secret ops postmortem",
+        );
 
         let eng = ScopedEngine::new(&be, "acme", "eu-west", schema());
         // The query is the EXACT text of the secret page → SECRET-9 is its nearest vector.
-        let vq = VectorQuery::Text { text: "deadlock secret ops postmortem".into(), embedder: &embedder };
+        let vq = VectorQuery::Text {
+            text: "deadlock secret ops postmortem".into(),
+            embedder: &embedder,
+        };
         let q = semantic_ast("deadlock secret ops postmortem");
 
         // UNAUTHORIZED (agent's delegated principal cannot read the confidential page).
@@ -522,7 +617,15 @@ mod tests {
         let stats = QueryStats::new();
         let cstats = ConsistencyStats::new();
         let res = kn_search_semantic(
-            &eng, &unauth, &q, &viewer(), &consistency(), &vq, Page::FIRST, &stats, &cstats,
+            &eng,
+            &unauth,
+            &q,
+            &viewer(),
+            &consistency(),
+            &vq,
+            Page::FIRST,
+            &stats,
+            &cstats,
         )
         .expect("semantic");
         let ids: std::collections::BTreeSet<&str> =
@@ -531,7 +634,11 @@ mod tests {
             !ids.contains("myelin://acme/knowledge/page/SECRET-9"),
             "the confidential page NEVER surfaces in the semantic/RAG result (KN-D5 vector half: 0 leak)"
         );
-        assert_eq!(stats.list_objects_calls(), 1, "exactly ONE list_objects (no N+1 on the semantic path)");
+        assert_eq!(
+            stats.list_objects_calls(),
+            1,
+            "exactly ONE list_objects (no N+1 on the semantic path)"
+        );
 
         // GRANT → re-search: the confidential page is now a visible neighbour.
         let granted = FakeAuthz::ids(&[
@@ -541,12 +648,23 @@ mod tests {
         let stats2 = QueryStats::new();
         let cstats2 = ConsistencyStats::new();
         let res2 = kn_search_semantic(
-            &eng, &granted, &q, &viewer(), &consistency(), &vq, Page::FIRST, &stats2, &cstats2,
+            &eng,
+            &granted,
+            &q,
+            &viewer(),
+            &consistency(),
+            &vq,
+            Page::FIRST,
+            &stats2,
+            &cstats2,
         )
         .expect("semantic after grant");
         let ids2: std::collections::BTreeSet<&str> =
             res2.hits.iter().map(|h| h.doc_id.as_str()).collect();
-        assert!(ids2.contains("myelin://acme/knowledge/page/SECRET-9"), "after grant the page is a visible neighbour");
+        assert!(
+            ids2.contains("myelin://acme/knowledge/page/SECRET-9"),
+            "after grant the page is a visible neighbour"
+        );
     }
 
     /// **The read permission the conjoin keys on is `knowledge.read` (one source of truth).**
@@ -554,6 +672,9 @@ mod tests {
     fn read_permission_is_knowledge_read() {
         assert_eq!(KN_READ_PERMISSION, "knowledge.read");
         assert_eq!(kn_read_permission(), Permission("knowledge.read".into()));
-        assert_eq!(KN_SEARCH_OBJECT_TYPE, "page", "the conjoin keys on the page object type");
+        assert_eq!(
+            KN_SEARCH_OBJECT_TYPE, "page",
+            "the conjoin keys on the page object type"
+        );
     }
 }

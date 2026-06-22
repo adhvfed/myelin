@@ -362,7 +362,11 @@ impl WfJournal {
     fn commit_rows(&self, history: Vec<WfHistoryRow>, attempts: Vec<WfActivityAttemptRow>) {
         let mut inner = self.lock();
         for row in history {
-            let key = (row.tenant.0.clone(), row.run_id.clone(), row.command_id.clone());
+            let key = (
+                row.tenant.0.clone(),
+                row.run_id.clone(),
+                row.command_id.clone(),
+            );
             if inner.journaled_commands.insert(key) {
                 inner.history.push(row);
             }
@@ -572,7 +576,12 @@ impl WfCtx {
     /// so a workflow body's `sleep` arms a `wf_timer` row the wheel fires. `now_secs` is the engine's
     /// live epoch-seconds clock (the lease/wheel clock) the park decision + `sleep_for`'s relative base
     /// read. Chainable on `begin`/`resume`.
-    pub fn with_timers(mut self, timers: crate::timer::TimerStore, partition: i16, now_secs: i64) -> Self {
+    pub fn with_timers(
+        mut self,
+        timers: crate::timer::TimerStore,
+        partition: i16,
+        now_secs: i64,
+    ) -> Self {
         self.timers = Some((timers, partition, now_secs));
         self
     }
@@ -618,7 +627,12 @@ impl WfCtx {
         );
         // The replay-order seq continues past the journaled rows (the cursor floor §3.1): a
         // newly-journaled command must land AFTER everything replayed, never overwrite it.
-        ctx.history_seq = history.iter().map(|r| r.seq).max().map(|m| m + 1).unwrap_or(0);
+        ctx.history_seq = history
+            .iter()
+            .map(|r| r.seq)
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
         for row in history {
             ctx.replay_history.insert(
                 row.command_id,
@@ -1073,10 +1087,9 @@ impl WfCtx {
             }
         }
         // LIVE: arm the durable timer + journal the timer_set marker.
-        let (timers, partition, now_secs) = self
-            .timers
-            .clone()
-            .ok_or_else(|| WfError::CoCommit("sleep_until requires a timer wheel (WfCtx::with_timers)".into()))?;
+        let (timers, partition, now_secs) = self.timers.clone().ok_or_else(|| {
+            WfError::CoCommit("sleep_until requires a timer wheel (WfCtx::with_timers)".into())
+        })?;
         // The deterministic timer_id = <run_id>/<command_id> (so a replayed sleep re-arms the SAME key
         // → ON CONFLICT DO NOTHING; producer + consumer agree without coordination, §3.3).
         let timer_id = format!("{}/{}", self.run_id, command_id);
@@ -1183,10 +1196,11 @@ impl WfCtx {
         // LIVE (or the resume re-check of a journaled `signal_waited`): scan the durable buffer for the
         // first unconsumed signal under (tenant, run, name). The signal store is REQUIRED — a wait with
         // no buffer is a loud error (never a silent no-op).
-        let signals = self
-            .signals
-            .clone()
-            .ok_or_else(|| WfError::CoCommit("wait_for_signal requires a signal store (WfCtx::with_signals)".into()))?;
+        let signals = self.signals.clone().ok_or_else(|| {
+            WfError::CoCommit(
+                "wait_for_signal requires a signal store (WfCtx::with_signals)".into(),
+            )
+        })?;
 
         // Whether this command was already journaled as a `signal_waited` (a resume re-check) — so we do
         // NOT journal a SECOND `signal_waited` for the same park (idempotent on the command position).
@@ -1196,7 +1210,9 @@ impl WfCtx {
             .map(|r| r.kind == crate::wfctx::history_kind::SIGNAL_WAITED)
             .unwrap_or(false);
 
-        if let Some((idem_key, row)) = signals.first_unconsumed_for(&self.tenant, &self.run_id, name) {
+        if let Some((idem_key, row)) =
+            signals.first_unconsumed_for(&self.tenant, &self.run_id, name)
+        {
             // **THE SIGNAL ARRIVED — consume it EXACTLY ONCE (§4.3).** Stamp its `consumed_seq` (the
             // history seq the `signal_received` row will land at) so the signal-buffer-depth drops and a
             // re-scan never re-consumes it. The consume is idempotent on `consumed_seq IS NULL` (a re-
@@ -1204,10 +1220,16 @@ impl WfCtx {
             // see it as consumed (None from the scan); here the scan returned it unconsumed so we win.
             let received_seq = self.history_seq; // the seq the signal_received row will get.
             signals.consume(&self.tenant, &self.run_id, name, &idem_key, received_seq);
-            self.consumed_signals.push((name.to_string(), idem_key.clone()));
+            self.consumed_signals
+                .push((name.to_string(), idem_key.clone()));
             // Journal the `signal_received` row carrying the consumed signal (idem_key + payload refs)
             // so replay returns the SAME signal (consume-exactly-once). references-not-payloads.
-            self.stage_received(command_id, &idem_key, &row.payload, row.payload_key_ref.as_deref());
+            self.stage_received(
+                command_id,
+                &idem_key,
+                &row.payload,
+                row.payload_key_ref.as_deref(),
+            );
             // **MID-WORKFLOW TOKEN RE-MINT ON RESUME (P-FLOW-17, contract 4.7, §6.2).** This wait had
             // PARKED (a journaled `signal_waited`) and is now RESUMING — the resumed body is about to run
             // (the consumed approval/job.done leads back into live activity), so the workflow's per-run
@@ -1233,14 +1255,20 @@ impl WfCtx {
             // The absolute timeout deadline: on the FIRST park it is now + timeout; on a resume it is the
             // deadline captured in the `signal_waited` marker (so the deadline is stable across re-drives).
             let deadline = if already_waited {
-                self.replayed_wait_deadline(&command_id).unwrap_or_else(|| now_secs.saturating_add(t))
+                self.replayed_wait_deadline(&command_id)
+                    .unwrap_or_else(|| now_secs.saturating_add(t))
             } else {
                 now_secs.saturating_add(t)
             };
             if now_secs >= deadline {
                 // the timeout fired before the signal arrived — journal a `signal_received` carrying the
                 // TIMEOUT marker (so replay returns TimedOut deterministically) and take the timeout path.
-                self.stage_received(command_id, WAIT_TIMEOUT_MARKER, &[], Some(WAIT_TIMEOUT_MARKER));
+                self.stage_received(
+                    command_id,
+                    WAIT_TIMEOUT_MARKER,
+                    &[],
+                    Some(WAIT_TIMEOUT_MARKER),
+                );
                 // **RE-MINT ON RESUME (P-FLOW-17, §6.2).** A timed-out wait that had PARKED is ALSO a
                 // resume — the body takes its timeout branch (the §6.3 auto-deny), which runs live (it may
                 // compensate / withhold), so it too runs under a FRESH short-lived per-run token. Only on a
@@ -1300,9 +1328,16 @@ impl WfCtx {
     /// resume reads a STABLE deadline. references-not-payloads (no PII body). STAGED — durable iff
     /// commit (FLOW-D5).
     fn stage_waited(&mut self, command_id: String, deadline: Option<i64>) {
-        let result = deadline
-            .map(|d| vec![myelin_refs::ArtifactRef(format!("{WAIT_DEADLINE_PREFIX}{d}"))]);
-        self.stage_history(crate::wfctx::history_kind::SIGNAL_WAITED, command_id, result);
+        let result = deadline.map(|d| {
+            vec![myelin_refs::ArtifactRef(format!(
+                "{WAIT_DEADLINE_PREFIX}{d}"
+            ))]
+        });
+        self.stage_history(
+            crate::wfctx::history_kind::SIGNAL_WAITED,
+            command_id,
+            result,
+        );
     }
 
     /// Stage a `signal_received` row (the consume marker, §4.3) carrying the consumed signal's idem_key
@@ -1316,12 +1351,20 @@ impl WfCtx {
         payload: &[myelin_refs::ArtifactRef],
         payload_key_ref: Option<&str>,
     ) {
-        let mut result = vec![myelin_refs::ArtifactRef(format!("{WAIT_IDEM_PREFIX}{idem_key}"))];
+        let mut result = vec![myelin_refs::ArtifactRef(format!(
+            "{WAIT_IDEM_PREFIX}{idem_key}"
+        ))];
         if let Some(kr) = payload_key_ref {
-            result.push(myelin_refs::ArtifactRef(format!("{WAIT_KEYREF_PREFIX}{kr}")));
+            result.push(myelin_refs::ArtifactRef(format!(
+                "{WAIT_KEYREF_PREFIX}{kr}"
+            )));
         }
         result.extend(payload.iter().cloned());
-        self.stage_history(crate::wfctx::history_kind::SIGNAL_RECEIVED, command_id, Some(result));
+        self.stage_history(
+            crate::wfctx::history_kind::SIGNAL_RECEIVED,
+            command_id,
+            Some(result),
+        );
     }
 
     /// **Whether this drive PARKED on a durable timer (a `sleep` into the future, §4.2).** The engine
@@ -1502,9 +1545,16 @@ mod tests {
         assert_eq!(journal.history_len(), 0, "nothing durable before commit");
         ctx.commit().expect("co-commit");
         let hist = journal.history_for(&tenant(), "R1");
-        assert_eq!(hist.len(), 1, "exactly one history row journaled for the command");
+        assert_eq!(
+            hist.len(),
+            1,
+            "exactly one history row journaled for the command"
+        );
         assert_eq!(hist[0].kind, history_kind::ACTIVITY_COMPLETED);
-        assert_eq!(hist[0].command_id, "agent.run:0", "deterministic command_id from position");
+        assert_eq!(
+            hist[0].command_id, "agent.run:0",
+            "deterministic command_id from position"
+        );
         assert_eq!(hist[0].seq, 0, "the per-run replay-order seq starts at 0");
         let attempts = journal.attempts_for(&tenant(), "R1");
         assert_eq!(attempts.len(), 1, "one attempt ledger row");
@@ -1523,7 +1573,8 @@ mod tests {
             Ok(vec![ArtifactRef("myelin://acme/agent/effect/e1".into())])
         })
         .expect("activity");
-        ctx.emit(draft("agent.run.step"), None).expect("emit buffers into the txn");
+        ctx.emit(draft("agent.run.step"), None)
+            .expect("emit buffers into the txn");
         // before commit: NEITHER the journal row NOR the outbox row is durable (one transaction).
         assert_eq!(journal.history_len(), 0, "no journal row before commit");
         assert_eq!(outbox.outbox_depth(), 0, "no outbox row before commit");
@@ -1549,16 +1600,33 @@ mod tests {
                 Ok(vec![ArtifactRef("myelin://acme/agent/effect/e1".into())])
             })
             .expect("activity");
-            ctx.emit(draft("agent.run.step"), None).expect("emit buffers");
+            ctx.emit(draft("agent.run.step"), None)
+                .expect("emit buffers");
             assert_eq!(ctx.staged_history_len(), 1, "journaled-but-not-committed");
             assert_eq!(ctx.staged_emit_len(), 1, "emitted-but-not-committed");
             // ctx dropped HERE without commit — the crash between journal and emit.
         }
         // NEITHER: 0 journal rows, 0 outbox rows — 0 ghost, 0 lost (FLOW-D5).
-        assert_eq!(journal.history_len(), 0, "0 lost: an aborted step journals nothing");
-        assert_eq!(journal.attempt_len(), 0, "0 lost: the attempt ledger row is not written either");
-        assert_eq!(outbox.outbox_depth(), 0, "0 ghost: an aborted step emits nothing");
-        assert_eq!(outbox.committed_count(), 0, "no committed outbox row from an abort");
+        assert_eq!(
+            journal.history_len(),
+            0,
+            "0 lost: an aborted step journals nothing"
+        );
+        assert_eq!(
+            journal.attempt_len(),
+            0,
+            "0 lost: the attempt ledger row is not written either"
+        );
+        assert_eq!(
+            outbox.outbox_depth(),
+            0,
+            "0 ghost: an aborted step emits nothing"
+        );
+        assert_eq!(
+            outbox.committed_count(),
+            0,
+            "no committed outbox row from an abort"
+        );
     }
 
     /// **A retried activity REUSES its `idem_token` (no duplicate effect, §3.5/§4.4).** An activity
@@ -1577,7 +1645,9 @@ mod tests {
             .activity(RetryPolicy { max_attempts: 3 }, move |idem, attempt| {
                 seen2.lock().unwrap().push(idem.to_string());
                 if attempt < 3 {
-                    Err(ActivityError(format!("transient failure on attempt {attempt}")))
+                    Err(ActivityError(format!(
+                        "transient failure on attempt {attempt}"
+                    )))
                 } else {
                     Ok(vec![ArtifactRef("myelin://acme/agent/effect/e1".into())])
                 }
@@ -1597,15 +1667,25 @@ mod tests {
             .iter()
             .filter(|r| r.kind == history_kind::ACTIVITY_COMPLETED)
             .collect();
-        assert_eq!(completed.len(), 1, "exactly one activity_completed row (no duplicate effect)");
+        assert_eq!(
+            completed.len(),
+            1,
+            "exactly one activity_completed row (no duplicate effect)"
+        );
         // the attempt ledger records all three attempts, all on the same idem_token.
         let attempts = journal.attempts_for(&tenant(), "R1");
         assert_eq!(attempts.len(), 3, "three attempt ledger rows");
         assert!(
-            attempts.iter().all(|a| a.idem_token == attempts[0].idem_token),
+            attempts
+                .iter()
+                .all(|a| a.idem_token == attempts[0].idem_token),
             "all attempts share one idem_token"
         );
-        assert_eq!(attempts[2].state, attempt_state::SUCCEEDED, "the third attempt succeeded");
+        assert_eq!(
+            attempts[2].state,
+            attempt_state::SUCCEEDED,
+            "the third attempt succeeded"
+        );
     }
 
     /// **An exhausted activity journals exactly one `activity_failed` row and returns
@@ -1635,12 +1715,18 @@ mod tests {
             .collect();
         assert_eq!(failed.len(), 1, "exactly one activity_failed history row");
         assert!(
-            !hist.iter().any(|r| r.kind == history_kind::ACTIVITY_COMPLETED),
+            !hist
+                .iter()
+                .any(|r| r.kind == history_kind::ACTIVITY_COMPLETED),
             "no completed row for a fully-failed activity"
         );
         let attempts = journal.attempts_for(&tenant(), "R1");
         assert_eq!(attempts.len(), 2, "both attempts in the ledger");
-        assert_eq!(attempts[1].state, attempt_state::FAILED, "the last attempt is FAILED");
+        assert_eq!(
+            attempts[1].state,
+            attempt_state::FAILED,
+            "the last attempt is FAILED"
+        );
     }
 
     /// **`now()` / `rand()` are journaled SIDE-MARKERS and are deterministic (§5.1).** Two `WfCtx`
@@ -1655,14 +1741,27 @@ mod tests {
         let t1 = ctx.now();
         let r1 = ctx.rand();
         let r2 = ctx.rand();
-        assert_eq!(t1, "2026-06-21T00:00:00Z", "now() returns the deterministic clock");
+        assert_eq!(
+            t1, "2026-06-21T00:00:00Z",
+            "now() returns the deterministic clock"
+        );
         assert_ne!(r1, r2, "rand() advances (a sequence, not a constant)");
         // The EXACT splitmix64 draws for seed 42 — pinned so a regression in the mixing function
         // (a flipped ^/>>) is caught: replay-stability requires the value derivation be frozen.
-        assert_eq!(r1, 13_679_457_532_755_275_413, "rand() draw 1 is the frozen splitmix64(42) value");
-        assert_eq!(r2, 2_949_826_092_126_892_291, "rand() draw 2 is the frozen splitmix64 value");
+        assert_eq!(
+            r1, 13_679_457_532_755_275_413,
+            "rand() draw 1 is the frozen splitmix64(42) value"
+        );
+        assert_eq!(
+            r2, 2_949_826_092_126_892_291,
+            "rand() draw 2 is the frozen splitmix64 value"
+        );
         // three side-marker history rows staged (now + two rands).
-        assert_eq!(ctx.staged_history_len(), 3, "now/rand each journal a side-marker");
+        assert_eq!(
+            ctx.staged_history_len(),
+            3,
+            "now/rand each journal a side-marker"
+        );
         ctx.commit().expect("co-commit");
         let markers: Vec<_> = journal
             .history_for(&tenant(), "R1")
@@ -1769,8 +1868,15 @@ mod tests {
 
         // history_for(R1) returns EXACTLY R1's three rows (the AND-filter is real — not R2's).
         let h1 = journal.history_for(&tenant(), "R1");
-        assert_eq!(h1.len(), 3, "R1 has exactly its three history rows (now+activity+rand)");
-        assert!(h1.iter().all(|r| r.run_id == "R1"), "no R2 row leaked into R1's history (AND-filter)");
+        assert_eq!(
+            h1.len(),
+            3,
+            "R1 has exactly its three history rows (now+activity+rand)"
+        );
+        assert!(
+            h1.iter().all(|r| r.run_id == "R1"),
+            "no R2 row leaked into R1's history (AND-filter)"
+        );
         // the per-run monotonic replay-order seq is 0, 1, 2 (kills the next_history_seq mutant).
         assert_eq!(
             h1.iter().map(|r| r.seq).collect::<Vec<_>>(),
@@ -1780,13 +1886,26 @@ mod tests {
         // attempts_for(R1) returns exactly R1's one attempt (not R2's).
         let a1 = journal.attempts_for(&tenant(), "R1");
         assert_eq!(a1.len(), 1, "R1 has exactly one attempt row");
-        assert!(a1.iter().all(|r| r.run_id == "R1"), "no R2 attempt leaked into R1's (AND-filter)");
+        assert!(
+            a1.iter().all(|r| r.run_id == "R1"),
+            "no R2 attempt leaked into R1's (AND-filter)"
+        );
         // R2 is isolated too.
-        assert_eq!(journal.history_for(&tenant(), "R2").len(), 1, "R2 has exactly its one row");
-        assert_eq!(journal.attempts_for(&tenant(), "R2").len(), 1, "R2 has exactly its one attempt");
+        assert_eq!(
+            journal.history_for(&tenant(), "R2").len(),
+            1,
+            "R2 has exactly its one row"
+        );
+        assert_eq!(
+            journal.attempts_for(&tenant(), "R2").len(),
+            1,
+            "R2 has exactly its one attempt"
+        );
         // a wrong tenant returns nothing (the tenant half of the AND-filter).
         assert!(
-            journal.history_for(&TenantId("other".into()), "R1").is_empty(),
+            journal
+                .history_for(&TenantId("other".into()), "R1")
+                .is_empty(),
             "a different tenant sees none of acme's rows (the tenant half of the AND-filter)"
         );
     }
@@ -1813,22 +1932,42 @@ mod tests {
         let ran = Arc::new(Mutex::new(false));
         let ran2 = ran.clone();
         let mut c2 = WfCtx::resume(
-            &outbox, minter(), journal.clone(), ctx_base(), "R1", "agent.run",
-            "2026-06-21T00:00:00Z", 42, history,
+            &outbox,
+            minter(),
+            journal.clone(),
+            ctx_base(),
+            "R1",
+            "agent.run",
+            "2026-06-21T00:00:00Z",
+            42,
+            history,
         );
         let out = c2
             .activity(RetryPolicy::default_policy(), move |_i, _a| {
                 *ran2.lock().unwrap() = true; // would flip true IF the closure re-ran.
-                Ok(vec![ArtifactRef("myelin://acme/agent/effect/SHOULD-NOT-APPEAR".into())])
+                Ok(vec![ArtifactRef(
+                    "myelin://acme/agent/effect/SHOULD-NOT-APPEAR".into(),
+                )])
             })
             .expect("the activity replays");
-        assert!(!*ran.lock().unwrap(), "the closure was NOT re-executed (replay short-circuit)");
+        assert!(
+            !*ran.lock().unwrap(),
+            "the closure was NOT re-executed (replay short-circuit)"
+        );
         assert_eq!(
             out[0].0, "myelin://acme/agent/effect/e1",
             "the JOURNALED result is returned, not the re-run closure's"
         );
-        assert_eq!(c2.side_effects_executed(), 0, "0 side effects executed on a pure replay");
-        assert_eq!(c2.double_effects(), 0, "0 double-effect (the FLOW-D1 floor)");
+        assert_eq!(
+            c2.side_effects_executed(),
+            0,
+            "0 side effects executed on a pure replay"
+        );
+        assert_eq!(
+            c2.double_effects(),
+            0,
+            "0 double-effect (the FLOW-D1 floor)"
+        );
     }
 
     /// **REPLAY: a journaled `activity_failed` command replays to the SAME failure — 0 re-execution
@@ -1848,7 +1987,9 @@ mod tests {
         c1.commit().expect("co-commit the failure");
         let history = journal.history_for(&tenant(), "R1");
         assert!(
-            history.iter().any(|r| r.kind == history_kind::ACTIVITY_FAILED),
+            history
+                .iter()
+                .any(|r| r.kind == history_kind::ACTIVITY_FAILED),
             "an activity_failed row is journaled"
         );
 
@@ -1856,8 +1997,15 @@ mod tests {
         let ran = Arc::new(Mutex::new(false));
         let ran2 = ran.clone();
         let mut c2 = WfCtx::resume(
-            &outbox, minter(), journal.clone(), ctx_base(), "R1", "agent.run",
-            "2026-06-21T00:00:00Z", 42, history,
+            &outbox,
+            minter(),
+            journal.clone(),
+            ctx_base(),
+            "R1",
+            "agent.run",
+            "2026-06-21T00:00:00Z",
+            42,
+            history,
         );
         let err = c2
             .activity(RetryPolicy { max_attempts: 5 }, move |_i, _a| {
@@ -1865,10 +2013,24 @@ mod tests {
                 Ok(vec![ArtifactRef("myelin://acme/SHOULD-NOT-RUN".into())])
             })
             .expect_err("the journaled failure replays to a failure");
-        assert!(matches!(err, WfError::ActivityExhausted(_)), "replays to ActivityExhausted");
-        assert!(!*ran.lock().unwrap(), "the closure was NOT re-executed (failed-replay short-circuit)");
-        assert_eq!(c2.side_effects_executed(), 0, "0 side effects on a failed-replay short-circuit");
-        assert_eq!(c2.double_effects(), 0, "0 double-effect on the failed-replay path");
+        assert!(
+            matches!(err, WfError::ActivityExhausted(_)),
+            "replays to ActivityExhausted"
+        );
+        assert!(
+            !*ran.lock().unwrap(),
+            "the closure was NOT re-executed (failed-replay short-circuit)"
+        );
+        assert_eq!(
+            c2.side_effects_executed(),
+            0,
+            "0 side effects on a failed-replay short-circuit"
+        );
+        assert_eq!(
+            c2.double_effects(),
+            0,
+            "0 double-effect on the failed-replay path"
+        );
     }
 
     /// **P-FLOW-07: a KIND-MISMATCH on replay HALTS as `nondeterministic` — it does NOT re-execute
@@ -1893,21 +2055,50 @@ mod tests {
         let ran = Arc::new(Mutex::new(false));
         let ran2 = ran.clone();
         let mut c2 = WfCtx::resume(
-            &outbox, minter(), journal.clone(), ctx_base(), "R1", "agent.run",
-            "2026-06-21T00:00:00Z", 42, history,
+            &outbox,
+            minter(),
+            journal.clone(),
+            ctx_base(),
+            "R1",
+            "agent.run",
+            "2026-06-21T00:00:00Z",
+            42,
+            history,
         );
         let err = c2
             .activity(RetryPolicy::default_policy(), move |_i, _a| {
                 *ran2.lock().unwrap() = true; // would flip IF the divergent activity ran live.
-                Ok(vec![ArtifactRef("myelin://acme/agent/effect/SHOULD-NOT-RUN".into())])
+                Ok(vec![ArtifactRef(
+                    "myelin://acme/agent/effect/SHOULD-NOT-RUN".into(),
+                )])
             })
             .expect_err("the kind-mismatch halts as nondeterministic");
-        assert!(matches!(err, WfError::Nondeterministic(_)), "the verdict is Nondeterministic, got {err:?}");
-        assert!(err.is_nondeterministic(), "is_nondeterministic predicate is true");
-        assert!(!*ran.lock().unwrap(), "the divergent activity did NOT run live (the guard halted it)");
-        assert_eq!(c2.side_effects_executed(), 0, "0 side effects — the guard halted before live exec");
-        assert_eq!(c2.double_effects(), 0, "0 double-effect — the divergence is a halt, not a re-execution");
-        assert!(c2.is_divergent(), "the divergence latch is set (the engine dead-letters the run)");
+        assert!(
+            matches!(err, WfError::Nondeterministic(_)),
+            "the verdict is Nondeterministic, got {err:?}"
+        );
+        assert!(
+            err.is_nondeterministic(),
+            "is_nondeterministic predicate is true"
+        );
+        assert!(
+            !*ran.lock().unwrap(),
+            "the divergent activity did NOT run live (the guard halted it)"
+        );
+        assert_eq!(
+            c2.side_effects_executed(),
+            0,
+            "0 side effects — the guard halted before live exec"
+        );
+        assert_eq!(
+            c2.double_effects(),
+            0,
+            "0 double-effect — the divergence is a halt, not a re-execution"
+        );
+        assert!(
+            c2.is_divergent(),
+            "the divergence latch is set (the engine dead-letters the run)"
+        );
         assert!(
             c2.divergence().unwrap().contains("agent.run:0"),
             "the divergence reason names the diverging position: {:?}",
@@ -1954,11 +2145,21 @@ mod tests {
 
         // resume but issue a now() at position 0 (the reverse divergence).
         let mut c2 = WfCtx::resume(
-            &outbox, minter(), journal.clone(), ctx_base(), "R1", "agent.run",
-            "2026-06-21T00:00:00Z", 42, history,
+            &outbox,
+            minter(),
+            journal.clone(),
+            ctx_base(),
+            "R1",
+            "agent.run",
+            "2026-06-21T00:00:00Z",
+            42,
+            history,
         );
         let _ = c2.now(); // the body reads now() where the journal records an activity.
-        assert!(c2.is_divergent(), "a now() at an activity position latches the divergence");
+        assert!(
+            c2.is_divergent(),
+            "a now() at an activity position latches the divergence"
+        );
         assert!(
             c2.divergence().unwrap().contains("side-marker"),
             "the reason names the side-marker divergence: {:?}",
@@ -1967,11 +2168,21 @@ mod tests {
         // a rand() at a journaled activity position likewise diverges (resume fresh to test rand).
         let history2 = journal.history_for(&tenant(), "R1");
         let mut c3 = WfCtx::resume(
-            &outbox, minter(), journal.clone(), ctx_base(), "R1", "agent.run",
-            "2026-06-21T00:00:00Z", 42, history2,
+            &outbox,
+            minter(),
+            journal.clone(),
+            ctx_base(),
+            "R1",
+            "agent.run",
+            "2026-06-21T00:00:00Z",
+            42,
+            history2,
         );
         let _ = c3.rand();
-        assert!(c3.is_divergent(), "a rand() at an activity position also latches the divergence");
+        assert!(
+            c3.is_divergent(),
+            "a rand() at an activity position also latches the divergence"
+        );
     }
 
     /// **REPLAY: a resumed `now()`/`rand()` returns its CAPTURED value, not a recomputed one (§4.1).**
@@ -1990,11 +2201,26 @@ mod tests {
 
         // resume with a DIFFERENT clock + seed — the captured values must still come back.
         let mut c2 = WfCtx::resume(
-            &outbox, minter(), journal.clone(), ctx_base(), "R1", "agent.run",
-            "2099-01-01T00:00:00Z", 999_999, history,
+            &outbox,
+            minter(),
+            journal.clone(),
+            ctx_base(),
+            "R1",
+            "agent.run",
+            "2099-01-01T00:00:00Z",
+            999_999,
+            history,
         );
-        assert_eq!(c2.now(), t1, "now() replays its captured clock (not the resume-time clock)");
-        assert_eq!(c2.rand(), r1, "rand() replays its captured draw (not a re-seeded draw)");
+        assert_eq!(
+            c2.now(),
+            t1,
+            "now() replays its captured clock (not the resume-time clock)"
+        );
+        assert_eq!(
+            c2.rand(),
+            r1,
+            "rand() replays its captured draw (not a re-seeded draw)"
+        );
     }
 
     /// **`staged_emit_len` reflects the OPEN transaction's buffered emits precisely.** Two emits on
@@ -2008,9 +2234,17 @@ mod tests {
         ctx.emit(draft("a.b.c"), None).expect("emit 1");
         assert_eq!(ctx.staged_emit_len(), 1, "one emit staged");
         ctx.emit(draft("a.b.d"), None).expect("emit 2");
-        assert_eq!(ctx.staged_emit_len(), 2, "two emits staged (not a constant)");
+        assert_eq!(
+            ctx.staged_emit_len(),
+            2,
+            "two emits staged (not a constant)"
+        );
         ctx.commit().expect("co-commit");
-        assert_eq!(outbox.outbox_depth(), 2, "both emits durable after the co-commit");
+        assert_eq!(
+            outbox.outbox_depth(),
+            2,
+            "both emits durable after the co-commit"
+        );
     }
 
     /// **`sleep_until` arms a durable `wf_timer` row + journals `timer_set` + PARKS (P-FLOW-13,
@@ -2025,12 +2259,23 @@ mod tests {
         // now = 1000s; sleep until 1600s (future → parks). partition 3.
         let mut ctx = begin(&outbox, journal.clone()).with_timers(timers.clone(), 3, 1000);
         ctx.sleep_until(1600).expect("the sleep arms + journals");
-        assert!(ctx.parked_on_timer(), "a future-deadline sleep parks the run (waiting, no runtime)");
+        assert!(
+            ctx.parked_on_timer(),
+            "a future-deadline sleep parks the run (waiting, no runtime)"
+        );
         // the timer is armed on the wheel in its minute bucket (1600/60 = 26), deterministic id.
-        let timer = timers.get(&tenant(), "R1/agent.run:0").expect("the armed timer");
+        let timer = timers
+            .get(&tenant(), "R1/agent.run:0")
+            .expect("the armed timer");
         assert_eq!(timer.fire_at, 1600, "the absolute deadline");
-        assert_eq!(timer.bucket, 26, "the minute bucket = epoch_minute(1600) = 26");
-        assert_eq!(timer.partition, 3, "the timer rides the run's partition (co-located dispatch)");
+        assert_eq!(
+            timer.bucket, 26,
+            "the minute bucket = epoch_minute(1600) = 26"
+        );
+        assert_eq!(
+            timer.partition, 3,
+            "the timer rides the run's partition (co-located dispatch)"
+        );
         assert!(!timer.fired, "armed-not-fired (the partial-index pivot)");
         // one timer_set side row staged + journaled.
         assert_eq!(ctx.staged_history_len(), 1, "one timer_set marker staged");
@@ -2038,7 +2283,10 @@ mod tests {
         let hist = journal.history_for(&tenant(), "R1");
         assert_eq!(hist.len(), 1, "the timer_set marker is journaled");
         assert_eq!(hist[0].kind, crate::timer::history_kind::TIMER_SET);
-        assert_eq!(hist[0].command_id, "agent.run:0", "under the deterministic command position");
+        assert_eq!(
+            hist[0].command_id, "agent.run:0",
+            "under the deterministic command position"
+        );
     }
 
     /// **A `sleep_until` whose deadline already PASSED arms immediately-due and does NOT park (§4.2).**
@@ -2051,9 +2299,15 @@ mod tests {
         // now = 1000s; sleep until 500s (already past).
         let mut ctx = begin(&outbox, WfJournal::new()).with_timers(timers.clone(), 0, 1000);
         ctx.sleep_until(500).expect("the sleep arms");
-        assert!(!ctx.parked_on_timer(), "a past-deadline sleep is a no-wait continuation (no park)");
+        assert!(
+            !ctx.parked_on_timer(),
+            "a past-deadline sleep is a no-wait continuation (no park)"
+        );
         // the timer is still armed (immediately due — the next wheel tick fires it).
-        assert!(timers.get(&tenant(), "R1/agent.run:0").is_some(), "the immediately-due timer is armed");
+        assert!(
+            timers.get(&tenant(), "R1/agent.run:0").is_some(),
+            "the immediately-due timer is armed"
+        );
     }
 
     /// **`sleep_for` arms a RELATIVE timer (now + duration) and parks (§4.2).** `sleep_for(30 days)`
@@ -2064,12 +2318,22 @@ mod tests {
         let outbox = OutboxStore::new();
         let timers = crate::timer::TimerStore::new();
         let mut ctx = begin(&outbox, WfJournal::new()).with_timers(timers.clone(), 0, 1000);
-        ctx.sleep_for(30 * 24 * 3600).expect("the relative sleep arms");
+        ctx.sleep_for(30 * 24 * 3600)
+            .expect("the relative sleep arms");
         assert!(ctx.parked_on_timer(), "a 30-day sleep parks the run");
-        let timer = timers.get(&tenant(), "R1/agent.run:0").expect("the armed timer");
-        assert_eq!(timer.fire_at, 1000 + 30 * 24 * 3600, "the deadline is now + duration");
+        let timer = timers
+            .get(&tenant(), "R1/agent.run:0")
+            .expect("the armed timer");
+        assert_eq!(
+            timer.fire_at,
+            1000 + 30 * 24 * 3600,
+            "the deadline is now + duration"
+        );
         // a far-future bucket — the SC-11 partial index never reads it until its minute.
-        assert_eq!(timer.bucket, crate::timer::epoch_minute(1000 + 30 * 24 * 3600));
+        assert_eq!(
+            timer.bucket,
+            crate::timer::epoch_minute(1000 + 30 * 24 * 3600)
+        );
     }
 
     /// **A `sleep` on a `WfCtx` with NO timer wheel errors LOUDLY — never a silent no-op (EI-01 §2).**
@@ -2080,12 +2344,20 @@ mod tests {
     fn sleep_with_no_timer_wheel_errors_loudly() {
         let outbox = OutboxStore::new();
         let mut ctx = begin(&outbox, WfJournal::new()); // NO with_timers.
-        let err = ctx.sleep_until(2000).expect_err("a sleep with no wheel is a loud error");
+        let err = ctx
+            .sleep_until(2000)
+            .expect_err("a sleep with no wheel is a loud error");
         match err {
-            WfError::CoCommit(msg) => assert!(msg.contains("timer wheel"), "the error names the missing wheel: {msg}"),
+            WfError::CoCommit(msg) => assert!(
+                msg.contains("timer wheel"),
+                "the error names the missing wheel: {msg}"
+            ),
             other => panic!("expected CoCommit naming the missing wheel, got {other:?}"),
         }
-        assert!(!ctx.parked_on_timer(), "a failed sleep did not park (it errored)");
+        assert!(
+            !ctx.parked_on_timer(),
+            "a failed sleep did not park (it errored)"
+        );
     }
 
     /// **REPLAY: a resumed `sleep_until` returns WITHOUT re-arming the timer (§4.1).** The first drive
@@ -2102,18 +2374,36 @@ mod tests {
         let mut c1 = begin(&outbox, journal.clone()).with_timers(timers.clone(), 0, 1000);
         c1.sleep_until(1600).expect("arm");
         c1.commit().expect("co-commit the marker");
-        assert_eq!(timers.armed_count(), 1, "one timer armed on the first drive");
+        assert_eq!(
+            timers.armed_count(),
+            1,
+            "one timer armed on the first drive"
+        );
         let history = journal.history_for(&tenant(), "R1");
 
         // resume: re-issue the sleep at the same position — it replays (no re-arm, no second park).
         let mut c2 = WfCtx::resume(
-            &outbox, minter(), journal.clone(), ctx_base(), "R1", "agent.run",
-            "2026-06-21T00:00:00Z", 42, history,
+            &outbox,
+            minter(),
+            journal.clone(),
+            ctx_base(),
+            "R1",
+            "agent.run",
+            "2026-06-21T00:00:00Z",
+            42,
+            history,
         )
         .with_timers(timers.clone(), 0, 1700);
         c2.sleep_until(1600).expect("the sleep replays");
-        assert_eq!(timers.armed_count(), 1, "no SECOND timer armed (the replay short-circuited)");
-        assert!(!c2.parked_on_timer(), "the resumed sleep does not re-park (the run already waited)");
+        assert_eq!(
+            timers.armed_count(),
+            1,
+            "no SECOND timer armed (the replay short-circuited)"
+        );
+        assert!(
+            !c2.parked_on_timer(),
+            "the resumed sleep does not re-park (the run already waited)"
+        );
     }
 
     /// **REVERSE divergence: a `sleep` at a position journaled as an ACTIVITY halts (P-FLOW-07,
@@ -2136,14 +2426,33 @@ mod tests {
 
         // resume but issue a sleep at position 0 (the divergence).
         let mut c2 = WfCtx::resume(
-            &outbox, minter(), journal.clone(), ctx_base(), "R1", "agent.run",
-            "2026-06-21T00:00:00Z", 42, history,
+            &outbox,
+            minter(),
+            journal.clone(),
+            ctx_base(),
+            "R1",
+            "agent.run",
+            "2026-06-21T00:00:00Z",
+            42,
+            history,
         )
         .with_timers(timers.clone(), 0, 1000);
-        let err = c2.sleep_until(2000).expect_err("the sleep-at-activity-position diverges");
-        assert!(err.is_nondeterministic(), "the verdict is Nondeterministic, got {err:?}");
-        assert!(c2.is_divergent(), "the divergence latch is set (the engine dead-letters the run)");
-        assert_eq!(timers.armed_count(), 0, "no timer armed against the journaled activity position");
+        let err = c2
+            .sleep_until(2000)
+            .expect_err("the sleep-at-activity-position diverges");
+        assert!(
+            err.is_nondeterministic(),
+            "the verdict is Nondeterministic, got {err:?}"
+        );
+        assert!(
+            c2.is_divergent(),
+            "the divergence latch is set (the engine dead-letters the run)"
+        );
+        assert_eq!(
+            timers.armed_count(),
+            0,
+            "no timer armed against the journaled activity position"
+        );
     }
 
     // ---- wait_for_signal (P-FLOW-11, §4.3) -------------------------------------------------------
@@ -2175,9 +2484,19 @@ mod tests {
         let mut ctx = begin(&outbox, journal.clone()).with_signals(signals.clone());
         let out = ctx.wait_for_signal("approval:call-1", None).expect("wait");
         assert_eq!(out, WaitOutcome::Parked, "an absent signal parks the run");
-        assert!(ctx.parked_on_signal(), "the run is parked on the signal (state=waiting holds no runtime)");
-        assert!(ctx.parked(), "the unified park predicate sees the signal park");
-        assert_eq!(ctx.consumed_signals().len(), 0, "nothing consumed — the signal has not arrived");
+        assert!(
+            ctx.parked_on_signal(),
+            "the run is parked on the signal (state=waiting holds no runtime)"
+        );
+        assert!(
+            ctx.parked(),
+            "the unified park predicate sees the signal park"
+        );
+        assert_eq!(
+            ctx.consumed_signals().len(),
+            0,
+            "nothing consumed — the signal has not arrived"
+        );
         ctx.commit().expect("co-commit the park marker");
         let hist = journal.history_for(&tenant(), "R1");
         assert_eq!(hist.len(), 1, "one signal_waited marker journaled");
@@ -2193,28 +2512,48 @@ mod tests {
         let outbox = OutboxStore::new();
         let journal = WfJournal::new();
         let signals = SignalStore::new();
-        buffer_signal(&signals, "approval:call-1", "card-7",
-            vec![ArtifactRef("myelin://acme/agent/decision/approve".into())]);
+        buffer_signal(
+            &signals,
+            "approval:call-1",
+            "card-7",
+            vec![ArtifactRef("myelin://acme/agent/decision/approve".into())],
+        );
         assert_eq!(signals.buffered_depth(), 1, "the approval is buffered");
 
         let mut ctx = begin(&outbox, journal.clone()).with_signals(signals.clone());
         let out = ctx.wait_for_signal("approval:call-1", None).expect("wait");
         match out {
-            WaitOutcome::Signalled { idem_key, payload, .. } => {
+            WaitOutcome::Signalled {
+                idem_key, payload, ..
+            } => {
                 assert_eq!(idem_key, "card-7", "the consumed signal's per-effect key");
-                assert_eq!(payload, vec![ArtifactRef("myelin://acme/agent/decision/approve".into())],
-                    "the references-not-payloads decision body");
+                assert_eq!(
+                    payload,
+                    vec![ArtifactRef("myelin://acme/agent/decision/approve".into())],
+                    "the references-not-payloads decision body"
+                );
             }
             other => panic!("expected Signalled, got {other:?}"),
         }
         assert!(!ctx.parked_on_signal(), "a consumed wait does NOT park");
-        assert_eq!(ctx.consumed_signals(), &[("approval:call-1".to_string(), "card-7".to_string())],
-            "exactly ONE signal consumed (FLOW-D4: 1 consume)");
+        assert_eq!(
+            ctx.consumed_signals(),
+            &[("approval:call-1".to_string(), "card-7".to_string())],
+            "exactly ONE signal consumed (FLOW-D4: 1 consume)"
+        );
         // the consume stamped consumed_seq → buffered depth dropped to 0 (the §4.3 consume-once).
-        assert_eq!(signals.buffered_depth(), 0, "the consumed signal no longer counts (1 consume)");
+        assert_eq!(
+            signals.buffered_depth(),
+            0,
+            "the consumed signal no longer counts (1 consume)"
+        );
         ctx.commit().expect("co-commit the signal_received marker");
         let hist = journal.history_for(&tenant(), "R1");
-        assert_eq!(hist[0].kind, history_kind::SIGNAL_RECEIVED, "the consume is journaled");
+        assert_eq!(
+            hist[0].kind,
+            history_kind::SIGNAL_RECEIVED,
+            "the consume is journaled"
+        );
     }
 
     /// **The multi-day round-trip: park, then a days-later signal resumes + consumes ONCE (FLOW-D4).**
@@ -2229,28 +2568,55 @@ mod tests {
 
         // DRIVE 1: the body waits; no signal is buffered → park (state=waiting).
         let mut c1 = begin(&outbox, journal.clone()).with_signals(signals.clone());
-        assert_eq!(c1.wait_for_signal("approval:call-1", None).unwrap(), WaitOutcome::Parked);
+        assert_eq!(
+            c1.wait_for_signal("approval:call-1", None).unwrap(),
+            WaitOutcome::Parked
+        );
         assert!(c1.parked_on_signal());
         c1.commit().expect("co-commit the park");
         let history = journal.history_for(&tenant(), "R1");
 
         // DAYS LATER: a human clicks Approve → the signal is buffered (DurableExecutor::signal).
-        buffer_signal(&signals, "approval:call-1", "card-7",
-            vec![ArtifactRef("myelin://acme/agent/decision/approve".into())]);
+        buffer_signal(
+            &signals,
+            "approval:call-1",
+            "card-7",
+            vec![ArtifactRef("myelin://acme/agent/decision/approve".into())],
+        );
 
         // DRIVE 2 (re-lease / re-drive): the wait replays the journaled `signal_waited` then re-checks
         // the buffer — the now-present signal resumes the run, consuming it EXACTLY once.
         let mut c2 = WfCtx::resume(
-            &outbox, minter(), journal.clone(), ctx_base(), "R1", "agent.run",
-            "2026-06-21T00:00:00Z", 42, history,
+            &outbox,
+            minter(),
+            journal.clone(),
+            ctx_base(),
+            "R1",
+            "agent.run",
+            "2026-06-21T00:00:00Z",
+            42,
+            history,
         )
         .with_signals(signals.clone());
-        let out = c2.wait_for_signal("approval:call-1", None).expect("the days-later resume");
-        assert!(matches!(out, WaitOutcome::Signalled { .. }), "the days-later signal resumes, got {out:?}");
-        assert_eq!(c2.consumed_signals().len(), 1, "exactly ONE consume across the restart (FLOW-D4)");
+        let out = c2
+            .wait_for_signal("approval:call-1", None)
+            .expect("the days-later resume");
+        assert!(
+            matches!(out, WaitOutcome::Signalled { .. }),
+            "the days-later signal resumes, got {out:?}"
+        );
+        assert_eq!(
+            c2.consumed_signals().len(),
+            1,
+            "exactly ONE consume across the restart (FLOW-D4)"
+        );
         assert!(!c2.parked_on_signal(), "the resumed run no longer parks");
         c2.commit().expect("co-commit the consume");
-        assert_eq!(signals.buffered_depth(), 0, "the signal is consumed once (buffered depth 0)");
+        assert_eq!(
+            signals.buffered_depth(),
+            0,
+            "the signal is consumed once (buffered depth 0)"
+        );
     }
 
     /// **Replay returns the SAME consumed signal — consume-exactly-once across a re-drive (§4.1).** A
@@ -2262,33 +2628,61 @@ mod tests {
         let outbox = OutboxStore::new();
         let journal = WfJournal::new();
         let signals = SignalStore::new();
-        buffer_signal(&signals, "approval:call-1", "card-7",
-            vec![ArtifactRef("myelin://acme/agent/decision/approve".into())]);
+        buffer_signal(
+            &signals,
+            "approval:call-1",
+            "card-7",
+            vec![ArtifactRef("myelin://acme/agent/decision/approve".into())],
+        );
         // drive 1 consumes the signal + journals signal_received.
         let mut c1 = begin(&outbox, journal.clone()).with_signals(signals.clone());
-        c1.wait_for_signal("approval:call-1", None).expect("consume");
+        c1.wait_for_signal("approval:call-1", None)
+            .expect("consume");
         c1.commit().expect("co-commit");
         let history = journal.history_for(&tenant(), "R1");
 
         // a SECOND, distinct signal is buffered (a different key) — replay must NOT consume it.
-        buffer_signal(&signals, "approval:call-1", "card-99",
-            vec![ArtifactRef("myelin://acme/agent/decision/other".into())]);
+        buffer_signal(
+            &signals,
+            "approval:call-1",
+            "card-99",
+            vec![ArtifactRef("myelin://acme/agent/decision/other".into())],
+        );
         let depth_before = signals.buffered_depth();
 
         // drive 2: re-issue the wait — it short-circuits to the journaled signal (card-7), not card-99.
         let mut c2 = WfCtx::resume(
-            &outbox, minter(), journal.clone(), ctx_base(), "R1", "agent.run",
-            "2026-06-21T00:00:00Z", 42, history,
+            &outbox,
+            minter(),
+            journal.clone(),
+            ctx_base(),
+            "R1",
+            "agent.run",
+            "2026-06-21T00:00:00Z",
+            42,
+            history,
         )
         .with_signals(signals.clone());
-        let out = c2.wait_for_signal("approval:call-1", None).expect("replay the consume");
+        let out = c2
+            .wait_for_signal("approval:call-1", None)
+            .expect("replay the consume");
         match out {
-            WaitOutcome::Signalled { idem_key, .. } => assert_eq!(idem_key, "card-7",
-                "replay returns the SAME journaled signal (card-7), never re-scans to card-99"),
+            WaitOutcome::Signalled { idem_key, .. } => assert_eq!(
+                idem_key, "card-7",
+                "replay returns the SAME journaled signal (card-7), never re-scans to card-99"
+            ),
             other => panic!("expected the journaled Signalled, got {other:?}"),
         }
-        assert_eq!(c2.consumed_signals().len(), 0, "replay consumed NOTHING new (the journal is the truth)");
-        assert_eq!(signals.buffered_depth(), depth_before, "the second signal (card-99) was NOT consumed on replay");
+        assert_eq!(
+            c2.consumed_signals().len(),
+            0,
+            "replay consumed NOTHING new (the journal is the truth)"
+        );
+        assert_eq!(
+            signals.buffered_depth(),
+            depth_before,
+            "the second signal (card-99) was NOT consumed on replay"
+        );
     }
 
     /// **A wait with a TIMEOUT whose deadline PASSED returns `TimedOut` (the §6.3 auto-deny branch).** No
@@ -2305,21 +2699,41 @@ mod tests {
         let mut c1 = begin(&outbox, journal.clone())
             .with_signals(signals.clone())
             .with_timers(timers.clone(), 0, 1000);
-        assert_eq!(c1.wait_for_signal("approval:call-1", Some(100)).unwrap(), WaitOutcome::Parked);
+        assert_eq!(
+            c1.wait_for_signal("approval:call-1", Some(100)).unwrap(),
+            WaitOutcome::Parked
+        );
         c1.commit().expect("co-commit the park + the timeout-timer");
         assert_eq!(timers.armed_count(), 1, "a durable timeout-timer was armed");
         let history = journal.history_for(&tenant(), "R1");
 
         // DRIVE 2 at clock=2000 (past the deadline 1100), STILL no signal → TimedOut.
         let mut c2 = WfCtx::resume(
-            &outbox, minter(), journal.clone(), ctx_base(), "R1", "agent.run",
-            "2026-06-21T00:00:00Z", 42, history,
+            &outbox,
+            minter(),
+            journal.clone(),
+            ctx_base(),
+            "R1",
+            "agent.run",
+            "2026-06-21T00:00:00Z",
+            42,
+            history,
         )
         .with_signals(signals.clone())
         .with_timers(timers.clone(), 0, 2000);
-        let out = c2.wait_for_signal("approval:call-1", Some(100)).expect("the timeout drive");
-        assert_eq!(out, WaitOutcome::TimedOut, "the deadline passed without a signal → TimedOut (auto-deny)");
-        assert_eq!(c2.consumed_signals().len(), 0, "a timeout consumes no signal (0 mutation, AG-8)");
+        let out = c2
+            .wait_for_signal("approval:call-1", Some(100))
+            .expect("the timeout drive");
+        assert_eq!(
+            out,
+            WaitOutcome::TimedOut,
+            "the deadline passed without a signal → TimedOut (auto-deny)"
+        );
+        assert_eq!(
+            c2.consumed_signals().len(),
+            0,
+            "a timeout consumes no signal (0 mutation, AG-8)"
+        );
     }
 
     /// **A `wait_for_signal` with NO signal store is a LOUD error (never a silent no-op, EI-01 §2).** A
@@ -2330,9 +2744,13 @@ mod tests {
         let outbox = OutboxStore::new();
         let journal = WfJournal::new();
         let mut ctx = begin(&outbox, journal); // NO with_signals.
-        let err = ctx.wait_for_signal("approval:call-1", None).expect_err("a wait with no store errors");
-        assert!(matches!(err, WfError::CoCommit(ref m) if m.contains("signal store")),
-            "the missing-store wait is a loud CoCommit error, got {err:?}");
+        let err = ctx
+            .wait_for_signal("approval:call-1", None)
+            .expect_err("a wait with no store errors");
+        assert!(
+            matches!(err, WfError::CoCommit(ref m) if m.contains("signal store")),
+            "the missing-store wait is a loud CoCommit error, got {err:?}"
+        );
     }
 
     /// **A `wait_for_signal` at a position journaled as an ACTIVITY halts nondeterministic (P-FLOW-07).**
@@ -2346,17 +2764,30 @@ mod tests {
         let mut c1 = begin(&outbox, journal.clone());
         c1.activity(RetryPolicy::default_policy(), |_i, _a| {
             Ok(vec![ArtifactRef("myelin://acme/agent/effect/e0".into())])
-        }).expect("activity");
+        })
+        .expect("activity");
         c1.commit().expect("co-commit");
         let history = journal.history_for(&tenant(), "R1");
 
         let mut c2 = WfCtx::resume(
-            &outbox, minter(), journal.clone(), ctx_base(), "R1", "agent.run",
-            "2026-06-21T00:00:00Z", 42, history,
+            &outbox,
+            minter(),
+            journal.clone(),
+            ctx_base(),
+            "R1",
+            "agent.run",
+            "2026-06-21T00:00:00Z",
+            42,
+            history,
         )
         .with_signals(signals.clone());
-        let err = c2.wait_for_signal("approval:call-1", None).expect_err("wait-at-activity diverges");
-        assert!(err.is_nondeterministic(), "the verdict is Nondeterministic, got {err:?}");
+        let err = c2
+            .wait_for_signal("approval:call-1", None)
+            .expect_err("wait-at-activity diverges");
+        assert!(
+            err.is_nondeterministic(),
+            "the verdict is Nondeterministic, got {err:?}"
+        );
         assert!(c2.is_divergent(), "the divergence latch is set");
     }
 }

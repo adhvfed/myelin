@@ -120,7 +120,12 @@ pub trait SnapshotRestore {
     /// Restore a FRESH microVM from the `(region, class)` snapshot, returning the restored guest's
     /// handle. Each call MUST produce a DISTINCT guest (a fresh restore — never the same live guest
     /// twice; one-job-per-sandbox). `seq` disambiguates successive restores in the model.
-    fn restore(&self, region: &Region, class: &RunnerClass, seq: u64) -> Result<SandboxHandle, String>;
+    fn restore(
+        &self,
+        region: &Region,
+        class: &RunnerClass,
+        seq: u64,
+    ) -> Result<SandboxHandle, String>;
 }
 
 /// **A modelled restore (the DB-free / VM-free default-test path).** Produces a distinct fresh guest
@@ -350,7 +355,10 @@ mod tests {
         let pool = SnapshotPool::new(3, ModeledRestore::new());
         let stats = pool.warm_up(&region(), &class());
         assert_eq!(stats.target, 3);
-        assert_eq!(stats.warm, 3, "the warm buffer is filled to the fixed target (the floor)");
+        assert_eq!(
+            stats.warm, 3,
+            "the warm buffer is filled to the fixed target (the floor)"
+        );
         assert_eq!(stats.refills, 3);
         // Idempotent — warming an already-full buffer is a no-op.
         let again = pool.warm_up(&region(), &class());
@@ -371,17 +379,26 @@ mod tests {
         let sb = pool
             .acquire(&region(), &class(), || {
                 cu.fetch_add(1, Ordering::SeqCst);
-                Ok(SandboxHandle { guest_id: "cold".into() })
+                Ok(SandboxHandle {
+                    guest_id: "cold".into(),
+                })
             })
             .unwrap();
         // Served WARM (no cold boot used).
         assert_eq!(sb.path(), AcquirePath::Warm);
-        assert_eq!(cold_used.load(Ordering::SeqCst), 0, "a warm hit never cold-boots");
+        assert_eq!(
+            cold_used.load(Ordering::SeqCst),
+            0,
+            "a warm hit never cold-boots"
+        );
         // The handed-out guest is a warm restore (not the cold fallback).
         assert!(sb.handle().guest_id.starts_with("warm-"));
         // The buffer was REPLACED — occupancy stays at target.
         let stats = pool.stats(&region(), &class());
-        assert_eq!(stats.warm, 2, "the handed-out slot is replaced — occupancy stays at target");
+        assert_eq!(
+            stats.warm, 2,
+            "the handed-out slot is replaced — occupancy stays at target"
+        );
         assert_eq!(stats.warm_served, 1);
         assert_eq!(stats.warm_hit_rate(), 1.0);
     }
@@ -396,11 +413,17 @@ mod tests {
         let sb = pool
             .acquire(&region(), &class(), || {
                 cu.fetch_add(1, Ordering::SeqCst);
-                Ok(SandboxHandle { guest_id: "cold-boot".into() })
+                Ok(SandboxHandle {
+                    guest_id: "cold-boot".into(),
+                })
             })
             .unwrap();
         assert_eq!(sb.path(), AcquirePath::Cold, "an empty buffer cold-boots");
-        assert_eq!(cold_used.load(Ordering::SeqCst), 1, "the cold-boot fallback was used");
+        assert_eq!(
+            cold_used.load(Ordering::SeqCst),
+            1,
+            "the cold-boot fallback was used"
+        );
         assert_eq!(sb.handle().guest_id, "cold-boot");
         let stats = pool.stats(&region(), &class());
         assert_eq!(stats.cold_served, 1);
@@ -417,7 +440,11 @@ mod tests {
         pool.warm_up(&region(), &class());
 
         let sb = pool
-            .acquire(&region(), &class(), || Ok(SandboxHandle { guest_id: "cold".into() }))
+            .acquire(&region(), &class(), || {
+                Ok(SandboxHandle {
+                    guest_id: "cold".into(),
+                })
+            })
             .unwrap();
         let handed_out = sb.handle().guest_id.clone();
 
@@ -437,12 +464,18 @@ mod tests {
         );
         assert!(job_ran);
         // The guest was killed (whole-guest kill on teardown — never reused).
-        assert_eq!(killed.lock().unwrap().as_slice(), std::slice::from_ref(&handed_out));
+        assert_eq!(
+            killed.lock().unwrap().as_slice(),
+            std::slice::from_ref(&handed_out)
+        );
 
         // The killed guest is NOT in the warm buffer (it was never returned — a fresh REPLACEMENT
         // restore is in the buffer, a DISTINCT guest id).
         let stats = pool.stats(&region(), &class());
-        assert_eq!(stats.warm, 2, "the buffer holds fresh replacements, never the served guest");
+        assert_eq!(
+            stats.warm, 2,
+            "the buffer holds fresh replacements, never the served guest"
+        );
         // (Type-level proof: `sb` was moved into `run_one_job_then_kill` — a second use does not
         // compile. The restored VM cannot serve a second job.)
     }
@@ -457,7 +490,11 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for _ in 0..5 {
             let sb = pool
-                .acquire(&region(), &class(), || Ok(SandboxHandle { guest_id: "cold".into() }))
+                .acquire(&region(), &class(), || {
+                    Ok(SandboxHandle {
+                        guest_id: "cold".into(),
+                    })
+                })
                 .unwrap();
             assert!(
                 seen.insert(sb.handle().guest_id.clone()),
@@ -476,11 +513,19 @@ mod tests {
         pool.warm_up(&fr, &class());
         // de-fra has its OWN (empty) buffer — warming fr-par does not fill it.
         assert_eq!(pool.stats(&fr, &class()).warm, 1);
-        assert_eq!(pool.stats(&de, &class()).warm, 0, "no cross-region warm pool (12.4)");
+        assert_eq!(
+            pool.stats(&de, &class()).warm,
+            0,
+            "no cross-region warm pool (12.4)"
+        );
 
         // an acquire in de-fra cold-boots (its own buffer is empty), even though fr-par is warm.
         let sb = pool
-            .acquire(&de, &class(), || Ok(SandboxHandle { guest_id: "cold-de".into() }))
+            .acquire(&de, &class(), || {
+                Ok(SandboxHandle {
+                    guest_id: "cold-de".into(),
+                })
+            })
             .unwrap();
         assert_eq!(sb.path(), AcquirePath::Cold);
         // fr-par's warm buffer is untouched.
@@ -503,16 +548,26 @@ mod tests {
             ) -> Result<SandboxHandle, String> {
                 // first 2 restores succeed, the rest fail.
                 if self.ok_count.fetch_add(1, Ordering::SeqCst) < 2 {
-                    Ok(SandboxHandle { guest_id: format!("warm-{seq}") })
+                    Ok(SandboxHandle {
+                        guest_id: format!("warm-{seq}"),
+                    })
                 } else {
                     Err("snapshot corrupt".into())
                 }
             }
         }
-        let pool = SnapshotPool::new(5, FlakyRestore { ok_count: AtomicUsize::new(0) });
+        let pool = SnapshotPool::new(
+            5,
+            FlakyRestore {
+                ok_count: AtomicUsize::new(0),
+            },
+        );
         let stats = pool.warm_up(&region(), &class());
         // Only 2 of the 5 target restores succeeded — the fill stopped at 2 (no degraded guest).
-        assert_eq!(stats.warm, 2, "the fill stops at the last successful restore");
+        assert_eq!(
+            stats.warm, 2,
+            "the fill stops at the last successful restore"
+        );
         assert_eq!(stats.target, 5);
     }
 }

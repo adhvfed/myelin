@@ -43,7 +43,11 @@ fn region() -> Region {
     Region("fr-par".into())
 }
 fn principal() -> Principal {
-    Principal::stub(PrincipalId("platform".into()), PrincipalKind::Service, tenant())
+    Principal::stub(
+        PrincipalId("platform".into()),
+        PrincipalKind::Service,
+        tenant(),
+    )
 }
 
 fn ctx_base() -> EmitContextBase {
@@ -66,7 +70,10 @@ struct OwnerProjection {
 }
 impl OwnerProjection {
     fn put(&self, ref_: &str, body: &str) {
-        self.bodies.lock().unwrap().insert(ref_.to_string(), body.to_string());
+        self.bodies
+            .lock()
+            .unwrap()
+            .insert(ref_.to_string(), body.to_string());
     }
 }
 impl ProjectFetcher for OwnerProjection {
@@ -77,7 +84,11 @@ impl ProjectFetcher for OwnerProjection {
         ref_: &myelin_tenancy::ArtifactRef,
     ) -> Result<SearchProjection, ProjectFetchError> {
         match self.bodies.lock().unwrap().get(&ref_.0) {
-            Some(b) => Ok(SearchProjection { text: b.clone(), fields: BTreeMap::new(), lang: None }),
+            Some(b) => Ok(SearchProjection {
+                text: b.clone(),
+                fields: BTreeMap::new(),
+                lang: None,
+            }),
             None => Err(ProjectFetchError::Gone),
         }
     }
@@ -105,7 +116,11 @@ fn reindex_provides_a_job_that_rebuilds_through_the_live_consumer() {
     fetcher.put(&snapshot_ref("guide"), "a guide about paxos");
 
     let embedder: Arc<dyn EmbeddingAdapter> = Arc::new(MockEmbeddingAdapter::new(8));
-    let ix = Arc::new(IncrementalIndexer::new(vec![page_spec()], fetcher, embedder));
+    let ix = Arc::new(IncrementalIndexer::new(
+        vec![page_spec()],
+        fetcher,
+        embedder,
+    ));
     let reindexer = SearchReindexer::new(ix.clone(), region());
 
     let scope = SnapshotScope::new("knowledge", "page:all");
@@ -117,14 +132,31 @@ fn reindex_provides_a_job_that_rebuilds_through_the_live_consumer() {
         .expect("reindex returns a job");
 
     // PROVIDER: the job reports Done + the totals (the 6.4 receipt body).
-    assert!(matches!(job, ReindexJob::Done(_)), "the rebuild completes (under the batch cap)");
-    assert_eq!(job.progress().snapshots_emitted, 2, "two pages re-emitted via the bus (2.6)");
-    assert_eq!(job.progress().docs_indexed, 2, "both driven through the LIVE indexer");
+    assert!(
+        matches!(job, ReindexJob::Done(_)),
+        "the rebuild completes (under the batch cap)"
+    );
+    assert_eq!(
+        job.progress().snapshots_emitted,
+        2,
+        "two pages re-emitted via the bus (2.6)"
+    );
+    assert_eq!(
+        job.progress().docs_indexed,
+        2,
+        "both driven through the LIVE indexer"
+    );
 
     // CONSUMER: the rebuilt docs are searchable through the ordinary FT path (cold == live).
     assert_eq!(ix.live_count(&tenant(), &region()), 2);
-    let raft = ix.search_ft(&tenant(), &region(), &AclFilter::All, "raft", 10).expect("ft");
-    assert_eq!(raft.len(), 1, "the rebuilt home page is searchable (cold == live)");
+    let raft = ix
+        .search_ft(&tenant(), &region(), &AclFilter::All, "raft", 10)
+        .expect("ft");
+    assert_eq!(
+        raft.len(),
+        1,
+        "the rebuilt home page is searchable (cold == live)"
+    );
 }
 
 /// **CDC 6.4 — the seam is the ONLY rebuild path (SEARCH-1): a reindex of an UNKNOWN owner is a LOUD
@@ -134,7 +166,11 @@ fn reindex_of_an_unknown_owner_is_loud() {
     let src = ReferenceReindexSource::new("knowledge", "page");
     let fetcher = Arc::new(OwnerProjection::default());
     let embedder: Arc<dyn EmbeddingAdapter> = Arc::new(MockEmbeddingAdapter::new(8));
-    let ix = Arc::new(IncrementalIndexer::new(vec![page_spec()], fetcher, embedder));
+    let ix = Arc::new(IncrementalIndexer::new(
+        vec![page_spec()],
+        fetcher,
+        embedder,
+    ));
     let reindexer = SearchReindexer::new(ix, region());
 
     let unknown = SnapshotScope::new("refs", "edge:all"); // no `refs` source registered.

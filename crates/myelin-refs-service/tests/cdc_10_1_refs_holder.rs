@@ -31,12 +31,10 @@
 use myelin_gdpr::{EraseScope, LocateReport, PersonalDataHolder, SubjectRef, TenantId};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_refs_service::{
-    refs_store_classifier, register_refs_holders, RefsCacheHolder, RefsEdgeHolder, REFS_CACHE_STORE,
-    REFS_EDGE_STORE,
+    refs_store_classifier, register_refs_holders, RefsCacheHolder, RefsEdgeHolder,
+    REFS_CACHE_STORE, REFS_EDGE_STORE,
 };
-use myelin_substrate::{
-    assert_holder_completeness, classify_store, Holder, StoreKind,
-};
+use myelin_substrate::{assert_holder_completeness, classify_store, Holder, StoreKind};
 
 fn subject(id: &str) -> SubjectRef {
     SubjectRef::new(Principal::stub(
@@ -68,7 +66,10 @@ impl<'a> DsrOrchestratorConsumer<'a> {
     fn fan_out_locate(&self, subject: &SubjectRef, tenant: TenantId) -> Vec<LocateReport> {
         self.holders
             .iter()
-            .map(|h| h.locate(subject, tenant.clone()).expect("a Refs holder locate succeeds (stub)"))
+            .map(|h| {
+                h.locate(subject, tenant.clone())
+                    .expect("a Refs holder locate succeeds (stub)")
+            })
             .collect()
     }
 
@@ -95,11 +96,21 @@ fn dsr_orchestrator_fans_locate_and_erase_out_to_the_refs_holders_via_the_contra
 
     // locate: each holder responds with a content-addressed receipt over its (empty) surface.
     let reports = consumer.fan_out_locate(&subj, tenant());
-    assert_eq!(reports.len(), 2, "both Refs holders responded to locate via the contract");
+    assert_eq!(
+        reports.len(),
+        2,
+        "both Refs holders responded to locate via the contract"
+    );
     for r in &reports {
         assert_eq!(r.receipt.operation, "locate");
-        assert!(r.receipt.content_hash.starts_with("blake3:"), "content-addressed receipt");
-        assert!(r.receipt.key_epoch_destroyed.is_none(), "locate shreds no key");
+        assert!(
+            r.receipt.content_hash.starts_with("blake3:"),
+            "content-addressed receipt"
+        );
+        assert!(
+            r.receipt.key_epoch_destroyed.is_none(),
+            "locate shreds no key"
+        );
     }
 
     // erase: each holder is a well-defined no-op now (nothing to shred) — never a panic.

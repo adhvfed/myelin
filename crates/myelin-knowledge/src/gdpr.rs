@@ -64,8 +64,8 @@
 //!   is the ONE platform posture (10.9, by reference). Structured PII is located reliably.
 
 use myelin_gdpr::{
-    DsrError, EraseReceipt, EraseScope, LocateReport, PersonalData, PersonalDataHolder,
-    PortableBundle, Patch, Receipt, RectifyReceipt, RestrictReceipt, Result as DsrResult, SubjectRef,
+    DsrError, EraseReceipt, EraseScope, LocateReport, Patch, PersonalData, PersonalDataHolder,
+    PortableBundle, Receipt, RectifyReceipt, RestrictReceipt, Result as DsrResult, SubjectRef,
     TenantId,
 };
 use std::collections::BTreeSet;
@@ -174,7 +174,10 @@ impl RestrictionRegistry {
     /// an un-restricted subject is a no-op. Returns whether the subject is restricted AFTER the call.
     pub fn set(&self, subject: &SubjectRef, tenant: &TenantId, on: bool) -> bool {
         let key = Self::key(subject, tenant);
-        let mut set = self.restricted.lock().expect("restriction registry poisoned");
+        let mut set = self
+            .restricted
+            .lock()
+            .expect("restriction registry poisoned");
         if on {
             set.insert(key);
         } else {
@@ -593,9 +596,10 @@ impl PersonalDataHolder for KnowledgePersonalDataHolder<'_> {
                 subject.principal.principal_id.0.clone(),
                 tenant.as_str().to_string(),
             ),
-            EraseScope::Tenant(tenant) => {
-                ("<tenant-offboarding>".to_string(), tenant.as_str().to_string())
-            }
+            EraseScope::Tenant(tenant) => (
+                "<tenant-offboarding>".to_string(),
+                tenant.as_str().to_string(),
+            ),
         };
         Err(DsrError(format!(
             "kn erase(scope) for subject `{subject_label}` in tenant `{tenant_label}` is the named \
@@ -736,7 +740,11 @@ mod tests {
             RestrictionSink::Olap,
             RestrictionSink::Notif,
         ] {
-            assert!(RestrictionSink::ALL.contains(&s), "{} must be suppressed", s.label());
+            assert!(
+                RestrictionSink::ALL.contains(&s),
+                "{} must be suppressed",
+                s.label()
+            );
         }
         assert_eq!(RestrictionSink::Search.label(), "search-index");
         assert_eq!(RestrictionSink::Agents.label(), "agent-rag");
@@ -758,7 +766,12 @@ mod tests {
         // BEFORE restrict: every sink admits alice's content (leak counter untouched — no attempt).
         let supp = RestrictSuppressor::new(&registry, tenant());
         for sink in RestrictionSink::ALL {
-            assert_eq!(supp.admit(&alice, sink), SinkVerdict::Emit, "pre-restrict: {} admits", sink.label());
+            assert_eq!(
+                supp.admit(&alice, sink),
+                SinkVerdict::Emit,
+                "pre-restrict: {} admits",
+                sink.label()
+            );
         }
         assert_eq!(registry.leak_count(), 0, "no leak attempts before restrict");
 
@@ -779,19 +792,33 @@ mod tests {
             );
         }
         // 4 attempts caught (one per sink) — the suppressor dropped EVERY one (0 actually emitted).
-        assert_eq!(registry.leak_count(), 4, "every sink emission for the restricted subject was caught");
+        assert_eq!(
+            registry.leak_count(),
+            4,
+            "every sink emission for the restricted subject was caught"
+        );
 
         // An un-restricted subject (bob) still flows to every sink (restrict is per-subject, not a
         // blanket hide — the per-viewer/per-subject conjoin, composing with KN-D5).
         for sink in RestrictionSink::ALL {
-            assert_eq!(supp.admit(&bob, sink), SinkVerdict::Emit, "bob (un-restricted) still flows to {}", sink.label());
+            assert_eq!(
+                supp.admit(&bob, sink),
+                SinkVerdict::Emit,
+                "bob (un-restricted) still flows to {}",
+                sink.label()
+            );
         }
 
         // CLEAR the restriction → alice flows again (the flag is reversible, Art. 18 restriction).
         holder.restrict_subject(&alice, &tenant(), false);
         assert!(!registry.is_restricted(&alice, &tenant()));
         for sink in RestrictionSink::ALL {
-            assert_eq!(supp.admit(&alice, sink), SinkVerdict::Emit, "post-clear: {} admits alice again", sink.label());
+            assert_eq!(
+                supp.admit(&alice, sink),
+                SinkVerdict::Emit,
+                "post-clear: {} admits alice again",
+                sink.label()
+            );
         }
     }
 
@@ -806,7 +833,11 @@ mod tests {
         holder.restrict_subject(&s, &tenant(), true);
         let supp = RestrictSuppressor::new(&registry, tenant());
         for sink in RestrictionSink::ALL {
-            assert!(!supp.admit(&s, sink).admits(), "{} must NOT admit a restricted subject", sink.label());
+            assert!(
+                !supp.admit(&s, sink).admits(),
+                "{} must NOT admit a restricted subject",
+                sink.label()
+            );
         }
     }
 
@@ -844,10 +875,21 @@ mod tests {
 
         // Structured loci are reliable; the free-text match is FLAGGED (not reliable) — the residual
         // is the ONE platform posture (10.9 by reference).
-        assert_eq!(report.reliable_loci().len(), 3, "the three structured loci are reliable");
-        assert_eq!(report.flagged_free_text().len(), 1, "the free-text match is flagged best-effort");
+        assert_eq!(
+            report.reliable_loci().len(),
+            3,
+            "the three structured loci are reliable"
+        );
+        assert_eq!(
+            report.flagged_free_text().len(),
+            1,
+            "the free-text match is flagged best-effort"
+        );
         assert!(report.flagged_free_text()[0].kind == LocatedKind::FreeTextMatch);
-        assert!(!report.flagged_free_text()[0].reliable, "free-text is never reliable (the residual)");
+        assert!(
+            !report.flagged_free_text()[0].reliable,
+            "free-text is never reliable (the residual)"
+        );
         assert_eq!(report.receipt.operation, "locate");
     }
 
@@ -865,10 +907,15 @@ mod tests {
 
         assert_eq!(bundle.receipt.operation, "export");
         // The bundle is valid lossless JSON (the Art. 20 portable artifact) carrying both pages.
-        let v: serde_json::Value = serde_json::from_str(&json).expect("the export bundle is valid JSON");
+        let v: serde_json::Value =
+            serde_json::from_str(&json).expect("the export bundle is valid JSON");
         assert_eq!(v["subject"], "p-grace");
         assert_eq!(v["tenant"], "acme");
-        assert_eq!(v["pages"].as_array().expect("pages array").len(), 2, "both pages exported");
+        assert_eq!(
+            v["pages"].as_array().expect("pages array").len(),
+            2,
+            "both pages exported"
+        );
     }
 
     // ───────────────────────── rectify (structured + span tombstone) ───────────────────────────────
@@ -880,8 +927,14 @@ mod tests {
         let s = subject_ref("p-lin");
         let (receipt, outcome) = holder.rectify_detailed(&s, &tenant(), 2, 1);
         assert_eq!(receipt.receipt.operation, "rectify");
-        assert_eq!(outcome.structured_corrected, 2, "two structured values corrected (reliable)");
-        assert_eq!(outcome.free_text_spans_tombstoned, 1, "one free-text span tombstoned (residual)");
+        assert_eq!(
+            outcome.structured_corrected, 2,
+            "two structured values corrected (reliable)"
+        );
+        assert_eq!(
+            outcome.free_text_spans_tombstoned, 1,
+            "one free-text span tombstoned (residual)"
+        );
     }
 
     // ───────────────────────── the frozen 10.1 trait (object-safe; CDC consumer-shape) ─────────────
@@ -904,18 +957,30 @@ mod tests {
         assert!(loc.receipt.content_hash.starts_with("blake3:"));
         let exp = dyn_holder.export(&s, tenant()).expect("export");
         assert_eq!(exp.receipt.operation, "export");
-        let rec = dyn_holder.rectify(&s, Patch("correct-name".into())).expect("rectify");
+        let rec = dyn_holder
+            .rectify(&s, Patch("correct-name".into()))
+            .expect("rectify");
         assert_eq!(rec.receipt.operation, "rectify");
         // restrict is fully functional through the trait (it flips the registry flag).
         let restr = dyn_holder.restrict(&s, true).expect("restrict");
         assert_eq!(restr.receipt.operation, "restrict");
-        assert!(registry.is_restricted(&s, &tenant()), "the trait restrict flipped the registry flag");
+        assert!(
+            registry.is_restricted(&s, &tenant()),
+            "the trait restrict flipped the registry flag"
+        );
 
         // erase REFUSES loud — the named KN-P26 floor (never a false 'erased').
         let err = dyn_holder
-            .erase(EraseScope::Subject { subject: s.clone(), tenant: tenant() })
+            .erase(EraseScope::Subject {
+                subject: s.clone(),
+                tenant: tenant(),
+            })
             .expect_err("erase is the KN-P26 floor");
-        assert!(err.0.contains("KN-P26"), "erase names the KN-P26 floor: {}", err.0);
+        assert!(
+            err.0.contains("KN-P26"),
+            "erase names the KN-P26 floor: {}",
+            err.0
+        );
     }
 
     // ───────────────────────── the #[personal_data] classify tags (10.2) ───────────────────────────
@@ -928,7 +993,11 @@ mod tests {
     fn knowledge_schema_carries_the_personal_data_tags() {
         let fields = KnowledgePersonRecord::personal_data_fields();
         // The six PII fields are tagged (artifact_id is a non-PII id — no entry).
-        assert_eq!(fields.len(), 6, "exactly the six PII fields are tagged, the opaque id has none");
+        assert_eq!(
+            fields.len(),
+            6,
+            "exactly the six PII fields are tagged, the opaque id has none"
+        );
         let by_field: std::collections::HashMap<&str, _> =
             fields.iter().map(|f| (f.field, f)).collect();
 
@@ -937,11 +1006,23 @@ mod tests {
         assert_eq!(by_field["edited_by"].tags.erasure, "Pseudonymise");
         assert_eq!(by_field["trace_actor"].tags.erasure, "Pseudonymise");
         // Free-text / mention / person prop ⇒ CryptoShred under the per-subject DEK (KN-P26).
-        assert_eq!(by_field["mention_text"].tags.erasure, "CryptoShred(subject_dek)");
-        assert_eq!(by_field["free_text_body"].tags.erasure, "CryptoShred(subject_dek)");
-        assert_eq!(by_field["db_row_person_prop"].tags.erasure, "CryptoShred(subject_dek)");
+        assert_eq!(
+            by_field["mention_text"].tags.erasure,
+            "CryptoShred(subject_dek)"
+        );
+        assert_eq!(
+            by_field["free_text_body"].tags.erasure,
+            "CryptoShred(subject_dek)"
+        );
+        assert_eq!(
+            by_field["db_row_person_prop"].tags.erasure,
+            "CryptoShred(subject_dek)"
+        );
         // The subject_locator is structural (the column a holder reads).
-        assert_eq!(KnowledgePersonRecord::subject_locator("created_by"), Some("created_by"));
+        assert_eq!(
+            KnowledgePersonRecord::subject_locator("created_by"),
+            Some("created_by")
+        );
     }
 
     /// A sanity bind: the holder fans out over the SAME content the tags classify (the structured
@@ -969,7 +1050,14 @@ mod tests {
         })
         .collect();
         let report = holder.locate_detailed(&s, &tenant(), structured, vec![]);
-        assert_eq!(report.reliable_loci().len(), 5, "every structured kind is reliable");
-        assert!(report.flagged_free_text().is_empty(), "no free-text matches in this fixture");
+        assert_eq!(
+            report.reliable_loci().len(),
+            5,
+            "every structured kind is reliable"
+        );
+        assert!(
+            report.flagged_free_text().is_empty(),
+            "no free-text matches in this fixture"
+        );
     }
 }

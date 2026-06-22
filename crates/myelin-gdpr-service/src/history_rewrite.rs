@@ -185,9 +185,9 @@ impl HistoryRewriteReceipt {
     /// phases) — the invalidation phase is the deferred M5 floor.
     pub fn skeleton_complete(&self) -> bool {
         // The three non-floor phases must be receipted; the invalidation phase is deferred.
-        RewritePhase::ALL.iter().all(|p| {
-            self.phase_receipts.iter().any(|r| r.phase == *p)
-        })
+        RewritePhase::ALL
+            .iter()
+            .all(|p| self.phase_receipts.iter().any(|r| r.phase == *p))
     }
 }
 
@@ -315,27 +315,44 @@ mod tests {
         let activity = HistoryRewriteActivity::new();
         let receipt = activity.drive(&request());
 
-        assert_eq!(receipt.action, HISTORY_REWRITE_ACTION, "the op is audited as git.history_rewrite");
+        assert_eq!(
+            receipt.action, HISTORY_REWRITE_ACTION,
+            "the op is audited as git.history_rewrite"
+        );
         assert!(receipt.skeleton_complete(), "every phase is checkpointed");
         // The phases ran in canonical order.
         let order: Vec<_> = receipt.phase_receipts.iter().map(|r| r.phase).collect();
-        assert_eq!(order, RewritePhase::ALL.to_vec(), "phases run in §6.6 order");
+        assert_eq!(
+            order,
+            RewritePhase::ALL.to_vec(),
+            "phases run in §6.6 order"
+        );
         // The invalidation phase is the NAMED M5 floor (deferred, not silently "done").
         let invalidate = receipt
             .phase_receipts
             .iter()
             .find(|r| r.phase == RewritePhase::InvalidateCaches)
             .unwrap();
-        assert!(invalidate.deferred_floor, "the invalidation fan-out is the M5 named floor");
+        assert!(
+            invalidate.deferred_floor,
+            "the invalidation fan-out is the M5 named floor"
+        );
         // The other phases are NOT floors (the skeleton performs them).
         for r in &receipt.phase_receipts {
             if r.phase != RewritePhase::InvalidateCaches {
-                assert!(!r.deferred_floor, "{} is performed on the skeleton", r.phase.token());
+                assert!(
+                    !r.deferred_floor,
+                    "{} is performed on the skeleton",
+                    r.phase.token()
+                );
             }
         }
         // The residual is NAMED, not pretended-solved (§6.6).
         assert!(receipt.residual_named.contains("off-platform clones"));
-        assert!(receipt.residual_named.contains("P-GA-35"), "the residual names its M5 follow-on");
+        assert!(
+            receipt.residual_named.contains("P-GA-35"),
+            "the residual names its M5 follow-on"
+        );
     }
 
     /// **The activity is RESUMABLE + IDEMPOTENT (the mutation-core — §4.1 step 4).** A re-drive runs
@@ -346,14 +363,27 @@ mod tests {
         let activity = HistoryRewriteActivity::new();
         let first = activity.drive(&request());
         for phase in RewritePhase::ALL {
-            assert_eq!(activity.phase_call_count(phase), 1, "{} ran once", phase.token());
+            assert_eq!(
+                activity.phase_call_count(phase),
+                1,
+                "{} ran once",
+                phase.token()
+            );
         }
         // Re-drive: no phase body re-runs (all checkpointed), and the receipts are byte-identical.
         let second = activity.drive(&request());
         for phase in RewritePhase::ALL {
-            assert_eq!(activity.phase_call_count(phase), 1, "{} did NOT re-run on the re-drive", phase.token());
+            assert_eq!(
+                activity.phase_call_count(phase),
+                1,
+                "{} did NOT re-run on the re-drive",
+                phase.token()
+            );
         }
-        assert_eq!(first.phase_receipts, second.phase_receipts, "idempotent — same receipts");
+        assert_eq!(
+            first.phase_receipts, second.phase_receipts,
+            "idempotent — same receipts"
+        );
     }
 
     /// **A crash mid-drive re-runs ONLY the lost phases (the resumability proof — §9.3).** The
@@ -371,8 +401,16 @@ mod tests {
         // Re-drive: phases 0–1 are still checkpointed (NOT re-run); phases 2–3 lost their receipts
         // and re-run exactly once MORE (call count goes 1 → 2 for the lost phases only).
         let resumed = activity.drive(&request());
-        assert_eq!(activity.phase_call_count(RewritePhase::Audit), 1, "phase 0 survived → not re-run");
-        assert_eq!(activity.phase_call_count(RewritePhase::Rewrite), 1, "phase 1 survived → not re-run");
+        assert_eq!(
+            activity.phase_call_count(RewritePhase::Audit),
+            1,
+            "phase 0 survived → not re-run"
+        );
+        assert_eq!(
+            activity.phase_call_count(RewritePhase::Rewrite),
+            1,
+            "phase 1 survived → not re-run"
+        );
         assert_eq!(
             activity.phase_call_count(RewritePhase::CryptoShredPackTier),
             2,
@@ -396,7 +434,10 @@ mod tests {
         let ra = a.drive(&request());
         let rb = b.drive(&request());
         // Two independent drives of the same request produce the SAME per-phase content addresses.
-        assert_eq!(ra.phase_receipts, rb.phase_receipts, "deterministic across activities");
+        assert_eq!(
+            ra.phase_receipts, rb.phase_receipts,
+            "deterministic across activities"
+        );
         for r in &ra.phase_receipts {
             assert!(r.content_hash.starts_with("blake3:"), "content-addressed");
         }
@@ -408,7 +449,10 @@ mod tests {
         assert_eq!(HISTORY_REWRITE_ACTION, "git.history_rewrite");
         assert!(HISTORY_REWRITE_FIRST_CLASS_PROMPT.contains("P-GA-35"));
         assert_eq!(RewritePhase::Audit as u8, 0, "audit is phase 0");
-        assert!(RewritePhase::InvalidateCaches > RewritePhase::Audit, "invalidation is last");
+        assert!(
+            RewritePhase::InvalidateCaches > RewritePhase::Audit,
+            "invalidation is last"
+        );
     }
 
     /// **Each phase token is the exact PII-free string (mutation-core).** The token reaches the
@@ -418,7 +462,10 @@ mod tests {
     fn each_phase_token_is_the_exact_string() {
         assert_eq!(RewritePhase::Audit.token(), "audit");
         assert_eq!(RewritePhase::Rewrite.token(), "rewrite");
-        assert_eq!(RewritePhase::CryptoShredPackTier.token(), "crypto_shred_pack_tier");
+        assert_eq!(
+            RewritePhase::CryptoShredPackTier.token(),
+            "crypto_shred_pack_tier"
+        );
         assert_eq!(RewritePhase::InvalidateCaches.token(), "invalidate_caches");
         // The four tokens are all distinct (no two phases share a token).
         let tokens: std::collections::BTreeSet<_> =
@@ -436,8 +483,13 @@ mod tests {
 
         // Drop one phase's receipt → NOT complete.
         let mut missing = full.clone();
-        missing.phase_receipts.retain(|r| r.phase != RewritePhase::Rewrite);
-        assert!(!missing.skeleton_complete(), "a missing phase is not complete");
+        missing
+            .phase_receipts
+            .retain(|r| r.phase != RewritePhase::Rewrite);
+        assert!(
+            !missing.skeleton_complete(),
+            "a missing phase is not complete"
+        );
 
         // An empty receipt set is NOT complete.
         let mut empty = full;

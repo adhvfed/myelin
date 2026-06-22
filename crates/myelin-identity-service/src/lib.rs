@@ -82,8 +82,8 @@ pub mod principal_store;
 pub mod pseudonym_erase;
 pub mod pseudonym_store;
 pub mod read_replica;
-pub mod revocation;
 pub mod reverse_index;
+pub mod revocation;
 pub mod tuple_store;
 
 pub use authenticate::{
@@ -96,6 +96,9 @@ pub use delegation::{
     EFFECTIVE_GRANT_CARRIER,
 };
 pub use expand::Expand;
+pub use failstatic_cache::{
+    CacheTelemetry, CachedDecision, CoarseGrant, FailStaticCache, Served, FRESH_TTL_SECS, S6_STORE,
+};
 pub use git_fragment::{
     compile_codeowners, git_fragment, CodeownersRule, APPROVE_UNTRUSTED_CI, CODE_OWNER,
     PROTECTED_PUSH,
@@ -103,24 +106,21 @@ pub use git_fragment::{
 pub use knowledge_fragment::{
     field_view_caveat, knowledge_fragment, DIRECT_BLOCK, DIRECT_READER, READ as KN_READ, VIEW_FIELD,
 };
-pub use failstatic_cache::{
-    CachedDecision, CacheTelemetry, CoarseGrant, FailStaticCache, Served, FRESH_TTL_SECS, S6_STORE,
-};
 pub use list_objects::{ListObjects, DEFAULT_IDS_CARDINALITY_CAP};
-pub use read_replica::{
-    AuthzReadReplica, ReadRoute, ReplicaRow, ReplicaTelemetry, ReplicaWriteRejected, S5_HOLDER,
-    S5_TABLE,
-};
 pub use lowering::{
     fall_back_to_check, is_fall_back, lower, watermark_verdict, AuthzJoin, BoundParam, Lowered,
     WatermarkVerdict,
 };
-pub use reverse_index::{
-    ReverseIndex, ReverseIndexConsumer, ReverseRow, S8_CONSUMER, S8_HOLDER, S8_TABLE,
-};
 pub use namespace::{
     core_hierarchy, AdmitReject, FragmentDef, NamespaceEngine, PermissionRule, Userset,
     MAX_RULE_DEPTH, WATCHER_RELATION,
+};
+pub use read_replica::{
+    AuthzReadReplica, ReadRoute, ReplicaRow, ReplicaTelemetry, ReplicaWriteRejected, S5_HOLDER,
+    S5_TABLE,
+};
+pub use reverse_index::{
+    ReverseIndex, ReverseIndexConsumer, ReverseRow, S8_CONSUMER, S8_HOLDER, S8_TABLE,
 };
 // `StoreBackedCheck` is defined below in this module; re-exported at the crate root for callers.
 pub use machine_auth::{
@@ -128,8 +128,8 @@ pub use machine_auth::{
     StructuralTokenVerifier, TokenVerifier,
 };
 pub use mint::{
-    expires_at_of, run_token_jti, MintError, RevocationProof, RunTokenMinter, StructuralTokenSigner,
-    TokenSigner, RUN_GRANT_RELATION, SELFHOSTED_GRANT_PREFIX,
+    expires_at_of, run_token_jti, MintError, RevocationProof, RunTokenMinter,
+    StructuralTokenSigner, TokenSigner, RUN_GRANT_RELATION, SELFHOSTED_GRANT_PREFIX,
 };
 pub use principal_store::{
     PrincipalError, PrincipalProfile, PrincipalRow, PrincipalStore, ProfileRef, S1_HOLDER, S1_TABLE,
@@ -138,16 +138,12 @@ pub use pseudonym_erase::{
     ErasureLedgerEntry, ErasureReceipt, PseudonymEraseError, PseudonymErasureLedger,
     ReErasureReceipt, ERASURE_LEDGER,
 };
-pub use pseudonym_store::{
-    PseudonymError, PseudonymRow, PseudonymStore, S2_HOLDER, S2_TABLE,
-};
+pub use pseudonym_store::{PseudonymError, PseudonymRow, PseudonymStore, S2_HOLDER, S2_TABLE};
 pub use revocation::{
     RevocationEntry, RevocationStore, RevocationTelemetry, RevokedKind, RunTokenState,
     REVOCATION_SLA_SECS, S7_TABLE,
 };
-pub use tuple_store::{
-    run_grant_expiry, StoredTuple, TupleStore, WriteError, S3_HOLDER, S3_TABLE,
-};
+pub use tuple_store::{run_grant_expiry, StoredTuple, TupleStore, WriteError, S3_HOLDER, S3_TABLE};
 
 use myelin_identity::{
     AuthzError, CaveatContext, Consistency, Decision, IdentityService, ListObjectsResult,
@@ -267,7 +263,10 @@ impl FailClosedCheck {
 
 impl IdentityService for FailClosedCheck {
     /// 4.1 — `authenticate` body is P-ID-06 / P-ID-07. The shell does not resolve credentials yet.
-    fn authenticate(&self, _credential: &myelin_identity::Credential) -> myelin_identity::Result<Principal> {
+    fn authenticate(
+        &self,
+        _credential: &myelin_identity::Credential,
+    ) -> myelin_identity::Result<Principal> {
         Err(AuthzError::NotYetImplemented(
             "authenticate → P-ID-06/07 (M1); the shell wires the slot, not the body",
         ))
@@ -309,7 +308,9 @@ impl IdentityService for FailClosedCheck {
         _permission: &Permission,
         _at: &Consistency,
     ) -> myelin_identity::Result<myelin_identity::SubjectTree> {
-        Err(AuthzError::NotYetImplemented("list_subjects → P-ID-13 (M1)"))
+        Err(AuthzError::NotYetImplemented(
+            "list_subjects → P-ID-13 (M1)",
+        ))
     }
 
     fn explain(
@@ -345,7 +346,9 @@ impl IdentityService for FailClosedCheck {
         _delegation_caveats: &myelin_identity::DelegationCaveats,
         _ttl: &myelin_identity::FailStaticBound,
     ) -> myelin_identity::Result<myelin_identity::RunToken> {
-        Err(AuthzError::NotYetImplemented("mint_run_token → P-ID-18 (M1)"))
+        Err(AuthzError::NotYetImplemented(
+            "mint_run_token → P-ID-18 (M1)",
+        ))
     }
 
     fn revoke(&self, _target: &myelin_identity::RevokeTarget) -> myelin_identity::Result<()> {
@@ -357,7 +360,9 @@ impl IdentityService for FailClosedCheck {
         _subject: &myelin_identity::PrincipalId,
         _tenant: &myelin_tenancy::TenantId,
     ) -> myelin_identity::Result<String> {
-        Err(AuthzError::NotYetImplemented("resolve_pseudonym → P-ID-19 (M1)"))
+        Err(AuthzError::NotYetImplemented(
+            "resolve_pseudonym → P-ID-19 (M1)",
+        ))
     }
 
     fn erase(&self, _subject: &myelin_identity::PrincipalId) -> myelin_identity::Result<()> {
@@ -368,7 +373,9 @@ impl IdentityService for FailClosedCheck {
         &self,
         _fragment: &myelin_identity::NamespaceFragment,
     ) -> myelin_identity::Result<myelin_identity::FragmentAdmit> {
-        Err(AuthzError::NotYetImplemented("admit_fragment → P-ID-10 (M1)"))
+        Err(AuthzError::NotYetImplemented(
+            "admit_fragment → P-ID-10 (M1)",
+        ))
     }
 }
 
@@ -405,7 +412,10 @@ impl<S: IdentityService + Send + Sync> Authorizer for CheckAuthorizer<S> {
         let permission = Permission(action.to_string());
         // A self-referential object stand-in for the action-level re-authorize (the object-level
         // threading is the surface body's, P-ID-09); the fail-closed stub ignores it and denies.
-        let object = ArtifactRef(format!("myelin://{}/identity/action/{}", subject.tenant.0, action));
+        let object = ArtifactRef(format!(
+            "myelin://{}/identity/action/{}",
+            subject.tenant.0, action
+        ));
         let at = Consistency {
             at_least: myelin_identity::Zookie(String::new()),
             mode: myelin_identity::ConsistencyMode::Strong,
@@ -867,10 +877,7 @@ impl StoreBackedCheck {
     /// schema — the path the M3/M4 fragment prompts (P-ID-24/26/27/29/30) use to declare a
     /// subsystem's relations + permissions. The names-only ABI [`IdentityService::admit_fragment`]
     /// is the contract-boundary validator; this is the build-time declaration the engine compiles.
-    pub fn admit_fragment_def(
-        &self,
-        frag: &FragmentDef,
-    ) -> myelin_identity::FragmentAdmit {
+    pub fn admit_fragment_def(&self, frag: &FragmentDef) -> myelin_identity::FragmentAdmit {
         self.namespace
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -917,7 +924,10 @@ impl StoreBackedCheck {
 
     /// A read-only snapshot of the compiled namespace engine (for inspection / the explain path).
     pub fn namespace(&self) -> NamespaceEngine {
-        self.namespace.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.namespace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// **`delegation(agent, trigger_actor) → EffectivePolicy` (contract 4.5) — the LIVE
@@ -946,7 +956,10 @@ impl StoreBackedCheck {
         agent: &Principal,
         trigger_actor: &Principal,
         input: &delegation::DelegationInput,
-    ) -> (myelin_identity::EffectivePolicy, delegation::IntersectionProof) {
+    ) -> (
+        myelin_identity::EffectivePolicy,
+        delegation::IntersectionProof,
+    ) {
         delegation::DelegationAlgebra::new().delegation_proved(agent, trigger_actor, input)
     }
 
@@ -1082,7 +1095,11 @@ impl StoreBackedCheck {
         permission: &Permission,
         at: &Consistency,
     ) -> myelin_identity::SubjectTree {
-        let namespace = self.namespace.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let namespace = self
+            .namespace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let expand = Expand::new(self.tuples.clone(), namespace, self.index.clone());
         let object_type = ObjectType(infer_object_type(&object.0));
         expand.list_subjects(scope, object, &object_type, permission, at)
@@ -1122,7 +1139,11 @@ impl StoreBackedCheck {
         object: &myelin_identity::ObjectId,
         at: &Consistency,
     ) -> myelin_identity::RewriteTrace {
-        let namespace = self.namespace.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let namespace = self
+            .namespace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let expand = Expand::new(self.tuples.clone(), namespace, self.index.clone());
         let object_type = ObjectType(infer_object_type(&object.0));
         expand.explain(scope, subject, object, &object_type, permission, at)
@@ -1142,8 +1163,13 @@ fn infer_object_type(object_id: &str) -> String {
 }
 
 impl IdentityService for StoreBackedCheck {
-    fn authenticate(&self, _credential: &myelin_identity::Credential) -> myelin_identity::Result<Principal> {
-        Err(AuthzError::NotYetImplemented("authenticate → P-ID-06/07 (M1)"))
+    fn authenticate(
+        &self,
+        _credential: &myelin_identity::Credential,
+    ) -> myelin_identity::Result<Principal> {
+        Err(AuthzError::NotYetImplemented(
+            "authenticate → P-ID-06/07 (M1)",
+        ))
     }
 
     /// 4.2 — the LIVE depth-bounded Zanzibar `check` (P-ID-09). The scope is the subject's verified
@@ -1161,7 +1187,8 @@ impl IdentityService for StoreBackedCheck {
         // a path. The namespace engine (P-ID-10) resolves a COMPILED permission through the four
         // userset operators; a name that is not a compiled permission falls through to a raw
         // relation check (one primitive — both compose over the SAME depth-bounded rewrite core).
-        let scope = myelin_storage::TenantScope::from_verified_token(subject, subject.region.clone());
+        let scope =
+            myelin_storage::TenantScope::from_verified_token(subject, subject.region.clone());
 
         // The S7 revocation consult (P-ID-14, the SCIM-disable cross-surface deny path). A
         // disabled/revoked principal is DENIED here — within the W = 5 min bound — regardless of a
@@ -1171,10 +1198,11 @@ impl IdentityService for StoreBackedCheck {
         // zero instant (it never gates a no-expiry entry). The check engine's own `subject.status`
         // gate (P-ID-09) remains the second line of defence (fail-closed in depth).
         let revoke_target = myelin_identity::RevokeTarget::Principal(subject.principal_id.clone());
-        if self
-            .revocations
-            .is_revoked(&scope, &revoke_target, &myelin_events::Timestamp(String::new()))
-        {
+        if self.revocations.is_revoked(
+            &scope,
+            &revoke_target,
+            &myelin_events::Timestamp(String::new()),
+        ) {
             return Ok(Decision::Deny);
         }
 
@@ -1184,15 +1212,19 @@ impl IdentityService for StoreBackedCheck {
         // run the namespace grant first, then apply the caveat through the raw engine's literal
         // evaluator only when a caveat is present.
         let object_type = namespace::type_of_object_ref(object);
-        let granted = self.namespace.lock().unwrap_or_else(|e| e.into_inner()).permits(
-            &self.engine,
-            &scope,
-            subject,
-            &object_type,
-            &permission.0,
-            object,
-            at,
-        );
+        let granted = self
+            .namespace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .permits(
+                &self.engine,
+                &scope,
+                subject,
+                &object_type,
+                &permission.0,
+                object,
+                at,
+            );
         if !granted {
             return Ok(Decision::Deny);
         }
@@ -1217,10 +1249,15 @@ impl IdentityService for StoreBackedCheck {
         at: &Consistency,
     ) -> myelin_identity::Result<ListObjectsResult> {
         // tenant-from-token (ID-3): the scope is the SUBJECT's own verified (tenant, region).
-        let scope = myelin_storage::TenantScope::from_verified_token(subject, subject.region.clone());
+        let scope =
+            myelin_storage::TenantScope::from_verified_token(subject, subject.region.clone());
         // Build the list_objects evaluator over the shared S3 store + S8 index + the compiled
         // namespace engine (one snapshot of the schema; admit holds the lock only to clone).
-        let namespace = self.namespace.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let namespace = self
+            .namespace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let lo = ListObjects::new(self.tuples.clone(), namespace, self.index.clone());
         Ok(lo.list_objects(&scope, subject, permission, ty, at))
     }
@@ -1289,7 +1326,9 @@ impl IdentityService for StoreBackedCheck {
     ) -> myelin_identity::Result<myelin_identity::Zookie> {
         // The write path is TupleStore::write_tuples (P-ID-08), which carries the (tenant, region)
         // scope + actor the ABI trait method does not; this slot is not the write entrypoint.
-        Err(AuthzError::NotYetImplemented("write_tuples → TupleStore::write_tuples (P-ID-08)"))
+        Err(AuthzError::NotYetImplemented(
+            "write_tuples → TupleStore::write_tuples (P-ID-08)",
+        ))
     }
 
     /// 4.7 (`mint_run_token`) — the LIVE per-run-token mint (P-ID-18). The ABI trait method carries
@@ -1483,7 +1522,10 @@ mod tests {
             Readiness::NotReady,
             "readiness is FALSE until migrations apply (the migrate-complete gate)"
         );
-        assert!(r.startup_incomplete, "the not-ready reason names the startup (pre-migrate) gate");
+        assert!(
+            r.startup_incomplete,
+            "the not-ready reason names the startup (pre-migrate) gate"
+        );
         assert!(r.sheds(), "a not-ready instance sheds new traffic");
         // not-killed: a slow/booting instance is NOT a wedge.
         assert_eq!(
@@ -1535,7 +1577,11 @@ mod tests {
             &at,
             None,
         );
-        assert_eq!(d, Ok(Decision::Deny), "the un-wired check slot denies (fail-closed)");
+        assert_eq!(
+            d,
+            Ok(Decision::Deny),
+            "the un-wired check slot denies (fail-closed)"
+        );
     }
 
     /// **The internal-RPC surface re-authorizes every call against the fail-closed slot.** A call
@@ -1547,7 +1593,10 @@ mod tests {
         let surface = myelin_substrate::InternalSurface::new(internal_authorizer());
         let r = surface.handle(&principal(), "issues.read");
         assert!(
-            matches!(r, Err(myelin_substrate::InternalReject::Unauthorized { .. })),
+            matches!(
+                r,
+                Err(myelin_substrate::InternalReject::Unauthorized { .. })
+            ),
             "the internal-RPC call is re-authorized against the fail-closed check and denied"
         );
     }
@@ -1635,15 +1684,25 @@ mod tests {
         let acme = TenantScope::from_verified_token(&principal(), principal().region.clone());
 
         // The primary replicates a coarse authz read row into S5 (S5 follows the primary).
-        slot.read_replica()
-            .replicate(&acme, "add", read_replica::ReplicaRow { key: "p:alice".into(), value: "active".into() }, 5);
+        slot.read_replica().replicate(
+            &acme,
+            "add",
+            read_replica::ReplicaRow {
+                key: "p:alice".into(),
+                value: "active".into(),
+            },
+            5,
+        );
 
         // A default-consistency read routes to S5 (the scaling win) and the row is served off it.
         let stale = Consistency {
             at_least: myelin_identity::Zookie(String::new()),
             mode: myelin_identity::ConsistencyMode::BoundedStale,
         };
-        assert!(slot.route_read(&stale).is_replica(), "a default-consistency read is served from S5");
+        assert!(
+            slot.route_read(&stale).is_replica(),
+            "a default-consistency read is served from S5"
+        );
         assert!(
             slot.read_replica().read(&acme, "p:alice").is_some(),
             "the replicated row is served off the stale-tolerant replica"
@@ -1654,10 +1713,16 @@ mod tests {
             at_least: myelin_identity::Zookie("zk-00000000000000000005".into()),
             mode: myelin_identity::ConsistencyMode::Strong,
         };
-        assert!(slot.route_read(&strong).is_primary(), "a zookie-stamped read bypasses S5 to the primary");
+        assert!(
+            slot.route_read(&strong).is_primary(),
+            "a zookie-stamped read bypasses S5 to the primary"
+        );
 
         // 0 writes to S5: the replica is read-only (the only mutator is replication from the primary).
-        assert!(slot.read_replica().reject_write().is_err(), "S5 is read-only (a write attempt errors)");
+        assert!(
+            slot.read_replica().reject_write().is_err(),
+            "S5 is read-only (a write attempt errors)"
+        );
     }
 
     /// `list_objects` errors loudly (NotYetImplemented) — a non-existent leak-free pre-filter must
@@ -1669,7 +1734,12 @@ mod tests {
             at_least: myelin_identity::Zookie("z".into()),
             mode: myelin_identity::ConsistencyMode::Strong,
         };
-        let r = slot.list_objects(&principal(), &Permission("read".into()), &ObjectType("issue".into()), &at);
+        let r = slot.list_objects(
+            &principal(),
+            &Permission("read".into()),
+            &ObjectType("issue".into()),
+            &at,
+        );
         assert!(
             matches!(r, Err(AuthzError::NotYetImplemented(_))),
             "list_objects errors loudly until P-ID-11/12 (never a permissive set)"

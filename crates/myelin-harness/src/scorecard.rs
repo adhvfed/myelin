@@ -407,28 +407,60 @@ pub fn id_m1_required_rows() -> Vec<GateRow> {
 fn id_drill_argv(target: &'static str) -> &'static [&'static str] {
     match target {
         "drill_id_d1_revocation" => &[
-            "test", "-p", "myelin-identity-service", "--test", "drill_id_d1_revocation",
+            "test",
+            "-p",
+            "myelin-identity-service",
+            "--test",
+            "drill_id_d1_revocation",
         ],
         "drill_id_d2_fail_static" => &[
-            "test", "-p", "myelin-identity-service", "--test", "drill_id_d2_fail_static",
+            "test",
+            "-p",
+            "myelin-identity-service",
+            "--test",
+            "drill_id_d2_fail_static",
         ],
         "drill_id_d3_cross_tenant" => &[
-            "test", "-p", "myelin-identity-service", "--test", "drill_id_d3_cross_tenant",
+            "test",
+            "-p",
+            "myelin-identity-service",
+            "--test",
+            "drill_id_d3_cross_tenant",
         ],
         "drill_id_d4_zero_escape" => &[
-            "test", "-p", "myelin-identity-service", "--test", "drill_id_d4_zero_escape",
+            "test",
+            "-p",
+            "myelin-identity-service",
+            "--test",
+            "drill_id_d4_zero_escape",
         ],
         "drill_id_d5_delegation" => &[
-            "test", "-p", "myelin-identity-service", "--test", "drill_id_d5_delegation",
+            "test",
+            "-p",
+            "myelin-identity-service",
+            "--test",
+            "drill_id_d5_delegation",
         ],
         "drill_id_d6_run_token" => &[
-            "test", "-p", "myelin-identity-service", "--test", "drill_id_d6_run_token",
+            "test",
+            "-p",
+            "myelin-identity-service",
+            "--test",
+            "drill_id_d6_run_token",
         ],
         "drill_id_d7_watermark" => &[
-            "test", "-p", "myelin-identity-service", "--test", "drill_id_d7_watermark",
+            "test",
+            "-p",
+            "myelin-identity-service",
+            "--test",
+            "drill_id_d7_watermark",
         ],
         "drill_id_d8_re_erasure" => &[
-            "test", "-p", "myelin-identity-service", "--test", "drill_id_d8_re_erasure",
+            "test",
+            "-p",
+            "myelin-identity-service",
+            "--test",
+            "drill_id_d8_re_erasure",
         ],
         other => panic!("unknown Id-M1 drill target `{other}` — the proof-command table is frozen"),
     }
@@ -594,7 +626,13 @@ pub fn infra_required_rows() -> Vec<GateRow> {
 /// row here (it would red the gate; M2 is *correct*, M5 is *load-hardened*).
 pub fn m2_required_rows() -> Vec<GateRow> {
     fn row(id: &'static str, title: &'static str, cmd: &'static [&'static str]) -> GateRow {
-        GateRow { id, title, proof_command: cmd, permanent: false, floor: None }
+        GateRow {
+            id,
+            title,
+            proof_command: cmd,
+            permanent: false,
+            floor: None,
+        }
     }
     vec![
         // ---- Bus / reactive dispatch engine ----
@@ -1109,7 +1147,10 @@ mod tests {
             "contract-coverage",
             "harness-self-test",
         ] {
-            assert!(ids.contains(&must), "SUB-M0 gate is missing required row {must}");
+            assert!(
+                ids.contains(&must),
+                "SUB-M0 gate is missing required row {must}"
+            );
         }
         assert_eq!(ids.len(), 11, "the SUB-M0 row set is frozen at 11 rows");
     }
@@ -1131,11 +1172,17 @@ mod tests {
     fn all_rows_proven_is_green() {
         let mut card = Scorecard::new(Band::M0);
         for r in required_rows() {
-            card.record(RowResult::pass(r.id, format!("[2026-06-19] PASS {}", r.id), "2026-06-19"));
+            card.record(RowResult::pass(
+                r.id,
+                format!("[2026-06-19] PASS {}", r.id),
+                "2026-06-19",
+            ));
         }
         assert!(card.is_green(), "every required row proven ⇒ green");
         assert!(card.missing_required().is_empty());
-        assert!(card.render_markdown("2026-06-19").contains("GREEN — M1 may start"));
+        assert!(card
+            .render_markdown("2026-06-19")
+            .contains("GREEN — M1 may start"));
     }
 
     /// THE RATCHET, half 1: dropping a row re-reds the gate. You cannot shrink the proof set by
@@ -1193,15 +1240,33 @@ mod tests {
     fn id_m1_required_rows_cover_the_eight_drills_plus_coverage() {
         let ids: Vec<&str> = id_m1_required_rows().iter().map(|r| r.id).collect();
         for must in [
-            "ID-D1", "ID-D2", "ID-D3", "ID-D4", "ID-D5", "ID-D6", "ID-D7", "ID-D8",
+            "ID-D1",
+            "ID-D2",
+            "ID-D3",
+            "ID-D4",
+            "ID-D5",
+            "ID-D6",
+            "ID-D7",
+            "ID-D8",
             "contract-coverage",
         ] {
-            assert!(ids.contains(&must), "Id-M1 gate is missing required row {must}");
+            assert!(
+                ids.contains(&must),
+                "Id-M1 gate is missing required row {must}"
+            );
         }
-        assert_eq!(ids.len(), 9, "the Id-M1 row set is frozen at 8 drills + coverage = 9 rows");
+        assert_eq!(
+            ids.len(),
+            9,
+            "the Id-M1 row set is frozen at 8 drills + coverage = 9 rows"
+        );
         // The band dispatch returns the same frozen set (the single dispatch point).
         assert_eq!(
-            Band::M1Identity.required_rows().iter().map(|r| r.id).collect::<Vec<_>>(),
+            Band::M1Identity
+                .required_rows()
+                .iter()
+                .map(|r| r.id)
+                .collect::<Vec<_>>(),
             ids
         );
     }
@@ -1212,7 +1277,10 @@ mod tests {
     /// must point at the eight named drill targets.
     #[test]
     fn id_m1_drill_proof_commands_target_the_service_drills() {
-        for row in id_m1_required_rows().into_iter().filter(|r| r.id != "contract-coverage") {
+        for row in id_m1_required_rows()
+            .into_iter()
+            .filter(|r| r.id != "contract-coverage")
+        {
             assert_eq!(row.proof_command[0], "test");
             assert_eq!(row.proof_command[1], "-p");
             assert_eq!(row.proof_command[2], "myelin-identity-service");
@@ -1240,13 +1308,20 @@ mod tests {
     fn id_m1_all_rows_proven_is_green() {
         let mut card = Scorecard::new(Band::M1Identity);
         for r in id_m1_required_rows() {
-            card.record(RowResult::pass(r.id, format!("[2026-06-19] PASS {}", r.id), "2026-06-19"));
+            card.record(RowResult::pass(
+                r.id,
+                format!("[2026-06-19] PASS {}", r.id),
+                "2026-06-19",
+            ));
         }
         assert!(card.is_green(), "every Id-M1 row proven ⇒ green");
         assert!(card.missing_required().is_empty());
         let md = card.render_markdown("2026-06-19");
         assert!(md.contains("GREEN — M2 may start"));
-        assert!(md.contains("P-ID-31"), "the M5-hardening floor (P-ID-31/P-ID-35) must be named");
+        assert!(
+            md.contains("P-ID-31"),
+            "the M5-hardening floor (P-ID-31/P-ID-35) must be named"
+        );
         assert!(md.contains("ID-D9"), "the 30× surge floor must be named");
     }
 
@@ -1256,11 +1331,18 @@ mod tests {
     fn id_m1_dropping_any_row_reds_the_gate() {
         for dropped in id_m1_required_rows() {
             let mut card = Scorecard::new(Band::M1Identity);
-            for r in id_m1_required_rows().into_iter().filter(|r| r.id != dropped.id) {
+            for r in id_m1_required_rows()
+                .into_iter()
+                .filter(|r| r.id != dropped.id)
+            {
                 card.record(RowResult::pass(r.id, "[2026-06-19] PASS", "2026-06-19"));
             }
             assert_eq!(card.missing_required(), vec![dropped.id]);
-            assert!(!card.is_green(), "dropping {} must RED the M1→M2 gate", dropped.id);
+            assert!(
+                !card.is_green(),
+                "dropping {} must RED the M1→M2 gate",
+                dropped.id
+            );
         }
     }
 
@@ -1282,7 +1364,9 @@ mod tests {
         }
         assert!(!card.is_green(), "a claimed-not-proven Id drill blocks M2");
         assert_eq!(card.not_proven().len(), 1);
-        assert!(card.render_markdown("2026-06-19").contains("RED — M2 is BLOCKED"));
+        assert!(card
+            .render_markdown("2026-06-19")
+            .contains("RED — M2 is BLOCKED"));
     }
 
     /// The two bands select DIFFERENT frozen row sets through the same machinery (coherence,
@@ -1290,7 +1374,11 @@ mod tests {
     #[test]
     fn bands_select_distinct_row_sets() {
         let m0: Vec<&str> = Band::M0.required_rows().iter().map(|r| r.id).collect();
-        let id: Vec<&str> = Band::M1Identity.required_rows().iter().map(|r| r.id).collect();
+        let id: Vec<&str> = Band::M1Identity
+            .required_rows()
+            .iter()
+            .map(|r| r.id)
+            .collect();
         assert_ne!(m0, id);
         assert!(m0.contains(&"SUB-D1"));
         assert!(id.contains(&"ID-D3"));
@@ -1312,11 +1400,22 @@ mod tests {
             "SANDBOX-SMOKE",
             "LOAD-10X-SMOKE",
         ] {
-            assert!(ids.contains(&must), "Infra gate is missing required row {must}");
+            assert!(
+                ids.contains(&must),
+                "Infra gate is missing required row {must}"
+            );
         }
-        assert_eq!(ids.len(), 6, "the Infra row set is frozen at 4 drills + 2 floor smokes = 6 rows");
         assert_eq!(
-            Band::Infra.required_rows().iter().map(|r| r.id).collect::<Vec<_>>(),
+            ids.len(),
+            6,
+            "the Infra row set is frozen at 4 drills + 2 floor smokes = 6 rows"
+        );
+        assert_eq!(
+            Band::Infra
+                .required_rows()
+                .iter()
+                .map(|r| r.id)
+                .collect::<Vec<_>>(),
             ids
         );
     }
@@ -1328,7 +1427,8 @@ mod tests {
     fn infra_proof_commands_are_features_integration() {
         for row in infra_required_rows() {
             assert!(
-                row.proof_command.contains(&"--features") && row.proof_command.contains(&"integration"),
+                row.proof_command.contains(&"--features")
+                    && row.proof_command.contains(&"integration"),
                 "{} must run --features integration (red-until-proven), got {:?}",
                 row.id,
                 row.proof_command
@@ -1356,12 +1456,22 @@ mod tests {
     fn infra_all_rows_proven_is_green_but_floors_stay_named() {
         let mut card = Scorecard::new(Band::Infra);
         for r in infra_required_rows() {
-            card.record(RowResult::pass(r.id, format!("[2026-06-19] PASS {}", r.id), "2026-06-19"));
+            card.record(RowResult::pass(
+                r.id,
+                format!("[2026-06-19] PASS {}", r.id),
+                "2026-06-19",
+            ));
         }
         assert!(card.is_green(), "every Infra row proven ⇒ green");
         let md = card.render_markdown("2026-06-19");
-        assert!(md.contains("SANDBOX-ESCAPE"), "the gVisor/microVM floor must stay named");
-        assert!(md.contains("WORLD-SCALE 30×"), "the real-hardware load floor must stay named");
+        assert!(
+            md.contains("SANDBOX-ESCAPE"),
+            "the gVisor/microVM floor must stay named"
+        );
+        assert!(
+            md.contains("WORLD-SCALE 30×"),
+            "the real-hardware load floor must stay named"
+        );
         assert!(md.contains("red-until-proven") || md.contains("Red-until-proven"));
     }
 
@@ -1371,11 +1481,18 @@ mod tests {
     fn infra_dropping_any_row_reds_the_gate() {
         for dropped in infra_required_rows() {
             let mut card = Scorecard::new(Band::Infra);
-            for r in infra_required_rows().into_iter().filter(|r| r.id != dropped.id) {
+            for r in infra_required_rows()
+                .into_iter()
+                .filter(|r| r.id != dropped.id)
+            {
                 card.record(RowResult::pass(r.id, "[2026-06-19] PASS", "2026-06-19"));
             }
             assert_eq!(card.missing_required(), vec![dropped.id]);
-            assert!(!card.is_green(), "dropping {} must RED the Infra gate", dropped.id);
+            assert!(
+                !card.is_green(),
+                "dropping {} must RED the Infra gate",
+                dropped.id
+            );
         }
     }
 
@@ -1395,7 +1512,10 @@ mod tests {
                 card.record(RowResult::pass(r.id, "[2026-06-19] PASS", "2026-06-19"));
             }
         }
-        assert!(!card.is_green(), "an unproven integration drill blocks the infra gate");
+        assert!(
+            !card.is_green(),
+            "an unproven integration drill blocks the infra gate"
+        );
         assert_eq!(card.not_proven().len(), 1);
     }
 
@@ -1410,27 +1530,62 @@ mod tests {
         let ids: Vec<&str> = m2_required_rows().iter().map(|r| r.id).collect();
         for must in [
             // bus/reactive engine
-            "BUS-D1", "BUS-D3", "BUS-D6", "BUS-D5", "BUS-D8",
+            "BUS-D1",
+            "BUS-D3",
+            "BUS-D6",
+            "BUS-D5",
+            "BUS-D8",
             // Reference Graph
             "REF-CDC",
             // Search (incl. the zero-leak keystone)
-            "SRCH-D1", "SRCH-D2", "SRCH-D3", "SRCH-D4", "SRCH-D7",
+            "SRCH-D1",
+            "SRCH-D2",
+            "SRCH-D3",
+            "SRCH-D4",
+            "SRCH-D7",
             // Notifications
-            "NOTIF-D1", "NOTIF-D2", "NOTIF-D3", "NOTIF-D4", "NOTIF-D7", "NOTIF-D8", "NOTIF-D9",
-            "NOTIF-D10", "NOTIF-D11", "NOTIF-snooze",
+            "NOTIF-D1",
+            "NOTIF-D2",
+            "NOTIF-D3",
+            "NOTIF-D4",
+            "NOTIF-D7",
+            "NOTIF-D8",
+            "NOTIF-D9",
+            "NOTIF-D10",
+            "NOTIF-D11",
+            "NOTIF-snooze",
             // Agent Fabric (M2-B family) incl. the AG-D4 keystone
-            "AG-D1/2/3", "AG-D5-batch", "AG-D5-loop", "AG-D7", "AG-D8", "AG-D11", "AG-D4",
+            "AG-D1/2/3",
+            "AG-D5-batch",
+            "AG-D5-loop",
+            "AG-D7",
+            "AG-D8",
+            "AG-D11",
+            "AG-D4",
             // Durable Workflow
-            "FLOW-D1", "FLOW-D3", "FLOW-D4-hitl", "FLOW-D4-per-effect", "FLOW-D5", "FLOW-D6",
-            "FLOW-D7", "FLOW-mergeq",
+            "FLOW-D1",
+            "FLOW-D3",
+            "FLOW-D4-hitl",
+            "FLOW-D4-per-effect",
+            "FLOW-D5",
+            "FLOW-D6",
+            "FLOW-D7",
+            "FLOW-mergeq",
             // coverage
             "contract-coverage",
         ] {
-            assert!(ids.contains(&must), "M2 gate is missing required row {must}");
+            assert!(
+                ids.contains(&must),
+                "M2 gate is missing required row {must}"
+            );
         }
         // The band dispatch returns the same frozen set (the single dispatch point).
         assert_eq!(
-            Band::M2Reactive.required_rows().iter().map(|r| r.id).collect::<Vec<_>>(),
+            Band::M2Reactive
+                .required_rows()
+                .iter()
+                .map(|r| r.id)
+                .collect::<Vec<_>>(),
             ids
         );
     }
@@ -1444,10 +1599,18 @@ mod tests {
             .filter(|r| r.permanent)
             .map(|r| r.id)
             .collect();
-        assert_eq!(perm, vec!["AG-D4"], "AG-D4 is the only re-run-forever M2 row");
-        let ag_d4 = m2_required_rows().into_iter().find(|r| r.id == "AG-D4").unwrap();
+        assert_eq!(
+            perm,
+            vec!["AG-D4"],
+            "AG-D4 is the only re-run-forever M2 row"
+        );
+        let ag_d4 = m2_required_rows()
+            .into_iter()
+            .find(|r| r.id == "AG-D4")
+            .unwrap();
         assert!(
-            ag_d4.proof_command.contains(&"--features") && ag_d4.proof_command.contains(&"integration"),
+            ag_d4.proof_command.contains(&"--features")
+                && ag_d4.proof_command.contains(&"integration"),
             "AG-D4 must run --features integration (the real-kernel escape drill), got {:?}",
             ag_d4.proof_command
         );
@@ -1461,23 +1624,39 @@ mod tests {
     fn m2_all_rows_proven_is_green_with_residuals_and_floor_named() {
         let mut card = Scorecard::new(Band::M2Reactive);
         for r in m2_required_rows() {
-            card.record(RowResult::pass(r.id, format!("[2026-06-21] PASS {}", r.id), "2026-06-21"));
+            card.record(RowResult::pass(
+                r.id,
+                format!("[2026-06-21] PASS {}", r.id),
+                "2026-06-21",
+            ));
         }
         assert!(card.is_green(), "every M2 row proven ⇒ green");
         assert!(card.missing_required().is_empty());
         let md = card.render_markdown("2026-06-21");
         assert!(md.contains("GREEN — M3 may start"));
         // AG-D4 non-vacuous: MYELIN_REQUIRE_KVM + proven-on-real-hardware named.
-        assert!(md.contains("MYELIN_REQUIRE_KVM"), "AG-D4 non-vacuous mechanism must be named");
+        assert!(
+            md.contains("MYELIN_REQUIRE_KVM"),
+            "AG-D4 non-vacuous mechanism must be named"
+        );
         assert!(md.contains("PROVEN-ON-REAL-HARDWARE"));
         // AG-D4's three residuals (a)/(b)/(c).
         assert!(md.contains("THIS kernel"), "residual (a) must be named");
         assert!(md.contains("Scaleway"), "residual (b) must be named");
-        assert!(md.contains("single-box ≠ fleet"), "residual (c) must be named");
+        assert!(
+            md.contains("single-box ≠ fleet"),
+            "residual (c) must be named"
+        );
         // The one true floor + the gVisor named residual.
-        assert!(md.contains("world-scale 30× LOAD"), "the one true 30× floor must be named");
+        assert!(
+            md.contains("world-scale 30× LOAD"),
+            "the one true 30× floor must be named"
+        );
         assert!(md.contains("M5"), "the floor is deferred to M5");
-        assert!(md.contains("CI-P28"), "the gVisor second-backend residual must be named");
+        assert!(
+            md.contains("CI-P28"),
+            "the gVisor second-backend residual must be named"
+        );
     }
 
     /// THE RATCHET on the M2 set: dropping ANY single row reds the M2→M3 gate (you cannot ship M3
@@ -1486,11 +1665,18 @@ mod tests {
     fn m2_dropping_any_row_reds_the_gate() {
         for dropped in m2_required_rows() {
             let mut card = Scorecard::new(Band::M2Reactive);
-            for r in m2_required_rows().into_iter().filter(|r| r.id != dropped.id) {
+            for r in m2_required_rows()
+                .into_iter()
+                .filter(|r| r.id != dropped.id)
+            {
                 card.record(RowResult::pass(r.id, "[2026-06-21] PASS", "2026-06-21"));
             }
             assert_eq!(card.missing_required(), vec![dropped.id]);
-            assert!(!card.is_green(), "dropping {} must RED the M2→M3 gate", dropped.id);
+            assert!(
+                !card.is_green(),
+                "dropping {} must RED the M2→M3 gate",
+                dropped.id
+            );
         }
     }
 
@@ -1513,6 +1699,8 @@ mod tests {
         }
         assert!(!card.is_green(), "a claimed-not-proven M2 row blocks M3");
         assert_eq!(card.not_proven().len(), 1);
-        assert!(card.render_markdown("2026-06-21").contains("RED — M3 is BLOCKED"));
+        assert!(card
+            .render_markdown("2026-06-21")
+            .contains("RED — M3 is BLOCKED"));
     }
 }

@@ -128,7 +128,10 @@ pub struct Blob {
 impl Blob {
     /// A blob from its oid + bytes.
     pub fn new(oid: impl Into<String>, bytes: impl Into<Vec<u8>>) -> Blob {
-        Blob { oid: BlobOid::new(oid), bytes: bytes.into() }
+        Blob {
+            oid: BlobOid::new(oid),
+            bytes: bytes.into(),
+        }
     }
 }
 
@@ -394,14 +397,23 @@ fn identifier_tokens(text: &str) -> Vec<String> {
             cur.push(c);
         } else if !cur.is_empty() {
             // An identifier must start with a letter/underscore (a bare number is a literal, not a symbol).
-            if cur.chars().next().is_some_and(|f| f.is_alphabetic() || f == '_') {
+            if cur
+                .chars()
+                .next()
+                .is_some_and(|f| f.is_alphabetic() || f == '_')
+            {
                 out.push(std::mem::take(&mut cur));
             } else {
                 cur.clear();
             }
         }
     }
-    if !cur.is_empty() && cur.chars().next().is_some_and(|f| f.is_alphabetic() || f == '_') {
+    if !cur.is_empty()
+        && cur
+            .chars()
+            .next()
+            .is_some_and(|f| f.is_alphabetic() || f == '_')
+    {
         out.push(cur);
     }
     out
@@ -446,8 +458,14 @@ impl BlobProjection {
     pub fn into_search_projection(self) -> SearchProjection {
         let mut fields: BTreeMap<String, FieldValue> = BTreeMap::new();
         fields.insert(FACET_PATH.to_string(), FieldValue::Text(self.path.clone()));
-        fields.insert(FACET_LANGUAGE.to_string(), FieldValue::Text(self.language.clone()));
-        fields.insert(FACET_BLOB_OID.to_string(), FieldValue::Text(self.blob_oid.0.clone()));
+        fields.insert(
+            FACET_LANGUAGE.to_string(),
+            FieldValue::Text(self.language.clone()),
+        );
+        fields.insert(
+            FACET_BLOB_OID.to_string(),
+            FieldValue::Text(self.blob_oid.0.clone()),
+        );
         // The analysable body: symbols + literals + commit message + the raw text (one run; Search
         // tokenizes — git supplies, it does not index).
         let body = format!(
@@ -457,7 +475,11 @@ impl BlobProjection {
             self.commit_message,
             self.text,
         );
-        SearchProjection { text: body, fields, lang: Some(self.language) }
+        SearchProjection {
+            text: body,
+            fields,
+            lang: Some(self.language),
+        }
     }
 }
 
@@ -495,7 +517,10 @@ impl CodeProjectionCursor {
         self.last_indexed
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert((repo.to_string(), ref_name.to_string()), new_tip.to_string());
+            .insert(
+                (repo.to_string(), ref_name.to_string()),
+                new_tip.to_string(),
+            );
     }
 }
 
@@ -598,17 +623,33 @@ impl<'a, R: RestrictionPolicy> CodeProjectionEmitter<'a, R> {
         commit_message: &str,
     ) -> BlobProjection {
         let restricted = self.restriction.is_restricted(&self.repo, path);
-        let text = if restricted { String::new() } else { String::from_utf8_lossy(&blob.bytes).into_owned() };
+        let text = if restricted {
+            String::new()
+        } else {
+            String::from_utf8_lossy(&blob.bytes).into_owned()
+        };
         BlobProjection {
             artifact_ref: self.blob_ref(ref_name, path),
             path: path.to_string(),
             language: detect_language(path),
-            symbols: if restricted { Vec::new() } else { extract_symbols(&text) },
-            literals: if restricted { Vec::new() } else { extract_literals(&text) },
+            symbols: if restricted {
+                Vec::new()
+            } else {
+                extract_symbols(&text)
+            },
+            literals: if restricted {
+                Vec::new()
+            } else {
+                extract_literals(&text)
+            },
             text,
             // A restricted blob still carries its path/oid (so the doc identity is stable for removal),
             // but never the commit message body.
-            commit_message: if restricted { String::new() } else { commit_message.to_string() },
+            commit_message: if restricted {
+                String::new()
+            } else {
+                commit_message.to_string()
+            },
             blob_oid: blob.oid.clone(),
         }
     }
@@ -709,7 +750,10 @@ impl<'a, R: RestrictionPolicy> CodeProjectionEmitter<'a, R> {
         tx.commit()?;
         self.cursor.advance(&self.repo, ref_name, new_tip_oid);
 
-        Ok(Some(ProjectionEmit { emitted, changed_blob_count }))
+        Ok(Some(ProjectionEmit {
+            emitted,
+            changed_blob_count,
+        }))
     }
 }
 
@@ -755,13 +799,19 @@ mod tests {
 
     #[test]
     fn split_symbol_handles_camel_snake_kebab_and_acronyms() {
-        assert_eq!(split_symbol("parse_http_response"), vec!["http", "parse", "parse_http_response", "response"]);
+        assert_eq!(
+            split_symbol("parse_http_response"),
+            vec!["http", "parse", "parse_http_response", "response"]
+        );
         // camelCase + acronym run: parseHTTPResponse → parse / http / response (+ the whole token)
         let s = split_symbol("parseHTTPResponse");
         assert!(s.contains(&"parse".to_string()));
         assert!(s.contains(&"http".to_string()));
         assert!(s.contains(&"response".to_string()));
-        assert!(s.contains(&"parsehttpresponse".to_string()), "the whole token is searchable too");
+        assert!(
+            s.contains(&"parsehttpresponse".to_string()),
+            "the whole token is searchable too"
+        );
         // kebab + digit boundary
         let k = split_symbol("api-v2");
         assert!(k.contains(&"api".to_string()));
@@ -786,7 +836,10 @@ mod tests {
     fn extract_literals_finds_strings_and_numbers() {
         let text = r#"let url = "https://example.test"; let n = 42; let pi = 3.14;"#;
         let lits = extract_literals(text);
-        assert!(lits.contains(&"https://example.test".to_string()), "{lits:?}");
+        assert!(
+            lits.contains(&"https://example.test".to_string()),
+            "{lits:?}"
+        );
         assert!(lits.contains(&"42".to_string()));
         assert!(lits.contains(&"3.14".to_string()));
     }
@@ -798,20 +851,35 @@ mod tests {
     fn extract_literals_handles_escapes_hex_and_trailing_dot() {
         // A backslash-escaped quote does NOT terminate the string; the inner char is captured.
         let escaped = extract_literals(r#""a\"b""#);
-        assert!(escaped.contains(&"a\"b".to_string()), "escape handling: {escaped:?}");
+        assert!(
+            escaped.contains(&"a\"b".to_string()),
+            "escape handling: {escaped:?}"
+        );
         // Single-quoted string.
         let sq = extract_literals("x = 'hello'");
         assert!(sq.contains(&"hello".to_string()), "{sq:?}");
         // Hex + underscore-grouped numeric literals.
         let nums = extract_literals("a = 0xFF; b = 1_000;");
         assert!(nums.contains(&"0xFF".to_string()), "hex literal: {nums:?}");
-        assert!(nums.contains(&"1_000".to_string()), "underscore-grouped: {nums:?}");
+        assert!(
+            nums.contains(&"1_000".to_string()),
+            "underscore-grouped: {nums:?}"
+        );
         // A trailing dot is trimmed (`5.` → `5`, the `.` was a statement separator).
         let td = extract_literals("n = 5. end");
-        assert!(td.contains(&"5".to_string()), "trailing dot trimmed: {td:?}");
-        assert!(!td.iter().any(|l| l == "5."), "the trailing-dot form is not emitted: {td:?}");
+        assert!(
+            td.contains(&"5".to_string()),
+            "trailing dot trimmed: {td:?}"
+        );
+        assert!(
+            !td.iter().any(|l| l == "5."),
+            "the trailing-dot form is not emitted: {td:?}"
+        );
         // An empty string literal `""` emits nothing.
-        assert!(extract_literals(r#"x = """#).is_empty(), "an empty string literal emits no literal");
+        assert!(
+            extract_literals(r#"x = """#).is_empty(),
+            "an empty string literal emits no literal"
+        );
     }
 
     /// Identifier tokenization: a bare number is NOT a symbol; an identifier may contain digits +
@@ -820,13 +888,22 @@ mod tests {
     fn identifier_tokens_require_a_leading_letter_or_underscore() {
         // `_private` and `var2` ARE identifiers; `42` is NOT.
         let syms = extract_symbols("let _private = var2 + 42;");
-        assert!(syms.iter().any(|s| s == "_private" || s == "private"), "{syms:?}");
+        assert!(
+            syms.iter().any(|s| s == "_private" || s == "private"),
+            "{syms:?}"
+        );
         assert!(syms.contains(&"var".to_string()), "{syms:?}");
         // 42 is a number → not a symbol.
-        assert!(!syms.contains(&"42".to_string()), "a bare number is a literal, not a symbol: {syms:?}");
+        assert!(
+            !syms.contains(&"42".to_string()),
+            "a bare number is a literal, not a symbol: {syms:?}"
+        );
         // A trailing identifier with no following separator is still captured.
         let trailing = extract_symbols("call doThing");
-        assert!(trailing.contains(&"do".to_string()) && trailing.contains(&"thing".to_string()), "{trailing:?}");
+        assert!(
+            trailing.contains(&"do".to_string()) && trailing.contains(&"thing".to_string()),
+            "{trailing:?}"
+        );
     }
 
     /// The underscore is part of an identifier (NOT a separator at the tokenizer level — the
@@ -836,11 +913,17 @@ mod tests {
     fn underscore_is_part_of_the_identifier_token() {
         // `parse_config` is ONE identifier token → its whole-token form is a symbol (plus the split).
         let syms = extract_symbols("fn parse_config");
-        assert!(syms.contains(&"parse_config".to_string()), "the whole snake token is searchable: {syms:?}");
+        assert!(
+            syms.contains(&"parse_config".to_string()),
+            "the whole snake token is searchable: {syms:?}"
+        );
         assert!(syms.contains(&"parse".to_string()) && syms.contains(&"config".to_string()));
         // A snake identifier at END-OF-TEXT (no trailing separator) still flushes WITH its underscore.
         let tail = extract_symbols("see also_this");
-        assert!(tail.contains(&"also_this".to_string()), "the trailing snake token flushes whole: {tail:?}");
+        assert!(
+            tail.contains(&"also_this".to_string()),
+            "the trailing snake token flushes whole: {tail:?}"
+        );
     }
 
     #[test]
@@ -892,12 +975,18 @@ mod tests {
     fn split_camel_includes_the_trailing_run() {
         // parseHTTPResponse → parse / HTTP / Response — the final "Response" must be present.
         let s = split_symbol("parseHTTPResponse");
-        assert!(s.contains(&"response".to_string()), "the trailing camel run is included: {s:?}");
+        assert!(
+            s.contains(&"response".to_string()),
+            "the trailing camel run is included: {s:?}"
+        );
         // A single-word token: the whole token + the one word.
         assert_eq!(split_symbol("hello"), vec!["hello"]);
         // A token ending in a digit run: foo2 → foo / 2 (both, incl. the trailing digit run).
         let d = split_symbol("foo2");
-        assert!(d.contains(&"foo".to_string()) && d.contains(&"2".to_string()), "{d:?}");
+        assert!(
+            d.contains(&"foo".to_string()) && d.contains(&"2".to_string()),
+            "{d:?}"
+        );
     }
 
     // ── the diff unit tests (the incremental invariant) ──
@@ -920,9 +1009,14 @@ mod tests {
         assert!(paths.contains(&"b.rs"));
         assert!(paths.contains(&"d.rs"));
         assert!(paths.contains(&"c.rs"));
-        assert!(!paths.contains(&"a.rs"), "an unchanged blob emits nothing (incremental)");
+        assert!(
+            !paths.contains(&"a.rs"),
+            "an unchanged blob emits nothing (incremental)"
+        );
         // c is a delete; b and d are upserts.
-        assert!(changes.iter().any(|c| matches!(c, BlobChange::Deleted { path, .. } if path == "c.rs")));
+        assert!(changes
+            .iter()
+            .any(|c| matches!(c, BlobChange::Deleted { path, .. } if path == "c.rs")));
     }
 
     #[test]
@@ -931,7 +1025,11 @@ mod tests {
             .with("a.rs", Blob::new("oid-a", b"fn a() {}".to_vec()))
             .with("b.rs", Blob::new("oid-b", b"fn b() {}".to_vec()));
         let changes = diff_trees(&Tree::empty(), &new);
-        assert_eq!(changes.len(), 2, "the first index of a ref projects every blob once");
+        assert_eq!(
+            changes.len(),
+            2,
+            "the first index of a ref projects every blob once"
+        );
     }
 
     // ── the GATE: emit-count == changed-blob-count, incremental ──
@@ -945,31 +1043,60 @@ mod tests {
 
         // Push 1: first index of main — 2 files → 2 emits.
         let t1 = Tree::empty()
-            .with("src/lib.rs", Blob::new("o1", b"pub fn helloWorld() {}".to_vec()))
+            .with(
+                "src/lib.rs",
+                Blob::new("o1", b"pub fn helloWorld() {}".to_vec()),
+            )
             .with("README.md", Blob::new("o2", b"# project".to_vec()));
         let p1 = e
-            .emit_for_push("refs/heads/main", "tip1", &Tree::empty(), &t1, "initial commit")
+            .emit_for_push(
+                "refs/heads/main",
+                "tip1",
+                &Tree::empty(),
+                &t1,
+                "initial commit",
+            )
             .unwrap()
             .expect("indexed ref emits");
         assert_eq!(p1.changed_blob_count, 2);
-        assert_eq!(p1.emitted.len(), 2, "emit-count == changed-blob-count (the GATE)");
+        assert_eq!(
+            p1.emitted.len(),
+            2,
+            "emit-count == changed-blob-count (the GATE)"
+        );
         assert_eq!(outbox.committed_count(), 2);
-        assert_eq!(cursor.last_indexed("core", "refs/heads/main").as_deref(), Some("tip1"));
+        assert_eq!(
+            cursor.last_indexed("core", "refs/heads/main").as_deref(),
+            Some("tip1")
+        );
 
         // Push 2: modify ONE file, add ONE — 2 changed of 2 files in the tree. README unchanged.
         let t2 = t1
             .clone()
-            .with("src/lib.rs", Blob::new("o1b", b"pub fn helloWorld() { ok() }".to_vec())) // modified
+            .with(
+                "src/lib.rs",
+                Blob::new("o1b", b"pub fn helloWorld() { ok() }".to_vec()),
+            ) // modified
             .with("src/new.rs", Blob::new("o3", b"fn n() {}".to_vec())); // added
         let p2 = e
             .emit_for_push("refs/heads/main", "tip2", &t1, &t2, "second commit")
             .unwrap()
             .unwrap();
-        assert_eq!(p2.changed_blob_count, 2, "2 changed (1 modified + 1 added); README unchanged");
-        assert_eq!(p2.emitted.len(), 2, "incremental: exactly 2 emits, NOT the whole 3-file tree");
+        assert_eq!(
+            p2.changed_blob_count, 2,
+            "2 changed (1 modified + 1 added); README unchanged"
+        );
+        assert_eq!(
+            p2.emitted.len(),
+            2,
+            "incremental: exactly 2 emits, NOT the whole 3-file tree"
+        );
         // Total committed: 2 + 2.
         assert_eq!(outbox.committed_count(), 4);
-        assert_eq!(cursor.last_indexed("core", "refs/heads/main").as_deref(), Some("tip2"));
+        assert_eq!(
+            cursor.last_indexed("core", "refs/heads/main").as_deref(),
+            Some("tip2")
+        );
     }
 
     #[test]
@@ -980,7 +1107,10 @@ mod tests {
         let e = emitter(&outbox, &cursor, &r);
         let t = Tree::empty().with("a.rs", Blob::new("o", b"fn a(){}".to_vec()));
         // The same tree on both sides (e.g. a merge that changed no blobs on this ref).
-        let p = e.emit_for_push("refs/heads/main", "tip", &t, &t, "noop").unwrap().unwrap();
+        let p = e
+            .emit_for_push("refs/heads/main", "tip", &t, &t, "noop")
+            .unwrap()
+            .unwrap();
         assert_eq!(p.changed_blob_count, 0);
         assert_eq!(p.emitted.len(), 0, "0 changed blobs → 0 emits");
         assert_eq!(outbox.committed_count(), 0);
@@ -1009,7 +1139,10 @@ mod tests {
         let e = emitter(&outbox, &cursor, &r);
         let t = Tree::empty().with(
             "src/main.rs",
-            Blob::new("blob-oid-1", b"fn parseHttp() { let url = \"http://x\"; }".to_vec()),
+            Blob::new(
+                "blob-oid-1",
+                b"fn parseHttp() { let url = \"http://x\"; }".to_vec(),
+            ),
         );
         let p = e
             .emit_for_push("refs/heads/main", "tip", &Tree::empty(), &t, "add parser")
@@ -1019,12 +1152,19 @@ mod tests {
         assert_eq!(row.envelope.type_.0, GIT_BLOB_SNAPSHOT);
         let pl = &row.envelope.payload;
         assert_eq!(pl["op"], serde_json::json!("upsert"));
-        assert_eq!(pl["artifact_ref"], serde_json::json!("myelin://acme/git/blob/core:refs/heads/main:src/main.rs"));
+        assert_eq!(
+            pl["artifact_ref"],
+            serde_json::json!("myelin://acme/git/blob/core:refs/heads/main:src/main.rs")
+        );
         assert_eq!(pl["path"], serde_json::json!("src/main.rs"));
         assert_eq!(pl["language"], serde_json::json!("rust"));
         assert_eq!(pl["blob_oid"], serde_json::json!("blob-oid-1"));
         assert_eq!(pl["commit_message"], serde_json::json!("add parser"));
-        assert_eq!(pl["acl_object_type"], serde_json::json!("repo"), "ACL keys on the parent repo");
+        assert_eq!(
+            pl["acl_object_type"],
+            serde_json::json!("repo"),
+            "ACL keys on the parent repo"
+        );
         // symbols carry the camel-split identifiers; literals carry the string.
         let syms = pl["symbols"].as_array().unwrap();
         assert!(syms.iter().any(|s| s == "parse"));
@@ -1049,9 +1189,18 @@ mod tests {
         };
         let sp = bp.into_search_projection();
         // The structured facets are exactly the GIT-P5 spec's three (path / language / blob_oid).
-        assert_eq!(sp.fields.get(FACET_PATH), Some(&FieldValue::Text("a.rs".into())));
-        assert_eq!(sp.fields.get(FACET_LANGUAGE), Some(&FieldValue::Text("rust".into())));
-        assert_eq!(sp.fields.get(FACET_BLOB_OID), Some(&FieldValue::Text("oid-1".into())));
+        assert_eq!(
+            sp.fields.get(FACET_PATH),
+            Some(&FieldValue::Text("a.rs".into()))
+        );
+        assert_eq!(
+            sp.fields.get(FACET_LANGUAGE),
+            Some(&FieldValue::Text("rust".into()))
+        );
+        assert_eq!(
+            sp.fields.get(FACET_BLOB_OID),
+            Some(&FieldValue::Text("oid-1".into()))
+        );
         assert_eq!(sp.fields.len(), 3, "exactly the three declared facets");
         assert_eq!(sp.lang.as_deref(), Some("rust"));
         // The full-text body carries the symbols + literals + commit message + text (one analysable run).
@@ -1077,7 +1226,10 @@ mod tests {
         let r = RestrictPath("secret.rs");
         let e = emitter(&outbox, &cursor, &r);
         let t = Tree::empty()
-            .with("secret.rs", Blob::new("os", b"const KEY = \"top-secret-value\";".to_vec()))
+            .with(
+                "secret.rs",
+                Blob::new("os", b"const KEY = \"top-secret-value\";".to_vec()),
+            )
             .with("ok.rs", Blob::new("ok", b"fn ok() {}".to_vec()));
         let p = e
             .emit_for_push("refs/heads/main", "tip", &Tree::empty(), &t, "msg")
@@ -1094,9 +1246,21 @@ mod tests {
             }
         }
         let sd = secret_doc.expect("the restricted doc was emitted");
-        assert_eq!(sd["text"], serde_json::json!(""), "the restricted body is suppressed");
-        assert_eq!(sd["symbols"], serde_json::json!([]), "no symbols leak from a restricted blob");
-        assert_eq!(sd["literals"], serde_json::json!([]), "the secret literal never enters the index");
+        assert_eq!(
+            sd["text"],
+            serde_json::json!(""),
+            "the restricted body is suppressed"
+        );
+        assert_eq!(
+            sd["symbols"],
+            serde_json::json!([]),
+            "no symbols leak from a restricted blob"
+        );
+        assert_eq!(
+            sd["literals"],
+            serde_json::json!([]),
+            "the secret literal never enters the index"
+        );
         // But the path/language/oid (the non-content facets) are still present (the doc identity).
         assert_eq!(sd["path"], serde_json::json!("secret.rs"));
         assert_eq!(sd["blob_oid"], serde_json::json!("os"));
@@ -1111,7 +1275,8 @@ mod tests {
         let r = NoRestrictions;
         let e = emitter(&outbox, &cursor, &r);
         let t1 = Tree::empty().with("gone.rs", Blob::new("g1", b"fn gone() {}".to_vec()));
-        e.emit_for_push("refs/heads/main", "t1", &Tree::empty(), &t1, "add").unwrap();
+        e.emit_for_push("refs/heads/main", "t1", &Tree::empty(), &t1, "add")
+            .unwrap();
         // Push 2: delete the file.
         let p = e
             .emit_for_push("refs/heads/main", "t2", &t1, &Tree::empty(), "rm")
@@ -1119,7 +1284,11 @@ mod tests {
             .unwrap();
         assert_eq!(p.emitted.len(), 1);
         let row = outbox.row(&p.emitted[0]).unwrap();
-        assert_eq!(row.envelope.payload["op"], serde_json::json!("delete"), "Gone is a tombstone, not a silent drop");
+        assert_eq!(
+            row.envelope.payload["op"],
+            serde_json::json!("delete"),
+            "Gone is a tombstone, not a silent drop"
+        );
         assert_eq!(row.envelope.payload["path"], serde_json::json!("gone.rs"));
         assert_eq!(row.envelope.payload["blob_oid"], serde_json::json!("g1"));
     }

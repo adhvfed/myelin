@@ -32,10 +32,16 @@ use myelin_substrate::{AuthzServed, FailStaticAuthz, ServeError, TestClock, Thre
 use myelin_tenancy::TenantId;
 
 fn bounded_stale() -> Consistency {
-    Consistency { at_least: Zookie(String::new()), mode: ConsistencyMode::BoundedStale }
+    Consistency {
+        at_least: Zookie(String::new()),
+        mode: ConsistencyMode::BoundedStale,
+    }
 }
 fn strong(z: &str) -> Consistency {
-    Consistency { at_least: Zookie(z.into()), mode: ConsistencyMode::Strong }
+    Consistency {
+        at_least: Zookie(z.into()),
+        mode: ConsistencyMode::Strong,
+    }
 }
 
 /// Build the consumer cache against the canonical thresholds-file bound + a deterministic clock,
@@ -80,7 +86,10 @@ fn cdc_1_10_constructor_enforces_the_threshold_file_bound() {
     // the seed (== SLA, ≥ token TTL) wires; W sits ≤ SLA ≥ token TTL.
     let (fs, sla, token_ttl) = cache_from_file(0);
     assert!(fs.static_max() <= sla, "W ≤ revocation SLA");
-    assert!(fs.static_max() >= token_ttl, "W ≥ agent-token TTL (the window contains the token)");
+    assert!(
+        fs.static_max() >= token_ttl,
+        "W ≥ agent-token TTL (the window contains the token)"
+    );
 }
 
 /// **CDC 1.10 — the sequence property (EI-01 §4) against the Identity authz client:** authenticate
@@ -103,18 +112,30 @@ fn cdc_1_10_sequence_authenticated_hiccup_stale_then_denied_at_window_close() {
     breaker.break_dependency(Dependency::Identity, scope.clone());
     fs.clock().advance(30); // age == fresh_ttl
     let f = fs.serve(key, &bounded_stale(), false, &src);
-    assert_eq!(f.served, AuthzServed::Fresh, "age == fresh_ttl is still fresh");
+    assert_eq!(
+        f.served,
+        AuthzServed::Fresh,
+        "age == fresh_ttl is still fresh"
+    );
 
     // 3) past fresh_ttl, inside static_max → Static (degraded), serving the last known-good grant.
     fs.clock().advance(100); // age == 130, inside static_max
     let s = fs.serve(key, &bounded_stale(), false, &src);
-    assert_eq!(s.served, AuthzServed::Static, "the consumer survives the hiccup on the coarse grant");
+    assert_eq!(
+        s.served,
+        AuthzServed::Static,
+        "the consumer survives the hiccup on the coarse grant"
+    );
     assert!(s.is_allow() && s.is_degraded());
 
     // 4) the window CLOSES: past static_max → Closed (deny) — NEVER open.
     fs.clock().advance(fs.static_max()); // age now > static_max
     let c = fs.serve(key, &bounded_stale(), false, &src);
-    assert_eq!(c.served, AuthzServed::Closed, "past W → deny, never fail open");
+    assert_eq!(
+        c.served,
+        AuthzServed::Closed,
+        "past W → deny, never fail open"
+    );
     assert!(c.is_deny());
 
     // the exported signals tracked the sequence; staleness never exceeded the budget ≤ the SLA.
@@ -122,7 +143,10 @@ fn cdc_1_10_sequence_authenticated_hiccup_stale_then_denied_at_window_close() {
     assert_eq!(sig.fresh, 2, "the live read + the within-ttl cached read");
     assert_eq!(sig.stale, 1, "one degraded answer");
     assert_eq!(sig.closed, 1, "one denied answer at window close");
-    assert!((sig.last_staleness_secs) <= sla, "staleness ≤ the revocation SLA");
+    assert!(
+        (sig.last_staleness_secs) <= sla,
+        "staleness ≤ the revocation SLA"
+    );
 }
 
 /// **CDC 1.10 — the zookie bypass (4.10): a Strong read bypasses the consumer cache and fails
@@ -141,8 +165,15 @@ fn cdc_1_10_zookie_bypass_fails_closed_on_hiccup() {
     fs.clock().advance(31);
 
     let z = fs.serve(key, &strong("z-strong"), false, &src);
-    assert_eq!(z.served, AuthzServed::BypassClosed, "a zookie read bypasses the cache");
-    assert!(z.is_deny(), "a strong read fails CLOSED on a hiccup (never stale)");
+    assert_eq!(
+        z.served,
+        AuthzServed::BypassClosed,
+        "a zookie read bypasses the cache"
+    );
+    assert!(
+        z.is_deny(),
+        "a strong read fails CLOSED on a hiccup (never stale)"
+    );
 }
 
 /// **CDC 1.10 — never escalate + never fail open:** a `Deny` provider answer is replayed stale as a
@@ -152,16 +183,26 @@ fn cdc_1_10_never_escalates_and_never_fails_open() {
     let (fs, _sla, _ttl) = cache_from_file(0);
 
     // a cold hiccup with no cached grant → Closed (never a fabricated open answer).
-    let cold = fs.serve("cold", &bounded_stale(), false, || Err(ServeError("hiccup".into())));
+    let cold = fs.serve("cold", &bounded_stale(), false, || {
+        Err(ServeError("hiccup".into()))
+    });
     assert_eq!(cold.served, AuthzServed::Closed);
-    assert!(cold.is_deny(), "a cold hiccup denies — never fabricates an open answer");
+    assert!(
+        cold.is_deny(),
+        "a cold hiccup denies — never fabricates an open answer"
+    );
 
     // a Deny provider answer is cached + replayed stale as a Deny (never escalated to Allow).
     let _ = fs.serve("k", &bounded_stale(), false, || Ok(Decision::Deny));
     fs.clock().advance(31);
-    let stale = fs.serve("k", &bounded_stale(), false, || Err(ServeError("hiccup".into())));
+    let stale = fs.serve("k", &bounded_stale(), false, || {
+        Err(ServeError("hiccup".into()))
+    });
     assert_eq!(stale.served, AuthzServed::Static);
-    assert!(stale.is_deny(), "the stale fallback replays the Deny — never escalates to Allow");
+    assert!(
+        stale.is_deny(),
+        "the stale fallback replays the Deny — never escalates to Allow"
+    );
 }
 
 /// **CDC 1.10 — the value W is `[OPEN — LEGAL]` but the mechanism ships.** Reading the ratified W

@@ -56,9 +56,7 @@ use std::collections::BTreeMap;
 use myelin_query::{FieldType, FieldValue, OrderKey};
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
-use tantivy::schema::{
-    Field, IndexRecordOption, Schema, FAST, INDEXED, STORED, STRING, TEXT,
-};
+use tantivy::schema::{Field, IndexRecordOption, Schema, FAST, INDEXED, STORED, STRING, TEXT};
 use tantivy::{Index, IndexWriter, TantivyDocument, Term};
 
 /// The canonical Search index document (§3.1) — the projection the two co-located shapes index.
@@ -579,7 +577,10 @@ impl TantivyBackend {
                 // `MUST_NOT` alone matches nothing in Tantivy, so pair it with an `AllQuery` MUST
                 // (admit everything, then exclude the deny-set) — `WHERE NOT IN (...)`.
                 Some(deny) => AclQuery::Clause(Box::new(BooleanQuery::new(vec![
-                    (Occur::Must, Box::new(tantivy::query::AllQuery) as Box<dyn Query>),
+                    (
+                        Occur::Must,
+                        Box::new(tantivy::query::AllQuery) as Box<dyn Query>,
+                    ),
                     (Occur::MustNot, deny),
                 ]))),
                 // An empty deny-set excludes nothing ⇒ everything of this type is visible.
@@ -622,7 +623,10 @@ impl TantivyBackend {
                 AclQuery::Empty => AclQuery::Clause(Box::new(tantivy::query::AllQuery)),
                 // ¬clause = admit everything, then exclude the inner clause (`WHERE NOT (...)`).
                 AclQuery::Clause(q) => AclQuery::Clause(Box::new(BooleanQuery::new(vec![
-                    (Occur::Must, Box::new(tantivy::query::AllQuery) as Box<dyn Query>),
+                    (
+                        Occur::Must,
+                        Box::new(tantivy::query::AllQuery) as Box<dyn Query>,
+                    ),
                     (Occur::MustNot, q),
                 ]))),
             },
@@ -725,7 +729,11 @@ impl TantivyBackend {
         // scored Tantivy query (a doc-id point lookup is not a permission-scoped search).
         self.doc_meta.insert(
             doc.doc_id.clone(),
-            DocMeta { doc: doc.clone(), indexed_zookie: indexed_zookie.to_string(), version },
+            DocMeta {
+                doc: doc.clone(),
+                indexed_zookie: indexed_zookie.to_string(),
+                version,
+            },
         );
         Ok(())
     }
@@ -810,7 +818,10 @@ impl SubjectMatcher {
         SubjectMatcher {
             subject_id: subject_id.into(),
             pseudonym,
-            locator_facets: DEFAULT_SUBJECT_LOCATOR_FACETS.iter().map(|s| s.to_string()).collect(),
+            locator_facets: DEFAULT_SUBJECT_LOCATOR_FACETS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         }
     }
 
@@ -912,8 +923,10 @@ impl IndexBackend for TantivyBackend {
         // at the posting-list level, §4.2). The engine never scores a doc the ACL clause excludes.
         let acl_filtered_plan =
             BooleanQuery::new(vec![(Occur::Must, acl_clause), (Occur::Must, ft)]);
-        let top =
-            searcher.search(&acl_filtered_plan, &TopDocs::with_limit(limit.max(1)).order_by_score())?;
+        let top = searcher.search(
+            &acl_filtered_plan,
+            &TopDocs::with_limit(limit.max(1)).order_by_score(),
+        )?;
 
         let mut hits = Vec::with_capacity(top.len());
         for (score, addr) in top {
@@ -938,7 +951,9 @@ impl IndexBackend for TantivyBackend {
         };
 
         let (tf, declared) = self.schema.facets.get(field).copied().ok_or_else(|| {
-            IndexError::Engine(format!("structured facet `{field}` was not declared at open()"))
+            IndexError::Engine(format!(
+                "structured facet `{field}` was not declared at open()"
+            ))
         })?;
         if value.field_type() != declared {
             return Err(IndexError::Engine(format!(
@@ -1007,7 +1022,9 @@ impl IndexBackend for TantivyBackend {
             // visible-id set) and the `And`/`Or`/`Not` boolean composition. The hidden nearest
             // neighbour (under ANY branch of the boolean tree) never enters the candidate set (no
             // count/rank leak through the vector/RAG path — the SRCH-D1 vector half).
-            _ => self.vectors.knn_filtered(query, k, |doc_id| acl_filter.admits(doc_id)),
+            _ => self
+                .vectors
+                .knn_filtered(query, k, |doc_id| acl_filter.admits(doc_id)),
         };
         Ok(hits)
     }
@@ -1074,10 +1091,22 @@ mod tests {
     fn full_text_shape_round_trips() {
         let mut be = TantivyBackend::open(&facet_decl()).expect("open");
         let k = OrderKey::bisect(None, None);
-        be.upsert(&doc("acme/issue/ENG-1", "deadlock in the scheduler", "open", 3, &k))
-            .expect("upsert");
-        be.upsert(&doc("acme/issue/ENG-2", "typo in the readme", "open", 1, &k))
-            .expect("upsert");
+        be.upsert(&doc(
+            "acme/issue/ENG-1",
+            "deadlock in the scheduler",
+            "open",
+            3,
+            &k,
+        ))
+        .expect("upsert");
+        be.upsert(&doc(
+            "acme/issue/ENG-2",
+            "typo in the readme",
+            "open",
+            1,
+            &k,
+        ))
+        .expect("upsert");
 
         let acl_filter = AclFilter::ids(["acme/issue/ENG-1", "acme/issue/ENG-2"]);
         let hits = be.search(&acl_filter, "deadlock", 10).expect("search");
@@ -1085,7 +1114,9 @@ mod tests {
         assert_eq!(hits[0].doc_id, "acme/issue/ENG-1");
 
         be.delete("acme/issue/ENG-1").expect("delete");
-        let hits = be.search(&acl_filter, "deadlock", 10).expect("search after delete");
+        let hits = be
+            .search(&acl_filter, "deadlock", 10)
+            .expect("search after delete");
         assert!(hits.is_empty(), "the deleted doc no longer surfaces");
     }
 
@@ -1095,13 +1126,21 @@ mod tests {
     fn structured_shape_round_trips() {
         let mut be = TantivyBackend::open(&facet_decl()).expect("open");
         let k = OrderKey::bisect(None, None);
-        be.upsert(&doc("d1", "alpha", "open", 5, &k)).expect("upsert");
-        be.upsert(&doc("d2", "beta", "closed", 5, &k)).expect("upsert");
-        be.upsert(&doc("d3", "gamma", "open", 2, &k)).expect("upsert");
+        be.upsert(&doc("d1", "alpha", "open", 5, &k))
+            .expect("upsert");
+        be.upsert(&doc("d2", "beta", "closed", 5, &k))
+            .expect("upsert");
+        be.upsert(&doc("d3", "gamma", "open", 2, &k))
+            .expect("upsert");
 
         let acl_filter = AclFilter::ids(["d1", "d2", "d3"]);
         let open = be
-            .search_structured(&acl_filter, "status", &FieldValue::Select("open".into()), 10)
+            .search_structured(
+                &acl_filter,
+                "status",
+                &FieldValue::Select("open".into()),
+                10,
+            )
             .expect("structured search");
         let ids: std::collections::BTreeSet<String> = open.into_iter().map(|h| h.doc_id).collect();
         assert_eq!(
@@ -1123,11 +1162,16 @@ mod tests {
     fn acl_filter_pre_filters_before_scoring() {
         let mut be = TantivyBackend::open(&facet_decl()).expect("open");
         let k = OrderKey::bisect(None, None);
-        be.upsert(&doc("secret", "deadlock secret", "open", 9, &k)).expect("upsert");
-        be.upsert(&doc("visible", "deadlock visible", "open", 9, &k)).expect("upsert");
+        be.upsert(&doc("secret", "deadlock secret", "open", 9, &k))
+            .expect("upsert");
+        be.upsert(&doc("visible", "deadlock visible", "open", 9, &k))
+            .expect("upsert");
 
         // None ⇒ empty, even though both docs match the text.
-        assert!(be.search(&AclFilter::None, "deadlock", 10).expect("none").is_empty());
+        assert!(be
+            .search(&AclFilter::None, "deadlock", 10)
+            .expect("none")
+            .is_empty());
 
         // An allow-set excluding `secret` returns only `visible` (the hidden doc never enters the
         // candidate set — no count/rank leak).
@@ -1142,9 +1186,13 @@ mod tests {
     fn acl_all_admits_every_matching_doc() {
         let mut be = TantivyBackend::open(&facet_decl()).expect("open");
         let k = OrderKey::bisect(None, None);
-        be.upsert(&doc("a", "deadlock one", "open", 1, &k)).expect("upsert");
-        be.upsert(&doc("b", "deadlock two", "open", 1, &k)).expect("upsert");
-        let hits = be.search(&AclFilter::All, "deadlock", 10).expect("admin search");
+        be.upsert(&doc("a", "deadlock one", "open", 1, &k))
+            .expect("upsert");
+        be.upsert(&doc("b", "deadlock two", "open", 1, &k))
+            .expect("upsert");
+        let hits = be
+            .search(&AclFilter::All, "deadlock", 10)
+            .expect("admin search");
         assert_eq!(hits.len(), 2, "admin sees both matching docs");
     }
 
@@ -1153,13 +1201,26 @@ mod tests {
     fn upsert_is_idempotent_on_doc_id() {
         let mut be = TantivyBackend::open(&facet_decl()).expect("open");
         let k = OrderKey::bisect(None, None);
-        be.upsert(&doc("d", "first text", "open", 1, &k)).expect("upsert");
-        be.upsert(&doc("d", "second text", "open", 1, &k)).expect("re-upsert");
+        be.upsert(&doc("d", "first text", "open", 1, &k))
+            .expect("upsert");
+        be.upsert(&doc("d", "second text", "open", 1, &k))
+            .expect("re-upsert");
         let acl_filter = AclFilter::ids(["d"]);
         // The old text is gone (the delete-then-add replaced).
-        assert!(be.search(&acl_filter, "first", 10).expect("s1").is_empty(), "old text replaced");
-        assert_eq!(be.search(&acl_filter, "second", 10).expect("s2").len(), 1, "new text indexed");
-        assert_eq!(be.snapshot().expect("snapshot"), 1, "exactly one live doc (no dupe)");
+        assert!(
+            be.search(&acl_filter, "first", 10).expect("s1").is_empty(),
+            "old text replaced"
+        );
+        assert_eq!(
+            be.search(&acl_filter, "second", 10).expect("s2").len(),
+            1,
+            "new text indexed"
+        );
+        assert_eq!(
+            be.snapshot().expect("snapshot"),
+            1,
+            "exactly one live doc (no dupe)"
+        );
     }
 
     /// **The structured shape is typed BYTE-IDENTICALLY over the frozen `FieldType` enum (the drift
@@ -1179,8 +1240,18 @@ mod tests {
         // Every declared facet is present and carries its frozen FieldType (byte-identical pairing).
         for (i, ty) in FieldType::all().into_iter().enumerate() {
             let name = format!("f{i}_{}", ty.wire_id());
-            let (_, declared) = be.schema.facets.get(&name).copied().expect("facet declared");
-            assert_eq!(declared, ty, "facet `{name}` is typed over FieldType::{}", ty.wire_id());
+            let (_, declared) = be
+                .schema
+                .facets
+                .get(&name)
+                .copied()
+                .expect("facet declared");
+            assert_eq!(
+                declared,
+                ty,
+                "facet `{name}` is typed over FieldType::{}",
+                ty.wire_id()
+            );
         }
 
         // **The byte-identical drift anchor.** Pin the frozen wire-id set the Search structured shape
@@ -1201,8 +1272,13 @@ mod tests {
         let mut be2 = TantivyBackend::open(&decl2).expect("open");
         let bad = IndexDocument::new("d", "x")
             .with_field("severity", FieldValue::Text("not-an-int".into()));
-        let err = be2.upsert(&bad).expect_err("a type mismatch must be rejected");
-        assert!(matches!(err, IndexError::Engine(_)), "loud rejection, not a silent coerce");
+        let err = be2
+            .upsert(&bad)
+            .expect_err("a type mismatch must be rejected");
+        assert!(
+            matches!(err, IndexError::Engine(_)),
+            "loud rejection, not a silent coerce"
+        );
     }
 
     /// **`order_key` is a columnar fast-field for sort (§3.1): the structured shape returns docs in
@@ -1218,8 +1294,10 @@ mod tests {
 
         // Insert out of order; the columnar fast-field must restore byte order.
         be.upsert(&doc("mid", "x", "open", 1, &k2)).expect("upsert");
-        be.upsert(&doc("first", "x", "open", 1, &k1)).expect("upsert");
-        be.upsert(&doc("last", "x", "open", 1, &k3)).expect("upsert");
+        be.upsert(&doc("first", "x", "open", 1, &k1))
+            .expect("upsert");
+        be.upsert(&doc("last", "x", "open", 1, &k3))
+            .expect("upsert");
 
         // Read back each doc's stored order_key via a structured equality search, and assert the
         // engine stored the right key per doc (the fast-field round-trips). The deterministic global
@@ -1228,10 +1306,19 @@ mod tests {
         let acl_filter = AclFilter::ids(["first", "mid", "last"]);
         for (id, key) in [("first", &k1), ("mid", &k2), ("last", &k3)] {
             let hits = be
-                .search_structured(&acl_filter, ORDER_KEY_FIELD, &FieldValue::OrderKey(key.clone()), 10)
+                .search_structured(
+                    &acl_filter,
+                    ORDER_KEY_FIELD,
+                    &FieldValue::OrderKey(key.clone()),
+                    10,
+                )
                 .expect("order_key facet search");
             let ids: Vec<String> = hits.into_iter().map(|h| h.doc_id).collect();
-            assert_eq!(ids, vec![id.to_string()], "the order_key fast-field keys `{id}` uniquely");
+            assert_eq!(
+                ids,
+                vec![id.to_string()],
+                "the order_key fast-field keys `{id}` uniquely"
+            );
         }
     }
 
@@ -1245,16 +1332,28 @@ mod tests {
         let k = OrderKey::bisect(None, None);
         for i in 0..5 {
             // one commit per upsert ⇒ five segments accumulate.
-            be.upsert(&doc(&format!("d{i}"), "body", "open", i, &k)).expect("upsert");
+            be.upsert(&doc(&format!("d{i}"), "body", "open", i, &k))
+                .expect("upsert");
         }
         assert_eq!(be.snapshot().expect("snapshot"), 5, "five live docs");
-        assert!(be.segment_count().expect("segments") > 1, "multiple segments accumulated");
+        assert!(
+            be.segment_count().expect("segments") > 1,
+            "multiple segments accumulated"
+        );
 
         be.delete("d2").expect("delete");
-        assert_eq!(be.snapshot().expect("snapshot"), 4, "one fewer after delete");
+        assert_eq!(
+            be.snapshot().expect("snapshot"),
+            4,
+            "one fewer after delete"
+        );
 
         be.merge().expect("merge compacts the segments");
-        assert_eq!(be.snapshot().expect("snapshot after merge"), 4, "merge preserves the live set");
+        assert_eq!(
+            be.snapshot().expect("snapshot after merge"),
+            4,
+            "merge preserves the live set"
+        );
         assert_eq!(
             be.segment_count().expect("segments after merge"),
             1,
@@ -1269,11 +1368,20 @@ mod tests {
     fn merge_is_a_noop_with_one_segment() {
         let mut be = TantivyBackend::open(&facet_decl()).expect("open");
         let k = OrderKey::bisect(None, None);
-        be.upsert(&doc("only", "body", "open", 1, &k)).expect("upsert");
+        be.upsert(&doc("only", "body", "open", 1, &k))
+            .expect("upsert");
         assert_eq!(be.segment_count().expect("segments"), 1, "one segment");
         be.merge().expect("merge");
-        assert_eq!(be.segment_count().expect("segments"), 1, "still one segment (no-op)");
-        assert_eq!(be.snapshot().expect("snapshot"), 1, "the live doc is intact");
+        assert_eq!(
+            be.segment_count().expect("segments"),
+            1,
+            "still one segment (no-op)"
+        );
+        assert_eq!(
+            be.snapshot().expect("snapshot"),
+            1,
+            "the live doc is intact"
+        );
     }
 
     /// **`IndexDocument::order_key` reads the LexoRank fast-field when present and is `None`
@@ -1283,16 +1391,24 @@ mod tests {
         let k = OrderKey::parse("V5").unwrap();
         let with = IndexDocument::new("d", "x")
             .with_field(ORDER_KEY_FIELD, FieldValue::OrderKey(k.clone()));
-        assert_eq!(with.order_key(), Some(&k), "the order_key fast-field is exposed");
+        assert_eq!(
+            with.order_key(),
+            Some(&k),
+            "the order_key fast-field is exposed"
+        );
 
-        let without = IndexDocument::new("d", "x")
-            .with_field("status", FieldValue::Select("open".into()));
+        let without =
+            IndexDocument::new("d", "x").with_field("status", FieldValue::Select("open".into()));
         assert_eq!(without.order_key(), None, "no order_key ⇒ None");
 
         // A facet under the order_key NAME but the WRONG type is not read as an order_key.
         let wrong = IndexDocument::new("d", "x")
             .with_field(ORDER_KEY_FIELD, FieldValue::Text("not-a-key".into()));
-        assert_eq!(wrong.order_key(), None, "a wrongly-typed order_key facet is None");
+        assert_eq!(
+            wrong.order_key(),
+            None,
+            "a wrongly-typed order_key facet is None"
+        );
     }
 
     /// **The vector HNSW shape round-trips behind the trait: upsert an EMBEDDED doc → semantic k-NN
@@ -1306,28 +1422,50 @@ mod tests {
         let embed = |id: &str, v: Vec<f32>| {
             doc(id, "body", "open", 1, &k).with_embedding(Embedding::new(v), "text-embed@1")
         };
-        be.upsert(&embed("acme/doc/A", vec![1.0, 0.0, 0.0])).expect("upsert A");
-        be.upsert(&embed("acme/doc/B", vec![0.0, 1.0, 0.0])).expect("upsert B");
-        be.upsert(&embed("acme/doc/C", vec![0.9, 0.1, 0.0])).expect("upsert C");
+        be.upsert(&embed("acme/doc/A", vec![1.0, 0.0, 0.0]))
+            .expect("upsert A");
+        be.upsert(&embed("acme/doc/B", vec![0.0, 1.0, 0.0]))
+            .expect("upsert B");
+        be.upsert(&embed("acme/doc/C", vec![0.9, 0.1, 0.0]))
+            .expect("upsert C");
 
         // Semantic k-NN near A returns A (and C), ACL-filtered to the allow-set.
         let acl_filter = AclFilter::ids(["acme/doc/A", "acme/doc/B", "acme/doc/C"]);
-        let hits = be.semantic(&acl_filter, &Embedding::new(vec![1.0, 0.05, 0.0]), 2).expect("semantic");
+        let hits = be
+            .semantic(&acl_filter, &Embedding::new(vec![1.0, 0.05, 0.0]), 2)
+            .expect("semantic");
         assert_eq!(hits.len(), 2);
-        let ids: std::collections::BTreeSet<&str> = hits.iter().map(|h| h.doc_id.as_str()).collect();
-        assert!(ids.contains("acme/doc/A") && ids.contains("acme/doc/C"), "A and C nearest: {ids:?}");
+        let ids: std::collections::BTreeSet<&str> =
+            hits.iter().map(|h| h.doc_id.as_str()).collect();
+        assert!(
+            ids.contains("acme/doc/A") && ids.contains("acme/doc/C"),
+            "A and C nearest: {ids:?}"
+        );
         // Every hit carries its model_ref (§3.3).
-        assert!(hits.iter().all(|h| h.model_ref == crate::vector::ModelRef("text-embed@1".into())));
+        assert!(hits
+            .iter()
+            .all(|h| h.model_ref == crate::vector::ModelRef("text-embed@1".into())));
 
         // Delete B (soft-delete the vector); it is gone from results immediately, bytes present.
         be.delete("acme/doc/B").expect("delete B");
-        assert!(be.vectors().has_orphan_embedding(), "B's vector tombstoned but physically present");
-        let bhit = be.semantic(&acl_filter, &Embedding::new(vec![0.0, 1.0, 0.0]), 3).expect("semantic");
-        assert!(!bhit.iter().any(|h| h.doc_id == "acme/doc/B"), "the deleted vector never surfaces");
+        assert!(
+            be.vectors().has_orphan_embedding(),
+            "B's vector tombstoned but physically present"
+        );
+        let bhit = be
+            .semantic(&acl_filter, &Embedding::new(vec![0.0, 1.0, 0.0]), 3)
+            .expect("semantic");
+        assert!(
+            !bhit.iter().any(|h| h.doc_id == "acme/doc/B"),
+            "the deleted vector never surfaces"
+        );
 
         // Merge compacts the vector shape: 0 orphan embedding.
         be.merge().expect("merge compacts vectors");
-        assert!(!be.vectors().has_orphan_embedding(), "0 orphan embedding after merge (the GATE)");
+        assert!(
+            !be.vectors().has_orphan_embedding(),
+            "0 orphan embedding after merge (the GATE)"
+        );
         assert_eq!(be.vectors().live_len(), 2, "A and C survive");
     }
 
@@ -1346,14 +1484,23 @@ mod tests {
         be.upsert(&embed("visible", vec![0.8, 0.2])).expect("u");
 
         // None ⇒ empty even though `secret` is the nearest.
-        assert!(be.semantic(&AclFilter::None, &Embedding::new(vec![1.0, 0.0]), 5).unwrap().is_empty());
+        assert!(be
+            .semantic(&AclFilter::None, &Embedding::new(vec![1.0, 0.0]), 5)
+            .unwrap()
+            .is_empty());
 
         // The allow-set excludes `secret`: only `visible` surfaces (the nearest hidden vector never
         // enters the candidate set).
         let acl_filter = AclFilter::ids(["visible"]);
-        let hits = be.semantic(&acl_filter, &Embedding::new(vec![1.0, 0.0]), 5).expect("semantic");
+        let hits = be
+            .semantic(&acl_filter, &Embedding::new(vec![1.0, 0.0]), 5)
+            .expect("semantic");
         let ids: Vec<&str> = hits.iter().map(|h| h.doc_id.as_str()).collect();
-        assert_eq!(ids, vec!["visible"], "only the visible vector; the secret never surfaces");
+        assert_eq!(
+            ids,
+            vec!["visible"],
+            "only the visible vector; the secret never surfaces"
+        );
     }
 
     /// **THE ONE-DOC-ID-SPACE FUSION PROPERTY (the SRCH-P05 GATE): a hybrid query fuses results that
@@ -1369,8 +1516,14 @@ mod tests {
         // ONE upsert per doc carries all three shapes (FT text + structured facets + the vector) —
         // there is no separate vector store; the doc_id is the single key.
         be.upsert(
-            &doc("acme/page/42", "distributed consensus and raft", "open", 5, &k)
-                .with_embedding(Embedding::new(vec![1.0, 0.0, 0.0]), "m@1"),
+            &doc(
+                "acme/page/42",
+                "distributed consensus and raft",
+                "open",
+                5,
+                &k,
+            )
+            .with_embedding(Embedding::new(vec![1.0, 0.0, 0.0]), "m@1"),
         )
         .expect("upsert the tri-shape doc");
         be.upsert(
@@ -1383,22 +1536,44 @@ mod tests {
 
         // The FT shape surfaces page/42 by keyword.
         let ft = be.search(&acl_filter, "raft", 10).expect("ft");
-        assert_eq!(ft.iter().map(|h| h.doc_id.as_str()).collect::<Vec<_>>(), vec!["acme/page/42"]);
+        assert_eq!(
+            ft.iter().map(|h| h.doc_id.as_str()).collect::<Vec<_>>(),
+            vec!["acme/page/42"]
+        );
 
         // The structured shape surfaces page/42 by facet.
         let st = be
-            .search_structured(&acl_filter, "status", &FieldValue::Select("open".into()), 10)
+            .search_structured(
+                &acl_filter,
+                "status",
+                &FieldValue::Select("open".into()),
+                10,
+            )
             .expect("structured");
-        assert_eq!(st.iter().map(|h| h.doc_id.as_str()).collect::<Vec<_>>(), vec!["acme/page/42"]);
+        assert_eq!(
+            st.iter().map(|h| h.doc_id.as_str()).collect::<Vec<_>>(),
+            vec!["acme/page/42"]
+        );
 
         // The vector shape surfaces THE SAME page/42 by semantic neighbourhood.
-        let ve = be.semantic(&acl_filter, &Embedding::new(vec![0.95, 0.05, 0.0]), 1).expect("semantic");
-        assert_eq!(ve.iter().map(|h| h.doc_id.as_str()).collect::<Vec<_>>(), vec!["acme/page/42"]);
+        let ve = be
+            .semantic(&acl_filter, &Embedding::new(vec![0.95, 0.05, 0.0]), 1)
+            .expect("semantic");
+        assert_eq!(
+            ve.iter().map(|h| h.doc_id.as_str()).collect::<Vec<_>>(),
+            vec!["acme/page/42"]
+        );
 
         // THE FUSION PROPERTY: the doc_id from the keyword hit == the doc_id from the vector hit ==
         // the doc_id from the structured hit. One key, three shapes, no separate store.
-        assert_eq!(ft[0].doc_id, ve[0].doc_id, "keyword and vector hits share one doc_id");
-        assert_eq!(ft[0].doc_id, st[0].doc_id, "and the structured hit too — one doc-id space (§3.2)");
+        assert_eq!(
+            ft[0].doc_id, ve[0].doc_id,
+            "keyword and vector hits share one doc_id"
+        );
+        assert_eq!(
+            ft[0].doc_id, st[0].doc_id,
+            "and the structured hit too — one doc-id space (§3.2)"
+        );
     }
 
     /// **A re-index that DROPS the embedding removes the old vector (no orphan in the one doc-id
@@ -1409,15 +1584,25 @@ mod tests {
         use crate::vector::Embedding;
         let mut be = TantivyBackend::open(&facet_decl()).expect("open");
         let k = OrderKey::bisect(None, None);
-        be.upsert(&doc("d", "body", "open", 1, &k).with_embedding(Embedding::new(vec![1.0, 0.0]), "m@1"))
-            .expect("upsert with vector");
+        be.upsert(
+            &doc("d", "body", "open", 1, &k).with_embedding(Embedding::new(vec![1.0, 0.0]), "m@1"),
+        )
+        .expect("upsert with vector");
         let acl_filter = AclFilter::ids(["d"]);
-        assert_eq!(be.semantic(&acl_filter, &Embedding::new(vec![1.0, 0.0]), 1).unwrap().len(), 1);
+        assert_eq!(
+            be.semantic(&acl_filter, &Embedding::new(vec![1.0, 0.0]), 1)
+                .unwrap()
+                .len(),
+            1
+        );
 
         // Re-index the same doc_id without an embedding ⇒ the vector is removed (one doc-id space).
-        be.upsert(&doc("d", "body", "open", 1, &k)).expect("re-upsert without vector");
+        be.upsert(&doc("d", "body", "open", 1, &k))
+            .expect("re-upsert without vector");
         assert!(
-            be.semantic(&acl_filter, &Embedding::new(vec![1.0, 0.0]), 1).unwrap().is_empty(),
+            be.semantic(&acl_filter, &Embedding::new(vec![1.0, 0.0]), 1)
+                .unwrap()
+                .is_empty(),
             "the dropped embedding leaves no orphan vector"
         );
     }
@@ -1432,7 +1617,10 @@ mod tests {
         d.embedding = Some(Embedding::new(vec![1.0, 0.0]));
         d.model_ref = None; // an embedding with no model_ref
         let err = be.upsert(&d).expect_err("must reject");
-        assert!(matches!(err, IndexError::Engine(_)), "loud rejection: a vector needs a model_ref");
+        assert!(
+            matches!(err, IndexError::Engine(_)),
+            "loud rejection: a vector needs a model_ref"
+        );
     }
 
     /// **SRCH-P09: the boolean-composition `AclFilter` (`And`/`Or`/`Not`) filters at the posting-list
@@ -1444,7 +1632,8 @@ mod tests {
         let mut be = TantivyBackend::open(&facet_decl()).expect("open");
         let k = OrderKey::bisect(None, None);
         for id in ["a", "b", "c"] {
-            be.upsert(&doc(id, "shared deadlock note", "open", 1, &k)).expect("upsert");
+            be.upsert(&doc(id, "shared deadlock note", "open", 1, &k))
+                .expect("upsert");
         }
 
         // Each composed filter is bound to `acl_filter` (the conjoin binder the
@@ -1453,14 +1642,22 @@ mod tests {
 
         // Or(Ids[a], Ids[b]) ⇒ {a, b}.
         let acl_filter = AclFilter::Or(vec![AclFilter::ids(["a"]), AclFilter::ids(["b"])]);
-        let got: std::collections::BTreeSet<String> =
-            be.search(&acl_filter, "deadlock", 10).unwrap().into_iter().map(|h| h.doc_id).collect();
+        let got: std::collections::BTreeSet<String> = be
+            .search(&acl_filter, "deadlock", 10)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.doc_id)
+            .collect();
         assert_eq!(got, ["a", "b"].iter().map(|s| s.to_string()).collect());
 
         // And(All, NotIds[c]) ⇒ everything EXCEPT c ⇒ {a, b}.
         let acl_filter = AclFilter::And(vec![AclFilter::All, AclFilter::not_ids(["c"])]);
-        let got: std::collections::BTreeSet<String> =
-            be.search(&acl_filter, "deadlock", 10).unwrap().into_iter().map(|h| h.doc_id).collect();
+        let got: std::collections::BTreeSet<String> = be
+            .search(&acl_filter, "deadlock", 10)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.doc_id)
+            .collect();
         assert_eq!(got, ["a", "b"].iter().map(|s| s.to_string()).collect());
 
         // And(Ids[a,b], Not(Ids[b])) ⇒ {a, b} minus b ⇒ {a} (the Difference lowering shape).
@@ -1468,26 +1665,52 @@ mod tests {
             AclFilter::ids(["a", "b"]),
             AclFilter::Not(Box::new(AclFilter::ids(["b"]))),
         ]);
-        let got: Vec<String> =
-            be.search(&acl_filter, "deadlock", 10).unwrap().into_iter().map(|h| h.doc_id).collect();
-        assert_eq!(got, vec!["a".to_string()], "left AND NOT right = the difference, no leak of b");
+        let got: Vec<String> = be
+            .search(&acl_filter, "deadlock", 10)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.doc_id)
+            .collect();
+        assert_eq!(
+            got,
+            vec!["a".to_string()],
+            "left AND NOT right = the difference, no leak of b"
+        );
 
         // An empty And ⇒ All (identity of intersection); an empty Or ⇒ None (identity of union).
         let acl_filter = AclFilter::And(vec![]);
         let all_via_empty_and = be.search(&acl_filter, "deadlock", 10).unwrap();
-        assert_eq!(all_via_empty_and.len(), 3, "empty And ⇒ All (every matching doc)");
+        assert_eq!(
+            all_via_empty_and.len(),
+            3,
+            "empty And ⇒ All (every matching doc)"
+        );
         let acl_filter = AclFilter::Or(vec![]);
         let none_via_empty_or = be.search(&acl_filter, "deadlock", 10).unwrap();
-        assert!(none_via_empty_or.is_empty(), "empty Or ⇒ None (nothing visible)");
+        assert!(
+            none_via_empty_or.is_empty(),
+            "empty Or ⇒ None (nothing visible)"
+        );
 
         // An Or with a None sub-clause drops it (∅ ∪ {a} = {a}); an And with a None sub-clause is
         // empty (∅ ∩ X = ∅).
         let acl_filter = AclFilter::Or(vec![AclFilter::None, AclFilter::ids(["a"])]);
-        let got: Vec<String> =
-            be.search(&acl_filter, "deadlock", 10).unwrap().into_iter().map(|h| h.doc_id).collect();
-        assert_eq!(got, vec!["a".to_string()], "a None sub-clause drops out of the union");
+        let got: Vec<String> = be
+            .search(&acl_filter, "deadlock", 10)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.doc_id)
+            .collect();
+        assert_eq!(
+            got,
+            vec!["a".to_string()],
+            "a None sub-clause drops out of the union"
+        );
         let acl_filter = AclFilter::And(vec![AclFilter::None, AclFilter::All]);
-        assert!(be.search(&acl_filter, "deadlock", 10).unwrap().is_empty(), "None absorbs the And");
+        assert!(
+            be.search(&acl_filter, "deadlock", 10).unwrap().is_empty(),
+            "None absorbs the And"
+        );
     }
 
     /// **SRCH-P09: `AclFilter::admits` (the vector filter-during-traversal predicate) matches the
@@ -1503,7 +1726,10 @@ mod tests {
         assert!(AclFilter::And(vec![AclFilter::All, AclFilter::ids(["x"])]).admits("x"));
         assert!(!AclFilter::And(vec![AclFilter::None, AclFilter::All]).admits("x"));
         assert!(AclFilter::Or(vec![AclFilter::None, AclFilter::ids(["x"])]).admits("x"));
-        assert!(!AclFilter::Or(vec![]).admits("x"), "empty Or admits nothing");
+        assert!(
+            !AclFilter::Or(vec![]).admits("x"),
+            "empty Or admits nothing"
+        );
         // A NON-EMPTY Or whose every sub-clause REJECTS the doc admits nothing (kills the `&&`→`||`
         // mutant: `!is_empty() || any` would wrongly admit here, `!is_empty() && any` correctly does
         // not).
@@ -1521,7 +1747,10 @@ mod tests {
     fn index_error_displays_loudly() {
         let e = IndexError::Engine("boom".into());
         let s = format!("{e}");
-        assert!(s.contains("boom"), "the Display surfaces the underlying engine error");
+        assert!(
+            s.contains("boom"),
+            "the Display surfaces the underlying engine error"
+        );
         assert!(s.contains("index engine error"), "and names it loudly");
         assert!(!s.is_empty(), "never an empty (silent) error message");
     }

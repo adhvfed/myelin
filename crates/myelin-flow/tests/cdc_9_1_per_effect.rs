@@ -21,12 +21,12 @@
 //! it exactly once per approved effect, never for a declined one.
 
 use myelin_agent::{EffectApi, EffectResult, EventId, ProposedEffect, RunCtx};
+use myelin_events::{IdMinter, MonotonicMinter};
 use myelin_flow::{
     apply_approved_effects, per_effect_idem_key, ApprovalCard, ApprovalDecision, DurableExecutor,
     EffectOutcome, FlowExecutor, GatedEffect, RunBudget, RunId, SignalSpec, StartSpec,
     APPROVAL_SIGNAL_NAME, DECLINE_MARKER,
 };
-use myelin_events::{IdMinter, MonotonicMinter};
 use myelin_refs::ArtifactRef;
 use myelin_tenancy::{Region, TenantId};
 use std::cell::RefCell;
@@ -78,7 +78,9 @@ fn approve(ex: &FlowExecutor, run: &RunId, card_id: &str, idx: usize, total: usi
         run: run.clone(),
         signal_name: APPROVAL_SIGNAL_NAME.into(),
         idem_key: per_effect_idem_key(card_id, idx, total),
-        payload: vec![ArtifactRef(format!("myelin://acme/agent/effect/{card_id}-{idx}"))],
+        payload: vec![ArtifactRef(format!(
+            "myelin://acme/agent/effect/{card_id}-{idx}"
+        ))],
         payload_key_ref: None,
     })
     .expect("approve");
@@ -125,12 +127,21 @@ fn partial_approval_maps_each_approved_effect_to_exactly_one_apply() {
     assert_eq!(ex.signals().count_for_run(&tenant(), &run.0), 3);
 
     // CONSUMER: the real Agent Fabric EffectApi the engine's gated loop delegates to.
-    let consumer = RecordingEffectApi { applied: RefCell::new(vec![]) };
+    let consumer = RecordingEffectApi {
+        applied: RefCell::new(vec![]),
+    };
     let run_ctx = RunCtx::default();
     let outcomes = apply_approved_effects(
         ex.signals(),
         &tenant(),
-        &card(&run, [ApprovalDecision::Approve, ApprovalDecision::Decline, ApprovalDecision::Approve]),
+        &card(
+            &run,
+            [
+                ApprovalDecision::Approve,
+                ApprovalDecision::Decline,
+                ApprovalDecision::Approve,
+            ],
+        ),
         &|eff: &ArtifactRef| {
             // delegate to the REAL EffectApi::apply (the contract 8.x consumer) — exactly the
             // production wiring: each approved effect → one apply.
@@ -144,14 +155,24 @@ fn partial_approval_maps_each_approved_effect_to_exactly_one_apply() {
 
     // the two ends RECONCILE: 0 applied, 1 withheld (AG-8), 2 applied.
     assert!(matches!(outcomes[0], Some(Ok(EffectOutcome::Applied(_)))));
-    assert_eq!(outcomes[1], Some(Ok(EffectOutcome::Withheld(DECLINE_MARKER.to_string()))));
+    assert_eq!(
+        outcomes[1],
+        Some(Ok(EffectOutcome::Withheld(DECLINE_MARKER.to_string())))
+    );
     assert!(matches!(outcomes[2], Some(Ok(EffectOutcome::Applied(_)))));
 
     // CONSUMER reliance: the real EffectApi::apply was called EXACTLY twice — the declined effect
     // never reached it (AG-8: a declined effect makes 0 mutation).
     let applied = consumer.applied.into_inner();
-    assert_eq!(applied.len(), 2, "exactly two applies (effects 0 and 2); the declined effect 1 made 0 mutation");
-    assert!(!applied.contains(&"myelin://acme/agent/effect/e1".to_string()), "the DECLINED effect never reached EffectApi::apply (AG-8)");
+    assert_eq!(
+        applied.len(),
+        2,
+        "exactly two applies (effects 0 and 2); the declined effect 1 made 0 mutation"
+    );
+    assert!(
+        !applied.contains(&"myelin://acme/agent/effect/e1".to_string()),
+        "the DECLINED effect never reached EffectApi::apply (AG-8)"
+    );
 }
 
 /// **A double-click on "approve all" wakes the engine once per effect — the real `EffectApi::apply`
@@ -168,18 +189,35 @@ fn double_click_drives_the_real_effect_api_exactly_once_per_effect() {
     for idx in 0..3 {
         approve(&ex, &run, "card-7", idx, 3); // double-click → ON CONFLICT DO NOTHING.
     }
-    assert_eq!(ex.signals().count_for_run(&tenant(), &run.0), 3, "the double-click buffered nothing new");
+    assert_eq!(
+        ex.signals().count_for_run(&tenant(), &run.0),
+        3,
+        "the double-click buffered nothing new"
+    );
 
-    let consumer = RecordingEffectApi { applied: RefCell::new(vec![]) };
+    let consumer = RecordingEffectApi {
+        applied: RefCell::new(vec![]),
+    };
     let run_ctx = RunCtx::default();
     apply_approved_effects(
         ex.signals(),
         &tenant(),
-        &card(&run, [ApprovalDecision::Approve, ApprovalDecision::Approve, ApprovalDecision::Approve]),
+        &card(
+            &run,
+            [
+                ApprovalDecision::Approve,
+                ApprovalDecision::Approve,
+                ApprovalDecision::Approve,
+            ],
+        ),
         &|eff: &ArtifactRef| match consumer.apply(&run_ctx, ProposedEffect(eff.0.clone())) {
             EffectResult::Applied(EventId(id)) => Ok(id),
             other => Err(format!("{other:?}")),
         },
     );
-    assert_eq!(consumer.applied.into_inner().len(), 3, "the real EffectApi::apply ran exactly 3 times (the double-click did not double-apply)");
+    assert_eq!(
+        consumer.applied.into_inner().len(),
+        3,
+        "the real EffectApi::apply ran exactly 3 times (the double-click did not double-apply)"
+    );
 }

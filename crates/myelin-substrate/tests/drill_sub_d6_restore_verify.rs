@@ -30,9 +30,7 @@
 //!     cross-seam assertion),
 //!   - a cheap CI smoke variant (small scale) of the SCHED drill.
 
-use myelin_harness::restore::{
-    CrossSeamMismatch, RestoreOutcome, RestoredSnapshot, RtoGrain,
-};
+use myelin_harness::restore::{CrossSeamMismatch, RestoreOutcome, RestoredSnapshot, RtoGrain};
 use myelin_harness::{Label, Predicate, SignalName, SignalSource};
 use myelin_storage::{BlobStore, FsBlobStore};
 use myelin_substrate::thresholds::Thresholds;
@@ -175,10 +173,12 @@ fn assertion_rejects_a_deliberately_injected_row_to_missing_blob_mismatch() {
         "a row → missing-blob rebuild MUST be rejected, not pass silently"
     );
     assert!(
-        report.mismatches.contains(&CrossSeamMismatch::RowMissingBlob {
-            row_id: "orphan".into(),
-            blob_addr: missing.into(),
-        }),
+        report
+            .mismatches
+            .contains(&CrossSeamMismatch::RowMissingBlob {
+                row_id: "orphan".into(),
+                blob_addr: missing.into(),
+            }),
         "the assertion must name the exact row→missing-blob mismatch, got {:?}",
         report.mismatches
     );

@@ -266,7 +266,10 @@ mod tests {
     #[test]
     fn spec_is_issues_owned_6_3_shape() {
         let s = issue_facets_projection_spec();
-        assert_eq!(s.subsystem, "issue", "Issues owns the `issue` subsystem projection");
+        assert_eq!(
+            s.subsystem, "issue",
+            "Issues owns the `issue` subsystem projection"
+        );
         assert_eq!(s.type_, "issue", "the indexed artifact type is an issue");
         assert_eq!(
             s.acl_object_type, "issue",
@@ -277,14 +280,27 @@ mod tests {
             object_types::ISSUE,
             "the acl_object_type is exactly Issues' frozen ReBAC `issue` object type"
         );
-        assert!(!s.semantic, "Issues is trigram-title + facet filter in v1, not vector-embedded");
+        assert!(
+            !s.semantic,
+            "Issues is trigram-title + facet filter in v1, not vector-embedded"
+        );
         // The seven structured board/list/search facets, each at its frozen FieldType.
-        assert_eq!(s.struct_fields.len(), 7, "exactly the seven structured issue facets");
-        assert_eq!(s.struct_fields.get("state_category"), Some(&FieldType::Select));
+        assert_eq!(
+            s.struct_fields.len(),
+            7,
+            "exactly the seven structured issue facets"
+        );
+        assert_eq!(
+            s.struct_fields.get("state_category"),
+            Some(&FieldType::Select)
+        );
         assert_eq!(s.struct_fields.get("priority"), Some(&FieldType::Int));
         assert_eq!(s.struct_fields.get("assignee"), Some(&FieldType::Principal));
         assert_eq!(s.struct_fields.get("type_rank"), Some(&FieldType::Int));
-        assert_eq!(s.struct_fields.get("project_id"), Some(&FieldType::Relation));
+        assert_eq!(
+            s.struct_fields.get("project_id"),
+            Some(&FieldType::Relation)
+        );
         assert_eq!(s.struct_fields.get("cycle_id"), Some(&FieldType::Relation));
         assert_eq!(s.struct_fields.get("rank"), Some(&FieldType::OrderKey));
     }
@@ -317,7 +333,13 @@ mod tests {
         keys.sort_unstable();
         assert_eq!(
             keys,
-            vec!["acl_object_type", "semantic", "struct_fields", "subsystem", "type"],
+            vec![
+                "acl_object_type",
+                "semantic",
+                "struct_fields",
+                "subsystem",
+                "type"
+            ],
             "the 6.3 wire key set"
         );
 
@@ -362,21 +384,43 @@ mod tests {
     #[test]
     fn notif_rules_are_the_three_issues_reasons_at_their_bands() {
         let rules = issue_notif_rules();
-        assert_eq!(rules.len(), 3, "exactly the three Issues reasons (SLA / unblocked / approval)");
+        assert_eq!(
+            rules.len(),
+            3,
+            "exactly the three Issues reasons (SLA / unblocked / approval)"
+        );
 
         let by_key: BTreeMap<&str, &NotifRule> = rules.iter().map(|(k, r)| (*k, r)).collect();
 
-        let sla = by_key.get(RULE_KEY_SLA_AT_RISK).expect("SLA rule registered");
+        let sla = by_key
+            .get(RULE_KEY_SLA_AT_RISK)
+            .expect("SLA rule registered");
         assert_eq!(sla.reason, Reason::Sla);
-        assert_eq!(sla.default_class, Class::Critical, "SLA at-risk pierces (critical)");
+        assert_eq!(
+            sla.default_class,
+            Class::Critical,
+            "SLA at-risk pierces (critical)"
+        );
 
-        let unb = by_key.get(RULE_KEY_UNBLOCKED).expect("unblocked rule registered");
+        let unb = by_key
+            .get(RULE_KEY_UNBLOCKED)
+            .expect("unblocked rule registered");
         assert_eq!(unb.reason, Reason::Unblocked);
-        assert_eq!(unb.default_class, Class::Watching, "unblocked re-surfaces calmly (watching)");
+        assert_eq!(
+            unb.default_class,
+            Class::Watching,
+            "unblocked re-surfaces calmly (watching)"
+        );
 
-        let appr = by_key.get(RULE_KEY_APPROVAL_REQUESTED).expect("approval rule registered");
+        let appr = by_key
+            .get(RULE_KEY_APPROVAL_REQUESTED)
+            .expect("approval rule registered");
         assert_eq!(appr.reason, Reason::ApprovalRequested);
-        assert_eq!(appr.default_class, Class::Critical, "approval is a HITL interrupt (critical)");
+        assert_eq!(
+            appr.default_class,
+            Class::Critical,
+            "approval is a HITL interrupt (critical)"
+        );
     }
 
     /// **The reason set registers with Notif and CLASSIFIES (the GATE).** Registering the set into a
@@ -391,14 +435,24 @@ mod tests {
         let mut reg = NotifRuleRegistry::platform_default();
         let before = reg.len();
         register_issue_notif_rules(&mut reg);
-        assert_eq!(reg.len(), before + 3, "the three Issues rules accreted (no Notif change)");
+        assert_eq!(
+            reg.len(),
+            before + 3,
+            "the three Issues rules accreted (no Notif change)"
+        );
 
         // SLA at-risk → critical.
         let c = reg.classify(RULE_KEY_SLA_AT_RISK, "psn:alice", &subject);
         assert_eq!(c.reason, Reason::Sla);
         assert_eq!(c.default_class, Class::Critical);
-        assert!(c.from_registered_rule, "the registered Issues rule took effect");
-        assert_eq!(c.dedup_key, "issue.sla:psn:alice:myelin://acme/issue/issue/ENG-1421");
+        assert!(
+            c.from_registered_rule,
+            "the registered Issues rule took effect"
+        );
+        assert_eq!(
+            c.dedup_key,
+            "issue.sla:psn:alice:myelin://acme/issue/issue/ENG-1421"
+        );
 
         // unblocked → watching.
         let c = reg.classify(RULE_KEY_UNBLOCKED, "psn:bob", &subject);
@@ -424,6 +478,9 @@ mod tests {
         let err = define_notif_rule(Reason::Sla, DedupTpl("{subject}".into()), Class::Watching)
             .expect_err("SLA must register at the critical band the §3.1 table owns");
         // it is the loud class-mismatch (never a silent re-band).
-        assert!(matches!(err, myelin_notif::DefineRuleError::ClassMismatch { .. }));
+        assert!(matches!(
+            err,
+            myelin_notif::DefineRuleError::ClassMismatch { .. }
+        ));
     }
 }

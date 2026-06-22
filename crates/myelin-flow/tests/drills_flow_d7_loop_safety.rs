@@ -26,9 +26,7 @@
 //! swallowed pass (EI-01 §3).
 
 use myelin_flow::{CausalGuard, FlowTelemetry, LoopVerdict, RefusalReason};
-use myelin_harness::{
-    Dependency, DependencyBreaker, Predicate, Scope, SignalName, SignalSource,
-};
+use myelin_harness::{Dependency, DependencyBreaker, Predicate, Scope, SignalName, SignalSource};
 use myelin_tenancy::TenantId;
 
 fn tenant() -> TenantId {
@@ -61,7 +59,10 @@ fn drill_flow_d7_adversarial_loop_stopped_under_ceiling_zero_fork() {
     // (1) INJECT the adversarial condition: the loop is "broken open" (it keeps feeding itself). The
     //     SAME tenant-scoped Broker seam BUS-D4 / FLOW-D5 / FLOW-D6 use.
     breaker.break_dependency(Dependency::Broker, scope.clone());
-    assert!(breaker.is_broken(&Dependency::Broker, &scope), "the adversarial loop is injected");
+    assert!(
+        breaker.is_broken(&Dependency::Broker, &scope),
+        "the adversarial loop is injected"
+    );
 
     // (2) DRIVE the adversarial loop. The depth chain self-feeds: an admitted child becomes the next
     //     parent. The same-root re-entry and the activity fan-out run alongside.
@@ -111,28 +112,66 @@ fn drill_flow_d7_adversarial_loop_stopped_under_ceiling_zero_fork() {
         "causal-depth max {} must be <= ceiling {ceiling}",
         telemetry.causal_depth_max()
     );
-    assert_eq!(telemetry.causal_depth_max(), ceiling, "the chain reached but did not exceed the ceiling");
+    assert_eq!(
+        telemetry.causal_depth_max(),
+        ceiling,
+        "the chain reached but did not exceed the ceiling"
+    );
     // the depth ceiling fired (the deep chain was stopped) AND the shared-root tripwire fired (the wide
     // same-root loop was caught) — both halves of §6.2 demonstrably engaged.
-    assert!(telemetry.depth_ceiling_hits() >= 1, "the depth ceiling stopped the deep chain");
-    assert!(telemetry.shared_root_tripwire_firings() >= 1, "the tripwire stopped the same-root loop");
-    assert_eq!(tripwire_drops as u64, telemetry.shared_root_tripwire_firings(), "tripwire-drop accounting");
+    assert!(
+        telemetry.depth_ceiling_hits() >= 1,
+        "the depth ceiling stopped the deep chain"
+    );
+    assert!(
+        telemetry.shared_root_tripwire_firings() >= 1,
+        "the tripwire stopped the same-root loop"
+    );
+    assert_eq!(
+        tripwire_drops as u64,
+        telemetry.shared_root_tripwire_firings(),
+        "tripwire-drop accounting"
+    );
     // the bounded activity pool capped concurrency at 4 and shed the rest.
-    assert!(activity_admitted <= 4, "the pool admitted at most its cap of 4");
-    assert_eq!(guard.activities_in_flight(), 4, "the pool is at cap (4 in flight, never released)");
+    assert!(
+        activity_admitted <= 4,
+        "the pool admitted at most its cap of 4"
+    );
+    assert_eq!(
+        guard.activities_in_flight(),
+        4,
+        "the pool is at cap (4 in flight, never released)"
+    );
     assert!(activity_parked >= 1, "over-cap activities were shed/parked");
-    assert_eq!(telemetry.activity_pool_sheds() as u32, activity_parked, "shed accounting");
+    assert_eq!(
+        telemetry.activity_pool_sheds() as u32,
+        activity_parked,
+        "shed accounting"
+    );
     // THE HEADLINE: 0 fork — nothing was ever multiplied; the loop was stopped, not forked.
-    assert_eq!(telemetry.fork_count(), 0, "0 FORK — the adversarial loop was dropped/parked, never forked");
+    assert_eq!(
+        telemetry.fork_count(),
+        0,
+        "0 FORK — the adversarial loop was dropped/parked, never forked"
+    );
 
-    assert!(child_admitted >= 1 && child_dropped >= 1, "the loop both admitted and refused");
+    assert!(
+        child_admitted >= 1 && child_dropped >= 1,
+        "the loop both admitted and refused"
+    );
 
     // (4) ASSERT via the M0 assertion library (typed green/red, never a swallowed pass).
     let mut signals = SignalSource::new();
     // the causal-depth signal stays UNDER the ceiling — the FLOW-D7 headline (here: max <= ceiling).
-    signals.set_scalar(SignalName::CausalDepthFirings, telemetry.causal_depth_max() as i64);
+    signals.set_scalar(
+        SignalName::CausalDepthFirings,
+        telemetry.causal_depth_max() as i64,
+    );
     signals
-        .assert_signal(SignalName::CausalDepthFirings, Predicate::Lte(ceiling as i64))
+        .assert_signal(
+            SignalName::CausalDepthFirings,
+            Predicate::Lte(ceiling as i64),
+        )
         .expect_green();
     // the 0-fork counter — the structural proof the gate never forks.
     signals.set_scalar(SignalName::ShedCount, telemetry.fork_count() as i64);
@@ -166,12 +205,24 @@ fn drill_flow_d7_bounded_pool_drains_on_release() {
     for _ in 0..3 {
         assert_eq!(guard.admit_activity().0, LoopVerdict::Admit);
     }
-    assert_eq!(guard.admit_activity().0, LoopVerdict::Park, "over-cap is parked");
+    assert_eq!(
+        guard.admit_activity().0,
+        LoopVerdict::Park,
+        "over-cap is parked"
+    );
     assert_eq!(guard.activities_in_flight(), 3, "the pool is at cap");
 
     // release one → a slot frees → the held work admits (the bound is steady-state, not a deadlock).
     guard.release_activity();
-    assert_eq!(guard.admit_activity().0, LoopVerdict::Admit, "a freed slot admits the held activity");
-    assert_eq!(guard.activities_in_flight(), 3, "back at cap — bounded, never over");
+    assert_eq!(
+        guard.admit_activity().0,
+        LoopVerdict::Admit,
+        "a freed slot admits the held activity"
+    );
+    assert_eq!(
+        guard.activities_in_flight(),
+        3,
+        "back at cap — bounded, never over"
+    );
     assert_eq!(telemetry.fork_count(), 0, "still 0 fork");
 }

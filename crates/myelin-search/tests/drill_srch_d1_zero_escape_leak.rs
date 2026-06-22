@@ -41,8 +41,8 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use myelin_identity::{
-    AuthzIndexRef, Consistency, ConsistencyMode, ListObjectsResult, Literal, ObjectType, Permission,
-    Principal, PrincipalId, PrincipalKind, Result as AuthzResult, SetExpr, Zookie,
+    AuthzIndexRef, Consistency, ConsistencyMode, ListObjectsResult, Literal, ObjectType,
+    Permission, Principal, PrincipalId, PrincipalKind, Result as AuthzResult, SetExpr, Zookie,
 };
 use myelin_query::{CmpOp, Expr, FieldType, FieldValue, OrderKey, Predicate, QueryAst};
 use myelin_tenancy::TenantId;
@@ -68,11 +68,18 @@ fn schema() -> FieldSchema {
 }
 
 fn viewer() -> Principal {
-    Principal::stub(PrincipalId("p:alice".into()), PrincipalKind::Human, TenantId("acme".into()))
+    Principal::stub(
+        PrincipalId("p:alice".into()),
+        PrincipalKind::Human,
+        TenantId("acme".into()),
+    )
 }
 
 fn consistency() -> Consistency {
-    Consistency { at_least: Zookie("z0".into()), mode: ConsistencyMode::BoundedStale }
+    Consistency {
+        at_least: Zookie("z0".into()),
+        mode: ConsistencyMode::BoundedStale,
+    }
 }
 
 fn ast(p: Predicate) -> QueryAst {
@@ -97,7 +104,9 @@ struct ScriptedAuthz {
 impl ScriptedAuthz {
     fn new(visible: &[&str], zookie: &str, revision: u64) -> ScriptedAuthz {
         ScriptedAuthz {
-            set_expr: SetExpr::TupleSet { index: AuthzIndexRef("authz_visible".into()) },
+            set_expr: SetExpr::TupleSet {
+                index: AuthzIndexRef("authz_visible".into()),
+            },
             zookie: zookie.into(),
             reverse: ReverseIndexAnswer {
                 object_ids: visible.iter().map(|s| (*s).to_string()).collect(),
@@ -132,8 +141,14 @@ impl ListObjectsPort for ScriptedAuthz {
     ) -> AuthzResult<ReverseIndexAnswer> {
         // The JOIN is over the TupleSet leaf (the big-result path); the pipeline passes the watermark
         // derived from the list_objects zookie.
-        assert!(matches!(form, RelationalLeaf::TupleSet { .. }), "the big-result path is a TupleSet JOIN");
-        assert!(self.reverse.revision >= *required, "the reverse index serves a fresh-enough revision");
+        assert!(
+            matches!(form, RelationalLeaf::TupleSet { .. }),
+            "the big-result path is a TupleSet JOIN"
+        );
+        assert!(
+            self.reverse.revision >= *required,
+            "the reverse index serves a fresh-enough revision"
+        );
         self.resolve_calls.fetch_add(1, Ordering::Relaxed);
         Ok(self.reverse.clone())
     }
@@ -153,7 +168,12 @@ fn adversarial_corpus() -> TantivyBackend {
             .with_embedding(Embedding::new(embed), "text-embed@1")
     };
     // The ONE visible doc — a single `deadlock`.
-    be.upsert(&doc("acme/issue/PUB-1", "a deadlock in the scheduler", vec![0.6, 0.4, 0.0])).unwrap();
+    be.upsert(&doc(
+        "acme/issue/PUB-1",
+        "a deadlock in the scheduler",
+        vec![0.6, 0.4, 0.0],
+    ))
+    .unwrap();
     // Many confidential docs all matching `deadlock` (the count/IDF adversary).
     for i in 0..20 {
         be.upsert(&doc(
@@ -200,11 +220,18 @@ fn srch_d1_zero_escape_leak_relational_big_result_path() {
     let res = query(
         &eng,
         &authz,
-        &ast(Predicate::Cmp { op: CmpOp::Eq, lhs: var(FT_BODY_FIELD), rhs: lit("deadlock") }),
+        &ast(Predicate::Cmp {
+            op: CmpOp::Eq,
+            lhs: var(FT_BODY_FIELD),
+            rhs: lit("deadlock"),
+        }),
         &viewer(),
         &ObjectType("issue".into()),
         &consistency(),
-        Page { offset: 0, limit: 1000 }, // a generous page so a count-leak would show up
+        Page {
+            offset: 0,
+            limit: 1000,
+        }, // a generous page so a count-leak would show up
         &stats,
     )
     .expect("query");
@@ -212,30 +239,56 @@ fn srch_d1_zero_escape_leak_relational_big_result_path() {
     let ids: Vec<&str> = res.hits.iter().map(|h| h.doc_id.as_str()).collect();
     // 0 leaked docs.
     for c in &confidential {
-        assert!(!ids.contains(&c.as_str()), "LEAK: confidential `{c}` surfaced in the FT result");
+        assert!(
+            !ids.contains(&c.as_str()),
+            "LEAK: confidential `{c}` surfaced in the FT result"
+        );
     }
     // 0 count-leak: exactly ONE visible doc (not 22 — the hidden docs never entered the candidate set).
-    assert_eq!(res.hits.len(), 1, "0 count-leak: only the visible doc is counted");
+    assert_eq!(
+        res.hits.len(),
+        1,
+        "0 count-leak: only the visible doc is counted"
+    );
     assert_eq!(ids, ["acme/issue/PUB-1"], "only the visible doc surfaces");
 
     // 0 N+1: one list_objects + one reverse-index JOIN (the big-result path is ONE JOIN).
-    assert_eq!(authz.calls.load(Ordering::Relaxed), 1, "exactly one list_objects (no N+1)");
-    assert_eq!(authz.resolve_calls.load(Ordering::Relaxed), 1, "exactly one reverse-index JOIN");
+    assert_eq!(
+        authz.calls.load(Ordering::Relaxed),
+        1,
+        "exactly one list_objects (no N+1)"
+    );
+    assert_eq!(
+        authz.resolve_calls.load(Ordering::Relaxed),
+        1,
+        "exactly one reverse-index JOIN"
+    );
 
     // (b) The structured branch (status == open matches ALL 22 docs) — still only PUB-1.
     let st = query(
         &eng,
         &authz,
-        &ast(Predicate::Cmp { op: CmpOp::Eq, lhs: var("status"), rhs: lit("open") }),
+        &ast(Predicate::Cmp {
+            op: CmpOp::Eq,
+            lhs: var("status"),
+            rhs: lit("open"),
+        }),
         &viewer(),
         &ObjectType("issue".into()),
         &consistency(),
-        Page { offset: 0, limit: 1000 },
+        Page {
+            offset: 0,
+            limit: 1000,
+        },
         &QueryStats::new(),
     )
     .expect("structured query");
     let st_ids: Vec<&str> = st.hits.iter().map(|h| h.doc_id.as_str()).collect();
-    assert_eq!(st_ids, ["acme/issue/PUB-1"], "0 leak on the structured branch (status==open)");
+    assert_eq!(
+        st_ids,
+        ["acme/issue/PUB-1"],
+        "0 leak on the structured branch (status==open)"
+    );
     assert_eq!(st.hits.len(), 1, "0 count-leak on the structured branch");
 }
 
@@ -250,12 +303,21 @@ fn srch_d1_zero_escape_leak_rag_vector_half() {
     // The reverse-index JOIN resolves the unauthorized viewer to ONLY PUB-1 — the SAME visible-id set
     // the pipeline lowers a TupleSet to. The query vector is NEAREST to the confidential STRONG doc.
     let acl = AclFilter::ids(VISIBLE);
-    let hits = be.semantic(&acl, &Embedding::new(vec![1.0, 0.0, 0.0]), 5).expect("semantic");
+    let hits = be
+        .semantic(&acl, &Embedding::new(vec![1.0, 0.0, 0.0]), 5)
+        .expect("semantic");
     let ids: Vec<&str> = hits.iter().map(|h| h.doc_id.as_str()).collect();
     for c in &confidential {
-        assert!(!ids.contains(&c.as_str()), "RAG LEAK: confidential `{c}` surfaced as a neighbour");
+        assert!(
+            !ids.contains(&c.as_str()),
+            "RAG LEAK: confidential `{c}` surfaced as a neighbour"
+        );
     }
-    assert_eq!(ids, ["acme/issue/PUB-1"], "only the visible neighbour; the nearest hidden one never surfaces");
+    assert_eq!(
+        ids,
+        ["acme/issue/PUB-1"],
+        "only the visible neighbour; the nearest hidden one never surfaces"
+    );
 }
 
 /// **SRCH-D1 (the RAG/vector half) through the PUBLIC `semantic` pipeline entry (contract 6.2 /
@@ -277,7 +339,11 @@ fn srch_d1_rag_vector_half_through_the_public_semantic_entry() {
     let cstats = myelin_search::ConsistencyStats::new();
     // The pure-semantic AST (the vector branch); the query vector is supplied directly (the agent-RAG
     // `vec` form), nearest the confidential STRONG doc `[1.0, 0.0, 0.0]`.
-    let q = ast(Predicate::Cmp { op: CmpOp::Eq, lhs: var(SEMANTIC_FIELD), rhs: lit("deadlock") });
+    let q = ast(Predicate::Cmp {
+        op: CmpOp::Eq,
+        lhs: var(SEMANTIC_FIELD),
+        rhs: lit("deadlock"),
+    });
     let vq = VectorQuery::Vec(Embedding::new(vec![1.0, 0.0, 0.0]));
 
     let res = semantic(
@@ -289,7 +355,10 @@ fn srch_d1_rag_vector_half_through_the_public_semantic_entry() {
         &ObjectType("issue".into()),
         &consistency(),
         &vq,
-        Page { offset: 0, limit: 1000 }, // a generous page so a count-leak would show up
+        Page {
+            offset: 0,
+            limit: 1000,
+        }, // a generous page so a count-leak would show up
         &stats,
         &cstats,
     )
@@ -302,10 +371,22 @@ fn srch_d1_rag_vector_half_through_the_public_semantic_entry() {
             "RAG LEAK through the public semantic entry: confidential `{c}` surfaced as a neighbour"
         );
     }
-    assert_eq!(ids, ["acme/issue/PUB-1"], "only the visible neighbour; the nearest hidden one never surfaces");
+    assert_eq!(
+        ids,
+        ["acme/issue/PUB-1"],
+        "only the visible neighbour; the nearest hidden one never surfaces"
+    );
     assert_eq!(res.hits.len(), 1, "0 count-leak on the RAG/vector path");
-    assert_eq!(authz.calls.load(Ordering::Relaxed), 1, "exactly one list_objects (no N+1 on the RAG path)");
-    assert_eq!(authz.resolve_calls.load(Ordering::Relaxed), 1, "exactly one reverse-index JOIN");
+    assert_eq!(
+        authz.calls.load(Ordering::Relaxed),
+        1,
+        "exactly one list_objects (no N+1 on the RAG path)"
+    );
+    assert_eq!(
+        authz.resolve_calls.load(Ordering::Relaxed),
+        1,
+        "exactly one reverse-index JOIN"
+    );
 }
 
 /// **SRCH-D1 — the chained grant: grant the relation → the reverse-index JOIN now resolves the
@@ -316,22 +397,57 @@ fn srch_d1_rag_vector_half_through_the_public_semantic_entry() {
 fn srch_d1_chained_grant_makes_the_relation_doc_visible() {
     let be = adversarial_corpus();
     let eng = ScopedEngine::new(&be, "acme", "eu-west", schema());
-    let q = ast(Predicate::Cmp { op: CmpOp::Eq, lhs: var(FT_BODY_FIELD), rhs: lit("deadlock") });
+    let q = ast(Predicate::Cmp {
+        op: CmpOp::Eq,
+        lhs: var(FT_BODY_FIELD),
+        rhs: lit("deadlock"),
+    });
 
     // BEFORE: only PUB-1 reachable.
     let before = ScriptedAuthz::new(&VISIBLE, "z@10", 10);
-    let r0 = query(&eng, &before, &q, &viewer(), &ObjectType("issue".into()), &consistency(),
-        Page { offset: 0, limit: 1000 }, &QueryStats::new()).expect("before");
+    let r0 = query(
+        &eng,
+        &before,
+        &q,
+        &viewer(),
+        &ObjectType("issue".into()),
+        &consistency(),
+        Page {
+            offset: 0,
+            limit: 1000,
+        },
+        &QueryStats::new(),
+    )
+    .expect("before");
     assert_eq!(r0.hits.len(), 1, "only PUB-1 before the grant");
 
     // GRANT SECRET-0 (the relation now reaches it), at a FRESHER revision (11 > 10).
     let after = ScriptedAuthz::new(&["acme/issue/PUB-1", "acme/issue/SECRET-0"], "z@11", 11);
-    let r1 = query(&eng, &after, &q, &viewer(), &ObjectType("issue".into()), &consistency(),
-        Page { offset: 0, limit: 1000 }, &QueryStats::new()).expect("after grant");
+    let r1 = query(
+        &eng,
+        &after,
+        &q,
+        &viewer(),
+        &ObjectType("issue".into()),
+        &consistency(),
+        Page {
+            offset: 0,
+            limit: 1000,
+        },
+        &QueryStats::new(),
+    )
+    .expect("after grant");
     let ids: std::collections::BTreeSet<&str> = r1.hits.iter().map(|h| h.doc_id.as_str()).collect();
-    assert!(ids.contains("acme/issue/SECRET-0"), "after the grant the relation doc is visible");
+    assert!(
+        ids.contains("acme/issue/SECRET-0"),
+        "after the grant the relation doc is visible"
+    );
     assert!(ids.contains("acme/issue/PUB-1"));
-    assert_eq!(ids.len(), 2, "exactly the two now-reachable docs (still no leak of the other 20)");
+    assert_eq!(
+        ids.len(),
+        2,
+        "exactly the two now-reachable docs (still no leak of the other 20)"
+    );
 }
 
 /// **SRCH-D1 — a more-results / pagination probe: a deep page never spills a hidden doc.** Even if
@@ -346,13 +462,23 @@ fn srch_d1_deep_page_never_spills_a_hidden_doc() {
     let res = query(
         &eng,
         &authz,
-        &ast(Predicate::Cmp { op: CmpOp::Eq, lhs: var(FT_BODY_FIELD), rhs: lit("deadlock") }),
+        &ast(Predicate::Cmp {
+            op: CmpOp::Eq,
+            lhs: var(FT_BODY_FIELD),
+            rhs: lit("deadlock"),
+        }),
         &viewer(),
         &ObjectType("issue".into()),
         &consistency(),
-        Page { offset: 1, limit: 50 }, // skip the one visible doc — the tail must be EMPTY, not hidden docs
+        Page {
+            offset: 1,
+            limit: 50,
+        }, // skip the one visible doc — the tail must be EMPTY, not hidden docs
         &QueryStats::new(),
     )
     .expect("query");
-    assert!(res.hits.is_empty(), "no 'more results' tail of hidden docs (0 leak past the visible page)");
+    assert!(
+        res.hits.is_empty(),
+        "no 'more results' tail of hidden docs (0 leak past the visible page)"
+    );
 }

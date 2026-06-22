@@ -33,7 +33,11 @@ fn tenant() -> TenantId {
 }
 
 fn principal() -> Principal {
-    Principal::stub(PrincipalId("p-opaque".into()), PrincipalKind::Human, tenant())
+    Principal::stub(
+        PrincipalId("p-opaque".into()),
+        PrincipalKind::Human,
+        tenant(),
+    )
 }
 
 fn transport() -> CollabTransport<AllowAllAuthority> {
@@ -41,7 +45,12 @@ fn transport() -> CollabTransport<AllowAllAuthority> {
 }
 
 fn op(client: &str, lamport: u64) -> DocOp {
-    DocOp::cas(OpId::new(client, lamport), "actor", OpKind::Insert, format!("cas:{lamport}").into_bytes())
+    DocOp::cas(
+        OpId::new(client, lamport),
+        "actor",
+        OpKind::Insert,
+        format!("cas:{lamport}").into_bytes(),
+    )
 }
 
 /// **PROVIDER side of 3.5 (Knowledge's half)** — a collaborator client `SEND_OP`s an op. Knowledge's
@@ -80,7 +89,11 @@ fn cdc_3_5_knowledge_provider_sends_consumer_reconnects_loses_zero_ops() {
     for (i, lamport) in [1, 2, 3].iter().enumerate() {
         let out = provider_send_op(&mut t, op("c1", *lamport));
         assert!(out.applied(), "a fresh op applies");
-        assert_eq!(out.persisted().op_seq, (i + 1) as u64, "op_seq is monotone (== firehose seq)");
+        assert_eq!(
+            out.persisted().op_seq,
+            (i + 1) as u64,
+            "op_seq is monotone (== firehose seq)"
+        );
     }
 
     // the consumer saw up to op_seq 2, then the connection dropped; meanwhile 3 (already sent) +
@@ -90,7 +103,11 @@ fn cdc_3_5_knowledge_provider_sends_consumer_reconnects_loses_zero_ops() {
 
     // CONSUMER RECONNECTs with last_seq = 2 → backfill (2, now] = {3,4,5}, 0 lost.
     let backfilled = consumer_connect_backfill(&mut t, 2);
-    assert_eq!(backfilled, vec![3, 4, 5], "the gap (last_seq, now] is replayed — 0 ops lost");
+    assert_eq!(
+        backfilled,
+        vec![3, 4, 5],
+        "the gap (last_seq, now] is replayed — 0 ops lost"
+    );
 }
 
 /// **The idempotent-apply half (Knowledge's owned discipline): a re-delivered op is a NO-OP.** The
@@ -107,8 +124,23 @@ fn cdc_3_5_knowledge_redelivered_op_is_idempotent_no_op() {
     // a re-delivery of the SAME op (at-least-once) — a no-op.
     let again = provider_send_op(&mut t, op("c1", 9));
     assert!(!again.applied(), "a re-delivered op did NOT freshly apply");
-    assert!(matches!(again, SendOutcome::Duplicate(_)), "it is an idempotent Duplicate no-op");
-    assert_eq!(again.persisted().op_seq, seq, "the duplicate resolves to the FIRST op_seq");
-    assert_eq!(t.head_seq(), seq, "the head did NOT advance (0 duplicate effect)");
-    assert_eq!(t.op_count(), 1, "exactly one op persisted (the duplicate was absorbed)");
+    assert!(
+        matches!(again, SendOutcome::Duplicate(_)),
+        "it is an idempotent Duplicate no-op"
+    );
+    assert_eq!(
+        again.persisted().op_seq,
+        seq,
+        "the duplicate resolves to the FIRST op_seq"
+    );
+    assert_eq!(
+        t.head_seq(),
+        seq,
+        "the head did NOT advance (0 duplicate effect)"
+    );
+    assert_eq!(
+        t.op_count(),
+        1,
+        "exactly one op persisted (the duplicate was absorbed)"
+    );
 }

@@ -174,7 +174,8 @@ impl LegalHoldRegistry {
     /// poisoned hold registry). When `true`, [`Self::verdict`] treats the registry as un-readable
     /// and DEFERS an erase (never proceeds under an un-readable hold state).
     pub fn set_unreadable(&self, unreadable: bool) {
-        self.unreadable.store(unreadable, std::sync::atomic::Ordering::SeqCst);
+        self.unreadable
+            .store(unreadable, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Whether the registry is (forced) un-readable — the fail-safe-to-suspend trigger.
@@ -387,7 +388,11 @@ impl<'a, C: Clock> FanOutDriver<'a, C> {
     /// but no completion is recorded into the 10.8 ledger). The upstream holder orchestrator + the
     /// durable checklist are passed per-`drive` (they are per-DSR-fan-out state).
     pub fn new(dsr: &'a DsrOrchestrator<C>, holds: &'a LegalHoldRegistry) -> FanOutDriver<'a, C> {
-        FanOutDriver { dsr, holds, ledger: None }
+        FanOutDriver {
+            dsr,
+            holds,
+            ledger: None,
+        }
     }
 
     /// **Build a driver that WRITES the erasure ledger (10.8, P-GA-15) on a completed erase.** A
@@ -401,7 +406,11 @@ impl<'a, C: Clock> FanOutDriver<'a, C> {
         holds: &'a LegalHoldRegistry,
         ledger: &'a crate::erasure_ledger::ErasureLedger,
     ) -> FanOutDriver<'a, C> {
-        FanOutDriver { dsr, holds, ledger: Some(ledger) }
+        FanOutDriver {
+            dsr,
+            holds,
+            ledger: Some(ledger),
+        }
     }
 
     /// **Drive a validated DSR's fan-out (§4.1 steps 2–5), data-map-driven + resumable.** The
@@ -548,8 +557,10 @@ impl<'a, C: Clock> FanOutDriver<'a, C> {
             }
             EraseScope::Tenant(tenant) => ("*".to_string(), tenant.0.clone()),
         };
-        let holders_erased: Vec<String> =
-            holder_receipts.iter().map(|hr| hr.holder_id.to_string()).collect();
+        let holders_erased: Vec<String> = holder_receipts
+            .iter()
+            .map(|hr| hr.holder_id.to_string())
+            .collect();
         let key_epochs_destroyed: Vec<crate::erasure_ledger::DestroyedKeyEpoch> = holder_receipts
             .iter()
             .map(|hr| crate::erasure_ledger::DestroyedKeyEpoch {
@@ -612,11 +623,18 @@ mod tests {
     }
 
     fn subject(id: &str) -> SubjectRef {
-        SubjectRef::new(Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, t("acme")))
+        SubjectRef::new(Principal::stub(
+            PrincipalId(id.into()),
+            PrincipalKind::Human,
+            t("acme"),
+        ))
     }
 
     fn subject_scope(s: &str) -> EraseScope {
-        EraseScope::Subject { subject: subject(s), tenant: t("acme") }
+        EraseScope::Subject {
+            subject: subject(s),
+            tenant: t("acme"),
+        }
     }
 
     /// A KMS seeded with one key per upstream holder (each holder shreds its OWN class).
@@ -634,7 +652,10 @@ mod tests {
         .enumerate()
         {
             kms.provision(
-                ShredKeyHandle { tenant: tenant.clone(), class: ShredKeyClass::Subject((*id).to_string()) },
+                ShredKeyHandle {
+                    tenant: tenant.clone(),
+                    class: ShredKeyClass::Subject((*id).to_string()),
+                },
                 base_epoch + i as u64,
             );
         }
@@ -651,7 +672,12 @@ mod tests {
             holder_ids::BACKUP,
         ]
         .into_iter()
-        .map(|id| (id, SeamHolder::new(id, ShredKeyClass::Subject(id.to_string()), kms)))
+        .map(|id| {
+            (
+                id,
+                SeamHolder::new(id, ShredKeyClass::Subject(id.to_string()), kms),
+            )
+        })
         .collect()
     }
 
@@ -704,7 +730,10 @@ mod tests {
         let kms = kms_with_all_holder_keys(&tenant, 100);
         let holders = seam_holders(&kms);
         let upstream = UpstreamHolderOrchestrator::register_m1_upstream(
-            holders.iter().map(|(id, h)| (*id, h as &dyn PersonalDataHolder)).collect(),
+            holders
+                .iter()
+                .map(|(id, h)| (*id, h as &dyn PersonalDataHolder))
+                .collect(),
         );
         let dsr = DsrOrchestrator::new(TestClock::at(1_700_000_000));
         let holds = LegalHoldRegistry::new();
@@ -712,13 +741,18 @@ mod tests {
 
         let id = submit_validated_erase(&dsr, "u-floor");
         let checklist = EraseChecklist::new();
-        let outcome = driver.drive(&id, &inventory(), &upstream, &checklist).unwrap();
+        let outcome = driver
+            .drive(&id, &inventory(), &upstream, &checklist)
+            .unwrap();
 
         // The DSR is COMPLETED via the state machine (awaiting-holders → verified → completed).
         assert_eq!(dsr.state_of(&id).unwrap(), DsrState::Completed);
         // The checklist was resolved FROM the map (surfaced in dsr_status) — the map drives it.
         let status_checklist = dsr.dsr_status(&id).unwrap().checklist;
-        let ids: Vec<&str> = status_checklist.iter().map(|c| c.holder_id.as_str()).collect();
+        let ids: Vec<&str> = status_checklist
+            .iter()
+            .map(|c| c.holder_id.as_str())
+            .collect();
         assert!(ids.contains(&"identity") && ids.contains(&"search_index:search_index"));
 
         // The fan-out hit EVERY existing upstream holder in canonical order; 100% coverage.
@@ -727,10 +761,21 @@ mod tests {
             FanOutOutcome::Erased(r) => r,
             other => panic!("expected Erased, got {other:?}"),
         };
-        assert_eq!(receipt.holder_receipts.len(), 6, "all six upstream holders receipted");
-        assert_eq!(receipt.holder_receipts[0].holder_id, holder_ids::IDENTITY, "Identity FIRST");
+        assert_eq!(
+            receipt.holder_receipts.len(),
+            6,
+            "all six upstream holders receipted"
+        );
+        assert_eq!(
+            receipt.holder_receipts[0].holder_id,
+            holder_ids::IDENTITY,
+            "Identity FIRST"
+        );
         assert_eq!(receipt.outcome, "erased");
-        assert!(receipt.content_hash.starts_with("blake3:"), "content-addressed (§4.2)");
+        assert!(
+            receipt.content_hash.starts_with("blake3:"),
+            "content-addressed (§4.2)"
+        );
         // Every per-holder receipt records its destroyed key epoch (the §4.2 independent-check trail).
         for hr in &receipt.holder_receipts {
             assert!(hr.receipt.receipt.key_epoch_destroyed.is_some());
@@ -738,7 +783,10 @@ mod tests {
         // The DSR certificate seals the same receipts (the auditor's verifiable bundle).
         let cert = dsr.dsr_certificate(&id).unwrap();
         assert_eq!(cert.receipts.len(), 6);
-        assert!(cert.merkle_inclusion.is_none(), "the Merkle seal is P-GA-20");
+        assert!(
+            cert.merkle_inclusion.is_none(),
+            "the Merkle seal is P-GA-20"
+        );
     }
 
     /// **The checklist is built FROM the data map, not a hard-coded list.** A DIFFERENT map (a new
@@ -752,25 +800,45 @@ mod tests {
         let kms = kms_with_all_holder_keys(&t("acme"), 10);
         let holders = seam_holders(&kms);
         let upstream = UpstreamHolderOrchestrator::register_m1_upstream(
-            holders.iter().map(|(id, h)| (*id, h as &dyn PersonalDataHolder)).collect(),
+            holders
+                .iter()
+                .map(|(id, h)| (*id, h as &dyn PersonalDataHolder))
+                .collect(),
         );
 
         // Map A: one derived holder.
         let id_a = submit_validated_erase(&dsr, "u-a");
-        driver.drive(&id_a, &inventory(), &upstream, &EraseChecklist::new()).unwrap();
-        let a: BTreeSet<String> =
-            dsr.dsr_status(&id_a).unwrap().checklist.iter().map(|c| c.holder_id.clone()).collect();
+        driver
+            .drive(&id_a, &inventory(), &upstream, &EraseChecklist::new())
+            .unwrap();
+        let a: BTreeSet<String> = dsr
+            .dsr_status(&id_a)
+            .unwrap()
+            .checklist
+            .iter()
+            .map(|c| c.holder_id.clone())
+            .collect();
 
         // Map B: an EXTRA holder added — the checklist grows (the map drives it).
         let mut inv_b = inventory();
         inv_b.holders.insert("refs_edge:refs_edge".to_string());
         let id_b = submit_validated_erase(&dsr, "u-b");
-        driver.drive(&id_b, &inv_b, &upstream, &EraseChecklist::new()).unwrap();
-        let b: BTreeSet<String> =
-            dsr.dsr_status(&id_b).unwrap().checklist.iter().map(|c| c.holder_id.clone()).collect();
+        driver
+            .drive(&id_b, &inv_b, &upstream, &EraseChecklist::new())
+            .unwrap();
+        let b: BTreeSet<String> = dsr
+            .dsr_status(&id_b)
+            .unwrap()
+            .checklist
+            .iter()
+            .map(|c| c.holder_id.clone())
+            .collect();
 
         assert!(!a.contains("refs_edge:refs_edge"));
-        assert!(b.contains("refs_edge:refs_edge"), "the new map holder appears in the checklist");
+        assert!(
+            b.contains("refs_edge:refs_edge"),
+            "the new map holder appears in the checklist"
+        );
     }
 
     // ───────────── the legal-hold gate (§4.1 step 3) ─────────────
@@ -784,13 +852,19 @@ mod tests {
         let kms = kms_with_all_holder_keys(&tenant, 200);
         let holders = seam_holders(&kms);
         let upstream = UpstreamHolderOrchestrator::register_m1_upstream(
-            holders.iter().map(|(id, h)| (*id, h as &dyn PersonalDataHolder)).collect(),
+            holders
+                .iter()
+                .map(|(id, h)| (*id, h as &dyn PersonalDataHolder))
+                .collect(),
         );
         let dsr = DsrOrchestrator::new(TestClock::at(0));
         let holds = LegalHoldRegistry::new();
         // Set a hold over the subject.
         holds.set(
-            HoldScope::Subject { tenant: "acme".into(), subject: "u-held".into() },
+            HoldScope::Subject {
+                tenant: "acme".into(),
+                subject: "u-held".into(),
+            },
             true,
         );
         assert_eq!(holds.active_count(), 1);
@@ -798,19 +872,43 @@ mod tests {
 
         let id = submit_validated_erase(&dsr, "u-held");
         let checklist = EraseChecklist::new();
-        let outcome = driver.drive(&id, &inventory(), &upstream, &checklist).unwrap();
+        let outcome = driver
+            .drive(&id, &inventory(), &upstream, &checklist)
+            .unwrap();
 
         // DEFERRED — the fan-out did NOT run, the DSR is parked at AwaitingHolders.
-        assert!(matches!(outcome, FanOutOutcome::DeferredUnderHold(_)), "erase deferred under hold");
+        assert!(
+            matches!(outcome, FanOutOutcome::DeferredUnderHold(_)),
+            "erase deferred under hold"
+        );
         assert_eq!(outcome.receipt().outcome, "deferred:legal_hold");
-        assert!(outcome.receipt().holder_receipts.is_empty(), "no holder was driven");
-        assert_eq!(dsr.state_of(&id).unwrap(), DsrState::AwaitingHolders, "parked, not completed");
-        assert_eq!(upstream.fanout_coverage(&checklist), 0.0, "0 holders driven under hold");
+        assert!(
+            outcome.receipt().holder_receipts.is_empty(),
+            "no holder was driven"
+        );
+        assert_eq!(
+            dsr.state_of(&id).unwrap(),
+            DsrState::AwaitingHolders,
+            "parked, not completed"
+        );
+        assert_eq!(
+            upstream.fanout_coverage(&checklist),
+            0.0,
+            "0 holders driven under hold"
+        );
 
         // Clear the hold and RE-DRIVE: the erase now proceeds to completion (resumable — the same
         // checklist re-drives the un-receipted holders).
-        holds.set(HoldScope::Subject { tenant: "acme".into(), subject: "u-held".into() }, false);
-        let outcome2 = driver.drive(&id, &inventory(), &upstream, &checklist).unwrap();
+        holds.set(
+            HoldScope::Subject {
+                tenant: "acme".into(),
+                subject: "u-held".into(),
+            },
+            false,
+        );
+        let outcome2 = driver
+            .drive(&id, &inventory(), &upstream, &checklist)
+            .unwrap();
         assert!(matches!(outcome2, FanOutOutcome::Erased(_)));
         assert_eq!(dsr.state_of(&id).unwrap(), DsrState::Completed);
         assert_eq!(upstream.fanout_coverage(&checklist), 1.0);
@@ -822,10 +920,19 @@ mod tests {
     fn a_tenant_hold_defers_a_subject_erase_in_that_tenant() {
         let holds = LegalHoldRegistry::new();
         holds.set(HoldScope::Tenant("acme".into()), true);
-        assert_eq!(holds.verdict(DsrKind::Erasure, &subject_scope("anyone")), HoldVerdict::Deferred);
+        assert_eq!(
+            holds.verdict(DsrKind::Erasure, &subject_scope("anyone")),
+            HoldVerdict::Deferred
+        );
         // a different tenant is NOT held.
-        let other = EraseScope::Subject { subject: subject("x"), tenant: t("other") };
-        assert_eq!(holds.verdict(DsrKind::Erasure, &other), HoldVerdict::Proceed);
+        let other = EraseScope::Subject {
+            subject: subject("x"),
+            tenant: t("other"),
+        };
+        assert_eq!(
+            holds.verdict(DsrKind::Erasure, &other),
+            HoldVerdict::Proceed
+        );
     }
 
     /// **A read right (access/portability) is NEVER suspended by a hold (§4.1 step 3) — it still
@@ -839,10 +946,16 @@ mod tests {
         let kms = kms_with_all_holder_keys(&t("acme"), 300);
         let holders = seam_holders(&kms);
         let upstream = UpstreamHolderOrchestrator::register_m1_upstream(
-            holders.iter().map(|(id, h)| (*id, h as &dyn PersonalDataHolder)).collect(),
+            holders
+                .iter()
+                .map(|(id, h)| (*id, h as &dyn PersonalDataHolder))
+                .collect(),
         );
 
-        for (kind, want) in [(DsrKind::Access, "access"), (DsrKind::Portability, "portability")] {
+        for (kind, want) in [
+            (DsrKind::Access, "access"),
+            (DsrKind::Portability, "portability"),
+        ] {
             let id = dsr.dsr_submit(
                 kind,
                 t("acme"),
@@ -852,10 +965,19 @@ mod tests {
                 Initiator::Myelin,
             );
             dsr.validate(&id).unwrap();
-            let outcome = driver.drive(&id, &inventory(), &upstream, &EraseChecklist::new()).unwrap();
-            assert!(matches!(outcome, FanOutOutcome::ReadRightServed(_)), "{kind:?} proceeds under hold");
+            let outcome = driver
+                .drive(&id, &inventory(), &upstream, &EraseChecklist::new())
+                .unwrap();
+            assert!(
+                matches!(outcome, FanOutOutcome::ReadRightServed(_)),
+                "{kind:?} proceeds under hold"
+            );
             assert_eq!(outcome.receipt().outcome, want);
-            assert_eq!(dsr.state_of(&id).unwrap(), DsrState::Completed, "{kind:?} completes");
+            assert_eq!(
+                dsr.state_of(&id).unwrap(),
+                DsrState::Completed,
+                "{kind:?} completes"
+            );
         }
     }
 
@@ -866,9 +988,15 @@ mod tests {
         let holds = LegalHoldRegistry::new();
         holds.set_unreadable(true);
         // an ERASE is deferred (fail-safe-to-suspend).
-        assert_eq!(holds.verdict(DsrKind::Erasure, &subject_scope("x")), HoldVerdict::Deferred);
+        assert_eq!(
+            holds.verdict(DsrKind::Erasure, &subject_scope("x")),
+            HoldVerdict::Deferred
+        );
         // a READ RIGHT is never gated by a hold (it short-circuits before the registry read).
-        assert_eq!(holds.verdict(DsrKind::Access, &subject_scope("x")), HoldVerdict::Proceed);
+        assert_eq!(
+            holds.verdict(DsrKind::Access, &subject_scope("x")),
+            HoldVerdict::Proceed
+        );
     }
 
     // ───────────── resumability (the §4.1 step-4 property, driven through the driver) ─────────────
@@ -883,7 +1011,10 @@ mod tests {
         let kms = kms_with_all_holder_keys(&tenant, 400);
         let holders = seam_holders(&kms);
         let upstream = UpstreamHolderOrchestrator::register_m1_upstream(
-            holders.iter().map(|(id, h)| (*id, h as &dyn PersonalDataHolder)).collect(),
+            holders
+                .iter()
+                .map(|(id, h)| (*id, h as &dyn PersonalDataHolder))
+                .collect(),
         );
         let dsr = DsrOrchestrator::new(TestClock::at(0));
         let holds = LegalHoldRegistry::new();
@@ -896,29 +1027,47 @@ mod tests {
         let first_three: Vec<(&'static str, &dyn PersonalDataHolder)> = holders
             .iter()
             .filter(|(id, _)| {
-                *id == holder_ids::IDENTITY || *id == holder_ids::BLOB || *id == holder_ids::AUTHZ_TUPLES
+                *id == holder_ids::IDENTITY
+                    || *id == holder_ids::BLOB
+                    || *id == holder_ids::AUTHZ_TUPLES
             })
             .map(|(id, h)| (*id, h as &dyn PersonalDataHolder))
             .collect();
         let partial = UpstreamHolderOrchestrator::register_m1_upstream(first_three);
-        partial.fan_out_erase(&subject_scope("u-resume"), &checklist).unwrap();
-        assert_eq!(checklist.done_count(), 3, "the crash left three holders receipted");
-        let calls_after_partial: Vec<u32> = holders.iter().map(|(_, h)| h.erase_call_count()).collect();
+        partial
+            .fan_out_erase(&subject_scope("u-resume"), &checklist)
+            .unwrap();
+        assert_eq!(
+            checklist.done_count(),
+            3,
+            "the crash left three holders receipted"
+        );
+        let calls_after_partial: Vec<u32> =
+            holders.iter().map(|(_, h)| h.erase_call_count()).collect();
 
         // RE-DRIVE the full DSR (resume after the crash) — only un-receipted holders are re-driven.
-        let outcome = driver.drive(&id, &inventory(), &upstream, &checklist).unwrap();
+        let outcome = driver
+            .drive(&id, &inventory(), &upstream, &checklist)
+            .unwrap();
         assert!(matches!(outcome, FanOutOutcome::Erased(_)));
 
         // The first three holders were NOT re-called (resumability — 0 double-erase).
         for (i, (id, _)) in holders.iter().enumerate() {
-            if *id == holder_ids::IDENTITY || *id == holder_ids::BLOB || *id == holder_ids::AUTHZ_TUPLES {
+            if *id == holder_ids::IDENTITY
+                || *id == holder_ids::BLOB
+                || *id == holder_ids::AUTHZ_TUPLES
+            {
                 assert_eq!(
                     holders[i].1.erase_call_count(),
                     calls_after_partial[i],
                     "holder {id} was already receipted ⇒ NOT re-called (0 double-erase)"
                 );
             } else {
-                assert_eq!(holders[i].1.erase_call_count(), 1, "holder {id} driven on resume");
+                assert_eq!(
+                    holders[i].1.erase_call_count(),
+                    1,
+                    "holder {id} driven on resume"
+                );
             }
         }
         assert_eq!(dsr.state_of(&id).unwrap(), DsrState::Completed);
@@ -933,7 +1082,10 @@ mod tests {
         let kms = kms_with_all_holder_keys(&tenant, 500);
         let holders = seam_holders(&kms);
         let upstream = UpstreamHolderOrchestrator::register_m1_upstream(
-            holders.iter().map(|(id, h)| (*id, h as &dyn PersonalDataHolder)).collect(),
+            holders
+                .iter()
+                .map(|(id, h)| (*id, h as &dyn PersonalDataHolder))
+                .collect(),
         );
         let dsr = DsrOrchestrator::new(TestClock::at(42));
         let holds = LegalHoldRegistry::new();
@@ -941,18 +1093,27 @@ mod tests {
         let id = submit_validated_erase(&dsr, "u-idem");
         let checklist = EraseChecklist::new();
 
-        let first = driver.drive(&id, &inventory(), &upstream, &checklist).unwrap();
-        let calls_after_first: Vec<u32> = holders.iter().map(|(_, h)| h.erase_call_count()).collect();
+        let first = driver
+            .drive(&id, &inventory(), &upstream, &checklist)
+            .unwrap();
+        let calls_after_first: Vec<u32> =
+            holders.iter().map(|(_, h)| h.erase_call_count()).collect();
 
-        let second = driver.drive(&id, &inventory(), &upstream, &checklist).unwrap();
-        let calls_after_second: Vec<u32> = holders.iter().map(|(_, h)| h.erase_call_count()).collect();
+        let second = driver
+            .drive(&id, &inventory(), &upstream, &checklist)
+            .unwrap();
+        let calls_after_second: Vec<u32> =
+            holders.iter().map(|(_, h)| h.erase_call_count()).collect();
 
         assert_eq!(
             first.receipt().content_hash,
             second.receipt().content_hash,
             "an idempotent re-drive seals the SAME content-addressed receipt"
         );
-        assert_eq!(calls_after_first, calls_after_second, "no holder re-called on the idempotent re-drive");
+        assert_eq!(
+            calls_after_first, calls_after_second,
+            "no holder re-called on the idempotent re-drive"
+        );
         assert_eq!(dsr.state_of(&id).unwrap(), DsrState::Completed);
     }
 
@@ -969,37 +1130,106 @@ mod tests {
             phase: crate::orchestration::CanonicalErasePhase::CryptoShredDek,
             receipt: myelin_gdpr::EraseReceipt {
                 receipt: myelin_gdpr::Receipt::content_addressed(
-                    "erase", holder, "u", "acme", "crypto_shred", epoch, 0,
+                    "erase",
+                    holder,
+                    "u",
+                    "acme",
+                    "crypto_shred",
+                    epoch,
+                    0,
                 ),
             },
         };
-        let base = DsrCompletionReceipt::build(&id, "acme/u", "erased", &[hr("blob_store", Some(9))], 1000);
+        let base = DsrCompletionReceipt::build(
+            &id,
+            "acme/u",
+            "erased",
+            &[hr("blob_store", Some(9))],
+            1000,
+        );
         // deterministic: the SAME inputs content-address the same.
-        let same = DsrCompletionReceipt::build(&id, "acme/u", "erased", &[hr("blob_store", Some(9))], 1000);
+        let same = DsrCompletionReceipt::build(
+            &id,
+            "acme/u",
+            "erased",
+            &[hr("blob_store", Some(9))],
+            1000,
+        );
         assert_eq!(base.content_hash, same.content_hash);
         assert!(base.content_hash.starts_with("blake3:"));
 
         // request_id matters.
-        let diff_id = DsrCompletionReceipt::build(&DsrId("dsr:8".into()), "acme/u", "erased", &[hr("blob_store", Some(9))], 1000);
-        assert_ne!(base.content_hash, diff_id.content_hash, "request_id is in the content address");
+        let diff_id = DsrCompletionReceipt::build(
+            &DsrId("dsr:8".into()),
+            "acme/u",
+            "erased",
+            &[hr("blob_store", Some(9))],
+            1000,
+        );
+        assert_ne!(
+            base.content_hash, diff_id.content_hash,
+            "request_id is in the content address"
+        );
         // scope matters.
-        let diff_scope = DsrCompletionReceipt::build(&id, "acme/v", "erased", &[hr("blob_store", Some(9))], 1000);
-        assert_ne!(base.content_hash, diff_scope.content_hash, "scope is in the content address");
+        let diff_scope = DsrCompletionReceipt::build(
+            &id,
+            "acme/v",
+            "erased",
+            &[hr("blob_store", Some(9))],
+            1000,
+        );
+        assert_ne!(
+            base.content_hash, diff_scope.content_hash,
+            "scope is in the content address"
+        );
         // outcome matters.
-        let diff_outcome = DsrCompletionReceipt::build(&id, "acme/u", "deferred:legal_hold", &[hr("blob_store", Some(9))], 1000);
-        assert_ne!(base.content_hash, diff_outcome.content_hash, "outcome is in the content address");
+        let diff_outcome = DsrCompletionReceipt::build(
+            &id,
+            "acme/u",
+            "deferred:legal_hold",
+            &[hr("blob_store", Some(9))],
+            1000,
+        );
+        assert_ne!(
+            base.content_hash, diff_outcome.content_hash,
+            "outcome is in the content address"
+        );
         // a holder's key_epoch matters.
-        let diff_epoch = DsrCompletionReceipt::build(&id, "acme/u", "erased", &[hr("blob_store", Some(10))], 1000);
-        assert_ne!(base.content_hash, diff_epoch.content_hash, "key_epoch is in the content address");
+        let diff_epoch = DsrCompletionReceipt::build(
+            &id,
+            "acme/u",
+            "erased",
+            &[hr("blob_store", Some(10))],
+            1000,
+        );
+        assert_ne!(
+            base.content_hash, diff_epoch.content_hash,
+            "key_epoch is in the content address"
+        );
         // timestamp matters.
-        let diff_ts = DsrCompletionReceipt::build(&id, "acme/u", "erased", &[hr("blob_store", Some(9))], 2000);
-        assert_ne!(base.content_hash, diff_ts.content_hash, "timestamp is in the content address");
+        let diff_ts = DsrCompletionReceipt::build(
+            &id,
+            "acme/u",
+            "erased",
+            &[hr("blob_store", Some(9))],
+            2000,
+        );
+        assert_ne!(
+            base.content_hash, diff_ts.content_hash,
+            "timestamp is in the content address"
+        );
         // the held holder set matters (an added holder receipt changes the address).
         let diff_holder = DsrCompletionReceipt::build(
-            &id, "acme/u", "erased",
-            &[hr("blob_store", Some(9)), hr("event_bus", Some(11))], 1000,
+            &id,
+            "acme/u",
+            "erased",
+            &[hr("blob_store", Some(9)), hr("event_bus", Some(11))],
+            1000,
         );
-        assert_ne!(base.content_hash, diff_holder.content_hash, "the holder set is in the content address");
+        assert_ne!(
+            base.content_hash, diff_holder.content_hash,
+            "the holder set is in the content address"
+        );
         // the fields are recorded verbatim.
         assert_eq!(base.request_id, id);
         assert_eq!(base.scope_token, "acme/u");
@@ -1030,7 +1260,10 @@ mod tests {
         let kms = kms_with_all_holder_keys(&tenant, 600);
         let holders = seam_holders(&kms);
         let upstream = UpstreamHolderOrchestrator::register_m1_upstream(
-            holders.iter().map(|(id, h)| (*id, h as &dyn PersonalDataHolder)).collect(),
+            holders
+                .iter()
+                .map(|(id, h)| (*id, h as &dyn PersonalDataHolder))
+                .collect(),
         );
         let dsr = DsrOrchestrator::new(TestClock::at(1_700_000_000));
         let holds = LegalHoldRegistry::new();
@@ -1039,25 +1272,41 @@ mod tests {
 
         let id = submit_validated_erase(&dsr, "u-ledger");
         let checklist = EraseChecklist::new();
-        let outcome = driver.drive(&id, &inventory(), &upstream, &checklist).unwrap();
+        let outcome = driver
+            .drive(&id, &inventory(), &upstream, &checklist)
+            .unwrap();
         assert!(matches!(outcome, FanOutOutcome::Erased(_)));
         assert_eq!(dsr.state_of(&id).unwrap(), DsrState::Completed);
 
         // The ledger recorded ONE PII-free entry for the completion.
         assert_eq!(ledger.len(), 1, "the completion wrote one ledger entry");
         let entry = ledger.entry(&id).unwrap();
-        assert_eq!(entry.subject_token, "u-ledger", "the opaque subject token (principal_id), never PII");
+        assert_eq!(
+            entry.subject_token, "u-ledger",
+            "the opaque subject token (principal_id), never PII"
+        );
         assert_eq!(entry.tenant_token, "acme");
         // every driven holder is recorded with its destroyed key epoch (the §4.2 trail).
-        assert_eq!(entry.holders_erased.len(), 6, "all six driven holders recorded");
+        assert_eq!(
+            entry.holders_erased.len(),
+            6,
+            "all six driven holders recorded"
+        );
         assert!(entry.erased_holder(holder_ids::IDENTITY));
         for ke in &entry.key_epochs_destroyed {
-            assert!(ke.key_epoch_destroyed.is_some(), "each holder's destroyed key epoch is recorded");
+            assert!(
+                ke.key_epoch_destroyed.is_some(),
+                "each holder's destroyed key epoch is recorded"
+            );
         }
         // the completion offset drives re-erasure: a restore to BEFORE it re-erases this subject.
         assert_eq!(entry.completed_at_offset, 1_700_000_000);
         let post_pit = ledger.post_pit_records_after(1_699_999_999);
-        assert_eq!(post_pit.len(), 1, "a restore before the completion re-erases this subject");
+        assert_eq!(
+            post_pit.len(),
+            1,
+            "a restore before the completion re-erases this subject"
+        );
         assert_eq!(post_pit[0].subject, "u-ledger");
         // a restore AFTER the completion does not re-erase (already dead in that backup).
         assert!(ledger.post_pit_records_after(1_700_000_000).is_empty());
@@ -1065,8 +1314,14 @@ mod tests {
         // A RESUME (a worker restart re-driving the SAME id over the durable checklist) does NOT
         // duplicate the ledger entry (idempotent write).
         let driver2 = FanOutDriver::with_ledger(&dsr, &holds, &ledger);
-        driver2.drive(&id, &inventory(), &upstream, &checklist).unwrap();
-        assert_eq!(ledger.len(), 1, "a resume does NOT duplicate the ledger entry");
+        driver2
+            .drive(&id, &inventory(), &upstream, &checklist)
+            .unwrap();
+        assert_eq!(
+            ledger.len(),
+            1,
+            "a resume does NOT duplicate the ledger entry"
+        );
     }
 
     /// **A DEFERRED erase (under a legal hold) writes NO ledger entry** (the erasure did not complete,
@@ -1079,18 +1334,32 @@ mod tests {
         let kms = kms_with_all_holder_keys(&tenant, 700);
         let holders = seam_holders(&kms);
         let upstream = UpstreamHolderOrchestrator::register_m1_upstream(
-            holders.iter().map(|(id, h)| (*id, h as &dyn PersonalDataHolder)).collect(),
+            holders
+                .iter()
+                .map(|(id, h)| (*id, h as &dyn PersonalDataHolder))
+                .collect(),
         );
         let dsr = DsrOrchestrator::new(TestClock::at(0));
         let holds = LegalHoldRegistry::new();
-        holds.set(HoldScope::Subject { tenant: "acme".into(), subject: "u-held".into() }, true);
+        holds.set(
+            HoldScope::Subject {
+                tenant: "acme".into(),
+                subject: "u-held".into(),
+            },
+            true,
+        );
         let ledger = ErasureLedger::new();
         let driver = FanOutDriver::with_ledger(&dsr, &holds, &ledger);
 
         let id = submit_validated_erase(&dsr, "u-held");
-        let outcome = driver.drive(&id, &inventory(), &upstream, &EraseChecklist::new()).unwrap();
+        let outcome = driver
+            .drive(&id, &inventory(), &upstream, &EraseChecklist::new())
+            .unwrap();
         assert!(matches!(outcome, FanOutOutcome::DeferredUnderHold(_)));
-        assert!(ledger.is_empty(), "a deferred erase writes NO ledger entry (it did not complete)");
+        assert!(
+            ledger.is_empty(),
+            "a deferred erase writes NO ledger entry (it did not complete)"
+        );
     }
 
     /// The telemetry signal name + unit are pinned (the `legal_hold_active_count` SLO, contract 1.8).
@@ -1104,12 +1373,21 @@ mod tests {
     #[test]
     fn a_hold_is_reversible_set_then_clear() {
         let holds = LegalHoldRegistry::new();
-        let s = HoldScope::Subject { tenant: "acme".into(), subject: "u".into() };
+        let s = HoldScope::Subject {
+            tenant: "acme".into(),
+            subject: "u".into(),
+        };
         holds.set(s.clone(), true);
         assert_eq!(holds.active_count(), 1);
-        assert_eq!(holds.verdict(DsrKind::Erasure, &subject_scope("u")), HoldVerdict::Deferred);
+        assert_eq!(
+            holds.verdict(DsrKind::Erasure, &subject_scope("u")),
+            HoldVerdict::Deferred
+        );
         holds.set(s, false);
         assert_eq!(holds.active_count(), 0);
-        assert_eq!(holds.verdict(DsrKind::Erasure, &subject_scope("u")), HoldVerdict::Proceed);
+        assert_eq!(
+            holds.verdict(DsrKind::Erasure, &subject_scope("u")),
+            HoldVerdict::Proceed
+        );
     }
 }

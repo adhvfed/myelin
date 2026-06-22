@@ -10,8 +10,8 @@
 
 use super::*;
 use crate::router::{build_router, InboxProjection, RoutedInboxItem, SignalRouter};
-use myelin_events::{Consumer, DedupLedger, EmitContextBase, Message, OutboxStore};
 use myelin_events::{Actor, Region as BusRegion, Timestamp};
+use myelin_events::{Consumer, DedupLedger, EmitContextBase, Message, OutboxStore};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_query::signals::{DedupKey, RuleId, Severity, Signal, SignalState};
 use myelin_refs::ArtifactRef;
@@ -24,7 +24,11 @@ fn region() -> Region {
     Region("fr-par".into())
 }
 fn principal() -> Principal {
-    Principal::stub(PrincipalId("platform".into()), PrincipalKind::Service, tenant())
+    Principal::stub(
+        PrincipalId("platform".into()),
+        PrincipalKind::Service,
+        tenant(),
+    )
 }
 
 fn ctx_base() -> EmitContextBase {
@@ -82,13 +86,17 @@ fn live_signal_msg(id: &str, sig: &Signal) -> Message {
         recorded_at: Timestamp("2026-06-20T00:00:01Z".into()),
         payload: serde_json::to_value(sig).unwrap(),
     };
-    Message { subject, envelope: env }
+    Message {
+        subject,
+        envelope: env,
+    }
 }
 
 /// Build a live Signal-consumer router over a fresh inbox (the SAME `build_router` `serve` wires).
 fn live_router(outbox: &OutboxStore) -> (Consumer<SignalRouter>, InboxProjection) {
     let inbox = InboxProjection::new();
-    let consumer = build_router(&tenant(), inbox.clone(), outbox.clone(), DedupLedger::new()).unwrap();
+    let consumer =
+        build_router(&tenant(), inbox.clone(), outbox.clone(), DedupLedger::new()).unwrap();
     (consumer, inbox)
 }
 
@@ -96,9 +104,33 @@ fn live_router(outbox: &OutboxStore) -> (Consumer<SignalRouter>, InboxProjection
 /// dispatch tier's curated-Signal log, the named floor).
 fn owner_with_three_signals() -> SignalReindexSource {
     let mut src = SignalReindexSource::new();
-    src.upsert(signal("ci_run_failed", Severity::Error, "myelin://acme/ci/run/1", "run-1"), 1);
-    src.upsert(signal("ci_run_failed", Severity::Error, "myelin://acme/ci/run/2", "run-2"), 1);
-    src.upsert(signal("deploy_ok", Severity::Info, "myelin://acme/ci/run/3", "run-3"), 1);
+    src.upsert(
+        signal(
+            "ci_run_failed",
+            Severity::Error,
+            "myelin://acme/ci/run/1",
+            "run-1",
+        ),
+        1,
+    );
+    src.upsert(
+        signal(
+            "ci_run_failed",
+            Severity::Error,
+            "myelin://acme/ci/run/2",
+            "run-2",
+        ),
+        1,
+    );
+    src.upsert(
+        signal(
+            "deploy_ok",
+            Severity::Info,
+            "myelin://acme/ci/run/3",
+            "run-3",
+        ),
+        1,
+    );
     src
 }
 
@@ -121,16 +153,36 @@ fn reindex_rebuilds_the_inbox_from_the_bus_re_emit_through_the_live_router() {
     let sources: &[&dyn ReindexSource] = &[&src];
 
     let receipt = reindexer
-        .reindex(&tenant(), &notif_scope("inbox:all"), None, sources, &mut outbox, ctx_base())
+        .reindex(
+            &tenant(),
+            &notif_scope("inbox:all"),
+            None,
+            sources,
+            &mut outbox,
+            ctx_base(),
+        )
         .expect("reindex");
 
-    assert_eq!(receipt.snapshots_emitted, 3, "three curated Signals re-emitted as *.snapshot via the bus");
-    assert_eq!(receipt.signals_replayed, 3, "all three driven through the LIVE router");
-    assert_eq!(receipt.signals_deduplicated, 0, "no dedup on a cold rebuild");
+    assert_eq!(
+        receipt.snapshots_emitted, 3,
+        "three curated Signals re-emitted as *.snapshot via the bus"
+    );
+    assert_eq!(
+        receipt.signals_replayed, 3,
+        "all three driven through the LIVE router"
+    );
+    assert_eq!(
+        receipt.signals_deduplicated, 0,
+        "no dedup on a cold rebuild"
+    );
     assert_eq!(receipt.owners_replayed, vec!["notif".to_string()]);
     assert_eq!(inbox.len(), 3, "the inbox holds the three rebuilt rows");
     // The rebuild went through the router's own projection (the rebuild target).
-    assert_eq!(reindexer.inbox().len(), 3, "the reindexer rebuilds the router's OWN inbox");
+    assert_eq!(
+        reindexer.inbox().len(),
+        3,
+        "the reindexer rebuilds the router's OWN inbox"
+    );
 }
 
 // ===========================================================================================
@@ -164,14 +216,27 @@ fn notif_d3_chained_wipe_reindex_rebuilds_hash_equal_to_live() {
     let reindexer = NotifReindexer::new(&consumer);
     let mut outbox = OutboxStore::new();
     let receipt = reindexer
-        .reindex(&tenant(), &notif_scope("inbox:all"), None, &[&src], &mut outbox, ctx_base())
+        .reindex(
+            &tenant(),
+            &notif_scope("inbox:all"),
+            None,
+            &[&src],
+            &mut outbox,
+            ctx_base(),
+        )
         .expect("reindex");
-    assert_eq!(receipt.signals_replayed, 3, "the rebuild replayed three through the live router");
+    assert_eq!(
+        receipt.signals_replayed, 3,
+        "the rebuild replayed three through the live router"
+    );
 
     // PARITY: the rebuilt inbox's hash == the live inbox's (items + read-state). cold == live.
     let cold_hash = inbox_parity_hash(&inbox, &tenant());
     assert_eq!(inbox.len(), 3, "the rebuilt inbox holds three rows");
-    assert_eq!(cold_hash, live_hash, "NOTIF-D3: cold == live (reindex-parity hash identical)");
+    assert_eq!(
+        cold_hash, live_hash,
+        "NOTIF-D3: cold == live (reindex-parity hash identical)"
+    );
 }
 
 /// Iterate the owner's truth in deterministic order (a test helper — mirrors `replay` ordering).
@@ -199,7 +264,12 @@ fn src_truth_iter(src: &SignalReindexSource) -> Vec<(String, (u64, Signal))> {
 /// collapse onto the live row.
 #[test]
 fn reindex_re_ingests_through_the_same_consumer_deliver_one_code_path() {
-    let sig = signal("ci_run_failed", Severity::Error, "myelin://acme/ci/run/7", "run-7");
+    let sig = signal(
+        "ci_run_failed",
+        Severity::Error,
+        "myelin://acme/ci/run/7",
+        "run-7",
+    );
     let outbox_router = OutboxStore::new();
     let (consumer, inbox) = live_router(&outbox_router);
 
@@ -215,12 +285,26 @@ fn reindex_re_ingests_through_the_same_consumer_deliver_one_code_path() {
     let reindexer = NotifReindexer::new(&consumer);
     let mut outbox = OutboxStore::new();
     reindexer
-        .reindex(&tenant(), &notif_scope("inbox:all"), Some(0), &[&src], &mut outbox, ctx_base())
+        .reindex(
+            &tenant(),
+            &notif_scope("inbox:all"),
+            Some(0),
+            &[&src],
+            &mut outbox,
+            ctx_base(),
+        )
         .expect("reindex");
 
-    assert_eq!(inbox.len(), 1, "the reindexed snapshot collapsed onto the SAME row (one code path)");
+    assert_eq!(
+        inbox.len(),
+        1,
+        "the reindexed snapshot collapsed onto the SAME row (one code path)"
+    );
     let after_row = inbox.snapshot_for_tenant(&tenant())[0].clone();
-    assert_eq!(after_row.item_id, live_row.item_id, "same (tenant, recipient, dedup_key) → same item_id");
+    assert_eq!(
+        after_row.item_id, live_row.item_id,
+        "same (tenant, recipient, dedup_key) → same item_id"
+    );
     assert!(
         after_row.coalesce_count >= live_row.coalesce_count,
         "the reindex re-ingested through the SAME router UPSERT (collapsed, not duplicated)"
@@ -244,9 +328,19 @@ fn reindex_is_idempotent_on_the_deterministic_snapshot_event_id() {
     let sources: &[&dyn ReindexSource] = &[&src];
 
     let first = reindexer
-        .reindex(&tenant(), &notif_scope("inbox:all"), None, sources, &mut outbox, ctx_base())
+        .reindex(
+            &tenant(),
+            &notif_scope("inbox:all"),
+            None,
+            sources,
+            &mut outbox,
+            ctx_base(),
+        )
         .expect("first");
-    assert_eq!(first.snapshots_emitted, 3, "first run emits three snapshots");
+    assert_eq!(
+        first.snapshots_emitted, 3,
+        "first run emits three snapshots"
+    );
     assert_eq!(first.signals_replayed, 3);
     let hash_after_first = inbox_parity_hash(&inbox, &tenant());
 
@@ -255,14 +349,34 @@ fn reindex_is_idempotent_on_the_deterministic_snapshot_event_id() {
     // snapshot dedup marks, so it RE-APPLIES the three through the router and converges to the SAME
     // three rows (the router's (tenant, recipient, dedup_key) UPSERT keeps it idempotent in effect).
     let second = reindexer
-        .reindex(&tenant(), &notif_scope("inbox:all"), None, sources, &mut outbox, ctx_base())
+        .reindex(
+            &tenant(),
+            &notif_scope("inbox:all"),
+            None,
+            sources,
+            &mut outbox,
+            ctx_base(),
+        )
         .expect("second");
-    assert_eq!(second.snapshots_emitted, 0, "0 NEW snapshots emitted (deterministic id — bus no-op)");
-    assert_eq!(second.snapshots_skipped_duplicate, 3, "all three skipped at the bus re-emit");
+    assert_eq!(
+        second.snapshots_emitted, 0,
+        "0 NEW snapshots emitted (deterministic id — bus no-op)"
+    );
+    assert_eq!(
+        second.snapshots_skipped_duplicate, 3,
+        "all three skipped at the bus re-emit"
+    );
     // The full rebuild forgot the prior marks → it re-applies the three (not a dedup no-op), so the
     // wiped inbox is rebuilt — never left empty.
-    assert_eq!(second.signals_replayed, 3, "the full rebuild re-applies the three over the wipe");
-    assert_eq!(inbox.len(), 3, "still exactly three rows — idempotent in effect");
+    assert_eq!(
+        second.signals_replayed, 3,
+        "the full rebuild re-applies the three over the wipe"
+    );
+    assert_eq!(
+        inbox.len(),
+        3,
+        "still exactly three rows — idempotent in effect"
+    );
     assert_eq!(
         inbox_parity_hash(&inbox, &tenant()),
         hash_after_first,
@@ -277,28 +391,73 @@ fn reindex_is_idempotent_on_the_deterministic_snapshot_event_id() {
 fn incremental_backfill_does_not_wipe_the_inbox() {
     // The owner gains a new curated Signal at version 5; the inbox already holds an older row.
     let mut src = SignalReindexSource::new();
-    src.upsert(signal("old_rule", Severity::Error, "myelin://acme/ci/run/old", "old"), 1);
-    src.upsert(signal("new_rule", Severity::Error, "myelin://acme/ci/run/new", "new"), 5);
+    src.upsert(
+        signal(
+            "old_rule",
+            Severity::Error,
+            "myelin://acme/ci/run/old",
+            "old",
+        ),
+        1,
+    );
+    src.upsert(
+        signal(
+            "new_rule",
+            Severity::Error,
+            "myelin://acme/ci/run/new",
+            "new",
+        ),
+        5,
+    );
     let outbox_router = OutboxStore::new();
     let (consumer, inbox) = live_router(&outbox_router);
     let reindexer = NotifReindexer::new(&consumer);
 
     // Pre-seed the inbox with the OLD row via a full reindex of only the old Signal.
     let mut only_old = SignalReindexSource::new();
-    only_old.upsert(signal("old_rule", Severity::Error, "myelin://acme/ci/run/old", "old"), 1);
+    only_old.upsert(
+        signal(
+            "old_rule",
+            Severity::Error,
+            "myelin://acme/ci/run/old",
+            "old",
+        ),
+        1,
+    );
     let mut outbox = OutboxStore::new();
     reindexer
-        .reindex(&tenant(), &notif_scope("inbox:all"), None, &[&only_old], &mut outbox, ctx_base())
+        .reindex(
+            &tenant(),
+            &notif_scope("inbox:all"),
+            None,
+            &[&only_old],
+            &mut outbox,
+            ctx_base(),
+        )
         .expect("seed old");
     assert_eq!(inbox.len(), 1, "the old row is routed");
 
     // Incremental backfill since=1: only the version-5 Signal replays; the old row is PRESERVED.
     let mut outbox2 = OutboxStore::new();
     let job = reindexer
-        .reindex(&tenant(), &notif_scope("inbox:all"), Some(1), &[&src], &mut outbox2, ctx_base())
+        .reindex(
+            &tenant(),
+            &notif_scope("inbox:all"),
+            Some(1),
+            &[&src],
+            &mut outbox2,
+            ctx_base(),
+        )
         .expect("backfill");
-    assert_eq!(job.signals_replayed, 1, "only the new Signal replays past since=1");
-    assert_eq!(inbox.len(), 2, "the backfill APPENDED — the old row survives (no wipe)");
+    assert_eq!(
+        job.signals_replayed, 1,
+        "only the new Signal replays past since=1"
+    );
+    assert_eq!(
+        inbox.len(),
+        2,
+        "the backfill APPENDED — the old row survives (no wipe)"
+    );
 }
 
 /// **A full reindex WIPES the inbox first (the cold-rebuild precondition).** A stale row not present
@@ -310,23 +469,53 @@ fn full_reindex_wipes_stale_rows_not_in_the_owner_truth() {
     let (consumer, inbox) = live_router(&outbox_router);
 
     // A STALE live row (a curated Signal the owner has since tombstoned — not in its truth).
-    consumer.deliver(&live_signal_msg("evt-stale", &signal("stale", Severity::Error, "myelin://acme/ci/run/x", "stale-k")));
+    consumer.deliver(&live_signal_msg(
+        "evt-stale",
+        &signal(
+            "stale",
+            Severity::Error,
+            "myelin://acme/ci/run/x",
+            "stale-k",
+        ),
+    ));
     assert_eq!(inbox.len(), 1, "the stale row is in the inbox");
 
     // The owner's CURRENT truth holds a DIFFERENT Signal (the stale one is gone — erased).
     let mut src = SignalReindexSource::new();
-    src.upsert(signal("fresh", Severity::Error, "myelin://acme/ci/run/y", "fresh-k"), 1);
+    src.upsert(
+        signal(
+            "fresh",
+            Severity::Error,
+            "myelin://acme/ci/run/y",
+            "fresh-k",
+        ),
+        1,
+    );
 
     let reindexer = NotifReindexer::new(&consumer);
     let mut outbox = OutboxStore::new();
     reindexer
-        .reindex(&tenant(), &notif_scope("inbox:all"), None, &[&src], &mut outbox, ctx_base())
+        .reindex(
+            &tenant(),
+            &notif_scope("inbox:all"),
+            None,
+            &[&src],
+            &mut outbox,
+            ctx_base(),
+        )
         .expect("reindex");
 
     // The rebuilt inbox holds ONLY the fresh row — the stale one is wiped and NOT resurrected.
-    assert_eq!(inbox.len(), 1, "the rebuilt inbox holds only the owner's current truth");
+    assert_eq!(
+        inbox.len(),
+        1,
+        "the rebuilt inbox holds only the owner's current truth"
+    );
     let rows = inbox.snapshot_for_tenant(&tenant());
-    assert!(rows[0].dedup_key.contains("fresh"), "the fresh Signal's row, not the stale one");
+    assert!(
+        rows[0].dedup_key.contains("fresh"),
+        "the fresh Signal's row, not the stale one"
+    );
 }
 
 /// **The parity hash covers the read-state — a reindex that lost read-state flips it.** Two inboxes
@@ -359,7 +548,12 @@ fn parity_hash_covers_read_state_and_is_order_independent() {
 
     // snooze_until also participates (read-state truth).
     let d = InboxProjection::new();
-    d.upsert_for_test(row("u1", "k1", "unread", Some("2026-07-01T00:00:00Z".into())));
+    d.upsert_for_test(row(
+        "u1",
+        "k1",
+        "unread",
+        Some("2026-07-01T00:00:00Z".into()),
+    ));
     d.upsert_for_test(row("u2", "k2", "read", None));
     assert_ne!(
         inbox_parity_hash(&a, &tenant()),
@@ -369,7 +563,12 @@ fn parity_hash_covers_read_state_and_is_order_independent() {
 }
 
 /// A test inbox row at a known `(recipient, dedup_key)` with an explicit read-state.
-fn row(recipient: &str, dedup_key: &str, state: &str, snooze_until: Option<String>) -> RoutedInboxItem {
+fn row(
+    recipient: &str,
+    dedup_key: &str,
+    state: &str,
+    snooze_until: Option<String>,
+) -> RoutedInboxItem {
     RoutedInboxItem {
         tenant: tenant(),
         region: region(),
@@ -399,7 +598,10 @@ fn reindex_of_unknown_owner_is_a_loud_error() {
     let err = reindexer
         .reindex(&tenant(), &unknown, None, &[&src], &mut outbox, ctx_base())
         .expect_err("unknown owner");
-    assert!(matches!(err, ReindexError::Bus(_)), "an unknown owner is a loud Bus error");
+    assert!(
+        matches!(err, ReindexError::Bus(_)),
+        "an unknown owner is a loud Bus error"
+    );
 }
 
 /// **The full rebuild wipes ONLY the reindexed tenant (another tenant's live inbox is untouched).**
@@ -416,7 +618,11 @@ fn full_reindex_wipe_is_tenant_scoped() {
     let wiped = inbox.wipe_tenant(&tenant());
     assert_eq!(wiped, 1, "only acme's row is wiped");
     assert_eq!(inbox.len(), 1, "globex's row survives");
-    assert_eq!(inbox.snapshot_for_tenant(&other).len(), 1, "globex's inbox is untouched");
+    assert_eq!(
+        inbox.snapshot_for_tenant(&other).len(),
+        1,
+        "globex's inbox is untouched"
+    );
 }
 
 // ===========================================================================================
@@ -427,11 +633,23 @@ fn full_reindex_wipe_is_tenant_scoped() {
 /// floored to 1 (never a wedged inbox); an explicit per-cell window is honoured (a config swap).
 #[test]
 fn retention_window_is_the_named_90_day_floor() {
-    assert_eq!(RetentionWindow::default().days, 90, "the default item window is ~90 days");
+    assert_eq!(
+        RetentionWindow::default().days,
+        90,
+        "the default item window is ~90 days"
+    );
     assert_eq!(DEFAULT_RETENTION_DAYS, 90);
     assert_eq!(RetentionWindow::new().days, 90);
-    assert_eq!(RetentionWindow::of_days(30).days, 30, "an explicit per-cell window is honoured");
-    assert_eq!(RetentionWindow::of_days(0).days, 1, "a 0-day window is floored to 1 (never wedged)");
+    assert_eq!(
+        RetentionWindow::of_days(30).days,
+        30,
+        "an explicit per-cell window is honoured"
+    );
+    assert_eq!(
+        RetentionWindow::of_days(0).days,
+        1,
+        "a 0-day window is floored to 1 (never wedged)"
+    );
 }
 
 /// **A snapshot draft carries the curated Signal on the `sig.<tenant>.*` subject the router
@@ -439,17 +657,31 @@ fn retention_window_is_the_named_90_day_floor() {
 /// deterministic id, with the live router's aggregate key.
 #[test]
 fn signal_snapshot_draft_carries_the_signal_on_the_whitelisted_subject() {
-    let sig = signal("ci_run_failed", Severity::Error, "myelin://acme/ci/run/42", "run-42");
+    let sig = signal(
+        "ci_run_failed",
+        Severity::Error,
+        "myelin://acme/ci/run/42",
+        "run-42",
+    );
     let draft = signal_snapshot_draft(&sig, 3);
     assert_eq!(draft.type_.0, "notif.signal.snapshot");
-    assert_eq!(draft.aggregate.0, "signal:run-42", "the router's per-Signal aggregate key");
+    assert_eq!(
+        draft.aggregate.0, "signal:run-42",
+        "the router's per-Signal aggregate key"
+    );
     assert_eq!(draft.version, 3);
-    assert_eq!(draft.subject.0, "sig.acme.error.ci_run_failed", "the `sig.<tenant>.*` whitelist subject");
+    assert_eq!(
+        draft.subject.0, "sig.acme.error.ci_run_failed",
+        "the `sig.<tenant>.*` whitelist subject"
+    );
     // The payload round-trips to the SAME curated Signal (cold == live).
     let back: Signal = serde_json::from_value(draft.payload.clone()).unwrap();
     assert_eq!(back.dedup_key.0, "run-42");
     // The deterministic id is stable on (aggregate, version).
-    assert_eq!(draft.event_id(), myelin_events::snapshot_event_id(&draft.aggregate, 3));
+    assert_eq!(
+        draft.event_id(),
+        myelin_events::snapshot_event_id(&draft.aggregate, 3)
+    );
 }
 
 /// **`notif_scope` pins the `notif` owner token; `NOTIF_OWNER_TOKEN`/`NOTIF_SNAPSHOT_TYPE` are
@@ -468,12 +700,21 @@ fn notif_scope_and_tokens_are_frozen() {
 #[test]
 fn signal_source_replays_deterministically_and_honours_since() {
     let mut src = SignalReindexSource::new();
-    src.upsert(signal("r1", Severity::Error, "myelin://acme/ci/run/1", "k1"), 1);
-    src.upsert(signal("r2", Severity::Error, "myelin://acme/ci/run/2", "k2"), 5);
+    src.upsert(
+        signal("r1", Severity::Error, "myelin://acme/ci/run/1", "k1"),
+        1,
+    );
+    src.upsert(
+        signal("r2", Severity::Error, "myelin://acme/ci/run/2", "k2"),
+        5,
+    );
     assert_eq!(src.len(), 2);
     assert!(!src.is_empty());
     // A truly empty source is empty (pins `is_empty` is not a constant).
-    assert!(SignalReindexSource::new().is_empty(), "a fresh source is empty");
+    assert!(
+        SignalReindexSource::new().is_empty(),
+        "a fresh source is empty"
+    );
 
     let all = src.replay(&notif_scope("inbox:all"), None);
     assert_eq!(all.len(), 2, "a full replay yields both");
@@ -482,15 +723,27 @@ fn signal_source_replays_deterministically_and_honours_since() {
     assert_eq!(all[1].aggregate.0, "signal:k2");
 
     let since = src.replay(&notif_scope("inbox:all"), Some(3));
-    assert_eq!(since.len(), 1, "only the version-5 Signal replays past since=3");
+    assert_eq!(
+        since.len(),
+        1,
+        "only the version-5 Signal replays past since=3"
+    );
     assert_eq!(since[0].aggregate.0, "signal:k2");
 
     // EXACT boundary: a Signal AT the cursor version is EXCLUDED (`> since`, not `>= since`). With
     // since=5, the version-5 Signal must NOT replay (it is at, not above, the cursor).
     let at_boundary = src.replay(&notif_scope("inbox:all"), Some(5));
-    assert_eq!(at_boundary.len(), 0, "a Signal AT the cursor is excluded (strict >, not >=)");
+    assert_eq!(
+        at_boundary.len(),
+        0,
+        "a Signal AT the cursor is excluded (strict >, not >=)"
+    );
     // since=4 includes the version-5 Signal (it IS above the cursor).
-    assert_eq!(src.replay(&notif_scope("inbox:all"), Some(4)).len(), 1, "version 5 > since 4 replays");
+    assert_eq!(
+        src.replay(&notif_scope("inbox:all"), Some(4)).len(),
+        1,
+        "version 5 > since 4 replays"
+    );
 }
 
 /// **An INCREMENTAL reindex (no wipe) of an already-applied snapshot is DEDUPLICATED by the live
@@ -499,7 +752,12 @@ fn signal_source_replays_deterministically_and_honours_since() {
 /// redelivered snapshot above the cursor is a no-op (no resurrection). Pins the dedup-counting arm.
 #[test]
 fn incremental_reindex_deduplicates_an_already_applied_snapshot() {
-    let sig = signal("ci_run_failed", Severity::Error, "myelin://acme/ci/run/1", "k1");
+    let sig = signal(
+        "ci_run_failed",
+        Severity::Error,
+        "myelin://acme/ci/run/1",
+        "k1",
+    );
     let outbox_router = OutboxStore::new();
     let (consumer, inbox) = live_router(&outbox_router);
 
@@ -510,20 +768,50 @@ fn incremental_reindex_deduplicates_an_already_applied_snapshot() {
 
     // First incremental reindex (since=Some(0), no wipe): the snapshot applies — replayed, not deduped.
     let first = reindexer
-        .reindex(&tenant(), &notif_scope("inbox:all"), Some(0), &[&src], &mut outbox, ctx_base())
+        .reindex(
+            &tenant(),
+            &notif_scope("inbox:all"),
+            Some(0),
+            &[&src],
+            &mut outbox,
+            ctx_base(),
+        )
         .expect("first");
-    assert_eq!(first.signals_replayed, 1, "the first incremental applies the snapshot");
-    assert_eq!(first.signals_deduplicated, 0, "nothing to dedup on the first pass");
+    assert_eq!(
+        first.signals_replayed, 1,
+        "the first incremental applies the snapshot"
+    );
+    assert_eq!(
+        first.signals_deduplicated, 0,
+        "nothing to dedup on the first pass"
+    );
     assert_eq!(inbox.len(), 1);
 
     // A SECOND incremental reindex of the SAME snapshot (no wipe): the consumer_dedup ledger makes it
     // a no-op — counted as deduplicated, NOT replayed (the row is not double-applied).
     let second = reindexer
-        .reindex(&tenant(), &notif_scope("inbox:all"), Some(0), &[&src], &mut outbox, ctx_base())
+        .reindex(
+            &tenant(),
+            &notif_scope("inbox:all"),
+            Some(0),
+            &[&src],
+            &mut outbox,
+            ctx_base(),
+        )
         .expect("second");
-    assert_eq!(second.signals_deduplicated, 1, "the redelivered snapshot is deduplicated (no-op)");
-    assert_eq!(second.signals_replayed, 0, "it is NOT re-applied (the dedup arm caught it)");
-    assert_eq!(inbox.len(), 1, "still exactly one row — no resurrection/duplication");
+    assert_eq!(
+        second.signals_deduplicated, 1,
+        "the redelivered snapshot is deduplicated (no-op)"
+    );
+    assert_eq!(
+        second.signals_replayed, 0,
+        "it is NOT re-applied (the dedup arm caught it)"
+    );
+    assert_eq!(
+        inbox.len(),
+        1,
+        "still exactly one row — no resurrection/duplication"
+    );
 }
 
 /// **The `ReindexError::Display` renders distinct, informative messages** (the LOUD-error artifact —
@@ -532,8 +820,18 @@ fn incremental_reindex_deduplicates_an_already_applied_snapshot() {
 fn reindex_error_display_is_informative() {
     let bus = ReindexError::Bus("no owner".into());
     let missing = ReindexError::MissingSnapshot("snap-abc".into());
-    assert!(format!("{bus}").contains("bus re-emit failed"), "the Bus error names the bus failure");
-    assert!(format!("{missing}").contains("snap-abc"), "the MissingSnapshot error names the id");
-    assert_ne!(format!("{bus}"), format!("{missing}"), "distinct variants render distinctly");
+    assert!(
+        format!("{bus}").contains("bus re-emit failed"),
+        "the Bus error names the bus failure"
+    );
+    assert!(
+        format!("{missing}").contains("snap-abc"),
+        "the MissingSnapshot error names the id"
+    );
+    assert_ne!(
+        format!("{bus}"),
+        format!("{missing}"),
+        "distinct variants render distinctly"
+    );
     assert!(!format!("{bus}").is_empty(), "the Display is not empty");
 }

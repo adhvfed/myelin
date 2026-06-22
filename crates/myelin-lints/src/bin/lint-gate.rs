@@ -159,7 +159,11 @@ fn main() -> ExitCode {
         .filter(|a| !a.starts_with("--"))
         .map(PathBuf::from)
         .collect();
-    let roots = if roots.is_empty() { default_roots() } else { roots };
+    let roots = if roots.is_empty() {
+        default_roots()
+    } else {
+        roots
+    };
 
     let lints = all_twelve();
     let mut violations = Vec::new();

@@ -206,9 +206,19 @@ fn long_park_dispatches_and_parks_holding_no_runtime() {
     .expect("a compute tool builds a long-park job")
     .expect("dispatch + park");
 
-    assert!(out.is_parked(), "the long-park returns Parked (the worker is freed): {out:?}");
-    assert!(ctx.parked_on_signal(), "the run is waiting on job.done (holds NO runtime)");
-    assert_eq!(runner.calls.load(Ordering::SeqCst), 1, "dispatched exactly once");
+    assert!(
+        out.is_parked(),
+        "the long-park returns Parked (the worker is freed): {out:?}"
+    );
+    assert!(
+        ctx.parked_on_signal(),
+        "the run is waiting on job.done (holds NO runtime)"
+    );
+    assert_eq!(
+        runner.calls.load(Ordering::SeqCst),
+        1,
+        "dispatched exactly once"
+    );
 
     // PRODUCER + CONSUMER agree on the deterministic dedup key WITHOUT coordination: the token the
     // runner RECORDED equals the one the workflow keyed its wait on (derived from run_id+command_id).
@@ -248,7 +258,11 @@ fn a_doubly_delivered_job_done_wakes_the_long_parked_run_exactly_once() {
             consumed_seq: None,
         });
     }
-    assert_eq!(signals.buffered_depth(), 1, "the double delivery deduped to ONE buffered row (9.4 PK)");
+    assert_eq!(
+        signals.buffered_depth(),
+        1,
+        "the double delivery deduped to ONE buffered row (9.4 PK)"
+    );
 
     let mut ctx = begin(&outbox, journal, signals.clone());
     let out = dispatch_long_compute(
@@ -264,12 +278,29 @@ fn a_doubly_delivered_job_done_wakes_the_long_parked_run_exactly_once() {
     .expect("dispatch + complete");
 
     match out {
-        myelin_agent_service::LongParkOutcome::Completed { idem_token, result: got } => {
-            assert_eq!(idem_token, token, "the runner echoed the dispatch token (the dedup agreement held)");
-            assert_eq!(got, result, "the references-not-payloads result threads back");
+        myelin_agent_service::LongParkOutcome::Completed {
+            idem_token,
+            result: got,
+        } => {
+            assert_eq!(
+                idem_token, token,
+                "the runner echoed the dispatch token (the dedup agreement held)"
+            );
+            assert_eq!(
+                got, result,
+                "the references-not-payloads result threads back"
+            );
         }
         other => panic!("expected Completed, got {other:?}"),
     }
-    assert_eq!(ctx.consumed_signals().len(), 1, "EXACTLY ONE wake per job (the double delivery deduped)");
-    assert_eq!(signals.buffered_depth(), 0, "the one buffered row is consumed once");
+    assert_eq!(
+        ctx.consumed_signals().len(),
+        1,
+        "EXACTLY ONE wake per job (the double delivery deduped)"
+    );
+    assert_eq!(
+        signals.buffered_depth(),
+        0,
+        "the one buffered row is consumed once"
+    );
 }

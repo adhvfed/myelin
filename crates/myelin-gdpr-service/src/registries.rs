@@ -310,12 +310,12 @@ impl ConsentRegistry {
         // Propagate: a controller-posture consent-only activity has no lawful ground to retain the
         // data once consent is withdrawn — trigger deletion over the subject scope (§5.2).
         match basis {
-            WithdrawalBasis::ControllerConsentOnly => WithdrawalEffect::StoppedAndTriggersDeletion(
-                EraseScope::Subject {
+            WithdrawalBasis::ControllerConsentOnly => {
+                WithdrawalEffect::StoppedAndTriggersDeletion(EraseScope::Subject {
                     subject: subject.clone(),
                     tenant: tenant.clone(),
-                },
-            ),
+                })
+            }
             WithdrawalBasis::HasOtherLawfulBasis => WithdrawalEffect::StoppedOnly,
         }
     }
@@ -448,7 +448,10 @@ impl SubProcessorRegistry {
             return false;
         }
         entry.objections.push(token);
-        *self.objection_count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        *self
+            .objection_count
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) += 1;
         true
     }
 
@@ -473,7 +476,10 @@ impl SubProcessorRegistry {
 
     /// The count of recorded objections (the [`SUBPROCESSOR_OBJECTIONS`] telemetry value).
     pub fn objection_count(&self) -> u64 {
-        *self.objection_count.lock().unwrap_or_else(|e| e.into_inner())
+        *self
+            .objection_count
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -568,7 +574,10 @@ impl TransferGate {
         if has_mechanism {
             TransferVerdict::Allowed
         } else {
-            *self.extra_eu_denials.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+            *self
+                .extra_eu_denials
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) += 1;
             TransferVerdict::Denied
         }
     }
@@ -576,7 +585,10 @@ impl TransferGate {
     /// The count of extra-EU transfers DENIED by default (the [`TRANSFER_GATE_EXTRA_EU_DENIALS`]
     /// telemetry value — the P-GA-23 green artifact: extra-EU transfers do not slip through).
     pub fn extra_eu_denial_count(&self) -> u64 {
-        *self.extra_eu_denials.lock().unwrap_or_else(|e| e.into_inner())
+        *self
+            .extra_eu_denials
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -602,16 +614,40 @@ mod tests {
     /// **`is_eea_region` admits within-EU/EEA areas and denies extra-EU (fail-closed on unknown).**
     #[test]
     fn is_eea_region_admits_eu_eea_denies_extra_eu_and_unknown() {
-        assert!(is_eea_region(&Region::new("fr-par")), "fr (France) is in the EU");
-        assert!(is_eea_region(&Region::new("nl-ams")), "nl (Netherlands) is in the EU");
-        assert!(is_eea_region(&Region::new("de-fra")), "de (Germany) is in the EU");
-        assert!(is_eea_region(&Region::new("no-osl")), "no (Norway) is EEA-EFTA");
-        assert!(is_eea_region(&Region::new("is-rey")), "is (Iceland) is EEA-EFTA");
+        assert!(
+            is_eea_region(&Region::new("fr-par")),
+            "fr (France) is in the EU"
+        );
+        assert!(
+            is_eea_region(&Region::new("nl-ams")),
+            "nl (Netherlands) is in the EU"
+        );
+        assert!(
+            is_eea_region(&Region::new("de-fra")),
+            "de (Germany) is in the EU"
+        );
+        assert!(
+            is_eea_region(&Region::new("no-osl")),
+            "no (Norway) is EEA-EFTA"
+        );
+        assert!(
+            is_eea_region(&Region::new("is-rey")),
+            "is (Iceland) is EEA-EFTA"
+        );
         assert!(!is_eea_region(&Region::new("us-east")), "us is extra-EU");
-        assert!(!is_eea_region(&Region::new("uk-lon")), "uk (post-Brexit) is extra-EU");
-        assert!(!is_eea_region(&Region::new("xx-nowhere")), "an unknown area is extra-EU (fail-closed)");
+        assert!(
+            !is_eea_region(&Region::new("uk-lon")),
+            "uk (post-Brexit) is extra-EU"
+        );
+        assert!(
+            !is_eea_region(&Region::new("xx-nowhere")),
+            "an unknown area is extra-EU (fail-closed)"
+        );
         // case-insensitive on the area prefix.
-        assert!(is_eea_region(&Region::new("FR-PAR")), "the area match is case-insensitive");
+        assert!(
+            is_eea_region(&Region::new("FR-PAR")),
+            "the area match is case-insensitive"
+        );
     }
 
     // ───────────── the transfer_allowed gate (deny extra-EU by default) ─────────────
@@ -622,14 +658,30 @@ mod tests {
     fn transfer_allowed_denies_extra_eu_by_default_admits_within_eu() {
         let gate = TransferGate::new();
         // within-EU — allowed structurally (no boundary crossed; the §5.3 within-EU clone).
-        assert_eq!(gate.transfer_allowed(&Region::new("fr-par")), TransferVerdict::Allowed);
-        assert_eq!(gate.transfer_allowed(&Region::new("nl-ams")), TransferVerdict::Allowed);
+        assert_eq!(
+            gate.transfer_allowed(&Region::new("fr-par")),
+            TransferVerdict::Allowed
+        );
+        assert_eq!(
+            gate.transfer_allowed(&Region::new("nl-ams")),
+            TransferVerdict::Allowed
+        );
         assert!(gate.transfer_allowed(&Region::new("de-fra")).is_allowed());
         // extra-EU — DENIED by default (no recorded mechanism). The deny-by-default posture.
-        assert_eq!(gate.transfer_allowed(&Region::new("us-east")), TransferVerdict::Denied);
-        assert_eq!(gate.transfer_allowed(&Region::new("ap-tokyo")), TransferVerdict::Denied);
+        assert_eq!(
+            gate.transfer_allowed(&Region::new("us-east")),
+            TransferVerdict::Denied
+        );
+        assert_eq!(
+            gate.transfer_allowed(&Region::new("ap-tokyo")),
+            TransferVerdict::Denied
+        );
         // the green artifact: extra-EU denials counted (2 above), within-EU allowed (not counted).
-        assert_eq!(gate.extra_eu_denial_count(), 2, "0 default extra-EU transfers slipped through");
+        assert_eq!(
+            gate.extra_eu_denial_count(),
+            2,
+            "0 default extra-EU transfers slipped through"
+        );
     }
 
     /// **An extra-EU target WITH a recorded valid transfer mechanism is ALLOWED** (the deny-by-default
@@ -639,12 +691,21 @@ mod tests {
     fn an_extra_eu_target_with_a_recorded_mechanism_is_allowed() {
         let gate = TransferGate::new();
         // before recording — denied.
-        assert_eq!(gate.transfer_allowed(&Region::new("us-east")), TransferVerdict::Denied);
+        assert_eq!(
+            gate.transfer_allowed(&Region::new("us-east")),
+            TransferVerdict::Denied
+        );
         // record a valid transfer mechanism for us-east — now allowed.
         gate.record_transfer_mechanism(Region::new("us-east"));
-        assert_eq!(gate.transfer_allowed(&Region::new("us-east")), TransferVerdict::Allowed);
+        assert_eq!(
+            gate.transfer_allowed(&Region::new("us-east")),
+            TransferVerdict::Allowed
+        );
         // a DIFFERENT extra-EU target (no mechanism) is still denied — the mechanism is per-target.
-        assert_eq!(gate.transfer_allowed(&Region::new("ap-tokyo")), TransferVerdict::Denied);
+        assert_eq!(
+            gate.transfer_allowed(&Region::new("ap-tokyo")),
+            TransferVerdict::Denied
+        );
     }
 
     // ───────────── the consent registry (withdrawal propagates) ─────────────
@@ -659,7 +720,10 @@ mod tests {
         let tenant = t("acme");
         let v = reg.record(&s, &tenant, "marketing-emails", 1000);
         assert_eq!(v, 1, "first consent is version 1");
-        assert!(reg.in_force(&s, &tenant, "marketing-emails"), "consent is in force");
+        assert!(
+            reg.in_force(&s, &tenant, "marketing-emails"),
+            "consent is in force"
+        );
 
         // withdraw a controller-posture, consent-ONLY activity — the path stops AND deletion fires.
         let effect = reg.withdraw(
@@ -669,23 +733,49 @@ mod tests {
             WithdrawalBasis::ControllerConsentOnly,
             2000,
         );
-        assert!(effect.triggers_deletion(), "controller consent-only ⇒ may-trigger-deletion fired");
+        assert!(
+            effect.triggers_deletion(),
+            "controller consent-only ⇒ may-trigger-deletion fired"
+        );
         match effect {
-            WithdrawalEffect::StoppedAndTriggersDeletion(EraseScope::Subject { subject, tenant: tn }) => {
-                assert_eq!(subject.principal.principal_id.0, "u-1", "the erase scope is the subject");
+            WithdrawalEffect::StoppedAndTriggersDeletion(EraseScope::Subject {
+                subject,
+                tenant: tn,
+            }) => {
+                assert_eq!(
+                    subject.principal.principal_id.0, "u-1",
+                    "the erase scope is the subject"
+                );
                 assert_eq!(tn.0, "acme");
             }
             other => panic!("expected StoppedAndTriggersDeletion(Subject), got {other:?}"),
         }
         // the path is STOPPED (consent no longer in force).
-        assert!(!reg.in_force(&s, &tenant, "marketing-emails"), "the consent-path is stopped");
-        assert_eq!(reg.withdrawal_count(), 1, "the withdrawal is observable (telemetry)");
+        assert!(
+            !reg.in_force(&s, &tenant, "marketing-emails"),
+            "the consent-path is stopped"
+        );
+        assert_eq!(
+            reg.withdrawal_count(),
+            1,
+            "the withdrawal is observable (telemetry)"
+        );
 
         // a SECOND withdrawal bumps the count to 2 (the count is a running total, not a constant —
         // this pins the accessor against a `-> 1` mutant).
         reg.record(&s, &tenant, "analytics", 3000);
-        reg.withdraw(&s, &tenant, "analytics", WithdrawalBasis::HasOtherLawfulBasis, 4000);
-        assert_eq!(reg.withdrawal_count(), 2, "the second withdrawal bumps the running total");
+        reg.withdraw(
+            &s,
+            &tenant,
+            "analytics",
+            WithdrawalBasis::HasOtherLawfulBasis,
+            4000,
+        );
+        assert_eq!(
+            reg.withdrawal_count(),
+            2,
+            "the second withdrawal bumps the running total"
+        );
     }
 
     /// **A withdrawal of an activity with ANOTHER lawful basis STOPS the path but does NOT trigger
@@ -704,9 +794,16 @@ mod tests {
             WithdrawalBasis::HasOtherLawfulBasis,
             2000,
         );
-        assert_eq!(effect, WithdrawalEffect::StoppedOnly, "another basis ⇒ stop only, no deletion");
+        assert_eq!(
+            effect,
+            WithdrawalEffect::StoppedOnly,
+            "another basis ⇒ stop only, no deletion"
+        );
         assert!(!effect.triggers_deletion());
-        assert!(!reg.in_force(&s, &tenant, "service-telemetry"), "the path is still stopped");
+        assert!(
+            !reg.in_force(&s, &tenant, "service-telemetry"),
+            "the path is still stopped"
+        );
     }
 
     /// **Consent is versioned + the history retained** (§5.2 — *which version was in force when*). A
@@ -718,7 +815,11 @@ mod tests {
         let s = subject("u-3");
         let tenant = t("acme");
         assert_eq!(reg.record(&s, &tenant, "a", 1000), 1);
-        assert_eq!(reg.record(&s, &tenant, "a", 2000), 2, "re-record bumps the monotone version");
+        assert_eq!(
+            reg.record(&s, &tenant, "a", 2000),
+            2,
+            "re-record bumps the monotone version"
+        );
         reg.withdraw(&s, &tenant, "a", WithdrawalBasis::HasOtherLawfulBasis, 3000);
 
         // Records for a DIFFERENT activity, a DIFFERENT subject, and a DIFFERENT tenant — the
@@ -755,9 +856,18 @@ mod tests {
         let tenant = t("acme");
         reg.record(&s, &tenant, "emails", 1000);
         reg.record(&s, &tenant, "analytics", 1000);
-        reg.withdraw(&s, &tenant, "emails", WithdrawalBasis::HasOtherLawfulBasis, 2000);
+        reg.withdraw(
+            &s,
+            &tenant,
+            "emails",
+            WithdrawalBasis::HasOtherLawfulBasis,
+            2000,
+        );
         assert!(!reg.in_force(&s, &tenant, "emails"), "emails withdrawn");
-        assert!(reg.in_force(&s, &tenant, "analytics"), "analytics still in force (granular)");
+        assert!(
+            reg.in_force(&s, &tenant, "analytics"),
+            "analytics still in force (granular)"
+        );
     }
 
     // ───────────── the sub-processor registry (versioned + region + DPA ref + objection) ─────────────
@@ -778,20 +888,48 @@ mod tests {
         assert_eq!(v2, 2, "re-register bumps the monotone version");
 
         // the objection workflow: a tenant objects; it is recorded + surfaced + counted.
-        assert_eq!(reg.objection_count(), 0, "no objections yet (count starts at 0)");
-        assert!(reg.object(&t("acme"), "eu-llm-adapter"), "the objection is newly recorded");
-        assert!(!reg.object(&t("acme"), "eu-llm-adapter"), "a duplicate objection is not double-recorded");
+        assert_eq!(
+            reg.objection_count(),
+            0,
+            "no objections yet (count starts at 0)"
+        );
+        assert!(
+            reg.object(&t("acme"), "eu-llm-adapter"),
+            "the objection is newly recorded"
+        );
+        assert!(
+            !reg.object(&t("acme"), "eu-llm-adapter"),
+            "a duplicate objection is not double-recorded"
+        );
         let entry = reg.get("eu-llm-adapter").expect("registered");
-        assert_eq!(entry.objections, vec!["acme".to_string()], "the objection is surfaced on the entry");
-        assert_eq!(reg.objection_count(), 1, "the objection is observable (telemetry)");
+        assert_eq!(
+            entry.objections,
+            vec!["acme".to_string()],
+            "the objection is surfaced on the entry"
+        );
+        assert_eq!(
+            reg.objection_count(),
+            1,
+            "the objection is observable (telemetry)"
+        );
 
         // a DIFFERENT tenant objecting bumps the count to 2 (a running total, not a constant — this
         // pins the accessor against a `-> 1` mutant).
-        assert!(reg.object(&t("globex"), "eu-llm-adapter"), "a second tenant's objection is recorded");
-        assert_eq!(reg.objection_count(), 2, "the second objection bumps the running total");
+        assert!(
+            reg.object(&t("globex"), "eu-llm-adapter"),
+            "a second tenant's objection is recorded"
+        );
+        assert_eq!(
+            reg.objection_count(),
+            2,
+            "the second objection bumps the running total"
+        );
 
         // an objection to an unregistered sub-processor is a no-op (returns false).
-        assert!(!reg.object(&t("acme"), "ghost-adapter"), "no entry to object to");
+        assert!(
+            !reg.object(&t("acme"), "ghost-adapter"),
+            "no entry to object to"
+        );
     }
 
     /// **A re-register PRESERVES a standing objection** (a region/DPA change does not clear a
@@ -804,7 +942,11 @@ mod tests {
         reg.register("x", Region::new("fr-par"), "DPA-2"); // moved in-EU.
         let entry = reg.get("x").expect("registered");
         assert_eq!(entry.version, 2);
-        assert_eq!(entry.objections, vec!["acme".to_string()], "the objection survives the re-version");
+        assert_eq!(
+            entry.objections,
+            vec!["acme".to_string()],
+            "the objection survives the re-version"
+        );
     }
 
     /// **The registry lists every entry (the §5.2 versioned list).**
@@ -823,7 +965,10 @@ mod tests {
 
     #[test]
     fn telemetry_signal_names_and_units_are_anchored() {
-        assert_eq!(TRANSFER_GATE_EXTRA_EU_DENIALS.0, "gdpr.transfer_gate_extra_eu_denials");
+        assert_eq!(
+            TRANSFER_GATE_EXTRA_EU_DENIALS.0,
+            "gdpr.transfer_gate_extra_eu_denials"
+        );
         assert_eq!(TRANSFER_GATE_EXTRA_EU_DENIALS.1, "count");
         assert_eq!(CONSENT_WITHDRAWALS.0, "gdpr.consent_withdrawals");
         assert_eq!(CONSENT_WITHDRAWALS.1, "count");

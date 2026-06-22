@@ -262,8 +262,15 @@ mod tests {
     /// All four tiers exist, in tier order, with the frozen wire tokens.
     #[test]
     fn isolation_tier_contract_enumerates_logical_schema_db_cell() {
-        let tokens: Vec<&str> = IsolationTier::ALL.iter().map(|t| t.as_contract_token()).collect();
-        assert_eq!(tokens, ["logical", "schema", "db", "cell"], "the frozen 12.5 tier set");
+        let tokens: Vec<&str> = IsolationTier::ALL
+            .iter()
+            .map(|t| t.as_contract_token())
+            .collect();
+        assert_eq!(
+            tokens,
+            ["logical", "schema", "db", "cell"],
+            "the frozen 12.5 tier set"
+        );
         // The set is exactly four (a fifth tier would change the frozen contract — caught here).
         assert_eq!(IsolationTier::ALL.len(), 4);
     }
@@ -272,11 +279,21 @@ mod tests {
     /// logical tier is the only v1-provisioned tier; every higher tier is on-demand (the named floor).
     #[test]
     fn pool_logical_is_the_v1_floor_others_on_demand() {
-        assert!(IsolationTier::Logical.is_v1_floor(), "Pool/logical is the v1 floor");
+        assert!(
+            IsolationTier::Logical.is_v1_floor(),
+            "Pool/logical is the v1 floor"
+        );
         assert!(!IsolationTier::Logical.is_declared_on_demand());
-        for higher in [IsolationTier::Schema, IsolationTier::Db, IsolationTier::Cell] {
+        for higher in [
+            IsolationTier::Schema,
+            IsolationTier::Db,
+            IsolationTier::Cell,
+        ] {
             assert!(!higher.is_v1_floor(), "{higher:?} is NOT the v1 floor");
-            assert!(higher.is_declared_on_demand(), "{higher:?} is declared-on-demand (the floor)");
+            assert!(
+                higher.is_declared_on_demand(),
+                "{higher:?} is declared-on-demand (the floor)"
+            );
         }
     }
 
@@ -284,9 +301,18 @@ mod tests {
     /// resolves to the logical floor; Bridge → db; Dedicated → cell — the three §7.1 classes map 1:1.
     #[test]
     fn resolve_maps_requested_cell_class_to_a_tier() {
-        assert_eq!(IsolationTier::resolve(IsolationKind::Pool), IsolationTier::Logical);
-        assert_eq!(IsolationTier::resolve(IsolationKind::Bridge), IsolationTier::Db);
-        assert_eq!(IsolationTier::resolve(IsolationKind::Dedicated), IsolationTier::Cell);
+        assert_eq!(
+            IsolationTier::resolve(IsolationKind::Pool),
+            IsolationTier::Logical
+        );
+        assert_eq!(
+            IsolationTier::resolve(IsolationKind::Bridge),
+            IsolationTier::Db
+        );
+        assert_eq!(
+            IsolationTier::resolve(IsolationKind::Dedicated),
+            IsolationTier::Cell
+        );
         // for_cell_class is the same mapping (resolve is its `place`-facing alias).
         assert_eq!(
             IsolationTier::for_cell_class(IsolationKind::Pool),
@@ -327,14 +353,30 @@ mod tests {
         assert!(store.tier().is_v1_floor());
 
         // The RLS predicate filters on the partition-key tenant; the region pin holds on its region.
-        assert_eq!(store.rls_tenant(), &tenant(), "the RLS predicate filters on the partition tenant");
-        assert_eq!(store.pinned_region(), &region(), "the residency pin holds on the partition region");
+        assert_eq!(
+            store.rls_tenant(),
+            &tenant(),
+            "the RLS predicate filters on the partition tenant"
+        );
+        assert_eq!(
+            store.pinned_region(),
+            &region(),
+            "the residency pin holds on the partition region"
+        );
 
         // The Pool-tier key is byte-identical to the key Bridge/Dedicated would carry (tier-invariant).
         let bridge_key = partition_key(tenant(), region(), IsolationTier::Db);
         let dedicated_key = partition_key(tenant(), region(), IsolationTier::Cell);
-        assert_eq!(store.partition(), &bridge_key, "Pool key == Bridge key (the partition is tier-invariant)");
-        assert_eq!(store.partition(), &dedicated_key, "Pool key == Dedicated key (the partition is tier-invariant)");
+        assert_eq!(
+            store.partition(),
+            &bridge_key,
+            "Pool key == Bridge key (the partition is tier-invariant)"
+        );
+        assert_eq!(
+            store.partition(),
+            &dedicated_key,
+            "Pool key == Dedicated key (the partition is tier-invariant)"
+        );
     }
 
     /// **CDC pair for 12.5 (provider + consumer).** The PROVIDER is this module's isolation-tier
@@ -361,7 +403,9 @@ mod tests {
             /// Open against the partition key the contract hands it at a given tier — the consumer
             /// takes the key, never the tier (the key is tier-invariant).
             fn open_at(tenant: TenantId, region: Region, tier: IsolationTier) -> SharedSystemStore {
-                SharedSystemStore { partition: partition_key(tenant, region, tier) }
+                SharedSystemStore {
+                    partition: partition_key(tenant, region, tier),
+                }
             }
             /// The RLS tenant the store filters every read by (the partition tenant — tier-invariant).
             fn rls_tenant(&self) -> &TenantId {
@@ -375,15 +419,24 @@ mod tests {
 
         // CONSUMER: a shared system opens its store at the Pool tier with the SAME partition key.
         let consumer_pool = SharedSystemStore::open_at(tenant(), region(), IsolationTier::Logical);
-        assert_eq!(consumer_pool.partition, *pool.partition(), "consumer keys on the same partition");
-        assert_eq!(consumer_pool.rls_tenant(), pool.rls_tenant(), "same RLS tenant binder");
+        assert_eq!(
+            consumer_pool.partition,
+            *pool.partition(),
+            "consumer keys on the same partition"
+        );
+        assert_eq!(
+            consumer_pool.rls_tenant(),
+            pool.rls_tenant(),
+            "same RLS tenant binder"
+        );
 
         // PROMOTION: the tenant is later promoted to Bridge then Dedicated (a PROVISIONING change).
         // The consumer's partition key is byte-identical — the shard key did not move (§4.1).
         for higher in [IsolationTier::Db, IsolationTier::Cell] {
             let promoted = SharedSystemStore::open_at(tenant(), region(), higher);
             assert_eq!(
-                promoted.partition, consumer_pool.partition,
+                promoted.partition,
+                consumer_pool.partition,
                 "promoting the tenant to the `{}` tier MUST NOT move the partition key — it is a \
                  provisioning change, not a code change (§4.1)",
                 higher.as_contract_token()
@@ -402,6 +455,9 @@ mod tests {
         assert_eq!(tier, IsolationTier::Cell);
         assert_eq!(tier.as_contract_token(), "cell");
         // The Pool cell class maps to the logical floor (NOT a `Pool` tier — there is none).
-        assert_eq!(IsolationTier::for_cell_class(IsolationKind::Pool), IsolationTier::Logical);
+        assert_eq!(
+            IsolationTier::for_cell_class(IsolationKind::Pool),
+            IsolationTier::Logical
+        );
     }
 }

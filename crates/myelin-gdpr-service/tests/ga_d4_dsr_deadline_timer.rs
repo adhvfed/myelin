@@ -55,11 +55,18 @@ fn tenant() -> TenantId {
 }
 
 fn subject(id: &str) -> SubjectRef {
-    SubjectRef::new(Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant()))
+    SubjectRef::new(Principal::stub(
+        PrincipalId(id.into()),
+        PrincipalKind::Human,
+        tenant(),
+    ))
 }
 
 fn subject_scope(s: &str) -> EraseScope {
-    EraseScope::Subject { subject: subject(s), tenant: tenant() }
+    EraseScope::Subject {
+        subject: subject(s),
+        tenant: tenant(),
+    }
 }
 
 #[test]
@@ -90,29 +97,55 @@ fn ga_d4_open_dsr_warning_fires_before_deadline_certificate_seals_and_restart_st
         "the durable timer's deadline matches the orchestrator's coarse field (the field shape is \
          unchanged — the timer REPLACES the tracking, not the field)"
     );
-    assert!(timer.wheel().is_armed(&id), "the durable timer is armed on submit");
+    assert!(
+        timer.wheel().is_armed(&id),
+        "the durable timer is armed on submit"
+    );
 
     // ─────────── 2. a tick a month out fires NOTHING ───────────
-    assert!(timer.tick().is_empty(), "no spurious warning fires a month out");
+    assert!(
+        timer.tick().is_empty(),
+        "no spurious warning fires a month out"
+    );
     assert!(timer.wheel().is_armed(&id), "the timer stays armed");
 
     // ─────────── 3. the warning fires at the nearing-deadline point, BEFORE the deadline ───────────
     let warning_at = durable_deadline - thr.warning_margin_secs;
-    assert!(warning_at < durable_deadline, "the warning point is BEFORE the deadline");
+    assert!(
+        warning_at < durable_deadline,
+        "the warning point is BEFORE the deadline"
+    );
     let fired = timer.tick_at(warning_at);
     // MEASURED: exactly 1 warning Signal fires.
-    assert_eq!(fired.len(), 1, "GA-D4: the durable timer fires the warning Signal");
+    assert_eq!(
+        fired.len(),
+        1,
+        "GA-D4: the durable timer fires the warning Signal"
+    );
     let w = &fired[0];
-    assert_eq!(w.dsr_id, id, "the warning carries the opaque DSR id (PII-free)");
-    assert_eq!(w.tenant, tenant(), "the warning carries the PII-free tenant token");
+    assert_eq!(
+        w.dsr_id, id,
+        "the warning carries the opaque DSR id (PII-free)"
+    );
+    assert_eq!(
+        w.tenant,
+        tenant(),
+        "the warning carries the PII-free tenant token"
+    );
     assert_eq!(w.deadline_secs, durable_deadline);
     // MEASURED: the margin is positive (0 silent misses — the warning fired BEFORE the deadline).
     assert_eq!(w.margin_remaining_secs, thr.warning_margin_secs);
-    assert!(w.margin_remaining_secs > 0, "GA-D4: 0 silent misses — the warning fired in time");
+    assert!(
+        w.margin_remaining_secs > 0,
+        "GA-D4: 0 silent misses — the warning fired in time"
+    );
     // the telemetry signal the warning fires on (§1.8 — observability is part of the pass).
     assert_eq!(DSR_DEADLINE_MARGIN, ("gdpr.dsr_deadline_margin", "secs"));
     // fire-once: the warning timer is disarmed after firing.
-    assert!(!timer.wheel().is_armed(&id), "the warning fired once and is disarmed");
+    assert!(
+        !timer.wheel().is_armed(&id),
+        "the warning fired once and is disarmed"
+    );
 
     // ─────────── 4. the certificate seals on completion ───────────
     // run the orchestrator state machine to Completed (the §4.1 happy path).
@@ -123,7 +156,10 @@ fn ga_d4_open_dsr_warning_fires_before_deadline_certificate_seals_and_restart_st
     assert_eq!(orch.state_of(&id).unwrap(), DsrState::Completed);
     let cert = orch.dsr_certificate(&id).unwrap();
     // MEASURED: the certificate seals (the content-addressed bundle; the Merkle seal rides P-GA-20).
-    assert_eq!(cert.dsr_id, id, "GA-D4: the certificate seals on completion");
+    assert_eq!(
+        cert.dsr_id, id,
+        "GA-D4: the certificate seals on completion"
+    );
     assert!(cert.bundle_digest.starts_with("blake3:"));
 
     // ─────────── 5. the restart-resilience leg: kill between arm and fire → STILL fires ───────────
@@ -147,10 +183,17 @@ fn ga_d4_open_dsr_warning_fires_before_deadline_certificate_seals_and_restart_st
     let warning_at2 = deadline2 - thr.warning_margin_secs;
     let mut restarted = DsrDeadlineTimer::new(TestClock::at(warning_at2), thr.clone());
     restarted.restore_wheel(DsrTimerWheel::restore(durable_rows));
-    assert!(restarted.wheel().is_armed(&id2), "the timer survived the restart");
+    assert!(
+        restarted.wheel().is_armed(&id2),
+        "the timer survived the restart"
+    );
     let fired2 = restarted.tick();
     // MEASURED: the restored timer STILL fires (0 silent misses across a restart).
-    assert_eq!(fired2.len(), 1, "GA-D4 restart leg: the timer fires after a kill-and-restart");
+    assert_eq!(
+        fired2.len(),
+        1,
+        "GA-D4 restart leg: the timer fires after a kill-and-restart"
+    );
     assert_eq!(fired2[0].dsr_id, id2);
 
     // ─────────── 6. the Art. 12(3) extension re-arms with a recorded reason ───────────
@@ -167,7 +210,11 @@ fn ga_d4_open_dsr_warning_fires_before_deadline_certificate_seals_and_restart_st
     let one_month_warning = timer3.wheel().fire_at_for(&id3).unwrap();
     let reason = "complex: cross-cell member iteration (Art. 12(3))".to_string();
     let three_months = timer3.extend_deadline(&id3, t0, reason.clone()).unwrap();
-    assert_eq!(three_months, t0 + thr.extension_total_secs, "extended to the 3-month total");
+    assert_eq!(
+        three_months,
+        t0 + thr.extension_total_secs,
+        "extended to the 3-month total"
+    );
     assert!(three_months > one_month);
     // the reason is recorded (Art. 12(3)).
     assert_eq!(timer3.wheel().extension_reason_for(&id3), Some(reason));

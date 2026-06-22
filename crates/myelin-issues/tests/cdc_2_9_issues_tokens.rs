@@ -148,7 +148,9 @@ fn cdc_2_1_issue_payload_units_validate_and_seconds_vs_millis_is_rejected() {
     });
     assert_eq!(
         validate_issue_payload_units(&drifted),
-        Err(UnitError::DurationNotSeconds { field: "target_millis".into() }),
+        Err(UnitError::DurationNotSeconds {
+            field: "target_millis".into()
+        }),
         "a millis-expressed duration must be REJECTED (the frozen unit is seconds)"
     );
 }

@@ -115,14 +115,20 @@ fn stor_d2_rpo_within_bound_under_continuous_archiving() {
     // THE green artifact: assert the measured RPO is within the bound, observably (the SAME
     // assertion surface every drill uses). A non-zero RPO over the bound reads RED.
     signals
-        .assert_signal(SignalName::RestoreRpoSecs, Predicate::Lte(rpo_bound_secs as i64))
+        .assert_signal(
+            SignalName::RestoreRpoSecs,
+            Predicate::Lte(rpo_bound_secs as i64),
+        )
         .expect_green();
 
     assert!(
         peak_rpo <= rpo_bound_secs,
         "the peak RPO {peak_rpo}s across the run + cell-kill must be within {rpo_bound_secs}s"
     );
-    assert!(archiver.base_backup_count() > 0, "at least one PITR base-backup anchor was taken");
+    assert!(
+        archiver.base_backup_count() > 0,
+        "at least one PITR base-backup anchor was taken"
+    );
 
     println!(
         "[P-059 DRILL GREEN 2026-06-19] STOR-D2 (RPO half): continuous WAL archiving over \
@@ -163,7 +169,10 @@ fn stor_d2_catches_an_archiver_that_falls_behind() {
     // The telemetry assertion reads RED (the gate would FAIL CI) — proving the threshold bites.
     let mut signals = SignalSource::new();
     signals.set_scalar(SignalName::RestoreRpoSecs, rpo as i64);
-    let verdict = signals.assert_signal(SignalName::RestoreRpoSecs, Predicate::Lte(rpo_bound_secs as i64));
+    let verdict = signals.assert_signal(
+        SignalName::RestoreRpoSecs,
+        Predicate::Lte(rpo_bound_secs as i64),
+    );
     assert!(
         !verdict.is_green(),
         "a stalled archiver (RPO past the bound) MUST read RED on the STOR-D2 assertion"

@@ -65,7 +65,9 @@ async fn index_directory_migration_applies_forward_only_with_per_tenant_pk() {
     let tbl = format!("search_index_directory_p166_{suffix}");
 
     // Always start clean (a prior aborted run may have left the table).
-    let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {tbl}")).execute(&admin).await;
+    let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {tbl}"))
+        .execute(&admin)
+        .await;
 
     // ── 1. The REAL forward-only CREATE applies against live Postgres (a CREATE, never a DROP). ──
     assert!(

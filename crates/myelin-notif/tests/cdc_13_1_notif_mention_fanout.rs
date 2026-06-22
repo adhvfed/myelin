@@ -45,7 +45,11 @@ fn region() -> Region {
 }
 /// The author of the content (the actor — NOT a mentioned recipient, so not self-suppressed).
 fn author() -> Principal {
-    Principal::stub(PrincipalId("p-author".into()), PrincipalKind::Human, tenant())
+    Principal::stub(
+        PrincipalId("p-author".into()),
+        PrincipalKind::Human,
+        tenant(),
+    )
 }
 fn mentioned(id: &str) -> Principal {
     Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant())
@@ -69,13 +73,21 @@ fn signal(rule: &str, subject: &str, dedup: &str) -> Signal {
 /// originating content's frozen `InlineNode::Mention(Principal)` nodes (13.1) onto the payload under
 /// [`SIGNAL_MENTIONS_KEY`]. The SAME node type every content-bearing subsystem authors (X-2/C10).
 fn provider_signal_envelope(id: &str, sig: &Signal, mentions: &[Principal]) -> EventEnvelope {
-    let subject = format!("sig.{}.{}.{}", sig.tenant.0, sig.severity.token(), sig.rule_id.0);
+    let subject = format!(
+        "sig.{}.{}.{}",
+        sig.tenant.0,
+        sig.severity.token(),
+        sig.rule_id.0
+    );
     // The frozen 13.1 node — the canonical write-fanout producer (identical across Chat/Issues/KN).
     let nodes: Vec<InlineNode> = mentions.iter().cloned().map(InlineNode::Mention).collect();
     let mut payload = serde_json::to_value(sig).expect("Signal serializes");
     if let serde_json::Value::Object(map) = &mut payload {
         // The structured nodes ride beside the Signal, under the frozen wire key (the CDC pins it).
-        map.insert(SIGNAL_MENTIONS_KEY.into(), serde_json::to_value(&nodes).unwrap());
+        map.insert(
+            SIGNAL_MENTIONS_KEY.into(),
+            serde_json::to_value(&nodes).unwrap(),
+        );
     }
     EventEnvelope {
         event_id: EventId(id.into()),
@@ -113,12 +125,23 @@ fn cdc_notif_consumes_13_1_mention_node_one_item_per_recipient() {
     // PROVIDER: a content body mentioning three principals (the frozen 13.1 node), stamped onto the
     // curated Signal envelope by the dispatch tier.
     let sig = signal("pr_review_requested", "myelin://acme/git/pr/9", "pr-9");
-    let mentions = [mentioned("p-alice"), mentioned("p-bob"), mentioned("p-carol")];
+    let mentions = [
+        mentioned("p-alice"),
+        mentioned("p-bob"),
+        mentioned("p-carol"),
+    ];
     let env = provider_signal_envelope("evt-mention-1", &sig, &mentions);
 
     // CONSUMER: Notif's router reads the STRUCTURED node and write-fans one item per recipient.
-    let out = consumer.deliver(&Message { subject: env.subject.0.clone(), envelope: env });
-    assert_eq!(out, Delivered::Acked, "the mention-carrying Signal routes + acks");
+    let out = consumer.deliver(&Message {
+        subject: env.subject.0.clone(),
+        envelope: env,
+    });
+    assert_eq!(
+        out,
+        Delivered::Acked,
+        "the mention-carrying Signal routes + acks"
+    );
 
     // EXACTLY one inbox_item per mentioned recipient (the write-fanout threshold: 1 per recipient).
     for p in &mentions {
@@ -134,10 +157,20 @@ fn cdc_notif_consumes_13_1_mention_node_one_item_per_recipient() {
             p.principal_id.0
         );
         let row = &mention_rows[0];
-        assert_eq!(row.class, Class::Direct, "a mention is directly addressed → Direct");
+        assert_eq!(
+            row.class,
+            Class::Direct,
+            "a mention is directly addressed → Direct"
+        );
         // references-not-payloads: the recipient is the opaque principal_id, the subject a ref.
-        assert_eq!(row.recipient, p.principal_id.0, "the recipient is the mentioned principal id");
-        assert_eq!(row.subject.0, "myelin://acme/git/pr/9", "the subject is a ref (no payload)");
+        assert_eq!(
+            row.recipient, p.principal_id.0,
+            "the recipient is the mentioned principal id"
+        );
+        assert_eq!(
+            row.subject.0, "myelin://acme/git/pr/9",
+            "the subject is a ref (no payload)"
+        );
     }
 }
 
@@ -151,7 +184,10 @@ fn cdc_mention_node_is_byte_identical_across_the_boundary() {
     // Serialize (provider) → deserialize (consumer): the node is identical (the frozen 13.1 shape).
     let json = serde_json::to_value(&node).expect("the frozen node serializes");
     let back: InlineNode = serde_json::from_value(json).expect("the consumer reads the SAME node");
-    assert_eq!(node, back, "the 13.1 mention node is byte-identical across the boundary (X-2/C10)");
+    assert_eq!(
+        node, back,
+        "the 13.1 mention node is byte-identical across the boundary (X-2/C10)"
+    );
     match back {
         InlineNode::Mention(got) => assert_eq!(got.principal_id, p.principal_id),
         _ => panic!("the node is a Mention (the frozen write-fanout producer)"),
@@ -171,7 +207,12 @@ fn cdc_no_structured_node_no_mention_fanout() {
 
     // A Signal with NO mentions key (a plain CI failure — content-less).
     let sig = signal("ci_run_failed", "myelin://acme/ci/run/42", "run-42");
-    let subject = format!("sig.{}.{}.{}", sig.tenant.0, sig.severity.token(), sig.rule_id.0);
+    let subject = format!(
+        "sig.{}.{}.{}",
+        sig.tenant.0,
+        sig.severity.token(),
+        sig.rule_id.0
+    );
     let env = EventEnvelope {
         event_id: EventId("evt-plain".into()),
         type_: EventType("signal.opened".into()),
@@ -193,12 +234,18 @@ fn cdc_no_structured_node_no_mention_fanout() {
         recorded_at: Timestamp("2026-06-20T00:00:01Z".into()),
         payload: serde_json::to_value(&sig).unwrap(),
     };
-    consumer.deliver(&Message { subject, envelope: env });
+    consumer.deliver(&Message {
+        subject,
+        envelope: env,
+    });
 
     let mention_rows = inbox
         .snapshot_for_tenant(&tenant())
         .into_iter()
         .filter(|r| r.reason == Reason::Mentioned)
         .count();
-    assert_eq!(mention_rows, 0, "no structured node → 0 mention fanout (no free-text fallback, AG-6)");
+    assert_eq!(
+        mention_rows, 0,
+        "no structured node → 0 mention fanout (no free-text fallback, AG-6)"
+    );
 }

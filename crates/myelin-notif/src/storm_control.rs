@@ -266,7 +266,10 @@ impl Default for RateConfig {
     /// damped) — bounded, never a flood. The drill reads this; it is the default-to-beat, never
     /// weakened.
     fn default() -> RateConfig {
-        RateConfig { capacity: 5.0, refill_per_tick: 1.0 }
+        RateConfig {
+            capacity: 5.0,
+            refill_per_tick: 1.0,
+        }
     }
 }
 
@@ -281,12 +284,19 @@ impl TokenBucket {
     /// available. Returns `true` iff a token was taken (admit the item); `false` iff the bucket is
     /// empty (DAMP the item — delivery suppressed). A fresh `(recipient, subject_root)` starts FULL
     /// (the burst allowance), so the first `capacity` items in a burst admit.
-    pub fn try_take(&self, recipient: &str, subject_root: &str, tick: u64, cfg: RateConfig) -> bool {
+    pub fn try_take(
+        &self,
+        recipient: &str,
+        subject_root: &str,
+        tick: u64,
+        cfg: RateConfig,
+    ) -> bool {
         let key = (recipient.to_string(), subject_root.to_string());
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let state = g
-            .entry(key)
-            .or_insert(BucketState { tokens: cfg.capacity, last_tick: tick });
+        let state = g.entry(key).or_insert(BucketState {
+            tokens: cfg.capacity,
+            last_tick: tick,
+        });
         // Refill the elapsed ticks (saturating; never below the current count, never above capacity).
         // NOTE (equivalent mutant): the `elapsed > 0` guard is a no-op short-circuit — at `elapsed ==
         // 0` the refill term is `0.0 * rate == 0.0` (and `last_tick` is already `tick`), so `> 0` and
@@ -444,7 +454,11 @@ impl StormControl {
 
         // (4) Per-(recipient, subject_root) token-bucket rate damping — a burst on a hot subject for
         // one recipient is damped after the burst allowance. A piercing class is exempt.
-        if !pierces && !self.buckets.try_take(&item.recipient, subject_root, ctx.tick, ctx.rate) {
+        if !pierces
+            && !self
+                .buckets
+                .try_take(&item.recipient, subject_root, ctx.tick, ctx.rate)
+        {
             return StormDecision::Suppress(SuppressReason::RateDamped);
         }
 
@@ -454,7 +468,11 @@ impl StormControl {
         if self.prefs.is_muted(&item.recipient, subject_root) {
             return StormDecision::Suppress(SuppressReason::Muted);
         }
-        if !pierces && ctx.quiet.is_quiet_at(ctx.utc_minute_of_day, ctx.utc_weekday) {
+        if !pierces
+            && ctx
+                .quiet
+                .is_quiet_at(ctx.utc_minute_of_day, ctx.utc_weekday)
+        {
             return StormDecision::Suppress(SuppressReason::QuietHours);
         }
 

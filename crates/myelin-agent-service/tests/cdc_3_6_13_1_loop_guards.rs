@@ -84,7 +84,8 @@ fn delivered_dispatch(actor: Principal, correlation: &str, depth: u32) -> EventE
 #[test]
 fn cdc_3_6_self_guard_reads_actor_principal_off_envelope() {
     let guards = AgentLoopGuards::new(PrincipalId("agent-alice".into()));
-    let ref_node = InlineNode::ArtifactRefNode(ArtifactRef("myelin://acme/issues/issue/PROJ-1".into()));
+    let ref_node =
+        InlineNode::ArtifactRefNode(ArtifactRef("myelin://acme/issues/issue/PROJ-1".into()));
 
     // the agent's OWN emission re-delivered by the Bus → the self-guard drops it.
     let own = delivered_dispatch(agent("agent-alice"), "corr", 0);
@@ -93,8 +94,17 @@ fn cdc_3_6_self_guard_reads_actor_principal_off_envelope() {
 
     // a HUMAN's dispatch (a structured ref, shallow depth) → admitted past the self-guard.
     let human_ev = delivered_dispatch(human("user-bob"), "corr", 0);
-    let v = guards.admit_dispatch(&human_ev.actor, &ref_node, &human_ev.correlation_id.0, human_ev.depth);
-    assert_eq!(v, GuardVerdict::Admit, "a human's dispatch is admitted (bounded by depth/tripwire)");
+    let v = guards.admit_dispatch(
+        &human_ev.actor,
+        &ref_node,
+        &human_ev.correlation_id.0,
+        human_ev.depth,
+    );
+    assert_eq!(
+        v,
+        GuardVerdict::Admit,
+        "a human's dispatch is admitted (bounded by depth/tripwire)"
+    );
 }
 
 /// **3.6 CONSUMER — the causal-depth ceiling reads `depth` off the delivered envelope (the 2.2 nested
@@ -104,7 +114,8 @@ fn cdc_3_6_self_guard_reads_actor_principal_off_envelope() {
 fn cdc_3_6_depth_ceiling_reads_envelope_depth() {
     let guards = AgentLoopGuards::new(PrincipalId("agent-alice".into()));
     let ceiling = guards.ceiling();
-    let ref_node = InlineNode::ArtifactRefNode(ArtifactRef("myelin://acme/issues/issue/PROJ-1".into()));
+    let ref_node =
+        InlineNode::ArtifactRefNode(ArtifactRef("myelin://acme/issues/issue/PROJ-1".into()));
     let other = Actor(human("user-bob"));
 
     // a dispatch whose parent depth is already AT the ceiling → the child (ceiling + 1) is dropped.
@@ -119,7 +130,11 @@ fn cdc_3_6_depth_ceiling_reads_envelope_depth() {
     // a dispatch one below the ceiling → its child is admitted (the boundary is exact).
     let ok = delivered_dispatch(human("user-bob"), "corr", ceiling - 1);
     let v = guards.admit_dispatch(&other, &ref_node, &ok.correlation_id.0, ok.depth);
-    assert_eq!(v, GuardVerdict::Admit, "a child exactly AT the ceiling is admitted");
+    assert_eq!(
+        v,
+        GuardVerdict::Admit,
+        "a child exactly AT the ceiling is admitted"
+    );
 }
 
 /// **13.1 CONSUMER — the reference gate keys on the frozen `InlineNode` taxonomy: ONLY
@@ -132,7 +147,8 @@ fn cdc_13_1_reference_gate_keys_on_inline_node_taxonomy() {
     let other = Actor(human("user-bob"));
 
     // ArtifactRefNode (13.1) → the ONLY re-trigger → admitted.
-    let ref_node = InlineNode::ArtifactRefNode(ArtifactRef("myelin://acme/knowledge/page/7".into()));
+    let ref_node =
+        InlineNode::ArtifactRefNode(ArtifactRef("myelin://acme/knowledge/page/7".into()));
     assert_eq!(
         guards.admit_dispatch(&other, &ref_node, "corr", 0),
         GuardVerdict::Admit,
@@ -162,7 +178,12 @@ fn cdc_13_1_reference_gate_keys_on_inline_node_taxonomy() {
 #[test]
 fn cdc_13_1_raw_text_is_not_an_inline_node_never_re_triggers() {
     let guards = AgentLoopGuards::new(PrincipalId("agent-alice".into()));
-    for raw in ["@agent-alice loop", "myelin://acme/issues/issue/PROJ-1", "plain text", ""] {
+    for raw in [
+        "@agent-alice loop",
+        "myelin://acme/issues/issue/PROJ-1",
+        "plain text",
+        "",
+    ] {
         assert_eq!(
             guards.reference_gate().admit_raw_text(raw),
             GuardVerdict::Drop(GuardRefusal::RawTextNotAReference),

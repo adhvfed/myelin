@@ -90,7 +90,10 @@ fn bridge(ordering_gap: i64, src: &mut SignalSource) {
     // which the producer side populates; the bound here is the ordering-health threshold).
     src.set_labelled(
         SignalName::ConsumerLag,
-        vec![Label::new("consumer", format!("check-seam:{}", check_aggregate(REPO, COMMIT).0))],
+        vec![Label::new(
+            "consumer",
+            format!("check-seam:{}", check_aggregate(REPO, COMMIT).0),
+        )],
         ordering_gap,
     );
 }
@@ -137,7 +140,11 @@ fn d11_check_seam_per_aggregate_ordering_holds_under_interleave_and_rerun() {
         "the stale re-delivery is a duplicate, absorbed — droppable"
     );
     let after_stale: Vec<u64> = order.in_order().iter().map(|c| c.seq).collect();
-    assert_eq!(after_stale, vec![1, 2, 3, 4, 5], "order preserved across the stale re-delivery");
+    assert_eq!(
+        after_stale,
+        vec![1, 2, 3, 4, 5],
+        "order preserved across the stale re-delivery"
+    );
 
     // (4) SUPERSESSION DETERMINISTIC: over the preserved order, each context's run_attempt is
     //     monotonic, so Git's "current status = highest run_attempt" is well-defined regardless of
@@ -149,7 +156,10 @@ fn d11_check_seam_per_aggregate_ordering_holds_under_interleave_and_rerun() {
         .map(|c| c.check_status["run_attempt"].as_u64().unwrap())
         .max()
         .unwrap();
-    assert_eq!(current_build_attempt, 2, "current build = the re-run (highest run_attempt)");
+    assert_eq!(
+        current_build_attempt, 2,
+        "current build = the re-run (highest run_attempt)"
+    );
     // The current build status is the re-run's success (the supersession the order makes deterministic).
     let current_build_state = order
         .in_order()
@@ -158,13 +168,19 @@ fn d11_check_seam_per_aggregate_ordering_holds_under_interleave_and_rerun() {
         .max_by_key(|c| c.check_status["run_attempt"].as_u64().unwrap())
         .map(|c| c.check_status["state"].as_str().unwrap().to_string())
         .unwrap();
-    assert_eq!(current_build_state, "success", "supersession: the re-run supersedes the failure");
+    assert_eq!(
+        current_build_state, "success",
+        "supersession: the re-run supersedes the failure"
+    );
 
     // (5) READ THE TELEMETRY ASSERTION (the loud-never-swallowed §10.2 verdict). The ordering GAP
     //     is 0 (a contiguous partition: every in-flight op delivered, 0 outstanding); the
     //     per-aggregate publish-latency is BOUNDED (the substrate is making progress, not stalled).
     let ordering_gap = order.ordering_gap();
-    assert_eq!(ordering_gap, 0, "0 ops outstanding ⇒ contiguous, fully-ordered partition");
+    assert_eq!(
+        ordering_gap, 0,
+        "0 ops outstanding ⇒ contiguous, fully-ordered partition"
+    );
 
     let mut rec = MetricRecorder::new();
     // The substrate is healthy: a bounded per-aggregate publish latency (the §4.11 #4 signal).
@@ -177,7 +193,10 @@ fn d11_check_seam_per_aggregate_ordering_holds_under_interleave_and_rerun() {
     // panic loudly with the observed value).
     src.assert_labelled(
         SignalName::ConsumerLag,
-        vec![Label::new("consumer", format!("check-seam:{}", check_aggregate(REPO, COMMIT).0))],
+        vec![Label::new(
+            "consumer",
+            format!("check-seam:{}", check_aggregate(REPO, COMMIT).0),
+        )],
         Predicate::Eq(0),
     )
     .expect_green();
@@ -198,7 +217,11 @@ fn d11_ci_result_wait_substrate_wakes_once_on_double_delivery() {
     let idem = "merge-attempt-7";
 
     // The merge-queue workflow parks (holds NO runtime while CI runs — contract 9.4).
-    assert_eq!(sub.wait_for_signal(idem), None, "pending until the rollup arrives");
+    assert_eq!(
+        sub.wait_for_signal(idem),
+        None,
+        "pending until the rollup arrives"
+    );
 
     let result = CiResult {
         commit_oid: COMMIT.into(),
@@ -208,10 +231,26 @@ fn d11_ci_result_wait_substrate_wakes_once_on_double_delivery() {
     };
 
     // CI delivers the rollup TWICE (at-least-once) — ONE wake, not two.
-    assert_eq!(sub.deliver(result.clone()), WakeOutcome::Woke, "first delivery wakes");
-    assert_eq!(sub.deliver(result.clone()), WakeOutcome::Duplicate, "re-delivery absorbed");
-    assert_eq!(sub.wake_count(idem), 1, "EXACTLY ONE wake on a doubly-delivered ci.result (9.4)");
-    assert_eq!(sub.wait_for_signal(idem), Some(result), "the workflow re-leases + reads the rollup");
+    assert_eq!(
+        sub.deliver(result.clone()),
+        WakeOutcome::Woke,
+        "first delivery wakes"
+    );
+    assert_eq!(
+        sub.deliver(result.clone()),
+        WakeOutcome::Duplicate,
+        "re-delivery absorbed"
+    );
+    assert_eq!(
+        sub.wake_count(idem),
+        1,
+        "EXACTLY ONE wake on a doubly-delivered ci.result (9.4)"
+    );
+    assert_eq!(
+        sub.wait_for_signal(idem),
+        Some(result),
+        "the workflow re-leases + reads the rollup"
+    );
 }
 
 /// A foreign event can never silently corrupt the partition order the supersession rule depends on.
@@ -220,5 +259,8 @@ fn d11_foreign_event_rejected_from_the_ordering_partition() {
     let mut order = CheckSeamOrder::new(REPO, COMMIT);
     let mut wrong = check_env("build", 1, "success");
     wrong.type_ = EventType("git.ref.updated".into());
-    assert!(matches!(order.ingest(&wrong, 1), Err(CheckSeamError::WrongType(_))));
+    assert!(matches!(
+        order.ingest(&wrong, 1),
+        Err(CheckSeamError::WrongType(_))
+    ));
 }

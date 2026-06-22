@@ -253,14 +253,17 @@ impl WfCtx {
         // spec to the runner; a dispatch failure RETRIES (reusing the same idem_token — the runner
         // dedups a re-dispatched job on it, §4.9). On replay the activity SHORT-CIRCUITS (the job is
         // NOT re-dispatched) and returns the journaled marker — so the worker never re-hands the spec.
-        self.activity(crate::RetryPolicy::default_policy(), move |act_idem, _attempt| {
-            debug_assert!(
-                act_idem.ends_with("/act"),
-                "the activity's own BUS-2 token is the /act token; the JOB token is /job"
-            );
-            runner.dispatch(&spec_for_closure)?;
-            Ok(vec![marker_for_closure.clone()])
-        })?;
+        self.activity(
+            crate::RetryPolicy::default_policy(),
+            move |act_idem, _attempt| {
+                debug_assert!(
+                    act_idem.ends_with("/act"),
+                    "the activity's own BUS-2 token is the /act token; the JOB token is /job"
+                );
+                runner.dispatch(&spec_for_closure)?;
+                Ok(vec![marker_for_closure.clone()])
+            },
+        )?;
 
         // ── Step 2: PARK on the durable `job.done` signal keyed by the idem_token (§4.3). The wait
         // composes the existing wait_for_signal: it consumes a buffered job.done (the runner already
@@ -489,18 +492,16 @@ mod tests {
         fn dispatch(&self, spec: &JobSpec) -> Result<(), crate::ActivityError> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             if self.fail_first && n == 0 {
-                return Err(crate::ActivityError("runner transiently unreachable".into()));
+                return Err(crate::ActivityError(
+                    "runner transiently unreachable".into(),
+                ));
             }
             self.dispatched.lock().unwrap().push(spec.clone());
             Ok(())
         }
     }
 
-    fn deliver_job_done(
-        signals: &SignalStore,
-        idem_token: &str,
-        result: Vec<ArtifactRef>,
-    ) {
+    fn deliver_job_done(signals: &SignalStore, idem_token: &str, result: Vec<ArtifactRef>) {
         signals.deliver(SignalRow {
             tenant: tenant(),
             region: region(),
@@ -530,7 +531,11 @@ mod tests {
 
         let mut ctx = begin(&outbox, journal.clone(), signals.clone());
         let out = ctx
-            .schedule_and_run_job(JobSpec::new(JobKind::Ci, "pipeline://acme/ci/pr-7"), &runner, None)
+            .schedule_and_run_job(
+                JobSpec::new(JobKind::Ci, "pipeline://acme/ci/pr-7"),
+                &runner,
+                None,
+            )
             .expect("dispatch + park");
         assert_eq!(out, JobOutcome::Parked, "no job.done yet → the run parks");
 
@@ -544,11 +549,19 @@ mod tests {
             producer_token, consumer_token,
             "producer + consumer derive the SAME idem_token without coordination"
         );
-        assert_eq!(producer_token, "R1/merge.queue:0/job", "deterministic on position");
+        assert_eq!(
+            producer_token, "R1/merge.queue:0/job",
+            "deterministic on position"
+        );
         // the dispatch is journaled activity_completed{job_dispatched} (one history row).
-        ctx.commit().expect("co-commit the dispatch + the park marker");
+        ctx.commit()
+            .expect("co-commit the dispatch + the park marker");
         let hist = journal.history_for(&tenant(), "R1");
-        assert_eq!(hist[0].kind, crate::history_kind::ACTIVITY_COMPLETED, "the dispatch is journaled");
+        assert_eq!(
+            hist[0].kind,
+            crate::history_kind::ACTIVITY_COMPLETED,
+            "the dispatch is journaled"
+        );
         assert_eq!(
             hist[0].result.as_ref().unwrap()[0],
             job_dispatch_marker("R1/merge.queue:0/job", JobKind::Ci),
@@ -568,13 +581,32 @@ mod tests {
 
         let mut ctx = begin(&outbox, journal, signals);
         let out = ctx
-            .schedule_and_run_job(JobSpec::new(JobKind::Agent, "agent://acme/job/x"), &runner, None)
+            .schedule_and_run_job(
+                JobSpec::new(JobKind::Agent, "agent://acme/job/x"),
+                &runner,
+                None,
+            )
             .expect("dispatch + park");
 
-        assert_eq!(out, JobOutcome::Parked, "the long-park returns Parked (the worker is freed)");
-        assert!(ctx.parked_on_signal(), "the run is waiting on job.done (holds no runtime)");
-        assert_eq!(runner.calls.load(Ordering::SeqCst), 1, "the job was dispatched exactly once");
-        assert_eq!(ctx.consumed_signals().len(), 0, "nothing consumed — the job is still running");
+        assert_eq!(
+            out,
+            JobOutcome::Parked,
+            "the long-park returns Parked (the worker is freed)"
+        );
+        assert!(
+            ctx.parked_on_signal(),
+            "the run is waiting on job.done (holds no runtime)"
+        );
+        assert_eq!(
+            runner.calls.load(Ordering::SeqCst),
+            1,
+            "the job was dispatched exactly once"
+        );
+        assert_eq!(
+            ctx.consumed_signals().len(),
+            0,
+            "nothing consumed — the job is still running"
+        );
     }
 
     /// **A fast job whose `job.done` is ALREADY buffered completes in one drive (§4.9).** If the runner
@@ -589,21 +621,36 @@ mod tests {
 
         // the runner already finished: job.done is buffered under the deterministic dispatch token.
         let token = job_idem_token("R1", "merge.queue:0");
-        deliver_job_done(&signals, &token, vec![ArtifactRef("myelin://acme/ci/result/green".into())]);
+        deliver_job_done(
+            &signals,
+            &token,
+            vec![ArtifactRef("myelin://acme/ci/result/green".into())],
+        );
 
         let mut ctx = begin(&outbox, journal, signals);
         let out = ctx
-            .schedule_and_run_job(JobSpec::new(JobKind::Ci, "pipeline://acme/ci/pr-7"), &runner, None)
+            .schedule_and_run_job(
+                JobSpec::new(JobKind::Ci, "pipeline://acme/ci/pr-7"),
+                &runner,
+                None,
+            )
             .expect("dispatch + complete");
 
         match out {
             JobOutcome::Completed { idem_token, result } => {
                 assert_eq!(idem_token, token, "the runner echoed the dispatch token");
-                assert_eq!(result, vec![ArtifactRef("myelin://acme/ci/result/green".into())]);
+                assert_eq!(
+                    result,
+                    vec![ArtifactRef("myelin://acme/ci/result/green".into())]
+                );
             }
             other => panic!("expected Completed, got {other:?}"),
         }
-        assert_eq!(ctx.consumed_signals().len(), 1, "exactly ONE job.done consumed");
+        assert_eq!(
+            ctx.consumed_signals().len(),
+            1,
+            "exactly ONE job.done consumed"
+        );
     }
 
     /// **A DOUBLE-delivered `job.done` wakes the workflow ONCE (the `wf_signal` PK dedup, §4.9).** The
@@ -618,17 +665,44 @@ mod tests {
 
         let token = job_idem_token("R1", "merge.queue:0");
         // DELIVERED TWICE under the SAME idem_token (at-least-once) — the PK dedups to one buffered row.
-        deliver_job_done(&signals, &token, vec![ArtifactRef("myelin://acme/ci/result/green".into())]);
-        deliver_job_done(&signals, &token, vec![ArtifactRef("myelin://acme/ci/result/green".into())]);
-        assert_eq!(signals.buffered_depth(), 1, "the double delivery deduped to ONE buffered row");
+        deliver_job_done(
+            &signals,
+            &token,
+            vec![ArtifactRef("myelin://acme/ci/result/green".into())],
+        );
+        deliver_job_done(
+            &signals,
+            &token,
+            vec![ArtifactRef("myelin://acme/ci/result/green".into())],
+        );
+        assert_eq!(
+            signals.buffered_depth(),
+            1,
+            "the double delivery deduped to ONE buffered row"
+        );
 
         let mut ctx = begin(&outbox, journal, signals.clone());
         let out = ctx
-            .schedule_and_run_job(JobSpec::new(JobKind::Ci, "pipeline://acme/ci/pr-7"), &runner, None)
+            .schedule_and_run_job(
+                JobSpec::new(JobKind::Ci, "pipeline://acme/ci/pr-7"),
+                &runner,
+                None,
+            )
             .expect("dispatch + complete");
-        assert!(matches!(out, JobOutcome::Completed { .. }), "the run completes, got {out:?}");
-        assert_eq!(ctx.consumed_signals().len(), 1, "ONE wake per job (the double-delivery deduped)");
-        assert_eq!(signals.buffered_depth(), 0, "the one buffered row is consumed once");
+        assert!(
+            matches!(out, JobOutcome::Completed { .. }),
+            "the run completes, got {out:?}"
+        );
+        assert_eq!(
+            ctx.consumed_signals().len(),
+            1,
+            "ONE wake per job (the double-delivery deduped)"
+        );
+        assert_eq!(
+            signals.buffered_depth(),
+            0,
+            "the one buffered row is consumed once"
+        );
     }
 
     /// **A VANISHED runner's timeout timer fires and bounds the wait (§4.9 step 2).** The job is
@@ -644,29 +718,58 @@ mod tests {
         let runner = RecordingRunner::default();
 
         // DRIVE 1 at clock=1000 with a 100s SLA → dispatch + park (deadline 1100 not reached).
-        let mut c1 = begin(&outbox, journal.clone(), signals.clone())
-            .with_timers(timers.clone(), 0, 1000);
+        let mut c1 =
+            begin(&outbox, journal.clone(), signals.clone()).with_timers(timers.clone(), 0, 1000);
         let out1 = c1
-            .schedule_and_run_job(JobSpec::new(JobKind::Ci, "pipeline://acme/ci/pr-7"), &runner, Some(100))
+            .schedule_and_run_job(
+                JobSpec::new(JobKind::Ci, "pipeline://acme/ci/pr-7"),
+                &runner,
+                Some(100),
+            )
             .expect("dispatch + park");
-        assert_eq!(out1, JobOutcome::Parked, "dispatched, parked on job.done with an SLA timer");
-        c1.commit().expect("co-commit the dispatch + the timeout-timer");
-        assert_eq!(timers.armed_count(), 1, "the vanished-runner SLA timeout-timer is armed");
+        assert_eq!(
+            out1,
+            JobOutcome::Parked,
+            "dispatched, parked on job.done with an SLA timer"
+        );
+        c1.commit()
+            .expect("co-commit the dispatch + the timeout-timer");
+        assert_eq!(
+            timers.armed_count(),
+            1,
+            "the vanished-runner SLA timeout-timer is armed"
+        );
         let history = journal.history_for(&tenant(), "R1");
 
         // DRIVE 2 at clock=2000 (past the 1100 deadline), STILL no job.done → TimedOut.
         let mut c2 = WfCtx::resume(
-            &outbox, minter(), journal.clone(), ctx_base(), "R1", "merge.queue",
-            "2026-06-21T00:00:00Z", 42, history,
+            &outbox,
+            minter(),
+            journal.clone(),
+            ctx_base(),
+            "R1",
+            "merge.queue",
+            "2026-06-21T00:00:00Z",
+            42,
+            history,
         )
         .with_signals(signals.clone())
         .with_timers(timers.clone(), 0, 2000);
         let out2 = c2
-            .schedule_and_run_job(JobSpec::new(JobKind::Ci, "pipeline://acme/ci/pr-7"), &runner, Some(100))
+            .schedule_and_run_job(
+                JobSpec::new(JobKind::Ci, "pipeline://acme/ci/pr-7"),
+                &runner,
+                Some(100),
+            )
             .expect("the timeout drive");
-        assert_eq!(out2, JobOutcome::TimedOut, "the SLA fired before the runner reported → TimedOut");
         assert_eq!(
-            runner.calls.load(Ordering::SeqCst), 1,
+            out2,
+            JobOutcome::TimedOut,
+            "the SLA fired before the runner reported → TimedOut"
+        );
+        assert_eq!(
+            runner.calls.load(Ordering::SeqCst),
+            1,
             "the job was dispatched ONCE — the replay short-circuit did not re-dispatch it"
         );
     }
@@ -683,29 +786,52 @@ mod tests {
         let runner = RecordingRunner::default();
 
         let token = job_idem_token("R1", "merge.queue:0");
-        deliver_job_done(&signals, &token, vec![ArtifactRef("myelin://acme/ci/result/green".into())]);
+        deliver_job_done(
+            &signals,
+            &token,
+            vec![ArtifactRef("myelin://acme/ci/result/green".into())],
+        );
 
         // DRIVE 1: dispatch + complete + journal.
         let mut c1 = begin(&outbox, journal.clone(), signals.clone());
         let out1 = c1
-            .schedule_and_run_job(JobSpec::new(JobKind::Ci, "pipeline://acme/ci/pr-7"), &runner, None)
+            .schedule_and_run_job(
+                JobSpec::new(JobKind::Ci, "pipeline://acme/ci/pr-7"),
+                &runner,
+                None,
+            )
             .expect("drive 1");
         assert!(matches!(out1, JobOutcome::Completed { .. }));
         c1.commit().expect("co-commit");
         let history = journal.history_for(&tenant(), "R1");
 
         // a SECOND buffered job.done under a different key — replay must NOT consume it.
-        deliver_job_done(&signals, "R1/other/job", vec![ArtifactRef("myelin://acme/ci/result/other".into())]);
+        deliver_job_done(
+            &signals,
+            "R1/other/job",
+            vec![ArtifactRef("myelin://acme/ci/result/other".into())],
+        );
         let depth_before = signals.buffered_depth();
 
         // DRIVE 2 (re-drive): replay the dispatch (0 re-dispatch) + the journaled completion.
         let mut c2 = WfCtx::resume(
-            &outbox, minter(), journal.clone(), ctx_base(), "R1", "merge.queue",
-            "2026-06-21T00:00:00Z", 42, history,
+            &outbox,
+            minter(),
+            journal.clone(),
+            ctx_base(),
+            "R1",
+            "merge.queue",
+            "2026-06-21T00:00:00Z",
+            42,
+            history,
         )
         .with_signals(signals.clone());
         let out2 = c2
-            .schedule_and_run_job(JobSpec::new(JobKind::Ci, "pipeline://acme/ci/pr-7"), &runner, None)
+            .schedule_and_run_job(
+                JobSpec::new(JobKind::Ci, "pipeline://acme/ci/pr-7"),
+                &runner,
+                None,
+            )
             .expect("the replay drive");
         match out2 {
             JobOutcome::Completed { idem_token, .. } => assert_eq!(
@@ -715,11 +841,20 @@ mod tests {
             other => panic!("expected the journaled Completed, got {other:?}"),
         }
         assert_eq!(
-            runner.calls.load(Ordering::SeqCst), 1,
+            runner.calls.load(Ordering::SeqCst),
+            1,
             "0 RE-DISPATCH on replay (the dispatch short-circuited)"
         );
-        assert_eq!(c2.consumed_signals().len(), 0, "replay consumed NOTHING new");
-        assert_eq!(signals.buffered_depth(), depth_before, "the second job.done was NOT consumed");
+        assert_eq!(
+            c2.consumed_signals().len(),
+            0,
+            "replay consumed NOTHING new"
+        );
+        assert_eq!(
+            signals.buffered_depth(),
+            depth_before,
+            "the second job.done was NOT consumed"
+        );
     }
 
     /// **A runner that does NOT echo the dispatch token is a LOUD error (§4.9, EI-01 §2).** The
@@ -734,11 +869,19 @@ mod tests {
         let runner = RecordingRunner::default();
 
         // the runner delivered job.done under the WRONG key (a protocol violation).
-        deliver_job_done(&signals, "the-wrong-token", vec![ArtifactRef("x://y".into())]);
+        deliver_job_done(
+            &signals,
+            "the-wrong-token",
+            vec![ArtifactRef("x://y".into())],
+        );
 
         let mut ctx = begin(&outbox, journal, signals);
         let err = ctx
-            .schedule_and_run_job(JobSpec::new(JobKind::Ci, "pipeline://acme/ci/pr-7"), &runner, None)
+            .schedule_and_run_job(
+                JobSpec::new(JobKind::Ci, "pipeline://acme/ci/pr-7"),
+                &runner,
+                None,
+            )
             .expect_err("a mismatched job.done idem_key is a loud error");
         assert!(
             matches!(err, WfError::CoCommit(ref m) if m.contains("does not match the dispatched idem_token")),
@@ -762,10 +905,22 @@ mod tests {
 
         let mut ctx = begin(&outbox, journal, signals);
         let out = ctx
-            .schedule_and_run_job(JobSpec::new(JobKind::Ci, "pipeline://acme/ci/pr-7"), &runner, None)
+            .schedule_and_run_job(
+                JobSpec::new(JobKind::Ci, "pipeline://acme/ci/pr-7"),
+                &runner,
+                None,
+            )
             .expect("the retried dispatch succeeds");
-        assert_eq!(out, JobOutcome::Parked, "the retried dispatch parks on job.done");
-        assert_eq!(runner.calls.load(Ordering::SeqCst), 2, "one failure + one retry");
+        assert_eq!(
+            out,
+            JobOutcome::Parked,
+            "the retried dispatch parks on job.done"
+        );
+        assert_eq!(
+            runner.calls.load(Ordering::SeqCst),
+            2,
+            "one failure + one retry"
+        );
         // the SUCCESSFUL dispatch carried the SAME deterministic token the first attempt would have.
         let dispatched = runner.dispatched.lock().unwrap();
         assert_eq!(dispatched.len(), 1, "one accepted dispatch (the retry)");
@@ -780,6 +935,10 @@ mod tests {
     /// [`RetryPolicy::default_policy`] is what `schedule_and_run_job` arms.
     #[test]
     fn dispatch_uses_the_default_retry_policy() {
-        assert_eq!(RetryPolicy::default_policy().max_attempts, 3, "the §4.4 retry floor");
+        assert_eq!(
+            RetryPolicy::default_policy().max_attempts,
+            3,
+            "the §4.4 retry floor"
+        );
     }
 }

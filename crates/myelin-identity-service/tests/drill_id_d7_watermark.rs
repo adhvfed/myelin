@@ -27,9 +27,10 @@ use myelin_identity::{
     Principal, PrincipalId, PrincipalKind, RelName, RelationTuple, SetExpr, TupleDelta,
 };
 use myelin_identity_service::{
-    lower, namespace::{FragmentDef, PermissionRule, Userset},
-    watermark_verdict, ListObjects, NamespaceEngine, ReverseIndex, ReverseIndexConsumer, TupleStore,
-    WatermarkVerdict,
+    lower,
+    namespace::{FragmentDef, PermissionRule, Userset},
+    watermark_verdict, ListObjects, NamespaceEngine, ReverseIndex, ReverseIndexConsumer,
+    TupleStore, WatermarkVerdict,
 };
 use myelin_storage::TenantScope;
 use myelin_tenancy::{Region, TenantId};
@@ -47,7 +48,11 @@ fn scope(tenant: &str) -> TenantScope {
 }
 
 fn subject(id: &str, tenant: &str) -> Principal {
-    Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, TenantId(tenant.into()))
+    Principal::stub(
+        PrincipalId(id.into()),
+        PrincipalKind::Human,
+        TenantId(tenant.into()),
+    )
 }
 
 fn tuple(object: &str, relation: &str, subj: &str) -> RelationTuple {
@@ -100,7 +105,14 @@ fn id_d7_revoke_then_reread_no_stale_allow() {
 
     // (1) GRANT: alice reads repo:core. Project it into S8 (the index is up to date for the grant).
     let _z_grant = store
-        .write_tuples(&s, &admin("acme"), &[TupleDelta::Add(tuple("repo:core", "reader", "p:alice"))], None, None, now())
+        .write_tuples(
+            &s,
+            &admin("acme"),
+            &[TupleDelta::Add(tuple("repo:core", "reader", "p:alice"))],
+            None,
+            None,
+            now(),
+        )
         .expect("grant");
     feed_pending(&outbox, &consumer);
     assert_eq!(
@@ -113,7 +125,14 @@ fn id_d7_revoke_then_reread_no_stale_allow() {
     //     reflects the revoke; we DO NOT feed the revoke to S8 (the index lags — the new-enemy
     //     window the watermark guard must close).
     let z_revoke = store
-        .write_tuples(&s, &admin("acme"), &[TupleDelta::Remove(tuple("repo:core", "reader", "p:alice"))], None, None, now())
+        .write_tuples(
+            &s,
+            &admin("acme"),
+            &[TupleDelta::Remove(tuple("repo:core", "reader", "p:alice"))],
+            None,
+            None,
+            now(),
+        )
         .expect("revoke");
     // (Intentionally NOT calling feed_pending — S8's watermark stays behind z_revoke.)
     assert!(
@@ -144,18 +163,33 @@ fn id_d7_revoke_then_reread_no_stale_allow() {
     };
 
     // (3a) The watermark verdict on the lowered Filter must be FallBackToCheck (the guard engaged).
-    let via = ColRef { table: "repo".into(), column: "id".into() };
+    let via = ColRef {
+        table: "repo".into(),
+        column: "id".into(),
+    };
     let join_lowered = lower(
-        &SetExpr::InRelation { relation: RelName("read".into()), via_column: via.clone() },
+        &SetExpr::InRelation {
+            relation: RelName("read".into()),
+            via_column: via.clone(),
+        },
         &alice,
         &via,
     );
     let verdict = watermark_verdict(&index, &s, &join_lowered, &post_revoke);
     match verdict {
-        WatermarkVerdict::FallBackToCheck { ref required, ref watermark } => {
+        WatermarkVerdict::FallBackToCheck {
+            ref required,
+            ref watermark,
+        } => {
             guard_engaged = true;
-            assert_eq!(required, &z_revoke, "the scan required the post-revoke revision");
-            assert!(watermark.0 < required.0, "the S8 watermark is behind the required revision");
+            assert_eq!(
+                required, &z_revoke,
+                "the scan required the post-revoke revision"
+            );
+            assert!(
+                watermark.0 < required.0,
+                "the S8 watermark is behind the required revision"
+            );
         }
         WatermarkVerdict::JoinServes => {
             // The behind index would serve the stale grant — the new-enemy leak.
@@ -184,8 +218,14 @@ fn id_d7_revoke_then_reread_no_stale_allow() {
     signals
         .assert_signal(SignalName::CrossTenantCount, Predicate::Eq(0))
         .expect_green();
-    assert_eq!(stale_allows, 0, "0 stale allows post-revoke (ID-D7 — the new-enemy guard holds)");
-    assert!(guard_engaged, "the S8 watermark fall-back guard engaged (it did not serve the behind JOIN)");
+    assert_eq!(
+        stale_allows, 0,
+        "0 stale allows post-revoke (ID-D7 — the new-enemy guard holds)"
+    );
+    assert!(
+        guard_engaged,
+        "the S8 watermark fall-back guard engaged (it did not serve the behind JOIN)"
+    );
 
     println!(
         "[P-070 DRILL GREEN 2026-06-19] ID-D7 revoke-then-reread watermark: \

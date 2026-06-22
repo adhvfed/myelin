@@ -116,7 +116,8 @@ mod tests {
     /// registration half).
     #[test]
     fn refs_accepts_knowledge_block_and_heading_registration() {
-        let reg = register_knowledge_sub_kinds().expect("Refs accepts Knowledge's #sub registration");
+        let reg =
+            register_knowledge_sub_kinds().expect("Refs accepts Knowledge's #sub registration");
         assert_eq!(reg.subsystem, "knowledge");
         assert_eq!(reg.kinds, vec![SubKind::Block, SubKind::Heading]);
     }
@@ -155,7 +156,11 @@ mod tests {
         // stripped root is what Refs stores, contract 5.7).
         for r in [&b, &h] {
             let root = strip_sub(r);
-            assert!(!format(&root).contains('#'), "stripped root carries a #sub: {}", format(&root));
+            assert!(
+                !format(&root).contains('#'),
+                "stripped root carries a #sub: {}",
+                format(&root)
+            );
             assert!(
                 myelin_refs::parse(&format(&root)).is_ok(),
                 "stripped root must itself parse as a canonical root"

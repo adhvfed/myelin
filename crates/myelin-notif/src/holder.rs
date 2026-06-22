@@ -67,9 +67,11 @@ use std::sync::{Arc, Mutex};
 
 use myelin_gdpr::{
     EraseReceipt, EraseScope, LocateReport, Patch, PersonalDataHolder, PortableBundle, Receipt,
-    RectifyReceipt, Result as DsrResult, RestrictReceipt, SubjectRef, TenantId as GdprTenantId,
+    RectifyReceipt, RestrictReceipt, Result as DsrResult, SubjectRef, TenantId as GdprTenantId,
 };
-use myelin_substrate::{Holder, HolderRegistration, HolderRegistry, StoreClassifier, StoreHolder, StoreKind};
+use myelin_substrate::{
+    Holder, HolderRegistration, HolderRegistry, StoreClassifier, StoreHolder, StoreKind,
+};
 use myelin_tenancy::TenantId;
 
 use crate::router::InboxProjection;
@@ -160,7 +162,10 @@ impl NotifBacking {
     /// Wire the holder over a live inbox projection (the NOTIF-P4 real body). The restrict set is
     /// fresh (empty) — `restrict(subject, true)` adds to it.
     pub fn new(inbox: InboxProjection) -> NotifBacking {
-        NotifBacking { inbox, restrict: RestrictSet::new() }
+        NotifBacking {
+            inbox,
+            restrict: RestrictSet::new(),
+        }
     }
 
     /// Wire the holder over a live projection AND a shared restrict-suppression set (so the
@@ -194,12 +199,16 @@ impl NotifHistoryHolder {
     /// 4.8 pseudonym shred — NO PII-column mutation on the refs-stored rows); `restrict` suppresses
     /// the subject's NEW routing/delivery.
     pub fn with_inbox(inbox: InboxProjection) -> NotifHistoryHolder {
-        NotifHistoryHolder { backing: Some(NotifBacking::new(inbox)) }
+        NotifHistoryHolder {
+            backing: Some(NotifBacking::new(inbox)),
+        }
     }
 
     /// The REAL holder over a live projection AND a shared restrict set (the router/delivery read it).
     pub fn with_backing(backing: NotifBacking) -> NotifHistoryHolder {
-        NotifHistoryHolder { backing: Some(backing) }
+        NotifHistoryHolder {
+            backing: Some(backing),
+        }
     }
 
     /// Register this holder through the substrate registry (the `serve`-called auto-registration
@@ -247,7 +256,15 @@ impl PersonalDataHolder for NotifHistoryHolder {
              refs, references-not-payloads — no stored name)"
         );
         Ok(LocateReport {
-            receipt: Receipt::content_addressed("locate", NOTIF_OLTP_STORE, &sid, &tenant.0, &outcome, None, 0),
+            receipt: Receipt::content_addressed(
+                "locate",
+                NOTIF_OLTP_STORE,
+                &sid,
+                &tenant.0,
+                &outcome,
+                None,
+                0,
+            ),
         })
     }
 
@@ -264,7 +281,9 @@ impl PersonalDataHolder for NotifHistoryHolder {
                 NOTIF_OLTP_STORE,
                 &sid,
                 &tenant.0,
-                &format!("references-not-payloads bundle: {count} inbox appearances, no free-text body"),
+                &format!(
+                    "references-not-payloads bundle: {count} inbox appearances, no free-text body"
+                ),
                 None,
                 0,
             ),
@@ -307,7 +326,15 @@ impl PersonalDataHolder for NotifHistoryHolder {
             format!("restrict={on} no-op (no live routing; suppression lands with routing/delivery NOTIF-P10/P16)")
         };
         Ok(RestrictReceipt {
-            receipt: Receipt::content_addressed("restrict", NOTIF_OLTP_STORE, &sid, "", &outcome, None, 0),
+            receipt: Receipt::content_addressed(
+                "restrict",
+                NOTIF_OLTP_STORE,
+                &sid,
+                "",
+                &outcome,
+                None,
+                0,
+            ),
         })
     }
 
@@ -323,7 +350,9 @@ impl PersonalDataHolder for NotifHistoryHolder {
         // NOTIF-P27. The reindex/replay rebuild is NOTIF-P17. No erasure backdoor: the row stays; the
         // person becomes unresolvable.
         let (sid, tenant) = match &scope {
-            EraseScope::Subject { subject, tenant } => (Self::subject_id(subject), tenant.0.clone()),
+            EraseScope::Subject { subject, tenant } => {
+                (Self::subject_id(subject), tenant.0.clone())
+            }
             EraseScope::Tenant(t) => (String::new(), t.0.clone()),
         };
         let count = match &scope {
@@ -345,7 +374,15 @@ impl PersonalDataHolder for NotifHistoryHolder {
         Ok(EraseReceipt {
             // No KEY destroyed at the inbox holder (the row is refs-only; the crypto-shred is the
             // inline-PII delivery DEK + the per-tenant DEK, the X-7/10.9 floor). key_epoch_destroyed = None.
-            receipt: Receipt::content_addressed("erase", NOTIF_OLTP_STORE, &sid, &tenant, &outcome, None, 0),
+            receipt: Receipt::content_addressed(
+                "erase",
+                NOTIF_OLTP_STORE,
+                &sid,
+                &tenant,
+                &outcome,
+                None,
+                0,
+            ),
         })
     }
 }
@@ -418,7 +455,11 @@ mod tests {
     fn re_registration_is_idempotent() {
         let mut registry = register_notif_holder();
         NotifHistoryHolder::default().register(&mut registry);
-        assert_eq!(registry.len(), 1, "re-opening the same Notif store does not double-register");
+        assert_eq!(
+            registry.len(),
+            1,
+            "re-opening the same Notif store does not double-register"
+        );
     }
 
     /// **The Notif store classifies to H13 — 0 orphans (contract 1.4 + gdpr §3.2).** The OLTP store
@@ -461,19 +502,38 @@ mod tests {
 
         // Snapshot the EXACT stored bytes of the subject's rows BEFORE erase.
         let before: Vec<RoutedInboxItem> = inbox.snapshot_for_tenant(&t());
-        let subj_rows_before: Vec<&RoutedInboxItem> =
-            before.iter().filter(|r| r.references_subject("u-erase")).collect();
-        assert_eq!(subj_rows_before.len(), 2, "locate finds both appearances (own + by-ref)");
+        let subj_rows_before: Vec<&RoutedInboxItem> = before
+            .iter()
+            .filter(|r| r.references_subject("u-erase"))
+            .collect();
+        assert_eq!(
+            subj_rows_before.len(),
+            2,
+            "locate finds both appearances (own + by-ref)"
+        );
 
         // locate reports the appearance count over the structural surface.
-        let loc = holder.locate(&subject("u-erase"), tenant()).expect("locate succeeds");
+        let loc = holder
+            .locate(&subject("u-erase"), tenant())
+            .expect("locate succeeds");
         assert!(loc.receipt.content_hash.starts_with("blake3:"));
-        assert!(loc.receipt.key_epoch_destroyed.is_none(), "locate shreds no key");
+        assert!(
+            loc.receipt.key_epoch_destroyed.is_none(),
+            "locate shreds no key"
+        );
 
         // ERASE the subject.
-        let scope = EraseScope::Subject { subject: subject("u-erase"), tenant: tenant() };
-        let er = holder.erase(scope.clone()).expect("structural erase succeeds");
-        assert!(er.receipt.key_epoch_destroyed.is_none(), "0 keys shredded at the inbox surface (refs-only)");
+        let scope = EraseScope::Subject {
+            subject: subject("u-erase"),
+            tenant: tenant(),
+        };
+        let er = holder
+            .erase(scope.clone())
+            .expect("structural erase succeeds");
+        assert!(
+            er.receipt.key_epoch_destroyed.is_none(),
+            "0 keys shredded at the inbox surface (refs-only)"
+        );
 
         // THE PROPERTY: 0 PII columns mutated — every stored row is byte-identical after erase.
         let after: Vec<RoutedInboxItem> = inbox.snapshot_for_tenant(&t());
@@ -485,7 +545,11 @@ mod tests {
             after_sorted, before_sorted,
             "the refs-stored items tombstone for FREE — 0 PII columns mutated (references-not-payloads)"
         );
-        assert_eq!(after.len(), 3, "no row deleted either — the appearance stays, only resolution changes");
+        assert_eq!(
+            after.len(),
+            3,
+            "no row deleted either — the appearance stays, only resolution changes"
+        );
 
         // Idempotent: a re-erase returns the IDENTICAL content-addressed receipt.
         let er2 = holder.erase(scope).expect("re-erase is idempotent");
@@ -498,15 +562,27 @@ mod tests {
     #[test]
     fn locate_counts_real_appearances_backed_vs_unbacked() {
         let unbacked = NotifHistoryHolder::default();
-        assert_eq!(unbacked.count_appearances(&tenant(), "u-x"), 0, "unbacked → empty-but-correct");
+        assert_eq!(
+            unbacked.count_appearances(&tenant(), "u-x"),
+            0,
+            "unbacked → empty-but-correct"
+        );
 
         let inbox = InboxProjection::new();
         inbox.upsert_for_test(row("u-x", "PROJ-1", "u-y", "a")); // recipient = subject
         inbox.upsert_for_test(row("u-z", "PROJ-2", "u-x", "b")); // by-ref actor = subject
         inbox.upsert_for_test(row("u-z", "PROJ-3", "u-q", "c")); // neither
         let backed = NotifHistoryHolder::with_inbox(inbox);
-        assert_eq!(backed.count_appearances(&tenant(), "u-x"), 2, "both structural appearances counted");
-        assert_eq!(backed.count_appearances(&tenant(), "u-none"), 0, "an absent subject → 0");
+        assert_eq!(
+            backed.count_appearances(&tenant(), "u-x"),
+            2,
+            "both structural appearances counted"
+        );
+        assert_eq!(
+            backed.count_appearances(&tenant(), "u-none"),
+            0,
+            "an absent subject → 0"
+        );
     }
 
     /// **`restrict` records the subject in the SHARED suppression set (the router/delivery read it).**
@@ -521,13 +597,21 @@ mod tests {
 
         assert!(!restrict.is_restricted("u-r"), "not restricted initially");
         holder.restrict(&subj, true).expect("restrict on succeeds");
-        assert!(restrict.is_restricted("u-r"), "the holder recorded the restriction in the shared set");
-        holder.restrict(&subj, false).expect("restrict off succeeds");
+        assert!(
+            restrict.is_restricted("u-r"),
+            "the holder recorded the restriction in the shared set"
+        );
+        holder
+            .restrict(&subj, false)
+            .expect("restrict off succeeds");
         assert!(!restrict.is_restricted("u-r"), "restrict off clears it");
 
         // Unbacked → a well-defined no-op (no panic), records nothing.
         let unbacked = NotifHistoryHolder::default();
-        assert!(unbacked.restrict(&subj, true).is_ok(), "unbacked restrict is a no-op receipt");
+        assert!(
+            unbacked.restrict(&subj, true).is_ok(),
+            "unbacked restrict is a no-op receipt"
+        );
     }
 
     /// **The holder is empty-but-correct unbacked (the registration-only surface), not an error.**
@@ -537,11 +621,17 @@ mod tests {
     fn unbacked_holder_is_empty_but_correct() {
         let holder = NotifHistoryHolder::default();
         let subj = subject("u-1");
-        let loc = holder.locate(&subj, tenant()).expect("locate over empty surface succeeds");
+        let loc = holder
+            .locate(&subj, tenant())
+            .expect("locate over empty surface succeeds");
         assert_eq!(loc.receipt.operation, "locate");
-        let exp = holder.export(&subj, tenant()).expect("export of empty bundle succeeds");
+        let exp = holder
+            .export(&subj, tenant())
+            .expect("export of empty bundle succeeds");
         assert_eq!(exp.receipt.operation, "export");
-        let rec = holder.rectify(&subj, Patch("x".into())).expect("rectify no-op succeeds");
+        let rec = holder
+            .rectify(&subj, Patch("x".into()))
+            .expect("rectify no-op succeeds");
         assert_eq!(rec.receipt.operation, "rectify");
     }
 
@@ -555,27 +645,45 @@ mod tests {
         let backing = NotifBacking::with_restrict(InboxProjection::new(), restrict.clone());
         // NotifBacking::restrict_set hands back the SAME set (writing through it is visible via the holder).
         backing.restrict_set().set("u-shared", true);
-        assert!(restrict.is_restricted("u-shared"), "the backing accessor is the shared set, not a fresh one");
+        assert!(
+            restrict.is_restricted("u-shared"),
+            "the backing accessor is the shared set, not a fresh one"
+        );
 
         let holder = NotifHistoryHolder::with_backing(backing);
         // NotifHistoryHolder::restrict_set surfaces Some(&that_same_set).
-        let via_holder = holder.restrict_set().expect("backed holder exposes its restrict set");
-        assert!(via_holder.is_restricted("u-shared"), "the holder accessor is the SAME shared set");
+        let via_holder = holder
+            .restrict_set()
+            .expect("backed holder exposes its restrict set");
+        assert!(
+            via_holder.is_restricted("u-shared"),
+            "the holder accessor is the SAME shared set"
+        );
         via_holder.set("u-shared", false);
-        assert!(!restrict.is_restricted("u-shared"), "a write through the holder accessor reaches the shared set");
+        assert!(
+            !restrict.is_restricted("u-shared"),
+            "a write through the holder accessor reaches the shared set"
+        );
 
         // Unbacked → None (no live suppression set).
-        assert!(NotifHistoryHolder::default().restrict_set().is_none(), "unbacked → no restrict set");
+        assert!(
+            NotifHistoryHolder::default().restrict_set().is_none(),
+            "unbacked → no restrict set"
+        );
     }
 
     /// **The holder is object-safe** — held behind `dyn PersonalDataHolder` exactly as the DSR
     /// orchestrator / holder registry need (a heterogeneous holder set, contract 10.1).
     #[test]
     fn holder_is_object_safe() {
-        let holders: Vec<Box<dyn PersonalDataHolder>> = vec![Box::new(NotifHistoryHolder::default())];
+        let holders: Vec<Box<dyn PersonalDataHolder>> =
+            vec![Box::new(NotifHistoryHolder::default())];
         let subj = subject("u-3");
         for h in &holders {
-            assert!(h.locate(&subj, tenant()).is_ok(), "the holder responds to the contract");
+            assert!(
+                h.locate(&subj, tenant()).is_ok(),
+                "the holder responds to the contract"
+            );
         }
     }
 }

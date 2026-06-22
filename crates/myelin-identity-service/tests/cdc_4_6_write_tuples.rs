@@ -85,16 +85,27 @@ fn cdc_4_6_write_tuples_provider_emits_consumer_stamps_zookie() {
     // CONSUMER stamps the returned zookie on the object and reads it back through the tenant-scoped
     // store — read-your-writes on the write half: the object's stamp IS the write's zookie.
     let stamped = provider.object_zookie(&s, "org:acme");
-    assert_eq!(stamped, zookie, "the consumer stamps + reads back exactly the provider's zookie");
+    assert_eq!(
+        stamped, zookie,
+        "the consumer stamps + reads back exactly the provider's zookie"
+    );
 
     // The provider emitted exactly one iam.tuple_written via the OUTBOX (no other emit path). The
     // relay (what `serve` runs) publishes it; the event carries the write's zookie for S8.
-    assert_eq!(outbox.outbox_depth(), 1, "exactly one event for the one committed write");
+    assert_eq!(
+        outbox.outbox_depth(),
+        1,
+        "exactly one event for the one committed write"
+    );
     let bus = InProcessBus::new();
     let relay = Relay::new(outbox.clone(), bus.clone(), || Timestamp("t".into()));
     relay.drain_to_empty();
     let published = bus.consume("");
-    assert_eq!(published.len(), 1, "the relay published exactly the one event");
+    assert_eq!(
+        published.len(),
+        1,
+        "the relay published exactly the one event"
+    );
     assert_eq!(published[0].type_.0, IAM_TUPLE_WRITTEN);
     assert_eq!(
         published[0].payload["zookie"],
@@ -129,5 +140,8 @@ fn cdc_4_6_zookie_advances_monotonically_across_writes() {
             Timestamp("2026-06-19T00:00:01Z".into()),
         )
         .unwrap();
-    assert!(z1.0 > z0.0, "the provider's zookie advances monotonically: {z1:?} after {z0:?}");
+    assert!(
+        z1.0 > z0.0,
+        "the provider's zookie advances monotonically: {z1:?} after {z0:?}"
+    );
 }

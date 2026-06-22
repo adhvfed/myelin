@@ -110,7 +110,11 @@ fn registry_with(tenant: &str, region: &str, home: &str) -> Registry {
         region: Region::new(region),
         status: CellStatus::Active,
         isolation_kind: IsolationKind::Pool,
-        capacity: Capacity { tenants_max: 1000, write_qps_max: 5000, storage_bytes_max: 1 << 40 },
+        capacity: Capacity {
+            tenants_max: 1000,
+            write_qps_max: 5000,
+            storage_bytes_max: 1 << 40,
+        },
         utilisation: 10,
         version: 1,
         endpoint: format!("cell.{region}.{home}.myelin.eu"),
@@ -144,12 +148,18 @@ fn cdc_10_5_mirror_gate_git_feature_honours_deny_by_default() {
     //    mirror feature HONOURS the deny — 0 pushes to the foreign host (the C-4 zero). ──
     let extra_eu = MirrorTarget::new("github.com", Region::new("us-east"));
     let denied = feature.try_mirror_push(&mut mirror_gate, &reg, &acme, &extra_eu, &policy);
-    assert!(!denied.is_allowed(), "the REAL transfer_allowed denies extra-EU by default → the gate denies");
+    assert!(
+        !denied.is_allowed(),
+        "the REAL transfer_allowed denies extra-EU by default → the gate denies"
+    );
     assert!(
         matches!(denied, MirrorDecision::Deny { .. }),
         "a crossing push without a transfer_allowed entry is REFUSED (loud), not logged-and-allowed"
     );
-    assert_eq!(feature.pushes_made, 0, "the Git mirror feature did NOT push (honours the deny)");
+    assert_eq!(
+        feature.pushes_made, 0,
+        "the Git mirror feature did NOT push (honours the deny)"
+    );
     assert_eq!(
         mirror_gate.unauthorised_pushes_prevented(),
         1,
@@ -160,8 +170,14 @@ fn cdc_10_5_mirror_gate_git_feature_honours_deny_by_default() {
     //    the SAME extra-EU target flips to ALLOWED; the feature now pushes (a lawful transfer). ──
     real_gate.record_transfer_mechanism(Region::new("us-east"));
     let allowed = feature.try_mirror_push(&mut mirror_gate, &reg, &acme, &extra_eu, &policy);
-    assert!(allowed.is_allowed(), "an extra-EU target WITH a recorded transfer mechanism is permitted");
-    assert_eq!(feature.pushes_made, 1, "the feature pushes on the now-lawful transfer");
+    assert!(
+        allowed.is_allowed(),
+        "an extra-EU target WITH a recorded transfer mechanism is permitted"
+    );
+    assert_eq!(
+        feature.pushes_made, 1,
+        "the feature pushes on the now-lawful transfer"
+    );
     assert_eq!(
         mirror_gate.unauthorised_pushes_prevented(),
         1,
@@ -192,14 +208,21 @@ fn cdc_10_5_mirror_gate_same_region_and_within_eu_allowed() {
 
     // Same region (fr-par → fr-par): no crossing, allowed.
     let same = MirrorTarget::new("git.acme.internal.fr", Region::new("fr-par"));
-    assert!(feature.try_mirror_push(&mut mirror_gate, &reg, &acme, &same, &policy).is_allowed());
+    assert!(feature
+        .try_mirror_push(&mut mirror_gate, &reg, &acme, &same, &policy)
+        .is_allowed());
 
     // Within-EU cross-region (fr-par → nl-ams): crosses the tenant's region but the REAL policy admits
     // within-EU structurally (within-EU acceleration, §5.3).
     let within_eu = MirrorTarget::new("mirror.nl.example", Region::new("nl-ams"));
-    assert!(feature.try_mirror_push(&mut mirror_gate, &reg, &acme, &within_eu, &policy).is_allowed());
+    assert!(feature
+        .try_mirror_push(&mut mirror_gate, &reg, &acme, &within_eu, &policy)
+        .is_allowed());
 
-    assert_eq!(feature.pushes_made, 2, "both the same-region and within-EU mirrors push");
+    assert_eq!(
+        feature.pushes_made, 2,
+        "both the same-region and within-EU mirrors push"
+    );
     assert_eq!(
         mirror_gate.unauthorised_pushes_prevented(),
         0,

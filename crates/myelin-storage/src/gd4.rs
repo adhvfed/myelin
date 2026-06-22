@@ -181,8 +181,10 @@ pub fn granularity_of_key_class(class: &KeyClass) -> KeyGranularity {
 /// key-granularity assertion). A mismatch is impossible by construction here (the table is the rule),
 /// but the assertion makes the completeness CHECKABLE and is the dated green artifact.
 pub fn assert_gd4_table_complete() -> Gd4TableReport {
-    let routed: Vec<(DataClass, KeyGranularity)> =
-        DataClass::all().iter().map(|c| (*c, c.granularity())).collect();
+    let routed: Vec<(DataClass, KeyGranularity)> = DataClass::all()
+        .iter()
+        .map(|c| (*c, c.granularity()))
+        .collect();
     // The expected §5.1 table — the independent oracle the routing is checked AGAINST (so the test is
     // not "the code agrees with itself"). A divergence is a `misrouted` count > 0.
     let expected = [
@@ -260,7 +262,8 @@ impl<'a> StructuralErasureFloor<'a> {
     /// This does NOT author a residual statement: the residual is [`RESIDUAL_POSTURE_REF`] (X-7).
     pub fn verify(&self, subject: &SubjectId, tenant: &TenantId) -> StructuralFloorReport {
         // Ensure the tenant KEK + the subject DEK exist (the structures the lever destroys).
-        self.engine.ensure_kek(&KekId::new(tenant.clone(), self.region.clone()));
+        self.engine
+            .ensure_kek(&KekId::new(tenant.clone(), self.region.clone()));
         let key_ref = self
             .engine
             .ensure_dek(tenant, &self.region, KeyClass::Subject(subject.0.clone()))
@@ -400,7 +403,10 @@ mod tests {
     fn gd4_table_routes_every_class_to_the_correct_granularity_zero_misrouted() {
         // THE HEADLINE: every §5.1 data class routes to its correct granularity, 0 misrouted.
         let report = assert_gd4_table_complete();
-        assert_eq!(report.misrouted, 0, "0 misrouted classes (GD-4 granularity completeness)");
+        assert_eq!(
+            report.misrouted, 0,
+            "0 misrouted classes (GD-4 granularity completeness)"
+        );
         assert!(report.is_green());
         // All six classes are present (the table is COMPLETE, not partial).
         assert_eq!(report.routed.len(), 6);
@@ -513,7 +519,10 @@ mod tests {
         let report = floor.verify(&SubjectId::new("u-erase"), &tenant);
 
         // (1) The lever destroyed the subject DEK and rendered their content unrecoverable.
-        assert!(report.lever_destroyed_dek, "the lever destroys the subject DEK");
+        assert!(
+            report.lever_destroyed_dek,
+            "the lever destroys the subject DEK"
+        );
         assert!(
             report.lever_renders_unrecoverable,
             "the destroyed DEK makes the subject's content unrecoverable (never plaintext)"
@@ -550,11 +559,23 @@ mod tests {
         };
         assert!(base.is_green());
         // A recoverable-in-backup > 0 (a key leaked into a backup) is RED.
-        assert!(!StructuralFloorReport { recoverable_in_backup: 1, ..base.clone() }.is_green());
+        assert!(!StructuralFloorReport {
+            recoverable_in_backup: 1,
+            ..base.clone()
+        }
+        .is_green());
         // The lever failing to render unrecoverable is RED.
-        assert!(!StructuralFloorReport { lever_renders_unrecoverable: false, ..base.clone() }.is_green());
+        assert!(!StructuralFloorReport {
+            lever_renders_unrecoverable: false,
+            ..base.clone()
+        }
+        .is_green());
         // The pseudonym reach missing is RED.
-        assert!(!StructuralFloorReport { pseudonym_shred_is_the_id_step: false, ..base }.is_green());
+        assert!(!StructuralFloorReport {
+            pseudonym_shred_is_the_id_step: false,
+            ..base
+        }
+        .is_green());
     }
 
     // ─────────────── the residual handled BY REFERENCE (X-7), not restated ───────────────
@@ -565,8 +586,14 @@ mod tests {
         let reference = assert_no_local_residual_statement();
         assert_eq!(reference, RESIDUAL_POSTURE_REF);
         // It is a REFERENCE (names §X-7 / 10.9), not a Storage-authored residual posture.
-        assert!(reference.contains("§X-7"), "the residual is a reference to X-7");
-        assert!(reference.contains("10.9"), "the residual is the ONE platform posture (10.9)");
+        assert!(
+            reference.contains("§X-7"),
+            "the residual is a reference to X-7"
+        );
+        assert!(
+            reference.contains("10.9"),
+            "the residual is the ONE platform posture (10.9)"
+        );
         // It does NOT author a Storage-local lawful-basis claim (a structural assertion: the only
         // residual string Storage emits is the by-reference pointer, never a local posture).
         assert!(
@@ -600,10 +627,15 @@ mod tests {
         let tenant = t("acme");
         let kms = engine_for(&tenant);
         // A second, NOT-erased subject whose DEK stays in the snapshot.
-        let _ = kms.ensure_dek(&tenant, &r(), KeyClass::Subject("u-keep".into())).unwrap();
+        let _ = kms
+            .ensure_dek(&tenant, &r(), KeyClass::Subject("u-keep".into()))
+            .unwrap();
         let floor = StructuralErasureFloor::new(&kms, r());
         let report = floor.verify(&SubjectId::new("u-erase"), &tenant);
-        assert_eq!(report.recoverable_in_backup, 0, "the erased subject's DEK is 0 in the backup");
+        assert_eq!(
+            report.recoverable_in_backup, 0,
+            "the erased subject's DEK is 0 in the backup"
+        );
         // The kept subject's DEK IS still in the snapshot (proves the filter matched the erased id,
         // not "any DEK" — a `!=` mutant would count the kept DEK and report non-zero).
         let kept = DekId::new(tenant.clone(), KeyClass::Subject("u-keep".into()));
@@ -625,7 +657,8 @@ mod tests {
         let floor = StructuralErasureFloor::new(&kms, r());
         let report = floor.verify(&SubjectId::new("u-x"), &tenant);
         // The resolve genuinely fails post-shred (the first conjunct).
-        let key_ref = crate::kms::PiiKeyRef::new(tenant.clone(), 0, KeyClass::Subject("u-x".into()));
+        let key_ref =
+            crate::kms::PiiKeyRef::new(tenant.clone(), 0, KeyClass::Subject("u-x".into()));
         assert!(
             kms.resolve_dek(&key_ref, &r()).is_err(),
             "the destroyed DEK no longer resolves (lever_works leg)"
@@ -670,7 +703,12 @@ mod tests {
         }
         let n = Noop;
         let holders = EraseHolders {
-            pseudonym: &n, search: &n, refs: &n, bus: &n, ledger: &n, git_reach: None,
+            pseudonym: &n,
+            search: &n,
+            refs: &n,
+            bus: &n,
+            ledger: &n,
+            git_reach: None,
         };
         assert!(structural_reach_uses_erase_seams(&holders));
     }

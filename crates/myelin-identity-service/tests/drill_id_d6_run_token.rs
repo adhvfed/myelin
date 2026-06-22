@@ -117,7 +117,12 @@ fn mint(svc: &StoreBackedCheck, s: &TenantScope, run: &str, now: &str) -> RunTok
         &RunId(run.into()),
         &agent("p:agent", "acme"),
         &human("p:human", "acme"),
-        &input(&["repo:acme/web#write"], &["repo:acme/web#write"], &["repo:acme/web#write"], &["repo:acme/web#write"]),
+        &input(
+            &["repo:acme/web#write"],
+            &["repo:acme/web#write"],
+            &["repo:acme/web#write"],
+            &["repo:acme/web#write"],
+        ),
         &caveats(&["repo:acme/web#write"]),
         MachineKind::Agent,
         &ttl(300), // run-life == 5 min == W (the upper bound)
@@ -148,7 +153,8 @@ fn id_d6_killed_run_token_revoked_and_auto_expires_within_run_life() {
     // Sanity: BEFORE the kill every surface honours the token (it is live mid-run).
     for surface in SURFACES {
         assert!(
-            svc.run_token_minter().is_live(&acme, &token, &ts("2026-06-19T00:01:00Z")),
+            svc.run_token_minter()
+                .is_live(&acme, &token, &ts("2026-06-19T00:01:00Z")),
             "surface {surface} honours the live per-run token before the kill"
         );
     }
@@ -176,7 +182,8 @@ fn id_d6_killed_run_token_revoked_and_auto_expires_within_run_life() {
         let _ = surface;
     }
     assert_eq!(
-        svc.run_token_minter().revocation_state(&acme, &token, &ts("2026-06-19T00:02:31Z")),
+        svc.run_token_minter()
+            .revocation_state(&acme, &token, &ts("2026-06-19T00:02:31Z")),
         RunTokenState::TornDown,
         "the killed run's token is torn down (the explicit teardown revoke)"
     );
@@ -186,7 +193,9 @@ fn id_d6_killed_run_token_revoked_and_auto_expires_within_run_life() {
     // die inside run-life ≤ W via the `expires_at` TTL (the revoke-on-crash defence-in-depth).
     let token_crash = mint(&svc, &acme, "run-crash", "2026-06-19T00:00:00Z");
     // Mid-run: live. (No teardown is ever issued for this run — the process crashed.)
-    assert!(svc.run_token_minter().is_live(&acme, &token_crash, &ts("2026-06-19T00:02:00Z")));
+    assert!(svc
+        .run_token_minter()
+        .is_live(&acme, &token_crash, &ts("2026-06-19T00:02:00Z")));
     // At run-life (now ≥ expires_at == 00:05:00) the token auto-expires — even with NO teardown.
     let auto_expire_lag_secs: i64 = w_secs; // the token dies at run-life == W (the bound it sits at).
     let mut crash_path_survival: i64 = 0;
@@ -200,7 +209,8 @@ fn id_d6_killed_run_token_revoked_and_auto_expires_within_run_life() {
         let _ = surface;
     }
     assert_eq!(
-        svc.run_token_minter().revocation_state(&acme, &token_crash, &ts("2026-06-19T00:05:01Z")),
+        svc.run_token_minter()
+            .revocation_state(&acme, &token_crash, &ts("2026-06-19T00:05:01Z")),
         RunTokenState::Expired,
         "the crash-path token auto-expires at run-life even though teardown was skipped"
     );
@@ -223,8 +233,14 @@ fn id_d6_killed_run_token_revoked_and_auto_expires_within_run_life() {
     signals
         .assert_signal(SignalName::CrossTenantCount, Predicate::Eq(0))
         .expect_green();
-    assert_eq!(stale_token_survival, 0, "0 surfaces honour the torn-down token (teardown leg)");
-    assert_eq!(crash_path_survival, 0, "0 surfaces honour the auto-expired token (crash leg)");
+    assert_eq!(
+        stale_token_survival, 0,
+        "0 surfaces honour the torn-down token (teardown leg)"
+    );
+    assert_eq!(
+        crash_path_survival, 0,
+        "0 surfaces honour the auto-expired token (crash leg)"
+    );
 
     // (2) token-revocation-lag ≤ W on the teardown leg (0 s ≤ 300 s), and the auto-expire window ≤ W
     //     on the crash leg (the token dies at run-life == W), with run-life ≥ the agent-token TTL
@@ -296,7 +312,8 @@ fn id_d6_mutation_floor_re_check_and_auto_expire_are_mandatory_core() {
     // (b) The AUTO-EXPIRE: every minted token dies at run-life even with no teardown (a mutation
     //     dropping the `expires_at` TTL would leave the token live past its run — caught here).
     assert!(
-        svc.run_token_minter().is_live(&acme, &token, &ts("2026-06-19T00:01:00Z")),
+        svc.run_token_minter()
+            .is_live(&acme, &token, &ts("2026-06-19T00:01:00Z")),
         "the token is live within run-life"
     );
     assert!(

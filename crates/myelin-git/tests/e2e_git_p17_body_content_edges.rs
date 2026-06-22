@@ -40,7 +40,11 @@ fn ctx_base() -> EmitContextBase {
 }
 
 fn alice() -> Principal {
-    Principal::stub(PrincipalId("p-alice".into()), PrincipalKind::Human, TenantId("acme".into()))
+    Principal::stub(
+        PrincipalId("p-alice".into()),
+        PrincipalKind::Human,
+        TenantId("acme".into()),
+    )
 }
 
 /// The inline comment body the e2e authors: a `@`-mention + an inline `Closes` artifact-ref + an embed,
@@ -56,7 +60,9 @@ fn comment_body() -> Body {
         // TYPED lifecycle edge is GIT-P19's distinct producer; THIS is the content-node reference edge.
         InlineNode::ArtifactRefNode(ArtifactRef("myelin://acme/issue/issue/ENG-1".into())),
         // an embed of a knowledge page (→ embeds).
-        InlineNode::Embed(ArtifactRef("myelin://acme/knowledge/page/7c2#block-3".into())),
+        InlineNode::Embed(ArtifactRef(
+            "myelin://acme/knowledge/page/7c2#block-3".into(),
+        )),
     ];
     Body::new(md, nodes)
 }
@@ -102,7 +108,10 @@ fn inline_comment_with_mention_closes_embed_emits_exactly_three_edges() {
     let body = comment_body();
 
     // 1. the round-trip parity leg (contract 13.1): render(parse(md)) === md byte-identical.
-    assert!(body.round_trips(), "the comment body must round-trip render(parse(md)) === md");
+    assert!(
+        body.round_trips(),
+        "the comment body must round-trip render(parse(md)) === md"
+    );
 
     // 2. open ONE outbox transaction; the body row co-commits (staged state change) with its edges.
     let content_event = content_event(&source);
@@ -112,23 +121,40 @@ fn inline_comment_with_mention_closes_embed_emits_exactly_three_edges() {
         .expect("the body edges emit");
 
     // exactly 3 edges (1 per structured node; 0 dup, 0 missed).
-    assert_eq!(edge_ids.len(), 3, "3 structured nodes → exactly 3 refs.edge.created");
+    assert_eq!(
+        edge_ids.len(),
+        3,
+        "3 structured nodes → exactly 3 refs.edge.created"
+    );
 
     // before commit nothing is durable (emit-iff-committed).
     assert_eq!(outbox.committed_count(), 0, "nothing durable before commit");
     tx.commit().expect("the body + edges co-commit");
 
     // 3. the 3 edges are durable (the body row co-committed; the edges are the outbox rows).
-    assert_eq!(outbox.committed_count(), 3, "the 3 edges co-committed with the body row");
+    assert_eq!(
+        outbox.committed_count(),
+        3,
+        "the 3 edges co-committed with the body row"
+    );
 
     // 4. assert the EXACT edge set the three nodes produced (mention→mentions, ref→links, embed→embeds),
     //    each a `refs.edge.created` with the references-not-payloads triple + the shared edge aggregate.
     let mut seen_rels: Vec<String> = Vec::new();
     for id in &edge_ids {
         let env = outbox.row(id).expect("the edge row is durable").envelope;
-        assert_eq!(env.type_.0, "refs.edge.created", "each edge is a refs.edge.created");
-        assert_eq!(env.payload["rel_class"], "reference", "content-node edges are reference-class");
-        assert_eq!(env.payload["source"], source.0, "the source is the comment body URN");
+        assert_eq!(
+            env.type_.0, "refs.edge.created",
+            "each edge is a refs.edge.created"
+        );
+        assert_eq!(
+            env.payload["rel_class"], "reference",
+            "content-node edges are reference-class"
+        );
+        assert_eq!(
+            env.payload["source"], source.0,
+            "the source is the comment body URN"
+        );
         // the edge inherits the content event's correlation root (causality correct-by-construction).
         assert_eq!(
             env.correlation_id, content_event.correlation_id,
@@ -139,13 +165,21 @@ fn inline_comment_with_mention_closes_embed_emits_exactly_three_edges() {
             Some(&content_event.event_id.0),
             "the edge's causation is the content event"
         );
-        assert_eq!(env.depth, content_event.depth + 1, "the edge is depth+1 (the loop-guard stamp)");
+        assert_eq!(
+            env.depth,
+            content_event.depth + 1,
+            "the edge is depth+1 (the loop-guard stamp)"
+        );
         seen_rels.push(env.payload["rel"].as_str().unwrap().to_string());
     }
     seen_rels.sort();
     assert_eq!(
         seen_rels,
-        vec!["embeds".to_string(), "links".to_string(), "mentions".to_string()],
+        vec![
+            "embeds".to_string(),
+            "links".to_string(),
+            "mentions".to_string()
+        ],
         "exactly one mentions + one links + one embeds edge"
     );
 
@@ -175,11 +209,16 @@ fn aborted_body_write_emits_zero_edges() {
         let content_event = content_event(&source);
         let mut tx = outbox.begin(Arc::clone(&minter), ctx_base());
         tx.stage_state_change("git comment cAbc body written");
-        let ids = emit_body_edges(&mut tx, &source, body.structured_nodes(), &content_event).unwrap();
+        let ids =
+            emit_body_edges(&mut tx, &source, body.structured_nodes(), &content_event).unwrap();
         assert_eq!(ids.len(), 3, "3 edges were buffered");
         // DROP the transaction without committing (the abort).
     }
-    assert_eq!(outbox.committed_count(), 0, "an aborted body write commits 0 rows (no ghost edges)");
+    assert_eq!(
+        outbox.committed_count(),
+        0,
+        "an aborted body write commits 0 rows (no ghost edges)"
+    );
 }
 
 /// **A plain-prose comment (a literal `Closes ENG-1` + a literal `@alice` in text) produces ZERO content

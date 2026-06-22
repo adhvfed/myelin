@@ -135,7 +135,8 @@ impl MockScript {
             None => StepOutcome::Submit(Submission(
                 // The defensive terminal submit — a well-formed script never reaches here. Loud
                 // marker so a golden/drill assertion that the script ran off its end is catchable.
-                "mock: script exhausted — defensive terminal submit (script not well-formed)".into(),
+                "mock: script exhausted — defensive terminal submit (script not well-formed)"
+                    .into(),
             )),
         }
     }
@@ -507,7 +508,10 @@ mod tests {
         let opening = Conversation::default();
         let a = brain.step(&opening);
         let b = brain.step(&opening); // same conversation → SAME outcome (stateless).
-        assert_eq!(a, b, "the brain holds no cursor — same conversation, same outcome");
+        assert_eq!(
+            a, b,
+            "the brain holds no cursor — same conversation, same outcome"
+        );
         assert_eq!(
             a,
             StepOutcome::UseTools(vec![ToolCall(ToolName("search".into()))]),
@@ -529,13 +533,28 @@ mod tests {
     #[test]
     fn model_turns_taken_counts_only_model_turns() {
         let mut conv = Conversation::default();
-        assert_eq!(model_turns_taken(&conv), 0, "an opening conversation is at position 0");
-        conv.turns.push(Turn::Model(StepOutcome::Submit(Submission("a".into()))));
+        assert_eq!(
+            model_turns_taken(&conv),
+            0,
+            "an opening conversation is at position 0"
+        );
+        conv.turns
+            .push(Turn::Model(StepOutcome::Submit(Submission("a".into()))));
         assert_eq!(model_turns_taken(&conv), 1, "one model turn → position 1");
-        conv.turns.push(Turn::ToolResults(vec![ToolResult("r".into())]));
-        assert_eq!(model_turns_taken(&conv), 1, "a tool-result turn does NOT advance the position");
-        conv.turns.push(Turn::Model(StepOutcome::Submit(Submission("b".into()))));
-        assert_eq!(model_turns_taken(&conv), 2, "a second model turn → position 2");
+        conv.turns
+            .push(Turn::ToolResults(vec![ToolResult("r".into())]));
+        assert_eq!(
+            model_turns_taken(&conv),
+            1,
+            "a tool-result turn does NOT advance the position"
+        );
+        conv.turns
+            .push(Turn::Model(StepOutcome::Submit(Submission("b".into()))));
+        assert_eq!(
+            model_turns_taken(&conv),
+            2,
+            "a second model turn → position 2"
+        );
     }
 
     /// **AG-D9 (the step-determinism leg) — the GOLDEN test: the SAME script replays to a
@@ -547,7 +566,10 @@ mod tests {
         let script = search_then_read_then_submit();
         let first = replay(&script);
         let second = replay(&script);
-        assert_eq!(first, second, "AG-D9: two replays of the same script are byte-identical");
+        assert_eq!(
+            first, second,
+            "AG-D9: two replays of the same script are byte-identical"
+        );
 
         // the recorded stream is exactly the script (search, read, submit), in order.
         assert_eq!(
@@ -559,7 +581,10 @@ mod tests {
             ],
             "the replayed StepOutcome stream IS the script, in order"
         );
-        assert!(first.terminated, "a well-formed script terminates the bounded loop");
+        assert!(
+            first.terminated,
+            "a well-formed script terminates the bounded loop"
+        );
         assert_eq!(
             first.submission,
             Some(Submission("the answer".into())),
@@ -576,21 +601,42 @@ mod tests {
         let rec = replay(&script);
 
         // three turns recorded (search, read, submit).
-        assert_eq!(rec.conversations.len(), 3, "three turns → three reconstructed conversations");
+        assert_eq!(
+            rec.conversations.len(),
+            3,
+            "three turns → three reconstructed conversations"
+        );
 
         // turn 0: an opening conversation (no prior turns), the script's system + tools + budget.
         let c0 = &rec.conversations[0];
         assert!(c0.turns.is_empty(), "turn 0 opens with an empty transcript");
-        assert_eq!(c0.system, SystemContext("you are agent-7; you are labelled as an agent".into()));
-        assert_eq!(c0.tools.len(), 2, "the scoped tool list is rebuilt from the script");
-        assert_eq!(c0.budget, BudgetView(100), "the budget view is rebuilt from the script");
+        assert_eq!(
+            c0.system,
+            SystemContext("you are agent-7; you are labelled as an agent".into())
+        );
+        assert_eq!(
+            c0.tools.len(),
+            2,
+            "the scoped tool list is rebuilt from the script"
+        );
+        assert_eq!(
+            c0.budget,
+            BudgetView(100),
+            "the budget view is rebuilt from the script"
+        );
 
         // turn 1: the transcript now holds [Model(search), ToolResults(tool:search:result)].
         let c1 = &rec.conversations[1];
-        assert_eq!(c1.turns.len(), 2, "turn 1 sees the search step + its routed tool result");
+        assert_eq!(
+            c1.turns.len(),
+            2,
+            "turn 1 sees the search step + its routed tool result"
+        );
         assert_eq!(
             c1.turns[0],
-            Turn::Model(StepOutcome::UseTools(vec![ToolCall(ToolName("search".into()))]))
+            Turn::Model(StepOutcome::UseTools(vec![ToolCall(ToolName(
+                "search".into()
+            ))]))
         );
         assert_eq!(
             c1.turns[1],
@@ -620,16 +666,32 @@ mod tests {
         }
         let framing = MockScript::new(SystemContext("sys".into()), vec![], BudgetView(0), vec![]);
         let rec = replay_bounded(&NeverSubmits, &framing, /* max_steps */ 5);
-        assert!(!rec.terminated, "a non-terminating brain trips the ceiling (never hangs)");
-        assert_eq!(rec.outcomes.len(), 5, "it ran exactly max_steps turns, then stopped (bounded)");
-        assert_eq!(rec.submission, None, "no terminal submission (it never submitted)");
+        assert!(
+            !rec.terminated,
+            "a non-terminating brain trips the ceiling (never hangs)"
+        );
+        assert_eq!(
+            rec.outcomes.len(),
+            5,
+            "it ran exactly max_steps turns, then stopped (bounded)"
+        );
+        assert_eq!(
+            rec.submission, None,
+            "no terminal submission (it never submitted)"
+        );
 
         // a well-formed scripted brain terminates BELOW the ceiling.
         let good = search_then_read_then_submit();
-        assert!(good.is_well_formed(), "search→read→submit ends in a terminal Submit");
+        assert!(
+            good.is_well_formed(),
+            "search→read→submit ends in a terminal Submit"
+        );
         let good_brain = MockAgentRuntime::new(good.clone());
         let good_rec = replay_bounded(&good_brain, &good, 64);
-        assert!(good_rec.terminated, "a well-formed scripted brain terminates the bounded loop");
+        assert!(
+            good_rec.terminated,
+            "a well-formed scripted brain terminates the bounded loop"
+        );
     }
 
     /// **An over-stepped script replays a defensive terminal Submit past its end (never hangs), and
@@ -645,11 +707,17 @@ mod tests {
         ));
         match script.step_at(1) {
             StepOutcome::Submit(Submission(s)) => {
-                assert!(s.contains("script exhausted"), "past-the-end is a LOUD defensive submit: {s}");
+                assert!(
+                    s.contains("script exhausted"),
+                    "past-the-end is a LOUD defensive submit: {s}"
+                );
             }
             other => panic!("expected a defensive terminal submit, got {other:?}"),
         }
-        assert!(script.is_well_formed(), "submit_only IS well-formed (a single terminal Submit)");
+        assert!(
+            script.is_well_formed(),
+            "submit_only IS well-formed (a single terminal Submit)"
+        );
     }
 
     /// **8.3 — the real `--use-mock` flag selects the mock brain on the SAME `&dyn AgentRuntime`
@@ -658,12 +726,20 @@ mod tests {
     fn use_mock_flag_selects_the_mock_brain_on_the_same_seam() {
         // absent → SKELETON (the default; immediate submit).
         let flag = RuntimeFlag::from_args(["myelin-agent", "serve"]);
-        assert_eq!(flag, RuntimeFlag::Skeleton, "no --use-mock → the SKELETON brain (default)");
+        assert_eq!(
+            flag,
+            RuntimeFlag::Skeleton,
+            "no --use-mock → the SKELETON brain (default)"
+        );
         assert!(!flag.is_mock());
 
         // present → the mock.
         let flag = RuntimeFlag::from_args(["myelin-agent", "serve", "--use-mock"]);
-        assert_eq!(flag, RuntimeFlag::UseMock, "--use-mock → the deterministic mock brain");
+        assert_eq!(
+            flag,
+            RuntimeFlag::UseMock,
+            "--use-mock → the deterministic mock brain"
+        );
         assert!(flag.is_mock());
 
         // select_runtime returns the brain behind the FROZEN &dyn AgentRuntime seam — the mock runs
@@ -676,7 +752,10 @@ mod tests {
         );
 
         // the SKELETON arm returns the SKELETON's immediate submit (the script is unused).
-        let skel = select_runtime(RuntimeFlag::Skeleton, MockScript::submit_only("sys", "ignored"));
+        let skel = select_runtime(
+            RuntimeFlag::Skeleton,
+            MockScript::submit_only("sys", "ignored"),
+        );
         assert!(
             matches!(skel.step(&Conversation::default()), StepOutcome::Submit(_)),
             "the SKELETON arm submits immediately (no model, no tools)"
@@ -708,24 +787,47 @@ mod tests {
     fn build_conversation_is_deterministic() {
         let script = search_then_read_then_submit();
         let mut history = TraceHistory::new();
-        history.push_model(StepOutcome::UseTools(vec![ToolCall(ToolName("search".into()))]));
+        history.push_model(StepOutcome::UseTools(vec![ToolCall(ToolName(
+            "search".into(),
+        ))]));
         history.push_tool_results(vec![ToolResult("tool:search:result".into())]);
 
         let a = build_conversation(&script, &history);
         let b = build_conversation(&script, &history);
-        assert_eq!(a, b, "the same (script, history) rebuilds a byte-identical conversation");
-        assert_eq!(a.turns.len(), 2, "the transcript carries the model step + the tool result");
-        assert_eq!(a.system, *script.system(), "the system framing is rebuilt from the script");
-        assert_eq!(a.tools, script.tools(), "the scoped tool list is rebuilt from the script");
+        assert_eq!(
+            a, b,
+            "the same (script, history) rebuilds a byte-identical conversation"
+        );
+        assert_eq!(
+            a.turns.len(),
+            2,
+            "the transcript carries the model step + the tool result"
+        );
+        assert_eq!(
+            a.system,
+            *script.system(),
+            "the system framing is rebuilt from the script"
+        );
+        assert_eq!(
+            a.tools,
+            script.tools(),
+            "the scoped tool list is rebuilt from the script"
+        );
     }
 
     /// **`MockScript::is_well_formed` is exact (mutation-floor — a committed fixture MUST terminate).**
     /// non-empty + last == Submit ⇒ well-formed; empty or last == UseTools ⇒ NOT.
     #[test]
     fn is_well_formed_predicate_is_exact() {
-        assert!(!MockScript::new(SystemContext("s".into()), vec![], BudgetView(0), vec![])
-            .is_well_formed(), "an empty script is NOT well-formed (it never terminates)");
-        assert!(MockScript::submit_only("s", "x").is_well_formed(), "a single Submit IS well-formed");
+        assert!(
+            !MockScript::new(SystemContext("s".into()), vec![], BudgetView(0), vec![])
+                .is_well_formed(),
+            "an empty script is NOT well-formed (it never terminates)"
+        );
+        assert!(
+            MockScript::submit_only("s", "x").is_well_formed(),
+            "a single Submit IS well-formed"
+        );
         let trailing_tools = MockScript::new(
             SystemContext("s".into()),
             vec![],
@@ -735,7 +837,10 @@ mod tests {
                 StepOutcome::UseTools(vec![ToolCall(ToolName("t".into()))]),
             ],
         );
-        assert!(!trailing_tools.is_well_formed(), "a script ending in UseTools is NOT well-formed");
+        assert!(
+            !trailing_tools.is_well_formed(),
+            "a script ending in UseTools is NOT well-formed"
+        );
     }
 
     /// **The `MockScript` / `TraceHistory` accessors are EXACT (mutation-floor — kills the
@@ -748,14 +853,32 @@ mod tests {
         // MockScript::len / is_empty — distinct non-trivial values kill `-> 0`, `-> 1`, `-> true/false`.
         let empty = MockScript::new(SystemContext("s".into()), vec![], BudgetView(0), vec![]);
         assert_eq!(empty.len(), 0, "an empty script has len 0 (kills -> 1)");
-        assert!(empty.is_empty(), "an empty script is_empty (kills -> false)");
+        assert!(
+            empty.is_empty(),
+            "an empty script is_empty (kills -> false)"
+        );
         let three = search_then_read_then_submit();
-        assert_eq!(three.len(), 3, "a three-step script has len 3 (kills -> 0 / -> 1)");
-        assert!(!three.is_empty(), "a non-empty script is NOT is_empty (kills -> true)");
+        assert_eq!(
+            three.len(),
+            3,
+            "a three-step script has len 3 (kills -> 0 / -> 1)"
+        );
+        assert!(
+            !three.is_empty(),
+            "a non-empty script is NOT is_empty (kills -> true)"
+        );
 
         // MockScript::budget — a non-default value kills the `-> default()` mutant.
-        assert_eq!(*three.budget(), BudgetView(100), "budget() returns its field (kills -> default)");
-        assert_ne!(*three.budget(), BudgetView::default(), "the budget is non-default (kills -> default)");
+        assert_eq!(
+            *three.budget(),
+            BudgetView(100),
+            "budget() returns its field (kills -> default)"
+        );
+        assert_ne!(
+            *three.budget(),
+            BudgetView::default(),
+            "the budget is non-default (kills -> default)"
+        );
 
         // TraceHistory::len / is_empty — distinct non-trivial values kill the constant mutants.
         let mut h = TraceHistory::new();
@@ -764,6 +887,9 @@ mod tests {
         h.push_model(StepOutcome::Submit(Submission("a".into())));
         h.push_tool_results(vec![ToolResult("r".into())]);
         assert_eq!(h.len(), 2, "two entries → len 2 (kills -> 0 / -> 1)");
-        assert!(!h.is_empty(), "a non-empty history is NOT is_empty (kills -> true)");
+        assert!(
+            !h.is_empty(),
+            "a non-empty history is NOT is_empty (kills -> true)"
+        );
     }
 }

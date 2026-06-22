@@ -167,7 +167,8 @@ impl<I: IdentityService, C: Clock> GitCheckGate<I, C> {
         threshold: &FailStaticThreshold,
         clock: C,
     ) -> Result<Self, FailStaticError> {
-        let failstatic = FailStaticAuthz::try_new_with_clock(revocation_sla_secs, threshold, clock)?;
+        let failstatic =
+            FailStaticAuthz::try_new_with_clock(revocation_sla_secs, threshold, clock)?;
         Ok(Self { id, failstatic })
     }
 
@@ -343,7 +344,11 @@ impl<I: IdentityService, C: Clock> GitCheckGate<I, C> {
 /// A single `Add` tuple delta (the grant shape `grant_relation` writes) — `object#relation@subject`.
 /// Spelled here so a caller declaring "grant alice `reviewer` on pr:42" does not hand-build the
 /// `TupleDelta::Add(RelationTuple { .. })` boilerplate.
-pub fn add_tuple(object: &str, relation: &str, subject: &myelin_identity::PrincipalId) -> TupleDelta {
+pub fn add_tuple(
+    object: &str,
+    relation: &str,
+    subject: &myelin_identity::PrincipalId,
+) -> TupleDelta {
     TupleDelta::Add(RelationTuple {
         object: ObjectId(object.to_string()),
         relation: RelName(relation.to_string()),
@@ -476,12 +481,12 @@ mod tests {
             if self.hiccup.get() {
                 return Err(AuthzError::Unavailable("forced Id break (drill)".into()));
             }
-            assert_eq!(permission.0, perm::CODE_OWNER, "code_owners lists the code_owner relation");
-            let members = self
-                .code_owners
-                .get(&object.0)
-                .cloned()
-                .unwrap_or_default();
+            assert_eq!(
+                permission.0,
+                perm::CODE_OWNER,
+                "code_owners lists the code_owner relation"
+            );
+            let members = self.code_owners.get(&object.0).cloned().unwrap_or_default();
             Ok(IdSubjectTree {
                 object: object.clone(),
                 relation: RelName(permission.0.clone()),
@@ -596,14 +601,32 @@ mod tests {
         let pull = Permission(perm::PULL.into());
 
         // a granted reader pulls (fresh allow).
-        let d = g.front_door_check(&subject("p:alice"), &pull, &repo, Zookie(String::new()), false);
-        assert!(is_allow(&d), "a granted reader pulls (live fragment enforced)");
+        let d = g.front_door_check(
+            &subject("p:alice"),
+            &pull,
+            &repo,
+            Zookie(String::new()),
+            false,
+        );
+        assert!(
+            is_allow(&d),
+            "a granted reader pulls (live fragment enforced)"
+        );
         assert_eq!(d.served, AuthzServed::Fresh);
 
         // an outsider on a DIFFERENT repo is denied (fail-closed — no grant).
         let other = repo_ref("secret");
-        let d = g.front_door_check(&subject("p:bob"), &pull, &other, Zookie(String::new()), false);
-        assert!(!is_allow(&d), "an outsider is denied (0 unauthorized admitted)");
+        let d = g.front_door_check(
+            &subject("p:bob"),
+            &pull,
+            &other,
+            Zookie(String::new()),
+            false,
+        );
+        assert!(
+            !is_allow(&d),
+            "an outsider is denied (0 unauthorized admitted)"
+        );
     }
 
     // ── 2. protected_push is the tighter gate: an admin passes, a mere writer does not. ──
@@ -618,8 +641,16 @@ mod tests {
 
         // a subject without the protected_push grant on the ref is denied.
         let other_ref = ArtifactRef("ref:core::refs/heads/release".into());
-        let d = g.protected_push_check(&subject("p:writer"), &other_ref, Zookie(String::new()), false);
-        assert!(!is_allow(&d), "a mere writer cannot push a different protected ref (fail-closed)");
+        let d = g.protected_push_check(
+            &subject("p:writer"),
+            &other_ref,
+            Zookie(String::new()),
+            false,
+        );
+        assert!(
+            !is_allow(&d),
+            "a mere writer cannot push a different protected ref (fail-closed)"
+        );
     }
 
     // ── 3. the X-1 fork-endorsement gate is a plain relation check; read-your-writes via the zookie. ──
@@ -631,12 +662,23 @@ mod tests {
 
         // before the grant: a maintainer cannot endorse (fail-closed).
         let d = g.fork_endorsement_check(&subject("p:maint"), &repo, Zookie(String::new()), false);
-        assert!(!is_allow(&d), "no endorsement relation yet → denied (X-1, fail-closed)");
+        assert!(
+            !is_allow(&d),
+            "no endorsement relation yet → denied (X-1, fail-closed)"
+        );
 
         // grant the approve_untrusted_ci relation → a fresh zookie fence.
-        let delta = add_tuple(&repo.0, perm::APPROVE_UNTRUSTED_CI, &PrincipalId("p:maint".into()));
+        let delta = add_tuple(
+            &repo.0,
+            perm::APPROVE_UNTRUSTED_CI,
+            &PrincipalId("p:maint".into()),
+        );
         let zk = g.grant_relation(&[delta], None).expect("grant");
-        assert_eq!(zk, Zookie("zk-1".into()), "write_tuples returns a fresh read-your-writes fence");
+        assert_eq!(
+            zk,
+            Zookie("zk-1".into()),
+            "write_tuples returns a fresh read-your-writes fence"
+        );
 
         // the grant was recorded (write_tuples ran).
         assert_eq!(g.id_ref().granted.borrow().len(), 1);
@@ -655,10 +697,15 @@ mod tests {
         let id = StubId::new().with_code_owners(&ref_id.0, &["p:alice", "team:payments"]);
         let g = gate(id, TestClock::at(1_000));
 
-        let tree = g.code_owners(&ref_id, Zookie(String::new())).expect("resolved");
+        let tree = g
+            .code_owners(&ref_id, Zookie(String::new()))
+            .expect("resolved");
         let owners: Vec<&str> = tree.members.iter().map(|p| p.0.as_str()).collect();
         assert!(owners.contains(&"p:alice"), "alice is a required reviewer");
-        assert!(owners.contains(&"team:payments"), "the payments team is a required reviewer");
+        assert!(
+            owners.contains(&"team:payments"),
+            "the payments team is a required reviewer"
+        );
     }
 
     // ── 5. THE DEGRADE GATE: a forced Id break → a BoundedStale read serves the last coarse grant
@@ -682,19 +729,35 @@ mod tests {
         //    coarse grant STATIC (the availability win), NOT a cascade-to-closed.
         g.clock().advance(31);
         let d = g.front_door_check(&alice, &pull, &repo, Zookie(String::new()), false);
-        assert!(d.is_degraded(), "the BoundedStale read served STATIC during the Id hiccup");
-        assert!(is_allow(&d), "the degraded answer is the cached ALLOW (already-authorised survives)");
+        assert!(
+            d.is_degraded(),
+            "the BoundedStale read served STATIC during the Id hiccup"
+        );
+        assert!(
+            is_allow(&d),
+            "the degraded answer is the cached ALLOW (already-authorised survives)"
+        );
 
         // 4) RECOVER the dependency (reversible) → the next read is fresh again (no cascade left
         //    behind).
         g.id_ref().set_hiccup(false);
         let d = g.front_door_check(&alice, &pull, &repo, Zookie(String::new()), false);
-        assert_eq!(d.served, AuthzServed::Fresh, "recovered → fresh again (the degrade was bounded)");
+        assert_eq!(
+            d.served,
+            AuthzServed::Fresh,
+            "recovered → fresh again (the degrade was bounded)"
+        );
 
         // observability: at least one stale answer was served + its age never exceeded static_max.
         let s = g.signals();
-        assert!(s.stale >= 1, "a degrade was observed (fresh/stale/closed ratio signal)");
-        assert!(s.last_staleness_secs <= g.static_max(), "staleness ≤ static_max (≤ revocation SLA)");
+        assert!(
+            s.stale >= 1,
+            "a degrade was observed (fresh/stale/closed ratio signal)"
+        );
+        assert!(
+            s.last_staleness_secs <= g.static_max(),
+            "staleness ≤ static_max (≤ revocation SLA)"
+        );
     }
 
     // ── 6. THE REVOKED-ACTOR DENY: a just-revoked subject is denied THROUGH the stale cache — a
@@ -708,15 +771,34 @@ mod tests {
         let alice = subject("p:alice");
 
         // cache a coarse ALLOW for alice.
-        assert!(is_allow(&g.front_door_check(&alice, &pull, &repo, Zookie(String::new()), false)));
+        assert!(is_allow(&g.front_door_check(
+            &alice,
+            &pull,
+            &repo,
+            Zookie(String::new()),
+            false
+        )));
 
         // alice is REVOKED. Even with a cached ALLOW + the Id hiccupping (so a fresh re-check is
         // impossible), the revocation consult denies her BEFORE the cache is read.
         g.id_ref().set_hiccup(true);
         g.clock().advance(31); // inside static_max — the cache WOULD serve Static otherwise.
-        let d = g.front_door_check(&alice, &pull, &repo, Zookie(String::new()), /*revoked*/ true);
-        assert_eq!(d.served, AuthzServed::Revoked, "a revoked subject is denied through the cache");
-        assert!(!is_allow(&d), "the cached ALLOW does NOT override the revoke (0 stale escalation)");
+        let d = g.front_door_check(
+            &alice,
+            &pull,
+            &repo,
+            Zookie(String::new()),
+            /*revoked*/ true,
+        );
+        assert_eq!(
+            d.served,
+            AuthzServed::Revoked,
+            "a revoked subject is denied through the cache"
+        );
+        assert!(
+            !is_allow(&d),
+            "the cached ALLOW does NOT override the revoke (0 stale escalation)"
+        );
     }
 
     // ── 7. THE ZOOKIE BYPASS (4.10): a Strong (merge-gate) read BYPASSES the cache and fails CLOSED
@@ -731,13 +813,20 @@ mod tests {
         // a healthy strong merge read serves the authoritative source directly (cache bypassed).
         let d = g.merge_check(&actor, &pr, Zookie("zk-1".into()), false);
         assert!(is_allow(&d), "a healthy merge read allows");
-        assert_eq!(d.served, AuthzServed::SourceBypass, "a Strong read bypasses the cache");
+        assert_eq!(
+            d.served,
+            AuthzServed::SourceBypass,
+            "a Strong read bypasses the cache"
+        );
 
         // BREAK the Id dependency: the strong read fails CLOSED (never serves stale — the new-enemy
         // guard), even though a BoundedStale read at the same instant would have degraded.
         g.id_ref().set_hiccup(true);
         let d = g.merge_check(&actor, &pr, Zookie("zk-2".into()), false);
-        assert!(!is_allow(&d), "a Strong read fails CLOSED on a hiccup (never stale)");
+        assert!(
+            !is_allow(&d),
+            "a Strong read fails CLOSED on a hiccup (never stale)"
+        );
         assert_eq!(d.served, AuthzServed::BypassClosed);
     }
 
@@ -751,14 +840,27 @@ mod tests {
         let pull = Permission(perm::PULL.into());
         let alice = subject("p:alice");
 
-        assert!(is_allow(&g.front_door_check(&alice, &pull, &repo, Zookie(String::new()), false)));
+        assert!(is_allow(&g.front_door_check(
+            &alice,
+            &pull,
+            &repo,
+            Zookie(String::new()),
+            false
+        )));
         g.id_ref().set_hiccup(true);
 
         // advance PAST static_max (age 301 > 300): the staleness budget is spent → fail CLOSED.
         g.clock().advance(301);
         let d = g.front_door_check(&alice, &pull, &repo, Zookie(String::new()), false);
-        assert!(!is_allow(&d), "past static_max → fail CLOSED (deny is correct again)");
-        assert_eq!(d.served, AuthzServed::Closed, "Closed, never an open fall-through");
+        assert!(
+            !is_allow(&d),
+            "past static_max → fail CLOSED (deny is correct again)"
+        );
+        assert_eq!(
+            d.served,
+            AuthzServed::Closed,
+            "Closed, never an open fall-through"
+        );
     }
 
     // ── 9. the staleness bound is structural: a static_max over the revocation SLA does NOT
@@ -791,15 +893,34 @@ mod tests {
         let pull = Permission(perm::PULL.into());
 
         // alice caches an ALLOW.
-        assert!(is_allow(&g.front_door_check(&subject("p:alice"), &pull, &repo, Zookie(String::new()), false)));
+        assert!(is_allow(&g.front_door_check(
+            &subject("p:alice"),
+            &pull,
+            &repo,
+            Zookie(String::new()),
+            false
+        )));
 
         // BREAK Id, then bob (no grant of his own) reads the SAME repo: he must NOT borrow alice's
         // cached allow — he has no cache bucket, so the hiccup is Closed (fail-closed), not Static.
         g.id_ref().set_hiccup(true);
         g.clock().advance(31);
-        let d = g.front_door_check(&subject("p:bob"), &pull, &repo, Zookie(String::new()), false);
-        assert!(!is_allow(&d), "bob does NOT inherit alice's cached grant (no cross-actor leak)");
-        assert_eq!(d.served, AuthzServed::Closed, "bob has no bucket → Closed, never alice's Static");
+        let d = g.front_door_check(
+            &subject("p:bob"),
+            &pull,
+            &repo,
+            Zookie(String::new()),
+            false,
+        );
+        assert!(
+            !is_allow(&d),
+            "bob does NOT inherit alice's cached grant (no cross-actor leak)"
+        );
+        assert_eq!(
+            d.served,
+            AuthzServed::Closed,
+            "bob has no bucket → Closed, never alice's Static"
+        );
     }
 
     // ── 11. the cache_key is distinct per (subject, permission, object) — kills a constant-key mutant. ──
@@ -814,19 +935,44 @@ mod tests {
 
         let k = |s: &Principal, p: &Permission, o: &ArtifactRef| cache_key(s, p, o);
         // different subject, permission, or object ⇒ different key (no collision).
-        assert_ne!(k(&alice, &pull, &core), k(&bob, &pull, &core), "subject differs");
-        assert_ne!(k(&alice, &pull, &core), k(&alice, &push, &core), "permission differs");
-        assert_ne!(k(&alice, &pull, &core), k(&alice, &pull, &secret), "object differs");
+        assert_ne!(
+            k(&alice, &pull, &core),
+            k(&bob, &pull, &core),
+            "subject differs"
+        );
+        assert_ne!(
+            k(&alice, &pull, &core),
+            k(&alice, &push, &core),
+            "permission differs"
+        );
+        assert_ne!(
+            k(&alice, &pull, &core),
+            k(&alice, &pull, &secret),
+            "object differs"
+        );
         // same question ⇒ same key (two callers share the bucket).
-        assert_eq!(k(&alice, &pull, &core), k(&alice, &pull, &core), "same question, same bucket");
+        assert_eq!(
+            k(&alice, &pull, &core),
+            k(&alice, &pull, &core),
+            "same question, same bucket"
+        );
     }
 
     // ── 12. is_allow / is_degraded report exactly their rung (kills the flattened-classifier mutant). ──
     #[test]
     fn classifiers_report_exactly_their_rung() {
-        let fresh_allow = AuthzDecision { decision: Decision::Allow, served: AuthzServed::Fresh };
-        let static_allow = AuthzDecision { decision: Decision::Allow, served: AuthzServed::Static };
-        let closed_deny = AuthzDecision { decision: Decision::Deny, served: AuthzServed::Closed };
+        let fresh_allow = AuthzDecision {
+            decision: Decision::Allow,
+            served: AuthzServed::Fresh,
+        };
+        let static_allow = AuthzDecision {
+            decision: Decision::Allow,
+            served: AuthzServed::Static,
+        };
+        let closed_deny = AuthzDecision {
+            decision: Decision::Deny,
+            served: AuthzServed::Closed,
+        };
 
         assert!(is_allow(&fresh_allow) && !is_degraded(&fresh_allow));
         assert!(is_allow(&static_allow) && is_degraded(&static_allow));

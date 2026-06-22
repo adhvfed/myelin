@@ -80,7 +80,12 @@ impl RefsStoreDescriptor {
 /// lints run over.
 pub fn refs_store_descriptors(tenant: TenantId, region: Region) -> Vec<RefsStoreDescriptor> {
     vec![
-        RefsStoreDescriptor::pinned(StoreKind::Oltp, REFS_EDGE_STORE, tenant.clone(), region.clone()),
+        RefsStoreDescriptor::pinned(
+            StoreKind::Oltp,
+            REFS_EDGE_STORE,
+            tenant.clone(),
+            region.clone(),
+        ),
         RefsStoreDescriptor::pinned(StoreKind::Cache, REFS_CACHE_STORE, tenant, region),
     ]
 }
@@ -104,11 +109,18 @@ mod tests {
         assert_eq!(descriptors.len(), 2, "the edge index + the R2 cache");
         for d in &descriptors {
             // residency-pin: the store is pinned to its home region (the residency tag matches).
-            assert_eq!(d.residency.region(), &d.region, "the store is pinned to its home region");
+            assert_eq!(
+                d.residency.region(),
+                &d.region,
+                "the store is pinned to its home region"
+            );
             // tenant-predicate: the tenant partition key is present (every query is tenant-first).
             assert_eq!(d.tenant, TenantId::from_token("acme"));
             // §3: no cross-tenant query path (the checked invariant, not prose).
-            assert!(d.no_cross_tenant_query_path, "no Refs store has a cross-tenant query path");
+            assert!(
+                d.no_cross_tenant_query_path,
+                "no Refs store has a cross-tenant query path"
+            );
         }
     }
 
@@ -134,7 +146,13 @@ mod tests {
     fn descriptor_names_match_the_registered_holder_stores() {
         let descriptors = refs_store_descriptors(TenantId::from_token("acme"), fr_par());
         let names: Vec<&str> = descriptors.iter().map(|d| d.name).collect();
-        assert!(names.contains(&REFS_EDGE_STORE), "the edge index is described + registered");
-        assert!(names.contains(&REFS_CACHE_STORE), "the R2 cache is described + registered");
+        assert!(
+            names.contains(&REFS_EDGE_STORE),
+            "the edge index is described + registered"
+        );
+        assert!(
+            names.contains(&REFS_CACHE_STORE),
+            "the R2 cache is described + registered"
+        );
     }
 }

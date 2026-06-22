@@ -110,7 +110,9 @@ pub fn key_class_for(
                 // erasure=subject → per-subject DEK. The subject MUST be known (no silent downgrade).
                 match subject {
                     Some(s) => Ok(KeyClass::Subject(s.0.clone())),
-                    None => Err(KeyChoiceError::SubjectClassMissingSubject(class_ref.clone())),
+                    None => Err(KeyChoiceError::SubjectClassMissingSubject(
+                        class_ref.clone(),
+                    )),
                 }
             } else if names_tenant_class(class_ref) {
                 Ok(KeyClass::Tenant)
@@ -266,7 +268,11 @@ impl<'a> ColumnCryptor<'a> {
             .resolve_dek(&key_ref, &self.region)
             .map_err(KeyChoiceError::Kms)?;
         let (nonce, ciphertext) = dek.seal(plaintext);
-        Ok(EncryptedColumn { key_ref, nonce, ciphertext })
+        Ok(EncryptedColumn {
+            key_ref,
+            nonce,
+            ciphertext,
+        })
     }
 
     /// Decrypt a stored [`EncryptedColumn`] back to its plaintext — resolve the DEK named by the
@@ -336,7 +342,12 @@ impl DekContentWrap {
         erasure: ErasureMethod,
         subject: Option<SubjectId>,
     ) -> DekContentWrap {
-        DekContentWrap { engine, region, erasure, subject }
+        DekContentWrap {
+            engine,
+            region,
+            erasure,
+            subject,
+        }
     }
 
     /// Seal blob bytes under the classify-chosen DEK into a self-framed stored record (key_ref +
@@ -410,7 +421,11 @@ fn unframe(stored: &[u8]) -> Option<EncryptedColumn> {
     let mut nonce = [0u8; NONCE_LEN];
     nonce.copy_from_slice(&rest[..NONCE_LEN]);
     let ciphertext = rest[NONCE_LEN..].to_vec();
-    Some(EncryptedColumn { key_ref, nonce, ciphertext })
+    Some(EncryptedColumn {
+        key_ref,
+        nonce,
+        ciphertext,
+    })
 }
 
 #[cfg(test)]
@@ -492,7 +507,9 @@ mod tests {
             err,
             KeyChoiceError::SubjectClassMissingSubject("subject_dek".into())
         );
-        assert!(err.to_string().contains("NEVER downgraded to the tenant key"));
+        assert!(err
+            .to_string()
+            .contains("NEVER downgraded to the tenant key"));
     }
 
     #[test]
@@ -619,20 +636,22 @@ mod tests {
         let store = FsBlobStore::with_wrap(Box::new(wrap));
 
         let plaintext = b"a repo object's bytes";
-        let h = store.put(&tenant, plaintext).expect("put through the DEK wrap");
+        let h = store
+            .put(&tenant, plaintext)
+            .expect("put through the DEK wrap");
 
         // The content address is the PLAINTEXT hash (stable across the real wrap — store ciphertext).
         assert_eq!(h, ContentHash::blake3(plaintext));
         // The stored bytes are NOT the plaintext (ciphertext-at-rest — the content-key-wrap floor
         // is closed).
         {
-            let stored = store
-                .head(&tenant, &h)
-                .expect("head")
-                .stored_len;
+            let stored = store.head(&tenant, &h).expect("head").stored_len;
             // The framed envelope (key_ref + nonce + ciphertext+tag) is strictly larger than the
             // plaintext, and re-hash-on-read proves it decrypts back to the exact bytes.
-            assert!(stored > plaintext.len(), "stored is the ciphertext envelope, not plaintext");
+            assert!(
+                stored > plaintext.len(),
+                "stored is the ciphertext envelope, not plaintext"
+            );
         }
         // get unwraps (decrypts) + re-hash-verifies and returns the exact plaintext.
         assert_eq!(store.get(&tenant, &h).expect("get round-trips"), plaintext);
@@ -661,9 +680,8 @@ mod tests {
             tenant.clone(),
             KeyClass::Subject("u-avatar".into())
         )));
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            store.get(&tenant, &h)
-        }));
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.get(&tenant, &h)));
         assert!(
             result.is_err(),
             "a crypto-shredded blob's unwrap must fail LOUDLY (unrecoverable), never silent serve"
@@ -696,9 +714,18 @@ mod tests {
             nonce: [0u8; NONCE_LEN],
             ciphertext: b"--SECRET--padding".to_vec(),
         };
-        assert!(col.contains_plaintext(b"SECRET"), "must detect a present plaintext run");
-        assert!(!col.contains_plaintext(b"ABSENT"), "must not false-positive on an absent run");
-        assert!(!col.contains_plaintext(b""), "an empty needle is never 'contained'");
+        assert!(
+            col.contains_plaintext(b"SECRET"),
+            "must detect a present plaintext run"
+        );
+        assert!(
+            !col.contains_plaintext(b"ABSENT"),
+            "must not false-positive on an absent run"
+        );
+        assert!(
+            !col.contains_plaintext(b""),
+            "an empty needle is never 'contained'"
+        );
     }
 
     #[test]
@@ -709,7 +736,8 @@ mod tests {
         // hand-built edge frame proving the boundary.)
         let mut framed = b"kms://acme/0/tenant\n".to_vec();
         framed.extend_from_slice(&[0u8; NONCE_LEN]); // exactly a nonce, zero ciphertext bytes.
-        let col = unframe(&framed).expect("an exactly-nonce-length tail is a valid (empty-ct) frame");
+        let col =
+            unframe(&framed).expect("an exactly-nonce-length tail is a valid (empty-ct) frame");
         assert!(col.ciphertext.is_empty());
         // One byte short of a full nonce is still rejected (the guard still rejects too-short).
         assert!(unframe(&framed[..framed.len() - 1]).is_none());
@@ -733,7 +761,10 @@ mod tests {
         assert_eq!(unframe(&framed).expect("round-trip"), col);
         // A frame with no newline / a too-short binary tail is rejected (loud, never wrong-key open).
         assert!(unframe(b"no-newline-here").is_none());
-        assert!(unframe(b"kms://acme/0/tenant\n\x00").is_none(), "tail shorter than a nonce");
+        assert!(
+            unframe(b"kms://acme/0/tenant\n\x00").is_none(),
+            "tail shorter than a nonce"
+        );
     }
 
     #[test]
@@ -755,6 +786,10 @@ mod tests {
         let cryptor = ColumnCryptor::new(&kms, r());
         assert_eq!(cryptor.plaintext_at_rest_count(), 0);
         cryptor.audit_plaintext();
-        assert_eq!(cryptor.plaintext_at_rest_count(), 1, "the leak detector counts a plaintext-at-rest");
+        assert_eq!(
+            cryptor.plaintext_at_rest_count(),
+            1,
+            "the leak detector counts a plaintext-at-rest"
+        );
     }
 }

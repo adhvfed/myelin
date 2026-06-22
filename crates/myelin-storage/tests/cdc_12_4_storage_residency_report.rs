@@ -100,8 +100,14 @@ fn cdc_12_4_storage_reports_feed_control_plane_residency_verify() {
         .expect("control plane: the store reports sign into a no-global-pool attestation");
     assert_eq!(signed.tenant_id, tenant);
     assert_eq!(signed.region.as_str(), "fr-par");
-    assert_eq!(signed.store_regions.len(), ResidencyStoreClass::M1_SET.len());
-    assert!(signed.verify(&key), "an auditor verifies the signed no-global-pool attestation");
+    assert_eq!(
+        signed.store_regions.len(),
+        ResidencyStoreClass::M1_SET.len()
+    );
+    assert!(
+        signed.verify(&key),
+        "an auditor verifies the signed no-global-pool attestation"
+    );
 }
 
 /// **CDC 12.4 fail leg — a cross-region store in Storage's report set makes the control plane's
@@ -120,7 +126,10 @@ fn cdc_12_4_a_cross_region_store_fails_both_halves() {
             ResidencyStoreClass::Blob,
             Region::new("eu-north"),
         ),
-        myelin_storage::RegionPinnedStore::pinned_to(ResidencyStoreClass::IndexSearch, region.clone()),
+        myelin_storage::RegionPinnedStore::pinned_to(
+            ResidencyStoreClass::IndexSearch,
+            region.clone(),
+        ),
         myelin_storage::RegionPinnedStore::pinned_to(ResidencyStoreClass::Kms, region.clone()),
     ]);
     assert!(

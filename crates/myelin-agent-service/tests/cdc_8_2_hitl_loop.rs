@@ -20,8 +20,8 @@ use myelin_agent::{EffectKind, EffectResult, EventId, ToolDef, ToolName, ToolSur
 use myelin_agent_service::{
     derive_approver_set, gate_id_of, run_hitl_loop, surface_card, ApplyError, ApprovedTools,
     ApproverSet, CapabilityCheck, DelegationLookup, EffectBudget, EffectCost, Halted, HitlGate,
-    HitlGateState, HitlOutcome, HitlWait, PipelineSignals, PlanThenApply, PlannedEffect, RiskSummary,
-    SubsystemApply, TenantGuard, WaitDecision,
+    HitlGateState, HitlOutcome, HitlWait, PipelineSignals, PlanThenApply, PlannedEffect,
+    RiskSummary, SubsystemApply, TenantGuard, WaitDecision,
 };
 use myelin_identity::{
     CaveatContext, Consistency, ConsistencyMode, Decision, EffectivePolicy, ObjectId, Permission,
@@ -187,7 +187,8 @@ fn merge_tool() -> ToolDef {
         name: ToolName("git.merge".into()),
         subsystem: "git".into(),
         version: 1,
-        input_schema: r#"{"type":"object","required":["pr"],"properties":{"pr":{"type":"integer"}}}"#.into(),
+        input_schema:
+            r#"{"type":"object","required":["pr"],"properties":{"pr":{"type":"integer"}}}"#.into(),
         required_caps: vec!["git.merge".into()],
         effect_kind: EffectKind::Mutate,
         side_effecting: true,
@@ -204,16 +205,26 @@ fn merge_plan() -> PlannedEffect {
         input_json: r#"{"pr":42}"#.into(),
         field: None,
         transition: None,
-        cost: EffectCost { unit: "git.merge", wholesale: 30, markup: 20 },
+        cost: EffectCost {
+            unit: "git.merge",
+            wholesale: 30,
+            markup: 20,
+        },
     }
 }
 
 fn approvers() -> Vec<PrincipalId> {
-    vec![PrincipalId("psn:lead".into()), PrincipalId("psn:maintainer".into())]
+    vec![
+        PrincipalId("psn:lead".into()),
+        PrincipalId("psn:maintainer".into()),
+    ]
 }
 
 fn strong(z: &str) -> Consistency {
-    Consistency { at_least: Zookie(z.into()), mode: ConsistencyMode::Strong }
+    Consistency {
+        at_least: Zookie(z.into()),
+        mode: ConsistencyMode::Strong,
+    }
 }
 
 /// Run the apply pipeline once for `plan` under the given `approved` set; returns the result + the
@@ -223,10 +234,17 @@ fn apply_once(
     endpoint: &Endpoint,
     approved: BTreeSet<String>,
 ) -> (EffectResult, usize) {
-    let check = AllowAll { allow: ["git.merge".to_string()].into_iter().collect() };
-    let del = Delegate { caps: vec!["git.merge".into()] };
+    let check = AllowAll {
+        allow: ["git.merge".to_string()].into_iter().collect(),
+    };
+    let del = Delegate {
+        caps: vec!["git.merge".into()],
+    };
     let tenant = PermitAll;
-    let mut budget = Budget { remaining: 1_000, settles: 0 };
+    let mut budget = Budget {
+        remaining: 1_000,
+        settles: 0,
+    };
     let mut signals = PipelineSignals::new();
     let mut p = PlanThenApply {
         catalogue: cat,
@@ -254,27 +272,46 @@ fn apply_once(
 /// with the REAL eight-step pipeline.
 #[test]
 fn chained_withhold_zero_mutation_then_approve_resumes_and_applies() {
-    let cat = Catalogue { defs: vec![merge_tool()] };
-    let endpoint = Endpoint { applied: RefCell::new(vec![]) };
+    let cat = Catalogue {
+        defs: vec![merge_tool()],
+    };
+    let endpoint = Endpoint {
+        applied: RefCell::new(vec![]),
+    };
 
     // 1. WITHHOLD: a fresh run (empty `approved`) proposes the gated merge → the pipeline GATES it.
     let (result, muts_before) = apply_once(&cat, &endpoint, BTreeSet::new());
     let gate_id = gate_id_of(&result).expect("a requires_approval tool GATES (AG-8)");
-    assert!(matches!(result, EffectResult::Gated(_)), "the gated effect is WITHHELD: {result:?}");
-    assert_eq!(muts_before, 0, "0 MUTATIONS before approval (AG-D5 — the gated tool did NOT mutate)");
+    assert!(
+        matches!(result, EffectResult::Gated(_)),
+        "the gated effect is WITHHELD: {result:?}"
+    );
+    assert_eq!(
+        muts_before, 0,
+        "0 MUTATIONS before approval (AG-D5 — the gated tool did NOT mutate)"
+    );
 
     // surface the card from the gate (action + risk + LIVE cost + approver set) — what the human sees.
-    let subjects = ProviderSubjects { members: approvers() };
+    let subjects = ProviderSubjects {
+        members: approvers(),
+    };
     let approver_filter = derive_approver_set(
         &subjects,
         &merge_plan().object,
         &Permission("git.approve".into()),
         &strong("z-1"),
     );
-    assert_eq!(approver_filter, approvers(), "the approver set = list_subjects(object, approve_perm) (4.4)");
+    assert_eq!(
+        approver_filter,
+        approvers(),
+        "the approver set = list_subjects(object, approve_perm) (4.4)"
+    );
 
     // 2 + 3. SURFACE + DECIDE: the run PARKS on the durable wait (9.4); an APPROVAL arrives days later.
-    let wait = ScriptedWait { decision: WaitDecision::Approve, parked: RefCell::new(vec![]) };
+    let wait = ScriptedWait {
+        decision: WaitDecision::Approve,
+        parked: RefCell::new(vec![]),
+    };
     let mut approved = ApprovedTools::new();
     let outcome = run_hitl_loop(
         gate_id,
@@ -288,7 +325,11 @@ fn chained_withhold_zero_mutation_then_approve_resumes_and_applies() {
     );
 
     // the run PARKED on the durable wait before the human decided (the worker was free, holds no runtime).
-    assert_eq!(wait.parked.borrow().len(), 1, "the run parked on the durable wait (state=waiting holds no runtime)");
+    assert_eq!(
+        wait.parked.borrow().len(),
+        1,
+        "the run parked on the durable wait (state=waiting holds no runtime)"
+    );
     match outcome {
         HitlOutcome::Approved(g) => assert_eq!(g.state, HitlGateState::Approved),
         other => panic!("expected Approved, got {other:?}"),
@@ -296,8 +337,14 @@ fn chained_withhold_zero_mutation_then_approve_resumes_and_applies() {
 
     // 4. RESUME: the re-run with the now-populated `approved` set passes step 6 and APPLIES — once.
     let (result2, muts_after) = apply_once(&cat, &endpoint, approved.as_set());
-    assert!(matches!(result2, EffectResult::Applied(_)), "the approved effect APPLIES on resume: {result2:?}");
-    assert_eq!(muts_after, 1, "the effect applied EXACTLY ONCE (after approval, never before)");
+    assert!(
+        matches!(result2, EffectResult::Applied(_)),
+        "the approved effect APPLIES on resume: {result2:?}"
+    );
+    assert_eq!(
+        muts_after, 1,
+        "the effect applied EXACTLY ONCE (after approval, never before)"
+    );
 }
 
 /// **CHAINED-E2E (AG-D5 rejection leg): a gated effect is WITHHELD, the run parks, a REJECTION
@@ -305,8 +352,12 @@ fn chained_withhold_zero_mutation_then_approve_resumes_and_applies() {
 /// GATES (the tool was never approved) — 0 mutation across the whole flow (AG-8).**
 #[test]
 fn chained_withhold_then_reject_halts_with_reason_zero_mutation() {
-    let cat = Catalogue { defs: vec![merge_tool()] };
-    let endpoint = Endpoint { applied: RefCell::new(vec![]) };
+    let cat = Catalogue {
+        defs: vec![merge_tool()],
+    };
+    let endpoint = Endpoint {
+        applied: RefCell::new(vec![]),
+    };
 
     // WITHHOLD.
     let (result, _) = apply_once(&cat, &endpoint, BTreeSet::new());
@@ -336,9 +387,15 @@ fn chained_withhold_then_reject_halts_with_reason_zero_mutation() {
         "rejection settles Halted::Rejected with the reason"
     );
     // the tool was NEVER threaded into `approved` → a re-run GATES again (never applies).
-    assert!(!approved.contains("git.merge"), "a rejected gate never approves the tool (AG-8)");
+    assert!(
+        !approved.contains("git.merge"),
+        "a rejected gate never approves the tool (AG-8)"
+    );
     let (result2, muts) = apply_once(&cat, &endpoint, approved.as_set());
-    assert!(matches!(result2, EffectResult::Gated(_)), "a rejected effect still GATES — never applies");
+    assert!(
+        matches!(result2, EffectResult::Gated(_)),
+        "a rejected effect still GATES — never applies"
+    );
     assert_eq!(muts, 0, "0 MUTATIONS across the entire reject flow (AG-8)");
 }
 
@@ -352,10 +409,17 @@ fn cdc_9_4_consumer_drives_all_three_wait_decisions() {
 
     for (decision, expect_approved, expect_halt) in [
         (WaitDecision::Approve, true, None),
-        (WaitDecision::Reject("no".into()), false, Some(Halted::Rejected("no".into()))),
+        (
+            WaitDecision::Reject("no".into()),
+            false,
+            Some(Halted::Rejected("no".into())),
+        ),
         (WaitDecision::Expired, false, Some(Halted::Expired)),
     ] {
-        let wait = ScriptedWait { decision, parked: RefCell::new(vec![]) };
+        let wait = ScriptedWait {
+            decision,
+            parked: RefCell::new(vec![]),
+        };
         let mut approved = ApprovedTools::new();
         let outcome = run_hitl_loop(
             gate_id_of(&EffectResult::Gated(myelin_agent::GateId("g".into()))).unwrap(),
@@ -367,8 +431,16 @@ fn cdc_9_4_consumer_drives_all_three_wait_decisions() {
             &wait,
             &mut approved,
         );
-        assert_eq!(wait.parked.borrow().len(), 1, "every decision parked on the durable wait first");
-        assert_eq!(approved.contains("git.merge"), expect_approved, "only Approve threads the tool");
+        assert_eq!(
+            wait.parked.borrow().len(),
+            1,
+            "every decision parked on the durable wait first"
+        );
+        assert_eq!(
+            approved.contains("git.merge"),
+            expect_approved,
+            "only Approve threads the tool"
+        );
         match (expect_halt, outcome) {
             (None, HitlOutcome::Approved(_)) => {}
             (Some(h), HitlOutcome::Halted(got)) => assert_eq!(got, h),
@@ -381,7 +453,9 @@ fn cdc_9_4_consumer_drives_all_three_wait_decisions() {
 /// `list_subjects(object, approve_perm)` members at the run's zookie (the REAL Identity provider).**
 #[test]
 fn cdc_4_4_consumer_approver_set_is_list_subjects_members() {
-    let subjects = ProviderSubjects { members: approvers() };
+    let subjects = ProviderSubjects {
+        members: approvers(),
+    };
     let set = derive_approver_set(
         &subjects,
         &ArtifactRef("myelin://acme/git/pr/42".into()),
@@ -400,7 +474,17 @@ fn cdc_4_4_consumer_approver_set_is_list_subjects_members() {
         "card:R1:0",
     );
     let card = surface_card(&gate);
-    assert_eq!(card.approvers, approvers(), "the card shows the approver set");
-    assert_eq!(card.cost_estimate, 50, "the card shows the LIVE cost estimate (wholesale 30 + markup 20)");
-    assert_eq!(card.action_tool, "git.merge", "the card shows the pending action");
+    assert_eq!(
+        card.approvers,
+        approvers(),
+        "the card shows the approver set"
+    );
+    assert_eq!(
+        card.cost_estimate, 50,
+        "the card shows the LIVE cost estimate (wholesale 30 + markup 20)"
+    );
+    assert_eq!(
+        card.action_tool, "git.merge",
+        "the card shows the pending action"
+    );
 }

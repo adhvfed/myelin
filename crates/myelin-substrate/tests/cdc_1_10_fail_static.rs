@@ -20,7 +20,9 @@
 //! no hardcoded magic number (the thresholds-file rule).
 
 use myelin_substrate::thresholds::Thresholds;
-use myelin_substrate::{Answer, FailStatic, FailStaticError, ServeError, StalenessBound, TestClock};
+use myelin_substrate::{
+    Answer, FailStatic, FailStaticError, ServeError, StalenessBound, TestClock,
+};
 
 /// Read the §8.2 staleness bound from the canonical thresholds file (P-S22) — the upper bound is the
 /// revocation SLA (minutes → seconds), the lower bound is the agent-token TTL (seconds). NO hardcoded
@@ -43,7 +45,8 @@ fn cdc_1_10_constructor_enforces_the_threshold_file_bound() {
     let (bound, seed) = bound_from_file();
 
     // the seed value (300s == revocation SLA) is exactly the upper boundary → admitted (≤).
-    FailStatic::<u8>::try_new(30, seed, bound).expect("the seed static_max == revocation SLA admits");
+    FailStatic::<u8>::try_new(30, seed, bound)
+        .expect("the seed static_max == revocation SLA admits");
 
     // one second over the revocation SLA → REJECTED (a revoked actor would outlive N).
     let err = FailStatic::<u8>::try_new(30, bound.revocation_sla_secs + 1, bound)
@@ -102,7 +105,10 @@ fn cdc_1_10_sequence_authenticated_hiccup_stale_then_denied_at_window_close() {
     };
 
     // 1) authenticated: a successful read is Fresh and caches the coarse answer.
-    assert_eq!(fs.get("actor:alice", refresh), Answer::Fresh("actor=active;grants=coarse"));
+    assert_eq!(
+        fs.get("actor:alice", refresh),
+        Answer::Fresh("actor=active;grants=coarse")
+    );
 
     // 2) the upstream hiccups; within fresh_ttl the cached answer is still Fresh (no degradation).
     up.set(false);
@@ -117,17 +123,28 @@ fn cdc_1_10_sequence_authenticated_hiccup_stale_then_denied_at_window_close() {
     //    (never an escalation of access).
     advance(&fs, 100); // age == 130, inside static_max(300)
     let a = fs.get("actor:alice", refresh);
-    assert_eq!(a, Answer::Static("actor=active;grants=coarse"), "stale serves the cached coarse grants");
+    assert_eq!(
+        a,
+        Answer::Static("actor=active;grants=coarse"),
+        "stale serves the cached coarse grants"
+    );
     assert!(a.is_degraded(), "the stale answer is marked degraded");
 
     // 4) the window CLOSES: past static_max the answer is Closed (deny is correct) — NEVER open.
     advance(&fs, seed); // age == 130 + 300 > static_max
-    assert_eq!(fs.get("actor:alice", refresh), Answer::Closed, "past W → deny, never fail open");
+    assert_eq!(
+        fs.get("actor:alice", refresh),
+        Answer::Closed,
+        "past W → deny, never fail open"
+    );
 
     // the exported contract-1.8 signals tracked the sequence; the staleness age never exceeded the
     // budget (the §8.2 bound the SUB-D4 drill asserts).
     let s = fs.signals();
-    assert_eq!(s.fresh, 2, "two fresh answers (the live read + the within-ttl cached read)");
+    assert_eq!(
+        s.fresh, 2,
+        "two fresh answers (the live read + the within-ttl cached read)"
+    );
     assert_eq!(s.stale, 1, "one degraded answer");
     assert_eq!(s.closed, 1, "one denied answer at window close");
     assert!(
@@ -144,7 +161,11 @@ fn cdc_1_10_cold_hiccup_never_fails_open() {
     let (bound, seed) = bound_from_file();
     let fs: FailStatic<u8> = FailStatic::try_new(30, seed, bound).expect("valid");
     let denied = fs.get("never-seen", || Err(ServeError("hiccup".into())));
-    assert_eq!(denied, Answer::Closed, "a cold hiccup denies — never fabricates an open answer");
+    assert_eq!(
+        denied,
+        Answer::Closed,
+        "a cold hiccup denies — never fabricates an open answer"
+    );
     assert_eq!(fs.signals().closed, 1);
 }
 

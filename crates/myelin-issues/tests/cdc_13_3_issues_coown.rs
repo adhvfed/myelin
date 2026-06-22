@@ -18,12 +18,12 @@
 //! references and asserts byte-identity. The two assertions below (the order_key conformance vector +
 //! the ViewSpec/FieldType golden serialization) are the byte-diff = 0 green artifact.
 
+use myelin_identity::Literal;
 use myelin_issues::query_coown::{
     issues_canonical_board_view, issues_field_type_wire_ids, issues_replay_conformance_vector,
-    tiebreak, CmpOp, EvalContext, Expr, FieldId, FieldType, OrderKey, Predicate, QueryAst, ViewKind,
-    CONFORMANCE_VECTOR,
+    tiebreak, CmpOp, EvalContext, Expr, FieldId, FieldType, OrderKey, Predicate, QueryAst,
+    ViewKind, CONFORMANCE_VECTOR,
 };
-use myelin_identity::Literal;
 use std::cmp::Ordering;
 
 /// **THE X-3 ANTI-DRIFT GATE (Issues side): the order_key conformance vector replays byte-for-byte,
@@ -46,7 +46,11 @@ fn cdc_13_3_order_key_conformance_vector_byte_identical_from_issues() {
             byte_diffs += 1;
         }
     }
-    assert_eq!(issues_keys.len(), knowledge_expected.len(), "the co-owners replay the same vector");
+    assert_eq!(
+        issues_keys.len(),
+        knowledge_expected.len(),
+        "the co-owners replay the same vector"
+    );
     assert_eq!(
         byte_diffs, 0,
         "the order_key codec is byte-identical across the co-owners (0 byte differences, X-3)"
@@ -63,7 +67,10 @@ fn cdc_13_3_order_key_conformance_vector_byte_identical_from_issues() {
     };
     let a = key_of("concurrent same-gap insert A");
     let b = key_of("concurrent same-gap insert B");
-    assert_ne!(a, b, "concurrent same-gap inserts produce DISTINCT keys (the jitter, from Issues)");
+    assert_ne!(
+        a, b,
+        "concurrent same-gap inserts produce DISTINCT keys (the jitter, from Issues)"
+    );
 }
 
 /// **The order_key midpoint bisection, 2-char jitter, and 48-char rebalance round-trip from the
@@ -76,7 +83,10 @@ fn order_key_bisection_jitter_rebalance_round_trip_from_issues() {
     let lo = OrderKey::parse("F22").unwrap();
     let hi = OrderKey::parse("U00").unwrap();
     let mid = OrderKey::bisect(Some(&lo), Some(&hi));
-    assert!(lo < mid && mid < hi, "the midpoint sorts strictly between the bounds: {lo} < {mid} < {hi}");
+    assert!(
+        lo < mid && mid < hi,
+        "the midpoint sorts strictly between the bounds: {lo} < {mid} < {hi}"
+    );
 
     // 2-char jitter: the same midpoint body with two different jitters yields DISTINCT in-range keys,
     // both strictly between the bounds (concurrency safety).
@@ -88,11 +98,17 @@ fn order_key_bisection_jitter_rebalance_round_trip_from_issues() {
 
     // 48-char rebalance trigger: a key AT the rebalance length trips `needs_rebalance`; one below
     // does not (the measured-pathology boundary, byte-identical with Knowledge).
-    let at_trigger =
-        OrderKey::parse("V".repeat(myelin_query::LEXORANK_REBALANCE_LEN)).unwrap();
+    let at_trigger = OrderKey::parse("V".repeat(myelin_query::LEXORANK_REBALANCE_LEN)).unwrap();
     let below = OrderKey::parse("V".repeat(myelin_query::LEXORANK_REBALANCE_LEN - 1)).unwrap();
-    assert!(at_trigger.needs_rebalance(), "a {}-char key trips rebalance", myelin_query::LEXORANK_REBALANCE_LEN);
-    assert!(!below.needs_rebalance(), "one char below the trigger does NOT trip");
+    assert!(
+        at_trigger.needs_rebalance(),
+        "a {}-char key trips rebalance",
+        myelin_query::LEXORANK_REBALANCE_LEN
+    );
+    assert!(
+        !below.needs_rebalance(),
+        "one char below the trigger does NOT trip"
+    );
 }
 
 /// **The `created_at`+ULID tiebreak is a total order from the Issues side** (contract 13.3 "total
@@ -103,14 +119,24 @@ fn order_key_created_at_ulid_tiebreak_total_order_from_issues() {
     let k = OrderKey::parse("M00").unwrap();
     // Equal key → earlier created_at wins.
     assert_eq!(
-        tiebreak(&k, "2026-06-21T10:00:00Z", "01A", &k, "2026-06-21T11:00:00Z", "01B"),
+        tiebreak(
+            &k,
+            "2026-06-21T10:00:00Z",
+            "01A",
+            &k,
+            "2026-06-21T11:00:00Z",
+            "01B"
+        ),
         Ordering::Less,
     );
     // Equal key + equal created_at → ULID id breaks it (lexicographic == time-ordered).
     assert_eq!(tiebreak(&k, "t", "01A", &k, "t", "01B"), Ordering::Less);
     // The order_key dominates when it differs (the tiebreak never overrides the primary rank).
     let hi = OrderKey::parse("U00").unwrap();
-    assert_eq!(tiebreak(&k, "2026z", "zzz", &hi, "2026a", "000"), Ordering::Less);
+    assert_eq!(
+        tiebreak(&k, "2026z", "zzz", &hi, "2026a", "000"),
+        Ordering::Less
+    );
     // Fully identical → the only legitimate Equal (the same row).
     assert_eq!(tiebreak(&k, "t", "id", &k, "t", "id"), Ordering::Equal);
 }
@@ -125,7 +151,16 @@ fn cdc_13_3_view_spec_and_field_type_golden_byte_identical_from_issues() {
     let issues_ids = issues_field_type_wire_ids();
     assert_eq!(
         issues_ids,
-        ["text", "int", "bool", "date", "select", "relation", "principal", "order_key"],
+        [
+            "text",
+            "int",
+            "bool",
+            "date",
+            "select",
+            "relation",
+            "principal",
+            "order_key"
+        ],
         "the frozen FieldType wire-id set is byte-identical (X-3 anti-drift anchor), from Issues"
     );
 
@@ -167,15 +202,25 @@ fn cdc_13_3_view_spec_and_field_type_golden_byte_identical_from_issues() {
     let ctx = EvalContext::new()
         .bind("status", Literal::Str("open".into()))
         .bind("severity", Literal::Int(4));
-    assert_eq!(view.filter.eval(&ctx), Ok(true), "the Issues filter evaluates through the ONE engine");
+    assert_eq!(
+        view.filter.eval(&ctx),
+        Ok(true),
+        "the Issues filter evaluates through the ONE engine"
+    );
 
     // The consumer round-trips the SAME bytes back into the SAME shape (0 divergence).
     let back: myelin_issues::query_coown::ViewSpec = serde_json::from_value(json).unwrap();
-    assert_eq!(back, view, "Issues reconstructs the provider's exact view-model");
+    assert_eq!(
+        back, view,
+        "Issues reconstructs the provider's exact view-model"
+    );
 
     // The view kind set is the frozen six, read from the co-owned enum (the closed taxonomy).
     let kinds: Vec<&str> = ViewKind::all().iter().map(|k| k.wire_id()).collect();
-    assert_eq!(kinds, ["table", "board", "calendar", "timeline", "gallery", "list"]);
+    assert_eq!(
+        kinds,
+        ["table", "board", "calendar", "timeline", "gallery", "list"]
+    );
 
     // A lone FieldId token serializes as the bare string (the byte-identical id encoding).
     assert_eq!(
@@ -183,7 +228,10 @@ fn cdc_13_3_view_spec_and_field_type_golden_byte_identical_from_issues() {
         serde_json::json!("order_key")
     );
     // A FieldType serializes byte-identically from Issues (the closed enum's wire form).
-    assert_eq!(serde_json::to_value(FieldType::OrderKey).unwrap(), serde_json::json!("OrderKey"));
+    assert_eq!(
+        serde_json::to_value(FieldType::OrderKey).unwrap(),
+        serde_json::json!("OrderKey")
+    );
 }
 
 fn jit(a: usize, b: usize) -> myelin_query::Jitter {

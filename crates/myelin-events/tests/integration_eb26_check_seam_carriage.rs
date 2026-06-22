@@ -96,9 +96,21 @@ async fn check_seam_carriage_over_real_nats() {
     use myelin_events::ArtifactRef;
     let subj = |e: &EventEnvelope| ArtifactRef(format!("{subject_root}.{}", e.subject.0));
 
-    assert_eq!(bus.put(&subj(&build1), &build1, &build1.event_id).expect("put build1"), Delivery::Accepted);
-    assert_eq!(bus.put(&subj(&test1), &test1, &test1.event_id).expect("put test1"), Delivery::Accepted);
-    assert_eq!(bus.put(&subj(&build2), &build2, &build2.event_id).expect("put build2"), Delivery::Accepted);
+    assert_eq!(
+        bus.put(&subj(&build1), &build1, &build1.event_id)
+            .expect("put build1"),
+        Delivery::Accepted
+    );
+    assert_eq!(
+        bus.put(&subj(&test1), &test1, &test1.event_id)
+            .expect("put test1"),
+        Delivery::Accepted
+    );
+    assert_eq!(
+        bus.put(&subj(&build2), &build2, &build2.event_id)
+            .expect("put build2"),
+        Delivery::Accepted
+    );
     // The DUPLICATE re-publish of build2 (same event_id) — broker-side dedup → 0 ghost.
     assert_eq!(
         bus.put(&subj(&build2), &build2, &build2.event_id).expect("re-put build2"),
@@ -108,16 +120,28 @@ async fn check_seam_carriage_over_real_nats() {
 
     // The consumer leg drains the carriage and feeds the Bus's per-aggregate ordering substrate.
     let delivered = bus.consume(&subject_root);
-    assert_eq!(delivered.len(), 3, "exactly 3 distinct facts (the duplicate build2 was deduped)");
+    assert_eq!(
+        delivered.len(),
+        3,
+        "exactly 3 distinct facts (the duplicate build2 was deduped)"
+    );
 
     // Envelope conformance survived the round-trip: every fact carries the §4.12 aggregate.
     let expected_agg = check_aggregate(REPO, COMMIT);
     let mut order = CheckSeamOrder::new(REPO, COMMIT);
     for (i, d) in delivered.iter().enumerate() {
-        assert_eq!(d.type_.0, CI_CHECK_UPDATED, "carried type is ci.check.updated");
-        assert_eq!(d.aggregate, expected_agg, "carried aggregate = (repo, commit_oid)");
+        assert_eq!(
+            d.type_.0, CI_CHECK_UPDATED,
+            "carried type is ci.check.updated"
+        );
+        assert_eq!(
+            d.aggregate, expected_agg,
+            "carried aggregate = (repo, commit_oid)"
+        );
         // Feed the ordering substrate at the delivery seq (the carriage's per-aggregate order key).
-        order.ingest(d, (i + 1) as u64).expect("ingest into the per-aggregate order");
+        order
+            .ingest(d, (i + 1) as u64)
+            .expect("ingest into the per-aggregate order");
         bus.ack(&consumer, &d.event_id);
     }
 
@@ -134,7 +158,11 @@ async fn check_seam_carriage_over_real_nats() {
         Some(2),
         "the carriage preserved both build attempts → supersession picks attempt 2 (the re-run)"
     );
-    assert_eq!(order.ordering_gap(), 0, "contiguous — 0 ops lost (at-least-once delivered every fact)");
+    assert_eq!(
+        order.ordering_gap(),
+        0,
+        "contiguous — 0 ops lost (at-least-once delivered every fact)"
+    );
 
     bus.purge();
 }

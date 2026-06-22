@@ -155,24 +155,59 @@ fn ag_d11_runaway_mock_loop_stops_at_the_wallet_never_interrupting() {
     // Exactly the funded prefix completed; the runaway tail was shed.
     let admitted = steps.iter().filter(|s| s.is_admitted()).count();
     let refused = steps.iter().filter(|s| s.is_refused()).count();
-    assert_eq!(admitted, 5, "the wallet afforded exactly 5 runs — the funded prefix completed");
-    assert_eq!(refused, 7, "the runaway over-budget tail was REFUSED — the loop stopped at the wallet");
+    assert_eq!(
+        admitted, 5,
+        "the wallet afforded exactly 5 runs — the funded prefix completed"
+    );
+    assert_eq!(
+        refused, 7,
+        "the runaway over-budget tail was REFUSED — the loop stopped at the wallet"
+    );
 
     // NOT ONE in-flight run was interrupted by the refusals (the gate has no tear-down-in-flight API).
-    assert_eq!(ledger.inflight_interrupt_count(), 0, "the headline zero: 0 in-flight interrupts");
+    assert_eq!(
+        ledger.inflight_interrupt_count(),
+        0,
+        "the headline zero: 0 in-flight interrupts"
+    );
     // The gate counted exactly the refusals (the AG-D11 reserve-refusal telemetry).
-    assert_eq!(gate.reserve_refusals(), 7, "the gate counted the runaway refusals");
-    assert_eq!(gate.runs_dispatched(), 5, "the gate fronted exactly the funded runs");
+    assert_eq!(
+        gate.reserve_refusals(),
+        7,
+        "the gate counted the runaway refusals"
+    );
+    assert_eq!(
+        gate.runs_dispatched(),
+        5,
+        "the gate fronted exactly the funded runs"
+    );
 
     // Every ADMITTED run completed the full chain: 5 traces written, 5 tokens revoked (one per run);
     // the refused runs STILL torn down their (un-dispatched) tokens (the teardown is unconditional).
-    assert_eq!(tele.traces_written(), 5, "each completed run wrote exactly one trace row");
+    assert_eq!(
+        tele.traces_written(),
+        5,
+        "each completed run wrote exactly one trace row"
+    );
     assert_eq!(tele.runs_completed(), 5, "5 runs completed the chain");
-    assert_eq!(tele.runs_killed(), 0, "no run was killed — the loop stopped at the wallet, not by a kill");
-    assert_eq!(tele.tokens_revoked(), 12, "every run (admitted + refused) tore down its token");
+    assert_eq!(
+        tele.runs_killed(),
+        0,
+        "no run was killed — the loop stopped at the wallet, not by a kill"
+    );
+    assert_eq!(
+        tele.tokens_revoked(),
+        12,
+        "every run (admitted + refused) tore down its token"
+    );
 
     // The books balance: every completed run reserved 10 and settled 10 (a Mock bills 0, refunds 10).
-    assert!(tele.ledger_balanced(), "reserved {} == settled {}", tele.reserved(), tele.settled());
+    assert!(
+        tele.ledger_balanced(),
+        "reserved {} == settled {}",
+        tele.reserved(),
+        tele.settled()
+    );
     assert_eq!(tele.reserved(), 50, "5 runs reserved 10 each");
     assert_eq!(tele.settled(), 50, "every reserved minor-unit was settled");
 
@@ -188,13 +223,19 @@ fn ag_d11_runaway_mock_loop_stops_at_the_wallet_never_interrupting() {
     // The refused runs have NO reservation row (the run never started — no balance → no run).
     for i in 5..12u32 {
         let run = RunId::new(format!("runaway-{i}"));
-        assert!(ledger.state_of(&tenant(), &run).is_none(), "refused run {i} never reserved");
+        assert!(
+            ledger.state_of(&tenant(), &run).is_none(),
+            "refused run {i} never reserved"
+        );
     }
 
     // THE GREEN ARTIFACT.
     let signal = RunawaySelfLimiter::signal(&steps, ledger.inflight_interrupt_count());
     assert!(signal.is_green(), "AG-D11 must be GREEN: {signal:?}");
-    assert!(signal.reserve_refusals > 0, "the runaway must have been shed");
+    assert!(
+        signal.reserve_refusals > 0,
+        "the runaway must have been shed"
+    );
     assert_eq!(signal.inflight_interrupt_count, 0, "the headline zero");
     assert_eq!(signal.runs_completed, 5);
     eprintln!("AG-D11 (agent-fabric tier) GREEN [2026-06-21]: {signal:?}");
@@ -212,9 +253,18 @@ fn ag_d11_a_live_in_flight_run_survives_an_exhausted_wallet() {
 
     // Dispatch ONE run that holds the WHOLE wallet (100/100) and leave it IN-FLIGHT (do not settle).
     let live = gate
-        .dispatch(&mut ledger, tenant(), RunId::new("live"), MinorUnits(100), MinorUnits(100))
+        .dispatch(
+            &mut ledger,
+            tenant(),
+            RunId::new("live"),
+            MinorUnits(100),
+            MinorUnits(100),
+        )
         .expect("the live run is funded and dispatched");
-    assert_eq!(ledger.state_of(&tenant(), &RunId::new("live")), Some(ReservationState::InFlight));
+    assert_eq!(
+        ledger.state_of(&tenant(), &RunId::new("live")),
+        Some(ReservationState::InFlight)
+    );
 
     // Now a runaway loop against the EXHAUSTED wallet (0 remaining): every run is refused.
     let brain = runaway_brain();
@@ -252,7 +302,10 @@ fn ag_d11_a_live_in_flight_run_survives_an_exhausted_wallet() {
             Ok(telemetry.settled() - before)
         },
     );
-    assert!(steps.iter().all(|s| s.is_refused()), "every runaway run was refused (empty wallet)");
+    assert!(
+        steps.iter().all(|s| s.is_refused()),
+        "every runaway run was refused (empty wallet)"
+    );
 
     // THE LIVE IN-FLIGHT RUN IS UNTOUCHED — still in-flight, never interrupted, still settle-able.
     assert_eq!(
@@ -260,10 +313,18 @@ fn ag_d11_a_live_in_flight_run_survives_an_exhausted_wallet() {
         Some(ReservationState::InFlight),
         "the live run kept running — the runaway refusals never touched it"
     );
-    assert_eq!(ledger.inflight_interrupt_count(), 0, "0 in-flight interrupts");
+    assert_eq!(
+        ledger.inflight_interrupt_count(),
+        0,
+        "0 in-flight interrupts"
+    );
     // It settles NORMALLY on completion — it was never torn down.
-    live.settle(&mut ledger, &[]).expect("the live run settles on its own completion");
-    assert_eq!(ledger.state_of(&tenant(), &RunId::new("live")), Some(ReservationState::Settled));
+    live.settle(&mut ledger, &[])
+        .expect("the live run settles on its own completion");
+    assert_eq!(
+        ledger.state_of(&tenant(), &RunId::new("live")),
+        Some(ReservationState::Settled)
+    );
 }
 
 /// **The runaway self-limiter is brain-INDEPENDENT.** The cost gate stops the loop regardless of
@@ -324,9 +385,19 @@ fn ag_d11_limiter_is_brain_independent() {
             Err(e) => panic!("unexpected error: {e}"),
         }
     }
-    assert_eq!(completed, 3, "a different brain is ALSO stopped by the wallet at exactly 3 runs");
-    assert_eq!(refused, 5, "the runaway tail is shed regardless of which brain runs");
-    assert_eq!(ledger.inflight_interrupt_count(), 0, "0 interrupts (brain-independent)");
+    assert_eq!(
+        completed, 3,
+        "a different brain is ALSO stopped by the wallet at exactly 3 runs"
+    );
+    assert_eq!(
+        refused, 5,
+        "the runaway tail is shed regardless of which brain runs"
+    );
+    assert_eq!(
+        ledger.inflight_interrupt_count(),
+        0,
+        "0 interrupts (brain-independent)"
+    );
 
     let signal = AgentFabricCostSignal {
         runs_attempted: attempts,
@@ -336,5 +407,8 @@ fn ag_d11_limiter_is_brain_independent() {
         total_reserved: completed * estimate.0,
         total_settled: completed * estimate.0,
     };
-    assert!(signal.is_green(), "the brain-independent runaway is GREEN: {signal:?}");
+    assert!(
+        signal.is_green(),
+        "the brain-independent runaway is GREEN: {signal:?}"
+    );
 }

@@ -35,7 +35,11 @@ fn provider_seam_is_a_registerable_holder_distinct_from_the_audit_log() {
     let seam = AgentTraceHolderSeam::new();
 
     // CONSUMER (the DSR orchestrator): it registers H17 through the seam's id + phase.
-    assert_eq!(seam.holder_id(), AGENT_TRACE_HOLDER_ID, "the orchestrator registers H17 under this id");
+    assert_eq!(
+        seam.holder_id(),
+        AGENT_TRACE_HOLDER_ID,
+        "the orchestrator registers H17 under this id"
+    );
     assert_eq!(
         agent_trace_phase(),
         CanonicalErasePhase::CachesAndDerivedCopies,
@@ -43,7 +47,10 @@ fn provider_seam_is_a_registerable_holder_distinct_from_the_audit_log() {
     );
 
     // The distinct-from-audit boundary (the §6.5 architecture-test face): trace ≠ audit.
-    assert!(trace_is_distinct_from_audit(), "H17 trace is distinct from the H16 audit log");
+    assert!(
+        trace_is_distinct_from_audit(),
+        "H17 trace is distinct from the H16 audit log"
+    );
     assert_ne!(
         AGENT_TRACE_ERASABLE, AUDIT_LOG_ERASABLE,
         "the trace is erasable; the audit log is the retain carve-out — distinct mechanisms"
@@ -64,11 +71,27 @@ fn the_consumer_sees_a_loud_named_floor_not_a_silent_false_green() {
     let tenant = TenantId("acme".into());
 
     let err = seam
-        .erase(EraseScope::Subject { subject: subject.clone(), tenant: tenant.clone() })
+        .erase(EraseScope::Subject {
+            subject: subject.clone(),
+            tenant: tenant.clone(),
+        })
         .expect_err("the H17 erase body is the M3 floor — loud, never a silent false green");
-    assert!(err.0.contains("P-GA-27"), "the floor names its filling prompt: {}", err.0);
+    assert!(
+        err.0.contains("P-GA-27"),
+        "the floor names its filling prompt: {}",
+        err.0
+    );
 
-    assert!(seam.locate(&subject, tenant.clone()).is_err(), "locate defers loudly");
-    assert!(seam.export(&subject, tenant).is_err(), "export defers loudly");
-    assert!(AGENT_TRACE_IMPL_PROMPT.contains("P-GA-27"), "the impl floor names P-GA-27");
+    assert!(
+        seam.locate(&subject, tenant.clone()).is_err(),
+        "locate defers loudly"
+    );
+    assert!(
+        seam.export(&subject, tenant).is_err(),
+        "export defers loudly"
+    );
+    assert!(
+        AGENT_TRACE_IMPL_PROMPT.contains("P-GA-27"),
+        "the impl floor names P-GA-27"
+    );
 }

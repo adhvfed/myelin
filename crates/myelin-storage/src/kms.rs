@@ -91,7 +91,9 @@ pub const NONCE_LEN: usize = 12;
 /// chat-body/agent-memory classes whose erasure unit is the individual subject are keyed
 /// [`KeyClass::Subject`] (one key-destroy = that person's Art. 17 erasure); a content blob's
 /// per-blob content key is wrapped under [`KeyClass::Blob`].
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum KeyClass {
     /// `tenant` — the per-tenant bulk DEK (issue field values, doc structure, repo/PR metadata,
     /// run state — mostly non-personal or pseudonym-referenced; erasure here is
@@ -140,7 +142,9 @@ impl KeyClass {
 /// `kms://<tenant>/<dek-epoch>/<class>`, `<class> ∈ {tenant, subject:<id>, blob}`. It names WHICH
 /// DEK (which tenant, which epoch, which class) sealed a given ciphertext — so rotation/shred
 /// operate at the key layer while the ciphertext bytes stay put.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct PiiKeyRef {
     /// The tenant whose key hierarchy sealed the ciphertext.
     pub tenant: TenantId,
@@ -153,7 +157,11 @@ pub struct PiiKeyRef {
 impl PiiKeyRef {
     /// Build a `pii_key_ref` from its three fields.
     pub fn new(tenant: TenantId, dek_epoch: u64, class: KeyClass) -> PiiKeyRef {
-        PiiKeyRef { tenant, dek_epoch, class }
+        PiiKeyRef {
+            tenant,
+            dek_epoch,
+            class,
+        }
     }
 
     /// Render the canonical `kms://<tenant>/<dek-epoch>/<class>` string (§4, byte-exact).
@@ -182,7 +190,11 @@ impl PiiKeyRef {
         }
         let dek_epoch: u64 = epoch.parse().ok()?;
         let class = KeyClass::parse_token(class)?;
-        Some(PiiKeyRef { tenant: TenantId(tenant.to_string()), dek_epoch, class })
+        Some(PiiKeyRef {
+            tenant: TenantId(tenant.to_string()),
+            dek_epoch,
+            class,
+        })
     }
 }
 
@@ -240,7 +252,9 @@ impl Default for CellRoot {
 impl CellRoot {
     /// Generate a fresh cell root (per-cell, never exported).
     pub fn generate() -> CellRoot {
-        CellRoot { root: RawKey::generate() }
+        CellRoot {
+            root: RawKey::generate(),
+        }
     }
 
     /// Wrap (envelope-encrypt) a KEK's plaintext under the cell root — the L0→L1 seal
@@ -254,7 +268,10 @@ impl CellRoot {
             .expect("AES-256-GCM wrap KEK under root");
         let mut n = [0u8; NONCE_LEN];
         n.copy_from_slice(nonce.as_slice());
-        WrappedKey { nonce: n, wrapped: ct }
+        WrappedKey {
+            nonce: n,
+            wrapped: ct,
+        }
     }
 
     /// Unwrap a KEK sealed by [`Self::wrap_kek`] back to its plaintext. Returns `None` if it does
@@ -490,7 +507,9 @@ impl KmsEngine {
     /// the KEK is unavailable (destroyed / never created) or fails to authenticate under the root.
     fn open_kek(&self, id: &KekId) -> Result<RawKey, KmsError> {
         let keks = self.keks.lock().expect("KMS keks poisoned");
-        let kek = keks.get(id).ok_or_else(|| KmsError::KekUnavailable(id.clone()))?;
+        let kek = keks
+            .get(id)
+            .ok_or_else(|| KmsError::KekUnavailable(id.clone()))?;
         self.root
             .unwrap_kek(&kek.wrapped)
             .ok_or_else(|| KmsError::KekUnavailable(id.clone()))
@@ -535,7 +554,9 @@ impl KmsEngine {
         let kek = self.open_kek(kek_id)?;
         let kek_epoch = {
             let keks = self.keks.lock().expect("KMS keks poisoned");
-            keks.get(kek_id).map(|k| k.epoch).ok_or_else(|| KmsError::KekUnavailable(kek_id.clone()))?
+            keks.get(kek_id)
+                .map(|k| k.epoch)
+                .ok_or_else(|| KmsError::KekUnavailable(kek_id.clone()))?
         };
         let nonce = Aes256Gcm::generate_nonce(OsRng);
         let wrapped = kek
@@ -544,7 +565,11 @@ impl KmsEngine {
             .expect("AES-256-GCM wrap");
         let mut n = [0u8; NONCE_LEN];
         n.copy_from_slice(nonce.as_slice());
-        Ok(WrappedDek { nonce: n, wrapped, kek_epoch })
+        Ok(WrappedDek {
+            nonce: n,
+            wrapped,
+            kek_epoch,
+        })
     }
 
     /// Resolve (unwrap) the DEK named by a [`PiiKeyRef`] into a usable [`DekHandle`] — the read
@@ -558,8 +583,9 @@ impl KmsEngine {
         let dek_id = DekId::new(key_ref.tenant.clone(), key_ref.class.clone());
 
         let deks = self.deks.lock().expect("KMS deks poisoned");
-        let (wrapped, _epoch) =
-            deks.get(&dek_id).ok_or_else(|| KmsError::DekUnavailable(dek_id.clone()))?;
+        let (wrapped, _epoch) = deks
+            .get(&dek_id)
+            .ok_or_else(|| KmsError::DekUnavailable(dek_id.clone()))?;
         let wrapped = wrapped.clone();
         drop(deks);
 
@@ -568,7 +594,10 @@ impl KmsEngine {
         let kek = self.open_kek(&kek_id)?;
         let plain = kek
             .cipher()
-            .decrypt(Nonce::from_slice(&wrapped.nonce), wrapped.wrapped.as_slice())
+            .decrypt(
+                Nonce::from_slice(&wrapped.nonce),
+                wrapped.wrapped.as_slice(),
+            )
             .map_err(|_| KmsError::UnwrapFailed(dek_id.clone()))?;
         // The decrypted plaintext MUST be exactly a 256-bit key — anything else is a corrupt/forged
         // envelope, refused (never a short/long key silently coerced).
@@ -606,7 +635,9 @@ impl KmsEngine {
         let new_wrapped = self.root.wrap_kek(&RawKey::generate());
         let new_epoch = {
             let mut keks = self.keks.lock().expect("KMS keks poisoned");
-            let kek = keks.get_mut(id).ok_or_else(|| KmsError::KekUnavailable(id.clone()))?;
+            let kek = keks
+                .get_mut(id)
+                .ok_or_else(|| KmsError::KekUnavailable(id.clone()))?;
             kek.wrapped = new_wrapped;
             kek.epoch += 1;
             kek.epoch
@@ -700,7 +731,10 @@ impl KmsEngine {
             .decrypt(Nonce::from_slice(&w.nonce), w.wrapped.as_slice())
             .map_err(|_| KmsError::UnwrapFailed(DekId::new(tenant.clone(), KeyClass::Tenant)))?;
         if plain.len() != KEY_LEN {
-            return Err(KmsError::UnwrapFailed(DekId::new(tenant.clone(), KeyClass::Tenant)));
+            return Err(KmsError::UnwrapFailed(DekId::new(
+                tenant.clone(),
+                KeyClass::Tenant,
+            )));
         }
         let mut bytes = [0u8; KEY_LEN];
         bytes.copy_from_slice(&plain);
@@ -778,7 +812,11 @@ mod tests {
 
     #[test]
     fn pii_key_ref_round_trips_through_parse() {
-        for uri in ["kms://acme/0/tenant", "kms://acme/12/subject:u-99", "kms://acme/5/blob"] {
+        for uri in [
+            "kms://acme/0/tenant",
+            "kms://acme/12/subject:u-99",
+            "kms://acme/5/blob",
+        ] {
             let kr = PiiKeyRef::parse(uri).expect("parses the canonical grammar");
             assert_eq!(kr.to_uri(), uri, "round-trip is byte-identical");
         }
@@ -787,12 +825,27 @@ mod tests {
     #[test]
     fn pii_key_ref_rejects_malformed_uris_loudly() {
         // A malformed ref is NEVER silently coerced (a wrong ref must be a loud None).
-        assert!(PiiKeyRef::parse("https://acme/0/tenant").is_none(), "wrong scheme");
+        assert!(
+            PiiKeyRef::parse("https://acme/0/tenant").is_none(),
+            "wrong scheme"
+        );
         assert!(PiiKeyRef::parse("kms://acme/0").is_none(), "missing class");
-        assert!(PiiKeyRef::parse("kms://acme/notanint/tenant").is_none(), "non-int epoch");
-        assert!(PiiKeyRef::parse("kms:///0/tenant").is_none(), "empty tenant");
-        assert!(PiiKeyRef::parse("kms://acme/0/bogus").is_none(), "unknown class");
-        assert!(PiiKeyRef::parse("kms://acme/0/subject:").is_none(), "empty subject id");
+        assert!(
+            PiiKeyRef::parse("kms://acme/notanint/tenant").is_none(),
+            "non-int epoch"
+        );
+        assert!(
+            PiiKeyRef::parse("kms:///0/tenant").is_none(),
+            "empty tenant"
+        );
+        assert!(
+            PiiKeyRef::parse("kms://acme/0/bogus").is_none(),
+            "unknown class"
+        );
+        assert!(
+            PiiKeyRef::parse("kms://acme/0/subject:").is_none(),
+            "empty subject id"
+        );
     }
 
     #[test]
@@ -810,7 +863,9 @@ mod tests {
         let kms = KmsEngine::new();
         let (tenant, region) = (t("acme"), r("eu-west"));
         kms.ensure_kek(&KekId::new(tenant.clone(), region.clone()));
-        let kr = kms.ensure_dek(&tenant, &region, KeyClass::Tenant).expect("ensure dek");
+        let kr = kms
+            .ensure_dek(&tenant, &region, KeyClass::Tenant)
+            .expect("ensure dek");
 
         // Resolve the DEK and use it to seal+open a payload (the full wrap→unwrap→use round-trip).
         let dek = kms.resolve_dek(&kr, &region).expect("resolve");
@@ -820,7 +875,10 @@ mod tests {
 
         // A SECOND resolve yields a key that decrypts the SAME ciphertext (stable DEK material).
         let dek2 = kms.resolve_dek(&kr, &region).expect("resolve again");
-        assert_eq!(dek2.open(&nonce, &ct).expect("open"), b"some encrypted column value");
+        assert_eq!(
+            dek2.open(&nonce, &ct).expect("open"),
+            b"some encrypted column value"
+        );
     }
 
     #[test]
@@ -828,7 +886,9 @@ mod tests {
         let kms = KmsEngine::new();
         let (tenant, region) = (t("acme"), r("eu-west"));
         kms.ensure_kek(&KekId::new(tenant.clone(), region.clone()));
-        let tk = kms.ensure_dek(&tenant, &region, KeyClass::Tenant).expect("tenant dek");
+        let tk = kms
+            .ensure_dek(&tenant, &region, KeyClass::Tenant)
+            .expect("tenant dek");
         let sk = kms
             .ensure_dek(&tenant, &region, KeyClass::Subject("u-1".into()))
             .expect("subject dek");
@@ -839,7 +899,10 @@ mod tests {
         let tdek = kms.resolve_dek(&tk, &region).expect("resolve tenant");
         let sdek = kms.resolve_dek(&sk, &region).expect("resolve subject");
         let (nonce, ct) = tdek.seal(b"bulk");
-        assert!(sdek.open(&nonce, &ct).is_none(), "subject DEK must not open tenant ciphertext");
+        assert!(
+            sdek.open(&nonce, &ct).is_none(),
+            "subject DEK must not open tenant ciphertext"
+        );
     }
 
     // ───────────── crypto-shred: destroy renders DEKs unrecoverable ─────────────
@@ -850,7 +913,9 @@ mod tests {
         let (tenant, region) = (t("acme"), r("eu-west"));
         let kek_id = KekId::new(tenant.clone(), region.clone());
         kms.ensure_kek(&kek_id);
-        let tk = kms.ensure_dek(&tenant, &region, KeyClass::Tenant).expect("tenant dek");
+        let tk = kms
+            .ensure_dek(&tenant, &region, KeyClass::Tenant)
+            .expect("tenant dek");
         let sk = kms
             .ensure_dek(&tenant, &region, KeyClass::Subject("u-1".into()))
             .expect("subject dek");
@@ -863,8 +928,14 @@ mod tests {
         assert!(kms.destroy_kek(&kek_id), "a KEK was present to destroy");
 
         // EVERY DEK under it is now unrecoverable — a LOUD KekUnavailable, NEVER a plaintext.
-        assert_eq!(kms.resolve_dek(&tk, &region), Err(KmsError::KekUnavailable(kek_id.clone())));
-        assert_eq!(kms.resolve_dek(&sk, &region), Err(KmsError::KekUnavailable(kek_id)));
+        assert_eq!(
+            kms.resolve_dek(&tk, &region),
+            Err(KmsError::KekUnavailable(kek_id.clone()))
+        );
+        assert_eq!(
+            kms.resolve_dek(&sk, &region),
+            Err(KmsError::KekUnavailable(kek_id))
+        );
     }
 
     #[test]
@@ -872,7 +943,9 @@ mod tests {
         let kms = KmsEngine::new();
         let (tenant, region) = (t("acme"), r("eu-west"));
         kms.ensure_kek(&KekId::new(tenant.clone(), region.clone()));
-        let tk = kms.ensure_dek(&tenant, &region, KeyClass::Tenant).expect("tenant");
+        let tk = kms
+            .ensure_dek(&tenant, &region, KeyClass::Tenant)
+            .expect("tenant");
         let s1 = kms
             .ensure_dek(&tenant, &region, KeyClass::Subject("u-1".into()))
             .expect("s1");
@@ -885,9 +958,18 @@ mod tests {
         assert!(kms.destroy_dek(&s1_id), "subject DEK present to destroy");
 
         // u-1 is gone (loud), the tenant + u-2 are untouched.
-        assert_eq!(kms.resolve_dek(&s1, &region), Err(KmsError::DekUnavailable(s1_id)));
-        assert!(kms.resolve_dek(&tk, &region).is_ok(), "tenant DEK untouched");
-        assert!(kms.resolve_dek(&s2, &region).is_ok(), "other subject untouched");
+        assert_eq!(
+            kms.resolve_dek(&s1, &region),
+            Err(KmsError::DekUnavailable(s1_id))
+        );
+        assert!(
+            kms.resolve_dek(&tk, &region).is_ok(),
+            "tenant DEK untouched"
+        );
+        assert!(
+            kms.resolve_dek(&s2, &region).is_ok(),
+            "other subject untouched"
+        );
     }
 
     // ───────────── rotation = envelope re-wrap, not bulk re-encryption ─────────────
@@ -898,7 +980,9 @@ mod tests {
         let (tenant, region) = (t("acme"), r("eu-west"));
         let kek_id = KekId::new(tenant.clone(), region.clone());
         kms.ensure_kek(&kek_id);
-        let kr = kms.ensure_dek(&tenant, &region, KeyClass::Tenant).expect("dek");
+        let kr = kms
+            .ensure_dek(&tenant, &region, KeyClass::Tenant)
+            .expect("dek");
 
         // Seal a payload BEFORE rotation.
         let dek = kms.resolve_dek(&kr, &region).expect("resolve");
@@ -909,7 +993,9 @@ mod tests {
         assert_eq!(new_epoch, 1, "forward-only epoch bump");
 
         // The DEK now lives at a new epoch in its ref.
-        let kr2 = kms.ensure_dek(&tenant, &region, KeyClass::Tenant).expect("dek post-rotate");
+        let kr2 = kms
+            .ensure_dek(&tenant, &region, KeyClass::Tenant)
+            .expect("dek post-rotate");
         assert_eq!(kr2.dek_epoch, 1, "the dek epoch bumped on re-wrap");
 
         // The pre-rotation ciphertext STILL decrypts to the same plaintext — proof the DEK
@@ -942,7 +1028,9 @@ mod tests {
         let kms = KmsEngine::new();
         let (tenant, region) = (t("acme"), r("eu-west"));
         // No KEK provisioned → ensure_dek cannot wrap → loud KekUnavailable (never a bare DEK).
-        let err = kms.ensure_dek(&tenant, &region, KeyClass::Tenant).expect_err("no kek");
+        let err = kms
+            .ensure_dek(&tenant, &region, KeyClass::Tenant)
+            .expect_err("no kek");
         assert_eq!(err, KmsError::KekUnavailable(KekId::new(tenant, region)));
     }
 
@@ -953,8 +1041,10 @@ mod tests {
         let (dead, _) = (t("offboarded-co"), r("eu-west"));
         kms.ensure_kek(&KekId::new(live.clone(), region.clone()));
         kms.ensure_kek(&KekId::new(dead.clone(), region.clone()));
-        kms.ensure_dek(&live, &region, KeyClass::Tenant).expect("live dek");
-        kms.ensure_dek(&dead, &region, KeyClass::Tenant).expect("dead dek");
+        kms.ensure_dek(&live, &region, KeyClass::Tenant)
+            .expect("live dek");
+        kms.ensure_dek(&dead, &region, KeyClass::Tenant)
+            .expect("dead dek");
 
         // Offboard the dead tenant (crypto-shred its KEK).
         assert!(kms.destroy_kek(&KekId::new(dead.clone(), region.clone())));
@@ -962,7 +1052,10 @@ mod tests {
         // The backup snapshot carries the LIVE tenant's wrapped DEK but EXCLUDES the shredded one
         // (it must stay dead across a restore — §7.5 / STOR-D3).
         let snap = kms.backup_snapshot();
-        assert!(snap.iter().any(|(d, _)| d.tenant == live), "live tenant DEK is backed up");
+        assert!(
+            snap.iter().any(|(d, _)| d.tenant == live),
+            "live tenant DEK is backed up"
+        );
         assert!(
             !snap.iter().any(|(d, _)| d.tenant == dead),
             "a crypto-shredded tenant DEK is EXCLUDED from backup (stays dead across restore)"
@@ -986,9 +1079,15 @@ mod tests {
         let m = e.to_string();
         assert!(m.contains("acme") && m.contains("crypto-shred"), "got: {m}");
         let e = KmsError::DekUnavailable(DekId::new(t("acme"), KeyClass::Subject("u".into())));
-        assert!(e.to_string().contains("unrecoverable"), "names the unrecoverable outcome");
+        assert!(
+            e.to_string().contains("unrecoverable"),
+            "names the unrecoverable outcome"
+        );
         let e = KmsError::UnwrapFailed(DekId::new(t("acme"), KeyClass::Tenant));
-        assert!(e.to_string().contains("authenticate"), "names the auth failure");
+        assert!(
+            e.to_string().contains("authenticate"),
+            "names the auth failure"
+        );
     }
 
     #[test]
@@ -999,7 +1098,10 @@ mod tests {
         let root = CellRoot::generate();
         let dbg = format!("{root:?}");
         assert!(dbg.contains("redacted"), "RawKey Debug is redacted: {dbg}");
-        assert!(dbg.contains("CellRoot"), "the CellRoot wrapper is named: {dbg}");
+        assert!(
+            dbg.contains("CellRoot"),
+            "the CellRoot wrapper is named: {dbg}"
+        );
     }
 
     #[test]
@@ -1007,11 +1109,16 @@ mod tests {
         let kms = KmsEngine::new();
         let (tenant, region) = (t("acme"), r("eu-west"));
         kms.ensure_kek(&KekId::new(tenant.clone(), region.clone()));
-        let kr = kms.ensure_dek(&tenant, &region, KeyClass::Tenant).expect("dek");
+        let kr = kms
+            .ensure_dek(&tenant, &region, KeyClass::Tenant)
+            .expect("dek");
         let dek = kms.resolve_dek(&kr, &region).expect("resolve");
         // Neither the engine nor a resolved handle leaks key bytes into Debug.
         assert!(format!("{kms:?}").contains("KmsEngine"));
-        assert!(!format!("{dek:?}").contains("["), "DekHandle redacts its bytes");
+        assert!(
+            !format!("{dek:?}").contains("["),
+            "DekHandle redacts its bytes"
+        );
         assert!(format!("{dek:?}").contains("redacted"));
     }
 }

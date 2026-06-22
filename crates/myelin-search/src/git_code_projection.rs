@@ -253,14 +253,24 @@ pub fn git_blob_search_projection(input: &GitBlobProjectionInput) -> SearchProje
         fields.insert(FACET_PATH.to_string(), FieldValue::Text(input.path.clone()));
     }
     if !input.language.is_empty() {
-        fields.insert(FACET_LANGUAGE.to_string(), FieldValue::Text(input.language.clone()));
+        fields.insert(
+            FACET_LANGUAGE.to_string(),
+            FieldValue::Text(input.language.clone()),
+        );
     }
     if !input.blob_oid.is_empty() {
-        fields.insert(FACET_BLOB_OID.to_string(), FieldValue::Text(input.blob_oid.clone()));
+        fields.insert(
+            FACET_BLOB_OID.to_string(),
+            FieldValue::Text(input.blob_oid.clone()),
+        );
     }
 
     // A git blob is analyzed under the CODE chain (§3.1 lang tag) — query-time selects the same chain.
-    SearchProjection { text, fields, lang: Some(Language::Code.tag().to_string()) }
+    SearchProjection {
+        text,
+        fields,
+        lang: Some(Language::Code.tag().to_string()),
+    }
 }
 
 /// **The trigram index (Russ Cox's `google/codesearch` substring index, §4.4).** Returns the set of
@@ -293,7 +303,10 @@ pub fn trigrams(text: &str) -> Vec<String> {
 /// targets the trigram namespace, never a real 3-char identifier. The candidates are then
 /// substring-verified by the caller (Cox's two-phase: trigram-filter then verify).
 pub fn trigram_query(substring: &str) -> Vec<String> {
-    trigrams(substring).iter().map(|t| trigram_token(t)).collect()
+    trigrams(substring)
+        .iter()
+        .map(|t| trigram_token(t))
+        .collect()
 }
 
 /// The namespaced searchable token for a trigram — a `t·` sentinel prefix keeps the trigram namespace
@@ -360,9 +373,19 @@ mod tests {
         let s = git_code_projection_spec();
         assert_eq!(s.subsystem, "git");
         assert_eq!(s.type_, "blob");
-        assert_eq!(s.acl_object_type, "repo", "a blob's reachability is its parent repo's");
-        assert!(!s.semantic, "code is trigram/symbol full-text, not vector-embedded in v1 (GF-3)");
-        assert_eq!(s.struct_fields.len(), 3, "exactly the three structured code facets");
+        assert_eq!(
+            s.acl_object_type, "repo",
+            "a blob's reachability is its parent repo's"
+        );
+        assert!(
+            !s.semantic,
+            "code is trigram/symbol full-text, not vector-embedded in v1 (GF-3)"
+        );
+        assert_eq!(
+            s.struct_fields.len(),
+            3,
+            "exactly the three structured code facets"
+        );
         for facet in [FACET_PATH, FACET_LANGUAGE, FACET_BLOB_OID] {
             assert_eq!(
                 s.struct_fields.get(facet),
@@ -385,7 +408,13 @@ mod tests {
         keys.sort_unstable();
         assert_eq!(
             keys,
-            vec!["acl_object_type", "semantic", "struct_fields", "subsystem", "type"],
+            vec![
+                "acl_object_type",
+                "semantic",
+                "struct_fields",
+                "subsystem",
+                "type"
+            ],
             "the 6.5 wire key set"
         );
         assert_eq!(obj["subsystem"], serde_json::json!("git"));
@@ -404,7 +433,11 @@ mod tests {
     #[test]
     fn registration_is_accepted_by_search() {
         let accepted = register_git_index_specs();
-        assert_eq!(accepted, git_index_specs(), "Search accepts the declared git spec verbatim");
+        assert_eq!(
+            accepted,
+            git_index_specs(),
+            "Search accepts the declared git spec verbatim"
+        );
         let _ix = IncrementalIndexer::new(
             git_index_specs(),
             std::sync::Arc::new(NullProjectFetcher),
@@ -436,7 +469,10 @@ mod tests {
         // camel split + whole identifier (exact-identifier hit).
         assert!(toks.contains("detect"), "camel part: {:?}", &p.text);
         assert!(toks.contains("deadlock"), "camel part");
-        assert!(toks.contains("detectdeadlock"), "whole identifier kept (exact-identifier hit)");
+        assert!(
+            toks.contains("detectdeadlock"),
+            "whole identifier kept (exact-identifier hit)"
+        );
         // snake split.
         assert!(toks.contains("has"));
         assert!(toks.contains("cycle"));
@@ -457,11 +493,20 @@ mod tests {
             p.fields.get(FACET_PATH),
             Some(&FieldValue::Text("src/scheduler/deadlock.rs".into()))
         );
-        assert_eq!(p.fields.get(FACET_LANGUAGE), Some(&FieldValue::Text("rust".into())));
-        assert_eq!(p.fields.get(FACET_BLOB_OID), Some(&FieldValue::Text("blob-oid-abc123".into())));
+        assert_eq!(
+            p.fields.get(FACET_LANGUAGE),
+            Some(&FieldValue::Text("rust".into()))
+        );
+        assert_eq!(
+            p.fields.get(FACET_BLOB_OID),
+            Some(&FieldValue::Text("blob-oid-abc123".into()))
+        );
         // full-text: a path segment is searchable.
         let toks: std::collections::BTreeSet<&str> = p.text.split(' ').collect();
-        assert!(toks.contains("scheduler"), "a path segment is full-text searchable");
+        assert!(
+            toks.contains("scheduler"),
+            "a path segment is full-text searchable"
+        );
         assert!(toks.contains("deadlock"));
     }
 
@@ -525,7 +570,10 @@ mod tests {
     /// to a scan).** `trigram_query` returns an empty conjunction, so the caller scans.
     #[test]
     fn substring_shorter_than_trigram_yields_no_conjunction() {
-        assert!(trigram_query("ab").is_empty(), "a <3-char substring cannot index — the caller scans");
+        assert!(
+            trigram_query("ab").is_empty(),
+            "a <3-char substring cannot index — the caller scans"
+        );
         assert!(trigram_query("a").is_empty());
     }
 
@@ -536,7 +584,10 @@ mod tests {
     #[test]
     fn trigram_namespace_is_disjoint_from_symbols() {
         let tg = trigram_token("foo");
-        assert_ne!(tg, "foo", "the trigram token is namespaced apart from the identifier token");
+        assert_ne!(
+            tg, "foo",
+            "the trigram token is namespaced apart from the identifier token"
+        );
         assert!(tg.contains("foo"));
         // The query form targets the namespaced token.
         assert_eq!(trigram_query("foo"), vec![tg]);
@@ -554,7 +605,11 @@ mod tests {
         let toks: std::collections::BTreeSet<&str> = p.text.split(' ').collect();
         // The identifier inside the backticks is tokenized (raw — the backticks are operators, the
         // identifier survives the code split), NOT consumed as markdown inline-code.
-        assert!(toks.contains("not"), "raw code tokenized verbatim (X-2): {:?}", &p.text);
+        assert!(
+            toks.contains("not"),
+            "raw code tokenized verbatim (X-2): {:?}",
+            &p.text
+        );
         assert!(toks.contains("markdown"));
         assert!(toks.contains("value"));
     }
@@ -566,7 +621,11 @@ mod tests {
         let p = git_blob_search_projection(&GitBlobProjectionInput::default());
         assert!(p.text.is_empty(), "no inputs ⇒ no searchable body");
         assert!(p.fields.is_empty(), "no inputs ⇒ no structured facets");
-        assert_eq!(p.lang.as_deref(), Some("code"), "still analyzed under the code chain");
+        assert_eq!(
+            p.lang.as_deref(),
+            Some("code"),
+            "still analyzed under the code chain"
+        );
     }
 
     /// The named floor marker is constructible (the greppable gap-report entry).

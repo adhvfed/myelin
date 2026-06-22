@@ -185,7 +185,12 @@ impl RunawaySelfLimiter {
         mut drive_one: F,
     ) -> Vec<RunawayStep>
     where
-        F: FnMut(String, MinorUnits, MinorUnits, &mut SkeletonTelemetry) -> Result<u64, SkeletonError>,
+        F: FnMut(
+            String,
+            MinorUnits,
+            MinorUnits,
+            &mut SkeletonTelemetry,
+        ) -> Result<u64, SkeletonError>,
     {
         let _ = brain; // the brain is the same for every run; the gate is brain-independent.
         let mut steps = Vec::with_capacity(attempts as usize);
@@ -226,10 +231,7 @@ impl RunawaySelfLimiter {
     /// drill gates on: the admitted/refused split, the in-flight interrupt count (read from the
     /// ledger), and the balanced reserve/settle totals. `inflight_interrupt_count` is the
     /// ledger's structural `0`.
-    pub fn signal(
-        steps: &[RunawayStep],
-        inflight_interrupt_count: u64,
-    ) -> AgentFabricCostSignal {
+    pub fn signal(steps: &[RunawayStep], inflight_interrupt_count: u64) -> AgentFabricCostSignal {
         let mut runs_completed = 0u64;
         let mut reserve_refusals = 0u64;
         let mut total_reserved = 0u64;
@@ -351,7 +353,10 @@ mod tests {
             reserve_refusals: 0,
             ..base.clone()
         };
-        assert!(!no_refusal.is_green(), "no refusal is not the runaway-limiter win");
+        assert!(
+            !no_refusal.is_green(),
+            "no refusal is not the runaway-limiter win"
+        );
 
         // A vanished run (completed + refused != attempted) is RED.
         let vanished = AgentFabricCostSignal {
@@ -395,7 +400,10 @@ mod tests {
         let admitted = steps.iter().filter(|s| s.is_admitted()).count();
         let refused = steps.iter().filter(|s| s.is_refused()).count();
         assert_eq!(admitted, 5, "the wallet afforded exactly 5 runs");
-        assert_eq!(refused, 7, "the runaway tail was shed (the loop stopped at the wallet)");
+        assert_eq!(
+            refused, 7,
+            "the runaway tail was shed (the loop stopped at the wallet)"
+        );
 
         let sig = RunawaySelfLimiter::signal(&steps, 0);
         assert!(sig.is_green(), "AG-D11 GREEN: {sig:?}");
@@ -418,11 +426,17 @@ mod tests {
                 Ok(estimate.0)
             }
         });
-        assert!(steps.iter().all(|s| s.is_refused()), "an empty wallet admits nothing");
+        assert!(
+            steps.iter().all(|s| s.is_refused()),
+            "an empty wallet admits nothing"
+        );
         let sig = RunawaySelfLimiter::signal(&steps, 0);
         assert_eq!(sig.runs_completed, 0);
         assert_eq!(sig.reserve_refusals, 4);
-        assert_eq!(sig.inflight_interrupt_count, 0, "0 interrupts even when nothing ran");
+        assert_eq!(
+            sig.inflight_interrupt_count, 0,
+            "0 interrupts even when nothing ran"
+        );
     }
 
     /// **The runaway brain is a well-formed single-turn script** (the brain is irrelevant to the cost
@@ -430,6 +444,9 @@ mod tests {
     #[test]
     fn runaway_brain_is_well_formed() {
         let brain = runaway_brain();
-        assert!(brain.script().is_well_formed(), "the runaway brain terminates each run");
+        assert!(
+            brain.script().is_well_formed(),
+            "the runaway brain terminates each run"
+        );
     }
 }

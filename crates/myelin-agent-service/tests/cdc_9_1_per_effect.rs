@@ -64,7 +64,9 @@ fn cdc_9_1_fabric_and_engine_per_effect_keys_agree() {
 fn cdc_9_1_partial_approval_keys_are_three_independent_and_agree() {
     let card_id = "card-7";
     let total = 3;
-    let keys: Vec<String> = (0..total).map(|idx| fabric_key(card_id, idx, total)).collect();
+    let keys: Vec<String> = (0..total)
+        .map(|idx| fabric_key(card_id, idx, total))
+        .collect();
     // three DISTINCT keys (no two effects share a key — independence).
     assert_eq!(keys.len(), 3);
     assert_ne!(keys[0], keys[1]);
@@ -72,6 +74,10 @@ fn cdc_9_1_partial_approval_keys_are_three_independent_and_agree() {
     assert_ne!(keys[0], keys[2]);
     // and each agrees with the durable engine (the PROVIDER dedups on exactly these).
     for (idx, k) in keys.iter().enumerate() {
-        assert_eq!(*k, engine_key(card_id, idx, total), "partial-approval key {idx} agrees with the engine");
+        assert_eq!(
+            *k,
+            engine_key(card_id, idx, total),
+            "partial-approval key {idx} agrees with the engine"
+        );
     }
 }

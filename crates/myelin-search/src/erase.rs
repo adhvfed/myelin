@@ -69,7 +69,7 @@ use myelin_events::{
 };
 use myelin_gdpr::{
     DsrError, EraseReceipt, EraseScope, LocateReport, Patch, PersonalDataHolder, PortableBundle,
-    Receipt, RectifyReceipt, Result as DsrResult, RestrictReceipt, SubjectRef,
+    Receipt, RectifyReceipt, RestrictReceipt, Result as DsrResult, SubjectRef,
 };
 use myelin_identity::Principal;
 use myelin_storage::KeyOrigin;
@@ -165,7 +165,10 @@ impl SearchEraseHolder {
     /// Build the [`SubjectMatcher`] for a subject in a tenant (the ONE "references the subject" predicate
     /// the locate/erase/restrict ops share, §4.8).
     fn matcher(subject: &SubjectRef, tenant: &TenantId) -> SubjectMatcher {
-        SubjectMatcher::new(Self::subject_id(subject), Self::pseudonym_of(subject, tenant))
+        SubjectMatcher::new(
+            Self::subject_id(subject),
+            Self::pseudonym_of(subject, tenant),
+        )
     }
 
     /// **Is `subject` restricted in `tenant` (§4.8 `restrict`)?** The query/RAG path consults this — a
@@ -226,9 +229,9 @@ impl SearchEraseHolder {
         // SEARCH-1 symmetry: the erase path IS the live consumer path.
         for doc_id in &located {
             let ev = Self::erased_event(tenant, &region, &subject.principal, doc_id);
-            self.indexer
-                .index(&ev)
-                .map_err(|e| crate::engine::IndexError::Engine(format!("erase purge failed: {e:?}")))?;
+            self.indexer.index(&ev).map_err(|e| {
+                crate::engine::IndexError::Engine(format!("erase purge failed: {e:?}"))
+            })?;
         }
 
         // COMPACT (§3.3): physically remove every tombstoned embedding so 0 orphan embedding survives
@@ -236,7 +239,11 @@ impl SearchEraseHolder {
         self.indexer.compact(tenant, &region)?;
         let zero_orphan_embedding = !self.indexer.has_orphan_embedding(tenant, &region);
 
-        Ok(EraseOutcome { docs_purged, zero_orphan_embedding, key_epoch_destroyed: None })
+        Ok(EraseOutcome {
+            docs_purged,
+            zero_orphan_embedding,
+            key_epoch_destroyed: None,
+        })
     }
 
     /// **Tenant offboard (`EraseScope::Tenant`, §4.4) — tenant-decommission crypto-shred.** Destroys the
@@ -300,7 +307,10 @@ impl PersonalDataHolder for SearchEraseHolder {
                 SEARCH_INDEX_STORE,
                 &Self::subject_id(subject),
                 &tenant.0,
-                &format!("located {} doc(s) referencing the subject (SRCH-P15 real locate)", located.len()),
+                &format!(
+                    "located {} doc(s) referencing the subject (SRCH-P15 real locate)",
+                    located.len()
+                ),
                 None,
                 0,
             ),
@@ -428,7 +438,11 @@ mod tests {
         Region(REGION.into())
     }
     fn subject(id: &str) -> SubjectRef {
-        SubjectRef::new(Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant()))
+        SubjectRef::new(Principal::stub(
+            PrincipalId(id.into()),
+            PrincipalKind::Human,
+            tenant(),
+        ))
     }
 
     /// A scripted ProjectFetcher: ref → projection; absent ⇒ Gone.
@@ -440,7 +454,10 @@ mod tests {
         fn with(items: &[(&str, SearchProjection)]) -> Arc<FakeFetcher> {
             let f = FakeFetcher::default();
             for (r, p) in items {
-                f.projections.lock().unwrap().insert((*r).to_string(), p.clone());
+                f.projections
+                    .lock()
+                    .unwrap()
+                    .insert((*r).to_string(), p.clone());
             }
             Arc::new(f)
         }
@@ -460,7 +477,11 @@ mod tests {
     }
 
     fn proj(text: &str, fields: BTreeMap<String, FieldValue>) -> SearchProjection {
-        SearchProjection { text: text.into(), fields, lang: None }
+        SearchProjection {
+            text: text.into(),
+            fields,
+            lang: None,
+        }
     }
 
     /// A semantic page spec (its docs get a vector) with `actor`/`assignee` subject-locator facets.
@@ -513,7 +534,8 @@ mod tests {
     fn holder_over(ix: Arc<IncrementalIndexer>) -> SearchEraseHolder {
         let kms = Arc::new(KmsEngine::new());
         let pin = SearchDekPin::new(kms);
-        pin.reserve(&tenant(), &region()).expect("reserve the per-tenant index DEK");
+        pin.reserve(&tenant(), &region())
+            .expect("reserve the per-tenant index DEK");
         SearchEraseHolder::new(ix, pin, region())
     }
 
@@ -534,29 +556,49 @@ mod tests {
     #[test]
     fn locate_finds_docs_by_acl_facet_and_pseudonym() {
         let subj = subject("u-42");
-        let pseudonym = SearchEraseHolder::pseudonym_of(&subj, &tenant()).expect("pseudonym renders");
+        let pseudonym =
+            SearchEraseHolder::pseudonym_of(&subj, &tenant()).expect("pseudonym renders");
 
         let docs = vec![
-            ("myelin://acme/knowledge/page/owned", proj("a page", with_actor("u-42"))),
-            ("myelin://acme/knowledge/page/assigned", proj("another page", with_assignee("u-42"))),
+            (
+                "myelin://acme/knowledge/page/owned",
+                proj("a page", with_actor("u-42")),
+            ),
+            (
+                "myelin://acme/knowledge/page/assigned",
+                proj("another page", with_assignee("u-42")),
+            ),
             (
                 "myelin://acme/knowledge/page/mentions",
                 proj(&format!("see {pseudonym} for context"), BTreeMap::new()),
             ),
-            ("myelin://acme/knowledge/page/unrelated", proj("nothing personal", BTreeMap::new())),
+            (
+                "myelin://acme/knowledge/page/unrelated",
+                proj("nothing personal", BTreeMap::new()),
+            ),
         ];
         let ix = indexer_with(&docs);
         let holder = holder_over(ix.clone());
 
         let matcher = SearchEraseHolder::matcher(&subj, &tenant());
         let located = ix.locate_subject(&tenant(), &region(), &matcher);
-        assert_eq!(located.len(), 3, "the three docs referencing u-42 are located (acl/facet/pseudonym)");
-        assert!(!located.iter().any(|d| d.ends_with("unrelated")), "the unrelated doc is NOT located");
+        assert_eq!(
+            located.len(),
+            3,
+            "the three docs referencing u-42 are located (acl/facet/pseudonym)"
+        );
+        assert!(
+            !located.iter().any(|d| d.ends_with("unrelated")),
+            "the unrelated doc is NOT located"
+        );
 
         let report = holder.locate(&subj, tenant()).expect("locate");
         assert_eq!(report.receipt.operation, "locate");
         assert!(report.receipt.content_hash.starts_with("blake3:"));
-        assert!(report.receipt.key_epoch_destroyed.is_none(), "locate shreds no key");
+        assert!(
+            report.receipt.key_epoch_destroyed.is_none(),
+            "locate shreds no key"
+        );
     }
 
     /// **`pseudonym_of` renders the FROZEN `<pseudonym>@<tenant>.noreply` grammar (contract 4.8) —
@@ -573,7 +615,10 @@ mod tests {
         );
         // A subject id that breaks the grammar (contains `@`) renders no handle (no body-mention match).
         let bad = subject("a@b");
-        assert!(SearchEraseHolder::pseudonym_of(&bad, &tenant()).is_none(), "a grammar-breaking id renders no handle");
+        assert!(
+            SearchEraseHolder::pseudonym_of(&bad, &tenant()).is_none(),
+            "a grammar-breaking id renders no handle"
+        );
     }
 
     /// **A doc mentioning the subject's EXACT `.noreply` pseudonym is located; a doc mentioning a
@@ -583,18 +628,31 @@ mod tests {
     fn body_mention_match_is_the_exact_pseudonym() {
         let subj = subject("u-77");
         let real = SearchEraseHolder::pseudonym_of(&subj, &tenant()).expect("renders");
-        assert_eq!(real, "u-77@acme.noreply", "the exact handle the body must contain");
+        assert_eq!(
+            real, "u-77@acme.noreply",
+            "the exact handle the body must contain"
+        );
 
         let docs = vec![
             // mentions the REAL handle ⇒ located.
-            ("myelin://acme/knowledge/page/hit", proj("cc u-77@acme.noreply please", BTreeMap::new())),
+            (
+                "myelin://acme/knowledge/page/hit",
+                proj("cc u-77@acme.noreply please", BTreeMap::new()),
+            ),
             // mentions a DIFFERENT handle ⇒ NOT located (no wildcard).
-            ("myelin://acme/knowledge/page/miss", proj("cc someone-else@acme.noreply", BTreeMap::new())),
+            (
+                "myelin://acme/knowledge/page/miss",
+                proj("cc someone-else@acme.noreply", BTreeMap::new()),
+            ),
         ];
         let ix = indexer_with(&docs);
         let matcher = SearchEraseHolder::matcher(&subj, &tenant());
         let located = ix.locate_subject(&tenant(), &region(), &matcher);
-        assert_eq!(located, vec!["myelin://acme/knowledge/page/hit".to_string()], "only the exact-handle mention is located");
+        assert_eq!(
+            located,
+            vec!["myelin://acme/knowledge/page/hit".to_string()],
+            "only the exact-handle mention is located"
+        );
     }
 
     /// **`erase(subject)` is PURGE + RE-INDEX, not hide — through the LIVE consumer path — and leaves 0
@@ -608,31 +666,72 @@ mod tests {
         let owned = "myelin://acme/knowledge/page/owned";
         let unrelated = "myelin://acme/knowledge/page/other";
         let docs = vec![
-            (owned, proj("the subject's own page about raft consensus", with_actor("u-42"))),
-            (unrelated, proj("an unrelated page about paxos", BTreeMap::new())),
+            (
+                owned,
+                proj(
+                    "the subject's own page about raft consensus",
+                    with_actor("u-42"),
+                ),
+            ),
+            (
+                unrelated,
+                proj("an unrelated page about paxos", BTreeMap::new()),
+            ),
         ];
         let ix = indexer_with(&docs);
         assert_eq!(ix.live_count(&tenant(), &region()), 2, "two docs indexed");
 
         // Both docs got a vector (the page spec is semantic). The subject's doc is reachable by k-NN.
-        let q = MockEmbeddingAdapter::new(8).embed("raft consensus").unwrap();
-        let pre = ix.search_semantic(&tenant(), &region(), &AclFilter::All, &q, 5).expect("semantic pre");
-        assert!(pre.iter().any(|h| h.doc_id == owned), "the subject's doc has a vector before erase");
+        let q = MockEmbeddingAdapter::new(8)
+            .embed("raft consensus")
+            .unwrap();
+        let pre = ix
+            .search_semantic(&tenant(), &region(), &AclFilter::All, &q, 5)
+            .expect("semantic pre");
+        assert!(
+            pre.iter().any(|h| h.doc_id == owned),
+            "the subject's doc has a vector before erase"
+        );
 
         let holder = holder_over(ix.clone());
         let outcome = holder.erase_subject(&subj, &tenant()).expect("erase");
-        assert_eq!(outcome.docs_purged, 1, "exactly the one referencing doc purged");
-        assert!(outcome.zero_orphan_embedding, "0 orphan embedding after compaction (SRCH-D4 GATE)");
+        assert_eq!(
+            outcome.docs_purged, 1,
+            "exactly the one referencing doc purged"
+        );
+        assert!(
+            outcome.zero_orphan_embedding,
+            "0 orphan embedding after compaction (SRCH-D4 GATE)"
+        );
 
         // 0 recoverable: the subject's doc is gone from FT search AND from the vector shape; the
         // unrelated doc survives.
-        let ft = ix.search_ft(&tenant(), &region(), &AclFilter::All, "raft", 10).expect("ft");
-        assert!(!ft.iter().any(|h| h.doc_id == owned), "the erased doc is GONE from full-text search");
-        let post = ix.search_semantic(&tenant(), &region(), &AclFilter::All, &q, 5).expect("semantic post");
-        assert!(!post.iter().any(|h| h.doc_id == owned), "the erased doc's VECTOR is gone (purged + compacted)");
-        assert!(!ix.has_orphan_embedding(&tenant(), &region()), "0 orphan embedding (the erasure-critical GATE)");
-        assert_eq!(ix.live_count(&tenant(), &region()), 1, "only the unrelated doc survives");
-        let other = ix.search_ft(&tenant(), &region(), &AclFilter::All, "paxos", 10).expect("ft other");
+        let ft = ix
+            .search_ft(&tenant(), &region(), &AclFilter::All, "raft", 10)
+            .expect("ft");
+        assert!(
+            !ft.iter().any(|h| h.doc_id == owned),
+            "the erased doc is GONE from full-text search"
+        );
+        let post = ix
+            .search_semantic(&tenant(), &region(), &AclFilter::All, &q, 5)
+            .expect("semantic post");
+        assert!(
+            !post.iter().any(|h| h.doc_id == owned),
+            "the erased doc's VECTOR is gone (purged + compacted)"
+        );
+        assert!(
+            !ix.has_orphan_embedding(&tenant(), &region()),
+            "0 orphan embedding (the erasure-critical GATE)"
+        );
+        assert_eq!(
+            ix.live_count(&tenant(), &region()),
+            1,
+            "only the unrelated doc survives"
+        );
+        let other = ix
+            .search_ft(&tenant(), &region(), &AclFilter::All, "paxos", 10)
+            .expect("ft other");
         assert_eq!(other.len(), 1, "the unrelated doc is untouched");
     }
 
@@ -653,8 +752,13 @@ mod tests {
         assert_eq!(ix.live_count(&tenant(), &region()), 1);
         let erase_ev =
             SearchEraseHolder::erased_event(&tenant(), &region(), &subject("u-1").principal, r);
-        ix.index(&erase_ev).expect("the erase event flows through the live index() path");
-        assert_eq!(ix.live_count(&tenant(), &region()), 0, "the doc was removed via the live consumer path");
+        ix.index(&erase_ev)
+            .expect("the erase event flows through the live index() path");
+        assert_eq!(
+            ix.live_count(&tenant(), &region()),
+            0,
+            "the doc was removed via the live consumer path"
+        );
     }
 
     /// **`restrict(subject)` suppresses the subject's content from results/RAG (§4.8); clearing restores
@@ -663,19 +767,36 @@ mod tests {
     fn restrict_suppresses_subject_from_results_and_rag() {
         let subj = subject("u-7");
         let holder = holder_over(indexer_with(&[]));
-        assert!(!holder.is_restricted(&tenant(), "u-7"), "not restricted initially");
+        assert!(
+            !holder.is_restricted(&tenant(), "u-7"),
+            "not restricted initially"
+        );
 
         holder.restrict(&subj, true).expect("restrict on");
-        assert!(holder.is_restricted(&tenant(), "u-7"), "the subject is restricted");
+        assert!(
+            holder.is_restricted(&tenant(), "u-7"),
+            "the subject is restricted"
+        );
 
         let hits = [("doc-a", "u-7"), ("doc-b", "u-other")];
         let surviving = holder.suppress_hits(&tenant(), hits.iter().map(|(d, s)| (*d, *s)));
-        assert_eq!(surviving, vec!["doc-b".to_string()], "the restricted subject's doc is suppressed");
+        assert_eq!(
+            surviving,
+            vec!["doc-b".to_string()],
+            "the restricted subject's doc is suppressed"
+        );
 
         holder.restrict(&subj, false).expect("restrict off");
-        assert!(!holder.is_restricted(&tenant(), "u-7"), "restriction cleared");
+        assert!(
+            !holder.is_restricted(&tenant(), "u-7"),
+            "restriction cleared"
+        );
         let surviving = holder.suppress_hits(&tenant(), hits.iter().map(|(d, s)| (*d, *s)));
-        assert_eq!(surviving.len(), 2, "both docs surface once the restriction is cleared");
+        assert_eq!(
+            surviving.len(),
+            2,
+            "both docs surface once the restriction is cleared"
+        );
     }
 
     /// **The HYOK structural skip: a HYOK class has NOTHING to erase — it is not in the index at all
@@ -701,9 +822,18 @@ mod tests {
         let hyok = Hyok::new(DenyAllHyok);
 
         let holder = holder_over(indexer_with(&[]));
-        assert!(!holder.erase_class(&platform), "a platform-managed class IS indexed (erase = purge)");
-        assert!(!holder.erase_class(&byok), "a BYOK class IS indexed (plaintext reachable while live)");
-        assert!(holder.erase_class(&hyok), "a HYOK class is structurally skipped — nothing to erase");
+        assert!(
+            !holder.erase_class(&platform),
+            "a platform-managed class IS indexed (erase = purge)"
+        );
+        assert!(
+            !holder.erase_class(&byok),
+            "a BYOK class IS indexed (plaintext reachable while live)"
+        );
+        assert!(
+            holder.erase_class(&hyok),
+            "a HYOK class is structurally skipped — nothing to erase"
+        );
     }
 
     /// **A tenant offboard (`EraseScope::Tenant`) is a tenant-decommission crypto-shred (the per-tenant
@@ -711,7 +841,9 @@ mod tests {
     #[test]
     fn tenant_offboard_crypto_shreds_the_index_dek() {
         let holder = holder_over(indexer_with(&[]));
-        let receipt = holder.erase(EraseScope::Tenant(tenant())).expect("tenant offboard erase");
+        let receipt = holder
+            .erase(EraseScope::Tenant(tenant()))
+            .expect("tenant offboard erase");
         assert_eq!(receipt.receipt.operation, "erase");
         assert_eq!(
             receipt.receipt.key_epoch_destroyed,
@@ -733,7 +865,10 @@ mod tests {
         let first = holder.erase_subject(&subj, &tenant()).expect("erase 1");
         assert_eq!(first.docs_purged, 1, "first erase purges the one doc");
         let second = holder.erase_subject(&subj, &tenant()).expect("erase 2");
-        assert_eq!(second.docs_purged, 0, "re-erase purges nothing (already gone — no resurrection)");
+        assert_eq!(
+            second.docs_purged, 0,
+            "re-erase purges nothing (already gone — no resurrection)"
+        );
         assert!(second.zero_orphan_embedding, "still 0 orphan embedding");
     }
 
@@ -741,19 +876,29 @@ mod tests {
     #[test]
     fn erase_receipt_is_content_addressed() {
         let holder = holder_over(indexer_with(&[]));
-        let scope = EraseScope::Subject { subject: subject("u-0"), tenant: tenant() };
+        let scope = EraseScope::Subject {
+            subject: subject("u-0"),
+            tenant: tenant(),
+        };
         let r1 = holder.erase(scope.clone()).expect("erase 1");
         assert!(r1.receipt.content_hash.starts_with("blake3:"));
         let r2 = holder.erase(scope).expect("erase 2");
-        assert_eq!(r1, r2, "the same erase scope yields the identical content-addressed receipt (idempotent)");
+        assert_eq!(
+            r1, r2,
+            "the same erase scope yields the identical content-addressed receipt (idempotent)"
+        );
     }
 
     /// **The holder is object-safe behind `dyn PersonalDataHolder` (contract 10.1).**
     #[test]
     fn holder_is_object_safe() {
-        let holders: Vec<Box<dyn PersonalDataHolder>> = vec![Box::new(holder_over(indexer_with(&[])))];
+        let holders: Vec<Box<dyn PersonalDataHolder>> =
+            vec![Box::new(holder_over(indexer_with(&[])))];
         for h in &holders {
-            assert!(h.locate(&subject("u-1"), tenant()).is_ok(), "the real holder responds to the contract");
+            assert!(
+                h.locate(&subject("u-1"), tenant()).is_ok(),
+                "the real holder responds to the contract"
+            );
         }
     }
 }

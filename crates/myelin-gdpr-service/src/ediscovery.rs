@@ -145,7 +145,10 @@ impl EDiscoveryScope {
                 format!("subject:{}:{}", tenant.0, subject.0)
             }
             EDiscoveryScope::Tenant(tenant) => format!("tenant:{}", tenant.0),
-            EDiscoveryScope::Matter { tenant, matter_token } => {
+            EDiscoveryScope::Matter {
+                tenant,
+                matter_token,
+            } => {
                 format!("matter:{}:{}", tenant.0, matter_token)
             }
         }
@@ -279,7 +282,10 @@ pub struct EDiscoveryExporter<'a, K: SigningKey> {
 impl<'a, K: SigningKey> EDiscoveryExporter<'a, K> {
     /// Build the exporter over the audit authority (the proofs substrate) + the legal-hold registry
     /// (the freeze gate). Both are the EXISTING singletons the DSR orchestration already uses.
-    pub fn new(authority: &'a AuditAuthority<K>, holds: &'a LegalHoldRegistry) -> EDiscoveryExporter<'a, K> {
+    pub fn new(
+        authority: &'a AuditAuthority<K>,
+        holds: &'a LegalHoldRegistry,
+    ) -> EDiscoveryExporter<'a, K> {
         EDiscoveryExporter { authority, holds }
     }
 
@@ -323,8 +329,7 @@ impl<'a, K: SigningKey> EDiscoveryExporter<'a, K> {
         }
 
         // 4. Content-address the whole bundle (binds the exact record set against the STH).
-        let bundle_digest =
-            EDiscoveryBundle::content_addressed(&scope.token(), &sth, &records);
+        let bundle_digest = EDiscoveryBundle::content_addressed(&scope.token(), &sth, &records);
         Some(EDiscoveryBundle {
             scope_token: scope.token(),
             sth,
@@ -339,17 +344,17 @@ impl<'a, K: SigningKey> EDiscoveryExporter<'a, K> {
     /// (§8.1 — eDiscovery and the DSR receipt ride the SAME tamper-evident bundle type). The
     /// `merkle_inclusion` carries the bundle's STH commitment (the chain-of-custody anchor — no
     /// longer `None`); the `receipts` are the per-record inclusion proofs.
-    pub fn export_bundle(&self, scope: &EDiscoveryScope, exported_at: &str) -> Option<MerkleProvenBundle> {
+    pub fn export_bundle(
+        &self,
+        scope: &EDiscoveryScope,
+        exported_at: &str,
+    ) -> Option<MerkleProvenBundle> {
         let bundle = self.export(scope, exported_at)?;
         Some(MerkleProvenBundle {
             // The eDiscovery bundle is not a DSR — its id is the content-address of the scope+export
             // (a stable matter handle, PII-free).
             dsr_id: DsrId(format!("ediscovery:{}", bundle.bundle_digest)),
-            receipts: bundle
-                .records
-                .iter()
-                .map(serialize_record_proof)
-                .collect(),
+            receipts: bundle.records.iter().map(serialize_record_proof).collect(),
             bundle_digest: bundle.bundle_digest.clone(),
             // The chain-of-custody anchor: the STH commitment the whole bundle is proven against
             // (the export IS Merkle-proven — the field is NOT `None`).
@@ -358,9 +363,16 @@ impl<'a, K: SigningKey> EDiscoveryExporter<'a, K> {
     }
 
     /// Whether an audit entry (by its `subject` + `correlation_id`) is in the export scope.
-    fn in_scope(&self, scope: &EDiscoveryScope, subject: &ArtifactRef, correlation_id: &str) -> bool {
+    fn in_scope(
+        &self,
+        scope: &EDiscoveryScope,
+        subject: &ArtifactRef,
+        correlation_id: &str,
+    ) -> bool {
         match scope {
-            EDiscoveryScope::Subject { subject: target, .. } => subject == target,
+            EDiscoveryScope::Subject {
+                subject: target, ..
+            } => subject == target,
             EDiscoveryScope::Tenant(_) => true,
             EDiscoveryScope::Matter { matter_token, .. } => correlation_id == matter_token,
         }
@@ -428,11 +440,16 @@ mod tests {
 
     fn seed(auth: &AuditAuthority<CellSigningKey>) {
         // Three actions about subject-A, two about subject-B, one matter "m-7" (about subject-B).
-        auth.consumer().handle(&action_event("1", "acme", "myelin://acme/subj/A", "r-1"));
-        auth.consumer().handle(&action_event("2", "acme", "myelin://acme/subj/B", "r-2"));
-        auth.consumer().handle(&action_event("3", "acme", "myelin://acme/subj/A", "r-3"));
-        auth.consumer().handle(&action_event("4", "acme", "myelin://acme/subj/A", "m-7"));
-        auth.consumer().handle(&action_event("5", "acme", "myelin://acme/subj/B", "m-7"));
+        auth.consumer()
+            .handle(&action_event("1", "acme", "myelin://acme/subj/A", "r-1"));
+        auth.consumer()
+            .handle(&action_event("2", "acme", "myelin://acme/subj/B", "r-2"));
+        auth.consumer()
+            .handle(&action_event("3", "acme", "myelin://acme/subj/A", "r-3"));
+        auth.consumer()
+            .handle(&action_event("4", "acme", "myelin://acme/subj/A", "m-7"));
+        auth.consumer()
+            .handle(&action_event("5", "acme", "myelin://acme/subj/B", "m-7"));
     }
 
     /// **A subject-scoped export carries every in-scope record, each inclusion-proof-bearing, and
@@ -448,11 +465,20 @@ mod tests {
             tenant: TenantId("acme".into()),
             subject: ArtifactRef("myelin://acme/subj/A".into()),
         };
-        let bundle = exporter.export(&scope, "2026-06-20T01:00:00Z").expect("a non-empty export");
+        let bundle = exporter
+            .export(&scope, "2026-06-20T01:00:00Z")
+            .expect("a non-empty export");
         // Three records about subject-A (events 1, 3, 4).
-        assert_eq!(bundle.record_count(), 3, "every subject-A record is in the bundle");
+        assert_eq!(
+            bundle.record_count(),
+            3,
+            "every subject-A record is in the bundle"
+        );
         // The whole bundle verifies: digest re-derives + STH signs + EVERY record's proof verifies.
-        assert!(bundle.verify(auth.key()), "the bundle is verifiable, not asserted");
+        assert!(
+            bundle.verify(auth.key()),
+            "the bundle is verifiable, not asserted"
+        );
         // Each record IS inclusion-proof-bearing against the bundle STH.
         for r in &bundle.records {
             assert!(
@@ -476,13 +502,23 @@ mod tests {
             tenant: TenantId("acme".into()),
             matter_token: "m-7".into(),
         };
-        let bundle = exporter.export(&scope, "t").expect("a non-empty matter export");
-        assert_eq!(bundle.record_count(), 2, "both m-7 records (across subjects) are in scope");
+        let bundle = exporter
+            .export(&scope, "t")
+            .expect("a non-empty matter export");
+        assert_eq!(
+            bundle.record_count(),
+            2,
+            "both m-7 records (across subjects) are in scope"
+        );
         assert!(bundle.verify(auth.key()));
         // The matter spans two distinct subjects.
         let subjects: std::collections::BTreeSet<_> =
             bundle.records.iter().map(|r| r.subject.0.clone()).collect();
-        assert_eq!(subjects.len(), 2, "the matter spans subject-A and subject-B");
+        assert_eq!(
+            subjects.len(),
+            2,
+            "the matter spans subject-A and subject-B"
+        );
     }
 
     /// **A tenant-scoped export carries the whole chain**, each record proven.
@@ -496,7 +532,11 @@ mod tests {
         let bundle = exporter
             .export(&EDiscoveryScope::Tenant(TenantId("acme".into())), "t")
             .expect("a non-empty tenant export");
-        assert_eq!(bundle.record_count(), 5, "every tenant record is in the bundle");
+        assert_eq!(
+            bundle.record_count(),
+            5,
+            "every tenant record is in the bundle"
+        );
         assert!(bundle.verify(auth.key()));
     }
 
@@ -563,16 +603,25 @@ mod tests {
         // Drop a record → the (unchanged) digest no longer matches the (shorter) record set.
         let mut dropped = bundle.clone();
         dropped.records.pop();
-        assert!(!dropped.verify(auth.key()), "a dropped record fails verification");
+        assert!(
+            !dropped.verify(auth.key()),
+            "a dropped record fails verification"
+        );
 
         // Reorder two records → the seq-tagged digest body changes → fails.
         let mut reordered = bundle.clone();
         reordered.records.swap(0, 1);
-        assert!(!reordered.verify(auth.key()), "a reordered record set fails verification");
+        assert!(
+            !reordered.verify(auth.key()),
+            "a reordered record set fails verification"
+        );
 
         // A bundle proven against a DIFFERENT key (a forged STH) fails the signature check.
         let other = CellSigningKey::from_seed("a-different-cell-key");
-        assert!(!bundle.verify(&other), "a bundle does not verify under a different key");
+        assert!(
+            !bundle.verify(&other),
+            "a bundle does not verify under a different key"
+        );
     }
 
     /// **The `export_bundle` MerkleProvenBundle return is the contract-10.7 shape** — content-
@@ -587,14 +636,26 @@ mod tests {
             tenant: TenantId("acme".into()),
             subject: ArtifactRef("myelin://acme/subj/A".into()),
         };
-        let mpb = exporter.export_bundle(&scope, "t").expect("a MerkleProvenBundle");
-        assert!(mpb.bundle_digest.starts_with("blake3:"), "content-addressed");
+        let mpb = exporter
+            .export_bundle(&scope, "t")
+            .expect("a MerkleProvenBundle");
+        assert!(
+            mpb.bundle_digest.starts_with("blake3:"),
+            "content-addressed"
+        );
         assert!(
             mpb.merkle_inclusion.is_some(),
             "the export IS Merkle-proven — the chain-of-custody STH commitment is carried (not None)"
         );
-        assert_eq!(mpb.receipts.len(), 3, "one per-record proof per subject-A record");
-        assert!(mpb.dsr_id.0.starts_with("ediscovery:"), "a PII-free matter handle");
+        assert_eq!(
+            mpb.receipts.len(),
+            3,
+            "one per-record proof per subject-A record"
+        );
+        assert!(
+            mpb.dsr_id.0.starts_with("ediscovery:"),
+            "a PII-free matter handle"
+        );
     }
 
     /// **An empty scope yields no export** (an empty tenant chain has no STH to prove against).
@@ -623,15 +684,27 @@ mod tests {
             tenant: TenantId("acme".into()),
             subject: ArtifactRef("myelin://acme/subj/NOBODY".into()),
         };
-        let bundle = exporter.export(&scope, "t").expect("the tenant has a chain → a bundle");
-        assert_eq!(bundle.record_count(), 0, "no records about an unknown subject");
-        assert!(bundle.verify(auth.key()), "an empty bundle still verifies (the digest binds 0 records)");
+        let bundle = exporter
+            .export(&scope, "t")
+            .expect("the tenant has a chain → a bundle");
+        assert_eq!(
+            bundle.record_count(),
+            0,
+            "no records about an unknown subject"
+        );
+        assert!(
+            bundle.verify(auth.key()),
+            "an empty bundle still verifies (the digest binds 0 records)"
+        );
     }
 
     /// The `ediscovery_export_records` telemetry signal is named + has the count unit.
     #[test]
     fn ediscovery_export_records_signal_is_named() {
-        assert_eq!(EDISCOVERY_EXPORT_RECORDS.0, "gdpr.ediscovery_export_records");
+        assert_eq!(
+            EDISCOVERY_EXPORT_RECORDS.0,
+            "gdpr.ediscovery_export_records"
+        );
         assert_eq!(EDISCOVERY_EXPORT_RECORDS.1, "count");
     }
 
@@ -651,8 +724,11 @@ mod tests {
             "tenant scope token"
         );
         assert_eq!(
-            EDiscoveryScope::Matter { tenant: TenantId("acme".into()), matter_token: "m-7".into() }
-                .token(),
+            EDiscoveryScope::Matter {
+                tenant: TenantId("acme".into()),
+                matter_token: "m-7".into()
+            }
+            .token(),
             "matter:acme:m-7",
             "matter scope token"
         );
@@ -663,10 +739,21 @@ mod tests {
         seed(&auth);
         let exporter = EDiscoveryExporter::new(&auth, &holds);
         let s = exporter.export(&subj, "t").unwrap();
-        assert_eq!(s.scope_token, "subject:acme:u-A", "the bundle carries the token verbatim");
-        let t = exporter.export(&EDiscoveryScope::Tenant(TenantId("acme".into())), "t").unwrap();
-        assert_ne!(s.scope_token, t.scope_token, "distinct scopes → distinct tokens");
-        assert_ne!(s.bundle_digest, t.bundle_digest, "distinct scopes → distinct bundle digests");
+        assert_eq!(
+            s.scope_token, "subject:acme:u-A",
+            "the bundle carries the token verbatim"
+        );
+        let t = exporter
+            .export(&EDiscoveryScope::Tenant(TenantId("acme".into())), "t")
+            .unwrap();
+        assert_ne!(
+            s.scope_token, t.scope_token,
+            "distinct scopes → distinct tokens"
+        );
+        assert_ne!(
+            s.bundle_digest, t.bundle_digest,
+            "distinct scopes → distinct bundle digests"
+        );
     }
 
     /// **The per-record proof serialises to the exact `seq@size:leaf->root` chain-of-custody form
@@ -687,11 +774,17 @@ mod tests {
             assert!(!proof.is_empty(), "the proof string is never empty");
             // The form is `seq@size:leaf->root` over real blake3 nodes.
             assert!(proof.contains('@'), "carries the leaf@size");
-            assert!(proof.contains("->blake3:"), "reduces to a blake3 root: {proof}");
+            assert!(
+                proof.contains("->blake3:"),
+                "reduces to a blake3 root: {proof}"
+            );
             assert!(proof.contains("blake3:"), "carries blake3 leaf/root nodes");
         }
         // The first record is leaf 0 @ a non-trivial tree size.
-        assert!(mpb.receipts[0].starts_with("0@"), "the first subject-A record is leaf 0");
+        assert!(
+            mpb.receipts[0].starts_with("0@"),
+            "the first subject-A record is leaf 0"
+        );
     }
 
     // A region is referenced so the import is used in a representative chain-of-custody assertion.
@@ -704,7 +797,11 @@ mod tests {
         let bundle = exporter
             .export(&EDiscoveryScope::Tenant(TenantId("acme".into())), "t")
             .unwrap();
-        assert_eq!(bundle.sth.tenant, TenantId("acme".into()), "the STH is the per-tenant root");
+        assert_eq!(
+            bundle.sth.tenant,
+            TenantId("acme".into()),
+            "the STH is the per-tenant root"
+        );
         // A different tenant's chain is empty (residency-partitioned).
         let _region = Region("acme-home".into());
         assert!(exporter

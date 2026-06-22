@@ -262,7 +262,10 @@ mod tests {
     fn every_git_token_carries_the_git_subsystem_prefix() {
         for &tok in GIT_EVENT_TOKENS {
             let head = tok.split('.').next().expect("non-empty token");
-            assert_eq!(head, "git", "token `{tok}` must carry the `git` subsystem prefix");
+            assert_eq!(
+                head, "git",
+                "token `{tok}` must carry the `git` subsystem prefix"
+            );
             // ...and `git` is the canonical subsystem token the Bus knows.
             assert!(
                 myelin_events::SUBSYSTEM_TOKENS.contains(&"git"),
@@ -277,7 +280,10 @@ mod tests {
     fn the_git_token_list_has_no_duplicates() {
         let mut seen = std::collections::BTreeSet::new();
         for &tok in GIT_EVENT_TOKENS {
-            assert!(seen.insert(tok), "git token `{tok}` is registered more than once");
+            assert!(
+                seen.insert(tok),
+                "git token `{tok}` is registered more than once"
+            );
         }
         assert_eq!(seen.len(), GIT_EVENT_TOKENS.len());
     }
@@ -296,7 +302,10 @@ mod tests {
             GIT_REVIEW_SUBMITTED,
             GIT_COMMENT_CREATED,
         ] {
-            assert!(GIT_EVENT_TOKENS.contains(&tok), "`{tok}` must be registered");
+            assert!(
+                GIT_EVENT_TOKENS.contains(&tok),
+                "`{tok}` must be registered"
+            );
         }
         // the audit-critical tokens (contract 10.6)
         assert!(GIT_EVENT_TOKENS.contains(&GIT_PROTECTION_BYPASS_USED));
@@ -313,7 +322,9 @@ mod tests {
     fn git_registers_no_foreign_subsystem_tokens() {
         for &tok in GIT_EVENT_TOKENS {
             assert!(
-                !tok.starts_with("ci.") && !tok.starts_with("identity.") && !tok.starts_with("key.")
+                !tok.starts_with("ci.")
+                    && !tok.starts_with("identity.")
+                    && !tok.starts_with("key.")
                     && !tok.starts_with("token."),
                 "git must not register the foreign-subsystem token `{tok}`"
             );

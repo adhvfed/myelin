@@ -71,7 +71,11 @@ fn registry_with(tenant: &str, region: &str, home: &str) -> Registry {
         region: Region::new(region),
         status: CellStatus::Active,
         isolation_kind: IsolationKind::Pool,
-        capacity: Capacity { tenants_max: 1000, write_qps_max: 5000, storage_bytes_max: 1 << 40 },
+        capacity: Capacity {
+            tenants_max: 1000,
+            write_qps_max: 5000,
+            storage_bytes_max: 1 << 40,
+        },
         utilisation: 10,
         version: 1,
         endpoint: format!("cell.{region}.{home}.myelin.eu"),
@@ -109,12 +113,20 @@ fn cdc_c6_storage_flag_and_control_plane_gate_agree_on_an_extra_eu_crossing() {
     let telemetry = MirrorTelemetry::new();
     let flagged = mirror.flag_target(&storage_target, &telemetry);
     assert!(flagged, "Storage FLAGS the extra-EU crossing");
-    assert_eq!(telemetry.mirror_residency_deny(), 1, "the flagged crossing is counted (the C6 signal)");
+    assert_eq!(
+        telemetry.mirror_residency_deny(),
+        1,
+        "the flagged crossing is counted (the C6 signal)"
+    );
 
     // Storage's flag REPORTS the mirror TARGET's region into residency_verify — the crossing surfaces.
     let mirror_report = mirror.residency_report(&storage_target);
     assert_eq!(mirror_report.store_class, ResidencyStoreClass::PushMirror);
-    assert_eq!(mirror_report.region.as_str(), "us-east", "Storage flags the TARGET's region");
+    assert_eq!(
+        mirror_report.region.as_str(),
+        "us-east",
+        "Storage flags the TARGET's region"
+    );
 
     let mut reports = StoreSet::for_cell(&region).reports_for(&tenant);
     reports.push(mirror_report);
@@ -135,7 +147,11 @@ fn cdc_c6_storage_flag_and_control_plane_gate_agree_on_an_extra_eu_crossing() {
         matches!(decision, MirrorDecision::Deny { .. }),
         "the control-plane gate DENIES the same crossing by default (0 PII to an ungated extra-EU mirror)"
     );
-    assert_eq!(gate.unauthorised_pushes_prevented(), 1, "the gate prevented the unauthorised push");
+    assert_eq!(
+        gate.unauthorised_pushes_prevented(),
+        1,
+        "the gate prevented the unauthorised push"
+    );
 
     println!(
         "[P-255 CDC 10.5/12.4 C6 GREEN 2026-06-21] Storage FLAGS an extra-EU mirror crossing \
@@ -158,7 +174,10 @@ fn cdc_c6_storage_flag_and_control_plane_gate_agree_on_a_same_region_mirror() {
     let mirror = PushMirrorClass::over(tenant.clone(), region.clone(), &store);
     let storage_target = PushMirrorTarget::new("git.acme.internal.fr", region.clone());
     let telemetry = MirrorTelemetry::new();
-    assert!(!mirror.flag_target(&storage_target, &telemetry), "a same-region mirror is no crossing");
+    assert!(
+        !mirror.flag_target(&storage_target, &telemetry),
+        "a same-region mirror is no crossing"
+    );
     assert_eq!(telemetry.mirror_residency_deny(), 0, "no crossing flagged");
 
     let mut reports = StoreSet::for_cell(&region).reports_for(&tenant);
@@ -175,8 +194,13 @@ fn cdc_c6_storage_flag_and_control_plane_gate_agree_on_a_same_region_mirror() {
     let policy = TransferPolicyDouble::new();
     let mut gate = MirrorGate::new();
     assert!(
-        gate.mirror_allowed(&reg, &tenant, &cp_target, &policy).is_allowed(),
+        gate.mirror_allowed(&reg, &tenant, &cp_target, &policy)
+            .is_allowed(),
         "the control-plane gate ALLOWS a same-region mirror (no crossing)"
     );
-    assert_eq!(gate.unauthorised_pushes_prevented(), 0, "no unauthorised push prevented — no crossing");
+    assert_eq!(
+        gate.unauthorised_pushes_prevented(),
+        0,
+        "no unauthorised push prevented — no crossing"
+    );
 }

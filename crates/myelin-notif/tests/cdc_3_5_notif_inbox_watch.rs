@@ -33,7 +33,11 @@ use myelin_notif::{publish_inbox_frame, watch_open, watch_resume, InboxFrame, Wa
 use myelin_tenancy::TenantId;
 
 fn principal(id: &str) -> Principal {
-    Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, TenantId("acme".into()))
+    Principal::stub(
+        PrincipalId(id.into()),
+        PrincipalKind::Human,
+        TenantId("acme".into()),
+    )
 }
 
 /// **PROVIDER side of 3.5 (Notif's leg)** — Notif's create/bump path mirrors an inbox item onto the
@@ -68,18 +72,32 @@ fn cdc_provider_seq_and_consumer_resume_agree_zero_lost_zero_dup() {
     // PROVIDER: publishes 1..5; the transport assigns the per-(stream,scope) monotone seq.
     for i in 1..=5 {
         let f = provider_publishes(&mut fh, &me, &format!("itm-{i}"));
-        assert_eq!(f.seq, i, "the PROVIDER does not mint the seq — the transport assigns it monotone");
+        assert_eq!(
+            f.seq, i,
+            "the PROVIDER does not mint the seq — the transport assigns it monotone"
+        );
     }
 
     // CONSUMER: saw up to seq 2 → resume backfills (2, now] = {3,4,5}.
     let backfilled = consumer_resume_drains(&mut fh, &me, 2);
-    assert_eq!(backfilled, vec!["itm-3", "itm-4", "itm-5"], "the gap is replayed in order — 0 lost");
+    assert_eq!(
+        backfilled,
+        vec!["itm-3", "itm-4", "itm-5"],
+        "the gap is replayed in order — 0 lost"
+    );
 
     // a LIVE frame after the resume is delivered gap-free (0 dup across the backfill→live boundary).
-    let live_watch = watch_resume(&mut fh, &me, 5).unwrap().into_live().expect("caught-up live");
+    let live_watch = watch_resume(&mut fh, &me, 5)
+        .unwrap()
+        .into_live()
+        .expect("caught-up live");
     provider_publishes(&mut fh, &me, "itm-6");
     let live: Vec<String> = live_watch.drain().into_iter().map(|f| f.item_id).collect();
-    assert_eq!(live, vec!["itm-6"], "the live frame continues gap-free — 0 dup");
+    assert_eq!(
+        live,
+        vec!["itm-6"],
+        "the live frame continues gap-free — 0 dup"
+    );
 }
 
 /// **CDC: the CONSUMER subscribes on a BOUNDED scope; an over-broad scope is REJECTED (the
@@ -90,12 +108,18 @@ fn cdc_provider_seq_and_consumer_resume_agree_zero_lost_zero_dup() {
 fn cdc_consumer_scope_is_bounded_unbounded_is_rejected() {
     let mut fh = Firehose::new();
     // the bounded inbox scope subscribes (the positive control).
-    assert!(watch_open(&mut fh, &principal("p-me")).is_ok(), "a bounded inbox: scope watch opens");
+    assert!(
+        watch_open(&mut fh, &principal("p-me")).is_ok(),
+        "a bounded inbox: scope watch opens"
+    );
     // an unbounded scope is rejected at the connection-tier subscribe entry (subscribe_raw).
     for raw in ["inbox:*", "*", "inbox:"] {
         let r = fh.subscribe_raw("fan.acme.inbox", raw, None);
         assert!(r.is_err(), "an unbounded scope `{raw}` is rejected");
-        assert!(r.unwrap_err().is_over_broad_scope(), "`{raw}` is an over-broad-scope rejection");
+        assert!(
+            r.unwrap_err().is_over_broad_scope(),
+            "`{raw}` is an over-broad-scope rejection"
+        );
     }
 }
 
@@ -111,9 +135,15 @@ fn cdc_over_old_cursor_yields_resync_required() {
         provider_publishes(&mut fh, &me, &format!("itm-{i}")); // window holds {4,5,6}
     }
     let out = watch_resume(&mut fh, &me, 2).expect("the resync verdict is a non-fatal outcome");
-    assert!(out.is_resync_required(), "an over-old cursor RAISES resync_required (NAMED)");
+    assert!(
+        out.is_resync_required(),
+        "an over-old cursor RAISES resync_required (NAMED)"
+    );
     match out {
-        WatchOutcome::ResyncRequired { last_seq, window_floor } => {
+        WatchOutcome::ResyncRequired {
+            last_seq,
+            window_floor,
+        } => {
             assert_eq!(last_seq, 2);
             assert_eq!(window_floor, 4, "the window floor is the oldest held seq");
         }
@@ -129,5 +159,8 @@ fn cdc_over_old_cursor_yields_resync_required() {
 fn cdc_unexpected_transport_error_is_propagated() {
     // FirehoseScope::parse is the LOUD chokepoint: an over-broad scope is an Err, never a silent ok.
     let err = myelin_events::firehose::FirehoseScope::parse("inbox:*").expect_err("over-broad");
-    assert!(matches!(err, FirehoseError::OverBroadScope { .. }), "the verdict is LOUD + typed");
+    assert!(
+        matches!(err, FirehoseError::OverBroadScope { .. }),
+        "the verdict is LOUD + typed"
+    );
 }

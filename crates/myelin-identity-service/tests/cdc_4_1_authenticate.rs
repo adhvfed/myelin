@@ -55,7 +55,12 @@ fn provider() -> HumanSsoAuthenticator {
         )
         .expect("seed the principal");
     store
-        .link_credential(&s, scheme::OIDC, "sub-alice", &PrincipalId("p:alice".into()))
+        .link_credential(
+            &s,
+            scheme::OIDC,
+            "sub-alice",
+            &PrincipalId("p:alice".into()),
+        )
         .expect("link the OIDC credential");
     HumanSsoAuthenticator::new(store)
 }

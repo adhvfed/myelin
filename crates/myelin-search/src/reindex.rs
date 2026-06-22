@@ -100,7 +100,11 @@ struct CursorKey {
 
 impl CursorKey {
     fn new(tenant: &TenantId, region: &Region, scope: &SnapshotScope) -> CursorKey {
-        CursorKey { tenant: tenant.0.clone(), region: region.0.clone(), scope: scope.as_key() }
+        CursorKey {
+            tenant: tenant.0.clone(),
+            region: region.0.clone(),
+            scope: scope.as_key(),
+        }
     }
 }
 
@@ -170,7 +174,10 @@ impl ReindexCursorStore {
     /// a resumed replay re-asks the owner for aggregates ABOVE it. `None` = nothing applied yet (a full
     /// rebuild from `since = None`).
     pub fn cursor(&self, tenant: &TenantId, region: &Region, scope: &SnapshotScope) -> Option<u64> {
-        self.lock().cursors.get(&CursorKey::new(tenant, region, scope)).copied()
+        self.lock()
+            .cursors
+            .get(&CursorKey::new(tenant, region, scope))
+            .copied()
     }
 
     /// Has the snapshot `event_id` already been applied for `(tenant, region, scope)`? (The idempotency
@@ -244,7 +251,11 @@ impl ReindexCursorStore {
     ) -> bool {
         let key = CursorKey::new(tenant, region, scope);
         let mut g = self.lock();
-        let fresh = g.applied.entry(key.clone()).or_default().insert(event_id.to_string());
+        let fresh = g
+            .applied
+            .entry(key.clone())
+            .or_default()
+            .insert(event_id.to_string());
         if fresh {
             let cur = g.cursors.entry(key).or_insert(0);
             *cur = (*cur).max(version);
@@ -272,7 +283,9 @@ impl std::fmt::Display for ReindexError {
         match self {
             ReindexError::Bus(e) => write!(f, "reindex: bus re-emit failed: {e}"),
             ReindexError::Index(e) => write!(f, "reindex: live indexer rejected a snapshot: {e}"),
-            ReindexError::AtCapacity(e) => write!(f, "reindex: per-tenant in-flight cap reached: {e}"),
+            ReindexError::AtCapacity(e) => {
+                write!(f, "reindex: per-tenant in-flight cap reached: {e}")
+            }
         }
     }
 }
@@ -352,7 +365,11 @@ impl SearchReindexer {
     /// Build the reindex driver over a live [`IncrementalIndexer`] + a fresh cursor store at the default
     /// budget + the cell's resident `region`.
     pub fn new(indexer: Arc<IncrementalIndexer>, region: Region) -> SearchReindexer {
-        SearchReindexer { indexer, cursors: ReindexCursorStore::new(), region }
+        SearchReindexer {
+            indexer,
+            cursors: ReindexCursorStore::new(),
+            region,
+        }
     }
 
     /// Build the driver over an explicit (shared) cursor store (so a test/op can pin the budget or share
@@ -362,7 +379,11 @@ impl SearchReindexer {
         cursors: ReindexCursorStore,
         region: Region,
     ) -> SearchReindexer {
-        SearchReindexer { indexer, cursors, region }
+        SearchReindexer {
+            indexer,
+            cursors,
+            region,
+        }
     }
 
     /// The cell's resident region (§3.4).
@@ -443,8 +464,11 @@ impl SearchReindexer {
         // (1) Drive the BUS re-emit (contract 2.6) — each owning subsystem's `replay(scope, since)`
         // emits `*.snapshot` drafts through the outbox (the SAME outbox→bus→live-consumer path; no
         // backdoor). A LOUD error if the scope's owner is unregistered (never a silent empty rebuild).
-        let BusReindexReceipt { snapshots_emitted, snapshots_skipped_duplicate, owners_replayed } =
-            bus_reindex(scope, since, sources, outbox, ctx_base).map_err(map_bus_err)?;
+        let BusReindexReceipt {
+            snapshots_emitted,
+            snapshots_skipped_duplicate,
+            owners_replayed,
+        } = bus_reindex(scope, since, sources, outbox, ctx_base).map_err(map_bus_err)?;
 
         // (2) Drain the snapshot rows from the outbox IN THE REPLAY'S DETERMINISTIC ORDER and feed each
         // through the live indexer's `index()` step (the EXACT live consumer step). We recompute the
@@ -474,7 +498,10 @@ impl SearchReindexer {
                 // The idempotency guard (the cursor store applied-set): a redelivered snapshot is a
                 // no-op (no resurrection of an already-applied — or post-erase, re-emitted-then-erased —
                 // doc). Belt to the deterministic-id braces.
-                if !self.cursors.record_applied(tenant, &region, scope, &event_id.0, draft.version) {
+                if !self
+                    .cursors
+                    .record_applied(tenant, &region, scope, &event_id.0, draft.version)
+                {
                     progress.docs_skipped_applied += 1;
                     continue;
                 }
@@ -496,7 +523,10 @@ impl SearchReindexer {
         }
 
         if hit_cap {
-            Ok(ReindexJob::InProgress { progress, resume_since: highest_applied })
+            Ok(ReindexJob::InProgress {
+                progress,
+                resume_since: highest_applied,
+            })
         } else {
             Ok(ReindexJob::Done(progress))
         }
@@ -509,9 +539,9 @@ fn map_bus_err(e: BusReindexError) -> ReindexError {
 
 fn map_index_err(e: IndexEventError) -> ReindexError {
     match e {
-        IndexEventError::Malformed(w) | IndexEventError::Engine(w) | IndexEventError::Transient(w) => {
-            ReindexError::Index(w)
-        }
+        IndexEventError::Malformed(w)
+        | IndexEventError::Engine(w)
+        | IndexEventError::Transient(w) => ReindexError::Index(w),
     }
 }
 
@@ -524,8 +554,8 @@ mod tests {
     };
     use myelin_events::reindex::ReferenceReindexSource;
     use myelin_events::{
-        Actor, AggregateKey, ArtifactRef, CorrelationId, DataRole, EventEnvelope, EventId, EventType,
-        Timestamp, Visibility,
+        Actor, AggregateKey, ArtifactRef, CorrelationId, DataRole, EventEnvelope, EventId,
+        EventType, Timestamp, Visibility,
     };
     use myelin_identity::{Principal, PrincipalId, PrincipalKind};
     use std::collections::HashMap;
@@ -540,7 +570,11 @@ mod tests {
         Region(REGION.into())
     }
     fn principal() -> Principal {
-        Principal::stub(PrincipalId("platform".into()), PrincipalKind::Service, tenant())
+        Principal::stub(
+            PrincipalId("platform".into()),
+            PrincipalKind::Service,
+            tenant(),
+        )
     }
 
     fn ctx_base() -> EmitContextBase {
@@ -564,7 +598,10 @@ mod tests {
     }
     impl OwnerProjection {
         fn put(&self, ref_: &str, body: &str) {
-            self.bodies.lock().unwrap().insert(ref_.to_string(), body.to_string());
+            self.bodies
+                .lock()
+                .unwrap()
+                .insert(ref_.to_string(), body.to_string());
         }
     }
     impl ProjectFetcher for OwnerProjection {
@@ -645,15 +682,30 @@ mod tests {
             .reindex(&tenant(), &scope(), None, sources, &mut outbox, ctx_base())
             .expect("reindex");
 
-        assert!(job.is_done(), "the full rebuild completes in one pass (under the batch cap)");
+        assert!(
+            job.is_done(),
+            "the full rebuild completes in one pass (under the batch cap)"
+        );
         let p = job.progress();
-        assert_eq!(p.snapshots_emitted, 3, "three pages re-emitted as *.snapshot via the bus");
-        assert_eq!(p.docs_indexed, 3, "all three driven through the LIVE indexer");
+        assert_eq!(
+            p.snapshots_emitted, 3,
+            "three pages re-emitted as *.snapshot via the bus"
+        );
+        assert_eq!(
+            p.docs_indexed, 3,
+            "all three driven through the LIVE indexer"
+        );
         assert_eq!(p.owners_replayed, vec!["knowledge".to_string()]);
-        assert_eq!(ix.live_count(&tenant(), &region()), 3, "the index holds the three rebuilt docs");
+        assert_eq!(
+            ix.live_count(&tenant(), &region()),
+            3,
+            "the index holds the three rebuilt docs"
+        );
 
         // The rebuilt docs are searchable through the ordinary FT path (cold == live).
-        let hits = ix.search_ft(&tenant(), &region(), &AclFilter::All, "raft", 10).expect("ft");
+        let hits = ix
+            .search_ft(&tenant(), &region(), &AclFilter::All, "raft", 10)
+            .expect("ft");
         assert_eq!(hits.len(), 1, "the rebuilt home page is searchable");
     }
 
@@ -678,7 +730,11 @@ mod tests {
         let first = reindexer
             .reindex(&tenant(), &scope(), None, sources, &mut outbox, ctx_base())
             .expect("first");
-        assert_eq!(first.progress().snapshots_emitted, 3, "first run emits three snapshots");
+        assert_eq!(
+            first.progress().snapshots_emitted,
+            3,
+            "first run emits three snapshots"
+        );
         assert_eq!(first.progress().docs_indexed, 3, "first pass indexes three");
 
         // A SECOND full reindex over the SAME outbox: the BUS skips all three as duplicate (their
@@ -687,11 +743,27 @@ mod tests {
         let second = reindexer
             .reindex(&tenant(), &scope(), None, sources, &mut outbox, ctx_base())
             .expect("second");
-        assert_eq!(second.progress().snapshots_emitted, 0, "0 NEW snapshots emitted (deterministic id)");
-        assert_eq!(second.progress().snapshots_skipped_duplicate, 3, "all three skipped at the bus re-emit");
-        assert_eq!(second.progress().docs_indexed, 3, "the cold rebuild re-applies the three (over a wipe)");
+        assert_eq!(
+            second.progress().snapshots_emitted,
+            0,
+            "0 NEW snapshots emitted (deterministic id)"
+        );
+        assert_eq!(
+            second.progress().snapshots_skipped_duplicate,
+            3,
+            "all three skipped at the bus re-emit"
+        );
+        assert_eq!(
+            second.progress().docs_indexed,
+            3,
+            "the cold rebuild re-applies the three (over a wipe)"
+        );
         // The index still holds exactly three (no resurrection/duplication — `doc_id` upsert + the wipe).
-        assert_eq!(ix.live_count(&tenant(), &region()), 3, "still exactly three docs — idempotent in effect");
+        assert_eq!(
+            ix.live_count(&tenant(), &region()),
+            3,
+            "still exactly three docs — idempotent in effect"
+        );
     }
 
     /// **CHAINED (joint SRCH-P15 + SRCH-P16): index → erase → reindex-from-source → the rebuilt index
@@ -702,8 +774,8 @@ mod tests {
     #[test]
     fn chained_index_erase_reindex_does_not_resurrect_the_erased_subject() {
         use crate::dek::SearchDekPin;
-        use crate::erase::SearchEraseHolder;
         use crate::engine::SubjectMatcher;
+        use crate::erase::SearchEraseHolder;
         use myelin_gdpr::SubjectRef;
         use myelin_identity::PseudonymHandle;
         use myelin_storage::KmsEngine;
@@ -724,7 +796,10 @@ mod tests {
         let other_ref = snapshot_ref("other");
 
         let (ix, fetcher) = indexer_with(&[]);
-        fetcher.put(&owned_ref, &format!("a page mentioning {pseudonym} about raft"));
+        fetcher.put(
+            &owned_ref,
+            &format!("a page mentioning {pseudonym} about raft"),
+        );
         fetcher.put(&other_ref, "an unrelated page about paxos");
 
         // The owner's truth (both pages). After the erase the owner TOMBSTONES the erased aggregate
@@ -746,12 +821,20 @@ mod tests {
         // purged from the index through the live consumer path.
         let kms = Arc::new(KmsEngine::new());
         let pin = SearchDekPin::new(kms);
-        pin.reserve(&tenant(), &region()).expect("reserve the index DEK");
+        pin.reserve(&tenant(), &region())
+            .expect("reserve the index DEK");
         let holder = SearchEraseHolder::new(ix.clone(), pin, region());
         let outcome = holder.erase_subject(&erased, &tenant()).expect("erase");
         assert_eq!(outcome.docs_purged, 1, "the subject's page is purged");
-        assert!(outcome.zero_orphan_embedding, "0 orphan embedding after the erase");
-        assert_eq!(ix.live_count(&tenant(), &region()), 1, "only the unrelated page remains");
+        assert!(
+            outcome.zero_orphan_embedding,
+            "0 orphan embedding after the erase"
+        );
+        assert_eq!(
+            ix.live_count(&tenant(), &region()),
+            1,
+            "only the unrelated page remains"
+        );
 
         // (3) The OWNER tombstones the erased aggregate (the erasure reached the owner — X-7). Build a
         // post-erase owner whose truth/projection no longer hold the erased page.
@@ -763,12 +846,28 @@ mod tests {
         // owner no longer replays it — the erasure stays erased across the rebuild).
         let mut outbox2 = OutboxStore::new();
         let job = reindexer
-            .reindex(&tenant(), &scope(), None, &[&src_after], &mut outbox2, ctx_base())
+            .reindex(
+                &tenant(),
+                &scope(),
+                None,
+                &[&src_after],
+                &mut outbox2,
+                ctx_base(),
+            )
             .expect("reindex after erase");
         assert!(job.is_done());
-        assert_eq!(ix.live_count(&tenant(), &region()), 1, "the rebuilt index holds only the unrelated page");
-        let raft = ix.search_ft(&tenant(), &region(), &AclFilter::All, "raft", 10).expect("ft raft");
-        assert!(raft.is_empty(), "the erased subject's page is NOT resurrected by the reindex (X-7)");
+        assert_eq!(
+            ix.live_count(&tenant(), &region()),
+            1,
+            "the rebuilt index holds only the unrelated page"
+        );
+        let raft = ix
+            .search_ft(&tenant(), &region(), &AclFilter::All, "raft", 10)
+            .expect("ft raft");
+        assert!(
+            raft.is_empty(),
+            "the erased subject's page is NOT resurrected by the reindex (X-7)"
+        );
 
         // (5) RE-ERASURE after the reindex purges 0 (the subject is already gone — no resurrection).
         let matcher = SubjectMatcher::new(
@@ -776,9 +875,15 @@ mod tests {
             Some(pseudonym.clone()),
         );
         let located = ix.locate_subject(&tenant(), &region(), &matcher);
-        assert!(located.is_empty(), "the erased subject references 0 docs after the reindex");
+        assert!(
+            located.is_empty(),
+            "the erased subject references 0 docs after the reindex"
+        );
         let re = holder.erase_subject(&erased, &tenant()).expect("re-erase");
-        assert_eq!(re.docs_purged, 0, "re-erasure after the reindex purges nothing (no resurrection)");
+        assert_eq!(
+            re.docs_purged, 0,
+            "re-erasure after the reindex purges nothing (no resurrection)"
+        );
         assert!(re.zero_orphan_embedding, "still 0 orphan embedding");
     }
 
@@ -808,21 +913,49 @@ mod tests {
             .reindex(&tenant(), &scope(), None, sources, &mut outbox, ctx_base())
             .expect("pass 1");
         match p1 {
-            ReindexJob::InProgress { progress, resume_since } => {
-                assert_eq!(progress.docs_indexed, 2, "the cap stops the pass at two docs");
-                assert_eq!(resume_since, 2, "the resume cursor is the high-water version applied");
+            ReindexJob::InProgress {
+                progress,
+                resume_since,
+            } => {
+                assert_eq!(
+                    progress.docs_indexed, 2,
+                    "the cap stops the pass at two docs"
+                );
+                assert_eq!(
+                    resume_since, 2,
+                    "the resume cursor is the high-water version applied"
+                );
             }
             ReindexJob::Done(_) => panic!("the capped pass must NOT report Done — more remain"),
         }
-        assert_eq!(ix.live_count(&tenant(), &region()), 2, "only two docs applied so far");
+        assert_eq!(
+            ix.live_count(&tenant(), &region()),
+            2,
+            "only two docs applied so far"
+        );
 
         // Pass 2: resume from the cursor (since = 2). Only p3/p4 replay; both apply; Done.
         let p2 = reindexer
-            .reindex(&tenant(), &scope(), Some(2), sources, &mut outbox, ctx_base())
+            .reindex(
+                &tenant(),
+                &scope(),
+                Some(2),
+                sources,
+                &mut outbox,
+                ctx_base(),
+            )
             .expect("pass 2");
         assert!(p2.is_done(), "the resumed pass finishes the rebuild");
-        assert_eq!(p2.progress().docs_indexed, 2, "the remaining two docs applied");
-        assert_eq!(ix.live_count(&tenant(), &region()), 4, "all four docs rebuilt across the two batches");
+        assert_eq!(
+            p2.progress().docs_indexed,
+            2,
+            "the remaining two docs applied"
+        );
+        assert_eq!(
+            ix.live_count(&tenant(), &region()),
+            4,
+            "all four docs rebuilt across the two batches"
+        );
     }
 
     /// **The incremental backfill (`since = Some`) does NOT wipe the live index — it appends.** A new
@@ -846,18 +979,44 @@ mod tests {
             s
         };
         reindexer
-            .reindex(&tenant(), &scope(), None, &[&only_old], &mut outbox, ctx_base())
+            .reindex(
+                &tenant(),
+                &scope(),
+                None,
+                &[&only_old],
+                &mut outbox,
+                ctx_base(),
+            )
             .expect("seed old");
-        assert_eq!(ix.live_count(&tenant(), &region()), 1, "the old doc is indexed");
+        assert_eq!(
+            ix.live_count(&tenant(), &region()),
+            1,
+            "the old doc is indexed"
+        );
 
         // Incremental backfill since=1: only the version-5 page replays; the old doc is PRESERVED.
         let mut outbox2 = OutboxStore::new();
         let job = reindexer
-            .reindex(&tenant(), &scope(), Some(1), &[&src], &mut outbox2, ctx_base())
+            .reindex(
+                &tenant(),
+                &scope(),
+                Some(1),
+                &[&src],
+                &mut outbox2,
+                ctx_base(),
+            )
             .expect("backfill");
         assert!(job.is_done());
-        assert_eq!(job.progress().docs_indexed, 1, "only the new page replays past since=1");
-        assert_eq!(ix.live_count(&tenant(), &region()), 2, "the backfill APPENDED — the old doc survives");
+        assert_eq!(
+            job.progress().docs_indexed,
+            1,
+            "only the new page replays past since=1"
+        );
+        assert_eq!(
+            ix.live_count(&tenant(), &region()),
+            2,
+            "the backfill APPENDED — the old doc survives"
+        );
     }
 
     /// **The per-tenant in-flight cap refuses an over-cap reindex (a reindex storm is shed, not allowed
@@ -878,7 +1037,10 @@ mod tests {
         let err = reindexer
             .reindex(&tenant(), &scope(), None, sources, &mut outbox, ctx_base())
             .expect_err("an over-cap reindex is refused");
-        assert!(matches!(err, ReindexError::AtCapacity(_)), "the per-tenant cap sheds the storm");
+        assert!(
+            matches!(err, ReindexError::AtCapacity(_)),
+            "the per-tenant cap sheds the storm"
+        );
 
         // Release the held slot; now the reindex succeeds (the cap is not a permanent block).
         cursors.release(&tenant());
@@ -888,7 +1050,11 @@ mod tests {
             .expect("reindex succeeds once a slot frees");
         assert!(job.is_done());
         // The reindex released its own slot on completion (no leak).
-        assert_eq!(cursors.in_flight(&tenant()), 0, "the reindex released its in-flight slot");
+        assert_eq!(
+            cursors.in_flight(&tenant()),
+            0,
+            "the reindex released its in-flight slot"
+        );
     }
 
     /// **A reindex of an UNKNOWN owner is a LOUD error (never a silent empty rebuild that masks a wiring
@@ -903,7 +1069,10 @@ mod tests {
         let err = reindexer
             .reindex(&tenant(), &unknown, None, &[&src], &mut outbox, ctx_base())
             .expect_err("unknown owner");
-        assert!(matches!(err, ReindexError::Bus(_)), "an unknown owner is a loud Bus error");
+        assert!(
+            matches!(err, ReindexError::Bus(_)),
+            "an unknown owner is a loud Bus error"
+        );
     }
 
     /// Build a `knowledge.page.created` live event (the ordinary ingest path) for a doc.
@@ -946,11 +1115,17 @@ mod tests {
         fetcher.put(&snapshot_ref("beta"), "beta discusses paxos consensus");
 
         // LIVE: ingest the two pages through the ordinary `*.created` path (the steady-state lane).
-        ix.index(&created_event(&snapshot_ref("alpha"))).expect("live alpha");
-        ix.index(&created_event(&snapshot_ref("beta"))).expect("live beta");
+        ix.index(&created_event(&snapshot_ref("alpha")))
+            .expect("live alpha");
+        ix.index(&created_event(&snapshot_ref("beta")))
+            .expect("live beta");
         let live_count = ix.live_count(&tenant(), &region());
-        let live_raft = ix.search_ft(&tenant(), &region(), &AclFilter::All, "raft", 10).expect("live raft");
-        let live_paxos = ix.search_ft(&tenant(), &region(), &AclFilter::All, "paxos", 10).expect("live paxos");
+        let live_raft = ix
+            .search_ft(&tenant(), &region(), &AclFilter::All, "raft", 10)
+            .expect("live raft");
+        let live_paxos = ix
+            .search_ft(&tenant(), &region(), &AclFilter::All, "paxos", 10)
+            .expect("live paxos");
         assert_eq!(live_count, 2, "the live index holds both pages");
         assert_eq!(live_raft.len(), 1);
         assert_eq!(live_paxos.len(), 1);
@@ -965,11 +1140,26 @@ mod tests {
 
         // PARITY: the cold-rebuilt index == live (doc count + the same docs searchable).
         let cold_count = ix.live_count(&tenant(), &region());
-        let cold_raft = ix.search_ft(&tenant(), &region(), &AclFilter::All, "raft", 10).expect("cold raft");
-        let cold_paxos = ix.search_ft(&tenant(), &region(), &AclFilter::All, "paxos", 10).expect("cold paxos");
-        assert_eq!(cold_count, live_count, "cold-rebuilt doc count == live (SRCH-D5)");
-        assert_eq!(cold_raft.len(), live_raft.len(), "the raft page is searchable in the cold rebuild");
-        assert_eq!(cold_paxos.len(), live_paxos.len(), "the paxos page is searchable in the cold rebuild");
+        let cold_raft = ix
+            .search_ft(&tenant(), &region(), &AclFilter::All, "raft", 10)
+            .expect("cold raft");
+        let cold_paxos = ix
+            .search_ft(&tenant(), &region(), &AclFilter::All, "paxos", 10)
+            .expect("cold paxos");
+        assert_eq!(
+            cold_count, live_count,
+            "cold-rebuilt doc count == live (SRCH-D5)"
+        );
+        assert_eq!(
+            cold_raft.len(),
+            live_raft.len(),
+            "the raft page is searchable in the cold rebuild"
+        );
+        assert_eq!(
+            cold_paxos.len(),
+            live_paxos.len(),
+            "the paxos page is searchable in the cold rebuild"
+        );
         assert_eq!(
             cold_raft.first().map(|h| h.doc_id.clone()),
             live_raft.first().map(|h| h.doc_id.clone()),

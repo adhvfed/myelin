@@ -54,7 +54,11 @@ fn cdc_1_3_lifecycle_metrics_health_is_liveness_ne_readiness() {
 
     // booted + all critical deps up → Ready, liveness Up.
     let r = mh.readiness();
-    assert_eq!(r.verdict, Readiness::Ready, "a fully-booted instance with healthy deps is ready");
+    assert_eq!(
+        r.verdict,
+        Readiness::Ready,
+        "a fully-booted instance with healthy deps is ready"
+    );
     assert_eq!(r.verdict.gauge(), 1, "the readiness gauge reads 1");
     assert_eq!(mh.liveness(), Liveness::Up, "a healthy instance is live");
     assert_eq!(mh.liveness_restart_count(), 0, "no restart churn");
@@ -64,21 +68,47 @@ fn cdc_1_3_lifecycle_metrics_health_is_liveness_ne_readiness() {
 
     // readiness FLIPS to not-ready + sheds, naming the down dependency; liveness is UNTOUCHED.
     let r = mh.readiness();
-    assert_eq!(r.verdict, Readiness::NotReady, "a dead critical dep reports not-ready (§4.3)");
-    assert!(r.sheds(), "not-ready → shed new traffic (never serve healthy-but-failing)");
+    assert_eq!(
+        r.verdict,
+        Readiness::NotReady,
+        "a dead critical dep reports not-ready (§4.3)"
+    );
+    assert!(
+        r.sheds(),
+        "not-ready → shed new traffic (never serve healthy-but-failing)"
+    );
     assert!(
         r.down_critical.iter().any(|d| d.0 == "identity"),
         "the report names the down critical dependency"
     );
-    assert_eq!(r.verdict.gauge(), 0, "the readiness gauge reads 0 when not-ready");
+    assert_eq!(
+        r.verdict.gauge(),
+        0,
+        "the readiness gauge reads 0 when not-ready"
+    );
     // the load-bearing SUB-D9 property: liveness does NOT check the dependency → no restart-storm.
-    assert_eq!(mh.liveness(), Liveness::Up, "liveness stays Up across a dependency outage (§4.3)");
-    assert!(!mh.liveness().should_restart(), "a dead dependency must NOT trigger a restart");
-    assert_eq!(mh.liveness_restart_count(), 0, "no restart-storm: liveness churn stays 0");
+    assert_eq!(
+        mh.liveness(),
+        Liveness::Up,
+        "liveness stays Up across a dependency outage (§4.3)"
+    );
+    assert!(
+        !mh.liveness().should_restart(),
+        "a dead dependency must NOT trigger a restart"
+    );
+    assert_eq!(
+        mh.liveness_restart_count(),
+        0,
+        "no restart-storm: liveness churn stays 0"
+    );
 
     // the OLTP store is implicitly critical too: severing it also flips readiness.
     handle.health_probe().mark_up("identity");
-    assert_eq!(mh.readiness().verdict, Readiness::Ready, "readiness recovers when identity heals");
+    assert_eq!(
+        mh.readiness().verdict,
+        Readiness::Ready,
+        "readiness recovers when identity heals"
+    );
     handle.health_probe().mark_down("oltp");
     assert_eq!(
         mh.readiness().verdict,
@@ -97,11 +127,26 @@ fn cdc_1_3_startup_is_not_ready_not_killed() {
     let s = MetricsHealthSurface::new(CriticalDependencies::new(["identity"]), HealthTable::new());
     // before mark_started: booting.
     assert_eq!(s.startup(), Startup::Booting);
-    assert_eq!(s.readiness().verdict, Readiness::NotReady, "an unbooted instance is not-ready");
-    assert!(s.readiness().startup_incomplete, "the reason is the startup gate");
-    assert_eq!(s.liveness(), Liveness::Up, "startup is NOT killed: liveness stays Up");
+    assert_eq!(
+        s.readiness().verdict,
+        Readiness::NotReady,
+        "an unbooted instance is not-ready"
+    );
+    assert!(
+        s.readiness().startup_incomplete,
+        "the reason is the startup gate"
+    );
+    assert_eq!(
+        s.liveness(),
+        Liveness::Up,
+        "startup is NOT killed: liveness stays Up"
+    );
     // after a successful boot, the startup gate no longer holds readiness down.
     s.mark_started();
     assert_eq!(s.startup(), Startup::Complete);
-    assert_eq!(s.readiness().verdict, Readiness::Ready, "booted + deps up → ready");
+    assert_eq!(
+        s.readiness().verdict,
+        Readiness::Ready,
+        "booted + deps up → ready"
+    );
 }

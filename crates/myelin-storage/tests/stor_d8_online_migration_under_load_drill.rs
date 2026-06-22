@@ -36,11 +36,12 @@ use std::path::Path;
 
 use myelin_harness::{Predicate, SignalName, SignalSource};
 // `mut` archiver below records a commit + archives it (the STOR-D2 RPO re-run).
+use myelin_storage::migration::{HotTables, Migration, MigrationPhase, Migrations};
 use myelin_storage::{
     ContinuousArchiver, ErasureLedger, GateInputs, KekId, KeyClass, KmsEngine, LockBudget,
-    MigrationUnderLoad, RestoreVerifyGate, RestoredObject, SourceLog, WalRow, WalSegment, WriteLoad,
+    MigrationUnderLoad, RestoreVerifyGate, RestoredObject, SourceLog, WalRow, WalSegment,
+    WriteLoad,
 };
-use myelin_storage::migration::{HotTables, Migration, MigrationPhase, Migrations};
 use myelin_tenancy::{Region, TenantId};
 
 fn region() -> Region {
@@ -78,8 +79,14 @@ fn lock_budget_from_thresholds() -> LockBudget {
         .get("downtime_max_ms")
         .and_then(|v| v.as_integer())
         .expect("online_migration.downtime_max_ms must be present");
-    assert!(lock_wait_p99_max_ms > 0, "the lock-wait budget must be a positive duration");
-    assert_eq!(downtime_max_ms, 0, "the 0-downtime invariant is structural (STOR-D8)");
+    assert!(
+        lock_wait_p99_max_ms > 0,
+        "the lock-wait budget must be a positive duration"
+    );
+    assert_eq!(
+        downtime_max_ms, 0,
+        "the 0-downtime invariant is structural (STOR-D8)"
+    );
     LockBudget::new(lock_wait_p99_max_ms as u64, downtime_max_ms as u64)
 }
 
@@ -98,9 +105,17 @@ fn rpo_max_secs_from_thresholds() -> u64 {
 /// Backups covering offsets `0..=tail` (a base at 0 + the WAL tail archived to `tail`).
 fn reachable_archiver(tail: u64) -> ContinuousArchiver {
     let mut arch = ContinuousArchiver::new();
-    arch.archive_segment(WalSegment { end_offset: 0, committed_at: 0 }).unwrap();
+    arch.archive_segment(WalSegment {
+        end_offset: 0,
+        committed_at: 0,
+    })
+    .unwrap();
     arch.take_base_backup(1);
-    arch.archive_segment(WalSegment { end_offset: tail, committed_at: 10 }).unwrap();
+    arch.archive_segment(WalSegment {
+        end_offset: tail,
+        committed_at: 10,
+    })
+    .unwrap();
     arch
 }
 
@@ -157,9 +172,21 @@ fn stor_d8_online_migration_on_restored_copy_holds_lock_budget_under_load() {
     let mut source = SourceLog::new();
     source.append(90, "r90").append(100, "r100");
     let rows = vec![
-        WalRow { id: "r90".into(), written_at: 90, blob_ref: Some(objects[0].content_address.clone()) },
-        WalRow { id: "r100".into(), written_at: 100, blob_ref: Some(objects[1].content_address.clone()) },
-        WalRow { id: "r-future".into(), written_at: 250, blob_ref: None }, // > T → dropped
+        WalRow {
+            id: "r90".into(),
+            written_at: 90,
+            blob_ref: Some(objects[0].content_address.clone()),
+        },
+        WalRow {
+            id: "r100".into(),
+            written_at: 100,
+            blob_ref: Some(objects[1].content_address.clone()),
+        },
+        WalRow {
+            id: "r-future".into(),
+            written_at: 250,
+            blob_ref: None,
+        }, // > T → dropped
     ];
     let ledger = ErasureLedger::new();
     let inputs = GateInputs {
@@ -175,9 +202,15 @@ fn stor_d8_online_migration_on_restored_copy_holds_lock_budget_under_load() {
         .run_or_fail_ci(&inputs)
         .expect("STOR-D1: the restored prod-scale copy must be WHOLE (the permanent gate re-runs)");
     let restored_to = artifact.restored_to_offset;
-    assert_eq!(restored_to, 100, "the restored copy lands at the consistency point T");
+    assert_eq!(
+        restored_to, 100,
+        "the restored copy lands at the consistency point T"
+    );
     // The cross-seam zero the permanent gate asserts (observability is part of the pass).
-    signals.set_scalar(SignalName::RestoreCrossSeamMismatch, artifact.cross_seam_mismatches as i64);
+    signals.set_scalar(
+        SignalName::RestoreCrossSeamMismatch,
+        artifact.cross_seam_mismatches as i64,
+    );
     signals
         .assert_signal(SignalName::RestoreCrossSeamMismatch, Predicate::Eq(0))
         .expect_green(); // STOR-D1: the restored copy is at ONE consistent cross-seam point.
@@ -208,7 +241,10 @@ fn stor_d8_online_migration_on_restored_copy_holds_lock_budget_under_load() {
     );
     // The dated green-artifact line (observability is part of the pass).
     let summary = drill.summary();
-    assert!(summary.contains("STOR-D8 PASS"), "dated green artifact: {summary}");
+    assert!(
+        summary.contains("STOR-D8 PASS"),
+        "dated green artifact: {summary}"
+    );
     println!("[P-126 STOR-D8 GREEN] {summary}");
 
     // ── (3) STOR-D2 remains green: the RPO measure over the same archiver ──
@@ -216,11 +252,18 @@ fn stor_d8_online_migration_on_restored_copy_holds_lock_budget_under_load() {
     // archiving stays caught up) — the RPO is the bounded commit↔archive freshness gap.
     let rpo_bound_secs = rpo_max_secs_from_thresholds();
     arch.record_commit(400, 320); // a write committed at offset 400, t=320s.
-    arch.archive_segment(WalSegment { end_offset: 400, committed_at: 350 }).unwrap(); // shipped at t=350s.
+    arch.archive_segment(WalSegment {
+        end_offset: 400,
+        committed_at: 350,
+    })
+    .unwrap(); // shipped at t=350s.
     let rpo_secs = arch.measure_rpo(); // caught up (archived ≥ committed) → RPO 0, within bound.
     signals.set_scalar(SignalName::RestoreRpoSecs, rpo_secs as i64);
     signals
-        .assert_signal(SignalName::RestoreRpoSecs, Predicate::Lte(rpo_bound_secs as i64))
+        .assert_signal(
+            SignalName::RestoreRpoSecs,
+            Predicate::Lte(rpo_bound_secs as i64),
+        )
         .expect_green(); // STOR-D2: RPO remains within bound across this store-touching change.
 }
 
@@ -243,6 +286,11 @@ fn stor_d8_a_blocking_alter_at_prod_scale_fails_the_drill() {
 
     let err = MigrationUnderLoad::new()
         .run_or_fail(&migrations, &HotTables::none(), load, 100, budget)
-        .expect_err("STOR-D8: a blocking ALTER at prod scale MUST fail the drill, never pass silently");
-    assert!(err.to_string().contains("STOR-D8 FAIL"), "loud + specific: {err}");
+        .expect_err(
+            "STOR-D8: a blocking ALTER at prod scale MUST fail the drill, never pass silently",
+        );
+    assert!(
+        err.to_string().contains("STOR-D8 FAIL"),
+        "loud + specific: {err}"
+    );
 }

@@ -117,7 +117,9 @@ impl StatefulComponent {
     /// mistaken for a working component).
     pub fn filled_by(self) -> &'static str {
         match self {
-            StatefulComponent::S1FtStructured => "SRCH-P04 (IndexBackend + FT/structured) + SRCH-P06 (indexer)",
+            StatefulComponent::S1FtStructured => {
+                "SRCH-P04 (IndexBackend + FT/structured) + SRCH-P06 (indexer)"
+            }
             StatefulComponent::S2Vector => "SRCH-P05 (vector shape) + SRCH-P06 (embedder/indexer)",
             StatefulComponent::S3DedupLedger => "SRCH-P06 (the indexer's idempotency ledger)",
             StatefulComponent::S4ReindexCursor => "SRCH-P16 (reindex-from-source cursor)",
@@ -159,7 +161,10 @@ impl std::fmt::Display for LayoutError {
                  the per-tenant index directory is UNRECOVERABLE (never a plaintext fall-through)"
             ),
             LayoutError::SegmentUnreadable => {
-                write!(f, "an index segment ciphertext failed to open under the per-tenant index DEK")
+                write!(
+                    f,
+                    "an index segment ciphertext failed to open under the per-tenant index DEK"
+                )
             }
         }
     }
@@ -259,7 +264,8 @@ impl PerTenantIndexLayout {
         let dek = pin
             .resolve(&self.index_dek_ref, &self.region)
             .map_err(LayoutError::Unrecoverable)?;
-        dek.open(nonce, ciphertext).ok_or(LayoutError::SegmentUnreadable)
+        dek.open(nonce, ciphertext)
+            .ok_or(LayoutError::SegmentUnreadable)
     }
 }
 
@@ -327,12 +333,35 @@ mod tests {
         let pin = pin();
         let layout = PerTenantIndexLayout::create(&pin, &t(), &r()).expect("create the directory");
 
-        assert_eq!(layout.store, SEARCH_INDEX_STORE, "the per-tenant search index store");
-        assert_eq!(layout.tenant, t(), "the directory is keyed to its tenant (first partition key)");
-        assert_eq!(layout.region, r(), "the directory lives in the tenant's cell region");
-        assert_eq!(layout.residency, ResidencyTag::pinned_to(r()), "residency-pinned to its region");
-        assert_eq!(layout.index_dek_ref.class, KeyClass::Tenant, "sealed under the per-tenant index DEK");
-        assert_eq!(layout.index_dek_ref.to_uri(), "kms://acme/0/tenant", "the encrypted-from-birth ref");
+        assert_eq!(
+            layout.store, SEARCH_INDEX_STORE,
+            "the per-tenant search index store"
+        );
+        assert_eq!(
+            layout.tenant,
+            t(),
+            "the directory is keyed to its tenant (first partition key)"
+        );
+        assert_eq!(
+            layout.region,
+            r(),
+            "the directory lives in the tenant's cell region"
+        );
+        assert_eq!(
+            layout.residency,
+            ResidencyTag::pinned_to(r()),
+            "residency-pinned to its region"
+        );
+        assert_eq!(
+            layout.index_dek_ref.class,
+            KeyClass::Tenant,
+            "sealed under the per-tenant index DEK"
+        );
+        assert_eq!(
+            layout.index_dek_ref.to_uri(),
+            "kms://acme/0/tenant",
+            "the encrypted-from-birth ref"
+        );
     }
 
     /// **Encrypted-from-birth: a segment written into the directory is sealed under the per-tenant
@@ -345,10 +374,21 @@ mod tests {
         let layout = PerTenantIndexLayout::create(&pin, &t(), &r()).expect("create");
 
         let body = b"a future FT+vector index segment's body";
-        let (nonce, ct) = layout.seal(&pin, body).expect("seal under the per-tenant index DEK");
-        assert_ne!(&ct[..], &body[..], "the segment is ciphertext at rest (encrypted-from-birth)");
-        let plain = layout.open(&pin, &nonce, &ct).expect("open the sealed segment");
-        assert_eq!(plain, body, "the sealed segment round-trips under the per-tenant index DEK");
+        let (nonce, ct) = layout
+            .seal(&pin, body)
+            .expect("seal under the per-tenant index DEK");
+        assert_ne!(
+            &ct[..],
+            &body[..],
+            "the segment is ciphertext at rest (encrypted-from-birth)"
+        );
+        let plain = layout
+            .open(&pin, &nonce, &ct)
+            .expect("open the sealed segment");
+        assert_eq!(
+            plain, body,
+            "the sealed segment round-trips under the per-tenant index DEK"
+        );
     }
 
     /// **Destroying the per-tenant index DEK renders the directory UNRECOVERABLE (the structural
@@ -364,7 +404,10 @@ mod tests {
 
         // Seal a segment while the DEK lives.
         let (nonce, ct) = layout.seal(&pin, b"sensitive analyzed text").expect("seal");
-        assert!(layout.open(&pin, &nonce, &ct).is_ok(), "readable before the shred");
+        assert!(
+            layout.open(&pin, &nonce, &ct).is_ok(),
+            "readable before the shred"
+        );
 
         // Tenant-decommission crypto-shred of the whole index directory.
         assert!(
@@ -375,11 +418,16 @@ mod tests {
         // Post-shred the directory is UNRECOVERABLE — loud, never a plaintext fall-through.
         match layout.open(&pin, &nonce, &ct) {
             Err(LayoutError::Unrecoverable(_)) => {}
-            other => panic!("a crypto-shredded index directory must be UNRECOVERABLE, got {other:?}"),
+            other => {
+                panic!("a crypto-shredded index directory must be UNRECOVERABLE, got {other:?}")
+            }
         }
         // A fresh seal also fails (the DEK is gone — there is no encrypted-from-birth write path
         // left either).
-        assert!(matches!(layout.seal(&pin, b"x"), Err(LayoutError::Unrecoverable(_))));
+        assert!(matches!(
+            layout.seal(&pin, b"x"),
+            Err(LayoutError::Unrecoverable(_))
+        ));
     }
 
     /// **Re-creating the directory on restart is idempotent (no silent DEK rotation).** A second
@@ -390,11 +438,17 @@ mod tests {
         let pin = pin();
         let a = PerTenantIndexLayout::create(&pin, &t(), &r()).expect("first create");
         let b = PerTenantIndexLayout::create(&pin, &t(), &r()).expect("re-create on restart");
-        assert_eq!(a.index_dek_ref, b.index_dek_ref, "the same per-tenant index DEK (no silent rotation)");
+        assert_eq!(
+            a.index_dek_ref, b.index_dek_ref,
+            "the same per-tenant index DEK (no silent rotation)"
+        );
 
         // A segment sealed before the restart is still readable through the re-created layout.
         let (nonce, ct) = a.seal(&pin, b"pre-restart segment").expect("seal");
-        assert_eq!(b.open(&pin, &nonce, &ct).expect("open after re-create"), b"pre-restart segment");
+        assert_eq!(
+            b.open(&pin, &nonce, &ct).expect("open after re-create"),
+            b"pre-restart segment"
+        );
     }
 
     /// **The S1–S5 register is the complete, ordered derived-state surface (§3.4).** All five are
@@ -407,10 +461,21 @@ mod tests {
         assert_eq!(ids, ["S1", "S2", "S3", "S4", "S5"], "S1–S5 in order");
 
         // §3.4: every component is derived and rebuildable by reindex-from-source.
-        assert!(derived_state_invariant_holds(), "no Search component is a system of record");
+        assert!(
+            derived_state_invariant_holds(),
+            "no Search component is a system of record"
+        );
         for c in reg {
-            assert!(c.is_derived_rebuildable(), "{} is derived/rebuildable", c.id());
-            assert!(!c.filled_by().is_empty(), "{} names the slice that fills it", c.id());
+            assert!(
+                c.is_derived_rebuildable(),
+                "{} is derived/rebuildable",
+                c.id()
+            );
+            assert!(
+                !c.filled_by().is_empty(),
+                "{} names the slice that fills it",
+                c.id()
+            );
         }
     }
 
@@ -423,7 +488,10 @@ mod tests {
         assert_eq!(floors.len(), 5, "the five named engine-shapes follow-ons");
         let fillers: Vec<&str> = floors.iter().map(|f| f.filled_by).collect();
         for required in ["SRCH-P04", "SRCH-P05", "SRCH-P06", "SRCH-P08", "SRCH-P15"] {
-            assert!(fillers.contains(&required), "the floor names {required} as a follow-on");
+            assert!(
+                fillers.contains(&required),
+                "the floor names {required} as a follow-on"
+            );
         }
         for f in floors {
             assert!(!f.deferred.is_empty(), "each floor states what it defers");

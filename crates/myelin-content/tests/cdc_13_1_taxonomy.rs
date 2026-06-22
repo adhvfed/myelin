@@ -12,8 +12,8 @@ use myelin_content::{
     Inline, InlineNode, ListItem, TaskItem,
 };
 use myelin_events::ArtifactRef;
-use myelin_query::{FieldId, ViewSpec};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
+use myelin_query::{FieldId, ViewSpec};
 use myelin_tenancy::TenantId;
 
 // ── PROVIDER side (13.1): Knowledge freezes the complete taxonomy ──────────────────
@@ -36,21 +36,62 @@ fn provider_full_taxonomy() -> Vec<Block> {
         ],
     );
     vec![
-        Block::Paragraph { inline: inline_with_three_nodes },
-        Block::Heading { level: HeadingLevel::new(1).unwrap(), inline: Inline::default() },
-        Block::BulletList { items: vec![ListItem { blocks: vec![] }] },
-        Block::OrderedList { items: vec![], start: 1 },
-        Block::TaskList { items: vec![TaskItem { checked: false, inline: Inline::default() }] },
+        Block::Paragraph {
+            inline: inline_with_three_nodes,
+        },
+        Block::Heading {
+            level: HeadingLevel::new(1).unwrap(),
+            inline: Inline::default(),
+        },
+        Block::BulletList {
+            items: vec![ListItem { blocks: vec![] }],
+        },
+        Block::OrderedList {
+            items: vec![],
+            start: 1,
+        },
+        Block::TaskList {
+            items: vec![TaskItem {
+                checked: false,
+                inline: Inline::default(),
+            }],
+        },
         Block::Blockquote { blocks: vec![] },
-        Block::CodeBlock { lang: Some("rust".into()), text: "**raw**".into() },
-        Block::Callout { tone: CalloutTone::Note, blocks: vec![] },
-        Block::Table { columns: vec![Column { header: Inline::default() }], rows: vec![vec![Cell { blocks: vec![] }]] },
+        Block::CodeBlock {
+            lang: Some("rust".into()),
+            text: "**raw**".into(),
+        },
+        Block::Callout {
+            tone: CalloutTone::Note,
+            blocks: vec![],
+        },
+        Block::Table {
+            columns: vec![Column {
+                header: Inline::default(),
+            }],
+            rows: vec![vec![Cell { blocks: vec![] }]],
+        },
         Block::Divider,
-        Block::Image { blob: ArtifactRef("myelin://acme/blob/1".into()), alt: "a".into(), caption: None },
-        Block::Embed { reference: ArtifactRef("myelin://acme/issue/1".into()), display: EmbedDisplay::Card },
-        Block::DbView { db: ArtifactRef("myelin://acme/db/1".into()), view: ViewSpec::table(FieldId::new("order_key")) },
-        Block::Toggle { summary: Inline::default(), blocks: vec![] },
-        Block::SyncBlock { source: ArtifactRef("myelin://acme/block/9".into()) },
+        Block::Image {
+            blob: ArtifactRef("myelin://acme/blob/1".into()),
+            alt: "a".into(),
+            caption: None,
+        },
+        Block::Embed {
+            reference: ArtifactRef("myelin://acme/issue/1".into()),
+            display: EmbedDisplay::Card,
+        },
+        Block::DbView {
+            db: ArtifactRef("myelin://acme/db/1".into()),
+            view: ViewSpec::table(FieldId::new("order_key")),
+        },
+        Block::Toggle {
+            summary: Inline::default(),
+            blocks: vec![],
+        },
+        Block::SyncBlock {
+            source: ArtifactRef("myelin://acme/block/9".into()),
+        },
     ]
 }
 
@@ -61,13 +102,27 @@ fn provider_full_taxonomy() -> Vec<Block> {
 /// the consumer simply never constructs them. The point: no redefinition, no new node.
 fn chat_subset_consumer() -> Vec<Block> {
     vec![
-        Block::Paragraph { inline: parse_inline("hi **there**", &[]) },
-        Block::Heading { level: HeadingLevel::new(3).unwrap(), inline: Inline::default() }, // chat caps at 1..3
+        Block::Paragraph {
+            inline: parse_inline("hi **there**", &[]),
+        },
+        Block::Heading {
+            level: HeadingLevel::new(3).unwrap(),
+            inline: Inline::default(),
+        }, // chat caps at 1..3
         Block::BulletList { items: vec![] },
-        Block::CodeBlock { lang: None, text: "x".into() },
-        Block::Callout { tone: CalloutTone::Info, blocks: vec![] },
+        Block::CodeBlock {
+            lang: None,
+            text: "x".into(),
+        },
+        Block::Callout {
+            tone: CalloutTone::Info,
+            blocks: vec![],
+        },
         Block::Divider,
-        Block::Embed { reference: ArtifactRef("myelin://acme/chat/message/1".into()), display: EmbedDisplay::Preview },
+        Block::Embed {
+            reference: ArtifactRef("myelin://acme/chat/message/1".into()),
+            display: EmbedDisplay::Preview,
+        },
     ]
 }
 
@@ -108,7 +163,9 @@ fn cdc_13_1_provider_freezes_taxonomy_consumer_rides_subset() {
     // consumer: a strict subset compiles against the SAME types, no redefinition
     let chat = chat_subset_consumer();
     assert!(chat.len() < full.len(), "a subset is strictly smaller");
-    assert!(chat.iter().all(|b| !matches!(b, Block::DbView { .. } | Block::SyncBlock { .. })));
+    assert!(chat
+        .iter()
+        .all(|b| !matches!(b, Block::DbView { .. } | Block::SyncBlock { .. })));
 
     // consumer: structured nodes are reused verbatim and walk-extractable
     let nodes = issues_subset_consumes_structured_nodes();

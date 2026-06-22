@@ -392,10 +392,11 @@ pub fn enforce_pseudonymous_commit(
             offending_email: rest.to_string(),
         })?;
         // The email MUST be a well-formed pseudonym handle in the frozen grammar.
-        let handle = PseudonymHandle::parse(email).ok_or(NonPseudonymousIdentity::NotAPseudonym {
-            role: role_name.to_string(),
-            offending_email: email.to_string(),
-        })?;
+        let handle =
+            PseudonymHandle::parse(email).ok_or(NonPseudonymousIdentity::NotAPseudonym {
+                role: role_name.to_string(),
+                offending_email: email.to_string(),
+            })?;
         // …and for the PRINCIPAL's tenant (no cross-tenant pseudonym in this tenant's refs).
         if handle.tenant() != tenant {
             return Err(NonPseudonymousIdentity::WrongTenant {
@@ -409,9 +410,12 @@ pub fn enforce_pseudonymous_commit(
             _ => committer = Some(handle),
         }
     }
-    let author = author.ok_or(NonPseudonymousIdentity::Unparseable { missing: "author".into() })?;
-    let committer =
-        committer.ok_or(NonPseudonymousIdentity::Unparseable { missing: "committer".into() })?;
+    let author = author.ok_or(NonPseudonymousIdentity::Unparseable {
+        missing: "author".into(),
+    })?;
+    let committer = committer.ok_or(NonPseudonymousIdentity::Unparseable {
+        missing: "committer".into(),
+    })?;
     Ok((author, committer))
 }
 
@@ -548,8 +552,8 @@ mod tests {
     #[test]
     fn enforce_accepts_a_pseudonymous_commit_for_the_tenant() {
         let c = commit(); // author == committer == psn-7f3a9c@acme.noreply
-        let (author, committer) =
-            enforce_pseudonymous_commit(&c.canonical_bytes(), "acme").expect("pseudonymous → accept");
+        let (author, committer) = enforce_pseudonymous_commit(&c.canonical_bytes(), "acme")
+            .expect("pseudonymous → accept");
         assert_eq!(author, handle());
         assert_eq!(committer, handle());
     }
@@ -566,7 +570,10 @@ mod tests {
                     \n\
                     fix: the bug\n";
         match enforce_pseudonymous_commit(raw, "acme") {
-            Err(NonPseudonymousIdentity::NotAPseudonym { role, offending_email }) => {
+            Err(NonPseudonymousIdentity::NotAPseudonym {
+                role,
+                offending_email,
+            }) => {
                 assert_eq!(role, "author", "the FIRST non-pseudonymous header is named");
                 assert_eq!(offending_email, "ada.lovelace@example.com");
             }
@@ -585,7 +592,11 @@ mod tests {
         c.author = id.clone();
         c.committer = id;
         match enforce_pseudonymous_commit(&c.canonical_bytes(), "acme") {
-            Err(NonPseudonymousIdentity::WrongTenant { role, expected_tenant, found_tenant }) => {
+            Err(NonPseudonymousIdentity::WrongTenant {
+                role,
+                expected_tenant,
+                found_tenant,
+            }) => {
                 assert_eq!(role, "author");
                 assert_eq!(expected_tenant, "acme");
                 assert_eq!(found_tenant, "globex");
@@ -604,8 +615,14 @@ mod tests {
                     \n\
                     chore: rebase\n";
         match enforce_pseudonymous_commit(raw, "acme") {
-            Err(NonPseudonymousIdentity::NotAPseudonym { role, offending_email }) => {
-                assert_eq!(role, "committer", "the committer is gated independently of the author");
+            Err(NonPseudonymousIdentity::NotAPseudonym {
+                role,
+                offending_email,
+            }) => {
+                assert_eq!(
+                    role, "committer",
+                    "the committer is gated independently of the author"
+                );
                 assert_eq!(offending_email, "real@corp.example");
             }
             other => panic!("expected committer NotAPseudonym, got {other:?}"),
@@ -622,7 +639,9 @@ mod tests {
                     msg\n";
         assert_eq!(
             enforce_pseudonymous_commit(raw, "acme"),
-            Err(NonPseudonymousIdentity::Unparseable { missing: "author".into() })
+            Err(NonPseudonymousIdentity::Unparseable {
+                missing: "author".into()
+            })
         );
     }
 
@@ -631,9 +650,18 @@ mod tests {
     #[test]
     fn is_commit_object_detects_only_commits() {
         let c = commit();
-        assert!(is_commit_object(&c.canonical_bytes()), "a tree-headed object is a commit");
-        assert!(!is_commit_object(b"just some file contents\n"), "a blob is not a commit");
-        assert!(!is_commit_object(b"AKIAEXAMPLE secret blob"), "a secret blob is not a commit");
+        assert!(
+            is_commit_object(&c.canonical_bytes()),
+            "a tree-headed object is a commit"
+        );
+        assert!(
+            !is_commit_object(b"just some file contents\n"),
+            "a blob is not a commit"
+        );
+        assert!(
+            !is_commit_object(b"AKIAEXAMPLE secret blob"),
+            "a secret blob is not a commit"
+        );
     }
 
     /// The pseudonymity gate does NOT scan the message body — a third-party name typed into a commit

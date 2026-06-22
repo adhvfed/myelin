@@ -80,7 +80,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use myelin_events::EventEnvelope;
 use myelin_gdpr::{
     DsrError, EraseReceipt, EraseScope, LocateReport, Patch, PersonalDataHolder, PortableBundle,
-    RectifyReceipt, Result as DsrResult, RestrictReceipt, SubjectRef, TenantId as GdprTenantId,
+    RectifyReceipt, RestrictReceipt, Result as DsrResult, SubjectRef, TenantId as GdprTenantId,
 };
 use myelin_tenancy::{Region, TenantId};
 
@@ -270,7 +270,11 @@ impl OlapReadStore {
     /// event-log replay used by the restore path) to the OLAP read model: each replayed source row
     /// becomes an [`OlapEvent`] projected through the live consumer. P-ST-18 swaps the in-frame
     /// replay for the live durable-stream + `*.snapshot` feed; the shape is identical.
-    pub fn reindex_from_source(region: Region, source: &SourceLog, through: crate::WalOffset) -> OlapReadStore {
+    pub fn reindex_from_source(
+        region: Region,
+        source: &SourceLog,
+        through: crate::WalOffset,
+    ) -> OlapReadStore {
         let replay: ReindexFromSource = ReindexFromSource::reindex(source, through);
         let mut store = OlapReadStore::pinned_to(region.clone());
         for (i, row_id) in replay.docs().iter().enumerate() {
@@ -472,7 +476,11 @@ mod tests {
         let mut store = OlapReadStore::pinned_to(region());
         let e = event("01J-1", "issue:42:7");
         assert_eq!(store.apply(&e).unwrap(), OlapApply::Fresh);
-        assert_eq!(store.apply(&e).unwrap(), OlapApply::Duplicate, "redelivery is a no-op");
+        assert_eq!(
+            store.apply(&e).unwrap(),
+            OlapApply::Duplicate,
+            "redelivery is a no-op"
+        );
         assert_eq!(store.doc_count(), 1, "exactly one projected doc");
         assert_eq!(store.doc("issue:42:7").unwrap().last_event_id, "01J-1");
     }
@@ -485,9 +493,15 @@ mod tests {
         let mut store = OlapReadStore::pinned_to(region());
         let mut e = event("01J-1", "issue:42:7");
         e.region = Region("us-east".into());
-        let err = store.apply(&e).expect_err("an out-of-region event is rejected");
+        let err = store
+            .apply(&e)
+            .expect_err("an out-of-region event is rejected");
         assert!(matches!(err, OlapIngestError::OutOfRegion { .. }));
-        assert_eq!(store.doc_count(), 0, "nothing projected from an out-of-region event");
+        assert_eq!(
+            store.doc_count(),
+            0,
+            "nothing projected from an out-of-region event"
+        );
     }
 
     /// **The no-OLTP-scan structural guard (the GATE: `oltp_scan_path_count == 0`).** The store is
@@ -573,7 +587,10 @@ mod tests {
             .filter(|k| live.doc(k).is_some())
             .map(|k| k.to_string())
             .collect();
-        assert_eq!(cold_keys, live_keys, "cold reindex == live projection (cold == live)");
+        assert_eq!(
+            cold_keys, live_keys,
+            "cold reindex == live projection (cold == live)"
+        );
         assert_eq!(cold.doc_count(), 3, "all three source rows projected");
     }
 
@@ -598,15 +615,22 @@ mod tests {
         let holder = OlapStoreHolder::new("issue_analytics_olap");
         let s = subject_ref();
         match holder.export(&s, GdprTenantId::from_token("acme")) {
-            Err(DsrError(msg)) => assert!(msg.contains("P-GA-25"), "floor names its follow-on: {msg}"),
+            Err(DsrError(msg)) => {
+                assert!(msg.contains("P-GA-25"), "floor names its follow-on: {msg}")
+            }
             Ok(_) => panic!("export body must be the named P-GA-25 floor on P-ST-17"),
         }
         match holder.erase(EraseScope::Tenant(GdprTenantId::from_token("acme"))) {
-            Err(DsrError(msg)) => assert!(msg.contains("crypto-shred"), "erase = crypto-shred: {msg}"),
+            Err(DsrError(msg)) => {
+                assert!(msg.contains("crypto-shred"), "erase = crypto-shred: {msg}")
+            }
             Ok(_) => panic!("erase body must be the crypto-shred floor"),
         }
         match holder.restrict(&s, true) {
-            Err(DsrError(msg)) => assert!(msg.contains("C5"), "restrict = the C5 suppression seam: {msg}"),
+            Err(DsrError(msg)) => assert!(
+                msg.contains("C5"),
+                "restrict = the C5 suppression seam: {msg}"
+            ),
             Ok(_) => panic!("restrict body must be the C5 floor"),
         }
     }
@@ -616,9 +640,15 @@ mod tests {
     #[test]
     fn c5_restriction_flag_is_carried_for_m4() {
         let mut store = OlapReadStore::pinned_to(region());
-        assert!(!store.is_restricted("subj:alice"), "no restriction by default");
+        assert!(
+            !store.is_restricted("subj:alice"),
+            "no restriction by default"
+        );
         store.set_restricted("subj:alice", true);
-        assert!(store.is_restricted("subj:alice"), "the flag the M4 filter reads");
+        assert!(
+            store.is_restricted("subj:alice"),
+            "the flag the M4 filter reads"
+        );
         store.set_restricted("subj:alice", false);
         assert!(!store.is_restricted("subj:alice"), "restriction lifts");
     }
@@ -653,8 +683,14 @@ mod tests {
             holder_registered: true,
             reindex_matches_live,
         };
-        assert!(signal.is_green(), "the OLAP frame GATE artifact is green: {signal:?}");
-        assert_eq!(signal.oltp_scan_path_count, 0, "the headline zero — no OLTP-scan backdoor");
+        assert!(
+            signal.is_green(),
+            "the OLAP frame GATE artifact is green: {signal:?}"
+        );
+        assert_eq!(
+            signal.oltp_scan_path_count, 0,
+            "the headline zero — no OLTP-scan backdoor"
+        );
     }
 
     /// **The drill reads RED when ANY frame invariant fails** (the gate is a conjunction — no
@@ -677,21 +713,30 @@ mod tests {
             oltp_scan_path_count: 1,
             ..green.clone()
         };
-        assert!(!red_backdoor.is_green(), "an OLTP-scan backdoor must read RED");
+        assert!(
+            !red_backdoor.is_green(),
+            "an OLTP-scan backdoor must read RED"
+        );
 
         // (2) an unregistered holder reads RED.
         let red_holder = OlapFrameSignal {
             holder_registered: false,
             ..green.clone()
         };
-        assert!(!red_holder.is_green(), "an unregistered holder must read RED");
+        assert!(
+            !red_holder.is_green(),
+            "an unregistered holder must read RED"
+        );
 
         // (3) a cold≠live reindex divergence reads RED.
         let red_reindex = OlapFrameSignal {
             reindex_matches_live: false,
             ..green.clone()
         };
-        assert!(!red_reindex.is_green(), "a cold≠live reindex divergence must read RED");
+        assert!(
+            !red_reindex.is_green(),
+            "a cold≠live reindex divergence must read RED"
+        );
     }
 
     /// The ingest-error `Display` renders the residency breach legibly (observability is part of
@@ -703,8 +748,14 @@ mod tests {
             event_region: Region("us-east".into()),
         };
         let rendered = err.to_string();
-        assert!(rendered.contains("fr-par"), "names the store's pinned region: {rendered}");
-        assert!(rendered.contains("us-east"), "names the rejected event region: {rendered}");
+        assert!(
+            rendered.contains("fr-par"),
+            "names the store's pinned region: {rendered}"
+        );
+        assert!(
+            rendered.contains("us-east"),
+            "names the rejected event region: {rendered}"
+        );
         assert!(
             rendered.contains("global warehouse"),
             "names the per-cell / not-a-global-warehouse property: {rendered}"

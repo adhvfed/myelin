@@ -34,12 +34,10 @@ use myelin_chat::rebac_fragment::{self, object_types};
 use myelin_events::{OutboxStore, Timestamp};
 use myelin_identity::{
     Consistency, ConsistencyMode, Decision, FragmentAdmit, IdentityService, NamespaceFragment,
-    ObjectId, ObjectType, Permission, Principal, PrincipalId, PrincipalKind, RelName, RelationTuple,
-    TupleDelta, Zookie,
+    ObjectId, ObjectType, Permission, Principal, PrincipalId, PrincipalKind, RelName,
+    RelationTuple, TupleDelta, Zookie,
 };
-use myelin_identity_service::{
-    FragmentDef, PermissionRule, StoreBackedCheck, TupleStore, Userset,
-};
+use myelin_identity_service::{FragmentDef, PermissionRule, StoreBackedCheck, TupleStore, Userset};
 use myelin_storage::TenantScope;
 use myelin_tenancy::{ArtifactRef, Region, TenantId};
 

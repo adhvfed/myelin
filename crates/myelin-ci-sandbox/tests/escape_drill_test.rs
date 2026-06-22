@@ -231,7 +231,9 @@ fn ag_d4_ci_t1_hard_escape_gate_zero_escapes_on_a_real_kernel() {
         backends.push(BackendRun {
             backend: Backend::GvisorRunsc,
             exercised: false,
-            residual_note: Some("runsc not on PATH — the CI-P28 second-backend residual.".to_string()),
+            residual_note: Some(
+                "runsc not on PATH — the CI-P28 second-backend residual.".to_string(),
+            ),
         });
     }
 
@@ -245,7 +247,15 @@ fn ag_d4_ci_t1_hard_escape_gate_zero_escapes_on_a_real_kernel() {
     let kernel_sha = sha256_file(&resolved_kernel_path());
     let kernel_version = console
         .lines()
-        .find_map(|l| l.find("kernel=").map(|i| l[i + 7..].split_whitespace().next().unwrap_or("").to_string()))
+        .find_map(|l| {
+            l.find("kernel=").map(|i| {
+                l[i + 7..]
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_string()
+            })
+        })
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "6.1.168".to_string());
 
@@ -282,13 +292,22 @@ fn ag_d4_ci_t1_hard_escape_gate_zero_escapes_on_a_real_kernel() {
     // Final structural assertions on the artifact (the consumer's contract).
     assert_eq!(attestation.total_escapes, 0);
     assert_eq!(attestation.gate_backend, Backend::FirecrackerMicrovm);
-    assert!(!rootfs_sha.is_empty(), "the attestation carries the rootfs sha256 (image digest)");
     assert!(
-        attestation.backends.iter().any(|b| b.backend == Backend::FirecrackerMicrovm && b.exercised),
+        !rootfs_sha.is_empty(),
+        "the attestation carries the rootfs sha256 (image digest)"
+    );
+    assert!(
+        attestation
+            .backends
+            .iter()
+            .any(|b| b.backend == Backend::FirecrackerMicrovm && b.exercised),
         "Firecracker is the EXERCISED gate backend"
     );
     assert!(
-        attestation.backends.iter().any(|b| b.backend == Backend::GvisorRunsc && !b.exercised),
+        attestation
+            .backends
+            .iter()
+            .any(|b| b.backend == Backend::GvisorRunsc && !b.exercised),
         "gVisor is recorded as the NAMED residual, not faked green"
     );
 }

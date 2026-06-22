@@ -50,7 +50,11 @@ fn ctx_base() -> EmitContextBase {
     EmitContextBase {
         tenant: tenant(),
         region: region(),
-        actor: Actor(Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, tenant())),
+        actor: Actor(Principal::stub(
+            PrincipalId("p".into()),
+            PrincipalKind::Human,
+            tenant(),
+        )),
         schema_ver: 1,
         occurred_at: Timestamp("2026-06-21T00:00:00Z".into()),
         recorded_at: Timestamp("2026-06-21T00:00:01Z".into()),
@@ -97,13 +101,24 @@ fn request() -> MergeRequest {
 fn merge_queue_body(ci: Arc<CountingCi>, merger: Arc<CountingMerger>) -> Box<WorkflowBody> {
     Box::new(move |ctx: &mut WfCtx| {
         let out = ctx
-            .run_merge_attempt(&request(), ci.as_ref(), merger.as_ref(), Some(3600), MinorUnits(0), vec![])
+            .run_merge_attempt(
+                &request(),
+                ci.as_ref(),
+                merger.as_ref(),
+                Some(3600),
+                MinorUnits(0),
+                vec![],
+            )
             .map_err(|e| format!("{e:?}"))?;
         match out {
-            MergeOutcome::Merged { merged_commit_oid, .. } => {
-                Ok(vec![ArtifactRef(format!("outcome:merged:{merged_commit_oid}"))])
+            MergeOutcome::Merged {
+                merged_commit_oid, ..
+            } => Ok(vec![ArtifactRef(format!(
+                "outcome:merged:{merged_commit_oid}"
+            ))]),
+            MergeOutcome::Dequeued { reason } => {
+                Ok(vec![ArtifactRef(format!("outcome:dequeued:{reason}"))])
             }
-            MergeOutcome::Dequeued { reason } => Ok(vec![ArtifactRef(format!("outcome:dequeued:{reason}"))]),
             MergeOutcome::TimedOut => Ok(vec![ArtifactRef("outcome:timedout".into())]),
             MergeOutcome::Parked => Ok(vec![]),
         }
@@ -213,31 +228,73 @@ fn merge_queue_success_double_delivery_one_wake_one_merge_across_restart() {
 
     // WORKER 1: dispatch CI + PARK on ci.result (state=waiting holds no runtime).
     let w1 = fresh_worker(&sub, "worker-1", part, ci.clone(), merger.clone());
-    let o1 = w1.tick(1_000, "2026-06-21T00:00:00Z", 7).expect("worker-1 drives");
-    assert_eq!(o1, DriveOutcome::Waiting, "the run PARKED on the ci.result wait");
+    let o1 = w1
+        .tick(1_000, "2026-06-21T00:00:00Z", 7)
+        .expect("worker-1 drives");
+    assert_eq!(
+        o1,
+        DriveOutcome::Waiting,
+        "the run PARKED on the ci.result wait"
+    );
     assert_eq!(
         sub.runs.get(&tenant(), &run.0).unwrap().state,
         run_state::WAITING,
         "state=waiting — the merge queue holds no runtime across the multi-hour CI run"
     );
-    assert_eq!(ci.calls.load(Ordering::SeqCst), 1, "CI dispatched exactly once");
-    assert_eq!(merger.merges.load(Ordering::SeqCst), 0, "no merge yet — CI still running");
+    assert_eq!(
+        ci.calls.load(Ordering::SeqCst),
+        1,
+        "CI dispatched exactly once"
+    );
+    assert_eq!(
+        merger.merges.load(Ordering::SeqCst),
+        0,
+        "no merge yet — CI still running"
+    );
     assert_eq!(sub.outbox.committed_count(), 0, "no git.pr.merged yet");
     drop(w1); // worker crashes + service redeployed while parked (hours pass).
 
     // The deterministic merge_attempt_id CI echoes (the dispatch was command merge.queue:0).
     let attempt = merge_attempt_id(&run.0, "merge.queue:0");
     // CI delivers the rollup TWICE (at-least-once double-delivery).
-    let first = deliver_ci_result(&ex, &run, &attempt, "deadbeef", CiOverall::Success, vec!["build".into(), "test".into()]);
-    let second = deliver_ci_result(&ex, &run, &attempt, "deadbeef", CiOverall::Success, vec!["build".into(), "test".into()]);
-    assert_eq!(first, SignalOutcome::Buffered, "the first ci.result buffered");
-    assert_eq!(second, SignalOutcome::Duplicate, "the double-delivery is a no-op (ON CONFLICT DO NOTHING)");
-    assert_eq!(sub.signals.count_for_run(&tenant(), &run.0), 1, "ONE buffered ci.result (wakes once)");
+    let first = deliver_ci_result(
+        &ex,
+        &run,
+        &attempt,
+        "deadbeef",
+        CiOverall::Success,
+        vec!["build".into(), "test".into()],
+    );
+    let second = deliver_ci_result(
+        &ex,
+        &run,
+        &attempt,
+        "deadbeef",
+        CiOverall::Success,
+        vec!["build".into(), "test".into()],
+    );
+    assert_eq!(
+        first,
+        SignalOutcome::Buffered,
+        "the first ci.result buffered"
+    );
+    assert_eq!(
+        second,
+        SignalOutcome::Duplicate,
+        "the double-delivery is a no-op (ON CONFLICT DO NOTHING)"
+    );
+    assert_eq!(
+        sub.signals.count_for_run(&tenant(), &run.0),
+        1,
+        "ONE buffered ci.result (wakes once)"
+    );
     sub.runs.wake(&tenant(), &run.0);
 
     // WORKER 2 (redeployed): re-lease + resume + merge.
     let w2 = fresh_worker(&sub, "worker-2", part, ci.clone(), merger.clone());
-    let o2 = w2.tick(2_000, "2026-06-21T02:00:00Z", 7).expect("worker-2 resumes");
+    let o2 = w2
+        .tick(2_000, "2026-06-21T02:00:00Z", 7)
+        .expect("worker-2 resumes");
     match o2 {
         DriveOutcome::Completed(refs) => assert_eq!(
             refs,
@@ -248,10 +305,26 @@ fn merge_queue_success_double_delivery_one_wake_one_merge_across_restart() {
     }
 
     // THE THRESHOLDS: 1 wake, 0 double-merge, 1 git.pr.merged, 0 re-dispatch.
-    assert_eq!(sub.signals.buffered_depth(), 0, "the ci.result was consumed EXACTLY ONCE (1 wake)");
-    assert_eq!(merger.merges.load(Ordering::SeqCst), 1, "EXACTLY one merge (0 double-merge)");
-    assert_eq!(sub.outbox.committed_count(), 1, "EXACTLY one git.pr.merged emit");
-    assert_eq!(ci.calls.load(Ordering::SeqCst), 1, "0 re-dispatch across the restart");
+    assert_eq!(
+        sub.signals.buffered_depth(),
+        0,
+        "the ci.result was consumed EXACTLY ONCE (1 wake)"
+    );
+    assert_eq!(
+        merger.merges.load(Ordering::SeqCst),
+        1,
+        "EXACTLY one merge (0 double-merge)"
+    );
+    assert_eq!(
+        sub.outbox.committed_count(),
+        1,
+        "EXACTLY one git.pr.merged emit"
+    );
+    assert_eq!(
+        ci.calls.load(Ordering::SeqCst),
+        1,
+        "0 re-dispatch across the restart"
+    );
     assert!(sub.runs.get(&tenant(), &run.0).unwrap().state == run_state::COMPLETED);
 
     println!(
@@ -271,26 +344,53 @@ fn merge_queue_failure_one_dequeue_humanised_reason() {
     let part = partition_for(&run.0);
 
     let w1 = fresh_worker(&sub, "worker-1", part, ci.clone(), merger.clone());
-    assert_eq!(w1.tick(1_000, "2026-06-21T00:00:00Z", 7).unwrap(), DriveOutcome::Waiting, "parked");
+    assert_eq!(
+        w1.tick(1_000, "2026-06-21T00:00:00Z", 7).unwrap(),
+        DriveOutcome::Waiting,
+        "parked"
+    );
     drop(w1);
 
     let attempt = merge_attempt_id(&run.0, "merge.queue:0");
-    deliver_ci_result(&ex, &run, &attempt, "deadbeef", CiOverall::Failure, vec!["build".into(), "test".into()]);
+    deliver_ci_result(
+        &ex,
+        &run,
+        &attempt,
+        "deadbeef",
+        CiOverall::Failure,
+        vec!["build".into(), "test".into()],
+    );
     sub.runs.wake(&tenant(), &run.0);
 
     let w2 = fresh_worker(&sub, "worker-2", part, ci.clone(), merger.clone());
-    let o2 = w2.tick(2_000, "2026-06-21T01:00:00Z", 7).expect("worker-2 resumes");
+    let o2 = w2
+        .tick(2_000, "2026-06-21T01:00:00Z", 7)
+        .expect("worker-2 resumes");
     match o2 {
         DriveOutcome::Completed(refs) => {
             let r = &refs[0].0;
-            assert!(r.starts_with("outcome:dequeued:"), "the PR was dequeued: {r}");
-            assert!(r.contains("CI failed"), "humanised reason (contract 7.3): {r}");
+            assert!(
+                r.starts_with("outcome:dequeued:"),
+                "the PR was dequeued: {r}"
+            );
+            assert!(
+                r.contains("CI failed"),
+                "humanised reason (contract 7.3): {r}"
+            );
             assert!(!r.contains("ActivityError"), "no raw error code: {r}");
         }
         other => panic!("expected dequeue, got {other:?}"),
     }
-    assert_eq!(merger.merges.load(Ordering::SeqCst), 0, "no merge on failure");
-    assert_eq!(sub.outbox.committed_count(), 0, "no git.pr.merged on failure");
+    assert_eq!(
+        merger.merges.load(Ordering::SeqCst),
+        0,
+        "no merge on failure"
+    );
+    assert_eq!(
+        sub.outbox.committed_count(),
+        0,
+        "no git.pr.merged on failure"
+    );
 
     println!(
         "[2026-06-21] PASS  drill=merge-queue-in-isolation  scenario=failure  \
@@ -323,7 +423,9 @@ fn merge_queue_vanished_ci_run_timeout_bounds_the_wait() {
     sub.runs.wake(&tenant(), &run.0);
     let w2 = fresh_worker(&sub, "worker-2", part, ci.clone(), merger.clone());
     // clock far past the 1000 + 3600 = 4600 deadline → the timeout fires.
-    let o2 = w2.tick(10_000, "2026-06-21T03:00:00Z", 7).expect("worker-2 re-drives past the deadline");
+    let o2 = w2
+        .tick(10_000, "2026-06-21T03:00:00Z", 7)
+        .expect("worker-2 re-drives past the deadline");
     match o2 {
         DriveOutcome::Completed(refs) => assert_eq!(
             refs,
@@ -332,8 +434,16 @@ fn merge_queue_vanished_ci_run_timeout_bounds_the_wait() {
         ),
         other => panic!("expected TimedOut, got {other:?}"),
     }
-    assert_eq!(ci.calls.load(Ordering::SeqCst), 1, "0 re-dispatch — the dispatch short-circuited on replay");
-    assert_eq!(merger.merges.load(Ordering::SeqCst), 0, "no merge on a vanished CI run");
+    assert_eq!(
+        ci.calls.load(Ordering::SeqCst),
+        1,
+        "0 re-dispatch — the dispatch short-circuited on replay"
+    );
+    assert_eq!(
+        merger.merges.load(Ordering::SeqCst),
+        0,
+        "no merge on a vanished CI run"
+    );
 
     println!(
         "[2026-06-21] PASS  drill=merge-queue-in-isolation  scenario=vanished-ci  \

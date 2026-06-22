@@ -21,7 +21,9 @@
 //! `FsBlobStore` floor.
 
 use myelin_git::shed_clone::{BundleUriClone, GitFrontDoorShed};
-use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus, RuntimeRef};
+use myelin_identity::{
+    DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus, RuntimeRef,
+};
 use myelin_storage::blob::FsBlobStore;
 use myelin_storage::cdn::CdnCloneClass;
 use myelin_substrate::shed::{RunClass, Surface};
@@ -65,7 +67,9 @@ fn agent_kind() -> PrincipalKind {
 fn git_p15_storm_protects_the_human_then_serves_the_accelerated_bundle_uri_clone() {
     // ── stage 1: the front-door shed gate, budget from the thresholds file (the production budget). ──
     let thresholds = Thresholds::load_canonical().expect("load thresholds.toml");
-    let budget = thresholds.shed_budget(Surface::GitFrontDoor).expect("GitFrontDoor budget present");
+    let budget = thresholds
+        .shed_budget(Surface::GitFrontDoor)
+        .expect("GitFrontDoor budget present");
     let mut shed = GitFrontDoorShed::from_thresholds(&thresholds).expect("open the shed gate");
 
     let t = "acme";
@@ -111,9 +115,16 @@ fn git_p15_storm_protects_the_human_then_serves_the_accelerated_bundle_uri_clone
     assert_eq!(human_class, RunClass::Human);
 
     // GREEN ARTIFACT (the per-lane shed-count signal): human lane 0 shed, agent lane sheds.
-    assert_eq!(shed.shed_count(RunClass::Human), 0, "human lane: 0 shed (served under the storm)");
+    assert_eq!(
+        shed.shed_count(RunClass::Human),
+        0,
+        "human lane: 0 shed (served under the storm)"
+    );
     assert!(shed.shed_count(RunClass::Agent) >= 1, "agent lane: shed");
-    assert!(shed.shed_count(RunClass::BatchCi) >= 1, "CI/batch lane: shed");
+    assert!(
+        shed.shed_count(RunClass::BatchCi) >= 1,
+        "CI/batch lane: shed"
+    );
 
     // ── stage 4: the served human takes the ACCELERATED CDN bundle-URI clone path. ──
     // (the bulk clone-storm read fan-out left serving compute for the object tier; the human's clone
@@ -123,7 +134,9 @@ fn git_p15_storm_protects_the_human_then_serves_the_accelerated_bundle_uri_clone
     let bundle = BundleUriClone::new(cdn);
 
     let repo_bundle_bytes = b"PACK\0acme/widgets-clone-bundle@deadbeefcafe";
-    let uri = bundle.publish_bundle(repo_bundle_bytes).expect("serving tier publishes the bundle");
+    let uri = bundle
+        .publish_bundle(repo_bundle_bytes)
+        .expect("serving tier publishes the bundle");
     // the human clones via the advertised bundle-URI → a VALID clone (round-trips the exact bytes).
     let cloned = bundle
         .clone_via_bundle_uri(&uri)

@@ -143,7 +143,11 @@ mod tests {
     /// A 13.1 inline run of plain text (a [`Span::Text`] with no marks) — the reasoning prose.
     fn text(s: &str) -> Inline {
         Inline {
-            spans: vec![Span::Text { text: s.to_string(), marks: vec![], link: None }],
+            spans: vec![Span::Text {
+                text: s.to_string(),
+                marks: vec![],
+                link: None,
+            }],
             nodes: vec![],
         }
     }
@@ -154,7 +158,9 @@ mod tests {
         TraceDocument::new(
             run_id,
             vec![
-                Block::Paragraph { inline: text(reasoning) },
+                Block::Paragraph {
+                    inline: text(reasoning),
+                },
                 Block::CodeBlock {
                     lang: Some("json".into()),
                     text: r#"{"tool":"draft","result":"ok"}"#.into(),
@@ -169,7 +175,11 @@ mod tests {
     #[test]
     fn the_trace_is_a_13_1_block_document() {
         let doc = sample_trace(7, "the agent decided to draft a page");
-        assert_eq!(doc.blocks.len(), 2, "a paragraph + a code block — frozen 13.1 nodes");
+        assert_eq!(
+            doc.blocks.len(),
+            2,
+            "a paragraph + a code block — frozen 13.1 nodes"
+        );
         assert!(
             matches!(doc.blocks[0], Block::Paragraph { .. }),
             "the reasoning is a 13.1 paragraph block"
@@ -187,10 +197,18 @@ mod tests {
     fn trace_ref_is_a_blake3_content_address() {
         let doc = sample_trace(7, "reasoning");
         let addr = doc.content_address();
-        assert!(addr.0.starts_with("blake3:"), "the ONE platform multihash convention: {}", addr.0);
+        assert!(
+            addr.0.starts_with("blake3:"),
+            "the ONE platform multihash convention: {}",
+            addr.0
+        );
         // 32-byte BLAKE3 → 64 hex chars after the `blake3:` prefix.
         assert_eq!(addr.0.len(), "blake3:".len() + 64, "blake3:<64-hex>");
-        assert_eq!(trace_ref_of(&doc), addr.0, "trace_ref_of is the content address (the §4.5 seam)");
+        assert_eq!(
+            trace_ref_of(&doc),
+            addr.0,
+            "trace_ref_of is the content address (the §4.5 seam)"
+        );
     }
 
     /// **Content addressing is DETERMINISTIC — the same trace bytes always address to the same ref
@@ -200,14 +218,23 @@ mod tests {
     fn content_address_is_deterministic_and_collision_sensitive() {
         let a1 = sample_trace(7, "reasoning A").content_address();
         let a2 = sample_trace(7, "reasoning A").content_address();
-        assert_eq!(a1, a2, "identical trace bytes → identical content address (deterministic)");
+        assert_eq!(
+            a1, a2,
+            "identical trace bytes → identical content address (deterministic)"
+        );
 
         let b = sample_trace(7, "reasoning B").content_address();
-        assert_ne!(a1, b, "a different reasoning body → a different content address");
+        assert_ne!(
+            a1, b,
+            "a different reasoning body → a different content address"
+        );
 
         // a different run with the same reasoning addresses distinctly (the holder body is per-run).
         let c = sample_trace(8, "reasoning A").content_address();
-        assert_ne!(a1, c, "the run_id is folded into the address — a per-run holder body");
+        assert_ne!(
+            a1, c,
+            "the run_id is folded into the address — a per-run holder body"
+        );
     }
 
     /// **The trace is the content-addressed Knowledge document seam (8.8).** The structural assertion
@@ -224,7 +251,13 @@ mod tests {
     fn the_stateless_except_trace_floor_is_named() {
         assert!(STATELESS_EXCEPT_TRACE_FLOOR.contains("stateless across runs"));
         assert!(STATELESS_EXCEPT_TRACE_FLOOR.contains("NOT BUILT"));
-        assert!(STATELESS_EXCEPT_TRACE_FLOOR.contains("AG-P25"), "names the long-term-memory follow-on");
-        assert!(STATELESS_EXCEPT_TRACE_FLOOR.contains("AG-P23"), "names the DSR fan-out follow-on");
+        assert!(
+            STATELESS_EXCEPT_TRACE_FLOOR.contains("AG-P25"),
+            "names the long-term-memory follow-on"
+        );
+        assert!(
+            STATELESS_EXCEPT_TRACE_FLOOR.contains("AG-P23"),
+            "names the DSR fan-out follow-on"
+        );
     }
 }

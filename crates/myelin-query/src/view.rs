@@ -181,7 +181,12 @@ mod tests {
         let all = ViewKind::all();
         assert_eq!(all.len(), 6, "the frozen view-kind set is six variants");
         for (i, k) in all.iter().enumerate() {
-            assert_eq!(*k as u8, i as u8, "{} discriminant is pinned to {i}", k.wire_id());
+            assert_eq!(
+                *k as u8,
+                i as u8,
+                "{} discriminant is pinned to {i}",
+                k.wire_id()
+            );
         }
         let ids: Vec<&str> = all.iter().map(|k| k.wire_id()).collect();
         assert_eq!(
@@ -204,7 +209,10 @@ mod tests {
             })
             .unwrap(),
             group_by: Some(FieldId::new("status")),
-            sort: vec![SortSpec { field: FieldId::new("priority"), dir: SortDir::Desc }],
+            sort: vec![SortSpec {
+                field: FieldId::new("priority"),
+                dir: SortDir::Desc,
+            }],
             visible: vec![FieldId::new("title"), FieldId::new("assignee")],
             order_field: FieldId::new("order_key"),
         };
@@ -230,7 +238,10 @@ mod tests {
             kind: ViewKind::List,
             filter: QueryAst::compiled(Predicate::True).unwrap(),
             group_by: None,
-            sort: vec![SortSpec { field: FieldId::new("due"), dir: SortDir::Asc }],
+            sort: vec![SortSpec {
+                field: FieldId::new("due"),
+                dir: SortDir::Asc,
+            }],
             visible: vec![FieldId::new("title")],
             order_field: FieldId::new("order_key"),
         };

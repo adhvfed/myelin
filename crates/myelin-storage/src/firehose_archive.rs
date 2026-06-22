@@ -140,7 +140,10 @@ impl SegmentBytes {
             }
             let body = std::str::from_utf8(&bytes[cur..end]).ok()?.to_string();
             cur = end;
-            frames.push(Frame { seq, payload: FramePayload(body) });
+            frames.push(Frame {
+                seq,
+                payload: FramePayload(body),
+            });
         }
         // A trailing-garbage segment is malformed — the record must consume EXACTLY its bytes.
         if cur != bytes.len() {
@@ -227,7 +230,10 @@ impl core::fmt::Display for ArchiveError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             ArchiveError::EmptySegment => {
-                write!(f, "firehose archive: refusing to seal an empty segment (no frames)")
+                write!(
+                    f,
+                    "firehose archive: refusing to seal an empty segment (no frames)"
+                )
             }
             ArchiveError::Blob(e) => write!(f, "firehose archive: blob error: {e}"),
             ArchiveError::CorruptSegment(h) => write!(
@@ -285,7 +291,8 @@ impl ArchiveTelemetry {
     /// Defence-in-depth: flag that a segment was observed written WITHOUT the DEK wrap. Never called
     /// on the normal path; exposed so an at-rest scanner can raise the leak loudly.
     pub fn record_unencrypted(&self) {
-        self.unencrypted_segment_count.fetch_add(1, Ordering::SeqCst);
+        self.unencrypted_segment_count
+            .fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -352,7 +359,12 @@ impl FirehoseArchiver {
     /// Returns the sealed-segment record (the references-not-payloads pointer the durable bus
     /// carries). REFUSES an empty batch ([`ArchiveError::EmptySegment`]) — never seals a junk
     /// zero-frame segment.
-    pub fn seal(&self, stream: &str, scope: &str, frames: &[Frame]) -> Result<SealedSegment, ArchiveError> {
+    pub fn seal(
+        &self,
+        stream: &str,
+        scope: &str,
+        frames: &[Frame],
+    ) -> Result<SealedSegment, ArchiveError> {
         if frames.is_empty() {
             return Err(ArchiveError::EmptySegment);
         }
@@ -372,7 +384,10 @@ impl FirehoseArchiver {
             last_seq,
             frame_count: frames.len(),
         };
-        self.segments.lock().expect("archive mutex").push(segment.clone());
+        self.segments
+            .lock()
+            .expect("archive mutex")
+            .push(segment.clone());
         self.telemetry.record_sealed();
         Ok(segment)
     }
@@ -406,7 +421,8 @@ impl FirehoseArchiver {
     /// pointer back to the exact frames the live firehose carried (cold == live).
     pub fn read_segment(&self, content_hash: &ContentHash) -> Result<Vec<Frame>, ArchiveError> {
         let bytes = self.store.get(&self.tenant, content_hash)?;
-        SegmentBytes::decode(&bytes).ok_or_else(|| ArchiveError::CorruptSegment(content_hash.clone()))
+        SegmentBytes::decode(&bytes)
+            .ok_or_else(|| ArchiveError::CorruptSegment(content_hash.clone()))
     }
 
     /// Resolve a frame `seq` to the sealed segment that covers it (the generic, non-CI resolver — the
@@ -465,7 +481,7 @@ pub fn segment_pointer_draft(segment: &SealedSegment) -> FrameDraft {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kms::{KekId, KeyClass, DekId};
+    use crate::kms::{DekId, KekId, KeyClass};
 
     fn tenant() -> TenantId {
         TenantId("acme".to_string())
@@ -482,7 +498,9 @@ mod tests {
         FirehoseArchiver::with_tenant_dek(tenant(), region(), engine)
     }
     fn frames(seqs: &[u64]) -> Vec<Frame> {
-        seqs.iter().map(|&s| Frame::new(s, format!("op-{s}"))).collect()
+        seqs.iter()
+            .map(|&s| Frame::new(s, format!("op-{s}")))
+            .collect()
     }
 
     // ── SegmentBytes round-trip (the deterministic, self-describing encode/decode) ──
@@ -502,7 +520,10 @@ mod tests {
         let fs = frames(&[1, 2]);
         assert_eq!(SegmentBytes::encode(&fs), SegmentBytes::encode(&fs));
         // A different batch encodes differently (the address discriminates).
-        assert_ne!(SegmentBytes::encode(&fs), SegmentBytes::encode(&frames(&[1, 3])));
+        assert_ne!(
+            SegmentBytes::encode(&fs),
+            SegmentBytes::encode(&frames(&[1, 3]))
+        );
     }
 
     #[test]
@@ -513,18 +534,27 @@ mod tests {
         let fs = vec![Frame::new(9, "")];
         let bytes = SegmentBytes::encode(&fs).0;
         let back = SegmentBytes::decode(&bytes).expect("an exactly-consumed tail is valid");
-        assert_eq!(back, fs, "an empty-payload frame round-trips (the tail-read boundary)");
+        assert_eq!(
+            back, fs,
+            "an empty-payload frame round-trips (the tail-read boundary)"
+        );
     }
 
     #[test]
     fn segment_bytes_decode_rejects_truncation_and_trailing_garbage() {
         let bytes = SegmentBytes::encode(&frames(&[7])).0;
         // One byte short → loud None (never a partial replay).
-        assert!(SegmentBytes::decode(&bytes[..bytes.len() - 1]).is_none(), "truncated → None");
+        assert!(
+            SegmentBytes::decode(&bytes[..bytes.len() - 1]).is_none(),
+            "truncated → None"
+        );
         // Trailing garbage → loud None (the record must consume exactly its bytes).
         let mut extra = bytes.clone();
         extra.push(0xAB);
-        assert!(SegmentBytes::decode(&extra).is_none(), "trailing garbage → None");
+        assert!(
+            SegmentBytes::decode(&extra).is_none(),
+            "trailing garbage → None"
+        );
         // An empty input has no count header → None.
         assert!(SegmentBytes::decode(&[]).is_none(), "no header → None");
     }
@@ -538,8 +568,14 @@ mod tests {
         let seg = arch.seal("oplog", "board:42", &fs).expect("seal");
 
         // (1) content-addressed: the segment's hash IS the BLAKE3 of the plaintext segment bytes.
-        assert_eq!(seg.content_hash, ContentHash::blake3(&SegmentBytes::encode(&fs).0));
-        assert!(seg.content_hash.to_multihash_string().starts_with("blake3:"));
+        assert_eq!(
+            seg.content_hash,
+            ContentHash::blake3(&SegmentBytes::encode(&fs).0)
+        );
+        assert!(seg
+            .content_hash
+            .to_multihash_string()
+            .starts_with("blake3:"));
         assert!(arch.telemetry().segment_content_addressed());
 
         // (2) the range aligns with the 3.5 resume cursor.
@@ -548,12 +584,25 @@ mod tests {
         // (3) 0 unencrypted segments (the GATE assertion) + the archive is live. Both counters read
         // 0 BEFORE any seal and the EXACT count after — pinning the accessors (not a constant).
         assert_eq!(arch.telemetry().unencrypted_segment_count(), 0);
-        assert_eq!(arch.telemetry().sealed_segment_count(), 1, "exactly one segment sealed");
+        assert_eq!(
+            arch.telemetry().sealed_segment_count(),
+            1,
+            "exactly one segment sealed"
+        );
         assert_eq!(arch.sealed_segment_count(), 1, "the pointer count agrees");
         // Seal a second segment → both counters advance to EXACTLY 2 (not a fixed 0/1).
-        arch.seal("oplog", "board:42", &frames(&[4, 5])).expect("second seal");
-        assert_eq!(arch.telemetry().sealed_segment_count(), 2, "the telemetry counts each seal");
-        assert_eq!(arch.sealed_segment_count(), 2, "the pointer count counts each seal");
+        arch.seal("oplog", "board:42", &frames(&[4, 5]))
+            .expect("second seal");
+        assert_eq!(
+            arch.telemetry().sealed_segment_count(),
+            2,
+            "the telemetry counts each seal"
+        );
+        assert_eq!(
+            arch.sealed_segment_count(),
+            2,
+            "the pointer count counts each seal"
+        );
 
         // (4) the segment round-trips back to the exact frames (cold == live) — proves it decrypts.
         assert_eq!(arch.read_segment(&seg.content_hash).expect("read"), fs);
@@ -568,9 +617,16 @@ mod tests {
 
         // The stored (at-rest) bytes are the DEK ciphertext envelope, strictly larger than the
         // plaintext segment and NOT containing the plaintext marker (ciphertext-at-rest).
-        let stored_len = arch.store.head(&tenant(), &seg.content_hash).expect("head").stored_len;
+        let stored_len = arch
+            .store
+            .head(&tenant(), &seg.content_hash)
+            .expect("head")
+            .stored_len;
         let plaintext = SegmentBytes::encode(&fs).0;
-        assert!(stored_len > plaintext.len(), "stored is the ciphertext envelope, not plaintext");
+        assert!(
+            stored_len > plaintext.len(),
+            "stored is the ciphertext envelope, not plaintext"
+        );
         // and it still decrypts back to the exact frames.
         assert_eq!(arch.read_segment(&seg.content_hash).expect("read"), fs);
     }
@@ -581,8 +637,13 @@ mod tests {
         // unrecoverable (a LOUD failure, never a silent serve) — live AND in backups by construction.
         let eng = engine();
         let arch = archiver(eng.clone());
-        let seg = arch.seal("oplog", "channel:eng", &frames(&[1])).expect("seal");
-        assert!(arch.read_segment(&seg.content_hash).is_ok(), "reads before the shred");
+        let seg = arch
+            .seal("oplog", "channel:eng", &frames(&[1]))
+            .expect("seal");
+        assert!(
+            arch.read_segment(&seg.content_hash).is_ok(),
+            "reads before the shred"
+        );
 
         // Crypto-shred the per-tenant DEK the segment is sealed under.
         assert!(eng.destroy_dek(&DekId::new(tenant(), KeyClass::Tenant)));
@@ -591,7 +652,10 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             arch.read_segment(&seg.content_hash)
         }));
-        assert!(result.is_err(), "a crypto-shredded segment is unrecoverable (LOUD), never served");
+        assert!(
+            result.is_err(),
+            "a crypto-shredded segment is unrecoverable (LOUD), never served"
+        );
     }
 
     #[test]
@@ -599,11 +663,30 @@ mod tests {
         let arch = archiver(engine());
         // A FRESH archive reads 0 on both counters (pins the accessors at the empty state — a
         // `-> 1` mutant on either would survive without this).
-        assert_eq!(arch.sealed_segment_count(), 0, "a fresh archive has sealed nothing");
-        assert_eq!(arch.telemetry().sealed_segment_count(), 0, "the telemetry starts at 0");
-        assert_eq!(arch.seal("oplog", "board:1", &[]).unwrap_err(), ArchiveError::EmptySegment);
-        assert_eq!(arch.sealed_segment_count(), 0, "a refused empty seal stores nothing");
-        assert_eq!(arch.telemetry().sealed_segment_count(), 0, "a refused seal does not count");
+        assert_eq!(
+            arch.sealed_segment_count(),
+            0,
+            "a fresh archive has sealed nothing"
+        );
+        assert_eq!(
+            arch.telemetry().sealed_segment_count(),
+            0,
+            "the telemetry starts at 0"
+        );
+        assert_eq!(
+            arch.seal("oplog", "board:1", &[]).unwrap_err(),
+            ArchiveError::EmptySegment
+        );
+        assert_eq!(
+            arch.sealed_segment_count(),
+            0,
+            "a refused empty seal stores nothing"
+        );
+        assert_eq!(
+            arch.telemetry().sealed_segment_count(),
+            0,
+            "a refused seal does not count"
+        );
     }
 
     // ── riding the 3.5 resume-cursor transport (the frame source) ──
@@ -621,12 +704,17 @@ mod tests {
     #[test]
     fn segment_covering_resolves_a_seq_to_its_segment() {
         let arch = archiver(engine());
-        arch.seal("oplog", "doc:a", &frames(&[1, 2, 3])).expect("seal");
-        arch.seal("oplog", "doc:a", &frames(&[4, 5, 6])).expect("seal");
+        arch.seal("oplog", "doc:a", &frames(&[1, 2, 3]))
+            .expect("seal");
+        arch.seal("oplog", "doc:a", &frames(&[4, 5, 6]))
+            .expect("seal");
 
         assert_eq!(arch.segment_covering(2).expect("covers 2").first_seq, 1);
         assert_eq!(arch.segment_covering(5).expect("covers 5").first_seq, 4);
-        assert!(arch.segment_covering(99).is_none(), "no segment covers an out-of-range seq");
+        assert!(
+            arch.segment_covering(99).is_none(),
+            "no segment covers an out-of-range seq"
+        );
     }
 
     #[test]
@@ -640,8 +728,14 @@ mod tests {
             last_seq: 5,
             frame_count: 3,
         };
-        assert!(seg.covers(3) && seg.covers(4) && seg.covers(5), "inclusive both ends");
-        assert!(!seg.covers(2) && !seg.covers(6), "exclusive outside the range");
+        assert!(
+            seg.covers(3) && seg.covers(4) && seg.covers(5),
+            "inclusive both ends"
+        );
+        assert!(
+            !seg.covers(2) && !seg.covers(6),
+            "exclusive outside the range"
+        );
     }
 
     // ── the pointer record (references-not-payloads) ──
@@ -649,12 +743,17 @@ mod tests {
     #[test]
     fn pointer_payload_is_pii_free_and_names_the_segment() {
         let arch = archiver(engine());
-        let seg = arch.seal("oplog", "board:42", &frames(&[1, 2])).expect("seal");
+        let seg = arch
+            .seal("oplog", "board:42", &frames(&[1, 2]))
+            .expect("seal");
         let payload = seg.pointer_payload();
         // The pointer names the content hash + range — a reference, NOT the frame bodies.
         assert!(payload.contains(&seg.content_hash.to_multihash_string()));
         assert!(payload.contains("1-2"));
-        assert!(!payload.contains("op-1"), "the pointer must NOT inline the frame body (PII-free)");
+        assert!(
+            !payload.contains("op-1"),
+            "the pointer must NOT inline the frame body (PII-free)"
+        );
         // The draft a durable bus would carry is built from it.
         assert_eq!(segment_pointer_draft(&seg).payload.0, payload);
     }
@@ -665,7 +764,10 @@ mod tests {
     fn a_corrupt_segment_is_caught_loudly_on_read() {
         let arch = archiver(engine());
         let seg = arch.seal("oplog", "doc:x", &frames(&[1, 2])).expect("seal");
-        assert!(arch.corrupt_segment_for_drill(&seg.content_hash), "segment present to corrupt");
+        assert!(
+            arch.corrupt_segment_for_drill(&seg.content_hash),
+            "segment present to corrupt"
+        );
         // A corrupt DEK-sealed segment is caught LOUDLY: the AEAD authentication fails on unwrap, so
         // the DekContentWrap PANICS (never a silent wrong-bytes serve) before re-hash-on-read even
         // runs. Either a panic (the DEK auth-fail path) or a typed error (a decode-fail on a
@@ -704,13 +806,22 @@ mod tests {
         let tel = ArchiveTelemetry::default();
         assert_eq!(tel.unencrypted_segment_count(), 0);
         tel.record_unencrypted();
-        assert_eq!(tel.unencrypted_segment_count(), 1, "the leak detector counts");
-        assert!(tel.segment_content_addressed(), "content-addressed by construction");
+        assert_eq!(
+            tel.unencrypted_segment_count(),
+            1,
+            "the leak detector counts"
+        );
+        assert!(
+            tel.segment_content_addressed(),
+            "content-addressed by construction"
+        );
     }
 
     #[test]
     fn archive_error_display_is_loud_and_specific() {
-        assert!(ArchiveError::EmptySegment.to_string().contains("empty segment"));
+        assert!(ArchiveError::EmptySegment
+            .to_string()
+            .contains("empty segment"));
         assert!(ArchiveError::Blob(BlobError::UnknownAlgo("md5".into()))
             .to_string()
             .contains("blob error"));

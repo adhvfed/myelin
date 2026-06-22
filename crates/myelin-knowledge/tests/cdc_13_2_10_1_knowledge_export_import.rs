@@ -25,8 +25,8 @@
 //!   [`ExportDoc`] per subject and serialises the bundle — modelled here by a consumer that builds the
 //!   subject's bundle and proves the round-trip is the portable Art. 20 artifact.
 
-use myelin_content::{parse_inline, serialize_inline, AdfNode, AdfTarget, Block, Loss, MAP};
 use myelin_content::adf::mapping_for;
+use myelin_content::{parse_inline, serialize_inline, AdfNode, AdfTarget, Block, Loss, MAP};
 use myelin_knowledge::{import_adf, ExportBlock, ExportDoc, ParsedAdfNode};
 
 // ── PROVIDER side (13.2): the frozen ADF map ────────────────────────────────────────────────
@@ -53,7 +53,10 @@ fn cdc_13_2_knowledge_import_builds_against_frozen_map_and_records_losses() {
         ParsedAdfNode::resolved(AdfNode::Expand, "x"), // → toggle, lossless
     ];
     let r = import_adf("pg", "Lossless import", &lossless);
-    assert!(r.report.is_lossless(), "a direct-equivalent import loses nothing");
+    assert!(
+        r.report.is_lossless(),
+        "a direct-equivalent import loses nothing"
+    );
     assert_eq!(r.doc.blocks.len(), 4);
 
     // CONSUMER: a lossy import records each conversion in the import report (named, never silent),
@@ -62,16 +65,25 @@ fn cdc_13_2_knowledge_import_builds_against_frozen_map_and_records_losses() {
         ParsedAdfNode::unresolved(AdfNode::Mention, "external"), // → plain text (recorded)
         ParsedAdfNode::resolved(AdfNode::Status, "In Progress"), // → code (recorded)
         ParsedAdfNode::resolved(AdfNode::Extension, "macro"),    // → callout+marker (recorded)
-        ParsedAdfNode::resolved(AdfNode::Paragraph, "kept"),    // lossless (not recorded)
+        ParsedAdfNode::resolved(AdfNode::Paragraph, "kept"),     // lossless (not recorded)
     ];
     let r = import_adf("pg", "Lossy import", &lossy);
-    assert_eq!(r.report.loss_count(), 3, "three lossy nodes recorded, the lossless one not");
+    assert_eq!(
+        r.report.loss_count(),
+        3,
+        "three lossy nodes recorded, the lossless one not"
+    );
     assert_eq!(r.report.conversions[0].node, AdfNode::Mention);
     assert_eq!(r.report.conversions[0].degraded_to, AdfTarget::PlainText);
 
     // The consumer's per-node target agrees with the frozen provider map EXACTLY (no drift): for a
     // resolved node the target is the map's `target`; for an unresolved conditional it is `degraded_to`.
-    for node in [AdfNode::Paragraph, AdfNode::Status, AdfNode::Extension, AdfNode::Mention] {
+    for node in [
+        AdfNode::Paragraph,
+        AdfNode::Status,
+        AdfNode::Extension,
+        AdfNode::Mention,
+    ] {
         let m = mapping_for(node);
         match &m.loss {
             Loss::None | Loss::Lossy { .. } => {
@@ -107,8 +119,18 @@ fn gdpr_export_subject_bundle(subject_page: &str) -> String {
         "Subject portable export",
         None,
         vec![
-            ExportBlock::leaf("b1", Block::Paragraph { inline: parse_inline("some **content**", &[]) }),
-            ExportBlock::leaf("b2", Block::Paragraph { inline: parse_inline("a `code` run", &[]) }),
+            ExportBlock::leaf(
+                "b1",
+                Block::Paragraph {
+                    inline: parse_inline("some **content**", &[]),
+                },
+            ),
+            ExportBlock::leaf(
+                "b2",
+                Block::Paragraph {
+                    inline: parse_inline("a `code` run", &[]),
+                },
+            ),
         ],
     );
     doc.to_json_bundle()
@@ -122,22 +144,41 @@ fn cdc_10_1_export_service_is_the_art20_lossless_mechanism() {
         "Runbook",
         None,
         vec![
-            ExportBlock::leaf("b1", Block::Paragraph { inline: parse_inline("**bold** and *italic*", &[]) }),
+            ExportBlock::leaf(
+                "b1",
+                Block::Paragraph {
+                    inline: parse_inline("**bold** and *italic*", &[]),
+                },
+            ),
             ExportBlock::with_children(
                 "b2",
-                Block::Paragraph { inline: parse_inline("parent", &[]) },
-                vec![ExportBlock::leaf("b2a", Block::Paragraph { inline: parse_inline("child", &[]) })],
+                Block::Paragraph {
+                    inline: parse_inline("parent", &[]),
+                },
+                vec![ExportBlock::leaf(
+                    "b2a",
+                    Block::Paragraph {
+                        inline: parse_inline("child", &[]),
+                    },
+                )],
             ),
         ],
     );
     let back = provider_export_then_import(&doc);
-    assert_eq!(back, doc, "the bundle is a byte-faithful lossless round-trip (Art. 20)");
-    assert!(doc.json_roundtrips(), "the export/import round-trip gate is green (render(parse(md))===md)");
+    assert_eq!(
+        back, doc,
+        "the bundle is a byte-faithful lossless round-trip (Art. 20)"
+    );
+    assert!(
+        doc.json_roundtrips(),
+        "the export/import round-trip gate is green (render(parse(md))===md)"
+    );
 
     // CONSUMER: the GDPR holder produces the subject's portable bundle by REUSING the Export service;
     // the bundle parses back to an ExportDoc (the portable Art. 20 artifact the data subject receives).
     let bundle = gdpr_export_subject_bundle("subject/page/1");
-    let parsed = ExportDoc::from_json_bundle(&bundle).expect("the holder's bundle is a valid export");
+    let parsed =
+        ExportDoc::from_json_bundle(&bundle).expect("the holder's bundle is a valid export");
     assert_eq!(parsed.page_id.as_str(), "subject/page/1");
     // the content survives losslessly through the holder's export (the marks round-trip).
     let md = parsed
@@ -149,6 +190,12 @@ fn cdc_10_1_export_service_is_the_art20_lossless_mechanism() {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(md.contains("**content**"), "the subject's bold content survives the export: {md}");
-    assert!(md.contains("`code`"), "the subject's code run survives the export: {md}");
+    assert!(
+        md.contains("**content**"),
+        "the subject's bold content survives the export: {md}"
+    );
+    assert!(
+        md.contains("`code`"),
+        "the subject's code run survives the export: {md}"
+    );
 }

@@ -100,7 +100,10 @@ pub enum PublicReject {
 impl core::fmt::Display for PublicReject {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            PublicReject::CrossTenantIdor { path_tenant, token_tenant } => write!(
+            PublicReject::CrossTenantIdor {
+                path_tenant,
+                token_tenant,
+            } => write!(
                 f,
                 "cross-tenant IDOR: URL path named tenant {:?} but the verified token owns {:?} \
                  — rejected + audited (§4.1, ID-3; tenant from token, never the path)",
@@ -144,12 +147,18 @@ impl AuditSink {
 
     /// Record an attempted cross-tenant IDOR (loud, never swallowed — the attempt IS evidence).
     fn record(&self, rec: IdorAuditRecord) {
-        self.records.lock().unwrap_or_else(|e| e.into_inner()).push(rec);
+        self.records
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(rec);
     }
 
     /// Every audited IDOR attempt so far (so a drill/test can assert the rejection was audited).
     pub fn records(&self) -> Vec<IdorAuditRecord> {
-        self.records.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.records
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// How many IDOR attempts have been audited.
@@ -361,8 +370,16 @@ mod tests {
         let resolved = surface
             .resolve_tenant(&id, &TenantId("acme".into()))
             .expect("a matching path tenant is served");
-        assert_eq!(resolved, TenantId("acme".into()), "the operating tenant is the token's");
-        assert_eq!(surface.misroute_count(), 0, "no cross-tenant read was served");
+        assert_eq!(
+            resolved,
+            TenantId("acme".into()),
+            "the operating tenant is the token's"
+        );
+        assert_eq!(
+            surface.misroute_count(),
+            0,
+            "no cross-tenant read was served"
+        );
         assert_eq!(surface.audit().count(), 0, "nothing to audit on a match");
     }
 
@@ -397,7 +414,11 @@ mod tests {
             "the audit record is the PII-free attempt evidence (opaque ids only)"
         );
         // The SUB-D7 ZERO — no cross-tenant read was served.
-        assert_eq!(surface.misroute_count(), 0, "misroute_count stays 0 (nothing served cross-tenant)");
+        assert_eq!(
+            surface.misroute_count(),
+            0,
+            "misroute_count stays 0 (nothing served cross-tenant)"
+        );
     }
 
     /// The tenant is NEVER taken from the path even when it "looks" plausible: a request with NO
@@ -411,7 +432,9 @@ mod tests {
         let id = InjectedIdentity::new(principal_of("p", "acme"));
         // A second, different principal in the SAME tenant resolves to that tenant — the source is
         // the token's tenant, independent of which path string the caller chose (as long as it matches).
-        let resolved = surface.resolve_tenant(&id, &TenantId("acme".into())).unwrap();
+        let resolved = surface
+            .resolve_tenant(&id, &TenantId("acme".into()))
+            .unwrap();
         // The returned value is the *token's* TenantId object, not the path's — same value, but the
         // function read it off `identity.token_tenant()`.
         assert_eq!(&resolved, id.token_tenant());
@@ -454,7 +477,10 @@ mod tests {
         };
         let d = denied.to_string();
         assert!(d.contains("re-authorization denied"), "names the rule: {d}");
-        assert!(d.contains("internal = safe"), "names the §4.2 doctrine: {d}");
+        assert!(
+            d.contains("internal = safe"),
+            "names the §4.2 doctrine: {d}"
+        );
     }
 
     /// The internal surface re-authorizes PER PRINCIPAL: an admitted principal passes (and resolves
@@ -465,9 +491,16 @@ mod tests {
         let surface = InternalSurface::new(AllowPrincipal("trusted-svc".into()));
         // The admitted principal passes → operating tenant is its verified tenant.
         let ok = surface.handle(&principal_of("trusted-svc", "acme"), "issues.read");
-        assert_eq!(ok, Ok(TenantId("acme".into())), "the admitted principal is authorized");
+        assert_eq!(
+            ok,
+            Ok(TenantId("acme".into())),
+            "the admitted principal is authorized"
+        );
         // A DIFFERENT principal on the same internal channel is denied (re-authorized per call).
         let denied = surface.handle(&principal_of("other-svc", "acme"), "issues.read");
-        assert!(matches!(denied, Err(InternalReject::Unauthorized { .. })), "a different principal is denied");
+        assert!(
+            matches!(denied, Err(InternalReject::Unauthorized { .. })),
+            "a different principal is denied"
+        );
     }
 }

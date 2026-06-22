@@ -20,11 +20,11 @@
 //! — a drill that cannot go red is not a gate) AND green (a whole + ready cell activates), and emits
 //! the gate result on the SAME [`SignalSource`] every drill uses (observability is part of the pass).
 
-use myelin_control_plane::{
-    CellStatus, Capacity, Cell, IsolationKind, PlacementService, ProvisionFailure, ProvisioningGate,
-    ProvisioningSignals, Registry,
-};
 use myelin_control_plane::place::CounterMinter;
+use myelin_control_plane::{
+    Capacity, Cell, CellStatus, IsolationKind, PlacementService, ProvisionFailure,
+    ProvisioningGate, ProvisioningSignals, Registry,
+};
 use myelin_harness::{Predicate, SignalName, SignalSource};
 use myelin_storage::{
     ContentHash, ContinuousArchiver, ErasureLedger, GateInputs, KekId, KeyClass, KmsEngine,
@@ -43,7 +43,11 @@ fn fresh_cell(id: &str) -> Cell {
         region: region(),
         status: CellStatus::Provisioning, // a FRESH cell starts Provisioning.
         isolation_kind: IsolationKind::Pool,
-        capacity: Capacity { tenants_max: 1000, write_qps_max: 5000, storage_bytes_max: 1 << 40 },
+        capacity: Capacity {
+            tenants_max: 1000,
+            write_qps_max: 5000,
+            storage_bytes_max: 1 << 40,
+        },
         utilisation: 0,
         version: 1,
         endpoint: format!("cell.eu-west.{id}.myelin.eu"),
@@ -52,16 +56,25 @@ fn fresh_cell(id: &str) -> Cell {
 
 fn reachable_archiver(tail: u64) -> ContinuousArchiver {
     let mut arch = ContinuousArchiver::new();
-    arch.archive_segment(WalSegment { end_offset: 0, committed_at: 0 }).unwrap();
+    arch.archive_segment(WalSegment {
+        end_offset: 0,
+        committed_at: 0,
+    })
+    .unwrap();
     arch.take_base_backup(1);
-    arch.archive_segment(WalSegment { end_offset: tail, committed_at: 10 }).unwrap();
+    arch.archive_segment(WalSegment {
+        end_offset: tail,
+        committed_at: 10,
+    })
+    .unwrap();
     arch
 }
 
 fn live_kms() -> KmsEngine {
     let kms = KmsEngine::new();
     kms.ensure_kek(&KekId::new(TenantId::from_token("acme"), region()));
-    kms.ensure_dek(&TenantId::from_token("acme"), &region(), KeyClass::Tenant).unwrap();
+    kms.ensure_dek(&TenantId::from_token("acme"), &region(), KeyClass::Tenant)
+        .unwrap();
     kms
 }
 
@@ -89,7 +102,11 @@ fn cp_d6_no_traffic_to_an_unverified_cell() {
 
     // A CORRUPT restore: a row references a blob the restore did not bring back (a dangling ref).
     let missing = ContentHash::blake3(b"never-restored");
-    let corrupt_rows = vec![WalRow { id: "corrupt".into(), written_at: 90, blob_ref: Some(missing) }];
+    let corrupt_rows = vec![WalRow {
+        id: "corrupt".into(),
+        written_at: 90,
+        blob_ref: Some(missing),
+    }];
     let no_objects: Vec<RestoredObject> = vec![];
     let source = SourceLog::new();
     let kms = live_kms();
@@ -105,21 +122,39 @@ fn cp_d6_no_traffic_to_an_unverified_cell() {
         erasure_ledger: &ledger,
     };
 
-    let red = gate.provision_cell(&mut reg, &cell_id, &red_inputs, &ready_surface(), &mut signals);
-    assert!(!red.is_active(), "a cell with an unwhole backup must NOT go Active (the gate is RED)");
+    let red = gate.provision_cell(
+        &mut reg,
+        &cell_id,
+        &red_inputs,
+        &ready_surface(),
+        &mut signals,
+    );
     assert!(
-        matches!(red.failure(), Some(ProvisionFailure::RestoreVerifyFailed { .. })),
+        !red.is_active(),
+        "a cell with an unwhole backup must NOT go Active (the gate is RED)"
+    );
+    assert!(
+        matches!(
+            red.failure(),
+            Some(ProvisionFailure::RestoreVerifyFailed { .. })
+        ),
         "the failure names restore-verify (the silent-data-loss floor): {red:?}"
     );
     // The cell stayed `provisioning` — and `place` cannot route to it.
     assert_eq!(reg.cell(&cell_id).unwrap().status, CellStatus::Provisioning);
     let placer = PlacementService::new(CounterMinter::new());
     assert!(
-        placer.place(&mut reg, &region(), IsolationKind::Pool, "acme").is_err(),
+        placer
+            .place(&mut reg, &region(), IsolationKind::Pool, "acme")
+            .is_err(),
         "place refuses an unverified (Provisioning) cell — no traffic"
     );
     // The headline CP-D6 zero: 0 tenants placed on the unverified cell.
-    assert_eq!(reg.placement_count(), 0, "0 tenants placed on the unverified cell");
+    assert_eq!(
+        reg.placement_count(),
+        0,
+        "0 tenants placed on the unverified cell"
+    );
     assert_eq!(ProvisioningGate::tenants_on_unverified_cells(&reg), 0);
 
     // ── GREEN leg: the same cell, now with a WHOLE backup + readiness, ACTIVATES. ──
@@ -141,9 +176,20 @@ fn cp_d6_no_traffic_to_an_unverified_cell() {
         erasure_ledger: &ledger,
     };
 
-    let green = gate.provision_cell(&mut reg, &cell_id, &green_inputs, &ready_surface(), &mut signals);
-    assert!(green.is_active(), "a whole + ready cell ACTIVATES (the gate is GREEN)");
-    let artifact = green.green_artifact().expect("the restore-verify green artifact is carried");
+    let green = gate.provision_cell(
+        &mut reg,
+        &cell_id,
+        &green_inputs,
+        &ready_surface(),
+        &mut signals,
+    );
+    assert!(
+        green.is_active(),
+        "a whole + ready cell ACTIVATES (the gate is GREEN)"
+    );
+    let artifact = green
+        .green_artifact()
+        .expect("the restore-verify green artifact is carried");
     assert_eq!(artifact.restored_to_offset, 100);
     assert_eq!(artifact.checksum_mismatches, 0);
     assert_eq!(artifact.cross_seam_mismatches, 0);
@@ -168,10 +214,18 @@ fn cp_d6_no_traffic_to_an_unverified_cell() {
     // of the pass, EI-01 §3). The restore-verify cross-seam mismatch is 0 (the green leg) and the
     // cell's readiness gauge is 1 (it passed the readiness probe). ──
     let mut sig = SignalSource::new();
-    sig.set_scalar(SignalName::RestoreCrossSeamMismatch, artifact.cross_seam_mismatches as i64);
-    sig.assert_signal(SignalName::RestoreCrossSeamMismatch, Predicate::Eq(0)).expect_green();
-    sig.set_scalar(SignalName::Readiness, ready_surface().readiness().verdict.gauge());
-    sig.assert_signal(SignalName::Readiness, Predicate::Eq(1)).expect_green();
+    sig.set_scalar(
+        SignalName::RestoreCrossSeamMismatch,
+        artifact.cross_seam_mismatches as i64,
+    );
+    sig.assert_signal(SignalName::RestoreCrossSeamMismatch, Predicate::Eq(0))
+        .expect_green();
+    sig.set_scalar(
+        SignalName::Readiness,
+        ready_surface().readiness().verdict.gauge(),
+    );
+    sig.assert_signal(SignalName::Readiness, Predicate::Eq(1))
+        .expect_green();
 
     println!(
         "[P-083 CP-D6 GREEN 2026-06-19] cell-provisioning gating: a fresh cell stays `provisioning` \
@@ -201,8 +255,13 @@ fn cp_d6_decommission_crypto_shreds_the_kek() {
     let tenant = TenantId::from_token("acme");
     let kms = KmsEngine::new();
     kms.ensure_kek(&KekId::new(tenant.clone(), region()));
-    let key_ref = kms.ensure_dek(&tenant, &region(), KeyClass::Tenant).unwrap();
-    assert!(kms.resolve_dek(&key_ref, &region()).is_ok(), "the DEK resolves while the tenant is live");
+    let key_ref = kms
+        .ensure_dek(&tenant, &region(), KeyClass::Tenant)
+        .unwrap();
+    assert!(
+        kms.resolve_dek(&key_ref, &region()).is_ok(),
+        "the DEK resolves while the tenant is live"
+    );
 
     let mut signals = ProvisioningSignals::default();
     assert!(

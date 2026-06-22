@@ -26,7 +26,11 @@ use myelin_events::{ConsumerName, DedupLedger, EventId, CONSUMER_DEDUP_MIGRATION
 /// `(consumer, event_id)` dedup fact, returning whether the handle was the FRESH one (it should
 /// run the effect) or a DUPLICATE (a redelivery — skip). This is the `INSERT … ON CONFLICT DO
 /// NOTHING` primitive.
-fn provider_record_handled(ledger: &DedupLedger, consumer: &ConsumerName, event_id: &EventId) -> bool {
+fn provider_record_handled(
+    ledger: &DedupLedger,
+    consumer: &ConsumerName,
+    event_id: &EventId,
+) -> bool {
     ledger.mark_handled(consumer, event_id)
 }
 
@@ -48,17 +52,33 @@ fn cdc_2_5_same_pair_inserted_twice_is_one_effect() {
     let id = EventId("01J-1".into());
 
     // Before any handle, the consumer side sees "not handled" → it WOULD run the handler.
-    assert!(!consumer_should_skip(&ledger, &consumer, &id), "nothing handled yet");
+    assert!(
+        !consumer_should_skip(&ledger, &consumer, &id),
+        "nothing handled yet"
+    );
 
     // Provider records the first handle: FRESH → the effect runs exactly this once.
-    assert!(provider_record_handled(&ledger, &consumer, &id), "first handle is FRESH");
+    assert!(
+        provider_record_handled(&ledger, &consumer, &id),
+        "first handle is FRESH"
+    );
 
     // The consumer side now reads "already handled" → it skips on a redelivery.
-    assert!(consumer_should_skip(&ledger, &consumer, &id), "the pair is now handled → skip redelivery");
+    assert!(
+        consumer_should_skip(&ledger, &consumer, &id),
+        "the pair is now handled → skip redelivery"
+    );
 
     // A second provider record of the SAME pair is a DUPLICATE (ON CONFLICT DO NOTHING).
-    assert!(!provider_record_handled(&ledger, &consumer, &id), "redelivery is a DUPLICATE");
-    assert_eq!(ledger.len(), 1, "exactly ONE (consumer, event_id) row — one effect");
+    assert!(
+        !provider_record_handled(&ledger, &consumer, &id),
+        "redelivery is a DUPLICATE"
+    );
+    assert_eq!(
+        ledger.len(),
+        1,
+        "exactly ONE (consumer, event_id) row — one effect"
+    );
 }
 
 /// **CDC 2.5 — the consumer dimension of the PK.** The SAME `event_id` recorded by TWO distinct
@@ -73,13 +93,28 @@ fn cdc_2_5_two_consumers_record_the_same_event_independently() {
     let id = EventId("01J-1".into());
 
     // Each consumer's first handle of the shared event is FRESH (different PK).
-    assert!(provider_record_handled(&ledger, &a, &id), "fresh for consumer A");
-    assert!(provider_record_handled(&ledger, &b, &id), "ALSO fresh for consumer B (different PK)");
+    assert!(
+        provider_record_handled(&ledger, &a, &id),
+        "fresh for consumer A"
+    );
+    assert!(
+        provider_record_handled(&ledger, &b, &id),
+        "ALSO fresh for consumer B (different PK)"
+    );
 
     // A redelivery to either consumer is a duplicate; a THIRD consumer has not handled it.
-    assert!(!provider_record_handled(&ledger, &a, &id), "redelivery to A is a duplicate");
-    assert!(!provider_record_handled(&ledger, &b, &id), "redelivery to B is a duplicate");
-    assert!(!consumer_should_skip(&ledger, &ConsumerName("auditor".into()), &id), "C has not handled it");
+    assert!(
+        !provider_record_handled(&ledger, &a, &id),
+        "redelivery to A is a duplicate"
+    );
+    assert!(
+        !provider_record_handled(&ledger, &b, &id),
+        "redelivery to B is a duplicate"
+    );
+    assert!(
+        !consumer_should_skip(&ledger, &ConsumerName("auditor".into()), &id),
+        "C has not handled it"
+    );
     assert_eq!(ledger.len(), 2, "two distinct (consumer, event_id) rows");
 }
 
@@ -96,7 +131,13 @@ fn cdc_2_5_migration_is_the_frozen_pk_shape() {
         "the PK is the (consumer, event_id) PAIR — the consumer dimension is contractual"
     );
     for col in ["consumer", "event_id", "recorded_at"] {
-        assert!(CONSUMER_DEDUP_MIGRATION.contains(col), "missing contractual column {col}");
+        assert!(
+            CONSUMER_DEDUP_MIGRATION.contains(col),
+            "missing contractual column {col}"
+        );
     }
-    assert!(!CONSUMER_DEDUP_MIGRATION.contains("DROP TABLE"), "forward-only: no destructive down");
+    assert!(
+        !CONSUMER_DEDUP_MIGRATION.contains("DROP TABLE"),
+        "forward-only: no destructive down"
+    );
 }

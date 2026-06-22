@@ -418,10 +418,20 @@ mod tests {
             RunTokenLease::DEFAULT_TTL_SECS,
             "the re-mint is SHORT-LIVED (the fail-static W), not the days-long workflow life"
         );
-        assert!(handle.ttl_secs > 0, "a token must live for some positive activity burst");
+        assert!(
+            handle.ttl_secs > 0,
+            "a token must live for some positive activity burst"
+        );
         // far shorter than even an hour — let alone a multi-day wait.
-        assert!(handle.ttl_secs <= 3600, "the activity-life TTL is far shorter than a multi-day wait");
-        assert_eq!(m.calls.load(Ordering::SeqCst), 1, "exactly one mint per resume");
+        assert!(
+            handle.ttl_secs <= 3600,
+            "the activity-life TTL is far shorter than a multi-day wait"
+        );
+        assert_eq!(
+            m.calls.load(Ordering::SeqCst),
+            1,
+            "exactly one mint per resume"
+        );
     }
 
     /// **The re-minted token is ATTENUATED to the run's scope (property 2, §6.2).** The mint carries
@@ -437,7 +447,10 @@ mod tests {
         ctx.remint_on_resume().expect("re-mint");
         let last = m.last.lock().unwrap().clone().expect("a mint was recorded");
         let (agent_id, run_id, caveats, _ttl) = last;
-        assert_eq!(agent_id, "agent://acme/agent/triage", "minted for the run's agent");
+        assert_eq!(
+            agent_id, "agent://acme/agent/triage",
+            "minted for the run's agent"
+        );
         assert_eq!(run_id, "R1", "minted for THIS run");
         assert!(
             caveats.0.contains(&"run:R1".to_string()),
@@ -462,10 +475,23 @@ mod tests {
         let mut ctx = begin_with(&outbox, journal, lease(m.clone()));
         assert_eq!(m.calls.load(Ordering::SeqCst), 0, "no token minted yet");
 
-        let handle = ctx.remint_on_resume().expect("re-mint even with no prior token");
-        assert_eq!(handle.token, "tok-R1-0", "a fresh token was minted from scratch");
-        assert_eq!(m.calls.load(Ordering::SeqCst), 1, "the resume re-minted unconditionally");
-        assert_eq!(ctx.reminted_tokens(), 1, "the re-mint probe counts one fresh token");
+        let handle = ctx
+            .remint_on_resume()
+            .expect("re-mint even with no prior token");
+        assert_eq!(
+            handle.token, "tok-R1-0",
+            "a fresh token was minted from scratch"
+        );
+        assert_eq!(
+            m.calls.load(Ordering::SeqCst),
+            1,
+            "the resume re-minted unconditionally"
+        );
+        assert_eq!(
+            ctx.reminted_tokens(),
+            1,
+            "the re-mint probe counts one fresh token"
+        );
     }
 
     /// **Two resumes mint two DISTINCT short-lived tokens (token life == activity life).** Each
@@ -479,9 +505,16 @@ mod tests {
 
         let h1 = ctx.remint_on_resume().expect("first resume");
         let h2 = ctx.remint_on_resume().expect("second resume");
-        assert_ne!(h1.token, h2.token, "each resume mints a DISTINCT fresh token (not the prior one)");
+        assert_ne!(
+            h1.token, h2.token,
+            "each resume mints a DISTINCT fresh token (not the prior one)"
+        );
         assert_ne!(h1.jti, h2.jti, "distinct jti per re-mint");
-        assert_eq!(ctx.reminted_tokens(), 2, "two fresh tokens across two activity bursts");
+        assert_eq!(
+            ctx.reminted_tokens(),
+            2,
+            "two fresh tokens across two activity bursts"
+        );
     }
 
     /// **A `WfCtx` with NO run-identity refuses to re-mint LOUD (never a silent run under no token,
@@ -559,8 +592,15 @@ mod tests {
         .expect("activity after re-mint");
         ctx.commit().expect("co-commit");
         let hist = journal.history_for(&tenant(), "R1");
-        assert_eq!(hist.len(), 1, "one history row (the activity) — the re-mint journaled nothing");
-        assert_eq!(hist[0].command_id, "agent.run:0", "the activity is at :0 — the re-mint consumed no command");
+        assert_eq!(
+            hist.len(),
+            1,
+            "one history row (the activity) — the re-mint journaled nothing"
+        );
+        assert_eq!(
+            hist[0].command_id, "agent.run:0",
+            "the activity is at :0 — the re-mint consumed no command"
+        );
     }
 
     /// **`with_ttl_secs` overrides the TTL bound; a 0 is clamped to a live 1 (never a dead-on-arrival
@@ -572,6 +612,10 @@ mod tests {
         assert_eq!(l.ttl_secs(), 60, "the TTL override holds");
         let m2 = Arc::new(RecordingMinter::default());
         let l0 = lease(m2).with_ttl_secs(0);
-        assert_eq!(l0.ttl_secs(), 1, "a 0 TTL is clamped to a live 1 (never dead-on-arrival)");
+        assert_eq!(
+            l0.ttl_secs(),
+            1,
+            "a 0 TTL is clamped to a live 1 (never dead-on-arrival)"
+        );
     }
 }

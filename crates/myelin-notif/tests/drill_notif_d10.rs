@@ -28,8 +28,8 @@
 //! observed lag, not a claimed one.
 
 use myelin_events::{
-    Actor, AggregateKey, ArtifactRef, ConsumerName, CorrelationId, DataRole, DedupLedger, Delivered,
-    EventEnvelope, EventId, EventType, Message, OutboxStore, Timestamp, Visibility,
+    Actor, AggregateKey, ArtifactRef, ConsumerName, CorrelationId, DataRole, DedupLedger,
+    Delivered, EventEnvelope, EventId, EventType, Message, OutboxStore, Timestamp, Visibility,
 };
 use myelin_harness::telemetry::{Label, Predicate, SignalName, SignalSource};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
@@ -44,7 +44,11 @@ fn region() -> Region {
     Region("fr-par".into())
 }
 fn principal() -> Principal {
-    Principal::stub(PrincipalId("p-opaque-1".into()), PrincipalKind::Human, tenant())
+    Principal::stub(
+        PrincipalId("p-opaque-1".into()),
+        PrincipalKind::Human,
+        tenant(),
+    )
 }
 
 /// A curated Signal (the shape the engine, P-138, publishes), carried in a `sig.<tenant>.…` event.
@@ -63,7 +67,12 @@ fn signal(rule: &str, severity: Severity, subject: &str, dedup: &str) -> Signal 
 }
 
 fn signal_envelope(id: &str, sig: &Signal, payload: serde_json::Value) -> EventEnvelope {
-    let subject = format!("sig.{}.{}.{}", sig.tenant.0, sig.severity.token(), sig.rule_id.0);
+    let subject = format!(
+        "sig.{}.{}.{}",
+        sig.tenant.0,
+        sig.severity.token(),
+        sig.rule_id.0
+    );
     EventEnvelope {
         event_id: EventId(id.into()),
         type_: EventType("signal.opened".into()),
@@ -89,7 +98,10 @@ fn signal_envelope(id: &str, sig: &Signal, payload: serde_json::Value) -> EventE
 
 fn good_msg(id: &str, sig: &Signal) -> Message {
     let env = signal_envelope(id, sig, serde_json::to_value(sig).unwrap());
-    Message { subject: env.subject.0.clone(), envelope: env }
+    Message {
+        subject: env.subject.0.clone(),
+        envelope: env,
+    }
 }
 
 /// **NOTIF-D10: 0 head-of-line stalls + the lag-alarm reads a bounded lag (the dated green).**
@@ -105,33 +117,84 @@ fn notif_d10_poison_signal_no_stall_lag_bounded() {
         subject: "sig.acme.error.broken_rule".into(),
         envelope: signal_envelope(
             "evt-poison",
-            &signal("broken_rule", Severity::Error, "myelin://acme/ci/run/0", "k"),
+            &signal(
+                "broken_rule",
+                Severity::Error,
+                "myelin://acme/ci/run/0",
+                "k",
+            ),
             serde_json::json!({ "this": "is not a curated Signal" }),
         ),
     };
 
     // Three GOOD Signals on sibling subjects (distinct runs → distinct inbox rows).
     let goods = [
-        good_msg("evt-g1", &signal("ci_run_failed", Severity::Error, "myelin://acme/ci/run/1", "run-1")),
-        good_msg("evt-g2", &signal("ci_run_failed", Severity::Error, "myelin://acme/ci/run/2", "run-2")),
-        good_msg("evt-g3", &signal("review_requested", Severity::Warning, "myelin://acme/git/pr/9", "pr-9")),
+        good_msg(
+            "evt-g1",
+            &signal(
+                "ci_run_failed",
+                Severity::Error,
+                "myelin://acme/ci/run/1",
+                "run-1",
+            ),
+        ),
+        good_msg(
+            "evt-g2",
+            &signal(
+                "ci_run_failed",
+                Severity::Error,
+                "myelin://acme/ci/run/2",
+                "run-2",
+            ),
+        ),
+        good_msg(
+            "evt-g3",
+            &signal(
+                "review_requested",
+                Severity::Warning,
+                "myelin://acme/git/pr/9",
+                "pr-9",
+            ),
+        ),
     ];
 
     // (1) The poison terminates IMMEDIATELY (dead-letter, rule 5) — not a Retry, not a stall.
     let out = consumer.deliver(&poison);
-    assert!(matches!(out, Delivered::DeadLettered(_)), "the poison terminated (NonRetryable)");
-    assert_eq!(consumer.dead_letters().len(), 1, "the poison is SURFACED, not silently dropped");
+    assert!(
+        matches!(out, Delivered::DeadLettered(_)),
+        "the poison terminated (NonRetryable)"
+    );
+    assert_eq!(
+        consumer.dead_letters().len(),
+        1,
+        "the poison is SURFACED, not silently dropped"
+    );
 
     // (2) Every GOOD Signal on a sibling subject still routes — 0 head-of-line stalls.
     let mut routed = 0;
     for g in &goods {
-        assert_eq!(consumer.deliver(g), Delivered::Acked, "a good Signal is not head-of-line-blocked");
+        assert_eq!(
+            consumer.deliver(g),
+            Delivered::Acked,
+            "a good Signal is not head-of-line-blocked"
+        );
         routed += 1;
     }
-    assert_eq!(routed, 3, "all three good Signals routed past the poison (0 stalls)");
-    assert_eq!(inbox.len(), 3, "three distinct inbox rows UPSERTed (the poison wrote none)");
+    assert_eq!(
+        routed, 3,
+        "all three good Signals routed past the poison (0 stalls)"
+    );
+    assert_eq!(
+        inbox.len(),
+        3,
+        "three distinct inbox rows UPSERTed (the poison wrote none)"
+    );
     // The poison emitted nothing; the three good Signals each emitted one notif.item.created.
-    assert_eq!(outbox.committed_count(), 3, "3 emits (the poison did not emit — not a half-write)");
+    assert_eq!(
+        outbox.committed_count(),
+        3,
+        "3 emits (the poison did not emit — not a half-write)"
+    );
 
     // (3) Read the consumer-lag survival signal off the LIVE consumer (observability is part of the
     // pass, §3.3 / EI-01 §3) and ASSERT it through the harness telemetry-assertion library. The lag
@@ -154,7 +217,11 @@ fn notif_d10_poison_signal_no_stall_lag_bounded() {
     .expect_green();
 
     // Belt: the runtime's own lag accessor agrees (0 head-of-line stalls).
-    assert_eq!(consumer.lag(), 0, "NOTIF-D10: 0 head-of-line stalls; lag recovered to 0");
+    assert_eq!(
+        consumer.lag(),
+        0,
+        "NOTIF-D10: 0 head-of-line stalls; lag recovered to 0"
+    );
     assert_eq!(consumer.name(), &ConsumerName(ROUTER_CONSUMER_NAME.into()));
 }
 
@@ -176,5 +243,8 @@ fn notif_d10_lag_alarm_fires_on_a_real_stall() {
         vec![Label::new("consumer", ROUTER_CONSUMER_NAME)],
         Predicate::Lte(0),
     );
-    assert!(!verdict.is_green(), "lag=1 against `<= 0` is RED — the lag-alarm fires on a real stall");
+    assert!(
+        !verdict.is_green(),
+        "lag=1 against `<= 0` is RED — the lag-alarm fires on a real stall"
+    );
 }

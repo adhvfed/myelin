@@ -188,7 +188,10 @@ impl CriticalDependencies {
     /// Declare the critical set from a list of names.
     pub fn new(names: impl IntoIterator<Item = impl Into<String>>) -> CriticalDependencies {
         CriticalDependencies {
-            deps: names.into_iter().map(|n| CriticalDependency::new(n)).collect(),
+            deps: names
+                .into_iter()
+                .map(|n| CriticalDependency::new(n))
+                .collect(),
         }
     }
 
@@ -234,13 +237,20 @@ impl HealthTable {
 
     /// Restore a dependency to up (model the outage healing).
     pub fn mark_up(&self, name: &str) {
-        self.down.lock().unwrap_or_else(|e| e.into_inner()).remove(name);
+        self.down
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name);
     }
 }
 
 impl DependencyHealth for HealthTable {
     fn is_up(&self, dep: &CriticalDependency) -> bool {
-        !self.down.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&dep.0)
+        !self
+            .down
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&dep.0)
     }
 }
 
@@ -422,12 +432,26 @@ mod tests {
         // before mark_started: booting.
         assert_eq!(s.startup(), Startup::Booting);
         let r = s.readiness();
-        assert_eq!(r.verdict, Readiness::NotReady, "an incompletely-booted instance is not-ready");
-        assert!(r.startup_incomplete, "the not-ready reason names the startup gate");
+        assert_eq!(
+            r.verdict,
+            Readiness::NotReady,
+            "an incompletely-booted instance is not-ready"
+        );
+        assert!(
+            r.startup_incomplete,
+            "the not-ready reason names the startup gate"
+        );
         assert!(r.sheds(), "a not-ready instance sheds new traffic");
         // NOT killed: liveness is Up (a slow boot must not be mistaken for a wedge).
-        assert_eq!(s.liveness(), Liveness::Up, "startup is not-killed: liveness stays Up");
-        assert!(!s.liveness().should_restart(), "the orchestrator must not restart a booting instance");
+        assert_eq!(
+            s.liveness(),
+            Liveness::Up,
+            "startup is not-killed: liveness stays Up"
+        );
+        assert!(
+            !s.liveness().should_restart(),
+            "the orchestrator must not restart a booting instance"
+        );
     }
 
     /// After boot completes with every critical dependency up, the instance is Ready.
@@ -436,10 +460,18 @@ mod tests {
         let (s, _health) = surface(&["identity", "storage"]);
         s.mark_started();
         let r = s.readiness();
-        assert_eq!(r.verdict, Readiness::Ready, "booted + all critical deps up → ready");
+        assert_eq!(
+            r.verdict,
+            Readiness::Ready,
+            "booted + all critical deps up → ready"
+        );
         assert!(r.is_ready());
         assert!(r.down_critical.is_empty(), "nothing down");
-        assert_eq!(r.verdict.gauge(), 1, "the readiness gauge reads 1 when ready");
+        assert_eq!(
+            r.verdict.gauge(),
+            1,
+            "the readiness gauge reads 1 when ready"
+        );
     }
 
     /// **THE SUB-D9 core property — a severed critical dependency flips readiness to not-ready +
@@ -457,19 +489,41 @@ mod tests {
 
         // readiness FLIPS to not-ready + sheds, and names the down dependency.
         let r = s.readiness();
-        assert_eq!(r.verdict, Readiness::NotReady, "a dead critical dependency reports not-ready");
-        assert!(r.sheds(), "not-ready → shed new traffic (never serve healthy-but-failing)");
+        assert_eq!(
+            r.verdict,
+            Readiness::NotReady,
+            "a dead critical dependency reports not-ready"
+        );
+        assert!(
+            r.sheds(),
+            "not-ready → shed new traffic (never serve healthy-but-failing)"
+        );
         assert_eq!(
             r.down_critical,
             vec![CriticalDependency::new("identity")],
             "the report names the down critical dependency (observability is part of the pass)"
         );
-        assert_eq!(r.verdict.gauge(), 0, "the readiness gauge reads 0 when not-ready");
+        assert_eq!(
+            r.verdict.gauge(),
+            0,
+            "the readiness gauge reads 0 when not-ready"
+        );
 
         // liveness does NOT flip — the process is not wedged; restarting would not heal the dep.
-        assert_eq!(s.liveness(), Liveness::Up, "liveness must NOT check the dependency (§4.3)");
-        assert!(!s.liveness().should_restart(), "a dead dependency must NOT trigger a restart");
-        assert_eq!(s.liveness_restart_count(), 0, "no restart-storm: liveness churn stays 0");
+        assert_eq!(
+            s.liveness(),
+            Liveness::Up,
+            "liveness must NOT check the dependency (§4.3)"
+        );
+        assert!(
+            !s.liveness().should_restart(),
+            "a dead dependency must NOT trigger a restart"
+        );
+        assert_eq!(
+            s.liveness_restart_count(),
+            0,
+            "no restart-storm: liveness churn stays 0"
+        );
     }
 
     /// Readiness RECOVERS when the severed dependency heals (the outage lifting → ready again),
@@ -482,7 +536,11 @@ mod tests {
         assert_eq!(s.readiness().verdict, Readiness::NotReady);
         // heal the dependency.
         health.mark_up("identity");
-        assert_eq!(s.readiness().verdict, Readiness::Ready, "readiness recovers when the dep heals");
+        assert_eq!(
+            s.readiness().verdict,
+            Readiness::Ready,
+            "readiness recovers when the dep heals"
+        );
     }
 
     /// **Liveness does NOT check dependencies (§4.3) — the independence property.** Across a dead
@@ -498,17 +556,32 @@ mod tests {
         health.mark_down("identity");
         health.mark_down("storage");
         assert_eq!(s.readiness().verdict, Readiness::NotReady);
-        assert_eq!(s.liveness(), Liveness::Up, "two dead deps still leave liveness Up");
+        assert_eq!(
+            s.liveness(),
+            Liveness::Up,
+            "two dead deps still leave liveness Up"
+        );
 
         // a genuine wedge (the ONLY thing that flips liveness) → liveness Wedged, restart.
         s.liveness_state().mark_wedged();
-        assert_eq!(s.liveness(), Liveness::Wedged, "a real wedge flips liveness");
-        assert!(s.liveness().should_restart(), "a wedged process IS restarted");
+        assert_eq!(
+            s.liveness(),
+            Liveness::Wedged,
+            "a real wedge flips liveness"
+        );
+        assert!(
+            s.liveness().should_restart(),
+            "a wedged process IS restarted"
+        );
 
         // healing the deps does not un-wedge the process (the two are independent).
         health.mark_up("identity");
         health.mark_up("storage");
-        assert_eq!(s.liveness(), Liveness::Wedged, "liveness is independent of dependency health");
+        assert_eq!(
+            s.liveness(),
+            Liveness::Wedged,
+            "liveness is independent of dependency health"
+        );
     }
 
     /// A NON-critical dependency being down does NOT flip readiness (only the declared *critical*
@@ -536,10 +609,18 @@ mod tests {
         // an outage does NOT increment the restart count.
         health.mark_down("identity");
         let _ = s.readiness();
-        assert_eq!(s.liveness_restart_count(), 0, "a dependency outage causes no restart");
+        assert_eq!(
+            s.liveness_restart_count(),
+            0,
+            "a dependency outage causes no restart"
+        );
         // a genuine wedge-restart increments it.
         s.liveness_state().mark_wedged();
         assert_eq!(s.record_liveness_restart(), 1);
-        assert_eq!(s.liveness_restart_count(), 1, "a real wedge-restart is counted");
+        assert_eq!(
+            s.liveness_restart_count(),
+            1,
+            "a real wedge-restart is counted"
+        );
     }
 }

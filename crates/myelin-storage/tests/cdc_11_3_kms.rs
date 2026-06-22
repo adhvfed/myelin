@@ -22,7 +22,7 @@
 //! KeyOrigin-trait consumer (the index-builder consulting `can_derive_plaintext_index`) to the
 //! same row.
 
-use myelin_storage::{DekId, KeyClass, KekId, KmsEngine, PiiKeyRef};
+use myelin_storage::{DekId, KekId, KeyClass, KmsEngine, PiiKeyRef};
 use myelin_tenancy::{Region, TenantId};
 
 /// A consumer of 11.3: an OLTP-style store that keeps a per-subject-encrypted free-text column
@@ -41,7 +41,12 @@ impl<'a> EncryptedProfileStore<'a> {
         // The tenant's KEK must exist before any encrypted store can wrap a DEK (the harness
         // provisions it at cell-onboard; here we ensure it explicitly).
         kms.ensure_kek(&KekId::new(tenant.clone(), region.clone()));
-        EncryptedProfileStore { kms, tenant, region, rows: Default::default() }
+        EncryptedProfileStore {
+            kms,
+            tenant,
+            region,
+            rows: Default::default(),
+        }
     }
 
     /// Write a subject's bio: ensure the per-subject DEK (11.3), seal the value, persist the
@@ -49,9 +54,16 @@ impl<'a> EncryptedProfileStore<'a> {
     fn write_bio(&mut self, subject: &str, bio: &[u8]) {
         let key_ref = self
             .kms
-            .ensure_dek(&self.tenant, &self.region, KeyClass::Subject(subject.into()))
+            .ensure_dek(
+                &self.tenant,
+                &self.region,
+                KeyClass::Subject(subject.into()),
+            )
             .expect("provider: ensure per-subject DEK");
-        let dek = self.kms.resolve_dek(&key_ref, &self.region).expect("provider: resolve DEK");
+        let dek = self
+            .kms
+            .resolve_dek(&key_ref, &self.region)
+            .expect("provider: resolve DEK");
         let (nonce, ct) = dek.seal(bio);
         self.rows.insert(subject.into(), (key_ref, nonce, ct));
     }
@@ -80,8 +92,14 @@ fn cdc_11_3_encrypted_store_wraps_and_unwraps_through_the_kms() {
     store.write_bio("bob", b"Bob's free-text bio with PII");
 
     // Both round-trip through resolve+open (the wrap→unwrap contract).
-    assert_eq!(store.read_bio("alice").as_deref(), Some(&b"Alice's free-text bio with PII"[..]));
-    assert_eq!(store.read_bio("bob").as_deref(), Some(&b"Bob's free-text bio with PII"[..]));
+    assert_eq!(
+        store.read_bio("alice").as_deref(),
+        Some(&b"Alice's free-text bio with PII"[..])
+    );
+    assert_eq!(
+        store.read_bio("bob").as_deref(),
+        Some(&b"Bob's free-text bio with PII"[..])
+    );
 
     // The persisted ref is the frozen §4 shape `kms://<tenant>/<epoch>/subject:<id>`.
     let (alice_ref, _, _) = &store.rows["alice"];
@@ -89,11 +107,18 @@ fn cdc_11_3_encrypted_store_wraps_and_unwraps_through_the_kms() {
 
     // The GD-4 individual-erasure lever the consumer (DSR) calls: crypto-shred ONLY alice's DEK.
     let alice_dek = DekId::new(tenant, KeyClass::Subject("alice".into()));
-    assert!(kms.destroy_dek(&alice_dek), "provider: per-subject DEK present to shred");
+    assert!(
+        kms.destroy_dek(&alice_dek),
+        "provider: per-subject DEK present to shred"
+    );
 
     // alice's bio is now unrecoverable (loud None); bob's is untouched — the contract the DSR
     // orchestrator depends on (one person's Art. 17 erasure, the tenant + others intact).
-    assert_eq!(store.read_bio("alice"), None, "11.3: crypto-shred makes the column unrecoverable");
+    assert_eq!(
+        store.read_bio("alice"),
+        None,
+        "11.3: crypto-shred makes the column unrecoverable"
+    );
     assert_eq!(
         store.read_bio("bob").as_deref(),
         Some(&b"Bob's free-text bio with PII"[..]),

@@ -238,11 +238,26 @@ mod tests {
     fn create_edge_table_ddl_is_the_3_2_shape() {
         let ddl = CREATE_EDGE_TABLE_DDL;
         for col in [
-            "tenant_id", "region", "edge_id", "source", "source_root", "target", "target_root",
-            "rel ", "rel_class", "origin_event", "origin_actor", "created_at", "zookie",
-            "tombstoned", "dek_ref",
+            "tenant_id",
+            "region",
+            "edge_id",
+            "source",
+            "source_root",
+            "target",
+            "target_root",
+            "rel ",
+            "rel_class",
+            "origin_event",
+            "origin_actor",
+            "created_at",
+            "zookie",
+            "tombstoned",
+            "dek_ref",
         ] {
-            assert!(ddl.contains(col), "the §3.2 edge column `{col}` is declared in the DDL");
+            assert!(
+                ddl.contains(col),
+                "the §3.2 edge column `{col}` is declared in the DDL"
+            );
         }
         // tenant-first primary key (the tenant-predicate floor: every key is tenant-first).
         assert!(
@@ -263,19 +278,38 @@ mod tests {
     #[test]
     fn the_three_indexes_carry_their_where_predicates() {
         let by_name = |n: &str| {
-            CREATE_EDGE_INDEXES_DDL.iter().find(|(name, _)| *name == n).map(|(_, ddl)| *ddl).unwrap()
+            CREATE_EDGE_INDEXES_DDL
+                .iter()
+                .find(|(name, _)| *name == n)
+                .map(|(_, ddl)| *ddl)
+                .unwrap()
         };
         // edge_inbound: tenant-first, target_root, live edges only.
         let inbound = by_name(EDGE_INBOUND_INDEX);
-        assert!(inbound.contains("(tenant_id, target_root)"), "edge_inbound keys (tenant_id, target_root)");
-        assert!(inbound.contains("WHERE NOT tombstoned"), "edge_inbound is live-edges-only (§3.2)");
+        assert!(
+            inbound.contains("(tenant_id, target_root)"),
+            "edge_inbound keys (tenant_id, target_root)"
+        );
+        assert!(
+            inbound.contains("WHERE NOT tombstoned"),
+            "edge_inbound is live-edges-only (§3.2)"
+        );
         // edge_outbound: tenant-first, source_root, no predicate (the C-4 filter column).
         let outbound = by_name(EDGE_OUTBOUND_INDEX);
-        assert!(outbound.contains("(tenant_id, source_root)"), "edge_outbound keys (tenant_id, source_root)");
-        assert!(!outbound.contains("WHERE"), "edge_outbound has no partial predicate (§3.2)");
+        assert!(
+            outbound.contains("(tenant_id, source_root)"),
+            "edge_outbound keys (tenant_id, source_root)"
+        );
+        assert!(
+            !outbound.contains("WHERE"),
+            "edge_outbound has no partial predicate (§3.2)"
+        );
         // edge_by_rel: tenant-first, (target_root, rel), lifecycle-class only (the TE-7 seam).
         let by_rel = by_name(EDGE_BY_REL_INDEX);
-        assert!(by_rel.contains("(tenant_id, target_root, rel)"), "edge_by_rel keys (tenant_id, target_root, rel)");
+        assert!(
+            by_rel.contains("(tenant_id, target_root, rel)"),
+            "edge_by_rel keys (tenant_id, target_root, rel)"
+        );
         assert!(
             by_rel.contains("WHERE rel_class = 'lifecycle'"),
             "edge_by_rel is lifecycle-class only (the TE-7 traversal index, §3.2)"
@@ -302,20 +336,40 @@ mod tests {
     #[test]
     fn the_edge_migration_is_forward_only() {
         let migrations = edge_table_migrations();
-        assert_eq!(migrations.0.len(), 1, "one forward migration: create the edge schema");
+        assert_eq!(
+            migrations.0.len(),
+            1,
+            "one forward migration: create the edge schema"
+        );
         let m = &migrations.0[0];
         assert_eq!(m.id, EDGE_MIGRATION_ID);
         assert_eq!(m.table, Some(EDGE_TABLE));
-        assert_eq!(m.phase, MigrationPhase::Plain, "a CREATE TABLE is a plain forward migration");
+        assert_eq!(
+            m.phase,
+            MigrationPhase::Plain,
+            "a CREATE TABLE is a plain forward migration"
+        );
         // forward-only: no destructive DROP anywhere in the assembled DDL.
-        assert!(edge_ddl_is_forward_only(m.ddl), "the edge migration is forward-only (no DROP)");
-        assert!(!m.ddl.to_ascii_uppercase().contains("DROP"), "no DROP in the edge migration");
+        assert!(
+            edge_ddl_is_forward_only(m.ddl),
+            "the edge migration is forward-only (no DROP)"
+        );
+        assert!(
+            !m.ddl.to_ascii_uppercase().contains("DROP"),
+            "no DROP in the edge migration"
+        );
         // the assembled DDL carries the create + all three indexes + the RLS scoping.
-        assert!(m.ddl.contains("CREATE TABLE IF NOT EXISTS edge"), "the create-table rides the migration");
+        assert!(
+            m.ddl.contains("CREATE TABLE IF NOT EXISTS edge"),
+            "the create-table rides the migration"
+        );
         for (name, _) in CREATE_EDGE_INDEXES_DDL {
             assert!(m.ddl.contains(name), "index `{name}` rides the migration");
         }
-        assert!(m.ddl.contains("myelin_make_tenant_scoped('edge')"), "the RLS scoping rides the migration");
+        assert!(
+            m.ddl.contains("myelin_make_tenant_scoped('edge')"),
+            "the RLS scoping rides the migration"
+        );
     }
 
     /// **The migration RUNNER admits the edge migration forward-only at boot (contract 1.5).** The
@@ -327,8 +381,14 @@ mod tests {
         let migrations = edge_table_migrations();
         let mut runner = MigrationRunner::new();
         // `edge` is NOT declared hot for the create-and-index migration (empty fresh table).
-        runner.run(&migrations, &HotTables::none()).expect("the edge schema migration applies forward-only");
-        assert_eq!(runner.applied(), &[EDGE_MIGRATION_ID], "the runner applied the edge migration");
+        runner
+            .run(&migrations, &HotTables::none())
+            .expect("the edge schema migration applies forward-only");
+        assert_eq!(
+            runner.applied(),
+            &[EDGE_MIGRATION_ID],
+            "the runner applied the edge migration"
+        );
     }
 
     /// **The runner REFUSES a destructive variant (forward-only is structural).** A hypothetical
@@ -339,8 +399,14 @@ mod tests {
         use myelin_substrate::{HotTables, Migration, MigrationRunner, Migrations};
         let bad = Migrations::of([Migration::plain("refs_9999_drop", "DROP TABLE edge")]);
         let mut runner = MigrationRunner::new();
-        let e = runner.run(&bad, &HotTables::none()).expect_err("a DROP must be refused");
-        assert!(e.0.contains("forward-only"), "the refusal names forward-only: {}", e.0);
+        let e = runner
+            .run(&bad, &HotTables::none())
+            .expect_err("a DROP must be refused");
+        assert!(
+            e.0.contains("forward-only"),
+            "the refusal names forward-only: {}",
+            e.0
+        );
     }
 
     /// **The table is RLS-ready — the migration calls the platform `myelin_make_tenant_scoped`
@@ -350,7 +416,10 @@ mod tests {
     #[test]
     fn the_edge_table_is_rls_on_and_tenant_region_partitioned() {
         // RLS: the migration installs the platform-wide isolation policy on `edge`.
-        assert_eq!(MAKE_EDGE_TENANT_SCOPED_DDL, "SELECT myelin_make_tenant_scoped('edge')");
+        assert_eq!(
+            MAKE_EDGE_TENANT_SCOPED_DDL,
+            "SELECT myelin_make_tenant_scoped('edge')"
+        );
         // (tenant, region)-partitioned: tenant_id + region are the first columns, the primary key is
         // tenant-first, the RLS policy binds (tenant_id, region).
         let ddl = CREATE_EDGE_TABLE_DDL;
@@ -358,7 +427,10 @@ mod tests {
         let region_pos = ddl.find("region").expect("region column");
         let edge_id_pos = ddl.find("edge_id").expect("edge_id column");
         assert!(tenant_pos < region_pos, "tenant_id is the FIRST column");
-        assert!(region_pos < edge_id_pos, "region is the SECOND column (the (tenant, region) prefix)");
+        assert!(
+            region_pos < edge_id_pos,
+            "region is the SECOND column (the (tenant, region) prefix)"
+        );
     }
 
     /// **The edge table is encrypted-from-birth under the per-tenant DEK (REF-P4, contract 11.3).**
@@ -368,13 +440,23 @@ mod tests {
     #[test]
     fn the_edge_table_is_encrypted_from_birth_under_the_per_tenant_dek() {
         // the table carries a per-row DEK ref column (no row is plaintext).
-        assert!(CREATE_EDGE_TABLE_DDL.contains("dek_ref"), "the edge table carries the per-row DEK ref");
+        assert!(
+            CREATE_EDGE_TABLE_DDL.contains("dek_ref"),
+            "the edge table carries the per-row DEK ref"
+        );
         // the DEK ref is the per-tenant DEK reserved in REF-P4 (the encrypted-from-birth anchor).
         let dek = RefsDekPin::new(Arc::new(KmsEngine::new()));
-        let key_ref = edge_table_dek_ref(&dek, &t(), &r()).expect("reserve the edge table per-tenant DEK");
-        assert_eq!(key_ref, "kms://acme/0/tenant", "the encrypted-from-birth per-tenant DEK ref (§3.7)");
+        let key_ref =
+            edge_table_dek_ref(&dek, &t(), &r()).expect("reserve the edge table per-tenant DEK");
+        assert_eq!(
+            key_ref, "kms://acme/0/tenant",
+            "the encrypted-from-birth per-tenant DEK ref (§3.7)"
+        );
         // it is the SAME ref the REF-P4 pin reserves (one hierarchy — not a second KMS).
         let direct = dek.reserve(&t(), &r()).expect("reserve directly").to_uri();
-        assert_eq!(key_ref, direct, "the edge table keys on the REF-P4 per-tenant DEK (one hierarchy)");
+        assert_eq!(
+            key_ref, direct,
+            "the edge table keys on the REF-P4 per-tenant DEK (one hierarchy)"
+        );
     }
 }

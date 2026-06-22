@@ -14,7 +14,8 @@
 //! through one harness, no per-subsystem drift.
 
 use myelin_events::{
-    HarnessError, PayloadShape, RegisteredToken, SubsystemTokenList, TaxonomyError, TokenListHarness,
+    HarnessError, PayloadShape, RegisteredToken, SubsystemTokenList, TaxonomyError,
+    TokenListHarness,
 };
 
 /// **PROVIDER side of 2.9 (a subsystem registers its completed list).** Git registers a
@@ -25,14 +26,28 @@ fn provider_subsystem_registers_its_completed_list_admitted_in_full() {
     let mut harness = TokenListHarness::new();
     let git = SubsystemTokenList::references_only(
         "git",
-        &["git.ref.updated", "git.pr.opened", "git.pr.merged", "git.repo.snapshot", "git.repo.erased"],
+        &[
+            "git.ref.updated",
+            "git.pr.opened",
+            "git.pr.merged",
+            "git.repo.snapshot",
+            "git.repo.erased",
+        ],
     );
-    assert_eq!(harness.register(&git).unwrap(), 5, "the whole git list is admitted");
+    assert_eq!(
+        harness.register(&git).unwrap(),
+        5,
+        "the whole git list is admitted"
+    );
 
     // A second subsystem (KN) registers its M3 list — admitted, no collision with git.
     let kn = SubsystemTokenList::references_only(
         "knowledge",
-        &["knowledge.page.created", "knowledge.block.updated", "knowledge.page.snapshot"],
+        &[
+            "knowledge.page.created",
+            "knowledge.block.updated",
+            "knowledge.page.snapshot",
+        ],
     );
     assert_eq!(harness.register(&kn).unwrap(), 3);
     assert_eq!(harness.registered_subsystems(), vec!["git", "knowledge"]);
@@ -47,18 +62,27 @@ fn provider_subsystem_registers_its_completed_list_admitted_in_full() {
 fn consumer_harness_rejects_a_malformed_addition_loudly() {
     let mut harness = TokenListHarness::new();
     harness
-        .register(&SubsystemTokenList::references_only("git", &["git.ref.updated"]))
+        .register(&SubsystemTokenList::references_only(
+            "git",
+            &["git.ref.updated"],
+        ))
         .unwrap();
 
     // present-tense verb → loud PresentTenseVerb.
     assert!(matches!(
         harness.add("git", RegisteredToken::references_only("git.pr.open")),
-        Err(HarnessError::UngrammaticalToken { cause: TaxonomyError::PresentTenseVerb { .. }, .. })
+        Err(HarnessError::UngrammaticalToken {
+            cause: TaxonomyError::PresentTenseVerb { .. },
+            ..
+        })
     ));
     // uppercase token → loud BadToken.
     assert!(matches!(
         harness.add("git", RegisteredToken::references_only("git.PR.opened")),
-        Err(HarnessError::UngrammaticalToken { cause: TaxonomyError::BadToken { .. }, .. })
+        Err(HarnessError::UngrammaticalToken {
+            cause: TaxonomyError::BadToken { .. },
+            ..
+        })
     ));
     // a foreign-prefix name → loud ForeignPrefix (the acyclic-producer invariant).
     assert!(matches!(
@@ -66,7 +90,11 @@ fn consumer_harness_rejects_a_malformed_addition_loudly() {
         Err(HarnessError::ForeignPrefix { .. })
     ));
     // The harness is UNCHANGED after every rejected addition.
-    assert_eq!(harness.len(), 1, "a rejected addition never mutates the harness");
+    assert_eq!(
+        harness.len(),
+        1,
+        "a rejected addition never mutates the harness"
+    );
 }
 
 /// The harness holds the **schema_ver lineage + payload-shape descriptor** per registered name
@@ -86,7 +114,14 @@ fn harness_holds_schema_ver_lineage_and_payload_shapes() {
     );
     harness.register(&kn).unwrap();
 
-    assert_eq!(harness.lookup("knowledge.page.updated").unwrap().1.current_schema_ver, 2);
+    assert_eq!(
+        harness
+            .lookup("knowledge.page.updated")
+            .unwrap()
+            .1
+            .current_schema_ver,
+        2
+    );
     assert_eq!(
         harness.lookup("knowledge.page.created").unwrap().1.shape,
         PayloadShape::ReferencesOnly
@@ -95,7 +130,10 @@ fn harness_holds_schema_ver_lineage_and_payload_shapes() {
         harness.lookup("knowledge.page.snapshot").unwrap().1.shape,
         PayloadShape::InlinePersonalData
     );
-    assert_eq!(harness.lookup("knowledge.block.op").unwrap().1.shape, PayloadShape::EphemeralFirehose);
+    assert_eq!(
+        harness.lookup("knowledge.block.op").unwrap().1.shape,
+        PayloadShape::EphemeralFirehose
+    );
 }
 
 /// A non-canonical leading subsystem token is rejected (the leading token must be a §6.2 token) —
@@ -104,7 +142,10 @@ fn harness_holds_schema_ver_lineage_and_payload_shapes() {
 fn harness_rejects_an_unknown_subsystem() {
     let mut harness = TokenListHarness::new();
     assert!(matches!(
-        harness.register(&SubsystemTokenList::references_only("billing", &["billing.invoice.created"])),
+        harness.register(&SubsystemTokenList::references_only(
+            "billing",
+            &["billing.invoice.created"]
+        )),
         Err(HarnessError::UnknownSubsystem { .. })
     ));
 }

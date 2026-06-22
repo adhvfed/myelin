@@ -51,7 +51,10 @@ fn restrict_is_honoured_by_an_m1_holder_suppressing_processing_retaining_storage
     store.store_self_authored(&subj, &tenant, "indexed body");
 
     // unrestricted ⇒ processed.
-    assert!(matches!(store.index(&subj, &tenant), Processed::Processed(_)));
+    assert!(matches!(
+        store.index(&subj, &tenant),
+        Processed::Processed(_)
+    ));
 
     // The consumer SETS the restriction; the holder HONOURS it across all four §4.4 ops.
     restrict.set(&subj, &tenant, true);
@@ -62,7 +65,11 @@ fn restrict_is_honoured_by_an_m1_holder_suppressing_processing_retaining_storage
             Processing::Analyse => store.analyse(&subj, &tenant),
             Processing::Notify => store.notify(&subj, &tenant),
         };
-        assert_eq!(r, Processed::Suppressed, "{op:?} suppressed for a restricted subject");
+        assert_eq!(
+            r,
+            Processed::Suppressed,
+            "{op:?} suppressed for a restricted subject"
+        );
     }
     // Storage retained (the holder did not delete the content).
     assert_eq!(
@@ -72,7 +79,10 @@ fn restrict_is_honoured_by_an_m1_holder_suppressing_processing_retaining_storage
     );
     // Reversible.
     restrict.set(&subj, &tenant, false);
-    assert!(matches!(store.index(&subj, &tenant), Processed::Processed(_)));
+    assert!(matches!(
+        store.index(&subj, &tenant),
+        Processed::Processed(_)
+    ));
 }
 
 /// **Lever 1 (11.4): per-subject DEK crypto-shred renders self-authored free-text unrecoverable.**
@@ -92,7 +102,10 @@ fn per_subject_dek_shred_renders_self_authored_free_text_unrecoverable() {
         Some(StoredContent::Unrecoverable),
         "the per-subject DEK shred renders the self-authored content unrecoverable (§7.1.1)"
     );
-    assert_eq!(kms.recoverable_in_backup(&M1Store::dek_handle(&subj, &tenant)), 0);
+    assert_eq!(
+        kms.recoverable_in_backup(&M1Store::dek_handle(&subj, &tenant)),
+        0
+    );
 }
 
 /// **Lever 2 (4.8): pseudonym-map shred leaves only `<pseudonym>@<tenant>.noreply`.**
@@ -109,7 +122,10 @@ fn pseudonym_map_shred_leaves_only_the_frozen_grammar() {
 /// documented limit — this is the X-7 anti-pattern guard (never pretend the residual is solved).
 #[test]
 fn the_residual_is_restrict_suppress_only_not_crypto_shredded() {
-    assert_eq!(classify_residual(Authorship::SelfAuthored), LeverCoverage::CryptoShred);
+    assert_eq!(
+        classify_residual(Authorship::SelfAuthored),
+        LeverCoverage::CryptoShred
+    );
     assert_eq!(
         classify_residual(Authorship::ThirdPartyMention),
         LeverCoverage::RestrictSuppressOnly,

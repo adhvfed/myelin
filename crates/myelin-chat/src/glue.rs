@@ -303,7 +303,9 @@ pub fn fanout_class(token: &str) -> Option<FanoutClass> {
 /// token added to [`crate::events`] without a fanout-class decision FAILS this invariant loudly
 /// (the prompt's "the fanout-class is total over the chat.* durable tokens" gate).
 pub fn fanout_class_is_total_over_durable_tokens() -> bool {
-    CHAT_DURABLE_TOKENS.iter().all(|t| fanout_class(t).is_some())
+    CHAT_DURABLE_TOKENS
+        .iter()
+        .all(|t| fanout_class(t).is_some())
 }
 
 // ===========================================================================================
@@ -330,7 +332,11 @@ pub fn chat_channel_scope(channel_id: &str) -> Result<FirehoseScope, FirehoseErr
     let scope = FirehoseScope::parse(&format!("channel:{channel_id}"))?;
     // chat's per-view scope is ALWAYS a channel slice (never board/doc/inbox) — assert the kind so a
     // future grammar drift can't silently re-point chat's scope off `channel:`.
-    debug_assert_eq!(scope.kind(), ScopeKind::Channel, "chat's per-view scope is channel:<id>");
+    debug_assert_eq!(
+        scope.kind(),
+        ScopeKind::Channel,
+        "chat's per-view scope is channel:<id>"
+    );
     Ok(scope)
 }
 
@@ -341,8 +347,11 @@ pub fn chat_channel_scope(channel_id: &str) -> Result<FirehoseScope, FirehoseErr
 /// the chat durable snapshot tokens (already registered in [`crate::events`]) that fallback emits —
 /// the channel / message / thread reindex-from-source projections. NAMED here as the scope's
 /// fallback contract; the replay BODY is CHAT-P6 (skeleton) / CHAT-P21 (full parity).
-pub const CHAT_RESYNC_SNAPSHOT_TOKENS: &[&str] =
-    &[CHAT_CHANNEL_SNAPSHOT, CHAT_MESSAGE_SNAPSHOT, CHAT_THREAD_SNAPSHOT];
+pub const CHAT_RESYNC_SNAPSHOT_TOKENS: &[&str] = &[
+    CHAT_CHANNEL_SNAPSHOT,
+    CHAT_MESSAGE_SNAPSHOT,
+    CHAT_THREAD_SNAPSHOT,
+];
 
 // ===========================================================================================
 // §5 — the TE-21 connection-tier language pin (contract 1.7): Rust default; the BEAM hatch

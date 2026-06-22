@@ -43,7 +43,11 @@ fn pid(s: &str) -> PrincipalId {
 fn schedule() -> OncallSchedule {
     OncallSchedule {
         schedule_id: "platform-oncall".into(),
-        rotation: vec![RotationWindow { from_minute: 0, to_minute: 1440, principal: pid("psn:alice") }],
+        rotation: vec![RotationWindow {
+            from_minute: 0,
+            to_minute: 1440,
+            principal: pid("psn:alice"),
+        }],
     }
 }
 
@@ -88,7 +92,10 @@ fn provider_page_walks_the_frozen_chain() {
     // oncall_now resolved the rotation AT FIRE TIME → alice (the on-call), critical pierces all channels.
     assert_eq!(first.principal, pid("psn:alice"));
     assert_eq!(first.channels, vec![Channel::InApp, Channel::WebPush]);
-    assert!(eng.wheel().has_timer(&run_id), "the ack_window durable timer is armed");
+    assert!(
+        eng.wheel().has_timer(&run_id),
+        "the ack_window durable timer is armed"
+    );
 
     // escalate-after-timer → walk to the next step EXACTLY ONCE.
     let next = eng
@@ -103,11 +110,19 @@ fn provider_page_walks_the_frozen_chain() {
 #[test]
 fn provider_oncall_now_resolves_the_rotation() {
     let s = schedule();
-    assert_eq!(oncall_now(&s, 600), Some(pid("psn:alice")), "the on-call at fire time");
+    assert_eq!(
+        oncall_now(&s, 600),
+        Some(pid("psn:alice")),
+        "the on-call at fire time"
+    );
     // An uncovered instant resolves to None (no one on call) — surfaced, never silently dropped.
     let gap = OncallSchedule {
         schedule_id: "g".into(),
-        rotation: vec![RotationWindow { from_minute: 0, to_minute: 60, principal: pid("psn:x") }],
+        rotation: vec![RotationWindow {
+            from_minute: 0,
+            to_minute: 60,
+            principal: pid("psn:x"),
+        }],
     };
     assert_eq!(oncall_now(&gap, 600), None);
 }
@@ -135,9 +150,23 @@ fn consumer_ack_emits_the_frozen_token_via_the_outbox() {
         )
         .unwrap();
     // The ack halts the chain + emits the FROZEN token via the ONLY emit path (the outbox).
-    assert!(eng.ack(&run_id, pid("psn:alice"), Timestamp("2026-06-20T12:00:00Z".into())).unwrap());
-    assert_eq!(eng.run(&run_id).unwrap().state, RunState::Acked, "the ack halted the chain");
-    assert_eq!(outbox.committed_count(), 1, "exactly one notif.escalation.acked committed via the outbox");
+    assert!(eng
+        .ack(
+            &run_id,
+            pid("psn:alice"),
+            Timestamp("2026-06-20T12:00:00Z".into())
+        )
+        .unwrap());
+    assert_eq!(
+        eng.run(&run_id).unwrap().state,
+        RunState::Acked,
+        "the ack halted the chain"
+    );
+    assert_eq!(
+        outbox.committed_count(),
+        1,
+        "exactly one notif.escalation.acked committed via the outbox"
+    );
     // The token the router declares is the token the ack emits (the WIRE both sides agree on).
     assert_eq!(NOTIF_ESCALATION_ACKED, "notif.escalation.acked");
 }

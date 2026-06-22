@@ -35,7 +35,11 @@ fn cell(id: &str, region: &str) -> Cell {
         region: Region::new(region),
         status: CellStatus::Active,
         isolation_kind: IsolationKind::Pool,
-        capacity: Capacity { tenants_max: 1000, write_qps_max: 5000, storage_bytes_max: 1 << 40 },
+        capacity: Capacity {
+            tenants_max: 1000,
+            write_qps_max: 5000,
+            storage_bytes_max: 1 << 40,
+        },
         utilisation: 10,
         version: 1,
         endpoint: format!("cell.{region}.{id}.myelin.eu"),
@@ -84,7 +88,11 @@ fn git_residency_leg_repo_grain() {
         .route_repo(&reg, &repo("01J0ACME", "web"))
         .expect("the home cell serves its own repo (the gate is GREEN)");
     assert_eq!(served.cell_id.as_str(), "cell-w-1");
-    assert_eq!(served.region.as_str(), "eu-west", "the repo's region is its TENANT's region (the pin)");
+    assert_eq!(
+        served.region.as_str(),
+        "eu-west",
+        "the repo's region is its TENANT's region (the pin)"
+    );
     assert_eq!(served.group.as_str(), "pack-0");
     assert_eq!(home.misroute_count(), 0);
     assert_eq!(home.cross_tenant_reads(), 0);
@@ -92,9 +100,9 @@ fn git_residency_leg_repo_grain() {
     // ── RED leg 1 — CROSS-TENANT: cell-w-2 (BETA's home) receives a request for ACME's repo → a
     //    repo-grain misroute. Rejected (NOT proxied) + redirected to cell-w-1 + audited, 0 cross-cell. ──
     let wrong = CellGateway::new(CellId::from_token("cell-w-2"));
-    let reject = wrong
-        .route_repo(&reg, &repo("01J0ACME", "web"))
-        .expect_err("cell-w-2 does not home ACME's repo → REJECTED (the gate is RED for the spoof)");
+    let reject = wrong.route_repo(&reg, &repo("01J0ACME", "web")).expect_err(
+        "cell-w-2 does not home ACME's repo → REJECTED (the gate is RED for the spoof)",
+    );
     assert_eq!(
         reject,
         GatewayReject::Misroute(Misroute {
@@ -104,7 +112,11 @@ fn git_residency_leg_repo_grain() {
         }),
         "the repo-grain misroute redirects to the HOME cell-endpoint (not proxied)"
     );
-    assert_eq!(wrong.audit().count(), 1, "the cross-tenant repo misroute is audited (PII-free)");
+    assert_eq!(
+        wrong.audit().count(),
+        1,
+        "the cross-tenant repo misroute is audited (PII-free)"
+    );
     assert_eq!(
         wrong.audit().records()[0],
         MisrouteAuditRecord {
@@ -114,20 +126,40 @@ fn git_residency_leg_repo_grain() {
         }
     );
     let cross_tenant_reads_spoof = wrong.cross_tenant_reads();
-    assert_eq!(wrong.misroute_count(), 1, "misroute_count increments on a repo-grain misroute");
-    assert_eq!(cross_tenant_reads_spoof, 0, "0 cross-tenant/cross-cell repo rows read (the GIT zero)");
+    assert_eq!(
+        wrong.misroute_count(),
+        1,
+        "misroute_count increments on a repo-grain misroute"
+    );
+    assert_eq!(
+        cross_tenant_reads_spoof, 0,
+        "0 cross-tenant/cross-cell repo rows read (the GIT zero)"
+    );
 
     // ── RED leg 2 — RELOCATION: relocate ACME's repo cell-w-1 → cell-w-2 (SAME region). A git-wire
     //    clone still pointing at the OLD cell (cell-w-1) is corrected to the new cell-endpoint. ──
-    reg.relocate_repo(&repo("01J0ACME", "web"), CellId::from_token("cell-w-2"), StorageGroup::from_token("pack-9"))
-        .expect("a same-region relocation is admitted (a stored-fact flip, NOT a hash recompute)");
+    reg.relocate_repo(
+        &repo("01J0ACME", "web"),
+        CellId::from_token("cell-w-2"),
+        StorageGroup::from_token("pack-9"),
+    )
+    .expect("a same-region relocation is admitted (a stored-fact flip, NOT a hash recompute)");
     let stale = CellGateway::new(CellId::from_token("cell-w-1")); // the OLD home, now stale.
     let redirect_err = stale
         .route_repo(&reg, &repo("01J0ACME", "web"))
         .expect_err("the OLD cell no longer homes the relocated repo → REJECTED + REDIRECTED");
-    let GatewayReject::Misroute(redirect) = redirect_err else { panic!("expected a relocation redirect") };
-    assert_eq!(redirect.correct_cell.as_str(), "cell-w-2", "redirect → the CURRENT (relocated) cell");
-    assert_eq!(redirect.correct_cell_endpoint, "cell.eu-west.cell-w-2.myelin.eu");
+    let GatewayReject::Misroute(redirect) = redirect_err else {
+        panic!("expected a relocation redirect")
+    };
+    assert_eq!(
+        redirect.correct_cell.as_str(),
+        "cell-w-2",
+        "redirect → the CURRENT (relocated) cell"
+    );
+    assert_eq!(
+        redirect.correct_cell_endpoint,
+        "cell.eu-west.cell-w-2.myelin.eu"
+    );
     assert_eq!(stale.cross_tenant_reads(), 0);
     // The redirect is SERVED by the current cell (a redirect, never a proxy) — region still eu-west.
     let current = CellGateway::new(redirect.correct_cell.clone());
@@ -135,29 +167,55 @@ fn git_residency_leg_repo_grain() {
         .route_repo(&reg, &repo("01J0ACME", "web"))
         .expect("the current cell serves the redirected clone");
     assert_eq!(re_served.cell_id.as_str(), "cell-w-2");
-    assert_eq!(re_served.group.as_str(), "pack-9", "the group moved to the target cell");
-    assert_eq!(re_served.region.as_str(), "eu-west", "region UNCHANGED — same-region move (the pin)");
-    assert_eq!(current.misroute_count(), 0, "the current cell does not misroute its own repo");
+    assert_eq!(
+        re_served.group.as_str(),
+        "pack-9",
+        "the group moved to the target cell"
+    );
+    assert_eq!(
+        re_served.region.as_str(),
+        "eu-west",
+        "region UNCHANGED — same-region move (the pin)"
+    );
+    assert_eq!(
+        current.misroute_count(),
+        0,
+        "the current cell does not misroute its own repo"
+    );
 
     // ── RED leg 3 — RESIDENCY PIN: a CROSS-REGION relocation target (cell-n-1, eu-north) is REJECTED.
     //    A repo cannot leave its tenant's region — 0 repos cross the residency boundary. ──
     let cross_region = reg
-        .relocate_repo(&repo("01J0ACME", "web"), CellId::from_token("cell-n-1"), StorageGroup::from_token("g"))
+        .relocate_repo(
+            &repo("01J0ACME", "web"),
+            CellId::from_token("cell-n-1"),
+            StorageGroup::from_token("g"),
+        )
         .expect_err("a cross-region relocation is rejected (the residency pin at repo grain)");
     assert!(
         cross_region.to_string().contains("residency pin"),
         "loud residency reason: {cross_region}"
     );
     // The repo did NOT move — still on cell-w-2, still in eu-west.
-    let after_reject = reg.placement_of_repo(&repo("01J0ACME", "web")).expect("still placed");
+    let after_reject = reg
+        .placement_of_repo(&repo("01J0ACME", "web"))
+        .expect("still placed");
     assert_eq!(after_reject.cell_id.as_str(), "cell-w-2");
-    assert_eq!(after_reject.region.as_str(), "eu-west", "0 repos cross the residency boundary");
+    assert_eq!(
+        after_reject.region.as_str(),
+        "eu-west",
+        "0 repos cross the residency boundary"
+    );
 
     // ── Emit the GIT-residency gate result on the SAME SignalSource every drill uses (observability is
     //    part of the pass, EI-01 §3): the CrossTenantCount projection == 0. ──
     let mut sig = SignalSource::new();
-    sig.set_scalar(SignalName::CrossTenantCount, cross_tenant_reads_spoof as i64);
-    sig.assert_signal(SignalName::CrossTenantCount, Predicate::Eq(0)).expect_green();
+    sig.set_scalar(
+        SignalName::CrossTenantCount,
+        cross_tenant_reads_spoof as i64,
+    );
+    sig.assert_signal(SignalName::CrossTenantCount, Predicate::Eq(0))
+        .expect_green();
 
     println!(
         "[P-250 GIT-residency (repo-grain) GREEN 2026-06-21] placement_of(repo) LIVE: the home cell \
@@ -183,7 +241,8 @@ fn git_repo_grain_gate_is_not_vacuous() {
     // A hypothetical regression that SERVED one cross-tenant repo read.
     sig.set_scalar(SignalName::CrossTenantCount, 1);
     assert!(
-        !sig.assert_signal(SignalName::CrossTenantCount, Predicate::Eq(0)).is_green(),
+        !sig.assert_signal(SignalName::CrossTenantCount, Predicate::Eq(0))
+            .is_green(),
         "a served cross-tenant repo read MUST read RED — the GIT residency zero is a real tripwire"
     );
 }

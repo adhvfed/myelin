@@ -28,10 +28,10 @@
 //! P-FLOW-05. The pair proves a DSR orchestrator can locate + export a subject's workflow history
 //! through the frozen holder trait, not a private channel.
 
+use myelin_flow::schema::WfHistoryRow;
 use myelin_flow::{
     flow_history_holder, register_flow_holder, WfHistoryHolder, WfJournal, FLOW_OLTP_STORE,
 };
-use myelin_flow::schema::WfHistoryRow;
 use myelin_gdpr::{EraseScope, PersonalDataHolder, SubjectRef, TenantId as GdprTenantId};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_refs::ArtifactRef;
@@ -111,7 +111,10 @@ fn consumer_dsr_orchestrator_locates_and_exports_via_the_trait() {
         let loc = h.locate(&subj, tenant_gdpr()).expect("locate succeeds");
         assert_eq!(loc.receipt.operation, "locate");
         assert!(loc.receipt.content_hash.starts_with("blake3:"));
-        assert!(loc.receipt.key_epoch_destroyed.is_none(), "locate shreds no key");
+        assert!(
+            loc.receipt.key_epoch_destroyed.is_none(),
+            "locate shreds no key"
+        );
         // export: a PII-free reference bundle.
         let exp = h.export(&subj, tenant_gdpr()).expect("export succeeds");
         assert_eq!(exp.receipt.operation, "export");
@@ -120,8 +123,14 @@ fn consumer_dsr_orchestrator_locates_and_exports_via_the_trait() {
 
     // Empty-but-correct over an unbacked holder (the registration-only `serve`-before-journal form).
     let empty: Box<dyn PersonalDataHolder> = Box::new(WfHistoryHolder::default());
-    assert!(empty.locate(&subj, tenant_gdpr()).is_ok(), "unbacked locate is empty-but-correct");
-    assert!(empty.export(&subj, tenant_gdpr()).is_ok(), "unbacked export is empty-but-correct");
+    assert!(
+        empty.locate(&subj, tenant_gdpr()).is_ok(),
+        "unbacked locate is empty-but-correct"
+    );
+    assert!(
+        empty.export(&subj, tenant_gdpr()).is_ok(),
+        "unbacked export is empty-but-correct"
+    );
 }
 
 /// **9.6 CONSUMER: a DSR orchestrator erases a subject (the STRUCTURAL references-not-payloads
@@ -137,8 +146,13 @@ fn consumer_dsr_orchestrator_erases_structurally() {
     let holder = WfHistoryHolder::with_journal(journal.clone());
 
     let before = journal.history_in_tenant(&tenant());
-    let scope = EraseScope::Subject { subject: subject("u-erase"), tenant: tenant_gdpr() };
-    let er = holder.erase(scope.clone()).expect("structural erase succeeds");
+    let scope = EraseScope::Subject {
+        subject: subject("u-erase"),
+        tenant: tenant_gdpr(),
+    };
+    let er = holder
+        .erase(scope.clone())
+        .expect("structural erase succeeds");
     assert!(
         er.receipt.key_epoch_destroyed.is_none(),
         "0 keys shredded at the flow surface (refs-stored; inline-PII DEK shred is P-FLOW-23)"
@@ -146,9 +160,15 @@ fn consumer_dsr_orchestrator_erases_structurally() {
 
     // 0 PII columns mutated — the refs-stored rows are byte-identical (tombstone for free).
     let after = journal.history_in_tenant(&tenant());
-    assert_eq!(after, before, "references-not-payloads: 0 PII columns mutated on erase");
+    assert_eq!(
+        after, before,
+        "references-not-payloads: 0 PII columns mutated on erase"
+    );
 
     // Idempotent.
     let er2 = holder.erase(scope).expect("re-erase is idempotent");
-    assert_eq!(er, er2, "the same erase scope yields the identical content-addressed receipt");
+    assert_eq!(
+        er, er2,
+        "the same erase scope yields the identical content-addressed receipt"
+    );
 }

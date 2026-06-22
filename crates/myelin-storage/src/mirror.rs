@@ -313,7 +313,10 @@ mod tests {
         assert_eq!(addr, ContentHash::blake3(pack));
 
         // A tampered source blob is REFUSED (the content-address is the validity check — STOR-D7).
-        assert!(store.corrupt_for_drill(&tenant(), &addr), "source blob present to corrupt");
+        assert!(
+            store.corrupt_for_drill(&tenant(), &addr),
+            "source blob present to corrupt"
+        );
         assert!(
             mirror.stage_source(pack).is_ok(),
             "re-staging identical bytes is idempotent (per-tenant dedup)"
@@ -342,15 +345,20 @@ mod tests {
         // The flag reports the TARGET's region (us-east), NOT the tenant's region.
         let report = mirror.residency_report(&target);
         assert_eq!(report.store_class, ResidencyStoreClass::PushMirror);
-        assert_eq!(report.region.as_str(), "us-east", "the flag reports the mirror TARGET's region");
+        assert_eq!(
+            report.region.as_str(),
+            "us-east",
+            "the flag reports the mirror TARGET's region"
+        );
         assert_eq!(report.tenant, tenant());
 
         // Fed into the SAME aggregation, an extra-EU mirror target FAILs the attestation (the crossing
         // surfaces) — no code change to `verify_region_pinning`.
         let mut reports = StoreSet::for_cell(&region).reports_for(&tenant());
         reports.push(report);
-        let err = verify_region_pinning(&tenant(), &region, &reports)
-            .expect_err("an extra-EU mirror target FAILs the attestation — the crossing is flagged");
+        let err = verify_region_pinning(&tenant(), &region, &reports).expect_err(
+            "an extra-EU mirror target FAILs the attestation — the crossing is flagged",
+        );
         assert!(
             err.to_string().contains("no-global-pool"),
             "the extra-EU mirror crossing is caught by the SAME aggregation: {err}"
@@ -368,7 +376,11 @@ mod tests {
         let target = PushMirrorTarget::new("git.acme.internal.fr", region.clone());
 
         let report = mirror.residency_report(&target);
-        assert_eq!(report.region.as_str(), "fr-par", "a same-region mirror reports the tenant's region");
+        assert_eq!(
+            report.region.as_str(),
+            "fr-par",
+            "a same-region mirror reports the tenant's region"
+        );
 
         let mut reports = StoreSet::for_cell(&region).reports_for(&tenant());
         reports.push(report);
@@ -380,7 +392,10 @@ mod tests {
                 .any(|(class, _)| *class == ResidencyStoreClass::PushMirror),
             "the attestation includes the push-mirror target (12.4)"
         );
-        assert!(!mirror.crosses_boundary(&target), "a same-region target crosses no boundary");
+        assert!(
+            !mirror.crosses_boundary(&target),
+            "a same-region target crosses no boundary"
+        );
     }
 
     /// **`mirror_residency_deny{tenant}` is incremented for an extra-region crossing, NOT for a
@@ -395,18 +410,31 @@ mod tests {
 
         // A same-region target: no crossing, nothing flagged.
         let same = PushMirrorTarget::new("git.acme.internal.fr", region.clone());
-        assert!(!mirror.flag_target(&same, &telemetry), "a same-region mirror is not a crossing");
-        assert_eq!(telemetry.mirror_residency_deny(), 0, "no crossing flagged for a same-region mirror");
+        assert!(
+            !mirror.flag_target(&same, &telemetry),
+            "a same-region mirror is not a crossing"
+        );
+        assert_eq!(
+            telemetry.mirror_residency_deny(),
+            0,
+            "no crossing flagged for a same-region mirror"
+        );
 
         // An extra-EU target: a crossing the control-plane gate denies — flagged + counted.
         let extra = PushMirrorTarget::new("github.com", Region::new("us-east"));
-        assert!(mirror.flag_target(&extra, &telemetry), "an extra-EU mirror is a flagged crossing");
+        assert!(
+            mirror.flag_target(&extra, &telemetry),
+            "an extra-EU mirror is a flagged crossing"
+        );
         assert_eq!(
             telemetry.mirror_residency_deny(),
             1,
             "mirror_residency_deny counts the flagged extra-EU crossing (the C6 / D-S13 signal)"
         );
-        assert!(mirror.crosses_boundary(&extra), "an extra-EU target crosses the boundary");
+        assert!(
+            mirror.crosses_boundary(&extra),
+            "an extra-EU target crosses the boundary"
+        );
     }
 
     /// **The push-mirror store-class label is stable + PII-free; it is NOT in the M1 set (a named
@@ -436,6 +464,6 @@ mod tests {
         let report = mirror.residency_report(&target);
         assert_eq!(report.region.as_str(), "us-east"); // the crossing, FLAGGED (target region)
         assert!(mirror.crosses_boundary(&target)); // the region-only fact Storage answers
-        // The verdict (allow/deny) is the control plane's — Storage holds no policy to assert here.
+                                                   // The verdict (allow/deny) is the control plane's — Storage holds no policy to assert here.
     }
 }

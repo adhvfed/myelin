@@ -8,8 +8,8 @@
 //! obligation). This file carries BOTH sides so the contract-coverage scanner (P-037) admits row
 //! 13.2 as a real provider+consumer pair.
 
-use myelin_content::{AdfNode, AdfTarget, ImportReport, Loss, MAP};
 use myelin_content::adf::mapping_for;
+use myelin_content::{AdfNode, AdfTarget, ImportReport, Loss, MAP};
 
 // ── PROVIDER side (13.2): Knowledge freezes the conversion table ───────────────────
 
@@ -35,7 +35,9 @@ fn issues_import_consumes_map(nodes: &[AdfNode], resolves_in_tenant: bool) -> Im
                 // Unconditionally lossy — always recorded.
                 report.record(node, m.target, what.to_string());
             }
-            Loss::Conditional { what, degraded_to, .. } => {
+            Loss::Conditional {
+                what, degraded_to, ..
+            } => {
                 // Lossy only when the condition does NOT hold (e.g. the principal/URL did not
                 // resolve in-tenant). The real parser evaluates the condition per node.
                 if !resolves_in_tenant {
@@ -62,7 +64,10 @@ fn cdc_13_2_provider_freezes_map_consumer_records_losses() {
         AdfNode::Expand, // → toggle, lossless
     ];
     let report = issues_import_consumes_map(&lossless_doc, true);
-    assert!(report.is_lossless(), "a direct-equivalent import loses nothing");
+    assert!(
+        report.is_lossless(),
+        "a direct-equivalent import loses nothing"
+    );
 
     // CONSUMER: an import with an external mention + a Jira status lozenge + a macro records each
     // loss in the import report (named, not silent).
@@ -73,7 +78,11 @@ fn cdc_13_2_provider_freezes_map_consumer_records_losses() {
         AdfNode::Paragraph, // lossless (not recorded)
     ];
     let report = issues_import_consumes_map(&lossy_doc, /* resolves_in_tenant */ false);
-    assert_eq!(report.loss_count(), 3, "three lossy nodes recorded, the lossless one is not");
+    assert_eq!(
+        report.loss_count(),
+        3,
+        "three lossy nodes recorded, the lossless one is not"
+    );
     assert_eq!(report.conversions[0].node, AdfNode::Mention);
     assert_eq!(report.conversions[0].degraded_to, AdfTarget::PlainText);
     assert_eq!(report.conversions[1].node, AdfNode::Status);
@@ -81,5 +90,8 @@ fn cdc_13_2_provider_freezes_map_consumer_records_losses() {
 
     // CONSUMER: the SAME mention, when it DOES resolve in-tenant, is lossless (the conditional row).
     let resolved = issues_import_consumes_map(&[AdfNode::Mention], /* resolves */ true);
-    assert!(resolved.is_lossless(), "an in-tenant mention survives as a structured node");
+    assert!(
+        resolved.is_lossless(),
+        "an in-tenant mention survives as a structured node"
+    );
 }

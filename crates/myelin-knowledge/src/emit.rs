@@ -64,12 +64,12 @@ use myelin_content::events::{
     KNOWLEDGE_PAGE_CREATED, KNOWLEDGE_PAGE_DELETED, KNOWLEDGE_PAGE_MOVED, KNOWLEDGE_PAGE_PUBLISHED,
     KNOWLEDGE_PAGE_RESTORED, KNOWLEDGE_PAGE_UNPUBLISHED, KNOWLEDGE_PAGE_UPDATED,
     KNOWLEDGE_ROW_CREATED, KNOWLEDGE_ROW_DELETED, KNOWLEDGE_ROW_MOVED, KNOWLEDGE_ROW_UPDATED,
-    KNOWLEDGE_SUBJECT_ERASURE_REQUESTED, KNOWLEDGE_SUBJECT_EXPORT_REQUESTED, KNOWLEDGE_VIEW_CREATED,
-    KNOWLEDGE_VIEW_UPDATED,
+    KNOWLEDGE_SUBJECT_ERASURE_REQUESTED, KNOWLEDGE_SUBJECT_EXPORT_REQUESTED,
+    KNOWLEDGE_VIEW_CREATED, KNOWLEDGE_VIEW_UPDATED,
 };
 use myelin_events::{
-    AggregateKey, ArtifactRef, DataRole, EventDraft, EventEnvelope, EventId, EventType, HandleOutcome,
-    OutboxTx, Result, SubjectPattern, Visibility,
+    AggregateKey, ArtifactRef, DataRole, EventDraft, EventEnvelope, EventId, EventType,
+    HandleOutcome, OutboxTx, Result, SubjectPattern, Visibility,
 };
 use myelin_tenancy::TenantId;
 
@@ -93,7 +93,10 @@ pub fn block_ref(tenant: &TenantId, page_id: &str, block_id: &str) -> ArtifactRe
 /// The canonical Knowledge **database** root URN (`myelin://<tenant>/knowledge/database/<id>`) — the
 /// aggregate for db/view/row/relation events (the db is the ordering partition for its rows, §4).
 pub fn database_ref(tenant: &TenantId, db_id: &str) -> ArtifactRef {
-    ArtifactRef(format!("myelin://{}/knowledge/database/{}", tenant.0, db_id))
+    ArtifactRef(format!(
+        "myelin://{}/knowledge/database/{}",
+        tenant.0, db_id
+    ))
 }
 
 /// The canonical Knowledge **row** sub-URN (`myelin://<tenant>/knowledge/database/<db>#row-<row>`) —
@@ -255,9 +258,18 @@ impl KnowledgeChange {
             | KnowledgeChange::BlockDeleted { page_id, block_id } => {
                 block_ref(tenant, page_id, block_id)
             }
-            KnowledgeChange::CommentCreated { page_id, comment_id }
-            | KnowledgeChange::CommentResolved { page_id, comment_id }
-            | KnowledgeChange::MentionCreated { page_id, comment_id } => ArtifactRef(format!(
+            KnowledgeChange::CommentCreated {
+                page_id,
+                comment_id,
+            }
+            | KnowledgeChange::CommentResolved {
+                page_id,
+                comment_id,
+            }
+            | KnowledgeChange::MentionCreated {
+                page_id,
+                comment_id,
+            } => ArtifactRef(format!(
                 "myelin://{}/knowledge/page/{}#comment-{}",
                 tenant.0, page_id, comment_id
             )),
@@ -408,7 +420,8 @@ impl myelin_events::EventHandler for KnowledgeLivingDocHandler {
     /// type filter here is belt-and-braces so an over-broad subject can never drive a wrong reaction).
     fn handle(&self, ev: &EventEnvelope) -> HandleOutcome {
         if KnowledgeLivingDocHandler::reacts_to(&ev.type_.0) {
-            self.observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.observed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         // The shell never fails (no I/O yet) — Done acks. The real body's transient-failure → Retry
         // and poison → NonRetryable land with the projection (KN-P19+).
@@ -466,7 +479,10 @@ mod tests {
                 "change {ch:?} → `{t}` is UNGRAMMATICAL: {:?}",
                 validate_event_type(t)
             );
-            assert!(t.starts_with("knowledge."), "`{t}` must be a knowledge.* token");
+            assert!(
+                t.starts_with("knowledge."),
+                "`{t}` must be a knowledge.* token"
+            );
         }
     }
 
@@ -489,11 +505,19 @@ mod tests {
             db_id: "tasks".into(),
             row_id: "r1".into(),
         };
-        assert_eq!(row.aggregate(&t).0, "myelin://acme/knowledge/database/tasks");
-        assert_eq!(row.subject(&t).0, "myelin://acme/knowledge/database/tasks#row-r1");
+        assert_eq!(
+            row.aggregate(&t).0,
+            "myelin://acme/knowledge/database/tasks"
+        );
+        assert_eq!(
+            row.subject(&t).0,
+            "myelin://acme/knowledge/database/tasks#row-r1"
+        );
 
         // A page change: aggregate == subject == the page root.
-        let page = KnowledgeChange::PageUpdated { page_id: "7c2".into() };
+        let page = KnowledgeChange::PageUpdated {
+            page_id: "7c2".into(),
+        };
         assert_eq!(page.aggregate(&t).0, page.subject(&t).0);
         assert_eq!(page.aggregate(&t).0, "myelin://acme/knowledge/page/7c2");
     }
@@ -503,11 +527,28 @@ mod tests {
     #[test]
     fn blocks_of_one_page_share_the_page_aggregate() {
         let t = tenant();
-        let b1 = KnowledgeChange::BlockUpdated { page_id: "p1".into(), block_id: "b1".into() };
-        let b2 = KnowledgeChange::BlockCreated { page_id: "p1".into(), block_id: "b2".into() };
-        let other = KnowledgeChange::BlockUpdated { page_id: "p2".into(), block_id: "b9".into() };
-        assert_eq!(b1.aggregate(&t), b2.aggregate(&t), "same page → same aggregate (per-doc order)");
-        assert_ne!(b1.aggregate(&t), other.aggregate(&t), "a different page → a different aggregate");
+        let b1 = KnowledgeChange::BlockUpdated {
+            page_id: "p1".into(),
+            block_id: "b1".into(),
+        };
+        let b2 = KnowledgeChange::BlockCreated {
+            page_id: "p1".into(),
+            block_id: "b2".into(),
+        };
+        let other = KnowledgeChange::BlockUpdated {
+            page_id: "p2".into(),
+            block_id: "b9".into(),
+        };
+        assert_eq!(
+            b1.aggregate(&t),
+            b2.aggregate(&t),
+            "same page → same aggregate (per-doc order)"
+        );
+        assert_ne!(
+            b1.aggregate(&t),
+            other.aggregate(&t),
+            "a different page → a different aggregate"
+        );
     }
 
     /// **`emit_change` emits via `OutboxTx::emit` ONLY, emit-iff-committed (KN-D7, 0 ghost / 0 lost).**
@@ -520,14 +561,29 @@ mod tests {
         // (1) committed: the staged state change + the event co-commit → 1 durable, unsent row.
         let mut tx = store.begin(Arc::clone(&minter), ctx_base());
         tx.stage_state_change("block b9 of page 7c2 updated (version 5)");
-        let change = KnowledgeChange::BlockUpdated { page_id: "7c2".into(), block_id: "9".into() };
+        let change = KnowledgeChange::BlockUpdated {
+            page_id: "7c2".into(),
+            block_id: "9".into(),
+        };
         let id = emit_change(&mut tx, &tenant(), &change, None).expect("emit");
-        assert_eq!(store.outbox_depth(), 0, "an OPEN transaction has written nothing (buffered)");
-        tx.commit().expect("commit the state change + its event together");
-        assert_eq!(store.outbox_depth(), 1, "after commit: exactly the one knowledge event is durable");
+        assert_eq!(
+            store.outbox_depth(),
+            0,
+            "an OPEN transaction has written nothing (buffered)"
+        );
+        tx.commit()
+            .expect("commit the state change + its event together");
+        assert_eq!(
+            store.outbox_depth(),
+            1,
+            "after commit: exactly the one knowledge event is durable"
+        );
         let row = store.row(&id).expect("the committed row");
         assert_eq!(row.envelope.type_.0, KNOWLEDGE_BLOCK_UPDATED);
-        assert_eq!(row.aggregate.0, "myelin://acme/knowledge/page/7c2", "aggregate = the page");
+        assert_eq!(
+            row.aggregate.0, "myelin://acme/knowledge/page/7c2",
+            "aggregate = the page"
+        );
 
         // (2) crash mid-flight: a transaction DROPPED without commit writes NO event — 0 ghost.
         {
@@ -536,8 +592,16 @@ mod tests {
             emit_change(&mut tx2, &tenant(), &change, None).expect("emit");
             // tx2 dropped here WITHOUT commit (the crash between block-commit and relay-publish).
         }
-        assert_eq!(store.outbox_depth(), 1, "the aborted transaction wrote NO event (0 ghost)");
-        assert_eq!(store.committed_count(), 1, "no committed state without its event, none with a ghost");
+        assert_eq!(
+            store.outbox_depth(),
+            1,
+            "the aborted transaction wrote NO event (0 ghost)"
+        );
+        assert_eq!(
+            store.committed_count(),
+            1,
+            "no committed state without its event, none with a ghost"
+        );
     }
 
     /// **A REACTION threads the causal triple (depth+1, the loop-guard stamp).** When a living-doc
@@ -553,7 +617,9 @@ mod tests {
         // The living-doc refresh emitted as a REACTION to the trigger (cause = Some(trigger)).
         let mut tx = store.begin(Arc::clone(&minter), ctx_base());
         tx.stage_state_change("living-doc home refreshed from issue PROJ-1");
-        let reaction = KnowledgeChange::DocUpdated { page_id: "home".into() };
+        let reaction = KnowledgeChange::DocUpdated {
+            page_id: "home".into(),
+        };
         let reaction_id =
             emit_change(&mut tx, &tenant(), &reaction, Some(&trigger)).expect("emit reaction");
         tx.commit().expect("commit");
@@ -561,7 +627,11 @@ mod tests {
         // The reaction row carries depth = trigger.depth + 1 and causation = the trigger event.
         let row = store.row(&reaction_id).expect("the committed reaction row");
         assert_eq!(row.envelope.type_.0, KNOWLEDGE_DOC_UPDATED);
-        assert_eq!(row.envelope.depth, trigger.depth + 1, "a reaction is depth parent+1 (loop guard)");
+        assert_eq!(
+            row.envelope.depth,
+            trigger.depth + 1,
+            "a reaction is depth parent+1 (loop guard)"
+        );
         assert_eq!(
             row.envelope.causation_id,
             Some(trigger.event_id.clone()),
@@ -588,7 +658,10 @@ mod tests {
         // the trigger types are the curated §1.7 signals (issue/ci/git/chat/refs), never the firehose.
         assert!(KnowledgeLivingDocHandler::reacts_to("issue.issue.updated"));
         assert!(KnowledgeLivingDocHandler::reacts_to("ci.run.passed"));
-        assert!(!KnowledgeLivingDocHandler::reacts_to("knowledge.block.op"), "no raw firehose op");
+        assert!(
+            !KnowledgeLivingDocHandler::reacts_to("knowledge.block.op"),
+            "no raw firehose op"
+        );
     }
 
     /// **The living-doc handler is idempotent + acks (the shell wired through the consumer runtime).**
@@ -597,9 +670,7 @@ mod tests {
     /// effectively-once discipline, with the shell body acking.
     #[test]
     fn living_doc_handler_is_idempotent_through_the_runtime() {
-        use myelin_events::{
-            consume, ConsumerName, ConsumerSpec, DedupLedger, Delivered, Message,
-        };
+        use myelin_events::{consume, ConsumerName, ConsumerSpec, DedupLedger, Delivered, Message};
         let spec = ConsumerSpec::new(
             ConsumerName("knowledge-living-doc".into()),
             &["myelin://acme/issues/"],
@@ -610,42 +681,116 @@ mod tests {
             subject: "myelin://acme/issues/issue/PROJ-1".into(),
             envelope: trigger_envelope("issue.issue.updated"),
         };
-        assert_eq!(consumer.deliver(&msg), Delivered::Acked, "first delivery runs + acks");
-        assert_eq!(consumer.deliver(&msg), Delivered::Deduplicated, "redelivery is deduped (0 dup)");
-        assert_eq!(consumer.handler().observed(), 1, "the handler ran EXACTLY once (idempotent)");
+        assert_eq!(
+            consumer.deliver(&msg),
+            Delivered::Acked,
+            "first delivery runs + acks"
+        );
+        assert_eq!(
+            consumer.deliver(&msg),
+            Delivered::Deduplicated,
+            "redelivery is deduped (0 dup)"
+        );
+        assert_eq!(
+            consumer.handler().observed(),
+            1,
+            "the handler ran EXACTLY once (idempotent)"
+        );
     }
 
     // ---- helpers ----
 
     fn all_representative_changes() -> Vec<KnowledgeChange> {
         vec![
-            KnowledgeChange::PageCreated { page_id: "p".into() },
-            KnowledgeChange::PageUpdated { page_id: "p".into() },
-            KnowledgeChange::PageMoved { page_id: "p".into() },
-            KnowledgeChange::PageArchived { page_id: "p".into() },
-            KnowledgeChange::PageRestored { page_id: "p".into() },
-            KnowledgeChange::PageDeleted { page_id: "p".into() },
-            KnowledgeChange::PagePublished { page_id: "p".into() },
-            KnowledgeChange::PageUnpublished { page_id: "p".into() },
-            KnowledgeChange::DocUpdated { page_id: "p".into() },
-            KnowledgeChange::BlockCreated { page_id: "p".into(), block_id: "b".into() },
-            KnowledgeChange::BlockUpdated { page_id: "p".into(), block_id: "b".into() },
-            KnowledgeChange::BlockDeleted { page_id: "p".into(), block_id: "b".into() },
+            KnowledgeChange::PageCreated {
+                page_id: "p".into(),
+            },
+            KnowledgeChange::PageUpdated {
+                page_id: "p".into(),
+            },
+            KnowledgeChange::PageMoved {
+                page_id: "p".into(),
+            },
+            KnowledgeChange::PageArchived {
+                page_id: "p".into(),
+            },
+            KnowledgeChange::PageRestored {
+                page_id: "p".into(),
+            },
+            KnowledgeChange::PageDeleted {
+                page_id: "p".into(),
+            },
+            KnowledgeChange::PagePublished {
+                page_id: "p".into(),
+            },
+            KnowledgeChange::PageUnpublished {
+                page_id: "p".into(),
+            },
+            KnowledgeChange::DocUpdated {
+                page_id: "p".into(),
+            },
+            KnowledgeChange::BlockCreated {
+                page_id: "p".into(),
+                block_id: "b".into(),
+            },
+            KnowledgeChange::BlockUpdated {
+                page_id: "p".into(),
+                block_id: "b".into(),
+            },
+            KnowledgeChange::BlockDeleted {
+                page_id: "p".into(),
+                block_id: "b".into(),
+            },
             KnowledgeChange::DatabaseCreated { db_id: "d".into() },
             KnowledgeChange::DatabaseSchemaChanged { db_id: "d".into() },
-            KnowledgeChange::ViewCreated { db_id: "d".into(), view_id: "v".into() },
-            KnowledgeChange::ViewUpdated { db_id: "d".into(), view_id: "v".into() },
-            KnowledgeChange::RowCreated { db_id: "d".into(), row_id: "r".into() },
-            KnowledgeChange::RowUpdated { db_id: "d".into(), row_id: "r".into() },
-            KnowledgeChange::RowDeleted { db_id: "d".into(), row_id: "r".into() },
-            KnowledgeChange::RowMoved { db_id: "d".into(), row_id: "r".into() },
-            KnowledgeChange::CommentCreated { page_id: "p".into(), comment_id: "c".into() },
-            KnowledgeChange::CommentResolved { page_id: "p".into(), comment_id: "c".into() },
-            KnowledgeChange::MentionCreated { page_id: "p".into(), comment_id: "c".into() },
-            KnowledgeChange::AccessGranted { page_id: "p".into() },
-            KnowledgeChange::AccessRevoked { page_id: "p".into() },
-            KnowledgeChange::SubjectExportRequested { page_id: "p".into() },
-            KnowledgeChange::SubjectErasureRequested { page_id: "p".into() },
+            KnowledgeChange::ViewCreated {
+                db_id: "d".into(),
+                view_id: "v".into(),
+            },
+            KnowledgeChange::ViewUpdated {
+                db_id: "d".into(),
+                view_id: "v".into(),
+            },
+            KnowledgeChange::RowCreated {
+                db_id: "d".into(),
+                row_id: "r".into(),
+            },
+            KnowledgeChange::RowUpdated {
+                db_id: "d".into(),
+                row_id: "r".into(),
+            },
+            KnowledgeChange::RowDeleted {
+                db_id: "d".into(),
+                row_id: "r".into(),
+            },
+            KnowledgeChange::RowMoved {
+                db_id: "d".into(),
+                row_id: "r".into(),
+            },
+            KnowledgeChange::CommentCreated {
+                page_id: "p".into(),
+                comment_id: "c".into(),
+            },
+            KnowledgeChange::CommentResolved {
+                page_id: "p".into(),
+                comment_id: "c".into(),
+            },
+            KnowledgeChange::MentionCreated {
+                page_id: "p".into(),
+                comment_id: "c".into(),
+            },
+            KnowledgeChange::AccessGranted {
+                page_id: "p".into(),
+            },
+            KnowledgeChange::AccessRevoked {
+                page_id: "p".into(),
+            },
+            KnowledgeChange::SubjectExportRequested {
+                page_id: "p".into(),
+            },
+            KnowledgeChange::SubjectErasureRequested {
+                page_id: "p".into(),
+            },
         ]
     }
 

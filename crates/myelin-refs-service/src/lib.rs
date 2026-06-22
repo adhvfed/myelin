@@ -351,19 +351,17 @@ pub mod migration;
 pub mod mirror;
 pub mod reindex;
 pub mod residency;
-pub mod restrict;
 pub mod resolve;
+pub mod restrict;
 pub mod traverse;
 
 pub use backlinks::{
     ids_result, lower_over_source_root, set_expr_admits, source_root_colref, view_permission,
     watermark_verdict, AuthzJoin, AuthzVisibleIndex, Backlink, BacklinkError, BacklinkPage,
-    BacklinkRead, BoundParam, FilterMode, SourceRootFilter, WatermarkVerdict,
-    AUTHZ_VISIBLE_TABLE, FILTER_MODE_SPLIT_SIGNAL, SOURCE_ROOT_COLUMN,
+    BacklinkRead, BoundParam, FilterMode, SourceRootFilter, WatermarkVerdict, AUTHZ_VISIBLE_TABLE,
+    FILTER_MODE_SPLIT_SIGNAL, SOURCE_ROOT_COLUMN,
 };
-pub use cache::{
-    CacheFillError, R2ProjectionCache, R2_DEFAULT_TTL, R2_KEY_PREFIX,
-};
+pub use cache::{CacheFillError, R2ProjectionCache, R2_DEFAULT_TTL, R2_KEY_PREFIX};
 pub use dek::{ref_p5_inherited_gates, InheritedGate, RefsDekPin};
 pub use edge_builder::{
     edge_id, EdgeProjection, EdgeRow, ProjectError, RefsEdgeBuilder, RelClass,
@@ -372,22 +370,13 @@ pub use edge_builder::{
 pub use emit::{
     edge_aggregate_key, emit_edges, extract_edges, EdgeDraft, EdgeRel, REFS_EDGE_CREATED,
 };
-pub use loop_guard::{
-    is_retrigger_source, stamped_depth, target_is_structured_node, would_exceed_ceiling,
-    GuardDecision, RefsLoopGuard, CAUSAL_DEPTH_CEILING,
-};
-pub use mirror::{
-    mirror_edges, project_typed_event, reconverge, Inverse, LifecycleRel, MirrorError,
-    SyntheticTypedEvent,
-};
-pub use migration::{
-    edge_ddl_is_forward_only, edge_table_dek_ref, edge_table_migrations, CREATE_EDGE_INDEXES_DDL,
-    CREATE_EDGE_TABLE_DDL, EDGE_BY_REL_INDEX, EDGE_INBOUND_INDEX, EDGE_MIGRATION_ID,
-    EDGE_OUTBOUND_INDEX, EDGE_TABLE, MAKE_EDGE_TENANT_SCOPED_DDL,
-};
 pub use erasure_posture::{erasure_posture, ErasurePosture};
 pub use git_producer::{
     git_replay_scope, CommentState, GitEdgeProducer, GitOwner, GitReplayGrain, GIT_OWNER_TOKEN,
+};
+pub use holder::{
+    refs_store_classifier, register_refs_holders, EdgeBacking, RefsCacheHolder, RefsEdgeHolder,
+    RefsHolderRegistration, REFS_CACHE_STORE, REFS_EDGE_STORE,
 };
 pub use invalidator::{
     InvalidateError, InvalidationCall, NoOpCacheShim, ProjectionCache, RefsProjectionInvalidator,
@@ -401,23 +390,32 @@ pub use ladder::{
     ladder_root, resolve_line_range, resolve_sub_outcome, LineRangeState, MintedLineRange,
     SubAnchorResolver, SubState, SyntheticSubResolver, TOMBSTONE_COUNT_SIGNAL,
 };
-pub use holder::{
-    refs_store_classifier, register_refs_holders, EdgeBacking, RefsCacheHolder, RefsEdgeHolder,
-    RefsHolderRegistration, REFS_CACHE_STORE, REFS_EDGE_STORE,
+pub use loop_guard::{
+    is_retrigger_source, stamped_depth, target_is_structured_node, would_exceed_ceiling,
+    GuardDecision, RefsLoopGuard, CAUSAL_DEPTH_CEILING,
+};
+pub use migration::{
+    edge_ddl_is_forward_only, edge_table_dek_ref, edge_table_migrations, CREATE_EDGE_INDEXES_DDL,
+    CREATE_EDGE_TABLE_DDL, EDGE_BY_REL_INDEX, EDGE_INBOUND_INDEX, EDGE_MIGRATION_ID,
+    EDGE_OUTBOUND_INDEX, EDGE_TABLE, MAKE_EDGE_TENANT_SCOPED_DDL,
+};
+pub use mirror::{
+    mirror_edges, project_typed_event, reconverge, Inverse, LifecycleRel, MirrorError,
+    SyntheticTypedEvent,
 };
 pub use reindex::{
-    ReindexError, ReindexReceipt, RefsReindexSource, RefsReindexer, SourceEdge, REFS_EDGE_SNAPSHOT_TYPE,
-    REFS_OWNER_TOKEN,
+    RefsReindexSource, RefsReindexer, ReindexError, ReindexReceipt, SourceEdge,
+    REFS_EDGE_SNAPSHOT_TYPE, REFS_OWNER_TOKEN,
 };
-pub use restrict::RestrictSet;
 pub use residency::{refs_store_descriptors, RefsStoreDescriptor};
-pub use traverse::{
-    apply_post_filter, depth_ceiling_from_thresholds, max_nodes_from_thresholds, Traverse,
-    TraverseFilter, TraverseNode, TraverseResult, TRAVERSE_DEPTH_CEILING, TRAVERSE_MAX_NODES,
-};
 pub use resolve::{
     bounded_stale, strong_read, AuthzServed, CrossCellDisposition, NoOpCacheRead, OwnerProjection,
     ProjectApi, ProjectApiError, ProjectOutcome, Projection, ProjectionCacheRead, ProjectionFlag,
-    ResolveMode, ResolveService, Resolution, Tombstone, TombstoneReason,
+    Resolution, ResolveMode, ResolveService, Tombstone, TombstoneReason,
     RESOLVE_CACHE_HIT_RATIO_SIGNAL, VIEW_PERMISSION,
+};
+pub use restrict::RestrictSet;
+pub use traverse::{
+    apply_post_filter, depth_ceiling_from_thresholds, max_nodes_from_thresholds, Traverse,
+    TraverseFilter, TraverseNode, TraverseResult, TRAVERSE_DEPTH_CEILING, TRAVERSE_MAX_NODES,
 };

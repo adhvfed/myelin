@@ -284,7 +284,10 @@ mod tests {
     fn every_chat_token_carries_the_chat_subsystem_prefix() {
         for tok in chat_event_tokens() {
             let head = tok.split('.').next().expect("non-empty token");
-            assert_eq!(head, "chat", "token `{tok}` must carry the `chat` subsystem prefix");
+            assert_eq!(
+                head, "chat",
+                "token `{tok}` must carry the `chat` subsystem prefix"
+            );
         }
         // ...and `chat` is the canonical subsystem token the Bus knows.
         assert!(
@@ -299,7 +302,10 @@ mod tests {
     fn the_chat_token_registry_has_no_duplicates() {
         let mut seen = std::collections::BTreeSet::new();
         for tok in chat_event_tokens() {
-            assert!(seen.insert(tok), "chat token `{tok}` is registered more than once");
+            assert!(
+                seen.insert(tok),
+                "chat token `{tok}` is registered more than once"
+            );
         }
         assert_eq!(seen.len(), chat_event_tokens().len());
     }
@@ -343,10 +349,18 @@ mod tests {
     #[test]
     fn delivery_class_matches_the_architecture_tables() {
         for d in CHAT_DURABLE_TOKENS {
-            assert_eq!(delivery_class(d), Some(DeliveryClass::Durable), "`{d}` must be Durable");
+            assert_eq!(
+                delivery_class(d),
+                Some(DeliveryClass::Durable),
+                "`{d}` must be Durable"
+            );
         }
         for f in CHAT_FIREHOSE_TOKENS {
-            assert_eq!(delivery_class(f), Some(DeliveryClass::Firehose), "`{f}` must be Firehose");
+            assert_eq!(
+                delivery_class(f),
+                Some(DeliveryClass::Firehose),
+                "`{f}` must be Firehose"
+            );
         }
         // An unregistered token (a foreign-subsystem name) does not classify.
         assert_eq!(delivery_class("git.pr.opened"), None);
@@ -361,7 +375,7 @@ mod tests {
         // the durable message family (CHAT-P5 emit follow-on)
         assert!(CHAT_DURABLE_TOKENS.contains(&CHAT_MESSAGE_CREATED));
         assert!(CHAT_DURABLE_TOKENS.contains(&CHAT_MESSAGE_MENTIONED)); // the write-fanout producer
-        // the membership family (CHAT-P8 emit follow-on — the ReBAC tuple write)
+                                                                        // the membership family (CHAT-P8 emit follow-on — the ReBAC tuple write)
         assert!(CHAT_DURABLE_TOKENS.contains(&CHAT_CHANNEL_MEMBER_ADDED));
         assert!(CHAT_DURABLE_TOKENS.contains(&CHAT_CHANNEL_MEMBER_REMOVED));
         // the cross-cutting *.erased + *.snapshot tokens (contracts 2.7 / 2.6)
@@ -391,7 +405,13 @@ mod tests {
     /// read-state stream (coarse cross-device sync is durable; per-message viewed markers are not).
     #[test]
     fn read_state_coarse_is_durable_fine_is_firehose() {
-        assert_eq!(delivery_class(CHAT_READ_STATE_UPDATED), Some(DeliveryClass::Durable));
-        assert_eq!(delivery_class(CHAT_READ_STATE_VIEWED), Some(DeliveryClass::Firehose));
+        assert_eq!(
+            delivery_class(CHAT_READ_STATE_UPDATED),
+            Some(DeliveryClass::Durable)
+        );
+        assert_eq!(
+            delivery_class(CHAT_READ_STATE_VIEWED),
+            Some(DeliveryClass::Firehose)
+        );
     }
 }

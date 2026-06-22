@@ -63,11 +63,24 @@ impl IssuesService {
 fn cdc_11_1_consumer_opens_oltp_client_through_the_harness() {
     let issues = IssuesService::boot();
 
-    let token = Principal::stub(PrincipalId("u1".into()), PrincipalKind::Human, TenantId("acme".into()));
+    let token = Principal::stub(
+        PrincipalId("u1".into()),
+        PrincipalKind::Human,
+        TenantId("acme".into()),
+    );
     let sql = issues.read_issue(&token, Region("eu-west".into()));
 
     // The provider produced a tenant-scoped statement pinned to the verified token.
-    assert!(sql.contains("tenant = 'acme'"), "11.1 must scope to the verified tenant: {sql}");
-    assert!(sql.contains("region = 'eu-west'"), "11.1 must scope to the region: {sql}");
-    assert!(sql.starts_with("issue WHERE"), "11.1 scopes the consumer's own table: {sql}");
+    assert!(
+        sql.contains("tenant = 'acme'"),
+        "11.1 must scope to the verified tenant: {sql}"
+    );
+    assert!(
+        sql.contains("region = 'eu-west'"),
+        "11.1 must scope to the region: {sql}"
+    );
+    assert!(
+        sql.starts_with("issue WHERE"),
+        "11.1 scopes the consumer's own table: {sql}"
+    );
 }

@@ -57,13 +57,22 @@ async fn scoped_tool_list_is_one_sql_clause_matching_the_reference_path() {
            exposed_over_mcp boolean NOT NULL, \
            PRIMARY KEY (tenant_id, region, subsystem, name, version))"
     );
-    sqlx::query(&format!("DROP TABLE IF EXISTS {tbl}")).execute(&admin).await.unwrap();
-    sqlx::query(&create).execute(&admin).await.expect("the tool_def DDL applies");
+    sqlx::query(&format!("DROP TABLE IF EXISTS {tbl}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    sqlx::query(&create)
+        .execute(&admin)
+        .await
+        .expect("the tool_def DDL applies");
     sqlx::query(&format!("SELECT myelin_make_tenant_scoped('{tbl}')"))
         .execute(&admin)
         .await
         .expect("the (tenant, region) RLS policy installs");
-    sqlx::query(&format!("GRANT ALL ON {tbl} TO myelin_app")).execute(&admin).await.unwrap();
+    sqlx::query(&format!("GRANT ALL ON {tbl} TO myelin_app"))
+        .execute(&admin)
+        .await
+        .unwrap();
 
     // Seed a real catalogue of five tools for tenant `acme`.
     let tools = [
@@ -75,8 +84,14 @@ async fn scoped_tool_list_is_one_sql_clause_matching_the_reference_path() {
     ];
     {
         let mut conn = admin.acquire().await.unwrap();
-        sqlx::query("SELECT set_config('myelin.tenant_id', 'acme', false)").execute(&mut *conn).await.unwrap();
-        sqlx::query("SELECT set_config('myelin.region', 'fr-par', false)").execute(&mut *conn).await.unwrap();
+        sqlx::query("SELECT set_config('myelin.tenant_id', 'acme', false)")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query("SELECT set_config('myelin.region', 'fr-par', false)")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
         for (subsystem, name) in tools {
             sqlx::query(&format!(
                 "INSERT INTO {tbl} \
@@ -110,15 +125,23 @@ async fn scoped_tool_list_is_one_sql_clause_matching_the_reference_path() {
     // The SINGLE SQL: the (tenant, region) RLS GUCs are in force (RLS), the scope predicate conjoined
     // over the Fabric's own id expression. ONE statement — no per-tool round-trip.
     let scope_sql = predicate.to_sql(TOOL_ID_EXPR);
-    let query = format!(
-        "SELECT {TOOL_ID_EXPR} AS id, name FROM {tbl} WHERE {scope_sql} ORDER BY name"
-    );
+    let query =
+        format!("SELECT {TOOL_ID_EXPR} AS id, name FROM {tbl} WHERE {scope_sql} ORDER BY name");
 
     let mut conn = app.acquire().await.unwrap();
-    sqlx::query("SELECT set_config('myelin.tenant_id', 'acme', false)").execute(&mut *conn).await.unwrap();
-    sqlx::query("SELECT set_config('myelin.region', 'fr-par', false)").execute(&mut *conn).await.unwrap();
+    sqlx::query("SELECT set_config('myelin.tenant_id', 'acme', false)")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query("SELECT set_config('myelin.region', 'fr-par', false)")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
 
-    let rows = sqlx::query(&query).fetch_all(&mut *conn).await.expect("the single scope SQL runs");
+    let rows = sqlx::query(&query)
+        .fetch_all(&mut *conn)
+        .await
+        .expect("the single scope SQL runs");
     let live_ids: Vec<String> = rows.iter().map(|r| r.get::<String, _>("id")).collect();
 
     // The in-process reference set: apply the predicate's `admits` to every seeded tool's own id.
@@ -171,8 +194,14 @@ async fn scoped_tool_list_is_one_sql_clause_matching_the_reference_path() {
     // A `None` (deny) push-down ⇒ the SQL is `false` ⇒ 0 visible tools (the brain gets nothing).
     let deny_sql = ToolScopePredicate::None.to_sql(TOOL_ID_EXPR);
     let deny_query = format!("SELECT count(*) AS n FROM {tbl} WHERE {deny_sql}");
-    let n: i64 = sqlx::query_scalar(&deny_query).fetch_one(&mut *conn).await.unwrap();
+    let n: i64 = sqlx::query_scalar(&deny_query)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
     assert_eq!(n, 0, "a denied run sees 0 tools (WHERE false)");
 
-    sqlx::query(&format!("DROP TABLE {tbl}")).execute(&admin).await.unwrap();
+    sqlx::query(&format!("DROP TABLE {tbl}"))
+        .execute(&admin)
+        .await
+        .unwrap();
 }

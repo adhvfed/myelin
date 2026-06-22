@@ -44,7 +44,9 @@ use myelin_git::notif_rules::{
     git_notif_rules, git_watchable_object_types, register_git_notif_rules, GitWatcherIndex,
     GIT_MENTIONED_RULE, GIT_REVIEW_REQUESTED_RULE, GIT_WATCHED_RULE, GIT_WATCHER_RELATION,
 };
-use myelin_identity::{Consistency, ConsistencyMode, Principal, PrincipalId, PrincipalKind, Zookie};
+use myelin_identity::{
+    Consistency, ConsistencyMode, Principal, PrincipalId, PrincipalKind, Zookie,
+};
 use myelin_notif::read_fanout::{read_fanout, AmbientMarkerStore};
 use myelin_notif::{Class, NotifRuleRegistry, Reason};
 use myelin_refs::ArtifactRef;
@@ -57,7 +59,10 @@ fn viewer(id: &str) -> Principal {
     Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant())
 }
 fn strong(zk: &str) -> Consistency {
-    Consistency { at_least: Zookie(zk.into()), mode: ConsistencyMode::Strong }
+    Consistency {
+        at_least: Zookie(zk.into()),
+        mode: ConsistencyMode::Strong,
+    }
 }
 
 // ===========================================================================
@@ -98,7 +103,11 @@ fn consumer_notif_admits_and_routes_git_rules() {
     let mut reg = NotifRuleRegistry::platform_default();
     let before = reg.len();
     register_git_notif_rules(&mut reg).expect("Notif admits Git's set");
-    assert_eq!(reg.len(), before + 3, "Notif admitted Git's three rules (zero Notif change)");
+    assert_eq!(
+        reg.len(),
+        before + 3,
+        "Notif admitted Git's three rules (zero Notif change)"
+    );
 
     let pr = ArtifactRef("myelin://acme/git/pr/42".into());
 
@@ -164,13 +173,21 @@ fn consumer_notif_read_fanout_over_real_git_watchers() {
     let alice = read_fanout(&viewer("psn:alice"), &markers, &idx, &strong(&zk.0))
         .expect("the real Git watcher index resolves");
     let alice_roots: Vec<&str> = alice.iter().map(|m| m.subject_root.as_str()).collect();
-    assert!(alice_roots.contains(&watched_pr.0.as_str()), "alice reaches her watched PR-9");
-    assert!(!alice_roots.contains(&unwatched_pr.0.as_str()), "alice does not reach the unwatched PR-10");
+    assert!(
+        alice_roots.contains(&watched_pr.0.as_str()),
+        "alice reaches her watched PR-9"
+    );
+    assert!(
+        !alice_roots.contains(&unwatched_pr.0.as_str()),
+        "alice does not reach the unwatched PR-10"
+    );
 
     // bob watches nothing → his ambient Git slice is empty (no leak of another's watched subject).
-    let bob = read_fanout(&viewer("psn:bob"), &markers, &idx, &strong(&zk.0))
-        .expect("resolves");
-    assert!(bob.is_empty(), "a non-watcher reaches no ambient Git subject (held, not leaked)");
+    let bob = read_fanout(&viewer("psn:bob"), &markers, &idx, &strong(&zk.0)).expect("resolves");
+    assert!(
+        bob.is_empty(),
+        "a non-watcher reaches no ambient Git subject (held, not leaked)"
+    );
 }
 
 /// **CONSUMER side (4.9 / 4.10) — a just-revoked Git watch is reflected (held, not leaked).** After
@@ -183,18 +200,31 @@ fn consumer_notif_read_fanout_reflects_a_revoked_git_watch() {
     idx.watch(&tenant(), "psn:alice", &pr.0);
 
     let markers = AmbientMarkerStore::new();
-    markers.record(&tenant(), &pr, Reason::Watched, &ArtifactRef("myelin://acme/bus/event/e".into()));
+    markers.record(
+        &tenant(),
+        &pr,
+        Reason::Watched,
+        &ArtifactRef("myelin://acme/bus/event/e".into()),
+    );
 
     // before revoke: alice reaches the PR.
-    let before = read_fanout(&viewer("psn:alice"), &markers, &idx, &strong(&idx.current_zookie().0))
-        .expect("resolves");
+    let before = read_fanout(
+        &viewer("psn:alice"),
+        &markers,
+        &idx,
+        &strong(&idx.current_zookie().0),
+    )
+    .expect("resolves");
     assert_eq!(before.len(), 1, "alice reaches the PR before revoke");
 
     // revoke alice's watch → a newer zookie (the watermark a strong read pins).
     let zk_after = idx.unwatch(&tenant(), "psn:alice", &pr.0);
-    let after = read_fanout(&viewer("psn:alice"), &markers, &idx, &strong(&zk_after.0))
-        .expect("resolves");
-    assert!(after.is_empty(), "the just-revoked Git watch is reflected (held, not leaked)");
+    let after =
+        read_fanout(&viewer("psn:alice"), &markers, &idx, &strong(&zk_after.0)).expect("resolves");
+    assert!(
+        after.is_empty(),
+        "the just-revoked Git watch is reflected (held, not leaked)"
+    );
 }
 
 /// **CONSUMER side — an unavailable Git index → held, not leaked (the ambient slice is withheld, never
@@ -217,5 +247,8 @@ fn consumer_notif_holds_not_leaks_on_unavailable_git_index() {
     let res = read_fanout(&viewer("psn:alice"), &markers, &idx, &strong("zk-1"));
     // held, not leaked: the read-fanout returns an Unavailable error (the proven set is withheld),
     // never a silent widen of the ambient Git slice.
-    assert!(res.is_err(), "an unavailable Git index holds, never leaks the ambient slice");
+    assert!(
+        res.is_err(),
+        "an unavailable Git index holds, never leaks the ambient slice"
+    );
 }

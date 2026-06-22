@@ -131,15 +131,24 @@ async fn kn_producer_edges_and_page_parent_mirror_ingest_reindex_and_reconverge_
     let tbl = format!("edge_p259_{suffix}");
 
     // ── Apply the REAL §3.2 schema (create + three indexes + RLS), suffixed for isolation. ──
-    sqlx::query(&rename(CREATE_EDGE_TABLE_DDL, &tbl)).execute(&admin).await.expect("create edge table");
+    sqlx::query(&rename(CREATE_EDGE_TABLE_DDL, &tbl))
+        .execute(&admin)
+        .await
+        .expect("create edge table");
     for (name, idx) in CREATE_EDGE_INDEXES_DDL {
         sqlx::query(&rename(idx, &tbl))
             .execute(&admin)
             .await
             .unwrap_or_else(|e| panic!("apply index {name}: {e}"));
     }
-    sqlx::query(&rename(MAKE_EDGE_TENANT_SCOPED_DDL, &tbl)).execute(&admin).await.expect("RLS scope");
-    sqlx::query(&format!("GRANT ALL ON {tbl} TO myelin_app")).execute(&admin).await.expect("grant app");
+    sqlx::query(&rename(MAKE_EDGE_TENANT_SCOPED_DDL, &tbl))
+        .execute(&admin)
+        .await
+        .expect("RLS scope");
+    sqlx::query(&format!("GRANT ALL ON {tbl} TO myelin_app"))
+        .execute(&admin)
+        .await
+        .expect("grant app");
 
     // ── A production-shaped KN corpus: reference edges + the page_parent lifecycle mirror pair. ──
     let mut corpus: Vec<Row> = vec![
@@ -165,12 +174,23 @@ async fn kn_producer_edges_and_page_parent_mirror_ingest_reindex_and_reconverge_
         ),
     ];
     // The FIRST real lifecycle mirror — "section" parented under "root" (both inverse directions).
-    corpus.extend(page_parent_rows("root", "section", "knowledge.page.created", "kn-pseudonym-1"));
+    corpus.extend(page_parent_rows(
+        "root",
+        "section",
+        "knowledge.page.created",
+        "kn-pseudonym-1",
+    ));
 
     // Pin the session to tenantA (RLS).
     let mut conn = app.acquire().await.unwrap();
-    sqlx::query("SELECT set_config('myelin.tenant_id','tenantA',false)").execute(&mut *conn).await.unwrap();
-    sqlx::query("SELECT set_config('myelin.region','fr-par',false)").execute(&mut *conn).await.unwrap();
+    sqlx::query("SELECT set_config('myelin.tenant_id','tenantA',false)")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query("SELECT set_config('myelin.region','fr-par',false)")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
 
     let upsert_sql = format!(
         "INSERT INTO {tbl} \
@@ -206,31 +226,57 @@ async fn kn_producer_edges_and_page_parent_mirror_ingest_reindex_and_reconverge_
 
     // ── (1) Build the LIVE KN edge table; capture its byte-image. ──
     rebuild(&mut conn, &upsert_sql, &corpus).await;
-    let live_img: String = sqlx::query(&parity_sql).fetch_one(&mut *conn).await.unwrap().get("img");
+    let live_img: String = sqlx::query(&parity_sql)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap()
+        .get("img");
     let live_count: i64 = sqlx::query(&format!("SELECT count(*) AS n FROM {tbl}"))
-        .fetch_one(&mut *conn).await.unwrap().get("n");
-    assert_eq!(live_count, 5, "3 reference edges + the page_parent inverse-paired lifecycle pair");
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap()
+        .get("n");
+    assert_eq!(
+        live_count, 5,
+        "3 reference edges + the page_parent inverse-paired lifecycle pair"
+    );
 
     // The page_parent mirror stored BOTH inverse directions, both lifecycle-class (5.5).
     let lifecycle_count: i64 = sqlx::query(&format!(
         "SELECT count(*) AS n FROM {tbl} WHERE rel_class='lifecycle'"
-    )).fetch_one(&mut *conn).await.unwrap().get("n");
-    assert_eq!(lifecycle_count, 2, "the page_parent mirror is BOTH inverse directions, lifecycle-class");
+    ))
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap()
+    .get("n");
+    assert_eq!(
+        lifecycle_count, 2,
+        "the page_parent mirror is BOTH inverse directions, lifecycle-class"
+    );
     // The forward `parent` edge: root → section.
-    let parent_target: String = sqlx::query(&format!(
-        "SELECT target FROM {tbl} WHERE rel='parent'"
-    )).fetch_one(&mut *conn).await.unwrap().get("target");
+    let parent_target: String =
+        sqlx::query(&format!("SELECT target FROM {tbl} WHERE rel='parent'"))
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap()
+            .get("target");
     assert_eq!(parent_target, "myelin://tenantA/knowledge/page/section");
     // The inverse `child` edge: section → root.
-    let child_target: String = sqlx::query(&format!(
-        "SELECT target FROM {tbl} WHERE rel='child'"
-    )).fetch_one(&mut *conn).await.unwrap().get("target");
+    let child_target: String = sqlx::query(&format!("SELECT target FROM {tbl} WHERE rel='child'"))
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap()
+        .get("target");
     assert_eq!(child_target, "myelin://tenantA/knowledge/page/root");
 
     // The block-anchored embed stored the #sub-STRIPPED page root (the block anchor re-derives, §4.7).
     let block_root: String = sqlx::query(&format!(
         "SELECT target_root FROM {tbl} WHERE source='myelin://tenantA/chat/message/m1'"
-    )).fetch_one(&mut *conn).await.unwrap().get("target_root");
+    ))
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap()
+    .get("target_root");
     assert_eq!(
         block_root, "myelin://tenantA/knowledge/page/design-doc",
         "the block embed's stored root is the #sub-stripped page (the anchor re-derives, never stale)"
@@ -238,28 +284,58 @@ async fn kn_producer_edges_and_page_parent_mirror_ingest_reindex_and_reconverge_
 
     // ── REF-D2 (IDOR / cross-tenant) at the DATABASE layer: a tenantB session reads 0 of these edges. ──
     let mut conn_b = app.acquire().await.unwrap();
-    sqlx::query("SELECT set_config('myelin.tenant_id','tenantB',false)").execute(&mut *conn_b).await.unwrap();
-    sqlx::query("SELECT set_config('myelin.region','fr-par',false)").execute(&mut *conn_b).await.unwrap();
+    sqlx::query("SELECT set_config('myelin.tenant_id','tenantB',false)")
+        .execute(&mut *conn_b)
+        .await
+        .unwrap();
+    sqlx::query("SELECT set_config('myelin.region','fr-par',false)")
+        .execute(&mut *conn_b)
+        .await
+        .unwrap();
     let b_count: i64 = sqlx::query(&format!("SELECT count(*) AS n FROM {tbl}"))
-        .fetch_one(&mut *conn_b).await.unwrap().get("n");
-    assert_eq!(b_count, 0, "RLS isolates tenants — tenantB reads 0 of tenantA's KN edges (REF-D2)");
+        .fetch_one(&mut *conn_b)
+        .await
+        .unwrap()
+        .get("n");
+    assert_eq!(
+        b_count, 0,
+        "RLS isolates tenants — tenantB reads 0 of tenantA's KN edges (REF-D2)"
+    );
 
     // ── (2) WIPE the partition (the cold-rebuild precondition — NO KN-DB reload). ──
-    sqlx::query(&format!("DELETE FROM {tbl}")).execute(&mut *conn).await.expect("wipe partition");
+    sqlx::query(&format!("DELETE FROM {tbl}"))
+        .execute(&mut *conn)
+        .await
+        .expect("wipe partition");
     let after_wipe: i64 = sqlx::query(&format!("SELECT count(*) AS n FROM {tbl}"))
-        .fetch_one(&mut *conn).await.unwrap().get("n");
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap()
+        .get("n");
     assert_eq!(after_wipe, 0, "the KN edge partition is wiped");
 
     // ── (3) Rebuild ONLY from the SAME upserts (the reindex re-emit path). ──
     rebuild(&mut conn, &upsert_sql, &corpus).await;
-    let rebuilt_img: String = sqlx::query(&parity_sql).fetch_one(&mut *conn).await.unwrap().get("img");
+    let rebuilt_img: String = sqlx::query(&parity_sql)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap()
+        .get("img");
 
     // ── (4) The rebuilt KN edge table byte-matches the live table (§4.7 reindex-parity, KN corpus). ──
-    assert_eq!(rebuilt_img, live_img, "the rebuilt KN edge index byte-matches the live index (cold == live)");
+    assert_eq!(
+        rebuilt_img, live_img,
+        "the rebuilt KN edge index byte-matches the live index (cold == live)"
+    );
 
     // ── REF-D4 TE-7 half — the FIRST real reconvergence (the typed table WINS). ──
     // Drift: "section" is ALSO (mistakenly) parented under "old-root" in the projection.
-    let drift = page_parent_rows("old-root", "section", "knowledge.page.created", "kn-pseudonym-x");
+    let drift = page_parent_rows(
+        "old-root",
+        "section",
+        "knowledge.page.created",
+        "kn-pseudonym-x",
+    );
     rebuild(&mut conn, &upsert_sql, &drift).await;
     // The authoritative typed snapshot says "section" is under "root" (the live truth). Reconverge:
     // tombstone any LIFECYCLE edge inbound to the child "section" that the typed snapshot does NOT back.
@@ -283,7 +359,10 @@ async fn kn_producer_edges_and_page_parent_mirror_ingest_reindex_and_reconverge_
     .await
     .expect("reconverge: tombstone drift")
     .rows_affected();
-    assert_eq!(tombstoned, 1, "the drifted old-root parent edge is tombstoned (typed table wins)");
+    assert_eq!(
+        tombstoned, 1,
+        "the drifted old-root parent edge is tombstoned (typed table wins)"
+    );
 
     // After reconvergence the LIVE inbound parent of "section" is EXACTLY root (the typed table won).
     let live_parents: Vec<(String,)> = sqlx::query_as(&format!(
@@ -293,12 +372,19 @@ async fn kn_producer_edges_and_page_parent_mirror_ingest_reindex_and_reconverge_
     .fetch_all(&mut *conn)
     .await
     .expect("live parents of section");
-    assert_eq!(live_parents.len(), 1, "exactly one live parent after reconvergence");
+    assert_eq!(
+        live_parents.len(),
+        1,
+        "exactly one live parent after reconvergence"
+    );
     assert_eq!(
         live_parents[0].0, "myelin://tenantA/knowledge/page/root",
         "the typed table wins — the live parent is root, the drifted old-root is tombstoned"
     );
 
     // Cleanup (a NEW forward operation — test teardown, not a down-migration).
-    sqlx::query(&format!("DROP TABLE {tbl}")).execute(&admin).await.unwrap();
+    sqlx::query(&format!("DROP TABLE {tbl}"))
+        .execute(&admin)
+        .await
+        .unwrap();
 }

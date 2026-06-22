@@ -84,7 +84,10 @@ fn search_migrations() -> Migrations {
 /// therefore registered as the H7 holder — through the harness's one door (reconciling the SRCH-P02
 /// holder registration into the boot path, not duplicating it).
 fn search_stores() -> StoreManifest {
-    StoreManifest::of([DeclaredStore::new(StoreKind::SearchIndex, SEARCH_INDEX_STORE)])
+    StoreManifest::of([DeclaredStore::new(
+        StoreKind::SearchIndex,
+        SEARCH_INDEX_STORE,
+    )])
 }
 
 /// The critical-dependency set the metrics-health readiness probe reads (§4.3, SUB-D9). The OLTP
@@ -154,7 +157,8 @@ mod tests {
     /// liveness ≠ readiness, and a forward-only migration creates a per-tenant index directory.
     #[test]
     fn search_boots_from_serve_appspec_with_three_ports() {
-        let handle = boot_search(Config::default()).expect("the Search shell boots from serve(AppSpec)");
+        let handle =
+            boot_search(Config::default()).expect("the Search shell boots from serve(AppSpec)");
         assert_eq!(handle.name(), SERVICE_NAME, "the deployable service name");
 
         // (1.2) the three ports opened in the lifecycle (public / internal / metrics-health).
@@ -167,7 +171,11 @@ mod tests {
         // (1.3) liveness ≠ readiness: after a successful boot the startup gate is Complete, so
         // readiness is governed by the critical-dependency health (not the same signal as liveness).
         let mh = handle.metrics_health();
-        assert_eq!(mh.liveness(), Liveness::Up, "liveness = not-wedged (never checks a dependency)");
+        assert_eq!(
+            mh.liveness(),
+            Liveness::Up,
+            "liveness = not-wedged (never checks a dependency)"
+        );
         assert!(
             mh.readiness().is_ready(),
             "readiness = can-serve-now (all critical deps healthy at boot) — distinct from liveness"
@@ -176,7 +184,9 @@ mod tests {
         // (1.5) the per-tenant search-index store auto-registered as the H7 holder through the
         // harness's one door (the SRCH-P02 holder, reconciled into the boot path, not duplicated).
         assert!(
-            handle.holder_registry().is_registered(StoreKind::SearchIndex, SEARCH_INDEX_STORE),
+            handle
+                .holder_registry()
+                .is_registered(StoreKind::SearchIndex, SEARCH_INDEX_STORE),
             "the per-tenant search index auto-registered as a holder (§3.4, GD-3)"
         );
         assert!(
@@ -188,7 +198,10 @@ mod tests {
         );
         // No store escaped registration (opening IS registering — the holder list cannot drift
         // below the data map).
-        assert!(handle.holder_registered().is_ok(), "every declared store registered");
+        assert!(
+            handle.holder_registered().is_ok(),
+            "every declared store registered"
+        );
     }
 
     /// **A dead critical dependency (`identity`) flips readiness to not-ready WITHOUT flipping
@@ -204,7 +217,10 @@ mod tests {
         // Mark the declared-critical `identity` dependency down.
         handle.health_probe().mark_down("identity");
 
-        assert!(!mh.readiness().is_ready(), "a dead critical dep → not-ready + shed");
+        assert!(
+            !mh.readiness().is_ready(),
+            "a dead critical dep → not-ready + shed"
+        );
         assert_eq!(
             mh.liveness(),
             Liveness::Up,
@@ -218,7 +234,11 @@ mod tests {
     /// calls the one entry).
     #[test]
     fn run_search_runs_lifecycle_and_returns_ok() {
-        assert_eq!(run_search(Config::default()), Ok(()), "the Search shell boots → … → drains cleanly");
+        assert_eq!(
+            run_search(Config::default()),
+            Ok(()),
+            "the Search shell boots → … → drains cleanly"
+        );
     }
 
     /// **A failed boot returns non-zero (§3.1).** A config that fails boot-time validation aborts
@@ -227,7 +247,10 @@ mod tests {
     fn failed_boot_returns_non_zero() {
         let r = run_search(Config("BAD_POOL".into()));
         assert!(r.is_err(), "a failed boot must return non-zero (Err)");
-        assert!(r.unwrap_err().0.contains("fail-fast"), "the error names the §3.2 fail-fast validation");
+        assert!(
+            r.unwrap_err().0.contains("fail-fast"),
+            "the error names the §3.2 fail-fast validation"
+        );
     }
 
     /// **The Search forward-only migration is additive (a CREATE), not destructive (§9.1).** The
@@ -247,7 +270,10 @@ mod tests {
         // And boot actually applies it (it is in the spec's migration set).
         let spec = search_app_spec(Config::default());
         assert!(
-            spec.migrations.0.iter().any(|m| m.id == "0010_search_index_directory"),
+            spec.migrations
+                .0
+                .iter()
+                .any(|m| m.id == "0010_search_index_directory"),
             "the index-directory migration is in the Search AppSpec's forward-only set"
         );
     }
@@ -260,11 +286,21 @@ mod tests {
     fn the_shell_declares_the_index_store_and_no_engine() {
         let spec = search_app_spec(Config::default());
         assert!(
-            spec.stores.stores().iter().any(|s| s.kind == StoreKind::SearchIndex),
+            spec.stores
+                .stores()
+                .iter()
+                .any(|s| s.kind == StoreKind::SearchIndex),
             "the per-tenant search index store is declared (auto-registered as H7)"
         );
-        assert!(spec.consumers.is_empty(), "no indexer consumer at the shell (SRCH-P06 floor)");
+        assert!(
+            spec.consumers.is_empty(),
+            "no indexer consumer at the shell (SRCH-P06 floor)"
+        );
         // The engine-shapes floor is named (the follow-on slices).
-        assert_eq!(crate::layout::srch_p03_floors().len(), 5, "the engine-shapes floor is named");
+        assert_eq!(
+            crate::layout::srch_p03_floors().len(),
+            5,
+            "the engine-shapes floor is named"
+        );
     }
 }

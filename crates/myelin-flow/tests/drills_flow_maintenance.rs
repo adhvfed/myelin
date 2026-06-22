@@ -101,8 +101,12 @@ fn journal_repack_prefix(outbox: &OutboxStore, journal: &WfJournal, up_to: usize
     let ran = ctx
         .run_maintenance(MaintenanceOp::Repack, up_to, &performer)
         .expect("the prefix runs");
-    assert_eq!(ran, up_to, "the prefix journaled {up_to} steps before the crash");
-    ctx.commit().expect("the prefix co-commits (durable before the crash)");
+    assert_eq!(
+        ran, up_to,
+        "the prefix journaled {up_to} steps before the crash"
+    );
+    ctx.commit()
+        .expect("the prefix co-commits (durable before the crash)");
 }
 
 /// **FLOW maintenance drill — kill a worker at repack step 3/8 → re-drive replays to the un-journaled
@@ -117,14 +121,20 @@ fn drill_crash_mid_repack_resumes_with_no_side_effect() {
 
     // (1) INJECT the worker-crash fault: journal steps 0..=2 (durable), then the worker dies.
     breaker.break_dependency(Dependency::Broker, scope.clone());
-    assert!(breaker.is_broken(&Dependency::Broker, &scope), "the worker-crash fault is injected");
+    assert!(
+        breaker.is_broken(&Dependency::Broker, &scope),
+        "the worker-crash fault is injected"
+    );
     journal_repack_prefix(&outbox, &journal, 3);
     let history = journal.history_for(&tenant(), "R1");
     assert_eq!(history.len(), 3, "3 journaled at the crash point");
 
     // (2) RESTORE: another worker re-leases + re-drives the FULL 8-step repack.
     breaker.restore_dependency(Dependency::Broker, scope.clone());
-    assert!(!breaker.is_broken(&Dependency::Broker, &scope), "the fault is restored");
+    assert!(
+        !breaker.is_broken(&Dependency::Broker, &scope),
+        "the fault is restored"
+    );
 
     let performer = RecordingPerformer::default();
     let mut ctx = WfCtx::resume(
@@ -155,7 +165,11 @@ fn drill_crash_mid_repack_resumes_with_no_side_effect() {
         "0 re-executed side effect — the journaled prefix's pack rewrite was NEVER re-run"
     );
     ctx.commit().expect("co-commit the resumed tail");
-    assert_eq!(journal.history_for(&tenant(), "R1").len(), 8, "8 journaled, 0 lost, 0 duplicate");
+    assert_eq!(
+        journal.history_for(&tenant(), "R1").len(),
+        8,
+        "8 journaled, 0 lost, 0 duplicate"
+    );
     assert_eq!(breaker.broken_count(), 0, "no leaked dependency break");
 
     println!(
@@ -204,7 +218,10 @@ fn drill_invalidation_fan_out_replays_from_last_step() {
         .expect("the resume drive");
 
     // (3) ASSERT: resumed from Mirror, Fork NOT re-invalidated.
-    assert_eq!(n2, 2, "resumed from Mirror — only Mirror + CloneBundle ran live");
+    assert_eq!(
+        n2, 2,
+        "resumed from Mirror — only Mirror + CloneBundle ran live"
+    );
     assert_eq!(
         *performer2.namespaces.lock().unwrap(),
         vec![CacheNamespace::Mirror, CacheNamespace::CloneBundle],
@@ -216,7 +233,11 @@ fn drill_invalidation_fan_out_replays_from_last_step() {
         "0 re-invalidation of the already-purged Fork trust scope"
     );
     c2.commit().expect("co-commit the resumed fan-out tail");
-    assert_eq!(journal.history_for(&tenant(), "R1").len(), 3, "3 journaled, 0 duplicate");
+    assert_eq!(
+        journal.history_for(&tenant(), "R1").len(),
+        3,
+        "3 journaled, 0 duplicate"
+    );
 
     println!(
         "[2026-06-21] PASS  drill=FLOW-maintenance  fan-out-replays-from-last-step  re_invalidated=0  (Fork short-circuited, resumed from Mirror)"
@@ -230,40 +251,58 @@ fn maintenance_drill_registers_into_the_permanent_suite() {
     use myelin_harness::{DrillRegistry, DrillScenario, Predicate, SignalName};
 
     let mut registry = DrillRegistry::new();
-    registry.register_drill(DrillScenario::new("FLOW-maintenance-crash-mid-repack", |ctx| {
-        let scope = Scope::Tenant(tenant());
-        let outbox = OutboxStore::new();
-        let journal = WfJournal::new();
+    registry.register_drill(DrillScenario::new(
+        "FLOW-maintenance-crash-mid-repack",
+        |ctx| {
+            let scope = Scope::Tenant(tenant());
+            let outbox = OutboxStore::new();
+            let journal = WfJournal::new();
 
-        ctx.breaker.break_dependency(Dependency::Broker, scope.clone());
-        journal_repack_prefix(&outbox, &journal, 3);
-        let history = journal.history_for(&tenant(), "R1");
-        ctx.breaker.restore_dependency(Dependency::Broker, scope);
+            ctx.breaker
+                .break_dependency(Dependency::Broker, scope.clone());
+            journal_repack_prefix(&outbox, &journal, 3);
+            let history = journal.history_for(&tenant(), "R1");
+            ctx.breaker.restore_dependency(Dependency::Broker, scope);
 
-        let performer = RecordingPerformer::default();
-        let mut wf = WfCtx::resume(
-            &outbox,
-            minter(),
-            journal.clone(),
-            ctx_base(),
-            "R1",
-            "git.maintenance",
-            "2026-06-21T00:00:00Z",
-            7,
-            history,
-        );
-        wf.run_maintenance(MaintenanceOp::Repack, 8, &performer)
-            .expect("the resume drive");
-        assert_eq!(*performer.steps.lock().unwrap(), vec![3, 4, 5, 6, 7], "resumed at 3");
+            let performer = RecordingPerformer::default();
+            let mut wf = WfCtx::resume(
+                &outbox,
+                minter(),
+                journal.clone(),
+                ctx_base(),
+                "R1",
+                "git.maintenance",
+                "2026-06-21T00:00:00Z",
+                7,
+                history,
+            );
+            wf.run_maintenance(MaintenanceOp::Repack, 8, &performer)
+                .expect("the resume drive");
+            assert_eq!(
+                *performer.steps.lock().unwrap(),
+                vec![3, 4, 5, 6, 7],
+                "resumed at 3"
+            );
 
-        // the 0-re-execution counter is the asserted survival signal (it MUST equal 5, the live tail).
-        ctx.signals
-            .set_scalar(SignalName::OutboxDepth, performer.step_calls.load(Ordering::SeqCst) as i64);
-        ctx.signals.assert_signal(SignalName::OutboxDepth, Predicate::Eq(5))
-    }));
+            // the 0-re-execution counter is the asserted survival signal (it MUST equal 5, the live tail).
+            ctx.signals.set_scalar(
+                SignalName::OutboxDepth,
+                performer.step_calls.load(Ordering::SeqCst) as i64,
+            );
+            ctx.signals
+                .assert_signal(SignalName::OutboxDepth, Predicate::Eq(5))
+        },
+    ));
 
     let results = registry.run_all();
-    assert!(results[0].is_pass(), "the maintenance drill must read green: {:?}", results[0]);
-    assert!(registry.all_green(), "the permanent suite re-runs the maintenance drill green forever");
+    assert!(
+        results[0].is_pass(),
+        "the maintenance drill must read green: {:?}",
+        results[0]
+    );
+    assert!(
+        registry.all_green(),
+        "the permanent suite re-runs the maintenance drill green forever"
+    );
     println!("{}", results[0].artifact_row("2026-06-21"));
 }

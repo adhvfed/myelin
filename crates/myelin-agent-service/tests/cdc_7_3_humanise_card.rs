@@ -16,14 +16,17 @@
 //! renamed field, a dropped per-viewer gate) breaks THIS test, never silently in prod (ADR-01).
 
 use myelin_agent::{GateId, ToolName};
+use myelin_agent_service::{assert_no_raw_agent_surface, humanise_agent_message};
 use myelin_agent_service::{
     humanise_card, humanise_risk_summary, register_agent_templates, surface_card, AgentMessage,
     EffectCost, HitlGate, PlannedEffect, RiskSummary,
 };
-use myelin_agent_service::{assert_no_raw_agent_surface, humanise_agent_message};
-use myelin_identity::{Consistency, ConsistencyMode, Principal, PrincipalId, PrincipalKind, Zookie};
+use myelin_identity::{
+    Consistency, ConsistencyMode, Principal, PrincipalId, PrincipalKind, Zookie,
+};
 use myelin_notif::{
-    Channel, RefProjection, RefResolution, RefResolvePort, TemplateStore, Tombstone, TombstoneReason,
+    Channel, RefProjection, RefResolution, RefResolvePort, TemplateStore, Tombstone,
+    TombstoneReason,
 };
 use myelin_tenancy::{ArtifactRef, Region, TenantId};
 use std::sync::Mutex;
@@ -42,7 +45,10 @@ struct ProviderResolve {
 }
 impl ProviderResolve {
     fn allow(&self, viewer_id: &str, ref_: &ArtifactRef) {
-        self.allowed.lock().unwrap().push((viewer_id.into(), ref_.0.clone()));
+        self.allowed
+            .lock()
+            .unwrap()
+            .push((viewer_id.into(), ref_.0.clone()));
     }
 }
 impl RefResolvePort for ProviderResolve {
@@ -67,7 +73,10 @@ impl RefResolvePort for ProviderResolve {
                 icon: "lock".into(),
             })
         } else {
-            RefResolution::Tombstone(Tombstone { root: ref_.clone(), reason: TombstoneReason::Denied })
+            RefResolution::Tombstone(Tombstone {
+                root: ref_.clone(),
+                reason: TombstoneReason::Denied,
+            })
         }
     }
 }
@@ -82,7 +91,10 @@ fn viewer(id: &str) -> Principal {
     Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant())
 }
 fn at() -> Consistency {
-    Consistency { at_least: Zookie("z-9".into()), mode: ConsistencyMode::Strong }
+    Consistency {
+        at_least: Zookie("z-9".into()),
+        mode: ConsistencyMode::Strong,
+    }
 }
 fn pr() -> ArtifactRef {
     ArtifactRef("myelin://acme/git/pr/99".into())
@@ -99,7 +111,11 @@ fn a_card() -> myelin_agent_service::HitlCard {
         input_json: r#"{"pr":99}"#.into(),
         field: None,
         transition: None,
-        cost: EffectCost { unit: "git.merge", wholesale: 40, markup: 10 },
+        cost: EffectCost {
+            unit: "git.merge",
+            wholesale: 40,
+            markup: 10,
+        },
     };
     let gate = HitlGate::open(
         GateId("gate:git.merge:pr99".into()),
@@ -126,19 +142,46 @@ fn cdc_card_renders_per_viewer_through_humanise() {
     let card = a_card();
 
     let lead = humanise_card(
-        &prov, &tenant(), &region(), &store(), &card, &viewer("lead"), "en", &at(), Channel::Cli,
+        &prov,
+        &tenant(),
+        &region(),
+        &store(),
+        &card,
+        &viewer("lead"),
+        "en",
+        &at(),
+        Channel::Cli,
     )
     .expect("a stable key renders");
     let other = humanise_card(
-        &prov, &tenant(), &region(), &store(), &card, &viewer("bystander"), "en", &at(),
+        &prov,
+        &tenant(),
+        &region(),
+        &store(),
+        &card,
+        &viewer("bystander"),
+        "en",
+        &at(),
         Channel::Cli,
     )
     .expect("a stable key renders");
 
-    assert!(lead.risk_text.text.contains(SECRET_TITLE), "authorised viewer sees the title");
-    assert!(!other.risk_text.text.contains(SECRET_TITLE), "denied viewer: 0 title leak");
-    assert!(other.risk_text.text.contains("a restricted pr"), "denied viewer sees a tombstone");
-    assert_ne!(lead.risk_text.text, other.risk_text.text, "per-viewer renders differ");
+    assert!(
+        lead.risk_text.text.contains(SECRET_TITLE),
+        "authorised viewer sees the title"
+    );
+    assert!(
+        !other.risk_text.text.contains(SECRET_TITLE),
+        "denied viewer: 0 title leak"
+    );
+    assert!(
+        other.risk_text.text.contains("a restricted pr"),
+        "denied viewer sees a tombstone"
+    );
+    assert_ne!(
+        lead.risk_text.text, other.risk_text.text,
+        "per-viewer renders differ"
+    );
     // the structured fields (the agreed non-text card payload) ride through unchanged.
     assert_eq!(lead.cost_estimate, 50);
     assert_eq!(lead.action_tool, "git.merge");
@@ -153,10 +196,21 @@ fn cdc_agent_message_renders_through_humanise() {
     prov.allow("lead", &pr());
     let msg = AgentMessage::about("agent.msg.completed", &pr());
     let out = humanise_agent_message(
-        &prov, &tenant(), &region(), &store(), &msg, &viewer("lead"), "en", &at(), Channel::Cli,
+        &prov,
+        &tenant(),
+        &region(),
+        &store(),
+        &msg,
+        &viewer("lead"),
+        "en",
+        &at(),
+        Channel::Cli,
     )
     .unwrap();
-    assert!(out.text.contains(SECRET_TITLE), "the agent message bound the title per-viewer");
+    assert!(
+        out.text.contains(SECRET_TITLE),
+        "the agent message bound the title per-viewer"
+    );
 }
 
 /// **CDC 7.3 (the 0-raw-string face): a raw agent string never reaches the templating surface.** The
@@ -164,15 +218,32 @@ fn cdc_agent_message_renders_through_humanise() {
 /// that only a stable `(template_key, args)` pair crosses into `humanise`.
 #[test]
 fn cdc_no_raw_agent_string_reaches_humanise() {
-    assert!(assert_no_raw_agent_surface("agent.hitl.merge_pr").is_ok(), "a token key crosses");
-    assert!(assert_no_raw_agent_surface("Merge this PR now!").is_err(), "a raw string never crosses");
+    assert!(
+        assert_no_raw_agent_surface("agent.hitl.merge_pr").is_ok(),
+        "a token key crosses"
+    );
+    assert!(
+        assert_no_raw_agent_surface("Merge this PR now!").is_err(),
+        "a raw string never crosses"
+    );
 
     let prov = ProviderResolve::default();
     prov.allow("lead", &pr());
-    let raw = RiskSummary { template_key: "Please approve!".into(), args: vec![("o".into(), pr())] };
+    let raw = RiskSummary {
+        template_key: "Please approve!".into(),
+        args: vec![("o".into(), pr())],
+    };
     assert!(
         humanise_risk_summary(
-            &prov, &tenant(), &region(), &store(), &raw, &viewer("lead"), "en", &at(), Channel::Cli,
+            &prov,
+            &tenant(),
+            &region(),
+            &store(),
+            &raw,
+            &viewer("lead"),
+            "en",
+            &at(),
+            Channel::Cli,
         )
         .is_err(),
         "the render boundary refuses a raw-string key (0 raw-string surfaces)"

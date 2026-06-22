@@ -223,7 +223,9 @@ pub struct TemplateStore {
 impl TemplateStore {
     /// An empty store (no templates registered — every lookup misses → the fallback display).
     pub fn new() -> TemplateStore {
-        TemplateStore { rows: BTreeMap::new() }
+        TemplateStore {
+            rows: BTreeMap::new(),
+        }
     }
 
     /// Register (or overwrite) a template row (§2.5 — a platform default or a tenant override).
@@ -244,10 +246,26 @@ impl TemplateStore {
         locale: &str,
     ) -> Option<&HumaniseTemplate> {
         let candidates = [
-            (tenant.to_string(), template_key.to_string(), locale.to_string()),
-            (tenant.to_string(), template_key.to_string(), DEFAULT_LOCALE.to_string()),
-            (PLATFORM_DEFAULT_TENANT.to_string(), template_key.to_string(), locale.to_string()),
-            (PLATFORM_DEFAULT_TENANT.to_string(), template_key.to_string(), DEFAULT_LOCALE.to_string()),
+            (
+                tenant.to_string(),
+                template_key.to_string(),
+                locale.to_string(),
+            ),
+            (
+                tenant.to_string(),
+                template_key.to_string(),
+                DEFAULT_LOCALE.to_string(),
+            ),
+            (
+                PLATFORM_DEFAULT_TENANT.to_string(),
+                template_key.to_string(),
+                locale.to_string(),
+            ),
+            (
+                PLATFORM_DEFAULT_TENANT.to_string(),
+                template_key.to_string(),
+                DEFAULT_LOCALE.to_string(),
+            ),
         ];
         candidates.iter().find_map(|k| self.rows.get(k))
     }
@@ -275,14 +293,22 @@ impl TemplateStore {
 /// args. ICU-subset bodies (markdown-subset text + `{N}` + plural/select). Frozen as the platform
 /// default; a tenant overrides by registering its own `(tenant, key, locale)` row.
 pub const PLATFORM_DEFAULT_TEMPLATES: &[(&str, &str, &str)] = &[
-    ("approval_requested", "Approval requested on {0}", "approval"),
+    (
+        "approval_requested",
+        "Approval requested on {0}",
+        "approval",
+    ),
     ("escalated", "Escalated: {0}", "escalation"),
     ("sla", "SLA timer fired on {0}", "sla"),
     ("review_requested", "Review requested on {0}", "review"),
     ("assigned", "You were assigned {0}", "assigned"),
     ("mentioned", "You were mentioned in {0}", "mention"),
     ("replied", "New reply on {0}", "reply"),
-    ("agent_proposal", "An agent proposed an effect on {0}", "agent"),
+    (
+        "agent_proposal",
+        "An agent proposed an effect on {0}",
+        "agent",
+    ),
     ("watched", "{0} changed", "watch"),
     ("state_changed", "{0} changed state", "state"),
     ("fyi", "FYI: {0}", "fyi"),
@@ -487,7 +513,11 @@ fn parse_branches(s: &str) -> BTreeMap<String, String> {
         if i >= chars.len() {
             break;
         }
-        let key: String = chars[key_start..i].iter().collect::<String>().trim().to_string();
+        let key: String = chars[key_start..i]
+            .iter()
+            .collect::<String>()
+            .trim()
+            .to_string();
         if let Some((body, next)) = read_braced(&chars, i) {
             out.insert(key, body);
             i = next;
@@ -812,7 +842,10 @@ pub fn humanise(
         Some(t) => (t.body.clone(), t.icon.clone()),
         // An unregistered key degrades to a stable, non-leaking fallback: the key + slot 0 (already
         // per-viewer-bound, so still a tombstone for a denied subject). Never raw, never a panic.
-        None => (fallback_body(template_key, slot_texts.len()), template_key.to_string()),
+        None => (
+            fallback_body(template_key, slot_texts.len()),
+            template_key.to_string(),
+        ),
     };
 
     // (3) ICU-format with the per-viewer-bound slots, then lower through the ONE content path.

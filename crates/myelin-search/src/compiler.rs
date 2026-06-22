@@ -112,14 +112,20 @@ pub struct FieldDecl {
 impl FieldDecl {
     /// A stored facet of the given frozen [`FieldType`] (the common case).
     pub fn stored(ty: FieldType) -> FieldDecl {
-        FieldDecl { ty, kind: FieldKind::Stored }
+        FieldDecl {
+            ty,
+            kind: FieldKind::Stored,
+        }
     }
 
     /// A read-time rollup/formula field (indexed by its inputs, computed after fetch). Its declared
     /// [`FieldType`] is the type of the DERIVED value (so the post-fetch predicate is well-typed),
     /// but no stored clause is ever produced over it.
     pub fn read_time(ty: FieldType) -> FieldDecl {
-        FieldDecl { ty, kind: FieldKind::ReadTime }
+        FieldDecl {
+            ty,
+            kind: FieldKind::ReadTime,
+        }
     }
 }
 
@@ -134,7 +140,9 @@ pub struct FieldSchema {
 impl FieldSchema {
     /// An empty schema (no declared fields).
     pub fn new() -> FieldSchema {
-        FieldSchema { fields: BTreeMap::new() }
+        FieldSchema {
+            fields: BTreeMap::new(),
+        }
     }
 
     /// Declare a field (builder style). A re-declaration replaces (last wins — the producer's
@@ -288,7 +296,11 @@ pub enum CompileError {
     /// undeclared field is a query error, not an empty match).
     UndeclaredField { field: String },
     /// A `Cmp`'s literal type disagrees with the field's frozen [`FieldType`] (no silent coercion).
-    TypeMismatch { field: String, declared: FieldType, got: &'static str },
+    TypeMismatch {
+        field: String,
+        declared: FieldType,
+        got: &'static str,
+    },
     /// A range comparison (`Lt/Le/Gt/Ge`) was used over a non-ordered [`FieldType`] (un-orderable —
     /// the structured shape has no range fast-field for it).
     NotOrderable { field: String, ty: FieldType },
@@ -307,7 +319,11 @@ impl std::fmt::Display for CompileError {
             CompileError::UndeclaredField { field } => {
                 write!(f, "query references undeclared field `{field}`")
             }
-            CompileError::TypeMismatch { field, declared, got } => write!(
+            CompileError::TypeMismatch {
+                field,
+                declared,
+                got,
+            } => write!(
                 f,
                 "field `{field}` is {} but the query value is {got}",
                 declared.wire_id()
@@ -318,7 +334,10 @@ impl std::fmt::Display for CompileError {
                 ty.wire_id()
             ),
             CompileError::NotCompiled => {
-                write!(f, "the QueryAst is the un-parsed placeholder surface (nothing to lower)")
+                write!(
+                    f,
+                    "the QueryAst is the un-parsed placeholder surface (nothing to lower)"
+                )
             }
             CompileError::UnsupportedShape { reason } => {
                 write!(f, "unsupported query shape: {reason}")
@@ -404,7 +423,11 @@ fn lower_or(
     let mut is_in_shape = !disjuncts.is_empty();
     for d in disjuncts {
         match d {
-            Predicate::Cmp { op: CmpOp::Eq, lhs, rhs } => match field_and_value(lhs, rhs) {
+            Predicate::Cmp {
+                op: CmpOp::Eq,
+                lhs,
+                rhs,
+            } => match field_and_value(lhs, rhs) {
                 Some((f, v)) => {
                     if let Some(prev) = &field {
                         if prev != f {
@@ -432,7 +455,9 @@ fn lower_or(
         let field = field.expect("an In-shaped Or has at least one equality (non-empty checked)");
         let decl = schema
             .get(&field)
-            .ok_or_else(|| CompileError::UndeclaredField { field: field.clone() })?;
+            .ok_or_else(|| CompileError::UndeclaredField {
+                field: field.clone(),
+            })?;
         // `In` only lowers to a structured clause over a STORED facet — a read-time field's `In`
         // is a post-fetch predicate (the derived value is computed after fetch).
         if decl.kind == FieldKind::ReadTime {
@@ -444,7 +469,11 @@ fn lower_or(
         for v in &values {
             check_value_type(&field, decl.ty, v)?;
         }
-        plan.structured.push(StructuredClause::In { field, ty: decl.ty, values });
+        plan.structured.push(StructuredClause::In {
+            field,
+            ty: decl.ty,
+            values,
+        });
         return Ok(());
     }
 
@@ -478,7 +507,9 @@ fn lower_cmp(
                 reason: "a semantic/near request must carry a string query (the text to embed)",
             });
         };
-        plan.vector = Some(VectorBranch { query_text: query_text.clone() });
+        plan.vector = Some(VectorBranch {
+            query_text: query_text.clone(),
+        });
         return Ok(());
     }
 
@@ -495,7 +526,9 @@ fn lower_cmp(
 
     let decl = schema
         .get(field)
-        .ok_or_else(|| CompileError::UndeclaredField { field: field.to_string() })?;
+        .ok_or_else(|| CompileError::UndeclaredField {
+            field: field.to_string(),
+        })?;
     check_value_type(field, decl.ty, value)?;
 
     // READ-TIME rollup/formula field (X-3 / KN-3): the derived value is NOT indexed — lower to a
@@ -503,7 +536,11 @@ fn lower_cmp(
     if decl.kind == FieldKind::ReadTime {
         plan.post_fetch.push(PostFetchPredicate {
             field: field.to_string(),
-            predicate: Predicate::Cmp { op, lhs: lhs.clone(), rhs: rhs.clone() },
+            predicate: Predicate::Cmp {
+                op,
+                lhs: lhs.clone(),
+                rhs: rhs.clone(),
+            },
         });
         return Ok(());
     }
@@ -511,7 +548,10 @@ fn lower_cmp(
     // A range op (`Lt/Le/Gt/Ge`) is only defined over an ordered FieldType.
     let is_range = matches!(op, CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge);
     if is_range && !decl.ty.is_ordered() {
-        return Err(CompileError::NotOrderable { field: field.to_string(), ty: decl.ty });
+        return Err(CompileError::NotOrderable {
+            field: field.to_string(),
+            ty: decl.ty,
+        });
     }
 
     // A `Text`-typed facet under an `Eq` lowers to a FULL-TEXT clause (the inverted shape — analyze
@@ -525,7 +565,10 @@ fn lower_cmp(
                 got: literal_kind(value),
             });
         };
-        plan.ft.push(FtClause { field: field.to_string(), query: query.clone() });
+        plan.ft.push(FtClause {
+            field: field.to_string(),
+            query: query.clone(),
+        });
         return Ok(());
     }
 
@@ -569,7 +612,11 @@ fn check_value_type(field: &str, ty: FieldType, value: &Literal) -> Result<(), C
     if ok {
         Ok(())
     } else {
-        Err(CompileError::TypeMismatch { field: field.to_string(), declared: ty, got: literal_kind(value) })
+        Err(CompileError::TypeMismatch {
+            field: field.to_string(),
+            declared: ty,
+            got: literal_kind(value),
+        })
     }
 }
 
@@ -595,8 +642,18 @@ pub fn render(plan: &CompiledPlan) -> String {
     }
     for c in &plan.structured {
         match c {
-            StructuredClause::Cmp { field, ty, op, value } => {
-                parts.push(format!("{field}:{} {} {}", ty.wire_id(), render_op(*op), render_lit(value)));
+            StructuredClause::Cmp {
+                field,
+                ty,
+                op,
+                value,
+            } => {
+                parts.push(format!(
+                    "{field}:{} {} {}",
+                    ty.wire_id(),
+                    render_op(*op),
+                    render_lit(value)
+                ));
             }
             StructuredClause::In { field, ty, values } => {
                 let vs: Vec<String> = values.iter().map(render_lit).collect();
@@ -668,7 +725,10 @@ mod tests {
             .with("assignee", FieldDecl::stored(FieldType::Principal))
             .with("parent", FieldDecl::stored(FieldType::Relation))
             .with("due", FieldDecl::stored(FieldType::Date))
-            .with(crate::ORDER_KEY_FIELD, FieldDecl::stored(FieldType::OrderKey))
+            .with(
+                crate::ORDER_KEY_FIELD,
+                FieldDecl::stored(FieldType::OrderKey),
+            )
             // a read-time rollup: `progress` (an Int derived value, computed after fetch).
             .with("progress", FieldDecl::read_time(FieldType::Int))
     }
@@ -681,11 +741,21 @@ mod tests {
     #[test]
     fn text_lowers_to_ft_clause() {
         let plan = compile(
-            &ast(Predicate::Cmp { op: CmpOp::Eq, lhs: var(FT_BODY_FIELD), rhs: s("deadlock") }),
+            &ast(Predicate::Cmp {
+                op: CmpOp::Eq,
+                lhs: var(FT_BODY_FIELD),
+                rhs: s("deadlock"),
+            }),
             &schema(),
         )
         .expect("compile");
-        assert_eq!(plan.ft, vec![FtClause { field: "text".into(), query: "deadlock".into() }]);
+        assert_eq!(
+            plan.ft,
+            vec![FtClause {
+                field: "text".into(),
+                query: "deadlock".into()
+            }]
+        );
         assert!(plan.structured.is_empty() && plan.vector.is_none());
     }
 
@@ -693,7 +763,11 @@ mod tests {
     #[test]
     fn eq_over_typed_facet_lowers_to_structured() {
         let plan = compile(
-            &ast(Predicate::Cmp { op: CmpOp::Eq, lhs: var("status"), rhs: s("open") }),
+            &ast(Predicate::Cmp {
+                op: CmpOp::Eq,
+                lhs: var("status"),
+                rhs: s("open"),
+            }),
             &schema(),
         )
         .expect("compile");
@@ -713,7 +787,11 @@ mod tests {
     #[test]
     fn range_over_ordered_ok_over_unordered_rejected() {
         let ok = compile(
-            &ast(Predicate::Cmp { op: CmpOp::Ge, lhs: var("severity"), rhs: i(3) }),
+            &ast(Predicate::Cmp {
+                op: CmpOp::Ge,
+                lhs: var("severity"),
+                rhs: i(3),
+            }),
             &schema(),
         )
         .expect("compile");
@@ -728,7 +806,11 @@ mod tests {
         );
         // A range over a Select (non-ordered) is rejected.
         let err = compile(
-            &ast(Predicate::Cmp { op: CmpOp::Lt, lhs: var("status"), rhs: s("z") }),
+            &ast(Predicate::Cmp {
+                op: CmpOp::Lt,
+                lhs: var("status"),
+                rhs: s("z"),
+            }),
             &schema(),
         )
         .expect_err("a range over a non-ordered facet is rejected");
@@ -741,8 +823,16 @@ mod tests {
     fn has_ref_lower_as_eq_over_relation_principal() {
         let plan = compile(
             &ast(Predicate::And(vec![
-                Predicate::Cmp { op: CmpOp::Eq, lhs: var("assignee"), rhs: s("p:alice") },
-                Predicate::Cmp { op: CmpOp::Eq, lhs: var("parent"), rhs: s("myelin://t/x/issue/1") },
+                Predicate::Cmp {
+                    op: CmpOp::Eq,
+                    lhs: var("assignee"),
+                    rhs: s("p:alice"),
+                },
+                Predicate::Cmp {
+                    op: CmpOp::Eq,
+                    lhs: var("parent"),
+                    rhs: s("myelin://t/x/issue/1"),
+                },
             ])),
             &schema(),
         )
@@ -764,8 +854,16 @@ mod tests {
     fn single_field_or_lowers_to_in() {
         let plan = compile(
             &ast(Predicate::Or(vec![
-                Predicate::Cmp { op: CmpOp::Eq, lhs: var("status"), rhs: s("open") },
-                Predicate::Cmp { op: CmpOp::Eq, lhs: var("status"), rhs: s("in_review") },
+                Predicate::Cmp {
+                    op: CmpOp::Eq,
+                    lhs: var("status"),
+                    rhs: s("open"),
+                },
+                Predicate::Cmp {
+                    op: CmpOp::Eq,
+                    lhs: var("status"),
+                    rhs: s("in_review"),
+                },
             ])),
             &schema(),
         )
@@ -775,7 +873,10 @@ mod tests {
             vec![StructuredClause::In {
                 field: "status".into(),
                 ty: FieldType::Select,
-                values: vec![Literal::Str("open".into()), Literal::Str("in_review".into())],
+                values: vec![
+                    Literal::Str("open".into()),
+                    Literal::Str("in_review".into())
+                ],
             }]
         );
     }
@@ -794,7 +895,9 @@ mod tests {
         .expect("compile");
         assert_eq!(
             plan.vector,
-            Some(VectorBranch { query_text: "how do I reset my password".into() })
+            Some(VectorBranch {
+                query_text: "how do I reset my password".into()
+            })
         );
     }
 
@@ -804,9 +907,21 @@ mod tests {
     fn hybrid_query_lowers_all_branches() {
         let plan = compile(
             &ast(Predicate::And(vec![
-                Predicate::Cmp { op: CmpOp::Eq, lhs: var(FT_BODY_FIELD), rhs: s("login") },
-                Predicate::Cmp { op: CmpOp::Eq, lhs: var(SEMANTIC_FIELD), rhs: s("auth flow") },
-                Predicate::Cmp { op: CmpOp::Eq, lhs: var("status"), rhs: s("open") },
+                Predicate::Cmp {
+                    op: CmpOp::Eq,
+                    lhs: var(FT_BODY_FIELD),
+                    rhs: s("login"),
+                },
+                Predicate::Cmp {
+                    op: CmpOp::Eq,
+                    lhs: var(SEMANTIC_FIELD),
+                    rhs: s("auth flow"),
+                },
+                Predicate::Cmp {
+                    op: CmpOp::Eq,
+                    lhs: var("status"),
+                    rhs: s("open"),
+                },
             ])),
             &schema(),
         )
@@ -823,12 +938,19 @@ mod tests {
     #[test]
     fn read_time_field_is_post_fetch_never_a_stored_clause() {
         let plan = compile(
-            &ast(Predicate::Cmp { op: CmpOp::Ge, lhs: var("progress"), rhs: i(80) }),
+            &ast(Predicate::Cmp {
+                op: CmpOp::Ge,
+                lhs: var("progress"),
+                rhs: i(80),
+            }),
             &schema(),
         )
         .expect("compile");
         // No stored/FT/vector clause was produced over the derived value.
-        assert!(plan.structured.is_empty(), "the derived value is NOT a stored structured clause");
+        assert!(
+            plan.structured.is_empty(),
+            "the derived value is NOT a stored structured clause"
+        );
         assert!(plan.ft.is_empty() && plan.vector.is_none());
         // It is a post-fetch predicate (the view computes `progress` after fetch, then evaluates).
         assert_eq!(plan.post_fetch.len(), 1);
@@ -842,11 +964,19 @@ mod tests {
         // Contrast: the SAME Int type as a STORED facet (`severity`) DOES lower to a structured
         // clause — so the difference is the read-time KIND, not the field type.
         let stored = compile(
-            &ast(Predicate::Cmp { op: CmpOp::Ge, lhs: var("severity"), rhs: i(80) }),
+            &ast(Predicate::Cmp {
+                op: CmpOp::Ge,
+                lhs: var("severity"),
+                rhs: i(80),
+            }),
             &schema(),
         )
         .expect("compile");
-        assert_eq!(stored.structured.len(), 1, "a STORED int facet lowers to a structured clause");
+        assert_eq!(
+            stored.structured.len(),
+            1,
+            "a STORED int facet lowers to a structured clause"
+        );
         assert!(stored.post_fetch.is_empty());
     }
 
@@ -883,7 +1013,11 @@ mod tests {
         // A deeply-nested tree at the depth ceiling is rejected by the compiler's re-assertion (we
         // build it just under the construction limit and confirm the compiler re-validates).
         let deep = {
-            let mut p = Predicate::Cmp { op: CmpOp::Eq, lhs: var("status"), rhs: s("open") };
+            let mut p = Predicate::Cmp {
+                op: CmpOp::Eq,
+                lhs: var("status"),
+                rhs: s("open"),
+            };
             for _ in 0..(myelin_query::MAX_PREDICATE_DEPTH - 2) {
                 p = Predicate::And(vec![p]);
             }
@@ -898,14 +1032,22 @@ mod tests {
     #[test]
     fn undeclared_field_and_type_mismatch_are_loud() {
         let undeclared = compile(
-            &ast(Predicate::Cmp { op: CmpOp::Eq, lhs: var("nope"), rhs: s("x") }),
+            &ast(Predicate::Cmp {
+                op: CmpOp::Eq,
+                lhs: var("nope"),
+                rhs: s("x"),
+            }),
             &schema(),
         )
         .expect_err("an undeclared field is rejected");
         assert!(matches!(undeclared, CompileError::UndeclaredField { .. }));
 
         let mismatch = compile(
-            &ast(Predicate::Cmp { op: CmpOp::Eq, lhs: var("severity"), rhs: s("not-an-int") }),
+            &ast(Predicate::Cmp {
+                op: CmpOp::Eq,
+                lhs: var("severity"),
+                rhs: s("not-an-int"),
+            }),
             &schema(),
         )
         .expect_err("a string over an int facet is rejected");
@@ -926,7 +1068,11 @@ mod tests {
     #[test]
     fn conjoin_seam_is_the_only_path_to_an_executable_plan() {
         let plan = compile(
-            &ast(Predicate::Cmp { op: CmpOp::Eq, lhs: var("status"), rhs: s("open") }),
+            &ast(Predicate::Cmp {
+                op: CmpOp::Eq,
+                lhs: var("status"),
+                rhs: s("open"),
+            }),
             &schema(),
         )
         .expect("compile");
@@ -935,7 +1081,10 @@ mod tests {
         // The ONLY constructor of an executable plan demands the acl clause (here a marker string
         // standing in for the SRCH-P08 AclFilter lowering of list_objects).
         let conjoined = plan.with_acl("acl_clause(list_objects(viewer, read, issue))");
-        assert_eq!(conjoined.acl, "acl_clause(list_objects(viewer, read, issue))");
+        assert_eq!(
+            conjoined.acl,
+            "acl_clause(list_objects(viewer, read, issue))"
+        );
         assert_eq!(conjoined.plan.structured.len(), 1);
     }
 
@@ -944,9 +1093,21 @@ mod tests {
     #[test]
     fn render_round_trip_and_no_agent_back_door() {
         let p = Predicate::And(vec![
-            Predicate::Cmp { op: CmpOp::Eq, lhs: var(FT_BODY_FIELD), rhs: s("deadlock") },
-            Predicate::Cmp { op: CmpOp::Eq, lhs: var("status"), rhs: s("open") },
-            Predicate::Cmp { op: CmpOp::Eq, lhs: var(SORT_FIELD), rhs: s(crate::ORDER_KEY_FIELD) },
+            Predicate::Cmp {
+                op: CmpOp::Eq,
+                lhs: var(FT_BODY_FIELD),
+                rhs: s("deadlock"),
+            },
+            Predicate::Cmp {
+                op: CmpOp::Eq,
+                lhs: var("status"),
+                rhs: s("open"),
+            },
+            Predicate::Cmp {
+                op: CmpOp::Eq,
+                lhs: var(SORT_FIELD),
+                rhs: s(crate::ORDER_KEY_FIELD),
+            },
         ]);
         // The "UI" emits the AST; the "agent" emits a byte-identical AST (the SAME frozen QueryAst).
         let ui_ast = ast(p.clone());
@@ -954,7 +1115,10 @@ mod tests {
         let ui_plan = compile(&ui_ast, &schema()).expect("ui compile");
         let agent_plan = compile(&agent_ast, &schema()).expect("agent compile");
         // The SAME AST compiles to the SAME plan — no agent back-door (§4.6 tail).
-        assert_eq!(ui_plan, agent_plan, "agent and UI compile the identical AST to the identical plan");
+        assert_eq!(
+            ui_plan, agent_plan,
+            "agent and UI compile the identical AST to the identical plan"
+        );
         // The canonical rendered form is identical too (the ONE renderer).
         assert_eq!(render(&ui_plan), render(&agent_plan));
         assert_eq!(
@@ -971,8 +1135,8 @@ mod tests {
     /// the matcher's projection types over.
     #[test]
     fn byte_identical_semantics_with_the_eventmatcher_core() {
-        use myelin_query::EventMatcher;
         use myelin_identity::ObjectType;
+        use myelin_query::EventMatcher;
 
         // ONE predicate, built once. The bus matcher and Search's compiler BOTH consume it.
         let predicate = QueryAst::compiled(Predicate::Cmp {
@@ -989,7 +1153,10 @@ mod tests {
         // matcher carries — there is ONE serialisation (a grammar change breaks both at once).
         let search_bytes = serde_json::to_value(&predicate).unwrap();
         let matcher_bytes = serde_json::to_value(matcher.predicate()).unwrap();
-        assert_eq!(search_bytes, matcher_bytes, "ONE QueryAst serialisation — no Search/matcher drift");
+        assert_eq!(
+            search_bytes, matcher_bytes,
+            "ONE QueryAst serialisation — no Search/matcher drift"
+        );
 
         // **Drift anchor 2:** Search lowers this AST against the frozen FieldType taxonomy; pin the
         // full taxonomy BY VALUE so a rename/reorder of a `FieldType` variant (in the contract home
@@ -998,7 +1165,16 @@ mod tests {
         let wire_ids: Vec<&str> = FieldType::all().iter().map(|t| t.wire_id()).collect();
         assert_eq!(
             wire_ids,
-            ["text", "int", "bool", "date", "select", "relation", "principal", "order_key"],
+            [
+                "text",
+                "int",
+                "bool",
+                "date",
+                "select",
+                "relation",
+                "principal",
+                "order_key"
+            ],
             "the frozen FieldType taxonomy Search's compiler lowers over (byte-identical to the \
              EventMatcher core / Issues / Knowledge)"
         );
@@ -1026,7 +1202,10 @@ mod tests {
         // The frozen LexoRank keys the sort is over compare by raw byte order.
         let a = OrderKey::parse("G").unwrap();
         let b = OrderKey::parse("V").unwrap();
-        assert!(a < b, "the LexoRank byte order is the sort order the columnar fast-field uses");
+        assert!(
+            a < b,
+            "the LexoRank byte order is the sort order the columnar fast-field uses"
+        );
     }
 
     /// **A comparison with the literal on the LEFT and the field var on the RIGHT lowers identically
@@ -1036,7 +1215,11 @@ mod tests {
         // `"open" == status` (literal first) lowers to the SAME structured clause as `status ==
         // "open"`.
         let plan = compile(
-            &ast(Predicate::Cmp { op: CmpOp::Eq, lhs: s("open"), rhs: var("status") }),
+            &ast(Predicate::Cmp {
+                op: CmpOp::Eq,
+                lhs: s("open"),
+                rhs: var("status"),
+            }),
             &schema(),
         )
         .expect("compile");
@@ -1052,7 +1235,11 @@ mod tests {
         );
         // A literal-vs-literal (no field var either side) is not a lowerable query clause.
         let err = compile(
-            &ast(Predicate::Cmp { op: CmpOp::Eq, lhs: s("a"), rhs: s("b") }),
+            &ast(Predicate::Cmp {
+                op: CmpOp::Eq,
+                lhs: s("a"),
+                rhs: s("b"),
+            }),
             &schema(),
         )
         .expect_err("a literal-vs-literal comparison has no field to lower over");
@@ -1065,7 +1252,11 @@ mod tests {
     #[test]
     fn compile_error_messages_are_exact() {
         let err = compile(
-            &ast(Predicate::Cmp { op: CmpOp::Eq, lhs: var("severity"), rhs: s("nope") }),
+            &ast(Predicate::Cmp {
+                op: CmpOp::Eq,
+                lhs: var("severity"),
+                rhs: s("nope"),
+            }),
             &schema(),
         )
         .expect_err("string over int");
@@ -1073,12 +1264,22 @@ mod tests {
         // literal_kind "" / "xyzzy" mutants AND the Display::fmt default mutant).
         let msg = err.to_string();
         assert!(msg.contains("severity"), "names the field: {msg}");
-        assert!(msg.contains("int"), "names the declared frozen FieldType: {msg}");
-        assert!(msg.contains("string"), "names the offending literal kind: {msg}");
+        assert!(
+            msg.contains("int"),
+            "names the declared frozen FieldType: {msg}"
+        );
+        assert!(
+            msg.contains("string"),
+            "names the offending literal kind: {msg}"
+        );
 
         // An undeclared field's message names the field too (a different Display arm).
         let undeclared = compile(
-            &ast(Predicate::Cmp { op: CmpOp::Eq, lhs: var("ghost"), rhs: s("x") }),
+            &ast(Predicate::Cmp {
+                op: CmpOp::Eq,
+                lhs: var("ghost"),
+                rhs: s("x"),
+            }),
             &schema(),
         )
         .expect_err("undeclared");
@@ -1089,11 +1290,18 @@ mod tests {
 
         // The not-orderable and not-compiled arms render non-empty, distinct messages.
         let not_orderable = compile(
-            &ast(Predicate::Cmp { op: CmpOp::Lt, lhs: var("status"), rhs: s("z") }),
+            &ast(Predicate::Cmp {
+                op: CmpOp::Lt,
+                lhs: var("status"),
+                rhs: s("z"),
+            }),
             &schema(),
         )
         .expect_err("range over select");
-        assert!(not_orderable.to_string().contains("status"), "not-orderable names the field");
+        assert!(
+            not_orderable.to_string().contains("status"),
+            "not-orderable names the field"
+        );
         assert!(
             compile(&QueryAst::raw("x"), &schema())
                 .expect_err("unparsed")

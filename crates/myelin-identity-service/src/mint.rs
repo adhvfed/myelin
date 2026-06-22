@@ -555,7 +555,11 @@ fn add_secs_rfc3339(instant: &str, secs: u64) -> String {
             let total = day_seconds(h, mi, s) + secs;
             let extra_days = total / 86_400;
             let rem = total % 86_400;
-            let (nh, nmi, ns) = ((rem / 3_600) as u32, ((rem % 3_600) / 60) as u32, (rem % 60) as u32);
+            let (nh, nmi, ns) = (
+                (rem / 3_600) as u32,
+                ((rem % 3_600) / 60) as u32,
+                (rem % 60) as u32,
+            );
             let (ny, nmo, nd) = add_days(y, mo, d, extra_days);
             format!("{ny:04}-{nmo:02}-{nd:02}T{nh:02}:{nmi:02}:{ns:02}Z")
         }
@@ -572,7 +576,14 @@ fn day_seconds(h: u32, mi: u32, s: u32) -> u64 {
 fn parse_rfc3339(s: &str) -> Option<(i64, u32, u32, u32, u32, u32)> {
     // Expected exact length `YYYY-MM-DDTHH:MM:SSZ` == 20 chars.
     let b = s.as_bytes();
-    if b.len() != 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' || b[19] != b'Z' {
+    if b.len() != 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+        || b[19] != b'Z'
+    {
         return None;
     }
     let y: i64 = s.get(0..4)?.parse().ok()?;
@@ -731,7 +742,10 @@ mod tests {
             !token.token.contains("admin"),
             "a grant the delegator never held is NEVER minted into the token (the mint re-check)"
         );
-        assert!(proof.holds(), "the minted authority is ⊆ every conjunct (monotone)");
+        assert!(
+            proof.holds(),
+            "the minted authority is ⊆ every conjunct (monotone)"
+        );
         assert_eq!(proof.effective, vec!["repo:acme/web#read".to_string()]);
     }
 
@@ -790,7 +804,9 @@ mod tests {
         );
         assert_eq!(
             r,
-            Err(MintError::SelfHostedScopeViolation("selfhosted:globex".into())),
+            Err(MintError::SelfHostedScopeViolation(
+                "selfhosted:globex".into()
+            )),
             "a self-hosted run token naming another tenant's scope is refused (C6, no-global-pool)"
         );
     }
@@ -815,13 +831,22 @@ mod tests {
         );
         let t0 = minter
             .mint_run_token(
-                &acme, &agent_id, &run,
-                &agent("p:agent", "acme"), &human("p:human", "acme"),
-                &dispatch, &caveats(&["repo:acme/web#read", "repo:acme/web#write"]),
-                MachineKind::Agent, &ttl(300), &ts("2026-06-19T00:00:00Z"),
+                &acme,
+                &agent_id,
+                &run,
+                &agent("p:agent", "acme"),
+                &human("p:human", "acme"),
+                &dispatch,
+                &caveats(&["repo:acme/web#read", "repo:acme/web#write"]),
+                MachineKind::Agent,
+                &ttl(300),
+                &ts("2026-06-19T00:00:00Z"),
             )
             .expect("dispatch mint");
-        assert!(t0.token.contains("repo:acme/web#write"), "dispatch token carries #write");
+        assert!(
+            t0.token.contains("repo:acme/web#write"),
+            "dispatch token carries #write"
+        );
 
         // RESUME days later: the delegator LOST #write. The re-mint recomputes the intersection
         // as-of-resume → the fresh token is narrower (no #write).
@@ -833,14 +858,26 @@ mod tests {
         );
         let t1 = minter
             .re_mint_on_resume(
-                &acme, &agent_id, &run,
-                &agent("p:agent", "acme"), &human("p:human", "acme"),
-                &resume, &caveats(&["repo:acme/web#read", "repo:acme/web#write"]),
-                MachineKind::Agent, &ttl(300), &ts("2026-06-22T09:00:00Z"),
+                &acme,
+                &agent_id,
+                &run,
+                &agent("p:agent", "acme"),
+                &human("p:human", "acme"),
+                &resume,
+                &caveats(&["repo:acme/web#read", "repo:acme/web#write"]),
+                MachineKind::Agent,
+                &ttl(300),
+                &ts("2026-06-22T09:00:00Z"),
             )
             .expect("re-mint on resume");
-        assert_ne!(t1.jti, t0.jti, "the re-mint is a FRESH token (distinct jti)");
-        assert!(t1.token.contains("repo:acme/web#read"), "the re-minted token keeps #read");
+        assert_ne!(
+            t1.jti, t0.jti,
+            "the re-mint is a FRESH token (distinct jti)"
+        );
+        assert!(
+            t1.token.contains("repo:acme/web#read"),
+            "the re-minted token keeps #read"
+        );
         assert!(
             !t1.token.contains("#write"),
             "the re-minted token is NARROWER (the delegator lost #write — recomputed as-of-resume)"
@@ -1015,7 +1052,11 @@ mod tests {
             ("not-a-real-instant", 60),
         ] {
             let exp = expires_at_of(&ts(now), &ttl(secs));
-            assert!(exp.0.as_str() > now, "expires_at ({}) must be strictly after now ({now})", exp.0);
+            assert!(
+                exp.0.as_str() > now,
+                "expires_at ({}) must be strictly after now ({now})",
+                exp.0
+            );
         }
     }
 
@@ -1035,7 +1076,12 @@ mod tests {
                 &RunId("run-9".into()),
                 &agent("svc:agent", "acme"),
                 &human("p:human", "acme"),
-                &input(&["agent:run"], &["agent:run"], &["agent:run"], &["agent:run"]),
+                &input(
+                    &["agent:run"],
+                    &["agent:run"],
+                    &["agent:run"],
+                    &["agent:run"],
+                ),
                 &caveats(&["agent:run"]),
                 MachineKind::Agent,
                 &ttl(60),
@@ -1047,8 +1093,17 @@ mod tests {
         assert_eq!(parts[0], "acme", "tenant from the verified scope");
         assert_eq!(parts[1], "eu-west", "region from the verified scope");
         assert_eq!(parts[2], "svc:agent", "subject_key is the agent id");
-        assert_eq!(parts[3], token.jti, "the envelope jti matches the RunToken jti");
-        assert_eq!(parts[4], "0", "a per-run token is dpop=0 (TTL-constrained, not DPoP-bound)");
-        assert_eq!(parts[5], "agent:run", "the grants are the attenuated effective authority");
+        assert_eq!(
+            parts[3], token.jti,
+            "the envelope jti matches the RunToken jti"
+        );
+        assert_eq!(
+            parts[4], "0",
+            "a per-run token is dpop=0 (TTL-constrained, not DPoP-bound)"
+        );
+        assert_eq!(
+            parts[5], "agent:run",
+            "the grants are the attenuated effective authority"
+        );
     }
 }

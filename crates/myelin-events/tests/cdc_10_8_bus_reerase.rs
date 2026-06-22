@@ -23,12 +23,12 @@
 //! the full provider+consumer pair (GDPR mints + owns the GLOBAL ledger) lands at GA-15; this file is
 //! the Bus's leg, not the GDPR provider side.
 
-use myelin_events::{
-    ArtifactRef, BusErasureLedger, BusEventLog, BusHolder, DataRole, EventDraft, EventType, IdMinter,
-    InMemoryShredder, InlinePiiShredder, MonotonicMinter, OutboxStore, PiiKeyRef, ReErasureReceipt,
-    Timestamp, Visibility,
-};
 use myelin_events::{Actor, AggregateKey, EmitContext, EventId};
+use myelin_events::{
+    ArtifactRef, BusErasureLedger, BusEventLog, BusHolder, DataRole, EventDraft, EventType,
+    IdMinter, InMemoryShredder, InlinePiiShredder, MonotonicMinter, OutboxStore, PiiKeyRef,
+    ReErasureReceipt, Timestamp, Visibility,
+};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_tenancy::{Region, TenantId};
 use std::sync::Arc;
@@ -43,7 +43,11 @@ fn now() -> Timestamp {
     Timestamp("2026-06-19T00:00:00Z".into())
 }
 fn actor_for(id: &str) -> Actor {
-    Actor(Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant()))
+    Actor(Principal::stub(
+        PrincipalId(id.into()),
+        PrincipalKind::Human,
+        tenant(),
+    ))
 }
 
 /// A retained inline-PII envelope sealed under `subject`'s per-subject DEK.
@@ -109,15 +113,30 @@ fn cdc_10_8_provider_restores_consumer_re_erases_zero_resurrected() {
     // 0 resurrected inline-PII keys post-restore (GD-14).
     let mut reerase_outbox = OutboxStore::new();
     let receipt: ReErasureReceipt = holder
-        .re_erase_after_restore(&ledger, &mut restored_log, &mut reerase_outbox, minter(), now())
+        .re_erase_after_restore(
+            &ledger,
+            &mut restored_log,
+            &mut reerase_outbox,
+            minter(),
+            now(),
+        )
         .expect("consumer: re-erase after restore");
 
     // The consumer's contract: 0 resurrected; the key is dead again; the ledger drove it.
-    assert!(receipt.is_green(), "consumer requires 0 resurrected inline-PII keys post-restore");
+    assert!(
+        receipt.is_green(),
+        "consumer requires 0 resurrected inline-PII keys post-restore"
+    );
     assert_eq!(receipt.resurrected, 0);
-    assert_eq!(receipt.keys_resurrected_by_restore, 1, "the restore resurrected one key");
+    assert_eq!(
+        receipt.keys_resurrected_by_restore, 1,
+        "the restore resurrected one key"
+    );
     assert_eq!(receipt.re_erased_subjects, 1);
-    assert!(!shredder.is_live(&key), "the key STAYS destroyed across the restore");
+    assert!(
+        !shredder.is_live(&key),
+        "the key STAYS destroyed across the restore"
+    );
     // The ledger is non-shred-erasable: it still remembers u42 was erased after the whole cycle.
     assert!(ledger.is_erased("u42"));
 }

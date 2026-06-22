@@ -164,7 +164,9 @@ impl InProcessBus {
     /// commit and publish" fault). The companion to the P-S03 dependency-break injector's
     /// `Dependency::Broker` — a drill that holds the injector handle flips this.
     pub fn sever(&self) {
-        self.lock().fail_with = Some(TransportError("broker unreachable (severed by drill)".into()));
+        self.lock().fail_with = Some(TransportError(
+            "broker unreachable (severed by drill)".into(),
+        ));
     }
 
     /// Heal the broker: `put` succeeds again (the drill restores the dependency).
@@ -242,7 +244,9 @@ impl BusTransport for InProcessBus {
     }
 
     fn ack(&self, consumer: &str, event_id: &EventId) {
-        self.lock().acks.insert(consumer.to_string(), event_id.clone());
+        self.lock()
+            .acks
+            .insert(consumer.to_string(), event_id.clone());
     }
 
     fn purge(&self) {
@@ -576,7 +580,11 @@ mod tests {
     }
 
     fn principal() -> Principal {
-        Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId("acme".into()))
+        Principal::stub(
+            PrincipalId("p".into()),
+            PrincipalKind::Human,
+            TenantId("acme".into()),
+        )
     }
 
     fn ctx_base() -> EmitContextBase {
@@ -604,12 +612,20 @@ mod tests {
         }
     }
 
-    fn commit_n(store: &OutboxStore, minter: Arc<dyn IdMinter>, n: usize, aggregate: &str) -> Vec<EventId> {
+    fn commit_n(
+        store: &OutboxStore,
+        minter: Arc<dyn IdMinter>,
+        n: usize,
+        aggregate: &str,
+    ) -> Vec<EventId> {
         let mut tx = store.begin(minter, ctx_base());
         tx.stage_state_change("state");
         let mut ids = Vec::new();
         for i in 0..n {
-            ids.push(tx.emit(draft(&format!("issues.issue.e{i}"), aggregate), None).unwrap());
+            ids.push(
+                tx.emit(draft(&format!("issues.issue.e{i}"), aggregate), None)
+                    .unwrap(),
+            );
         }
         tx.commit().unwrap();
         ids
@@ -653,16 +669,32 @@ mod tests {
         bus.sever();
         relay.drain_to_empty();
         // 0 LOST: every committed event is still in the outbox (depth unchanged), none ghosted.
-        assert_eq!(store.outbox_depth(), 4, "severed broker → events parked, not lost");
+        assert_eq!(
+            store.outbox_depth(),
+            4,
+            "severed broker → events parked, not lost"
+        );
         assert_eq!(bus.delivered_count(), 0, "nothing delivered while severed");
 
         // (2) heal + drain: every event is delivered exactly once (0 ghost), depth → 0.
         bus.heal();
         let report = relay.drain_to_empty();
         assert_eq!(report.published, 4);
-        assert_eq!(store.outbox_depth(), 0, "outbox-depth drains after heal (SUB-D1)");
-        assert_eq!(bus.delivered_count(), 4, "exactly-once: 4 committed → 4 delivered");
-        assert_eq!(bus.delivered_ids(), ids.into_iter().collect(), "0 ghost / 0 lost");
+        assert_eq!(
+            store.outbox_depth(),
+            0,
+            "outbox-depth drains after heal (SUB-D1)"
+        );
+        assert_eq!(
+            bus.delivered_count(),
+            4,
+            "exactly-once: 4 committed → 4 delivered"
+        );
+        assert_eq!(
+            bus.delivered_ids(),
+            ids.into_iter().collect(),
+            "0 ghost / 0 lost"
+        );
     }
 
     /// **SUB-D1 idempotence — a re-claim after a crash mid-publish does not double-deliver.** We
@@ -684,15 +716,30 @@ mod tests {
             bus.put(&row.subject, &row.envelope, &row.event_id).unwrap(),
             Delivery::Accepted
         );
-        assert_eq!(store.outbox_depth(), 1, "row still unsent (crash before mark)");
+        assert_eq!(
+            store.outbox_depth(),
+            1,
+            "row still unsent (crash before mark)"
+        );
 
         // The relay re-runs: it re-claims the unsent row and re-publishes — the broker dedups it.
         let relay = Relay::new(store.clone(), bus.clone(), clock);
         let report = relay.drain_once();
-        assert_eq!(report.deduplicated, 1, "the re-claim was deduplicated (0 ghost)");
+        assert_eq!(
+            report.deduplicated, 1,
+            "the re-claim was deduplicated (0 ghost)"
+        );
         assert_eq!(report.published, 0);
-        assert_eq!(bus.delivered_count(), 1, "still exactly one delivery (no ghost)");
-        assert_eq!(store.outbox_depth(), 0, "the row is marked sent after the dedup");
+        assert_eq!(
+            bus.delivered_count(),
+            1,
+            "still exactly one delivery (no ghost)"
+        );
+        assert_eq!(
+            store.outbox_depth(),
+            0,
+            "the row is marked sent after the dedup"
+        );
     }
 
     /// `FOR UPDATE SKIP LOCKED`: two relay workers claiming concurrently never double-claim a
@@ -736,7 +783,11 @@ mod tests {
             relay.drain_once();
         }
         assert_eq!(store.outbox_depth(), 0, "the row left the unsent set");
-        assert_eq!(store.dead_letter_count(), 1, "it is dead-lettered, not silently lost");
+        assert_eq!(
+            store.dead_letter_count(),
+            1,
+            "it is dead-lettered, not silently lost"
+        );
         assert_eq!(bus.delivered_count(), 0);
     }
 
@@ -753,8 +804,15 @@ mod tests {
         // dead-letter the MIDDLE row directly (the relay mechanic).
         store.dead_letter(&ids[1]);
         assert_eq!(store.dead_letter_count(), 1);
-        assert_eq!(store.outbox_depth(), 2, "only the dead row left the live set");
-        assert!(store.row(&ids[1]).is_none(), "the dead row is gone from live rows");
+        assert_eq!(
+            store.outbox_depth(),
+            2,
+            "only the dead row left the live set"
+        );
+        assert!(
+            store.row(&ids[1]).is_none(),
+            "the dead row is gone from live rows"
+        );
         assert!(store.row(&ids[0]).is_some(), "survivor 0 still live");
         assert!(store.row(&ids[2]).is_some(), "survivor 2 still live");
 
@@ -764,7 +822,10 @@ mod tests {
         assert_eq!(bus.delivered_count(), 2);
         let delivered = bus.delivered_ids();
         assert!(delivered.contains(&ids[0]) && delivered.contains(&ids[2]));
-        assert!(!delivered.contains(&ids[1]), "the dead-lettered row is not delivered");
+        assert!(
+            !delivered.contains(&ids[1]),
+            "the dead-lettered row is not delivered"
+        );
     }
 
     /// `drain_once` reports exactly what it did this pass: a fresh drain of 3 rows reports
@@ -783,7 +844,11 @@ mod tests {
         assert_eq!(r.dead_lettered, 0);
         // a second pass on an empty outbox publishes nothing.
         let r2 = relay.drain_once();
-        assert_eq!(r2, DrainReport::default(), "an empty drain pass reports all-zero");
+        assert_eq!(
+            r2,
+            DrainReport::default(),
+            "an empty drain pass reports all-zero"
+        );
     }
 
     /// `drain_once` reports `failed == N` (one per claimed row) when the broker is severed but
@@ -838,7 +903,10 @@ mod tests {
         // the dead-lettered row is surfaced (not silently lost) — `dead_letters()` returns it.
         let dl = store.dead_letters();
         assert_eq!(dl.len(), 1);
-        assert_eq!(dl[0].attempts, MAX_PUBLISH_ATTEMPTS, "attempts hit the bound");
+        assert_eq!(
+            dl[0].attempts, MAX_PUBLISH_ATTEMPTS,
+            "attempts hit the bound"
+        );
     }
 
     /// `drain_to_empty` keeps looping while it makes progress and ACCUMULATES the published
@@ -858,10 +926,21 @@ mod tests {
 
         let total = relay.drain_to_empty();
         // pass 1: 5 claimed, 2 transient-fail, 3 published; pass 2: 2 published. Total 5.
-        assert_eq!(total.published, 5, "published accumulates across passes (3 + 2)");
+        assert_eq!(
+            total.published, 5,
+            "published accumulates across passes (3 + 2)"
+        );
         assert_eq!(total.failed, 2, "the 2 transient failures are reported");
-        assert_eq!(store.outbox_depth(), 0, "the outbox fully drained over 2 passes");
-        assert_eq!(bus.delivered_count(), 5, "exactly 5 delivered, none ghosted/lost");
+        assert_eq!(
+            store.outbox_depth(),
+            0,
+            "the outbox fully drained over 2 passes"
+        );
+        assert_eq!(
+            bus.delivered_count(),
+            5,
+            "exactly 5 delivered, none ghosted/lost"
+        );
     }
 
     /// `drain_to_empty` counts DEDUPLICATED rows as progress and accumulates them: if the rows
@@ -881,14 +960,28 @@ mod tests {
             let row = store.row(id).unwrap();
             bus.put(&row.subject, &row.envelope, &row.event_id).unwrap();
         }
-        assert_eq!(store.outbox_depth(), 3, "rows delivered but not yet marked sent");
+        assert_eq!(
+            store.outbox_depth(),
+            3,
+            "rows delivered but not yet marked sent"
+        );
 
         let relay = Relay::new(store.clone(), bus.clone(), clock);
         let total = relay.drain_to_empty();
-        assert_eq!(total.deduplicated, 3, "all 3 re-claims were deduplicated (0 ghost)");
-        assert_eq!(total.published, 0, "nothing newly published (already delivered)");
+        assert_eq!(
+            total.deduplicated, 3,
+            "all 3 re-claims were deduplicated (0 ghost)"
+        );
+        assert_eq!(
+            total.published, 0,
+            "nothing newly published (already delivered)"
+        );
         assert_eq!(store.outbox_depth(), 0, "depth drains via the dedup path");
-        assert_eq!(bus.delivered_count(), 3, "still exactly 3 delivered (no double-delivery)");
+        assert_eq!(
+            bus.delivered_count(),
+            3,
+            "still exactly 3 delivered (no double-delivery)"
+        );
     }
 
     /// `drain_to_empty` stops (does not spin forever) when the broker is severed and no progress
@@ -906,7 +999,11 @@ mod tests {
         let total = relay.drain_to_empty();
         assert_eq!(total.published, 0);
         assert_eq!(total.failed, 3, "one failed per claimed row, then it stops");
-        assert_eq!(store.outbox_depth(), 3, "0 lost: the rows stay parked while severed");
+        assert_eq!(
+            store.outbox_depth(),
+            3,
+            "0 lost: the rows stay parked while severed"
+        );
     }
 
     /// The in-process broker's `purge` clears the delivered/dedup state, and `ack` records the
@@ -921,8 +1018,16 @@ mod tests {
         assert_eq!(bus.delivered_count(), 2);
 
         bus.ack("indexer", &ids[1]);
-        assert_eq!(bus.ack_of("indexer").as_ref(), Some(&ids[1]), "ack recorded the high-water");
-        assert_eq!(bus.ack_of("nobody"), None, "an un-acked consumer reads None");
+        assert_eq!(
+            bus.ack_of("indexer").as_ref(),
+            Some(&ids[1]),
+            "ack recorded the high-water"
+        );
+        assert_eq!(
+            bus.ack_of("nobody"),
+            None,
+            "an un-acked consumer reads None"
+        );
         // purge clears the delivered + dedup state, so a re-publish is accepted afresh.
         bus.purge();
         assert_eq!(bus.delivered_count(), 0, "purge cleared the delivered log");
@@ -956,7 +1061,10 @@ mod tests {
         assert_eq!(consumed[1].event_id, ids[1]);
         // the envelope the consumer reads round-trips against what the store holds (provider).
         let provider_row = store.row(&ids[0]).unwrap();
-        assert_eq!(consumed[0], provider_row.envelope, "consumer sees the provider's wire shape");
+        assert_eq!(
+            consumed[0], provider_row.envelope,
+            "consumer sees the provider's wire shape"
+        );
 
         // ack is part of the frozen shape.
         bus.ack("indexer", &ids[1]);
@@ -973,13 +1081,20 @@ mod tests {
     /// `issues.issue.created` row for tenant `acme` routes to `dlq.acme.issues`.
     #[test]
     fn eb04_dlq_subject_is_tenant_and_subsystem() {
-        assert_eq!(dlq_subject(&TenantId("acme".into()), "issues"), "dlq.acme.issues");
+        assert_eq!(
+            dlq_subject(&TenantId("acme".into()), "issues"),
+            "dlq.acme.issues"
+        );
         // subsystem is the first dotted segment of the type; a malformed/empty type is routable.
         let store = OutboxStore::new();
         let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
         let ids = commit_n(&store, minter, 1, "issue:PROJ-1");
         let row = store.row(&ids[0]).unwrap();
-        assert_eq!(subsystem_of(&row.envelope), "issues", "type 'issues.issue.eN' → 'issues'");
+        assert_eq!(
+            subsystem_of(&row.envelope),
+            "issues",
+            "type 'issues.issue.eN' → 'issues'"
+        );
     }
 
     /// **EB-04 — a poison row that exhausts the retry bound is dead-lettered AND raises a
@@ -1002,18 +1117,38 @@ mod tests {
         for _ in 0..(MAX_PUBLISH_ATTEMPTS - 1) {
             relay.drain_once();
         }
-        assert!(relay.dead_letter_alerts().is_empty(), "no alert before the retry bound");
+        assert!(
+            relay.dead_letter_alerts().is_empty(),
+            "no alert before the retry bound"
+        );
         // the bound-th pass dead-letters AND alerts.
         relay.drain_once();
 
-        assert_eq!(store.dead_letter_count(), 1, "the row is dead-lettered (count signal)");
+        assert_eq!(
+            store.dead_letter_count(),
+            1,
+            "the row is dead-lettered (count signal)"
+        );
         let alerts = relay.dead_letter_alerts();
-        assert_eq!(alerts.len(), 1, "exactly one dead-letter Signal alert raised");
-        assert_eq!(alerts[0].dlq_subject, "dlq.acme.issues", "routed to dlq.<tenant>.<subsystem>");
-        assert_eq!(alerts[0].event_id, ids[0], "the alert carries the offending event_id");
+        assert_eq!(
+            alerts.len(),
+            1,
+            "exactly one dead-letter Signal alert raised"
+        );
+        assert_eq!(
+            alerts[0].dlq_subject, "dlq.acme.issues",
+            "routed to dlq.<tenant>.<subsystem>"
+        );
+        assert_eq!(
+            alerts[0].event_id, ids[0],
+            "the alert carries the offending event_id"
+        );
         assert_eq!(alerts[0].tenant, TenantId("acme".into()));
         assert_eq!(alerts[0].subsystem, "issues");
-        assert_eq!(alerts[0].attempts, MAX_PUBLISH_ATTEMPTS, "the bound was exhausted");
+        assert_eq!(
+            alerts[0].attempts, MAX_PUBLISH_ATTEMPTS,
+            "the bound was exhausted"
+        );
     }
 
     /// **EB-04 — the 24h published-row GC reaps only SENT rows past the cutoff; it can never reap
@@ -1037,9 +1172,18 @@ mod tests {
         let reaped = relay.gc_published(&Timestamp("2026-06-18T12:00:00Z".into()));
 
         assert_eq!(reaped, 1, "only the >24h-old published row is GC'd");
-        assert!(store.row(&ids[0]).is_none(), "the old published row was reaped");
-        assert!(store.row(&ids[1]).is_some(), "the recent published row is retained");
-        assert!(store.row(&ids[2]).is_some(), "the UNSENT row is NEVER reaped (0 lost)");
+        assert!(
+            store.row(&ids[0]).is_none(),
+            "the old published row was reaped"
+        );
+        assert!(
+            store.row(&ids[1]).is_some(),
+            "the recent published row is retained"
+        );
+        assert!(
+            store.row(&ids[2]).is_some(),
+            "the UNSENT row is NEVER reaped (0 lost)"
+        );
         assert_eq!(store.outbox_depth(), 1, "GC did not touch the unsent set");
     }
 
@@ -1056,7 +1200,11 @@ mod tests {
         // even with a cutoff in the far future, no unsent row is reaped (0 lost).
         let reaped = relay.gc_published(&Timestamp("2099-01-01T00:00:00Z".into()));
         assert_eq!(reaped, 0, "an unsent outbox loses nothing to GC");
-        assert_eq!(store.outbox_depth(), 4, "all four rows still parked + deliverable");
+        assert_eq!(
+            store.outbox_depth(),
+            4,
+            "all four rows still parked + deliverable"
+        );
     }
 
     /// **EB-04 — the BusTransport put/consume CDC conformance pair.** The frozen seam contract:
@@ -1075,8 +1223,14 @@ mod tests {
 
         let bus = InProcessBus::new();
         // PROVIDER side: put two distinct events, then re-put the first (a redelivery).
-        assert_eq!(bus.put(&r0.subject, &r0.envelope, &r0.event_id).unwrap(), Delivery::Accepted);
-        assert_eq!(bus.put(&r1.subject, &r1.envelope, &r1.event_id).unwrap(), Delivery::Accepted);
+        assert_eq!(
+            bus.put(&r0.subject, &r0.envelope, &r0.event_id).unwrap(),
+            Delivery::Accepted
+        );
+        assert_eq!(
+            bus.put(&r1.subject, &r1.envelope, &r1.event_id).unwrap(),
+            Delivery::Accepted
+        );
         assert_eq!(
             bus.put(&r0.subject, &r0.envelope, &r0.event_id).unwrap(),
             Delivery::Deduplicated,
@@ -1085,9 +1239,19 @@ mod tests {
 
         // CONSUMER side: consume returns exactly the put envelopes, in publish order, once each.
         let consumed = bus.consume("myelin://acme/issues/issue/");
-        assert_eq!(consumed.len(), 2, "exactly two distinct events delivered (dedup suppressed the 3rd put)");
-        assert_eq!(consumed[0], r0.envelope, "consumer sees the provider's wire envelope #0");
-        assert_eq!(consumed[1], r1.envelope, "consumer sees the provider's wire envelope #1, in order");
+        assert_eq!(
+            consumed.len(),
+            2,
+            "exactly two distinct events delivered (dedup suppressed the 3rd put)"
+        );
+        assert_eq!(
+            consumed[0], r0.envelope,
+            "consumer sees the provider's wire envelope #0"
+        );
+        assert_eq!(
+            consumed[1], r1.envelope,
+            "consumer sees the provider's wire envelope #1, in order"
+        );
     }
 
     /// **EB-04 dated GATE re-confirm — SUB-D1 / BUS-D4 stay 0 ghost / 0 lost AFTER the relay
@@ -1108,25 +1272,52 @@ mod tests {
         // kill between commit and publish (SUB-D1 / BUS-D4 fault): severed → 0 delivered, 0 lost.
         bus.sever();
         relay.drain_to_empty();
-        assert_eq!(store.outbox_depth(), 5, "0 lost while severed (events parked)");
+        assert_eq!(
+            store.outbox_depth(),
+            5,
+            "0 lost while severed (events parked)"
+        );
         assert_eq!(bus.delivered_count(), 0, "0 ghost while severed");
-        assert!(relay.dead_letter_alerts().is_empty(), "no premature dead-letter");
+        assert!(
+            relay.dead_letter_alerts().is_empty(),
+            "no premature dead-letter"
+        );
 
         // heal + drain: exactly-once delivery (0 ghost, 0 lost), depth → 0.
         bus.heal();
         relay.drain_to_empty();
         assert_eq!(store.outbox_depth(), 0, "outbox-depth drains (SUB-D1)");
-        assert_eq!(store.dead_letter_count(), 0, "0 dead-letters on the no-loss path");
-        assert_eq!(bus.delivered_count(), 5, "exactly-once: 5 committed → 5 delivered");
-        assert_eq!(bus.delivered_ids(), committed, "delivered set == committed set (0 ghost/0 lost)");
+        assert_eq!(
+            store.dead_letter_count(),
+            0,
+            "0 dead-letters on the no-loss path"
+        );
+        assert_eq!(
+            bus.delivered_count(),
+            5,
+            "exactly-once: 5 committed → 5 delivered"
+        );
+        assert_eq!(
+            bus.delivered_ids(),
+            committed,
+            "delivered set == committed set (0 ghost/0 lost)"
+        );
 
         // EB-04 GC runs over the published rows: the delivered set is unchanged (GC frees the
         // retention window, never an undelivered event).
         let reaped = relay.gc_published(&Timestamp("2099-01-01T00:00:00Z".into()));
         assert_eq!(reaped, 5, "all 5 published rows aged out of the 24h window");
         assert_eq!(store.outbox_depth(), 0, "still 0 unsent after GC");
-        assert_eq!(bus.delivered_count(), 5, "GC did not lose or duplicate any delivery");
-        assert_eq!(bus.delivered_ids(), committed, "delivered set STILL == committed set after GC");
+        assert_eq!(
+            bus.delivered_count(),
+            5,
+            "GC did not lose or duplicate any delivery"
+        );
+        assert_eq!(
+            bus.delivered_ids(),
+            committed,
+            "delivered set STILL == committed set after GC"
+        );
         println!("[2026-06-19] PASS  gate=EB-04  SUB-D1/BUS-D4 reconfirm  ghost=0 lost=0  (after DLQ-alert + 24h-GC refinements)");
     }
 }

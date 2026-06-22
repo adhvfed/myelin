@@ -314,8 +314,10 @@ impl<'a> ReErasePass<'a> {
         for record in &post_pit {
             // (2a) Was the subject resurrected? Its per-subject DEK present in the restored copy means
             // the restore brought a now-supposed-to-be-erased key back to life.
-            let subject_dek =
-                DekId::new(record.tenant.clone(), KeyClass::Subject(record.subject.0.clone()));
+            let subject_dek = DekId::new(
+                record.tenant.clone(),
+                KeyClass::Subject(record.subject.0.clone()),
+            );
             let was_resurrected = self.dek_present(&subject_dek);
 
             // (2b) RE-APPLY the erasure: re-run the P-099 six-step algorithm (re-destroy DEK + re-run
@@ -338,8 +340,10 @@ impl<'a> ReErasePass<'a> {
         let resurrected_count = post_pit
             .iter()
             .filter(|record| {
-                let dek =
-                    DekId::new(record.tenant.clone(), KeyClass::Subject(record.subject.0.clone()));
+                let dek = DekId::new(
+                    record.tenant.clone(),
+                    KeyClass::Subject(record.subject.0.clone()),
+                );
                 self.dek_present(&dek)
             })
             .count() as u64;
@@ -355,10 +359,7 @@ impl<'a> ReErasePass<'a> {
     /// KMS engine — a resurrected key. A destroyed DEK is absent from both, so after a re-apply this is
     /// `false` (the §7.5 0-resurrected post-condition).
     fn dek_present(&self, dek: &DekId) -> bool {
-        self.engine
-            .backup_snapshot()
-            .iter()
-            .any(|(d, _)| d == dek)
+        self.engine.backup_snapshot().iter().any(|(d, _)| d == dek)
     }
 }
 
@@ -462,9 +463,7 @@ mod tests {
     use super::*;
     use crate::backup::{ContinuousArchiver, WalSegment};
     use crate::encryption::ColumnCryptor;
-    use crate::erase::{
-        BusErase, ErasureLedgerSink, PseudonymShred, RefsTombstone, SearchPurge,
-    };
+    use crate::erase::{BusErase, ErasureLedgerSink, PseudonymShred, RefsTombstone, SearchPurge};
     use crate::kms::KekId;
     use crate::restore::{restore_to_offset, BlobPresence, SourceLog};
     use myelin_gdpr::ErasureMethod;
@@ -534,9 +533,17 @@ mod tests {
     /// A reachable archiver (base at 0, tail at `tail`).
     fn reachable_archiver(tail: WalOffset) -> ContinuousArchiver {
         let mut a = ContinuousArchiver::new();
-        a.archive_segment(WalSegment { end_offset: 0, committed_at: 0 }).unwrap();
+        a.archive_segment(WalSegment {
+            end_offset: 0,
+            committed_at: 0,
+        })
+        .unwrap();
         a.take_base_backup(1);
-        a.archive_segment(WalSegment { end_offset: tail, committed_at: 10 }).unwrap();
+        a.archive_segment(WalSegment {
+            end_offset: tail,
+            committed_at: 10,
+        })
+        .unwrap();
         a
     }
 
@@ -586,8 +593,7 @@ mod tests {
         // The restored copy's KMS has the subject's DEK alive (the restore of T brought it back —
         // the erasure happened at offset 140, AFTER the backup PIT T=100).
         let kms = engine_with_subject(&tenant, &subject);
-        let subject_dek =
-            DekId::new(tenant.clone(), KeyClass::Subject(subject.0.clone()));
+        let subject_dek = DekId::new(tenant.clone(), KeyClass::Subject(subject.0.clone()));
         assert!(
             kms.backup_snapshot().iter().any(|(d, _)| *d == subject_dek),
             "the restored copy RESURRECTED the subject's DEK (it was live at the backup PIT)"
@@ -595,9 +601,15 @@ mod tests {
 
         // The restore landed at T=100.
         let arch = reachable_archiver(300);
-        let report =
-            restore_to_offset(&arch, 100, &[], &BlobPresence::new(), &SourceLog::new(), &kms)
-                .unwrap();
+        let report = restore_to_offset(
+            &arch,
+            100,
+            &[],
+            &BlobPresence::new(),
+            &SourceLog::new(),
+            &kms,
+        )
+        .unwrap();
 
         // The ledger records the erasure as completed at offset 140 (AFTER T=100).
         let mut ledger = InMemoryPostPitLedger::new();
@@ -628,7 +640,10 @@ mod tests {
         let calls = seams.calls.borrow();
         assert!(calls.contains(&"search:u-erased-after-backup".to_string()));
         assert!(calls.contains(&"refs:u-erased-after-backup".to_string()));
-        assert!(calls.contains(&"erased:u-erased-after-backup".to_string()), "`*.erased` re-emitted");
+        assert!(
+            calls.contains(&"erased:u-erased-after-backup".to_string()),
+            "`*.erased` re-emitted"
+        );
     }
 
     /// **The re-erasure pass is IDEMPOTENT** — running it TWICE yields the same `resurrected_count ==
@@ -640,9 +655,15 @@ mod tests {
         let subject = SubjectId::new("u-twice");
         let kms = engine_with_subject(&tenant, &subject);
         let arch = reachable_archiver(300);
-        let report =
-            restore_to_offset(&arch, 100, &[], &BlobPresence::new(), &SourceLog::new(), &kms)
-                .unwrap();
+        let report = restore_to_offset(
+            &arch,
+            100,
+            &[],
+            &BlobPresence::new(),
+            &SourceLog::new(),
+            &kms,
+        )
+        .unwrap();
         let mut ledger = InMemoryPostPitLedger::new();
         ledger.record(ErasureRecord::new(subject.clone(), tenant.clone(), 140));
         let seams = RecSeams::default();
@@ -650,11 +671,17 @@ mod tests {
 
         let first = pass.run(&report, &ledger, &holders(&seams), 1).unwrap();
         assert!(first.is_green());
-        assert!(first.re_erased[0].was_resurrected_before_reapply, "first pass re-killed it");
+        assert!(
+            first.re_erased[0].was_resurrected_before_reapply,
+            "first pass re-killed it"
+        );
 
         // SECOND pass: the DEK is already gone (a no-op re-apply); still 0 resurrected.
         let second = pass.run(&report, &ledger, &holders(&seams), 2).unwrap();
-        assert_eq!(second.resurrected_count, 0, "idempotent: still 0 resurrected");
+        assert_eq!(
+            second.resurrected_count, 0,
+            "idempotent: still 0 resurrected"
+        );
         assert!(
             !second.re_erased[0].was_resurrected_before_reapply,
             "the second pass found the key already gone (no resurrection to re-kill)"
@@ -710,16 +737,26 @@ mod tests {
     fn a_pre_pit_erasure_is_not_re_applied() {
         let kms = KmsEngine::new();
         let arch = reachable_archiver(300);
-        let report =
-            restore_to_offset(&arch, 100, &[], &BlobPresence::new(), &SourceLog::new(), &kms)
-                .unwrap();
+        let report = restore_to_offset(
+            &arch,
+            100,
+            &[],
+            &BlobPresence::new(),
+            &SourceLog::new(),
+            &kms,
+        )
+        .unwrap();
         let mut ledger = InMemoryPostPitLedger::new();
         // Erased at offset 60 — BEFORE the backup PIT T=100. Not a resurrection risk.
         ledger.record(ErasureRecord::new(SubjectId::new("pre"), t("acme"), 60));
         let seams = RecSeams::default();
         let pass = ReErasePass::new(&kms, r());
         let rep = pass.run(&report, &ledger, &holders(&seams), 1).unwrap();
-        assert_eq!(rep.re_erased_count(), 0, "a pre-PIT erasure is not re-applied");
+        assert_eq!(
+            rep.re_erased_count(),
+            0,
+            "a pre-PIT erasure is not re-applied"
+        );
         assert!(rep.is_green());
         assert!(seams.calls.borrow().is_empty(), "no re-erasure ran");
     }
@@ -733,7 +770,10 @@ mod tests {
             resurrected_count: 1, // a person un-erased
         };
         assert!(!red.is_green(), "a resurrected subject is RED");
-        let green = ReEraseReport { resurrected_count: 0, ..red };
+        let green = ReEraseReport {
+            resurrected_count: 0,
+            ..red
+        };
         assert!(green.is_green(), "0 resurrected is GREEN");
     }
 
@@ -747,8 +787,14 @@ mod tests {
         // A tenant recovery: killed at t=0, ready at t=2400s (40 min).
         let tenant_recovery = CellKillRestore::new(RtoGrain::Tenant, 0, 2_400);
         assert_eq!(tenant_recovery.rto_secs(), 2_400);
-        assert!(tenant_recovery.within_bound(3_600), "40 min ≤ 1 h tenant bound");
-        assert!(!tenant_recovery.within_bound(1_800), "40 min exceeds a 30-min bound (the gate bites)");
+        assert!(
+            tenant_recovery.within_bound(3_600),
+            "40 min ≤ 1 h tenant bound"
+        );
+        assert!(
+            !tenant_recovery.within_bound(1_800),
+            "40 min exceeds a 30-min bound (the gate bites)"
+        );
 
         // A cell recovery: killed at t=0, ready at t=10800s (3 h).
         let cell_recovery = CellKillRestore::new(RtoGrain::Cell, 0, 10_800);
@@ -766,7 +812,11 @@ mod tests {
     #[test]
     fn rto_clock_is_monotone() {
         let recovery = CellKillRestore::new(RtoGrain::Tenant, 100, 50);
-        assert_eq!(recovery.rto_secs(), 0, "ready clamped to began → RTO 0, never underflow");
+        assert_eq!(
+            recovery.rto_secs(),
+            0,
+            "ready clamped to began → RTO 0, never underflow"
+        );
     }
 
     /// The grain labels are stable (kills a `label -> ""`/swapped mutant — the telemetry label is

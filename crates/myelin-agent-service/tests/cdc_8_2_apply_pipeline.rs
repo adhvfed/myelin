@@ -160,7 +160,9 @@ fn tool(name: &str, caps: &[&str], requires_approval: bool) -> ToolDef {
         name: ToolName(name.into()),
         subsystem: "issues".into(),
         version: 1,
-        input_schema: r#"{"type":"object","required":["title"],"properties":{"title":{"type":"string"}}}"#.into(),
+        input_schema:
+            r#"{"type":"object","required":["title"],"properties":{"title":{"type":"string"}}}"#
+                .into(),
         required_caps: caps.iter().map(|c| c.to_string()).collect(),
         effect_kind: EffectKind::Mutate,
         side_effecting: true,
@@ -231,7 +233,10 @@ fn cdc_8_2_pipeline_applies_allowed_denies_disallowed() {
     // CONSUMER: an allowed effect → Applied(event_id), metered once.
     match p.apply_planned(&plan("issue.create")) {
         EffectResult::Applied(EventId(id)) => {
-            assert!(id.starts_with("evt:issue.create"), "applied carries the emitted event id: {id}")
+            assert!(
+                id.starts_with("evt:issue.create"),
+                "applied carries the emitted event id: {id}"
+            )
         }
         other => panic!("expected Applied, got {other:?}"),
     }
@@ -241,11 +246,22 @@ fn cdc_8_2_pipeline_applies_allowed_denies_disallowed() {
         other => panic!("expected Denied, got {other:?}"),
     }
 
-    assert_eq!(endpoint.applied.borrow().len(), 1, "exactly one mutation reached a subsystem endpoint");
-    assert_eq!(budget.settles, 1, "exactly one cost event metered (the applied effect)");
+    assert_eq!(
+        endpoint.applied.borrow().len(),
+        1,
+        "exactly one mutation reached a subsystem endpoint"
+    );
+    assert_eq!(
+        budget.settles, 1,
+        "exactly one cost event metered (the applied effect)"
+    );
     assert_eq!(signals.applied(), 1);
     assert_eq!(signals.denied(), 1);
-    assert_eq!(signals.privileged_fallback(), 0, "AG-D2: 0 privileged fallback");
+    assert_eq!(
+        signals.privileged_fallback(),
+        0,
+        "AG-D2: 0 privileged fallback"
+    );
 }
 
 /// **CONSUMER CDC for 4.2 (`check` + `CaveatContext`) — the pipeline consumes a REAL `check`
@@ -293,7 +309,11 @@ fn cdc_4_2_consumer_check_with_caveat_fail_closes() {
         EffectResult::Denied(_) => {}
         other => panic!("a Conditional caveat must DENY, never silently allow; got {other:?}"),
     }
-    assert_eq!(endpoint.applied.borrow().len(), 0, "the unmet caveat did NOT mutate");
+    assert_eq!(
+        endpoint.applied.borrow().len(),
+        0,
+        "the unmet caveat did NOT mutate"
+    );
 }
 
 /// **CONSUMER CDC for 4.5 (`delegation` → `EffectivePolicy`) — the pipeline consumes the REAL ∩
@@ -338,7 +358,11 @@ fn cdc_4_5_consumer_delegation_intersection_confines() {
         EffectResult::Denied(r) => assert!(r.contains("intersection"), "{r}"),
         other => panic!("over-privilege must be confined to the ∩; got {other:?}"),
     }
-    assert_eq!(endpoint.applied.borrow().len(), 0, "the over-privileged effect did NOT mutate");
+    assert_eq!(
+        endpoint.applied.borrow().len(),
+        0,
+        "the over-privileged effect did NOT mutate"
+    );
 }
 
 /// **The frozen 8.2 `EffectApi::apply(&RunCtx, ProposedEffect)` trait body works through the glue
@@ -347,7 +371,11 @@ fn cdc_4_5_consumer_delegation_intersection_confines() {
 #[test]
 fn cdc_8_2_glue_trait_body_through_the_carrier_gates_without_mutating() {
     let cat = Catalogue {
-        defs: vec![tool("git.merge", &["git.merge"], /* requires_approval */ true)],
+        defs: vec![tool(
+            "git.merge",
+            &["git.merge"],
+            /* requires_approval */ true,
+        )],
     };
     let check = ProviderCheck {
         allow: ["git.merge".to_string()].into_iter().collect(),
@@ -386,5 +414,9 @@ fn cdc_8_2_glue_trait_body_through_the_carrier_gates_without_mutating() {
         EffectResult::Gated(_) => {}
         other => panic!("a requires_approval tool must Gate (AG-8); got {other:?}"),
     }
-    assert_eq!(endpoint.applied.borrow().len(), 0, "a gated effect does NOT mutate (AG-8)");
+    assert_eq!(
+        endpoint.applied.borrow().len(),
+        0,
+        "a gated effect does NOT mutate (AG-8)"
+    );
 }

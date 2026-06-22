@@ -23,9 +23,7 @@ use myelin_events::{
     Visibility,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
-use myelin_refs_service::{
-    NoOpCacheShim, RefsProjectionInvalidator, INVALIDATOR_SUBJECT_PREFIXES,
-};
+use myelin_refs_service::{NoOpCacheShim, RefsProjectionInvalidator, INVALIDATOR_SUBJECT_PREFIXES};
 use myelin_tenancy::{Region, TenantId};
 use std::sync::Arc;
 
@@ -65,7 +63,10 @@ fn lifecycle_event(id: &str, type_: &str, subject: &str) -> EventEnvelope {
 }
 
 fn msg(subject: &str, ev: &EventEnvelope) -> Message {
-    Message { subject: subject.into(), envelope: ev.clone() }
+    Message {
+        subject: subject.into(),
+        envelope: ev.clone(),
+    }
 }
 
 /// **The refs-projection-invalidator is a valid consumer: it binds through the ONE sanctioned
@@ -113,9 +114,16 @@ fn updated_busts_once_and_redelivery_is_deduped() {
         "redelivery is deduped (0 double-bust)"
     );
     let calls = shim.invalidations();
-    assert_eq!(calls.len(), 1, "exactly one invalidation call (idempotent on event_id)");
+    assert_eq!(
+        calls.len(),
+        1,
+        "exactly one invalidation call (idempotent on event_id)"
+    );
     assert_eq!(calls[0].tenant, tenant(), "tenant-first");
-    assert_eq!(calls[0].ref_.0, ref_, "the exact ArtifactRef the event named");
+    assert_eq!(
+        calls[0].ref_.0, ref_,
+        "the exact ArtifactRef the event named"
+    );
 }
 
 /// **An `*.erased` busts the cache through the runtime (the §3.6 erasure invalidation).**
@@ -130,8 +138,15 @@ fn erased_busts_through_the_runtime() {
     let consumer = consume(spec, inv, DedupLedger::new()).expect("bind");
     let ref_ = "myelin://acme/issue/issue/ENG-1";
     let ev = lifecycle_event("01J-e1", "issue.issue.erased", ref_);
-    assert_eq!(consumer.deliver(&msg("issue.issue.erased", &ev)), Delivered::Acked);
-    assert_eq!(shim.call_count(), 1, "the erased artifact's cache entry is busted");
+    assert_eq!(
+        consumer.deliver(&msg("issue.issue.erased", &ev)),
+        Delivered::Acked
+    );
+    assert_eq!(
+        shim.call_count(),
+        1,
+        "the erased artifact's cache entry is busted"
+    );
 }
 
 /// **A `*.created` is acked with NO bust (the invalidator only busts on update/erase).** Creation
@@ -145,7 +160,11 @@ fn created_is_acked_with_no_bust() {
         INVALIDATOR_SUBJECT_PREFIXES,
     );
     let consumer = consume(spec, inv, DedupLedger::new()).expect("bind");
-    let ev = lifecycle_event("01J-c1", "issue.issue.created", "myelin://acme/issue/issue/ENG-2");
+    let ev = lifecycle_event(
+        "01J-c1",
+        "issue.issue.created",
+        "myelin://acme/issue/issue/ENG-2",
+    );
     assert_eq!(
         consumer.deliver(&msg("issue.issue.created", &ev)),
         Delivered::Acked,
@@ -171,7 +190,10 @@ fn malformed_updated_dead_letters() {
     bad.payload = serde_json::json!({ "title": "x" }); // no ref/subject.
     match consumer.deliver(&msg("knowledge.page.updated", &bad)) {
         Delivered::DeadLettered(Reason(r)) => {
-            assert!(r.contains("ArtifactRef"), "the poison names the missing ref: {r}")
+            assert!(
+                r.contains("ArtifactRef"),
+                "the poison names the missing ref: {r}"
+            )
         }
         other => panic!("a malformed invalidation event must dead-letter, got {other:?}"),
     }

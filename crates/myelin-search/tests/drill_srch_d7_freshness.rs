@@ -56,7 +56,11 @@ impl SyntheticOwner {
     fn put(&self, ref_: &str, text: &str) {
         self.projections.lock().unwrap().insert(
             ref_.to_string(),
-            SearchProjection { text: text.into(), fields: BTreeMap::new(), lang: None },
+            SearchProjection {
+                text: text.into(),
+                fields: BTreeMap::new(),
+                lang: None,
+            },
         );
     }
 }
@@ -83,7 +87,11 @@ fn event(id: &str, subject: &str) -> EventEnvelope {
         schema_ver: 1,
         tenant: tenant(),
         region: region(),
-        actor: Actor(Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, tenant())),
+        actor: Actor(Principal::stub(
+            PrincipalId("p".into()),
+            PrincipalKind::Human,
+            tenant(),
+        )),
         subject: ArtifactRef(subject.into()),
         aggregate: AggregateKey(format!("agg:{subject}")),
         causation_id: None,
@@ -115,8 +123,16 @@ fn srch_d7_synthetic_event_is_searchable_within_the_freshness_budget() {
     );
 
     // index_lag emits (contract 1.8) — 0 before any event (the signal exists, named).
-    assert_eq!(indexer.index_lag(), 0, "the index_lag signal reads 0 on a fresh indexer");
-    assert_eq!(IncrementalIndexer::INDEX_LAG_SIGNAL, "search.index_lag", "the contract-1.8 signal name");
+    assert_eq!(
+        indexer.index_lag(),
+        0,
+        "the index_lag signal reads 0 on a fresh indexer"
+    );
+    assert_eq!(
+        IncrementalIndexer::INDEX_LAG_SIGNAL,
+        "search.index_lag",
+        "the contract-1.8 signal name"
+    );
 
     // The synthetic event arrives; measure the time to searchable.
     let t0 = Instant::now();
@@ -134,7 +150,11 @@ fn srch_d7_synthetic_event_is_searchable_within_the_freshness_budget() {
     );
 
     // index_lag recovered to 0 after the synchronous apply (the steady-state signal).
-    assert_eq!(indexer.index_lag(), 0, "index_lag recovers to 0 after projection (no stuck lag)");
+    assert_eq!(
+        indexer.index_lag(),
+        0,
+        "index_lag recovers to 0 after projection (no stuck lag)"
+    );
 }
 
 /// **The `index_lag` signal is NON-ZERO while an event is mid-flight (the drill that pauses mid-apply
@@ -191,10 +211,17 @@ fn srch_d7_index_lag_is_observable_mid_flight() {
 
     // Wait until the indexer has entered the pipeline (the owner fetch started) — index_lag is now > 0.
     started_rx.recv().expect("the indexer entered the pipeline");
-    assert!(indexer.index_lag() >= 1, "index_lag is NON-ZERO while an event is mid-flight (the live signal)");
+    assert!(
+        indexer.index_lag() >= 1,
+        "index_lag is NON-ZERO while an event is mid-flight (the live signal)"
+    );
 
     // Release the owner; the apply completes and lag recovers to 0.
     release_tx.send(()).expect("release");
     assert_eq!(h.join().expect("handle thread"), HandleOutcome::Done);
-    assert_eq!(indexer.index_lag(), 0, "index_lag recovers to 0 once the apply completes");
+    assert_eq!(
+        indexer.index_lag(),
+        0,
+        "index_lag recovers to 0 once the apply completes"
+    );
 }

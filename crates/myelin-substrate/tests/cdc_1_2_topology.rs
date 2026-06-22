@@ -16,16 +16,20 @@
 //! `tests/drill_sub_d7_idor.rs`).
 
 use myelin_events::relay::InProcessBus;
+use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_substrate::serve::{boot, AppSpec, OutboxSpec, Surface};
 use myelin_substrate::{
     AllowPrincipal, Config, CriticalDependencies, HotTables, InjectedIdentity, InternalReject,
     InternalRpc, InternalSurface, Migrations, PublicReject, PublicRoutes, StoreManifest,
 };
-use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_tenancy::TenantId;
 
 fn stub(id: &str, tenant: &str) -> Principal {
-    Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, TenantId(tenant.into()))
+    Principal::stub(
+        PrincipalId(id.into()),
+        PrincipalKind::Human,
+        TenantId(tenant.into()),
+    )
 }
 
 /// **CDC 1.2 — the consumer side (public surface).** A service boots via `serve`'s lifecycle; the
@@ -75,8 +79,16 @@ fn cdc_1_2_lifecycle_public_surface_is_tenant_from_token() {
         }),
         "a path≠token spoof is rejected as an IDOR"
     );
-    assert_eq!(public.audit().count(), 1, "the spoof was audited (PII-free)");
-    assert_eq!(public.misroute_count(), 0, "the SUB-D7 zero: no cross-tenant read served");
+    assert_eq!(
+        public.audit().count(),
+        1,
+        "the spoof was audited (PII-free)"
+    );
+    assert_eq!(
+        public.misroute_count(),
+        0,
+        "the SUB-D7 zero: no cross-tenant read served"
+    );
 }
 
 /// **CDC 1.2 — the consumer side (internal surface).** A service builds the internal RPC trust

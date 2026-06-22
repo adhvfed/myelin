@@ -66,9 +66,7 @@
 //!   two seams (the substrate primitive + the Identity authz usage).
 
 use myelin_events::Timestamp;
-use myelin_identity::{
-    Consistency, ConsistencyMode, Decision, PrincipalId, RevokeTarget,
-};
+use myelin_identity::{Consistency, ConsistencyMode, Decision, PrincipalId, RevokeTarget};
 use myelin_storage::TenantScope;
 use myelin_substrate::thresholds::FailStaticThreshold;
 use myelin_substrate::{
@@ -119,7 +117,10 @@ impl CoarseGrant {
     /// the cache stores the answer it was given; the revocation gate (S7) is what makes a *later*
     /// disable take effect through a stale entry.
     pub fn from_decision(decision: Decision, actor_active: bool) -> CoarseGrant {
-        CoarseGrant { actor_active, coarse_grant: decision }
+        CoarseGrant {
+            actor_active,
+            coarse_grant: decision,
+        }
     }
 }
 
@@ -267,7 +268,10 @@ impl<C: Clock> FailStaticCache<C> {
         // revoked subject is denied on EVERY consistency mode, BEFORE the cache is even consulted.
         // This is the F7 / ID-D2 correctness floor: a stale ALLOW in S6 never overrides a revoke.
         if self.subject_revoked(scope, subject, now) {
-            return CachedDecision { decision: Decision::Deny, served: Served::Revoked };
+            return CachedDecision {
+                decision: Decision::Deny,
+                served: Served::Revoked,
+            };
         }
 
         match consistency.mode {
@@ -277,12 +281,18 @@ impl<C: Clock> FailStaticCache<C> {
             ConsistencyMode::Strong => match source() {
                 Ok(decision) => {
                     self.telemetry.observe_bypass();
-                    CachedDecision { decision, served: Served::SourceBypass }
+                    CachedDecision {
+                        decision,
+                        served: Served::SourceBypass,
+                    }
                 }
                 // The new-enemy guard: a zookie read does NOT fall back to stale — it fails closed.
                 Err(_hiccup) => {
                     self.telemetry.observe_bypass_closed();
-                    CachedDecision { decision: Decision::Deny, served: Served::BypassClosed }
+                    CachedDecision {
+                        decision: Decision::Deny,
+                        served: Served::BypassClosed,
+                    }
                 }
             },
 
@@ -313,7 +323,10 @@ impl<C: Clock> FailStaticCache<C> {
             // `fail_static_signals` is the authoritative survival signal.
             Answer::Fresh(grant) => {
                 self.telemetry.observe_hit();
-                CachedDecision { decision: grant.coarse_grant, served: Served::Fresh }
+                CachedDecision {
+                    decision: grant.coarse_grant,
+                    served: Served::Fresh,
+                }
             }
             // Static (degraded): the bounded-staleness availability win — the last coarse grant is
             // served while the upstream hiccups. The drill asserts authenticated traffic survives
@@ -321,12 +334,18 @@ impl<C: Clock> FailStaticCache<C> {
             Answer::Static(grant) => {
                 let age = self.inner.signals().last_staleness_secs;
                 self.telemetry.observe_stale(age);
-                CachedDecision { decision: grant.coarse_grant, served: Served::Static }
+                CachedDecision {
+                    decision: grant.coarse_grant,
+                    served: Served::Static,
+                }
             }
             // Closed: budget spent or no fallback → fail CLOSED (deny is correct). NEVER open.
             Answer::Closed => {
                 self.telemetry.observe_closed();
-                CachedDecision { decision: Decision::Deny, served: Served::Closed }
+                CachedDecision {
+                    decision: Decision::Deny,
+                    served: Served::Closed,
+                }
             }
         }
     }
@@ -421,8 +440,7 @@ pub struct CacheTelemetry {
 
 impl CacheTelemetry {
     /// The FROZEN `cache_hit_ratio` signal name (contract-index row 1.8).
-    pub const CACHE_HIT_RATIO: &'static str =
-        myelin_identity::iam_events::signals::CACHE_HIT_RATIO;
+    pub const CACHE_HIT_RATIO: &'static str = myelin_identity::iam_events::signals::CACHE_HIT_RATIO;
     /// The FROZEN `staleness_age` signal name (contract-index row 1.8).
     pub const STALENESS_AGE: &'static str = myelin_identity::iam_events::signals::STALENESS_AGE;
 
@@ -532,8 +550,13 @@ mod tests {
     }
 
     fn cache_at(t0: u64) -> FailStaticCache<TestClock> {
-        FailStaticCache::try_new_with_clock(300, &threshold(), RevocationStore::new(), TestClock::at(t0))
-            .expect("valid bound")
+        FailStaticCache::try_new_with_clock(
+            300,
+            &threshold(),
+            RevocationStore::new(),
+            TestClock::at(t0),
+        )
+        .expect("valid bound")
     }
 
     fn allow() -> Result<Decision, ServeError> {
@@ -550,14 +573,23 @@ mod tests {
         // A threshold whose seed exceeds the revocation SLA (301 > 300) does not construct.
         let mut bad = threshold();
         bad.static_max_default_secs = 301;
-        match FailStaticCache::try_new_with_clock(300, &bad, RevocationStore::new(), TestClock::at(0)) {
+        match FailStaticCache::try_new_with_clock(
+            300,
+            &bad,
+            RevocationStore::new(),
+            TestClock::at(0),
+        ) {
             Err(FailStaticError::ExceedsRevocationSla { .. }) => {}
             Err(other) => panic!("expected ExceedsRevocationSla, got {other:?}"),
             Ok(_) => panic!("a static_max over the revocation SLA must reject (4.11 / §8.2)"),
         }
         // The valid seed (300 == SLA, ≥ token TTL) constructs; its static_max is the seed W.
         let c = cache_at(0);
-        assert_eq!(c.static_max(), 300, "S6's W is the thresholds-file engineering seed");
+        assert_eq!(
+            c.static_max(),
+            300,
+            "S6's W is the thresholds-file engineering seed"
+        );
     }
 
     /// **S6 serves coarse grants during an injected Id-hiccup (availability fails static).** A
@@ -570,16 +602,40 @@ mod tests {
         let subj = PrincipalId("p:alice".into());
 
         // 1) a healthy read caches the Allow + serves it Fresh.
-        let fresh = c.check_cached(&acme, &subj, "read@doc:1", &bounded_stale(), &ts("z"), allow);
+        let fresh = c.check_cached(
+            &acme,
+            &subj,
+            "read@doc:1",
+            &bounded_stale(),
+            &ts("z"),
+            allow,
+        );
         assert_eq!(fresh.served, Served::Fresh);
         assert!(fresh.is_allow(), "the healthy read allows");
 
         // advance past fresh_ttl (age 31 > 30) but within static_max → STATIC (degraded) on a hiccup.
         c.clock().advance(31);
-        let stale = c.check_cached(&acme, &subj, "read@doc:1", &bounded_stale(), &ts("z"), hiccup);
-        assert_eq!(stale.served, Served::Static, "the hiccup is survived on the static fallback");
-        assert!(stale.is_allow(), "authenticated traffic survives the hiccup (still Allow)");
-        assert!(stale.is_degraded(), "the answer is marked degraded (bounded-staleness win)");
+        let stale = c.check_cached(
+            &acme,
+            &subj,
+            "read@doc:1",
+            &bounded_stale(),
+            &ts("z"),
+            hiccup,
+        );
+        assert_eq!(
+            stale.served,
+            Served::Static,
+            "the hiccup is survived on the static fallback"
+        );
+        assert!(
+            stale.is_allow(),
+            "authenticated traffic survives the hiccup (still Allow)"
+        );
+        assert!(
+            stale.is_degraded(),
+            "the answer is marked degraded (bounded-staleness win)"
+        );
     }
 
     /// **A zookie-stamped (`Strong`) read BYPASSES S6 (the 4.10 bypass half).** It goes straight to
@@ -592,20 +648,43 @@ mod tests {
         let subj = PrincipalId("p:alice".into());
 
         // Warm S6 with a stale Allow via a BoundedStale read.
-        let _ = c.check_cached(&acme, &subj, "read@doc:1", &bounded_stale(), &ts("z"), allow);
+        let _ = c.check_cached(
+            &acme,
+            &subj,
+            "read@doc:1",
+            &bounded_stale(),
+            &ts("z"),
+            allow,
+        );
         c.clock().advance(31); // S6 now holds a stale-eligible Allow
 
         // A STRONG read with a hiccup does NOT serve the stale S6 allow — it fails CLOSED.
         let strong_hiccup =
             c.check_cached(&acme, &subj, "read@doc:1", &strong("z2"), &ts("z2"), hiccup);
-        assert_eq!(strong_hiccup.served, Served::BypassClosed, "strong read bypassed the cache");
-        assert!(strong_hiccup.is_deny(), "a strong read fails CLOSED on a hiccup (never stale)");
+        assert_eq!(
+            strong_hiccup.served,
+            Served::BypassClosed,
+            "strong read bypassed the cache"
+        );
+        assert!(
+            strong_hiccup.is_deny(),
+            "a strong read fails CLOSED on a hiccup (never stale)"
+        );
 
         // A STRONG read with a healthy source serves the AUTHORITATIVE answer (bypass), not the cache.
         let strong_ok =
-            c.check_cached(&acme, &subj, "read@doc:1", &strong("z2"), &ts("z2"), || Ok(Decision::Deny));
-        assert_eq!(strong_ok.served, Served::SourceBypass, "strong read served from source");
-        assert!(strong_ok.is_deny(), "the strong read returns the live authoritative Deny, not the cached Allow");
+            c.check_cached(&acme, &subj, "read@doc:1", &strong("z2"), &ts("z2"), || {
+                Ok(Decision::Deny)
+            });
+        assert_eq!(
+            strong_ok.served,
+            Served::SourceBypass,
+            "strong read served from source"
+        );
+        assert!(
+            strong_ok.is_deny(),
+            "the strong read returns the live authoritative Deny, not the cached Allow"
+        );
     }
 
     /// **A just-revoked grant is still denied (the F7 / ID-D2 correctness floor).** Even when S6
@@ -619,11 +698,28 @@ mod tests {
         let subj = PrincipalId("p:alice".into());
 
         // Warm S6 with a stale Allow.
-        let _ = c.check_cached(&acme, &subj, "read@doc:1", &bounded_stale(), &ts("z"), allow);
+        let _ = c.check_cached(
+            &acme,
+            &subj,
+            "read@doc:1",
+            &bounded_stale(),
+            &ts("z"),
+            allow,
+        );
         c.clock().advance(31);
         // Confirm it WOULD serve a stale allow absent a revocation.
-        let before = c.check_cached(&acme, &subj, "read@doc:1", &bounded_stale(), &ts("z"), hiccup);
-        assert!(before.is_allow() && before.is_degraded(), "the stale allow is live before revoke");
+        let before = c.check_cached(
+            &acme,
+            &subj,
+            "read@doc:1",
+            &bounded_stale(),
+            &ts("z"),
+            hiccup,
+        );
+        assert!(
+            before.is_allow() && before.is_degraded(),
+            "the stale allow is live before revoke"
+        );
 
         // SCIM-disable the subject (the §4 authoritative deny path).
         c.revocations()
@@ -638,8 +734,15 @@ mod tests {
             &ts("2026-06-19T00:01:00Z"),
             hiccup,
         );
-        assert_eq!(after.served, Served::Revoked, "the revoke is enforced before the cache is read");
-        assert!(after.is_deny(), "0 successful authz after the cache for a revoked subject (F7)");
+        assert_eq!(
+            after.served,
+            Served::Revoked,
+            "the revoke is enforced before the cache is read"
+        );
+        assert!(
+            after.is_deny(),
+            "0 successful authz after the cache for a revoked subject (F7)"
+        );
     }
 
     /// **Correctness fails CLOSED while availability fails STATIC.** Past the staleness budget a
@@ -650,13 +753,34 @@ mod tests {
         let c = cache_at(1_000);
         let acme = scope("acme");
         let subj = PrincipalId("p:alice".into());
-        let _ = c.check_cached(&acme, &subj, "read@doc:1", &bounded_stale(), &ts("z"), allow);
+        let _ = c.check_cached(
+            &acme,
+            &subj,
+            "read@doc:1",
+            &bounded_stale(),
+            &ts("z"),
+            allow,
+        );
 
         // advance one past static_max (age 301 > 300) → fail CLOSED (deny), never open.
         c.clock().advance(301);
-        let closed = c.check_cached(&acme, &subj, "read@doc:1", &bounded_stale(), &ts("z"), hiccup);
-        assert_eq!(closed.served, Served::Closed, "past the budget the cache fails closed");
-        assert!(closed.is_deny(), "fail CLOSED (deny is correct), never fail open");
+        let closed = c.check_cached(
+            &acme,
+            &subj,
+            "read@doc:1",
+            &bounded_stale(),
+            &ts("z"),
+            hiccup,
+        );
+        assert_eq!(
+            closed.served,
+            Served::Closed,
+            "past the budget the cache fails closed"
+        );
+        assert!(
+            closed.is_deny(),
+            "fail CLOSED (deny is correct), never fail open"
+        );
     }
 
     /// **A cold `BoundedStale` read with no fallback fails CLOSED (never open).** A hiccup before any
@@ -666,9 +790,19 @@ mod tests {
         let c = cache_at(0);
         let acme = scope("acme");
         let subj = PrincipalId("p:bob".into());
-        let cold = c.check_cached(&acme, &subj, "read@doc:1", &bounded_stale(), &ts("z"), hiccup);
+        let cold = c.check_cached(
+            &acme,
+            &subj,
+            "read@doc:1",
+            &bounded_stale(),
+            &ts("z"),
+            hiccup,
+        );
         assert_eq!(cold.served, Served::Closed, "no fallback → fail closed");
-        assert!(cold.is_deny(), "S6 never fabricates an allow (never fail open)");
+        assert!(
+            cold.is_deny(),
+            "S6 never fabricates an allow (never fail open)"
+        );
     }
 
     /// **The cache is `(tenant, region, subject, question)`-keyed — no cross-tenant / cross-question
@@ -683,17 +817,45 @@ mod tests {
         let bob = PrincipalId("p:bob".into());
 
         // Warm acme/alice/read@doc:1 with an Allow.
-        let _ = c.check_cached(&acme, &alice, "read@doc:1", &bounded_stale(), &ts("z"), allow);
+        let _ = c.check_cached(
+            &acme,
+            &alice,
+            "read@doc:1",
+            &bounded_stale(),
+            &ts("z"),
+            allow,
+        );
         c.clock().advance(31);
 
         // A DIFFERENT tenant (same id) has no cached grant → a hiccup fails closed (not alice's allow).
-        let cross_tenant = c.check_cached(&evil, &alice, "read@doc:1", &bounded_stale(), &ts("z"), hiccup);
+        let cross_tenant = c.check_cached(
+            &evil,
+            &alice,
+            "read@doc:1",
+            &bounded_stale(),
+            &ts("z"),
+            hiccup,
+        );
         assert!(cross_tenant.is_deny(), "no cross-tenant cache leak");
         // A DIFFERENT subject has no cached grant → fails closed.
-        let cross_subject = c.check_cached(&acme, &bob, "read@doc:1", &bounded_stale(), &ts("z"), hiccup);
+        let cross_subject = c.check_cached(
+            &acme,
+            &bob,
+            "read@doc:1",
+            &bounded_stale(),
+            &ts("z"),
+            hiccup,
+        );
         assert!(cross_subject.is_deny(), "no cross-subject cache leak");
         // A DIFFERENT question has no cached grant → fails closed.
-        let cross_question = c.check_cached(&acme, &alice, "write@doc:1", &bounded_stale(), &ts("z"), hiccup);
+        let cross_question = c.check_cached(
+            &acme,
+            &alice,
+            "write@doc:1",
+            &bounded_stale(),
+            &ts("z"),
+            hiccup,
+        );
         assert!(cross_question.is_deny(), "no cross-question cache leak");
     }
 
@@ -710,13 +872,34 @@ mod tests {
         let subj = PrincipalId("p:alice".into());
 
         // fresh hit
-        let _ = c.check_cached(&acme, &subj, "read@doc:1", &bounded_stale(), &ts("z"), allow);
+        let _ = c.check_cached(
+            &acme,
+            &subj,
+            "read@doc:1",
+            &bounded_stale(),
+            &ts("z"),
+            allow,
+        );
         // stale hit (records a staleness age)
         c.clock().advance(31);
-        let _ = c.check_cached(&acme, &subj, "read@doc:1", &bounded_stale(), &ts("z"), hiccup);
+        let _ = c.check_cached(
+            &acme,
+            &subj,
+            "read@doc:1",
+            &bounded_stale(),
+            &ts("z"),
+            hiccup,
+        );
         // closed miss
         c.clock().advance(301);
-        let _ = c.check_cached(&acme, &subj, "read@doc:1", &bounded_stale(), &ts("z"), hiccup);
+        let _ = c.check_cached(
+            &acme,
+            &subj,
+            "read@doc:1",
+            &bounded_stale(),
+            &ts("z"),
+            hiccup,
+        );
 
         let t = c.telemetry();
         assert_eq!(t.hits(), 2, "two cache hits (fresh + stale)");
@@ -743,7 +926,11 @@ mod tests {
         assert_eq!(t.bypasses(), 2, "both strong reads bypassed the cache");
         assert_eq!(t.hits(), 0);
         assert_eq!(t.misses(), 0);
-        assert_eq!(t.cache_hit_ratio_pct(), None, "no cache-consulting read → no ratio (never fabricated)");
+        assert_eq!(
+            t.cache_hit_ratio_pct(),
+            None,
+            "no cache-consulting read → no ratio (never fabricated)"
+        );
     }
 
     /// **The fresh/stale/closed survival signals are exposed (architecture §10.2 row 6).** The drill
@@ -754,13 +941,33 @@ mod tests {
         let c = cache_at(1_000);
         let acme = scope("acme");
         let subj = PrincipalId("p:alice".into());
-        let _ = c.check_cached(&acme, &subj, "read@doc:1", &bounded_stale(), &ts("z"), allow); // fresh
+        let _ = c.check_cached(
+            &acme,
+            &subj,
+            "read@doc:1",
+            &bounded_stale(),
+            &ts("z"),
+            allow,
+        ); // fresh
         c.clock().advance(31);
-        let _ = c.check_cached(&acme, &subj, "read@doc:1", &bounded_stale(), &ts("z"), hiccup); // stale
+        let _ = c.check_cached(
+            &acme,
+            &subj,
+            "read@doc:1",
+            &bounded_stale(),
+            &ts("z"),
+            hiccup,
+        ); // stale
         let s = c.fail_static_signals();
         assert_eq!(s.fresh, 1, "one fresh answer");
-        assert_eq!(s.stale, 1, "one stale (degraded) answer — the survival rung");
-        assert!(s.last_staleness_secs <= c.static_max(), "staleness ≤ the budget");
+        assert_eq!(
+            s.stale, 1,
+            "one stale (degraded) answer — the survival rung"
+        );
+        assert!(
+            s.last_staleness_secs <= c.static_max(),
+            "staleness ≤ the budget"
+        );
     }
 
     /// **`CoarseGrant::from_decision` never fabricates an allow + caches only authoritative answers.**
@@ -772,12 +979,29 @@ mod tests {
         let acme = scope("acme");
         let subj = PrincipalId("p:alice".into());
         // a DENY source caches a Deny.
-        let d = c.check_cached(&acme, &subj, "read@doc:1", &bounded_stale(), &ts("z"), || Ok(Decision::Deny));
+        let d = c.check_cached(
+            &acme,
+            &subj,
+            "read@doc:1",
+            &bounded_stale(),
+            &ts("z"),
+            || Ok(Decision::Deny),
+        );
         assert!(d.is_deny(), "a Deny source serves Deny");
         // on a hiccup the cached Deny is replayed STALE — still a Deny (never escalated to Allow).
         c.clock().advance(31);
-        let stale = c.check_cached(&acme, &subj, "read@doc:1", &bounded_stale(), &ts("z"), hiccup);
+        let stale = c.check_cached(
+            &acme,
+            &subj,
+            "read@doc:1",
+            &bounded_stale(),
+            &ts("z"),
+            hiccup,
+        );
         assert_eq!(stale.served, Served::Static);
-        assert!(stale.is_deny(), "the stale fallback replays the cached Deny — never escalates to Allow");
+        assert!(
+            stale.is_deny(),
+            "the stale fallback replays the cached Deny — never escalates to Allow"
+        );
     }
 }

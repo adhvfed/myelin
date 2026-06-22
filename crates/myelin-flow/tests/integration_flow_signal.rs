@@ -28,7 +28,10 @@ async fn flow_p09_signal_delivery_buffers_once_on_conflict_in_real_postgres() {
     let cfg = MyelinConfig::dev();
     let admin = sqlx::postgres::PgPoolOptions::new()
         .max_connections(4)
-        .connect(&cfg.database_url.replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw"))
+        .connect(
+            &cfg.database_url
+                .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw"),
+        )
         .await
         .expect("connect as admin to dev Postgres (is the stack up?)");
 
@@ -41,9 +44,18 @@ async fn flow_p09_signal_delivery_buffers_once_on_conflict_in_real_postgres() {
     let idx_create = WF_SIGNAL_PENDING_IDX
         .replacen("wf_signal_pending", &format!("{sig_tbl}_pending"), 1)
         .replacen("ON wf_signal", &format!("ON {sig_tbl}"), 1);
-    sqlx::query(&format!("DROP TABLE IF EXISTS {sig_tbl}")).execute(&admin).await.unwrap();
-    sqlx::query(&sig_create).execute(&admin).await.expect("the wf_signal DDL applies");
-    sqlx::query(&idx_create).execute(&admin).await.expect("the wf_signal_pending index applies");
+    sqlx::query(&format!("DROP TABLE IF EXISTS {sig_tbl}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    sqlx::query(&sig_create)
+        .execute(&admin)
+        .await
+        .expect("the wf_signal DDL applies");
+    sqlx::query(&idx_create)
+        .execute(&admin)
+        .await
+        .expect("the wf_signal_pending index applies");
 
     // The DELIVERY: INSERT … ON CONFLICT (tenant_id, run_id, signal_name, idem_key) DO NOTHING — the
     // exact statement `DurableExecutor::signal` issues. The references-not-payloads payload is jsonb
@@ -68,12 +80,18 @@ async fn flow_p09_signal_delivery_buffers_once_on_conflict_in_real_postgres() {
 
     // FIRST delivery: the row is inserted (RETURNING yields a row — buffered).
     let first = deliver("first").await;
-    assert!(first.is_some(), "the FIRST delivery buffered the signal (RETURNING a row)");
+    assert!(
+        first.is_some(),
+        "the FIRST delivery buffered the signal (RETURNING a row)"
+    );
 
     // SECOND delivery (the at-least-once redelivery, §4.9): SAME (tenant, run, signal_name, idem_key),
     // a DIFFERENT payload — ON CONFLICT DO NOTHING fires, NOTHING is inserted (RETURNING is empty).
     let second = deliver("second").await;
-    assert!(second.is_none(), "the RE-delivery is a no-op (ON CONFLICT DO NOTHING — the workflow wakes once)");
+    assert!(
+        second.is_none(),
+        "the RE-delivery is a no-op (ON CONFLICT DO NOTHING — the workflow wakes once)"
+    );
 
     // EXACTLY ONE buffered row for the run (not two) — the §4.9 wake-once gate, in real Postgres.
     let count: i64 = sqlx::query(&format!(
@@ -83,7 +101,10 @@ async fn flow_p09_signal_delivery_buffers_once_on_conflict_in_real_postgres() {
     .await
     .unwrap()
     .get("c");
-    assert_eq!(count, 1, "EXACTLY ONE wf_signal row buffered (a double-delivery is one, not two)");
+    assert_eq!(
+        count, 1,
+        "EXACTLY ONE wf_signal row buffered (a double-delivery is one, not two)"
+    );
 
     // the buffered payload is the FIRST delivery's (ON CONFLICT DO NOTHING never overwrote it) +
     // references-not-payloads (a jsonb array of ArtifactRefs, no inline PII).
@@ -117,7 +138,10 @@ async fn flow_p09_signal_delivery_buffers_once_on_conflict_in_real_postgres() {
     .await
     .unwrap()
     .get("c");
-    assert_eq!(count2, 2, "a distinct idem_key buffers distinctly (the per-effect anchor, §6.4)");
+    assert_eq!(
+        count2, 2,
+        "a distinct idem_key buffers distinctly (the per-effect anchor, §6.4)"
+    );
 
     // the buffered-pending index covers exactly the unconsumed signals (the wait's wake lookup) — both
     // rows are unconsumed (consumed_seq IS NULL), so the signal-buffer-depth is 2.
@@ -128,9 +152,15 @@ async fn flow_p09_signal_delivery_buffers_once_on_conflict_in_real_postgres() {
     .await
     .unwrap()
     .get("c");
-    assert_eq!(pending, 2, "two BUFFERED (unconsumed) signals — the signal-buffer-depth source (§1.8 / §5.4)");
+    assert_eq!(
+        pending, 2,
+        "two BUFFERED (unconsumed) signals — the signal-buffer-depth source (§1.8 / §5.4)"
+    );
 
-    sqlx::query(&format!("DROP TABLE IF EXISTS {sig_tbl}")).execute(&admin).await.unwrap();
+    sqlx::query(&format!("DROP TABLE IF EXISTS {sig_tbl}"))
+        .execute(&admin)
+        .await
+        .unwrap();
     println!(
         "[2026-06-21] PASS  drill=FLOW-P09(live-PG)  double-deliver(same idem_key)->buffer once  rows=1 redelivery=no-op  distinct-key->2  buffered_depth=2  (real Postgres wf_signal PK + ON CONFLICT DO NOTHING)"
     );

@@ -88,7 +88,14 @@ fn provider(scope: &TenantScope, grants: &[TupleDelta]) -> StoreBackedCheck {
     // Seed the grants into S3 and feed S8 off the bus (the live feed — the provider's reverse index
     // is the projection of the same writes).
     store
-        .write_tuples(scope, &admin(&scope.tenant().0), grants, None, None, Timestamp("2026-06-19T00:00:00Z".into()))
+        .write_tuples(
+            scope,
+            &admin(&scope.tenant().0),
+            grants,
+            None,
+            None,
+            Timestamp("2026-06-19T00:00:00Z".into()),
+        )
         .expect("seed grants");
     let bus = InProcessBus::new();
     let relay = Relay::new(outbox.clone(), bus.clone(), || Timestamp("t".into()));
@@ -164,7 +171,12 @@ fn cdc_4_3_ids_path_renders_exactly_the_reachable_set() {
         ],
     );
     let result = svc
-        .list_objects(&subject("p:alice"), &Permission("read".into()), &ObjectType("repo".into()), &at_latest())
+        .list_objects(
+            &subject("p:alice"),
+            &Permission("read".into()),
+            &ObjectType("repo".into()),
+            &at_latest(),
+        )
         .expect("list_objects returns a result");
     let rendered = list_consumer_renders(&result, "repo");
     assert_eq!(
@@ -189,12 +201,19 @@ fn cdc_4_3_filter_path_is_conjoined_not_post_filtered() {
     let filter = ListObjectsResult::Filter {
         set_expr: SetExpr::InRelation {
             relation: RelName("read".into()),
-            via_column: ColRef { table: "repo".into(), column: "id".into() },
+            via_column: ColRef {
+                table: "repo".into(),
+                column: "id".into(),
+            },
         },
         zookie: Zookie("zk-00000000000000000001".into()),
     };
     let rendered = list_consumer_renders(&filter, "repo");
-    assert_eq!(rendered, vec!["<pushed-down-filter>".to_string()], "the consumer conjoins the push-down (no post-filter)");
+    assert_eq!(
+        rendered,
+        vec!["<pushed-down-filter>".to_string()],
+        "the consumer conjoins the push-down (no post-filter)"
+    );
 }
 
 /// **The 4.3 leak-free property: a subject with no grant renders the EMPTY set (never a superset).**
@@ -203,7 +222,12 @@ fn cdc_4_3_no_grant_renders_empty() {
     let s = scope("acme");
     let svc = provider(&s, &[grant("repo:core", "reader", "p:alice")]);
     let result = svc
-        .list_objects(&subject("p:nobody"), &Permission("read".into()), &ObjectType("repo".into()), &at_latest())
+        .list_objects(
+            &subject("p:nobody"),
+            &Permission("read".into()),
+            &ObjectType("repo".into()),
+            &at_latest(),
+        )
         .expect("list_objects returns a result");
     assert!(
         list_consumer_renders(&result, "repo").is_empty(),
@@ -222,7 +246,12 @@ fn cdc_4_3_no_cross_tenant_list() {
     let mut alice_globex = subject("p:alice");
     alice_globex.tenant = TenantId("globex".into());
     let result = svc
-        .list_objects(&alice_globex, &Permission("read".into()), &ObjectType("repo".into()), &at_latest())
+        .list_objects(
+            &alice_globex,
+            &Permission("read".into()),
+            &ObjectType("repo".into()),
+            &at_latest(),
+        )
         .expect("list_objects returns a result");
     assert!(
         list_consumer_renders(&result, "repo").is_empty(),

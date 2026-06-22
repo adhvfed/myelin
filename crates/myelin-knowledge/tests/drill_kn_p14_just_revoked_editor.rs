@@ -118,7 +118,11 @@ impl IdentityService for ZookieAwareCheck {
     ) -> myelin_identity::Result<RewriteTrace> {
         Err(AuthzError::NotYetImplemented("n/a"))
     }
-    fn delegation(&self, _a: &Principal, _t: &Principal) -> myelin_identity::Result<EffectivePolicy> {
+    fn delegation(
+        &self,
+        _a: &Principal,
+        _t: &Principal,
+    ) -> myelin_identity::Result<EffectivePolicy> {
         Err(AuthzError::NotYetImplemented("n/a"))
     }
     fn write_tuples(
@@ -186,25 +190,40 @@ fn kn_p14_just_revoked_editor_op_straddling_zookie_rejected_zero_stale_grant_wri
     // ── leg 1: before the ACL change, Alice (granted) can edit ──────────────────────────────────────
     let pre = content_op(actor("alice"), "design-doc", AuthZookie::empty());
     let pre_decision = auth.authorize_op(&pre, &CollectionSchema::new());
-    assert_eq!(pre_decision, OpDecision::Apply, "before the revoke Alice's op is authorized");
+    assert_eq!(
+        pre_decision,
+        OpDecision::Apply,
+        "before the revoke Alice's op is authorized"
+    );
     let applied_pre = auth.apply_if_authorized(&pre_decision);
     assert!(applied_pre, "the authorized op reaches the merge layer");
 
     // ── leg 2: the `knowledge.access.revoked` change stamps page.acl_zookie forward to z9 ───────────
     assert!(
-        auth.acl_zookies_mut().stamp("design-doc", Zookie("z9".into())),
+        auth.acl_zookies_mut()
+            .stamp("design-doc", Zookie("z9".into())),
         "the ACL change stamps page.acl_zookie forward (monotone advance)"
     );
 
     // ── leg 3: Alice's op STRADDLING the zookie is rejected (the new-enemy guard) ───────────────────
-    let post = content_op(actor("alice"), "design-doc", AuthZookie::of(Zookie("z9".into())));
+    let post = content_op(
+        actor("alice"),
+        "design-doc",
+        AuthZookie::of(Zookie("z9".into())),
+    );
     let post_decision = auth.authorize_op(&post, &CollectionSchema::new());
     assert!(
-        matches!(post_decision, OpDecision::Rejected(RejectReason::PermissionDenied { .. })),
+        matches!(
+            post_decision,
+            OpDecision::Rejected(RejectReason::PermissionDenied { .. })
+        ),
         "the just-revoked editor's op is REJECTED on permission (new-enemy guard fired)"
     );
     let applied_post = auth.apply_if_authorized(&post_decision);
-    assert!(!applied_post, "the rejected op NEVER reaches the merge layer");
+    assert!(
+        !applied_post,
+        "the rejected op NEVER reaches the merge layer"
+    );
     auth.audit_stale_grant_write_if_misapplied(&post_decision, applied_post);
 
     // ── leg 4: across the whole sequence — 0 STALE-GRANT WRITES (the dated-green artifact) ──────────
@@ -213,9 +232,15 @@ fn kn_p14_just_revoked_editor_op_straddling_zookie_rejected_zero_stale_grant_wri
         0,
         "0 STALE-GRANT WRITES — the new-enemy guard let nothing through"
     );
-    assert!(auth.counter().rejected_by_zookie() >= 1, "the zookie guard fired at least once");
+    assert!(
+        auth.counter().rejected_by_zookie() >= 1,
+        "the zookie guard fired at least once"
+    );
     let (metric, n) = auth.counter().telemetry_sample();
-    assert_eq!(metric, "knowledge.stale_grant_writes", "the canonical 0-stale-grant metric name");
+    assert_eq!(
+        metric, "knowledge.stale_grant_writes",
+        "the canonical 0-stale-grant metric name"
+    );
     assert_eq!(n, 0, "the dated-green gate value");
 }
 
@@ -227,15 +252,27 @@ fn kn_p14_stale_client_zookie_cannot_serve_a_revoked_grant() {
     id.grant("alice");
     id.revoke_at("alice", "z9");
     let mut auth = OpAuthorizer::new(id);
-    auth.acl_zookies_mut().stamp("design-doc", Zookie("z9".into()));
+    auth.acl_zookies_mut()
+        .stamp("design-doc", Zookie("z9".into()));
 
     // Alice carries an OLD zookie (z2 — she has not seen the revoke). A naive read at z2 would ALLOW;
     // the guard reads at the page's current z9 → Deny.
-    let op = content_op(actor("alice"), "design-doc", AuthZookie::of(Zookie("z2".into())));
+    let op = content_op(
+        actor("alice"),
+        "design-doc",
+        AuthZookie::of(Zookie("z2".into())),
+    );
     let decision = auth.authorize_op(&op, &CollectionSchema::new());
-    assert!(decision.is_rejected(), "a stale client zookie cannot serve a since-revoked grant");
+    assert!(
+        decision.is_rejected(),
+        "a stale client zookie cannot serve a since-revoked grant"
+    );
     assert!(!auth.apply_if_authorized(&decision));
-    assert_eq!(auth.counter().stale_grant_writes(), 0, "0 stale-grant writes");
+    assert_eq!(
+        auth.counter().stale_grant_writes(),
+        0,
+        "0 stale-grant writes"
+    );
 }
 
 /// **The schema-validation gate: a db-row op violating the FieldType defs is rejected BEFORE merge —
@@ -257,7 +294,11 @@ fn kn_p14_schema_validation_rejects_invalid_db_row_zero_invalid_rows() {
         ("priority".into(), FieldValue::Int(1)),
         ("done".into(), FieldValue::Bool(false)),
     ];
-    assert_eq!(auth.authorize_op(&good, &schema), OpDecision::Apply, "a well-typed row is authorized");
+    assert_eq!(
+        auth.authorize_op(&good, &schema),
+        OpDecision::Apply,
+        "a well-typed row is authorized"
+    );
 
     // An invalid db-row op (priority given a Text value) → rejected before merge.
     let mut invalid_rows = 0u32;
@@ -269,10 +310,16 @@ fn kn_p14_schema_validation_rejects_invalid_db_row_zero_invalid_rows() {
         invalid_rows += 1; // would have persisted a malformed row — the bug the gate forbids
     }
     assert!(
-        matches!(decision, OpDecision::Rejected(RejectReason::SchemaViolation { .. })),
+        matches!(
+            decision,
+            OpDecision::Rejected(RejectReason::SchemaViolation { .. })
+        ),
         "the malformed db-row op is rejected before merge"
     );
-    assert_eq!(invalid_rows, 0, "0 INVALID ROWS PERSISTED — the schema gate held");
+    assert_eq!(
+        invalid_rows, 0,
+        "0 INVALID ROWS PERSISTED — the schema gate held"
+    );
 }
 
 /// **The full three-check ladder on one op: erasure → permission → schema, in order (arch §3.1).**

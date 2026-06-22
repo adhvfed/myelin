@@ -27,8 +27,8 @@
 use myelin_content::InlineNode;
 use myelin_events::{
     Actor, AggregateKey, ArtifactRef, CausedBy, CorrelationId, DataRole, EmitContextBase,
-    EventEnvelope, EventId, EventType, IdMinter, MonotonicMinter, OutboxStore, OUTBOX_MIGRATION,
-    Region, TenantId, Timestamp, Visibility,
+    EventEnvelope, EventId, EventType, IdMinter, MonotonicMinter, OutboxStore, Region, TenantId,
+    Timestamp, Visibility, OUTBOX_MIGRATION,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_refs_service::emit_edges;
@@ -50,7 +50,11 @@ fn region() -> Region {
     Region("fr-par".into())
 }
 fn principal() -> Principal {
-    Principal::stub(PrincipalId("p-opaque-7".into()), PrincipalKind::Human, tenant())
+    Principal::stub(
+        PrincipalId("p-opaque-7".into()),
+        PrincipalKind::Human,
+        tenant(),
+    )
 }
 fn source_doc() -> ArtifactRef {
     ArtifactRef("myelin://tenantA/chat/message/m1".into())
@@ -110,7 +114,8 @@ fn staged_edge_rows() -> Vec<(String, String, String, serde_json::Value)> {
     let content = content_event();
     let mut tx = store.begin(minter, ctx_base());
     let ids = emit_edges(&mut tx, &source_doc(), &three_node_doc(), &content).expect("emit ok");
-    tx.commit().expect("commit ok (the in-memory derive — the real co-commit is the PG tx below)");
+    tx.commit()
+        .expect("commit ok (the in-memory derive — the real co-commit is the PG tx below)");
     ids.into_iter()
         .map(|id: EventId| {
             let row = store.row(&id).expect("staged edge row");
@@ -147,16 +152,39 @@ async fn emit_iff_committed_n_nodes_n_rows_and_rollback_zero_on_real_postgres() 
     let outbox_ddl = OUTBOX_MIGRATION
         .replace("EXISTS outbox (", &format!("EXISTS {outbox} ("))
         .replace("ON outbox (", &format!("ON {outbox} ("))
-        .replace("outbox_event_id_unique", &format!("{outbox}_event_id_unique"))
-        .replace("outbox_aggregate_seq_unique", &format!("{outbox}_aggregate_seq_unique"))
+        .replace(
+            "outbox_event_id_unique",
+            &format!("{outbox}_event_id_unique"),
+        )
+        .replace(
+            "outbox_aggregate_seq_unique",
+            &format!("{outbox}_aggregate_seq_unique"),
+        )
         .replace("outbox_unsent_idx", &format!("{outbox}_unsent_idx"));
-    for stmt in outbox_ddl.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-        sqlx::query(stmt).execute(&admin).await.unwrap_or_else(|e| panic!("outbox ddl `{stmt}`: {e}"));
+    for stmt in outbox_ddl
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        sqlx::query(stmt)
+            .execute(&admin)
+            .await
+            .unwrap_or_else(|e| panic!("outbox ddl `{stmt}`: {e}"));
     }
-    sqlx::query(&format!("CREATE TABLE IF NOT EXISTS {content_tbl} (id TEXT PRIMARY KEY, body_ref TEXT)"))
-        .execute(&admin).await.expect("create content table");
-    sqlx::query(&format!("GRANT ALL ON {outbox} TO myelin_app")).execute(&admin).await.expect("grant outbox");
-    sqlx::query(&format!("GRANT ALL ON {content_tbl} TO myelin_app")).execute(&admin).await.expect("grant content");
+    sqlx::query(&format!(
+        "CREATE TABLE IF NOT EXISTS {content_tbl} (id TEXT PRIMARY KEY, body_ref TEXT)"
+    ))
+    .execute(&admin)
+    .await
+    .expect("create content table");
+    sqlx::query(&format!("GRANT ALL ON {outbox} TO myelin_app"))
+        .execute(&admin)
+        .await
+        .expect("grant outbox");
+    sqlx::query(&format!("GRANT ALL ON {content_tbl} TO myelin_app"))
+        .execute(&admin)
+        .await
+        .expect("grant content");
 
     let rows = staged_edge_rows();
     assert_eq!(rows.len(), 3, "the 3-node document derives 3 edge events");
@@ -167,51 +195,105 @@ async fn emit_iff_committed_n_nodes_n_rows_and_rollback_zero_on_real_postgres() 
 
     // ── (1) emit-iff-committed: the content row + the 3 edge rows co-commit in ONE transaction. ──
     let mut tx = app.begin().await.expect("begin the content transaction");
-    sqlx::query(&format!("INSERT INTO {content_tbl} (id, body_ref) VALUES ('m1','r1')"))
-        .execute(&mut *tx).await.expect("write the content row");
+    sqlx::query(&format!(
+        "INSERT INTO {content_tbl} (id, body_ref) VALUES ('m1','r1')"
+    ))
+    .execute(&mut *tx)
+    .await
+    .expect("write the content row");
     for (i, (event_id, aggregate, subject, envelope)) in rows.iter().enumerate() {
         sqlx::query(&insert_outbox)
-            .bind(event_id).bind(aggregate).bind(i as i64).bind(subject).bind(envelope)
-            .execute(&mut *tx).await.expect("emit the edge row into the SAME tx");
+            .bind(event_id)
+            .bind(aggregate)
+            .bind(i as i64)
+            .bind(subject)
+            .bind(envelope)
+            .execute(&mut *tx)
+            .await
+            .expect("emit the edge row into the SAME tx");
     }
-    tx.commit().await.expect("commit the content + edges together");
+    tx.commit()
+        .await
+        .expect("commit the content + edges together");
 
     // N nodes committed → N relay-visible (unsent) edge rows (0 lost); all refs.edge.created.
     let n: i64 = sqlx::query(&format!(
         "SELECT count(*) AS n FROM {outbox} \
          WHERE published_at IS NULL AND envelope->>'type_' = 'refs.edge.created'"
     ))
-    .fetch_one(&app).await.unwrap().get("n");
-    assert_eq!(n, 3, "3 structured nodes committed → 3 relay-visible refs.edge.created rows (0 lost)");
+    .fetch_one(&app)
+    .await
+    .unwrap()
+    .get("n");
+    assert_eq!(
+        n, 3,
+        "3 structured nodes committed → 3 relay-visible refs.edge.created rows (0 lost)"
+    );
     // the content row committed too (no content without its edges; no edges without their content).
     let c: i64 = sqlx::query(&format!("SELECT count(*) AS n FROM {content_tbl}"))
-        .fetch_one(&app).await.unwrap().get("n");
+        .fetch_one(&app)
+        .await
+        .unwrap()
+        .get("n");
     assert_eq!(c, 1, "the content row co-committed");
 
     // ── (2) emit-iff-committed: the SAME content transaction ROLLED BACK → 0 edges, 0 content. ──
-    let mut tx2 = app.begin().await.expect("begin a second content transaction");
-    sqlx::query(&format!("INSERT INTO {content_tbl} (id, body_ref) VALUES ('m2','r2')"))
-        .execute(&mut *tx2).await.expect("write the second content row");
+    let mut tx2 = app
+        .begin()
+        .await
+        .expect("begin a second content transaction");
+    sqlx::query(&format!(
+        "INSERT INTO {content_tbl} (id, body_ref) VALUES ('m2','r2')"
+    ))
+    .execute(&mut *tx2)
+    .await
+    .expect("write the second content row");
     let rows2 = staged_edge_rows();
     for (i, (event_id, aggregate, subject, envelope)) in rows2.iter().enumerate() {
         // a fresh seq range so a UNIQUE(aggregate,seq) clash can never mask the rollback proof.
         sqlx::query(&insert_outbox)
-            .bind(format!("{event_id}-tx2")).bind(aggregate).bind(100 + i as i64).bind(subject).bind(envelope)
-            .execute(&mut *tx2).await.expect("emit the second edge set into the SAME tx");
+            .bind(format!("{event_id}-tx2"))
+            .bind(aggregate)
+            .bind(100 + i as i64)
+            .bind(subject)
+            .bind(envelope)
+            .execute(&mut *tx2)
+            .await
+            .expect("emit the second edge set into the SAME tx");
     }
-    tx2.rollback().await.expect("ABORT the content transaction (no commit)");
+    tx2.rollback()
+        .await
+        .expect("ABORT the content transaction (no commit)");
 
     // aborted content tx → still exactly the 3 committed edges + 1 committed content (no new rows).
     let n_after: i64 = sqlx::query(&format!(
         "SELECT count(*) AS n FROM {outbox} WHERE envelope->>'type_' = 'refs.edge.created'"
     ))
-    .fetch_one(&app).await.unwrap().get("n");
-    assert_eq!(n_after, 3, "aborted content tx wrote 0 edges (emit-iff-committed): still only the 3 committed");
+    .fetch_one(&app)
+    .await
+    .unwrap()
+    .get("n");
+    assert_eq!(
+        n_after, 3,
+        "aborted content tx wrote 0 edges (emit-iff-committed): still only the 3 committed"
+    );
     let c_after: i64 = sqlx::query(&format!("SELECT count(*) AS n FROM {content_tbl}"))
-        .fetch_one(&app).await.unwrap().get("n");
-    assert_eq!(c_after, 1, "the aborted content row rolled back too (no content without its edges)");
+        .fetch_one(&app)
+        .await
+        .unwrap()
+        .get("n");
+    assert_eq!(
+        c_after, 1,
+        "the aborted content row rolled back too (no content without its edges)"
+    );
 
     // Cleanup (a NEW forward operation — test teardown, not a down-migration).
-    sqlx::query(&format!("DROP TABLE {outbox}")).execute(&admin).await.unwrap();
-    sqlx::query(&format!("DROP TABLE {content_tbl}")).execute(&admin).await.unwrap();
+    sqlx::query(&format!("DROP TABLE {outbox}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    sqlx::query(&format!("DROP TABLE {content_tbl}"))
+        .execute(&admin)
+        .await
+        .unwrap();
 }

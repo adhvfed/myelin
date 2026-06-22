@@ -23,9 +23,9 @@
 
 use myelin_content::InlineNode;
 use myelin_events::{
-    Actor, AggregateKey, ArtifactRef, CausedBy, CorrelationId, DataRole, EmitContextBase, EventId,
-    EventType, EventEnvelope, OutboxStore, IdMinter, MonotonicMinter, Region, TenantId, Timestamp,
-    Visibility,
+    Actor, AggregateKey, ArtifactRef, CausedBy, CorrelationId, DataRole, EmitContextBase,
+    EventEnvelope, EventId, EventType, IdMinter, MonotonicMinter, OutboxStore, Region, TenantId,
+    Timestamp, Visibility,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_refs_service::{emit_edges, extract_edges, EdgeRel};
@@ -39,7 +39,11 @@ fn region() -> Region {
     Region("fr-par".into())
 }
 fn principal() -> Principal {
-    Principal::stub(PrincipalId("p-opaque-7".into()), PrincipalKind::Human, tenant())
+    Principal::stub(
+        PrincipalId("p-opaque-7".into()),
+        PrincipalKind::Human,
+        tenant(),
+    )
 }
 fn source_doc() -> ArtifactRef {
     ArtifactRef("myelin://acme/chat/message/m1".into())
@@ -84,7 +88,10 @@ fn ctx_base() -> EmitContextBase {
 }
 
 fn store_and_minter() -> (OutboxStore, Arc<dyn IdMinter>) {
-    (OutboxStore::new(), Arc::new(MonotonicMinter::new()) as Arc<dyn IdMinter>)
+    (
+        OutboxStore::new(),
+        Arc::new(MonotonicMinter::new()) as Arc<dyn IdMinter>,
+    )
 }
 
 /// A three-node document: one of each structured inline node. → three edges.
@@ -112,10 +119,18 @@ fn n_nodes_emit_n_edges_caused_by_content_and_committed() {
 
     assert_eq!(ids.len(), 3, "three structured nodes → three edge events");
     // before commit: nothing durable (emit-iff-committed).
-    assert_eq!(store.outbox_depth(), 0, "an open transaction has written nothing yet");
+    assert_eq!(
+        store.outbox_depth(),
+        0,
+        "an open transaction has written nothing yet"
+    );
 
     tx.commit().expect("commit ok");
-    assert_eq!(store.outbox_depth(), 3, "three edge rows durable after commit");
+    assert_eq!(
+        store.outbox_depth(),
+        3,
+        "three edge rows durable after commit"
+    );
 
     // Every emitted edge: refs.edge.created, reference-class triple, caused by the content event.
     let rels: Vec<String> = ids
@@ -136,7 +151,11 @@ fn n_nodes_emit_n_edges_caused_by_content_and_committed() {
                 Some(&content.event_id),
                 "causation = the content event"
             );
-            assert_eq!(env.depth, content.depth + 1, "the loop-guard +1 depth stamp (drill REF-P9)");
+            assert_eq!(
+                env.depth,
+                content.depth + 1,
+                "the loop-guard +1 depth stamp (drill REF-P9)"
+            );
             env.payload["rel"].as_str().unwrap().to_string()
         })
         .collect();
@@ -156,7 +175,11 @@ fn aborted_content_transaction_emits_zero_edges() {
         let mut tx = store.begin(minter, ctx_base());
         tx.stage_state_change("chat message m1 written");
         let ids = emit_edges(&mut tx, &source_doc(), &doc, &content).expect("emit ok");
-        assert_eq!(ids.len(), 3, "three edges buffered into the open transaction");
+        assert_eq!(
+            ids.len(),
+            3,
+            "three edges buffered into the open transaction"
+        );
         // DROP tx without commit (the abort / crash between state-write and publish).
     }
     // the content tx aborted → 0 edge rows, 0 ghosts (emit-iff-committed; no edge without its content).

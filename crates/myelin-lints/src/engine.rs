@@ -246,9 +246,19 @@ mod tests {
         // lint targeting the real construct does not trip on the check that forbids it.
         let line = r#"if upper.contains("DROP COLUMN") { reject(); }"#;
         let blanked = blank_string_literals(line);
-        assert!(!blanked.contains("DROP COLUMN"), "literal contents must be blanked");
-        assert!(blanked.contains("upper.contains("), "code outside the literal survives");
-        assert_eq!(blanked.len(), line.len(), "length (and so column offsets) is preserved");
+        assert!(
+            !blanked.contains("DROP COLUMN"),
+            "literal contents must be blanked"
+        );
+        assert!(
+            blanked.contains("upper.contains("),
+            "code outside the literal survives"
+        );
+        assert_eq!(
+            blanked.len(),
+            line.len(),
+            "length (and so column offsets) is preserved"
+        );
     }
 
     #[test]

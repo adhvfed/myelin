@@ -686,11 +686,18 @@ mod tests {
 
         // The stale_after deadline was DELEGATED to the durable timer wheel (armed through the seam,
         // NOT reinvented in the engine) — the proof of delegation.
-        assert_eq!(timer.armed_count(), 1, "the stale_after timer was armed via the seam");
+        assert_eq!(
+            timer.armed_count(),
+            1,
+            "the stale_after timer was armed via the seam"
+        );
         assert_eq!(timer.deadline_for(&arming_id), Some(deadline));
 
         // The durable timer fires (the minute-bucket wheel delivers the stale callback) → Stale.
-        assert!(engine.on_timer_fired(&arming_id), "the timer fired armed → stale");
+        assert!(
+            engine.on_timer_fired(&arming_id),
+            "the timer fired armed → stale"
+        );
         assert_eq!(
             engine.arming(&TriggerId("t-stale".into())).unwrap().state,
             TriggerState::Stale
@@ -706,7 +713,10 @@ mod tests {
         let arming_id = engine
             .arm(
                 TriggerId("t".into()),
-                notify_trigger("issues.issue.unblocked", Some(StaleAfter("2026-06-21T00:00:00Z".into()))),
+                notify_trigger(
+                    "issues.issue.unblocked",
+                    Some(StaleAfter("2026-06-21T00:00:00Z".into())),
+                ),
                 &timer,
             )
             .unwrap();
@@ -716,10 +726,17 @@ mod tests {
         let r = engine.on_event(&e, &SetExpr::All, &no_rel, &timer);
         assert!(matches!(&r[0], Resolution::Resolved { .. }));
         // The resolve disarmed the stale timer through the seam.
-        assert_eq!(timer.armed_count(), 0, "the resolve disarmed the stale_after timer");
+        assert_eq!(
+            timer.armed_count(),
+            0,
+            "the resolve disarmed the stale_after timer"
+        );
 
         // A late timer firing must NOT clobber the resolution (it lost the guard).
-        assert!(!engine.on_timer_fired(&arming_id), "the late timer loses to the resolve");
+        assert!(
+            !engine.on_timer_fired(&arming_id),
+            "the late timer loses to the resolve"
+        );
         assert_eq!(
             engine.arming(&TriggerId("t".into())).unwrap().state,
             TriggerState::Resolved
@@ -735,22 +752,33 @@ mod tests {
         engine
             .arm(
                 TriggerId("t".into()),
-                notify_trigger("issues.issue.unblocked", Some(StaleAfter("2026-06-21T00:00:00Z".into()))),
+                notify_trigger(
+                    "issues.issue.unblocked",
+                    Some(StaleAfter("2026-06-21T00:00:00Z".into())),
+                ),
                 &timer,
             )
             .unwrap();
         assert_eq!(timer.armed_count(), 1);
 
         // The owner cancels → armed → disarmed; the stale_after timer is disarmed via the seam.
-        assert!(engine.disarm_trigger(&TriggerId("t".into()), &timer).unwrap());
+        assert!(engine
+            .disarm_trigger(&TriggerId("t".into()), &timer)
+            .unwrap());
         assert_eq!(
             engine.arming(&TriggerId("t".into())).unwrap().state,
             TriggerState::Disarmed
         );
-        assert_eq!(timer.armed_count(), 0, "the owner cancel disarmed the stale_after timer");
+        assert_eq!(
+            timer.armed_count(),
+            0,
+            "the owner cancel disarmed the stale_after timer"
+        );
 
         // A disarm of an already-disarmed arming is a no-op (the guard rejects it).
-        assert!(!engine.disarm_trigger(&TriggerId("t".into()), &timer).unwrap());
+        assert!(!engine
+            .disarm_trigger(&TriggerId("t".into()), &timer)
+            .unwrap());
         // A resolving event after disarm does NOT resolve (the arming is no longer armed).
         let e = envelope("issues.issue.unblocked", "PROJ-1", "evt-late");
         let r = engine.on_event(&e, &SetExpr::All, &no_rel, &timer);
@@ -767,7 +795,11 @@ mod tests {
 
         // Arm + resolve the first arming.
         let a1 = engine
-            .arm(id.clone(), notify_trigger("issues.issue.unblocked", None), &timer)
+            .arm(
+                id.clone(),
+                notify_trigger("issues.issue.unblocked", None),
+                &timer,
+            )
             .unwrap();
         let e1 = envelope("issues.issue.unblocked", "PROJ-1", "evt-1");
         let r1 = engine.on_event(&e1, &SetExpr::All, &no_rel, &timer);
@@ -775,9 +807,16 @@ mod tests {
 
         // RE-ARM the SAME trigger id → a FRESH arming (new ArmingId), back to Armed.
         let a2 = engine
-            .arm(id.clone(), notify_trigger("issues.issue.unblocked", None), &timer)
+            .arm(
+                id.clone(),
+                notify_trigger("issues.issue.unblocked", None),
+                &timer,
+            )
             .unwrap();
-        assert_ne!(a1, a2, "re-arming mints a fresh ArmingId (idempotency is per-arming)");
+        assert_ne!(
+            a1, a2,
+            "re-arming mints a fresh ArmingId (idempotency is per-arming)"
+        );
         assert_eq!(engine.arming(&id).unwrap().state, TriggerState::Armed);
 
         // The new arming can fire AGAIN (the per-arming promise is independent of the old one).
@@ -806,7 +845,10 @@ mod tests {
         let e = envelope("issues.issue.unblocked", "PROJ-1", "evt-hidden");
         // SetExpr::None ⇒ the owner sees nothing ⇒ no resolution (the condition is never consulted).
         let r = engine.on_event(&e, &SetExpr::None, &no_rel, &timer);
-        assert!(r.is_empty(), "an unviewable subject never resolves (0-leak)");
+        assert!(
+            r.is_empty(),
+            "an unviewable subject never resolves (0-leak)"
+        );
         assert_eq!(
             engine.arming(&TriggerId("t".into())).unwrap().state,
             TriggerState::Armed,
@@ -839,7 +881,10 @@ mod tests {
         let mut partial = envelope("issues.issue.relation_resolved", "PROJ-1", "evt-partial");
         partial.payload = serde_json::json!({ "blocked_by_unresolved": 1 });
         let r0 = engine.on_event(&partial, &SetExpr::All, &no_rel, &timer);
-        assert!(r0.is_empty(), "a partial resolution does not fire the trigger");
+        assert!(
+            r0.is_empty(),
+            "a partial resolution does not fire the trigger"
+        );
 
         // The last blocker resolved → blocked_by_unresolved == 0 → the condition resolves.
         let mut done = envelope("issues.issue.relation_resolved", "PROJ-1", "evt-done");
@@ -882,7 +927,10 @@ mod tests {
                 arms_subject,
                 ..
             } => {
-                assert_eq!(resolved_by.0, "evt-cause", "the resolving event is the cause");
+                assert_eq!(
+                    resolved_by.0, "evt-cause",
+                    "the resolving event is the cause"
+                );
                 assert_eq!(o, &owner());
                 assert_eq!(
                     arms_subject,
@@ -962,7 +1010,10 @@ mod tests {
         let mut engine = TriggerEngine::new();
         let res = engine.arm(
             TriggerId("t".into()),
-            notify_trigger("issues.issue.unblocked", Some(StaleAfter("2026-06-21T00:00:00Z".into()))),
+            notify_trigger(
+                "issues.issue.unblocked",
+                Some(StaleAfter("2026-06-21T00:00:00Z".into())),
+            ),
             &FailingTimer,
         );
         assert_eq!(

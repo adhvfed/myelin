@@ -91,7 +91,10 @@ impl<H: ToolHands> UnifiedRunner<H> {
 impl<H: ToolHands> JobRunner for UnifiedRunner<H> {
     fn dispatch(&self, spec: &JobSpec) -> Result<(), ActivityError> {
         // record the engine's deterministic idem_token (the no-coordination dedup key, §4.9).
-        self.seen_tokens.lock().unwrap().push(spec.idem_token.clone());
+        self.seen_tokens
+            .lock()
+            .unwrap()
+            .push(spec.idem_token.clone());
         // hand the job to the contract-8.4 hands (the unified sandbox runner). The Command carries the
         // job's target + the kind (a routing discriminator); the result is recorded as proof of exec.
         let cmd = Command(format!("run {} target={}", spec.kind.as_str(), spec.target));
@@ -163,13 +166,19 @@ fn provider_dispatches_into_the_runner_and_parks_consumer_sees_the_token() {
     // CONSUMER (runner) saw the engine's DETERMINISTIC token (the agreement, §4.9).
     let consumer_token = job_idem_token("R1", "merge.queue:0");
     let seen = runner.seen_tokens.lock().unwrap();
-    assert_eq!(seen.as_slice(), &[consumer_token], "the runner saw the engine's deterministic token");
+    assert_eq!(
+        seen.as_slice(),
+        &[consumer_token],
+        "the runner saw the engine's deterministic token"
+    );
 
     // the contract-8.4 hands were actually driven (the dispatch reached `ToolHands::exec`).
     let exec = runner.last_exec.lock().unwrap();
     assert_eq!(
         *exec,
-        Some(ToolResult("dispatched: run ci target=pipeline://acme/ci/pr-7".into())),
+        Some(ToolResult(
+            "dispatched: run ci target=pipeline://acme/ci/pr-7".into()
+        )),
         "the dispatch reached the unified runner's ToolHands::exec (contract 8.4 consumed)"
     );
 }
@@ -188,8 +197,12 @@ fn consumer_echoes_the_token_on_job_done_and_the_workflow_wakes_once() {
     // DRIVE 1: dispatch + park.
     let mut c1 = begin(&outbox, journal.clone(), signals.clone());
     assert_eq!(
-        c1.schedule_and_run_job(JobSpec::new(JobKind::Ci, "pipeline://acme/ci/pr-7"), &runner, None)
-            .expect("dispatch"),
+        c1.schedule_and_run_job(
+            JobSpec::new(JobKind::Ci, "pipeline://acme/ci/pr-7"),
+            &runner,
+            None
+        )
+        .expect("dispatch"),
         JobOutcome::Parked
     );
     c1.commit().expect("co-commit the dispatch + park");
@@ -200,7 +213,11 @@ fn consumer_echoes_the_token_on_job_done_and_the_workflow_wakes_once() {
     let result = vec![ArtifactRef("myelin://acme/ci/result/green".into())];
     deliver_job_done(&signals, &token, result.clone());
     deliver_job_done(&signals, &token, result.clone());
-    assert_eq!(signals.buffered_depth(), 1, "the double delivery deduped to ONE row (wf_signal PK)");
+    assert_eq!(
+        signals.buffered_depth(),
+        1,
+        "the double delivery deduped to ONE row (wf_signal PK)"
+    );
 
     // DRIVE 2 (re-lease): the long-park resumes, consumes job.done ONCE, completes with the result.
     let mut c2 = WfCtx::resume(
@@ -216,15 +233,33 @@ fn consumer_echoes_the_token_on_job_done_and_the_workflow_wakes_once() {
     )
     .with_signals(signals.clone());
     let out = c2
-        .schedule_and_run_job(JobSpec::new(JobKind::Ci, "pipeline://acme/ci/pr-7"), &runner, None)
+        .schedule_and_run_job(
+            JobSpec::new(JobKind::Ci, "pipeline://acme/ci/pr-7"),
+            &runner,
+            None,
+        )
         .expect("resume + complete");
     match out {
-        JobOutcome::Completed { idem_token, result: got } => {
-            assert_eq!(idem_token, token, "the runner echoed the engine's token (agreement held)");
+        JobOutcome::Completed {
+            idem_token,
+            result: got,
+        } => {
+            assert_eq!(
+                idem_token, token,
+                "the runner echoed the engine's token (agreement held)"
+            );
             assert_eq!(got, result, "the job's references-not-payloads result");
         }
         other => panic!("expected Completed, got {other:?}"),
     }
-    assert_eq!(c2.consumed_signals().len(), 1, "ONE wake per job (the double delivery deduped)");
-    assert_eq!(signals.buffered_depth(), 0, "the one buffered job.done is consumed once");
+    assert_eq!(
+        c2.consumed_signals().len(),
+        1,
+        "ONE wake per job (the double delivery deduped)"
+    );
+    assert_eq!(
+        signals.buffered_depth(),
+        0,
+        "the one buffered job.done is consumed once"
+    );
 }

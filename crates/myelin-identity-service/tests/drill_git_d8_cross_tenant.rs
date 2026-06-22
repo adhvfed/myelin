@@ -88,7 +88,10 @@ fn git_d8_cross_tenant_repo_access_reads_zero() {
     let svc = StoreBackedCheck::new(store);
     // Admit Id's compiled Git fragment so `pull` resolves through the four operators.
     for admit in svc.admit_git_fragment() {
-        assert!(matches!(admit, myelin_identity::FragmentAdmit::Admitted { .. }));
+        assert!(matches!(
+            admit,
+            myelin_identity::FragmentAdmit::Admitted { .. }
+        ));
     }
     let spoofed_repo = ArtifactRef("repo:core".into()); // acme's repo, spoofed by the attacker
 
@@ -96,7 +99,13 @@ fn git_d8_cross_tenant_repo_access_reads_zero() {
     // partition).
     let alice = principal("acme", "p:alice");
     assert_eq!(
-        svc.check(&alice, &Permission("pull".into()), &spoofed_repo, &at_latest(), None),
+        svc.check(
+            &alice,
+            &Permission("pull".into()),
+            &spoofed_repo,
+            &at_latest(),
+            None
+        ),
         Ok(Decision::Allow),
         "the legitimate acme admin pulls (Id resolves within acme's partition)"
     );
@@ -111,7 +120,13 @@ fn git_d8_cross_tenant_repo_access_reads_zero() {
         // but the VERIFIED tenant is still evil-corp, so acme's partition is unreachable.
         attacker.principal_id = PrincipalId("p:alice".into());
         attacker.tenant = TenantId("evil-corp".into());
-        let decision = svc.check(&attacker, &Permission("pull".into()), &spoofed_repo, &at_latest(), None);
+        let decision = svc.check(
+            &attacker,
+            &Permission("pull".into()),
+            &spoofed_repo,
+            &at_latest(),
+            None,
+        );
         if decision == Ok(Decision::Allow) {
             cross_tenant_reads += 1;
         }

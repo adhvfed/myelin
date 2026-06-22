@@ -56,7 +56,11 @@ fn region() -> Region {
     Region(REGION.into())
 }
 fn subject(id: &str) -> SubjectRef {
-    SubjectRef::new(Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant()))
+    SubjectRef::new(Principal::stub(
+        PrincipalId(id.into()),
+        PrincipalKind::Human,
+        tenant(),
+    ))
 }
 
 /// A semantic page spec with `actor`/`assignee` subject-locator facets.
@@ -86,7 +90,11 @@ impl myelin_search::ProjectFetcher for Fetcher {
 }
 
 fn proj(text: &str, fields: BTreeMap<String, FieldValue>) -> myelin_search::SearchProjection {
-    myelin_search::SearchProjection { text: text.into(), fields, lang: None }
+    myelin_search::SearchProjection {
+        text: text.into(),
+        fields,
+        lang: None,
+    }
 }
 
 fn created_event(doc: &str) -> EventEnvelope {
@@ -129,25 +137,39 @@ fn assignee(id: &str) -> BTreeMap<String, FieldValue> {
 #[test]
 fn srch_d4_erase_leaves_zero_recoverable_including_vectors() {
     let target = subject("u-target");
-    let pseudonym = PseudonymHandle::new("u-target", "acme").expect("pseudonym").render();
+    let pseudonym = PseudonymHandle::new("u-target", "acme")
+        .expect("pseudonym")
+        .render();
 
     // The corpus: 5 docs reference u-target (actor / assignee / pseudonym-mention), 20 do not.
     let mut docs: Vec<(String, myelin_search::SearchProjection)> = Vec::new();
     docs.push((
         "myelin://acme/knowledge/page/t-owned".into(),
-        proj("u-target's design note on raft leadership and quorum", actor("u-target")),
+        proj(
+            "u-target's design note on raft leadership and quorum",
+            actor("u-target"),
+        ),
     ));
     docs.push((
         "myelin://acme/knowledge/page/t-owned-2".into(),
-        proj("u-target's second note on log compaction", actor("u-target")),
+        proj(
+            "u-target's second note on log compaction",
+            actor("u-target"),
+        ),
     ));
     docs.push((
         "myelin://acme/knowledge/page/t-assigned".into(),
-        proj("a task assigned to the subject about snapshotting", assignee("u-target")),
+        proj(
+            "a task assigned to the subject about snapshotting",
+            assignee("u-target"),
+        ),
     ));
     docs.push((
         "myelin://acme/knowledge/page/t-mentioned".into(),
-        proj(&format!("ping {pseudonym} re the membership change protocol"), BTreeMap::new()),
+        proj(
+            &format!("ping {pseudonym} re the membership change protocol"),
+            BTreeMap::new(),
+        ),
     ));
     docs.push((
         "myelin://acme/knowledge/page/t-acl".into(),
@@ -158,7 +180,10 @@ fn srch_d4_erase_leaves_zero_recoverable_including_vectors() {
     for i in 0..20 {
         docs.push((
             format!("myelin://acme/knowledge/page/u{i}"),
-            proj(&format!("unrelated page {i} about paxos and consensus"), actor(&format!("u-{i}"))),
+            proj(
+                &format!("unrelated page {i} about paxos and consensus"),
+                actor(&format!("u-{i}")),
+            ),
         ));
     }
 
@@ -171,7 +196,9 @@ fn srch_d4_erase_leaves_zero_recoverable_including_vectors() {
 
     let map: std::collections::HashMap<String, myelin_search::SearchProjection> =
         docs.iter().cloned().collect();
-    let fetcher = Arc::new(Fetcher { map: std::sync::Mutex::new(map) });
+    let fetcher = Arc::new(Fetcher {
+        map: std::sync::Mutex::new(map),
+    });
     let ix = Arc::new(IncrementalIndexer::new(
         vec![page_spec()],
         fetcher,
@@ -181,14 +208,26 @@ fn srch_d4_erase_leaves_zero_recoverable_including_vectors() {
         ix.index(&created_event(d)).expect("index");
     }
     let total = docs.len() as u64;
-    assert_eq!(ix.live_count(&tenant(), &region()), total, "the whole corpus indexed");
+    assert_eq!(
+        ix.live_count(&tenant(), &region()),
+        total,
+        "the whole corpus indexed"
+    );
 
     // Pre-erase: the subject's referencing docs are located + reachable by FT + by vector.
     let matcher = SubjectMatcher::new("u-target", Some(pseudonym.clone()));
     let referencing = ix.locate_subject(&tenant(), &region(), &matcher);
-    assert_eq!(referencing.len(), 4, "four docs reference u-target (2 actor + assignee + pseudonym)");
-    let q = MockEmbeddingAdapter::new(8).embed("raft leadership and quorum").unwrap();
-    let pre = ix.search_semantic(&tenant(), &region(), &AclFilter::All, &q, 30).expect("semantic pre");
+    assert_eq!(
+        referencing.len(),
+        4,
+        "four docs reference u-target (2 actor + assignee + pseudonym)"
+    );
+    let q = MockEmbeddingAdapter::new(8)
+        .embed("raft leadership and quorum")
+        .unwrap();
+    let pre = ix
+        .search_semantic(&tenant(), &region(), &AclFilter::All, &q, 30)
+        .expect("semantic pre");
     assert!(
         pre.iter().any(|h| h.doc_id.ends_with("t-owned")),
         "the subject's doc is reachable by k-NN before erase"
@@ -197,19 +236,29 @@ fn srch_d4_erase_leaves_zero_recoverable_including_vectors() {
     // The DSR fan-out: erase the subject through the Search holder (the contract surface).
     let kms = Arc::new(KmsEngine::new());
     let pin = SearchDekPin::new(kms);
-    pin.reserve(&tenant(), &region()).expect("reserve the per-tenant index DEK");
+    pin.reserve(&tenant(), &region())
+        .expect("reserve the per-tenant index DEK");
     let holder = SearchEraseHolder::new(ix.clone(), pin, region());
 
     let receipt = holder
-        .erase(EraseScope::Subject { subject: target.clone(), tenant: tenant() })
+        .erase(EraseScope::Subject {
+            subject: target.clone(),
+            tenant: tenant(),
+        })
         .expect("erase the subject");
     assert_eq!(receipt.receipt.operation, "erase");
-    assert!(receipt.receipt.content_hash.starts_with("blake3:"), "content-addressed receipt");
+    assert!(
+        receipt.receipt.content_hash.starts_with("blake3:"),
+        "content-addressed receipt"
+    );
 
     // ── GATE: 0 recoverable personal data incl. vectors ──────────────────────────────────────────
     // (1) every referencing doc is GONE from the index (not hidden).
     let post_located = ix.locate_subject(&tenant(), &region(), &matcher);
-    assert!(post_located.is_empty(), "0 docs reference the subject after erase (purged, not hidden)");
+    assert!(
+        post_located.is_empty(),
+        "0 docs reference the subject after erase (purged, not hidden)"
+    );
     assert_eq!(
         ix.live_count(&tenant(), &region()),
         total - 4,
@@ -217,14 +266,18 @@ fn srch_d4_erase_leaves_zero_recoverable_including_vectors() {
     );
 
     // (2) the erased docs are gone from FULL-TEXT search.
-    let ft = ix.search_ft(&tenant(), &region(), &AclFilter::All, "raft leadership", 30).expect("ft");
+    let ft = ix
+        .search_ft(&tenant(), &region(), &AclFilter::All, "raft leadership", 30)
+        .expect("ft");
     assert!(
         !ft.iter().any(|h| h.doc_id.ends_with("t-owned")),
         "the erased doc is GONE from full-text search (0 recoverable via FT)"
     );
 
     // (3) the erased docs' VECTORS are gone from the co-located HNSW shape.
-    let post = ix.search_semantic(&tenant(), &region(), &AclFilter::All, &q, 30).expect("semantic post");
+    let post = ix
+        .search_semantic(&tenant(), &region(), &AclFilter::All, &q, 30)
+        .expect("semantic post");
     for d in ["t-owned", "t-owned-2", "t-assigned", "t-mentioned"] {
         assert!(
             !post.iter().any(|h| h.doc_id.ends_with(d)),
@@ -239,8 +292,14 @@ fn srch_d4_erase_leaves_zero_recoverable_including_vectors() {
     );
 
     // (5) the unrelated docs are untouched (surgical erase, not a blanket wipe).
-    let unrelated = ix.search_ft(&tenant(), &region(), &AclFilter::All, "paxos", 30).expect("ft unrelated");
-    assert_eq!(unrelated.len(), 20, "all 20 unrelated docs survive (the erase is surgical)");
+    let unrelated = ix
+        .search_ft(&tenant(), &region(), &AclFilter::All, "paxos", 30)
+        .expect("ft unrelated");
+    assert_eq!(
+        unrelated.len(),
+        20,
+        "all 20 unrelated docs survive (the erase is surgical)"
+    );
 }
 
 /// **The `*.erased` tombstone drives the purge via the SAME live consumer path — NO erasure backdoor
@@ -251,8 +310,12 @@ fn srch_d4_erase_leaves_zero_recoverable_including_vectors() {
 fn srch_d4_erase_tombstone_rides_the_live_consumer_path() {
     let r = "myelin://acme/knowledge/page/p1";
     let map: std::collections::HashMap<String, myelin_search::SearchProjection> =
-        [(r.to_string(), proj("a body", BTreeMap::new()))].into_iter().collect();
-    let fetcher = Arc::new(Fetcher { map: std::sync::Mutex::new(map) });
+        [(r.to_string(), proj("a body", BTreeMap::new()))]
+            .into_iter()
+            .collect();
+    let fetcher = Arc::new(Fetcher {
+        map: std::sync::Mutex::new(map),
+    });
     let ix = Arc::new(IncrementalIndexer::new(
         vec![page_spec()],
         fetcher,
@@ -270,5 +333,9 @@ fn srch_d4_erase_tombstone_rides_the_live_consumer_path() {
         Ok(()),
         "the `*.erased` tombstone flows through the SAME live consumer index() path (no backdoor)"
     );
-    assert_eq!(ix.live_count(&tenant(), &region()), 0, "the doc was purged via the live consumer path");
+    assert_eq!(
+        ix.live_count(&tenant(), &region()),
+        0,
+        "the doc was purged via the live consumer path"
+    );
 }

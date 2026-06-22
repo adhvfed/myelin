@@ -46,7 +46,11 @@ use myelin_substrate::Thresholds;
 use myelin_tenancy::TenantId;
 
 fn viewer() -> Principal {
-    Principal::stub(PrincipalId("p:v".into()), PrincipalKind::Human, TenantId("acme".into()))
+    Principal::stub(
+        PrincipalId("p:v".into()),
+        PrincipalKind::Human,
+        TenantId("acme".into()),
+    )
 }
 
 /// **13.3 — the executor consumes the frozen `ViewSpec`/`QueryAst`/`FieldType` byte-identically.** A
@@ -66,20 +70,48 @@ fn cdc_13_3_executor_consumes_the_frozen_shapes() {
         })
         .unwrap(),
         group_by: None,
-        sort: vec![SortSpec { field: FieldId::new("priority"), dir: SortDir::Desc }],
+        sort: vec![SortSpec {
+            field: FieldId::new("priority"),
+            dir: SortDir::Desc,
+        }],
         visible: vec![FieldId::new("title")],
         order_field: FieldId::new("order_key"),
     };
     // The executor lowers it (the JSONB ops over props) — proving Knowledge owns the executor over
     // the shared definition.
     let lowered = lower_view_filter(&view.filter, &[]).expect("the frozen filter lowers");
-    assert!(lowered.sql_predicate.contains("db_row.props ->> 'status'"), "the frozen FieldId facet is read: {}", lowered.sql_predicate);
-    assert_eq!(lowered.params.len(), 1, "the frozen Literal is bound, not interpolated");
+    assert!(
+        lowered.sql_predicate.contains("db_row.props ->> 'status'"),
+        "the frozen FieldId facet is read: {}",
+        lowered.sql_predicate
+    );
+    assert_eq!(
+        lowered.params.len(),
+        1,
+        "the frozen Literal is bound, not interpolated"
+    );
 
     // And the whole VIEW_QUERY composes with the view's frozen sort + order_field tiebreak.
-    let q = execute_view_query(&view, &SetExpr::All, &viewer(), &TenantId("acme".into()), "db:p", &[], PageBound::DEFAULT).unwrap();
-    assert!(q.sql.contains("db_row.props ->> 'priority' DESC"), "the frozen ViewSpec sort is applied: {}", q.sql);
-    assert!(q.sql.contains("db_row.order_key ASC"), "the frozen order_field is the last-resort tiebreak: {}", q.sql);
+    let q = execute_view_query(
+        &view,
+        &SetExpr::All,
+        &viewer(),
+        &TenantId("acme".into()),
+        "db:p",
+        &[],
+        PageBound::DEFAULT,
+    )
+    .unwrap();
+    assert!(
+        q.sql.contains("db_row.props ->> 'priority' DESC"),
+        "the frozen ViewSpec sort is applied: {}",
+        q.sql
+    );
+    assert!(
+        q.sql.contains("db_row.order_key ASC"),
+        "the frozen order_field is the last-resort tiebreak: {}",
+        q.sql
+    );
 }
 
 /// **4.3 conjoin (the leak-free view-permission gate): the executor conjoins the `SetExpr` ACL
@@ -102,16 +134,53 @@ fn cdc_4_3_executor_conjoins_the_setexpr_acl() {
         order_field: FieldId::new("order_key"),
     };
     // The reverse-index JOIN ACL (the InRelation form) is conjoined INTO the view query + the COUNT.
-    let acl = SetExpr::InRelation { relation: RelName("read".into()), via_column: db_row_id_colref() };
-    let q = execute_view_query(&view, &acl, &viewer(), &TenantId("acme".into()), "db:p", &[], PageBound::DEFAULT).unwrap();
-    assert_eq!(q.statement_count(), 1, "one query (no N+1, no post-filter): {}", q.sql);
+    let acl = SetExpr::InRelation {
+        relation: RelName("read".into()),
+        via_column: db_row_id_colref(),
+    };
+    let q = execute_view_query(
+        &view,
+        &acl,
+        &viewer(),
+        &TenantId("acme".into()),
+        "db:p",
+        &[],
+        PageBound::DEFAULT,
+    )
+    .unwrap();
+    assert_eq!(
+        q.statement_count(),
+        1,
+        "one query (no N+1, no post-filter): {}",
+        q.sql
+    );
     let where_part = q.sql.split(" ORDER BY ").next().unwrap();
-    assert!(where_part.contains("JOIN authz_visible"), "the ACL JOIN is conjoined: {}", q.sql);
-    assert!(where_part.contains("db_row.props ->> 'status'"), "the view filter is conjoined in the SAME WHERE: {}", q.sql);
+    assert!(
+        where_part.contains("JOIN authz_visible"),
+        "the ACL JOIN is conjoined: {}",
+        q.sql
+    );
+    assert!(
+        where_part.contains("db_row.props ->> 'status'"),
+        "the view filter is conjoined in the SAME WHERE: {}",
+        q.sql
+    );
 
     // The permission-correct COUNT conjoins the SAME ACL INSIDE the aggregate (KN-D5 count-leak-closed).
-    let count = execute_view_count(&view, &acl, &viewer(), &TenantId("acme".into()), "db:p", &[]).unwrap();
-    assert!(count.sql.starts_with("SELECT COUNT(*)") && count.sql.contains("JOIN authz_visible"), "the ACL is inside the COUNT: {}", count.sql);
+    let count = execute_view_count(
+        &view,
+        &acl,
+        &viewer(),
+        &TenantId("acme".into()),
+        "db:p",
+        &[],
+    )
+    .unwrap();
+    assert!(
+        count.sql.starts_with("SELECT COUNT(*)") && count.sql.contains("JOIN authz_visible"),
+        "the ACL is inside the COUNT: {}",
+        count.sql
+    );
 }
 
 /// **6.3 — the measured >5% facet-promotion trigger; the threshold matches the file (one source of
@@ -124,7 +193,10 @@ fn cdc_6_3_facet_promotion_threshold_matches_file_and_is_strict() {
         thresholds.flex_db.facet_promotion_ratio, FACET_PROMOTION_THRESHOLD,
         "the executor's facet-promotion threshold == the thresholds-file value (one source of truth)"
     );
-    assert_eq!(FACET_PROMOTION_THRESHOLD, 0.05, "the frozen 6.3 trigger is >5%");
+    assert_eq!(
+        FACET_PROMOTION_THRESHOLD, 0.05,
+        "the frozen 6.3 trigger is >5%"
+    );
 
     // The measured trigger fires strictly ABOVE the ratio. 20 executions: `hot` in 2 (10% > 5% →
     // promote), `edge` in 1 (5% == ratio → does NOT promote, strict >).
@@ -144,9 +216,16 @@ fn cdc_6_3_facet_promotion_threshold_matches_file_and_is_strict() {
         }
         tel.record_execution("db:x", &facets);
     }
-    let candidates: Vec<String> =
-        tel.promotion_candidates("db:x", &schema).into_iter().map(|h| h.field_id.to_string()).collect();
-    assert_eq!(candidates, vec!["hot".to_string()], "hot (10%) promotes; edge (exactly 5%) does NOT (strict >5%): {candidates:?}");
+    let candidates: Vec<String> = tel
+        .promotion_candidates("db:x", &schema)
+        .into_iter()
+        .map(|h| h.field_id.to_string())
+        .collect();
+    assert_eq!(
+        candidates,
+        vec!["hot".to_string()],
+        "hot (10%) promotes; edge (exactly 5%) does NOT (strict >5%): {candidates:?}"
+    );
 }
 
 /// **The typed FieldType validation gate is part of the executor contract: a wrong-typed value is
@@ -156,7 +235,10 @@ fn cdc_13_3_typed_field_validation_rejects_mismatch() {
     let schema = FieldSchema::of([FieldDef::new("priority", FieldType::Int)]).unwrap();
     let mut bad: PropertyBag = BTreeMap::new();
     bad.insert(FieldId::new("priority"), FieldValue::Text("high".into()));
-    assert!(schema.validate_props(&bad).is_err(), "a Text in an Int field is rejected (no coercion)");
+    assert!(
+        schema.validate_props(&bad).is_err(),
+        "a Text in an Int field is rejected (no coercion)"
+    );
     let mut good: PropertyBag = BTreeMap::new();
     good.insert(FieldId::new("priority"), FieldValue::Int(3));
     assert_eq!(schema.validate_props(&good), Ok(()));

@@ -74,7 +74,10 @@ fn cdc_5_1_provider_mints_consumer_parses_round_trip() {
     for raw in canonical {
         // PROVIDER → wire
         let on_the_wire = provider_mints_canonical_urn(raw);
-        assert_eq!(on_the_wire, raw, "provider canonical form drifted for `{raw}`");
+        assert_eq!(
+            on_the_wire, raw,
+            "provider canonical form drifted for `{raw}`"
+        );
         // wire → CONSUMER, round-trip byte-identical
         let parsed = consumer_parses(&on_the_wire)
             .unwrap_or_else(|e| panic!("consumer rejected provider URN `{on_the_wire}`: {e}"));

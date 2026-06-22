@@ -44,11 +44,11 @@ pub const LINK_LOCAL_PREFIX: &str = "169.254.";
 /// live on private addressing. **ALWAYS blocked** (arch 02 §5.3): an allowlist may name PUBLIC
 /// destinations (a package registry, a customer's cloud endpoint), never a private/internal one.
 pub const ALWAYS_BLOCKED_PRIVATE_PREFIXES: &[&str] = &[
-    "10.",        // RFC-1918 10.0.0.0/8 — internal-RPC / control-plane / cross-tenant.
-    "192.168.",   // RFC-1918 192.168.0.0/16.
-    "127.",       // loopback (escape to host-localhost services).
-    "169.254.",   // link-local (metadata + SSRF pivots).
-    "0.",         // 0.0.0.0/8 (this-host / SSRF normalisation trick).
+    "10.",      // RFC-1918 10.0.0.0/8 — internal-RPC / control-plane / cross-tenant.
+    "192.168.", // RFC-1918 192.168.0.0/16.
+    "127.",     // loopback (escape to host-localhost services).
+    "169.254.", // link-local (metadata + SSRF pivots).
+    "0.",       // 0.0.0.0/8 (this-host / SSRF normalisation trick).
 ];
 
 /// RFC-1918 172.16.0.0/12 spans 172.16.* .. 172.31.* — checked numerically so 172.15 / 172.32
@@ -245,8 +245,9 @@ impl HardeningProfile {
         };
         let eval = EgressEvaluator::new(&policy);
         for dest in &self.egress_allowlist {
-            if let EgressDecision::Deny(reason @ (DenyReason::CloudMetadata
-            | DenyReason::InternalOrCrossTenant)) = eval.evaluate(dest)
+            if let EgressDecision::Deny(
+                reason @ (DenyReason::CloudMetadata | DenyReason::InternalOrCrossTenant),
+            ) = eval.evaluate(dest)
             {
                 return Err(format!(
                     "egress allowlist names an always-blocked destination `{dest}` ({reason:?})"
@@ -260,8 +261,8 @@ impl HardeningProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ImageRef, JobKind, ResourceLimits, TrustTier, WorkspaceSpec};
     use crate::{IdemToken, MeterTarget, RunTokenRef};
+    use crate::{ImageRef, JobKind, ResourceLimits, TrustTier, WorkspaceSpec};
 
     fn spec_with_egress(allow: Vec<String>) -> JobSpec {
         JobSpec::new(
@@ -310,14 +311,14 @@ mod tests {
     fn control_plane_and_cross_tenant_private_ranges_are_always_denied() {
         // Even with these explicitly allowlisted, the always-blocked classes win.
         let internal = [
-            "10.0.0.5",      // RFC-1918 /8 — internal-RPC / control-plane / cross-tenant
+            "10.0.0.5", // RFC-1918 /8 — internal-RPC / control-plane / cross-tenant
             "10.255.255.255",
-            "192.168.1.1",   // RFC-1918 /16
-            "172.16.0.1",    // RFC-1918 /12 (low edge)
-            "172.31.255.254",// RFC-1918 /12 (high edge)
-            "127.0.0.1",     // loopback (host services)
-            "169.254.10.20", // link-local (other than the metadata IP)
-            "0.0.0.0",       // this-host normalisation
+            "192.168.1.1",    // RFC-1918 /16
+            "172.16.0.1",     // RFC-1918 /12 (low edge)
+            "172.31.255.254", // RFC-1918 /12 (high edge)
+            "127.0.0.1",      // loopback (host services)
+            "169.254.10.20",  // link-local (other than the metadata IP)
+            "0.0.0.0",        // this-host normalisation
         ];
         let policy = EgressPolicy {
             allow: internal.iter().map(|s| s.to_string()).collect(),
@@ -399,13 +400,19 @@ mod tests {
     fn an_empty_allowlist_attaches_no_network_device_full_default_deny() {
         // The strongest default-deny: a job needing zero egress gets NO NIC at all.
         let p = HardeningProfile::derive(&spec_with_egress(vec![]));
-        assert!(!p.network_device, "no allowlist ⇒ no NIC (egress closed at the device level)");
+        assert!(
+            !p.network_device,
+            "no allowlist ⇒ no NIC (egress closed at the device level)"
+        );
     }
 
     #[test]
     fn a_nonempty_allowlist_attaches_a_filtered_network_device() {
         let p = HardeningProfile::derive(&spec_with_egress(vec!["registry.example.com".into()]));
-        assert!(p.network_device, "a non-empty allowlist ⇒ a filtered NIC is attached");
+        assert!(
+            p.network_device,
+            "a non-empty allowlist ⇒ a filtered NIC is attached"
+        );
     }
 
     #[test]

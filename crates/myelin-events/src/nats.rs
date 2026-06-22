@@ -167,15 +167,14 @@ impl BusTransport for NatsJetStreamBus {
         // same event_id is suppressed and flagged `duplicate` on the ack.
         headers.insert("Nats-Msg-Id", dedup_id.0.as_str());
 
-        let ack = self
-            .block(async {
-                self.js
-                    .publish_with_headers(nats_subject, headers, body.into())
-                    .await
-                    .map_err(|e| TransportError(format!("publish: {e}")))?
-                    .await
-                    .map_err(|e| TransportError(format!("publish ack: {e}")))
-            })?;
+        let ack = self.block(async {
+            self.js
+                .publish_with_headers(nats_subject, headers, body.into())
+                .await
+                .map_err(|e| TransportError(format!("publish: {e}")))?
+                .await
+                .map_err(|e| TransportError(format!("publish ack: {e}")))
+        })?;
 
         // `duplicate` true ⇒ the broker already had this dedup_id ⇒ Deduplicated; else Accepted.
         if ack.duplicate {
@@ -193,11 +192,7 @@ impl BusTransport for NatsJetStreamBus {
         let consumer_name = self.consumer_name();
         let stream_name = self.stream_name.clone();
         let msgs: Vec<jetstream::Message> = self.block(async {
-            let consumer: PullConsumer = match self
-                .js
-                .get_stream(&stream_name)
-                .await
-            {
+            let consumer: PullConsumer = match self.js.get_stream(&stream_name).await {
                 Ok(s) => match s.get_consumer(&consumer_name).await {
                     Ok(c) => c,
                     Err(_) => return Vec::new(),
@@ -254,6 +249,9 @@ impl BusTransport for NatsJetStreamBus {
                 let _ = stream.purge().await;
             }
         });
-        self.pending.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 }

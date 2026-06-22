@@ -46,7 +46,9 @@ impl<'a> CloneStormAccelerator<'a> {
 
     /// Publish a hot repo's clone bundle, returning its content-address (the edge cache key).
     fn publish(&self, bundle: &[u8]) -> ContentHash {
-        self.cdn.publish_bundle(bundle).expect("publish clone bundle")
+        self.cdn
+            .publish_bundle(bundle)
+            .expect("publish clone bundle")
     }
 
     /// Pick the eligible edges for this tenant from a candidate POP set (within-EU for an EU tenant).
@@ -56,7 +58,9 @@ impl<'a> CloneStormAccelerator<'a> {
 
     /// Serve the bundle from the edge BY its content-address (re-hash-verified — the validity check).
     fn serve(&self, address: &ContentHash) -> Vec<u8> {
-        self.cdn.bundle(address).expect("serve bundle by content-address")
+        self.cdn
+            .bundle(address)
+            .expect("serve bundle by content-address")
     }
 }
 
@@ -84,11 +88,22 @@ fn cdc_11_2_c3_clone_storm_publishes_and_serves_by_content_address_from_a_within
     // The consumer picks an eligible edge — within-EU only for an EU tenant.
     let candidates = candidate_pops();
     let edges = accel.eligible(&candidates);
-    assert_eq!(edges.len(), 2, "an EU tenant's eligible edge set excludes the extra-EU POP");
-    assert!(edges.iter().all(|p| p.within_eu), "every eligible edge is within-EU");
+    assert_eq!(
+        edges.len(),
+        2,
+        "an EU tenant's eligible edge set excludes the extra-EU POP"
+    );
+    assert!(
+        edges.iter().all(|p| p.within_eu),
+        "every eligible edge is within-EU"
+    );
 
     // Serving by the content-address returns the exact published bundle (re-hash-verified).
-    assert_eq!(accel.serve(&address), bundle, "11.2-C3: serve by content-address round-trips the bundle");
+    assert_eq!(
+        accel.serve(&address),
+        bundle,
+        "11.2-C3: serve by content-address round-trips the bundle"
+    );
 }
 
 /// The consumer relies on the residency attestation COVERING the CDN edge set (12.4): the CDN

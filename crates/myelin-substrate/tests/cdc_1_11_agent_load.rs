@@ -70,7 +70,11 @@ fn cdc_1_11_agent_dispatch_pool_drops_over_cap_never_forks() {
         "over-cap is DROPPED (never forked) — the §7.4 structural concurrency cap"
     );
     assert_eq!(pool.in_flight(), 2, "in-flight never exceeds the bound");
-    assert_eq!(pool.dispatch_pool_drops(), 1, "the drop is exported (contract-1.8)");
+    assert_eq!(
+        pool.dispatch_pool_drops(),
+        1,
+        "the drop is exported (contract-1.8)"
+    );
 }
 
 /// **CDC 1.11 agent (b) — the causal-depth ceiling reads `EventEnvelope.depth` and halts at the hard
@@ -78,9 +82,16 @@ fn cdc_1_11_agent_dispatch_pool_drops_over_cap_never_forks() {
 #[test]
 fn cdc_1_11_agent_depth_ceiling_reads_envelope_depth_and_halts() {
     let mut ceiling = DepthCeiling::v1_floor();
-    assert_eq!((ceiling.soft(), ceiling.hard()), (12, 16), "the v1 floor (P-038)");
+    assert_eq!(
+        (ceiling.soft(), ceiling.hard()),
+        (12, 16),
+        "the v1 floor (P-038)"
+    );
     assert_eq!(ceiling.evaluate(&reaction(5, "r")), DepthVerdict::Admit);
-    assert_eq!(ceiling.evaluate(&reaction(12, "r")), DepthVerdict::AdmitFlagged);
+    assert_eq!(
+        ceiling.evaluate(&reaction(12, "r")),
+        DepthVerdict::AdmitFlagged
+    );
     assert_eq!(
         ceiling.evaluate(&reaction(16, "r")),
         DepthVerdict::Halt,
@@ -104,11 +115,18 @@ fn cdc_1_11_agent_shared_root_tripwire_reads_correlation_id_and_fires() {
         "too many reactions off ONE root within the window → fire + quarantine"
     );
     assert!(tw.is_quarantined(&root));
-    assert_eq!(tw.tripwire_fired(), 1, "tripwire_fired is exported (contract-1.8)");
+    assert_eq!(
+        tw.tripwire_fired(),
+        1,
+        "tripwire_fired is exported (contract-1.8)"
+    );
     // diverse roots are normal traffic — never fire.
     let mut tw2 = SharedRootTripwire::new(8, 4);
     for i in 0..8 {
-        assert_eq!(tw2.record(&reaction(1, &format!("r{i}"))), TripwireVerdict::Admit);
+        assert_eq!(
+            tw2.record(&reaction(1, &format!("r{i}"))),
+            TripwireVerdict::Admit
+        );
     }
     assert_eq!(tw2.tripwire_fired(), 0);
 }
@@ -118,7 +136,11 @@ fn cdc_1_11_agent_shared_root_tripwire_reads_correlation_id_and_fires() {
 #[test]
 fn cdc_1_11_agent_predicate_guard_rejects_over_cost_matcher() {
     let mut guard = PredicateGuard::v1_floor();
-    assert_eq!((guard.max_steps(), guard.max_eval_micros()), (256, 2_000), "the v1 floor");
+    assert_eq!(
+        (guard.max_steps(), guard.max_eval_micros()),
+        (256, 2_000),
+        "the v1 floor"
+    );
     assert_eq!(guard.admit_static(20), PredicateVerdict::WithinBudget);
     assert_eq!(
         guard.admit_static(10_000),
@@ -154,7 +176,10 @@ fn cdc_1_11_agent_composed_guard_stops_the_loop_whichever_way_it_evades() {
     for _ in 0..3 {
         assert_eq!(g2.admit(&reaction(2, "fan")), GuardOutcome::Dispatch);
     }
-    assert_eq!(g2.admit(&reaction(2, "fan")), GuardOutcome::HaltedByTripwire);
+    assert_eq!(
+        g2.admit(&reaction(2, "fan")),
+        GuardOutcome::HaltedByTripwire
+    );
     assert_eq!(g2.signals().tripwire_fired, 1);
 
     // a concurrency surge → dropped by the pool (never forked).

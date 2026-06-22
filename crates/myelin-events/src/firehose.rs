@@ -200,7 +200,10 @@ impl FirehoseScope {
                 })
             }
         };
-        Ok(FirehoseScope { kind, id: id.to_string() })
+        Ok(FirehoseScope {
+            kind,
+            id: id.to_string(),
+        })
     }
 
     /// The scope kind (`board`/`doc`/`channel`).
@@ -247,7 +250,10 @@ pub struct FramePayload(pub String);
 impl Frame {
     /// A frame at `seq` carrying the opaque pointer `payload`.
     pub fn new(seq: u64, payload: impl Into<String>) -> Frame {
-        Frame { seq, payload: FramePayload(payload.into()) }
+        Frame {
+            seq,
+            payload: FramePayload(payload.into()),
+        }
     }
 }
 
@@ -264,7 +270,9 @@ pub struct FrameDraft {
 impl FrameDraft {
     /// A draft carrying the opaque pointer `payload`.
     pub fn new(payload: impl Into<String>) -> FrameDraft {
-        FrameDraft { payload: FramePayload(payload.into()) }
+        FrameDraft {
+            payload: FramePayload(payload.into()),
+        }
     }
 }
 
@@ -364,7 +372,10 @@ impl RetentionWindow {
     /// Evicts the oldest frame once at capacity (the window is bounded). Returns the assigned frame.
     fn publish(&mut self, draft: FrameDraft) -> Frame {
         self.last_seq += 1;
-        let frame = Frame { seq: self.last_seq, payload: draft.payload };
+        let frame = Frame {
+            seq: self.last_seq,
+            payload: draft.payload,
+        };
         if self.frames.len() == self.capacity {
             self.frames.pop_front();
         }
@@ -405,7 +416,10 @@ impl RetentionWindow {
         // ops it is missing are simply not held). `first_missing < floor` means the gap's head was
         // evicted.
         if floor == 0 || first_missing < floor {
-            return Err(FirehoseError::ResyncRequired { last_seq, window_floor: floor });
+            return Err(FirehoseError::ResyncRequired {
+                last_seq,
+                window_floor: floor,
+            });
         }
         Ok(self
             .frames
@@ -698,7 +712,10 @@ impl Firehose {
     /// here `tail` reads the live window.)
     pub fn tail(&self, stream: &str, scope: &FirehoseScope, lo: u64, hi: u64) -> Vec<Frame> {
         let key = (stream.to_string(), scope.clone());
-        self.windows.get(&key).map(|w| w.tail(lo, hi)).unwrap_or_default()
+        self.windows
+            .get(&key)
+            .map(|w| w.tail(lo, hi))
+            .unwrap_or_default()
     }
 
     /// **`subscribe(stream, scope, cursor?)` → `SubStream` (§5.5, NEW).** Open a per-view subscription
@@ -761,13 +778,24 @@ impl Firehose {
     /// and return the caller handle. The subscription's start cursor is the last backfilled seq (or
     /// the window head if no backfill), so a subsequent `publish` enqueues only strictly-newer frames
     /// (no duplicate across the backfill→live boundary — the zero-loss, zero-dup property).
-    fn open_live(&mut self, stream: &str, scope: &FirehoseScope, backfill: Vec<Frame>) -> Subscription {
+    fn open_live(
+        &mut self,
+        stream: &str,
+        scope: &FirehoseScope,
+        backfill: Vec<Frame>,
+    ) -> Subscription {
         let key = (stream.to_string(), scope.clone());
         // The live start cursor: the head of the window (so a `None`-cursor subscribe starts live
         // from now and a backfilled resume continues from its last backfilled frame).
         let head = self.windows.get(&key).map(|w| w.last_seq()).unwrap_or(0);
         let start_seq = backfill.last().map(|f| f.seq).unwrap_or(head);
-        let sub = SubStream::new(stream.to_string(), scope.clone(), backfill, self.inflight_cap, start_seq);
+        let sub = SubStream::new(
+            stream.to_string(),
+            scope.clone(),
+            backfill,
+            self.inflight_cap,
+            start_seq,
+        );
         let rc = std::rc::Rc::new(std::cell::RefCell::new(sub));
         self.subscribers
             .entry(key)
@@ -819,11 +847,18 @@ mod tests {
         let f1 = fh.publish("chat-live", &board_a, draft("op-1"));
         let f2 = fh.publish("chat-live", &board_a, draft("op-2"));
         let f3 = fh.publish("chat-live", &board_a, draft("op-3"));
-        assert_eq!((f1.seq, f2.seq, f3.seq), (1, 2, 3), "monotone per (stream,scope)");
+        assert_eq!(
+            (f1.seq, f2.seq, f3.seq),
+            (1, 2, 3),
+            "monotone per (stream,scope)"
+        );
 
         // a DIFFERENT scope on the same stream has its OWN sequence starting at 1.
         let g1 = fh.publish("chat-live", &board_b, draft("op-x"));
-        assert_eq!(g1.seq, 1, "a different scope has an independent monotonic seq");
+        assert_eq!(
+            g1.seq, 1,
+            "a different scope has an independent monotonic seq"
+        );
         // board:a's next frame continues from 3 (unaffected by board:b).
         let f4 = fh.publish("chat-live", &board_a, draft("op-4"));
         assert_eq!(f4.seq, 4, "the original scope's sequence is independent");
@@ -848,21 +883,35 @@ mod tests {
         fh.publish("kn-ops", &s, draft("op-5"));
 
         // reconnect with last_seq = 2 → backfill (2, now] = {3,4,5}.
-        let sub = fh.resume("kn-ops", &s, 2).expect("in-window resume backfills");
+        let sub = fh
+            .resume("kn-ops", &s, 2)
+            .expect("in-window resume backfills");
         let backfilled = sub.drain_ready();
         let seqs: Vec<u64> = backfilled.iter().map(|f| f.seq).collect();
-        assert_eq!(seqs, vec![3, 4, 5], "the gap (last_seq, now] is replayed — ZERO ops lost");
+        assert_eq!(
+            seqs,
+            vec![3, 4, 5],
+            "the gap (last_seq, now] is replayed — ZERO ops lost"
+        );
         assert_eq!(sub.last_seq(), 5, "the resume cursor advanced to the head");
 
         // now a LIVE frame is published → it is delivered with NO gap and NO duplicate.
         fh.publish("kn-ops", &s, draft("op-6"));
         let live = sub.drain_ready();
-        assert_eq!(live.iter().map(|f| f.seq).collect::<Vec<_>>(), vec![6], "live continues gap-free");
+        assert_eq!(
+            live.iter().map(|f| f.seq).collect::<Vec<_>>(),
+            vec![6],
+            "live continues gap-free"
+        );
 
         // TOTAL: the client saw 3,4,5,6 across the reconnect — every op exactly once, none lost.
         let mut all = seqs;
         all.extend(live.iter().map(|f| f.seq));
-        assert_eq!(all, vec![3, 4, 5, 6], "across the reconnect: 0 lost, 0 duplicate");
+        assert_eq!(
+            all,
+            vec![3, 4, 5, 6],
+            "across the reconnect: 0 lost, 0 duplicate"
+        );
     }
 
     /// A `cursor = None` subscribe starts LIVE from now (no backfill) and receives only frames
@@ -875,14 +924,23 @@ mod tests {
         fh.publish("chat-live", &s, draft("old-2"));
 
         // subscribe with no cursor → no backfill, live from head.
-        let sub = fh.subscribe("chat-live", &s, None).expect("bounded scope subscribes");
-        assert!(sub.drain_ready().is_empty(), "no backfill on a None cursor (live from now)");
+        let sub = fh
+            .subscribe("chat-live", &s, None)
+            .expect("bounded scope subscribes");
+        assert!(
+            sub.drain_ready().is_empty(),
+            "no backfill on a None cursor (live from now)"
+        );
 
         // only frames published after the subscription opened are delivered.
         fh.publish("chat-live", &s, draft("new-3"));
         fh.publish("chat-live", &s, draft("new-4"));
         let live: Vec<u64> = sub.drain_ready().iter().map(|f| f.seq).collect();
-        assert_eq!(live, vec![3, 4], "a None-cursor subscribe receives only post-open live frames");
+        assert_eq!(
+            live,
+            vec![3, 4],
+            "a None-cursor subscribe receives only post-open live frames"
+        );
     }
 
     /// A resume at the CURRENT head (caught-up client) backfills nothing and just continues live —
@@ -895,8 +953,13 @@ mod tests {
             fh.publish("issues", &s, draft("row"));
         }
         // resume at last_seq = 5 (the head) → nothing to replay.
-        let sub = fh.resume("issues", &s, 5).expect("caught-up resume is fine");
-        assert!(sub.drain_ready().is_empty(), "a caught-up resume backfills nothing");
+        let sub = fh
+            .resume("issues", &s, 5)
+            .expect("caught-up resume is fine");
+        assert!(
+            sub.drain_ready().is_empty(),
+            "a caught-up resume backfills nothing"
+        );
         assert!(!sub.resync_required(), "a caught-up resume is NOT a resync");
     }
 
@@ -915,22 +978,43 @@ mod tests {
         for _ in 0..6 {
             fh.publish("kn-ops", &s, draft("op"));
         }
-        assert_eq!(fh.window_len("kn-ops", &s), 3, "the window is bounded at 3 (1,2,3 evicted)");
+        assert_eq!(
+            fh.window_len("kn-ops", &s),
+            3,
+            "the window is bounded at 3 (1,2,3 evicted)"
+        );
 
         // a client at last_seq = 2 needs op 3 first — but 3 was evicted → resync_required.
-        let err = fh.resume("kn-ops", &s, 2).expect_err("an out-of-window cursor cannot backfill");
-        assert!(err.is_resync_required(), "the over-window cursor RAISES resync_required (NAMED)");
-        if let FirehoseError::ResyncRequired { last_seq, window_floor } = err {
+        let err = fh
+            .resume("kn-ops", &s, 2)
+            .expect_err("an out-of-window cursor cannot backfill");
+        assert!(
+            err.is_resync_required(),
+            "the over-window cursor RAISES resync_required (NAMED)"
+        );
+        if let FirehoseError::ResyncRequired {
+            last_seq,
+            window_floor,
+        } = err
+        {
             assert_eq!(last_seq, 2);
-            assert_eq!(window_floor, 4, "the window floor is the oldest held seq (4)");
+            assert_eq!(
+                window_floor, 4,
+                "the window floor is the oldest held seq (4)"
+            );
         } else {
             panic!("expected ResyncRequired");
         }
 
         // a client at last_seq = 4 (its next-missing op 5 is still held) DOES backfill {5,6} — the
         // boundary case proves the floor check is exact, not over-eager.
-        let sub = fh.resume("kn-ops", &s, 4).expect("an in-window cursor backfills");
-        assert_eq!(sub.drain_ready().iter().map(|f| f.seq).collect::<Vec<_>>(), vec![5, 6]);
+        let sub = fh
+            .resume("kn-ops", &s, 4)
+            .expect("an in-window cursor backfills");
+        assert_eq!(
+            sub.drain_ready().iter().map(|f| f.seq).collect::<Vec<_>>(),
+            vec![5, 6]
+        );
     }
 
     /// The exact window-floor boundary: `last_seq` such that the FIRST missing op equals the window
@@ -944,8 +1028,13 @@ mod tests {
         }
         // window holds {4,5,6}, floor = 4.
         // last_seq = 3 → first missing op = 4 == floor → IN-WINDOW (replays {4,5,6}).
-        let sub = fh.resume("issues", &s, 3).expect("first-missing == floor is in-window");
-        assert_eq!(sub.drain_ready().iter().map(|f| f.seq).collect::<Vec<_>>(), vec![4, 5, 6]);
+        let sub = fh
+            .resume("issues", &s, 3)
+            .expect("first-missing == floor is in-window");
+        assert_eq!(
+            sub.drain_ready().iter().map(|f| f.seq).collect::<Vec<_>>(),
+            vec![4, 5, 6]
+        );
         // last_seq = 2 → first missing op = 3 < floor 4 → resync_required.
         assert!(fh
             .resume("issues", &s, 2)
@@ -964,32 +1053,66 @@ mod tests {
         let mut fh = Firehose::new();
 
         // the headline fixture: scope = `*` is rejected at the connection-tier subscribe entry.
-        let err = fh.subscribe_raw("chat-live", "*", None).expect_err("`*` is rejected");
-        assert!(err.is_over_broad_scope(), "scope = * is an over-broad scope (rejected)");
+        let err = fh
+            .subscribe_raw("chat-live", "*", None)
+            .expect_err("`*` is rejected");
+        assert!(
+            err.is_over_broad_scope(),
+            "scope = * is an over-broad scope (rejected)"
+        );
 
         // every over-broad form is rejected through `subscribe_raw` (the connection-tier entry).
-        for raw in ["*", "board:*", "doc:a*", "123", "", "   ", "team:eng", "all"] {
+        for raw in [
+            "*", "board:*", "doc:a*", "123", "", "   ", "team:eng", "all",
+        ] {
             let r = fh.subscribe_raw("chat-live", raw, None);
-            assert!(r.is_err(), "over-broad scope `{raw}` must be rejected at subscribe, got {r:?}");
-            assert!(r.unwrap_err().is_over_broad_scope(), "`{raw}` is an over-broad-scope rejection");
+            assert!(
+                r.is_err(),
+                "over-broad scope `{raw}` must be rejected at subscribe, got {r:?}"
+            );
+            assert!(
+                r.unwrap_err().is_over_broad_scope(),
+                "`{raw}` is an over-broad-scope rejection"
+            );
         }
 
         // a BOUNDED scope through the same entry subscribes fine (the positive control).
-        assert!(fh.subscribe_raw("chat-live", "channel:eng", None).is_ok(), "a bounded scope subscribes");
+        assert!(
+            fh.subscribe_raw("chat-live", "channel:eng", None).is_ok(),
+            "a bounded scope subscribes"
+        );
     }
 
     /// Re-state the over-broad rejection cleanly (the loop above is awkward with Result) — every
     /// over-broad form is an `Err(OverBroadScope)`, every bounded form parses.
     #[test]
     fn over_broad_scopes_are_all_rejected_bounded_scopes_all_parse() {
-        for raw in ["*", "board:*", "doc:a*", "channel:*", "123", "", "   ", "team:eng", "all", "board:"] {
+        for raw in [
+            "*",
+            "board:*",
+            "doc:a*",
+            "channel:*",
+            "123",
+            "",
+            "   ",
+            "team:eng",
+            "all",
+            "board:",
+        ] {
             let r = FirehoseScope::parse(raw);
-            assert!(r.is_err(), "over-broad/invalid scope `{raw}` must be rejected, got {r:?}");
+            assert!(
+                r.is_err(),
+                "over-broad/invalid scope `{raw}` must be rejected, got {r:?}"
+            );
             assert!(r.unwrap_err().is_over_broad_scope());
         }
         for raw in ["board:42", "doc:design", "channel:eng", "board:proj-1_x"] {
             let s = FirehoseScope::parse(raw).unwrap_or_else(|_| panic!("`{raw}` must parse"));
-            assert_eq!(s.selector(), raw, "a bounded scope round-trips its selector string");
+            assert_eq!(
+                s.selector(),
+                raw,
+                "a bounded scope round-trips its selector string"
+            );
         }
     }
 
@@ -1000,14 +1123,32 @@ mod tests {
     #[test]
     fn inbox_scope_is_a_bounded_kind_and_unbounded_inbox_is_rejected() {
         let s = FirehoseScope::parse("inbox:p-opaque-1").expect("a bounded inbox scope parses");
-        assert_eq!(s.kind(), ScopeKind::Inbox, "inbox: parses to the Inbox kind");
-        assert_eq!(s.id(), "p-opaque-1", "the principal id is the bounded resource id");
-        assert_eq!(s.selector(), "inbox:p-opaque-1", "the inbox scope round-trips its selector");
+        assert_eq!(
+            s.kind(),
+            ScopeKind::Inbox,
+            "inbox: parses to the Inbox kind"
+        );
+        assert_eq!(
+            s.id(),
+            "p-opaque-1",
+            "the principal id is the bounded resource id"
+        );
+        assert_eq!(
+            s.selector(),
+            "inbox:p-opaque-1",
+            "the inbox scope round-trips its selector"
+        );
         // the *-rejection generalises to inbox: an unbounded inbox scope is STILL rejected.
         for raw in ["inbox:*", "inbox:", "inbox"] {
             let r = FirehoseScope::parse(raw);
-            assert!(r.is_err(), "unbounded/empty inbox scope `{raw}` must be rejected, got {r:?}");
-            assert!(r.unwrap_err().is_over_broad_scope(), "`{raw}` is an over-broad-scope rejection");
+            assert!(
+                r.is_err(),
+                "unbounded/empty inbox scope `{raw}` must be rejected, got {r:?}"
+            );
+            assert!(
+                r.unwrap_err().is_over_broad_scope(),
+                "`{raw}` is an over-broad-scope rejection"
+            );
         }
     }
 
@@ -1029,14 +1170,27 @@ mod tests {
             fh.publish("chat-live", &s, draft("frame"));
         }
         assert_eq!(sub.ready_len(), 3, "the in-flight queue filled to the cap");
-        assert!(!sub.resync_required(), "not dropped yet (at the cap, not over it)");
+        assert!(
+            !sub.resync_required(),
+            "not dropped yet (at the cap, not over it)"
+        );
 
         // the 4th frame is OVER the cap → the slow consumer is DROPPED to resync_required.
         fh.publish("chat-live", &s, draft("over-cap"));
-        assert!(sub.resync_required(), "a slow consumer is dropped to resync_required (NAMED)");
-        assert_eq!(sub.ready_len(), 0, "the buffer is RELEASED — memory bounded, the gap NOT buffered");
+        assert!(
+            sub.resync_required(),
+            "a slow consumer is dropped to resync_required (NAMED)"
+        );
+        assert_eq!(
+            sub.ready_len(),
+            0,
+            "the buffer is RELEASED — memory bounded, the gap NOT buffered"
+        );
         // a pull on a dropped subscription yields nothing (the consumer must resume/*.snapshot).
-        assert!(sub.pull().is_none(), "a dropped subscription delivers nothing until it resumes");
+        assert!(
+            sub.pull().is_none(),
+            "a dropped subscription delivers nothing until it resumes"
+        );
     }
 
     /// A consumer that KEEPS UP is never dropped: it pulls each frame as it is published, so the
@@ -1048,11 +1202,19 @@ mod tests {
         let sub = fh.subscribe("chat-live", &s, None).expect("subscribe");
         for i in 1..=100u64 {
             fh.publish("chat-live", &s, draft("f"));
-            let pulled = sub.pull().expect("a keeping-up consumer always has its frame");
+            let pulled = sub
+                .pull()
+                .expect("a keeping-up consumer always has its frame");
             assert_eq!(pulled.seq, i, "delivered in order");
-            assert!(sub.ready_len() <= 1, "the in-flight stays bounded for a keeping-up consumer");
+            assert!(
+                sub.ready_len() <= 1,
+                "the in-flight stays bounded for a keeping-up consumer"
+            );
         }
-        assert!(!sub.resync_required(), "a keeping-up consumer is never dropped");
+        assert!(
+            !sub.resync_required(),
+            "a keeping-up consumer is never dropped"
+        );
     }
 
     // ---- tail(range) ---------------------------------------------------------------------------
@@ -1068,9 +1230,17 @@ mod tests {
             fh.publish("ci-logs", &s, draft("line"));
         }
         let mid: Vec<u64> = fh.tail("ci-logs", &s, 3, 6).iter().map(|f| f.seq).collect();
-        assert_eq!(mid, vec![3, 4, 5, 6], "tail reads the inclusive [lo, hi] range");
+        assert_eq!(
+            mid,
+            vec![3, 4, 5, 6],
+            "tail reads the inclusive [lo, hi] range"
+        );
         // a range past the head returns only what exists.
-        let tail: Vec<u64> = fh.tail("ci-logs", &s, 8, 100).iter().map(|f| f.seq).collect();
+        let tail: Vec<u64> = fh
+            .tail("ci-logs", &s, 8, 100)
+            .iter()
+            .map(|f| f.seq)
+            .collect();
         assert_eq!(tail, vec![8, 9, 10], "tail clamps to the held frames");
     }
 
@@ -1083,8 +1253,15 @@ mod tests {
         let a = fh.subscribe("chat-live", &s, None).expect("a subscribes");
         let b = fh.subscribe("chat-live", &s, None).expect("b subscribes");
         fh.publish("chat-live", &s, draft("hello"));
-        assert_eq!(a.drain_ready().iter().map(|f| f.seq).collect::<Vec<_>>(), vec![1]);
-        assert_eq!(b.drain_ready().iter().map(|f| f.seq).collect::<Vec<_>>(), vec![1], "both viewers receive it");
+        assert_eq!(
+            a.drain_ready().iter().map(|f| f.seq).collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(
+            b.drain_ready().iter().map(|f| f.seq).collect::<Vec<_>>(),
+            vec![1],
+            "both viewers receive it"
+        );
     }
 
     /// The resume cursor a `SubStream` reports is the last DELIVERED seq — so a client that pulls some
@@ -1097,13 +1274,24 @@ mod tests {
         for _ in 0..5 {
             fh.publish("kn-ops", &s, draft("op"));
         }
-        let sub = fh.resume("kn-ops", &s, 0).expect("fresh client replays the window");
+        let sub = fh
+            .resume("kn-ops", &s, 0)
+            .expect("fresh client replays the window");
         // pull only the first two of the backfill, then "drop".
         assert_eq!(sub.pull().map(|f| f.seq), Some(1));
         assert_eq!(sub.pull().map(|f| f.seq), Some(2));
-        assert_eq!(sub.last_seq(), 2, "the cursor is the last DELIVERED seq (not the head 5)");
+        assert_eq!(
+            sub.last_seq(),
+            2,
+            "the cursor is the last DELIVERED seq (not the head 5)"
+        );
         // resume from 2 → backfill {3,4,5}.
-        let sub2 = fh.resume("kn-ops", &s, sub.last_seq()).expect("resume from the partial cursor");
-        assert_eq!(sub2.drain_ready().iter().map(|f| f.seq).collect::<Vec<_>>(), vec![3, 4, 5]);
+        let sub2 = fh
+            .resume("kn-ops", &s, sub.last_seq())
+            .expect("resume from the partial cursor");
+        assert_eq!(
+            sub2.drain_ready().iter().map(|f| f.seq).collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
     }
 }

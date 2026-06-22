@@ -128,8 +128,8 @@ pub use coverage::{
 
 pub use engine::{Lint, LintId, Violation};
 pub use lints::{
-    all_twelve, control_plane_pii_free, flow_determinism, forward_only_migration, load_bearing_four,
-    no_cross_db, no_cross_sync_cycle, no_host_exec, no_llm_in_platform, no_raw_publish,
-    no_untagged_personal_data, remaining_eight, residency_pin, search_requires_acl_filter,
-    tenant_predicate, ALL_TWELVE, LOAD_BEARING_FOUR, REMAINING_EIGHT,
+    all_twelve, control_plane_pii_free, flow_determinism, forward_only_migration,
+    load_bearing_four, no_cross_db, no_cross_sync_cycle, no_host_exec, no_llm_in_platform,
+    no_raw_publish, no_untagged_personal_data, remaining_eight, residency_pin,
+    search_requires_acl_filter, tenant_predicate, ALL_TWELVE, LOAD_BEARING_FOUR, REMAINING_EIGHT,
 };

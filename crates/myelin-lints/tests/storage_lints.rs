@@ -141,12 +141,18 @@ fn residency_pin_is_sharpened_to_the_real_oltp_constructors() {
     let red_pool = "let p = OltpPool::open(cfg);";
     let red_coloc = "let db = ColocatedOltp::open(cfg, minter);";
     let green_pool = "let p = OltpPool::open(cfg.region(region));";
-    assert!(!residency_pin().run(red_pool).is_empty(), "region-less OltpPool::open must reject");
+    assert!(
+        !residency_pin().run(red_pool).is_empty(),
+        "region-less OltpPool::open must reject"
+    );
     assert!(
         !residency_pin().run(red_coloc).is_empty(),
         "region-less ColocatedOltp::open must reject"
     );
-    assert!(residency_pin().run(green_pool).is_empty(), "region-pinned open must admit");
+    assert!(
+        residency_pin().run(green_pool).is_empty(),
+        "region-pinned open must admit"
+    );
 }
 
 #[test]
@@ -160,8 +166,14 @@ fn residency_pin_named_floor_waiver_is_loud_and_scoped() {
     let file_waived =
         "//! @residency-cell-pinned:file (the M0 pool model)\nfn f() { OltpPool::open(cfg); }";
     let unmarked = "fn f() { OltpPool::open(cfg); }";
-    assert!(residency_pin().run(site_waived).is_empty(), "a named site waiver admits");
-    assert!(residency_pin().run(file_waived).is_empty(), "a named file waiver admits");
+    assert!(
+        residency_pin().run(site_waived).is_empty(),
+        "a named site waiver admits"
+    );
+    assert!(
+        residency_pin().run(file_waived).is_empty(),
+        "a named file waiver admits"
+    );
     assert!(
         !residency_pin().run(unmarked).is_empty(),
         "an UNMARKED region-less open must still fire (the waiver is named, not a blanket skip)"
@@ -175,9 +187,18 @@ fn forward_only_migration_rejects_inplace_rewrite_admits_online_expand() {
     let red_inplace = "ALTER TABLE principals ALTER COLUMN email TYPE TEXT;";
     let red_drop = "DROP COLUMN email_old;";
     let green_expand = "ALTER TABLE principals ADD COLUMN email_v2 TEXT;";
-    assert!(!forward_only_migration().run(red_inplace).is_empty(), "in-place rewrite must reject");
-    assert!(!forward_only_migration().run(red_drop).is_empty(), "DROP COLUMN must reject");
-    assert!(forward_only_migration().run(green_expand).is_empty(), "nullable add must admit");
+    assert!(
+        !forward_only_migration().run(red_inplace).is_empty(),
+        "in-place rewrite must reject"
+    );
+    assert!(
+        !forward_only_migration().run(red_drop).is_empty(),
+        "DROP COLUMN must reject"
+    );
+    assert!(
+        forward_only_migration().run(green_expand).is_empty(),
+        "nullable add must admit"
+    );
 }
 
 #[test]

@@ -26,7 +26,7 @@
 
 use myelin_events::{
     Actor, AggregateKey, ArtifactRef, CorrelationId, DataRole, EmitContextBase, EventEnvelope,
-    EventId, EventType, InProcessBus, OutboxStore, Region, Relay, ReindexSource, SnapshotScope,
+    EventId, EventType, InProcessBus, OutboxStore, Region, ReindexSource, Relay, SnapshotScope,
     TenantId, Timestamp, Visibility, OUTBOX_MIGRATION,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
@@ -112,13 +112,18 @@ fn live_projection(src: &OlapAnalyticsSource) -> OlapBusConsumer {
     for draft in src.replay(&SnapshotScope::new("olap_src", "all"), None) {
         let subject = draft.payload.get("subject").and_then(|s| s.as_str());
         let env = live_envelope(&draft.aggregate.0, &draft.event_id().0, subject);
-        consumer.ingest(&env).expect("an in-region live event is admitted");
+        consumer
+            .ingest(&env)
+            .expect("an in-region live event is admitted");
     }
     consumer
 }
 
 fn booted_bus() -> (OutboxStore, InProcessBus, Relay<InProcessBus>) {
-    assert!(OUTBOX_MIGRATION.contains("event_id"), "the frozen 2.3 outbox DDL is present");
+    assert!(
+        OUTBOX_MIGRATION.contains("event_id"),
+        "the frozen 2.3 outbox DDL is present"
+    );
     let outbox = OutboxStore::new();
     let bus = InProcessBus::new();
     let relay = Relay::new(outbox.clone(), bus.clone(), || {
@@ -145,27 +150,58 @@ fn stor_f4_olap_reindex_parity_cold_equals_live() {
 
     // (3) REINDEX through the REAL path.
     let (cold, r1) = reindex_olap_from_bus(
-        region(), &scope, &sources, &mut outbox, &bus, &relay, ctx_base(), "",
+        region(),
+        &scope,
+        &sources,
+        &mut outbox,
+        &bus,
+        &relay,
+        ctx_base(),
+        "",
     )
     .expect("the OLAP reindex-from-bus succeeds");
 
     // (4) cold == live, BYTE-FOR-BYTE (the F4 gate).
-    assert_eq!(r1.snapshots_emitted, 4, "reindex re-emitted all 4 aggregates as *.snapshot");
-    assert_eq!(cold.store().doc_count(), 4, "the cold rebuild projected all 4");
+    assert_eq!(
+        r1.snapshots_emitted, 4,
+        "reindex re-emitted all 4 aggregates as *.snapshot"
+    );
+    assert_eq!(
+        cold.store().doc_count(),
+        4,
+        "the cold rebuild projected all 4"
+    );
     assert_eq!(
         cold.parity_bytes(),
         live_bytes,
         "F4: cold == live (byte-identical OLAP rebuild)"
     );
-    assert_eq!(cold.store().oltp_scan_path_count(), 0, "no OLTP-scan backdoor");
+    assert_eq!(
+        cold.store().oltp_scan_path_count(),
+        0,
+        "no OLTP-scan backdoor"
+    );
 
     // (5) IDEMPOTENT re-run: 0 new snapshots; a WIPED consumer rebuilds byte-stable.
     let (again, r2) = reindex_olap_from_bus(
-        region(), &scope, &sources, &mut outbox, &bus, &relay, ctx_base(), "",
+        region(),
+        &scope,
+        &sources,
+        &mut outbox,
+        &bus,
+        &relay,
+        ctx_base(),
+        "",
     )
     .expect("the re-run succeeds");
-    assert_eq!(r2.snapshots_emitted, 0, "the re-run emits 0 NEW snapshots (idempotent)");
-    assert_eq!(r2.snapshots_skipped_duplicate, 4, "all four skipped as duplicate");
+    assert_eq!(
+        r2.snapshots_emitted, 0,
+        "the re-run emits 0 NEW snapshots (idempotent)"
+    );
+    assert_eq!(
+        r2.snapshots_skipped_duplicate, 4,
+        "all four skipped as duplicate"
+    );
     assert_eq!(
         again.parity_bytes(),
         live_bytes,
@@ -180,7 +216,10 @@ fn stor_f4_olap_reindex_parity_cold_equals_live() {
         snapshots_emitted_first: r1.snapshots_emitted,
         snapshots_emitted_second: r2.snapshots_emitted,
     };
-    assert!(signal.is_green(), "the F4 OLAP reindex-parity artifact is GREEN: {signal:?}");
+    assert!(
+        signal.is_green(),
+        "the F4 OLAP reindex-parity artifact is GREEN: {signal:?}"
+    );
     println!(
         "[P-145 STOR-F4 DRILL GREEN 2026-06-20] OLAP reindex-parity: reindex(scope=olap_src) \
          rebuilt the OLAP read model BYTE-MATCHING live through the real outbox→relay→bus→consumer \
@@ -203,7 +242,14 @@ fn stor_f4_no_oltp_scan_backdoor_on_the_rebuild() {
     let scope = SnapshotScope::new("olap_src", "all");
     let sources: Vec<&dyn ReindexSource> = vec![&src];
     let (cold, _r) = reindex_olap_from_bus(
-        region(), &scope, &sources, &mut outbox, &bus, &relay, ctx_base(), "",
+        region(),
+        &scope,
+        &sources,
+        &mut outbox,
+        &bus,
+        &relay,
+        ctx_base(),
+        "",
     )
     .unwrap();
     assert_eq!(

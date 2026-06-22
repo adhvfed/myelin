@@ -160,7 +160,11 @@ impl InboxWatch {
     /// poll it returns the frames published since the last drain. ZERO items lost, ZERO duplicate
     /// across the backfill→live boundary (the Bus protocol's invariant, which this rides).
     pub fn drain(&self) -> Vec<InboxFrame> {
-        self.sub.drain_ready().into_iter().map(decode_frame).collect()
+        self.sub
+            .drain_ready()
+            .into_iter()
+            .map(decode_frame)
+            .collect()
     }
 
     /// **The resume cursor — the seq of the last frame this watch DELIVERED.** The client presents
@@ -190,7 +194,10 @@ impl InboxWatch {
 
 /// Decode a Bus firehose frame into an [`InboxFrame`] (the `item_id` pointer is the opaque payload).
 fn decode_frame(frame: myelin_events::firehose::Frame) -> InboxFrame {
-    InboxFrame { seq: frame.seq, item_id: frame.payload.0 }
+    InboxFrame {
+        seq: frame.seq,
+        item_id: frame.payload.0,
+    }
 }
 
 /// **PRODUCER side: mirror an inbox `notif.item.created` onto the firehose as a live frame (§7).**
@@ -253,9 +260,13 @@ pub fn watch_resume(
     match firehose.resume(&stream, &scope, last_seq) {
         Ok(sub) => Ok(WatchOutcome::Live(InboxWatch { sub, scope })),
         // the ONE expected non-fatal verdict: an over-old cursor → the NAMED cold-rebuild signal.
-        Err(FirehoseError::ResyncRequired { last_seq, window_floor }) => {
-            Ok(WatchOutcome::ResyncRequired { last_seq, window_floor })
-        }
+        Err(FirehoseError::ResyncRequired {
+            last_seq,
+            window_floor,
+        }) => Ok(WatchOutcome::ResyncRequired {
+            last_seq,
+            window_floor,
+        }),
         // an over-broad scope cannot happen here (the scope is the bounded inbox: selector), but
         // propagate any other transport error rather than swallow it (LOUD, not silent).
         Err(other) => Err(other),
@@ -291,7 +302,14 @@ pub fn cold_rebuild(
 ) -> InboxPage {
     // the full, unfiltered inbox — the cold rebuild replaces the lost live view entirely (the gap
     // cannot be reconstructed from the window, so we rebuild from source, §7).
-    list_inbox(inbox, principal, &InboxFilter::all(), &Page::default(), authorize, at)
+    list_inbox(
+        inbox,
+        principal,
+        &InboxFilter::all(),
+        &Page::default(),
+        authorize,
+        at,
+    )
 }
 
 /// The current set of `item_id`s a cold rebuild yields (the convenience the drill compares against

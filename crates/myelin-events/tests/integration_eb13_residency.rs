@@ -121,13 +121,19 @@ async fn a_region_pinned_stream_has_no_cross_region_read_path_on_the_live_broker
         .expect("ack");
 
     let info = stream.get_info().await.expect("stream info");
-    assert_eq!(info.state.messages, 1, "the in-region event landed in the cell stream");
+    assert_eq!(
+        info.state.messages, 1,
+        "the in-region event landed in the cell stream"
+    );
 
     // THE GATE: a consumer scoped to a DIFFERENT region's namespace captures 0 messages — there is
     // no cross-region read path. (The cell stream does not even capture another region's subject
     // space, so a cross-region filter has nothing to read.)
     let cross_region_filter = format!("{root}.{}.>", other_region.as_str());
-    assert_ne!(cell_filter, cross_region_filter, "the region is the partition boundary");
+    assert_ne!(
+        cell_filter, cross_region_filter,
+        "the region is the partition boundary"
+    );
     let mut cross_consumer = stream
         .create_consumer(jetstream::consumer::pull::Config {
             durable_name: Some(format!("xregion_{suffix}")),
@@ -162,7 +168,10 @@ async fn a_region_pinned_stream_has_no_cross_region_read_path_on_the_live_broker
         .await
         .expect("in-region consumer");
     let in_info = in_consumer.info().await.expect("in consumer info");
-    assert_eq!(in_info.num_pending, 1, "the in-region read sees the event (the pin allows in-region)");
+    assert_eq!(
+        in_info.num_pending, 1,
+        "the in-region read sees the event (the pin allows in-region)"
+    );
 
     // Cleanup.
     js.delete_stream(&stream_name).await.expect("delete stream");

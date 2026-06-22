@@ -57,9 +57,7 @@
 //! is one-way.
 
 use myelin_events::taxonomy::new_tokens::CI_CHECK_UPDATED;
-use myelin_events::{
-    EventEnvelope, EventHandler, HandleOutcome, Reason, SubjectPattern,
-};
+use myelin_events::{EventEnvelope, EventHandler, HandleOutcome, Reason, SubjectPattern};
 use myelin_tenancy::{ArtifactRef, TenantId};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -89,12 +87,18 @@ pub struct CheckContext {
 impl CheckContext {
     /// A Myelin-CI context (`{ci, name}`).
     pub fn ci(name: impl Into<String>) -> CheckContext {
-        CheckContext { provider: CheckProvider::Ci, name: name.into() }
+        CheckContext {
+            provider: CheckProvider::Ci,
+            name: name.into(),
+        }
     }
 
     /// An external-status context (`{external, name}`) — e.g. a third-party scanner.
     pub fn external(name: impl Into<String>) -> CheckContext {
-        CheckContext { provider: CheckProvider::External, name: name.into() }
+        CheckContext {
+            provider: CheckProvider::External,
+            name: name.into(),
+        }
     }
 }
 
@@ -238,7 +242,10 @@ impl CheckStatus {
     /// The projection key `(commit_oid, context)` for this fact — the merge-gate truth key. The
     /// projection holds exactly one current row per `(tenant, key)`.
     pub fn key(&self) -> CheckKey {
-        CheckKey { commit_oid: self.commit_oid.clone(), context: self.context.clone() }
+        CheckKey {
+            commit_oid: self.commit_oid.clone(),
+            context: self.context.clone(),
+        }
     }
 }
 
@@ -308,7 +315,10 @@ impl CheckStatusRow {
 
     /// The `(commit_oid, context)` key of this row.
     pub fn key(&self) -> CheckKey {
-        CheckKey { commit_oid: self.commit_oid.clone(), context: self.context.clone() }
+        CheckKey {
+            commit_oid: self.commit_oid.clone(),
+            context: self.context.clone(),
+        }
     }
 }
 
@@ -388,7 +398,9 @@ impl CheckStatusProjection {
             _ => {
                 // No stored row, or the incoming attempt is >= the stored one — it becomes current.
                 self.rows.insert(key, CheckStatusRow::from_fact(fact));
-                ApplyOutcome::Superseded { current_attempt: fact.run_attempt }
+                ApplyOutcome::Superseded {
+                    current_attempt: fact.run_attempt,
+                }
             }
         }
     }
@@ -500,7 +512,10 @@ pub fn gate_outcome(
 ) -> GateOutcome {
     let mut unmet: Vec<CheckContext> = Vec::new();
     for ctx in &policy.required_contexts {
-        let key = CheckKey { commit_oid: commit_oid.clone(), context: ctx.clone() };
+        let key = CheckKey {
+            commit_oid: commit_oid.clone(),
+            context: ctx.clone(),
+        };
         match projection.current(&key) {
             None => unmet.push(ctx.clone()),
             Some(row) => {
@@ -599,14 +614,19 @@ impl CheckStatusConsumer {
     /// silent drop, never the wrong shape into the projection).
     pub fn decode(payload: &serde_json::Value) -> Result<CheckStatus, Reason> {
         serde_json::from_value(payload.clone()).map_err(|e| {
-            Reason(format!("ci.check.updated payload is not a valid CheckStatus fact: {e}"))
+            Reason(format!(
+                "ci.check.updated payload is not a valid CheckStatus fact: {e}"
+            ))
         })
     }
 
     /// Snapshot of the current projection (a clone) — the merge gate reads this. Cloned out under the
     /// lock so the gate scan never races a concurrent apply.
     pub fn projection(&self) -> CheckStatusProjection {
-        self.projection.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.projection
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// The number of facts that became current (the supersession high-water advances).
@@ -662,7 +682,10 @@ mod tests {
     use super::*;
 
     fn h(key: &str) -> HumanisedRef {
-        HumanisedRef { template_key: key.into(), args: BTreeMap::new() }
+        HumanisedRef {
+            template_key: key.into(),
+            args: BTreeMap::new(),
+        }
     }
 
     /// Build a decoded CheckStatus fact for a `(commit, context, attempt, state, trust)`.
@@ -694,7 +717,13 @@ mod tests {
     /// The frozen 5.9 shape serialises to exactly the X-1 field set — the compile/shape CDC half.
     #[test]
     fn check_status_serialises_to_the_frozen_5_9_shape() {
-        let f = fact("abc123", CheckContext::ci("build"), 1, CheckState::Success, TrustTier::Trusted);
+        let f = fact(
+            "abc123",
+            CheckContext::ci("build"),
+            1,
+            CheckState::Success,
+            TrustTier::Trusted,
+        );
         let v = serde_json::to_value(&f).unwrap();
         // The KEY half + the closed-set fields.
         assert_eq!(v["commit_oid"], "abc123");
@@ -722,24 +751,39 @@ mod tests {
     /// carriage decodes to THIS (EI-01 §7 reconciliation).
     #[test]
     fn opaque_bus_payload_decodes_to_the_consumer_view() {
-        let f = fact("abc123", CheckContext::ci("test"), 2, CheckState::Failure, TrustTier::Trusted);
+        let f = fact(
+            "abc123",
+            CheckContext::ci("test"),
+            2,
+            CheckState::Failure,
+            TrustTier::Trusted,
+        );
         // Git produces the opaque payload shape the Bus carries...
         let opaque: serde_json::Value = serde_json::to_value(&f).unwrap();
         // ...and the consumer decodes that opaque value into the typed view.
         let decoded: CheckStatus = serde_json::from_value(opaque).unwrap();
         assert_eq!(decoded, f);
-        assert_eq!(decoded.key(), CheckKey {
-            commit_oid: GitOid("abc123".into()),
-            context: CheckContext::ci("test"),
-        });
+        assert_eq!(
+            decoded.key(),
+            CheckKey {
+                commit_oid: GitOid("abc123".into()),
+                context: CheckContext::ci("test"),
+            }
+        );
     }
 
     /// **The monotonic supersession rule** — `>=` supersedes, a lower attempt is dropped.
     #[test]
     fn supersession_is_monotonic_on_run_attempt() {
         assert!(supersedes(2, 1), "a higher attempt supersedes");
-        assert!(supersedes(1, 1), "the same attempt is an idempotent re-apply (>=)");
-        assert!(!supersedes(1, 2), "a LOWER attempt is dropped (stale re-delivery)");
+        assert!(
+            supersedes(1, 1),
+            "the same attempt is an idempotent re-apply (>=)"
+        );
+        assert!(
+            !supersedes(1, 2),
+            "a LOWER attempt is dropped (stale re-delivery)"
+        );
     }
 
     /// **A late lower-attempt re-delivery is DROPPED** — the projection keeps the newer row.
@@ -750,22 +794,46 @@ mod tests {
 
         // attempt 1 (failure) lands, then attempt 2 (a re-run, success) supersedes it.
         assert_eq!(
-            proj.apply(&fact("c1", build.clone(), 1, CheckState::Failure, TrustTier::Trusted)),
+            proj.apply(&fact(
+                "c1",
+                build.clone(),
+                1,
+                CheckState::Failure,
+                TrustTier::Trusted
+            )),
             ApplyOutcome::Superseded { current_attempt: 1 }
         );
         assert_eq!(
-            proj.apply(&fact("c1", build.clone(), 2, CheckState::Success, TrustTier::Trusted)),
+            proj.apply(&fact(
+                "c1",
+                build.clone(),
+                2,
+                CheckState::Success,
+                TrustTier::Trusted
+            )),
             ApplyOutcome::Superseded { current_attempt: 2 }
         );
 
         // The at-least-once transport RE-DELIVERS the stale attempt 1 — it is DROPPED.
         assert_eq!(
-            proj.apply(&fact("c1", build.clone(), 1, CheckState::Failure, TrustTier::Trusted)),
-            ApplyOutcome::DroppedStale { incoming_attempt: 1, current_attempt: 2 }
+            proj.apply(&fact(
+                "c1",
+                build.clone(),
+                1,
+                CheckState::Failure,
+                TrustTier::Trusted
+            )),
+            ApplyOutcome::DroppedStale {
+                incoming_attempt: 1,
+                current_attempt: 2
+            }
         );
 
         // The CURRENT row is still the attempt-2 success (the stale re-delivery did not clobber).
-        let key = CheckKey { commit_oid: GitOid("c1".into()), context: build };
+        let key = CheckKey {
+            commit_oid: GitOid("c1".into()),
+            context: build,
+        };
         let row = proj.current(&key).unwrap();
         assert_eq!(row.run_attempt, 2);
         assert_eq!(row.state, CheckState::Success);
@@ -776,12 +844,34 @@ mod tests {
     #[test]
     fn one_current_row_per_key() {
         let mut proj = CheckStatusProjection::new();
-        proj.apply(&fact("c1", CheckContext::ci("build"), 1, CheckState::Success, TrustTier::Trusted));
-        proj.apply(&fact("c1", CheckContext::ci("test"), 1, CheckState::Success, TrustTier::Trusted));
+        proj.apply(&fact(
+            "c1",
+            CheckContext::ci("build"),
+            1,
+            CheckState::Success,
+            TrustTier::Trusted,
+        ));
+        proj.apply(&fact(
+            "c1",
+            CheckContext::ci("test"),
+            1,
+            CheckState::Success,
+            TrustTier::Trusted,
+        ));
         assert_eq!(proj.len(), 2, "two distinct contexts → two rows");
         // Re-apply build at a higher attempt — supersedes in place, no new row.
-        proj.apply(&fact("c1", CheckContext::ci("build"), 5, CheckState::Success, TrustTier::Trusted));
-        assert_eq!(proj.len(), 2, "supersession is in-place, never a duplicate row");
+        proj.apply(&fact(
+            "c1",
+            CheckContext::ci("build"),
+            5,
+            CheckState::Success,
+            TrustTier::Trusted,
+        ));
+        assert_eq!(
+            proj.len(),
+            2,
+            "supersession is in-place, never a duplicate row"
+        );
     }
 
     /// **The required-set policy gate: all required green ⇒ merge may proceed.**
@@ -790,8 +880,20 @@ mod tests {
         let mut proj = CheckStatusProjection::new();
         let build = CheckContext::ci("build");
         let test = CheckContext::ci("test");
-        proj.apply(&fact("c1", build.clone(), 1, CheckState::Success, TrustTier::Trusted));
-        proj.apply(&fact("c1", test.clone(), 1, CheckState::Success, TrustTier::Trusted));
+        proj.apply(&fact(
+            "c1",
+            build.clone(),
+            1,
+            CheckState::Success,
+            TrustTier::Trusted,
+        ));
+        proj.apply(&fact(
+            "c1",
+            test.clone(),
+            1,
+            CheckState::Success,
+            TrustTier::Trusted,
+        ));
 
         let policy = RequiredSetPolicy::requiring(vec![build, test]);
         assert_eq!(
@@ -807,8 +909,20 @@ mod tests {
         let build = CheckContext::ci("build");
         let test = CheckContext::ci("test");
         // build succeeds; test FAILS; lint is required but MISSING.
-        proj.apply(&fact("c1", build.clone(), 1, CheckState::Success, TrustTier::Trusted));
-        proj.apply(&fact("c1", test.clone(), 1, CheckState::Failure, TrustTier::Trusted));
+        proj.apply(&fact(
+            "c1",
+            build.clone(),
+            1,
+            CheckState::Success,
+            TrustTier::Trusted,
+        ));
+        proj.apply(&fact(
+            "c1",
+            test.clone(),
+            1,
+            CheckState::Failure,
+            TrustTier::Trusted,
+        ));
         let lint = CheckContext::ci("lint");
 
         let policy = RequiredSetPolicy::requiring(vec![build, test.clone(), lint.clone()]);
@@ -830,7 +944,13 @@ mod tests {
         let mut proj = CheckStatusProjection::new();
         let build = CheckContext::ci("build");
         // A fork run: success, but trust_tier = untrusted_fork.
-        proj.apply(&fact("c1", build.clone(), 1, CheckState::Success, TrustTier::UntrustedFork));
+        proj.apply(&fact(
+            "c1",
+            build.clone(),
+            1,
+            CheckState::Success,
+            TrustTier::UntrustedFork,
+        ));
 
         let policy = RequiredSetPolicy::requiring(vec![build.clone()]);
         let commit = GitOid("c1".into());
@@ -838,7 +958,9 @@ mod tests {
         // UN-endorsed → the fork success cannot self-satisfy → BLOCKED.
         assert_eq!(
             gate_outcome(&policy, &proj, &commit, &[]),
-            GateOutcome::Blocked { unmet: vec![build.clone()] }
+            GateOutcome::Blocked {
+                unmet: vec![build.clone()]
+            }
         );
 
         // The maintainer ENDORSES the context (the approve_untrusted_ci flow) → now GREEN.
@@ -855,9 +977,21 @@ mod tests {
     fn rerun_trusted_supersedes_fork_and_greens_the_gate() {
         let mut proj = CheckStatusProjection::new();
         let build = CheckContext::ci("build");
-        proj.apply(&fact("c1", build.clone(), 1, CheckState::Success, TrustTier::UntrustedFork));
+        proj.apply(&fact(
+            "c1",
+            build.clone(),
+            1,
+            CheckState::Success,
+            TrustTier::UntrustedFork,
+        ));
         // The maintainer re-runs the context trusted (attempt 2) — supersedes the fork fact.
-        proj.apply(&fact("c1", build.clone(), 2, CheckState::Success, TrustTier::Trusted));
+        proj.apply(&fact(
+            "c1",
+            build.clone(),
+            2,
+            CheckState::Success,
+            TrustTier::Trusted,
+        ));
 
         let policy = RequiredSetPolicy::requiring(vec![build]);
         assert_eq!(
@@ -881,7 +1015,13 @@ mod tests {
     /// A row materialises 1:1 from a fact (the consumer apply step).
     #[test]
     fn row_materialises_from_fact() {
-        let f = fact("c1", CheckContext::ci("build"), 3, CheckState::Success, TrustTier::Trusted);
+        let f = fact(
+            "c1",
+            CheckContext::ci("build"),
+            3,
+            CheckState::Success,
+            TrustTier::Trusted,
+        );
         let row = CheckStatusRow::from_fact(&f);
         assert_eq!(row.key(), f.key());
         assert_eq!(row.run_attempt, 3);

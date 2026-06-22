@@ -29,8 +29,8 @@
 use std::collections::BTreeMap;
 
 use myelin_issues::declares::{
-    issue_notif_rules, register_issue_notif_rules, RULE_KEY_APPROVAL_REQUESTED, RULE_KEY_SLA_AT_RISK,
-    RULE_KEY_UNBLOCKED,
+    issue_notif_rules, register_issue_notif_rules, RULE_KEY_APPROVAL_REQUESTED,
+    RULE_KEY_SLA_AT_RISK, RULE_KEY_UNBLOCKED,
 };
 use myelin_notif::{
     define_notif_rule, Class, DedupTpl, DefineRuleError, NotifRule, NotifRuleRegistry, Reason,
@@ -58,7 +58,9 @@ fn producer_issues_declares_the_three_reasons_at_their_bands() {
     assert_eq!(unb.reason, Reason::Unblocked);
     assert_eq!(unb.default_class, Class::Watching);
 
-    let appr = by_key.get(RULE_KEY_APPROVAL_REQUESTED).expect("approval rule");
+    let appr = by_key
+        .get(RULE_KEY_APPROVAL_REQUESTED)
+        .expect("approval rule");
     assert_eq!(appr.reason, Reason::ApprovalRequested);
     assert_eq!(appr.default_class, Class::Critical);
 }
@@ -82,13 +84,20 @@ fn consumer_notif_admits_and_routes_the_reason_set() {
     let mut reg = NotifRuleRegistry::platform_default();
     let before = reg.len();
     register_issue_notif_rules(&mut reg);
-    assert_eq!(reg.len(), before + 3, "Notif admits the three Issues rules (zero Notif change)");
+    assert_eq!(
+        reg.len(),
+        before + 3,
+        "Notif admits the three Issues rules (zero Notif change)"
+    );
 
     let c = reg.classify(RULE_KEY_SLA_AT_RISK, "psn:alice", &subject());
     assert_eq!(c.reason, Reason::Sla);
     assert_eq!(c.default_class, Class::Critical);
     assert!(c.from_registered_rule);
-    assert_eq!(c.dedup_key, "issue.sla:psn:alice:myelin://acme/issue/issue/ENG-1421");
+    assert_eq!(
+        c.dedup_key,
+        "issue.sla:psn:alice:myelin://acme/issue/issue/ENG-1421"
+    );
 
     let c = reg.classify(RULE_KEY_UNBLOCKED, "psn:bob", &subject());
     assert_eq!(c.reason, Reason::Unblocked);

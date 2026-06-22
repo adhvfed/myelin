@@ -32,9 +32,7 @@ use myelin_events::{
     Actor, AggregateKey, ArtifactRef as EvArtifactRef, DataRole, EmitContextBase, EventDraft,
     EventType, IdMinter, MonotonicMinter, OutboxStore, Timestamp, Visibility,
 };
-use myelin_flow::{
-    CausalGuard, FlowTelemetry, LoopVerdict, RefusalReason, WfCtx, WfJournal,
-};
+use myelin_flow::{CausalGuard, FlowTelemetry, LoopVerdict, RefusalReason, WfCtx, WfJournal};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_tenancy::{Region, TenantId};
 use std::sync::Arc;
@@ -52,7 +50,11 @@ fn ctx_base() -> EmitContextBase {
     EmitContextBase {
         tenant: tenant(),
         region: region(),
-        actor: Actor(Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, tenant())),
+        actor: Actor(Principal::stub(
+            PrincipalId("p".into()),
+            PrincipalKind::Human,
+            tenant(),
+        )),
         schema_ver: 1,
         occurred_at: Timestamp("2026-06-21T00:00:00Z".into()),
         recorded_at: Timestamp("2026-06-21T00:00:01Z".into()),
@@ -74,17 +76,32 @@ fn provider_9_2_loop_safety_drops_or_parks_never_forks() {
     assert_eq!(guard.admit_child(root, 1).0, LoopVerdict::Admit);
     assert_eq!(guard.admit_child(root, 2).0, LoopVerdict::Admit);
     let (v, r) = guard.admit_child(root, 3);
-    assert_eq!(v, LoopVerdict::Drop, "child at depth 4 > ceiling 3 is DROPPED");
+    assert_eq!(
+        v,
+        LoopVerdict::Drop,
+        "child at depth 4 > ceiling 3 is DROPPED"
+    );
     assert_eq!(r, Some(RefusalReason::DepthCeiling));
-    assert!(telemetry.causal_depth_max() <= guard.ceiling(), "depth never exceeds the ceiling");
+    assert!(
+        telemetry.causal_depth_max() <= guard.ceiling(),
+        "depth never exceeds the ceiling"
+    );
 
     // an over-cap activity is PARKED (never forked).
     assert_eq!(guard.admit_activity().0, LoopVerdict::Admit);
     assert_eq!(guard.admit_activity().0, LoopVerdict::Admit);
-    assert_eq!(guard.admit_activity().0, LoopVerdict::Park, "over-cap activity is PARKED");
+    assert_eq!(
+        guard.admit_activity().0,
+        LoopVerdict::Park,
+        "over-cap activity is PARKED"
+    );
 
     // the 0-fork invariant — the headline.
-    assert_eq!(telemetry.fork_count(), 0, "the engine NEVER forks a runaway loop");
+    assert_eq!(
+        telemetry.fork_count(),
+        0,
+        "the engine NEVER forks a runaway loop"
+    );
 }
 
 /// **CONSUMER half — a sibling that propagates an `EventEnvelope`'s `correlation_id`/`depth` into a
@@ -137,15 +154,29 @@ fn consumer_9_2_propagated_causality_is_bounded_by_the_engine() {
             LoopVerdict::Admit => admitted += 1,
             LoopVerdict::Drop => {
                 refused += 1;
-                assert_eq!(reason, Some(RefusalReason::SharedRootTripwire), "observable reason");
+                assert_eq!(
+                    reason,
+                    Some(RefusalReason::SharedRootTripwire),
+                    "observable reason"
+                );
             }
             LoopVerdict::Park => refused += 1,
         }
     }
 
-    assert_eq!(admitted, 3, "the consumer's loop was admitted up to the shared-root cap");
-    assert_eq!(refused, 5, "every same-root hop past the cap was refused (drop/park)");
-    assert_eq!(telemetry.fork_count(), 0, "0-fork — the consumer relies on this");
+    assert_eq!(
+        admitted, 3,
+        "the consumer's loop was admitted up to the shared-root cap"
+    );
+    assert_eq!(
+        refused, 5,
+        "every same-root hop past the cap was refused (drop/park)"
+    );
+    assert_eq!(
+        telemetry.fork_count(),
+        0,
+        "0-fork — the consumer relies on this"
+    );
     assert!(
         telemetry.shared_root_tripwire_firings() >= 1,
         "the tripwire fired (the consumer's loop was caught by its root)"

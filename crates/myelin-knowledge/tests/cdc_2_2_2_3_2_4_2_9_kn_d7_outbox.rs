@@ -40,7 +40,9 @@ use myelin_events::{
     SubsystemTokenList, TenantId, Timestamp, TokenListHarness, Visibility,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
-use myelin_knowledge::{emit_change, KnowledgeChange, KnowledgeLivingDocHandler, LIVING_DOC_CONSUMER};
+use myelin_knowledge::{
+    emit_change, KnowledgeChange, KnowledgeLivingDocHandler, LIVING_DOC_CONSUMER,
+};
 use std::sync::Arc;
 
 fn tenant() -> TenantId {
@@ -74,7 +76,10 @@ fn minter() -> Arc<dyn IdMinter> {
 /// in full — every name `knowledge.`-prefixed + grammatical + unique.
 #[test]
 fn cdc_2_9_complete_knowledge_taxonomy_is_admitted() {
-    assert!(register_knowledge_tokens().is_ok(), "KN's complete list parses the §6.1 grammar");
+    assert!(
+        register_knowledge_tokens().is_ok(),
+        "KN's complete list parses the §6.1 grammar"
+    );
 
     let mut harness = TokenListHarness::new();
     let all: Vec<&str> = KNOWLEDGE_DURABLE_TOKENS
@@ -101,7 +106,10 @@ fn cdc_2_9_complete_knowledge_taxonomy_is_admitted() {
         "knowledge.subject.erasure_requested",
         "knowledge.row.snapshot",
     ] {
-        assert!(harness.is_registered(tok), "the owner taxonomy must include `{tok}`");
+        assert!(
+            harness.is_registered(tok),
+            "the owner taxonomy must include `{tok}`"
+        );
     }
 }
 
@@ -132,13 +140,27 @@ fn cdc_2_2_emit_change_co_commits_with_the_state() {
     let store = OutboxStore::new();
     let mut tx = store.begin(minter(), ctx_base());
     tx.stage_state_change("block b9 of page 7c2 written (version 5)");
-    let change = KnowledgeChange::BlockUpdated { page_id: "7c2".into(), block_id: "9".into() };
+    let change = KnowledgeChange::BlockUpdated {
+        page_id: "7c2".into(),
+        block_id: "9".into(),
+    };
     let id = emit_change(&mut tx, &tenant(), &change, None).expect("emit");
 
-    assert_eq!(store.outbox_depth(), 0, "the OPEN transaction has written nothing (buffered)");
+    assert_eq!(
+        store.outbox_depth(),
+        0,
+        "the OPEN transaction has written nothing (buffered)"
+    );
     tx.commit().expect("the block write + its event co-commit");
-    assert_eq!(store.outbox_depth(), 1, "after commit: exactly the one knowledge event is durable");
-    assert_eq!(store.row(&id).unwrap().envelope.type_.0, "knowledge.block.updated");
+    assert_eq!(
+        store.outbox_depth(),
+        1,
+        "after commit: exactly the one knowledge event is durable"
+    );
+    assert_eq!(
+        store.row(&id).unwrap().envelope.type_.0,
+        "knowledge.block.updated"
+    );
 }
 
 /// **CDC 2.3 — the aggregate is the doc/row/db (the per-aggregate `seq` ordering key).** Two block
@@ -151,21 +173,30 @@ fn cdc_2_3_aggregate_is_the_doc_or_db_with_monotonic_seq() {
     let b1 = emit_change(
         &mut tx,
         &tenant(),
-        &KnowledgeChange::BlockCreated { page_id: "p1".into(), block_id: "b1".into() },
+        &KnowledgeChange::BlockCreated {
+            page_id: "p1".into(),
+            block_id: "b1".into(),
+        },
         None,
     )
     .unwrap();
     let b2 = emit_change(
         &mut tx,
         &tenant(),
-        &KnowledgeChange::BlockUpdated { page_id: "p1".into(), block_id: "b2".into() },
+        &KnowledgeChange::BlockUpdated {
+            page_id: "p1".into(),
+            block_id: "b2".into(),
+        },
         None,
     )
     .unwrap();
     let row = emit_change(
         &mut tx,
         &tenant(),
-        &KnowledgeChange::RowUpdated { db_id: "tasks".into(), row_id: "r1".into() },
+        &KnowledgeChange::RowUpdated {
+            db_id: "tasks".into(),
+            row_id: "r1".into(),
+        },
         None,
     )
     .unwrap();
@@ -176,10 +207,21 @@ fn cdc_2_3_aggregate_is_the_doc_or_db_with_monotonic_seq() {
     assert_eq!(store.row(&b1).unwrap().aggregate.0, agg);
     assert_eq!(store.row(&b2).unwrap().aggregate.0, agg);
     assert_eq!(store.row(&b1).unwrap().seq, 0);
-    assert_eq!(store.row(&b2).unwrap().seq, 1, "the second block of p1 is seq 1 (per-doc ordering)");
+    assert_eq!(
+        store.row(&b2).unwrap().seq,
+        1,
+        "the second block of p1 is seq 1 (per-doc ordering)"
+    );
     // The row aggregates on its database (independent counter, starts at 0).
-    assert_eq!(store.row(&row).unwrap().aggregate.0, "myelin://acme/knowledge/database/tasks");
-    assert_eq!(store.row(&row).unwrap().seq, 0, "a different aggregate has its own seq counter");
+    assert_eq!(
+        store.row(&row).unwrap().aggregate.0,
+        "myelin://acme/knowledge/database/tasks"
+    );
+    assert_eq!(
+        store.row(&row).unwrap().seq,
+        0,
+        "a different aggregate has its own seq counter"
+    );
 }
 
 // =================================================================================================
@@ -197,15 +239,31 @@ fn cdc_2_4_living_doc_consumer_is_whitelisted_and_idempotent() {
     );
     let consumer = consume(spec, KnowledgeLivingDocHandler::new(), DedupLedger::new())
         .expect("the *-free whitelist binds (rule 3)");
-    assert_eq!(consumer.name(), &ConsumerName(LIVING_DOC_CONSUMER.into()), "bound by durable name (rule 4)");
+    assert_eq!(
+        consumer.name(),
+        &ConsumerName(LIVING_DOC_CONSUMER.into()),
+        "bound by durable name (rule 4)"
+    );
 
     let msg = Message {
         subject: "myelin://acme/issues/issue/PROJ-1".into(),
         envelope: trigger("issue.issue.updated"),
     };
-    assert_eq!(consumer.deliver(&msg), Delivered::Acked, "first delivery runs + acks");
-    assert_eq!(consumer.deliver(&msg), Delivered::Deduplicated, "redelivery deduped (0 dup, rule 1)");
-    assert_eq!(consumer.handler().observed(), 1, "the handler ran EXACTLY once");
+    assert_eq!(
+        consumer.deliver(&msg),
+        Delivered::Acked,
+        "first delivery runs + acks"
+    );
+    assert_eq!(
+        consumer.deliver(&msg),
+        Delivered::Deduplicated,
+        "redelivery deduped (0 dup, rule 1)"
+    );
+    assert_eq!(
+        consumer.handler().observed(),
+        1,
+        "the handler ran EXACTLY once"
+    );
 }
 
 /// **CDC 2.4 — a `*` (or empty) subject is REJECTED at registration (rule 3, head-of-line guard).**
@@ -238,13 +296,24 @@ fn cdc_2_4_wildcard_consumer_is_rejected() {
 fn kn_d7_crash_between_commit_and_publish_zero_ghost_zero_lost() {
     let store = OutboxStore::new();
     let bus = InProcessBus::new();
-    let relay = Relay::new(store.clone(), bus, || Timestamp("2026-06-21T00:00:02Z".into()));
+    let relay = Relay::new(store.clone(), bus, || {
+        Timestamp("2026-06-21T00:00:02Z".into())
+    });
 
     // (1) Three Knowledge state changes co-commit with their events.
     let changes = [
-        KnowledgeChange::BlockUpdated { page_id: "7c2".into(), block_id: "1".into() },
-        KnowledgeChange::BlockUpdated { page_id: "7c2".into(), block_id: "2".into() },
-        KnowledgeChange::RowUpdated { db_id: "tasks".into(), row_id: "r1".into() },
+        KnowledgeChange::BlockUpdated {
+            page_id: "7c2".into(),
+            block_id: "1".into(),
+        },
+        KnowledgeChange::BlockUpdated {
+            page_id: "7c2".into(),
+            block_id: "2".into(),
+        },
+        KnowledgeChange::RowUpdated {
+            db_id: "tasks".into(),
+            row_id: "r1".into(),
+        },
     ];
     let mut ids = Vec::new();
     let m = minter();
@@ -254,31 +323,67 @@ fn kn_d7_crash_between_commit_and_publish_zero_ghost_zero_lost() {
         ids.push(emit_change(&mut tx, &tenant(), ch, None).expect("emit"));
         tx.commit().expect("the state + event co-commit");
     }
-    assert_eq!(store.outbox_depth(), 3, "all three committed events are durable + unsent");
+    assert_eq!(
+        store.outbox_depth(),
+        3,
+        "all three committed events are durable + unsent"
+    );
 
     // (2) CRASH mid-relay: the broker is unreachable when the relay tries to publish (the kill
     // point between the commit and the publish). The drain fails every publish; the rows stay
     // claimable (0 lost so far — they are durable, just undelivered).
     relay.transport().sever();
     let crashed = relay.drain_once();
-    assert_eq!(crashed.published, 0, "the broker is severed → nothing published (the crash window)");
-    assert_eq!(crashed.failed, 3, "the rows failed to publish, but stay claimable (not lost)");
-    assert_eq!(store.outbox_depth(), 3, "still 3 unsent — the crash lost NOTHING (durable in the outbox)");
+    assert_eq!(
+        crashed.published, 0,
+        "the broker is severed → nothing published (the crash window)"
+    );
+    assert_eq!(
+        crashed.failed, 3,
+        "the rows failed to publish, but stay claimable (not lost)"
+    );
+    assert_eq!(
+        store.outbox_depth(),
+        3,
+        "still 3 unsent — the crash lost NOTHING (durable in the outbox)"
+    );
 
     // (3) RECOVER: heal the broker + drain to empty. Exactly-once delivery, depth → baseline.
     relay.transport().heal();
     let recovered = relay.drain_to_empty();
-    assert_eq!(recovered.published, 3, "recovery delivers every committed event (0 lost)");
-    assert_eq!(store.outbox_depth(), 0, "the outbox-depth telemetry returns to baseline (0)");
-    assert_eq!(store.dead_letter_count(), 0, "0 dead-letters on the no-loss path");
-    assert_eq!(relay.transport().delivered_count(), 3, "exactly 3 distinct events delivered (0 ghost)");
+    assert_eq!(
+        recovered.published, 3,
+        "recovery delivers every committed event (0 lost)"
+    );
+    assert_eq!(
+        store.outbox_depth(),
+        0,
+        "the outbox-depth telemetry returns to baseline (0)"
+    );
+    assert_eq!(
+        store.dead_letter_count(),
+        0,
+        "0 dead-letters on the no-loss path"
+    );
+    assert_eq!(
+        relay.transport().delivered_count(),
+        3,
+        "exactly 3 distinct events delivered (0 ghost)"
+    );
 
     // 0 ghost, made precise: the delivered set is exactly the three committed event_ids (none extra).
     let delivered = relay.transport().delivered_ids();
     for id in &ids {
-        assert!(delivered.contains(id), "committed event {id:?} was delivered (0 lost)");
+        assert!(
+            delivered.contains(id),
+            "committed event {id:?} was delivered (0 lost)"
+        );
     }
-    assert_eq!(delivered.len(), 3, "no ghost: exactly the committed events were delivered, no more");
+    assert_eq!(
+        delivered.len(),
+        3,
+        "no ghost: exactly the committed events were delivered, no more"
+    );
 }
 
 /// **KN-D7 (no ghost from an ABORT) — an aborted block transaction publishes nothing.** A crash
@@ -293,30 +398,64 @@ fn kn_d7_aborted_transaction_yields_no_ghost() {
         emit_change(
             &mut tx,
             &tenant(),
-            &KnowledgeChange::BlockUpdated { page_id: "7c2".into(), block_id: "9".into() },
+            &KnowledgeChange::BlockUpdated {
+                page_id: "7c2".into(),
+                block_id: "9".into(),
+            },
             None,
         )
         .expect("emit");
         // tx dropped here WITHOUT commit (the crash before the state commit).
     }
-    assert_eq!(store.outbox_depth(), 0, "an aborted transaction wrote NO event (0 ghost)");
-    assert_eq!(store.committed_count(), 0, "no committed state without its event, none with a ghost");
+    assert_eq!(
+        store.outbox_depth(),
+        0,
+        "an aborted transaction wrote NO event (0 ghost)"
+    );
+    assert_eq!(
+        store.committed_count(),
+        0,
+        "no committed state without its event, none with a ghost"
+    );
 }
 
 // ---- helpers ----
 
 fn representative_changes() -> Vec<KnowledgeChange> {
     vec![
-        KnowledgeChange::PageCreated { page_id: "p".into() },
-        KnowledgeChange::PagePublished { page_id: "p".into() },
-        KnowledgeChange::BlockCreated { page_id: "p".into(), block_id: "b".into() },
+        KnowledgeChange::PageCreated {
+            page_id: "p".into(),
+        },
+        KnowledgeChange::PagePublished {
+            page_id: "p".into(),
+        },
+        KnowledgeChange::BlockCreated {
+            page_id: "p".into(),
+            block_id: "b".into(),
+        },
         KnowledgeChange::DatabaseSchemaChanged { db_id: "d".into() },
-        KnowledgeChange::ViewUpdated { db_id: "d".into(), view_id: "v".into() },
-        KnowledgeChange::RowMoved { db_id: "d".into(), row_id: "r".into() },
-        KnowledgeChange::CommentCreated { page_id: "p".into(), comment_id: "c".into() },
-        KnowledgeChange::MentionCreated { page_id: "p".into(), comment_id: "c".into() },
-        KnowledgeChange::AccessGranted { page_id: "p".into() },
-        KnowledgeChange::SubjectErasureRequested { page_id: "p".into() },
+        KnowledgeChange::ViewUpdated {
+            db_id: "d".into(),
+            view_id: "v".into(),
+        },
+        KnowledgeChange::RowMoved {
+            db_id: "d".into(),
+            row_id: "r".into(),
+        },
+        KnowledgeChange::CommentCreated {
+            page_id: "p".into(),
+            comment_id: "c".into(),
+        },
+        KnowledgeChange::MentionCreated {
+            page_id: "p".into(),
+            comment_id: "c".into(),
+        },
+        KnowledgeChange::AccessGranted {
+            page_id: "p".into(),
+        },
+        KnowledgeChange::SubjectErasureRequested {
+            page_id: "p".into(),
+        },
     ]
 }
 

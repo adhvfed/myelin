@@ -464,7 +464,10 @@ impl DurableExecutor for FlowExecutor {
             .run_to_idem
             .get(&run.0)
             .ok_or_else(|| ExecutorError::UnknownRun(run.0.clone()))?;
-        let record = started.by_idem.get(idem).expect("run_to_idem points at a record");
+        let record = started
+            .by_idem
+            .get(idem)
+            .expect("run_to_idem points at a record");
         let wf_version = record.wf_version;
         let wf_type = record.wf_type.clone();
         drop(started);
@@ -521,9 +524,7 @@ mod tests {
     use super::*;
     use crate::engine::{DriveOutcome, FlowDispatcher, WorkflowBody};
     use crate::wfctx::{RetryPolicy, WfCtx, WfJournal};
-    use myelin_events::{
-        Actor, EmitContextBase, MonotonicMinter, OutboxStore, Timestamp,
-    };
+    use myelin_events::{Actor, EmitContextBase, MonotonicMinter, OutboxStore, Timestamp};
     use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 
     fn tenant() -> TenantId {
@@ -555,7 +556,9 @@ mod tests {
         StartSpec {
             wf_type: "agent.run".into(),
             input: vec![ArtifactRef("myelin://acme/git/pr/PR-1".into())],
-            budget: Some(RunBudget { minor_units: 10_000 }),
+            budget: Some(RunBudget {
+                minor_units: 10_000,
+            }),
             idem_key: idem.into(),
         }
     }
@@ -582,13 +585,21 @@ mod tests {
     fn start_is_idempotent_on_idem_key() {
         let ex = executor();
         let r1 = ex.start(spec("rule:evt-1")).expect("start");
-        let r2 = ex.start(spec("rule:evt-1")).expect("re-start same idem_key");
-        assert_eq!(r1, r2, "the re-start returns the SAME run id (effectively-once)");
+        let r2 = ex
+            .start(spec("rule:evt-1"))
+            .expect("re-start same idem_key");
+        assert_eq!(
+            r1, r2,
+            "the re-start returns the SAME run id (effectively-once)"
+        );
         // exactly ONE runnable run was seeded (not two) across all partitions.
         let total: usize = (0..PARTITION_COUNT as i16)
             .map(|p| ex.runs().runnable_lag(p, i64::MAX))
             .sum();
-        assert_eq!(total, 1, "the second start was a no-op — exactly one run seeded");
+        assert_eq!(
+            total, 1,
+            "the second start was a no-op — exactly one run seeded"
+        );
 
         // a DIFFERENT idem_key starts a distinct run.
         let r3 = ex.start(spec("rule:evt-2")).expect("distinct start");
@@ -602,7 +613,10 @@ mod tests {
         let mut s = spec("k");
         s.wf_type = "no.such.workflow".into();
         let err = ex.start(s).expect_err("unknown workflow type is surfaced");
-        assert_eq!(err, ExecutorError::UnknownWorkflow("no.such.workflow".into()));
+        assert_eq!(
+            err,
+            ExecutorError::UnknownWorkflow("no.such.workflow".into())
+        );
     }
 
     /// **`describe` returns the run's `RunStatus` — lifecycle + cursor + pinned version (contract
@@ -616,7 +630,10 @@ mod tests {
         assert_eq!(status.wf_type, "agent.run");
         assert_eq!(status.state, run_state::RUNNING, "a fresh run is running");
         assert_eq!(status.cursor, 0, "a fresh run is at cursor 0");
-        assert_eq!(status.wf_version, 1, "the wf_version pinned at start (§4.6)");
+        assert_eq!(
+            status.wf_version, 1,
+            "the wf_version pinned at start (§4.6)"
+        );
         assert!(!status.terminal, "a running run is not terminal");
 
         // describe of an unknown run is surfaced.
@@ -648,10 +665,17 @@ mod tests {
         disp.register("agent.run", one_activity_body());
 
         let outcome = disp.tick(1000, "2026-06-21T00:00:00Z", 7);
-        assert!(matches!(outcome, Some(DriveOutcome::Completed(_))), "the dispatcher drove the run");
+        assert!(
+            matches!(outcome, Some(DriveOutcome::Completed(_))),
+            "the dispatcher drove the run"
+        );
 
         let status = ex.describe(&run).expect("describe");
-        assert_eq!(status.state, run_state::COMPLETED, "the run describes as completed");
+        assert_eq!(
+            status.state,
+            run_state::COMPLETED,
+            "the run describes as completed"
+        );
         assert!(status.terminal, "a completed run is terminal");
     }
 
@@ -665,13 +689,25 @@ mod tests {
     fn deploy_version_bump_halts_in_flight_run_as_nondeterministic() {
         let ex = executor(); // registers agent.run at pinned version 1.
         let run = ex.start(spec("k")).expect("start a v1-pinned run");
-        assert_eq!(ex.describe(&run).unwrap().wf_version, 1, "the run pinned to v1 at start");
+        assert_eq!(
+            ex.describe(&run).unwrap().wf_version,
+            1,
+            "the run pinned to v1 at start"
+        );
 
         // the worker is redeployed running VERSION 2 of agent.run (a new body shape).
         let part = FlowExecutor::partition_for(&run.0);
         let (runs, tele) = ex.dispatcher_handles();
         let mut disp = FlowDispatcher::new(
-            runs, OutboxStore::new(), WfJournal::new(), tele, minter(), ctx_base(), part, "worker-2", 30,
+            runs,
+            OutboxStore::new(),
+            WfJournal::new(),
+            tele,
+            minter(),
+            ctx_base(),
+            part,
+            "worker-2",
+            30,
         );
         disp.register_versioned("agent.run", 2, one_activity_body());
 
@@ -682,8 +718,15 @@ mod tests {
             "the version mismatch halts the run, got {outcome:?}"
         );
         let status = ex.describe(&run).expect("describe after the halt");
-        assert_eq!(status.state, run_state::NONDETERMINISTIC, "the run is dead-lettered as nondeterministic");
-        assert!(status.terminal, "a nondeterministic run is terminal — never re-driven");
+        assert_eq!(
+            status.state,
+            run_state::NONDETERMINISTIC,
+            "the run is dead-lettered as nondeterministic"
+        );
+        assert!(
+            status.terminal,
+            "a nondeterministic run is terminal — never re-driven"
+        );
         assert_eq!(
             ex.telemetry().nondeterministic_halt_count(),
             1,
@@ -715,13 +758,16 @@ mod tests {
         let ex = executor();
         let run = ex.start(spec("k")).expect("start");
         ex.cancel(&run, "first").expect("cancel");
-        ex.cancel(&run, "second").expect("a second cancel is a no-op (idempotent)");
+        ex.cancel(&run, "second")
+            .expect("a second cancel is a no-op (idempotent)");
         assert_eq!(
             ex.describe(&run).unwrap().state,
             run_state::TERMINATED,
             "the run stays terminated (the second cancel did not change it)"
         );
-        let err = ex.cancel(&RunId("nope".into()), "x").expect_err("unknown run");
+        let err = ex
+            .cancel(&RunId("nope".into()), "x")
+            .expect_err("unknown run");
         assert_eq!(err, ExecutorError::UnknownRun("nope".into()));
     }
 
@@ -741,16 +787,32 @@ mod tests {
         // start two runs → the runnable-run-lag gauge reads 2 (the §1.8 signal is set on start).
         ex.start(spec("a")).expect("start a");
         ex.start(spec("b")).expect("start b");
-        assert_eq!(ex.telemetry().runnable_run_lag(), 2, "two runnable runs are queued (the lag signal)");
+        assert_eq!(
+            ex.telemetry().runnable_run_lag(),
+            2,
+            "two runnable runs are queued (the lag signal)"
+        );
 
         // the activity-queue/retry/dead-letter signals are settable + readable (the §1.8 leg this
         // prompt adds; the engine sets them as it schedules/retries/dead-letters activities).
         ex.telemetry().set_activity_queue_depth(3);
         ex.telemetry().record_activity_retry();
         ex.telemetry().record_dead_letter();
-        assert_eq!(ex.telemetry().activity_queue_depth(), 3, "activity-queue-depth readable");
-        assert_eq!(ex.telemetry().activity_retry_count(), 1, "activity-retry readable");
-        assert_eq!(ex.telemetry().dead_letter_count(), 1, "dead-letter readable");
+        assert_eq!(
+            ex.telemetry().activity_queue_depth(),
+            3,
+            "activity-queue-depth readable"
+        );
+        assert_eq!(
+            ex.telemetry().activity_retry_count(),
+            1,
+            "activity-retry readable"
+        );
+        assert_eq!(
+            ex.telemetry().dead_letter_count(),
+            1,
+            "dead-letter readable"
+        );
     }
 
     fn signal_spec(run: &RunId, name: &str, idem: &str) -> SignalSpec {
@@ -772,17 +834,33 @@ mod tests {
         let ex = executor();
         let run = ex.start(spec("k")).expect("start");
 
-        let first = ex.signal(signal_spec(&run, "job.done", "tok-1")).expect("first delivery");
-        let second = ex.signal(signal_spec(&run, "job.done", "tok-1")).expect("re-delivery");
-        assert_eq!(first, SignalOutcome::Buffered, "the first delivery buffered the signal");
-        assert_eq!(second, SignalOutcome::Duplicate, "the re-delivery is a no-op (ON CONFLICT DO NOTHING)");
+        let first = ex
+            .signal(signal_spec(&run, "job.done", "tok-1"))
+            .expect("first delivery");
+        let second = ex
+            .signal(signal_spec(&run, "job.done", "tok-1"))
+            .expect("re-delivery");
+        assert_eq!(
+            first,
+            SignalOutcome::Buffered,
+            "the first delivery buffered the signal"
+        );
+        assert_eq!(
+            second,
+            SignalOutcome::Duplicate,
+            "the re-delivery is a no-op (ON CONFLICT DO NOTHING)"
+        );
         assert_eq!(
             ex.signals().count_for_run(&tenant(), &run.0),
             1,
             "the wf_signal PK buffered the signal EXACTLY ONCE (the workflow wakes once, §4.9)"
         );
         // the signal-buffer-depth telemetry incremented by ONE, not two (the §1.8 / §5.4 gate).
-        assert_eq!(ex.telemetry().signal_buffer_depth(), 1, "signal-buffer-depth = 1 (a double-delivery is one)");
+        assert_eq!(
+            ex.telemetry().signal_buffer_depth(),
+            1,
+            "signal-buffer-depth = 1 (a double-delivery is one)"
+        );
     }
 
     /// **Two signals differing ONLY in `idem_key` BOTH insert (distinct per-effect keys).** The PK's
@@ -791,14 +869,20 @@ mod tests {
     fn signals_differing_in_idem_key_both_insert() {
         let ex = executor();
         let run = ex.start(spec("k")).expect("start");
-        ex.signal(signal_spec(&run, "approval", "card-7:0")).expect("effect 0");
-        ex.signal(signal_spec(&run, "approval", "card-7:1")).expect("effect 1");
+        ex.signal(signal_spec(&run, "approval", "card-7:0"))
+            .expect("effect 0");
+        ex.signal(signal_spec(&run, "approval", "card-7:1"))
+            .expect("effect 1");
         assert_eq!(
             ex.signals().count_for_run(&tenant(), &run.0),
             2,
             "two distinct per-effect keys buffer two rows (the multi-effect anchor, §6.4)"
         );
-        assert_eq!(ex.telemetry().signal_buffer_depth(), 2, "signal-buffer-depth = 2 (two distinct keys)");
+        assert_eq!(
+            ex.telemetry().signal_buffer_depth(),
+            2,
+            "signal-buffer-depth = 2 (two distinct keys)"
+        );
     }
 
     /// **Two signals differing in `signal_name` BOTH insert (the PK's name dimension).** An `approval`
@@ -807,9 +891,15 @@ mod tests {
     fn signals_differing_in_signal_name_both_insert() {
         let ex = executor();
         let run = ex.start(spec("k")).expect("start");
-        ex.signal(signal_spec(&run, "approval", "tok-1")).expect("approval");
-        ex.signal(signal_spec(&run, "cancel", "tok-1")).expect("cancel");
-        assert_eq!(ex.signals().count_for_run(&tenant(), &run.0), 2, "distinct signal_names are distinct rows");
+        ex.signal(signal_spec(&run, "approval", "tok-1"))
+            .expect("approval");
+        ex.signal(signal_spec(&run, "cancel", "tok-1"))
+            .expect("cancel");
+        assert_eq!(
+            ex.signals().count_for_run(&tenant(), &run.0),
+            2,
+            "distinct signal_names are distinct rows"
+        );
     }
 
     /// **A signal payload is stored as a REFERENCE, not inline PII (the §3.4 invariant).** The
@@ -827,13 +917,19 @@ mod tests {
             .get(&tenant(), &run.0, "approval", "tok-1")
             .expect("the buffered signal");
         // the body is ArtifactRefs (references-not-payloads), never an inline PII string.
-        assert_eq!(row.payload, vec![ArtifactRef("myelin://acme/agent/result/r0".into())]);
+        assert_eq!(
+            row.payload,
+            vec![ArtifactRef("myelin://acme/agent/result/r0".into())]
+        );
         assert_eq!(
             row.payload_key_ref.as_deref(),
             Some("kms://acme/epoch-1/content"),
             "the rare inline-PII payload names a crypto-shred key ref, never an inline body"
         );
-        assert_eq!(row.consumed_seq, None, "a freshly-delivered signal is buffered, unconsumed (the wait is P-FLOW-11)");
+        assert_eq!(
+            row.consumed_seq, None,
+            "a freshly-delivered signal is buffered, unconsumed (the wait is P-FLOW-11)"
+        );
     }
 
     /// **A signal to an UNKNOWN run is surfaced (never a silently dropped signal to a phantom run,
@@ -845,7 +941,11 @@ mod tests {
             .signal(signal_spec(&RunId("nope".into()), "job.done", "tok-1"))
             .expect_err("a signal to an unknown run is surfaced");
         assert_eq!(err, ExecutorError::UnknownRun("nope".into()));
-        assert_eq!(ex.telemetry().signal_buffer_depth(), 0, "nothing buffered for a phantom run");
+        assert_eq!(
+            ex.telemetry().signal_buffer_depth(),
+            0,
+            "nothing buffered for a phantom run"
+        );
     }
 
     /// **The references-not-payloads `input` is carried as `ArtifactRef`s (the §3.1 invariant).** A

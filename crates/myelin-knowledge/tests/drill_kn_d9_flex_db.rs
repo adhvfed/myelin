@@ -48,7 +48,11 @@ const TENANTS: usize = 8;
 const ROWS_PER_DB: usize = 2_000;
 
 fn p(id: &str, tenant: &str) -> Principal {
-    Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, TenantId(tenant.into()))
+    Principal::stub(
+        PrincipalId(id.into()),
+        PrincipalKind::Human,
+        TenantId(tenant.into()),
+    )
 }
 
 /// The collection schema: a Select `status`, an Int `priority`, a Principal `assignee` (PII), a
@@ -68,11 +72,21 @@ fn schema() -> FieldSchema {
 /// Build one row's property bag deterministically from its index (so the drill is reproducible).
 fn row_props(n: usize) -> PropertyBag {
     let mut props: PropertyBag = BTreeMap::new();
-    let status = if n.is_multiple_of(3) { "open" } else { "closed" };
+    let status = if n.is_multiple_of(3) {
+        "open"
+    } else {
+        "closed"
+    };
     props.insert(FieldId::new("status"), FieldValue::Select(status.into()));
     props.insert(FieldId::new("priority"), FieldValue::Int((n % 5) as i64));
-    props.insert(FieldId::new("assignee"), FieldValue::Principal(format!("p:{}", n % 7)));
-    props.insert(FieldId::new("due"), FieldValue::Date(format!("2026-06-{:02}", (n % 28) + 1)));
+    props.insert(
+        FieldId::new("assignee"),
+        FieldValue::Principal(format!("p:{}", n % 7)),
+    );
+    props.insert(
+        FieldId::new("due"),
+        FieldValue::Date(format!("2026-06-{:02}", (n % 28) + 1)),
+    );
     props.insert(FieldId::new("title"), FieldValue::Text(format!("Item {n}")));
     props
 }
@@ -88,7 +102,10 @@ fn status_open_view() -> ViewSpec {
         })
         .unwrap(),
         group_by: Some(FieldId::new("status")),
-        sort: vec![SortSpec { field: FieldId::new("priority"), dir: SortDir::Desc }],
+        sort: vec![SortSpec {
+            field: FieldId::new("priority"),
+            dir: SortDir::Desc,
+        }],
         visible: vec![FieldId::new("title"), FieldId::new("assignee")],
         order_field: FieldId::new("order_key"),
     }
@@ -101,7 +118,10 @@ fn kn_d9_flex_db_filter_sort_group_within_budget_zero_leak_promotion_trigger_mea
     let thresholds = Thresholds::load_canonical().expect("the canonical thresholds file must load");
     let budget_ms = thresholds.flex_db.view_read_p99_max_ms;
     let ratio = thresholds.flex_db.facet_promotion_ratio;
-    assert_eq!(ratio, 0.05, "the frozen 6.3 >5% trigger is read from the file (never weakened)");
+    assert_eq!(
+        ratio, 0.05,
+        "the frozen 6.3 >5% trigger is read from the file (never weakened)"
+    );
     assert!(
         thresholds.flex_db.page_row_cap >= PageBound::MAX,
         "the file's row cap is at least the PageBound::MAX seed (a view read is always row-capped)"
@@ -123,12 +143,21 @@ fn kn_d9_flex_db_filter_sort_group_within_budget_zero_leak_promotion_trigger_mea
         let mut rows = Vec::new();
         for n in 0..ROWS_PER_DB {
             let props = row_props(n);
-            schema.validate_props(&props).expect("every row is schema-valid (typed FieldType gate)");
+            schema
+                .validate_props(&props)
+                .expect("every row is schema-valid (typed FieldType gate)");
             let id = format!("row:{t}:{n}");
             let row = DbRow::new(id.clone(), props, OrderKey::parse("U").unwrap());
             // Grant read of the first half only — the SECOND half is the leak witness.
             if n < ROWS_PER_DB / 2 {
-                av.grant(&tenant, &region, &viewer.principal_id.0, "read", &id, "zk-0000000001");
+                av.grant(
+                    &tenant,
+                    &region,
+                    &viewer.principal_id.0,
+                    "read",
+                    &id,
+                    "zk-0000000001",
+                );
             }
             rows.push(row);
         }
@@ -161,7 +190,12 @@ fn kn_d9_flex_db_filter_sort_group_within_budget_zero_leak_promotion_trigger_mea
             PageBound::DEFAULT,
         )
         .expect("the VIEW_QUERY composes");
-        assert_eq!(q.statement_count(), 1, "the VIEW_QUERY is ONE query (no N+1): {}", q.sql);
+        assert_eq!(
+            q.statement_count(),
+            1,
+            "the VIEW_QUERY is ONE query (no N+1): {}",
+            q.sql
+        );
 
         // Measure the modelled read: filter (the bounded QueryAst interpreter over each row's props)
         // AND the ACL conjoin (the in-memory mirror of the authz_visible JOIN) over the page.
@@ -184,7 +218,10 @@ fn kn_d9_flex_db_filter_sort_group_within_budget_zero_leak_promotion_trigger_mea
         };
         matched.sort_by(|a, b| prio(b).cmp(&prio(a)).then(a.order_key.cmp(&b.order_key)));
         // … and page (row-capped — the §4.1 step-5 bound).
-        let page: Vec<&&DbRow> = matched.iter().take(PageBound::DEFAULT.limit as usize).collect();
+        let page: Vec<&&DbRow> = matched
+            .iter()
+            .take(PageBound::DEFAULT.limit as usize)
+            .collect();
         let elapsed = start.elapsed();
         per_read_ms.push(elapsed.as_secs_f64() * 1000.0);
 
@@ -194,8 +231,11 @@ fn kn_d9_flex_db_filter_sort_group_within_budget_zero_leak_promotion_trigger_mea
             if n >= ROWS_PER_DB / 2 {
                 total_leaked += 1;
             }
-            assert_eq!(r.props.get(&FieldId::new("status")), Some(&FieldValue::Select("open".into())),
-                "every page row matches the filter (status == open)");
+            assert_eq!(
+                r.props.get(&FieldId::new("status")),
+                Some(&FieldValue::Select("open".into())),
+                "every page row matches the filter (status == open)"
+            );
         }
 
         // Feed the facet-frequency telemetry: this execution referenced `status` (the filter facet).
@@ -203,8 +243,13 @@ fn kn_d9_flex_db_filter_sort_group_within_budget_zero_leak_promotion_trigger_mea
         tel.record_execution(&db_id, &facets);
 
         // Run a permission-correct COUNT too (the KN-D5 count-leak-closed shape) — one statement.
-        let count_q = execute_view_count(&view, &acl_set, &viewer, tenant, &db_id, &[]).expect("count");
-        assert_eq!(count_q.statement_count(), 1, "the COUNT is one aggregate query");
+        let count_q =
+            execute_view_count(&view, &acl_set, &viewer, tenant, &db_id, &[]).expect("count");
+        assert_eq!(
+            count_q.statement_count(),
+            1,
+            "the COUNT is one aggregate query"
+        );
         assert!(count_q.is_count);
     }
 
@@ -243,25 +288,44 @@ fn kn_d9_flex_db_filter_sort_group_within_budget_zero_leak_promotion_trigger_mea
     // ── 4. THE GATE. ─────────────────────────────────────────────────────────────────────────────
     // (a) read-time p99 within budget (read from the file).
     per_read_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let p99 = per_read_ms[((per_read_ms.len() as f64 * 0.99).ceil() as usize - 1).min(per_read_ms.len() - 1)];
+    let p99 = per_read_ms
+        [((per_read_ms.len() as f64 * 0.99).ceil() as usize - 1).min(per_read_ms.len() - 1)];
     assert!(
         p99 <= budget_ms as f64,
         "KN-D9: flex-DB filter/sort/group read p99 {p99:.3} ms must be within the {budget_ms} ms budget (from thresholds.toml)"
     );
 
     // (b) 0 leak across the row-restricted db (the SetExpr conjoined — no forbidden row in any view).
-    assert_eq!(total_leaked, 0, "KN-D9 / KN-D5: 0 leaked rows across the whole multi-tenant scale set");
+    assert_eq!(
+        total_leaked, 0,
+        "KN-D9 / KN-D5: 0 leaked rows across the whole multi-tenant scale set"
+    );
 
     // (c) the >5% facet-promotion trigger is MEASURED (not acted on): `priority` on the hot db
     //     crossed the frozen ratio; the candidate list reports it (the type + PII flag for KN-P31).
     let status_freq = tel.facet_frequency(hot_db, &FieldId::new("status"));
     let priority_freq = tel.facet_frequency(hot_db, &FieldId::new("priority"));
-    assert!(priority_freq > ratio, "priority frequency {priority_freq:.3} crossed the >5% trigger");
-    assert!(status_freq <= ratio, "status frequency {status_freq:.3} did NOT cross it (1 of 31 executions)");
-    let candidates: Vec<String> =
-        tel.promotion_candidates(hot_db, &schema).into_iter().map(|h| h.field_id.to_string()).collect();
-    assert!(candidates.contains(&"priority".to_string()), "the >5% facet `priority` is a promotion candidate (acted on in KN-P31): {candidates:?}");
-    assert!(!candidates.contains(&"status".to_string()), "the cold facet is NOT a candidate");
+    assert!(
+        priority_freq > ratio,
+        "priority frequency {priority_freq:.3} crossed the >5% trigger"
+    );
+    assert!(
+        status_freq <= ratio,
+        "status frequency {status_freq:.3} did NOT cross it (1 of 31 executions)"
+    );
+    let candidates: Vec<String> = tel
+        .promotion_candidates(hot_db, &schema)
+        .into_iter()
+        .map(|h| h.field_id.to_string())
+        .collect();
+    assert!(
+        candidates.contains(&"priority".to_string()),
+        "the >5% facet `priority` is a promotion candidate (acted on in KN-P31): {candidates:?}"
+    );
+    assert!(
+        !candidates.contains(&"status".to_string()),
+        "the cold facet is NOT a candidate"
+    );
 
     println!(
         "[P-307 KN-D9 GREEN] flexible DB at scale ({} tenants × {} rows): filter/sort/group VIEW_QUERY \

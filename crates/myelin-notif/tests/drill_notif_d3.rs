@@ -39,8 +39,8 @@ use myelin_events::{
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_notif::{
-    active_inbox, build_router, inbox_parity_hash, mark, notif_scope, signal_snapshot_subject, snooze,
-    InboxProjection, NotifReindexer, ReadState, SignalReindexSource, SignalRouter,
+    active_inbox, build_router, inbox_parity_hash, mark, notif_scope, signal_snapshot_subject,
+    snooze, InboxProjection, NotifReindexer, ReadState, SignalReindexSource, SignalRouter,
 };
 use myelin_query::signals::{DedupKey, RuleId, Severity, Signal, SignalState};
 use myelin_refs::ArtifactRef;
@@ -50,7 +50,11 @@ fn tenant() -> TenantId {
     TenantId("acme".into())
 }
 fn principal() -> Principal {
-    Principal::stub(PrincipalId("platform".into()), PrincipalKind::Service, tenant())
+    Principal::stub(
+        PrincipalId("platform".into()),
+        PrincipalKind::Service,
+        tenant(),
+    )
 }
 fn ctx_base() -> EmitContextBase {
     EmitContextBase {
@@ -77,7 +81,9 @@ fn signal(rule: &str, severity: Severity, subject: &str, dedup: &str) -> Signal 
     }
 }
 fn live_msg(id: &str, sig: &Signal) -> myelin_events::Message {
-    use myelin_events::{AggregateKey, CorrelationId, EventEnvelope, EventId, EventType, Visibility};
+    use myelin_events::{
+        AggregateKey, CorrelationId, EventEnvelope, EventId, EventType, Visibility,
+    };
     let subject = signal_snapshot_subject(sig);
     let env = EventEnvelope {
         event_id: EventId(id.into()),
@@ -100,12 +106,16 @@ fn live_msg(id: &str, sig: &Signal) -> myelin_events::Message {
         recorded_at: Timestamp("2026-06-20T00:00:01Z".into()),
         payload: serde_json::to_value(sig).unwrap(),
     };
-    myelin_events::Message { subject, envelope: env }
+    myelin_events::Message {
+        subject,
+        envelope: env,
+    }
 }
 
 fn live_router(outbox: &OutboxStore) -> (Consumer<SignalRouter>, InboxProjection) {
     let inbox = InboxProjection::new();
-    let consumer = build_router(&tenant(), inbox.clone(), outbox.clone(), DedupLedger::new()).unwrap();
+    let consumer =
+        build_router(&tenant(), inbox.clone(), outbox.clone(), DedupLedger::new()).unwrap();
     (consumer, inbox)
 }
 
@@ -114,10 +124,30 @@ fn live_router(outbox: &OutboxStore) -> (Consumer<SignalRouter>, InboxProjection
 #[test]
 fn notif_d3_wipe_reindex_rebuilds_cold_equals_live() {
     let signals = [
-        signal("ci_run_failed", Severity::Error, "myelin://acme/ci/run/1", "run-1"),
-        signal("ci_run_failed", Severity::Error, "myelin://acme/ci/run/2", "run-2"),
-        signal("review_requested", Severity::Warning, "myelin://acme/git/pr/9", "pr-9"),
-        signal("deploy_ok", Severity::Info, "myelin://acme/ci/run/3", "run-3"),
+        signal(
+            "ci_run_failed",
+            Severity::Error,
+            "myelin://acme/ci/run/1",
+            "run-1",
+        ),
+        signal(
+            "ci_run_failed",
+            Severity::Error,
+            "myelin://acme/ci/run/2",
+            "run-2",
+        ),
+        signal(
+            "review_requested",
+            Severity::Warning,
+            "myelin://acme/git/pr/9",
+            "pr-9",
+        ),
+        signal(
+            "deploy_ok",
+            Severity::Info,
+            "myelin://acme/ci/run/3",
+            "run-3",
+        ),
     ];
     let outbox_router = OutboxStore::new();
     let (consumer, inbox) = live_router(&outbox_router);
@@ -135,7 +165,13 @@ fn notif_d3_wipe_reindex_rebuilds_cold_equals_live() {
     let read_recipient = recipient_principal(&read_me.recipient);
     let snooze_recipient = recipient_principal(&snooze_me.recipient);
     mark(&inbox, &read_recipient, &read_me.item_id, ReadState::Read).expect("mark read");
-    snooze(&inbox, &snooze_recipient, &snooze_me.item_id, "2026-07-01T00:00:00Z").expect("snooze");
+    snooze(
+        &inbox,
+        &snooze_recipient,
+        &snooze_me.item_id,
+        "2026-07-01T00:00:00Z",
+    )
+    .expect("snooze");
 
     // Capture the LIVE parity hash + the live active-inbox view (items the recipient sees).
     let live_hash = inbox_parity_hash(&inbox, &tenant());
@@ -167,14 +203,31 @@ fn notif_d3_wipe_reindex_rebuilds_cold_equals_live() {
     let mut outbox = OutboxStore::new();
     let sources: &[&dyn ReindexSource] = &[&owner];
     let receipt = reindexer
-        .reindex(&tenant(), &notif_scope("inbox:all"), None, sources, &mut outbox, ctx_base())
+        .reindex(
+            &tenant(),
+            &notif_scope("inbox:all"),
+            None,
+            sources,
+            &mut outbox,
+            ctx_base(),
+        )
         .expect("reindex(notif)");
 
     // THE ARTIFACT, asserted with no threshold weakened:
     // 1. the rebuilt inbox matches live (items).
-    assert_eq!(receipt.snapshots_emitted, 4, "four *.snapshot re-emitted via the bus");
-    assert_eq!(receipt.signals_replayed, 4, "all four re-ingested through the LIVE router");
-    assert_eq!(inbox.len(), live_count, "the rebuilt row count == live (cold == live, items)");
+    assert_eq!(
+        receipt.snapshots_emitted, 4,
+        "four *.snapshot re-emitted via the bus"
+    );
+    assert_eq!(
+        receipt.signals_replayed, 4,
+        "all four re-ingested through the LIVE router"
+    );
+    assert_eq!(
+        inbox.len(),
+        live_count,
+        "the rebuilt row count == live (cold == live, items)"
+    );
 
     // NOTE on read-state: the inbox is a PROJECTION of the SIGNAL stream. The reindex rebuilds it from
     // the SOURCE Signals; per-user read-state (mark/snooze) is itself recorded as source state
@@ -209,7 +262,10 @@ fn notif_d3_wipe_reindex_rebuilds_cold_equals_live() {
 
     // 2. the reindex-parity hash is IDENTICAL (items + read-state) — cold == live.
     let cold_hash = inbox_parity_hash(&inbox, &tenant());
-    assert_eq!(cold_hash, live_hash, "NOTIF-D3: cold == live (reindex-parity hash IDENTICAL)");
+    assert_eq!(
+        cold_hash, live_hash,
+        "NOTIF-D3: cold == live (reindex-parity hash IDENTICAL)"
+    );
 
     // The active-inbox view (what the user sees) reconstructs identically too.
     let cold_active = active_inbox(
@@ -220,13 +276,20 @@ fn notif_d3_wipe_reindex_rebuilds_cold_equals_live() {
             .collect(),
     )
     .len();
-    assert_eq!(cold_active, live_active, "the active-inbox view rebuilt identically (read-state honoured)");
+    assert_eq!(
+        cold_active, live_active,
+        "the active-inbox view rebuilt identically (read-state honoured)"
+    );
 }
 
 /// A recipient [`Principal`] from the opaque pseudonym the router stores as `recipient` (the read-state
 /// API addresses the row by `(tenant, principal_id)`; the router's recipient is that pseudonym id).
 fn recipient_principal(recipient: &str) -> Principal {
-    Principal::stub(PrincipalId(recipient.into()), PrincipalKind::Service, tenant())
+    Principal::stub(
+        PrincipalId(recipient.into()),
+        PrincipalKind::Service,
+        tenant(),
+    )
 }
 
 /// **The single-code-path check (CI): recovery re-drives the SAME router as live — 0 second read
@@ -234,7 +297,12 @@ fn recipient_principal(recipient: &str) -> Principal {
 /// `(tenant, recipient, dedup_key)` UPSERT), proving recovery and steady-state share ONE write path.
 #[test]
 fn notif_d3_single_code_path_no_second_read_path() {
-    let sig = signal("ci_run_failed", Severity::Error, "myelin://acme/ci/run/7", "run-7");
+    let sig = signal(
+        "ci_run_failed",
+        Severity::Error,
+        "myelin://acme/ci/run/7",
+        "run-7",
+    );
     let outbox_router = OutboxStore::new();
     let (consumer, inbox) = live_router(&outbox_router);
 
@@ -248,10 +316,21 @@ fn notif_d3_single_code_path_no_second_read_path() {
     let mut outbox = OutboxStore::new();
     // An INCREMENTAL re-ingest (since=Some(0), no wipe) of the SAME Signal collapses onto the SAME row.
     reindexer
-        .reindex(&tenant(), &notif_scope("inbox:all"), Some(0), &[&owner], &mut outbox, ctx_base())
+        .reindex(
+            &tenant(),
+            &notif_scope("inbox:all"),
+            Some(0),
+            &[&owner],
+            &mut outbox,
+            ctx_base(),
+        )
         .expect("reindex");
 
-    assert_eq!(inbox.len(), 1, "the reindex collapsed onto the SAME row (one code path, no second store)");
+    assert_eq!(
+        inbox.len(),
+        1,
+        "the reindex collapsed onto the SAME row (one code path, no second store)"
+    );
     assert_eq!(
         inbox.snapshot_for_tenant(&tenant())[0].item_id,
         item_id_live,

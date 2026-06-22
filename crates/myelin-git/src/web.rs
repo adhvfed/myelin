@@ -117,29 +117,43 @@ impl StatusCue {
     /// `queued`/`in_progress`→clock/`info`, `neutral`→dash-circle/`text-muted` (recorded, never gating).
     pub fn for_check_state(state: CheckState) -> StatusCue {
         match state {
-            CheckState::Success => {
-                StatusCue { token: StatusToken::Success, glyph: "\u{2714}", label: "passed" }
-            }
-            CheckState::Failure => {
-                StatusCue { token: StatusToken::Danger, glyph: "\u{2717}", label: "failed" }
-            }
+            CheckState::Success => StatusCue {
+                token: StatusToken::Success,
+                glyph: "\u{2714}",
+                label: "passed",
+            },
+            CheckState::Failure => StatusCue {
+                token: StatusToken::Danger,
+                glyph: "\u{2717}",
+                label: "failed",
+            },
             // error/cancelled are visually DISTINCT from failure (design pass §4.2) — an infra error
             // is not a test failure and must not read as one.
-            CheckState::Error => {
-                StatusCue { token: StatusToken::Warning, glyph: "\u{26A0}", label: "error" }
-            }
-            CheckState::Cancelled => {
-                StatusCue { token: StatusToken::Warning, glyph: "\u{2298}", label: "cancelled" }
-            }
-            CheckState::Queued => {
-                StatusCue { token: StatusToken::Info, glyph: "\u{25F4}", label: "queued" }
-            }
-            CheckState::InProgress => {
-                StatusCue { token: StatusToken::Info, glyph: "\u{27F3}", label: "running" }
-            }
-            CheckState::Neutral => {
-                StatusCue { token: StatusToken::Muted, glyph: "\u{2296}", label: "neutral" }
-            }
+            CheckState::Error => StatusCue {
+                token: StatusToken::Warning,
+                glyph: "\u{26A0}",
+                label: "error",
+            },
+            CheckState::Cancelled => StatusCue {
+                token: StatusToken::Warning,
+                glyph: "\u{2298}",
+                label: "cancelled",
+            },
+            CheckState::Queued => StatusCue {
+                token: StatusToken::Info,
+                glyph: "\u{25F4}",
+                label: "queued",
+            },
+            CheckState::InProgress => StatusCue {
+                token: StatusToken::Info,
+                glyph: "\u{27F3}",
+                label: "running",
+            },
+            CheckState::Neutral => StatusCue {
+                token: StatusToken::Muted,
+                glyph: "\u{2296}",
+                label: "neutral",
+            },
         }
     }
 }
@@ -269,12 +283,22 @@ impl CheckRowView {
             self.cue.glyph,
             escape(self.cue.label),
         ));
-        h.push_str(&format!("<code class=\"check-context\">{}</code>", escape(&self.context)));
+        h.push_str(&format!(
+            "<code class=\"check-context\">{}</code>",
+            escape(&self.context)
+        ));
         h.push_str(&format!(
             "<span class=\"check-required\">{}</span>",
-            if self.required { "required" } else { "optional" }
+            if self.required {
+                "required"
+            } else {
+                "optional"
+            }
         ));
-        h.push_str(&format!("<span class=\"check-summary\">{}</span>", escape(&self.summary)));
+        h.push_str(&format!(
+            "<span class=\"check-summary\">{}</span>",
+            escape(&self.summary)
+        ));
         if let Some(badge) = &self.fork_badge {
             h.push_str(&badge.render());
         }
@@ -397,7 +421,9 @@ impl MergeReadiness {
     pub fn from_gate(outcome: &MergeGateOutcome, approvals: (u32, u32)) -> MergeReadiness {
         match outcome {
             MergeGateOutcome::Admitted => MergeReadiness::Ready { approvals },
-            MergeGateOutcome::Blocked { unmet } => MergeReadiness::Blocked { unmet: unmet.clone() },
+            MergeGateOutcome::Blocked { unmet } => MergeReadiness::Blocked {
+                unmet: unmet.clone(),
+            },
         }
     }
 
@@ -531,12 +557,16 @@ fn render_pr_hint(hint: &RenderHint) -> String {
             glyph: "\u{2714}",
             label: "checks green",
         },
-        ChecksSummary::Red => {
-            StatusCue { token: StatusToken::Danger, glyph: "\u{2717}", label: "checks blocked" }
-        }
-        ChecksSummary::Neutral => {
-            StatusCue { token: StatusToken::Muted, glyph: "\u{2296}", label: "no required checks" }
-        }
+        ChecksSummary::Red => StatusCue {
+            token: StatusToken::Danger,
+            glyph: "\u{2717}",
+            label: "checks blocked",
+        },
+        ChecksSummary::Neutral => StatusCue {
+            token: StatusToken::Muted,
+            glyph: "\u{2296}",
+            label: "no required checks",
+        },
     };
     format!(
         "<div class=\"pr-hint\"><span class=\"check-status {}\">\
@@ -548,7 +578,11 @@ fn render_pr_hint(hint: &RenderHint) -> String {
         escape(cue.label),
         hint.approvals.0,
         hint.approvals.1,
-        if hint.is_draft { "<span class=\"draft-pill\">draft</span>" } else { "" },
+        if hint.is_draft {
+            "<span class=\"draft-pill\">draft</span>"
+        } else {
+            ""
+        },
     )
 }
 
@@ -609,7 +643,12 @@ impl RepoHome {
         let mut h = String::new();
         h.push_str("<main class=\"repo-home\">");
         match self {
-            RepoHome::Populated { slug, readme_excerpt, entries, clone_url } => {
+            RepoHome::Populated {
+                slug,
+                readme_excerpt,
+                entries,
+                clone_url,
+            } => {
                 h.push_str(&format!("<h2 class=\"repo-title\">{}</h2>", escape(slug)));
                 h.push_str(&format!(
                     "<div class=\"clone-url\"><code>{}</code>\
@@ -677,7 +716,10 @@ impl WebEditForm {
     pub fn render(&self) -> String {
         let mut h = String::new();
         h.push_str("<main class=\"web-edit\">");
-        h.push_str(&format!("<h3 class=\"edit-path\"><code>{}</code></h3>", escape(&self.path)));
+        h.push_str(&format!(
+            "<h3 class=\"edit-path\"><code>{}</code></h3>",
+            escape(&self.path)
+        ));
         if self.viewer_may_edit {
             h.push_str(&format!(
                 "<form data-action=\"web-commit\" data-base-oid=\"{}\">",
@@ -746,10 +788,14 @@ impl WebEditOutcome {
             return WebEditOutcome::Denied;
         }
         if expected_base == current_head {
-            WebEditOutcome::Committed { new_oid: new_oid.to_string() }
+            WebEditOutcome::Committed {
+                new_oid: new_oid.to_string(),
+            }
         } else {
             // GF-6: refuse honestly rather than silently overwrite or offer a 3-way editor.
-            WebEditOutcome::StaleBase { current_oid: current_head.to_string() }
+            WebEditOutcome::StaleBase {
+                current_oid: current_head.to_string(),
+            }
         }
     }
 }

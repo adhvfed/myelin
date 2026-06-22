@@ -41,18 +41,18 @@
 pub use myelin_query::{
     // The field-type enum + its typed value + the LexoRank `order_key` codec primitives.
     field::{FieldType, FieldValue, Jitter, OrderKey},
-    // The frozen view-model.
-    view::{FieldId, SortDir, SortSpec, ViewKind, ViewSpec},
+    // The shared X-3 anti-drift conformance vector + the created_at+ULID tiebreak (authored once in
+    // Knowledge; Issues replays the SAME fixture through its OWN call sites — the byte-identity proof).
+    order_key::{tiebreak, ConformanceStep, RankOp},
     // The ONE predicate/query AST grammar (= the EventMatcher core, 3.4) + its textual parser.
     parse_query,
+    // The frozen view-model.
+    view::{FieldId, SortDir, SortSpec, ViewKind, ViewSpec},
     CmpOp,
     EvalContext,
     Expr,
     Predicate,
     QueryAst,
-    // The shared X-3 anti-drift conformance vector + the created_at+ULID tiebreak (authored once in
-    // Knowledge; Issues replays the SAME fixture through its OWN call sites — the byte-identity proof).
-    order_key::{tiebreak, ConformanceStep, RankOp},
     CONFORMANCE_VECTOR,
 };
 
@@ -104,7 +104,10 @@ pub fn issues_canonical_board_view() -> ViewSpec {
         filter: parse_query("status == 'open' AND severity >= 3")
             .expect("the co-owned grammar compiles a well-formed Issues board filter"),
         group_by: Some(FieldId::new("status")),
-        sort: vec![SortSpec { field: FieldId::new("priority"), dir: SortDir::Desc }],
+        sort: vec![SortSpec {
+            field: FieldId::new("priority"),
+            dir: SortDir::Desc,
+        }],
         visible: vec![FieldId::new("title"), FieldId::new("assignee")],
         order_field: FieldId::new("order_key"),
     }

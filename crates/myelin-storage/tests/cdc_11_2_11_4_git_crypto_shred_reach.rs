@@ -19,9 +19,9 @@
 
 use myelin_gdpr::ErasureMethod;
 use myelin_storage::{
-    BlobShredReach, BusErase, ColumnCryptor, CryptoShredErase, EpochMillis, EraseError, EraseHolders,
-    ErasureLedgerSink, GitCryptoShredReach, GitResidual, KekId, KeyClass, KmsEngine, PseudonymShred,
-    RefsTombstone, SearchPurge, SubjectId,
+    BlobShredReach, BusErase, ColumnCryptor, CryptoShredErase, EpochMillis, EraseError,
+    EraseHolders, ErasureLedgerSink, GitCryptoShredReach, GitResidual, KekId, KeyClass, KmsEngine,
+    PseudonymShred, RefsTombstone, SearchPurge, SubjectId,
 };
 use myelin_tenancy::{Region, TenantId};
 use std::cell::RefCell;
@@ -87,7 +87,8 @@ fn engine_with_subject_and_blob_dek(tenant: &TenantId, subject: &SubjectId) -> K
         )
         .expect("seal a per-subject column");
     // The per-tenant blob DEK git structures seal under.
-    kms.ensure_dek(tenant, &region(), KeyClass::Blob).expect("blob dek");
+    kms.ensure_dek(tenant, &region(), KeyClass::Blob)
+        .expect("blob dek");
     kms
 }
 
@@ -118,8 +119,14 @@ fn cdc_git_reach_runs_in_the_erase_crypto_shred_step_for_a_commit_author() {
         wiring.order.borrow().as_slice(),
         ["1:pseudonym", "3:search", "4:refs", "5:bus", "6:ledger"],
     );
-    assert!(receipt.dek_destroyed_now, "step 2 destroyed the per-subject DEK");
-    assert_eq!(receipt.recoverable_in_backup, 0, "the per-subject ciphertext is 0 recoverable");
+    assert!(
+        receipt.dek_destroyed_now,
+        "step 2 destroyed the per-subject DEK"
+    );
+    assert_eq!(
+        receipt.recoverable_in_backup, 0,
+        "the per-subject ciphertext is 0 recoverable"
+    );
 
     // THE GIT REACH RAN IN THE SAME CRYPTO-SHRED STEP: the per-tenant blob DEK is now gone, so git's
     // reflog/bitmap/pack-tier-backup ciphertext is unrecoverable live AND in backup.
@@ -138,7 +145,8 @@ fn cdc_git_reach_post_condition_is_verified_not_assumed() {
     let subject = SubjectId::new("u-author");
     let kms = KmsEngine::new();
     kms.ensure_kek(&KekId::new(tenant.clone(), region()));
-    kms.ensure_dek(&tenant, &region(), KeyClass::Blob).expect("blob dek");
+    kms.ensure_dek(&tenant, &region(), KeyClass::Blob)
+        .expect("blob dek");
     let git_reach = GitCryptoShredReach::new(&kms, region());
 
     // The seam succeeds (green) and really reaches the git structures.
@@ -161,7 +169,12 @@ fn cdc_subject_with_no_git_content_skips_the_reach_no_op() {
     kms.ensure_kek(&KekId::new(tenant.clone(), region()));
     let cryptor = ColumnCryptor::new(&kms, region());
     cryptor
-        .encrypt(&tenant, Some(&subject), &ErasureMethod::CryptoShred("subject_dek".into()), b"chat body")
+        .encrypt(
+            &tenant,
+            Some(&subject),
+            &ErasureMethod::CryptoShred("subject_dek".into()),
+            b"chat body",
+        )
         .expect("seal");
     let eraser = CryptoShredErase::new(&kms, region());
     let wiring = OrchestratorWiring::default();
@@ -173,7 +186,12 @@ fn cdc_subject_with_no_git_content_skips_the_reach_no_op() {
         ledger: &wiring,
         git_reach: None,
     };
-    let receipt = eraser.erase(&subject, &tenant, &holders, 1).expect("erase without git reach");
-    assert!(receipt.dek_destroyed_now, "the per-subject free-text DEK was still destroyed");
+    let receipt = eraser
+        .erase(&subject, &tenant, &holders, 1)
+        .expect("erase without git reach");
+    assert!(
+        receipt.dek_destroyed_now,
+        "the per-subject free-text DEK was still destroyed"
+    );
     assert!(receipt.is_green());
 }

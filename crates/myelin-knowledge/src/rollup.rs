@@ -338,7 +338,9 @@ pub struct FormulaSchema {
 impl FormulaSchema {
     /// Build a formula schema from an ordered set of formula fields, validating each tree against
     /// the static cost bounds (an over-budget / duplicate tree is rejected here, fail-closed).
-    pub fn of(fields: impl IntoIterator<Item = FormulaField>) -> Result<FormulaSchema, FormulaSchemaError> {
+    pub fn of(
+        fields: impl IntoIterator<Item = FormulaField>,
+    ) -> Result<FormulaSchema, FormulaSchemaError> {
         let fields: Vec<FormulaField> = fields.into_iter().collect();
         let mut seen = BTreeSet::new();
         for ff in &fields {
@@ -356,11 +358,17 @@ impl FormulaSchema {
     pub fn validate(field: &FieldId, expr: &FormulaExpr) -> Result<(), FormulaSchemaError> {
         let nodes = expr.node_count();
         if nodes > MAX_FORMULA_NODES {
-            return Err(FormulaSchemaError::TooLarge { field: field.to_string(), nodes });
+            return Err(FormulaSchemaError::TooLarge {
+                field: field.to_string(),
+                nodes,
+            });
         }
         let depth = expr.depth();
         if depth > MAX_FORMULA_DEPTH {
-            return Err(FormulaSchemaError::TooDeep { field: field.to_string(), depth });
+            return Err(FormulaSchemaError::TooDeep {
+                field: field.to_string(),
+                depth,
+            });
         }
         Ok(())
     }
@@ -372,7 +380,10 @@ impl FormulaSchema {
 
     /// Look up a formula field's expression (`None` if the schema does not declare it).
     pub fn formula(&self, field: &FieldId) -> Option<&FormulaExpr> {
-        self.fields.iter().find(|ff| &ff.field == field).map(|ff| &ff.expr)
+        self.fields
+            .iter()
+            .find(|ff| &ff.field == field)
+            .map(|ff| &ff.expr)
     }
 }
 
@@ -455,7 +466,13 @@ impl<'a> RollupResolver<'a> {
         authz: &'a AuthzVisibleIndex,
         target_props: &'a BTreeMap<String, PropertyBag>,
     ) -> RollupResolver<'a> {
-        RollupResolver { tenant, region, relations, authz, target_props }
+        RollupResolver {
+            tenant,
+            region,
+            relations,
+            authz,
+            target_props,
+        }
     }
 
     /// **The permission-filtered visible related target row ids (the §4.2 `targets` step).** The
@@ -465,7 +482,9 @@ impl<'a> RollupResolver<'a> {
     /// token is the `db_row.id` of the sibling target). Returns the visible target ids, in stable
     /// order.
     fn visible_target_ids(&self, viewer: &Principal, src_row: &str) -> Vec<String> {
-        let edges = self.relations.relations_from(self.tenant, src_row, RelationKind::RollupSource);
+        let edges = self
+            .relations
+            .relations_from(self.tenant, src_row, RelationKind::RollupSource);
         // The candidate target ids (the dst end of each rollup_source edge — the sibling db_row id).
         let candidate_ids: Vec<String> = edges.iter().map(|e| e.dst_ref.0.clone()).collect();
         let candidate_refs: Vec<&str> = candidate_ids.iter().map(|s| s.as_str()).collect();
@@ -487,7 +506,13 @@ impl<'a> RollupResolver<'a> {
     /// each visible target's `target` property value (an `Int`) — a non-numeric / missing target
     /// value is SKIPPED (it does not contribute, never coerced). A restricted target is absent (0
     /// rollup leak).
-    fn compute(&self, viewer: &Principal, src_row: &str, func: RollupFn, target: &FieldId) -> CellValue {
+    fn compute(
+        &self,
+        viewer: &Principal,
+        src_row: &str,
+        func: RollupFn,
+        target: &FieldId,
+    ) -> CellValue {
         let visible = self.visible_target_ids(viewer, src_row);
         let mut target_values: Vec<i64> = Vec::new();
         if func != RollupFn::Count {
@@ -537,7 +562,16 @@ pub fn compute_row(
     };
     let mut visiting: BTreeSet<FieldId> = BTreeSet::new();
     visiting.insert(field.clone());
-    eval_expr(viewer, src_row, expr, props, formulas, rollups, &mut visiting, 0)
+    eval_expr(
+        viewer,
+        src_row,
+        expr,
+        props,
+        formulas,
+        rollups,
+        &mut visiting,
+        0,
+    )
 }
 
 /// The recursive bounded evaluator. `visiting` is the visited-set of formula fields on the current
@@ -581,17 +615,74 @@ fn eval_expr(
                 return CellValue::Cycle;
             }
             // A FormulaRef hop deepens the dependency graph by one (the depth guard counts HOPS).
-            let v = eval_expr(viewer, src_row, dep_expr, props, formulas, rollups, visiting, depth + 1);
+            let v = eval_expr(
+                viewer,
+                src_row,
+                dep_expr,
+                props,
+                formulas,
+                rollups,
+                visiting,
+                depth + 1,
+            );
             visiting.remove(field);
             v
         }
-        FormulaExpr::Add(a, b) => arith(viewer, src_row, a, b, props, formulas, rollups, visiting, depth, |x, y| Some(x.wrapping_add(y))),
-        FormulaExpr::Sub(a, b) => arith(viewer, src_row, a, b, props, formulas, rollups, visiting, depth, |x, y| Some(x.wrapping_sub(y))),
-        FormulaExpr::Mul(a, b) => arith(viewer, src_row, a, b, props, formulas, rollups, visiting, depth, |x, y| Some(x.wrapping_mul(y))),
-        FormulaExpr::Div(a, b) => arith(viewer, src_row, a, b, props, formulas, rollups, visiting, depth, |x, y| {
-            // A divide-by-zero is `#ERROR` (a diagnostic cell), never a panic.
-            if y == 0 { None } else { Some(x / y) }
-        }),
+        FormulaExpr::Add(a, b) => arith(
+            viewer,
+            src_row,
+            a,
+            b,
+            props,
+            formulas,
+            rollups,
+            visiting,
+            depth,
+            |x, y| Some(x.wrapping_add(y)),
+        ),
+        FormulaExpr::Sub(a, b) => arith(
+            viewer,
+            src_row,
+            a,
+            b,
+            props,
+            formulas,
+            rollups,
+            visiting,
+            depth,
+            |x, y| Some(x.wrapping_sub(y)),
+        ),
+        FormulaExpr::Mul(a, b) => arith(
+            viewer,
+            src_row,
+            a,
+            b,
+            props,
+            formulas,
+            rollups,
+            visiting,
+            depth,
+            |x, y| Some(x.wrapping_mul(y)),
+        ),
+        FormulaExpr::Div(a, b) => arith(
+            viewer,
+            src_row,
+            a,
+            b,
+            props,
+            formulas,
+            rollups,
+            visiting,
+            depth,
+            |x, y| {
+                // A divide-by-zero is `#ERROR` (a diagnostic cell), never a panic.
+                if y == 0 {
+                    None
+                } else {
+                    Some(x / y)
+                }
+            },
+        ),
     }
 }
 
@@ -616,13 +707,17 @@ fn arith(
     // graph (the expression-tree depth is statically capped at MAX_FORMULA_DEPTH at schema build).
     // Only a FormulaRef hop increments `depth`; passing it through keeps the depth guard a measure
     // of dependency-graph hops, so a deep-but-acyclic FormulaRef chain is not a false #CYCLE.
-    let lv = eval_expr(viewer, src_row, a, props, formulas, rollups, visiting, depth);
+    let lv = eval_expr(
+        viewer, src_row, a, props, formulas, rollups, visiting, depth,
+    );
     // A cycle in any operand propagates as the cycle diagnostic (the cycle gate's green artifact is
     // that a cyclic formula is `#CYCLE`, never masked by an arithmetic wrapper or an infinite loop).
     if matches!(lv, CellValue::Cycle) {
         return CellValue::Cycle;
     }
-    let rv = eval_expr(viewer, src_row, b, props, formulas, rollups, visiting, depth);
+    let rv = eval_expr(
+        viewer, src_row, b, props, formulas, rollups, visiting, depth,
+    );
     if matches!(rv, CellValue::Cycle) {
         return CellValue::Cycle;
     }
@@ -651,7 +746,9 @@ fn field_value_to_cell(value: &FieldValue) -> CellValue {
     match value {
         FieldValue::Int(n) => CellValue::Int(*n),
         FieldValue::Bool(b) => CellValue::Bool(*b),
-        FieldValue::Text(s) | FieldValue::Date(s) | FieldValue::Select(s) => CellValue::Str(s.clone()),
+        FieldValue::Text(s) | FieldValue::Date(s) | FieldValue::Select(s) => {
+            CellValue::Str(s.clone())
+        }
         FieldValue::Relation(r) => CellValue::Str(r.clone()),
         FieldValue::Principal(p) => CellValue::Str(p.clone()),
         FieldValue::OrderKey(k) => CellValue::Str(k.as_str().to_string()),

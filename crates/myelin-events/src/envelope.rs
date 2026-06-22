@@ -307,7 +307,11 @@ mod tests {
     use myelin_identity::{PrincipalId, PrincipalKind};
 
     fn sample_principal() -> Principal {
-        Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId("acme".into()))
+        Principal::stub(
+            PrincipalId("p".into()),
+            PrincipalKind::Human,
+            TenantId("acme".into()),
+        )
     }
 
     /// Build the canonical anchor envelope used by the field-shape test, the provider-side
@@ -380,14 +384,26 @@ mod tests {
         let env = anchor_envelope();
         // pre-conditions: the round-trip is only meaningful if the fixture actually
         // populates the OPTIONAL / nested fields EB-01 calls out.
-        assert!(env.causation_id.is_some(), "fixture exercises the immediate-parent leg");
-        assert!(env.caused_by.is_some(), "fixture exercises the human-action ref");
-        assert!(env.pii_key_ref.is_some(), "fixture exercises a populated pii_key_ref");
+        assert!(
+            env.causation_id.is_some(),
+            "fixture exercises the immediate-parent leg"
+        );
+        assert!(
+            env.caused_by.is_some(),
+            "fixture exercises the human-action ref"
+        );
+        assert!(
+            env.pii_key_ref.is_some(),
+            "fixture exercises a populated pii_key_ref"
+        );
         assert_ne!(env.depth, 0, "fixture exercises a non-root depth");
 
         let json = serde_json::to_string(&env).expect("envelope serialises");
         let back: EventEnvelope = serde_json::from_str(&json).expect("envelope deserialises");
-        assert_eq!(back, env, "every field round-trips lossless (the X-5 anchor is well-defined)");
+        assert_eq!(
+            back, env,
+            "every field round-trips lossless (the X-5 anchor is well-defined)"
+        );
         // explicitly re-assert the nested triad + pii survived (not just the derived Eq).
         assert_eq!(back.causation_id, env.causation_id);
         assert_eq!(back.correlation_id, env.correlation_id);
@@ -398,7 +414,10 @@ mod tests {
         // (b) depth-derivation (child = parent + 1) computed from a cause is correct.
         let parent = derive_envelope(
             draft_for("issues.issue.created"),
-            ctx_for(EventId("01J-root".into()), Some(CausedBy("session:abc".into()))),
+            ctx_for(
+                EventId("01J-root".into()),
+                Some(CausedBy("session:abc".into())),
+            ),
             None,
         );
         assert_eq!(parent.depth, 0, "a root is at depth 0");
@@ -407,7 +426,11 @@ mod tests {
             ctx_for(EventId("01J-child".into()), None),
             Some(&parent),
         );
-        assert_eq!(child.depth, parent.depth + 1, "child depth = parent depth + 1 (BUS-5)");
+        assert_eq!(
+            child.depth,
+            parent.depth + 1,
+            "child depth = parent depth + 1 (BUS-5)"
+        );
         assert_eq!(
             child.causation_id,
             Some(parent.event_id.clone()),
@@ -422,7 +445,10 @@ mod tests {
         // is a wire-shape envelope, no special-casing).
         let cjson = serde_json::to_string(&child).expect("child serialises");
         let cback: EventEnvelope = serde_json::from_str(&cjson).expect("child deserialises");
-        assert_eq!(cback, child, "a derived (caused) envelope round-trips lossless too");
+        assert_eq!(
+            cback, child,
+            "a derived (caused) envelope round-trips lossless too"
+        );
     }
 
     /// P-S06 GATE artifact (1/3): a ROOT emit (`cause == None`) is its own causal root.
@@ -434,7 +460,10 @@ mod tests {
         let ctx = ctx_for(id.clone(), Some(CausedBy("session:abc".into())));
         let env = derive_envelope(draft_for("issues.issue.created"), ctx, None);
 
-        assert_eq!(env.event_id, id, "the minted id is carried onto the envelope");
+        assert_eq!(
+            env.event_id, id,
+            "the minted id is carried onto the envelope"
+        );
         assert_eq!(env.causation_id, None, "a root has no immediate parent");
         assert_eq!(
             env.correlation_id,
@@ -458,7 +487,10 @@ mod tests {
         // The parent: a root at depth 0.
         let parent = derive_envelope(
             draft_for("issues.issue.created"),
-            ctx_for(EventId("01J-root".into()), Some(CausedBy("session:abc".into()))),
+            ctx_for(
+                EventId("01J-root".into()),
+                Some(CausedBy("session:abc".into())),
+            ),
             None,
         );
 
@@ -466,7 +498,10 @@ mod tests {
         // DIFFERENT value to prove the derivation IGNORES it and inherits the parent's.
         let child = derive_envelope(
             draft_for("refs.edge.created"),
-            ctx_for(EventId("01J-child".into()), Some(CausedBy("session:WRONG".into()))),
+            ctx_for(
+                EventId("01J-child".into()),
+                Some(CausedBy("session:WRONG".into())),
+            ),
             Some(&parent),
         );
 
@@ -504,7 +539,10 @@ mod tests {
         for i in 1..=10u32 {
             let next = derive_envelope(
                 draft_for("refs.edge.created"),
-                ctx_for(EventId(format!("01J-{i}")), Some(CausedBy("human:DECOY".into()))),
+                ctx_for(
+                    EventId(format!("01J-{i}")),
+                    Some(CausedBy("human:DECOY".into())),
+                ),
                 Some(&prev),
             );
             // depth strictly increases by 1 each hop.
@@ -542,7 +580,11 @@ mod tests {
             ctx_for(EventId("01J-deeper".into()), None),
             Some(&maxed),
         );
-        assert_eq!(child.depth, u32::MAX, "depth saturates at u32::MAX, never wraps to 0");
+        assert_eq!(
+            child.depth,
+            u32::MAX,
+            "depth saturates at u32::MAX, never wraps to 0"
+        );
     }
 
     /// P-S06: the caller-authored fields (type/subject/aggregate/payload/classification)
@@ -609,8 +651,14 @@ mod tests {
         // --- frozen units (§2.10) ---
         // timestamps = RFC-3339 UTC: `T`-separated, `Z`-suffixed (UTC), parseable shape.
         for ts in [&env.occurred_at.0, &env.recorded_at.0] {
-            assert!(ts.contains('T'), "timestamp must be RFC-3339 (date T time): {ts}");
-            assert!(ts.ends_with('Z'), "timestamp must be UTC (Z-suffixed): {ts}");
+            assert!(
+                ts.contains('T'),
+                "timestamp must be RFC-3339 (date T time): {ts}"
+            );
+            assert!(
+                ts.ends_with('Z'),
+                "timestamp must be UTC (Z-suffixed): {ts}"
+            );
         }
         // depth is an integer causal depth (u32) — the loop ceiling (AG-6) reads it.
         assert_eq!(env.depth, 4u32);
@@ -619,17 +667,26 @@ mod tests {
         assert_eq!(env.correlation_id, CorrelationId("root".into()));
         // pii_key_ref format: kms://<tenant>/<dek-epoch>/<class>, class ∈ {tenant,subject:<id>,blob}.
         let pkr = &env.pii_key_ref.as_ref().expect("anchor sets pii_key_ref").0;
-        assert!(pkr.starts_with("kms://"), "pii_key_ref must be a kms:// URN: {pkr}");
+        assert!(
+            pkr.starts_with("kms://"),
+            "pii_key_ref must be a kms:// URN: {pkr}"
+        );
         let rest = pkr.strip_prefix("kms://").unwrap();
         let parts: Vec<&str> = rest.splitn(3, '/').collect();
         assert_eq!(parts.len(), 3, "kms://<tenant>/<dek-epoch>/<class>: {pkr}");
         assert_eq!(parts[0], "acme", "tenant segment");
-        assert!(parts[1].parse::<u64>().is_ok(), "dek-epoch is an integer: {}", parts[1]);
+        assert!(
+            parts[1].parse::<u64>().is_ok(),
+            "dek-epoch is an integer: {}",
+            parts[1]
+        );
         let class = parts[2];
         assert!(
             class == "tenant"
                 || class == "blob"
-                || class.strip_prefix("subject:").is_some_and(|id| !id.is_empty()),
+                || class
+                    .strip_prefix("subject:")
+                    .is_some_and(|id| !id.is_empty()),
             "class ∈ {{tenant, subject:<id>, blob}}: {class}"
         );
         // references-not-payloads: payload is a JSON value (IDs/refs), not a typed PII body.
@@ -682,21 +739,42 @@ mod tests {
             "payload",
         ];
         expected.sort_unstable();
-        assert_eq!(keys, expected, "the 2.1 envelope wire key set is frozen (X-5 anchor)");
+        assert_eq!(
+            keys, expected,
+            "the 2.1 envelope wire key set is frozen (X-5 anchor)"
+        );
 
         // Frozen unit renderings on the wire.
-        assert!(obj["schema_ver"].is_u64(), "schema_ver is an integer on the wire");
+        assert!(
+            obj["schema_ver"].is_u64(),
+            "schema_ver is an integer on the wire"
+        );
         assert!(obj["depth"].is_u64(), "depth is an integer on the wire");
         // timestamps are RFC-3339 UTC strings (Z-suffixed).
-        assert_eq!(obj["occurred_at"], serde_json::json!("2026-06-19T00:00:00Z"));
-        assert_eq!(obj["recorded_at"], serde_json::json!("2026-06-19T00:00:01Z"));
+        assert_eq!(
+            obj["occurred_at"],
+            serde_json::json!("2026-06-19T00:00:00Z")
+        );
+        assert_eq!(
+            obj["recorded_at"],
+            serde_json::json!("2026-06-19T00:00:01Z")
+        );
         // pii_key_ref renders as the kms:// URN string (Option::Some).
-        assert_eq!(obj["pii_key_ref"], serde_json::json!("kms://acme/3/subject:u42"));
+        assert_eq!(
+            obj["pii_key_ref"],
+            serde_json::json!("kms://acme/3/subject:u42")
+        );
         // payload is a nested object of references, never a flat PII body.
-        assert!(obj["payload"].is_object(), "payload carries references, not a PII body");
+        assert!(
+            obj["payload"].is_object(),
+            "payload carries references, not a PII body"
+        );
 
         // The shape IS the contract: round-trip is lossless.
         let back: EventEnvelope = serde_json::from_value(json).expect("envelope round-trips");
-        assert_eq!(back, env, "the wire shape round-trips to the anchor (no lossy field)");
+        assert_eq!(
+            back, env,
+            "the wire shape round-trips to the anchor (no lossy field)"
+        );
     }
 }

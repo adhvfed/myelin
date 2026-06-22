@@ -31,7 +31,12 @@ const HEAD: &str = "c0ffee";
 
 /// **PRODUCER side of 5.9** — CI emits the `CheckStatus` fact carried OPAQUE over the Bus, carrying
 /// CI's `required` bool (its REPORT). The consumer decodes exactly this shape.
-fn producer_fact(context: &str, state: CheckState, ci_required: bool, trust: TrustTier) -> CheckStatus {
+fn producer_fact(
+    context: &str,
+    state: CheckState,
+    ci_required: bool,
+    trust: TrustTier,
+) -> CheckStatus {
     let mut args = BTreeMap::new();
     args.insert("context".to_string(), context.to_string());
     CheckStatus {
@@ -45,7 +50,10 @@ fn producer_fact(context: &str, state: CheckState, ci_required: bool, trust: Tru
         run_attempt: 1,
         trust_tier: trust,
         details_ref: ArtifactRef("myelin://acme/ci/run/7#step-1".into()),
-        summary: HumanisedRef { template_key: "ci.check.updated".into(), args },
+        summary: HumanisedRef {
+            template_key: "ci.check.updated".into(),
+            args,
+        },
         started_at: Timestamp("2026-06-22T00:00:00Z".into()),
         completed_at: Some(Timestamp("2026-06-22T00:01:00Z".into())),
         cost_settled: true,
@@ -58,7 +66,10 @@ fn producer_fact(context: &str, state: CheckState, ci_required: bool, trust: Tru
 fn consumer_apply(proj: &mut CheckStatusProjection, fact: &CheckStatus) {
     let opaque: serde_json::Value = serde_json::to_value(fact).unwrap();
     let decoded: CheckStatus = serde_json::from_value(opaque).unwrap();
-    assert_eq!(&decoded, fact, "the opaque Bus payload decodes to exactly Git's CheckStatus");
+    assert_eq!(
+        &decoded, fact,
+        "the opaque Bus payload decodes to exactly Git's CheckStatus"
+    );
     proj.apply(&decoded);
 }
 
@@ -72,8 +83,14 @@ fn cdc_5_9_git_required_set_policy_overrides_the_ci_required_bool() {
     let mut proj = CheckStatusProjection::new();
 
     // CI reports: build green (CI says required=true), lint FAILING (CI says required=FALSE).
-    consumer_apply(&mut proj, &producer_fact("build", CheckState::Success, true, TrustTier::Trusted));
-    consumer_apply(&mut proj, &producer_fact("lint", CheckState::Failure, false, TrustTier::Trusted));
+    consumer_apply(
+        &mut proj,
+        &producer_fact("build", CheckState::Success, true, TrustTier::Trusted),
+    );
+    consumer_apply(
+        &mut proj,
+        &producer_fact("lint", CheckState::Failure, false, TrustTier::Trusted),
+    );
 
     // Git's OWN policy: gate on `ci/lint` ONLY (NOT `ci/build`) — the inverse of CI's `required` bools.
     let policy = MergeGatePolicy::from_required_contexts(&["ci/lint"]).unwrap();
@@ -83,7 +100,12 @@ fn cdc_5_9_git_required_set_policy_overrides_the_ci_required_bool() {
     match evaluate_merge_gate(&policy, &proj, &head, &[]) {
         MergeGateOutcome::Blocked { unmet } => {
             assert_eq!(unmet[0].context, CheckContext::ci("lint"));
-            assert_eq!(unmet[0].reason, UnmetReason::NotGreen { state: CheckState::Failure });
+            assert_eq!(
+                unmet[0].reason,
+                UnmetReason::NotGreen {
+                    state: CheckState::Failure
+                }
+            );
         }
         MergeGateOutcome::Admitted => {
             panic!("Git's policy names lint → the failing lint must block (CI's required bool is advisory)")
@@ -110,7 +132,10 @@ fn cdc_5_9_untrusted_fork_success_is_neutral_until_endorsed() {
     let mut proj = CheckStatusProjection::new();
     // CI reports the fork's self-greened build as a SUCCESS, but stamps trust_tier = untrusted_fork
     // (Git reads it OFF the fact — it never recomputes trust).
-    consumer_apply(&mut proj, &producer_fact("build", CheckState::Success, true, TrustTier::UntrustedFork));
+    consumer_apply(
+        &mut proj,
+        &producer_fact("build", CheckState::Success, true, TrustTier::UntrustedFork),
+    );
 
     let policy = MergeGatePolicy::from_required_contexts(&["ci/build"]).unwrap();
 
@@ -151,15 +176,27 @@ fn cdc_5_9_zero_under_gated_merges_every_non_green_posture_blocks() {
         CheckState::InProgress,
     ] {
         let mut proj = CheckStatusProjection::new();
-        consumer_apply(&mut proj, &producer_fact("x", state, true, TrustTier::Trusted));
+        consumer_apply(
+            &mut proj,
+            &producer_fact("x", state, true, TrustTier::Trusted),
+        );
         assert!(
-            matches!(evaluate_merge_gate(&policy, &proj, &head, &[]), MergeGateOutcome::Blocked { .. }),
+            matches!(
+                evaluate_merge_gate(&policy, &proj, &head, &[]),
+                MergeGateOutcome::Blocked { .. }
+            ),
             "state {state:?} must block (only a success admits)"
         );
     }
 
     // a trusted success → admit (the ONLY admitting posture)
     let mut proj = CheckStatusProjection::new();
-    consumer_apply(&mut proj, &producer_fact("x", CheckState::Success, true, TrustTier::Trusted));
-    assert_eq!(evaluate_merge_gate(&policy, &proj, &head, &[]), MergeGateOutcome::Admitted);
+    consumer_apply(
+        &mut proj,
+        &producer_fact("x", CheckState::Success, true, TrustTier::Trusted),
+    );
+    assert_eq!(
+        evaluate_merge_gate(&policy, &proj, &head, &[]),
+        MergeGateOutcome::Admitted
+    );
 }

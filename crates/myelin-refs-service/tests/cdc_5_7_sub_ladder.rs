@@ -23,9 +23,9 @@ use std::sync::Arc;
 use myelin_events::ArtifactRef;
 use myelin_identity::{Decision, Permission, Principal, PrincipalId, PrincipalKind};
 use myelin_refs_service::{
-    bounded_stale, ladder_root, resolve_sub_outcome, MintedLineRange, NoOpCacheRead, OwnerProjection,
-    ProjectApi, ProjectApiError, ProjectOutcome, ProjectionFlag, ResolveMode, ResolveService,
-    Resolution, SubState, SyntheticSubResolver, TombstoneReason,
+    bounded_stale, ladder_root, resolve_sub_outcome, MintedLineRange, NoOpCacheRead,
+    OwnerProjection, ProjectApi, ProjectApiError, ProjectOutcome, ProjectionFlag, Resolution,
+    ResolveMode, ResolveService, SubState, SyntheticSubResolver, TombstoneReason,
 };
 use myelin_substrate::{FailStaticAuthz, FailStaticThreshold};
 use myelin_tenancy::{CellId, Region, TenantId};
@@ -40,7 +40,11 @@ fn cell() -> CellId {
     CellId::from_token("cell-fr-par-1")
 }
 fn viewer() -> Principal {
-    Principal::stub(PrincipalId("insider".into()), PrincipalKind::Human, tenant())
+    Principal::stub(
+        PrincipalId("insider".into()),
+        PrincipalKind::Human,
+        tenant(),
+    )
 }
 fn aref(s: &str) -> ArtifactRef {
     myelin_refs::parse(s).expect("a well-formed URN")
@@ -87,7 +91,12 @@ impl ProjectApi for LadderOwner {
 }
 
 fn resolve(sub: Arc<SyntheticSubResolver>, ref_: &ArtifactRef) -> Resolution {
-    let svc = ResolveService::new(authz(), Arc::new(NoOpCacheRead), Arc::new(LadderOwner { sub }), cell());
+    let svc = ResolveService::new(
+        authz(),
+        Arc::new(NoOpCacheRead),
+        Arc::new(LadderOwner { sub }),
+        cell(),
+    );
     let root = ladder_root(ref_);
     svc.resolve(
         &tenant(),
@@ -184,11 +193,19 @@ fn ref_d9_unified_ladder_across_three_content_shapes_root_always_carried() {
             (Some(reason), Resolution::Tombstone(t)) => {
                 assert_eq!(t.reason, *reason, "{}: correct tombstone reason", c.label);
                 // THE ladder invariant: a tombstone ALWAYS carries the root (0 dangling, 0 hard 404).
-                assert_eq!(t.root.0, c.root, "{}: the tombstone carries the root", c.label);
+                assert_eq!(
+                    t.root.0, c.root,
+                    "{}: the tombstone carries the root",
+                    c.label
+                );
             }
             (None, Resolution::Projection(p)) => {
                 // a degraded-but-rendering state (moved/outdated) — flagged, never a tombstone.
-                assert_eq!(p.flag, c.expect_flag, "{}: correct degradation flag", c.label);
+                assert_eq!(
+                    p.flag, c.expect_flag,
+                    "{}: correct degradation flag",
+                    c.label
+                );
             }
             other => panic!("{}: unexpected resolution {other:?}", c.label),
         }

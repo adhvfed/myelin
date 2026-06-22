@@ -29,7 +29,7 @@
 use myelin_gdpr::ErasureMethod;
 use myelin_storage::{
     BusErase, ColumnCryptor, CryptoShredErase, DekId, EpochMillis, EraseError, EraseHolders,
-    ErasureLedgerSink, GitCryptoShredReach, GitResidual, GitShreddable, KeyClass, KekId, KmsEngine,
+    ErasureLedgerSink, GitCryptoShredReach, GitResidual, GitShreddable, KekId, KeyClass, KmsEngine,
     PiiKeyRef, PseudonymShred, RefsTombstone, SearchPurge, SubjectId,
 };
 use myelin_tenancy::{Region, TenantId};
@@ -76,15 +76,22 @@ impl ErasureLedgerSink for DrillWiring {
 /// Seal a git structure's bytes under the per-tenant blob DEK (`KeyClass::Blob`) — the at-rest form
 /// of git's reflog / bitmap / pack-tier-backup ciphertext. Returns the `(key_ref, nonce, ct)` the
 /// live structure AND its pack-tier backup hold (a backup stores ciphertext under the DEK, §7.5).
-fn seal_git_structure(kms: &KmsEngine, tenant: &TenantId, bytes: &[u8]) -> (PiiKeyRef, [u8; 12], Vec<u8>) {
+fn seal_git_structure(
+    kms: &KmsEngine,
+    tenant: &TenantId,
+    bytes: &[u8],
+) -> (PiiKeyRef, [u8; 12], Vec<u8>) {
     let key_ref = PiiKeyRef::new(tenant.clone(), 0, KeyClass::Blob);
-    let dek = kms.resolve_dek(&key_ref, &region()).expect("resolve blob dek");
+    let dek = kms
+        .resolve_dek(&key_ref, &region())
+        .expect("resolve blob dek");
     let (nonce, ct) = dek.seal(bytes);
     (key_ref, nonce, ct)
 }
 
 #[test]
-fn git_d2_storage_half_erase_commit_author_zero_recoverable_git_structures_residual_is_the_posture() {
+fn git_d2_storage_half_erase_commit_author_zero_recoverable_git_structures_residual_is_the_posture()
+{
     let tenant = TenantId("acme".into());
     let author = SubjectId::new("u-commit-author");
 
@@ -101,21 +108,39 @@ fn git_d2_storage_half_erase_commit_author_zero_recoverable_git_structures_resid
         )
         .expect("seal the author's free-text body");
     // The per-tenant blob DEK git's structures seal under.
-    kms.ensure_dek(&tenant, &region(), KeyClass::Blob).expect("blob dek");
+    kms.ensure_dek(&tenant, &region(), KeyClass::Blob)
+        .expect("blob dek");
 
     // Seal each of the THREE shreddable git structures under the per-tenant blob DEK; retain the
     // stored ciphertext so the drill can ATTEMPT recovery after the erase.
-    let reflog = seal_git_structure(&kms, &tenant, b"refs/heads/main 0000 abcd <pseudonym>@acme.noreply pushed");
-    let bitmap = seal_git_structure(&kms, &tenant, b"\x42\x49\x54\x4d pack reachability bitmap index");
-    let pack_backup = seal_git_structure(&kms, &tenant, b"PACK\0\0\0\x02 a pack-tier backup object");
+    let reflog = seal_git_structure(
+        &kms,
+        &tenant,
+        b"refs/heads/main 0000 abcd <pseudonym>@acme.noreply pushed",
+    );
+    let bitmap = seal_git_structure(
+        &kms,
+        &tenant,
+        b"\x42\x49\x54\x4d pack reachability bitmap index",
+    );
+    let pack_backup =
+        seal_git_structure(&kms, &tenant, b"PACK\0\0\0\x02 a pack-tier backup object");
 
     // Pre-condition: the author's body decrypts, each git structure decrypts, and the per-tenant
     // blob DEK is in the backup snapshot.
-    assert!(cryptor.decrypt(&body_col).is_ok(), "the author body decrypts before erase");
+    assert!(
+        cryptor.decrypt(&body_col).is_ok(),
+        "the author body decrypts before erase"
+    );
     let blob_dek = DekId::new(tenant.clone(), KeyClass::Blob);
     for (kr, nonce, ct) in [&reflog, &bitmap, &pack_backup] {
-        let dek = kms.resolve_dek(kr, &region()).expect("git structure DEK resolves before erase");
-        assert!(dek.open(nonce, ct).is_some(), "git structure decrypts before erase");
+        let dek = kms
+            .resolve_dek(kr, &region())
+            .expect("git structure DEK resolves before erase");
+        assert!(
+            dek.open(nonce, ct).is_some(),
+            "git structure decrypts before erase"
+        );
     }
     assert!(
         kms.backup_snapshot().iter().any(|(d, _)| *d == blob_dek),
@@ -127,7 +152,10 @@ fn git_d2_storage_half_erase_commit_author_zero_recoverable_git_structures_resid
     // artifact reading. ──
     let git_reach = GitCryptoShredReach::new(&kms, region());
     let git_receipt = git_reach.shred_git_structures(&tenant);
-    assert!(git_receipt.blob_dek_destroyed_now, "the GIT-D2 reach destroyed the per-tenant blob DEK");
+    assert!(
+        git_receipt.blob_dek_destroyed_now,
+        "the GIT-D2 reach destroyed the per-tenant blob DEK"
+    );
 
     // ── INTEGRATION: the commit author's full `erase` drives the SAME git reach as the step-2
     // crypto-shred seam (here an idempotent re-run, since the reach above already shred). The
@@ -145,7 +173,10 @@ fn git_d2_storage_half_erase_commit_author_zero_recoverable_git_structures_resid
     let erase_receipt = eraser
         .erase(&author, &tenant, &holders, 1_718_000_000_000)
         .expect("the commit author's erase completes (incl. the git reach)");
-    assert!(erase_receipt.is_green(), "the per-subject crypto-shred is green");
+    assert!(
+        erase_receipt.is_green(),
+        "the per-subject crypto-shred is green"
+    );
 
     // ── GIT-D2 assertions — attempt recovery of each git structure, prove 0 recoverable. ──
 

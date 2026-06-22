@@ -75,12 +75,20 @@ fn mint_binds_token_to_agent_and_run_and_refuses_zero_ttl() {
     let token = provider
         .mint_run_token("psn:agent-7", "R1", &caveats, 300)
         .expect("the mint succeeds under a positive TTL");
-    assert_eq!(token.jti, "jti:psn:agent-7:R1", "the jti is bound to (agent, run)");
-    assert_eq!(token.ttl_secs, 300, "token life == the short fail-static window (run life)");
+    assert_eq!(
+        token.jti, "jti:psn:agent-7:R1",
+        "the jti is bound to (agent, run)"
+    );
+    assert_eq!(
+        token.ttl_secs, 300,
+        "token life == the short fail-static window (run life)"
+    );
 
     // a 0-TTL mint is refused (a per-run token must have a finite positive life).
     assert!(
-        provider.mint_run_token("psn:agent-7", "R2", &caveats, 0).is_err(),
+        provider
+            .mint_run_token("psn:agent-7", "R2", &caveats, 0)
+            .is_err(),
         "a 0-TTL per-run token is refused (never a no-expiry token)"
     );
 }
@@ -100,11 +108,22 @@ fn revoke_is_idempotent_even_on_crash_and_token_auto_expires() {
     let jti = "jti:psn:agent-7:R1";
 
     // first teardown: revoke (lag 0 — teardown == now in this run).
-    assert_eq!(provider.revoke(jti, minted_at, minted_at), 0, "first revoke records the jti (lag 0)");
-    assert!(provider.is_dead(jti, minted_at), "revoked-on-teardown → dead now");
+    assert_eq!(
+        provider.revoke(jti, minted_at, minted_at),
+        0,
+        "first revoke records the jti (lag 0)"
+    );
+    assert!(
+        provider.is_dead(jti, minted_at),
+        "revoked-on-teardown → dead now"
+    );
 
     // a SECOND teardown (a crash-recovery sweep) is a no-op — idempotent even on crash.
-    assert_eq!(provider.revoke(jti, minted_at + 5, minted_at), 0, "a re-revoke is a no-op (idempotent)");
+    assert_eq!(
+        provider.revoke(jti, minted_at + 5, minted_at),
+        0,
+        "a re-revoke is a no-op (idempotent)"
+    );
 
     // belt-and-suspenders: even ABSENT the explicit revoke, the token auto-expires within W.
     let fresh = IdentityRevokeProvider {
@@ -114,5 +133,8 @@ fn revoke_is_idempotent_even_on_crash_and_token_auto_expires() {
     };
     let other = "jti:psn:agent-7:R2";
     assert!(!fresh.is_dead(other, minted_at), "not yet expired before W");
-    assert!(fresh.is_dead(other, minted_at + w), "auto-expires by minted_at + W (≤ W window)");
+    assert!(
+        fresh.is_dead(other, minted_at + w),
+        "auto-expires by minted_at + W (≤ W window)"
+    );
 }

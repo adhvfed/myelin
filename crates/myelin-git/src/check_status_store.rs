@@ -44,10 +44,10 @@
 
 #![cfg(feature = "integration")]
 
-use crate::check_status::{CheckContext, CheckState, CheckStatus, CheckStatusRow, GitOid, TrustTier};
-use crate::merge_gate::{
-    evaluate_merge_gate_row, MergeGateOutcome, MergeGatePolicy, UnmetContext,
+use crate::check_status::{
+    CheckContext, CheckState, CheckStatus, CheckStatusRow, GitOid, TrustTier,
 };
+use crate::merge_gate::{evaluate_merge_gate_row, MergeGateOutcome, MergeGatePolicy, UnmetContext};
 use sqlx::postgres::PgPool;
 use sqlx::Row;
 
@@ -124,7 +124,9 @@ impl PgCheckStatusProjection {
         dedup_table: &str,
         consumer: &str,
     ) -> Result<PgCheckStatusProjection, sqlx::Error> {
-        sqlx::raw_sql(&projection_ddl(table, dedup_table)).execute(&pool).await?;
+        sqlx::raw_sql(&projection_ddl(table, dedup_table))
+            .execute(&pool)
+            .await?;
         Ok(PgCheckStatusProjection {
             pool,
             table: table.to_string(),
@@ -276,11 +278,16 @@ impl PgCheckStatusProjection {
                 crate::check_status::CheckProvider::External => "external",
             };
             // Read Git's OWN projection row for this required (head_oid, context) — never CI.
-            let row = self.current(tenant_id, head_oid, provider, &ctx.name).await?;
+            let row = self
+                .current(tenant_id, head_oid, provider, &ctx.name)
+                .await?;
             let endorsed = endorsed_contexts.contains(ctx);
             // The IDENTICAL classify logic as the in-memory gate (no drift between the DB + memory path).
             if let Some(reason) = evaluate_merge_gate_row(row.as_ref(), endorsed) {
-                unmet.push(UnmetContext { context: ctx.clone(), reason });
+                unmet.push(UnmetContext {
+                    context: ctx.clone(),
+                    reason,
+                });
             }
         }
         Ok(if unmet.is_empty() {
@@ -361,7 +368,9 @@ fn parse_trust(s: &str) -> TrustTier {
     match s {
         "trusted" => TrustTier::Trusted,
         "untrusted_fork" => TrustTier::UntrustedFork,
-        other => panic!("check_status row has an unknown trust_tier {other:?} (corrupt projection)"),
+        other => {
+            panic!("check_status row has an unknown trust_tier {other:?} (corrupt projection)")
+        }
     }
 }
 
@@ -382,7 +391,10 @@ fn decode_row(row: sqlx::postgres::PgRow) -> CheckStatusRow {
     CheckStatusRow {
         tenant: TenantId(row.get::<String, _>("tenant_id")),
         commit_oid: GitOid(row.get::<String, _>("commit_oid")),
-        context: CheckContext { provider, name: row.get::<String, _>("context_name") },
+        context: CheckContext {
+            provider,
+            name: row.get::<String, _>("context_name"),
+        },
         state: parse_state(&row.get::<String, _>("state")),
         run: ArtifactRef(row.get::<String, _>("run_ref")),
         run_attempt: u32::try_from(row.get::<i64, _>("run_attempt"))

@@ -59,7 +59,11 @@ impl OwnerProjectStandIn {
     fn put(&self, ref_: &str, text: &str, fields: BTreeMap<String, FieldValue>) {
         self.projections.lock().unwrap().insert(
             ref_.to_string(),
-            SearchProjection { text: text.into(), fields, lang: None },
+            SearchProjection {
+                text: text.into(),
+                fields,
+                lang: None,
+            },
         );
     }
     fn calls(&self, ref_: &str) -> u32 {
@@ -73,7 +77,12 @@ impl ProjectFetcher for OwnerProjectStandIn {
         _r: &Region,
         ref_: &ArtifactRef,
     ) -> Result<SearchProjection, ProjectFetchError> {
-        *self.calls.lock().unwrap().entry(ref_.0.clone()).or_insert(0) += 1;
+        *self
+            .calls
+            .lock()
+            .unwrap()
+            .entry(ref_.0.clone())
+            .or_insert(0) += 1;
         self.projections
             .lock()
             .unwrap()
@@ -96,7 +105,11 @@ fn event(id: &str, type_: &str, subject: &str) -> EventEnvelope {
         schema_ver: 1,
         tenant: tenant(),
         region: region(),
-        actor: Actor(Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, tenant())),
+        actor: Actor(Principal::stub(
+            PrincipalId("p".into()),
+            PrincipalKind::Human,
+            tenant(),
+        )),
         subject: ArtifactRef(subject.into()),
         aggregate: AggregateKey(format!("agg:{subject}")),
         causation_id: None,
@@ -140,11 +153,22 @@ fn indexer_consumes_via_2_4_and_fetches_via_5_6() {
     let consumer = Consumer::new(indexer.clone(), sub, DedupLedger::new());
 
     let ev = event("01J-1", "issue.issue.created", r);
-    let msg = Message { subject: r.to_string(), envelope: ev };
+    let msg = Message {
+        subject: r.to_string(),
+        envelope: ev,
+    };
 
     // First delivery: the handler fetches the owner projection (5.6) ONCE and indexes the doc.
-    assert_eq!(consumer.deliver(&msg), Delivered::Acked, "first delivery indexes + acks");
-    assert_eq!(owner.calls(r), 1, "the owner's project(ref) was fetched once (5.6 — NOT the DB)");
+    assert_eq!(
+        consumer.deliver(&msg),
+        Delivered::Acked,
+        "first delivery indexes + acks"
+    );
+    assert_eq!(
+        owner.calls(r),
+        1,
+        "the owner's project(ref) was fetched once (5.6 — NOT the DB)"
+    );
 
     // The doc is searchable (the freshness property — SRCH-D7).
     let hits = indexer
@@ -155,9 +179,21 @@ fn indexer_consumes_via_2_4_and_fetches_via_5_6() {
 
     // Redelivery: the dedup ledger absorbs it (2.5) — the handler is SKIPped, the owner is NOT
     // re-fetched, and the index is unchanged (0 dup).
-    assert_eq!(consumer.deliver(&msg), Delivered::Deduplicated, "redelivery is deduped (0 dup)");
-    assert_eq!(owner.calls(r), 1, "the deduped redelivery never re-fetched the owner");
-    assert_eq!(indexer.live_count(&tenant(), &region()), 1, "still exactly one doc");
+    assert_eq!(
+        consumer.deliver(&msg),
+        Delivered::Deduplicated,
+        "redelivery is deduped (0 dup)"
+    );
+    assert_eq!(
+        owner.calls(r),
+        1,
+        "the deduped redelivery never re-fetched the owner"
+    );
+    assert_eq!(
+        indexer.live_count(&tenant(), &region()),
+        1,
+        "still exactly one doc"
+    );
 }
 
 /// **The 5.6 fetch is the ONLY ingest path — a transient owner hiccup RETRIES (0 lost), never a
@@ -182,12 +218,19 @@ fn transient_owner_unavailable_retries_never_fabricates() {
                 *n -= 1;
                 return Err(ProjectFetchError::Unavailable("owner down".into()));
             }
-            Ok(SearchProjection { text: self.text.clone(), fields: BTreeMap::new(), lang: None })
+            Ok(SearchProjection {
+                text: self.text.clone(),
+                fields: BTreeMap::new(),
+                lang: None,
+            })
         }
     }
 
     let r = "myelin://acme/issue/issue/ENG-9";
-    let owner = Arc::new(FlakyOwner { fail_remaining: Mutex::new(1), text: "body".into() });
+    let owner = Arc::new(FlakyOwner {
+        fail_remaining: Mutex::new(1),
+        text: "body".into(),
+    });
     let indexer = IncrementalIndexer::new(
         vec![issue_spec()],
         owner,
@@ -196,9 +239,24 @@ fn transient_owner_unavailable_retries_never_fabricates() {
     let ev = event("01J-9", "issue.issue.created", r);
 
     // First handle: the owner is down → Retry (NOT acked, NOT a poison, NOTHING indexed).
-    assert!(matches!(indexer.handle(&ev), HandleOutcome::Retry(_)), "a transient hiccup retries");
-    assert_eq!(indexer.live_count(&tenant(), &region()), 0, "no fabricated projection on the hiccup");
+    assert!(
+        matches!(indexer.handle(&ev), HandleOutcome::Retry(_)),
+        "a transient hiccup retries"
+    );
+    assert_eq!(
+        indexer.live_count(&tenant(), &region()),
+        0,
+        "no fabricated projection on the hiccup"
+    );
     // Redelivery: the owner is back → Done, the doc indexes (0 lost).
-    assert_eq!(indexer.handle(&ev), HandleOutcome::Done, "the redelivery succeeds");
-    assert_eq!(indexer.live_count(&tenant(), &region()), 1, "0 lost: indexed on the redelivery");
+    assert_eq!(
+        indexer.handle(&ev),
+        HandleOutcome::Done,
+        "the redelivery succeeds"
+    );
+    assert_eq!(
+        indexer.live_count(&tenant(), &region()),
+        1,
+        "0 lost: indexed on the redelivery"
+    );
 }

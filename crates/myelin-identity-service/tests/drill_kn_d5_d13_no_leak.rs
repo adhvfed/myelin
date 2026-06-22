@@ -82,7 +82,14 @@ fn provider(scope: &TenantScope, grants: &[TupleDelta]) -> StoreBackedCheck {
     let index = ReverseIndex::new();
     let consumer = ReverseIndexConsumer::new(index.clone());
     store
-        .write_tuples(scope, &principal(&scope.tenant().0, "p-admin"), grants, None, None, now())
+        .write_tuples(
+            scope,
+            &principal(&scope.tenant().0, "p-admin"),
+            grants,
+            None,
+            None,
+            now(),
+        )
         .expect("seed grants");
     let bus = InProcessBus::new();
     let relay = Relay::new(outbox.clone(), bus.clone(), || Timestamp("t".into()));
@@ -136,12 +143,24 @@ fn kn_d5_blocked_page_absent_from_list_incl_count() {
     // Sanity: the viewer reads home + open, NOT secret (the override narrows the inherited access).
     let can = |obj: &str| {
         matches!(
-            svc.check(&viewer, &Permission("read".into()), &ArtifactRef(obj.into()), &at_latest(), None),
+            svc.check(
+                &viewer,
+                &Permission("read".into()),
+                &ArtifactRef(obj.into()),
+                &at_latest(),
+                None
+            ),
             Ok(Decision::Allow)
         )
     };
-    assert!(can("page:home"), "the viewer reads page:home (direct_reader)");
-    assert!(can("page:open"), "the viewer reads page:open (direct_reader)");
+    assert!(
+        can("page:home"),
+        "the viewer reads page:home (direct_reader)"
+    );
+    assert!(
+        can("page:open"),
+        "the viewer reads page:open (direct_reader)"
+    );
     assert!(
         !can("page:secret"),
         "the - direct_block override narrows inherited access: the viewer does NOT read page:secret"
@@ -150,11 +169,19 @@ fn kn_d5_blocked_page_absent_from_list_incl_count() {
     // THE NO-COUNT-LEAK GUARD: list_objects(read, page) returns the visible pages — and the COUNT
     // (ids.len()) is exactly the visible count. The blocked sub-page is absent from BODY and COUNT.
     let listed = ids_of(
-        svc.list_objects(&viewer, &Permission("read".into()), &ObjectType("page".into()), &at_latest())
-            .expect("list pages"),
+        svc.list_objects(
+            &viewer,
+            &Permission("read".into()),
+            &ObjectType("page".into()),
+            &at_latest(),
+        )
+        .expect("list pages"),
     );
     let leaked_pages = listed.iter().filter(|o| o.0 == "page:secret").count();
-    assert_eq!(leaked_pages, 0, "0 leaked pages: page:secret is ABSENT from the viewer's list (KN-D5)");
+    assert_eq!(
+        leaked_pages, 0,
+        "0 leaked pages: page:secret is ABSENT from the viewer's list (KN-D5)"
+    );
     assert_eq!(
         listed.len(),
         2,
@@ -189,11 +216,22 @@ fn kn_d13_confidential_row_absent_from_list_incl_count() {
     );
     let viewer = principal("acme", "p:viewer");
     let listed = ids_of(
-        svc.list_objects(&viewer, &Permission("read".into()), &ObjectType("database_row".into()), &at_latest())
-            .expect("list rows"),
+        svc.list_objects(
+            &viewer,
+            &Permission("read".into()),
+            &ObjectType("database_row".into()),
+            &at_latest(),
+        )
+        .expect("list rows"),
     );
-    let leaked_rows = listed.iter().filter(|o| o.0 == "database_row:r-confidential").count();
-    assert_eq!(leaked_rows, 0, "0 leaked rows: the confidential row is ABSENT (KN-D13)");
+    let leaked_rows = listed
+        .iter()
+        .filter(|o| o.0 == "database_row:r-confidential")
+        .count();
+    assert_eq!(
+        leaked_rows, 0,
+        "0 leaked rows: the confidential row is ABSENT (KN-D13)"
+    );
     assert_eq!(
         listed.len(),
         2,
@@ -219,13 +257,22 @@ fn kn_d13_confidential_row_absent_from_list_incl_count() {
 #[test]
 fn kn_d5_redacted_field_absent_from_field_count() {
     let s = scope_of(&principal("acme", "p-admin"));
-    let svc = provider(&s, &[add("database_row:emp-1", "direct_reader", "p:viewer")]);
+    let svc = provider(
+        &s,
+        &[add("database_row:emp-1", "direct_reader", "p:viewer")],
+    );
     let viewer = principal("acme", "p:viewer");
     let row = ArtifactRef("database_row:emp-1".into());
 
     // The row is readable (the row ACL).
     assert_eq!(
-        svc.check(&viewer, &Permission("read".into()), &row, &at_latest(), None),
+        svc.check(
+            &viewer,
+            &Permission("read".into()),
+            &row,
+            &at_latest(),
+            None
+        ),
         Ok(Decision::Allow),
         "the viewer reads the row; the field caveat gates a column on top (§8.6)"
     );
@@ -251,8 +298,14 @@ fn kn_d5_redacted_field_absent_from_field_count() {
                 Literal::Int(3),
                 &ctx,
             );
-            svc.check(&viewer, &Permission("view_field".into()), &row, &at_latest(), Some(&cav))
-                .expect("field check")
+            svc.check(
+                &viewer,
+                &Permission("view_field".into()),
+                &row,
+                &at_latest(),
+                Some(&cav),
+            )
+            .expect("field check")
         };
         columns
             .iter()
@@ -267,7 +320,11 @@ fn kn_d5_redacted_field_absent_from_field_count() {
         "an under-cleared viewer projects 1 column (name) — the redacted salary is ABSENT from the count"
     );
     // Cleared (clearance 5): both columns visible.
-    assert_eq!(field_decision(Some(5)), 2, "a cleared viewer projects both columns");
+    assert_eq!(
+        field_decision(Some(5)),
+        2,
+        "a cleared viewer projects both columns"
+    );
     // Missing clearance → salary is Conditional (NOT Allow) → absent from the count (never a silent allow).
     assert_eq!(
         field_decision(None),
@@ -301,7 +358,13 @@ fn kn_d5_cross_tenant_page_access_reads_zero() {
 
     // Sanity: the legitimate acme reader DOES read (within acme's partition).
     assert_eq!(
-        svc.check(&principal("acme", "p:alice"), &Permission("read".into()), &page, &at_latest(), None),
+        svc.check(
+            &principal("acme", "p:alice"),
+            &Permission("read".into()),
+            &page,
+            &at_latest(),
+            None
+        ),
         Ok(Decision::Allow),
         "the legitimate acme reader reads page:home (Id resolves within acme's partition)"
     );
@@ -314,7 +377,13 @@ fn kn_d5_cross_tenant_page_access_reads_zero() {
         let mut attacker = principal("evil-corp", &format!("p:mallory-{i}"));
         attacker.principal_id = PrincipalId("p:alice".into());
         attacker.tenant = TenantId("evil-corp".into());
-        let decision = svc.check(&attacker, &Permission("read".into()), &page, &at_latest(), None);
+        let decision = svc.check(
+            &attacker,
+            &Permission("read".into()),
+            &page,
+            &at_latest(),
+            None,
+        );
         if decision == Ok(Decision::Allow) {
             cross_tenant_reads += 1;
         }

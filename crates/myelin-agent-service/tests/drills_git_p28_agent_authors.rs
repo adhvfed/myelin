@@ -27,9 +27,9 @@
 use myelin_agent::{EffectKind, EffectResult, EventId, ToolDef, ToolName, ToolSurface};
 use myelin_agent_service::{
     gate_id_of, git_author_tool_defs, git_tool_defs, register_git_tools, run_hitl_loop, ApplyError,
-    ApprovedTools, CapabilityCheck, DelegationLookup, EffectBudget, EffectCost, HitlGate, HitlOutcome,
-    HitlWait, PipelineSignals, PlanThenApply, PlannedEffect, RiskSummary, SubsystemApply, TenantGuard,
-    WaitDecision, GIT_MERGE_TOOL, GIT_SUBSYSTEM,
+    ApprovedTools, CapabilityCheck, DelegationLookup, EffectBudget, EffectCost, HitlGate,
+    HitlOutcome, HitlWait, PipelineSignals, PlanThenApply, PlannedEffect, RiskSummary,
+    SubsystemApply, TenantGuard, WaitDecision, GIT_MERGE_TOOL, GIT_SUBSYSTEM,
 };
 use myelin_git::agent_author::{
     AgentAuthorship, Authorship, COMMENT_TOOL, RESOLVE_THREAD_TOOL, SUBMIT_REVIEW_TOOL,
@@ -85,7 +85,9 @@ struct Delegate {
 }
 impl DelegationLookup for Delegate {
     fn delegation(&self, _a: &Principal, _t: &Principal) -> EffectivePolicy {
-        EffectivePolicy { caveats: self.caps.clone() }
+        EffectivePolicy {
+            caveats: self.caps.clone(),
+        }
     }
 }
 
@@ -145,12 +147,19 @@ impl HitlWait for ScriptedWait {
 fn agent() -> Principal {
     Principal::stub(
         PrincipalId("psn:agent-7".into()),
-        PrincipalKind::Agent { runtime_ref: RuntimeRef("mock".into()), on_behalf_of: None },
+        PrincipalKind::Agent {
+            runtime_ref: RuntimeRef("mock".into()),
+            on_behalf_of: None,
+        },
         TenantId("acme".into()),
     )
 }
 fn human() -> Principal {
-    Principal::stub(PrincipalId("psn:human-x".into()), PrincipalKind::Human, TenantId("acme".into()))
+    Principal::stub(
+        PrincipalId("psn:human-x".into()),
+        PrincipalKind::Human,
+        TenantId("acme".into()),
+    )
 }
 
 fn git_catalogue() -> Catalogue {
@@ -168,12 +177,19 @@ fn author_plan(tool: &str, input_json: &str) -> PlannedEffect {
         input_json: input_json.into(),
         field: None,
         transition: None,
-        cost: EffectCost { unit: "agent.effect", wholesale: 1, markup: 1 },
+        cost: EffectCost {
+            unit: "agent.effect",
+            wholesale: 1,
+            markup: 1,
+        },
     }
 }
 
 fn comment_plan() -> PlannedEffect {
-    author_plan(COMMENT_TOOL, r#"{"pull_request":"repo7:42","body":"nit: rename `x`"}"#)
+    author_plan(
+        COMMENT_TOOL,
+        r#"{"pull_request":"repo7:42","body":"nit: rename `x`"}"#,
+    )
 }
 fn review_plan() -> PlannedEffect {
     author_plan(
@@ -188,7 +204,11 @@ fn merge_plan() -> PlannedEffect {
         input_json: r#"{"pull_request":"repo7:42","strategy":"squash"}"#.into(),
         field: None,
         transition: None,
-        cost: EffectCost { unit: "git.merge", wholesale: 30, markup: 20 },
+        cost: EffectCost {
+            unit: "git.merge",
+            wholesale: 30,
+            markup: 20,
+        },
     }
 }
 
@@ -203,8 +223,12 @@ fn apply_once(
     delegated_caps: &[&str],
     approved: BTreeSet<String>,
 ) -> (EffectResult, usize) {
-    let check = AllowCaps { allow: allowed_caps.iter().map(|c| c.to_string()).collect() };
-    let del = Delegate { caps: delegated_caps.iter().map(|c| c.to_string()).collect() };
+    let check = AllowCaps {
+        allow: allowed_caps.iter().map(|c| c.to_string()).collect(),
+    };
+    let del = Delegate {
+        caps: delegated_caps.iter().map(|c| c.to_string()).collect(),
+    };
     let tenant = PermitAll;
     let mut budget = Budget { remaining: 10_000 };
     let mut signals = PipelineSignals::new();
@@ -235,15 +259,38 @@ fn apply_once(
 #[test]
 fn agent_authoring_tools_register_ungated_merge_stays_gated() {
     let cat = git_catalogue();
-    for tool in [COMMENT_TOOL, SUBMIT_REVIEW_TOOL, SUGGEST_CHANGE_TOOL, RESOLVE_THREAD_TOOL] {
-        let def = cat.resolve(&ToolName(tool.into())).unwrap_or_else(|| panic!("{tool} registered"));
+    for tool in [
+        COMMENT_TOOL,
+        SUBMIT_REVIEW_TOOL,
+        SUGGEST_CHANGE_TOOL,
+        RESOLVE_THREAD_TOOL,
+    ] {
+        let def = cat
+            .resolve(&ToolName(tool.into()))
+            .unwrap_or_else(|| panic!("{tool} registered"));
         assert_eq!(def.subsystem, GIT_SUBSYSTEM);
-        assert_eq!(def.effect_kind, EffectKind::Mutate, "{tool} routes through EffectApi");
-        assert!(!def.requires_approval, "{tool} is reversible authoring → NOT gated (§7)");
-        assert_eq!(def.required_caps, vec!["pull_request.review".to_string()], "{tool} cap (4.9)");
+        assert_eq!(
+            def.effect_kind,
+            EffectKind::Mutate,
+            "{tool} routes through EffectApi"
+        );
+        assert!(
+            !def.requires_approval,
+            "{tool} is reversible authoring → NOT gated (§7)"
+        );
+        assert_eq!(
+            def.required_caps,
+            vec!["pull_request.review".to_string()],
+            "{tool} cap (4.9)"
+        );
     }
-    let merge = cat.resolve(&ToolName(GIT_MERGE_TOOL.into())).expect("git.merge registered");
-    assert!(merge.requires_approval, "git.merge stays the consequential gate (§6.3 / AG-8)");
+    let merge = cat
+        .resolve(&ToolName(GIT_MERGE_TOOL.into()))
+        .expect("git.merge registered");
+    assert!(
+        merge.requires_approval,
+        "git.merge stays the consequential gate (§6.3 / AG-8)"
+    );
 }
 
 // ───────── the CHAINED e2e: mock agent opens → comments → reviews → proposes merge → gate ─────────
@@ -256,7 +303,9 @@ fn agent_authoring_tools_register_ungated_merge_stays_gated() {
 #[test]
 fn a_mock_agent_authors_then_proposes_a_gated_merge_zero_mutation_then_one_apply() {
     let cat = git_catalogue();
-    let endpoint = Endpoint { applied: RefCell::new(vec![]) };
+    let endpoint = Endpoint {
+        applied: RefCell::new(vec![]),
+    };
     // the agent's caps: it may push (open PR), review (comment/review), and merge — all inside the
     // delegation intersection (a bounded, first-class author/reviewer).
     let caps = ["repo.push", "pull_request.review", "pull_request.merge"];
@@ -266,34 +315,80 @@ fn a_mock_agent_authors_then_proposes_a_gated_merge_zero_mutation_then_one_apply
     let open_pr = PlannedEffect {
         tool: ToolName("open_pr".into()),
         object: ArtifactRef("myelin://acme/git/repo/repo7".into()),
-        input_json: r#"{"repo":"repo7","source_ref":"agent/fix","target_ref":"main","title":"fix"}"#.into(),
+        input_json:
+            r#"{"repo":"repo7","source_ref":"agent/fix","target_ref":"main","title":"fix"}"#.into(),
         field: None,
         transition: None,
-        cost: EffectCost { unit: "agent.effect", wholesale: 2, markup: 1 },
+        cost: EffectCost {
+            unit: "agent.effect",
+            wholesale: 2,
+            markup: 1,
+        },
     };
     let (r_open, m1) = apply_once(&cat, &endpoint, &open_pr, &caps, &caps, BTreeSet::new());
-    assert!(matches!(r_open, EffectResult::Applied(_)), "the agent opens a PR directly: {r_open:?}");
-    assert_eq!(m1, 1, "open PR applied (no approval) — the agent is a first-class author");
+    assert!(
+        matches!(r_open, EffectResult::Applied(_)),
+        "the agent opens a PR directly: {r_open:?}"
+    );
+    assert_eq!(
+        m1, 1,
+        "open PR applied (no approval) — the agent is a first-class author"
+    );
 
     // 2. COMMENT — reversible authoring → applies DIRECTLY.
-    let (r_comment, m2) =
-        apply_once(&cat, &endpoint, &comment_plan(), &caps, &caps, BTreeSet::new());
-    assert!(matches!(r_comment, EffectResult::Applied(_)), "the agent comments directly: {r_comment:?}");
+    let (r_comment, m2) = apply_once(
+        &cat,
+        &endpoint,
+        &comment_plan(),
+        &caps,
+        &caps,
+        BTreeSet::new(),
+    );
+    assert!(
+        matches!(r_comment, EffectResult::Applied(_)),
+        "the agent comments directly: {r_comment:?}"
+    );
     assert_eq!(m2, 2, "the comment applied (no approval)");
 
     // 3. SUBMIT REVIEW — reversible authoring → applies DIRECTLY. The reviewer is legible (is_agent).
-    let (r_review, m3) = apply_once(&cat, &endpoint, &review_plan(), &caps, &caps, BTreeSet::new());
-    assert!(matches!(r_review, EffectResult::Applied(_)), "the agent submits a review: {r_review:?}");
+    let (r_review, m3) = apply_once(
+        &cat,
+        &endpoint,
+        &review_plan(),
+        &caps,
+        &caps,
+        BTreeSet::new(),
+    );
+    assert!(
+        matches!(r_review, EffectResult::Applied(_)),
+        "the agent submits a review: {r_review:?}"
+    );
     assert_eq!(m3, 3, "the review applied (no approval)");
 
     // 4. PROPOSE MERGE — git.merge is GATED → WITHHELD (0 mutation before approval, AG-8).
-    let (r_merge, m4) = apply_once(&cat, &endpoint, &merge_plan(), &caps, &caps, BTreeSet::new());
+    let (r_merge, m4) = apply_once(
+        &cat,
+        &endpoint,
+        &merge_plan(),
+        &caps,
+        &caps,
+        BTreeSet::new(),
+    );
     let gate_id = gate_id_of(&r_merge).expect("git.merge GATES (the consequential gate)");
-    assert!(matches!(r_merge, EffectResult::Gated(_)), "the agent's merge WITHHOLDS: {r_merge:?}");
-    assert_eq!(m4, 3, "0 MUTATIONS from the merge before approval (AG-D3 / AG-8) — still 3 authored");
+    assert!(
+        matches!(r_merge, EffectResult::Gated(_)),
+        "the agent's merge WITHHOLDS: {r_merge:?}"
+    );
+    assert_eq!(
+        m4, 3,
+        "0 MUTATIONS from the merge before approval (AG-D3 / AG-8) — still 3 authored"
+    );
 
     // 5. PARK on the durable wait → APPROVE → thread into `approved`.
-    let wait = ScriptedWait { decision: WaitDecision::Approve, parked: RefCell::new(0) };
+    let wait = ScriptedWait {
+        decision: WaitDecision::Approve,
+        parked: RefCell::new(0),
+    };
     let mut approved = ApprovedTools::new();
     let outcome = run_hitl_loop(
         gate_id,
@@ -305,17 +400,40 @@ fn a_mock_agent_authors_then_proposes_a_gated_merge_zero_mutation_then_one_apply
         &wait,
         &mut approved,
     );
-    assert_eq!(*wait.parked.borrow(), 1, "the run PARKED on the durable wait (no runtime held)");
-    assert!(matches!(outcome, HitlOutcome::Approved(_)), "approval resumes: {outcome:?}");
+    assert_eq!(
+        *wait.parked.borrow(),
+        1,
+        "the run PARKED on the durable wait (no runtime held)"
+    );
+    assert!(
+        matches!(outcome, HitlOutcome::Approved(_)),
+        "approval resumes: {outcome:?}"
+    );
 
     // 6. RESUME — the approved merge APPLIES EXACTLY ONCE (AG-8: after approval, never before).
-    let (r_merge2, m5) = apply_once(&cat, &endpoint, &merge_plan(), &caps, &caps, approved.as_set());
-    assert!(matches!(r_merge2, EffectResult::Applied(_)), "the approved merge applies: {r_merge2:?}");
-    assert_eq!(m5, 4, "the merge applied EXACTLY ONCE after approval (3 authored + 1 merge)");
+    let (r_merge2, m5) = apply_once(
+        &cat,
+        &endpoint,
+        &merge_plan(),
+        &caps,
+        &caps,
+        approved.as_set(),
+    );
+    assert!(
+        matches!(r_merge2, EffectResult::Applied(_)),
+        "the approved merge applies: {r_merge2:?}"
+    );
+    assert_eq!(
+        m5, 4,
+        "the merge applied EXACTLY ONCE after approval (3 authored + 1 merge)"
+    );
 
     // EVERY mutation landed via the public-endpoint seam (AG-D1 — no write outside EffectApi).
     let applied = endpoint.applied.borrow();
-    assert_eq!(*applied, vec!["open_pr", "comment", "submit_review", "merge"]);
+    assert_eq!(
+        *applied,
+        vec!["open_pr", "comment", "submit_review", "merge"]
+    );
 }
 
 // ───────────────────────── AG-D2 — the effect-intersection denial ─────────────────────────────────
@@ -327,7 +445,9 @@ fn a_mock_agent_authors_then_proposes_a_gated_merge_zero_mutation_then_one_apply
 #[test]
 fn agd2_an_authoring_effect_outside_the_delegation_intersection_is_denied() {
     let cat = git_catalogue();
-    let endpoint = Endpoint { applied: RefCell::new(vec![]) };
+    let endpoint = Endpoint {
+        applied: RefCell::new(vec![]),
+    };
 
     // the check ALLOWS pull_request.review, but the delegation intersection is EMPTY (the run was not
     // delegated the review cap) → the effect is outside the intersection → DENIED.
@@ -348,7 +468,10 @@ fn agd2_an_authoring_effect_outside_the_delegation_intersection_is_denied() {
         }
         other => panic!("expected Denied (outside the intersection), got {other:?}"),
     }
-    assert_eq!(muts, 0, "AG-D2: 0 mutation on an over-privileged authoring effect (no fallback)");
+    assert_eq!(
+        muts, 0,
+        "AG-D2: 0 mutation on an over-privileged authoring effect (no fallback)"
+    );
 }
 
 /// **AG-D2 (capability leg): an authoring effect the `check` DENIES is DENIED (0 mutation).** A run
@@ -357,12 +480,26 @@ fn agd2_an_authoring_effect_outside_the_delegation_intersection_is_denied() {
 #[test]
 fn agd2_an_authoring_effect_without_the_review_cap_is_denied() {
     let cat = git_catalogue();
-    let endpoint = Endpoint { applied: RefCell::new(vec![]) };
+    let endpoint = Endpoint {
+        applied: RefCell::new(vec![]),
+    };
     // neither the check nor the delegation grants pull_request.review.
-    let (result, muts) =
-        apply_once(&cat, &endpoint, &review_plan(), &["repo.pull"], &["repo.pull"], BTreeSet::new());
-    assert!(matches!(result, EffectResult::Denied(_)), "no review cap → Denied: {result:?}");
-    assert_eq!(muts, 0, "AG-D2: 0 mutation without the review cap (same governance as any principal)");
+    let (result, muts) = apply_once(
+        &cat,
+        &endpoint,
+        &review_plan(),
+        &["repo.pull"],
+        &["repo.pull"],
+        BTreeSet::new(),
+    );
+    assert!(
+        matches!(result, EffectResult::Denied(_)),
+        "no review cap → Denied: {result:?}"
+    );
+    assert_eq!(
+        muts, 0,
+        "AG-D2: 0 mutation without the review cap (same governance as any principal)"
+    );
 }
 
 // ───────────────────────── AG-D5 — exactly-once (a double-click is ONE approval) ──────────────────
@@ -373,13 +510,25 @@ fn agd2_an_authoring_effect_without_the_review_cap_is_denied() {
 #[test]
 fn agd5_a_double_click_on_merge_approval_is_one_approval_exactly_once() {
     let cat = git_catalogue();
-    let endpoint = Endpoint { applied: RefCell::new(vec![]) };
+    let endpoint = Endpoint {
+        applied: RefCell::new(vec![]),
+    };
     let caps = ["pull_request.merge"];
 
-    let (r_merge, _) = apply_once(&cat, &endpoint, &merge_plan(), &caps, &caps, BTreeSet::new());
+    let (r_merge, _) = apply_once(
+        &cat,
+        &endpoint,
+        &merge_plan(),
+        &caps,
+        &caps,
+        BTreeSet::new(),
+    );
     let gate_id = gate_id_of(&r_merge).expect("gated");
 
-    let wait = ScriptedWait { decision: WaitDecision::Approve, parked: RefCell::new(0) };
+    let wait = ScriptedWait {
+        decision: WaitDecision::Approve,
+        parked: RefCell::new(0),
+    };
     let mut approved = ApprovedTools::new();
     let outcome = run_hitl_loop(
         gate_id,
@@ -394,16 +543,33 @@ fn agd5_a_double_click_on_merge_approval_is_one_approval_exactly_once() {
     if let HitlOutcome::Approved(ref gate) = outcome {
         approved.admit(gate); // the double-click — already in the set.
         approved.admit(gate); // a triple-click — still ONE approval.
-        assert_eq!(approved.as_set().len(), 1, "a double/triple-click is ONE approval");
+        assert_eq!(
+            approved.as_set().len(),
+            1,
+            "a double/triple-click is ONE approval"
+        );
     } else {
         panic!("expected Approved, got {outcome:?}");
     }
 
     // resume TWICE with the same approved set — each is a clean re-run; but the pipeline applies the
     // merge once per call. (Exactly-once is the per-effect idempotency: the HITL approval is one.)
-    let (r2, m1) = apply_once(&cat, &endpoint, &merge_plan(), &caps, &caps, approved.as_set());
-    assert!(matches!(r2, EffectResult::Applied(_)), "the approved merge applies once: {r2:?}");
-    assert_eq!(m1, 1, "AG-D5: the merge applied exactly once after the single approval");
+    let (r2, m1) = apply_once(
+        &cat,
+        &endpoint,
+        &merge_plan(),
+        &caps,
+        &caps,
+        approved.as_set(),
+    );
+    assert!(
+        matches!(r2, EffectResult::Applied(_)),
+        "the approved merge applies once: {r2:?}"
+    );
+    assert_eq!(
+        m1, 1,
+        "AG-D5: the merge applied exactly once after the single approval"
+    );
 }
 
 // ───────────────────────── legibility (ADR-08 / AI-Act — never disguised as human) ───────────────
@@ -419,13 +585,23 @@ fn an_agent_author_is_legible_never_disguised_as_human() {
         "run:R1",
         "request changes: missing test coverage",
     ));
-    assert!(agent_authored.is_agent(), "the agent reviewer is legibly flagged (is_agent)");
-    let prov = agent_authored.agent_provenance().expect("AI-Act: provenance is REQUIRED");
+    assert!(
+        agent_authored.is_agent(),
+        "the agent reviewer is legibly flagged (is_agent)"
+    );
+    let prov = agent_authored
+        .agent_provenance()
+        .expect("AI-Act: provenance is REQUIRED");
     assert_eq!(prov.run_id, "run:R1", "which run authored this (traceable)");
 
-    let human = Authorship::Human { author_pseudonym: "psn:human-x".into() };
+    let human = Authorship::Human {
+        author_pseudonym: "psn:human-x".into(),
+    };
     assert!(!human.is_agent());
-    assert!(human.agent_provenance().is_none(), "a human author has no agent provenance");
+    assert!(
+        human.agent_provenance().is_none(),
+        "a human author has no agent provenance"
+    );
 }
 
 // ───────────────────────── the 8.1 CDC pair (the registered authoring ToolDefs) ───────────────────
@@ -448,7 +624,10 @@ fn cdc_8_1_authoring_tooldefs_are_the_frozen_shape_with_the_4_9_review_cap() {
 
     // CONSUMER: every registered authoring ToolDef's cap is exactly `pull_request.review`, sourced
     // from the canonical git crate (the cap construction the registration consumes).
-    assert_eq!(review_authoring_required_caps(), vec!["pull_request.review".to_string()]);
+    assert_eq!(
+        review_authoring_required_caps(),
+        vec!["pull_request.review".to_string()]
+    );
     for def in git_author_tool_defs() {
         assert_eq!(
             def.required_caps,
@@ -456,14 +635,31 @@ fn cdc_8_1_authoring_tooldefs_are_the_frozen_shape_with_the_4_9_review_cap() {
             "{}'s cap is the frozen 4.9 pull_request.review permission",
             def.name.0
         );
-        assert_eq!(def.effect_kind, EffectKind::Mutate, "{} is a mutate tool (8.2)", def.name.0);
-        assert!(!def.requires_approval, "{} is reversible authoring → not gated (§7)", def.name.0);
+        assert_eq!(
+            def.effect_kind,
+            EffectKind::Mutate,
+            "{} is a mutate tool (8.2)",
+            def.name.0
+        );
+        assert!(
+            !def.requires_approval,
+            "{} is reversible authoring → not gated (§7)",
+            def.name.0
+        );
     }
 
     // the four authoring tools are present in the full producer surface (the SAME registry — no
     // second governance model; EI-03 §4).
     let all = git_tool_defs();
-    for tool in [COMMENT_TOOL, SUBMIT_REVIEW_TOOL, SUGGEST_CHANGE_TOOL, RESOLVE_THREAD_TOOL] {
-        assert!(all.iter().any(|d| d.name.0 == tool), "{tool} is in the ONE producer surface");
+    for tool in [
+        COMMENT_TOOL,
+        SUBMIT_REVIEW_TOOL,
+        SUGGEST_CHANGE_TOOL,
+        RESOLVE_THREAD_TOOL,
+    ] {
+        assert!(
+            all.iter().any(|d| d.name.0 == tool),
+            "{tool} is in the ONE producer surface"
+        );
     }
 }

@@ -25,7 +25,9 @@ use myelin_events::{
     Actor, AggregateKey, ArtifactRef, CausedBy, CorrelationId, DataRole, EventEnvelope, EventId,
     EventType, Timestamp, Visibility,
 };
-use myelin_harness::{Dependency, DependencyBreaker, Label, Predicate, Scope, SignalName, SignalSource};
+use myelin_harness::{
+    Dependency, DependencyBreaker, Label, Predicate, Scope, SignalName, SignalSource,
+};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_query::{
     DispatchError, DispatchRequest, DispatchTarget, DispatchTier, Disposition, InMemoryCostGate,
@@ -36,7 +38,11 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 
 fn principal(id: &str) -> Principal {
-    Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, TenantId("t1".into()))
+    Principal::stub(
+        PrincipalId(id.into()),
+        PrincipalKind::Human,
+        TenantId("t1".into()),
+    )
 }
 
 fn event(n: u64) -> EventEnvelope {
@@ -134,24 +140,47 @@ fn bus_d1_kill_consumer_sever_broker_zero_lost_zero_duplicate_on_reconnect() {
         .changed());
     let mut pending: Vec<u64> = Vec::new();
     for &n in &backlog {
-        match tier.dispatch(&req(n), || EventId(format!("act-{n}")), &Timestamp("2026-06-20T00:00:01Z".into())) {
+        match tier.dispatch(
+            &req(n),
+            || EventId(format!("act-{n}")),
+            &Timestamp("2026-06-20T00:00:01Z".into()),
+        ) {
             Disposition::Delivered { .. } => panic!("should not deliver while the broker is down"),
             Disposition::BreakerShed { .. } => pending.push(n), // surfaced, queued for re-drive
             o => panic!("unexpected disposition {o:?}"),
         }
     }
-    assert_eq!(pending.len(), backlog.len(), "0 lost: every dispatch is queued for re-drive");
-    assert_eq!(*tier.target().effect_count.borrow(), 0, "no effect landed while the broker was down");
+    assert_eq!(
+        pending.len(),
+        backlog.len(),
+        "0 lost: every dispatch is queued for re-drive"
+    );
+    assert_eq!(
+        *tier.target().effect_count.borrow(),
+        0,
+        "no effect landed while the broker was down"
+    );
 
     // LEG 2 — restore the broker (reconnect). Re-drive the pending backlog AND replay the first two
     // (the at-least-once redelivery that BUS-D1 must dedup) — the inbox dedups by event_id.
     assert!(breaker
         .restore_dependency(Dependency::Broker, Scope::Tenant(t1.clone()))
         .changed());
-    let redrive: Vec<u64> = pending.iter().copied().chain([backlog[0], backlog[1]]).collect();
+    let redrive: Vec<u64> = pending
+        .iter()
+        .copied()
+        .chain([backlog[0], backlog[1]])
+        .collect();
     for n in redrive {
-        let disp = tier.dispatch(&req(n), || EventId(format!("act-{n}")), &Timestamp("2026-06-20T00:00:01Z".into()));
-        assert!(matches!(disp, Disposition::Delivered { .. }), "reconnect delivers");
+        let disp = tier.dispatch(
+            &req(n),
+            || EventId(format!("act-{n}")),
+            &Timestamp("2026-06-20T00:00:01Z".into()),
+        );
+        assert!(
+            matches!(disp, Disposition::Delivered { .. }),
+            "reconnect delivers"
+        );
     }
 
     // GATE: 0 lost (every distinct dispatch landed) + 0 duplicate (the at-least-once redelivery of
@@ -166,7 +195,11 @@ fn bus_d1_kill_consumer_sever_broker_zero_lost_zero_duplicate_on_reconnect() {
     // The §10.2 ConsumerLag survival signal drains to 0 after reconnect.
     let mut src = SignalSource::new();
     let lag = backlog.len() as i64 - tier.target().landed.borrow().len() as i64;
-    src.set_labelled(SignalName::ConsumerLag, vec![Label::new("consumer", "dispatch-tier")], lag);
+    src.set_labelled(
+        SignalName::ConsumerLag,
+        vec![Label::new("consumer", "dispatch-tier")],
+        lag,
+    );
     src.assert_labelled(
         SignalName::ConsumerLag,
         vec![Label::new("consumer", "dispatch-tier")],

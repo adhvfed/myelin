@@ -34,22 +34,22 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use myelin_events::{
-    Actor, AggregateKey, CorrelationId, DataRole, EmitContextBase, EventEnvelope, EventId, EventType,
-    OutboxStore, ReindexSource, SnapshotScope, Timestamp, Visibility,
-};
 use myelin_events::reindex::ReferenceReindexSource;
+use myelin_events::{
+    Actor, AggregateKey, CorrelationId, DataRole, EmitContextBase, EventEnvelope, EventId,
+    EventType, OutboxStore, ReindexSource, SnapshotScope, Timestamp, Visibility,
+};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_query::{FieldValue, OrderKey};
 use myelin_tenancy::{ArtifactRef, Region, TenantId};
 
+use myelin_content::{parse_inline, Block, HeadingLevel};
 use myelin_search::{
     block_subdoc_projection, db_field_subdoc_projection, db_row_subdoc_projection,
     line_range_subdoc_projection, AclFilter, AnchorState, ContentAnchoredSpan, IncrementalIndexer,
     IndexSpec, MockEmbeddingAdapter, ProjectFetchError, ProjectFetcher, SearchProjection,
     SearchReindexer, SubGrain, FACET_ANCHOR_STATE, FACET_LINE_START,
 };
-use myelin_content::{parse_inline, Block, HeadingLevel};
 
 // ----------------------------------------------------------------------------------------------
 // fixtures
@@ -162,13 +162,23 @@ fn doc_block_sub_anchor_resolves_at_block_grain() {
     };
     fetcher.put(block_ref, block_subdoc_projection(&block, Some("en")));
 
-    ix.index(&created_event("knowledge.page.updated", block_ref)).expect("index block sub-doc");
-    assert_eq!(ix.live_count(&tenant(), &region()), 1, "the block sub-doc is indexed");
+    ix.index(&created_event("knowledge.page.updated", block_ref))
+        .expect("index block sub-doc");
+    assert_eq!(
+        ix.live_count(&tenant(), &region()),
+        1,
+        "the block sub-doc is indexed"
+    );
 
     // A query hits the block sub-doc; the doc_id is the SUB-PRECISE ref (the `#b9` is kept).
-    let hits = ix.search_ft(&tenant(), &region(), &AclFilter::All, "deadlock", 10).expect("ft");
+    let hits = ix
+        .search_ft(&tenant(), &region(), &AclFilter::All, "deadlock", 10)
+        .expect("ft");
     assert_eq!(hits.len(), 1, "the block is searchable at block grain");
-    assert_eq!(hits[0].doc_id, block_ref, "the doc_id keeps the #b9 (sub-precise, §3.1)");
+    assert_eq!(
+        hits[0].doc_id, block_ref,
+        "the doc_id keeps the #b9 (sub-precise, §3.1)"
+    );
 
     // The classifier confirms the grain (the frozen grammar).
     assert_eq!(
@@ -191,7 +201,8 @@ fn kn_db_row_sub_anchor_resolves_at_row_grain() {
         db_row_subdoc_projection(&fields, "a row about the P0 incident", Some(ok)),
     );
 
-    ix.index(&created_event("knowledge.db_row.created", row_ref)).expect("index row sub-doc");
+    ix.index(&created_event("knowledge.db_row.created", row_ref))
+        .expect("index row sub-doc");
     assert_eq!(ix.live_count(&tenant(), &region()), 1);
 
     // The structured facet (priority == P0) hits the row sub-doc (the GIN-scan path), ACL-filtered.
@@ -205,10 +216,19 @@ fn kn_db_row_sub_anchor_resolves_at_row_grain() {
             10,
         )
         .expect("structured");
-    assert_eq!(hits.len(), 1, "the row is found by its typed facet at row grain");
-    assert_eq!(hits[0].doc_id, row_ref, "the doc_id keeps the #row-r7 (sub-precise)");
+    assert_eq!(
+        hits.len(),
+        1,
+        "the row is found by its typed facet at row grain"
+    );
+    assert_eq!(
+        hits[0].doc_id, row_ref,
+        "the doc_id keeps the #row-r7 (sub-precise)"
+    );
     // The row's full-text is searchable too.
-    let ft = ix.search_ft(&tenant(), &region(), &AclFilter::All, "incident", 10).expect("ft");
+    let ft = ix
+        .search_ft(&tenant(), &region(), &AclFilter::All, "incident", 10)
+        .expect("ft");
     assert_eq!(ft.len(), 1);
 }
 
@@ -220,10 +240,15 @@ fn kn_field_sub_anchor_resolves_at_field_grain() {
     let field_ref = "myelin://acme/knowledge/db_row/tasks:r7#field-priority";
     fetcher.put(
         field_ref,
-        db_field_subdoc_projection("priority", FieldValue::Select("P0".into()), "priority is P0"),
+        db_field_subdoc_projection(
+            "priority",
+            FieldValue::Select("P0".into()),
+            "priority is P0",
+        ),
     );
 
-    ix.index(&created_event("knowledge.db_row.updated", field_ref)).expect("index field sub-doc");
+    ix.index(&created_event("knowledge.db_row.updated", field_ref))
+        .expect("index field sub-doc");
     let hits = ix
         .search_structured(
             &tenant(),
@@ -235,7 +260,10 @@ fn kn_field_sub_anchor_resolves_at_field_grain() {
         )
         .expect("structured");
     assert_eq!(hits.len(), 1, "the field sub-doc is found at field grain");
-    assert_eq!(hits[0].doc_id, field_ref, "the doc_id keeps the #field-priority");
+    assert_eq!(
+        hits[0].doc_id, field_ref,
+        "the doc_id keeps the #field-priority"
+    );
     assert_eq!(
         SubGrain::classify(&ArtifactRef(field_ref.into())),
         SubGrain::Field("priority".into())
@@ -261,13 +289,23 @@ fn git_line_range_sub_anchor_resolves_at_span_grain_content_anchored() {
     };
     fetcher.put(lr_ref, line_range_subdoc_projection(&span));
 
-    ix.index(&created_event("git.blob.indexed", lr_ref)).expect("index line-range sub-doc");
+    ix.index(&created_event("git.blob.indexed", lr_ref))
+        .expect("index line-range sub-doc");
     assert_eq!(ix.live_count(&tenant(), &region()), 1);
 
     // The span is code-searchable (a symbol query hits the line-range sub-doc).
-    let hits = ix.search_ft(&tenant(), &region(), &AclFilter::All, "detectdeadlock", 10).expect("ft");
-    assert_eq!(hits.len(), 1, "the line-range span is code-searchable at span grain");
-    assert_eq!(hits[0].doc_id, lr_ref, "the doc_id keeps the #L42-L45 (sub-precise)");
+    let hits = ix
+        .search_ft(&tenant(), &region(), &AclFilter::All, "detectdeadlock", 10)
+        .expect("ft");
+    assert_eq!(
+        hits.len(),
+        1,
+        "the line-range span is code-searchable at span grain"
+    );
+    assert_eq!(
+        hits[0].doc_id, lr_ref,
+        "the doc_id keeps the #L42-L45 (sub-precise)"
+    );
 
     // The re-derived endpoint is stamped (the owner's resolve, never a stored raw line).
     let by_state = ix
@@ -280,7 +318,11 @@ fn git_line_range_sub_anchor_resolves_at_span_grain_content_anchored() {
             10,
         )
         .expect("structured");
-    assert_eq!(by_state.len(), 1, "the anchor state is a typed facet (exact)");
+    assert_eq!(
+        by_state.len(),
+        1,
+        "the anchor state is a typed facet (exact)"
+    );
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -314,7 +356,11 @@ fn chained_force_push_line_range_re_derives_through_a_scoped_reindex() {
     // The owner truth: a single Git blob aggregate at the line-range scope. The reference owner replays
     // the sub-doc as `myelin://t/git/blob/<agg>` — mirror that for the fetcher key.
     let mut src = ReferenceReindexSource::new("git", "blob");
-    src.upsert("repo:main:src/scheduler/deadlock.rs#L42-L45", 1, serde_json::json!({ "kind": "blob" }));
+    src.upsert(
+        "repo:main:src/scheduler/deadlock.rs#L42-L45",
+        1,
+        serde_json::json!({ "kind": "blob" }),
+    );
     let snapshot_ref = "myelin://t/git/blob/repo:main:src/scheduler/deadlock.rs#L42-L45";
 
     let (ix, fetcher) = indexer();
@@ -338,7 +384,11 @@ fn chained_force_push_line_range_re_derives_through_a_scoped_reindex() {
     reindexer
         .reindex(&tenant(), &scope, None, &[&src], &mut outbox, ctx_base())
         .expect("initial index");
-    assert_eq!(ix.live_count(&tenant(), &region()), 1, "the line-range sub-doc is indexed");
+    assert_eq!(
+        ix.live_count(&tenant(), &region()),
+        1,
+        "the line-range sub-doc is indexed"
+    );
 
     // The indexed line-range starts at the minted position (42) — the BEFORE state.
     let pre = ix
@@ -380,10 +430,21 @@ fn chained_force_push_line_range_re_derives_through_a_scoped_reindex() {
     );
     let mut outbox2 = OutboxStore::new();
     let job = reindexer
-        .reindex(&tenant(), &scope, None, &[&src_after], &mut outbox2, ctx_base())
+        .reindex(
+            &tenant(),
+            &scope,
+            None,
+            &[&src_after],
+            &mut outbox2,
+            ctx_base(),
+        )
         .expect("scoped reindex after force-push");
     assert!(job.is_done());
-    assert_eq!(ix.live_count(&tenant(), &region()), 1, "still exactly one line-range sub-doc");
+    assert_eq!(
+        ix.live_count(&tenant(), &region()),
+        1,
+        "still exactly one line-range sub-doc"
+    );
 
     // ---- THE CONTENT-ANCHORING INVARIANT ----
     // The re-derived line-range is at the NEW position (60) — the stale 42 is GONE (never stored).
@@ -397,7 +458,10 @@ fn chained_force_push_line_range_re_derives_through_a_scoped_reindex() {
             10,
         )
         .expect("structured stale");
-    assert!(stale.is_empty(), "the STALE raw line number (42) is GONE — content-anchored, not positional");
+    assert!(
+        stale.is_empty(),
+        "the STALE raw line number (42) is GONE — content-anchored, not positional"
+    );
 
     let fresh = ix
         .search_structured(
@@ -409,8 +473,15 @@ fn chained_force_push_line_range_re_derives_through_a_scoped_reindex() {
             10,
         )
         .expect("structured fresh");
-    assert_eq!(fresh.len(), 1, "the span RE-DERIVES to the shifted position (60) through the owner's resolve");
-    assert_eq!(fresh[0].doc_id, snapshot_ref, "the same sub-precise doc_id, re-derived span");
+    assert_eq!(
+        fresh.len(),
+        1,
+        "the span RE-DERIVES to the shifted position (60) through the owner's resolve"
+    );
+    assert_eq!(
+        fresh[0].doc_id, snapshot_ref,
+        "the same sub-precise doc_id, re-derived span"
+    );
 
     // The anchor state now flags `rebased` (the hit renders the `moved` flag from the CURRENT resolve).
     let moved = ix
@@ -423,10 +494,20 @@ fn chained_force_push_line_range_re_derives_through_a_scoped_reindex() {
             10,
         )
         .expect("structured moved");
-    assert_eq!(moved.len(), 1, "the re-derived span is flagged `rebased` (moved)");
+    assert_eq!(
+        moved.len(),
+        1,
+        "the re-derived span is flagged `rebased` (moved)"
+    );
     // The span content is still code-searchable after the re-derive.
-    let ft = ix.search_ft(&tenant(), &region(), &AclFilter::All, "detectdeadlock", 10).expect("ft");
-    assert_eq!(ft.len(), 1, "the span content is still searchable post-force-push");
+    let ft = ix
+        .search_ft(&tenant(), &region(), &AclFilter::All, "detectdeadlock", 10)
+        .expect("ft");
+    assert_eq!(
+        ft.len(),
+        1,
+        "the span content is still searchable post-force-push"
+    );
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -469,14 +550,24 @@ fn srch_d5_git_kn_subartifact_reindex_parity_cold_equals_live() {
     fetcher.put(&lr_snap, line_range_subdoc_projection(&span));
 
     // LIVE: ingest both sub-docs through the ordinary `*.created`/`*.indexed` path.
-    ix.index(&created_event("knowledge.page.updated", &block_snap)).expect("live block");
-    ix.index(&created_event("git.blob.indexed", &lr_snap)).expect("live line-range");
+    ix.index(&created_event("knowledge.page.updated", &block_snap))
+        .expect("live block");
+    ix.index(&created_event("git.blob.indexed", &lr_snap))
+        .expect("live line-range");
     let live_count = ix.live_count(&tenant(), &region());
-    let live_raft = ix.search_ft(&tenant(), &region(), &AclFilter::All, "raft", 10).expect("live raft");
-    let live_paxos = ix.search_ft(&tenant(), &region(), &AclFilter::All, "paxosround", 10).expect("live paxos");
+    let live_raft = ix
+        .search_ft(&tenant(), &region(), &AclFilter::All, "raft", 10)
+        .expect("live raft");
+    let live_paxos = ix
+        .search_ft(&tenant(), &region(), &AclFilter::All, "paxosround", 10)
+        .expect("live paxos");
     assert_eq!(live_count, 2, "the live index holds both sub-docs");
     assert_eq!(live_raft.len(), 1, "the KN block sub-doc is searchable");
-    assert_eq!(live_paxos.len(), 1, "the Git line-range sub-doc is searchable");
+    assert_eq!(
+        live_paxos.len(),
+        1,
+        "the Git line-range sub-doc is searchable"
+    );
 
     // COLD: wipe + reindex-from-source (both owners) through the live consumer path. A full reindex
     // (`since = None`) WIPES the whole per-tenant index, so we wipe ONCE on the first owner (knowledge),
@@ -488,22 +579,51 @@ fn srch_d5_git_kn_subartifact_reindex_parity_cold_equals_live() {
     let git_scope = SnapshotScope::new("git", "blob:all");
     let mut kn_outbox = OutboxStore::new();
     let kn_job = reindexer
-        .reindex(&tenant(), &kn_scope, None, sources, &mut kn_outbox, ctx_base())
+        .reindex(
+            &tenant(),
+            &kn_scope,
+            None,
+            sources,
+            &mut kn_outbox,
+            ctx_base(),
+        )
         .expect("reindex KN (wipes once)");
     assert!(kn_job.is_done());
     let mut git_outbox = OutboxStore::new();
     let git_job = reindexer
-        .reindex(&tenant(), &git_scope, Some(0), sources, &mut git_outbox, ctx_base())
+        .reindex(
+            &tenant(),
+            &git_scope,
+            Some(0),
+            sources,
+            &mut git_outbox,
+            ctx_base(),
+        )
         .expect("backfill git (appends, no re-wipe)");
     assert!(git_job.is_done());
 
     // PARITY: cold == live (doc count + the same sub-docs searchable + the re-derived line-range).
     let cold_count = ix.live_count(&tenant(), &region());
-    let cold_raft = ix.search_ft(&tenant(), &region(), &AclFilter::All, "raft", 10).expect("cold raft");
-    let cold_paxos = ix.search_ft(&tenant(), &region(), &AclFilter::All, "paxosround", 10).expect("cold paxos");
-    assert_eq!(cold_count, live_count, "cold-rebuilt doc count == live (SRCH-D5)");
-    assert_eq!(cold_raft.len(), live_raft.len(), "the KN block sub-doc is searchable in the cold rebuild");
-    assert_eq!(cold_paxos.len(), live_paxos.len(), "the Git line-range sub-doc is searchable in the cold rebuild");
+    let cold_raft = ix
+        .search_ft(&tenant(), &region(), &AclFilter::All, "raft", 10)
+        .expect("cold raft");
+    let cold_paxos = ix
+        .search_ft(&tenant(), &region(), &AclFilter::All, "paxosround", 10)
+        .expect("cold paxos");
+    assert_eq!(
+        cold_count, live_count,
+        "cold-rebuilt doc count == live (SRCH-D5)"
+    );
+    assert_eq!(
+        cold_raft.len(),
+        live_raft.len(),
+        "the KN block sub-doc is searchable in the cold rebuild"
+    );
+    assert_eq!(
+        cold_paxos.len(),
+        live_paxos.len(),
+        "the Git line-range sub-doc is searchable in the cold rebuild"
+    );
     // The re-derived content-anchored line-range survives the rebuild (still at its resolved position).
     let lr = ix
         .search_structured(
@@ -515,7 +635,11 @@ fn srch_d5_git_kn_subartifact_reindex_parity_cold_equals_live() {
             10,
         )
         .expect("structured cold line-range");
-    assert_eq!(lr.len(), 1, "the content-anchored line-range re-derives in the cold rebuild (SRCH-D5)");
+    assert_eq!(
+        lr.len(),
+        1,
+        "the content-anchored line-range re-derives in the cold rebuild (SRCH-D5)"
+    );
 }
 
 /// **The Search half of E2E-1 behaviour proven in-context: a hit on a confidential sub-doc resolves to
@@ -526,19 +650,36 @@ fn srch_d5_git_kn_subartifact_reindex_parity_cold_equals_live() {
 fn e2e1_confidential_sub_doc_is_a_tombstone_zero_leak() {
     let (ix, fetcher) = indexer();
     let block_ref = "myelin://acme/knowledge/page/secret#b1";
-    let block = Block::Paragraph { inline: parse_inline("the confidential merger terms", &[]) };
+    let block = Block::Paragraph {
+        inline: parse_inline("the confidential merger terms", &[]),
+    };
     fetcher.put(block_ref, block_subdoc_projection(&block, Some("en")));
-    ix.index(&created_event("knowledge.page.updated", block_ref)).expect("index secret block");
+    ix.index(&created_event("knowledge.page.updated", block_ref))
+        .expect("index secret block");
 
     // A viewer with NO grant: the ACL pre-filter admits NOTHING (the parent page is unreachable). The
     // confidential block sub-doc never appears in any result, incl. the count.
     let denied = AclFilter::None;
-    let hits = ix.search_ft(&tenant(), &region(), &denied, "merger", 10).expect("ft denied");
-    assert!(hits.is_empty(), "0 leak: the confidential sub-doc never appears (incl. count) without a grant");
+    let hits = ix
+        .search_ft(&tenant(), &region(), &denied, "merger", 10)
+        .expect("ft denied");
+    assert!(
+        hits.is_empty(),
+        "0 leak: the confidential sub-doc never appears (incl. count) without a grant"
+    );
 
     // A grant on the PARENT page (the ACL pins on the #sub-stripped parent, §3.1) ⇒ the block appears.
     let granted = AclFilter::ids(["myelin://acme/knowledge/page/secret"]);
-    let ok = ix.search_ft(&tenant(), &region(), &granted, "merger", 10).expect("ft granted");
-    assert_eq!(ok.len(), 1, "a grant on the parent page makes the block sub-doc reachable (the ACL, not a deny)");
-    assert_eq!(ok[0].doc_id, block_ref, "the sub-precise doc_id resolves once reachable");
+    let ok = ix
+        .search_ft(&tenant(), &region(), &granted, "merger", 10)
+        .expect("ft granted");
+    assert_eq!(
+        ok.len(),
+        1,
+        "a grant on the parent page makes the block sub-doc reachable (the ACL, not a deny)"
+    );
+    assert_eq!(
+        ok[0].doc_id, block_ref,
+        "the sub-precise doc_id resolves once reachable"
+    );
 }

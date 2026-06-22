@@ -300,9 +300,15 @@ mod tests {
             );
         }
         for ty in ["space", "page", "block", "database_row"] {
-            assert!(eng.object_types().contains(&ty.to_string()), "`{ty}` is admitted");
+            assert!(
+                eng.object_types().contains(&ty.to_string()),
+                "`{ty}` is admitted"
+            );
         }
-        assert!(eng.resolve_permission("page", READ).is_some(), "page.read is a compiled permission");
+        assert!(
+            eng.resolve_permission("page", READ).is_some(),
+            "page.read is a compiled permission"
+        );
         assert!(
             eng.resolve_permission("database_row", READ).is_some(),
             "database_row.read is a compiled permission (the row-level ACL)"
@@ -332,8 +338,14 @@ mod tests {
                 // The base is the inheritance ∪ direct grant union.
                 match &**base {
                     Userset::Union(arms) => {
-                        assert!(arms.contains(&ttu("parent_page", READ)), "inherits parent_page->read");
-                        assert!(arms.contains(&rel(DIRECT_READER)), "unions the direct_reader grant");
+                        assert!(
+                            arms.contains(&ttu("parent_page", READ)),
+                            "inherits parent_page->read"
+                        );
+                        assert!(
+                            arms.contains(&rel(DIRECT_READER)),
+                            "unions the direct_reader grant"
+                        );
                     }
                     other => panic!("page.read base must be the inheritance union, got {other:?}"),
                 }
@@ -366,8 +378,14 @@ mod tests {
     fn watchable_knowledge_types_declare_the_watcher_relation() {
         assert!(space_fragment().is_watchable(), "space is watchable");
         assert!(page_fragment().is_watchable(), "page is watchable");
-        assert!(database_row_fragment().is_watchable(), "database_row is watchable");
-        assert!(!block_fragment().is_watchable(), "block is not independently watchable");
+        assert!(
+            database_row_fragment().is_watchable(),
+            "database_row is watchable"
+        );
+        assert!(
+            !block_fragment().is_watchable(),
+            "block is not independently watchable"
+        );
     }
 
     /// **The field-view caveat is a NON-LITERAL predicate over the ONE `QueryAst` core, and a violated
@@ -389,7 +407,11 @@ mod tests {
             Literal::Int(3),
             &[("clearance", Literal::Int(4))],
         );
-        assert_eq!(eval_caveat(&cleared), Decision::Allow, "cleared viewer sees the salary column");
+        assert_eq!(
+            eval_caveat(&cleared),
+            Decision::Allow,
+            "cleared viewer sees the salary column"
+        );
 
         // The under-cleared viewer: clearance 1 < threshold 3 → the column is REDACTED (Deny) — it is
         // absent from the viewer's projection AND any count (no count leak).
@@ -401,7 +423,11 @@ mod tests {
             Literal::Int(3),
             &[("clearance", Literal::Int(1))],
         );
-        assert_eq!(eval_caveat(&blocked), Decision::Deny, "under-cleared viewer's salary column is redacted");
+        assert_eq!(
+            eval_caveat(&blocked),
+            Decision::Deny,
+            "under-cleared viewer's salary column is redacted"
+        );
 
         // The viewer whose clearance is NOT supplied → Conditional (the caller supplies it) — NEVER a
         // silent Allow (the mutation-tested mandatory-core branch).
@@ -427,12 +453,20 @@ mod tests {
     fn no_knowledge_name_smuggles_an_object_id() {
         let mints = |s: &str| s.contains(':') || s.contains('/') || s.contains('#');
         for f in knowledge_fragment() {
-            assert!(!mints(&f.object_type.0), "type `{}` is a bare identifier", f.object_type.0);
+            assert!(
+                !mints(&f.object_type.0),
+                "type `{}` is a bare identifier",
+                f.object_type.0
+            );
             for r in &f.relations {
                 assert!(!mints(&r.0), "relation `{}` is a bare identifier", r.0);
             }
             for p in &f.permissions {
-                assert!(!mints(&p.permission.0), "permission `{}` is a bare identifier", p.permission.0);
+                assert!(
+                    !mints(&p.permission.0),
+                    "permission `{}` is a bare identifier",
+                    p.permission.0
+                );
             }
         }
     }

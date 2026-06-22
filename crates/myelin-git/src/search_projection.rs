@@ -156,7 +156,10 @@ mod tests {
     #[test]
     fn spec_is_gits_owned_6_3_shape() {
         let s = git_code_projection_spec();
-        assert_eq!(s.subsystem, "git", "git owns the `git` subsystem projection");
+        assert_eq!(
+            s.subsystem, "git",
+            "git owns the `git` subsystem projection"
+        );
         assert_eq!(s.type_, "blob", "the indexed artifact type is a blob");
         assert_eq!(
             s.acl_object_type, "repo",
@@ -167,9 +170,16 @@ mod tests {
             crate::rebac_fragment::object_types::REPO,
             "the acl_object_type is exactly git's frozen ReBAC `repo` object type"
         );
-        assert!(!s.semantic, "code is trigram/symbol full-text, not vector-embedded in v1 (GF-3)");
+        assert!(
+            !s.semantic,
+            "code is trigram/symbol full-text, not vector-embedded in v1 (GF-3)"
+        );
         // The structured facets: path / language / blob_oid (the columnar filter shape).
-        assert_eq!(s.struct_fields.len(), 3, "exactly the three structured code facets");
+        assert_eq!(
+            s.struct_fields.len(),
+            3,
+            "exactly the three structured code facets"
+        );
         assert_eq!(s.struct_fields.get("path"), Some(&FieldType::Text));
         assert_eq!(s.struct_fields.get("language"), Some(&FieldType::Text));
         assert_eq!(s.struct_fields.get("blob_oid"), Some(&FieldType::Text));
@@ -204,7 +214,13 @@ mod tests {
         keys.sort_unstable();
         assert_eq!(
             keys,
-            vec!["acl_object_type", "semantic", "struct_fields", "subsystem", "type"],
+            vec![
+                "acl_object_type",
+                "semantic",
+                "struct_fields",
+                "subsystem",
+                "type"
+            ],
             "the 6.3 wire key set"
         );
 
@@ -226,6 +242,10 @@ mod tests {
     #[test]
     fn registration_is_accepted_by_search() {
         let accepted = register_git_code_projection_spec();
-        assert_eq!(accepted, git_code_projection_spec(), "Search accepts the declared spec verbatim");
+        assert_eq!(
+            accepted,
+            git_code_projection_spec(),
+            "Search accepts the declared spec verbatim"
+        );
     }
 }

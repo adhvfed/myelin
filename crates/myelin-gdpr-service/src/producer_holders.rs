@@ -106,7 +106,7 @@ use std::sync::Mutex;
 
 use myelin_gdpr::{
     EraseReceipt, EraseScope, LocateReport, Patch, PersonalDataHolder, PortableBundle, Receipt,
-    RectifyReceipt, Result as DsrResult, RestrictReceipt, SubjectRef, TenantId,
+    RectifyReceipt, RestrictReceipt, Result as DsrResult, SubjectRef, TenantId,
 };
 use myelin_substrate::{Holder, HolderRegistration, StoreKind};
 use myelin_tenancy::Region;
@@ -189,21 +189,30 @@ pub fn producer_holder_schemas(region: Region) -> Vec<HolderSchema> {
     vec![
         // H1 — Git subsystem DB.
         HolderSchema {
-            registration: HolderRegistration { kind: StoreKind::Oltp, name: producer_holder_ids::GIT_DB },
+            registration: HolderRegistration {
+                kind: StoreKind::Oltp,
+                name: producer_holder_ids::GIT_DB,
+            },
             holder: Holder::H1Git,
             region: region.clone(),
             fields: &[],
         },
         // H4 — Knowledge subsystem DB.
         HolderSchema {
-            registration: HolderRegistration { kind: StoreKind::Oltp, name: producer_holder_ids::KNOWLEDGE_DB },
+            registration: HolderRegistration {
+                kind: StoreKind::Oltp,
+                name: producer_holder_ids::KNOWLEDGE_DB,
+            },
             holder: Holder::H4Knowledge,
             region: region.clone(),
             fields: &[],
         },
         // H17 — the agent execution trace (a content-addressed Knowledge doc of a run's trace).
         HolderSchema {
-            registration: HolderRegistration { kind: StoreKind::Oltp, name: producer_holder_ids::AGENT_TRACE },
+            registration: HolderRegistration {
+                kind: StoreKind::Oltp,
+                name: producer_holder_ids::AGENT_TRACE,
+            },
             holder: Holder::H17AgentTrace,
             region,
             fields: &[],
@@ -217,9 +226,18 @@ pub fn producer_holder_schemas(region: Region) -> Vec<HolderSchema> {
 /// coverage gap; once [`producer_holder_schemas`] contributes them, the gap closes.
 pub fn producer_registrations() -> Vec<HolderRegistration> {
     vec![
-        HolderRegistration { kind: StoreKind::Oltp, name: producer_holder_ids::GIT_DB },
-        HolderRegistration { kind: StoreKind::Oltp, name: producer_holder_ids::KNOWLEDGE_DB },
-        HolderRegistration { kind: StoreKind::Oltp, name: producer_holder_ids::AGENT_TRACE },
+        HolderRegistration {
+            kind: StoreKind::Oltp,
+            name: producer_holder_ids::GIT_DB,
+        },
+        HolderRegistration {
+            kind: StoreKind::Oltp,
+            name: producer_holder_ids::KNOWLEDGE_DB,
+        },
+        HolderRegistration {
+            kind: StoreKind::Oltp,
+            name: producer_holder_ids::AGENT_TRACE,
+        },
     ]
 }
 
@@ -258,7 +276,10 @@ impl<'a> GitDbHolder<'a> {
     /// The per-subject DEK handle the subject's inline Git bodies are sealed under (the crypto-shred
     /// key class).
     fn dek(subject_token: &str, tenant: &TenantId) -> ShredKeyHandle {
-        ShredKeyHandle { tenant: tenant.clone(), class: ShredKeyClass::Subject(subject_token.to_string()) }
+        ShredKeyHandle {
+            tenant: tenant.clone(),
+            class: ShredKeyClass::Subject(subject_token.to_string()),
+        }
     }
 }
 
@@ -272,7 +293,13 @@ impl PersonalDataHolder for GitDbHolder<'_> {
         };
         Ok(LocateReport {
             receipt: Receipt::content_addressed(
-                "locate", producer_holder_ids::GIT_DB, &sid, &tenant.0, outcome, None, 0,
+                "locate",
+                producer_holder_ids::GIT_DB,
+                &sid,
+                &tenant.0,
+                outcome,
+                None,
+                0,
             ),
         })
     }
@@ -281,7 +308,13 @@ impl PersonalDataHolder for GitDbHolder<'_> {
         let sid = subject.principal.principal_id.0.clone();
         Ok(PortableBundle {
             receipt: Receipt::content_addressed(
-                "export", producer_holder_ids::GIT_DB, &sid, &tenant.0, "exported", None, 0,
+                "export",
+                producer_holder_ids::GIT_DB,
+                &sid,
+                &tenant.0,
+                "exported",
+                None,
+                0,
             ),
         })
     }
@@ -290,17 +323,33 @@ impl PersonalDataHolder for GitDbHolder<'_> {
         let sid = subject.principal.principal_id.0.clone();
         Ok(RectifyReceipt {
             receipt: Receipt::content_addressed(
-                "rectify", producer_holder_ids::GIT_DB, &sid, "*", "rectified", None, 0,
+                "rectify",
+                producer_holder_ids::GIT_DB,
+                &sid,
+                "*",
+                "rectified",
+                None,
+                0,
             ),
         })
     }
 
     fn restrict(&self, subject: &SubjectRef, on: bool) -> DsrResult<RestrictReceipt> {
         let sid = subject.principal.principal_id.0.clone();
-        let outcome = if on { "restricted:set" } else { "restricted:clear" };
+        let outcome = if on {
+            "restricted:set"
+        } else {
+            "restricted:clear"
+        };
         Ok(RestrictReceipt {
             receipt: Receipt::content_addressed(
-                "restrict", producer_holder_ids::GIT_DB, &sid, "*", outcome, None, 0,
+                "restrict",
+                producer_holder_ids::GIT_DB,
+                &sid,
+                "*",
+                outcome,
+                None,
+                0,
             ),
         })
     }
@@ -313,8 +362,13 @@ impl PersonalDataHolder for GitDbHolder<'_> {
         let destroyed = self.kms.destroy(&Self::dek(&sid, &tenant));
         Ok(EraseReceipt {
             receipt: Receipt::content_addressed(
-                "erase", producer_holder_ids::GIT_DB, &sid, &tenant_token,
-                "pseudonymise+crypto_shred:inline_bodies", destroyed, 0,
+                "erase",
+                producer_holder_ids::GIT_DB,
+                &sid,
+                &tenant_token,
+                "pseudonymise+crypto_shred:inline_bodies",
+                destroyed,
+                0,
             ),
         })
     }
@@ -403,13 +457,19 @@ pub struct KnowledgeStoreHolder<'a> {
 impl<'a> KnowledgeStoreHolder<'a> {
     /// Build the H4 holder over a Knowledge store model + the crypto-shred KMS seam (the live
     /// Knowledge-service store at boot; the model in the drill).
-    pub fn new(model: &'a KnowledgeStoreModel, kms: &'a dyn CryptoShredKms) -> KnowledgeStoreHolder<'a> {
+    pub fn new(
+        model: &'a KnowledgeStoreModel,
+        kms: &'a dyn CryptoShredKms,
+    ) -> KnowledgeStoreHolder<'a> {
         KnowledgeStoreHolder { model, kms }
     }
 
     /// The per-subject DEK handle the subject's Knowledge blocks + db-row values are sealed under.
     fn dek(subject_token: &str, tenant: &TenantId) -> ShredKeyHandle {
-        ShredKeyHandle { tenant: tenant.clone(), class: ShredKeyClass::Subject(subject_token.to_string()) }
+        ShredKeyHandle {
+            tenant: tenant.clone(),
+            class: ShredKeyClass::Subject(subject_token.to_string()),
+        }
     }
 }
 
@@ -424,7 +484,13 @@ impl PersonalDataHolder for KnowledgeStoreHolder<'_> {
         };
         Ok(LocateReport {
             receipt: Receipt::content_addressed(
-                "locate", producer_holder_ids::KNOWLEDGE_DB, &sid, &tenant.0, outcome, None, 0,
+                "locate",
+                producer_holder_ids::KNOWLEDGE_DB,
+                &sid,
+                &tenant.0,
+                outcome,
+                None,
+                0,
             ),
         })
     }
@@ -433,7 +499,13 @@ impl PersonalDataHolder for KnowledgeStoreHolder<'_> {
         let sid = subject.principal.principal_id.0.clone();
         Ok(PortableBundle {
             receipt: Receipt::content_addressed(
-                "export", producer_holder_ids::KNOWLEDGE_DB, &sid, &tenant.0, "exported", None, 0,
+                "export",
+                producer_holder_ids::KNOWLEDGE_DB,
+                &sid,
+                &tenant.0,
+                "exported",
+                None,
+                0,
             ),
         })
     }
@@ -442,18 +514,33 @@ impl PersonalDataHolder for KnowledgeStoreHolder<'_> {
         let sid = subject.principal.principal_id.0.clone();
         Ok(RectifyReceipt {
             receipt: Receipt::content_addressed(
-                "rectify", producer_holder_ids::KNOWLEDGE_DB, &sid, "*",
-                "rectified:reindex_from_source", None, 0,
+                "rectify",
+                producer_holder_ids::KNOWLEDGE_DB,
+                &sid,
+                "*",
+                "rectified:reindex_from_source",
+                None,
+                0,
             ),
         })
     }
 
     fn restrict(&self, subject: &SubjectRef, on: bool) -> DsrResult<RestrictReceipt> {
         let sid = subject.principal.principal_id.0.clone();
-        let outcome = if on { "restricted:set" } else { "restricted:clear" };
+        let outcome = if on {
+            "restricted:set"
+        } else {
+            "restricted:clear"
+        };
         Ok(RestrictReceipt {
             receipt: Receipt::content_addressed(
-                "restrict", producer_holder_ids::KNOWLEDGE_DB, &sid, "*", outcome, None, 0,
+                "restrict",
+                producer_holder_ids::KNOWLEDGE_DB,
+                &sid,
+                "*",
+                outcome,
+                None,
+                0,
             ),
         })
     }
@@ -467,8 +554,13 @@ impl PersonalDataHolder for KnowledgeStoreHolder<'_> {
         self.model.purge_embedding(&sid);
         Ok(EraseReceipt {
             receipt: Receipt::content_addressed(
-                "erase", producer_holder_ids::KNOWLEDGE_DB, &sid, &tenant_token,
-                "crypto_shred:blocks+db_rows+embeddings_purged_not_hidden", destroyed, 0,
+                "erase",
+                producer_holder_ids::KNOWLEDGE_DB,
+                &sid,
+                &tenant_token,
+                "crypto_shred:blocks+db_rows+embeddings_purged_not_hidden",
+                destroyed,
+                0,
             ),
         })
     }
@@ -510,7 +602,10 @@ impl AgentTraceModel {
 
     /// Whether the subject's trace is STILL present (the post-erase `locate` "0 recoverable" reading).
     pub fn has_trace(&self, subject_token: &str) -> bool {
-        self.traces.lock().unwrap_or_else(|e| e.into_inner()).contains_key(subject_token)
+        self.traces
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(subject_token)
     }
 
     /// How many times `erase` was actually CALLED (the resumability witness).
@@ -548,7 +643,10 @@ pub struct KnowledgeAgentTraceHolder<'a> {
 impl<'a> KnowledgeAgentTraceHolder<'a> {
     /// Build the H17 holder over an agent-trace model + the crypto-shred KMS seam (the live
     /// `agent_fabric_trace` store at boot; the model in the drill).
-    pub fn new(model: &'a AgentTraceModel, kms: &'a dyn CryptoShredKms) -> KnowledgeAgentTraceHolder<'a> {
+    pub fn new(
+        model: &'a AgentTraceModel,
+        kms: &'a dyn CryptoShredKms,
+    ) -> KnowledgeAgentTraceHolder<'a> {
         KnowledgeAgentTraceHolder { model, kms }
     }
 
@@ -559,7 +657,10 @@ impl<'a> KnowledgeAgentTraceHolder<'a> {
 
     /// The per-subject DEK handle the subject's content-addressed trace is sealed under.
     fn dek(subject_token: &str, tenant: &TenantId) -> ShredKeyHandle {
-        ShredKeyHandle { tenant: tenant.clone(), class: ShredKeyClass::Subject(subject_token.to_string()) }
+        ShredKeyHandle {
+            tenant: tenant.clone(),
+            class: ShredKeyClass::Subject(subject_token.to_string()),
+        }
     }
 }
 
@@ -573,7 +674,13 @@ impl PersonalDataHolder for KnowledgeAgentTraceHolder<'_> {
         };
         Ok(LocateReport {
             receipt: Receipt::content_addressed(
-                "locate", AGENT_TRACE_HOLDER_ID, &sid, &tenant.0, outcome, None, 0,
+                "locate",
+                AGENT_TRACE_HOLDER_ID,
+                &sid,
+                &tenant.0,
+                outcome,
+                None,
+                0,
             ),
         })
     }
@@ -582,7 +689,13 @@ impl PersonalDataHolder for KnowledgeAgentTraceHolder<'_> {
         let sid = subject.principal.principal_id.0.clone();
         Ok(PortableBundle {
             receipt: Receipt::content_addressed(
-                "export", AGENT_TRACE_HOLDER_ID, &sid, &tenant.0, "exported", None, 0,
+                "export",
+                AGENT_TRACE_HOLDER_ID,
+                &sid,
+                &tenant.0,
+                "exported",
+                None,
+                0,
             ),
         })
     }
@@ -591,17 +704,33 @@ impl PersonalDataHolder for KnowledgeAgentTraceHolder<'_> {
         let sid = subject.principal.principal_id.0.clone();
         Ok(RectifyReceipt {
             receipt: Receipt::content_addressed(
-                "rectify", AGENT_TRACE_HOLDER_ID, &sid, "*", "rectified", None, 0,
+                "rectify",
+                AGENT_TRACE_HOLDER_ID,
+                &sid,
+                "*",
+                "rectified",
+                None,
+                0,
             ),
         })
     }
 
     fn restrict(&self, subject: &SubjectRef, on: bool) -> DsrResult<RestrictReceipt> {
         let sid = subject.principal.principal_id.0.clone();
-        let outcome = if on { "restricted:set" } else { "restricted:clear" };
+        let outcome = if on {
+            "restricted:set"
+        } else {
+            "restricted:clear"
+        };
         Ok(RestrictReceipt {
             receipt: Receipt::content_addressed(
-                "restrict", AGENT_TRACE_HOLDER_ID, &sid, "*", outcome, None, 0,
+                "restrict",
+                AGENT_TRACE_HOLDER_ID,
+                &sid,
+                "*",
+                outcome,
+                None,
+                0,
             ),
         })
     }
@@ -615,8 +744,13 @@ impl PersonalDataHolder for KnowledgeAgentTraceHolder<'_> {
         self.model.shred_trace(&sid);
         Ok(EraseReceipt {
             receipt: Receipt::content_addressed(
-                "erase", AGENT_TRACE_HOLDER_ID, &sid, &tenant_token,
-                "crypto_shred:agent_trace:distinct_from_audit", destroyed, 0,
+                "erase",
+                AGENT_TRACE_HOLDER_ID,
+                &sid,
+                &tenant_token,
+                "crypto_shred:agent_trace:distinct_from_audit",
+                destroyed,
+                0,
             ),
         })
     }
@@ -646,8 +780,9 @@ impl ProducerHolderRegistration {
         holders
             .into_iter()
             .map(|(id, holder)| {
-                let phase = producer_phase_of(id)
-                    .unwrap_or_else(|| panic!("producer holder `{id}` has no canonical erase phase"));
+                let phase = producer_phase_of(id).unwrap_or_else(|| {
+                    panic!("producer holder `{id}` has no canonical erase phase")
+                });
                 RegisteredHolder { id, phase, holder }
             })
             .collect()
@@ -660,7 +795,7 @@ mod tests {
     use crate::datamap::data_map;
     use crate::holders::InMemoryShredKms;
     use crate::orchestration::UpstreamHolderOrchestrator;
-    use crate::{AUDIT_CARVE_OUT_STORE, EraseChecklist};
+    use crate::{EraseChecklist, AUDIT_CARVE_OUT_STORE};
     use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 
     fn t(s: &str) -> TenantId {
@@ -668,11 +803,18 @@ mod tests {
     }
 
     fn subject(id: &str) -> SubjectRef {
-        SubjectRef::new(Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, t("acme")))
+        SubjectRef::new(Principal::stub(
+            PrincipalId(id.into()),
+            PrincipalKind::Human,
+            t("acme"),
+        ))
     }
 
     fn subject_scope(s: &str) -> EraseScope {
-        EraseScope::Subject { subject: subject(s), tenant: t("acme") }
+        EraseScope::Subject {
+            subject: subject(s),
+            tenant: t("acme"),
+        }
     }
 
     fn region() -> Region {
@@ -680,7 +822,12 @@ mod tests {
     }
 
     /// Provision a per-subject DEK on the KMS for each producer holder (each seals its own free-text).
-    fn provision_subject_dek(kms: &InMemoryShredKms, tenant: &TenantId, subject_token: &str, epoch: u64) {
+    fn provision_subject_dek(
+        kms: &InMemoryShredKms,
+        tenant: &TenantId,
+        subject_token: &str,
+        epoch: u64,
+    ) {
         kms.provision(
             ShredKeyHandle {
                 tenant: tenant.clone(),
@@ -701,9 +848,18 @@ mod tests {
         let inv = data_map(&producer_holder_schemas(region()));
 
         // The three producer holders are in the map's roster (H1 Git / H4 Knowledge / H17 trace).
-        assert!(inv.holders.contains("oltp:git_oltp"), "H1 Git is in the map");
-        assert!(inv.holders.contains("oltp:knowledge_oltp"), "H4 Knowledge is in the map");
-        assert!(inv.holders.contains("oltp:agent_fabric_trace"), "H17 agent-trace is in the map");
+        assert!(
+            inv.holders.contains("oltp:git_oltp"),
+            "H1 Git is in the map"
+        );
+        assert!(
+            inv.holders.contains("oltp:knowledge_oltp"),
+            "H4 Knowledge is in the map"
+        );
+        assert!(
+            inv.holders.contains("oltp:agent_fabric_trace"),
+            "H17 agent-trace is in the map"
+        );
         assert_eq!(inv.holder_count(), 3, "exactly the three producer holders");
 
         // No holder-without-map drift: every REGISTERED producer holder is in the map (0 gaps).
@@ -741,14 +897,29 @@ mod tests {
     /// producer slots in without re-deriving a hand-written sequence.
     #[test]
     fn producer_holders_declare_their_canonical_erase_phases() {
-        assert_eq!(producer_phase_of(producer_holder_ids::GIT_DB), Some(CanonicalErasePhase::CryptoShredDek));
-        assert_eq!(producer_phase_of(producer_holder_ids::KNOWLEDGE_DB), Some(CanonicalErasePhase::CryptoShredDek));
-        assert_eq!(producer_phase_of(producer_holder_ids::AGENT_TRACE), Some(agent_trace_phase()));
-        assert_eq!(producer_phase_of(producer_holder_ids::AGENT_TRACE), Some(CanonicalErasePhase::CachesAndDerivedCopies));
+        assert_eq!(
+            producer_phase_of(producer_holder_ids::GIT_DB),
+            Some(CanonicalErasePhase::CryptoShredDek)
+        );
+        assert_eq!(
+            producer_phase_of(producer_holder_ids::KNOWLEDGE_DB),
+            Some(CanonicalErasePhase::CryptoShredDek)
+        );
+        assert_eq!(
+            producer_phase_of(producer_holder_ids::AGENT_TRACE),
+            Some(agent_trace_phase())
+        );
+        assert_eq!(
+            producer_phase_of(producer_holder_ids::AGENT_TRACE),
+            Some(CanonicalErasePhase::CachesAndDerivedCopies)
+        );
         // An unknown holder has no producer phase (it must declare one in its own prompt).
         assert_eq!(producer_phase_of("not_a_producer"), None);
         // The trace shreds AFTER the per-subject DEK (the free-text) — a trailing derived copy.
-        assert!(producer_phase_of(producer_holder_ids::AGENT_TRACE) > producer_phase_of(producer_holder_ids::KNOWLEDGE_DB));
+        assert!(
+            producer_phase_of(producer_holder_ids::AGENT_TRACE)
+                > producer_phase_of(producer_holder_ids::KNOWLEDGE_DB)
+        );
     }
 
     // ───────── the fan-out reaches the producer holders (the data map drives them) ─────────
@@ -773,7 +944,10 @@ mod tests {
         let trace_h = KnowledgeAgentTraceHolder::new(&trace, &kms);
 
         let producers = ProducerHolderRegistration::register_producers(vec![
-            (producer_holder_ids::GIT_DB, &git_h as &dyn PersonalDataHolder),
+            (
+                producer_holder_ids::GIT_DB,
+                &git_h as &dyn PersonalDataHolder,
+            ),
             (producer_holder_ids::KNOWLEDGE_DB, &kn_h),
             (producer_holder_ids::AGENT_TRACE, &trace_h),
         ]);
@@ -781,16 +955,35 @@ mod tests {
 
         // The fan-out checklist includes all three producer holders.
         let ids = orch.holder_ids_in_order();
-        assert!(ids.contains(&producer_holder_ids::GIT_DB), "H1 Git is in the fan-out");
-        assert!(ids.contains(&producer_holder_ids::KNOWLEDGE_DB), "H4 Knowledge is in the fan-out");
-        assert!(ids.contains(&producer_holder_ids::AGENT_TRACE), "H17 agent-trace is in the fan-out");
+        assert!(
+            ids.contains(&producer_holder_ids::GIT_DB),
+            "H1 Git is in the fan-out"
+        );
+        assert!(
+            ids.contains(&producer_holder_ids::KNOWLEDGE_DB),
+            "H4 Knowledge is in the fan-out"
+        );
+        assert!(
+            ids.contains(&producer_holder_ids::AGENT_TRACE),
+            "H17 agent-trace is in the fan-out"
+        );
         // The trace (a trailing derived copy) is fanned LAST (after the free-text DEK shreds).
-        assert_eq!(ids.last(), Some(&producer_holder_ids::AGENT_TRACE), "the trace shreds last");
+        assert_eq!(
+            ids.last(),
+            Some(&producer_holder_ids::AGENT_TRACE),
+            "the trace shreds last"
+        );
 
         let checklist = EraseChecklist::new();
-        let receipts = orch.fan_out_erase(&subject_scope("u-prod"), &checklist).unwrap();
+        let receipts = orch
+            .fan_out_erase(&subject_scope("u-prod"), &checklist)
+            .unwrap();
         assert_eq!(receipts.len(), 3, "all three producer holders were reached");
-        assert_eq!(orch.fanout_coverage(&checklist), 1.0, "100% coverage of the producer holders");
+        assert_eq!(
+            orch.fanout_coverage(&checklist),
+            1.0,
+            "100% coverage of the producer holders"
+        );
     }
 
     // ───────── the Knowledge instance: crypto-shred free-text + purge embeddings (KN-D4) ─────────
@@ -807,22 +1000,46 @@ mod tests {
         let model = KnowledgeStoreModel::new();
         model.index_embedding_from_source("u-kn");
 
-        let dek = ShredKeyHandle { tenant: tenant.clone(), class: ShredKeyClass::Subject("u-kn".into()) };
-        assert!(kms.is_present(&dek), "the per-subject DEK is live before erase");
-        assert_eq!(model.reidentify_hits("u-kn"), 1, "the embedding re-identifies before erase");
+        let dek = ShredKeyHandle {
+            tenant: tenant.clone(),
+            class: ShredKeyClass::Subject("u-kn".into()),
+        };
+        assert!(
+            kms.is_present(&dek),
+            "the per-subject DEK is live before erase"
+        );
+        assert_eq!(
+            model.reidentify_hits("u-kn"),
+            1,
+            "the embedding re-identifies before erase"
+        );
 
         let holder = KnowledgeStoreHolder::new(&model, &kms);
         let receipt = holder.erase(subject_scope("u-kn")).unwrap();
 
         // 0 recoverable: the DEK is destroyed (DBs AND backups) AND the embedding is purged.
-        assert!(!kms.is_present(&dek), "the per-subject DEK is destroyed (free-text unrecoverable)");
-        assert_eq!(kms.recoverable_in_backup(&dek), 0, "0 recoverable in backups (crypto-shred reaches backups)");
-        assert_eq!(model.reidentify_hits("u-kn"), 0, "0 re-identification — the embedding was PURGED (KN-D4)");
+        assert!(
+            !kms.is_present(&dek),
+            "the per-subject DEK is destroyed (free-text unrecoverable)"
+        );
+        assert_eq!(
+            kms.recoverable_in_backup(&dek),
+            0,
+            "0 recoverable in backups (crypto-shred reaches backups)"
+        );
+        assert_eq!(
+            model.reidentify_hits("u-kn"),
+            0,
+            "0 re-identification — the embedding was PURGED (KN-D4)"
+        );
         assert!(
             receipt.receipt.key_epoch_destroyed.is_some(),
             "the erase receipt records the destroyed key epoch (the GD-4 audit trail)"
         );
-        assert!(receipt.receipt.content_hash.starts_with("blake3:"), "the receipt is content-addressed");
+        assert!(
+            receipt.receipt.content_hash.starts_with("blake3:"),
+            "the receipt is content-addressed"
+        );
     }
 
     /// **The Knowledge instance has NO hide path — only a real purge.** The only mutation that drops
@@ -835,8 +1052,14 @@ mod tests {
         provision_subject_dek(&kms, &tenant, "u-hide", 30);
         let model = KnowledgeStoreModel::new();
         model.index_embedding_from_source("u-hide");
-        KnowledgeStoreHolder::new(&model, &kms).erase(subject_scope("u-hide")).unwrap();
-        assert_eq!(model.reidentify_hits("u-hide"), 0, "the only erase is a real purge");
+        KnowledgeStoreHolder::new(&model, &kms)
+            .erase(subject_scope("u-hide"))
+            .unwrap();
+        assert_eq!(
+            model.reidentify_hits("u-hide"),
+            0,
+            "the only erase is a real purge"
+        );
     }
 
     // ───────── the H17 trace: crypto-shred, distinct from audit (KN-D12 / §6.5) ─────────
@@ -853,25 +1076,42 @@ mod tests {
         let model = AgentTraceModel::new();
         model.write_trace_from_source("u-trace", "blake3:cafef00d");
 
-        let dek = ShredKeyHandle { tenant: tenant.clone(), class: ShredKeyClass::Subject("u-trace".into()) };
-        assert!(model.has_trace("u-trace"), "the run trace is present before erase");
+        let dek = ShredKeyHandle {
+            tenant: tenant.clone(),
+            class: ShredKeyClass::Subject("u-trace".into()),
+        };
+        assert!(
+            model.has_trace("u-trace"),
+            "the run trace is present before erase"
+        );
         assert!(kms.is_present(&dek), "the trace DEK is live before erase");
 
         let holder = KnowledgeAgentTraceHolder::new(&model, &kms);
         // The H17 holder is the agent-trace store id — DISTINCT from the H16 audit carve-out.
         assert_eq!(holder.holder_id(), AGENT_TRACE_HOLDER_ID);
         assert_ne!(
-            holder.holder_id(), AUDIT_CARVE_OUT_STORE,
+            holder.holder_id(),
+            AUDIT_CARVE_OUT_STORE,
             "H17 trace is distinct from the H16 audit carve-out (§6.5)"
         );
 
         let receipt = holder.erase(subject_scope("u-trace")).unwrap();
 
         // 0 recoverable: the DEK is destroyed AND the content-addressed trace row is dropped.
-        assert!(!model.has_trace("u-trace"), "the trace row is dropped (crypto-shredded)");
+        assert!(
+            !model.has_trace("u-trace"),
+            "the trace row is dropped (crypto-shredded)"
+        );
         assert!(!kms.is_present(&dek), "the trace DEK is destroyed");
-        assert_eq!(kms.recoverable_in_backup(&dek), 0, "0 recoverable in backups");
-        assert!(receipt.receipt.key_epoch_destroyed.is_some(), "the destroyed key epoch is recorded");
+        assert_eq!(
+            kms.recoverable_in_backup(&dek),
+            0,
+            "0 recoverable in backups"
+        );
+        assert!(
+            receipt.receipt.key_epoch_destroyed.is_some(),
+            "the destroyed key epoch is recorded"
+        );
         assert!(
             receipt.receipt.content_hash.starts_with("blake3:"),
             "the trace-shred receipt is content-addressed"
@@ -892,13 +1132,20 @@ mod tests {
         let holder = KnowledgeAgentTraceHolder::new(&model, &kms);
 
         // The live body returns a real receipt (no longer the loud "P-GA-27" deferral the seam had).
-        let loc = holder.locate(&subject("u-fill"), tenant.clone()).expect("the live locate body exists");
+        let loc = holder
+            .locate(&subject("u-fill"), tenant.clone())
+            .expect("the live locate body exists");
         assert!(loc.receipt.content_hash.starts_with("blake3:"));
-        let erased = holder.erase(subject_scope("u-fill")).expect("the live erase body exists");
+        let erased = holder
+            .erase(subject_scope("u-fill"))
+            .expect("the live erase body exists");
         assert_eq!(erased.receipt.operation, "erase");
         // The id + phase match the seam's frozen coordinates (the live impl plugged into them).
         assert_eq!(holder.holder_id(), AGENT_TRACE_HOLDER_ID);
-        assert_eq!(producer_phase_of(holder.holder_id()), Some(agent_trace_phase()));
+        assert_eq!(
+            producer_phase_of(holder.holder_id()),
+            Some(agent_trace_phase())
+        );
     }
 
     // ───────── idempotent re-erase (the fan-out resumability property) ─────────
@@ -920,7 +1167,11 @@ mod tests {
         // purged — the model's purge is a no-op. The outcome string is stable.
         let second = holder.erase(subject_scope("u-idem")).unwrap();
         assert_eq!(first.receipt.operation, second.receipt.operation);
-        assert_eq!(model.reidentify_hits("u-idem"), 0, "0 re-identification after the re-erase too");
+        assert_eq!(
+            model.reidentify_hits("u-idem"),
+            0,
+            "0 re-identification after the re-erase too"
+        );
     }
 
     /// The producer-holder id roster is the three M3 producer subsystems (a drift guard).
@@ -962,11 +1213,24 @@ mod tests {
         let model_b = KnowledgeStoreModel::new();
         model_b.index_embedding_from_source("u-b");
         let holder_b = KnowledgeStoreHolder::new(&model_b, &kms_b);
-        assert!(!kms_b.is_present(&ShredKeyHandle { tenant: tenant.clone(), class: ShredKeyClass::Subject("u-b".into()) }));
-        assert_eq!(model_b.reidentify_hits("u-b"), 1, "the embedding re-identifies (> 0)");
+        assert!(!kms_b.is_present(&ShredKeyHandle {
+            tenant: tenant.clone(),
+            class: ShredKeyClass::Subject("u-b".into())
+        }));
+        assert_eq!(
+            model_b.reidentify_hits("u-b"),
+            1,
+            "the embedding re-identifies (> 0)"
+        );
         let located = holder_b.locate(&subject("u-b"), tenant.clone()).unwrap();
         let expected_located = Receipt::content_addressed(
-            "locate", producer_holder_ids::KNOWLEDGE_DB, "u-b", &tenant.0, "located:content+embeddings", None, 0,
+            "locate",
+            producer_holder_ids::KNOWLEDGE_DB,
+            "u-b",
+            &tenant.0,
+            "located:content+embeddings",
+            None,
+            0,
         );
         assert_eq!(
             located.receipt.content_hash, expected_located.content_hash,
@@ -975,7 +1239,13 @@ mod tests {
         // The 0-recoverable outcome for the SAME subject would hash differently — proving the outcome
         // string (not just the subject token) drives the address.
         let zero = Receipt::content_addressed(
-            "locate", producer_holder_ids::KNOWLEDGE_DB, "u-b", &tenant.0, "located:0-recoverable", None, 0,
+            "locate",
+            producer_holder_ids::KNOWLEDGE_DB,
+            "u-b",
+            &tenant.0,
+            "located:0-recoverable",
+            None,
+            0,
         );
         assert_ne!(located.receipt.content_hash, zero.content_hash);
 
@@ -988,7 +1258,13 @@ mod tests {
             .locate(&subject("u-c"), tenant.clone())
             .unwrap();
         let expected_zero_c = Receipt::content_addressed(
-            "locate", producer_holder_ids::KNOWLEDGE_DB, "u-c", &tenant.0, "located:0-recoverable", None, 0,
+            "locate",
+            producer_holder_ids::KNOWLEDGE_DB,
+            "u-c",
+            &tenant.0,
+            "located:0-recoverable",
+            None,
+            0,
         );
         assert_eq!(
             loc_c.receipt.content_hash, expected_zero_c.content_hash,
@@ -1003,12 +1279,30 @@ mod tests {
         let tenant = t("acme");
         let kms = InMemoryShredKms::new();
         provision_subject_dek(&kms, &tenant, "u-git", 70);
-        let dek = ShredKeyHandle { tenant: tenant.clone(), class: ShredKeyClass::Subject("u-git".into()) };
-        assert!(kms.is_present(&dek), "the inline-body DEK is live before erase");
+        let dek = ShredKeyHandle {
+            tenant: tenant.clone(),
+            class: ShredKeyClass::Subject("u-git".into()),
+        };
+        assert!(
+            kms.is_present(&dek),
+            "the inline-body DEK is live before erase"
+        );
 
-        let receipt = GitDbHolder::new(&kms).erase(subject_scope("u-git")).unwrap();
-        assert!(!kms.is_present(&dek), "the inline-body DEK is crypto-shredded");
-        assert_eq!(kms.recoverable_in_backup(&dek), 0, "0 recoverable in backups");
-        assert!(receipt.receipt.key_epoch_destroyed.is_some(), "the destroyed epoch is recorded");
+        let receipt = GitDbHolder::new(&kms)
+            .erase(subject_scope("u-git"))
+            .unwrap();
+        assert!(
+            !kms.is_present(&dek),
+            "the inline-body DEK is crypto-shredded"
+        );
+        assert_eq!(
+            kms.recoverable_in_backup(&dek),
+            0,
+            "0 recoverable in backups"
+        );
+        assert!(
+            receipt.receipt.key_epoch_destroyed.is_some(),
+            "the destroyed epoch is recorded"
+        );
     }
 }

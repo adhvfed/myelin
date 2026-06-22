@@ -199,10 +199,7 @@ pub enum RelMembership {
         object_id: ObjectId,
     },
     /// `SetExpr::TupleSet { index }` — is the object in the server-materialised tuple set?
-    InTupleSet {
-        index: String,
-        object_id: ObjectId,
-    },
+    InTupleSet { index: String, object_id: ObjectId },
 }
 
 /// Extract the object id (the last `/`-segment, sans any `#sub` anchor) from an

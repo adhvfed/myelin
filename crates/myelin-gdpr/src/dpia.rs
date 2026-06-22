@@ -205,7 +205,11 @@ mod tests {
         let markers = dpia_markers::<Subject>();
         // Exactly one marker — the health_note field. The crypto-shred `email` is ordinary-category
         // (ContactInfo); it carries no DPIA obligation.
-        assert_eq!(markers.len(), 1, "100% of (and ONLY) special-category fields emit a marker");
+        assert_eq!(
+            markers.len(),
+            1,
+            "100% of (and ONLY) special-category fields emit a marker"
+        );
         let marker = markers.iter().next().unwrap();
         assert_eq!(marker.field_path, "Subject.health_note");
         assert_eq!(marker.special_category_kind, "health");
@@ -244,7 +248,11 @@ mod tests {
 
         // First appearance: the new flow routes to DPIA-required (the §2.3 gate fires).
         let verdicts = router.route(&prior, &current);
-        assert_eq!(verdicts.len(), 1, "a new special-category flow fires the DPIA gate");
+        assert_eq!(
+            verdicts.len(),
+            1,
+            "a new special-category flow fires the DPIA gate"
+        );
         match &verdicts[0] {
             DpiaVerdict::Required { marker, reason } => {
                 assert_eq!(marker.field_path, "Subject.health_note");
@@ -260,7 +268,10 @@ mod tests {
         // No change build-to-build: the SAME marker set in prior and current routes to NOTHING (the
         // gate does not re-fire on an already-adjudicated flow — only a diff fires it).
         let no_change = router.route(&current, &current);
-        assert!(no_change.is_empty(), "an unchanged flow does not re-fire the DPIA gate");
+        assert!(
+            no_change.is_empty(),
+            "an unchanged flow does not re-fire the DPIA gate"
+        );
     }
 
     /// A reclassification (the kind changes at the same field path) is a NEW flow — the marker

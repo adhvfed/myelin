@@ -37,7 +37,9 @@ fn the_lint_rejects_an_unfiltered_search_path() {
          post-filter existence/rank leak)"
     );
     assert!(
-        violations.iter().all(|v| v.lint.0 == "search-requires-acl-filter"),
+        violations
+            .iter()
+            .all(|v| v.lint.0 == "search-requires-acl-filter"),
         "every violation must carry the search-requires-acl-filter id (not a false attribution)"
     );
 }

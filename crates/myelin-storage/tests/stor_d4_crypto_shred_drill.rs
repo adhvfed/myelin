@@ -25,7 +25,7 @@
 use myelin_gdpr::ErasureMethod;
 use myelin_storage::{
     BusErase, ColumnCryptor, CryptoShredErase, DekId, EpochMillis, EraseError, EraseHolders,
-    ErasureLedgerSink, KeyClass, KekId, KmsEngine, PseudonymShred, RefsTombstone, SearchPurge,
+    ErasureLedgerSink, KekId, KeyClass, KmsEngine, PseudonymShred, RefsTombstone, SearchPurge,
     SubjectId,
 };
 use myelin_tenancy::{Region, TenantId};
@@ -101,7 +101,10 @@ fn stor_d4_crypto_shred_erase_leaves_zero_recoverable_pii_in_backups() {
     let col_b = seal(&keep_b, b"keep-b-bio");
 
     // Pre-condition: every column decrypts, and every subject's DEK is in the backup snapshot.
-    assert!(cryptor.decrypt(&col_erase).is_ok(), "erase-me decrypts before the erase");
+    assert!(
+        cryptor.decrypt(&col_erase).is_ok(),
+        "erase-me decrypts before the erase"
+    );
     let dek_of = |s: &SubjectId| DekId::new(tenant.clone(), KeyClass::Subject(s.0.clone()));
     for s in [&erase_me, &keep_a, &keep_b] {
         let d = dek_of(s);
@@ -116,7 +119,11 @@ fn stor_d4_crypto_shred_erase_leaves_zero_recoverable_pii_in_backups() {
     let eraser = CryptoShredErase::new(&kms, region());
     let wiring = DrillWiring::default();
     let holders = EraseHolders {
-        pseudonym: &wiring, search: &wiring, refs: &wiring, bus: &wiring, ledger: &wiring,
+        pseudonym: &wiring,
+        search: &wiring,
+        refs: &wiring,
+        bus: &wiring,
+        ledger: &wiring,
         git_reach: None,
     };
     let receipt = eraser
@@ -145,7 +152,10 @@ fn stor_d4_crypto_shred_erase_leaves_zero_recoverable_pii_in_backups() {
     );
     // The receipt's own reading agrees (the algorithm computed the same 0).
     assert_eq!(receipt.recoverable_in_backup, 0);
-    assert!(receipt.is_green(), "STOR-D4 green: 0 recoverable PII in backup");
+    assert!(
+        receipt.is_green(),
+        "STOR-D4 green: 0 recoverable PII in backup"
+    );
 
     // (c) Per-subject ISOLATION: the OTHER two subjects are UNTOUCHED (live + backup) — one person's
     // erasure does not crypto-shred the tenant.
@@ -196,7 +206,11 @@ fn stor_d4_re_erase_after_a_restore_style_replay_stays_zero_recoverable() {
     let eraser = CryptoShredErase::new(&kms, region());
     let wiring = DrillWiring::default();
     let holders = EraseHolders {
-        pseudonym: &wiring, search: &wiring, refs: &wiring, bus: &wiring, ledger: &wiring,
+        pseudonym: &wiring,
+        search: &wiring,
+        refs: &wiring,
+        bus: &wiring,
+        ledger: &wiring,
         git_reach: None,
     };
     eraser.erase(&subject, &tenant, &holders, 1).unwrap();
@@ -205,5 +219,8 @@ fn stor_d4_re_erase_after_a_restore_style_replay_stays_zero_recoverable() {
         .erase(&subject, &tenant, &holders, 2)
         .expect("re-erase is a no-op SUCCESS");
     assert!(again.re_run);
-    assert_eq!(again.recoverable_in_backup, 0, "still 0 recoverable after re-erase");
+    assert_eq!(
+        again.recoverable_in_backup, 0,
+        "still 0 recoverable after re-erase"
+    );
 }

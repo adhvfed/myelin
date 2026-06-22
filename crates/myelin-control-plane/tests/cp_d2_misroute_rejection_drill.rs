@@ -36,7 +36,11 @@ fn cell(id: &str, region: &str) -> Cell {
         region: Region::new(region),
         status: CellStatus::Active,
         isolation_kind: IsolationKind::Pool,
-        capacity: Capacity { tenants_max: 1000, write_qps_max: 5000, storage_bytes_max: 1 << 40 },
+        capacity: Capacity {
+            tenants_max: 1000,
+            write_qps_max: 5000,
+            storage_bytes_max: 1 << 40,
+        },
         utilisation: 10,
         version: 1,
         endpoint: format!("cell.{region}.{id}.myelin.eu"),
@@ -95,15 +99,30 @@ fn cp_d2_misroute_rejection_tenant_grain() {
     );
     let misroute_count = wrong.misroute_count();
     let cross_tenant_reads = wrong.cross_tenant_reads();
-    assert_eq!(misroute_count, 1, "misroute_count increments on a rejected misroute");
-    assert_eq!(cross_tenant_reads, 0, "0 cross-tenant/cross-cell rows read (the CP-D2 zero)");
+    assert_eq!(
+        misroute_count, 1,
+        "misroute_count increments on a rejected misroute"
+    );
+    assert_eq!(
+        cross_tenant_reads, 0,
+        "0 cross-tenant/cross-cell rows read (the CP-D2 zero)"
+    );
 
     // An UNKNOWN tenant is also rejected (no redirect target) + audited — still 0 cross-cell read.
     let unknown = wrong
         .route(&reg, &TenantId::from_token("01J0GHOST"))
         .expect_err("an unknown tenant is rejected (no route)");
-    assert_eq!(unknown, GatewayReject::NoSuchTenant { tenant_id: TenantId::from_token("01J0GHOST") });
-    assert_eq!(wrong.misroute_count(), 2, "the unknown-tenant rejection is also counted");
+    assert_eq!(
+        unknown,
+        GatewayReject::NoSuchTenant {
+            tenant_id: TenantId::from_token("01J0GHOST")
+        }
+    );
+    assert_eq!(
+        wrong.misroute_count(),
+        2,
+        "the unknown-tenant rejection is also counted"
+    );
     assert_eq!(wrong.cross_tenant_reads(), 0, "still 0 cross-tenant reads");
 
     // ── GREEN leg: the home cell (cell-w-1) serves its OWN tenant (ACME) — no misroute, no audit. ──
@@ -113,14 +132,24 @@ fn cp_d2_misroute_rejection_tenant_grain() {
         .expect("the home cell serves its own tenant (the gate is GREEN)");
     assert_eq!(served.home_cell.as_str(), "cell-w-1");
     assert_eq!(served.region.as_str(), "eu-west");
-    assert_eq!(served.member_cells.len(), 1, "v1 member_cells single-element (the floor)");
-    assert_eq!(home.misroute_count(), 0, "the home cell does not misroute its own tenant");
+    assert_eq!(
+        served.member_cells.len(),
+        1,
+        "v1 member_cells single-element (the floor)"
+    );
+    assert_eq!(
+        home.misroute_count(),
+        0,
+        "the home cell does not misroute its own tenant"
+    );
     assert_eq!(home.audit().count(), 0, "nothing to audit on an accept");
     assert_eq!(home.cross_tenant_reads(), 0);
 
     // The redirect is then SERVED by the home cell (a redirect, never a proxy): re-route ACME to the
     // redirect's correct cell — it accepts.
-    let GatewayReject::Misroute(redirect) = reject else { panic!("expected a misroute") };
+    let GatewayReject::Misroute(redirect) = reject else {
+        panic!("expected a misroute")
+    };
     let re_routed = CellGateway::new(redirect.correct_cell.clone())
         .route(&reg, &TenantId::from_token("01J0ACME"))
         .expect("the redirected request is served by the home cell");
@@ -130,7 +159,8 @@ fn cp_d2_misroute_rejection_tenant_grain() {
     //    of the pass, EI-01 §3): the CrossTenantCount projection == 0 (the headline CP-D2 zero). ──
     let mut sig = SignalSource::new();
     sig.set_scalar(SignalName::CrossTenantCount, cross_tenant_reads as i64);
-    sig.assert_signal(SignalName::CrossTenantCount, Predicate::Eq(0)).expect_green();
+    sig.assert_signal(SignalName::CrossTenantCount, Predicate::Eq(0))
+        .expect_green();
 
     println!(
         "[P-084 CP-D2 GREEN 2026-06-19] placement_of + gateway misroute-rejection (tenant grain): a \
@@ -157,7 +187,8 @@ fn cp_d2_gate_is_not_vacuous() {
     // A hypothetical regression that SERVED one cross-tenant read.
     sig.set_scalar(SignalName::CrossTenantCount, 1);
     assert!(
-        !sig.assert_signal(SignalName::CrossTenantCount, Predicate::Eq(0)).is_green(),
+        !sig.assert_signal(SignalName::CrossTenantCount, Predicate::Eq(0))
+            .is_green(),
         "a served cross-tenant read MUST read RED — the CP-D2 zero is a real tripwire"
     );
 }

@@ -325,7 +325,9 @@ impl RestoreReport {
     /// `true` iff a key for `tenant` was restored (used by the crypto-shred-exclusion assertion: a
     /// shredded tenant has NO restored key, so this is `false` — it stays dead across the restore).
     pub fn restored_key_for_tenant(&self, tenant: &TenantId) -> bool {
-        self.restored_keys.iter().any(|(id, _)| &id.tenant == tenant)
+        self.restored_keys
+            .iter()
+            .any(|(id, _)| &id.tenant == tenant)
     }
 }
 
@@ -446,9 +448,17 @@ mod tests {
     /// the tail archived to `tail`).
     fn reachable_archiver(tail: WalOffset) -> ContinuousArchiver {
         let mut arch = ContinuousArchiver::new();
-        arch.archive_segment(WalSegment { end_offset: 0, committed_at: 0 }).unwrap();
+        arch.archive_segment(WalSegment {
+            end_offset: 0,
+            committed_at: 0,
+        })
+        .unwrap();
         arch.take_base_backup(1); // base anchor at offset 0
-        arch.archive_segment(WalSegment { end_offset: tail, committed_at: 10 }).unwrap();
+        arch.archive_segment(WalSegment {
+            end_offset: tail,
+            committed_at: 10,
+        })
+        .unwrap();
         arch
     }
 
@@ -464,15 +474,34 @@ mod tests {
         let source = SourceLog::new();
         let kms = KmsEngine::new();
         let rows = vec![
-            WalRow { id: "r1".into(), written_at: 90, blob_ref: None },
-            WalRow { id: "r2".into(), written_at: 100, blob_ref: None }, // == T, kept
-            WalRow { id: "r3".into(), written_at: 140, blob_ref: None }, // > T, DROPPED
+            WalRow {
+                id: "r1".into(),
+                written_at: 90,
+                blob_ref: None,
+            },
+            WalRow {
+                id: "r2".into(),
+                written_at: 100,
+                blob_ref: None,
+            }, // == T, kept
+            WalRow {
+                id: "r3".into(),
+                written_at: 140,
+                blob_ref: None,
+            }, // > T, DROPPED
         ];
         let report = restore_to_offset(&arch, 100, &rows, &blobs, &source, &kms).unwrap();
 
-        assert_eq!(report.restored_to_offset, 100, "restored to the consistency point T");
+        assert_eq!(
+            report.restored_to_offset, 100,
+            "restored to the consistency point T"
+        );
         let ids: Vec<&str> = report.oltp_rows.iter().map(|r| r.id.as_str()).collect();
-        assert_eq!(ids, vec!["r1", "r2"], "rows ≤ T restored; the row past T dropped");
+        assert_eq!(
+            ids,
+            vec!["r1", "r2"],
+            "rows ≤ T restored; the row past T dropped"
+        );
         assert!(
             report.oltp_rows.iter().all(|r| r.written_at <= 100),
             "no restored row may be past the consistency point"
@@ -491,11 +520,22 @@ mod tests {
         let source = SourceLog::new();
         let kms = KmsEngine::new();
         let rows = vec![
-            WalRow { id: "r1".into(), written_at: 90, blob_ref: Some(h("blob-a")) },
-            WalRow { id: "r2".into(), written_at: 100, blob_ref: Some(h("blob-b")) },
+            WalRow {
+                id: "r1".into(),
+                written_at: 90,
+                blob_ref: Some(h("blob-a")),
+            },
+            WalRow {
+                id: "r2".into(),
+                written_at: 100,
+                blob_ref: Some(h("blob-b")),
+            },
         ];
         let report = restore_to_offset(&arch, 100, &rows, &blobs, &source, &kms).unwrap();
-        assert_eq!(report.dangling_ref_count, 0, "every referenced blob is present → 0 dangling");
+        assert_eq!(
+            report.dangling_ref_count, 0,
+            "every referenced blob is present → 0 dangling"
+        );
     }
 
     /// **MANDATORY-CORE: a referenced-but-MISSING ContentHash makes the restore FAIL (not silently
@@ -509,18 +549,32 @@ mod tests {
         let source = SourceLog::new();
         let kms = KmsEngine::new();
         let rows = vec![
-            WalRow { id: "r1".into(), written_at: 90, blob_ref: Some(h("blob-a")) },
-            WalRow { id: "r2".into(), written_at: 95, blob_ref: Some(h("blob-b")) }, // MISSING
+            WalRow {
+                id: "r1".into(),
+                written_at: 90,
+                blob_ref: Some(h("blob-a")),
+            },
+            WalRow {
+                id: "r2".into(),
+                written_at: 95,
+                blob_ref: Some(h("blob-b")),
+            }, // MISSING
         ];
         let err = restore_to_offset(&arch, 100, &rows, &blobs, &source, &kms)
             .expect_err("a row → missing blob MUST make the restore FAIL, not pass silently");
         assert_eq!(
             err,
-            RestoreError::DanglingBlobRef { row_id: "r2".into(), missing: h("blob-b") }
+            RestoreError::DanglingBlobRef {
+                row_id: "r2".into(),
+                missing: h("blob-b")
+            }
         );
         // The error is loud + specific (observability is part of the pass).
         let m = err.to_string();
-        assert!(m.contains("DANGLING BLOB REF"), "must name the dangling-ref case: {m}");
+        assert!(
+            m.contains("DANGLING BLOB REF"),
+            "must name the dangling-ref case: {m}"
+        );
         assert!(m.contains("r2"), "must name the offending row: {m}");
     }
 
@@ -534,9 +588,17 @@ mod tests {
         let source = SourceLog::new();
         let kms = KmsEngine::new();
         let rows = vec![
-            WalRow { id: "kept".into(), written_at: 90, blob_ref: None },
+            WalRow {
+                id: "kept".into(),
+                written_at: 90,
+                blob_ref: None,
+            },
             // r-future is PAST T=100 and references a missing blob — but it is dropped, so OK.
-            WalRow { id: "r-future".into(), written_at: 150, blob_ref: Some(h("gone")) },
+            WalRow {
+                id: "r-future".into(),
+                written_at: 150,
+                blob_ref: Some(h("gone")),
+            },
         ];
         let report = restore_to_offset(&arch, 100, &rows, &blobs, &source, &kms).unwrap();
         assert_eq!(report.oltp_rows.len(), 1, "only the kept row is restored");
@@ -567,8 +629,16 @@ mod tests {
             !derived.has_doc("r-future"),
             "a source event past T must NOT be reindexed (consumers resume at T)"
         );
-        assert_eq!(derived.resumed_at(), 100, "consumers resume at the restored point T");
-        assert_eq!(derived.doc_count(), 3, "derived == source replayed to T, by construction");
+        assert_eq!(
+            derived.resumed_at(),
+            100,
+            "consumers resume at the restored point T"
+        );
+        assert_eq!(
+            derived.doc_count(),
+            3,
+            "derived == source replayed to T, by construction"
+        );
     }
 
     /// Reindex-from-source is IDEMPOTENT — replaying the same source twice yields the same derived
@@ -576,11 +646,18 @@ mod tests {
     #[test]
     fn reindex_from_source_is_idempotent() {
         let mut source = SourceLog::new();
-        source.append(10, "dup").append(20, "dup").append(30, "other");
+        source
+            .append(10, "dup")
+            .append(20, "dup")
+            .append(30, "other");
         let a = ReindexFromSource::reindex(&source, 100);
         let b = ReindexFromSource::reindex(&source, 100);
         assert_eq!(a.docs(), b.docs(), "reindex is deterministic + idempotent");
-        assert_eq!(a.doc_count(), 2, "the duplicated projection collapses to one doc");
+        assert_eq!(
+            a.doc_count(),
+            2,
+            "the duplicated projection collapses to one doc"
+        );
     }
 
     // ───────── the KEK restore-except-crypto-shredded rule (§7.5) ─────────
@@ -601,8 +678,10 @@ mod tests {
         let shredded_kek = KekId::new(shredded.clone(), region_eu());
         kms.ensure_kek(&live_kek);
         kms.ensure_kek(&shredded_kek);
-        kms.ensure_dek(&live, &region_eu(), KeyClass::Tenant).unwrap();
-        kms.ensure_dek(&shredded, &region_eu(), KeyClass::Tenant).unwrap();
+        kms.ensure_dek(&live, &region_eu(), KeyClass::Tenant)
+            .unwrap();
+        kms.ensure_dek(&shredded, &region_eu(), KeyClass::Tenant)
+            .unwrap();
 
         // Crypto-shred the second tenant (destroy its KEK — the offboard / erasure lever).
         assert!(kms.destroy_kek(&shredded_kek));
@@ -617,7 +696,11 @@ mod tests {
             "a CRYPTO-SHREDDED tenant's KEK must NOT be restored — it stays dead across the restore (§7.5)"
         );
         let counts = restored_key_counts(&report);
-        assert_eq!(counts.get(&shredded), None, "the shredded tenant contributes 0 restored keys");
+        assert_eq!(
+            counts.get(&shredded),
+            None,
+            "the shredded tenant contributes 0 restored keys"
+        );
         assert_eq!(counts.get(&live).copied(), Some(1));
     }
 
@@ -654,17 +737,35 @@ mod tests {
         kms.ensure_dek(&t, &region_eu(), KeyClass::Tenant).unwrap();
 
         let rows = vec![
-            WalRow { id: "r1".into(), written_at: 90, blob_ref: Some(h("a")) },
-            WalRow { id: "r2".into(), written_at: 100, blob_ref: Some(h("b")) },
-            WalRow { id: "r3".into(), written_at: 250, blob_ref: None }, // past T → dropped
+            WalRow {
+                id: "r1".into(),
+                written_at: 90,
+                blob_ref: Some(h("a")),
+            },
+            WalRow {
+                id: "r2".into(),
+                written_at: 100,
+                blob_ref: Some(h("b")),
+            },
+            WalRow {
+                id: "r3".into(),
+                written_at: 250,
+                blob_ref: None,
+            }, // past T → dropped
         ];
         let report = restore_to_offset(&arch, 100, &rows, &blobs, &source, &kms).unwrap();
 
         assert_eq!(report.restored_to_offset, 100);
         assert_eq!(report.oltp_rows.len(), 2, "rows ≤ T");
-        assert_eq!(report.dangling_ref_count, 0, "every referenced blob present");
+        assert_eq!(
+            report.dangling_ref_count, 0,
+            "every referenced blob present"
+        );
         assert!(report.derived.has_doc("r1") && report.derived.has_doc("r2"));
         assert_eq!(report.derived.resumed_at(), 100);
-        assert!(report.restored_key_for_tenant(&t), "the live tenant's KEK is restored");
+        assert!(
+            report.restored_key_for_tenant(&t),
+            "the live tenant's KEK is restored"
+        );
     }
 }

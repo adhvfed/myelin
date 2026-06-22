@@ -103,9 +103,7 @@ mod tests {
     /// the frame is the Bus's frame by construction.
     fn sample_pointer() -> CrossCellPointer {
         CrossCellPointer::new(
-            OpaqueSubjectId::from_ref(ArtifactRef(
-                "myelin://01J0ACME/issues/issue/42".into(),
-            )),
+            OpaqueSubjectId::from_ref(ArtifactRef("myelin://01J0ACME/issues/issue/42".into())),
             ArtifactType::Issue,
             CorrelationId("01J0CORR".into()),
             CellId::from_token("cell-fr-par-1"),
@@ -132,8 +130,14 @@ mod tests {
             "the pinned frame carries EXACTLY the four §6.1 fields — no payload/PII/authz state"
         );
         // `type` is the frozen wire name (not the Rust `r#type`).
-        assert!(obj.contains_key("type"), "the frozen wire field name is `type`");
-        assert!(!obj.contains_key("r#type"), "the Rust keyword never leaks onto the wire");
+        assert!(
+            obj.contains_key("type"),
+            "the frozen wire field name is `type`"
+        );
+        assert!(
+            !obj.contains_key("r#type"),
+            "the Rust keyword never leaks onto the wire"
+        );
 
         let back: CrossCellPointer =
             serde_json::from_value(json).expect("frame deserialises to the same value");
@@ -203,7 +207,10 @@ mod tests {
         let routed_subject = assert_cell_agnostic(&consumer);
         assert_eq!(routed_subject.0, "myelin://01J0ACME/issues/issue/42");
         assert_eq!(consumer.home_cell().as_str(), "cell-fr-par-1");
-        assert_eq!(consumer, provider, "the CDC wire shape is conformant both ways");
+        assert_eq!(
+            consumer, provider,
+            "the CDC wire shape is conformant both ways"
+        );
     }
 
     /// A self-contained envelope fixture (the crosscell tests own their fixture rather than

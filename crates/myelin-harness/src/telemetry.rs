@@ -388,7 +388,10 @@ fn fmt_labels(labels: &[Label]) -> String {
     if labels.is_empty() {
         String::new()
     } else {
-        let inner: Vec<String> = labels.iter().map(|l| format!("{}={}", l.key, l.value)).collect();
+        let inner: Vec<String> = labels
+            .iter()
+            .map(|l| format!("{}={}", l.key, l.value))
+            .collect();
         format!("{{{}}}", inner.join(", "))
     }
 }
@@ -586,7 +589,10 @@ mod tests {
         // Even with a "passing-looking" value present, the vacuous predicate is rejected.
         src.set_scalar(SignalName::OutboxDepth, 0);
         let verdict = src.assert_signal(SignalName::OutboxDepth, Predicate::AlwaysTrue);
-        assert!(!verdict.is_green(), "a vacuous assertion must NOT read green");
+        assert!(
+            !verdict.is_green(),
+            "a vacuous assertion must NOT read green"
+        );
         match verdict {
             Assertion::Rejected {
                 reason: RejectReason::VacuousPredicate,

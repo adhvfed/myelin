@@ -209,7 +209,10 @@ fn cdc_4_4_explain_trace_is_non_empty_and_correct() {
         &at_latest(),
     );
     let rendered = inspector_renders_trace(&allow_trace);
-    assert!(!rendered.is_empty(), "the inspector renders a non-empty trace");
+    assert!(
+        !rendered.is_empty(),
+        "the inspector renders a non-empty trace"
+    );
     assert!(
         rendered.last().unwrap().starts_with("ALLOW"),
         "an approver's trace ends in ALLOW: {rendered:?}"

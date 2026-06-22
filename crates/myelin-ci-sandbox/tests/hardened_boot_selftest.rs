@@ -36,7 +36,8 @@ use std::path::PathBuf;
 fn trivial_hardened_spec() -> JobSpec {
     JobSpec::new(
         JobKind::Ci,
-        ImageRef::pinned("registry.example/runner@sha256:0123456789abcdef0123456789abcdef").unwrap(),
+        ImageRef::pinned("registry.example/runner@sha256:0123456789abcdef0123456789abcdef")
+            .unwrap(),
         // The one-shot boot uses init=/bin/true (set by the backend); the command is the
         // logical in-guest workload the spec describes.
         vec!["/bin/true".into()],
@@ -119,19 +120,40 @@ fn hardened_boot_selftest_boots_a_real_microvm_and_asserts_the_profile() {
     profile
         .assert_enforced()
         .expect("the mandatory hardening profile must be enforced");
-    assert!(profile.egress_default_deny, "egress-default-deny must be in force");
+    assert!(
+        profile.egress_default_deny,
+        "egress-default-deny must be in force"
+    );
     assert!(profile.read_only_root, "read-only-root must be in force");
-    assert!(profile.pids_max > 0, "pids.max must be set (fork-bomb ceiling)");
-    assert!(!profile.network_device, "fully default-deny ⇒ NO NIC attached");
+    assert!(
+        profile.pids_max > 0,
+        "pids.max must be set (fork-bomb ceiling)"
+    );
+    assert!(
+        !profile.network_device,
+        "fully default-deny ⇒ NO NIC attached"
+    );
 
     // 2) Build the REAL machine config the boot uses and assert posture FROM it (the enforced state).
     let cfg = FcMachineConfig::from_spec(&spec, &profile, /* oneshot = */ true);
-    assert!(cfg.root_is_read_only(), "the boot config's root drive MUST be read-only");
-    assert!(!cfg.has_network_device(), "the boot config MUST attach no NIC (egress closed at the device)");
+    assert!(
+        cfg.root_is_read_only(),
+        "the boot config's root drive MUST be read-only"
+    );
+    assert!(
+        !cfg.has_network_device(),
+        "the boot config MUST attach no NIC (egress closed at the device)"
+    );
     assert_eq!(cfg.pids_max(), profile.pids_max);
     let json = cfg.to_json();
-    assert!(json.contains("\"is_read_only\": true"), "is_read_only=true in the real config JSON");
-    assert!(!json.contains("network-interfaces"), "no network-interfaces key (egress device-closed)");
+    assert!(
+        json.contains("\"is_read_only\": true"),
+        "is_read_only=true in the real config JSON"
+    );
+    assert!(
+        !json.contains("network-interfaces"),
+        "no network-interfaces key (egress device-closed)"
+    );
 
     // Sanity that machine_config (which asserts hardening) agrees.
     let cfg2 = FirecrackerBackend::machine_config(&spec, true)
@@ -139,7 +161,8 @@ fn hardened_boot_selftest_boots_a_real_microvm_and_asserts_the_profile() {
     assert_eq!(cfg, cfg2);
 
     // 3) BOOT a REAL microVM with this exact hardened config and capture the guest serial console.
-    let cfg_path = std::env::temp_dir().join(format!("myelin-fc-selftest-{}.json", std::process::id()));
+    let cfg_path =
+        std::env::temp_dir().join(format!("myelin-fc-selftest-{}.json", std::process::id()));
     std::fs::write(&cfg_path, cfg.to_json()).expect("write machine config");
     let (exit_code, console) = boot_and_capture(&cfg_path).expect("boot the microVM");
     let _ = std::fs::remove_file(&cfg_path);

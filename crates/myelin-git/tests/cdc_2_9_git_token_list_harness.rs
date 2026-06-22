@@ -11,7 +11,9 @@
 //! Bus's cross-subsystem harness IN FULL (every name §6.1-conformant + carries the `git.` prefix +
 //! unique), and a malformed addition to git's list is REJECTED LOUDLY by the harness.
 
-use myelin_events::{HarnessError, RegisteredToken, SubsystemTokenList, TaxonomyError, TokenListHarness};
+use myelin_events::{
+    HarnessError, RegisteredToken, SubsystemTokenList, TaxonomyError, TokenListHarness,
+};
 use myelin_git::events::GIT_EVENT_TOKENS;
 
 /// **PROVIDER (git) registers its COMPLETE list; the CONSUMER (the Bus harness) admits it in full.**
@@ -19,8 +21,14 @@ use myelin_git::events::GIT_EVENT_TOKENS;
 fn git_complete_list_is_admitted_by_the_bus_harness_in_full() {
     let mut harness = TokenListHarness::new();
     let git = SubsystemTokenList::references_only("git", GIT_EVENT_TOKENS);
-    let admitted = harness.register(&git).expect("git's complete list is admitted by the harness");
-    assert_eq!(admitted, GIT_EVENT_TOKENS.len(), "EVERY git token is admitted (0 ungrammatical)");
+    let admitted = harness
+        .register(&git)
+        .expect("git's complete list is admitted by the harness");
+    assert_eq!(
+        admitted,
+        GIT_EVENT_TOKENS.len(),
+        "EVERY git token is admitted (0 ungrammatical)"
+    );
     assert_eq!(harness.names_for("git").len(), GIT_EVENT_TOKENS.len());
     // The load-bearing tokens are registered + looked-up by name (the X-5 names anchor).
     assert!(harness.is_registered("git.ref.updated"));
@@ -33,13 +41,19 @@ fn git_complete_list_is_admitted_by_the_bus_harness_in_full() {
 fn the_harness_rejects_a_malformed_addition_to_gits_list() {
     let mut harness = TokenListHarness::new();
     harness
-        .register(&SubsystemTokenList::references_only("git", GIT_EVENT_TOKENS))
+        .register(&SubsystemTokenList::references_only(
+            "git",
+            GIT_EVENT_TOKENS,
+        ))
         .unwrap();
 
     // present-tense verb.
     assert!(matches!(
         harness.add("git", RegisteredToken::references_only("git.pr.open")),
-        Err(HarnessError::UngrammaticalToken { cause: TaxonomyError::PresentTenseVerb { .. }, .. })
+        Err(HarnessError::UngrammaticalToken {
+            cause: TaxonomyError::PresentTenseVerb { .. },
+            ..
+        })
     ));
     // a foreign-prefix name (git cannot register a ci.* name — the acyclic-producer invariant).
     assert!(matches!(

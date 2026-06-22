@@ -69,7 +69,10 @@ fn add(object: &str, relation: &str, subject: &str) -> TupleDelta {
 }
 
 fn at_latest() -> Consistency {
-    Consistency { at_least: Zookie(String::new()), mode: ConsistencyMode::Strong }
+    Consistency {
+        at_least: Zookie(String::new()),
+        mode: ConsistencyMode::Strong,
+    }
 }
 
 fn now() -> Timestamp {
@@ -97,7 +100,14 @@ fn wired(cap: usize, scope: &TenantScope, grants: &[TupleDelta]) -> ListObjects 
     }
 
     store
-        .write_tuples(scope, &principal(&scope.tenant().0, "p-admin"), grants, None, None, now())
+        .write_tuples(
+            scope,
+            &principal(&scope.tenant().0, "p-admin"),
+            grants,
+            None,
+            None,
+            now(),
+        )
         .expect("seed grants");
     let bus = InProcessBus::new();
     let relay = Relay::new(outbox.clone(), bus.clone(), || Timestamp("t".into()));
@@ -141,14 +151,23 @@ fn cdc_4_3_identity_filter_lowers_to_one_knowledge_view_and_count_query() {
     );
     // The producer names the consumer's OWN id column (§7.3): `db_row.id`, NOT `database_row.id`.
     if let SetExpr::InRelation { ref via_column, .. } = set_expr {
-        assert_eq!(via_column, &db_row_id_colref(), "the producer + consumer agree on the §7.3 db_row.id via_column");
+        assert_eq!(
+            via_column,
+            &db_row_id_colref(),
+            "the producer + consumer agree on the §7.3 db_row.id via_column"
+        );
     }
 
     // CONSUMER (the VIEW): Knowledge lowers it over its OWN db_row.id column into ONE leak-free query.
     let view = compose_db_view_query(&set_expr, &viewer, s.tenant(), "db:projects");
-    assert_eq!(view.statement_count(), 1, "the consumer composes EXACTLY ONE view query (no N+1)");
+    assert_eq!(
+        view.statement_count(),
+        1,
+        "the consumer composes EXACTLY ONE view query (no N+1)"
+    );
     assert!(
-        view.sql.contains("JOIN authz_visible av0 ON av0.object_id = db_row.id"),
+        view.sql
+            .contains("JOIN authz_visible av0 ON av0.object_id = db_row.id"),
         "the consumer JOINs the producer's reverse index over its own db_row.id (§4.1/§7.3): {}",
         view.sql
     );
@@ -156,7 +175,11 @@ fn cdc_4_3_identity_filter_lowers_to_one_knowledge_view_and_count_query() {
 
     // CONSUMER (the COUNT — the KN-D5 headline): the SAME ACL conjunct INSIDE a SELECT COUNT(*).
     let count = compose_db_count_query(&set_expr, &viewer, s.tenant(), "db:projects");
-    assert_eq!(count.statement_count(), 1, "the consumer composes EXACTLY ONE COUNT query");
+    assert_eq!(
+        count.statement_count(),
+        1,
+        "the consumer composes EXACTLY ONE COUNT query"
+    );
     assert!(count.is_count && count.sql.starts_with("SELECT COUNT(*) FROM db_row"));
     assert!(
         count.sql.contains("AND (av0.object_id IS NOT NULL)"),
@@ -181,7 +204,11 @@ fn kn_d5_chained_grant_list_zero_leak_zero_count_leak_one_query_then_revoke_refl
     const VISIBLE: usize = 3;
     let mut grants: Vec<TupleDelta> = Vec::new();
     for i in 0..VISIBLE {
-        grants.push(add(&format!("database_row:row-{i}"), "direct_reader", "p:viewer"));
+        grants.push(add(
+            &format!("database_row:row-{i}"),
+            "direct_reader",
+            "p:viewer",
+        ));
     }
     grants.push(add("database_row:row-secret", "direct_reader", "p:other"));
     // The cap is BELOW the visible slice → the producer pushes down to Filter (the SetExpr JOIN path).
@@ -197,33 +224,62 @@ fn kn_d5_chained_grant_list_zero_leak_zero_count_leak_one_query_then_revoke_refl
     );
     let set_expr = match r {
         ListObjectsResult::Filter { set_expr, .. } => set_expr,
-        ListObjectsResult::Ids { .. } => panic!("the partial-visibility list pushes down to Filter"),
+        ListObjectsResult::Ids { .. } => {
+            panic!("the partial-visibility list pushes down to Filter")
+        }
     };
     let view = compose_db_view_query(&set_expr, &viewer, s.tenant(), "db:projects");
     let count_q = compose_db_count_query(&set_expr, &viewer, s.tenant(), "db:projects");
-    assert_eq!(view.statement_count(), 1, "ONE view query (KN-D5 signal: 1 query)");
+    assert_eq!(
+        view.statement_count(),
+        1,
+        "ONE view query (KN-D5 signal: 1 query)"
+    );
     assert_eq!(count_q.statement_count(), 1, "ONE COUNT query");
     let lowered = lower_over_db_row_id(&set_expr, &viewer);
-    assert!(lowered.joins.len() <= 1, "no N+1: at most one JOIN, got {}", lowered.joins.len());
+    assert!(
+        lowered.joins.len() <= 1,
+        "no N+1: at most one JOIN, got {}",
+        lowered.joins.len()
+    );
 
     // Build the authz_visible model the live JOIN reads, fed the SAME grants at rev 1. The model is
     // keyed on the relation the producer emitted in its `InRelation` (the `read` permission — the JOIN
     // keys on `av.relation = read`), so the model = the live SQL the JOIN runs.
     let av = AuthzVisibleIndex::new();
     for i in 0..VISIBLE {
-        av.grant(s.tenant(), &region, "p:viewer", ROW_PRODUCER_PERMISSION, &format!("database_row:row-{i}"), "zk-0000000001");
+        av.grant(
+            s.tenant(),
+            &region,
+            "p:viewer",
+            ROW_PRODUCER_PERMISSION,
+            &format!("database_row:row-{i}"),
+            "zk-0000000001",
+        );
     }
-    av.grant(s.tenant(), &region, "p:other", ROW_PRODUCER_PERMISSION, "database_row:row-secret", "zk-0000000001");
+    av.grant(
+        s.tenant(),
+        &region,
+        "p:other",
+        ROW_PRODUCER_PERMISSION,
+        "database_row:row-secret",
+        "zk-0000000001",
+    );
 
     // The candidate universe includes the secret row (the leak witness).
-    let mut candidates: Vec<String> =
-        (0..VISIBLE).map(|i| format!("database_row:row-{i}")).collect();
+    let mut candidates: Vec<String> = (0..VISIBLE)
+        .map(|i| format!("database_row:row-{i}"))
+        .collect();
     candidates.push("database_row:row-secret".into());
     let candidate_refs: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
 
     let visible = av.evaluate(s.tenant(), &region, &viewer, &lowered, &candidate_refs);
     // 0 LEAK: the secret row (granted to p:other) NEVER appears in the viewer's list.
-    assert_eq!(visible.len(), VISIBLE, "exactly the {VISIBLE} visible rows survive");
+    assert_eq!(
+        visible.len(),
+        VISIBLE,
+        "exactly the {VISIBLE} visible rows survive"
+    );
     assert!(
         !visible.iter().any(|o| o == "database_row:row-secret"),
         "0 leak: a row the viewer cannot see never appears (KN-D5)"
@@ -231,17 +287,32 @@ fn kn_d5_chained_grant_list_zero_leak_zero_count_leak_one_query_then_revoke_refl
     // 0 COUNT-LEAK: the permission-correct COUNT is exactly the visible cardinality, NOT the universe.
     let n = av.count_visible(s.tenant(), &region, &viewer, &lowered, &candidate_refs);
     assert_eq!(n, VISIBLE, "0 count-leak: COUNT = {VISIBLE} (the visible rows), NOT {} (the universe incl. the secret)", candidate_refs.len());
-    assert_eq!(n, visible.len(), "the COUNT equals the listed cardinality — no second path can diverge");
+    assert_eq!(
+        n,
+        visible.len(),
+        "the COUNT equals the listed cardinality — no second path can diverge"
+    );
 
     // ── 3. REVOKE reflected (zookie / read-your-writes): revoke row-0 at a later revision; it drops out
     //       of BOTH the list and the COUNT (the new-enemy guard, KN-D5/4.10). ──────────────────────────
-    av.revoke(s.tenant(), &region, "p:viewer", ROW_PRODUCER_PERMISSION, "database_row:row-0", "zk-0000000099");
+    av.revoke(
+        s.tenant(),
+        &region,
+        "p:viewer",
+        ROW_PRODUCER_PERMISSION,
+        "database_row:row-0",
+        "zk-0000000099",
+    );
     let after = av.evaluate(s.tenant(), &region, &viewer, &lowered, &candidate_refs);
     assert!(
         !after.iter().any(|o| o == "database_row:row-0"),
         "the just-revoked row is reflected — it drops out of the list (zookie, KN-D5)"
     );
-    assert_eq!(after.len(), VISIBLE - 1, "exactly one row (the revoked one) dropped out");
+    assert_eq!(
+        after.len(),
+        VISIBLE - 1,
+        "exactly one row (the revoked one) dropped out"
+    );
     let n_after = av.count_visible(s.tenant(), &region, &viewer, &lowered, &candidate_refs);
     assert_eq!(n_after, VISIBLE - 1, "0 count-leak after revoke: the COUNT decremented — a revoked grant cannot be counted stale");
 

@@ -26,13 +26,13 @@ use myelin_git::check_status::{
     CheckContext, CheckState, CheckStatus, CheckStatusProjection, GitOid, HumanisedRef, Timestamp,
     TrustTier,
 };
-use myelin_git::fork_gate::{endorsement_need, Endorser, EndorsementNeed, EndorsementResolver};
+use myelin_git::fork_gate::{endorsement_need, EndorsementNeed, EndorsementResolver, Endorser};
 use myelin_git::live_check::GitCheckGate;
 use myelin_git::merge_gate::{evaluate_merge_gate, MergeGateOutcome, MergeGatePolicy};
 use myelin_identity::{
     AuthzError, CaveatContext, Consistency, Credential, Decision, EffectivePolicy, IdentityService,
     ListObjectsResult, ObjectId, ObjectType, Permission, Precondition, Principal, PrincipalId,
-    PrincipalKind, RewriteTrace, Result as IdResult, SubjectTree, TupleDelta, Zookie,
+    PrincipalKind, Result as IdResult, RewriteTrace, SubjectTree, TupleDelta, Zookie,
 };
 use myelin_substrate::{FailStaticThreshold, SystemClock};
 use myelin_tenancy::{ArtifactRef, Region, TenantId};
@@ -54,7 +54,10 @@ fn producer_fact(context: &str, state: CheckState, trust: TrustTier) -> CheckSta
         run_attempt: 1,
         trust_tier: trust, // CI's STAMP — Git reads it off, never recomputes.
         details_ref: ArtifactRef("myelin://acme/ci/run/7#step-1".into()),
-        summary: HumanisedRef { template_key: "ci.check.updated".into(), args: BTreeMap::new() },
+        summary: HumanisedRef {
+            template_key: "ci.check.updated".into(),
+            args: BTreeMap::new(),
+        },
         started_at: Timestamp("2026-06-22T00:00:00Z".into()),
         completed_at: Some(Timestamp("2026-06-22T00:01:00Z".into())),
         cost_settled: true,
@@ -62,8 +65,11 @@ fn producer_fact(context: &str, state: CheckState, trust: TrustTier) -> CheckSta
 }
 
 fn principal(id: &str) -> Principal {
-    let mut p =
-        Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, TenantId("acme".into()));
+    let mut p = Principal::stub(
+        PrincipalId(id.into()),
+        PrincipalKind::Human,
+        TenantId("acme".into()),
+    );
     p.region = Region("fr-par".into());
     p
 }
@@ -74,7 +80,10 @@ struct StubId {
 impl StubId {
     fn with_endorser(principal_id: &str) -> Self {
         let mut endorsers = HashMap::new();
-        endorsers.insert(format!("approve_untrusted_ci@{principal_id}@{REPO}"), Decision::Allow);
+        endorsers.insert(
+            format!("approve_untrusted_ci@{principal_id}@{REPO}"),
+            Decision::Allow,
+        );
         Self { endorsers }
     }
 }
@@ -94,7 +103,10 @@ impl IdentityService for StubId {
         // approve_untrusted_ci on the repo", never CI "is this run trusted" (no recompute).
         Ok(self
             .endorsers
-            .get(&format!("{}@{}@{}", permission.0, s.principal_id.0, object.0))
+            .get(&format!(
+                "{}@{}@{}",
+                permission.0, s.principal_id.0, object.0
+            ))
             .copied()
             .unwrap_or(Decision::Deny))
     }
@@ -185,7 +197,11 @@ fn ci_stamps_fork_tier_git_treats_it_neutral_until_endorsed() {
     let fork_fact = producer_fact("build", CheckState::Success, TrustTier::UntrustedFork);
     let opaque: serde_json::Value = serde_json::to_value(&fork_fact).unwrap();
     let decoded: CheckStatus = serde_json::from_value(opaque).unwrap();
-    assert_eq!(decoded.trust_tier, TrustTier::UntrustedFork, "CI's tier stamp survives the seam");
+    assert_eq!(
+        decoded.trust_tier,
+        TrustTier::UntrustedFork,
+        "CI's tier stamp survives the seam"
+    );
 
     let mut proj = CheckStatusProjection::new();
     proj.apply(&decoded);
@@ -211,9 +227,18 @@ fn ci_stamps_fork_tier_git_treats_it_neutral_until_endorsed() {
         &policy.required,
         &proj,
         &head,
-        &Endorser { subject: &m, repo: &repo, zookie: Zookie("zk".into()), subject_revoked: false },
+        &Endorser {
+            subject: &m,
+            repo: &repo,
+            zookie: Zookie("zk".into()),
+            subject_revoked: false,
+        },
     );
-    assert_eq!(endorsed, vec![build], "a maintainer's plain approve_untrusted_ci check endorses");
+    assert_eq!(
+        endorsed,
+        vec![build],
+        "a maintainer's plain approve_untrusted_ci check endorses"
+    );
     assert_eq!(
         evaluate_merge_gate(&policy, &proj, &head, &endorsed),
         MergeGateOutcome::Admitted,
@@ -231,7 +256,11 @@ fn the_fork_author_cannot_self_endorse() {
     let policy = MergeGatePolicy::from_required_contexts(&["ci/build"]).unwrap();
 
     let mut proj = CheckStatusProjection::new();
-    proj.apply(&producer_fact("build", CheckState::Success, TrustTier::UntrustedFork));
+    proj.apply(&producer_fact(
+        "build",
+        CheckState::Success,
+        TrustTier::UntrustedFork,
+    ));
 
     // Only `maintainer-1` holds the relation; the fork author does not.
     let g = gate(StubId::with_endorser("maintainer-1"));
@@ -241,9 +270,17 @@ fn the_fork_author_cannot_self_endorse() {
         &policy.required,
         &proj,
         &head,
-        &Endorser { subject: &author, repo: &repo, zookie: Zookie("zk".into()), subject_revoked: false },
+        &Endorser {
+            subject: &author,
+            repo: &repo,
+            zookie: Zookie("zk".into()),
+            subject_revoked: false,
+        },
     );
-    assert!(endorsed.is_empty(), "the fork author cannot self-endorse (0 forks green their gate)");
+    assert!(
+        endorsed.is_empty(),
+        "the fork author cannot self-endorse (0 forks green their gate)"
+    );
     assert!(matches!(
         evaluate_merge_gate(&policy, &proj, &head, &endorsed),
         MergeGateOutcome::Blocked { .. }

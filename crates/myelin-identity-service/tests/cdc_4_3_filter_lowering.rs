@@ -72,8 +72,14 @@ fn consumer_assembles_one_query(table: &str, lowered: &Lowered) -> String {
 /// one query JOINing `authz_visible` on its own `issue.id`.
 #[test]
 fn cdc_4_3_board_consumer_pushes_down_filter_against_its_own_id_column() {
-    let via = ColRef { table: "issue".into(), column: "id".into() };
-    let set_expr = SetExpr::InRelation { relation: RelName("read".into()), via_column: via.clone() };
+    let via = ColRef {
+        table: "issue".into(),
+        column: "id".into(),
+    };
+    let set_expr = SetExpr::InRelation {
+        relation: RelName("read".into()),
+        via_column: via.clone(),
+    };
 
     // PROVIDER: lower the Filter.
     let lowered = lower(&set_expr, &subject("p:alice"), &via);
@@ -96,13 +102,26 @@ fn cdc_4_3_board_consumer_pushes_down_filter_against_its_own_id_column() {
 /// ORed in the WHERE.
 #[test]
 fn cdc_4_3_union_lowers_to_one_query_no_n_plus_1() {
-    let via = ColRef { table: "pr".into(), column: "id".into() };
+    let via = ColRef {
+        table: "pr".into(),
+        column: "id".into(),
+    };
     let set_expr = SetExpr::Union(vec![
-        SetExpr::InRelation { relation: RelName("reader".into()), via_column: via.clone() },
-        SetExpr::InRelation { relation: RelName("writer".into()), via_column: via.clone() },
+        SetExpr::InRelation {
+            relation: RelName("reader".into()),
+            via_column: via.clone(),
+        },
+        SetExpr::InRelation {
+            relation: RelName("writer".into()),
+            via_column: via.clone(),
+        },
     ]);
     let lowered = lower(&set_expr, &subject("p:alice"), &via);
-    assert_eq!(lowered.joins.len(), 2, "two distinct relations → two JOINs (still one query)");
+    assert_eq!(
+        lowered.joins.len(),
+        2,
+        "two distinct relations → two JOINs (still one query)"
+    );
     let sql = consumer_assembles_one_query("pr", &lowered);
     assert!(
         sql.contains("WHERE ((av0.object_id IS NOT NULL OR av1.object_id IS NOT NULL))"),
@@ -114,7 +133,10 @@ fn cdc_4_3_union_lowers_to_one_query_no_n_plus_1() {
 /// post-filter.** A Knowledge db-view consumer sees "all rows EXCEPT the confidential ids".
 #[test]
 fn cdc_4_3_difference_conjoins_the_deny_set() {
-    let via = ColRef { table: "database_row".into(), column: "id".into() };
+    let via = ColRef {
+        table: "database_row".into(),
+        column: "id".into(),
+    };
     let set_expr = SetExpr::Difference(
         Box::new(SetExpr::All),
         Box::new(SetExpr::Ids(vec![ObjectId("database_row:secret".into())])),
@@ -131,8 +153,13 @@ fn cdc_4_3_difference_conjoins_the_deny_set() {
 /// consumer JOINs against the server-materialised tuple set keyed on its own id column.
 #[test]
 fn cdc_4_3_tuple_set_lowers_to_the_join() {
-    let via = ColRef { table: "channel".into(), column: "id".into() };
-    let set_expr = SetExpr::TupleSet { index: AuthzIndexRef("watcher".into()) };
+    let via = ColRef {
+        table: "channel".into(),
+        column: "id".into(),
+    };
+    let set_expr = SetExpr::TupleSet {
+        index: AuthzIndexRef("watcher".into()),
+    };
     let lowered = lower(&set_expr, &subject("p:alice"), &via);
     assert_eq!(lowered.joins.len(), 1);
     let sql = consumer_assembles_one_query("channel", &lowered);
@@ -146,8 +173,14 @@ fn cdc_4_3_tuple_set_lowers_to_the_join() {
 /// **`None` lowers to `FALSE` — a denied subject's board renders nothing (leak-free).**
 #[test]
 fn cdc_4_3_none_renders_empty() {
-    let via = ColRef { table: "issue".into(), column: "id".into() };
+    let via = ColRef {
+        table: "issue".into(),
+        column: "id".into(),
+    };
     let lowered = lower(&SetExpr::None, &subject("p:nobody"), &via);
     let sql = consumer_assembles_one_query("issue", &lowered);
-    assert!(sql.contains("WHERE (FALSE)"), "a denied subject's board is WHERE false (renders nothing): {sql}");
+    assert!(
+        sql.contains("WHERE (FALSE)"),
+        "a denied subject's board is WHERE false (renders nothing): {sql}"
+    );
 }

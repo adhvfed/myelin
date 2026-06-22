@@ -111,7 +111,10 @@ fn cdc_4_9_id_compiled_git_fragment_admits() {
     // The four Git types are now in the compiled vocabulary (admitted, not just declared).
     let ns = svc.namespace();
     for ty in ["repo", "ref", "pull_request", "pr_comment"] {
-        assert!(ns.object_types().contains(&ty.to_string()), "`{ty}` admitted into the cell schema");
+        assert!(
+            ns.object_types().contains(&ty.to_string()),
+            "`{ty}` admitted into the cell schema"
+        );
     }
     // protected_push (admin-only) + merge (parent_repo->protected_push) are compiled permissions.
     assert!(ns.resolve_permission("repo", PROTECTED_PUSH).is_some());
@@ -140,12 +143,27 @@ fn cdc_4_9_git_rewrites_resolve_through_the_engine() {
             Ok(Decision::Allow)
         )
     };
-    assert!(can(&subject("p:alice"), "pull"), "a direct repo admin pulls");
-    assert!(can(&subject("p:carol"), "pull"), "a project member inherits repo pull (parent_project->view)");
-    assert!(!can(&subject("p:bob"), "pull"), "an outsider cannot pull (fail-closed)");
+    assert!(
+        can(&subject("p:alice"), "pull"),
+        "a direct repo admin pulls"
+    );
+    assert!(
+        can(&subject("p:carol"), "pull"),
+        "a project member inherits repo pull (parent_project->view)"
+    );
+    assert!(
+        !can(&subject("p:bob"), "pull"),
+        "an outsider cannot pull (fail-closed)"
+    );
     // protected_push = admin only: alice yes, carol (mere project reader) no.
-    assert!(can(&subject("p:alice"), PROTECTED_PUSH), "admin → protected_push");
-    assert!(!can(&subject("p:carol"), PROTECTED_PUSH), "a project reader does NOT get protected_push (admin-only, §5)");
+    assert!(
+        can(&subject("p:alice"), PROTECTED_PUSH),
+        "admin → protected_push"
+    );
+    assert!(
+        !can(&subject("p:carol"), PROTECTED_PUSH),
+        "a project reader does NOT get protected_push (admin-only, §5)"
+    );
 }
 
 /// **`pull_request.merge = parent_repo->protected_push` resolves end-to-end (§5).** A PR whose parent
@@ -170,8 +188,14 @@ fn cdc_4_9_pull_request_merge_via_protected_push() {
             Ok(Decision::Allow)
         )
     };
-    assert!(can_merge(&subject("p:alice")), "a repo admin can merge (parent_repo->protected_push)");
-    assert!(!can_merge(&subject("p:bob")), "a writer cannot merge (protected_push is admin-only, §5)");
+    assert!(
+        can_merge(&subject("p:alice")),
+        "a repo admin can merge (parent_repo->protected_push)"
+    );
+    assert!(
+        !can_merge(&subject("p:bob")),
+        "a writer cannot merge (protected_push is admin-only, §5)"
+    );
 }
 
 /// **`approve_untrusted_ci` is a plain relation `check` (X-1, C7).** The fork-endorsement gate is
@@ -180,16 +204,31 @@ fn cdc_4_9_pull_request_merge_via_protected_push() {
 #[test]
 fn cdc_4_9_approve_untrusted_ci_is_a_plain_relation_check() {
     let s = scope("acme");
-    let svc = provider(&s, &[add("repo:core", APPROVE_UNTRUSTED_CI, "p:maintainer")]);
+    let svc = provider(
+        &s,
+        &[add("repo:core", APPROVE_UNTRUSTED_CI, "p:maintainer")],
+    );
     let repo = ArtifactRef("repo:core".into());
     let endorse = |actor: &Principal| {
         matches!(
-            svc.check(actor, &Permission(APPROVE_UNTRUSTED_CI.into()), &repo, &at_latest(), None),
+            svc.check(
+                actor,
+                &Permission(APPROVE_UNTRUSTED_CI.into()),
+                &repo,
+                &at_latest(),
+                None
+            ),
             Ok(Decision::Allow)
         )
     };
-    assert!(endorse(&subject("p:maintainer")), "a maintainer endorses an untrusted fork run");
-    assert!(!endorse(&subject("p:bob")), "an outsider cannot endorse (X-1, fail-closed)");
+    assert!(
+        endorse(&subject("p:maintainer")),
+        "a maintainer endorses an untrusted fork run"
+    );
+    assert!(
+        !endorse(&subject("p:bob")),
+        "an outsider cannot endorse (X-1, fail-closed)"
+    );
 }
 
 /// **A CODEOWNERS path-glob compiles to reviewer-requirement tuples that resolve as a relation.**
@@ -201,7 +240,10 @@ fn cdc_4_9_codeowners_glob_compiles_to_resolvable_reviewer_tuples() {
     // Compile a CODEOWNERS rule (path-glob → owners) into ref.code_owner tuples.
     let rules = vec![git_fragment::CodeownersRule {
         path_glob: "/src/payments/**".into(),
-        owners: vec![PrincipalId("p:alice".into()), PrincipalId("team:payments".into())],
+        owners: vec![
+            PrincipalId("p:alice".into()),
+            PrincipalId("team:payments".into()),
+        ],
     }];
     let tuples = git_fragment::compile_codeowners("repo:core", &rules);
     assert_eq!(tuples.len(), 2, "two owners → two code_owner tuples");
@@ -215,6 +257,12 @@ fn cdc_4_9_codeowners_glob_compiles_to_resolvable_reviewer_tuples() {
     let ref_obj = ObjectId("ref:repo:core::/src/payments/**".into());
     let owners = svc.list_subjects_in(&s, &ref_obj, &Permission("code_owner".into()), &at_latest());
     let members: Vec<&str> = owners.members.iter().map(|m| m.0.as_str()).collect();
-    assert!(members.contains(&"p:alice"), "alice is a required reviewer for the path");
-    assert!(members.contains(&"team:payments"), "team:payments is a required reviewer for the path");
+    assert!(
+        members.contains(&"p:alice"),
+        "alice is a required reviewer for the path"
+    );
+    assert!(
+        members.contains(&"team:payments"),
+        "team:payments is a required reviewer for the path"
+    );
 }

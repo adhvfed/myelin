@@ -120,8 +120,7 @@ pub const GIT_WATCHED_RULE: &str = "git.watched";
 /// with the §3.1 table loudly (never silently mis-banded) — Git's set is table-correct by
 /// construction, so this is `Ok` in prod; the error is surfaced (not `unwrap`ped) so a future band
 /// drift in Git's registration fails LOUDLY at boot, not silently in the inbox.
-pub fn git_notif_rules(
-) -> Result<Vec<(&'static str, NotifRule)>, myelin_notif::DefineRuleError> {
+pub fn git_notif_rules() -> Result<Vec<(&'static str, NotifRule)>, myelin_notif::DefineRuleError> {
     Ok(vec![
         (
             GIT_REVIEW_REQUESTED_RULE,
@@ -222,12 +221,7 @@ impl GitWatcherIndex {
     /// `repo.watcher` tuple write; bumps the revision).** The new revision is the watermark a
     /// subsequent strong read pins (a fresh watch reflected at-or-after it). Returns the new zookie
     /// (the `zk-<rev>` form Notif's read-fanout passes back as the watermark).
-    pub fn watch(
-        &self,
-        tenant: &TenantId,
-        principal: &str,
-        subject_root: &str,
-    ) -> Zookie {
+    pub fn watch(&self, tenant: &TenantId, principal: &str, subject_root: &str) -> Zookie {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.revision += 1;
         g.watches
@@ -241,15 +235,13 @@ impl GitWatcherIndex {
     /// read at the NEW watermark reflects the revocation: Notif's read-fanout JOINs the reverse index
     /// at-or-after the new revision, so the unwatched subject_root is absent from the reachable set
     /// (held, not leaked). Returns the new zookie (the watermark a strong read must honour).
-    pub fn unwatch(
-        &self,
-        tenant: &TenantId,
-        principal: &str,
-        subject_root: &str,
-    ) -> Zookie {
+    pub fn unwatch(&self, tenant: &TenantId, principal: &str, subject_root: &str) -> Zookie {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.revision += 1;
-        if let Some(set) = g.watches.get_mut(&(tenant.0.clone(), principal.to_string())) {
+        if let Some(set) = g
+            .watches
+            .get_mut(&(tenant.0.clone(), principal.to_string()))
+        {
             set.remove(subject_root);
         }
         Zookie(format!("zk-{}", g.revision))
@@ -263,7 +255,10 @@ impl GitWatcherIndex {
 
     /// Make the index report UNAVAILABLE (an Identity hiccup) — exercises Notif's held-not-leaked path.
     pub fn set_unavailable(&self, on: bool) {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).unavailable = on;
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unavailable = on;
     }
 }
 
@@ -350,7 +345,11 @@ mod tests {
         let keys: Vec<&str> = rules.iter().map(|(k, _)| *k).collect();
         assert_eq!(
             keys,
-            vec![GIT_REVIEW_REQUESTED_RULE, GIT_MENTIONED_RULE, GIT_WATCHED_RULE]
+            vec![
+                GIT_REVIEW_REQUESTED_RULE,
+                GIT_MENTIONED_RULE,
+                GIT_WATCHED_RULE
+            ]
         );
         for (key, rule) in &rules {
             // the registered default_class is EXACTLY the §3.1 ranking-table band for the reason.
@@ -379,14 +378,21 @@ mod tests {
         let mut reg = NotifRuleRegistry::platform_default();
         let before = reg.len();
         register_git_notif_rules(&mut reg).expect("git's set registers");
-        assert_eq!(reg.len(), before + 3, "git's three rules accreted (no Notif enum/match edit)");
+        assert_eq!(
+            reg.len(),
+            before + 3,
+            "git's three rules accreted (no Notif enum/match edit)"
+        );
 
         // the router classifies a Git review-requested Signal through Git's registered rule.
         let subject = myelin_refs::ArtifactRef("myelin://acme/git/pr/9".into());
         let c = reg.classify(GIT_REVIEW_REQUESTED_RULE, "psn:reviewer", &subject);
         assert_eq!(c.reason, Reason::ReviewRequested);
         assert_eq!(c.default_class, Class::Direct);
-        assert!(c.from_registered_rule, "the Git registration took effect (0 Notif change)");
+        assert!(
+            c.from_registered_rule,
+            "the Git registration took effect (0 Notif change)"
+        );
         assert_eq!(c.dedup_key, "git-review:myelin://acme/git/pr/9");
 
         // a Git mention Signal classifies + collapses by (recipient, subject).
@@ -402,7 +408,11 @@ mod tests {
         let mut reg = NotifRuleRegistry::new();
         register_git_notif_rules(&mut reg).unwrap();
         register_git_notif_rules(&mut reg).unwrap();
-        assert_eq!(reg.len(), 3, "re-registering Git's set keeps three rules (idempotent)");
+        assert_eq!(
+            reg.len(),
+            3,
+            "re-registering Git's set keeps three rules (idempotent)"
+        );
     }
 
     /// **The watcher relation Git wires the reverse index over IS the frozen relation Git's ReBAC
@@ -477,7 +487,10 @@ mod tests {
         let none = idx
             .resolve_relation(&viewer("psn:nobody"), &leaf, RevisionWatermark(0))
             .expect("available");
-        assert!(none.subject_roots.is_empty(), "a non-watcher reaches nothing");
+        assert!(
+            none.subject_roots.is_empty(),
+            "a non-watcher reaches nothing"
+        );
     }
 
     /// **A different relation than `watcher` resolves to the empty set (never a widen).** The Git
@@ -493,7 +506,10 @@ mod tests {
         let answer = idx
             .resolve_relation(&viewer("psn:alice"), &other, RevisionWatermark(0))
             .expect("available");
-        assert!(answer.subject_roots.is_empty(), "a non-watcher relation reaches nothing (no widen)");
+        assert!(
+            answer.subject_roots.is_empty(),
+            "a non-watcher relation reaches nothing (no widen)"
+        );
     }
 
     fn strong(zk: &str) -> Consistency {

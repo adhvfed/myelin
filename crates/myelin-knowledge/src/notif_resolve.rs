@@ -80,7 +80,9 @@
 //!   store-agnostic).
 
 use myelin_identity::{Consistency, IdentityService, Principal, Zookie};
-use myelin_notif::humanise::{RefProjection, RefResolution, RefResolvePort, Tombstone, TombstoneReason};
+use myelin_notif::humanise::{
+    RefProjection, RefResolution, RefResolvePort, Tombstone, TombstoneReason,
+};
 use myelin_refs::ArtifactRef;
 use myelin_tenancy::{Region, TenantId};
 
@@ -214,7 +216,9 @@ mod tests {
     }
     impl StubId {
         fn new() -> Self {
-            Self { allow: HashSet::new() }
+            Self {
+                allow: HashSet::new(),
+            }
         }
         fn allow_read(mut self, object: &ArtifactRef) -> Self {
             self.allow.insert(format!("read@{}", object.0));
@@ -234,7 +238,11 @@ mod tests {
             _caveat: Option<&CaveatContext>,
         ) -> IdResult<Decision> {
             let key = format!("{}@{}", permission.0, object.0);
-            Ok(if self.allow.contains(&key) { Decision::Allow } else { Decision::Deny })
+            Ok(if self.allow.contains(&key) {
+                Decision::Allow
+            } else {
+                Decision::Deny
+            })
         }
         fn list_objects(
             &self,
@@ -302,7 +310,8 @@ mod tests {
         }
     }
 
-    const SECRET_TITLE: &str = "Incident runbook: rotate the PROJECT-NIGHTFALL key before acquisition";
+    const SECRET_TITLE: &str =
+        "Incident runbook: rotate the PROJECT-NIGHTFALL key before acquisition";
 
     fn acme() -> TenantId {
         TenantId("acme".into())
@@ -314,7 +323,10 @@ mod tests {
         Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, acme())
     }
     fn strong(zk: &str) -> Consistency {
-        Consistency { at_least: Zookie(zk.into()), mode: ConsistencyMode::Strong }
+        Consistency {
+            at_least: Zookie(zk.into()),
+            mode: ConsistencyMode::Strong,
+        }
     }
     fn secret_page() -> ArtifactRef {
         ArtifactRef("myelin://acme/knowledge/page/7c2".into())
@@ -324,8 +336,18 @@ mod tests {
     fn confidential_page_resolver(grant_read: bool) -> (KnowledgeRefResolver<StubId>, ArtifactRef) {
         let page = secret_page();
         let mut store = PageStore::new();
-        store.put_root(&page, PageMeta { title: SECRET_TITLE.into(), state: "published".into() });
-        let id = if grant_read { StubId::new().allow_read(&page) } else { StubId::new() };
+        store.put_root(
+            &page,
+            PageMeta {
+                title: SECRET_TITLE.into(),
+                state: "published".into(),
+            },
+        );
+        let id = if grant_read {
+            StubId::new().allow_read(&page)
+        } else {
+            StubId::new()
+        };
         (KnowledgeRefResolver::new(Projector::new(id, store)), page)
     }
 
@@ -335,13 +357,24 @@ mod tests {
     #[test]
     fn denied_viewer_resolves_to_a_tombstone_no_title() {
         let (resolver, page) = confidential_page_resolver(false); // nobody granted
-        let r = resolver.resolve_display(&acme(), &region(), &page, &viewer("ex-contractor"), &strong("zk-1"));
+        let r = resolver.resolve_display(
+            &acme(),
+            &region(),
+            &page,
+            &viewer("ex-contractor"),
+            &strong("zk-1"),
+        );
         match r {
             RefResolution::Tombstone(t) => {
-                assert_eq!(t.root, page, "the opaque root crosses (for `a restricted page`)");
+                assert_eq!(
+                    t.root, page,
+                    "the opaque root crosses (for `a restricted page`)"
+                );
                 assert_eq!(t.reason, TombstoneReason::Denied);
             }
-            RefResolution::Projection(_) => panic!("a denied viewer must NOT get a projection (leak!)"),
+            RefResolution::Projection(_) => {
+                panic!("a denied viewer must NOT get a projection (leak!)")
+            }
         }
     }
 
@@ -351,11 +384,20 @@ mod tests {
     #[test]
     fn permitted_viewer_resolves_to_a_projection_with_the_title() {
         let (resolver, page) = confidential_page_resolver(true);
-        let r = resolver.resolve_display(&acme(), &region(), &page, &viewer("maintainer"), &strong("zk-1"));
+        let r = resolver.resolve_display(
+            &acme(),
+            &region(),
+            &page,
+            &viewer("maintainer"),
+            &strong("zk-1"),
+        );
         match r {
             RefResolution::Projection(p) => {
                 assert_eq!(p.ref_, page);
-                assert_eq!(p.title, SECRET_TITLE, "the permitted viewer sees the page title");
+                assert_eq!(
+                    p.title, SECRET_TITLE,
+                    "the permitted viewer sees the page title"
+                );
                 assert_eq!(p.icon, "page");
             }
             RefResolution::Tombstone(_) => panic!("the permitted viewer must see the projection"),
@@ -372,7 +414,12 @@ mod tests {
     fn notif_d4_zero_title_leak_through_humanise() {
         let (resolver, page) = confidential_page_resolver(false); // denied
         let templates = TemplateStore::with_platform_defaults();
-        let reasons = [Reason::Mentioned, Reason::Comments, Reason::Shared, Reason::Watched];
+        let reasons = [
+            Reason::Mentioned,
+            Reason::Comments,
+            Reason::Shared,
+            Reason::Watched,
+        ];
         let mut renders = 0u64;
         let mut leaks = 0u64;
         let mut tombstones = 0u64;
@@ -398,10 +445,16 @@ mod tests {
                 if h.text.contains("a restricted page") {
                     tombstones += 1;
                 }
-                assert!(h.links.is_empty(), "a denied KN unfurl yields no click-route link");
+                assert!(
+                    h.links.is_empty(),
+                    "a denied KN unfurl yields no click-route link"
+                );
             }
         }
-        assert_eq!(leaks, 0, "NOTIF-D4-class: 0 title leak over {renders} denied KN renders (threshold 0)");
+        assert_eq!(
+            leaks, 0,
+            "NOTIF-D4-class: 0 title leak over {renders} denied KN renders (threshold 0)"
+        );
         assert_eq!(
             tombstones, renders,
             "every denied render shows the PII-free `a restricted page` tombstone (the embed degrades)"
@@ -416,10 +469,22 @@ mod tests {
     /// content-free reason; never a free-text leak). A mutant that mis-maps a reason is caught.
     #[test]
     fn tombstone_reason_mapping_is_total_and_pii_free() {
-        assert_eq!(map_tombstone_reason(KnTombstoneReason::Denied), TombstoneReason::Denied);
-        assert_eq!(map_tombstone_reason(KnTombstoneReason::RootGone), TombstoneReason::RootGone);
-        assert_eq!(map_tombstone_reason(KnTombstoneReason::SubGone), TombstoneReason::SubGone);
-        assert_eq!(map_tombstone_reason(KnTombstoneReason::Erased), TombstoneReason::Erased);
+        assert_eq!(
+            map_tombstone_reason(KnTombstoneReason::Denied),
+            TombstoneReason::Denied
+        );
+        assert_eq!(
+            map_tombstone_reason(KnTombstoneReason::RootGone),
+            TombstoneReason::RootGone
+        );
+        assert_eq!(
+            map_tombstone_reason(KnTombstoneReason::SubGone),
+            TombstoneReason::SubGone
+        );
+        assert_eq!(
+            map_tombstone_reason(KnTombstoneReason::Erased),
+            TombstoneReason::Erased
+        );
     }
 
     /// **An erased KN subject humanises to `[erased user]` (the erasure-safe display, EI-04 §1).** A
@@ -429,9 +494,16 @@ mod tests {
     fn an_erased_kn_subject_humanises_to_the_erased_display() {
         let page = secret_page();
         let mut store = PageStore::new();
-        store.put_root(&page, PageMeta { title: SECRET_TITLE.into(), state: "published".into() });
+        store.put_root(
+            &page,
+            PageMeta {
+                title: SECRET_TITLE.into(),
+                state: "published".into(),
+            },
+        );
         store.mark_erased(&page);
-        let resolver = KnowledgeRefResolver::new(Projector::new(StubId::new().allow_read(&page), store));
+        let resolver =
+            KnowledgeRefResolver::new(Projector::new(StubId::new().allow_read(&page), store));
         let h = humanise(
             &resolver,
             &acme(),
@@ -444,8 +516,14 @@ mod tests {
             &strong("zk-1"),
             Channel::Cli,
         );
-        assert!(h.text.contains("[erased user]"), "an erased KN subject renders the erased display");
-        assert!(!h.text.contains(SECRET_TITLE), "the erased subject's title never leaks");
+        assert!(
+            h.text.contains("[erased user]"),
+            "an erased KN subject renders the erased display"
+        );
+        assert!(
+            !h.text.contains(SECRET_TITLE),
+            "the erased subject's title never leaks"
+        );
     }
 
     /// **A malformed / non-KN ref degrades to a non-leaking `RootGone` tombstone (never a panic).**
@@ -453,7 +531,13 @@ mod tests {
     fn a_non_kn_ref_degrades_to_a_non_leaking_tombstone() {
         let (resolver, _) = confidential_page_resolver(false);
         let not_kn = ArtifactRef("myelin://acme/git/pr/9".into());
-        let r = resolver.resolve_display(&acme(), &region(), &not_kn, &viewer("alice"), &strong("zk-1"));
+        let r = resolver.resolve_display(
+            &acme(),
+            &region(),
+            &not_kn,
+            &viewer("alice"),
+            &strong("zk-1"),
+        );
         match r {
             RefResolution::Tombstone(t) => assert_eq!(t.reason, TombstoneReason::RootGone),
             RefResolution::Projection(_) => panic!("a non-KN ref must not project a title"),

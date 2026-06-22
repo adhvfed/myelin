@@ -64,14 +64,22 @@ fn notif_d9_crash_after_ledger_write_retry_is_a_noop_exactly_one_delivery() {
     // idem_key) constraint). The fabric + the mock adapter are the in-process handle that "crashes".
     let ledger = DeliveryLedger::new();
     let mock = MockAdapter::new(Channel::Email, region());
-    let fabric_a =
-        DeliveryFabric::new(ledger.clone()).with_adapter(Arc::new(mock.clone()));
+    let fabric_a = DeliveryFabric::new(ledger.clone()).with_adapter(Arc::new(mock.clone()));
     let msg = redact_for_offcell(summary(), Class::Direct);
 
     // === before the crash: deliver — the provider acks AND the ledger row commits ===
-    let out = fabric_a.deliver(&tenant(), "itm-1", Channel::Email, &msg).unwrap();
-    assert!(matches!(out, DeliveryOutcome::Delivered(_)), "the first deliver is a new effective delivery");
-    assert_eq!(mock.send_count(&build_idem_key("itm-1", Channel::Email)), 1, "provider acked once");
+    let out = fabric_a
+        .deliver(&tenant(), "itm-1", Channel::Email, &msg)
+        .unwrap();
+    assert!(
+        matches!(out, DeliveryOutcome::Delivered(_)),
+        "the first deliver is a new effective delivery"
+    );
+    assert_eq!(
+        mock.send_count(&build_idem_key("itm-1", Channel::Email)),
+        1,
+        "provider acked once"
+    );
 
     // === THE CRASH: drop the in-process fabric handle. The durable ledger row SURVIVES. ===
     drop(fabric_a);
@@ -79,7 +87,9 @@ fn notif_d9_crash_after_ledger_write_retry_is_a_noop_exactly_one_delivery() {
     // === recover on a NEW fabric over the SAME durable ledger + the SAME mock (the provider) ===
     let fabric_b = DeliveryFabric::new(ledger.clone()).with_adapter(Arc::new(mock.clone()));
     // The retry re-runs deliver — but the ledger row is the durable source of truth: it is a NO-OP.
-    let retry = fabric_b.deliver(&tenant(), "itm-1", Channel::Email, &msg).unwrap();
+    let retry = fabric_b
+        .deliver(&tenant(), "itm-1", Channel::Email, &msg)
+        .unwrap();
     assert_eq!(
         retry,
         DeliveryOutcome::AlreadyDelivered { accepted: true },
@@ -125,8 +135,14 @@ fn notif_d9_crash_between_provider_ack_and_ledger_write_collapses_to_one() {
     // constraint (the collapse) — exactly one effective delivery results.
     let crashed_wins = ledger.record(&tenant(), attempt(true));
     let retry_collapsed = !ledger.record(&tenant(), attempt(true));
-    assert!(crashed_wins, "the first (crashed) INSERT wins the UNIQUE(tenant, idem_key)");
-    assert!(retry_collapsed, "the retry INSERT is collapsed by the constraint (no double row)");
+    assert!(
+        crashed_wins,
+        "the first (crashed) INSERT wins the UNIQUE(tenant, idem_key)"
+    );
+    assert!(
+        retry_collapsed,
+        "the retry INSERT is collapsed by the constraint (no double row)"
+    );
 
     // 1 EFFECTIVE DELIVERY — the threshold (exactly 1; never softened).
     assert_eq!(
@@ -136,7 +152,10 @@ fn notif_d9_crash_between_provider_ack_and_ledger_write_collapses_to_one() {
     );
 
     // off-cell stays redacted across the crash (0 off-cell full-body).
-    assert!(ledger.get(&tenant(), &idem).unwrap().redacted, "off-cell stays redacted across the crash");
+    assert!(
+        ledger.get(&tenant(), &idem).unwrap().redacted,
+        "off-cell stays redacted across the crash"
+    );
 }
 
 /// **NOTIF-D9 — the in-app-stays-in-cell assertion across the crash/retry (CI threshold 0/0).** The
@@ -153,13 +172,26 @@ fn notif_d9_in_app_stays_in_cell_and_offcell_redacted_across_recovery() {
             &tenant(),
             "itm-1",
             Channel::InApp,
-            &RedactedMessage { rendered: summary(), class: Class::Direct },
+            &RedactedMessage {
+                rendered: summary(),
+                class: Class::Direct,
+            },
         )
         .unwrap();
     // every off-cell channel — carries a RedactedMessage, redacted=true (0 off-cell full-body).
-    for channel in [Channel::WebPush, Channel::MobilePush, Channel::Email, Channel::Desktop] {
+    for channel in [
+        Channel::WebPush,
+        Channel::MobilePush,
+        Channel::Email,
+        Channel::Desktop,
+    ] {
         fabric
-            .deliver(&tenant(), "itm-1", channel, &redact_for_offcell(summary(), Class::Direct))
+            .deliver(
+                &tenant(),
+                "itm-1",
+                channel,
+                &redact_for_offcell(summary(), Class::Direct),
+            )
             .unwrap();
     }
 
@@ -173,7 +205,9 @@ fn notif_d9_in_app_stays_in_cell_and_offcell_redacted_across_recovery() {
         Channel::Email,
         Channel::Desktop,
     ] {
-        let row = ledger.get(&tenant(), &build_idem_key("itm-1", channel)).unwrap();
+        let row = ledger
+            .get(&tenant(), &build_idem_key("itm-1", channel))
+            .unwrap();
         if channel.is_in_cell() && row.redacted {
             // an in-cell channel that produced an off-cell (redacted) payload would be an egress.
             in_app_egress += 1;
@@ -184,7 +218,10 @@ fn notif_d9_in_app_stays_in_cell_and_offcell_redacted_across_recovery() {
         }
     }
     assert_eq!(in_app_egress, 0, "0 in-app egress (in_app stays in-cell)");
-    assert_eq!(offcell_fullbody, 0, "0 off-cell full-body (every off-cell payload is redacted)");
+    assert_eq!(
+        offcell_fullbody, 0,
+        "0 off-cell full-body (every off-cell payload is redacted)"
+    );
 
     // GREEN ARTIFACT (2026-06-20): 1 effective delivery per (item, channel); 0 in-app egress; 0
     // off-cell full-body; provider invoked exactly once per key. No threshold weakened.

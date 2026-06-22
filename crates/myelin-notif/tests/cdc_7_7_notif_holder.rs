@@ -83,13 +83,17 @@ impl<'a> DsrOrchestratorConsumer<'a> {
     fn fan_out_locate(&self, subject: &SubjectRef, tenant: TenantId) -> Vec<LocateReport> {
         self.holders
             .iter()
-            .map(|h| h.locate(subject, tenant.clone()).expect("a Notif holder locate succeeds"))
+            .map(|h| {
+                h.locate(subject, tenant.clone())
+                    .expect("a Notif holder locate succeeds")
+            })
             .collect()
     }
 
     fn fan_out_erase(&self, scope: EraseScope) -> usize {
         for h in &self.holders {
-            h.erase(scope.clone()).expect("a Notif holder erase succeeds");
+            h.erase(scope.clone())
+                .expect("a Notif holder erase succeeds");
         }
         self.holders.len()
     }
@@ -111,23 +115,39 @@ fn dsr_orchestrator_fans_locate_and_erase_out_to_the_notif_holder_via_the_contra
 
     // locate: the holder responds with a content-addressed receipt over the structural surface.
     let reports = consumer.fan_out_locate(&subj, tenant());
-    assert_eq!(reports.len(), 1, "the Notif holder responded to locate via the contract");
+    assert_eq!(
+        reports.len(),
+        1,
+        "the Notif holder responded to locate via the contract"
+    );
     assert_eq!(reports[0].receipt.operation, "locate");
-    assert!(reports[0].receipt.content_hash.starts_with("blake3:"), "content-addressed receipt");
-    assert!(reports[0].receipt.key_epoch_destroyed.is_none(), "locate shreds no key");
+    assert!(
+        reports[0].receipt.content_hash.starts_with("blake3:"),
+        "content-addressed receipt"
+    );
+    assert!(
+        reports[0].receipt.key_epoch_destroyed.is_none(),
+        "locate shreds no key"
+    );
 
     // The exact stored bytes BEFORE erase.
     let before = inbox.snapshot_for_tenant(&tenant());
 
     // erase: the structural references-not-payloads erase — 0 PII columns mutated.
-    let erased = consumer.fan_out_erase(EraseScope::Subject { subject: subj.clone(), tenant: tenant() });
+    let erased = consumer.fan_out_erase(EraseScope::Subject {
+        subject: subj.clone(),
+        tenant: tenant(),
+    });
     assert_eq!(erased, 1, "the Notif holder honoured the erase contract");
 
     let mut a = inbox.snapshot_for_tenant(&tenant());
     let mut b = before;
     a.sort_by(|x, y| x.item_id.cmp(&y.item_id));
     b.sort_by(|x, y| x.item_id.cmp(&y.item_id));
-    assert_eq!(a, b, "the refs-stored items tombstone for free — 0 PII columns mutated (the 7.7 property)");
+    assert_eq!(
+        a, b,
+        "the refs-stored items tombstone for free — 0 PII columns mutated (the 7.7 property)"
+    );
 }
 
 /// **The provider registers + classifies (contract 1.4 + gdpr §3.2): 0 orphan Notif stores.** The

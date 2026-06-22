@@ -50,9 +50,19 @@ fn producer_kn_page_spec_is_the_frozen_6_3_shape() {
     let s = kn_page_index_spec();
     assert_eq!(s.subsystem, "knowledge");
     assert_eq!(s.type_, "page");
-    assert_eq!(s.acl_object_type, "page", "a page's reachability is the page-tree's");
-    assert!(s.semantic, "a page is semantically indexed (vector-in-v1, §4.5)");
-    assert_eq!(s.struct_fields.len(), 3, "the three structured inline-node reference facets");
+    assert_eq!(
+        s.acl_object_type, "page",
+        "a page's reachability is the page-tree's"
+    );
+    assert!(
+        s.semantic,
+        "a page is semantically indexed (vector-in-v1, §4.5)"
+    );
+    assert_eq!(
+        s.struct_fields.len(),
+        3,
+        "the three structured inline-node reference facets"
+    );
     for facet in [FACET_MENTION, FACET_ARTIFACT_REF, FACET_EMBED] {
         assert_eq!(
             s.struct_fields.get(facet),
@@ -69,13 +79,22 @@ fn producer_kn_db_row_spec_is_the_gin_scan_facet_shape() {
     let s = kn_db_row_index_spec();
     assert_eq!(s.subsystem, "knowledge");
     assert_eq!(s.type_, "db_row");
-    assert!(!s.semantic, "a db row is a structured record, not vector-embedded prose");
+    assert!(
+        !s.semantic,
+        "a db row is a structured record, not vector-embedded prose"
+    );
     assert_eq!(s.struct_fields.get("priority"), Some(&FieldType::Select));
     assert_eq!(s.struct_fields.get("owner"), Some(&FieldType::Principal));
     assert_eq!(s.struct_fields.get("due"), Some(&FieldType::Date));
     assert_eq!(s.struct_fields.get("order_key"), Some(&FieldType::OrderKey));
-    assert!(!s.struct_fields.contains_key("rollup"), "rollup is read-time, never a stored facet (KN-3)");
-    assert!(!s.struct_fields.contains_key("formula"), "formula is read-time, never a stored facet (KN-3)");
+    assert!(
+        !s.struct_fields.contains_key("rollup"),
+        "rollup is read-time, never a stored facet (KN-3)"
+    );
+    assert!(
+        !s.struct_fields.contains_key("formula"),
+        "formula is read-time, never a stored facet (KN-3)"
+    );
 }
 
 /// **PRODUCER side — both KN specs serialize to the 6.3 wire shape (0 schema mismatches).** The
@@ -90,7 +109,13 @@ fn producer_kn_specs_serialize_to_the_6_3_wire_shape() {
         keys.sort_unstable();
         assert_eq!(
             keys,
-            vec!["acl_object_type", "semantic", "struct_fields", "subsystem", "type"],
+            vec![
+                "acl_object_type",
+                "semantic",
+                "struct_fields",
+                "subsystem",
+                "type"
+            ],
             "the frozen 6.3 wire key set"
         );
         assert_eq!(obj["subsystem"], serde_json::json!("knowledge"));
@@ -115,7 +140,11 @@ fn consumer_search_admits_the_kn_specs() {
         std::sync::Arc::new(MockEmbeddingAdapter::new(16)),
     );
     let accepted: Vec<IndexSpec> = register_kn_index_specs();
-    assert_eq!(accepted, kn_index_specs(), "Search accepts the declared KN specs verbatim");
+    assert_eq!(
+        accepted,
+        kn_index_specs(),
+        "Search accepts the declared KN specs verbatim"
+    );
 }
 
 /// **CONSUMER side — the KN specs COEXIST with another subsystem's spec in one facet union.** Search

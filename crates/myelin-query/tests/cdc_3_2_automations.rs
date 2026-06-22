@@ -298,5 +298,8 @@ fn cdc_3_2_registration_shape_round_trips_stably() {
     let v = serde_json::to_value(&rule).unwrap();
     let matcher_predicate = &v["matcher"]["predicate"];
     let bare = serde_json::to_value(type_matcher("issues.issue.created").predicate()).unwrap();
-    assert_eq!(matcher_predicate, &bare, "no QueryAst drift in the matcher field");
+    assert_eq!(
+        matcher_predicate, &bare,
+        "no QueryAst drift in the matcher field"
+    );
 }

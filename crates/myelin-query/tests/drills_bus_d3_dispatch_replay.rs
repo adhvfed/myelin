@@ -64,22 +64,53 @@ fn node(n: u64, actor: &str, depth: u32, correlation: &str) -> EventEnvelope {
 fn correlation_tree() -> Vec<(DispatchRequest, EventId)> {
     vec![
         // Root A — admits + one self-guard drop.
-        (auto(node(1, "human", 2, "root-A"), "agentX", "run-1"), EventId("act-1".into())),
-        (auto(node(2, "human", 3, "root-A"), "agentX", "run-2"), EventId("act-2".into())),
-        (auto(node(3, "agentX", 3, "root-A"), "agentX", "run-3"), EventId("act-3".into())), // self-guard
-        (auto(node(4, "human", 3, "root-A"), "agentX", "run-4"), EventId("act-4".into())),
+        (
+            auto(node(1, "human", 2, "root-A"), "agentX", "run-1"),
+            EventId("act-1".into()),
+        ),
+        (
+            auto(node(2, "human", 3, "root-A"), "agentX", "run-2"),
+            EventId("act-2".into()),
+        ),
+        (
+            auto(node(3, "agentX", 3, "root-A"), "agentX", "run-3"),
+            EventId("act-3".into()),
+        ), // self-guard
+        (
+            auto(node(4, "human", 3, "root-A"), "agentX", "run-4"),
+            EventId("act-4".into()),
+        ),
         // Root B — a mention (notify-only), a raw-text ref-gate drop, and an admit.
-        (mention(node(5, "human", 1, "root-B"), "agentX", "run-5"), EventId("act-5".into())),
-        (auto(raw_text(node(6, "human", 1, "root-B")), "agentX", "run-6"), EventId("act-6".into())), // ref-gate
-        (auto(node(7, "human", 1, "root-B"), "agentX", "run-7"), EventId("act-7".into())),
+        (
+            mention(node(5, "human", 1, "root-B"), "agentX", "run-5"),
+            EventId("act-5".into()),
+        ),
+        (
+            auto(raw_text(node(6, "human", 1, "root-B")), "agentX", "run-6"),
+            EventId("act-6".into()),
+        ), // ref-gate
+        (
+            auto(node(7, "human", 1, "root-B"), "agentX", "run-7"),
+            EventId("act-7".into()),
+        ),
     ]
 }
 
 fn auto(ev: EventEnvelope, agent: &str, run_ref: &str) -> DispatchRequest {
-    DispatchRequest { event: ev, agent: PrincipalId(agent.into()), run_ref: run_ref.into(), trigger: TriggerKind::Automation }
+    DispatchRequest {
+        event: ev,
+        agent: PrincipalId(agent.into()),
+        run_ref: run_ref.into(),
+        trigger: TriggerKind::Automation,
+    }
 }
 fn mention(ev: EventEnvelope, agent: &str, run_ref: &str) -> DispatchRequest {
-    DispatchRequest { event: ev, agent: PrincipalId(agent.into()), run_ref: run_ref.into(), trigger: TriggerKind::Mention }
+    DispatchRequest {
+        event: ev,
+        agent: PrincipalId(agent.into()),
+        run_ref: run_ref.into(),
+        trigger: TriggerKind::Mention,
+    }
 }
 fn raw_text(mut ev: EventEnvelope) -> EventEnvelope {
     ev.subject = ArtifactRef("please do the thing".into()); // not a myelin:// artifact_ref node
@@ -93,7 +124,13 @@ fn run_tape() -> Vec<Disposition> {
     let mut tier = DispatchTier::new(RecordingTarget::new(), gate);
     correlation_tree()
         .into_iter()
-        .map(|(req, mint)| tier.dispatch(&req, move || mint, &Timestamp("2026-06-20T00:00:01Z".into())))
+        .map(|(req, mint)| {
+            tier.dispatch(
+                &req,
+                move || mint,
+                &Timestamp("2026-06-20T00:00:01Z".into()),
+            )
+        })
         .collect()
 }
 
@@ -104,7 +141,10 @@ fn bus_d3_replay_equals_original_deterministic_idempotent_causality_preserved() 
     let replay = run_tape();
 
     // replay-equals-original: the FULL disposition tape (incl. every derived envelope) is identical.
-    assert_eq!(original, replay, "the dispatch tier replays byte-identically (replay == original)");
+    assert_eq!(
+        original, replay,
+        "the dispatch tier replays byte-identically (replay == original)"
+    );
 
     // Causality preserved: every Delivered action nests on its trigger (depth = parent + 1).
     let tree = correlation_tree();
@@ -136,16 +176,31 @@ fn bus_d3_redelivery_is_idempotent_no_double_charge_no_double_effect() {
     let ev = node(42, "human", 1, "root-C");
     let r = auto(ev, "agentX", "run-42");
 
-    let first = tier.dispatch(&r, || EventId("act-42a".into()), &Timestamp("2026-06-20T00:00:01Z".into()));
-    assert!(matches!(first, Disposition::Delivered { .. }), "first delivery admits on the balance");
+    let first = tier.dispatch(
+        &r,
+        || EventId("act-42a".into()),
+        &Timestamp("2026-06-20T00:00:01Z".into()),
+    );
+    assert!(
+        matches!(first, Disposition::Delivered { .. }),
+        "first delivery admits on the balance"
+    );
 
     // Redeliver the SAME run_ref: re-reserves the SAME reservation (idempotent), so it is NOT
     // refused for lack of balance and does NOT consume a second unit (no double-charge).
-    let second = tier.dispatch(&r, || EventId("act-42b".into()), &Timestamp("2026-06-20T00:00:01Z".into()));
+    let second = tier.dispatch(
+        &r,
+        || EventId("act-42b".into()),
+        &Timestamp("2026-06-20T00:00:01Z".into()),
+    );
     assert!(
         matches!(second, Disposition::Delivered { .. }),
         "the redelivery re-reserves the same reservation — not a no-balance refusal"
     );
     // Two deliveries of the same run consumed ONE unit of balance (idempotent reserve).
-    assert_eq!(tier.telemetry().no_balance_refused, 0, "no double-charge → no spurious refusal");
+    assert_eq!(
+        tier.telemetry().no_balance_refused,
+        0,
+        "no double-charge → no spurious refusal"
+    );
 }

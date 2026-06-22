@@ -27,8 +27,8 @@
 use myelin_client::{CallError, Idempotency, ResilientClient, Target};
 use myelin_events::{OutboxStore, Timestamp};
 use myelin_identity::{
-    Consistency, ConsistencyMode, ObjectId, Permission, Principal, PrincipalId,
-    PrincipalKind, RelName, RelationTuple, TupleDelta, Zookie,
+    Consistency, ConsistencyMode, ObjectId, Permission, Principal, PrincipalId, PrincipalKind,
+    RelName, RelationTuple, TupleDelta, Zookie,
 };
 use myelin_identity_service::{Served, StoreBackedCheck, TupleStore};
 use myelin_storage::TenantScope;
@@ -156,25 +156,55 @@ fn cdc_4_11_consumer_wraps_check_in_resilient_client_and_survives_a_hiccup() {
     // ── PHASE 1: Identity is HEALTHY. The consumer calls `check` THROUGH the resilient client; the
     //    call succeeds and the S6 cache records the coarse grant (a fresh authoritative Allow). ──
     let phase1 = consumer_check(
-        &client, &target, &svc, &s6, &acme, &alice, &Permission("view".into()), &obj,
-        &bounded_stale(), &ts("2026-06-19T00:00:01Z"), /* identity_up */ true,
+        &client,
+        &target,
+        &svc,
+        &s6,
+        &acme,
+        &alice,
+        &Permission("view".into()),
+        &obj,
+        &bounded_stale(),
+        &ts("2026-06-19T00:00:01Z"),
+        /* identity_up */ true,
     );
-    assert!(matches!(phase1.served, Served::Fresh), "healthy: served fresh through the client");
-    assert!(phase1.is_allow(), "alice's live grant is allowed (and cached)");
+    assert!(
+        matches!(phase1.served, Served::Fresh),
+        "healthy: served fresh through the client"
+    );
+    assert!(
+        phase1.is_allow(),
+        "alice's live grant is allowed (and cached)"
+    );
 
     // ── PHASE 2: Identity HICCUPS. The resilient client's downstream errors (a CallError); the
     //    consumer falls back to S6 and serves the bounded-staleness coarse grant — alice survives. ──
     s6.clock().advance(31); // past fresh_ttl, within static_max → the static (degraded) rung
     let phase2 = consumer_check(
-        &client, &target, &svc, &s6, &acme, &alice, &Permission("view".into()), &obj,
-        &bounded_stale(), &ts("2026-06-19T00:00:02Z"), /* identity_up */ false,
+        &client,
+        &target,
+        &svc,
+        &s6,
+        &acme,
+        &alice,
+        &Permission("view".into()),
+        &obj,
+        &bounded_stale(),
+        &ts("2026-06-19T00:00:02Z"),
+        /* identity_up */ false,
     );
     assert!(
         matches!(phase2.served, Served::Static),
         "hiccup: the consumer survives on the S6 bounded-staleness grant (no cascade)"
     );
-    assert!(phase2.is_allow(), "authenticated traffic survives the hiccup (still Allow)");
-    assert!(phase2.is_degraded(), "the survived answer is marked degraded (bounded-staleness)");
+    assert!(
+        phase2.is_allow(),
+        "authenticated traffic survives the hiccup (still Allow)"
+    );
+    assert!(
+        phase2.is_degraded(),
+        "the survived answer is marked degraded (bounded-staleness)"
+    );
     assert!(
         s6.fail_static_signals().last_staleness_secs <= s6.static_max(),
         "the staleness age never exceeds the budget (≤ the revocation SLA)"
@@ -202,18 +232,42 @@ fn cdc_4_11_strong_read_bypasses_cache_and_fails_closed_on_hiccup() {
 
     // Warm S6 with a stale-eligible Allow via a BoundedStale read.
     let _ = consumer_check(
-        &client, &target, &svc, &s6, &acme, &alice, &Permission("view".into()), &obj,
-        &bounded_stale(), &ts("2026-06-19T00:00:01Z"), true,
+        &client,
+        &target,
+        &svc,
+        &s6,
+        &acme,
+        &alice,
+        &Permission("view".into()),
+        &obj,
+        &bounded_stale(),
+        &ts("2026-06-19T00:00:01Z"),
+        true,
     );
     s6.clock().advance(31);
 
     // A STRONG read with Identity hiccuping does NOT serve the stale S6 grant — it fails CLOSED.
     let strong_hiccup = consumer_check(
-        &client, &target, &svc, &s6, &acme, &alice, &Permission("view".into()), &obj,
-        &strong(), &ts("2026-06-19T00:00:02Z"), false,
+        &client,
+        &target,
+        &svc,
+        &s6,
+        &acme,
+        &alice,
+        &Permission("view".into()),
+        &obj,
+        &strong(),
+        &ts("2026-06-19T00:00:02Z"),
+        false,
     );
-    assert!(matches!(strong_hiccup.served, Served::BypassClosed), "strong read bypassed S6");
-    assert!(strong_hiccup.is_deny(), "a strong read fails CLOSED on a hiccup (never serves stale)");
+    assert!(
+        matches!(strong_hiccup.served, Served::BypassClosed),
+        "strong read bypassed S6"
+    );
+    assert!(
+        strong_hiccup.is_deny(),
+        "a strong read fails CLOSED on a hiccup (never serves stale)"
+    );
 }
 
 /// **The CONSUMER shape: wrap `check` in `ResilientClient` + `FailStatic`.** Run the authoritative
@@ -259,5 +313,7 @@ fn consumer_check<C: myelin_substrate::Clock>(
     // hiccuping (fall back to the bounded-staleness S6 grant). Either way S6 honours the
     // zookie-bypass + the just-revoked deny.
     let source_ok = outcome.is_ok();
-    svc.check_failstatic(s6, scope, subject, permission, object, at, None, now, source_ok)
+    svc.check_failstatic(
+        s6, scope, subject, permission, object, at, None, now, source_ok,
+    )
 }

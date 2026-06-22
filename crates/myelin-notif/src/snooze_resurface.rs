@@ -153,7 +153,8 @@ impl<W: DurableWheel> SnoozeResurfacer<W> {
     /// persisted handle a restart resumes from — used by the durability drill to assert the timer
     /// survived the kill.
     pub fn has_timer(&self, tenant: &TenantId, recipient: &str, item_id: &str) -> bool {
-        self.wheel.has_timer(&snooze_timer_key(tenant, recipient, item_id))
+        self.wheel
+            .has_timer(&snooze_timer_key(tenant, recipient, item_id))
     }
 
     /// **The re-surface fire (contract 9.3) — flip `snoozed → unread` EXACTLY ONCE.** Called when the
@@ -203,7 +204,8 @@ impl<W: DurableWheel> SnoozeResurfacer<W> {
     /// `unread`. Idempotent (cancelling a non-existent timer is a no-op). Uses the SHARED wheel's
     /// `cancel_timer` (one substrate).
     pub fn cancel(&self, tenant: &TenantId, recipient: &str, item_id: &str) {
-        self.wheel.cancel_timer(&snooze_timer_key(tenant, recipient, item_id));
+        self.wheel
+            .cancel_timer(&snooze_timer_key(tenant, recipient, item_id));
     }
 }
 
@@ -227,7 +229,12 @@ pub fn snooze_and_arm<W: DurableWheel>(
     crate::read_state::snooze(inbox, principal, item_id, until)?;
     // Arm the durable re-surface timer on the SHARED wheel (only if the snooze applied — a
     // not-for-me item returned Err above and never reaches here, so no orphan timer is armed).
-    resurfacer.arm(&principal.tenant, principal.principal_id.0.as_str(), item_id, until_minutes);
+    resurfacer.arm(
+        &principal.tenant,
+        principal.principal_id.0.as_str(),
+        item_id,
+        until_minutes,
+    );
     Ok(())
 }
 

@@ -132,11 +132,13 @@ impl BusErasureLedger {
     /// [`BusHolder::erase`] (or by [`BusHolder::erase_and_record`], which does both atomically).
     pub fn record(&self, subject: &str, key_refs: &[PiiKeyRef], erased_at: Timestamp) {
         let mut g = self.entries.lock().expect("erasure ledger poisoned");
-        let entry = g.entry(subject.to_string()).or_insert_with(|| ErasedSubject {
-            subject: subject.to_string(),
-            key_refs: Vec::new(),
-            erased_at: erased_at.clone(),
-        });
+        let entry = g
+            .entry(subject.to_string())
+            .or_insert_with(|| ErasedSubject {
+                subject: subject.to_string(),
+                key_refs: Vec::new(),
+                erased_at: erased_at.clone(),
+            });
         for k in key_refs {
             if !entry.key_refs.contains(k) {
                 entry.key_refs.push(k.clone());
@@ -350,7 +352,11 @@ mod tests {
         Timestamp("2026-06-19T00:00:00Z".into())
     }
     fn actor_for(id: &str) -> Actor {
-        Actor(Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant()))
+        Actor(Principal::stub(
+            PrincipalId(id.into()),
+            PrincipalKind::Human,
+            tenant(),
+        ))
     }
 
     /// Build a retained inline-PII envelope sealed under `subject`'s per-subject DEK.
@@ -409,13 +415,22 @@ mod tests {
             .erase_and_record("u42", &mut log, &mut outbox, minter(), &ledger, now())
             .expect("erase+record");
 
-        assert!(ledger.is_erased("u42"), "the ledger remembers u42 was erased");
+        assert!(
+            ledger.is_erased("u42"),
+            "the ledger remembers u42 was erased"
+        );
         assert_eq!(ledger.len(), 1);
         let entry = &ledger.entries()[0];
         assert_eq!(entry.subject, "u42");
-        assert_eq!(entry.key_refs, vec![PiiKeyRef("kms://acme/0/subject:u42".into())]);
+        assert_eq!(
+            entry.key_refs,
+            vec![PiiKeyRef("kms://acme/0/subject:u42".into())]
+        );
         // The ledger is PII-free: only the opaque discriminator + the key NAME, never a payload.
-        assert!(!shredder.is_live(&PiiKeyRef("kms://acme/0/subject:u42".into())), "key shredded");
+        assert!(
+            !shredder.is_live(&PiiKeyRef("kms://acme/0/subject:u42".into())),
+            "key shredded"
+        );
     }
 
     /// Unit (the EB-16 core): a post-restore re-erasure pass re-destroys the keys for a
@@ -443,14 +458,29 @@ mod tests {
         // (3) RE-ERASE AFTER RESTORE: replay the ledger — re-destroy the resurrected key.
         let mut reerase_outbox = OutboxStore::new();
         let receipt = holder
-            .re_erase_after_restore(&ledger, &mut restored_log, &mut reerase_outbox, minter(), now())
+            .re_erase_after_restore(
+                &ledger,
+                &mut restored_log,
+                &mut reerase_outbox,
+                minter(),
+                now(),
+            )
             .expect("re-erase");
 
         // The key is DEAD again — the restored backup did not resurrect it past the re-erasure.
-        assert!(!shredder.is_live(&key), "the key stays destroyed across the restore");
+        assert!(
+            !shredder.is_live(&key),
+            "the key stays destroyed across the restore"
+        );
         assert_eq!(receipt.re_erased_subjects, 1);
-        assert_eq!(receipt.keys_resurrected_by_restore, 1, "the restore brought the key back");
-        assert!(receipt.tombstones_re_emitted >= 1, "re-tombstoned the restored row");
+        assert_eq!(
+            receipt.keys_resurrected_by_restore, 1,
+            "the restore brought the key back"
+        );
+        assert!(
+            receipt.tombstones_re_emitted >= 1,
+            "re-tombstoned the restored row"
+        );
         // THE GATE: 0 resurrected inline-PII keys post-restore.
         assert_eq!(receipt.resurrected, 0, "0 resurrected keys post-restore");
         assert!(receipt.is_green());
@@ -475,7 +505,10 @@ mod tests {
             .re_erase_after_restore(&ledger, &mut log2, &mut outbox2, minter(), now())
             .expect("re-erase no-op");
         // The DEK in `shredder` is still dead (never resurrected) → 0 resurrected.
-        assert_eq!(receipt.keys_resurrected_by_restore, 0, "nothing was resurrected");
+        assert_eq!(
+            receipt.keys_resurrected_by_restore, 0,
+            "nothing was resurrected"
+        );
         assert_eq!(receipt.resurrected, 0);
         assert!(receipt.is_green());
     }
@@ -507,7 +540,10 @@ mod tests {
             .expect("re-erase all");
         assert_eq!(receipt.re_erased_subjects, 3);
         assert_eq!(receipt.keys_resurrected_by_restore, 3);
-        assert_eq!(receipt.resurrected, 0, "all three stay destroyed across the restore");
+        assert_eq!(
+            receipt.resurrected, 0,
+            "all three stay destroyed across the restore"
+        );
     }
 
     /// Unit: a KMS failure during the re-erasure pass is LOUD (never "assume re-erased") — the pass

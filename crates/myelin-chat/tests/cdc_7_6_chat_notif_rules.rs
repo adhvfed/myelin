@@ -62,21 +62,45 @@ fn cdc_7_6_chat_provider_declares_reasons_consumer_admits_and_classifies() {
     let by_key: BTreeMap<&str, &NotifRule> = rules.iter().map(|(k, r)| (*k, r)).collect();
     assert_eq!(by_key[RULE_KEY_MENTIONED].default_class, Class::Direct);
     assert_eq!(by_key[RULE_KEY_REPLIED].default_class, Class::Participating);
-    assert_eq!(by_key[RULE_KEY_THREAD_WATCHED].default_class, Class::Watching);
-    assert_eq!(by_key[RULE_KEY_APPROVAL_REQUESTED].default_class, Class::Critical);
+    assert_eq!(
+        by_key[RULE_KEY_THREAD_WATCHED].default_class,
+        Class::Watching
+    );
+    assert_eq!(
+        by_key[RULE_KEY_APPROVAL_REQUESTED].default_class,
+        Class::Critical
+    );
 
     // the CONSUMER admits + classifies each rule_key through the registered chat rule.
     for (key, reason, class) in [
         (RULE_KEY_MENTIONED, Reason::Mentioned, Class::Direct),
         (RULE_KEY_REPLIED, Reason::Replied, Class::Participating),
-        (RULE_KEY_THREAD_WATCHED, Reason::ThreadWatched, Class::Watching),
-        (RULE_KEY_APPROVAL_REQUESTED, Reason::ApprovalRequested, Class::Critical),
+        (
+            RULE_KEY_THREAD_WATCHED,
+            Reason::ThreadWatched,
+            Class::Watching,
+        ),
+        (
+            RULE_KEY_APPROVAL_REQUESTED,
+            Reason::ApprovalRequested,
+            Class::Critical,
+        ),
     ] {
         let c = consumer_admits_and_classifies(provider_chat_rules(), key, "psn:alice", &subject);
         assert_eq!(c.reason, reason, "rule `{key}` classifies to its reason");
-        assert_eq!(c.default_class, class, "rule `{key}` lands in its §3.1 band");
-        assert_eq!(c.default_class, reason_base_class(reason).1, "the table owns the band");
-        assert!(c.from_registered_rule, "the registered chat rule took effect (0 Notif change)");
+        assert_eq!(
+            c.default_class, class,
+            "rule `{key}` lands in its §3.1 band"
+        );
+        assert_eq!(
+            c.default_class,
+            reason_base_class(reason).1,
+            "the table owns the band"
+        );
+        assert!(
+            c.from_registered_rule,
+            "the registered chat rule took effect (0 Notif change)"
+        );
     }
 }
 
@@ -88,7 +112,11 @@ fn cdc_7_6_chat_reason_set_accretes_with_zero_notif_change() {
     let mut reg = NotifRuleRegistry::platform_default();
     let before = reg.len();
     register_chat_notif_rules(&mut reg);
-    assert_eq!(reg.len(), before + 4, "the four chat rules accreted (no Notif enum/match edit)");
+    assert_eq!(
+        reg.len(),
+        before + 4,
+        "the four chat rules accreted (no Notif enum/match edit)"
+    );
 }
 
 /// **The fanout-class is chat's OWNED per-event decision (arch §4) and is TOTAL over the durable
@@ -102,7 +130,10 @@ fn cdc_7_6_chat_fanout_class_is_total_and_write_fanout_is_bounded() {
         "the fanout-class must be total over chat's durable tokens"
     );
     // the canonical write-fanout producer is the mention (contract 13.1).
-    assert_eq!(fanout_class(CHAT_MESSAGE_MENTIONED), Some(FanoutClass::WriteFanout));
+    assert_eq!(
+        fanout_class(CHAT_MESSAGE_MENTIONED),
+        Some(FanoutClass::WriteFanout)
+    );
     // write-fanout is a STRICT bounded subset (the unbounded ambient set never write-amplifies).
     let write_fanout = CHAT_DURABLE_TOKENS
         .iter()

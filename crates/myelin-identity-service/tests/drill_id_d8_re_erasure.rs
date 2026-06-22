@@ -58,8 +58,12 @@ fn id_d8_restore_resurrects_no_authority_and_emits_a_dated_re_erasure_receipt() 
     let bob = PrincipalId("p:bob".into());
 
     // (1) Seed + erase both subjects.
-    slot.pseudonyms().put_mapping(&s, &alice, handle("anon-a", "acme")).unwrap();
-    slot.pseudonyms().put_mapping(&s, &bob, handle("anon-b", "acme")).unwrap();
+    slot.pseudonyms()
+        .put_mapping(&s, &alice, handle("anon-a", "acme"))
+        .unwrap();
+    slot.pseudonyms()
+        .put_mapping(&s, &bob, handle("anon-b", "acme"))
+        .unwrap();
     slot.erase_in(&s, &alice, at("2026-06-19T10:00:00Z"));
     slot.erase_in(&s, &bob, at("2026-06-19T10:00:01Z"));
 
@@ -71,19 +75,29 @@ fn id_d8_restore_resurrects_no_authority_and_emits_a_dated_re_erasure_receipt() 
 
     // (2) RESTORE an older (pre-erasure) backup — modelled by re-materialising the mappings (the
     // restore brings back the per-subject DEK + the sealed link). This RESURRECTS the subjects.
-    slot.pseudonyms().put_mapping(&s, &alice, handle("anon-a", "acme")).unwrap();
-    slot.pseudonyms().put_mapping(&s, &bob, handle("anon-b", "acme")).unwrap();
+    slot.pseudonyms()
+        .put_mapping(&s, &alice, handle("anon-a", "acme"))
+        .unwrap();
+    slot.pseudonyms()
+        .put_mapping(&s, &bob, handle("anon-b", "acme"))
+        .unwrap();
     assert!(
         slot.pseudonyms().resolve_subject(&s, &alice).is_some(),
         "the restore RESURRECTED alice (resolvable again) — the bug ID-D8 catches"
     );
-    assert!(slot.pseudonyms().resolve_subject(&s, &bob).is_some(), "the restore resurrected bob");
+    assert!(
+        slot.pseudonyms().resolve_subject(&s, &bob).is_some(),
+        "the restore resurrected bob"
+    );
 
     // (3) POST-RESTORE RE-ERASURE runs — replays the ledger, re-runs the IDENTICAL crypto-shred.
     let receipt = slot.re_erase_after_restore(&s, at("2026-06-19T11:00:00Z"));
 
     // (4) The quantified thresholds:
-    assert_eq!(receipt.re_erased, 2, "the ledger drove re-erasure of BOTH recorded subjects");
+    assert_eq!(
+        receipt.re_erased, 2,
+        "the ledger drove re-erasure of BOTH recorded subjects"
+    );
     assert_eq!(
         receipt.pre_pass_resurrected, 2,
         "the restore resurrected both (the honest 'what the backup brought back' signal)"
@@ -99,22 +113,33 @@ fn id_d8_restore_resurrects_no_authority_and_emits_a_dated_re_erasure_receipt() 
     assert!(receipt.summary().contains("2026-06-19T11:00:00Z"));
 
     // 0 recoverable PII post-restore: neither subject resolves; both principals stay disabled.
-    assert!(slot.pseudonyms().resolve_subject(&s, &alice).is_none(), "alice re-erased");
-    assert!(slot.pseudonyms().resolve_subject(&s, &bob).is_none(), "bob re-erased");
+    assert!(
+        slot.pseudonyms().resolve_subject(&s, &alice).is_none(),
+        "alice re-erased"
+    );
+    assert!(
+        slot.pseudonyms().resolve_subject(&s, &bob).is_none(),
+        "bob re-erased"
+    );
     let nowt = at("2026-06-19T11:00:00Z");
     assert!(
-        slot.revocations().is_revoked(&s, &RevokeTarget::Principal(alice), &nowt),
+        slot.revocations()
+            .is_revoked(&s, &RevokeTarget::Principal(alice), &nowt),
         "alice's grants stay revoked (no resurrected authority)"
     );
     assert!(
-        slot.revocations().is_revoked(&s, &RevokeTarget::Principal(bob), &nowt),
+        slot.revocations()
+            .is_revoked(&s, &RevokeTarget::Principal(bob), &nowt),
         "bob's grants stay revoked"
     );
 
     // Each per-subject re-erase produced a dated, content-addressed receipt.
     assert_eq!(receipt.per_subject.len(), 2);
     for r in &receipt.per_subject {
-        assert!(r.content_hash.starts_with("blake3:"), "content-addressed receipt");
+        assert!(
+            r.content_hash.starts_with("blake3:"),
+            "content-addressed receipt"
+        );
         assert_eq!(r.erased_at, at("2026-06-19T11:00:00Z"), "dated");
     }
 }
@@ -142,10 +167,14 @@ fn id_d8_without_re_erasure_a_restore_resurrects_the_subject() {
     let slot = slot();
     let s = scope("acme");
     let alice = PrincipalId("p:alice".into());
-    slot.pseudonyms().put_mapping(&s, &alice, handle("anon-a", "acme")).unwrap();
+    slot.pseudonyms()
+        .put_mapping(&s, &alice, handle("anon-a", "acme"))
+        .unwrap();
     slot.erase_in(&s, &alice, at("2026-06-19T10:00:00Z"));
     // RESTORE without re-erasure.
-    slot.pseudonyms().put_mapping(&s, &alice, handle("anon-a", "acme")).unwrap();
+    slot.pseudonyms()
+        .put_mapping(&s, &alice, handle("anon-a", "acme"))
+        .unwrap();
     assert!(
         slot.pseudonyms().resolve_subject(&s, &alice).is_some(),
         "WITHOUT re-erasure, the restore resurrects the subject — the property re_erase_after_restore \

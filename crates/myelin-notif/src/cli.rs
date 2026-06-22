@@ -43,9 +43,7 @@
 use myelin_identity::{Consistency, Principal};
 
 use crate::list_inbox::{list_inbox, InboxFilter, InboxPage, Page, ReadAuthorizePort, Subsystem};
-use crate::prefs::{
-    get_prefs, route, set_prefs, PrefStore, PrefView, QuietHours,
-};
+use crate::prefs::{get_prefs, route, set_prefs, PrefStore, PrefView, QuietHours};
 use crate::read_state::{mark, snooze, ReadState, ReadStateError};
 use crate::router::{InboxProjection, RoutedInboxItem};
 use crate::watch::{watch_open, watch_resume, InboxFrame, WatchOutcome};
@@ -128,7 +126,10 @@ pub fn inbox_show(
         inbox,
         principal,
         &InboxFilter::all(),
-        &Page { after: None, limit: usize::MAX },
+        &Page {
+            after: None,
+            limit: usize::MAX,
+        },
         authorize,
         at,
     );
@@ -193,7 +194,10 @@ pub fn inbox_watch(
         Ok(WatchOutcome::ResyncRequired { .. }) => WatchView::ResyncRequired,
         Ok(WatchOutcome::Live(watch)) => {
             let frames = watch.drain();
-            WatchView::Live { last_seq: watch.last_seq(), frames }
+            WatchView::Live {
+                last_seq: watch.last_seq(),
+                frames,
+            }
         }
     }
 }
@@ -299,7 +303,10 @@ pub fn render_prefs(view: &PrefView) -> String {
         out.push_str(&format!("  {} <- {}\n", rule.channel.token(), m));
     }
     out.push_str(&format!("digest: {}\n", view.prefs.digest.cadence));
-    out.push_str(&format!("quiet-hours (tz offset {}m):\n", view.quiet.tz.offset_minutes));
+    out.push_str(&format!(
+        "quiet-hours (tz offset {}m):\n",
+        view.quiet.tz.offset_minutes
+    ));
     for w in &view.quiet.windows {
         out.push_str(&format!(
             "  [{:02}:{:02}, {:02}:{:02})  days={:?}\n",
@@ -404,9 +411,17 @@ mod tests {
         Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant())
     }
     fn strong() -> Consistency {
-        Consistency { at_least: Zookie("zk".into()), mode: ConsistencyMode::Strong }
+        Consistency {
+            at_least: Zookie("zk".into()),
+            mode: ConsistencyMode::Strong,
+        }
     }
-    fn item(recipient: &str, item_id: &str, subject: &str, reason: crate::Reason) -> RoutedInboxItem {
+    fn item(
+        recipient: &str,
+        item_id: &str,
+        subject: &str,
+        reason: crate::Reason,
+    ) -> RoutedInboxItem {
         RoutedInboxItem {
             tenant: tenant(),
             region: Region("fr-par".into()),
@@ -424,9 +439,24 @@ mod tests {
     }
     fn seeded(me: &str) -> InboxProjection {
         let inbox = InboxProjection::new();
-        inbox.upsert_for_test(item(me, "iss-1", "myelin://acme/issue/issue/PROJ-1", crate::Reason::Assigned));
-        inbox.upsert_for_test(item(me, "chat-1", "myelin://acme/chat/thread/T1", crate::Reason::Mentioned));
-        inbox.upsert_for_test(item(me, "git-1", "myelin://acme/git/pr/9", crate::Reason::ReviewRequested));
+        inbox.upsert_for_test(item(
+            me,
+            "iss-1",
+            "myelin://acme/issue/issue/PROJ-1",
+            crate::Reason::Assigned,
+        ));
+        inbox.upsert_for_test(item(
+            me,
+            "chat-1",
+            "myelin://acme/chat/thread/T1",
+            crate::Reason::Mentioned,
+        ));
+        inbox.upsert_for_test(item(
+            me,
+            "git-1",
+            "myelin://acme/git/pr/9",
+            crate::Reason::ReviewRequested,
+        ));
         inbox
     }
 
@@ -438,8 +468,14 @@ mod tests {
         assert_eq!(CliView::parse(Some("all")).unwrap(), CliView::All);
         assert_eq!(CliView::parse(Some("my-work")).unwrap(), CliView::MyWork);
         assert_eq!(CliView::parse(Some("activity")).unwrap(), CliView::Activity);
-        assert_eq!(CliView::parse(Some("review-requests")).unwrap(), CliView::ReviewRequests);
-        assert!(CliView::parse(Some("everything")).is_err(), "an unknown view is rejected (never the ALL inbox)");
+        assert_eq!(
+            CliView::parse(Some("review-requests")).unwrap(),
+            CliView::ReviewRequests
+        );
+        assert!(
+            CliView::parse(Some("everything")).is_err(),
+            "an unknown view is rejected (never the ALL inbox)"
+        );
     }
 
     /// **`inbox list --view my-work` drives `list_inbox` with the frozen My Work filter** — exactly
@@ -447,9 +483,20 @@ mod tests {
     #[test]
     fn inbox_list_my_work_selects_only_the_issues_row() {
         let inbox = seeded("u1");
-        let page = inbox_list(&inbox, &principal("u1"), CliView::MyWork, &Page::default(), &AllowAllAuthorize, &strong());
+        let page = inbox_list(
+            &inbox,
+            &principal("u1"),
+            CliView::MyWork,
+            &Page::default(),
+            &AllowAllAuthorize,
+            &strong(),
+        );
         let ids: Vec<_> = page.items.iter().map(|i| i.item_id.clone()).collect();
-        assert_eq!(ids, vec!["iss-1".to_string()], "the My Work view selects only the assigned issue");
+        assert_eq!(
+            ids,
+            vec!["iss-1".to_string()],
+            "the My Work view selects only the assigned issue"
+        );
     }
 
     /// **`inbox list` (the default view) is the unified ONE inbox** — all three rows for the
@@ -457,8 +504,19 @@ mod tests {
     #[test]
     fn inbox_list_default_is_the_one_inbox() {
         let inbox = seeded("u1");
-        let page = inbox_list(&inbox, &principal("u1"), CliView::All, &Page::default(), &AllowAllAuthorize, &strong());
-        assert_eq!(page.items.len(), 3, "the default view is the ONE inbox (all rows for u1)");
+        let page = inbox_list(
+            &inbox,
+            &principal("u1"),
+            CliView::All,
+            &Page::default(),
+            &AllowAllAuthorize,
+            &strong(),
+        );
+        assert_eq!(
+            page.items.len(),
+            3,
+            "the default view is the ONE inbox (all rows for u1)"
+        );
     }
 
     /// **`inbox show <id>` returns the item's PII-free detail — refs/tokens, never a rendered
@@ -466,11 +524,24 @@ mod tests {
     #[test]
     fn inbox_show_returns_refs_not_payloads() {
         let inbox = seeded("u1");
-        let show = inbox_show(&inbox, &principal("u1"), "iss-1", &AllowAllAuthorize, &strong()).unwrap();
+        let show = inbox_show(
+            &inbox,
+            &principal("u1"),
+            "iss-1",
+            &AllowAllAuthorize,
+            &strong(),
+        )
+        .unwrap();
         assert_eq!(show.item_id, "iss-1");
-        assert_eq!(show.reason, "assigned", "the reason is the snake_case token (PII-free)");
+        assert_eq!(
+            show.reason, "assigned",
+            "the reason is the snake_case token (PII-free)"
+        );
         assert_eq!(show.class, "direct");
-        assert_eq!(show.subject, "myelin://acme/issue/issue/PROJ-1", "the subject is a REF, never a title");
+        assert_eq!(
+            show.subject, "myelin://acme/issue/issue/PROJ-1",
+            "the subject is a REF, never a title"
+        );
         assert_eq!(show.state, "unread");
     }
 
@@ -487,11 +558,31 @@ mod tests {
         }
         let inbox = seeded("u1");
         // a denied item is not shown (held, not leaked — same as list).
-        assert!(inbox_show(&inbox, &principal("u1"), "iss-1", &DenyAll, &strong()).is_none(), "denied → not shown");
+        assert!(
+            inbox_show(&inbox, &principal("u1"), "iss-1", &DenyAll, &strong()).is_none(),
+            "denied → not shown"
+        );
         // another principal cannot show u1's item (recipient scope).
-        assert!(inbox_show(&inbox, &principal("u2"), "iss-1", &AllowAllAuthorize, &strong()).is_none(), "not my item → not shown");
+        assert!(
+            inbox_show(
+                &inbox,
+                &principal("u2"),
+                "iss-1",
+                &AllowAllAuthorize,
+                &strong()
+            )
+            .is_none(),
+            "not my item → not shown"
+        );
         // a missing id is None.
-        assert!(inbox_show(&inbox, &principal("u1"), "no-such", &AllowAllAuthorize, &strong()).is_none());
+        assert!(inbox_show(
+            &inbox,
+            &principal("u1"),
+            "no-such",
+            &AllowAllAuthorize,
+            &strong()
+        )
+        .is_none());
     }
 
     /// **`inbox read <id>` marks the caller's item read (the ONE read-state truth), recipient-
@@ -500,12 +591,25 @@ mod tests {
     fn inbox_read_marks_read_recipient_scoped() {
         let inbox = seeded("u1");
         inbox_read(&inbox, &principal("u1"), "iss-1").expect("read my own item");
-        let show = inbox_show(&inbox, &principal("u1"), "iss-1", &AllowAllAuthorize, &strong()).unwrap();
+        let show = inbox_show(
+            &inbox,
+            &principal("u1"),
+            "iss-1",
+            &AllowAllAuthorize,
+            &strong(),
+        )
+        .unwrap();
         assert_eq!(show.state, "read", "the item is read after `inbox read`");
         // u2 cannot read u1's item.
-        assert_eq!(inbox_read(&inbox, &principal("u2"), "iss-1"), Err(crate::read_state::ReadStateError::NotFound));
+        assert_eq!(
+            inbox_read(&inbox, &principal("u2"), "iss-1"),
+            Err(crate::read_state::ReadStateError::NotFound)
+        );
         // a missing id is NotFound.
-        assert_eq!(inbox_read(&inbox, &principal("u1"), "no-such"), Err(crate::read_state::ReadStateError::NotFound));
+        assert_eq!(
+            inbox_read(&inbox, &principal("u1"), "no-such"),
+            Err(crate::read_state::ReadStateError::NotFound)
+        );
     }
 
     /// **`inbox snooze <id> --until <ts>` records the until + parks the item.** After snooze, `show`
@@ -513,13 +617,34 @@ mod tests {
     #[test]
     fn inbox_snooze_records_until_and_parks() {
         let inbox = seeded("u1");
-        inbox_snooze(&inbox, &principal("u1"), "chat-1", "2026-06-25T09:00:00Z").expect("snooze my own item");
-        let show = inbox_show(&inbox, &principal("u1"), "chat-1", &AllowAllAuthorize, &strong()).unwrap();
-        assert_eq!(show.state, "snoozed", "the item is snoozed after `inbox snooze`");
+        inbox_snooze(&inbox, &principal("u1"), "chat-1", "2026-06-25T09:00:00Z")
+            .expect("snooze my own item");
+        let show = inbox_show(
+            &inbox,
+            &principal("u1"),
+            "chat-1",
+            &AllowAllAuthorize,
+            &strong(),
+        )
+        .unwrap();
+        assert_eq!(
+            show.state, "snoozed",
+            "the item is snoozed after `inbox snooze`"
+        );
         // suppressed from the active inbox.
-        let page = inbox_list(&inbox, &principal("u1"), CliView::All, &Page::default(), &AllowAllAuthorize, &strong());
+        let page = inbox_list(
+            &inbox,
+            &principal("u1"),
+            CliView::All,
+            &Page::default(),
+            &AllowAllAuthorize,
+            &strong(),
+        );
         let active = crate::read_state::active_inbox(page.items);
-        assert!(!active.iter().any(|r| r.item_id == "chat-1"), "the snoozed item is absent from the active inbox");
+        assert!(
+            !active.iter().any(|r| r.item_id == "chat-1"),
+            "the snoozed item is absent from the active inbox"
+        );
     }
 
     /// **`render_list` renders PII-free lines (item_id + reason/class token + subject ref + state),
@@ -527,9 +652,18 @@ mod tests {
     #[test]
     fn render_list_is_pii_free_lines() {
         let inbox = seeded("u1");
-        let page = inbox_list(&inbox, &principal("u1"), CliView::All, &Page::default(), &AllowAllAuthorize, &strong());
+        let page = inbox_list(
+            &inbox,
+            &principal("u1"),
+            CliView::All,
+            &Page::default(),
+            &AllowAllAuthorize,
+            &strong(),
+        );
         let out = render_list(&page);
-        assert!(out.contains("iss-1  [assigned/direct]  myelin://acme/issue/issue/PROJ-1  (unread)"));
+        assert!(
+            out.contains("iss-1  [assigned/direct]  myelin://acme/issue/issue/PROJ-1  (unread)")
+        );
         // the subject is a ref, never a title — there is no humanised string in the CLI output.
         assert!(out.contains("myelin://acme/git/pr/9"));
     }
@@ -549,8 +683,14 @@ mod tests {
         // frames we resume from 0 (the connection-tier holds the live handle — here we drive a poll).
         let view = inbox_watch(&mut fh, &me, Some(0));
         let out = render_watch(&view);
-        assert!(out.contains("WATCH 1 itm-1"), "the first live frame renders as a pii-free pointer line");
-        assert!(out.contains("WATCH 2 itm-2"), "the second live frame renders");
+        assert!(
+            out.contains("WATCH 1 itm-1"),
+            "the first live frame renders as a pii-free pointer line"
+        );
+        assert!(
+            out.contains("WATCH 2 itm-2"),
+            "the second live frame renders"
+        );
         // the cursor advanced to the head.
         if let WatchView::Live { last_seq, .. } = view {
             assert_eq!(last_seq, 2, "the resume cursor is the last delivered seq");
@@ -571,6 +711,9 @@ mod tests {
         }
         let view = inbox_watch(&mut fh, &me, Some(1)); // op 2 evicted → resync
         assert_eq!(view, WatchView::ResyncRequired);
-        assert!(render_watch(&view).contains("RESYNC_REQUIRED"), "the resync directive is surfaced, NAMED");
+        assert!(
+            render_watch(&view).contains("RESYNC_REQUIRED"),
+            "the resync directive is surfaced, NAMED"
+        );
     }
 }

@@ -46,8 +46,16 @@ fn self_host_parity_degenerate_one_cell_identical_code_path() {
     let mut sh = DegenerateControlPlane::bootstrap(CellId::from_token("cell-self"), region.clone());
 
     // ── ONE-ROW registry (architecture §10): exactly one cell — the install's own. ──
-    assert_eq!(sh.registry().cell_count(), 1, "a self-host install is EXACTLY one cell");
-    assert_eq!(sh.cell().region.as_str(), "fr-par", "pinned to the install's region");
+    assert_eq!(
+        sh.registry().cell_count(),
+        1,
+        "a self-host install is EXACTLY one cell"
+    );
+    assert_eq!(
+        sh.cell().region.as_str(),
+        "fr-par",
+        "pinned to the install's region"
+    );
 
     // ── `place` runs the IDENTICAL two-phase-signup code path (PlacementService::place — no fork). ──
     let service = PlacementService::new(CounterMinter::new());
@@ -55,13 +63,29 @@ fn self_host_parity_degenerate_one_cell_identical_code_path() {
         .place(&service, IsolationKind::Pool, "self-host-tenant")
         .expect("the one Active cell is eligible → placed via the SHARED PlacementService::place");
     let tenant: TenantId = answer.tenant_id.clone();
-    assert_eq!(answer.home_cell.as_str(), "cell-self", "placed on the install's own cell");
+    assert_eq!(
+        answer.home_cell.as_str(),
+        "cell-self",
+        "placed on the install's own cell"
+    );
 
     // ── `discover` / `placement_of` return "this cell" (the SHARED Registry methods). ──
-    let discovered = sh.discover_cell(&tenant).expect("a placed tenant discovers");
-    assert_eq!(discovered.as_str(), "cell-self", "discover returns 'this cell'");
-    let placement = sh.placement_of(&tenant).expect("a placed tenant has a placement_of answer");
-    assert_eq!(placement.home_cell.as_str(), "cell-self", "placement_of returns 'this cell'");
+    let discovered = sh
+        .discover_cell(&tenant)
+        .expect("a placed tenant discovers");
+    assert_eq!(
+        discovered.as_str(),
+        "cell-self",
+        "discover returns 'this cell'"
+    );
+    let placement = sh
+        .placement_of(&tenant)
+        .expect("a placed tenant has a placement_of answer");
+    assert_eq!(
+        placement.home_cell.as_str(),
+        "cell-self",
+        "placement_of returns 'this cell'"
+    );
     assert_eq!(
         placement.member_cells.len(),
         1,
@@ -70,11 +94,16 @@ fn self_host_parity_degenerate_one_cell_identical_code_path() {
 
     // ── The one cell's gateway (layer 4) ACCEPTS every tenant it homes; 0 cross-tenant reads. ──
     let gw = sh.gateway();
-    let served = gw.route(sh.registry(), &tenant).expect("the one cell homes (and serves) every tenant");
+    let served = gw
+        .route(sh.registry(), &tenant)
+        .expect("the one cell homes (and serves) every tenant");
     assert_eq!(served.home_cell.as_str(), "cell-self");
     assert_eq!(gw.misroute_count(), 0, "no misroute on a one-cell install");
     let cross_tenant_reads = gw.cross_tenant_reads();
-    assert_eq!(cross_tenant_reads, 0, "0 cross-tenant reads (the CP-D2 zero) on the degenerate cell");
+    assert_eq!(
+        cross_tenant_reads, 0,
+        "0 cross-tenant reads (the CP-D2 zero) on the degenerate cell"
+    );
 
     // ── CP-D3 ON THE DEGENERATE CELL: the residency-pin write boundary REJECTS an out-of-region write
     //    (the SAME layer-3 check a fleet cell runs). An in-region write is admitted. ──
@@ -82,22 +111,37 @@ fn self_host_parity_degenerate_one_cell_identical_code_path() {
         .expect("the residency-pin holds on the degenerate cell (out-of-region write REJECTED)");
     // The no-cross-region-query-path property holds on the degenerate cell (the SAME four-layer check).
     sh.assert_no_cross_region_query_path(&tenant, &Region::new("us-east"))
-        .expect("the one cell serves its tenant and that data stays in fr-par (no cross-region path)");
-    let out_of_region_writes_admitted = sh.four_layer().write_boundary().out_of_region_writes_admitted();
-    assert_eq!(out_of_region_writes_admitted, 0, "0 out-of-region writes admitted (CP-D3 on the degenerate cell)");
+        .expect(
+            "the one cell serves its tenant and that data stays in fr-par (no cross-region path)",
+        );
+    let out_of_region_writes_admitted = sh
+        .four_layer()
+        .write_boundary()
+        .out_of_region_writes_admitted();
+    assert_eq!(
+        out_of_region_writes_admitted, 0,
+        "0 out-of-region writes admitted (CP-D3 on the degenerate cell)"
+    );
 
     // ── `residency_verify` GREEN on the install's own data (the SHARED free function — no fork). ──
     let key = ResidencySigningKey::from_bytes([0x5eu8; 32]);
     let attestation = sh
         .residency_verify_own_data(&tenant, &key)
         .expect("residency_verify is GREEN on the self-host cell's own data");
-    assert_eq!(attestation.region.as_str(), "fr-par", "every M1 store reported the install's region");
+    assert_eq!(
+        attestation.region.as_str(),
+        "fr-par",
+        "every M1 store reported the install's region"
+    );
     assert_eq!(
         attestation.store_regions.len(),
         ResidencyStoreClass::M1_SET.len(),
         "every M1 store attested"
     );
-    assert!(attestation.verify(&key), "the green residency-attestation verifies (0 mismatches)");
+    assert!(
+        attestation.verify(&key),
+        "the green residency-attestation verifies (0 mismatches)"
+    );
 
     // ── Emit the green artifact on the SAME SignalSource every drill uses (observability is part of the
     //    pass, EI-01 §3). The self-host-parity zero is the sum of cross-region/cross-tenant violations
@@ -107,7 +151,8 @@ fn self_host_parity_degenerate_one_cell_identical_code_path() {
         SignalName::CrossTenantCount,
         (out_of_region_writes_admitted + cross_tenant_reads) as i64,
     );
-    sig.assert_signal(SignalName::CrossTenantCount, Predicate::Eq(0)).expect_green();
+    sig.assert_signal(SignalName::CrossTenantCount, Predicate::Eq(0))
+        .expect_green();
 
     println!(
         "[P-097 CP-D13/self-host-parity GREEN 2026-06-19] the degenerate one-cell control plane \

@@ -43,7 +43,11 @@ fn tenant() -> TenantId {
     TenantId("tenantA".into())
 }
 fn principal() -> Principal {
-    Principal::stub(PrincipalId("p-opaque-7".into()), PrincipalKind::Human, tenant())
+    Principal::stub(
+        PrincipalId("p-opaque-7".into()),
+        PrincipalKind::Human,
+        tenant(),
+    )
 }
 fn ctx_base() -> EmitContextBase {
     EmitContextBase {
@@ -60,9 +64,18 @@ fn ctx_base() -> EmitContextBase {
 /// The three block changes of one page (per-doc aggregate = the page).
 fn block_changes() -> Vec<KnowledgeChange> {
     vec![
-        KnowledgeChange::BlockCreated { page_id: "7c2".into(), block_id: "1".into() },
-        KnowledgeChange::BlockUpdated { page_id: "7c2".into(), block_id: "2".into() },
-        KnowledgeChange::BlockUpdated { page_id: "7c2".into(), block_id: "3".into() },
+        KnowledgeChange::BlockCreated {
+            page_id: "7c2".into(),
+            block_id: "1".into(),
+        },
+        KnowledgeChange::BlockUpdated {
+            page_id: "7c2".into(),
+            block_id: "2".into(),
+        },
+        KnowledgeChange::BlockUpdated {
+            page_id: "7c2".into(),
+            block_id: "3".into(),
+        },
     ]
 }
 
@@ -78,7 +91,8 @@ fn staged_block_rows() -> Vec<(String, String, String, serde_json::Value)> {
     for ch in &block_changes() {
         ids.push(emit_change(&mut tx, &tenant(), ch, None).expect("emit"));
     }
-    tx.commit().expect("commit the in-memory derive (the real co-commit is the PG tx below)");
+    tx.commit()
+        .expect("commit the in-memory derive (the real co-commit is the PG tx below)");
     ids.into_iter()
         .map(|id: EventId| {
             let row = store.row(&id).expect("staged knowledge row");
@@ -115,11 +129,24 @@ async fn emit_iff_committed_n_blocks_n_rows_and_rollback_zero_on_real_postgres()
     let outbox_ddl = OUTBOX_MIGRATION
         .replace("EXISTS outbox (", &format!("EXISTS {outbox} ("))
         .replace("ON outbox (", &format!("ON {outbox} ("))
-        .replace("outbox_event_id_unique", &format!("{outbox}_event_id_unique"))
-        .replace("outbox_aggregate_seq_unique", &format!("{outbox}_aggregate_seq_unique"))
+        .replace(
+            "outbox_event_id_unique",
+            &format!("{outbox}_event_id_unique"),
+        )
+        .replace(
+            "outbox_aggregate_seq_unique",
+            &format!("{outbox}_aggregate_seq_unique"),
+        )
         .replace("outbox_unsent_idx", &format!("{outbox}_unsent_idx"));
-    for stmt in outbox_ddl.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-        sqlx::query(stmt).execute(&admin).await.unwrap_or_else(|e| panic!("outbox ddl `{stmt}`: {e}"));
+    for stmt in outbox_ddl
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        sqlx::query(stmt)
+            .execute(&admin)
+            .await
+            .unwrap_or_else(|e| panic!("outbox ddl `{stmt}`: {e}"));
     }
     sqlx::query(&format!(
         "CREATE TABLE IF NOT EXISTS {block_tbl} (block_id TEXT PRIMARY KEY, page_id TEXT, version BIGINT)"
@@ -127,18 +154,31 @@ async fn emit_iff_committed_n_blocks_n_rows_and_rollback_zero_on_real_postgres()
     .execute(&admin)
     .await
     .expect("create block table");
-    sqlx::query(&format!("GRANT ALL ON {outbox} TO myelin_app")).execute(&admin).await.expect("grant outbox");
-    sqlx::query(&format!("GRANT ALL ON {block_tbl} TO myelin_app")).execute(&admin).await.expect("grant block");
+    sqlx::query(&format!("GRANT ALL ON {outbox} TO myelin_app"))
+        .execute(&admin)
+        .await
+        .expect("grant outbox");
+    sqlx::query(&format!("GRANT ALL ON {block_tbl} TO myelin_app"))
+        .execute(&admin)
+        .await
+        .expect("grant block");
 
     let rows = staged_block_rows();
-    assert_eq!(rows.len(), 3, "the 3 block changes derive 3 knowledge.* events");
+    assert_eq!(
+        rows.len(),
+        3,
+        "the 3 block changes derive 3 knowledge.* events"
+    );
 
     let insert_outbox = format!(
         "INSERT INTO {outbox} (event_id, aggregate, seq, subject, envelope) VALUES ($1,$2,$3,$4,$5)"
     );
 
     // ── (1) emit-iff-committed: the 3 block rows + the 3 event rows co-commit in ONE transaction. ─
-    let mut tx = app.begin().await.expect("begin the block state transaction");
+    let mut tx = app
+        .begin()
+        .await
+        .expect("begin the block state transaction");
     for (i, ch) in block_changes().iter().enumerate() {
         let block_id = match ch {
             KnowledgeChange::BlockCreated { block_id, .. }
@@ -165,7 +205,9 @@ async fn emit_iff_committed_n_blocks_n_rows_and_rollback_zero_on_real_postgres()
             .await
             .expect("emit the knowledge event into the SAME tx");
     }
-    tx.commit().await.expect("commit the blocks + events together");
+    tx.commit()
+        .await
+        .expect("commit the blocks + events together");
 
     // N blocks committed → N relay-visible (unsent) knowledge.block.updated/created rows (0 lost).
     let n: i64 = sqlx::query(&format!(
@@ -176,7 +218,10 @@ async fn emit_iff_committed_n_blocks_n_rows_and_rollback_zero_on_real_postgres()
     .await
     .unwrap()
     .get("n");
-    assert_eq!(n, 3, "3 block changes committed → 3 relay-visible knowledge.block.* rows (0 lost)");
+    assert_eq!(
+        n, 3,
+        "3 block changes committed → 3 relay-visible knowledge.block.* rows (0 lost)"
+    );
     // the block state rows committed too (no block without its event; no event without its block).
     let c: i64 = sqlx::query(&format!("SELECT count(*) AS n FROM {block_tbl}"))
         .fetch_one(&app)
@@ -191,7 +236,10 @@ async fn emit_iff_committed_n_blocks_n_rows_and_rollback_zero_on_real_postgres()
         .await
         .unwrap()
         .get("aggregate");
-    assert_eq!(agg, "myelin://tenantA/knowledge/page/7c2", "the aggregate is the PAGE (the doc, §4)");
+    assert_eq!(
+        agg, "myelin://tenantA/knowledge/page/7c2",
+        "the aggregate is the PAGE (the doc, §4)"
+    );
 
     // ── (2) emit-iff-committed: the SAME state transaction ROLLED BACK → 0 events, 0 blocks. ──
     let mut tx2 = app.begin().await.expect("begin a second state transaction");
@@ -214,7 +262,9 @@ async fn emit_iff_committed_n_blocks_n_rows_and_rollback_zero_on_real_postgres()
             .await
             .expect("emit the second event set into the SAME tx");
     }
-    tx2.rollback().await.expect("ABORT the state transaction (the crash before commit)");
+    tx2.rollback()
+        .await
+        .expect("ABORT the state transaction (the crash before commit)");
 
     // aborted state tx → still exactly the 3 committed events + 3 committed blocks (no new rows).
     let n_after: i64 = sqlx::query(&format!(
@@ -224,15 +274,27 @@ async fn emit_iff_committed_n_blocks_n_rows_and_rollback_zero_on_real_postgres()
     .await
     .unwrap()
     .get("n");
-    assert_eq!(n_after, 3, "aborted state tx wrote 0 events (emit-iff-committed, KN-D7): still only the 3 committed");
+    assert_eq!(
+        n_after, 3,
+        "aborted state tx wrote 0 events (emit-iff-committed, KN-D7): still only the 3 committed"
+    );
     let c_after: i64 = sqlx::query(&format!("SELECT count(*) AS n FROM {block_tbl}"))
         .fetch_one(&app)
         .await
         .unwrap()
         .get("n");
-    assert_eq!(c_after, 3, "the aborted block row rolled back too (no block without its event)");
+    assert_eq!(
+        c_after, 3,
+        "the aborted block row rolled back too (no block without its event)"
+    );
 
     // Cleanup (a NEW forward operation — test teardown, not a down-migration).
-    sqlx::query(&format!("DROP TABLE {outbox}")).execute(&admin).await.unwrap();
-    sqlx::query(&format!("DROP TABLE {block_tbl}")).execute(&admin).await.unwrap();
+    sqlx::query(&format!("DROP TABLE {outbox}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    sqlx::query(&format!("DROP TABLE {block_tbl}"))
+        .execute(&admin)
+        .await
+        .unwrap();
 }

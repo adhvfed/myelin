@@ -69,9 +69,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use myelin_events::{
-    EventEnvelope, EventHandler, HandleOutcome, Reason, SubjectPattern,
-};
+use myelin_events::{EventEnvelope, EventHandler, HandleOutcome, Reason, SubjectPattern};
 use myelin_refs::{strip_sub, ArtifactRef};
 use myelin_tenancy::{Region, TenantId};
 
@@ -217,9 +215,15 @@ impl EdgeProjection {
     /// edge (a removed-then-recreated edge is live again) — the chained-mutation
     /// created→removed→created path asserts this. Built tenant-first (the tenant-predicate floor).
     pub fn upsert(&self, tenant: &TenantId, region: &Region, row: EdgeRow) {
-        let pk = PartKey { tenant: tenant.clone(), region: region.clone() };
+        let pk = PartKey {
+            tenant: tenant.clone(),
+            region: region.clone(),
+        };
         let mut inner = self.lock();
-        inner.entry(pk).or_default().insert(row.edge_id.clone(), row);
+        inner
+            .entry(pk)
+            .or_default()
+            .insert(row.edge_id.clone(), row);
     }
 
     /// **Soft-delete (tombstone) the edge `edge_id` (the `*.removed`/`*.erased` path, §4.6).** Sets
@@ -228,7 +232,10 @@ impl EdgeProjection {
     /// gone — idempotent; a redelivered `*.removed` never errors). The `origin_event` is advanced to
     /// the removing event for provenance. Tenant-first.
     pub fn tombstone(&self, tenant: &TenantId, region: &Region, edge_id: &str, origin_event: &str) {
-        let pk = PartKey { tenant: tenant.clone(), region: region.clone() };
+        let pk = PartKey {
+            tenant: tenant.clone(),
+            region: region.clone(),
+        };
         let mut inner = self.lock();
         if let Some(part) = inner.get_mut(&pk) {
             if let Some(row) = part.get_mut(edge_id) {
@@ -241,22 +248,34 @@ impl EdgeProjection {
     /// The (live, non-tombstoned) edge row for `edge_id` in the `(tenant, region)` partition, if any.
     /// Tenant-first (no cross-tenant read path).
     pub fn get(&self, tenant: &TenantId, region: &Region, edge_id: &str) -> Option<EdgeRow> {
-        let pk = PartKey { tenant: tenant.clone(), region: region.clone() };
+        let pk = PartKey {
+            tenant: tenant.clone(),
+            region: region.clone(),
+        };
         self.lock().get(&pk).and_then(|p| p.get(edge_id).cloned())
     }
 
     /// The count of LIVE (non-tombstoned) edges in the `(tenant, region)` partition (the cold-rebuild
     /// parity check reads this — a replayed log rebuilds the SAME live-edge set).
     pub fn live_count(&self, tenant: &TenantId, region: &Region) -> usize {
-        let pk = PartKey { tenant: tenant.clone(), region: region.clone() };
-        self.lock().get(&pk).map(|p| p.values().filter(|r| !r.tombstoned).count()).unwrap_or(0)
+        let pk = PartKey {
+            tenant: tenant.clone(),
+            region: region.clone(),
+        };
+        self.lock()
+            .get(&pk)
+            .map(|p| p.values().filter(|r| !r.tombstoned).count())
+            .unwrap_or(0)
     }
 
     /// The TOTAL row count (live + tombstoned) in the `(tenant, region)` partition — the rebuild
     /// parity check reads this so a cold rebuild reproduces the SAME rows (incl. tombstones) the
     /// steady-state path held (REF-D4 byte-parity).
     pub fn total_count(&self, tenant: &TenantId, region: &Region) -> usize {
-        let pk = PartKey { tenant: tenant.clone(), region: region.clone() };
+        let pk = PartKey {
+            tenant: tenant.clone(),
+            region: region.clone(),
+        };
         self.lock().get(&pk).map(|p| p.len()).unwrap_or(0)
     }
 
@@ -281,7 +300,10 @@ impl EdgeProjection {
     /// recovery guarantee callers actually depend on.) Tenant-first (no cross-tenant read path);
     /// PII-free (every field is an opaque ref/token/pseudonymous id).
     pub fn parity_bytes(&self, tenant: &TenantId, region: &Region) -> Vec<u8> {
-        let pk = PartKey { tenant: tenant.clone(), region: region.clone() };
+        let pk = PartKey {
+            tenant: tenant.clone(),
+            region: region.clone(),
+        };
         let mut rows: Vec<EdgeRow> = self
             .lock()
             .get(&pk)
@@ -328,7 +350,10 @@ impl EdgeProjection {
     /// backdoor. This models the `TRUNCATE`/drop of the per-tenant `edge` partition before a recovery
     /// rebuild. Tenant-first (a wipe NEVER touches another tenant's partition).
     pub fn wipe_partition(&self, tenant: &TenantId, region: &Region) {
-        let pk = PartKey { tenant: tenant.clone(), region: region.clone() };
+        let pk = PartKey {
+            tenant: tenant.clone(),
+            region: region.clone(),
+        };
         self.lock().remove(&pk);
     }
 
@@ -338,12 +363,25 @@ impl EdgeProjection {
     /// "the edges this opaque actor authored". Tenant-first (no cross-tenant path). Returns live AND
     /// tombstoned rows (a `locate` reports everything the subject touches; the audit row is retained).
     /// Deterministic order by `edge_id`. The opaque id is matched, never a name — erasure-safe.
-    pub fn edges_by_actor(&self, tenant: &TenantId, region: &Region, subject_id: &str) -> Vec<EdgeRow> {
-        let pk = PartKey { tenant: tenant.clone(), region: region.clone() };
+    pub fn edges_by_actor(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+        subject_id: &str,
+    ) -> Vec<EdgeRow> {
+        let pk = PartKey {
+            tenant: tenant.clone(),
+            region: region.clone(),
+        };
         let mut rows: Vec<EdgeRow> = self
             .lock()
             .get(&pk)
-            .map(|p| p.values().filter(|r| r.origin_actor == subject_id).cloned().collect())
+            .map(|p| {
+                p.values()
+                    .filter(|r| r.origin_actor == subject_id)
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default();
         rows.sort_by(|a, b| a.edge_id.cmp(&b.edge_id));
         rows
@@ -371,7 +409,10 @@ impl EdgeProjection {
         region: &Region,
         target_root: &ArtifactRef,
     ) -> Vec<EdgeRow> {
-        let pk = PartKey { tenant: tenant.clone(), region: region.clone() };
+        let pk = PartKey {
+            tenant: tenant.clone(),
+            region: region.clone(),
+        };
         let mut rows: Vec<EdgeRow> = self
             .lock()
             .get(&pk)
@@ -403,7 +444,10 @@ impl EdgeProjection {
         region: &Region,
         source_root: &ArtifactRef,
     ) -> Vec<EdgeRow> {
-        let pk = PartKey { tenant: tenant.clone(), region: region.clone() };
+        let pk = PartKey {
+            tenant: tenant.clone(),
+            region: region.clone(),
+        };
         let mut rows: Vec<EdgeRow> = self
             .lock()
             .get(&pk)
@@ -443,7 +487,10 @@ impl RefsEdgeBuilder {
 
     /// Build the refs-edge-builder over `projection` (the edge inverse index it feeds).
     pub fn new(projection: EdgeProjection) -> RefsEdgeBuilder {
-        RefsEdgeBuilder { projection, index_lag: Arc::new(AtomicU64::new(0)) }
+        RefsEdgeBuilder {
+            projection,
+            index_lag: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     /// The edge projection this builder feeds (read access for the backlink read / tests / a reindex
@@ -535,9 +582,8 @@ impl RefsEdgeBuilder {
         let target = str_field(p, "target").ok_or_else(|| {
             ProjectError(format!("{} edge payload is missing `target`", ev.type_.0))
         })?;
-        let rel = str_field(p, "rel").ok_or_else(|| {
-            ProjectError(format!("{} edge payload is missing `rel`", ev.type_.0))
-        })?;
+        let rel = str_field(p, "rel")
+            .ok_or_else(|| ProjectError(format!("{} edge payload is missing `rel`", ev.type_.0)))?;
 
         let source_ref = ArtifactRef(source.clone());
         let target_ref = ArtifactRef(target.clone());
@@ -577,17 +623,24 @@ impl RefsEdgeBuilder {
             id
         } else {
             let source = str_field(p, "source").ok_or_else(|| {
-                ProjectError(format!("{} removal is missing `edge_id`/`source`", ev.type_.0))
+                ProjectError(format!(
+                    "{} removal is missing `edge_id`/`source`",
+                    ev.type_.0
+                ))
             })?;
             let target = str_field(p, "target").ok_or_else(|| {
-                ProjectError(format!("{} removal is missing `edge_id`/`target`", ev.type_.0))
+                ProjectError(format!(
+                    "{} removal is missing `edge_id`/`target`",
+                    ev.type_.0
+                ))
             })?;
             let rel = str_field(p, "rel").ok_or_else(|| {
                 ProjectError(format!("{} removal is missing `edge_id`/`rel`", ev.type_.0))
             })?;
             edge_id(&ev.tenant, &source, &target, &rel)
         };
-        self.projection.tombstone(&ev.tenant, &ev.region, &id, &ev.event_id.0);
+        self.projection
+            .tombstone(&ev.tenant, &ev.region, &id, &ev.event_id.0);
         Ok(())
     }
 
@@ -601,7 +654,10 @@ impl RefsEdgeBuilder {
 
 /// Read a string field from a references-not-payloads payload, or `None` if absent / non-string.
 fn str_field(payload: &serde_json::Value, key: &str) -> Option<String> {
-    payload.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+    payload
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 impl EventHandler for RefsEdgeBuilder {
@@ -640,7 +696,11 @@ mod tests {
         Region("fr-par".into())
     }
     fn principal() -> Principal {
-        Principal::stub(PrincipalId("p-opaque-1".into()), PrincipalKind::Human, tenant())
+        Principal::stub(
+            PrincipalId("p-opaque-1".into()),
+            PrincipalKind::Human,
+            tenant(),
+        )
     }
 
     /// An edge event with a references-not-payloads payload. `type_` drives the branch; the payload
@@ -678,10 +738,26 @@ mod tests {
     fn edge_id_is_deterministic_and_field_unambiguous() {
         let t = tenant();
         let a = edge_id(&t, "s", "t", "mentions");
-        assert_eq!(a, edge_id(&t, "s", "t", "mentions"), "the same tuple → the same id (idempotent)");
-        assert_ne!(a, edge_id(&t, "s", "t", "embeds"), "a different rel → a different id");
-        assert_ne!(a, edge_id(&t, "s2", "t", "mentions"), "a different source → a different id");
-        assert_ne!(a, edge_id(&TenantId("other".into()), "s", "t", "mentions"), "tenant-scoped id");
+        assert_eq!(
+            a,
+            edge_id(&t, "s", "t", "mentions"),
+            "the same tuple → the same id (idempotent)"
+        );
+        assert_ne!(
+            a,
+            edge_id(&t, "s", "t", "embeds"),
+            "a different rel → a different id"
+        );
+        assert_ne!(
+            a,
+            edge_id(&t, "s2", "t", "mentions"),
+            "a different source → a different id"
+        );
+        assert_ne!(
+            a,
+            edge_id(&TenantId("other".into()), "s", "t", "mentions"),
+            "tenant-scoped id"
+        );
         // field boundary: ("ab","c",…) must not collide with ("a","bc",…)
         assert_ne!(
             edge_id(&t, "ab", "c", "mentions"),
@@ -705,18 +781,35 @@ mod tests {
         assert_eq!(b.handle(&ev), HandleOutcome::Done);
         // replay the SAME event → still one row (idempotent on edge_id).
         assert_eq!(b.handle(&ev), HandleOutcome::Done);
-        assert_eq!(b.projection().live_count(&tenant(), &region()), 1, "idempotent: one row");
+        assert_eq!(
+            b.projection().live_count(&tenant(), &region()),
+            1,
+            "idempotent: one row"
+        );
 
         let id = edge_id(&tenant(), src, tgt, "embeds");
-        let row = b.projection().get(&tenant(), &region(), &id).expect("the edge row exists");
+        let row = b
+            .projection()
+            .get(&tenant(), &region(), &id)
+            .expect("the edge row exists");
         // the roots are the #sub-stripped parents (strip_sub, REF-P1).
-        assert_eq!(row.source_root.0, "myelin://acme/chat/message/m1", "source_root strips #sub");
-        assert_eq!(row.target_root.0, "myelin://acme/knowledge/page/7c2", "target_root strips #sub");
+        assert_eq!(
+            row.source_root.0, "myelin://acme/chat/message/m1",
+            "source_root strips #sub"
+        );
+        assert_eq!(
+            row.target_root.0, "myelin://acme/knowledge/page/7c2",
+            "target_root strips #sub"
+        );
         // the FULL #sub URNs are retained (the edge identity is sub-precise).
         assert_eq!(row.source.0, src);
         assert_eq!(row.target.0, tgt);
         assert_eq!(row.rel, "embeds");
-        assert_eq!(row.rel_class, RelClass::Reference, "refs.edge.* is reference-class");
+        assert_eq!(
+            row.rel_class,
+            RelClass::Reference,
+            "refs.edge.* is reference-class"
+        );
         // origin_actor is the PSEUDONYMOUS opaque principal id, never a name (erasure-safe).
         assert_eq!(row.origin_actor, "p-opaque-1");
         assert_eq!(row.zookie.as_deref(), Some("zk-1"));
@@ -733,8 +826,15 @@ mod tests {
         let ev = edge_event("01J-rel", "issue.relation.created", src, tgt, "blocks");
         assert_eq!(b.handle(&ev), HandleOutcome::Done);
         let id = edge_id(&tenant(), src, tgt, "blocks");
-        let row = b.projection().get(&tenant(), &region(), &id).expect("lifecycle edge exists");
-        assert_eq!(row.rel_class, RelClass::Lifecycle, "issue.relation.* is lifecycle-class (TE-7)");
+        let row = b
+            .projection()
+            .get(&tenant(), &region(), &id)
+            .expect("lifecycle edge exists");
+        assert_eq!(
+            row.rel_class,
+            RelClass::Lifecycle,
+            "issue.relation.* is lifecycle-class (TE-7)"
+        );
     }
 
     /// **A `knowledge.page.created` with NO edge payload is a valid no-op (not a poison).** A page
@@ -744,8 +844,16 @@ mod tests {
         let b = RefsEdgeBuilder::new(EdgeProjection::new());
         let mut ev = edge_event("01J-pg", "knowledge.page.created", "x", "y", "z");
         ev.payload = serde_json::json!({ "title_ref": "r1" }); // no source/target/rel.
-        assert_eq!(b.handle(&ev), HandleOutcome::Done, "no edge payload → no-op, not poison");
-        assert_eq!(b.projection().total_count(&tenant(), &region()), 0, "no edge projected");
+        assert_eq!(
+            b.handle(&ev),
+            HandleOutcome::Done,
+            "no edge payload → no-op, not poison"
+        );
+        assert_eq!(
+            b.projection().total_count(&tenant(), &region()),
+            0,
+            "no edge projected"
+        );
     }
 
     /// **A `refs.edge.created` with a missing `source` is a LOUD non-retryable poison** (fail-closed
@@ -756,7 +864,9 @@ mod tests {
         let mut ev = edge_event("01J-bad", "refs.edge.created", "s", "t", "mentions");
         ev.payload = serde_json::json!({ "target": "t", "rel": "mentions" }); // no source.
         match b.handle(&ev) {
-            HandleOutcome::NonRetryable(Reason(r)) => assert!(r.contains("source"), "names the field: {r}"),
+            HandleOutcome::NonRetryable(Reason(r)) => {
+                assert!(r.contains("source"), "names the field: {r}")
+            }
             other => panic!("a malformed edge event must be a non-retryable poison, got {other:?}"),
         }
         assert_eq!(b.projection().total_count(&tenant(), &region()), 0);
@@ -771,20 +881,39 @@ mod tests {
         let b = RefsEdgeBuilder::new(EdgeProjection::new());
         let src = "myelin://acme/chat/message/m1";
         let tgt = "myelin://acme/issue/issue/ENG-1";
-        b.handle(&edge_event("01J-c", "refs.edge.created", src, tgt, "mentions"));
+        b.handle(&edge_event(
+            "01J-c",
+            "refs.edge.created",
+            src,
+            tgt,
+            "mentions",
+        ));
         assert_eq!(b.projection().live_count(&tenant(), &region()), 1);
 
         // remove by the (source, target, rel) triple → tombstone.
         let rm = edge_event("01J-r", "refs.edge.removed", src, tgt, "mentions");
         assert_eq!(b.handle(&rm), HandleOutcome::Done);
-        assert_eq!(b.projection().live_count(&tenant(), &region()), 0, "tombstoned → hidden from live");
-        assert_eq!(b.projection().total_count(&tenant(), &region()), 1, "row retained for audit");
+        assert_eq!(
+            b.projection().live_count(&tenant(), &region()),
+            0,
+            "tombstoned → hidden from live"
+        );
+        assert_eq!(
+            b.projection().total_count(&tenant(), &region()),
+            1,
+            "row retained for audit"
+        );
         // redelivered removal is a no-op (idempotent).
         assert_eq!(b.handle(&rm), HandleOutcome::Done);
         assert_eq!(b.projection().total_count(&tenant(), &region()), 1);
 
         let id = edge_id(&tenant(), src, tgt, "mentions");
-        assert!(b.projection().get(&tenant(), &region(), &id).unwrap().tombstoned);
+        assert!(
+            b.projection()
+                .get(&tenant(), &region(), &id)
+                .unwrap()
+                .tombstoned
+        );
     }
 
     /// **A tombstone of an edge that was never built is a no-op (idempotent), not an error.** A
@@ -793,7 +922,11 @@ mod tests {
     fn tombstone_of_absent_edge_is_a_noop() {
         let b = RefsEdgeBuilder::new(EdgeProjection::new());
         let rm = edge_event("01J-r", "refs.edge.removed", "s", "t", "mentions");
-        assert_eq!(b.handle(&rm), HandleOutcome::Done, "removal of absent edge is a no-op");
+        assert_eq!(
+            b.handle(&rm),
+            HandleOutcome::Done,
+            "removal of absent edge is a no-op"
+        );
         assert_eq!(b.projection().total_count(&tenant(), &region()), 0);
     }
 
@@ -803,10 +936,20 @@ mod tests {
         let b = RefsEdgeBuilder::new(EdgeProjection::new());
         let src = "myelin://acme/chat/message/m1";
         let tgt = "myelin://acme/issue/issue/ENG-1";
-        b.handle(&edge_event("01J-c", "refs.edge.created", src, tgt, "mentions"));
+        b.handle(&edge_event(
+            "01J-c",
+            "refs.edge.created",
+            src,
+            tgt,
+            "mentions",
+        ));
         let er = edge_event("01J-e", "chat.message.erased", src, tgt, "mentions");
         assert_eq!(b.handle(&er), HandleOutcome::Done);
-        assert_eq!(b.projection().live_count(&tenant(), &region()), 0, "erased → tombstoned");
+        assert_eq!(
+            b.projection().live_count(&tenant(), &region()),
+            0,
+            "erased → tombstoned"
+        );
     }
 
     // --- index_lag telemetry (contract 1.8) ---
@@ -817,8 +960,18 @@ mod tests {
     fn index_lag_is_zero_in_steady_state_and_named() {
         let b = RefsEdgeBuilder::new(EdgeProjection::new());
         assert_eq!(b.index_lag(), 0, "a fresh builder has no lag");
-        b.handle(&edge_event("01J-1", "refs.edge.created", "s", "t", "mentions"));
+        b.handle(&edge_event(
+            "01J-1",
+            "refs.edge.created",
+            "s",
+            "t",
+            "mentions",
+        ));
         assert_eq!(b.index_lag(), 0, "index_lag returns to 0 after projection");
-        assert_eq!(RefsEdgeBuilder::INDEX_LAG_SIGNAL, "refs.index_lag", "the contract-1.8 signal name");
+        assert_eq!(
+            RefsEdgeBuilder::INDEX_LAG_SIGNAL,
+            "refs.index_lag",
+            "the contract-1.8 signal name"
+        );
     }
 }

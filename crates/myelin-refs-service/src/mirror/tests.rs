@@ -33,16 +33,33 @@ fn typed_event(source: &str, target: &str, rel: LifecycleRel) -> SyntheticTypedE
 #[test]
 fn vocabulary_is_the_frozen_set_and_rejects_unknown() {
     for &rel in LifecycleRel::FORWARD_VOCABULARY {
-        assert_eq!(LifecycleRel::parse(rel.as_str()), Some(rel), "{} round-trips", rel.as_str());
+        assert_eq!(
+            LifecycleRel::parse(rel.as_str()),
+            Some(rel),
+            "{} round-trips",
+            rel.as_str()
+        );
     }
     // the 7 frozen forward rels (the §3.3 set, exactly).
-    assert_eq!(LifecycleRel::FORWARD_VOCABULARY.len(), 7, "the §3.3 vocabulary is 7 rels");
+    assert_eq!(
+        LifecycleRel::FORWARD_VOCABULARY.len(),
+        7,
+        "the §3.3 vocabulary is 7 rels"
+    );
     // `child` is the inverse direction of `parent` (projected, parseable).
     assert_eq!(LifecycleRel::parse("child"), Some(LifecycleRel::Child));
     // an unknown lifecycle token is REJECTED (never guessed) — and a reference-class rel is NOT a
     // lifecycle rel (the two classes never alias).
-    assert_eq!(LifecycleRel::parse("unblocks"), None, "unknown token rejected");
-    assert_eq!(LifecycleRel::parse("mentions"), None, "a reference rel is not a lifecycle rel");
+    assert_eq!(
+        LifecycleRel::parse("unblocks"),
+        None,
+        "unknown token rejected"
+    );
+    assert_eq!(
+        LifecycleRel::parse("mentions"),
+        None,
+        "a reference rel is not a lifecycle rel"
+    );
     assert_eq!(LifecycleRel::parse(""), None, "empty token rejected");
 }
 
@@ -54,14 +71,36 @@ fn vocabulary_is_the_frozen_set_and_rejects_unknown() {
 #[test]
 fn inverse_pairing_is_correct_across_the_relation_set() {
     // the frozen reciprocal pairs.
-    assert_eq!(LifecycleRel::Blocks.inverse(), Inverse::Paired(LifecycleRel::BlockedBy));
-    assert_eq!(LifecycleRel::BlockedBy.inverse(), Inverse::Paired(LifecycleRel::Blocks));
-    assert_eq!(LifecycleRel::Parent.inverse(), Inverse::Paired(LifecycleRel::Child));
-    assert_eq!(LifecycleRel::Child.inverse(), Inverse::Paired(LifecycleRel::Parent));
+    assert_eq!(
+        LifecycleRel::Blocks.inverse(),
+        Inverse::Paired(LifecycleRel::BlockedBy)
+    );
+    assert_eq!(
+        LifecycleRel::BlockedBy.inverse(),
+        Inverse::Paired(LifecycleRel::Blocks)
+    );
+    assert_eq!(
+        LifecycleRel::Parent.inverse(),
+        Inverse::Paired(LifecycleRel::Child)
+    );
+    assert_eq!(
+        LifecycleRel::Child.inverse(),
+        Inverse::Paired(LifecycleRel::Parent)
+    );
     // reciprocity: the inverse of the inverse is the original (no asymmetric drift).
-    for &rel in &[LifecycleRel::Blocks, LifecycleRel::BlockedBy, LifecycleRel::Parent, LifecycleRel::Child] {
+    for &rel in &[
+        LifecycleRel::Blocks,
+        LifecycleRel::BlockedBy,
+        LifecycleRel::Parent,
+        LifecycleRel::Child,
+    ] {
         if let Inverse::Paired(inv) = rel.inverse() {
-            assert_eq!(inv.inverse(), Inverse::Paired(rel), "{} ↔ inverse is reciprocal", rel.as_str());
+            assert_eq!(
+                inv.inverse(),
+                Inverse::Paired(rel),
+                "{} ↔ inverse is reciprocal",
+                rel.as_str()
+            );
         } else {
             panic!("{} must have a paired inverse", rel.as_str());
         }
@@ -87,13 +126,22 @@ fn blocks_event_yields_both_blocks_and_blocked_by_with_correct_direction() {
     let rows = mirror_edges(&tenant(), &typed_event(eng1, eng2, LifecycleRel::Blocks));
 
     assert_eq!(rows.len(), 2, "a blocks event projects BOTH directions");
-    let blocks = rows.iter().find(|r| r.rel == "blocks").expect("the forward blocks edge");
-    let blocked_by = rows.iter().find(|r| r.rel == "blocked_by").expect("the inverse blocked_by edge");
+    let blocks = rows
+        .iter()
+        .find(|r| r.rel == "blocks")
+        .expect("the forward blocks edge");
+    let blocked_by = rows
+        .iter()
+        .find(|r| r.rel == "blocked_by")
+        .expect("the inverse blocked_by edge");
 
     // direction: blocks runs ENG-1 → ENG-2; blocked_by runs ENG-2 → ENG-1 (endpoints swapped).
     assert_eq!(blocks.source.0, eng1);
     assert_eq!(blocks.target.0, eng2);
-    assert_eq!(blocked_by.source.0, eng2, "inverse edge has the endpoints SWAPPED");
+    assert_eq!(
+        blocked_by.source.0, eng2,
+        "inverse edge has the endpoints SWAPPED"
+    );
     assert_eq!(blocked_by.target.0, eng1);
 
     // THE discipline: BOTH are lifecycle-class (never reference).
@@ -119,8 +167,12 @@ fn parent_relates_and_floor_rels_mirror_correctly() {
     // parent ⇒ parent + child.
     let rows = mirror_edges(&tenant(), &typed_event(a, b, LifecycleRel::Parent));
     assert_eq!(rows.len(), 2);
-    assert!(rows.iter().any(|r| r.rel == "parent" && r.source.0 == a && r.target.0 == b));
-    assert!(rows.iter().any(|r| r.rel == "child" && r.source.0 == b && r.target.0 == a));
+    assert!(rows
+        .iter()
+        .any(|r| r.rel == "parent" && r.source.0 == a && r.target.0 == b));
+    assert!(rows
+        .iter()
+        .any(|r| r.rel == "child" && r.source.0 == b && r.target.0 == a));
 
     // relates ⇒ relates + relates (same token, endpoints swapped — visible from both ends).
     let rows = mirror_edges(&tenant(), &typed_event(a, b, LifecycleRel::Relates));
@@ -130,9 +182,18 @@ fn parent_relates_and_floor_rels_mirror_correctly() {
     assert!(rows.iter().any(|r| r.source.0 == b && r.target.0 == a));
 
     // the floor rels (closes/depends_on/assigns) mirror FORWARD-only (no invented inverse token).
-    for rel in [LifecycleRel::Closes, LifecycleRel::DependsOn, LifecycleRel::Assigns] {
+    for rel in [
+        LifecycleRel::Closes,
+        LifecycleRel::DependsOn,
+        LifecycleRel::Assigns,
+    ] {
         let rows = mirror_edges(&tenant(), &typed_event(a, b, rel));
-        assert_eq!(rows.len(), 1, "{} mirrors forward-only (floor: no inverse token)", rel.as_str());
+        assert_eq!(
+            rows.len(),
+            1,
+            "{} mirrors forward-only (floor: no inverse token)",
+            rel.as_str()
+        );
         assert_eq!(rows[0].rel_class, RelClass::Lifecycle);
     }
 }
@@ -146,7 +207,10 @@ fn mirror_strips_sub_for_roots_keeps_full_urn() {
     let rows = mirror_edges(&tenant(), &typed_event(src, tgt, LifecycleRel::Parent));
     let parent = rows.iter().find(|r| r.rel == "parent").unwrap();
     assert_eq!(parent.source.0, src, "full #sub URN retained");
-    assert_eq!(parent.source_root.0, "myelin://acme/knowledge/page/7c2", "root strips #sub");
+    assert_eq!(
+        parent.source_root.0, "myelin://acme/knowledge/page/7c2",
+        "root strips #sub"
+    );
     assert_eq!(parent.target_root.0, "myelin://acme/knowledge/page/abc");
 }
 
@@ -164,7 +228,11 @@ fn project_typed_event_is_idempotent_on_both_directions() {
     project_typed_event(&proj, &tenant(), &region(), &ev).unwrap();
     // replay → still two live edges (idempotent on the deterministic edge_id).
     project_typed_event(&proj, &tenant(), &region(), &ev).unwrap();
-    assert_eq!(proj.live_count(&tenant(), &region()), 2, "forward + inverse, idempotent");
+    assert_eq!(
+        proj.live_count(&tenant(), &region()),
+        2,
+        "forward + inverse, idempotent"
+    );
 
     // the inverse edge is inbound to ENG-1 (the blocked_by edge ENG-2→ENG-1 has target_root ENG-1).
     let inbound = proj.inbound_live(&tenant(), &region(), &ArtifactRef(eng1.into()));
@@ -187,8 +255,13 @@ fn drift_reconverges_to_the_typed_table_typed_wins() {
     let eng3 = "myelin://acme/issue/issue/ENG-3";
 
     // DRIFT: a stale lifecycle edge says ENG-3 blocks ENG-2 (the typed table no longer agrees).
-    project_typed_event(&proj, &tenant(), &region(), &typed_event(eng3, eng2, LifecycleRel::Blocks))
-        .unwrap();
+    project_typed_event(
+        &proj,
+        &tenant(),
+        &region(),
+        &typed_event(eng3, eng2, LifecycleRel::Blocks),
+    )
+    .unwrap();
     // and a reference-class edge inbound to ENG-2 (must NOT be touched by reconvergence).
     proj.upsert(
         &tenant(),
@@ -211,20 +284,37 @@ fn drift_reconverges_to_the_typed_table_typed_wins() {
     // THE TYPED TRUTH for the scope (target ENG-2): ENG-1 blocks ENG-2 (NOT ENG-3).
     let snapshot = vec![typed_event(eng1, eng2, LifecycleRel::Blocks)];
     let covered = vec![ArtifactRef(eng2.into())];
-    let (reprojected, tombstoned) =
-        reconverge(&proj, &tenant(), &region(), &snapshot, &covered, "01J-reindex").unwrap();
+    let (reprojected, tombstoned) = reconverge(
+        &proj,
+        &tenant(),
+        &region(),
+        &snapshot,
+        &covered,
+        "01J-reindex",
+    )
+    .unwrap();
 
-    assert_eq!(reprojected, 2, "the typed snapshot re-projects both directions");
-    assert_eq!(tombstoned, 1, "the drifted ENG-3 blocks ENG-2 edge is tombstoned (typed wins)");
+    assert_eq!(
+        reprojected, 2,
+        "the typed snapshot re-projects both directions"
+    );
+    assert_eq!(
+        tombstoned, 1,
+        "the drifted ENG-3 blocks ENG-2 edge is tombstoned (typed wins)"
+    );
 
     // the drift is gone; the typed truth is live; the reference edge is UNTOUCHED.
     let inbound = proj.inbound_live(&tenant(), &region(), &ArtifactRef(eng2.into()));
     assert!(
-        inbound.iter().any(|r| r.rel == "blocks" && r.source.0 == eng1),
+        inbound
+            .iter()
+            .any(|r| r.rel == "blocks" && r.source.0 == eng1),
         "the typed truth (ENG-1 blocks ENG-2) is live"
     );
     assert!(
-        !inbound.iter().any(|r| r.rel == "blocks" && r.source.0 == eng3),
+        !inbound
+            .iter()
+            .any(|r| r.rel == "blocks" && r.source.0 == eng3),
         "the drifted ENG-3 edge is tombstoned (typed table wins)"
     );
     assert!(
@@ -244,17 +334,39 @@ fn reconverge_leaves_out_of_scope_edges_alone() {
     let y = "myelin://acme/issue/issue/Y";
 
     // an edge inbound to B (in scope) and one inbound to Y (out of scope).
-    project_typed_event(&proj, &tenant(), &region(), &typed_event(a, b, LifecycleRel::Blocks)).unwrap();
-    project_typed_event(&proj, &tenant(), &region(), &typed_event(x, y, LifecycleRel::Blocks)).unwrap();
+    project_typed_event(
+        &proj,
+        &tenant(),
+        &region(),
+        &typed_event(a, b, LifecycleRel::Blocks),
+    )
+    .unwrap();
+    project_typed_event(
+        &proj,
+        &tenant(),
+        &region(),
+        &typed_event(x, y, LifecycleRel::Blocks),
+    )
+    .unwrap();
 
     // reconverge a snapshot that re-emits A blocks B, covering ONLY root B (not Y).
     let snapshot = vec![typed_event(a, b, LifecycleRel::Blocks)];
     let covered = vec![ArtifactRef(b.into())];
-    let (_, tombstoned) =
-        reconverge(&proj, &tenant(), &region(), &snapshot, &covered, "01J-reindex").unwrap();
+    let (_, tombstoned) = reconverge(
+        &proj,
+        &tenant(),
+        &region(),
+        &snapshot,
+        &covered,
+        "01J-reindex",
+    )
+    .unwrap();
 
     assert_eq!(tombstoned, 0, "no drift in the covered scope");
     // the out-of-scope X→Y blocks edge is untouched (its inverse blocked_by is inbound to X).
     let inbound_y = proj.inbound_live(&tenant(), &region(), &ArtifactRef(y.into()));
-    assert!(inbound_y.iter().any(|r| r.rel == "blocks"), "out-of-scope edge left alone");
+    assert!(
+        inbound_y.iter().any(|r| r.rel == "blocks"),
+        "out-of-scope edge left alone"
+    );
 }

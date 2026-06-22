@@ -91,7 +91,10 @@ fn see_all(_m: &myelin_query::RelMembership) -> bool {
 
 /// **PROVIDER side of 3.3** — an `arm_trigger` arming + the Trigger engine that resolves. A
 /// per-person "notify me when this issue is unblocked" promise.
-fn provider_engine(timer: &dyn DurableTimer, stale: Option<StaleAfter>) -> (TriggerEngine, ArmingId) {
+fn provider_engine(
+    timer: &dyn DurableTimer,
+    stale: Option<StaleAfter>,
+) -> (TriggerEngine, ArmingId) {
     let mut engine = TriggerEngine::new();
     let arming = engine
         .arm(
@@ -127,7 +130,11 @@ fn cdc_3_3_fires_exactly_once_per_arming_under_concurrent_events() {
             owner: o,
             ..
         } => {
-            assert_eq!(resolved_by, &EventId("evt-a".into()), "the resolving event is the cause");
+            assert_eq!(
+                resolved_by,
+                &EventId("evt-a".into()),
+                "the resolving event is the cause"
+            );
             assert!(matches!(on_resolve, OnResolve::Notify));
             assert_eq!(o, &owner());
         }
@@ -143,7 +150,10 @@ fn cdc_3_3_fires_exactly_once_per_arming_under_concurrent_events() {
     );
     // The durable state is Resolved, resolved_by the FIRST event.
     assert_eq!(
-        engine.arming(&TriggerId("notify_on_unblock".into())).unwrap().resolved_by,
+        engine
+            .arming(&TriggerId("notify_on_unblock".into()))
+            .unwrap()
+            .resolved_by,
         Some(EventId("evt-a".into()))
     );
 }
@@ -159,13 +169,23 @@ fn cdc_3_3_stale_after_delegates_to_durable_timer_9_3() {
 
     // CONSUMER side of 9.3: the timer wheel was armed through the seam with the precomputed fire_at
     // (the stale_after deadline — DELEGATED, not reinvented in the engine).
-    assert_eq!(timer.armed_count(), 1, "the stale_after timer was armed via the 9.3 seam");
+    assert_eq!(
+        timer.armed_count(),
+        1,
+        "the stale_after timer was armed via the 9.3 seam"
+    );
     assert_eq!(timer.deadline_for(&arming), Some(deadline));
 
     // The durable timer fires (the minute-bucket wheel delivers the stale callback) → armed → stale.
-    assert!(engine.on_timer_fired(&arming), "the timer firing drives armed → stale");
+    assert!(
+        engine.on_timer_fired(&arming),
+        "the timer firing drives armed → stale"
+    );
     assert_eq!(
-        engine.arming(&TriggerId("notify_on_unblock".into())).unwrap().state,
+        engine
+            .arming(&TriggerId("notify_on_unblock".into()))
+            .unwrap()
+            .state,
         TriggerState::Stale
     );
 }
@@ -176,7 +196,8 @@ fn cdc_3_3_stale_after_delegates_to_durable_timer_9_3() {
 #[test]
 fn cdc_3_3_disarm_cancels_the_arming_and_the_timer() {
     let timer = InMemoryTimer::new();
-    let (mut engine, _arming) = provider_engine(&timer, Some(StaleAfter("2026-06-21T00:00:00Z".into())));
+    let (mut engine, _arming) =
+        provider_engine(&timer, Some(StaleAfter("2026-06-21T00:00:00Z".into())));
     assert_eq!(timer.armed_count(), 1);
 
     // CONSUMER: the owner disarms → armed → disarmed; the timer wheel is disarmed via the seam.
@@ -184,10 +205,17 @@ fn cdc_3_3_disarm_cancels_the_arming_and_the_timer() {
         .disarm_trigger(&TriggerId("notify_on_unblock".into()), &timer)
         .unwrap());
     assert_eq!(
-        engine.arming(&TriggerId("notify_on_unblock".into())).unwrap().state,
+        engine
+            .arming(&TriggerId("notify_on_unblock".into()))
+            .unwrap()
+            .state,
         TriggerState::Disarmed
     );
-    assert_eq!(timer.armed_count(), 0, "the disarm cancelled the stale_after timer");
+    assert_eq!(
+        timer.armed_count(),
+        0,
+        "the disarm cancelled the stale_after timer"
+    );
 
     // A late resolving event does NOT resolve a disarmed arming.
     let e = envelope("issues.issue.unblocked", "PROJ-1", "evt-late");
@@ -276,7 +304,10 @@ fn cdc_3_3_stale_after_arm_failure_is_surfaced() {
         ),
         &Failing,
     );
-    assert!(res.is_err(), "a stale_after arm failure is surfaced, never swallowed");
+    assert!(
+        res.is_err(),
+        "a stale_after arm failure is surfaced, never swallowed"
+    );
 }
 
 /// The 3.3 pair, REGISTRATION-SHAPE leg: the frozen `Trigger{ owner, condition, arms_subject,
@@ -301,7 +332,9 @@ fn cdc_3_3_registration_shape_round_trips_stably() {
     // consumers read (no drift, 13.3).
     let v = serde_json::to_value(&trigger).unwrap();
     let condition_predicate = &v["condition"]["predicate"];
-    let bare =
-        serde_json::to_value(type_condition("issues.issue.unblocked").predicate()).unwrap();
-    assert_eq!(condition_predicate, &bare, "no QueryAst drift in the condition field");
+    let bare = serde_json::to_value(type_condition("issues.issue.unblocked").predicate()).unwrap();
+    assert_eq!(
+        condition_predicate, &bare,
+        "no QueryAst drift in the condition field"
+    );
 }

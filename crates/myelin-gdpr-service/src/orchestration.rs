@@ -204,7 +204,10 @@ impl EraseChecklist {
     /// Whether this holder has already returned a receipt (so a re-drive SKIPS the call —
     /// resumability). Reads the durable checklist, never the holder.
     pub fn is_done(&self, holder_id: &str) -> bool {
-        self.done.lock().unwrap_or_else(|e| e.into_inner()).contains_key(holder_id)
+        self.done
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(holder_id)
     }
 
     /// Record a holder's receipt into the durable checklist (the holder is now done).
@@ -444,7 +447,13 @@ impl PersonalDataHolder for SeamHolder<'_> {
         let sid = subject.principal.principal_id.0.clone();
         Ok(myelin_gdpr::RectifyReceipt {
             receipt: myelin_gdpr::Receipt::content_addressed(
-                "rectify", self.id, &sid, "*", "rectified", None, 0,
+                "rectify",
+                self.id,
+                &sid,
+                "*",
+                "rectified",
+                None,
+                0,
             ),
         })
     }
@@ -455,7 +464,11 @@ impl PersonalDataHolder for SeamHolder<'_> {
         on: bool,
     ) -> myelin_gdpr::Result<myelin_gdpr::RestrictReceipt> {
         let sid = subject.principal.principal_id.0.clone();
-        let outcome = if on { "restricted:set" } else { "restricted:clear" };
+        let outcome = if on {
+            "restricted:set"
+        } else {
+            "restricted:clear"
+        };
         Ok(myelin_gdpr::RestrictReceipt {
             receipt: myelin_gdpr::Receipt::content_addressed(
                 "restrict", self.id, &sid, "*", outcome, None, 0,
@@ -573,19 +586,22 @@ mod tests {
         let kms = kms_with_all_holder_keys(&tenant, 100);
         let holders = seam_holders(&kms);
         let orch = UpstreamHolderOrchestrator::register_m1_upstream(
-            holders.iter().map(|(id, h)| (*id, h as &dyn PersonalDataHolder)).collect(),
+            holders
+                .iter()
+                .map(|(id, h)| (*id, h as &dyn PersonalDataHolder))
+                .collect(),
         );
 
         // The registered order IS the canonical erase order.
         assert_eq!(
             orch.holder_ids_in_order(),
             vec![
-                holder_ids::IDENTITY,      // phase 0 — pseudonym map FIRST
-                holder_ids::BLOB,          // phase 1 — crypto-shred DEK
-                holder_ids::AUTHZ_TUPLES,  // phase 2 — purge/tombstone derived
-                holder_ids::BUS,           // phase 3 — bus erase
-                holder_ids::CACHE,         // phase 4 — caches/derived copies
-                holder_ids::BACKUP,        // phase 5 — backups (consequence of upstream shred)
+                holder_ids::IDENTITY,     // phase 0 — pseudonym map FIRST
+                holder_ids::BLOB,         // phase 1 — crypto-shred DEK
+                holder_ids::AUTHZ_TUPLES, // phase 2 — purge/tombstone derived
+                holder_ids::BUS,          // phase 3 — bus erase
+                holder_ids::CACHE,        // phase 4 — caches/derived copies
+                holder_ids::BACKUP,       // phase 5 — backups (consequence of upstream shred)
             ],
             "Identity is erased FIRST; backups LAST (§4.1)"
         );
@@ -599,8 +615,16 @@ mod tests {
 
         // The receipts are collected in canonical phase order (Identity first).
         let order: Vec<&str> = receipts.iter().map(|r| r.holder_id).collect();
-        assert_eq!(order[0], holder_ids::IDENTITY, "Identity (pseudonym map) is erased FIRST");
-        assert_eq!(order.last(), Some(&holder_ids::BACKUP), "backups are erased LAST");
+        assert_eq!(
+            order[0],
+            holder_ids::IDENTITY,
+            "Identity (pseudonym map) is erased FIRST"
+        );
+        assert_eq!(
+            order.last(),
+            Some(&holder_ids::BACKUP),
+            "backups are erased LAST"
+        );
         assert_eq!(
             order,
             vec![
@@ -654,7 +678,10 @@ mod tests {
         let kms = kms_with_all_holder_keys(&tenant, 300);
         let holders = seam_holders(&kms);
         let orch = UpstreamHolderOrchestrator::register_m1_upstream(
-            holders.iter().map(|(id, h)| (*id, h as &dyn PersonalDataHolder)).collect(),
+            holders
+                .iter()
+                .map(|(id, h)| (*id, h as &dyn PersonalDataHolder))
+                .collect(),
         );
         let checklist = EraseChecklist::new();
         let scope = EraseScope::Subject {
@@ -666,7 +693,11 @@ mod tests {
         assert_eq!(orch.fanout_coverage(&checklist), 0.0);
 
         let receipts = orch.fan_out_erase(&scope, &checklist).unwrap();
-        assert_eq!(receipts.len(), 6, "all six M1 upstream holders were reached");
+        assert_eq!(
+            receipts.len(),
+            6,
+            "all six M1 upstream holders were reached"
+        );
 
         // AFTER: 100% coverage of the EXISTING holder set (the floor gate).
         assert_eq!(
@@ -713,7 +744,10 @@ mod tests {
         let kms = kms_with_all_holder_keys(&tenant, 400);
         let holders = seam_holders(&kms);
         let orch = UpstreamHolderOrchestrator::register_m1_upstream(
-            holders.iter().map(|(id, h)| (*id, h as &dyn PersonalDataHolder)).collect(),
+            holders
+                .iter()
+                .map(|(id, h)| (*id, h as &dyn PersonalDataHolder))
+                .collect(),
         );
         let checklist = EraseChecklist::new();
         let scope = EraseScope::Subject {
@@ -734,17 +768,27 @@ mod tests {
             .collect();
         let partial = UpstreamHolderOrchestrator::register_m1_upstream(first_three);
         partial.fan_out_erase(&scope, &checklist).unwrap();
-        assert_eq!(checklist.done_count(), 3, "the crash left three holders receipted");
+        assert_eq!(
+            checklist.done_count(),
+            3,
+            "the crash left three holders receipted"
+        );
 
         // Record the per-holder erase-call counts after the partial run.
-        let calls_after_partial: BTreeMap<&str, u32> =
-            holders.iter().map(|(id, h)| (*id, h.erase_call_count())).collect();
+        let calls_after_partial: BTreeMap<&str, u32> = holders
+            .iter()
+            .map(|(id, h)| (*id, h.erase_call_count()))
+            .collect();
 
         // RE-DRIVE the FULL fan-out on the same checklist (resume after the crash).
         let receipts = orch.fan_out_erase(&scope, &checklist).unwrap();
 
         // The first three holders were NOT re-called (resumability — they were skipped).
-        for id in [holder_ids::IDENTITY, holder_ids::BLOB, holder_ids::AUTHZ_TUPLES] {
+        for id in [
+            holder_ids::IDENTITY,
+            holder_ids::BLOB,
+            holder_ids::AUTHZ_TUPLES,
+        ] {
             let h = &holders.iter().find(|(hid, _)| *hid == id).unwrap().1;
             assert_eq!(
                 h.erase_call_count(),
@@ -773,7 +817,10 @@ mod tests {
         let kms = kms_with_all_holder_keys(&tenant, 500);
         let holders = seam_holders(&kms);
         let orch = UpstreamHolderOrchestrator::register_m1_upstream(
-            holders.iter().map(|(id, h)| (*id, h as &dyn PersonalDataHolder)).collect(),
+            holders
+                .iter()
+                .map(|(id, h)| (*id, h as &dyn PersonalDataHolder))
+                .collect(),
         );
         let checklist = EraseChecklist::new();
         let scope = EraseScope::Subject {
@@ -781,13 +828,18 @@ mod tests {
             tenant: tenant.clone(),
         };
         let first = orch.fan_out_erase(&scope, &checklist).unwrap();
-        let calls_after_first: Vec<u32> = holders.iter().map(|(_, h)| h.erase_call_count()).collect();
+        let calls_after_first: Vec<u32> =
+            holders.iter().map(|(_, h)| h.erase_call_count()).collect();
 
         // Re-run the COMPLETE fan-out: every holder is already receipted ⇒ all skipped.
         let second = orch.fan_out_erase(&scope, &checklist).unwrap();
-        let calls_after_second: Vec<u32> = holders.iter().map(|(_, h)| h.erase_call_count()).collect();
+        let calls_after_second: Vec<u32> =
+            holders.iter().map(|(_, h)| h.erase_call_count()).collect();
 
-        assert_eq!(first, second, "an idempotent re-drive returns the SAME receipts");
+        assert_eq!(
+            first, second,
+            "an idempotent re-drive returns the SAME receipts"
+        );
         assert_eq!(
             calls_after_first, calls_after_second,
             "no holder's erase was re-called on the idempotent re-drive"
@@ -805,16 +857,32 @@ mod tests {
             fail: Mutex<bool>,
         }
         impl PersonalDataHolder for FailingHolder {
-            fn locate(&self, _s: &SubjectRef, _t: TenantId) -> myelin_gdpr::Result<myelin_gdpr::LocateReport> {
+            fn locate(
+                &self,
+                _s: &SubjectRef,
+                _t: TenantId,
+            ) -> myelin_gdpr::Result<myelin_gdpr::LocateReport> {
                 unreachable!()
             }
-            fn export(&self, _s: &SubjectRef, _t: TenantId) -> myelin_gdpr::Result<myelin_gdpr::PortableBundle> {
+            fn export(
+                &self,
+                _s: &SubjectRef,
+                _t: TenantId,
+            ) -> myelin_gdpr::Result<myelin_gdpr::PortableBundle> {
                 unreachable!()
             }
-            fn rectify(&self, _s: &SubjectRef, _p: myelin_gdpr::Patch) -> myelin_gdpr::Result<myelin_gdpr::RectifyReceipt> {
+            fn rectify(
+                &self,
+                _s: &SubjectRef,
+                _p: myelin_gdpr::Patch,
+            ) -> myelin_gdpr::Result<myelin_gdpr::RectifyReceipt> {
                 unreachable!()
             }
-            fn restrict(&self, _s: &SubjectRef, _on: bool) -> myelin_gdpr::Result<myelin_gdpr::RestrictReceipt> {
+            fn restrict(
+                &self,
+                _s: &SubjectRef,
+                _on: bool,
+            ) -> myelin_gdpr::Result<myelin_gdpr::RestrictReceipt> {
                 unreachable!()
             }
             fn erase(&self, _scope: EraseScope) -> myelin_gdpr::Result<EraseReceipt> {
@@ -824,7 +892,13 @@ mod tests {
                 }
                 Ok(EraseReceipt {
                     receipt: myelin_gdpr::Receipt::content_addressed(
-                        "erase", holder_ids::BUS, "u-fail", "acme", "crypto_shred", Some(9), 0,
+                        "erase",
+                        holder_ids::BUS,
+                        "u-fail",
+                        "acme",
+                        "crypto_shred",
+                        Some(9),
+                        0,
                     ),
                 })
             }
@@ -833,12 +907,35 @@ mod tests {
         let tenant = t("acme");
         let kms = kms_with_all_holder_keys(&tenant, 600);
         // Build the holder set with the bus holder replaced by the failing one.
-        let id_h = SeamHolder::new(holder_ids::IDENTITY, ShredKeyClass::Subject(holder_ids::IDENTITY.into()), &kms);
-        let blob_h = SeamHolder::new(holder_ids::BLOB, ShredKeyClass::Subject(holder_ids::BLOB.into()), &kms);
-        let authz_h = SeamHolder::new(holder_ids::AUTHZ_TUPLES, ShredKeyClass::Subject(holder_ids::AUTHZ_TUPLES.into()), &kms);
-        let bus_h = FailingHolder { calls: Mutex::new(0), fail: Mutex::new(true) };
-        let cache_h = SeamHolder::new(holder_ids::CACHE, ShredKeyClass::Subject(holder_ids::CACHE.into()), &kms);
-        let backup_h = SeamHolder::new(holder_ids::BACKUP, ShredKeyClass::Subject(holder_ids::BACKUP.into()), &kms);
+        let id_h = SeamHolder::new(
+            holder_ids::IDENTITY,
+            ShredKeyClass::Subject(holder_ids::IDENTITY.into()),
+            &kms,
+        );
+        let blob_h = SeamHolder::new(
+            holder_ids::BLOB,
+            ShredKeyClass::Subject(holder_ids::BLOB.into()),
+            &kms,
+        );
+        let authz_h = SeamHolder::new(
+            holder_ids::AUTHZ_TUPLES,
+            ShredKeyClass::Subject(holder_ids::AUTHZ_TUPLES.into()),
+            &kms,
+        );
+        let bus_h = FailingHolder {
+            calls: Mutex::new(0),
+            fail: Mutex::new(true),
+        };
+        let cache_h = SeamHolder::new(
+            holder_ids::CACHE,
+            ShredKeyClass::Subject(holder_ids::CACHE.into()),
+            &kms,
+        );
+        let backup_h = SeamHolder::new(
+            holder_ids::BACKUP,
+            ShredKeyClass::Subject(holder_ids::BACKUP.into()),
+            &kms,
+        );
 
         let orch = UpstreamHolderOrchestrator::register_m1_upstream(vec![
             (holder_ids::IDENTITY, &id_h as &dyn PersonalDataHolder),
@@ -858,12 +955,23 @@ mod tests {
         let err = orch.fan_out_erase(&scope, &checklist);
         assert!(err.is_err(), "a holder error fails the whole fan-out");
         // Phases 0–2 (identity/blob/authz) were receipted before the failure (resumable).
-        assert_eq!(checklist.done_count(), 3, "the pre-failure holders are receipted");
+        assert_eq!(
+            checklist.done_count(),
+            3,
+            "the pre-failure holders are receipted"
+        );
         assert!(checklist.is_done(holder_ids::IDENTITY));
         assert!(checklist.is_done(holder_ids::AUTHZ_TUPLES));
-        assert!(!checklist.is_done(holder_ids::BUS), "the failed holder is NOT receipted");
+        assert!(
+            !checklist.is_done(holder_ids::BUS),
+            "the failed holder is NOT receipted"
+        );
         // Downstream holders (cache/backup) were NEVER called (we stop at the failure).
-        assert_eq!(cache_h.erase_call_count(), 0, "we do not continue past a failed holder");
+        assert_eq!(
+            cache_h.erase_call_count(),
+            0,
+            "we do not continue past a failed holder"
+        );
         assert_eq!(backup_h.erase_call_count(), 0);
 
         // REPAIR the bus holder and RETRY: only the failed-onward holders are driven.
@@ -896,7 +1004,11 @@ mod tests {
         let kms = kms_with_all_holder_keys(&tenant, 700);
         // Two DIFFERENT holder impls (SeamHolder + the GDPR-owned H18) behind the SAME dyn — the
         // orchestrator is polymorphic over the contract, never a concrete store.
-        let seam = SeamHolder::new(holder_ids::BLOB, ShredKeyClass::Subject(holder_ids::BLOB.into()), &kms);
+        let seam = SeamHolder::new(
+            holder_ids::BLOB,
+            ShredKeyClass::Subject(holder_ids::BLOB.into()),
+            &kms,
+        );
         let owned = crate::holders::GdprOwnStoreHolder::new(&kms);
         let registered = vec![
             RegisteredHolder {
@@ -919,12 +1031,30 @@ mod tests {
 
     #[test]
     fn canonical_phase_map_is_pinned_for_the_six_m1_holders() {
-        assert_eq!(canonical_phase_of(holder_ids::IDENTITY), Some(CanonicalErasePhase::IdentityPseudonymMap));
-        assert_eq!(canonical_phase_of(holder_ids::BLOB), Some(CanonicalErasePhase::CryptoShredDek));
-        assert_eq!(canonical_phase_of(holder_ids::AUTHZ_TUPLES), Some(CanonicalErasePhase::PurgeAndTombstoneDerived));
-        assert_eq!(canonical_phase_of(holder_ids::BUS), Some(CanonicalErasePhase::BusErase));
-        assert_eq!(canonical_phase_of(holder_ids::CACHE), Some(CanonicalErasePhase::CachesAndDerivedCopies));
-        assert_eq!(canonical_phase_of(holder_ids::BACKUP), Some(CanonicalErasePhase::Backups));
+        assert_eq!(
+            canonical_phase_of(holder_ids::IDENTITY),
+            Some(CanonicalErasePhase::IdentityPseudonymMap)
+        );
+        assert_eq!(
+            canonical_phase_of(holder_ids::BLOB),
+            Some(CanonicalErasePhase::CryptoShredDek)
+        );
+        assert_eq!(
+            canonical_phase_of(holder_ids::AUTHZ_TUPLES),
+            Some(CanonicalErasePhase::PurgeAndTombstoneDerived)
+        );
+        assert_eq!(
+            canonical_phase_of(holder_ids::BUS),
+            Some(CanonicalErasePhase::BusErase)
+        );
+        assert_eq!(
+            canonical_phase_of(holder_ids::CACHE),
+            Some(CanonicalErasePhase::CachesAndDerivedCopies)
+        );
+        assert_eq!(
+            canonical_phase_of(holder_ids::BACKUP),
+            Some(CanonicalErasePhase::Backups)
+        );
         // An unknown holder has no canonical phase (it must declare one in its own prompt).
         assert_eq!(canonical_phase_of("not_a_holder"), None);
         // Identity is strictly before every other phase (the pseudonym-map-first invariant).
@@ -959,22 +1089,38 @@ mod tests {
         // Provision a Tenant-class key per holder.
         for id in [holder_ids::IDENTITY, holder_ids::BLOB, holder_ids::BACKUP] {
             kms.provision(
-                ShredKeyHandle { tenant: tenant.clone(), class: ShredKeyClass::Subject(id.to_string()) },
+                ShredKeyHandle {
+                    tenant: tenant.clone(),
+                    class: ShredKeyClass::Subject(id.to_string()),
+                },
                 1,
             );
         }
-        let holders: Vec<(&'static str, SeamHolder)> = [holder_ids::IDENTITY, holder_ids::BLOB, holder_ids::BACKUP]
-            .into_iter()
-            .map(|id| (id, SeamHolder::new(id, ShredKeyClass::Subject(id.to_string()), &kms)))
-            .collect();
+        let holders: Vec<(&'static str, SeamHolder)> =
+            [holder_ids::IDENTITY, holder_ids::BLOB, holder_ids::BACKUP]
+                .into_iter()
+                .map(|id| {
+                    (
+                        id,
+                        SeamHolder::new(id, ShredKeyClass::Subject(id.to_string()), &kms),
+                    )
+                })
+                .collect();
         let orch = UpstreamHolderOrchestrator::register_m1_upstream(
-            holders.iter().map(|(id, h)| (*id, h as &dyn PersonalDataHolder)).collect(),
+            holders
+                .iter()
+                .map(|(id, h)| (*id, h as &dyn PersonalDataHolder))
+                .collect(),
         );
         let checklist = EraseChecklist::new();
         let receipts = orch
             .fan_out_erase(&EraseScope::Tenant(tenant.clone()), &checklist)
             .unwrap();
-        assert_eq!(receipts[0].holder_id, holder_ids::IDENTITY, "Identity first for offboarding too");
+        assert_eq!(
+            receipts[0].holder_id,
+            holder_ids::IDENTITY,
+            "Identity first for offboarding too"
+        );
         assert_eq!(orch.fanout_coverage(&checklist), 1.0);
     }
 }

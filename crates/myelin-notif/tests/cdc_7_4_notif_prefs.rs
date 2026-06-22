@@ -28,15 +28,19 @@
 use myelin_identity::{Literal, Principal, PrincipalId, PrincipalKind};
 use myelin_notif::cli::notify_test;
 use myelin_notif::prefs::{
-    build_routing_matcher, get_prefs, route, set_prefs, Channel, DigestConfig, NotifPrefs, PrefStore,
-    QuietHours, QuietWindow, RoutingRule, Tz,
+    build_routing_matcher, get_prefs, route, set_prefs, Channel, DigestConfig, NotifPrefs,
+    PrefStore, QuietHours, QuietWindow, RoutingRule, Tz,
 };
 use myelin_notif::{Class, Reason, Subsystem};
 use myelin_query::{CmpOp, Expr, Predicate, QueryAst};
 use myelin_tenancy::TenantId;
 
 fn principal(id: &str) -> Principal {
-    Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, TenantId("acme".into()))
+    Principal::stub(
+        PrincipalId(id.into()),
+        PrincipalKind::Human,
+        TenantId("acme".into()),
+    )
 }
 
 /// **PROVIDER side (Notif owns 7.4): set_prefs UPSERTs, get_prefs reads back, route decides.** The
@@ -59,17 +63,28 @@ fn provider_set_get_and_route_decision() {
                 matcher: build_routing_matcher(&[], &[], &[]).unwrap(),
             },
         ],
-        digest: DigestConfig { cadence: "off".into(), at: None, classes: vec![] },
+        digest: DigestConfig {
+            cadence: "off".into(),
+            at: None,
+            classes: vec![],
+        },
     };
     // quiet all night, Paris tz; critical pierces by default.
     let quiet = QuietHours {
         tz: Tz::from_offset_minutes(60),
-        windows: vec![QuietWindow { from: 22 * 60, to: 7 * 60, days: vec![] }],
+        windows: vec![QuietWindow {
+            from: 22 * 60,
+            to: 7 * 60,
+            days: vec![],
+        }],
         pierce_classes: vec![Class::Critical],
     };
 
     let stored = set_prefs(&store, &me, prefs.clone(), quiet.clone());
-    assert_eq!(stored.prefs, prefs, "set_prefs echoes the stored routing matrix");
+    assert_eq!(
+        stored.prefs, prefs,
+        "set_prefs echoes the stored routing matrix"
+    );
 
     let got = get_prefs(&store, &me);
     assert_eq!(got.quiet, quiet, "get_prefs reads back the quiet-hours");
@@ -77,12 +92,37 @@ fn provider_set_get_and_route_decision() {
     // 02:00 Paris = 01:00 UTC — inside the 22:00..07:00 quiet window.
     let utc_min = 60;
     // CRITICAL pierces: delivers to mobile_push even at 02:00 local.
-    let crit = route(&got.prefs, &got.quiet, Reason::Escalated, Class::Critical, Subsystem::Issue, utc_min, 2);
-    assert!(crit.contains(&Channel::MobilePush), "critical pierces quiet-hours (on-call cannot be silenced)");
+    let crit = route(
+        &got.prefs,
+        &got.quiet,
+        Reason::Escalated,
+        Class::Critical,
+        Subsystem::Issue,
+        utc_min,
+        2,
+    );
+    assert!(
+        crit.contains(&Channel::MobilePush),
+        "critical pierces quiet-hours (on-call cannot be silenced)"
+    );
     // FYI suppressed off-cell; the in-cell inbox still receives.
-    let fyi = route(&got.prefs, &got.quiet, Reason::Fyi, Class::Fyi, Subsystem::Issue, utc_min, 2);
-    assert!(!fyi.contains(&Channel::MobilePush), "a non-crit item in quiet-hours is suppressed off-cell");
-    assert!(fyi.contains(&Channel::InApp), "the ONE inbox row is NEVER suppressed (only the off-cell push)");
+    let fyi = route(
+        &got.prefs,
+        &got.quiet,
+        Reason::Fyi,
+        Class::Fyi,
+        Subsystem::Issue,
+        utc_min,
+        2,
+    );
+    assert!(
+        !fyi.contains(&Channel::MobilePush),
+        "a non-crit item in quiet-hours is suppressed off-cell"
+    );
+    assert!(
+        fyi.contains(&Channel::InApp),
+        "the ONE inbox row is NEVER suppressed (only the off-cell push)"
+    );
 }
 
 /// **CONSUMER side: a consumer builds the routing matcher as the ONE frozen QueryAst.** A consumer
@@ -112,7 +152,10 @@ fn consumer_matcher_is_the_one_query_ast() {
         &store,
         &me,
         NotifPrefs {
-            routing: vec![RoutingRule { channel: Channel::Email, matcher }],
+            routing: vec![RoutingRule {
+                channel: Channel::Email,
+                matcher,
+            }],
             digest: DigestConfig::default(),
         },
         QuietHours::default(),
@@ -121,13 +164,29 @@ fn consumer_matcher_is_the_one_query_ast() {
     // The provider's route uses the consumer's matcher: critical/direct → email; watching → none.
     let got = get_prefs(&store, &me);
     assert!(
-        route(&got.prefs, &got.quiet, Reason::Assigned, Class::Direct, Subsystem::Issue, 12 * 60, 0)
-            .contains(&Channel::Email),
+        route(
+            &got.prefs,
+            &got.quiet,
+            Reason::Assigned,
+            Class::Direct,
+            Subsystem::Issue,
+            12 * 60,
+            0
+        )
+        .contains(&Channel::Email),
         "the direct item routes via the consumer-built matcher"
     );
     assert!(
-        route(&got.prefs, &got.quiet, Reason::Watched, Class::Watching, Subsystem::Issue, 12 * 60, 0)
-            .is_empty(),
+        route(
+            &got.prefs,
+            &got.quiet,
+            Reason::Watched,
+            Class::Watching,
+            Subsystem::Issue,
+            12 * 60,
+            0
+        )
+        .is_empty(),
         "the watching item does not match → no route"
     );
 }
@@ -152,8 +211,20 @@ fn consumer_cli_notify_test_matches_route() {
         QuietHours::default(),
     );
     // CLI preview at noon.
-    let preview = notify_test(&store, &me, Reason::Escalated, Class::Critical, Subsystem::Issue, 12 * 60, 0);
-    assert_eq!(preview, vec!["email".to_string()], "the CLI preview drives the SAME route decision");
+    let preview = notify_test(
+        &store,
+        &me,
+        Reason::Escalated,
+        Class::Critical,
+        Subsystem::Issue,
+        12 * 60,
+        0,
+    );
+    assert_eq!(
+        preview,
+        vec!["email".to_string()],
+        "the CLI preview drives the SAME route decision"
+    );
 }
 
 /// **The cost-bound is the WIRE invariant both sides honour: 0 unbounded matcher accepted.** An

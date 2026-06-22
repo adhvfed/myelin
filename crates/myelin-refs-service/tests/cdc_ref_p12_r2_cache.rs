@@ -26,14 +26,14 @@
 use std::sync::Arc;
 
 use myelin_events::{
-    Actor, AggregateKey, ArtifactRef, CorrelationId, DataRole, EventEnvelope, EventHandler, EventId,
-    EventType, HandleOutcome, Timestamp, Visibility,
+    Actor, AggregateKey, ArtifactRef, CorrelationId, DataRole, EventEnvelope, EventHandler,
+    EventId, EventType, HandleOutcome, Timestamp, Visibility,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_refs_service::{
     bounded_stale, OwnerProjection, ProjectApi, ProjectApiError, ProjectOutcome, Projection,
-    ProjectionCacheRead, R2ProjectionCache, RefsDekPin, RefsProjectionInvalidator, ResolveMode,
-    ResolveService, Resolution, TombstoneReason,
+    ProjectionCacheRead, R2ProjectionCache, RefsDekPin, RefsProjectionInvalidator, Resolution,
+    ResolveMode, ResolveService, TombstoneReason,
 };
 use myelin_storage::{InMemoryCache, KmsEngine};
 use myelin_substrate::{FailStaticAuthz, FailStaticThreshold};
@@ -113,7 +113,13 @@ impl ProjectApi for SyntheticOwner {
         viewer: &Principal,
         _p: &Permission,
     ) -> Result<Decision, ProjectApiError> {
-        if self.allowed.lock().unwrap().iter().any(|a| a == &viewer.principal_id.0) {
+        if self
+            .allowed
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|a| a == &viewer.principal_id.0)
+        {
             Ok(Decision::Allow)
         } else {
             Ok(Decision::Deny)
@@ -182,24 +188,44 @@ fn chained_hit_then_updated_then_miss_then_re_resolve_through_the_chokepoint() {
 
     // ── 1: first resolve MISSES → owner project → the chokepoint FILLS the live cache. ──
     let r1 = svc.resolve(
-        &tenant(), &region(), &ref_, &root,
-        &viewer("insider"), ResolveMode::Live, &bounded_stale(), false,
+        &tenant(),
+        &region(),
+        &ref_,
+        &root,
+        &viewer("insider"),
+        ResolveMode::Live,
+        &bounded_stale(),
+        false,
     );
     assert!(r1.is_projection(), "first resolve projects");
-    assert_eq!(owner.project_call_count(), 1, "the first (miss) resolve reached project");
+    assert_eq!(
+        owner.project_call_count(),
+        1,
+        "the first (miss) resolve reached project"
+    );
     let (_h, _m, fills) = cache.counters();
     assert_eq!(fills, 1, "the chokepoint filled the cache after the miss");
 
     // ── 2: second resolve of the SAME ref → a cache HIT (owner project NOT called again). ──
     let r2 = svc.resolve(
-        &tenant(), &region(), &ref_, &root,
-        &viewer("insider"), ResolveMode::Live, &bounded_stale(), false,
+        &tenant(),
+        &region(),
+        &ref_,
+        &root,
+        &viewer("insider"),
+        ResolveMode::Live,
+        &bounded_stale(),
+        false,
     );
     assert!(r2.is_projection(), "second resolve is a HIT");
     if let Resolution::Projection(p) = &r2 {
         assert_eq!(p.title, "v1 title", "the cache served the v1 projection");
     }
-    assert_eq!(owner.project_call_count(), 1, "the HIT short-circuited the owner (no second project)");
+    assert_eq!(
+        owner.project_call_count(),
+        1,
+        "the HIT short-circuited the owner (no second project)"
+    );
 
     // ── 3: a *.updated busts the entry (the REF-P7 invalidator over the LIVE cache). ──
     owner.set_outcome(SyntheticOwner::live("v2 title (fresh)")); // the owner now has a fresh title
@@ -212,14 +238,27 @@ fn chained_hit_then_updated_then_miss_then_re_resolve_through_the_chokepoint() {
 
     // ── 4: the next resolve MISSES (busted) + re-resolves through the owner → the FRESH v2 title. ──
     let r3 = svc.resolve(
-        &tenant(), &region(), &ref_, &root,
-        &viewer("insider"), ResolveMode::Live, &bounded_stale(), false,
+        &tenant(),
+        &region(),
+        &ref_,
+        &root,
+        &viewer("insider"),
+        ResolveMode::Live,
+        &bounded_stale(),
+        false,
     );
     assert!(r3.is_projection(), "the post-bust resolve re-resolves");
     if let Resolution::Projection(p) = &r3 {
-        assert_eq!(p.title, "v2 title (fresh)", "after the bust the cache re-resolves the FRESH title, never the stale v1");
+        assert_eq!(
+            p.title, "v2 title (fresh)",
+            "after the bust the cache re-resolves the FRESH title, never the stale v1"
+        );
     }
-    assert_eq!(owner.project_call_count(), 2, "the post-bust miss reached project again (re-resolve)");
+    assert_eq!(
+        owner.project_call_count(),
+        2,
+        "the post-bust miss reached project again (re-resolve)"
+    );
 }
 
 /// **The cache is NEVER a source of truth: on `*.erased` it re-resolves, never serving the stale
@@ -237,8 +276,26 @@ fn on_erasure_the_cache_re_resolves_never_serving_stale() {
     let root = ref_.clone();
 
     // warm the cache (miss → fill), then confirm a HIT.
-    let _ = svc.resolve(&tenant(), &region(), &ref_, &root, &viewer("insider"), ResolveMode::Live, &bounded_stale(), false);
-    let warm = svc.resolve(&tenant(), &region(), &ref_, &root, &viewer("insider"), ResolveMode::Live, &bounded_stale(), false);
+    let _ = svc.resolve(
+        &tenant(),
+        &region(),
+        &ref_,
+        &root,
+        &viewer("insider"),
+        ResolveMode::Live,
+        &bounded_stale(),
+        false,
+    );
+    let warm = svc.resolve(
+        &tenant(),
+        &region(),
+        &ref_,
+        &root,
+        &viewer("insider"),
+        ResolveMode::Live,
+        &bounded_stale(),
+        false,
+    );
     assert!(warm.is_projection(), "warm HIT before erasure");
 
     // the *.erased busts the entry; the owner now reports the artifact ERASED.
@@ -251,8 +308,20 @@ fn on_erasure_the_cache_re_resolves_never_serving_stale() {
     owner.set_outcome(ProjectOutcome::Erased);
 
     // the next resolve re-resolves (busted) and, the artifact gone, tombstones — never the stale title.
-    let after = svc.resolve(&tenant(), &region(), &ref_, &root, &viewer("insider"), ResolveMode::Live, &bounded_stale(), false);
-    assert!(after.is_tombstone(), "on erasure the cache re-resolves to a tombstone, never the stale title");
+    let after = svc.resolve(
+        &tenant(),
+        &region(),
+        &ref_,
+        &root,
+        &viewer("insider"),
+        ResolveMode::Live,
+        &bounded_stale(),
+        false,
+    );
+    assert!(
+        after.is_tombstone(),
+        "on erasure the cache re-resolves to a tombstone, never the stale title"
+    );
     assert_eq!(after.tombstone_reason(), Some(TombstoneReason::Erased));
 }
 
@@ -275,14 +344,19 @@ fn cdc_r2_holder_is_dek_sealed_and_crypto_shred_able() {
         sub_anchor: None,
         flag: None,
     };
-    cache.fill(&tenant(), &region(), &ref_, &projection).expect("fill seals under the per-tenant DEK");
+    cache
+        .fill(&tenant(), &region(), &ref_, &projection)
+        .expect("fill seals under the per-tenant DEK");
     assert!(
         ProjectionCacheRead::read(&cache, &tenant(), &region(), &ref_).is_some(),
         "the title decrypts while the DEK lives"
     );
 
     // tenant offboard: destroy the per-tenant DEK (crypto-shred). The blob survives, the key does not.
-    assert!(dek.destroy_tenant_dek(&tenant(), &region()), "the per-tenant DEK is shredded");
+    assert!(
+        dek.destroy_tenant_dek(&tenant(), &region()),
+        "the per-tenant DEK is shredded"
+    );
     assert!(
         ProjectionCacheRead::read(&cache, &tenant(), &region(), &ref_).is_none(),
         "a crypto-shredded cached title is unrecoverable — a MISS, never plaintext (10.1 cache half)"

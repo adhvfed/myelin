@@ -36,11 +36,18 @@ fn tenant() -> TenantId {
 }
 
 fn subject(id: &str) -> SubjectRef {
-    SubjectRef::new(Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant()))
+    SubjectRef::new(Principal::stub(
+        PrincipalId(id.into()),
+        PrincipalKind::Human,
+        tenant(),
+    ))
 }
 
 fn subject_scope(s: &str) -> EraseScope {
-    EraseScope::Subject { subject: subject(s), tenant: tenant() }
+    EraseScope::Subject {
+        subject: subject(s),
+        tenant: tenant(),
+    }
 }
 
 /// A real-shaped data-map inventory with one tagged identity field + one zero-PII derived holder
@@ -93,29 +100,52 @@ fn cdc_10_4_caller_submits_polls_status_and_auditor_reads_the_certificate() {
     assert_eq!(s0.deadline_secs, t0 + DSR_DEADLINE_SECS);
 
     // drive the total + ordered state machine (the caller / the durable workflow P-GA-12 drives it).
-    assert!(orchestrator.validate(&dsr_id).unwrap(), "controller access is admitted");
-    assert_eq!(orchestrator.dsr_status(&dsr_id).unwrap().state, DsrState::Validated);
+    assert!(
+        orchestrator.validate(&dsr_id).unwrap(),
+        "controller access is admitted"
+    );
+    assert_eq!(
+        orchestrator.dsr_status(&dsr_id).unwrap().state,
+        DsrState::Validated
+    );
 
     // §4.1 step 2 — the checklist is resolved FROM the data map (the map drives the scope).
     let checklist = orchestrator.fan_out(&dsr_id, &inventory()).unwrap();
-    assert_eq!(orchestrator.dsr_status(&dsr_id).unwrap().state, DsrState::AwaitingHolders);
+    assert_eq!(
+        orchestrator.dsr_status(&dsr_id).unwrap().state,
+        DsrState::AwaitingHolders
+    );
     // every holder in the map (incl. the zero-PII index) is a checklist line — 0 holders missed.
     let ids: Vec<&str> = checklist.iter().map(|c| c.holder_id.as_str()).collect();
     assert!(ids.contains(&"oltp:identity_oltp") && ids.contains(&"search_index:search_index"));
 
     // the fan-out (P-GA-12) returns the verified receipts; here the caller records them.
-    orchestrator.verify(&dsr_id, vec!["receipt-identity".into()]).unwrap();
-    assert_eq!(orchestrator.dsr_status(&dsr_id).unwrap().state, DsrState::Verified);
+    orchestrator
+        .verify(&dsr_id, vec!["receipt-identity".into()])
+        .unwrap();
+    assert_eq!(
+        orchestrator.dsr_status(&dsr_id).unwrap().state,
+        DsrState::Verified
+    );
     orchestrator.complete(&dsr_id).unwrap();
-    assert_eq!(orchestrator.dsr_status(&dsr_id).unwrap().state, DsrState::Completed);
+    assert_eq!(
+        orchestrator.dsr_status(&dsr_id).unwrap().state,
+        DsrState::Completed
+    );
 
     // ── consumer (b): the auditor reads dsr_certificate → MerkleProvenBundle ─────────────────────
     let cert = orchestrator.dsr_certificate(&dsr_id).unwrap();
     assert_eq!(cert.dsr_id, dsr_id);
     assert_eq!(cert.receipts, vec!["receipt-identity".to_string()]);
-    assert!(cert.bundle_digest.starts_with("blake3:"), "content-addressed bundle");
+    assert!(
+        cert.bundle_digest.starts_with("blake3:"),
+        "content-addressed bundle"
+    );
     // the Merkle inclusion proof is the named P-GA-20 seal (None on this floor).
-    assert!(cert.merkle_inclusion.is_none(), "the Merkle seal is P-GA-20 → P-119");
+    assert!(
+        cert.merkle_inclusion.is_none(),
+        "the Merkle seal is P-GA-20 → P-119"
+    );
 }
 
 /// PROVIDER + CONSUMER — the posture gate (§1, the controller/processor boundary): a
@@ -135,8 +165,14 @@ fn cdc_10_4_posture_gate_refuses_myelin_initiated_tenant_content_erase() {
         Posture::Processor,
         Initiator::Myelin,
     );
-    assert!(!orchestrator.validate(&refused).unwrap(), "the posture gate refuses it");
-    assert_eq!(orchestrator.dsr_status(&refused).unwrap().state, DsrState::Refused);
+    assert!(
+        !orchestrator.validate(&refused).unwrap(),
+        "the posture gate refuses it"
+    );
+    assert_eq!(
+        orchestrator.dsr_status(&refused).unwrap().state,
+        DsrState::Refused
+    );
     // the auditor cannot certify a refused DSR (no fan-out ran).
     assert_eq!(
         orchestrator.dsr_certificate(&refused).unwrap_err(),
@@ -152,8 +188,14 @@ fn cdc_10_4_posture_gate_refuses_myelin_initiated_tenant_content_erase() {
         Posture::Processor,
         Initiator::TenantInstructed,
     );
-    assert!(orchestrator.validate(&admitted).unwrap(), "a tenant-instructed erase is admitted");
-    assert_eq!(orchestrator.dsr_status(&admitted).unwrap().state, DsrState::Validated);
+    assert!(
+        orchestrator.validate(&admitted).unwrap(),
+        "a tenant-instructed erase is admitted"
+    );
+    assert_eq!(
+        orchestrator.dsr_status(&admitted).unwrap().state,
+        DsrState::Validated
+    );
 }
 
 /// PROVIDER — the state machine is total + ordered (§4.1): `awaiting-holders` cannot be skipped,
@@ -175,8 +217,14 @@ fn cdc_10_4_state_machine_is_total_and_awaiting_holders_is_unskippable() {
     let err = orchestrator.verify(&id, vec![]).unwrap_err();
     assert_eq!(
         err,
-        DsrError::IllegalTransition { from: DsrState::Validated, to: DsrState::Verified }
+        DsrError::IllegalTransition {
+            from: DsrState::Validated,
+            to: DsrState::Verified
+        }
     );
     // the DSR did not silently advance.
-    assert_eq!(orchestrator.dsr_status(&id).unwrap().state, DsrState::Validated);
+    assert_eq!(
+        orchestrator.dsr_status(&id).unwrap().state,
+        DsrState::Validated
+    );
 }

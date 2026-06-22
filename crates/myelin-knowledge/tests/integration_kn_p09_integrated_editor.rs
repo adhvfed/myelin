@@ -15,9 +15,9 @@
 //! properties over the transport, independent of the apply engine (the named CAS/Yrs floor).
 
 use myelin_content::editor::{dom_to_offset, offset_to_dom};
+use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_knowledge::editor::{Document, EditorBlock, SecondViewer};
 use myelin_knowledge::{Editor, PersistedOp};
-use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_tenancy::TenantId;
 
 fn tenant() -> TenantId {
@@ -35,13 +35,20 @@ fn principal(name: &str) -> Principal {
 #[test]
 fn create_page_type_blocks_second_connection_sees_edits_live() {
     // create a page (the S1 "create a page" entry — one empty block to type into).
-    let mut editor = Editor::open_page(tenant(), "incident-api-5xx", "client-A", principal("alice"))
-        .expect("the page opens");
-    assert_eq!(editor.document().block_count(), 1, "a new page starts with one empty block");
+    let mut editor =
+        Editor::open_page(tenant(), "incident-api-5xx", "client-A", principal("alice"))
+            .expect("the page opens");
+    assert_eq!(
+        editor.document().block_count(),
+        1,
+        "a new page starts with one empty block"
+    );
 
     // a second connection opens a live subscription on this doc's (stream, scope) BEFORE the edits,
     // and seeds from the same fresh-page state — it will observe every op live.
-    let sub = editor.subscribe(None).expect("the second connection's live subscription opens");
+    let sub = editor
+        .subscribe(None)
+        .expect("the second connection's live subscription opens");
     let mut viewer = SecondViewer::new();
 
     // Type the S1 happy-path content, block by block, recording the op stream so the live frames can
@@ -52,9 +59,18 @@ fn create_page_type_blocks_second_connection_sees_edits_live() {
     // left to right — the vec is the recorded transcript.
     let op_log: Vec<PersistedOp> = vec![
         // a heading + two blocks (the slash-menu "Text" + a to-do)
-        editor.type_text(0, 0, "# Incident: API 5xx spike").persisted().clone(),
-        editor.append_block("Severity **high**. Owner @alice").persisted().clone(),
-        editor.append_block("- [ ] page the on-call").persisted().clone(),
+        editor
+            .type_text(0, 0, "# Incident: API 5xx spike")
+            .persisted()
+            .clone(),
+        editor
+            .append_block("Severity **high**. Owner @alice")
+            .persisted()
+            .clone(),
+        editor
+            .append_block("- [ ] page the on-call")
+            .persisted()
+            .clone(),
         // press Enter mid-line to split a block (caret lands at the start of the new block)
         editor.split_block(1, 9).persisted().clone(),
         // an IME / CJK commit mid-line (the named top risk — char offsets, never byte)
@@ -63,7 +79,11 @@ fn create_page_type_blocks_second_connection_sees_edits_live() {
 
     // the live subscription received exactly one frame per fresh op (the live fan-out).
     let frames = sub.drain_ready();
-    assert_eq!(frames.len(), op_log.len(), "the live subscriber saw a frame per edit");
+    assert_eq!(
+        frames.len(),
+        op_log.len(),
+        "the live subscriber saw a frame per edit"
+    );
 
     // the second connection applies each op live (resolving each frame → the op-log entry).
     for frame in &frames {
@@ -71,7 +91,10 @@ fn create_page_type_blocks_second_connection_sees_edits_live() {
             .iter()
             .find(|p| p.op_seq == frame.seq)
             .expect("the live frame resolves to its op-log entry (op_seq is the cursor)");
-        assert!(viewer.observe(persisted), "the viewer applies each live edit freshly");
+        assert!(
+            viewer.observe(persisted),
+            "the viewer applies each live edit freshly"
+        );
     }
 
     // CONVERGENCE: the second connection's document is byte-identical to the editor's (the live
@@ -81,12 +104,22 @@ fn create_page_type_blocks_second_connection_sees_edits_live() {
         editor.document().to_markdown(),
         "the second connection converged on the editor's document"
     );
-    assert_eq!(viewer.document(), editor.document(), "byte-identical documents on both connections");
+    assert_eq!(
+        viewer.document(),
+        editor.document(),
+        "byte-identical documents on both connections"
+    );
 
     // KN-D2 over the INTEGRATED path: every block on BOTH documents is a serialize(parse(md))===md
     // fixed point (100%, 0 regressions on the integrated path, not just the library).
-    assert!(editor.document().corpus_roundtrips(), "the editor doc is a KN-D2 fixed point");
-    assert!(viewer.document().corpus_roundtrips(), "the viewer doc is a KN-D2 fixed point");
+    assert!(
+        editor.document().corpus_roundtrips(),
+        "the editor doc is a KN-D2 fixed point"
+    );
+    assert!(
+        viewer.document().corpus_roundtrips(),
+        "the viewer doc is a KN-D2 fixed point"
+    );
 }
 
 /// **A re-delivered live frame is an idempotent no-op on the second connection (the `op_id` dedup —
@@ -102,8 +135,15 @@ fn a_redelivered_live_frame_does_not_double_apply() {
     assert!(viewer.observe(&p), "the first delivery applies");
     let converged = viewer.document().clone();
     // the SAME frame is re-delivered (an at-least-once retransmit) — a no-op.
-    assert!(!viewer.observe(&p), "the re-delivered frame is an idempotent no-op");
-    assert_eq!(viewer.document(), &converged, "the document did not double-apply");
+    assert!(
+        !viewer.observe(&p),
+        "the re-delivered frame is an idempotent no-op"
+    );
+    assert_eq!(
+        viewer.document(),
+        &converged,
+        "the document did not double-apply"
+    );
 }
 
 /// **A late joiner is caught up by the CONNECT backfill, then sees live edits (the §1.1 resume
@@ -172,7 +212,10 @@ fn the_kn_d2_corpus_round_trips_over_the_integrated_path() {
         let nodes = myelin_content::corpus::synthetic_nodes_for(fixture.md);
         doc.blocks.push(EditorBlock::new(fixture.md, &nodes));
     }
-    assert!(doc.block_count() >= 18, "the corpus must not be shrunk below its frozen size");
+    assert!(
+        doc.block_count() >= 18,
+        "the corpus must not be shrunk below its frozen size"
+    );
     assert!(
         doc.corpus_roundtrips(),
         "every frozen KN-D2 fixture is a fixed point loaded as an integrated-editor block (100%)"

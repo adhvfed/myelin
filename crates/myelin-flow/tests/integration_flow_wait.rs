@@ -30,7 +30,10 @@ async fn flow_p11_wait_consume_stamps_consumed_seq_exactly_once_in_real_postgres
     let cfg = MyelinConfig::dev();
     let admin = sqlx::postgres::PgPoolOptions::new()
         .max_connections(4)
-        .connect(&cfg.database_url.replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw"))
+        .connect(
+            &cfg.database_url
+                .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw"),
+        )
         .await
         .expect("connect as admin to dev Postgres (is the stack up?)");
 
@@ -43,9 +46,18 @@ async fn flow_p11_wait_consume_stamps_consumed_seq_exactly_once_in_real_postgres
     let idx_create = WF_SIGNAL_PENDING_IDX
         .replacen("wf_signal_pending", &format!("{sig_tbl}_pending"), 1)
         .replacen("ON wf_signal", &format!("ON {sig_tbl}"), 1);
-    sqlx::query(&format!("DROP TABLE IF EXISTS {sig_tbl}")).execute(&admin).await.unwrap();
-    sqlx::query(&sig_create).execute(&admin).await.expect("the wf_signal DDL applies");
-    sqlx::query(&idx_create).execute(&admin).await.expect("the wf_signal_pending index applies");
+    sqlx::query(&format!("DROP TABLE IF EXISTS {sig_tbl}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    sqlx::query(&sig_create)
+        .execute(&admin)
+        .await
+        .expect("the wf_signal DDL applies");
+    sqlx::query(&idx_create)
+        .execute(&admin)
+        .await
+        .expect("the wf_signal_pending index applies");
 
     // Buffer the approval (the §6.3 round-trip: Chat posted the decision) — unconsumed (consumed_seq
     // NULL). A double-click would be a second INSERT under the SAME key → ON CONFLICT DO NOTHING → still
@@ -68,7 +80,10 @@ async fn flow_p11_wait_consume_stamps_consumed_seq_exactly_once_in_real_postgres
     .await
     .unwrap()
     .get("c");
-    assert_eq!(before, 1, "the approval is buffered, unconsumed (signal-buffer-depth = 1)");
+    assert_eq!(
+        before, 1,
+        "the approval is buffered, unconsumed (signal-buffer-depth = 1)"
+    );
 
     // THE CONSUME (the wait resuming): UPDATE … SET consumed_seq = $seq WHERE consumed_seq IS NULL — the
     // WHERE clause IS the consume-EXACTLY-ONCE guard. This is the exact statement the wait issues when it
@@ -93,13 +108,19 @@ async fn flow_p11_wait_consume_stamps_consumed_seq_exactly_once_in_real_postgres
     // FIRST consume (the wait resumes, stamping the signal_received seq): the row is stamped (RETURNING
     // yields a row — consumed).
     let first = consume(5).await;
-    assert!(first.is_some(), "the FIRST consume stamped consumed_seq (the wait resumed on this signal)");
+    assert!(
+        first.is_some(),
+        "the FIRST consume stamped consumed_seq (the wait resumed on this signal)"
+    );
 
     // SECOND consume (a re-drive of the SAME wait, e.g. a later step crashed + the run re-leased): the
     // WHERE consumed_seq IS NULL guard already LOST — UPDATE matches NOTHING (RETURNING empty) → the
     // consume is EXACTLY ONCE (the replay returns the journaled signal, never re-consumes, §4.3/§4.1).
     let second = consume(9).await;
-    assert!(second.is_none(), "the SECOND consume is a no-op (consumed_seq IS NULL guard lost) — consume-exactly-once");
+    assert!(
+        second.is_none(),
+        "the SECOND consume is a no-op (consumed_seq IS NULL guard lost) — consume-exactly-once"
+    );
 
     // the consumed_seq is the FIRST consume's seq (5), NEVER overwritten by the second (9).
     let stamped: i64 = sqlx::query(&format!(
@@ -109,7 +130,10 @@ async fn flow_p11_wait_consume_stamps_consumed_seq_exactly_once_in_real_postgres
     .await
     .unwrap()
     .get("consumed_seq");
-    assert_eq!(stamped, 5, "the FIRST consume's seq stuck (the second consume never overwrote it)");
+    assert_eq!(
+        stamped, 5,
+        "the FIRST consume's seq stuck (the second consume never overwrote it)"
+    );
 
     // the signal-buffer-depth dropped by EXACTLY one (the FLOW-D4 "1 consume" threshold) — 0 unconsumed.
     let after: i64 = sqlx::query(&format!(
@@ -119,9 +143,15 @@ async fn flow_p11_wait_consume_stamps_consumed_seq_exactly_once_in_real_postgres
     .await
     .unwrap()
     .get("c");
-    assert_eq!(after, 0, "the signal-buffer-depth dropped by EXACTLY one (FLOW-D4: 1 consume, real Postgres)");
+    assert_eq!(
+        after, 0,
+        "the signal-buffer-depth dropped by EXACTLY one (FLOW-D4: 1 consume, real Postgres)"
+    );
 
-    sqlx::query(&format!("DROP TABLE IF EXISTS {sig_tbl}")).execute(&admin).await.unwrap();
+    sqlx::query(&format!("DROP TABLE IF EXISTS {sig_tbl}"))
+        .execute(&admin)
+        .await
+        .unwrap();
     println!(
         "[2026-06-21] PASS  drill=FLOW-D4(live-PG)  wait consume stamps consumed_seq once  \
          consume(5)->stamped  consume(9)->no-op(WHERE consumed_seq IS NULL)  buffered_depth 1->0  \

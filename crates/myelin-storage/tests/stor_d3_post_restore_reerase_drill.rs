@@ -19,14 +19,14 @@
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 
+use myelin_gdpr::ErasureMethod;
 use myelin_harness::{Predicate, SignalName, SignalSource};
 use myelin_storage::{
-    restore_to_offset, BlobPresence, BusErase, ColumnCryptor, ContinuousArchiver, DekId, EpochMillis,
-    EraseError, EraseHolders, ErasureLedgerSink, ErasureRecord, InMemoryPostPitLedger, KekId,
-    KeyClass, KmsEngine, PseudonymShred, ReErasePass, RefsTombstone, SearchPurge, SourceLog,
+    restore_to_offset, BlobPresence, BusErase, ColumnCryptor, ContinuousArchiver, DekId,
+    EpochMillis, EraseError, EraseHolders, ErasureLedgerSink, ErasureRecord, InMemoryPostPitLedger,
+    KekId, KeyClass, KmsEngine, PseudonymShred, ReErasePass, RefsTombstone, SearchPurge, SourceLog,
     SubjectId, WalSegment,
 };
-use myelin_gdpr::ErasureMethod;
 use myelin_tenancy::{Region, TenantId};
 
 fn region() -> Region {
@@ -71,9 +71,17 @@ impl ErasureLedgerSink for Seams {
 
 fn reachable_archiver(tail: u64) -> ContinuousArchiver {
     let mut arch = ContinuousArchiver::new();
-    arch.archive_segment(WalSegment { end_offset: 0, committed_at: 0 }).unwrap();
+    arch.archive_segment(WalSegment {
+        end_offset: 0,
+        committed_at: 0,
+    })
+    .unwrap();
     arch.take_base_backup(1);
-    arch.archive_segment(WalSegment { end_offset: tail, committed_at: 10 }).unwrap();
+    arch.archive_segment(WalSegment {
+        end_offset: tail,
+        committed_at: 10,
+    })
+    .unwrap();
     arch
 }
 
@@ -110,8 +118,15 @@ fn stor_d3_post_restore_reerase_zero_resurrected() {
 
     // Restore lands at the older PIT T=100.
     let arch = reachable_archiver(300);
-    let report =
-        restore_to_offset(&arch, 100, &[], &BlobPresence::new(), &SourceLog::new(), &kms).unwrap();
+    let report = restore_to_offset(
+        &arch,
+        100,
+        &[],
+        &BlobPresence::new(),
+        &SourceLog::new(),
+        &kms,
+    )
+    .unwrap();
 
     // The erasure ledger records the erasure as completed at offset 200 — AFTER the backup PIT.
     let mut ledger = InMemoryPostPitLedger::new();
@@ -128,19 +143,30 @@ fn stor_d3_post_restore_reerase_zero_resurrected() {
         git_reach: None,
     };
     let pass = ReErasePass::new(&kms, region());
-    let rep = pass.run(&report, &ledger, &holders, 1_000).expect("re-erasure pass runs");
+    let rep = pass
+        .run(&report, &ledger, &holders, 1_000)
+        .expect("re-erasure pass runs");
 
     // THE GATE READING: 0 resurrected, observably on the telemetry source (the SAME assertion surface
     // every drill uses). A subject still recoverable would read RED.
     let mut signals = SignalSource::new();
-    signals.set_scalar(SignalName::RestoreCrossSeamMismatch, rep.resurrected_count as i64);
+    signals.set_scalar(
+        SignalName::RestoreCrossSeamMismatch,
+        rep.resurrected_count as i64,
+    );
     signals
         .assert_signal(SignalName::RestoreCrossSeamMismatch, Predicate::Eq(0))
         .expect_green();
 
-    assert_eq!(rep.resurrected_count, 0, "STOR-D3: 0 resurrected subjects (§7.5)");
+    assert_eq!(
+        rep.resurrected_count, 0,
+        "STOR-D3: 0 resurrected subjects (§7.5)"
+    );
     assert!(rep.is_green());
-    assert!(rep.re_erased_subject(&subject, &t), "the subject was re-erased (the receipt)");
+    assert!(
+        rep.re_erased_subject(&subject, &t),
+        "the subject was re-erased (the receipt)"
+    );
     assert!(
         rep.re_erased[0].was_resurrected_before_reapply,
         "the subject WAS resurrected by the restore and re-killed by the pass"

@@ -82,11 +82,18 @@ fn tenant() -> TenantId {
 }
 
 fn subject(id: &str) -> SubjectRef {
-    SubjectRef::new(Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant()))
+    SubjectRef::new(Principal::stub(
+        PrincipalId(id.into()),
+        PrincipalKind::Human,
+        tenant(),
+    ))
 }
 
 fn subject_scope(s: &str) -> EraseScope {
-    EraseScope::Subject { subject: subject(s), tenant: tenant() }
+    EraseScope::Subject {
+        subject: subject(s),
+        tenant: tenant(),
+    }
 }
 
 /// The eight M1 holders the floor proves over: the six M1-shared-layer upstream holders
@@ -125,13 +132,19 @@ fn seed_kms_for(subject_id: &str, base_epoch: u64) -> InMemoryShredKms {
     .enumerate()
     {
         kms.provision(
-            ShredKeyHandle { tenant: t.clone(), class: ShredKeyClass::Subject((*id).to_string()) },
+            ShredKeyHandle {
+                tenant: t.clone(),
+                class: ShredKeyClass::Subject((*id).to_string()),
+            },
             base_epoch + i as u64,
         );
     }
     // H18's per-subject consent DEK is keyed on the SUBJECT id (not the holder id) — the GD-4 lever.
     kms.provision(
-        ShredKeyHandle { tenant: t.clone(), class: ShredKeyClass::Subject(subject_id.to_string()) },
+        ShredKeyHandle {
+            tenant: t.clone(),
+            class: ShredKeyClass::Subject(subject_id.to_string()),
+        },
         base_epoch + 100,
     );
     kms
@@ -148,7 +161,12 @@ fn seam_holders(kms: &InMemoryShredKms) -> Vec<(&'static str, SeamHolder<'_>)> {
         holder_ids::BACKUP,
     ]
     .into_iter()
-    .map(|id| (id, SeamHolder::new(id, ShredKeyClass::Subject(id.to_string()), kms)))
+    .map(|id| {
+        (
+            id,
+            SeamHolder::new(id, ShredKeyClass::Subject(id.to_string()), kms),
+        )
+    })
     .collect()
 }
 
@@ -256,7 +274,11 @@ fn ga_d1_m1_floor_subject_erasure_yields_zero_recoverable_over_every_holder() {
     // The full registered M1 holder set (upstream + GDPR-owned), behind the SAME trait object —
     // the data-map-driven fan-out reaches them all (the map drives it; nothing is forgotten).
     let upstream = full_m1_orchestrator(&upstream_seams, &h18, &h16);
-    assert_eq!(upstream.registered_count(), 8, "all eight M1 holders are registered");
+    assert_eq!(
+        upstream.registered_count(),
+        8,
+        "all eight M1 holders are registered"
+    );
     assert_eq!(
         upstream.holder_ids_in_order()[0],
         holder_ids::IDENTITY,
@@ -284,7 +306,10 @@ fn ga_d1_m1_floor_subject_erasure_yields_zero_recoverable_over_every_holder() {
         Posture::Controller, // platform-operational — Myelin is the controller, the erase is admitted
         Initiator::Myelin,
     );
-    assert!(dsr.validate(&id).unwrap(), "the controller-posture erase is admitted");
+    assert!(
+        dsr.validate(&id).unwrap(),
+        "the controller-posture erase is admitted"
+    );
 
     let checklist = EraseChecklist::new();
     let outcome = driver
@@ -292,10 +317,18 @@ fn ga_d1_m1_floor_subject_erasure_yields_zero_recoverable_over_every_holder() {
         .expect("the fan-out drives to completion");
 
     // The data-map-driven checklist named every holder (the map drives it — §4.1 step 2).
-    let status_holders: BTreeSet<String> =
-        dsr.dsr_status(&id).unwrap().checklist.iter().map(|c| c.holder_id.clone()).collect();
+    let status_holders: BTreeSet<String> = dsr
+        .dsr_status(&id)
+        .unwrap()
+        .checklist
+        .iter()
+        .map(|c| c.holder_id.clone())
+        .collect();
     for id in all_m1_holder_ids() {
-        assert!(status_holders.contains(id), "the checklist (from the map) names holder `{id}`");
+        assert!(
+            status_holders.contains(id),
+            "the checklist (from the map) names holder `{id}`"
+        );
     }
 
     // The fan-out hit EVERY existing holder in canonical order; coverage = 100% (the GATE telemetry).
@@ -308,8 +341,16 @@ fn ga_d1_m1_floor_subject_erasure_yields_zero_recoverable_over_every_holder() {
         FanOutOutcome::Erased(r) => r,
         other => panic!("expected an Erased outcome, got {other:?}"),
     };
-    assert_eq!(receipt.holder_receipts.len(), 8, "all eight holders receipted");
-    assert_eq!(receipt.holder_receipts[0].holder_id, holder_ids::IDENTITY, "Identity erased FIRST");
+    assert_eq!(
+        receipt.holder_receipts.len(),
+        8,
+        "all eight holders receipted"
+    );
+    assert_eq!(
+        receipt.holder_receipts[0].holder_id,
+        holder_ids::IDENTITY,
+        "Identity erased FIRST"
+    );
 
     // ── THE PROVE-IT ARTIFACT (EI-01 §3): post-erase `locate` returns 0 recoverable over EVERY ──
     // ── holder, observed THROUGH the contract (not an internal flag). ─────────────────────────
@@ -360,12 +401,20 @@ fn ga_d1_m1_floor_subject_erasure_yields_zero_recoverable_over_every_holder() {
         holder_ids::CACHE,
         holder_ids::BACKUP,
     ] {
-        let handle =
-            ShredKeyHandle { tenant: tenant(), class: ShredKeyClass::Subject(hid.to_string()) };
-        assert_eq!(kms.recoverable_in_backup(&handle), 0, "holder `{hid}`: 0 recoverable in backup");
+        let handle = ShredKeyHandle {
+            tenant: tenant(),
+            class: ShredKeyClass::Subject(hid.to_string()),
+        };
+        assert_eq!(
+            kms.recoverable_in_backup(&handle),
+            0,
+            "holder `{hid}`: 0 recoverable in backup"
+        );
     }
-    let consent_handle =
-        ShredKeyHandle { tenant: tenant(), class: ShredKeyClass::Subject(subject_id.to_string()) };
+    let consent_handle = ShredKeyHandle {
+        tenant: tenant(),
+        class: ShredKeyClass::Subject(subject_id.to_string()),
+    };
     assert_eq!(
         kms.recoverable_in_backup(&consent_handle),
         0,
@@ -374,11 +423,25 @@ fn ga_d1_m1_floor_subject_erasure_yields_zero_recoverable_over_every_holder() {
 
     // THE CERTIFICATE SEALS (the §4.1 step-5 artifact). The DSR is Completed; the certificate
     // carries the verifiable per-holder receipts; the Merkle inclusion rides P-GA-20 (None here).
-    assert_eq!(dsr.state_of(&id).unwrap(), DsrState::Completed, "the DSR reached Completed");
+    assert_eq!(
+        dsr.state_of(&id).unwrap(),
+        DsrState::Completed,
+        "the DSR reached Completed"
+    );
     let cert = dsr.dsr_certificate(&id).unwrap();
-    assert_eq!(cert.receipts.len(), 8, "the certificate seals all eight holder receipts");
-    assert!(cert.bundle_digest.starts_with("blake3:"), "the certificate is content-addressed");
-    assert!(cert.merkle_inclusion.is_none(), "the Merkle seal is P-GA-20 (named floor)");
+    assert_eq!(
+        cert.receipts.len(),
+        8,
+        "the certificate seals all eight holder receipts"
+    );
+    assert!(
+        cert.bundle_digest.starts_with("blake3:"),
+        "the certificate is content-addressed"
+    );
+    assert!(
+        cert.merkle_inclusion.is_none(),
+        "the Merkle seal is P-GA-20 (named floor)"
+    );
 }
 
 /// **The coarse 1-month deadline floor (§4.1 step 6).** The deadline is tracked synchronously here
@@ -449,10 +512,16 @@ fn ga_d1_worker_kill_mid_fan_out_resumes_only_un_receipted_holders_zero_double_e
         .collect();
     let crashing = UpstreamHolderOrchestrator::register_m1_upstream(first_three);
     crashing.fan_out_erase(&scope, &checklist).unwrap();
-    assert_eq!(checklist.done_count(), 3, "the worker died after receipting three holders");
+    assert_eq!(
+        checklist.done_count(),
+        3,
+        "the worker died after receipting three holders"
+    );
     // The per-holder erase-call counts at the moment of the crash (the double-erase baseline).
-    let calls_at_crash: BTreeMap<&str, u32> =
-        upstream_seams.iter().map(|(id, h)| (*id, h.erase_call_count())).collect();
+    let calls_at_crash: BTreeMap<&str, u32> = upstream_seams
+        .iter()
+        .map(|(id, h)| (*id, h.erase_call_count()))
+        .collect();
 
     // ── RESTART — a brand-new worker process: a FRESH orchestrator register + a FRESH driver. The
     //    DSR is re-submitted/validated on the restarted orchestrator (its register did not survive
@@ -473,10 +542,17 @@ fn ga_d1_worker_kill_mid_fan_out_resumes_only_un_receipted_holders_zero_double_e
     let outcome = driver2
         .drive(&id2, &inventory_for_all_holders(), &upstream, &checklist)
         .expect("the restarted worker resumes the fan-out to completion");
-    assert!(matches!(outcome, FanOutOutcome::Erased(_)), "the resumed DSR erases to completion");
+    assert!(
+        matches!(outcome, FanOutOutcome::Erased(_)),
+        "the resumed DSR erases to completion"
+    );
 
     // 0 DOUBLE-ERASE: the three holders receipted before the crash were NOT re-called on restart.
-    for id in [holder_ids::IDENTITY, holder_ids::BLOB, holder_ids::AUTHZ_TUPLES] {
+    for id in [
+        holder_ids::IDENTITY,
+        holder_ids::BLOB,
+        holder_ids::AUTHZ_TUPLES,
+    ] {
         let h = &upstream_seams.iter().find(|(hid, _)| *hid == id).unwrap().1;
         assert_eq!(
             h.erase_call_count(),
@@ -487,7 +563,11 @@ fn ga_d1_worker_kill_mid_fan_out_resumes_only_un_receipted_holders_zero_double_e
     // 0 MISSED: the remaining five upstream holders WERE driven on the restart.
     for id in [holder_ids::BUS, holder_ids::CACHE, holder_ids::BACKUP] {
         let h = &upstream_seams.iter().find(|(hid, _)| *hid == id).unwrap().1;
-        assert_eq!(h.erase_call_count(), 1, "holder `{id}` driven exactly once (on the resume)");
+        assert_eq!(
+            h.erase_call_count(),
+            1,
+            "holder `{id}` driven exactly once (on the resume)"
+        );
     }
     // Coverage = 1.0 (0 missed holder) and the DSR completed.
     assert_eq!(
@@ -495,8 +575,16 @@ fn ga_d1_worker_kill_mid_fan_out_resumes_only_un_receipted_holders_zero_double_e
         1.0,
         "0 missed: erasure_fanout_coverage = 1.0 after the resume (all 8 holders receipted)"
     );
-    assert_eq!(checklist.done_count(), 8, "all eight holders are receipted exactly once");
-    assert_eq!(dsr2.state_of(&id2).unwrap(), DsrState::Completed, "the resumed DSR reached Completed");
+    assert_eq!(
+        checklist.done_count(),
+        8,
+        "all eight holders are receipted exactly once"
+    );
+    assert_eq!(
+        dsr2.state_of(&id2).unwrap(),
+        DsrState::Completed,
+        "the resumed DSR reached Completed"
+    );
 
     // And the post-resume erasure is COMPLETE: 0 recoverable over every holder's key.
     for hid in all_m1_holder_ids() {
@@ -508,7 +596,10 @@ fn ga_d1_worker_kill_mid_fan_out_resumes_only_un_receipted_holders_zero_double_e
         } else {
             ShredKeyClass::Subject(hid.to_string())
         };
-        let handle = ShredKeyHandle { tenant: tenant(), class };
+        let handle = ShredKeyHandle {
+            tenant: tenant(),
+            class,
+        };
         assert_eq!(
             kms.recoverable_in_backup(&handle),
             0,
@@ -542,26 +633,38 @@ fn ga_d1_a_restart_after_completion_is_an_idempotent_no_op() {
     let holds1 = LegalHoldRegistry::new();
     let driver1 = FanOutDriver::new(&dsr1, &holds1);
     let id1 = dsr1.dsr_submit(
-        DsrKind::Erasure, tenant(), subject(subject_id), subject_scope(subject_id),
-        Posture::Controller, Initiator::Myelin,
+        DsrKind::Erasure,
+        tenant(),
+        subject(subject_id),
+        subject_scope(subject_id),
+        Posture::Controller,
+        Initiator::Myelin,
     );
     dsr1.validate(&id1).unwrap();
     let first = driver1.drive(&id1, &inv, &upstream, &checklist).unwrap();
-    let calls_after_first: Vec<u32> =
-        upstream_seams.iter().map(|(_, h)| h.erase_call_count()).collect();
+    let calls_after_first: Vec<u32> = upstream_seams
+        .iter()
+        .map(|(_, h)| h.erase_call_count())
+        .collect();
 
     // Worker #2 RESTARTS over the already-complete checklist (a fresh orchestrator + driver).
     let dsr2 = DsrOrchestrator::new(TestClock::at(10));
     let holds2 = LegalHoldRegistry::new();
     let driver2 = FanOutDriver::new(&dsr2, &holds2);
     let id2 = dsr2.dsr_submit(
-        DsrKind::Erasure, tenant(), subject(subject_id), subject_scope(subject_id),
-        Posture::Controller, Initiator::Myelin,
+        DsrKind::Erasure,
+        tenant(),
+        subject(subject_id),
+        subject_scope(subject_id),
+        Posture::Controller,
+        Initiator::Myelin,
     );
     dsr2.validate(&id2).unwrap();
     let second = driver2.drive(&id2, &inv, &upstream, &checklist).unwrap();
-    let calls_after_second: Vec<u32> =
-        upstream_seams.iter().map(|(_, h)| h.erase_call_count()).collect();
+    let calls_after_second: Vec<u32> = upstream_seams
+        .iter()
+        .map(|(_, h)| h.erase_call_count())
+        .collect();
 
     assert_eq!(
         calls_after_first, calls_after_second,

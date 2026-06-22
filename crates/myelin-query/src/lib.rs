@@ -171,10 +171,7 @@ impl QueryAst {
     /// against the static cost bound exactly like [`QueryAst::compiled`]; the source is kept for
     /// observability and round-trip recovery. This is the constructor the **P-235 grammar
     /// front-end** uses — it does NOT introduce a second engine, it wraps the ONE validated tree.
-    pub fn compiled_with_source(
-        predicate: Predicate,
-        source: impl Into<String>,
-    ) -> QueryAst {
+    pub fn compiled_with_source(predicate: Predicate, source: impl Into<String>) -> QueryAst {
         // The parser already re-validates; this constructor is infallible by contract (the parser
         // never hands an over-budget tree). We still keep the validated tree as the source of truth.
         QueryAst {
@@ -296,11 +293,7 @@ pub enum Predicate {
     /// The constant `false`.
     False,
     /// A comparison `lhs <op> rhs` over two expressions.
-    Cmp {
-        op: CmpOp,
-        lhs: Expr,
-        rhs: Expr,
-    },
+    Cmp { op: CmpOp, lhs: Expr, rhs: Expr },
     /// Conjunction — every conjunct must hold (`AND`).
     And(Vec<Predicate>),
     /// Disjunction — at least one disjunct must hold (`OR`).
@@ -439,7 +432,9 @@ impl CmpOp {
     fn apply(self, lhs: &Literal, rhs: &Literal) -> Result<bool, EvalError> {
         match self {
             CmpOp::Eq => literals_eq(lhs, rhs).ok_or(EvalError::TypeError),
-            CmpOp::Ne => literals_eq(lhs, rhs).map(|b| !b).ok_or(EvalError::TypeError),
+            CmpOp::Ne => literals_eq(lhs, rhs)
+                .map(|b| !b)
+                .ok_or(EvalError::TypeError),
             CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => match (lhs, rhs) {
                 (Literal::Int(a), Literal::Int(b)) => Ok(match self {
                     CmpOp::Lt => a < b,
@@ -518,14 +513,23 @@ impl std::fmt::Display for EvalError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             EvalError::MissingContext { name } => {
-                write!(f, "predicate references unbound variable `{name}` (missing context)")
+                write!(
+                    f,
+                    "predicate references unbound variable `{name}` (missing context)"
+                )
             }
             EvalError::TypeError => write!(f, "comparison is not defined over the operand types"),
             EvalError::CostExceeded => {
-                write!(f, "predicate evaluation exceeded the step ceiling ({MAX_EVAL_STEPS})")
+                write!(
+                    f,
+                    "predicate evaluation exceeded the step ceiling ({MAX_EVAL_STEPS})"
+                )
             }
             EvalError::NotCompiled => {
-                write!(f, "the QueryAst is the un-parsed placeholder surface (no compiled tree)")
+                write!(
+                    f,
+                    "the QueryAst is the un-parsed placeholder surface (no compiled tree)"
+                )
             }
         }
     }
@@ -585,7 +589,9 @@ mod tests {
         // The context does NOT bind `severity`.
         assert_eq!(
             ast.eval(&EvalContext::new()),
-            Err(EvalError::MissingContext { name: "severity".into() })
+            Err(EvalError::MissingContext {
+                name: "severity".into()
+            })
         );
     }
 
@@ -594,8 +600,16 @@ mod tests {
     #[test]
     fn and_propagates_missing_context() {
         let ast = QueryAst::compiled(Predicate::And(vec![
-            Predicate::Cmp { op: CmpOp::Eq, lhs: int(1), rhs: int(1) },
-            Predicate::Cmp { op: CmpOp::Eq, lhs: var("x"), rhs: int(1) },
+            Predicate::Cmp {
+                op: CmpOp::Eq,
+                lhs: int(1),
+                rhs: int(1),
+            },
+            Predicate::Cmp {
+                op: CmpOp::Eq,
+                lhs: var("x"),
+                rhs: int(1),
+            },
         ]))
         .unwrap();
         assert_eq!(
@@ -611,7 +625,11 @@ mod tests {
     fn or_does_not_mask_missing_context() {
         let ast = QueryAst::compiled(Predicate::Or(vec![
             Predicate::True,
-            Predicate::Cmp { op: CmpOp::Eq, lhs: var("x"), rhs: int(1) },
+            Predicate::Cmp {
+                op: CmpOp::Eq,
+                lhs: var("x"),
+                rhs: int(1),
+            },
         ]))
         .unwrap();
         assert_eq!(
@@ -627,8 +645,16 @@ mod tests {
             .bind("a", Literal::Int(1))
             .bind("b", Literal::Str("x".into()));
         let and = QueryAst::compiled(Predicate::And(vec![
-            Predicate::Cmp { op: CmpOp::Eq, lhs: var("a"), rhs: int(1) },
-            Predicate::Cmp { op: CmpOp::Eq, lhs: var("b"), rhs: lit_str("x") },
+            Predicate::Cmp {
+                op: CmpOp::Eq,
+                lhs: var("a"),
+                rhs: int(1),
+            },
+            Predicate::Cmp {
+                op: CmpOp::Eq,
+                lhs: var("b"),
+                rhs: lit_str("x"),
+            },
         ]))
         .unwrap();
         assert_eq!(and.eval(&ctx), Ok(true));
@@ -663,7 +689,10 @@ mod tests {
             .map(|_| Predicate::True)
             .collect();
         let err = QueryAst::compiled(Predicate::And(big)).unwrap_err();
-        assert!(matches!(err, PredicateError::TooLarge { .. }), "oversized tree rejected");
+        assert!(
+            matches!(err, PredicateError::TooLarge { .. }),
+            "oversized tree rejected"
+        );
     }
 
     /// **A deeply-nested tree is rejected at construction (static depth bound).**
@@ -674,7 +703,10 @@ mod tests {
             p = Predicate::Not(Box::new(p));
         }
         let err = QueryAst::compiled(p).unwrap_err();
-        assert!(matches!(err, PredicateError::TooDeep { .. }), "over-deep tree rejected");
+        assert!(
+            matches!(err, PredicateError::TooDeep { .. }),
+            "over-deep tree rejected"
+        );
     }
 
     /// The AST + predicate tree serialize/deserialize stably (the wire contract).

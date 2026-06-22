@@ -119,7 +119,11 @@ fn id_d2_fail_static_survives_hiccup_and_denies_revoked() {
     // S6 against a deterministic TestClock so the drill advances across the fresh_ttl / static_max
     // boundaries exactly (the production SystemClock exposes no mutators).
     let s6 = svc
-        .failstatic_cache_with_clock(sla_secs as u64, &fs_threshold, myelin_substrate::TestClock::at(1_000))
+        .failstatic_cache_with_clock(
+            sla_secs as u64,
+            &fs_threshold,
+            myelin_substrate::TestClock::at(1_000),
+        )
         .expect("S6 constructs against the thresholds-file bound");
     assert!(
         (s6.static_max() as i64) <= sla_secs,
@@ -130,29 +134,59 @@ fn id_d2_fail_static_survives_hiccup_and_denies_revoked() {
 
     // ── STEP 1 (healthy): a default-consistency check is served FRESH + cached. ──
     let healthy = svc.check_failstatic(
-        &s6, &acme, &alice, &Permission("view".into()), &obj, &bounded_stale(), None,
-        &ts("2026-06-19T00:00:01Z"), /* source_ok */ true,
+        &s6,
+        &acme,
+        &alice,
+        &Permission("view".into()),
+        &obj,
+        &bounded_stale(),
+        None,
+        &ts("2026-06-19T00:00:01Z"),
+        /* source_ok */ true,
     );
-    assert!(matches!(healthy.served, Served::Fresh), "healthy default-consistency read is fresh");
-    assert!(healthy.is_allow(), "alice's grant is allowed and the coarse answer is cached");
+    assert!(
+        matches!(healthy.served, Served::Fresh),
+        "healthy default-consistency read is fresh"
+    );
+    assert!(
+        healthy.is_allow(),
+        "alice's grant is allowed and the coarse answer is cached"
+    );
 
     // ── STEP 2 (the Id dependency BREAKS): a default-consistency check is served STATIC. ──
     // Advance past fresh_ttl (within static_max) so the cached grant is the degraded-stale rung.
     s6.clock().advance(31);
     let survived = svc.check_failstatic(
-        &s6, &acme, &alice, &Permission("view".into()), &obj, &bounded_stale(), None,
-        &ts("2026-06-19T00:00:02Z"), /* source_ok */ false, // the injected hiccup
+        &s6,
+        &acme,
+        &alice,
+        &Permission("view".into()),
+        &obj,
+        &bounded_stale(),
+        None,
+        &ts("2026-06-19T00:00:02Z"),
+        /* source_ok */ false, // the injected hiccup
     );
     assert!(
         matches!(survived.served, Served::Static),
         "during the Id hiccup the default-consistency read survives on the coarse fail-static cache"
     );
-    assert!(survived.is_allow(), "authenticated traffic SURVIVES the hiccup (still Allow)");
+    assert!(
+        survived.is_allow(),
+        "authenticated traffic SURVIVES the hiccup (still Allow)"
+    );
 
     // ── STEP 3 (the zookie-bypass): a Strong read during the SAME hiccup fails CLOSED, not stale. ──
     let strong_during_hiccup = svc.check_failstatic(
-        &s6, &acme, &alice, &Permission("view".into()), &obj, &strong(), None,
-        &ts("2026-06-19T00:00:03Z"), /* source_ok */ false,
+        &s6,
+        &acme,
+        &alice,
+        &Permission("view".into()),
+        &obj,
+        &strong(),
+        None,
+        &ts("2026-06-19T00:00:03Z"),
+        /* source_ok */ false,
     );
     assert!(
         matches!(strong_during_hiccup.served, Served::BypassClosed),
@@ -164,22 +198,36 @@ fn id_d2_fail_static_survives_hiccup_and_denies_revoked() {
     );
 
     // ── STEP 4 (the just-revoked deny): revoke alice; the stale S6 grant must NOT be served. ──
-    svc.disable_principal_in(&acme, &PrincipalId("p:alice".into()), ts("2026-06-19T00:04:00Z"));
+    svc.disable_principal_in(
+        &acme,
+        &PrincipalId("p:alice".into()),
+        ts("2026-06-19T00:04:00Z"),
+    );
 
     // A BATCH of default-consistency reads during the SAME hiccup AFTER the revoke — count the ones
     // that still succeeded (the "successful authz after the cache for a revoked subject"). Must be 0.
     let mut successful_authz_after_cache_for_revoked: i64 = 0;
     for i in 0..8 {
         let d = svc.check_failstatic(
-            &s6, &acme, &alice, &Permission("view".into()), &obj, &bounded_stale(), None,
-            &ts(&format!("2026-06-19T00:05:{i:02}Z")), /* source_ok */ false,
+            &s6,
+            &acme,
+            &alice,
+            &Permission("view".into()),
+            &obj,
+            &bounded_stale(),
+            None,
+            &ts(&format!("2026-06-19T00:05:{i:02}Z")),
+            /* source_ok */ false,
         );
         if d.is_allow() {
             successful_authz_after_cache_for_revoked += 1;
         } else {
             // The revoke is enforced BEFORE the cache is read (the S7 consult) — the served
             // provenance is `Revoked`, the answer Deny.
-            assert!(matches!(d.served, Served::Revoked), "the revoke is enforced through the cache");
+            assert!(
+                matches!(d.served, Served::Revoked),
+                "the revoke is enforced through the cache"
+            );
         }
     }
 
@@ -199,9 +247,15 @@ fn id_d2_fail_static_survives_hiccup_and_denies_revoked() {
     //     stale answer served), the fresh/stale/closed ratio is observable, and the staleness age is
     //     bounded ≤ static_max ≤ the revocation SLA.
     let fs = s6.fail_static_signals();
-    assert!(fs.stale >= 1, "authenticated traffic survived on the static (degraded) fail-static rung");
+    assert!(
+        fs.stale >= 1,
+        "authenticated traffic survived on the static (degraded) fail-static rung"
+    );
     let mut fs_signals = SignalSource::new();
-    fs_signals.set_scalar(SignalName::FailStaticStalenessSecs, fs.last_staleness_secs as i64);
+    fs_signals.set_scalar(
+        SignalName::FailStaticStalenessSecs,
+        fs.last_staleness_secs as i64,
+    );
     fs_signals
         .assert_signal(
             SignalName::FailStaticStalenessSecs,

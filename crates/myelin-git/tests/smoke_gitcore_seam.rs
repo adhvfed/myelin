@@ -119,7 +119,16 @@ fn gitcore_seam_clones_via_canonical_wire_then_diffs_and_blames_via_gix() {
     let blob2 = git_stdout(&work, &["rev-parse", &format!("{c2}:file.txt")]);
 
     let bare = base.join("origin.git");
-    git(&base, &["clone", "-q", "--bare", work.to_str().unwrap(), bare.to_str().unwrap()]);
+    git(
+        &base,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            work.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+    );
 
     // ── 2. WIRE PATH through the seam: advertise refs of the bare origin via the executor port ──
     // The production wire op (upload-pack) would stream over the smart protocol; the smoke proves
@@ -150,9 +159,17 @@ fn gitcore_seam_clones_via_canonical_wire_then_diffs_and_blames_via_gix() {
     let clone_dst = base.join("clone");
     git(
         &base,
-        &["clone", "-q", bare.to_str().unwrap(), clone_dst.to_str().unwrap()],
+        &[
+            "clone",
+            "-q",
+            bare.to_str().unwrap(),
+            clone_dst.to_str().unwrap(),
+        ],
     );
-    assert!(clone_dst.join("file.txt").exists(), "clone delivered the tree");
+    assert!(
+        clone_dst.join("file.txt").exists(),
+        "clone delivered the tree"
+    );
 
     // ── 3. READ PATH through the seam: diff + blame via in-process gix (libgit2) ──
     assert_eq!(
@@ -189,8 +206,10 @@ fn gitcore_seam_clones_via_canonical_wire_then_diffs_and_blames_via_gix() {
     let total_lines: usize = blame.iter().map(|h| h.lines).sum();
     assert_eq!(total_lines, 4, "blame covers all 4 lines of file.txt at c2");
     // The changed + added lines are attributed to c2; the unchanged ones to c1.
-    let attributed: std::collections::BTreeSet<_> =
-        blame.iter().map(|h| h.commit.as_str().to_string()).collect();
+    let attributed: std::collections::BTreeSet<_> = blame
+        .iter()
+        .map(|h| h.commit.as_str().to_string())
+        .collect();
     assert!(
         attributed.contains(&c1) && attributed.contains(&c2),
         "blame attributes lines to BOTH commits (c1 unchanged, c2 changed); got {attributed:?}"

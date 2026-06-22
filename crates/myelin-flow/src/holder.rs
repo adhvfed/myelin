@@ -73,7 +73,7 @@ use std::sync::{Arc, Mutex};
 
 use myelin_gdpr::{
     EraseReceipt, EraseScope, LocateReport, Patch, PersonalDataHolder, PortableBundle, Receipt,
-    RectifyReceipt, Result as DsrResult, RestrictReceipt, SubjectRef, TenantId as GdprTenantId,
+    RectifyReceipt, RestrictReceipt, Result as DsrResult, SubjectRef, TenantId as GdprTenantId,
 };
 use myelin_substrate::{
     Holder, HolderRegistration, HolderRegistry, StoreClassifier, StoreHolder, StoreKind,
@@ -173,7 +173,10 @@ impl FlowBacking {
     /// Wire the holder over a live workflow journal (the P-FLOW-03 real body). The restrict set is
     /// fresh (empty) — `restrict(subject, true)` adds to it.
     pub fn new(journal: WfJournal) -> FlowBacking {
-        FlowBacking { journal, restrict: RestrictSet::new() }
+        FlowBacking {
+            journal,
+            restrict: RestrictSet::new(),
+        }
     }
 
     /// Wire the holder over a live journal AND a shared restrict-suppression set (so the suppression a
@@ -207,12 +210,16 @@ impl WfHistoryHolder {
     /// Identity's pseudonym shred — NO PII-column mutation on the refs-stored rows; the inline-PII DEK
     /// crypto-shred is the P-FLOW-23 reach); `restrict` suppresses the subject's NEW dispatch.
     pub fn with_journal(journal: WfJournal) -> WfHistoryHolder {
-        WfHistoryHolder { backing: Some(FlowBacking::new(journal)) }
+        WfHistoryHolder {
+            backing: Some(FlowBacking::new(journal)),
+        }
     }
 
     /// The REAL holder over a live journal AND a shared restrict set (the replay/lease loop reads it).
     pub fn with_backing(backing: FlowBacking) -> WfHistoryHolder {
-        WfHistoryHolder { backing: Some(backing) }
+        WfHistoryHolder {
+            backing: Some(backing),
+        }
     }
 
     /// Register this holder through the substrate registry (the `serve`-called auto-registration
@@ -393,7 +400,9 @@ impl PersonalDataHolder for WfHistoryHolder {
         // is the P-FLOW-23 follow-on. No erasure backdoor: the row stays; the person becomes
         // unresolvable.
         let (sid, tenant) = match &scope {
-            EraseScope::Subject { subject, tenant } => (Self::subject_id(subject), tenant.0.clone()),
+            EraseScope::Subject { subject, tenant } => {
+                (Self::subject_id(subject), tenant.0.clone())
+            }
             EraseScope::Tenant(t) => (String::new(), t.0.clone()),
         };
         let count = match &scope {
@@ -409,9 +418,11 @@ impl PersonalDataHolder for WfHistoryHolder {
                  columns mutated; inline-PII result_key_ref/payload_key_ref per-subject-DEK \
                  crypto-shred = P-FLOW-23 (M5); replay P-FLOW-05"
             ),
-            EraseScope::Tenant(_) => "tenant crypto-shred: destroy the per-tenant DEK (11.3/11.4) — \
+            EraseScope::Tenant(_) => {
+                "tenant crypto-shred: destroy the per-tenant DEK (11.3/11.4) — \
                  every workflow row unrecoverable"
-                .into(),
+                    .into()
+            }
         };
         Ok(EraseReceipt {
             // No KEY destroyed at the flow holder (the refs-stored rows tombstone for free; the inline-
@@ -464,12 +475,7 @@ mod tests {
     /// A `wf_history` row in `acme` for `run_id`, naming `actor` by ref in a `result` ArtifactRef, and
     /// (when `key_subject` is Some) carrying the inline-PII `result_key_ref` for that subject's DEK.
     /// All refs / opaque ids, never a name.
-    fn history_row(
-        run_id: &str,
-        seq: i64,
-        actor: &str,
-        key_subject: Option<&str>,
-    ) -> WfHistoryRow {
+    fn history_row(run_id: &str, seq: i64, actor: &str, key_subject: Option<&str>) -> WfHistoryRow {
         WfHistoryRow {
             tenant: t(),
             region: Region::new("fr-par"),
@@ -480,8 +486,7 @@ mod tests {
             result: Some(vec![ArtifactRef(format!(
                 "myelin://acme/identity/principal/{actor}"
             ))]),
-            result_key_ref: key_subject
-                .map(|s| format!("kms://acme/subject/{s}")),
+            result_key_ref: key_subject.map(|s| format!("kms://acme/subject/{s}")),
         }
     }
 
@@ -592,18 +597,30 @@ mod tests {
             .iter()
             .filter(|r| WfHistoryHolder::row_references_subject(r, "u-erase"))
             .collect();
-        assert_eq!(subj_before.len(), 2, "locate finds both appearances (result ref + key ref)");
+        assert_eq!(
+            subj_before.len(),
+            2,
+            "locate finds both appearances (result ref + key ref)"
+        );
 
         // locate reports the appearance count over the structural surface.
         let loc = holder
             .locate(&subject("u-erase"), tenant())
             .expect("locate succeeds");
         assert!(loc.receipt.content_hash.starts_with("blake3:"));
-        assert!(loc.receipt.key_epoch_destroyed.is_none(), "locate shreds no key");
+        assert!(
+            loc.receipt.key_epoch_destroyed.is_none(),
+            "locate shreds no key"
+        );
 
         // ERASE the subject.
-        let scope = EraseScope::Subject { subject: subject("u-erase"), tenant: tenant() };
-        let er = holder.erase(scope.clone()).expect("structural erase succeeds");
+        let scope = EraseScope::Subject {
+            subject: subject("u-erase"),
+            tenant: tenant(),
+        };
+        let er = holder
+            .erase(scope.clone())
+            .expect("structural erase succeeds");
         assert!(
             er.receipt.key_epoch_destroyed.is_none(),
             "0 keys shredded at the flow surface (refs-stored; inline-PII DEK shred is P-FLOW-23)"
@@ -615,7 +632,11 @@ mod tests {
             after, before,
             "the refs-stored rows tombstone for FREE — 0 PII columns mutated (references-not-payloads)"
         );
-        assert_eq!(after.len(), 3, "no row deleted either — the appearance stays, only resolution changes");
+        assert_eq!(
+            after.len(),
+            3,
+            "no row deleted either — the appearance stays, only resolution changes"
+        );
 
         // Idempotent: a re-erase returns the IDENTICAL content-addressed receipt.
         let er2 = holder.erase(scope).expect("re-erase is idempotent");
@@ -634,13 +655,21 @@ mod tests {
 
         assert!(!restrict.is_restricted("u-r"), "not restricted initially");
         holder.restrict(&subj, true).expect("restrict on succeeds");
-        assert!(restrict.is_restricted("u-r"), "the holder recorded the restriction in the shared set");
-        holder.restrict(&subj, false).expect("restrict off succeeds");
+        assert!(
+            restrict.is_restricted("u-r"),
+            "the holder recorded the restriction in the shared set"
+        );
+        holder
+            .restrict(&subj, false)
+            .expect("restrict off succeeds");
         assert!(!restrict.is_restricted("u-r"), "restrict off clears it");
 
         // Unbacked → a well-defined no-op (no panic), records nothing.
         let unbacked = WfHistoryHolder::default();
-        assert!(unbacked.restrict(&subj, true).is_ok(), "unbacked restrict is a no-op receipt");
+        assert!(
+            unbacked.restrict(&subj, true).is_ok(),
+            "unbacked restrict is a no-op receipt"
+        );
     }
 
     /// **The holder is empty-but-correct unbacked (the registration-only surface), not an error.**
@@ -650,11 +679,17 @@ mod tests {
     fn unbacked_holder_is_empty_but_correct() {
         let holder = WfHistoryHolder::default();
         let subj = subject("u-1");
-        let loc = holder.locate(&subj, tenant()).expect("locate over empty surface succeeds");
+        let loc = holder
+            .locate(&subj, tenant())
+            .expect("locate over empty surface succeeds");
         assert_eq!(loc.receipt.operation, "locate");
-        let exp = holder.export(&subj, tenant()).expect("export of empty bundle succeeds");
+        let exp = holder
+            .export(&subj, tenant())
+            .expect("export of empty bundle succeeds");
         assert_eq!(exp.receipt.operation, "export");
-        let rec = holder.rectify(&subj, Patch("x".into())).expect("rectify no-op succeeds");
+        let rec = holder
+            .rectify(&subj, Patch("x".into()))
+            .expect("rectify no-op succeeds");
         assert_eq!(rec.receipt.operation, "rectify");
     }
 
@@ -667,9 +702,14 @@ mod tests {
         journal.append_history_for_test(history_row("run-1", 0, "u-e", None));
         journal.append_history_for_test(history_row("run-2", 0, "u-e", None));
         let holder = WfHistoryHolder::with_journal(journal);
-        let exp = holder.export(&subject("u-e"), tenant()).expect("export succeeds");
+        let exp = holder
+            .export(&subject("u-e"), tenant())
+            .expect("export succeeds");
         assert!(exp.receipt.content_hash.starts_with("blake3:"));
-        assert!(exp.receipt.key_epoch_destroyed.is_none(), "export shreds no key");
+        assert!(
+            exp.receipt.key_epoch_destroyed.is_none(),
+            "export shreds no key"
+        );
     }
 
     /// **Tenant-scoping: a subject id never matches another tenant's journal rows.** `locate` is
@@ -680,7 +720,10 @@ mod tests {
         let journal = WfJournal::new();
         journal.append_history_for_test(history_row("run-1", 0, "u-x", None)); // tenant = acme
         let holder = WfHistoryHolder::with_journal(journal);
-        assert_eq!(holder.count_appearances(&GdprTenantId::from_token("acme"), "u-x"), 1);
+        assert_eq!(
+            holder.count_appearances(&GdprTenantId::from_token("acme"), "u-x"),
+            1
+        );
         assert_eq!(
             holder.count_appearances(&GdprTenantId::from_token("other"), "u-x"),
             0,
@@ -698,7 +741,10 @@ mod tests {
             .erase(EraseScope::Tenant(tenant()))
             .expect("tenant erase succeeds");
         assert_eq!(er.receipt.operation, "erase");
-        assert!(er.receipt.key_epoch_destroyed.is_none(), "the per-subject DEK shred is P-FLOW-23");
+        assert!(
+            er.receipt.key_epoch_destroyed.is_none(),
+            "the per-subject DEK shred is P-FLOW-23"
+        );
     }
 
     /// **The `restrict_set` accessors return the SHARED set the holder records into.** Both
@@ -710,13 +756,24 @@ mod tests {
         let restrict = RestrictSet::new();
         let backing = FlowBacking::with_restrict(WfJournal::new(), restrict.clone());
         backing.restrict_set().set("u-shared", true);
-        assert!(restrict.is_restricted("u-shared"), "the backing accessor is the shared set");
+        assert!(
+            restrict.is_restricted("u-shared"),
+            "the backing accessor is the shared set"
+        );
 
         let holder = WfHistoryHolder::with_backing(backing);
-        let via_holder = holder.restrict_set().expect("backed holder exposes its restrict set");
-        assert!(via_holder.is_restricted("u-shared"), "the holder accessor is the SAME shared set");
+        let via_holder = holder
+            .restrict_set()
+            .expect("backed holder exposes its restrict set");
+        assert!(
+            via_holder.is_restricted("u-shared"),
+            "the holder accessor is the SAME shared set"
+        );
         via_holder.set("u-shared", false);
-        assert!(!restrict.is_restricted("u-shared"), "a write through the holder accessor reaches it");
+        assert!(
+            !restrict.is_restricted("u-shared"),
+            "a write through the holder accessor reaches it"
+        );
 
         assert!(
             WfHistoryHolder::default().restrict_set().is_none(),
@@ -731,7 +788,10 @@ mod tests {
         let holders: Vec<Box<dyn PersonalDataHolder>> = vec![Box::new(WfHistoryHolder::default())];
         let subj = subject("u-3");
         for h in &holders {
-            assert!(h.locate(&subj, tenant()).is_ok(), "the holder responds to the contract");
+            assert!(
+                h.locate(&subj, tenant()).is_ok(),
+                "the holder responds to the contract"
+            );
         }
     }
 }

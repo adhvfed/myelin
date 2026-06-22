@@ -109,7 +109,10 @@ impl LockBudget {
     /// Construct the budget from the two threshold values (the drill reads them from
     /// `thresholds.toml` and constructs this — never a hardcoded literal in this module).
     pub fn new(lock_wait_p99_max_ms: u64, downtime_max_ms: u64) -> LockBudget {
-        LockBudget { lock_wait_p99_max_ms, downtime_max_ms }
+        LockBudget {
+            lock_wait_p99_max_ms,
+            downtime_max_ms,
+        }
     }
 }
 
@@ -133,7 +136,10 @@ impl WriteLoad {
     /// A prod-scale write load: `rows` live rows on the migrated table + `concurrent_writers` steady
     /// writers in flight.
     pub fn prod_scale(rows: u64, concurrent_writers: u32) -> WriteLoad {
-        WriteLoad { rows, concurrent_writers }
+        WriteLoad {
+            rows,
+            concurrent_writers,
+        }
     }
 }
 
@@ -424,22 +430,37 @@ impl MigrationUnderLoad {
         for m in &migrations.0 {
             // A destructive migration would have been refused in (1); assert the invariant defensively
             // so a future runner change that admitted one cannot reach the measurement silently.
-            debug_assert!(!is_destructive(m.ddl), "a destructive migration must be refused before measure");
+            debug_assert!(
+                !is_destructive(m.ddl),
+                "a destructive migration must be refused before measure"
+            );
 
             let (lock_wait_ms, lock_class) = lock_cost_ms(m.ddl, m.phase, load.rows);
             // A blocking ACCESS EXCLUSIVE table lock takes the table offline for the rewrite duration
             // (downtime); an online lock does not. The 0-downtime invariant is asserted in (3a).
             let caused_downtime = lock_class.blocks_writers();
-            steps.push(StepLockMeasure { id: m.id, lock_class, lock_wait_ms, caused_downtime });
+            steps.push(StepLockMeasure {
+                id: m.id,
+                lock_class,
+                lock_wait_ms,
+                caused_downtime,
+            });
         }
 
         // (3a) The 0-downtime invariant — any step that took the table offline is a hard fail (an
         // online migration NEVER takes the table offline). The total downtime is the SUM of the
         // blocking steps' lock-waits; ANY downtime (`> 0`) is a hard fail, so we surface the first
         // offline step (the precise blocking migration) with the total downtime it would cause.
-        let downtime_ms: u64 = steps.iter().filter(|s| s.caused_downtime).map(|s| s.lock_wait_ms).sum();
+        let downtime_ms: u64 = steps
+            .iter()
+            .filter(|s| s.caused_downtime)
+            .map(|s| s.lock_wait_ms)
+            .sum();
         if downtime_ms > 0 {
-            let offline = steps.iter().find(|s| s.caused_downtime).expect("downtime > 0 ⇒ an offline step");
+            let offline = steps
+                .iter()
+                .find(|s| s.caused_downtime)
+                .expect("downtime > 0 ⇒ an offline step");
             return MigrationLoadVerdict::Red(MigrationLoadFailure::DowntimeIncurred {
                 id: offline.id,
                 downtime_ms,
@@ -545,11 +566,19 @@ mod tests {
         let load = WriteLoad::prod_scale(50_000_000, 256);
 
         let verdict = MigrationUnderLoad::new().run(&migrations, &hot, load, 100, budget());
-        assert!(verdict.is_green(), "the online idiom must hold the budget, got {:?}", verdict.failure());
+        assert!(
+            verdict.is_green(),
+            "the online idiom must hold the budget, got {:?}",
+            verdict.failure()
+        );
         let a = verdict.artifact().expect("green artifact present");
         assert_eq!(a.steps.len(), 3);
         assert_eq!(a.downtime_ms, 0, "0 downtime is the invariant");
-        assert!(a.lock_wait_p99_ms <= 500, "p99 within budget: {}", a.lock_wait_p99_ms);
+        assert!(
+            a.lock_wait_p99_ms <= 500,
+            "p99 within budget: {}",
+            a.lock_wait_p99_ms
+        );
         // Every step took a SHORT online lock, none an ACCESS EXCLUSIVE rewrite.
         assert!(a.steps.iter().all(|s| !s.lock_class.blocks_writers()));
         let s = a.summary();
@@ -576,7 +605,10 @@ mod tests {
         let load = WriteLoad::prod_scale(50_000_000, 256);
 
         let verdict = MigrationUnderLoad::new().run(&migrations, &cold, load, 100, budget());
-        assert!(!verdict.is_green(), "a blocking ALTER at prod scale MUST fail the drill");
+        assert!(
+            !verdict.is_green(),
+            "a blocking ALTER at prod scale MUST fail the drill"
+        );
         // It fails on downtime first (a rewrite lock takes the table offline) — the gravest case.
         match verdict.failure() {
             Some(MigrationLoadFailure::DowntimeIncurred { id, downtime_ms }) => {
@@ -600,15 +632,30 @@ mod tests {
         assert_eq!(class_small, LockClass::AccessExclusive);
         assert_eq!(class_big, LockClass::AccessExclusive);
         // EXACT values pin the cost formula `ONLINE_LOCK_BASE_MS + (rows/1000) * REWRITE_LOCK_PER_1K_ROWS_MS`.
-        assert_eq!(cost_small, ONLINE_LOCK_BASE_MS + (2_000 / 1000) * REWRITE_LOCK_PER_1K_ROWS_MS);
+        assert_eq!(
+            cost_small,
+            ONLINE_LOCK_BASE_MS + (2_000 / 1000) * REWRITE_LOCK_PER_1K_ROWS_MS
+        );
         assert_eq!(cost_small, 14, "10 + (2000/1000)*2 = 14");
-        assert_eq!(cost_big, ONLINE_LOCK_BASE_MS + (50_000_000 / 1000) * REWRITE_LOCK_PER_1K_ROWS_MS);
+        assert_eq!(
+            cost_big,
+            ONLINE_LOCK_BASE_MS + (50_000_000 / 1000) * REWRITE_LOCK_PER_1K_ROWS_MS
+        );
         assert_eq!(cost_big, 100_010, "10 + (50_000_000/1000)*2 = 100010");
-        assert!(cost_big > cost_small, "a rewrite lock's wait scales with the row count");
-        assert!(cost_big > budget().lock_wait_p99_max_ms, "a prod-scale rewrite blows the budget: {cost_big}");
+        assert!(
+            cost_big > cost_small,
+            "a rewrite lock's wait scales with the row count"
+        );
+        assert!(
+            cost_big > budget().lock_wait_p99_max_ms,
+            "a prod-scale rewrite blows the budget: {cost_big}"
+        );
         // The per-1k factor is > 1 so doubling the rows doubles the rewrite component (kills `*`→`/`):
         let (cost_2x, _) = lock_cost_ms(ddl, MigrationPhase::Expand, 4_000);
-        assert_eq!(cost_2x, 18, "10 + (4000/1000)*2 = 18 — the rewrite component doubled");
+        assert_eq!(
+            cost_2x, 18,
+            "10 + (4000/1000)*2 = 18 — the rewrite component doubled"
+        );
     }
 
     /// **A `CREATE INDEX` WITHOUT `CONCURRENTLY` is a BLOCKING rewrite, not a SHARE UPDATE EXCLUSIVE
@@ -617,25 +664,55 @@ mod tests {
     /// `is_blocking_alter`, so it takes an ACCESS EXCLUSIVE lock; the CONCURRENTLY form does not.
     #[test]
     fn a_non_concurrent_create_index_is_blocking_not_a_concurrent_build() {
-        let (cost_blocking, class_blocking) =
-            lock_cost_ms("CREATE INDEX idx ON issue (x)", MigrationPhase::Expand, 1_000_000);
-        assert_eq!(class_blocking, LockClass::AccessExclusive, "a non-CONCURRENTLY index is a table lock");
-        assert!(cost_blocking > ONLINE_LOCK_BASE_MS, "it scales with the rows (a rewrite)");
-        let (cost_conc, class_conc) =
-            lock_cost_ms("CREATE INDEX CONCURRENTLY idx ON issue (x)", MigrationPhase::Expand, 1_000_000);
-        assert_eq!(class_conc, LockClass::ShareUpdateExclusive, "CONCURRENTLY does not block writers");
-        assert_eq!(cost_conc, ONLINE_LOCK_BASE_MS, "a concurrent build is a SHORT, row-count-independent lock");
+        let (cost_blocking, class_blocking) = lock_cost_ms(
+            "CREATE INDEX idx ON issue (x)",
+            MigrationPhase::Expand,
+            1_000_000,
+        );
+        assert_eq!(
+            class_blocking,
+            LockClass::AccessExclusive,
+            "a non-CONCURRENTLY index is a table lock"
+        );
+        assert!(
+            cost_blocking > ONLINE_LOCK_BASE_MS,
+            "it scales with the rows (a rewrite)"
+        );
+        let (cost_conc, class_conc) = lock_cost_ms(
+            "CREATE INDEX CONCURRENTLY idx ON issue (x)",
+            MigrationPhase::Expand,
+            1_000_000,
+        );
+        assert_eq!(
+            class_conc,
+            LockClass::ShareUpdateExclusive,
+            "CONCURRENTLY does not block writers"
+        );
+        assert_eq!(
+            cost_conc, ONLINE_LOCK_BASE_MS,
+            "a concurrent build is a SHORT, row-count-independent lock"
+        );
         // A VALIDATE CONSTRAINT is also SHARE UPDATE EXCLUSIVE (the `validate` arm of the `||`).
-        let (_, class_validate) =
-            lock_cost_ms("ALTER TABLE issue VALIDATE CONSTRAINT c", MigrationPhase::Plain, 1_000_000);
+        let (_, class_validate) = lock_cost_ms(
+            "ALTER TABLE issue VALIDATE CONSTRAINT c",
+            MigrationPhase::Plain,
+            1_000_000,
+        );
         assert_eq!(class_validate, LockClass::ShareUpdateExclusive);
         // **BOTH terms are required (the `&&`, not `||`):** a non-blocking DDL that mentions only ONE
         // of `create index` / `concurrently` is NOT a concurrent build. A backfill whose text contains
         // the word "concurrently" but not "create index" is a ROW-LEVEL backfill, not a concurrent
         // index build (kills the `&&`→`||` mutant — with `||` it would wrongly be ShareUpdateExclusive).
-        let (_, class_only_conc) =
-            lock_cost_ms("UPDATE issue SET x = 0 -- runs concurrently", MigrationPhase::Backfill, 1_000_000);
-        assert_eq!(class_only_conc, LockClass::RowLevel, "only one term ⇒ NOT a concurrent build (the `&&`)");
+        let (_, class_only_conc) = lock_cost_ms(
+            "UPDATE issue SET x = 0 -- runs concurrently",
+            MigrationPhase::Backfill,
+            1_000_000,
+        );
+        assert_eq!(
+            class_only_conc,
+            LockClass::RowLevel,
+            "only one term ⇒ NOT a concurrent build (the `&&`)"
+        );
     }
 
     /// The p99 over a per-step series is the WORST step's lock-wait (kills the `p99_lock_wait -> 0/1`
@@ -645,8 +722,18 @@ mod tests {
     fn the_artifact_p99_is_the_worst_step_lock_wait() {
         let hot = HotTables::declare(["issue"]);
         let migrations = Migrations::of([
-            Migration::phased("0010_e", "ALTER TABLE issue ADD COLUMN p INT;", MigrationPhase::Expand, "issue"),
-            Migration::phased("0011_b", "UPDATE issue SET p = 0;", MigrationPhase::Backfill, "issue"),
+            Migration::phased(
+                "0010_e",
+                "ALTER TABLE issue ADD COLUMN p INT;",
+                MigrationPhase::Expand,
+                "issue",
+            ),
+            Migration::phased(
+                "0011_b",
+                "UPDATE issue SET p = 0;",
+                MigrationPhase::Backfill,
+                "issue",
+            ),
         ]);
         let load = WriteLoad::prod_scale(50_000_000, 256);
         let a = MigrationUnderLoad::new()
@@ -664,15 +751,24 @@ mod tests {
     fn the_budget_boundary_admits_p99_equal_to_budget() {
         let hot = HotTables::declare(["issue"]);
         let migrations = Migrations::of([Migration::phased(
-            "0010_e", "ALTER TABLE issue ADD COLUMN p INT;", MigrationPhase::Expand, "issue",
+            "0010_e",
+            "ALTER TABLE issue ADD COLUMN p INT;",
+            MigrationPhase::Expand,
+            "issue",
         )]);
         let load = WriteLoad::prod_scale(50_000_000, 256);
         // Budget set to EXACTLY the online base — p99 == budget. A `>` check admits it; a `>=`/`==`
         // mutant would (wrongly) reject it.
         let exact = LockBudget::new(ONLINE_LOCK_BASE_MS, 0);
         let verdict = MigrationUnderLoad::new().run(&migrations, &hot, load, 100, exact);
-        assert!(verdict.is_green(), "p99 == budget must be admitted (the boundary is strict-over)");
-        assert_eq!(verdict.artifact().unwrap().lock_wait_p99_ms, ONLINE_LOCK_BASE_MS);
+        assert!(
+            verdict.is_green(),
+            "p99 == budget must be admitted (the boundary is strict-over)"
+        );
+        assert_eq!(
+            verdict.artifact().unwrap().lock_wait_p99_ms,
+            ONLINE_LOCK_BASE_MS
+        );
     }
 
     /// The total downtime is the SUM of the blocking steps' lock-waits (kills the `+=`→`*=` mutant on
@@ -685,17 +781,24 @@ mod tests {
         // DowntimeIncurred carries the exact step cost — pinning the accumulator's first add.
         let cold = HotTables::none();
         let migrations = Migrations::of([Migration::phased(
-            "0010_block", "ALTER TABLE issue ADD COLUMN x TEXT NOT NULL;", MigrationPhase::Expand, "issue",
+            "0010_block",
+            "ALTER TABLE issue ADD COLUMN x TEXT NOT NULL;",
+            MigrationPhase::Expand,
+            "issue",
         )]);
         let load = WriteLoad::prod_scale(2_000, 8); // small so the cost is the exact 14 ms.
-        // A budget that ALLOWS downtime (so the run reaches the budget arm, not the 0-downtime arm) to
-        // exercise the accumulator: but the 0-downtime invariant fires first by design. So assert the
-        // per-step downtime carried in the failure equals the exact step cost (`+=` started from 0).
-        let verdict = MigrationUnderLoad::new().run(&migrations, &cold, load, 100, LockBudget::new(500, 0));
+                                                    // A budget that ALLOWS downtime (so the run reaches the budget arm, not the 0-downtime arm) to
+                                                    // exercise the accumulator: but the 0-downtime invariant fires first by design. So assert the
+                                                    // per-step downtime carried in the failure equals the exact step cost (`+=` started from 0).
+        let verdict =
+            MigrationUnderLoad::new().run(&migrations, &cold, load, 100, LockBudget::new(500, 0));
         match verdict.failure() {
             Some(MigrationLoadFailure::DowntimeIncurred { id, downtime_ms }) => {
                 assert_eq!(*id, "0010_block");
-                assert_eq!(*downtime_ms, 14, "the blocking step's lock-wait at 2000 rows = 10 + 2*2 = 14");
+                assert_eq!(
+                    *downtime_ms, 14,
+                    "the blocking step's lock-wait at 2000 rows = 10 + 2*2 = 14"
+                );
             }
             other => panic!("expected DowntimeIncurred, got {other:?}"),
         }
@@ -705,15 +808,34 @@ mod tests {
     /// property) — the cost is the same base whether 1K or 50M rows.
     #[test]
     fn online_lock_cost_is_independent_of_row_count() {
-        let (small, _) = lock_cost_ms("ALTER TABLE issue ADD COLUMN x INT", MigrationPhase::Expand, 1_000);
-        let (big, _) = lock_cost_ms("ALTER TABLE issue ADD COLUMN x INT", MigrationPhase::Expand, 50_000_000);
-        assert_eq!(small, big, "an online step's lock cost does not scale with the table size");
+        let (small, _) = lock_cost_ms(
+            "ALTER TABLE issue ADD COLUMN x INT",
+            MigrationPhase::Expand,
+            1_000,
+        );
+        let (big, _) = lock_cost_ms(
+            "ALTER TABLE issue ADD COLUMN x INT",
+            MigrationPhase::Expand,
+            50_000_000,
+        );
+        assert_eq!(
+            small, big,
+            "an online step's lock cost does not scale with the table size"
+        );
         assert_eq!(small, ONLINE_LOCK_BASE_MS);
         // A concurrent index build is SHARE UPDATE EXCLUSIVE (does not block writes).
-        let (_, idx_class) = lock_cost_ms("CREATE INDEX CONCURRENTLY idx ON issue (x)", MigrationPhase::Expand, 50_000_000);
+        let (_, idx_class) = lock_cost_ms(
+            "CREATE INDEX CONCURRENTLY idx ON issue (x)",
+            MigrationPhase::Expand,
+            50_000_000,
+        );
         assert_eq!(idx_class, LockClass::ShareUpdateExclusive);
         // A backfill takes row locks only.
-        let (_, bf_class) = lock_cost_ms("UPDATE issue SET x = 0", MigrationPhase::Backfill, 50_000_000);
+        let (_, bf_class) = lock_cost_ms(
+            "UPDATE issue SET x = 0",
+            MigrationPhase::Backfill,
+            50_000_000,
+        );
         assert_eq!(bf_class, LockClass::RowLevel);
     }
 
@@ -725,7 +847,12 @@ mod tests {
     fn the_runner_gate_is_re_run_a_contract_before_backfill_is_refused() {
         let hot = HotTables::declare(["issue"]);
         let migrations = Migrations::of([
-            Migration::phased("0010_e", "ALTER TABLE issue ADD COLUMN p INT;", MigrationPhase::Expand, "issue"),
+            Migration::phased(
+                "0010_e",
+                "ALTER TABLE issue ADD COLUMN p INT;",
+                MigrationPhase::Expand,
+                "issue",
+            ),
             // CONTRACT before BACKFILL — the forbidden ordering the runner refuses.
             Migration::phased(
                 "0011_c",
@@ -738,7 +865,10 @@ mod tests {
         let verdict = MigrationUnderLoad::new().run(&migrations, &hot, load, 100, budget());
         assert!(!verdict.is_green());
         match verdict.failure() {
-            Some(MigrationLoadFailure::RunnerRefused(MigrationError::PhaseOutOfOrder { id, .. })) => {
+            Some(MigrationLoadFailure::RunnerRefused(MigrationError::PhaseOutOfOrder {
+                id,
+                ..
+            })) => {
                 assert_eq!(*id, "0011_c");
             }
             other => panic!("expected a RunnerRefused(PhaseOutOfOrder), got {other:?}"),
@@ -751,7 +881,10 @@ mod tests {
     fn run_or_fail_is_loud() {
         let hot = HotTables::declare(["issue"]);
         let ok = Migrations::of([Migration::phased(
-            "0010_e", "ALTER TABLE issue ADD COLUMN p INT;", MigrationPhase::Expand, "issue",
+            "0010_e",
+            "ALTER TABLE issue ADD COLUMN p INT;",
+            MigrationPhase::Expand,
+            "issue",
         )]);
         let load = WriteLoad::prod_scale(10_000_000, 64);
         let artifact = MigrationUnderLoad::new()
@@ -760,7 +893,10 @@ mod tests {
         assert_eq!(artifact.rows_under_load, 10_000_000);
 
         let bad = Migrations::of([Migration::phased(
-            "0010_block", "ALTER TABLE issue ALTER COLUMN p TYPE BIGINT;", MigrationPhase::Expand, "issue",
+            "0010_block",
+            "ALTER TABLE issue ALTER COLUMN p TYPE BIGINT;",
+            MigrationPhase::Expand,
+            "issue",
         )]);
         let err = MigrationUnderLoad::new()
             .run_or_fail(&bad, &HotTables::none(), load, 100, budget())

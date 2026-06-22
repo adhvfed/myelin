@@ -207,7 +207,13 @@ impl RevocationStore {
     /// path; this is its denylist write — the fast cross-surface deny that does not wait for the
     /// next `authenticate`. Idempotent + crash-safe (it is a `revoke` of the principal handle).
     pub fn disable_principal(&self, scope: &TenantScope, principal: &PrincipalId, now: Timestamp) {
-        self.insert(scope, RevokedKind::Principal, principal.0.clone(), now, None);
+        self.insert(
+            scope,
+            RevokedKind::Principal,
+            principal.0.clone(),
+            now,
+            None,
+        );
     }
 
     /// Register a **per-run agent-token TTL** (architecture §2/§6 — per-run grants are auto-expiring
@@ -222,7 +228,13 @@ impl RevocationStore {
         now: Timestamp,
         expires_at: Timestamp,
     ) {
-        self.insert(scope, RevokedKind::Jti, jti.to_string(), now, Some(expires_at));
+        self.insert(
+            scope,
+            RevokedKind::Jti,
+            jti.to_string(),
+            now,
+            Some(expires_at),
+        );
     }
 
     /// **The explicit teardown of a per-run token (P-ID-18 — the ID-D6 teardown leg).** Records the
@@ -369,7 +381,10 @@ impl RevocationStore {
         // (1) Durable mirror FIRST (crash-safe: a crash after this line recovers the revocation).
         //     IDEMPOTENT: only insert if absent — an already-revoked handle keeps its FIRST
         //     `revoked_at` (a re-revoke does not overwrite, duplicate, or clear it).
-        guard.mirror.entry(key.clone()).or_insert_with(|| entry.clone());
+        guard
+            .mirror
+            .entry(key.clone())
+            .or_insert_with(|| entry.clone());
         // (2) Fast Redis/Valkey-class layer (mirror of the mirror — same idempotent semantics).
         guard.fast.entry(key).or_insert(entry);
         drop(guard);
@@ -479,7 +494,12 @@ mod tests {
         let guard = s7.lock();
         let entry = guard
             .mirror
-            .get(&("acme".into(), "eu-west".into(), RevokedKind::Jti, "jti-1".into()))
+            .get(&(
+                "acme".into(),
+                "eu-west".into(),
+                RevokedKind::Jti,
+                "jti-1".into(),
+            ))
             .expect("entry present");
         assert_eq!(
             entry.revoked_at.0, "2026-06-19T00:00:00Z",
@@ -562,7 +582,11 @@ mod tests {
         );
         // A `jti` named "p:alice" is a DISTINCT namespace — disabling the principal does not
         // denylist a same-named jti.
-        assert!(!s7.is_revoked(&acme, &RevokeTarget::Jti("p:alice".into()), &ts("2026-06-19T00:01:00Z")));
+        assert!(!s7.is_revoked(
+            &acme,
+            &RevokeTarget::Jti("p:alice".into()),
+            &ts("2026-06-19T00:01:00Z")
+        ));
     }
 
     /// `revoke` emits the `revocation_lag` telemetry under the FROZEN signal name (row 1.8).
@@ -575,8 +599,16 @@ mod tests {
         );
         let s7 = RevocationStore::new();
         let acme = scope("acme");
-        s7.revoke(&acme, &RevokeTarget::Jti("jti-1".into()), ts("2026-06-19T00:00:00Z"));
-        s7.disable_principal(&acme, &PrincipalId("p:bob".into()), ts("2026-06-19T00:00:01Z"));
+        s7.revoke(
+            &acme,
+            &RevokeTarget::Jti("jti-1".into()),
+            ts("2026-06-19T00:00:00Z"),
+        );
+        s7.disable_principal(
+            &acme,
+            &PrincipalId("p:bob".into()),
+            ts("2026-06-19T00:00:01Z"),
+        );
         assert_eq!(
             s7.telemetry().revocation_count(),
             2,

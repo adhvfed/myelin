@@ -179,8 +179,14 @@ fn drill_ag_d7_adversarial_self_trigger_loop_halts_under_ceiling_zero_fork() {
 
     // (3) ASSERT the green artifact.
     // guards 1+2: every self-trigger and every raw-text re-trigger was dropped — 0 admitted.
-    assert_eq!(self_trigger_drops, 200, "every self-trigger dropped (0 self re-triggers)");
-    assert_eq!(raw_text_drops, 200, "every raw-text re-trigger dropped (0 raw-text re-triggers)");
+    assert_eq!(
+        self_trigger_drops, 200,
+        "every self-trigger dropped (0 self re-triggers)"
+    );
+    assert_eq!(
+        raw_text_drops, 200,
+        "every raw-text re-trigger dropped (0 raw-text re-triggers)"
+    );
 
     // guard 3: the causal-depth NEVER exceeded the ceiling — the self-feeding chain was stopped AT it.
     assert!(
@@ -188,29 +194,63 @@ fn drill_ag_d7_adversarial_self_trigger_loop_halts_under_ceiling_zero_fork() {
         "causal-depth max {} must be <= ceiling {ceiling} (NEVER raised to pass)",
         telemetry.causal_depth_max()
     );
-    assert_eq!(telemetry.causal_depth_max(), ceiling, "the chain reached but did not exceed 12");
-    assert!(telemetry.depth_ceiling_hits() >= 1, "the depth ceiling stopped the deep chain");
-    assert!(depth_ceiling_drops >= 1, "the depth ceiling fired in the loop");
+    assert_eq!(
+        telemetry.causal_depth_max(),
+        ceiling,
+        "the chain reached but did not exceed 12"
+    );
+    assert!(
+        telemetry.depth_ceiling_hits() >= 1,
+        "the depth ceiling stopped the deep chain"
+    );
+    assert!(
+        depth_ceiling_drops >= 1,
+        "the depth ceiling fired in the loop"
+    );
 
     // guard 4: the shared-root tripwire tripped the per-tenant breaker on the wide same-root loop.
-    assert!(telemetry.shared_root_tripwire_firings() >= 1, "the per-tenant breaker tripped");
+    assert!(
+        telemetry.shared_root_tripwire_firings() >= 1,
+        "the per-tenant breaker tripped"
+    );
     assert!(tripwire_drops >= 1, "the tripwire fired in the loop");
 
     // guard 5: the bounded dispatch pool capped concurrency at 4 and shed the rest.
-    assert_eq!(guards.dispatches_in_flight(), 4, "the pool is at cap (4 in flight, never released)");
+    assert_eq!(
+        guards.dispatches_in_flight(),
+        4,
+        "the pool is at cap (4 in flight, never released)"
+    );
     assert!(pool_parked >= 1, "over-cap dispatches were shed/parked");
-    assert_eq!(telemetry.activity_pool_sheds() as u32, pool_parked, "shed accounting");
+    assert_eq!(
+        telemetry.activity_pool_sheds() as u32,
+        pool_parked,
+        "shed accounting"
+    );
 
     // THE HEADLINE: 0 fork — nothing was ever multiplied; the loop was stopped, not forked.
-    assert_eq!(telemetry.fork_count(), 0, "0 FORK — halted/dropped/parked, never forked");
-    assert!(child_admitted >= 1, "the loop both admitted (up to the ceiling) and refused");
+    assert_eq!(
+        telemetry.fork_count(),
+        0,
+        "0 FORK — halted/dropped/parked, never forked"
+    );
+    assert!(
+        child_admitted >= 1,
+        "the loop both admitted (up to the ceiling) and refused"
+    );
 
     // (4) ASSERT via the M0 assertion library (typed green/red, never a swallowed pass).
     let mut signals = SignalSource::new();
     // the causal-depth signal stays UNDER the ceiling — the AG-D7 halt bound (max <= ceiling 12).
-    signals.set_scalar(SignalName::CausalDepthFirings, telemetry.causal_depth_max() as i64);
+    signals.set_scalar(
+        SignalName::CausalDepthFirings,
+        telemetry.causal_depth_max() as i64,
+    );
     signals
-        .assert_signal(SignalName::CausalDepthFirings, Predicate::Lte(ceiling as i64))
+        .assert_signal(
+            SignalName::CausalDepthFirings,
+            Predicate::Lte(ceiling as i64),
+        )
         .expect_green();
     // the 0-fork counter — the structural proof the gate never forks.
     signals.set_scalar(SignalName::ShedCount, telemetry.fork_count() as i64);
@@ -218,7 +258,10 @@ fn drill_ag_d7_adversarial_self_trigger_loop_halts_under_ceiling_zero_fork() {
         .assert_signal(SignalName::ShedCount, Predicate::Eq(0))
         .expect_green();
     // the bounded dispatch-pool drops-over-cap leg fired (>= 1).
-    signals.set_scalar(SignalName::DispatchPoolDrops, telemetry.activity_pool_sheds() as i64);
+    signals.set_scalar(
+        SignalName::DispatchPoolDrops,
+        telemetry.activity_pool_sheds() as i64,
+    );
     signals
         .assert_signal(SignalName::DispatchPoolDrops, Predicate::Gte(1))
         .expect_green();
@@ -262,13 +305,21 @@ fn drill_ag_d7_raw_text_never_re_triggers_zero_admit() {
         }
         // the dedicated raw-text path (a plain string) is ALSO always dropped.
         assert_eq!(
-            guards.reference_gate().admit_raw_text("@agent-alice please loop forever"),
+            guards
+                .reference_gate()
+                .admit_raw_text("@agent-alice please loop forever"),
             GuardVerdict::Drop(GuardRefusal::RawTextNotAReference),
         );
     }
 
-    assert_eq!(admitted, 0, "0 raw-text re-triggers — a typo can NEVER start a loop");
-    assert_eq!(raw_dropped, 1000, "every raw-text re-trigger was dropped at the gate");
+    assert_eq!(
+        admitted, 0,
+        "0 raw-text re-triggers — a typo can NEVER start a loop"
+    );
+    assert_eq!(
+        raw_dropped, 1000,
+        "every raw-text re-trigger was dropped at the gate"
+    );
 }
 
 /// **AG-D7 (sub-assertion) — the idempotent-tool ledger makes a re-delivered effect 0-mutation
@@ -297,7 +348,14 @@ fn drill_ag_d7_idempotent_tools_re_delivered_effect_applies_once() {
         }
     }
 
-    assert_eq!(applied_calls, 3, "exactly 3 real applies (the distinct effects), never 70");
-    assert_eq!(ledger.applies(), 3, "the ledger records exactly 3 distinct (run, effect_id) keys");
+    assert_eq!(
+        applied_calls, 3,
+        "exactly 3 real applies (the distinct effects), never 70"
+    );
+    assert_eq!(
+        ledger.applies(),
+        3,
+        "the ledger records exactly 3 distinct (run, effect_id) keys"
+    );
     // a re-delivered effect double-mutates 0 times — the structural exactly-once.
 }

@@ -182,10 +182,7 @@ impl RunIdentity {
     /// [`RunTokenError`] LOUD (the resumed work would run past the run's own deadline; the run
     /// terminates rather than widening attribution, §5.7). Records the new attribution segment so the
     /// window stays gap-free across the pause.
-    pub fn remint_on_resume(
-        &mut self,
-        now_secs: i64,
-    ) -> Result<&RunTokenHandle, RunTokenError> {
+    pub fn remint_on_resume(&mut self, now_secs: i64) -> Result<&RunTokenHandle, RunTokenError> {
         // The remaining run life at the wake instant. A run that parked past its OWN deadline has no
         // remaining life — refusing to re-mint past the deadline is the never-widen-attribution
         // guarantee (a resume can never run beyond the run's allotted life, §5.7).
@@ -398,7 +395,10 @@ mod tests {
         let m = Arc::new(RecordingMinter::default());
         let mut id = identity(m.clone());
         // a run with a 200s life (< W=300) → token TTL == 200 (run life is the tighter bound).
-        let token = id.mint_at_dispatch(1000, 200).expect("mint succeeds").clone();
+        let token = id
+            .mint_at_dispatch(1000, 200)
+            .expect("mint succeeds")
+            .clone();
         assert_eq!(token.jti, "jti:R1:0", "the jti is bound to the run");
         assert_eq!(token.ttl_secs, 200, "token life == run life (200 < W=300)");
         assert_eq!(id.deadline_secs(), 1200, "deadline == dispatch + run life");
@@ -408,8 +408,14 @@ mod tests {
         assert_eq!(agent, "psn:agent-7");
         assert_eq!(run, "R1");
         assert_eq!(ttl, 200);
-        assert!(cav.0.contains(&"run:R1".to_string()), "per-run attenuation carried");
-        assert!(cav.0.contains(&"delegated:human-x".to_string()), "grant chain carried");
+        assert!(
+            cav.0.contains(&"run:R1".to_string()),
+            "per-run attenuation carried"
+        );
+        assert!(
+            cav.0.contains(&"delegated:human-x".to_string()),
+            "grant chain carried"
+        );
     }
 
     /// **Token life is clamped to W when the run life is longer (§5.7).** A run with a 10-minute life
@@ -419,8 +425,15 @@ mod tests {
         let m = Arc::new(RecordingMinter::default());
         let mut id = identity(m);
         let token = id.mint_at_dispatch(1000, 600).expect("mint").clone();
-        assert_eq!(token.ttl_secs, FAIL_STATIC_W_SECS, "TTL clamped to W when run life > W");
-        assert_eq!(id.deadline_secs(), 1600, "the deadline is still the full run life");
+        assert_eq!(
+            token.ttl_secs, FAIL_STATIC_W_SECS,
+            "TTL clamped to W when run life > W"
+        );
+        assert_eq!(
+            id.deadline_secs(),
+            1600,
+            "the deadline is still the full run life"
+        );
     }
 
     /// **AG-D8 re-mint leg — a multi-day pause spanning the token TTL re-mints on resume with the
@@ -435,41 +448,79 @@ mod tests {
         let mut id = identity(m.clone());
         let dispatch_at = 1000i64;
         let run_life = 259_200u64; // 3 days.
-        id.mint_at_dispatch(dispatch_at, run_life).expect("dispatch mint");
+        id.mint_at_dispatch(dispatch_at, run_life)
+            .expect("dispatch mint");
         // the dispatch token's TTL is clamped to W (300), NOT the 3-day life.
-        assert_eq!(id.current().unwrap().ttl_secs, FAIL_STATIC_W_SECS, "dispatch token TTL == W");
+        assert_eq!(
+            id.current().unwrap().ttl_secs,
+            FAIL_STATIC_W_SECS,
+            "dispatch token TTL == W"
+        );
 
         // PARK for ~2 days (well past the 300s token TTL — the token expired harmlessly while the
         // run held no thread), then RESUME.
         let resume_at = dispatch_at + 172_800; // +2 days.
-        let reminted = id.remint_on_resume(resume_at).expect("re-mint on resume").clone();
-        assert_eq!(reminted.jti, "jti:R1:1", "a FRESH token (not the dispatch one)");
+        let reminted = id
+            .remint_on_resume(resume_at)
+            .expect("re-mint on resume")
+            .clone();
+        assert_eq!(
+            reminted.jti, "jti:R1:1",
+            "a FRESH token (not the dispatch one)"
+        );
         assert_ne!(reminted.jti, "jti:R1:0", "the re-mint is a NEW token");
         // ATTRIBUTED WITHIN THE TTL BOUND: the re-minted token's TTL is min(W, remaining run life).
         // remaining = deadline(1000+259200=260200) - resume(173800) = 86400 (1 day) > W → clamp to W.
-        assert_eq!(reminted.ttl_secs, FAIL_STATIC_W_SECS, "re-mint TTL == min(W, remaining) == W");
-        assert!(reminted.ttl_secs <= FAIL_STATIC_W_SECS, "never widens beyond W");
+        assert_eq!(
+            reminted.ttl_secs, FAIL_STATIC_W_SECS,
+            "re-mint TTL == min(W, remaining) == W"
+        );
+        assert!(
+            reminted.ttl_secs <= FAIL_STATIC_W_SECS,
+            "never widens beyond W"
+        );
 
         // SAME caveats on re-mint (attenuate-only — a resume never widens the grant).
         let calls = m.calls.lock().unwrap();
         let (_, _, cav, ttl) = calls[1].clone();
-        assert!(cav.0.contains(&"run:R1".to_string()), "per-run attenuation re-carried");
-        assert!(cav.0.contains(&"delegated:human-x".to_string()), "SAME grant chain on re-mint");
+        assert!(
+            cav.0.contains(&"run:R1".to_string()),
+            "per-run attenuation re-carried"
+        );
+        assert!(
+            cav.0.contains(&"delegated:human-x".to_string()),
+            "SAME grant chain on re-mint"
+        );
         assert_eq!(ttl, FAIL_STATIC_W_SECS);
         drop(calls);
 
         // 0 UNATTRIBUTED WINDOW: every executing instant (dispatch + resume) opened a live segment.
-        assert!(!id.attribution_window().has_unattributed_gap(), "0 unattributed window");
-        assert_eq!(id.attribution_window().segment_count(), 2, "dispatch + one resume segment");
+        assert!(
+            !id.attribution_window().has_unattributed_gap(),
+            "0 unattributed window"
+        );
+        assert_eq!(
+            id.attribution_window().segment_count(),
+            2,
+            "dispatch + one resume segment"
+        );
         // the re-mint NEVER widened the window beyond W.
-        assert!(id.attribution_window().max_segment_width() <= FAIL_STATIC_W_SECS,
-            "no segment wider than W");
+        assert!(
+            id.attribution_window().max_segment_width() <= FAIL_STATIC_W_SECS,
+            "no segment wider than W"
+        );
         assert_eq!(id.reminted(), 1, "exactly one re-mint on the resume");
 
         // 0 LEAKED TOKEN: the child env is minted from the FRESH per-run token only.
         let child = id.child_env().expect("a child env after re-mint");
-        assert!(!child.leaked_shared_token(), "0 shared platform token leaked into the child env");
-        assert_eq!(child.run_token_jti, "jti:R1:1", "the child inherits the FRESH per-run jti");
+        assert!(
+            !child.leaked_shared_token(),
+            "0 shared platform token leaked into the child env"
+        );
+        assert_eq!(
+            child.run_token_jti, "jti:R1:1",
+            "the child inherits the FRESH per-run jti"
+        );
     }
 
     /// **The remaining-run-life clamp is TIGHTER than W near the deadline (§5.7 C6).** A resume with
@@ -480,13 +531,25 @@ mod tests {
         let m = Arc::new(RecordingMinter::default());
         let mut id = identity(m);
         id.mint_at_dispatch(1000, 600).expect("dispatch"); // deadline 1600.
-        // resume at 1560 → remaining = 1600 - 1560 = 40s (< W=300) → token TTL == 40.
-        let reminted = id.remint_on_resume(1560).expect("re-mint near deadline").clone();
-        assert_eq!(reminted.ttl_secs, 40, "TTL clamped to the remaining run life (40 < W)");
+                                                           // resume at 1560 → remaining = 1600 - 1560 = 40s (< W=300) → token TTL == 40.
+        let reminted = id
+            .remint_on_resume(1560)
+            .expect("re-mint near deadline")
+            .clone();
+        assert_eq!(
+            reminted.ttl_secs, 40,
+            "TTL clamped to the remaining run life (40 < W)"
+        );
         // the segment opened at 1560 expires at 1600 — exactly the run deadline, never past it.
-        assert_eq!(id.attribution_window().max_segment_width(), FAIL_STATIC_W_SECS,
-            "the widest segment is still the dispatch W; the resume segment is only 40");
-        assert!(!id.attribution_window().has_unattributed_gap(), "still 0 unattributed");
+        assert_eq!(
+            id.attribution_window().max_segment_width(),
+            FAIL_STATIC_W_SECS,
+            "the widest segment is still the dispatch W; the resume segment is only 40"
+        );
+        assert!(
+            !id.attribution_window().has_unattributed_gap(),
+            "still 0 unattributed"
+        );
     }
 
     /// **A resume PAST the run deadline refuses to re-mint LOUD (§5.7 — never widen past run life).**
@@ -497,9 +560,14 @@ mod tests {
         let m = Arc::new(RecordingMinter::default());
         let mut id = identity(m);
         id.mint_at_dispatch(1000, 300).expect("dispatch"); // deadline 1300.
-        // resume at 1400 — already 100s PAST the deadline. No remaining life.
-        let err = id.remint_on_resume(1400).expect_err("no remaining life → refuse");
-        assert!(err.to_string().contains("no remaining life"), "refused LOUD: {err}");
+                                                           // resume at 1400 — already 100s PAST the deadline. No remaining life.
+        let err = id
+            .remint_on_resume(1400)
+            .expect_err("no remaining life → refuse");
+        assert!(
+            err.to_string().contains("no remaining life"),
+            "refused LOUD: {err}"
+        );
         // the prior token was the only one minted; the re-mint did NOT happen.
         assert_eq!(id.reminted(), 0, "no re-mint past the deadline");
     }
@@ -515,8 +583,15 @@ mod tests {
         let h2 = id.remint_on_resume(5000).expect("second resume").clone();
         assert_ne!(h1.jti, h2.jti, "distinct token per resume");
         assert_eq!(id.reminted(), 2, "two re-mints across two bursts");
-        assert_eq!(id.attribution_window().segment_count(), 3, "dispatch + two resumes");
-        assert!(!id.attribution_window().has_unattributed_gap(), "0 unattributed across both");
+        assert_eq!(
+            id.attribution_window().segment_count(),
+            3,
+            "dispatch + two resumes"
+        );
+        assert!(
+            !id.attribution_window().has_unattributed_gap(),
+            "0 unattributed across both"
+        );
     }
 
     /// **Revoke on teardown is idempotent even on crash (4.7, §5.7).** The current token is revoked;
@@ -528,10 +603,21 @@ mod tests {
         id.mint_at_dispatch(1000, 300).expect("dispatch");
         let revoker = DenylistRevoker::default();
         // first teardown: revoke (lag 0 — teardown == now).
-        assert_eq!(id.revoke_on_teardown(&revoker, 1000, 1000), 0, "first revoke lands");
-        assert!(revoker.is_dead("jti:R1:0", 1000), "the current token is dead after revoke");
+        assert_eq!(
+            id.revoke_on_teardown(&revoker, 1000, 1000),
+            0,
+            "first revoke lands"
+        );
+        assert!(
+            revoker.is_dead("jti:R1:0", 1000),
+            "the current token is dead after revoke"
+        );
         // a SECOND teardown (a crash sweep) is a no-op — idempotent even on crash.
-        assert_eq!(id.revoke_on_teardown(&revoker, 1005, 1000), 0, "re-revoke is a no-op");
+        assert_eq!(
+            id.revoke_on_teardown(&revoker, 1005, 1000),
+            0,
+            "re-revoke is a no-op"
+        );
     }
 
     /// **Revoke targets the CURRENT (re-minted) token after a resume (§5.7).** After a re-mint the
@@ -545,8 +631,14 @@ mod tests {
         id.remint_on_resume(2000).expect("resume re-mint");
         let revoker = DenylistRevoker::default();
         id.revoke_on_teardown(&revoker, 2100, 2100);
-        assert!(revoker.is_dead("jti:R1:1", 2100), "the FRESH token is revoked");
-        assert!(!revoker.is_dead("jti:R1:0", 2100), "the stale dispatch token was NOT re-revoked");
+        assert!(
+            revoker.is_dead("jti:R1:1", 2100),
+            "the FRESH token is revoked"
+        );
+        assert!(
+            !revoker.is_dead("jti:R1:0", 2100),
+            "the stale dispatch token was NOT re-revoked"
+        );
     }
 
     /// **Teardown before dispatch is a no-op (no token to revoke).** A run torn down before it minted
@@ -556,7 +648,11 @@ mod tests {
         let m = Arc::new(RecordingMinter::default());
         let id = identity(m);
         let revoker = DenylistRevoker::default();
-        assert_eq!(id.revoke_on_teardown(&revoker, 1000, 1000), 0, "no token → no-op");
+        assert_eq!(
+            id.revoke_on_teardown(&revoker, 1000, 1000),
+            0,
+            "no token → no-op"
+        );
         assert!(id.child_env().is_none(), "no child env before dispatch");
         assert!(id.current().is_none(), "no current token before dispatch");
     }
@@ -567,15 +663,27 @@ mod tests {
     #[test]
     fn unattributed_gap_predicate_is_exact() {
         let mut w = AttributionWindow::new();
-        assert!(w.has_unattributed_gap(), "empty window is a gap (un-minted run)");
+        assert!(
+            w.has_unattributed_gap(),
+            "empty window is a gap (un-minted run)"
+        );
         w.open_segment(1000, 1300); // a positive 300-wide segment.
-        assert!(!w.has_unattributed_gap(), "a positive segment is attributed");
+        assert!(
+            !w.has_unattributed_gap(),
+            "a positive segment is attributed"
+        );
         w.open_segment(2000, 2040); // another positive segment.
-        assert!(!w.has_unattributed_gap(), "two positive segments are attributed");
+        assert!(
+            !w.has_unattributed_gap(),
+            "two positive segments are attributed"
+        );
         // a degenerate 0-length segment (a hypothetical dead-on-arrival token) IS a gap.
         let mut bad = AttributionWindow::new();
         bad.open_segment(1000, 1000); // expiry == start → 0-length.
-        assert!(bad.has_unattributed_gap(), "a 0-length segment is an unattributed instant (kills <=)");
+        assert!(
+            bad.has_unattributed_gap(),
+            "a 0-length segment is an unattributed instant (kills <=)"
+        );
     }
 
     /// **`max_segment_width` returns the widest segment (mutation-floor — the TTL-bound assertion
@@ -583,13 +691,25 @@ mod tests {
     #[test]
     fn max_segment_width_is_exact() {
         let mut w = AttributionWindow::new();
-        assert_eq!(w.max_segment_width(), 0, "empty window has width 0 (kills -> 1)");
+        assert_eq!(
+            w.max_segment_width(),
+            0,
+            "empty window has width 0 (kills -> 1)"
+        );
         w.open_segment(1000, 1040); // width 40.
         assert_eq!(w.max_segment_width(), 40);
         w.open_segment(2000, 2300); // width 300 — wider.
-        assert_eq!(w.max_segment_width(), 300, "the MAX (kills a first/last/min mutant)");
+        assert_eq!(
+            w.max_segment_width(),
+            300,
+            "the MAX (kills a first/last/min mutant)"
+        );
         w.open_segment(3000, 3010); // width 10 — narrower, must not lower the max.
-        assert_eq!(w.max_segment_width(), 300, "a narrower segment does not lower the max");
+        assert_eq!(
+            w.max_segment_width(),
+            300,
+            "a narrower segment does not lower the max"
+        );
     }
 
     /// **`with_fail_static_w` overrides W and clamps a 0 to a live 1 (never a dead-on-arrival W).**

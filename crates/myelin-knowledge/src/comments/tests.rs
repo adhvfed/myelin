@@ -37,7 +37,9 @@ fn tenant() -> TenantId {
 }
 
 fn body(text: &str) -> Vec<Block> {
-    vec![Block::Paragraph { inline: parse_inline(text, &[]) }]
+    vec![Block::Paragraph {
+        inline: parse_inline(text, &[]),
+    }]
 }
 
 fn ctx_base() -> EmitContextBase {
@@ -54,7 +56,10 @@ fn ctx_base() -> EmitContextBase {
 }
 
 fn store_and_minter() -> (OutboxStore, Arc<dyn IdMinter>) {
-    (OutboxStore::new(), Arc::new(MonotonicMinter::new()) as Arc<dyn IdMinter>)
+    (
+        OutboxStore::new(),
+        Arc::new(MonotonicMinter::new()) as Arc<dyn IdMinter>,
+    )
 }
 
 // ── the #sub mints ───────────────────────────────────────────────────────────────────────────────
@@ -108,7 +113,14 @@ fn anchor_exposes_the_stable_block_id_and_validates_a_range() {
 
     let r = CommentAnchor::range(b.clone(), 3, 10).expect("a well-formed range");
     assert_eq!(r.block_id(), &b);
-    assert!(matches!(r, CommentAnchor::Range { start: 3, end: 10, .. }));
+    assert!(matches!(
+        r,
+        CommentAnchor::Range {
+            start: 3,
+            end: 10,
+            ..
+        }
+    ));
 
     // A degenerate (empty/inverted) range is not a range.
     assert!(CommentAnchor::range(b.clone(), 5, 5).is_none());
@@ -132,9 +144,12 @@ fn comment_anchor_survives_a_block_move_zero_dangling() {
     let pa = BlockId("pa".into());
     let pb = BlockId("pb".into());
     let b9 = BlockId("b9".into());
-    tree.insert_root(pa.clone(), "paragraph", jit()).expect("insert pa");
-    tree.insert_root(pb.clone(), "paragraph", jit()).expect("insert pb");
-    tree.insert_block(b9.clone(), &pa, "paragraph", jit()).expect("insert b9 under pa");
+    tree.insert_root(pa.clone(), "paragraph", jit())
+        .expect("insert pa");
+    tree.insert_root(pb.clone(), "paragraph", jit())
+        .expect("insert pb");
+    tree.insert_block(b9.clone(), &pa, "paragraph", jit())
+        .expect("insert b9 under pa");
 
     // Two comment threads anchored to b9: one whole-block, one a text range within it.
     let mut store = CommentStore::new();
@@ -160,16 +175,32 @@ fn comment_anchor_survives_a_block_move_zero_dangling() {
         .expect("create range thread");
 
     // Before the move: both threads resolve to b9; b9 lives under pa.
-    assert_eq!(store.threads_on_block(&b9).len(), 2, "both threads anchor to b9 before the move");
-    assert_eq!(tree.get(&b9).and_then(|r| r.parent_id.clone()), Some(pa.clone()));
+    assert_eq!(
+        store.threads_on_block(&b9).len(),
+        2,
+        "both threads anchor to b9 before the move"
+    );
+    assert_eq!(
+        tree.get(&b9).and_then(|r| r.parent_id.clone()),
+        Some(pa.clone())
+    );
 
     // THE MOVE — re-parent b9 from pa to pb (a real move: order_key + parent rewrite, NOT a re-mint).
-    tree.move_block(&b9, &pb, None, None, jit()).expect("move b9 under pb");
+    tree.move_block(&b9, &pb, None, None, jit())
+        .expect("move b9 under pb");
 
     // After the move: the block id is UNCHANGED, so EVERY comment still resolves to b9 (0 dangling).
-    assert_eq!(tree.get(&b9).and_then(|r| r.parent_id.clone()), Some(pb), "b9 re-parented to pb");
+    assert_eq!(
+        tree.get(&b9).and_then(|r| r.parent_id.clone()),
+        Some(pb),
+        "b9 re-parented to pb"
+    );
     let still_on_b9 = store.threads_on_block(&b9);
-    assert_eq!(still_on_b9.len(), 2, "0 dangling: both threads STILL anchor to b9 after the move");
+    assert_eq!(
+        still_on_b9.len(),
+        2,
+        "0 dangling: both threads STILL anchor to b9 after the move"
+    );
 
     // The dangling check: every comment's anchored block id is a LIVE block in the tree.
     let mut dangling = 0usize;
@@ -178,7 +209,10 @@ fn comment_anchor_survives_a_block_move_zero_dangling() {
             dangling += 1;
         }
     }
-    assert_eq!(dangling, 0, "moved_block_comment_dangles == 0 (the comment-anchor gate)");
+    assert_eq!(
+        dangling, 0,
+        "moved_block_comment_dangles == 0 (the comment-anchor gate)"
+    );
 }
 
 // ── the store guards ───────────────────────────────────────────────────────────────────────────────
@@ -196,13 +230,19 @@ fn store_rejects_duplicate_degenerate_and_ungrammatical() {
 
     // Duplicate thread id.
     assert_eq!(
-        store.create_thread(&t, "p", "t1".into(), "c2".into(), anchor, body("b")).unwrap_err(),
+        store
+            .create_thread(&t, "p", "t1".into(), "c2".into(), anchor, body("b"))
+            .unwrap_err(),
         CommentError::DuplicateThread("t1".into())
     );
 
     // A range anchor cannot be built degenerate (the constructor guards), and create_thread also
     // guards if a Range is constructed directly.
-    let degenerate = CommentAnchor::Range { block_id: BlockId("b2".into()), start: 7, end: 7 };
+    let degenerate = CommentAnchor::Range {
+        block_id: BlockId("b2".into()),
+        start: 7,
+        end: 7,
+    };
     assert_eq!(
         store
             .create_thread(&t, "p", "t2".into(), "c3".into(), degenerate, body("c"))
@@ -213,7 +253,14 @@ fn store_rejects_duplicate_degenerate_and_ungrammatical() {
     // Ungrammatical: an empty comment id never enters the store.
     assert!(matches!(
         store
-            .create_thread(&t, "p", "t3".into(), String::new(), CommentAnchor::block(BlockId("b3".into())), body("d"))
+            .create_thread(
+                &t,
+                "p",
+                "t3".into(),
+                String::new(),
+                CommentAnchor::block(BlockId("b3".into())),
+                body("d")
+            )
             .unwrap_err(),
         CommentError::Ungrammatical(_)
     ));
@@ -225,17 +272,35 @@ fn resolve_is_reversible_and_guarded() {
     let t = tenant();
     let mut store = CommentStore::new();
     store
-        .create_thread(&t, "p", "t1".into(), "c1".into(), CommentAnchor::block(BlockId("b1".into())), body("a"))
+        .create_thread(
+            &t,
+            "p",
+            "t1".into(),
+            "c1".into(),
+            CommentAnchor::block(BlockId("b1".into())),
+            body("a"),
+        )
         .expect("create");
-    assert!(!store.thread("t1").unwrap().resolved, "fresh thread is unresolved");
+    assert!(
+        !store.thread("t1").unwrap().resolved,
+        "fresh thread is unresolved"
+    );
 
     store.resolve_thread("t1").expect("resolve");
-    assert!(store.thread("t1").unwrap().resolved, "resolved after resolve");
-    store.resolve_thread("t1").expect("resolve again (idempotent)");
+    assert!(
+        store.thread("t1").unwrap().resolved,
+        "resolved after resolve"
+    );
+    store
+        .resolve_thread("t1")
+        .expect("resolve again (idempotent)");
     assert!(store.thread("t1").unwrap().resolved);
 
     store.reopen_thread("t1").expect("reopen");
-    assert!(!store.thread("t1").unwrap().resolved, "reopen clears the flag (reversible)");
+    assert!(
+        !store.thread("t1").unwrap().resolved,
+        "reopen clears the flag (reversible)"
+    );
 
     assert_eq!(
         store.resolve_thread("nope").unwrap_err(),
@@ -272,19 +337,39 @@ fn create_comment_emits_comment_created_through_the_outbox() {
     )
     .expect("create_comment");
 
-    assert_eq!(store_bus.outbox_depth(), 0, "an OPEN tx has buffered the event (nothing durable yet)");
-    assert!(cstore.thread("t9").is_some(), "the thread is in the store (staged with the event)");
+    assert_eq!(
+        store_bus.outbox_depth(),
+        0,
+        "an OPEN tx has buffered the event (nothing durable yet)"
+    );
+    assert!(
+        cstore.thread("t9").is_some(),
+        "the thread is in the store (staged with the event)"
+    );
 
-    tx.commit().expect("commit the comment + its event together");
-    assert_eq!(store_bus.outbox_depth(), 1, "after commit: exactly the comment.created event is durable");
+    tx.commit()
+        .expect("commit the comment + its event together");
+    assert_eq!(
+        store_bus.outbox_depth(),
+        1,
+        "after commit: exactly the comment.created event is durable"
+    );
 
-    let row = store_bus.row(&id).expect("the committed comment.created row");
-    assert_eq!(row.envelope.type_.0, KNOWLEDGE_COMMENT_CREATED, "the frozen comment.created token");
+    let row = store_bus
+        .row(&id)
+        .expect("the committed comment.created row");
+    assert_eq!(
+        row.envelope.type_.0, KNOWLEDGE_COMMENT_CREATED,
+        "the frozen comment.created token"
+    );
     assert_eq!(
         row.envelope.subject.0, "myelin://acme/knowledge/page/7c2#comment-cabc",
         "subject = the #comment- sub-URN (the KN-P22 notif rules fire on this)"
     );
-    assert_eq!(row.aggregate.0, "myelin://acme/knowledge/page/7c2", "aggregate = the page (per-doc order)");
+    assert_eq!(
+        row.aggregate.0, "myelin://acme/knowledge/page/7c2",
+        "aggregate = the page (per-doc order)"
+    );
 }
 
 /// Resolving a comment emits `knowledge.comment.resolved` through the outbox, co-committed with the
@@ -316,13 +401,27 @@ fn resolve_comment_emits_comment_resolved_through_the_outbox() {
     let mut tx = store_bus.begin(Arc::clone(&minter), ctx_base());
     let id = resolve_comment(&mut cstore, &mut tx, &t, "7c2", "t9", "cabc".into())
         .expect("resolve_comment");
-    assert!(store_bus.row(&id).is_none(), "an OPEN tx has not made the resolved event durable yet");
+    assert!(
+        store_bus.row(&id).is_none(),
+        "an OPEN tx has not made the resolved event durable yet"
+    );
     tx.commit().expect("commit the resolve + its event");
 
-    assert!(cstore.thread("t9").unwrap().resolved, "the thread is resolved in the store");
-    let row = store_bus.row(&id).expect("the committed comment.resolved row");
-    assert_eq!(row.envelope.type_.0, KNOWLEDGE_COMMENT_RESOLVED, "the frozen comment.resolved token");
-    assert_eq!(row.envelope.subject.0, "myelin://acme/knowledge/page/7c2#comment-cabc");
+    assert!(
+        cstore.thread("t9").unwrap().resolved,
+        "the thread is resolved in the store"
+    );
+    let row = store_bus
+        .row(&id)
+        .expect("the committed comment.resolved row");
+    assert_eq!(
+        row.envelope.type_.0, KNOWLEDGE_COMMENT_RESOLVED,
+        "the frozen comment.resolved token"
+    );
+    assert_eq!(
+        row.envelope.subject.0,
+        "myelin://acme/knowledge/page/7c2#comment-cabc"
+    );
 }
 
 /// **The gate's atomicity: a store REJECT buffers NO event (no event without its state).** A duplicate
@@ -334,16 +433,41 @@ fn a_rejected_create_buffers_no_event() {
     let t = tenant();
 
     let mut tx0 = store_bus.begin(Arc::clone(&minter), ctx_base());
-    create_comment(&mut cstore, &mut tx0, &t, "p", "t1".into(), "c1".into(), CommentAnchor::block(BlockId("b1".into())), body("a"))
-        .expect("first create");
+    create_comment(
+        &mut cstore,
+        &mut tx0,
+        &t,
+        "p",
+        "t1".into(),
+        "c1".into(),
+        CommentAnchor::block(BlockId("b1".into())),
+        body("a"),
+    )
+    .expect("first create");
     tx0.commit().expect("commit");
     assert_eq!(store_bus.outbox_depth(), 1);
 
     // A duplicate create: the store rejects, the event is NOT buffered.
     let mut tx = store_bus.begin(Arc::clone(&minter), ctx_base());
-    let err = create_comment(&mut cstore, &mut tx, &t, "p", "t1".into(), "c9".into(), CommentAnchor::block(BlockId("b1".into())), body("b"))
-        .unwrap_err();
-    assert!(matches!(err, CommentOpError::Store(CommentError::DuplicateThread(_))));
+    let err = create_comment(
+        &mut cstore,
+        &mut tx,
+        &t,
+        "p",
+        "t1".into(),
+        "c9".into(),
+        CommentAnchor::block(BlockId("b1".into())),
+        body("b"),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        CommentOpError::Store(CommentError::DuplicateThread(_))
+    ));
     tx.commit().expect("commit the (empty) tx");
-    assert_eq!(store_bus.outbox_depth(), 1, "the rejected create buffered NO event (no event without state)");
+    assert_eq!(
+        store_bus.outbox_depth(),
+        1,
+        "the rejected create buffered NO event (no event without state)"
+    );
 }

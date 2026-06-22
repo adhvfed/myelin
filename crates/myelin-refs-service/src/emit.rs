@@ -264,7 +264,11 @@ mod tests {
     }
 
     fn principal() -> Principal {
-        Principal::stub(PrincipalId("p-opaque-7".into()), PrincipalKind::Human, tenant())
+        Principal::stub(
+            PrincipalId("p-opaque-7".into()),
+            PrincipalKind::Human,
+            tenant(),
+        )
     }
 
     // --- extraction: one edge per structured node, correct rel/rel_class ---
@@ -330,12 +334,19 @@ mod tests {
         };
         let draft = edge_event_draft(&edge);
         assert_eq!(draft.type_.0, "refs.edge.created");
-        assert_eq!(draft.subject, source_doc(), "the subject is the referencing content");
+        assert_eq!(
+            draft.subject,
+            source_doc(),
+            "the subject is the referencing content"
+        );
         assert_eq!(draft.payload["source"], "myelin://acme/chat/message/m1");
         assert_eq!(draft.payload["target"], target.0);
         assert_eq!(draft.payload["rel"], "embeds");
         assert_eq!(draft.payload["rel_class"], "reference");
-        assert!(!draft.contains_personal_data, "references-not-payloads: no inline PII");
+        assert!(
+            !draft.contains_personal_data,
+            "references-not-payloads: no inline PII"
+        );
         assert!(draft.pii_key_ref.is_none());
     }
 

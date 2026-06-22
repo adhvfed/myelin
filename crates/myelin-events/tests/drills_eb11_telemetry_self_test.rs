@@ -42,7 +42,11 @@ fn ctx_base(tenant: &str) -> EmitContextBase {
     EmitContextBase {
         tenant: TenantId(tenant.into()),
         region: Region("eu-west".into()),
-        actor: Actor(Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId(tenant.into()))),
+        actor: Actor(Principal::stub(
+            PrincipalId("p".into()),
+            PrincipalKind::Human,
+            TenantId(tenant.into()),
+        )),
         schema_ver: 1,
         occurred_at: Timestamp("2026-06-19T00:00:00Z".into()),
         recorded_at: Timestamp("2026-06-19T00:00:00Z".into()),
@@ -137,9 +141,21 @@ fn eb11_self_test_inject_producer_kill_read_outbox_depth_and_dedup_assertion() {
     sig.emit_to(&mut rec);
 
     // The Bus EMITTED the silent-data-loss signals (a missing signal is itself a failure).
-    assert_eq!(rec.scalar(BusSignal::OutboxDepth), Some(5), "outbox depth emitted");
-    assert_eq!(rec.scalar(BusSignal::OutboxAgeSecs), Some(30), "outbox age emitted");
-    assert_eq!(rec.scalar(BusSignal::DeadLetterCount), Some(0), "dead-letter count emitted");
+    assert_eq!(
+        rec.scalar(BusSignal::OutboxDepth),
+        Some(5),
+        "outbox depth emitted"
+    );
+    assert_eq!(
+        rec.scalar(BusSignal::OutboxAgeSecs),
+        Some(30),
+        "outbox age emitted"
+    );
+    assert_eq!(
+        rec.scalar(BusSignal::DeadLetterCount),
+        Some(0),
+        "dead-letter count emitted"
+    );
 
     // (3) READ THE TELEMETRY ASSERTION through the harness §10.2 assertion library: while the
     //     broker is severed, every committed event is PARKED (0 lost) — depth == 5, dead-letters
@@ -150,7 +166,11 @@ fn eb11_self_test_inject_producer_kill_read_outbox_depth_and_dedup_assertion() {
         .expect_green();
     src.assert_signal(SignalName::DeadLetterCount, Predicate::Eq(0))
         .expect_green();
-    assert_eq!(bus.delivered_count(), 0, "severed broker delivered nothing (0 ghost)");
+    assert_eq!(
+        bus.delivered_count(),
+        0,
+        "severed broker delivered nothing (0 ghost)"
+    );
 
     // (4) RESTORE the dependency + drain: the outbox-depth telemetry DRAINS to 0, and a consumer
     //     that sees the relay's redelivery dedups it — the dedup hit-rate signal proves
@@ -177,8 +197,16 @@ fn eb11_self_test_inject_producer_kill_read_outbox_depth_and_dedup_assertion() {
 
     // outbox-depth drained to 0 (SUB-D1), age 0 (no unsent row), dedup hit recorded.
     assert_eq!(rec_after.scalar(BusSignal::OutboxDepth), Some(0));
-    assert_eq!(rec_after.scalar(BusSignal::OutboxAgeSecs), Some(0), "drained → age 0");
-    assert_eq!(rec_after.scalar(BusSignal::DedupHits), Some(1), "one redelivery deduped");
+    assert_eq!(
+        rec_after.scalar(BusSignal::OutboxAgeSecs),
+        Some(0),
+        "drained → age 0"
+    );
+    assert_eq!(
+        rec_after.scalar(BusSignal::DedupHits),
+        Some(1),
+        "one redelivery deduped"
+    );
     assert_eq!(rec_after.scalar(BusSignal::DedupDeliveries), Some(6));
 
     let mut src_after = SignalSource::new();
@@ -191,7 +219,11 @@ fn eb11_self_test_inject_producer_kill_read_outbox_depth_and_dedup_assertion() {
         .assert_signal(SignalName::DeadLetterCount, Predicate::Eq(0))
         .expect_green();
 
-    assert_eq!(bus.delivered_count(), 5, "exactly-once: 5 committed → 5 delivered");
+    assert_eq!(
+        bus.delivered_count(),
+        5,
+        "exactly-once: 5 committed → 5 delivered"
+    );
     assert_eq!(breaker.broken_count(), 0, "no leaked break");
     println!(
         "[2026-06-19] PASS  drill=EB-11-self-test  inject(producer-kill) → \
@@ -239,13 +271,19 @@ fn eb11_full_4_11_signal_set_is_emitted_to_the_port() {
         BusSignal::CausalDepthMax,
         BusSignal::SharedRootTripwireFirings,
     ] {
-        assert!(rec.scalar(s).is_some(), "scalar signal {s:?} must be emitted");
+        assert!(
+            rec.scalar(s).is_some(),
+            "scalar signal {s:?} must be emitted"
+        );
     }
     // The two labelled signals are present per their label set.
     assert!(rec
         .labelled(
             BusSignal::ConsumerLag,
-            &[myelin_events::MetricLabel::new("consumer", "search-indexer")]
+            &[myelin_events::MetricLabel::new(
+                "consumer",
+                "search-indexer"
+            )]
         )
         .is_some());
     assert!(rec
@@ -258,7 +296,11 @@ fn eb11_full_4_11_signal_set_is_emitted_to_the_port() {
     // 11 distinct scalar+labelled signal kinds, exactly the §4.11 set.
     let kinds: std::collections::HashSet<BusSignal> =
         rec.samples().iter().map(|s| s.signal).collect();
-    assert_eq!(kinds.len(), BusSignal::ALL.len(), "the full §4.11 set is on the port");
+    assert_eq!(
+        kinds.len(),
+        BusSignal::ALL.len(),
+        "the full §4.11 set is on the port"
+    );
 }
 
 /// The self-test also REGISTERS into the P-S04 every-incident-adds-a-drill registry so it
@@ -281,7 +323,8 @@ fn eb11_self_test_registers_into_the_permanent_drill_suite() {
         let relay = Relay::new(store.clone(), bus.clone(), clock);
 
         // inject the producer-kill via the scenario's breaker (harness drains it on teardown).
-        ctx.breaker.break_dependency(Dependency::Broker, scope.clone());
+        ctx.breaker
+            .break_dependency(Dependency::Broker, scope.clone());
         if ctx.breaker.is_broken(&Dependency::Broker, &scope) {
             bus.sever();
         }
@@ -301,15 +344,21 @@ fn eb11_self_test_registers_into_the_permanent_drill_suite() {
         );
         let mut rec = MetricRecorder::new();
         sig.emit_to(&mut rec);
-        ctx.signals
-            .set_scalar(SignalName::OutboxDepth, rec.scalar(BusSignal::OutboxDepth).unwrap());
+        ctx.signals.set_scalar(
+            SignalName::OutboxDepth,
+            rec.scalar(BusSignal::OutboxDepth).unwrap(),
+        );
         assert_eq!(bus.delivered_count(), 4);
         ctx.signals
             .assert_signal(SignalName::OutboxDepth, Predicate::Eq(0))
     }));
 
     let results = registry.run_all();
-    assert!(results[0].is_pass(), "EB-11 self-test must read green: {:?}", results[0]);
+    assert!(
+        results[0].is_pass(),
+        "EB-11 self-test must read green: {:?}",
+        results[0]
+    );
     assert!(registry.all_green(), "the self-test re-runs green forever");
     println!("{}", results[0].artifact_row("2026-06-19"));
 }

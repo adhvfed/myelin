@@ -27,7 +27,9 @@ use myelin_events::{
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_refs::ArtifactRef;
-use myelin_refs_service::{edge_id, EdgeProjection, RefsEdgeBuilder, EDGE_BUILDER_SUBJECT_PREFIXES};
+use myelin_refs_service::{
+    edge_id, EdgeProjection, RefsEdgeBuilder, EDGE_BUILDER_SUBJECT_PREFIXES,
+};
 use myelin_tenancy::{Region, TenantId};
 
 fn tenant() -> TenantId {
@@ -67,7 +69,10 @@ fn edge_event(id: &str, type_: &str, source: &str, target: &str, rel: &str) -> E
 
 fn msg(ev: &EventEnvelope) -> Message {
     // The broker subject the message arrives on — a `refs.*` subject the builder whitelists.
-    Message { subject: "refs.edge.created".into(), envelope: ev.clone() }
+    Message {
+        subject: "refs.edge.created".into(),
+        envelope: ev.clone(),
+    }
 }
 
 /// **The refs-edge-builder is a valid consumer: it binds through the ONE sanctioned entry-point with
@@ -81,7 +86,10 @@ fn edge_builder_binds_through_the_sanctioned_entrypoint_no_wildcard() {
         EDGE_BUILDER_SUBJECT_PREFIXES,
     );
     let consumer = consume(spec, builder, DedupLedger::new());
-    assert!(consumer.is_ok(), "the builder binds with a *-free whitelist (one of the reviewed BUS-4 consumers)");
+    assert!(
+        consumer.is_ok(),
+        "the builder binds with a *-free whitelist (one of the reviewed BUS-4 consumers)"
+    );
 }
 
 /// **CDC 5.4 (consumer side) + idempotent rebuild through the runtime.** Delivering
@@ -91,19 +99,37 @@ fn edge_builder_binds_through_the_sanctioned_entrypoint_no_wildcard() {
 fn created_is_consumed_and_redelivery_is_deduped_one_row() {
     let projection = EdgeProjection::new();
     let builder = RefsEdgeBuilder::new(projection.clone());
-    let spec = ConsumerSpec::new(ConsumerName("refs-edge-builder".into()), EDGE_BUILDER_SUBJECT_PREFIXES);
+    let spec = ConsumerSpec::new(
+        ConsumerName("refs-edge-builder".into()),
+        EDGE_BUILDER_SUBJECT_PREFIXES,
+    );
     let consumer = consume(spec, builder, DedupLedger::new()).expect("bind the builder");
 
     let src = "myelin://acme/chat/message/m1";
     let tgt = "myelin://acme/issue/issue/ENG-1";
     let ev = edge_event("01J-1", "refs.edge.created", src, tgt, "mentions");
 
-    assert_eq!(consumer.deliver(&msg(&ev)), Delivered::Acked, "first delivery projects the edge");
-    assert_eq!(consumer.deliver(&msg(&ev)), Delivered::Deduplicated, "redelivery is deduped (0 dup)");
-    assert_eq!(projection.live_count(&tenant(), &region()), 1, "exactly one row (idempotent rebuild)");
+    assert_eq!(
+        consumer.deliver(&msg(&ev)),
+        Delivered::Acked,
+        "first delivery projects the edge"
+    );
+    assert_eq!(
+        consumer.deliver(&msg(&ev)),
+        Delivered::Deduplicated,
+        "redelivery is deduped (0 dup)"
+    );
+    assert_eq!(
+        projection.live_count(&tenant(), &region()),
+        1,
+        "exactly one row (idempotent rebuild)"
+    );
 
     let id = edge_id(&tenant(), src, tgt, "mentions");
-    assert!(projection.get(&tenant(), &region(), &id).is_some(), "the edge row exists at the deterministic id");
+    assert!(
+        projection.get(&tenant(), &region(), &id).is_some(),
+        "the edge row exists at the deterministic id"
+    );
 }
 
 /// **Chained mutation across a simulated consumer RESTART — exactly-once-in-effect (the prompt's
@@ -130,29 +156,74 @@ fn chained_created_removed_created_across_restart_is_exactly_once_in_effect() {
     // ── Connection 1: deliver created, then removed; broker "drops" before re-create. ──
     {
         let builder = RefsEdgeBuilder::new(projection.clone());
-        let spec = ConsumerSpec::new(ConsumerName("refs-edge-builder".into()), EDGE_BUILDER_SUBJECT_PREFIXES);
+        let spec = ConsumerSpec::new(
+            ConsumerName("refs-edge-builder".into()),
+            EDGE_BUILDER_SUBJECT_PREFIXES,
+        );
         let c = consume(spec, builder, ledger.clone()).expect("bind");
         assert_eq!(c.deliver(&msg(&created)), Delivered::Acked);
-        assert_eq!(projection.live_count(&tenant(), &region()), 1, "created → one live edge");
+        assert_eq!(
+            projection.live_count(&tenant(), &region()),
+            1,
+            "created → one live edge"
+        );
         assert_eq!(c.deliver(&msg(&removed)), Delivered::Acked);
-        assert_eq!(projection.live_count(&tenant(), &region()), 0, "removed → tombstoned, hidden");
-        assert!(projection.get(&tenant(), &region(), &id).unwrap().tombstoned);
+        assert_eq!(
+            projection.live_count(&tenant(), &region()),
+            0,
+            "removed → tombstoned, hidden"
+        );
+        assert!(
+            projection
+                .get(&tenant(), &region(), &id)
+                .unwrap()
+                .tombstoned
+        );
         // broker drops here.
     }
 
     // ── Reconnect: SAME name + SAME ledger. The broker REDELIVERS created + removed (at-least-once),
     //    then delivers the new re-create. The redeliveries are deduped; the re-create revives the edge. ──
     let builder = RefsEdgeBuilder::new(projection.clone());
-    let spec = ConsumerSpec::new(ConsumerName("refs-edge-builder".into()), EDGE_BUILDER_SUBJECT_PREFIXES);
+    let spec = ConsumerSpec::new(
+        ConsumerName("refs-edge-builder".into()),
+        EDGE_BUILDER_SUBJECT_PREFIXES,
+    );
     let c2 = consume(spec, builder, ledger.clone()).expect("re-bind by name");
-    assert_eq!(c2.deliver(&msg(&created)), Delivered::Deduplicated, "redelivered created → 0 dup");
-    assert_eq!(c2.deliver(&msg(&removed)), Delivered::Deduplicated, "redelivered removed → 0 dup");
-    assert_eq!(c2.deliver(&msg(&recreated)), Delivered::Acked, "the re-create revives the edge");
+    assert_eq!(
+        c2.deliver(&msg(&created)),
+        Delivered::Deduplicated,
+        "redelivered created → 0 dup"
+    );
+    assert_eq!(
+        c2.deliver(&msg(&removed)),
+        Delivered::Deduplicated,
+        "redelivered removed → 0 dup"
+    );
+    assert_eq!(
+        c2.deliver(&msg(&recreated)),
+        Delivered::Acked,
+        "the re-create revives the edge"
+    );
 
     // Exactly-once-in-effect: ONE live edge, ONE row (the deterministic edge_id never duplicated).
-    assert_eq!(projection.live_count(&tenant(), &region()), 1, "final state: one LIVE edge");
-    assert_eq!(projection.total_count(&tenant(), &region()), 1, "no duplicate rows (deterministic edge_id)");
-    assert!(!projection.get(&tenant(), &region(), &id).unwrap().tombstoned, "the edge is live again");
+    assert_eq!(
+        projection.live_count(&tenant(), &region()),
+        1,
+        "final state: one LIVE edge"
+    );
+    assert_eq!(
+        projection.total_count(&tenant(), &region()),
+        1,
+        "no duplicate rows (deterministic edge_id)"
+    );
+    assert!(
+        !projection
+            .get(&tenant(), &region(), &id)
+            .unwrap()
+            .tombstoned,
+        "the edge is live again"
+    );
 }
 
 /// **Steady-state == cold-rebuild (REF-D4): the SAME log replayed into a FRESH projection rebuilds
@@ -194,7 +265,11 @@ fn steady_state_equals_cold_rebuild_one_code_path() {
         cold.live_count(&tenant(), &region()),
         "cold rebuild reproduces the live-edge set"
     );
-    assert_eq!(steady.live_count(&tenant(), &region()), 1, "one live edge (m2→7c2; m1→ENG-1 removed)");
+    assert_eq!(
+        steady.live_count(&tenant(), &region()),
+        1,
+        "one live edge (m2→7c2; m1→ENG-1 removed)"
+    );
     assert_eq!(
         steady.total_count(&tenant(), &region()),
         cold.total_count(&tenant(), &region()),
@@ -220,14 +295,23 @@ fn steady_state_equals_cold_rebuild_one_code_path() {
 fn malformed_edge_event_dead_letters_through_the_runtime() {
     let projection = EdgeProjection::new();
     let builder = RefsEdgeBuilder::new(projection.clone());
-    let spec = ConsumerSpec::new(ConsumerName("refs-edge-builder".into()), EDGE_BUILDER_SUBJECT_PREFIXES);
+    let spec = ConsumerSpec::new(
+        ConsumerName("refs-edge-builder".into()),
+        EDGE_BUILDER_SUBJECT_PREFIXES,
+    );
     let consumer = consume(spec, builder, DedupLedger::new()).expect("bind");
 
     let mut bad = edge_event("01J-bad", "refs.edge.created", "s", "t", "mentions");
     bad.payload = serde_json::json!({ "target": "t", "rel": "mentions" }); // no source.
     match consumer.deliver(&msg(&bad)) {
-        Delivered::DeadLettered(Reason(r)) => assert!(r.contains("source"), "the poison names the field: {r}"),
+        Delivered::DeadLettered(Reason(r)) => {
+            assert!(r.contains("source"), "the poison names the field: {r}")
+        }
         other => panic!("a malformed edge event must dead-letter, got {other:?}"),
     }
-    assert_eq!(projection.total_count(&tenant(), &region()), 0, "the index is never corrupted");
+    assert_eq!(
+        projection.total_count(&tenant(), &region()),
+        0,
+        "the index is never corrupted"
+    );
 }

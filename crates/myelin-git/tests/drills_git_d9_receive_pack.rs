@@ -68,7 +68,10 @@ fn push(ref_name: &str, old: Oid, new: Oid) -> PushSession {
             oid: Oid::new("feed"),
             bytes: b"a benign commit object".to_vec(),
         }],
-        pusher: Pusher { pseudonym: "anon-3@acme.noreply".into(), is_agent: false },
+        pusher: Pusher {
+            pseudonym: "anon-3@acme.noreply".into(),
+            is_agent: false,
+        },
     }
 }
 
@@ -87,7 +90,11 @@ fn git_d9_happy_path_delivers_iff_committed_zero_ghost_zero_lost() {
     let db = InMemoryObjectDb::new();
 
     let committed_id = match store
-        .receive(&push("refs/heads/feature", Oid::zero(), Oid::new("c0ffee")), &db, CrashPoint::None)
+        .receive(
+            &push("refs/heads/feature", Oid::zero(), Oid::new("c0ffee")),
+            &db,
+            CrashPoint::None,
+        )
         .unwrap()
     {
         PushOutcome::Accepted { emitted, .. } => emitted[0].clone(),
@@ -98,14 +105,24 @@ fn git_d9_happy_path_delivers_iff_committed_zero_ghost_zero_lost() {
 
     let r = relay(&outbox);
     let report = r.drain_to_empty();
-    assert_eq!(report.published, 1, "exactly the one committed event was delivered");
+    assert_eq!(
+        report.published, 1,
+        "exactly the one committed event was delivered"
+    );
 
     // 0 lost: the committed event WAS delivered. 0 ghost: nothing ELSE was delivered.
     let delivered: std::collections::HashSet<EventId> = r.transport().delivered_ids();
     assert_eq!(delivered.len(), 1);
-    assert!(delivered.contains(&committed_id), "0 lost — the committed ref move's event delivered");
+    assert!(
+        delivered.contains(&committed_id),
+        "0 lost — the committed ref move's event delivered"
+    );
     // The depth drained to 0 (the survival signal), 0 dead-letters.
-    assert_eq!(outbox.outbox_depth(), 0, "depth drained to 0 — emit-iff-committed delivered");
+    assert_eq!(
+        outbox.outbox_depth(),
+        0,
+        "depth drained to 0 — emit-iff-committed delivered"
+    );
     assert_eq!(outbox.dead_letter_count(), 0);
 }
 
@@ -130,8 +147,15 @@ fn git_d9_policy_reject_path_emits_and_delivers_nothing() {
     let report = r.drain_to_empty();
     assert_eq!(report.published, 0, "a rejected push delivers nothing");
     assert_eq!(r.transport().delivered_count(), 0);
-    assert_eq!(outbox.committed_count(), 0, "0 ghost — the reject emitted nothing");
-    assert!(db.is_empty(), "the quarantine was discarded (never promoted)");
+    assert_eq!(
+        outbox.committed_count(),
+        0,
+        "0 ghost — the reject emitted nothing"
+    );
+    assert!(
+        db.is_empty(),
+        "the quarantine was discarded (never promoted)"
+    );
 }
 
 /// **GIT-D9 — crash BEFORE commit → recover → emit-iff-committed (0 ghost).** The serving tier dies
@@ -144,7 +168,11 @@ fn git_d9_crash_before_commit_then_recover_is_zero_ghost() {
 
     // The kill: the process dies before the transaction commits.
     match store
-        .receive(&push("refs/heads/feature", Oid::zero(), Oid::new("v1")), &db, CrashPoint::BeforeCommit)
+        .receive(
+            &push("refs/heads/feature", Oid::zero(), Oid::new("v1")),
+            &db,
+            CrashPoint::BeforeCommit,
+        )
         .unwrap()
     {
         PushOutcome::Crashed(c) => assert_eq!(c.at, CrashPoint::BeforeCommit),
@@ -152,24 +180,43 @@ fn git_d9_crash_before_commit_then_recover_is_zero_ghost() {
     }
     // emit-iff-committed: the crash left NO row + the ref unmoved (0 ghost). Recovery discards the
     // un-acked state; the orphan objects are harmless (content-addressed).
-    assert_eq!(outbox.committed_count(), 0, "0 ghost — the un-committed transaction left no row");
-    assert_eq!(store.tip(&RefName::new("refs/heads/feature")), None, "the ref never moved");
+    assert_eq!(
+        outbox.committed_count(),
+        0,
+        "0 ghost — the un-committed transaction left no row"
+    );
+    assert_eq!(
+        store.tip(&RefName::new("refs/heads/feature")),
+        None,
+        "the ref never moved"
+    );
 
     // RECOVER: the client retries the push (same expected-old zero — the ref still doesn't exist).
     let committed_id = match store
-        .receive(&push("refs/heads/feature", Oid::zero(), Oid::new("v1")), &db, CrashPoint::None)
+        .receive(
+            &push("refs/heads/feature", Oid::zero(), Oid::new("v1")),
+            &db,
+            CrashPoint::None,
+        )
         .unwrap()
     {
         PushOutcome::Accepted { emitted, .. } => emitted[0].clone(),
         o => panic!("expected Accepted on retry, got {o:?}"),
     };
-    assert_eq!(store.tip(&RefName::new("refs/heads/feature")), Some(Oid::new("v1")));
+    assert_eq!(
+        store.tip(&RefName::new("refs/heads/feature")),
+        Some(Oid::new("v1"))
+    );
 
     // The relay delivers EXACTLY ONE event (the retry's) — not two (no ghost from the crash).
     let r = relay(&outbox);
     r.drain_to_empty();
     let delivered = r.transport().delivered_ids();
-    assert_eq!(delivered.len(), 1, "0 ghost — exactly one event delivered after the crash+retry");
+    assert_eq!(
+        delivered.len(),
+        1,
+        "0 ghost — exactly one event delivered after the crash+retry"
+    );
     assert!(delivered.contains(&committed_id));
     assert_eq!(outbox.outbox_depth(), 0);
 }
@@ -185,21 +232,35 @@ fn git_d9_crash_after_commit_then_relay_restart_is_zero_lost() {
 
     // The kill: the process dies AFTER the transaction committed.
     match store
-        .receive(&push("refs/heads/feature", Oid::zero(), Oid::new("done")), &db, CrashPoint::AfterCommit)
+        .receive(
+            &push("refs/heads/feature", Oid::zero(), Oid::new("done")),
+            &db,
+            CrashPoint::AfterCommit,
+        )
         .unwrap()
     {
         PushOutcome::Crashed(c) => assert_eq!(c.at, CrashPoint::AfterCommit),
         o => panic!("expected Crashed, got {o:?}"),
     }
     // 0 lost: the ref MOVED and the event row is durable + unsent — the kill lost neither.
-    assert_eq!(store.tip(&RefName::new("refs/heads/feature")), Some(Oid::new("done")));
+    assert_eq!(
+        store.tip(&RefName::new("refs/heads/feature")),
+        Some(Oid::new("done"))
+    );
     assert_eq!(outbox.committed_count(), 1);
-    assert_eq!(outbox.outbox_depth(), 1, "the committed event awaits the (restarted) relay");
+    assert_eq!(
+        outbox.outbox_depth(),
+        1,
+        "the committed event awaits the (restarted) relay"
+    );
 
     // RECOVER: a fresh relay (the restarted process) drains the durable row → delivered exactly once.
     let r = relay(&outbox);
     let report = r.drain_to_empty();
-    assert_eq!(report.published, 1, "0 lost — the committed event is delivered after the restart");
+    assert_eq!(
+        report.published, 1,
+        "0 lost — the committed event is delivered after the restart"
+    );
     assert_eq!(outbox.outbox_depth(), 0, "depth drained to 0");
     assert_eq!(outbox.dead_letter_count(), 0);
 }
@@ -214,7 +275,11 @@ fn git_d9_crash_mid_publish_redelivers_once_via_broker_dedup() {
     let db = InMemoryObjectDb::new();
 
     store
-        .receive(&push("refs/heads/feature", Oid::zero(), Oid::new("x1")), &db, CrashPoint::None)
+        .receive(
+            &push("refs/heads/feature", Oid::zero(), Oid::new("x1")),
+            &db,
+            CrashPoint::None,
+        )
         .unwrap();
     assert_eq!(outbox.outbox_depth(), 1);
 
@@ -224,11 +289,22 @@ fn git_d9_crash_mid_publish_redelivers_once_via_broker_dedup() {
     r.transport().fail_next(1);
     let first = r.drain_once();
     assert_eq!(first.published, 0, "the severed publish delivered nothing");
-    assert_eq!(outbox.outbox_depth(), 1, "the row is still unsent (claimable) — 0 lost");
+    assert_eq!(
+        outbox.outbox_depth(),
+        1,
+        "the row is still unsent (claimable) — 0 lost"
+    );
 
     // On the next pass the broker is healthy: the relay re-claims + delivers exactly once.
     let second = r.drain_to_empty();
-    assert_eq!(second.published, 1, "the re-claim delivered the committed event once");
-    assert_eq!(r.transport().delivered_count(), 1, "0 ghost — exactly one logical delivery");
+    assert_eq!(
+        second.published, 1,
+        "the re-claim delivered the committed event once"
+    );
+    assert_eq!(
+        r.transport().delivered_count(),
+        1,
+        "0 ghost — exactly one logical delivery"
+    );
     assert_eq!(outbox.outbox_depth(), 0);
 }

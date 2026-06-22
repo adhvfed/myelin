@@ -140,17 +140,26 @@ pub enum FailStaticError {
 impl std::fmt::Display for FailStaticError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FailStaticError::ExceedsRevocationSla { static_max, revocation_sla } => write!(
+            FailStaticError::ExceedsRevocationSla {
+                static_max,
+                revocation_sla,
+            } => write!(
                 f,
                 "fail-static static_max ({static_max}s) > revocation SLA ({revocation_sla}s) — \
                  a revoked actor would keep working past N; rejected (architecture §8.2)"
             ),
-            FailStaticError::BelowAgentTokenTtl { static_max, agent_token_ttl } => write!(
+            FailStaticError::BelowAgentTokenTtl {
+                static_max,
+                agent_token_ttl,
+            } => write!(
                 f,
                 "fail-static static_max ({static_max}s) < agent-token TTL ({agent_token_ttl}s) — \
                  the window must contain the short-lived agent token; rejected (architecture §8.2)"
             ),
-            FailStaticError::FreshExceedsStatic { fresh_ttl, static_max } => write!(
+            FailStaticError::FreshExceedsStatic {
+                fresh_ttl,
+                static_max,
+            } => write!(
                 f,
                 "fail-static fresh_ttl ({fresh_ttl}s) > static_max ({static_max}s) — \
                  the Fresh→Static→Closed ladder must be monotone; rejected"
@@ -192,7 +201,9 @@ pub struct TestClock {
 impl TestClock {
     /// A clock starting at `t0` seconds.
     pub fn at(t0: u64) -> Self {
-        TestClock { now: AtomicU64::new(t0) }
+        TestClock {
+            now: AtomicU64::new(t0),
+        }
     }
 
     /// Advance the clock by `secs` seconds (the drill steps across a boundary).
@@ -325,7 +336,10 @@ impl<T: Clone, C: Clock> FailStatic<T, C> {
         }
         // Monotone ladder: fresh_ttl ≤ static_max.
         if fresh_ttl > static_max {
-            return Err(FailStaticError::FreshExceedsStatic { fresh_ttl, static_max });
+            return Err(FailStaticError::FreshExceedsStatic {
+                fresh_ttl,
+                static_max,
+            });
         }
         Ok(FailStatic {
             fresh_ttl,
@@ -373,7 +387,13 @@ impl<T: Clone, C: Clock> FailStatic<T, C> {
                 let now = self.clock.now_secs();
                 {
                     let mut cache = self.cache.lock().expect("fail-static cache poisoned");
-                    cache.insert(bucket, Entry { value: value.clone(), cached_at_secs: now });
+                    cache.insert(
+                        bucket,
+                        Entry {
+                            value: value.clone(),
+                            cached_at_secs: now,
+                        },
+                    );
                 }
                 self.fresh_count.fetch_add(1, Ordering::SeqCst);
                 self.last_staleness_secs.store(0, Ordering::SeqCst);
@@ -436,7 +456,13 @@ impl<T: Clone, C: Clock> FailStatic<T, C> {
         if let Ok(value) = refresh() {
             let now = self.clock.now_secs();
             let mut cache = self.cache.lock().expect("fail-static cache poisoned");
-            cache.insert(bucket, Entry { value, cached_at_secs: now });
+            cache.insert(
+                bucket,
+                Entry {
+                    value,
+                    cached_at_secs: now,
+                },
+            );
         }
     }
 
@@ -468,7 +494,10 @@ mod tests {
     /// (upper, == thresholds.toml revocation 5min). `static_max = 300` is the engineering seed (the
     /// largest the constraint admits); the ratified W is `[OPEN — LEGAL]`.
     fn drill_bound() -> StalenessBound {
-        StalenessBound { revocation_sla_secs: 300, agent_token_ttl_secs: 60 }
+        StalenessBound {
+            revocation_sla_secs: 300,
+            agent_token_ttl_secs: 60,
+        }
     }
 
     fn fail_once() -> impl Fn() -> Result<u32, ServeError> {
@@ -484,7 +513,10 @@ mod tests {
             FailStatic::<u32>::try_new(30, 301, drill_bound()).expect_err("must reject > SLA");
         assert_eq!(
             err,
-            FailStaticError::ExceedsRevocationSla { static_max: 301, revocation_sla: 300 }
+            FailStaticError::ExceedsRevocationSla {
+                static_max: 301,
+                revocation_sla: 300
+            }
         );
     }
 
@@ -495,18 +527,24 @@ mod tests {
             FailStatic::<u32>::try_new(30, 59, drill_bound()).expect_err("must reject < token TTL");
         assert_eq!(
             err,
-            FailStaticError::BelowAgentTokenTtl { static_max: 59, agent_token_ttl: 60 }
+            FailStaticError::BelowAgentTokenTtl {
+                static_max: 59,
+                agent_token_ttl: 60
+            }
         );
     }
 
     #[test]
     fn constructor_rejects_fresh_over_static() {
         // fresh_ttl (200) > static_max (120) → REJECTED (the ladder must be monotone).
-        let err =
-            FailStatic::<u32>::try_new(200, 120, drill_bound()).expect_err("must reject fresh>static");
+        let err = FailStatic::<u32>::try_new(200, 120, drill_bound())
+            .expect_err("must reject fresh>static");
         assert_eq!(
             err,
-            FailStaticError::FreshExceedsStatic { fresh_ttl: 200, static_max: 120 }
+            FailStaticError::FreshExceedsStatic {
+                fresh_ttl: 200,
+                static_max: 120
+            }
         );
     }
 
@@ -533,21 +571,37 @@ mod tests {
 
         // advance to exactly fresh_ttl (age == 30) — a hiccup here is STILL fresh (age ≤ fresh_ttl).
         fs_clock(&fs).advance(30);
-        assert_eq!(fs.get("k", fail_once()), Answer::Fresh(7), "age == fresh_ttl is fresh");
+        assert_eq!(
+            fs.get("k", fail_once()),
+            Answer::Fresh(7),
+            "age == fresh_ttl is fresh"
+        );
 
         // advance one past fresh_ttl (age == 31) — now STALE (degraded), still inside static_max.
         fs_clock(&fs).advance(1);
         let a = fs.get("k", fail_once());
-        assert_eq!(a, Answer::Static(7), "age just past fresh_ttl is degraded-stale");
+        assert_eq!(
+            a,
+            Answer::Static(7),
+            "age just past fresh_ttl is degraded-stale"
+        );
         assert!(a.is_degraded());
 
         // advance to exactly static_max (age == 300) — STILL served stale (age ≤ static_max).
         fs_clock(&fs).advance(300 - 31);
-        assert_eq!(fs.get("k", fail_once()), Answer::Static(7), "age == static_max is stale");
+        assert_eq!(
+            fs.get("k", fail_once()),
+            Answer::Static(7),
+            "age == static_max is stale"
+        );
 
         // advance one past static_max (age == 301) — fail CLOSED (budget exhausted). Never open.
         fs_clock(&fs).advance(1);
-        assert_eq!(fs.get("k", fail_once()), Answer::Closed, "past static_max is closed");
+        assert_eq!(
+            fs.get("k", fail_once()),
+            Answer::Closed,
+            "past static_max is closed"
+        );
     }
 
     #[test]
@@ -561,12 +615,14 @@ mod tests {
     fn stale_serves_the_last_known_good_never_escalates() {
         // the static (degraded) answer is the LAST CACHED value — never a fabricated/escalated one.
         let clock = TestClock::at(0);
-        let fs = FailStatic::<u32, _>::try_new_with_clock(10, 100, drill_bound(), clock)
-            .expect("valid");
+        let fs =
+            FailStatic::<u32, _>::try_new_with_clock(10, 100, drill_bound(), clock).expect("valid");
         assert_eq!(fs.get("k", || Ok(42u32)), Answer::Fresh(42));
         fs_clock(&fs).advance(50); // inside static_max, past fresh_ttl
         match fs.get("k", fail_once()) {
-            Answer::Static(v) => assert_eq!(v, 42, "stale serves the cached value, not an escalation"),
+            Answer::Static(v) => {
+                assert_eq!(v, 42, "stale serves the cached value, not an escalation")
+            }
             other => panic!("expected Static(42), got {other:?}"),
         }
     }
@@ -574,15 +630,19 @@ mod tests {
     #[test]
     fn stale_while_revalidate_refreshes_when_upstream_recovers() {
         let clock = TestClock::at(0);
-        let fs = FailStatic::<u32, _>::try_new_with_clock(10, 100, drill_bound(), clock)
-            .expect("valid");
+        let fs =
+            FailStatic::<u32, _>::try_new_with_clock(10, 100, drill_bound(), clock).expect("valid");
         assert_eq!(fs.get("k", || Ok(1u32)), Answer::Fresh(1));
         fs_clock(&fs).advance(50);
         // upstream has recovered: the read returns the NEW value Fresh, AND the background path is
         // moot (the foreground refresh already succeeded → Fresh(2), cache re-stamped at now).
         assert_eq!(fs.get("k", || Ok(2u32)), Answer::Fresh(2));
         // a subsequent hiccup at the SAME time is fresh again (the cache was re-stamped).
-        assert_eq!(fs.get("k", fail_once()), Answer::Fresh(2), "re-stamped cache is fresh");
+        assert_eq!(
+            fs.get("k", fail_once()),
+            Answer::Fresh(2),
+            "re-stamped cache is fresh"
+        );
     }
 
     // ----- the signals (contract 1.8 / §10.2 row 6) -----
@@ -590,8 +650,8 @@ mod tests {
     #[test]
     fn signals_count_fresh_stale_closed_and_staleness_age() {
         let clock = TestClock::at(0);
-        let fs = FailStatic::<u32, _>::try_new_with_clock(10, 100, drill_bound(), clock)
-            .expect("valid");
+        let fs =
+            FailStatic::<u32, _>::try_new_with_clock(10, 100, drill_bound(), clock).expect("valid");
         assert_eq!(fs.get("k", || Ok(5u32)), Answer::Fresh(5)); // fresh #1
         fs_clock(&fs).advance(50);
         assert_eq!(fs.get("k", fail_once()), Answer::Static(5)); // stale #1, age 50
@@ -603,15 +663,25 @@ mod tests {
         assert_eq!(s.stale, 1, "one stale answer");
         assert_eq!(s.closed, 1, "one closed answer");
         assert_eq!(s.total(), 3);
-        assert_eq!(s.last_staleness_secs, 50, "last stale age == 50 (≤ static_max)");
-        assert!(s.last_staleness_secs <= fs.static_max(), "staleness never exceeds the budget");
+        assert_eq!(
+            s.last_staleness_secs, 50,
+            "last stale age == 50 (≤ static_max)"
+        );
+        assert!(
+            s.last_staleness_secs <= fs.static_max(),
+            "staleness never exceeds the budget"
+        );
         assert_eq!(s.fresh_ratio_pct(), Some(33), "1/3 fresh ≈ 33%");
     }
 
     #[test]
     fn fresh_ratio_is_absent_before_any_answer() {
         let s = FailStaticSignals::default();
-        assert_eq!(s.fresh_ratio_pct(), None, "no ratio over zero answers (never a fabricated 100)");
+        assert_eq!(
+            s.fresh_ratio_pct(),
+            None,
+            "no ratio over zero answers (never a fabricated 100)"
+        );
         assert_eq!(s.total(), 0);
     }
 
@@ -624,9 +694,18 @@ mod tests {
         let stale: Answer<u8> = Answer::Static(1);
         let closed: Answer<u8> = Answer::Closed;
 
-        assert!(fresh.is_fresh() && !fresh.is_static() && !fresh.is_closed() && !fresh.is_degraded());
-        assert!(!stale.is_fresh() && stale.is_static() && !stale.is_closed() && stale.is_degraded());
-        assert!(!closed.is_fresh() && !closed.is_static() && closed.is_closed() && !closed.is_degraded());
+        assert!(
+            fresh.is_fresh() && !fresh.is_static() && !fresh.is_closed() && !fresh.is_degraded()
+        );
+        assert!(
+            !stale.is_fresh() && stale.is_static() && !stale.is_closed() && stale.is_degraded()
+        );
+        assert!(
+            !closed.is_fresh()
+                && !closed.is_static()
+                && closed.is_closed()
+                && !closed.is_degraded()
+        );
     }
 
     /// The fresh-ratio is `fresh * 100 / total` (kills the `* → +` mutant: at 1 fresh / 2 total the
@@ -634,8 +713,17 @@ mod tests {
     #[test]
     fn fresh_ratio_is_multiplicative_not_additive() {
         // 3 fresh, 1 stale → 4 total. `3*100/4 == 75`; the `+` mutant gives `(3+100)/4 == 25`.
-        let s = FailStaticSignals { fresh: 3, stale: 1, closed: 0, last_staleness_secs: 0 };
-        assert_eq!(s.fresh_ratio_pct(), Some(75), "3/4 fresh == 75% (multiplicative)");
+        let s = FailStaticSignals {
+            fresh: 3,
+            stale: 1,
+            closed: 0,
+            last_staleness_secs: 0,
+        };
+        assert_eq!(
+            s.fresh_ratio_pct(),
+            Some(75),
+            "3/4 fresh == 75% (multiplicative)"
+        );
         assert_eq!(s.total(), 4);
     }
 
@@ -646,8 +734,8 @@ mod tests {
     #[test]
     fn background_refresh_restamps_the_cache_on_recovery() {
         let clock = TestClock::at(0);
-        let fs = FailStatic::<u32, _>::try_new_with_clock(10, 100, drill_bound(), clock)
-            .expect("valid");
+        let fs =
+            FailStatic::<u32, _>::try_new_with_clock(10, 100, drill_bound(), clock).expect("valid");
         assert_eq!(fs.get("k", || Ok(1u32)), Answer::Fresh(1));
         fs_clock(&fs).advance(50); // inside static_max, past fresh_ttl → stale
 
@@ -663,10 +751,18 @@ mod tests {
                 Ok(99u32) // the background-revalidate refresh()
             }
         };
-        assert_eq!(fs.get("k", flaky), Answer::Static(1), "served the OLD stale value to the caller");
+        assert_eq!(
+            fs.get("k", flaky),
+            Answer::Static(1),
+            "served the OLD stale value to the caller"
+        );
         // the background refresh re-stamped the cache to 99 at now(50); a hiccup at the SAME time is
         // now Fresh(99) — proving the background path ran (not a no-op).
-        assert_eq!(fs.get("k", fail_once()), Answer::Fresh(99), "background refresh re-stamped to 99");
+        assert_eq!(
+            fs.get("k", fail_once()),
+            Answer::Fresh(99),
+            "background refresh re-stamped to 99"
+        );
     }
 
     /// Distinct keys land in distinct cache buckets — a constant `hash_key` would collide every key
@@ -698,13 +794,31 @@ mod tests {
     /// `fmt → Ok(default)` mutant: an empty error message hides which bound was violated).
     #[test]
     fn error_display_names_the_violated_bound() {
-        let e = FailStaticError::ExceedsRevocationSla { static_max: 301, revocation_sla: 300 };
+        let e = FailStaticError::ExceedsRevocationSla {
+            static_max: 301,
+            revocation_sla: 300,
+        };
         let m = e.to_string();
-        assert!(m.contains("301") && m.contains("300") && m.contains("revocation"), "got: {m}");
-        let e = FailStaticError::BelowAgentTokenTtl { static_max: 5, agent_token_ttl: 60 };
-        assert!(e.to_string().contains("agent-token"), "names the agent-token bound");
-        let e = FailStaticError::FreshExceedsStatic { fresh_ttl: 9, static_max: 8 };
-        assert!(e.to_string().contains("monotone"), "names the ladder violation");
+        assert!(
+            m.contains("301") && m.contains("300") && m.contains("revocation"),
+            "got: {m}"
+        );
+        let e = FailStaticError::BelowAgentTokenTtl {
+            static_max: 5,
+            agent_token_ttl: 60,
+        };
+        assert!(
+            e.to_string().contains("agent-token"),
+            "names the agent-token bound"
+        );
+        let e = FailStaticError::FreshExceedsStatic {
+            fresh_ttl: 9,
+            static_max: 8,
+        };
+        assert!(
+            e.to_string().contains("monotone"),
+            "names the ladder violation"
+        );
     }
 
     /// The `Debug` impl prints the window bounds + the live signal counters (kills the Debug
@@ -713,16 +827,28 @@ mod tests {
     #[test]
     fn debug_shows_bounds_and_counters_not_cached_values() {
         let clock = TestClock::at(0);
-        let fs = FailStatic::<u32, _>::try_new_with_clock(10, 100, drill_bound(), clock)
-            .expect("valid");
+        let fs =
+            FailStatic::<u32, _>::try_new_with_clock(10, 100, drill_bound(), clock).expect("valid");
         // 57005 == 0xDEAD: a recognisable cached value we assert never appears in the debug output.
         assert_eq!(fs.get("k", || Ok(57005_u32)), Answer::Fresh(57005));
         let dbg = format!("{fs:?}");
-        assert!(dbg.contains("fresh_ttl"), "prints the fresh_ttl bound: {dbg}");
-        assert!(dbg.contains("static_max"), "prints the static_max bound: {dbg}");
+        assert!(
+            dbg.contains("fresh_ttl"),
+            "prints the fresh_ttl bound: {dbg}"
+        );
+        assert!(
+            dbg.contains("static_max"),
+            "prints the static_max bound: {dbg}"
+        );
         assert!(dbg.contains("10"), "prints the fresh_ttl value (10): {dbg}");
-        assert!(dbg.contains("100"), "prints the static_max value (100): {dbg}");
-        assert!(!dbg.contains("57005"), "the cached coarse-grant value must NOT leak into Debug: {dbg}");
+        assert!(
+            dbg.contains("100"),
+            "prints the static_max value (100): {dbg}"
+        );
+        assert!(
+            !dbg.contains("57005"),
+            "the cached coarse-grant value must NOT leak into Debug: {dbg}"
+        );
     }
 
     /// The production `SystemClock` returns real wall-seconds — a plausibly-large value that does not
@@ -733,7 +859,10 @@ mod tests {
         let c = SystemClock;
         let a = c.now_secs();
         // well past 2020 (1_577_836_800 == 2020-01-01Z) — proves it is NOT the constant 0 or 1.
-        assert!(a > 1_577_836_800, "SystemClock reads real wall time, got {a}");
+        assert!(
+            a > 1_577_836_800,
+            "SystemClock reads real wall time, got {a}"
+        );
         let b = c.now_secs();
         assert!(b >= a, "wall time does not run backwards across two reads");
     }

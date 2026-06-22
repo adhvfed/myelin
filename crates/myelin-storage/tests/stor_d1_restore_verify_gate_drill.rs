@@ -47,9 +47,17 @@ fn tenant(s: &str) -> TenantId {
 /// Backups covering offsets `0..=tail` (a base at 0 + the WAL tail archived to `tail`).
 fn reachable_archiver(tail: u64) -> ContinuousArchiver {
     let mut arch = ContinuousArchiver::new();
-    arch.archive_segment(WalSegment { end_offset: 0, committed_at: 0 }).unwrap();
+    arch.archive_segment(WalSegment {
+        end_offset: 0,
+        committed_at: 0,
+    })
+    .unwrap();
     arch.take_base_backup(1);
-    arch.archive_segment(WalSegment { end_offset: tail, committed_at: 10 }).unwrap();
+    arch.archive_segment(WalSegment {
+        end_offset: tail,
+        committed_at: 10,
+    })
+    .unwrap();
     arch
 }
 
@@ -91,7 +99,8 @@ fn stor_d1_restore_verify_gate_greens_a_whole_restore() {
     kms.ensure_kek(&KekId::new(live.clone(), region()));
     kms.ensure_dek(&live, &region(), KeyClass::Tenant).unwrap();
     kms.ensure_kek(&KekId::new(erased.clone(), region()));
-    kms.ensure_dek(&erased, &region(), KeyClass::Tenant).unwrap();
+    kms.ensure_dek(&erased, &region(), KeyClass::Tenant)
+        .unwrap();
     // The erased tenant was crypto-shredded BEFORE the backup — it must stay dead across the restore.
     assert!(kms.destroy_kek(&KekId::new(erased.clone(), region())));
 
@@ -103,9 +112,21 @@ fn stor_d1_restore_verify_gate_greens_a_whole_restore() {
     let mut source = SourceLog::new();
     source.append(90, "r90").append(100, "r100");
     let rows = vec![
-        WalRow { id: "r90".into(), written_at: 90, blob_ref: Some(objects[0].content_address.clone()) },
-        WalRow { id: "r100".into(), written_at: 100, blob_ref: Some(objects[1].content_address.clone()) },
-        WalRow { id: "r-future".into(), written_at: 250, blob_ref: None }, // > T → dropped
+        WalRow {
+            id: "r90".into(),
+            written_at: 90,
+            blob_ref: Some(objects[0].content_address.clone()),
+        },
+        WalRow {
+            id: "r100".into(),
+            written_at: 100,
+            blob_ref: Some(objects[1].content_address.clone()),
+        },
+        WalRow {
+            id: "r-future".into(),
+            written_at: 250,
+            blob_ref: None,
+        }, // > T → dropped
     ];
     let mut ledger = ErasureLedger::new();
     ledger.record_erased(erased.clone());
@@ -126,22 +147,41 @@ fn stor_d1_restore_verify_gate_greens_a_whole_restore() {
     let artifact = gate
         .run_or_fail_ci(&inputs)
         .expect("a whole restore must GREEN — the permanent gate passes");
-    assert_eq!(artifact.restored_to_offset, target, "restore_verify landed at T");
+    assert_eq!(
+        artifact.restored_to_offset, target,
+        "restore_verify landed at T"
+    );
     assert_eq!(artifact.oltp_row_count, 2, "the future row was dropped");
-    assert_eq!(artifact.objects_verified, 2, "both referenced objects checksum-parity-verified");
+    assert_eq!(
+        artifact.objects_verified, 2,
+        "both referenced objects checksum-parity-verified"
+    );
     assert_eq!(artifact.dangling_ref_count, 0, "dangling_ref_count == 0");
     assert_eq!(artifact.checksum_mismatches, 0, "checksum parity holds");
-    assert_eq!(artifact.cross_seam_mismatches, 0, "one consistent cross-seam point");
-    assert_eq!(artifact.resurrected_subjects, 0, "the erased tenant stayed erased");
+    assert_eq!(
+        artifact.cross_seam_mismatches, 0,
+        "one consistent cross-seam point"
+    );
+    assert_eq!(
+        artifact.resurrected_subjects, 0,
+        "the erased tenant stayed erased"
+    );
 
     // (b) the harness cross-seam assertion (the SUB-D6 one) AGREES with the gate's native check.
-    let report = myelin_storage::restore_to_offset(&arch, target, &rows, &{
-        let mut p = myelin_storage::BlobPresence::new();
-        for o in &objects {
-            p.insert(o.content_address.clone());
-        }
-        p
-    }, &source, &kms)
+    let report = myelin_storage::restore_to_offset(
+        &arch,
+        target,
+        &rows,
+        &{
+            let mut p = myelin_storage::BlobPresence::new();
+            for o in &objects {
+                p.insert(o.content_address.clone());
+            }
+            p
+        },
+        &source,
+        &kms,
+    )
     .expect("the restore the gate drove");
     let snapshot = to_harness_snapshot(&report, &objects);
     let cross_seam = snapshot.verify_cross_seam();
@@ -153,7 +193,10 @@ fn stor_d1_restore_verify_gate_greens_a_whole_restore() {
 
     // The green artifact: emit the cross-seam telemetry observably (the SAME signal every drill uses).
     let mut signals = SignalSource::new();
-    signals.set_scalar(SignalName::RestoreCrossSeamMismatch, cross_seam.mismatch_count());
+    signals.set_scalar(
+        SignalName::RestoreCrossSeamMismatch,
+        cross_seam.mismatch_count(),
+    );
     signals
         .assert_signal(SignalName::RestoreCrossSeamMismatch, Predicate::Eq(0))
         .expect_green();
@@ -184,13 +227,26 @@ fn stor_d1_gate_fails_ci_on_a_corrupted_backup() {
     let objects = vec![present.clone()];
     let source = SourceLog::new();
     let rows = vec![
-        WalRow { id: "ok".into(), written_at: 50, blob_ref: Some(present.content_address.clone()) },
-        WalRow { id: "corrupt".into(), written_at: 90, blob_ref: Some(missing_addr) },
+        WalRow {
+            id: "ok".into(),
+            written_at: 50,
+            blob_ref: Some(present.content_address.clone()),
+        },
+        WalRow {
+            id: "corrupt".into(),
+            written_at: 90,
+            blob_ref: Some(missing_addr),
+        },
     ];
     let ledger = ErasureLedger::new();
     let inputs = GateInputs {
-        archiver: &arch, target: 100, rows: &rows, objects: &objects,
-        source: &source, kms: &kms, erasure_ledger: &ledger,
+        archiver: &arch,
+        target: 100,
+        rows: &rows,
+        objects: &objects,
+        source: &source,
+        kms: &kms,
+        erasure_ledger: &ledger,
     };
 
     let err = RestoreVerifyGate::new()
@@ -213,21 +269,36 @@ fn stor_d1_gate_fails_ci_on_a_checksum_mismatch() {
     kms.ensure_dek(&t, &region(), KeyClass::Tenant).unwrap();
     let arch = reachable_archiver(300);
     let address = ContentHash::blake3(b"good-bytes");
-    let corrupt = RestoredObject { content_address: address.clone(), bytes: b"TAMPERED".to_vec() };
+    let corrupt = RestoredObject {
+        content_address: address.clone(),
+        bytes: b"TAMPERED".to_vec(),
+    };
     let objects = vec![corrupt];
     let source = SourceLog::new();
-    let rows = vec![WalRow { id: "r1".into(), written_at: 50, blob_ref: Some(address.clone()) }];
+    let rows = vec![WalRow {
+        id: "r1".into(),
+        written_at: 50,
+        blob_ref: Some(address.clone()),
+    }];
     let ledger = ErasureLedger::new();
     let inputs = GateInputs {
-        archiver: &arch, target: 100, rows: &rows, objects: &objects,
-        source: &source, kms: &kms, erasure_ledger: &ledger,
+        archiver: &arch,
+        target: 100,
+        rows: &rows,
+        objects: &objects,
+        source: &source,
+        kms: &kms,
+        erasure_ledger: &ledger,
     };
 
     let err = RestoreVerifyGate::new()
         .run_or_fail_ci(&inputs)
         .expect_err("a present-but-corrupt object MUST fail CI (checksum parity)");
     assert!(matches!(err, GateFailure::ChecksumMismatch { .. }), "{err}");
-    assert!(err.to_string().contains("CHECKSUM MISMATCH"), "loud + specific: {err}");
+    assert!(
+        err.to_string().contains("CHECKSUM MISMATCH"),
+        "loud + specific: {err}"
+    );
 }
 
 /// **The gate CATCHES a resurrected erased subject → FAILs CI** (the erasure-held leg / §7.5 — the
@@ -239,7 +310,8 @@ fn stor_d1_gate_fails_ci_on_a_resurrected_erased_subject() {
     let kms = KmsEngine::new();
     // The key IS in the KMS (the restore WILL bring it back) — but the ledger says it was erased.
     kms.ensure_kek(&KekId::new(resurrected.clone(), region()));
-    kms.ensure_dek(&resurrected, &region(), KeyClass::Tenant).unwrap();
+    kms.ensure_dek(&resurrected, &region(), KeyClass::Tenant)
+        .unwrap();
     let arch = reachable_archiver(300);
     let objects: Vec<RestoredObject> = vec![];
     let source = SourceLog::new();
@@ -247,14 +319,24 @@ fn stor_d1_gate_fails_ci_on_a_resurrected_erased_subject() {
     let mut ledger = ErasureLedger::new();
     ledger.record_erased(resurrected.clone());
     let inputs = GateInputs {
-        archiver: &arch, target: 100, rows: &rows, objects: &objects,
-        source: &source, kms: &kms, erasure_ledger: &ledger,
+        archiver: &arch,
+        target: 100,
+        rows: &rows,
+        objects: &objects,
+        source: &source,
+        kms: &kms,
+        erasure_ledger: &ledger,
     };
 
     let err = RestoreVerifyGate::new()
         .run_or_fail_ci(&inputs)
         .expect_err("a resurrected erased subject MUST fail CI");
-    assert_eq!(err, GateFailure::ErasureResurrected { tenant: resurrected });
+    assert_eq!(
+        err,
+        GateFailure::ErasureResurrected {
+            tenant: resurrected
+        }
+    );
 }
 
 /// **The gate is wired LOUD-NEVER-SWALLOWED (EI-01 §5): a swallowing wrapper is structurally
@@ -271,26 +353,47 @@ fn stor_d1_gate_is_loud_never_swallowed() {
     kms.ensure_dek(&t, &region(), KeyClass::Tenant).unwrap();
     let arch = reachable_archiver(300);
     let address = ContentHash::blake3(b"good");
-    let corrupt = RestoredObject { content_address: address.clone(), bytes: b"BAD".to_vec() };
+    let corrupt = RestoredObject {
+        content_address: address.clone(),
+        bytes: b"BAD".to_vec(),
+    };
     let objects = vec![corrupt];
     let source = SourceLog::new();
-    let rows = vec![WalRow { id: "r1".into(), written_at: 50, blob_ref: Some(address) }];
+    let rows = vec![WalRow {
+        id: "r1".into(),
+        written_at: 50,
+        blob_ref: Some(address),
+    }];
     let ledger = ErasureLedger::new();
     let inputs = GateInputs {
-        archiver: &arch, target: 100, rows: &rows, objects: &objects,
-        source: &source, kms: &kms, erasure_ledger: &ledger,
+        archiver: &arch,
+        target: 100,
+        rows: &rows,
+        objects: &objects,
+        source: &source,
+        kms: &kms,
+        erasure_ledger: &ledger,
     };
 
     // The blessed CI path: `?` propagates the failure (process exits non-zero). A swallow that turns
     // this into a silent pass is the EI-01 §5 violation the gate forbids — the verdict is `#[must_use]`,
     // and the only Ok-yielding consumer (`run_or_fail_ci`) returns Err on a red.
     let result = RestoreVerifyGate::new().run_or_fail_ci(&inputs);
-    assert!(result.is_err(), "a red restore MUST surface as Err — never swallowed into Ok/true");
+    assert!(
+        result.is_err(),
+        "a red restore MUST surface as Err — never swallowed into Ok/true"
+    );
 
     // Demonstrate the swallow would be a BUG: if a caller wrote `let _ = gate.run(&inputs);` the
     // #[must_use] warns; if they coerced to a bool and ignored it, the red is lost. We assert the
     // verdict carries the failure so a correct caller cannot miss it.
     let verdict = RestoreVerifyGate::new().run(&inputs);
-    assert!(!verdict.is_green(), "the red verdict is observable, never a hidden pass");
-    assert!(verdict.failure().is_some(), "a red verdict names the failure (loud)");
+    assert!(
+        !verdict.is_green(),
+        "the red verdict is observable, never a hidden pass"
+    );
+    assert!(
+        verdict.failure().is_some(),
+        "a red verdict names the failure (loud)"
+    );
 }

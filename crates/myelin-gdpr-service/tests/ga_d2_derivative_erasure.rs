@@ -37,8 +37,8 @@
 
 use myelin_gdpr::{EraseScope, PersonalDataHolder, SubjectRef, TenantId};
 use myelin_gdpr_service::{
-    DerivativeErasureDriver, NotifHistoryHolder, NotifHistoryModel, RefsGraphHolder, RefsGraphModel,
-    RefsResolve, SearchIndexHolder, SearchIndexModel, ERASED_USER,
+    DerivativeErasureDriver, NotifHistoryHolder, NotifHistoryModel, RefsGraphHolder,
+    RefsGraphModel, RefsResolve, SearchIndexHolder, SearchIndexModel, ERASED_USER,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 
@@ -51,7 +51,10 @@ fn subject(id: &str) -> SubjectRef {
 }
 
 fn scope(id: &str) -> EraseScope {
-    EraseScope::Subject { subject: subject(id), tenant: TenantId::from_token("acme") }
+    EraseScope::Subject {
+        subject: subject(id),
+        tenant: TenantId::from_token("acme"),
+    }
 }
 
 /// **The P-GA-24 GATE: GA-D2 + REF-D5 + NOTIF-D6, chained end-to-end over the derived stores.** A
@@ -73,7 +76,11 @@ fn ga_d2_ref_d5_notif_d6_derivative_erasure_fan_out_is_green() {
 
     // BEFORE erase: indexed + re-identifiable, edge resolves Live, mention renders the token.
     assert_eq!(search.hits("victim"), 1, "indexed before erase");
-    assert_eq!(search.reidentify_hits("victim"), 1, "embedding re-identifies before erase");
+    assert_eq!(
+        search.reidentify_hits("victim"),
+        1,
+        "embedding re-identifies before erase"
+    );
     assert_eq!(refs.resolve("victim"), RefsResolve::Live("issue:99".into()));
     assert_eq!(notif.render_mention("inbox-1").as_deref(), Some("victim"));
 
@@ -100,7 +107,10 @@ fn ga_d2_ref_d5_notif_d6_derivative_erasure_fan_out_is_green() {
         0,
         "GA-D2: 0 embedding re-identification (purged, NOT hidden) — the measured number"
     );
-    assert!(receipt.embeddings_purged, "GA-D2: the embedding-purge receipt records the purge");
+    assert!(
+        receipt.embeddings_purged,
+        "GA-D2: the embedding-purge receipt records the purge"
+    );
 
     // ── REF-D5: refs tombstone, 0 recoverable PII, no resolve-500.
     assert_eq!(
@@ -108,8 +118,15 @@ fn ga_d2_ref_d5_notif_d6_derivative_erasure_fan_out_is_green() {
         RefsResolve::Tombstone,
         "REF-D5: a resolve returns the tombstone, NOT a 500"
     );
-    assert_eq!(refs.recoverable_edges("victim"), 0, "REF-D5: 0 recoverable edges");
-    assert!(receipt.refs_tombstoned, "REF-D5: the receipt records the tombstone");
+    assert_eq!(
+        refs.recoverable_edges("victim"),
+        0,
+        "REF-D5: 0 recoverable edges"
+    );
+    assert!(
+        receipt.refs_tombstoned,
+        "REF-D5: the receipt records the tombstone"
+    );
 
     // ── NOTIF-D6: the inbox humanises to `[erased user]`; other mentions are untouched.
     assert_eq!(
@@ -117,7 +134,10 @@ fn ga_d2_ref_d5_notif_d6_derivative_erasure_fan_out_is_green() {
         Some(ERASED_USER),
         "NOTIF-D6: the erased subject's mention humanises to [erased user]"
     );
-    assert_eq!(notif.render_mention("inbox-1").as_deref(), Some("[erased user]"));
+    assert_eq!(
+        notif.render_mention("inbox-1").as_deref(),
+        Some("[erased user]")
+    );
     assert_eq!(
         notif.render_mention("inbox-2").as_deref(),
         Some("bystander"),
@@ -126,9 +146,16 @@ fn ga_d2_ref_d5_notif_d6_derivative_erasure_fan_out_is_green() {
 
     // The green artifact: the embedding-purge receipt records all three post-conditions + the
     // per-holder receipts (Search + Refs + Notif), each content-addressed.
-    assert_eq!(receipt.holder_receipts.len(), 3, "Search + Refs + Notif receipts collected");
+    assert_eq!(
+        receipt.holder_receipts.len(),
+        3,
+        "Search + Refs + Notif receipts collected"
+    );
     for hr in &receipt.holder_receipts {
-        assert!(hr.receipt.content_hash.starts_with("blake3:"), "each derivative receipt is content-addressed");
+        assert!(
+            hr.receipt.content_hash.starts_with("blake3:"),
+            "each derivative receipt is content-addressed"
+        );
     }
 }
 
@@ -165,5 +192,8 @@ fn rectification_via_reindex_from_source_rebuilds_drift_is_zero() {
         "Refs rebuilt the edge from the corrected source"
     );
     assert_eq!(search.projection("subj").as_deref(), Some("corrected name"));
-    assert_eq!(refs.resolve("subj"), RefsResolve::Live("corrected-target".into()));
+    assert_eq!(
+        refs.resolve("subj"),
+        RefsResolve::Live("corrected-target".into())
+    );
 }

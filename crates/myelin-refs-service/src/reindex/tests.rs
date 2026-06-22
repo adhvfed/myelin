@@ -7,9 +7,7 @@
 
 use super::*;
 
-use myelin_events::{
-    Actor, CorrelationId, EventId, OutboxStore, Timestamp,
-};
+use myelin_events::{Actor, CorrelationId, EventId, OutboxStore, Timestamp};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 
 fn tenant() -> TenantId {
@@ -19,7 +17,11 @@ fn region() -> Region {
     Region("fr-par".into())
 }
 fn principal() -> Principal {
-    Principal::stub(PrincipalId("platform".into()), PrincipalKind::Service, tenant())
+    Principal::stub(
+        PrincipalId("platform".into()),
+        PrincipalKind::Service,
+        tenant(),
+    )
 }
 
 fn ctx_base() -> EmitContextBase {
@@ -48,7 +50,12 @@ fn source_edge(agg: &str, version: u64, source: &str, target: &str, rel: &str) -
 
 /// A live edge event (the SAME shape the producer emits live) — used to build the LIVE reference
 /// projection the cold rebuild must byte-match.
-fn live_edge_event(id: &str, source: &str, target: &str, rel: &str) -> myelin_events::EventEnvelope {
+fn live_edge_event(
+    id: &str,
+    source: &str,
+    target: &str,
+    rel: &str,
+) -> myelin_events::EventEnvelope {
     use myelin_events::{AggregateKey, DataRole, EventType, Visibility};
     myelin_events::EventEnvelope {
         event_id: EventId(id.into()),
@@ -98,8 +105,14 @@ fn refs_source_replays_source_of_truth_as_snapshot_drafts() {
     assert_eq!(drafts.len(), 2, "the whole scope replays (since=None)");
     // the snapshot type + the edge payload shape (cold == live).
     assert_eq!(drafts[0].type_.0, REFS_EDGE_SNAPSHOT_TYPE);
-    assert_eq!(drafts[0].payload.get("source").and_then(|v| v.as_str()), Some("s1"));
-    assert_eq!(drafts[0].payload.get("rel").and_then(|v| v.as_str()), Some("mentions"));
+    assert_eq!(
+        drafts[0].payload.get("source").and_then(|v| v.as_str()),
+        Some("s1")
+    );
+    assert_eq!(
+        drafts[0].payload.get("rel").and_then(|v| v.as_str()),
+        Some("mentions")
+    );
 }
 
 /// **The `since` cursor replays only newer versions (the incremental backfill path).**
@@ -109,7 +122,11 @@ fn refs_source_since_cursor_replays_only_newer_versions() {
     src.record(source_edge("refs.edge:a", 1, "s1", "t1", "mentions"));
     src.record(source_edge("refs.edge:b", 5, "s2", "t2", "embeds"));
     let drafts = src.replay(&scope(), Some(3));
-    assert_eq!(drafts.len(), 1, "only the version-5 edge replays past since=3");
+    assert_eq!(
+        drafts.len(),
+        1,
+        "only the version-5 edge replays past since=3"
+    );
     assert_eq!(drafts[0].version, 5);
 }
 
@@ -120,8 +137,14 @@ fn erased_aggregate_is_not_re_snapshotted_x7() {
     let mut src = RefsReindexSource::new();
     src.record(source_edge("refs.edge:a", 1, "s1", "t1", "mentions"));
     src.record(source_edge("refs.edge:b", 1, "s2", "t2", "embeds"));
-    assert!(src.erase("refs.edge:a"), "erase reports it removed the aggregate");
-    assert!(!src.erase("refs.edge:a"), "erasing an absent aggregate is an idempotent no-op");
+    assert!(
+        src.erase("refs.edge:a"),
+        "erase reports it removed the aggregate"
+    );
+    assert!(
+        !src.erase("refs.edge:a"),
+        "erasing an absent aggregate is an idempotent no-op"
+    );
 
     let drafts = src.replay(&scope(), None);
     assert_eq!(drafts.len(), 1, "the erased aggregate is NOT replayed");
@@ -143,36 +166,64 @@ fn reindex_from_source_rebuilds_byte_parity_cold_equals_live() {
     let live_builder = RefsEdgeBuilder::new(EdgeProjection::new());
     live_builder.handle(&live_edge_event("01J-1", "s1", "t1", "mentions"));
     live_builder.handle(&live_edge_event("01J-2", "s2", "t2", "embeds"));
-    live_builder.handle(&live_edge_event("01J-3", "s3#block-9", "t3#block-3", "embeds"));
+    live_builder.handle(&live_edge_event(
+        "01J-3",
+        "s3#block-9",
+        "t3#block-3",
+        "embeds",
+    ));
     let live = live_builder.projection().clone();
-    assert_eq!(live.live_count(&tenant(), &region()), 3, "the live index holds 3 edges");
+    assert_eq!(
+        live.live_count(&tenant(), &region()),
+        3,
+        "the live index holds 3 edges"
+    );
 
     // ── COLD rebuild: wipe + rebuild ONLY from the snapshot replay (no owner-DB backdoor). ──
     let reindexer = RefsReindexer::new(RefsEdgeBuilder::new(EdgeProjection::new()));
     // Seed the cold index with STALE rows first, so the WIPE is load-bearing (a mutant that skips the
     // wipe would leave these and break byte-parity).
-    reindexer.builder().handle(&live_edge_event("stale-1", "GONE", "GONE2", "links"));
-    assert_eq!(reindexer.projection().live_count(&tenant(), &region()), 1, "stale pre-state");
+    reindexer
+        .builder()
+        .handle(&live_edge_event("stale-1", "GONE", "GONE2", "links"));
+    assert_eq!(
+        reindexer.projection().live_count(&tenant(), &region()),
+        1,
+        "stale pre-state"
+    );
 
     // The owner's source of truth (mirrors the live log — that is what cold==live MEANS).
     let mut src = RefsReindexSource::new();
     src.record(source_edge("refs.edge:1", 1, "s1", "t1", "mentions"));
     src.record(source_edge("refs.edge:2", 1, "s2", "t2", "embeds"));
-    src.record(source_edge("refs.edge:3", 1, "s3#block-9", "t3#block-3", "embeds"));
+    src.record(source_edge(
+        "refs.edge:3",
+        1,
+        "s3#block-9",
+        "t3#block-3",
+        "embeds",
+    ));
 
     let mut outbox = OutboxStore::new();
     let receipt = reindexer
         .reindex(&scope(), None, &src, &mut outbox, ctx_base())
         .expect("reindex succeeds");
     assert_eq!(receipt.snapshots_emitted, 3, "3 snapshots emitted");
-    assert_eq!(receipt.ingested, 3, "3 snapshots ingested through the live consumer");
+    assert_eq!(
+        receipt.ingested, 3,
+        "3 snapshots ingested through the live consumer"
+    );
 
     // The rebuilt partition byte-matches the live partition (the §4.7 equality).
     assert!(
         reindexer.verify_parity(&live, &tenant(), &region()),
         "the rebuilt index byte-matches the live index (cold == live)"
     );
-    assert_eq!(receipt.parity_hash, live.parity_hash(&tenant(), &region()), "the parity HASH matches");
+    assert_eq!(
+        receipt.parity_hash,
+        live.parity_hash(&tenant(), &region()),
+        "the parity HASH matches"
+    );
     assert_eq!(
         reindexer.reindex_parity(),
         1,
@@ -180,7 +231,11 @@ fn reindex_from_source_rebuilds_byte_parity_cold_equals_live() {
         RefsReindexer::REINDEX_PARITY_SIGNAL,
     );
     // The stale pre-state row is GONE (the wipe was load-bearing).
-    assert_eq!(reindexer.projection().live_count(&tenant(), &region()), 3, "exactly the live set");
+    assert_eq!(
+        reindexer.projection().live_count(&tenant(), &region()),
+        3,
+        "exactly the live set"
+    );
 }
 
 /// **A re-run of the reindex emits 0 NEW snapshots (idempotent on the deterministic id).** The second
@@ -205,9 +260,15 @@ fn reindex_rerun_emits_zero_new_and_stays_byte_parity() {
     let r2 = reindexer
         .reindex(&scope(), None, &src, &mut outbox, ctx_base())
         .expect("second reindex");
-    assert_eq!(r2.snapshots_emitted, 0, "a re-run emits 0 NEW (idempotent on the deterministic id)");
+    assert_eq!(
+        r2.snapshots_emitted, 0,
+        "a re-run emits 0 NEW (idempotent on the deterministic id)"
+    );
     assert_eq!(r2.snapshots_skipped_duplicate, 1);
-    assert!(reindexer.verify_parity(&live, &tenant(), &region()), "still byte-parity after the re-run");
+    assert!(
+        reindexer.verify_parity(&live, &tenant(), &region()),
+        "still byte-parity after the re-run"
+    );
 }
 
 /// **The `reindex_parity` telemetry reads 0 on DRIFT (a failed recovery is LOUD + observable).** If the
@@ -229,8 +290,15 @@ fn reindex_parity_telemetry_is_zero_on_drift() {
         .reindex(&scope(), None, &src, &mut outbox, ctx_base())
         .expect("reindex");
 
-    assert!(!reindexer.verify_parity(&live, &tenant(), &region()), "the rebuild DRIFTED");
-    assert_eq!(reindexer.reindex_parity(), 0, "the telemetry reads 0 (failed recovery — LOUD)");
+    assert!(
+        !reindexer.verify_parity(&live, &tenant(), &region()),
+        "the rebuild DRIFTED"
+    );
+    assert_eq!(
+        reindexer.reindex_parity(),
+        0,
+        "the telemetry reads 0 (failed recovery — LOUD)"
+    );
 }
 
 /// **A structurally-malformed snapshot is a LOUD poison on rebuild (fail-closed), never a silent
@@ -249,7 +317,10 @@ fn malformed_snapshot_fails_the_rebuild_loudly() {
     malformed.payload = serde_json::json!({ "target": "t", "rel": "mentions" }); // no source.
     match reindexer.builder().handle(&malformed) {
         myelin_events::HandleOutcome::NonRetryable(myelin_events::Reason(r)) => {
-            assert!(r.contains("source"), "the poison names the missing field: {r}");
+            assert!(
+                r.contains("source"),
+                "the poison names the missing field: {r}"
+            );
         }
         other => panic!("a malformed snapshot must be a non-retryable poison, got {other:?}"),
     }
@@ -294,14 +365,27 @@ fn te7_drift_reconverges_to_typed_table_typed_wins() {
     let (reprojected, tombstoned) = reindexer
         .reconverge_typed(&tenant(), &region(), &typed_truth, &covered, "reindex-1")
         .expect("reconverge");
-    assert_eq!(reprojected, 2, "the typed event projects forward + inverse (blocks + blocked_by)");
-    assert_eq!(tombstoned, 1, "the spurious drift edge is tombstoned (typed wins)");
+    assert_eq!(
+        reprojected, 2,
+        "the typed event projects forward + inverse (blocks + blocked_by)"
+    );
+    assert_eq!(
+        tombstoned, 1,
+        "the spurious drift edge is tombstoned (typed wins)"
+    );
 
     // The live inbound set to ENG-2 is exactly the typed-backed `blocks` edge (ENG-1→ENG-2); the
     // spurious ENG-9→ENG-2 is gone.
     let inbound = proj.inbound_live(&tenant(), &region(), &covered[0]);
-    assert_eq!(inbound.len(), 1, "exactly the typed-backed inbound edge survives");
-    assert_eq!(inbound[0].source.0, "myelin://acme/issue/issue/ENG-1", "the typed source wins");
+    assert_eq!(
+        inbound.len(),
+        1,
+        "exactly the typed-backed inbound edge survives"
+    );
+    assert_eq!(
+        inbound[0].source.0, "myelin://acme/issue/issue/ENG-1",
+        "the typed source wins"
+    );
 }
 
 /// **`reference`-class edges are NEVER touched by the TE-7 reconvergence (they are Refs-authoritative).**
@@ -325,7 +409,10 @@ fn reconverge_leaves_reference_class_edges_untouched() {
         .expect("reconverge");
     assert_eq!(tombstoned, 0, "no lifecycle drift to tombstone");
     assert_eq!(
-        reindexer.projection().inbound_live(&tenant(), &region(), &covered[0]).len(),
+        reindexer
+            .projection()
+            .inbound_live(&tenant(), &region(), &covered[0])
+            .len(),
         1,
         "the reference-class edge is Refs-authoritative — untouched by reconvergence",
     );
@@ -338,7 +425,9 @@ fn reconverge_leaves_reference_class_edges_untouched() {
 fn incremental_backfill_extends_does_not_wipe() {
     let reindexer = RefsReindexer::new(RefsEdgeBuilder::new(EdgeProjection::new()));
     // An existing edge in the index (from steady-state).
-    reindexer.builder().handle(&live_edge_event("01J-existing", "s0", "t0", "links"));
+    reindexer
+        .builder()
+        .handle(&live_edge_event("01J-existing", "s0", "t0", "links"));
     assert_eq!(reindexer.projection().live_count(&tenant(), &region()), 1);
 
     let mut src = RefsReindexSource::new();
@@ -359,7 +448,11 @@ fn incremental_backfill_extends_does_not_wipe() {
 /// **The `reindex_parity` signal NAME is the named constant (drills assert against the name).**
 #[test]
 fn reindex_parity_signal_is_named() {
-    assert_eq!(RefsReindexer::REINDEX_PARITY_SIGNAL, "refs.reindex_parity", "contract-1.8 signal name");
+    assert_eq!(
+        RefsReindexer::REINDEX_PARITY_SIGNAL,
+        "refs.reindex_parity",
+        "contract-1.8 signal name"
+    );
     // a fresh reindexer starts un-drifted (parity = 1).
     let r = RefsReindexer::new(RefsEdgeBuilder::new(EdgeProjection::new()));
     assert_eq!(r.reindex_parity(), 1, "a fresh reindexer has not drifted");

@@ -307,7 +307,11 @@ mod tests {
         Region("fr-par".into())
     }
     fn principal() -> Principal {
-        Principal::stub(PrincipalId("p-opaque-7".into()), PrincipalKind::Human, tenant())
+        Principal::stub(
+            PrincipalId("p-opaque-7".into()),
+            PrincipalKind::Human,
+            tenant(),
+        )
     }
     fn source_doc() -> ArtifactRef {
         ArtifactRef("myelin://acme/chat/message/m1".into())
@@ -351,7 +355,10 @@ mod tests {
     }
 
     fn store_and_minter() -> (OutboxStore, Arc<dyn IdMinter>) {
-        (OutboxStore::new(), Arc::new(MonotonicMinter::new()) as Arc<dyn IdMinter>)
+        (
+            OutboxStore::new(),
+            Arc::new(MonotonicMinter::new()) as Arc<dyn IdMinter>,
+        )
     }
 
     fn one_link_doc() -> Vec<InlineNode> {
@@ -376,7 +383,11 @@ mod tests {
     /// chain UNDER the ceiling and defeat the loop guard — the leak-of-runaway-critical case).
     #[test]
     fn stamped_depth_saturates_never_wraps() {
-        assert_eq!(stamped_depth(&content_event(u32::MAX)), u32::MAX, "saturates, never wraps to 0");
+        assert_eq!(
+            stamped_depth(&content_event(u32::MAX)),
+            u32::MAX,
+            "saturates, never wraps to 0"
+        );
     }
 
     /// **The drill (REF-P9 reason to exist): a guarded emit stamps every `refs.edge.*` at
@@ -397,7 +408,10 @@ mod tests {
 
         let ids = match decision {
             GuardDecision::Emitted { ids, stamped_depth } => {
-                assert_eq!(stamped_depth, 4, "the +1 stamp: content depth 3 → edge depth 4");
+                assert_eq!(
+                    stamped_depth, 4,
+                    "the +1 stamp: content depth 3 → edge depth 4"
+                );
                 ids
             }
             other => panic!("expected Emitted, got {other:?}"),
@@ -405,7 +419,10 @@ mod tests {
         assert_eq!(ids.len(), 1, "one structured node → one edge");
         // The DURABLE emitted envelope carries the +1 stamp (read off the committed outbox row).
         let row = store.row(&ids[0]).expect("committed edge row present");
-        assert_eq!(row.envelope.depth, 4, "every emitted refs.edge.* carries content.depth + 1");
+        assert_eq!(
+            row.envelope.depth, 4,
+            "every emitted refs.edge.* carries content.depth + 1"
+        );
         assert_eq!(
             row.envelope.correlation_id, content.correlation_id,
             "the correlation root carries (BUS-5)"
@@ -416,8 +433,16 @@ mod tests {
             "causation = the content event"
         );
         // The causal-depth telemetry (1.8) recorded the deepest hop.
-        assert_eq!(guard.causal_depth_max(), 4, "bus.causal_depth_max recorded the +1 hop");
-        assert_eq!(guard.ceiling_tripwire_firings(), 0, "below the ceiling → no tripwire");
+        assert_eq!(
+            guard.causal_depth_max(),
+            4,
+            "bus.causal_depth_max recorded the +1 hop"
+        );
+        assert_eq!(
+            guard.ceiling_tripwire_firings(),
+            0,
+            "below the ceiling → no tripwire"
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -428,8 +453,14 @@ mod tests {
     /// source; a `mention` (`mentions`) is a NOTIFY, never an auto re-trigger (AG-6 / CHAT-1).**
     #[test]
     fn only_artifact_ref_and_embed_are_retrigger_sources() {
-        assert!(is_retrigger_source(EdgeRel::Links), "artifact_ref node re-triggers");
-        assert!(is_retrigger_source(EdgeRel::Embeds), "embed node re-triggers");
+        assert!(
+            is_retrigger_source(EdgeRel::Links),
+            "artifact_ref node re-triggers"
+        );
+        assert!(
+            is_retrigger_source(EdgeRel::Embeds),
+            "embed node re-triggers"
+        );
         assert!(
             !is_retrigger_source(EdgeRel::Mentions),
             "a mention notifies, it does not auto re-trigger (CHAT-1)"
@@ -489,12 +520,24 @@ mod tests {
 
         match decision {
             GuardDecision::CeilingParked { would_be_depth } => {
-                assert_eq!(would_be_depth, CAUSAL_DEPTH_CEILING + 1, "the parked edge would be over");
+                assert_eq!(
+                    would_be_depth,
+                    CAUSAL_DEPTH_CEILING + 1,
+                    "the parked edge would be over"
+                );
             }
             other => panic!("expected CeilingParked, got {other:?}"),
         }
-        assert_eq!(store.outbox_depth(), 0, "the chain halts ≤ ceiling → 0 edges emitted");
-        assert_eq!(guard.ceiling_tripwire_firings(), 1, "the tripwire fired exactly once");
+        assert_eq!(
+            store.outbox_depth(),
+            0,
+            "the chain halts ≤ ceiling → 0 edges emitted"
+        );
+        assert_eq!(
+            guard.ceiling_tripwire_firings(),
+            1,
+            "the tripwire fired exactly once"
+        );
         assert_eq!(
             guard.causal_depth_max(),
             CAUSAL_DEPTH_CEILING + 1,
@@ -522,17 +565,30 @@ mod tests {
             match decision {
                 GuardDecision::Emitted { stamped_depth, .. } => {
                     emitted += 1;
-                    assert!(stamped_depth < 4, "an emitted edge is strictly inside the ceiling");
+                    assert!(
+                        stamped_depth < 4,
+                        "an emitted edge is strictly inside the ceiling"
+                    );
                 }
                 GuardDecision::CeilingParked { .. } => parked += 1,
             }
         }
         // causes 0,1,2 → edges 1,2,3 (inside ceiling 4); causes 3..=6 → would-be 4..=7 → parked.
-        assert_eq!(emitted, 3, "edges emitted only while strictly inside the ceiling");
+        assert_eq!(
+            emitted, 3,
+            "edges emitted only while strictly inside the ceiling"
+        );
         assert_eq!(parked, 4, "every over-ceiling hop parked");
-        assert!(guard.ceiling_tripwire_firings() >= 1, "the tripwire bounded the chain");
+        assert!(
+            guard.ceiling_tripwire_firings() >= 1,
+            "the tripwire bounded the chain"
+        );
         // The deepest stamped hop the chain reached is observable (1.8).
-        assert_eq!(guard.causal_depth_max(), 7, "bus.causal_depth_max saw the deepest would-be hop");
+        assert_eq!(
+            guard.causal_depth_max(),
+            7,
+            "bus.causal_depth_max saw the deepest would-be hop"
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -544,8 +600,14 @@ mod tests {
     /// not depend on the mid-tier query crate (DOCUMENTED). DISTINCT from the traversal ceiling 16.
     #[test]
     fn refs_ceiling_matches_the_frozen_ag6_number() {
-        assert_eq!(CAUSAL_DEPTH_CEILING, 12, "the frozen AG-6 causal-depth ceiling");
-        assert_ne!(CAUSAL_DEPTH_CEILING, 16, "NOT the Refs traversal ceiling (REF-P13 / §4.4)");
+        assert_eq!(
+            CAUSAL_DEPTH_CEILING, 12,
+            "the frozen AG-6 causal-depth ceiling"
+        );
+        assert_ne!(
+            CAUSAL_DEPTH_CEILING, 16,
+            "NOT the Refs traversal ceiling (REF-P13 / §4.4)"
+        );
     }
 
     /// The causal-depth telemetry signal name is the frozen `bus.causal_depth_max` (1.8) — the guard

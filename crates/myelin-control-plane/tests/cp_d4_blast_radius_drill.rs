@@ -52,7 +52,11 @@ fn cell(id: &str, region: &str) -> Cell {
         region: Region::new(region),
         status: CellStatus::Active,
         isolation_kind: IsolationKind::Pool,
-        capacity: Capacity { tenants_max: 1000, write_qps_max: 5000, storage_bytes_max: 1 << 40 },
+        capacity: Capacity {
+            tenants_max: 1000,
+            write_qps_max: 5000,
+            storage_bytes_max: 1 << 40,
+        },
         utilisation: 10,
         version: 1,
         endpoint: format!("cell.{region}.{id}.myelin.eu"),
@@ -96,60 +100,119 @@ fn cp_d4_cp_outage_blast_radius_placed_tenants_keep_serving() {
     let breaker = DependencyBreaker::new();
 
     // ── CP UP: the placed tenant serves (fresh route, primes the discovery cache). ──
-    let s0 = dp.serve(&cp, &reg, &acme).expect("CP up: the placed tenant serves");
+    let s0 = dp
+        .serve(&cp, &reg, &acme)
+        .expect("CP up: the placed tenant serves");
     assert!(!s0.via_fail_static, "with the CP up the route is fresh");
 
     // ── HARD-DOWN the control plane rig-wide via the injector (the CP-D4 outage). The break is
     //    reversible + scoped: it severs ONLY the control plane, Global scope, and is lifted at the
     //    end. The ControlPlane handle is driven from the injector's consult — the fault-point. ──
-    assert!(breaker.break_dependency(control_plane_dep(), Scope::Global).changed(), "the CP is severed");
+    assert!(
+        breaker
+            .break_dependency(control_plane_dep(), Scope::Global)
+            .changed(),
+        "the CP is severed"
+    );
     if breaker.is_broken(&control_plane_dep(), &Scope::Global) {
         cp.hard_down();
     }
-    assert!(cp.is_down(), "the control plane is hard-down (the CP-D4 outage)");
+    assert!(
+        cp.is_down(),
+        "the control plane is hard-down (the CP-D4 outage)"
+    );
 
     // Drive already-placed-tenant traffic during the outage: the cache is past fresh_ttl (age 100 >
     // 30) but inside static_max (300) → every request is served FAIL-STATIC (the last-known-good
     // route) — the placed tenant KEEPS SERVING entirely within its cell.
     dp.cache().clock().advance(100);
     for _ in 0..5 {
-        let s = dp.serve(&cp, &reg, &acme).expect("CP down: the placed tenant KEEPS SERVING");
-        assert!(s.via_fail_static, "the route is served fail-static while the CP is down");
-        assert_eq!(s.placement.home_cell.as_str(), "cell-w-1", "served within its cell");
+        let s = dp
+            .serve(&cp, &reg, &acme)
+            .expect("CP down: the placed tenant KEEPS SERVING");
+        assert!(
+            s.via_fail_static,
+            "the route is served fail-static while the CP is down"
+        );
+        assert_eq!(
+            s.placement.home_cell.as_str(),
+            "cell-w-1",
+            "served within its cell"
+        );
     }
 
     // SIGNUP degrades (and ONLY signup) — a new tenant cannot be placed while the CP is down.
     let degraded = signup
-        .signup(&cp, &mut reg, &Region::new("eu-west"), IsolationKind::Pool, "newco")
+        .signup(
+            &cp,
+            &mut reg,
+            &Region::new("eu-west"),
+            IsolationKind::Pool,
+            "newco",
+        )
         .expect_err("CP down: signup DEGRADES (the contained blast radius)");
-    assert!(degraded.to_string().contains("control plane hard-down"), "loud degrade: {degraded}");
+    assert!(
+        degraded.to_string().contains("control plane hard-down"),
+        "loud degrade: {degraded}"
+    );
     assert_eq!(signup.signups_degraded(), 1, "exactly one signup degraded");
-    assert_eq!(signup.service().signals().placement_count, 0, "0 tenants placed while the CP was down");
+    assert_eq!(
+        signup.service().signals().placement_count,
+        0,
+        "0 tenants placed while the CP was down"
+    );
 
     // The data plane served EVERY placed-tenant request (the CP-D4 zero: 0 failures).
     let served = dp.placed_requests_served(); // 1 (CP up) + 5 (CP down) = 6
     let failed = dp.placed_requests_failed();
-    assert_eq!(served, 6, "all placed-tenant requests served (1 fresh + 5 fail-static)");
-    assert_eq!(failed, 0, "0 placed-tenant requests failed (the CP-D4 zero)");
+    assert_eq!(
+        served, 6,
+        "all placed-tenant requests served (1 fresh + 5 fail-static)"
+    );
+    assert_eq!(
+        failed, 0,
+        "0 placed-tenant requests failed (the CP-D4 zero)"
+    );
 
     // ── RESTORE the control plane (the outage is lifted; the system is observed recovering). The
     //    break is reversible — a restored dependency is indistinguishable from one never broken. ──
-    assert!(breaker.restore_dependency(control_plane_dep(), Scope::Global).changed(), "the CP is restored");
+    assert!(
+        breaker
+            .restore_dependency(control_plane_dep(), Scope::Global)
+            .changed(),
+        "the CP is restored"
+    );
     if !breaker.is_broken(&control_plane_dep(), &Scope::Global) {
         cp.restore();
     }
     assert!(!cp.is_down(), "the control plane recovered");
-    assert_eq!(breaker.broken_count(), 0, "no leaked break (the injector is fully reversible)");
+    assert_eq!(
+        breaker.broken_count(),
+        0,
+        "no leaked break (the injector is fully reversible)"
+    );
     // Signup works again — a new tenant is placed PII-free (the system recovered).
     let placed = signup
-        .signup(&cp, &mut reg, &Region::new("eu-west"), IsolationKind::Pool, "newco")
+        .signup(
+            &cp,
+            &mut reg,
+            &Region::new("eu-west"),
+            IsolationKind::Pool,
+            "newco",
+        )
         .expect("CP restored: signup works again");
-    assert!(placed.tenant_id.as_str().starts_with("01J0CP-"), "a new tenant placed PII-free post-recovery");
+    assert!(
+        placed.tenant_id.as_str().starts_with("01J0CP-"),
+        "a new tenant placed PII-free post-recovery"
+    );
 
     // ── The measured CP-D4 report: serving-uptime 100%, degrade scope signup/provisioning ONLY. ──
     let report = CpOutageReport::compute(served, failed, signup.signups_degraded());
     assert!(report.is_cp_d4_win(), "the CP-D4 win: {report:?}");
-    assert_eq!(report.serving_uptime_pct, 100, "serving-uptime is 100% (0 placed-request failures)");
+    assert_eq!(
+        report.serving_uptime_pct, 100,
+        "serving-uptime is 100% (0 placed-request failures)"
+    );
     assert_eq!(
         report.degrade_scope,
         DegradeScope::SignupAndProvisioningOnly,
@@ -162,10 +225,15 @@ fn cp_d4_cp_outage_blast_radius_placed_tenants_keep_serving() {
     let mut sig = SignalSource::new();
     // serving-uptime: the percentage of placed-tenant requests still served during the outage.
     sig.set_scalar(SignalName::RequestRate, report.serving_uptime_pct as i64);
-    sig.assert_signal(SignalName::RequestRate, Predicate::Eq(100)).expect_green();
+    sig.assert_signal(SignalName::RequestRate, Predicate::Eq(100))
+        .expect_green();
     // the CP-D4 zero: 0 placed-tenant requests failed (the data plane did not cascade).
-    sig.set_scalar(SignalName::CrossTenantCount, report.placed_requests_failed as i64);
-    sig.assert_signal(SignalName::CrossTenantCount, Predicate::Eq(0)).expect_green();
+    sig.set_scalar(
+        SignalName::CrossTenantCount,
+        report.placed_requests_failed as i64,
+    );
+    sig.assert_signal(SignalName::CrossTenantCount, Predicate::Eq(0))
+        .expect_green();
 
     println!(
         "[P-098 CP-D4 GREEN 2026-06-19] CP-outage blast-radius win: the control plane was hard-down \
@@ -193,20 +261,29 @@ fn cp_d4_cp_outage_blast_radius_placed_tenants_keep_serving() {
 fn cp_d4_gate_is_not_vacuous() {
     // A hypothetical cascade: 1 of 6 placed-tenant requests failed during the outage.
     let cascaded = CpOutageReport::compute(5, 1, 2);
-    assert_eq!(cascaded.degrade_scope, DegradeScope::DataPlaneCascaded, "a failed placed request cascades");
+    assert_eq!(
+        cascaded.degrade_scope,
+        DegradeScope::DataPlaneCascaded,
+        "a failed placed request cascades"
+    );
     assert!(!cascaded.is_cp_d4_win(), "a cascade is NOT the CP-D4 win");
 
     let mut sig = SignalSource::new();
     // serving-uptime dropped below 100 → the predicate fails.
     sig.set_scalar(SignalName::RequestRate, cascaded.serving_uptime_pct as i64);
     assert!(
-        !sig.assert_signal(SignalName::RequestRate, Predicate::Eq(100)).is_green(),
+        !sig.assert_signal(SignalName::RequestRate, Predicate::Eq(100))
+            .is_green(),
         "serving-uptime < 100 MUST read RED — the CP-D4 serving-uptime is a real tripwire"
     );
     // and the failure count ticked above 0 → the zero tripwire fails too.
-    sig.set_scalar(SignalName::CrossTenantCount, cascaded.placed_requests_failed as i64);
+    sig.set_scalar(
+        SignalName::CrossTenantCount,
+        cascaded.placed_requests_failed as i64,
+    );
     assert!(
-        !sig.assert_signal(SignalName::CrossTenantCount, Predicate::Eq(0)).is_green(),
+        !sig.assert_signal(SignalName::CrossTenantCount, Predicate::Eq(0))
+            .is_green(),
         "a failed placed-tenant request MUST read RED — the CP-D4 zero is a real tripwire"
     );
 }

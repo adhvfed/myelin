@@ -105,7 +105,10 @@ pub const SUBJECT_ROOT_TYPE: &str = "subject_root";
 /// "JOIN … over Notif's own `inbox_item.subject_root` column"). The watcher push-down is a JOIN keyed
 /// by THIS column, never an N+1 per-subject `check`.
 pub fn subject_root_col() -> ColRef {
-    ColRef { table: "notif_inbox_item".into(), column: "subject_root".into() }
+    ColRef {
+        table: "notif_inbox_item".into(),
+        column: "subject_root".into(),
+    }
 }
 
 /// **ONE coalesced ambient marker for a watched `subject_root` (the §3.5 read-fanout store).** An
@@ -272,10 +275,15 @@ impl ReverseIndexAnswer {
 pub enum RelationalLeaf {
     /// `InRelation{relation, via_column}` — subject_roots where the viewer is the subject of
     /// `relation` (the `watcher` relation, §3.5), JOINed by Notif's own `via_column`.
-    InRelation { relation: RelName, via_column: ColRef },
+    InRelation {
+        relation: RelName,
+        via_column: ColRef,
+    },
     /// `TupleSet{index}` — a server-materialised `(subject, watcher, subject_root)` tuple set to
     /// semijoin against (the big-result path, §7.1).
-    TupleSet { index: myelin_identity::AuthzIndexRef },
+    TupleSet {
+        index: myelin_identity::AuthzIndexRef,
+    },
 }
 
 /// **The narrow Identity port the read-fanout consumes** — the `list_objects` slice of contract 4.3
@@ -339,7 +347,10 @@ pub enum ReadFanoutError {
     /// The reverse index served a revision BELOW the zookie watermark (contract 4.10) — a stale
     /// revision could re-admit a just-revoked watch grant (the new-enemy problem). REJECTED loudly:
     /// the ambient slice is held, not leaked, rather than served from a stale revision.
-    StaleReverseIndex { required: RevisionWatermark, served: RevisionWatermark },
+    StaleReverseIndex {
+        required: RevisionWatermark,
+        served: RevisionWatermark,
+    },
 }
 
 /// **`read_fanout(viewer, markers, resolver, at)` — materialise the viewer's ambient slice LAZILY on
@@ -431,11 +442,14 @@ fn lower(
         // An explicit allow-set, inlined (`WHERE subject_root IN (...)`).
         SetExpr::Ids(ids) => Ok(Reachable::Some(ids.iter().map(|o| o.0.clone()).collect())),
         // An explicit deny-set over the otherwise-visible space (`subject_root NOT IN (...)`).
-        SetExpr::NotIds(ids) => {
-            Ok(Reachable::AllExcept(ids.iter().map(|o| o.0.clone()).collect()))
-        }
+        SetExpr::NotIds(ids) => Ok(Reachable::AllExcept(
+            ids.iter().map(|o| o.0.clone()).collect(),
+        )),
         // The relational watcher JOIN: resolve via the reverse index (the watermark-honoured leaf).
-        SetExpr::InRelation { relation, via_column } => {
+        SetExpr::InRelation {
+            relation,
+            via_column,
+        } => {
             let leaf = RelationalLeaf::InRelation {
                 relation: relation.clone(),
                 via_column: via_column.clone(),
@@ -443,7 +457,9 @@ fn lower(
             resolve_leaf(viewer, &leaf, resolver, required)
         }
         SetExpr::TupleSet { index } => {
-            let leaf = RelationalLeaf::TupleSet { index: index.clone() };
+            let leaf = RelationalLeaf::TupleSet {
+                index: index.clone(),
+            };
             resolve_leaf(viewer, &leaf, resolver, required)
         }
         // Boolean composition (the §7.2 AND/OR/EXCEPT).
@@ -693,7 +709,10 @@ impl SyntheticReverseIndex {
     ) -> myelin_identity::Zookie {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.revision += 1;
-        if let Some(set) = g.watches.get_mut(&(tenant.0.clone(), principal.to_string())) {
+        if let Some(set) = g
+            .watches
+            .get_mut(&(tenant.0.clone(), principal.to_string()))
+        {
             set.remove(subject_root);
         }
         myelin_identity::Zookie(format!("zk-{}", g.revision))
@@ -707,7 +726,10 @@ impl SyntheticReverseIndex {
 
     /// Make the index report UNAVAILABLE (an Id hiccup) — the held-not-leaked drill.
     pub fn set_unavailable(&self, on: bool) {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).unavailable = on;
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unavailable = on;
     }
 
     /// Pin the index to serve answers at `revision` regardless of the current one (the STALE-revision
@@ -730,7 +752,9 @@ impl WatcherResolvePort for SyntheticReverseIndex {
     ) -> AuthzResult<myelin_identity::ListObjectsResult> {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if g.unavailable {
-            return Err(AuthzError::Unavailable("synthetic reverse index unavailable".into()));
+            return Err(AuthzError::Unavailable(
+                "synthetic reverse index unavailable".into(),
+            ));
         }
         // The S8 PUSHED-DOWN path: the read-fanout always lowers the watcher relation via the JOIN
         // (the 50k-density path the prompt exercises) — return the Filter{InRelation{watcher}} the
@@ -752,7 +776,9 @@ impl WatcherResolvePort for SyntheticReverseIndex {
     ) -> AuthzResult<ReverseIndexAnswer> {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if g.unavailable {
-            return Err(AuthzError::Unavailable("synthetic reverse index unavailable".into()));
+            return Err(AuthzError::Unavailable(
+                "synthetic reverse index unavailable".into(),
+            ));
         }
         // Only the watcher relation is served by THIS synthetic index (a different relation → empty).
         let watched = match leaf {

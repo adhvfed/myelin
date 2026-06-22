@@ -29,7 +29,9 @@
 
 use myelin_agent_service::escape_gate::{AgentExecGate, GateRefusal, ProductionBackendId};
 use myelin_ci_sandbox::escape_corpus::{BEGIN_MARKER, END_MARKER};
-use myelin_ci_sandbox::{parse_console, Backend, BackendRun, EscapeAttestation, CORPUS, CORPUS_VERSION};
+use myelin_ci_sandbox::{
+    parse_console, Backend, BackendRun, EscapeAttestation, CORPUS, CORPUS_VERSION,
+};
 
 /// The production backend identity the Fabric is about to dispatch onto (the gate verifies the
 /// attestation describes EXACTLY this — the permanent gate, re-run on every identity change).
@@ -128,8 +130,8 @@ fn a_green_attestation_for_the_production_backend_admits() {
 #[test]
 fn the_gate_consumes_the_real_json_artifact_form() {
     let json = attestation(false).unwrap().to_json();
-    let gate = AgentExecGate::admit_from_json(&json, &prod_id())
-        .expect("the green JSON artifact admits");
+    let gate =
+        AgentExecGate::admit_from_json(&json, &prod_id()).expect("the green JSON artifact admits");
     assert_eq!(gate.backend_id().corpus_version, CORPUS_VERSION);
 }
 
@@ -198,7 +200,10 @@ fn a_residual_production_backend_does_not_admit() {
 fn the_no_floor_permanent_gate_residuals_are_carried_in_writing() {
     let att = attestation(false).unwrap();
     assert!(att.residuals.iter().any(|r| r.contains("PERMANENT GATE")));
-    assert!(att.residuals.iter().any(|r| r.contains("P-348") || r.contains("CI-P27")));
+    assert!(att
+        .residuals
+        .iter()
+        .any(|r| r.contains("P-348") || r.contains("CI-P27")));
     assert!(att
         .residuals
         .iter()

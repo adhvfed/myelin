@@ -114,8 +114,14 @@ fn cdc_2_9_chat_durable_firehose_split_is_disjoint_and_total() {
         "the chat durable/firehose split must be disjoint AND total (0 misclassified tokens)"
     );
     // The representative durable token classes durable; the representative firehose token firehose.
-    assert_eq!(delivery_class(CHAT_MESSAGE_CREATED), Some(DeliveryClass::Durable));
-    assert_eq!(delivery_class(CHAT_PRESENCE_CHANGED), Some(DeliveryClass::Firehose));
+    assert_eq!(
+        delivery_class(CHAT_MESSAGE_CREATED),
+        Some(DeliveryClass::Durable)
+    );
+    assert_eq!(
+        delivery_class(CHAT_PRESENCE_CHANGED),
+        Some(DeliveryClass::Firehose)
+    );
     // The two classes partition the registry exactly (sizes add up — no token lost/double-counted).
     assert_eq!(
         CHAT_DURABLE_TOKENS.len() + CHAT_FIREHOSE_TOKENS.len(),

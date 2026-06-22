@@ -22,13 +22,11 @@
 //! set) are pinned here so a change to either side fails this test in the same CI job. The M2 re-run
 //! of ID-D5 against the LIVE `EffectApi` is P-ID-23; this pair is the M1 `delegation` CDC.
 
-use myelin_identity::{
-    EffectivePolicy, Principal, PrincipalId, PrincipalKind, RuntimeRef,
-};
+use myelin_events::OutboxStore;
+use myelin_identity::{EffectivePolicy, Principal, PrincipalId, PrincipalKind, RuntimeRef};
 use myelin_identity_service::{
     authority_of, Authority, DelegationInput, StoreBackedCheck, TupleStore,
 };
-use myelin_events::OutboxStore;
 use myelin_tenancy::{Region, TenantId};
 
 fn agent(id: &str) -> Principal {
@@ -83,7 +81,11 @@ fn cdc_4_5_effect_inside_intersection_applies() {
     let input = DelegationInput {
         agent_policy: auth(&["repo:acme/web#read", "repo:acme/web#write"]),
         delegation: auth(&["repo:acme/web#read", "repo:acme/api#read"]),
-        tenant_policy: auth(&["repo:acme/web#read", "repo:acme/api#read", "repo:acme/web#write"]),
+        tenant_policy: auth(&[
+            "repo:acme/web#read",
+            "repo:acme/api#read",
+            "repo:acme/web#write",
+        ]),
         trigger_actor_held: auth(&["repo:acme/web#read", "repo:acme/api#read"]),
     };
     let effective = svc.delegation_in(&agent("p:agent"), &human("p:human"), &input);
@@ -142,6 +144,12 @@ fn cdc_4_5_provider_effective_set_is_subset_of_every_conjunct() {
     );
     // The consumer can safely test membership: nothing outside the conjuncts is ever returned.
     assert!(effect_api_apply(&effective, "c"));
-    assert!(!effect_api_apply(&effective, "a"), "a (only in the agent ceiling) is NOT effective");
-    assert!(!effect_api_apply(&effective, "e"), "e (only in the tenant policy) is NOT effective");
+    assert!(
+        !effect_api_apply(&effective, "a"),
+        "a (only in the agent ceiling) is NOT effective"
+    );
+    assert!(
+        !effect_api_apply(&effective, "e"),
+        "e (only in the tenant policy) is NOT effective"
+    );
 }

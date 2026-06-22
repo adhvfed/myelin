@@ -91,7 +91,12 @@ pub fn segments(md: &str) -> Vec<Segment> {
         if c == OBJ {
             // close any open text run
             if let Some(s) = run_start.take() {
-                out.push(Segment { kind: SegmentKind::Text, start: s, end: idx, node_index: None });
+                out.push(Segment {
+                    kind: SegmentKind::Text,
+                    start: s,
+                    end: idx,
+                    node_index: None,
+                });
             }
             out.push(Segment {
                 kind: SegmentKind::Node,
@@ -106,7 +111,12 @@ pub fn segments(md: &str) -> Vec<Segment> {
         idx += 1;
     }
     if let Some(s) = run_start.take() {
-        out.push(Segment { kind: SegmentKind::Text, start: s, end: idx, node_index: None });
+        out.push(Segment {
+            kind: SegmentKind::Text,
+            start: s,
+            end: idx,
+            node_index: None,
+        });
     }
     out
 }
@@ -128,10 +138,16 @@ pub fn offset_to_dom(md: &str, offset: usize) -> DomPosition {
     let clamped = offset.min(md.chars().count());
     // Empty line (or offset 0 with a leading segment): the position before everything.
     if segs.is_empty() {
-        return DomPosition { segment: 0, offset_in_segment: 0 };
+        return DomPosition {
+            segment: 0,
+            offset_in_segment: 0,
+        };
     }
     if clamped == 0 {
-        return DomPosition { segment: 0, offset_in_segment: 0 };
+        return DomPosition {
+            segment: 0,
+            offset_in_segment: 0,
+        };
     }
     // Find the segment whose half-open range CONTAINS offset-1's char, i.e. the segment we
     // are "inside or at the end of". We bind a boundary offset to the LEFT segment's end so
@@ -141,13 +157,19 @@ pub fn offset_to_dom(md: &str, offset: usize) -> DomPosition {
     // returns — there is no fallthrough (no dead defensive branch to drift, EI-01 §7).
     for (i, seg) in segs.iter().enumerate() {
         if clamped <= seg.end {
-            return DomPosition { segment: i, offset_in_segment: clamped - seg.start };
+            return DomPosition {
+                segment: i,
+                offset_in_segment: clamped - seg.start,
+            };
         }
     }
     // Unreachable for a tiled grid + clamped offset (asserted by the offset gate over the
     // corpus). `unreachable!` documents the invariant without a behaviour-equivalent
     // arithmetic branch a mutant could survive on.
-    unreachable!("offset {clamped} is within a tiled grid of len {}", md.chars().count())
+    unreachable!(
+        "offset {clamped} is within a tiled grid of len {}",
+        md.chars().count()
+    )
 }
 
 /// Bridge a DOM [`DomPosition`] back to a model char offset. Inverse of [`offset_to_dom`]
@@ -178,7 +200,10 @@ pub struct CaretMap {
 impl CaretMap {
     /// Build the caret map for a serialized line.
     pub fn new(md: &str) -> Self {
-        CaretMap { segments: segments(md), char_len: md.chars().count() }
+        CaretMap {
+            segments: segments(md),
+            char_len: md.chars().count(),
+        }
     }
     /// Number of caret positions (`char_len + 1`).
     pub fn caret_count(&self) -> usize {
@@ -213,7 +238,11 @@ mod tests {
             assert!(s.end > s.start, "zero-width segment in {md:?}");
             cursor = s.end;
         }
-        assert_eq!(cursor, md.chars().count(), "grid does not cover the line {md:?}");
+        assert_eq!(
+            cursor,
+            md.chars().count(),
+            "grid does not cover the line {md:?}"
+        );
     }
 
     #[test]
@@ -238,10 +267,17 @@ mod tests {
     fn structured_node_is_one_caret_position() {
         let md = format!("a{OBJ}b{OBJ}");
         let segs = segments(&md);
-        let nodes: Vec<_> = segs.iter().filter(|s| s.kind == SegmentKind::Node).collect();
+        let nodes: Vec<_> = segs
+            .iter()
+            .filter(|s| s.kind == SegmentKind::Node)
+            .collect();
         assert_eq!(nodes.len(), 2);
         for n in &nodes {
-            assert_eq!(n.len(), 1, "a structured node must be exactly one caret position");
+            assert_eq!(
+                n.len(),
+                1,
+                "a structured node must be exactly one caret position"
+            );
         }
         // positional binding: the i-th OBJ ⇒ node_index i
         assert_eq!(nodes[0].node_index, Some(0));
@@ -268,7 +304,12 @@ mod tests {
             for off in 0..=len {
                 let dom = offset_to_dom(md, off);
                 let back = dom_to_offset(md, dom);
-                assert_eq!(back, off, "off-by-{} at offset {off} in {md:?} (dom {dom:?})", back as i64 - off as i64);
+                assert_eq!(
+                    back,
+                    off,
+                    "off-by-{} at offset {off} in {md:?} (dom {dom:?})",
+                    back as i64 - off as i64
+                );
             }
         }
     }
@@ -281,13 +322,22 @@ mod tests {
     fn caret_steps_over_a_chip_by_exactly_one() {
         let md = format!("x{OBJ}y");
         let segs = segments(&md);
-        let node_seg = segs.iter().position(|s| s.kind == SegmentKind::Node).unwrap();
+        let node_seg = segs
+            .iter()
+            .position(|s| s.kind == SegmentKind::Node)
+            .unwrap();
         let node_start = segs[node_seg].start; // char offset of the OBJ
         let before = offset_to_dom(&md, node_start);
         let after = offset_to_dom(&md, node_start + 1);
         assert_eq!(dom_to_offset(&md, after) - dom_to_offset(&md, before), 1);
         // canonical "after the chip" form
-        assert_eq!(after, DomPosition { segment: node_seg, offset_in_segment: 1 });
+        assert_eq!(
+            after,
+            DomPosition {
+                segment: node_seg,
+                offset_in_segment: 1
+            }
+        );
     }
 
     /// The end-of-line offset (== char_len) maps to the END of the last segment and back.
@@ -311,7 +361,11 @@ mod tests {
         assert_eq!(caret_count(md), md.chars().count() + 1);
         let len = md.chars().count();
         for off in 0..=len {
-            assert_eq!(dom_to_offset(md, offset_to_dom(md, off)), off, "byte/char confusion in {md:?}");
+            assert_eq!(
+                dom_to_offset(md, offset_to_dom(md, off)),
+                off,
+                "byte/char confusion in {md:?}"
+            );
         }
         // sanity: char_len (7) is strictly less than the byte length
         assert!(md.len() > len);
@@ -327,12 +381,22 @@ mod tests {
             assert!(!s.is_empty(), "well-formed segment must not report empty");
         }
         // a synthetic zero-width segment DOES report empty (pins the == in is_empty)
-        let zero = Segment { kind: SegmentKind::Text, start: 3, end: 3, node_index: None };
+        let zero = Segment {
+            kind: SegmentKind::Text,
+            start: 3,
+            end: 3,
+            node_index: None,
+        };
         assert!(zero.is_empty());
         assert_eq!(zero.len(), 0);
         // a non-zero segment whose start != 0 reports NOT empty (pins is_empty's == AND
         // that len is end-start, not a constant)
-        let nonzero = Segment { kind: SegmentKind::Text, start: 3, end: 5, node_index: None };
+        let nonzero = Segment {
+            kind: SegmentKind::Text,
+            start: 3,
+            end: 5,
+            node_index: None,
+        };
         assert!(!nonzero.is_empty());
         assert_eq!(nonzero.len(), 2);
     }
@@ -347,14 +411,26 @@ mod tests {
         let md = format!("{OBJ}xyz");
         // absolute offset 3 = the 'y'..'z' boundary → segment 1, offset_in_segment 2
         let dom = offset_to_dom(&md, 3);
-        assert_eq!(dom, DomPosition { segment: 1, offset_in_segment: 2 });
+        assert_eq!(
+            dom,
+            DomPosition {
+                segment: 1,
+                offset_in_segment: 2
+            }
+        );
         // if `-` were `+`: 3 + 1 = 4 (out of the len-3 segment); if `/`: 3/1 = 3 (the end,
         // not offset 2). Both are caught by this exact expectation.
         assert_eq!(dom_to_offset(&md, dom), 3);
         // a deeper case: leading "ab" text then a chip then "cdef"; offset inside "cdef"
         let md2 = format!("ab{OBJ}cdef");
         let dom2 = offset_to_dom(&md2, 5); // 'd' boundary in seg "cdef" (start 3)
-        assert_eq!(dom2, DomPosition { segment: 2, offset_in_segment: 2 });
+        assert_eq!(
+            dom2,
+            DomPosition {
+                segment: 2,
+                offset_in_segment: 2
+            }
+        );
         assert_eq!(dom_to_offset(&md2, dom2), 5);
     }
 
@@ -393,7 +469,13 @@ mod tests {
             assert_eq!(dom_to_offset(&canon, offset_to_dom(&canon, off)), off);
         }
         // two node segments, bound positionally
-        let node_segs: Vec<_> = segments(&canon).into_iter().filter(|s| s.kind == SegmentKind::Node).collect();
-        assert_eq!(node_segs.iter().map(|s| s.node_index).collect::<Vec<_>>(), vec![Some(0), Some(1)]);
+        let node_segs: Vec<_> = segments(&canon)
+            .into_iter()
+            .filter(|s| s.kind == SegmentKind::Node)
+            .collect();
+        assert_eq!(
+            node_segs.iter().map(|s| s.node_index).collect::<Vec<_>>(),
+            vec![Some(0), Some(1)]
+        );
     }
 }

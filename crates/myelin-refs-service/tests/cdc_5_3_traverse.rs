@@ -35,7 +35,11 @@ fn region() -> Region {
     Region("fr-par".into())
 }
 fn viewer() -> Principal {
-    Principal::stub(PrincipalId("p-viewer".into()), PrincipalKind::Human, tenant())
+    Principal::stub(
+        PrincipalId("p-viewer".into()),
+        PrincipalKind::Human,
+        tenant(),
+    )
 }
 fn aref(s: &str) -> ArtifactRef {
     ArtifactRef(s.into())
@@ -65,7 +69,11 @@ struct ImpactRenderer;
 impl ImpactRenderer {
     fn render(&self, r: &TraverseResult) -> (Vec<String>, bool, bool) {
         // The consumer trusts the provider's prune — no per-node check here.
-        let ids: Vec<String> = r.nodes.iter().map(|n: &TraverseNode| n.artifact.0.clone()).collect();
+        let ids: Vec<String> = r
+            .nodes
+            .iter()
+            .map(|n: &TraverseNode| n.artifact.0.clone())
+            .collect();
         (ids, r.truncated, r.cycle_detected)
     }
 }
@@ -93,8 +101,15 @@ fn cdc_provider_returns_bounded_readable_subtree_consumer_renders() {
 
     let (mut ids, truncated, cycle) = ImpactRenderer.render(&result);
     ids.sort();
-    assert_eq!(ids, vec!["story1", "story2", "task1"], "the whole readable epic tree");
-    assert!(!truncated, "the tree fits under the ceiling → not truncated");
+    assert_eq!(
+        ids,
+        vec!["story1", "story2", "task1"],
+        "the whole readable epic tree"
+    );
+    assert!(
+        !truncated,
+        "the tree fits under the ceiling → not truncated"
+    );
     assert!(!cycle, "no cycle in a tree");
 }
 
@@ -105,8 +120,20 @@ fn cdc_provider_returns_bounded_readable_subtree_consumer_renders() {
 fn cdc_provider_prunes_unreadable_branch_consumer_never_sees_it() {
     let proj = EdgeProjection::new();
     link(&proj, "epic", "ok-story", "parent_of", RelClass::Lifecycle);
-    link(&proj, "epic", "secret-story", "parent_of", RelClass::Lifecycle);
-    link(&proj, "secret-story", "secret-task", "parent_of", RelClass::Lifecycle);
+    link(
+        &proj,
+        "epic",
+        "secret-story",
+        "parent_of",
+        RelClass::Lifecycle,
+    );
+    link(
+        &proj,
+        "secret-story",
+        "secret-task",
+        "parent_of",
+        RelClass::Lifecycle,
+    );
     let t = Traverse::with_default_bounds(proj, AuthzVisibleIndex::new());
 
     // the viewer may view ok-story (and secret-task in isolation) but NOT secret-story.
@@ -121,9 +148,16 @@ fn cdc_provider_prunes_unreadable_branch_consumer_never_sees_it() {
     );
 
     let (ids, _, _) = ImpactRenderer.render(&result);
-    assert_eq!(ids, vec!["ok-story".to_string()], "the secret branch is pruned (0 leak)");
+    assert_eq!(
+        ids,
+        vec!["ok-story".to_string()],
+        "the secret branch is pruned (0 leak)"
+    );
     assert!(!ids.contains(&"secret-story".to_string()));
-    assert!(!ids.contains(&"secret-task".to_string()), "the branch under the unreadable hop is gone");
+    assert!(
+        !ids.contains(&"secret-task".to_string()),
+        "the branch under the unreadable hop is gone"
+    );
 }
 
 /// **PROVIDER + CONSUMER CDC — the cycle diagnostic + the truncated marker: the consumer reads them
@@ -146,12 +180,21 @@ fn cdc_consumer_reads_cycle_and_truncated_markers() {
         &ids_result(&["A", "B"], "zk-1"),
     );
     let (_, _, cycle) = ImpactRenderer.render(&rc);
-    assert!(cycle, "the consumer is told the graph has a cycle (a diagnostic, not a hang)");
+    assert!(
+        cycle,
+        "the consumer is told the graph has a cycle (a diagnostic, not a hang)"
+    );
 
     // a too-deep chain.
     let deep = EdgeProjection::new();
     for i in 0..100 {
-        link(&deep, &format!("n{i}"), &format!("n{}", i + 1), "blocks", RelClass::Lifecycle);
+        link(
+            &deep,
+            &format!("n{i}"),
+            &format!("n{}", i + 1),
+            "blocks",
+            RelClass::Lifecycle,
+        );
     }
     let td = Traverse::with_default_bounds(deep, AuthzVisibleIndex::new());
     let all: Vec<String> = (0..=100).map(|i| format!("n{i}")).collect();
@@ -166,6 +209,13 @@ fn cdc_consumer_reads_cycle_and_truncated_markers() {
         &ids_result(&all_refs, "zk-1"),
     );
     let (ids, truncated, _) = ImpactRenderer.render(&rd);
-    assert!(truncated, "the consumer is told the walk is PARTIAL (truncated), never an unbounded scan");
-    assert_eq!(ids.len(), TRAVERSE_DEPTH_CEILING as usize, "exactly the depth-16 prefix is returned");
+    assert!(
+        truncated,
+        "the consumer is told the walk is PARTIAL (truncated), never an unbounded scan"
+    );
+    assert_eq!(
+        ids.len(),
+        TRAVERSE_DEPTH_CEILING as usize,
+        "exactly the depth-16 prefix is returned"
+    );
 }

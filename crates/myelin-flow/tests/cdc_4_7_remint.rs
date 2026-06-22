@@ -36,8 +36,8 @@ use myelin_flow::{
 use myelin_identity::{
     AuthzError, Consistency, Credential, Decision, DelegationCaveats as IdCaveats, EffectivePolicy,
     FailStaticBound, FragmentAdmit, IdentityService, NamespaceFragment, ObjectId, ObjectType,
-    Permission, Precondition, Principal, PrincipalId, PrincipalKind, RewriteTrace, RunId as IdRunId,
-    RunToken, RevokeTarget, SubjectTree, TupleDelta, Zookie,
+    Permission, Precondition, Principal, PrincipalId, PrincipalKind, RevokeTarget, RewriteTrace,
+    RunId as IdRunId, RunToken, SubjectTree, TupleDelta, Zookie,
 };
 use myelin_refs::ArtifactRef;
 use myelin_tenancy::{Region, TenantId};
@@ -143,11 +143,7 @@ impl IdentityService for MintingIdentity {
     ) -> Result<RewriteTrace, AuthzError> {
         Err(AuthzError::NotYetImplemented("explain (CDC stub)"))
     }
-    fn delegation(
-        &self,
-        _a: &Principal,
-        _t: &Principal,
-    ) -> Result<EffectivePolicy, AuthzError> {
+    fn delegation(&self, _a: &Principal, _t: &Principal) -> Result<EffectivePolicy, AuthzError> {
         Err(AuthzError::NotYetImplemented("delegation (CDC stub)"))
     }
     fn write_tuples(
@@ -161,7 +157,9 @@ impl IdentityService for MintingIdentity {
         Err(AuthzError::NotYetImplemented("revoke (CDC stub)"))
     }
     fn resolve_pseudonym(&self, _s: &PrincipalId, _t: &TenantId) -> Result<String, AuthzError> {
-        Err(AuthzError::NotYetImplemented("resolve_pseudonym (CDC stub)"))
+        Err(AuthzError::NotYetImplemented(
+            "resolve_pseudonym (CDC stub)",
+        ))
     }
     fn erase(&self, _s: &PrincipalId) -> Result<(), AuthzError> {
         Err(AuthzError::NotYetImplemented("erase (CDC stub)"))
@@ -241,40 +239,83 @@ fn provider_mints_a_short_lived_per_run_token_on_a_days_later_hitl_resume() {
 
     // DRIVE 1: park on the approval wait (no signal yet) → no mint (the run holds NO token while parked).
     let mut c1 = WfCtx::begin(
-        &outbox, minter(), journal.clone(), ctx_base(), "R1", "agent.run",
-        "2026-06-21T00:00:00Z", 42,
+        &outbox,
+        minter(),
+        journal.clone(),
+        ctx_base(),
+        "R1",
+        "agent.run",
+        "2026-06-21T00:00:00Z",
+        42,
     )
     .with_signals(signals.clone())
     .with_run_identity(lease(id.clone()));
     let out1 = c1
         .wait_for_signal(&approval_wait_name("call-7"), Some(3600))
         .expect("park on the approval wait");
-    assert_eq!(out1, WaitOutcome::Parked, "drive 1 parks (state=waiting, holds no runtime)");
-    assert_eq!(c1.reminted_tokens(), 0, "a PARK does not re-mint (the run holds no token while waiting)");
-    assert_eq!(id.calls.load(Ordering::SeqCst), 0, "Identity was NOT asked to mint on the park");
+    assert_eq!(
+        out1,
+        WaitOutcome::Parked,
+        "drive 1 parks (state=waiting, holds no runtime)"
+    );
+    assert_eq!(
+        c1.reminted_tokens(),
+        0,
+        "a PARK does not re-mint (the run holds no token while waiting)"
+    );
+    assert_eq!(
+        id.calls.load(Ordering::SeqCst),
+        0,
+        "Identity was NOT asked to mint on the park"
+    );
     c1.commit().expect("co-commit the park");
     let history = journal.history_for(&tenant(), "R1");
 
     // ... DAYS later, the human clicks Approve ...
-    deliver_approval(&signals, "call-7", vec![ArtifactRef("myelin://acme/approval/yes".into())]);
+    deliver_approval(
+        &signals,
+        "call-7",
+        vec![ArtifactRef("myelin://acme/approval/yes".into())],
+    );
 
     // DRIVE 2 (the resume): consume the approval AND re-mint a fresh token via Identity (contract 4.7).
     let mut c2 = WfCtx::resume(
-        &outbox, minter(), journal.clone(), ctx_base(), "R1", "agent.run",
-        "2026-06-21T00:00:00Z", 42, history,
+        &outbox,
+        minter(),
+        journal.clone(),
+        ctx_base(),
+        "R1",
+        "agent.run",
+        "2026-06-21T00:00:00Z",
+        42,
+        history,
     )
     .with_signals(signals.clone())
     .with_run_identity(lease(id.clone()));
     let out2 = c2
         .wait_for_signal(&approval_wait_name("call-7"), Some(3600))
         .expect("resume + consume");
-    assert!(matches!(out2, WaitOutcome::Signalled { .. }), "the resume consumed the approval");
-    assert_eq!(c2.reminted_tokens(), 1, "the resume re-minted exactly one fresh token");
+    assert!(
+        matches!(out2, WaitOutcome::Signalled { .. }),
+        "the resume consumed the approval"
+    );
+    assert_eq!(
+        c2.reminted_tokens(),
+        1,
+        "the resume re-minted exactly one fresh token"
+    );
 
     // CONSUMER ↔ PROVIDER agreement: Identity's mint_run_token was driven with the engine's args.
-    assert_eq!(id.calls.load(Ordering::SeqCst), 1, "Identity minted exactly once on resume");
+    assert_eq!(
+        id.calls.load(Ordering::SeqCst),
+        1,
+        "Identity minted exactly once on resume"
+    );
     let (agent, run, caveats, ttl) = id.last.lock().unwrap().clone().expect("a mint recorded");
-    assert_eq!(agent.0, "agent://acme/agent/triage", "minted for the run's agent (4.7 agent_id)");
+    assert_eq!(
+        agent.0, "agent://acme/agent/triage",
+        "minted for the run's agent (4.7 agent_id)"
+    );
     assert_eq!(run.0, "R1", "minted for THIS run (4.7 run_id)");
     // SHORT-LIVED: the TTL is the fail-static window (token life == activity life), not the workflow life.
     assert_eq!(
@@ -302,13 +343,30 @@ fn consumer_remint_on_resume_drives_identity_mint_run_token() {
     let journal = WfJournal::new();
     let id = Arc::new(MintingIdentity::default());
     let mut ctx = WfCtx::begin(
-        &outbox, minter(), journal, ctx_base(), "R1", "agent.run",
-        "2026-06-21T00:00:00Z", 42,
+        &outbox,
+        minter(),
+        journal,
+        ctx_base(),
+        "R1",
+        "agent.run",
+        "2026-06-21T00:00:00Z",
+        42,
     )
     .with_run_identity(lease(id.clone()));
 
     let handle = ctx.remint_on_resume().expect("re-mint via Identity");
-    assert_eq!(handle.token, "rt-R1-0", "the token came from Identity's mint_run_token (not fabricated)");
-    assert_eq!(handle.ttl_secs, RunTokenLease::DEFAULT_TTL_SECS, "short-lived (token life == activity life)");
-    assert_eq!(id.calls.load(Ordering::SeqCst), 1, "Identity's mint surface was driven");
+    assert_eq!(
+        handle.token, "rt-R1-0",
+        "the token came from Identity's mint_run_token (not fabricated)"
+    );
+    assert_eq!(
+        handle.ttl_secs,
+        RunTokenLease::DEFAULT_TTL_SECS,
+        "short-lived (token life == activity life)"
+    );
+    assert_eq!(
+        id.calls.load(Ordering::SeqCst),
+        1,
+        "Identity's mint surface was driven"
+    );
 }

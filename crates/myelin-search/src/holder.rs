@@ -35,9 +35,9 @@
 
 use myelin_gdpr::{
     EraseReceipt, EraseScope, LocateReport, Patch, PersonalDataHolder, PortableBundle, Receipt,
-    RectifyReceipt, Result as DsrResult, RestrictReceipt, SubjectRef, TenantId,
+    RectifyReceipt, RestrictReceipt, Result as DsrResult, SubjectRef, TenantId,
 };
-use myelin_substrate::{Holder, HolderRegistration, HolderRegistry, StoreKind, classify_store};
+use myelin_substrate::{classify_store, Holder, HolderRegistration, HolderRegistry, StoreKind};
 
 /// The stable, PII-free name of the Search **per-tenant index** store (the holder's H7 store).
 /// Frozen here so the SRCH-P03 index layout, the data-map (P-GA-09), and the DSR fan-out all
@@ -192,7 +192,11 @@ impl PersonalDataHolder for SearchIndexHolder {
 /// the classification without rebuilding an empty `StoreClassifier`.
 pub fn search_index_holder() -> Option<Holder> {
     // SearchIndex classifies structurally — no per-store declaration needed (gdpr §3.2).
-    classify_store(StoreKind::SearchIndex, SEARCH_INDEX_STORE, &Default::default())
+    classify_store(
+        StoreKind::SearchIndex,
+        SEARCH_INDEX_STORE,
+        &Default::default(),
+    )
 }
 
 #[cfg(test)]
@@ -220,7 +224,11 @@ mod tests {
     fn search_registers_its_index_store_as_a_holder() {
         let registry = register_search_holder();
         assert!(registry.is_registered(StoreKind::SearchIndex, SEARCH_INDEX_STORE));
-        assert_eq!(registry.len(), 1, "exactly the one Search index store registered");
+        assert_eq!(
+            registry.len(),
+            1,
+            "exactly the one Search index store registered"
+        );
     }
 
     /// **Re-registration is idempotent** — `serve` re-running the registration on a restart records
@@ -229,7 +237,11 @@ mod tests {
     fn re_registration_is_idempotent() {
         let mut registry = register_search_holder();
         SearchIndexHolder.register(&mut registry);
-        assert_eq!(registry.len(), 1, "re-opening the same Search store does not double-register");
+        assert_eq!(
+            registry.len(),
+            1,
+            "re-opening the same Search store does not double-register"
+        );
     }
 
     /// **The Search store classifies to H7 — 0 orphans (contract 1.4 + gdpr §3.2).** The index
@@ -261,12 +273,19 @@ mod tests {
     fn holder_stub_returns_empty_but_correct_locate_and_export() {
         let holder = SearchIndexHolder;
         let subj = subject("u-1");
-        let locate = holder.locate(&subj, tenant()).expect("locate over empty surface succeeds");
+        let locate = holder
+            .locate(&subj, tenant())
+            .expect("locate over empty surface succeeds");
         assert_eq!(locate.receipt.operation, "locate");
         assert!(locate.receipt.content_hash.starts_with("blake3:"));
-        assert!(locate.receipt.key_epoch_destroyed.is_none(), "locate shreds no key");
+        assert!(
+            locate.receipt.key_epoch_destroyed.is_none(),
+            "locate shreds no key"
+        );
 
-        let export = holder.export(&subj, tenant()).expect("export of empty bundle succeeds");
+        let export = holder
+            .export(&subj, tenant())
+            .expect("export of empty bundle succeeds");
         assert_eq!(export.receipt.operation, "export");
         assert!(export.receipt.content_hash.starts_with("blake3:"));
     }
@@ -278,11 +297,22 @@ mod tests {
     #[test]
     fn holder_stub_erase_is_a_no_op_receipt_and_idempotent() {
         let holder = SearchIndexHolder;
-        let scope = EraseScope::Subject { subject: subject("u-1"), tenant: tenant() };
-        let r1 = holder.erase(scope.clone()).expect("stub erase succeeds (no-op)");
+        let scope = EraseScope::Subject {
+            subject: subject("u-1"),
+            tenant: tenant(),
+        };
+        let r1 = holder
+            .erase(scope.clone())
+            .expect("stub erase succeeds (no-op)");
         let r2 = holder.erase(scope).expect("stub erase is idempotent");
-        assert_eq!(r1, r2, "the same erase scope yields the identical content-addressed receipt");
-        assert!(r1.receipt.key_epoch_destroyed.is_none(), "no key shredded (no index exists)");
+        assert_eq!(
+            r1, r2,
+            "the same erase scope yields the identical content-addressed receipt"
+        );
+        assert!(
+            r1.receipt.key_epoch_destroyed.is_none(),
+            "no key shredded (no index exists)"
+        );
     }
 
     /// **`restrict` is a well-defined no-op now** (no index to suppress) — the suppression the X-7
@@ -291,8 +321,14 @@ mod tests {
     fn holder_stub_restrict_surface() {
         let holder = SearchIndexHolder;
         let subj = subject("u-2");
-        assert!(holder.restrict(&subj, true).is_ok(), "restrict on succeeds (no-op stub)");
-        assert!(holder.restrict(&subj, false).is_ok(), "restrict off succeeds (no-op stub)");
+        assert!(
+            holder.restrict(&subj, true).is_ok(),
+            "restrict on succeeds (no-op stub)"
+        );
+        assert!(
+            holder.restrict(&subj, false).is_ok(),
+            "restrict off succeeds (no-op stub)"
+        );
     }
 
     /// **The holder is object-safe** — held behind `dyn PersonalDataHolder` exactly as the DSR
@@ -302,7 +338,10 @@ mod tests {
         let holders: Vec<Box<dyn PersonalDataHolder>> = vec![Box::new(SearchIndexHolder)];
         let subj = subject("u-3");
         for h in &holders {
-            assert!(h.locate(&subj, tenant()).is_ok(), "the holder responds to the contract");
+            assert!(
+                h.locate(&subj, tenant()).is_ok(),
+                "the holder responds to the contract"
+            );
         }
     }
 }

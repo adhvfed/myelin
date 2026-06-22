@@ -31,7 +31,9 @@ use myelin_harness::{
     Dependency, DrillContext, DrillRegistry, DrillResult, DrillScenario, Predicate, SignalName,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
-use myelin_substrate::{AgentLoadGuard, DepthCeiling, DispatchPool, GuardOutcome, SharedRootTripwire};
+use myelin_substrate::{
+    AgentLoadGuard, DepthCeiling, DispatchPool, GuardOutcome, SharedRootTripwire,
+};
 
 /// Build a reaction envelope at a chosen causal depth + root (the same path `OutboxTx::emit` stamps).
 fn reaction(depth: u32, root: &str) -> EventEnvelope {
@@ -69,75 +71,101 @@ fn reaction(depth: u32, root: &str) -> EventEnvelope {
 /// agent→agent loop (deep chain + wide fan-out + concurrency surge) through the [`AgentLoadGuard`] and
 /// assert the three loop-guard survival signals read green.
 fn sub_d8_causal_loop_scenario() -> DrillScenario {
-    DrillScenario::new("sub-d8-adversarial-causal-loop", |ctx: &mut DrillContext| {
-        // (inject) the reactive/dispatch tier is under stress — the structural caps must hold anyway.
-        ctx.breaker
-            .break_dependency(Dependency::Named("dispatch-tier".into()), myelin_harness::Scope::Global);
+    DrillScenario::new(
+        "sub-d8-adversarial-causal-loop",
+        |ctx: &mut DrillContext| {
+            // (inject) the reactive/dispatch tier is under stress — the structural caps must hold anyway.
+            ctx.breaker.break_dependency(
+                Dependency::Named("dispatch-tier".into()),
+                myelin_harness::Scope::Global,
+            );
 
-        // The guard the dispatch tier consults per reaction. A SMALL pool (4) so the concurrency surge
-        // trips the pool; the depth ceiling + tripwire at small bounds so the loop trips them quickly.
-        let mut guard = AgentLoadGuard {
-            pool: DispatchPool::new(4),
-            depth: DepthCeiling::new(12, 16),
-            tripwire: SharedRootTripwire::new(32, 8),
-            predicate: myelin_substrate::PredicateGuard::v1_floor(),
-        };
+            // The guard the dispatch tier consults per reaction. A SMALL pool (4) so the concurrency surge
+            // trips the pool; the depth ceiling + tripwire at small bounds so the loop trips them quickly.
+            let mut guard = AgentLoadGuard {
+                pool: DispatchPool::new(4),
+                depth: DepthCeiling::new(12, 16),
+                tripwire: SharedRootTripwire::new(32, 8),
+                predicate: myelin_substrate::PredicateGuard::v1_floor(),
+            };
 
-        // ---- (load 1) a DEEP chain: each hop climbs depth, sharing one chain-root. The depth ceiling
-        // halts it at the hard depth (16); the histogram is bounded. -----------------------------------
-        let mut depth_ceiling = DepthCeiling::new(12, 16);
-        let mut halted_by_depth = 0u64;
-        for hop in 0..40u32 {
-            if depth_ceiling.evaluate(&reaction(hop, "chain-root")).is_halted() {
-                halted_by_depth += 1;
+            // ---- (load 1) a DEEP chain: each hop climbs depth, sharing one chain-root. The depth ceiling
+            // halts it at the hard depth (16); the histogram is bounded. -----------------------------------
+            let mut depth_ceiling = DepthCeiling::new(12, 16);
+            let mut halted_by_depth = 0u64;
+            for hop in 0..40u32 {
+                if depth_ceiling
+                    .evaluate(&reaction(hop, "chain-root"))
+                    .is_halted()
+                {
+                    halted_by_depth += 1;
+                }
             }
-        }
-        let max_depth = depth_ceiling.max_observed_depth();
+            let max_depth = depth_ceiling.max_observed_depth();
 
-        // ---- (load 2) a WIDE fan-out: 20 reactions off ONE root within the window → the shared-root
-        // tripwire fires. (Each is shallow, so a depth ceiling alone would miss it.) ------------------
-        let mut tripwire_fired = 0u64;
-        for _ in 0..20 {
-            if guard.tripwire.record(&reaction(2, "fanout-root")).is_fired() {
-                tripwire_fired += 1;
+            // ---- (load 2) a WIDE fan-out: 20 reactions off ONE root within the window → the shared-root
+            // tripwire fires. (Each is shallow, so a depth ceiling alone would miss it.) ------------------
+            let mut tripwire_fired = 0u64;
+            for _ in 0..20 {
+                if guard
+                    .tripwire
+                    .record(&reaction(2, "fanout-root"))
+                    .is_fired()
+                {
+                    tripwire_fired += 1;
+                }
             }
-        }
 
-        // ---- (load 3) a CONCURRENCY surge: 12 distinct-root shallow reactions at a pool of 4 → 8 are
-        // dropped (never forked). Use the pool directly (distinct roots so only the pool can trip). ----
-        let mut pool_drops = 0u64;
-        for i in 0..12 {
-            if let GuardOutcome::HaltedByPool = guard_admit_distinct(&mut guard, i) {
-                pool_drops += 1;
+            // ---- (load 3) a CONCURRENCY surge: 12 distinct-root shallow reactions at a pool of 4 → 8 are
+            // dropped (never forked). Use the pool directly (distinct roots so only the pool can trip). ----
+            let mut pool_drops = 0u64;
+            for i in 0..12 {
+                if let GuardOutcome::HaltedByPool = guard_admit_distinct(&mut guard, i) {
+                    pool_drops += 1;
+                }
             }
-        }
 
-        // Record the three contract-1.8 survival signals (the producer side wires this off the real
-        // dispatch-tier meter at EB-23/P-143; here the drill records what the guards observed).
-        ctx.signals
-            .set_scalar(SignalName::CausalDepthFirings, (halted_by_depth + tripwire_fired) as i64);
-        ctx.signals.set_scalar(SignalName::DispatchPoolDrops, pool_drops as i64);
+            // Record the three contract-1.8 survival signals (the producer side wires this off the real
+            // dispatch-tier meter at EB-23/P-143; here the drill records what the guards observed).
+            ctx.signals.set_scalar(
+                SignalName::CausalDepthFirings,
+                (halted_by_depth + tripwire_fired) as i64,
+            );
+            ctx.signals
+                .set_scalar(SignalName::DispatchPoolDrops, pool_drops as i64);
 
-        // restore the injected fault before returning (a re-run starts clean).
-        ctx.breaker
-            .restore_dependency(Dependency::Named("dispatch-tier".into()), myelin_harness::Scope::Global);
+            // restore the injected fault before returning (a re-run starts clean).
+            ctx.breaker.restore_dependency(
+                Dependency::Named("dispatch-tier".into()),
+                myelin_harness::Scope::Global,
+            );
 
-        // (assert) the loop was HALTED by the guards:
-        //   - the depth histogram is bounded (never climbed past the bucket ceiling — no runaway).
-        assert!(
-            max_depth < DepthCeiling::HIST_BUCKETS as u32,
-            "the causal-depth histogram must be BOUNDED (no unbounded climb): max={max_depth}"
-        );
-        assert!(halted_by_depth >= 1, "the deep chain must be halted by the depth ceiling");
-        assert!(tripwire_fired >= 1, "the wide fan-out must fire the shared-root tripwire");
-        assert!(pool_drops >= 1, "the concurrency surge must be dropped (never forked)");
+            // (assert) the loop was HALTED by the guards:
+            //   - the depth histogram is bounded (never climbed past the bucket ceiling — no runaway).
+            assert!(
+                max_depth < DepthCeiling::HIST_BUCKETS as u32,
+                "the causal-depth histogram must be BOUNDED (no unbounded climb): max={max_depth}"
+            );
+            assert!(
+                halted_by_depth >= 1,
+                "the deep chain must be halted by the depth ceiling"
+            );
+            assert!(
+                tripwire_fired >= 1,
+                "the wide fan-out must fire the shared-root tripwire"
+            );
+            assert!(
+                pool_drops >= 1,
+                "the concurrency surge must be dropped (never forked)"
+            );
 
-        // The single telemetry assertion that reads green: the loop-guard FIRED
-        // (`causal_depth_firings >= 1`) — the SUB-D8 survival signal. (The dispatch-pool-drops
-        // assertion below is the bounded-pool half; both must be green.)
-        ctx.signals
-            .assert_signal(SignalName::CausalDepthFirings, Predicate::Gte(1))
-    })
+            // The single telemetry assertion that reads green: the loop-guard FIRED
+            // (`causal_depth_firings >= 1`) — the SUB-D8 survival signal. (The dispatch-pool-drops
+            // assertion below is the bounded-pool half; both must be green.)
+            ctx.signals
+                .assert_signal(SignalName::CausalDepthFirings, Predicate::Gte(1))
+        },
+    )
 }
 
 /// Helper: admit a reaction at a DISTINCT root so the only cap that can trip is the dispatch pool
@@ -194,8 +222,10 @@ fn sub_d8_both_survival_signals_read_green() {
             for i in 0..12 {
                 guard_admit_distinct(&mut guard, i);
             }
-            ctx.signals
-                .set_scalar(SignalName::DispatchPoolDrops, guard.signals().dispatch_pool_drops as i64);
+            ctx.signals.set_scalar(
+                SignalName::DispatchPoolDrops,
+                guard.signals().dispatch_pool_drops as i64,
+            );
             ctx.signals
                 .assert_signal(SignalName::DispatchPoolDrops, Predicate::Gte(1))
                 .expect_green();

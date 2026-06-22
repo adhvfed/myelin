@@ -232,7 +232,10 @@ impl MisrouteAudit {
 
     /// Record a rejected misroute (loud, never swallowed — the attempt IS evidence).
     fn record(&self, rec: MisrouteAuditRecord) {
-        self.records.lock().unwrap_or_else(|e| e.into_inner()).push(rec);
+        self.records
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(rec);
     }
 
     /// **Record a rejected misroute from the repo-grain path** ([`crate::placement_of_repo`]) — the
@@ -244,7 +247,10 @@ impl MisrouteAudit {
 
     /// Every audited misroute so far (so a drill/test can assert the rejection was audited).
     pub fn records(&self) -> Vec<MisrouteAuditRecord> {
-        self.records.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.records
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// How many misroutes have been audited.
@@ -364,7 +370,9 @@ impl CellGateway {
                 received_by_cell: self.cell_id.clone(),
                 home_cell: None,
             });
-            return Err(GatewayReject::NoSuchTenant { tenant_id: tenant_id.clone() });
+            return Err(GatewayReject::NoSuchTenant {
+                tenant_id: tenant_id.clone(),
+            });
         };
 
         // 3. This cell homes the tenant → accept. The request is served entirely within this cell.
@@ -411,7 +419,9 @@ impl core::fmt::Debug for CellGateway {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{Capacity, Cell, CellStatus, IsolationKind, PlacementStatus, TenantPlacement};
+    use crate::schema::{
+        Capacity, Cell, CellStatus, IsolationKind, PlacementStatus, TenantPlacement,
+    };
 
     fn cell(id: &str, region: &str) -> Cell {
         Cell {
@@ -419,7 +429,11 @@ mod tests {
             region: Region::new(region),
             status: CellStatus::Active,
             isolation_kind: IsolationKind::Pool,
-            capacity: Capacity { tenants_max: 1000, write_qps_max: 5000, storage_bytes_max: 1 << 40 },
+            capacity: Capacity {
+                tenants_max: 1000,
+                write_qps_max: 5000,
+                storage_bytes_max: 1 << 40,
+            },
             utilisation: 10,
             version: 1,
             endpoint: format!("cell.{region}.{id}.myelin.eu"),
@@ -457,7 +471,11 @@ mod tests {
             .expect("a placed tenant resolves to a placement_of answer");
         assert_eq!(answer.region.as_str(), "eu-west");
         assert_eq!(answer.home_cell.as_str(), "cell-w-1");
-        assert_eq!(answer.member_cells.len(), 1, "v1 member_cells is single-element (the floor)");
+        assert_eq!(
+            answer.member_cells.len(),
+            1,
+            "v1 member_cells is single-element (the floor)"
+        );
         assert_eq!(answer.member_cells[0].as_str(), "cell-w-1");
         assert_eq!(answer.isolation_tier, IsolationKind::Pool);
         assert_eq!(answer.status, PlacementStatus::Active);
@@ -467,7 +485,9 @@ mod tests {
     #[test]
     fn placement_of_unknown_tenant_is_none() {
         let reg = registry_two_cells();
-        assert!(reg.placement_of(&TenantId::from_token("01J0GHOST")).is_none());
+        assert!(reg
+            .placement_of(&TenantId::from_token("01J0GHOST"))
+            .is_none());
     }
 
     // ----- the gateway-rejects-misroute path (architecture §5.3 layer 4; CP-D2) -----
@@ -484,7 +504,11 @@ mod tests {
         assert_eq!(answer.home_cell.as_str(), "cell-w-1");
         assert_eq!(gw.misroute_count(), 0, "an accept is not a misroute");
         assert_eq!(gw.audit().count(), 0, "nothing to audit on an accept");
-        assert_eq!(gw.cross_tenant_reads(), 0, "the home cell serving its own tenant is not cross-tenant");
+        assert_eq!(
+            gw.cross_tenant_reads(),
+            0,
+            "the home cell serving its own tenant is not cross-tenant"
+        );
     }
 
     /// **THE CP-D2 REJECTION — the gateway REJECTS (does not proxy) a request for a `tenant_id` it
@@ -521,10 +545,21 @@ mod tests {
             "the audit record is the PII-free misroute evidence (opaque ids only)"
         );
         // `misroute_count` increments; the CP-D2 ZERO holds — 0 cross-tenant rows served.
-        assert_eq!(gw.misroute_count(), 1, "misroute_count increments on a rejected misroute");
-        assert_eq!(gw.cross_tenant_reads(), 0, "0 cross-tenant/cross-cell rows read (the CP-D2 zero)");
+        assert_eq!(
+            gw.misroute_count(),
+            1,
+            "misroute_count increments on a rejected misroute"
+        );
+        assert_eq!(
+            gw.cross_tenant_reads(),
+            0,
+            "0 cross-tenant/cross-cell rows read (the CP-D2 zero)"
+        );
         // The reject Display names the rule loudly (§5.3 layer 4).
-        assert!(reject.to_string().contains("REJECTED (not proxied)"), "loud: {reject}");
+        assert!(
+            reject.to_string().contains("REJECTED (not proxied)"),
+            "loud: {reject}"
+        );
     }
 
     /// **A request for an UNKNOWN tenant is rejected (no redirect target) + audited.** The control
@@ -539,14 +574,27 @@ mod tests {
             .expect_err("an unknown tenant is rejected (no route)");
         assert_eq!(
             reject,
-            GatewayReject::NoSuchTenant { tenant_id: TenantId::from_token("01J0GHOST") }
+            GatewayReject::NoSuchTenant {
+                tenant_id: TenantId::from_token("01J0GHOST")
+            }
         );
         // Audited (with no home cell) + counted; still 0 cross-tenant reads.
-        assert_eq!(gw.audit().count(), 1, "the unknown-tenant rejection is audited");
-        assert_eq!(gw.audit().records()[0].home_cell, None, "no redirect target for an unknown tenant");
+        assert_eq!(
+            gw.audit().count(),
+            1,
+            "the unknown-tenant rejection is audited"
+        );
+        assert_eq!(
+            gw.audit().records()[0].home_cell,
+            None,
+            "no redirect target for an unknown tenant"
+        );
         assert_eq!(gw.misroute_count(), 1);
         assert_eq!(gw.cross_tenant_reads(), 0);
-        assert!(reject.to_string().contains("no redirect target"), "loud: {reject}");
+        assert!(
+            reject.to_string().contains("no redirect target"),
+            "loud: {reject}"
+        );
     }
 
     /// **The gateway never proxies — a misroute is a REDIRECT, and the home cell's OWN gateway then
@@ -568,7 +616,11 @@ mod tests {
             .route(&reg, &TenantId::from_token("01J0ACME"))
             .expect("the home cell serves the redirected request");
         assert_eq!(served.home_cell, redirect.correct_cell);
-        assert_eq!(home.misroute_count(), 0, "the home cell does not misroute its own tenant");
+        assert_eq!(
+            home.misroute_count(),
+            0,
+            "the home cell does not misroute its own tenant"
+        );
         // Neither gateway served a cross-tenant read.
         assert_eq!(wrong.cross_tenant_reads(), 0);
         assert_eq!(home.cross_tenant_reads(), 0);
@@ -594,9 +646,21 @@ mod tests {
         assert!(gw.route(&reg, &TenantId::from_token("01J0BETA")).is_err());
         assert!(gw.route(&reg, &TenantId::from_token("01J0BETA")).is_err());
         assert!(gw.route(&reg, &TenantId::from_token("01J0GHOST")).is_err());
-        assert_eq!(gw.misroute_count(), 3, "each misroute (incl. unknown) is counted");
-        assert_eq!(gw.audit().count(), 3, "each misroute is audited (append-only, none swallowed)");
-        assert_eq!(gw.cross_tenant_reads(), 0, "still 0 cross-tenant reads across all misroutes");
+        assert_eq!(
+            gw.misroute_count(),
+            3,
+            "each misroute (incl. unknown) is counted"
+        );
+        assert_eq!(
+            gw.audit().count(),
+            3,
+            "each misroute is audited (append-only, none swallowed)"
+        );
+        assert_eq!(
+            gw.cross_tenant_reads(),
+            0,
+            "still 0 cross-tenant reads across all misroutes"
+        );
     }
 
     /// The `CellGateway` Debug is PII-free + aggregate-only (the cell id + counters, never a tenant
@@ -607,9 +671,18 @@ mod tests {
         let gw = CellGateway::new(CellId::from_token("cell-w-2"));
         let _ = gw.route(&reg, &TenantId::from_token("01J0ACME"));
         let dbg = format!("{gw:?}");
-        assert!(dbg.contains("cell-w-2"), "the Debug shows the cell id: {dbg}");
-        assert!(dbg.contains("misroute_count"), "the Debug shows the aggregate count: {dbg}");
+        assert!(
+            dbg.contains("cell-w-2"),
+            "the Debug shows the cell id: {dbg}"
+        );
+        assert!(
+            dbg.contains("misroute_count"),
+            "the Debug shows the aggregate count: {dbg}"
+        );
         // The misrouted tenant id is NOT in the Debug surface (PII-free log discipline).
-        assert!(!dbg.contains("01J0ACME"), "the Debug leaks no tenant id: {dbg}");
+        assert!(
+            !dbg.contains("01J0ACME"),
+            "the Debug leaks no tenant id: {dbg}"
+        );
     }
 }

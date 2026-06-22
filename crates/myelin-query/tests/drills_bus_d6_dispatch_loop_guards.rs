@@ -111,7 +111,11 @@ fn bus_d6_depth_ceiling_halts_a_deepening_chain_at_the_ceiling() {
     let mut dispatched = 0u64;
     for depth in (CAUSAL_DEPTH_CEILING - 3)..=(CAUSAL_DEPTH_CEILING + 1) {
         let ev = chain_event("loop-agent", depth as u64, depth, "root-deep");
-        match tier.dispatch(&req(ev, depth as u64), || EventId(format!("act-{depth}")), &Timestamp("2026-06-20T00:00:01Z".into())) {
+        match tier.dispatch(
+            &req(ev, depth as u64),
+            || EventId(format!("act-{depth}")),
+            &Timestamp("2026-06-20T00:00:01Z".into()),
+        ) {
             Disposition::Delivered { action } => {
                 dispatched += 1;
                 // The dispatched action is strictly deeper than its trigger (nested, never flat).
@@ -125,14 +129,30 @@ fn bus_d6_depth_ceiling_halts_a_deepening_chain_at_the_ceiling() {
         }
     }
     let parked = parked_at.expect("the chain parked at the ceiling, never recursed unboundedly");
-    assert!(parked >= CAUSAL_DEPTH_CEILING, "halted at ≤ ceiling (parked at {parked})");
-    assert_eq!(tier.telemetry().depth_ceiling_parked, 1, "exactly one park recorded");
-    assert!(dispatched <= 3, "the chain halted in a bounded number of hops, not unboundedly");
+    assert!(
+        parked >= CAUSAL_DEPTH_CEILING,
+        "halted at ≤ ceiling (parked at {parked})"
+    );
+    assert_eq!(
+        tier.telemetry().depth_ceiling_parked,
+        1,
+        "exactly one park recorded"
+    );
+    assert!(
+        dispatched <= 3,
+        "the chain halted in a bounded number of hops, not unboundedly"
+    );
 
     // The §10.2 survival signal reads the ceiling fired.
     let mut src = SignalSource::new();
-    bridge(&mut src, tier.telemetry().depth_ceiling_parked as i64, false, 0);
-    src.assert_signal(SignalName::CausalDepthFirings, Predicate::Gte(1)).expect_green();
+    bridge(
+        &mut src,
+        tier.telemetry().depth_ceiling_parked as i64,
+        false,
+        0,
+    );
+    src.assert_signal(SignalName::CausalDepthFirings, Predicate::Gte(1))
+        .expect_green();
 }
 
 /// **BUS-D6 LEG 2 (the headline) — the shared-causal-root tripwire trips the per-tenant breaker.**
@@ -149,7 +169,11 @@ fn bus_d6_shared_root_tripwire_trips_the_per_tenant_breaker_and_sheds() {
     let mut shed = 0u64;
     for n in 0..20u64 {
         let ev = chain_event("loop-agent", n, 1, root); // depth 1 — under the ceiling
-        match tier.dispatch(&req(ev, n), || EventId(format!("act-{n}")), &Timestamp("2026-06-20T00:00:01Z".into())) {
+        match tier.dispatch(
+            &req(ev, n),
+            || EventId(format!("act-{n}")),
+            &Timestamp("2026-06-20T00:00:01Z".into()),
+        ) {
             Disposition::Delivered { .. } => {}
             Disposition::BreakerShed { shed: s } => {
                 assert_eq!(s.status, 429, "the shed is 429 + Retry-After, never silent");
@@ -165,14 +189,30 @@ fn bus_d6_shared_root_tripwire_trips_the_per_tenant_breaker_and_sheds() {
     // GATE: the breaker tripped (exactly once), the over-K root crossed the tripwire, and the
     // post-trip dispatches were shed — halts (the storm bounded), breaker trips.
     assert!(tier.breaker_open(&t1), "the per-tenant breaker is OPEN");
-    assert_eq!(tier.telemetry().tripwire_firings, 1, "the tripwire fired exactly once");
-    assert!(tier.root_count(&t1, &CorrelationId(root.into())) > 5, "the shared-root counter crossed K");
-    assert!(shed >= 1, "post-trip dispatches were shed (the storm halted)");
+    assert_eq!(
+        tier.telemetry().tripwire_firings,
+        1,
+        "the tripwire fired exactly once"
+    );
+    assert!(
+        tier.root_count(&t1, &CorrelationId(root.into())) > 5,
+        "the shared-root counter crossed K"
+    );
+    assert!(
+        shed >= 1,
+        "post-trip dispatches were shed (the storm halted)"
+    );
 
     // The §10.2 survival signals read the verdict: tripwire fired, breaker OPEN, lane shed.
     let mut src = SignalSource::new();
-    bridge(&mut src, tier.telemetry().tripwire_firings as i64, true, shed as i64);
-    src.assert_signal(SignalName::CausalDepthFirings, Predicate::Gte(1)).expect_green();
+    bridge(
+        &mut src,
+        tier.telemetry().tripwire_firings as i64,
+        true,
+        shed as i64,
+    );
+    src.assert_signal(SignalName::CausalDepthFirings, Predicate::Gte(1))
+        .expect_green();
     src.assert_labelled(
         SignalName::BreakerState,
         vec![Label::new("downstream", "dispatch:t1")],
@@ -196,7 +236,11 @@ fn bus_d6_breaker_is_per_tenant_blast_radius_limited() {
     // Storm t1's root until it trips.
     for n in 0..10u64 {
         let ev = chain_event("loop-agent", n, 1, "root-t1");
-        let _ = tier.dispatch(&req(ev, n), || EventId(format!("t1-{n}")), &Timestamp("2026-06-20T00:00:01Z".into()));
+        let _ = tier.dispatch(
+            &req(ev, n),
+            || EventId(format!("t1-{n}")),
+            &Timestamp("2026-06-20T00:00:01Z".into()),
+        );
     }
     assert!(tier.breaker_open(&TenantId("t1".into())));
 
@@ -213,6 +257,12 @@ fn bus_d6_breaker_is_per_tenant_blast_radius_limited() {
         || EventId("t2-act".into()),
         &Timestamp("2026-06-20T00:00:01Z".into()),
     );
-    assert!(matches!(disp, Disposition::Delivered { .. }), "t2 is unaffected by t1's breaker");
-    assert!(!tier.breaker_open(&TenantId("t2".into())), "t2's breaker is closed");
+    assert!(
+        matches!(disp, Disposition::Delivered { .. }),
+        "t2 is unaffected by t1's breaker"
+    );
+    assert!(
+        !tier.breaker_open(&TenantId("t2".into())),
+        "t2's breaker is closed"
+    );
 }

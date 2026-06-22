@@ -94,7 +94,11 @@ fn refs_rows() -> Vec<RefsRow> {
 #[test]
 fn there_are_exactly_four_refs_lints() {
     // The REF-P2 obligation is the FOUR lints Refs leans on — no more, no less.
-    assert_eq!(refs_rows().len(), 4, "REF-P2 wires exactly the four Refs lints");
+    assert_eq!(
+        refs_rows().len(),
+        4,
+        "REF-P2 wires exactly the four Refs lints"
+    );
 }
 
 #[test]

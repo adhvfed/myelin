@@ -18,7 +18,9 @@
 //! compiling/passing.
 
 use myelin_git::shed_clone::GitFrontDoorShed;
-use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus, RuntimeRef};
+use myelin_identity::{
+    DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus, RuntimeRef,
+};
 use myelin_substrate::shed::{RunClass, RunClassHeader, Surface};
 use myelin_substrate::thresholds::Thresholds;
 use myelin_tenancy::{Region, TenantId};
@@ -55,9 +57,18 @@ fn cdc_1_11_git_front_door_reads_its_shed_budget_from_the_thresholds_file() {
     let budget = thresholds
         .shed_budget(Surface::GitFrontDoor)
         .expect("the thresholds file carries a GitFrontDoor shed-budget row (OQ-K)");
-    assert!(budget.per_tenant_in_flight_cap > 0, "the surface is bounded (§7.1)");
-    assert!(budget.human_lane_reservation > 0, "a human lane is reserved");
-    assert!(budget.retry_after_secs > 0, "the surface sheds with a Retry-After (clients honour it)");
+    assert!(
+        budget.per_tenant_in_flight_cap > 0,
+        "the surface is bounded (§7.1)"
+    );
+    assert!(
+        budget.human_lane_reservation > 0,
+        "a human lane is reserved"
+    );
+    assert!(
+        budget.retry_after_secs > 0,
+        "the surface sheds with a Retry-After (clients honour it)"
+    );
 
     // the consumer opens against the file's budget.
     GitFrontDoorShed::from_thresholds(&thresholds).expect("the front-door shed gate opens");
@@ -70,7 +81,9 @@ fn cdc_1_11_git_front_door_reads_its_shed_budget_from_the_thresholds_file() {
 #[test]
 fn cdc_1_11_git_shed_serves_the_human_and_sheds_the_agent_lane() {
     let thresholds = Thresholds::load_canonical().expect("load");
-    let budget = thresholds.shed_budget(Surface::GitFrontDoor).expect("present");
+    let budget = thresholds
+        .shed_budget(Surface::GitFrontDoor)
+        .expect("present");
     let mut gate = GitFrontDoorShed::from_thresholds(&thresholds).expect("open");
 
     let t = "acme";
@@ -102,7 +115,8 @@ fn cdc_1_11_git_shed_serves_the_human_and_sheds_the_agent_lane() {
 
     // THE CONTRACT: the human's interactive fetch is STILL SERVED (the protected lane).
     assert_eq!(
-        gate.admit_for(&h, None).expect("the human is served while the agent sheds"),
+        gate.admit_for(&h, None)
+            .expect("the human is served while the agent sheds"),
         RunClass::Human
     );
     // the green-artifact signal: human lane 0 shed, agent lane sheds.
@@ -119,11 +133,15 @@ fn cdc_1_11_a_machine_principal_cannot_spoof_the_human_lane() {
 
     // a service principal derives the batch/ci lane (no header).
     let svc = principal("acme", PrincipalKind::Service);
-    assert_eq!(gate.admit_for(&svc, None).expect("admitted"), RunClass::BatchCi);
+    assert_eq!(
+        gate.admit_for(&svc, None).expect("admitted"),
+        RunClass::BatchCi
+    );
     // a header may only down-class — a service declaring speculative is speculative, never human.
     let svc2 = principal("acme", PrincipalKind::Service);
     assert_eq!(
-        gate.admit_for(&svc2, Some(RunClassHeader::Speculative)).expect("admitted"),
+        gate.admit_for(&svc2, Some(RunClassHeader::Speculative))
+            .expect("admitted"),
         RunClass::Speculative,
         "the human lane is structurally unspoofable (no human header exists)"
     );

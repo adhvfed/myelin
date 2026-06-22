@@ -29,8 +29,8 @@
 use myelin_events::{OutboxStore, Timestamp};
 use myelin_identity::{
     Consistency, ConsistencyMode, Decision, FragmentAdmit, IdentityService, NamespaceFragment,
-    ObjectId, ObjectType, Permission, Principal, PrincipalId, PrincipalKind, RelName, RelationTuple,
-    TupleDelta, Zookie,
+    ObjectId, ObjectType, Permission, Principal, PrincipalId, PrincipalKind, RelName,
+    RelationTuple, TupleDelta, Zookie,
 };
 use myelin_identity_service::{
     FragmentDef, NamespaceEngine, PermissionRule, StoreBackedCheck, TupleStore, Userset,
@@ -242,7 +242,13 @@ fn cdc_4_9_confidential_set_difference_resolves_leak_free() {
     let issue = ArtifactRef("issue:secret".into());
     let can_view = |actor: &Principal| {
         matches!(
-            svc.check(actor, &Permission("view".into()), &issue, &at_latest(), None),
+            svc.check(
+                actor,
+                &Permission("view".into()),
+                &issue,
+                &at_latest(),
+                None
+            ),
             Ok(Decision::Allow)
         )
     };
@@ -267,11 +273,20 @@ fn cdc_4_9_confidential_set_difference_resolves_leak_free() {
     // `comment = view` carries the SAME exclusion: dave cannot comment either.
     let can_comment = |actor: &Principal| {
         matches!(
-            svc.check(actor, &Permission("comment".into()), &issue, &at_latest(), None),
+            svc.check(
+                actor,
+                &Permission("comment".into()),
+                &issue,
+                &at_latest(),
+                None
+            ),
             Ok(Decision::Allow)
         )
     };
-    assert!(can_comment(&subject("p:carol")), "the grantee can comment (comment = view)");
+    assert!(
+        can_comment(&subject("p:carol")),
+        "the grantee can comment (comment = view)"
+    );
     assert!(
         !can_comment(&subject("p:dave")),
         "the excluded non-grantee cannot comment either (comment = view, same exclusion)"
@@ -330,11 +345,20 @@ fn cdc_4_9_transition_resolves_through_assignee_and_inheritance() {
     let issue = ArtifactRef("issue:eng-1".into());
     let can_transition = |actor: &Principal| {
         matches!(
-            svc.check(actor, &Permission("transition".into()), &issue, &at_latest(), None),
+            svc.check(
+                actor,
+                &Permission("transition".into()),
+                &issue,
+                &at_latest(),
+                None
+            ),
             Ok(Decision::Allow)
         )
     };
-    assert!(can_transition(&subject("p:frank")), "the assignee can transition");
+    assert!(
+        can_transition(&subject("p:frank")),
+        "the assignee can transition"
+    );
     assert!(
         can_transition(&subject("p:grace")),
         "a project member inherits transition (parent_project->write maps to core view)"

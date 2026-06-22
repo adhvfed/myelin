@@ -70,17 +70,27 @@ fn doc(id: &str, text: &str) -> IndexDocument {
 }
 
 fn viewer() -> Principal {
-    Principal::stub(PrincipalId("p:alice".into()), PrincipalKind::Human, TenantId("acme".into()))
+    Principal::stub(
+        PrincipalId("p:alice".into()),
+        PrincipalKind::Human,
+        TenantId("acme".into()),
+    )
 }
 
 /// A zookie-stamped STRONG read at watermark `rev` (read-your-writes — bypasses fail-static).
 fn strong_at(rev: u64) -> Consistency {
-    Consistency { at_least: Zookie(format!("z@{rev}")), mode: ConsistencyMode::Strong }
+    Consistency {
+        at_least: Zookie(format!("z@{rev}")),
+        mode: ConsistencyMode::Strong,
+    }
 }
 
 /// A default-consistency BoundedStale read at watermark `rev` (fail-static eligible).
 fn bounded_at(rev: u64) -> Consistency {
-    Consistency { at_least: Zookie(format!("z@{rev}")), mode: ConsistencyMode::BoundedStale }
+    Consistency {
+        at_least: Zookie(format!("z@{rev}")),
+        mode: ConsistencyMode::BoundedStale,
+    }
 }
 
 fn ast(p: Predicate) -> QueryAst {
@@ -102,7 +112,11 @@ struct FixedAuthz {
 }
 impl FixedAuthz {
     fn new(ids: &[&'static str], zookie: &'static str) -> FixedAuthz {
-        FixedAuthz { ids: ids.to_vec(), zookie, calls: AtomicU64::new(0) }
+        FixedAuthz {
+            ids: ids.to_vec(),
+            zookie,
+            calls: AtomicU64::new(0),
+        }
     }
 }
 impl myelin_search::ListObjectsPort for FixedAuthz {
@@ -131,7 +145,10 @@ struct Revoker {
 }
 impl Revoker {
     fn new(revoked: &[&'static str]) -> Revoker {
-        Revoker { revoked: revoked.to_vec(), checks: AtomicU64::new(0) }
+        Revoker {
+            revoked: revoked.to_vec(),
+            checks: AtomicU64::new(0),
+        }
     }
 }
 impl BoundedCheckPort for Revoker {
@@ -157,15 +174,23 @@ impl BoundedCheckPort for Revoker {
 fn srch_d2_zero_stale_allow_with_zookie() {
     let mut be = TantivyBackend::open(&facet_decl()).expect("open");
     // The doc was indexed under the OLD ACL projection (zookie z@5) — before the revoke.
-    be.upsert_stamped(&doc("acme/issue/SECRET-9", "deadlock secret incident"), "z@5", 5)
-        .unwrap();
+    be.upsert_stamped(
+        &doc("acme/issue/SECRET-9", "deadlock secret incident"),
+        "z@5",
+        5,
+    )
+    .unwrap();
     let eng = ScopedEngine::new(&be, "acme", "eu-west", schema());
 
     // The STALE list_objects projection STILL lists SECRET-9 (the revoke has not re-indexed yet).
     let authz = FixedAuthz::new(&["acme/issue/SECRET-9"], "z-acl");
     // The source has REVOKED the grant — the bounded check denies at the demanded snapshot.
     let revoker = Revoker::new(&["acme/issue/SECRET-9"]);
-    let q = ast(Predicate::Cmp { op: CmpOp::Eq, lhs: var(FT_BODY_FIELD), rhs: s("deadlock") });
+    let q = ast(Predicate::Cmp {
+        op: CmpOp::Eq,
+        lhs: var(FT_BODY_FIELD),
+        rhs: s("deadlock"),
+    });
 
     let stats = QueryStats::new();
     let cstats = ConsistencyStats::new();
@@ -184,12 +209,35 @@ fn srch_d2_zero_stale_allow_with_zookie() {
     )
     .expect("query");
 
-    assert!(res.hits.is_empty(), "0 stale-allow: the revoked doc is EXCLUDED, never served stale");
-    assert_eq!(cstats.revalidated(), 1, "exactly the ONE stale candidate was re-validated (no N+1)");
-    assert_eq!(cstats.excluded_stale(), 1, "the zero-escape-under-staleness counter: 1 excluded");
-    assert_eq!(revoker.checks.load(Ordering::Relaxed), 1, "exactly one bounded check (affected set)");
-    assert_eq!(stats.list_objects_calls(), 1, "still exactly one list_objects (no N+1)");
-    assert_eq!(cstats.fail_static_bypassed(), 1, "a zookie-stamped read BYPASSES the fail-static cache");
+    assert!(
+        res.hits.is_empty(),
+        "0 stale-allow: the revoked doc is EXCLUDED, never served stale"
+    );
+    assert_eq!(
+        cstats.revalidated(),
+        1,
+        "exactly the ONE stale candidate was re-validated (no N+1)"
+    );
+    assert_eq!(
+        cstats.excluded_stale(),
+        1,
+        "the zero-escape-under-staleness counter: 1 excluded"
+    );
+    assert_eq!(
+        revoker.checks.load(Ordering::Relaxed),
+        1,
+        "exactly one bounded check (affected set)"
+    );
+    assert_eq!(
+        stats.list_objects_calls(),
+        1,
+        "still exactly one list_objects (no N+1)"
+    );
+    assert_eq!(
+        cstats.fail_static_bypassed(),
+        1,
+        "a zookie-stamped read BYPASSES the fail-static cache"
+    );
 }
 
 /// **The chained grant→search→revoke→re-search ladder.** Before the revoke (the bounded check
@@ -198,10 +246,18 @@ fn srch_d2_zero_stale_allow_with_zookie() {
 #[test]
 fn srch_d2_chained_grant_then_revoke_excludes() {
     let mut be = TantivyBackend::open(&facet_decl()).expect("open");
-    be.upsert_stamped(&doc("acme/issue/SECRET-9", "deadlock secret incident"), "z@5", 5)
-        .unwrap();
+    be.upsert_stamped(
+        &doc("acme/issue/SECRET-9", "deadlock secret incident"),
+        "z@5",
+        5,
+    )
+    .unwrap();
     let eng = ScopedEngine::new(&be, "acme", "eu-west", schema());
-    let q = ast(Predicate::Cmp { op: CmpOp::Eq, lhs: var(FT_BODY_FIELD), rhs: s("deadlock") });
+    let q = ast(Predicate::Cmp {
+        op: CmpOp::Eq,
+        lhs: var(FT_BODY_FIELD),
+        rhs: s("deadlock"),
+    });
     let authz = FixedAuthz::new(&["acme/issue/SECRET-9"], "z-acl");
 
     // GRANTED: the bounded check ALLOWS (nothing revoked) → the stale candidate is re-validated and
@@ -209,27 +265,57 @@ fn srch_d2_chained_grant_then_revoke_excludes() {
     let granted = Revoker::new(&[]);
     let cstats1 = ConsistencyStats::new();
     let res1 = query_consistent(
-        &eng, &authz, Some(&granted), &q, &viewer(), &ObjectType("issue".into()),
-        &strong_at(9), Page::FIRST, &QueryStats::new(), &cstats1,
+        &eng,
+        &authz,
+        Some(&granted),
+        &q,
+        &viewer(),
+        &ObjectType("issue".into()),
+        &strong_at(9),
+        Page::FIRST,
+        &QueryStats::new(),
+        &cstats1,
     )
     .expect("q1");
     assert_eq!(
-        res1.hits.iter().map(|h| h.doc_id.as_str()).collect::<Vec<_>>(),
+        res1.hits
+            .iter()
+            .map(|h| h.doc_id.as_str())
+            .collect::<Vec<_>>(),
         ["acme/issue/SECRET-9"],
         "a stale-but-STILL-granted candidate is re-validated and surfaces"
     );
-    assert_eq!(cstats1.revalidated(), 1, "the stale candidate was re-validated");
-    assert_eq!(cstats1.excluded_stale(), 0, "and admitted (the grant survived the snapshot)");
+    assert_eq!(
+        cstats1.revalidated(),
+        1,
+        "the stale candidate was re-validated"
+    );
+    assert_eq!(
+        cstats1.excluded_stale(),
+        0,
+        "and admitted (the grant survived the snapshot)"
+    );
 
     // REVOKED: the bounded check now DENIES → the SAME stale candidate is excluded.
     let revoked = Revoker::new(&["acme/issue/SECRET-9"]);
     let cstats2 = ConsistencyStats::new();
     let res2 = query_consistent(
-        &eng, &authz, Some(&revoked), &q, &viewer(), &ObjectType("issue".into()),
-        &strong_at(9), Page::FIRST, &QueryStats::new(), &cstats2,
+        &eng,
+        &authz,
+        Some(&revoked),
+        &q,
+        &viewer(),
+        &ObjectType("issue".into()),
+        &strong_at(9),
+        Page::FIRST,
+        &QueryStats::new(),
+        &cstats2,
     )
     .expect("q2");
-    assert!(res2.hits.is_empty(), "after the revoke the doc is EXCLUDED (the new-enemy is kept out)");
+    assert!(
+        res2.hits.is_empty(),
+        "after the revoke the doc is EXCLUDED (the new-enemy is kept out)"
+    );
     assert_eq!(cstats2.excluded_stale(), 1, "the zero-escape counter fired");
 }
 
@@ -240,26 +326,52 @@ fn srch_d2_chained_grant_then_revoke_excludes() {
 fn srch_d2_only_stale_candidates_are_revalidated() {
     let mut be = TantivyBackend::open(&facet_decl()).expect("open");
     // FRESH: indexed at z@9 (== the query zookie) — its ACL projection reflects the snapshot.
-    be.upsert_stamped(&doc("acme/issue/FRESH-1", "deadlock fresh"), "z@9", 9).unwrap();
+    be.upsert_stamped(&doc("acme/issue/FRESH-1", "deadlock fresh"), "z@9", 9)
+        .unwrap();
     // STALE: indexed at z@4 (< the query zookie) — re-validated.
-    be.upsert_stamped(&doc("acme/issue/STALE-2", "deadlock stale"), "z@4", 4).unwrap();
+    be.upsert_stamped(&doc("acme/issue/STALE-2", "deadlock stale"), "z@4", 4)
+        .unwrap();
     let eng = ScopedEngine::new(&be, "acme", "eu-west", schema());
 
     let authz = FixedAuthz::new(&["acme/issue/FRESH-1", "acme/issue/STALE-2"], "z-acl");
     // Nothing revoked — the stale candidate's grant survives, so both surface.
     let allow = Revoker::new(&[]);
-    let q = ast(Predicate::Cmp { op: CmpOp::Eq, lhs: var(FT_BODY_FIELD), rhs: s("deadlock") });
+    let q = ast(Predicate::Cmp {
+        op: CmpOp::Eq,
+        lhs: var(FT_BODY_FIELD),
+        rhs: s("deadlock"),
+    });
     let cstats = ConsistencyStats::new();
     let res = query_consistent(
-        &eng, &authz, Some(&allow), &q, &viewer(), &ObjectType("issue".into()),
-        &strong_at(9), Page::FIRST, &QueryStats::new(), &cstats,
+        &eng,
+        &authz,
+        Some(&allow),
+        &q,
+        &viewer(),
+        &ObjectType("issue".into()),
+        &strong_at(9),
+        Page::FIRST,
+        &QueryStats::new(),
+        &cstats,
     )
     .expect("query");
 
-    let ids: std::collections::BTreeSet<&str> = res.hits.iter().map(|h| h.doc_id.as_str()).collect();
-    assert!(ids.contains("acme/issue/FRESH-1") && ids.contains("acme/issue/STALE-2"), "both visible: {ids:?}");
-    assert_eq!(cstats.revalidated(), 1, "ONLY the stale doc was re-validated (the fresh one is served as-is)");
-    assert_eq!(allow.checks.load(Ordering::Relaxed), 1, "exactly one bounded check — the affected set, no N+1");
+    let ids: std::collections::BTreeSet<&str> =
+        res.hits.iter().map(|h| h.doc_id.as_str()).collect();
+    assert!(
+        ids.contains("acme/issue/FRESH-1") && ids.contains("acme/issue/STALE-2"),
+        "both visible: {ids:?}"
+    );
+    assert_eq!(
+        cstats.revalidated(),
+        1,
+        "ONLY the stale doc was re-validated (the fresh one is served as-is)"
+    );
+    assert_eq!(
+        allow.checks.load(Ordering::Relaxed),
+        1,
+        "exactly one bounded check — the affected set, no N+1"
+    );
 }
 
 /// **Fail-static degrade-not-cascade: a default-consistency (BoundedStale) read does NOT bypass the
@@ -268,10 +380,15 @@ fn srch_d2_only_stale_candidates_are_revalidated() {
 #[test]
 fn srch_d2_fail_static_bounded_degrades_strong_bypasses() {
     let mut be = TantivyBackend::open(&facet_decl()).expect("open");
-    be.upsert_stamped(&doc("acme/issue/PUB-1", "deadlock public"), "z@5", 5).unwrap();
+    be.upsert_stamped(&doc("acme/issue/PUB-1", "deadlock public"), "z@5", 5)
+        .unwrap();
     let eng = ScopedEngine::new(&be, "acme", "eu-west", schema());
     let authz = FixedAuthz::new(&["acme/issue/PUB-1"], "z-acl");
-    let q = ast(Predicate::Cmp { op: CmpOp::Eq, lhs: var(FT_BODY_FIELD), rhs: s("deadlock") });
+    let q = ast(Predicate::Cmp {
+        op: CmpOp::Eq,
+        lhs: var(FT_BODY_FIELD),
+        rhs: s("deadlock"),
+    });
 
     // DEFAULT-CONSISTENCY (BoundedStale) at rev 5: the doc indexed at z@5 is NOT stale (5 == 5) — it
     // is served from the indexed filter (degrade-not-cascade, no re-validation, no cascade). No
@@ -279,31 +396,74 @@ fn srch_d2_fail_static_bounded_degrades_strong_bypasses() {
     let revoker = Revoker::new(&["acme/issue/PUB-1"]);
     let cstats_b = ConsistencyStats::new();
     let res_b = query_consistent(
-        &eng, &authz, Some(&revoker), &q, &viewer(), &ObjectType("issue".into()),
-        &bounded_at(5), Page::FIRST, &QueryStats::new(), &cstats_b,
+        &eng,
+        &authz,
+        Some(&revoker),
+        &q,
+        &viewer(),
+        &ObjectType("issue".into()),
+        &bounded_at(5),
+        Page::FIRST,
+        &QueryStats::new(),
+        &cstats_b,
     )
     .expect("bounded");
     assert_eq!(
-        res_b.hits.iter().map(|h| h.doc_id.as_str()).collect::<Vec<_>>(),
+        res_b
+            .hits
+            .iter()
+            .map(|h| h.doc_id.as_str())
+            .collect::<Vec<_>>(),
         ["acme/issue/PUB-1"],
         "default-consistency uses the cached/indexed filter (degrade-not-cascade)"
     );
-    assert_eq!(cstats_b.fail_static_served(), 1, "the BoundedStale read used the fail-static path");
-    assert_eq!(cstats_b.fail_static_bypassed(), 0, "a default-consistency read does NOT bypass");
-    assert_eq!(cstats_b.revalidated(), 0, "nothing stale at the indexed watermark — no re-check");
+    assert_eq!(
+        cstats_b.fail_static_served(),
+        1,
+        "the BoundedStale read used the fail-static path"
+    );
+    assert_eq!(
+        cstats_b.fail_static_bypassed(),
+        0,
+        "a default-consistency read does NOT bypass"
+    );
+    assert_eq!(
+        cstats_b.revalidated(),
+        0,
+        "nothing stale at the indexed watermark — no re-check"
+    );
 
     // ZOOKIE-STAMPED (Strong) at a NEWER rev 9: the SAME doc (indexed at z@5) is now stale (5 < 9) →
     // re-validated → the revoke DENIES → excluded. The strong read BYPASSES the fail-static cache.
     let revoker2 = Revoker::new(&["acme/issue/PUB-1"]);
     let cstats_s = ConsistencyStats::new();
     let res_s = query_consistent(
-        &eng, &authz, Some(&revoker2), &q, &viewer(), &ObjectType("issue".into()),
-        &strong_at(9), Page::FIRST, &QueryStats::new(), &cstats_s,
+        &eng,
+        &authz,
+        Some(&revoker2),
+        &q,
+        &viewer(),
+        &ObjectType("issue".into()),
+        &strong_at(9),
+        Page::FIRST,
+        &QueryStats::new(),
+        &cstats_s,
     )
     .expect("strong");
-    assert!(res_s.hits.is_empty(), "the strong read sees the revocation (the new-enemy is excluded)");
-    assert_eq!(cstats_s.fail_static_bypassed(), 1, "the zookie-stamped read BYPASSED the fail-static cache");
-    assert_eq!(cstats_s.fail_static_served(), 0, "and did NOT degrade on a stale grant");
+    assert!(
+        res_s.hits.is_empty(),
+        "the strong read sees the revocation (the new-enemy is excluded)"
+    );
+    assert_eq!(
+        cstats_s.fail_static_bypassed(),
+        1,
+        "the zookie-stamped read BYPASSED the fail-static cache"
+    );
+    assert_eq!(
+        cstats_s.fail_static_served(),
+        0,
+        "and did NOT degrade on a stale grant"
+    );
 }
 
 /// **No check port wired → a stale candidate is EXCLUDED pending re-index (fail CLOSED, ADR-03).**
@@ -311,10 +471,15 @@ fn srch_d2_fail_static_bounded_degrades_strong_bypasses() {
 #[test]
 fn srch_d2_no_check_port_excludes_stale_fail_closed() {
     let mut be = TantivyBackend::open(&facet_decl()).expect("open");
-    be.upsert_stamped(&doc("acme/issue/SECRET-9", "deadlock secret"), "z@5", 5).unwrap();
+    be.upsert_stamped(&doc("acme/issue/SECRET-9", "deadlock secret"), "z@5", 5)
+        .unwrap();
     let eng = ScopedEngine::new(&be, "acme", "eu-west", schema());
     let authz = FixedAuthz::new(&["acme/issue/SECRET-9"], "z-acl");
-    let q = ast(Predicate::Cmp { op: CmpOp::Eq, lhs: var(FT_BODY_FIELD), rhs: s("deadlock") });
+    let q = ast(Predicate::Cmp {
+        op: CmpOp::Eq,
+        lhs: var(FT_BODY_FIELD),
+        rhs: s("deadlock"),
+    });
 
     let cstats = ConsistencyStats::new();
     let res = query_consistent(
@@ -330,7 +495,18 @@ fn srch_d2_no_check_port_excludes_stale_fail_closed() {
         &cstats,
     )
     .expect("query");
-    assert!(res.hits.is_empty(), "fail CLOSED: the stale candidate is excluded pending re-index");
-    assert_eq!(cstats.excluded_stale(), 1, "the zero-escape counter fired without a check port");
-    assert_eq!(cstats.revalidated(), 0, "no bounded check could run (none wired) — excluded, not admitted");
+    assert!(
+        res.hits.is_empty(),
+        "fail CLOSED: the stale candidate is excluded pending re-index"
+    );
+    assert_eq!(
+        cstats.excluded_stale(),
+        1,
+        "the zero-escape counter fired without a check port"
+    );
+    assert_eq!(
+        cstats.revalidated(),
+        0,
+        "no bounded check could run (none wired) — excluded, not admitted"
+    );
 }

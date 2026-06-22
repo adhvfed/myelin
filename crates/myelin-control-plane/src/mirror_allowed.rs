@@ -388,7 +388,8 @@ mod tests {
         let mut gate = MirrorGate::new();
 
         let target = MirrorTarget::new("github.com", Region::new("us-east"));
-        let decision = gate.mirror_allowed(&reg, &TenantId::from_token("01J0ACME"), &target, &policy);
+        let decision =
+            gate.mirror_allowed(&reg, &TenantId::from_token("01J0ACME"), &target, &policy);
 
         assert_eq!(
             decision,
@@ -428,7 +429,8 @@ mod tests {
 
         // The `[OPEN — LEGAL]` counsel-ratified entry is recorded (the engineering fact).
         policy.record_mechanism("us-east");
-        let decision = gate.mirror_allowed(&reg, &TenantId::from_token("01J0ACME"), &target, &policy);
+        let decision =
+            gate.mirror_allowed(&reg, &TenantId::from_token("01J0ACME"), &target, &policy);
         assert_eq!(
             decision,
             MirrorDecision::Allow {
@@ -493,7 +495,8 @@ mod tests {
         let mut gate = MirrorGate::new();
 
         let target = MirrorTarget::new("mirror.nl.example", Region::new("nl-ams"));
-        let decision = gate.mirror_allowed(&reg, &TenantId::from_token("01J0ACME"), &target, &policy);
+        let decision =
+            gate.mirror_allowed(&reg, &TenantId::from_token("01J0ACME"), &target, &policy);
         assert_eq!(
             decision,
             MirrorDecision::Allow {
@@ -521,7 +524,8 @@ mod tests {
         let mut gate = MirrorGate::new();
 
         let target = MirrorTarget::new("git.acme.internal.fr", Region::new("fr-par"));
-        let decision = gate.mirror_allowed(&reg, &TenantId::from_token("01J0GHOST"), &target, &policy);
+        let decision =
+            gate.mirror_allowed(&reg, &TenantId::from_token("01J0GHOST"), &target, &policy);
         assert_eq!(
             decision,
             MirrorDecision::Deny {

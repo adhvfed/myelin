@@ -151,7 +151,9 @@ impl<C: Clock> std::fmt::Debug for FailStaticAuthz<C> {
         // Delegate to the inner `FailStatic` Debug, which deliberately prints only the window
         // bounds + the signal counters, NEVER the cached coarse-grant values (they are authz
         // answers, not for the log).
-        f.debug_struct("FailStaticAuthz").field("inner", &self.inner).finish()
+        f.debug_struct("FailStaticAuthz")
+            .field("inner", &self.inner)
+            .finish()
     }
 }
 
@@ -233,7 +235,10 @@ impl<C: Clock> FailStaticAuthz<C> {
         // is consulted. A stale ALLOW in the cache never overrides a revoke (the SUB-D4 "revoked
         // denied once the window closes" property; never an escalation of access).
         if subject_revoked {
-            return AuthzDecision { decision: Decision::Deny, served: AuthzServed::Revoked };
+            return AuthzDecision {
+                decision: Decision::Deny,
+                served: AuthzServed::Revoked,
+            };
         }
 
         match at.mode {
@@ -241,11 +246,15 @@ impl<C: Clock> FailStaticAuthz<C> {
             // Fail-closed-or-wait: hit the authoritative source; on a hiccup fail CLOSED. The cache
             // is neither read nor written — a strong read never serves (or caches) stale.
             ConsistencyMode::Strong => match source() {
-                Ok(decision) => AuthzDecision { decision, served: AuthzServed::SourceBypass },
+                Ok(decision) => AuthzDecision {
+                    decision,
+                    served: AuthzServed::SourceBypass,
+                },
                 // The new-enemy guard: a zookie read does NOT fall back to stale — it fails closed.
-                Err(_hiccup) => {
-                    AuthzDecision { decision: Decision::Deny, served: AuthzServed::BypassClosed }
-                }
+                Err(_hiccup) => AuthzDecision {
+                    decision: Decision::Deny,
+                    served: AuthzServed::BypassClosed,
+                },
             },
 
             // ── Default-consistency (BoundedStale) read → consult the cache (the availability win). ──
@@ -265,10 +274,19 @@ impl<C: Clock> FailStaticAuthz<C> {
 /// out so the branch logic is one testable unit (the mutation floor reads it).
 fn serve_answer(answer: Answer<CoarseAuthz>) -> AuthzDecision {
     match answer {
-        Answer::Fresh(grant) => AuthzDecision { decision: grant.decision, served: AuthzServed::Fresh },
-        Answer::Static(grant) => AuthzDecision { decision: grant.decision, served: AuthzServed::Static },
+        Answer::Fresh(grant) => AuthzDecision {
+            decision: grant.decision,
+            served: AuthzServed::Fresh,
+        },
+        Answer::Static(grant) => AuthzDecision {
+            decision: grant.decision,
+            served: AuthzServed::Static,
+        },
         // Closed: budget spent or no fallback → fail CLOSED (deny is correct). NEVER open.
-        Answer::Closed => AuthzDecision { decision: Decision::Deny, served: AuthzServed::Closed },
+        Answer::Closed => AuthzDecision {
+            decision: Decision::Deny,
+            served: AuthzServed::Closed,
+        },
     }
 }
 
@@ -298,10 +316,16 @@ mod tests {
     }
 
     fn bounded_stale() -> Consistency {
-        Consistency { at_least: Zookie(String::new()), mode: ConsistencyMode::BoundedStale }
+        Consistency {
+            at_least: Zookie(String::new()),
+            mode: ConsistencyMode::BoundedStale,
+        }
     }
     fn strong(z: &str) -> Consistency {
-        Consistency { at_least: Zookie(z.into()), mode: ConsistencyMode::Strong }
+        Consistency {
+            at_least: Zookie(z.into()),
+            mode: ConsistencyMode::Strong,
+        }
     }
 
     fn allow() -> Result<Decision, ServeError> {
@@ -322,7 +346,11 @@ mod tests {
             other => panic!("a static_max over the revocation SLA must reject, got {other:?}"),
         }
         // the valid seed (300 == SLA) constructs; its static_max is the seed W.
-        assert_eq!(authz_at(0).static_max(), 300, "W is the thresholds-file engineering seed");
+        assert_eq!(
+            authz_at(0).static_max(),
+            300,
+            "W is the thresholds-file engineering seed"
+        );
     }
 
     /// **Within W a hiccup serves STALE + degraded (never open).** A `BoundedStale` read caches a
@@ -339,9 +367,19 @@ mod tests {
         // past fresh_ttl (age 31 > 30), within static_max → STATIC (degraded) on a hiccup.
         fs.clock().advance(31);
         let stale = fs.serve("acme|eu|alice|read@doc:1", &bounded_stale(), false, hiccup);
-        assert_eq!(stale.served, AuthzServed::Static, "the hiccup is survived on the static fallback");
-        assert!(stale.is_allow(), "authenticated traffic survives the hiccup (still Allow)");
-        assert!(stale.is_degraded(), "the answer is marked degraded (bounded-staleness win)");
+        assert_eq!(
+            stale.served,
+            AuthzServed::Static,
+            "the hiccup is survived on the static fallback"
+        );
+        assert!(
+            stale.is_allow(),
+            "authenticated traffic survives the hiccup (still Allow)"
+        );
+        assert!(
+            stale.is_degraded(),
+            "the answer is marked degraded (bounded-staleness win)"
+        );
     }
 
     /// **Past W a `BoundedStale` read fails CLOSED (never open).** The staleness budget is bounded
@@ -353,8 +391,15 @@ mod tests {
         let _ = fs.serve("k", &bounded_stale(), false, allow);
         fs.clock().advance(301); // age 301 > 300 static_max
         let closed = fs.serve("k", &bounded_stale(), false, hiccup);
-        assert_eq!(closed.served, AuthzServed::Closed, "past the budget the cache fails closed");
-        assert!(closed.is_deny(), "fail CLOSED (deny is correct), never fail open");
+        assert_eq!(
+            closed.served,
+            AuthzServed::Closed,
+            "past the budget the cache fails closed"
+        );
+        assert!(
+            closed.is_deny(),
+            "fail CLOSED (deny is correct), never fail open"
+        );
     }
 
     /// **A cold `BoundedStale` hiccup with no fallback fails CLOSED (never open).** A hiccup before
@@ -363,8 +408,15 @@ mod tests {
     fn cold_bounded_stale_hiccup_fails_closed() {
         let fs = authz_at(0);
         let cold = fs.serve("never-seen", &bounded_stale(), false, hiccup);
-        assert_eq!(cold.served, AuthzServed::Closed, "no fallback → fail closed");
-        assert!(cold.is_deny(), "the cache never fabricates an allow (never fail open)");
+        assert_eq!(
+            cold.served,
+            AuthzServed::Closed,
+            "no fallback → fail closed"
+        );
+        assert!(
+            cold.is_deny(),
+            "the cache never fabricates an allow (never fail open)"
+        );
     }
 
     /// **A zookie-stamped (`Strong`) read BYPASSES the cache (4.10).** It goes straight to the
@@ -379,13 +431,27 @@ mod tests {
 
         // a STRONG read with a hiccup does NOT serve the stale allow — it fails CLOSED.
         let strong_hiccup = fs.serve("k", &strong("z2"), false, hiccup);
-        assert_eq!(strong_hiccup.served, AuthzServed::BypassClosed, "strong read bypassed the cache");
-        assert!(strong_hiccup.is_deny(), "a strong read fails CLOSED on a hiccup (never stale)");
+        assert_eq!(
+            strong_hiccup.served,
+            AuthzServed::BypassClosed,
+            "strong read bypassed the cache"
+        );
+        assert!(
+            strong_hiccup.is_deny(),
+            "a strong read fails CLOSED on a hiccup (never stale)"
+        );
 
         // a STRONG read with a healthy source serves the AUTHORITATIVE answer (bypass), not the cache.
         let strong_ok = fs.serve("k", &strong("z2"), false, || Ok(Decision::Deny));
-        assert_eq!(strong_ok.served, AuthzServed::SourceBypass, "strong read served from source");
-        assert!(strong_ok.is_deny(), "the strong read returns the live authoritative Deny, not the cached Allow");
+        assert_eq!(
+            strong_ok.served,
+            AuthzServed::SourceBypass,
+            "strong read served from source"
+        );
+        assert!(
+            strong_ok.is_deny(),
+            "the strong read returns the live authoritative Deny, not the cached Allow"
+        );
     }
 
     /// **A revoked subject is denied even with a stale cache ALLOW (the revoked-at-window-close
@@ -399,16 +465,30 @@ mod tests {
         fs.clock().advance(31);
         // absent a revoke it WOULD serve a stale allow.
         let before = fs.serve("k", &bounded_stale(), false, hiccup);
-        assert!(before.is_allow() && before.is_degraded(), "the stale allow is live before revoke");
+        assert!(
+            before.is_allow() && before.is_degraded(),
+            "the stale allow is live before revoke"
+        );
 
         // now revoke: even the stale allow is DENIED, before the cache is read.
         let after = fs.serve("k", &bounded_stale(), /* revoked */ true, hiccup);
-        assert_eq!(after.served, AuthzServed::Revoked, "the revoke is enforced before the cache is read");
-        assert!(after.is_deny(), "0 successful authz after the cache for a revoked subject");
+        assert_eq!(
+            after.served,
+            AuthzServed::Revoked,
+            "the revoke is enforced before the cache is read"
+        );
+        assert!(
+            after.is_deny(),
+            "0 successful authz after the cache for a revoked subject"
+        );
 
         // a revoke also denies a STRONG read (every mode), before bypass.
         let strong_revoked = fs.serve("k", &strong("z"), true, allow);
-        assert_eq!(strong_revoked.served, AuthzServed::Revoked, "revoke is applied on every mode");
+        assert_eq!(
+            strong_revoked.served,
+            AuthzServed::Revoked,
+            "revoke is applied on every mode"
+        );
         assert!(strong_revoked.is_deny());
     }
 
@@ -423,7 +503,10 @@ mod tests {
         fs.clock().advance(31);
         let stale = fs.serve("k", &bounded_stale(), false, hiccup);
         assert_eq!(stale.served, AuthzServed::Static);
-        assert!(stale.is_deny(), "the stale fallback replays the cached Deny — never escalates to Allow");
+        assert!(
+            stale.is_deny(),
+            "the stale fallback replays the cached Deny — never escalates to Allow"
+        );
     }
 
     /// **Distinct keys do not share a cache bucket — no cross-actor/cross-question leak.** A grant
@@ -437,7 +520,10 @@ mod tests {
         let other = fs.serve("acme|eu|bob|read@doc:1", &bounded_stale(), false, hiccup);
         assert!(other.is_deny(), "bob must not borrow alice's cached grant");
         let other_q = fs.serve("acme|eu|alice|write@doc:1", &bounded_stale(), false, hiccup);
-        assert!(other_q.is_deny(), "a different question must not borrow the read grant");
+        assert!(
+            other_q.is_deny(),
+            "a different question must not borrow the read grant"
+        );
     }
 
     /// **The survival signals are exposed (architecture §10.2 row 6).** The SUB-D4 drill reads the
@@ -452,9 +538,15 @@ mod tests {
         let _ = fs.serve("k", &bounded_stale(), false, hiccup); // closed
         let s = fs.signals();
         assert_eq!(s.fresh, 1, "one fresh answer");
-        assert_eq!(s.stale, 1, "one stale (degraded) answer — the survival rung");
+        assert_eq!(
+            s.stale, 1,
+            "one stale (degraded) answer — the survival rung"
+        );
         assert_eq!(s.closed, 1, "one fail-closed answer past the window");
-        assert!(s.last_staleness_secs <= fs.static_max(), "staleness ≤ the budget (≤ revocation SLA)");
+        assert!(
+            s.last_staleness_secs <= fs.static_max(),
+            "staleness ≤ the budget (≤ revocation SLA)"
+        );
     }
 
     /// **`AuthzDecision` classifiers are exact per rung** (kills the `is_allow`/`is_deny`/
@@ -462,12 +554,24 @@ mod tests {
     /// buckets the drill asserts).
     #[test]
     fn authz_decision_classifiers_are_exact() {
-        let allow_fresh = AuthzDecision { decision: Decision::Allow, served: AuthzServed::Static };
+        let allow_fresh = AuthzDecision {
+            decision: Decision::Allow,
+            served: AuthzServed::Static,
+        };
         assert!(allow_fresh.is_allow() && !allow_fresh.is_deny() && allow_fresh.is_degraded());
-        let deny_closed = AuthzDecision { decision: Decision::Deny, served: AuthzServed::Closed };
+        let deny_closed = AuthzDecision {
+            decision: Decision::Deny,
+            served: AuthzServed::Closed,
+        };
         assert!(deny_closed.is_deny() && !deny_closed.is_allow() && !deny_closed.is_degraded());
-        let allow_bypass = AuthzDecision { decision: Decision::Allow, served: AuthzServed::SourceBypass };
-        assert!(!allow_bypass.is_degraded(), "only the Static rung is degraded");
+        let allow_bypass = AuthzDecision {
+            decision: Decision::Allow,
+            served: AuthzServed::SourceBypass,
+        };
+        assert!(
+            !allow_bypass.is_degraded(),
+            "only the Static rung is degraded"
+        );
     }
 
     /// **`CoarseAuthz::of` carries the exact decision** (kills a constant-decision mutant: a cache
@@ -476,7 +580,10 @@ mod tests {
     fn coarse_authz_carries_the_exact_decision() {
         assert_eq!(CoarseAuthz::of(Decision::Deny).decision, Decision::Deny);
         assert_eq!(CoarseAuthz::of(Decision::Allow).decision, Decision::Allow);
-        assert_eq!(CoarseAuthz::of(Decision::Conditional).decision, Decision::Conditional);
+        assert_eq!(
+            CoarseAuthz::of(Decision::Conditional).decision,
+            Decision::Conditional
+        );
     }
 
     /// **The `Debug` impl prints the window bounds + the live signal counters and does NOT leak the
@@ -487,9 +594,21 @@ mod tests {
         let fs = authz_at(0);
         let _ = fs.serve("k", &bounded_stale(), false, allow); // one fresh answer (counter ticks)
         let dbg = format!("{fs:?}");
-        assert!(dbg.contains("FailStaticAuthz"), "names the wiring type: {dbg}");
-        assert!(dbg.contains("static_max"), "prints the static_max bound (via the inner): {dbg}");
-        assert!(dbg.contains("300"), "prints the static_max value (300): {dbg}");
-        assert!(dbg.contains("fresh"), "prints the live signal counters (via the inner): {dbg}");
+        assert!(
+            dbg.contains("FailStaticAuthz"),
+            "names the wiring type: {dbg}"
+        );
+        assert!(
+            dbg.contains("static_max"),
+            "prints the static_max bound (via the inner): {dbg}"
+        );
+        assert!(
+            dbg.contains("300"),
+            "prints the static_max value (300): {dbg}"
+        );
+        assert!(
+            dbg.contains("fresh"),
+            "prints the live signal counters (via the inner): {dbg}"
+        );
     }
 }

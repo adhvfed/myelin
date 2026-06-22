@@ -402,7 +402,12 @@ impl AuthzVisibleIndex {
         object_id: &str,
         at_revision: &str,
     ) {
-        let key = (tenant.0.clone(), region.0.clone(), subject.into(), relation.into());
+        let key = (
+            tenant.0.clone(),
+            region.0.clone(),
+            subject.into(),
+            relation.into(),
+        );
         self.visible
             .lock()
             .unwrap()
@@ -424,7 +429,12 @@ impl AuthzVisibleIndex {
         object_id: &str,
         at_revision: &str,
     ) {
-        let key = (tenant.0.clone(), region.0.clone(), subject.into(), relation.into());
+        let key = (
+            tenant.0.clone(),
+            region.0.clone(),
+            subject.into(),
+            relation.into(),
+        );
         if let Some(set) = self.visible.lock().unwrap().get_mut(&key) {
             set.retain(|o| o != object_id);
         }
@@ -469,7 +479,12 @@ impl AuthzVisibleIndex {
         relation: &str,
         object_id: &str,
     ) -> bool {
-        let key = (tenant.0.clone(), region.0.clone(), subject.into(), relation.into());
+        let key = (
+            tenant.0.clone(),
+            region.0.clone(),
+            subject.into(),
+            relation.into(),
+        );
         self.visible
             .lock()
             .unwrap()
@@ -712,7 +727,14 @@ impl BacklinkRead {
         let admitted: Vec<Backlink> = candidates
             .iter()
             .filter(|row| {
-                set_expr_admits(&set_expr, &self.authz, viewer, tenant, region, &row.source_root)
+                set_expr_admits(
+                    &set_expr,
+                    &self.authz,
+                    viewer,
+                    tenant,
+                    region,
+                    &row.source_root,
+                )
             })
             .map(Backlink::from_row)
             .take(page)
@@ -813,13 +835,21 @@ pub fn set_expr_admits(
         SetExpr::NotIds(ids) => !ids.iter().any(|id| id.0 == source_root.0),
         // The reverse-index JOIN: admit iff `authz_visible` makes the source_root visible to the viewer
         // under this relation (the materialised `(subject, relation, object_id)` set).
-        SetExpr::InRelation { relation, .. } => {
-            authz.visible(tenant, region, &viewer.principal_id.0, &relation.0, &source_root.0)
-        }
+        SetExpr::InRelation { relation, .. } => authz.visible(
+            tenant,
+            region,
+            &viewer.principal_id.0,
+            &relation.0,
+            &source_root.0,
+        ),
         // The big-result materialised tuple set — the index ref names the relation it materialises.
-        SetExpr::TupleSet { index } => {
-            authz.visible(tenant, region, &viewer.principal_id.0, &index.0, &source_root.0)
-        }
+        SetExpr::TupleSet { index } => authz.visible(
+            tenant,
+            region,
+            &viewer.principal_id.0,
+            &index.0,
+            &source_root.0,
+        ),
         // Boolean composition. An EMPTY Union admits nothing (sees nothing); an EMPTY Intersect admits
         // all (no restriction) — the identity elements, never a leak.
         SetExpr::Union(parts) => parts

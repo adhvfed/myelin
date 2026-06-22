@@ -265,7 +265,9 @@ impl HitlGate {
     /// click sees `Approved` and returns `Err`, never a second apply).
     pub fn approve(&mut self) -> Result<(), InvalidTransition> {
         if self.state.is_terminal() {
-            return Err(InvalidTransition { already: self.state });
+            return Err(InvalidTransition {
+                already: self.state,
+            });
         }
         self.state = HitlGateState::Approved;
         Ok(())
@@ -276,7 +278,9 @@ impl HitlGate {
     /// so the effect is never applied (0 mutation, AG-8). Refused (a no-op) if already terminal.
     pub fn reject(&mut self, reason: impl Into<String>) -> Result<Halted, InvalidTransition> {
         if self.state.is_terminal() {
-            return Err(InvalidTransition { already: self.state });
+            return Err(InvalidTransition {
+                already: self.state,
+            });
         }
         self.state = HitlGateState::Rejected;
         Ok(Halted::Rejected(reason.into()))
@@ -286,7 +290,9 @@ impl HitlGate {
     /// applied (0 mutation, AG-8); settles [`Halted::Expired`]. Refused (a no-op) if already terminal.
     pub fn expire(&mut self) -> Result<Halted, InvalidTransition> {
         if self.state.is_terminal() {
-            return Err(InvalidTransition { already: self.state });
+            return Err(InvalidTransition {
+                already: self.state,
+            });
         }
         self.state = HitlGateState::Expired;
         Ok(Halted::Expired)
@@ -519,7 +525,9 @@ pub fn run_hitl_loop<W: HitlWait>(
             HitlOutcome::Approved(gate)
         }
         WaitDecision::Reject(reason) => {
-            let halted = gate.reject(reason).expect("a freshly-opened gate is Waiting");
+            let halted = gate
+                .reject(reason)
+                .expect("a freshly-opened gate is Waiting");
             HitlOutcome::Halted(halted)
         }
         WaitDecision::Expired => {
@@ -552,16 +560,26 @@ mod tests {
             input_json: r#"{"pr":42}"#.into(),
             field: None,
             transition: None,
-            cost: EffectCost { unit: "git.merge", wholesale: 30, markup: 20 },
+            cost: EffectCost {
+                unit: "git.merge",
+                wholesale: 30,
+                markup: 20,
+            },
         }
     }
 
     fn risk() -> RiskSummary {
-        RiskSummary::for_action("agent.hitl.merge_pr", &ArtifactRef("myelin://acme/git/pr/42".into()))
+        RiskSummary::for_action(
+            "agent.hitl.merge_pr",
+            &ArtifactRef("myelin://acme/git/pr/42".into()),
+        )
     }
 
     fn approvers() -> Vec<PrincipalId> {
-        vec![PrincipalId("psn:lead".into()), PrincipalId("psn:maintainer".into())]
+        vec![
+            PrincipalId("psn:lead".into()),
+            PrincipalId("psn:maintainer".into()),
+        ]
     }
 
     fn open_waiting() -> HitlGate {
@@ -585,12 +603,19 @@ mod tests {
         assert_eq!(g.state, HitlGateState::Waiting);
         assert!(!g.state.is_terminal());
         // the LIVE cost estimate = the effect's metered total (wholesale 30 + markup 20 = 50).
-        assert_eq!(g.cost_estimate, 50, "the card shows the LIVE cost the reserve would debit");
+        assert_eq!(
+            g.cost_estimate, 50,
+            "the card shows the LIVE cost the reserve would debit"
+        );
         assert_eq!(g.tool_name, "git.merge");
         assert_eq!(g.object, ArtifactRef("myelin://acme/git/pr/42".into()));
         // the risk_summary is a (template_key, args) SLOT, NEVER a raw string (C9 — AG-P11 renders it).
         assert_eq!(g.risk_summary.template_key, "agent.hitl.merge_pr");
-        assert_eq!(g.approver_filter.len(), 2, "the approver set = list_subjects(object, approve_perm)");
+        assert_eq!(
+            g.approver_filter.len(),
+            2,
+            "the approver set = list_subjects(object, approve_perm)"
+        );
         assert_eq!(g.card_ref, "card:R1:0");
     }
 
@@ -613,7 +638,10 @@ mod tests {
         let halted = g.reject("not safe to merge").expect("waiting → rejected");
         assert_eq!(halted, Halted::Rejected("not safe to merge".into()));
         assert_eq!(g.state, HitlGateState::Rejected);
-        assert!(!g.is_approved(), "a rejected gate never approves the tool (0 mutation, AG-8)");
+        assert!(
+            !g.is_approved(),
+            "a rejected gate never approves the tool (0 mutation, AG-8)"
+        );
     }
 
     /// **`Waiting → Expired` settles `Halted::Expired` (auto-deny; 0 mutation).**
@@ -634,14 +662,34 @@ mod tests {
         let mut g = open_waiting();
         g.approve().unwrap();
         // a double-click "approve" is refused (a no-op) — the gate is already Approved.
-        assert_eq!(g.approve(), Err(InvalidTransition { already: HitlGateState::Approved }));
+        assert_eq!(
+            g.approve(),
+            Err(InvalidTransition {
+                already: HitlGateState::Approved
+            })
+        );
         // a late "reject" after an approve is also refused (the decision is settled).
-        assert_eq!(g.reject("late"), Err(InvalidTransition { already: HitlGateState::Approved }));
+        assert_eq!(
+            g.reject("late"),
+            Err(InvalidTransition {
+                already: HitlGateState::Approved
+            })
+        );
 
         let mut r = open_waiting();
         r.reject("no").unwrap();
-        assert_eq!(r.approve(), Err(InvalidTransition { already: HitlGateState::Rejected }));
-        assert_eq!(r.expire(), Err(InvalidTransition { already: HitlGateState::Rejected }));
+        assert_eq!(
+            r.approve(),
+            Err(InvalidTransition {
+                already: HitlGateState::Rejected
+            })
+        );
+        assert_eq!(
+            r.expire(),
+            Err(InvalidTransition {
+                already: HitlGateState::Rejected
+            })
+        );
     }
 
     /// **The state tokens are the frozen §4.4 lowercase taxonomy (a renamed token fails the audit).**
@@ -661,10 +709,22 @@ mod tests {
     fn surface_card_shows_action_risk_cost_and_approvers() {
         let g = open_waiting();
         let card = surface_card(&g);
-        assert_eq!(card.action_tool, "git.merge", "the card shows the pending ACTION");
-        assert_eq!(card.action_object, ArtifactRef("myelin://acme/git/pr/42".into()));
-        assert_eq!(card.risk_summary.template_key, "agent.hitl.merge_pr", "the card shows the RISK slot");
-        assert_eq!(card.cost_estimate, 50, "the card shows the LIVE COST estimate");
+        assert_eq!(
+            card.action_tool, "git.merge",
+            "the card shows the pending ACTION"
+        );
+        assert_eq!(
+            card.action_object,
+            ArtifactRef("myelin://acme/git/pr/42".into())
+        );
+        assert_eq!(
+            card.risk_summary.template_key, "agent.hitl.merge_pr",
+            "the card shows the RISK slot"
+        );
+        assert_eq!(
+            card.cost_estimate, 50,
+            "the card shows the LIVE COST estimate"
+        );
         assert_eq!(card.approvers.len(), 2, "the card shows the APPROVER set");
         // surfacing did not change the gate state (a read-side projection).
         assert_eq!(g.state, HitlGateState::Waiting);
@@ -695,15 +755,24 @@ mod tests {
     /// approval permission on the gated object, at the run's zookie.**
     #[test]
     fn approver_set_is_list_subjects_members() {
-        let subjects = FakeSubjects { members: approvers() };
-        let at = Consistency { at_least: Zookie("z-7".into()), mode: ConsistencyMode::Strong };
+        let subjects = FakeSubjects {
+            members: approvers(),
+        };
+        let at = Consistency {
+            at_least: Zookie("z-7".into()),
+            mode: ConsistencyMode::Strong,
+        };
         let set = derive_approver_set(
             &subjects,
             &ArtifactRef("myelin://acme/git/pr/42".into()),
             &Permission("git.approve".into()),
             &at,
         );
-        assert_eq!(set, approvers(), "the approver_filter is list_subjects(object, approve_perm).members");
+        assert_eq!(
+            set,
+            approvers(),
+            "the approver_filter is list_subjects(object, approve_perm).members"
+        );
     }
 
     // ───────── the approved-tool set (the resume threading into EffectApi step 6) ─────────
@@ -723,17 +792,27 @@ mod tests {
         // an Approved gate IS admitted → the re-run applies the effect.
         let mut g = open_waiting();
         g.approve().unwrap();
-        assert!(approved.admit(&g), "an Approved gate threads its tool into approved");
+        assert!(
+            approved.admit(&g),
+            "an Approved gate threads its tool into approved"
+        );
         assert!(approved.contains("git.merge"));
         // idempotent: a double-click (re-admit) is a no-op.
         assert!(approved.admit(&g));
-        assert_eq!(approved.as_set().len(), 1, "a double-click is one approval (one entry)");
+        assert_eq!(
+            approved.as_set().len(),
+            1,
+            "a double-click is one approval (one entry)"
+        );
 
         // a Rejected gate NEVER threads its tool (0 mutation, AG-8).
         let mut r = open_waiting();
         r.tool_name = "git.force_push".into();
         r.reject("no").unwrap();
-        assert!(!approved.admit(&r), "a Rejected gate NEVER approves the tool (AG-8)");
+        assert!(
+            !approved.admit(&r),
+            "a Rejected gate NEVER approves the tool (AG-8)"
+        );
         assert!(!approved.contains("git.force_push"));
     }
 
@@ -774,7 +853,10 @@ mod tests {
             other => panic!("expected Approved, got {other:?}"),
         }
         // the resume threaded the tool into `approved` → a re-run of apply_planned now passes step 6.
-        assert!(approved.contains("git.merge"), "the approved tool is now in the run's approved set");
+        assert!(
+            approved.contains("git.merge"),
+            "the approved tool is now in the run's approved set"
+        );
     }
 
     /// **The withhold → surface → resume loop, REJECT leg: open `Waiting`, park, resume on Reject →
@@ -792,9 +874,15 @@ mod tests {
             &RejectWait("not safe".into()),
             &mut approved,
         );
-        assert_eq!(outcome, HitlOutcome::Halted(Halted::Rejected("not safe".into())));
+        assert_eq!(
+            outcome,
+            HitlOutcome::Halted(Halted::Rejected("not safe".into()))
+        );
         // the rejected gate NEVER threaded the tool → the re-run gates again / the loop withholds.
-        assert!(!approved.contains("git.merge"), "a rejected gate makes 0 mutation (the tool stays unapproved, AG-8)");
+        assert!(
+            !approved.contains("git.merge"),
+            "a rejected gate makes 0 mutation (the tool stays unapproved, AG-8)"
+        );
     }
 
     // ───────── the Gated-result entry guard ─────────
@@ -806,7 +894,10 @@ mod tests {
             gate_id_of(&EffectResult::Gated(GateId("g".into()))),
             Some(GateId("g".into()))
         );
-        assert_eq!(gate_id_of(&EffectResult::Applied(myelin_agent::EventId("e".into()))), None);
+        assert_eq!(
+            gate_id_of(&EffectResult::Applied(myelin_agent::EventId("e".into()))),
+            None
+        );
         assert_eq!(gate_id_of(&EffectResult::Denied("nope".into())), None);
     }
 }

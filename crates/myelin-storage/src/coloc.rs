@@ -147,7 +147,10 @@ impl ColocatedOltp {
     /// id seam; the real wall-clock+random ULID source lands at P-S12 — see [`crate::oltp`]).
     ///
     /// Fast-fails on a bad pool config (never starts with an unbounded pool — the §3.1 bound).
-    pub fn open(config: OltpConfig, minter: Arc<dyn IdMinter>) -> Result<ColocatedOltp, ColocError> {
+    pub fn open(
+        config: OltpConfig,
+        minter: Arc<dyn IdMinter>,
+    ) -> Result<ColocatedOltp, ColocError> {
         let pool = OltpPool::open(config)?;
         Ok(ColocatedOltp {
             pool,
@@ -182,9 +185,7 @@ impl ColocatedOltp {
         // transaction runs on). The permit is held for the life of the transaction and released
         // on drop — committed or aborted — so a connection is never leaked.
         let permit = self.pool.acquire(&ctx_base.tenant)?;
-        let outbox_tx = self
-            .outbox
-            .begin(Arc::clone(&self.minter), ctx_base);
+        let outbox_tx = self.outbox.begin(Arc::clone(&self.minter), ctx_base);
         Ok(ColocatedTx {
             _permit: permit,
             outbox_tx,
@@ -241,7 +242,8 @@ impl ColocatedTx {
         self.staged_state.push(change.into());
         // Mirror it onto the outbox transaction's modeled state slot too, so the events crate's
         // own co-commit invariant sees the staged state (one transaction, one truth).
-        self.outbox_tx.stage_state_change(change_label(&self.staged_state));
+        self.outbox_tx
+            .stage_state_change(change_label(&self.staged_state));
         self
     }
 
@@ -323,10 +325,10 @@ pub use myelin_events::OUTBOX_MIGRATION as COLOCATED_OUTBOX_MIGRATION;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use myelin_events::{Actor, CausedBy, Region, TenantId, Timestamp};
     use myelin_events::{
         AggregateKey, ArtifactRef, DataRole, EventDraft, EventType, MonotonicMinter, Visibility,
     };
-    use myelin_events::{Actor, CausedBy, Region, TenantId, Timestamp};
     use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 
     fn cfg() -> OltpConfig {
@@ -346,7 +348,11 @@ mod tests {
         EmitContextBase {
             tenant: TenantId(tenant.into()),
             region: Region("eu-west".into()),
-            actor: Actor(Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId(tenant.into()))),
+            actor: Actor(Principal::stub(
+                PrincipalId("p".into()),
+                PrincipalKind::Human,
+                TenantId(tenant.into()),
+            )),
             schema_ver: 1,
             occurred_at: Timestamp("2026-06-19T00:00:00Z".into()),
             recorded_at: Timestamp("2026-06-19T00:00:01Z".into()),
@@ -398,7 +404,10 @@ mod tests {
         tx.stage_state("write A");
         tx.stage_state("write B");
         // The co-located handle records both writes...
-        assert_eq!(tx.staged_state(), &["write A".to_string(), "write B".to_string()]);
+        assert_eq!(
+            tx.staged_state(),
+            &["write A".to_string(), "write B".to_string()]
+        );
         // ...and the outbox tx's modeled state slot carries the joined label (the exact value,
         // so an empty/constant `change_label` is caught).
         assert_eq!(
@@ -416,19 +425,35 @@ mod tests {
         let db = store();
         let mut tx = db.begin(ctx_base("acme")).unwrap();
         tx.stage_state("issue PROJ-1 created");
-        let id = tx.emit(draft("issues.issue.created", "issue:PROJ-1"), None).unwrap();
-        tx.emit(draft("issues.issue.updated", "issue:PROJ-1"), None).unwrap();
+        let id = tx
+            .emit(draft("issues.issue.created", "issue:PROJ-1"), None)
+            .unwrap();
+        tx.emit(draft("issues.issue.updated", "issue:PROJ-1"), None)
+            .unwrap();
         assert_eq!(tx.staged_event_count(), 2, "two events buffered");
         assert_eq!(tx.staged_state(), &["issue PROJ-1 created".to_string()]);
         // Before commit: NOTHING durable — the outbox is empty (the row co-commits with state).
-        assert_eq!(db.outbox_depth(), 0, "an open co-located tx has written nothing");
+        assert_eq!(
+            db.outbox_depth(),
+            0,
+            "an open co-located tx has written nothing"
+        );
 
         tx.commit().unwrap();
         // After commit: both event rows are durable + unsent (depth 2) and carry the cursor seq.
         assert_eq!(db.outbox_depth(), 2);
-        let row = db.outbox().row(&id).expect("the committed event row is present");
-        assert_eq!(row.seq, 0, "first event for the aggregate is the seq-0 cursor anchor");
-        assert!(row.published_at.is_none(), "freshly co-committed rows are unsent");
+        let row = db
+            .outbox()
+            .row(&id)
+            .expect("the committed event row is present");
+        assert_eq!(
+            row.seq, 0,
+            "first event for the aggregate is the seq-0 cursor anchor"
+        );
+        assert!(
+            row.published_at.is_none(),
+            "freshly co-committed rows are unsent"
+        );
     }
 
     /// **BUS-D4 direction 1 (no event without committed state): a DROPPED co-located tx writes
@@ -440,12 +465,21 @@ mod tests {
         {
             let mut tx = db.begin(ctx_base("acme")).unwrap();
             tx.stage_state("issue PROJ-9 created");
-            tx.emit(draft("issues.issue.created", "issue:PROJ-9"), None).unwrap();
+            tx.emit(draft("issues.issue.created", "issue:PROJ-9"), None)
+                .unwrap();
             assert_eq!(tx.staged_event_count(), 1, "buffered, not committed");
             // tx dropped here WITHOUT commit (the crash point between state-write and publish).
         }
-        assert_eq!(db.outbox_depth(), 0, "an aborted co-located tx writes no event");
-        assert_eq!(db.outbox().committed_count(), 0, "no ghost row from an abort");
+        assert_eq!(
+            db.outbox_depth(),
+            0,
+            "an aborted co-located tx writes no event"
+        );
+        assert_eq!(
+            db.outbox().committed_count(),
+            0,
+            "no ghost row from an abort"
+        );
     }
 
     /// **BUS-D4 direction 2 (no committed state without its event): an injected MID-TX STATE
@@ -457,7 +491,8 @@ mod tests {
         let db = store();
         let mut tx = db.begin(ctx_base("acme")).unwrap();
         tx.stage_state("issue PROJ-7 created");
-        tx.emit(draft("issues.issue.created", "issue:PROJ-7"), None).unwrap();
+        tx.emit(draft("issues.issue.created", "issue:PROJ-7"), None)
+            .unwrap();
         assert_eq!(tx.staged_event_count(), 1);
 
         // Inject the state-write failure mid-transaction.
@@ -467,8 +502,16 @@ mod tests {
             "an injected mid-tx state failure must roll the whole tx back: {result:?}"
         );
         // NEITHER the state NOR the events committed — the outbox is empty.
-        assert_eq!(db.outbox_depth(), 0, "a rolled-back co-commit writes no event");
-        assert_eq!(db.outbox().committed_count(), 0, "no committed row from a rolled-back state write");
+        assert_eq!(
+            db.outbox_depth(),
+            0,
+            "a rolled-back co-commit writes no event"
+        );
+        assert_eq!(
+            db.outbox().committed_count(),
+            0,
+            "no committed row from a rolled-back state write"
+        );
     }
 
     /// **The per-aggregate seq is the §7.3 cross-seam cursor: monotonic, gap-free, and ==
@@ -486,8 +529,15 @@ mod tests {
             tx.commit().unwrap();
             ids.push(id);
         }
-        let seqs: Vec<u64> = ids.iter().map(|id| db.outbox().row(id).unwrap().seq).collect();
-        assert_eq!(seqs, vec![0, 1, 2], "OLTP commit order == event order (the §7.3 cursor)");
+        let seqs: Vec<u64> = ids
+            .iter()
+            .map(|id| db.outbox().row(id).unwrap().seq)
+            .collect();
+        assert_eq!(
+            seqs,
+            vec![0, 1, 2],
+            "OLTP commit order == event order (the §7.3 cursor)"
+        );
     }
 
     /// Co-location inherits the bounded-pool fast-fail: a transaction cannot even BEGIN if no
@@ -525,12 +575,14 @@ mod tests {
             .unwrap();
         {
             let mut tx = db.begin(ctx_base("acme")).unwrap();
-            tx.emit(draft("issues.issue.created", "issue:A"), None).unwrap();
+            tx.emit(draft("issues.issue.created", "issue:A"), None)
+                .unwrap();
             tx.commit().unwrap();
         }
         // The connection is free again — a second tx begins (no leaked permit).
         let mut tx2 = db.begin(ctx_base("acme")).unwrap();
-        tx2.emit(draft("issues.issue.created", "issue:B"), None).unwrap();
+        tx2.emit(draft("issues.issue.created", "issue:B"), None)
+            .unwrap();
         tx2.commit().unwrap();
         assert_eq!(db.outbox_depth(), 2, "both co-committed events are durable");
     }
@@ -543,6 +595,9 @@ mod tests {
         let msg = e.to_string();
         assert!(!msg.is_empty());
         assert!(msg.contains("rolled back"), "must name the rollback: {msg}");
-        assert!(msg.contains("neither"), "must say neither side committed: {msg}");
+        assert!(
+            msg.contains("neither"),
+            "must say neither side committed: {msg}"
+        );
     }
 }

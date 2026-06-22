@@ -44,10 +44,7 @@ fn issues_consumes_vector() -> Vec<String> {
     // Issues drives the SAME data-only RankOp fixture through the SAME public operations — exactly
     // what its executor will do. (This mirrors how `cdc_13_3_query_primitive` has the consumer build
     // its own serialization against the shared ViewSpec.)
-    CONFORMANCE_VECTOR
-        .iter()
-        .map(consumer_run_step)
-        .collect()
+    CONFORMANCE_VECTOR.iter().map(consumer_run_step).collect()
 }
 
 /// The consumer's independent re-implementation of "run a step": it dispatches on the SAME frozen
@@ -104,7 +101,10 @@ fn cdc_13_3_order_key_conformance_vector_is_byte_identical_across_co_owners() {
         .find(|(_, s)| s.label.starts_with("concurrent same-gap insert B"))
         .map(|(k, _)| k.clone())
         .unwrap();
-    assert_ne!(a, b, "concurrent same-gap inserts produce DISTINCT keys (the jitter property)");
+    assert_ne!(
+        a, b,
+        "concurrent same-gap inserts produce DISTINCT keys (the jitter property)"
+    );
 }
 
 #[test]
@@ -113,7 +113,14 @@ fn cdc_13_3_order_key_tiebreak_total_order_is_shared() {
     // (Issues) breaks equal keys exactly the same way (created_at, then ULID id).
     let k = OrderKey::parse("M00").unwrap();
     assert_eq!(
-        tiebreak(&k, "2026-06-21T10:00:00Z", "01A", &k, "2026-06-21T11:00:00Z", "01B"),
+        tiebreak(
+            &k,
+            "2026-06-21T10:00:00Z",
+            "01A",
+            &k,
+            "2026-06-21T11:00:00Z",
+            "01B"
+        ),
         Ordering::Less,
         "equal key → earlier created_at wins (byte-identical across co-owners)"
     );

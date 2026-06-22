@@ -56,11 +56,19 @@ fn admin_url(cfg: &MyelinConfig) -> String {
 /// event_ids / aggregates / stream names.
 fn uniq() -> String {
     static N: AtomicU64 = AtomicU64::new(0);
-    format!("{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst))
+    format!(
+        "{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    )
 }
 
 fn principal() -> Principal {
-    Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId("acme".into()))
+    Principal::stub(
+        PrincipalId("p".into()),
+        PrincipalKind::Human,
+        TenantId("acme".into()),
+    )
 }
 
 fn envelope(id: &str, subject: &str, aggregate: &str) -> EventEnvelope {
@@ -104,7 +112,9 @@ async fn rls_read_all_no_predicate(store: &PgStore, acting_tenant: &str) -> Vec<
         .fetch_all(&mut *conn)
         .await
         .expect("RLS-scoped read");
-    rows.iter().map(|r| r.get::<String, _>("object_id")).collect()
+    rows.iter()
+        .map(|r| r.get::<String, _>("object_id"))
+        .collect()
 }
 
 // ==============================================================================================
@@ -129,7 +139,10 @@ async fn drill1_outbox_no_loss_under_crash() {
     let store = PgStore::connect(&admin_url(&cfg), &cfg.region, 6)
         .await
         .expect("connect Postgres (is the stack up?)");
-    store.migrate().await.expect("run migrations (outbox + rebac_tuple + RLS)");
+    store
+        .migrate()
+        .await
+        .expect("run migrations (outbox + rebac_tuple + RLS)");
 
     let tag = uniq();
     // A real domain STATE table the outbox co-commits with (the emit-iff-committed seam).
@@ -161,8 +174,7 @@ async fn drill1_outbox_no_loss_under_crash() {
             .await
             .expect("co-commit state + outbox row");
     }
-    let committed: std::collections::HashSet<EventId> =
-        ids.iter().cloned().map(EventId).collect();
+    let committed: std::collections::HashSet<EventId> = ids.iter().cloned().map(EventId).collect();
     assert_eq!(
         relay.outbox_depth().await.expect("depth") as usize,
         N,
@@ -206,7 +218,10 @@ async fn drill1_outbox_no_loss_under_crash() {
     // (3) RESTART the relay: re-claim the unsent rows and re-publish. The 3 crash-window rows are
     //     re-published; the broker dedups them on Nats-Msg-Id = event_id (0 ghost). The remaining
     //     rows are published fresh. After this pass the outbox fully drains.
-    let published_after_restart = relay.relay_once(&bus, 16).await.expect("restart drain pass");
+    let published_after_restart = relay
+        .relay_once(&bus, 16)
+        .await
+        .expect("restart drain pass");
     assert_eq!(
         published_after_restart, N,
         "the restarted relay re-claims all N unsent rows (the 3 crash-window rows re-publish + dedup)"
@@ -246,7 +261,11 @@ async fn drill1_outbox_no_loss_under_crash() {
             "0 ghost: event {id:?} delivered exactly once (the crash re-publish was deduplicated)"
         );
     }
-    assert_eq!(delivered.len(), N, "exactly N distinct events delivered, exactly-once each");
+    assert_eq!(
+        delivered.len(),
+        N,
+        "exactly N distinct events delivered, exactly-once each"
+    );
 
     // No event without its committed state change (emit-iff-committed): every delivered event_id
     // has a row in the co-committed state table.
@@ -258,7 +277,10 @@ async fn drill1_outbox_no_loss_under_crash() {
         .fetch_one(store.pool())
         .await
         .expect("state lookup");
-        assert_eq!(n, 1, "every delivered event has its committed state change (no ghost)");
+        assert_eq!(
+            n, 1,
+            "every delivered event has its committed state change (no ghost)"
+        );
     }
 
     println!(
@@ -357,25 +379,29 @@ async fn drill2_restore_verify_cross_seam() {
         .await
         .expect("insert doc row");
         // the bus delivered this event → advance the offset.
-        sqlx::query(&format!("UPDATE {offset} SET bus_offset = $1 WHERE k = 'bus'"))
-            .bind(seq)
-            .execute(store.pool())
-            .await
-            .expect("advance bus offset");
+        sqlx::query(&format!(
+            "UPDATE {offset} SET bus_offset = $1 WHERE k = 'bus'"
+        ))
+        .bind(seq)
+        .execute(store.pool())
+        .await
+        .expect("advance bus offset");
     }
 
     // CAPTURE the consistent point T: the snapshot is (rows seq<=T, the blob set they reference,
     // the bus offset == T). This is the one cross-seam cursor restore lands every tier at.
-    let captured_offset: i64 = sqlx::query_scalar(&format!("SELECT bus_offset FROM {offset} WHERE k='bus'"))
-        .fetch_one(store.pool())
-        .await
-        .expect("read offset at T");
+    let captured_offset: i64 =
+        sqlx::query_scalar(&format!("SELECT bus_offset FROM {offset} WHERE k='bus'"))
+            .fetch_one(store.pool())
+            .await
+            .expect("read offset at T");
     assert_eq!(captured_offset, T, "the captured bus offset is exactly T");
 
     // (2) MUTATE PAST T: a new row at seq=T+1 referencing a fresh blob, and the bus advanced past
     //     T. This is the divergence a crash/restore must roll back.
     let post_bytes = format!("drill2 POST-T blob tag={tag}").into_bytes();
-    let post_hash = tokio::task::block_in_place(|| blobs.put(&tenant, &post_bytes)).expect("post blob put");
+    let post_hash =
+        tokio::task::block_in_place(|| blobs.put(&tenant, &post_bytes)).expect("post blob put");
     sqlx::query(&format!(
         "INSERT INTO {docs} (seq, blob_hash, bus_event_id) VALUES ($1, $2, $3)"
     ))
@@ -385,11 +411,13 @@ async fn drill2_restore_verify_cross_seam() {
     .execute(store.pool())
     .await
     .expect("insert post-T row");
-    sqlx::query(&format!("UPDATE {offset} SET bus_offset = $1 WHERE k = 'bus'"))
-        .bind(T + 1)
-        .execute(store.pool())
-        .await
-        .expect("advance bus offset past T");
+    sqlx::query(&format!(
+        "UPDATE {offset} SET bus_offset = $1 WHERE k = 'bus'"
+    ))
+    .bind(T + 1)
+    .execute(store.pool())
+    .await
+    .expect("advance bus offset past T");
 
     // (3) RESTORE PG to T: PITR drops every row whose seq > T (the §7.3 restore_to_offset shape),
     //     and lands the bus offset back at T (the cursor cannot point past the restored rows).
@@ -398,27 +426,35 @@ async fn drill2_restore_verify_cross_seam() {
         .execute(store.pool())
         .await
         .expect("restore: drop rows past T");
-    sqlx::query(&format!("UPDATE {offset} SET bus_offset = $1 WHERE k = 'bus'"))
-        .bind(T)
-        .execute(store.pool())
-        .await
-        .expect("restore: land bus offset at T");
+    sqlx::query(&format!(
+        "UPDATE {offset} SET bus_offset = $1 WHERE k = 'bus'"
+    ))
+    .bind(T)
+    .execute(store.pool())
+    .await
+    .expect("restore: land bus offset at T");
 
     // (4a) rows <-> blob refs: every restored row's referenced blob is PRESENT in RustFS AND its
     //      bytes re-hash to the stored address (no dangling ref, no silent corruption).
     let restored_rows: Vec<(i64, String)> = {
-        let rows: Vec<(i64, String)> = sqlx::query_as(&format!(
-            "SELECT seq, blob_hash FROM {docs} ORDER BY seq"
-        ))
-        .fetch_all(store.pool())
-        .await
-        .expect("read restored rows");
+        let rows: Vec<(i64, String)> =
+            sqlx::query_as(&format!("SELECT seq, blob_hash FROM {docs} ORDER BY seq"))
+                .fetch_all(store.pool())
+                .await
+                .expect("read restored rows");
         rows
     };
-    assert_eq!(restored_rows.len() as i64, T, "exactly the seq<=T rows survive the restore");
+    assert_eq!(
+        restored_rows.len() as i64,
+        T,
+        "exactly the seq<=T rows survive the restore"
+    );
     for (seq, blob_hex) in &restored_rows {
         let expected = blob_at.get(seq).expect("known blob for restored seq");
-        assert_eq!(*blob_hex, expected.digest_hex, "row's stored address matches what we wrote");
+        assert_eq!(
+            *blob_hex, expected.digest_hex,
+            "row's stored address matches what we wrote"
+        );
         // PRESENCE + checksum parity: get() re-hashes on read and refuses a corrupt object, so a
         // successful get IS the no-loss / checksum-parity proof for this referenced blob.
         let got = tokio::task::block_in_place(|| blobs.get(&tenant, expected))
@@ -432,14 +468,16 @@ async fn drill2_restore_verify_cross_seam() {
 
     // (4b) rows <-> bus offset: the restored bus offset is exactly the max restored row seq — no
     //      offset past the restored rows (the post-T event is not referenced by any cursor).
-    let max_restored_seq: i64 = sqlx::query_scalar(&format!("SELECT coalesce(max(seq),0) FROM {docs}"))
-        .fetch_one(store.pool())
-        .await
-        .expect("max restored seq");
-    let restored_offset: i64 = sqlx::query_scalar(&format!("SELECT bus_offset FROM {offset} WHERE k='bus'"))
-        .fetch_one(store.pool())
-        .await
-        .expect("restored offset");
+    let max_restored_seq: i64 =
+        sqlx::query_scalar(&format!("SELECT coalesce(max(seq),0) FROM {docs}"))
+            .fetch_one(store.pool())
+            .await
+            .expect("max restored seq");
+    let restored_offset: i64 =
+        sqlx::query_scalar(&format!("SELECT bus_offset FROM {offset} WHERE k='bus'"))
+            .fetch_one(store.pool())
+            .await
+            .expect("restored offset");
     assert_eq!(max_restored_seq, T, "the newest restored row is at T");
     assert_eq!(restored_offset, T, "the bus offset landed at T");
     assert!(
@@ -456,7 +494,10 @@ async fn drill2_restore_verify_cross_seam() {
         .fetch_one(store.pool())
         .await
         .expect("count post-T rows");
-    assert_eq!(post_rows, 0, "the post-T row was rolled back by the restore (no row past T)");
+    assert_eq!(
+        post_rows, 0,
+        "the post-T row was rolled back by the restore (no row past T)"
+    );
 
     println!(
         "[2026-06-19] PASS  drill=RESTORE-VERIFY-CROSS-SEAM  T={T}  restored_rows={T} \
@@ -469,10 +510,12 @@ async fn drill2_restore_verify_cross_seam() {
         tokio::task::block_in_place(|| blobs.delete(&tenant, h)).ok();
     }
     tokio::task::block_in_place(|| blobs.delete(&tenant, &post_hash)).ok();
-    sqlx::raw_sql(&format!("DROP TABLE IF EXISTS {docs}; DROP TABLE IF EXISTS {offset};"))
-        .execute(store.pool())
-        .await
-        .ok();
+    sqlx::raw_sql(&format!(
+        "DROP TABLE IF EXISTS {docs}; DROP TABLE IF EXISTS {offset};"
+    ))
+    .execute(store.pool())
+    .await
+    .ok();
 }
 
 // ==============================================================================================
@@ -498,7 +541,10 @@ async fn drill3_tenant_region_rls_isolation() {
     let admin = PgStore::connect(&admin_url(&cfg), &cfg.region, 4)
         .await
         .expect("connect Postgres as admin");
-    admin.migrate().await.expect("migrate (rebac_tuple + RLS policy)");
+    admin
+        .migrate()
+        .await
+        .expect("migrate (rebac_tuple + RLS policy)");
 
     let tag = uniq();
     let tenant_a = format!("tenant-A-{tag}");
@@ -507,10 +553,22 @@ async fn drill3_tenant_region_rls_isolation() {
     // Seed tenant A's rows and tenant B's rows into the SAME table. put_tuple sets the session
     // (tenant, region) scope before each insert, so each row is written in its own tenant's
     // partition (and the WITH CHECK half of the RLS policy admits it).
-    admin.put_tuple(&tenant_a, "A-doc1", "reader", "user:alice").await.expect("seed A1");
-    admin.put_tuple(&tenant_a, "A-doc2", "reader", "user:alice").await.expect("seed A2");
-    admin.put_tuple(&tenant_b, "B-secret1", "reader", "user:mallory").await.expect("seed B1");
-    admin.put_tuple(&tenant_b, "B-secret2", "reader", "user:mallory").await.expect("seed B2");
+    admin
+        .put_tuple(&tenant_a, "A-doc1", "reader", "user:alice")
+        .await
+        .expect("seed A1");
+    admin
+        .put_tuple(&tenant_a, "A-doc2", "reader", "user:alice")
+        .await
+        .expect("seed A2");
+    admin
+        .put_tuple(&tenant_b, "B-secret1", "reader", "user:mallory")
+        .await
+        .expect("seed B1");
+    admin
+        .put_tuple(&tenant_b, "B-secret2", "reader", "user:mallory")
+        .await
+        .expect("seed B2");
 
     // Connect as the NOBYPASSRLS APP role (myelin_app) — the real runtime role. This is the
     // load-bearing part: a superuser / BYPASSRLS role would silently ignore the policy. myelin_app
@@ -566,20 +624,32 @@ async fn drill3_tenant_region_rls_isolation() {
     );
 
     // cleanup (admin, scoped per tenant so the RLS DELETE policy admits it).
-    sqlx::query("SELECT set_config('myelin.tenant_id',$1,false), set_config('myelin.region',$2,false)")
+    sqlx::query(
+        "SELECT set_config('myelin.tenant_id',$1,false), set_config('myelin.region',$2,false)",
+    )
+    .bind(&tenant_a)
+    .bind(&cfg.region)
+    .execute(admin.pool())
+    .await
+    .ok();
+    sqlx::query("DELETE FROM rebac_tuple WHERE tenant_id = $1")
         .bind(&tenant_a)
-        .bind(&cfg.region)
         .execute(admin.pool())
         .await
         .ok();
-    sqlx::query("DELETE FROM rebac_tuple WHERE tenant_id = $1").bind(&tenant_a).execute(admin.pool()).await.ok();
-    sqlx::query("SELECT set_config('myelin.tenant_id',$1,false), set_config('myelin.region',$2,false)")
+    sqlx::query(
+        "SELECT set_config('myelin.tenant_id',$1,false), set_config('myelin.region',$2,false)",
+    )
+    .bind(&tenant_b)
+    .bind(&cfg.region)
+    .execute(admin.pool())
+    .await
+    .ok();
+    sqlx::query("DELETE FROM rebac_tuple WHERE tenant_id = $1")
         .bind(&tenant_b)
-        .bind(&cfg.region)
         .execute(admin.pool())
         .await
         .ok();
-    sqlx::query("DELETE FROM rebac_tuple WHERE tenant_id = $1").bind(&tenant_b).execute(admin.pool()).await.ok();
 }
 
 // ==============================================================================================
@@ -616,51 +686,84 @@ async fn drill4_rebac_check_list_objects_no_leak_no_n_plus_1() {
     let alice_objs: Vec<String> = (0..12).map(|i| format!("alice-doc-{i:02}")).collect();
     let bob_objs: Vec<String> = (0..8).map(|i| format!("bob-secret-{i:02}")).collect();
     for o in &alice_objs {
-        store.put_tuple(&tenant, o, "reader", "user:alice").await.expect("put alice tuple");
+        store
+            .put_tuple(&tenant, o, "reader", "user:alice")
+            .await
+            .expect("put alice tuple");
     }
     for o in &bob_objs {
-        store.put_tuple(&tenant, o, "reader", "user:bob").await.expect("put bob tuple");
+        store
+            .put_tuple(&tenant, o, "reader", "user:bob")
+            .await
+            .expect("put bob tuple");
     }
     // mallory shares ONE object id namespace-adjacent to alice but with a DIFFERENT relation —
     // a check for the wrong relation must DENY (no relation confusion).
-    store.put_tuple(&tenant, "alice-doc-00", "writer", "user:mallory").await.expect("put mallory");
+    store
+        .put_tuple(&tenant, "alice-doc-00", "writer", "user:mallory")
+        .await
+        .expect("put mallory");
 
     // (1) check() allow/deny correctness (fail-closed).
     // ALLOW: an edge that exists.
     assert!(
-        store.check_tuple(&tenant, "alice-doc-00", "reader", "user:alice").await.expect("check"),
+        store
+            .check_tuple(&tenant, "alice-doc-00", "reader", "user:alice")
+            .await
+            .expect("check"),
         "ALLOW: alice IS reader on alice-doc-00"
     );
     // DENY: alice is not reader on a bob object (the object exists, but not for alice).
     assert!(
-        !store.check_tuple(&tenant, "bob-secret-00", "reader", "user:alice").await.expect("check"),
+        !store
+            .check_tuple(&tenant, "bob-secret-00", "reader", "user:alice")
+            .await
+            .expect("check"),
         "DENY (fail-closed): alice is NOT reader on bob-secret-00"
     );
     // DENY: relation confusion — mallory is writer (not reader) on alice-doc-00.
     assert!(
-        !store.check_tuple(&tenant, "alice-doc-00", "reader", "user:mallory").await.expect("check"),
+        !store
+            .check_tuple(&tenant, "alice-doc-00", "reader", "user:mallory")
+            .await
+            .expect("check"),
         "DENY: mallory is writer, not reader, on alice-doc-00 (no relation confusion)"
     );
     // DENY: a wholly nonexistent edge.
     assert!(
-        !store.check_tuple(&tenant, "no-such-doc", "reader", "user:alice").await.expect("check"),
+        !store
+            .check_tuple(&tenant, "no-such-doc", "reader", "user:alice")
+            .await
+            .expect("check"),
         "DENY: a nonexistent edge is denied, never a silent allow"
     );
 
     // (2) list_objects NO-LEAK: alice's visible set is EXACTLY her objects — bob's are not present.
-    let visible = store.list_objects(&tenant, "user:alice", "reader").await.expect("list_objects");
+    let visible = store
+        .list_objects(&tenant, "user:alice", "reader")
+        .await
+        .expect("list_objects");
     let mut expected = alice_objs.clone();
     expected.sort();
-    assert_eq!(visible, expected, "list_objects returns EXACTLY alice's visible objects");
+    assert_eq!(
+        visible, expected,
+        "list_objects returns EXACTLY alice's visible objects"
+    );
     // explicit no-leak assertion: not one bob object appears.
     for b in &bob_objs {
-        assert!(!visible.contains(b), "NO LEAK: unauthorized object {b} is absent from alice's list");
+        assert!(
+            !visible.contains(b),
+            "NO LEAK: unauthorized object {b} is absent from alice's list"
+        );
     }
     // and the cross-check: every returned object genuinely passes check() (the list is sound —
     // it does not over-return).
     for o in &visible {
         assert!(
-            store.check_tuple(&tenant, o, "reader", "user:alice").await.expect("re-check"),
+            store
+                .check_tuple(&tenant, o, "reader", "user:alice")
+                .await
+                .expect("re-check"),
             "every listed object {o} is genuinely visible (check() agrees with list_objects)"
         );
     }
@@ -668,7 +771,10 @@ async fn drill4_rebac_check_list_objects_no_leak_no_n_plus_1() {
     // (3) NO N+1: list_objects over the many-object tenant is EXACTLY ONE authz query — not one
     //     check() per candidate. Snapshot the counter, run list_objects, assert delta == 1.
     let before = store.authz_query_count();
-    let visible2 = store.list_objects(&tenant, "user:alice", "reader").await.expect("list_objects 2");
+    let visible2 = store
+        .list_objects(&tenant, "user:alice", "reader")
+        .await
+        .expect("list_objects 2");
     let after = store.authz_query_count();
     assert_eq!(
         after - before,
@@ -677,7 +783,11 @@ async fn drill4_rebac_check_list_objects_no_leak_no_n_plus_1() {
          (not one check per candidate)",
         visible2.len()
     );
-    assert!(visible2.len() >= 12, "the no-N+1 assertion is over a many-object set ({} objects)", visible2.len());
+    assert!(
+        visible2.len() >= 12,
+        "the no-N+1 assertion is over a many-object set ({} objects)",
+        visible2.len()
+    );
 
     println!(
         "[2026-06-19] PASS  drill=ReBAC-NO-LEAK/NO-N+1  visible={} leaked=0 check_allow/deny=correct \
@@ -687,11 +797,17 @@ async fn drill4_rebac_check_list_objects_no_leak_no_n_plus_1() {
     );
 
     // cleanup
-    sqlx::query("SELECT set_config('myelin.tenant_id',$1,false), set_config('myelin.region',$2,false)")
+    sqlx::query(
+        "SELECT set_config('myelin.tenant_id',$1,false), set_config('myelin.region',$2,false)",
+    )
+    .bind(&tenant)
+    .bind(&cfg.region)
+    .execute(store.pool())
+    .await
+    .ok();
+    sqlx::query("DELETE FROM rebac_tuple WHERE tenant_id = $1")
         .bind(&tenant)
-        .bind(&cfg.region)
         .execute(store.pool())
         .await
         .ok();
-    sqlx::query("DELETE FROM rebac_tuple WHERE tenant_id = $1").bind(&tenant).execute(store.pool()).await.ok();
 }

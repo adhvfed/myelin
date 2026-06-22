@@ -38,6 +38,7 @@
 //! (LIVE/MOVED/OUTDATED/GONE/ERASED), and the TE-7 forward-edge emit shape each have a unit + a CDC a
 //! mutation flips. The world-scale corpus-under-load drill is KN-P32 (named).
 
+use myelin_content::inline::InlineNode;
 use myelin_events::{
     Actor, ArtifactRef, CausedBy, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Region,
     TenantId, Timestamp,
@@ -57,7 +58,6 @@ use myelin_knowledge::{
     emit_content_edges, emit_page_parent_set, emit_relation_edge, REL_CLASS_LIFECYCLE,
     REL_CLASS_REFERENCE,
 };
-use myelin_content::inline::InlineNode;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -90,7 +90,9 @@ struct StubId {
 }
 impl StubId {
     fn new() -> Self {
-        Self { allow: HashSet::new() }
+        Self {
+            allow: HashSet::new(),
+        }
     }
     fn allow_read(mut self, o: &ArtifactRef) -> Self {
         self.allow.insert(format!("read@{}", o.0));
@@ -124,7 +126,12 @@ impl IdentityService for StubId {
     ) -> IdResult<ListObjectsResult> {
         Err(AuthzError::NotYetImplemented("n/a"))
     }
-    fn list_subjects(&self, _o: &ObjectId, _p: &Permission, _at: &Consistency) -> IdResult<SubjectTree> {
+    fn list_subjects(
+        &self,
+        _o: &ObjectId,
+        _p: &Permission,
+        _at: &Consistency,
+    ) -> IdResult<SubjectTree> {
         Err(AuthzError::NotYetImplemented("n/a"))
     }
     fn explain(
@@ -169,7 +176,10 @@ impl IdentityService for StubId {
 }
 
 fn store_and_minter() -> (OutboxStore, Arc<dyn IdMinter>) {
-    (OutboxStore::new(), Arc::new(MonotonicMinter::new()) as Arc<dyn IdMinter>)
+    (
+        OutboxStore::new(),
+        Arc::new(MonotonicMinter::new()) as Arc<dyn IdMinter>,
+    )
 }
 fn ctx_base() -> EmitContextBase {
     EmitContextBase {
@@ -205,7 +215,11 @@ fn cdc_5_4_content_nodes_produce_reference_edges() {
     let mut tx = store.begin(Arc::clone(&minter), ctx_base());
     let ids = emit_content_edges(&mut tx, &tenant(), &source, &nodes, None).expect("emit");
     tx.commit().expect("commit");
-    assert_eq!(ids.len(), 3, "one edge per node — NOT coalesced (a discrete edge fact)");
+    assert_eq!(
+        ids.len(),
+        3,
+        "one edge per node — NOT coalesced (a discrete edge fact)"
+    );
 
     // CONSUMER field reads: every content edge is reference-class (never lifecycle).
     for id in &ids {
@@ -242,8 +256,14 @@ fn cdc_5_5_page_parent_mirror_forward_only_lifecycle() {
     assert_eq!(row.envelope.payload["rel_class"], REL_CLASS_LIFECYCLE);
     // CONSUMER responsibility: the producer emits the FORWARD edge only; the inverse `child` is the
     // Refs mirror's (no inverse token in the emitted payload).
-    assert_eq!(row.envelope.payload["source"], "myelin://acme/knowledge/page/project");
-    assert_eq!(row.envelope.payload["target"], "myelin://acme/knowledge/page/team");
+    assert_eq!(
+        row.envelope.payload["source"],
+        "myelin://acme/knowledge/page/project"
+    );
+    assert_eq!(
+        row.envelope.payload["target"],
+        "myelin://acme/knowledge/page/team"
+    );
 }
 
 /// **PROVIDER side of 5.5** — a `db_relation` typed-row write/delete emits `knowledge.relation.created`
@@ -260,7 +280,10 @@ fn cdc_5_5_db_relation_mirror_created_then_removed() {
         dst_ref: ArtifactRef("myelin://acme/knowledge/row/row9".into()),
         rel: RelationKind::Relates,
     };
-    assert!(rels.relate(&tenant(), relation.clone()), "the typed table is truth: a new forward row");
+    assert!(
+        rels.relate(&tenant(), relation.clone()),
+        "the typed table is truth: a new forward row"
+    );
 
     let mut tx = store.begin(Arc::clone(&minter), ctx_base());
     let cid = emit_relation_edge(&mut tx, &tenant(), &relation, true, None).expect("created");
@@ -275,7 +298,10 @@ fn cdc_5_5_db_relation_mirror_created_then_removed() {
     tx2.commit().expect("commit");
     let r = store.row(&rid).expect("removed row");
     assert_eq!(r.envelope.type_.0, "knowledge.relation.removed");
-    assert_eq!(r.aggregate.0, c.aggregate.0, "create + remove share the edge aggregate (ordered)");
+    assert_eq!(
+        r.aggregate.0, c.aggregate.0,
+        "create + remove share the edge aggregate (ordered)"
+    );
 }
 
 // ════════════════ 5.6 / 5.7 — project(ref, viewer) + the 4-step tombstone ladder ════════════════
@@ -287,7 +313,13 @@ fn cdc_5_5_db_relation_mirror_created_then_removed() {
 fn cdc_5_6_project_authorized_shape() {
     let root = page_root("7c2");
     let mut store = PageStore::new();
-    store.put_root(&root, PageMeta { title: "Incident runbook".into(), state: "live".into() });
+    store.put_root(
+        &root,
+        PageMeta {
+            title: "Incident runbook".into(),
+            state: "live".into(),
+        },
+    );
     let p = Projector::new(StubId::new().allow_read(&root), store);
     let got = p.project(&root, &viewer("alice"), z()).unwrap();
     assert!(got.is_visible());
@@ -305,7 +337,13 @@ fn cdc_5_6_project_authorized_shape() {
 fn cdc_5_6_confidential_page_tombstones_never_leaks() {
     let root = page_root("7c2");
     let mut store = PageStore::new();
-    store.put_root(&root, PageMeta { title: "TOP SECRET".into(), state: "live".into() });
+    store.put_root(
+        &root,
+        PageMeta {
+            title: "TOP SECRET".into(),
+            state: "live".into(),
+        },
+    );
     let p = Projector::new(StubId::new(), store); // allows nobody.
     let got = p.project(&root, &viewer("mallory"), z()).unwrap();
     assert!(got.is_tombstone());
@@ -313,7 +351,10 @@ fn cdc_5_6_confidential_page_tombstones_never_leaks() {
     if let Projected::Tombstoned(t) = got {
         assert_eq!(t.reason, TombstoneReason::Denied);
         assert_eq!(t.root, root, "a tombstone ALWAYS carries the root (§2.1)");
-        assert!(!t.root.0.contains("SECRET"), "the root URN is opaque scope, never the title");
+        assert!(
+            !t.root.0.contains("SECRET"),
+            "the root URN is opaque scope, never the title"
+        );
         assert_eq!(t.display_text(), "(not available)");
     }
 }
@@ -331,7 +372,13 @@ fn cdc_5_7_the_four_step_ladder_all_rungs() {
     let erased = myelin_refs::mint(&root, myelin_refs::Sub::Block("b7".into())).unwrap();
 
     let mut store = PageStore::new();
-    store.put_root(&root, PageMeta { title: "Incident runbook".into(), state: "live".into() });
+    store.put_root(
+        &root,
+        PageMeta {
+            title: "Incident runbook".into(),
+            state: "live".into(),
+        },
+    );
     store.put_sub_state(&live, SubState::Live);
     store.put_sub_state(&moved, SubState::Moved);
     store.put_sub_state(&outdated, SubState::Outdated);

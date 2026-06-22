@@ -73,9 +73,19 @@ async fn backlink_setexpr_join_is_one_query_leak_free_tenant_scoped_paginated() 
     //       from a PUBLIC source. Plus a cross-tenant edge in tenant B (must never be readable).
     let target_root = "myelin://acme/issue/issue/PUBLIC-1";
     for (eid, src, tenant, secs) in [
-        ("e-secret", "myelin://acme/issue/issue/SECRET-9", "acme", 10_i64),
+        (
+            "e-secret",
+            "myelin://acme/issue/issue/SECRET-9",
+            "acme",
+            10_i64,
+        ),
         ("e-public", "myelin://acme/issue/issue/OPEN-2", "acme", 20),
-        ("e-crosstenant", "myelin://evilcorp/issue/issue/X-1", "evilcorp", 30),
+        (
+            "e-crosstenant",
+            "myelin://evilcorp/issue/issue/X-1",
+            "evilcorp",
+            30,
+        ),
     ] {
         sqlx::query(&format!(
             "INSERT INTO {edge_tbl} (tenant_id, region, edge_id, source, source_root, target, \
@@ -110,10 +120,17 @@ async fn backlink_setexpr_join_is_one_query_leak_free_tenant_scoped_paginated() 
 
     // ── 4. Build the REAL lowered SetExpr (InRelation → the authz_visible JOIN over source_root). ─────
     let lowered = lower_over_source_root(
-        &SetExpr::InRelation { relation: RelName("view".into()), via_column: source_root_colref() },
+        &SetExpr::InRelation {
+            relation: RelName("view".into()),
+            via_column: source_root_colref(),
+        },
         &viewer,
     );
-    assert_eq!(lowered.joins.len(), 1, "the InRelation lowers to ONE JOIN (no N+1)");
+    assert_eq!(
+        lowered.joins.len(),
+        1,
+        "the InRelation lowers to ONE JOIN (no N+1)"
+    );
     // The lowered JOIN clause names `authz_visible` + `edge.source_root`; rebind it onto the suffixed
     // tables and bind the viewer subject. (In production the table names are the canonical ones; here
     // we rebind for test isolation — the SHAPE under test is the lowering's clause verbatim.)
@@ -144,8 +161,15 @@ async fn backlink_setexpr_join_is_one_query_leak_free_tenant_scoped_paginated() 
     // ── 6. PROVE leak-free: exactly the ONE authorized (public) backlink; the SECRET + cross-tenant ───
     //       are ABSENT.
     let sources: Vec<String> = rows.iter().map(|r| r.get::<String, _>("source")).collect();
-    assert_eq!(sources.len(), 1, "exactly the ONE authorized backlink (0 leak): {sources:?}");
-    assert_eq!(sources[0], "myelin://acme/issue/issue/OPEN-2", "the public referrer is present");
+    assert_eq!(
+        sources.len(),
+        1,
+        "exactly the ONE authorized backlink (0 leak): {sources:?}"
+    );
+    assert_eq!(
+        sources[0], "myelin://acme/issue/issue/OPEN-2",
+        "the public referrer is present"
+    );
     assert!(
         !sources.iter().any(|s| s.contains("SECRET")),
         "0 leak: the confidential referrer is ABSENT (the SetExpr JOIN excluded it)"
@@ -164,13 +188,24 @@ async fn backlink_setexpr_join_is_one_query_leak_free_tenant_scoped_paginated() 
         .fetch_all(&admin)
         .await
         .expect("EXPLAIN the backlink query");
-    let plan_text: String = plan.iter().map(|r| r.get::<String, _>(0)).collect::<Vec<_>>().join("\n");
+    let plan_text: String = plan
+        .iter()
+        .map(|r| r.get::<String, _>(0))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        plan_text.to_lowercase().contains("join") || plan_text.to_lowercase().contains("nested loop"),
+        plan_text.to_lowercase().contains("join")
+            || plan_text.to_lowercase().contains("nested loop"),
         "the read is ONE join query (no per-row check loop): {plan_text}"
     );
 
     // ── 8. Cleanup (forward teardown). ────────────────────────────────────────────────────────────
-    sqlx::query(&format!("DROP TABLE {edge_tbl}")).execute(&admin).await.unwrap();
-    sqlx::query(&format!("DROP TABLE {av_tbl}")).execute(&admin).await.unwrap();
+    sqlx::query(&format!("DROP TABLE {edge_tbl}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    sqlx::query(&format!("DROP TABLE {av_tbl}"))
+        .execute(&admin)
+        .await
+        .unwrap();
 }

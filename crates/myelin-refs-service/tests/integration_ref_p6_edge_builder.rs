@@ -22,10 +22,10 @@
 #![cfg(feature = "integration")]
 
 use myelin_refs::strip_sub;
+use myelin_refs::ArtifactRef;
 use myelin_refs_service::{
     edge_id, CREATE_EDGE_INDEXES_DDL, CREATE_EDGE_TABLE_DDL, MAKE_EDGE_TENANT_SCOPED_DDL,
 };
-use myelin_refs::ArtifactRef;
 
 fn app_url() -> String {
     std::env::var("DATABASE_URL")
@@ -66,15 +66,24 @@ async fn edge_builder_ingest_upserts_idempotently_and_tombstones_on_real_postgre
     let tbl = format!("edge_p155_{suffix}");
 
     // ── Apply the REAL §3.2 schema (create + three indexes + RLS), suffixed for isolation. ──
-    sqlx::query(&rename(CREATE_EDGE_TABLE_DDL, &tbl)).execute(&admin).await.expect("create edge table");
+    sqlx::query(&rename(CREATE_EDGE_TABLE_DDL, &tbl))
+        .execute(&admin)
+        .await
+        .expect("create edge table");
     for (name, idx) in CREATE_EDGE_INDEXES_DDL {
         sqlx::query(&rename(idx, &tbl))
             .execute(&admin)
             .await
             .unwrap_or_else(|e| panic!("apply index {name}: {e}"));
     }
-    sqlx::query(&rename(MAKE_EDGE_TENANT_SCOPED_DDL, &tbl)).execute(&admin).await.expect("RLS scope");
-    sqlx::query(&format!("GRANT ALL ON {tbl} TO myelin_app")).execute(&admin).await.expect("grant app");
+    sqlx::query(&rename(MAKE_EDGE_TENANT_SCOPED_DDL, &tbl))
+        .execute(&admin)
+        .await
+        .expect("RLS scope");
+    sqlx::query(&format!("GRANT ALL ON {tbl} TO myelin_app"))
+        .execute(&admin)
+        .await
+        .expect("grant app");
 
     // The builder's ingest decision, expressed as the REAL upsert the production consumer runs
     // against this table (the deterministic `edge_id` + `strip_sub` roots + `ON CONFLICT DO NOTHING`).
@@ -95,39 +104,100 @@ async fn edge_builder_ingest_upserts_idempotently_and_tombstones_on_real_postgre
          ON CONFLICT (tenant_id, edge_id) DO NOTHING"
     );
     let mut conn = app.acquire().await.unwrap();
-    sqlx::query("SELECT set_config('myelin.tenant_id','tenantA',false)").execute(&mut *conn).await.unwrap();
-    sqlx::query("SELECT set_config('myelin.region','fr-par',false)").execute(&mut *conn).await.unwrap();
+    sqlx::query("SELECT set_config('myelin.tenant_id','tenantA',false)")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query("SELECT set_config('myelin.region','fr-par',false)")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
 
     // ── (a) 0 lost: the delivered edge event produces exactly its row. ──
     sqlx::query(&upsert_sql)
-        .bind(&id).bind(source).bind(&source_root).bind(target).bind(&target_root).bind(rel)
-        .execute(&mut *conn).await.expect("first upsert (the delivered edge)");
+        .bind(&id)
+        .bind(source)
+        .bind(&source_root)
+        .bind(target)
+        .bind(&target_root)
+        .bind(rel)
+        .execute(&mut *conn)
+        .await
+        .expect("first upsert (the delivered edge)");
 
     // ── (b) 0 ghost / 0 dup: re-running the SAME edge event upserts ONE row (deterministic edge_id). ──
     sqlx::query(&upsert_sql)
-        .bind(&id).bind(source).bind(&source_root).bind(target).bind(&target_root).bind(rel)
-        .execute(&mut *conn).await.expect("replay upsert is idempotent (ON CONFLICT DO NOTHING)");
+        .bind(&id)
+        .bind(source)
+        .bind(&source_root)
+        .bind(target)
+        .bind(&target_root)
+        .bind(rel)
+        .execute(&mut *conn)
+        .await
+        .expect("replay upsert is idempotent (ON CONFLICT DO NOTHING)");
 
-    let live: i64 = sqlx::query(&format!("SELECT count(*) AS n FROM {tbl} WHERE NOT tombstoned"))
-        .fetch_one(&mut *conn).await.unwrap().get("n");
-    assert_eq!(live, 1, "idempotent rebuild: replaying the edge event leaves exactly ONE live row (0 ghost, 0 dup)");
+    let live: i64 = sqlx::query(&format!(
+        "SELECT count(*) AS n FROM {tbl} WHERE NOT tombstoned"
+    ))
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap()
+    .get("n");
+    assert_eq!(
+        live, 1,
+        "idempotent rebuild: replaying the edge event leaves exactly ONE live row (0 ghost, 0 dup)"
+    );
 
     // The roots are the #sub-stripped parents (the inbound/outbound index keys).
-    let row = sqlx::query(&format!("SELECT source_root, target_root FROM {tbl} WHERE edge_id=$1"))
-        .bind(&id).fetch_one(&mut *conn).await.unwrap();
-    assert_eq!(row.get::<String, _>("source_root"), "myelin://tenantA/chat/message/m1");
-    assert_eq!(row.get::<String, _>("target_root"), "myelin://tenantA/knowledge/page/7c2");
+    let row = sqlx::query(&format!(
+        "SELECT source_root, target_root FROM {tbl} WHERE edge_id=$1"
+    ))
+    .bind(&id)
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap();
+    assert_eq!(
+        row.get::<String, _>("source_root"),
+        "myelin://tenantA/chat/message/m1"
+    );
+    assert_eq!(
+        row.get::<String, _>("target_root"),
+        "myelin://tenantA/knowledge/page/7c2"
+    );
 
     // ── (c) `*.removed` tombstones the edge (the builder's `apply_removed`): hidden from the live index. ──
-    sqlx::query(&format!("UPDATE {tbl} SET tombstoned=true, origin_event='evt-2' WHERE edge_id=$1"))
-        .bind(&id).execute(&mut *conn).await.expect("tombstone the edge");
-    let live_after: i64 = sqlx::query(&format!("SELECT count(*) AS n FROM {tbl} WHERE NOT tombstoned"))
-        .fetch_one(&mut *conn).await.unwrap().get("n");
-    assert_eq!(live_after, 0, "tombstoned → hidden from the live edge_inbound index");
+    sqlx::query(&format!(
+        "UPDATE {tbl} SET tombstoned=true, origin_event='evt-2' WHERE edge_id=$1"
+    ))
+    .bind(&id)
+    .execute(&mut *conn)
+    .await
+    .expect("tombstone the edge");
+    let live_after: i64 = sqlx::query(&format!(
+        "SELECT count(*) AS n FROM {tbl} WHERE NOT tombstoned"
+    ))
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap()
+    .get("n");
+    assert_eq!(
+        live_after, 0,
+        "tombstoned → hidden from the live edge_inbound index"
+    );
     let total: i64 = sqlx::query(&format!("SELECT count(*) AS n FROM {tbl}"))
-        .fetch_one(&mut *conn).await.unwrap().get("n");
-    assert_eq!(total, 1, "the row is retained for audit/provenance (soft-delete)");
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap()
+        .get("n");
+    assert_eq!(
+        total, 1,
+        "the row is retained for audit/provenance (soft-delete)"
+    );
 
     // Cleanup (a NEW forward operation — test teardown, not a down-migration).
-    sqlx::query(&format!("DROP TABLE {tbl}")).execute(&admin).await.unwrap();
+    sqlx::query(&format!("DROP TABLE {tbl}"))
+        .execute(&admin)
+        .await
+        .unwrap();
 }

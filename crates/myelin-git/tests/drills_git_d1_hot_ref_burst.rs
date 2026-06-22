@@ -41,13 +41,13 @@
 
 use myelin_events::relay::{BusTransport, InProcessBus, Relay};
 use myelin_events::{
-    Actor, AggregateKey, CausedBy, EmitContextBase, EventId, IdMinter, MonotonicMinter, OutboxStore,
-    Region, TenantId, Timestamp,
+    Actor, AggregateKey, CausedBy, EmitContextBase, EventId, IdMinter, MonotonicMinter,
+    OutboxStore, Region, TenantId, Timestamp,
 };
 use myelin_git::events::GIT_REF_UPDATED;
 use myelin_git::receive_pack::{
-    CrashPoint, InMemoryObjectDb, Oid, ProposedRefUpdate, PushOutcome, PushSession, Pusher, RefName,
-    RefStore, RejectReason,
+    CrashPoint, InMemoryObjectDb, Oid, ProposedRefUpdate, PushOutcome, PushSession, Pusher,
+    RefName, RefStore, RejectReason,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use std::collections::BTreeMap;
@@ -95,7 +95,10 @@ fn push(ref_name: &str, old: Oid, new: Oid, forced: bool) -> PushSession {
             commit_oids: vec![new],
         }],
         quarantine: vec![],
-        pusher: Pusher { pseudonym: "anon-3@acme.noreply".into(), is_agent: false },
+        pusher: Pusher {
+            pseudonym: "anon-3@acme.noreply".into(),
+            is_agent: false,
+        },
     }
 }
 
@@ -141,7 +144,9 @@ fn run_surge(multiplier: usize) -> (Arc<RefStore>, OutboxStore, SurgeResult) {
             handles.push(std::thread::spawn(move || {
                 let db = InMemoryObjectDb::new();
                 barrier.wait(); // release the whole round at once → maximal per-ref contention.
-                store.receive(&push(HOT_REF, old, new, forced), &db, CrashPoint::None).unwrap()
+                store
+                    .receive(&push(HOT_REF, old, new, forced), &db, CrashPoint::None)
+                    .unwrap()
             }));
         }
 
@@ -150,7 +155,10 @@ fn run_surge(multiplier: usize) -> (Arc<RefStore>, OutboxStore, SurgeResult) {
         for h in handles {
             match h.join().unwrap() {
                 PushOutcome::Accepted { moved, emitted } => {
-                    assert!(round_winner.is_none(), "round {round}: TWO racers won — lost-update!");
+                    assert!(
+                        round_winner.is_none(),
+                        "round {round}: TWO racers won — lost-update!"
+                    );
                     round_winner = Some((moved[0].1.clone(), moved[0].2, emitted[0].clone()));
                 }
                 PushOutcome::Rejected(RejectReason::NonFastForward { .. }) => rejects += 1,
@@ -163,7 +171,15 @@ fn run_surge(multiplier: usize) -> (Arc<RefStore>, OutboxStore, SurgeResult) {
         tip = winner_tip;
     }
 
-    (store, outbox, SurgeResult { committed_update_seqs, rejects, committed_ids })
+    (
+        store,
+        outbox,
+        SurgeResult {
+            committed_update_seqs,
+            rejects,
+            committed_ids,
+        },
+    )
 }
 
 /// **GIT-D1 at 1×/10×/30×: the hot-ref burst keeps push order per ref; 0 lost / 0 ghost; outbox
@@ -206,7 +222,10 @@ fn git_d1_hot_ref_burst_per_ref_order_zero_lost_zero_ghost() {
             .iter()
             .map(|id| {
                 let row = outbox.row(id).expect("the committed row");
-                assert_eq!(row.aggregate, agg, "{multiplier}×: every burst event is on the hot-ref aggregate");
+                assert_eq!(
+                    row.aggregate, agg,
+                    "{multiplier}×: every burst event is on the hot-ref aggregate"
+                );
                 assert_eq!(row.envelope.type_.0, GIT_REF_UPDATED);
                 row.seq
             })
@@ -225,7 +244,12 @@ fn git_d1_hot_ref_burst_per_ref_order_zero_lost_zero_ghost() {
             .transport()
             .consume(&format!("myelin://{TENANT}/git/ref/{REPO}:{HOT_REF}"))
             .iter()
-            .map(|e| e.payload.get("update_seq").and_then(|v| v.as_u64()).expect("update_seq"))
+            .map(|e| {
+                e.payload
+                    .get("update_seq")
+                    .and_then(|v| v.as_u64())
+                    .expect("update_seq")
+            })
             .collect();
         assert_eq!(
             delivered_for_hot,
@@ -233,22 +257,44 @@ fn git_d1_hot_ref_burst_per_ref_order_zero_lost_zero_ghost() {
             "{multiplier}×: the relay delivers the hot ref in push order per ref"
         );
         let delivered_ids = r.transport().delivered_ids();
-        let committed_set: std::collections::HashSet<EventId> = result.committed_ids.iter().cloned().collect();
+        let committed_set: std::collections::HashSet<EventId> =
+            result.committed_ids.iter().cloned().collect();
         assert_eq!(
             delivered_ids, committed_set,
             "{multiplier}×: delivered set == committed set (0 lost / 0 ghost end-to-end)"
         );
 
         // (6) The survival signal (contract 1.8): depth drained to 0, 0 dead-letters.
-        assert_eq!(outbox.outbox_depth(), 0, "{multiplier}×: outbox depth drained to 0 (survival signal)");
-        assert_eq!(outbox.dead_letter_count(), 0, "{multiplier}×: 0 dead-letters");
+        assert_eq!(
+            outbox.outbox_depth(),
+            0,
+            "{multiplier}×: outbox depth drained to 0 (survival signal)"
+        );
+        assert_eq!(
+            outbox.dead_letter_count(),
+            0,
+            "{multiplier}×: 0 dead-letters"
+        );
 
         // The store's final tip is the last round's winner, at generation ROUNDS.
-        let tip = store.tip(&RefName::new(HOT_REF)).expect("the hot ref exists");
+        let tip = store
+            .tip(&RefName::new(HOT_REF))
+            .expect("the hot ref exists");
         let log = store.reflog();
-        let gens: Vec<u64> = log.iter().filter(|e| e.ref_name == RefName::new(HOT_REF)).map(|e| e.update_seq).collect();
-        assert_eq!(gens, (1..=ROUNDS).collect::<Vec<_>>(), "{multiplier}×: the reflog is the contiguous chain");
-        assert!(tip.0.starts_with("r030"), "{multiplier}×: the tip is the final round's winner: {tip:?}");
+        let gens: Vec<u64> = log
+            .iter()
+            .filter(|e| e.ref_name == RefName::new(HOT_REF))
+            .map(|e| e.update_seq)
+            .collect();
+        assert_eq!(
+            gens,
+            (1..=ROUNDS).collect::<Vec<_>>(),
+            "{multiplier}×: the reflog is the contiguous chain"
+        );
+        assert!(
+            tip.0.starts_with("r030"),
+            "{multiplier}×: the tip is the final round's winner: {tip:?}"
+        );
     }
 }
 
@@ -269,12 +315,18 @@ fn git_d1_distinct_refs_fan_out_parallel_under_burst() {
         handles.push(std::thread::spawn(move || {
             let db = InMemoryObjectDb::new();
             let ref_name = format!("refs/heads/b{i:02}");
-            let p = push(&ref_name, Oid::zero(), Oid::new(format!("tip{i:02}")), false);
+            let p = push(
+                &ref_name,
+                Oid::zero(),
+                Oid::new(format!("tip{i:02}")),
+                false,
+            );
             barrier.wait(); // all distinct-ref pushes fire at once → they must NOT serialise.
             (ref_name, store.receive(&p, &db, CrashPoint::None).unwrap())
         }));
     }
-    let results: Vec<(String, PushOutcome)> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let results: Vec<(String, PushOutcome)> =
+        handles.into_iter().map(|h| h.join().unwrap()).collect();
 
     // Every distinct-ref push committed in parallel (none lost to a whole-repo contention reject).
     let mut per_ref_seq: BTreeMap<String, u64> = BTreeMap::new();
@@ -287,13 +339,24 @@ fn git_d1_distinct_refs_fan_out_parallel_under_burst() {
         }
     }
     assert_eq!(per_ref_seq.len(), n, "all N distinct refs advanced");
-    assert!(per_ref_seq.values().all(|&s| s == 1), "each distinct ref is its own generation 1");
-    assert_eq!(outbox.committed_count(), n, "N distinct-ref events committed (refs fan out parallel)");
+    assert!(
+        per_ref_seq.values().all(|&s| s == 1),
+        "each distinct ref is its own generation 1"
+    );
+    assert_eq!(
+        outbox.committed_count(),
+        n,
+        "N distinct-ref events committed (refs fan out parallel)"
+    );
 
     // Drain → each ref's single event delivers; depth → 0 (the survival signal).
     let r = relay(&outbox);
     r.drain_to_empty();
-    assert_eq!(r.transport().delivered_count(), n, "every distinct-ref event delivered");
+    assert_eq!(
+        r.transport().delivered_count(),
+        n,
+        "every distinct-ref event delivered"
+    );
     assert_eq!(outbox.outbox_depth(), 0, "depth drained to 0");
     assert_eq!(outbox.dead_letter_count(), 0);
     // Each ref is at its own tip — independent generations, no cross-ref interference.

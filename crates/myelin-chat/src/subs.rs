@@ -187,7 +187,10 @@ mod tests {
         let before = mint_message("acme", "01J0STABLE").unwrap();
         // an edit changes the message BODY but never the message_id; re-minting yields the same #sub.
         let after = mint_message("acme", "01J0STABLE").unwrap();
-        assert_eq!(before, after, "the #sub is stable across edits (the id is immutable)");
+        assert_eq!(
+            before, after,
+            "the #sub is stable across edits (the id is immutable)"
+        );
     }
 
     /// An empty opaque message / thread id is rejected LOUDLY at mint time (the stable-id obligation is

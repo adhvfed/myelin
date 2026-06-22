@@ -19,9 +19,7 @@
 //! minimised record (never rewrites the chain); both return a content-addressed receipt. If 10.1's
 //! body shape drifts, this stops compiling/passing — that is the contract.
 
-use myelin_gdpr::{
-    EraseReceipt, EraseScope, PersonalDataHolder, Receipt, SubjectRef, TenantId,
-};
+use myelin_gdpr::{EraseReceipt, EraseScope, PersonalDataHolder, Receipt, SubjectRef, TenantId};
 use myelin_gdpr_service::{
     AuditCarveOutHolder, CryptoShredKms, GdprOwnStoreHolder, InMemoryShredKms, ShredKeyClass,
     ShredKeyHandle,
@@ -54,7 +52,10 @@ impl<'a> DsrOrchestratorConsumer<'a> {
     fn fan_out_erase(&self, scope: EraseScope) -> Vec<EraseReceipt> {
         self.holders
             .iter()
-            .map(|h| h.erase(scope.clone()).expect("a GDPR-owned holder erase succeeds"))
+            .map(|h| {
+                h.erase(scope.clone())
+                    .expect("a GDPR-owned holder erase succeeds")
+            })
             .collect()
     }
 }
@@ -87,7 +88,11 @@ fn dsr_orchestrator_fans_erase_out_to_the_gdpr_owned_holders_via_the_contract() 
         tenant: tenant.clone(),
     });
 
-    assert_eq!(receipts.len(), 2, "the fan-out reached both GDPR-owned holders");
+    assert_eq!(
+        receipts.len(),
+        2,
+        "the fan-out reached both GDPR-owned holders"
+    );
     // Every receipt is content-addressed (the provider honoured "each op returns a receipt").
     for r in &receipts {
         assert_eq!(r.receipt.operation, "erase");
@@ -99,9 +104,15 @@ fn dsr_orchestrator_fans_erase_out_to_the_gdpr_owned_holders_via_the_contract() 
         tenant: tenant.clone(),
         class: ShredKeyClass::Subject(subj.principal.principal_id.0.clone()),
     };
-    assert_eq!(kms.recoverable_in_backup(&handle), 0, "H18 crypto-shred: 0 recoverable");
+    assert_eq!(
+        kms.recoverable_in_backup(&handle),
+        0,
+        "H18 crypto-shred: 0 recoverable"
+    );
     assert!(
-        receipts.iter().any(|r| r.receipt.key_epoch_destroyed == Some(11)),
+        receipts
+            .iter()
+            .any(|r| r.receipt.key_epoch_destroyed == Some(11)),
         "the H18 erase receipt records the destroyed key epoch"
     );
 }
@@ -112,7 +123,13 @@ fn dsr_orchestrator_fans_erase_out_to_the_gdpr_owned_holders_via_the_contract() 
 #[test]
 fn receipt_shape_is_the_frozen_provider_consumer_contract() {
     let r = Receipt::content_addressed(
-        "erase", "gdpr_own_store", "u", "acme", "crypto_shred", Some(2), 0,
+        "erase",
+        "gdpr_own_store",
+        "u",
+        "acme",
+        "crypto_shred",
+        Some(2),
+        0,
     );
     assert_eq!(r.operation, "erase");
     assert_eq!(r.key_epoch_destroyed, Some(2));

@@ -122,7 +122,8 @@ fn tool_def(name: &str, caps: &[&str], requires_approval: bool) -> ToolDef {
         name: ToolName(name.into()),
         subsystem: "issues".into(),
         version: 1,
-        input_schema: r#"{"type":"object","required":["x"],"properties":{"x":{"type":"string"}}}"#.into(),
+        input_schema: r#"{"type":"object","required":["x"],"properties":{"x":{"type":"string"}}}"#
+            .into(),
         required_caps: caps.iter().map(|c| c.to_string()).collect(),
         effect_kind: EffectKind::Mutate,
         side_effecting: true,
@@ -211,16 +212,30 @@ fn cdc_8_7_dry_run_returns_the_plan_with_unchanged_wallet() {
     };
 
     // the PLAN — two proposed effects (merge, post), in order.
-    assert_eq!(plan.len(), 2, "the dry-run plan holds both proposed effects");
+    assert_eq!(
+        plan.len(),
+        2,
+        "the dry-run plan holds both proposed effects"
+    );
     assert_eq!(plan[0], encode_proposed(&planned("merge")));
     assert_eq!(plan[1], encode_proposed(&planned("post")));
 
     // the per-effect verdicts — merge WOULD gate (requires_approval), post WOULD apply.
-    assert!(matches!(entries[0].verdict, PlanVerdict::WouldGate(_)), "merge gates (AG-8)");
-    assert_eq!(entries[1].verdict, PlanVerdict::WouldApply, "post would apply");
+    assert!(
+        matches!(entries[0].verdict, PlanVerdict::WouldGate(_)),
+        "merge gates (AG-8)"
+    );
+    assert_eq!(
+        entries[1].verdict,
+        PlanVerdict::WouldApply,
+        "post would apply"
+    );
 
     // the GATE: 0 applies, 0 meter, the WALLET BALANCE IS UNCHANGED.
-    assert_eq!(budget.remaining, 1000, "the reserve balance is unchanged after a dry-run");
+    assert_eq!(
+        budget.remaining, 1000,
+        "the reserve balance is unchanged after a dry-run"
+    );
     assert_eq!(signals.applied(), 0, "0 applies");
     assert_eq!(signals.metered_total(), 0, "0 metered effects");
 }
@@ -261,13 +276,17 @@ fn cdc_8_7_frozen_glue_dry_run_trait_body() {
             signals: &mut signals,
         };
         let planner = DryRunPlanner::new(&p, effect_for, MOCK_MAX_STEPS);
-        let brain: Box<dyn myelin_agent::AgentRuntime> = Box::new(MockAgentRuntime::new(sc.clone()));
+        let brain: Box<dyn myelin_agent::AgentRuntime> =
+            Box::new(MockAgentRuntime::new(sc.clone()));
         let bridge = DryRunBridge::new(planner, brain, sc);
         // the frozen glue entry: dry_run(InboxEvent) → Vec<ProposedEffect>.
         bridge.dry_run(InboxEvent("issue.created".into()))
     }; // the bridge (holding &p, holding &mut budget) drops here, releasing the borrow.
     assert_eq!(plan.len(), 2, "the frozen DryRun body returns the plan");
-    assert_eq!(budget.remaining, 1000, "side-effect-free through the frozen trait too");
+    assert_eq!(
+        budget.remaining, 1000,
+        "side-effect-free through the frozen trait too"
+    );
 }
 
 /// **AG-D9 (the effect-sequence half, re-asserted) — running the SAME script TWICE through the
@@ -308,7 +327,10 @@ fn cdc_8_7_ag_d9_effect_sequence_is_byte_identical_across_two_runs() {
 
     let first = planner.plan(&brain, &sc);
     let second = planner.plan(&brain, &sc);
-    assert_eq!(first, second, "AG-D9: two dry-runs of the same script are byte-identical");
+    assert_eq!(
+        first, second,
+        "AG-D9: two dry-runs of the same script are byte-identical"
+    );
     // literal byte-identity of the carriers.
     assert_eq!(first[0].0, second[0].0);
     assert_eq!(first[1].0, second[1].0);

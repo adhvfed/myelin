@@ -42,8 +42,14 @@ fn stor_d13_outbound_mirror_residency_deny_zero_pii_egress() {
 
     // ── (2) THE EXTRA-EU FLAG: the crossing surfaces in residency_verify + the deny signal fires. ──
     let extra_eu = PushMirrorTarget::new("github.com", Region::new("us-east"));
-    assert!(mirror.crosses_boundary(&extra_eu), "an extra-EU target crosses the tenant's region boundary");
-    assert!(mirror.flag_target(&extra_eu, &telemetry), "the extra-EU crossing is FLAGGED");
+    assert!(
+        mirror.crosses_boundary(&extra_eu),
+        "an extra-EU target crosses the tenant's region boundary"
+    );
+    assert!(
+        mirror.flag_target(&extra_eu, &telemetry),
+        "the extra-EU crossing is FLAGGED"
+    );
     assert_eq!(
         telemetry.mirror_residency_deny(),
         1,
@@ -51,27 +57,47 @@ fn stor_d13_outbound_mirror_residency_deny_zero_pii_egress() {
     );
 
     let mirror_report = mirror.residency_report(&extra_eu);
-    assert_eq!(mirror_report.region.as_str(), "us-east", "the flag reports the mirror TARGET's region");
+    assert_eq!(
+        mirror_report.region.as_str(),
+        "us-east",
+        "the flag reports the mirror TARGET's region"
+    );
     let mut reports = StoreSet::for_cell(&region).reports_for(&tenant);
     reports.push(mirror_report);
-    let fail = verify_region_pinning(&tenant, &region, &reports)
-        .expect_err("an extra-EU mirror target FAILs the attestation — no silent extra-EU PII path");
+    let fail = verify_region_pinning(&tenant, &region, &reports).expect_err(
+        "an extra-EU mirror target FAILs the attestation — no silent extra-EU PII path",
+    );
     assert!(
-        matches!(fail, ResidencyViolation::OutOfRegionStore { store_class: ResidencyStoreClass::PushMirror, .. }),
+        matches!(
+            fail,
+            ResidencyViolation::OutOfRegionStore {
+                store_class: ResidencyStoreClass::PushMirror,
+                ..
+            }
+        ),
         "the fail leg is the extra-EU push-mirror target: {fail:?}"
     );
 
     // ── (3) THE SAME-REGION NON-CROSSING: passes the attestation, nothing flagged. ──
     let same_region = PushMirrorTarget::new("git.tenant.internal.fr", region.clone());
     let same_telemetry = MirrorTelemetry::new();
-    assert!(!mirror.flag_target(&same_region, &same_telemetry), "a same-region mirror is no crossing");
-    assert_eq!(same_telemetry.mirror_residency_deny(), 0, "no crossing flagged for a same-region mirror");
+    assert!(
+        !mirror.flag_target(&same_region, &same_telemetry),
+        "a same-region mirror is no crossing"
+    );
+    assert_eq!(
+        same_telemetry.mirror_residency_deny(),
+        0,
+        "no crossing flagged for a same-region mirror"
+    );
     let mut ok_reports = StoreSet::for_cell(&region).reports_for(&tenant);
     ok_reports.push(mirror.residency_report(&same_region));
     let att = verify_region_pinning(&tenant, &region, &ok_reports)
         .expect("a same-region mirror passes the attestation (the byte never leaves the region)");
     assert!(
-        att.store_regions.iter().any(|(c, _)| *c == ResidencyStoreClass::PushMirror),
+        att.store_regions
+            .iter()
+            .any(|(c, _)| *c == ResidencyStoreClass::PushMirror),
         "the attestation includes the (same-region) push-mirror target"
     );
 

@@ -475,7 +475,7 @@ mod tests {
             .build();
         let outcome = RestoreOutcome::new(
             snap.verify_cross_seam(),
-            120,                                       // 2 min RPO
+            120,                                                 // 2 min RPO
             &[(RtoGrain::Tenant, 1800), (RtoGrain::Cell, 7200)], // 30 min / 2 h
         );
         let mut signals = SignalSource::new();

@@ -130,8 +130,7 @@ fn cdc_4_9_git_resolver_encoding_matches_the_engine_compile() {
     // The engine encodes the repo as a string id; the Git resolver uses the numeric repo id. They
     // agree on the SHAPE `ref:<repo>::<glob>` and the `code_owner` relation; pin both for the SAME
     // repo token so the produced tuples are identical.
-    let engine_tuples =
-        git_fragment::compile_codeowners(&REPO_ID.to_string(), &engine_rules);
+    let engine_tuples = git_fragment::compile_codeowners(&REPO_ID.to_string(), &engine_rules);
 
     let git_tuples: Vec<_> = git_deltas
         .iter()
@@ -181,7 +180,10 @@ fn cdc_4_9_codeowners_resolves_zero_mis_resolved_via_list_subjects() {
     for (path, expected_glob) in cases {
         // 1) the Git matcher picks the rule (its owners are the truth).
         let matched_owners = co.owners_for(path);
-        assert!(!matched_owners.is_empty(), "path `{path}` is owned by some rule");
+        assert!(
+            !matched_owners.is_empty(),
+            "path `{path}` is owned by some rule"
+        );
 
         // 2) the engine resolves the SAME rule's ref object via list_subjects(ref, code_owner).
         let ref_obj = ObjectId(format!("ref:{REPO_ID}::{expected_glob}"));

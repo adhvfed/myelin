@@ -42,7 +42,9 @@
 //! The KN Signal-curation EMITTER (a `knowledge.comment.created` → curated Signal) is the KN emit
 //! follow-on.
 
-use myelin_identity::{Consistency, ConsistencyMode, Principal, PrincipalId, PrincipalKind, Zookie};
+use myelin_identity::{
+    Consistency, ConsistencyMode, Principal, PrincipalId, PrincipalKind, Zookie,
+};
 use myelin_identity_service::knowledge_rules::{
     knowledge_notif_rules, knowledge_watchable_object_types, register_knowledge_notif_rules,
     KnowledgeWatcherIndex, KN_COMMENTS_RULE, KN_MENTIONED_RULE, KN_SHARED_RULE, KN_WATCHED_RULE,
@@ -60,7 +62,10 @@ fn viewer(id: &str) -> Principal {
     Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant())
 }
 fn strong(zk: &str) -> Consistency {
-    Consistency { at_least: Zookie(zk.into()), mode: ConsistencyMode::Strong }
+    Consistency {
+        at_least: Zookie(zk.into()),
+        mode: ConsistencyMode::Strong,
+    }
 }
 
 // ===========================================================================
@@ -107,7 +112,11 @@ fn consumer_notif_admits_and_routes_knowledge_rules() {
     let mut reg = NotifRuleRegistry::platform_default();
     let before = reg.len();
     register_knowledge_notif_rules(&mut reg).expect("Notif admits KN's set");
-    assert_eq!(reg.len(), before + 4, "Notif admitted KN's four rules (zero Notif change)");
+    assert_eq!(
+        reg.len(),
+        before + 4,
+        "Notif admitted KN's four rules (zero Notif change)"
+    );
 
     let page = ArtifactRef("myelin://acme/knowledge/page/42".into());
 
@@ -116,7 +125,10 @@ fn consumer_notif_admits_and_routes_knowledge_rules() {
     assert_eq!(m.reason, Reason::Mentioned);
     assert_eq!(m.default_class, Class::Direct);
     assert!(m.from_registered_rule, "KN's rule took effect");
-    assert_eq!(m.dedup_key, "kn-mention:psn:bob:myelin://acme/knowledge/page/42");
+    assert_eq!(
+        m.dedup_key,
+        "kn-mention:psn:bob:myelin://acme/knowledge/page/42"
+    );
 
     // a KN comments Signal routes into the participating band + collapses by subject.
     let c = reg.classify(KN_COMMENTS_RULE, "psn:alice", &page);
@@ -127,7 +139,10 @@ fn consumer_notif_admits_and_routes_knowledge_rules() {
     // a KN shared Signal routes into the direct band + collapses by (recipient, subject).
     let s = reg.classify(KN_SHARED_RULE, "psn:carol", &page);
     assert_eq!(s.reason, Reason::Shared);
-    assert_eq!(s.dedup_key, "kn-shared:psn:carol:myelin://acme/knowledge/page/42");
+    assert_eq!(
+        s.dedup_key,
+        "kn-shared:psn:carol:myelin://acme/knowledge/page/42"
+    );
 }
 
 // ===========================================================================
@@ -143,18 +158,30 @@ fn consumer_notif_admits_and_routes_knowledge_rules() {
 fn provider_knowledge_declares_watcher_on_watchable_types() {
     assert_eq!(KN_WATCHER_RELATION, "watcher");
     assert_eq!(KN_WATCHER_RELATION, myelin_notif::WATCHER_RELATION);
-    assert_eq!(knowledge_watchable_object_types(), ["space", "page", "database_row"]);
+    assert_eq!(
+        knowledge_watchable_object_types(),
+        ["space", "page", "database_row"]
+    );
     // the frozen fragment declares `watcher` on the three watchable types (the producer half).
     use myelin_identity_service::knowledge_fragment;
-    assert!(knowledge_fragment::space_fragment().is_watchable(), "space declares watcher");
-    assert!(knowledge_fragment::page_fragment().is_watchable(), "page declares watcher");
+    assert!(
+        knowledge_fragment::space_fragment().is_watchable(),
+        "space declares watcher"
+    );
+    assert!(
+        knowledge_fragment::page_fragment().is_watchable(),
+        "page declares watcher"
+    );
     assert!(
         knowledge_fragment::database_row_fragment().is_watchable(),
         "database_row declares watcher"
     );
     // block is NOT independently watchable (it inherits its page's ACL; a watcher fans out at page
     // granularity).
-    assert!(!knowledge_fragment::block_fragment().is_watchable(), "block is not watchable");
+    assert!(
+        !knowledge_fragment::block_fragment().is_watchable(),
+        "block is not watchable"
+    );
 }
 
 /// **CONSUMER side (4.9) — Notif's read-fanout materialises a viewer's ambient KN slice over Knowledge's
@@ -180,7 +207,10 @@ fn consumer_notif_read_fanout_over_real_knowledge_watchers() {
     let alice = read_fanout(&viewer("psn:alice"), &markers, &idx, &strong(&zk.0))
         .expect("the real KN watcher index resolves");
     let alice_roots: Vec<&str> = alice.iter().map(|m| m.subject_root.as_str()).collect();
-    assert!(alice_roots.contains(&watched_page.0.as_str()), "alice reaches her watched page-9");
+    assert!(
+        alice_roots.contains(&watched_page.0.as_str()),
+        "alice reaches her watched page-9"
+    );
     assert!(
         !alice_roots.contains(&unwatched_page.0.as_str()),
         "alice does not reach the unwatched page-10"
@@ -188,7 +218,10 @@ fn consumer_notif_read_fanout_over_real_knowledge_watchers() {
 
     // bob watches nothing → his ambient KN slice is empty (no leak of another's watched subject).
     let bob = read_fanout(&viewer("psn:bob"), &markers, &idx, &strong(&zk.0)).expect("resolves");
-    assert!(bob.is_empty(), "a non-watcher reaches no ambient KN subject (held, not leaked)");
+    assert!(
+        bob.is_empty(),
+        "a non-watcher reaches no ambient KN subject (held, not leaked)"
+    );
 }
 
 /// **CONSUMER side (4.9 / 4.10) — a just-revoked KN watch is reflected (held, not leaked).** After
@@ -201,18 +234,31 @@ fn consumer_notif_read_fanout_reflects_a_revoked_knowledge_watch() {
     idx.watch(&tenant(), "psn:alice", &page.0);
 
     let markers = AmbientMarkerStore::new();
-    markers.record(&tenant(), &page, Reason::Watched, &ArtifactRef("myelin://acme/bus/event/e".into()));
+    markers.record(
+        &tenant(),
+        &page,
+        Reason::Watched,
+        &ArtifactRef("myelin://acme/bus/event/e".into()),
+    );
 
     // before revoke: alice reaches the page.
-    let before = read_fanout(&viewer("psn:alice"), &markers, &idx, &strong(&idx.current_zookie().0))
-        .expect("resolves");
+    let before = read_fanout(
+        &viewer("psn:alice"),
+        &markers,
+        &idx,
+        &strong(&idx.current_zookie().0),
+    )
+    .expect("resolves");
     assert_eq!(before.len(), 1, "alice reaches the page before revoke");
 
     // revoke alice's watch → a newer zookie (the watermark a strong read pins).
     let zk_after = idx.unwatch(&tenant(), "psn:alice", &page.0);
-    let after = read_fanout(&viewer("psn:alice"), &markers, &idx, &strong(&zk_after.0))
-        .expect("resolves");
-    assert!(after.is_empty(), "the just-revoked KN watch is reflected (held, not leaked)");
+    let after =
+        read_fanout(&viewer("psn:alice"), &markers, &idx, &strong(&zk_after.0)).expect("resolves");
+    assert!(
+        after.is_empty(),
+        "the just-revoked KN watch is reflected (held, not leaked)"
+    );
 }
 
 /// **CONSUMER side — an unavailable KN index → held, not leaked (the ambient slice is withheld, never
@@ -235,5 +281,8 @@ fn consumer_notif_holds_not_leaks_on_unavailable_knowledge_index() {
     let res = read_fanout(&viewer("psn:alice"), &markers, &idx, &strong("zk-1"));
     // held, not leaked: the read-fanout returns an Unavailable error (the proven set is withheld),
     // never a silent widen of the ambient KN slice.
-    assert!(res.is_err(), "an unavailable KN index holds, never leaks the ambient slice");
+    assert!(
+        res.is_err(),
+        "an unavailable KN index holds, never leaks the ambient slice"
+    );
 }

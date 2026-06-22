@@ -377,9 +377,7 @@ fn ctx_activity_emit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::executor::{
-        DurableExecutor, FlowExecutor, RunBudget, RunId, SignalSpec, StartSpec,
-    };
+    use crate::executor::{DurableExecutor, FlowExecutor, RunBudget, RunId, SignalSpec, StartSpec};
     use myelin_events::{IdMinter, MonotonicMinter};
     use myelin_tenancy::Region;
     use std::cell::RefCell;
@@ -418,7 +416,9 @@ mod tests {
             run: run.clone(),
             signal_name: APPROVAL_SIGNAL_NAME.into(),
             idem_key: key,
-            payload: vec![ArtifactRef(format!("myelin://acme/agent/effect/{card_id}-{idx}"))],
+            payload: vec![ArtifactRef(format!(
+                "myelin://acme/agent/effect/{card_id}-{idx}"
+            ))],
             payload_key_ref: None,
         })
         .expect("approve");
@@ -449,14 +449,28 @@ mod tests {
         assert_eq!(per_effect_idem_key("card-7", 2, 3), "card-7:2");
     }
 
-    fn three_effect_card(run: &RunId, d0: ApprovalDecision, d1: ApprovalDecision, d2: ApprovalDecision) -> ApprovalCard {
+    fn three_effect_card(
+        run: &RunId,
+        d0: ApprovalDecision,
+        d1: ApprovalDecision,
+        d2: ApprovalDecision,
+    ) -> ApprovalCard {
         ApprovalCard {
             run_id: run.0.clone(),
             card_id: "card-7".into(),
             effects: vec![
-                GatedEffect { effect_ref: ArtifactRef("myelin://acme/agent/effect/e0".into()), decision: d0 },
-                GatedEffect { effect_ref: ArtifactRef("myelin://acme/agent/effect/e1".into()), decision: d1 },
-                GatedEffect { effect_ref: ArtifactRef("myelin://acme/agent/effect/e2".into()), decision: d2 },
+                GatedEffect {
+                    effect_ref: ArtifactRef("myelin://acme/agent/effect/e0".into()),
+                    decision: d0,
+                },
+                GatedEffect {
+                    effect_ref: ArtifactRef("myelin://acme/agent/effect/e1".into()),
+                    decision: d1,
+                },
+                GatedEffect {
+                    effect_ref: ArtifactRef("myelin://acme/agent/effect/e2".into()),
+                    decision: d2,
+                },
             ],
         }
     }
@@ -477,25 +491,41 @@ mod tests {
 
         // the apply closure records each apply EXACTLY once (the Agent Fabric EffectApi::apply target).
         let applied = RefCell::new(Vec::<String>::new());
-        let card = three_effect_card(&run, ApprovalDecision::Approve, ApprovalDecision::Decline, ApprovalDecision::Approve);
-        let outcomes = apply_approved_effects(ex.signals(), &tenant(), &card, &|eff: &ArtifactRef| {
-            applied.borrow_mut().push(eff.0.clone());
-            Ok(format!("evt-for-{}", eff.0))
-        });
+        let card = three_effect_card(
+            &run,
+            ApprovalDecision::Approve,
+            ApprovalDecision::Decline,
+            ApprovalDecision::Approve,
+        );
+        let outcomes =
+            apply_approved_effects(ex.signals(), &tenant(), &card, &|eff: &ArtifactRef| {
+                applied.borrow_mut().push(eff.0.clone());
+                Ok(format!("evt-for-{}", eff.0))
+            });
 
         // effect 0: applied; effect 1: withheld (declined, zero mutation); effect 2: applied.
         assert_eq!(outcomes.len(), 3);
-        assert!(matches!(outcomes[0], Some(Ok(EffectOutcome::Applied(_)))), "effect 0 approved → applied");
+        assert!(
+            matches!(outcomes[0], Some(Ok(EffectOutcome::Applied(_)))),
+            "effect 0 approved → applied"
+        );
         assert_eq!(
             outcomes[1],
             Some(Ok(EffectOutcome::Withheld(DECLINE_MARKER.to_string()))),
             "effect 1 declined → WITHHELD (Denied, zero mutation, AG-8)"
         );
-        assert!(matches!(outcomes[2], Some(Ok(EffectOutcome::Applied(_)))), "effect 2 approved → applied");
+        assert!(
+            matches!(outcomes[2], Some(Ok(EffectOutcome::Applied(_)))),
+            "effect 2 approved → applied"
+        );
 
         // GATE: exactly TWO applies (effects 0 and 2), and the declined effect 1 made ZERO mutation.
         let applied = applied.into_inner();
-        assert_eq!(applied.len(), 2, "exactly two effects applied (0 and 2); the declined effect 1 made 0 mutation");
+        assert_eq!(
+            applied.len(),
+            2,
+            "exactly two effects applied (0 and 2); the declined effect 1 made 0 mutation"
+        );
         assert_eq!(applied[0], "myelin://acme/agent/effect/e0");
         assert_eq!(applied[1], "myelin://acme/agent/effect/e2");
         assert!(
@@ -528,14 +558,26 @@ mod tests {
         );
 
         let applies = RefCell::new(0usize);
-        let card = three_effect_card(&run, ApprovalDecision::Approve, ApprovalDecision::Approve, ApprovalDecision::Approve);
-        let outcomes = apply_approved_effects(ex.signals(), &tenant(), &card, &|_eff: &ArtifactRef| {
-            *applies.borrow_mut() += 1;
-            Ok("evt".into())
-        });
+        let card = three_effect_card(
+            &run,
+            ApprovalDecision::Approve,
+            ApprovalDecision::Approve,
+            ApprovalDecision::Approve,
+        );
+        let outcomes =
+            apply_approved_effects(ex.signals(), &tenant(), &card, &|_eff: &ArtifactRef| {
+                *applies.borrow_mut() += 1;
+                Ok("evt".into())
+            });
         // exactly three applies — one per effect, NOT six (the double-click was a no-op).
-        assert_eq!(*applies.borrow(), 3, "exactly 3 applies (the double-click did not double-apply)");
-        assert!(outcomes.iter().all(|o| matches!(o, Some(Ok(EffectOutcome::Applied(_))))));
+        assert_eq!(
+            *applies.borrow(),
+            3,
+            "exactly 3 applies (the double-click did not double-apply)"
+        );
+        assert!(outcomes
+            .iter()
+            .all(|o| matches!(o, Some(Ok(EffectOutcome::Applied(_))))));
     }
 
     /// **A DECLINED single-effect card makes ZERO mutation (AG-8).** The lone effect keys on the bare
@@ -545,8 +587,11 @@ mod tests {
         let ex = executor();
         let run = start_a_run(&ex);
         decline(&ex, &run, "card-1", 0, 1); // single-effect → keys on the bare card id.
-        // the buffered signal keys on the bare card id (§6.4 single-effect rule).
-        assert!(ex.signals().get(&tenant(), &run.0, APPROVAL_SIGNAL_NAME, "card-1").is_some());
+                                            // the buffered signal keys on the bare card id (§6.4 single-effect rule).
+        assert!(ex
+            .signals()
+            .get(&tenant(), &run.0, APPROVAL_SIGNAL_NAME, "card-1")
+            .is_some());
 
         let applies = RefCell::new(0usize);
         let card = ApprovalCard {
@@ -557,16 +602,21 @@ mod tests {
                 decision: ApprovalDecision::Decline,
             }],
         };
-        let outcomes = apply_approved_effects(ex.signals(), &tenant(), &card, &|_eff: &ArtifactRef| {
-            *applies.borrow_mut() += 1;
-            Ok("evt".into())
-        });
+        let outcomes =
+            apply_approved_effects(ex.signals(), &tenant(), &card, &|_eff: &ArtifactRef| {
+                *applies.borrow_mut() += 1;
+                Ok("evt".into())
+            });
         assert_eq!(
             outcomes[0],
             Some(Ok(EffectOutcome::Withheld(DECLINE_MARKER.to_string()))),
             "the declined single effect is WITHHELD (AG-8)"
         );
-        assert_eq!(*applies.borrow(), 0, "apply was NEVER reached — a declined effect makes 0 mutation (AG-8)");
+        assert_eq!(
+            *applies.borrow(),
+            0,
+            "apply was NEVER reached — a declined effect makes 0 mutation (AG-8)"
+        );
     }
 
     /// **An effect with NO buffered decision yet is SKIPPED (the wait, P-FLOW-11, re-runs the loop).**
@@ -577,11 +627,28 @@ mod tests {
         let run = start_a_run(&ex);
         approve(&ex, &run, "card-7", 0, 3); // only effect 0 decided so far.
 
-        let card = three_effect_card(&run, ApprovalDecision::Approve, ApprovalDecision::Approve, ApprovalDecision::Approve);
-        let outcomes = apply_approved_effects(ex.signals(), &tenant(), &card, &|_e: &ArtifactRef| Ok("evt".into()));
-        assert!(matches!(outcomes[0], Some(Ok(EffectOutcome::Applied(_)))), "effect 0 has a decision → applied");
-        assert_eq!(outcomes[1], None, "effect 1 has no buffered decision → skipped (the wait re-runs the loop)");
-        assert_eq!(outcomes[2], None, "effect 2 has no buffered decision → skipped");
+        let card = three_effect_card(
+            &run,
+            ApprovalDecision::Approve,
+            ApprovalDecision::Approve,
+            ApprovalDecision::Approve,
+        );
+        let outcomes =
+            apply_approved_effects(ex.signals(), &tenant(), &card, &|_e: &ArtifactRef| {
+                Ok("evt".into())
+            });
+        assert!(
+            matches!(outcomes[0], Some(Ok(EffectOutcome::Applied(_)))),
+            "effect 0 has a decision → applied"
+        );
+        assert_eq!(
+            outcomes[1], None,
+            "effect 1 has no buffered decision → skipped (the wait re-runs the loop)"
+        );
+        assert_eq!(
+            outcomes[2], None,
+            "effect 2 has no buffered decision → skipped"
+        );
     }
 
     /// **A non-decline `EffectApi` denial is SURFACED (never swallowed, EI-02 §4).** An approved
@@ -601,9 +668,10 @@ mod tests {
                 decision: ApprovalDecision::Approve,
             }],
         };
-        let outcomes = apply_approved_effects(ex.signals(), &tenant(), &card, &|_e: &ArtifactRef| {
-            Err("capability denied".into())
-        });
+        let outcomes =
+            apply_approved_effects(ex.signals(), &tenant(), &card, &|_e: &ArtifactRef| {
+                Err("capability denied".into())
+            });
         assert_eq!(
             outcomes[0],
             Some(Err(ApplyError::EffectDenied("capability denied".into()))),
@@ -625,7 +693,11 @@ mod tests {
         EmitContextBase {
             tenant: tenant(),
             region: region(),
-            actor: Actor(Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, tenant())),
+            actor: Actor(Principal::stub(
+                PrincipalId("p".into()),
+                PrincipalKind::Human,
+                tenant(),
+            )),
             schema_ver: 1,
             occurred_at: Timestamp("2026-06-21T00:00:00Z".into()),
             recorded_at: Timestamp("2026-06-21T00:00:01Z".into()),
@@ -660,7 +732,9 @@ mod tests {
             )
             .map_err(|e| format!("{e:?}"))?;
             match outcome {
-                WaitOutcome::Signalled { payload_key_ref, .. } if payload_key_ref.as_deref() == Some(DECLINE_MARKER) => {
+                WaitOutcome::Signalled {
+                    payload_key_ref, ..
+                } if payload_key_ref.as_deref() == Some(DECLINE_MARKER) => {
                     // DENY → WITHHELD: 0 mutation (AG-8). The tool does NOT run.
                     Ok(vec![])
                 }
@@ -668,7 +742,9 @@ mod tests {
                     // APPROVE → run the tool (one mutating activity → one effect).
                     let eff = ctx
                         .activity(RetryPolicy { max_attempts: 1 }, |_i, _a| {
-                            Ok(vec![ArtifactRef("myelin://acme/agent/effect/merged".into())])
+                            Ok(vec![ArtifactRef(
+                                "myelin://acme/agent/effect/merged".into(),
+                            )])
                         })
                         .map_err(|e| format!("{e:?}"))?;
                     Ok(eff)
@@ -697,11 +773,32 @@ mod tests {
 
         // DRIVE 1: emit the card request + park on the approval wait.
         let o1 = drive_full(
-            ex.runs(), &outbox, &journal, &tele, minter(), ctx_base(), &run_row,
-            "2026-06-21T00:00:00Z", 7, body.as_ref(), 1, 1, None, Some(ex.signals().clone()), 1_000,
+            ex.runs(),
+            &outbox,
+            &journal,
+            &tele,
+            minter(),
+            ctx_base(),
+            &run_row,
+            "2026-06-21T00:00:00Z",
+            7,
+            body.as_ref(),
+            1,
+            1,
+            None,
+            Some(ex.signals().clone()),
+            1_000,
         );
-        assert_eq!(o1, DriveOutcome::Waiting, "drive 1 parks on the approval wait (state=waiting)");
-        assert_eq!(outbox.committed_count(), 1, "the agent.approval.requested card request was emitted ONCE");
+        assert_eq!(
+            o1,
+            DriveOutcome::Waiting,
+            "drive 1 parks on the approval wait (state=waiting)"
+        );
+        assert_eq!(
+            outbox.committed_count(),
+            1,
+            "the agent.approval.requested card request was emitted ONCE"
+        );
         assert_eq!(
             ex.runs().get(&tenant(), &run.0).unwrap().state,
             run_state::WAITING,
@@ -724,8 +821,21 @@ mod tests {
         ex.runs().wake(&tenant(), &run.0);
         let run_row2 = ex.runs().get(&tenant(), &run.0).unwrap();
         let o2 = drive_full(
-            ex.runs(), &outbox, &journal, &tele, minter(), ctx_base(), &run_row2,
-            "2026-06-21T00:00:00Z", 7, body.as_ref(), 1, 1, None, Some(ex.signals().clone()), 200_000,
+            ex.runs(),
+            &outbox,
+            &journal,
+            &tele,
+            minter(),
+            ctx_base(),
+            &run_row2,
+            "2026-06-21T00:00:00Z",
+            7,
+            body.as_ref(),
+            1,
+            1,
+            None,
+            Some(ex.signals().clone()),
+            200_000,
         );
         match o2 {
             DriveOutcome::Completed(refs) => assert_eq!(
@@ -739,9 +849,17 @@ mod tests {
         // drive — the activity-guarded emit short-circuits on replay). The approved tool runs (its
         // effect is the terminal result above) but emits no event here, so the card request is the only
         // emit: committed_count stays 1 (the re-drive did NOT re-emit the card).
-        assert_eq!(outbox.committed_count(), 1, "the card request was emitted EXACTLY once (NO re-emit on the resume)");
+        assert_eq!(
+            outbox.committed_count(),
+            1,
+            "the card request was emitted EXACTLY once (NO re-emit on the resume)"
+        );
         // the approval was consumed EXACTLY once (the buffered depth dropped to 0).
-        assert_eq!(ex.signals().buffered_depth(), 0, "the approval was consumed EXACTLY once (FLOW-D4: 1 consume)");
+        assert_eq!(
+            ex.signals().buffered_depth(),
+            0,
+            "the approval was consumed EXACTLY once (FLOW-D4: 1 consume)"
+        );
     }
 
     /// **A DENY withholds the tool → 0 mutation (AG-8 / FLOW-D4).** The approval round-trip parks; a
@@ -760,8 +878,21 @@ mod tests {
 
         // DRIVE 1: park.
         drive_full(
-            ex.runs(), &outbox, &journal, &tele, minter(), ctx_base(), &run_row,
-            "2026-06-21T00:00:00Z", 7, body.as_ref(), 1, 1, None, Some(ex.signals().clone()), 1_000,
+            ex.runs(),
+            &outbox,
+            &journal,
+            &tele,
+            minter(),
+            ctx_base(),
+            &run_row,
+            "2026-06-21T00:00:00Z",
+            7,
+            body.as_ref(),
+            1,
+            1,
+            None,
+            Some(ex.signals().clone()),
+            1_000,
         );
         let emits_after_park = outbox.committed_count();
 
@@ -779,17 +910,38 @@ mod tests {
         ex.runs().wake(&tenant(), &run.0);
         let run_row2 = ex.runs().get(&tenant(), &run.0).unwrap();
         let o2 = drive_full(
-            ex.runs(), &outbox, &journal, &tele, minter(), ctx_base(), &run_row2,
-            "2026-06-21T00:00:00Z", 7, body.as_ref(), 1, 1, None, Some(ex.signals().clone()), 2_000,
+            ex.runs(),
+            &outbox,
+            &journal,
+            &tele,
+            minter(),
+            ctx_base(),
+            &run_row2,
+            "2026-06-21T00:00:00Z",
+            7,
+            body.as_ref(),
+            1,
+            1,
+            None,
+            Some(ex.signals().clone()),
+            2_000,
         );
-        assert_eq!(o2, DriveOutcome::Completed(vec![]), "a DENY completes with NO effect (withheld)");
+        assert_eq!(
+            o2,
+            DriveOutcome::Completed(vec![]),
+            "a DENY completes with NO effect (withheld)"
+        );
         // 0 mutation: the merge effect was NEVER emitted (only the card request, before the park).
         assert_eq!(
             outbox.committed_count(),
             emits_after_park,
             "the declined tool made 0 mutation — no effect emitted past the card request (AG-8)"
         );
-        assert_eq!(ex.signals().buffered_depth(), 0, "the decline was consumed once");
+        assert_eq!(
+            ex.signals().buffered_depth(),
+            0,
+            "the decline was consumed once"
+        );
     }
 
     /// **`ApprovalCard::idem_key_for` applies the §6.4 rule to the card's own arity.** A multi-effect
@@ -800,8 +952,14 @@ mod tests {
             run_id: "r".into(),
             card_id: "c".into(),
             effects: vec![
-                GatedEffect { effect_ref: ArtifactRef("a".into()), decision: ApprovalDecision::Approve },
-                GatedEffect { effect_ref: ArtifactRef("b".into()), decision: ApprovalDecision::Approve },
+                GatedEffect {
+                    effect_ref: ArtifactRef("a".into()),
+                    decision: ApprovalDecision::Approve,
+                },
+                GatedEffect {
+                    effect_ref: ArtifactRef("b".into()),
+                    decision: ApprovalDecision::Approve,
+                },
             ],
         };
         assert_eq!(multi.idem_key_for(0), "c:0");
@@ -810,8 +968,15 @@ mod tests {
         let single = ApprovalCard {
             run_id: "r".into(),
             card_id: "c".into(),
-            effects: vec![GatedEffect { effect_ref: ArtifactRef("a".into()), decision: ApprovalDecision::Approve }],
+            effects: vec![GatedEffect {
+                effect_ref: ArtifactRef("a".into()),
+                decision: ApprovalDecision::Approve,
+            }],
         };
-        assert_eq!(single.idem_key_for(0), "c", "single-effect card keys on the bare card id");
+        assert_eq!(
+            single.idem_key_for(0),
+            "c",
+            "single-effect card keys on the bare card id"
+        );
     }
 }

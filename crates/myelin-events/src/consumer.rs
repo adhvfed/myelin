@@ -226,7 +226,8 @@ pub fn consume<H: EventHandler>(
 ) -> Result<Consumer<H>, SubscribeError> {
     let subjects: Vec<&str> = spec.subjects.iter().map(|s| s.as_str()).collect();
     let subscription = Subscription::bind(spec.durable, &subjects, spec.max_ack_pending)?;
-    Ok(Consumer::new(handler, subscription, dedup).with_per_tenant_inflight(spec.per_tenant_inflight))
+    Ok(Consumer::new(handler, subscription, dedup)
+        .with_per_tenant_inflight(spec.per_tenant_inflight))
 }
 
 /// Why a subscription was rejected at registration (rule 3: never `*`). A rejected subscription
@@ -271,7 +272,10 @@ impl Subscription {
         }
         Ok(Subscription {
             name,
-            subjects: subjects.iter().map(|s| SubjectPattern((*s).to_string())).collect(),
+            subjects: subjects
+                .iter()
+                .map(|s| SubjectPattern((*s).to_string()))
+                .collect(),
             prefetch,
         })
     }
@@ -471,7 +475,10 @@ impl<H: EventHandler> Consumer<H> {
 
     /// The dead-lettered (poison) messages so far (rule 5), surfaced.
     pub fn dead_letters(&self) -> Vec<DeadLetter> {
-        self.dead_letters.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.dead_letters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// **Deliver ONE message through the seven rules.** Applies, in order:
@@ -529,7 +536,10 @@ impl<H: EventHandler> Consumer<H> {
                 return Delivered::DeadLettered(reason);
             }
         };
-        debug_assert_eq!(envelope.event_id, event_id, "an upcaster never changes event_id");
+        debug_assert_eq!(
+            envelope.event_id, event_id,
+            "an upcaster never changes event_id"
+        );
 
         // Rule 1: idempotent on `event_id` via the (consumer, event_id) dedup ledger. A FRESH
         // pair runs the handler; a DUPLICATE (redelivery) SKIPs it and acks — 0 dup.
@@ -640,7 +650,10 @@ impl<H: EventHandler> Consumer<H> {
     }
 
     fn clear_tenant_inflight(&self, tenant: &TenantId, event_id: &crate::EventId) {
-        let mut guard = self.tenant_inflight.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self
+            .tenant_inflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(set) = guard.get_mut(tenant) {
             set.remove(event_id);
             if set.is_empty() {
@@ -673,7 +686,11 @@ mod tests {
     use std::sync::Arc;
 
     fn principal() -> Principal {
-        Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId("acme".into()))
+        Principal::stub(
+            PrincipalId("p".into()),
+            PrincipalKind::Human,
+            TenantId("acme".into()),
+        )
     }
 
     fn envelope(id: &str, subject: &str) -> EventEnvelope {
@@ -727,7 +744,11 @@ mod tests {
     static SUBJECTS: &[SubjectPattern] = &[];
 
     fn done_handler() -> CountingHandler {
-        CountingHandler { runs: AtomicU32::new(0), subjects: SUBJECTS, outcome: |_| HandleOutcome::Done }
+        CountingHandler {
+            runs: AtomicU32::new(0),
+            subjects: SUBJECTS,
+            outcome: |_| HandleOutcome::Done,
+        }
     }
 
     fn sub(name: &str, subjects: &[&str]) -> Subscription {
@@ -743,7 +764,10 @@ mod tests {
         let name = ConsumerName("indexer".into());
         for bad in ["*", ">", "issues.*", "issues.>", "issues.*.created", ""] {
             let r = Subscription::bind(name.clone(), &[bad], PrefetchBound::DEFAULT);
-            assert!(matches!(r, Err(SubscribeError::WildcardSubject(_))), "`{bad}` must be rejected");
+            assert!(
+                matches!(r, Err(SubscribeError::WildcardSubject(_))),
+                "`{bad}` must be rejected"
+            );
         }
         // a subscription with NO subjects is rejected too.
         assert_eq!(
@@ -761,7 +785,10 @@ mod tests {
     fn subscription_matches_only_whitelisted_subjects() {
         let s = sub("indexer", &["myelin://acme/issues/"]);
         assert!(s.matches("myelin://acme/issues/issue/PROJ-1"));
-        assert!(!s.matches("myelin://acme/chat/message/1"), "off-whitelist subject does not match");
+        assert!(
+            !s.matches("myelin://acme/chat/message/1"),
+            "off-whitelist subject does not match"
+        );
     }
 
     /// `Subscription` carries the durable name + the exact whitelist + the bounded prefetch it
@@ -794,13 +821,29 @@ mod tests {
     #[test]
     fn redelivered_event_id_is_a_no_op_handler_runs_once() {
         let h = done_handler();
-        let c = Consumer::new(h, sub("indexer", &["myelin://acme/issues/"]), DedupLedger::new());
+        let c = Consumer::new(
+            h,
+            sub("indexer", &["myelin://acme/issues/"]),
+            DedupLedger::new(),
+        );
         let m = msg("01J-1", "myelin://acme/issues/issue/PROJ-1");
 
-        assert_eq!(c.deliver(&m), Delivered::Acked, "first delivery runs + acks");
-        assert_eq!(c.deliver(&m), Delivered::Deduplicated, "redelivery is deduped");
+        assert_eq!(
+            c.deliver(&m),
+            Delivered::Acked,
+            "first delivery runs + acks"
+        );
+        assert_eq!(
+            c.deliver(&m),
+            Delivered::Deduplicated,
+            "redelivery is deduped"
+        );
         assert_eq!(c.deliver(&m), Delivered::Deduplicated, "and again");
-        assert_eq!(c.handler.runs.load(Ordering::SeqCst), 1, "the handler ran EXACTLY once");
+        assert_eq!(
+            c.handler.runs.load(Ordering::SeqCst),
+            1,
+            "the handler ran EXACTLY once"
+        );
         assert_eq!(c.dedup().len(), 1, "one (consumer, event_id) pair recorded");
     }
 
@@ -809,12 +852,24 @@ mod tests {
     #[test]
     fn dedup_key_is_per_consumer_two_consumers_each_process_once() {
         let ledger = DedupLedger::new();
-        let a = Consumer::new(done_handler(), sub("indexer", &["myelin://acme/issues/"]), ledger.clone());
-        let b = Consumer::new(done_handler(), sub("notifier", &["myelin://acme/issues/"]), ledger.clone());
+        let a = Consumer::new(
+            done_handler(),
+            sub("indexer", &["myelin://acme/issues/"]),
+            ledger.clone(),
+        );
+        let b = Consumer::new(
+            done_handler(),
+            sub("notifier", &["myelin://acme/issues/"]),
+            ledger.clone(),
+        );
         let m = msg("01J-1", "myelin://acme/issues/issue/PROJ-1");
 
         assert_eq!(a.deliver(&m), Delivered::Acked, "consumer A processes it");
-        assert_eq!(b.deliver(&m), Delivered::Acked, "consumer B ALSO processes it (different PK)");
+        assert_eq!(
+            b.deliver(&m),
+            Delivered::Acked,
+            "consumer B ALSO processes it (different PK)"
+        );
         // A second delivery to each is deduped.
         assert_eq!(a.deliver(&m), Delivered::Deduplicated);
         assert_eq!(b.deliver(&m), Delivered::Deduplicated);
@@ -832,12 +887,21 @@ mod tests {
         assert!(!ledger.is_handled(&consumer, &id), "nothing handled yet");
 
         assert!(ledger.mark_handled(&consumer, &id), "first mark is fresh");
-        assert!(!ledger.is_empty(), "the ledger is no longer empty after a mark");
-        assert!(ledger.is_handled(&consumer, &id), "the exact pair is handled");
+        assert!(
+            !ledger.is_empty(),
+            "the ledger is no longer empty after a mark"
+        );
+        assert!(
+            ledger.is_handled(&consumer, &id),
+            "the exact pair is handled"
+        );
         // a different consumer's view of the same id is still unhandled (per-consumer PK).
         assert!(!ledger.is_handled(&ConsumerName("other".into()), &id));
         // a re-mark of the same pair is NOT fresh (the idempotency no-op).
-        assert!(!ledger.mark_handled(&consumer, &id), "re-mark is a duplicate, not fresh");
+        assert!(
+            !ledger.mark_handled(&consumer, &id),
+            "re-mark is a duplicate, not fresh"
+        );
     }
 
     // --- Rule 4: bind-by-name — a reconnect resumes (the SUB-D2 0-lost-across-reconnect core) ---
@@ -853,17 +917,37 @@ mod tests {
 
         // First connection: handles m1, then the broker "drops" before m2.
         {
-            let c = Consumer::new(done_handler(), sub("indexer", &["myelin://acme/issues/"]), ledger.clone());
+            let c = Consumer::new(
+                done_handler(),
+                sub("indexer", &["myelin://acme/issues/"]),
+                ledger.clone(),
+            );
             assert_eq!(c.deliver(&m1), Delivered::Acked);
             // broker drops here — m2 was never delivered.
         }
 
         // Reconnect: SAME name, SAME ledger. The broker redelivers BOTH m1 and m2 (at-least-once).
         let h = done_handler();
-        let c2 = Consumer::new(h, sub("indexer", &["myelin://acme/issues/"]), ledger.clone());
-        assert_eq!(c2.deliver(&m1), Delivered::Deduplicated, "m1 already handled → 0 dup");
-        assert_eq!(c2.deliver(&m2), Delivered::Acked, "m2 handled after reconnect → 0 lost");
-        assert_eq!(c2.handler.runs.load(Ordering::SeqCst), 1, "only m2 re-ran the handler");
+        let c2 = Consumer::new(
+            h,
+            sub("indexer", &["myelin://acme/issues/"]),
+            ledger.clone(),
+        );
+        assert_eq!(
+            c2.deliver(&m1),
+            Delivered::Deduplicated,
+            "m1 already handled → 0 dup"
+        );
+        assert_eq!(
+            c2.deliver(&m2),
+            Delivered::Acked,
+            "m2 handled after reconnect → 0 lost"
+        );
+        assert_eq!(
+            c2.handler.runs.load(Ordering::SeqCst),
+            1,
+            "only m2 re-ran the handler"
+        );
         assert_eq!(ledger.len(), 2, "both events are now in the ledger");
     }
 
@@ -878,19 +962,39 @@ mod tests {
             subjects: SUBJECTS,
             outcome: |_| HandleOutcome::NonRetryable(Reason("malformed".into())),
         };
-        let c = Consumer::new(h, sub("indexer", &["myelin://acme/issues/"]), DedupLedger::new());
+        let c = Consumer::new(
+            h,
+            sub("indexer", &["myelin://acme/issues/"]),
+            DedupLedger::new(),
+        );
         let poison = msg("01J-bad", "myelin://acme/issues/issue/PROJ-1");
 
         let out = c.deliver(&poison);
         assert_eq!(out, Delivered::DeadLettered(Reason("malformed".into())));
-        assert_eq!(c.dead_letters().len(), 1, "the poison is SURFACED, not silently dropped");
+        assert_eq!(
+            c.dead_letters().len(),
+            1,
+            "the poison is SURFACED, not silently dropped"
+        );
         assert_eq!(c.dead_letters()[0].reason, Reason("malformed".into()));
-        assert_eq!(c.lag(), 0, "a dead-lettered message does not sit in lag (it is terminal)");
+        assert_eq!(
+            c.lag(),
+            0,
+            "a dead-lettered message does not sit in lag (it is terminal)"
+        );
 
         // a SECOND delivery of the same poison is deduped (its mark stayed) — it does not
         // re-poison / re-burn anything.
-        assert_eq!(c.deliver(&poison), Delivered::Deduplicated, "a redelivered dead-letter is deduped");
-        assert_eq!(c.dead_letters().len(), 1, "still exactly one dead-letter (not re-poisoned)");
+        assert_eq!(
+            c.deliver(&poison),
+            Delivered::Deduplicated,
+            "a redelivered dead-letter is deduped"
+        );
+        assert_eq!(
+            c.dead_letters().len(),
+            1,
+            "still exactly one dead-letter (not re-poisoned)"
+        );
     }
 
     /// A fast subject is NOT head-of-line-blocked by a poison/slow subject: a poison on subject A
@@ -920,8 +1024,16 @@ mod tests {
 
         // A poisons (dead-letters, terminal); B still processes — A did not block B.
         assert!(matches!(c.deliver(&a), Delivered::DeadLettered(_)));
-        assert_eq!(c.deliver(&b), Delivered::Acked, "subject B is not head-of-line-blocked by A");
-        assert_eq!(c.lag_on("myelin://acme/A/x"), 0, "the poison subject did not accumulate lag");
+        assert_eq!(
+            c.deliver(&b),
+            Delivered::Acked,
+            "subject B is not head-of-line-blocked by A"
+        );
+        assert_eq!(
+            c.lag_on("myelin://acme/A/x"),
+            0,
+            "the poison subject did not accumulate lag"
+        );
         assert_eq!(c.lag_on("myelin://acme/B/y"), 0, "B drained");
     }
 
@@ -950,7 +1062,9 @@ mod tests {
             }
         }
         let c = Consumer::new(
-            Flaky { seen: Mutex::new(HashSet::new()) },
+            Flaky {
+                seen: Mutex::new(HashSet::new()),
+            },
             sub("indexer", &["myelin://acme/issues/"]),
             DedupLedger::new(),
         );
@@ -959,12 +1073,26 @@ mod tests {
         // first delivery: Retry → NOT acked → pending lag rises, dedup mark reverted.
         assert_eq!(c.deliver(&m), Delivered::Retried(2));
         assert_eq!(c.lag(), 1, "an un-acked retry sits in consumer lag");
-        assert!(!c.dedup().is_handled(c.name(), &m.envelope.event_id), "a retry leaves NO dedup mark");
+        assert!(
+            !c.dedup().is_handled(c.name(), &m.envelope.event_id),
+            "a retry leaves NO dedup mark"
+        );
 
         // redelivery: the handler RE-RUNS (0 lost) and now succeeds → acked, lag clears.
-        assert_eq!(c.deliver(&m), Delivered::Acked, "the redelivery re-ran the handler and succeeded");
-        assert_eq!(c.lag(), 0, "lag recovers to 0 after the successful redelivery (SUB-D2)");
-        assert!(c.dedup().is_handled(c.name(), &m.envelope.event_id), "now it is durably handled");
+        assert_eq!(
+            c.deliver(&m),
+            Delivered::Acked,
+            "the redelivery re-ran the handler and succeeded"
+        );
+        assert_eq!(
+            c.lag(),
+            0,
+            "lag recovers to 0 after the successful redelivery (SUB-D2)"
+        );
+        assert!(
+            c.dedup().is_handled(c.name(), &m.envelope.event_id),
+            "now it is durably handled"
+        );
     }
 
     // --- Rule 6: bounded prefetch ---
@@ -973,7 +1101,11 @@ mod tests {
     /// bound is admitted and read back.
     #[test]
     fn prefetch_bound_rejects_zero() {
-        assert_eq!(PrefetchBound::new(0), None, "a zero prefetch is meaningless, rejected");
+        assert_eq!(
+            PrefetchBound::new(0),
+            None,
+            "a zero prefetch is meaningless, rejected"
+        );
         assert_eq!(PrefetchBound::new(8).unwrap().get(), 8);
         assert_eq!(PrefetchBound::DEFAULT.get(), 64);
     }
@@ -983,16 +1115,29 @@ mod tests {
     #[test]
     fn deliver_lane_honours_bounded_prefetch() {
         let bound = PrefetchBound::new(2).unwrap();
-        let s = Subscription::bind(ConsumerName("indexer".into()), &["myelin://acme/issues/"], bound).unwrap();
+        let s = Subscription::bind(
+            ConsumerName("indexer".into()),
+            &["myelin://acme/issues/"],
+            bound,
+        )
+        .unwrap();
         let c = Consumer::new(done_handler(), s, DedupLedger::new());
 
         let lane: Vec<Message> = (0..5)
             .map(|i| msg(&format!("01J-{i}"), "myelin://acme/issues/issue/PROJ-1"))
             .collect();
         let out = c.deliver_lane("myelin://acme/issues/issue/PROJ-1", &lane);
-        assert_eq!(out.len(), 2, "bounded prefetch: only 2 of 5 delivered this drain");
+        assert_eq!(
+            out.len(),
+            2,
+            "bounded prefetch: only 2 of 5 delivered this drain"
+        );
         assert!(out.iter().all(|o| *o == Delivered::Acked));
-        assert_eq!(c.handler.runs.load(Ordering::SeqCst), 2, "the handler ran exactly twice");
+        assert_eq!(
+            c.handler.runs.load(Ordering::SeqCst),
+            2,
+            "the handler ran exactly twice"
+        );
     }
 
     // --- The dedup ledger (contract 2.5) lives in `crate::dedup` (EB-06) — see its tests there
@@ -1033,7 +1178,11 @@ mod tests {
             Ok(e)
         });
         c.deliver(&msg("01J-1", "myelin://acme/issues/issue/PROJ-1"));
-        assert_eq!(seen_ver.load(Ordering::SeqCst), 2, "the handler saw the upcasted schema_ver");
+        assert_eq!(
+            seen_ver.load(Ordering::SeqCst),
+            2,
+            "the handler saw the upcasted schema_ver"
+        );
     }
 
     /// **Contract 2.8 rule 2 through the runtime:** an UNBRIDGEABLE version gap (the upcaster hook
@@ -1044,15 +1193,30 @@ mod tests {
     #[test]
     fn unbridgeable_gap_dead_letters_loudly_never_silently_passes() {
         let h = done_handler();
-        let c = Consumer::new(h, sub("indexer", &["myelin://acme/issues/"]), DedupLedger::new())
-            .with_upcaster(|_e| Err(Reason("unbridgeable schema gap: no upcaster".into())));
+        let c = Consumer::new(
+            h,
+            sub("indexer", &["myelin://acme/issues/"]),
+            DedupLedger::new(),
+        )
+        .with_upcaster(|_e| Err(Reason("unbridgeable schema gap: no upcaster".into())));
 
         let m = msg("01J-gap", "myelin://acme/issues/issue/PROJ-1");
         let out = c.deliver(&m);
 
-        assert!(matches!(out, Delivered::DeadLettered(_)), "a gap dead-letters → DLQ");
-        assert_eq!(c.handler.runs.load(Ordering::SeqCst), 0, "the handler never saw the wrong shape");
-        assert_eq!(c.dead_letters().len(), 1, "the gap is surfaced, not silently dropped");
+        assert!(
+            matches!(out, Delivered::DeadLettered(_)),
+            "a gap dead-letters → DLQ"
+        );
+        assert_eq!(
+            c.handler.runs.load(Ordering::SeqCst),
+            0,
+            "the handler never saw the wrong shape"
+        );
+        assert_eq!(
+            c.dead_letters().len(),
+            1,
+            "the gap is surfaced, not silently dropped"
+        );
         // The dedup ledger was NOT marked: re-delivering the SAME event after the upcaster ships
         // is not deduplicated away. Prove it by re-installing an identity hook and re-delivering.
         assert!(
@@ -1065,10 +1229,18 @@ mod tests {
     /// silently processed (defence in depth around rule 3).
     #[test]
     fn off_whitelist_message_is_dead_lettered_not_silently_processed() {
-        let c = Consumer::new(done_handler(), sub("indexer", &["myelin://acme/issues/"]), DedupLedger::new());
+        let c = Consumer::new(
+            done_handler(),
+            sub("indexer", &["myelin://acme/issues/"]),
+            DedupLedger::new(),
+        );
         let off = msg("01J-off", "myelin://acme/chat/message/1");
         assert!(matches!(c.deliver(&off), Delivered::DeadLettered(_)));
-        assert_eq!(c.handler.runs.load(Ordering::SeqCst), 0, "the handler never ran for an off-whitelist subject");
+        assert_eq!(
+            c.handler.runs.load(Ordering::SeqCst),
+            0,
+            "the handler never ran for an off-whitelist subject"
+        );
         assert_eq!(c.dead_letters().len(), 1);
     }
 
@@ -1096,7 +1268,11 @@ mod tests {
         };
         let c = consume(spec, done_handler(), DedupLedger::new()).unwrap();
         assert_eq!(c.name(), &ConsumerName("indexer".into()));
-        assert_eq!(c.per_tenant_inflight_cap().get(), 4, "the per-tenant cap is wired from the spec");
+        assert_eq!(
+            c.per_tenant_inflight_cap().get(),
+            4,
+            "the per-tenant cap is wired from the spec"
+        );
 
         // the wired consumer actually processes a whitelisted message.
         assert_eq!(
@@ -1109,7 +1285,11 @@ mod tests {
     /// is admitted and read back; the default is 16.
     #[test]
     fn per_tenant_inflight_rejects_zero() {
-        assert_eq!(PerTenantInflight::new(0), None, "a zero per-tenant cap is meaningless, rejected");
+        assert_eq!(
+            PerTenantInflight::new(0),
+            None,
+            "a zero per-tenant cap is meaningless, rejected"
+        );
         assert_eq!(PerTenantInflight::new(4).unwrap().get(), 4);
         assert_eq!(PerTenantInflight::DEFAULT.get(), 16);
     }
@@ -1153,7 +1333,11 @@ mod tests {
         // The surge tenant's first 2 retries occupy its 2 in-flight slots.
         assert_eq!(c.deliver(&surge("01J-s1")), Delivered::Retried(5));
         assert_eq!(c.deliver(&surge("01J-s2")), Delivered::Retried(5));
-        assert_eq!(c.tenant_inflight(&TenantId("surge".into())), 2, "the surge tenant holds its 2 slots");
+        assert_eq!(
+            c.tenant_inflight(&TenantId("surge".into())),
+            2,
+            "the surge tenant holds its 2 slots"
+        );
 
         // The 3rd surge message is THROTTLED (deferred, not dropped) — at cap.
         assert_eq!(
@@ -1161,15 +1345,27 @@ mod tests {
             Delivered::Throttled(TenantId("surge".into())),
             "the surge tenant is bounded to its cap"
         );
-        assert_eq!(c.tenant_inflight(&TenantId("surge".into())), 2, "still 2 — the throttled message took no slot");
+        assert_eq!(
+            c.tenant_inflight(&TenantId("surge".into())),
+            2,
+            "still 2 — the throttled message took no slot"
+        );
 
         // A DIFFERENT tenant's message still ACKs — the surge did NOT starve it (fairness).
         let other = Message {
             subject: "myelin://other/issues/y".into(),
             envelope: tenant_envelope("01J-o1", "myelin://other/issues/y", "other"),
         };
-        assert_eq!(c.deliver(&other), Delivered::Acked, "the other tenant is not starved by the surge");
-        assert_eq!(c.tenant_inflight(&TenantId("other".into())), 0, "the other tenant's Done released its slot");
+        assert_eq!(
+            c.deliver(&other),
+            Delivered::Acked,
+            "the other tenant is not starved by the surge"
+        );
+        assert_eq!(
+            c.tenant_inflight(&TenantId("other".into())),
+            0,
+            "the other tenant's Done released its slot"
+        );
     }
 
     /// A throttled message is DEFERRED, not lost: once the surging tenant's slots free (its work
@@ -1199,7 +1395,14 @@ mod tests {
             max_ack_pending: PrefetchBound::DEFAULT,
             per_tenant_inflight: PerTenantInflight::new(1).unwrap(),
         };
-        let c = consume(spec, DrainHandler { failed: Mutex::new(HashSet::new()) }, DedupLedger::new()).unwrap();
+        let c = consume(
+            spec,
+            DrainHandler {
+                failed: Mutex::new(HashSet::new()),
+            },
+            DedupLedger::new(),
+        )
+        .unwrap();
         let m = |id: &str| Message {
             subject: "myelin://surge/x".into(),
             envelope: tenant_envelope(id, "myelin://surge/x", "surge"),
@@ -1207,15 +1410,30 @@ mod tests {
 
         // m1 retries (holds the single slot); m2 is throttled (cap 1).
         assert_eq!(c.deliver(&m("01J-1")), Delivered::Retried(1));
-        assert_eq!(c.deliver(&m("01J-2")), Delivered::Throttled(TenantId("surge".into())));
+        assert_eq!(
+            c.deliver(&m("01J-2")),
+            Delivered::Throttled(TenantId("surge".into()))
+        );
 
         // m1 redelivers and now succeeds → the slot frees.
         assert_eq!(c.deliver(&m("01J-1")), Delivered::Acked);
-        assert_eq!(c.tenant_inflight(&TenantId("surge".into())), 0, "the slot freed");
+        assert_eq!(
+            c.tenant_inflight(&TenantId("surge".into())),
+            0,
+            "the slot freed"
+        );
 
         // m2 is re-offered (it was deferred, never dropped): first retry, then it acks. 0 loss.
-        assert_eq!(c.deliver(&m("01J-2")), Delivered::Retried(1), "the previously-throttled message is re-offered");
-        assert_eq!(c.deliver(&m("01J-2")), Delivered::Acked, "and eventually processed — 0 loss");
+        assert_eq!(
+            c.deliver(&m("01J-2")),
+            Delivered::Retried(1),
+            "the previously-throttled message is re-offered"
+        );
+        assert_eq!(
+            c.deliver(&m("01J-2")),
+            Delivered::Acked,
+            "and eventually processed — 0 loss"
+        );
     }
 
     /// Build an envelope for a given tenant (the per-tenant fairness tests key on `envelope.tenant`).

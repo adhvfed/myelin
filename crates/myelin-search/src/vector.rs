@@ -284,7 +284,9 @@ impl HnswVectorIndex {
     pub fn upsert(&mut self, record: VectorRecord) -> Result<(), IndexError> {
         let dim = record.embedding.dim();
         if dim == 0 {
-            return Err(IndexError::Engine("a vector embedding must be non-empty".into()));
+            return Err(IndexError::Engine(
+                "a vector embedding must be non-empty".into(),
+            ));
         }
         match self.dim {
             Some(d) if d != dim => {
@@ -380,13 +382,7 @@ impl HnswVectorIndex {
     /// first. Tombstoned nodes are traversed (the graph stays connected through them) but excluded
     /// from the returned result set — soft-delete hides a vector from results without disconnecting
     /// the graph until compaction rebuilds it.
-    fn search_layer(
-        &self,
-        query: &Embedding,
-        ep: usize,
-        l: usize,
-        ef: usize,
-    ) -> Vec<(usize, f32)> {
+    fn search_layer(&self, query: &Embedding, ep: usize, l: usize, ef: usize) -> Vec<(usize, f32)> {
         // Max-heap on distance for the result set (so we can pop the farthest); min-heap (via
         // Reverse) for the frontier.
         let mut visited: HashSet<usize> = HashSet::new();
@@ -752,9 +748,9 @@ mod tests {
 
     fn dek() -> DekHandle {
         // A standalone DEK for the seal/open tests (the same primitive the per-tenant index DEK is).
-        use std::sync::Arc;
         use myelin_storage::{KekId, KmsEngine};
         use myelin_tenancy::{Region, TenantId};
+        use std::sync::Arc;
         let kms = Arc::new(KmsEngine::new());
         let t = TenantId("acme".into());
         let r = Region("fr-par".into());
@@ -788,26 +784,52 @@ mod tests {
         assert_eq!(hits.len(), 2, "k=2 nearest");
         // The two nearest to ~[1,0,0] are `a` and `d`.
         let ids: HashSet<&str> = hits.iter().map(|h| h.doc_id.as_str()).collect();
-        assert!(ids.contains("a") && ids.contains("d"), "a and d are nearest, got {ids:?}");
+        assert!(
+            ids.contains("a") && ids.contains("d"),
+            "a and d are nearest, got {ids:?}"
+        );
         // The nearest has the highest similarity, sorted first.
-        assert!(hits[0].similarity >= hits[1].similarity, "sorted by similarity desc");
-        assert!(hits[0].similarity > 0.99, "the near-identical vector is highly similar");
+        assert!(
+            hits[0].similarity >= hits[1].similarity,
+            "sorted by similarity desc"
+        );
+        assert!(
+            hits[0].similarity > 0.99,
+            "the near-identical vector is highly similar"
+        );
     }
 
     /// **Every vector carries its `model_ref` (§3.3) — a hit reports it; a model swap is detectable.**
     #[test]
     fn model_ref_is_carried_on_every_vector() {
         let mut idx = HnswVectorIndex::open();
-        idx.upsert(rec("a", vec![1.0, 0.0], "text-embed-3@1")).unwrap();
-        assert_eq!(idx.model_ref_of("a"), Some(&ModelRef("text-embed-3@1".into())));
+        idx.upsert(rec("a", vec![1.0, 0.0], "text-embed-3@1"))
+            .unwrap();
+        assert_eq!(
+            idx.model_ref_of("a"),
+            Some(&ModelRef("text-embed-3@1".into()))
+        );
 
         let hits = idx.knn(&Embedding(vec![1.0, 0.0]), 1);
-        assert_eq!(hits[0].model_ref, ModelRef("text-embed-3@1".into()), "the hit carries model_ref");
+        assert_eq!(
+            hits[0].model_ref,
+            ModelRef("text-embed-3@1".into()),
+            "the hit carries model_ref"
+        );
 
         // A model swap: re-embedding `a` under a new model replaces the vector (idempotent on doc_id).
-        idx.upsert(rec("a", vec![0.0, 1.0], "text-embed-4@1")).unwrap();
-        assert_eq!(idx.model_ref_of("a"), Some(&ModelRef("text-embed-4@1".into())), "new model");
-        assert_eq!(idx.live_len(), 1, "the same doc_id replaced, not duplicated (one doc-id space)");
+        idx.upsert(rec("a", vec![0.0, 1.0], "text-embed-4@1"))
+            .unwrap();
+        assert_eq!(
+            idx.model_ref_of("a"),
+            Some(&ModelRef("text-embed-4@1".into())),
+            "new model"
+        );
+        assert_eq!(
+            idx.live_len(),
+            1,
+            "the same doc_id replaced, not duplicated (one doc-id space)"
+        );
     }
 
     /// **Soft-delete-then-compact leaves 0 orphan embedding (the SRCH-P05 GATE, §3.3).** A
@@ -823,9 +845,19 @@ mod tests {
 
         // Soft-delete: the erased vector is gone from results IMMEDIATELY, but physically present.
         assert!(idx.soft_delete("erase"), "a live vector was tombstoned");
-        assert!(!idx.contains("erase"), "the erased vector no longer surfaces");
-        assert!(idx.has_orphan_embedding(), "its bytes are still physically present (tombstoned)");
-        assert_eq!(idx.physical_len(), 3, "still physically there until compaction");
+        assert!(
+            !idx.contains("erase"),
+            "the erased vector no longer surfaces"
+        );
+        assert!(
+            idx.has_orphan_embedding(),
+            "its bytes are still physically present (tombstoned)"
+        );
+        assert_eq!(
+            idx.physical_len(),
+            3,
+            "still physically there until compaction"
+        );
         assert_eq!(idx.live_len(), 2, "two live");
 
         // A k-NN aimed straight at the erased vector must NOT return it.
@@ -837,10 +869,20 @@ mod tests {
 
         // Compact-on-merge: 0 orphan embedding survives.
         idx.compact();
-        assert!(!idx.has_orphan_embedding(), "0 orphan embedding after compaction (the GATE)");
-        assert_eq!(idx.physical_len(), 2, "the tombstoned bytes are physically gone");
+        assert!(
+            !idx.has_orphan_embedding(),
+            "0 orphan embedding after compaction (the GATE)"
+        );
+        assert_eq!(
+            idx.physical_len(),
+            2,
+            "the tombstoned bytes are physically gone"
+        );
         assert_eq!(idx.live_len(), 2, "the live set is intact after compaction");
-        assert!(idx.contains("keep1") && idx.contains("keep2"), "survivors kept");
+        assert!(
+            idx.contains("keep1") && idx.contains("keep2"),
+            "survivors kept"
+        );
         // The graph still answers post-compaction.
         let hits = idx.knn(&Embedding(vec![1.0, 0.0]), 1);
         assert_eq!(hits[0].doc_id, "keep1", "k-NN works post-compaction");
@@ -853,7 +895,10 @@ mod tests {
         idx.upsert(rec("d", vec![1.0, 0.0], "m@1")).unwrap();
         assert!(idx.soft_delete("d"));
         assert!(!idx.soft_delete("d"), "second soft-delete is a no-op");
-        assert!(!idx.soft_delete("absent"), "deleting an absent doc is a no-op");
+        assert!(
+            !idx.soft_delete("absent"),
+            "deleting an absent doc is a no-op"
+        );
 
         idx.upsert(rec("d", vec![0.0, 1.0], "m@2")).unwrap();
         assert!(idx.contains("d"), "re-inserted");
@@ -866,14 +911,19 @@ mod tests {
     #[test]
     fn knn_filtered_returns_k_visible_neighbours() {
         let mut idx = HnswVectorIndex::open();
-        idx.upsert(rec("secret", vec![1.0, 0.0, 0.0], "m@1")).unwrap();
+        idx.upsert(rec("secret", vec![1.0, 0.0, 0.0], "m@1"))
+            .unwrap();
         idx.upsert(rec("v1", vec![0.95, 0.05, 0.0], "m@1")).unwrap();
         idx.upsert(rec("v2", vec![0.9, 0.1, 0.0], "m@1")).unwrap();
         idx.upsert(rec("v3", vec![0.85, 0.15, 0.0], "m@1")).unwrap();
 
         let visible = |doc: &str| doc != "secret";
         let hits = idx.knn_filtered(&Embedding(vec![1.0, 0.0, 0.0]), 2, visible);
-        assert_eq!(hits.len(), 2, "two VISIBLE neighbours (the hidden one didn't waste a slot)");
+        assert_eq!(
+            hits.len(),
+            2,
+            "two VISIBLE neighbours (the hidden one didn't waste a slot)"
+        );
         assert!(
             !hits.iter().any(|h| h.doc_id == "secret"),
             "the hidden vector never surfaces (no post-filter leak/under-fill)"
@@ -892,7 +942,9 @@ mod tests {
         // 400 deterministic 6-d vectors; only 5 specific doc-ids are "visible".
         let mut s: u64 = 0xC0FF_EE11;
         let mut gen = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 33) as f32 / (1u64 << 31) as f32) - 1.0
         };
         let mut corpus: Vec<(String, Vec<f32>)> = Vec::new();
@@ -902,8 +954,10 @@ mod tests {
             idx.upsert(rec(&format!("d{i}"), v, "m@1")).unwrap();
         }
         // The visible set: 5 docs scattered across the corpus (the very-selective ACL filter).
-        let visible_ids: Vec<String> =
-            ["d3", "d97", "d180", "d255", "d399"].iter().map(|s| s.to_string()).collect();
+        let visible_ids: Vec<String> = ["d3", "d97", "d180", "d255", "d399"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let visible = |doc: &str| visible_ids.iter().any(|v| v == doc);
 
         // The query: near `d255` (a visible doc) — but the graph neighbourhood around it is full of
@@ -921,12 +975,25 @@ mod tests {
         let truth_ids: Vec<&str> = truth.iter().take(3).map(|(_, id)| id.as_str()).collect();
 
         let got: Vec<&str> = hits.iter().map(|h| h.doc_id.as_str()).collect();
-        assert_eq!(got, truth_ids, "the k-nearest VISIBLE neighbours (recovered by brute-force)");
-        assert_eq!(hits.len(), 3, "k visible neighbours, fully filled (not under-filled)");
+        assert_eq!(
+            got, truth_ids,
+            "the k-nearest VISIBLE neighbours (recovered by brute-force)"
+        );
+        assert_eq!(
+            hits.len(),
+            3,
+            "k visible neighbours, fully filled (not under-filled)"
+        );
         // No invisible doc leaked.
-        assert!(hits.iter().all(|h| visible(&h.doc_id)), "no hidden vector surfaced");
+        assert!(
+            hits.iter().all(|h| visible(&h.doc_id)),
+            "no hidden vector surfaced"
+        );
         // The nearest is `d255` itself (distance ~0).
-        assert_eq!(hits[0].doc_id, "d255", "the exact nearest visible neighbour is first");
+        assert_eq!(
+            hits[0].doc_id, "d255",
+            "the exact nearest visible neighbour is first"
+        );
     }
 
     /// **The brute-force fallback EXCLUDES tombstoned AND invisible vectors (no leak, no orphan) and
@@ -941,7 +1008,9 @@ mod tests {
         // A large corpus so the graph walk under-fills under the selective filter (forcing fallback).
         let mut s: u64 = 0xBEEF_0042;
         let mut gen = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 33) as f32 / (1u64 << 31) as f32) - 1.0
         };
         for i in 0..300 {
@@ -949,10 +1018,18 @@ mod tests {
             idx.upsert(rec(&format!("filler{i}"), v, "m@1")).unwrap();
         }
         // Three controlled vectors AT/near the query direction.
-        idx.upsert(rec("near_visible", vec![1.0, 0.0, 0.0, 0.0, 0.0], "m@1")).unwrap();
-        idx.upsert(rec("near_invisible", vec![0.99, 0.01, 0.0, 0.0, 0.0], "m@1")).unwrap();
-        idx.upsert(rec("near_tombstoned", vec![1.0, 0.0, 0.0, 0.0, 0.0], "m@1")).unwrap();
-        idx.upsert(rec("far_visible", vec![-1.0, 0.0, 0.0, 0.0, 0.0], "m@1")).unwrap();
+        idx.upsert(rec("near_visible", vec![1.0, 0.0, 0.0, 0.0, 0.0], "m@1"))
+            .unwrap();
+        idx.upsert(rec(
+            "near_invisible",
+            vec![0.99, 0.01, 0.0, 0.0, 0.0],
+            "m@1",
+        ))
+        .unwrap();
+        idx.upsert(rec("near_tombstoned", vec![1.0, 0.0, 0.0, 0.0, 0.0], "m@1"))
+            .unwrap();
+        idx.upsert(rec("far_visible", vec![-1.0, 0.0, 0.0, 0.0, 0.0], "m@1"))
+            .unwrap();
         // Tombstone one of the near ones — it must NEVER enter the scan (no orphan leak).
         assert!(idx.soft_delete("near_tombstoned"));
 
@@ -963,14 +1040,30 @@ mod tests {
 
         let ids: Vec<&str> = hits.iter().map(|h| h.doc_id.as_str()).collect();
         // Exactly the two visible docs, NEAREST first (near_visible at dist 0, then far_visible).
-        assert_eq!(ids, ["near_visible", "far_visible"], "exact ascending-distance order over visible set");
+        assert_eq!(
+            ids,
+            ["near_visible", "far_visible"],
+            "exact ascending-distance order over visible set"
+        );
         // The tombstoned + invisible near vectors NEVER surface (the leak/orphan exclusion).
-        assert!(!ids.contains(&"near_tombstoned"), "a tombstoned vector never enters the brute-force scan");
-        assert!(!ids.contains(&"near_invisible"), "an invisible-but-near vector never enters the scan (no leak)");
+        assert!(
+            !ids.contains(&"near_tombstoned"),
+            "a tombstoned vector never enters the brute-force scan"
+        );
+        assert!(
+            !ids.contains(&"near_invisible"),
+            "an invisible-but-near vector never enters the scan (no leak)"
+        );
         // near_visible is at the query ⇒ similarity ~1; far_visible is opposite ⇒ similarity ~ -1
         // (distance ~2) — proves the distance is ASCENDING (a sign-flipped distance would reverse this).
-        assert!(hits[0].similarity > hits[1].similarity, "nearest has the higher similarity (ascending distance)");
-        assert!(hits[0].similarity > 0.99, "the at-query vector is maximally similar");
+        assert!(
+            hits[0].similarity > hits[1].similarity,
+            "nearest has the higher similarity (ascending distance)"
+        );
+        assert!(
+            hits[0].similarity > 0.99,
+            "the at-query vector is maximally similar"
+        );
     }
 
     /// **The fallback does NOT trigger when the graph walk already returned k visible hits (the
@@ -988,7 +1081,11 @@ mod tests {
         let visible = |_: &str| true;
         let q = Embedding(vec![1.0, 0.0]);
         let hits = idx.knn_filtered(&q, 3, visible);
-        assert_eq!(hits.len(), 3, "k visible neighbours filled by the graph walk (no under-fill)");
+        assert_eq!(
+            hits.len(),
+            3,
+            "k visible neighbours filled by the graph walk (no under-fill)"
+        );
         // Cross-check the top hit against brute-force ground truth (the graph walk is correct here).
         let mut truth: Vec<(f32, String)> = (0..50)
             .map(|i| {
@@ -997,7 +1094,10 @@ mod tests {
             })
             .collect();
         truth.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        assert_eq!(hits[0].doc_id, truth[0].1, "the nearest is the true nearest (graph walk correct)");
+        assert_eq!(
+            hits[0].doc_id, truth[0].1,
+            "the nearest is the true nearest (graph walk correct)"
+        );
     }
 
     /// **The fallback never UNDER-fills when fewer than k are visible — it returns ALL visible
@@ -1013,7 +1113,11 @@ mod tests {
         let visible = |doc: &str| doc == "d10" || doc == "d50";
         let q = Embedding(vec![0.0, 1.0, 0.0]);
         let hits = idx.knn_filtered(&q, 5, visible);
-        assert_eq!(hits.len(), 2, "exactly the two visible docs — never padded with a hidden one");
+        assert_eq!(
+            hits.len(),
+            2,
+            "exactly the two visible docs — never padded with a hidden one"
+        );
         assert!(hits.iter().all(|h| h.doc_id == "d10" || h.doc_id == "d50"));
     }
 
@@ -1030,15 +1134,28 @@ mod tests {
         let d2 = nonzero.cosine_distance(&zero);
         let d3 = zero.cosine_distance(&zero);
         for d in [d1, d2, d3] {
-            assert!(!d.is_nan(), "a zero-norm vector must not produce a NaN distance");
-            assert_eq!(d, 1.0, "the zero-norm guard yields the defined sentinel distance 1.0");
+            assert!(
+                !d.is_nan(),
+                "a zero-norm vector must not produce a NaN distance"
+            );
+            assert_eq!(
+                d, 1.0,
+                "the zero-norm guard yields the defined sentinel distance 1.0"
+            );
         }
         // Searching an index against a zero query is defined (returns results, no panic/NaN sort).
         let mut idx = HnswVectorIndex::open();
         idx.upsert(rec("a", vec![1.0, 0.0, 0.0], "m@1")).unwrap();
         let hits = idx.knn(&Embedding(vec![0.0, 0.0, 0.0]), 1);
-        assert_eq!(hits.len(), 1, "a zero query still searches (defined distance), no NaN");
-        assert_eq!(hits[0].similarity, 0.0, "similarity = 1 - 1.0 = 0 for a zero-norm query");
+        assert_eq!(
+            hits.len(),
+            1,
+            "a zero query still searches (defined distance), no NaN"
+        );
+        assert_eq!(
+            hits[0].similarity, 0.0,
+            "similarity = 1 - 1.0 = 0 for a zero-norm query"
+        );
     }
 
     /// **A dimension mismatch is a loud error (no silent mixing — §3.3).**
@@ -1046,10 +1163,18 @@ mod tests {
     fn dimension_mismatch_is_loud() {
         let mut idx = HnswVectorIndex::open();
         idx.upsert(rec("a", vec![1.0, 0.0, 0.0], "m@1")).unwrap();
-        let err = idx.upsert(rec("b", vec![1.0, 0.0], "m@1")).expect_err("dim mismatch");
-        assert!(matches!(err, IndexError::Engine(_)), "loud dimension-mismatch error");
+        let err = idx
+            .upsert(rec("b", vec![1.0, 0.0], "m@1"))
+            .expect_err("dim mismatch");
+        assert!(
+            matches!(err, IndexError::Engine(_)),
+            "loud dimension-mismatch error"
+        );
         let empty = idx.upsert(rec("c", vec![], "m@1")).expect_err("empty");
-        assert!(matches!(empty, IndexError::Engine(_)), "an empty embedding is rejected");
+        assert!(
+            matches!(empty, IndexError::Engine(_)),
+            "an empty embedding is rejected"
+        );
     }
 
     /// **The vector segment is encrypted-from-birth under the per-tenant index DEK (contract 11.3).**
@@ -1075,13 +1200,22 @@ mod tests {
             .expect("open")
             .expect("the right key opens");
         assert!(restored.contains("a"), "the live vector round-trips");
-        assert!(!restored.contains("b"), "the soft-deleted vector's bytes never reached the segment");
-        assert_eq!(restored.model_ref_of("a"), Some(&ModelRef("m@1".into())), "model_ref round-trips");
+        assert!(
+            !restored.contains("b"),
+            "the soft-deleted vector's bytes never reached the segment"
+        );
+        assert_eq!(
+            restored.model_ref_of("a"),
+            Some(&ModelRef("m@1".into())),
+            "model_ref round-trips"
+        );
 
         // A WRONG key opens to nothing — never a plaintext fall-through (0-fail-open).
         let wrong = dek();
         assert!(
-            HnswVectorIndex::open_segment(&wrong, &nonce, &ct).expect("no error").is_none(),
+            HnswVectorIndex::open_segment(&wrong, &nonce, &ct)
+                .expect("no error")
+                .is_none(),
             "a wrong/shredded key yields None, never a plaintext leak"
         );
     }
@@ -1098,7 +1232,9 @@ mod tests {
         // 200 deterministic pseudo-random 8-d vectors.
         let mut s: u64 = 0x1234_5678;
         let mut gen = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 33) as f32 / (1u64 << 31) as f32) - 1.0
         };
         let mut corpus: Vec<(String, Vec<f32>)> = Vec::new();

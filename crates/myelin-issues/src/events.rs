@@ -349,9 +349,7 @@ pub mod unit_check {
     /// the explicit smell the check rejects (the frozen unit is seconds — arch §1). This is the
     /// floor `EventEnvelope`-anchored unit discipline the issue payloads conform to; the typed SLA
     /// payload structs land with the SLA write path (ISS-P06+), and they read THIS rule.
-    pub fn validate_issue_payload_units(
-        payload: &serde_json::Value,
-    ) -> Result<(), UnitError> {
+    pub fn validate_issue_payload_units(payload: &serde_json::Value) -> Result<(), UnitError> {
         let Some(obj) = payload.as_object() else {
             // a non-object payload carries no unit-bearing keys to check.
             return Ok(());
@@ -382,9 +380,7 @@ pub mod unit_check {
 
 #[cfg(test)]
 mod tests {
-    use super::unit_check::{
-        timestamp_is_rfc3339_utc, validate_issue_payload_units, UnitError,
-    };
+    use super::unit_check::{timestamp_is_rfc3339_utc, validate_issue_payload_units, UnitError};
     use super::*;
 
     /// **THE GATE (contract 2.9): 0 ungrammatical tokens.** Every registered `issue.*` token —
@@ -415,7 +411,10 @@ mod tests {
     fn every_issue_token_carries_the_issue_subsystem_prefix() {
         for &tok in ISSUE_EVENT_TOKENS {
             let head = tok.split('.').next().expect("non-empty token");
-            assert_eq!(head, "issue", "token `{tok}` must carry the `issue` subsystem prefix");
+            assert_eq!(
+                head, "issue",
+                "token `{tok}` must carry the `issue` subsystem prefix"
+            );
         }
         // ...and `issue` is the canonical subsystem token the Bus knows (the names anchor X-5).
         assert!(
@@ -433,7 +432,10 @@ mod tests {
         assert!(ISSUE_EVENT_TOKENS.contains(&INITIATIVE_HEALTH_CHANGED));
         assert!(validate_event_type(INITIATIVE_HEALTH_CHANGED).is_ok());
         // the artifact-type segment is `initiative`, the registered §6.2 extension.
-        assert_eq!(INITIATIVE_HEALTH_CHANGED.split('.').nth(1), Some("initiative"));
+        assert_eq!(
+            INITIATIVE_HEALTH_CHANGED.split('.').nth(1),
+            Some("initiative")
+        );
         assert!(
             myelin_events::ARTIFACT_TYPE_TOKENS.contains(&"initiative"),
             "`initiative` must be a registered Bus artifact-type token (recon §2 / §6.2)"
@@ -446,7 +448,10 @@ mod tests {
     fn the_issue_token_list_has_no_duplicates() {
         let mut seen = std::collections::BTreeSet::new();
         for &tok in ISSUE_EVENT_TOKENS {
-            assert!(seen.insert(tok), "issue token `{tok}` is registered more than once");
+            assert!(
+                seen.insert(tok),
+                "issue token `{tok}` is registered more than once"
+            );
         }
         assert_eq!(seen.len(), ISSUE_EVENT_TOKENS.len());
     }
@@ -516,7 +521,9 @@ mod tests {
         });
         assert_eq!(
             validate_issue_payload_units(&drifted),
-            Err(UnitError::DurationNotSeconds { field: "target_millis".into() }),
+            Err(UnitError::DurationNotSeconds {
+                field: "target_millis".into()
+            }),
             "a millis-expressed duration must be REJECTED (the frozen unit is seconds)"
         );
         // the `_ms` short form is the same drift, rejected the same way.

@@ -755,7 +755,10 @@ mod tests {
         let matching = envelope("issues.issue.created", "PROJ-1", "evt-1");
         let outs = engine.ingest(&matching, &SetExpr::All, &no_rel, &exec);
         assert!(
-            matches!(outcome_for(&outs, "label_on_create"), Outcome::Emitted { .. }),
+            matches!(
+                outcome_for(&outs, "label_on_create"),
+                Outcome::Emitted { .. }
+            ),
             "a matching event fires the automation"
         );
 
@@ -782,7 +785,10 @@ mod tests {
         // The action started a durable workflow (delegation succeeded).
         match outcome_for(&outs, "escalate") {
             Outcome::WorkflowStarted { handle, .. } => {
-                assert_eq!(handle, &DurableHandle("wf:escalate:svc-bot:evt-wf-1".into()));
+                assert_eq!(
+                    handle,
+                    &DurableHandle("wf:escalate:svc-bot:evt-wf-1".into())
+                );
             }
             other => panic!("expected WorkflowStarted, got {other:?}"),
         }
@@ -793,7 +799,10 @@ mod tests {
             .run_for("escalate:svc-bot:evt-wf-1")
             .expect("the run is recorded");
         assert_eq!(run.workflow_ref, WorkflowRef("escalate_incident".into()));
-        assert_eq!(run.input, serde_json::json!({ "ref": "myelin://t1/issues/issue/PROJ-1" }));
+        assert_eq!(
+            run.input,
+            serde_json::json!({ "ref": "myelin://t1/issues/issue/PROJ-1" })
+        );
     }
 
     /// **GATE: a matching event fires the automation EXACTLY ONCE per delivery (idempotent on
@@ -816,7 +825,10 @@ mod tests {
         // Redelivery of the SAME event_id → NO-OP (already fired); the action runs ZERO more times.
         let second = engine.ingest(&env, &SetExpr::All, &no_rel, &exec);
         assert!(
-            matches!(outcome_for(&second, "escalate"), Outcome::AlreadyFired { .. }),
+            matches!(
+                outcome_for(&second, "escalate"),
+                Outcome::AlreadyFired { .. }
+            ),
             "a redelivered event is a no-op (effectively-once on event_id)"
         );
         assert_eq!(
@@ -927,7 +939,10 @@ mod tests {
         // A non-PII event of the same type → the gate passes → the action fires.
         let clean = envelope("issues.issue.created", "PROJ-2", "evt-clean");
         let outs2 = engine.ingest(&clean, &SetExpr::All, &no_rel, &exec);
-        assert!(matches!(outcome_for(&outs2, "label"), Outcome::Emitted { .. }));
+        assert!(matches!(
+            outcome_for(&outs2, "label"),
+            Outcome::Emitted { .. }
+        ));
     }
 
     /// **A `RequireHumanApproval` gate routes the firing to the approval lane (held, not run
@@ -943,11 +958,18 @@ mod tests {
         let env = envelope("issues.issue.created", "PROJ-1", "evt-approve");
         let outs = engine.ingest(&env, &SetExpr::All, &no_rel, &exec);
         assert!(
-            matches!(outcome_for(&outs, "escalate"), Outcome::AwaitingApproval { .. }),
+            matches!(
+                outcome_for(&outs, "escalate"),
+                Outcome::AwaitingApproval { .. }
+            ),
             "a human-approval gate holds the action for a human decision"
         );
         // The action did NOT run inline — no durable workflow was started.
-        assert_eq!(exec.started_count(), 0, "the action is held, not run inline");
+        assert_eq!(
+            exec.started_count(),
+            0,
+            "the action is held, not run inline"
+        );
         // A redelivery is a no-op (the firing was recorded so no second card is raised).
         let again = engine.ingest(&env, &SetExpr::All, &no_rel, &exec);
         assert!(matches!(
@@ -967,7 +989,10 @@ mod tests {
 
         let shallow = envelope("issues.issue.created", "PROJ-1", "evt-shallow");
         assert!(matches!(
-            outcome_for(&engine.ingest(&shallow, &SetExpr::All, &no_rel, &exec), "label"),
+            outcome_for(
+                &engine.ingest(&shallow, &SetExpr::All, &no_rel, &exec),
+                "label"
+            ),
             Outcome::Emitted { .. }
         ));
 
@@ -975,7 +1000,10 @@ mod tests {
         deep.depth = 7;
         assert!(
             matches!(
-                outcome_for(&engine.ingest(&deep, &SetExpr::All, &no_rel, &exec), "label"),
+                outcome_for(
+                    &engine.ingest(&deep, &SetExpr::All, &no_rel, &exec),
+                    "label"
+                ),
                 Outcome::GateFailed { .. }
             ),
             "a firing past the causal-depth ceiling is suppressed (the self-trigger guard)"
@@ -1002,7 +1030,10 @@ mod tests {
         let env = envelope("issues.issue.created", "PROJ-1", "evt-fail");
         let outs = engine.ingest(&env, &SetExpr::All, &no_rel, &FailingExec);
         assert!(
-            matches!(outcome_for(&outs, "escalate"), Outcome::WorkflowStartFailed { .. }),
+            matches!(
+                outcome_for(&outs, "escalate"),
+                Outcome::WorkflowStartFailed { .. }
+            ),
             "a start failure is surfaced, never swallowed"
         );
     }
@@ -1024,7 +1055,11 @@ mod tests {
             }
             all
         };
-        assert_eq!(run(), run(), "the same stream → the same outcomes (deterministic)");
+        assert_eq!(
+            run(),
+            run(),
+            "the same stream → the same outcomes (deterministic)"
+        );
     }
 
     /// **`AutomationRule` round-trips stably (the wire contract — the durable `automation_rule`

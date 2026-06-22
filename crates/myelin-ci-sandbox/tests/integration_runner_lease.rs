@@ -63,9 +63,18 @@ async fn runner_lease_heartbeat_and_exactly_once_terminal_in_real_postgres() {
     let jq = format!("job_queue_lease_{pid}");
     let sig = format!("wf_signal_runner_{pid}");
 
-    sqlx::query(&format!("DROP TABLE IF EXISTS {jq}")).execute(&admin).await.unwrap();
-    sqlx::query(&format!("DROP TABLE IF EXISTS {sig}")).execute(&admin).await.unwrap();
-    sqlx::query(&job_queue_ddl(&jq)).execute(&admin).await.expect("the job_queue lease DDL applies");
+    sqlx::query(&format!("DROP TABLE IF EXISTS {jq}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    sqlx::query(&format!("DROP TABLE IF EXISTS {sig}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    sqlx::query(&job_queue_ddl(&jq))
+        .execute(&admin)
+        .await
+        .expect("the job_queue lease DDL applies");
     // the REAL frozen wf_signal DDL (the engine's exactly-once buffer) — per-pid isolation.
     sqlx::query(&WF_SIGNAL_DDL.replacen("wf_signal", &sig, 1))
         .execute(&admin)
@@ -108,7 +117,10 @@ async fn runner_lease_heartbeat_and_exactly_once_terminal_in_real_postgres() {
     let idem_token: String = claimed.get("idem_token");
     let run_id: String = claimed.get("run_id");
     assert_eq!(job_id, "job-1");
-    assert_eq!(idem_token, "tok-1", "the spec's idem_token the runner will echo on job.done");
+    assert_eq!(
+        idem_token, "tok-1",
+        "the spec's idem_token the runner will echo on job.done"
+    );
     tx1.commit().await.unwrap();
 
     // a SECOND claimer finds NO eligible row (the only job's lease is LIVE) — skip-locked safety.
@@ -124,7 +136,10 @@ async fn runner_lease_heartbeat_and_exactly_once_terminal_in_real_postgres() {
     .fetch_optional(&admin)
     .await
     .unwrap();
-    assert!(none.is_none(), "a live-leased job is not double-claimed (skip-locked / no double-run)");
+    assert!(
+        none.is_none(),
+        "a live-leased job is not double-claimed (skip-locked / no double-run)"
+    );
 
     // ───────────────────────── 2. HEARTBEAT renew (owner only) ───────────────────────────────────
     // worker-1 renews its OWN lease (UPDATE … WHERE lease_owner = 'worker-1'); the renew applies.
@@ -135,7 +150,11 @@ async fn runner_lease_heartbeat_and_exactly_once_terminal_in_real_postgres() {
     .execute(&admin)
     .await
     .unwrap();
-    assert_eq!(renewed.rows_affected(), 1, "the owner's heartbeat renews the lease");
+    assert_eq!(
+        renewed.rows_affected(),
+        1,
+        "the owner's heartbeat renews the lease"
+    );
 
     // worker-2 CANNOT heartbeat a lease it does not own (0 rows) — only the owner renews.
     let foreign = sqlx::query(&format!(
@@ -145,7 +164,11 @@ async fn runner_lease_heartbeat_and_exactly_once_terminal_in_real_postgres() {
     .execute(&admin)
     .await
     .unwrap();
-    assert_eq!(foreign.rows_affected(), 0, "a non-owner cannot heartbeat the lease");
+    assert_eq!(
+        foreign.rows_affected(),
+        0,
+        "a non-owner cannot heartbeat the lease"
+    );
 
     // force the lease EXPIRED (set it in the past) → worker-2 reclaims it (the reaper seam, CI-P12).
     sqlx::query(&format!(
@@ -168,7 +191,10 @@ async fn runner_lease_heartbeat_and_exactly_once_terminal_in_real_postgres() {
     .unwrap()
     .expect("worker-2 reclaims the EXPIRED lease");
     let owner: String = reclaimed.get("lease_owner");
-    assert_eq!(owner, "worker-2", "an expired lease is reclaimable (the reaper / reclaim seam)");
+    assert_eq!(
+        owner, "worker-2",
+        "an expired lease is reclaimable (the reaper / reclaim seam)"
+    );
 
     // ───────────────────────── 3. EXACTLY-ONCE terminal report ───────────────────────────────────
     // the runner reports terminal by delivering job.done ECHOING the idem_token onto the ENGINE's
@@ -195,9 +221,15 @@ async fn runner_lease_heartbeat_and_exactly_once_terminal_in_real_postgres() {
     };
 
     let first = deliver("first").await;
-    assert!(first.is_some(), "the FIRST job.done delivery buffered (the workflow wakes)");
+    assert!(
+        first.is_some(),
+        "the FIRST job.done delivery buffered (the workflow wakes)"
+    );
     let second = deliver("second").await;
-    assert!(second.is_none(), "the SECOND job.done is a no-op (ON CONFLICT DO NOTHING — wake once)");
+    assert!(
+        second.is_none(),
+        "the SECOND job.done is a no-op (ON CONFLICT DO NOTHING — wake once)"
+    );
 
     let count: i64 = sqlx::query(&format!(
         "SELECT count(*)::bigint AS c FROM {sig} WHERE tenant_id='acme' AND run_id=$1 AND signal_name='job.done'"
@@ -207,7 +239,10 @@ async fn runner_lease_heartbeat_and_exactly_once_terminal_in_real_postgres() {
     .await
     .unwrap()
     .get("c");
-    assert_eq!(count, 1, "double-effect = 0: a doubly-delivered job.done buffers EXACTLY ONCE");
+    assert_eq!(
+        count, 1,
+        "double-effect = 0: a doubly-delivered job.done buffers EXACTLY ONCE"
+    );
 
     // the buffered payload is the FIRST delivery's (DO NOTHING never overwrote) — references-not-payloads.
     let payload: serde_json::Value = sqlx::query(&format!(
@@ -225,8 +260,14 @@ async fn runner_lease_heartbeat_and_exactly_once_terminal_in_real_postgres() {
         "the buffered job.done payload is references-not-payloads (the FIRST delivery's; DO NOTHING never overwrote)"
     );
 
-    sqlx::query(&format!("DROP TABLE IF EXISTS {jq}")).execute(&admin).await.unwrap();
-    sqlx::query(&format!("DROP TABLE IF EXISTS {sig}")).execute(&admin).await.unwrap();
+    sqlx::query(&format!("DROP TABLE IF EXISTS {jq}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    sqlx::query(&format!("DROP TABLE IF EXISTS {sig}"))
+        .execute(&admin)
+        .await
+        .unwrap();
     println!(
         "[2026-06-21] PASS  drill=CI-P3(live-PG)  claim(FOR UPDATE SKIP LOCKED)=worker-1 second-claim=skipped  \
          heartbeat-renew=owner-only(1) foreign=0  expired->reclaim=worker-2  \

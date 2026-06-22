@@ -22,9 +22,9 @@
 use myelin_identity::{
     AuthzError, CaveatContext, Consistency, ConsistencyMode, Credential, DataRole, Decision,
     DelegationCaveats, EffectivePolicy, FailStaticBound, FragmentAdmit, IdentityService,
-    ListObjectsResult, NamespaceFragment, ObjectId, ObjectType, Permission, Precondition, Principal,
-    PrincipalId, PrincipalKind, PrincipalStatus, RevokeTarget, RewriteTrace, RunId, RunToken,
-    SubjectTree, TupleDelta, Zookie,
+    ListObjectsResult, NamespaceFragment, ObjectId, ObjectType, Permission, Precondition,
+    Principal, PrincipalId, PrincipalKind, PrincipalStatus, RevokeTarget, RewriteTrace, RunId,
+    RunToken, SubjectTree, TupleDelta, Zookie,
 };
 use myelin_knowledge::{
     AuthZookie, CollectionSchema, IncomingOp, OpAuthorizer, OpDecision, OpPermission,
@@ -76,13 +76,23 @@ impl IdentityService for ProviderCheck {
         // The CONSUMER's promise pinned from the provider side: Knowledge always passes the frozen
         // shape — a non-empty page object, an `edit`|`comment` permission, a STRONG consistency, no
         // caveat for a page-level check.
-        assert!(!object.0.is_empty(), "the consumer passes a non-empty page ArtifactRef");
+        assert!(
+            !object.0.is_empty(),
+            "the consumer passes a non-empty page ArtifactRef"
+        );
         assert!(
             permission == &Permission("edit".into()) || permission == &Permission("comment".into()),
             "the consumer authorizes edit|comment (the two collab verbs)"
         );
-        assert_eq!(at.mode, ConsistencyMode::Strong, "the consumer reads at Strong consistency (4.10)");
-        assert!(caveat.is_none(), "a page-level per-op check passes no CaveatContext (the field core is KN-P16/P-ID-22)");
+        assert_eq!(
+            at.mode,
+            ConsistencyMode::Strong,
+            "the consumer reads at Strong consistency (4.10)"
+        );
+        assert!(
+            caveat.is_none(),
+            "a page-level per-op check passes no CaveatContext (the field core is KN-P16/P-ID-22)"
+        );
 
         let id = &subject.principal_id.0;
         if self.uncertain.contains(id) {
@@ -127,7 +137,11 @@ impl IdentityService for ProviderCheck {
     ) -> myelin_identity::Result<RewriteTrace> {
         Err(AuthzError::NotYetImplemented("n/a"))
     }
-    fn delegation(&self, _a: &Principal, _t: &Principal) -> myelin_identity::Result<EffectivePolicy> {
+    fn delegation(
+        &self,
+        _a: &Principal,
+        _t: &Principal,
+    ) -> myelin_identity::Result<EffectivePolicy> {
         Err(AuthzError::NotYetImplemented("n/a"))
     }
     fn write_tuples(
@@ -201,18 +215,27 @@ fn cdc_4_2_consumer_applies_only_on_allow() {
     let a = op(actor("alice"), "p1", AuthZookie::empty());
     let d_a = auth.authorize_op(&a, &CollectionSchema::new());
     assert_eq!(d_a, OpDecision::Apply, "a granted op is authorized");
-    assert!(auth.apply_if_authorized(&d_a), "the consumer applies on Allow");
+    assert!(
+        auth.apply_if_authorized(&d_a),
+        "the consumer applies on Allow"
+    );
 
     // Deny → refused.
     let b = op(actor("bob"), "p1", AuthZookie::empty());
     let d_b = auth.authorize_op(&b, &CollectionSchema::new());
-    assert!(d_b.is_rejected(), "an ungranted op is refused (fail-closed)");
+    assert!(
+        d_b.is_rejected(),
+        "an ungranted op is refused (fail-closed)"
+    );
     assert!(!auth.apply_if_authorized(&d_b));
 
     // Conditional (uncertainty) → refused (fail-closed — NOT a silent allow).
     let c = op(actor("carol"), "p1", AuthZookie::empty());
     let d_c = auth.authorize_op(&c, &CollectionSchema::new());
-    assert!(d_c.is_rejected(), "a Conditional decision is treated as not-Allow (fail-closed, ADR-03)");
+    assert!(
+        d_c.is_rejected(),
+        "a Conditional decision is treated as not-Allow (fail-closed, ADR-03)"
+    );
 }
 
 /// **The CONSUMER consumes the 4.10 zookie correctly: it reads `check` at-or-after `page.acl_zookie`,
@@ -227,7 +250,10 @@ fn cdc_4_10_consumer_reads_at_or_after_page_acl_zookie() {
 
     // Before the ACL change (page at empty zookie) — Alice's grant holds.
     let before = op(actor("alice"), "p1", AuthZookie::empty());
-    assert_eq!(auth.authorize_op(&before, &CollectionSchema::new()), OpDecision::Apply);
+    assert_eq!(
+        auth.authorize_op(&before, &CollectionSchema::new()),
+        OpDecision::Apply
+    );
 
     // The ACL change stamps page.acl_zookie forward to z7.
     assert!(auth.acl_zookies_mut().stamp("p1", Zookie("z7".into())));
@@ -235,7 +261,14 @@ fn cdc_4_10_consumer_reads_at_or_after_page_acl_zookie() {
     // Alice's op now reads at-or-after z7 → Deny (the new-enemy guard); refused, 0 stale-grant writes.
     let after = op(actor("alice"), "p1", AuthZookie::of(Zookie("z7".into())));
     let d = auth.authorize_op(&after, &CollectionSchema::new());
-    assert!(d.is_rejected(), "the just-revoked op is refused (4.10 read-your-writes)");
+    assert!(
+        d.is_rejected(),
+        "the just-revoked op is refused (4.10 read-your-writes)"
+    );
     assert!(!auth.apply_if_authorized(&d));
-    assert_eq!(auth.counter().stale_grant_writes(), 0, "0 stale-grant writes");
+    assert_eq!(
+        auth.counter().stale_grant_writes(),
+        0,
+        "0 stale-grant writes"
+    );
 }

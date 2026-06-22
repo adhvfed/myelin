@@ -226,9 +226,7 @@ pub fn lower_set_expr(expr: &SetExpr) -> ToolScopePredicate {
         SetExpr::NotIds(ids) => {
             ToolScopePredicate::NotIds(ids.iter().map(|o| o.0.clone()).collect())
         }
-        SetExpr::Union(subs) => {
-            ToolScopePredicate::Or(subs.iter().map(lower_set_expr).collect())
-        }
+        SetExpr::Union(subs) => ToolScopePredicate::Or(subs.iter().map(lower_set_expr).collect()),
         SetExpr::Intersect(subs) => {
             ToolScopePredicate::And(subs.iter().map(lower_set_expr).collect())
         }
@@ -467,8 +465,7 @@ mod tests {
         let big: Vec<(String, String)> = (0..50)
             .map(|i| (format!("tool-{i}"), "issues".to_string()))
             .collect();
-        let refs: Vec<(&str, &str)> =
-            big.iter().map(|(n, s)| (n.as_str(), s.as_str())).collect();
+        let refs: Vec<(&str, &str)> = big.iter().map(|(n, s)| (n.as_str(), s.as_str())).collect();
         let cat = catalogue(&refs);
 
         // The push-down result admits the first three tools (a bounded allow-set).
@@ -487,7 +484,11 @@ mod tests {
         let scoped = build_scoped_tool_list(&cat, &lo, "psn:agent-7", &Zookie("z-1".into()));
 
         // EXACTLY one list_objects call — the no-N+1 GATE (50 tools, ONE query).
-        assert_eq!(lo.calls.get(), 1, "exactly one list_objects call for the whole catalogue");
+        assert_eq!(
+            lo.calls.get(),
+            1,
+            "exactly one list_objects call for the whole catalogue"
+        );
         assert_eq!(scoped.query_count, 1, "the no-N+1 GATE: one query");
         // The brain sees ONLY the three scoped tools (the delegation-scoped subset).
         assert_eq!(scoped.tools.len(), 3);
@@ -557,7 +558,11 @@ mod tests {
                 column: "id".into(),
             },
         });
-        assert_eq!(in_rel, ToolScopePredicate::None, "no silent allow for a relational grant");
+        assert_eq!(
+            in_rel,
+            ToolScopePredicate::None,
+            "no silent allow for a relational grant"
+        );
         assert!(!in_rel.admits("any-tool"));
     }
 
@@ -566,14 +571,20 @@ mod tests {
     fn deny_yields_empty_scope_and_all_yields_full() {
         let cat = catalogue(&[("a", "issues"), ("b", "git")]);
         let deny = CountingListObjects {
-            result: ListObjectsResult::Filter { set_expr: SetExpr::None, zookie: Zookie("z".into()) },
+            result: ListObjectsResult::Filter {
+                set_expr: SetExpr::None,
+                zookie: Zookie("z".into()),
+            },
             calls: Cell::new(0),
         };
         let scoped = build_scoped_tool_list(&cat, &deny, "psn:x", &Zookie("z0".into()));
         assert!(scoped.tools.is_empty(), "a denied run is shown NO tool");
 
         let all = CountingListObjects {
-            result: ListObjectsResult::Ids { ids: vec![], zookie: Zookie("z".into()) }, // Ids materialised
+            result: ListObjectsResult::Ids {
+                ids: vec![],
+                zookie: Zookie("z".into()),
+            }, // Ids materialised
             calls: Cell::new(0),
         };
         // An empty Ids materialised result admits nothing (an explicit empty allow-set).
@@ -581,11 +592,18 @@ mod tests {
         assert!(scoped_empty.tools.is_empty());
 
         let admin = CountingListObjects {
-            result: ListObjectsResult::Filter { set_expr: SetExpr::All, zookie: Zookie("z".into()) },
+            result: ListObjectsResult::Filter {
+                set_expr: SetExpr::All,
+                zookie: Zookie("z".into()),
+            },
             calls: Cell::new(0),
         };
         let scoped_all = build_scoped_tool_list(&cat, &admin, "psn:x", &Zookie("z0".into()));
-        assert_eq!(scoped_all.tools.len(), 2, "admin (All) sees every tool of this type");
+        assert_eq!(
+            scoped_all.tools.len(),
+            2,
+            "admin (All) sees every tool of this type"
+        );
     }
 
     /// The lowering of a materialised `Ids` result (the S4 path) is the SAME allow-set membership as
@@ -593,13 +611,18 @@ mod tests {
     #[test]
     fn materialised_ids_and_filter_ids_lower_identically() {
         let ids = vec![ObjectId("git/merge/1".into())];
-        let from_materialised =
-            lower_list_objects(&ListObjectsResult::Ids { ids: ids.clone(), zookie: Zookie("z".into()) });
+        let from_materialised = lower_list_objects(&ListObjectsResult::Ids {
+            ids: ids.clone(),
+            zookie: Zookie("z".into()),
+        });
         let from_filter = lower_list_objects(&ListObjectsResult::Filter {
             set_expr: SetExpr::Ids(ids),
             zookie: Zookie("z".into()),
         });
-        assert_eq!(from_materialised, from_filter, "no drift between the S4 and S8 paths");
+        assert_eq!(
+            from_materialised, from_filter,
+            "no drift between the S4 and S8 paths"
+        );
     }
 
     // ───────────────────────── the apply-time re-check (the guarantee) ────────────────────────
@@ -620,7 +643,10 @@ mod tests {
             calls: Cell::new(0),
         };
         let scoped = build_scoped_tool_list(&cat, &lo, "psn:agent", &Zookie("z-0".into()));
-        assert!(scoped.tools.contains(&ToolSchema("merge".into())), "merge was scoped in");
+        assert!(
+            scoped.tools.contains(&ToolSchema("merge".into())),
+            "merge was scoped in"
+        );
 
         // (2)+(3)+(4): the grant is revoked AFTER the build; the brain proposes `merge`; EffectApi
         // re-checks at apply time and DENIES. The Denied outcome is the AG-P6 pipeline's verdict for
@@ -652,7 +678,10 @@ mod tests {
         };
         let mut conv = Conversation::default();
         apply_scope_to_conversation(&mut conv, &scoped);
-        assert_eq!(conv.tools, scoped.tools, "the brain sees exactly the scoped subset");
+        assert_eq!(
+            conv.tools, scoped.tools,
+            "the brain sees exactly the scoped subset"
+        );
     }
 
     /// SQL-injection safety: a `'` in a tool id is escaped in the inline-literal form (the live path

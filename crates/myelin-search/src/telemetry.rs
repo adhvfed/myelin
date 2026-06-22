@@ -177,7 +177,11 @@ impl LabelledSignal {
     fn new(name: &'static str, labels: Vec<(String, String)>, value: i64) -> LabelledSignal {
         let mut labels = labels;
         labels.sort();
-        LabelledSignal { name, labels, value }
+        LabelledSignal {
+            name,
+            labels,
+            value,
+        }
     }
 }
 
@@ -405,7 +409,11 @@ mod tests {
         let n = sorted.len();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), n, "every §4.11 Search signal name is distinct");
+        assert_eq!(
+            sorted.len(),
+            n,
+            "every §4.11 Search signal name is distinct"
+        );
         assert_eq!(n, 16, "the full §4.11 set is named exhaustively");
     }
 
@@ -443,7 +451,10 @@ mod tests {
             signal::REINDEX_PARITY_HASH,
             signal::ERASE_RECEIPTS,
         ] {
-            assert!(t.scalar(name).is_some(), "scalar `{name}` is emitted from boot");
+            assert!(
+                t.scalar(name).is_some(),
+                "scalar `{name}` is emitted from boot"
+            );
         }
     }
 
@@ -453,7 +464,11 @@ mod tests {
     fn red_is_labelled_per_kind_tenant_surface() {
         let mut t = SearchTelemetry::empty();
         t.record_red(
-            RedLabels { kind: "human", tenant: "acme", surface: "ft" },
+            RedLabels {
+                kind: "human",
+                tenant: "acme",
+                surface: "ft",
+            },
             120,
             0,
             7,
@@ -470,7 +485,10 @@ mod tests {
             "RED errors are read per {{kind,tenant,surface}}, order-independent"
         );
         assert_eq!(t.labelled_value(signal::QUERY_RATE, &labels), Some(120));
-        assert_eq!(t.labelled_value(signal::QUERY_DURATION_MS, &labels), Some(7));
+        assert_eq!(
+            t.labelled_value(signal::QUERY_DURATION_MS, &labels),
+            Some(7)
+        );
     }
 
     /// A labelled set overwrites in place (a re-observation updates, never duplicates the key).
@@ -483,9 +501,16 @@ mod tests {
             signal::CONSUMER_LAG,
             &[("consumer".to_string(), "search-indexer".to_string())],
         );
-        assert_eq!(lag, Some(0), "the consumer lag drained to 0 (in-place update)");
         assert_eq!(
-            t.labelled.iter().filter(|s| s.name == signal::CONSUMER_LAG).count(),
+            lag,
+            Some(0),
+            "the consumer lag drained to 0 (in-place update)"
+        );
+        assert_eq!(
+            t.labelled
+                .iter()
+                .filter(|s| s.name == signal::CONSUMER_LAG)
+                .count(),
             1,
             "no duplicate key on re-observation"
         );

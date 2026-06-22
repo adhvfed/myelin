@@ -16,7 +16,7 @@
 
 use myelin_agent::{EffectKind, EffectResult, EventId, ToolDef, ToolName, ToolSurface};
 use myelin_agent_service::{
-    gate_id_of, run_batch_hitl_loop, ApplyLedger, ApplyError, ApprovedTools, BatchApprovalCard,
+    gate_id_of, run_batch_hitl_loop, ApplyError, ApplyLedger, ApprovedTools, BatchApprovalCard,
     BatchGatedEffect, CapabilityCheck, DecisionScript, DelegationLookup, EffectBudget, EffectCost,
     EffectOutcome, PipelineSignals, PlanThenApply, PlannedEffect, RiskSummary, SubsystemApply,
     TenantGuard, WaitDecision,
@@ -69,7 +69,9 @@ struct Delegate {
 }
 impl DelegationLookup for Delegate {
     fn delegation(&self, _a: &Principal, _t: &Principal) -> EffectivePolicy {
-        EffectivePolicy { caveats: self.caps.clone() }
+        EffectivePolicy {
+            caveats: self.caps.clone(),
+        }
     }
 }
 
@@ -117,12 +119,19 @@ impl EffectBudget for Budget {
 fn agent() -> Principal {
     Principal::stub(
         PrincipalId("psn:agent-7".into()),
-        PrincipalKind::Agent { runtime_ref: RuntimeRef("mock".into()), on_behalf_of: None },
+        PrincipalKind::Agent {
+            runtime_ref: RuntimeRef("mock".into()),
+            on_behalf_of: None,
+        },
         TenantId("acme".into()),
     )
 }
 fn human() -> Principal {
-    Principal::stub(PrincipalId("psn:human-x".into()), PrincipalKind::Human, TenantId("acme".into()))
+    Principal::stub(
+        PrincipalId("psn:human-x".into()),
+        PrincipalKind::Human,
+        TenantId("acme".into()),
+    )
 }
 
 fn merge_tool() -> ToolDef {
@@ -130,7 +139,8 @@ fn merge_tool() -> ToolDef {
         name: ToolName("git.merge".into()),
         subsystem: "git".into(),
         version: 1,
-        input_schema: r#"{"type":"object","required":["pr"],"properties":{"pr":{"type":"integer"}}}"#.into(),
+        input_schema:
+            r#"{"type":"object","required":["pr"],"properties":{"pr":{"type":"integer"}}}"#.into(),
         required_caps: vec!["git.merge".into()],
         effect_kind: EffectKind::Mutate,
         side_effecting: true,
@@ -146,18 +156,34 @@ fn merge_plan(pr: u32) -> PlannedEffect {
         input_json: format!(r#"{{"pr":{pr}}}"#),
         field: None,
         transition: None,
-        cost: EffectCost { unit: "git.merge", wholesale: 30, markup: 20 },
+        cost: EffectCost {
+            unit: "git.merge",
+            wholesale: 30,
+            markup: 20,
+        },
     }
 }
 
 fn approvers() -> Vec<PrincipalId> {
-    vec![PrincipalId("psn:lead".into()), PrincipalId("psn:maintainer".into())]
+    vec![
+        PrincipalId("psn:lead".into()),
+        PrincipalId("psn:maintainer".into()),
+    ]
 }
 
 /// Run the apply pipeline once for `plan` under the given `approved` set; returns the result.
-fn apply_once(cat: &Catalogue, endpoint: &Endpoint, plan: &PlannedEffect, approved: BTreeSet<String>) -> EffectResult {
-    let check = AllowAll { allow: ["git.merge".to_string()].into_iter().collect() };
-    let del = Delegate { caps: vec!["git.merge".into()] };
+fn apply_once(
+    cat: &Catalogue,
+    endpoint: &Endpoint,
+    plan: &PlannedEffect,
+    approved: BTreeSet<String>,
+) -> EffectResult {
+    let check = AllowAll {
+        allow: ["git.merge".to_string()].into_iter().collect(),
+    };
+    let del = Delegate {
+        caps: vec!["git.merge".into()],
+    };
     let tenant = PermitAll;
     let mut budget = Budget { remaining: 10_000 };
     let mut signals = PipelineSignals::new();
@@ -186,14 +212,21 @@ fn withhold_three(cat: &Catalogue, endpoint: &Endpoint) -> BatchApprovalCard {
         // WITHHOLD through the REAL pipeline (a fresh run, empty `approved`) → GATES (0 mutation).
         let result = apply_once(cat, endpoint, &plan, BTreeSet::new());
         let gate_id = gate_id_of(&result).expect("a requires_approval tool GATES (AG-8)");
-        assert!(matches!(result, EffectResult::Gated(_)), "effect for pr {pr} is WITHHELD: {result:?}");
+        assert!(
+            matches!(result, EffectResult::Gated(_)),
+            "effect for pr {pr} is WITHHELD: {result:?}"
+        );
         effects.push(BatchGatedEffect {
             gate_id,
             risk_summary: RiskSummary::for_action("agent.hitl.merge_pr", &plan.object),
             plan,
         });
     }
-    assert_eq!(endpoint.applied.borrow().len(), 0, "0 MUTATIONS before approval (AG-D5: the gated effects did NOT mutate)");
+    assert_eq!(
+        endpoint.applied.borrow().len(),
+        0,
+        "0 MUTATIONS before approval (AG-D5: the gated effects did NOT mutate)"
+    );
     BatchApprovalCard {
         run_id: "R1".into(),
         card_id: "card-7".into(),
@@ -210,8 +243,12 @@ fn withhold_three(cat: &Catalogue, endpoint: &Endpoint) -> BatchApprovalCard {
 /// count (2).** This is the core AG-D5 partial-approval parity number, proven end-to-end.
 #[test]
 fn chained_partial_approval_applies_exactly_the_approved_effects() {
-    let cat = Catalogue { defs: vec![merge_tool()] };
-    let endpoint = Endpoint { applied: RefCell::new(vec![]) };
+    let cat = Catalogue {
+        defs: vec![merge_tool()],
+    };
+    let endpoint = Endpoint {
+        applied: RefCell::new(vec![]),
+    };
 
     // 1. WITHHOLD all three through the REAL pipeline (0 mutation).
     let card = withhold_three(&cat, &endpoint);
@@ -220,7 +257,10 @@ fn chained_partial_approval_applies_exactly_the_approved_effects() {
     let mut script = DecisionScript::new();
     script
         .decide(card.idem_key_for(0), WaitDecision::Approve)
-        .decide(card.idem_key_for(1), WaitDecision::Reject("pr 41 fails checks".into()))
+        .decide(
+            card.idem_key_for(1),
+            WaitDecision::Reject("pr 41 fails checks".into()),
+        )
         .decide(card.idem_key_for(2), WaitDecision::Approve);
 
     let mut approved = ApprovedTools::new();
@@ -228,13 +268,27 @@ fn chained_partial_approval_applies_exactly_the_approved_effects() {
     let outcome = run_batch_hitl_loop(&card, &script, &mut approved, &mut ledger);
 
     // the batch loop itself made 0 mutation (it only opened gates + threaded decisions).
-    assert_eq!(endpoint.applied.borrow().len(), 0, "the batch loop made 0 mutation (the apply is the re-run)");
+    assert_eq!(
+        endpoint.applied.borrow().len(),
+        0,
+        "the batch loop made 0 mutation (the apply is the re-run)"
+    );
     // exactly the approved effects are settled Applied; the declined one is Withheld (0 mutation, AG-8).
     assert!(matches!(outcome.effects[0], EffectOutcome::Applied { .. }));
-    assert!(matches!(outcome.effects[1], EffectOutcome::Withheld { .. }), "effect 1 declined → WITHHELD");
+    assert!(
+        matches!(outcome.effects[1], EffectOutcome::Withheld { .. }),
+        "effect 1 declined → WITHHELD"
+    );
     assert!(matches!(outcome.effects[2], EffectOutcome::Applied { .. }));
-    assert_eq!(outcome.approved_effect_count(), 2, "exactly 2 approved effects (0 and 2)");
-    assert!(outcome.exactly_once(), "the apply-counter (ledger) == the approved-effect count (AG-D5)");
+    assert_eq!(
+        outcome.approved_effect_count(),
+        2,
+        "exactly 2 approved effects (0 and 2)"
+    );
+    assert!(
+        outcome.exactly_once(),
+        "the apply-counter (ledger) == the approved-effect count (AG-D5)"
+    );
 
     // 4b. RE-RUN through the REAL pipeline — but ONLY the approved effects are re-submitted (the
     //     declined effect was WITHHELD: it is never re-run, AG-8). The per-effect `ApplyLedger` is the
@@ -247,17 +301,27 @@ fn chained_partial_approval_applies_exactly_the_approved_effects() {
         if outcome.ledger.contains(&idem_key) {
             // an APPROVED effect re-runs through the REAL pipeline → APPLIES.
             let result = apply_once(&cat, &endpoint, &eff.plan, approved.as_set());
-            assert!(matches!(result, EffectResult::Applied(_)), "the approved effect {idx} APPLIES on the re-run");
+            assert!(
+                matches!(result, EffectResult::Applied(_)),
+                "the approved effect {idx} APPLIES on the re-run"
+            );
         } else {
             // the DECLINED effect is WITHHELD — never re-submitted to apply (0 mutation, AG-8). To
             // PROVE it would still gate if anyone tried, re-run it with an EMPTY approved set: it gates.
             let result = apply_once(&cat, &endpoint, &eff.plan, BTreeSet::new());
-            assert!(matches!(result, EffectResult::Gated(_)), "the declined effect {idx} still GATES (never applied, AG-8)");
+            assert!(
+                matches!(result, EffectResult::Gated(_)),
+                "the declined effect {idx} still GATES (never applied, AG-8)"
+            );
         }
     }
     // THE GATE: exactly 2 applies through the REAL endpoint — pr 40 and pr 42, NEVER pr 41.
     let applied = endpoint.applied.borrow();
-    assert_eq!(applied.len(), 2, "1 apply per approved effect — exactly 2 (AG-D5: apply-counter == approved count)");
+    assert_eq!(
+        applied.len(),
+        2,
+        "1 apply per approved effect — exactly 2 (AG-D5: apply-counter == approved count)"
+    );
     assert!(applied.contains(&"myelin://acme/git/pr/40".to_string()));
     assert!(applied.contains(&"myelin://acme/git/pr/42".to_string()));
     assert!(
@@ -274,8 +338,12 @@ fn chained_partial_approval_applies_exactly_the_approved_effects() {
 /// the re-run through the REAL pipeline is itself idempotent (the approved set is unchanged).
 #[test]
 fn chained_double_click_approve_all_applies_each_effect_once() {
-    let cat = Catalogue { defs: vec![merge_tool()] };
-    let endpoint = Endpoint { applied: RefCell::new(vec![]) };
+    let cat = Catalogue {
+        defs: vec![merge_tool()],
+    };
+    let endpoint = Endpoint {
+        applied: RefCell::new(vec![]),
+    };
     let card = withhold_three(&cat, &endpoint);
 
     // "approve all" — every effect approved.
@@ -288,12 +356,23 @@ fn chained_double_click_approve_all_applies_each_effect_once() {
     let mut ledger = ApplyLedger::new();
     // FIRST click → applies all three (the ledger records card-7:0/1/2).
     let first = run_batch_hitl_loop(&card, &script, &mut approved, &mut ledger);
-    assert_eq!(first.ledger.applies(), 3, "the first click applies all three effects");
+    assert_eq!(
+        first.ledger.applies(),
+        3,
+        "the first click applies all three effects"
+    );
 
     // DOUBLE-CLICK → re-send the SAME per-effect keys (re-run with the SAME ledger): 0 new applies.
     let second = run_batch_hitl_loop(&card, &script, &mut approved, &mut ledger);
-    assert_eq!(second.ledger.applies(), 3, "a double-click adds 0 applies — exactly 3 (1 per effect)");
-    assert!(second.exactly_once(), "the apply-counter == the approved count (3), never 6 — one approval");
+    assert_eq!(
+        second.ledger.applies(),
+        3,
+        "a double-click adds 0 applies — exactly 3 (1 per effect)"
+    );
+    assert!(
+        second.exactly_once(),
+        "the apply-counter == the approved count (3), never 6 — one approval"
+    );
 
     // RE-RUN each effect once through the REAL pipeline (the apply is the re-run; applied once each).
     for eff in &card.effects {
@@ -303,7 +382,15 @@ fn chained_double_click_approve_all_applies_each_effect_once() {
     // exactly 3 distinct applies through the REAL endpoint (one per effect) — the double-click did not
     // double-apply (the per-effect ledger + the approved set are the truth, not the click count).
     let applied = endpoint.applied.borrow();
-    assert_eq!(applied.len(), 3, "exactly 3 applies (1 per approved effect), NOT 6 — the double-click is one approval");
+    assert_eq!(
+        applied.len(),
+        3,
+        "exactly 3 applies (1 per approved effect), NOT 6 — the double-click is one approval"
+    );
     let distinct: BTreeSet<&String> = applied.iter().collect();
-    assert_eq!(distinct.len(), 3, "the three applies are the three distinct effects (pr 40/41/42)");
+    assert_eq!(
+        distinct.len(),
+        3,
+        "the three applies are the three distinct effects (pr 40/41/42)"
+    );
 }

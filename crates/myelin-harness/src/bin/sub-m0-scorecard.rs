@@ -25,14 +25,15 @@ fn main() -> ExitCode {
 
     println!("== SUB-M0 exit-gate scorecard ({date}) — running every required gate row ==");
     for row in required_rows() {
-        let perm = if row.permanent { " [permanent — re-run-forever]" } else { "" };
+        let perm = if row.permanent {
+            " [permanent — re-run-forever]"
+        } else {
+            ""
+        };
         print!("  {} … ", row.id);
         match run_proof(row.proof_command) {
             Ok(()) => {
-                let proof = format!(
-                    "[{date}] PASS  `cargo {}`",
-                    row.proof_command.join(" ")
-                );
+                let proof = format!("[{date}] PASS  `cargo {}`", row.proof_command.join(" "));
                 println!("PASS{perm}");
                 card.record(RowResult::pass(row.id, proof, &date));
             }

@@ -355,9 +355,7 @@ fn spawn_real_vmm(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    let child = cmd
-        .spawn()
-        .map_err(|e| format!("spawn firecracker: {e}"))?;
+    let child = cmd.spawn().map_err(|e| format!("spawn firecracker: {e}"))?;
     Ok(Box::new(SpawnedVmm { child: Some(child) }))
 }
 
@@ -397,9 +395,7 @@ pub fn boot_and_capture(cfg_path: &PathBuf) -> Result<(i32, String), String> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    let output = cmd
-        .output()
-        .map_err(|e| format!("run firecracker: {e}"))?;
+    let output = cmd.output().map_err(|e| format!("run firecracker: {e}"))?;
     let mut console = String::from_utf8_lossy(&output.stdout).into_owned();
     console.push_str(&String::from_utf8_lossy(&output.stderr));
     Ok((output.status.code().unwrap_or(-1), console))
@@ -530,7 +526,10 @@ mod tests {
             "no NIC must be attached when egress is fully default-deny"
         );
         assert!(json.contains("\"is_read_only\": true"));
-        assert!(json.contains("init=/bin/true"), "one-shot boot uses init=/bin/true");
+        assert!(
+            json.contains("init=/bin/true"),
+            "one-shot boot uses init=/bin/true"
+        );
     }
 
     #[test]
@@ -560,7 +559,10 @@ mod tests {
             .unwrap();
         assert_eq!(handle.guest_id, "fc-idem-fc-1");
         backend.kill(&handle).unwrap();
-        assert!(killed.load(Ordering::SeqCst), "kill must whole-guest-kill the VMM");
+        assert!(
+            killed.load(Ordering::SeqCst),
+            "kill must whole-guest-kill the VMM"
+        );
         // Idempotent: killing an already-gone guest is a no-op success.
         backend.kill(&handle).unwrap();
     }
@@ -583,7 +585,10 @@ mod tests {
             }))
         });
         assert!(matches!(r, Err(FcError::Hook(_))));
-        assert!(!spawned.load(Ordering::SeqCst), "the VMM must NOT spawn when the wallet is exhausted");
+        assert!(
+            !spawned.load(Ordering::SeqCst),
+            "the VMM must NOT spawn when the wallet is exhausted"
+        );
     }
 
     #[test]
@@ -604,6 +609,9 @@ mod tests {
             }))
         });
         assert!(r.is_err());
-        assert!(!spawned.load(Ordering::SeqCst), "no VMM spawns if the isolation floor is not met");
+        assert!(
+            !spawned.load(Ordering::SeqCst),
+            "no VMM spawns if the isolation floor is not met"
+        );
     }
 }

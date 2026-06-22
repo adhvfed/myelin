@@ -336,7 +336,13 @@ pub trait ProjectionCacheRead: Send + Sync {
     /// floor). The live R2 cache (REF-P12, [`crate::cache::R2ProjectionCache`]) overrides this to seal +
     /// write the projection under the per-tenant DEK. Best-effort: a fill failure is swallowed (the
     /// cache is derived — the next read just re-resolves).
-    fn fill(&self, _tenant: &TenantId, _region: &Region, _ref_: &ArtifactRef, _projection: &Projection) {
+    fn fill(
+        &self,
+        _tenant: &TenantId,
+        _region: &Region,
+        _ref_: &ArtifactRef,
+        _projection: &Projection,
+    ) {
         // No-op default (the NoOpCacheRead floor never caches). The live R2 cache overrides it.
     }
 }
@@ -351,7 +357,12 @@ pub trait ProjectionCacheRead: Send + Sync {
 pub struct NoOpCacheRead;
 
 impl ProjectionCacheRead for NoOpCacheRead {
-    fn read(&self, _tenant: &TenantId, _region: &Region, _ref_: &ArtifactRef) -> Option<Projection> {
+    fn read(
+        &self,
+        _tenant: &TenantId,
+        _region: &Region,
+        _ref_: &ArtifactRef,
+    ) -> Option<Projection> {
         // No entries are held yet (REF-P12 ships the live cache) — every read MISSES, so resolve
         // falls through to the owner's project. Documented floor.
         None
@@ -459,8 +470,16 @@ impl ResolveService {
         at: &Consistency,
         subject_revoked: bool,
     ) -> Resolution {
-        let (resolution, _served) =
-            self.resolve_observed(tenant, region, ref_, root, viewer, mode, at, subject_revoked);
+        let (resolution, _served) = self.resolve_observed(
+            tenant,
+            region,
+            ref_,
+            root,
+            viewer,
+            mode,
+            at,
+            subject_revoked,
+        );
         resolution
     }
 
@@ -486,11 +505,7 @@ impl ResolveService {
         // viewer + the OWNER-supplied ref, never a path.
         let key = format!(
             "{}|{}|{}|{}@{}",
-            tenant.0,
-            region.0,
-            viewer.principal_id.0,
-            VIEW_PERMISSION,
-            root.0
+            tenant.0, region.0, viewer.principal_id.0, VIEW_PERMISSION, root.0
         );
         let perm = Permission(VIEW_PERMISSION.to_string());
         // The owner of the authoritative check is Identity; here it is the synthetic owner's
@@ -836,12 +851,18 @@ mod tests {
             false,
         );
 
-        assert!(r.is_tombstone(), "a denied viewer gets a tombstone, never a projection");
+        assert!(
+            r.is_tombstone(),
+            "a denied viewer gets a tombstone, never a projection"
+        );
         assert_eq!(r.tombstone_reason(), Some(TombstoneReason::Denied));
         // the structural leak invariant: a Tombstone has NO title/state/icon field at all. We assert
         // the only data it carries is the OPAQUE root URN + the reason — the secret title cannot appear.
         if let Resolution::Tombstone(t) = &r {
-            assert_eq!(t.root, root, "the tombstone carries the root (and only the root)");
+            assert_eq!(
+                t.root, root,
+                "the tombstone carries the root (and only the root)"
+            );
             // the secret never appears anywhere in the rendered tombstone (Debug-format the whole
             // value and assert the secret title is absent — a regression that added a leak field fails).
             let rendered = format!("{t:?}");
@@ -852,9 +873,17 @@ mod tests {
         }
         // defense in depth: the owner's project was NEVER called for a denied viewer (the gate runs
         // first; a denied viewer never reaches the projection step).
-        assert_eq!(owner.project_call_count(), 0, "a denied viewer never reaches project");
+        assert_eq!(
+            owner.project_call_count(),
+            0,
+            "a denied viewer never reaches project"
+        );
         // and the cache stage was never touched (no hit/miss bumped) — the gate short-circuits.
-        assert_eq!(svc.cache_counters(), (0, 0), "a denied resolve never touches the cache");
+        assert_eq!(
+            svc.cache_counters(),
+            (0, 0),
+            "a denied resolve never touches the cache"
+        );
     }
 
     /// **An ALLOWED viewer gets the projection from `project` (the happy path).** The title/state/icon
@@ -880,13 +909,24 @@ mod tests {
 
         assert!(r.is_projection(), "an allowed viewer gets a projection");
         if let Resolution::Projection(p) = &r {
-            assert_eq!(p.title, "TOP SECRET acquisition plan", "the allowed viewer sees the title");
+            assert_eq!(
+                p.title, "TOP SECRET acquisition plan",
+                "the allowed viewer sees the title"
+            );
             assert_eq!(p.ref_, ref_, "the projection carries the resolved ref");
             assert_eq!(p.state, "open");
         }
-        assert_eq!(owner.project_call_count(), 1, "the allowed viewer reached project once");
+        assert_eq!(
+            owner.project_call_count(),
+            1,
+            "the allowed viewer reached project once"
+        );
         // a cache MISS was recorded (the no-op shim always misses → falls through to project).
-        assert_eq!(svc.cache_counters(), (0, 1), "an allowed miss falls through to project");
+        assert_eq!(
+            svc.cache_counters(),
+            (0, 1),
+            "an allowed miss falls through to project"
+        );
     }
 
     // ── The chained two-viewer shared-cache test (the prompt's required chained test) ──
@@ -922,26 +962,52 @@ mod tests {
 
         // the PERMITTED viewer: gate passes → the shared ref-keyed cache HIT serves the projection.
         let permitted = svc.resolve(
-            &tenant(), &region(), &ref_, &root,
-            &viewer("insider"), ResolveMode::Live, &strong_read("z1"), false,
+            &tenant(),
+            &region(),
+            &ref_,
+            &root,
+            &viewer("insider"),
+            ResolveMode::Live,
+            &strong_read("z1"),
+            false,
         );
-        assert!(permitted.is_projection(), "the permitted viewer is served the cached projection");
+        assert!(
+            permitted.is_projection(),
+            "the permitted viewer is served the cached projection"
+        );
 
         // the DENIED viewer: SAME ref, SAME cache — but the per-viewer gate denies BEFORE the cache is
         // read, so 0 content leaks. The shared cache served the permitted viewer; the denied one sees
         // only a tombstone.
         let denied = svc.resolve(
-            &tenant(), &region(), &ref_, &root,
-            &viewer("intruder"), ResolveMode::Live, &strong_read("z1"), false,
+            &tenant(),
+            &region(),
+            &ref_,
+            &root,
+            &viewer("intruder"),
+            ResolveMode::Live,
+            &strong_read("z1"),
+            false,
         );
-        assert!(denied.is_tombstone(), "the denied viewer is tombstoned even though the ref is cached");
+        assert!(
+            denied.is_tombstone(),
+            "the denied viewer is tombstoned even though the ref is cached"
+        );
         assert_eq!(denied.tombstone_reason(), Some(TombstoneReason::Denied));
 
         // exactly ONE cache HIT (the permitted viewer); the denied viewer never touched the cache.
-        assert_eq!(svc.cache_counters(), (1, 0), "one shared-cache hit (permitted); denied never read");
+        assert_eq!(
+            svc.cache_counters(),
+            (1, 0),
+            "one shared-cache hit (permitted); denied never read"
+        );
         // project was NEVER called — the permitted viewer was served from the cache, the denied one
         // was tombstoned at the gate.
-        assert_eq!(owner.project_call_count(), 0, "the shared cache served the permitted viewer");
+        assert_eq!(
+            owner.project_call_count(),
+            0,
+            "the shared cache served the permitted viewer"
+        );
     }
 
     // ── Fail-static: an Id hiccup degrades, never cascades, never leaks ──
@@ -960,18 +1026,39 @@ mod tests {
         let root = ref_.clone();
 
         let (r, served) = svc.resolve_observed(
-            &tenant(), &region(), &ref_, &root,
-            &viewer("insider"), ResolveMode::Live, &bounded_stale(), false,
+            &tenant(),
+            &region(),
+            &ref_,
+            &root,
+            &viewer("insider"),
+            ResolveMode::Live,
+            &bounded_stale(),
+            false,
         );
         // a cold BoundedStale hiccup with no warmed grant → fail CLOSED → Tombstone{denied} (never a
         // leak, never a cascade — the resolve returns a value, it does not panic/propagate).
-        assert!(r.is_tombstone(), "an Id hiccup degrades to a tombstone (fail-closed), never a leak");
+        assert!(
+            r.is_tombstone(),
+            "an Id hiccup degrades to a tombstone (fail-closed), never a leak"
+        );
         assert_eq!(r.tombstone_reason(), Some(TombstoneReason::Denied));
-        assert_eq!(served, AuthzServed::Closed, "the fail-static branch is Closed (degraded, not cascade)");
+        assert_eq!(
+            served,
+            AuthzServed::Closed,
+            "the fail-static branch is Closed (degraded, not cascade)"
+        );
         // observability: the fail-static signals recorded the closed answer (the 1.8 ratio fires).
-        assert_eq!(svc.fail_static_signals().closed, 1, "the fail-static ratio telemetry fires");
+        assert_eq!(
+            svc.fail_static_signals().closed,
+            1,
+            "the fail-static ratio telemetry fires"
+        );
         // the owner's project was never reached (the gate failed closed before the projection step).
-        assert_eq!(owner.project_call_count(), 0, "a fail-closed gate never reaches project");
+        assert_eq!(
+            owner.project_call_count(),
+            0,
+            "a fail-closed gate never reaches project"
+        );
     }
 
     /// **A zookie-stamped (`Strong`) read bypasses the fail-static cache and fails closed on an Id
@@ -986,11 +1073,24 @@ mod tests {
         let ref_ = confidential_issue();
         let root = ref_.clone();
         let (r, served) = svc.resolve_observed(
-            &tenant(), &region(), &ref_, &root,
-            &viewer("insider"), ResolveMode::Live, &strong_read("z9"), false,
+            &tenant(),
+            &region(),
+            &ref_,
+            &root,
+            &viewer("insider"),
+            ResolveMode::Live,
+            &strong_read("z9"),
+            false,
         );
-        assert!(r.is_tombstone(), "a strong read fails closed on a hiccup → tombstone");
-        assert_eq!(served, AuthzServed::BypassClosed, "the strong read bypassed the cache, failed closed");
+        assert!(
+            r.is_tombstone(),
+            "a strong read fails closed on a hiccup → tombstone"
+        );
+        assert_eq!(
+            served,
+            AuthzServed::BypassClosed,
+            "the strong read bypassed the cache, failed closed"
+        );
     }
 
     /// **A revoked subject is denied even if otherwise allowed (the revoked-at-window-close defense).**
@@ -1003,12 +1103,29 @@ mod tests {
         let ref_ = confidential_issue();
         let root = ref_.clone();
         let (r, served) = svc.resolve_observed(
-            &tenant(), &region(), &ref_, &root,
-            &viewer("insider"), ResolveMode::Live, &bounded_stale(), /* revoked */ true,
+            &tenant(),
+            &region(),
+            &ref_,
+            &root,
+            &viewer("insider"),
+            ResolveMode::Live,
+            &bounded_stale(),
+            /* revoked */ true,
         );
-        assert!(r.is_tombstone(), "a revoked subject is tombstoned even though otherwise allowed");
-        assert_eq!(served, AuthzServed::Revoked, "the revoke is enforced before the cache/gate");
-        assert_eq!(owner.project_call_count(), 0, "a revoked viewer never reaches project");
+        assert!(
+            r.is_tombstone(),
+            "a revoked subject is tombstoned even though otherwise allowed"
+        );
+        assert_eq!(
+            served,
+            AuthzServed::Revoked,
+            "the revoke is enforced before the cache/gate"
+        );
+        assert_eq!(
+            owner.project_call_count(),
+            0,
+            "a revoked viewer never reaches project"
+        );
     }
 
     // ── The §4.6 sub-ladder: moved / outdated / sub_gone / root_gone / erased ──
@@ -1030,8 +1147,16 @@ mod tests {
         let svc = service(owner);
         let ref_ = ArtifactRef("myelin://acme/git/ref/main#L42-L88".into());
         let root = ArtifactRef("myelin://acme/git/ref/main".into());
-        let r = svc.resolve(&tenant(), &region(), &ref_, &root,
-            &viewer("insider"), ResolveMode::Live, &bounded_stale(), false);
+        let r = svc.resolve(
+            &tenant(),
+            &region(),
+            &ref_,
+            &root,
+            &viewer("insider"),
+            ResolveMode::Live,
+            &bounded_stale(),
+            false,
+        );
         match r {
             Resolution::Projection(p) => assert_eq!(p.flag, Some(ProjectionFlag::Moved)),
             other => panic!("a moved sub must render a flagged projection, got {other:?}"),
@@ -1053,9 +1178,21 @@ mod tests {
             let svc = service(owner);
             let ref_ = ArtifactRef("myelin://acme/knowledge/page/7c2#b9".into());
             let root = ArtifactRef("myelin://acme/knowledge/page/7c2".into());
-            let r = svc.resolve(&tenant(), &region(), &ref_, &root,
-                &viewer("insider"), ResolveMode::Live, &bounded_stale(), false);
-            assert_eq!(r.tombstone_reason(), Some(want), "outcome {outcome:?} → {want:?}");
+            let r = svc.resolve(
+                &tenant(),
+                &region(),
+                &ref_,
+                &root,
+                &viewer("insider"),
+                ResolveMode::Live,
+                &bounded_stale(),
+                false,
+            );
+            assert_eq!(
+                r.tombstone_reason(),
+                Some(want),
+                "outcome {outcome:?} → {want:?}"
+            );
             // every tombstone carries the ROOT (§4.6 — "a tombstone always carries the root").
             if let Resolution::Tombstone(t) = &r {
                 assert_eq!(t.root, root, "the {want:?} tombstone carries the root");
@@ -1070,19 +1207,49 @@ mod tests {
     fn owner_project_hiccup_degrades_to_tombstone_no_fabrication() {
         struct HiccupOwner;
         impl ProjectApi for HiccupOwner {
-            fn check_view(&self, _t: &TenantId, _r: &Region, _o: &ArtifactRef, _v: &Principal, _p: &Permission) -> Result<Decision, ProjectApiError> {
+            fn check_view(
+                &self,
+                _t: &TenantId,
+                _r: &Region,
+                _o: &ArtifactRef,
+                _v: &Principal,
+                _p: &Permission,
+            ) -> Result<Decision, ProjectApiError> {
                 Ok(Decision::Allow) // gate passes
             }
-            fn project(&self, _t: &TenantId, _r: &Region, _rf: &ArtifactRef, _v: &Principal, _m: ResolveMode) -> Result<ProjectOutcome, ProjectApiError> {
+            fn project(
+                &self,
+                _t: &TenantId,
+                _r: &Region,
+                _rf: &ArtifactRef,
+                _v: &Principal,
+                _m: ResolveMode,
+            ) -> Result<ProjectOutcome, ProjectApiError> {
                 Err(ProjectApiError::Unavailable("owner down".into())) // project hiccup
             }
         }
-        let svc = ResolveService::new(authz(), Arc::new(NoOpCacheRead), Arc::new(HiccupOwner), cell());
+        let svc = ResolveService::new(
+            authz(),
+            Arc::new(NoOpCacheRead),
+            Arc::new(HiccupOwner),
+            cell(),
+        );
         let ref_ = confidential_issue();
         let root = ref_.clone();
-        let r = svc.resolve(&tenant(), &region(), &ref_, &root,
-            &viewer("insider"), ResolveMode::Live, &bounded_stale(), false);
-        assert!(r.is_tombstone(), "an owner project hiccup degrades to a tombstone, never a fabrication");
+        let r = svc.resolve(
+            &tenant(),
+            &region(),
+            &ref_,
+            &root,
+            &viewer("insider"),
+            ResolveMode::Live,
+            &bounded_stale(),
+            false,
+        );
+        assert!(
+            r.is_tombstone(),
+            "an owner project hiccup degrades to a tombstone, never a fabrication"
+        );
     }
 
     // ── Telemetry: resolve_cache_hit_ratio ──
@@ -1092,17 +1259,36 @@ mod tests {
     /// a live cache hit the ratio rises. The signal NAME is the frozen constant.
     #[test]
     fn resolve_cache_hit_ratio_telemetry_is_emitted() {
-        assert_eq!(RESOLVE_CACHE_HIT_RATIO_SIGNAL, "resolve_cache_hit_ratio", "the 1.8 signal name");
+        assert_eq!(
+            RESOLVE_CACHE_HIT_RATIO_SIGNAL, "resolve_cache_hit_ratio",
+            "the 1.8 signal name"
+        );
         let owner = Arc::new(SyntheticOwner::default());
         owner.allow("insider");
         let svc = service(owner);
         let ref_ = confidential_issue();
         let root = ref_.clone();
-        assert_eq!(svc.cache_hit_ratio(), None, "no denominator before any allowed resolve");
-        let _ = svc.resolve(&tenant(), &region(), &ref_, &root,
-            &viewer("insider"), ResolveMode::Live, &bounded_stale(), false);
+        assert_eq!(
+            svc.cache_hit_ratio(),
+            None,
+            "no denominator before any allowed resolve"
+        );
+        let _ = svc.resolve(
+            &tenant(),
+            &region(),
+            &ref_,
+            &root,
+            &viewer("insider"),
+            ResolveMode::Live,
+            &bounded_stale(),
+            false,
+        );
         // one miss (the no-op shim) → ratio 0.0 (the metric is live; the cache is the shim floor).
-        assert_eq!(svc.cache_hit_ratio(), Some(0.0), "the no-op shim always misses → ratio 0.0");
+        assert_eq!(
+            svc.cache_hit_ratio(),
+            Some(0.0),
+            "the no-op shim always misses → ratio 0.0"
+        );
         assert_eq!(svc.cache_counters(), (0, 1));
     }
 
@@ -1120,23 +1306,48 @@ mod tests {
         cache.put(
             &ref_.0,
             Projection {
-                ref_: ref_.clone(), title: "t".into(), state: "s".into(),
-                icon: "i".into(), render_hint: "h".into(), sub_anchor: None, flag: None,
+                ref_: ref_.clone(),
+                title: "t".into(),
+                state: "s".into(),
+                icon: "i".into(),
+                render_hint: "h".into(),
+                sub_anchor: None,
+                flag: None,
             },
         );
         let svc = ResolveService::new(authz(), cache, owner, cell());
         // 3 allowed resolves → 3 cache hits.
         for _ in 0..3 {
-            let _ = svc.resolve(&tenant(), &region(), &ref_, &root,
-                &viewer("insider"), ResolveMode::Live, &bounded_stale(), false);
+            let _ = svc.resolve(
+                &tenant(),
+                &region(),
+                &ref_,
+                &root,
+                &viewer("insider"),
+                ResolveMode::Live,
+                &bounded_stale(),
+                false,
+            );
         }
         // 1 allowed resolve of a DIFFERENT (uncached) ref → 1 miss.
         let other = ArtifactRef("myelin://acme/issue/issue/ENG-other".into());
-        let _ = svc.resolve(&tenant(), &region(), &other, &other,
-            &viewer("insider"), ResolveMode::Live, &bounded_stale(), false);
+        let _ = svc.resolve(
+            &tenant(),
+            &region(),
+            &other,
+            &other,
+            &viewer("insider"),
+            ResolveMode::Live,
+            &bounded_stale(),
+            false,
+        );
         assert_eq!(svc.cache_counters(), (3, 1), "3 hits, 1 miss");
         // 3/(3+1) = 0.75 — a true division. (modulo 3%4=3→3.0; multiply 3*4=12→12.0 would differ.)
-        assert_eq!(svc.cache_hit_ratio(), Some(0.75), "the ratio is hits/(hits+misses), a real division");
+        assert_eq!(
+            svc.cache_hit_ratio(),
+            Some(0.75),
+            "the ratio is hits/(hits+misses), a real division"
+        );
     }
 
     // ── Step 4: the subscribe seam ──
@@ -1146,7 +1357,10 @@ mod tests {
     #[test]
     fn subscribe_subjects_are_precise_never_a_firehose() {
         let subs = ResolveService::subscribe_subjects(&confidential_issue());
-        assert_eq!(subs, vec!["issue.updated".to_string(), "issue.erased".to_string()]);
+        assert_eq!(
+            subs,
+            vec!["issue.updated".to_string(), "issue.erased".to_string()]
+        );
         for s in &subs {
             assert!(!s.contains('*'), "never a `*` subscription (BUS-4): {s}");
         }
@@ -1201,11 +1415,19 @@ mod tests {
     #[test]
     fn resolution_classifiers_are_exact() {
         let proj = Resolution::Projection(Projection {
-            ref_: confidential_issue(), title: "t".into(), state: "s".into(),
-            icon: "i".into(), render_hint: "h".into(), sub_anchor: None, flag: None,
+            ref_: confidential_issue(),
+            title: "t".into(),
+            state: "s".into(),
+            icon: "i".into(),
+            render_hint: "h".into(),
+            sub_anchor: None,
+            flag: None,
         });
         assert!(proj.is_projection() && !proj.is_tombstone() && proj.tombstone_reason().is_none());
-        let tomb = Resolution::Tombstone(Tombstone { root: confidential_issue(), reason: TombstoneReason::Denied });
+        let tomb = Resolution::Tombstone(Tombstone {
+            root: confidential_issue(),
+            reason: TombstoneReason::Denied,
+        });
         assert!(tomb.is_tombstone() && !tomb.is_projection());
         assert_eq!(tomb.tombstone_reason(), Some(TombstoneReason::Denied));
     }
@@ -1219,8 +1441,20 @@ mod tests {
         let svc = service(owner);
         let ref_ = confidential_issue();
         let root = ref_.clone();
-        let _ = svc.resolve(&tenant(), &region(), &ref_, &root,
-            &viewer("intruder"), ResolveMode::Live, &bounded_stale(), false);
-        assert_eq!(svc.cache_counters(), (0, 0), "a denied resolve must NOT read the cache (no leak path)");
+        let _ = svc.resolve(
+            &tenant(),
+            &region(),
+            &ref_,
+            &root,
+            &viewer("intruder"),
+            ResolveMode::Live,
+            &bounded_stale(),
+            false,
+        );
+        assert_eq!(
+            svc.cache_counters(),
+            (0, 0),
+            "a denied resolve must NOT read the cache (no leak path)"
+        );
     }
 }

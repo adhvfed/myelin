@@ -10,14 +10,14 @@
 //! This feeds the M3-G5/M5 leak drills (GIT-D11, SRCH-D1/D3) — the projection is the ONLY git-artifact
 //! read path, so a 0-leak here is a 0-leak for every downstream consumer (Refs/Search/Notif).
 
-use myelin_git::project::{
-    display_key, git_pr_ref, ArtifactStore, Projected, Projector, TombstoneReason,
-};
 use myelin_git::body::Body;
 use myelin_git::check_status::GateOutcome;
 use myelin_git::lifecycle::PullRequest;
+use myelin_git::project::{
+    display_key, git_pr_ref, ArtifactStore, Projected, Projector, TombstoneReason,
+};
 use myelin_identity::{
-    AuthzError, CaveatContext, Consistency, Credential, Decision, DataRole, IdentityService,
+    AuthzError, CaveatContext, Consistency, Credential, DataRole, Decision, IdentityService,
     ListObjectsResult, ObjectId, ObjectType, Permission, Principal, PrincipalId, PrincipalKind,
     PrincipalStatus, Result as IdResult, RewriteTrace, SubjectTree, TupleDelta, Zookie,
 };
@@ -34,7 +34,10 @@ impl StubId {
     /// Grant `subject` the `view` permission on each object.
     fn granting(subject: &str, objects: &[&ArtifactRef]) -> Self {
         Self {
-            allow: objects.iter().map(|o| format!("{subject}:view@{}", o.0)).collect(),
+            allow: objects
+                .iter()
+                .map(|o| format!("{subject}:view@{}", o.0))
+                .collect(),
         }
     }
 }
@@ -51,7 +54,11 @@ impl IdentityService for StubId {
         _c: Option<&CaveatContext>,
     ) -> IdResult<Decision> {
         let key = format!("{}:{}@{}", subject.principal_id.0, permission.0, object.0);
-        Ok(if self.allow.contains(&key) { Decision::Allow } else { Decision::Deny })
+        Ok(if self.allow.contains(&key) {
+            Decision::Allow
+        } else {
+            Decision::Deny
+        })
     }
     fn list_objects(
         &self,
@@ -146,7 +153,13 @@ fn project_pr_authorized_gets_title_unauthorized_gets_tombstone_zero_leak() {
         "the `#1421` display is render-time only — 0 stored display keys (it never re-parses to a scope)"
     );
 
-    let mut pr = PullRequest::open(1421, "refs/heads/main", "refs/heads/feature", "psn:alice", false);
+    let mut pr = PullRequest::open(
+        1421,
+        "refs/heads/main",
+        "refs/heads/feature",
+        "psn:alice",
+        false,
+    );
     pr.body = Body::new("Harden the payment retry path", vec![]);
     let mut store = ArtifactStore::new();
     store.put_pr(&pr_ref, pr, GateOutcome::AllRequiredGreen, 2, 1);
@@ -155,8 +168,13 @@ fn project_pr_authorized_gets_title_unauthorized_gets_tombstone_zero_leak() {
     let projector = Projector::new(StubId::granting("alice", &[&pr_ref]), store);
 
     // ── act + assert: the authorized viewer gets the title ──
-    let alice = projector.project(&pr_ref, &viewer("alice"), Zookie("z".into())).unwrap();
-    assert!(alice.is_visible(), "an authorized viewer gets a visible projection");
+    let alice = projector
+        .project(&pr_ref, &viewer("alice"), Zookie("z".into()))
+        .unwrap();
+    assert!(
+        alice.is_visible(),
+        "an authorized viewer gets a visible projection"
+    );
     assert_eq!(
         alice.title(),
         Some("Harden the payment retry path"),
@@ -164,8 +182,13 @@ fn project_pr_authorized_gets_title_unauthorized_gets_tombstone_zero_leak() {
     );
 
     // ── the unauthorized viewer gets a tombstone, NEVER the title (the 0-leak invariant) ──
-    let mallory = projector.project(&pr_ref, &viewer("mallory"), Zookie("z".into())).unwrap();
-    assert!(mallory.is_tombstone(), "an unauthorized viewer gets a tombstone");
+    let mallory = projector
+        .project(&pr_ref, &viewer("mallory"), Zookie("z".into()))
+        .unwrap();
+    assert!(
+        mallory.is_tombstone(),
+        "an unauthorized viewer gets a tombstone"
+    );
     assert_eq!(
         mallory.title(),
         None,

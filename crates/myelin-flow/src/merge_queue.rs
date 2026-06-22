@@ -677,7 +677,9 @@ mod tests {
         fn dispatch(&self, ci: &CiDispatch) -> Result<(), crate::ActivityError> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             if self.fail_first && n == 0 {
-                return Err(crate::ActivityError("CI runner transiently unreachable".into()));
+                return Err(crate::ActivityError(
+                    "CI runner transiently unreachable".into(),
+                ));
             }
             self.dispatched.lock().unwrap().push(ci.clone());
             Ok(())
@@ -722,10 +724,25 @@ mod tests {
         let out = ctx
             .run_merge_attempt(&request(), &ci, &merger, None, cost, units)
             .expect("dispatch + park");
-        assert_eq!(out, MergeOutcome::Parked, "no ci.result yet → the run parks");
-        assert!(ctx.parked_on_signal(), "parked on ci.result (holds no runtime)");
-        assert_eq!(ci.calls.load(Ordering::SeqCst), 1, "CI dispatched exactly once");
-        assert_eq!(merger.merges.load(Ordering::SeqCst), 0, "no merge — CI still running");
+        assert_eq!(
+            out,
+            MergeOutcome::Parked,
+            "no ci.result yet → the run parks"
+        );
+        assert!(
+            ctx.parked_on_signal(),
+            "parked on ci.result (holds no runtime)"
+        );
+        assert_eq!(
+            ci.calls.load(Ordering::SeqCst),
+            1,
+            "CI dispatched exactly once"
+        );
+        assert_eq!(
+            merger.merges.load(Ordering::SeqCst),
+            0,
+            "no merge — CI still running"
+        );
 
         // The id the runner received == the id derived independently from (run_id, command_id).
         let dispatched = ci.dispatched.lock().unwrap();
@@ -775,7 +792,11 @@ mod tests {
             other => panic!("expected Merged, got {other:?}"),
         }
         assert_eq!(merger.merges.load(Ordering::SeqCst), 1, "EXACTLY one merge");
-        assert_eq!(ctx.staged_emit_len(), 1, "EXACTLY one git.pr.merged emitted");
+        assert_eq!(
+            ctx.staged_emit_len(),
+            1,
+            "EXACTLY one git.pr.merged emitted"
+        );
     }
 
     /// **A double-delivered `ci.result` wakes the workflow ONCE → 0 double-merge (§6.5).** The
@@ -793,17 +814,33 @@ mod tests {
         let producer = MockCiResultProducer::new(&signals, tenant(), region(), "R1");
         let attempt = merge_attempt_id("R1", "merge.queue:0");
         // DELIVERED TWICE (at-least-once) under the same merge_attempt_id.
-        let first = producer.deliver(&attempt, "deadbeef", CiOverall::Success, vec!["build".into(), "test".into()]);
-        let second = producer.deliver(&attempt, "deadbeef", CiOverall::Success, vec!["build".into(), "test".into()]);
+        let first = producer.deliver(
+            &attempt,
+            "deadbeef",
+            CiOverall::Success,
+            vec!["build".into(), "test".into()],
+        );
+        let second = producer.deliver(
+            &attempt,
+            "deadbeef",
+            CiOverall::Success,
+            vec!["build".into(), "test".into()],
+        );
         assert!(first, "first delivery is new");
-        assert!(!second, "the at-least-once double-delivery deduped (ON CONFLICT DO NOTHING)");
+        assert!(
+            !second,
+            "the at-least-once double-delivery deduped (ON CONFLICT DO NOTHING)"
+        );
         assert_eq!(signals.buffered_depth(), 1, "ONE buffered row");
 
         let mut ctx = begin(&outbox, journal, signals.clone());
         let out = ctx
             .run_merge_attempt(&request(), &ci, &merger, None, cost, units)
             .expect("merge");
-        assert!(matches!(out, MergeOutcome::Merged { .. }), "merged, got {out:?}");
+        assert!(
+            matches!(out, MergeOutcome::Merged { .. }),
+            "merged, got {out:?}"
+        );
         assert_eq!(ctx.consumed_signals().len(), 1, "ONE wake per attempt");
         assert_eq!(merger.merges.load(Ordering::SeqCst), 1, "0 double-merge");
         assert_eq!(ctx.staged_emit_len(), 1, "ONE git.pr.merged");
@@ -823,7 +860,12 @@ mod tests {
 
         let producer = MockCiResultProducer::new(&signals, tenant(), region(), "R1");
         let attempt = merge_attempt_id("R1", "merge.queue:0");
-        producer.deliver(&attempt, "deadbeef", CiOverall::Failure, vec!["build".into(), "test".into()]);
+        producer.deliver(
+            &attempt,
+            "deadbeef",
+            CiOverall::Failure,
+            vec!["build".into(), "test".into()],
+        );
 
         let mut ctx = begin(&outbox, journal, signals);
         let out = ctx
@@ -832,12 +874,22 @@ mod tests {
         match out {
             MergeOutcome::Dequeued { reason } => {
                 assert!(reason.contains("CI failed"), "humanised: {reason}");
-                assert!(reason.contains("build"), "names the failing checks: {reason}");
-                assert!(!reason.contains("ActivityError"), "no raw error code: {reason}");
+                assert!(
+                    reason.contains("build"),
+                    "names the failing checks: {reason}"
+                );
+                assert!(
+                    !reason.contains("ActivityError"),
+                    "no raw error code: {reason}"
+                );
             }
             other => panic!("expected Dequeued, got {other:?}"),
         }
-        assert_eq!(merger.merges.load(Ordering::SeqCst), 0, "no merge on failure");
+        assert_eq!(
+            merger.merges.load(Ordering::SeqCst),
+            0,
+            "no merge on failure"
+        );
         assert_eq!(ctx.staged_emit_len(), 0, "no git.pr.merged on failure");
     }
 
@@ -856,7 +908,12 @@ mod tests {
         let producer = MockCiResultProducer::new(&signals, tenant(), region(), "R1");
         let attempt = merge_attempt_id("R1", "merge.queue:0");
         // success overall but only `build` reported — `test` (required) is missing.
-        producer.deliver(&attempt, "deadbeef", CiOverall::Success, vec!["build".into()]);
+        producer.deliver(
+            &attempt,
+            "deadbeef",
+            CiOverall::Success,
+            vec!["build".into()],
+        );
 
         let mut ctx = begin(&outbox, journal, signals);
         let out = ctx
@@ -864,11 +921,18 @@ mod tests {
             .expect("dequeue");
         match out {
             MergeOutcome::Dequeued { reason } => {
-                assert!(reason.contains("test"), "names the missing required context: {reason}");
+                assert!(
+                    reason.contains("test"),
+                    "names the missing required context: {reason}"
+                );
             }
             other => panic!("expected Dequeued, got {other:?}"),
         }
-        assert_eq!(merger.merges.load(Ordering::SeqCst), 0, "no merge — not all required green");
+        assert_eq!(
+            merger.merges.load(Ordering::SeqCst),
+            0,
+            "no merge — not all required green"
+        );
     }
 
     /// **A vanished CI run's timeout-timer fires and bounds the wait → TimedOut (§6.5 step 2).** CI is
@@ -885,31 +949,57 @@ mod tests {
         let merger = RecordingMerger::default();
 
         // DRIVE 1 at clock=1000 with a 100s SLA → dispatch + park (deadline 1100 not reached).
-        let mut c1 = begin(&outbox, journal.clone(), signals.clone()).with_timers(timers.clone(), 0, 1000);
+        let mut c1 =
+            begin(&outbox, journal.clone(), signals.clone()).with_timers(timers.clone(), 0, 1000);
         let out1 = c1
             .run_merge_attempt(&request(), &ci, &merger, Some(100), MinorUnits(0), vec![])
             .expect("dispatch + park");
-        assert_eq!(out1, MergeOutcome::Parked, "dispatched, parked with an SLA timer");
-        c1.commit().expect("co-commit the dispatch + the timeout-timer");
-        assert_eq!(timers.armed_count(), 1, "the vanished-CI SLA timeout-timer is armed");
+        assert_eq!(
+            out1,
+            MergeOutcome::Parked,
+            "dispatched, parked with an SLA timer"
+        );
+        c1.commit()
+            .expect("co-commit the dispatch + the timeout-timer");
+        assert_eq!(
+            timers.armed_count(),
+            1,
+            "the vanished-CI SLA timeout-timer is armed"
+        );
         let history = journal.history_for(&tenant(), "R1");
 
         // DRIVE 2 at clock=2000 (past the 1100 deadline), STILL no ci.result → TimedOut.
         let mut c2 = WfCtx::resume(
-            &outbox, minter(), journal.clone(), ctx_base(), "R1", "merge.queue",
-            "2026-06-21T00:00:00Z", 42, history,
+            &outbox,
+            minter(),
+            journal.clone(),
+            ctx_base(),
+            "R1",
+            "merge.queue",
+            "2026-06-21T00:00:00Z",
+            42,
+            history,
         )
         .with_signals(signals.clone())
         .with_timers(timers.clone(), 0, 2000);
         let out2 = c2
             .run_merge_attempt(&request(), &ci, &merger, Some(100), MinorUnits(0), vec![])
             .expect("the timeout drive");
-        assert_eq!(out2, MergeOutcome::TimedOut, "the SLA fired before CI reported → TimedOut");
         assert_eq!(
-            ci.calls.load(Ordering::SeqCst), 1,
+            out2,
+            MergeOutcome::TimedOut,
+            "the SLA fired before CI reported → TimedOut"
+        );
+        assert_eq!(
+            ci.calls.load(Ordering::SeqCst),
+            1,
             "CI dispatched ONCE — the replay short-circuit did not re-dispatch it"
         );
-        assert_eq!(merger.merges.load(Ordering::SeqCst), 0, "no merge on a vanished CI run");
+        assert_eq!(
+            merger.merges.load(Ordering::SeqCst),
+            0,
+            "no merge on a vanished CI run"
+        );
     }
 
     /// **A failed merge (a conflict) → dequeue, NOT merge (§6.5).** CI is green but the git merge
@@ -928,7 +1018,12 @@ mod tests {
 
         let producer = MockCiResultProducer::new(&signals, tenant(), region(), "R1");
         let attempt = merge_attempt_id("R1", "merge.queue:0");
-        producer.deliver(&attempt, "deadbeef", CiOverall::Success, vec!["build".into(), "test".into()]);
+        producer.deliver(
+            &attempt,
+            "deadbeef",
+            CiOverall::Success,
+            vec!["build".into(), "test".into()],
+        );
 
         let mut ctx = begin(&outbox, journal, signals);
         let out = ctx
@@ -936,11 +1031,18 @@ mod tests {
             .expect("dequeue on conflict");
         match out {
             MergeOutcome::Dequeued { reason } => {
-                assert!(reason.contains("merge could not be completed"), "humanised: {reason}");
+                assert!(
+                    reason.contains("merge could not be completed"),
+                    "humanised: {reason}"
+                );
             }
             other => panic!("expected Dequeued, got {other:?}"),
         }
-        assert_eq!(ctx.staged_emit_len(), 0, "no git.pr.merged on a failed merge");
+        assert_eq!(
+            ctx.staged_emit_len(),
+            0,
+            "no git.pr.merged on a failed merge"
+        );
     }
 
     /// **CI that does NOT echo the merge_attempt_id is a LOUD error (§6.5/§4.9, EI-01 §2).** The
@@ -956,7 +1058,12 @@ mod tests {
 
         // CI delivered ci.result under the WRONG key (a protocol violation).
         let producer = MockCiResultProducer::new(&signals, tenant(), region(), "R1");
-        producer.deliver("the-wrong-attempt-id", "deadbeef", CiOverall::Success, vec!["build".into(), "test".into()]);
+        producer.deliver(
+            "the-wrong-attempt-id",
+            "deadbeef",
+            CiOverall::Success,
+            vec!["build".into(), "test".into()],
+        );
 
         let mut ctx = begin(&outbox, journal, signals);
         let err = ctx
@@ -986,8 +1093,16 @@ mod tests {
         let out = ctx
             .run_merge_attempt(&request(), &ci, &merger, None, MinorUnits(0), vec![])
             .expect("the retried dispatch parks");
-        assert_eq!(out, MergeOutcome::Parked, "the retried dispatch parks on ci.result");
-        assert_eq!(ci.calls.load(Ordering::SeqCst), 2, "one failure + one retry");
+        assert_eq!(
+            out,
+            MergeOutcome::Parked,
+            "the retried dispatch parks on ci.result"
+        );
+        assert_eq!(
+            ci.calls.load(Ordering::SeqCst),
+            2,
+            "one failure + one retry"
+        );
         let dispatched = ci.dispatched.lock().unwrap();
         assert_eq!(dispatched.len(), 1, "one accepted dispatch (the retry)");
         assert_eq!(
@@ -1010,7 +1125,12 @@ mod tests {
 
         let producer = MockCiResultProducer::new(&signals, tenant(), region(), "R1");
         let attempt = merge_attempt_id("R1", "merge.queue:0");
-        producer.deliver(&attempt, "deadbeef", CiOverall::Success, vec!["build".into(), "test".into()]);
+        producer.deliver(
+            &attempt,
+            "deadbeef",
+            CiOverall::Success,
+            vec!["build".into(), "test".into()],
+        );
 
         // DRIVE 1: dispatch + merge + emit + journal.
         let mut c1 = begin(&outbox, journal.clone(), signals.clone());
@@ -1023,22 +1143,44 @@ mod tests {
 
         // DRIVE 2 (re-drive): replay all three journaled steps with 0 re-execution.
         let mut c2 = WfCtx::resume(
-            &outbox, minter(), journal.clone(), ctx_base(), "R1", "merge.queue",
-            "2026-06-21T00:00:00Z", 42, history,
+            &outbox,
+            minter(),
+            journal.clone(),
+            ctx_base(),
+            "R1",
+            "merge.queue",
+            "2026-06-21T00:00:00Z",
+            42,
+            history,
         )
         .with_signals(signals.clone());
         let out2 = c2
             .run_merge_attempt(&request(), &ci, &merger, None, MinorUnits(0), vec![])
             .expect("the replay drive");
         match out2 {
-            MergeOutcome::Merged { merge_attempt_id: id, .. } => {
+            MergeOutcome::Merged {
+                merge_attempt_id: id,
+                ..
+            } => {
                 assert_eq!(id, attempt, "replay returns the SAME journaled merge")
             }
             other => panic!("expected the journaled Merged, got {other:?}"),
         }
-        assert_eq!(ci.calls.load(Ordering::SeqCst), 1, "0 RE-DISPATCH on replay");
-        assert_eq!(merger.merges.load(Ordering::SeqCst), 1, "0 RE-MERGE on replay");
-        assert_eq!(c2.consumed_signals().len(), 0, "replay consumed NOTHING new");
+        assert_eq!(
+            ci.calls.load(Ordering::SeqCst),
+            1,
+            "0 RE-DISPATCH on replay"
+        );
+        assert_eq!(
+            merger.merges.load(Ordering::SeqCst),
+            1,
+            "0 RE-MERGE on replay"
+        );
+        assert_eq!(
+            c2.consumed_signals().len(),
+            0,
+            "replay consumed NOTHING new"
+        );
     }
 
     /// **The codec round-trips a [`CiResult`] through the references-not-payloads signal body
@@ -1053,7 +1195,10 @@ mod tests {
         };
         let refs = encode_ci_result(&result);
         // every ref is a PII-free machine token.
-        assert!(refs.iter().all(|r| r.0.starts_with("ci.result:")), "machine tokens only");
+        assert!(
+            refs.iter().all(|r| r.0.starts_with("ci.result:")),
+            "machine tokens only"
+        );
         let back = decode_ci_result(&refs, "R1/merge.queue:0/merge").expect("decodable");
         assert_eq!(back, result, "encode → decode round-trips the verdict");
     }
@@ -1112,17 +1257,30 @@ mod tests {
     #[test]
     fn every_dequeue_cause_humanises() {
         let causes = [
-            DequeueCause::CiFailure { failing: vec!["build".into()] },
+            DequeueCause::CiFailure {
+                failing: vec!["build".into()],
+            },
             DequeueCause::CiFailure { failing: vec![] },
-            DequeueCause::MissingRequiredContext { missing: vec!["test".into()] },
+            DequeueCause::MissingRequiredContext {
+                missing: vec!["test".into()],
+            },
             DequeueCause::CiVanished,
             DequeueCause::MergeConflict,
         ];
         for cause in causes {
             let reason = humanise_dequeue_reason(cause.clone());
-            assert!(!reason.is_empty(), "humanised reason is non-empty for {cause:?}");
-            assert!(!reason.contains("ActivityError"), "no raw error code in {reason:?}");
-            assert!(!reason.contains("Err("), "no debug formatting in {reason:?}");
+            assert!(
+                !reason.is_empty(),
+                "humanised reason is non-empty for {cause:?}"
+            );
+            assert!(
+                !reason.contains("ActivityError"),
+                "no raw error code in {reason:?}"
+            );
+            assert!(
+                !reason.contains("Err("),
+                "no debug formatting in {reason:?}"
+            );
         }
     }
 }

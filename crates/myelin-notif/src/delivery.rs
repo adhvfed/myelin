@@ -80,7 +80,7 @@
 //! mutation score on `delivery.rs`** (measured with `cargo mutants`; reported in the P-194 commit body).
 
 use crate::prefs::Channel;
-use crate::{HumanisedString, RedactedMessage, Receipt};
+use crate::{HumanisedString, Receipt, RedactedMessage};
 use myelin_tenancy::{Region, TenantId};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -130,7 +130,10 @@ impl Channel {
 /// tombstone, never a leaked title — the title is never in `summary.text`). This function does NOT
 /// re-render; it CARRIES the summary + the class, asserting the off-cell shape.
 pub fn redact_for_offcell(summary: HumanisedString, class: crate::Class) -> RedactedMessage {
-    RedactedMessage { rendered: summary, class }
+    RedactedMessage {
+        rendered: summary,
+        class,
+    }
 }
 
 /// **The stable idempotency key for a delivery — `<item_id>:<channel>` (architecture §2.3).** The
@@ -285,7 +288,10 @@ impl MockAdapter {
     /// Mark an `idem_key` as a BOUNCE (the next `send` for it returns `accepted = false`) — for
     /// exercising the bounce-telemetry path (signal 1.8 `bounce`).
     pub fn with_bounce(self, idem_key: &str) -> MockAdapter {
-        self.bounce.lock().expect("bounce set lock").insert(idem_key.to_string());
+        self.bounce
+            .lock()
+            .expect("bounce set lock")
+            .insert(idem_key.to_string());
         self
     }
 
@@ -297,7 +303,12 @@ impl MockAdapter {
     /// How many times the provider was invoked for `idem_key` (the at-least-once-but-not-more
     /// observable; the drill asserts this is 1 — the fabric never double-invokes a deduped key).
     pub fn send_count(&self, idem_key: &str) -> usize {
-        self.sent.lock().expect("sent log lock").iter().filter(|k| *k == idem_key).count()
+        self.sent
+            .lock()
+            .expect("sent log lock")
+            .iter()
+            .filter(|k| *k == idem_key)
+            .count()
     }
 }
 
@@ -312,9 +323,19 @@ impl crate::DeliveryAdapter for MockAdapter {
 
     fn send(&self, _message: &RedactedMessage, idem_key: &str) -> Receipt {
         // Record the provider invocation (the exactly-once proof) — deterministic, no network.
-        self.sent.lock().expect("sent log lock").push(idem_key.to_string());
-        let bounced = self.bounce.lock().expect("bounce set lock").contains(idem_key);
-        Receipt { idem_key: idem_key.to_string(), accepted: !bounced }
+        self.sent
+            .lock()
+            .expect("sent log lock")
+            .push(idem_key.to_string());
+        let bounced = self
+            .bounce
+            .lock()
+            .expect("bounce set lock")
+            .contains(idem_key);
+        Receipt {
+            idem_key: idem_key.to_string(),
+            accepted: !bounced,
+        }
     }
 }
 
@@ -365,7 +386,10 @@ impl DeliveryFabric {
     /// A fresh fabric over a shared [`DeliveryLedger`] (so a crash/retry reads the SAME durable
     /// ledger). Register adapters with [`with_adapter`](DeliveryFabric::with_adapter).
     pub fn new(ledger: DeliveryLedger) -> DeliveryFabric {
-        DeliveryFabric { adapters: BTreeMap::new(), ledger }
+        DeliveryFabric {
+            adapters: BTreeMap::new(),
+            ledger,
+        }
     }
 
     /// **A fabric wired with the deterministic MOCK adapter for every channel (`--use-mock`).** The
@@ -380,8 +404,7 @@ impl DeliveryFabric {
             Channel::Email,
             Channel::Desktop,
         ] {
-            fabric = fabric
-                .with_adapter(Arc::new(MockAdapter::new(channel, region.clone())));
+            fabric = fabric.with_adapter(Arc::new(MockAdapter::new(channel, region.clone())));
         }
         fabric
     }
@@ -405,7 +428,10 @@ impl DeliveryFabric {
     }
 
     /// The adapter registered for `channel` (the region-aware §3.6 adapter), if any.
-    pub fn adapter(&self, channel: Channel) -> Option<&Arc<dyn crate::DeliveryAdapter + Send + Sync>> {
+    pub fn adapter(
+        &self,
+        channel: Channel,
+    ) -> Option<&Arc<dyn crate::DeliveryAdapter + Send + Sync>> {
         self.adapters.get(&channel)
     }
 
@@ -434,7 +460,9 @@ impl DeliveryFabric {
         // delivered, return WITHOUT invoking the provider (the durable half of at-least-once: this
         // is what makes a retry after a crash a no-op — the ledger row is the source of truth).
         if let Some(existing) = self.ledger.get(tenant, &idem_key) {
-            return Ok(DeliveryOutcome::AlreadyDelivered { accepted: existing.accepted });
+            return Ok(DeliveryOutcome::AlreadyDelivered {
+                accepted: existing.accepted,
+            });
         }
 
         // The region-aware adapter for the channel (the strategy-pattern dispatch; loud on absence).
@@ -467,7 +495,9 @@ impl DeliveryFabric {
                 .ledger
                 .get(tenant, &idem_key)
                 .expect("the winning record exists");
-            return Ok(DeliveryOutcome::AlreadyDelivered { accepted: existing.accepted });
+            return Ok(DeliveryOutcome::AlreadyDelivered {
+                accepted: existing.accepted,
+            });
         }
 
         if receipt.accepted {

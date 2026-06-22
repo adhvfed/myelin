@@ -102,40 +102,82 @@ fn restrict_is_honoured_end_to_end_across_the_five_derived_stores() {
         0,
         "0 processing of a restricted subject across Search/Refs/Notif/Agents/OLAP (GA-D7)"
     );
-    assert!(set.all_suppressed(), "every derived store SUPPRESSED the restricted subject");
-    assert_eq!(set.verdicts.len(), 5, "Search + Refs + Notif + Agents + OLAP");
+    assert!(
+        set.all_suppressed(),
+        "every derived store SUPPRESSED the restricted subject"
+    );
+    assert_eq!(
+        set.verdicts.len(),
+        5,
+        "Search + Refs + Notif + Agents + OLAP"
+    );
 
     // No-indexing / no-agent-use / no-analytics / no-notification — assert per derived store.
-    assert_eq!(search.process(&subj, &tenant), DerivedProcessed::Suppressed, "Search: no indexing");
-    assert_eq!(refs.process(&subj, &tenant), DerivedProcessed::Suppressed, "Refs: no edge projection");
-    assert_eq!(notif.process(&subj, &tenant), DerivedProcessed::Suppressed, "Notif: no notification");
-    assert_eq!(agents.process(&subj, &tenant), DerivedProcessed::Suppressed, "Agents: no agent-use");
-    assert_eq!(olap.process(&subj, &tenant), DerivedProcessed::Suppressed, "OLAP: no analytics (11.6)");
+    assert_eq!(
+        search.process(&subj, &tenant),
+        DerivedProcessed::Suppressed,
+        "Search: no indexing"
+    );
+    assert_eq!(
+        refs.process(&subj, &tenant),
+        DerivedProcessed::Suppressed,
+        "Refs: no edge projection"
+    );
+    assert_eq!(
+        notif.process(&subj, &tenant),
+        DerivedProcessed::Suppressed,
+        "Notif: no notification"
+    );
+    assert_eq!(
+        agents.process(&subj, &tenant),
+        DerivedProcessed::Suppressed,
+        "Agents: no agent-use"
+    );
+    assert_eq!(
+        olap.process(&subj, &tenant),
+        DerivedProcessed::Suppressed,
+        "OLAP: no analytics (11.6)"
+    );
 
     // Storage RETAINED while restricted (§4.4 "while retaining storage") — suppression ≠ delete.
-    assert!(set.all_rows_retained(), "every derived row RETAINED while restricted (§4.4)");
+    assert!(
+        set.all_rows_retained(),
+        "every derived row RETAINED while restricted (§4.4)"
+    );
     for s in stores {
-        assert!(s.has_row(&subj, &tenant), "{} retains its derived row while restricted", s.holder_id());
+        assert!(
+            s.has_row(&subj, &tenant),
+            "{} retains its derived row while restricted",
+            s.holder_id()
+        );
     }
 
     // The OLAP read store is explicitly in the suppression set (contract 11.6 / GA-9 — the §8
     // restriction-flag-into-OLAP propagation; "no analytics for a restricted subject").
     assert!(
-        set.verdicts.iter().any(|v| v.holder_id == restrict_holder_ids::OLAP_READ_STORE
-            && matches!(v.outcome, DerivedProcessed::Suppressed)),
+        set.verdicts
+            .iter()
+            .any(|v| v.holder_id == restrict_holder_ids::OLAP_READ_STORE
+                && matches!(v.outcome, DerivedProcessed::Suppressed)),
         "OLAP honours the restriction flag — no analytics for a restricted subject (11.6)"
     );
 
     // ─────── REVERSIBLE: CLEAR the restriction → processing resumes across all five ───────
     let clear = RestrictFanOutDriver::fan_out_restrict(&subj, &tenant, false, &stores, &holders)
         .expect("the un-restrict fan-out succeeds");
-    assert!(!clear.all_suppressed(), "processing resumes after the restriction is lifted (reversible)");
+    assert!(
+        !clear.all_suppressed(),
+        "processing resumes after the restriction is lifted (reversible)"
+    );
     let processed_again = clear
         .verdicts
         .iter()
         .filter(|v| matches!(v.outcome, DerivedProcessed::Processed(_)))
         .count();
-    assert_eq!(processed_again, 5, "all five derived stores process again (reversible)");
+    assert_eq!(
+        processed_again, 5,
+        "all five derived stores process again (reversible)"
+    );
     for s in stores {
         assert!(
             matches!(s.process(&subj, &tenant), DerivedProcessed::Processed(_)),
@@ -166,9 +208,21 @@ fn the_restriction_is_scoped_other_subjects_still_process_across_the_derived_sto
     restrict.set(&restricted, &tenant, true);
 
     // The restricted subject is suppressed across the derived stores.
-    assert_eq!(search.process(&restricted, &tenant), DerivedProcessed::Suppressed);
-    assert_eq!(olap.process(&restricted, &tenant), DerivedProcessed::Suppressed);
+    assert_eq!(
+        search.process(&restricted, &tenant),
+        DerivedProcessed::Suppressed
+    );
+    assert_eq!(
+        olap.process(&restricted, &tenant),
+        DerivedProcessed::Suppressed
+    );
     // The UNRELATED subject still processes (the restriction did not over-suppress).
-    assert!(matches!(search.process(&other, &tenant), DerivedProcessed::Processed(_)));
-    assert!(matches!(olap.process(&other, &tenant), DerivedProcessed::Processed(_)));
+    assert!(matches!(
+        search.process(&other, &tenant),
+        DerivedProcessed::Processed(_)
+    ));
+    assert!(matches!(
+        olap.process(&other, &tenant),
+        DerivedProcessed::Processed(_)
+    ));
 }

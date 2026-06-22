@@ -115,14 +115,17 @@ pub enum GitArtifactType {
 /// reads the `<subsystem>`/`<type>` segments of the canonical URN — never a render-time display form.
 fn classify(r: &ArtifactRef) -> Result<GitArtifactType, ProjectError> {
     // The canonical URN is `myelin://<tenant>/git/<type>/<id>[#<sub>]`; split the scope segments.
-    let rest = r
-        .0
-        .strip_prefix("myelin://")
-        .ok_or_else(|| ProjectError::NotAGitArtifact { reference: r.0.clone() })?;
+    let rest =
+        r.0.strip_prefix("myelin://")
+            .ok_or_else(|| ProjectError::NotAGitArtifact {
+                reference: r.0.clone(),
+            })?;
     let scope = rest.split('#').next().unwrap_or(rest);
     let segments: Vec<&str> = scope.split('/').collect();
     if segments.len() != 4 || segments[1] != "git" {
-        return Err(ProjectError::NotAGitArtifact { reference: r.0.clone() });
+        return Err(ProjectError::NotAGitArtifact {
+            reference: r.0.clone(),
+        });
     }
     match segments[2] {
         "pr" => Ok(GitArtifactType::Pr),
@@ -130,7 +133,9 @@ fn classify(r: &ArtifactRef) -> Result<GitArtifactType, ProjectError> {
         "review" => Ok(GitArtifactType::Review),
         "repo" => Ok(GitArtifactType::Repo),
         "blob" => Ok(GitArtifactType::Blob),
-        other => Err(ProjectError::UnknownGitType { ty: other.to_string() }),
+        other => Err(ProjectError::UnknownGitType {
+            ty: other.to_string(),
+        }),
     }
 }
 
@@ -151,7 +156,12 @@ pub fn git_commit_ref(tenant: &str, repo: &str, sha: &str) -> ArtifactRef {
 /// Mint the canonical **review** `ArtifactRef`: `myelin://<tenant>/git/review/<repo>:<n>:<reviewer>`.
 /// Keyed by the parent PR number + the reviewer's opaque pseudonym (a review is a child of a PR; the
 /// id is stable for that `(pr, reviewer)`).
-pub fn git_review_ref(tenant: &str, repo: &str, pr_number: u64, reviewer_pseudonym: &str) -> ArtifactRef {
+pub fn git_review_ref(
+    tenant: &str,
+    repo: &str,
+    pr_number: u64,
+    reviewer_pseudonym: &str,
+) -> ArtifactRef {
     parse_git(&format!(
         "myelin://{tenant}/git/review/{repo}:{pr_number}:{reviewer_pseudonym}"
     ))
@@ -388,7 +398,10 @@ impl std::fmt::Display for ProjectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ProjectError::NotAGitArtifact { reference } => {
-                write!(f, "not a git artifact: `{reference}` — git's projector does not own this ref")
+                write!(
+                    f,
+                    "not a git artifact: `{reference}` — git's projector does not own this ref"
+                )
             }
             ProjectError::UnknownGitType { ty } => {
                 write!(f, "unknown git artifact type `{ty}`")
@@ -568,7 +581,9 @@ impl<I: IdentityService> Projector<I> {
         let ty = classify(reference)?;
         if ty == GitArtifactType::Blob {
             // The blob `#L<a>-L<b>` content-anchored resolver is the named GIT-P24 floor.
-            return Err(ProjectError::BlobFloor { reference: reference.0.clone() });
+            return Err(ProjectError::BlobFloor {
+                reference: reference.0.clone(),
+            });
         }
 
         // ── 1. PERMISSION FIRST (the 0-leak gate). The acl_object is the artifact's own ref; the
@@ -576,11 +591,15 @@ impl<I: IdentityService> Projector<I> {
         //    artifact) so a comment/thread sub inherits the parent PR's `view` (a sub is never more
         //    visible than its parent). A Deny / Conditional / Id-error all fail CLOSED to a tombstone.
         let acl_object = myelin_refs::strip_sub(reference);
-        let at = Consistency { at_least: zookie, mode: ConsistencyMode::Strong };
+        let at = Consistency {
+            at_least: zookie,
+            mode: ConsistencyMode::Strong,
+        };
         let permission = Permission(VIEW.to_string());
         let decision = self.id.check(viewer, &permission, &acl_object, &at, None);
         match decision {
-            Ok(Decision::Allow) => { /* authorised — fall through to the erasure/restriction guards */ }
+            Ok(Decision::Allow) => { /* authorised — fall through to the erasure/restriction guards */
+            }
             // Deny, Conditional (no caveat satisfied at the projection seam), or an Id transport error
             // ALL fail closed: a tombstone with NO artifact field read (0 leak).
             Ok(Decision::Deny) | Ok(Decision::Conditional) | Err(_) => {
@@ -594,11 +613,16 @@ impl<I: IdentityService> Projector<I> {
         //    too). The permission passed, but the content is gone / restricted — a tombstone, never
         //    the content.
         if self.store.erased.contains(&acl_object.0) || self.store.erased.contains(&reference.0) {
-            return Ok(Projected::Tombstoned(Tombstone { reason: TombstoneReason::Erased }));
+            return Ok(Projected::Tombstoned(Tombstone {
+                reason: TombstoneReason::Erased,
+            }));
         }
-        if self.store.restricted.contains(&acl_object.0) || self.store.restricted.contains(&reference.0)
+        if self.store.restricted.contains(&acl_object.0)
+            || self.store.restricted.contains(&reference.0)
         {
-            return Ok(Projected::Tombstoned(Tombstone { reason: TombstoneReason::Restricted }));
+            return Ok(Projected::Tombstoned(Tombstone {
+                reason: TombstoneReason::Restricted,
+            }));
         }
 
         // ── 3. LOAD THE OWN DB + BUILD THE PER-VIEWER PROJECTION (§3).
@@ -625,13 +649,14 @@ impl<I: IdentityService> Projector<I> {
             .store
             .prs
             .get(&root.0)
-            .ok_or_else(|| ProjectError::NotFound { reference: root.0.clone() })?;
-        let (gate, current, required) = self
-            .store
-            .pr_render
-            .get(&root.0)
-            .cloned()
-            .unwrap_or((GateOutcome::AllRequiredGreen, 0, 0));
+            .ok_or_else(|| ProjectError::NotFound {
+                reference: root.0.clone(),
+            })?;
+        let (gate, current, required) = self.store.pr_render.get(&root.0).cloned().unwrap_or((
+            GateOutcome::AllRequiredGreen,
+            0,
+            0,
+        ));
         let checks = match (&gate, required) {
             // No required contexts gate this PR → neutral (nothing to summarise).
             (_, 0) => ChecksSummary::Neutral,
@@ -658,13 +683,20 @@ impl<I: IdentityService> Projector<I> {
             .store
             .commits
             .get(&root.0)
-            .ok_or_else(|| ProjectError::NotFound { reference: root.0.clone() })?;
+            .ok_or_else(|| ProjectError::NotFound {
+                reference: root.0.clone(),
+            })?;
         let short = canonical_id(root)
             .and_then(|id| id.rsplit(':').next().map(short_sha))
             .unwrap_or_default();
         Ok(Projection {
             title: format!("{short} {}", meta.subject),
-            state: if meta.verified { "verified" } else { "unverified" }.to_string(),
+            state: if meta.verified {
+                "verified"
+            } else {
+                "unverified"
+            }
+            .to_string(),
             icon: "commit".to_string(),
             render_hint: None,
             sub_anchor: None,
@@ -677,7 +709,9 @@ impl<I: IdentityService> Projector<I> {
             .store
             .reviews
             .get(&root.0)
-            .ok_or_else(|| ProjectError::NotFound { reference: root.0.clone() })?;
+            .ok_or_else(|| ProjectError::NotFound {
+                reference: root.0.clone(),
+            })?;
         Ok(Projection {
             title: review_title(review),
             state: review_state_token(&review.state).to_string(),
@@ -693,7 +727,9 @@ impl<I: IdentityService> Projector<I> {
             .store
             .repos
             .get(&root.0)
-            .ok_or_else(|| ProjectError::NotFound { reference: root.0.clone() })?;
+            .ok_or_else(|| ProjectError::NotFound {
+                reference: root.0.clone(),
+            })?;
         Ok(Projection {
             title: meta.slug.clone(),
             state: meta.visibility.clone(),
@@ -712,11 +748,21 @@ impl<I: IdentityService> Projector<I> {
         match sub {
             myelin_refs::Sub::Comment(_) => Some(SubAnchor {
                 kind: "comment".to_string(),
-                excerpt: self.store.comments.get(&reference.0).cloned().unwrap_or_default(),
+                excerpt: self
+                    .store
+                    .comments
+                    .get(&reference.0)
+                    .cloned()
+                    .unwrap_or_default(),
             }),
             myelin_refs::Sub::Thread(_) => Some(SubAnchor {
                 kind: "thread".to_string(),
-                excerpt: self.store.comments.get(&reference.0).cloned().unwrap_or_default(),
+                excerpt: self
+                    .store
+                    .comments
+                    .get(&reference.0)
+                    .cloned()
+                    .unwrap_or_default(),
             }),
             // A line-range / other sub on a non-blob ref carries no comment excerpt here.
             _ => None,
@@ -774,8 +820,8 @@ mod tests {
     use crate::body::Body;
     use crate::check_status::{CheckContext, GateOutcome};
     use myelin_identity::{
-        AuthzError, CaveatContext, Credential, ListObjectsResult, ObjectId, ObjectType, PrincipalId,
-        PrincipalKind, Result as IdResult, RewriteTrace, SubjectTree, TupleDelta,
+        AuthzError, CaveatContext, Credential, ListObjectsResult, ObjectId, ObjectType,
+        PrincipalId, PrincipalKind, Result as IdResult, RewriteTrace, SubjectTree, TupleDelta,
     };
     use myelin_tenancy::{Region, TenantId};
     use std::collections::HashSet;
@@ -789,7 +835,10 @@ mod tests {
 
     impl StubId {
         fn new() -> Self {
-            Self { allow: HashSet::new(), hiccup: false }
+            Self {
+                allow: HashSet::new(),
+                hiccup: false,
+            }
         }
         fn allow_view(mut self, object: &ArtifactRef) -> Self {
             self.allow.insert(format!("view@{}", object.0));
@@ -817,7 +866,11 @@ mod tests {
                 return Err(AuthzError::Unavailable("forced Id break".into()));
             }
             let key = format!("{}@{}", permission.0, object.0);
-            Ok(if self.allow.contains(&key) { Decision::Allow } else { Decision::Deny })
+            Ok(if self.allow.contains(&key) {
+                Decision::Allow
+            } else {
+                Decision::Deny
+            })
         }
         fn list_objects(
             &self,
@@ -897,7 +950,13 @@ mod tests {
     }
 
     fn a_pr() -> PullRequest {
-        let mut pr = PullRequest::open(42, "refs/heads/main", "refs/heads/feature", "psn:alice", false);
+        let mut pr = PullRequest::open(
+            42,
+            "refs/heads/main",
+            "refs/heads/feature",
+            "psn:alice",
+            false,
+        );
         pr.body = Body::new("Fix the charge race condition\n\nmore detail", vec![]);
         pr
     }
@@ -916,13 +975,19 @@ mod tests {
         assert_eq!(myelin_refs::parse(&myelin_refs::format(&pr)).unwrap(), pr);
 
         let c = git_commit_ref("acme", "repo7", "blake3:deadbeefcafe0000");
-        assert_eq!(myelin_refs::format(&c), "myelin://acme/git/commit/repo7:blake3:deadbeefcafe0000");
+        assert_eq!(
+            myelin_refs::format(&c),
+            "myelin://acme/git/commit/repo7:blake3:deadbeefcafe0000"
+        );
 
         let repo = git_repo_ref("acme", "repo7");
         assert_eq!(myelin_refs::format(&repo), "myelin://acme/git/repo/repo7");
 
         let rv = git_review_ref("acme", "repo7", 4291, "psn:bob");
-        assert_eq!(myelin_refs::format(&rv), "myelin://acme/git/review/repo7:4291:psn:bob");
+        assert_eq!(
+            myelin_refs::format(&rv),
+            "myelin://acme/git/review/repo7:4291:psn:bob"
+        );
     }
 
     #[test]
@@ -946,7 +1011,10 @@ mod tests {
     #[test]
     fn classify_rejects_a_non_git_ref() {
         let issue = myelin_refs::parse("myelin://acme/issue/issue/ENG-1").unwrap();
-        assert!(matches!(classify(&issue), Err(ProjectError::NotAGitArtifact { .. })));
+        assert!(matches!(
+            classify(&issue),
+            Err(ProjectError::NotAGitArtifact { .. })
+        ));
     }
 
     // ════════ 2. project(ref, viewer) — PERMISSION FIRST (the 0-leak gate) ════════
@@ -958,7 +1026,9 @@ mod tests {
         store.put_pr(
             &pr_ref,
             a_pr(),
-            GateOutcome::Blocked { unmet: vec![CheckContext::ci("ci/build")] },
+            GateOutcome::Blocked {
+                unmet: vec![CheckContext::ci("ci/build")],
+            },
             1,
             2,
         );
@@ -987,9 +1057,16 @@ mod tests {
         let p = Projector::new(StubId::new(), store);
 
         let got = p.project(&pr_ref, &viewer("mallory"), z()).unwrap();
-        assert!(got.is_tombstone(), "an unauthorized viewer must get a tombstone");
+        assert!(
+            got.is_tombstone(),
+            "an unauthorized viewer must get a tombstone"
+        );
         // THE 0-LEAK INVARIANT: the title is NEVER returned to the denied viewer.
-        assert_eq!(got.title(), None, "0 title leak — the denied viewer never gets the title");
+        assert_eq!(
+            got.title(),
+            None,
+            "0 title leak — the denied viewer never gets the title"
+        );
         if let Projected::Tombstoned(t) = got {
             assert_eq!(t.reason, TombstoneReason::Unauthorized);
             assert_eq!(t.display_text(), "(not available)"); // content-free.
@@ -1006,7 +1083,10 @@ mod tests {
         let p = Projector::new(id, store);
 
         let got = p.project(&pr_ref, &viewer("alice"), z()).unwrap();
-        assert!(got.is_tombstone(), "an Id hiccup fails closed to a tombstone (never a leak)");
+        assert!(
+            got.is_tombstone(),
+            "an Id hiccup fails closed to a tombstone (never a leak)"
+        );
         assert_eq!(got.title(), None);
     }
 
@@ -1022,7 +1102,11 @@ mod tests {
 
         let got = p.project(&pr_ref, &viewer("alice"), z()).unwrap();
         assert!(got.is_tombstone());
-        assert_eq!(got.title(), None, "an erased artifact never leaks its (gone) title");
+        assert_eq!(
+            got.title(),
+            None,
+            "an erased artifact never leaks its (gone) title"
+        );
         if let Projected::Tombstoned(t) = got {
             assert_eq!(t.reason, TombstoneReason::Erased);
         }
@@ -1050,14 +1134,20 @@ mod tests {
         let mut store = ArtifactStore::new();
         store.put_commit(
             &commit_ref,
-            CommitMeta { subject: "Fix the leak".into(), verified: true },
+            CommitMeta {
+                subject: "Fix the leak".into(),
+                verified: true,
+            },
         );
         let mut review = Review::request("psn:bob", false);
         review.submit(ReviewVerdict::Approve).unwrap();
         store.put_review(&review_ref, review);
         store.put_repo(
             &repo_ref,
-            RepoMeta { slug: "acme/payments".into(), visibility: "private".into() },
+            RepoMeta {
+                slug: "acme/payments".into(),
+                visibility: "private".into(),
+            },
         );
         let id = StubId::new()
             .allow_view(&commit_ref)

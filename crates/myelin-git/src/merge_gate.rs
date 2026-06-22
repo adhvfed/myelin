@@ -134,9 +134,15 @@ pub fn parse_required_context(s: &str) -> Result<CheckContext, RequiredContextPa
         Some(("ci", "")) | Some(("external", "")) => {
             Err(RequiredContextParseError::EmptyName { raw: s.to_string() })
         }
-        Some(_) => Ok(CheckContext { provider: CheckProvider::Ci, name: s.to_string() }),
+        Some(_) => Ok(CheckContext {
+            provider: CheckProvider::Ci,
+            name: s.to_string(),
+        }),
         // No `/` — a bare name under the default CI provider.
-        None => Ok(CheckContext { provider: CheckProvider::Ci, name: s.to_string() }),
+        None => Ok(CheckContext {
+            provider: CheckProvider::Ci,
+            name: s.to_string(),
+        }),
     }
 }
 
@@ -161,7 +167,10 @@ impl std::fmt::Display for RequiredContextParseError {
                 write!(f, "a required_contexts entry was empty")
             }
             RequiredContextParseError::EmptyName { raw } => {
-                write!(f, "a required_contexts entry has a provider but no name: {raw:?}")
+                write!(
+                    f,
+                    "a required_contexts entry has a provider but no name: {raw:?}"
+                )
             }
         }
     }
@@ -253,7 +262,10 @@ pub fn evaluate_merge_gate(
     for ctx in &policy.required {
         match resolve_context(projection, head_oid, ctx, endorsed_contexts) {
             None => {}
-            Some(reason) => unmet.push(UnmetContext { context: ctx.clone(), reason }),
+            Some(reason) => unmet.push(UnmetContext {
+                context: ctx.clone(),
+                reason,
+            }),
         }
     }
     if unmet.is_empty() {
@@ -340,7 +352,10 @@ mod tests {
             run_attempt: attempt,
             trust_tier: trust,
             details_ref: ArtifactRef("myelin://acme/ci/run/1#step-3".into()),
-            summary: HumanisedRef { template_key: "ci.check.updated".into(), args: BTreeMap::new() },
+            summary: HumanisedRef {
+                template_key: "ci.check.updated".into(),
+                args: BTreeMap::new(),
+            },
             started_at: Timestamp("2026-06-22T00:00:00Z".into()),
             completed_at: Some(Timestamp("2026-06-22T00:01:00Z".into())),
             cost_settled: true,
@@ -367,7 +382,10 @@ mod tests {
 
     #[test]
     fn parse_bare_name_defaults_to_ci() {
-        assert_eq!(parse_required_context("build").unwrap(), CheckContext::ci("build"));
+        assert_eq!(
+            parse_required_context("build").unwrap(),
+            CheckContext::ci("build")
+        );
     }
 
     #[test]
@@ -390,8 +408,14 @@ mod tests {
 
     #[test]
     fn parse_empty_is_a_loud_error() {
-        assert_eq!(parse_required_context("").unwrap_err(), RequiredContextParseError::Empty);
-        assert_eq!(parse_required_context("   ").unwrap_err(), RequiredContextParseError::Empty);
+        assert_eq!(
+            parse_required_context("").unwrap_err(),
+            RequiredContextParseError::Empty
+        );
+        assert_eq!(
+            parse_required_context("   ").unwrap_err(),
+            RequiredContextParseError::Empty
+        );
     }
 
     #[test]
@@ -404,7 +428,9 @@ mod tests {
         );
         assert_eq!(
             parse_required_context("external/").unwrap_err(),
-            RequiredContextParseError::EmptyName { raw: "external/".into() }
+            RequiredContextParseError::EmptyName {
+                raw: "external/".into()
+            }
         );
         // The Display surfaces the loud, humanisable message (never a silent drop).
         assert_eq!(
@@ -433,13 +459,16 @@ mod tests {
     #[test]
     fn policy_is_empty_distinguishes_empty_from_non_empty() {
         assert!(MergeGatePolicy::default().is_empty());
-        assert!(!MergeGatePolicy::from_required_contexts(&["ci/build"]).unwrap().is_empty());
+        assert!(!MergeGatePolicy::from_required_contexts(&["ci/build"])
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
     fn policy_from_ruleset_strings() {
         let policy =
-            MergeGatePolicy::from_required_contexts(&["ci/build", "ci/test", "external/scan"]).unwrap();
+            MergeGatePolicy::from_required_contexts(&["ci/build", "ci/test", "external/scan"])
+                .unwrap();
         assert_eq!(policy.required.len(), 3);
         assert!(policy.requires(&CheckContext::ci("build")));
         assert!(policy.requires(&CheckContext::external("scan")));
@@ -457,8 +486,20 @@ mod tests {
     fn gate_admits_when_all_required_green_trusted() {
         let mut proj = CheckStatusProjection::new();
         let head = GitOid("h1".into());
-        proj.apply(&fact("h1", CheckContext::ci("build"), 1, CheckState::Success, TrustTier::Trusted));
-        proj.apply(&fact("h1", CheckContext::ci("test"), 1, CheckState::Success, TrustTier::Trusted));
+        proj.apply(&fact(
+            "h1",
+            CheckContext::ci("build"),
+            1,
+            CheckState::Success,
+            TrustTier::Trusted,
+        ));
+        proj.apply(&fact(
+            "h1",
+            CheckContext::ci("test"),
+            1,
+            CheckState::Success,
+            TrustTier::Trusted,
+        ));
 
         let policy = MergeGatePolicy::from_required_contexts(&["ci/build", "ci/test"]).unwrap();
         assert_eq!(
@@ -472,7 +513,13 @@ mod tests {
         let mut proj = CheckStatusProjection::new();
         let head = GitOid("h1".into());
         // build is green; test is REQUIRED but never reported.
-        proj.apply(&fact("h1", CheckContext::ci("build"), 1, CheckState::Success, TrustTier::Trusted));
+        proj.apply(&fact(
+            "h1",
+            CheckContext::ci("build"),
+            1,
+            CheckState::Success,
+            TrustTier::Trusted,
+        ));
 
         let policy = MergeGatePolicy::from_required_contexts(&["ci/build", "ci/test"]).unwrap();
         match evaluate_merge_gate(&policy, &proj, &head, &[]) {
@@ -489,12 +536,23 @@ mod tests {
     fn gate_blocks_on_failing_required_context() {
         let mut proj = CheckStatusProjection::new();
         let head = GitOid("h1".into());
-        proj.apply(&fact("h1", CheckContext::ci("build"), 1, CheckState::Failure, TrustTier::Trusted));
+        proj.apply(&fact(
+            "h1",
+            CheckContext::ci("build"),
+            1,
+            CheckState::Failure,
+            TrustTier::Trusted,
+        ));
 
         let policy = MergeGatePolicy::from_required_contexts(&["ci/build"]).unwrap();
         match evaluate_merge_gate(&policy, &proj, &head, &[]) {
             MergeGateOutcome::Blocked { unmet } => {
-                assert_eq!(unmet[0].reason, UnmetReason::NotGreen { state: CheckState::Failure });
+                assert_eq!(
+                    unmet[0].reason,
+                    UnmetReason::NotGreen {
+                        state: CheckState::Failure
+                    }
+                );
             }
             MergeGateOutcome::Admitted => panic!("a failing required context must BLOCK"),
         }
@@ -506,12 +564,23 @@ mod tests {
         // is not admitted until it goes green (fail-closed on a not-yet-green context).
         let mut proj = CheckStatusProjection::new();
         let head = GitOid("h1".into());
-        proj.apply(&fact("h1", CheckContext::ci("build"), 1, CheckState::InProgress, TrustTier::Trusted));
+        proj.apply(&fact(
+            "h1",
+            CheckContext::ci("build"),
+            1,
+            CheckState::InProgress,
+            TrustTier::Trusted,
+        ));
 
         let policy = MergeGatePolicy::from_required_contexts(&["ci/build"]).unwrap();
         match evaluate_merge_gate(&policy, &proj, &head, &[]) {
             MergeGateOutcome::Blocked { unmet } => {
-                assert_eq!(unmet[0].reason, UnmetReason::NotGreen { state: CheckState::InProgress });
+                assert_eq!(
+                    unmet[0].reason,
+                    UnmetReason::NotGreen {
+                        state: CheckState::InProgress
+                    }
+                );
             }
             MergeGateOutcome::Admitted => panic!("a pending required context must BLOCK"),
         }
@@ -523,7 +592,13 @@ mod tests {
         // distinct UntrustedForkNeutral reason (a fork cannot self-green its required gate).
         let mut proj = CheckStatusProjection::new();
         let head = GitOid("h1".into());
-        proj.apply(&fact("h1", CheckContext::ci("build"), 1, CheckState::Success, TrustTier::UntrustedFork));
+        proj.apply(&fact(
+            "h1",
+            CheckContext::ci("build"),
+            1,
+            CheckState::Success,
+            TrustTier::UntrustedFork,
+        ));
 
         let policy = MergeGatePolicy::from_required_contexts(&["ci/build"]).unwrap();
         // Un-endorsed → blocked (neutral-for-gating).
@@ -558,19 +633,41 @@ mod tests {
     fn the_in_memory_and_row_paths_agree() {
         // The store-backed gate primitive (evaluate_merge_gate_row) applies the IDENTICAL classify
         // logic as the in-memory gate — a row that the in-memory gate admits, the row primitive admits.
-        let f = fact("h1", CheckContext::ci("build"), 1, CheckState::Success, TrustTier::Trusted);
+        let f = fact(
+            "h1",
+            CheckContext::ci("build"),
+            1,
+            CheckState::Success,
+            TrustTier::Trusted,
+        );
         let row = CheckStatusRow::from_fact(&f);
-        assert_eq!(evaluate_merge_gate_row(Some(&row), false), None, "trusted success satisfies");
-        assert_eq!(evaluate_merge_gate_row(None, false), Some(UnmetReason::Missing), "absent → missing");
+        assert_eq!(
+            evaluate_merge_gate_row(Some(&row), false),
+            None,
+            "trusted success satisfies"
+        );
+        assert_eq!(
+            evaluate_merge_gate_row(None, false),
+            Some(UnmetReason::Missing),
+            "absent → missing"
+        );
 
         let fork = CheckStatusRow::from_fact(&fact(
-            "h1", CheckContext::ci("build"), 1, CheckState::Success, TrustTier::UntrustedFork,
+            "h1",
+            CheckContext::ci("build"),
+            1,
+            CheckState::Success,
+            TrustTier::UntrustedFork,
         ));
         assert_eq!(
             evaluate_merge_gate_row(Some(&fork), false),
             Some(UnmetReason::UntrustedForkNeutral),
             "un-endorsed fork success → neutral"
         );
-        assert_eq!(evaluate_merge_gate_row(Some(&fork), true), None, "endorsed fork success satisfies");
+        assert_eq!(
+            evaluate_merge_gate_row(Some(&fork), true),
+            None,
+            "endorsed fork success satisfies"
+        );
     }
 }

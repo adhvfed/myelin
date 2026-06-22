@@ -47,12 +47,21 @@ fn clock() -> Timestamp {
 }
 
 fn actor_for(id: &str) -> Actor {
-    Actor(Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant()))
+    Actor(Principal::stub(
+        PrincipalId(id.into()),
+        PrincipalKind::Human,
+        tenant(),
+    ))
 }
 
 /// Build one retained envelope. `pii_subject = Some(s)` = an inline-PII event sealed under `s`'s
 /// per-subject DEK; `None` = references-not-payloads (no inline PII).
-fn retained(event_id: &str, type_: &str, actor_id: &str, pii_subject: Option<&str>) -> myelin_events::EventEnvelope {
+fn retained(
+    event_id: &str,
+    type_: &str,
+    actor_id: &str,
+    pii_subject: Option<&str>,
+) -> myelin_events::EventEnvelope {
     let (contains, key) = match pii_subject {
         Some(s) => (true, Some(PiiKeyRef(format!("kms://acme/0/subject:{s}")))),
         None => (false, None),
@@ -125,7 +134,10 @@ fn bus_d8_live_store_leg_crypto_shred_renders_inline_pii_unrecoverable_tombstone
     log.append(e4);
 
     let key_u42 = PiiKeyRef("kms://acme/0/subject:u42".into());
-    assert!(shredder.is_live(&key_u42), "precondition: u42's inline-PII DEK is live");
+    assert!(
+        shredder.is_live(&key_u42),
+        "precondition: u42's inline-PII DEK is live"
+    );
 
     // (1) ERASE(u42): crypto-shred the per-subject DEK + emit *.erased tombstones into the outbox.
     let holder = BusHolder::new(tenant(), region(), shredder.clone());
@@ -136,29 +148,53 @@ fn bus_d8_live_store_leg_crypto_shred_renders_inline_pii_unrecoverable_tombstone
         .expect("erase succeeds (KMS reachable)");
 
     // (2) READ the erase-receipt (the SCHED artifact) — the BUS-D8 threshold.
-    assert_eq!(receipt.recoverable_remaining, 0, "BUS-D8: 0 recoverable inline-PII in the live log");
-    assert_eq!(receipt.keys_shredded, 1, "the per-subject DEK was destroyed");
+    assert_eq!(
+        receipt.recoverable_remaining, 0,
+        "BUS-D8: 0 recoverable inline-PII in the live log"
+    );
+    assert_eq!(
+        receipt.keys_shredded, 1,
+        "the per-subject DEK was destroyed"
+    );
     assert_eq!(receipt.tombstones_emitted, 1, "tombstones present");
     // The crypto-shred is REAL: u42's DEK no longer resolves (the live-log ciphertext is dead).
-    assert!(!shredder.is_live(&key_u42), "u42's inline-PII DEK is crypto-shredded — unrecoverable");
+    assert!(
+        !shredder.is_live(&key_u42),
+        "u42's inline-PII DEK is crypto-shredded — unrecoverable"
+    );
     // Per-subject granularity (GD-4): u99 is UNTOUCHED.
-    assert!(shredder.is_live(&PiiKeyRef("kms://acme/0/subject:u99".into())), "u99 untouched");
+    assert!(
+        shredder.is_live(&PiiKeyRef("kms://acme/0/subject:u99".into())),
+        "u99 untouched"
+    );
     // The erased event is tombstoned in the live log (the consumer-degrade signal).
-    assert!(log.is_tombstoned("01J-1"), "the erased event carries a tombstone");
+    assert!(
+        log.is_tombstoned("01J-1"),
+        "the erased event carries a tombstone"
+    );
 
     // (3) RELAY → BROKER → CONSUMER: the relay publishes the tombstone; a live consumer degrades.
     let bus = InProcessBus::new();
     let relay = Relay::new(outbox.clone(), bus.clone(), clock);
     let drain = relay.drain_to_empty();
-    assert!(drain.published >= 1, "the relay published the *.erased tombstone");
+    assert!(
+        drain.published >= 1,
+        "the relay published the *.erased tombstone"
+    );
 
     // The relay publishes each event under its `subject` ArtifactRef; the Bus's tombstones land
     // under `myelin://<tenant>/bus/event/<id>`, so the consumer binds + reads that prefix.
     const TOMBSTONE_PREFIX: &str = "myelin://acme/bus/event";
     let consumer = Consumer::new(
-        DegradingConsumer { seen_tombstones: std::sync::Mutex::new(0) },
-        Subscription::bind(ConsumerName("indexer".into()), &[TOMBSTONE_PREFIX], PrefetchBound::DEFAULT)
-            .expect("bind"),
+        DegradingConsumer {
+            seen_tombstones: std::sync::Mutex::new(0),
+        },
+        Subscription::bind(
+            ConsumerName("indexer".into()),
+            &[TOMBSTONE_PREFIX],
+            PrefetchBound::DEFAULT,
+        )
+        .expect("bind"),
         DedupLedger::new(),
     );
     for envelope in bus.consume(TOMBSTONE_PREFIX) {
@@ -188,8 +224,14 @@ fn bus_d8_live_store_leg_crypto_shred_renders_inline_pii_unrecoverable_tombstone
     }
     let depth_ok = src.assert_signal(SignalName::OutboxDepth, Predicate::Eq(0));
     let dlq_ok = src.assert_signal(SignalName::DeadLetterCount, Predicate::Eq(0));
-    assert!(depth_ok.is_green(), "outbox drained after erasing the subject: {depth_ok:?}");
-    assert!(dlq_ok.is_green(), "no tombstone dead-lettered erasing the subject: {dlq_ok:?}");
+    assert!(
+        depth_ok.is_green(),
+        "outbox drained after erasing the subject: {depth_ok:?}"
+    );
+    assert!(
+        dlq_ok.is_green(),
+        "no tombstone dead-lettered erasing the subject: {dlq_ok:?}"
+    );
 }
 
 /// **BUS-D8 loud-failure leg:** a crypto-shred KMS failure ABORTS the erase as INCOMPLETE (never
@@ -210,9 +252,21 @@ fn bus_d8_crypto_shred_kms_failure_is_loud_never_assumes_erased() {
     let mut outbox = OutboxStore::new();
     let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
 
-    let err = holder.erase("u42", &mut log, &mut outbox, minter).expect_err("loud failure");
+    let err = holder
+        .erase("u42", &mut log, &mut outbox, minter)
+        .expect_err("loud failure");
     assert!(matches!(err, myelin_events::ShredError::KmsUnavailable(_)));
-    assert_eq!(outbox.committed_count(), 0, "no tombstone committed on a failed erase");
-    assert!(!log.is_tombstoned("01J-1"), "not tombstoned on a failed erase");
-    assert!(shredder.is_live(&key_u42), "DEK untouched — the DSR retries (never assume erased)");
+    assert_eq!(
+        outbox.committed_count(),
+        0,
+        "no tombstone committed on a failed erase"
+    );
+    assert!(
+        !log.is_tombstoned("01J-1"),
+        "not tombstoned on a failed erase"
+    );
+    assert!(
+        shredder.is_live(&key_u42),
+        "DEK untouched — the DSR retries (never assume erased)"
+    );
 }

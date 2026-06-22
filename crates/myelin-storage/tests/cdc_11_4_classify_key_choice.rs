@@ -14,10 +14,8 @@
 //! exactly the consumer-driven contract the DSR orchestrator (P-ST-09 / GDPR M1) depends on.
 
 use myelin_gdpr::ErasureMethod;
-use myelin_storage::{
-    key_class_for, ColumnCryptor, DekContentWrap, KeyChoiceError, SubjectId,
-};
-use myelin_storage::{BlobStore, ContentHash, FsBlobStore, KeyClass, KekId, KmsEngine};
+use myelin_storage::{key_class_for, ColumnCryptor, DekContentWrap, KeyChoiceError, SubjectId};
+use myelin_storage::{BlobStore, ContentHash, FsBlobStore, KekId, KeyClass, KmsEngine};
 use myelin_tenancy::{Region, TenantId};
 use std::sync::Arc;
 
@@ -72,7 +70,11 @@ fn cdc_11_4_classify_drives_per_subject_vs_per_tenant_key_choice() {
     for (f, want) in fields.iter().zip(expected.iter()) {
         let got = key_class_for(&f.erasure, f.subject.as_ref())
             .unwrap_or_else(|e| panic!("classify {} failed: {e}", f.name));
-        assert_eq!(&got, want, "11.4: field {} routes to the wrong key class", f.name);
+        assert_eq!(
+            &got, want,
+            "11.4: field {} routes to the wrong key class",
+            f.name
+        );
     }
 }
 
@@ -108,7 +110,11 @@ fn cdc_11_1_encrypted_column_round_trips_and_is_ciphertext_at_rest() {
     // Sealed under the per-subject DEK; ciphertext-at-rest; decrypts back exactly.
     assert_eq!(col.key_ref.class, KeyClass::Subject("u-alice".into()));
     assert!(!col.contains_plaintext(plaintext), "ciphertext-at-rest");
-    assert_eq!(cryptor.plaintext_at_rest_count(), 0, "0 plaintext-at-rest for the tagged column");
+    assert_eq!(
+        cryptor.plaintext_at_rest_count(),
+        0,
+        "0 plaintext-at-rest for the tagged column"
+    );
     assert_eq!(cryptor.decrypt(&col).expect("decrypt"), plaintext);
 }
 

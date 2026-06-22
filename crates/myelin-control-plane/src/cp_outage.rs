@@ -97,8 +97,8 @@ use myelin_substrate::{Answer, Clock, ServeError, StalenessBound, SystemClock};
 use myelin_tenancy::TenantId;
 
 use crate::discover::{DiscoverKey, DiscoveryCache, RouteTuple};
-use crate::placement_of::{CellGateway, GatewayReject, PlacementOf};
 use crate::place::{PlaceError, PlacementAnswer, PlacementService, TokenMinter};
+use crate::placement_of::{CellGateway, GatewayReject, PlacementOf};
 use crate::registry::Registry;
 use crate::schema::IsolationKind;
 
@@ -160,7 +160,9 @@ pub struct ControlPlane {
 impl ControlPlane {
     /// A control plane that is up (reachable).
     pub fn up() -> ControlPlane {
-        ControlPlane { down: Arc::new(AtomicBool::new(false)) }
+        ControlPlane {
+            down: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     /// **Hard-down the control plane (the CP-D4 outage).** Every subsequent CP operation is
@@ -191,7 +193,9 @@ impl ControlPlane {
         ttl_seconds: myelin_substrate::Seconds,
     ) -> Result<Option<RouteTuple>, ServeError> {
         if self.is_down() {
-            return Err(ServeError("control plane hard-down (CP-D4 outage) — unreachable".into()));
+            return Err(ServeError(
+                "control plane hard-down (CP-D4 outage) — unreachable".into(),
+            ));
         }
         Ok(registry.discover(key, ttl_seconds))
     }
@@ -199,7 +203,9 @@ impl ControlPlane {
 
 impl core::fmt::Debug for ControlPlane {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("ControlPlane").field("down", &self.is_down()).finish()
+        f.debug_struct("ControlPlane")
+            .field("down", &self.is_down())
+            .finish()
     }
 }
 
@@ -277,7 +283,11 @@ impl<C: Clock> DataPlane<C> {
     /// Build a data plane for a cell over a fail-static discovery cache. `ttl_seconds` is the route
     /// freshness window; the cache is constructed with the SAME bound the production discovery cache
     /// uses (`static_max ≤` revocation SLA, `≥` agent-token TTL — [`DiscoveryCache::try_new`]).
-    pub fn new(gateway: CellGateway, cache: DiscoveryCache<C>, ttl_seconds: myelin_substrate::Seconds) -> DataPlane<C> {
+    pub fn new(
+        gateway: CellGateway,
+        cache: DiscoveryCache<C>,
+        ttl_seconds: myelin_substrate::Seconds,
+    ) -> DataPlane<C> {
         DataPlane {
             gateway,
             cache,
@@ -317,15 +327,17 @@ impl<C: Clock> DataPlane<C> {
         let key = DiscoverKey::TenantId(tenant.clone());
 
         // 1. Discover the route, fail-static for routing (the mechanism that survives a CP outage).
-        let answer = self
-            .cache
-            .resolve(&key, |k| control_plane.discover(registry, k, self.ttl_seconds));
+        let answer = self.cache.resolve(&key, |k| {
+            control_plane.discover(registry, k, self.ttl_seconds)
+        });
         let via_fail_static = matches!(answer, Answer::Static(_));
         if matches!(answer, Answer::Closed) {
             // No route to serve: the cache is empty/expired AND the CP is unreachable (cold start
             // during the outage), OR the CP authoritatively said "unknown". Correctly fail-closed.
             self.placed_requests_failed.fetch_add(1, Ordering::SeqCst);
-            return Err(ServeFailure::NoRoute { tenant_id: tenant.clone() });
+            return Err(ServeFailure::NoRoute {
+                tenant_id: tenant.clone(),
+            });
         }
 
         // 2. Route at the cell gateway (layer 4) — served IFF this cell homes the tenant. NB the
@@ -335,7 +347,10 @@ impl<C: Clock> DataPlane<C> {
         match self.gateway.route(registry, tenant) {
             Ok(placement) => {
                 self.placed_requests_served.fetch_add(1, Ordering::SeqCst);
-                Ok(Served { placement, via_fail_static })
+                Ok(Served {
+                    placement,
+                    via_fail_static,
+                })
             }
             Err(reject) => {
                 self.placed_requests_failed.fetch_add(1, Ordering::SeqCst);
@@ -381,7 +396,10 @@ pub struct SignupPlane<M: TokenMinter, C: Clock = SystemClock> {
 impl<M: TokenMinter, C: Clock> SignupPlane<M, C> {
     /// Build the signup plane over a placement service.
     pub fn new(service: PlacementService<M, C>) -> SignupPlane<M, C> {
-        SignupPlane { service, signups_degraded: Arc::new(AtomicU64::new(0)) }
+        SignupPlane {
+            service,
+            signups_degraded: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     /// **`signup(control_plane, registry, region, tier, slug)` — place a NEW tenant (architecture
@@ -413,7 +431,10 @@ impl<M: TokenMinter, C: Clock> SignupPlane<M, C> {
         // (signup did not complete), keeping the degrade scope honest.
         match self.service.place(registry, region, requested_tier, slug) {
             Ok(answer) => Ok(answer),
-            Err(PlaceError::NoEligibleCell { region, requested_tier }) => {
+            Err(PlaceError::NoEligibleCell {
+                region,
+                requested_tier,
+            }) => {
                 self.signups_degraded.fetch_add(1, Ordering::SeqCst);
                 Err(SignupDegraded {
                     reason: format!(
@@ -425,7 +446,9 @@ impl<M: TokenMinter, C: Clock> SignupPlane<M, C> {
             }
             Err(PlaceError::Invariant(e)) => {
                 self.signups_degraded.fetch_add(1, Ordering::SeqCst);
-                Err(SignupDegraded { reason: format!("placement invariant rejected the write: {e}") })
+                Err(SignupDegraded {
+                    reason: format!("placement invariant rejected the write: {e}"),
+                })
             }
         }
     }
@@ -466,12 +489,17 @@ impl CpOutageReport {
     /// served every placed request (0 failures) AND at least one signup degraded — otherwise
     /// [`DegradeScope::DataPlaneCascaded`] (a placed request failed → the data plane cascaded, the
     /// gate's red) or [`DegradeScope::None`] (nothing degraded).
-    pub fn compute(placed_requests_served: u64, placed_requests_failed: u64, signups_degraded: u64) -> CpOutageReport {
+    pub fn compute(
+        placed_requests_served: u64,
+        placed_requests_failed: u64,
+        signups_degraded: u64,
+    ) -> CpOutageReport {
         let total = placed_requests_served + placed_requests_failed;
         // Integer percentage; 100 iff 0 failures. `checked_div` yields `None` when no placed-tenant
         // requests were exercised — uptime is then vacuously 100 (nothing to serve).
-        let serving_uptime_pct =
-            (placed_requests_served * 100).checked_div(total).unwrap_or(100) as u8;
+        let serving_uptime_pct = (placed_requests_served * 100)
+            .checked_div(total)
+            .unwrap_or(100) as u8;
         let degrade_scope = if placed_requests_failed > 0 {
             // A placed request failed during the outage → the data plane CASCADED (the gate's red).
             DegradeScope::DataPlaneCascaded
@@ -505,14 +533,19 @@ impl CpOutageReport {
 /// agent-token TTL). Re-used by the drill so the discovery cache's staleness budget is exactly the
 /// production-shaped one.
 pub fn cp_outage_bound() -> StalenessBound {
-    StalenessBound { revocation_sla_secs: 300, agent_token_ttl_secs: 60 }
+    StalenessBound {
+        revocation_sla_secs: 300,
+        agent_token_ttl_secs: 60,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::place::CounterMinter;
-    use crate::schema::{Capacity, Cell, CellStatus, IsolationKind, PlacementStatus, TenantPlacement};
+    use crate::schema::{
+        Capacity, Cell, CellStatus, IsolationKind, PlacementStatus, TenantPlacement,
+    };
     use myelin_substrate::TestClock;
     use myelin_tenancy::{CellId, Region};
 
@@ -522,7 +555,11 @@ mod tests {
             region: Region::new(region),
             status: CellStatus::Active,
             isolation_kind: IsolationKind::Pool,
-            capacity: Capacity { tenants_max: 1000, write_qps_max: 5000, storage_bytes_max: 1 << 40 },
+            capacity: Capacity {
+                tenants_max: 1000,
+                write_qps_max: 5000,
+                storage_bytes_max: 1 << 40,
+            },
             utilisation: 10,
             version: 1,
             endpoint: format!("cell.{region}.{id}.myelin.eu"),
@@ -567,8 +604,13 @@ mod tests {
         let signup = SignupPlane::new(PlacementService::new(CounterMinter::new()));
 
         // ── CP UP: the placed tenant serves (fresh route, primes the cache). ──
-        let s0 = dp.serve(&cp, &reg, &tenant).expect("CP up: the placed tenant serves");
-        assert!(!s0.via_fail_static, "with the CP up the route is fresh, not fail-static");
+        let s0 = dp
+            .serve(&cp, &reg, &tenant)
+            .expect("CP up: the placed tenant serves");
+        assert!(
+            !s0.via_fail_static,
+            "with the CP up the route is fresh, not fail-static"
+        );
         assert_eq!(s0.placement.home_cell.as_str(), "cell-w-1");
 
         // ── HARD-DOWN the control plane (the CP-D4 outage). ──
@@ -578,28 +620,67 @@ mod tests {
         // The cache is past fresh_ttl (age 100 > 30) but inside static_max (300): the route is served
         // FAIL-STATIC — the placed tenant KEEPS SERVING entirely within its cell.
         dp.cache().clock().advance(100);
-        let s1 = dp.serve(&cp, &reg, &tenant).expect("CP down: the placed tenant KEEPS SERVING");
-        assert!(s1.via_fail_static, "with the CP hard-down the route is served fail-static");
-        assert_eq!(s1.placement.home_cell.as_str(), "cell-w-1", "served within its cell");
+        let s1 = dp
+            .serve(&cp, &reg, &tenant)
+            .expect("CP down: the placed tenant KEEPS SERVING");
+        assert!(
+            s1.via_fail_static,
+            "with the CP hard-down the route is served fail-static"
+        );
+        assert_eq!(
+            s1.placement.home_cell.as_str(),
+            "cell-w-1",
+            "served within its cell"
+        );
 
         // SIGNUP degrades (and ONLY signup) — a new tenant cannot be placed while the CP is down.
         let degraded = signup
-            .signup(&cp, &mut reg, &Region::new("eu-west"), IsolationKind::Pool, "newco")
+            .signup(
+                &cp,
+                &mut reg,
+                &Region::new("eu-west"),
+                IsolationKind::Pool,
+                "newco",
+            )
             .expect_err("CP down: signup DEGRADES");
-        assert!(degraded.to_string().contains("control plane hard-down"), "loud: {degraded}");
+        assert!(
+            degraded.to_string().contains("control plane hard-down"),
+            "loud: {degraded}"
+        );
         assert_eq!(signup.signups_degraded(), 1, "exactly one signup degraded");
-        assert_eq!(signup.service().signals().placement_count, 0, "nothing was placed while CP down");
+        assert_eq!(
+            signup.service().signals().placement_count,
+            0,
+            "nothing was placed while CP down"
+        );
 
         // The data plane served every placed-tenant request (0 failures) — the CP-D4 zero.
-        assert_eq!(dp.placed_requests_served(), 2, "both placed-tenant requests served");
-        assert_eq!(dp.placed_requests_failed(), 0, "0 placed-tenant requests failed (the CP-D4 zero)");
+        assert_eq!(
+            dp.placed_requests_served(),
+            2,
+            "both placed-tenant requests served"
+        );
+        assert_eq!(
+            dp.placed_requests_failed(),
+            0,
+            "0 placed-tenant requests failed (the CP-D4 zero)"
+        );
 
         // ── RESTORE: signup works again (the outage is lifted, the system recovers). ──
         cp.restore();
         let placed = signup
-            .signup(&cp, &mut reg, &Region::new("eu-west"), IsolationKind::Pool, "newco")
+            .signup(
+                &cp,
+                &mut reg,
+                &Region::new("eu-west"),
+                IsolationKind::Pool,
+                "newco",
+            )
             .expect("CP restored: signup works again");
-        assert!(placed.tenant_id.as_str().starts_with("01J0CP-"), "a new tenant is placed PII-free");
+        assert!(
+            placed.tenant_id.as_str().starts_with("01J0CP-"),
+            "a new tenant is placed PII-free"
+        );
 
         // The report: 100% serving-uptime, degrade scope signup/provisioning ONLY (the CP-D4 win).
         let report = CpOutageReport::compute(
@@ -609,7 +690,10 @@ mod tests {
         );
         assert!(report.is_cp_d4_win(), "the CP-D4 win: {report:?}");
         assert_eq!(report.serving_uptime_pct, 100);
-        assert_eq!(report.degrade_scope, DegradeScope::SignupAndProvisioningOnly);
+        assert_eq!(
+            report.degrade_scope,
+            DegradeScope::SignupAndProvisioningOnly
+        );
     }
 
     /// **`signups_degraded` counts EACH degrade (not a constant).** Two signups attempted while the
@@ -625,12 +709,22 @@ mod tests {
         for _ in 0..2 {
             assert!(
                 signup
-                    .signup(&cp, &mut reg, &Region::new("eu-west"), IsolationKind::Pool, "newco")
+                    .signup(
+                        &cp,
+                        &mut reg,
+                        &Region::new("eu-west"),
+                        IsolationKind::Pool,
+                        "newco"
+                    )
                     .is_err(),
                 "CP down: signup degrades"
             );
         }
-        assert_eq!(signup.signups_degraded(), 2, "each degrade is counted (not a constant)");
+        assert_eq!(
+            signup.signups_degraded(),
+            2,
+            "each degrade is counted (not a constant)"
+        );
     }
 
     /// **The data plane does NOT touch the control plane on the hot path for a CACHED route (off the
@@ -648,9 +742,17 @@ mod tests {
         // WITHOUT reaching the CP.
         cp.hard_down();
         dp.cache().clock().advance(10);
-        let s = dp.serve(&cp, &reg, &tenant).expect("a fresh cached route serves without the CP");
-        assert!(!s.via_fail_static, "within the TTL the cached route is fresh (the CP was not needed)");
-        assert!(dp.cache().signals().discovery_cache_hit >= 1, "served from the cache");
+        let s = dp
+            .serve(&cp, &reg, &tenant)
+            .expect("a fresh cached route serves without the CP");
+        assert!(
+            !s.via_fail_static,
+            "within the TTL the cached route is fresh (the CP was not needed)"
+        );
+        assert!(
+            dp.cache().signals().discovery_cache_hit >= 1,
+            "served from the cache"
+        );
     }
 
     /// **Past the staleness budget, a NEW request during the outage correctly fails closed (never a
@@ -668,15 +770,31 @@ mod tests {
         cp.hard_down();
         // Past static_max (age 301 > 300): no route to serve → fail-closed (never a fabricated route).
         dp.cache().clock().advance(301);
-        let fail = dp.serve(&cp, &reg, &tenant).expect_err("past the budget routing fails closed");
-        assert!(matches!(fail, ServeFailure::NoRoute { .. }), "no route, correctly fail-closed: {fail}");
-        assert_eq!(dp.placed_requests_failed(), 1, "the past-budget request failed");
+        let fail = dp
+            .serve(&cp, &reg, &tenant)
+            .expect_err("past the budget routing fails closed");
+        assert!(
+            matches!(fail, ServeFailure::NoRoute { .. }),
+            "no route, correctly fail-closed: {fail}"
+        );
+        assert_eq!(
+            dp.placed_requests_failed(),
+            1,
+            "the past-budget request failed"
+        );
 
         // The report reads RED for this run (a placed request failed → the data plane cascaded).
-        let report = CpOutageReport::compute(dp.placed_requests_served(), dp.placed_requests_failed(), 0);
-        assert!(!report.is_cp_d4_win(), "a failed placed request is NOT the CP-D4 win");
+        let report =
+            CpOutageReport::compute(dp.placed_requests_served(), dp.placed_requests_failed(), 0);
+        assert!(
+            !report.is_cp_d4_win(),
+            "a failed placed request is NOT the CP-D4 win"
+        );
         assert_eq!(report.degrade_scope, DegradeScope::DataPlaneCascaded);
-        assert!(report.serving_uptime_pct < 100, "uptime dropped below 100: {report:?}");
+        assert!(
+            report.serving_uptime_pct < 100,
+            "uptime dropped below 100: {report:?}"
+        );
     }
 
     /// **A misroute during a CP outage is a gateway reject, NOT a CP-outage symptom.** The discovery
@@ -730,7 +848,10 @@ mod tests {
         // Nothing degraded (CP up the whole time) → None, not a win (no outage was exercised).
         let none = CpOutageReport::compute(10, 0, 0);
         assert_eq!(none.degrade_scope, DegradeScope::None);
-        assert!(!none.is_cp_d4_win(), "no outage exercised is not a CP-D4 win");
+        assert!(
+            !none.is_cp_d4_win(),
+            "no outage exercised is not a CP-D4 win"
+        );
     }
 
     /// **CDC pair for the fail-static discovery degrade (provider + consumer).** The PROVIDER is the
@@ -755,9 +876,17 @@ mod tests {
         }
         impl GatewayDuringOutage<'_> {
             /// Serve a placed-tenant request; report whether it was served fail-static + its home cell.
-            fn serve_during_outage(&self, tenant: &TenantId) -> Result<(bool, String), ServeFailure> {
-                let served = self.data_plane.serve(self.control_plane, self.registry, tenant)?;
-                Ok((served.via_fail_static, served.placement.home_cell.as_str().to_string()))
+            fn serve_during_outage(
+                &self,
+                tenant: &TenantId,
+            ) -> Result<(bool, String), ServeFailure> {
+                let served = self
+                    .data_plane
+                    .serve(self.control_plane, self.registry, tenant)?;
+                Ok((
+                    served.via_fail_static,
+                    served.placement.home_cell.as_str().to_string(),
+                ))
             }
         }
 
@@ -765,22 +894,34 @@ mod tests {
         let (reg, tenant) = placed_registry();
         let cp = ControlPlane::up();
         let dp = data_plane(TestClock::at(0));
-        dp.serve(&cp, &reg, &tenant).expect("primes the cache (CP up)");
+        dp.serve(&cp, &reg, &tenant)
+            .expect("primes the cache (CP up)");
         cp.hard_down();
         dp.cache().clock().advance(100); // past ttl, inside static_max → fail-static
 
         // CONSUMER: serve the placed tenant while the CP is down → served FAIL-STATIC, within its cell.
-        let consumer = GatewayDuringOutage { data_plane: &dp, control_plane: &cp, registry: &reg };
-        let (via_fail_static, home_cell) =
-            consumer.serve_during_outage(&tenant).expect("the placed tenant serves while the CP is down");
-        assert!(via_fail_static, "the route is served fail-static while the CP is down");
+        let consumer = GatewayDuringOutage {
+            data_plane: &dp,
+            control_plane: &cp,
+            registry: &reg,
+        };
+        let (via_fail_static, home_cell) = consumer
+            .serve_during_outage(&tenant)
+            .expect("the placed tenant serves while the CP is down");
+        assert!(
+            via_fail_static,
+            "the route is served fail-static while the CP is down"
+        );
         assert_eq!(home_cell, "cell-w-1", "served entirely within its cell");
 
         // CONSUMER (the contract's other half): a tenant whose route was never cached, served past the
         // staleness budget during the outage, correctly FAILS CLOSED (never a fabricated route).
         dp.cache().clock().advance(300); // past static_max
         let cold = consumer.serve_during_outage(&tenant);
-        assert!(matches!(cold, Err(ServeFailure::NoRoute { .. })), "past-budget serve fails closed: {cold:?}");
+        assert!(
+            matches!(cold, Err(ServeFailure::NoRoute { .. })),
+            "past-budget serve fails closed: {cold:?}"
+        );
     }
 
     /// The `DataPlane` Debug is PII-free + aggregate-only (the cell id + counters, never a tenant id).
@@ -792,7 +933,10 @@ mod tests {
         dp.serve(&cp, &reg, &tenant).expect("served");
         let dbg = format!("{dp:?}");
         assert!(dbg.contains("cell-w-1"), "shows the cell id: {dbg}");
-        assert!(dbg.contains("placed_requests_served"), "shows the aggregate: {dbg}");
+        assert!(
+            dbg.contains("placed_requests_served"),
+            "shows the aggregate: {dbg}"
+        );
         assert!(!dbg.contains("01J0ACME"), "leaks no tenant id: {dbg}");
     }
 }

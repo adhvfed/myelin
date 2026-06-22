@@ -118,7 +118,10 @@ impl std::fmt::Display for SubjectError {
                 "{field} token `{token}` is empty or contains a `.` (the subject delimiter)"
             ),
             SubjectError::NotAnEventSubject { subject } => {
-                write!(f, "`{subject}` is not an `{SUBJECT_ROOT}.`-rooted event subject")
+                write!(
+                    f,
+                    "`{subject}` is not an `{SUBJECT_ROOT}.`-rooted event subject"
+                )
             }
             SubjectError::WrongTokenCount { subject, tokens } => write!(
                 f,
@@ -244,7 +247,11 @@ impl StreamSubject {
     /// blast-radius unit. A consumer binds a NON-`*` subject under this (the §5 consumer template's
     /// `*`-rejection is unaffected — `>` here is the *stream* filter, not a consumer subscription).
     pub fn stream_filter(&self) -> String {
-        format!("{SUBJECT_ROOT}.{}.{}.>", self.tenant.as_str(), self.subsystem)
+        format!(
+            "{SUBJECT_ROOT}.{}.{}.>",
+            self.tenant.as_str(),
+            self.subsystem
+        )
     }
 
     /// The ordering partition (the aggregate) — `<aggregate_type>:<aggregate_id>` (§2.2/§2.3). All
@@ -289,9 +296,7 @@ fn split_type(type_: &EventType) -> Result<(String, String), SubjectError> {
 /// only, so `ref.<repo>:<ref_name>` style ids survive intact. Both halves must be non-empty.
 fn split_aggregate(aggregate: &AggregateKey) -> Result<(String, String), SubjectError> {
     match aggregate.0.split_once(':') {
-        Some((ty, id)) if !ty.is_empty() && !id.is_empty() => {
-            Ok((ty.to_string(), id.to_string()))
-        }
+        Some((ty, id)) if !ty.is_empty() && !id.is_empty() => Ok((ty.to_string(), id.to_string())),
         _ => Err(SubjectError::MalformedAggregate {
             aggregate: aggregate.0.clone(),
         }),
@@ -443,9 +448,9 @@ mod tests {
         };
         assert_ne!(s_acme.to_subject(), s_globex.to_subject());
         // A cross-tenant stream filter never captures another tenant's subject.
-        assert!(!s_globex.to_subject().starts_with(
-            &s_acme.stream_filter().trim_end_matches('>').to_string()
-        ));
+        assert!(!s_globex
+            .to_subject()
+            .starts_with(&s_acme.stream_filter().trim_end_matches('>').to_string()));
     }
 
     /// Malformed inputs are LOUD, never silently coerced (EI-01 §5).
@@ -480,7 +485,10 @@ mod tests {
         env3.tenant = TenantId("ac.me".into());
         assert!(matches!(
             StreamSubject::of(&env3),
-            Err(SubjectError::BadSubjectToken { field: "tenant", .. })
+            Err(SubjectError::BadSubjectToken {
+                field: "tenant",
+                ..
+            })
         ));
     }
 

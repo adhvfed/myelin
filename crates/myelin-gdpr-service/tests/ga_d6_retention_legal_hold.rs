@@ -63,11 +63,18 @@ fn tenant() -> TenantId {
 }
 
 fn subject(id: &str) -> SubjectRef {
-    SubjectRef::new(Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant()))
+    SubjectRef::new(Principal::stub(
+        PrincipalId(id.into()),
+        PrincipalKind::Human,
+        tenant(),
+    ))
 }
 
 fn subject_scope(s: &str) -> EraseScope {
-    EraseScope::Subject { subject: subject(s), tenant: tenant() }
+    EraseScope::Subject {
+        subject: subject(s),
+        tenant: tenant(),
+    }
 }
 
 fn kms_with_all_holder_keys(base_epoch: u64) -> InMemoryShredKms {
@@ -84,7 +91,10 @@ fn kms_with_all_holder_keys(base_epoch: u64) -> InMemoryShredKms {
     .enumerate()
     {
         kms.provision(
-            ShredKeyHandle { tenant: tenant(), class: ShredKeyClass::Subject((*id).to_string()) },
+            ShredKeyHandle {
+                tenant: tenant(),
+                class: ShredKeyClass::Subject((*id).to_string()),
+            },
             base_epoch + i as u64,
         );
     }
@@ -101,7 +111,12 @@ fn seam_holders(kms: &InMemoryShredKms) -> Vec<(&'static str, SeamHolder<'_>)> {
         holder_ids::BACKUP,
     ]
     .into_iter()
-    .map(|id| (id, SeamHolder::new(id, ShredKeyClass::Subject(id.to_string()), kms)))
+    .map(|id| {
+        (
+            id,
+            SeamHolder::new(id, ShredKeyClass::Subject(id.to_string()), kms),
+        )
+    })
     .collect()
 }
 
@@ -113,7 +128,10 @@ fn ga_d6_retention_engine_legal_hold_suspend_dont_delete() {
     let kms = kms_with_all_holder_keys(1_000);
     let holders = seam_holders(&kms);
     let upstream = UpstreamHolderOrchestrator::register_m1_upstream(
-        holders.iter().map(|(id, h)| (*id, h as &dyn PersonalDataHolder)).collect(),
+        holders
+            .iter()
+            .map(|(id, h)| (*id, h as &dyn PersonalDataHolder))
+            .collect(),
     );
     let holds = LegalHoldRegistry::new();
     let engine = RetentionEngine::new(&holds);
@@ -123,7 +141,11 @@ fn ga_d6_retention_engine_legal_hold_suspend_dont_delete() {
         platform_default(Duration::from_secs(90 * DAY)),
         tenant_window(Duration::from_secs(30 * DAY)),
     ]);
-    assert_eq!(effective.window_secs(), 30 * DAY, "tightest-wins: the tenant 30-day window");
+    assert_eq!(
+        effective.window_secs(),
+        30 * DAY,
+        "tightest-wins: the tenant 30-day window"
+    );
     assert_eq!(
         effective.winning_source,
         RetentionSource::TenantPolicy,
@@ -135,18 +157,34 @@ fn ga_d6_retention_engine_legal_hold_suspend_dont_delete() {
         tenant_delete_immediately(),
         legal_floor(Duration::from_secs(180 * DAY)),
     ]);
-    assert_eq!(floor_won.winning_source, RetentionSource::LegalFloor, "the legal floor won, recorded");
-    assert!(floor_won.floor_clamped, "the floor clamped the tenant delete-immediately UP");
+    assert_eq!(
+        floor_won.winning_source,
+        RetentionSource::LegalFloor,
+        "the legal floor won, recorded"
+    );
+    assert!(
+        floor_won.floor_clamped,
+        "the floor clamped the tenant delete-immediately UP"
+    );
 
     // ── 2. The retention window elapses (Art. 5(1)(e)). ──
     let stored_at = 1_700_000_000;
     let now = stored_at + 30 * DAY; // a month later — the 30-day window has elapsed.
-    assert!(effective.has_elapsed(stored_at, now), "the 30-day window has elapsed");
+    assert!(
+        effective.has_elapsed(stored_at, now),
+        "the 30-day window has elapsed"
+    );
 
     // ── 3. SET A HOLD, then submit the retention-expiry → SUSPENDED (0 held-scope deletions). ──
     let scope = subject_scope("u-d6");
     let checklist = EraseChecklist::new();
-    holds.set(HoldScope::Subject { tenant: "acme".into(), subject: "u-d6".into() }, true);
+    holds.set(
+        HoldScope::Subject {
+            tenant: "acme".into(),
+            subject: "u-d6".into(),
+        },
+        true,
+    );
 
     let deferred = engine.expire(&scope, &upstream, &checklist).unwrap();
     assert_eq!(
@@ -154,15 +192,31 @@ fn ga_d6_retention_engine_legal_hold_suspend_dont_delete() {
         ExpiryOutcome::DeferredUnderHold,
         "the hold-defer receipt — suspend-don't-delete (Art. 17(3)(e))"
     );
-    assert!(!deferred.ran_deletion(), "the expiry did NOT run under the hold");
+    assert!(
+        !deferred.ran_deletion(),
+        "the expiry did NOT run under the hold"
+    );
 
     // THE GA-D6 INVARIANT: 0 held-scope deletions — NOT A SINGLE holder erased under the hold.
     let held_scope_deletions: u32 = holders.iter().map(|(_, h)| h.erase_call_count()).sum();
-    assert_eq!(held_scope_deletions, 0, "0 held-scope deletions (the GA-D6 green artifact value)");
-    assert_eq!(checklist.done_count(), 0, "no holder receipted under the hold");
+    assert_eq!(
+        held_scope_deletions, 0,
+        "0 held-scope deletions (the GA-D6 green artifact value)"
+    );
+    assert_eq!(
+        checklist.done_count(),
+        0,
+        "no holder receipted under the hold"
+    );
 
     // ── 4. LIFT the hold and re-submit the expiry → the deferred deletion RESUMES via §3. ──
-    holds.set(HoldScope::Subject { tenant: "acme".into(), subject: "u-d6".into() }, false);
+    holds.set(
+        HoldScope::Subject {
+            tenant: "acme".into(),
+            subject: "u-d6".into(),
+        },
+        false,
+    );
     let mut expiry_runs = 0u64;
     let resumed = engine.expire(&scope, &upstream, &checklist).unwrap();
     if resumed.ran_deletion() {
@@ -172,8 +226,16 @@ fn ga_d6_retention_engine_legal_hold_suspend_dont_delete() {
         ExpiryOutcome::Expired(r) => r,
         other => panic!("expected Expired on resume, got {other:?}"),
     };
-    assert_eq!(receipts.len(), 6, "the §3 erasure mechanisms ran over every holder on resume");
-    assert_eq!(receipts[0].holder_id, holder_ids::IDENTITY, "Identity FIRST (canonical order)");
+    assert_eq!(
+        receipts.len(),
+        6,
+        "the §3 erasure mechanisms ran over every holder on resume"
+    );
+    assert_eq!(
+        receipts[0].holder_id,
+        holder_ids::IDENTITY,
+        "Identity FIRST (canonical order)"
+    );
     for hr in &receipts {
         assert!(
             hr.receipt.receipt.key_epoch_destroyed.is_some(),
@@ -184,11 +246,18 @@ fn ga_d6_retention_engine_legal_hold_suspend_dont_delete() {
     // every holder erased exactly once across the WHOLE scenario (0 double-erase — the resumable
     // checklist skipped nothing-yet-done and re-drove only on resume).
     for (id, h) in &holders {
-        assert_eq!(h.erase_call_count(), 1, "holder {id} erased exactly once (on resume only)");
+        assert_eq!(
+            h.erase_call_count(),
+            1,
+            "holder {id} erased exactly once (on resume only)"
+        );
     }
 
     // ── 5. The telemetry invariants (observability is part of the pass — EI-01 §3). ──
-    assert_eq!(expiry_runs, 1, "the retention-expiry ran exactly once (on resume)");
+    assert_eq!(
+        expiry_runs, 1,
+        "the retention-expiry ran exactly once (on resume)"
+    );
     assert_eq!(
         RETENTION_HELD_SCOPE_DELETIONS,
         ("gdpr.retention_held_scope_deletions", "count"),

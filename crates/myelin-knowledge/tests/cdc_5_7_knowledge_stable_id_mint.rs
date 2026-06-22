@@ -73,7 +73,8 @@ fn consumer_classifies(r: &ArtifactRef) -> Option<SubKind> {
 #[test]
 fn cdc_5_7_knowledge_provider_mints_consumer_accepts_and_classifies_every_kind() {
     // The registration is accepted by Refs (the one grammar owner).
-    let reg = register_knowledge_sub_kinds().expect("Refs must ACCEPT Knowledge's #sub registration");
+    let reg =
+        register_knowledge_sub_kinds().expect("Refs must ACCEPT Knowledge's #sub registration");
     assert_eq!(reg.subsystem, "knowledge");
     assert_eq!(reg.kinds, KNOWLEDGE_OWNED_SUB_KINDS.to_vec());
 
@@ -138,22 +139,48 @@ fn cdc_5_7_minted_sub_is_stable_across_a_block_move_zero_dangles() {
 
     // Build a tree: root → c1 → nested, plus a sibling c2 to move `nested` under.
     let mut tree = BlockTree::new(PageId(page.into()));
-    tree.insert_root(BlockId("root".into()), "paragraph", jit(0, 0)).unwrap();
-    tree.insert_block(BlockId("c1".into()), &BlockId("root".into()), "paragraph", jit(0, 1)).unwrap();
-    tree.insert_block(BlockId("c2".into()), &BlockId("root".into()), "paragraph", jit(0, 2)).unwrap();
-    tree.insert_block(bid.clone(), &BlockId("c1".into()), "paragraph", jit(0, 0)).unwrap();
+    tree.insert_root(BlockId("root".into()), "paragraph", jit(0, 0))
+        .unwrap();
+    tree.insert_block(
+        BlockId("c1".into()),
+        &BlockId("root".into()),
+        "paragraph",
+        jit(0, 1),
+    )
+    .unwrap();
+    tree.insert_block(
+        BlockId("c2".into()),
+        &BlockId("root".into()),
+        "paragraph",
+        jit(0, 2),
+    )
+    .unwrap();
+    tree.insert_block(bid.clone(), &BlockId("c1".into()), "paragraph", jit(0, 0))
+        .unwrap();
 
     // The editor stored a `#sub` embed of `nested` (the b<id> mint) BEFORE any move.
     let sub_before = mint_block(tenant, page, bid.as_str()).expect("mint before move");
-    let row_before = tree.resolve_sub(&bid).expect("embed resolves before move").clone();
+    let row_before = tree
+        .resolve_sub(&bid)
+        .expect("embed resolves before move")
+        .clone();
 
     // MOVE `nested` from under c1 to under c2 (an order_key + parent_id write; NEVER an id re-mint).
-    tree.move_block(&bid, &BlockId("c2".into()), None, None, jit(3, 3)).unwrap();
+    tree.move_block(&bid, &BlockId("c2".into()), None, None, jit(3, 3))
+        .unwrap();
 
     // The same stable id resolves AFTER the move (0 dangles).
-    let row_after = tree.resolve_sub(&bid).expect("embed STILL resolves after move");
-    assert_eq!(row_after.block_id, row_before.block_id, "block_id stable across the move");
-    assert_ne!(row_after.order_key, row_before.order_key, "the move rewrote the order_key");
+    let row_after = tree
+        .resolve_sub(&bid)
+        .expect("embed STILL resolves after move");
+    assert_eq!(
+        row_after.block_id, row_before.block_id,
+        "block_id stable across the move"
+    );
+    assert_ne!(
+        row_after.order_key, row_before.order_key,
+        "the move rewrote the order_key"
+    );
 
     // And the minted `#sub` is byte-IDENTICAL before and after — the embed never dangles.
     let sub_after = mint_block(tenant, page, bid.as_str()).expect("mint after move");

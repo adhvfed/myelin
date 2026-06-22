@@ -26,7 +26,8 @@
 //! `issue.*` projection EMITTER that feeds the rows at write time is the ISS-P17 follow-on.
 
 use myelin_issues::declares::{
-    issue_facets_projection_spec, register_issue_facets_projection_spec, ISSUE_SUBSYSTEM, ISSUE_TYPE,
+    issue_facets_projection_spec, register_issue_facets_projection_spec, ISSUE_SUBSYSTEM,
+    ISSUE_TYPE,
 };
 use myelin_query::FieldType;
 use myelin_search::{IncrementalIndexer, IndexSpec, MockEmbeddingAdapter, ProjectFetcher};
@@ -54,16 +55,38 @@ fn producer_issues_declares_the_frozen_6_3_shape() {
     assert_eq!(spec.subsystem, "issue");
     assert_eq!(spec.type_, ISSUE_TYPE);
     assert_eq!(spec.type_, "issue");
-    assert_eq!(spec.acl_object_type, "issue", "an issue's reachability is its own ReBAC `view`");
-    assert!(!spec.semantic, "Issues is trigram-title + facet filter in v1, not vector-embedded");
-    assert_eq!(spec.struct_fields.get("state_category"), Some(&FieldType::Select));
+    assert_eq!(
+        spec.acl_object_type, "issue",
+        "an issue's reachability is its own ReBAC `view`"
+    );
+    assert!(
+        !spec.semantic,
+        "Issues is trigram-title + facet filter in v1, not vector-embedded"
+    );
+    assert_eq!(
+        spec.struct_fields.get("state_category"),
+        Some(&FieldType::Select)
+    );
     assert_eq!(spec.struct_fields.get("priority"), Some(&FieldType::Int));
-    assert_eq!(spec.struct_fields.get("assignee"), Some(&FieldType::Principal));
+    assert_eq!(
+        spec.struct_fields.get("assignee"),
+        Some(&FieldType::Principal)
+    );
     assert_eq!(spec.struct_fields.get("type_rank"), Some(&FieldType::Int));
-    assert_eq!(spec.struct_fields.get("project_id"), Some(&FieldType::Relation));
-    assert_eq!(spec.struct_fields.get("cycle_id"), Some(&FieldType::Relation));
+    assert_eq!(
+        spec.struct_fields.get("project_id"),
+        Some(&FieldType::Relation)
+    );
+    assert_eq!(
+        spec.struct_fields.get("cycle_id"),
+        Some(&FieldType::Relation)
+    );
     assert_eq!(spec.struct_fields.get("rank"), Some(&FieldType::OrderKey));
-    assert_eq!(spec.struct_fields.len(), 7, "exactly the seven structured issue facets");
+    assert_eq!(
+        spec.struct_fields.len(),
+        7,
+        "exactly the seven structured issue facets"
+    );
 }
 
 /// **PRODUCER side — the spec serializes to the 6.3 wire shape (0 schema mismatches).** The frozen
@@ -76,7 +99,13 @@ fn producer_spec_serializes_to_the_6_3_wire_shape() {
     keys.sort_unstable();
     assert_eq!(
         keys,
-        vec!["acl_object_type", "semantic", "struct_fields", "subsystem", "type"],
+        vec![
+            "acl_object_type",
+            "semantic",
+            "struct_fields",
+            "subsystem",
+            "type"
+        ],
         "the frozen 6.3 wire key set"
     );
     assert_eq!(obj["subsystem"], serde_json::json!("issue"));
@@ -111,7 +140,10 @@ fn consumer_search_admits_the_spec() {
     );
     // The Issues-side registration helper proves the same admission + returns the accepted spec.
     let accepted: IndexSpec = register_issue_facets_projection_spec();
-    assert_eq!(accepted, spec, "Search accepts the declared spec verbatim (no mutation/rejection)");
+    assert_eq!(
+        accepted, spec,
+        "Search accepts the declared spec verbatim (no mutation/rejection)"
+    );
 }
 
 /// **CONSUMER side — Issues' spec COEXISTS with another subsystem's spec in the same facet union.**

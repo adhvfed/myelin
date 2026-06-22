@@ -27,19 +27,20 @@
 //! fixtures here. CI's REAL producer is EB-27 / M4 — the X-1 seam goes end-to-end (GIT-D10 / CI-D8
 //! re-confirmed against the real producer) at the M4 co-gate. NAMED FLOOR (seam-floor).
 
+use myelin_events::{
+    Actor, CausedBy, CiOverall, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore,
+    Timestamp as EvTs,
+};
+use myelin_flow::{
+    merge_attempt_id, ActivityError, CiDispatch, CiDispatcher, MergeOutcome, MergeRequest,
+    MockCiResultProducer, SignalStore, WfCtx, WfJournal,
+};
 use myelin_git::check_status::{
     CheckContext, CheckState, CheckStatus, CheckStatusProjection, GitOid, HumanisedRef, Timestamp,
     TrustTier,
 };
 use myelin_git::merge_gate::MergeGatePolicy;
 use myelin_git::merge_queue::GitMergePerformer;
-use myelin_flow::{
-    merge_attempt_id, ActivityError, CiDispatch, CiDispatcher, MergeOutcome, MergeRequest,
-    MockCiResultProducer, SignalStore, WfCtx, WfJournal,
-};
-use myelin_events::{
-    Actor, CausedBy, CiOverall, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Timestamp as EvTs,
-};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_storage::reserve_settle::MinorUnits;
 use myelin_tenancy::{ArtifactRef, Region, TenantId};
@@ -70,7 +71,10 @@ fn fact(context: &str, attempt: u32, state: CheckState, trust: TrustTier) -> Che
         run_attempt: attempt,
         trust_tier: trust,
         details_ref: ArtifactRef(format!("myelin://acme/ci/run/{attempt}#step-2")),
-        summary: HumanisedRef { template_key: "ci.check.updated".into(), args: Default::default() },
+        summary: HumanisedRef {
+            template_key: "ci.check.updated".into(),
+            args: Default::default(),
+        },
         started_at: Timestamp("2026-06-22T00:00:00Z".into()),
         completed_at: Some(Timestamp("2026-06-22T00:01:00Z".into())),
         cost_settled: true,
@@ -81,7 +85,11 @@ fn ctx_base() -> EmitContextBase {
     EmitContextBase {
         tenant: tenant(),
         region: region(),
-        actor: Actor(Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, tenant())),
+        actor: Actor(Principal::stub(
+            PrincipalId("p".into()),
+            PrincipalKind::Human,
+            tenant(),
+        )),
         schema_ver: 1,
         occurred_at: EvTs("2026-06-21T00:00:00Z".into()),
         recorded_at: EvTs("2026-06-21T00:00:01Z".into()),
@@ -133,38 +141,60 @@ fn git_d10_full_aggregate_doubly_delivered_ci_result_merges_exactly_once() {
     proj.apply(&fact("build", 2, CheckState::Success, TrustTier::Trusted)); // attempt 2 first
     proj.apply(&fact("build", 1, CheckState::Failure, TrustTier::Trusted)); // stale lower → DROPPED
     proj.apply(&fact("build", 2, CheckState::Success, TrustTier::Trusted)); // duplicate → idempotent
-    // (c) the fork's `test` run self-greened untrusted; a maintainer ENDORSED it.
-    proj.apply(&fact("test", 1, CheckState::Success, TrustTier::UntrustedFork));
+                                                                            // (c) the fork's `test` run self-greened untrusted; a maintainer ENDORSED it.
+    proj.apply(&fact(
+        "test",
+        1,
+        CheckState::Success,
+        TrustTier::UntrustedFork,
+    ));
     let endorsed = vec![CheckContext::ci("test")];
 
     // The synthetic CI rolls up `overall: success` for build+test and DELIVERS IT TWICE (at-least-once).
     let signals = SignalStore::new();
     let producer = MockCiResultProducer::new(&signals, tenant(), region(), RUN);
     let attempt = merge_attempt_id(RUN, "merge.queue:0");
-    let first = producer.deliver(&attempt, HEAD, CiOverall::Success, vec!["ci/build".into(), "ci/test".into()]);
-    let second = producer.deliver(&attempt, HEAD, CiOverall::Success, vec!["ci/build".into(), "ci/test".into()]);
+    let first = producer.deliver(
+        &attempt,
+        HEAD,
+        CiOverall::Success,
+        vec!["ci/build".into(), "ci/test".into()],
+    );
+    let second = producer.deliver(
+        &attempt,
+        HEAD,
+        CiOverall::Success,
+        vec!["ci/build".into(), "ci/test".into()],
+    );
     assert!(first, "first ci.result delivery is new");
-    assert!(!second, "the at-least-once DOUBLE delivery deduped (wf_signal PK)");
-    assert_eq!(signals.buffered_depth(), 1, "ONE buffered ci.result row (woke ONCE)");
+    assert!(
+        !second,
+        "the at-least-once DOUBLE delivery deduped (wf_signal PK)"
+    );
+    assert_eq!(
+        signals.buffered_depth(),
+        1,
+        "ONE buffered ci.result row (woke ONCE)"
+    );
 
     // Git's merge performer: gates on its OWN projection (build trusted + test endorsed → admit).
     let merges = Cell::new(0u32);
-    let merger = GitMergePerformer::new(
-        &proj,
-        GitOid(HEAD.into()),
-        policy(),
-        endorsed,
-        |r| {
-            merges.set(merges.get() + 1);
-            Ok(format!("merged-{}", r.speculative_commit_oid))
-        },
-    );
+    let merger = GitMergePerformer::new(&proj, GitOid(HEAD.into()), policy(), endorsed, |r| {
+        merges.set(merges.get() + 1);
+        Ok(format!("merged-{}", r.speculative_commit_oid))
+    });
 
     let outbox = OutboxStore::new();
     let ci = RecordingCi::default();
     let mut wf = WfCtx::begin(
-        &outbox, minter(), WfJournal::new(), ctx_base(), RUN, "merge.queue",
-        "2026-06-21T00:00:00Z", 42,
+        &outbox,
+        minter(),
+        WfJournal::new(),
+        ctx_base(),
+        RUN,
+        "merge.queue",
+        "2026-06-21T00:00:00Z",
+        42,
     )
     .with_signals(signals);
 
@@ -173,17 +203,35 @@ fn git_d10_full_aggregate_doubly_delivered_ci_result_merges_exactly_once() {
         .expect("dispatch + merge");
 
     match out {
-        MergeOutcome::Merged { merge_attempt_id: id, merged_commit_oid } => {
-            assert_eq!(id, attempt, "CI echoed the no-coordination merge_attempt_id");
+        MergeOutcome::Merged {
+            merge_attempt_id: id,
+            merged_commit_oid,
+        } => {
+            assert_eq!(
+                id, attempt,
+                "CI echoed the no-coordination merge_attempt_id"
+            );
             assert_eq!(merged_commit_oid, "merged-deadbeefcafe");
         }
         other => panic!("expected Merged, got {other:?}"),
     }
     // ── THE GREEN ARTIFACT: merge-count == 1 ──
-    assert_eq!(merges.get(), 1, "GIT-D10 (d): 0 double-merge — merge-count == 1");
-    assert_eq!(wf.consumed_signals().len(), 1, "the doubly-delivered ci.result woke the workflow ONCE");
+    assert_eq!(
+        merges.get(),
+        1,
+        "GIT-D10 (d): 0 double-merge — merge-count == 1"
+    );
+    assert_eq!(
+        wf.consumed_signals().len(),
+        1,
+        "the doubly-delivered ci.result woke the workflow ONCE"
+    );
     assert_eq!(wf.staged_emit_len(), 1, "EXACTLY one git.pr.merged emitted");
-    assert_eq!(ci.calls.load(Ordering::SeqCst), 1, "CI dispatched exactly once");
+    assert_eq!(
+        ci.calls.load(Ordering::SeqCst),
+        1,
+        "CI dispatched exactly once"
+    );
 }
 
 /// **GIT-D10 (b): a fork self-greened required context → the merge is REFUSED → the PR is DEQUEUED; 0
@@ -194,14 +242,24 @@ fn git_d10_full_aggregate_doubly_delivered_ci_result_merges_exactly_once() {
 fn git_d10_b_fork_self_green_is_neutral_dequeues() {
     let mut proj = CheckStatusProjection::new();
     proj.apply(&fact("build", 1, CheckState::Success, TrustTier::Trusted));
-    proj.apply(&fact("test", 1, CheckState::Success, TrustTier::UntrustedFork)); // fork, NOT endorsed
+    proj.apply(&fact(
+        "test",
+        1,
+        CheckState::Success,
+        TrustTier::UntrustedFork,
+    )); // fork, NOT endorsed
 
     let signals = SignalStore::new();
     let producer = MockCiResultProducer::new(&signals, tenant(), region(), RUN);
     let attempt = merge_attempt_id(RUN, "merge.queue:0");
     // CI rolls up `overall: success` (the fork's pipeline reported green) — the rollup is coarse; Git's
     // per-context trust gate is the authority.
-    producer.deliver(&attempt, HEAD, CiOverall::Success, vec!["ci/build".into(), "ci/test".into()]);
+    producer.deliver(
+        &attempt,
+        HEAD,
+        CiOverall::Success,
+        vec!["ci/build".into(), "ci/test".into()],
+    );
 
     let merges = Cell::new(0u32);
     let merger = GitMergePerformer::new(
@@ -218,8 +276,14 @@ fn git_d10_b_fork_self_green_is_neutral_dequeues() {
     let outbox = OutboxStore::new();
     let ci = RecordingCi::default();
     let mut wf = WfCtx::begin(
-        &outbox, minter(), WfJournal::new(), ctx_base(), RUN, "merge.queue",
-        "2026-06-21T00:00:00Z", 42,
+        &outbox,
+        minter(),
+        WfJournal::new(),
+        ctx_base(),
+        RUN,
+        "merge.queue",
+        "2026-06-21T00:00:00Z",
+        42,
     )
     .with_signals(signals);
 
@@ -231,12 +295,23 @@ fn git_d10_b_fork_self_green_is_neutral_dequeues() {
         MergeOutcome::Dequeued { reason } => {
             // The flow body humanises a refused merge as a "could not be completed" dequeue.
             assert!(!reason.is_empty(), "humanised dequeue reason");
-            assert!(!reason.contains("Blocked"), "no raw gate struct in the reason: {reason}");
+            assert!(
+                !reason.contains("Blocked"),
+                "no raw gate struct in the reason: {reason}"
+            );
         }
         other => panic!("expected Dequeued (a fork self-green must not merge), got {other:?}"),
     }
-    assert_eq!(merges.get(), 0, "GIT-D10 (b): 0 forks self-green their gate — merge-count == 0");
-    assert_eq!(wf.staged_emit_len(), 0, "no git.pr.merged on a refused fork merge");
+    assert_eq!(
+        merges.get(),
+        0,
+        "GIT-D10 (b): 0 forks self-green their gate — merge-count == 0"
+    );
+    assert_eq!(
+        wf.staged_emit_len(),
+        0,
+        "no git.pr.merged on a refused fork merge"
+    );
 }
 
 /// **GIT-D10 (c): the maintainer endorsement flips the gate green → MERGE (merge-count == 1).** The SAME
@@ -245,12 +320,22 @@ fn git_d10_b_fork_self_green_is_neutral_dequeues() {
 fn git_d10_c_maintainer_endorsement_flips_the_gate_green() {
     let mut proj = CheckStatusProjection::new();
     proj.apply(&fact("build", 1, CheckState::Success, TrustTier::Trusted));
-    proj.apply(&fact("test", 1, CheckState::Success, TrustTier::UntrustedFork));
+    proj.apply(&fact(
+        "test",
+        1,
+        CheckState::Success,
+        TrustTier::UntrustedFork,
+    ));
 
     let signals = SignalStore::new();
     let producer = MockCiResultProducer::new(&signals, tenant(), region(), RUN);
     let attempt = merge_attempt_id(RUN, "merge.queue:0");
-    producer.deliver(&attempt, HEAD, CiOverall::Success, vec!["ci/build".into(), "ci/test".into()]);
+    producer.deliver(
+        &attempt,
+        HEAD,
+        CiOverall::Success,
+        vec!["ci/build".into(), "ci/test".into()],
+    );
 
     let merges = Cell::new(0u32);
     let merger = GitMergePerformer::new(
@@ -267,16 +352,29 @@ fn git_d10_c_maintainer_endorsement_flips_the_gate_green() {
     let outbox = OutboxStore::new();
     let ci = RecordingCi::default();
     let mut wf = WfCtx::begin(
-        &outbox, minter(), WfJournal::new(), ctx_base(), RUN, "merge.queue",
-        "2026-06-21T00:00:00Z", 42,
+        &outbox,
+        minter(),
+        WfJournal::new(),
+        ctx_base(),
+        RUN,
+        "merge.queue",
+        "2026-06-21T00:00:00Z",
+        42,
     )
     .with_signals(signals);
 
     let out = wf
         .run_merge_attempt(&request(), &ci, &merger, None, MinorUnits(0), vec![])
         .expect("dispatch + merge");
-    assert!(matches!(out, MergeOutcome::Merged { .. }), "endorsed fork → merge, got {out:?}");
-    assert_eq!(merges.get(), 1, "GIT-D10 (c): the endorsement flips green — merge-count == 1");
+    assert!(
+        matches!(out, MergeOutcome::Merged { .. }),
+        "endorsed fork → merge, got {out:?}"
+    );
+    assert_eq!(
+        merges.get(),
+        1,
+        "GIT-D10 (c): the endorsement flips green — merge-count == 1"
+    );
 }
 
 /// **The no-cross-sync-cycle lint is GREEN over Git's merge-queue source.** Git makes 0 synchronous

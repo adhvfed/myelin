@@ -79,13 +79,23 @@ fn open_pr_with_closes_trailer_then_merge_emits_exactly_one_closes_edge() {
     let source = git_pr_ref("acme", "repo7", 42);
 
     // 1. open the PR (the lifecycle entity). Its merge-commit message carries a `Closes ENG-1` trailer.
-    let mut pr = PullRequest::open(42, "refs/heads/main", "refs/heads/feature", "psn:alice", false);
+    let mut pr = PullRequest::open(
+        42,
+        "refs/heads/main",
+        "refs/heads/feature",
+        "psn:alice",
+        false,
+    );
     assert_eq!(pr.state, PrState::Open);
     let merge_message = "Land the charge fix\n\nReviewed and tested.\nCloses ENG-1\n";
 
     // 2. parse the trailer (structured — a prose `closes` would not match).
     let issue_keys = parse_closes_trailers(merge_message);
-    assert_eq!(issue_keys, vec!["ENG-1".to_string()], "exactly the one trailer key");
+    assert_eq!(
+        issue_keys,
+        vec!["ENG-1".to_string()],
+        "exactly the one trailer key"
+    );
     let closes_targets: Vec<ArtifactRef> = issue_keys
         .iter()
         .map(|k| ArtifactRef(format!("myelin://acme/issue/issue/{k}")))
@@ -94,7 +104,10 @@ fn open_pr_with_closes_trailer_then_merge_emits_exactly_one_closes_edge() {
     // 3. advance the PR lifecycle to Merged (gate satisfied) and, in the SAME outbox transaction as the
     //    git.pr.merged event, emit the lifecycle edges. The PR state change + the merge event + the
     //    lifecycle edges co-commit.
-    assert_eq!(pr.transition(PrTransition::Merge, true).unwrap(), PrState::Merged);
+    assert_eq!(
+        pr.transition(PrTransition::Merge, true).unwrap(),
+        PrState::Merged
+    );
     let ev = merged_event(&source);
     let mut tx = outbox.begin(Arc::clone(&minter), ctx_base());
     tx.stage_state_change("git pr 42 merged");
@@ -102,28 +115,56 @@ fn open_pr_with_closes_trailer_then_merge_emits_exactly_one_closes_edge() {
         .expect("the lifecycle edges emit");
 
     // exactly one closes edge (0 dup, 0 missed).
-    assert_eq!(edge_ids.len(), 1, "one Closes trailer → exactly one closes edge");
+    assert_eq!(
+        edge_ids.len(),
+        1,
+        "one Closes trailer → exactly one closes edge"
+    );
 
     // before commit nothing is durable (emit-iff-committed).
     assert_eq!(outbox.committed_count(), 0, "nothing durable before commit");
-    tx.commit().expect("the merge + the lifecycle edge co-commit");
-    assert_eq!(outbox.committed_count(), 1, "the closes edge co-committed with the merge");
+    tx.commit()
+        .expect("the merge + the lifecycle edge co-commit");
+    assert_eq!(
+        outbox.committed_count(),
+        1,
+        "the closes edge co-committed with the merge"
+    );
 
     // 4. assert the EXACT lifecycle edge the trailer produced.
     let env = outbox.row(&edge_ids[0]).unwrap().envelope;
-    assert_eq!(env.type_.0, "refs.edge.created", "the lifecycle edge is a refs.edge.created");
+    assert_eq!(
+        env.type_.0, "refs.edge.created",
+        "the lifecycle edge is a refs.edge.created"
+    );
     assert_eq!(env.payload["rel"], "closes", "the trailer → a closes edge");
-    assert_eq!(env.payload["rel_class"], "lifecycle", "a typed-edge mirror edge is lifecycle-class");
-    assert_eq!(env.payload["source"], source.0, "the source is the merged PR URN");
-    assert_eq!(env.payload["target"], "myelin://acme/issue/issue/ENG-1", "the target is the issue URN");
+    assert_eq!(
+        env.payload["rel_class"], "lifecycle",
+        "a typed-edge mirror edge is lifecycle-class"
+    );
+    assert_eq!(
+        env.payload["source"], source.0,
+        "the source is the merged PR URN"
+    );
+    assert_eq!(
+        env.payload["target"], "myelin://acme/issue/issue/ENG-1",
+        "the target is the issue URN"
+    );
     // the edge inherits the merge event's correlation root (causality correct-by-construction).
-    assert_eq!(env.correlation_id, ev.correlation_id, "the edge carries the merge's correlation root");
+    assert_eq!(
+        env.correlation_id, ev.correlation_id,
+        "the edge carries the merge's correlation root"
+    );
     assert_eq!(
         env.causation_id.as_ref().map(|c| &c.0),
         Some(&ev.event_id.0),
         "the edge's causation is the merge event"
     );
-    assert_eq!(env.depth, ev.depth + 1, "the edge is depth+1 (the loop-guard stamp)");
+    assert_eq!(
+        env.depth,
+        ev.depth + 1,
+        "the edge is depth+1 (the loop-guard stamp)"
+    );
 }
 
 /// **Emit-iff-committed: an ABORTED merge produces ZERO lifecycle edges (no edge without its committed
@@ -144,7 +185,11 @@ fn aborted_merge_emits_zero_lifecycle_edges() {
         assert_eq!(ids.len(), 1, "one edge was buffered");
         // DROP the transaction without committing (the abort).
     }
-    assert_eq!(outbox.committed_count(), 0, "an aborted merge commits 0 rows (no ghost lifecycle edge)");
+    assert_eq!(
+        outbox.committed_count(),
+        0,
+        "an aborted merge commits 0 rows (no ghost lifecycle edge)"
+    );
 }
 
 /// **A merge whose message has NO trailer and NO PR-link produces ZERO lifecycle edges** (the no-op
@@ -166,5 +211,9 @@ fn plain_merge_without_trailer_or_link_emits_zero_edges() {
     let ids = emit_lifecycle_edges(&mut tx, &source, &[], &[], &ev).unwrap();
     tx.commit().unwrap();
     assert!(ids.is_empty(), "a plain merge produces 0 lifecycle edges");
-    assert_eq!(outbox.committed_count(), 0, "no lifecycle edge rows committed");
+    assert_eq!(
+        outbox.committed_count(),
+        0,
+        "no lifecycle edge rows committed"
+    );
 }

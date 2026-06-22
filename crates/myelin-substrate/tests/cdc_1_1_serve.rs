@@ -15,9 +15,10 @@
 
 use myelin_events::relay::InProcessBus;
 use myelin_events::{
-    Actor, AggregateKey, ArtifactRef, Consumer, ConsumerName, DataRole, DedupLedger, EmitContextBase,
-    EventDraft, EventEnvelope, EventHandler, EventType, HandleOutcome, IdMinter, MonotonicMinter,
-    OutboxStore, OutboxTx, PrefetchBound, SubjectPattern, Subscription, Timestamp, Visibility,
+    Actor, AggregateKey, ArtifactRef, Consumer, ConsumerName, DataRole, DedupLedger,
+    EmitContextBase, EventDraft, EventEnvelope, EventHandler, EventType, HandleOutcome, IdMinter,
+    MonotonicMinter, OutboxStore, OutboxTx, PrefetchBound, SubjectPattern, Subscription, Timestamp,
+    Visibility,
 };
 use myelin_harness::{Predicate, SignalName, SignalSource};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
@@ -49,7 +50,11 @@ fn ctx_base() -> EmitContextBase {
     EmitContextBase {
         tenant: myelin_tenancy::TenantId("acme".into()),
         region: myelin_tenancy::Region("eu-west".into()),
-        actor: Actor(Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, myelin_tenancy::TenantId("acme".into()))),
+        actor: Actor(Principal::stub(
+            PrincipalId("p".into()),
+            PrincipalKind::Human,
+            myelin_tenancy::TenantId("acme".into()),
+        )),
         schema_ver: 1,
         occurred_at: Timestamp("2026-06-19T00:00:00Z".into()),
         recorded_at: Timestamp("2026-06-19T00:00:01Z".into()),
@@ -113,7 +118,10 @@ fn cdc_1_1_hello_world_main_boots_emits_consumes_drains_and_emits_signals() {
     );
     assert_eq!(
         handle.registered_holders(),
-        &[HolderRegistration { kind: StoreKind::Oltp, name: "hello" }],
+        &[HolderRegistration {
+            kind: StoreKind::Oltp,
+            name: "hello"
+        }],
         "the opened store auto-registered as a holder (§3.4)"
     );
 
@@ -127,7 +135,11 @@ fn cdc_1_1_hello_world_main_boots_emits_consumes_drains_and_emits_signals() {
     // serve one tick: the relay publishes the event + the consumer processes it.
     let delivered = handle.tick();
     assert_eq!(delivered, vec![(ConsumerName("indexer".into()), 1)]);
-    assert_eq!(runs.load(Ordering::SeqCst), 1, "the consumer processed the event exactly once");
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "the consumer processed the event exactly once"
+    );
 
     // graceful drain.
     handle.signal_drain();
@@ -142,13 +154,16 @@ fn cdc_1_1_hello_world_main_boots_emits_consumes_drains_and_emits_signals() {
     src.set_labelled(
         SignalName::ConsumerLag,
         vec![myelin_harness::Label::new("consumer", "indexer")],
-        t.consumer_lag("indexer").expect("the indexer consumer's lag is exported"),
+        t.consumer_lag("indexer")
+            .expect("the indexer consumer's lag is exported"),
     );
 
     // outbox drained to 0 (nothing committed left unpublished — the SUB-D1 zero, read via serve).
-    src.assert_signal(SignalName::OutboxDepth, Predicate::Eq(0)).expect_green();
+    src.assert_signal(SignalName::OutboxDepth, Predicate::Eq(0))
+        .expect_green();
     // no dead letters on the happy path.
-    src.assert_signal(SignalName::DeadLetterCount, Predicate::Eq(0)).expect_green();
+    src.assert_signal(SignalName::DeadLetterCount, Predicate::Eq(0))
+        .expect_green();
     // the consumer fully caught up (rule 7 lag recovered to 0).
     src.assert_labelled(
         SignalName::ConsumerLag,

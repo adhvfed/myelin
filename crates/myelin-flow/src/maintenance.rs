@@ -242,7 +242,10 @@ impl WfCtx {
         // A heavy maintenance op is a unified-runner job (kind=ci — it runs on the CI runner pool's
         // batch lane, not an agent lane). The dispatch + park + idempotent completion is the existing
         // §4.9 idiom — no new primitive. The job target carries the op + the opaque repo descriptor.
-        let spec = JobSpec::new(JobKind::Ci, format!("maintenance:{}:{}", op.as_str(), target.into()));
+        let spec = JobSpec::new(
+            JobKind::Ci,
+            format!("maintenance:{}:{}", op.as_str(), target.into()),
+        );
         self.schedule_and_run_job(spec, runner, timeout_secs)
     }
 
@@ -299,7 +302,10 @@ pub fn maintenance_step_marker(op: MaintenanceOp, step_index: usize) -> myelin_r
 /// token recording WHICH trust-scoped namespace was invalidated, so the fan-out's journal attributes
 /// each step. Exposed so a consumer fixture can reconstruct the same marker.
 pub fn invalidation_marker(namespace: CacheNamespace) -> myelin_refs::ArtifactRef {
-    myelin_refs::ArtifactRef(format!("history-rewrite:invalidated:{}", namespace.as_str()))
+    myelin_refs::ArtifactRef(format!(
+        "history-rewrite:invalidated:{}",
+        namespace.as_str()
+    ))
 }
 
 #[cfg(test)]
@@ -350,7 +356,11 @@ mod tests {
             7,
         )
     }
-    fn resume(outbox: &OutboxStore, journal: WfJournal, history: Vec<crate::schema::WfHistoryRow>) -> WfCtx {
+    fn resume(
+        outbox: &OutboxStore,
+        journal: WfJournal,
+        history: Vec<crate::schema::WfHistoryRow>,
+    ) -> WfCtx {
         WfCtx::resume(
             outbox,
             minter(),
@@ -420,13 +430,17 @@ mod tests {
             .run_maintenance(MaintenanceOp::Repack, 8, &performer)
             .expect("the repack runs");
         assert_eq!(ran, 8, "all 8 steps ran live this drive");
-        assert_eq!(*performer.steps.lock().unwrap(), vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(
+            *performer.steps.lock().unwrap(),
+            vec![0, 1, 2, 3, 4, 5, 6, 7]
+        );
         ctx.commit().expect("co-commit the journaled steps");
 
         let hist = journal.history_for(&tenant(), "R1");
         assert_eq!(hist.len(), 8, "8 journaled activity_completed rows");
         assert!(
-            hist.iter().all(|r| r.kind == history_kind::ACTIVITY_COMPLETED),
+            hist.iter()
+                .all(|r| r.kind == history_kind::ACTIVITY_COMPLETED),
             "each step is a journaled activity"
         );
         assert_eq!(
@@ -448,9 +462,12 @@ mod tests {
         // DRIVE 1: run a 3-step prefix (the worker journaled 3 steps, then crashed).
         let performer1 = RecordingPerformer::default();
         let mut c1 = begin(&outbox, journal.clone());
-        let ran1 = c1.run_maintenance(MaintenanceOp::Repack, 3, &performer1).expect("drive 1");
+        let ran1 = c1
+            .run_maintenance(MaintenanceOp::Repack, 3, &performer1)
+            .expect("drive 1");
         assert_eq!(ran1, 3, "3 steps ran before the crash");
-        c1.commit().expect("the 3 steps co-commit (durable before the crash)");
+        c1.commit()
+            .expect("the 3 steps co-commit (durable before the crash)");
         assert_eq!(*performer1.steps.lock().unwrap(), vec![0, 1, 2]);
         let history = journal.history_for(&tenant(), "R1");
         assert_eq!(history.len(), 3, "3 journaled at the crash point");
@@ -458,9 +475,14 @@ mod tests {
         // DRIVE 2 (re-drive): the FULL 8-step body. Steps 0..=2 replay (short-circuit), 3..=7 run live.
         let performer2 = RecordingPerformer::default();
         let mut c2 = resume(&outbox, journal.clone(), history);
-        let ran2 = c2.run_maintenance(MaintenanceOp::Repack, 8, &performer2).expect("the resume drive");
+        let ran2 = c2
+            .run_maintenance(MaintenanceOp::Repack, 8, &performer2)
+            .expect("the resume drive");
 
-        assert_eq!(ran2, 5, "resumed at step 3 — only steps 3..=7 ran live (5 steps)");
+        assert_eq!(
+            ran2, 5,
+            "resumed at step 3 — only steps 3..=7 ran live (5 steps)"
+        );
         assert_eq!(
             *performer2.steps.lock().unwrap(),
             vec![3, 4, 5, 6, 7],
@@ -472,7 +494,11 @@ mod tests {
             "0 re-executed side effect — the journaled prefix's perform_step was NEVER called"
         );
         c2.commit().expect("co-commit the resumed tail");
-        assert_eq!(journal.history_for(&tenant(), "R1").len(), 8, "8 journaled, 0 lost, 0 duplicate");
+        assert_eq!(
+            journal.history_for(&tenant(), "R1").len(),
+            8,
+            "8 journaled, 0 lost, 0 duplicate"
+        );
     }
 
     /// **The history-rewrite invalidation fan-out is a journaled sequence (§6.6, contract 11.2).** The
@@ -491,7 +517,11 @@ mod tests {
         assert_eq!(invalidated, 3, "all 3 namespaces invalidated live");
         assert_eq!(
             *performer.namespaces.lock().unwrap(),
-            vec![CacheNamespace::Fork, CacheNamespace::Mirror, CacheNamespace::CloneBundle],
+            vec![
+                CacheNamespace::Fork,
+                CacheNamespace::Mirror,
+                CacheNamespace::CloneBundle
+            ],
             "the fan-out visits the trust-scoped namespaces in the FROZEN order"
         );
         ctx.commit().expect("co-commit the fan-out");
@@ -532,7 +562,10 @@ mod tests {
             .run_history_rewrite_invalidation(&CacheNamespace::FANOUT_ORDER, &performer2)
             .expect("the resume drive");
 
-        assert_eq!(n2, 2, "resumed from Mirror — only Mirror + CloneBundle ran live");
+        assert_eq!(
+            n2, 2,
+            "resumed from Mirror — only Mirror + CloneBundle ran live"
+        );
         assert_eq!(
             *performer2.namespaces.lock().unwrap(),
             vec![CacheNamespace::Mirror, CacheNamespace::CloneBundle],
@@ -544,7 +577,11 @@ mod tests {
             "0 re-invalidation — the already-purged Fork scope's invalidate was NEVER re-called"
         );
         c2.commit().expect("co-commit the resumed fan-out tail");
-        assert_eq!(journal.history_for(&tenant(), "R1").len(), 3, "3 journaled, 0 duplicate");
+        assert_eq!(
+            journal.history_for(&tenant(), "R1").len(),
+            3,
+            "3 journaled, 0 duplicate"
+        );
     }
 
     /// **A failed maintenance step RETRIES (the step is an ordinary activity, §4.4).** Step 2 fails
@@ -564,11 +601,23 @@ mod tests {
             .run_maintenance(MaintenanceOp::Gc, 4, &performer)
             .expect("the gc runs despite a transient failure");
         assert_eq!(ran, 4, "all 4 steps complete (step 2 retried)");
-        assert_eq!(*performer.steps.lock().unwrap(), vec![0, 1, 2, 3], "step 2 succeeded on retry");
+        assert_eq!(
+            *performer.steps.lock().unwrap(),
+            vec![0, 1, 2, 3],
+            "step 2 succeeded on retry"
+        );
         // 4 steps + 1 retry of step 2 = 5 perform_step calls.
-        assert_eq!(performer.step_calls.load(Ordering::SeqCst), 5, "one retry of step 2");
+        assert_eq!(
+            performer.step_calls.load(Ordering::SeqCst),
+            5,
+            "one retry of step 2"
+        );
         ctx.commit().expect("co-commit");
-        assert_eq!(journal.history_for(&tenant(), "R1").len(), 4, "step 2 journaled exactly once");
+        assert_eq!(
+            journal.history_for(&tenant(), "R1").len(),
+            4,
+            "step 2 journaled exactly once"
+        );
     }
 
     /// **A heavy maintenance op rides the `SCHEDULE_AND_RUN_JOB` long-park (§6.6/§4.9).** A repack
@@ -590,13 +639,24 @@ mod tests {
                 Ok(())
             }
         }
-        let runner = AcceptingRunner { dispatched: Mutex::new(Vec::new()) };
+        let runner = AcceptingRunner {
+            dispatched: Mutex::new(Vec::new()),
+        };
 
         let mut ctx = begin(&outbox, journal).with_signals(signals);
         let out = ctx
-            .run_heavy_maintenance(MaintenanceOp::Repack, "repo://acme/giant", &runner, Some(7200))
+            .run_heavy_maintenance(
+                MaintenanceOp::Repack,
+                "repo://acme/giant",
+                &runner,
+                Some(7200),
+            )
             .expect("dispatch + park");
-        assert_eq!(out, JobOutcome::Parked, "the heavy repack parks on job.done (holds no runtime)");
+        assert_eq!(
+            out,
+            JobOutcome::Parked,
+            "the heavy repack parks on job.done (holds no runtime)"
+        );
         assert!(ctx.parked_on_signal(), "the run is waiting on the runner");
         let dispatched = runner.dispatched.lock().unwrap();
         assert_eq!(dispatched.len(), 1, "one heavy job dispatched");
@@ -604,7 +664,11 @@ mod tests {
             dispatched[0].target, "maintenance:repack:repo://acme/giant",
             "the job target carries the op + the opaque repo descriptor"
         );
-        assert_eq!(dispatched[0].kind, JobKind::Ci, "a heavy maintenance job runs on the CI batch lane");
+        assert_eq!(
+            dispatched[0].kind,
+            JobKind::Ci,
+            "a heavy maintenance job runs on the CI batch lane"
+        );
     }
 
     /// The op / namespace machine tokens are stable (no PII; the journaled markers depend on them).
@@ -617,6 +681,10 @@ mod tests {
         assert_eq!(CacheNamespace::Fork.as_str(), "fork");
         assert_eq!(CacheNamespace::Mirror.as_str(), "mirror");
         assert_eq!(CacheNamespace::CloneBundle.as_str(), "clone-bundle");
-        assert_eq!(CacheNamespace::FANOUT_ORDER.len(), 3, "the three trust-scoped namespaces");
+        assert_eq!(
+            CacheNamespace::FANOUT_ORDER.len(),
+            3,
+            "the three trust-scoped namespaces"
+        );
     }
 }

@@ -15,7 +15,7 @@
 use myelin_gdpr::ErasureMethod;
 use myelin_lints::lints::no_untagged_personal_data;
 use myelin_storage::{
-    BlobStore, ColumnCryptor, DekContentWrap, FsBlobStore, KeyClass, KekId, KmsEngine, SubjectId,
+    BlobStore, ColumnCryptor, DekContentWrap, FsBlobStore, KekId, KeyClass, KmsEngine, SubjectId,
 };
 use myelin_tenancy::{Region, TenantId};
 use std::sync::Arc;
@@ -148,8 +148,14 @@ fn gate_leg2_and_3_classify_drives_key_choice_zero_plaintext_at_rest() {
     );
 
     // Both columns + the blob round-trip back to the exact plaintext (no data loss).
-    assert_eq!(cryptor.decrypt(&subject_col).expect("subject decrypt"), subject_plain);
-    assert_eq!(cryptor.decrypt(&bulk_col).expect("bulk decrypt"), bulk_plain);
+    assert_eq!(
+        cryptor.decrypt(&subject_col).expect("subject decrypt"),
+        subject_plain
+    );
+    assert_eq!(
+        cryptor.decrypt(&bulk_col).expect("bulk decrypt"),
+        bulk_plain
+    );
 
     // (3) THE telemetry the GATE asserts: plaintext_at_rest_count == 0 for tagged columns.
     let plaintext_at_rest = cryptor.plaintext_at_rest_count();

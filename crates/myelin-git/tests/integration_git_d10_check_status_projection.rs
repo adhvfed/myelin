@@ -41,12 +41,7 @@ fn admin_url() -> String {
 
 /// The SYNTHETIC `ci.check.updated` fact (CI's real producer is EB-27/M4). One commit; vary the
 /// context, attempt, state, trust to drive the supersession + the gate.
-fn fact(
-    context: &str,
-    attempt: u32,
-    state: CheckState,
-    trust: TrustTier,
-) -> CheckStatus {
+fn fact(context: &str, attempt: u32, state: CheckState, trust: TrustTier) -> CheckStatus {
     let mut args = BTreeMap::new();
     args.insert("context".to_string(), context.to_string());
     CheckStatus {
@@ -60,7 +55,10 @@ fn fact(
         run_attempt: attempt,
         trust_tier: trust,
         details_ref: ArtifactRef(format!("myelin://{TENANT}/ci/run/{attempt}#step-2")),
-        summary: HumanisedRef { template_key: "ci.check.updated".into(), args },
+        summary: HumanisedRef {
+            template_key: "ci.check.updated".into(),
+            args,
+        },
         started_at: Timestamp("2026-06-22T00:00:00Z".into()),
         completed_at: Some(Timestamp("2026-06-22T00:01:00Z".into())),
         cost_settled: true,
@@ -115,41 +113,56 @@ async fn check_status_supersession_holds_one_current_row_per_key() {
 
     // build#1 (failure) — seeds the row.
     assert_eq!(
-        proj.apply(&event_id("build", 1), &fact("build", 1, CheckState::Failure, TrustTier::Trusted))
-            .await
-            .unwrap(),
+        proj.apply(
+            &event_id("build", 1),
+            &fact("build", 1, CheckState::Failure, TrustTier::Trusted)
+        )
+        .await
+        .unwrap(),
         StoreApplyOutcome::Superseded
     );
     // test#1 (success) — a DISTINCT context → a second row on the same commit.
     assert_eq!(
-        proj.apply(&event_id("test", 1), &fact("test", 1, CheckState::Success, TrustTier::Trusted))
-            .await
-            .unwrap(),
+        proj.apply(
+            &event_id("test", 1),
+            &fact("test", 1, CheckState::Success, TrustTier::Trusted)
+        )
+        .await
+        .unwrap(),
         StoreApplyOutcome::Superseded
     );
     // build#2 (re-run, success) — supersedes build#1 IN PLACE (the >= rule).
     assert_eq!(
-        proj.apply(&event_id("build", 2), &fact("build", 2, CheckState::Success, TrustTier::Trusted))
-            .await
-            .unwrap(),
+        proj.apply(
+            &event_id("build", 2),
+            &fact("build", 2, CheckState::Success, TrustTier::Trusted)
+        )
+        .await
+        .unwrap(),
         StoreApplyOutcome::Superseded
     );
 
     // The at-least-once transport RE-DELIVERS the stale build#1 (a NEW event_id so the dedup guard does
     // NOT absorb it — this isolates the SUPERSESSION drop). The supersession `WHERE` drops it in SQL.
     assert_eq!(
-        proj.apply("gitp20-build-a1-redelivered", &fact("build", 1, CheckState::Failure, TrustTier::Trusted))
-            .await
-            .unwrap(),
+        proj.apply(
+            "gitp20-build-a1-redelivered",
+            &fact("build", 1, CheckState::Failure, TrustTier::Trusted)
+        )
+        .await
+        .unwrap(),
         StoreApplyOutcome::DroppedStale,
         "a late LOWER attempt is dropped in SQL — the newer row is not clobbered"
     );
 
     // A DUPLICATE of build#2 (the SAME event_id) — the consumer_dedup guard absorbs it (idempotent).
     assert_eq!(
-        proj.apply(&event_id("build", 2), &fact("build", 2, CheckState::Success, TrustTier::Trusted))
-            .await
-            .unwrap(),
+        proj.apply(
+            &event_id("build", 2),
+            &fact("build", 2, CheckState::Success, TrustTier::Trusted)
+        )
+        .await
+        .unwrap(),
         StoreApplyOutcome::DuplicateEvent,
         "a re-delivered event_id is the effectively-once no-op"
     );
@@ -167,8 +180,15 @@ async fn check_status_supersession_holds_one_current_row_per_key() {
         .await
         .unwrap()
         .expect("the build row is present");
-    assert_eq!(build_row.run_attempt, 2, "the current build row is the highest attempt");
-    assert_eq!(build_row.state, CheckState::Success, "the re-run success is current, not the stale failure");
+    assert_eq!(
+        build_row.run_attempt, 2,
+        "the current build row is the highest attempt"
+    );
+    assert_eq!(
+        build_row.state,
+        CheckState::Success,
+        "the re-run success is current, not the stale failure"
+    );
 
     // The test row is its own attempt-1 success (independent key, untouched by the build supersession).
     let test_row = proj
@@ -193,24 +213,46 @@ async fn supersession_is_order_independent_highest_attempt_wins() {
     // Scrambled arrival: attempt 3 (success) first, then 1 (failure), then 2 (error). Each a distinct
     // event_id so the dedup guard never fires — this isolates the supersession ordering.
     assert_eq!(
-        proj.apply("scramble-a3", &fact("lint", 3, CheckState::Success, TrustTier::Trusted)).await.unwrap(),
+        proj.apply(
+            "scramble-a3",
+            &fact("lint", 3, CheckState::Success, TrustTier::Trusted)
+        )
+        .await
+        .unwrap(),
         StoreApplyOutcome::Superseded
     );
     assert_eq!(
-        proj.apply("scramble-a1", &fact("lint", 1, CheckState::Failure, TrustTier::Trusted)).await.unwrap(),
+        proj.apply(
+            "scramble-a1",
+            &fact("lint", 1, CheckState::Failure, TrustTier::Trusted)
+        )
+        .await
+        .unwrap(),
         StoreApplyOutcome::DroppedStale,
         "attempt 1 < the stored 3 → dropped"
     );
     assert_eq!(
-        proj.apply("scramble-a2", &fact("lint", 2, CheckState::Error, TrustTier::Trusted)).await.unwrap(),
+        proj.apply(
+            "scramble-a2",
+            &fact("lint", 2, CheckState::Error, TrustTier::Trusted)
+        )
+        .await
+        .unwrap(),
         StoreApplyOutcome::DroppedStale,
         "attempt 2 < the stored 3 → dropped"
     );
 
     // Exactly one row, at attempt 3 (the highest), success (the attempt-3 state).
     assert_eq!(proj.row_count_for_commit(TENANT, &commit).await.unwrap(), 1);
-    let row = proj.current(TENANT, &commit, "ci", "lint").await.unwrap().unwrap();
-    assert_eq!(row.run_attempt, 3, "the highest attempt is current regardless of arrival order");
+    let row = proj
+        .current(TENANT, &commit, "ci", "lint")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.run_attempt, 3,
+        "the highest attempt is current regardless of arrival order"
+    );
     assert_eq!(row.state, CheckState::Success);
 
     proj.drop_tables().await.unwrap();
@@ -225,13 +267,30 @@ async fn idempotent_on_event_id_zero_dup() {
     let commit = GitOid(COMMIT.into());
     let f = fact("build", 5, CheckState::Success, TrustTier::Trusted);
 
-    assert_eq!(proj.apply("evt-once", &f).await.unwrap(), StoreApplyOutcome::Superseded);
+    assert_eq!(
+        proj.apply("evt-once", &f).await.unwrap(),
+        StoreApplyOutcome::Superseded
+    );
     // Re-deliver the SAME event_id twice — both are the effectively-once no-op.
-    assert_eq!(proj.apply("evt-once", &f).await.unwrap(), StoreApplyOutcome::DuplicateEvent);
-    assert_eq!(proj.apply("evt-once", &f).await.unwrap(), StoreApplyOutcome::DuplicateEvent);
+    assert_eq!(
+        proj.apply("evt-once", &f).await.unwrap(),
+        StoreApplyOutcome::DuplicateEvent
+    );
+    assert_eq!(
+        proj.apply("evt-once", &f).await.unwrap(),
+        StoreApplyOutcome::DuplicateEvent
+    );
 
-    assert_eq!(proj.row_count_for_commit(TENANT, &commit).await.unwrap(), 1, "applied exactly once");
-    let row = proj.current(TENANT, &commit, "ci", "build").await.unwrap().unwrap();
+    assert_eq!(
+        proj.row_count_for_commit(TENANT, &commit).await.unwrap(),
+        1,
+        "applied exactly once"
+    );
+    let row = proj
+        .current(TENANT, &commit, "ci", "build")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(row.run_attempt, 5);
 
     proj.drop_tables().await.unwrap();

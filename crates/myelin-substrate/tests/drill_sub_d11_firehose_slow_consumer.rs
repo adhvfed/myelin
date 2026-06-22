@@ -31,7 +31,9 @@ use myelin_harness::{
     Dependency, DrillContext, DrillRegistry, DrillResult, DrillScenario, Label, Predicate, Scope,
     SignalName,
 };
-use myelin_substrate::{FirehoseScope, FirehoseSignals, Frame, FrameBuffer, FrameClass, PushOutcome};
+use myelin_substrate::{
+    FirehoseScope, FirehoseSignals, Frame, FrameBuffer, FrameClass, PushOutcome,
+};
 
 fn scope(s: &str) -> FirehoseScope {
     FirehoseScope(s.to_string())
@@ -45,90 +47,113 @@ fn human(seq: u64) -> Frame {
 /// producer against a slow consumer (and a keeping-up neighbour), then assert the two firehose
 /// survival signals read green (frame-lag bounded + resync_required accurate).
 fn sub_d11_firehose_slow_consumer_scenario() -> DrillScenario {
-    DrillScenario::new("sub-d11-firehose-slow-consumer", |ctx: &mut DrillContext| {
-        // (inject) drop a firehose subscription mid-stream on a hot stream (the D-11 condition).
-        ctx.breaker
-            .break_dependency(Dependency::Firehose, Scope::Global);
+    DrillScenario::new(
+        "sub-d11-firehose-slow-consumer",
+        |ctx: &mut DrillContext| {
+            // (inject) drop a firehose subscription mid-stream on a hot stream (the D-11 condition).
+            ctx.breaker
+                .break_dependency(Dependency::Firehose, Scope::Global);
 
-        // The hot stream carries two connections on two scopes: one consumer keeps up, one stalls.
-        // cap 4 per connection, slow-consumer ceiling 8 (a connection cannot be 'slow' before it has
-        // filled its buffer; once its lag reaches 8 it is structurally too slow → dropped).
-        let mut keeping_up = FrameBuffer::new("chat-live", scope("channel:hot-fast"), 4, 8);
-        let mut slow = FrameBuffer::new("chat-live", scope("channel:hot-slow"), 4, 8);
+            // The hot stream carries two connections on two scopes: one consumer keeps up, one stalls.
+            // cap 4 per connection, slow-consumer ceiling 8 (a connection cannot be 'slow' before it has
+            // filled its buffer; once its lag reaches 8 it is structurally too slow → dropped).
+            let mut keeping_up = FrameBuffer::new("chat-live", scope("channel:hot-fast"), 4, 8);
+            let mut slow = FrameBuffer::new("chat-live", scope("channel:hot-slow"), 4, 8);
 
-        // ---- (load) a fast producer floods the hot stream. ------------------------------------------
-        // The keeping-up consumer delivers each frame right after it is offered → its lag stays ~0,
-        // it never sheds, never drops.
-        for seq in 1..=64u64 {
-            assert!(
-                keeping_up.offer(human(seq)).is_buffered(),
-                "the keeping-up consumer never sheds (it keeps pace)"
-            );
-            keeping_up.deliver(human(seq));
-        }
+            // ---- (load) a fast producer floods the hot stream. ------------------------------------------
+            // The keeping-up consumer delivers each frame right after it is offered → its lag stays ~0,
+            // it never sheds, never drops.
+            for seq in 1..=64u64 {
+                assert!(
+                    keeping_up.offer(human(seq)).is_buffered(),
+                    "the keeping-up consumer never sheds (it keeps pace)"
+                );
+                keeping_up.deliver(human(seq));
+            }
 
-        // The slow consumer never delivers (a fully-stalled subscription, the dropped one). The lag
-        // climbs: the first 4 buffer, 5..7 shed (over the per-connection cap — memory stays bounded at
-        // the cap), and at seq 8 the lag reaches the slow-consumer ceiling → it is DROPPED to
-        // resync_required. We keep offering past the drop to prove the connection STAYS dropped + the
-        // count does NOT double-increment.
-        let mut drop_seen = false;
-        for seq in 1..=20u64 {
-            match slow.offer(human(seq)) {
-                PushOutcome::ResyncRequired => drop_seen = true,
-                PushOutcome::Buffered | PushOutcome::Shed => {
-                    // below the ceiling, memory stays bounded at the cap as the lag climbs.
-                    assert!(
-                        slow.buffered_frames() <= slow.capacity(),
-                        "memory NEVER exceeds the per-connection cap (Little's Law): seq={seq}"
-                    );
+            // The slow consumer never delivers (a fully-stalled subscription, the dropped one). The lag
+            // climbs: the first 4 buffer, 5..7 shed (over the per-connection cap — memory stays bounded at
+            // the cap), and at seq 8 the lag reaches the slow-consumer ceiling → it is DROPPED to
+            // resync_required. We keep offering past the drop to prove the connection STAYS dropped + the
+            // count does NOT double-increment.
+            let mut drop_seen = false;
+            for seq in 1..=20u64 {
+                match slow.offer(human(seq)) {
+                    PushOutcome::ResyncRequired => drop_seen = true,
+                    PushOutcome::Buffered | PushOutcome::Shed => {
+                        // below the ceiling, memory stays bounded at the cap as the lag climbs.
+                        assert!(
+                            slow.buffered_frames() <= slow.capacity(),
+                            "memory NEVER exceeds the per-connection cap (Little's Law): seq={seq}"
+                        );
+                    }
                 }
             }
-        }
-        assert!(drop_seen, "the slow consumer must be dropped to resync_required");
-        // bounded memory: the dropped connection holds NOTHING (it did not buffer the gap).
-        assert_eq!(slow.buffered_frames(), 0, "a dropped connection releases its buffer (bounded memory)");
-        assert_eq!(slow.frame_lag(), 0, "a dropped connection holds no gap (it is in *.snapshot replay)");
-        assert_eq!(slow.resync_required_count(), 1, "the resync_required drop is counted EXACTLY once");
+            assert!(
+                drop_seen,
+                "the slow consumer must be dropped to resync_required"
+            );
+            // bounded memory: the dropped connection holds NOTHING (it did not buffer the gap).
+            assert_eq!(
+                slow.buffered_frames(),
+                0,
+                "a dropped connection releases its buffer (bounded memory)"
+            );
+            assert_eq!(
+                slow.frame_lag(),
+                0,
+                "a dropped connection holds no gap (it is in *.snapshot replay)"
+            );
+            assert_eq!(
+                slow.resync_required_count(),
+                1,
+                "the resync_required drop is counted EXACTLY once"
+            );
 
-        // the keeping-up connection is UNTOUCHED by its slow neighbour's drop (per-connection isolation).
-        assert!(!keeping_up.resync_required(), "a slow consumer never drops a keeping-up neighbour");
+            // the keeping-up connection is UNTOUCHED by its slow neighbour's drop (per-connection isolation).
+            assert!(
+                !keeping_up.resync_required(),
+                "a slow consumer never drops a keeping-up neighbour"
+            );
 
-        // (signals) snapshot the two §10.2 firehose survival signals off the open buffers (the
-        // producer side wires this off the real connection tier at Chat M4; here the drill records it).
-        let sig = FirehoseSignals::snapshot([&keeping_up, &slow]);
-        // firehose_frame_lag is labelled by {stream, scope} — record each (stream,scope) row.
-        for row in &sig.frame_lag {
-            ctx.signals.set_labelled(
+            // (signals) snapshot the two §10.2 firehose survival signals off the open buffers (the
+            // producer side wires this off the real connection tier at Chat M4; here the drill records it).
+            let sig = FirehoseSignals::snapshot([&keeping_up, &slow]);
+            // firehose_frame_lag is labelled by {stream, scope} — record each (stream,scope) row.
+            for row in &sig.frame_lag {
+                ctx.signals.set_labelled(
+                    SignalName::FirehoseFrameLag,
+                    vec![
+                        Label::new("stream", row.stream.clone()),
+                        Label::new("scope", row.scope.clone()),
+                    ],
+                    row.lag as i64,
+                );
+            }
+            // resync_required_count is scalar.
+            ctx.signals.set_scalar(
+                SignalName::ResyncRequiredCount,
+                sig.resync_required_count as i64,
+            );
+
+            // restore the injected fault before returning (a re-run starts clean).
+            ctx.breaker
+                .restore_dependency(Dependency::Firehose, Scope::Global);
+
+            // (assert) the per-(stream,scope) frame-lag is BOUNDED — assert the hot-slow scope's lag is
+            // ≤ the slow-consumer ceiling (memory never grew unboundedly). This is the single telemetry
+            // assertion that reads green; the resync_required_count is asserted in the runner below.
+            ctx.signals.assert_labelled(
                 SignalName::FirehoseFrameLag,
                 vec![
-                    Label::new("stream", row.stream.clone()),
-                    Label::new("scope", row.scope.clone()),
+                    Label::new("stream", "chat-live".to_string()),
+                    Label::new("scope", "channel:hot-slow".to_string()),
                 ],
-                row.lag as i64,
-            );
-        }
-        // resync_required_count is scalar.
-        ctx.signals
-            .set_scalar(SignalName::ResyncRequiredCount, sig.resync_required_count as i64);
-
-        // restore the injected fault before returning (a re-run starts clean).
-        ctx.breaker
-            .restore_dependency(Dependency::Firehose, Scope::Global);
-
-        // (assert) the per-(stream,scope) frame-lag is BOUNDED — assert the hot-slow scope's lag is
-        // ≤ the slow-consumer ceiling (memory never grew unboundedly). This is the single telemetry
-        // assertion that reads green; the resync_required_count is asserted in the runner below.
-        ctx.signals.assert_labelled(
-            SignalName::FirehoseFrameLag,
-            vec![
-                Label::new("stream", "chat-live".to_string()),
-                Label::new("scope", "channel:hot-slow".to_string()),
-            ],
-            // ≤ 8 (the slow-consumer ceiling): a dropped connection reads 0; a live one ≤ ceiling.
-            Predicate::Lte(8),
-        )
-    })
+                // ≤ 8 (the slow-consumer ceiling): a dropped connection reads 0; a live one ≤ ceiling.
+                Predicate::Lte(8),
+            )
+        },
+    )
 }
 
 /// **THE SUB-D11 DRILL** — the dated green artifact the P-S28 GATE/DRILLS names. Register it (it joins
@@ -180,14 +205,19 @@ fn sub_d11_both_firehose_survival_signals_read_green() {
             }
             let sig = FirehoseSignals::snapshot([&keeping_up, &slow]);
             let mut ctx = DrillContext::new();
-            ctx.signals
-                .set_scalar(SignalName::ResyncRequiredCount, sig.resync_required_count as i64);
+            ctx.signals.set_scalar(
+                SignalName::ResyncRequiredCount,
+                sig.resync_required_count as i64,
+            );
             // the resync_required count is accurate: exactly one drop (NAMED, not silent).
             ctx.signals
                 .assert_signal(SignalName::ResyncRequiredCount, Predicate::Eq(1))
                 .expect_green();
             // and the frame-lag is bounded (memory never grew unboundedly).
-            assert!(sig.max_frame_lag() <= 8, "every (stream,scope) frame-lag is BOUNDED");
+            assert!(
+                sig.max_frame_lag() <= 8,
+                "every (stream,scope) frame-lag is BOUNDED"
+            );
         }
         other => panic!("SUB-D11 must pass: {other:?}"),
     }

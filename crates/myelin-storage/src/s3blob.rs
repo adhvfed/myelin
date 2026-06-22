@@ -114,7 +114,13 @@ impl BlobStore for S3BlobStore {
     fn get(&self, tenant: &TenantId, hash: &ContentHash) -> Result<Vec<u8>> {
         let key = Self::key_path(tenant, hash);
         let out = self
-            .block(self.client.get_object().bucket(&self.bucket).key(&key).send())
+            .block(
+                self.client
+                    .get_object()
+                    .bucket(&self.bucket)
+                    .key(&key)
+                    .send(),
+            )
             .map_err(|e| {
                 // A NoSuchKey from the store is a NotFound; any other error is surfaced as a
                 // NotFound too (the trait's narrow error set has no transport variant — the
@@ -153,7 +159,13 @@ impl BlobStore for S3BlobStore {
     fn head(&self, tenant: &TenantId, hash: &ContentHash) -> Result<BlobMeta> {
         let key = Self::key_path(tenant, hash);
         let out = self
-            .block(self.client.head_object().bucket(&self.bucket).key(&key).send())
+            .block(
+                self.client
+                    .head_object()
+                    .bucket(&self.bucket)
+                    .key(&key)
+                    .send(),
+            )
             .map_err(|e| {
                 if is_no_such_key(&e) {
                     BlobError::NotFound {

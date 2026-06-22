@@ -10,9 +10,9 @@ use myelin_events::{
     Actor, CausedBy, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Region, Timestamp,
 };
 use myelin_identity::{
-    AuthzError, CaveatContext, Credential, DataRole as IdDataRole, EffectivePolicy, ListObjectsResult,
-    ObjectId, ObjectType, Precondition, PrincipalId, PrincipalKind, PrincipalStatus,
-    Result as IdResult, RewriteTrace, SubjectTree, TupleDelta,
+    AuthzError, CaveatContext, Credential, DataRole as IdDataRole, EffectivePolicy,
+    ListObjectsResult, ObjectId, ObjectType, Precondition, PrincipalId, PrincipalKind,
+    PrincipalStatus, Result as IdResult, RewriteTrace, SubjectTree, TupleDelta,
 };
 use std::sync::Arc;
 
@@ -50,7 +50,10 @@ struct StubId {
 
 impl StubId {
     fn new() -> Self {
-        Self { allow: HashSet::new(), hiccup: false }
+        Self {
+            allow: HashSet::new(),
+            hiccup: false,
+        }
     }
     fn allow_read(mut self, object: &ArtifactRef) -> Self {
         self.allow.insert(format!("read@{}", object.0));
@@ -78,7 +81,11 @@ impl IdentityService for StubId {
             return Err(AuthzError::Unavailable("forced Id break".into()));
         }
         let key = format!("{}@{}", permission.0, object.0);
-        Ok(if self.allow.contains(&key) { Decision::Allow } else { Decision::Deny })
+        Ok(if self.allow.contains(&key) {
+            Decision::Allow
+        } else {
+            Decision::Deny
+        })
     }
     fn list_objects(
         &self,
@@ -89,7 +96,12 @@ impl IdentityService for StubId {
     ) -> IdResult<ListObjectsResult> {
         Err(AuthzError::NotYetImplemented("n/a"))
     }
-    fn list_subjects(&self, _o: &ObjectId, _p: &Permission, _at: &Consistency) -> IdResult<SubjectTree> {
+    fn list_subjects(
+        &self,
+        _o: &ObjectId,
+        _p: &Permission,
+        _at: &Consistency,
+    ) -> IdResult<SubjectTree> {
         Err(AuthzError::NotYetImplemented("n/a"))
     }
     fn explain(
@@ -134,7 +146,10 @@ impl IdentityService for StubId {
 }
 
 fn store_and_minter() -> (OutboxStore, Arc<dyn IdMinter>) {
-    (OutboxStore::new(), Arc::new(MonotonicMinter::new()) as Arc<dyn IdMinter>)
+    (
+        OutboxStore::new(),
+        Arc::new(MonotonicMinter::new()) as Arc<dyn IdMinter>,
+    )
 }
 
 fn ctx_base() -> EmitContextBase {
@@ -178,20 +193,32 @@ fn each_inline_node_emits_one_reference_edge() {
     assert_eq!(m.envelope.type_.0, "refs.edge.created");
     assert_eq!(m.envelope.payload["rel"], "mentions");
     assert_eq!(m.envelope.payload["rel_class"], "reference");
-    assert_eq!(m.envelope.payload["target"], "myelin://acme/identity/principal/alice");
-    assert!(!m.envelope.contains_personal_data, "references-not-payloads: opaque principal id, no PII");
+    assert_eq!(
+        m.envelope.payload["target"],
+        "myelin://acme/identity/principal/alice"
+    );
+    assert!(
+        !m.envelope.contains_personal_data,
+        "references-not-payloads: opaque principal id, no PII"
+    );
 
     // artifact_ref → references edge → the issue URN verbatim.
     let a = store.row(&ids[1]).expect("artifact_ref edge row");
     assert_eq!(a.envelope.payload["rel"], "references");
-    assert_eq!(a.envelope.payload["target"], "myelin://acme/issue/issue/ENG-1");
+    assert_eq!(
+        a.envelope.payload["target"],
+        "myelin://acme/issue/issue/ENG-1"
+    );
 
     // embed → embeds edge → the embedded page URN; the aggregate is the shared edge convention.
     let e = store.row(&ids[2]).expect("embed edge row");
     assert_eq!(e.envelope.payload["rel"], "embeds");
     assert_eq!(
         e.aggregate.0,
-        format!("edge:{}->{}", source.0, "myelin://acme/knowledge/page/incident-runbook")
+        format!(
+            "edge:{}->{}",
+            source.0, "myelin://acme/knowledge/page/incident-runbook"
+        )
     );
     assert_eq!(e.envelope.payload["source"], source.0);
 }
@@ -202,13 +229,19 @@ fn each_inline_node_emits_one_reference_edge() {
 fn content_edges_are_emit_iff_committed() {
     let (store, minter) = store_and_minter();
     let source = page_root("7c2");
-    let nodes = vec![InlineNode::ArtifactRefNode(ArtifactRef("myelin://acme/issue/issue/ENG-1".into()))];
+    let nodes = vec![InlineNode::ArtifactRefNode(ArtifactRef(
+        "myelin://acme/issue/issue/ENG-1".into(),
+    ))];
     {
         let mut tx = store.begin(Arc::clone(&minter), ctx_base());
         emit_content_edges(&mut tx, &tenant(), &source, &nodes, None).expect("emit");
         // tx dropped WITHOUT commit — the crash between the block commit and the relay.
     }
-    assert_eq!(store.outbox_depth(), 0, "an aborted block persist wrote 0 edges (no edge without its node)");
+    assert_eq!(
+        store.outbox_depth(),
+        0,
+        "an aborted block persist wrote 0 edges (no edge without its node)"
+    );
 }
 
 // ════════════════════════════ 2. the TE-7 typed-edge mirror (5.5) ═══════════════════════════════
@@ -240,15 +273,25 @@ fn te7_page_parent_set_mirrors_the_typed_row_in_the_same_tx() {
         None,
     )
     .expect("emit the TE-7 parent_set mirror");
-    assert_eq!(store.outbox_depth(), 0, "buffered into the open tx (co-commits with the typed row)");
+    assert_eq!(
+        store.outbox_depth(),
+        0,
+        "buffered into the open tx (co-commits with the typed row)"
+    );
     tx.commit().expect("the typed row + its mirror co-commit");
 
     let row = store.row(&id).expect("the parent_set row");
     assert_eq!(row.envelope.type_.0, "knowledge.page.parent_set");
     assert_eq!(row.envelope.payload["rel"], "parent");
     assert_eq!(row.envelope.payload["rel_class"], "lifecycle");
-    assert_eq!(row.envelope.payload["source"], "myelin://acme/knowledge/page/project");
-    assert_eq!(row.envelope.payload["target"], "myelin://acme/knowledge/page/team");
+    assert_eq!(
+        row.envelope.payload["source"],
+        "myelin://acme/knowledge/page/project"
+    );
+    assert_eq!(
+        row.envelope.payload["target"],
+        "myelin://acme/knowledge/page/team"
+    );
     // the aggregate is the child page (per-page ordering).
     assert_eq!(row.aggregate.0, "myelin://acme/knowledge/page/project");
 }
@@ -266,25 +309,39 @@ fn te7_db_relation_mirrors_created_and_removed() {
         rel: RelationKind::Relates,
     };
     // relate (the forward typed row is the source of truth) + emit its mirror.
-    assert!(rels.relate(&tenant(), relation.clone()), "a new edge was created");
+    assert!(
+        rels.relate(&tenant(), relation.clone()),
+        "a new edge was created"
+    );
     let mut tx = store.begin(Arc::clone(&minter), ctx_base());
-    let cid = emit_relation_edge(&mut tx, &tenant(), &relation, true, None).expect("emit relation.created");
+    let cid = emit_relation_edge(&mut tx, &tenant(), &relation, true, None)
+        .expect("emit relation.created");
     tx.commit().expect("commit");
 
     let c = store.row(&cid).expect("relation.created row");
     assert_eq!(c.envelope.type_.0, "knowledge.relation.created");
     assert_eq!(c.envelope.payload["rel"], "relates");
     assert_eq!(c.envelope.payload["rel_class"], "lifecycle");
-    assert_eq!(c.envelope.payload["source"], "myelin://acme/knowledge/row/row7");
-    assert_eq!(c.envelope.payload["target"], "myelin://acme/knowledge/row/row9");
+    assert_eq!(
+        c.envelope.payload["source"],
+        "myelin://acme/knowledge/row/row7"
+    );
+    assert_eq!(
+        c.envelope.payload["target"],
+        "myelin://acme/knowledge/row/row9"
+    );
 
     // unrelate → relation.removed on the SAME edge aggregate (the create→remove sequence is ordered).
     let mut tx2 = store.begin(Arc::clone(&minter), ctx_base());
-    let rid = emit_relation_edge(&mut tx2, &tenant(), &relation, false, None).expect("emit removed");
+    let rid =
+        emit_relation_edge(&mut tx2, &tenant(), &relation, false, None).expect("emit removed");
     tx2.commit().expect("commit");
     let r = store.row(&rid).expect("relation.removed row");
     assert_eq!(r.envelope.type_.0, "knowledge.relation.removed");
-    assert_eq!(r.aggregate.0, c.aggregate.0, "create + remove share the edge aggregate (ordered)");
+    assert_eq!(
+        r.aggregate.0, c.aggregate.0,
+        "create + remove share the edge aggregate (ordered)"
+    );
 }
 
 /// **The rollup_source relation maps to its own lifecycle rel token.**
@@ -300,7 +357,10 @@ fn te7_rollup_source_rel_token() {
     let mut tx = store.begin(Arc::clone(&minter), ctx_base());
     let id = emit_relation_edge(&mut tx, &tenant(), &relation, true, None).expect("emit");
     tx.commit().expect("commit");
-    assert_eq!(store.row(&id).unwrap().envelope.payload["rel"], "rollup_source");
+    assert_eq!(
+        store.row(&id).unwrap().envelope.payload["rel"],
+        "rollup_source"
+    );
 }
 
 // ════════════════════════════ 3. project(ref, viewer) — the 4-step tombstone ladder (5.6/5.7) ═══
@@ -308,8 +368,18 @@ fn te7_rollup_source_rel_token() {
 fn seeded_projector(allow: bool) -> Projector<StubId> {
     let root = page_root("7c2");
     let mut store = PageStore::new();
-    store.put_root(&root, PageMeta { title: "Incident runbook".into(), state: "live".into() });
-    let id = if allow { StubId::new().allow_read(&root) } else { StubId::new() };
+    store.put_root(
+        &root,
+        PageMeta {
+            title: "Incident runbook".into(),
+            state: "live".into(),
+        },
+    );
+    let id = if allow {
+        StubId::new().allow_read(&root)
+    } else {
+        StubId::new()
+    };
     Projector::new(id, store)
 }
 
@@ -325,7 +395,10 @@ fn authorized_viewer_gets_the_page_projection() {
         assert_eq!(proj.state, "live");
         assert_eq!(proj.icon, "page");
         assert_eq!(proj.render_hint, "page");
-        assert!(proj.sub_anchor.is_none(), "a bare-root page has no sub-anchor");
+        assert!(
+            proj.sub_anchor.is_none(),
+            "a bare-root page has no sub-anchor"
+        );
     }
 }
 
@@ -335,14 +408,26 @@ fn authorized_viewer_gets_the_page_projection() {
 #[test]
 fn unauthorized_viewer_gets_a_tombstone_carrying_the_root_never_the_title() {
     let p = seeded_projector(false); // the Id allows NOBODY → every check denies.
-    let got = p.project(&page_root("7c2"), &viewer("mallory"), z()).unwrap();
-    assert!(got.is_tombstone(), "an unauthorized viewer must get a tombstone");
-    assert_eq!(got.title(), None, "0 title leak — the denied viewer never gets the title");
+    let got = p
+        .project(&page_root("7c2"), &viewer("mallory"), z())
+        .unwrap();
+    assert!(
+        got.is_tombstone(),
+        "an unauthorized viewer must get a tombstone"
+    );
+    assert_eq!(
+        got.title(),
+        None,
+        "0 title leak — the denied viewer never gets the title"
+    );
     if let Projected::Tombstoned(t) = got {
         assert_eq!(t.reason, TombstoneReason::Denied);
         // a tombstone ALWAYS carries the root (§2.1) — an opaque scope, never the title.
         assert_eq!(t.root, page_root("7c2"));
-        assert!(!t.root.0.contains("Incident"), "the root URN is opaque scope, never the title");
+        assert!(
+            !t.root.0.contains("Incident"),
+            "the root URN is opaque scope, never the title"
+        );
         assert_eq!(t.display_text(), "(not available)");
     }
 }
@@ -352,10 +437,19 @@ fn unauthorized_viewer_gets_a_tombstone_carrying_the_root_never_the_title() {
 fn an_id_hiccup_fails_closed_to_a_tombstone() {
     let root = page_root("7c2");
     let mut store = PageStore::new();
-    store.put_root(&root, PageMeta { title: "secret".into(), state: "live".into() });
+    store.put_root(
+        &root,
+        PageMeta {
+            title: "secret".into(),
+            state: "live".into(),
+        },
+    );
     let p = Projector::new(StubId::new().allow_read(&root).with_hiccup(), store);
     let got = p.project(&root, &viewer("alice"), z()).unwrap();
-    assert!(got.is_tombstone(), "an Id hiccup fails closed (never a leak)");
+    assert!(
+        got.is_tombstone(),
+        "an Id hiccup fails closed (never a leak)"
+    );
     assert_eq!(got.title(), None);
 }
 
@@ -365,12 +459,22 @@ fn an_id_hiccup_fails_closed_to_a_tombstone() {
 fn an_erased_page_projects_to_an_erased_tombstone() {
     let root = page_root("7c2");
     let mut store = PageStore::new();
-    store.put_root(&root, PageMeta { title: "gone".into(), state: "live".into() });
+    store.put_root(
+        &root,
+        PageMeta {
+            title: "gone".into(),
+            state: "live".into(),
+        },
+    );
     store.mark_erased(&root);
     let p = Projector::new(StubId::new().allow_read(&root), store);
     let got = p.project(&root, &viewer("alice"), z()).unwrap();
     assert!(got.is_tombstone());
-    assert_eq!(got.title(), None, "an erased page never leaks its (shredded) title");
+    assert_eq!(
+        got.title(),
+        None,
+        "an erased page never leaks its (shredded) title"
+    );
     if let Projected::Tombstoned(t) = got {
         assert_eq!(t.reason, TombstoneReason::Erased);
         assert_eq!(t.root, root);
@@ -382,7 +486,13 @@ fn an_erased_page_projects_to_an_erased_tombstone() {
 fn a_restricted_subject_projects_to_a_tombstone() {
     let root = page_root("7c2");
     let mut store = PageStore::new();
-    store.put_root(&root, PageMeta { title: "restricted".into(), state: "live".into() });
+    store.put_root(
+        &root,
+        PageMeta {
+            title: "restricted".into(),
+            state: "live".into(),
+        },
+    );
     store.mark_restricted(&root);
     let p = Projector::new(StubId::new().allow_read(&root), store);
     let got = p.project(&root, &viewer("alice"), z()).unwrap();
@@ -415,7 +525,13 @@ fn the_sub_anchor_ladder_lives_moves_outdates_and_gones() {
     let gone = myelin_refs::mint(&root, myelin_refs::Sub::Block("b99".into())).unwrap();
 
     let mut store = PageStore::new();
-    store.put_root(&root, PageMeta { title: "Incident runbook".into(), state: "live".into() });
+    store.put_root(
+        &root,
+        PageMeta {
+            title: "Incident runbook".into(),
+            state: "live".into(),
+        },
+    );
     store.put_sub_state(&live, SubState::Live);
     store.put_sub_state(&moved, SubState::Moved);
     store.put_sub_state(&outdated, SubState::Outdated);
@@ -458,7 +574,10 @@ fn the_sub_anchor_ladder_lives_moves_outdates_and_gones() {
     assert_eq!(g.title(), None);
     if let Projected::Tombstoned(t) = g {
         assert_eq!(t.reason, TombstoneReason::SubGone);
-        assert_eq!(t.root, root, "a SubGone tombstone carries the root (the embed shows the page)");
+        assert_eq!(
+            t.root, root,
+            "a SubGone tombstone carries the root (the embed shows the page)"
+        );
     }
 }
 
@@ -469,7 +588,13 @@ fn a_sub_anchor_of_a_confidential_page_is_denied_carrying_the_root() {
     let root = page_root("7c2");
     let block = myelin_refs::mint(&root, myelin_refs::Sub::Block("b9".into())).unwrap();
     let mut store = PageStore::new();
-    store.put_root(&root, PageMeta { title: "secret".into(), state: "live".into() });
+    store.put_root(
+        &root,
+        PageMeta {
+            title: "secret".into(),
+            state: "live".into(),
+        },
+    );
     store.put_sub_state(&block, SubState::Live);
     // the Id allows NOBODY → the parent page is denied → the block sub is tombstoned.
     let p = Projector::new(StubId::new(), store);
@@ -488,7 +613,13 @@ fn an_untracked_sub_defaults_to_live() {
     let root = page_root("7c2");
     let block = myelin_refs::mint(&root, myelin_refs::Sub::Block("bnew".into())).unwrap();
     let mut store = PageStore::new();
-    store.put_root(&root, PageMeta { title: "t".into(), state: "live".into() });
+    store.put_root(
+        &root,
+        PageMeta {
+            title: "t".into(),
+            state: "live".into(),
+        },
+    );
     let p = Projector::new(StubId::new().allow_read(&root), store);
     let got = p.project(&block, &viewer("alice"), z()).unwrap();
     if let Projected::Visible(proj) = got {
@@ -518,7 +649,10 @@ fn frozen_rel_class_and_rel_tokens() {
     assert_ne!(REL_CLASS_REFERENCE, REL_CLASS_LIFECYCLE);
     assert_eq!(KnowledgeLifecycleRel::Parent.as_str(), "parent");
     assert_eq!(KnowledgeLifecycleRel::Relates.as_str(), "relates");
-    assert_eq!(KnowledgeLifecycleRel::RollupSource.as_str(), "rollup_source");
+    assert_eq!(
+        KnowledgeLifecycleRel::RollupSource.as_str(),
+        "rollup_source"
+    );
 }
 
 /// **The ladder-rung tokens are the frozen `live`/`moved`/`outdated` (a mutation that blanks them is
@@ -540,7 +674,10 @@ fn projected_predicates_are_exact_complements() {
     let p = seeded_projector(true);
     let visible = p.project(&page_root("7c2"), &viewer("alice"), z()).unwrap();
     assert!(visible.is_visible());
-    assert!(!visible.is_tombstone(), "a visible projection is NOT a tombstone");
+    assert!(
+        !visible.is_tombstone(),
+        "a visible projection is NOT a tombstone"
+    );
 
     let denied = seeded_projector(false)
         .project(&page_root("7c2"), &viewer("mallory"), z())
@@ -557,13 +694,22 @@ fn a_restricted_sub_urn_tombstones_even_when_the_root_is_not() {
     let root = page_root("7c2");
     let block = myelin_refs::mint(&root, myelin_refs::Sub::Block("b9".into())).unwrap();
     let mut store = PageStore::new();
-    store.put_root(&root, PageMeta { title: "page".into(), state: "live".into() });
+    store.put_root(
+        &root,
+        PageMeta {
+            title: "page".into(),
+            state: "live".into(),
+        },
+    );
     store.put_sub_state(&block, SubState::Live);
     // ONLY the sub-URN is restricted; the root is NOT.
     store.mark_restricted(&block);
     let p = Projector::new(StubId::new().allow_read(&root), store);
     let got = p.project(&block, &viewer("alice"), z()).unwrap();
-    assert!(got.is_tombstone(), "a restricted sub-URN tombstones even when its root is not restricted");
+    assert!(
+        got.is_tombstone(),
+        "a restricted sub-URN tombstones even when its root is not restricted"
+    );
     assert_eq!(got.title(), None);
 }
 
@@ -574,7 +720,13 @@ fn an_erased_sub_urn_tombstones_even_when_the_root_is_not() {
     let root = page_root("7c2");
     let block = myelin_refs::mint(&root, myelin_refs::Sub::Block("b9".into())).unwrap();
     let mut store = PageStore::new();
-    store.put_root(&root, PageMeta { title: "page".into(), state: "live".into() });
+    store.put_root(
+        &root,
+        PageMeta {
+            title: "page".into(),
+            state: "live".into(),
+        },
+    );
     store.put_sub_state(&block, SubState::Live);
     store.mark_erased(&block); // ONLY the sub-URN is erased.
     let p = Projector::new(StubId::new().allow_read(&root), store);
@@ -589,11 +741,18 @@ fn an_erased_sub_urn_tombstones_even_when_the_root_is_not() {
 /// formatter is caught).**
 #[test]
 fn project_error_display_is_loud() {
-    let e = ProjectError::NotAKnowledgeArtifact { reference: "myelin://acme/git/pr/r:1".into() };
+    let e = ProjectError::NotAKnowledgeArtifact {
+        reference: "myelin://acme/git/pr/r:1".into(),
+    };
     let s = e.to_string();
     assert!(!s.is_empty());
-    assert!(s.contains("myelin://acme/git/pr/r:1"), "the error names the offending ref");
-    let u = ProjectError::UnknownKnowledgeType { ty: "widget".into() };
+    assert!(
+        s.contains("myelin://acme/git/pr/r:1"),
+        "the error names the offending ref"
+    );
+    let u = ProjectError::UnknownKnowledgeType {
+        ty: "widget".into(),
+    };
     assert!(u.to_string().contains("widget"));
 }
 
@@ -603,8 +762,17 @@ fn project_error_display_is_loud() {
 fn store_mut_borrows_the_live_store() {
     let root = page_root("seeded-via-mut");
     let mut p = Projector::new(StubId::new().allow_read(&root), PageStore::new());
-    p.store_mut()
-        .put_root(&root, PageMeta { title: "via store_mut".into(), state: "live".into() });
+    p.store_mut().put_root(
+        &root,
+        PageMeta {
+            title: "via store_mut".into(),
+            state: "live".into(),
+        },
+    );
     let got = p.project(&root, &viewer("alice"), z()).unwrap();
-    assert_eq!(got.title(), Some("via store_mut"), "the projector reads the store seeded via store_mut");
+    assert_eq!(
+        got.title(),
+        Some("via store_mut"),
+        "the projector reads the store seeded via store_mut"
+    );
 }

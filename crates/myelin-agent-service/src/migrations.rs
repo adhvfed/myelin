@@ -28,12 +28,18 @@
 //! read against the LIVE dev stack (0 rows). The validation logic does not change shape when the
 //! driver lands.
 
-use myelin_storage::migration::{HotTables, MigrationError, Migrations, OnlineMigrationRunner};
 pub use myelin_storage::migration::Migration;
+use myelin_storage::migration::{HotTables, MigrationError, Migrations, OnlineMigrationRunner};
 
 /// The five table names (architecture §4.1..§4.5), in their migration order. Exposed so the
 /// integration test can build + RLS-scope each one without restating the names.
-pub const TABLES: [&str; 5] = ["agent_run", "agent_tool_def", "agent_proposed_effect", "agent_hitl_gate", "agent_trace"];
+pub const TABLES: [&str; 5] = [
+    "agent_run",
+    "agent_tool_def",
+    "agent_proposed_effect",
+    "agent_hitl_gate",
+    "agent_trace",
+];
 
 /// The `run` table DDL (§4.1) — `(tenant, region)`-first; the durable-workflow instance row.
 /// `budget bigint` is integer minor-units (never a float). The PK leads with `(tenant_id, region)`.
@@ -124,8 +130,16 @@ pub fn migrations() -> Migrations {
     Migrations::of([
         Migration::plain_on("0001_create_agent_run", RUN_DDL, "agent_run"),
         Migration::plain_on("0002_create_agent_tool_def", TOOL_DEF_DDL, "agent_tool_def"),
-        Migration::plain_on("0003_create_agent_proposed_effect", PROPOSED_EFFECT_DDL, "agent_proposed_effect"),
-        Migration::plain_on("0004_create_agent_hitl_gate", HITL_GATE_DDL, "agent_hitl_gate"),
+        Migration::plain_on(
+            "0003_create_agent_proposed_effect",
+            PROPOSED_EFFECT_DDL,
+            "agent_proposed_effect",
+        ),
+        Migration::plain_on(
+            "0004_create_agent_hitl_gate",
+            HITL_GATE_DDL,
+            "agent_hitl_gate",
+        ),
         Migration::plain_on("0005_create_agent_trace", TRACE_DDL, "agent_trace"),
     ])
 }
@@ -193,13 +207,25 @@ mod tests {
     /// cross-tenant query path).
     #[test]
     fn every_table_is_tenant_region_first_with_a_tenant_first_pk() {
-        let ddls = [RUN_DDL, TOOL_DEF_DDL, PROPOSED_EFFECT_DDL, HITL_GATE_DDL, TRACE_DDL];
+        let ddls = [
+            RUN_DDL,
+            TOOL_DEF_DDL,
+            PROPOSED_EFFECT_DDL,
+            HITL_GATE_DDL,
+            TRACE_DDL,
+        ];
         for ddl in ddls {
             // Leading columns: tenant_id then region, before any other column.
             let cols = ddl.split('(').nth(1).expect("a column list");
             let first_two: Vec<&str> = cols.split(',').take(2).map(str::trim).collect();
-            assert!(first_two[0].starts_with("tenant_id text"), "first column must be tenant_id: {ddl}");
-            assert!(first_two[1].starts_with("region text"), "second column must be region: {ddl}");
+            assert!(
+                first_two[0].starts_with("tenant_id text"),
+                "first column must be tenant_id: {ddl}"
+            );
+            assert!(
+                first_two[1].starts_with("region text"),
+                "second column must be region: {ddl}"
+            );
             // The PK leads with (tenant_id, region).
             assert!(
                 ddl.contains("PRIMARY KEY (tenant_id, region"),
@@ -224,7 +250,10 @@ mod tests {
     #[test]
     fn each_table_gets_the_rls_scope_call() {
         for t in TABLES {
-            assert_eq!(rls_scope_sql(t), format!("SELECT myelin_make_tenant_scoped('{t}')"));
+            assert_eq!(
+                rls_scope_sql(t),
+                format!("SELECT myelin_make_tenant_scoped('{t}')")
+            );
         }
         assert_eq!(TABLES.len(), 5, "the five-table data model");
     }
@@ -236,8 +265,15 @@ mod tests {
     fn a_destructive_fabric_migration_is_refused() {
         let bad = Migrations::of([Migration::plain("0006_drop_run", "DROP TABLE agent_run")]);
         let mut runner = OnlineMigrationRunner::new();
-        let e = runner.run(&bad, &hot_tables()).expect_err("a DROP must be refused");
-        assert_eq!(e, MigrationError::Destructive { id: "0006_drop_run" });
+        let e = runner
+            .run(&bad, &hot_tables())
+            .expect_err("a DROP must be refused");
+        assert_eq!(
+            e,
+            MigrationError::Destructive {
+                id: "0006_drop_run"
+            }
+        );
         assert!(e.to_string().contains("forward-only"), "loud reason: {e}");
     }
 
@@ -258,7 +294,10 @@ mod tests {
             .expect_err("a blocking ALTER on a hot table is refused");
         assert_eq!(
             e,
-            MigrationError::BlockingAlterOnHotTable { id: "0006_run_add_notnull", table: "agent_run" }
+            MigrationError::BlockingAlterOnHotTable {
+                id: "0006_run_add_notnull",
+                table: "agent_run"
+            }
         );
     }
 }

@@ -65,7 +65,7 @@ use std::collections::BTreeMap;
 
 use myelin_events::{
     reindex, ArtifactRef, BusTransport, DataRole, EmitContextBase, EventEnvelope, InProcessBus,
-    OutboxStore, Region, Relay, ReindexError, ReindexReceipt, ReindexSource, SnapshotDraft,
+    OutboxStore, Region, ReindexError, ReindexReceipt, ReindexSource, Relay, SnapshotDraft,
     SnapshotScope, Visibility,
 };
 
@@ -162,7 +162,11 @@ impl OlapAnalyticsSource {
 
     /// The `<owner>.analytics.snapshot` event type for this owner.
     fn snapshot_type(&self) -> myelin_events::EventType {
-        myelin_events::EventType(format!("{}.analytics.{}", self.owner, reindex::SNAPSHOT_EVENT_NAME))
+        myelin_events::EventType(format!(
+            "{}.analytics.{}",
+            self.owner,
+            reindex::SNAPSHOT_EVENT_NAME
+        ))
     }
 }
 
@@ -189,9 +193,9 @@ impl ReindexSource for OlapAnalyticsSource {
                     version: *v,
                     type_: self.snapshot_type(),
                     subject: ArtifactRef(
-                        subject
-                            .clone()
-                            .unwrap_or_else(|| format!("myelin://t/{}/analytics/{agg}", self.owner)),
+                        subject.clone().unwrap_or_else(|| {
+                            format!("myelin://t/{}/analytics/{agg}", self.owner)
+                        }),
                     ),
                     payload,
                     data_role: DataRole::Processor,
@@ -319,7 +323,12 @@ mod tests {
 
     /// A live bus envelope for one of the owner's facts — the SAME shape a `*.snapshot` of that
     /// `(aggregate, version)` carries (so the cold snapshot is byte-indistinct from the live event).
-    fn live_envelope(agg: &str, version: u64, event_id: &str, subject: Option<&str>) -> EventEnvelope {
+    fn live_envelope(
+        agg: &str,
+        version: u64,
+        event_id: &str,
+        subject: Option<&str>,
+    ) -> EventEnvelope {
         let mut payload = serde_json::json!({ "aggregate_row": agg, "version": version });
         if let Some(s) = subject {
             payload["subject"] = serde_json::json!(s);
@@ -378,7 +387,9 @@ mod tests {
                 &draft.event_id().0,
                 subject,
             );
-            consumer.ingest(&env).expect("an in-region live event is admitted");
+            consumer
+                .ingest(&env)
+                .expect("an in-region live event is admitted");
         }
         consumer
     }
@@ -387,7 +398,10 @@ mod tests {
     /// (the relay holds a SHARED clone of the outbox, so it sees the reindex-staged rows). The bus +
     /// relay are stable across reindex runs (the broker retains delivered snapshots).
     fn booted_bus() -> (OutboxStore, InProcessBus, Relay<InProcessBus>) {
-        assert!(OUTBOX_MIGRATION.contains("event_id"), "the frozen outbox DDL is present");
+        assert!(
+            OUTBOX_MIGRATION.contains("event_id"),
+            "the frozen outbox DDL is present"
+        );
         let outbox = OutboxStore::new();
         let bus = InProcessBus::new();
         // A deterministic relay clock (the `published_at` stamp; the real clock is wired at serve).
@@ -421,9 +435,15 @@ mod tests {
         let mut consumer = OlapBusConsumer::boot(region());
         let mut env = live_envelope("issue:PROJ-1", 1, "01J-1", None);
         env.region = Region("us-east".into());
-        let err = consumer.ingest(&env).expect_err("out-of-region is rejected");
+        let err = consumer
+            .ingest(&env)
+            .expect_err("out-of-region is rejected");
         assert!(matches!(err, OlapIngestError::OutOfRegion { .. }));
-        assert_eq!(consumer.store().doc_count(), 0, "nothing projected out-of-region");
+        assert_eq!(
+            consumer.store().doc_count(),
+            0,
+            "nothing projected out-of-region"
+        );
     }
 
     /// **MANDATORY-CORE — the F4 gate: `reindex(scope)` rebuilds the OLAP read model BYTE-MATCHING
@@ -436,7 +456,11 @@ mod tests {
 
         // LIVE projection (steady-state feed).
         let live = live_projection(&src);
-        assert_eq!(live.store().doc_count(), 3, "all three facts projected live");
+        assert_eq!(
+            live.store().doc_count(),
+            3,
+            "all three facts projected live"
+        );
 
         // COLD rebuild through the REAL reindex `*.snapshot` re-emit seam.
         let (mut outbox, bus, relay) = booted_bus();
@@ -454,14 +478,25 @@ mod tests {
         )
         .expect("the OLAP reindex-from-bus succeeds");
 
-        assert_eq!(receipt.snapshots_emitted, 3, "three snapshots re-emitted (the rebuild)");
-        assert_eq!(cold.store().doc_count(), 3, "the cold rebuild projected all three");
+        assert_eq!(
+            receipt.snapshots_emitted, 3,
+            "three snapshots re-emitted (the rebuild)"
+        );
+        assert_eq!(
+            cold.store().doc_count(),
+            3,
+            "the cold rebuild projected all three"
+        );
         assert_eq!(
             cold.parity_bytes(),
             live.parity_bytes(),
             "COLD reindex == LIVE projection, BYTE-FOR-BYTE (the F4 reindex-parity gate)"
         );
-        assert_eq!(cold.store().oltp_scan_path_count(), 0, "no OLTP-scan backdoor");
+        assert_eq!(
+            cold.store().oltp_scan_path_count(),
+            0,
+            "no OLTP-scan backdoor"
+        );
     }
 
     /// **A second reindex is an idempotent no-op (the deterministic-`event_id` `ON CONFLICT DO
@@ -475,17 +510,37 @@ mod tests {
         let sources: Vec<&dyn ReindexSource> = vec![&src];
 
         let (first, r1) = reindex_olap_from_bus(
-            region(), &scope, &sources, &mut outbox, &bus, &relay, ctx_base(), subject_prefix(),
+            region(),
+            &scope,
+            &sources,
+            &mut outbox,
+            &bus,
+            &relay,
+            ctx_base(),
+            subject_prefix(),
         )
         .unwrap();
         assert_eq!(r1.snapshots_emitted, 3, "the first rebuild emits three");
 
         let (second, r2) = reindex_olap_from_bus(
-            region(), &scope, &sources, &mut outbox, &bus, &relay, ctx_base(), subject_prefix(),
+            region(),
+            &scope,
+            &sources,
+            &mut outbox,
+            &bus,
+            &relay,
+            ctx_base(),
+            subject_prefix(),
         )
         .unwrap();
-        assert_eq!(r2.snapshots_emitted, 0, "the re-run emits 0 NEW snapshots (idempotent)");
-        assert_eq!(r2.snapshots_skipped_duplicate, 3, "all three skipped as duplicate");
+        assert_eq!(
+            r2.snapshots_emitted, 0,
+            "the re-run emits 0 NEW snapshots (idempotent)"
+        );
+        assert_eq!(
+            r2.snapshots_skipped_duplicate, 3,
+            "all three skipped as duplicate"
+        );
         assert_eq!(
             first.parity_bytes(),
             second.parity_bytes(),
@@ -503,7 +558,14 @@ mod tests {
         let scope = SnapshotScope::new("not_registered", "all");
         let sources: Vec<&dyn ReindexSource> = vec![&src];
         let err = reindex_olap_from_bus(
-            region(), &scope, &sources, &mut outbox, &bus, &relay, ctx_base(), subject_prefix(),
+            region(),
+            &scope,
+            &sources,
+            &mut outbox,
+            &bus,
+            &relay,
+            ctx_base(),
+            subject_prefix(),
         )
         .expect_err("an unknown-owner reindex must fail loudly");
         assert!(matches!(err, ReindexError::NoSourceForOwner(_)));
@@ -520,11 +582,25 @@ mod tests {
         let sources: Vec<&dyn ReindexSource> = vec![&src];
 
         let (cold, r1) = reindex_olap_from_bus(
-            region(), &scope, &sources, &mut outbox, &bus, &relay, ctx_base(), subject_prefix(),
+            region(),
+            &scope,
+            &sources,
+            &mut outbox,
+            &bus,
+            &relay,
+            ctx_base(),
+            subject_prefix(),
         )
         .unwrap();
         let (_again, r2) = reindex_olap_from_bus(
-            region(), &scope, &sources, &mut outbox, &bus, &relay, ctx_base(), subject_prefix(),
+            region(),
+            &scope,
+            &sources,
+            &mut outbox,
+            &bus,
+            &relay,
+            ctx_base(),
+            subject_prefix(),
         )
         .unwrap();
 
@@ -535,7 +611,10 @@ mod tests {
             snapshots_emitted_first: r1.snapshots_emitted,
             snapshots_emitted_second: r2.snapshots_emitted,
         };
-        assert!(signal.is_green(), "the F4 OLAP reindex-parity artifact is green: {signal:?}");
+        assert!(
+            signal.is_green(),
+            "the F4 OLAP reindex-parity artifact is green: {signal:?}"
+        );
         assert_eq!(signal.snapshots_emitted_first, 3);
         assert_eq!(signal.snapshots_emitted_second, 0);
     }
@@ -553,9 +632,21 @@ mod tests {
             snapshots_emitted_second: 0,
         };
         assert!(green.is_green());
-        assert!(!OlapReindexParitySignal { reindex_matches_live: false, ..green.clone() }.is_green());
-        assert!(!OlapReindexParitySignal { oltp_scan_path_count: 1, ..green.clone() }.is_green());
-        assert!(!OlapReindexParitySignal { snapshots_emitted_second: 1, ..green.clone() }.is_green());
+        assert!(!OlapReindexParitySignal {
+            reindex_matches_live: false,
+            ..green.clone()
+        }
+        .is_green());
+        assert!(!OlapReindexParitySignal {
+            oltp_scan_path_count: 1,
+            ..green.clone()
+        }
+        .is_green());
+        assert!(!OlapReindexParitySignal {
+            snapshots_emitted_second: 1,
+            ..green.clone()
+        }
+        .is_green());
     }
 
     /// **No OLTP-scan backdoor — STRUCTURAL source assertion (the §3.4 headline, on the LIVE feed).**
@@ -564,7 +655,10 @@ mod tests {
     #[test]
     fn no_oltp_scan_backdoor_in_the_feed_structural() {
         let src = include_str!("olap_feed.rs");
-        let prod = src.split("#[cfg(test)]").next().expect("a production half above tests");
+        let prod = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("a production half above tests");
         let code: String = prod
             .lines()
             .filter(|l| !l.trim_start().starts_with("//") && !l.trim_start().starts_with("//!"))

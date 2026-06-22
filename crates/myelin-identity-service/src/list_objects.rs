@@ -241,12 +241,10 @@ impl ListObjects {
         // is not `Ord`) so the candidate set is deterministic.
         let mut candidates: BTreeSet<String> = BTreeSet::new();
         for relation in self.namespace.relations_of(&ty.0) {
-            for obj in self.index.objects_for(
-                scope,
-                ty,
-                &subject.principal_id,
-                &RelName(relation.clone()),
-            ) {
+            for obj in
+                self.index
+                    .objects_for(scope, ty, &subject.principal_id, &RelName(relation.clone()))
+            {
                 candidates.insert(obj.0);
             }
         }
@@ -430,10 +428,10 @@ fn type_of_object_id(object_id: &str) -> String {
 mod tests {
     use super::*;
     use crate::reverse_index::{ReverseIndexConsumer, ReverseRow};
-    use myelin_events::{BusTransport, EventHandler as _, InProcessBus, OutboxStore, Relay, Timestamp};
-    use myelin_identity::{
-        ConsistencyMode, PrincipalId, PrincipalKind, RelationTuple, TupleDelta,
+    use myelin_events::{
+        BusTransport, EventHandler as _, InProcessBus, OutboxStore, Relay, Timestamp,
     };
+    use myelin_identity::{ConsistencyMode, PrincipalId, PrincipalKind, RelationTuple, TupleDelta};
     use myelin_tenancy::{Region, TenantId};
 
     fn actor_in(tenant: &str) -> Principal {
@@ -449,7 +447,11 @@ mod tests {
     }
 
     fn subject(id: &str, tenant: &str) -> Principal {
-        Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, TenantId(tenant.into()))
+        Principal::stub(
+            PrincipalId(id.into()),
+            PrincipalKind::Human,
+            TenantId(tenant.into()),
+        )
     }
 
     fn add(object: &str, relation: &str, subject: &str) -> TupleDelta {
@@ -498,7 +500,14 @@ mod tests {
 
         // Write each grant through S3 and feed S8 off the bus (the live feed).
         store
-            .write_tuples(scope, &actor_in(&scope.tenant().0), grants, None, None, now())
+            .write_tuples(
+                scope,
+                &actor_in(&scope.tenant().0),
+                grants,
+                None,
+                None,
+                now(),
+            )
             .expect("seed grants");
         let bus = InProcessBus::new();
         let relay = Relay::new(outbox.clone(), bus.clone(), || Timestamp("t".into()));
@@ -524,7 +533,13 @@ mod tests {
                 add("repo:secret", "reader", "p:bob"), // bob's, not alice's
             ],
         );
-        let r = lo.list_objects(&s, &subject("p:alice", "acme"), &Permission("read".into()), &ObjectType("repo".into()), &latest());
+        let r = lo.list_objects(
+            &s,
+            &subject("p:alice", "acme"),
+            &Permission("read".into()),
+            &ObjectType("repo".into()),
+            &latest(),
+        );
         match r {
             ListObjectsResult::Ids { mut ids, .. } => {
                 ids.sort_by(|a, b| a.0.cmp(&b.0));
@@ -550,12 +565,32 @@ mod tests {
         ];
         // cap = 1: two readable repos exceed it → Filter.
         let lo = wired(1, &s, &grants);
-        let r = lo.list_objects(&s, &subject("p:alice", "acme"), &Permission("read".into()), &ObjectType("repo".into()), &latest());
+        let r = lo.list_objects(
+            &s,
+            &subject("p:alice", "acme"),
+            &Permission("read".into()),
+            &ObjectType("repo".into()),
+            &latest(),
+        );
         match r {
             ListObjectsResult::Filter { set_expr, .. } => match set_expr {
-                SetExpr::InRelation { relation, via_column } => {
-                    assert_eq!(relation, RelName("read".into()), "the push-down names the permission relation");
-                    assert_eq!(via_column, ColRef { table: "repo".into(), column: "id".into() }, "the push-down names the consumer's own id column (§7.3)");
+                SetExpr::InRelation {
+                    relation,
+                    via_column,
+                } => {
+                    assert_eq!(
+                        relation,
+                        RelName("read".into()),
+                        "the push-down names the permission relation"
+                    );
+                    assert_eq!(
+                        via_column,
+                        ColRef {
+                            table: "repo".into(),
+                            column: "id".into()
+                        },
+                        "the push-down names the consumer's own id column (§7.3)"
+                    );
                 }
                 other => panic!("the Filter is the InRelation push-down shape, got {other:?}"),
             },
@@ -568,9 +603,17 @@ mod tests {
     fn no_grants_returns_empty_ids() {
         let s = scope("acme");
         let lo = wired(10, &s, &[add("repo:core", "reader", "p:alice")]);
-        let r = lo.list_objects(&s, &subject("p:nobody", "acme"), &Permission("read".into()), &ObjectType("repo".into()), &latest());
+        let r = lo.list_objects(
+            &s,
+            &subject("p:nobody", "acme"),
+            &Permission("read".into()),
+            &ObjectType("repo".into()),
+            &latest(),
+        );
         match r {
-            ListObjectsResult::Ids { ids, .. } => assert!(ids.is_empty(), "no grants → the empty set, never All"),
+            ListObjectsResult::Ids { ids, .. } => {
+                assert!(ids.is_empty(), "no grants → the empty set, never All")
+            }
             ListObjectsResult::Filter { .. } => panic!("no grants is a small (empty) set → Ids"),
         }
     }
@@ -582,9 +625,17 @@ mod tests {
         let lo = wired(10, &s, &[add("repo:core", "reader", "p:alice")]);
         let mut suspended = subject("p:alice", "acme");
         suspended.status = PrincipalStatus::Disabled;
-        let r = lo.list_objects(&s, &suspended, &Permission("read".into()), &ObjectType("repo".into()), &latest());
+        let r = lo.list_objects(
+            &s,
+            &suspended,
+            &Permission("read".into()),
+            &ObjectType("repo".into()),
+            &latest(),
+        );
         match r {
-            ListObjectsResult::Ids { ids, .. } => assert!(ids.is_empty(), "a disabled subject sees nothing (ID-D1)"),
+            ListObjectsResult::Ids { ids, .. } => {
+                assert!(ids.is_empty(), "a disabled subject sees nothing (ID-D1)")
+            }
             ListObjectsResult::Filter { .. } => panic!("a disabled subject is the empty Ids set"),
         }
     }
@@ -595,13 +646,26 @@ mod tests {
     fn ids_carry_the_s8_watermark_zookie() {
         let s = scope("acme");
         let lo = wired(10, &s, &[add("repo:core", "reader", "p:alice")]);
-        let r = lo.list_objects(&s, &subject("p:alice", "acme"), &Permission("read".into()), &ObjectType("repo".into()), &latest());
+        let r = lo.list_objects(
+            &s,
+            &subject("p:alice", "acme"),
+            &Permission("read".into()),
+            &ObjectType("repo".into()),
+            &latest(),
+        );
         let zookie = match r {
             ListObjectsResult::Ids { zookie, .. } => zookie,
             ListObjectsResult::Filter { zookie, .. } => zookie,
         };
-        assert_eq!(zookie, lo.index.watermark(&s), "the list reflects the S8 partition watermark");
-        assert!(!zookie.0.is_empty(), "the watermark advanced after the write");
+        assert_eq!(
+            zookie,
+            lo.index.watermark(&s),
+            "the list reflects the S8 partition watermark"
+        );
+        assert!(
+            !zookie.0.is_empty(),
+            "the watermark advanced after the write"
+        );
     }
 
     /// **No cross-tenant list path.** alice's repos in `acme` do not appear in a list under `globex`
@@ -611,9 +675,17 @@ mod tests {
         let acme = scope("acme");
         let lo = wired(10, &acme, &[add("repo:core", "reader", "p:alice")]);
         let globex = scope("globex");
-        let r = lo.list_objects(&globex, &subject("p:alice", "globex"), &Permission("read".into()), &ObjectType("repo".into()), &latest());
+        let r = lo.list_objects(
+            &globex,
+            &subject("p:alice", "globex"),
+            &Permission("read".into()),
+            &ObjectType("repo".into()),
+            &latest(),
+        );
         match r {
-            ListObjectsResult::Ids { ids, .. } => assert!(ids.is_empty(), "a grant in acme does not list under globex"),
+            ListObjectsResult::Ids { ids, .. } => {
+                assert!(ids.is_empty(), "a grant in acme does not list under globex")
+            }
             ListObjectsResult::Filter { .. } => panic!("the cross-tenant set is empty → Ids"),
         }
     }
@@ -627,7 +699,10 @@ mod tests {
         let index = ReverseIndex::new();
         let lo = ListObjects::new(store, NamespaceEngine::with_core_hierarchy(), index);
         assert_eq!(lo.cap(), DEFAULT_IDS_CARDINALITY_CAP);
-        assert_eq!(DEFAULT_IDS_CARDINALITY_CAP, 1000, "the seed default-to-beat written to thresholds.toml");
+        assert_eq!(
+            DEFAULT_IDS_CARDINALITY_CAP, 1000,
+            "the seed default-to-beat written to thresholds.toml"
+        );
         let _ = s;
     }
 
@@ -642,7 +717,14 @@ mod tests {
         // Seed a tuple in S3 so the permission resolution finds the direct grant, AND mirror it into
         // S8 (the candidate source) directly.
         store
-            .write_tuples(&s, &actor_in("acme"), &[add("repo:core", "reader", "p:alice")], None, None, now())
+            .write_tuples(
+                &s,
+                &actor_in("acme"),
+                &[add("repo:core", "reader", "p:alice")],
+                None,
+                None,
+                now(),
+            )
             .expect("seed");
         index.apply_delta(
             &s,
@@ -666,9 +748,17 @@ mod tests {
             }],
         });
         let lo = ListObjects::with_cap(store, namespace, index, 10);
-        let r = lo.list_objects(&s, &subject("p:alice", "acme"), &Permission("read".into()), &ObjectType("repo".into()), &latest());
+        let r = lo.list_objects(
+            &s,
+            &subject("p:alice", "acme"),
+            &Permission("read".into()),
+            &ObjectType("repo".into()),
+            &latest(),
+        );
         match r {
-            ListObjectsResult::Ids { ids, .. } => assert_eq!(ids, vec![ObjectId("repo:core".into())]),
+            ListObjectsResult::Ids { ids, .. } => {
+                assert_eq!(ids, vec![ObjectId("repo:core".into())])
+            }
             ListObjectsResult::Filter { .. } => panic!("a single candidate materialises as Ids"),
         }
     }

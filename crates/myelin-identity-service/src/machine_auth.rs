@@ -191,7 +191,11 @@ impl Authority {
     /// a caveat ADD authority, breaking the security floor.
     pub fn attenuate(&self, requested: &Authority) -> Authority {
         Authority {
-            grants: self.grants.intersection(&requested.grants).cloned().collect(),
+            grants: self
+                .grants
+                .intersection(&requested.grants)
+                .cloned()
+                .collect(),
         }
     }
 
@@ -565,10 +569,7 @@ impl CapabilityAuthenticator {
     /// ceiling is refused — the authority is NEVER silently widened. The PAT/CI/agent kinds carry
     /// their attenuated caveat chain unchanged (no extra structural ceiling — their narrowing is the
     /// monotone delegation algebra, §6).
-    fn enforce_authority_ceiling(
-        &self,
-        token: &CapabilityToken,
-    ) -> myelin_identity::Result<()> {
+    fn enforce_authority_ceiling(&self, token: &CapabilityToken) -> myelin_identity::Result<()> {
         match token.kind {
             MachineKind::DeployKey => {
                 // Every grant must be a repo grant (the one-repo ceiling). A deploy key naming a
@@ -718,14 +719,29 @@ mod tests {
             );
             let p = auth
                 .authenticate(
-                    &cred(s, material("acme", "eu-west", "subj-1", "jti-1", *dpop, &[grant])),
+                    &cred(
+                        s,
+                        material("acme", "eu-west", "subj-1", "jti-1", *dpop, &[grant]),
+                    ),
                     None,
                 )
                 .unwrap_or_else(|e| panic!("scheme `{s}` should resolve: {e:?}"));
-            assert_eq!(p.principal_id, PrincipalId("svc:machine".into()), "scheme {s}");
-            assert_eq!(p.tenant, TenantId("acme".into()), "scheme {s} tenant from token");
+            assert_eq!(
+                p.principal_id,
+                PrincipalId("svc:machine".into()),
+                "scheme {s}"
+            );
+            assert_eq!(
+                p.tenant,
+                TenantId("acme".into()),
+                "scheme {s} tenant from token"
+            );
             assert_eq!(p.region, Region("eu-west".into()), "scheme {s} region");
-            assert_eq!(p.kind, PrincipalKind::Service, "scheme {s} machine → Service");
+            assert_eq!(
+                p.kind,
+                PrincipalKind::Service,
+                "scheme {s} machine → Service"
+            );
         }
     }
 
@@ -748,18 +764,36 @@ mod tests {
             .authenticate(
                 &cred(
                     scheme::DEPLOY_KEY,
-                    material("acme", "eu-west", "SHA256:dk", "jti-dk", false, &["repo:acme/web#push"]),
+                    material(
+                        "acme",
+                        "eu-west",
+                        "SHA256:dk",
+                        "jti-dk",
+                        false,
+                        &["repo:acme/web#push"],
+                    ),
                 ),
                 None,
             )
             .unwrap();
-        assert_eq!(p.kind, PrincipalKind::Service, "a deploy key → repo-scoped Service principal");
+        assert_eq!(
+            p.kind,
+            PrincipalKind::Service,
+            "a deploy key → repo-scoped Service principal"
+        );
 
         // A deploy key naming a PROJECT-WIDE (non-repo) grant exceeds its ceiling → refused.
         let r = auth.authenticate(
             &cred(
                 scheme::DEPLOY_KEY,
-                material("acme", "eu-west", "SHA256:dk", "jti-dk2", false, &["project:acme#admin"]),
+                material(
+                    "acme",
+                    "eu-west",
+                    "SHA256:dk",
+                    "jti-dk2",
+                    false,
+                    &["project:acme#admin"],
+                ),
             ),
             None,
         );
@@ -789,12 +823,23 @@ mod tests {
             .authenticate(
                 &cred(
                     scheme::PER_JOB,
-                    material("acme", "eu-west", "run-1", "jti-r1", false, &["selfhosted:acme"]),
+                    material(
+                        "acme",
+                        "eu-west",
+                        "run-1",
+                        "jti-r1",
+                        false,
+                        &["selfhosted:acme"],
+                    ),
                 ),
                 None,
             )
             .unwrap();
-        assert_eq!(p.tenant, TenantId("acme".into()), "the runner resolves into its own tenant");
+        assert_eq!(
+            p.tenant,
+            TenantId("acme".into()),
+            "the runner resolves into its own tenant"
+        );
         assert_eq!(
             auth.idor_counters().path_derived_tenant_count(),
             0,
@@ -805,7 +850,14 @@ mod tests {
         let r = auth.authenticate(
             &cred(
                 scheme::PER_JOB,
-                material("acme", "eu-west", "run-1", "jti-r2", false, &["selfhosted:globex"]),
+                material(
+                    "acme",
+                    "eu-west",
+                    "run-1",
+                    "jti-r2",
+                    false,
+                    &["selfhosted:globex"],
+                ),
             ),
             None,
         );
@@ -831,8 +883,13 @@ mod tests {
             None,
         )
         .unwrap();
-        st.link_credential(&acme, scheme::PER_JOB, "run-1", &PrincipalId("svc:runner".into()))
-            .unwrap();
+        st.link_credential(
+            &acme,
+            scheme::PER_JOB,
+            "run-1",
+            &PrincipalId("svc:runner".into()),
+        )
+        .unwrap();
         let auth = CapabilityAuthenticator::new(st);
 
         // A token VERIFIED for globex presenting the same subject key resolves into globex's
@@ -840,7 +897,14 @@ mod tests {
         let r = auth.authenticate(
             &cred(
                 scheme::PER_JOB,
-                material("globex", "eu-west", "run-1", "jti-x", false, &["selfhosted:globex"]),
+                material(
+                    "globex",
+                    "eu-west",
+                    "run-1",
+                    "jti-x",
+                    false,
+                    &["selfhosted:globex"],
+                ),
             ),
             None,
         );
@@ -866,7 +930,10 @@ mod tests {
         );
         let p = auth
             .authenticate(
-                &cred(scheme::CI, material("acme", "eu-west", "run-7", "jti-ci", false, &["ci:run"])),
+                &cred(
+                    scheme::CI,
+                    material("acme", "eu-west", "run-7", "jti-ci", false, &["ci:run"]),
+                ),
                 Some(&TenantId("globex".into())),
             )
             .unwrap();
@@ -913,7 +980,10 @@ mod tests {
             attenuated.is_subset_of(&parent),
             "attenuation is monotone: the child authority is no wider than the parent"
         );
-        assert!(attenuated.len() < parent.len(), "the chain strictly narrowed (#write dropped)");
+        assert!(
+            attenuated.len() < parent.len(),
+            "the chain strictly narrowed (#write dropped)"
+        );
         assert!(
             !attenuated.holds("repo:acme/web#admin"),
             "a grant the parent never held is NEVER minted by a caveat (monotone law)"
@@ -923,7 +993,10 @@ mod tests {
 
         // A multi-step chain stays monotone: attenuating again only narrows further.
         let step2 = attenuated.attenuate(&Authority::of(["repo:acme/web#read"]));
-        assert!(step2.is_subset_of(&attenuated), "a second caveat narrows again (never widens)");
+        assert!(
+            step2.is_subset_of(&attenuated),
+            "a second caveat narrows again (never widens)"
+        );
         assert_eq!(step2.len(), 1, "the chain converged to one grant");
     }
 
@@ -933,11 +1006,11 @@ mod tests {
     #[test]
     fn attenuation_is_never_amplifying() {
         let cases: &[(&[&str], &[&str])] = &[
-            (&["a", "b"], &["a", "b", "c"]),   // caveat asks for more than parent has
-            (&["a", "b", "c"], &["b"]),        // caveat narrows
-            (&[], &["a"]),                     // empty parent stays empty
-            (&["a"], &[]),                     // empty caveat ⇒ empty result
-            (&["x", "y"], &["x", "y"]),        // equal ⇒ equal (subset, not strict)
+            (&["a", "b"], &["a", "b", "c"]), // caveat asks for more than parent has
+            (&["a", "b", "c"], &["b"]),      // caveat narrows
+            (&[], &["a"]),                   // empty parent stays empty
+            (&["a"], &[]),                   // empty caveat ⇒ empty result
+            (&["x", "y"], &["x", "y"]),      // equal ⇒ equal (subset, not strict)
         ];
         for (parent_g, caveat_g) in cases {
             let parent = Authority::of(parent_g.iter().copied());
@@ -967,7 +1040,17 @@ mod tests {
         );
         // Bearer-only PAT (dpop = false) → refused.
         let r = auth.authenticate(
-            &cred(scheme::PAT, material("acme", "eu-west", "pat-1", "jti-p1", false, &["repo:acme/web#read"])),
+            &cred(
+                scheme::PAT,
+                material(
+                    "acme",
+                    "eu-west",
+                    "pat-1",
+                    "jti-p1",
+                    false,
+                    &["repo:acme/web#read"],
+                ),
+            ),
             None,
         );
         assert!(
@@ -977,11 +1060,25 @@ mod tests {
         // DPoP-bound PAT → resolves.
         let p = auth
             .authenticate(
-                &cred(scheme::PAT, material("acme", "eu-west", "pat-1", "jti-p2", true, &["repo:acme/web#read"])),
+                &cred(
+                    scheme::PAT,
+                    material(
+                        "acme",
+                        "eu-west",
+                        "pat-1",
+                        "jti-p2",
+                        true,
+                        &["repo:acme/web#read"],
+                    ),
+                ),
                 None,
             )
             .unwrap();
-        assert_eq!(p.principal_id, PrincipalId("p:alice".into()), "a DPoP-bound PAT resolves");
+        assert_eq!(
+            p.principal_id,
+            PrincipalId("p:alice".into()),
+            "a DPoP-bound PAT resolves"
+        );
     }
 
     /// **A revoked token (S7 denylist) fails closed (the revocation consult seam → P-ID-14).** A token
@@ -1000,7 +1097,10 @@ mod tests {
         );
         // Before revocation: resolves.
         auth.authenticate(
-            &cred(scheme::CI, material("acme", "eu-west", "run-9", "jti-live", false, &["ci:run"])),
+            &cred(
+                scheme::CI,
+                material("acme", "eu-west", "run-9", "jti-live", false, &["ci:run"]),
+            ),
             None,
         )
         .unwrap();
@@ -1008,7 +1108,10 @@ mod tests {
         auth.denylist().revoke_jti("jti-live");
         // After revocation: fail-closed.
         let r = auth.authenticate(
-            &cred(scheme::CI, material("acme", "eu-west", "run-9", "jti-live", false, &["ci:run"])),
+            &cred(
+                scheme::CI,
+                material("acme", "eu-west", "run-9", "jti-live", false, &["ci:run"]),
+            ),
             None,
         );
         assert!(
@@ -1044,13 +1147,13 @@ mod tests {
     fn malformed_token_envelope_is_refused() {
         let auth = CapabilityAuthenticator::new(store());
         let bad = [
-            "",                                     // empty
-            "acme|eu-west|s|jti|0",                 // 5 fields (missing grants)
-            "acme|eu-west|s|jti|0|g|extra",         // 7 fields
-            "|eu-west|s|jti|0|",                    // empty tenant
-            "acme|eu-west||jti|0|",                 // empty subject_key
-            "acme|eu-west|s||0|",                   // empty jti
-            "acme|eu-west|s|jti|2|",                // bad dpop flag
+            "",                             // empty
+            "acme|eu-west|s|jti|0",         // 5 fields (missing grants)
+            "acme|eu-west|s|jti|0|g|extra", // 7 fields
+            "|eu-west|s|jti|0|",            // empty tenant
+            "acme|eu-west||jti|0|",         // empty subject_key
+            "acme|eu-west|s||0|",           // empty jti
+            "acme|eu-west|s|jti|2|",        // bad dpop flag
         ];
         for m in bad {
             let r = auth.authenticate(&cred(scheme::CI, m.into()), None);
@@ -1081,16 +1184,30 @@ mod tests {
         );
         assert_eq!(auth.telemetry().decision_count(), 0);
         auth.authenticate(
-            &cred(scheme::AGENT, material("acme", "eu-west", "run-x", "jti-a", false, &["agent:run"])),
+            &cred(
+                scheme::AGENT,
+                material("acme", "eu-west", "run-x", "jti-a", false, &["agent:run"]),
+            ),
             None,
         )
         .unwrap();
-        assert_eq!(auth.telemetry().decision_count(), 1, "success emits one observation");
+        assert_eq!(
+            auth.telemetry().decision_count(),
+            1,
+            "success emits one observation"
+        );
         let _ = auth.authenticate(
-            &cred(scheme::AGENT, material("acme", "eu-west", "no-such", "jti-b", false, &["agent:run"])),
+            &cred(
+                scheme::AGENT,
+                material("acme", "eu-west", "no-such", "jti-b", false, &["agent:run"]),
+            ),
             None,
         );
-        assert_eq!(auth.telemetry().decision_count(), 2, "a failed decision also emits");
+        assert_eq!(
+            auth.telemetry().decision_count(),
+            2,
+            "a failed decision also emits"
+        );
         assert_eq!(AuthTelemetry::SIGNAL, signals::AUTH_DECISION_LATENCY);
     }
 
@@ -1102,18 +1219,38 @@ mod tests {
     #[test]
     fn authority_and_kind_predicates_are_exact() {
         let parent = Authority::of(["a", "b"]);
-        assert!(Authority::of(["a"]).is_subset_of(&parent), "a strict subset is ⊆");
-        assert!(parent.is_subset_of(&parent), "an equal set is ⊆ (not strict)");
-        assert!(!Authority::of(["a", "c"]).is_subset_of(&parent), "a non-subset is NOT ⊆");
-        assert!(Authority::default().is_empty(), "the empty authority is empty");
+        assert!(
+            Authority::of(["a"]).is_subset_of(&parent),
+            "a strict subset is ⊆"
+        );
+        assert!(
+            parent.is_subset_of(&parent),
+            "an equal set is ⊆ (not strict)"
+        );
+        assert!(
+            !Authority::of(["a", "c"]).is_subset_of(&parent),
+            "a non-subset is NOT ⊆"
+        );
+        assert!(
+            Authority::default().is_empty(),
+            "the empty authority is empty"
+        );
         assert!(!parent.is_empty(), "a non-empty authority is not empty");
         assert_eq!(parent.len(), 2);
         assert!(parent.holds("a") && !parent.holds("z"));
 
         // is_self_hosted_runner is true ONLY for PerJob.
         assert!(MachineKind::PerJob.is_self_hosted_runner());
-        for k in [MachineKind::Pat, MachineKind::Ci, MachineKind::Agent, MachineKind::DeployKey] {
-            assert!(!k.is_self_hosted_runner(), "{k:?} is not a self-hosted runner");
+        for k in [
+            MachineKind::Pat,
+            MachineKind::Ci,
+            MachineKind::Agent,
+            MachineKind::DeployKey,
+        ] {
+            assert!(
+                !k.is_self_hosted_runner(),
+                "{k:?} is not a self-hosted runner"
+            );
         }
 
         // is_machine recognises exactly the five machine schemes (and nothing human/SSO).
@@ -1121,7 +1258,10 @@ mod tests {
             assert!(scheme::is_machine(s), "`{s}` is a machine scheme");
         }
         for s in human_scheme::HUMAN_SSO_SCHEMES {
-            assert!(!scheme::is_machine(s), "`{s}` is NOT a machine scheme (it is human/SSO)");
+            assert!(
+                !scheme::is_machine(s),
+                "`{s}` is NOT a machine scheme (it is human/SSO)"
+            );
         }
         assert!(!scheme::is_machine("nonsense"));
     }
@@ -1141,7 +1281,17 @@ mod tests {
                 status,
             );
             let r = auth.authenticate(
-                &cred(scheme::DEPLOY_KEY, material("acme", "eu-west", "SHA256:dk", "jti", false, &["repo:acme/web#push"])),
+                &cred(
+                    scheme::DEPLOY_KEY,
+                    material(
+                        "acme",
+                        "eu-west",
+                        "SHA256:dk",
+                        "jti",
+                        false,
+                        &["repo:acme/web#push"],
+                    ),
+                ),
                 None,
             );
             assert!(

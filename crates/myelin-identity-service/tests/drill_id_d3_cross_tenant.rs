@@ -99,7 +99,13 @@ fn id_d3_cross_tenant_path_spoof_reads_zero() {
     // grant within acme's own partition).
     let alice = principal("acme", "p:alice");
     assert_eq!(
-        svc.check(&alice, &Permission("view".into()), &spoofed_object, &at_latest(), None),
+        svc.check(
+            &alice,
+            &Permission("view".into()),
+            &spoofed_object,
+            &at_latest(),
+            None
+        ),
         Ok(Decision::Allow),
         "the legitimate acme principal inherits view (the engine resolves within acme's partition)"
     );
@@ -188,7 +194,13 @@ fn id_d3_inheritance_edge_does_not_cross_tenant() {
     // Deny. The inheritance edge in acme's partition is invisible cross-tenant.
     let mallory = principal("evil-corp", "p:alice");
     assert_eq!(
-        svc.check(&mallory, &Permission("view".into()), &obj, &at_latest(), None),
+        svc.check(
+            &mallory,
+            &Permission("view".into()),
+            &obj,
+            &at_latest(),
+            None
+        ),
         Ok(Decision::Deny),
         "a cross-tenant principal does not inherit through acme's tuple-to-userset edge"
     );

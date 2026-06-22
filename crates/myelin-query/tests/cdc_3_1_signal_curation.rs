@@ -25,12 +25,10 @@ use myelin_events::{
     Actor, AggregateKey, ArtifactRef, CorrelationId, DataRole, EventEnvelope, EventId, EventType,
     Timestamp, Visibility,
 };
-use myelin_identity::{
-    Literal, ObjectType, Principal, PrincipalId, PrincipalKind, SetExpr,
-};
+use myelin_identity::{Literal, ObjectType, Principal, PrincipalId, PrincipalKind, SetExpr};
 use myelin_query::{
-    define_signal_rule, CmpOp, DedupKeyTpl, DedupWindow, EventMatcher, Expr, Predicate, PublishKind,
-    RuleId, Severity, SignalEngine, SignalState,
+    define_signal_rule, CmpOp, DedupKeyTpl, DedupWindow, EventMatcher, Expr, Predicate,
+    PublishKind, RuleId, Severity, SignalEngine, SignalState,
 };
 use myelin_tenancy::{Region, TenantId};
 
@@ -109,7 +107,11 @@ fn cdc_3_1_provider_curates_dedup_collapse_consumer_reads_count() {
     for i in 0..5 {
         let env = envelope_at("ci.run.failed", "42", &format!("2026-06-20T00:00:0{i}Z"));
         let drafts = engine.ingest(&env, &SetExpr::All, &see_all);
-        assert_eq!(drafts.len(), 1, "one rule → one curated draft per matching event");
+        assert_eq!(
+            drafts.len(),
+            1,
+            "one rule → one curated draft per matching event"
+        );
         // The CONSUMER side reads the curated subject + count off the draft.
         last_subject = drafts[0].subject.clone();
         last_count = drafts[0].signal.count;
@@ -121,7 +123,10 @@ fn cdc_3_1_provider_curates_dedup_collapse_consumer_reads_count() {
         "the publish subject is the frozen sig.<tenant>.<severity>.<rule>"
     );
     // And the dedup-window collapse gave it ONE Signal with count=N (the storm-control unit).
-    assert_eq!(last_count, 5, "N=5 identical failures collapse to one Signal count=5");
+    assert_eq!(
+        last_count, 5,
+        "N=5 identical failures collapse to one Signal count=5"
+    );
 }
 
 /// The 3.1 pair, RESOLVE leg: a PROVIDER auto-resolves the curated Signal on the resolving

@@ -33,12 +33,10 @@ use myelin_events::{
     consume, Actor, AggregateKey, ArtifactRef, Backoff, BusTransport, CausedBy, Consumer,
     ConsumerName, ConsumerSpec, CorrelationId, DataRole, DedupLedger, Delivered, EmitContextBase,
     EventDraft, EventEnvelope, EventHandler, EventId, EventType, HandleOutcome, IdMinter,
-    InProcessBus, Message, MonotonicMinter, OutboxStore, OutboxTx, PerTenantInflight, PrefetchBound,
-    Relay, SubjectPattern, Timestamp, Visibility,
+    InProcessBus, Message, MonotonicMinter, OutboxStore, OutboxTx, PerTenantInflight,
+    PrefetchBound, Relay, SubjectPattern, Timestamp, Visibility,
 };
-use myelin_harness::{
-    DrillRegistry, DrillScenario, Label, Predicate, SignalName, SignalSource,
-};
+use myelin_harness::{DrillRegistry, DrillScenario, Label, Predicate, SignalName, SignalSource};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_tenancy::{Region, TenantId};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -47,7 +45,11 @@ use std::sync::Arc;
 const WHITELIST_PREFIX: &str = "myelin://acme/issues/";
 
 fn principal() -> Principal {
-    Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId("acme".into()))
+    Principal::stub(
+        PrincipalId("p".into()),
+        PrincipalKind::Human,
+        TenantId("acme".into()),
+    )
 }
 
 fn envelope(id: &str, subject: &str, tenant: &str) -> EventEnvelope {
@@ -75,7 +77,10 @@ fn envelope(id: &str, subject: &str, tenant: &str) -> EventEnvelope {
 }
 
 fn msg(id: &str, subject: &str) -> Message {
-    Message { subject: subject.into(), envelope: envelope(id, subject, "acme") }
+    Message {
+        subject: subject.into(),
+        envelope: envelope(id, subject, "acme"),
+    }
 }
 
 /// The whitelist-template consumer: it only handles `issues.*` (one whitelisted prefix). A handler
@@ -107,7 +112,10 @@ struct NaiveStarConsumer {
 }
 impl NaiveStarConsumer {
     fn new() -> Self {
-        NaiveStarConsumer { pending: std::cell::RefCell::new(0), processed: std::cell::RefCell::new(0) }
+        NaiveStarConsumer {
+            pending: std::cell::RefCell::new(0),
+            processed: std::cell::RefCell::new(0),
+        }
     }
     /// Deliver to the naive consumer. It "recognises" only `issues.*` subjects; everything else it
     /// cannot handle, so it sits in the backlog forever (head-of-line block) — its `num_pending`
@@ -132,7 +140,9 @@ impl NaiveStarConsumer {
 fn template_consumer() -> Consumer<CountingHandler> {
     consume(
         ConsumerSpec::new(ConsumerName("indexer".into()), &[WHITELIST_PREFIX]),
-        CountingHandler { runs: AtomicU32::new(0) },
+        CountingHandler {
+            runs: AtomicU32::new(0),
+        },
         DedupLedger::new(),
     )
     .expect("a concrete whitelist is admitted")
@@ -157,9 +167,16 @@ fn drill_bus_d2_whitelist_consumer_does_not_stall_naive_star_does() {
     const JUNK: u64 = 1000;
     let mut flood: Vec<Message> = Vec::new();
     for i in 0..5 {
-        flood.push(msg(&format!("01J-real-{i}"), &format!("{WHITELIST_PREFIX}issue/PROJ-{i}")));
+        flood.push(msg(
+            &format!("01J-real-{i}"),
+            &format!("{WHITELIST_PREFIX}issue/PROJ-{i}"),
+        ));
     }
-    let junk_subjects = ["myelin://acme/chat/m", "myelin://acme/ci/job", "myelin://acme/refs/edge"];
+    let junk_subjects = [
+        "myelin://acme/chat/m",
+        "myelin://acme/ci/job",
+        "myelin://acme/refs/edge",
+    ];
     for i in 0..JUNK {
         let s = junk_subjects[(i as usize) % junk_subjects.len()];
         flood.push(msg(&format!("01J-junk-{i}"), &format!("{s}/{i}")));
@@ -175,26 +192,57 @@ fn drill_bus_d2_whitelist_consumer_does_not_stall_naive_star_does() {
         if m.subject.starts_with(WHITELIST_PREFIX) {
             assert_eq!(out, Delivered::Acked, "whitelisted real events are handled");
         } else {
-            assert!(matches!(out, Delivered::DeadLettered(_)), "off-whitelist junk is rejected, not queued");
+            assert!(
+                matches!(out, Delivered::DeadLettered(_)),
+                "off-whitelist junk is rejected, not queued"
+            );
         }
     }
 
     // === The template consumer did NOT stall: it handled all 5 real events; its lag is BOUNDED. ===
-    assert_eq!(template.handler().runs.load(Ordering::SeqCst), 5, "the template handled every real event");
-    assert_eq!(template.lag(), 0, "the template consumer's lag is bounded (0) — no head-of-line stall");
-    assert_eq!(template.dead_letters().len() as u64, JUNK, "the junk was rejected at the boundary, surfaced");
+    assert_eq!(
+        template.handler().runs.load(Ordering::SeqCst),
+        5,
+        "the template handled every real event"
+    );
+    assert_eq!(
+        template.lag(),
+        0,
+        "the template consumer's lag is bounded (0) — no head-of-line stall"
+    );
+    assert_eq!(
+        template.dead_letters().len() as u64,
+        JUNK,
+        "the junk was rejected at the boundary, surfaced"
+    );
 
     // === The naive `*` consumer STALLED: it processed only the 5 it recognised; the rest is an
     //     UNBOUNDED backlog its lag grows without bound on. ===
-    assert_eq!(naive.processed(), 5, "the naive consumer processed only the recognised handful");
-    assert_eq!(naive.lag(), JUNK, "the naive `*` consumer's lag grew to the whole junk flood (HoL stall)");
+    assert_eq!(
+        naive.processed(),
+        5,
+        "the naive consumer processed only the recognised handful"
+    );
+    assert_eq!(
+        naive.lag(),
+        JUNK,
+        "the naive `*` consumer's lag grew to the whole junk flood (HoL stall)"
+    );
 
     // === The lag alarm FIRES on the naive consumer (num_pending crossed the bound); it does NOT on
     //     the template consumer. The §4.11 `ConsumerLag` survival signal, labelled per consumer. ===
     const LAG_ALARM_BOUND: i64 = 100;
     let mut signals = SignalSource::new();
-    signals.set_labelled(SignalName::ConsumerLag, vec![Label::new("consumer", "naive-star")], naive.lag() as i64);
-    signals.set_labelled(SignalName::ConsumerLag, vec![Label::new("consumer", "indexer")], template.lag() as i64);
+    signals.set_labelled(
+        SignalName::ConsumerLag,
+        vec![Label::new("consumer", "naive-star")],
+        naive.lag() as i64,
+    );
+    signals.set_labelled(
+        SignalName::ConsumerLag,
+        vec![Label::new("consumer", "indexer")],
+        template.lag() as i64,
+    );
 
     // the alarm fires on the naive consumer: its lag EXCEEDS the bound.
     signals
@@ -226,8 +274,17 @@ fn drill_bus_d2_whitelist_consumer_does_not_stall_naive_star_does() {
 fn drill_bus_d2_star_subscription_is_unconstructable_through_consume() {
     for bad in ["*", ">", "issues.*", "issues.>", ""] {
         let spec = ConsumerSpec::new(ConsumerName("indexer".into()), &[bad]);
-        let r = consume(spec, CountingHandler { runs: AtomicU32::new(0) }, DedupLedger::new());
-        assert!(r.is_err(), "the over-broad subject `{bad}` is rejected — a `*` consumer cannot be built");
+        let r = consume(
+            spec,
+            CountingHandler {
+                runs: AtomicU32::new(0),
+            },
+            DedupLedger::new(),
+        );
+        assert!(
+            r.is_err(),
+            "the over-broad subject `{bad}` is rejected — a `*` consumer cannot be built"
+        );
     }
 }
 
@@ -269,7 +326,11 @@ fn drill_eb05_per_tenant_surge_is_bounded_other_tenant_not_starved() {
     for i in 0..20 {
         let m = Message {
             subject: "myelin://surge/issues/x".into(),
-            envelope: envelope(&format!("01J-surge-{i}"), "myelin://surge/issues/x", "surge"),
+            envelope: envelope(
+                &format!("01J-surge-{i}"),
+                "myelin://surge/issues/x",
+                "surge",
+            ),
         };
         match c.deliver(&m) {
             Delivered::Retried(_) => {}
@@ -280,43 +341,75 @@ fn drill_eb05_per_tenant_surge_is_bounded_other_tenant_not_starved() {
             other => panic!("unexpected surge outcome: {other:?}"),
         }
     }
-    assert_eq!(c.tenant_inflight(&TenantId("surge".into())), CAP, "the surge tenant is bounded to its cap");
-    assert_eq!(throttled, 20 - CAP, "every surge event over the cap was throttled (deferred, not dropped)");
+    assert_eq!(
+        c.tenant_inflight(&TenantId("surge".into())),
+        CAP,
+        "the surge tenant is bounded to its cap"
+    );
+    assert_eq!(
+        throttled,
+        20 - CAP,
+        "every surge event over the cap was throttled (deferred, not dropped)"
+    );
 
     // A DIFFERENT tenant's events ALL ack — the surge did NOT starve it (fairness held, 0 lost).
     for i in 0..10 {
         let m = Message {
             subject: "myelin://other/issues/y".into(),
-            envelope: envelope(&format!("01J-other-{i}"), "myelin://other/issues/y", "other"),
+            envelope: envelope(
+                &format!("01J-other-{i}"),
+                "myelin://other/issues/y",
+                "other",
+            ),
         };
-        assert_eq!(c.deliver(&m), Delivered::Acked, "the other tenant flows under the surge");
+        assert_eq!(
+            c.deliver(&m),
+            Delivered::Acked,
+            "the other tenant flows under the surge"
+        );
     }
-    assert_eq!(c.tenant_inflight(&TenantId("other".into())), 0, "the other tenant drained (not starved)");
+    assert_eq!(
+        c.tenant_inflight(&TenantId("other".into())),
+        0,
+        "the other tenant drained (not starved)"
+    );
 
     // The `bus.per_tenant_inflight` survival signal: the surge tenant's in-flight is bounded to the
     // cap; the other tenant's is 0 (it never queued behind the surge).
     let mut signals = SignalSource::new();
     signals.set_labelled(
         SignalName::ConsumerLag,
-        vec![Label::new("consumer", "indexer"), Label::new("tenant", "surge")],
+        vec![
+            Label::new("consumer", "indexer"),
+            Label::new("tenant", "surge"),
+        ],
         c.tenant_inflight(&TenantId("surge".into())) as i64,
     );
     signals.set_labelled(
         SignalName::ConsumerLag,
-        vec![Label::new("consumer", "indexer"), Label::new("tenant", "other")],
+        vec![
+            Label::new("consumer", "indexer"),
+            Label::new("tenant", "other"),
+        ],
         c.tenant_inflight(&TenantId("other".into())) as i64,
     );
     signals
         .assert_labelled(
             SignalName::ConsumerLag,
-            vec![Label::new("consumer", "indexer"), Label::new("tenant", "surge")],
+            vec![
+                Label::new("consumer", "indexer"),
+                Label::new("tenant", "surge"),
+            ],
             Predicate::Lte(CAP as i64),
         )
         .expect_green();
     signals
         .assert_labelled(
             SignalName::ConsumerLag,
-            vec![Label::new("consumer", "indexer"), Label::new("tenant", "other")],
+            vec![
+                Label::new("consumer", "indexer"),
+                Label::new("tenant", "other"),
+            ],
             Predicate::Eq(0),
         )
         .expect_green();
@@ -374,12 +467,18 @@ fn cdc_2_4_provider_relay_to_consumer_template_pair() {
 
     let bus = InProcessBus::new();
     Relay::new(store.clone(), bus.clone(), clock).drain_to_empty();
-    assert_eq!(bus.delivered_count(), 3, "the provider relayed all 3 onto the broker");
+    assert_eq!(
+        bus.delivered_count(),
+        3,
+        "the provider relayed all 3 onto the broker"
+    );
 
     // === Consumer: stood up through the EB-05 entry-point, reads exactly the relayed envelopes. ===
     let c = consume(
         ConsumerSpec::new(ConsumerName("indexer".into()), &[WHITELIST_PREFIX]),
-        CountingHandler { runs: AtomicU32::new(0) },
+        CountingHandler {
+            runs: AtomicU32::new(0),
+        },
         DedupLedger::new(),
     )
     .unwrap();
@@ -393,10 +492,25 @@ fn cdc_2_4_provider_relay_to_consumer_template_pair() {
         })
         .collect();
 
-    assert_eq!(outcomes.len(), 3, "the consumer saw exactly the 3 relayed events (provider↔consumer pair)");
-    assert!(outcomes.iter().all(|o| *o == Delivered::Acked), "each relayed event processed once");
-    assert_eq!(c.handler().runs.load(Ordering::SeqCst), 3, "the handler ran exactly 3 times");
-    assert_eq!(c.dedup().len(), 3, "3 (consumer, event_id) pairs recorded (2.5, the dedup half)");
+    assert_eq!(
+        outcomes.len(),
+        3,
+        "the consumer saw exactly the 3 relayed events (provider↔consumer pair)"
+    );
+    assert!(
+        outcomes.iter().all(|o| *o == Delivered::Acked),
+        "each relayed event processed once"
+    );
+    assert_eq!(
+        c.handler().runs.load(Ordering::SeqCst),
+        3,
+        "the handler ran exactly 3 times"
+    );
+    assert_eq!(
+        c.dedup().len(),
+        3,
+        "3 (consumer, event_id) pairs recorded (2.5, the dedup half)"
+    );
 
     // A redelivery of the same stream is fully deduped (the 2.5 effectively-once anchor under 2.4).
     let again: Vec<Delivered> = bus
@@ -407,8 +521,15 @@ fn cdc_2_4_provider_relay_to_consumer_template_pair() {
             c.deliver(&Message { subject, envelope })
         })
         .collect();
-    assert!(again.iter().all(|o| *o == Delivered::Deduplicated), "redelivery is deduped under 2.4");
-    assert_eq!(c.handler().runs.load(Ordering::SeqCst), 3, "the handler still ran only 3 times (0 dup)");
+    assert!(
+        again.iter().all(|o| *o == Delivered::Deduplicated),
+        "redelivery is deduped under 2.4"
+    );
+    assert_eq!(
+        c.handler().runs.load(Ordering::SeqCst),
+        3,
+        "the handler still ran only 3 times (0 dup)"
+    );
     let _ = ids;
 }
 
@@ -424,7 +545,10 @@ fn bus_d2_and_fairness_register_into_the_permanent_drill_suite() {
         let naive = NaiveStarConsumer::new();
         const JUNK: u64 = 500;
         for i in 0..3 {
-            let m = msg(&format!("01J-real-{i}"), &format!("{WHITELIST_PREFIX}issue/PROJ-{i}"));
+            let m = msg(
+                &format!("01J-real-{i}"),
+                &format!("{WHITELIST_PREFIX}issue/PROJ-{i}"),
+            );
             naive.deliver(&m.subject);
             template.deliver(&m);
         }
@@ -488,23 +612,43 @@ fn bus_d2_and_fairness_register_into_the_permanent_drill_suite() {
             subject: "myelin://other/y".into(),
             envelope: envelope("01J-o", "myelin://other/y", "other"),
         };
-        assert_eq!(c.deliver(&other), Delivered::Acked, "other tenant not starved");
-        assert_eq!(c.tenant_inflight(&TenantId("surge".into())), CAP, "surge bounded to cap");
+        assert_eq!(
+            c.deliver(&other),
+            Delivered::Acked,
+            "other tenant not starved"
+        );
+        assert_eq!(
+            c.tenant_inflight(&TenantId("surge".into())),
+            CAP,
+            "surge bounded to cap"
+        );
         ctx.signals.set_labelled(
             SignalName::ConsumerLag,
-            vec![Label::new("consumer", "indexer"), Label::new("tenant", "surge")],
+            vec![
+                Label::new("consumer", "indexer"),
+                Label::new("tenant", "surge"),
+            ],
             c.tenant_inflight(&TenantId("surge".into())) as i64,
         );
         ctx.signals.assert_labelled(
             SignalName::ConsumerLag,
-            vec![Label::new("consumer", "indexer"), Label::new("tenant", "surge")],
+            vec![
+                Label::new("consumer", "indexer"),
+                Label::new("tenant", "surge"),
+            ],
             Predicate::Lte(CAP as i64),
         )
     }));
 
     let results = registry.run_all();
-    assert!(results.iter().all(|r| r.is_pass()), "BUS-D2 + fairness must read green: {results:?}");
-    assert!(registry.all_green(), "they re-run forever (a regression re-reds them)");
+    assert!(
+        results.iter().all(|r| r.is_pass()),
+        "BUS-D2 + fairness must read green: {results:?}"
+    );
+    assert!(
+        registry.all_green(),
+        "they re-run forever (a regression re-reds them)"
+    );
     for r in &results {
         println!("{}", r.artifact_row("2026-06-19"));
     }

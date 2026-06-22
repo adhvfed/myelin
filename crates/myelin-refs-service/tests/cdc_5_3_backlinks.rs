@@ -22,13 +22,13 @@
 //!   the SetExpr to the §4.4 SQL forms (the consumer contract — no Id signature change).
 
 use myelin_identity::{
-    AuthzIndexRef, Consistency, ConsistencyMode, ListObjectsResult, ObjectId, Principal, PrincipalId,
-    PrincipalKind, RelName, SetExpr, Zookie,
+    AuthzIndexRef, Consistency, ConsistencyMode, ListObjectsResult, ObjectId, Principal,
+    PrincipalId, PrincipalKind, RelName, SetExpr, Zookie,
 };
 use myelin_refs_service::{
     edge_builder::{EdgeProjection, EdgeRow, RelClass},
-    ids_result, lower_over_source_root, source_root_colref, AuthzVisibleIndex, Backlink, BacklinkRead,
-    FilterMode,
+    ids_result, lower_over_source_root, source_root_colref, AuthzVisibleIndex, Backlink,
+    BacklinkRead, FilterMode,
 };
 use myelin_tenancy::{Region, TenantId};
 
@@ -98,17 +98,35 @@ fn cdc_5_3_provider_returns_only_admitted_backlinks_consumer_renders_without_rec
 
     // The provider lowers the Filter{InRelation} the consumer (Identity 4.3) returned.
     let lo = ListObjectsResult::Filter {
-        set_expr: SetExpr::InRelation { relation: RelName("view".into()), via_column: source_root_colref() },
+        set_expr: SetExpr::InRelation {
+            relation: RelName("view".into()),
+            via_column: source_root_colref(),
+        },
         zookie: Zookie("zk-00000000000000000003".into()),
     };
     let page = read
-        .backlinks(&tenant(), &region(), &target(), &viewer("p:viewer"), &lo, &at("zk-00000000000000000003"), 50)
+        .backlinks(
+            &tenant(),
+            &region(),
+            &target(),
+            &viewer("p:viewer"),
+            &lo,
+            &at("zk-00000000000000000003"),
+            50,
+        )
         .expect("provider serves the read");
 
     // CONSUMER: a "what references this" panel renders every returned backlink with NO re-check.
     let rendered: Vec<String> = page.edges.iter().map(render_backlink).collect();
-    assert_eq!(rendered.len(), 1, "the consumer renders exactly the admitted backlinks");
-    assert!(rendered[0].contains("OPEN-2"), "the public referrer is rendered");
+    assert_eq!(
+        rendered.len(),
+        1,
+        "the consumer renders exactly the admitted backlinks"
+    );
+    assert!(
+        rendered[0].contains("OPEN-2"),
+        "the public referrer is rendered"
+    );
     // The leak invariant the consumer relies on: no confidential referrer is in the rendered list.
     assert!(
         !rendered.iter().any(|r| r.contains("SECRET")),
@@ -125,21 +143,48 @@ fn cdc_4_3_refs_consumes_both_frozen_list_objects_shapes() {
     // Ids mode: the materialised allow-set.
     let ids = ids_result(&[&public().0], "zk-1");
     let p1 = read
-        .backlinks(&tenant(), &region(), &target(), &viewer("p:a"), &ids, &at(""), 50)
+        .backlinks(
+            &tenant(),
+            &region(),
+            &target(),
+            &viewer("p:a"),
+            &ids,
+            &at(""),
+            50,
+        )
         .expect("Ids-mode read");
-    assert_eq!(p1.mode, FilterMode::Ids, "the Ids shape drives the materialised mode");
+    assert_eq!(
+        p1.mode,
+        FilterMode::Ids,
+        "the Ids shape drives the materialised mode"
+    );
     assert_eq!(p1.edges.len(), 1);
 
     // Filter mode: the pushed-down SetExpr.
     read_grant(&read, "p:a", &secret().0, "zk-1");
     let filter = ListObjectsResult::Filter {
-        set_expr: SetExpr::InRelation { relation: RelName("view".into()), via_column: source_root_colref() },
+        set_expr: SetExpr::InRelation {
+            relation: RelName("view".into()),
+            via_column: source_root_colref(),
+        },
         zookie: Zookie("zk-1".into()),
     };
     let p2 = read
-        .backlinks(&tenant(), &region(), &target(), &viewer("p:a"), &filter, &at(""), 50)
+        .backlinks(
+            &tenant(),
+            &region(),
+            &target(),
+            &viewer("p:a"),
+            &filter,
+            &at(""),
+            50,
+        )
         .expect("Filter-mode read");
-    assert_eq!(p2.mode, FilterMode::PushedDown, "the Filter shape drives the pushed-down mode");
+    assert_eq!(
+        p2.mode,
+        FilterMode::PushedDown,
+        "the Filter shape drives the pushed-down mode"
+    );
 }
 
 /// **CONSUMER CDC (4.3): the SetExpr lowering SHAPE Refs composes is the §4.4 frozen form.** Every
@@ -148,8 +193,14 @@ fn cdc_4_3_refs_consumes_both_frozen_list_objects_shapes() {
 #[test]
 fn cdc_4_3_setexpr_lowers_to_the_frozen_source_root_forms() {
     let v = viewer("p:alice");
-    assert_eq!(lower_over_source_root(&SetExpr::All, &v).sql_predicate, "TRUE");
-    assert_eq!(lower_over_source_root(&SetExpr::None, &v).sql_predicate, "FALSE");
+    assert_eq!(
+        lower_over_source_root(&SetExpr::All, &v).sql_predicate,
+        "TRUE"
+    );
+    assert_eq!(
+        lower_over_source_root(&SetExpr::None, &v).sql_predicate,
+        "FALSE"
+    );
     assert_eq!(
         lower_over_source_root(&SetExpr::Ids(vec![ObjectId("s:a".into())]), &v).sql_predicate,
         "edge.source_root IN (:id_0)"
@@ -159,12 +210,25 @@ fn cdc_4_3_setexpr_lowers_to_the_frozen_source_root_forms() {
         "edge.source_root NOT IN (:id_0)"
     );
     let join = lower_over_source_root(
-        &SetExpr::InRelation { relation: RelName("view".into()), via_column: source_root_colref() },
+        &SetExpr::InRelation {
+            relation: RelName("view".into()),
+            via_column: source_root_colref(),
+        },
         &v,
     );
-    assert!(join.joins[0].clause.contains("JOIN authz_visible av0 ON av0.object_id = edge.source_root"));
-    let tuple = lower_over_source_root(&SetExpr::TupleSet { index: AuthzIndexRef("view".into()) }, &v);
-    assert!(tuple.depends_on_reverse_index(), "TupleSet JOINs the reverse index");
+    assert!(join.joins[0]
+        .clause
+        .contains("JOIN authz_visible av0 ON av0.object_id = edge.source_root"));
+    let tuple = lower_over_source_root(
+        &SetExpr::TupleSet {
+            index: AuthzIndexRef("view".into()),
+        },
+        &v,
+    );
+    assert!(
+        tuple.depends_on_reverse_index(),
+        "TupleSet JOINs the reverse index"
+    );
 }
 
 /// Grant `subject` view of `object_id` through the read's reverse index (the public

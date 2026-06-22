@@ -90,12 +90,16 @@ pub struct StoreManifest {
 impl StoreManifest {
     /// An empty manifest (a service that declares no stores yet).
     pub fn new() -> StoreManifest {
-        StoreManifest { declared: Vec::new() }
+        StoreManifest {
+            declared: Vec::new(),
+        }
     }
 
     /// Build a manifest from a set of declared stores.
     pub fn of(stores: impl IntoIterator<Item = DeclaredStore>) -> StoreManifest {
-        StoreManifest { declared: stores.into_iter().collect() }
+        StoreManifest {
+            declared: stores.into_iter().collect(),
+        }
     }
 
     /// Declare one store this service owns.
@@ -216,7 +220,9 @@ mod tests {
         let violations = holder_registered(&manifest, &registry);
         assert_eq!(
             violations,
-            vec![HolderViolation { store: DeclaredStore::new(StoreKind::Oltp, "rogue_oltp") }],
+            vec![HolderViolation {
+                store: DeclaredStore::new(StoreKind::Oltp, "rogue_oltp")
+            }],
             "the store opened outside the harness is the violation"
         );
         // The CI gate surfaces it as a failure (captured-expected).
@@ -225,9 +231,18 @@ mod tests {
         assert_eq!(err.len(), 1);
         // the message is loud + names the offending store + the fix.
         let msg = err[0].message();
-        assert!(msg.contains("rogue_oltp"), "the failure names the offending store: {msg}");
-        assert!(msg.contains("OUTSIDE the harness"), "the failure names WHY: {msg}");
-        assert!(msg.contains("HolderRegistry::open"), "the failure names the one door: {msg}");
+        assert!(
+            msg.contains("rogue_oltp"),
+            "the failure names the offending store: {msg}"
+        );
+        assert!(
+            msg.contains("OUTSIDE the harness"),
+            "the failure names WHY: {msg}"
+        );
+        assert!(
+            msg.contains("HolderRegistry::open"),
+            "the failure names the one door: {msg}"
+        );
     }
 
     /// A PARTIAL violation: some declared stores registered, one did not. The test reports
@@ -245,8 +260,15 @@ mod tests {
         // svc_blobs was opened outside the harness → the lone violation.
 
         let violations = holder_registered(&manifest, &registry);
-        assert_eq!(violations.len(), 1, "exactly the one unregistered store is a violation");
-        assert_eq!(violations[0].store, DeclaredStore::new(StoreKind::Blob, "svc_blobs"));
+        assert_eq!(
+            violations.len(),
+            1,
+            "exactly the one unregistered store is a violation"
+        );
+        assert_eq!(
+            violations[0].store,
+            DeclaredStore::new(StoreKind::Blob, "svc_blobs")
+        );
     }
 
     /// An over-registration (the registry has MORE than the manifest declares) is NOT a
@@ -282,6 +304,10 @@ mod tests {
         assert_eq!(d.holder_id(), "search_index:edge_index");
         let mut registry = HolderRegistry::new();
         let reg = registry.open(StoreKind::SearchIndex, "edge_index");
-        assert_eq!(reg.holder_id(), d.holder_id(), "declared id == registered id");
+        assert_eq!(
+            reg.holder_id(),
+            d.holder_id(),
+            "declared id == registered id"
+        );
     }
 }

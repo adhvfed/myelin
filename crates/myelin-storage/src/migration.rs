@@ -104,13 +104,23 @@ pub struct Migration {
 impl Migration {
     /// A plain forward migration (non-hot table; no phase discipline required).
     pub fn plain(id: &'static str, ddl: &'static str) -> Migration {
-        Migration { id, ddl, phase: MigrationPhase::Plain, table: None }
+        Migration {
+            id,
+            ddl,
+            phase: MigrationPhase::Plain,
+            table: None,
+        }
     }
 
     /// A plain forward migration that NAMES its (cold) table — so the runner can verify the table
     /// is not declared hot (a hot table left `Plain` is the "must use the online path" violation).
     pub fn plain_on(id: &'static str, ddl: &'static str, table: &'static str) -> Migration {
-        Migration { id, ddl, phase: MigrationPhase::Plain, table: Some(table) }
+        Migration {
+            id,
+            ddl,
+            phase: MigrationPhase::Plain,
+            table: Some(table),
+        }
     }
 
     /// A phased migration on a (possibly hot) table — carries which step of expand→backfill→contract
@@ -121,7 +131,12 @@ impl Migration {
         phase: MigrationPhase,
         table: &'static str,
     ) -> Migration {
-        Migration { id, ddl, phase, table: Some(table) }
+        Migration {
+            id,
+            ddl,
+            phase,
+            table: Some(table),
+        }
     }
 }
 
@@ -148,12 +163,16 @@ pub struct HotTables {
 impl HotTables {
     /// No hot tables declared.
     pub fn none() -> HotTables {
-        HotTables { tables: BTreeSet::new() }
+        HotTables {
+            tables: BTreeSet::new(),
+        }
     }
 
     /// Declare a service's hot tables (§3.1) — measured-not-predicted per subsystem.
     pub fn declare(tables: impl IntoIterator<Item = impl Into<String>>) -> HotTables {
-        HotTables { tables: tables.into_iter().map(Into::into).collect() }
+        HotTables {
+            tables: tables.into_iter().map(Into::into).collect(),
+        }
     }
 
     /// Whether `table` is declared hot.
@@ -204,10 +223,16 @@ pub enum MigrationError {
     /// migration, never a down (§3.1; EI-01 §2).
     Destructive { id: &'static str },
     /// A blocking `ALTER` on a declared-hot table — must be expand→backfill→contract (§3.1).
-    BlockingAlterOnHotTable { id: &'static str, table: &'static str },
+    BlockingAlterOnHotTable {
+        id: &'static str,
+        table: &'static str,
+    },
     /// A `Plain` (un-phased) migration touches a declared-hot table — a hot-table change MUST use
     /// the online path (the second half of the deliverable), never a plain blocking change.
-    HotTableNotOnline { id: &'static str, table: &'static str },
+    HotTableNotOnline {
+        id: &'static str,
+        table: &'static str,
+    },
     /// **The P-ST-05 ordering gate.** A phase arrived out of expand→backfill→contract order for a
     /// table — the canonical case being a **Contract before its Backfill** (the prompt's named
     /// reject verdict). Also fires on a Backfill before its Expand, or a duplicate Contract.
@@ -255,7 +280,12 @@ impl fmt::Display for MigrationError {
                  migration touching a declared hot table MUST use the online path \
                  (expand→backfill→contract), never a plain change (storage §3.1; P-ST-05)"
             ),
-            MigrationError::PhaseOutOfOrder { id, table, phase, after } => write!(
+            MigrationError::PhaseOutOfOrder {
+                id,
+                table,
+                phase,
+                after,
+            } => write!(
                 f,
                 "migration {id} on `{table}` carries phase {phase:?} out of order — \
                  expand→backfill→contract must run in order (the table is currently {after:?}); a \
@@ -289,7 +319,9 @@ pub struct OnlineMigrationRunner {
 impl OnlineMigrationRunner {
     /// A fresh runner (nothing applied yet).
     pub fn new() -> OnlineMigrationRunner {
-        OnlineMigrationRunner { applied: Vec::new() }
+        OnlineMigrationRunner {
+            applied: Vec::new(),
+        }
     }
 
     /// Validate + apply each migration in order against the [`HotTables`] declaration, enforcing the
@@ -409,7 +441,10 @@ mod tests {
         runner
             .run(&migrations, &hot)
             .expect("expand→backfill→contract is admitted on a hot table");
-        assert_eq!(runner.applied(), &["0010_expand", "0011_backfill", "0012_contract"]);
+        assert_eq!(
+            runner.applied(),
+            &["0010_expand", "0011_backfill", "0012_contract"]
+        );
     }
 
     /// **THE P-ST-05 GATE: a contract-before-backfill ordering is REJECTED** — the 1/1 reject
@@ -450,7 +485,10 @@ mod tests {
         // Nothing past the violation was applied beyond what was validated-then-pushed: the expand
         // was admitted, the contract was rejected (the runner stops at the first violation).
         assert_eq!(runner.applied(), &["0010_expand"]);
-        assert!(e.to_string().contains("contract-before-backfill"), "loud reason: {e}");
+        assert!(
+            e.to_string().contains("contract-before-backfill"),
+            "loud reason: {e}"
+        );
     }
 
     /// A backfill arriving before its expand is also out of order (the gate is the full ordering,
@@ -465,7 +503,9 @@ mod tests {
             "issue",
         )]);
         let mut runner = OnlineMigrationRunner::new();
-        let e = runner.run(&migrations, &hot).expect_err("backfill-before-expand is rejected");
+        let e = runner
+            .run(&migrations, &hot)
+            .expect_err("backfill-before-expand is rejected");
         assert_eq!(
             e,
             MigrationError::PhaseOutOfOrder {
@@ -488,8 +528,16 @@ mod tests {
             "issue",
         )]);
         let mut runner = OnlineMigrationRunner::new();
-        let e = runner.run(&migrations, &hot).expect_err("a hot table demands the online path");
-        assert_eq!(e, MigrationError::HotTableNotOnline { id: "0010_plain_hot", table: "issue" });
+        let e = runner
+            .run(&migrations, &hot)
+            .expect_err("a hot table demands the online path");
+        assert_eq!(
+            e,
+            MigrationError::HotTableNotOnline {
+                id: "0010_plain_hot",
+                table: "issue"
+            }
+        );
         assert!(e.to_string().contains("online path"), "loud reason: {e}");
     }
 
@@ -516,8 +564,16 @@ mod tests {
             "issue",
         )]);
         let mut runner = OnlineMigrationRunner::new();
-        let e = runner.run(&migrations, &hot).expect_err("blocking ALTER on hot table is rejected");
-        assert_eq!(e, MigrationError::BlockingAlterOnHotTable { id: "0010_hot", table: "issue" });
+        let e = runner
+            .run(&migrations, &hot)
+            .expect_err("blocking ALTER on hot table is rejected");
+        assert_eq!(
+            e,
+            MigrationError::BlockingAlterOnHotTable {
+                id: "0010_hot",
+                table: "issue"
+            }
+        );
     }
 
     /// A plain, non-destructive migration on a NON-hot table is admitted (cold tables don't need the
@@ -526,7 +582,10 @@ mod tests {
     fn plain_migration_on_a_cold_table_is_admitted() {
         let hot = HotTables::declare(["issue"]); // `audit_archive` is NOT hot.
         let migrations = Migrations::of([
-            Migration::plain("0010_new", "CREATE TABLE audit_archive (id BIGINT PRIMARY KEY);"),
+            Migration::plain(
+                "0010_new",
+                "CREATE TABLE audit_archive (id BIGINT PRIMARY KEY);",
+            ),
             Migration::plain_on(
                 "0011_add",
                 "ALTER TABLE audit_archive ADD COLUMN note TEXT;",
@@ -534,7 +593,9 @@ mod tests {
             ),
         ]);
         let mut runner = OnlineMigrationRunner::new();
-        runner.run(&migrations, &hot).expect("a plain migration on a cold table is admitted");
+        runner
+            .run(&migrations, &hot)
+            .expect("a plain migration on a cold table is admitted");
         assert_eq!(runner.applied(), &["0010_new", "0011_add"]);
     }
 
@@ -544,15 +605,47 @@ mod tests {
     fn per_table_ordering_is_independent() {
         let hot = HotTables::declare(["issue", "message"]);
         let migrations = Migrations::of([
-            Migration::phased("0010_e", "ALTER TABLE issue ADD COLUMN a INT;", MigrationPhase::Expand, "issue"),
-            Migration::phased("0011_e", "ALTER TABLE message ADD COLUMN b INT;", MigrationPhase::Expand, "message"),
-            Migration::phased("0012_b", "UPDATE issue SET a = 0;", MigrationPhase::Backfill, "issue"),
-            Migration::phased("0013_b", "UPDATE message SET b = 0;", MigrationPhase::Backfill, "message"),
-            Migration::phased("0014_c", "ALTER TABLE issue ADD COLUMN a2 INT DEFAULT 0 NOT NULL;", MigrationPhase::Contract, "issue"),
-            Migration::phased("0015_c", "ALTER TABLE message ADD COLUMN b2 INT DEFAULT 0 NOT NULL;", MigrationPhase::Contract, "message"),
+            Migration::phased(
+                "0010_e",
+                "ALTER TABLE issue ADD COLUMN a INT;",
+                MigrationPhase::Expand,
+                "issue",
+            ),
+            Migration::phased(
+                "0011_e",
+                "ALTER TABLE message ADD COLUMN b INT;",
+                MigrationPhase::Expand,
+                "message",
+            ),
+            Migration::phased(
+                "0012_b",
+                "UPDATE issue SET a = 0;",
+                MigrationPhase::Backfill,
+                "issue",
+            ),
+            Migration::phased(
+                "0013_b",
+                "UPDATE message SET b = 0;",
+                MigrationPhase::Backfill,
+                "message",
+            ),
+            Migration::phased(
+                "0014_c",
+                "ALTER TABLE issue ADD COLUMN a2 INT DEFAULT 0 NOT NULL;",
+                MigrationPhase::Contract,
+                "issue",
+            ),
+            Migration::phased(
+                "0015_c",
+                "ALTER TABLE message ADD COLUMN b2 INT DEFAULT 0 NOT NULL;",
+                MigrationPhase::Contract,
+                "message",
+            ),
         ]);
         let mut runner = OnlineMigrationRunner::new();
-        runner.run(&migrations, &hot).expect("two interleaved online cycles are admitted");
+        runner
+            .run(&migrations, &hot)
+            .expect("two interleaved online cycles are admitted");
         assert_eq!(runner.applied().len(), 6);
     }
 
@@ -560,9 +653,15 @@ mod tests {
     /// resets cleanly on Contracted→Expand) — schema evolves forever, forward-only.
     #[test]
     fn a_table_can_start_a_second_online_cycle() {
-        assert_eq!(next_progress(PhaseProgress::Contracted, MigrationPhase::Expand), Some(PhaseProgress::Expanded));
+        assert_eq!(
+            next_progress(PhaseProgress::Contracted, MigrationPhase::Expand),
+            Some(PhaseProgress::Expanded)
+        );
         // But a second contract with no fresh expand/backfill is still out of order.
-        assert_eq!(next_progress(PhaseProgress::Contracted, MigrationPhase::Contract), None);
+        assert_eq!(
+            next_progress(PhaseProgress::Contracted, MigrationPhase::Contract),
+            None
+        );
     }
 
     /// The DDL classifiers catch the bug classes (the predicates the runner + the lint share).
@@ -571,10 +670,16 @@ mod tests {
         assert!(is_destructive("DROP TABLE issue"));
         assert!(is_destructive("ALTER TABLE issue DROP COLUMN body"));
         assert!(!is_destructive("ALTER TABLE issue ADD COLUMN x INT"));
-        assert!(is_blocking_alter("ALTER TABLE issue ADD COLUMN x TEXT NOT NULL"));
-        assert!(is_blocking_alter("ALTER TABLE issue ALTER COLUMN x TYPE BIGINT"));
+        assert!(is_blocking_alter(
+            "ALTER TABLE issue ADD COLUMN x TEXT NOT NULL"
+        ));
+        assert!(is_blocking_alter(
+            "ALTER TABLE issue ALTER COLUMN x TYPE BIGINT"
+        ));
         assert!(is_blocking_alter("CREATE INDEX idx ON issue (x)"));
-        assert!(!is_blocking_alter("CREATE INDEX CONCURRENTLY idx ON issue (x)"));
+        assert!(!is_blocking_alter(
+            "CREATE INDEX CONCURRENTLY idx ON issue (x)"
+        ));
         assert!(!is_blocking_alter("ALTER TABLE issue ADD COLUMN x TEXT")); // nullable add = expand.
     }
 
@@ -584,7 +689,10 @@ mod tests {
         let hot = HotTables::declare(["block", "db_row", "doc_op"]); // the KN seed set (§3.1).
         assert!(hot.is_hot("block"));
         assert!(!hot.is_hot("audit_archive"));
-        assert_eq!(hot.tables().collect::<Vec<_>>(), vec!["block", "db_row", "doc_op"]);
+        assert_eq!(
+            hot.tables().collect::<Vec<_>>(),
+            vec!["block", "db_row", "doc_op"]
+        );
         assert!(!hot.is_empty());
         assert!(HotTables::none().is_empty());
         // `none()` IS the empty/default declaration — pin it so the constructor can't drift (and so

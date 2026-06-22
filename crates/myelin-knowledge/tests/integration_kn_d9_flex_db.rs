@@ -70,10 +70,12 @@ async fn kn_d9_flex_db_jsonb_gin_view_filter_setexpr_conjoin_zero_leak_zero_coun
     .execute(&admin)
     .await
     .expect("create the db_row table (JSONB property bag)");
-    sqlx::query(&format!("CREATE INDEX {row_tbl}_gin ON {row_tbl} USING gin (props jsonb_path_ops)"))
-        .execute(&admin)
-        .await
-        .expect("create the GIN jsonb_path_ops derived projection");
+    sqlx::query(&format!(
+        "CREATE INDEX {row_tbl}_gin ON {row_tbl} USING gin (props jsonb_path_ops)"
+    ))
+    .execute(&admin)
+    .await
+    .expect("create the GIN jsonb_path_ops derived projection");
     sqlx::query(&format!(
         "CREATE TABLE {av_tbl} (\
            tenant text NOT NULL, subject text NOT NULL, relation text NOT NULL, object_id text NOT NULL)"
@@ -88,10 +90,10 @@ async fn kn_d9_flex_db_jsonb_gin_view_filter_setexpr_conjoin_zero_leak_zero_coun
         // (tenant, db_id, id, status, priority)
         ("acme", "db:projects", "row:1", "open", 5),
         ("acme", "db:projects", "row:2", "open", 3),
-        ("acme", "db:projects", "row:3", "closed", 4),   // filtered out (status != open)
+        ("acme", "db:projects", "row:3", "closed", 4), // filtered out (status != open)
         ("acme", "db:projects", "row:secret", "open", 9), // leak witness: open, but granted to p:other
-        ("acme", "db:other", "row:otherdb", "open", 1),  // no-cross-db
-        ("evilcorp", "db:projects", "row:x", "open", 1), // no-cross-tenant
+        ("acme", "db:other", "row:otherdb", "open", 1),   // no-cross-db
+        ("evilcorp", "db:projects", "row:x", "open", 1),  // no-cross-tenant
     ];
     for (tenant, db_id, id, status, priority) in seed {
         let props = serde_json::json!({ "status": status, "priority": priority, "title": format!("Item {id}") });
@@ -111,10 +113,18 @@ async fn kn_d9_flex_db_jsonb_gin_view_filter_setexpr_conjoin_zero_leak_zero_coun
     // ── 3. Grant the viewer `read` of row:1, row:2, row:3 (closed) + row:otherdb; row:secret to
     //       p:other. (row:3 is granted but filtered by status; row:otherdb is granted but cross-db —
     //       proving the FILTER and the db_id predicate, not ACL-luck, confine the result.) ───────────
-    let viewer = Principal::stub(PrincipalId("p:viewer".into()), PrincipalKind::Human, TenantId("acme".into()));
-    for (subject, object) in
-        [("p:viewer", "row:1"), ("p:viewer", "row:2"), ("p:viewer", "row:3"), ("p:viewer", "row:otherdb"), ("p:other", "row:secret")]
-    {
+    let viewer = Principal::stub(
+        PrincipalId("p:viewer".into()),
+        PrincipalKind::Human,
+        TenantId("acme".into()),
+    );
+    for (subject, object) in [
+        ("p:viewer", "row:1"),
+        ("p:viewer", "row:2"),
+        ("p:viewer", "row:3"),
+        ("p:viewer", "row:otherdb"),
+        ("p:other", "row:secret"),
+    ] {
         sqlx::query(&format!(
             "INSERT INTO {av_tbl} (tenant, subject, relation, object_id) VALUES ('acme', $1, 'read', $2)"
         ))
@@ -135,15 +145,24 @@ async fn kn_d9_flex_db_jsonb_gin_view_filter_setexpr_conjoin_zero_leak_zero_coun
     .unwrap();
     let lowered_filter = lower_view_filter(&filter, &[]).expect("the view filter lowers");
     assert!(
-        lowered_filter.sql_predicate.contains("db_row.props ->> 'status'"),
+        lowered_filter
+            .sql_predicate
+            .contains("db_row.props ->> 'status'"),
         "the cold facet lowers to the GIN-covered props path: {}",
         lowered_filter.sql_predicate
     );
     let lowered_acl = lower_over_db_row_id(
-        &SetExpr::InRelation { relation: RelName("read".into()), via_column: db_row_id_colref() },
+        &SetExpr::InRelation {
+            relation: RelName("read".into()),
+            via_column: db_row_id_colref(),
+        },
         &viewer,
     );
-    assert_eq!(lowered_acl.joins.len(), 1, "the InRelation lowers to ONE JOIN (no N+1)");
+    assert_eq!(
+        lowered_acl.joins.len(),
+        1,
+        "the InRelation lowers to ONE JOIN (no N+1)"
+    );
 
     // Rebind the lowering output onto the suffixed test tables + bind the literals inline for the
     // seeded test (the SHAPE under test is the lowering's verbatim output; production binds params).
@@ -154,7 +173,7 @@ async fn kn_d9_flex_db_jsonb_gin_view_filter_setexpr_conjoin_zero_leak_zero_coun
         .replace(":subject_0", "'p:viewer'")
         .replace(":rel_for_read", "'read'");
     let acl_pred = lowered_acl.sql_predicate; // `av0.object_id IS NOT NULL`
-    // The view filter predicate, with `db_row.props` → the test table + the bound `:f0` → 'open'.
+                                              // The view filter predicate, with `db_row.props` → the test table + the bound `:f0` → 'open'.
     let filter_pred = lowered_filter
         .sql_predicate
         .replace("db_row.props", &format!("{row_tbl}.props"))
@@ -177,11 +196,27 @@ async fn kn_d9_flex_db_jsonb_gin_view_filter_setexpr_conjoin_zero_leak_zero_coun
     // ── 6. PROVE leak-free + filtered: exactly the granted OPEN rows in this db, priority-sorted.
     //       row:1 (prio 5) before row:2 (prio 3); row:3 (closed) filtered; row:secret (granted to
     //       other) absent; cross-db + cross-tenant absent. ──────────────────────────────────────────
-    assert_eq!(ids, vec!["row:1".to_string(), "row:2".to_string()], "exactly the 2 granted OPEN rows, priority-sorted (0 leak): {ids:?}");
-    assert!(!ids.iter().any(|i| i == "row:3"), "the filter excluded the closed row (granted but status != open)");
-    assert!(!ids.iter().any(|i| i == "row:secret"), "0 leak: the open row granted to someone else is ABSENT");
-    assert!(!ids.iter().any(|i| i == "row:otherdb"), "no-cross-db: the db_id predicate excluded the other db's row (despite a grant)");
-    assert!(!ids.iter().any(|i| i == "row:x"), "0 cross-tenant: the tenant predicate excluded evilcorp's row");
+    assert_eq!(
+        ids,
+        vec!["row:1".to_string(), "row:2".to_string()],
+        "exactly the 2 granted OPEN rows, priority-sorted (0 leak): {ids:?}"
+    );
+    assert!(
+        !ids.iter().any(|i| i == "row:3"),
+        "the filter excluded the closed row (granted but status != open)"
+    );
+    assert!(
+        !ids.iter().any(|i| i == "row:secret"),
+        "0 leak: the open row granted to someone else is ABSENT"
+    );
+    assert!(
+        !ids.iter().any(|i| i == "row:otherdb"),
+        "no-cross-db: the db_id predicate excluded the other db's row (despite a grant)"
+    );
+    assert!(
+        !ids.iter().any(|i| i == "row:x"),
+        "0 cross-tenant: the tenant predicate excluded evilcorp's row"
+    );
 
     // ── 7. The permission-correct COUNT(*) — the SAME filter + ACL INSIDE the aggregate. 0
     //       count-leak: COUNT = 2 (the granted open rows), NOT 3 (would leak row:secret). ────────────
@@ -195,8 +230,15 @@ async fn kn_d9_flex_db_jsonb_gin_view_filter_setexpr_conjoin_zero_leak_zero_coun
         .await
         .unwrap_or_else(|e| panic!("the ONE COUNT runs: {e}\nSQL: {count_sql}"))
         .get::<i64, _>("n");
-    assert_eq!(count, 2, "0 count-leak: the permission-correct COUNT is 2, NOT 3 (row:secret uncounted)");
-    assert_eq!(count as usize, ids.len(), "the COUNT == the listed cardinality (the SAME conjunct, no divergent path)");
+    assert_eq!(
+        count, 2,
+        "0 count-leak: the permission-correct COUNT is 2, NOT 3 (row:secret uncounted)"
+    );
+    assert_eq!(
+        count as usize,
+        ids.len(),
+        "the COUNT == the listed cardinality (the SAME conjunct, no divergent path)"
+    );
 
     // ── 8. PROVE one query + the GIN projection: EXPLAIN confirms a single JOIN plan (no per-row
     //       check subplan). With this small seed Postgres may pick a seq-scan over the index, but the
@@ -222,7 +264,10 @@ async fn kn_d9_flex_db_jsonb_gin_view_filter_setexpr_conjoin_zero_leak_zero_coun
     .await
     .expect("check the GIN index")
     .get::<bool, _>("e");
-    assert!(has_gin, "the GIN jsonb_path_ops derived projection exists on props");
+    assert!(
+        has_gin,
+        "the GIN jsonb_path_ops derived projection exists on props"
+    );
 
     println!(
         "[P-307 INTEGRATION GREEN] KN-D9 flexible DB PROVEN against live Postgres: JSONB props \
@@ -234,6 +279,12 @@ async fn kn_d9_flex_db_jsonb_gin_view_filter_setexpr_conjoin_zero_leak_zero_coun
     );
 
     // ── 9. Cleanup (forward teardown). ───────────────────────────────────────────────────────────
-    sqlx::query(&format!("DROP TABLE {row_tbl}")).execute(&admin).await.unwrap();
-    sqlx::query(&format!("DROP TABLE {av_tbl}")).execute(&admin).await.unwrap();
+    sqlx::query(&format!("DROP TABLE {row_tbl}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    sqlx::query(&format!("DROP TABLE {av_tbl}"))
+        .execute(&admin)
+        .await
+        .unwrap();
 }

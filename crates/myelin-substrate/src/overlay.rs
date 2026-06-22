@@ -74,7 +74,12 @@ impl Rect {
     /// never an inverted rect — inverted rects make containment math lie).
     #[must_use]
     pub fn new(x: Px, y: Px, w: Px, h: Px) -> Self {
-        Self { x, y, w: w.max(0), h: h.max(0) }
+        Self {
+            x,
+            y,
+            w: w.max(0),
+            h: h.max(0),
+        }
     }
 
     /// The right edge (`x + w`).
@@ -376,7 +381,11 @@ mod tests {
         let anchor = Rect::new(20, 600, 100, 24);
         let picker = Rect::new(0, 0, 200, 120);
         let p = place_overlay(&anchor, &picker, Side::Below, &vp);
-        assert!(p.rect.is_contained_by(&vp), "flipped picker must be on-screen: {:?}", p);
+        assert!(
+            p.rect.is_contained_by(&vp),
+            "flipped picker must be on-screen: {:?}",
+            p
+        );
         assert_eq!(p.side, Side::Above);
         assert!(p.flipped);
     }
@@ -433,7 +442,11 @@ mod tests {
         let vp = Rect::new(0, 0, 200, 200);
         let dialog = Rect::new(0, 0, 500, 500); // bigger than the viewport on both axes
         let d = center_dialog(&dialog, &vp);
-        assert!(d.is_contained_by(&vp), "a too-big dialog must fit, never clip: {:?}", d);
+        assert!(
+            d.is_contained_by(&vp),
+            "a too-big dialog must fit, never clip: {:?}",
+            d
+        );
         assert_eq!(d.w, 200);
         assert_eq!(d.h, 200);
     }
@@ -460,13 +473,21 @@ mod tests {
         assert_eq!(t.current(), 10);
         assert_eq!(t.step(FocusMove::Next), 20);
         assert_eq!(t.step(FocusMove::Next), 30);
-        assert_eq!(t.step(FocusMove::Next), 10, "Tab past the last wraps to the first");
+        assert_eq!(
+            t.step(FocusMove::Next),
+            10,
+            "Tab past the last wraps to the first"
+        );
     }
 
     #[test]
     fn shift_tab_cycles_backward_and_wraps() {
         let mut t = FocusTrap::new(vec![10, 20, 30]).unwrap();
-        assert_eq!(t.step(FocusMove::Prev), 30, "Shift+Tab before the first wraps to the last");
+        assert_eq!(
+            t.step(FocusMove::Prev),
+            30,
+            "Shift+Tab before the first wraps to the last"
+        );
         assert_eq!(t.step(FocusMove::Prev), 20);
         assert_eq!(t.step(FocusMove::Prev), 10);
     }

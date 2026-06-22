@@ -35,8 +35,8 @@
 use std::collections::BTreeMap;
 
 use myelin_events::{
-    ArtifactRef, DataRole, EventType, ReindexSource, SnapshotDraft, SnapshotScope, Visibility,
-    AggregateKey,
+    AggregateKey, ArtifactRef, DataRole, EventType, ReindexSource, SnapshotDraft, SnapshotScope,
+    Visibility,
 };
 
 use crate::events;
@@ -175,7 +175,11 @@ impl ReindexSource for GitReindexSource {
             None => return Vec::new(),
         };
         // The part after `kind:` — `all` (every aggregate of this kind) or a specific aggregate id.
-        let target = scope.selector.split_once(':').map(|(_, rest)| rest).unwrap_or("");
+        let target = scope
+            .selector
+            .split_once(':')
+            .map(|(_, rest)| rest)
+            .unwrap_or("");
         self.truth
             .iter()
             .filter(|(_, row)| row.kind == kind)
@@ -202,8 +206,8 @@ impl ReindexSource for GitReindexSource {
 mod tests {
     use super::*;
     use myelin_events::{
-        reindex, snapshot_event_id, DerivedStore, EmitContextBase, OutboxStore, Region, TenantId,
-        Timestamp, Actor,
+        reindex, snapshot_event_id, Actor, DerivedStore, EmitContextBase, OutboxStore, Region,
+        TenantId, Timestamp,
     };
     use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 
@@ -296,7 +300,11 @@ mod tests {
             serde_json::json!({ "title": "ref" }),
         );
         let drafts = s.replay(&SnapshotScope::new("git", "pr:all"), None);
-        assert_eq!(drafts.len(), 1, "the pr arm resolved (else the selector is unparseable → empty)");
+        assert_eq!(
+            drafts.len(),
+            1,
+            "the pr arm resolved (else the selector is unparseable → empty)"
+        );
         assert_eq!(drafts[0].type_.0, "git.pr.snapshot");
     }
 
@@ -309,7 +317,11 @@ mod tests {
         let s = source();
         let scope = SnapshotScope::new("git", "repo:myelin://acme/git/repo/core");
         let drafts = s.replay(&scope, None);
-        assert_eq!(drafts.len(), 1, "exactly the named repo (not all repos, not none)");
+        assert_eq!(
+            drafts.len(),
+            1,
+            "exactly the named repo (not all repos, not none)"
+        );
         assert_eq!(drafts[0].aggregate.0, "myelin://acme/git/repo/core");
     }
 
@@ -320,7 +332,11 @@ mod tests {
     fn replay_suffix_selector_matches_via_ends_with() {
         let s = source();
         let drafts = s.replay(&SnapshotScope::new("git", "repo:core"), None);
-        assert_eq!(drafts.len(), 1, "the `core` suffix selector matched the full aggregate");
+        assert_eq!(
+            drafts.len(),
+            1,
+            "the `core` suffix selector matched the full aggregate"
+        );
         assert_eq!(drafts[0].aggregate.0, "myelin://acme/git/repo/core");
     }
 
@@ -339,18 +355,37 @@ mod tests {
             serde_json::json!({ "default_branch": "main" }),
         );
         let drafts = s.replay(&SnapshotScope::new("git", "repo:core"), None);
-        assert_eq!(drafts.len(), 1, "`core` matches ONLY the segment `…/repo/core`, never `…/mycore`");
+        assert_eq!(
+            drafts.len(),
+            1,
+            "`core` matches ONLY the segment `…/repo/core`, never `…/mycore`"
+        );
         assert_eq!(drafts[0].aggregate.0, "myelin://acme/git/repo/core");
     }
 
     /// `matches_aggregate` directly: exact, segment-anchored suffix, and the rejected substring.
     #[test]
     fn matches_aggregate_exact_anchored_and_substring_reject() {
-        assert!(matches_aggregate("myelin://acme/git/repo/core", "myelin://acme/git/repo/core"), "exact");
-        assert!(matches_aggregate("myelin://acme/git/repo/core", "core"), "segment-anchored `/core`");
-        assert!(matches_aggregate("myelin://acme/git/repo/core#blob-1", "blob-1"), "anchored at `#`");
-        assert!(!matches_aggregate("myelin://acme/git/repo/mycore", "core"), "substring is NOT a match");
-        assert!(!matches_aggregate("myelin://acme/git/repo/core", "other"), "a non-suffix is no match");
+        assert!(
+            matches_aggregate("myelin://acme/git/repo/core", "myelin://acme/git/repo/core"),
+            "exact"
+        );
+        assert!(
+            matches_aggregate("myelin://acme/git/repo/core", "core"),
+            "segment-anchored `/core`"
+        );
+        assert!(
+            matches_aggregate("myelin://acme/git/repo/core#blob-1", "blob-1"),
+            "anchored at `#`"
+        );
+        assert!(
+            !matches_aggregate("myelin://acme/git/repo/mycore", "core"),
+            "substring is NOT a match"
+        );
+        assert!(
+            !matches_aggregate("myelin://acme/git/repo/core", "other"),
+            "a non-suffix is no match"
+        );
     }
 
     /// **The `since` cursor replays STRICTLY ABOVE the cursor (kills `>`→`==`/`<`/`>=`).** With
@@ -360,18 +395,24 @@ mod tests {
     #[test]
     fn replay_since_cursor_is_strictly_above() {
         let s = source(); // repos: core@3, docs@1 ; blob@2
-        // since = 2 over the repo scope: only core@3 (>2) replays; docs@1 (<2) and any @2 are skipped.
+                          // since = 2 over the repo scope: only core@3 (>2) replays; docs@1 (<2) and any @2 are skipped.
         let drafts = s.replay(&SnapshotScope::new("git", "repo:all"), Some(2));
-        assert_eq!(drafts.len(), 1, "only the version-3 repo replays past since=2");
+        assert_eq!(
+            drafts.len(),
+            1,
+            "only the version-3 repo replays past since=2"
+        );
         assert_eq!(drafts[0].version, 3);
         // since exactly AT the highest version (3) → nothing replays (`>` is strict, not `>=`).
         assert!(
-            s.replay(&SnapshotScope::new("git", "repo:all"), Some(3)).is_empty(),
+            s.replay(&SnapshotScope::new("git", "repo:all"), Some(3))
+                .is_empty(),
             "since == the high-water version re-emits nothing (the cursor row is not re-applied)"
         );
         // since = 0 → every repo replays (the full-rebuild floor).
         assert_eq!(
-            s.replay(&SnapshotScope::new("git", "repo:all"), Some(0)).len(),
+            s.replay(&SnapshotScope::new("git", "repo:all"), Some(0))
+                .len(),
             2,
             "since=0 replays every repo (full rebuild)"
         );
@@ -401,7 +442,11 @@ mod tests {
             let row = outbox.row(&draft.event_id()).expect("snapshot row present");
             cold.ingest(&row.envelope);
         }
-        assert_eq!(cold.parity_bytes(), live.parity_bytes(), "cold == live (byte-identical)");
+        assert_eq!(
+            cold.parity_bytes(),
+            live.parity_bytes(),
+            "cold == live (byte-identical)"
+        );
 
         // Re-run — idempotent (0 new; the deterministic ids are already present).
         let r2 = reindex(&scope, None, sources, &mut outbox, ctx_base()).expect("re-reindex");
