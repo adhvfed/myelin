@@ -38,6 +38,17 @@ myelin-events = { path = "../myelin-events" }
 # through this one codec — git mints, Refs owns the grammar (no second URN language, REF-3). Refs is
 # a shared glue crate that does NOT depend back on git (the §2.9 DAG stays acyclic).
 myelin-refs = { path = "../myelin-refs" }
+# The durable-workflow substrate (contract 9.1/9.2/9.4) — `WfCtx::run_merge_attempt` + the
+# `ci.result`-waiting merge-queue BODY (the generic durable mechanics: dispatch+reserve, park on
+# ci.result, merge-or-dequeue, exactly-once-on-merge_attempt_id). GIT-P23 (P-285, M3-G4) COMPOSES
+# that body — it does NOT re-implement it (EI-01 §7): Git owns the merge-queue's Git-specific seams
+# (the `MergePerformer` that runs the §6.2 merge gate + the §6.3 fork-endorsement before merging) and
+# drives the GIT-D10 aggregate against the flow `MockCiResultProducer` (the synthetic producer; CI's
+# real producer is M4/EB-27). `myelin-flow` is a shared durable-execution substrate that does NOT
+# depend back on `myelin-git` (the §2.9 DAG stays acyclic — verified: flow's Cargo.toml carries no
+# myelin-git edge); Git reads its OWN check_status projection and NEVER synchronously calls CI
+# (no-cross-sync-cycle, X-1 / EI-02 §3).
+myelin-flow = { path = "../myelin-flow" }
 # The Search indexing-contract surface (contract 6.3 declare_indexable / IndexSpec). GIT-P5 (P-231)
 # REGISTERS git's owned code-projection spec — the `git.*` blob projection shape — by constructing
 # the frozen `myelin_search::IndexSpec` and proving it serializes to the 6.3 wire shape. Git declares
@@ -142,6 +153,11 @@ myelin-client = { path = "../myelin-client" }
 # engine, never re-define it.
 [dev-dependencies]
 myelin-identity-service = { path = "../myelin-identity-service" }
+# The architecture-lint engine — the merge-queue e2e (GIT-P23 / P-285) runs the `no-cross-sync-cycle`
+# lint over `src/merge_queue.rs` to PROVE Git makes 0 synchronous calls to CI (it reads its own
+# check_status projection; X-1 / EI-02 §3). A dev-only edge (the lint scanner is a test-time tool, not
+# a production-DAG node — architecture §2.9).
+myelin-lints = { path = "../myelin-lints" }
 
 [features]
 # The DEV-REAL integration leg (GIT-P20 / P-281, M3) — the store-backed `check_status` projection

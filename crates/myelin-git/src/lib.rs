@@ -210,6 +210,21 @@ pub mod merge_gate;
 /// CI-stamped trust tier, never caller-chosen). Floor: the merge queue (durable workflow, exactly-once
 /// merge, the `ci.result` rollup wait) is GIT-P23.
 pub mod fork_gate;
+/// The **merge queue as a durable workflow** (GIT-P23 / P-285, M3-G4 — parks on `ci.result`,
+/// exactly-once merge, GIT-D10 part (d) + the full GIT-D10 aggregate). The Git-side COMPOSITION of the
+/// generic durable merge-queue body ([`myelin_flow::WfCtx::run_merge_attempt`], contract 9.4 — already
+/// live at P-FLOW-19): it binds Git's OWN merge gate ([`merge_gate`], §6.2) + the fork-endorsement
+/// posture ([`fork_gate`], §6.3) into the durable [`myelin_flow::MergePerformer`] seam via
+/// [`merge_queue::GitMergePerformer`], so a merge is performed ONLY when EVERY required context is a
+/// current trusted/endorsed success on Git's projection (an under-gated / fork-self-greened / missing
+/// context REFUSES the merge → the flow body dequeues with a humanised reason; 0 such merges land). The
+/// doubly-delivered-`ci.result`-wakes-once + exactly-once-merge mechanics come FROM `myelin-flow` (not
+/// re-implemented, EI-01 §7); Git reads its OWN `check_status` projection and NEVER synchronously calls
+/// CI (no-cross-sync-cycle, X-1 / EI-02 §3). Floors: GF-8 single-lane (the speculative queue is
+/// GIT-P33/M5); the seam-floor — the REAL CI producer is EB-27/M4 (the X-1 seam goes end-to-end at the
+/// M4 co-gate GIT-D10 / CI-D8; here the `ci.result` rollup is the synthetic
+/// [`myelin_flow::MockCiResultProducer`]).
+pub mod merge_queue;
 pub mod notif_rules;
 /// The git **PACK TIER on the local-NVMe `BlobStore` floor** (GIT-P11 / P-272, M3-G1): the git-side
 /// object-DB migration THROUGH the [`myelin_storage::GitPackTier`] (closing the receive-pack
