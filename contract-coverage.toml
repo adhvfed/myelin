@@ -500,8 +500,16 @@ title = "resolve(ref, viewer, mode)"
 # (named): the GENERAL Refs `resolve(ref, viewer, mode)` 4-step tombstone LADDER over ALL subsystems
 # (the per-kind resolution spine) is the P-159 Refs-resolver follow-on; the `blob`/`#L<a>-L<b>`
 # content-anchored sub-resolver is GIT-P24; cross-cell projection is single-home (the multi-cell floor).
+# GIT-P31 / P-292 (M3-G8) wires that GIT-OWNED `project` (5.6) into the 5.2 resolve seam Notif's
+# humanise consumes: `myelin_git::git_resolve::GitRefResolver` implements the frozen `RefResolvePort`
+# (resolve `Display` → Projection|Tombstone) over the projector — promoting the GIT-P19 test-local
+# resolve stand-in (the named floor) to a real producer-crate seam (the leak gate now runs over Git's
+# real projection). cell-local (OQ-I); the cross-cell single-home resolve stays the named multi-cell floor.
 status = "covered"
-cdc = ["crates/myelin-git/tests/cdc_5_1_5_2_5_6_git_project.rs"]
+cdc = [
+    "crates/myelin-git/tests/cdc_5_1_5_2_5_6_git_project.rs",
+    "crates/myelin-git/tests/cdc_5_2_7_3_7_1_git_humanise_resolve.rs",
+]
 
 [[contract]]
 row = "5.3"
@@ -761,6 +769,11 @@ title = "list_inbox"
 status = "covered"
 cdc = [
     "crates/myelin-notif/tests/cdc_7_1_notif_list_inbox.rs",
+    # GIT slice — git (GIT-P31 / P-292, M3-G8) pins that its "Review requests" scoped view is a FILTER
+    # over the ONE inbox (`reason = ReviewRequested` AND a git subject), NEVER a second store (C-9). The
+    # `git_review_requests_filter` / `matches_review_requests_view` predicate selects a row in the ONE
+    # inbox; it does not move it into a parallel store.
+    "crates/myelin-git/tests/cdc_5_2_7_3_7_1_git_humanise_resolve.rs",
 ]
 
 # 7.2 COVERED at NOTIF-P6 (P-184): mark / snooze / mark_all_read — the ONE read-state truth. The
@@ -791,6 +804,16 @@ title = "humanise"
 status = "covered"
 cdc = [
     "crates/myelin-chat/tests/cdc_7_3_chat_humanise_keys.rs",
+    # GIT slice — git (GIT-P31 / P-292, M3-G8) ships the resolve-for-unfurls CONSUMER of the ONE
+    # humanise surface: `myelin_git::git_resolve::GitRefResolver` is a REAL impl of the frozen
+    # `RefResolvePort` (the 5.2 resolve seam humanise binds its slots to) over Git's permission-first
+    # `Projector` (5.6). A confidential PR/commit subject → for a viewer lacking `pull` the humanise
+    # render is a TOMBSTONE (`a restricted pr`); the title NEVER leaks (NOTIF-D4-class, 0 title leaks).
+    # This PROMOTES the GIT-P19 test-local resolve stand-in (the named floor) to a real producer-crate
+    # seam — the leak property is now exercised over Git's real projection, zero Notif change. The CDC
+    # carries the PROVIDER (Git's resolver returns Projection|Tombstone, permission-first) + CONSUMER
+    # (Notif's humanise binds the denied slot to the PII-free tombstone) sides.
+    "crates/myelin-git/tests/cdc_5_2_7_3_7_1_git_humanise_resolve.rs",
 ]
 
 # 7.4 COVERED at NOTIF-P10 (P-188): get_prefs / set_prefs — prefs + quiet-hours over the frozen

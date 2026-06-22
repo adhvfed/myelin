@@ -282,6 +282,17 @@ pub mod fork_gate;
 /// M4 co-gate GIT-D10 / CI-D8; here the `ci.result` rollup is the synthetic
 /// [`myelin_flow::MockCiResultProducer`]).
 pub mod merge_queue;
+/// **Git `resolve(ref, viewer, Display)` for unfurls, wired through Notif's humanise** (GIT-P31 /
+/// P-292, M3-G8 — the notifications + humanise half). [`git_resolve::GitRefResolver`] implements
+/// Notif's frozen [`myelin_notif::RefResolvePort`] (contract 5.2 — the resolve seam humanise consumes)
+/// by delegating to Git's REAL [`project::Projector`] (contract 5.6): a confidential PR/commit subject
+/// resolves to a **humanised tombstone, the TITLE NEVER LEAKS** (NOTIF-D4-class, threshold 0). This
+/// PROMOTES the GIT-P19 test-local resolve stand-in to a real producer-crate seam (EI-01 §7) — the
+/// leak property is now exercised over Git's real permission-first projection. Review-requests are a
+/// FILTER over the ONE inbox ([`git_resolve::git_review_requests_filter`], contract 7.1), never a second
+/// store. Floors: the Web-UI/CLI render is GIT-P32; the live OLTP store is GIT-P20; cross-cell resolve
+/// is single-home (contract 5.2 / OQ-I).
+pub mod git_resolve;
 pub mod notif_rules;
 /// The git **PACK TIER on the local-NVMe `BlobStore` floor** (GIT-P11 / P-272, M3-G1): the git-side
 /// object-DB migration THROUGH the [`myelin_storage::GitPackTier`] (closing the receive-pack
