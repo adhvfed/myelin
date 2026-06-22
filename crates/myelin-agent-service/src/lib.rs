@@ -205,10 +205,18 @@ pub use defaults::{
 // no-silent-loosening ratchet. NO new engine — a ToolDef is a row in the existing registry; the
 // routing/gating/HITL are the existing plan-then-apply pipeline. The KNOWLEDGE producer ToolDefs +
 // the agent-trace holder seam (KN-D11/KN-D12) are AG-P19 (→ P-268) and reuse THIS registration pattern.
+// GIT-P28 → P-289 (M3-G6) extends the Git producer surface with the AGENT AUTHOR/REVIEWER tools:
+// git.comment + git.submit_review + git.suggest_change + git.resolve_thread (all reversible Mutate →
+// EffectApi, requires_approval = no — the ONLY consequential git gate stays git.merge). Agents are
+// FIRST-CLASS, legible (myelin_git::agent_author::Authorship — never disguised as human, ADR-08 /
+// AI-Act), bounded (every effect rides the eight-step pipeline) authors/reviewers governed by the
+// SAME pull_request.review cap (4.9) a human reviewer is. NO new engine — registration data.
 pub use git_tools::{
-    git_history_rewrite_tool_def, git_merge_required_caps, git_merge_tool_def,
-    git_scip_index_tool_def, git_tool_defs, open_pr_required_caps, open_pr_tool_def,
-    register_git_tools, GIT_MERGE_TOOL, GIT_SUBSYSTEM, GIT_TOOL_VERSION, OPEN_PR_TOOL,
+    git_author_tool_defs, git_comment_tool_def, git_history_rewrite_tool_def,
+    git_merge_required_caps, git_merge_tool_def, git_resolve_thread_tool_def, git_scip_index_tool_def,
+    git_submit_review_tool_def, git_suggest_change_tool_def, git_tool_defs, open_pr_required_caps,
+    open_pr_tool_def, register_git_tools, GIT_MERGE_TOOL, GIT_SUBSYSTEM, GIT_TOOL_VERSION,
+    OPEN_PR_TOOL,
 };
 
 // The per-producer KNOWLEDGE ToolDefs (AG-P19 → P-268, M3): publish + edit_confidential (the
