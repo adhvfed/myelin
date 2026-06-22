@@ -20,3 +20,11 @@ publish = false
 myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-identity = { path = "../myelin-identity" }
 serde.workspace = true
+
+# DEV-ONLY (P-S30 / P-319): the cross-language harness shim conformance suite records its 1.7
+# N/A against chat's REAL TE-21 connection-tier language pin (today: Rust → the shim is a NO-OP,
+# recorded loudly). chat is read ONLY by tests/shim_conformance_p_s30.rs — it is a dev-dependency,
+# NOT a runtime dependency, so the production harness dep set stays tiny and nothing pulls chat's
+# tree into the harness binary. (Nothing depends on myelin-harness, so this is not a DAG cycle.)
+[dev-dependencies]
+myelin-chat = { path = "../myelin-chat" }
