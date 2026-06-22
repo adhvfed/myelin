@@ -116,6 +116,23 @@ pub enum Band {
     /// genuine remaining floor — the world-scale 30x LOAD drill (real fleet hardware) — is a named,
     /// dated M5 deferral, not a row that reds this gate.
     M2Reactive,
+    /// The **M3 producer-subsystems exit gate** (M3 → M4) — the consolidated go/no-go over the two
+    /// M3 producer subsystems built on the reactive layer: **Git hosting** (GIT-D1 hot-ref burst,
+    /// GIT-D2 erase-reaches-every-holder + pseudonymity, GIT-D3 reindex parity, GIT-D7 inline-thread
+    /// anchor resolution, GIT-D8 front-door cross-tenant, GIT-D9 receive-pack ref-CAS silent-data-loss,
+    /// GIT-D10 check_status projection, GIT-D11 leak-free lists / SetExpr push-down) and **Knowledge**
+    /// (KN-D1 resume-cursor collab, KN-D3 the per-block CAS-merge NAMED FLOOR, KN-D4 crypto-shred erase,
+    /// KN-D5 list push-down 0-leak, KN-D6 reindex parity cold==live, KN-D7 outbox emit-iff-committed,
+    /// KN-D9 flexible DB, KN-D10 rollup/formula, KN-D11 agent governance, KN-D12 agent-trace holder,
+    /// KN-D13 OLTP RLS partition), plus the contract-coverage scanner re-affirm. It WIRES (does not
+    /// re-implement) each per-feature drill (P-246..P-318). A single RED row blocks M4 (the master band
+    /// gate invariant, master-sequencing §2/§4, EI-01 §2). Several rows are integration drills run
+    /// `--features integration` against the live docker-compose stack (RED-until-proven against the real
+    /// backends). The two genuine remaining floors — KN-D3's full CRDT/OT convergence (the M3 deliverable
+    /// proved the soft-lock + offline-reconcile FLOOR; the full convergence is the named later follow-on)
+    /// and the world-scale 30× LOAD surge (real fleet hardware, M5) — are named, dated deferrals in
+    /// [`Scorecard::render_markdown`], not rows that red this gate.
+    M3Producers,
 }
 
 impl fmt::Display for Band {
@@ -125,6 +142,7 @@ impl fmt::Display for Band {
             Band::M1Identity => write!(f, "M1→M2 (Identity)"),
             Band::Infra => write!(f, "Infra (integration)"),
             Band::M2Reactive => write!(f, "M2 (reactive shared layer)"),
+            Band::M3Producers => write!(f, "M3 (producer subsystems)"),
         }
     }
 }
@@ -140,6 +158,7 @@ impl Band {
             Band::M1Identity => id_m1_required_rows(),
             Band::Infra => infra_required_rows(),
             Band::M2Reactive => m2_required_rows(),
+            Band::M3Producers => m3_required_rows(),
         }
     }
 }
@@ -843,6 +862,250 @@ pub fn m2_required_rows() -> Vec<GateRow> {
     ]
 }
 
+/// The FROZEN required-row set for the **M3 producer-subsystems exit gate** (M3 → M4). This is the
+/// build-layer realisation of the master band gate invariant (master-sequencing §2/§4, EI-01 §2):
+/// the two M3 producer subsystems (Git hosting + Knowledge) are *correct* before M4 is started. It
+/// WIRES the per-feature M3 drills (it does not re-implement them — each `proof_command` is the real
+/// `cargo test`/`cargo run` target that already lives with its feature prompt, P-246..P-318) across
+/// the two families:
+///
+/// - **Git hosting (myelin-git):** GIT-D1 (hot-ref burst), GIT-D2 (erase reaches every holder +
+///   receive-pack pseudonymity + the pseudonymous residual), GIT-D3 (reindex parity), GIT-D7
+///   (inline-thread anchor resolution across rebase/force-push), GIT-D8 (front-door cross-tenant),
+///   GIT-D9 (receive-pack ref-CAS, the silent-data-loss gate + the consumer-leg seam), GIT-D10
+///   (check_status projection, `--features integration`), GIT-D11 (leak-free PR lists / SetExpr
+///   push-down — the unit CDC `cdc_4_3_git_list_pushdown` AND the live-stack
+///   `integration_git_p26_list_pushdown`).
+/// - **Knowledge (myelin-knowledge):** KN-D1 (resume-cursor collab), KN-D3 (per-block CAS merge — the
+///   NAMED FLOOR: P-303/P-316 shipped the soft-lock + offline-reconcile floor; the full CRDT/OT
+///   convergence is the named later follow-on, printed by [`Scorecard::render_markdown`]), KN-D4
+///   (crypto-shred erase → 0 recoverable structured PII incl. vectors), KN-D5 (list push-down 0-leak,
+///   `--features integration`), KN-D6 (reindex parity cold==live), KN-D7 (outbox emit-iff-committed,
+///   `--features integration`), KN-D9 (flexible DB filter/sort/group, `--features integration`), KN-D10
+///   (rollup/formula read-time permission-filtered conjoin, `--features integration`), KN-D11 (agent
+///   governance, CDC 8.2), KN-D12 (agent-trace holder, CDC 8.8), KN-D13 (OLTP store + RLS partition,
+///   CDC 11.1/12.1).
+/// - **contract-coverage:** the scanner re-affirm (no falsely-claimed / silently-dropped / un-named row).
+///
+/// No M3 row is `permanent` in the M0 sense (the three emit-path gates re-run forever; KN-D7 and GIT-D9
+/// RIDE the permanent outbox/co-commit gate, Storage/EB-owned, but those gates — not these producer
+/// drills — are the re-run-forever markers). KN-D3 carries a `floor` note: it is a PROVEN row (the
+/// soft-lock + offline-reconcile floor passes) whose rendered artifact STILL prints the full-CRDT/OT
+/// convergence as an open, dated follow-on (EI-01 §1). The world-scale 30× LOAD surge (real fleet
+/// hardware) is a named M5 deferral in `render_markdown`, NOT a row here (it would red the gate; M3 is
+/// *correct*, M5 is *load-hardened*).
+pub fn m3_required_rows() -> Vec<GateRow> {
+    fn row(id: &'static str, title: &'static str, cmd: &'static [&'static str]) -> GateRow {
+        GateRow {
+            id,
+            title,
+            proof_command: cmd,
+            permanent: false,
+            floor: None,
+        }
+    }
+    vec![
+        // ---- Git hosting (myelin-git) ----
+        row(
+            "GIT-D1",
+            "hot-ref burst → concurrent pushes to one hot ref serialize without a lost update (ref-CAS holds under contention)",
+            &["test", "-p", "myelin-git", "--test", "drills_git_d1_hot_ref_burst"],
+        ),
+        row(
+            "GIT-D2",
+            "erasure/pseudonymity → an erase reaches every holder; receive-pack commits stay pseudonymous with 0 residual PII",
+            &["test", "-p", "myelin-git", "--test", "drills_git_d2_erase_reaches_every_holder"],
+        ),
+        row(
+            "GIT-D3",
+            "reindex parity → a cold re-index pass equals the live projection; no stale/dup/resurrected rows",
+            &["test", "-p", "myelin-git", "--test", "drills_git_d3_reindex_parity"],
+        ),
+        row(
+            "GIT-D7",
+            "inline-thread anchor resolution → every comment anchor resolves across rebase/force-push with 0 mis-anchored",
+            &["test", "-p", "myelin-git", "--test", "e2e_git_d7_anchor_resolution"],
+        ),
+        row(
+            "GIT-D8",
+            "front-door cross-tenant → a path-spoofed front-door request reads 0 cross-tenant repository data",
+            &["test", "-p", "myelin-git", "--test", "drill_git_d8_front_door"],
+        ),
+        row(
+            "GIT-D9",
+            "receive-pack ref-CAS (silent-data-loss) → emit-iff-committed; crash-before/after/mid is 0 ghost / 0 lost / redeliver-once",
+            &["test", "-p", "myelin-git", "--test", "drills_git_d9_receive_pack"],
+        ),
+        row(
+            "GIT-D9-seam",
+            "receive-pack consumer-leg seam → dead-letters foreign/malformed payloads, idempotent on dup, drops stale supersession",
+            &["test", "-p", "myelin-git", "--test", "drills_git_d9_check_seam_consumer_leg"],
+        ),
+        // GIT-D10 — check_status projection, integration drill against the live stack.
+        GateRow {
+            id: "GIT-D10",
+            title: "check_status projection → supersession holds one current row per key, order-independent, idempotent on dup (real PG)",
+            proof_command: &[
+                "test",
+                "-p",
+                "myelin-git",
+                "--features",
+                "integration",
+                "--test",
+                "integration_git_d10_check_status_projection",
+            ],
+            permanent: false,
+            floor: None,
+        },
+        // GIT-D11 — the unit CDC (leak-free SetExpr push-down) ...
+        row(
+            "GIT-D11",
+            "leak-free PR lists / SetExpr push-down → the list pre-filter lowers the authz predicate into the query (CDC 4.3)",
+            &["test", "-p", "myelin-git", "--test", "cdc_4_3_git_list_pushdown"],
+        ),
+        // ... AND the live-stack push-down (one query, 0 leak, revoke reflected).
+        GateRow {
+            id: "GIT-D11-int",
+            title: "PR list SetExpr JOIN → one query, 0 leak, tenant-scoped, just-revoked grant reflected (real PG)",
+            proof_command: &[
+                "test",
+                "-p",
+                "myelin-git",
+                "--features",
+                "integration",
+                "--test",
+                "integration_git_p26_list_pushdown",
+            ],
+            permanent: false,
+            floor: None,
+        },
+        // ---- Knowledge (myelin-knowledge) ----
+        row(
+            "KN-D1",
+            "resume-cursor collab → a collaborator's resume cursor replays exactly to the last applied op (no gap / no double-apply)",
+            &["test", "-p", "myelin-knowledge", "--test", "drill_kn_d1_resume_cursor"],
+        ),
+        // KN-D3 — the per-block CAS-merge NAMED FLOOR (P-303/P-316 shipped the soft-lock +
+        // offline-reconcile floor; full CRDT/OT convergence is the named later follow-on).
+        GateRow {
+            id: "KN-D3",
+            title: "per-block CAS merge (NAMED FLOOR) → soft-lock + offline reconcile converge; per-block CAS rejects a stale write",
+            proof_command: &["test", "-p", "myelin-knowledge", "--test", "drill_kn_d3_cas_merge_floor"],
+            permanent: false,
+            floor: Some(
+                "the per-block CAS-merge row proves the M3 FLOOR (soft-locks + offline reconcile + \
+                 per-block CAS); the full real-time CRDT/OT convergence is the named later follow-on \
+                 (KN-P-collab, post-M3) — proven floor now, full convergence dated-deferred, never \
+                 silently claimed closed (EI-01 §1)",
+            ),
+        },
+        // KN-D4 — crypto-shred erase. The proof is the lib unit drill in src/gdpr/erase_floor.rs.
+        row(
+            "KN-D4",
+            "crypto-shred erase → subject authors PII → erase → 0 recoverable structured PII incl. vectors (DEK shred + tombstone)",
+            &[
+                "test",
+                "-p",
+                "myelin-knowledge",
+                "--lib",
+                "gdpr::erase_floor::tests::kn_d4_erase_subject_zero_recoverable_pii_including_vectors",
+            ],
+        ),
+        // KN-D5 — list push-down 0-leak, integration drill against the live stack.
+        GateRow {
+            id: "KN-D5",
+            title: "list push-down 0-leak → DB-row list+count SetExpr JOIN, 0 leak, 0 count-leak, just-revoked reflected (real PG)",
+            proof_command: &[
+                "test",
+                "-p",
+                "myelin-knowledge",
+                "--features",
+                "integration",
+                "--test",
+                "integration_kn_d5_list_pushdown",
+            ],
+            permanent: false,
+            floor: None,
+        },
+        row(
+            "KN-D6",
+            "reindex parity (cold==live) → a wipe-replay cold rebuild equals the live projection; no resurrected erased state",
+            &["test", "-p", "myelin-knowledge", "--test", "drill_kn_d6_reindex_parity"],
+        ),
+        // KN-D7 — outbox emit-iff-committed, integration drill against real Postgres.
+        GateRow {
+            id: "KN-D7",
+            title: "outbox → emit-iff-committed: N blocks ⇒ N rows; a rollback emits 0 (on real Postgres)",
+            proof_command: &[
+                "test",
+                "-p",
+                "myelin-knowledge",
+                "--features",
+                "integration",
+                "--test",
+                "integration_kn_d7_outbox",
+            ],
+            permanent: false,
+            floor: None,
+        },
+        // KN-D9 — flexible DB filter/sort/group, integration drill against the live stack.
+        GateRow {
+            id: "KN-D9",
+            title: "flexible DB → JSONB GIN view filter/sort/group SetExpr conjoin, 0 leak, 0 count-leak (real PG)",
+            proof_command: &[
+                "test",
+                "-p",
+                "myelin-knowledge",
+                "--features",
+                "integration",
+                "--test",
+                "integration_kn_d9_flex_db",
+            ],
+            permanent: false,
+            floor: None,
+        },
+        // KN-D10 — rollup/formula read-time permission-filtered conjoin, integration drill.
+        GateRow {
+            id: "KN-D10",
+            title: "rollup/formula → read-time rollup is permission-filtered (conjoin), 0 leak across the aggregate (real PG)",
+            proof_command: &[
+                "test",
+                "-p",
+                "myelin-knowledge",
+                "--features",
+                "integration",
+                "--test",
+                "integration_kn_d10_rollup",
+            ],
+            permanent: false,
+            floor: None,
+        },
+        row(
+            "KN-D11",
+            "agent governance → the Knowledge agent-tool path runs the schema→cap→delegation→tenant→budget→HITL pipeline (CDC 8.2)",
+            &["test", "-p", "myelin-knowledge", "--test", "cdc_8_2_knowledge_agent_governance"],
+        ),
+        row(
+            "KN-D12",
+            "agent-trace holder → every agent effect lands on its trace holder (the audit projection, CDC 8.8)",
+            &["test", "-p", "myelin-knowledge", "--test", "cdc_8_8_knowledge_agent_trace"],
+        ),
+        row(
+            "KN-D13",
+            "OLTP RLS partition → the OLTP store enforces the (tenant, region) RLS partition; cross-partition read = 0 (CDC 11.1/12.1)",
+            &["test", "-p", "myelin-knowledge", "--test", "cdc_11_1_12_1_knowledge_oltp_store_and_partition"],
+        ),
+        // ---- contract-coverage re-affirm ----
+        GateRow {
+            id: "contract-coverage",
+            title: "the contract-coverage scanner re-affirms the M3 CDC rows — no falsely-claimed/dropped row",
+            proof_command: &["run", "-p", "myelin-lints", "--bin", "contract-coverage"],
+            permanent: false,
+            floor: None,
+        },
+    ]
+}
+
 /// The verdict of one recorded scorecard row. A `Pass` is only constructible WITH a non-empty
 /// proof line (the dated green artifact the proof command emitted) — a green must be earned, it
 /// cannot be flipped from nothing (the ratchet's "no green without proof" half).
@@ -990,6 +1253,11 @@ impl Scorecard {
                  FLOW-D1/D3/D4/D5/D6/D7+mergeq + contract-coverage",
                 "M3",
             ),
+            Band::M3Producers => (
+                "GIT-D1/D2/D3/D7/D8/D9(+seam)/D10/D11(+int) + KN-D1/D3(floor)/D4/D5/D6/D7/D9/D10/D11/D12/D13 \
+                 + contract-coverage",
+                "M4",
+            ),
         };
         let mut out = String::new();
         out.push_str(&format!(
@@ -1117,6 +1385,40 @@ impl Scorecard {
                      under it needs an OCI bundle + root/userns privileges this host lacks; the \
                      AG-D4 attestation records it as a NAMED parametrized residual, never faked \
                      green. Firecracker (the production default) IS the exercised gate backend.\n",
+                );
+            }
+            Band::M3Producers => {
+                out.push_str(
+                    "**Integration rows are RED-until-proven against the LIVE stack.** GIT-D10, \
+                     GIT-D11-int, KN-D5, KN-D7, KN-D9, KN-D10 are proven ONLY by their \
+                     `cargo test --features integration` against the live docker-compose stack \
+                     (Postgres / RustFS / Valkey / NATS JetStream). A DB-free run cannot flip them \
+                     green — the proof command FAILS without the stack. The remaining rows are the \
+                     deterministic per-feature drills / CDC pairs that run with no external backend. \
+                     KN-D7 rides the permanent outbox emit-iff-committed gate and GIT-D9 the co-commit \
+                     gate (Storage/EB-owned, re-run-forever); the producer drills here re-affirm them \
+                     but the Storage/EB gates are the permanent markers.\n\n",
+                );
+                out.push_str("**KN-D3 — the per-block CAS-merge NAMED FLOOR (proven floor, dated follow-on, NOT a red row):**\n");
+                for gr in self.band.required_rows().iter().filter(|r| r.floor.is_some()) {
+                    if let Some(floor) = gr.floor {
+                        out.push_str(&format!("- **{}** — {}\n", gr.id, floor));
+                    }
+                }
+                out.push_str(
+                    "\nThe M3 deliverable PROVED the per-block CAS-merge floor (soft-locks + offline \
+                     reconcile + per-block CAS rejecting a stale write); the full real-time CRDT/OT \
+                     convergence is the named later collaboration follow-on (post-M3), not part of this \
+                     M3→M4 go/no-go. The floor row reads green; the rendered artifact still prints the \
+                     full-convergence follow-on as open, so it is never silently claimed closed \
+                     (EI-01 §1).\n\n",
+                );
+                out.push_str(
+                    "**The ONE true remaining floor (named, dated deferral — NOT a row that reds this gate):** \
+                     the **world-scale 30× LOAD surge** (the GIT / KN producer surge under fleet-scale \
+                     fan-out) needs real fleet hardware (a multi-node cluster), so it is deferred to \
+                     **M5** — not run on a single dev box. Everything else in M3 is proven with a dated \
+                     artifact above. The deferral is visible, never invisible (EI-01 §1).\n",
                 );
             }
         }
@@ -1702,5 +2004,179 @@ mod tests {
         assert!(card
             .render_markdown("2026-06-21")
             .contains("RED — M3 is BLOCKED"));
+    }
+
+    // ---- M3 producer-subsystems exit gate (M3 → M4) ----
+
+    /// The M3 required row set covers both producer families: Git hosting (GIT-D1..D11 incl. the
+    /// receive-pack seam + the two integration legs) and Knowledge (KN-D1/D3/D4/D5/D6/D7/D9/D10/D11/
+    /// D12/D13), plus the contract-coverage re-affirm. The frozen-row ratchet asserts a future edit
+    /// cannot silently shrink the proof set, and the band dispatch returns the same frozen set.
+    #[test]
+    fn m3_required_rows_cover_the_producer_families() {
+        let ids: Vec<&str> = m3_required_rows().iter().map(|r| r.id).collect();
+        for must in [
+            // Git hosting
+            "GIT-D1",
+            "GIT-D2",
+            "GIT-D3",
+            "GIT-D7",
+            "GIT-D8",
+            "GIT-D9",
+            "GIT-D9-seam",
+            "GIT-D10",
+            "GIT-D11",
+            "GIT-D11-int",
+            // Knowledge
+            "KN-D1",
+            "KN-D3",
+            "KN-D4",
+            "KN-D5",
+            "KN-D6",
+            "KN-D7",
+            "KN-D9",
+            "KN-D10",
+            "KN-D11",
+            "KN-D12",
+            "KN-D13",
+            // coverage
+            "contract-coverage",
+        ] {
+            assert!(
+                ids.contains(&must),
+                "M3 gate is missing required row {must}"
+            );
+        }
+        // Both families present (not just one): a GIT-* and a KN-* row each.
+        assert!(ids.iter().any(|id| id.starts_with("GIT-")));
+        assert!(ids.iter().any(|id| id.starts_with("KN-")));
+        // The band dispatch returns the same frozen set (the single dispatch point).
+        assert_eq!(
+            Band::M3Producers
+                .required_rows()
+                .iter()
+                .map(|r| r.id)
+                .collect::<Vec<_>>(),
+            ids
+        );
+    }
+
+    /// The M3 integration rows (the live-stack drills) all carry `--features integration` — the
+    /// red-until-proven mechanism. The deterministic per-feature drills / CDC rows do not.
+    #[test]
+    fn m3_integration_rows_are_features_integration() {
+        let integration: Vec<&str> = m3_required_rows()
+            .into_iter()
+            .filter(|r| {
+                r.proof_command.contains(&"--features") && r.proof_command.contains(&"integration")
+            })
+            .map(|r| r.id)
+            .collect();
+        // Exactly the six live-stack drills run --features integration.
+        assert_eq!(
+            integration,
+            vec![
+                "GIT-D10",
+                "GIT-D11-int",
+                "KN-D5",
+                "KN-D7",
+                "KN-D9",
+                "KN-D10"
+            ],
+            "the M3 integration set is frozen at the six live-stack producer drills"
+        );
+    }
+
+    /// EXACTLY the KN-D3 row carries a `floor` note (the per-block CAS-merge NAMED FLOOR — the
+    /// proven floor whose full CRDT/OT convergence is a dated follow-on). No other M3 row is a floor.
+    #[test]
+    fn m3_only_kn_d3_names_a_floor() {
+        let floored: Vec<&str> = m3_required_rows()
+            .into_iter()
+            .filter(|r| r.floor.is_some())
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(floored, vec!["KN-D3"]);
+    }
+
+    /// A fully-proven M3 scorecard reads GREEN, renders the M4-may-start verdict, and STILL prints
+    /// the KN-D3 CAS-merge NAMED FLOOR + the world-scale 30× LOAD surge (M5) as named, visible
+    /// deferrals that do NOT red the gate (EI-01 §1).
+    #[test]
+    fn m3_all_rows_proven_is_green_with_floor_and_surge_named() {
+        let mut card = Scorecard::new(Band::M3Producers);
+        for r in m3_required_rows() {
+            card.record(RowResult::pass(
+                r.id,
+                format!("[2026-06-22] PASS {}", r.id),
+                "2026-06-22",
+            ));
+        }
+        assert!(card.is_green(), "every M3 row proven ⇒ green");
+        assert!(card.missing_required().is_empty());
+        let md = card.render_markdown("2026-06-22");
+        assert!(md.contains("GREEN — M4 may start"));
+        // The KN-D3 named floor (CRDT/OT convergence follow-on) is printed.
+        assert!(
+            md.contains("CRDT/OT"),
+            "the KN-D3 full-convergence follow-on must be named"
+        );
+        assert!(
+            md.contains("NAMED FLOOR"),
+            "the KN-D3 named floor must be printed"
+        );
+        // The world-scale 30× LOAD surge floor is deferred to M5.
+        assert!(
+            md.contains("world-scale 30× LOAD"),
+            "the 30× surge floor must be named"
+        );
+        assert!(md.contains("M5"), "the surge floor is deferred to M5");
+        // The integration rows are flagged red-until-proven against the live stack.
+        assert!(md.contains("RED-until-proven"));
+    }
+
+    /// THE RATCHET on the M3 set: dropping ANY single row reds the M3→M4 gate (you cannot ship M4
+    /// over a missing producer drill).
+    #[test]
+    fn m3_dropping_any_row_reds_the_gate() {
+        for dropped in m3_required_rows() {
+            let mut card = Scorecard::new(Band::M3Producers);
+            for r in m3_required_rows()
+                .into_iter()
+                .filter(|r| r.id != dropped.id)
+            {
+                card.record(RowResult::pass(r.id, "[2026-06-22] PASS", "2026-06-22"));
+            }
+            assert_eq!(card.missing_required(), vec![dropped.id]);
+            assert!(
+                !card.is_green(),
+                "dropping {} must RED the M3→M4 gate",
+                dropped.id
+            );
+        }
+    }
+
+    /// THE RATCHET on the M3 set: a claimed-not-proven row (e.g. a live-stack drill that did not run
+    /// against the real backend) keeps the gate RED — recorded honestly, never softened into a green
+    /// (EI-01 §3). The honest red blocks M4.
+    #[test]
+    fn m3_claimed_not_proven_row_reds_the_gate() {
+        let mut card = Scorecard::new(Band::M3Producers);
+        for r in m3_required_rows() {
+            if r.id == "KN-D7" {
+                card.record(RowResult::claimed_not_proven(
+                    r.id,
+                    "the live stack was not up — `cargo test --features integration` failed (red-until-proven)",
+                    "2026-06-22",
+                ));
+            } else {
+                card.record(RowResult::pass(r.id, "[2026-06-22] PASS", "2026-06-22"));
+            }
+        }
+        assert!(!card.is_green(), "a claimed-not-proven M3 row blocks M4");
+        assert_eq!(card.not_proven().len(), 1);
+        assert!(card
+            .render_markdown("2026-06-22")
+            .contains("RED — M4 is BLOCKED"));
     }
 }
