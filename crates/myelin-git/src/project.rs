@@ -298,6 +298,12 @@ pub enum TombstoneReason {
     /// The viewer's subject is RESTRICTED (the GDPR `restrict` flag, §6) — the projection omits the
     /// restricted content (a tombstone for the restricted artifact).
     Restricted,
+    /// The anchored CONTENT IS GONE — a content-anchored `#L<a>-L<b>` line-range resolved to the GONE
+    /// state (the anchored lines are entirely absent from the new blob; X-4 §"Git line-ranges" /
+    /// contract 5.7). The tombstone is rooted at the parent PR ("this referenced PR #N, that line is
+    /// no longer present"), never a silent drop. Produced by [`crate::anchor::resolve`] (GIT-P24); the
+    /// distinct reason keeps a content-gone line range separable from an ERASED artifact in the audit.
+    ContentGone,
 }
 
 impl Tombstone {
@@ -363,9 +369,15 @@ pub enum ProjectError {
         /// The reference that resolved to nothing.
         reference: String,
     },
-    /// A `blob`/`#L<a>-L<b>` ref — the content-anchored 4-state resolver is the **GIT-P24 floor**, not
-    /// built here (the named follow-on; this projector handles PR/commit/review/repo + the
-    /// `#comment-`/`#thread-` sub).
+    /// A `blob`/`#L<a>-L<b>` ref — the content-anchored 4-state resolver now lives in
+    /// [`crate::anchor`] (GIT-P24 / P-286, shipped). This projector does NOT build a blob projection
+    /// inline: the L-range sub-resolve needs the OLD + NEW blob BYTES (read via the git2 object
+    /// backend at the resolved head) which the per-viewer `project(ref, viewer)` seam does not carry —
+    /// the Refs ladder calls [`crate::anchor::resolve`] directly for the sub-resolve step. So a bare
+    /// `blob` ref handed to THIS projector returns this variant pointing the caller at the resolver
+    /// (the projector handles PR/commit/review/repo + the `#comment-`/`#thread-` sub; the L-range is
+    /// the anchor resolver's). The live OLTP blob-byte wiring that lets a projection embed a resolved
+    /// L-range excerpt rides the GIT-P20 store wiring.
     BlobFloor {
         /// The blob reference deferred to GIT-P24.
         reference: String,
