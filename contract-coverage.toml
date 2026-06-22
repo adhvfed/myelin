@@ -1404,9 +1404,20 @@ row = "8.6"
 # auto-spawn a costed run). The CDC pair pins the PROVIDER (the platform delivers a matched event)
 # against the CONSUMER (the agent fabric records it). The dispatch-tier wiring is the Bus's (§3.6) +
 # the SKELETON consumer body is AG-P4 (→ P-216) — IMPL follow-ons, not a pair gap.
+# NOTIF-P22 / P-343 (M4) ships the CHAT half of the EXPLICIT-FIRST boundary: chat decides the
+# dispatch CLASS per event (`myelin_chat::glue::agent_dispatch_class` — a casual @agent mention →
+# NotifyOnly, an explicit action → ExplicitDispatch) and the Bus dispatch tier
+# (`myelin_query::DispatchTier`, §4.7) ENFORCES it: a Mention → `Disposition::NotifiedOnly`, 0
+# auto-spawn, 0 reservation (the explicit-first check fires BEFORE reserve/settle). The CDC carries
+# the PROVIDER (chat's class decision) + CONSUMER (the dispatch tier's enforcement) sides; the
+# CHAT-D17 drill (drill_chat_d17_explicit_first.rs) proves 0 auto-spawn from a casual mention + the
+# reserve gate bites even the explicit run. ZERO Notif/Bus code change (the inverse-signal).
 title = "EventInbox::deliver"
 status = "covered"
-cdc = ["crates/myelin-agent/tests/cdc_8_6_event_inbox.rs"]
+cdc = [
+    "crates/myelin-agent/tests/cdc_8_6_event_inbox.rs",
+    "crates/myelin-chat/tests/cdc_8_6_chat_explicit_first.rs",
+]
 
 [[contract]]
 row = "8.7"
