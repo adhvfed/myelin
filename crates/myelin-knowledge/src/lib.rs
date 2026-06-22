@@ -55,6 +55,7 @@
 
 pub mod emit;
 pub mod store;
+pub mod transport;
 
 pub use emit::{
     block_ref, database_ref, emit_change, page_ref, row_ref, KnowledgeChange,
@@ -62,6 +63,11 @@ pub use emit::{
 };
 pub use store::{
     knowledge_scope, knowledge_store_migrations, KnowledgeStore, KnowledgeTable,
+};
+pub use transport::{
+    doc_scope, knowledge_stream, AllowAllAuthority, AuthAction, CollabTransport, Connected, DocOp,
+    DocOpLog, FailClosedAuthority, OpAuthority, OpId, OpKind, PageSnapshot, PersistedOp, Presence,
+    SendOutcome, TransportError,
 };
 
 use myelin_identity::{
