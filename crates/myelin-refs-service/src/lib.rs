@@ -345,6 +345,7 @@ pub mod erasure_posture;
 pub mod git_producer;
 pub mod holder;
 pub mod invalidator;
+pub mod issues_producer;
 pub mod kn_producer;
 pub mod ladder;
 pub mod loop_guard;
@@ -383,6 +384,10 @@ pub use holder::{
 pub use invalidator::{
     InvalidateError, InvalidationCall, NoOpCacheShim, ProjectionCache, RefsProjectionInvalidator,
     INVALIDATOR_CONSUMER, INVALIDATOR_SUBJECTS, INVALIDATOR_SUBJECT_PREFIXES,
+};
+pub use issues_producer::{
+    mirror_issue_relation, project_issue_relation, reconverge_issue_relations, IssueAnchorState,
+    IssueEdgeProducer, IssueOwner, IssueRelationEvent, ISSUE_OWNER_TOKEN,
 };
 pub use kn_producer::{
     kn_replay_scope, mirror_page_parent, project_page_parent, reconverge_page_tree, KnAnchorState,
