@@ -141,6 +141,24 @@ impl GitReindexSource {
     }
 }
 
+/// **Does aggregate `agg` match a specific (non-`all`) selector `target`?** A match is EITHER an EXACT
+/// aggregate id (`repo:myelin://acme/git/repo/core`) OR a SEGMENT-ANCHORED trailing suffix
+/// (`repo:core` → `…/repo/core`; the suffix must begin at a `/` or `#` boundary, so a short selector
+/// `core` matches `…/core` but NEVER `mycore`). The boundary anchor is the correctness guard: an
+/// unanchored `ends_with` would over-match (`core` → `mycore`) and silently widen a sub-artifact-
+/// granular reindex into a sibling's snapshot. The exact-match arm is NOT redundant: it matches a
+/// whole-id selector that is its own first segment (no leading boundary char).
+fn matches_aggregate(agg: &str, target: &str) -> bool {
+    if agg == target {
+        return true;
+    }
+    // A segment-anchored suffix: `agg` ends with `target` AND the char just before the suffix is a
+    // segment boundary (`/` or `#`) — so the selector names a whole trailing segment, not a substring.
+    agg.strip_suffix(target)
+        .and_then(|head| head.chars().next_back())
+        .is_some_and(|boundary| boundary == '/' || boundary == '#')
+}
+
 impl ReindexSource for GitReindexSource {
     fn owner_token(&self) -> &str {
         "git"
@@ -161,7 +179,7 @@ impl ReindexSource for GitReindexSource {
         self.truth
             .iter()
             .filter(|(_, row)| row.kind == kind)
-            .filter(|(agg, _)| target == "all" || agg.as_str() == target || agg.ends_with(target))
+            .filter(|(agg, _)| target == "all" || matches_aggregate(agg, target))
             .filter(|(_, row)| since.is_none_or(|s| row.version > s))
             .map(|(agg, row)| SnapshotDraft {
                 aggregate: AggregateKey(agg.clone()),
@@ -263,6 +281,100 @@ mod tests {
         let drafts = s.replay(&SnapshotScope::new("git", "repo:all"), None);
         assert_eq!(drafts.len(), 1, "the erased repo is not re-snapshotted");
         assert_eq!(drafts[0].aggregate.0, "myelin://acme/git/repo/core");
+    }
+
+    /// **The `pr:` selector arm parses (kills the `delete Some("pr")` arm mutant).** A `pr:all` scope
+    /// resolves the PR kind — without the arm `from_selector` returns `None` and the replay is empty.
+    #[test]
+    fn replay_pr_selector_arm_resolves() {
+        let mut s = source();
+        s.upsert(
+            GitReplayKind::Pr,
+            "myelin://acme/git/repo/core#pr-1",
+            7,
+            "myelin://acme/git/repo/core#pr-1",
+            serde_json::json!({ "title": "ref" }),
+        );
+        let drafts = s.replay(&SnapshotScope::new("git", "pr:all"), None);
+        assert_eq!(drafts.len(), 1, "the pr arm resolved (else the selector is unparseable → empty)");
+        assert_eq!(drafts[0].type_.0, "git.pr.snapshot");
+    }
+
+    /// **A specific aggregate id matches EXACTLY ONE, not `all` (kills `==`→`!=` and `||`→`&&` on the
+    /// target filter).** A `repo:<full-id>` selector replays only that repo — the other repo is NOT
+    /// re-emitted. If `==` flipped to `!=` the wrong repo(s) would match; if `||` flipped to `&&` the
+    /// `target == "all"` term would force-empty a specific selector.
+    #[test]
+    fn replay_specific_aggregate_matches_exactly_one_not_all() {
+        let s = source();
+        let scope = SnapshotScope::new("git", "repo:myelin://acme/git/repo/core");
+        let drafts = s.replay(&scope, None);
+        assert_eq!(drafts.len(), 1, "exactly the named repo (not all repos, not none)");
+        assert_eq!(drafts[0].aggregate.0, "myelin://acme/git/repo/core");
+    }
+
+    /// **The `ends_with` suffix match resolves a short selector (kills the `ends_with` term drop).** A
+    /// selector that is a trailing suffix of the aggregate (`core` of `…/repo/core`) matches it. Drop
+    /// the `ends_with` term and a suffix selector matches nothing.
+    #[test]
+    fn replay_suffix_selector_matches_via_ends_with() {
+        let s = source();
+        let drafts = s.replay(&SnapshotScope::new("git", "repo:core"), None);
+        assert_eq!(drafts.len(), 1, "the `core` suffix selector matched the full aggregate");
+        assert_eq!(drafts[0].aggregate.0, "myelin://acme/git/repo/core");
+    }
+
+    /// **A suffix selector is SEGMENT-ANCHORED — `core` matches `…/repo/core` but NOT a substring
+    /// `mycore` (kills the boundary-anchor mutants + the over-match hazard).** The anchor is the
+    /// correctness guard: an unanchored suffix would widen a per-repo reindex into a sibling's.
+    #[test]
+    fn replay_suffix_selector_is_segment_anchored_not_substring() {
+        let mut s = source();
+        // a sibling repo whose id ENDS WITH the substring `core` but is NOT segment `core`.
+        s.upsert(
+            GitReplayKind::Repo,
+            "myelin://acme/git/repo/mycore",
+            1,
+            "myelin://acme/git/repo/mycore",
+            serde_json::json!({ "default_branch": "main" }),
+        );
+        let drafts = s.replay(&SnapshotScope::new("git", "repo:core"), None);
+        assert_eq!(drafts.len(), 1, "`core` matches ONLY the segment `…/repo/core`, never `…/mycore`");
+        assert_eq!(drafts[0].aggregate.0, "myelin://acme/git/repo/core");
+    }
+
+    /// `matches_aggregate` directly: exact, segment-anchored suffix, and the rejected substring.
+    #[test]
+    fn matches_aggregate_exact_anchored_and_substring_reject() {
+        assert!(matches_aggregate("myelin://acme/git/repo/core", "myelin://acme/git/repo/core"), "exact");
+        assert!(matches_aggregate("myelin://acme/git/repo/core", "core"), "segment-anchored `/core`");
+        assert!(matches_aggregate("myelin://acme/git/repo/core#blob-1", "blob-1"), "anchored at `#`");
+        assert!(!matches_aggregate("myelin://acme/git/repo/mycore", "core"), "substring is NOT a match");
+        assert!(!matches_aggregate("myelin://acme/git/repo/core", "other"), "a non-suffix is no match");
+    }
+
+    /// **The `since` cursor replays STRICTLY ABOVE the cursor (kills `>`→`==`/`<`/`>=`).** With
+    /// `since = Some(2)` only the version-3 repo replays; the version-1 repo is below the cursor and is
+    /// skipped, and the version-2 cursor value itself is NOT re-emitted (`>` is strict, the incremental
+    /// backfill resume invariant — re-emitting the cursor row would double-apply it).
+    #[test]
+    fn replay_since_cursor_is_strictly_above() {
+        let s = source(); // repos: core@3, docs@1 ; blob@2
+        // since = 2 over the repo scope: only core@3 (>2) replays; docs@1 (<2) and any @2 are skipped.
+        let drafts = s.replay(&SnapshotScope::new("git", "repo:all"), Some(2));
+        assert_eq!(drafts.len(), 1, "only the version-3 repo replays past since=2");
+        assert_eq!(drafts[0].version, 3);
+        // since exactly AT the highest version (3) → nothing replays (`>` is strict, not `>=`).
+        assert!(
+            s.replay(&SnapshotScope::new("git", "repo:all"), Some(3)).is_empty(),
+            "since == the high-water version re-emits nothing (the cursor row is not re-applied)"
+        );
+        // since = 0 → every repo replays (the full-rebuild floor).
+        assert_eq!(
+            s.replay(&SnapshotScope::new("git", "repo:all"), Some(0)).len(),
+            2,
+            "since=0 replays every repo (full rebuild)"
+        );
     }
 
     /// **cold == live + idempotent re-run (BUS-D5 for the git owner).** Build a LIVE projection from

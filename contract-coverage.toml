@@ -165,9 +165,16 @@ status = "covered"
 # page-subtree-at-BLOCK-granularity replay (`myelin_content::replay::KnowledgeReindexSource`) — both
 # proven cold == live + idempotent against THIS seam. FLOOR (M4 owners, EB-27): CI one-run, Issues/Chat,
 # Refs per-blob, Search full reindex land with those subsystems' M4 prompts.
+# GIT-P30/P-291 (M3-G7) greens GIT-D3 (reindex-from-source PARITY): the end-to-end drill that wipes +
+# rebuilds ALL THREE Git-fed derived stores (Search code index, the check_status projection, the Refs
+# lifecycle edges) and proves the cold rebuild BYTE-MATCHES live (one code path, no drift) + the
+# check_status projection rebuilds from CI's ci.check.updated re-emit + an erased body does NOT
+# resurrect (0 resurrected PII; the ONE posture residual) + the no-cross-db reach is structural
+# (the only doc-entry path is the owner's project(ref)/replay — never a Git DB read).
 cdc = [
     "crates/myelin-events/tests/cdc_2_6_reindex.rs",
     "crates/myelin-content/tests/cdc_2_9_2_6_knowledge_tokens_and_replay.rs",
+    "crates/myelin-git/tests/drills_git_d3_reindex_parity.rs",
 ]
 
 [[contract]]
