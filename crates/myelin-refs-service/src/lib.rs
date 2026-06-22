@@ -337,6 +337,7 @@
 
 pub mod backlinks;
 pub mod cache;
+pub mod ci_producer;
 pub mod dek;
 pub mod edge_builder;
 pub mod emit;
@@ -362,6 +363,7 @@ pub use backlinks::{
     FILTER_MODE_SPLIT_SIGNAL, SOURCE_ROOT_COLUMN,
 };
 pub use cache::{CacheFillError, R2ProjectionCache, R2_DEFAULT_TTL, R2_KEY_PREFIX};
+pub use ci_producer::{CiOwner, StepAnchorResolver, StepResolution, CI_OWNER_TOKEN};
 pub use dek::{ref_p5_inherited_gates, InheritedGate, RefsDekPin};
 pub use edge_builder::{
     edge_id, EdgeProjection, EdgeRow, ProjectError, RefsEdgeBuilder, RelClass,
