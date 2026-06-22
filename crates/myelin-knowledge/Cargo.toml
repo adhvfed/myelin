@@ -92,6 +92,13 @@ default = []
 # `authz_visible` JOIN conjoined into ONE db-list query AND one COUNT aggregate; 0 leaked rows, 0
 # count-leak, no-cross-db/cross-tenant, revoke reflected). tests/integration_kn_d5_list_pushdown.rs.
 # Registered red-until-proven; flips green only with the real artifact.
+#
+# KN-D9 / P-307 (the flex-DB latency crux): the flexible database (JSONB property bag + GIN
+# `jsonb_path_ops` projection + the view filter conjoined with the `list_objects` `SetExpr` ACL)
+# PROVEN against the live dev-stack Postgres — the VIEW_QUERY lowers a `QueryAst` filter into JSONB
+# ops over `props` (the GIN-covered source of truth) AND conjoins the ACL JOIN over `db_row.id` into
+# ONE leak-free query AND the permission-correct COUNT (0 leak, 0 count-leak, no-cross-db/tenant).
+# tests/integration_kn_d9_flex_db.rs. Registered red-until-proven; flips green only with the real artifact.
 integration = ["dep:sqlx", "dep:tokio"]
 
 [dev-dependencies]

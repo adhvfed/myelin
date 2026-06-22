@@ -148,6 +148,32 @@ depth_ceiling = 16
 max_nodes = 10000
 
 # ---------------------------------------------------------------------------------------------
+# [flex_db] — the Knowledge flexible-database read budgets + the FROZEN >5% facet-promotion
+# threshold (KN-P17 / P-307; KN-D9; contract 6.3 / OQ-C, knowledge-platform architecture 01 §1.2 /
+# 02 §4.1). The flexible DB is JSONB property-bag rows (source of truth) + a GIN `jsonb_path_ops`
+# projection + generated columns for the MEASURED-hot facets; views lower their `QueryAst` filter
+# into JSONB ops over `props` and ALWAYS conjoin the `list_objects` `SetExpr` ACL (permission by
+# construction, 0 post-filter — composes with KN-D5).
+#
+# `view_read_p99_max_ms` is the KN-D9 flex-DB latency gate (the default-to-beat measured at scale
+# on the failure-injection harness; re-confirmed at WORLD scale in KN-P31). `page_row_cap` is the
+# §4.1 step-5 row cap — a single view read is ALWAYS paginated/row-capped, never an unbounded scan
+# (mirrors `database::PageBound::MAX`). `facet_promotion_ratio` is the FROZEN Search-owned tunable
+# (contract 6.3): a facet in MORE than this fraction of a collection's view executions over a
+# rolling window promotes from a cold GIN scan to a per-facet generated/expression-column index —
+# MEASURED here (KN-P17 `FacetTelemetry`), ACTED on (the index provisioned off the bus via
+# expand→backfill→contract) in KN-P31 (M5). The trigger is STRICTLY >5% (a facet at exactly 5% does
+# NOT promote — the frozen 6.3 wording). Weakening any number to pass is forbidden (EI-01 §3) —
+# a red is a dated [[claimed_not_proven]] row, never a lowered bar. Mirrors
+# `myelin_knowledge::{database::PageBound::MAX, FACET_PROMOTION_THRESHOLD}`; this file is their
+# source of truth.
+# ---------------------------------------------------------------------------------------------
+[flex_db]
+view_read_p99_max_ms = 200    # KN-D9: the flex-DB view-read p99 budget (JSONB + GIN + SetExpr conjoin).
+page_row_cap = 500            # §4.1 step 5: the page row cap (a view read is always row-capped).
+facet_promotion_ratio = 0.05  # contract 6.3: the FROZEN >5% facet-promotion trigger (measured, acted on KN-P31).
+
+# ---------------------------------------------------------------------------------------------
 # [authz_index] — the S8 authz-reverse-index measured tunables (P-ID-11 / P-069, identity §7.1).
 # The Ids↔Filter SHAPE is FROZEN (small reachable sets materialise as `Ids`, large ones push down as
 # `Filter`); only the NUMBER — the cardinality cap that switches between them — is open. This is the

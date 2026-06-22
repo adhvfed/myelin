@@ -812,11 +812,21 @@ status = "covered"
 # changed-blob-count) and the per-blob doc lowers to the Search-owned SearchProjection whose facets
 # are EXACTLY the declared 6.3 spec's (path/language/blob_oid). The emitter CDC pins both sides; the
 # emit GATE is in crates/myelin-git/tests/e2e_git_p287_code_projection_emit.rs.
+#
+# KN-P17 / P-307 adds the >5% FACET-PROMOTION-THRESHOLD aspect of 6.3 / OQ-C (the Search-owned
+# tunable: a facet in MORE than 5% of a collection's view executions over a rolling window promotes
+# from a cold GIN scan to a per-facet generated/expression-column index). Knowledge MEASURES the
+# trigger (myelin_knowledge::FacetTelemetry — per-(db, facet) view-execution frequency); the CDC
+# (cdc_13_3_6_3_knowledge_flex_db.rs::cdc_6_3_*) pins that the executor's threshold == the
+# thresholds-file value (one source of truth, `flex_db.facet_promotion_ratio`) and that the trigger
+# is STRICTLY >5% (a facet at exactly 5% does NOT promote — the frozen wording, never weakened). The
+# promotion ACT (provisioning the generated-column index off the bus) is the NAMED KN-P31 (M5) floor.
 cdc = [
     "crates/myelin-git/tests/cdc_6_3_git_code_projection.rs",
     "crates/myelin-git/tests/cdc_6_5_git_code_projection_emitter.rs",
     "crates/myelin-issues/tests/cdc_6_3_issues_facets_projection.rs",
     "crates/myelin-search/tests/cdc_6_3_kn_index_specs.rs",
+    "crates/myelin-knowledge/tests/cdc_13_3_6_3_knowledge_flex_db.rs",
 ]
 
 [[contract]]
@@ -1766,10 +1776,21 @@ row = "13.3"
 # Knowledge's frozen outputs. A FieldType rename / ViewSpec reorder / order_key midpoint-or-jitter
 # change now fails BOTH co-owners' tests at once. Issues' own AST→store compiler is ISS-P13; the
 # order_key CAS reorder is ISS-P09; the co-equal views are ISS-P16 (no data written yet).
+#
+# KN-P17 / P-307: Knowledge now ships its EXECUTOR over the frozen 13.3 shapes — the flexible-DB
+# query lowering (myelin_knowledge::database). The executor CONSUMES the frozen ViewSpec/QueryAst/
+# FieldType byte-identically (it never re-defines them) and lowers a view into JSONB ops over
+# `db_row.props`, conjoining the `list_objects` SetExpr ACL (4.3) into ONE leak-free view query AND
+# the permission-correct COUNT. The typed FieldType validation gate (FieldSchema::validate_props —
+# a wrong-typed value is rejected, never coerced) + the two-way relation maintenance (db_relation,
+# the TE-7 source of truth) ride here. The executor CDC (cdc_13_3_6_3_knowledge_flex_db.rs) pins the
+# agreement; the live JSONB+GIN+SetExpr one-query/0-leak proof is the `--features integration` test
+# (integration_kn_d9_flex_db.rs) + the KN-D9 SCHED drill (drill_kn_d9_flex_db.rs).
 title = "myelin-query primitive (frozen byte-identical)"
 status = "covered"
 cdc = [
     "crates/myelin-query/tests/cdc_13_3_query_primitive.rs",
     "crates/myelin-query/tests/cdc_13_3_order_key.rs",
     "crates/myelin-issues/tests/cdc_13_3_issues_coown.rs",
+    "crates/myelin-knowledge/tests/cdc_13_3_6_3_knowledge_flex_db.rs",
 ]
