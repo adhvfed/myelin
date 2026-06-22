@@ -148,4 +148,6 @@ myelin-identity-service = { path = "../myelin-identity-service" }
 # (`src/check_status_store.rs`) + its live GIT-D10 part-(a) drill
 # (`tests/integration_git_d10_check_status_projection.rs`). Off by default so `cargo build --workspace`
 # stays DB-free; proven green against the docker-compose dev Postgres stack.
-integration = ["dep:sqlx", "dep:tokio", "dep:myelin-config"]
+# `myelin-storage/integration` pulls in the REAL `ValkeyCache` (the `fork:<pr_id>` cache-confinement
+# integration test, GIT-P22 / P-284, `tests/integration_git_p22_fork_cache_confinement.rs`).
+integration = ["dep:sqlx", "dep:tokio", "dep:myelin-config", "myelin-storage/integration"]

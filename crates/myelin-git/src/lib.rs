@@ -196,6 +196,20 @@ pub mod lifecycle;
 /// confinement is GIT-P22; the merge queue (durable workflow, exactly-once merge, the `ci.result`
 /// rollup wait) is GIT-P23.
 pub mod merge_gate;
+/// The **fork / trust-tier endorsement gate** (GIT-P22 / P-284, M3-G4 — the poisoned-pipeline defence).
+/// Closes the [`merge_gate`] floor by shipping the two halves the merge gate consumed as explicit
+/// inputs in GIT-P21: (A) the LIVE endorsement RESOLVER ([`fork_gate::EndorsementResolver`]) that runs
+/// the maintainer's `check(subject, approve_untrusted_ci, repo)` through the LIVE
+/// [`live_check::GitCheckGate`] (GIT-P14) for each required context whose CURRENT row is an un-endorsed
+/// `untrusted_fork` success, PRODUCING the `endorsed_contexts` set [`merge_gate::evaluate_merge_gate`]
+/// consumes (a fork can never self-green — the subject is the maintainer who holds the relation, never
+/// the fork author); and (B) the **`fork:<pr_id>` trust-scoped cache confinement**
+/// ([`fork_gate::TrustScope`] + [`fork_gate::ScopedCache`], contract 11.2 C4 / recon §8) — a scope-key
+/// convention over the per-tenant [`myelin_storage::Cache`] so an `UntrustedFork` write can NEVER reach
+/// the `trusted:` cache scope (0 fork writes in the trusted scope; the scope is DERIVED from the
+/// CI-stamped trust tier, never caller-chosen). Floor: the merge queue (durable workflow, exactly-once
+/// merge, the `ci.result` rollup wait) is GIT-P23.
+pub mod fork_gate;
 pub mod notif_rules;
 /// The git **PACK TIER on the local-NVMe `BlobStore` floor** (GIT-P11 / P-272, M3-G1): the git-side
 /// object-DB migration THROUGH the [`myelin_storage::GitPackTier`] (closing the receive-pack

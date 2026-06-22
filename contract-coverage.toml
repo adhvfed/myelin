@@ -623,10 +623,28 @@ landing = "P-282"
 # merge-gate mutation floor is MET (cargo-mutants on `merge_gate.rs`: 18 caught / 0 missed / 5 unviable —
 # 100% of viable mutants on the gate-decision path).
 # The row stays DEFERRED because the seam is not yet live END-TO-END (no real CI PRODUCER until M4).
-# The LIVE fork-endorsement RESOLUTION (`check(subject, approve_untrusted_ci, repo)` + the `fork:<pr_id>`
-# trust-scoped cache confinement) is GIT-P22 — here the endorsement is the explicit gate input, and the
-# neutral-until-endorsed rule already holds. The merge queue (durable workflow, exactly-once merge, the
-# `ci.result` rollup wait) is GIT-P23.
+# GIT-P22/P-284 (M3-G4) LANDED THE FORK / TRUST-TIER ENDORSEMENT GATE (the poisoned-pipeline defence,
+# GIT-D10 parts (b)+(c)) — closing the GIT-P21 floor. `myelin_git::fork_gate` ships the two halves the
+# merge gate consumed as explicit inputs: (A) the LIVE endorsement RESOLVER (`EndorsementResolver`) runs
+# the maintainer's `check(subject, approve_untrusted_ci, repo)` through the LIVE `GitCheckGate` (GIT-P14
+# `fork_endorsement_check`, a Strong zookie-stamped read) for each required context whose CURRENT row is
+# an un-endorsed `untrusted_fork` success, PRODUCING the `endorsed_contexts` set `evaluate_merge_gate`
+# consumes — a fork can NEVER self-green (the check's subject is the maintainer who holds the relation,
+# never the fork author → Deny → 0 endorsements); (B) the `fork:<pr_id>` trust-scoped cache confinement
+# (`TrustScope` + `ScopedCache`, contract 11.2 C4 / recon §8) — a scope-key convention over the per-tenant
+# `myelin_storage::Cache` so an `UntrustedFork` write can NEVER reach the `trusted:` cache scope (the
+# scope is DERIVED from the CI-stamped trust tier, never caller-chosen). GIT-D10 (b) fork-neutral + (c)
+# endorse-flips are greened in the chained e2e `crates/myelin-git/tests/e2e_git_p22_fork_endorsement.rs`
+# (fork author blocked → maintainer endorses → green; re-run-trusted greens with no endorsement; 0 fork
+# writes in the trusted scope) + the CDC `crates/myelin-git/tests/cdc_5_9_fork_endorsement.rs` (CI stamps
+# the tier, Git reads it off the fact, the endorsement is a plain relation check, the fork author cannot
+# self-endorse). The `fork:<pr_id>` confinement is PROVEN against LIVE Valkey in
+# `crates/myelin-git/tests/integration_git_p22_fork_cache_confinement.rs` (--features integration: 0 fork
+# writes in the trusted scope on the real server). The fork-gate mutation floor is MET (cargo-mutants on
+# `fork_gate.rs`: 18 caught / 0 missed / 5 unviable — 100% of viable mutants on the endorsement + cache-
+# confinement path). The row stays DEFERRED because the seam is not yet live END-TO-END (no real CI
+# PRODUCER until M4). The merge queue (durable workflow, exactly-once merge, the `ci.result` rollup wait)
+# is GIT-P23.
 
 # ──────────────── §6 Search (myelin-search) ─────────────────────────────────────────────────────
 
@@ -1271,6 +1289,14 @@ status = "covered"
 # Floors named GF-1 (object-backed packs) / GF-2 (cross-cell) / GF-2b (SHA-256 flip) / GF-4 (Mononoke-
 # class) all → GIT-P33. The git consumer-half CDC is cdc_11_2_git_pack_tier_consumer.rs (the REAL
 # PackObjectDb drives the storage provider — pins the frozen put/get/placement shape).
+# P-284 (GIT-P22): the C4 TRUST-SCOPED CACHE namespaces (row 11.2-C4 — an `UntrustedFork` write cannot
+# reach the trusted cache scope, the poisoned-cache defence). `myelin_git::fork_gate::ScopedCache` is the
+# `fork:<pr_id>` confinement: a scope-key convention (`TrustScope` → key-prefix) over the UNCHANGED
+# per-tenant `myelin_storage::Cache` (NOT a new store, EI-01 §7) — a fork run's keys ALWAYS prefix
+# `fork:<pr_id>:` (the scope is DERIVED from the CI-stamped trust tier, never caller-chosen), so a fork
+# write can never address a `trusted:`-prefixed key. PROVEN against LIVE Valkey in
+# crates/myelin-git/tests/integration_git_p22_fork_cache_confinement.rs (0 fork writes in the trusted
+# scope on the real server; per-PR fork isolation; the trusted scope still round-trips). Ties to X-1.
 cdc = [
     "crates/myelin-storage/tests/cdc_11_2_blobstore.rs",
     "crates/myelin-storage/tests/cdc_11_2_git_pack_tier.rs",
