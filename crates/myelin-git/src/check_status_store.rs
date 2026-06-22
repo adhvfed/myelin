@@ -44,7 +44,10 @@
 
 #![cfg(feature = "integration")]
 
-use crate::check_status::{CheckState, CheckStatus, CheckStatusRow, GitOid, TrustTier};
+use crate::check_status::{CheckContext, CheckState, CheckStatus, CheckStatusRow, GitOid, TrustTier};
+use crate::merge_gate::{
+    evaluate_merge_gate_row, MergeGateOutcome, MergeGatePolicy, UnmetContext,
+};
 use sqlx::postgres::PgPool;
 use sqlx::Row;
 
@@ -244,6 +247,47 @@ impl PgCheckStatusProjection {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(decode_row))
+    }
+
+    /// **THE LIVE MERGE GATE (GIT-P21 / §6.2 — the required-set policy over the STORE-BACKED
+    /// projection).** Evaluate a [`MergeGatePolicy`] against the live `check_status` table for the PR's
+    /// `head_oid`: for EACH required context, fetch its current row from Postgres and classify it via
+    /// the SHARED [`evaluate_merge_gate_row`] primitive (the IDENTICAL state/trust logic the in-memory
+    /// gate applies — the DB path and the in-memory path can never drift). `endorsed_contexts` is the
+    /// set of fork-endorsed contexts (the GIT-P22 `approve_untrusted_ci` input).
+    ///
+    /// Returns [`MergeGateOutcome::Admitted`] iff every required context has a current `success` row
+    /// with an acceptable trust posture, else [`MergeGateOutcome::Blocked`] with the specific unmet
+    /// contexts. **0 merges are admitted with a missing/stale/un-endorsed required context** (the
+    /// 0-under-gated-merges invariant, proven against the LIVE stack). Git reads its OWN table — it
+    /// never synchronously calls CI (acyclic, EI-02 §3); it reads `trust_tier` OFF the row, never
+    /// recomputes it.
+    pub async fn merge_gate(
+        &self,
+        tenant_id: &str,
+        head_oid: &GitOid,
+        policy: &MergeGatePolicy,
+        endorsed_contexts: &[CheckContext],
+    ) -> Result<MergeGateOutcome, sqlx::Error> {
+        let mut unmet: Vec<UnmetContext> = Vec::new();
+        for ctx in &policy.required {
+            let provider = match ctx.provider {
+                crate::check_status::CheckProvider::Ci => "ci",
+                crate::check_status::CheckProvider::External => "external",
+            };
+            // Read Git's OWN projection row for this required (head_oid, context) — never CI.
+            let row = self.current(tenant_id, head_oid, provider, &ctx.name).await?;
+            let endorsed = endorsed_contexts.contains(ctx);
+            // The IDENTICAL classify logic as the in-memory gate (no drift between the DB + memory path).
+            if let Some(reason) = evaluate_merge_gate_row(row.as_ref(), endorsed) {
+                unmet.push(UnmetContext { context: ctx.clone(), reason });
+            }
+        }
+        Ok(if unmet.is_empty() {
+            MergeGateOutcome::Admitted
+        } else {
+            MergeGateOutcome::Blocked { unmet }
+        })
     }
 
     /// The number of current rows for a commit (one per context) — the "exactly 1 current row per key"

@@ -170,6 +170,20 @@ pub mod live_check;
 /// line-anchor 4-state resolver is GIT-P23/GIT-P24; the live OLTP store + per-ref ruleset persistence
 /// (+ the `write_tuples` CODEOWNERS tuple write) is GIT-P20/GIT-P22.
 pub mod lifecycle;
+/// The **merge gate + the required-set policy** (GIT-P21 / P-282, M3-G4 — "Git owns what is allowed to
+/// land"). The bridge the merge gate fires across: it parses a `base_ref`'s branch-protection
+/// [`lifecycle::BranchProtectionRuleset`] `required_contexts` strings into typed
+/// [`check_status::CheckContext`]s ([`merge_gate::parse_required_context`]), resolves each against
+/// Git's OWN [`check_status`] projection for the PR `head_oid`, applies the fork-endorsement trust
+/// posture (reading `trust_tier` OFF the fact, never recomputing it), and returns the typed
+/// [`merge_gate::MergeGateOutcome`] — the **0-under-gated-merges** decision (a missing/stale/un-endorsed
+/// required context ALWAYS blocks). REUSES the per-context gate logic in [`check_status`] (EI-01 §7 —
+/// extend/reconcile, never duplicate). The live-store gate read is
+/// [`check_status_store::PgCheckStatusProjection::merge_gate`] (proven against the dev Postgres stack).
+/// Floors: the LIVE `approve_untrusted_ci` fork-endorsement resolution + the `fork:<pr_id>` cache
+/// confinement is GIT-P22; the merge queue (durable workflow, exactly-once merge, the `ci.result`
+/// rollup wait) is GIT-P23.
+pub mod merge_gate;
 pub mod notif_rules;
 /// The git **PACK TIER on the local-NVMe `BlobStore` floor** (GIT-P11 / P-272, M3-G1): the git-side
 /// object-DB migration THROUGH the [`myelin_storage::GitPackTier`] (closing the receive-pack
