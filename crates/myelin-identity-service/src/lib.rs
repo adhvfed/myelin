@@ -945,8 +945,11 @@ impl StoreBackedCheck {
     /// fragment's compiled `pull`/`push`, so for those edges to resolve at check-time the Git fragment
     /// must also be admitted into the same engine (the cross-fragment inheritance — admit the Git
     /// fragment first, e.g. via [`StoreBackedCheck::admit_git_fragment`]). The self-hosted-runner token
-    /// SCOPE exercise against this fragment is P-ID-28 (P-321). Returns the per-type admit verdicts in
-    /// admit order; a malformed fragment is `Rejected{reason}` (loudly, never silently admitted).
+    /// SCOPE (the [`mint`] one-tenant ceiling, P-ID-18) is exercised AGAINST this live fragment by
+    /// P-ID-28 (P-321): a self-hosted runner token is bounded to one tenant's `SelfHosted` jobs → 0
+    /// cross-tenant job/secret reads (`tests/drill_ci_d10_self_hosted_scope.rs`, CI-D10 scope side).
+    /// Returns the per-type admit verdicts in admit order; a malformed fragment is `Rejected{reason}`
+    /// (loudly, never silently admitted).
     pub fn admit_ci_fragment(&self) -> Vec<myelin_identity::FragmentAdmit> {
         let mut ns = self.namespace.lock().unwrap_or_else(|e| e.into_inner());
         ci_fragment::ci_fragment()
