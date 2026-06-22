@@ -522,8 +522,19 @@ cdc = ["crates/myelin-git/tests/cdc_5_4_13_1_git_content_edges.rs"]
 [[contract]]
 row = "5.5"
 title = "TE-7 typed-edge mirror"
-status = "deferred"
-landing = "P-163"
+# The Refs-OWNED mirror DISCIPLINE (the lifecycle vocabulary, the inverse pairing, the both-directions
+# projection, drift reconvergence) shipped in REF-P14 / P-163 (`myelin_refs_service::mirror`). GIT-P19 /
+# P-280 adds the GIT-OWNED PRODUCER half — as the PR lifecycle advances, a Git PR emits the forward
+# lifecycle edges (`Closes <ISSUEKEY>` trailer on a merged PR → exactly one `closes` edge; a PR-link →
+# exactly one `relates` edge) as `refs.edge.created` with `rel_class='lifecycle'`, in the SAME outbox
+# transaction as the `git.pr.merged`/`git.pr.updated` event (emit-iff-committed; 0 dup/missed). This is
+# the byte-identical wire shape the Refs mirror consumer ingests; the CDC models the consumer's field
+# reads + the deterministic `edge_id` + the forward/inverse projection locally because `myelin-git`
+# cannot depend on the Refs SERVICE crate (the §2.9 one-directional edge: `myelin-refs-service` depends
+# on `myelin-git`). Git emits the FORWARD edge only; the inverse projection is the Refs mirror's
+# (`relates` symmetric swap; `closes` has the `Inverse::None` floor — REF-P18/REF-P20 mint the token).
+status = "covered"
+cdc = ["crates/myelin-git/tests/cdc_5_5_git_lifecycle_edges.rs"]
 
 [[contract]]
 row = "5.6"

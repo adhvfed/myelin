@@ -203,3 +203,19 @@ pub mod search_projection;
 /// clone (the full within-EU CDN class hardens in GIT-P33).
 pub mod shed_clone;
 pub mod subs;
+/// The **typed-edge mirror: PR-link / commit-trailer lifecycle edges into the Refs projection**
+/// (GIT-P19 / P-280, M3-G3 — the typed-edge-mirror half). As the PR lifecycle advances, a Git PR emits
+/// **lifecycle edges** (`closes`/`relates`, `rel_class='lifecycle'`) via the outbox — DISTINCT from the
+/// content-node `mention`/`artifact_ref`/`embed` REFERENCE edges ([`body`], GIT-P17,
+/// `rel_class='reference'`). A `Closes <ISSUEKEY>` trailer on a MERGED PR
+/// ([`typed_edges::parse_closes_trailers`]) produces exactly one `closes` edge (PR→issue); an explicit
+/// PR-link produces one `relates` edge. [`typed_edges::emit_lifecycle_edges`] emits one
+/// `refs.edge.created` per linkage in the SAME outbox transaction as the PR's `git.pr.merged` /
+/// `git.pr.updated` lifecycle event (emit-iff-committed — 0 dup/missed; no lifecycle edge without its
+/// committed transition). This is the **Git-owned producer half** of contract 5.5 (Git cannot depend on
+/// the Refs service crate — the §2.9 DAG); it produces the byte-identical lifecycle-edge wire-shape the
+/// Refs mirror consumer (`myelin_refs_service::mirror`) ingests (CDC-pinned). Floors: the inverse
+/// projection is the Refs mirror's (Git emits forward only); `blocks`/`depends_on`/`parent`/`assigns`
+/// are the Issues/Knowledge typed tables' (REF-P18/REF-P20); the live PR-merge transition wiring is
+/// GIT-P20/GIT-P22.
+pub mod typed_edges;
