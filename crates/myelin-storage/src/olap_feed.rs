@@ -118,6 +118,15 @@ impl OlapBusConsumer {
         &self.store
     }
 
+    /// The underlying read model, mutably — the seam the C5 restriction-flag gate (P-ST-29 /
+    /// [`crate::olap_restrict`]) uses to propagate `restrict(subject)` into T4 (it sets the read
+    /// model's restriction flag; [`crate::olap_restrict::OlapAnalytics`] then excludes the subject's
+    /// rows from every analytics aggregate at query time). The GDPR DSR orchestrator drives this via
+    /// the holder's `restrict` body (P-GA-25) on the live floor; the gate reads the flag the same way.
+    pub fn store_mut(&mut self) -> &mut OlapReadStore {
+        &mut self.store
+    }
+
     /// The read model's reindex-parity bytes (the F4 comparison: cold == live byte-for-byte).
     pub fn parity_bytes(&self) -> Vec<u8> {
         self.store.parity_bytes()
