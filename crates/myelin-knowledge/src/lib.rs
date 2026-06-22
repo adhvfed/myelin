@@ -69,6 +69,7 @@ pub mod list_filter;
 pub mod merge;
 pub mod rebac_fragment;
 pub mod refs_glue;
+pub mod replay;
 pub mod rollup;
 pub mod store;
 pub mod subs;
@@ -129,6 +130,7 @@ pub use refs_glue::{
     KnowledgeLifecycleRel, LadderRung, PageMeta, PageStore, Projected, Projector, SubAnchor, SubState,
     ProjectError as RefsProjectError, REFS_EDGE_CREATED, REL_CLASS_LIFECYCLE, REL_CLASS_REFERENCE,
 };
+pub use replay::{KnowledgeReindexSource, REFS_EDGE_SNAPSHOT};
 pub use rollup::{
     compute_row, CellValue, FormulaExpr, FormulaField, FormulaSchema, FormulaSchemaError,
     MaterialisationHint, RollupFn, RollupLatencyTelemetry, RollupResolver, MAX_DEPENDENCY_DEPTH,

@@ -206,6 +206,16 @@ cdc = [
     "crates/myelin-events/tests/cdc_2_6_reindex.rs",
     "crates/myelin-content/tests/cdc_2_9_2_6_knowledge_tokens_and_replay.rs",
     "crates/myelin-git/tests/drills_git_d3_reindex_parity.rs",
+    # KN-P20/P-310 (M3 · KN-D6): Knowledge's FULL SERVICE-crate replay body
+    # (myelin_knowledge::replay::KnowledgeReindexSource) — the superset of the content-crate
+    # page/block floor: it adds the knowledge.row.snapshot row leg (off the flexible-DB rows) + the
+    # refs.edge.snapshot TE-7 drift-correction (off the page_parent/db_relation typed tables, §3.1 —
+    # the typed table WINS). KN-D6 (catalogue F4, was SCHED) GREENED: wipe -> replay -> cold == live
+    # (the reindex-parity hash byte-matches), live consumer path only, a crash-mid-rebuild resume
+    # converges idempotently (deterministic ids, 0 double-apply), an erased page/row is never
+    # resurrected (X-7). The replay-idempotence gate (a re-run emits 0 new) is CI-green.
+    "crates/myelin-knowledge/tests/cdc_2_6_knowledge_replay.rs",
+    "crates/myelin-knowledge/tests/drill_kn_d6_reindex_parity.rs",
 ]
 
 [[contract]]
