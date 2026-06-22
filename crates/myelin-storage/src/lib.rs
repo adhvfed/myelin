@@ -580,7 +580,8 @@ pub use blob::{
 pub use cache::{Cache, CacheError, InMemoryCache};
 pub use cdn::{CdnCloneClass, CdnEdgePop, CdnEdgeSet};
 pub use ci_log_index::{
-    CiLogError, CiLogFrame, CiLogIndex, CiLogTier, StepAnchor, StepSpan, CI_LOG_STREAM,
+    CiLogError, CiLogFrame, CiLogIndex, CiLogTier, SegmentKeying, StepAnchor, StepSpan,
+    CI_LOG_STREAM,
 };
 pub use coloc::{ColocError, ColocatedOltp, ColocatedTx, COLOCATED_OUTBOX_MIGRATION};
 pub use encryption::{

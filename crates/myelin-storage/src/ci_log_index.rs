@@ -54,12 +54,26 @@
 //!   log segment IS a T3 firehose archive segment) — no new residency variant; it feeds the SAME
 //!   `verify_region_pinning` aggregation.
 //!
+//! ## The per-subject CI-log DEK (C1 — P-ST-27 / global P-329)
+//! A CI log segment whose inline PII is **isolable to one subject** is sealed under THAT subject's
+//! DEK ([`CiLogTier::seal_ci_batch_for_subject`]), so the subject's Art. 17 erasure (the
+//! [`crate::erase`] step-2 per-subject DEK crypto-shred) renders exactly their CI log content
+//! unrecoverable — live AND in backups by construction (§7.5) — **without destroying the rest of the
+//! tenant's logs**. Where inline PII is **not** isolable (interleaved free-text from many subjects),
+//! the segment falls back to the per-TENANT DEK ([`CiLogTier::seal_ci_batch`], the P-ST-20 default)
+//! and the residual is handled by the platform erasure posture (10.9 / X-7) — Storage authors NO
+//! CI-local residual statement (the C1 per-tenant-fallback is the documented residual per 10.9, NOT
+//! a floor-with-follow-on). This is a key-CLASS swap on the same
+//! [`crate::encryption::DekContentWrap`] seam (`with_subject_dek` vs `with_tenant_dek`), NOT a new
+//! mechanism: one [`crate::kms::KmsEngine`], one sealing path, the per-subject lever differing only
+//! in the chosen [`crate::kms::KeyClass`]. Each [`StepSpan`] records the [`SegmentKeying`] it was
+//! sealed under so resolution reads through the matching archiver (the subject's, or the tenant's).
+//!
 //! ## Floors named (deferred bodies → filling prompt) — VISION §3, prompt DoD
-//! - **The per-SUBJECT CI-log DEK (C1)** — a CI log segment carrying isolable inline PII keyed to that
-//!   subject's DEK so their erasure crypto-shreds exactly their log content — is the SIBLING prompt
-//!   **P-ST-27 (M4)**. This prompt keys CI log segments under the per-TENANT DEK (the P-ST-20 default);
-//!   the C1 extension is a key-CLASS swap on the same [`crate::encryption::DekContentWrap`] seam (pass
-//!   `CryptoShred("subject_dek")` + the subject to the archiver's wrap), NOT a new mechanism. Recorded.
+//! - **The per-tenant-fallback for non-isolable interleaved CI-log PII is the documented RESIDUAL**
+//!   (per 10.9 / X-7), NOT a floor-with-follow-on: where many subjects' free text is interleaved in
+//!   one segment, no single subject's DEK can isolate it, so it keys per-tenant and the residual
+//!   posture covers it. Recorded in writing here (the prompt's named residual).
 //! - **The OLTP persistence of the index** is the in-process [`CiLogIndex`] map here (the index SHAPE +
 //!   the `(job, step, byte-range) → (segment, offset)` resolution are frozen + testable now); the real
 //!   `ci_log_index` OLTP table (`UNIQUE(job, step, seq)`) lands when `serve`'s pool body does
@@ -86,7 +100,9 @@ use myelin_events::{Frame, FramePayload};
 use myelin_tenancy::{Region, TenantId};
 
 use crate::blob::ContentHash;
+use crate::encryption::SubjectId;
 use crate::firehose_archive::{ArchiveError, FirehoseArchiver, SealedSegment};
+use crate::kms::KmsEngine;
 use crate::residency::StoreResidencyReport;
 
 /// The firehose stream CI logs ride (the `(stream, scope)` half the archiver seals under). CI logs
@@ -174,6 +190,20 @@ fn hex_val(c: u8) -> Option<u8> {
     }
 }
 
+/// **Which DEK class a CI log segment was sealed under (the C1 key-choice record).** Recorded on each
+/// [`StepSpan`] so resolution reads the segment through the matching archiver — and so the index is
+/// self-describing about WHOSE erasure crypto-shreds the segment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SegmentKeying {
+    /// Sealed under the per-TENANT DEK (the P-ST-20 default) — non-isolable / interleaved-PII or
+    /// PII-free segments. The C1 per-tenant fallback's residual is the platform posture (10.9 / X-7).
+    Tenant,
+    /// Sealed under the named subject's per-SUBJECT DEK (C1) — an isolable inline-PII segment. The
+    /// subject's Art. 17 erasure (the per-subject DEK crypto-shred) renders exactly this content
+    /// unrecoverable, without touching the rest of the tenant's logs.
+    Subject(SubjectId),
+}
+
 /// **One span of a `(job, step)`'s log within a sealed segment — the C2 index row's value.** It names
 /// the content-addressed segment blob the bytes rest in and the byte-range WITHIN the reconstructed
 /// step log this span covers (`offset..offset+len`). The reconstructed step log is the in-order
@@ -192,6 +222,10 @@ pub struct StepSpan {
     /// The `seq` of the firehose frame this span came from — the `UNIQUE(job, step, seq)` order key
     /// (so re-delivery is idempotent and the spans concatenate in firehose order, never reordered).
     pub frame_seq: u64,
+    /// **The C1 DEK-class record:** which DEK class sealed this span's segment (per-tenant fallback or
+    /// the per-subject lever). Resolution reads the segment through the matching archiver; erasure of
+    /// the named subject crypto-shreds exactly the [`SegmentKeying::Subject`] spans.
+    pub keying: SegmentKeying,
 }
 
 impl StepSpan {
@@ -360,27 +394,46 @@ impl StepAnchor {
 pub struct CiLogTier {
     /// The run this tier indexes (CI logs are per-run; the run id keys the `#step-<n>` resolve).
     run_id: String,
-    /// The P-ST-20 sealing + per-tenant-DEK archiver — REUSED wholesale (no second seal path).
+    /// The tenant whose keyspace + DEKs the segments are sealed under.
+    tenant: TenantId,
+    /// The cell region the segments are pinned to.
+    region: Region,
+    /// The SAME P-058 KMS engine the tenant + subject DEKs resolve through — held so the C1
+    /// per-subject archivers can be minted lazily (one engine, one key store; never a parallel one).
+    engine: std::sync::Arc<KmsEngine>,
+    /// The P-ST-20 sealing + per-TENANT-DEK archiver — the C1 per-tenant fallback (non-isolable /
+    /// interleaved / PII-free segments). REUSED wholesale (no second seal path).
     archiver: FirehoseArchiver,
+    /// **The C1 per-SUBJECT-DEK archivers, lazily minted one per subject** (`subject id → archiver`).
+    /// An isolable-PII CI log segment for a subject seals through THAT subject's archiver
+    /// ([`FirehoseArchiver::with_subject_dek`]); the subject's erasure (per-subject DEK crypto-shred)
+    /// renders exactly those segments unrecoverable. The SAME sealing mechanism + key store as the
+    /// tenant archiver — differing only in the chosen key class.
+    subject_archivers: Mutex<BTreeMap<String, std::sync::Arc<FirehoseArchiver>>>,
     /// The `(job, step, byte-range)` index (C2).
     index: Mutex<CiLogIndex>,
 }
 
 impl CiLogTier {
-    /// **Build a CI log tier for `run_id` over a per-tenant-DEK firehose archive.** The archiver is the
-    /// P-ST-20 [`FirehoseArchiver::with_tenant_dek`] — every CI log segment is a content-addressed T2
-    /// blob under the per-tenant DEK (inheriting crypto-shred). The per-SUBJECT CI-log DEK (C1) is the
-    /// sibling P-ST-27 (a key-class swap on the same wrap). The `engine`'s tenant KEK must already
+    /// **Build a CI log tier for `run_id` over a per-tenant-DEK firehose archive.** The default
+    /// archiver is the P-ST-20 [`FirehoseArchiver::with_tenant_dek`] — a CI log segment sealed via
+    /// [`Self::seal_ci_batch`] is a content-addressed T2 blob under the per-tenant DEK (the C1
+    /// per-tenant fallback for non-isolable / interleaved PII). The C1 per-SUBJECT archivers are
+    /// minted lazily by [`Self::seal_ci_batch_for_subject`]. The `engine`'s tenant KEK must already
     /// exist (the cell-provisioning wired it).
     pub fn with_tenant_dek(
         run_id: impl Into<String>,
         tenant: TenantId,
         region: Region,
-        engine: std::sync::Arc<crate::kms::KmsEngine>,
+        engine: std::sync::Arc<KmsEngine>,
     ) -> CiLogTier {
         CiLogTier {
             run_id: run_id.into(),
+            tenant: tenant.clone(),
+            region: region.clone(),
+            engine: engine.clone(),
             archiver: FirehoseArchiver::with_tenant_dek(tenant, region, engine),
+            subject_archivers: Mutex::new(BTreeMap::new()),
             index: Mutex::new(CiLogIndex::new()),
         }
     }
@@ -388,6 +441,25 @@ impl CiLogTier {
     /// The run id this tier indexes.
     pub fn run_id(&self) -> &str {
         &self.run_id
+    }
+
+    /// The C1 per-SUBJECT-DEK archiver for `subject`, minted on first use (lazily) and cached. It
+    /// seals every segment under the subject's per-subject DEK (the same [`KmsEngine`], one key store).
+    fn subject_archiver(&self, subject: &SubjectId) -> std::sync::Arc<FirehoseArchiver> {
+        let mut map = self
+            .subject_archivers
+            .lock()
+            .expect("ci log subject-archiver mutex");
+        map.entry(subject.0.clone())
+            .or_insert_with(|| {
+                std::sync::Arc::new(FirehoseArchiver::with_subject_dek(
+                    subject.clone(),
+                    self.tenant.clone(),
+                    self.region.clone(),
+                    self.engine.clone(),
+                ))
+            })
+            .clone()
     }
 
     /// **Seal a batch of CI log frames into a content-addressed T2 segment + build the C2 index.** Each
@@ -399,7 +471,43 @@ impl CiLogTier {
     /// `UNIQUE(job, step, seq)` order key). Returns the sealed segment pointer.
     ///
     /// REFUSES an empty batch (the archiver's [`ArchiveError::EmptySegment`] — never a junk seal).
+    ///
+    /// **C1 per-tenant fallback:** this seals under the per-TENANT DEK — the path for a non-isolable /
+    /// interleaved-PII / PII-free CI log segment. An ISOLABLE inline-PII segment for one subject seals
+    /// through [`Self::seal_ci_batch_for_subject`] (the per-subject DEK lever) instead.
     pub fn seal_ci_batch(&self, frames: &[(u64, CiLogFrame)]) -> Result<SealedSegment, CiLogError> {
+        self.seal_through(&self.archiver, SegmentKeying::Tenant, frames)
+    }
+
+    /// **C1 — seal a batch of ISOLABLE inline-PII CI log frames under `subject`'s per-subject DEK.**
+    /// Where a CI log segment's inline PII is attributable to and isolable per subject (the runner /
+    /// the CI subsystem stamps the attribution), it is sealed under that subject's DEK
+    /// ([`FirehoseArchiver::with_subject_dek`]) so the subject's Art. 17 erasure (the [`crate::erase`]
+    /// step-2 per-subject DEK crypto-shred) renders exactly their CI log content unrecoverable — live
+    /// AND in backups by construction — **without destroying the rest of the tenant's logs**. The
+    /// index records [`SegmentKeying::Subject`] on each span so resolution reads through the subject's
+    /// archiver and erasure reach is self-describing. REFUSES an empty batch.
+    ///
+    /// This is the GD-4 per-subject lever for the CI inline-PII log class (§5.1): a key-CLASS swap on
+    /// the same [`crate::encryption::DekContentWrap`] seam, NOT a new sealing mechanism.
+    pub fn seal_ci_batch_for_subject(
+        &self,
+        subject: &SubjectId,
+        frames: &[(u64, CiLogFrame)],
+    ) -> Result<SealedSegment, CiLogError> {
+        let archiver = self.subject_archiver(subject);
+        self.seal_through(&archiver, SegmentKeying::Subject(subject.clone()), frames)
+    }
+
+    /// The shared seal path: lower the frames to transport `Frame`s, seal through the chosen archiver
+    /// (per-tenant or per-subject — the SAME mechanism, differing only in the key class), then build
+    /// the `(job, step, byte-range)` index recording the segment's [`SegmentKeying`] on each span.
+    fn seal_through(
+        &self,
+        archiver: &FirehoseArchiver,
+        keying: SegmentKeying,
+        frames: &[(u64, CiLogFrame)],
+    ) -> Result<SealedSegment, CiLogError> {
         // Lower each CI log frame to a transport `Frame` (opaque payload), then seal the batch.
         let scope_selector = format!("run:{}", self.run_id); // the `(stream, scope)` selector
         let transport: Vec<Frame> = frames
@@ -409,11 +517,10 @@ impl CiLogTier {
                 payload: clf.to_payload(),
             })
             .collect();
-        let segment = self
-            .archiver
-            .seal(CI_LOG_STREAM, &scope_selector, &transport)?;
+        let segment = archiver.seal(CI_LOG_STREAM, &scope_selector, &transport)?;
 
-        // Build the index: per `(job, step)`, record this chunk's byte-range in the step log.
+        // Build the index: per `(job, step)`, record this chunk's byte-range in the step log + the
+        // DEK class the segment was sealed under (so resolution reads the right archiver).
         let mut index = self.index.lock().expect("ci log index mutex");
         for (seq, clf) in frames {
             // The offset is the running total of this step's prior spans' lengths (the reconstructed
@@ -424,6 +531,7 @@ impl CiLogTier {
                 offset,
                 len: clf.bytes.len() as u64,
                 frame_seq: *seq,
+                keying: keying.clone(),
             };
             index.append(&clf.job_id, clf.step_no, span);
         }
@@ -454,8 +562,15 @@ impl CiLogTier {
 
         let mut out = Vec::with_capacity(spans.iter().map(|s| s.len as usize).sum());
         for span in &spans {
-            // Read the segment the index names + decode its frames (decrypts through the DEK).
-            let frames = self.archiver.read_segment(&span.segment)?;
+            // Read the segment the index names through the archiver that SEALED it (the per-tenant
+            // fallback, or the subject's per-subject archiver for a C1 isolable-PII segment) + decode
+            // its frames (decrypts through that DEK — a crypto-shredded DEK surfaces LOUDLY here).
+            let subject_archiver = match &span.keying {
+                SegmentKeying::Tenant => None,
+                SegmentKeying::Subject(s) => Some(self.subject_archiver(s)),
+            };
+            let archiver: &FirehoseArchiver = subject_archiver.as_deref().unwrap_or(&self.archiver);
+            let frames = archiver.read_segment(&span.segment)?;
             // Find the `(job, step)` chunk at this span's frame_seq within the segment.
             let chunk = frames
                 .iter()
@@ -509,10 +624,32 @@ impl CiLogTier {
             .step_log_len(job_id, step_no)
     }
 
-    /// The underlying P-ST-20 archiver (its `unencrypted_segment_count == 0` /
+    /// The underlying P-ST-20 per-tenant archiver (its `unencrypted_segment_count == 0` /
     /// `segment_content_addressed == true` telemetry rides through — a CI log segment is a T2 segment).
     pub fn archiver(&self) -> &FirehoseArchiver {
         &self.archiver
+    }
+
+    /// **The DEK-class keying of a `(job, step)`'s segments (the C1 self-describing record).** Returns
+    /// the [`SegmentKeying`]s the step's spans were sealed under, in order — `Subject(<id>)` for an
+    /// isolable inline-PII step (the per-subject lever), `Tenant` for the per-tenant fallback. `None`
+    /// for a step the index never saw. A consumer / an auditor reads this to confirm a subject's CI
+    /// log content is isolated to their DEK (so their erasure crypto-shreds exactly it).
+    pub fn step_keying(&self, job_id: &str, step_no: u32) -> Option<Vec<SegmentKeying>> {
+        self.index
+            .lock()
+            .expect("ci log index mutex")
+            .spans(job_id, step_no)
+            .map(|spans| spans.iter().map(|s| s.keying.clone()).collect())
+    }
+
+    /// The number of distinct subjects whose CI log segments this tier has sealed under their own
+    /// per-subject DEK (the C1 lever is live — each minted a per-subject archiver).
+    pub fn subject_keyed_count(&self) -> usize {
+        self.subject_archivers
+            .lock()
+            .expect("ci log subject-archiver mutex")
+            .len()
     }
 
     /// Test/CI-only: inject a DESYNCED span for `(job, step)` pointing at a `frame_seq` that resolves
@@ -538,6 +675,7 @@ impl CiLogTier {
                 offset: 0,
                 len: claimed_len,
                 frame_seq: wrong_frame_seq,
+                keying: SegmentKeying::Tenant,
             },
         );
     }
@@ -881,6 +1019,177 @@ mod tests {
         );
     }
 
+    // ── C1: the per-subject CI-log DEK (P-ST-27) ──
+
+    #[test]
+    fn an_isolable_pii_ci_log_segment_keys_under_the_subjects_dek() {
+        // C1: an isolable inline-PII segment for one subject seals under THAT subject's DEK (the
+        // per-subject lever), recorded as SegmentKeying::Subject so resolution + erasure are
+        // self-describing. It still resolves to the exact step bytes through the subject archiver.
+        let t = tier("run-1");
+        let subject = SubjectId::new("u-alice");
+        t.seal_ci_batch_for_subject(
+            &subject,
+            &[(
+                1,
+                CiLogFrame::new("run-1", 1, b"alice@example.test ran the build\n".to_vec()),
+            )],
+        )
+        .expect("seal an isolable-PII segment under the subject DEK");
+
+        // The index records the per-subject keying (not the tenant fallback).
+        assert_eq!(
+            t.step_keying("run-1", 1).unwrap(),
+            vec![SegmentKeying::Subject(subject.clone())],
+            "an isolable-PII step is keyed under the subject's DEK (C1)"
+        );
+        assert_eq!(t.subject_keyed_count(), 1, "one subject's DEK is in use");
+        // It resolves to the EXACT bytes through the subject archiver.
+        assert_eq!(
+            t.resolve_step("run-1", 1).unwrap(),
+            b"alice@example.test ran the build\n"
+        );
+    }
+
+    #[test]
+    fn a_non_isolable_segment_falls_back_to_the_per_tenant_dek_the_documented_residual() {
+        // C1 residual: interleaved free-text from many subjects is NOT isolable to one DEK, so it
+        // falls back to the per-tenant DEK (the documented 10.9 residual, NOT a floor) via the plain
+        // seal_ci_batch path. The index records SegmentKeying::Tenant.
+        let t = tier("run-1");
+        t.seal_ci_batch(&[(
+            1,
+            CiLogFrame::new(
+                "run-1",
+                1,
+                b"alice & bob co-edited; interleaved log\n".to_vec(),
+            ),
+        )])
+        .expect("seal a non-isolable segment under the tenant DEK");
+        assert_eq!(
+            t.step_keying("run-1", 1).unwrap(),
+            vec![SegmentKeying::Tenant],
+            "a non-isolable segment falls back to the per-tenant DEK (the residual)"
+        );
+        assert_eq!(
+            t.subject_keyed_count(),
+            0,
+            "no subject DEK minted for the fallback"
+        );
+        assert_eq!(
+            t.resolve_step("run-1", 1).unwrap(),
+            b"alice & bob co-edited; interleaved log\n"
+        );
+    }
+
+    #[test]
+    fn erasing_a_subject_crypto_shreds_exactly_their_isolable_ci_log_without_touching_the_tenants()
+    {
+        // THE C1 HEADLINE: destroying ONE subject's DEK renders exactly their isolable CI log content
+        // unrecoverable, while a DIFFERENT subject's isolable log AND the tenant-fallback log stay
+        // readable (the per-subject erasure reach is surgical, never tenant-wide).
+        let eng = engine();
+        let t = CiLogTier::with_tenant_dek("run-1", tenant(), region(), eng.clone());
+        let alice = SubjectId::new("u-alice");
+        let bob = SubjectId::new("u-bob");
+
+        // alice's isolable-PII step (under alice's DEK), bob's isolable-PII step (under bob's DEK),
+        // and a non-isolable interleaved step (per-tenant fallback).
+        t.seal_ci_batch_for_subject(
+            &alice,
+            &[(1, CiLogFrame::new("run-1", 1, b"ALICE-PII".to_vec()))],
+        )
+        .expect("seal alice");
+        t.seal_ci_batch_for_subject(
+            &bob,
+            &[(2, CiLogFrame::new("run-1", 2, b"BOB-PII".to_vec()))],
+        )
+        .expect("seal bob");
+        t.seal_ci_batch(&[(3, CiLogFrame::new("run-1", 3, b"INTERLEAVED".to_vec()))])
+            .expect("seal interleaved");
+
+        // All three resolve before the erase.
+        assert_eq!(t.resolve_step("run-1", 1).unwrap(), b"ALICE-PII");
+        assert_eq!(t.resolve_step("run-1", 2).unwrap(), b"BOB-PII");
+        assert_eq!(t.resolve_step("run-1", 3).unwrap(), b"INTERLEAVED");
+
+        // Erase alice: crypto-shred alice's per-subject DEK (the erase() step-2 lever).
+        assert!(eng.destroy_dek(&DekId::new(tenant(), KeyClass::Subject(alice.0.clone()))));
+
+        // alice's CI log step is now UNRECOVERABLE (LOUD), never served.
+        let alice_after =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| t.resolve_step("run-1", 1)));
+        assert!(
+            alice_after.is_err(),
+            "alice's isolable CI log step is crypto-shredded (unrecoverable, LOUD)"
+        );
+        // bob's step + the tenant-fallback step are UNTOUCHED (surgical per-subject reach).
+        assert_eq!(
+            t.resolve_step("run-1", 2).unwrap(),
+            b"BOB-PII",
+            "bob's log is untouched by alice's erasure"
+        );
+        assert_eq!(
+            t.resolve_step("run-1", 3).unwrap(),
+            b"INTERLEAVED",
+            "the tenant-fallback log is untouched by alice's erasure"
+        );
+    }
+
+    #[test]
+    fn destroying_the_tenant_dek_does_not_shred_a_subject_keyed_ci_log() {
+        // The converse isolation: a subject-keyed CI log is NOT sealed under the tenant DEK, so
+        // destroying the tenant DEK leaves the subject's isolable log readable (it is keyed to the
+        // subject, the per-subject lever). This proves the C1 segment really keys per-subject.
+        let eng = engine();
+        let t = CiLogTier::with_tenant_dek("run-1", tenant(), region(), eng.clone());
+        let alice = SubjectId::new("u-alice");
+        t.seal_ci_batch_for_subject(
+            &alice,
+            &[(1, CiLogFrame::new("run-1", 1, b"ALICE-PII".to_vec()))],
+        )
+        .expect("seal alice");
+        // A tenant-fallback step too, so the per-tenant DEK genuinely exists to destroy.
+        t.seal_ci_batch(&[(2, CiLogFrame::new("run-1", 2, b"INTERLEAVED".to_vec()))])
+            .expect("seal interleaved");
+
+        // Destroy the per-TENANT DEK — alice's segment is under alice's DEK, so it survives; the
+        // tenant-fallback step is shredded.
+        assert!(eng.destroy_dek(&DekId::new(tenant(), KeyClass::Tenant)));
+        assert_eq!(
+            t.resolve_step("run-1", 1).unwrap(),
+            b"ALICE-PII",
+            "a subject-keyed CI log is not shredded by the tenant-DEK destroy (it keys per-subject)"
+        );
+        let tenant_after =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| t.resolve_step("run-1", 2)));
+        assert!(
+            tenant_after.is_err(),
+            "the tenant-fallback step IS shredded by the tenant-DEK destroy"
+        );
+    }
+
+    #[test]
+    fn step_keying_is_none_for_an_unknown_step() {
+        let t = tier("run-1");
+        assert!(t.step_keying("run-1", 99).is_none());
+    }
+
+    #[test]
+    fn seal_empty_subject_batch_is_refused() {
+        let t = tier("run-1");
+        assert!(matches!(
+            t.seal_ci_batch_for_subject(&SubjectId::new("u-x"), &[]),
+            Err(CiLogError::Archive(ArchiveError::EmptySegment))
+        ));
+        assert_eq!(
+            t.subject_keyed_count(),
+            1,
+            "the archiver is minted but seals nothing"
+        );
+        assert_eq!(t.indexed_step_count(), 0, "a refused seal indexes nothing");
+    }
+
     // ── index idempotence (at-least-once re-delivery) ──
 
     #[test]
@@ -920,6 +1229,7 @@ mod tests {
             offset: 10,
             len: 5,
             frame_seq: 1,
+            keying: SegmentKeying::Tenant,
         };
         assert_eq!(span.byte_range(), (10, 15));
         assert!(CiLogError::UnknownStep {
