@@ -167,3 +167,13 @@ myelin-lints = { path = "../myelin-lints" }
 # precedent). DEV-dependency ONLY — `myelin-identity-service` does NOT enter the Knowledge production
 # DAG (the production crate depends only on the frozen `myelin-identity` ABI; the DAG stays acyclic).
 myelin-identity-service = { path = "../myelin-identity-service" }
+# DEV-only (KN-P27 / P-317): the Fabric's Knowledge ToolDef REGISTRATION
+# (`myelin_agent_service::knowledge_tools`, AG-P19 → P-268) — the contract-8.1 CDC pairs the KN-domain
+# SOURCE OF TRUTH (`myelin_knowledge::agent` — the tool identity + the `required_caps` from the frozen
+# `myelin-content` ReBAC carrier + the frozen §6.3 gate classification) against the registered ToolDefs
+# the Fabric consumes, so a rename/gate-drift on either side is a compile/test break (the SAME shape
+# both sides agree on, never a stub of the producer — the git_tools.rs/agent_author.rs precedent).
+# DEV-dependency ONLY: `myelin-agent-service` depends on `myelin-content`/`-git` but NOT on
+# `myelin-knowledge`, so this test-scope edge keeps the §2.9 DAG acyclic.
+myelin-agent-service = { path = "../myelin-agent-service" }
+myelin-agent = { path = "../myelin-agent" }
