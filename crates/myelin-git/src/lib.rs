@@ -118,6 +118,18 @@
 /// the per-subject-DEK at-rest seal rides the GIT-P20 store wiring.
 pub mod body;
 pub mod check_status;
+/// The **code-executing git tools on the unified sandbox** (GIT-P27 / P-283, M3-G6 — the AG-D4
+/// gate): the audited, tamper-evident, **rate-limited** [`code_tools::HistoryRewriteTool`] erasure
+/// op (contract 10.6 / recon §9) with the **fork/mirror/clone-cache invalidation fan-out** (the
+/// trust-scoped cache namespaces, 11.2 C4), and the [`code_tools::ScipIndexJob`] SCIP-indexing
+/// compute descriptor. Both ride git's [`core::WireExecutor`] no-host-exec sandbox seam (= the CI
+/// `kind=agent` job the AG-D4 escape drill gates), inheriting the FOUR uniform sandbox guarantees
+/// BY CONSTRUCTION. The Fabric `ToolDef` registration that catalogues them (`git.history_rewrite`
+/// gated, `git.scip_index` compute) lives in `myelin_agent_service::git_tools` (the §2.9 DAG — git
+/// is a leaf), keyed on [`code_tools`]'s identity constants. Floors: GF-9 (`exposed_over_mcp=false`,
+/// the external MCP server is GIT-P33/P6); the erasure SEMANTICS complete at GIT-P29;
+/// agents-as-authors is GIT-P28.
+pub mod code_tools;
 /// The **STORE-BACKED `check_status` projection** (GIT-P20 / P-281, M3): the LIVE Postgres binding of
 /// the in-memory [`check_status::CheckStatusProjection`] — the real table + migration + the same-tx
 /// idempotent-on-`event_id` + monotonic `run_attempt` supersession apply (contract 5.9 / X-1 / §6.1).

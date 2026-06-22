@@ -1,6 +1,15 @@
 //! # `git_tools` — the per-producer **Git** ToolDefs registered into the ONE ToolSurface
 //! (AG-P18 → P-267, M3): `git.merge` (gated) + `open_pr` (reversible)
 //!
+//! **GIT-P27 → P-283 (M3-G6) extends this registration site** with the two **code-executing** Git
+//! tools that ride the ONE unified sandbox (§7): `git.history_rewrite` (a `Mutate` →
+//! `EffectApi::apply`, **gated** by the fail-closed §6.3 default — the audited erasure-admin op,
+//! 10.6) and `git.scip_index` (a `Compute` tool → `ToolHands::exec` = the CI `kind=agent` job the
+//! AG-D4 escape drill gates). Both inherit the FOUR uniform sandbox guarantees BY CONSTRUCTION; their
+//! OP bodies + identity constants live in `myelin_git::code_tools` (git's domain, riding git's
+//! no-host-exec `WireExecutor` port), this is the THIN catalogue registration. See
+//! [`git_history_rewrite_tool_def`] / [`git_scip_index_tool_def`].
+//!
 //! **Owning architecture doc:**
 //! `planning/05-refined-shared-systems-architecture/agent-fabric.md` §6.1 (ONE catalogue, two
 //! front-ends — every subsystem registers typed [`ToolDef`]s into the ONE shared [`ToolSurface`];
@@ -56,6 +65,7 @@
 //!   MCP-exposed at v1 (internal-loop only).
 
 use myelin_agent::{EffectKind, ToolDef, ToolName, ToolSurface};
+use myelin_git::code_tools as git_code;
 use myelin_git::rebac_fragment::object_types as git_objects;
 
 use crate::defaults::{assert_no_silent_loosening, seed_requires_approval, LooseningViolation};
@@ -149,11 +159,85 @@ pub fn open_pr_tool_def() -> ToolDef {
     })
 }
 
-/// **The two Git producer ToolDefs, in catalogue order (`git.merge` then `open_pr`).** The single
-/// list every registration + CDC consumes (one source of truth — a drift in either def is caught
-/// once). Both are SEEDED from the frozen §6.3 defaults.
+// ───────────────── the CODE-EXECUTING Git producer ToolDefs (GIT-P27 → P-283, M3-G6) ─────────────
+//
+// The two tools that EXECUTE CODE on the ONE unified sandbox (§7 — "any Git tool that executes code:
+// the history-rewrite activity, SCIP indexing if run as a job"). They inherit the FOUR uniform
+// sandbox guarantees BY CONSTRUCTION (reserve/settle 11.7, per-run token 4.7, HITL withhold, the
+// isolation floor + the AG-D4 real-kernel escape drill) because they ride the SAME seams the agent
+// loop already routes through — `EffectApi::apply` (the gated history-rewrite) and the sandbox exec
+// (the SCIP compute job). The OP bodies + the identity constants live in `myelin_git::code_tools`
+// (git's domain, riding git's no-host-exec `WireExecutor` port); this is the THIN catalogue
+// registration (a `ToolDef` is a row in the ONE registry — EI-03 §4, no new engine).
+
+/// **The `git.history_rewrite` ToolDef (8.1 / 10.6) — the audited, HITL-GATED erasure-admin tool.**
+///
+/// - `effect_kind = Mutate` ⇒ it routes through [`EffectApi::apply`](myelin_agent::EffectApi)
+///   (plan-then-apply) — a history-rewrite changes every downstream hash (consequential), so it is
+///   NEVER a direct mutation.
+/// - `requires_approval` is SEEDED from the frozen §6.3 default — `("git", "history_rewrite")` is a
+///   NAMED row (`true`, gated): a history-rewrite changes every downstream hash (consequential,
+///   irreversible — VISION §3), so step 6 WITHHOLDS (`Gated`) until the HITL resume.
+/// - `required_caps = [repo.administer]` (4.9) — the admin-scoped tenant op (recon §9), built from
+///   the canonical `myelin_git::code_tools::history_rewrite_required_caps` (a fragment rename breaks
+///   here, never a silent drift).
+/// - `exposed_over_mcp = false` — GF-9 floor (the external MCP server + threat model is GIT-P33/P6).
+pub fn git_history_rewrite_tool_def() -> ToolDef {
+    seed_requires_approval(ToolDef {
+        name: ToolName(git_code::HISTORY_REWRITE_TOOL.to_string()),
+        subsystem: git_code::GIT_SUBSYSTEM.to_string(),
+        version: git_code::GIT_CODE_TOOL_VERSION,
+        // The rewrite input the Git audited op validates (the repo + the target refs + the opaque
+        // reason code — never the leaked content). An opaque-string JSON-Schema carrier at this seam.
+        input_schema: r#"{"type":"object","required":["repo","target_refs","reason_code"],"properties":{"repo":{"type":"string"},"target_refs":{"type":"array","items":{"type":"string"}},"reason_code":{"type":"string"}}}"#.to_string(),
+        required_caps: git_code::history_rewrite_required_caps(),
+        effect_kind: EffectKind::Mutate,
+        side_effecting: true,
+        // SEEDED below from §6.3 (fail-closed default `true` for this unnamed consequential op).
+        requires_approval: true,
+        exposed_over_mcp: false,
+    })
+}
+
+/// **The `git.scip_index` ToolDef (8.1 / §7) — the SCIP-indexing COMPUTE tool on the unified sandbox.**
+///
+/// - `effect_kind = Compute` ⇒ the platform loop routes it to the **sandbox** (`ToolHands::exec` =
+///   the CI `kind=agent` job, §5.0) — untrusted code execution that produces a read-only
+///   code-intelligence index. `side_effecting = false` (it reads repo bytes, writes an artifact).
+/// - `requires_approval = false` — a read-only index build is reversible/advisory, NOT a gated
+///   mutation. (It is the ONLY effect kind that reaches the bare kernel sandbox, so the AG-D4 escape
+///   drill on the git tool image gates it BY CONSTRUCTION — `exec.rs`'s routing split + escape gate.)
+/// - `required_caps = [repo.pull]` (4.9) — reading the repo objects to index them.
+/// - `exposed_over_mcp = false` — GF-9 floor.
+pub fn git_scip_index_tool_def() -> ToolDef {
+    seed_requires_approval(ToolDef {
+        name: ToolName(git_code::SCIP_INDEX_TOOL.to_string()),
+        subsystem: git_code::GIT_SUBSYSTEM.to_string(),
+        version: git_code::GIT_CODE_TOOL_VERSION,
+        input_schema: r#"{"type":"object","required":["repo","commit_oid"],"properties":{"repo":{"type":"string"},"commit_oid":{"type":"string"}}}"#.to_string(),
+        required_caps: git_code::scip_index_required_caps(),
+        // A `compute` tool → the unified sandbox (the ONLY route that touches the kernel; the AG-D4
+        // escape drill on the git tool image gates it). It is NOT a mutation (no EffectApi gate).
+        effect_kind: EffectKind::Compute,
+        side_effecting: false,
+        // SEEDED below from §6.3 (a read-only index build is NOT gated).
+        requires_approval: false,
+        exposed_over_mcp: false,
+    })
+}
+
+/// **The four Git producer ToolDefs, in catalogue order** — the two producer mutations (`git.merge`
+/// gated, `open_pr` reversible, P-267) + the two CODE-EXECUTING tools on the unified sandbox
+/// (`git.history_rewrite` gated/`Mutate`, `git.scip_index` `Compute`, P-283). The single list every
+/// registration + CDC consumes (one source of truth — a drift in any def is caught once). Each is
+/// SEEDED from the frozen §6.3 defaults.
 pub fn git_tool_defs() -> Vec<ToolDef> {
-    vec![git_merge_tool_def(), open_pr_tool_def()]
+    vec![
+        git_merge_tool_def(),
+        open_pr_tool_def(),
+        git_history_rewrite_tool_def(),
+        git_scip_index_tool_def(),
+    ]
 }
 
 // ───────────────────────── the registration seam (8.1 — into the ONE ToolSurface) ────────────────
@@ -252,7 +336,7 @@ mod tests {
     fn register_git_tools_registers_both_into_the_one_surface() {
         let mut cat = Catalogue { defs: vec![] };
         let registered = register_git_tools(&mut cat).expect("seeded defs always admit");
-        assert_eq!(registered.len(), 2, "git.merge + open_pr");
+        assert_eq!(registered.len(), 4, "git.merge + open_pr + history_rewrite + scip_index");
 
         let merge = cat.resolve(&ToolName(GIT_MERGE_TOOL.into())).expect("git.merge registered");
         assert_eq!(merge.subsystem, GIT_SUBSYSTEM);
@@ -264,8 +348,90 @@ mod tests {
         assert!(!pr.requires_approval, "the registered open_pr is NOT gated");
         assert_eq!(pr.required_caps, vec!["repo.push".to_string()]);
 
-        // a tool NOT registered resolves to None (the catalogue is exactly these two).
+        // a tool NOT registered resolves to None (the catalogue is exactly these four).
         assert!(cat.resolve(&ToolName("git.delete_repo".into())).is_none());
+    }
+
+    // ───────────── the CODE-EXECUTING tools on the unified sandbox (GIT-P27 → P-283) ─────────────
+
+    /// **`git.history_rewrite` is `Mutate` → `EffectApi::apply`, GATED by the fail-closed §6.3
+    /// default (the audited erasure-admin op, 10.6 / recon §9).** A history-rewrite changes every
+    /// downstream hash (consequential), so it routes through plan-then-apply and WITHHOLDS until the
+    /// HITL resume — never a direct, un-approved mutation.
+    #[test]
+    fn git_history_rewrite_is_a_gated_mutate_tool() {
+        let def = git_history_rewrite_tool_def();
+        assert_eq!(def.subsystem, GIT_SUBSYSTEM);
+        assert_eq!(def.name.0, myelin_git::code_tools::HISTORY_REWRITE_TOOL);
+        // Mutate ⇒ EffectApi (plan-then-apply), never the bare sandbox / a direct write.
+        assert_eq!(def.effect_kind, EffectKind::Mutate);
+        assert!(def.side_effecting);
+        // GATED — and it IS the frozen §6.3 seed (the named consequential erasure-admin row).
+        assert!(def.requires_approval, "history-rewrite is HITL-gated (the §6.3 consequential row)");
+        assert_eq!(
+            def.requires_approval,
+            requires_approval_default(GIT_SUBSYSTEM, myelin_git::code_tools::HISTORY_REWRITE_TOOL),
+            "the gating IS the frozen §6.3 seed (the consequential history-rewrite row)"
+        );
+        // admin-scoped tenant op cap (recon §9), from the canonical git constants.
+        assert_eq!(def.required_caps, vec!["repo.administer".to_string()]);
+        // GF-9: not MCP-exposed at v1.
+        assert!(!def.exposed_over_mcp, "GF-9: no external MCP endpoint at v1");
+    }
+
+    /// **`git.scip_index` is a `Compute` tool → the unified sandbox (`ToolHands::exec`), NOT gated
+    /// (§7).** SCIP indexing reads repo bytes + writes a read-only code-intelligence artifact — the
+    /// ONLY effect kind that reaches the bare kernel sandbox, so the AG-D4 escape drill on the git
+    /// tool image gates it BY CONSTRUCTION (the routing split + escape gate in `exec.rs`).
+    #[test]
+    fn git_scip_index_is_a_compute_tool_on_the_unified_sandbox() {
+        let def = git_scip_index_tool_def();
+        assert_eq!(def.subsystem, GIT_SUBSYSTEM);
+        assert_eq!(def.name.0, myelin_git::code_tools::SCIP_INDEX_TOOL);
+        // Compute ⇒ the sandbox (the only kind that touches the kernel — gated by AG-D4).
+        assert_eq!(def.effect_kind, EffectKind::Compute);
+        assert!(!def.side_effecting, "a read-only index build is not a mutation");
+        // NOT gated (a reversible/advisory read-only artifact) — and it IS the frozen seed.
+        assert!(!def.requires_approval, "a read-only index build is NOT gated");
+        assert_eq!(def.required_caps, vec!["repo.pull".to_string()]);
+        assert!(!def.exposed_over_mcp, "GF-9: no external MCP endpoint at v1");
+    }
+
+    /// **The catalogue carries ALL FOUR Git producer tools, seeded from the frozen §6.3 defaults
+    /// (the two mutations + the two code-executing tools).** A drift in any def's gating is caught
+    /// against the frozen seed once.
+    #[test]
+    fn all_four_git_tools_are_seeded_from_the_frozen_defaults() {
+        let defs = git_tool_defs();
+        assert_eq!(defs.len(), 4, "merge + open_pr + history_rewrite + scip_index");
+        for d in &defs {
+            assert_eq!(d.subsystem, GIT_SUBSYSTEM);
+            // every def's gating IS the frozen §6.3 seed (never a value local to this module).
+            assert_eq!(
+                d.requires_approval,
+                requires_approval_default(&d.subsystem, &d.name.0),
+                "{}.{} gating is the frozen §6.3 seed",
+                d.subsystem,
+                d.name.0
+            );
+        }
+        // the consequential split: merge + history_rewrite gated; open_pr + scip_index not.
+        let gated: Vec<&str> = defs
+            .iter()
+            .filter(|d| d.requires_approval)
+            .map(|d| d.name.0.as_str())
+            .collect();
+        assert!(gated.contains(&"merge"));
+        assert!(gated.contains(&"history_rewrite"));
+        assert!(!gated.contains(&"open_pr"));
+        assert!(!gated.contains(&"scip_index"));
+        // exactly ONE compute (sandbox-bound) tool — the SCIP indexer.
+        let compute: Vec<&str> = defs
+            .iter()
+            .filter(|d| d.effect_kind == EffectKind::Compute)
+            .map(|d| d.name.0.as_str())
+            .collect();
+        assert_eq!(compute, vec!["scip_index"], "only SCIP indexing reaches the bare sandbox");
     }
 
     /// **The no-silent-loosening guard (VISION §3) protects the registration path.** A `git.merge`
@@ -285,21 +451,23 @@ mod tests {
         );
     }
 
-    /// **The compounding-payoff / no-new-engine check (EI-03 §4 / EI-01 §7).** The Git producer
-    /// tools are PURE data: every def is a `mutate` `ToolDef` whose gating is the frozen §6.3 seed
-    /// and whose caps are the frozen 4.9 fragment — there is NO bespoke apply/gate machinery in this
-    /// module (it constructs `ToolDef`s and registers them; the routing + gating + HITL are the
-    /// existing pipeline). This test pins that invariant: both defs route the SAME way (`Mutate` →
-    /// EffectApi) and differ ONLY in their frozen `requires_approval` seed.
+    /// **The compounding-payoff / no-new-engine check (EI-03 §4 / EI-01 §7).** The two PRODUCER
+    /// MUTATION tools (`git.merge`, `open_pr`) are PURE data: each is a `mutate` `ToolDef` whose
+    /// gating is the frozen §6.3 seed and whose caps are the frozen 4.9 fragment — there is NO
+    /// bespoke apply/gate machinery in this module (it constructs `ToolDef`s and registers them; the
+    /// routing + gating + HITL are the existing pipeline). This test pins that invariant for the
+    /// producer mutations: both route the SAME way (`Mutate` → EffectApi) and differ ONLY in their
+    /// frozen `requires_approval` seed. (The CODE-EXECUTING tools, P-283, are covered by
+    /// [`all_four_git_tools_are_seeded_from_the_frozen_defaults`] — `history_rewrite` is a gated
+    /// `Mutate`, `scip_index` is an un-gated `Compute` that rides the sandbox.)
     #[test]
-    fn the_git_tools_are_a_projection_not_a_new_engine() {
-        let defs = git_tool_defs();
-        assert_eq!(defs.len(), 2);
-        for d in &defs {
+    fn the_git_producer_mutations_are_a_projection_not_a_new_engine() {
+        let mutations = [git_merge_tool_def(), open_pr_tool_def()];
+        for d in &mutations {
             assert_eq!(
                 d.effect_kind,
                 EffectKind::Mutate,
-                "every Git producer tool routes through EffectApi (plan-then-apply) — no new path"
+                "every Git producer MUTATION routes through EffectApi (plan-then-apply) — no new path"
             );
             assert!(d.side_effecting);
             // the gating is the frozen seed, never a value local to this module.
@@ -311,9 +479,10 @@ mod tests {
                 d.name.0
             );
         }
-        // the ONLY difference between the two tools is the frozen gate (merge yes, open_pr no).
+        // the ONLY difference between the two producer mutations is the frozen gate (merge yes,
+        // open_pr no).
         assert_ne!(
-            defs[0].requires_approval, defs[1].requires_approval,
+            mutations[0].requires_approval, mutations[1].requires_approval,
             "git.merge is gated, open_pr is not — the consequential split"
         );
     }
