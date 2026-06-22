@@ -1005,6 +1005,20 @@ cdc = [
     # carries the PROVIDER (Git's resolver returns Projection|Tombstone, permission-first) + CONSUMER
     # (Notif's humanise binds the denied slot to the PII-free tombstone) sides.
     "crates/myelin-git/tests/cdc_5_2_7_3_7_1_git_humanise_resolve.rs",
+    # KNOWLEDGE slice — knowledge (KN-P22 / P-312, M3) ships the project-Display → humanise CONSUMER
+    # of the ONE humanise surface: `myelin_knowledge::KnowledgeRefResolver` is a REAL impl of the
+    # frozen `RefResolvePort` (the 5.2 resolve seam humanise binds its slots to) over Knowledge's
+    # permission-first `Projector` (5.6, project Display mode = the humanisation projection Notif uses,
+    # architecture 03 §2.2 / OQ-L). A confidential page/block/row subject → for a viewer lacking `read`
+    # the humanise render is a TOMBSTONE (`a restricted page`); the title NEVER leaks (NOTIF-D4-class, 0
+    # title leaks). Knowledge registers NO second template engine — it feeds its Display projection into
+    # the ONE templating surface. This is the SAME acyclic `producer-service -> myelin-notif` edge the
+    # Git slice carries (`myelin-notif` is a NAMED leaf consumer; the DAG stays acyclic). The CDC carries
+    # BOTH the provider (KN's resolver returns Projection|Tombstone, permission-first, no 2nd engine) and
+    # consumer (Notif's humanise binds the denied slot to the PII-free tombstone) sides; it pins the KN
+    # reason vocabulary (mentioned/comments/shared/watched) agrees between the 7.6 registration
+    # (NOTIF-P20, cdc_7_6_4_9_knowledge_notif_rules.rs) and the 7.3 render — one vocabulary, no drift.
+    "crates/myelin-knowledge/tests/cdc_5_2_7_3_knowledge_humanise_resolve.rs",
 ]
 
 # 7.4 COVERED at NOTIF-P10 (P-188): get_prefs / set_prefs — prefs + quiet-hours over the frozen

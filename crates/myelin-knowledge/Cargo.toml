@@ -64,6 +64,19 @@ myelin-query = { path = "../myelin-query" }
 # author the grammar — Refs owns it; Knowledge owns the stable opaque mint). The per-viewer
 # `project(ref, viewer)` resolver (the ladder calls) is the KN-P19 follow-on.
 myelin-refs = { path = "../myelin-refs" }
+# The ONE notification + humanise surface (contract 7.3 / 5.2). KN-P22 / P-312 (M3) ships the
+# Knowledge-side resolve-for-unfurls CONSUMER of the ONE humanise surface:
+# `myelin_knowledge::notif_resolve::KnowledgeRefResolver` is a REAL impl of the frozen
+# `RefResolvePort` (the 5.2 resolve seam humanise binds its slots to) over Knowledge's permission-
+# first `Projector` (5.6, project Display mode). A confidential page/block/row subject → for a
+# viewer lacking `read` the humanise render is a TOMBSTONE (`a restricted page`); the title NEVER
+# leaks (NOTIF-D4-class, 0 title leaks). This is the SAME sanctioned acyclic edge `myelin-git`
+# carries (GIT-P31 `git_resolve::GitRefResolver`): `myelin-notif` is a NAMED leaf consumer that
+# depends on NO subsystem crate (it depends only on -content/-refs/-identity/-tenancy), so a
+# producer service crate may depend on `myelin-notif` to wire its OWNED resolve seam — the DAG
+# stays acyclic; `myelin-notif` does NOT depend on `myelin-knowledge`. Knowledge registers NO
+# second template engine (OQ-L) — it feeds its Display projection into the ONE templating surface.
+myelin-notif = { path = "../myelin-notif" }
 # The Storage tier (KN-P05): the OLTP bounded pool (11.1, OltpPool), the (tenant, region)-first RLS
 # tenant-scoping guard (11.1/12.1, TenantScope/TenantQuery — the structural tenant-predicate floor),
 # and the fs-backed content-addressed BlobStore (11.2, the M1 media + CRDT-snapshot floor).
