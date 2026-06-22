@@ -318,7 +318,15 @@ title = "list_objects (SetExpr push-down)"
 # watermark read-consistency path → P-070 (P-ID-12); list_subjects → P-071 (P-ID-13); the
 # Ids↔Filter cardinality cap finalised at scale → P-074 (P-ID-31).
 status = "covered"
-cdc = ["crates/myelin-identity-service/tests/cdc_4_3_list_objects.rs"]
+# GIT-P26 / P-288 adds the GIT-side consumer half: `myelin_git::list_filter` lowers the returned
+# `Filter{set_expr}` over Git's OWN id column (`repo.id`/`pr.id`, §5.3/§7.3) into ONE leak-free list
+# query (the `authz_visible` JOIN, no N+1, no post-filter) + the code-search pre-filter (6.1). The
+# git consumer CDC + the GIT-D11 chained drill ride here; the live one-query/0-leak/revoke-reflected
+# proof is the `--features integration` test against the dev-stack Postgres.
+cdc = [
+  "crates/myelin-identity-service/tests/cdc_4_3_list_objects.rs",
+  "crates/myelin-git/tests/cdc_4_3_git_list_pushdown.rs",
+]
 
 [[contract]]
 row = "4.4"
