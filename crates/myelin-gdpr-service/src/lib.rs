@@ -511,10 +511,43 @@
 //! [`commit_prerequisite::commit_actor_holds_only_pseudonym`] is killed by {a pseudonym actor passes,
 //! every real-identity actor fails} over fixtures AND over Git's real `canonical_bytes`; Git's own
 //! `erase`-impl floor is owned by Git (GIT-P25). `cargo mutants` score recorded in the commit body.
+//!
+//! ## P-GA-29 (→ P-332) — the CI consumer holder (H2) + the per-subject CI-log DEK crypto-shred reach + the CI instance (CI-D3)
+//! [`ci_instance`] ships the **CI consumer holder (H2)** — the orchestration leg of 10.1 over the CI
+//! subsystem (the `erase` IMPL is CI's; GDPR REGISTERS + CALLS it): (1) **registers H2** (CI + log
+//! segments) into the data map ([`ci_instance::ci_holder_schemas`] — the data-map diff surfaces it,
+//! no holder-without-map drift); (2) **the fan-out reaches it** at its
+//! [`ci_instance::ci_phase_of`] phase ([`orchestration::CanonicalErasePhase::CryptoShredDek`] — the CI
+//! log free-text is a per-subject-DEK holder) via [`ci_instance::CiHolderRegistration::register_ci`];
+//! (3) the **per-subject CI-log DEK crypto-shred reaches isolable log-segment PII**
+//! ([`ci_instance::CiLogHolder`] — a subject erase destroys exactly that subject's per-subject CI-log
+//! DEK (the C1/P5 reach shipped storage-side in P-329 / P-ST-27), 0 dangling leak incl. backups, while
+//! a different subject's CI log AND the per-tenant FALLBACK survive; a tenant offboarding destroys the
+//! per-tenant fallback — the honest per-subject-where-isolable / per-tenant-fallback split; the
+//! run-graph structure survives in both); and (4) the **CI instance of the ONE posture BY REFERENCE**
+//! ([`ci_instance::CI_INSTANCE`] cites [`posture::POSTURE_ANCHOR`] + never restates — the SAME
+//! [`posture::reference_is_by_reference`] predicate the Git instance fired, the consumer half of the
+//! 10.9 CDC pair for CI). **CI-D3** (erase fans to CI → isolable log PII destroyed per-subject,
+//! per-tenant fallback for non-isolable, structure survives, 0 dangling leak incl. backups) emits its
+//! dated green artifact in `tests/ci_d3_ci_holder_erasure.rs`; the CDC pair for 10.1 is
+//! `tests/cdc_10_1_ci_holder.rs`. It REUSES the orchestrator / the canonical phase / the crypto-shred
+//! KMS / the by-reference predicate WHOLESALE (EI-01 §7 coherence — no second orchestrator, no
+//! re-defined posture). **Floors named:** the per-subject-where-isolable / per-tenant-fallback split
+//! is the honest answer (named); the **Issues (H3) + Chat (H5) consumer holders** over this SAME
+//! pattern → **P-GA-30 → P-333** ([`ci_instance::CONSUMER_HOLDER_FOLLOW_ON`]); the live CI `erase`
+//! binding behind the seam is a config swap at boot (the per-subject CI-log DEK mechanism is
+//! `myelin-storage`'s, its OWN live-stack integration proof owned storage-side, P-329 / STOR-D4-C1).
+//! **No `--features integration` leg owed:** this composes already-shipped in-memory seams and touches
+//! NO new DB / object-store / cache / bus contract. **Mutation floor (P-GA-29 TESTS — the
+//! per-subject-where-isolable / per-tenant-fallback selection path is mandatory-core):**
+//! [`ci_instance::CiLogHolder::erase`]'s scope selection (subject ⇒ per-subject DEK; tenant ⇒
+//! per-tenant fallback) + [`ci_instance::ci_phase_of`] + [`ci_instance::CiHolderRegistration::register_ci`]
+//! are the behavioral core; the `cargo mutants` score is in the commit body.
 
 pub mod agent_trace_seam;
 pub mod audit;
 pub mod audit_proofs;
+pub mod ci_instance;
 pub mod commit_prerequisite;
 pub mod datamap;
 pub mod derivative_erasure;
@@ -545,6 +578,11 @@ pub use audit_proofs::{
     serialize_sth_commitment, verify_consistency, verify_inclusion, AuditAuthority, CellSigningKey,
     ConsistencyProof, InclusionProof, NotaryWitness, SignedTreeHead, SigningKey, Witness,
     WitnessAttestation, DSR_SEAL_ACTION, STH_PUBLISH_AGE,
+};
+pub use ci_instance::{
+    ci_holder_schemas, ci_phase_of, ci_registrations, ci_residual, ci_section_references_posture,
+    CiHolderRegistration, CiLogHolder, CiLogModel, CI_DB, CI_INSTANCE, CI_SUBSYSTEM,
+    CONSUMER_HOLDER_FOLLOW_ON,
 };
 pub use commit_prerequisite::{
     commit_actor_holds_only_pseudonym, verdict_for, CommitActorVerdict, CommitIdentityPrerequisite,
