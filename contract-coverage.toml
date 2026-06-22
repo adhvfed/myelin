@@ -93,9 +93,15 @@ title = "cross-language harness shim (frozen)"
 # PROVIDER (chat pins Rust + records the obligation) + CONSUMER (the shim is a NO-OP in the all-Rust
 # default — no cross-language boundary; the obligation binds only on the BEAM divergence) sides. The
 # divergence is written-but-closed — the shim's obligations are stated, satisfied as a no-op today.
+# ENFORCED at P-S30 / P-319 (M4): myelin-harness ships the cross-language harness shim CONFORMANCE
+# SUITE (the SEVEN §3.7 non-negotiables as an exhaustive enum + a DivergentTierProbe trait + the
+# loud Enforced/RecordedNa discharge record). The specified→enforced floor is now real: a divergent
+# (BEAM) tier CANNOT ship unless all seven clauses are green; today (chat = Rust) the gate is a
+# LOUDLY-recorded, dated N/A (NOT a silent skip, EI-01 §4/§5) — discharged against chat's real pin.
 status = "covered"
 cdc = [
     "crates/myelin-chat/tests/cdc_1_7_chat_te21_pin.rs",
+    "crates/myelin-harness/tests/shim_conformance_p_s30.rs",
 ]
 
 # 1.8 (telemetry signal set) — the survival-signal contract every drill reads; greened transitively

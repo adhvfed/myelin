@@ -109,7 +109,26 @@
 //!   **P-S07 / P-S12 / P-S13 / P-S16** — each wires its fault-point to this consult then.
 //! - **Abstract sink only.** The generator drives an in-memory [`Sink`]; pointing it at a
 //!   real three-port `serve` instance lands once `serve` exists (**P-S12 / P-S13**).
+//!
+//! ## What P-S30 ships (this prompt → global P-319)
+//! The **cross-language harness shim conformance suite** ([`cross_language_shim`]) — the
+//! enforcement mechanism for contract 1.7 / architecture §3.7 (the frozen divergence
+//! contract). [`Nonnegotiable`] is the exhaustive, frozen seven-element set a non-Rust
+//! subsystem's shim must satisfy; [`DivergentTierProbe`] is the seam the divergent tier
+//! implements; [`ShimConformance::check`] runs all seven and is green iff all seven pass
+//! (`shim-conformance` ×7); [`ShimEnforcement`] is the LOUD discharge record — either
+//! `Enforced` (a divergent tier passed) or `RecordedNa` (the subsystem stayed Rust — a NO-OP
+//! recorded loudly with a dated reason). There is no third variant and no path from a failing
+//! suite to an `Enforced` record (EI-01 §5: a non-negotiable cannot be quietly dropped at a
+//! language boundary; §4: an N/A is recorded, never silently skipped). **Today this is the
+//! N/A path:** Chat's TE-21 pin is Rust (the BEAM hatch is written-but-closed,
+//! `myelin_chat::glue`), so there is no cross-language boundary; the loudly-recorded dated N/A
+//! row + the CDC pair for 1.7 live in `tests/shim_conformance_p_s30.rs` (a dev-dependency on
+//! `myelin-chat`, keeping the production harness dep set tiny). When Chat diverges (CHAT-P26)
+//! the suite binds: the BEAM tier's probe implements [`DivergentTierProbe`] and the tier
+//! cannot ship unless all seven clauses are green.
 
+pub mod cross_language_shim;
 pub mod dependency_break;
 pub mod drills;
 pub mod load_generator;
@@ -117,6 +136,9 @@ pub mod restore;
 pub mod scorecard;
 pub mod telemetry;
 
+pub use cross_language_shim::{
+    DivergentTierProbe, Nonnegotiable, ShimConformance, ShimEnforcement,
+};
 pub use dependency_break::{BreakOutcome, Dependency, DependencyBreaker, Scope};
 pub use drills::{DrillContext, DrillRegistry, DrillResult, DrillScenario};
 pub use load_generator::{
