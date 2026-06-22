@@ -1708,11 +1708,30 @@ status = "covered"
 # write can never address a `trusted:`-prefixed key. PROVEN against LIVE Valkey in
 # crates/myelin-git/tests/integration_git_p22_fork_cache_confinement.rs (0 fork writes in the trusted
 # scope on the real server; per-PR fork isolation; the trusted scope still round-trips). Ties to X-1.
+# P-330 (P-ST-28): the STORAGE-side C4 TRUST-SCOPED CACHE namespaces over the T2 BLOB keyspace (row
+# 11.2-C4) — the SIBLING of P-284 at a DIFFERENT tier (the durable build-cache artifacts, not the T7
+# coordination cache). `myelin_storage::ci_cache_scope::CiCacheNamespace` is the scope-key convention
+# `<tenant>/ci/cache/<scope>/...` (`<scope> ∈ {trusted, fork:<pr_id>, branch:<name>}`) over the
+# UNCHANGED content-addressed `BlobStore` (a namespace + a write-scope refusal, NOT a new store —
+# EI-01 §7; a cache artifact IS a content-addressed blob). The asymmetric C4 rule the prompt mandates:
+# an `untrusted_fork` run may READ the `trusted` scope (a cache hit is fine) but its WRITE to `trusted`
+# is REFUSED by the blob client (`CacheScopeError::ForkWriteToTrusted`). The scope is stamped from the
+# CI-stamped `trust_tier` (an INPUT `TrustTier` — Storage ENFORCES, it does NOT recompute trust; storage
+# cannot depend on git, so the tier is handed in off the SAME X-1 fact the git gate reads). Wires the
+# `cache_scope_violation{tenant}` signal (D-S11, 0 cross-scope LANDINGS). D-S11 GREEN (poisoned-cache
+# attack defeated; 0 fork value readable as trusted; per-PR fork isolation) in
+# crates/myelin-storage/tests/stor_d_s11_trust_scoped_cache_isolation_drill.rs. PROVEN against the LIVE
+# RustFS object store (the real T2 backing — dev<->prod is a backing SWAP) in
+# crates/myelin-storage/tests/integration_backends.rs::c4_trust_scoped_cache_namespaces_over_real_object_store
+# (--features integration: a fork write to trusted is refused BEFORE any byte hits the real bucket; the
+# fork reads trusted; the fork's own scope round-trips; 0 cross-scope landings). The C5 OLAP
+# restriction-flag gate is the sibling → P-ST-29 (P-331). Ties to X-1.
 cdc = [
     "crates/myelin-storage/tests/cdc_11_2_blobstore.rs",
     "crates/myelin-storage/tests/cdc_11_2_git_pack_tier.rs",
     "crates/myelin-storage/tests/cdc_11_2_11_4_git_crypto_shred_reach.rs",
     "crates/myelin-storage/tests/cdc_11_2_c3_cdn_clone_class.rs",
+    "crates/myelin-storage/tests/cdc_11_2_c4_trust_scoped_cache.rs",
     "crates/myelin-git/tests/cdc_11_2_git_pack_tier_consumer.rs",
     "crates/myelin-git/tests/cdc_11_2_c3_git_bundle_uri.rs",
 ]
