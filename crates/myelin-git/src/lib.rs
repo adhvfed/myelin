@@ -130,6 +130,20 @@ pub mod check_status;
 /// the external MCP server is GIT-P33/P6); the erasure SEMANTICS complete at GIT-P29;
 /// agents-as-authors is GIT-P28.
 pub mod code_tools;
+/// The **code-projection EMITTER for Search** (GIT-P25 / P-287, M3-G5 — the §9 TE-27 code
+/// projection). The receive-pack post-commit hook that, on a `git.ref.updated` to an indexed ref,
+/// diffs `new_tip ∖ last_indexed_oid` ([`code_projection::CodeProjectionCursor`]) and emits ONE
+/// `git.blob.snapshot` projection doc per changed blob through the outbox (per-blob, incremental —
+/// the GATE `emit-count == changed-blob-count`, 0 missed / 0 stale). Each upserted doc carries the
+/// §9 shape (path / detected language / camel·snake-split symbols / literals / blob text / tip commit
+/// message / blob_oid) lowering to the GIT-P5 Search-owned [`search_projection`] spec's facets; a
+/// delete is a tombstone; a `restrict`-ed subject's body is suppressed (§6). Git emits the projection;
+/// Search builds the trigram/symbol/path/literal index (no cross-DB). Floors: **GF-3** trigram/lexical
+/// search v1 is what this feeds — AST-aware "find usages" via CI-produced SCIP/LSIF (6.5, R-3) is the
+/// **GIT-P33/M5** follow-on; the leak-free `list_objects` SetExpr push-down + code-search pre-filter
+/// (GIT-D11) that conjoins this per viewer is **GIT-P26/P-288**; the production tree-walk/blob read
+/// rides the [`gix_backend`]/[`core`] seam (GIT-P13).
+pub mod code_projection;
 /// The **STORE-BACKED `check_status` projection** (GIT-P20 / P-281, M3): the LIVE Postgres binding of
 /// the in-memory [`check_status::CheckStatusProjection`] — the real table + migration + the same-tx
 /// idempotent-on-`event_id` + monotonic `run_attempt` supersession apply (contract 5.9 / X-1 / §6.1).

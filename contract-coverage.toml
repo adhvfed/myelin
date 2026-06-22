@@ -686,8 +686,15 @@ status = "covered"
 # read-time rollup/formula + SRCH-D1/D3 on the KN corpus) is in
 # crates/myelin-search/tests/integration_srch_p17_kn_indexing.rs. The KN projection EMITTER is the M3
 # KN service prompt cluster.
+# GIT-P25/P-287 adds the git code-projection EMITTER slice (the §9 TE-27 receive-pack post-commit
+# hook): git EMITS one git.blob.snapshot per changed blob on a push to an indexed ref
+# (`myelin_git::code_projection::CodeProjectionEmitter::emit_for_push`, incremental — emit-count ==
+# changed-blob-count) and the per-blob doc lowers to the Search-owned SearchProjection whose facets
+# are EXACTLY the declared 6.3 spec's (path/language/blob_oid). The emitter CDC pins both sides; the
+# emit GATE is in crates/myelin-git/tests/e2e_git_p287_code_projection_emit.rs.
 cdc = [
     "crates/myelin-git/tests/cdc_6_3_git_code_projection.rs",
+    "crates/myelin-git/tests/cdc_6_5_git_code_projection_emitter.rs",
     "crates/myelin-issues/tests/cdc_6_3_issues_facets_projection.rs",
     "crates/myelin-search/tests/cdc_6_3_kn_index_specs.rs",
 ]
@@ -708,8 +715,24 @@ cdc = ["crates/myelin-search/tests/cdc_6_4_reindex.rs"]
 [[contract]]
 row = "6.5"
 title = "code-search input"
-status = "deferred"
-landing = "P-231"
+status = "covered"
+# GIT-P5/P-231 froze the declare_indexable code-projection SPEC (row 6.3). GIT-P25/P-287 ships the
+# EMITTER that feeds the code-search input: on a git.ref.updated to an indexed ref the receive-pack
+# post-commit hook (`myelin_git::code_projection::CodeProjectionEmitter`, architecture 02 §9 / TE-27)
+# diffs new_tip ∖ last_indexed_oid (the code_projection_cursor) and emits ONE git.blob.snapshot per
+# changed blob — the §9 shape (path / detected language / camel·snake-split symbols / literals / blob
+# text / tip commit message / blob_oid), incremental (emit-count == changed-blob-count, 0 missed/stale),
+# restriction-safe (a restrict-ed subject's body is suppressed), through the outbox so replay re-emits
+# the same doc (cold == live). Git emits the projection + supplies the TEXT; Search builds the
+# trigram/symbol/path/literal index (no cross-DB). The provider (git emits the §9 shape) + consumer
+# (the doc lowers to the Search-owned SearchProjection whose facets match the declared 6.3 spec) CDC
+# pair is crates/myelin-git/tests/cdc_6_5_git_code_projection_emitter.rs; the chained-e2e emit GATE
+# (push code → per-changed-blob incremental emit) is
+# crates/myelin-git/tests/e2e_git_p287_code_projection_emit.rs.
+# FLOOR named (GF-3): trigram/lexical code search v1 is what this feeds; AST-aware "find usages" via
+# CI-produced SCIP/LSIF indices is the GIT-P33/M5 follow-on. The leak-free list_objects SetExpr
+# push-down + code-search pre-filter (GIT-D11) that conjoins this per viewer is GIT-P26/P-288.
+cdc = ["crates/myelin-git/tests/cdc_6_5_git_code_projection_emitter.rs"]
 
 # ──────────────── §7 Notifications (myelin-notif) ───────────────────────────────────────────────
 
