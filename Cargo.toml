@@ -28,6 +28,19 @@ members = [
     "crates/myelin-search",
     "crates/myelin-content",
     "crates/myelin-query",
+    # The Knowledge service SHELL crate (KN-P04 → P-294, M3): the bootable AppSpec the harness
+    # wires (boot → migrate → outbox-relay hook → three ports → graceful drain; liveness ≠
+    # readiness) + the hot-table-flag declaration (block/db_row/doc_op, contract 1.5) the high-
+    # write tables KN-P05 creates are protected by + the fail-closed authenticate/check entrypoint
+    # slots (4.1/4.2, the per-op body KN-P14 / ABAC push-down KN-P16). Like the other SERVICE
+    # crates (myelin-identity-service, myelin-notif, myelin-git, myelin-issues) it is a LEAF
+    # CONSUMER above the glue crates (depends on -content/-query/-identity/-events/-tenancy/
+    # -substrate) and is NOT a node in the eleven-crate library DAG modelled by
+    # myelin-substrate::crate_graph — nothing in the production DAG depends back on it;
+    # substrate_is_root()/identity_is_sink() are preserved (a service is the graph's terminal
+    # consumer). The OLTP store + (tenant,region) partition land in KN-P05; the outbox emit
+    # bodies + consumers in KN-P06. See crates/myelin-knowledge/src/lib.rs.
+    "crates/myelin-knowledge",
     "crates/myelin-agent",
     # The Agent-Fabric IMPLEMENTATION / SERVICE crate (AG-P2 → P-131), distinct from the glue crate
     # myelin-agent (AG-P1 → P-130). It ships the data-model MIGRATIONS — the five (tenant, region)-
