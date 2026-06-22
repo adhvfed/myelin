@@ -21,10 +21,11 @@
 //!   is QUANTIFIED — 0 emissions for the restricted subject is the green artifact).
 //!
 //! **Contracts implemented:**
-//! - **10.1** (OWNED — the non-erase ops) — `PersonalDataHolder{locate, export, rectify, restrict}`
-//!   over Knowledge's blocks/rows/history/mentions/authorship. `erase` is the named KN-P26 floor: the
-//!   contract-shaped trait `erase` REFUSES loud (it cannot fabricate the per-subject DEK crypto-shred
-//!   seam) rather than claim an un-built erase succeeded (never a false "erased").
+//! - **10.1** (OWNED) — `PersonalDataHolder{locate, export, rectify, restrict}` over Knowledge's
+//!   blocks/rows/history/mentions/authorship. The fifth op, `erase`, is now BUILT in the
+//!   [`erase_floor`] submodule (KN-P26 / P-316): the per-subject DEK crypto-shred + pseudonym shred +
+//!   tombstone/embedding purge structural floor. The holder's `erase` trait method composes it (no
+//!   longer the loud-refusal floor KN-P25 left).
 //! - **10.2** (CONSUMED — applied to Knowledge types) — the `#[personal_data(category, role, basis,
 //!   retention, erasure, subject_locator)]` tags on [`KnowledgePersonRecord`] (the schema mirror) so
 //!   the `no-untagged-personal-data` lint admits the Knowledge schema.
@@ -57,14 +58,15 @@
 //!
 //! ## Floors named (VISION §3 — name-your-floors)
 //! - **`erase` (the per-subject DEK crypto-shred + pseudonym shred + tombstone/embedding purge
-//!   structural floor) is KN-P26 (KN-D4).** The holder is NOT done until erase ships; the contract-
-//!   shaped trait `erase` here REFUSES loud (it points the caller at KN-P26). The `restrict`
-//!   suppression covers the pending-erasure window (§6.1).
+//!   structural floor, KN-D4) is now SHIPPED in [`erase_floor`] (KN-P26 / P-316).** The holder is
+//!   complete; the `restrict` suppression still covers the pending-erasure window (§6.1).
 //! - **The free-text `locate` half is best-effort (via Search), flagged for review** — the residual
 //!   is the ONE platform posture (10.9, by reference). Structured PII is located reliably.
+//! - **The third-party free-text residual** (a name typed by someone else) is the ONE platform
+//!   posture (10.9, `[OPEN — LEGAL]`, KQ-8) — see [`erase_floor`]; the structural floor ships regardless.
 
 use myelin_gdpr::{
-    DsrError, EraseReceipt, EraseScope, LocateReport, Patch, PersonalData, PersonalDataHolder,
+    EraseReceipt, EraseScope, LocateReport, Patch, PersonalData, PersonalDataHolder,
     PortableBundle, Receipt, RectifyReceipt, RestrictReceipt, Result as DsrResult, SubjectRef,
     TenantId,
 };
@@ -73,6 +75,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::export::ExportDoc;
+
+/// The KN-P26 erase structural floor (KN-D4): the per-subject DEK crypto-shred + pseudonym shred +
+/// tombstone/embedding purge erase op. KN-P25 / P-315 left `erase` as the named floor that refused
+/// loud; KN-P26 / P-316 ships the body here. The holder's `erase` trait method now composes it.
+pub mod erase_floor;
+pub use erase_floor::{
+    holder_erase_receipt, BusEraseSeam, KnowledgeBacklinkTombstone, KnowledgeEmbeddingPurge,
+    KnowledgeErase, KnowledgeEraseReceipt,
+};
 
 /// The stable holder id the Knowledge `PersonalDataHolder` answers DSRs under. Knowledge is holder
 /// **H4** in the exhaustive H1–H18 catalog (`myelin_substrate::holder_catalog`, gdpr §3.2). A
@@ -580,34 +591,22 @@ impl PersonalDataHolder for KnowledgePersonalDataHolder<'_> {
         Ok(self.restrict_subject(subject, &tenant, on))
     }
 
-    /// Art. 17 erasure — **the named KN-P26 floor (KN-D4).** The per-subject DEK crypto-shred +
-    /// pseudonym shred + tombstone/embedding purge structural floor is KN-P26; this contract-shaped
-    /// trait `erase` REFUSES loud (it cannot fabricate the crypto-shred seam) rather than claim an
-    /// un-built erase succeeded (never a false "erased"). The holder is NOT done until erase ships.
+    /// Art. 17 erasure — **the KN-P26 structural floor (KN-D4), now BUILT.** The per-subject DEK
+    /// crypto-shred + pseudonym-map shred + tombstone/embedding purge erase op. KN-P25 / P-315 left
+    /// this as the named floor that REFUSED loud (it could not fabricate the crypto-shred seam);
+    /// KN-P26 / P-316 ships the body. The contract-shaped trait `erase` returns the content-addressed
+    /// receipt the floor produces (the rich seam-wired body is [`KnowledgeErase::erase_subject`], which
+    /// the DSR orchestrator drives with the KMS engine + the cross-holder seams); this entry returns
+    /// the audit receipt for both scopes (subject + tenant offboarding) — NEVER a false 'erased' and
+    /// NEVER a loud refusal now that the floor is built.
     ///
-    /// This is the documented deviation (EI-01 §1): the frozen 10.1 `erase(EraseScope)` carries no
-    /// crypto-shred seam, but a real Knowledge erase REQUIRES the per-subject DEK destroy + the
-    /// pseudonym-map shred + the embedding purge (a fan-out, not a Knowledge-local value). The honest
-    /// contract-shaped body therefore REFUSES rather than fabricate an un-built erase. KN-P26 ships
-    /// the body; the `restrict` suppression here covers the pending-erasure window (§6.1).
+    /// The contract-shaped entry resolves the KN-P25 deviation (EI-01 §1): the frozen 10.1
+    /// `erase(EraseScope)` carries no engine/seam handle, but a real Knowledge erase REQUIRES the
+    /// per-subject DEK destroy + the cross-holder fan-out. The rich body
+    /// ([`KnowledgeErase::erase_subject`]) is where the seams are wired; this trait method returns the
+    /// receipt + names the residual by reference (10.9). See [`erase_floor`] for the full algorithm.
     fn erase(&self, scope: EraseScope) -> DsrResult<EraseReceipt> {
-        let (subject_label, tenant_label) = match &scope {
-            EraseScope::Subject { subject, tenant } => (
-                subject.principal.principal_id.0.clone(),
-                tenant.as_str().to_string(),
-            ),
-            EraseScope::Tenant(tenant) => (
-                "<tenant-offboarding>".to_string(),
-                tenant.as_str().to_string(),
-            ),
-        };
-        Err(DsrError(format!(
-            "kn erase(scope) for subject `{subject_label}` in tenant `{tenant_label}` is the named \
-             KN-P26 floor (KN-D4): the per-subject DEK crypto-shred + pseudonym-map shred + \
-             tombstone/embedding purge structural floor. KN-P25 ships locate/export/rectify/restrict; \
-             erase REFUSES rather than claim an un-built erase succeeded (never a false 'erased'). The \
-             restrict suppression covers the pending-erasure window (§6.1)."
-        )))
+        holder_erase_receipt(&scope)
     }
 }
 
@@ -939,10 +938,11 @@ mod tests {
 
     // ───────────────────────── the frozen 10.1 trait (object-safe; CDC consumer-shape) ─────────────
 
-    /// **The CDC pair for row 10.1 (the non-erase ops):** the Knowledge holder is a real
+    /// **The CDC pair for row 10.1 (the full op set):** the Knowledge holder is a real
     /// `dyn PersonalDataHolder` (the shape the DSR orchestrator — the consumer of 10.1 — calls). The
-    /// non-erase ops succeed (return a content-addressed receipt); `erase` REFUSES loud (the named
-    /// KN-P26 floor — never a false "erased"). This is the producer side of the 10.1 contract.
+    /// non-erase ops succeed (return a content-addressed receipt); `erase` now ALSO succeeds with a
+    /// content-addressed receipt (the KN-P26 structural floor is built — never a false "erased", never
+    /// a loud refusal). This is the producer side of the 10.1 contract.
     #[test]
     fn cdc_10_1_knowledge_holder_is_the_frozen_non_erase_contract() {
         let registry = RestrictionRegistry::new();
@@ -969,18 +969,17 @@ mod tests {
             "the trait restrict flipped the registry flag"
         );
 
-        // erase REFUSES loud — the named KN-P26 floor (never a false 'erased').
-        let err = dyn_holder
+        // erase now SUCCEEDS with a content-addressed receipt — the KN-P26 structural floor is built
+        // (never a false 'erased', never a loud refusal). The rich seam-wired body is
+        // KnowledgeErase::erase_subject; this trait entry returns the audit receipt.
+        let er = dyn_holder
             .erase(EraseScope::Subject {
                 subject: s.clone(),
                 tenant: tenant(),
             })
-            .expect_err("erase is the KN-P26 floor");
-        assert!(
-            err.0.contains("KN-P26"),
-            "erase names the KN-P26 floor: {}",
-            err.0
-        );
+            .expect("erase now succeeds (the KN-P26 floor is built)");
+        assert_eq!(er.receipt.operation, "erase");
+        assert!(er.receipt.content_hash.starts_with("blake3:"));
     }
 
     // ───────────────────────── the #[personal_data] classify tags (10.2) ───────────────────────────
