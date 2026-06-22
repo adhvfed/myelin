@@ -78,6 +78,15 @@ serde.workspace = true
 # rest of the workspace pins.
 serde_json.workspace = true
 
+# DEV-REAL data layer (GIT-P20 / P-281, M3) — the store-backed `check_status` projection. The Postgres
+# driver + async runtime + dev config are OPTIONAL and pulled ONLY by `--features integration`, so
+# `cargo build --workspace` stays DB-free (the binding data-layer policy). The live `check_status`
+# table + the same-tx idempotent-on-`event_id` + monotonic supersession apply (contract 5.9 / X-1 §6.1)
+# is proven against the dev Postgres stack by `tests/integration_git_d10_check_status_projection.rs`.
+sqlx = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+myelin-config = { workspace = true, optional = true }
+
 # BLAKE3 content-addresses the IMMUTABLE git commit object (GIT-P25 / P-ID-25, M3): the commit OID
 # is `blake3:<hex>` over the canonical commit bytes — the SAME multihash convention the GDPR holder
 # Receipt + the BlobStore content-address use (one digest convention across the platform, never a
@@ -133,3 +142,10 @@ myelin-client = { path = "../myelin-client" }
 # engine, never re-define it.
 [dev-dependencies]
 myelin-identity-service = { path = "../myelin-identity-service" }
+
+[features]
+# The DEV-REAL integration leg (GIT-P20 / P-281, M3) — the store-backed `check_status` projection
+# (`src/check_status_store.rs`) + its live GIT-D10 part-(a) drill
+# (`tests/integration_git_d10_check_status_projection.rs`). Off by default so `cargo build --workspace`
+# stays DB-free; proven green against the docker-compose dev Postgres stack.
+integration = ["dep:sqlx", "dep:tokio", "dep:myelin-config"]
