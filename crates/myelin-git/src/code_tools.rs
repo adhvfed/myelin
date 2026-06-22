@@ -186,6 +186,21 @@ pub trait CacheInvalidator {
     ) -> Result<usize, GitCoreError>;
 }
 
+/// A reference to a [`CacheInvalidator`] is itself a [`CacheInvalidator`] (the blanket forwarding
+/// impl). This lets a caller wire the SAME invalidator into both the [`HistoryRewriteTool`] and a
+/// holder's erase fan-out (the GIT-P29 [`crate::holder::GitPersonalDataHolder`]) by reference — one
+/// invalidator, never two parallel cache seams (EI-01 §7).
+impl<T: CacheInvalidator + ?Sized> CacheInvalidator for &T {
+    fn invalidate(
+        &self,
+        tenant: &TenantId,
+        repo: &RepoLoc,
+        namespace: CacheNamespace,
+    ) -> Result<usize, GitCoreError> {
+        (**self).invalidate(tenant, repo, namespace)
+    }
+}
+
 // ───────────────────────── the rate limiter (the "rate-limited tenant op", recon §9) ─────────────
 
 /// **A per-tenant rate limiter for the history-rewrite op (recon §9 — "rate-limited tenant op").**
