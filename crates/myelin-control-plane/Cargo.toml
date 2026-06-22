@@ -74,3 +74,11 @@ myelin-gdpr-service = { path = "../myelin-gdpr-service" }
 # §3). DEV-only — myelin-harness never enters the service production DAG (a test-support crate above
 # the substrate).
 myelin-harness = { path = "../myelin-harness" }
+# The CI subsystem's runner-claim MECHANISM (`JobLeaseStore::claim_for_labels`) — DEV-only, for the
+# CI-R3 runner-claim drill (P-CP-18 / P-325): the cross-owner drill proves the CI claim mechanism (the
+# residency predicate that skips out-of-region jobs) and the control-plane region-pin ASSERTION
+# (`RunnerClaimPin::admit_claim`) AGREE — an out-of-region runner cannot claim an EU tenant's run from
+# either side. NO production DAG edge (myelin-ci-sandbox is a leaf; nothing in the control-plane
+# production DAG depends on it — substrate_is_root() preserved); it is a TEST-only cross-owner pairing,
+# the same shape the residency_verify CDC uses to prove Storage's reports feed the control plane.
+myelin-ci-sandbox = { path = "../myelin-ci-sandbox" }
