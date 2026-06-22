@@ -65,6 +65,7 @@ pub mod compaction;
 pub mod editor;
 pub mod emit;
 pub mod merge;
+pub mod rebac_fragment;
 pub mod store;
 pub mod subs;
 pub mod sync_block;
@@ -97,6 +98,10 @@ pub use merge::{
     cas_update_sql, BlockState, CasError, CasOutcome, CasStore, ConflictMeter, OfflineQueue,
     QueuedEdit, ReconcileResult, SimultaneousPresence, SoftLock, SoftLockTable,
     CAS_CONFLICT_RATE_METRIC,
+};
+pub use rebac_fragment::{
+    block_read_fragment, database_row_read_fragment, field_view_permission, knowledge_read_fragment,
+    page_read_fragment, page_read_override, row_reader_set_expr, space_read_fragment,
 };
 pub use store::{
     knowledge_scope, knowledge_store_migrations, KnowledgeStore, KnowledgeTable,
