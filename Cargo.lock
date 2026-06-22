@@ -2365,7 +2365,9 @@ dependencies = [
  "myelin-events",
  "myelin-harness",
  "myelin-identity",
+ "myelin-lints",
  "myelin-query",
+ "myelin-storage",
  "myelin-substrate",
  "myelin-tenancy",
 ]
