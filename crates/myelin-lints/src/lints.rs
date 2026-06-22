@@ -543,7 +543,7 @@ fn scan_no_untagged_personal_data(src: &str) -> Vec<Violation> {
         // attribute opened above it AND its bracket span has closed (`attr_bracket_depth <= 0`) by
         // the time we reach the field line — i.e. the whole (possibly multi-line) attribute precedes
         // the field, never bleeding into the field's own line.
-        if in_struct && depth >= struct_brace_depth - 1 {
+        if in_struct && depth >= struct_brace_depth {
             if let Some(field_name) = field_identifier(trimmed) {
                 let tagged = field_is_tagged && attr_bracket_depth <= 0;
                 if PII_FIELDS.contains(&field_name) && !tagged {
@@ -569,7 +569,14 @@ fn scan_no_untagged_personal_data(src: &str) -> Vec<Violation> {
         let opens = code.matches('{').count() as i32;
         let closes = code.matches('}').count() as i32;
         depth += opens - closes;
-        if in_struct && depth < struct_brace_depth - 1 {
+        // Leave the struct body when brace depth drops below it. NOTE: this must be
+        // `< struct_brace_depth` (not `- 1`): for a TOP-LEVEL struct, `struct_brace_depth == 1`, so
+        // after the closing `}` brings `depth` to 0 the old `0 < 0` never fired and `in_struct`
+        // latched true for the rest of the file — making every later `ident: Type` line (fn params,
+        // struct literals) eligible for PII-flagging once they sit on their own line (e.g. after
+        // `cargo fmt` reflows a long signature). Resetting at `< struct_brace_depth` confines the
+        // scan to the actual struct-definition body.
+        if in_struct && depth < struct_brace_depth {
             in_struct = false;
         }
     }
