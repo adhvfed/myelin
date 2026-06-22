@@ -1,0 +1,21 @@
+// RED fixture for `no-untagged-personal-data` — the KNOWLEDGE-relevant slice (KN-P25 / P-315).
+// The lint MUST reject this. The Knowledge person record's free-text comment body field
+// (`comment_text`, a PII fingerprint) carries NO #[personal_data(...)] tag — so the per-subject
+// DEK crypto-shred erase (architecture knowledge-platform §6.1; KN-P26) and the RoPA/data-map
+// fan-out would NOT reach it, leaving an un-erasable subject (ADR-12). The author attribution IS
+// tagged here, isolating the failure to the deliberately-untagged body field.
+pub struct KnowledgePersonRecord {
+    pub tenant: TenantId,
+    pub region: Region,
+    pub artifact_id: String,
+    #[personal_data(
+        category = Identifier,
+        role = TenantContent,
+        basis = Contract,
+        retention = UntilContractEnd,
+        erasure = Pseudonymise,
+        subject_locator = "created_by",
+    )]
+    pub created_by: String,
+    pub comment_text: String,
+}

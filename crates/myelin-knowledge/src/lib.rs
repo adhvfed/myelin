@@ -72,6 +72,14 @@ pub mod emit;
 /// recording each lossy node in the [`myelin_content::ImportReport`]. The export/import round-trip
 /// is byte-faithful for the content model (`render(parse(md)) === md` across the boundary, 13.1).
 pub mod export;
+/// The Knowledge `PersonalDataHolder` H4 body + the `#[personal_data]` classify tags (KN-P25 /
+/// P-315, M3 / KN-M3e): the `locate`/`export`/`rectify`/`restrict` ops (contract 10.1, the non-erase
+/// ops) over Knowledge's blocks/rows/history/mentions/authorship, the four-sink restrict suppression
+/// (Search/Agents/OLAP/Notif — the QUANTIFIED 0-emissions gate, [`gdpr::RestrictionRegistry`]), and
+/// the `#[personal_data(...)]` tags on the Knowledge schema ([`gdpr::KnowledgePersonRecord`]) so the
+/// `no-untagged-personal-data` lint is green. The `erase` op (the per-subject DEK crypto-shred
+/// structural floor, KN-D4) is the named KN-P26 follow-on.
+pub mod gdpr;
 pub mod list_filter;
 pub mod merge;
 pub mod notif_resolve;
@@ -114,6 +122,11 @@ pub use editor::{
 pub use export::{
     export_rows_to_csv, import_adf, AdfImportResult, ExportBlock, ExportDoc, ExportError,
     ExportFormat, ParsedAdfNode, EXPORT_SCHEMA_VERSION,
+};
+pub use gdpr::{
+    KnowledgeLocateReport, KnowledgePersonRecord, KnowledgePersonalDataHolder, LocatedKind,
+    LocatedLocus, RectifyOutcome, RestrictSuppressor, RestrictionRegistry, RestrictionSink,
+    SinkVerdict, HOLDER_ID as KNOWLEDGE_HOLDER_ID,
 };
 pub use subs::{
     mint_block, mint_heading, register_knowledge_sub_kinds, KNOWLEDGE_OWNED_SUB_KINDS,
