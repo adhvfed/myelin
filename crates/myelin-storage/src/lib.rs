@@ -522,6 +522,21 @@ pub mod migration_under_load;
 // residency M1 backup-able set because T4 is a derived, NOT-backed-up, reindex-from-source store).
 pub mod olap;
 pub mod olap_feed;
+// The OLAP restriction-flag gate (C5, P-ST-29 / P-331, M4, contract 11.6 the C5 gate + consumed
+// 10.1 `restrict(subject)`): `restrict(subject)` propagates into T4 — a restricted subject's rows
+// are EXCLUDED from every analytics aggregate (CFD/cycle-time/velocity/delivery-health). The OLAP
+// consumer applies the restriction flag as a QUERY-TIME filter (`OlapAnalytics` over the frame's
+// read model — never a second store, EI-01 §7); the subject's contribution is withheld until
+// restriction lifts (it reappears with no reindex — the rows stay) or erasure completes. A
+// COMPLIANCE gate, not a tuning knob — it unblocks the Issues analytics ask without leaking a
+// restricted subject. Wires `olap_restricted_subject_leak` (D-S12, must be 0 — the leak audit
+// intersects each aggregate's contributing-subject set with the restriction set). REUSES olap.rs's
+// `OlapReadStore` docs + restriction set (P-104/P-145) — never a parallel store. FLOOR NAMED: the
+// worklog/productivity/estimate analytics-ELIGIBILITY (OQ-H) is [OPEN — LEGAL] (works-council
+// consultation) — Storage ships the `AnalyticsEligibility` SEAM (conservative default: per-individual
+// rollups OFF) + the C5 restriction gate REGARDLESS; the LEGAL ratification of which rollups are
+// eligible is the named follow-on. STOR-D1/STOR-D2 remain green (no restore/backup code touched).
+pub mod olap_restrict;
 pub mod oltp;
 pub mod reerase;
 // The reserve/settle cost gate mechanism + the durable per-tenant ledger (P-ST-16 / P-103,
@@ -645,6 +660,10 @@ pub use olap::{
 };
 pub use olap_feed::{
     reindex_olap_from_bus, OlapAnalyticsSource, OlapBusConsumer, OlapReindexParitySignal,
+};
+pub use olap_restrict::{
+    AnalyticsAggregate, AnalyticsEligibility, OlapAnalytics, RestrictionGateSignal,
+    RestrictionLeakAudit,
 };
 pub use oltp::{OltpConfig, OltpError, OltpPool, PermitGuard};
 pub use reerase::{

@@ -1839,15 +1839,29 @@ status = "covered"
 # seam). The CDC pair is the bus-fed CQRS feeder (`OlapBusFeeder`, the shape the live feed takes) over
 # `OlapEvent::from_envelope` + `apply` (cdc_11_6_olap_frame.rs).
 # Floors named: the LIVE bus feed (steady-state idempotent consumer off the durable stream +
-# `*.snapshot` replay) is P-ST-18 (global P-145), which COMPLETES this frame; the C5 restriction-flag
-# analytics-suppression gate (no analytics for a restricted subject; the `olap_restricted_subject_leak
-# == 0` drill) lights up with Issues analytics in M4 (P-ST-29) — the frame carries the flag + the
-# `is_restricted` read; worklog/productivity analytics-eligibility is [OPEN → LEGAL] (OQ-H). The real
-# ClickHouse-class columnar backend lands with the live feed (P-ST-18); the frame is an in-memory-
-# testable MODEL over the existing SourceLog/ReindexFromSource primitive + the frozen EventEnvelope,
-# so NO new db/object-store/cache/bus trait is touched and no new integration drill is owed.
-landing = "P-145"
-cdc = ["crates/myelin-storage/tests/cdc_11_6_olap_frame.rs"]
+# `*.snapshot` replay) is P-ST-18 (global P-145), which COMPLETES this frame.
+# C5 — the OLAP restriction-flag gate (P-331 / P-ST-29, M4) is now LANDED (olap_restrict.rs):
+# `restrict(subject)` (10.1) propagates into T4 — a restricted subject's rows are EXCLUDED from
+# every analytics aggregate (CFD/cycle-time/velocity/delivery-health). `OlapAnalytics` over the frame's
+# read model applies the restriction as a QUERY-TIME filter (the subject's rows STAY — a lift makes it
+# reappear with no reindex; an erasure removes them); the leak audit intersects each aggregate's
+# contributing-subject set with the restriction set → `olap_restricted_subject_leak == 0` (D-S12). A
+# COMPLIANCE gate, not a tuning knob — it unblocks the Issues analytics ask without leaking a restricted
+# subject. CDC pair = the Issues analytics consumer (cdc_11_6_c5_restriction_gate.rs); drill =
+# stor_d_s12_restricted_subject_olap_suppression_drill.rs (over the real live bus feed). REUSES the
+# frame's docs + restriction set — never a parallel store (EI-01 §7).
+# Floor named (C5): the worklog/productivity/estimate analytics-ELIGIBILITY (OQ-H) is [OPEN — LEGAL]
+# (works-council consultation) — Storage ships the `AnalyticsEligibility` SEAM (per-individual rollups
+# OFF by default) + the C5 restriction gate REGARDLESS; the LEGAL ratification of which rollups are
+# eligible is the named follow-on. The real ClickHouse-class columnar backend lands with the live feed
+# (P-ST-18); the frame + the C5 gate are an in-memory-testable MODEL over the existing
+# SourceLog/ReindexFromSource primitive + the frozen EventEnvelope, so NO new db/object-store/cache/bus
+# trait is touched and no new integration drill is owed.
+landing = "P-331"
+cdc = [
+  "crates/myelin-storage/tests/cdc_11_6_olap_frame.rs",
+  "crates/myelin-storage/tests/cdc_11_6_c5_restriction_gate.rs",
+]
 
 [[contract]]
 row = "11.7"

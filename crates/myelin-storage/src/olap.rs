@@ -58,10 +58,11 @@
 //!   consumer SHAPE + the cold reindex-from-source path; P-ST-18 wires the live durable-stream
 //!   feed (the `*.snapshot` replay seam + the Bus/KN M2 consumer template).
 //! - **The C5 restriction-flag gate** — `restrict(subject)` suppression propagating into T4 (no
-//!   analytics for a restricted subject) — is **NAMED here** but lights up with **Issues analytics
-//!   in M4: P-ST-29 (global P-... — the C5 OLAP suppression gate)**. The frame carries the
-//!   `restricted_subjects` set + the `is_restricted` read so P-ST-29 can wire the filter; the
-//!   gate's drill (`olap_restricted_subject_leak == 0`) is M4.
+//!   analytics for a restricted subject) — was **NAMED here** and is **now LANDED in M4: P-ST-29
+//!   (global P-331)**, the C5 OLAP suppression gate (see [`crate::olap_restrict`]). This frame
+//!   carries the `restricted_subjects` set + the `is_restricted`/`restricted_subjects`/`docs` reads
+//!   the gate consumes; P-ST-29 wires the aggregate filter (CFD/cycle-time/velocity/delivery-health
+//!   exclude a restricted subject's rows) + the `olap_restricted_subject_leak == 0` drill (D-S12).
 //! - **Worklog/productivity/estimate analytics-eligibility** is `[OPEN → LEGAL]` (**OQ-H**):
 //!   per-individual productivity rollups are off by default (works-council consultation in
 //!   applicable jurisdictions); counsel/DPO ratifies the special-category classification. Storage
@@ -184,10 +185,11 @@ pub struct OlapReadStore {
     /// The CQRS analytics read model: the projected docs keyed by their `aggregate_row`. A model of
     /// the ClickHouse-class columnar rows — the real columnar backend lands with the live feed.
     docs: BTreeMap<String, OlapDoc>,
-    /// **The C5 restriction-flag set (NAMED floor; the gate lights up M4 / P-ST-29).** Subjects
-    /// under `restrict(subject)` whose contribution MUST be excluded from analytics aggregates. The
-    /// frame carries the set + the `is_restricted` read; P-ST-29 wires the aggregate filter + the
-    /// `olap_restricted_subject_leak == 0` drill.
+    /// **The C5 restriction-flag set (now wired by M4 / P-ST-29 — [`crate::olap_restrict`]).**
+    /// Subjects under `restrict(subject)` whose contribution MUST be excluded from analytics
+    /// aggregates. The frame carries the set + the `is_restricted`/`restricted_subjects`/`docs`
+    /// reads; P-ST-29's [`crate::olap_restrict`] applies the aggregate filter + the
+    /// `olap_restricted_subject_leak == 0` drill (D-S12).
     restricted_subjects: BTreeSet<String>,
 }
 
@@ -335,10 +337,27 @@ impl OlapReadStore {
         self.docs.get(aggregate_row)
     }
 
-    /// **C5 (NAMED floor — the gate lights up M4 / P-ST-29).** Mark a subject restricted (its
-    /// contribution must be excluded from analytics aggregates pending erasure/lift). The frame
-    /// records the flag; the aggregate-exclusion filter + the `olap_restricted_subject_leak == 0`
-    /// drill are the Issues-analytics M4 deliverable.
+    /// Iterate every projected doc in the read model, in `aggregate_row` order (the deterministic
+    /// `BTreeMap` order). The C5 restriction-flag gate ([`crate::olap_restrict`]) reads this to
+    /// build analytics aggregates while EXCLUDING a restricted subject's rows; it is the only doc
+    /// enumeration the aggregate computation needs (the read model stays the single source — the C5
+    /// gate does not fork a second store).
+    pub fn docs(&self) -> impl Iterator<Item = &OlapDoc> {
+        self.docs.values()
+    }
+
+    /// The set of subjects currently under restriction (the C5 read the aggregate filter consumes),
+    /// in deterministic order. Used by [`crate::olap_restrict`] to prove a restricted subject's
+    /// contribution is absent from every analytics aggregate (the `olap_restricted_subject_leak == 0`
+    /// gate) and to detect a leak (a restricted subject appearing in an aggregate's contributing set).
+    pub fn restricted_subjects(&self) -> impl Iterator<Item = &String> {
+        self.restricted_subjects.iter()
+    }
+
+    /// **C5 (the restriction flag — wired by M4 / P-ST-29, [`crate::olap_restrict`]).** Mark a
+    /// subject restricted (its contribution is excluded from every analytics aggregate pending
+    /// erasure/lift). The frame records the flag; the aggregate-exclusion filter + the
+    /// `olap_restricted_subject_leak == 0` drill (D-S12) are realised in [`crate::olap_restrict`].
     pub fn set_restricted(&mut self, subject: impl Into<String>, on: bool) {
         let subject = subject.into();
         if on {
