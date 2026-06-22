@@ -63,6 +63,15 @@
 //! DB. `cargo build --workspace` stays DB-free (the reserve/settle + collab apply bodies it composes
 //! are proven against the live stack at the Fabric/Storage integration drills).
 
+/// The AG-7 content-addressed agent-trace holder (KN-P28 / P-318, M3 — drill KN-D12): the erasable
+/// trace holder that accepts content-addressed (BLAKE3) trace writes reusing the block model, returns
+/// `run.trace_ref`, and is DISTINCT from the tamper-evident audit log (contract 8.8 / 10.1 / §5.2).
+pub mod trace;
+pub use trace::{
+    write_agent_trace, AgentTrace, AgentTraceHolder, TraceEraseReceipt, AUDIT_LOG_ERASABLE,
+    AUDIT_LOG_STORE_ID, TRACE_ERASABLE, TRACE_HOLDER_ID,
+};
+
 use myelin_content::rebac_fragment::object_types as kn_objects;
 use myelin_content::rebac_fragment::{COMMENT, DRAFT, EDIT, PUBLISH};
 

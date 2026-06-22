@@ -1268,10 +1268,16 @@ title = "AG-7 agent trace"
 # the trace registers as the erasable H17 PersonalDataHolder, distinct from the audit log. The drill
 # pair below carries the PROVIDER (the Fabric builds + content-addresses the 13.1 trace document) +
 # CONSUMER (run.trace_ref reads the content address; the H17 holder erase crypto-shreds it, KN-D12).
+# KN-P28 (→ P-318, M3) lands the LIVE KNOWLEDGE-side PRODUCER (`myelin_knowledge::agent::trace`): the
+# content-addressed write_agent_trace reusing the block model, the erasable AgentTraceHolder distinct
+# from the audit log, and the KN-D12 erase (per-subject DEK crypto-shred, attribution falls back to the
+# pseudonym). The Knowledge-slice CDC below pins that PRODUCER agrees with the Fabric CONSUMER seam (the
+# same blake3:<hex> over the same 13.1 Vec<Block>) + the GDPR-service H17 id (one name across the seam).
 status = "covered"
 cdc = [
     "crates/myelin-gdpr-service/tests/cdc_8_8_agent_trace_seam.rs",
     "crates/myelin-agent-service/tests/drills_ag_p19_knowledge_tools.rs",
+    "crates/myelin-knowledge/tests/cdc_8_8_knowledge_agent_trace.rs",
 ]
 
 # ──────────────── §9 Durable workflow (myelin-flow) ─────────────────────────────────────────────
