@@ -2366,6 +2366,7 @@ dependencies = [
  "myelin-content",
  "myelin-events",
  "myelin-gdpr",
+ "myelin-gdpr-service",
  "myelin-harness",
  "myelin-identity",
  "myelin-identity-service",

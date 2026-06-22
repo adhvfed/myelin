@@ -177,3 +177,10 @@ myelin-identity-service = { path = "../myelin-identity-service" }
 # `myelin-knowledge`, so this test-scope edge keeps the §2.9 DAG acyclic.
 myelin-agent-service = { path = "../myelin-agent-service" }
 myelin-agent = { path = "../myelin-agent" }
+# DEV-only (KN-P28 / P-318): the GDPR-service AG-7 trace-holder SEAM
+# (`myelin_gdpr_service::AGENT_TRACE_HOLDER_ID`, P-GA-26) — the contract-8.8 cross-check pins that the
+# Knowledge-side trace HOLDER id (`agent::trace::TRACE_HOLDER_ID`) IS the H17 `agent_fabric_trace` id
+# the seam registers (ONE name across the seam, no parallel id). DEV-dependency ONLY:
+# `myelin-gdpr-service` does NOT depend on `myelin-knowledge`, so this test-scope edge keeps the §2.9
+# DAG acyclic.
+myelin-gdpr-service = { path = "../myelin-gdpr-service" }
