@@ -10,6 +10,16 @@
 //! no-host-exec `WireExecutor` port), this is the THIN catalogue registration. See
 //! [`git_history_rewrite_tool_def`] / [`git_scip_index_tool_def`].
 //!
+//! **GIT-P28 → P-289 (M3-G6) further extends this registration site** with the four AGENT
+//! AUTHOR/REVIEWER tools (§7) — agents as FIRST-CLASS, legible, bounded authors/reviewers:
+//! `git.comment` / `git.submit_review` / `git.suggest_change` / `git.resolve_thread`, all reversible
+//! `Mutate` → `EffectApi::apply`, all `requires_approval = no` (the frozen §6.3 default — the ONLY
+//! consequential git gate stays `git.merge`). Their identity constants + the `pull_request.review`
+//! `required_caps` + the `Authorship` legibility value (ADR-08 / AI-Act — never disguised as human)
+//! live in `myelin_git::agent_author`; this is the THIN catalogue registration. See
+//! [`git_comment_tool_def`] / [`git_submit_review_tool_def`] / [`git_suggest_change_tool_def`] /
+//! [`git_resolve_thread_tool_def`] / [`git_author_tool_defs`].
+//!
 //! **Owning architecture doc:**
 //! `planning/05-refined-shared-systems-architecture/agent-fabric.md` §6.1 (ONE catalogue, two
 //! front-ends — every subsystem registers typed [`ToolDef`]s into the ONE shared [`ToolSurface`];
@@ -65,6 +75,7 @@
 //!   MCP-exposed at v1 (internal-loop only).
 
 use myelin_agent::{EffectKind, ToolDef, ToolName, ToolSurface};
+use myelin_git::agent_author as git_author;
 use myelin_git::code_tools as git_code;
 use myelin_git::rebac_fragment::object_types as git_objects;
 
@@ -226,18 +237,106 @@ pub fn git_scip_index_tool_def() -> ToolDef {
     })
 }
 
-/// **The four Git producer ToolDefs, in catalogue order** — the two producer mutations (`git.merge`
-/// gated, `open_pr` reversible, P-267) + the two CODE-EXECUTING tools on the unified sandbox
-/// (`git.history_rewrite` gated/`Mutate`, `git.scip_index` `Compute`, P-283). The single list every
-/// registration + CDC consumes (one source of truth — a drift in any def is caught once). Each is
-/// SEEDED from the frozen §6.3 defaults.
-pub fn git_tool_defs() -> Vec<ToolDef> {
+// ───────────── the AGENT AUTHOR/REVIEWER ToolDefs (GIT-P28 → P-289, M3-G6) ────────────────────────
+//
+// Agents as FIRST-CLASS, legible, bounded authors/reviewers (§7). An agent can comment, submit a
+// review, suggest a committable change, and resolve a thread — exactly the way a human principal can,
+// through the SAME plan-then-apply `EffectApi` (8.2), governed by the SAME caps (the frozen
+// `pull_request.review` permission, 4.9) as any principal. Authoring is REVERSIBLE/advisory, so every
+// one is `requires_approval = no` (the frozen §6.3 default — suggest-by-default, VISION §3); the ONLY
+// consequential git gate stays `git.merge`. Legibility (ADR-08 / AI-Act — an agent author is never
+// disguised as a human) is the GIT-domain `myelin_git::agent_author::Authorship` value the public
+// endpoint stamps, NOT an approval gate. These are PURE registration data (a `ToolDef` is a row in the
+// ONE registry, EI-03 §4) — no new engine; the routing/gating/HITL are the existing pipeline.
+
+/// **An agent author/reviewer ToolDef (8.1 / §7) — a reversible `Mutate` tool → `EffectApi::apply`,
+/// NOT gated.** Builds the frozen-shape def for one of the §7 authoring tools (`comment` /
+/// `submit_review` / `suggest_change` / `resolve_thread`): `effect_kind = Mutate` (routes through
+/// plan-then-apply — agents NEVER write directly), `required_caps = [pull_request.review]` (4.9 — the
+/// SAME permission a human reviewer is governed by, sourced from `myelin_git::agent_author`),
+/// `requires_approval` SEEDED from the frozen §6.3 default (`false` — reversible). `exposed_over_mcp =
+/// false` (internal-loop only at v1; the external MCP endpoint is the post-M5 follow-on AG-P25).
+fn git_author_tool_def(name: &str, input_schema: &str) -> ToolDef {
+    seed_requires_approval(ToolDef {
+        name: ToolName(name.to_string()),
+        subsystem: GIT_SUBSYSTEM.to_string(),
+        version: git_author::GIT_AUTHOR_TOOL_VERSION,
+        input_schema: input_schema.to_string(),
+        required_caps: git_author::review_authoring_required_caps(),
+        effect_kind: EffectKind::Mutate,
+        side_effecting: true,
+        // SEEDED below from §6.3 (a reversible authoring tool is NOT gated).
+        requires_approval: false,
+        exposed_over_mcp: false,
+    })
+}
+
+/// **`git.comment` (8.1 / §7)** — an agent posts an inline/thread comment (agent legibly labelled).
+/// Reversible (a comment can be edited/deleted) → NOT gated; routes through `EffectApi::apply`.
+pub fn git_comment_tool_def() -> ToolDef {
+    git_author_tool_def(
+        git_author::COMMENT_TOOL,
+        r#"{"type":"object","required":["pull_request","body"],"properties":{"pull_request":{"type":"string"},"body":{"type":"string"},"thread":{"type":"string"}}}"#,
+    )
+}
+
+/// **`git.submit_review` (8.1 / §7)** — an agent submits a review (approve / request-changes /
+/// comment). The agent reviewer rides `git.review.submitted` with `is_agent = true` (legibility,
+/// `myelin_git::agent_author::Authorship`). Reversible (a review can be dismissed) → NOT gated.
+pub fn git_submit_review_tool_def() -> ToolDef {
+    git_author_tool_def(
+        git_author::SUBMIT_REVIEW_TOOL,
+        r#"{"type":"object","required":["pull_request","verdict"],"properties":{"pull_request":{"type":"string"},"verdict":{"type":"string","enum":["approve","request_changes","comment"]},"body":{"type":"string"}}}"#,
+    )
+}
+
+/// **`git.suggest_change` (8.1 / §7)** — an agent proposes a committable suggestion on a PR. A human
+/// applies or dismisses it (reversible) → NOT gated; routes through `EffectApi::apply`.
+pub fn git_suggest_change_tool_def() -> ToolDef {
+    git_author_tool_def(
+        git_author::SUGGEST_CHANGE_TOOL,
+        r#"{"type":"object","required":["pull_request","path","suggestion"],"properties":{"pull_request":{"type":"string"},"path":{"type":"string"},"suggestion":{"type":"string"}}}"#,
+    )
+}
+
+/// **`git.resolve_thread` (8.1 / §7)** — an agent resolves a review thread. Reversible (a thread can
+/// be re-opened) → NOT gated; routes through `EffectApi::apply`.
+pub fn git_resolve_thread_tool_def() -> ToolDef {
+    git_author_tool_def(
+        git_author::RESOLVE_THREAD_TOOL,
+        r#"{"type":"object","required":["pull_request","thread"],"properties":{"pull_request":{"type":"string"},"thread":{"type":"string"}}}"#,
+    )
+}
+
+/// **The agent author/reviewer ToolDefs, in catalogue order** (GIT-P28 → P-289) — `git.comment`,
+/// `git.submit_review`, `git.suggest_change`, `git.resolve_thread`. All reversible `Mutate` tools
+/// SEEDED `requires_approval = no` from the frozen §6.3 defaults. (`git.open_pr`, also an authoring
+/// tool, lives in the producer-mutation set — P-267 — so it is registered with the other producer
+/// mutations, not duplicated here.)
+pub fn git_author_tool_defs() -> Vec<ToolDef> {
     vec![
+        git_comment_tool_def(),
+        git_submit_review_tool_def(),
+        git_suggest_change_tool_def(),
+        git_resolve_thread_tool_def(),
+    ]
+}
+
+/// **The full Git producer ToolDef set, in catalogue order** — the two producer mutations
+/// (`git.merge` gated, `open_pr` reversible, P-267) + the two CODE-EXECUTING tools on the unified
+/// sandbox (`git.history_rewrite` gated/`Mutate`, `git.scip_index` `Compute`, P-283) + the four
+/// AGENT AUTHOR/REVIEWER tools (`git.comment` / `submit_review` / `suggest_change` / `resolve_thread`,
+/// all reversible `Mutate`, P-289). The single list every registration + CDC consumes (one source of
+/// truth — a drift in any def is caught once). Each is SEEDED from the frozen §6.3 defaults.
+pub fn git_tool_defs() -> Vec<ToolDef> {
+    let mut defs = vec![
         git_merge_tool_def(),
         open_pr_tool_def(),
         git_history_rewrite_tool_def(),
         git_scip_index_tool_def(),
-    ]
+    ];
+    defs.extend(git_author_tool_defs());
+    defs
 }
 
 // ───────────────────────── the registration seam (8.1 — into the ONE ToolSurface) ────────────────
@@ -336,7 +435,12 @@ mod tests {
     fn register_git_tools_registers_both_into_the_one_surface() {
         let mut cat = Catalogue { defs: vec![] };
         let registered = register_git_tools(&mut cat).expect("seeded defs always admit");
-        assert_eq!(registered.len(), 4, "git.merge + open_pr + history_rewrite + scip_index");
+        assert_eq!(
+            registered.len(),
+            8,
+            "merge + open_pr + history_rewrite + scip_index + comment + submit_review + \
+             suggest_change + resolve_thread"
+        );
 
         let merge = cat.resolve(&ToolName(GIT_MERGE_TOOL.into())).expect("git.merge registered");
         assert_eq!(merge.subsystem, GIT_SUBSYSTEM);
@@ -397,13 +501,55 @@ mod tests {
         assert!(!def.exposed_over_mcp, "GF-9: no external MCP endpoint at v1");
     }
 
+    // ───────────── the AGENT AUTHOR/REVIEWER tools (GIT-P28 → P-289, M3-G6) ──────────────────────
+
+    /// **The four agent author/reviewer tools are reversible `Mutate` tools → `EffectApi`, NOT gated,
+    /// governed by the frozen `pull_request.review` cap (§7 / 4.9).** Agents are FIRST-CLASS authors:
+    /// each routes through plan-then-apply (never a direct write), is seeded NOT gated from the frozen
+    /// §6.3 default (reversible/advisory — suggest-by-default), and is governed by the SAME `review`
+    /// permission a human reviewer is (EI-02 §2). The ONLY consequential git gate stays `git.merge`.
+    #[test]
+    fn git_author_tools_are_reversible_ungated_mutate_tools() {
+        for def in git_author_tool_defs() {
+            assert_eq!(def.subsystem, GIT_SUBSYSTEM);
+            // Mutate ⇒ EffectApi (plan-then-apply), never a direct write.
+            assert_eq!(def.effect_kind, EffectKind::Mutate, "{} routes through EffectApi", def.name.0);
+            assert!(def.side_effecting);
+            // NOT gated — and it IS the frozen §6.3 seed (reversible authoring).
+            assert!(!def.requires_approval, "{} is reversible authoring → NOT gated", def.name.0);
+            assert_eq!(
+                def.requires_approval,
+                requires_approval_default(GIT_SUBSYSTEM, &def.name.0),
+                "{}'s (non-)gating IS the frozen §6.3 seed (not hand-set)",
+                def.name.0
+            );
+            // governed by the frozen pull_request.review permission (4.9), from the canonical git crate.
+            assert_eq!(
+                def.required_caps,
+                vec!["pull_request.review".to_string()],
+                "{} is governed by the SAME pull_request.review cap a human reviewer is (EI-02 §2)",
+                def.name.0
+            );
+            // GF: not MCP-exposed at v1 (internal-loop only).
+            assert!(!def.exposed_over_mcp);
+        }
+        // the four author tools are exactly the §7 comment/review/suggest/resolve quartet.
+        let names: Vec<String> = git_author_tool_defs().iter().map(|d| d.name.0.clone()).collect();
+        assert_eq!(names, vec!["comment", "submit_review", "suggest_change", "resolve_thread"]);
+    }
+
     /// **The catalogue carries ALL FOUR Git producer tools, seeded from the frozen §6.3 defaults
     /// (the two mutations + the two code-executing tools).** A drift in any def's gating is caught
     /// against the frozen seed once.
     #[test]
     fn all_four_git_tools_are_seeded_from_the_frozen_defaults() {
         let defs = git_tool_defs();
-        assert_eq!(defs.len(), 4, "merge + open_pr + history_rewrite + scip_index");
+        assert_eq!(
+            defs.len(),
+            8,
+            "merge + open_pr + history_rewrite + scip_index + comment + submit_review + \
+             suggest_change + resolve_thread"
+        );
         for d in &defs {
             assert_eq!(d.subsystem, GIT_SUBSYSTEM);
             // every def's gating IS the frozen §6.3 seed (never a value local to this module).
@@ -415,16 +561,24 @@ mod tests {
                 d.name.0
             );
         }
-        // the consequential split: merge + history_rewrite gated; open_pr + scip_index not.
+        // the consequential split: merge + history_rewrite gated; ALL authoring tools (open_pr +
+        // comment + submit_review + suggest_change + resolve_thread) + scip_index NOT gated.
         let gated: Vec<&str> = defs
             .iter()
             .filter(|d| d.requires_approval)
             .map(|d| d.name.0.as_str())
             .collect();
-        assert!(gated.contains(&"merge"));
-        assert!(gated.contains(&"history_rewrite"));
+        assert_eq!(
+            gated,
+            vec!["merge", "history_rewrite"],
+            "exactly two git tools are gated: the merge gate + the consequential history-rewrite"
+        );
         assert!(!gated.contains(&"open_pr"));
         assert!(!gated.contains(&"scip_index"));
+        assert!(!gated.contains(&"comment"));
+        assert!(!gated.contains(&"submit_review"));
+        assert!(!gated.contains(&"suggest_change"));
+        assert!(!gated.contains(&"resolve_thread"));
         // exactly ONE compute (sandbox-bound) tool — the SCIP indexer.
         let compute: Vec<&str> = defs
             .iter()

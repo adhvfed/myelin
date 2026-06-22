@@ -116,6 +116,19 @@
 /// consumes (CDC-pinned). Replaces the GIT-P16 opaque `BodyRef` ciphertext floor for the body content.
 /// Floors: the typed-edge LIFECYCLE mirror (`Closes`/PR-link edges) is the DISTINCT GIT-P19 follow-on;
 /// the per-subject-DEK at-rest seal rides the GIT-P20 store wiring.
+/// **Agents as first-class, legible, bounded authors/reviewers** (GIT-P28 / P-289, M3-G6): the
+/// GIT-domain half of the agent author/reviewer surface — the tool identity constants
+/// ([`agent_author::COMMENT_TOOL`] / `SUBMIT_REVIEW_TOOL` / `SUGGEST_CHANGE_TOOL` /
+/// `RESOLVE_THREAD_TOOL`), the `required_caps` built from the frozen Git ReBAC fragment
+/// ([`agent_author::review_authoring_required_caps`] = `pull_request.review` — the SAME permission a
+/// human reviewer is governed by, EI-02 §2), and the typed [`agent_author::Authorship`] legibility
+/// value (ADR-08 / EU AI-Act: an agent author carries its provenance — which agent, which run, why —
+/// and is STRUCTURALLY never disguised as a human). Authoring is reversible → NOT HITL-gated (the
+/// ONLY consequential git gate stays `git.merge`, §6.3). Every authored effect routes through the
+/// Fabric `EffectApi::apply` (8.2 plan-then-apply, AG-D1/D2/D3); agents never write directly. The
+/// thin `ToolDef` registration lives in `myelin_agent_service::git_tools` (the §2.9 DAG — git is a
+/// leaf), keyed on this module's identity constants.
+pub mod agent_author;
 pub mod body;
 pub mod check_status;
 /// The **code-executing git tools on the unified sandbox** (GIT-P27 / P-283, M3-G6 — the AG-D4

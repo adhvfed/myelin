@@ -71,6 +71,16 @@ pub fn requires_approval_default(subsystem: &str, tool: &str) -> bool {
         // ── Git (§6.3) ──
         ("git", "merge") => true,    // merge is the consequential gate (AG-8)
         ("git", "open_pr") => false, // reversible
+        // The AGENT AUTHOR/REVIEWER surface (GIT-P28 → P-289, §7 frozen ToolDef table). Agents are
+        // FIRST-CLASS authors/reviewers (legible, bounded): every one of these is REVERSIBLE/advisory
+        // — a comment/review/suggestion/thread-resolution can be revised or dismissed — so the frozen
+        // §6.3 default is NOT gated (suggest-by-default, VISION §3). The ONLY consequential git gate
+        // stays `git.merge` (yes, above). Legibility (ADR-08 AI-Act: an agent author is never disguised
+        // as human) is carried by `myelin_git::agent_author`, not by the approval gate.
+        ("git", "comment") => false,        // inline/thread comment (agent legibly labelled)
+        ("git", "submit_review") => false,  // approve / request-changes / comment review
+        ("git", "suggest_change") => false, // a committable suggestion (reversible)
+        ("git", "resolve_thread") => false, // resolve a review thread (reversible)
         // The CODE-EXECUTING git tools (GIT-P27 → P-283, §7). history_rewrite is the audited
         // erasure-admin op — it changes every downstream hash (consequential, irreversible), so it is
         // GATED (VISION §3). scip_index is a read-only code-intelligence index build (a `compute`
@@ -274,6 +284,22 @@ mod tests {
         assert!(
             !requires_approval_default("git", "scip_index"),
             "SCIP indexing is a read-only index build → NOT gated (governed by AG-D4, not HITL)"
+        );
+
+        // Git agent author/reviewer surface (GIT-P28 → P-289) — every authoring tool is reversible →
+        // NOT gated (suggest-by-default); only git.merge stays the consequential gate.
+        assert!(!requires_approval_default("git", "comment"), "git.comment is reversible → NOT gated");
+        assert!(
+            !requires_approval_default("git", "submit_review"),
+            "git.submit_review is reversible → NOT gated"
+        );
+        assert!(
+            !requires_approval_default("git", "suggest_change"),
+            "git.suggest_change is reversible → NOT gated"
+        );
+        assert!(
+            !requires_approval_default("git", "resolve_thread"),
+            "git.resolve_thread is reversible → NOT gated"
         );
 
         // Issues — forecast/triage/sla_draft = no (advisory); transition = gated (ABAC floor).
