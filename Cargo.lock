@@ -2358,6 +2358,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "myelin-knowledge"
+version = "0.0.0"
+dependencies = [
+ "myelin-content",
+ "myelin-events",
+ "myelin-harness",
+ "myelin-identity",
+ "myelin-query",
+ "myelin-substrate",
+ "myelin-tenancy",
+]
+
+[[package]]
 name = "myelin-lints"
 version = "0.0.0"
 

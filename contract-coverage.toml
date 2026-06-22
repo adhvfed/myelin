@@ -29,7 +29,13 @@
 row = "1.1"
 title = "serve(AppSpec) lifecycle"
 status = "covered"
-cdc = ["crates/myelin-substrate/tests/cdc_1_1_serve.rs"]
+# The substrate ships the lifecycle (PROVIDER); each service that boots over it is a CONSUMER. The
+# Knowledge service shell (KN-P04 / P-294) is one such consumer — it hands its eight-field AppSpec
+# to serve and re-implements no lifecycle. Each CDC file carries its own provider+consumer pair.
+cdc = [
+    "crates/myelin-substrate/tests/cdc_1_1_serve.rs",
+    "crates/myelin-knowledge/tests/cdc_1_1_1_5_knowledge_boot_and_hot_tables.rs",
+]
 
 [[contract]]
 row = "1.2"
@@ -59,7 +65,14 @@ cdc = [
 row = "1.5"
 title = "forward-only online migrations"
 status = "covered"
-cdc = ["crates/myelin-substrate/tests/cdc_1_4_1_5_holders_and_migrations.rs"]
+# The substrate ships the runner + the hot-table declaration MECHANISM; KN-P04 / P-294 adds the
+# Knowledge OWNED half — the `block`/`db_row`/`doc_op` hot-table-flag declaration (the high-write
+# tables KN-P05 creates) carried on the Knowledge AppSpec + proven refused-on-blocking-ALTER. Each
+# CDC file carries its own provider+consumer pair.
+cdc = [
+    "crates/myelin-substrate/tests/cdc_1_4_1_5_holders_and_migrations.rs",
+    "crates/myelin-knowledge/tests/cdc_1_1_1_5_knowledge_boot_and_hot_tables.rs",
+]
 
 # 1.6 (architecture lints) is the committed-lint RATCHET itself — a gate, not a producer⇄consumer
 # data seam, so it has no CDC pair (the lint crate's fixture matrix + workspace scan ARE its proof).

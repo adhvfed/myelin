@@ -1,0 +1,65 @@
+[package]
+name = "myelin-knowledge"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The service binary the harness runs (the "every service `main.rs`" of contract 1.1). Named
+# `knowledge` (= SERVICE_NAME) so the deployable matches the service/trace identifier.
+[[bin]]
+name = "knowledge"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+# THE Knowledge service SHELL crate (KN-P04 → P-294, M3). This prompt ships the BOOTABLE SHELL
+# ONLY: an AppSpec passed to serve(AppSpec) — boot → migrate → outbox relay (hook) → (consumer
+# seam, empty until KN-P06) → three ports → graceful drain, liveness ≠ readiness — plus the
+# hot-table-flag declaration (block / db_row / doc_op, contract 1.5) the high-write tables
+# KN-P05 will create are declared against, and the authenticate/check call-site SLOTS (4.1/4.2)
+# fail-closed until KN-P14/KN-P16 wire the per-op bodies. NOT a hand-rolled main.
+#
+# NAMED FOLLOW-ON FLOORS: the OLTP store + (tenant,region) partition + RLS land in KN-P05
+# (P-295); the transactional outbox table + the relay wiring + the consumer set land in KN-P06.
+# This shell carries the migration SKELETON those prompts extend (so the booting instance is
+# not-ready until migrations apply) and declares the hot tables — it does NOT create the high-
+# write tables itself (that is KN-P05's owned work).
+#
+# DAG POSITION (a documented, NAMED leaf consumer, like myelin-identity-service / myelin-notif /
+# myelin-git / myelin-issues / myelin-gdpr-service): it sits ABOVE the glue crates and the
+# harness — it depends on -content/-query (the frozen shapes Knowledge stores + executes),
+# -tenancy/-events/-identity (the carrier value types + the authenticate/check ABI), and
+# -substrate (the serve/AppSpec lifecycle); NOTHING in the production library DAG depends back on
+# it. It is therefore OUTSIDE the eleven-crate library DAG modelled by myelin-substrate::
+# crate_graph (substrate_is_root()/identity_is_sink() are preserved — a service main is the
+# graph's terminal consumer, not a node in it).
+[dependencies]
+# The harness: serve(AppSpec) + the three-surface topology (public/internal/metrics-health) +
+# liveness≠readiness + the outbox relay + graceful drain. The shell is an AppSpec this wires; it
+# is NOT a service that re-implements the lifecycle (contract 1.1, architecture 00 §3.1).
+myelin-substrate = { path = "../myelin-substrate" }
+# The frozen Identity & Access ABI (authenticate 4.1 / check 4.2 + the Principal/Decision/
+# Consistency types). KN-P04 wires the read/write entrypoint SLOTS against these signatures with
+# fail-closed stubs (the per-op Layer-2 check is KN-P14; full ABAC list_objects is KN-P16).
+myelin-identity = { path = "../myelin-identity" }
+# TenantId / Region / ArtifactRef value types (the verified Principal the entrypoints thread, the
+# subject ref a read/write names). The (tenant, region) partition the store enforces is KN-P05.
+myelin-tenancy = { path = "../myelin-tenancy" }
+# The EventEnvelope tier (OutboxStore / OutboxSpec carriers). The outbox relay hook is declared
+# here; the doc/row/db state-change → emit bodies + the consumer set land in KN-P06.
+myelin-events = { path = "../myelin-events" }
+# The FROZEN block + inline taxonomy (contract 13.1). Knowledge LEADS + FREEZES it (KN-P01); the
+# shell depends on it so the crate that stores + executes the taxonomy compiles against the frozen
+# shapes — the block store over it lands in KN-P05/KN-P10.
+myelin-content = { path = "../myelin-content" }
+# The FROZEN FieldType/ViewSpec/QueryAst/order_key shapes (contract 13.3). Knowledge co-owns it
+# (KN-P02/P03); the shell depends on it so the flexible-database executor (KN-P09+) compiles
+# against the frozen query shapes.
+myelin-query = { path = "../myelin-query" }
+
+[dev-dependencies]
+# The shell's boot self-test asserts against the same three-port / liveness≠readiness surface the
+# later drills read from. DEV-only — the harness never enters the knowledge production DAG.
+myelin-harness = { path = "../myelin-harness" }
