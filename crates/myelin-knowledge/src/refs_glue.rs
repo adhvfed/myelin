@@ -634,6 +634,13 @@ impl PageStore {
         self.erased.insert(reference.0.clone());
     }
 
+    /// Whether a canonical ref (root or sub-URN) is marked ERASED (a `*.erased` tombstone). The KN-P26
+    /// erase floor asserts the backlink tombstone took effect; the projector reads the same set to
+    /// degrade the ref to an `Erased` tombstone (§2.1 step 4 — never the shredded content).
+    pub fn is_erased(&self, reference: &ArtifactRef) -> bool {
+        self.erased.contains(&reference.0)
+    }
+
     /// Mark a canonical ref's subject RESTRICTED (the GDPR `restrict` flag, §6).
     pub fn mark_restricted(&mut self, reference: &ArtifactRef) {
         self.restricted.insert(reference.0.clone());
