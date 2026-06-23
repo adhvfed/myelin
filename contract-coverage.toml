@@ -2215,12 +2215,25 @@ title = "residency_verify -> SignedAttestation"
 # (PROVIDER) and the control-plane region-pin assertion (CONSUMER) AGREE — an out-of-region runner is
 # refused from both sides; the CI-R3 runner-claim drill (ci_r3_runner_claim_drill.rs) proves the gate
 # goes red on an out-of-region claim. No floor — this completes the CI residency posture begun in P-CP-17.
+# The CI-FLEET PROVIDER leg EXTENDS this same row in M4 (CI-P14 / P-357 — LANDED: the EU fleet
+# autoscaler (myelin-ci-controlplane/src/fleet.rs) is the PROVISION/WRITE side the CLAIM side (P-CP-18)
+# pairs with. The fleet's runner-row write is residency-pinned by RunnerWritePin::admit_runner_write
+# (contract 1.6 — `row.region == cell.region`, 0 cross-region runner rows; the CI-side analogue of the
+# Bus BusStreamResidency::provision write-boundary), and the fleet REPORTS its pool region via
+# FleetResidencyReport (the consumer side of 12.4) into the SAME no-global-pool aggregation — a
+# wrong-region fleet report FAILs the per-store match-of-record. The CI-fleet CDC pair below proves the
+# fleet's report (PROVIDER) and the auditor's match-of-record demand (CONSUMER) agree; the live
+# integration test (integration_ci_p14_fleet.rs, behind --features integration, PROVEN green against the
+# dev-stack Postgres) proves the region-pinned runner INSERT applies under RLS and the per-(region,pool)
+# autoscale COUNT never aggregates across regions. No floor for the write-boundary; the cell-scale CI-R3
+# residency drill at fleet scale stays CI-P31 / CI-M5.
 status = "covered"
 cdc = [
     "crates/myelin-storage/tests/cdc_12_4_storage_residency_report.rs",
     "crates/myelin-storage/tests/cdc_10_5_mirror_crossing_flag.rs",
     "crates/myelin-control-plane/tests/cdc_12_4_residency_verify_ci_coverage.rs",
     "crates/myelin-control-plane/tests/cdc_ci_r3_runner_claim_region_pin.rs",
+    "crates/myelin-ci-controlplane/tests/cdc_12_4_ci_fleet_residency_report.rs",
 ]
 
 [[contract]]
