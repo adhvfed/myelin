@@ -136,6 +136,14 @@ myelin-git = { path = "../myelin-git" }
 # the production DAG): `myelin-notif` is a leaf consumer that does not depend back on
 # `myelin-ci-controlplane`, so the test-only edge stays acyclic.
 myelin-notif = { path = "../myelin-notif" }
+# CI-P27 (P-370): the STOR-D1/D2 restore-verify gate over the CI stores
+# (tests/integration_ci_p27_restore_verify_ci_stores.rs) REUSES Storage's RestoreVerifyGate +
+# CellKillRestore and emits the measured RPO/RTO/cross-seam numbers on the SAME telemetry-assertion
+# library every restore drill uses (the harness `SignalSource`), reading the RPO/RTO bounds from the
+# versioned workspace-root `thresholds.toml` (NEVER hardcoded, EI-01 §3). Both are TEST-SUPPORT only —
+# nothing in the CI control-plane production DAG pulls `myelin-harness` or `toml` (no cycle).
+myelin-harness = { path = "../myelin-harness" }
+toml.workspace = true
 
 [features]
 default = []

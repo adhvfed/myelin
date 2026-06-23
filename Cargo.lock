@@ -2157,6 +2157,7 @@ dependencies = [
  "myelin-flow",
  "myelin-gdpr",
  "myelin-git",
+ "myelin-harness",
  "myelin-identity",
  "myelin-lints",
  "myelin-notif",
@@ -2169,6 +2170,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
+ "toml",
 ]
 
 [[package]]
