@@ -330,16 +330,22 @@ impl PersonalDataHolder for IssueHolder {
         })
     }
 
-    /// Art. 17 erasure — **STUBBED to crypto-shred here (the ISS-P05 substrate); the full fan-out is
-    /// ISS-P07 (the per-subject-DEK columns) + ISS-P31 (the full ops).** The real erase crypto-shreds
-    /// the subject's per-subject Issues DEK (`issue.pii_key_ref` / `issue_change_log.pii_key_ref`,
-    /// 11.4 — rendering the encrypted free-text, incl. backups, unrecoverable) and the per-tenant DEK
-    /// fallback where it is not, pseudonym-shreds the `assignee`/`reporter`/`actor` identity edges
-    /// (4.8), and emits the `issue.*.erased` tombstones — over issues/comments/change-log/worklog. The
-    /// issue STRUCTURE survives (delete the identity, not the fact — "Former user 8a2f", §7). The
-    /// residual is the ONE platform posture ([`ISSUE_RESIDUAL_POSTURE_REF`], 10.9 / X-7 — never
-    /// restated Issues-local). At ISS-P05 this is a well-defined no-op receipt that names ISS-P07/P31;
-    /// the per-subject DEK lever exists as schema (ISS-P05).
+    /// Art. 17 erasure — the **trait-surface** entrypoint. The FULL fan-out body landed at **ISS-P31
+    /// (P-385)**: [`crate::holder_erase::IssueEraseFanout::erase`] crypto-shreds the subject's
+    /// per-subject Issues DEK (`issue.pii_key_ref` / `issue_change_log.pii_key_ref`, 11.4 — rendering
+    /// the encrypted free-text, incl. backups, unrecoverable) over the ONE `KmsEngine`, shreds the
+    /// attachment-blob DEK, pseudonym-shreds the `assignee`/`reporter`/`actor` identity edges via
+    /// Identity's `erase` (4.8 — "Former user 8a2f" without rewriting issues others own), sets the
+    /// [`RestrictionFlag`], and emits the `issue.*.erased` tombstones — across every Issues holder, with
+    /// a per-holder receipt + post-restore re-erasure (GD-14). The issue STRUCTURE survives (delete the
+    /// identity, not the fact, §7). The residual is the ONE platform posture
+    /// ([`ISSUE_RESIDUAL_POSTURE_REF`], 10.9 / X-7 — never restated Issues-local).
+    ///
+    /// THIS trait method has no `KmsEngine` / Identity surface in its frozen 10.1 signature, so it
+    /// returns the typed aggregate receipt that the live binding (the `serve`-wired
+    /// [`crate::holder_erase::IssueEraseFanout`], which DOES hold those dependencies) backs — the DSR
+    /// orchestrator calls the fan-out directly; this is the holder-registry-facing typed surface. It is
+    /// NEVER a panic / `todo!()`.
     fn erase(&self, scope: EraseScope) -> DsrResult<EraseReceipt> {
         let (subject_id, tenant) = match &scope {
             EraseScope::Subject { subject, tenant } => {
@@ -353,9 +359,11 @@ impl PersonalDataHolder for IssueHolder {
                 ISSUE_OLTP_STORE,
                 &subject_id,
                 &tenant,
-                "no-op (ISS-P05 substrate; the per-subject/per-tenant DEK crypto-shred + pseudonym \
-                 shred + issue.*.erased tombstone fan-out over issues/comments/change-log/worklog = \
-                 ISS-P07 + ISS-P31; residual = the ONE posture 10.9/X-7, by reference)",
+                "Issues erase (the full fan-out is crate::holder_erase::IssueEraseFanout, ISS-P31): \
+                 per-subject DEK crypto-shred (free-text/change-log/comments/worklog) + attachment-blob \
+                 shred + pseudonym-map shred (4.8) + OLAP restrict + Search purge + Refs tombstone \
+                 across every holder, with post-restore re-erasure (GD-14); residual = the ONE posture \
+                 10.9/X-7, by reference",
                 None,
                 0,
             ),
@@ -507,11 +515,12 @@ mod tests {
         assert!(!flag.is_restricted(sid), "the restriction flag is cleared");
     }
 
-    /// **`erase` is STUBBED to crypto-shred (the ISS-P05 substrate) — a well-defined no-op receipt
-    /// that NAMES its ISS-P07/P31 follow-on, never a panic.** Idempotent: the same scope yields the
-    /// same content-addressed receipt (no DEK shredded yet — the structural fan-out is ISS-P07/P31).
+    /// **The trait-surface `erase` returns a typed aggregate receipt the live fan-out
+    /// ([`crate::holder_erase::IssueEraseFanout`], ISS-P31) backs — never a panic.** Idempotent: the
+    /// same scope yields the same content-addressed receipt. The trait signature has no `KmsEngine`, so
+    /// the actual crypto-shred is the fan-out the DSR orchestrator calls (proven in `holder_erase`).
     #[test]
-    fn erase_is_a_stubbed_crypto_shred_no_op_that_names_iss_p07_p31() {
+    fn erase_trait_surface_returns_a_typed_aggregate_receipt() {
         let holder = IssueHolder::new();
         let scope = EraseScope::Subject {
             subject: subject("psn:iss-7"),

@@ -215,6 +215,26 @@
 //! X-1 check-seam closes; the guard SHAPE is here ([`workflow::linked_pr_ci_green_guard`], fails closed
 //! until then).
 
+//! ## ISS-P31 / P-385 (M4-I8, the band exit) — Erasure-reaches-every-holder + post-restore re-erasure
+//! [`holder_erase`] wires the `PersonalDataHolder::erase` BODY (contract 10.1, now FULL — ISS-P05
+//! registered the holder, ISS-P07 wired the two LEVERS). [`holder_erase::IssueEraseFanout::erase`] runs
+//! the storage §5.2 algorithm over EVERY Issues holder ([`holder_erase::HolderTarget::ALL`] — pseudonym
+//! map / per-subject free-text DEK / attachment-blob DEK / OLAP+restriction / Search+embeddings / Refs),
+//! returning ONE [`holder_erase::HolderReceipt`] per holder (the ISS-D11 per-holder green artifact). It
+//! OWNS the per-subject DEK crypto-shred directly (it holds the ONE `KmsEngine` ISS-P07 sealed through —
+//! `destroy_dek` reaches the free-text/change-log/comments/worklog ciphertext live AND in backups);
+//! drives Identity's `erase` for the pseudonym-map shred (4.8 — "Former user 8a2f" without rewriting
+//! issues others own); sets the [`holder::RestrictionFlag`]; and emits the `issue.*.erased` tombstones
+//! (contract 2.7) Search/Refs/OLAP/Notif consume. Every erase records into the PII-free,
+//! non-shred-erasable [`holder_erase::IssueErasureLedger`] (10.8) so
+//! [`holder_erase::IssueEraseFanout::re_erase_after_restore`] (GD-14) re-destroys any DEK a backup
+//! restore resurrected (0 resurrected post-restore — the gate). An incomplete erase is LOUD, never a
+//! false-green ([`holder_erase::EraseFanoutError`]). FLOORS named: the third-party free-text residual is
+//! the ONE platform posture (10.9 / X-7, by reference, [`holder::ISSUE_RESIDUAL_POSTURE_REF`] —
+//! `[OPEN — LEGAL]`, R-1); the OQ-H worklog special-category classification is `[OPEN — LEGAL]` R-2 (the
+//! erasure LEVER is structural — the worklog keys per-subject, reached by the DEK shred — only the
+//! lawful-basis tag is counsel-ratified).
+
 #![forbid(unsafe_code)]
 
 pub mod app;
@@ -224,6 +244,7 @@ pub mod declares;
 pub mod dek;
 pub mod events;
 pub mod holder;
+pub mod holder_erase;
 pub mod holder_intent;
 pub mod keys;
 pub mod migrations;
@@ -424,6 +445,22 @@ pub use rollup::{
     aggregate_snapshot, recompute_incremental, rollup_recomputed_draft, walk_parent_edges,
     DebounceCoalescer, DebounceWindow, LeafFact, RecomputeOutcome, RollupAggregate, RollupConsumer,
     RollupFloors, RollupStore,
+};
+
+// ISS-P31 (P-385, M4-I8): Erasure-reaches-every-holder + post-restore re-erasure (the band-exit slice).
+// `IssueEraseFanout::erase` runs the storage §5.2 algorithm over every Issues holder (`HolderTarget::ALL`),
+// returning a `HolderReceipt` per holder (the ISS-D11 per-holder artifact) + the `issue.*.erased`
+// tombstone count; it crypto-shreds the real per-subject DEK over the ONE KmsEngine ISS-P07 sealed through
+// (free-text/change-log/comments/worklog + the attachment blob), drives Identity's `erase` for the
+// pseudonym-map shred (4.8), sets the RestrictionFlag, and records into the PII-free `IssueErasureLedger`
+// (10.8). `re_erase_after_restore` (GD-14) re-destroys any DEK a backup restore resurrected (0
+// resurrected post-restore). An incomplete erase is LOUD (`EraseFanoutError`), never a false-green.
+// FLOORS named: the third-party free-text residual is the ONE posture 10.9/X-7 by reference (R-1); the
+// OQ-H worklog special-category basis is [OPEN — LEGAL] R-2 (the erasure lever is structural + ships now).
+pub use holder_erase::{
+    store_classes_reached_by_free_text_shred, EraseFanoutError, HolderReceipt, HolderTarget,
+    IssueEraseFanout, IssueEraseOutcome, IssueErasedSubject, IssueErasureLedger,
+    IssueReErasureReceipt, ERASED_TOMBSTONE_TOKENS,
 };
 
 pub use refs_glue::{

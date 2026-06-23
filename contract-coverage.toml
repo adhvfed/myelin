@@ -1965,6 +1965,14 @@ cdc = [
     # auto-registers through the substrate one door (1.4) + classifies to H2 (0 orphans). The
     # provider+consumer pair fans the DSR out via dyn PersonalDataHolder.
     "crates/myelin-ci-controlplane/tests/cdc_10_1_ci_holder.rs",
+    # ISS-P31 / P-385 (M4-I8, the band exit) — the Issues side of 10.1, now the FULL erase BODY: the
+    # Issues holder responds to the frozen dyn PersonalDataHolder surface (provider) AND the DSR
+    # orchestrator drives IssueEraseFanout across EVERY Issues holder (HolderTarget::ALL — pseudonym map
+    # / per-subject free-text DEK / attachment-blob DEK / OLAP+restriction / Search+embeddings / Refs)
+    # with a per-holder receipt + post-restore re-erasure (GD-14). The real per-subject DEK is
+    # crypto-shredded over the ONE KmsEngine ISS-P07 sealed through; 0 PII keys resurrected post-restore.
+    # The third-party residual = the ONE posture 10.9/X-7, by reference. The provider+consumer pair.
+    "crates/myelin-issues/tests/cdc_10_1_issues_holder_erase.rs",
 ]
 
 # 10.2 — the classify-derive (five tags + subject_locator, P-GA-07) PLUS the OQ-H worklog extension
