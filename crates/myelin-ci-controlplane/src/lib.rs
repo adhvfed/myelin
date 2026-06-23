@@ -34,9 +34,11 @@
 //!     `no-untagged-personal-data` lint is GREEN on the CI schema (contract 10.2 / 4.8).
 //!
 //! ## Floors named (the per-table-behaviour follow-ons — see [`migrations`])
-//! This prompt ships the table SHAPES + the bootable shell ONLY. The per-table behaviour lands in
-//! its own prompt: the scheduler claim over `job_queue` (CI-P12), DRR fair-share over `fair_deficit`
-//! (CI-P13), the fleet autoscaler over `runner` (CI-P14), the `check_attempt` counter + the
+//! The CI-P6 shell shipped the table SHAPES + the bootable shell. The per-table behaviour lands in
+//! its own prompt: the scheduler pull-lease claim over `job_queue` + concurrency + affinity + the
+//! dead-runner reaper is now SHIPPED in [`scheduler`] (CI-P12 / P-355); DRR fair-share over
+//! `fair_deficit` (CI-P13 — the claim ORDERs on `fair_deficit.deficit DESC`, the advance/replenish is
+//! CI-P13), the fleet autoscaler over `runner` (CI-P14), the `check_attempt` counter + the
 //! `ci.check.updated` producer (CI-P18), the log index (CI-P20), trust-scoped artifacts/caches
 //! (CI-P22), reserve/settle metering into `cost_event` (CI-P17), the deploy/secret broker (CI-P24).
 //! No consumers are registered at the shell (the Trigger & Dispatch dedup consumer is the OTHER
@@ -52,6 +54,7 @@ pub mod events;
 pub mod holder;
 pub mod migrations;
 pub mod rebac_fragment;
+pub mod scheduler;
 pub mod schema;
 
 pub use holder::{
@@ -68,6 +71,11 @@ pub use events::{
 use myelin_substrate::{
     boot, serve, AppSpec, Config, CriticalDependencies, InternalRpc, OutboxSpec, PublicRoutes,
     ServeError, ServeHandle,
+};
+
+pub use scheduler::{
+    lane_token, state_token, ClaimRequest, Claimed, EnqueueOutcome, JobState, Lane, QueuedJob,
+    SchedulerState, CANCEL_SUPERSEDED_QUERY, CLAIM_QUERY, REAP_QUERY,
 };
 
 pub use migrations::{
