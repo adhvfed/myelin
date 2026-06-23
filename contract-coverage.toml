@@ -1273,6 +1273,18 @@ cdc = [
     # doubly-delivered ci.result → wakes once → merge-count == 1 (0 double-merge). CI is the producer
     # (emits the rollup signal); Git is the gate (the merge performer is Git's). Closes the X-1 seam.
     "crates/myelin-ci-controlplane/tests/drills_ci_p19_seam_gate.rs",
+    # ISS-P27 / P-394 (M4): the Issues CONSUMER half of 5.9 — the CI-red governed-transition guard. At
+    # transition time Issues reads the linked PR's CURRENT `CheckStatus{state, trust_tier}` OFF THE FACT
+    # (via `project(PR_ref)`, 5.6) into a `LinkedPrCheck` posture, binds it into the guard context, and
+    # runs `plan_transition` — "can't mark Done while CI red on the linked PR" BLOCKS with a reason; an
+    # un-endorsed `untrusted_fork` success is NEUTRAL (the poisoned-Done defence, the SAME trust posture
+    # Git's merge gate applies — Issues NEVER recomputes trust, EI-01 §7). The agent path is HITL-gated
+    # (a permitted governed transition is WITHHELD for approval — 0 pre-approval mutation, AG-8). The
+    # CDC pins that a FROZEN 5.9 `CheckStatus` payload (CI produces, Git projects) decodes into the
+    # Issues consumer posture with NO drift (the `snake_case` token vocabulary is byte-faithful; the
+    # trust tier is carried verbatim). ISS-D12 complete (transition blocked + 0 pre-approval mutation).
+    # The guard RESTS ON THE PROVEN X-1 SEAM (GIT-D10/CI-D8 GREEN end-to-end above) — not a doc claim.
+    "crates/myelin-issues/tests/e2e_iss_p27_ci_guard.rs",
 ]
 
 # ──────────────── §6 Search (myelin-search) ─────────────────────────────────────────────────────
@@ -2831,6 +2843,21 @@ row = "13.3"
 # ISS-D12 ("can't mark Done while CI red on the linked PR" — the X-1 CheckStatus + trust_tier off the
 # fact, 5.9/Δ10) lands in ISS-P27 (P-394) when the X-1 check-seam closes; the guard SHAPE
 # (linked_pr_ci_green_guard) is here and fails closed until then.
+# ISS-P27 / P-394 (M4) CLOSED THAT FLOOR — the CI-red governed-transition guard (the X-1 consumer half).
+# `myelin_issues::ci_guard` LIVE-BINDS the linked PR's CURRENT `CheckStatus{state, trust_tier}` OFF THE
+# FACT (read via `project(PR_ref)`, 5.6) into the guard context (`bind_linked_pr_ctx`) and runs
+# `plan_transition` (`plan_ci_gated_transition`): "can't mark Done while CI red on the linked PR" BLOCKS
+# with a reason; an un-endorsed `untrusted_fork` success is NEUTRAL (the poisoned-Done defence —
+# `LinkedPrCheck::is_acceptable` is the SAME trust posture Git's merge-gate `is_acceptable_satisfaction`
+# applies, no second trust algebra). Issues NEVER recomputes trust — the CI-stamped tier is bound
+# verbatim off the fact. The AGENT path is HITL-gated (`plan_agent_ci_gated_transition` →
+# `AgentTransitionOutcome::WithheldForApproval` — a permitted governed transition is WITHHELD, 0
+# pre-approval mutation, AG-8). ISS-D12 is COMPLETE (transition blocked + 0 pre-approval mutation, the
+# green artifact) in the e2e/drill/CDC `crates/myelin-issues/tests/e2e_iss_p27_ci_guard.rs` (chained:
+# Done blocked while CI red → green → allowed; the agent HITL-gate; the poisoned-Done fork drill; the
+# 5.9 consumer CDC — a frozen 5.9 payload decodes into the consumer posture with no drift). The guard
+# RESTS ON THE PROVEN X-1 SEAM (GIT-D10/CI-D8 GREEN end-to-end, row 5.9 `covered`), not a doc claim — no
+# floor new, no trust recomputed to fake green.
 # ISS-P16 / P-382 (M4): Issues now BUILDS the co-equal ViewSpec VIEWS over the 13.3 view-model — the
 # seven canonical views (board/roadmap/backlog/list/table/calendar/cycle) are each a frozen
 # myelin_query::ViewSpec projection over the ONE issue table (myelin_issues::views::IssueView::spec —
@@ -2851,6 +2878,7 @@ cdc = [
     "crates/myelin-issues/tests/cdc_13_3_issues_coown.rs",
     "crates/myelin-issues/tests/drill_iss_d5_reorder_zero_clobber.rs",
     "crates/myelin-issues/tests/e2e_iss_p12_workflow_fsm.rs",
+    "crates/myelin-issues/tests/e2e_iss_p27_ci_guard.rs",
     "crates/myelin-knowledge/tests/cdc_13_3_6_3_knowledge_flex_db.rs",
     "crates/myelin-knowledge/tests/cdc_13_3_4_3_knowledge_rollup.rs",
 ]
