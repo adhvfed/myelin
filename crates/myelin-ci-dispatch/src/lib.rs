@@ -25,7 +25,7 @@
 //!     starts the workflow on; `authz` — the ReBAC `read & !is_untrusted_fork` edge the trust-tier
 //!     evaluation reads; the OLTP store is implicitly critical) for the readiness probe (§4.3).
 //!
-//! ## The dispatch BEHAVIOUR — CI-P10 (P-353) landed it in [`dispatch`]
+//! ## The dispatch BEHAVIOUR — CI-P10 (P-353) + the resolve/start (CI-P11, P-354)
 //! CI-P6 (this shell) shipped the dedup-ledger SHAPE; **CI-P10 (P-353) lands the dispatch
 //! behaviour** in the [`dispatch`] module ON TOP of that ledger: the [`compile_trigger`]
 //! `EventMatcher` (= the frozen `QueryAst`, contract 3.4 — a `pull_request` trigger IS a `QueryAst`,
@@ -35,13 +35,31 @@
 //! `myelin-query` matcher engine and the already-frozen `myelin-ci-sandbox` / `myelin-git` trust
 //! enums — no second trigger language, no third trust enum.
 //!
-//! ## Floor named (the dispatch-behaviour follow-on)
-//! The definition resolution → content-addressed snapshot + the reserve/start handoff is **CI-P11**
-//! (P-354); the sandboxed dynamic-generation escape hatch is wired in **CI-P11**. The [`dispatch`]
-//! module stops at the matched, deduped, trust-stamped trigger — it produces the stamped
-//! [`TrustStamp`] + the dedup verdict; it does NOT read `.myelin/ci.*`, build the CAS snapshot, or
-//! call `DurableExecutor::start`. The shell below registers no consumer yet — the live trigger
-//! consumer (the bus subscription that drives this behaviour) lands with CI-P11's reserve/start.
+//! ## CI-P11 (P-354) — the definition resolution → CAS snapshot + the reserve/start handoff
+//! **CI-P11 (P-354) lands the resolve/start** in the [`resolve`] module ON TOP of CI-P10's stamped
+//! trigger: [`resolve::resolve_snapshot`] reads a parsed `.myelin/ci.*` [`resolve::CiDefinition`],
+//! validates the DAG, **resolves every image to a digest FAIL-CLOSED** (a floating tag is rejected —
+//! 0 un-digested references reach a snapshot), expands the matrix deterministically, and writes the
+//! resolved DAG as a **T2 CAS blob** (`myelin_storage::BlobStore`, contract 11.2). Then
+//! [`resolve::reserve_and_start`] builds the **atomic reserve+start handoff**
+//! ([`resolve::StartHandoff`]): the `StartSpec` for the `ci.pipeline` workflow
+//! (`myelin_flow::DurableExecutor::start`, contract 9.1) + the `ci_run` row + `ci.run.started` + the
+//! first `ci.check.updated{state: queued}` per context (via the outbox, contract 2.2) — committed in
+//! ONE tx (no partial run).
+//!
+//! ## Floors named (CI-P11 DoD)
+//! - the **sandboxed dynamic-generation escape hatch** is HOOKED here
+//!   ([`resolve::ResolvedSnapshot::has_dynamic_generation`] — a `Generate` job is a normal
+//!   digest-pinned job on the CI-P3 runner, the SAME sandbox as any untrusted code, NO privileged
+//!   config-eval path); the in-sandbox EXECUTION of the generation step lands with the runner + the
+//!   `ci.pipeline` body (**CI-P15**);
+//! - the **tag→digest registry resolution** (the real lookup + sigstore verify) is **CI-P23**
+//!   (CI-D4); CI-P11 enforces the fail-closed PLAN-time half only.
+//!
+//! The shell below still registers no consumer — the LIVE bus-subscription consumer that drives
+//! match→dedup→stamp→resolve→start end-to-end on each triggering event is the named follow-on; this
+//! prompt ships the pure resolve/start core ([`resolve`]) the consumer will call, proven
+//! deterministically (the CAS round-trip + the atomic-bundle invariant), DB-free by default.
 //!
 //! ## DB-free by default; the live-stack proof behind `integration`
 //! `cargo build --workspace` / `cargo test --workspace` stay DB-free. The REAL forward-only apply
@@ -50,10 +68,17 @@
 
 pub mod dispatch;
 pub mod migrations;
+pub mod resolve;
 
 pub use dispatch::{
     classify_trust, compile_trigger, git_trust_of, stamp_trust, trigger_matches, DedupLedger,
     OnTrigger, RunProvenance, TrustStamp, TrustTier, RUN_OBJECT_TYPE, TRIGGER_CONSUMER,
+};
+
+pub use resolve::{
+    reserve_and_start, resolve_snapshot, snapshot_ref, CheckContext, CiDefinition, CiRunWrite,
+    JobDef, JobKind, ResolveError, ResolvedJob, ResolvedSnapshot, RunFacts, StartHandoff,
+    StartSpec, CI_PIPELINE_WF_TYPE,
 };
 
 use myelin_substrate::{

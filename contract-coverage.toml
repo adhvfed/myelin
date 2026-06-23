@@ -1552,8 +1552,18 @@ cdc = [
 [[contract]]
 row = "9.1"
 title = "DurableExecutor{start, signal, describe, cancel}"
-status = "deferred"
-landing = "P-203"
+status = "covered"
+# The PROVIDER half (the engine-agnostic start/describe/cancel control surface + the per-effect
+# idem_key rule) shipped in myelin-flow (P-203 + siblings); its CDC is cdc_9_1_executor.rs.
+# CI-P11 (P-354, M4) adds the CI Trigger & Dispatch CONSUMER half: the reserve/start handoff
+# (myelin_ci_dispatch::resolve::reserve_and_start) builds StartSpec{ wf_type: "ci.pipeline",
+# input: [snapshot_ref], idem_key } and hands it to DurableExecutor::start (9.1) — a re-delivered
+# trigger is ONE run (idempotent on idem_key), started on the references-not-payloads CAS snapshot
+# ref. The prior `deferred → P-203` marker was stale (P-203 had shipped the provider + its CDC).
+cdc = [
+    "crates/myelin-flow/tests/cdc_9_1_executor.rs",
+    "crates/myelin-ci-dispatch/tests/cdc_ci_p11_resolve_dispatch.rs",
+]
 
 [[contract]]
 row = "9.2"
@@ -1912,6 +1922,12 @@ status = "covered"
 # (--features integration: a fork write to trusted is refused BEFORE any byte hits the real bucket; the
 # fork reads trusted; the fork's own scope round-trips; 0 cross-scope landings). The C5 OLAP
 # restriction-flag gate is the sibling → P-ST-29 (P-331). Ties to X-1.
+# P-354 (CI-P11, M4): the CI Trigger & Dispatch CONSUMER of the CAS snapshot — the
+# definition-resolution (myelin_ci_dispatch::resolve::resolve_snapshot) serialises the resolved,
+# matrix-expanded, digest-pinned DAG to canonical JSON and PUTs it as a T2 content-addressed blob
+# (the run's reproducible, auditable definition — IDENTICAL to `myelin ci plan`, shift-left). The
+# content address round-trips (the consumer reads the SAME bytes back) and is reproducible (the same
+# definition → the same BLAKE3 address). Consumer CDC: cdc_ci_p11_resolve_dispatch.rs.
 cdc = [
     "crates/myelin-storage/tests/cdc_11_2_blobstore.rs",
     "crates/myelin-storage/tests/cdc_11_2_git_pack_tier.rs",
@@ -1920,6 +1936,7 @@ cdc = [
     "crates/myelin-storage/tests/cdc_11_2_c4_trust_scoped_cache.rs",
     "crates/myelin-git/tests/cdc_11_2_git_pack_tier_consumer.rs",
     "crates/myelin-git/tests/cdc_11_2_c3_git_bundle_uri.rs",
+    "crates/myelin-ci-dispatch/tests/cdc_ci_p11_resolve_dispatch.rs",
 ]
 # P-276 (GIT-P15): the GIT-SIDE consumer of the C3 within-EU CDN clone/bundle class — the bundle-URI
 # accelerated-clone path (myelin-git/src/shed_clone.rs BundleUriClone) CONSUMES the storage
