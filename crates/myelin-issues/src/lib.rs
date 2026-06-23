@@ -288,6 +288,7 @@ pub mod replay;
 pub mod rollup;
 pub mod schema;
 pub mod schemes;
+pub mod sla_calendar;
 pub mod sla_escalation;
 pub mod time_axis;
 pub mod trigger;
