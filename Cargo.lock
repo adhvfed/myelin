@@ -2150,9 +2150,11 @@ version = "0.0.0"
 dependencies = [
  "myelin-ci-sandbox",
  "myelin-events",
+ "myelin-flow",
  "myelin-gdpr",
  "myelin-identity",
  "myelin-lints",
+ "myelin-refs",
  "myelin-substrate",
  "myelin-tenancy",
  "serde_json",

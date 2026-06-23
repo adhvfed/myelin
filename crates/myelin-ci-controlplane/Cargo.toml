@@ -57,6 +57,16 @@ myelin-ci-sandbox = { path = "../myelin-ci-sandbox" }
 # cycle: `myelin-identity` has no edge back to `myelin-ci-controlplane` (a leaf consumer, nothing in the
 # DAG depends on it).
 myelin-identity = { path = "../myelin-identity" }
+# CI-P15 (P-358): the `ci.pipeline` DURABLE WORKFLOW BODY composes the FROZEN `myelin-flow` durable
+# substrate — `WfCtx` (contract 9.2), `run_ci_pipeline` (the `SCHEDULE_AND_RUN_JOB` long-park idiom,
+# 9.4), the per-stage reserve/settle bookend (11.7), and the SLA timer wheel (9.3). The CI body OWNS
+# only the X-1 PRODUCER side over that substrate (the per-context `ci.check.updated` terminal facts +
+# `ci.run.failed`/`ci.run.succeeded` + the `ci.result` rollup signal). NO cycle: `myelin-flow` has no
+# edge back to `myelin-ci-controlplane` (it is the durable-execution engine; CI is a leaf consumer).
+myelin-flow = { path = "../myelin-flow" }
+# The references-not-payloads `ArtifactRef` (contract 5.7) every X-1 check fact rides
+# (`run`/`details_ref` refs, never log bytes). The frozen Refs contract surface — a leaf edge.
+myelin-refs = { path = "../myelin-refs" }
 # CI-P14 (P-357): the fleet events are `EventDraft`s whose payload is a `serde_json::Value` (the
 # frozen envelope payload shape) — runner-id / region / pool / health, PII-free. The workspace
 # serde_json (the same crate the envelope payload uses); no new myelin edge.
