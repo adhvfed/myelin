@@ -2408,14 +2408,18 @@ dependencies = [
  "myelin-gdpr",
  "myelin-identity",
  "myelin-identity-service",
+ "myelin-lints",
  "myelin-notif",
  "myelin-query",
  "myelin-refs",
  "myelin-search",
  "myelin-storage",
+ "myelin-substrate",
  "myelin-tenancy",
  "serde",
  "serde_json",
+ "sqlx",
+ "tokio",
 ]
 
 [[package]]
