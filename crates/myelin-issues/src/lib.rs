@@ -173,6 +173,24 @@
 //! storage layer's ([`dek`], ISS-P07 — `content` is the cleartext document); the structured-node →
 //! `refs.edge.created` emission is the Issues Refs-producer band (the node walk is
 //! [`content::IssueContent::structured_nodes`]).
+//!
+//! ## ISS-P11 / P-377 (M4) — governance schemes + the precedence algebra + the flexible-field model
+//! [`schemes`] ships the BEHAVIOUR over the ISS-P05 `scheme`/`scheme_assignment` tables (the schema
+//! floor named this prompt): the five interpreted scheme kinds ([`schemes::SchemeKind`] —
+//! workflow/field/permission/sla/type, byte-identical to the `scheme.kind` CHECK vocabulary), the
+//! deterministic, CACHED, off-the-hot-path scheme-precedence algebra
+//! ([`schemes::SchemeResolver`]/[`schemes::resolve`] — most-specific-wins over the fixed eight-row
+//! `(type × project × team)` lattice; the write loads the ALREADY-RESOLVED compiled scheme via
+//! [`schemes::SchemeResolver::load_resolved`], never resolves precedence inline) and the
+//! flexible-field model ([`schemes::FlexibleField`]/[`schemes::add_flexible_field`] — a custom field
+//! is a JSONB `props` write + a default-GIN-indexable facet over `issue_props_gin`, NEVER a DDL). A
+//! scheme reassignment is a CONFIG write — [`schemes::Reassignment`] proves `issue_rows_touched == 0`
+//! (the no-config = Linear-simple gate). The `FieldType` on a `field` scheme is the frozen
+//! [`myelin_query::FieldType`] (contract 13.3 — no second vocabulary). FLOORS named: the hierarchy is
+//! a TREE parent (constrained-DAG portfolios are M5+, [`schemes::TypeDef`]); the projection-feeder
+//! generated-index promotion is ISS-P15 (a cold facet rides the GIN index until a measured OQ-C
+//! threshold, [`schemes::IndexPosture`]). The FSM interpreter + the QueryAst guards that RUN the
+//! workflow body are the next prompt, ISS-P12.
 
 #![forbid(unsafe_code)]
 
@@ -191,6 +209,7 @@ pub mod rebac_fragment;
 pub mod reorder;
 pub mod replay;
 pub mod schema;
+pub mod schemes;
 pub mod sla_escalation;
 pub mod write_path;
 
@@ -282,4 +301,18 @@ pub use reorder::{
 pub use content::{
     emit_content_event, is_issue_block, paragraph_body, roundtrips_md, validate_subtree,
     CasConflict, ContentError, ContentKind, IssueContent, SubsetError, ISSUES_EXCLUDED_BLOCKS,
+};
+
+// ISS-P11 (P-377, M4): governance schemes + the precedence algebra + the flexible-field model.
+// `SchemeResolver`/`resolve` is the deterministic, cached, off-the-hot-path most-specific-wins
+// precedence algebra over the fixed eight-row (type × project × team) lattice; `load_resolved` is the
+// write-path seam (loads the already-resolved compiled scheme, never resolves inline). `Reassignment`
+// proves a scheme reassignment is a CONFIG write (0 issue rows touched). `FlexibleField`/
+// `add_flexible_field` is the zero-DDL JSONB property-bag custom-field model (default GIN over
+// issue_props_gin). FLOORS named in `schemes`: the hierarchy is a tree parent (DAG portfolios M5+);
+// the projection-feeder generated-index promotion is ISS-P15. The FSM interpreter is ISS-P12.
+pub use schemes::{
+    add_flexible_field, org_default_scheme_id, resolve, specificity_rank, FlexibleField,
+    FlexibleFieldWrite, IndexPosture, Reassignment, ResolveContext, ResolveKey, Scheme,
+    SchemeAssignment, SchemeKind, SchemeResolver, TypeDef, TypeSchemeBody,
 };

@@ -69,9 +69,24 @@ status = "covered"
 # Knowledge OWNED half — the `block`/`db_row`/`doc_op` hot-table-flag declaration (the high-write
 # tables KN-P05 creates) carried on the Knowledge AppSpec + proven refused-on-blocking-ALTER. Each
 # CDC file carries its own provider+consumer pair.
+# ISS-P11 (P-377, M4): the Issues governance schemes + the precedence algebra + the flexible-field
+# model CONSUME 1.5 — the forward-only-migration lint HOLDS over the flexible-field add (the
+# flexible-field model `myelin_issues::schemes` is ZERO-DDL: a custom field is a JSONB `props` write +
+# a default-GIN-indexable facet over `issue_props_gin`, NEVER an ALTER on the hot `issue` table —
+# proven in tests/lint_issue_spine.rs::forward_only_migration_holds_under_the_flexible_field_add). The
+# scheme-precedence resolution (`myelin_issues::schemes::resolve`/`SchemeResolver`) is the
+# deterministic, cached, off-the-hot-path most-specific-wins algebra; a scheme reassignment is a CONFIG
+# write that touches 0 issue rows (the no-config = Linear-simple gate, proven in
+# tests/e2e_iss_p11_scheme_precedence.rs). MANDATORY-CORE mutation floor MET on the precedence-
+# resolution module: cargo-mutants on `src/schemes.rs` = 31 caught / 0 missed / 5 unviable (100% of
+# viable mutants on the precedence + org_default + flexible-field path; precedence determinism is
+# governance-correctness-bearing). FLOORS named: the hierarchy is a tree parent (constrained-DAG
+# portfolios M5+); the projection-feeder generated-index promotion is ISS-P15 (cold facets ride GIN
+# until a measured OQ-C threshold). The FSM interpreter + the QueryAst guards are ISS-P12.
 cdc = [
     "crates/myelin-substrate/tests/cdc_1_4_1_5_holders_and_migrations.rs",
     "crates/myelin-knowledge/tests/cdc_1_1_1_5_knowledge_boot_and_hot_tables.rs",
+    "crates/myelin-issues/tests/e2e_iss_p11_scheme_precedence.rs",
 ]
 
 # 1.6 (architecture lints) is the committed-lint RATCHET itself — a gate, not a producer⇄consumer

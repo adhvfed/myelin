@@ -108,3 +108,35 @@ fn forward_only_migration_is_green_over_the_issue_migrations() {
         "forward-only-migration MUST be GREEN over the issue-spine migration source (additive CREATEs only)"
     );
 }
+
+/// **ISS-P11 / P-377 — the forward-only-migration lint HOLDS over the flexible-field add (0
+/// destructive migrations).** The flexible-field model (`src/schemes.rs`) is ZERO-DDL: adding a
+/// custom field is a JSONB `props` write + a GIN-indexable facet, NOT an `ALTER TABLE`. So the
+/// `schemes` source introduces no migration at all (no DROP, no blocking ALTER on a hot table) — the
+/// lint admits it. This is the prompt's "the forward-only-migration lint holds on the hot tables
+/// under a flexible-field add" gate (the flexible field rides the existing `issue_props_gin` GIN
+/// index over the hot `issue` table, never altering it).
+#[test]
+fn forward_only_migration_holds_under_the_flexible_field_add() {
+    let src = include_str!("../src/schemes.rs");
+    assert!(
+        forward_only_migration().run(src).is_empty(),
+        "forward-only-migration MUST be GREEN over the flexible-field model source (zero-DDL — no ALTER on the hot issue table)"
+    );
+    // The flexible-field model performs NO DDL at all (the zero-DDL guarantee, design rule 2): no
+    // DDL STRING LITERAL exists in the source (a custom field is a JSONB write, not an ALTER). We
+    // scan for a DDL keyword inside a string literal — prose in doc comments naming "ALTER TABLE" as
+    // the thing it does NOT do is not a violation; an executable DDL literal would be.
+    for line in src.lines() {
+        let code = line.trim_start();
+        // Skip doc/line comments (the prose that explains the zero-DDL guarantee).
+        if code.starts_with("//") {
+            continue;
+        }
+        let upper = code.to_ascii_uppercase();
+        assert!(
+            !upper.contains("ALTER TABLE") && !upper.contains("DROP TABLE"),
+            "the flexible-field model performs no DDL in code (a custom field is a JSONB write): {line}"
+        );
+    }
+}
