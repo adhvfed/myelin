@@ -54,6 +54,7 @@ pub mod artifact_cache;
 pub mod check_emitter;
 pub mod ci_pipeline;
 pub mod ci_result_signal;
+pub mod deployment;
 pub mod events;
 pub mod fairness;
 pub mod fleet;
@@ -66,6 +67,7 @@ pub mod rebac_fragment;
 pub mod schedule_and_run_job;
 pub mod scheduler;
 pub mod schema;
+pub mod secret_broker;
 pub mod supply_chain;
 
 // CI-P15 (P-358): the `ci.pipeline` DURABLE WORKFLOW BODY + the X-1 producer side. The deterministic
@@ -119,6 +121,36 @@ pub use ci_result_signal::{CiResultSignal, RollupDelivery};
 pub use supply_chain::{
     BuildIdentity, KeylessSignature, RekorLog, Sbom, SbomFormat, SlsaProvenance,
     SupplyChainVerifier, VerificationFailure,
+};
+
+// CI-P24 (P-367, M4, drill CI-D7): the IN-BOUNDARY SECRET BROKER (arch 02 §7.3). The `JobSpec` carries
+// secret NAMES (`SecretRef`); the broker resolves them AFTER the sandbox is up, scoped to EXACTLY this
+// job's references, via the shared secret capability (placed under Id/GDPR). The two structural
+// defences: (1) a fork-tier run short-circuits to ZERO secrets BEFORE any authz check (the
+// `!is_untrusted_fork` arm by construction — CI-D7's "0 fork secret reads"); (2) a trusted run resolves
+// ONLY its referenced names AND only those its subject can `read` via the DIRECT NARROW
+// `secret#direct_reader` grant (CI-1, contract 4.9). OIDC short-lived audience-scoped federated
+// credentials (4.7) over static keys; a fork is refused those too. MUTATION-SCORE FLOOR: the broker is
+// mandatory-core (security-load-bearing) — `cargo-mutants` ≥ 90% viable mutants caught. FLOOR named:
+// none new (the broker composes the FROZEN `SecretRef`/`TrustTier`/`IdentityService::check` surfaces).
+pub use secret_broker::{
+    OidcCredential, ResolvedSecret, SecretBroker, SecretCapability, SecretOutcome,
+    SecretResolution, WithholdReason, SECRET_READ_PERMISSION,
+};
+
+// CI-P24 (P-367, M4): DEPLOYMENTS & the protected-env HITL gate (arch 03 §1.2). The deploy state
+// machine + the gate composition over the FROZEN `myelin-flow` HITL substrate: the per-effect `idem_key`
+// (OQ-F) makes a DOUBLE-CLICK ONE apply + a DECLINED deploy WITHHELD (returns Denied, 0 mutation, AG-8);
+// the approver set resolves via `list_subjects(environment, approve)` (4.4); the `ci.deployment.*` event
+// drafts ride the OUTBOX (the only emit path); rollback is first-class (`ci.deployment.rolled_back` —
+// reversibility). FLOOR named: none new (composes frozen myelin-flow signals + the frozen
+// `requires_approval` defaults X-6 + the frozen `ci.deployment.*` tokens).
+pub use deployment::{
+    deploy_outcome_of, deploy_requires_approval, deployment_approval_required_draft,
+    deployment_approved_draft, deployment_failed_draft, deployment_rejected_draft,
+    deployment_requested_draft, deployment_rolled_back_draft, deployment_started_draft,
+    deployment_succeeded_draft, resolve_approvers, DeployGate, DeployGateOutcome, DeployState,
+    ENVIRONMENT_APPROVE_PERMISSION,
 };
 
 // CI-P16 (P-359): the `SCHEDULE_AND_RUN_JOB` dispatch handshake into CI's `job_queue` + the
