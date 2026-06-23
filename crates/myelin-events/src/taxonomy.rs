@@ -70,7 +70,17 @@ pub const ARTIFACT_TYPE_TOKENS: &[&str] = &[
     "run",
     "check",
     "log",
-    "artifact", // issue
+    "artifact",
+    // CI's remaining canonical-root type tokens (CI-P25 / P-368): the cross-fabric `ArtifactRef`
+    // mints `project(ref, viewer)` resolves are `myelin://<t>/ci/{run|deployment|pipeline|runner|
+    // artifact}/<id>` (continuous-integration §7.1). `run`/`artifact` were already present (the
+    // `#step-<n>`/`L<a>-L<b>` mints attach to `run`; `check`/`log` are the X-1 + log roots); the
+    // deployment/pipeline/runner canonical roots are added here so CI's run-unfurl / PR-context-pane
+    // / deploy-card refs parse to a grammatical URN root — the SAME EB-24 root-type extension git
+    // (`repo`/`commit`/`blob`) and chat (`channel`/`thread`) carry for the same reason.
+    "deployment",
+    "pipeline",
+    "runner", // issue
     "issue",
     "initiative", // NEW type token (recon §2 / §6.2)
     "relation",   // knowledge
