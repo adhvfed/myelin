@@ -312,6 +312,19 @@ impl OutboxStore {
         self.lock().dead_letters.clone()
     }
 
+    /// Snapshot the committed rows in per-aggregate commit order (for a producer test / a consumer
+    /// re-hydration). The `order` vector is the commit sequence; each id resolves to its row. Used by
+    /// a producer drill to assert WHICH events a workflow body emitted (e.g. the CI-P15 `ci.pipeline`
+    /// body's terminal `ci.check.updated` / `ci.run.*` / `ci.result` facts).
+    pub fn committed_rows(&self) -> Vec<OutboxRow> {
+        let inner = self.lock();
+        inner
+            .order
+            .iter()
+            .filter_map(|id| inner.rows.get(id).cloned())
+            .collect()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }

@@ -229,6 +229,9 @@ pub use ci_pipeline::{
     read_stage_verdict, stage_verdict_marker, CiPipelineSpec, CiStage, PipelineOutcome,
     CI_PIPELINE_WF_TYPE,
 };
+// The reserve/settle cost type the public `CiStage` / `metered_schedule_and_run_job` surface takes
+// (contract 11.7) — re-exported so a consumer building a `CiStage` does not need a second
+// `myelin-storage` edge just to name the cost.
 pub use engine::{
     drive, drive_full, drive_versioned, drive_with_timers, run_state, DriveOutcome, FlowDispatcher,
     FlowTelemetry, RunRow, RunStore, SignalRow, SignalStore, WorkflowBody,
@@ -257,6 +260,7 @@ pub use merge_queue::{
     MergeOutcome, MergePerformer, MergeRequest, MockCiResultProducer, RealCiResultProducer,
     CI_RESULT_SIGNAL, GIT_PR_MERGED_EVENT,
 };
+pub use myelin_storage::reserve_settle::{MeteredUnit, MinorUnits};
 pub use remint::{DelegationCaveats, RunTokenError, RunTokenHandle, RunTokenLease, RunTokenMinter};
 pub use signal_consumer::{FlowSignalConsumer, SIGNAL_EVENT_TYPE};
 pub use timer::sla::{sla_timer_id, trigger_stale_timer_id, SlaTimerCall};

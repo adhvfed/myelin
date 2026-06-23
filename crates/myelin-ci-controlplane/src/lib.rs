@@ -50,6 +50,7 @@
 //! The REAL forward-only apply against the dev-stack Postgres (RLS isolation + the claim indexes) is
 //! `tests/integration_ci_p6_controlplane_schema.rs` behind the `integration` cargo feature.
 
+pub mod ci_pipeline;
 pub mod events;
 pub mod fairness;
 pub mod fleet;
@@ -58,6 +59,16 @@ pub mod migrations;
 pub mod rebac_fragment;
 pub mod scheduler;
 pub mod schema;
+
+// CI-P15 (P-358): the `ci.pipeline` DURABLE WORKFLOW BODY + the X-1 producer side. The deterministic
+// Rust body registered under `CI_PIPELINE_WF_TYPE` at serve (guarded by the flow-determinism lint):
+// the protected-env / manual gates (9.4), the runner stages over the FROZEN `SCHEDULE_AND_RUN_JOB`
+// long-park substrate (9.4/11.7/9.3), and CI's X-1 producer emits — the per-context terminal
+// `ci.check.updated` facts + `ci.run.failed`/`ci.run.succeeded` + the `ci.result` rollup signal
+// (contract 5.9). The `SCHEDULE_AND_RUN_JOB` handshake into the live scheduler/runner is CI-P16; the
+// reserve/settle metering into `cost_event` is CI-P17; the `check_attempt` monotonic counter + the
+// outbox producer plumbing is CI-P18; the end-to-end merge-queue seam GATE (GIT-D10/CI-D8) is CI-P19.
+pub use ci_pipeline::{CheckFacts, PipelineRun, PipelineStage, RunVerdict, CI_PIPELINE_WF_TYPE};
 
 pub use holder::{
     ci_store_classifier, register_ci_holders, CiHolder, CiHolderRegistration, CiStoreClass,
