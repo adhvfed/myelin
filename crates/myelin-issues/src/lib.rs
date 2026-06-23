@@ -274,6 +274,7 @@ pub mod holder_intent;
 pub mod import;
 pub mod keys;
 pub mod migrations;
+pub mod my_work;
 pub mod olap_feed;
 pub mod planner;
 pub mod projection_feeder;
@@ -528,6 +529,22 @@ pub use import::{
     DryRun, GitHubAdapter, IdMapEntry, ImportEngine, ImportError, ImportLaneBudget,
     InMemorySourceIdMap, JiraAdapter, LinearAdapter, ProviderRecord, ReconciliationReport,
     SourceAdapter, SourceIdMap, SourceSystem, Unresolved, UNSUPPORTED_PERMISSION_SCHEME,
+};
+
+// ISS-P22 (P-389, M4-I5): "My Work" over the ONE Notif inbox + the humanise templates (one read-state
+// truth). `my_work_filter`/`list_my_work` read the ONE inbox through the frozen
+// `InboxFilter::issues_my_work` (contract 7.1 — a FILTER, never a second store); a mark/snooze on a My
+// Work item reflects in the unified inbox (contract 7.2 — one read-state truth).
+// `register_issue_humanise_templates` registers the Issues SLA-at-risk / unblocked /
+// approval-requested strings into the ONE `myelin_notif::TemplateStore` (contract 7.3 — the OQ-L ONE
+// templating surface, 0 second template engine); `wire_issues_my_work` ties the reason set (7.6, now
+// wired) AND the templates onto the ONE Notif surfaces in one call. FLOOR named: the SLA-breach
+// escalation ENGINE that FIRES the at-risk string is ISS-P26 (the SLA engine on the myelin-flow wheel);
+// the at-risk STRING registers here.
+pub use my_work::{
+    issue_humanise_templates, list_my_work, list_my_work_default, my_work_filter,
+    register_issue_humanise_templates, wire_issues_my_work, ISSUE_HUMANISE_TEMPLATES,
+    TPL_APPROVAL_REQUESTED, TPL_SLA_AT_RISK, TPL_UNBLOCKED,
 };
 
 pub use refs_glue::{
