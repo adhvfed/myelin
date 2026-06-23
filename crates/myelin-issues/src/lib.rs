@@ -290,6 +290,7 @@ pub mod schema;
 pub mod schemes;
 pub mod sla_escalation;
 pub mod time_axis;
+pub mod trigger;
 pub mod views;
 pub mod workflow;
 pub mod write_path;
@@ -559,4 +560,22 @@ pub use refs_glue::{
 pub use agent_spend::{
     per_effect_idem_key, spend_bearing_run, BalancedRunSignal, DispatchedRun, IssueRunKind,
     IssueSpendGate, SpendError,
+};
+
+// ISS-P25 (P-392, M4-I6): the stateful Trigger flagship ("Remind me when unblocked") — exactly-once
+// across a restart, stale-once. `IssueTriggerEngine` is the Issues-side stateful Trigger over the
+// CONSUMED bus arm_trigger/disarm_trigger primitive (3.3/3.4, the frozen `myelin_query::TriggerEngine`
+// fire-once-per-arming), the CONSUMED `myelin-flow` `stale_after` durable timer (9.3, the
+// `myelin_query::DurableTimer` wheel seam), and the ONE Notif inbox for on_resolve (7.1) — never a
+// second engine/timer/store (EI-01 §7). It adds the Issues-owned semantics: the armable-condition
+// catalogue (`ArmableCondition` — each a frozen EventMatcher = QueryAst over issue.* events +
+// issue_relation projection state; the flagship `RemindWhenUnblocked` is `blocked_by_unresolved == 0`),
+// the ONE inbox item per resolve, the stale nudge that fires ONCE after `stale_after` (default 30d, a
+// per-tenant tunable — `DEFAULT_STALE_AFTER_DAYS`), and the snapshot/restore durability across a
+// restart (`TriggerSnapshot` = the durable `trigger` row, §3.6). ISS-D7 (1-fire + stale-once across a
+// restart) is the green artifact. FLOOR named: none new beyond the 30d default note.
+pub use trigger::{
+    default_stale_after, ArmRequest, ArmableCondition, IssueTriggerEngine, TriggerInboxItem,
+    TriggerInboxKind, TriggerSnapshot, DEFAULT_STALE_AFTER_DAYS, VAR_ASSIGNEE,
+    VAR_BLOCKED_BY_UNRESOLVED, VAR_STATE_CATEGORY,
 };
