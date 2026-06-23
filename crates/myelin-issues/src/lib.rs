@@ -169,6 +169,7 @@ pub mod migrations;
 pub mod pseudonym;
 pub mod query_coown;
 pub mod rebac_fragment;
+pub mod reorder;
 pub mod replay;
 pub mod schema;
 pub mod sla_escalation;
@@ -233,3 +234,18 @@ pub use keys::{
     ReserveError, ReservedBlock, INITIAL_BLOCK_SIZE, MAX_BLOCK_SIZE,
 };
 pub use write_path::create_issue;
+
+// ISS-P09 (P-375, M4): the server-arbitrated order_key CAS reorder (the silent-clobber floor).
+// `reorder` bisects a new rank via the frozen byte-identical `OrderKey::rank_between` (contract 13.3,
+// executed) and writes it under a server-arbitrated CAS on the moved issue's last-seen version: a
+// stale version LOSES and re-bases against the authoritative order (0 silent clobber); a win
+// co-commits the `issue.reordered` event (contract 2.2 consumed) on the SAME outbox transaction
+// (emit-iff-committed). `BoardRanking` is the CAS-guarded `(order_key, version)` ranking store;
+// `rebalance` re-spaces the keys at the 48-char trigger WITHOUT reordering the displayed order.
+// FLOOR named: ranking = order_key + server-arbitrated CAS; the move-CRDT (Yrs list / Fugue) reusing
+// the byte-identical order_key is the measured M5 follow-on (ISS-P32) — the promotion swaps the
+// conflict engine, not the data model (`reorder` crate doc).
+pub use reorder::{
+    cmp_ranked, rebalance, reorder, same_displayed_sequence, BoardRanking, RankedIssue,
+    ReorderError, ReorderOutcome, ReorderRequest,
+};

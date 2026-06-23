@@ -173,12 +173,17 @@ status = "covered"
 # validate → Id.check (+CaveatContext) → mutate typed core → OutboxTx::emit IN ONE TX; the issue is the
 # aggregate; emit-iff-committed (0 ghost / 0 lost — kill-between-commit-and-publish drill green); the
 # no-raw-publish lint GREEN over the source (emit is the only path).
+# ISS-P09 (P-375, M4): the order_key CAS reorder (myelin_issues::reorder) CO-COMMITS its issue.reordered
+# event via OutboxTx::emit on the SAME tx — emit-iff-committed: a LOST CAS commits neither the rank nor
+# the event (0 silent clobber), a WIN co-commits exactly one issue.reordered per accepted move. Proven in
+# drill_iss_d5_reorder_zero_clobber.rs (the reorder provider/consumer CDC pair + the ISS-D5 0-clobber drill).
 cdc = [
     "crates/myelin-storage/tests/cdc_st_02_coloc.rs",
     "crates/myelin-knowledge/tests/cdc_2_2_2_3_2_4_2_9_kn_d7_outbox.rs",
     "crates/myelin-ci-controlplane/tests/cdc_supply_chain_2_2_10_6_4_7.rs",
     "crates/myelin-issues/tests/drill_iss_p06_emit_iff_committed.rs",
     "crates/myelin-issues/tests/integration_iss_p06_outbox.rs",
+    "crates/myelin-issues/tests/drill_iss_d5_reorder_zero_clobber.rs",
 ]
 
 [[contract]]
@@ -2571,12 +2576,33 @@ row = "13.3"
 # is the `--features integration` test (integration_kn_d10_rollup.rs) + the KN-D10 SCHED drill
 # (drill_kn_d10_rollup.rs). Floor 2 (per-rollup materialised aggregate when read-time recompute is
 # MEASURED too slow → the OLAP read store 11.6) is KN-P31 (M5), named.
+# ISS-P09 / P-375 (M4): Issues now EXECUTES the order_key half of 13.3 — the server-arbitrated CAS
+# reorder (myelin_issues::reorder). A drag-to-reorder bisects a new rank via the frozen byte-identical
+# OrderKey::rank_between (midpoint + 2-char jitter, contract 13.3 — NOT re-defined; the shared crate is
+# called) and writes it under a CAS on the moved issue's last-seen (order_key, version): a STALE version
+# LOSES and re-bases honestly against the authoritative order (0 silent clobber — nothing written,
+# nothing emitted), a WIN co-commits issue.reordered (2.2). The 48-char rebalance (myelin_issues::rebalance)
+# re-spaces precision-exhausted keys WITHOUT reordering the displayed order. The ISS-D5 drill
+# (drill_iss_d5_reorder_zero_clobber.rs) proves it: N writers + an agent re-rank the SAME region ->
+# 0 silent clobber (5 distinct-issue moves converge into the (I3,I4) region, jitter keeps keys distinct,
+# strict total order), a 6-way same-issue+version contention -> exactly ONE winner / 5 losers re-base
+# (bounded 1-retry churn), and the 48-char rebalance preserves the displayed sequence issue-for-issue.
+# The reorder provider/consumer CDC pair (same file) pins issue.reordered per-aggregate ordering (2.3)
+# + dedup-safe replay (2.5). MUTATION FLOOR (mandatory-core — the order_key CAS IS the silent-clobber
+# seam): `cargo mutants -p myelin-issues --file crates/myelin-issues/src/reorder.rs` ≥ 90%; the
+# mutation-tested core is the CAS precondition (a stale version must LOSE), the loser-rebases path (a
+# lost CAS writes NOTHING + emits NOTHING), the co-commit ordering (emit on the SAME tx — emit-iff-
+# committed), and the order-preserving rebalance. The measured % is the CI artifact, registered
+# RED-UNTIL-RUN here, never self-asserted (EI-01 §3). FLOOR named: ranking = order_key + server-
+# arbitrated CAS; the move-CRDT (Yrs list / Fugue) reusing the byte-identical order_key is the measured
+# M5 follow-on (ISS-P32) — the promotion swaps the conflict engine, not the data model.
 title = "myelin-query primitive (frozen byte-identical)"
 status = "covered"
 cdc = [
     "crates/myelin-query/tests/cdc_13_3_query_primitive.rs",
     "crates/myelin-query/tests/cdc_13_3_order_key.rs",
     "crates/myelin-issues/tests/cdc_13_3_issues_coown.rs",
+    "crates/myelin-issues/tests/drill_iss_d5_reorder_zero_clobber.rs",
     "crates/myelin-knowledge/tests/cdc_13_3_6_3_knowledge_flex_db.rs",
     "crates/myelin-knowledge/tests/cdc_13_3_4_3_knowledge_rollup.rs",
 ]
