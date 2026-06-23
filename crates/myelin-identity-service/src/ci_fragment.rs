@@ -106,6 +106,18 @@ pub const VIEW: &str = "view";
 /// **The `trigger` permission name** on `run` (`run.trigger = parent_repo->push`).
 pub const TRIGGER: &str = "trigger";
 
+/// **The `deploy` permission name** on `environment` (`deploy = deployer ∪
+/// parent_ci_project->administer`). The gate the consequential CI `deploy`/`approve_deploy` agent
+/// tools (§6.3) carry as their `required_caps` — exposed so the Fabric registration sources the
+/// canonical name, not a stringly-typed literal (a rename here breaks the consumer test).
+pub const DEPLOY: &str = "deploy";
+
+/// **The `administer` permission name** on `ci_project` (`administer = admin`). The privileged
+/// project-management gate the CI `write_secret` agent tool (§6.3) carries as its `required_caps`
+/// (managing a secret is a project-admin op — and a secret's READ is the separate DIRECT NARROW
+/// relation, CI-1, never inherited). Exposed canonically (a rename here breaks the consumer test).
+pub const ADMINISTER: &str = "administer";
+
 fn rel(n: &str) -> Userset {
     Userset::Relation(RelName(n.into()))
 }
@@ -151,7 +163,7 @@ pub fn ci_project_fragment() -> FragmentDef {
                     ttu("parent_repo", "pull"),
                 ]),
             ),
-            perm("administer", rel("admin")),
+            perm(ADMINISTER, rel("admin")),
         ],
     )
 }
@@ -166,11 +178,8 @@ pub fn environment_fragment() -> FragmentDef {
         object_types::ENVIRONMENT,
         &["parent_ci_project", "deployer"],
         vec![perm(
-            "deploy",
-            Userset::Union(vec![
-                rel("deployer"),
-                ttu("parent_ci_project", "administer"),
-            ]),
+            DEPLOY,
+            Userset::Union(vec![rel("deployer"), ttu("parent_ci_project", ADMINISTER)]),
         )],
     )
 }

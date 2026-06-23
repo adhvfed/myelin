@@ -75,6 +75,22 @@ myelin-ci-sandbox = { path = "../myelin-ci-sandbox" }
 # consumer (it depends only on glue/substrate crates below this one) and does NOT depend back on
 # -agent/-agent-service, so this edge keeps the DAG acyclic.
 myelin-git = { path = "../myelin-git" }
+# AG-P20 (→ P-347) — the per-CONSUMER ToolDefs (Issues transition ABAC / Chat explicit-first / CI
+# deploy gated) consume the FROZEN ReBAC fragments (contract 4.9) for their `required_caps`, the SAME
+# one-source-of-truth pattern the Git (AG-P18) + KN (AG-P19) producer tools use:
+#   - `myelin-issues`  (ISS-P01) owns `rebac_fragment::object_types` (issue / issue_field /
+#     issue_transition) + the `transition` / `perform_transition` permission names the Issues
+#     advisory + the SLA-bound transition-ABAC tools source their caps from;
+#   - `myelin-chat`    (CHAT-P01) owns `rebac_fragment::object_types` (channel / message) + the `post`
+#     permission the Chat post_message/react tools source their cap from;
+#   - `myelin-identity-service` (the canonical CI fragment, §5) owns the CI `environment.deploy` /
+#     `ci_project.administer` / `run.trigger` permission names the CI deploy/secret/pipeline tools
+#     source their caps from (a rename in any fragment breaks our consumer test, never a silent drift).
+# NO cycle: all three are leaf consumers that do NOT depend back on -agent-service (issues/chat already
+# depend on identity-service, so this adds no new transitive edge into the DAG).
+myelin-issues = { path = "../myelin-issues" }
+myelin-chat = { path = "../myelin-chat" }
+myelin-identity-service = { path = "../myelin-identity-service" }
 # The SKELETON's terminal trace event carries a references-not-payloads JSON payload (the trace
 # `ArtifactRef`); serde_json builds the `EventDraft.payload` value (it was a dev-dep for AG-P2's
 # round-trip test; the SKELETON's emit needs it at lib scope).
