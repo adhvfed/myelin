@@ -612,6 +612,19 @@ title = "per-subsystem ReBAC namespace fragment (engine + admit-contract + core 
 # PROVIDER half; the self-hosted-runner token SCOPE is exercised against this live fragment by P-ID-28
 # / P-321 (CI-D10 scope side — 0 cross-tenant job/secret reads by a self-hosted runner; see the 4.7
 # row note + drill_ci_d10_self_hosted_scope.rs).
+# The CI-side CONSUMER half (CI-P8 / P-351, M4) ships in `myelin-ci-controlplane`: the read-side
+# names-only fragment carrier (`myelin_ci_controlplane::rebac_fragment` — the
+# `ci_project`/`environment`/`secret`/`run` types + the §5.2 relations/permissions, the SAME canonical
+# names the engine's rich fragment resolves over) + the FROZEN `read & !is_untrusted_fork` edge's CI-side
+# names anchor (the `is_untrusted_fork` SUBTRACTED relation + the `read` permission it gates, so the
+# engine's `run.read = run.view − is_untrusted_fork` Exclusion compiles — a fork subject classified a
+# non-reader BY CONSTRUCTION) + the secret-non-inheritance (`secret.read = direct_reader`, DIRECT NARROW,
+# CI-1) + the protected-env `approve` `list_subjects` target + the `watcher` read-fanout relation. The
+# CDC (cdc_4_9_ci_rebac_fragment.rs) asserts the frozen §5.2 vocabulary literals (it does NOT import the
+# engine crate — the §2.9 acyclic DAG forbids a leaf consumer depending on `myelin-identity-service`); the
+# engine-side cdc_4_9_ci_fragment.rs asserts the SAME literals + admits them through the real engine. The
+# fragment CONSUMERS are named floors: the trust-tier classifier that stamps `is_untrusted_fork` (CI-P12),
+# the secret-broker fork-no-secrets edge (CI-P24), the `list_objects` push-down (CI-P25).
 status = "covered"
 cdc = [
     "crates/myelin-identity-service/tests/cdc_4_9_namespace_engine.rs",
@@ -631,6 +644,7 @@ cdc = [
     "crates/myelin-git/tests/cdc_4_9_git_codeowners.rs",
     "crates/myelin-issues/tests/cdc_4_9_issues_fragment.rs",
     "crates/myelin-chat/tests/cdc_4_9_chat_fragment.rs",
+    "crates/myelin-ci-controlplane/tests/cdc_4_9_ci_rebac_fragment.rs",
 ]
 
 [[contract]]

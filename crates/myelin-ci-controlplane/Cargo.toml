@@ -49,6 +49,14 @@ myelin-tenancy = { path = "../myelin-tenancy" }
 # the DAG depends on it), so `myelin-ci-controlplane → {myelin-events, myelin-ci-sandbox}` is acyclic.
 myelin-events = { path = "../myelin-events" }
 myelin-ci-sandbox = { path = "../myelin-ci-sandbox" }
+# CI-P8 (P-351): the CI ReBAC namespace fragment (contract 4.9) the CI subsystem DECLARES.
+# `myelin-identity` is the FROZEN contract-surface crate carrying the names-only `NamespaceFragment` ABI
+# carrier Identity's `admit_fragment` consumes — NOT the rich `FragmentDef`/`Userset` engine
+# (`myelin-identity-service`), so the §2.9 acyclic DAG is preserved (a leaf consumer depends on the
+# contract surface, never on the service engine; the same edge Git/Issues/Chat/Knowledge each carry). NO
+# cycle: `myelin-identity` has no edge back to `myelin-ci-controlplane` (a leaf consumer, nothing in the
+# DAG depends on it).
+myelin-identity = { path = "../myelin-identity" }
 
 # ------------------------------------------------------------------------------------------
 # REAL live-stack schema apply behind the `integration` feature (CI-P6). The complete CI
