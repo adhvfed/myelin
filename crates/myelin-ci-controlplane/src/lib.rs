@@ -50,6 +50,7 @@
 
 pub mod events;
 pub mod migrations;
+pub mod rebac_fragment;
 pub mod schema;
 
 pub use events::{
