@@ -2148,7 +2148,9 @@ dependencies = [
 name = "myelin-ci-controlplane"
 version = "0.0.0"
 dependencies = [
+ "aws-sdk-s3",
  "myelin-ci-sandbox",
+ "myelin-config",
  "myelin-events",
  "myelin-flow",
  "myelin-gdpr",

@@ -88,6 +88,19 @@ const EXCLUDED_SUBSTRINGS: &[&str] = &[
     // (the same posture as firehose.rs / relay.rs) honours the two-transport split. NAMED, LOUD
     // exclusion (see the module note in transport.rs), never a silent skip.
     "myelin-knowledge/src/transport.rs",
+    // The CI LOG PIPELINE (CI-P20 / P-363): `LogPipeline::ship_line` calls
+    // `firehose.publish(stream=ci-log, scope=run:<id>, frame)` — the EPHEMERAL CI log live-tail the
+    // architecture explicitly sites on the firehose (arch 02 §7.1: "logs ride the firehose +
+    // the resume-cursor protocol"; "CI is the heaviest firehose producer", event-bus §4.3). A
+    // firehose frame is a references-not-payloads byte-range pointer, never an inline-PII durable
+    // event, and is NOT emitted-iff-committed through the outbox. CI's DURABLE log emit (the
+    // COALESCED `ci.log.available` pointer via OutboxTx::emit) is assembled in this same module as a
+    // BUFFERED `EventDraft` the caller emits through the outbox (`LogAvailablePointer::to_draft` —
+    // never a raw `.publish(`); only the firehose live-tail `.publish(` is here). Excluding this ONE
+    // transport file (the exact posture as knowledge/src/transport.rs / firehose.rs / relay.rs)
+    // honours the two-transport split. NAMED, LOUD exclusion (see the module note in
+    // log_pipeline.rs), never a silent skip — the lint stays live on every durable-bus call site.
+    "myelin-ci-controlplane/src/log_pipeline.rs",
     "myelin-harness/src/bin/sub-m0-scorecard.rs",
     "myelin-harness/src/bin/id-m1-scorecard.rs",
     // The infra integration exit-gate runner (Stage 4): same posture as the two runners above —
