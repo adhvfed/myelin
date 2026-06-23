@@ -1,0 +1,64 @@
+[package]
+name = "myelin-ci-controlplane"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# CI-P6 (P-349, M4): the CI Control Plane service is a `serve(AppSpec)` shell (contract 1.1) — the
+# binary below is the "every service main.rs" the row names: it does nothing but hand the CI Control
+# Plane AppSpec to the harness's one call (NOT a hand-rolled lifecycle). The library carries the
+# shell builder (`controlplane_app_spec` / `run_controlplane`), the COMPLETE forward-only data-model
+# migrations for every CI Control-Plane table (ci_run, ci_job, check_attempt, job_queue, fair_deficit,
+# runner, log_segment, log_anchor, artifact, cache_entry, environment, deployment, secret_binding,
+# cost_event — arch 01 §3), and the `#[personal_data(...)]`-tagged row mirrors that keep the
+# no-untagged-personal-data lint GREEN on the CI schema.
+#
+# Like the other service/subsystem crates (myelin-search, myelin-identity-service, myelin-control-plane)
+# it is a LEAF CONSUMER above the shared substrate + glue crates: it depends on the frozen contract
+# surfaces (substrate serve/AppSpec + migrations + holder-registry, gdpr PersonalData, tenancy
+# partition keys) and NOTHING in the production eleven-crate library DAG depends back on it — so
+# `substrate_is_root()` / `identity_is_sink()` in crate_graph.rs are preserved (a subsystem crate is
+# the graph's terminal consumer, OUTSIDE the modelled DAG). cargo build --workspace stays DB-free; the
+# live-stack schema apply is behind the `integration` feature only.
+[[bin]]
+name = "ci-controlplane"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# The substrate serve(AppSpec) harness (contract 1.1/1.2/1.3): the three-surface split, liveness ≠
+# readiness, the forward-only migration runner + the HotTables declaration, the holder auto-registry
+# (contract 1.4). The CI Control Plane is an AppSpec, not a hand-rolled main.
+myelin-substrate = { path = "../myelin-substrate" }
+# The GDPR contract surface — the `#[derive(PersonalData)]` classify-derive + the
+# `#[personal_data(...)]` helper (contract 10.2) the CI row mirrors carry on `triggered_by` /
+# `approved_by` (the pseudonym-subject PII fields, arch 01 §3 / contract 4.8).
+myelin-gdpr = { path = "../myelin-gdpr" }
+# The frozen (tenant, region) partition-key value types (contract 12.1) every CI table is keyed on.
+myelin-tenancy = { path = "../myelin-tenancy" }
+
+# ------------------------------------------------------------------------------------------
+# REAL live-stack schema apply behind the `integration` feature (CI-P6). The complete CI
+# Control-Plane data-model migration gets PROVEN against the live dev-stack Postgres (forward-only
+# apply + RLS isolation + the scheduler claim indexes) in
+# tests/integration_ci_p6_controlplane_schema.rs. The OPTIONAL sqlx + tokio deps are pulled ONLY by
+# `--features integration` — the default `cargo build`/`cargo test --workspace` stay DB-free. These
+# are EXTERNAL crates only; no new myelin edge is added. The test reads DATABASE_URL inline (no
+# myelin-config edge — same posture as refs-service/identity).
+# ------------------------------------------------------------------------------------------
+sqlx = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The architecture-lint ratchet (contract 1.6): CI-P6's own red+green confirmation that the
+# `no-untagged-personal-data` lint REJECTS an untagged PII CI field and ADMITS the tagged CI schema
+# (tests/lint_no_untagged_personal_data.rs). A test-support crate (NOT a production DAG node) — it
+# keeps the gate provably live over the CI types. Plus the residency-pin / forward-only confirmations.
+myelin-lints = { path = "../myelin-lints" }
+
+[features]
+default = []
+integration = ["dep:sqlx", "dep:tokio"]

@@ -2145,6 +2145,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "myelin-ci-controlplane"
+version = "0.0.0"
+dependencies = [
+ "myelin-gdpr",
+ "myelin-lints",
+ "myelin-substrate",
+ "myelin-tenancy",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
+name = "myelin-ci-dispatch"
+version = "0.0.0"
+dependencies = [
+ "myelin-substrate",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
 name = "myelin-ci-sandbox"
 version = "0.0.0"
 dependencies = [
