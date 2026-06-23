@@ -115,19 +115,44 @@
 //! platform `consumer_dedup` + `outbox`), each domain table `(tenant_id, region)`-first + RLS-on
 //! (11.1/12.1/1.5) with `issue`/`issue_relation`/`issue_change_log` flagged HOT (§8.1); [`holder`]
 //! is the auto-registered **H3** `PersonalDataHolder` (locate/export typed, erase stubbed to
-//! crypto-shred naming ISS-P07/P31, the `restrict` flag wired — contract 10.1/1.4). **NO Issues data
-//! is written yet**: the silent-data-loss-safe write path is ISS-P06 (P-372); the per-subject DEK +
-//! the full holder ops are ISS-P07 (P-373). Storage floor = PG-hybrid sharded by tenant;
+//! crypto-shred naming ISS-P31, the `restrict` flag wired — contract 10.1/1.4). The
+//! silent-data-loss-safe write path is ISS-P06 (P-372). Storage floor = PG-hybrid sharded by tenant;
 //! distributed-SQL is the measured R-6 follow-on (ISS-P32) — named in [`migrations`].
+//!
+//! ## ISS-P07 / P-373 (M4) — pseudonymous-by-default identity columns + per-subject-DEK free-text
+//! The GDPR-safe-by-construction half (VISION §3): the structural erasure floor (recon §X-7) ships at
+//! the COLUMN.
+//! - [`pseudonym`] — **the pseudonymous-by-default identity columns (contract 4.8).** The Issues
+//!   `assignee` / `reporter` / `created_by` / comment-author / change-log-actor columns hold an OPAQUE
+//!   `<pseudonym>@<tenant>.noreply` handle ([`myelin_identity::PseudonymHandle`], the SAME frozen
+//!   grammar the Git commit codec bakes into immutable bytes) — NEVER a raw id (the 0-raw-id GATE).
+//!   [`pseudonym::pseudonymise`] resolves a subject through the ONE Identity person↔pseudonym map
+//!   ([`resolve_pseudonym`], 4.8 — the erasable record); a value not in the grammar is REFUSED.
+//! - [`dek`] — **the per-subject-DEK free-text columns (contract 11.3/11.4).** The free-text `title` /
+//!   `props` / `change_delta` / comment body are sealed under the SUBJECT's per-subject DEK through the
+//!   ONE shared [`myelin_storage::encryption::ColumnCryptor`] over the P-058 `KmsEngine` (rotation /
+//!   crypto-shred reach by construction, EI-01 §7) — ciphertext + the `pii_key_ref` DEK metadata at
+//!   rest, **0 plaintext free-text** (the at-rest GATE). A subject's erasure destroys their DEK ⇒ their
+//!   free-text in DBs + backups + immutable logs is unrecoverable ciphertext (the GD-4 individual lever).
+//! - [`write_path::apply_mutation_sealed`] wires BOTH through the ISS-P06 seam: it pseudonymises the
+//!   reporter + seals the free-text BEFORE validate → check → mutate → emit, threading the REAL
+//!   `kms://<tenant>/<epoch>/subject:<id>` `pii_key_ref` onto the `issue.created` event (the erase
+//!   fan-out destroys exactly that key). A pseudonymise/seal failure FAILS THE WRITE CLOSED.
+//! - The **H3 holder is registered** ([`holder`], 10.1/1.4 — confirmed in place from ISS-P05, the ops
+//!   still stubbed). **FLOORS named:** the `erase` crypto-shred + pseudonym-map shred BODY (the full
+//!   DSR fan-out) is **ISS-P31**; the third-party free-text residual is the ONE platform posture
+//!   (10.9 / X-7, by reference, [`holder::ISSUE_RESIDUAL_POSTURE_REF`] — `[OPEN — LEGAL]`, R-1).
 
 #![forbid(unsafe_code)]
 
 pub mod app;
 pub mod declares;
+pub mod dek;
 pub mod events;
 pub mod holder;
 pub mod holder_intent;
 pub mod migrations;
+pub mod pseudonym;
 pub mod query_coown;
 pub mod rebac_fragment;
 pub mod replay;
@@ -167,3 +192,17 @@ pub use write_path::{
     apply_mutation, issue_aggregate_key, issue_ref, IssueDraft, MutationKind, WriteError,
     WriteOutcome, PERM_COMMENT, PERM_MANAGE, PERM_PERFORM_TRANSITION, PERM_TRANSITION,
 };
+
+// ISS-P07 (P-373, M4): pseudonymous-by-default identity columns (4.8) + per-subject-DEK free-text
+// (11.4) + the holder registration (10.1/1.4). `pseudonymise`/`IssuePseudonym` (the 0-raw-id identity
+// columns), `encrypt_free_text`/`IssueFreeText` (the 0-plaintext-at-rest free-text columns), and
+// `apply_mutation_sealed` (the GDPR-safe write path threading both onto the ISS-P06 seam + the REAL
+// per-subject-DEK pii_key_ref). Floors named: the erase crypto-shred + pseudonym-map shred fan-out is
+// ISS-P31 (`holder`); the third-party free-text residual is the ONE posture 10.9/X-7, by reference.
+pub use dek::{
+    decrypt_free_text, encrypt_free_text, plaintext_at_rest, subject_dek_erasure, IssueFreeText,
+};
+pub use pseudonym::{
+    is_raw_principal_id, is_resolvable_pseudonym, pseudonymise, IssuePseudonym, PseudonymError,
+};
+pub use write_path::{apply_mutation_sealed, SealError, SealedCreate};

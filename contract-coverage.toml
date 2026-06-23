@@ -592,6 +592,17 @@ landing = "P-078"
 # identities admitted, dated); the GIT half CDC:
 # crates/myelin-git/tests/cdc_4_8_git_pseudonymous_commits.rs
 # (cdc_4_8_git_enforces_pseudonymous_commit_identity_at_the_door).
+# P-373 (ISS-P07, M4): the ISSUES CONSUMER half of 4.8 — pseudonymous-by-default Issues identity
+# columns. `myelin_issues::pseudonym::{IssuePseudonym, pseudonymise}` admits ONLY a
+# `<pseudonym>@<tenant>.noreply` handle into an `assignee`/`reporter`/`created_by`/actor column
+# (resolved through the ONE Identity person↔pseudonym map, `resolve_pseudonym`) — a raw id / name /
+# email is REFUSED, the write fails closed (0 raw id at rest, recon §X-7). The row stays `deferred`
+# because the `resolve_pseudonym`/`erase` BODY is Identity's P-078; Issues is a CONSUMER of the frozen
+# grammar (the `myelin_identity::PseudonymHandle` carrier). CDC + at-rest artifacts:
+# crates/myelin-issues/tests/cdc_4_8_11_4_issues_pseudonym_dek.rs (provider: the write path resolves a
+# pseudonym; consumer: the column parses back through the frozen grammar — 0 raw id) and the
+# live-Postgres at-rest proof crates/myelin-issues/tests/integration_iss_p07_subject_dek.rs (the stored
+# reporter column is a pseudonym, never the raw principal id).
 
 [[contract]]
 row = "4.9"
@@ -2166,6 +2177,7 @@ cdc = [
     "crates/myelin-storage/tests/cdc_11_4_erase_algorithm.rs",
     "crates/myelin-storage/tests/cdc_11_2_11_4_git_crypto_shred_reach.rs",
     "crates/myelin-ci-controlplane/tests/cdc_11_2_11_4_ci_artifact_cache.rs",
+    "crates/myelin-issues/tests/cdc_4_8_11_4_issues_pseudonym_dek.rs",
 ]
 # P-365 (CI-P22, M4): the CI CONTROL-PLANE consumer of the per-subject-vs-per-tenant DEK selection
 # (11.4) for isolable inline log PII (Storage C1). `select_log_segment_dek` composes the FROZEN
@@ -2176,6 +2188,18 @@ cdc = [
 # `pii_key_ref`, so the erase fan-out reaches the bytes). This BUILDS the per-subject DEK key-selection
 # SUBSTRATE; the full erase fan-out (crypto-shred ERASE path that destroys the DEK across every holder)
 # is the named M5 follow-on CI-P32 (P-492). Consumer CDC: cdc_11_2_11_4_ci_artifact_cache.rs.
+# P-373 (ISS-P07, M4): the ISSUES CONSUMER of the per-subject-DEK free-text columns (11.4 / GD-4).
+# `myelin_issues::dek::{encrypt_free_text, IssueFreeText}` seals the free-text `title`/`props`/
+# `change_delta`/comment-body under the SUBJECT's per-subject DEK through the ONE shared
+# `myelin_storage::encryption::ColumnCryptor` over the P-058 KmsEngine (NO second cryptor, NO parallel
+# key store — EI-01 §7): ciphertext + the `kms://<tenant>/<epoch>/subject:<id>` pii_key_ref at rest, 0
+# plaintext free-text. `apply_mutation_sealed` threads the REAL per-subject-DEK pii_key_ref onto the
+# emitted `issue.created` event (the erase fan-out — ISS-P31 — destroys exactly that key). The erase
+# BODY (the crypto-shred that destroys the DEK) is the named ISS-P31 follow-on. Provider/consumer CDC:
+# cdc_4_8_11_4_issues_pseudonym_dek.rs (seal under the per-subject DEK → decrypt-while-the-key-lives, 0
+# plaintext at rest); the live-Postgres at-rest artifact:
+# crates/myelin-issues/tests/integration_iss_p07_subject_dek.rs (0 plaintext free-text in the real
+# Postgres bytea column).
 
 [[contract]]
 row = "11.5"
