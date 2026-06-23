@@ -2522,10 +2522,23 @@ status = "covered"
 # refuses-to-start a CI stage when the shared wallet is exhausted by a prior agent reserve.
 # FLOOR named: the resource-second → credit/price MARKUP mapping is Commercial's (arch 06 R-2 — CI
 # carries the MarkupPolicy seam + owns ONLY the meter + the wholesale column).
+#
+# P-391 (ISS-P24, M4): the ISSUES CONSUMER HALF — reserve/settle on every spend-bearing Issues agent
+# run (the triage/forecast/sla_draft/automation runs, arch issue-tracker 03 §9). Issues does NOT own
+# the wallet — it CONSUMES the SAME Storage-owned AgentRunGate + CostLedger CI draws from (the shared
+# wallet, 11.7). `myelin_issues::IssueSpendGate` / `spend_bearing_run` bracket a spend-bearing run
+# with the 9.5 reserve/settle BOOKENDS: reserve at dispatch (no balance → the agent brain NEVER runs)
+# → run behind the move-only InFlightRun handle (never interrupted) → settle on completion (one cost
+# event per metered unit, wholesale ≠ markup). The green artifact is the BalancedRunSignal — the
+# wallet nets to 0 over a completed run (reserved == billed + refunded). The per-effect idem_key rule
+# (OQ-F: card_id single / card_id:<effect_idx> multi) is stated Issues-side (per_effect_idem_key),
+# byte-identical to the agent-fabric derivation. The CDC pair + the chained-mutation e2e (dispatch →
+# reserve → complete → settle → assert balanced) is cdc_11_7_issues_reserve_settle.rs.
 cdc = [
     "crates/myelin-storage/tests/cdc_11_7_reserve_settle.rs",
     "crates/myelin-storage/tests/ag_d6_d11_reserve_refusal_drill.rs",
     "crates/myelin-ci-controlplane/tests/drills_ci_p17_reserve_settle_parity.rs",
+    "crates/myelin-issues/tests/cdc_11_7_issues_reserve_settle.rs",
 ]
 
 [[contract]]

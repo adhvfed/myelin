@@ -46,8 +46,10 @@
 //! - **Forecast = LINEAR** (`remaining ÷ velocity`, [`LinearForecast`]). The Monte-Carlo forecast
 //!   agent is the **follow-on (R-5, ISS-P32)** — it reads the SAME OLAP this linear one does (the
 //!   swap is the forecast function, not the tool/runtime seam). Named here per VISION §3.
-//! - **Reserve/settle** on every spend-bearing run is **ISS-P24 (→ P-391)** — the BUDGET step of the
-//!   pipeline reads the reserve HERE (consumed); the wallet wiring on every agent dispatch is P-391.
+//! - **Reserve/settle** on every spend-bearing run is **ISS-P24 (→ P-391), LANDED** — the BUDGET step
+//!   of the pipeline reads the reserve HERE (per-effect, consumed); the run-level wallet bookends on
+//!   every spend-bearing Issues agent dispatch (reserve at dispatch → settle on completion, the SAME
+//!   wallet as CI, 9.5) landed in `myelin_issues::agent_spend` (P-391).
 //! - **The stateful Trigger** ("remind me when unblocked") is **ISS-P25 (→ P-392)**.
 //! - **The external MCP ENDPOINT** (its auth + the agent-lane rate-limit) is the post-M5 follow-on
 //!   (AG-P25); the Issues tools are NOT MCP-exposed at v1 (`exposed_over_mcp = false`).
