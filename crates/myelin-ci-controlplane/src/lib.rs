@@ -57,6 +57,7 @@ pub mod events;
 pub mod fairness;
 pub mod fleet;
 pub mod holder;
+pub mod log_pipeline;
 pub mod metering;
 pub mod migrations;
 pub mod rebac_fragment;
@@ -126,6 +127,23 @@ pub use metering::{
 pub use holder::{
     ci_store_classifier, register_ci_holders, CiHolder, CiHolderRegistration, CiStoreClass,
     RestrictionFlag, CI_OLTP_STORE, CI_RESIDUAL_POSTURE_REF,
+};
+
+// CI-P20 (P-363): logs over the firehose + the sealed T3 (job, step, byte-range) log tier +
+// `ci.log.available` pointers. The log-pipeline coordinator — `ship_line` redacts secrets (in-flight
+// masking, defence-in-depth), publishes the frame to the firehose (the LIVE TAIL; CI is the heaviest
+// firehose producer, contract 3.5 — never the durable bus), seals segments into T2 content-addressed
+// blobs + the `(job, step, byte-range)` index (`log_segment`/`log_anchor`, contract 11.8), and emits
+// COALESCED `ci.log.available` POINTER events via the outbox (contract 2.2 — never per-line). The
+// residency-pin lint is green on every log write (logs near the runner region, contract 1.6). FLOORS
+// named: the time-series/wide-column log tier is CI-P29 (P-489); the resume-cursor live-tail VIEWER +
+// the `details_ref` jump-to-failure RESOLUTION is CI-P21 (P-364); the per-subject DEK for isolable
+// inline log PII is CI-P22 (P-365). NO cycle: `myelin-events` (firehose) / `myelin-storage`
+// (BlobStore) have no edge back to `myelin-ci-controlplane` (the same acyclic leaf edges CI carries).
+pub use log_pipeline::{
+    AnchorStatus, CoalesceBudget, CrossRegionLogWrite, LogAnchorRow, LogAvailablePointer, LogCoord,
+    LogPipeline, LogSegmentRow, LogWritePin, SealThreshold, SecretRedactor, CI_LOG_STREAM,
+    INSERT_LOG_SEGMENT_QUERY, REDACTION_MARKER, UPSERT_LOG_ANCHOR_QUERY,
 };
 
 pub use events::{

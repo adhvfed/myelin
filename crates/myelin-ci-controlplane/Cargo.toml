@@ -89,6 +89,16 @@ serde_json = { workspace = true }
 # ------------------------------------------------------------------------------------------
 sqlx = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
+# CI-P20 (P-363): the log-pipeline seal is PROVEN against the live dev stack — the sealed segment
+# flushes to the REAL RustFS object store (`S3BlobStore`, contract 11.2) AND the `(job, step,
+# byte-range)` index rows (`log_segment`/`log_anchor`, contract 11.8) apply + INSERT + read back
+# (0 dangling anchors) against the live Postgres in tests/integration_ci_p20_log_pipeline.rs. The
+# OPTIONAL myelin-config (the dev S3 endpoint) + aws-sdk-s3 (the raw client for the round-trip
+# verify) deps are pulled ONLY by `--features integration`; `myelin-storage/integration` exposes the
+# real `S3BlobStore` (RustFS in dev, Scaleway in prod — a config swap, never a code change). The
+# default build stays DB-free.
+myelin-config = { path = "../myelin-config", optional = true }
+aws-sdk-s3 = { workspace = true, optional = true }
 
 [dev-dependencies]
 # The architecture-lint ratchet (contract 1.6): CI-P6's own red+green confirmation that the
@@ -108,4 +118,12 @@ myelin-git = { path = "../myelin-git" }
 
 [features]
 default = []
-integration = ["dep:sqlx", "dep:tokio"]
+# `myelin-storage/integration` exposes the s3blob module (the real S3BlobStore over RustFS/Scaleway)
+# the CI-P20 log-pipeline seal flushes its sealed segments to.
+integration = [
+    "dep:sqlx",
+    "dep:tokio",
+    "dep:myelin-config",
+    "dep:aws-sdk-s3",
+    "myelin-storage/integration",
+]

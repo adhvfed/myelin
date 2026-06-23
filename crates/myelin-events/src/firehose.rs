@@ -139,6 +139,15 @@ pub enum ScopeKind {
     /// One principal's inbox slice (Notif `inbox watch`, §7 / contract 3.5 C4) — a BOUNDED selector
     /// `inbox:<principal>`; a client gets only its own inbox's live frames, never the tenant firehose.
     Inbox,
+    /// One CI run's live log tail (CI §7.1 / contract 3.5) — a BOUNDED selector `run:<run_id>`; a
+    /// viewer gets only that run's live log frames, never the tenant firehose. **CI is the heaviest
+    /// firehose producer** (event-bus §4.3): its log lines ride this transport keyed by the run, the
+    /// resume-cursor protocol backfilling a reconnect's gap (CI-D11 / CI-P21). Added to the ONE scope
+    /// grammar (coherence, EI-01 §7 — the bounded-selector whitelist grows by admitting a new bounded
+    /// resource kind, never by forking a second transport): the `*`-rejection, the per-`(stream,
+    /// scope)` monotone seq, the `(last_seq, now]` backfill, and the `resync_required` fallback all
+    /// apply to `run:` identically.
+    Run,
 }
 
 impl ScopeKind {
@@ -149,6 +158,7 @@ impl ScopeKind {
             ScopeKind::Doc => "doc",
             ScopeKind::Channel => "channel",
             ScopeKind::Inbox => "inbox",
+            ScopeKind::Run => "run",
         }
     }
 }
@@ -193,10 +203,11 @@ impl FirehoseScope {
             "doc" => ScopeKind::Doc,
             "channel" => ScopeKind::Channel,
             "inbox" => ScopeKind::Inbox,
+            "run" => ScopeKind::Run,
             _ => {
                 return Err(FirehoseError::OverBroadScope {
                     scope: raw.to_string(),
-                    why: "unknown scope kind (only board:/doc:/channel:/inbox:)",
+                    why: "unknown scope kind (only board:/doc:/channel:/inbox:/run:)",
                 })
             }
         };
@@ -1112,6 +1123,34 @@ mod tests {
                 s.selector(),
                 raw,
                 "a bounded scope round-trips its selector string"
+            );
+        }
+    }
+
+    /// **`run:<run_id>` is admitted as a BOUNDED scope (CI §7.1 / contract 3.5 — the CI live-log
+    /// tail).** CI's log lines ride this transport keyed by the run; a viewer subscribes on exactly
+    /// one run, never `*` (CI is the heaviest firehose producer). `run:<id>` parses to
+    /// [`ScopeKind::Run`] and round-trips, while `run:*` / a bare `run:` are STILL rejected as
+    /// over-broad — the `*`-rejection generalises to the new kind exactly as for board/doc/channel.
+    #[test]
+    fn run_scope_is_a_bounded_kind_and_unbounded_run_is_rejected() {
+        let s = FirehoseScope::parse("run:01J0RUN").expect("a bounded run scope parses");
+        assert_eq!(s.kind(), ScopeKind::Run, "run: parses to the Run kind");
+        assert_eq!(s.id(), "01J0RUN", "the run id is the bounded resource id");
+        assert_eq!(
+            s.selector(),
+            "run:01J0RUN",
+            "the run scope round-trips its selector"
+        );
+        for raw in ["run:*", "run:", "run"] {
+            let r = FirehoseScope::parse(raw);
+            assert!(
+                r.is_err(),
+                "unbounded/empty run scope `{raw}` must be rejected, got {r:?}"
+            );
+            assert!(
+                r.unwrap_err().is_over_broad_scope(),
+                "`{raw}` is an over-broad-scope rejection"
             );
         }
     }
