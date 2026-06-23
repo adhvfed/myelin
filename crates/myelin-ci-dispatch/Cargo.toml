@@ -1,0 +1,50 @@
+[package]
+name = "myelin-ci-dispatch"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# CI-P6 (P-349, M4): the CI Trigger & Dispatch service is a `serve(AppSpec)` shell (contract 1.1) —
+# the binary below is the "every service main.rs" the row names: it does nothing but hand the CI
+# Trigger & Dispatch AppSpec to the harness's one call (NOT a hand-rolled lifecycle). Trigger &
+# Dispatch is "stateless except the dedup ledger" (arch 00 §4): the library carries the shell
+# builder (`dispatch_app_spec` / `run_dispatch`) + the ONE table this service owns — the
+# `consumer_dedup` ledger (arch 01 §3.8 / contract 2.5), the exactly-once-effect anchor so one push
+# = one run. (The dispatch BEHAVIOUR — the EventMatcher, the trust-tier stamp, the definition
+# resolution → CAS snapshot, the reserve/start handoff — is CI-P10/CI-P11; this is the shell + the
+# dedup-ledger schema.)
+#
+# Like the other service/subsystem crates (myelin-search, myelin-ci-controlplane) it is a LEAF
+# CONSUMER above the shared substrate: it depends on the frozen serve/AppSpec + migrations surface
+# and NOTHING in the production eleven-crate library DAG depends back on it — so
+# `substrate_is_root()` is preserved (a subsystem crate is the graph's terminal consumer, OUTSIDE the
+# modelled DAG). cargo build --workspace stays DB-free; the live-stack schema apply is behind the
+# `integration` feature only.
+[[bin]]
+name = "ci-dispatch"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# The substrate serve(AppSpec) harness (contract 1.1/1.2/1.3): the three-surface split, liveness ≠
+# readiness, the forward-only migration runner, the holder auto-registry (contract 1.4). Trigger &
+# Dispatch is an AppSpec, not a hand-rolled main.
+myelin-substrate = { path = "../myelin-substrate" }
+
+# ------------------------------------------------------------------------------------------
+# REAL live-stack schema apply behind the `integration` feature (CI-P6). The consumer_dedup ledger
+# migration gets PROVEN against the live dev-stack Postgres (forward-only apply + RLS isolation +
+# the exactly-once PRIMARY KEY) in tests/integration_ci_p6_dispatch_schema.rs. The OPTIONAL sqlx +
+# tokio deps are pulled ONLY by `--features integration` — the default `cargo build`/`cargo test
+# --workspace` stay DB-free. EXTERNAL crates only; no new myelin edge. The test reads DATABASE_URL
+# inline (no myelin-config edge — same posture as refs-service/identity).
+# ------------------------------------------------------------------------------------------
+sqlx = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+
+[features]
+default = []
+integration = ["dep:sqlx", "dep:tokio"]

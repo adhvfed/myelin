@@ -161,6 +161,24 @@ members = [
     # value/trait crate; no DB/object-store/cache/bus contract is touched at P-129). See the
     # crate-level note in crates/myelin-ci-sandbox/src/lib.rs.
     "crates/myelin-ci-sandbox",
+    # The CI Trigger & Dispatch SERVICE shell (CI-P6 → P-349, M4): a serve(AppSpec) shell (contract
+    # 1.1) with the three-surface split + liveness ≠ readiness, owning the ONE table Trigger &
+    # Dispatch is stateful in — the `consumer_dedup` exactly-once-effect ledger (arch 01 §3.8 /
+    # contract 2.5). Like the other service/subsystem crates it is a LEAF CONSUMER above the shared
+    # substrate (serve/AppSpec + migrations) and is NOT a node in the eleven-crate library DAG
+    # modelled by crate_graph.rs — nothing in the production DAG depends back on it; substrate_is_root()
+    # is preserved. cargo build --workspace stays DB-free (the live-stack schema apply is behind the
+    # `integration` feature). See crates/myelin-ci-dispatch/src/lib.rs.
+    "crates/myelin-ci-dispatch",
+    # The CI Control Plane SERVICE shell (CI-P6 → P-349, M4): a serve(AppSpec) shell (contract 1.1)
+    # carrying the COMPLETE forward-only data-model migrations for every CI Control-Plane table
+    # (ci_run … cost_event, arch 01 §3) + the #[personal_data(...)]-tagged row mirrors that keep the
+    # no-untagged-personal-data lint green. Like the other service/subsystem crates it is a LEAF
+    # CONSUMER above the shared substrate + glue crates and is NOT a node in the eleven-crate library
+    # DAG modelled by crate_graph.rs — nothing in the production DAG depends back on it;
+    # substrate_is_root()/identity_is_sink() are preserved. cargo build --workspace stays DB-free (the
+    # live-stack schema apply is behind the `integration` feature). See crates/myelin-ci-controlplane/src/lib.rs.
+    "crates/myelin-ci-controlplane",
     # The storage SUBSTRATE crate (P-ST-01 → P-007): the OLTP tier client (harness pool +
     # (tenant, region) RLS guard), and — in later prompts — the KMS hierarchy + BlobStore
     # impls + backup/restore machinery. Sits below -gdpr/-client and ABOVE -substrate in
