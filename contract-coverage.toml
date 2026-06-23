@@ -140,6 +140,16 @@ cdc = [
 # interactive fetch is served; a machine principal can never up-class to the protected human lane.
 # The consumer-half CDC is cdc_1_11_git_shed_order.rs. FLOOR: the per-surface budget NUMBERS are tuned
 # by the 30× clone-storm GIT-D6 → GIT-P34 (M5); here the order is asserted at 1× with mixed principals.
+#
+# P-356 (CI-P13): the CI-SIDE consumer of 1.11 — the scheduler fairness slice
+# (myelin-ci-controlplane/src/fairness.rs) COMPOSES the CI lane shed order (`shed_order()` →
+# [Deploy, Batch, Interactive], interactive held last = the protected-human-lane analogue inside CI)
+# with the substrate ShedLane over Surface::CiDispatch (REUSED, never re-defined): the CI per-tenant
+# in-flight cap (Backpressure::DEFAULT_TENANT_IN_FLIGHT_CAP) is asserted EQUAL to the substrate
+# CiDispatch shed budget (one v1 floor, not two — default_cap_matches_substrate_ci_dispatch_budget).
+# FLOOR: the cap + the DRR plan-tier weights are tuned by the 30× CI-D2 surge → CI-P30 (M5). The 1.8
+# consumer half is the per-fair_key deficit-DESC ordering + the backpressured/queue-depth signals the
+# DRR advance/replenish + the in-flight count produce (proven live in integration_ci_p13_fairness.rs).
 
 # ──────────────── §2 Event envelope, outbox & consumer template (Bus myelin-events) ─────────────
 

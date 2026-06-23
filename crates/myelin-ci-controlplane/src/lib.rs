@@ -51,6 +51,7 @@
 //! `tests/integration_ci_p6_controlplane_schema.rs` behind the `integration` cargo feature.
 
 pub mod events;
+pub mod fairness;
 pub mod holder;
 pub mod migrations;
 pub mod rebac_fragment;
@@ -76,6 +77,15 @@ use myelin_substrate::{
 pub use scheduler::{
     lane_token, state_token, ClaimRequest, Claimed, EnqueueOutcome, JobState, Lane, QueuedJob,
     SchedulerState, CANCEL_SUPERSEDED_QUERY, CLAIM_QUERY, REAP_QUERY,
+};
+
+// CI-P13 (P-356): the scheduler fairness slice — DRR fair-share over `fair_key` + the lane shed
+// order + per-tenant backpressure (the slice CI-P12 named as its floor). The deficit advance/
+// replenish (plan-weighted) + the bounded run-queue cap + the lane shed order, with the live
+// `fair_deficit`/`job_queue` SQL the integration test proves against Postgres.
+pub use fairness::{
+    shed_order, Backpressure, FairShare, PlanTier, ADVANCE_DEFICIT_QUERY, BASE_QUANTUM,
+    DEFAULT_TENANT_IN_FLIGHT_CAP, DEFICIT_CEILING, IN_FLIGHT_COUNT_QUERY, REPLENISH_DEFICIT_QUERY,
 };
 
 pub use migrations::{
