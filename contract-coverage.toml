@@ -1206,11 +1206,19 @@ title = "query(ast, viewer, zookie?, page) -> RankedResults"
 # parity check proves BYTE-IDENTICAL visible rows across the OLTP board tier and the Search valve
 # tier (0 leak divergence between the two ACL pre-filters — both share `pipeline::lower_set_expr`,
 # no second interpreter), plus SRCH-D1 on the valve path (0 confidential-issue leak incl. counts).
+# ISS-P14/P-380 (M4) adds the ISSUES COST-BOUNDER CONSUMER half: `myelin_issues::plan_board_query`
+# is the three-tier escalation decision — a Tier-3 leg (full-text/cold-huge-facet/over-budget)
+# returns an `EscalateToSearch` carrying the board's OWN `Filter{set_expr}` (4.3, constructible ONLY
+# with it — the `search-requires-acl-filter` discipline is structural), driven into Search's
+# `escalate_to_search`. The Issues-side CDC proves the cost-bounder's escalation conjoins the SAME
+# filter over the LIVE engine (SECRET absent, one conjoin) — crates/myelin-issues/tests/
+# cdc_6_1_issues_tier3_escalation.rs.
 status = "covered"
 cdc = [
     "crates/myelin-search/tests/cdc_query_pipeline_6_1.rs",
     "crates/myelin-knowledge/tests/cdc_6_3_6_1_6_2_knowledge_search_feed.rs",
     "crates/myelin-search/tests/cdc_tier3_valve_6_1.rs",
+    "crates/myelin-issues/tests/cdc_6_1_issues_tier3_escalation.rs",
 ]
 
 [[contract]]

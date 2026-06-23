@@ -219,6 +219,7 @@
 
 pub mod app;
 pub mod content;
+pub mod cost_bounder;
 pub mod declares;
 pub mod dek;
 pub mod events;
@@ -363,4 +364,14 @@ pub use planner::{
     compose_board_query, issue_id_colref, lower_over_issue_id, AuthzJoin, AuthzVisibleIndex,
     BoundParam, ComposedBoardQuery, FilterMode, LoweredFilter, AUTHZ_VISIBLE_TABLE,
     ISSUE_VIEW_PERMISSION,
+};
+
+// ISS-P14 (P-380, M4): the cost-bounding + three-tier escalation ON TOP of the ISS-P13 leak-free
+// pre-filter — classify each predicate (typed-core / generated facet / GIN probe / Search), bound
+// the cost, and escalate to Search (the SAME `Filter` conjoined, 6.1) or return Refine — NEVER an
+// unbounded JSONB scan. Every query paginated + statement-timeout'd (the ISS-D2 `<1s` latency gate).
+pub use cost_bounder::{
+    classify_field, estimate_cost, lower_acl, plan_board_query, BoundedBoardQuery,
+    CostBounderFloors, CostBudget, FacetCatalog, PlanOutcome, RefineHint, SearchEscalation, Tier,
+    TIER3_FIELDS, TYPED_CORE_FIELDS,
 };
