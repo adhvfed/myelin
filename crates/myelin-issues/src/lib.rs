@@ -226,6 +226,7 @@ pub mod holder;
 pub mod holder_intent;
 pub mod keys;
 pub mod migrations;
+pub mod planner;
 pub mod pseudonym;
 pub mod query_coown;
 pub mod rebac_fragment;
@@ -353,4 +354,13 @@ pub use workflow::{
     arm_trigger_body, blocked_by_guard, example_arm_trigger, linked_pr_ci_green_guard,
     ArmedTrigger, GuardVar, IssueContext, PostAction, StateCategory, TransitionBlocked,
     TransitionPlan, Workflow, WorkflowError, WorkflowGuard, WorkflowState, WorkflowTransition,
+};
+
+// ISS-P13 (P-379, M4): the AST→OLTP-store compiler — the `list_objects` `SetExpr` push-down lowered
+// FIRST into a leak-free SQL predicate / JOIN over `issue.id` (contract 4.3, the highest-stakes
+// leak-free property; 4.10 the zookie new-enemy guard). Issues is the headline consumer of 4.3.
+pub use planner::{
+    compose_board_query, issue_id_colref, lower_over_issue_id, AuthzJoin, AuthzVisibleIndex,
+    BoundParam, ComposedBoardQuery, FilterMode, LoweredFilter, AUTHZ_VISIBLE_TABLE,
+    ISSUE_VIEW_PERMISSION,
 };
