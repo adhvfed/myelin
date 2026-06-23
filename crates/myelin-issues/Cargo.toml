@@ -101,6 +101,15 @@ myelin-notif = { path = "../myelin-notif" }
 # DB-free in-memory `KmsEngine::new()` keeps `cargo build --workspace` DB-free; the live-stack DEK
 # round-trip is the `integration`-feature proof (tests/integration_iss_p07_subject_dek.rs).
 myelin-storage = { path = "../myelin-storage" }
+# ISS-P17 (P-383, M4): the ONE Refs codec (contract 5.1/5.7) — `parse`/`format`/`mint`/`strip_sub`/
+# `sub_kind` over the frozen `ArtifactRef` + the unified `#sub` grammar. The Issues Refs wiring
+# (`project(ref,viewer)` + the `#sub` mints + the inline-node `refs.edge.created` producer + the TE-7
+# mirror + the bounded traverse) mints/strips/classifies through THIS — Issues never re-implements URN
+# handling (REF-3 / EI-01 §7). A consumer LEAF edge onto the refs GLUE crate (the SAME edge
+# `myelin-git`/`myelin-ci-controlplane`/`myelin-knowledge` already carry — never the refs SERVICE
+# crate, so the §2.9 DAG stays acyclic). Promoted from a dev-dependency: the Refs glue now ships at
+# RUNTIME, not just in the declares CDC.
+myelin-refs = { path = "../myelin-refs" }
 serde.workspace = true
 serde_json.workspace = true
 
@@ -128,10 +137,9 @@ myelin-identity-service = { path = "../myelin-identity-service" }
 # Note: `myelin-storage` is now a REGULAR dependency (above) — ISS-P07 seals the free-text columns
 # with the shared `ColumnCryptor` at RUNTIME (the per-subject-DEK write path), so the edge is no
 # longer test-only.
-# The frozen `ArtifactRef` token (contract 5.1) the Notif `classify`/dedup-render seam keys on — used
-# ONLY in the 7.6 declares CDC + unit tests to render an Issues subject's inbox dedup key. Test
-# scaffolding (no runtime edge: the declares module is generic over the caller's subject ref).
-myelin-refs = { path = "../myelin-refs" }
+# Note: `myelin-refs` is now a REGULAR dependency (above) — ISS-P17 (P-383) ships the Refs wiring
+# (project/#sub-mints/edges/traverse/TE-7 mirror) at RUNTIME over the ONE Refs codec, so the edge is
+# no longer test-only.
 # ISS-P05 (P-371): the architecture-lint ratchet (contract 1.6) — Issues' own dated red+green
 # confirmation that `no-untagged-personal-data` REJECTS an untagged PII Issues field + ADMITS the
 # tagged schema, and that `forward-only-migration` / `residency-pin` are GREEN over the issue-spine

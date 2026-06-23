@@ -862,9 +862,16 @@ cdc = [
 row = "5.3"
 title = "backlinks / edges / traverse"
 status = "covered"
+# ISS-P17 / P-383 (M4) adds the ISSUES-OWNED bounded cycle-safe traverse over the `issue_relation`
+# TE-7 source-of-truth (`myelin_issues::refs_glue::IssueRelationGraph::traverse`) — a depth-16
+# (contract 5.3) BFS that is cycle-safe (a `blocked_by` cycle terminates with ONE finite result, never
+# a hang) and depth-bounded (a node past depth 16 is not expanded). The impact/hierarchy surface + the
+# unblock-trigger walk ride this. The Refs-service traverse (cdc_5_3_traverse.rs) is the cross-subsystem
+# projection-graph half; this is the producer-owned typed-table walk.
 cdc = [
     "crates/myelin-refs-service/tests/cdc_5_3_backlinks.rs",
     "crates/myelin-refs-service/tests/cdc_5_3_traverse.rs",
+    "crates/myelin-issues/tests/cdc_5_4_5_5_5_6_5_7_5_3_6_3_issues_refs_glue.rs",
 ]
 
 [[contract]]
@@ -893,9 +900,16 @@ status = "covered"
 # fact); no standalone edge-write API (`myelin_knowledge::refs_glue::emit_content_edges`). The CDC
 # carries the provider (the emit shape + the shared edge aggregate) + the consumer field reads
 # (reference-class never aliases lifecycle), modelled locally (myelin-knowledge is a producer LEAF).
+# ISS-P17 / P-383 (M4) adds the ISSUES-OWNED producer half: the three structured content nodes
+# (`mention`/`artifact_ref`/`embed`) in an issue body/comment emit the byte-identical
+# `refs.edge.created` (reference-class) wire shape via the outbox, NOT coalesced
+# (`myelin_issues::refs_glue::emit_content_edges`). The CDC carries the provider (the emit shape + the
+# shared edge aggregate) + the consumer field reads (reference-class never aliases lifecycle), modelled
+# locally (myelin-issues is a producer LEAF).
 cdc = [
     "crates/myelin-git/tests/cdc_5_4_13_1_git_content_edges.rs",
     "crates/myelin-knowledge/tests/cdc_5_4_5_5_5_6_5_7_knowledge_refs_glue.rs",
+    "crates/myelin-issues/tests/cdc_5_4_5_5_5_6_5_7_5_3_6_3_issues_refs_glue.rs",
 ]
 
 [[contract]]
@@ -935,10 +949,19 @@ title = "TE-7 typed-edge mirror"
 # feature, proven green against the live dev-stack). The `closes`/`depends_on`/`assigns` inverse token
 # stays the `Inverse::None` floor (the owning subsystem's mint).
 status = "covered"
+# ISS-P17 / P-383 (M4) adds the ISSUES-OWNED PRODUCER half of the SECOND TE-7 mirror: an
+# `issue_relation` typed-row write/delete emits `issue.relation.created`/`.removed`
+# (`rel_class='lifecycle'`) in the SAME outbox transaction (`myelin_issues::refs_glue::emit_relation_edge`),
+# so 0 typed-row-without-edge. The typed table is the SOURCE OF TRUTH; Issues emits the FORWARD edge
+# only over the whole lifecycle vocabulary (parent/blocks/blocked_by/closes/depends_on/relates) — the
+# inverse pairing + both-directions projection is the Refs mirror's (REF-P20, already named below). The
+# CDC models the consumer field reads locally (myelin-issues is a producer LEAF; no inverse token in
+# the emitted payload).
 cdc = [
     "crates/myelin-git/tests/cdc_5_5_git_lifecycle_edges.rs",
     "crates/myelin-knowledge/tests/cdc_5_4_5_5_5_6_5_7_knowledge_refs_glue.rs",
     "crates/myelin-refs-service/tests/cdc_5_5_issue_relation.rs",
+    "crates/myelin-issues/tests/cdc_5_4_5_5_5_6_5_7_5_3_6_3_issues_refs_glue.rs",
 ]
 
 [[contract]]
@@ -963,10 +986,20 @@ status = "covered"
 # counter = 0). Backs the chat run unfurl / PR context pane / knowledge embed / inbox / search snippet.
 # The provider+consumer pair (cdc_5_1_5_6_5_7_ci_surfacing.rs) proves the projection shape + the
 # tombstone-on-deny. Mandatory-core (a project leak IS the failure), mutation floor ≥ 80% on surfacing.rs.
+# ISS-P17 / P-383 (M4) adds the ISSUES-OWNED `project(ref, viewer)` half
+# (`myelin_issues::refs_glue::Projector::project`) — the ONLY way Refs/Search/Notif read an Issues
+# artifact (no cross-DB), per-viewer permission-checked on the `#sub`-stripped ROOT: a CONFIDENTIAL
+# issue degrades to a content-free tombstone CARRYING THE ROOT, never the title (the project-leak
+# counter = 0 — the ISS-D3 slice re-asserted at the unfurl boundary). The frozen
+# `{title,state,category,icon,render_hint,sub_anchor?}` shape; mandatory-core (a project leak IS the
+# failure), mutation floor ≥ 90% on refs_glue.rs (the permission-first gate + each ladder rung). The
+# provider+consumer pair (cdc_5_4_5_5_5_6_5_7_5_3_6_3_issues_refs_glue.rs) proves the shape + the
+# tombstone-on-deny + the chained mint→resolve-per-viewer flow.
 cdc = [
     "crates/myelin-git/tests/cdc_5_1_5_2_5_6_git_project.rs",
     "crates/myelin-knowledge/tests/cdc_5_4_5_5_5_6_5_7_knowledge_refs_glue.rs",
     "crates/myelin-ci-controlplane/tests/cdc_5_1_5_6_5_7_ci_surfacing.rs",
+    "crates/myelin-issues/tests/cdc_5_4_5_5_5_6_5_7_5_3_6_3_issues_refs_glue.rs",
 ]
 
 [[contract]]
@@ -990,6 +1023,11 @@ cdc = [
     "crates/myelin-knowledge/tests/cdc_5_7_knowledge_stable_id_mint.rs",
     "crates/myelin-knowledge/tests/cdc_5_4_5_5_5_6_5_7_knowledge_refs_glue.rs",
     "crates/myelin-ci-controlplane/tests/cdc_5_1_5_6_5_7_ci_surfacing.rs",
+    # ISS-P17 / P-383 (M4): Issues' owned `comment-`/`b`/`field-`/`row-` `#sub` mints — STABLE opaque
+    # ids minted through the ONE refs codec (0 ungrammatical; a tombstone always carries the root). The
+    # provider+consumer pair classifies every mint to its declared kind + strips it to the root, and
+    # PROVES the 4-step ladder over the mints (a confidential viewer of a #sub gets a tombstone).
+    "crates/myelin-issues/tests/cdc_5_4_5_5_5_6_5_7_5_3_6_3_issues_refs_glue.rs",
 ]
 # CI-P25 / P-368 (M4) adds CI's owned `#sub` mints: `step-<n>` (jump-to-failure, resolves
 # `CheckStatus.details_ref`) + `check-<context>` + `L<a>-L<b>`, minted through the ONE refs codec
@@ -1302,6 +1340,13 @@ cdc = [
     "crates/myelin-git/tests/cdc_6_3_git_code_projection.rs",
     "crates/myelin-git/tests/cdc_6_5_git_code_projection_emitter.rs",
     "crates/myelin-issues/tests/cdc_6_3_issues_facets_projection.rs",
+    # ISS-P17 / P-383 (M4): the LIVE Issues `issue.*` Search projection EMITTER that feeds the rows
+    # (`myelin_issues::refs_glue::IssueProjectFetcher`) — the `project(ref)` → SearchProjection push
+    # body the incremental indexer fetches through (the SAME cross-DB read; ACL-/restriction-/erasure-
+    # safe — a restricted/erased issue projects to Gone, no leak via a result/count/rank). The facet
+    # keys are byte-identical to the ISS-P04 declared 6.3 spec (the spec is the schema, the emitter is
+    # the row). This fills the named ISS-P04 emitter floor.
+    "crates/myelin-issues/tests/cdc_5_4_5_5_5_6_5_7_5_3_6_3_issues_refs_glue.rs",
     "crates/myelin-search/tests/cdc_6_3_kn_index_specs.rs",
     "crates/myelin-knowledge/tests/cdc_13_3_6_3_knowledge_flex_db.rs",
     "crates/myelin-knowledge/tests/cdc_6_3_6_1_6_2_knowledge_search_feed.rs",

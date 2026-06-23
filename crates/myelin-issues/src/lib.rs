@@ -232,6 +232,7 @@ pub mod projection_feeder;
 pub mod pseudonym;
 pub mod query_coown;
 pub mod rebac_fragment;
+pub mod refs_glue;
 pub mod reorder;
 pub mod replay;
 pub mod schema;
@@ -393,4 +394,22 @@ pub use views::{
     board_and_roadmap_share_row, edit_on_board_reflects_on_roadmap, type_rank_split_is_partition,
     IssueView, RowProjection, ViewFloors, BOARD_TYPE_RANK_MAX, CYCLE_FIELD, ORDER_KEY_FIELD,
     ROADMAP_TYPE_RANK_MIN, STATE_CATEGORY_FIELD, TYPE_RANK_FIELD,
+};
+
+// ISS-P17 (P-383, M4): the Refs wiring (resolve/project/#sub/edges/traverse/TE-7 mirror) + the
+// issue.* Search projection emitter. `project(ref, viewer)` (5.6, OWNED) is the only cross-DB read of
+// an Issues artifact — permission FIRST, a confidential issue returns a tombstone carrying the root,
+// NEVER the title (the ISS-D3 slice re-asserted at the unfurl boundary). The `#sub` mints
+// (comment-/b/field-/row-, 5.7) go through the ONE Refs codec; `emit_content_edges` (5.4) emits one
+// refs.edge.created per mention/artifact_ref/embed node; `emit_relation_edge` (5.5) is the TE-7
+// typed-edge mirror (the issue_relation table is truth); `IssueRelationGraph::traverse` (5.3) is the
+// bounded cycle-safe depth-16 walk; `IssueProjectFetcher` (6.3) is the LIVE issue.* Search projection
+// emitter (reindex 6.4 rides the ONE replay-from-source path). FLOOR: the cross-cell projection bridge
+// is the M5 follow-on (ISS-P32).
+pub use refs_glue::{
+    block_sub_ref, comment_sub_ref, edge_aggregate_key, emit_content_edges, emit_relation_edge,
+    field_sub_ref, issue_root_ref, row_sub_ref, IssueLifecycleRel, IssueMeta, IssueProjectFetcher,
+    IssueProjectionStore, IssueRelationGraph, LadderRung, ProjectError, Projected, Projection,
+    Projector, RelationEdge, SubAnchor, SubState, Tombstone, TombstoneReason, TraversedNode,
+    REFS_EDGE_CREATED, REL_CLASS_LIFECYCLE, REL_CLASS_REFERENCE, TRAVERSE_MAX_DEPTH,
 };
