@@ -2163,13 +2163,18 @@ dependencies = [
 name = "myelin-ci-dispatch"
 version = "0.0.0"
 dependencies = [
+ "aws-sdk-s3",
  "myelin-ci-sandbox",
+ "myelin-config",
  "myelin-events",
+ "myelin-flow",
  "myelin-git",
  "myelin-identity",
  "myelin-query",
+ "myelin-storage",
  "myelin-substrate",
  "myelin-tenancy",
+ "serde",
  "serde_json",
  "sqlx",
  "tokio",
