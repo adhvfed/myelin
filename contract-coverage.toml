@@ -1996,7 +1996,19 @@ cdc = [
     "crates/myelin-git/tests/cdc_11_2_git_pack_tier_consumer.rs",
     "crates/myelin-git/tests/cdc_11_2_c3_git_bundle_uri.rs",
     "crates/myelin-ci-dispatch/tests/cdc_ci_p11_resolve_dispatch.rs",
+    "crates/myelin-ci-controlplane/tests/cdc_11_2_11_4_ci_artifact_cache.rs",
 ]
+# P-365 (CI-P22, M4): the CI CONTROL-PLANE consumer of the C4 trust-scoped cache namespaces (11.2) —
+# `myelin_ci_controlplane::artifact_cache::derive_cache_scope` maps a run's CI-stamped `trust_tier`
+# (the `ci_run.trust_tier` fact + branch/PR provenance) to the EXACT `(TrustTier, CacheScope, pr_id)`
+# triple the storage `CiCacheNamespace::put` enforces against — the CI half of the poisoned-cache
+# defence. A fork run derives ONLY its `fork:<pr_id>` scope (a fork with no pr_id is a LOUD error,
+# never a fall-through to trusted); a trusted run derives `trusted` / `branch:<name>`. The two halves
+# AGREE with no drift (the CDC property). The CI-D6 drill (0 fork→trusted writes) is greened end-to-end
+# in drills_ci_p22_fork_cache_poison.rs. CI also consumes the within-EU CDN clone class (C3) + the
+# residency-pin on every artifact/cache/CDN write (ArtifactWritePin, 0 cross-region). FLOOR: the full
+# erase fan-out (crypto-shred ERASE path) is CI-P32 (P-492). Consumer CDC:
+# cdc_11_2_11_4_ci_artifact_cache.rs.
 # P-276 (GIT-P15): the GIT-SIDE consumer of the C3 within-EU CDN clone/bundle class — the bundle-URI
 # accelerated-clone path (myelin-git/src/shed_clone.rs BundleUriClone) CONSUMES the storage
 # CdnCloneClass (REUSED, never re-defined, EI-01 §7): publish a precomputed bundle → advertise a
@@ -2051,7 +2063,17 @@ cdc = [
     "crates/myelin-storage/tests/cdc_11_4_classify_key_choice.rs",
     "crates/myelin-storage/tests/cdc_11_4_erase_algorithm.rs",
     "crates/myelin-storage/tests/cdc_11_2_11_4_git_crypto_shred_reach.rs",
+    "crates/myelin-ci-controlplane/tests/cdc_11_2_11_4_ci_artifact_cache.rs",
 ]
+# P-365 (CI-P22, M4): the CI CONTROL-PLANE consumer of the per-subject-vs-per-tenant DEK selection
+# (11.4) for isolable inline log PII (Storage C1). `select_log_segment_dek` composes the FROZEN
+# `myelin_storage::kms::{KeyClass, PiiKeyRef}` grammar (no second vocabulary): an isolable subject →
+# `subject:<id>` DEK (the GD-4 individual crypto-shred lever, `kms://<tenant>/<epoch>/subject:<id>`);
+# non-isolable → the per-tenant DEK fallback (`kms://<tenant>/<epoch>/tenant`). The SAME selection
+# keys an artifact holding isolable subject PII (the `ci.artifact.published` pointer carries the
+# `pii_key_ref`, so the erase fan-out reaches the bytes). This BUILDS the per-subject DEK key-selection
+# SUBSTRATE; the full erase fan-out (crypto-shred ERASE path that destroys the DEK across every holder)
+# is the named M5 follow-on CI-P32 (P-492). Consumer CDC: cdc_11_2_11_4_ci_artifact_cache.rs.
 
 [[contract]]
 row = "11.5"
