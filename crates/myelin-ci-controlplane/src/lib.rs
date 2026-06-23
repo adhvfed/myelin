@@ -50,6 +50,7 @@
 //! The REAL forward-only apply against the dev-stack Postgres (RLS isolation + the claim indexes) is
 //! `tests/integration_ci_p6_controlplane_schema.rs` behind the `integration` cargo feature.
 
+pub mod artifact_cache;
 pub mod check_emitter;
 pub mod ci_pipeline;
 pub mod ci_result_signal;
