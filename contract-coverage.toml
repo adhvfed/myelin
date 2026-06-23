@@ -1441,6 +1441,14 @@ cdc = [
     # `git_review_requests_filter` / `matches_review_requests_view` predicate selects a row in the ONE
     # inbox; it does not move it into a parallel store.
     "crates/myelin-git/tests/cdc_5_2_7_3_7_1_git_humanise_resolve.rs",
+    # ISSUES slice — Issues (ISS-P22 / P-389, M4) pins that its "My Work" scoped view is a FILTER over
+    # the ONE inbox (`myelin_issues::my_work_filter` = `InboxFilter::issues_my_work`: subsystem∈{issue}
+    # ∧ a My-Work reason), a STRICT SUBSET (it adds no row), NEVER a second store; and that a
+    # mark/snooze on a My Work item reflects in the unified inbox (one read-state truth, 0 divergence).
+    # The PROVIDER (Issues returns the ONE filter) + CONSUMER (Notif's list_inbox reads the ONE inbox
+    # through it) pair — the live trigger/SLA → Signal → inbox wiring that ISS-P04's 7.6 reason set
+    # named as a follow-on.
+    "crates/myelin-issues/tests/cdc_7_1_7_3_issues_my_work.rs",
 ]
 
 # 7.2 COVERED at NOTIF-P6 (P-184): mark / snooze / mark_all_read — the ONE read-state truth. The
@@ -1502,6 +1510,15 @@ cdc = [
     # registered ICU body with the `{0}` per-viewer subject slot (NOTIF-D4), NEVER a raw string (the X-1
     # invariant is structural — there is no raw-string summary constructor). One vocabulary, no drift.
     "crates/myelin-ci-controlplane/tests/cdc_6_3_2_6_7_3_ci_surfacing_index.rs",
+    # ISSUES slice — Issues (ISS-P22 / P-389, M4) registers its SLA-at-risk / unblocked /
+    # approval-requested strings (`myelin_issues::register_issue_humanise_templates`) into the ONE
+    # templating surface (OQ-L — no second template engine): they are HumaniseTemplate rows in the ONE
+    # TemplateStore, rendered through the SAME `humanise` formatter + the SAME per-viewer tombstone-
+    # never-leak chokepoint (NOTIF-D4 — a denied viewer gets `a restricted issue`, never the title).
+    # The PROVIDER (Issues registers its strings, no 2nd engine) + CONSUMER (Notif's ONE humanise
+    # admits + renders + leak-gates them) pair. FLOOR: the SLA-breach ENGINE that FIRES the at-risk
+    # string is ISS-P26; the string registers here.
+    "crates/myelin-issues/tests/cdc_7_1_7_3_issues_my_work.rs",
 ]
 
 # 7.4 COVERED at NOTIF-P10 (P-188): get_prefs / set_prefs — prefs + quiet-hours over the frozen
