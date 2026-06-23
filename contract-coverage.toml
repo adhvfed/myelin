@@ -166,9 +166,13 @@ status = "covered"
 # KN-P06/P-296 (M3) adds the Knowledge OWNER emit seam (myelin_knowledge::emit) — every state change
 # emits via OutboxTx::emit ONLY (no-raw-publish), emit-iff-committed, PROVEN against the live dev-stack
 # Postgres outbox co-commit (tests/integration_kn_d7_outbox.rs).
+# CI-P23 (P-366, M4) adds the CI supply-chain verifier's CONSUMER side: every fail-closed refusal
+# builds a `ci.supply_chain.verification_failed` EventDraft (the frozen envelope shape, a registered
+# durable ci.* token, the `ci/run/<run_id>` aggregate, PII-free) to be emitted via the outbox ONLY.
 cdc = [
     "crates/myelin-storage/tests/cdc_st_02_coloc.rs",
     "crates/myelin-knowledge/tests/cdc_2_2_2_3_2_4_2_9_kn_d7_outbox.rs",
+    "crates/myelin-ci-controlplane/tests/cdc_supply_chain_2_2_10_6_4_7.rs",
 ]
 
 [[contract]]
@@ -1835,9 +1839,15 @@ cdc = [
 row = "10.6"
 title = "tamper-evident audit log"
 status = "covered"
+# CI-P23 (P-366, M4) adds a CONSUMER of the CT-Merkle PATTERN: CI's sigstore Rekor transparency log
+# is the SAME RFC 6962 BLAKE3 Merkle structure (deterministic root over leaf digests + the inclusion
+# check) GDPR/Audit's tamper-evident log builds — one Merkle convention platform-wide, no second
+# transparency mechanism (the audit-log CODE stays service-internal to gdpr-service; CI reuses the
+# structure over its own supply-chain leaves).
 cdc = [
     "crates/myelin-gdpr-service/tests/cdc_10_6_audit_log.rs",
     "crates/myelin-gdpr-service/tests/cdc_10_6_audit_proofs.rs",
+    "crates/myelin-ci-controlplane/tests/cdc_supply_chain_2_2_10_6_4_7.rs",
 ]
 
 [[contract]]

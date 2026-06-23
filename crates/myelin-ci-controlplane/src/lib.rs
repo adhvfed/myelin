@@ -66,6 +66,7 @@ pub mod rebac_fragment;
 pub mod schedule_and_run_job;
 pub mod scheduler;
 pub mod schema;
+pub mod supply_chain;
 
 // CI-P15 (P-358): the `ci.pipeline` DURABLE WORKFLOW BODY + the X-1 producer side. The deterministic
 // Rust body registered under `CI_PIPELINE_WF_TYPE` at serve (guarded by the flow-determinism lint):
@@ -102,6 +103,23 @@ pub use check_emitter::{
 // GIT-D10/CI-D8 seam GATE (CI's real `run_ci_pipeline_body` → this signal → Git's `run_merge_attempt`)
 // is `tests/drills_ci_p19_seam_gate.rs`. This CLOSES the X-1 seam — no new floor.
 pub use ci_result_signal::{CiResultSignal, RollupDelivery};
+
+// CI-P23 (P-366, M4, drill CI-D4): the SUPPLY-CHAIN TRUST verifier (arch 05 HP-4). The control-plane
+// service (arch 00 §4 names it) enforces the THREE HP-4 controls fail-closed:
+// digest-pin-or-fail-closed AT RUN (CI-P11 enforces it at plan; this re-asserts the FROZEN
+// `ImageRef::digest_pinned` rule before USE — 0 un-pinned executions), sign + verify-before-use
+// (sigstore Fulcio keyless bound to the 4.7 OIDC `BuildIdentity` + CI's sigstore Rekor transparency
+// log — the SAME RFC 6962 BLAKE3 Merkle structure GDPR/Audit's tamper-evident log builds, contract
+// 10.6 — verified BEFORE use; 0 unsigned-component runs), and SLSA L1–L2 provenance + SBOM
+// (CycloneDX/SPDX) for produced artifacts. Every refusal builds the audit-critical
+// `ci.supply_chain.verification_failed` draft via the outbox (contract 2.2). FLOORS: SLSA L3+
+// (hermetic/two-party) is demand-triggered (CI-M5); the component-registry PRODUCT is
+// commercial-flagged; the live Fulcio CA / EU-hosted Rekor witness round-trip is a deploy concern
+// (the verify-before-use LOGIC + the fail-closed gates are real + tested here).
+pub use supply_chain::{
+    BuildIdentity, KeylessSignature, RekorLog, Sbom, SbomFormat, SlsaProvenance,
+    SupplyChainVerifier, VerificationFailure,
+};
 
 // CI-P16 (P-359): the `SCHEDULE_AND_RUN_JOB` dispatch handshake into CI's `job_queue` + the
 // effectively-once invariant (CI-D1). The concrete `JobRunner` that BINDS the FROZEN engine dispatch
