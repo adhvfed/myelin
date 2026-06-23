@@ -125,6 +125,12 @@ myelin-harness = { path = "../myelin-harness" }
 # The CDC + drill build the inbound EventEnvelope / InlineNode fixtures the guards read (3.6 dispatch
 # tier, 13.1 inline ref nodes). myelin-content/-events/-identity/-tenancy are already lib deps; the
 # fixtures use them at test scope.
+# CI-P26 (P-369): the 8.1 X-6 CDC — the Fabric `requires_approval_default` seed table is RECONCILED
+# against CI's OWNED X-6 classification (`myelin_ci_controlplane::ci_requires_approval_default` + the
+# complete `ci_tool_defs`) so a gating drift on either side is a test break
+# (tests/cdc_8_1_ci_x6_tooldefs.rs). A DEV-DEP ONLY (the CDC test surface): `myelin-ci-controlplane`
+# is a producer leaf that does not depend back on `myelin-agent-service`, so the edge stays acyclic.
+myelin-ci-controlplane = { path = "../myelin-ci-controlplane" }
 
 [features]
 default = []

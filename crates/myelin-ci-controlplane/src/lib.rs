@@ -70,6 +70,8 @@ pub mod schema;
 pub mod secret_broker;
 pub mod supply_chain;
 pub mod surfacing;
+pub mod surfacing_index;
+pub mod surfacing_tools;
 
 // CI-P15 (P-358): the `ci.pipeline` DURABLE WORKFLOW BODY + the X-1 producer side. The deterministic
 // Rust body registered under `CI_PIPELINE_WF_TYPE` at serve (guarded by the flow-determinism lint):
@@ -241,6 +243,23 @@ pub use surfacing::{
     DeploymentMeta, LoweredFilter, PipelineMeta, ProjectError, Projected, Projection, Projector,
     RenderHint, RunMeta, SubAnchor, Tombstone, TombstoneReason, AUTHZ_VISIBLE_TABLE, CI_SUBSYSTEM,
     RUN_LIST_PERMISSION, VIEW,
+};
+
+// CI-P26 (P-369): the cross-fabric surfacing INDEX + REPLAY half — `declare_indexable` (the `ci/run`
+// IndexSpec, 6.3), the replay re-export + no-cross-db rebuild gate (2.6), and the humanise re-export
+// (7.3). `CI_SUBSYSTEM` is already re-exported from `surfacing` (one token) so it is referenced via
+// the module path here, not re-exported again.
+pub use surfacing_index::{
+    ci_run_index_spec, ci_summary, register_ci_run_index_spec, register_ci_summary_templates,
+    run_doc_is_indexable, summary_template_key, CheckVerdict, CiReindexSource, CiReplayKind,
+    CiSummary, CI_RUN_ACL_OBJECT_TYPE, CI_RUN_TYPE, CI_SUMMARY_TEMPLATES,
+};
+// CI-P26 (P-369): the `ToolDef` registrations half (8.1) — the complete CI agent-tool set with the
+// FROZEN X-6 `requires_approval` defaults. `CI_SUBSYSTEM` / `CI_TOOL_VERSION` are referenced via the
+// `surfacing_tools` module path (the surfacing module already owns the `CI_SUBSYSTEM` re-export).
+pub use surfacing_tools::{
+    ci_effect_kind, ci_required_caps, ci_requires_approval_default, ci_side_effecting, ci_tool_def,
+    ci_tool_defs, register_ci_tools, CI_TOOL_NAMES,
 };
 
 pub use scheduler::{
