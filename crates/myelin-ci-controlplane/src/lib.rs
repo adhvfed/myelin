@@ -52,6 +52,7 @@
 
 pub mod check_emitter;
 pub mod ci_pipeline;
+pub mod ci_result_signal;
 pub mod events;
 pub mod fairness;
 pub mod fleet;
@@ -70,7 +71,8 @@ pub mod schema;
 // `ci.check.updated` facts + `ci.run.failed`/`ci.run.succeeded` + the `ci.result` rollup signal
 // (contract 5.9). The `SCHEDULE_AND_RUN_JOB` handshake into the live scheduler/runner is CI-P16; the
 // reserve/settle metering into `cost_event` is CI-P17; the `check_attempt` monotonic counter + the
-// outbox producer plumbing is CI-P18; the end-to-end merge-queue seam GATE (GIT-D10/CI-D8) is CI-P19.
+// outbox producer plumbing is CI-P18; the end-to-end merge-queue seam GATE (GIT-D10/CI-D8) is now
+// CLOSED by CI-P19 (P-362) — the `ci.result` rollup SIGNAL ([`ci_result_signal::CiResultSignal`]).
 pub use ci_pipeline::{CheckFacts, PipelineRun, PipelineStage, RunVerdict, CI_PIPELINE_WF_TYPE};
 
 // CI-P18 (P-361): the X-1 `check_attempt` monotonic counter + the `ci.check.updated` PRODUCER (the
@@ -85,6 +87,18 @@ pub use check_emitter::{
     assemble_check_status, check_status_payload, details_ref, summary_for, CheckAttemptCounter,
     CheckEmitContext, CheckProvider, CheckState, CostPosture, TrustTier, BUMP_CHECK_ATTEMPT_SQL,
 };
+
+// CI-P19 (P-362): the X-1 `ci.result` ROLLUP SIGNAL that wakes Git's merge queue (the seam-closer
+// half of contract 5.9). CI's `ci.pipeline` body emits the per-context `ci.check.updated` BUS EVENTS
+// + the `ci.result` BUS EVENT; the merge-queue durable workflow waits on the durable `ci.result`
+// SIGNAL (`wait_for_signal("ci.result", idem_key=<merge_attempt_id>)`, contract 9.4). This module
+// turns CI's rollup into THAT signal: derive the FROZEN 5.9 verdict (REUSES `rollup_ci_result`),
+// encode it references-not-payloads (`encode_ci_result`), and deliver it idempotently on the
+// `idem_token` — a doubly-delivered rollup is ONE buffered `wf_signal` row → the merge queue wakes
+// EXACTLY ONCE (0 double-merge). CI emits the fact; Git gates; CI never merges. The end-to-end
+// GIT-D10/CI-D8 seam GATE (CI's real `run_ci_pipeline_body` → this signal → Git's `run_merge_attempt`)
+// is `tests/drills_ci_p19_seam_gate.rs`. This CLOSES the X-1 seam — no new floor.
+pub use ci_result_signal::{CiResultSignal, RollupDelivery};
 
 // CI-P16 (P-359): the `SCHEDULE_AND_RUN_JOB` dispatch handshake into CI's `job_queue` + the
 // effectively-once invariant (CI-D1). The concrete `JobRunner` that BINDS the FROZEN engine dispatch

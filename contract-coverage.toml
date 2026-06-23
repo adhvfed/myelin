@@ -1025,8 +1025,18 @@ status = "covered"
 # Git's frozen consumer view. The CDC PROVIDER half is below
 # (`crates/myelin-ci-controlplane/tests/cdc_5_9_ci_check_producer.rs`): CI's assembled payload decodes
 # through Git's REAL `CheckStatusConsumer::decode` (no drift; an incomplete payload is a LOUD decode
-# failure). The `ci.result` rollup end-to-end + the GIT-D10/CI-D8 seam GATE (0 double-merge) is CI-P19
-# (P-362); external-provider checks are a demand-driven follow-on.
+# failure). CI-P19/P-362 (M4) CLOSED THE SEAM END-TO-END FROM CI's REAL PRODUCER: the `ci.result`
+# rollup SIGNAL (`myelin_ci_controlplane::CiResultSignal` — derives the FROZEN 5.9 verdict via
+# `rollup_ci_result`, encodes it references-not-payloads via `encode_ci_result`, delivers it into the
+# merge-queue run's `wf_signal` store idempotent on the `idem_token` = merge_attempt_id; a
+# doubly-delivered rollup is ONE buffered row → the merge queue wakes EXACTLY ONCE). The GIT-D10/CI-D8
+# end-to-end GATE drives CI's REAL `run_ci_pipeline_body` → the per-context `ci.check.updated` facts →
+# Git's projection (monotonic supersession, 1 current row/key) → CI's REAL `ci.result` rollup signal →
+# Git's `run_merge_attempt` merge queue: (a) out-of-order/dup supersession holds, (b) fork self-green
+# NEUTRAL (merge-count == 0), (c) maintainer endorses → green, (d) doubly-delivered ci.result → wakes
+# once → merge-count == 1 (0 double-merge). The dated green artifact is in
+# `crates/myelin-ci-controlplane/tests/drills_ci_p19_seam_gate.rs`. The seam is frozen to the 5.9 shape
+# EXACTLY (no local divergence); external-provider checks are a demand-driven follow-on.
 cdc = [
     # the Bus's carriage CDC (the narrow half — envelope + ordering + the wait substrate)
     "crates/myelin-events/tests/cdc_5_9_check_seam_carriage.rs",
@@ -1055,6 +1065,15 @@ cdc = [
     # on settle; an untrusted_fork run is recorded faithfully but never endorsed; an incomplete
     # payload is a LOUD decode failure — the seam shape is a real gate).
     "crates/myelin-ci-controlplane/tests/cdc_5_9_ci_check_producer.rs",
+    # CI-P19 / P-362 (M4): the X-1 `ci.result` rollup SIGNAL + the GIT-D10/CI-D8 check-seam END-TO-END
+    # GATE driven by CI's REAL producer. `myelin_ci_controlplane::CiResultSignal` derives the FROZEN 5.9
+    # verdict (`rollup_ci_result`) + delivers it as the durable `ci.result` signal (references-not-
+    # payloads via `encode_ci_result`) idempotent on the merge_attempt_id. The drill drives CI's REAL
+    # `run_ci_pipeline_body` → Git's projection (monotonic supersession) → CI's real rollup signal →
+    # Git's merge queue: 1 current row/key, fork-self-green NEUTRAL (merge-count == 0), endorsed → GREEN,
+    # doubly-delivered ci.result → wakes once → merge-count == 1 (0 double-merge). CI is the producer
+    # (emits the rollup signal); Git is the gate (the merge performer is Git's). Closes the X-1 seam.
+    "crates/myelin-ci-controlplane/tests/drills_ci_p19_seam_gate.rs",
 ]
 
 # ──────────────── §6 Search (myelin-search) ─────────────────────────────────────────────────────
