@@ -264,6 +264,7 @@
 
 pub mod agent_spend;
 pub mod app;
+pub mod ci_guard;
 pub mod content;
 pub mod cost_bounder;
 pub mod declares;
@@ -412,6 +413,20 @@ pub use workflow::{
     arm_trigger_body, blocked_by_guard, example_arm_trigger, linked_pr_ci_green_guard,
     ArmedTrigger, GuardVar, IssueContext, PostAction, StateCategory, TransitionBlocked,
     TransitionPlan, Workflow, WorkflowError, WorkflowGuard, WorkflowState, WorkflowTransition,
+};
+
+// ISS-P27 (P-394, M4): the CI-red governed-transition guard — closing the X-1 consumer. At transition
+// time Issues reads the linked PR's CURRENT `CheckStatus{state, trust_tier}` OFF THE FACT (via
+// `project(PR_ref)`, contract 5.9 / 5.6), binds it into the guard context, and runs
+// `plan_transition` — "can't mark Done while CI red on the linked PR" BLOCKS with a reason; an
+// un-endorsed `untrusted_fork` success is NEUTRAL (the poisoned-Done defence). Issues NEVER recomputes
+// trust (the SAME posture Git's merge gate applies — one trust rule, EI-01 §7). The agent path is
+// HITL-gated (a permitted transition is WITHHELD for approval — 0 pre-approval mutation, AG-8). The
+// guard RESTS ON THE PROVEN X-1 SEAM (GIT-D10/CI-D8 GREEN), not a doc claim; no floor new.
+pub use ci_guard::{
+    bind_linked_pr_ctx, ci_done_guard, plan_agent_ci_gated_transition, plan_ci_gated_transition,
+    AgentTransitionOutcome, LinkedPrCheck, CHECK_STATE_NEUTRAL, CHECK_STATE_SUCCESS,
+    TRUST_TIER_TRUSTED, TRUST_TIER_UNTRUSTED_FORK,
 };
 
 // ISS-P13 (P-379, M4): the AST→OLTP-store compiler — the `list_objects` `SetExpr` push-down lowered
