@@ -83,6 +83,14 @@ status = "covered"
 # governance-correctness-bearing). FLOORS named: the hierarchy is a tree parent (constrained-DAG
 # portfolios M5+); the projection-feeder generated-index promotion is ISS-P15 (cold facets ride GIN
 # until a measured OQ-C threshold). The FSM interpreter + the QueryAst guards are ISS-P12.
+# ISS-P15 (P-381, M4): the projection feeder CONSUMES 1.5 — when a custom facet crosses the measured
+# OQ-C threshold (> 5% of a collection's view executions) the feeder PROVISIONS its generated/expression
+# index via a forward-only ONLINE migration: a `CREATE INDEX CONCURRENTLY` over the `props` JSONB tail,
+# asserted NON-BLOCKING on the declared-hot `issue` table (myelin_storage::migration::is_blocking_alter)
+# + forward-only (no down). Proven 0-downtime against the LIVE dev-stack Postgres: a concurrent INSERT
+# succeeds WHILE the CONCURRENTLY index builds, and EXPLAIN goes Seq Scan -> Index Scan on the generated
+# index (integration_iss_p15_projection_feeder.rs, --features integration). A below-threshold facet
+# provisions NO index (measured, never predicted).
 cdc = [
     "crates/myelin-substrate/tests/cdc_1_4_1_5_holders_and_migrations.rs",
     "crates/myelin-knowledge/tests/cdc_1_1_1_5_knowledge_boot_and_hot_tables.rs",
@@ -225,9 +233,13 @@ status = "covered"
 # SUB-D2/BUS-D2 drills. KN-P06/P-296 (M3) adds the Knowledge OWNER consumer-template instance: the
 # living-doc EventHandler with a `*`-free subjects() whitelist (rule 3) + idempotent-through-the-runtime
 # (rules 1/4), wired into the Knowledge AppSpec consumer seam (the relay + consumer in the boot hook).
+# ISS-P15 (P-381, M4) adds the Issues projection-feeder CONSUMER instance: the measured generated-index
+# promotion EventHandler with a `*`-free `issue.issue.updated` whitelist + idempotent-on-event_id handle,
+# admitted + driven through the Bus consumer runtime (cdc_2_4_issues_projection_feeder.rs).
 cdc = [
     "crates/myelin-events/tests/drills_sub_d2_consumer.rs",
     "crates/myelin-knowledge/tests/cdc_2_2_2_3_2_4_2_9_kn_d7_outbox.rs",
+    "crates/myelin-issues/tests/cdc_2_4_issues_projection_feeder.rs",
 ]
 
 [[contract]]

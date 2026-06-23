@@ -228,6 +228,7 @@ pub mod holder_intent;
 pub mod keys;
 pub mod migrations;
 pub mod planner;
+pub mod projection_feeder;
 pub mod pseudonym;
 pub mod query_coown;
 pub mod rebac_fragment;
