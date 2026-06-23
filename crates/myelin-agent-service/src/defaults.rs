@@ -62,11 +62,21 @@ use myelin_agent::{ToolDef, ToolName};
 /// added HERE, never silently un-gated at runtime).
 pub fn requires_approval_default(subsystem: &str, tool: &str) -> bool {
     match (subsystem, tool) {
-        // ── CI (§6.3) ──
+        // ── CI (§6.3 / X-6 frozen — the FULL agent-tool table, arch 04 §3) ──
+        // Gated (yes): consequential / irreversible / privileged.
         ("ci", "deploy") => true, // protected-env deploy is consequential
-        ("ci", "approve_deploy") => true, // approval is privileged
-        ("ci", "write_secret") => true, // secret write is privileged
+        ("ci", "approve_deploy") => true, // approval is privileged (agent cannot self-approve)
+        ("ci", "rollback") => true, // prod rollback is consequential (reversibility ≠ free)
+        ("ci", "write_secret") => true, // secret write is audit-critical / privileged
+        // NOT gated (no): cheap, reversible, metered, or an ACL-checked read.
+        ("ci", "run") => false, // start a run; reserve gate bounds spend (X-6)
         ("ci", "run_pipeline") => false, // non-prod: cheap, reversible, metered
+        ("ci", "cancel_run") => false, // cancel; low-risk, reversible
+        ("ci", "retry_run") => false, // re-run; reserve-gated; bumps run_attempt
+        ("ci", "read_log") => false, // ACL-checked read (RAG/triage input)
+        ("ci", "read_run") => false, // ACL-checked read (RAG/triage input)
+        ("ci", "validate") => false, // shift-left; no runner spend
+        ("ci", "plan") => false, // shift-left; no runner spend
 
         // ── Git (§6.3) ──
         ("git", "merge") => true, // merge is the consequential gate (AG-8)

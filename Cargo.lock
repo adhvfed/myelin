@@ -2107,6 +2107,7 @@ dependencies = [
  "hex",
  "myelin-agent",
  "myelin-chat",
+ "myelin-ci-controlplane",
  "myelin-ci-sandbox",
  "myelin-config",
  "myelin-content",
@@ -2149,6 +2150,7 @@ name = "myelin-ci-controlplane"
 version = "0.0.0"
 dependencies = [
  "aws-sdk-s3",
+ "myelin-agent",
  "myelin-ci-sandbox",
  "myelin-config",
  "myelin-events",
@@ -2157,7 +2159,10 @@ dependencies = [
  "myelin-git",
  "myelin-identity",
  "myelin-lints",
+ "myelin-notif",
+ "myelin-query",
  "myelin-refs",
+ "myelin-search",
  "myelin-storage",
  "myelin-substrate",
  "myelin-tenancy",

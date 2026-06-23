@@ -73,6 +73,21 @@ myelin-storage = { path = "../myelin-storage" }
 # The references-not-payloads `ArtifactRef` (contract 5.7) every X-1 check fact rides
 # (`run`/`details_ref` refs, never log bytes). The frozen Refs contract surface — a leaf edge.
 myelin-refs = { path = "../myelin-refs" }
+# CI-P26 (P-369): the cross-fabric surfacing `declare_indexable` half (contract 6.3) constructs the
+# ONE Search-owned `IndexSpec` (`myelin_search::IndexSpec`) for CI's `ci/run` projection — CI declares
+# WHAT to index (the run facets + the semantic failure_summary), Search owns the engine. The same
+# acyclic GIT-P5 edge (`myelin-git → myelin-search`): `myelin-search` has NO edge back to
+# `myelin-ci-controlplane` (a leaf producer), so `myelin-ci-controlplane → myelin-search` is acyclic.
+# `myelin-query` carries the frozen `FieldType` taxonomy the struct facets type over (re-export anchor).
+myelin-search = { path = "../myelin-search" }
+myelin-query = { path = "../myelin-query" }
+# CI-P26 (P-369): the `ToolDef` registrations half (contract 8.1) registers CI's agent-facing actions
+# into the ONE permissioned `ToolSurface` (`myelin_agent::ToolSurface`/`ToolDef`) with the FROZEN X-6
+# `requires_approval` defaults (deploy/secret/rollback/approve = yes; run/read/validate/plan = no).
+# `myelin-agent` is the frozen contract-surface types crate (deps only `myelin-identity` +
+# `myelin-events`, both already in this tree) — it has NO edge back to `myelin-ci-controlplane`, so
+# `myelin-ci-controlplane → myelin-agent` is acyclic (mirrors the `myelin-search` edge above).
+myelin-agent = { path = "../myelin-agent" }
 # CI-P14 (P-357): the fleet events are `EventDraft`s whose payload is a `serde_json::Value` (the
 # frozen envelope payload shape) — runner-id / region / pool / health, PII-free. The workspace
 # serde_json (the same crate the envelope payload uses); no new myelin edge.
@@ -115,6 +130,12 @@ myelin-lints = { path = "../myelin-lints" }
 # PRODUCTION code never depends on Git (it produces the frozen JSON shape); only the CDC test decodes
 # it through Git to PROVE the no-drift property.
 myelin-git = { path = "../myelin-git" }
+# CI-P26 (P-369): the 7.3 CDC CONSUMER half — CI's `CheckStatus.summary` HumanisedRef templates are
+# admitted into Notif's ONE humanise `TemplateStore` and every summary key resolves to a registered
+# ICU body (tests/cdc_6_3_2_6_7_3_ci_surfacing_index.rs). A DEV-DEP ONLY (the CDC test surface, NOT
+# the production DAG): `myelin-notif` is a leaf consumer that does not depend back on
+# `myelin-ci-controlplane`, so the test-only edge stays acyclic.
+myelin-notif = { path = "../myelin-notif" }
 
 [features]
 default = []

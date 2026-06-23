@@ -246,6 +246,11 @@ cdc = [
     # resurrected (X-7). The replay-idempotence gate (a re-run emits 0 new) is CI-green.
     "crates/myelin-knowledge/tests/cdc_2_6_knowledge_replay.rs",
     "crates/myelin-knowledge/tests/drill_kn_d6_reindex_parity.rs",
+    # CI-P26 / P-369 (M4): the CI surfacing-side 2.6 CDC — CI's replay (the EB-27/P-327
+    # `myelin_ci_sandbox::CiReindexSource`, RE-EXPORTED through `myelin_ci_controlplane::surfacing_index`,
+    # one source of truth) rebuilds the derived view from the `ci.run.snapshot` drafts ALONE (cold == live,
+    # no CI-DB read) + idempotent re-run. The surfacing read+ref half (5.1/5.6/5.7) is CI-P25/P-368.
+    "crates/myelin-ci-controlplane/tests/cdc_6_3_2_6_7_3_ci_surfacing_index.rs",
 ]
 
 [[contract]]
@@ -1215,6 +1220,14 @@ cdc = [
     "crates/myelin-search/tests/cdc_6_3_kn_index_specs.rs",
     "crates/myelin-knowledge/tests/cdc_13_3_6_3_knowledge_flex_db.rs",
     "crates/myelin-knowledge/tests/cdc_6_3_6_1_6_2_knowledge_search_feed.rs",
+    # CI-P26 / P-369 (M4): the CI slice — CI declares its owned `ci/run` IndexSpec
+    # (`myelin_ci_controlplane::ci_run_index_spec` — ci/run, acl_object_type=ci_run, the seven struct
+    # facets state/trust_tier/env/actor_pseudonym/created_at/repo_ref/commit_oid, SEMANTIC for the
+    # failure_summary RAG/dedup field) and Search ADMITS it into a live indexer (the build-time
+    # registration). The restriction flag is honoured (`run_doc_is_indexable` — 0 restricted/erased
+    # rows indexed). The run-projection EMITTER REUSES project() (§7.2); the SCIP/LSIF find-usages
+    # input (6.5) is the NAMED post-CI-M5 follow-on (arch 06 R-3). The CI-log doc spec is ci_log_projection.
+    "crates/myelin-ci-controlplane/tests/cdc_6_3_2_6_7_3_ci_surfacing_index.rs",
 ]
 
 [[contract]]
@@ -1323,6 +1336,13 @@ cdc = [
     # reason vocabulary (mentioned/comments/shared/watched) agrees between the 7.6 registration
     # (NOTIF-P20, cdc_7_6_4_9_knowledge_notif_rules.rs) and the 7.3 render — one vocabulary, no drift.
     "crates/myelin-knowledge/tests/cdc_5_2_7_3_knowledge_humanise_resolve.rs",
+    # CI slice — CI-P26 / P-369 (M4): CI's `CheckStatus.summary` HumanisedRef `(template_key, args)`
+    # (the NOTIF-P23/P-344 `myelin_ci_sandbox::notif_rules` set, RE-EXPORTED through
+    # `myelin_ci_controlplane::surfacing_index` so the surfacing surface names the humanise half)
+    # resolves through Notif's ONE humanise TemplateStore — every `ci.check.<verdict>` key admits to a
+    # registered ICU body with the `{0}` per-viewer subject slot (NOTIF-D4), NEVER a raw string (the X-1
+    # invariant is structural — there is no raw-string summary constructor). One vocabulary, no drift.
+    "crates/myelin-ci-controlplane/tests/cdc_6_3_2_6_7_3_ci_surfacing_index.rs",
 ]
 
 # 7.4 COVERED at NOTIF-P10 (P-188): get_prefs / set_prefs — prefs + quiet-hours over the frozen
@@ -1487,6 +1507,17 @@ status = "covered"
 cdc = [
     "crates/myelin-agent/tests/cdc_8_1_tool_surface.rs",
     "crates/myelin-knowledge/tests/cdc_8_1_knowledge_agent_tools.rs",
+    # CI-P26 / P-369 (M4): the CI X-6 slice — CI OWNS its action-consequence classification (X-6, a
+    # frozen contract value): `myelin_ci_controlplane::surfacing_tools` ships the COMPLETE CI agent-tool
+    # set (run/run_pipeline/cancel_run/retry_run/read_log/read_run/validate/plan = NOT gated;
+    # deploy/approve_deploy/rollback/write_secret = gated) with the frozen X-6 requires_approval +
+    # effect-kind/read split + the 4.9 required_caps, and `register_ci_tools` registers them into the ONE
+    # ToolSurface. The CDC RECONCILES the Fabric seed (`myelin_agent_service::defaults::
+    # requires_approval_default`) against CI's owned classification for every CI tool — a gating drift on
+    # either side is a test break. CI-P24/P-347 (`myelin_agent_service::ci_tools`) shipped the four
+    # privileged/run-pipeline consumer defs; CI-P26 completes the read/run/lifecycle/rollback rows so the
+    # frozen X-6 table is whole. ToolHands::exec is ABSENT (the runner itself, X-6 / 05 §HP-5).
+    "crates/myelin-agent-service/tests/cdc_8_1_ci_x6_tooldefs.rs",
 ]
 
 [[contract]]
