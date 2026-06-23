@@ -1644,6 +1644,15 @@ cdc = [
     # pair drives the Export service (provider) + the GDPR export(subject) holder pattern (consumer)
     # that assembles the subject's bundle by reusing it (EI-01 §7, one mechanism).
     "crates/myelin-knowledge/tests/cdc_13_2_10_1_knowledge_export_import.rs",
+    # CI-P9 / P-352 (M4) — the CI side of 10.1: the CI Control Plane holder (CiHolder, H2) over
+    # run-state/logs/artifacts/caches/deployments. locate/export are TYPED (empty-but-correct
+    # content-addressed receipts); restrict flips a REAL per-subject flag the CI index/agent/analytics/
+    # notif seams read (Art. 18/21); erase is STUBBED to crypto-shred — a typed no-op naming its CI-P32
+    # / CI-D3 fan-out follow-on (the per-subject/per-tenant DEK crypto-shred + pseudonym shred +
+    # ci.*.erased tombstones; residual = the ONE posture 10.9/X-7, by reference). The CI OLTP store
+    # auto-registers through the substrate one door (1.4) + classifies to H2 (0 orphans). The
+    # provider+consumer pair fans the DSR out via dyn PersonalDataHolder.
+    "crates/myelin-ci-controlplane/tests/cdc_10_1_ci_holder.rs",
 ]
 
 # 10.2 — the classify-derive (five tags + subject_locator, P-GA-07) PLUS the OQ-H worklog extension
