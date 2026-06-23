@@ -35,6 +35,27 @@ path = "src/lib.rs"
 myelin-substrate = { path = "../myelin-substrate" }
 
 # ------------------------------------------------------------------------------------------
+# CI-P10 (P-353, M4): the dispatch BEHAVIOUR's reused engines + frozen types. Trigger & Dispatch
+# is the graph's TERMINAL consumer (a subsystem crate OUTSIDE the modelled production DAG —
+# nothing depends back on it, so `substrate_is_root()` is preserved). It pulls:
+#   - myelin-query     — the ONE EventMatcher (= the frozen QueryAst, contract 3.4); a trigger
+#                        compiles to this, NOT a CI DSL / CEL. NO second predicate language.
+#   - myelin-ci-sandbox — the already-frozen 3-way `TrustTier` the `JobSpec.trust_tier` carries.
+#   - myelin-git       — the already-frozen 2-way `CheckStatus`-tier the merge gate reads (X-1).
+#   - myelin-events / myelin-identity / myelin-tenancy — the envelope + SetExpr/ObjectType + the
+#                        partition keys these surfaces are typed over.
+# These crates already sit above the substrate (myelin-ci-sandbox -> myelin-git -> myelin-query),
+# so adding them HERE creates no cycle (dispatch is the terminal leaf). cargo build --workspace
+# stays DB-free (none of these pull a DB on the default features).
+myelin-query = { path = "../myelin-query" }
+myelin-ci-sandbox = { path = "../myelin-ci-sandbox" }
+myelin-git = { path = "../myelin-git" }
+myelin-events = { path = "../myelin-events" }
+myelin-identity = { path = "../myelin-identity" }
+myelin-tenancy = { path = "../myelin-tenancy" }
+serde_json = { workspace = true }
+
+# ------------------------------------------------------------------------------------------
 # REAL live-stack schema apply behind the `integration` feature (CI-P6). The consumer_dedup ledger
 # migration gets PROVEN against the live dev-stack Postgres (forward-only apply + RLS isolation +
 # the exactly-once PRIMARY KEY) in tests/integration_ci_p6_dispatch_schema.rs. The OPTIONAL sqlx +

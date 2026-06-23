@@ -25,19 +25,36 @@
 //!     starts the workflow on; `authz` — the ReBAC `read & !is_untrusted_fork` edge the trust-tier
 //!     evaluation reads; the OLTP store is implicitly critical) for the readiness probe (§4.3).
 //!
-//! ## Floors named (the dispatch-behaviour follow-ons)
-//! This prompt ships the SHELL + the dedup-ledger SHAPE ONLY. The dispatch behaviour lands in its
-//! own prompt: the `EventMatcher` (= `QueryAst`) + the exactly-once dedup + the trust-tier
-//! evaluation + the single stamp is **CI-P10** (P-353); the definition resolution → content-
-//! addressed snapshot + the reserve/start handoff is **CI-P11** (P-354). Nothing here matches an
-//! event or starts a workflow; the dedup ledger gives CI-P10 its idempotency target.
+//! ## The dispatch BEHAVIOUR — CI-P10 (P-353) landed it in [`dispatch`]
+//! CI-P6 (this shell) shipped the dedup-ledger SHAPE; **CI-P10 (P-353) lands the dispatch
+//! behaviour** in the [`dispatch`] module ON TOP of that ledger: the [`compile_trigger`]
+//! `EventMatcher` (= the frozen `QueryAst`, contract 3.4 — a `pull_request` trigger IS a `QueryAst`,
+//! not CEL), the [`DedupLedger`] exactly-once effect (contract 2.5 — one push = one run), and the
+//! [`classify_trust`] / [`stamp_trust`] trust-tier evaluation + the single consistent stamp onto
+//! BOTH `JobSpec.trust_tier` AND `CheckStatus.trust_tier` (contract 4.9 / X-1). It REUSES the one
+//! `myelin-query` matcher engine and the already-frozen `myelin-ci-sandbox` / `myelin-git` trust
+//! enums — no second trigger language, no third trust enum.
+//!
+//! ## Floor named (the dispatch-behaviour follow-on)
+//! The definition resolution → content-addressed snapshot + the reserve/start handoff is **CI-P11**
+//! (P-354); the sandboxed dynamic-generation escape hatch is wired in **CI-P11**. The [`dispatch`]
+//! module stops at the matched, deduped, trust-stamped trigger — it produces the stamped
+//! [`TrustStamp`] + the dedup verdict; it does NOT read `.myelin/ci.*`, build the CAS snapshot, or
+//! call `DurableExecutor::start`. The shell below registers no consumer yet — the live trigger
+//! consumer (the bus subscription that drives this behaviour) lands with CI-P11's reserve/start.
 //!
 //! ## DB-free by default; the live-stack proof behind `integration`
 //! `cargo build --workspace` / `cargo test --workspace` stay DB-free. The REAL forward-only apply
 //! against the dev-stack Postgres (RLS isolation + the exactly-once PRIMARY KEY) is
 //! `tests/integration_ci_p6_dispatch_schema.rs` behind the `integration` cargo feature.
 
+pub mod dispatch;
 pub mod migrations;
+
+pub use dispatch::{
+    classify_trust, compile_trigger, git_trust_of, stamp_trust, trigger_matches, DedupLedger,
+    OnTrigger, RunProvenance, TrustStamp, TrustTier, RUN_OBJECT_TYPE, TRIGGER_CONSUMER,
+};
 
 use myelin_substrate::{
     boot, serve, AppSpec, Config, CriticalDependencies, InternalRpc, OutboxSpec, PublicRoutes,
@@ -70,8 +87,9 @@ fn dispatch_critical() -> CriticalDependencies {
 /// `config` is the validated, env-first config (§3.2; `Config::from_env()` lands with the driver,
 /// P-S15). The forward-only migration creates the `consumer_dedup` ledger `(tenant, region)`-first
 /// and RLS-on; `broker` / `authz` are declared critical. No consumers are registered at the SHELL —
-/// the real `EventMatcher` consumer (the dedup'd, trust-stamped trigger handler) is CI-P10; this
-/// shell carries the ledger SHAPE its idempotency rides on, not the handler.
+/// the dispatch BEHAVIOUR (the [`dispatch`] module's `EventMatcher` + dedup + trust stamp) is
+/// CI-P10's pure core; the bus-subscription consumer that drives it on each triggering event is
+/// wired in with CI-P11's reserve/start. This shell carries the ledger SHAPE the idempotency rides.
 pub fn dispatch_app_spec(config: Config) -> AppSpec {
     AppSpec {
         name: SERVICE_NAME,
@@ -82,7 +100,8 @@ pub fn dispatch_app_spec(config: Config) -> AppSpec {
         hot_tables: myelin_substrate::HotTables::none(),
         public: PublicRoutes::default(),
         internal: InternalRpc::default(),
-        // No consumers at the shell — the EventMatcher trigger consumer is CI-P10.
+        // No consumers at the shell — the dispatch behaviour is CI-P10's `dispatch` core; the
+        // bus-subscription that wires it in lands with CI-P11's reserve/start.
         consumers: Vec::new(),
         holders: AppSpec::auto(),
         // Trigger & Dispatch owns only its OLTP store (the dedup ledger lives in it); the harness
@@ -208,7 +227,8 @@ mod tests {
         );
         assert!(
             spec.consumers.is_empty(),
-            "no consumers at the shell (the EventMatcher trigger consumer is CI-P10)"
+            "no consumers at the shell yet (the dispatch BEHAVIOUR is CI-P10's `dispatch` module; \
+             the bus-subscription that wires it in lands with CI-P11's reserve/start)"
         );
         let deps: Vec<&str> = spec.critical.deps().iter().map(|d| d.0.as_str()).collect();
         assert!(
