@@ -39,6 +39,16 @@ myelin-substrate = { path = "../myelin-substrate" }
 myelin-gdpr = { path = "../myelin-gdpr" }
 # The frozen (tenant, region) partition-key value types (contract 12.1) every CI table is keyed on.
 myelin-tenancy = { path = "../myelin-tenancy" }
+# CI-P7 (P-350): the CI Control Plane is the outbox PRODUCER / check emitter (arch 00 §4), so it is
+# the proper home for CI's `ci.*` event-taxonomy REGISTRATION into the Bus seed (contract 2.9).
+# `myelin-events` is the FROZEN Bus grammar + the §6.2 subsystem/type token table CI registers
+# AGAINST (the one validator, EB-02 / P-042); `myelin-ci-sandbox` carries the canonical `ci.*` token
+# CONSTANTS the early M4 names-freeze (EB-27 / P-327) defined — the control plane RE-EXPORTS them
+# (one source of truth, no second token language). NO cycle: neither `myelin-events` nor
+# `myelin-ci-sandbox` has an edge back to `myelin-ci-controlplane` (it is a LEAF consumer, nothing in
+# the DAG depends on it), so `myelin-ci-controlplane → {myelin-events, myelin-ci-sandbox}` is acyclic.
+myelin-events = { path = "../myelin-events" }
+myelin-ci-sandbox = { path = "../myelin-ci-sandbox" }
 
 # ------------------------------------------------------------------------------------------
 # REAL live-stack schema apply behind the `integration` feature (CI-P6). The complete CI

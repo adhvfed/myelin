@@ -48,8 +48,15 @@
 //! The REAL forward-only apply against the dev-stack Postgres (RLS isolation + the claim indexes) is
 //! `tests/integration_ci_p6_controlplane_schema.rs` behind the `integration` cargo feature.
 
+pub mod events;
 pub mod migrations;
 pub mod schema;
+
+pub use events::{
+    ci_event_tokens, is_durable, register_ci_taxonomy, register_ci_tokens, validate_ci_type_token,
+    validate_ci_type_tokens, CiTypeTokenError, CI_DURABLE_TOKENS, CI_FIREHOSE_TOKENS,
+    CI_SUBSYSTEM_TOKEN, CI_TYPE_TOKENS,
+};
 
 use myelin_substrate::{
     boot, serve, AppSpec, Config, CriticalDependencies, InternalRpc, OutboxSpec, PublicRoutes,
