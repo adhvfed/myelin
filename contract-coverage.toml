@@ -2505,10 +2505,19 @@ title = "myelin-content taxonomy (frozen)"
 # GIT-P17/P-278 adds GIT as a CONSUMER of the frozen subset: PR/review/comment bodies are
 # `myelin-content` documents (`myelin_git::body::Body`) round-tripped `render(parse(md)) === md`
 # through the ONE editor render path (the KN-D2-class git-body corpus parity, 100%).
+# ISS-P10/P-376 adds ISSUES as a CONSUMER of the frozen subset: the issue description body + comments
+# are a `myelin-content` block SUBTREE (the consumed Issues SUBSET = the full block set MINUS the
+# Knowledge-only db_view/sync_block/toggle, X-2) under a single-author version-token CAS, round-tripped
+# `render(parse(md)) === md` through the ONE WASM render path (read + edit use the identical parser —
+# no second renderer). `myelin_issues::content` LINKS the frozen Block/Inline (never re-defines a node)
+# + the subset validator REJECTS a Knowledge-only node LOUDLY (never a silent drop). The Issues consumer
+# CDC (cdc_13_1_issues_content_subset.rs) pins the subset agreement; the ISS-D10 gate
+# (roundtrip_iss_d10.rs) is the 100%-round-trip body+comment corpus artifact.
 status = "covered"
 cdc = [
     "crates/myelin-content/tests/cdc_13_1_taxonomy.rs",
     "crates/myelin-git/tests/cdc_5_4_13_1_git_content_edges.rs",
+    "crates/myelin-issues/tests/cdc_13_1_issues_content_subset.rs",
 ]
 
 [[contract]]

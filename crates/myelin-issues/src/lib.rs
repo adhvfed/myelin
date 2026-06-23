@@ -155,10 +155,29 @@
 //! into the ISS-P06 write path — the minted canonical key co-commits with the issue's `issue.created`
 //! event (replacing the ISS-P06 placeholder). **FLOOR named:** the render-time `#<seqno>` projection
 //! ([`keys::render_display_key`]) is display-only, never stored, never an `ArtifactRef` link.
+//!
+//! ## ISS-P10 / P-376 (M4) — the issue body + comments as a `myelin-content` block subtree
+//! [`content`] makes an issue's **description body** and its **comments** real [`myelin_content`]
+//! documents: a **block subtree** (the consumed Issues SUBSET of the frozen contract-13.1 [`Block`]
+//! taxonomy — the full block set MINUS the Knowledge-only `db_view`/`sync_block`/`toggle`, X-2) whose
+//! every inline run round-trips `render(parse(md)) === md` through the **ONE WASM render path** (the
+//! SAME [`myelin_content::parse_inline`]/[`myelin_content::serialize_inline`] compiled native on the
+//! server and to `wasm32-unknown-unknown` for the editor — read + edit use the IDENTICAL parser, no
+//! second renderer, EI-01 §7). [`content::validate_subtree`] REJECTS a Knowledge-only node LOUDLY
+//! (never a silent drop); [`content::IssueContent::cas_edit`] is the **single-author version-token
+//! CAS** (arch §1.3 — NOT the Knowledge CRDT; a stale write loses loudly); [`content::emit_content_event`]
+//! co-commits the body/comment `issue.*` event through the ONE [`myelin_events::OutboxTx::emit`]
+//! (contract 2.2, emit-iff-committed). This completes M4-I1's first-runnable create → key → edit →
+//! link → reorder loop. **FLOORS named:** the move-CRDT body collaboration is OUT of v1 scope
+//! (single-author version-CAS is the floor); the at-rest per-subject-DEK body ciphertext is the
+//! storage layer's ([`dek`], ISS-P07 — `content` is the cleartext document); the structured-node →
+//! `refs.edge.created` emission is the Issues Refs-producer band (the node walk is
+//! [`content::IssueContent::structured_nodes`]).
 
 #![forbid(unsafe_code)]
 
 pub mod app;
+pub mod content;
 pub mod declares;
 pub mod dek;
 pub mod events;
@@ -248,4 +267,19 @@ pub use write_path::create_issue;
 pub use reorder::{
     cmp_ranked, rebalance, reorder, same_displayed_sequence, BoardRanking, RankedIssue,
     ReorderError, ReorderOutcome, ReorderRequest,
+};
+
+// ISS-P10 (P-376, M4): the issue body + comments as a `myelin-content` block subtree (the consumed
+// Issues SUBSET, X-2) under a single-author version-token CAS, round-tripping `render(parse(md)) ===
+// md` through the ONE WASM render path (the SAME parse/serialize the editor compiles to wasm32 — no
+// second renderer). `validate_subtree`/`is_issue_block` enforce the Issues subset (reject the
+// Knowledge-only db_view/sync_block/toggle LOUDLY); `IssueContent::cas_edit` is the single-author CAS
+// (stale write loses); `emit_content_event` co-commits the body/comment event through the ONE
+// `OutboxTx::emit` (contract 2.2). `roundtrips_md`/`paragraph_body` are the editor-entry helpers the
+// ISS-D10 corpus gate feeds. FLOOR named: the move-CRDT body collaboration is out of v1 scope
+// (single-author version-CAS is the floor); the at-rest per-subject-DEK body ciphertext is the
+// storage layer's (`dek`); the structured-node → refs.edge.created emission is the Refs-producer band.
+pub use content::{
+    emit_content_event, is_issue_block, paragraph_body, roundtrips_md, validate_subtree,
+    CasConflict, ContentError, ContentKind, IssueContent, SubsetError, ISSUES_EXCLUDED_BLOCKS,
 };
