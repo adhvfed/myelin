@@ -611,6 +611,27 @@ impl SchedulerState {
         false
     }
 
+    /// **Complete a job — move it to `terminal` (the runner reported `job.done`).** A `leased` /
+    /// `running` job whose runner finished is moved to `terminal` (clearing the lease) so the reaper
+    /// NEVER re-queues a completed job (a completed job is not a dead-runner orphan — re-queuing it
+    /// would double-run it). Idempotent: a re-complete of an already-`terminal` job is a NO-OP
+    /// (returns false) — this is the `job.done` side of the effectively-once invariant (a double-
+    /// delivered `job.done` terminates the row ONCE). Returns true iff this call moved the row to
+    /// terminal. A `queued` job (not yet claimed) reporting done is unusual but also terminates (the
+    /// runner finished a job the scheduler had not yet observed as leased).
+    pub fn complete_job(&mut self, tenant_id: &str, job_id: &str) -> bool {
+        if let Some(i) = self.find(tenant_id, job_id) {
+            let j = &mut self.jobs[i];
+            if j.state != JobState::Terminal {
+                j.state = JobState::Terminal;
+                j.lease_owner = None;
+                j.lease_expires = None;
+                return true;
+            }
+        }
+        false
+    }
+
     /// The state of a job (for assertions).
     pub fn state_of(&self, tenant_id: &str, job_id: &str) -> Option<JobState> {
         self.find(tenant_id, job_id).map(|i| self.jobs[i].state)
