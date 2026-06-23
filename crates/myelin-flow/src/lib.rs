@@ -37,7 +37,9 @@
 //!   (the structural references-not-payloads half) → **LANDED at P-FLOW-03** (P-201), see [`holder`]
 //!   ([`WfHistoryHolder`]: `locate`/`export` real over the journal, `erase` structurally wired; the
 //!   flow store classifies to H8 — the §5.5 references-not-payloads reconcile; the per-subject-DEK
-//!   crypto-shred reach is the NAMED M5 follow-on **P-FLOW-23**).
+//!   crypto-shred reach is the NAMED M5 follow-on **P-FLOW-24** — N.B. P-FLOW-23 is the X-1 seam
+//!   end-to-end, NOT the crypto-shred; the erasure follow-on is P-FLOW-24, the merge-queue floor's
+//!   crypto-shred sibling in the §6.5 cluster).
 //! - **The algorithms**: WfCtx + journal/outbox co-commit (**P-FLOW-04**, FLOW-D5) — **LANDED**,
 //!   see [`wfctx`] ([`WfCtx`]: `activity`/`now`/`rand`/`emit` + the single-txn co-commit; the
 //!   FLOW-D5 drill is `tests/drills_flow_d5_cocommit.rs`); deterministic
@@ -122,10 +124,16 @@
 //!   `04-sandbox-AG-D4.md`, NO untrusted code until green). The merge-queue-in-isolation drill (0
 //!   double-merge, 1 wake/attempt, timeout-bounded) is `tests/drills_flow_merge_queue.rs`; the 5.9
 //!   merge-queue CONSUMER CDC pair (vs CI's `ci.result` producer shape) is
-//!   `tests/cdc_5_9_merge_queue.rs`. **NAMED FLOOR:** this is the merge-queue body built + drilled
-//!   IN ISOLATION against a MOCK [`MockCiResultProducer`]; the X-1 seam END-TO-END against CI's REAL
-//!   `ci.result` producer (GIT-D10 / CI-D8) is **P-FLOW-22** (M4 — the floor this prompt opens). (M2.4
-//!   — and the whole M2 engine surface for myelin-flow — is now covered across P-FLOW-13..19.)
+//!   `tests/cdc_5_9_merge_queue.rs`. The body was built + drilled IN ISOLATION against a MOCK
+//!   [`MockCiResultProducer`] (P-FLOW-19, the floor). **P-FLOW-23 (P-346, M4) CLOSED that floor —
+//!   the X-1 seam END-TO-END**: [`RealCiResultProducer`] replaces the mock with CI's REAL producer
+//!   wiring (the merge queue wakes on the rollup CI DERIVES from per-context `ci.check.updated` facts
+//!   through `myelin_events::check_seam::{CheckSeamOrder, rollup_ci_result}` + Git's `run_attempt`
+//!   supersession, keyed idempotently on the `merge_attempt_id`). GIT-D10 / CI-D8 green (0
+//!   double-merge, merge-count == 1/attempt, 0 spurious unblock, across re-delivery + restart) —
+//!   `tests/drills_flow_d10_x1_seam_e2e.rs`; the consumer half is now paired with CI's real provider
+//!   half in `tests/cdc_5_9_merge_queue.rs`. (M2.4 — and the whole M2 engine surface for myelin-flow
+//!   — is covered across P-FLOW-13..19.)
 //! - **The §6.6 resumable maintenance activities + the history-rewrite invalidation fan-out** (the M3
 //!   support Git's GC / repack / bundle-gen / history-rewrite ride) → **LANDED at P-FLOW-20** (P-265),
 //!   see [`maintenance`] ([`WfCtx::run_maintenance`]: a maintenance op as a sequence of journaled
@@ -245,9 +253,9 @@ pub use maintenance::{
 };
 pub use merge_queue::{
     ci_dispatch_marker, decode_ci_result, encode_ci_result, git_pr_merged_draft,
-    humanise_dequeue_reason, merge_attempt_id, CiDispatch, CiDispatcher, DequeueCause,
-    MergeOutcome, MergePerformer, MergeRequest, MockCiResultProducer, CI_RESULT_SIGNAL,
-    GIT_PR_MERGED_EVENT,
+    humanise_dequeue_reason, merge_attempt_id, CheckFact, CiDispatch, CiDispatcher, DequeueCause,
+    MergeOutcome, MergePerformer, MergeRequest, MockCiResultProducer, RealCiResultProducer,
+    CI_RESULT_SIGNAL, GIT_PR_MERGED_EVENT,
 };
 pub use remint::{DelegationCaveats, RunTokenError, RunTokenHandle, RunTokenLease, RunTokenMinter};
 pub use signal_consumer::{FlowSignalConsumer, SIGNAL_EVENT_TYPE};
