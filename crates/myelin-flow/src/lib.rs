@@ -192,6 +192,7 @@
 pub mod app;
 pub mod approval;
 pub mod budget;
+pub mod ci_pipeline;
 pub mod engine;
 pub mod executor;
 pub mod holder;
@@ -216,6 +217,10 @@ pub use approval::{
     GatedEffect, APPROVAL_REQUESTED_EVENT, APPROVAL_SIGNAL_NAME, DECLINE_MARKER,
 };
 pub use budget::{BudgetError, BudgetGate, BudgetSettle, Wallet};
+pub use ci_pipeline::{
+    read_stage_verdict, stage_verdict_marker, CiPipelineSpec, CiStage, PipelineOutcome,
+    CI_PIPELINE_WF_TYPE,
+};
 pub use engine::{
     drive, drive_full, drive_versioned, drive_with_timers, run_state, DriveOutcome, FlowDispatcher,
     FlowTelemetry, RunRow, RunStore, SignalRow, SignalStore, WorkflowBody,

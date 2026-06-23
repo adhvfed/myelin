@@ -162,3 +162,81 @@ mod green_compiles {
         let _ = make_error();
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// `flow-determinism` over the CI-PIPELINE-AS-WORKFLOW body (P-FLOW-22 / P-345, CI-D9) — the
+// reference fixture's body. The committed-ratchet proof (EI-01 §5): the CI-pipeline body reads NO
+// clock/RNG/IO outside `WfCtx` (every long stage rides the deterministic `SCHEDULE_AND_RUN_JOB`
+// surface), so the lint ADMITS it and it COMPILES against the real `WfCtx::run_ci_pipeline`; a
+// CI-pipeline body with a raw `SystemTime::now()`/`rand::`/`tokio::time::sleep`/`Uuid::new_v4` is
+// REJECTED (the non-deterministic-replay bug class: a re-driven pipeline would dispatch a different
+// stage / double-deploy).
+// ---------------------------------------------------------------------------------------------
+
+/// **The lint REJECTS the raw-clock/RNG/IO CI-pipeline red fixture and ADMITS the WfCtx-routed green
+/// one (CI-D9, the flow-determinism half).** A CI-pipeline body that read `SystemTime::now()` or
+/// dispatched a stage chosen by `rand::random()` would diverge on replay (a double-deploy / a lost
+/// run); the lint fires on every raw read and stays silent when every stage rides the deterministic
+/// `run_ci_pipeline` → `SCHEDULE_AND_RUN_JOB` surface.
+#[test]
+fn flow_determinism_rejects_raw_ci_pipeline_body_admits_wfctx_ci_pipeline() {
+    let red = fixture("ci_pipeline.flow.red.rs.txt");
+    let violations = flow_determinism().run(&red);
+    assert!(
+        !violations.is_empty(),
+        "a CI-pipeline body reading SystemTime/RNG/IO outside WfCtx must be REJECTED by \
+         flow-determinism (the non-deterministic-replay floor, index 9.2/§4.9)"
+    );
+    assert!(
+        violations.len() >= 4,
+        "all four raw non-deterministic reads (SystemTime::now / rand:: / tokio::time::sleep / \
+         Uuid::new_v4) in the CI-pipeline body must each be flagged, got {}: {violations:?}",
+        violations.len()
+    );
+
+    let green = fixture("ci_pipeline.flow.green.rs.txt");
+    assert!(
+        flow_determinism().run(&green).is_empty(),
+        "the CI-pipeline body expressed via run_ci_pipeline → SCHEDULE_AND_RUN_JOB must be ADMITTED \
+         by flow-determinism (it reads no clock/RNG/IO outside the deterministic WfCtx surface)"
+    );
+}
+
+/// **The GREEN CI-pipeline fixture COMPILES against the real `myelin_flow::WfCtx::run_ci_pipeline`.**
+/// This `include!`s the exact green-fixture source, so a build of this test crate is a real `rustc`
+/// compile of the CI-pipeline reference body against the frozen `WfCtx` surface
+/// (`run_ci_pipeline` → `metered_schedule_and_run_job` → `wait_for_signal`). If the fixture ever
+/// drifted off the real surface, THIS test crate would fail to COMPILE — the "green admits" half of
+/// the CI-D9 gate is an artifact, not a claim.
+mod ci_pipeline_green_compiles {
+    // NOTE: `JobRunner` / `JobSpec` / `WfCtx` / `WfResult` / `PipelineOutcome` are imported by the
+    // included fixture source itself (it is real, self-contained crate code), so we do NOT re-import
+    // them here. We add only `JobKind` (referenced by the fixture's `_example_spec` helper but not in
+    // its own `use`).
+    use myelin_flow::JobKind;
+
+    include!("fixtures/ci_pipeline.flow.green.rs.txt");
+
+    /// A concrete CI runner the included generic body is instantiated against (so the body's full
+    /// generic surface is type-checked, not just its signature). The dispatch is a no-op recorder —
+    /// compiling the body is THIS test's proof; driving it is the unit/drill tests' job.
+    struct NoopCiRunner;
+    impl JobRunner for NoopCiRunner {
+        fn dispatch(&self, _spec: &JobSpec) -> Result<(), myelin_flow::ActivityError> {
+            Ok(())
+        }
+    }
+
+    /// Reference the included workflow fn (instantiated against `NoopCiRunner`) so it is fully
+    /// type-checked against the real `WfCtx::run_ci_pipeline` surface.
+    #[test]
+    fn ci_pipeline_green_fixture_compiles_against_real_wfctx() {
+        let _body: fn(
+            &mut myelin_flow::WfCtx,
+            &NoopCiRunner,
+        ) -> myelin_flow::WfResult<myelin_flow::PipelineOutcome> =
+            ci_pipeline_workflow::<NoopCiRunner>;
+        let _ = JobKind::Ci;
+        let _ = _example_spec();
+    }
+}

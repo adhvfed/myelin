@@ -369,9 +369,34 @@ impl WfJournal {
             );
             if inner.journaled_commands.insert(key) {
                 inner.history.push(row);
+            } else if row.kind == crate::wfctx::history_kind::SIGNAL_RECEIVED {
+                // **A `signal_received` UPGRADES a journaled `signal_waited` at the SAME command_id
+                // (§4.3).** A `wait_for_signal` that PARKED journals a provisional `signal_waited` row;
+                // when a later drive RESUMES + consumes the named signal, the wait resolves to a
+                // `signal_received` carrying the CONSUMED signal's idem_key + payload refs. The two are
+                // the SAME command position (the `UNIQUE(tenant, run_id, command_id)` row), so the
+                // receipt UPGRADES the park IN PLACE rather than appending a second row. This records
+                // WHICH idem_key the wait consumed, so a subsequent replay short-circuits to the SAME
+                // signal (consume-exactly-once) — essential when a body re-uses ONE signal NAME across
+                // several waits (a CI pipeline's per-stage `job.done`, §4.9 item 6): without the
+                // upgrade, a re-driven earlier wait would re-scan the buffer and wrongly consume a LATER
+                // stage's still-buffered signal (the multi-signal-name reuse divergence). The upgrade is
+                // idempotent: a re-driven receipt of an already-`signal_received` row is a no-op (the
+                // first receipt's captured idem_key stays). NEVER downgrades a `signal_received` back to
+                // a `signal_waited`.
+                if let Some(existing) = inner.history.iter_mut().find(|h| {
+                    h.tenant.0 == row.tenant.0
+                        && h.run_id == row.run_id
+                        && h.command_id == row.command_id
+                        && h.kind == crate::wfctx::history_kind::SIGNAL_WAITED
+                }) {
+                    existing.kind = row.kind;
+                    existing.result = row.result;
+                    existing.result_key_ref = row.result_key_ref;
+                }
             }
-            // else: UNIQUE(tenant, run_id, command_id) — already journaled, this is a no-op
-            // (idempotent journaling; the replay-safe property §3.2).
+            // else: UNIQUE(tenant, run_id, command_id) — already journaled (and not a park→receipt
+            // upgrade), this is a no-op (idempotent journaling; the replay-safe property §3.2).
         }
         inner.attempts.extend(attempts);
     }
