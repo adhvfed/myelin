@@ -191,6 +191,29 @@
 //! generated-index promotion is ISS-P15 (a cold facet rides the GIN index until a measured OQ-C
 //! threshold, [`schemes::IndexPosture`]). The FSM interpreter + the QueryAst guards that RUN the
 //! workflow body are the next prompt, ISS-P12.
+//!
+//! ## ISS-P12 / P-378 (M4) — the data-driven workflow FSM interpreter + the QueryAst guards
+//! [`workflow`] ships the BEHAVIOUR over the ISS-P11 `workflow`-scheme config: the data-driven FSM
+//! interpreter ([`workflow::Workflow`] / [`workflow::Workflow::plan_transition`]) over a CONFIG FSM —
+//! not codegen, not user-scripting (EI-01 §7). The ONE mandatory governance invariant is the FIXED
+//! [`workflow::StateCategory`] set (unstarted/started/completed/cancelled) over unlimited admin-named
+//! [`workflow::WorkflowState`]s; guards are the frozen [`myelin_query::QueryAst`]
+//! ([`workflow::WorkflowGuard`] — bounded, no UDFs/loops/recursion); required-fields-on-transition;
+//! and the post-actions ([`workflow::PostAction`] — assign/set-field/link/arm-trigger), the
+//! arm-trigger carrying the frozen [`myelin_query::EventMatcher`] = the SAME `QueryAst` core (contract
+//! 3.4). A blocked transition returns a pre-assembled, admin-authored reason
+//! ([`workflow::TransitionBlocked`]) — never a silent allow, never a silent drop; an un-evaluable
+//! guard fails CLOSED. The interpreter is the pure governance decision the ISS-P06 write path then
+//! drives (the transition ABAC — `Id.check` + the transition `CaveatContext`, contract 4.2 — is
+//! already wired on [`write_path::apply_mutation`] for a [`write_path::MutationKind::Transition`]); the
+//! interpreter NEVER emits (emit is the ONE `OutboxTx::emit` verb). The ISS-D12 guard-half green
+//! artifact is the canonical [`workflow::blocked_by_guard`] ("can't close while `blocked_by` an open
+//! issue" → blocked + reason). The flow-determinism lint (1.6) holds on the arm-trigger workflow body
+//! ([`workflow::arm_trigger_body`] reads time through `WfCtx`, never a raw clock). **FLOOR named:** the
+//! CI-red guard half of ISS-D12 ("can't mark Done while CI red on the linked PR" — the X-1
+//! `CheckStatus` + `trust_tier` off the fact, contract 5.9 / Δ10) lands in **ISS-P27 (P-394)** when the
+//! X-1 check-seam closes; the guard SHAPE is here ([`workflow::linked_pr_ci_green_guard`], fails closed
+//! until then).
 
 #![forbid(unsafe_code)]
 
@@ -211,6 +234,7 @@ pub mod replay;
 pub mod schema;
 pub mod schemes;
 pub mod sla_escalation;
+pub mod workflow;
 pub mod write_path;
 
 pub use replay::{IssueReindexSource, IssueReplayKind};
@@ -315,4 +339,18 @@ pub use schemes::{
     add_flexible_field, org_default_scheme_id, resolve, specificity_rank, FlexibleField,
     FlexibleFieldWrite, IndexPosture, Reassignment, ResolveContext, ResolveKey, Scheme,
     SchemeAssignment, SchemeKind, SchemeResolver, TypeDef, TypeSchemeBody,
+};
+
+// ISS-P12 (P-378, M4): the data-driven workflow FSM interpreter + the frozen-QueryAst guards.
+// `Workflow::plan_transition` is the pure governance decision (the FIXED state-category invariant +
+// the bounded QueryAst guards + required-fields + the staged post-actions) the ISS-P06 write path
+// drives; a blocked transition returns a pre-assembled reason (the ISS-D12 guard half — `blocked_by`
+// an open issue → blocked + reason via `blocked_by_guard`). Guards are `myelin_query::QueryAst`, the
+// arm-trigger post-action carries `myelin_query::EventMatcher` (= QueryAst, 3.4); the arm-trigger
+// workflow body (`arm_trigger_body`) reads time through WfCtx (flow-determinism, 1.6). FLOOR: the
+// CI-red guard half (X-1 CheckStatus + trust_tier) lands in ISS-P27 (`linked_pr_ci_green_guard` shape).
+pub use workflow::{
+    arm_trigger_body, blocked_by_guard, example_arm_trigger, linked_pr_ci_green_guard,
+    ArmedTrigger, GuardVar, IssueContext, PostAction, StateCategory, TransitionBlocked,
+    TransitionPlan, Workflow, WorkflowError, WorkflowGuard, WorkflowState, WorkflowTransition,
 };

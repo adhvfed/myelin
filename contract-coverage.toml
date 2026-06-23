@@ -2620,6 +2620,28 @@ row = "13.3"
 # RED-UNTIL-RUN here, never self-asserted (EI-01 §3). FLOOR named: ranking = order_key + server-
 # arbitrated CAS; the move-CRDT (Yrs list / Fugue) reusing the byte-identical order_key is the measured
 # M5 follow-on (ISS-P32) — the promotion swaps the conflict engine, not the data model.
+# ISS-P12 / P-378 (M4): Issues now EXECUTES the QueryAst guard half of 13.3 (and 3.4) — the
+# data-driven workflow FSM interpreter (myelin_issues::workflow). A governed transition runs the
+# frozen myelin_query::QueryAst guards (WorkflowGuard::predicate — NOT re-defined; the shared engine is
+# called) over an IssueContext: a defined-false OR un-evaluable guard BLOCKS with a pre-assembled,
+# admin-authored reason (fail-closed — MissingContext → block, never a silent allow), required-fields
+# are enforced, and a permitted transition stamps the FIXED state-category (unstarted/started/completed/
+# cancelled — the ONE mandatory governance invariant) + stages the post-actions (assign/set-field/link/
+# arm-trigger; the arm-trigger carries the frozen myelin_query::EventMatcher = the SAME QueryAst core,
+# 3.4). The interpreter is the pure governance decision the ISS-P06 write path drives (the transition
+# ABAC — Id.check + the transition CaveatContext, 4.2 — is already wired on apply_mutation); it NEVER
+# emits. The ISS-D12 guard-half drill (e2e_iss_p12_workflow_fsm.rs) proves "can't close while blocked_by
+# an open issue" → transition blocked + reason + 0 pre-approval mutation; the guard config-shape CDC
+# (same file) pins the workflow body round-trip (provider: ISS-P11 scheme author; consumer: the FSM
+# interpreter). The flow-determinism lint (1.6) is GREEN over the arm-trigger workflow body
+# (lint_workflow_determinism.rs — time read through WfCtx, never a raw clock), with a RED witness.
+# MUTATION FLOOR (mandatory-core — the guard is governance-correctness-bearing): `cargo mutants -p
+# myelin-issues --file crates/myelin-issues/src/workflow.rs` MET at 26 caught / 0 missed / 10 unviable
+# (100% of viable mutants — the guard-evaluation decision, the fixed-category stamp, required-fields,
+# and the fail-closed un-evaluable-guard path are all killed). FLOOR named: the CI-red guard half of
+# ISS-D12 ("can't mark Done while CI red on the linked PR" — the X-1 CheckStatus + trust_tier off the
+# fact, 5.9/Δ10) lands in ISS-P27 (P-394) when the X-1 check-seam closes; the guard SHAPE
+# (linked_pr_ci_green_guard) is here and fails closed until then.
 title = "myelin-query primitive (frozen byte-identical)"
 status = "covered"
 cdc = [
@@ -2627,6 +2649,7 @@ cdc = [
     "crates/myelin-query/tests/cdc_13_3_order_key.rs",
     "crates/myelin-issues/tests/cdc_13_3_issues_coown.rs",
     "crates/myelin-issues/tests/drill_iss_d5_reorder_zero_clobber.rs",
+    "crates/myelin-issues/tests/e2e_iss_p12_workflow_fsm.rs",
     "crates/myelin-knowledge/tests/cdc_13_3_6_3_knowledge_flex_db.rs",
     "crates/myelin-knowledge/tests/cdc_13_3_4_3_knowledge_rollup.rs",
 ]
