@@ -262,6 +262,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod agent_spend;
 pub mod app;
 pub mod content;
 pub mod cost_bounder;
@@ -553,4 +554,9 @@ pub use refs_glue::{
     IssueProjectionStore, IssueRelationGraph, LadderRung, ProjectError, Projected, Projection,
     Projector, RelationEdge, SubAnchor, SubState, Tombstone, TombstoneReason, TraversedNode,
     REFS_EDGE_CREATED, REL_CLASS_LIFECYCLE, REL_CLASS_REFERENCE, TRAVERSE_MAX_DEPTH,
+};
+
+pub use agent_spend::{
+    per_effect_idem_key, spend_bearing_run, BalancedRunSignal, DispatchedRun, IssueRunKind,
+    IssueSpendGate, SpendError,
 };
