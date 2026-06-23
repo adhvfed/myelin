@@ -2680,11 +2680,17 @@ row = "13.2"
 # target Block for each node and recording every lossy conversion in the ImportReport (named, never
 # silent); the degraded content survives. Bounded to EXACTLY the frozen map (the X-2 anti-drift
 # anchor). The provider+consumer pair drives the frozen map + the per-import report artifact.
+# ISS-P21 / P-388 (M4-I5): the ISSUES IMPORT consumer — myelin_issues::JiraAdapter (the import
+# engine's ADF-bearing adapter) consumes the frozen myelin_content::adf::MAP at import: it converts
+# each ADF body node through the map and records every lossy conversion in the ImportReport with the
+# FROZEN what-text (no looser, never silent). Bounded to exactly the frozen map (the X-2 anti-drift
+# anchor) over the REAL adapter. The Issues consumer half of the adoption gate.
 title = "ADF -> myelin-content lossy-map (frozen)"
 status = "covered"
 cdc = [
     "crates/myelin-content/tests/cdc_13_2_adf_map.rs",
     "crates/myelin-knowledge/tests/cdc_13_2_10_1_knowledge_export_import.rs",
+    "crates/myelin-issues/tests/cdc_13_2_issues_import_adf.rs",
 ]
 
 [[contract]]
