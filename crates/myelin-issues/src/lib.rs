@@ -142,6 +142,19 @@
 //!   still stubbed). **FLOORS named:** the `erase` crypto-shred + pseudonym-map shred BODY (the full
 //!   DSR fan-out) is **ISS-P31**; the third-party free-text residual is the ONE platform posture
 //!   (10.9 / X-7, by reference, [`holder::ISSUE_RESIDUAL_POSTURE_REF`] — `[OPEN — LEGAL]`, R-1).
+//!
+//! ## ISS-P08 / P-374 (M4) — Hi/Lo human-key allocation (the `<PROJECTKEY>-<seqno>` canonical id)
+//! [`keys`] ships the per-prefix **Hi/Lo** allocator that mints the issue's **stored canonical id**
+//! `<PROJECTKEY>-<seqno>` (contract 5.1, recon REF-3) — the stored `<id>` segment of the issue's
+//! [`myelin_events::ArtifactRef`]. The `prefix_counter` table (ISS-P05) holds the durable **Hi** block
+//! high-water; [`keys::HiLoKeyAllocator`] reserves a block atomically over the [`keys::PrefixReserve`]
+//! port (the live `UPDATE … RETURNING` in production) and hands out the **Lo** seqnos from memory (1
+//! counter write per block, not per key). Gap-tolerant (a leaked block on crash is a benign gap, never
+//! a reuse), monotonic per prefix, adaptive block size (50 → 1000 on a hot prefix), per-prefix
+//! isolation (`ENG` never slows `OPS`), cell-local. [`write_path::create_issue`] slots the allocation
+//! into the ISS-P06 write path — the minted canonical key co-commits with the issue's `issue.created`
+//! event (replacing the ISS-P06 placeholder). **FLOOR named:** the render-time `#<seqno>` projection
+//! ([`keys::render_display_key`]) is display-only, never stored, never an `ArtifactRef` link.
 
 #![forbid(unsafe_code)]
 
@@ -151,6 +164,7 @@ pub mod dek;
 pub mod events;
 pub mod holder;
 pub mod holder_intent;
+pub mod keys;
 pub mod migrations;
 pub mod pseudonym;
 pub mod query_coown;
@@ -206,3 +220,16 @@ pub use pseudonym::{
     is_raw_principal_id, is_resolvable_pseudonym, pseudonymise, IssuePseudonym, PseudonymError,
 };
 pub use write_path::{apply_mutation_sealed, SealError, SealedCreate};
+
+// ISS-P08 (P-374, M4): the Hi/Lo human-key allocator. `HiLoKeyAllocator` mints the stored canonical
+// `<PROJECTKEY>-<seqno>` id (5.1) over the `PrefixReserve` port (the live `prefix_counter`
+// `UPDATE … RETURNING` reserve); gap-tolerant, monotonic per prefix, adaptive block size, per-prefix
+// isolation, cell-local. `CanonicalKey::render` is the stored id; `render_display_key` is the
+// display-only `#<seqno>` projection (REF-3). `write_path::create_issue` slots the allocation into the
+// ISS-P06 write path so the minted key co-commits with `issue.created`. Floor: the `#<seqno>` form is
+// display-only (named in `keys`).
+pub use keys::{
+    render_display_key, CanonicalKey, HiLoKeyAllocator, InMemoryPrefixCounter, PrefixReserve,
+    ReserveError, ReservedBlock, INITIAL_BLOCK_SIZE, MAX_BLOCK_SIZE,
+};
+pub use write_path::create_issue;

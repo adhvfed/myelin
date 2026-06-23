@@ -788,9 +788,74 @@ pub fn apply_mutation_sealed<Id: IdentityService>(
     Ok((outcome, sealed))
 }
 
+// ===========================================================================
+// §6 — ISS-P08: the Hi/Lo key allocation slots into the CREATE write path (5.1)
+// ===========================================================================
+
+/// **THE ISS-P08 issue-CREATE that mints the stored canonical key (contract 5.1, recon REF-3).**
+///
+/// The integration point of the Hi/Lo allocator ([`crate::keys::HiLoKeyAllocator`]) and the ISS-P07
+/// GDPR-safe write path ([`apply_mutation_sealed`]): it
+///
+/// 1. **allocates the stored canonical `<PROJECTKEY>-<seqno>`** for the issue's project `prefix` over
+///    the [`crate::keys::PrefixReserve`] port (the live `prefix_counter` `UPDATE … RETURNING` reserve;
+///    gap-tolerant, monotonic per prefix, adaptive-block, per-prefix-isolated, cell-local). This
+///    REPLACES the ISS-P06 placeholder `issue_local_id` — the minted key's [`crate::keys::CanonicalKey::render`]
+///    (e.g. `ENG-1421`) IS the `<id>` segment of the issue's [`ArtifactRef`] + the per-issue aggregate
+///    key (so the issue's `issue.*` events key on the real canonical id from creation onward);
+/// 2. runs the ISS-P07 pseudonymise → DEK-seal → validate → check → mutate → emit seam under that
+///    canonical key, co-committing the `issue.created` event with the minted key (the key write
+///    co-commits its event — contract 2.2; no second emit verb, the `no-raw-publish` lint holds).
+///
+/// An allocation failure FAILS THE CREATE CLOSED ([`WriteError::Outbox`] wrapping the reserve error) —
+/// no key is minted without a durable Hi advance, so a canonical id is never reused on a counter
+/// hiccup (the 0-duplicate-key floor). Returns the minted [`crate::keys::CanonicalKey`] (the stored
+/// canonical id the caller persists + references) alongside the [`WriteOutcome`] + [`SealedCreate`].
+///
+/// The `prefix` is the issue's project key (`ENG`, `OPS`, …) — the per-prefix counter partition; the
+/// `draft.project_id` is the aggregate's numeric project partition (both carried so the aggregate key
+/// stays stable across the issue's lifetime). The render-time `#<seqno>` short form
+/// ([`crate::keys::CanonicalKey::render_display_key`]) is DISPLAY-ONLY — never stored as the link.
+#[allow(clippy::too_many_arguments)]
+pub fn create_issue<Id: IdentityService, R: crate::keys::PrefixReserve>(
+    store: &OutboxStore,
+    minter: Arc<dyn IdMinter>,
+    ctx_base: EmitContextBase,
+    id: &Id,
+    engine: &KmsEngine,
+    allocator: &crate::keys::HiLoKeyAllocator<R>,
+    actor: &Principal,
+    prefix: &str,
+    draft: &IssueDraft,
+    cause: Option<&myelin_events::EventEnvelope>,
+) -> Result<(crate::keys::CanonicalKey, WriteOutcome, SealedCreate), WriteError> {
+    // 1. allocate the STORED CANONICAL <PROJECTKEY>-<seqno> (5.1) — fail the create closed on a
+    //    reserve error (a key is never minted without a durable Hi advance → 0 reuse).
+    let key = allocator
+        .allocate(&ctx_base.tenant, prefix)
+        .map_err(|e| WriteError::Outbox(format!("key allocation failed: {e}")))?;
+    let issue_local_id = key.render();
+
+    // 2. the ISS-P07 GDPR-safe write path under the REAL canonical key (replacing the ISS-P06
+    //    placeholder local id) — the minted key co-commits with issue.created (2.2).
+    let (outcome, sealed) = apply_mutation_sealed(
+        store,
+        minter,
+        ctx_base,
+        id,
+        engine,
+        actor,
+        &issue_local_id,
+        draft,
+        cause,
+    )?;
+    Ok((key, outcome, sealed))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keys::{HiLoKeyAllocator, InMemoryPrefixCounter};
     use myelin_events::{
         Actor, CausedBy, EventEnvelope, MonotonicMinter, Region, TenantId, Timestamp,
     };
@@ -897,8 +962,15 @@ mod tests {
         fn revoke(&self, _t: &myelin_identity::RevokeTarget) -> IdResult<()> {
             Err(AuthzError::NotYetImplemented("n/a"))
         }
-        fn resolve_pseudonym(&self, _s: &PrincipalId, _t: &TenantId) -> IdResult<String> {
-            Err(AuthzError::NotYetImplemented("n/a"))
+        fn resolve_pseudonym(&self, s: &PrincipalId, t: &TenantId) -> IdResult<String> {
+            // a deterministic <pseudonym>@<tenant>.noreply handle (the frozen 4.8 grammar) so the
+            // ISS-P07 sealed CREATE path (and the ISS-P08 create_issue wiring on top) resolves —
+            // test scaffolding for the ONE Identity map, never a second grammar.
+            Ok(
+                myelin_identity::PseudonymHandle::new(format!("psn-{}", s.0), t.0.clone())
+                    .expect("a valid pseudonym handle")
+                    .render(),
+            )
         }
         fn erase(&self, _s: &PrincipalId) -> IdResult<()> {
             Err(AuthzError::NotYetImplemented("n/a"))
@@ -1345,6 +1417,115 @@ mod tests {
         .unwrap();
         tx.commit().unwrap();
         store.committed_rows()[0].envelope.clone()
+    }
+
+    // ── ISS-P08: create_issue mints the stored canonical key + co-commits issue.created (5.1/2.2) ──
+
+    /// **`create_issue` mints the stored canonical `<PROJECTKEY>-<seqno>` (5.1) and co-commits the
+    /// `issue.created` event under that canonical key (2.2).** The minted key IS the issue's
+    /// `issue_local_id` / aggregate id (the events key on the real canonical id, not a placeholder);
+    /// the create's PII flag + key ref are carried; the seqno is monotonic per prefix.
+    #[test]
+    fn create_issue_mints_canonical_key_and_co_commits() {
+        let store = OutboxStore::new();
+        let engine = KmsEngine::new();
+        let allocator = HiLoKeyAllocator::new(InMemoryPrefixCounter::new());
+        let m = minter();
+
+        // the gate must allow `manage` on the issue object whose <id> is the minted canonical key.
+        let id = StubId::new()
+            .allowing(PERM_MANAGE, &issue_ref("acme", "ENG-1"))
+            .allowing(PERM_MANAGE, &issue_ref("acme", "ENG-2"));
+
+        let (key, out, sealed) = create_issue(
+            &store,
+            Arc::clone(&m),
+            ctx_base(),
+            &id,
+            &engine,
+            &allocator,
+            &actor(),
+            "ENG",
+            &draft(),
+            None,
+        )
+        .expect("create_issue commits");
+
+        // the stored canonical key is ENG-1 (the first seqno for the prefix).
+        assert_eq!(key.render(), "ENG-1");
+        assert_eq!(key.render_display_key(), "#1", "the #form is display-only");
+        // the issue.created event keys on the REAL canonical aggregate (not a placeholder).
+        let row = store.row(&out.event_id.unwrap()).unwrap();
+        assert_eq!(row.envelope.type_.0, events::ISSUE_CREATED);
+        assert_eq!(row.aggregate, issue_aggregate_key(7, "ENG-1"));
+        assert_eq!(row.subject.0, "myelin://acme/issue/issue/ENG-1");
+        // the PII flag + the REAL per-subject-DEK key ref are carried (ISS-P07 seam intact).
+        assert!(row.envelope.contains_personal_data);
+        assert_eq!(
+            row.envelope.pii_key_ref.as_ref().map(|r| r.0.clone()),
+            Some(sealed.pii_key_ref().0),
+            "the create carries the per-subject-DEK key ref"
+        );
+
+        // a SECOND create on the same prefix mints the next monotonic key ENG-2.
+        let (key2, _, _) = create_issue(
+            &store,
+            Arc::clone(&m),
+            ctx_base(),
+            &id,
+            &engine,
+            &allocator,
+            &actor(),
+            "ENG",
+            &draft(),
+            None,
+        )
+        .expect("second create commits");
+        assert_eq!(key2.render(), "ENG-2", "monotonic per prefix");
+    }
+
+    /// **A reserve failure FAILS THE CREATE CLOSED — nothing minted, nothing written.** A
+    /// fail-static reserve makes `create_issue` return `Err` before any key is handed out, so no
+    /// canonical id is reused on a counter hiccup (the 0-duplicate-key floor).
+    #[test]
+    fn create_issue_fails_closed_on_reserve_error() {
+        struct FailReserve;
+        impl crate::keys::PrefixReserve for FailReserve {
+            fn reserve(
+                &self,
+                _t: &TenantId,
+                _p: &str,
+                _b: u32,
+            ) -> Result<crate::keys::ReservedBlock, crate::keys::ReserveError> {
+                Err(crate::keys::ReserveError::Backend(
+                    "counter unavailable".into(),
+                ))
+            }
+        }
+        let store = OutboxStore::new();
+        let engine = KmsEngine::new();
+        let allocator = HiLoKeyAllocator::new(FailReserve);
+        let id = StubId::new().allowing(PERM_MANAGE, &issue_ref("acme", "ENG-1"));
+
+        let err = create_issue(
+            &store,
+            minter(),
+            ctx_base(),
+            &id,
+            &engine,
+            &allocator,
+            &actor(),
+            "ENG",
+            &draft(),
+            None,
+        )
+        .expect_err("a reserve failure fails the create closed");
+        assert!(matches!(err, WriteError::Outbox(_)));
+        assert_eq!(
+            store.committed_count(),
+            0,
+            "nothing written when the key cannot be minted"
+        );
     }
 
     // The no-raw-publish GATE (contract 1.6 / P-019) over this module's source is asserted by the
