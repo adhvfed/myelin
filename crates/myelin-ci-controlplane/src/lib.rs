@@ -63,6 +63,7 @@ pub mod live_tail;
 pub mod log_pipeline;
 pub mod metering;
 pub mod migrations;
+pub mod permanent_gates;
 pub mod rebac_fragment;
 pub mod schedule_and_run_job;
 pub mod scheduler;
@@ -297,6 +298,11 @@ pub use migrations::{
     DEPLOYMENT_TABLE, ENVIRONMENT_TABLE, FAIR_DEFICIT_TABLE, JOB_QUEUE_TABLE, JQ_CLAIMABLE_INDEX,
     JQ_IDEM_INDEX, JQ_SERIALIZE_INDEX, LOG_ANCHOR_TABLE, LOG_SEGMENT_TABLE, RUNNER_TABLE,
     SECRET_BINDING_TABLE,
+};
+
+pub use permanent_gates::{
+    ci_restore_verify_stores, m4_boundary_permanent_gates, run_ci_restore_verify_or_fail,
+    PermanentGate, PermanentGateKind,
 };
 
 /// The deployable service name (the `AppSpec::name` + the telemetry/trace service identifier). The
