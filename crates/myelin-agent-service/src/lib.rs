@@ -92,6 +92,7 @@ pub mod hitl;
 pub mod hitl_batch;
 pub mod holder;
 pub mod identity;
+pub mod issues_agents;
 pub mod issues_tools;
 pub mod knowledge_tools;
 pub mod long_park;
@@ -249,6 +250,30 @@ pub use issues_tools::{
     sla_draft_tool_def, transition_caveat, transition_required_caps, transition_tool_def,
     triage_tool_def, FORECAST_TOOL, ISSUES_SUBSYSTEM, ISSUES_TOOL_VERSION, SLA_DRAFT_TOOL,
     TRANSITION_TOOL, TRIAGE_TOOL,
+};
+
+// The FULL Issues ToolDef catalogue + the MOCK forecast/triage agents (ISS-P23 → P-390, M4-I6):
+// EXTENDS AG-P20's four agent-facing Issues tools with the human/CLI CRUD tools (create/update/
+// comment/link/estimate/reorder/assign/close — arch 03 §8) so the FULL arch-§8 catalogue registers
+// into the ONE ToolSurface (8.1; UI=CLI=agent parity, no privileged back-channel). Every tool is a
+// Mutate routed through the existing plan-then-apply pipeline (8.2, no carve-out); exactly two are
+// gated by the frozen §6.3 default — close + the SLA-bound transition (the consequential split,
+// conservative floor + ABAC caveat refinement). The MOCK forecast agent (compute-only, linear
+// remaining÷velocity off OLAP — the named R-5 floor; Monte-Carlo is ISS-P32) + the MOCK triage agent
+// (the S9 suggestion strip via run --dry-run, 8.7 — proposed, NOT applied) run on the SAME
+// --use-mock MockAgentRuntime path (8.3 — the named R-10 floor; the real LlmAgentRuntime is the
+// post-M5 AG-P25 swap, never a rewrite). AG-D9 (identical replay/effect-sequence) is greened here;
+// AG-D5 (the governed-transition HITL withhold) is the drills_iss_p23 test. NO new engine.
+// NOTE: `comment_required_caps` / `comment_tool_def` / `COMMENT_TOOL` are NOT re-exported here (the
+// Knowledge surface above already exports same-named items); reach the Issues comment tool via
+// `issues_agents::comment_tool_def`. Every other Issues catalogue/agent surface is re-exported.
+pub use issues_agents::{
+    assign_required_caps, assign_tool_def, close_tool_def, create_required_caps, create_tool_def,
+    estimate_tool_def, full_issues_tool_defs, link_tool_def, mock_forecast_agent,
+    mock_triage_agent, register_full_issues_tools, reorder_tool_def, replay_forecast_agent,
+    triage_effect_for, triage_suggestion_strip, update_required_caps, update_tool_def,
+    ForecastInput, ForecastOutput, LinearForecast, ASSIGN_TOOL, CLOSE_TOOL, CREATE_TOOL,
+    ESTIMATE_TOOL, LINK_TOOL, REORDER_TOOL, UPDATE_TOOL,
 };
 
 // The per-CONSUMER Chat ToolDefs (AG-P20 → P-347, M4): post_message / react (reversible, NOT gated) +

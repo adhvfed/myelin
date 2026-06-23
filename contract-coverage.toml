@@ -1694,6 +1694,16 @@ cdc = [
     # privileged/run-pipeline consumer defs; CI-P26 completes the read/run/lifecycle/rollback rows so the
     # frozen X-6 table is whole. ToolHands::exec is ABSENT (the runner itself, X-6 / 05 §HP-5).
     "crates/myelin-agent-service/tests/cdc_8_1_ci_x6_tooldefs.rs",
+    # ISS-P23 / P-390 (M4): the FULL Issues ToolDef catalogue slice — arch 03 §8's COMPLETE catalogue
+    # (create/update/comment/link/estimate/reorder/assign/close + forecast/triage/sla_draft/transition,
+    # 12 tools) registered into the ONE ToolSurface, with required_caps from the FROZEN Issues ReBAC
+    # fragment (4.9) and requires_approval SEEDED from the frozen §6.3 defaults (the consequential split
+    # is exactly close + the SLA-bound transition, both the conservative floor). EXTENDS AG-P20's four
+    # agent-facing Issues tools (`issues_tools`) — `issues_agents` reuses them verbatim + adds the eight
+    # human/CLI CRUD tools. The CDC pins the registration (resolve-by-name carries every frozen field) +
+    # AG-D5 (the governed transition/close HITL withhold: 0 pre-approval mutation, exactly-once
+    # post-approval) + AG-D9 (the MOCK forecast/triage agents replay byte-identically) + AG-D4 green.
+    "crates/myelin-agent-service/tests/drills_iss_p23_issues_tools_and_agents.rs",
 ]
 
 [[contract]]

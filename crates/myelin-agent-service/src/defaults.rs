@@ -99,15 +99,33 @@ pub fn requires_approval_default(subsystem: &str, tool: &str) -> bool {
         ("git", "history_rewrite") => true,
         ("git", "scip_index") => false,
 
-        // ── Issues (§6.3) ──
+        // ── Issues (§6.3 + arch 03 §8 — the FULL Issues ToolDef catalogue, ISS-P23 → P-390) ──
+        // The advisory agent tools (suggest-by-default; the human accepts the suggestion).
         ("issues", "forecast") => false,  // advisory (suggest)
         ("issues", "triage") => false,    // advisory (suggest)
         ("issues", "sla_draft") => false, // advisory (suggest)
+        // The human/CLI/agent CRUD tools (arch 03 §8 table) — every one reversible/cheap, so the
+        // frozen default is NOT gated (suggest-by-default; a `governed` field on `update` is
+        // caveat-gated at check-time via the field ABAC, never by the static default — same posture
+        // as the SLA transition floor below).
+        ("issues", "create") => false,  // create an issue (reversible)
+        ("issues", "update") => false, // edit fields (a governed field → field-ABAC caveat, not the static default)
+        ("issues", "comment") => false, // add a comment (reversible)
+        ("issues", "link") => false,   // create a typed relation edge (reversible)
+        ("issues", "estimate") => false, // set an estimate/story-point (reversible)
+        ("issues", "reorder") => false, // rank CAS (the SAME path as a human — reversible)
+        ("issues", "assign") => false, // (re)assign (reversible)
         // an SLA-bound transition with an approver edge is caveat-gated (ABAC, §5.2 step 2). The
         // STATIC default is `true` (gated) — the ABAC caveat is the refinement, never a loosening:
         // a transition WITHOUT an approver edge is admitted by the caveat at check-time, but the
         // tool_def default is gated so the gate is the conservative floor.
         ("issues", "transition") => true,
+        // `close` is gated when the issue is confidential OR the close transition is governed
+        // (arch 03 §8 — "yes if confidential or governed"). The STATIC default is `true` (gated) —
+        // the CONSERVATIVE FLOOR: a non-confidential, non-governed close is admitted by the
+        // confidential/governed ABAC caveat at check-time, but the tool_def default is gated so the
+        // floor is never loosened silently (the SAME posture as `transition`).
+        ("issues", "close") => true,
 
         // ── Knowledge (§6.3) ──
         ("knowledge", "publish") => true, // publishing is consequential (approver set)
