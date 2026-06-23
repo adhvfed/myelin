@@ -260,6 +260,7 @@ pub mod rollup;
 pub mod schema;
 pub mod schemes;
 pub mod sla_escalation;
+pub mod time_axis;
 pub mod views;
 pub mod workflow;
 pub mod write_path;

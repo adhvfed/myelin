@@ -151,6 +151,23 @@ pub const CYCLE_ISSUE_REMOVED: &str = "issue.cycle.issue_removed";
 
 /// A milestone (version/release) was released. Aggregate `issue/<milestone-key>`.
 pub const MILESTONE_RELEASED: &str = "issue.milestone.released";
+/// An issue was added to a milestone (a MEMBERSHIP edge, not containment — ISS-P19). Aggregate
+/// `issue/<milestone-key>`.
+pub const MILESTONE_ISSUE_ADDED: &str = "issue.milestone.issue_added";
+/// An issue was removed from a milestone (the membership edge dropped). Aggregate
+/// `issue/<milestone-key>`.
+pub const MILESTONE_ISSUE_REMOVED: &str = "issue.milestone.issue_removed";
+
+// --- attachment (BlobStore-backed; the row holds the POINTER, never bytes — ISS-P19) ---
+
+/// An attachment was added to an issue (the BlobStore content-addressed POINTER + per-subject-DEK
+/// metadata — 0 bytes in the OLTP row; arch §1.2 / contract 11.2). The payload carries the content
+/// address (`blob_ref`) + size + the `pii_key_ref`, NEVER the bytes (references-not-payloads, 2.7).
+/// Aggregate `issue/<key>`.
+pub const ATTACHMENT_ADDED: &str = "issue.attachment.added";
+/// An attachment was removed from an issue (the row pointer dropped; the blob crypto-shreds via the
+/// holder erasure path, not a synchronous delete — §7). Aggregate `issue/<key>`.
+pub const ATTACHMENT_REMOVED: &str = "issue.attachment.removed";
 
 // --- sla (the compliance feed → OLAP; durations in SECONDS — unit anchor) ---
 
@@ -259,8 +276,13 @@ pub const ISSUE_EVENT_TOKENS: &[&str] = &[
     CYCLE_COMPLETED,
     CYCLE_ISSUE_ADDED,
     CYCLE_ISSUE_REMOVED,
-    // milestone (versions/releases)
+    // milestone (versions/releases) + the time-axis MEMBERSHIP edges (ISS-P19)
     MILESTONE_RELEASED,
+    MILESTONE_ISSUE_ADDED,
+    MILESTONE_ISSUE_REMOVED,
+    // attachment (BlobStore pointer; 0 bytes in row — ISS-P19)
+    ATTACHMENT_ADDED,
+    ATTACHMENT_REMOVED,
     // sla (compliance feed; durations in SECONDS)
     SLA_STARTED,
     SLA_PAUSED,

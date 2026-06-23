@@ -2236,7 +2236,19 @@ cdc = [
     "crates/myelin-git/tests/cdc_11_2_c3_git_bundle_uri.rs",
     "crates/myelin-ci-dispatch/tests/cdc_ci_p11_resolve_dispatch.rs",
     "crates/myelin-ci-controlplane/tests/cdc_11_2_11_4_ci_artifact_cache.rs",
+    "crates/myelin-issues/tests/cdc_11_2_issues_attachment_pointer.rs",
 ]
+# P-386 (ISS-P19, M4): the ISSUES consumer of the BlobStore row for ATTACHMENTS —
+# `myelin_issues::time_axis::{attach, AttachmentPointer}` PUTs the attachment bytes through the REAL
+# fs-backed `FsBlobStore` provider + builds the OLTP-row POINTER. The row holds ONLY the content
+# address + per-subject-DEK metadata (`pii_key_ref` `kms://…subject:<id>`) + size + region — 0 bytes
+# of the attachment in the row (`AttachmentPointer::row_byte_count() == 0`, structural: no `bytes`
+# field; the 0-bytes-in-row GATE artifact). The provider/consumer halves AGREE on the content address
+# with no drift (the pointer address == the BlobStore put/get address == BLAKE3(plaintext)); per-tenant
+# content-addressed dedup holds + cross-tenant dedup is forgone (residency isolation). FLOOR: the
+# burndown/CFD ANALYTICS the time-axis feed serves land in the OLAP read store (ISS-P20 / P-387). The
+# real per-blob DEK WRAP at rest is the storage-side P-ST-08 floor (unchanged here — the address is
+# plaintext-derived). Consumer CDC: cdc_11_2_issues_attachment_pointer.rs.
 # P-365 (CI-P22, M4): the CI CONTROL-PLANE consumer of the C4 trust-scoped cache namespaces (11.2) —
 # `myelin_ci_controlplane::artifact_cache::derive_cache_scope` maps a run's CI-stamped `trust_tier`
 # (the `ci_run.trust_tier` fact + branch/PR provenance) to the EXACT `(TrustTier, CacheScope, pr_id)`
