@@ -235,6 +235,31 @@
 //! erasure LEVER is structural — the worklog keys per-subject, reached by the DEK shred — only the
 //! lawful-basis tag is counsel-ratified).
 
+//! ## ISS-P21 / P-388 (M4-I5, the adoption gate) — the two-pass ID-remapped import engine + ADF map
+//! [`import`] ships the **adoption gate** ("leave Atlassian cleanly", VISION §1): the two-pass,
+//! ID-remapped, idempotent + resumable import engine ([`import::ImportEngine`]) over a persisted
+//! source-to-Myelin id map ([`import::SourceIdMap`] — the load-bearing artifact for idempotency /
+//! resume / rollback / round-trip). Four source adapters ([`import::JiraAdapter`]/
+//! [`import::LinearAdapter`]/[`import::GitHubAdapter`]/[`import::CsvAdapter`]) normalise an
+//! already-parsed provider payload into ONE canonical interchange format ([`import::CanonicalImport`])
+//! that round-trips with the portability export (the ISS-D9(a) round-trip oracle). The Jira adapter
+//! converts ADF description bodies through the FROZEN [`myelin_content::adf`] lossy-map (13.2 consumed
+//! — every lossy/dropped node recorded in the [`myelin_content::ImportReport`], NEVER silent; the
+//! permission-scheme mapping is the named lossy/legal-review leg R-9,
+//! [`import::UNSUPPORTED_PERMISSION_SCHEME`], M5+). Pass 1 mints a canonical key (REUSING
+//! [`keys::HiLoKeyAllocator`] — an imported issue is just an issue), records the id-map entry, and
+//! emits `issue.created` via the ONE [`myelin_events::OutboxTx::emit`] (2.2 consumed — one indexing
+//! path; reindex-from-source works on imported data for free); an already-mapped source id is SKIPPED
+//! (0 duplicate creates on a crash, ISS-D9(b)). Pass 2 resolves relation endpoints through the id-map
+//! and emits `issue.relation.created` (an unmapped endpoint is a NAMED [`import::Unresolved`] gap,
+//! never a silent dangling edge). [`import::ImportEngine::dry_run`] builds the FULL
+//! [`import::ReconciliationReport`] WITHOUT emitting (reconciliation-report-first); the per-tenant
+//! in-flight cap ([`import::ImportLaneBudget`], 1.11 consumed — the import is the BATCH lane, shed
+//! before the human lane) bounds a 100k-issue import to capped batches that never starve another
+//! tenant. FLOORS named: the byte-level provider wire parsers are upstream of the adapters; the id-map
+//! BACKEND is the OLTP store in prod ([`import::InMemorySourceIdMap`] is the DB-free drill model — the
+//! live PgStore integration is the named follow-on); the permission-scheme mapping is the R-9 legal leg.
+
 #![forbid(unsafe_code)]
 
 pub mod app;
@@ -246,6 +271,7 @@ pub mod events;
 pub mod holder;
 pub mod holder_erase;
 pub mod holder_intent;
+pub mod import;
 pub mod keys;
 pub mod migrations;
 pub mod olap_feed;
@@ -484,6 +510,24 @@ pub use holder_erase::{
 pub use olap_feed::{
     issue_analytics_aggregate_names, IssueOlapAnalytics, IssueOlapConsumer, IssueOlapFeedFloors,
     IssueOlapFeedSignal, IssueRestrictionLeakAudit, ReindexCtx, ISSUE_ANALYTICS_OLAP,
+};
+
+// ISS-P21 (P-388, M4-I5): the two-pass ID-remapped import engine + the ADF lossy-map (the adoption
+// gate). `ImportEngine` mints canonical keys (REUSING HiLoKeyAllocator) over the persisted `SourceIdMap`
+// (idempotency/resume/rollback/round-trip), runs pass 1 (mint+map+emit issue.created, SKIP an
+// already-mapped source id = 0 dup on crash) + pass 2 (resolve relations through the id-map + emit
+// issue.relation.created, an unmapped endpoint = a named Unresolved gap), and `dry_run` builds the full
+// `ReconciliationReport` WITHOUT emitting. The four `SourceAdapter`s (Jira/Linear/GitHub/CSV) normalise
+// an already-parsed provider payload into the canonical `CanonicalImport`; the Jira adapter converts ADF
+// bodies through the FROZEN `myelin_content::adf` map (13.2 consumed — every lossy node recorded, never
+// silent). `ImportLaneBudget` is the per-tenant in-flight cap (1.11 — the import is bounded backfill).
+// FLOORS named: the wire parsers are upstream; the id-map backend is the live PgStore (the in-memory
+// model is the drill); the permission-scheme mapping is the R-9 legal leg (`UNSUPPORTED_PERMISSION_SCHEME`).
+pub use import::{
+    adapter_for, AdfBodyNode, CanonicalImport, CanonicalIssue, CanonicalRelation, CsvAdapter,
+    DryRun, GitHubAdapter, IdMapEntry, ImportEngine, ImportError, ImportLaneBudget,
+    InMemorySourceIdMap, JiraAdapter, LinearAdapter, ProviderRecord, ReconciliationReport,
+    SourceAdapter, SourceIdMap, SourceSystem, Unresolved, UNSUPPORTED_PERMISSION_SCHEME,
 };
 
 pub use refs_glue::{
