@@ -235,6 +235,7 @@ pub mod rebac_fragment;
 pub mod refs_glue;
 pub mod reorder;
 pub mod replay;
+pub mod rollup;
 pub mod schema;
 pub mod schemes;
 pub mod sla_escalation;
@@ -406,6 +407,25 @@ pub use views::{
 // bounded cycle-safe depth-16 walk; `IssueProjectFetcher` (6.3) is the LIVE issue.* Search projection
 // emitter (reindex 6.4 rides the ONE replay-from-source path). FLOOR: the cross-cell projection bridge
 // is the M5 follow-on (ISS-P32).
+// ISS-P18 (P-384, M4): the event-driven, debounced, incremental rollup consumer (off the bus, NEVER
+// in the write path — ADR-11.5). `RollupConsumer` is the `EventHandler` (contract 2.4 consumed) that
+// watches the rollup-driving issue.* deltas, walks the affected ancestors (`walk_parent_edges` —
+// contract 5.3 consumed, the depth-16 cycle-safe walk reusing the ONE IssueRelationGraph forward-parent
+// traverse), debounce-coalesces a burst into ONE recompute per ancestor (DebounceCoalescer, OQ-K),
+// re-sums incrementally (`recompute_incremental`), and SUPPRESSES the input_hash no-op (the loop-storm
+// guard, AG-6 — an unchanged recompute emits NO event). `flush` drains the coalesced burst → the owed
+// issue.rollup.recomputed drafts (`rollup_recomputed_draft`); `reindex_from` rebuilds the derived rollup
+// DRIFT-FREE off the source of truth (issue_relation edges + leaf facts — contract 2.6 consumed, the
+// ONLY recovery path; steady-state + recovery share one code path). The rollup row is DERIVED (no
+// migration table; rebuildable). FLOORS named in `rollup` (RollupFloors): read-time rollup →
+// materialise-on-measured-large (KN-3, ISS-P32 / P-495); the debounce-window per-tenant tunable (OQ-K);
+// cross-cell ancestors (OQ-I); the forecast agent off issue.rollup.recomputed (ADR-08).
+pub use rollup::{
+    aggregate_snapshot, recompute_incremental, rollup_recomputed_draft, walk_parent_edges,
+    DebounceCoalescer, DebounceWindow, LeafFact, RecomputeOutcome, RollupAggregate, RollupConsumer,
+    RollupFloors, RollupStore,
+};
+
 pub use refs_glue::{
     block_sub_ref, comment_sub_ref, edge_aggregate_key, emit_content_edges, emit_relation_edge,
     field_sub_ref, issue_root_ref, row_sub_ref, IssueLifecycleRel, IssueMeta, IssueProjectFetcher,
