@@ -311,6 +311,15 @@ cdc = [
     # the green artifact; the rollup *.snapshot replay (IssueReindexSource, rollup: granular) is
     # deterministic (cold == live, idempotent re-run). drill_iss_d8_rollup.rs.
     "crates/myelin-issues/tests/drill_iss_d8_rollup.rs",
+    # P-387 (ISS-P20, M4): the Issues OLAP FEED is rebuilt DRIFT-FREE off the source of truth
+    # (IssueReindexSource → *.snapshot → the SAME IssueOlapConsumer handle body — steady-state +
+    # recovery share one code path). ISS-D8(b) OLAP-feed reindex-parity (0 drift, projection byte-match
+    # cold == live) is the green artifact; the restriction flag still excludes a restricted subject
+    # after the rebuild (it reads the holder flag live). The provider (IssueReindexSource) + consumer
+    # (IssueOlapConsumer) pair is in cdc_11_6_issues_olap_feed.rs; the reindex-parity drill is
+    # drill_iss_d8b_olap_feed.rs + the chained-mutation e2e is e2e_iss_p20_olap.rs (consumer drills,
+    # not pair-evidence — registered under 11.6's landing).
+    "crates/myelin-issues/tests/cdc_11_6_issues_olap_feed.rs",
 ]
 
 [[contract]]
@@ -2416,10 +2425,30 @@ status = "covered"
 # (P-ST-18); the frame + the C5 gate are an in-memory-testable MODEL over the existing
 # SourceLog/ReindexFromSource primitive + the frozen EventEnvelope, so NO new db/object-store/cache/bus
 # trait is touched and no new integration drill is owed.
-landing = "P-331"
+# P-387 (ISS-P20, M4): the ISSUES CONSUMER side of 11.6 — the Issues OLAP CQRS feed
+# (myelin_issues::olap_feed). `IssueOlapConsumer` is the bus `EventHandler` (contract 2.4) whose
+# whitelist is the analytics-driving issue.*/sla.*/cycle.* tokens (NEVER `*`); it feeds the SHARED
+# `myelin_storage::olap::OlapReadStore` through the SAME `OlapEvent::from_envelope` seam Storage's live
+# `OlapBusFeeder` uses (REUSED, never a parallel store — EI-01 §7), NEVER the OLTP issue table (the
+# 0-OLTP-read gate, `oltp_read_count == 0` by construction). `IssueOlapAnalytics` reuses Storage's
+# frozen CFD/cycle-time/velocity aggregates (a restricted subject EXCLUDED at query time via the C5
+# filter) + ADDS the Issues ask's SLA-compliance leg with the SAME restriction filter; `leak_audit`
+# (`restricted_subject_leak == 0`) is the restriction-exclusion gate (recon §8: no analytics for a
+# restricted subject). `reindex_from` rebuilds the DERIVED feed DRIFT-FREE off Issues' source of truth
+# (`IssueReindexSource` → *.snapshot → the SAME handle body — steady-state + recovery share one code
+# path, contract 2.6 consumed); the cold rebuild byte-matches the live projection
+# (`projection_fingerprint`, the ISS-D8b OLAP-feed reindex-parity). The restriction flag is the SHARED
+# holder `RestrictionFlag` (the SAME one the Issues erase fan-out / index / notif seams read).
+# Floors named: the Monte-Carlo forecast that reads OLAP throughput samples is ISS-P32 (linear floor →
+# Monte-Carlo, ADR-08); the ClickHouse columnar backend is behind OlapReadStore (Storage P-ST-18,
+# wired); the OQ-H worklog analytics-eligibility seam is Storage's AnalyticsEligibility ([OPEN — LEGAL]).
+# The feed is an in-memory-testable consumer over the existing frozen OLAP read-store API + the frozen
+# EventEnvelope — NO new db/object-store/cache/bus trait is touched, so no new integration drill is owed.
+landing = "P-331, P-387"
 cdc = [
   "crates/myelin-storage/tests/cdc_11_6_olap_frame.rs",
   "crates/myelin-storage/tests/cdc_11_6_c5_restriction_gate.rs",
+  "crates/myelin-issues/tests/cdc_11_6_issues_olap_feed.rs",
 ]
 
 [[contract]]

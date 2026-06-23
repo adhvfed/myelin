@@ -248,6 +248,7 @@ pub mod holder_erase;
 pub mod holder_intent;
 pub mod keys;
 pub mod migrations;
+pub mod olap_feed;
 pub mod planner;
 pub mod projection_feeder;
 pub mod pseudonym;
@@ -462,6 +463,27 @@ pub use holder_erase::{
     store_classes_reached_by_free_text_shred, EraseFanoutError, HolderReceipt, HolderTarget,
     IssueEraseFanout, IssueEraseOutcome, IssueErasedSubject, IssueErasureLedger,
     IssueReErasureReceipt, ERASED_TOMBSTONE_TOKENS,
+};
+
+// ISS-P20 (P-387, M4): the OLAP read store (CQRS, reindex-from-source only, restriction-flag-honouring).
+// `IssueOlapConsumer` is the Issues-side bus `EventHandler` (contract 2.4 + 11.6 + 2.6 consumed) that
+// feeds the SHARED `myelin_storage::olap::OlapReadStore` (REUSED, never a parallel store — EI-01 §7)
+// off the analytics-driving issue.*/sla.*/cycle.* stream — NEVER the OLTP issue table (the 0-OLTP-read
+// gate, `oltp_read_count == 0` by construction). It keeps the OLAP store's C5 restriction set in sync
+// with the shared holder `RestrictionFlag` so a restricted subject contributes 0 rows to analytics
+// (recon §8 / contract 11.6). `IssueOlapAnalytics` reuses Storage's frozen CFD/cycle-time/velocity
+// aggregates (a restricted subject excluded at query time) + ADDS the Issues ask's SLA-compliance leg
+// with the SAME restriction filter; `leak_audit` (`restricted_subject_leak == 0`) is the
+// restriction-exclusion gate. `reindex_from` rebuilds the DERIVED feed DRIFT-FREE off Issues' source of
+// truth (`IssueReindexSource` → *.snapshot → the SAME handle body — steady-state + recovery share one
+// code path, contract 2.6); the cold rebuild byte-matches the live projection (`parity_bytes`, the
+// ISS-D8b OLAP-feed reindex-parity). FLOORS named in `olap_feed` (IssueOlapFeedFloors): the Monte-Carlo
+// forecast that reads OLAP throughput is ISS-P32 (linear floor → Monte-Carlo, ADR-08); the ClickHouse
+// columnar backend is behind OlapReadStore (Storage P-ST-18, wired); the OQ-H worklog eligibility seam
+// is Storage's AnalyticsEligibility ([OPEN — LEGAL]).
+pub use olap_feed::{
+    issue_analytics_aggregate_names, IssueOlapAnalytics, IssueOlapConsumer, IssueOlapFeedFloors,
+    IssueOlapFeedSignal, IssueRestrictionLeakAudit, ReindexCtx, ISSUE_ANALYTICS_OLAP,
 };
 
 pub use refs_glue::{
