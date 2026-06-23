@@ -2662,6 +2662,18 @@ row = "13.3"
 # ISS-D12 ("can't mark Done while CI red on the linked PR" — the X-1 CheckStatus + trust_tier off the
 # fact, 5.9/Δ10) lands in ISS-P27 (P-394) when the X-1 check-seam closes; the guard SHAPE
 # (linked_pr_ci_green_guard) is here and fails closed until then.
+# ISS-P16 / P-382 (M4): Issues now BUILDS the co-equal ViewSpec VIEWS over the 13.3 view-model — the
+# seven canonical views (board/roadmap/backlog/list/table/calendar/cycle) are each a frozen
+# myelin_query::ViewSpec projection over the ONE issue table (myelin_issues::views::IssueView::spec —
+# the co-owned shape, never a second view-model). The board↔roadmap co-equality is STRUCTURAL: the
+# denormalised type_rank (board ≤ 1, roadmap ≥ 2) partitions the SAME rows. The ISS-D1 same-row gate is
+# proven by row id — the e2e (e2e_iss_p16_coequal_views.rs: edit on board → read on roadmap → same id,
+# 0 drift) + the LIVE integration drill (integration_iss_p16_coequal_views.rs: one issue table, two
+# index-range scans, an UPDATE on the board moves the SAME row id onto the roadmap with the board-set
+# date, PROVEN against the dev-stack Postgres). The design-system pass over all seven views (incl. the
+# empty/loading/error/permission/tombstone states) is signed off in the design folder. FLOORS named:
+# the cross-cell portfolio rollup view is the M5 follow-on (ISS-P32); the real-time board sync is
+# ISS-P30 (P-397).
 title = "myelin-query primitive (frozen byte-identical)"
 status = "covered"
 cdc = [
