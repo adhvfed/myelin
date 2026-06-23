@@ -2148,6 +2148,8 @@ dependencies = [
 name = "myelin-ci-controlplane"
 version = "0.0.0"
 dependencies = [
+ "myelin-ci-sandbox",
+ "myelin-events",
  "myelin-gdpr",
  "myelin-lints",
  "myelin-substrate",

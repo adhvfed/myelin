@@ -264,7 +264,16 @@ status = "covered"
 # loudly); CI's complete `ci.*` list lands in `myelin_ci_sandbox::events` (the M4 names freeze, split
 # durable-via-outbox vs firehose-only ci.log.appended; the Δ1-superseded ci.status.updated /
 # ci.run.passed deliberately absent). Issues/Chat already completed their lists (ISS-P03 / CHAT-P1).
+# CI-P7/P-350 (M4) REGISTERS CI's complete `ci.*` taxonomy FROM ITS PROPER HOME — the CI Control
+# Plane (`myelin_ci_controlplane::events`, the outbox producer / check emitter): it RE-EXPORTS the one
+# canonical token source (`myelin_ci_sandbox::events`, EB-27 — no second token language) and adds (a)
+# the control-plane registration entry `register_ci_taxonomy()` and (b) the §6.2 singular subsystem/
+# type token-table validation the early grammar-only freeze lacked (`ci` is canonical + the CI type
+# tokens run/job/check/deployment/runner/pipeline/log/artifact/cost/supply_chain). The CDC
+# (cdc_2_9_ci_tokens.rs) pins the control-plane provider + the Bus §6.1/§6.2 consumer and that the
+# registration equals the source byte-for-byte (coherence: ONE list, no drift).
 cdc = [
+    "crates/myelin-ci-controlplane/tests/cdc_2_9_ci_tokens.rs",
     "crates/myelin-events/tests/cdc_2_9_taxonomy.rs",
     "crates/myelin-events/tests/cdc_2_9_token_list_harness.rs",
     "crates/myelin-events/tests/cdc_2_9_m4_token_lists.rs",
