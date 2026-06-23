@@ -57,6 +57,7 @@ pub mod events;
 pub mod fairness;
 pub mod fleet;
 pub mod holder;
+pub mod live_tail;
 pub mod log_pipeline;
 pub mod metering;
 pub mod migrations;
@@ -144,6 +145,16 @@ pub use log_pipeline::{
     AnchorStatus, CoalesceBudget, CrossRegionLogWrite, LogAnchorRow, LogAvailablePointer, LogCoord,
     LogPipeline, LogSegmentRow, LogWritePin, SealThreshold, SecretRedactor, CI_LOG_STREAM,
     INSERT_LOG_SEGMENT_QUERY, REDACTION_MARKER, UPSERT_LOG_ANCHOR_QUERY,
+};
+
+// CI-P21 (P-364): the resume-cursor live-tail VIEWER + the `details_ref` jump-to-failure resolution
+// (CI-D11). The `LiveTail` viewer composes the frozen firehose `subscribe`/`resume` on the bounded
+// `run:<id>` scope (0 lost lines on reconnect; `resync_required` → a range-read of the sealed
+// segments); the `DetailsRefResolver` resolves `CheckStatus.details_ref = …/ci/run/<id>#step-<n>`
+// through `log_anchor` → `log_segment` → the byte range (0 dangling step anchors).
+pub use live_tail::{
+    parse_step_ref, read_range_from_archive, DetailsRefError, DetailsRefResolver, LiveTail,
+    ParsedStepRef, ResumeOutcome, SegmentIndex, SegmentRange, StepByteRange,
 };
 
 pub use events::{

@@ -369,6 +369,12 @@ cdc = [
     # the *.snapshot cold path (NAMED). The KN-D1 drill (drill_kn_d1_resume_cursor.rs) proves
     # 0-lost/0-dup across a real kill+sever, written to re-run green across the KN-P29 CRDT boundary.
     "crates/myelin-knowledge/tests/cdc_3_5_knowledge_resume_cursor.rs",
+    # CONSUMER leg — CI's live-tail VIEWER (CI-P21 / P-364) rides this SAME frozen protocol: the
+    # `LiveTail` viewer subscribes/resumes on the bounded `run:<id>` scope (never `*`); a reconnect
+    # backfills (last_seq, now] then live (0 log lines lost — CI-D11); an over-window cursor ->
+    # resync_required -> a range-read of the sealed segments (the durable archive, never lost). The
+    # CI-D11 drill (drills_ci_p21_live_tail.rs) proves 0 lost lines + the bounded-scope rejection.
+    "crates/myelin-ci-controlplane/tests/cdc_live_tail_3_5_11_8.rs",
 ]
 
 # 3.6 reactive/dispatch tier (EB-23 / P-143). OWNED by the Bus; built in myelin-query (the
