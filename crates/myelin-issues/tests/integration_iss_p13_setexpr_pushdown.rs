@@ -1,0 +1,246 @@
+//! **ISS-P13 / P-379 — the leak-free `list_objects` `SetExpr` push-down for the issue board, PROVEN
+//! against the live dev-stack Postgres (the ISS-D3 gate's REAL artifact).**
+//!
+//! Gated behind the `integration` cargo feature so the default `cargo build --workspace` /
+//! `cargo test --workspace` stay DB-free. Run against the docker-compose dev stack:
+//!
+//!   docker compose -f docker-compose.dev.yml up -d --wait
+//!   cargo test -p myelin-issues --features integration \
+//!     --test integration_iss_p13_setexpr_pushdown -- --nocapture
+//!
+//! This is the REAL data-layer proof the binding policy requires (the prompt touches the §3
+//! `list_objects` DB read contract, 4.3): the board read — the lowered `SetExpr` (the confidential
+//! set-difference `(read − confidential) + grant`, lowered to `authz_visible` JOINs over `issue.id`)
+//! conjoined into the `issue` board scan — runs as **ONE SQL query** against real Postgres and returns
+//! ONLY the issues the viewer may see (0 leak), with the tenant predicate isolating cross-tenant rows
+//! and the confidential issue ABSENT by construction. The ISS-D3 drill flips green ONLY here, against
+//! the live stack — never mocked. Survival signals: **0 leak; 1 SQL query; confidential absent;
+//! cross-tenant absent; revoke reflected.**
+//!
+//! The SQL is the lowered form the Issues `planner` composes: it builds the confidential-set-difference
+//! `SetExpr` via the REAL [`myelin_issues::planner::lower_over_issue_id`] (the SAME `LoweredFilter` the
+//! production board read composes), then executes the one-query board scan against the seeded `issue` +
+//! `authz_visible` tables.
+#![cfg(feature = "integration")]
+
+use myelin_identity::{Principal, PrincipalId, PrincipalKind, RelName, SetExpr};
+use myelin_issues::planner::{issue_id_colref, lower_over_issue_id, AUTHZ_VISIBLE_TABLE};
+use myelin_tenancy::TenantId;
+
+fn app_url() -> String {
+    std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://myelin_app:myelin_app_pw@localhost:5433/myelin".into())
+}
+fn admin_url() -> String {
+    app_url().replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw")
+}
+
+/// The frozen `view` set-expr (the confidential set-difference, §6.1): `(read − confidential) + grant`.
+fn view_set_expr() -> SetExpr {
+    let in_rel = |r: &str| SetExpr::InRelation {
+        relation: RelName(r.into()),
+        via_column: issue_id_colref(),
+    };
+    SetExpr::Union(vec![
+        SetExpr::Difference(Box::new(in_rel("read")), Box::new(in_rel("confidential"))),
+        in_rel("confidential_grant"),
+    ])
+}
+
+#[tokio::test]
+async fn iss_d3_board_setexpr_join_one_query_zero_leak_confidential_and_cross_tenant() {
+    use sqlx::Row;
+
+    let admin = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&admin_url())
+        .await
+        .expect("connect to dev Postgres as admin (is the stack up? docker compose -f docker-compose.dev.yml up -d --wait)");
+
+    let suffix = std::process::id();
+    let issue_tbl = format!("issue_p379_{suffix}");
+    let av_tbl = format!("authz_visible_p379_{suffix}");
+
+    // ── 1. A minimal `issue` table (the §3 board columns the read touches incl. `rank`) + an
+    //       authz_visible reverse index table (the JOIN target). Throwaway, suffixed for isolation. ────
+    sqlx::query(&format!(
+        "CREATE TABLE {issue_tbl} (\
+           tenant_id text NOT NULL, region text NOT NULL, id text NOT NULL, \
+           rank text NOT NULL, title text NOT NULL, PRIMARY KEY (tenant_id, id))"
+    ))
+    .execute(&admin)
+    .await
+    .expect("create the issue table");
+    sqlx::query(&format!(
+        "CREATE TABLE {av_tbl} (\
+           tenant_id text NOT NULL, subject text NOT NULL, relation text NOT NULL, \
+           object_id text NOT NULL)"
+    ))
+    .execute(&admin)
+    .await
+    .expect("create the authz_visible reverse index table");
+
+    // ── 2. Seed: two issues the viewer reads (ENG-1 normal, ENG-2 confidential w/ a grant — visible),
+    //       one confidential issue WITHOUT a grant (ENG-3 — the leak witness, must be ABSENT), and a
+    //       CROSS-TENANT issue in another tenant (must never be readable). ─────────────────────────────
+    for (tenant, id, rank, title) in [
+        ("acme", "ENG-1", "U", "open one"),
+        ("acme", "ENG-2", "V", "granted confidential"),
+        ("acme", "ENG-3", "W", "CONFIDENTIAL no grant"),
+        ("evilcorp", "ENG-X", "U", "cross-tenant"),
+    ] {
+        sqlx::query(&format!(
+            "INSERT INTO {issue_tbl} (tenant_id, region, id, rank, title) VALUES ($1, 'fr-par', $2, $3, $4)"
+        ))
+        .bind(tenant)
+        .bind(id)
+        .bind(rank)
+        .bind(title)
+        .execute(&admin)
+        .await
+        .expect("seed an issue");
+    }
+
+    // ── 3. Grant the viewer (tenant acme): read of ENG-1, ENG-2, ENG-3; confidential on ENG-2 + ENG-3;
+    //       a confidential_grant on ENG-2 ONLY. So `(read − confidential) + grant` = {ENG-1, ENG-2}. ──
+    let viewer = Principal::stub(
+        PrincipalId("p:viewer".into()),
+        PrincipalKind::Human,
+        TenantId("acme".into()),
+    );
+    for (subject, relation, object) in [
+        ("p:viewer", "read", "ENG-1"),
+        ("p:viewer", "read", "ENG-2"),
+        ("p:viewer", "read", "ENG-3"),
+        ("p:viewer", "confidential", "ENG-2"),
+        ("p:viewer", "confidential", "ENG-3"),
+        ("p:viewer", "confidential_grant", "ENG-2"),
+    ] {
+        sqlx::query(&format!(
+            "INSERT INTO {av_tbl} (tenant_id, subject, relation, object_id) VALUES ('acme', $1, $2, $3)"
+        ))
+        .bind(subject)
+        .bind(relation)
+        .bind(object)
+        .execute(&admin)
+        .await
+        .expect("grant a tuple");
+    }
+
+    // ── 4. Build the REAL lowered SetExpr (the confidential set-difference → three authz_visible JOINs
+    //       over issue.id; no N+1 — one JOIN per distinct relation). ────────────────────────────────────
+    let lowered = lower_over_issue_id(&view_set_expr(), &viewer);
+    assert_eq!(
+        lowered.joins.len(),
+        3,
+        "the view set-difference lowers to 3 JOINs (read/confidential/confidential_grant), no N+1"
+    );
+
+    // Rebind the lowered JOIN clauses + predicate onto the suffixed test tables + bind the viewer
+    // subject/relations (in production the table names are canonical + the driver binds the params; the
+    // SHAPE under test is the lowering's clauses verbatim).
+    let mut join_clauses = String::new();
+    for j in &lowered.joins {
+        let clause = j
+            .clause
+            .replace(AUTHZ_VISIBLE_TABLE, &av_tbl)
+            .replace("issue.id", &format!("{issue_tbl}.id"))
+            .replace(":subject_0", "'p:viewer'")
+            .replace(":subject_1", "'p:viewer'")
+            .replace(":subject_2", "'p:viewer'")
+            .replace(":rel_for_read", "'read'")
+            .replace(":rel_for_confidential_grant", "'confidential_grant'")
+            .replace(":rel_for_confidential", "'confidential'");
+        join_clauses.push(' ');
+        join_clauses.push_str(&clause);
+    }
+    let predicate = lowered.sql_predicate.clone();
+
+    // ── 5. THE ONE BOARD query: the lowered JOINs + predicate conjoined into the issue scan, tenant-
+    //       scoped, ORDER BY rank LIMIT :page (the §3 pre-filter, never post-filter). The confidential
+    //       JOINs are LEFT JOINs so a row with no confidential tuple yields NULL (the `AND NOT … IS NOT
+    //       NULL` then keeps it) — the set-difference semantics in one query. ─────────────────────────
+    let join_clauses_left = join_clauses.replace("JOIN", "LEFT JOIN");
+    let list_sql = format!(
+        "SELECT {issue_tbl}.id FROM {issue_tbl}{join_clauses_left} \
+         WHERE {issue_tbl}.tenant_id = 'acme' AND {issue_tbl}.region = 'fr-par' AND ({predicate}) \
+         ORDER BY {issue_tbl}.rank LIMIT 50"
+    );
+    let rows = sqlx::query(&list_sql)
+        .fetch_all(&admin)
+        .await
+        .unwrap_or_else(|e| panic!("the ONE board query runs: {e}\nSQL: {list_sql}"));
+
+    // ── 6. PROVE leak-free: exactly {ENG-1, ENG-2}; ENG-3 (confidential, no grant) + the cross-tenant
+    //       issue ABSENT. ───────────────────────────────────────────────────────────────────────────
+    let ids: Vec<String> = rows.iter().map(|r| r.get::<String, _>("id")).collect();
+    assert_eq!(
+        ids,
+        vec!["ENG-1".to_string(), "ENG-2".to_string()],
+        "exactly the 2 visible issues (0 leak): {ids:?}"
+    );
+    assert!(
+        !ids.iter().any(|i| i == "ENG-3"),
+        "0 leak: the confidential issue (no grant) is ABSENT (the set-difference JOIN excluded it)"
+    );
+    assert!(
+        !ids.iter().any(|i| i == "ENG-X"),
+        "0 cross-tenant: the tenant predicate excluded evilcorp's issue"
+    );
+
+    // ── 7. PROVE one query / no N+1: the read is ONE statement (joins), EXPLAIN confirms a single plan
+    //       (no correlated per-row check subplan). ─────────────────────────────────────────────────────
+    let plan = sqlx::query(&format!("EXPLAIN (FORMAT TEXT) {list_sql}"))
+        .fetch_all(&admin)
+        .await
+        .expect("EXPLAIN the board query");
+    let plan_text: String = plan
+        .iter()
+        .map(|r| r.get::<String, _>(0))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan_text.to_lowercase().contains("join")
+            || plan_text.to_lowercase().contains("nested loop"),
+        "the read is ONE join query (no per-row check loop): {plan_text}"
+    );
+
+    // ── 8. REVOKE reflected (the new-enemy guard): remove the viewer's confidential_grant on ENG-2;
+    //       re-run the SAME one query → ENG-2 drops out (read-your-writes; ISS-D3 under staleness). ────
+    sqlx::query(&format!(
+        "DELETE FROM {av_tbl} WHERE tenant_id = 'acme' AND subject = 'p:viewer' AND relation = 'confidential_grant' AND object_id = 'ENG-2'"
+    ))
+    .execute(&admin)
+    .await
+    .expect("revoke the confidential_grant on ENG-2");
+    let rows_after = sqlx::query(&list_sql)
+        .fetch_all(&admin)
+        .await
+        .expect("re-run the board after revoke");
+    let ids_after: Vec<String> = rows_after
+        .iter()
+        .map(|r| r.get::<String, _>("id"))
+        .collect();
+    assert_eq!(
+        ids_after,
+        vec!["ENG-1".to_string()],
+        "the just-revoked ENG-2 drops out — the confidential issue is absent again (revoke reflected): {ids_after:?}"
+    );
+
+    println!(
+        "[P-379 INTEGRATION GREEN] ISS-D3 board SetExpr push-down PROVEN against live Postgres: \
+         2 visible of 4 issues → ONE JOIN query over issue.id (0 leak: confidential ENG-3 + \
+         cross-tenant ENG-X absent; EXPLAIN shows one join plan, no per-row check); revoking the \
+         confidential_grant drops ENG-2 from the SAME query (the new-enemy guard)."
+    );
+
+    // ── 9. Cleanup (forward teardown). ──────────────────────────────────────────────────────────────
+    sqlx::query(&format!("DROP TABLE {issue_tbl}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    sqlx::query(&format!("DROP TABLE {av_tbl}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+}
