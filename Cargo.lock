@@ -2163,7 +2163,14 @@ dependencies = [
 name = "myelin-ci-dispatch"
 version = "0.0.0"
 dependencies = [
+ "myelin-ci-sandbox",
+ "myelin-events",
+ "myelin-git",
+ "myelin-identity",
+ "myelin-query",
  "myelin-substrate",
+ "myelin-tenancy",
+ "serde_json",
  "sqlx",
  "tokio",
 ]

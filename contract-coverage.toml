@@ -189,7 +189,13 @@ cdc = [
 row = "2.5"
 title = "consumer_dedup ledger"
 status = "covered"
-cdc = ["crates/myelin-events/tests/cdc_2_5_consumer_dedup.rs"]
+# CI-P10 (P-353, M4) adds the CI Trigger & Dispatch CONSUMER half: the dispatch `DedupLedger` models
+# the `(consumer, event_id)` first-write-wins guard so one triggering push = exactly one run under
+# at-least-once redelivery (the exactly-once-effect drill). The provider half is the events ledger.
+cdc = [
+    "crates/myelin-events/tests/cdc_2_5_consumer_dedup.rs",
+    "crates/myelin-ci-dispatch/tests/cdc_ci_dispatch_trigger.rs",
+]
 
 [[contract]]
 row = "2.6"
@@ -308,8 +314,15 @@ cdc = ["crates/myelin-query/tests/cdc_3_3_triggers.rs"]
 [[contract]]
 row = "3.4"
 title = "EventMatcher = the frozen QueryAst"
-status = "deferred"
-landing = "P-137"
+# P-137 (EB-17) LANDED the `EventMatcher` (= the frozen `QueryAst`) in `myelin-query` (matcher.rs:
+# the one bounded predicate engine, the envelope projection, the JetStream subject-filter compile,
+# the leak-free permission compose). CI-P10 (P-353, M4) is its FIRST cross-subsystem CONSUMER and
+# ships the pair file: an `on: pull_request` CI trigger compiles to that one matcher (NOT a CI DSL,
+# NOT CEL) — the PROVIDER half (myelin-query's matcher) + the CONSUMER half (CI dispatch) both in
+# `cdc_ci_dispatch_trigger.rs`. The prior `deferred → P-137` deferral was stale (P-137 had shipped);
+# this flips it covered now that a real consumer + pair exist.
+status = "covered"
+cdc = ["crates/myelin-ci-dispatch/tests/cdc_ci_dispatch_trigger.rs"]
 
 # 3.5 firehose: SPLIT into the Bus-owned protocol half (subscribe/resume + zero-loss-replay) and the
 # SUBSTRATE-owned bounded-and-sheds half (§7.7). The substrate half — per-connection in-flight frame
@@ -645,6 +658,11 @@ cdc = [
     "crates/myelin-issues/tests/cdc_4_9_issues_fragment.rs",
     "crates/myelin-chat/tests/cdc_4_9_chat_fragment.rs",
     "crates/myelin-ci-controlplane/tests/cdc_4_9_ci_rebac_fragment.rs",
+    # CI-P10 (P-353, M4): the CI Trigger & Dispatch CONSUMER of the `read & !is_untrusted_fork` edge.
+    # The trust-tier classifier reads the edge's verdict (`read_excludes_fork`) and stamps the SAME
+    # evaluated tier onto BOTH `JobSpec.trust_tier` AND `CheckStatus.trust_tier` (X-1, 0 divergence) —
+    # the security-critical single stamp. (The `is_untrusted_fork` STAMP-WRITE half stays CI-P12.)
+    "crates/myelin-ci-dispatch/tests/cdc_ci_dispatch_trigger.rs",
 ]
 
 [[contract]]
