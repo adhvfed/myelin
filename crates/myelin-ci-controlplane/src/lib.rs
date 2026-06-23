@@ -52,6 +52,7 @@
 
 pub mod events;
 pub mod fairness;
+pub mod fleet;
 pub mod holder;
 pub mod migrations;
 pub mod rebac_fragment;
@@ -77,6 +78,17 @@ use myelin_substrate::{
 pub use scheduler::{
     lane_token, state_token, ClaimRequest, Claimed, EnqueueOutcome, JobState, Lane, QueuedJob,
     SchedulerState, CANCEL_SUPERSEDED_QUERY, CLAIM_QUERY, REAP_QUERY,
+};
+
+// CI-P14 (P-357): the EU fleet autoscaler — the FleetProvider impl + autoscale-on-queue-depth +
+// per-residency-zone pools (no global pool) + the fleet events. The residency-pin runner-write
+// boundary (1.6), the `residency_verify` report (12.4), the two EU adapters, and the autoscaler that
+// sizes the per-(region, label-class) pool to the scheduler's queue depth.
+pub use fleet::{
+    AutoscalePolicy, Autoscaler, BareMetalPxeAdapter, CrossRegionRunnerWrite, EuFleetProvider,
+    FleetAdapter, FleetError, FleetEvent, FleetPools, FleetResidencyReport, GenericEuIaasAdapter,
+    PoolKey, RunnerWritePin, ScalePlan, COUNT_RUNNERS_BY_POOL_QUERY, DELETE_RUNNER_QUERY,
+    INSERT_RUNNER_QUERY,
 };
 
 // CI-P13 (P-356): the scheduler fairness slice — DRR fair-share over `fair_key` + the lane shed

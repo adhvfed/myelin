@@ -2155,6 +2155,7 @@ dependencies = [
  "myelin-lints",
  "myelin-substrate",
  "myelin-tenancy",
+ "serde_json",
  "sqlx",
  "tokio",
 ]

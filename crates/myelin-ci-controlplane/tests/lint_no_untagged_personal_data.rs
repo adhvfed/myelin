@@ -93,6 +93,11 @@ fn residency_pin_is_green_over_the_ci_source() {
         include_str!("../src/migrations.rs"),
         include_str!("../src/schema.rs"),
         include_str!("../src/lib.rs"),
+        // CI-P14 (P-357): the fleet's runner-WRITE boundary (the `@residency-write` site). The fleet
+        // pins every runner row's region from the CELL's region (`cell_region`/`row_region`
+        // parameters), NEVER a request/payload field — so the residency-pin lint admits it (the
+        // no-global-pool write-boundary, contract 1.6).
+        include_str!("../src/fleet.rs"),
     ] {
         assert!(
             residency_pin().run(src).is_empty(),
