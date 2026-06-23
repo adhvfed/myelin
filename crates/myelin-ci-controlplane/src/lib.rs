@@ -57,6 +57,7 @@ pub mod fleet;
 pub mod holder;
 pub mod migrations;
 pub mod rebac_fragment;
+pub mod schedule_and_run_job;
 pub mod scheduler;
 pub mod schema;
 
@@ -69,6 +70,15 @@ pub mod schema;
 // reserve/settle metering into `cost_event` is CI-P17; the `check_attempt` monotonic counter + the
 // outbox producer plumbing is CI-P18; the end-to-end merge-queue seam GATE (GIT-D10/CI-D8) is CI-P19.
 pub use ci_pipeline::{CheckFacts, PipelineRun, PipelineStage, RunVerdict, CI_PIPELINE_WF_TYPE};
+
+// CI-P16 (P-359): the `SCHEDULE_AND_RUN_JOB` dispatch handshake into CI's `job_queue` + the
+// effectively-once invariant (CI-D1). The concrete `JobRunner` that BINDS the FROZEN engine dispatch
+// seam (9.2/9.4) onto the scheduler's `job_queue` — minting the deterministic `idem_token` (engine),
+// idempotent enqueue on `jq_idem` (a reaper re-queue + a control-plane re-dispatch = ONE row), and the
+// runner's terminal `job.done` delivery (idempotent on `idem_token`, the `wf_signal` PK = one wake).
+// The reserve/settle metering bookends into `cost_event` are CI-P17 (P-360); the live runner lease +
+// in-sandbox execution is GATED by AG-D4.
+pub use schedule_and_run_job::{complete_job, JobScheduleTerms, SchedulerJobRunner};
 
 pub use holder::{
     ci_store_classifier, register_ci_holders, CiHolder, CiHolderRegistration, CiStoreClass,
