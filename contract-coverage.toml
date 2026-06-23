@@ -236,10 +236,17 @@ status = "covered"
 # ISS-P15 (P-381, M4) adds the Issues projection-feeder CONSUMER instance: the measured generated-index
 # promotion EventHandler with a `*`-free `issue.issue.updated` whitelist + idempotent-on-event_id handle,
 # admitted + driven through the Bus consumer runtime (cdc_2_4_issues_projection_feeder.rs).
+# ISS-P18 (P-384, M4) adds the Issues rollup CONSUMER instance: the event-driven, debounced, incremental
+# rollup EventHandler (`myelin_issues::rollup::RollupConsumer`) — a `*`-free whitelist over the
+# rollup-driving issue.* deltas (issue.updated/transitioned/parent_changed) + idempotent-on-event_id
+# handle (off the bus, NEVER in the write path); a malformed (no-subject) event is non-retryable poison.
+# The ISS-D8(a) bounded-recompute (debounce-coalesce) + the input_hash no-op suppression (AG-6) are the
+# loop-storm guard (drill_iss_d8_rollup.rs).
 cdc = [
     "crates/myelin-events/tests/drills_sub_d2_consumer.rs",
     "crates/myelin-knowledge/tests/cdc_2_2_2_3_2_4_2_9_kn_d7_outbox.rs",
     "crates/myelin-issues/tests/cdc_2_4_issues_projection_feeder.rs",
+    "crates/myelin-issues/tests/drill_iss_d8_rollup.rs",
 ]
 
 [[contract]]
@@ -297,6 +304,13 @@ cdc = [
     # one source of truth) rebuilds the derived view from the `ci.run.snapshot` drafts ALONE (cold == live,
     # no CI-DB read) + idempotent re-run. The surfacing read+ref half (5.1/5.6/5.7) is CI-P25/P-368.
     "crates/myelin-ci-controlplane/tests/cdc_6_3_2_6_7_3_ci_surfacing_index.rs",
+    # ISS-P18 / P-384 (M4): the rollup reindex-from-source half — the DERIVED rollup aggregate
+    # (`myelin_issues::rollup::RollupConsumer`) is rebuilt DRIFT-FREE off the source of truth (the
+    # issue_relation edges + the leaf facts) via `reindex_from`, the SAME re-sum the live consumer runs
+    # (steady-state + recovery share ONE code path). ISS-D8(b) reindex-parity (0 drift, byte-match) is
+    # the green artifact; the rollup *.snapshot replay (IssueReindexSource, rollup: granular) is
+    # deterministic (cold == live, idempotent re-run). drill_iss_d8_rollup.rs.
+    "crates/myelin-issues/tests/drill_iss_d8_rollup.rs",
 ]
 
 [[contract]]
@@ -868,10 +882,16 @@ status = "covered"
 # a hang) and depth-bounded (a node past depth 16 is not expanded). The impact/hierarchy surface + the
 # unblock-trigger walk ride this. The Refs-service traverse (cdc_5_3_traverse.rs) is the cross-subsystem
 # projection-graph half; this is the producer-owned typed-table walk.
+# ISS-P18 / P-384 (M4) adds the ROLLUP consumer of the same depth-16 cycle-safe walk: the rollup's
+# `walk_parent_edges` (`myelin_issues::rollup`) is the ancestor walk over the issue_relation `parent`
+# edges (a `parent` row is `child --parent--> parent`, so the forward walk from a child IS its ancestor
+# walk) — it REUSES the ONE IssueRelationGraph::traverse (no second traversal), depth-bounded at 16 +
+# cycle-safe (a `parent` cycle terminates with a finite ancestor set, never a hang). drill_iss_d8_rollup.rs.
 cdc = [
     "crates/myelin-refs-service/tests/cdc_5_3_backlinks.rs",
     "crates/myelin-refs-service/tests/cdc_5_3_traverse.rs",
     "crates/myelin-issues/tests/cdc_5_4_5_5_5_6_5_7_5_3_6_3_issues_refs_glue.rs",
+    "crates/myelin-issues/tests/drill_iss_d8_rollup.rs",
 ]
 
 [[contract]]
