@@ -776,9 +776,22 @@ status = "covered"
 # provider+consumer pair (cdc_5_1_5_6_5_7_ci_surfacing.rs) round-trips the mint + strips the `#sub` to
 # the canonical root. The deployment/pipeline/runner canonical-root type tokens are added to the
 # frozen Bus §6.2 ARTIFACT_TYPE_TOKENS table (the EB-24 git/chat root-type extension, same posture).
+# ISS-P08 / P-374 (M4) adds the ISSUES slice: the Hi/Lo allocator (myelin_issues::HiLoKeyAllocator)
+# mints the STORED CANONICAL `<PROJECTKEY>-<seqno>` id as the `<id>` segment of the issue's
+# `myelin://<t>/issue/issue/<key>` URN (recon REF-3 — the human key IS the ArtifactRef id). The
+# provider+consumer pair (cdc_5_1_iss_key.rs) proves the allocator mints the canonical key, the ONE
+# refs codec round-trips it byte-identical, and the render-time `#<seqno>` short form is REJECTED as a
+# scope (display-only, never stored). The allocator's correctness drill is ISS-D4 (create-storm on one
+# hot prefix): the DEFAULT-build leg is drill_iss_d4_create_storm.rs (24 workers x 1000 -> 24000
+# distinct keys, 0 dup, monotonic 1..=total, per-prefix isolation) and the LIVE-Postgres
+# `prefix_counter` `UPDATE … RETURNING` leg is integration_iss_p08_key_storm.rs (12 workers x 400 ->
+# 4800 distinct keys, 0 dup, monotonic <= the durable high-water, OPS isolated — dated green
+# 2026-06-23 against the dev stack). The allocation slots into the ISS-P06 write path via
+# write_path::create_issue (the minted key co-commits with issue.created — contract 2.2).
 cdc = [
     "crates/myelin-refs/tests/cdc_5_1_artifactref.rs",
     "crates/myelin-ci-controlplane/tests/cdc_5_1_5_6_5_7_ci_surfacing.rs",
+    "crates/myelin-issues/tests/cdc_5_1_iss_key.rs",
 ]
 
 [[contract]]
