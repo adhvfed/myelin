@@ -193,35 +193,63 @@ pub enum RunVerdict {
     Parked,
 }
 
-/// Build a [`myelin_events::check_seam::CheckStatus`]-shaped opaque payload value for a terminal
-/// `ci.check.updated` fact (X-1, §4). The Bus carries the CI-owned struct OPAQUE; this is the small,
-/// PII-free shape Git's [`myelin_git::check_status::CheckStatus`] decodes — `state` / `run` /
-/// `run_attempt` / `trust_tier` / `details_ref` / `cost_settled`. A PURE function of the facts + the
-/// terminal state, so replay re-builds a BYTE-IDENTICAL payload (the CI-D9 property).
+/// Build the FROZEN 5.9 `CheckStatus`-shaped opaque payload value for a terminal `ci.check.updated`
+/// fact (X-1, §4) — **assembled THROUGH the [`crate::check_emitter`] producer (CI-P18, P-361), the
+/// ONE producer shape (no divergence, EI-01 §7 reconcile-in-place).** The Bus carries the CI-owned
+/// struct OPAQUE; this is the byte-identical shape Git's `myelin_git::check_status::CheckStatus`
+/// decodes off the payload. A PURE function of the facts + the terminal state, so replay re-builds a
+/// BYTE-IDENTICAL payload (the CI-D9 property).
+///
+/// The `trust_tier` is STAMPED from the run's provenance (`CheckFacts.trust_tier`, read off the
+/// CI-P10 dispatch stamp, NEVER recomputed). The `summary` is a HumanisedRef (7.3, never a raw
+/// string). `cost_settled` is `Unsettled` on the terminal-but-not-yet-settled fact — a check is NOT
+/// "final" until the reserve/settle bookend closes (the terminal-SETTLED re-emit on `job.done` settle
+/// carries `cost_settled: true`; this body emits the terminal verdict fact, the settle re-emit is the
+/// metering follow-on).
 fn terminal_check_status(facts: &CheckFacts, context: &str, success: bool) -> serde_json::Value {
-    let state = if success { "success" } else { "failure" };
-    // The jump-to-failure sub-anchor (`#step-<n>`, OQ-D). The body anchors the details_ref on the
-    // run's failure step; the per-context step index is the runner's (firehose) state — here the
-    // PII-free run-anchored ref Git renders as a link (never CI's DB resolved, §2 of the glue doc).
-    let details_ref = if success {
-        format!("{}#summary", facts.run_ref)
+    let state = if success {
+        crate::check_emitter::CheckState::Success
     } else {
-        format!("{}#step-failure", facts.run_ref)
+        crate::check_emitter::CheckState::Failure
     };
-    serde_json::json!({
-        "repo": facts.repo,
-        "commit_oid": facts.commit_oid,
-        "context": { "provider": "ci", "name": context },
-        "state": state,
-        "run": facts.run_ref,
-        "run_attempt": facts.run_attempt,
-        "trust_tier": facts.trust_tier,
-        "details_ref": details_ref,
-        // terminal but NOT settled until CI-P17's reserve/settle bookend closes — the X-1 cost-gate
-        // field (a check is not "final" until cost_settled = true). The terminal-settled
-        // `ci.check.updated` (cost_settled: true) is CI-P17/CI-P18.
-        "cost_settled": false,
-    })
+    let emit_ctx = crate::check_emitter::CheckEmitContext {
+        tenant: tenant_of(&facts.run_ref),
+        repo: facts.repo.clone(),
+        commit_oid: facts.commit_oid.clone(),
+        run_ref: facts.run_ref.clone(),
+        run_attempt: facts.run_attempt,
+        // STAMPED from provenance (read off the run's CI-P10 stamp), NEVER recomputed — a fork run is
+        // recorded faithfully but CI never endorses it (the poisoned-pipeline defence, X-1).
+        trust_tier: crate::check_emitter::TrustTier::from_stamp(&facts.trust_tier),
+        // The body's run window — the per-step started/completed wall-clock is NOT the supersession
+        // authority; the body carries the run's deterministic timestamps (display columns only).
+        started_at: "1970-01-01T00:00:00Z".to_string(),
+        completed_at: Some("1970-01-01T00:00:00Z".to_string()),
+    };
+    crate::check_emitter::check_status_payload(
+        &emit_ctx,
+        crate::check_emitter::CheckProvider::Ci,
+        context,
+        state,
+        // CI's REPORT/echo of `required` — Git's branch-protection policy is authoritative (CI
+        // reports, Git decides). The body echoes `true` for the run's emitted contexts.
+        true,
+        // terminal but NOT settled until CI-P17's reserve/settle bookend closes (the X-1 cost gate).
+        crate::check_emitter::CostPosture::Unsettled,
+        // the failing-step index resolves through CI-P21's log index; the body anchors on the run.
+        None,
+    )
+}
+
+/// The tenant token from a `myelin://<tenant>/ci/run/<id>` run ref (the projection partition key,
+/// EI-02 §1). A PURE parse over the PII-free ref grammar (no IO); defaults to the ref itself if the
+/// shape is unexpected (loud-but-safe — the partition key is never silently empty).
+fn tenant_of(run_ref: &str) -> String {
+    run_ref
+        .strip_prefix("myelin://")
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or(run_ref)
+        .to_string()
 }
 
 // @workflow-body — the `ci.pipeline` durable workflow body (the flow-determinism lint scans this

@@ -1011,6 +1011,22 @@ status = "covered"
 # merge-queue CONSUMER half is now PAIRED with CI's REAL provider half (not the mock) in
 # `crates/myelin-flow/tests/cdc_5_9_merge_queue.rs::consumer_reconciles_with_the_real_ci_producer_end_to_end`.
 # The merge-queue-in-isolation FLOOR (P-FLOW-19) is PROMOTED to the seam end-to-end (the floor closed).
+# CI-P18/P-361 (M4) LANDED THE REAL CI CONTROL-PLANE PRODUCER HALF — the `check_attempt` monotonic
+# counter + the FROZEN 5.9 `CheckStatus` assembly in `myelin_ci_controlplane::check_emitter`. CI is the
+# SOURCE of `run_attempt`: `BUMP_CHECK_ATTEMPT_SQL` (the `next_attempt + 1 RETURNING next_attempt - 1`
+# UPSERT on the `(commit_oid, context)` key) is monotonic — proven against the live dev Postgres in
+# `crates/myelin-ci-controlplane/tests/integration_ci_p18_check_attempt_bump.rs` (first dispatch → 1,
+# each re-run bumps strictly; per-(commit_oid, context) sequences; the supersession key is the counter,
+# never wall-clock). `check_status_payload` assembles the frozen struct EXACTLY (the `summary` is a
+# HumanisedRef never a raw string, 7.3; `cost_settled` flips ONLY on settle, X-1; `trust_tier` is
+# STAMPED from provenance — CI records a fork run faithfully but NEVER endorses it). The `ci.pipeline`
+# body (CI-P15) was RECONCILED to assemble its terminal facts THROUGH this module (ONE producer shape,
+# no divergence — EI-01 §7), fixing the prior loose payload so it now decodes BYTE-IDENTICALLY into
+# Git's frozen consumer view. The CDC PROVIDER half is below
+# (`crates/myelin-ci-controlplane/tests/cdc_5_9_ci_check_producer.rs`): CI's assembled payload decodes
+# through Git's REAL `CheckStatusConsumer::decode` (no drift; an incomplete payload is a LOUD decode
+# failure). The `ci.result` rollup end-to-end + the GIT-D10/CI-D8 seam GATE (0 double-merge) is CI-P19
+# (P-362); external-provider checks are a demand-driven follow-on.
 cdc = [
     # the Bus's carriage CDC (the narrow half — envelope + ordering + the wait substrate)
     "crates/myelin-events/tests/cdc_5_9_check_seam_carriage.rs",
@@ -1031,6 +1047,14 @@ cdc = [
     # producer DERIVES (RealCiResultProducer over CheckSeamOrder + run_attempt supersession +
     # rollup_ci_result), not a fabricated verdict. Closes the P-FLOW-19 merge-queue-in-isolation floor.
     "crates/myelin-flow/tests/cdc_5_9_merge_queue.rs",
+    # CI's CONTROL-PLANE PRODUCER half (CI-P18 / P-361, M4): the `check_attempt` monotonic counter +
+    # the frozen 5.9 `CheckStatus` assembly. CI assembles the payload through
+    # `myelin_ci_controlplane::check_status_payload` (CI never depends on Git in production code — it
+    # produces the frozen JSON shape) and this CDC proves it decodes BYTE-IDENTICALLY through Git's
+    # REAL `CheckStatusConsumer::decode` (no drift; summary is a HumanisedRef; cost_settled flips only
+    # on settle; an untrusted_fork run is recorded faithfully but never endorsed; an incomplete
+    # payload is a LOUD decode failure — the seam shape is a real gate).
+    "crates/myelin-ci-controlplane/tests/cdc_5_9_ci_check_producer.rs",
 ]
 
 # ──────────────── §6 Search (myelin-search) ─────────────────────────────────────────────────────

@@ -50,6 +50,7 @@
 //! The REAL forward-only apply against the dev-stack Postgres (RLS isolation + the claim indexes) is
 //! `tests/integration_ci_p6_controlplane_schema.rs` behind the `integration` cargo feature.
 
+pub mod check_emitter;
 pub mod ci_pipeline;
 pub mod events;
 pub mod fairness;
@@ -71,6 +72,19 @@ pub mod schema;
 // reserve/settle metering into `cost_event` is CI-P17; the `check_attempt` monotonic counter + the
 // outbox producer plumbing is CI-P18; the end-to-end merge-queue seam GATE (GIT-D10/CI-D8) is CI-P19.
 pub use ci_pipeline::{CheckFacts, PipelineRun, PipelineStage, RunVerdict, CI_PIPELINE_WF_TYPE};
+
+// CI-P18 (P-361): the X-1 `check_attempt` monotonic counter + the `ci.check.updated` PRODUCER (the
+// check-fact half of contract 5.9). The `check_attempt` counter (arch 01 §3.2 — CI's SOURCE of
+// `run_attempt`, monotonic, never wall-clock) + the FROZEN 5.9 `CheckStatus` assembly (the
+// byte-identical shape Git's consumer decodes off the OPAQUE `ci.check.updated` payload): the
+// `summary` is a HumanisedRef (7.3, never a raw string), `cost_settled` flips ONLY on settle (X-1),
+// `trust_tier` is STAMPED from provenance (CI never endorses a fork). The `ci.pipeline` body
+// ([`ci_pipeline`]) now assembles its terminal facts THROUGH this module (ONE producer shape, no
+// divergence). The `ci.result` rollup end-to-end + the GIT-D10/CI-D8 seam GATE is CI-P19 (P-362).
+pub use check_emitter::{
+    assemble_check_status, check_status_payload, details_ref, summary_for, CheckAttemptCounter,
+    CheckEmitContext, CheckProvider, CheckState, CostPosture, TrustTier, BUMP_CHECK_ATTEMPT_SQL,
+};
 
 // CI-P16 (P-359): the `SCHEDULE_AND_RUN_JOB` dispatch handshake into CI's `job_queue` + the
 // effectively-once invariant (CI-D1). The concrete `JobRunner` that BINDS the FROZEN engine dispatch
