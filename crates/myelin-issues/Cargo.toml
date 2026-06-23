@@ -23,7 +23,26 @@ publish = false
 # the OQ-H worklog/productivity behavioural tags) so the no-untagged-personal-data lint (contract
 # 1.6) is GREEN from the first migration (ISS-P05). No Issues FEATURE ships here — the holder is
 # OPENED + auto-registered by serve when the store opens in ISS-P07.
+[[bin]]
+# ISS-P05 (P-371, M4): the Issue Tracker service is a `serve(AppSpec)` shell (contract 1.1) — this
+# binary is the "every service main.rs" the row names: it does nothing but hand the Issues AppSpec to
+# the harness's one call (NOT a hand-rolled lifecycle). The library carries the shell builder
+# (`issues_app_spec` / `run_issues`), the COMPLETE forward-only issue-spine migrations, and the
+# auto-registered H3 PersonalDataHolder.
+name = "issues"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
 [dependencies]
+# ISS-P05 (P-371, M4): the substrate serve(AppSpec) harness (contract 1.1/1.2/1.3): the three-surface
+# split, liveness ≠ readiness, the forward-only migration runner + the HotTables declaration, the
+# holder auto-registry (contract 1.4). The Issues service is an AppSpec, not a hand-rolled main. A
+# leaf-consumer edge onto the substrate (the same edge every service shell carries); nothing in the
+# production DAG depends back on myelin-issues. The CREATE-TABLE DDL stays `&str` the runner admits
+# DB-free; the live forward-only apply is behind the `integration` feature only.
+myelin-substrate = { path = "../myelin-substrate" }
 # The frozen Identity contract surface: the names-only `NamespaceFragment` ABI carrier Identity
 # admits into the cell schema (contract 4.9) + Principal (the verified subject the holder keys on).
 # A consumer LEAF depending on the identity GLUE crate (not the service) keeps the §2.9 DAG acyclic.
@@ -64,6 +83,17 @@ myelin-notif = { path = "../myelin-notif" }
 serde.workspace = true
 serde_json.workspace = true
 
+# ------------------------------------------------------------------------------------------
+# ISS-P05 (P-371): REAL live-stack schema apply behind the `integration` feature. The complete
+# issue-spine data-model migration gets PROVEN against the live dev-stack Postgres (forward-only
+# apply + RLS isolation + the FK + the hot-path indexes) in tests/integration_iss_p05_spine_schema.rs.
+# The OPTIONAL sqlx + tokio deps are pulled ONLY by `--features integration` — the default
+# `cargo build`/`cargo test --workspace` stay DB-free. EXTERNAL crates only; no new myelin edge. The
+# test reads DATABASE_URL inline (no myelin-config edge — same posture as ci-controlplane/refs).
+# ------------------------------------------------------------------------------------------
+sqlx = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+
 # DEV-ONLY: the rich ReBAC namespace ENGINE (FragmentDef / Userset / StoreBackedCheck) lives in the
 # Identity SERVICE crate. The runtime Issues fragment is the names-only `myelin_identity::Namespace-
 # Fragment` ABI carrier (above) — a consumer subsystem never depends on a service crate at runtime
@@ -79,7 +109,18 @@ myelin-storage = { path = "../myelin-storage" }
 # ONLY in the 7.6 declares CDC + unit tests to render an Issues subject's inbox dedup key. Test
 # scaffolding (no runtime edge: the declares module is generic over the caller's subject ref).
 myelin-refs = { path = "../myelin-refs" }
+# ISS-P05 (P-371): the architecture-lint ratchet (contract 1.6) — Issues' own dated red+green
+# confirmation that `no-untagged-personal-data` REJECTS an untagged PII Issues field + ADMITS the
+# tagged schema, and that `forward-only-migration` / `residency-pin` are GREEN over the issue-spine
+# migration source (tests/lint_issue_spine.rs). A test-support crate (NOT a production DAG node).
+myelin-lints = { path = "../myelin-lints" }
 # Note: `myelin-events` + `serde_json` are now REGULAR dependencies (above) — `events.rs` (ISS-P03)
 # registers the `issue.*` taxonomy against the Bus grammar at RUNTIME, and the 13.3 byte-identity CDC
 # (tests/cdc_13_3_issues_coown.rs) keeps serializing the co-owned ViewSpec/FieldType to JSON. Both
 # resolve through the regular deps; no separate dev entry needed.
+
+[features]
+default = []
+# ISS-P05 (P-371): the live-stack schema-apply proof (the issue-spine migration against real
+# Postgres). Pulls the optional sqlx + tokio external crates only; the default build stays DB-free.
+integration = ["dep:sqlx", "dep:tokio"]

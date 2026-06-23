@@ -105,11 +105,29 @@
 //! ratification is a parallel legal track — P-GA-08's DPIA router consumes the `SpecialCategory` flag
 //! if counsel reclassifies.)
 
+//! ## ISS-P05 / P-371 (M4) — the issue-spine migrations + the bootable service shell
+//! M4 opens with the schema floor under all of Issues. [`app`] assembles the Issue Tracker
+//! [`myelin_substrate::AppSpec`] the harness drives (boot → migrate → relay → three ports → graceful
+//! drain, liveness ≠ readiness — contract 1.1, the EXACT analog of the CI / Search / Refs shells);
+//! [`migrations`] is the COMPLETE forward-only issue-spine data model (arch 01 §2–§8: the `issue`
+//! typed-core + JSONB-tail spine, `issue_relation` TE-7 source-of-truth, `issue_change_log`, the
+//! `scheme`/`scheme_assignment`/`cycle`/`cycle_membership`/`milestone`/`prefix_counter` tables, the
+//! platform `consumer_dedup` + `outbox`), each domain table `(tenant_id, region)`-first + RLS-on
+//! (11.1/12.1/1.5) with `issue`/`issue_relation`/`issue_change_log` flagged HOT (§8.1); [`holder`]
+//! is the auto-registered **H3** `PersonalDataHolder` (locate/export typed, erase stubbed to
+//! crypto-shred naming ISS-P07/P31, the `restrict` flag wired — contract 10.1/1.4). **NO Issues data
+//! is written yet**: the silent-data-loss-safe write path is ISS-P06 (P-372); the per-subject DEK +
+//! the full holder ops are ISS-P07 (P-373). Storage floor = PG-hybrid sharded by tenant;
+//! distributed-SQL is the measured R-6 follow-on (ISS-P32) — named in [`migrations`].
+
 #![forbid(unsafe_code)]
 
+pub mod app;
 pub mod declares;
 pub mod events;
+pub mod holder;
 pub mod holder_intent;
+pub mod migrations;
 pub mod query_coown;
 pub mod rebac_fragment;
 pub mod replay;
@@ -117,3 +135,23 @@ pub mod schema;
 pub mod sla_escalation;
 
 pub use replay::{IssueReindexSource, IssueReplayKind};
+
+// ISS-P05 (P-371, M4): the bootable service shell + the complete issue-spine data model + the H3
+// holder. The `serve(AppSpec)` shell (contract 1.1), the forward-only migrations (1.5/11.1/12.1), and
+// the auto-registered PersonalDataHolder (10.1/1.4).
+pub use app::{boot_issues, issues_app_spec, run_issues, SERVICE_NAME};
+pub use holder::{
+    issue_store_classifier, register_issue_holders, IssueHolder, IssueHolderRegistration,
+    IssueStoreClass, RestrictionFlag, ISSUE_OLTP_STORE, ISSUE_RESIDUAL_POSTURE_REF,
+};
+pub use migrations::{
+    issues_hot_tables, issues_migrations, make_tenant_scoped_ddl, CONSUMER_DEDUP_TABLE,
+    CREATE_CONSUMER_DEDUP_DDL, CREATE_CYCLE_DDL, CREATE_CYCLE_MEMBERSHIP_DDL,
+    CREATE_ISSUE_CHANGE_LOG_DDL, CREATE_ISSUE_DDL, CREATE_ISSUE_INDEXES_DDL,
+    CREATE_ISSUE_RELATION_DDL, CREATE_ISSUE_RELATION_INDEXES_DDL, CREATE_MILESTONE_DDL,
+    CREATE_PREFIX_COUNTER_DDL, CREATE_SCHEME_ASSIGNMENT_DDL, CREATE_SCHEME_DDL,
+    CYCLE_MEMBERSHIP_TABLE, CYCLE_TABLE, ISSUE_ASSIGNEE_INDEX, ISSUE_BOARD_INDEX,
+    ISSUE_CHANGE_LOG_TABLE, ISSUE_CYCLE_INDEX, ISSUE_PARENT_INDEX, ISSUE_PROPS_GIN_INDEX,
+    ISSUE_RELATION_TABLE, ISSUE_ROADMAP_INDEX, ISSUE_TABLE, MILESTONE_TABLE, OUTBOX_TABLE,
+    PREFIX_COUNTER_TABLE, SCHEME_ASSIGNMENT_TABLE, SCHEME_TABLE,
+};
