@@ -133,6 +133,7 @@ pub mod rebac_fragment;
 pub mod replay;
 pub mod schema;
 pub mod sla_escalation;
+pub mod write_path;
 
 pub use replay::{IssueReindexSource, IssueReplayKind};
 
@@ -154,4 +155,15 @@ pub use migrations::{
     ISSUE_CHANGE_LOG_TABLE, ISSUE_CYCLE_INDEX, ISSUE_PARENT_INDEX, ISSUE_PROPS_GIN_INDEX,
     ISSUE_RELATION_TABLE, ISSUE_ROADMAP_INDEX, ISSUE_TABLE, MILESTONE_TABLE, OUTBOX_TABLE,
     PREFIX_COUNTER_TABLE, SCHEME_ASSIGNMENT_TABLE, SCHEME_TABLE,
+};
+
+// ISS-P06 (P-372, M4): the silent-data-loss-safe write path. `apply_mutation` runs validate →
+// Id.check (+ CaveatContext) → mutate the typed core → OutboxTx::emit IN ONE TRANSACTION (the issue
+// is the aggregate, UNIQUE(aggregate, seq)); emit-iff-committed (0 ghost / 0 lost), the no-raw-publish
+// lint holds (emit is the only path), write_tuples + the zookie wired on the relation-changing
+// mutations (4.6/4.10). Floors named in `write_path`: the canonical key is ISS-P08, the order_key CAS
+// reorder is ISS-P09, the myelin-content body is ISS-P10.
+pub use write_path::{
+    apply_mutation, issue_aggregate_key, issue_ref, IssueDraft, MutationKind, WriteError,
+    WriteOutcome, PERM_COMMENT, PERM_MANAGE, PERM_PERFORM_TRANSITION, PERM_TRANSITION,
 };
