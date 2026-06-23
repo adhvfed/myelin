@@ -169,10 +169,16 @@ status = "covered"
 # CI-P23 (P-366, M4) adds the CI supply-chain verifier's CONSUMER side: every fail-closed refusal
 # builds a `ci.supply_chain.verification_failed` EventDraft (the frozen envelope shape, a registered
 # durable ci.* token, the `ci/run/<run_id>` aggregate, PII-free) to be emitted via the outbox ONLY.
+# ISS-P06 (P-372, M4) adds the Issues silent-data-loss-safe write path (myelin_issues::write_path):
+# validate → Id.check (+CaveatContext) → mutate typed core → OutboxTx::emit IN ONE TX; the issue is the
+# aggregate; emit-iff-committed (0 ghost / 0 lost — kill-between-commit-and-publish drill green); the
+# no-raw-publish lint GREEN over the source (emit is the only path).
 cdc = [
     "crates/myelin-storage/tests/cdc_st_02_coloc.rs",
     "crates/myelin-knowledge/tests/cdc_2_2_2_3_2_4_2_9_kn_d7_outbox.rs",
     "crates/myelin-ci-controlplane/tests/cdc_supply_chain_2_2_10_6_4_7.rs",
+    "crates/myelin-issues/tests/drill_iss_p06_emit_iff_committed.rs",
+    "crates/myelin-issues/tests/integration_iss_p06_outbox.rs",
 ]
 
 [[contract]]
@@ -181,9 +187,14 @@ title = "outbox table + FOR UPDATE SKIP LOCKED relay"
 status = "covered"
 # KN-P06/P-296 (M3): the Knowledge emit seam stamps the aggregate = the doc/row/db (§4 ordering key);
 # per-doc events stay per-aggregate ordered (monotonic seq), proven in the same CDC + live integration.
+# ISS-P06 (P-372, M4): the Issues write path stamps the aggregate = the issue (the issue is the
+# aggregate, UNIQUE(aggregate, seq)); chained create→update→transition events stay per-issue ordered
+# (monotonic, gap-free), proven in the write-path provider CDC.
 cdc = [
     "crates/myelin-storage/tests/cdc_st_02_coloc.rs",
     "crates/myelin-knowledge/tests/cdc_2_2_2_3_2_4_2_9_kn_d7_outbox.rs",
+    "crates/myelin-issues/tests/drill_iss_p06_emit_iff_committed.rs",
+    "crates/myelin-issues/tests/integration_iss_p06_outbox.rs",
 ]
 
 [[contract]]
@@ -206,9 +217,12 @@ status = "covered"
 # CI-P10 (P-353, M4) adds the CI Trigger & Dispatch CONSUMER half: the dispatch `DedupLedger` models
 # the `(consumer, event_id)` first-write-wins guard so one triggering push = exactly one run under
 # at-least-once redelivery (the exactly-once-effect drill). The provider half is the events ledger.
+# ISS-P06 (P-372, M4) adds the Issues consumer-dedup CDC half: a replay of the SAME stable issue.*
+# event_id is dedup-suppressed (0 double-handle) — the write path's stable ids are dedup-safe on replay.
 cdc = [
     "crates/myelin-events/tests/cdc_2_5_consumer_dedup.rs",
     "crates/myelin-ci-dispatch/tests/cdc_ci_dispatch_trigger.rs",
+    "crates/myelin-issues/tests/drill_iss_p06_emit_iff_committed.rs",
 ]
 
 [[contract]]
@@ -434,9 +448,16 @@ status = "covered"
 # rejected (the 4.10 new-enemy guard). The consumer CDC + the just-revoked drill (0 stale-grant
 # writes) + the schema-validation gate (0 invalid rows) ride here. The read-side list_objects SetExpr
 # push-down is the named KN-P16 follow-on.
+# ISS-P06 (P-372, M4) adds the ISSUES consumer half: the Issues write path
+# (myelin_issues::apply_mutation) gates EVERY mutation on `check(actor, <perm>, issue_ref, Strong, +
+# CaveatContext)` BEFORE the same-tx co-commit — applies ONLY on Allow, fail-closes on Deny/Conditional/
+# error (the transaction is dropped without commit → nothing written, emit-iff-committed). A transition
+# carries the transition-level CaveatContext (off the hot list_objects path, OQ-E). The drill proves a
+# denied write co-commits nothing (0 ghost).
 cdc = [
   "crates/myelin-identity-service/tests/cdc_4_2_check.rs",
   "crates/myelin-knowledge/tests/cdc_4_2_4_10_knowledge_per_op_authority.rs",
+  "crates/myelin-issues/tests/drill_iss_p06_emit_iff_committed.rs",
 ]
 
 [[contract]]

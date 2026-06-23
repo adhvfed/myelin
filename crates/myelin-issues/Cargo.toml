@@ -122,5 +122,8 @@ myelin-lints = { path = "../myelin-lints" }
 [features]
 default = []
 # ISS-P05 (P-371): the live-stack schema-apply proof (the issue-spine migration against real
-# Postgres). Pulls the optional sqlx + tokio external crates only; the default build stays DB-free.
+# Postgres). ISS-P06 (P-372) ADDS the live-stack emit-iff-committed proof for the write path (the
+# issue state row + its issue.* event co-commit in ONE Postgres tx; a rolled-back tx writes 0 of
+# each — tests/integration_iss_p06_outbox.rs). Pulls the optional sqlx + tokio external crates only;
+# the default build stays DB-free.
 integration = ["dep:sqlx", "dep:tokio"]
