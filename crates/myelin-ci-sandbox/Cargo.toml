@@ -56,6 +56,15 @@ myelin-refs = { path = "../myelin-refs" }
 # myelin-events is a real (not dev-only) dep. NO cycle: myelin-events has no edge back to
 # myelin-ci-sandbox, and myelin-refs (above) already pulls myelin-events transitively.
 myelin-events = { path = "../myelin-events" }
+# CI registers its status-summary `define_notif_rule` set (7.6) + its `CheckStatus.summary`
+# `HumanisedRef` templates (7.3) on Notif's ONE templating surface — the CI half of the M4 consumer
+# accretion (NOTIF-P23 / P-344). The registration is a data insertion + a template `put` (the
+# inverse-signal seam, EI-01 §1) — ZERO Notif code change. NO cycle: `myelin-notif` has NO edge back
+# to `myelin-ci-sandbox` (it sits below it in the DAG, depending only on the shared glue crates), so
+# `myelin-ci-sandbox → myelin-notif` stays acyclic — exactly the edge `myelin-git` / `myelin-issues`
+# already carry. CI is the producer; it depends on Notif's frozen registration seams, NOT on Git's
+# consumer view of `CheckStatus` (X-1 acyclic: CI emits, Git reads — CI never depends back on Git).
+myelin-notif = { path = "../myelin-notif" }
 serde.workspace = true
 # The escape-drill green-attestation artifact (CI-P5 → P-239) serializes to the JSON form AG-P17
 # (P-229) consumes — `EscapeAttestation::to_json` is non-test code, so serde_json is a real dep here
@@ -97,3 +106,15 @@ serde_json.workspace = true
 # to drive `events::reindex` through the outbox. Production `replay.rs` takes refs only — it never
 # names `Principal` outside `#[cfg(test)]`. NO production DAG edge (test-only).
 myelin-identity = { path = "../myelin-identity" }
+# Dev-dep ONLY: the NOTIF-P23 X-1 CDC test (integration_ci_summary_humanises.rs) decodes CI's
+# producer summary `(template_key, args)` into the Git CONSUMER `HumanisedRef` to prove the producer
+# half and the consumer half agree on the ONE frozen 5.9 shape. CI never depends on Git in
+# production (X-1 acyclic: CI emits, Git reads) — this edge is `#[cfg(test)]`-only, no production DAG edge.
+myelin-git = { path = "../myelin-git" }
+# Dev-dep ONLY: the same CDC test drives CI's summary through Notif's `humanise` (the ONE templating
+# surface) with a synthetic Refs resolver — it names `humanise` + `RefResolvePort` + `Region` +
+# `Principal`. `myelin-notif` is already a production dep (above); `myelin-refs` / `myelin-tenancy`
+# are pulled transitively. The test-only names below are the resolver/Region/Principal fixtures.
+myelin-refs = { path = "../myelin-refs" }
+myelin-tenancy = { path = "../myelin-tenancy" }
+myelin-notif = { path = "../myelin-notif" }

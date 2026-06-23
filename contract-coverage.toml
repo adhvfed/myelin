@@ -949,6 +949,14 @@ cdc = [
     "crates/myelin-git/tests/cdc_5_9_check_status_consumer.rs",
     # Refs' sub-anchor resolution half (the Refs half of X-1 — check-/step- through the one ladder)
     "crates/myelin-refs-service/tests/cdc_5_9_ci_sub_anchors.rs",
+    # CI's status-summary PRODUCER half (NOTIF-P23 / P-344, M4): CI's `CheckStatus.summary` is a
+    # `HumanisedRef` `(template_key, args)` pair (X-1, never a raw string) that resolves THROUGH
+    # Notif's ONE templating surface (7.3 humanise). CI registers its summary templates (the
+    # `ci.check.<verdict>` bodies, `{0}` subject slot) on that surface with ZERO Notif change; the
+    # producer `(template_key, args)` is byte-faithfully the Git consumer `HumanisedRef`. The
+    # end-to-end render (per-viewer resolve → tombstone on deny, NOTIF-D4 0 leak) is the companion
+    # integration test `integration_ci_summary_humanises.rs`.
+    "crates/myelin-ci-sandbox/tests/cdc_7_6_5_9_ci_notif_summary.rs",
 ]
 
 # ──────────────── §6 Search (myelin-search) ─────────────────────────────────────────────────────
@@ -1256,6 +1264,16 @@ cdc = [
     # real-chain half are in cdc_7_5_4_9_issues_sla_escalation.rs (the C-9 "My Work" invariant is
     # integration_issues_my_work_c9.rs; the ISS-D6 chain-start drill is drill_iss_d6_sla_escalation.rs).
     "crates/myelin-issues/tests/cdc_7_5_4_9_issues_sla_escalation.rs",
+    # CI slice — CI (NOTIF-P23 / P-344, M4 — the FINAL M4 consumer accretion) declares its
+    # status-summary reason set (a check status change → `state_changed`->watching, via the frozen
+    # `define_notif_rule` verb reconciled against the §3.1 table — `myelin_ci_sandbox::ci_notif_rules`)
+    # AND registers its `CheckStatus.summary` `HumanisedRef` templates on the ONE humanise surface (7.3
+    # — the `ci.check.<verdict>` bodies). Notif ADMITS + ROUTES the rule + admits the templates — zero
+    # Notif change, the FOURTH+ consumer no harder than the first. The X-1 invariant the CI summary is a
+    # `(template_key, args)` pair (never a raw string) that resolves THROUGH humanise is pinned here +
+    # exercised end-to-end (per-viewer resolve → tombstone on deny, NOTIF-D4) in the companion
+    # integration_ci_summary_humanises.rs. The live CI Signal-curation emitter is the CI emit follow-on.
+    "crates/myelin-ci-sandbox/tests/cdc_7_6_5_9_ci_notif_summary.rs",
 ]
 
 # 7.7 SPLIT: the HOLDER HALF (registration + locate/export/rectify/restrict + the structural
