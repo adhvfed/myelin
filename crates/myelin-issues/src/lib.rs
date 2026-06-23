@@ -237,6 +237,7 @@ pub mod replay;
 pub mod schema;
 pub mod schemes;
 pub mod sla_escalation;
+pub mod views;
 pub mod workflow;
 pub mod write_path;
 
@@ -375,4 +376,21 @@ pub use cost_bounder::{
     classify_field, estimate_cost, lower_acl, plan_board_query, BoundedBoardQuery,
     CostBounderFloors, CostBudget, FacetCatalog, PlanOutcome, RefineHint, SearchEscalation, Tier,
     TIER3_FIELDS, TYPED_CORE_FIELDS,
+};
+
+// ISS-P16 (P-382, M4): the co-equal `ViewSpec` views over the ONE issue table + the design-system pass.
+// `IssueView` is the seven canonical views (board/roadmap/backlog/list/table/calendar/cycle), each a
+// frozen `myelin_query::ViewSpec` projection over the one `issue` table (13.3, co-owned); `IssueView::plan`
+// is the executor seam that ALWAYS conjoins the leak-free ACL `Filter` through plan_board_query (4.3 —
+// ISS-P13/P14; a confidential issue is ABSENT, no "N hidden" leak). The board↔roadmap co-equality is
+// STRUCTURAL: the denormalised `type_rank` (board ≤ 1, roadmap ≥ 2) partitions the SAME rows;
+// `RowProjection` + `board_and_roadmap_share_row` + `edit_on_board_reflects_on_roadmap` prove an edit on
+// one lens reflects the SAME row id on the other (ISS-D1, 0 drift, asserted by row id). The design-system
+// pass (all states) is recorded + signed off in the design folder. FLOORS named: the cross-cell portfolio
+// rollup view is the M5 follow-on (ISS-P32, the CrossCellPointer bridge); the real-time board sync is
+// ISS-P30 (P-397). Both named in `ViewFloors`.
+pub use views::{
+    board_and_roadmap_share_row, edit_on_board_reflects_on_roadmap, type_rank_split_is_partition,
+    IssueView, RowProjection, ViewFloors, BOARD_TYPE_RANK_MAX, CYCLE_FIELD, ORDER_KEY_FIELD,
+    ROADMAP_TYPE_RANK_MIN, STATE_CATEGORY_FIELD, TYPE_RANK_FIELD,
 };
