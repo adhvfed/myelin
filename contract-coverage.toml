@@ -396,8 +396,17 @@ cdc = ["crates/myelin-query/tests/cdc_3_2_automations.rs"]
 [[contract]]
 row = "3.3"
 title = "arm_trigger / disarm_trigger"
+# ISS-P25 (P-392, M4-I6): Issues ships the stateful Trigger flagship ("Remind me when unblocked") over
+# the CONSUMED bus arm/disarm primitive — the armable-condition catalogue (each a frozen EventMatcher =
+# QueryAst over issue.* events + issue_relation projection state), the ONE Notif inbox for on_resolve
+# (7.1), and the stale nudge that fires once after stale_after (default 30d). The Issues CDC slice pins
+# the producer (Issues arming a catalogue condition) + consumer (the bus TriggerEngine's fire-once-per-
+# arming guarded UPDATE). ISS-D7 (1-fire + stale-once across a restart) is the green artifact.
 status = "covered"
-cdc = ["crates/myelin-query/tests/cdc_3_3_triggers.rs"]
+cdc = [
+    "crates/myelin-query/tests/cdc_3_3_triggers.rs",
+    "crates/myelin-issues/tests/cdc_3_3_issues_trigger.rs",
+]
 
 [[contract]]
 row = "3.4"

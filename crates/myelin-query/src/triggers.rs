@@ -388,6 +388,40 @@ impl TriggerEngine {
         self.armings.get(trigger_id)
     }
 
+    /// **The arming-id high-water (the `next_arming` ULID-counter, §3.6) — the durability seam.** A
+    /// consumer that PERSISTS the armings (the durable `trigger` table) reads this so a
+    /// [`TriggerEngine::restore_arming`]d engine after a process restart mints fresh, non-colliding
+    /// arming ids. The dispatch tier (EB-23) / the Issues stateful Trigger (ISS-P25) thread it through
+    /// their snapshot.
+    pub fn next_arming(&self) -> u64 {
+        self.next_arming
+    }
+
+    /// **Restore a durable arming after a process restart (the across-restart durability seam, §3.6).**
+    /// A consumer that persisted the armings (the durable `trigger` table) re-loads each row into a
+    /// fresh engine through this verb so the engine resumes EXACTLY where it left off: an
+    /// already-`Resolved`/`Stale`/`Disarmed` arming stays terminal (a re-delivered event after the
+    /// restart LOSES the atomic guarded UPDATE — fire-once survives the restart), and an `Armed` arming
+    /// is live again (its resolving event fires it once). This re-inserts the row VERBATIM (the `state`
+    /// column IS the fire-once guard — it is not re-evaluated). Idempotent: restoring the same row
+    /// twice keeps the last write. Set the [`TriggerEngine::next_arming`] high-water separately via the
+    /// snapshot so fresh armings do not collide with restored ids.
+    pub fn restore_arming(&mut self, arming: TriggerArming) {
+        let trigger_id = arming.trigger_id.clone();
+        // Keep the arming-id high-water monotone across restored rows (a restored `t#7` must not let a
+        // later fresh arm mint `t#7` again). The id form is `<trigger_id>#<n>`; recover `n` if present.
+        if let Some(n) = arming
+            .arming_id
+            .0
+            .rsplit('#')
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            self.next_arming = self.next_arming.max(n + 1);
+        }
+        self.armings.insert(trigger_id, arming);
+    }
+
     /// **`disarm_trigger(id)`** (contract 3.3) — the owner cancels: `armed → disarmed` (§4.6),
     /// **the atomic guarded UPDATE again** (only an `Armed` arming disarms; a resolved/stale one is
     /// untouched — disarm cannot un-fire a fired promise). The `stale_after` timer is disarmed
