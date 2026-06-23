@@ -1417,13 +1417,27 @@ title = "ToolHands::exec (unified sandbox)"
 # (cdc_8_4_escape_gate.rs) proves the Fabric exec path is fail-closed without a green attestation and
 # admits with one; the integration test (integration_escape_gate.rs, integration-gated) consumes the
 # REAL P-239 artifact. There is NO floor on AG-D4 (ZERO escapes is floor + full answer; a PERMANENT
-# GATE re-run on every backend/image/kernel change); the M4 re-confirm is AG-P21 (→ P-348); the real
-# LlmAgentRuntime against this runner is post-M5 (AG-P25). These are follow-ons, not pair gaps.
+# GATE re-run on every backend/image/kernel change); the real LlmAgentRuntime against this runner is
+# post-M5 (AG-P25). These are follow-ons, not pair gaps.
+#
+# M4 PROD-IMAGE RE-CONFIRM at AG-P21 (→ P-348): the SAME real escape battery (the CI-P5 / P-239
+# adversarial corpus + the production Firecracker launch recipe — REUSED, not forked) is re-run on the
+# PRODUCTION CI runner image (the config-resolved runner rootfs — dev↔prod is a config swap,
+# MYELIN_REGION=fr-par / prod=Scaleway), emitting a DATED GREEN attestation tagged as the prod-image
+# re-confirm (a distinct `prod-image-<date>.json` path + a role residual; the EscapeAttestation type is
+# REUSED whole). The drill is `myelin-ci-sandbox/tests/escape_drill_prod_image_reconfirm_test.rs`
+# (integration-gated; boots a REAL microVM on this host, ZERO escapes). The CONSUMER CDC
+# (cdc_8_4_prod_image_reconfirm.rs) proves the Fabric exec/escape-gate path (AgentExecGate, REUSED)
+# admits a green prod-image attestation + is fail-closed without one + treats the prod image as a
+# DISTINCT identity (the permanent gate). NAMED residual: production runs on KVM-capable Scaleway
+# Elastic Metal (the prod image is re-drilled there at deploy); the CI-side M4-boundary re-confirm is
+# CI-P27 / P-370.
 status = "covered"
 cdc = [
     "crates/myelin-ci-sandbox/tests/cdc_8_4_unified_sandbox.rs",
     "crates/myelin-agent-service/tests/cdc_8_4_exec_routing.rs",
     "crates/myelin-agent-service/tests/cdc_8_4_escape_gate.rs",
+    "crates/myelin-agent-service/tests/cdc_8_4_prod_image_reconfirm.rs",
 ]
 
 [[contract]]
