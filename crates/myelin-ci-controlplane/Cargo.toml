@@ -96,6 +96,15 @@ tokio = { workspace = true, optional = true }
 # (tests/lint_no_untagged_personal_data.rs). A test-support crate (NOT a production DAG node) — it
 # keeps the gate provably live over the CI types. Plus the residency-pin / forward-only confirmations.
 myelin-lints = { path = "../myelin-lints" }
+# CI-P18 (P-361): the CDC PROVIDER half of contract 5.9 (`tests/cdc_5_9_ci_check_producer.rs`) proves
+# CI's assembled `ci.check.updated` payload decodes BYTE-IDENTICALLY into Git's frozen consumer view
+# `myelin_git::check_status::CheckStatus` — the seam's contract test (CI producer + Git consumer). A
+# DEV-DEP ONLY (the test surface, NOT the production DAG): `myelin-git` is a leaf consumer that does
+# NOT depend back on `myelin-ci-controlplane`, so the test-only edge stays acyclic — exactly the
+# `myelin-ci-dispatch → myelin-git` / `myelin-ci-sandbox → myelin-git` edges the CI crates carry. CI's
+# PRODUCTION code never depends on Git (it produces the frozen JSON shape); only the CDC test decodes
+# it through Git to PROVE the no-drift property.
+myelin-git = { path = "../myelin-git" }
 
 [features]
 default = []
