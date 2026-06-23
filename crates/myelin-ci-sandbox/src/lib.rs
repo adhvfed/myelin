@@ -64,6 +64,7 @@ pub mod events;
 pub mod firecracker;
 pub mod gvisor;
 pub mod hardening;
+pub mod notif_rules;
 pub mod replay;
 pub mod runner;
 pub mod self_hosted;
@@ -73,6 +74,11 @@ pub use events::{
     ci_event_tokens, is_durable, register_ci_tokens, CI_DURABLE_TOKENS, CI_FIREHOSE_TOKENS,
 };
 pub use replay::CiReindexSource;
+
+pub use notif_rules::{
+    ci_notif_rules, ci_summary, register_ci_notif_rules, register_ci_summary_templates,
+    summary_template_key, CheckVerdict, CiSummary, CI_CHECK_STATUS_RULE, CI_SUMMARY_TEMPLATES,
+};
 
 pub use escape_corpus::{
     build_corpus_script, parse_console, AttackFamily, AttackMarker, AttackOutcome, Backend,
