@@ -62,9 +62,13 @@
 //!   is CI-P16 (P-359). This body composes the FROZEN engine idiom over a [`myelin_flow::JobRunner`]
 //!   seam; CI-P16 binds that seam onto the CI scheduler + the unified runner (`ToolHands::exec`, 8.4),
 //!   GATED by AG-D4 (no untrusted code runs until the sandbox-escape gate is green).
-//! - **The per-stage reserve/settle METERING into `cost_event`** (the wholesale→retail markup, the
-//!   `ci.cost.metered` rollup) is CI-P17 (P-360). The body uses the engine's reserve/settle bookend
-//!   (11.7) over a per-stage `MinorUnits` cost today; CI-P17 wires the real `cost_event` ledger.
+//! - **The per-stage reserve/settle METERING into `cost_event`** is now SHIPPED in [`crate::metering`]
+//!   (CI-P17 / P-360): the resource-second meter taxonomy ([`crate::metering::Meter`]) is the
+//!   wholesale unit, [`crate::metering::CostEventRow`] is the CI `cost_event` schema row (wholesale +
+//!   markup SEPARATE columns, `kind ∈ {ci, agent}`), and [`crate::metering::CiMeter`] wraps the engine
+//!   bookend so a stage `reserve_budget()`s (refuse-to-start) + `settle_budget()`s its resource-seconds
+//!   on `job.done`. The body composes the engine bookend over a per-stage `MinorUnits` cost; the
+//!   resource-second → credit/price MARKUP mapping remains Commercial's (arch 06 R-2).
 //! - **The `check_attempt` monotonic counter + the `ci.check.updated` PRODUCER plumbing into the
 //!   outbox** is CI-P18 (P-361); **the `ci.result` rollup signal end-to-end with Git's merge queue
 //!   (GIT-D10 / CI-D8)** is CI-P19 (P-362). This body PRODUCES the facts at the right body positions;

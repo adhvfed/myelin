@@ -2105,9 +2105,25 @@ status = "covered"
 # (P-S12) — the arithmetic + invariants are complete + testable now over the same OLTP tier whose
 # real backend (PgStore) is already proven by the infra-stage integration drills (no NEW
 # db/object-store/cache/bus trait is touched by P-146, so no new integration drill is owed).
+#
+# P-360 (CI-P17, M4): the gate FRONTS CI RUNS — the named M4 follow-on row 11.7 recorded ("it fronts
+# CI runs in M4 — a CI-subsystem run-dispatch consumer"). CI builds NO second metering path (arch CI
+# 02 §6): the CI metering module (myelin-ci-controlplane/src/metering.rs) REUSES this frozen ledger +
+# the engine bookend (9.5) in place. It adds the CI METER: the resource-second taxonomy (Meter — the
+# EXACT cost_event.meter CHECK set, the wholesale unit directly comparable to an agent compute call,
+# X-6), the CI cost_event schema row (CostEventRow — wholesale + markup SEPARATE columns, kind ∈ {ci,
+# agent}, UNIFY/X-6), and CiMeter (reserve_budget refuse-to-start / settle_budget on job.done over the
+# SAME BudgetGate/wallet both kinds use). The CI-D5 drill
+# (drills_ci_p17_reserve_settle_parity.rs) exhausts ONE wallet → BOTH a CI run AND an agent run
+# refuse-start (the parity, never interrupt in flight) → 0 starts past exhaustion, wholesale ≠ markup
+# STABLE under a pricing change (one cost_event per metered unit), AND the REAL ci.pipeline body
+# refuses-to-start a CI stage when the shared wallet is exhausted by a prior agent reserve.
+# FLOOR named: the resource-second → credit/price MARKUP mapping is Commercial's (arch 06 R-2 — CI
+# carries the MarkupPolicy seam + owns ONLY the meter + the wholesale column).
 cdc = [
     "crates/myelin-storage/tests/cdc_11_7_reserve_settle.rs",
     "crates/myelin-storage/tests/ag_d6_d11_reserve_refusal_drill.rs",
+    "crates/myelin-ci-controlplane/tests/drills_ci_p17_reserve_settle_parity.rs",
 ]
 
 [[contract]]

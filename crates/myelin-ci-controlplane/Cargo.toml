@@ -64,6 +64,12 @@ myelin-identity = { path = "../myelin-identity" }
 # `ci.run.failed`/`ci.run.succeeded` + the `ci.result` rollup signal). NO cycle: `myelin-flow` has no
 # edge back to `myelin-ci-controlplane` (it is the durable-execution engine; CI is a leaf consumer).
 myelin-flow = { path = "../myelin-flow" }
+# CI-P17 (P-360): the reserve/settle metering module reserves/settles against the SAME durable ledger
+# (contract 11.7) the engine bookend wraps — the `cost_event` rows live in `myelin_storage::reserve_settle`
+# (the `RunId` ledger key + the integer-minor-units `CostEvent` shape). CI builds NO second ledger; it
+# REUSES Storage's frozen one (EI-01 §7 coherence). NO cycle: `myelin-storage` has no edge back to
+# `myelin-ci-controlplane` (the same acyclic edge `myelin-flow` carries to the ledger).
+myelin-storage = { path = "../myelin-storage" }
 # The references-not-payloads `ArtifactRef` (contract 5.7) every X-1 check fact rides
 # (`run`/`details_ref` refs, never log bytes). The frozen Refs contract surface — a leaf edge.
 myelin-refs = { path = "../myelin-refs" }

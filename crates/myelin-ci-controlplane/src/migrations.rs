@@ -60,7 +60,9 @@
 //!   (P-361);
 //! - the **log range index** populate over `log_segment` / `log_anchor` — **CI-P20** (P-363);
 //! - the **trust-scoped artifact/cache** writes + the per-subject log DEK — **CI-P22** (P-365);
-//! - the **reserve/settle metering** that writes `cost_event` — **CI-P17** (P-359 cluster);
+//! - the **reserve/settle metering** that writes `cost_event` — SHIPPED in [`crate::metering`]
+//!   (**CI-P17** / P-360): the resource-second meter + the `cost_event` row (wholesale ≠ markup) over
+//!   the FROZEN reserve/settle ledger (contract 11.7);
 //! - the **deployment / protected-env HITL gate + the in-boundary secret broker** that drives
 //!   `environment` / `deployment` / `secret_binding` — **CI-P24**.
 //!
