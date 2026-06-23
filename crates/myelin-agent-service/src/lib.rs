@@ -78,8 +78,11 @@
 
 pub mod app;
 pub mod card_text;
+pub mod chat_tools;
+pub mod ci_tools;
 pub mod cost_gate;
 pub mod defaults;
+pub mod dispatch;
 pub mod dry_run;
 pub mod effect_api;
 pub mod escape_gate;
@@ -89,6 +92,7 @@ pub mod hitl;
 pub mod hitl_batch;
 pub mod holder;
 pub mod identity;
+pub mod issues_tools;
 pub mod knowledge_tools;
 pub mod long_park;
 pub mod loop_guards;
@@ -232,6 +236,60 @@ pub use knowledge_tools::{
     publish_required_caps, publish_tool_def, register_knowledge_tools, COMMENT_TOOL, DRAFT_TOOL,
     EDIT_CONFIDENTIAL_TOOL, KNOWLEDGE_SUBSYSTEM, KNOWLEDGE_TOOL_VERSION, PUBLISH_TOOL,
 };
+
+// The per-CONSUMER Issues ToolDefs (AG-P20 → P-347, M4): forecast / triage / sla_draft (advisory, NOT
+// gated — suggest-by-default) + transition (the SLA-bound, approver-edged transition — the gated §6.3
+// FLOOR + the field/transition ABAC caveat at EffectApi check-time, §5.2 step 2). Registered into the
+// ONE ToolSurface (8.1) with required_caps sourced from the FROZEN Issues ReBAC fragment (4.9:
+// issue.transition / issue_transition.perform_transition) and requires_approval SEEDED from the frozen
+// defaults (AG-P8), guarded by the VISION §3 no-silent-loosening ratchet. NO new engine — the
+// transition-ABAC caveat is carried by crate::effect_api::PlannedEffect into the existing pipeline.
+pub use issues_tools::{
+    advisory_required_caps, forecast_tool_def, issues_tool_defs, register_issues_tools,
+    sla_draft_tool_def, transition_caveat, transition_required_caps, transition_tool_def,
+    triage_tool_def, FORECAST_TOOL, ISSUES_SUBSYSTEM, ISSUES_TOOL_VERSION, SLA_DRAFT_TOOL,
+    TRANSITION_TOOL, TRIAGE_TOOL,
+};
+
+// The per-CONSUMER Chat ToolDefs (AG-P20 → P-347, M4): post_message / react (reversible, NOT gated) +
+// the cross-subsystem "governed where it LANDS" rule (§6.3 last row) — any EffectApi tool a Chat run
+// invokes against another subsystem inherits THAT subsystem's frozen default (a chat-invoked git.merge
+// is GATED — Git's default). required_caps from the FROZEN Chat ReBAC fragment (4.9: channel.post);
+// requires_approval SEEDED from the frozen defaults (AG-P8). Explicit-first dispatch is crate::dispatch
+// (a mention NOTIFIES, does not auto-spawn). NO new governance model — landing_requires_approval reuses
+// the AG-P8 requires_approval_for_landing helper.
+pub use chat_tools::{
+    chat_tool_defs, landing_requires_approval, post_message_tool_def, post_required_caps,
+    react_tool_def, register_chat_tools, CHAT_SUBSYSTEM, CHAT_TOOL_VERSION, POST_MESSAGE_TOOL,
+    REACT_TOOL,
+};
+
+// The per-CONSUMER CI ToolDefs (AG-P20 → P-347, M4): deploy / approve_deploy / write_secret (the
+// privileged gates — gated by the frozen §6.3 default, withhold at EffectApi step 6 → Gated until the
+// HITL resume) + run_pipeline non-prod (cheap/reversible/metered, NOT gated). required_caps from the
+// canonical CI ReBAC fragment (4.9: environment.deploy / ci_project.administer / run.trigger from
+// myelin_identity_service::ci_fragment); requires_approval SEEDED from the frozen defaults (AG-P8),
+// guarded by the VISION §3 no-silent-loosening ratchet. NO new engine — a ToolDef is a row in the
+// existing registry. FLOOR: the AG-D4 / CI-T1 re-confirm on the PRODUCTION CI runner image is AG-P21
+// (→ P-348), the M4 hard gate — the CI deploy tools run on that prod image; that re-confirm is the
+// SEPARATE next prompt, not this one.
+pub use ci_tools::{
+    approve_deploy_tool_def, ci_tool_defs, deploy_required_caps, deploy_tool_def,
+    register_ci_tools, run_pipeline_required_caps, run_pipeline_tool_def,
+    write_secret_required_caps, write_secret_tool_def, APPROVE_DEPLOY_TOOL, CI_SUBSYSTEM,
+    CI_TOOL_VERSION, DEPLOY_TOOL, RUN_PIPELINE_TOOL, WRITE_SECRET_TOOL,
+};
+
+// Explicit-first dispatch wiring (AG-P20 → P-347, M4, contract 8.6 / §3.4 / CHAT-1): the TYPED
+// classifier the dispatch tier consults to decide notify-vs-dispatch. A casual @agent mention
+// (DispatchTrigger::Mention) ALWAYS resolves Notify (0 auto-spawn — the dispatch-counter stays 0, the
+// CHAT-D17 gate); only an explicit "run an agent here" trigger (ExplicitRun) / a structured artifact-
+// ref re-trigger (StructuredRef) resolves Dispatch — and EVEN the explicit run passes the reserve gate
+// (the costed run is still crate::skeleton::SkeletonAgent::handle_run). The 0-auto-spawn property is in
+// the TYPE (no arm maps a Mention to Dispatch) and COUNTED (DispatchCounter, EI-01 §3). FLOOR: implicit
+// auto-dispatch on a casual mention remains [OPEN → LEGAL] (L-3, counsel-gated — GDPR Art. 22 / EU
+// AI-Act human-oversight); the auto-spawn path is NOT wired until counsel ratifies the basis.
+pub use dispatch::{classify, DispatchCounter, DispatchDecision, DispatchTrigger};
 
 // The agent-trace HOLDER seam (AG-P19 → P-268, M3, AG-7 / contract 8.8): the execution trace is a
 // CONTENT-ADDRESSED Knowledge document reusing the frozen myelin-content 13.1 block model;
