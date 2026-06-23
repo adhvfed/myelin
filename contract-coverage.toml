@@ -466,11 +466,21 @@ status = "covered"
 # viewer (0 rollup leak, composing with KN-D5). The rollup-permission gate rides in
 # cdc_13_3_4_3_knowledge_rollup.rs; the live permission-filtered rollup conjoin against the dev-stack
 # Postgres is integration_kn_d10_rollup.rs.
+#
+# CI-P25 / P-368 (M4) adds the CI-side consumer half: `myelin_ci_controlplane::surfacing` lowers the
+# returned `Filter{set_expr}` over CI's OWN `ci_run.run_id` column (§5.1 / §7.3 / OQ-E) into ONE
+# leak-free run-list query (the `authz_visible` JOIN, no N+1, no post-filter) + the CI search
+# pre-filter (`run_search_pre_filter`, the `search-requires-acl-filter` lint binder). The CI consumer
+# CDC (`cdc_4_3_ci_list_pushdown.rs`) proves CI lowers the FROZEN SetExpr variants exactly + the
+# leak-free / revoke-reflected row set; the `myelin ci list` CLI rides this push-down. The REAL
+# one-query / 0-leak / tenant-scoped / revoke-reflected proof against the live dev-stack Postgres is
+# `crates/myelin-ci-controlplane/tests/integration_ci_p25_list_pushdown.rs` (the `integration` feature).
 cdc = [
   "crates/myelin-identity-service/tests/cdc_4_3_list_objects.rs",
   "crates/myelin-git/tests/cdc_4_3_git_list_pushdown.rs",
   "crates/myelin-knowledge/tests/cdc_4_3_knowledge_list_pushdown.rs",
   "crates/myelin-knowledge/tests/cdc_13_3_4_3_knowledge_rollup.rs",
+  "crates/myelin-ci-controlplane/tests/cdc_4_3_ci_list_pushdown.rs",
 ]
 
 [[contract]]
@@ -724,7 +734,15 @@ title = "ArtifactRef"
 # The resolve half (5.2/5.7 tombstone ladder) is a separate row; this row's parse/format pair ships
 # its provider+consumer CDC here.
 status = "covered"
-cdc = ["crates/myelin-refs/tests/cdc_5_1_artifactref.rs"]
+# CI-P25 / P-368 (M4) adds CI's owned canonical mints (`myelin://<t>/ci/{run|deployment|pipeline|
+# runner|artifact}/<id>`) through the ONE refs codec (0 ungrammatical by construction); the
+# provider+consumer pair (cdc_5_1_5_6_5_7_ci_surfacing.rs) round-trips the mint + strips the `#sub` to
+# the canonical root. The deployment/pipeline/runner canonical-root type tokens are added to the
+# frozen Bus §6.2 ARTIFACT_TYPE_TOKENS table (the EB-24 git/chat root-type extension, same posture).
+cdc = [
+    "crates/myelin-refs/tests/cdc_5_1_artifactref.rs",
+    "crates/myelin-ci-controlplane/tests/cdc_5_1_5_6_5_7_ci_surfacing.rs",
+]
 
 [[contract]]
 row = "5.2"
@@ -856,9 +874,17 @@ title = "project(ref, viewer)"
 # `{title,state,icon,render_hint,sub_anchor?}` shape; mandatory-core (a project leak IS the failure),
 # mutation floor ≥ 90% on refs_glue.rs (the permission-first gate + each ladder rung).
 status = "covered"
+# CI-P25 / P-368 (M4) adds the CI-OWNED `project(ref, viewer)` half
+# (`myelin_ci_controlplane::surfacing::Projector::project`) — the ONLY cross-DB read of a CI artifact
+# (run/deployment/pipeline), per-viewer permission-checked on the `#sub`-stripped ROOT: a confidential
+# run degrades to a content-free tombstone, never the title (0 title leak — the cross-fabric leak
+# counter = 0). Backs the chat run unfurl / PR context pane / knowledge embed / inbox / search snippet.
+# The provider+consumer pair (cdc_5_1_5_6_5_7_ci_surfacing.rs) proves the projection shape + the
+# tombstone-on-deny. Mandatory-core (a project leak IS the failure), mutation floor ≥ 80% on surfacing.rs.
 cdc = [
     "crates/myelin-git/tests/cdc_5_1_5_2_5_6_git_project.rs",
     "crates/myelin-knowledge/tests/cdc_5_4_5_5_5_6_5_7_knowledge_refs_glue.rs",
+    "crates/myelin-ci-controlplane/tests/cdc_5_1_5_6_5_7_ci_surfacing.rs",
 ]
 
 [[contract]]
@@ -881,7 +907,12 @@ cdc = [
     "crates/myelin-chat/tests/cdc_5_7_chat_sub_mints.rs",
     "crates/myelin-knowledge/tests/cdc_5_7_knowledge_stable_id_mint.rs",
     "crates/myelin-knowledge/tests/cdc_5_4_5_5_5_6_5_7_knowledge_refs_glue.rs",
+    "crates/myelin-ci-controlplane/tests/cdc_5_1_5_6_5_7_ci_surfacing.rs",
 ]
+# CI-P25 / P-368 (M4) adds CI's owned `#sub` mints: `step-<n>` (jump-to-failure, resolves
+# `CheckStatus.details_ref`) + `check-<context>` + `L<a>-L<b>`, minted through the ONE refs codec
+# (the `#step-<n>` mint is byte-identical to `check_emitter::details_ref` — one source of truth). The
+# `step-<n>` id is opaque + STABLE across retries (a chat/runbook embed of `#step-3` never dangles).
 # KN-P10 / P-300 (M3) adds Knowledge's owned `b<id>` / `h<id>` stable block-id mints — the §2.3
 # stability obligation (the `block_id` is stable across edits/moves/collaboration; the move is an
 # `order_key` write, NEVER an id re-mint). The provider+consumer pair

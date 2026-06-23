@@ -69,6 +69,7 @@ pub mod scheduler;
 pub mod schema;
 pub mod secret_broker;
 pub mod supply_chain;
+pub mod surfacing;
 
 // CI-P15 (P-358): the `ci.pipeline` DURABLE WORKFLOW BODY + the X-1 producer side. The deterministic
 // Rust body registered under `CI_PIPELINE_WF_TYPE` at serve (guarded by the flow-determinism lint):
@@ -217,6 +218,29 @@ pub use events::{
 use myelin_substrate::{
     boot, serve, AppSpec, Config, CriticalDependencies, InternalRpc, OutboxSpec, PublicRoutes,
     ServeError, ServeHandle,
+};
+
+// CI-P25 (P-368, M4): CROSS-FABRIC SURFACING — the read+ref half (arch 03 §5.1/§7.1/§7.2). The
+// leak-free `list_objects` SetExpr push-down over `ci_run.run_id` (the OQ-E JOIN against the
+// per-tenant `authz_visible` reverse index — ONE query, NO N+1, NO post-filter; the
+// `search-requires-acl-filter` lint conjoins the Filter before scoring), the `ArtifactRef`/`#sub`
+// mints (`run`/`deployment`/`pipeline`/`runner`/`artifact` + the ci-owned `step-<n>`/`check-<context>`/
+// `L<a>-L<b>` subs — the `#step-<n>` mint is byte-identical to `check_emitter::details_ref`, one
+// source of truth), and `project(ref, viewer)` (the ONLY cross-DB read of a CI artifact — permission
+// FIRST, deny ⇒ a content-free Tombstone, 0 title leak). Backs the chat run unfurl / PR context pane /
+// knowledge embed / inbox humanisation / search snippet. FLOOR named: `declare_indexable` + humanise +
+// `replay(*.snapshot)` + the agent `ToolDef` registrations are CI-P26. NO cycle: `myelin-refs` /
+// `myelin-identity` have no edge back to `myelin-ci-controlplane` (the same acyclic leaf edges CI
+// carries; the SetExpr lowering SHAPE is restated because a producer LEAF cannot depend on the
+// Identity SERVICE crate, §2.9).
+pub use surfacing::{
+    ci_artifact_ref, ci_deployment_ref, ci_pipeline_ref, ci_run_id_colref, ci_run_ref,
+    ci_runner_ref, commit_check_ref, compose_run_list_query, lower_over_run_id,
+    run_search_pre_filter, run_step_line_ref, run_step_ref, ArtifactStore, AuthzJoin,
+    AuthzVisibleIndex, BoundParam, CiArtifactType, CiSearchPreFilter, ComposedRunListQuery,
+    DeploymentMeta, LoweredFilter, PipelineMeta, ProjectError, Projected, Projection, Projector,
+    RenderHint, RunMeta, SubAnchor, Tombstone, TombstoneReason, AUTHZ_VISIBLE_TABLE, CI_SUBSYSTEM,
+    RUN_LIST_PERMISSION, VIEW,
 };
 
 pub use scheduler::{
