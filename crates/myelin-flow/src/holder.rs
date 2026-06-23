@@ -48,11 +48,11 @@
 //!
 //! ## FLOORS named (VISION §3 / EI-01 §1 name-your-floors)
 //! - **The crypto-shred reach** — the per-subject-DEK destruction into the inline-PII `result_key_ref`
-//!   / `payload_key_ref` history rows + backups — is the NAMED M5 follow-on **P-FLOW-23**. This prompt
+//!   / `payload_key_ref` history rows + backups — is the NAMED M5 follow-on **P-FLOW-24**. This prompt
 //!   ships the STRUCTURAL erase (the references-not-payloads tombstone + the restrict suppression);
-//!   the per-subject key destruction lands at P-FLOW-23. So `erase` here destroys NO key at the flow
+//!   the per-subject key destruction lands at P-FLOW-24. So `erase` here destroys NO key at the flow
 //!   surface (`key_epoch_destroyed = None`) — the references-not-payloads tombstone needs no key
-//!   destroyed for the refs-stored rows; the inline-PII DEK shred is the P-FLOW-23 reach.
+//!   destroyed for the refs-stored rows; the inline-PII DEK shred is the P-FLOW-24 reach.
 //! - **The `replay` half of 9.6** (`replay(scope, since)` — the run rebuilt by deterministic replay
 //!   from the journal, the only recovery path) is **P-FLOW-05** (FLOW-D1). This module is the holder
 //!   half only; the two together complete contract 9.6.
@@ -208,7 +208,7 @@ impl WfHistoryHolder {
     /// naming the subject (a referenced actor in a `result` ref OR the inline-PII `result_key_ref`);
     /// `erase` is the STRUCTURAL references-not-payloads erase (the appearance tombstones for free via
     /// Identity's pseudonym shred — NO PII-column mutation on the refs-stored rows; the inline-PII DEK
-    /// crypto-shred is the P-FLOW-23 reach); `restrict` suppresses the subject's NEW dispatch.
+    /// crypto-shred is the P-FLOW-24 reach); `restrict` suppresses the subject's NEW dispatch.
     pub fn with_journal(journal: WfJournal) -> WfHistoryHolder {
         WfHistoryHolder {
             backing: Some(FlowBacking::new(journal)),
@@ -393,11 +393,11 @@ impl PersonalDataHolder for WfHistoryHolder {
         // NO PII-column mutation on the refs-stored rows (the structural property the gate pins): it
         // reports the surface covered + relies on the platform posture.
         //
-        // NAMED FLOOR (P-FLOW-23, M5): the per-subject-DEK crypto-shred reach into the inline-PII
+        // NAMED FLOOR (P-FLOW-24, M5): the per-subject-DEK crypto-shred reach into the inline-PII
         // result_key_ref / payload_key_ref history rows + backups is NOT performed here. So this erase
         // destroys NO key at the flow surface (key_epoch_destroyed = None) — the references-not-
         // payloads tombstone needs no key destroyed for the refs-stored rows; the inline-PII DEK shred
-        // is the P-FLOW-23 follow-on. No erasure backdoor: the row stays; the person becomes
+        // is the P-FLOW-24 follow-on. No erasure backdoor: the row stays; the person becomes
         // unresolvable.
         let (sid, tenant) = match &scope {
             EraseScope::Subject { subject, tenant } => {
@@ -416,7 +416,7 @@ impl PersonalDataHolder for WfHistoryHolder {
                 "structural erase: {count} wf_history appearances tombstone for free (refs-not-\
                  payloads; Identity §4.8 pseudonym-shred makes the opaque id unresolvable) — 0 PII \
                  columns mutated; inline-PII result_key_ref/payload_key_ref per-subject-DEK \
-                 crypto-shred = P-FLOW-23 (M5); replay P-FLOW-05"
+                 crypto-shred = P-FLOW-24 (M5); replay P-FLOW-05"
             ),
             EraseScope::Tenant(_) => {
                 "tenant crypto-shred: destroy the per-tenant DEK (11.3/11.4) — \
@@ -426,7 +426,7 @@ impl PersonalDataHolder for WfHistoryHolder {
         };
         Ok(EraseReceipt {
             // No KEY destroyed at the flow holder (the refs-stored rows tombstone for free; the inline-
-            // PII DEK crypto-shred is the P-FLOW-23 reach). key_epoch_destroyed = None.
+            // PII DEK crypto-shred is the P-FLOW-24 reach). key_epoch_destroyed = None.
             receipt: Receipt::content_addressed(
                 "erase",
                 FLOW_OLTP_STORE,
@@ -580,7 +580,7 @@ mod tests {
     /// tombstones with NO PII mutation.** A row naming the subject (by result ref AND by inline-PII key
     /// ref) is erased; the stored rows are byte-identical after erase (0 PII columns mutated) — the
     /// refs re-resolve to a tombstone at read time via Identity's §4.8 shred. The inline-PII DEK
-    /// crypto-shred is the named P-FLOW-23 floor (no key destroyed here). This is the §5.5 references-
+    /// crypto-shred is the named P-FLOW-24 floor (no key destroyed here). This is the §5.5 references-
     /// not-payloads tombstone-for-free, proven at the unit grain.
     #[test]
     fn structural_erase_tombstones_refs_stored_rows_with_zero_pii_mutation() {
@@ -623,7 +623,7 @@ mod tests {
             .expect("structural erase succeeds");
         assert!(
             er.receipt.key_epoch_destroyed.is_none(),
-            "0 keys shredded at the flow surface (refs-stored; inline-PII DEK shred is P-FLOW-23)"
+            "0 keys shredded at the flow surface (refs-stored; inline-PII DEK shred is P-FLOW-24)"
         );
 
         // THE PROPERTY: 0 PII columns mutated — every stored row is byte-identical after erase.
@@ -743,7 +743,7 @@ mod tests {
         assert_eq!(er.receipt.operation, "erase");
         assert!(
             er.receipt.key_epoch_destroyed.is_none(),
-            "the per-subject DEK shred is P-FLOW-23"
+            "the per-subject DEK shred is P-FLOW-24"
         );
     }
 

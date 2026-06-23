@@ -40,6 +40,11 @@ path = "src/main.rs"
 [dependencies]
 # The (tenant, region) partition key — every table LEADS with TenantId + Region (12.1, ADR-11).
 myelin-tenancy = { path = "../myelin-tenancy" }
+# Principal / Actor — the CI service principal the REAL ci.result producer (P-FLOW-23,
+# src/merge_queue.rs RealCiResultProducer) stamps on the per-context ci.check.updated envelopes it
+# feeds through CI's CheckSeamOrder before deriving the rollup. Identity is a foundational sink crate
+# (identity_is_sink() in the DAG); this edge is acyclic.
+myelin-identity = { path = "../myelin-identity" }
 # ArtifactRef — `workflow_run.input` + `wf_history.result` are references-not-payloads (the
 # workflow about a PR carries the PR's ArtifactRef, never the PR body — architecture §3.1/§3.2).
 myelin-refs = { path = "../myelin-refs" }

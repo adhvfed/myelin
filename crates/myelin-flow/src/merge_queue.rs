@@ -56,11 +56,21 @@
 //! deterministic codec over the CI-owned shape, never a redefinition of it. No inline PII ever rides
 //! the merge-queue signal.
 //!
-//! ## NAMED FLOORS (this prompt ships the body against a MOCK producer ONLY)
+//! ## The X-1 seam END-TO-END (P-FLOW-23, M4) — the P-FLOW-19 floor CLOSED
 //!
-//! - **The X-1 seam end-to-end** (GIT-D10 / CI-D8 against CI's REAL `ci.result` producer) → the M4
-//!   gate, follow-on **P-FLOW-22**. This prompt is the merge-queue FLOOR: built + drilled in
-//!   isolation against [`MockCiResultProducer`]; the real producer wires in M4.
+//! The merge-queue body was BUILT + drilled in isolation against the [`MockCiResultProducer`]
+//! (P-FLOW-19, the named floor). **P-FLOW-23 (M4) CLOSES that floor**: [`RealCiResultProducer`]
+//! replaces the mock with the REAL CI producer wiring — the merge-queue workflow now wakes on the
+//! rollup CI's REAL producer (`myelin_events::check_seam::{CheckSeamOrder, rollup_ci_result,
+//! ci_result_draft}`, contract 5.9) DERIVES from per-context `ci.check.updated` facts (through the
+//! Bus's per-aggregate ordering + Git's `run_attempt` supersession), keyed idempotently on the
+//! `merge_attempt_id`. The seam is now END-TO-END (GIT-D10 / CI-D8): 0 double-merge, merge-count == 1
+//! per attempt, across re-delivery + restart. The body itself is UNCHANGED — it is the floor's
+//! follow-on (the mock → the real producer), not a new engine primitive.
+//!
+//! ## REMAINING NAMED FLOORS
+//!
+//! - **The CI dispatch into the unified runner is GATED by AG-D4** (recorded below, not owned here).
 //! - **The CI dispatch into the unified runner is GATED by AG-D4** (the sandbox-escape drill,
 //!   Agent-Fabric / CI-owned, `04-sandbox-AG-D4.md`). The [`CiDispatcher`] is the seam the engine
 //!   calls; the production binding (onto `ToolHands::exec`, contract 8.4) lands behind that gate.
@@ -349,8 +359,9 @@ impl WfCtx {
     /// **A double-delivered `ci.result` wakes the workflow ONCE** (the `wf_signal` PK dedup) → ONE
     /// merge, ONE `git.pr.merged`. A vanished CI run's timeout-timer fires and bounds the wait.
     ///
-    /// **NAMED FLOORS (recorded, not owned here):** the X-1 seam end-to-end against CI's REAL producer
-    /// is **P-FLOW-22** (M4); the CI dispatch into `ci` is GATED by **AG-D4** (no untrusted code until
+    /// **The X-1 seam is END-TO-END as of P-FLOW-23 (M4):** the body wakes on the rollup CI's REAL
+    /// producer ([`RealCiResultProducer`]) derives (contract 5.9), not the mock — GIT-D10/CI-D8 green
+    /// (0 double-merge). The CI dispatch into `ci` remains GATED by **AG-D4** (no untrusted code until
     /// the sandbox-escape gate is green).
     #[allow(clippy::too_many_arguments)]
     pub fn run_merge_attempt<D, M>(
@@ -582,6 +593,223 @@ impl<'a> MockCiResultProducer<'a> {
             contexts,
             idem_token: merge_attempt_id.to_string(),
         };
+        self.signals.deliver(crate::SignalRow {
+            tenant: self.tenant.clone(),
+            region: self.region.clone(),
+            run_id: self.run_id.clone(),
+            signal_name: CI_RESULT_SIGNAL.to_string(),
+            idem_key: merge_attempt_id.to_string(),
+            payload: encode_ci_result(&result),
+            payload_key_ref: None,
+            consumed_seq: None,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The REAL ci.result producer wiring — the X-1 seam END-TO-END (P-FLOW-23, M4)
+// ---------------------------------------------------------------------------
+
+/// **The REAL `ci.result` producer wiring — the X-1 seam END-TO-END (P-FLOW-23, GIT-D10/CI-D8).**
+///
+/// This is the floor-closing replacement for [`MockCiResultProducer`]: where the mock FABRICATES a
+/// [`CiResult`] verdict directly, this drives the merge-queue body off the ROLLUP CI's REAL producer
+/// derives — `myelin_events::check_seam::{CheckSeamOrder, rollup_ci_result, ci_result_draft}`
+/// (contract 5.9, CI-owned). The producer is the very same shape CI emits in production; this engine
+/// owns ONLY the durable-workflow half (the long-park + the idempotent signal delivery), never the
+/// rollup derivation.
+///
+/// The end-to-end flow this models (durable-workflow.md §6.5 + the GIT-D10/CI-D8 catalogue rows):
+///
+/// 1. **CI emits per-context `ci.check.updated` facts** for the speculative commit — possibly
+///    interleaved across contexts, out of `seq`, with re-runs (a higher `run_attempt`) and an
+///    at-least-once duplicate. They are INGESTED into the Bus's per-aggregate ordering substrate
+///    ([`CheckSeamOrder`]) on the `(repo, commit_oid)` aggregate (the D-11 substrate).
+/// 2. **Git's supersession collapses each context** to its CURRENT row (the highest `run_attempt`)
+///    — the last-writer-wins rule over the per-aggregate-ordered carriage. A stale lower-attempt
+///    re-delivery is dropped because the order is preserved.
+/// 3. **CI DERIVES the rollup** from the post-supersession current status over Git's REQUIRED gate
+///    set via [`rollup_ci_result`] (success iff EVERY required context succeeded), keyed on the
+///    `merge_attempt_id` the workflow minted (the no-coordination agreement, §4.9).
+/// 4. **CI delivers the rollup** (possibly DOUBLY, at-least-once) into the run's signal store as the
+///    `ci.result` signal — the merge-queue workflow's `wait_for_signal` wakes EXACTLY ONCE.
+///
+/// This producer owns NONE of the CI/Git logic — it CALLS CI's real `check_seam` functions and Git's
+/// supersession rule (modelled here as highest-`run_attempt`-wins, exactly the §4.12 last-writer-wins
+/// the producer leg pins). The verdict it delivers is byte-identical to what
+/// `myelin_events::check_seam::ci_result_draft` carries on the Bus — proven by [`Self::rollup`]
+/// returning the SAME [`CiResult`] the §4.12 draft would carry. The merge-queue body decodes it
+/// through the SAME references-not-payloads codec ([`encode_ci_result`]/[`decode_ci_result`]).
+pub struct RealCiResultProducer<'a> {
+    signals: &'a crate::SignalStore,
+    tenant: myelin_tenancy::TenantId,
+    region: myelin_tenancy::Region,
+    run_id: String,
+    repo: String,
+}
+
+/// **One per-context `ci.check.updated` fact CI emits (the producer-leg input).** references-not-
+/// payloads: the context name, the run_attempt (Git's supersession key), the success verdict, and
+/// the outbox `seq` the at-least-once carriage assigns. CI emits these per check; the producer
+/// ingests them through [`CheckSeamOrder`] before deriving the rollup. All fields are PII-free.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckFact {
+    /// The check context name (`build`/`test`/…) — Git's supersession key (with the commit).
+    pub context: String,
+    /// The `run_attempt` Git's last-writer-wins supersession keys on (a higher attempt supersedes).
+    pub run_attempt: u64,
+    /// Did this check succeed? (`success`/`failure` — the post-supersession current verdict feeds
+    /// the rollup.)
+    pub success: bool,
+    /// The outbox `seq` the Bus's per-aggregate carriage assigns (the `UNIQUE(aggregate, seq)`
+    /// order key — the D-11 ordering substrate consumes facts in this order regardless of arrival).
+    pub seq: u64,
+}
+
+impl<'a> RealCiResultProducer<'a> {
+    /// A real producer bound to a run's signal store + `(tenant, region)` partition + the repo the
+    /// checks anchor on (the `(repo, commit_oid)` aggregate is CI's, contract 5.9).
+    pub fn new(
+        signals: &'a crate::SignalStore,
+        tenant: myelin_tenancy::TenantId,
+        region: myelin_tenancy::Region,
+        run_id: impl Into<String>,
+        repo: impl Into<String>,
+    ) -> Self {
+        Self {
+            signals,
+            tenant,
+            region,
+            run_id: run_id.into(),
+            repo: repo.into(),
+        }
+    }
+
+    /// **Derive the `ci.result` rollup CI emits (the REAL producer derivation, §6.5/§4.12).** Ingests
+    /// the per-context `ci.check.updated` facts through the Bus's per-aggregate ordering substrate
+    /// ([`CheckSeamOrder`], honouring whatever interleaved/out-of-`seq` arrival order the at-least-once
+    /// transport produced), applies Git's `run_attempt` last-writer-wins supersession to collapse each
+    /// context to its CURRENT verdict, then rolls up over the REQUIRED gate set via [`rollup_ci_result`]
+    /// keyed on `merge_attempt_id`. The result is byte-identical to what
+    /// `myelin_events::check_seam::ci_result_draft` carries on the Bus.
+    ///
+    /// Deterministic: the same facts (in ANY arrival order) → the same rollup (the ordering substrate
+    /// is order-by-`seq`, the supersession is highest-attempt-wins, the rollup sorts its contexts). A
+    /// stale lower-attempt re-delivery is dropped (the supersession never regresses).
+    pub fn rollup(
+        &self,
+        commit_oid: &str,
+        facts: &[CheckFact],
+        required_contexts: &[String],
+        merge_attempt_id: &str,
+    ) -> CiResult {
+        use myelin_events::check_seam::{check_updated_draft, rollup_ci_result, CheckSeamOrder};
+        use myelin_events::{Actor, CorrelationId, EventEnvelope, EventId, Timestamp};
+        use myelin_identity::{Principal, PrincipalId, PrincipalKind};
+        use std::collections::BTreeMap;
+
+        // The CI service principal that PRODUCED these check facts (contract 5.9 — CI is the producer).
+        let ci_actor = Actor(Principal::stub(
+            PrincipalId("ci".into()),
+            PrincipalKind::Service,
+            self.tenant.clone(),
+        ));
+
+        // ── Step 1: INGEST the per-context facts through the Bus's per-aggregate ordering substrate
+        // ([`CheckSeamOrder`]) — interleaved/out-of-`seq` arrivals stay per-aggregate ordered (D-11).
+        let mut order = CheckSeamOrder::new(&self.repo, commit_oid);
+        for fact in facts {
+            // The producer-leg draft pins the §4.12 envelope shape (subject + aggregate); we wrap it
+            // into a delivered envelope carrying the CI-owned opaque CheckStatus (context/run_attempt/
+            // state), at the outbox seq the carriage assigned. The ordering substrate reads only
+            // type_/aggregate/subject/payload off the envelope.
+            let draft = check_updated_draft(
+                &self.repo,
+                commit_oid,
+                &fact.context,
+                serde_json::json!({
+                    "context": fact.context,
+                    "run_attempt": fact.run_attempt,
+                    "state": if fact.success { "success" } else { "failure" },
+                }),
+            );
+            let env = EventEnvelope {
+                event_id: EventId(format!("evt-{}-{}", fact.context, fact.run_attempt)),
+                type_: draft.type_,
+                schema_ver: 1,
+                tenant: self.tenant.clone(),
+                region: self.region.clone(),
+                actor: ci_actor.clone(),
+                subject: draft.subject,
+                aggregate: draft.aggregate,
+                causation_id: None,
+                correlation_id: CorrelationId(format!("corr-{commit_oid}")),
+                caused_by: None,
+                depth: 0,
+                contains_personal_data: draft.contains_personal_data,
+                data_role: draft.data_role,
+                visibility: draft.visibility,
+                pii_key_ref: draft.pii_key_ref,
+                occurred_at: Timestamp("2026-06-21T00:00:00Z".into()),
+                recorded_at: Timestamp("2026-06-21T00:00:01Z".into()),
+                payload: draft.payload,
+            };
+            // A re-delivered identical seq is an idempotent no-op (the at-least-once dedup at the
+            // ordering layer) — the rollup is unchanged.
+            let _ = order.ingest(&env, fact.seq);
+        }
+
+        // ── Step 2: GIT'S SUPERSESSION — collapse each context to its CURRENT verdict (highest
+        // run_attempt wins). The per-aggregate seq order makes this deterministic: a stale lower
+        // attempt arriving after a higher one never regresses the current verdict (it is dropped).
+        let mut current: BTreeMap<String, (u64, bool)> = BTreeMap::new();
+        for check in order.in_order() {
+            let attempt = check.check_status["run_attempt"].as_u64().unwrap_or(0);
+            let success = check.check_status["state"].as_str() == Some("success");
+            // strip the `repo#commit-<oid>/check-` prefix to recover the context.
+            let ctx = check
+                .subject
+                .0
+                .rsplit_once("/check-")
+                .map(|(_, c)| c.to_string())
+                .unwrap_or_default();
+            current
+                .entry(ctx)
+                .and_modify(|(a, s)| {
+                    if attempt >= *a {
+                        *a = attempt;
+                        *s = success;
+                    }
+                })
+                .or_insert((attempt, success));
+        }
+        let post_supersession: BTreeMap<String, bool> =
+            current.into_iter().map(|(c, (_, s))| (c, s)).collect();
+
+        // ── Step 3: CI DERIVES THE ROLLUP over Git's required gate set (CI's real rollup_ci_result —
+        // success iff EVERY required context succeeded; a missing/failed required context fails).
+        rollup_ci_result(
+            commit_oid,
+            &post_supersession,
+            required_contexts,
+            merge_attempt_id,
+        )
+    }
+
+    /// **Deliver the REAL `ci.result` rollup for a merge attempt (§6.5).** Derives the rollup from the
+    /// per-context facts ([`Self::rollup`]) and delivers it into the run's signal store keyed on
+    /// `merge_attempt_id` (= the signal `idem_key`). Returns `true` if this was a NEW delivery and
+    /// `false` if it was an at-least-once DUPLICATE (the `wf_signal` PK deduped it — the workflow
+    /// still wakes ONCE). This is the floor-closing replacement for [`MockCiResultProducer::deliver`]:
+    /// the verdict is DERIVED (CI's real rollup), not fabricated.
+    pub fn deliver(
+        &self,
+        commit_oid: &str,
+        facts: &[CheckFact],
+        required_contexts: &[String],
+        merge_attempt_id: &str,
+    ) -> bool {
+        let result = self.rollup(commit_oid, facts, required_contexts, merge_attempt_id);
         self.signals.deliver(crate::SignalRow {
             tenant: self.tenant.clone(),
             region: self.region.clone(),
@@ -1282,5 +1510,183 @@ mod tests {
                 "no debug formatting in {reason:?}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // RealCiResultProducer — the X-1 seam END-TO-END producer wiring (P-FLOW-23)
+    // -----------------------------------------------------------------------
+
+    const REPO: &str = "myelin://acme/git/repo/core";
+
+    fn required() -> Vec<String> {
+        vec!["build".into(), "test".into()]
+    }
+
+    /// **The REAL producer DERIVES a green rollup from out-of-order + re-run + duplicate checks (the
+    /// `run_attempt` supersession holds).** `build` is re-run (attempt 2 success supersedes the stale
+    /// attempt-1 failure that ARRIVES LATER), `test` is green; a duplicate of `test#1` is absorbed.
+    /// CI's REAL `rollup_ci_result` over the required set derives `success` — NOT a fabricated verdict.
+    #[test]
+    fn real_producer_derives_green_rollup_from_out_of_order_checks() {
+        let signals = SignalStore::new();
+        let producer = RealCiResultProducer::new(&signals, tenant(), region(), "R1", REPO);
+        let facts = vec![
+            CheckFact {
+                context: "build".into(),
+                run_attempt: 2,
+                success: true,
+                seq: 3,
+            },
+            CheckFact {
+                context: "test".into(),
+                run_attempt: 1,
+                success: true,
+                seq: 2,
+            },
+            CheckFact {
+                context: "build".into(),
+                run_attempt: 1,
+                success: false,
+                seq: 1,
+            }, // stale failure arrives LAST — superseded by attempt 2
+            CheckFact {
+                context: "test".into(),
+                run_attempt: 1,
+                success: true,
+                seq: 2,
+            }, // at-least-once duplicate — absorbed
+        ];
+        let rollup = producer.rollup("deadbeef", &facts, &required(), "R1/merge.queue:0/merge");
+        assert_eq!(
+            rollup.overall,
+            CiOverall::Success,
+            "build's CURRENT attempt is success#2 (the stale failure#1 was superseded)"
+        );
+        assert_eq!(
+            rollup.contexts,
+            vec!["build".to_string(), "test".to_string()],
+            "the rollup is over Git's required gate set, sorted (byte-stable)"
+        );
+        assert_eq!(rollup.idem_token, "R1/merge.queue:0/merge");
+    }
+
+    /// **The REAL producer derives FAILURE on a superseding failure (the supersession never
+    /// regresses).** `test`'s re-run (attempt 2) FAILS; the current verdict is failure → the rollup
+    /// is failure, never the stale green.
+    #[test]
+    fn real_producer_derives_failure_on_a_superseding_failure() {
+        let signals = SignalStore::new();
+        let producer = RealCiResultProducer::new(&signals, tenant(), region(), "R1", REPO);
+        let facts = vec![
+            CheckFact {
+                context: "build".into(),
+                run_attempt: 1,
+                success: true,
+                seq: 1,
+            },
+            CheckFact {
+                context: "test".into(),
+                run_attempt: 1,
+                success: true,
+                seq: 2,
+            },
+            CheckFact {
+                context: "test".into(),
+                run_attempt: 2,
+                success: false,
+                seq: 3,
+            },
+        ];
+        let rollup = producer.rollup("deadbeef", &facts, &required(), "R1/merge.queue:0/merge");
+        assert_eq!(
+            rollup.overall,
+            CiOverall::Failure,
+            "test's CURRENT attempt failed → the rollup is failure (0 spurious unblock)"
+        );
+    }
+
+    /// **A missing required context (a fork self-green that does not run the required check) → the
+    /// rollup is FAILURE (neutral for gating).** A required context never implicitly passes.
+    #[test]
+    fn real_producer_missing_required_context_is_failure() {
+        let signals = SignalStore::new();
+        let producer = RealCiResultProducer::new(&signals, tenant(), region(), "R1", REPO);
+        // only `build` reported — required `test` is absent.
+        let facts = vec![CheckFact {
+            context: "build".into(),
+            run_attempt: 1,
+            success: true,
+            seq: 1,
+        }];
+        let rollup = producer.rollup("deadbeef", &facts, &required(), "R1/merge.queue:0/merge");
+        assert_eq!(
+            rollup.overall,
+            CiOverall::Failure,
+            "a missing required context keeps the gate closed (fork self-green is neutral)"
+        );
+    }
+
+    /// **The producer derivation is DETERMINISTIC (the idempotent-wake precondition):** the same facts
+    /// in ANY arrival order → the same rollup. So a re-derivation after a redelivery is byte-identical.
+    #[test]
+    fn real_producer_rollup_is_deterministic_across_arrival_order() {
+        let signals = SignalStore::new();
+        let producer = RealCiResultProducer::new(&signals, tenant(), region(), "R1", REPO);
+        let ordered = vec![
+            CheckFact {
+                context: "build".into(),
+                run_attempt: 1,
+                success: true,
+                seq: 1,
+            },
+            CheckFact {
+                context: "test".into(),
+                run_attempt: 1,
+                success: true,
+                seq: 2,
+            },
+        ];
+        let mut scrambled = ordered.clone();
+        scrambled.reverse();
+        let a = producer.rollup("deadbeef", &ordered, &required(), "R1/merge.queue:0/merge");
+        let b = producer.rollup(
+            "deadbeef",
+            &scrambled,
+            &required(),
+            "R1/merge.queue:0/merge",
+        );
+        assert_eq!(
+            a, b,
+            "same facts, any arrival order → byte-identical rollup"
+        );
+    }
+
+    /// **`deliver` is idempotent on the `merge_attempt_id` (at-least-once → one buffered row).** A
+    /// double delivery of the derived rollup returns `false` the second time and buffers ONE row — the
+    /// workflow wakes once.
+    #[test]
+    fn real_producer_double_delivery_buffers_one_row() {
+        let signals = SignalStore::new();
+        let producer = RealCiResultProducer::new(&signals, tenant(), region(), "R1", REPO);
+        let facts = vec![
+            CheckFact {
+                context: "build".into(),
+                run_attempt: 1,
+                success: true,
+                seq: 1,
+            },
+            CheckFact {
+                context: "test".into(),
+                run_attempt: 1,
+                success: true,
+                seq: 2,
+            },
+        ];
+        let attempt = "R1/merge.queue:0/merge";
+        let first = producer.deliver("deadbeef", &facts, &required(), attempt);
+        let second = producer.deliver("deadbeef", &facts, &required(), attempt);
+        assert!(first, "first delivery is new");
+        assert!(!second, "the at-least-once double-delivery deduped");
+        assert_eq!(signals.buffered_depth(), 1, "ONE buffered ci.result row");
     }
 }

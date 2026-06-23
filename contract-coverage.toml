@@ -942,6 +942,24 @@ status = "covered"
 # `crates/myelin-refs-service/src/ci_producer/tests.rs`. The Refs sub-anchor consumer-side CDC pair is
 # `crates/myelin-refs-service/tests/cdc_5_9_ci_sub_anchors.rs`. The NON-Refs half (merge gate, fork
 # endorsement, the merge-queue wake) stays the Git+CI deliverable (GIT-D10/CI-D8, above).
+# P-FLOW-23/P-346 (M4) CLOSED THE MERGE-QUEUE FLOOR — the durable-execution half of X-1 END-TO-END.
+# The merge-queue durable workflow body (`myelin_flow::merge_queue::WfCtx::run_merge_attempt`) was
+# built + drilled IN ISOLATION against a MOCK ci.result producer at P-FLOW-19 (the named floor). This
+# prompt replaces the mock with the REAL producer wiring `myelin_flow::RealCiResultProducer`: it does
+# NOT fabricate a verdict — it DERIVES the rollup from per-context `ci.check.updated` facts through
+# CI's REAL `myelin_events::check_seam::{CheckSeamOrder (per-aggregate ordering), rollup_ci_result
+# (success iff every required context green)}` after Git's `run_attempt` last-writer-wins supersession
+# collapses each context, keyed idempotently on the merge_attempt_id the workflow minted (the
+# no-coordination agreement, §4.9). The merge queue — parked across a worker restart — wakes on that
+# DERIVED rollup (delivered twice, at-least-once) EXACTLY once and merges EXACTLY once. GIT-D10/CI-D8
+# GREEN end-to-end (out-of-order/re-run/dup ci.check.updated → supersession holds, drops stale; a
+# superseding failure → dequeue with a humanised reason; a fork self-green / missing required context
+# is NEUTRAL for gating — 0 spurious unblock; 0 double-merge, merge-count == 1/attempt) in
+# `crates/myelin-flow/tests/drills_flow_d10_x1_seam_e2e.rs` (the merge-queue durable-workflow half;
+# the Bus-substrate half is `crates/myelin-events/tests/drills_eb27_check_seam_e2e.rs`). The 5.9
+# merge-queue CONSUMER half is now PAIRED with CI's REAL provider half (not the mock) in
+# `crates/myelin-flow/tests/cdc_5_9_merge_queue.rs::consumer_reconciles_with_the_real_ci_producer_end_to_end`.
+# The merge-queue-in-isolation FLOOR (P-FLOW-19) is PROMOTED to the seam end-to-end (the floor closed).
 cdc = [
     # the Bus's carriage CDC (the narrow half — envelope + ordering + the wait substrate)
     "crates/myelin-events/tests/cdc_5_9_check_seam_carriage.rs",
@@ -957,6 +975,11 @@ cdc = [
     # end-to-end render (per-viewer resolve → tombstone on deny, NOTIF-D4 0 leak) is the companion
     # integration test `integration_ci_summary_humanises.rs`.
     "crates/myelin-ci-sandbox/tests/cdc_7_6_5_9_ci_notif_summary.rs",
+    # The merge-queue CONSUMER half PAIRED with CI's REAL ci.result provider (P-FLOW-23 / P-346, M4):
+    # the durable-execution half of X-1 END-TO-END — the merge queue wakes on the rollup CI's REAL
+    # producer DERIVES (RealCiResultProducer over CheckSeamOrder + run_attempt supersession +
+    # rollup_ci_result), not a fabricated verdict. Closes the P-FLOW-19 merge-queue-in-isolation floor.
+    "crates/myelin-flow/tests/cdc_5_9_merge_queue.rs",
 ]
 
 # ──────────────── §6 Search (myelin-search) ─────────────────────────────────────────────────────

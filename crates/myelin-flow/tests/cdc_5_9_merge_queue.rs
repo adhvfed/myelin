@@ -26,17 +26,20 @@
 //!   no-coordination agreement — CI echoes the dispatch id WITHOUT a coordination round-trip);
 //! - deliver it (possibly DOUBLY, at-least-once) → the wait consumes it ONCE (one wake).
 //!
-//! This pair proves the two ends RECONCILE against a MOCK CI producer ([`MockCiResultProducer`]) —
-//! the merge-queue consumer (this engine, M2) paired with the CI provider's shape (M4). The REAL CI
-//! producer landing END-TO-END is the NAMED FLOOR **P-FLOW-22** (GIT-D10 / CI-D8); until then this
-//! pair pins the agreement against the mock.
+//! This pair proves the two ends RECONCILE — the merge-queue consumer (this engine) paired with the
+//! CI provider's shape. The M2 prompt pinned the agreement against a MOCK CI producer
+//! ([`MockCiResultProducer`]); **P-FLOW-23 (M4) CLOSES the floor** by pairing the consumer with CI's
+//! REAL producer ([`RealCiResultProducer`]) — the rollup is now DERIVED from per-context
+//! `ci.check.updated` facts through CI's REAL `myelin_events::check_seam::{CheckSeamOrder,
+//! rollup_ci_result}` (the X-1 seam END-TO-END, GIT-D10 / CI-D8), not fabricated. Both halves of the
+//! 5.9 pair are now green against the real producer.
 
 use myelin_events::check_seam::{CiOverall, CiResult};
 use myelin_events::{Actor, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Timestamp};
 use myelin_flow::{
-    decode_ci_result, encode_ci_result, merge_attempt_id, CiDispatch, CiDispatcher, MergeOutcome,
-    MergePerformer, MergeRequest, MockCiResultProducer, SignalStore, WfCtx, WfJournal,
-    CI_RESULT_SIGNAL,
+    decode_ci_result, encode_ci_result, merge_attempt_id, CheckFact, CiDispatch, CiDispatcher,
+    MergeOutcome, MergePerformer, MergeRequest, MockCiResultProducer, RealCiResultProducer,
+    SignalStore, WfCtx, WfJournal, CI_RESULT_SIGNAL,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_storage::reserve_settle::MinorUnits;
@@ -259,6 +262,79 @@ fn a_failure_rollup_reconciles_to_a_humanised_dequeue() {
         ctx.staged_emit_len(),
         0,
         "no git.pr.merged on a failure rollup"
+    );
+}
+
+/// **5.9 PROVIDER (REAL) ↔ CONSUMER reconcile END-TO-END (P-FLOW-23, GIT-D10/CI-D8).** The CI
+/// provider half is now the REAL [`RealCiResultProducer`]: it DERIVES the rollup from per-context
+/// `ci.check.updated` facts through CI's REAL ordering + `run_attempt` supersession + rollup (NOT a
+/// fabricated verdict), keyed on the merge_attempt_id the workflow minted. The merge-queue consumer
+/// wakes on that derived rollup and merges — the two ends reconcile against the real producer, the
+/// floor CLOSED. A build re-run (attempt 2 success) supersedes a stale failure (attempt 1) that
+/// arrives out of order.
+#[test]
+fn consumer_reconciles_with_the_real_ci_producer_end_to_end() {
+    let outbox = OutboxStore::new();
+    let journal = WfJournal::new();
+    let signals = SignalStore::new();
+
+    // PROVIDER (CI, REAL): per-context facts — build re-run supersedes a stale failure; test green.
+    let facts = vec![
+        CheckFact {
+            context: "build".into(),
+            run_attempt: 2,
+            success: true,
+            seq: 3,
+        },
+        CheckFact {
+            context: "build".into(),
+            run_attempt: 1,
+            success: false,
+            seq: 1,
+        }, // stale failure (out of order) — superseded
+        CheckFact {
+            context: "test".into(),
+            run_attempt: 1,
+            success: true,
+            seq: 2,
+        },
+    ];
+    let attempt = merge_attempt_id("R1", "merge.queue:0");
+    let producer = RealCiResultProducer::new(
+        &signals,
+        tenant(),
+        region(),
+        "R1",
+        "myelin://acme/git/repo/core",
+    );
+    // The REAL rollup is success (supersession honoured); deliver it on the minted attempt id.
+    let derived = producer.rollup("deadbeef", &facts, &request().required_contexts, &attempt);
+    assert_eq!(
+        derived.overall,
+        CiOverall::Success,
+        "the REAL producer derives success (the stale failure was superseded)"
+    );
+    producer.deliver("deadbeef", &facts, &request().required_contexts, &attempt);
+
+    // CONSUMER (the merge queue): dispatch + consume the DERIVED rollup + merge.
+    let mut ctx = begin(&outbox, journal, signals);
+    let out = ctx
+        .run_merge_attempt(&request(), &OkCi, &OkMerger, None, MinorUnits(0), vec![])
+        .expect("merge");
+    match out {
+        MergeOutcome::Merged {
+            merge_attempt_id: id,
+            ..
+        } => assert_eq!(
+            id, attempt,
+            "RECONCILE: the consumer merged on the REAL derived rollup keyed on the minted id"
+        ),
+        other => panic!("expected Merged on the real rollup, got {other:?}"),
+    }
+    assert_eq!(
+        ctx.staged_emit_len(),
+        1,
+        "one git.pr.merged on the real-producer rollup"
     );
 }
 
