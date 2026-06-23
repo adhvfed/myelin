@@ -55,6 +55,7 @@ pub mod events;
 pub mod fairness;
 pub mod fleet;
 pub mod holder;
+pub mod metering;
 pub mod migrations;
 pub mod rebac_fragment;
 pub mod schedule_and_run_job;
@@ -79,6 +80,20 @@ pub use ci_pipeline::{CheckFacts, PipelineRun, PipelineStage, RunVerdict, CI_PIP
 // The reserve/settle metering bookends into `cost_event` are CI-P17 (P-360); the live runner lease +
 // in-sandbox execution is GATED by AG-D4.
 pub use schedule_and_run_job::{complete_job, JobScheduleTerms, SchedulerJobRunner};
+
+// CI-P17 (P-360): reserve/settle = the ONE metering path + the `cost_event` ledger + parity CI ↔ agent
+// (CI-D5). The CI METER on the FROZEN reserve/settle path: the resource-second taxonomy
+// ([`metering::Meter`]) is the wholesale meter (directly comparable to an agent `compute` call, X-6);
+// the CI `cost_event` schema row ([`metering::CostEventRow`]) carries wholesale + markup as SEPARATE
+// integer-minor-units columns with `kind ∈ {ci, agent}` (UNIFY / X-6); [`metering::CiMeter`] wraps the
+// engine [`myelin_flow::BudgetGate`] (contract 9.5/11.7 — CI builds NO second ledger) so a CI dispatch
+// `reserve_budget()`s (refuse-to-start on exhaustion, never interrupt in flight) + `settle_budget()`s
+// on `job.done`. FLOOR named: the resource-second → credit/price MARKUP mapping is Commercial's (arch
+// 06 R-2 — the `MarkupPolicy` seam carries it; CI owns only the meter + the wholesale column).
+pub use metering::{
+    meter_resource_seconds, metered_units_for, reserve_settle_parity_drill, CiMeter, CostEventRow,
+    CostKind, FlatBpsMarkup, MarkupPolicy, Meter, MeteredResource, ReserveSettleParitySignal,
+};
 
 pub use holder::{
     ci_store_classifier, register_ci_holders, CiHolder, CiHolderRegistration, CiStoreClass,
