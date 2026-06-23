@@ -27,10 +27,11 @@
 //! - **`restrict` WIRED** — [`IssueHolder::restrict`] flips a per-subject flag the index/agent/
 //!   analytics/notif seams read ([`RestrictionFlag`]); the honoured-everywhere proof is the GDPR
 //!   P-GA-25 path, but the flag the seams check is REAL here (Art. 18/21).
-//! - **`erase` STUBBED to crypto-shred** — a well-defined no-op receipt that NAMES its ISS-P07/P31
+//! - **`erase` STUBBED to crypto-shred** — a well-defined no-op receipt that NAMES its ISS-P31
 //!   follow-on (the full per-subject-DEK crypto-shred + pseudonym shred over issues/comments/
-//!   change-log/worklog). The erasure LEVER (the per-subject DEK on `issue.pii_key_ref` /
-//!   `issue_change_log.pii_key_ref`, 11.4) already exists as schema (ISS-P05); the wiring is ISS-P07.
+//!   change-log/worklog). The erasure LEVERS now BOTH exist: the per-subject DEK on the free-text
+//!   columns ([`crate::dek`], 11.4) and the pseudonymous-by-default identity columns
+//!   ([`crate::pseudonym`], 4.8) are WIRED at ISS-P07 / P-373; ISS-P31 wires the `erase` BODY.
 //!
 //! The residual (third-party free-text PII a person typed into ANOTHER subject's issue, under that
 //! other person's DEK) is the ONE platform posture (10.9 / X-7) — handled **by reference**
@@ -48,8 +49,11 @@
 //! ## Floors named (deferred bodies → filling prompt)
 //! - **The `erase` crypto-shred fan-out body** (the full per-subject-DEK destroy over issues/comments/
 //!   change-log/worklog + the `issue.*.erased` tombstones; pseudonym shred of `assignee`/`reporter`/
-//!   `actor`) is **ISS-P07** (the per-subject-DEK columns) + **ISS-P31** (the full ops). Here `erase`
-//!   is the typed no-op that names them; the per-subject DEK lever already exists as schema (ISS-P05).
+//!   `actor`) is **ISS-P31** (the full ops). The per-subject-DEK COLUMNS the destroy operates on are
+//!   now WIRED (ISS-P07 / P-373 — [`crate::dek`] seals the free-text under the per-subject DEK, and
+//!   [`crate::pseudonym`] makes the identity columns pseudonymous-by-default), so the two erasure
+//!   LEVERS (per-subject-DEK crypto-shred + pseudonym-map shred) both exist; ISS-P31 wires the
+//!   `erase` BODY that pulls them. Here `erase` is still the typed no-op receipt that names ISS-P31.
 //! - **The full `locate`/`export` subject-walk** (the real issue/comment/change-log rows naming the
 //!   subject) lands with the write path (ISS-P06) + the DSR fan-out (ISS-P31). Here they are
 //!   empty-but-correct typed receipts.

@@ -80,6 +80,17 @@ myelin-search = { path = "../myelin-search" }
 # reason vocabulary (EI-01 §1/§7). The live notif wiring ("My Work" inbox routing) lands in ISS-P22;
 # here the DECLARATION is the deliverable.
 myelin-notif = { path = "../myelin-notif" }
+# ISS-P07 (P-373, M4): the FROZEN per-subject-DEK at-rest encryption surface (contract 11.4 / GD-4).
+# Issues' free-text title/props/change-delta columns are sealed with the per-subject DEK through the
+# ONE shared `myelin_storage::encryption::ColumnCryptor` over the P-058 `KmsEngine` (the SAME engine
+# rotation/crypto-shred reach by construction) — Issues defines NO second cryptor and NO parallel key
+# store (EI-01 §7). `key_class_for` routes the `#[personal_data(erasure = CryptoShred(subject_dek))]`
+# tag to a `KeyClass::Subject` DEK; a wrong/missing subject is a LOUD `KeyChoiceError`, never a silent
+# tenant-key downgrade. `myelin-storage` is a SHARED GLUE crate with no edge back to a subsystem (the
+# §2.9 DAG stays acyclic — the same regular edge `myelin-git`/`myelin-ci-controlplane` carry). The
+# DB-free in-memory `KmsEngine::new()` keeps `cargo build --workspace` DB-free; the live-stack DEK
+# round-trip is the `integration`-feature proof (tests/integration_iss_p07_subject_dek.rs).
+myelin-storage = { path = "../myelin-storage" }
 serde.workspace = true
 serde_json.workspace = true
 
@@ -104,7 +115,9 @@ tokio = { workspace = true, optional = true }
 # frozen engine, never re-define it.
 [dev-dependencies]
 myelin-identity-service = { path = "../myelin-identity-service" }
-myelin-storage = { path = "../myelin-storage" }
+# Note: `myelin-storage` is now a REGULAR dependency (above) — ISS-P07 seals the free-text columns
+# with the shared `ColumnCryptor` at RUNTIME (the per-subject-DEK write path), so the edge is no
+# longer test-only.
 # The frozen `ArtifactRef` token (contract 5.1) the Notif `classify`/dedup-render seam keys on — used
 # ONLY in the 7.6 declares CDC + unit tests to render an Issues subject's inbox dedup key. Test
 # scaffolding (no runtime edge: the declares module is generic over the caller's subject ref).
@@ -125,5 +138,9 @@ default = []
 # Postgres). ISS-P06 (P-372) ADDS the live-stack emit-iff-committed proof for the write path (the
 # issue state row + its issue.* event co-commit in ONE Postgres tx; a rolled-back tx writes 0 of
 # each — tests/integration_iss_p06_outbox.rs). Pulls the optional sqlx + tokio external crates only;
-# the default build stays DB-free.
+# the default build stays DB-free. ISS-P07 (P-373) ADDS the live-stack per-subject-DEK proof: the
+# free-text title/props/change-delta columns sealed under the per-subject DEK are stored as ciphertext
+# into a real Postgres column and read back to assert 0 plaintext-at-rest + a successful decrypt while
+# the key lives (tests/integration_iss_p07_subject_dek.rs). The ColumnCryptor seal/open is DB-free
+# (in-memory KmsEngine), so the integration test only adds the real at-rest round-trip.
 integration = ["dep:sqlx", "dep:tokio"]

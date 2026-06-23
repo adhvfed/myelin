@@ -82,15 +82,19 @@
 //! calls `OutboxTx::emit` on the SAME transaction so the issue's `issue.*` event co-commits with the
 //! row. One outbox, one emit verb, one ordering key — exactly the substrate seam, used in place.
 
+use crate::dek::{self, IssueFreeText};
 use crate::events;
+use crate::pseudonym::{self, IssuePseudonym, PseudonymError};
 use myelin_events::{
     AggregateKey, ArtifactRef, DataRole, EmitContextBase, EventDraft, EventType, IdMinter,
-    OutboxStore, OutboxTransaction, OutboxTx, Visibility,
+    OutboxStore, OutboxTransaction, OutboxTx, PiiKeyRef, Visibility,
 };
 use myelin_identity::{
     CaveatContext, Consistency, ConsistencyMode, Decision, IdentityService, Permission,
     Precondition, Principal, RelName, RelationTuple, TupleDelta, Zookie,
 };
+use myelin_storage::encryption::{EncryptedColumn, KeyChoiceError, SubjectId};
+use myelin_storage::kms::KmsEngine;
 use std::sync::Arc;
 
 // ===========================================================================
@@ -344,6 +348,40 @@ pub fn apply_mutation<Id: IdentityService>(
     mutation: &MutationKind,
     cause: Option<&myelin_events::EventEnvelope>,
 ) -> Result<WriteOutcome, WriteError> {
+    // ISS-P06 entrypoint: the per-subject-DEK pii_key_ref is a PLACEHOLDER (`issue-dek:<id>`) — the
+    // real ISS-P07 wiring lands in `apply_mutation_sealed` (below), which seals the free-text under
+    // the subject's per-subject DEK and threads the REAL `kms://…/subject:<id>` key ref. The seam
+    // shape (a PII-bearing event carries a key ref, never the body) does not change.
+    apply_mutation_inner(
+        store,
+        minter,
+        ctx_base,
+        id,
+        actor,
+        issue_local_id,
+        mutation,
+        cause,
+        None,
+    )
+}
+
+/// The write-path core both [`apply_mutation`] (ISS-P06 placeholder key ref) and
+/// [`apply_mutation_sealed`] (ISS-P07 real per-subject-DEK key ref) share. `real_pii_key_ref` is the
+/// per-subject-DEK [`PiiKeyRef`] for a free-text-bearing mutation when the caller pre-sealed the
+/// free-text (ISS-P07); `None` falls back to the ISS-P06 placeholder so the emit-iff-committed seam is
+/// unchanged. One write path, one emit verb — never two.
+#[allow(clippy::too_many_arguments)]
+fn apply_mutation_inner<Id: IdentityService>(
+    store: &OutboxStore,
+    minter: Arc<dyn IdMinter>,
+    ctx_base: EmitContextBase,
+    id: &Id,
+    actor: &Principal,
+    issue_local_id: &str,
+    mutation: &MutationKind,
+    cause: Option<&myelin_events::EventEnvelope>,
+    real_pii_key_ref: Option<PiiKeyRef>,
+) -> Result<WriteOutcome, WriteError> {
     // ── 1. VALIDATE (reject malformed input before the gate / the store) ──────────────────────────
     validate(mutation)?;
 
@@ -403,6 +441,7 @@ pub fn apply_mutation<Id: IdentityService>(
                 project_of(mutation),
                 issue_local_id,
                 mutation,
+                real_pii_key_ref.clone(),
             );
             match tx.emit(draft, cause) {
                 Ok(eid) => Some(eid),
@@ -520,6 +559,7 @@ fn event_draft(
     project_id: u128,
     issue_local_id: &str,
     mutation: &MutationKind,
+    real_pii_key_ref: Option<PiiKeyRef>,
 ) -> EventDraft {
     let contains_pii = mutation.carries_personal_data();
     let mut payload = serde_json::json!({
@@ -553,12 +593,16 @@ fn event_draft(
         // decision — Identity decides at resolve-time).
         visibility: Visibility::Internal,
         contains_personal_data: contains_pii,
-        // The per-subject-DEK pii_key_ref is ISS-P07. A PII-bearing event carries a key REF (never
-        // the body); here a placeholder ref proves the envelope shape carries it iff PII is present.
+        // A PII-bearing event carries a key REF (never the body — references-not-payloads). ISS-P07
+        // wires the REAL per-subject-DEK key ref (`kms://<tenant>/<epoch>/subject:<id>`) when the
+        // caller pre-sealed the free-text ([`apply_mutation_sealed`]); the ISS-P06 placeholder
+        // (`issue-dek:<id>`) is the fallback that proves the envelope shape carries the ref iff PII is
+        // present. Either way the inline body is NEVER on the wire.
         pii_key_ref: if contains_pii {
-            Some(myelin_events::PiiKeyRef(format!(
-                "issue-dek:{issue_local_id}"
-            )))
+            Some(
+                real_pii_key_ref
+                    .unwrap_or_else(|| PiiKeyRef(format!("issue-dek:{issue_local_id}"))),
+            )
         } else {
             None
         },
@@ -594,6 +638,154 @@ fn state_change_description(mutation: &MutationKind, issue_local_id: &str) -> St
 fn commit_tx(tx: OutboxTransaction) -> Result<(), WriteError> {
     tx.commit()
         .map_err(|e| WriteError::Outbox(format!("{e:?}")))
+}
+
+// ===========================================================================
+// §5 — ISS-P07: the pseudonymous + per-subject-DEK-sealed write path (4.8 / 11.4)
+// ===========================================================================
+
+/// **A CREATE draft after the ISS-P07 GDPR-safe transform (recon §X-7).** The reporter is a
+/// pseudonymous-by-default identity column ([`IssuePseudonym`], contract 4.8 — never a raw id); the
+/// free-text `title` / `props` are sealed under the SUBJECT's per-subject DEK
+/// ([`EncryptedColumn`], contract 11.4 — ciphertext + the `pii_key_ref` DEK metadata at rest, 0
+/// plaintext). The per-subject-DEK [`PiiKeyRef`] the emitted event carries is derived from the sealed
+/// columns (the SAME key the erase fan-out — ISS-P31 — destroys). This is what rests in the OLTP
+/// spine: a pseudonymous reporter + DEK-sealed free-text, never a raw id and never plaintext PII.
+#[derive(Clone, Debug)]
+pub struct SealedCreate {
+    /// The reporter, pseudonymised through the ONE Identity map (4.8). 0-raw-id by construction.
+    pub reporter: IssuePseudonym,
+    /// The issue `title` sealed under the subject's per-subject DEK (11.4 — ciphertext at rest).
+    pub title: EncryptedColumn,
+    /// The issue `props` JSONB tail sealed under the subject's per-subject DEK (11.4).
+    pub props: EncryptedColumn,
+}
+
+impl SealedCreate {
+    /// The per-subject-DEK [`PiiKeyRef`] the emitted `issue.created` event carries (contract 11.4 —
+    /// the real `kms://<tenant>/<epoch>/subject:<id>` ref, NOT a placeholder). Derived from the sealed
+    /// `title` column's key ref (title + props share the subject's per-subject DEK). The erase fan-out
+    /// (ISS-P31) destroys exactly this key to render the free-text unrecoverable.
+    pub fn pii_key_ref(&self) -> PiiKeyRef {
+        PiiKeyRef(self.title.key_ref.to_uri())
+    }
+}
+
+/// Why the ISS-P07 GDPR-safe transform of a write failed (LOUD — a transform failure FAILS THE WRITE
+/// CLOSED; a raw id is never stored and plaintext PII is never persisted).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SealError {
+    /// The reporter could not be pseudonymised (4.8 — the map has no entry / a malformed pseudonym).
+    /// The write fails closed; an Issues identity column is NEVER written with a raw id.
+    Pseudonym(PseudonymError),
+    /// The free-text could not be sealed under the per-subject DEK (11.4 — KMS unavailable / a
+    /// classification error). The write fails closed; plaintext PII is NEVER persisted.
+    Dek(String),
+}
+
+impl core::fmt::Display for SealError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            SealError::Pseudonym(e) => write!(f, "pseudonymise failed (write fails closed): {e}"),
+            SealError::Dek(e) => write!(f, "per-subject-DEK seal failed (write fails closed): {e}"),
+        }
+    }
+}
+
+impl std::error::Error for SealError {}
+
+impl From<KeyChoiceError> for SealError {
+    fn from(e: KeyChoiceError) -> Self {
+        SealError::Dek(format!("{e}"))
+    }
+}
+
+/// **THE ISS-P07 pseudonymous + per-subject-DEK-sealed Issues write path (contract 4.8 + 11.4).**
+///
+/// The GDPR-safe superset of [`apply_mutation`] for a CREATE: BEFORE the ISS-P06 write path runs, it
+///
+/// 1. **pseudonymises the reporter** through the ONE Identity map ([`pseudonym::pseudonymise`], 4.8) —
+///    the stored `reporter` identity column is a `<pseudonym>@<tenant>.noreply` handle, NEVER a raw
+///    id (recon §X-7);
+/// 2. **seals the free-text `title` / `props`** under the SUBJECT's per-subject DEK
+///    ([`dek::encrypt_free_text`], 11.4) over the ONE shared [`KmsEngine`] — ciphertext + the
+///    `pii_key_ref` DEK metadata at rest, 0 plaintext;
+/// 3. runs the ISS-P06 validate → check → mutate → emit seam, threading the REAL per-subject-DEK
+///    [`PiiKeyRef`] (`kms://<tenant>/<epoch>/subject:<id>`) onto the emitted `issue.created` event
+///    (the erase fan-out — ISS-P31 — destroys exactly this key).
+///
+/// A pseudonymise / seal failure FAILS THE WRITE CLOSED ([`WriteError::Invalid`] wrapping the
+/// [`SealError`]) — nothing is written, no raw id is stored, no plaintext PII is persisted. The
+/// returned [`SealedCreate`] is the at-rest form the OLTP store persists (a pseudonymous reporter +
+/// DEK-sealed columns). Non-CREATE mutations have no new free-text to seal here; use [`apply_mutation`]
+/// for them (their identity references are already opaque pseudonyms / state tokens).
+#[allow(clippy::too_many_arguments)]
+pub fn apply_mutation_sealed<Id: IdentityService>(
+    store: &OutboxStore,
+    minter: Arc<dyn IdMinter>,
+    ctx_base: EmitContextBase,
+    id: &Id,
+    engine: &KmsEngine,
+    actor: &Principal,
+    issue_local_id: &str,
+    draft: &IssueDraft,
+    cause: Option<&myelin_events::EventEnvelope>,
+) -> Result<(WriteOutcome, SealedCreate), WriteError> {
+    // `myelin_events::{TenantId, Region}` ARE `myelin_tenancy::{TenantId, Region}` (re-exports) and
+    // Identity keys its surface on the SAME `myelin_tenancy::TenantId` — one tenant type, no
+    // conversion (EI-01 §7 — one vocabulary).
+    let tenant = ctx_base.tenant.clone();
+    let region = ctx_base.region.clone();
+
+    // ── 1. pseudonymise the reporter (4.8) — fail closed, never store a raw id ────────────────────
+    // The subject the free-text belongs to + whose pseudonym the reporter column stores: the actor
+    // (the human/agent creating the issue). One subject id — the opaque pseudonymous principal id.
+    let reporter = pseudonym::pseudonymise(id, &actor.principal_id, &tenant)
+        .map_err(|e| WriteError::Invalid(format!("{}", SealError::Pseudonym(e))))?;
+    // The subject the per-subject DEK keys on: the OPAQUE pseudonym (never a raw id). The SAME subject
+    // the reporter identity column stores — one subject id across identity + free-text.
+    let subject = SubjectId::new(reporter.render());
+
+    // ── 2. seal the free-text title / props under the subject's per-subject DEK (11.4) ────────────
+    let title = dek::encrypt_free_text(
+        engine,
+        &region,
+        &tenant,
+        &subject,
+        IssueFreeText::Title,
+        draft.title.as_bytes(),
+    )
+    .map_err(|e| WriteError::Invalid(format!("{}", SealError::from(e))))?;
+    let props = dek::encrypt_free_text(
+        engine,
+        &region,
+        &tenant,
+        &subject,
+        IssueFreeText::Props,
+        &draft.props,
+    )
+    .map_err(|e| WriteError::Invalid(format!("{}", SealError::from(e))))?;
+
+    let sealed = SealedCreate {
+        reporter,
+        title,
+        props,
+    };
+
+    // ── 3. the ISS-P06 write path, threading the REAL per-subject-DEK pii_key_ref onto the event ──
+    let mutation = MutationKind::Create(draft.clone());
+    let outcome = apply_mutation_inner(
+        store,
+        minter,
+        ctx_base,
+        id,
+        actor,
+        issue_local_id,
+        &mutation,
+        cause,
+        Some(sealed.pii_key_ref()),
+    )?;
+    Ok((outcome, sealed))
 }
 
 #[cfg(test)]
