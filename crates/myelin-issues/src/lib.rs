@@ -270,6 +270,7 @@ pub mod cost_bounder;
 pub mod declares;
 pub mod dek;
 pub mod events;
+pub mod governance;
 pub mod holder;
 pub mod holder_erase;
 pub mod holder_intent;
@@ -464,6 +465,22 @@ pub use views::{
     board_and_roadmap_share_row, edit_on_board_reflects_on_roadmap, type_rank_split_is_partition,
     IssueView, RowProjection, ViewFloors, BOARD_TYPE_RANK_MAX, CYCLE_FIELD, ORDER_KEY_FIELD,
     ROADMAP_TYPE_RANK_MIN, STATE_CATEGORY_FIELD, TYPE_RANK_FIELD,
+};
+
+// ISS-P29 (P-396, M4): the governance admin views S13–S18 (the M4-I7 admin-views slice). The
+// `governance` module ships the backend view-models for the six governance screens (each naming the
+// REAL engine it writes through — never a parallel calc, EI-01 §7), the S15 permission inspector
+// (the CONSUMER of contract 4.4 — reads `list_subjects`/`explain` through the `PermissionResolver`
+// port, 0 private recompute; the inspector's answer EQUALS Identity's `explain`), the S14 breach-
+// simulation (the REAL ISS-P26 `business_fire_at`, not a parallel calc), and the S13 unreachable-
+// state inline validation (over the REAL ISS-P12 `Workflow` FSM). The design sketches (S13/S14/S15/
+// S16/S18, incl. the empty/loading/error/permission states) are signed off in the design folder
+// (governance-admin-pass.md + governance-signoff.md). FLOOR: none new — the inspector reads 4.4, the
+// breach-sim reuses the SLA engine, the guard/condition builders reuse the frozen QueryAst.
+pub use governance::{
+    simulate_breach, workflow_unreachable_states, BreachSimulation, GovernanceFloors,
+    GovernanceView, GovernanceViewModel, GuardLanguage, InspectorAnswer, PermissionInspector,
+    PermissionResolver,
 };
 
 // ISS-P17 (P-383, M4): the Refs wiring (resolve/project/#sub/edges/traverse/TE-7 mirror) + the
