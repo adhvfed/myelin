@@ -2586,6 +2586,8 @@ dependencies = [
  "myelin-harness",
  "myelin-identity",
  "myelin-lints",
+ "myelin-refs-service",
+ "myelin-search",
  "myelin-tenancy",
  "serde",
  "serde_json",
