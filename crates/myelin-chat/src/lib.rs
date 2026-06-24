@@ -69,8 +69,15 @@
 //!   touched, so a denied viewer's title is NEVER fetched (CHAT-D5, 0 title leak); the SetExpr→JOIN
 //!   class precompute lowers over the unfurl candidate id column (no N+1); the 4-step ladder
 //!   (live/gone/erased) maps to leak-free cards. The Refs `resolve` chokepoint (REF-P10 / CHAT-P15)
-//!   is the named floor; bus-invalidation + erasure-safe re-render is CHAT-P14; the canvas is an
-//!   embedded Knowledge page, NOT a chat editor (M4-C4 lean).
+//!   is the named floor; the canvas is an embedded Knowledge page, NOT a chat editor (M4-C4 lean).
+//!   - **CHAT-P14 / P-408** ([`unfurl::invalidation`]): the bus-driven invalidation consumer
+//!     (matching `*.updated`/`ci.check.updated`/`*.erased`, contracts 5.9 / 2.7, whitelisted-subject +
+//!     idempotent) that busts the ONE shared cache + pushes a live firehose card-update frame
+//!     (contract 3.5, `channel:<id>` scope) — CHAT-D7; the erasure-safe re-render (erase a third party
+//!     → tombstone on next render, 0 recoverable PII, no durable snapshot, re-resolves live) — CHAT-D6;
+//!     and the `#sub` anchor stability (an edited `message-<id>` embed stays live, a deleted one
+//!     degrades to a root tombstone, never dangles) — CHAT-D18. The cache-TTL backstop is a
+//!     measured-not-predicted tunable (R-C4), never a separate milestone.
 //!
 //! **Owning architecture doc:**
 //! `planning/04-subsystem-architectures/chat/architecture/03-events-contracts-and-glue.md` §1 (the

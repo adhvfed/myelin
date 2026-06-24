@@ -356,7 +356,16 @@ cdc = [
 row = "2.7"
 title = "crypto-shred / tombstone on the log"
 status = "covered"
-cdc = ["crates/myelin-events/tests/cdc_2_7_bus_holder.rs"]
+# CHAT-P14 / P-408 (M4-C4): the Chat unfurl-invalidation CONSUMER of `*.erased` — an erasure tombstone
+# busts the shared per-ref projection cache (no durable snapshot; the cache re-resolves live → a
+# tombstone), so an erased third party rendered in a chat card produces a tombstone on next render with
+# 0 recoverable PII (the erasure-safe property, CHAT-D6). The provider models an `*.erased` envelope;
+# the consumer (`myelin_chat::unfurl::invalidation::UnfurlInvalidator`) busts the shared entry. The
+# chained 0-recoverable-PII drill is drill_chat_d6_d7_d18_invalidation.rs.
+cdc = [
+    "crates/myelin-events/tests/cdc_2_7_bus_holder.rs",
+    "crates/myelin-chat/tests/cdc_5_9_2_7_chat_unfurl_invalidation.rs",
+]
 
 [[contract]]
 row = "2.8"
@@ -509,6 +518,14 @@ cdc = [
     # + the resync fallback through the §10.2 survival-signal library. No transport here (the live
     # connection tier is the shared Chat M4 gateway, P-403) — Issues is the board CONSUMER.
     "crates/myelin-issues/tests/cdc_3_5_issues_board_sync.rs",
+    # CONSUMER leg — the Chat unfurl LIVE CARD-UPDATE push (CHAT-P14 / P-408, M4-C4, CHAT-D7): after a
+    # bus-bust, the invalidator publishes a live card-update frame on the bounded `channel:<id>` scope
+    # (never `*`) so a viewer showing the card re-resolves the fresh artifact within budget. The frame
+    # is a references-not-payloads pointer (the ref, never a rendered title — leak-free). The provider
+    # models the `*.updated`/`ci.check.updated` envelope; the consumer
+    # (`myelin_chat::unfurl::invalidation::LiveUnfurlInvalidator`) busts + pushes on the bounded scope.
+    # The CHAT-D7 live-bust drill is drill_chat_d6_d7_d18_invalidation.rs.
+    "crates/myelin-chat/tests/cdc_5_9_2_7_chat_unfurl_invalidation.rs",
 ]
 
 # 3.6 reactive/dispatch tier (EB-23 / P-143). OWNED by the Bus; built in myelin-query (the
@@ -1176,6 +1193,13 @@ cdc = [
     # stable id, no moved/outdated), and the tombstone ALWAYS carries the root. The CDC proves the
     # ladder outcomes map to leak-free cards.
     "crates/myelin-chat/tests/cdc_5_2_5_7_4_3_chat_unfurl.rs",
+    # CHAT-P14 / P-408 (M4-C4): the `#sub` anchor-stability half of 5.7 (CHAT-D18) — a `message-<id>`
+    # `#sub` is STABLE across edits (the id is immutable; the embed stays live), and degrades to a
+    # Tombstone carrying the ROOT (the channel) on delete/erase, NEVER dangling (the dangling-anchor
+    # signal = 0). The provider models the referenced message's lifecycle; the consumer
+    # (`myelin_chat::unfurl::invalidation::anchor`) maps it through the ONE ladder to a leak-free,
+    # dangle-free card. The CHAT-D6/D7/D18 chained drill is drill_chat_d6_d7_d18_invalidation.rs.
+    "crates/myelin-chat/tests/cdc_5_9_2_7_chat_unfurl_invalidation.rs",
 ]
 # CI-P25 / P-368 (M4) adds CI's owned `#sub` mints: `step-<n>` (jump-to-failure, resolves
 # `CheckStatus.details_ref`) + `check-<context>` + `L<a>-L<b>`, minted through the ONE refs codec
@@ -1395,6 +1419,14 @@ cdc = [
     # trust tier is carried verbatim). ISS-D12 complete (transition blocked + 0 pre-approval mutation).
     # The guard RESTS ON THE PROVEN X-1 SEAM (GIT-D10/CI-D8 GREEN end-to-end above) — not a doc claim.
     "crates/myelin-issues/tests/e2e_iss_p27_ci_guard.rs",
+    # CHAT-P14 / P-408 (M4-C4): the Chat unfurl-invalidation CONSUMER of `ci.check.updated` — chat
+    # consumes the frozen X-1 token for INVALIDATION ONLY (it busts the shared per-ref projection cache
+    # so a chat card showing the artifact re-resolves the fresh check state; it does NOT gate merges —
+    # that is Git). The provider models a real `ci.check.updated` envelope; the consumer
+    # (`myelin_chat::unfurl::invalidation::UnfurlInvalidator`) busts the shared entry idempotently
+    # (consumer_dedup, never `*`). The live-bust-within-budget + the re-resolve are proven in the
+    # CHAT-D7 drill (drill_chat_d6_d7_d18_invalidation.rs).
+    "crates/myelin-chat/tests/cdc_5_9_2_7_chat_unfurl_invalidation.rs",
 ]
 
 # ──────────────── §6 Search (myelin-search) ─────────────────────────────────────────────────────
