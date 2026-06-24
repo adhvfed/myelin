@@ -443,6 +443,71 @@ the thesis: backup/restore-verification before real tenant data, and the team's 
 - **No later-band gate is red** (the gate invariant holds end-to-end: a truth-up pass confirms every PROVEN row
   rests on a dated green artifact, never a doc claim; code-wins-over-docs, EI-01 §1).
 
+### M7 — Production readiness & security hardening (fill the floors; the fail-closed release gate)
+
+**Thesis:** M0..M6 deliberately shipped several production mechanisms as **documented EI-01 §1 structural
+floors** — correct in shape, honestly `Floor named:`, but not production-real — and the M6 dogfood loop is the
+cheapest, most honest place to surface that the named follow-ons ("P5/P6") were never ledger prompts. M7 is the
+post-dogfood band that **fills those floors with real implementations, proves each on real infrastructure with a
+SEPARATE verification prompt (a mock/model/dogfood never proves a production mechanism — EI-01 §3), and gates the
+platform's first production release fail-closed.** It runs AFTER M6 and BEFORE any real customer tenant data is
+admitted. The full per-finding disposition is the audit
+[`../07-prompts/production-readiness-audit.md`](../07-prompts/production-readiness-audit.md); the prompt bodies
+are [`../07-prompts/by-system/production-readiness.md`](../07-prompts/by-system/production-readiness.md)
+(P-522..P-546).
+
+**Work (the floors filled, each with its filling prompt):**
+- **Durable persistence** — bind the live OLTP/cache pool under Identity's in-memory principal/tuple/revocation
+  stores (P-522), verify crash/restart + multi-instance + no-in-memory-store-in-prod-graph (P-523).
+- **KMS / HSM** — back the L0 cell root with a durable HSM-class adapter; root never in process; destruction
+  permanent; rotation O(keys) (P-524); verify zeroization + no-resurrection-across-restore + no-key-leak (P-525).
+- **Real authentication cryptography** — OIDC JWKS / SAML XML-DSig / WebAuthn / SSH (P-526); signed
+  capability/machine tokens + DPoP proof + TPM attestation (P-527); verify no structural verifier in the prod
+  graph + expired-grants-cannot-authorize (P-528). These REMOVE `Structural{Verifier,TokenVerifier,TokenSigner,
+  AttestationVerifier}` from every production path.
+- **Real backup/restore** — WAL shipping + base backups + PITR + destructive clean-target restore (P-529);
+  verify MEASURED RPO ≤ 5min / RTO ≤ 1h-tenant / 4h-cell over real data at cell scale (P-530).
+- **Tenant isolation** — transaction-local `SET LOCAL` RLS + reset-on-release + identifier validation + mTLS +
+  region fail-fast on the live pool (P-531).
+- **Secret handling** — redacted Debug + secrecy/zeroize + no-Serialize-on-bearer sweep (P-532); verify
+  no-credential/key-in-any-sink (P-533).
+- **Supply chain & governance** — SHA-pin actions / digest-pin images / pin toolchain (P-534); cargo-deny
+  advisory+license (P-535); SBOM + signed provenance (P-536); reproducible builds (P-537); SECURITY.md +
+  CODEOWNERS + vuln-response (P-538).
+- **Production runtime** — real OS-signal drain + OpenTelemetry export + trace propagation (P-539).
+- **Gate integrity + truth-up** — required jobs fail-not-skip + mandatory mutation + immutable attestations
+  (P-540); re-run every band scorecard against the M7 production graph (P-541).
+- **External human blockers (recorded, not asserted)** — independent crypto + sandbox reviews + prod-image escape
+  drill (P-542); third-party penetration test + findings register (P-543).
+- **Sandbox production exec path** (corrected on re-audit, F4) — neither committed backend ran `JobSpec.command`
+  through its production `launch()` (Firecracker hardcoded `oneshot=true` → `init=/bin/true`; gVisor only probed
+  `runsc --version`). Implement the real microVM/runsc job runner so both backends execute `spec.command`,
+  enforce limits + timeout-whole-guest-kill, capture exit code + stdout/stderr, and meter only post-completion
+  (P-544); verify a real command runs end-to-end on BOTH backends AND re-run the AG-D4 corpus THROUGH the
+  production exec path (not the special harness) → 0 escapes on a real kernel (P-545).
+
+**Entry dependency:** M6 green (the platform is dogfooded and the M0..M6 gate invariant holds end-to-end).
+
+**Exit gate (the production-release done-bar — P-546, FAIL-CLOSED, RED by default):** the single release gate
+goes green if and ONLY IF all hold, computed mechanically from dated green artifacts (never a self-claim):
+**no structural/mock impl in the production dependency graph**; durable persistence + real crypto + real KMS +
+tenant-isolation + secret-handling + production-runtime gates all green; **the sandbox production exec path runs
+the real `spec.command` with no `oneshot`/`init=/bin/true`-only launch in the production graph, and the
+production-path escape drill is green (0 escapes) on both committed backends**; **a destructive production
+restore has been performed and RPO/RTO MEASURED over real data**; current dependency/advisory + license scans
+pass at release time; gates mechanically enforced + the truth-up pass has 0 red rows; **independent cryptography
++ sandbox + penetration reviews completed with 0 critical/high open, OR each open item explicitly recorded as a
+named external/human blocker with owner + rationale + sign-off**. Any single condition red ⇒ no production
+release; a threshold is never weakened to flip it.
+
+**The M7 gate invariant:** M7 is the only band whose exit gate is a release authorization, not a build
+boundary. The two permanent gates (AG-D4/CI-T1, STOR-D1/D2) still ratchet through M7 — and P-529 re-arms
+STOR-D1/D2 over the REAL restore driver, P-542 re-runs AG-D4/CI-T1 on the committed prod image, and **P-545
+re-arms AG-D4/CI-T1 over the production exec path** (the corpus run through the real `launch()`, not the special
+harness, now that P-544 makes the sandbox actually execute `spec.command`) — so M7 does not relax either
+permanent gate; it raises the bar from "green on the floor" to "green on the production mechanism" and from
+"green on a harness" to "green on the path real jobs use."
+
 ---
 
 ## 3. The critical path + the dependency DAG
@@ -533,6 +598,7 @@ band-boundary go/no-go, with the must-be-green-first ordering:
 | **M4 → M5** | GIT-D10/CI-D8 (**X-1 check seam, 0 double-merge**); CI-T1 re-green on the prod runner; CI-D4/D6/D7 (supply-chain + fork isolation); ISS-D2/D3 (board <1s + IDOR 0); CHAT-D1/D13/D14 (resume + co-commit + idempotent send). | X-1, escape, F1, F5 |
 | **M5 → M6** | The full F6 surge family (human lane holds, agent sheds, cross-tenant 0); GA-D1/CP-D7/CP-D8 (DSR fan-out 0-missed + multi-cell floors); **E2E-1..E2E-4 green**; STOR-D2 at cell scale. | F6, F3, the whole-system wedge |
 | **M6 done** | ISS-D14/CHAT-D19 switch tests; the self-hosting CI graph green; the truth-up pass confirms 0 red earlier gates. | the done-bar |
+| **M7 done (release)** | **P-546 fail-closed release gate green:** 0 structural/mock impl in the prod graph; durable-persistence + real-crypto + real-KMS + restore + tenant-isolation + secret + runtime gates green; **sandbox production exec path runs `spec.command` (no `init=/bin/true`-only launch) + AG-D4 corpus through the prod path = 0 escapes on both backends**; destructive restore performed + RPO/RTO MEASURED over real data; advisory+license scans pass at release; truth-up 0 red; independent crypto/sandbox/pentest reviews 0 critical/high open or recorded as named human blockers. | the production-release done-bar |
 
 **The two permanent gates** (re-run forever, never "done"): **AG-D4 / CI-T1** (re-run on every backend/image/
 kernel change — one escape is catastrophic) and **STOR-D1/STOR-D2** (the restore-verify CI job runs on every
@@ -558,6 +624,13 @@ and its follow-on-band:
 | **GIN-indexed JSONB facet scan** (Issues/KN custom fields) | M3/M4 | **Generated projection-feeder index** (promoted per facet) | M5 | a facet in > 5% of view executions, *measured* (OQ-C) |
 | **Single-region event log** (general-purpose DB) | M0 | **Column-store/time-series seam** for highest-volume streams | post-M5 | event volume *measured* to outgrow the DB (EI-04 §5); not before |
 | **The `[OPEN — LEGAL]` erasure residual posture** (structural floor built, residual flagged) | M1→M5 | **Counsel/DPO ratification** of the one residual lawful-basis statement (10.9, X-7) | parallel (legal) | the structural floor ships regardless; the residual is one ratified statement, not five |
+| **In-memory principal/tuple/revocation stores** (model the SQL S1/S3/S7 tables; the executed-code floor, audit F6) | M1 (Identity) | **Live OLTP/cache pool binding** (real Postgres + Valkey behind the unchanged store surface) | **M7 (P-522, verify P-523)** | first production deployment; the floor note ("until the driver lands P-S15") was never a real follow-on prompt |
+| **`StructuralVerifier`/`StructuralTokenVerifier`/`StructuralTokenSigner`/`StructuralAttestationVerifier`** (parse envelopes, no crypto; audit F2) | M1 (Identity) | **Real credential + token cryptography** (OIDC JWKS / SAML XML-DSig / WebAuthn / SSH; signed PASETO/biscuit tokens + DPoP proof + TPM attestation) | **M7 (P-526/P-527, verify P-528)** | first production deployment; the "P5/P6 follow-on" in the code/roadmaps was a planning-phase label, not a ledger prompt |
+| **Software-floor KMS root** (`CellRoot` process-held; audit F7) | M1 (Storage) | **Durable HSM-class KMS adapter** (root never in process, Shamir-split recovery, destruction permanent) + zeroization | **M7 (P-524, verify P-525)** | first production deployment; real-HSM physical keying ceremony is a named external/human blocker on P-544 |
+| **Modeled-WAL backup/restore** (abstract `WalOffset`; modeled clean target; audit F8) | M1 (Storage) | **Real WAL shipping + base backups + PITR + destructive clean-target restore** (`pg_basebackup`/`pg_restore`) + MEASURED RPO/RTO | **M7 (P-529, verify P-530)** | first production deployment; re-arms STOR-D1/D2 over the real driver |
+| **Unpinned supply chain + absent governance** (tag-pinned actions/images, no cargo-deny/SBOM/SECURITY.md; audit F11) | (pre-M7) | **SHA/digest pinning + cargo-deny + SBOM/provenance + reproducible builds + SECURITY.md/CODEOWNERS** | **M7 (P-534..P-538)** | first production deployment; the license allowlist + staffed security owners are named human prerequisites |
+| **Sandbox boot-smoke launch, no job exec** (Firecracker `launch()` hardcodes `oneshot=true` → `init=/bin/true`, `firecracker.rs:327-328`; gVisor `spawn_real_runsc` probes `runsc --version` only, `gvisor.rs:227-237`; neither runs `JobSpec.command` in production; escape drills pass only on special harnesses; audit F4) | M2 (CI/agent, the hardening posture + drill harness) | **Real microVM/runsc job runner** (both backends execute `spec.command`, enforce limits + timeout-whole-guest-kill, capture exit code + stdout/stderr, meter only post-completion) + **production-path escape drill** (AG-D4 corpus through the real `launch()`, 0 escapes on both backends) | **M7 (P-544, verify P-545)** | first production deployment; the boot self-test keeps its `oneshot` path; re-arms AG-D4/CI-T1 over the production exec path |
+| **Mock agent runtime** (re-stated: `--use-mock`) | M2 | **`LlmAgentRuntime`** (real adapter) | post-M5 / execution (P-481 names the swap; the swap itself is a config/impl change, gated by the M7 release gate's "no mock in the prod graph" condition) | after AG-D4/D2/D3/D5 green |
 
 **The honest-floor rule binds all of these:** each floor is tracked in the gap report with its claimed/proven
 status and its linked follow-on; the gap being *invisible* is the only failure (EI-04 §4). KN-D1 is deliberately
@@ -585,6 +658,13 @@ drilled.
 - **M5 — World-scale hardening + the floor follow-ons + the E2E wedge:** CRDT, object-backed packs, multi-cell,
   full DSR fan-out; the 30× surge family; the four whole-system chained-mutation E2E scenarios.
 - **M6 — Dogfooding:** Myelin hosts itself (one self-hosting CI graph; the switch tests driven in a browser).
+- **M7 — Production readiness & security hardening:** fill the executed-code floors (live OLTP/cache stores, real
+  credential+token cryptography, HSM-class KMS, real WAL/PITR backup-restore, transaction-local RLS, secret
+  zeroization, supply-chain pinning/cargo-deny/SBOM/SECURITY.md, OS-signal runtime, AND — corrected on re-audit —
+  the **real sandbox JobSpec.command execution path** for both Firecracker + gVisor, neither of which ran
+  `spec.command` in production), each impl + a separate verification prompt; the truth-up pass; the recorded
+  external/human blockers (HSM ceremony, independent crypto/sandbox audits, third-party pentest); and the single
+  FAIL-CLOSED production-release gate (P-546).
 
 **The critical path:** harness+outbox+lints (M0) → Identity+restore-verify+tenancy (M1) → agent fabric+workflow+
 firehose transport+**AG-D4 sandbox-escape GATE** (M2) → Git pseudonymous commits + merge gate (M3) → CI
