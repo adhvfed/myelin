@@ -35,6 +35,7 @@ fn conv_row(tenant: &TenantId, region: &Region, id: &str, kind: ConversationKind
         retention_days: Some(90),
         archived: false,
         created_by: "psn:creator".into(),
+        acl_zookie: None,
     }
 }
 

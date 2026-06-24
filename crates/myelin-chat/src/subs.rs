@@ -91,6 +91,17 @@ fn thread_root(tenant: &str, thread_root_id: &str) -> Result<ArtifactRef, ParseE
     myelin_refs::parse(&format!("myelin://{tenant}/chat/thread/{thread_root_id}"))
 }
 
+/// Build chat's canonical **channel root** `myelin://<tenant>/chat/channel/<channel_id>` (architecture
+/// §2 — a Conversation of any kind is the root Chat authz object `channel`). A channel carries no
+/// `#sub` (it is a root artifact, not a sub-anchor), so this returns the bare root ref. Public because
+/// the CHAT-P8 membership module mints THIS ref as both the `chat.channel.*` event subject AND the
+/// ReBAC `channel:<id>` object the membership tuple is written against — one canonical channel ref
+/// language, never a second spelling (EI-01 §7). An empty `channel_id` is rejected LOUDLY by the Refs
+/// grammar.
+pub fn mint_channel(tenant: &str, channel_id: &str) -> Result<ArtifactRef, ParseError> {
+    myelin_refs::parse(&format!("myelin://{tenant}/chat/channel/{channel_id}"))
+}
+
 /// Mint a **single-message** sub-URN `…/chat/message/<message_id>#message-<message_id>` (contract 5.7,
 /// `message-` kind). The opaque body is chat's **immutable `message_id` ULID** (the stability
 /// obligation is chat's, §2 — the id does not change when the message is edited, so the `#sub` survives
