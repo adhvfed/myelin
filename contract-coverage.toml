@@ -462,6 +462,15 @@ cdc = [
     # resync_required -> a range-read of the sealed segments (the durable archive, never lost). The
     # CI-D11 drill (drills_ci_p21_live_tail.rs) proves 0 lost lines + the bounded-scope rejection.
     "crates/myelin-ci-controlplane/tests/cdc_live_tail_3_5_11_8.rs",
+    # CONSUMER leg — Issues' real-time board sync (ISS-P30 / P-397) rides this SAME frozen protocol:
+    # `myelin_issues::BoardSync` subscribes/resumes on the bounded `board:<id>` scope (never `*` — the
+    # OQ-J co-designed huge-board case, paginated to the visible window + margin via the substrate's
+    # ScopeWindow); optimistic local updates + bus-driven cache invalidation; a reconnect backfills
+    # (last_seq, now] then live (0 ops lost — ISS-D13); an over-window cursor -> resync_required -> a
+    # full *.snapshot replay (NAMED). The ISS-D13 drill (drill_iss_d13_board_sync.rs) proves 0 ops lost
+    # + the resync fallback through the §10.2 survival-signal library. No transport here (the live
+    # connection tier is the shared Chat M4 gateway, P-403) — Issues is the board CONSUMER.
+    "crates/myelin-issues/tests/cdc_3_5_issues_board_sync.rs",
 ]
 
 # 3.6 reactive/dispatch tier (EB-23 / P-143). OWNED by the Bus; built in myelin-query (the

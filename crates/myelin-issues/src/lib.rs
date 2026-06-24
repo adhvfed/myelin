@@ -264,6 +264,7 @@
 
 pub mod agent_spend;
 pub mod app;
+pub mod board_sync;
 pub mod ci_guard;
 pub mod content;
 pub mod cost_bounder;
@@ -465,6 +466,18 @@ pub use views::{
     board_and_roadmap_share_row, edit_on_board_reflects_on_roadmap, type_rank_split_is_partition,
     IssueView, RowProjection, ViewFloors, BOARD_TYPE_RANK_MAX, CYCLE_FIELD, ORDER_KEY_FIELD,
     ROADMAP_TYPE_RANK_MIN, STATE_CATEGORY_FIELD, TYPE_RANK_FIELD,
+};
+
+// ISS-P30 (P-397, M4): the real-time board sync over the firehose resume-cursor protocol (the
+// ISS-D13 zero-ops-lost-on-reconnect gate). `board_sync` is the Issues-layer CONSUMER of the ONE
+// frozen Bus-owned firehose protocol (`myelin_events::Firehose` — subscribe/resume/resync_required,
+// contract 3.5) + the substrate's paginated bounded scope (`ScopeWindow`, never `*`): optimistic
+// local updates + bus-driven cache invalidation; a reconnect backfills (last_seq, now] then live
+// (0 ops lost); a past-window cursor → resync_required → a full *.snapshot replay (NAMED). The sync
+// floor (R-8 offline/local-first) is the named follow-on; the real connection tier is P-403.
+pub use board_sync::{
+    board_stream, BoardCache, BoardCard, BoardOp, BoardSync, BoardSyncFloors, LocalMutationError,
+    BOARD_FIREHOSE_STREAM_PREFIX,
 };
 
 // ISS-P29 (P-396, M4): the governance admin views S13–S18 (the M4-I7 admin-views slice). The

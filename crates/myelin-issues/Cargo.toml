@@ -134,6 +134,13 @@ tokio = { workspace = true, optional = true }
 # frozen engine, never re-define it.
 [dev-dependencies]
 myelin-identity-service = { path = "../myelin-identity-service" }
+# ISS-P30 (P-397, M4): the §10.2 firehose survival-signal assertion library
+# (`SignalSource`/`Predicate`/`SignalName::{FirehoseFrameLag, ResyncRequiredCount}`) the ISS-D13
+# board-sync drill (drill_iss_d13_board_sync.rs) asserts its 0-ops-lost + resync-fired green artifact
+# through — the SAME frozen library the EB-21 D-10 firehose drill uses (the firehose owns the
+# measurement; the harness owns the assertion vocabulary). DEV-only: a test-support failure-injection
+# crate, never a production DAG node (the same posture events/substrate carry).
+myelin-harness = { path = "../myelin-harness" }
 # Note: `myelin-storage` is now a REGULAR dependency (above) — ISS-P07 seals the free-text columns
 # with the shared `ColumnCryptor` at RUNTIME (the per-subject-DEK write path), so the edge is no
 # longer test-only.
