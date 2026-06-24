@@ -101,6 +101,17 @@ const EXCLUDED_SUBSTRINGS: &[&str] = &[
     // honours the two-transport split. NAMED, LOUD exclusion (see the module note in
     // log_pipeline.rs), never a silent skip — the lint stays live on every durable-bus call site.
     "myelin-ci-controlplane/src/log_pipeline.rs",
+    // The CHAT FIREHOSE-ONLY LIVE-DELIVERY surface (CHAT-P10 / P-404): `LiveDelivery::deliver` calls
+    // `firehose.publish(stream=fan.<tenant>, scope=channel:<id>, frame)` — the EPHEMERAL live
+    // message/presence/typing/read-state/partial frames the arch sites FIREHOSE-ONLY (02 §7 / 03 §1.2
+    // / ADR-04.5), a references-not-payloads message-id/op pointer, NOT an outbox-emitted durable
+    // event. There is NO durable-bus handle in the module (the live frame cannot reach the durable
+    // bus by construction); the durable `chat.message.created` is the Message Service's
+    // outbox-co-committed write, never the gateway's (arch §9 — the gateway has no emit path).
+    // Exactly the two-transport-split posture as transport.rs / log_pipeline.rs / firehose.rs. NAMED,
+    // LOUD exclusion of this ONE file (see the module note in delivery.rs); the lint stays fully live
+    // on every other gateway file (the shed governor + the frame builders carry no `.publish(`).
+    "myelin-chat-gateway/src/delivery.rs",
     "myelin-harness/src/bin/sub-m0-scorecard.rs",
     "myelin-harness/src/bin/id-m1-scorecard.rs",
     // The infra integration exit-gate runner (Stage 4): same posture as the two runners above —

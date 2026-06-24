@@ -59,6 +59,12 @@
 
 #![forbid(unsafe_code)]
 
+pub mod delivery;
+pub mod shed;
+
+pub use delivery::{DeliveryOutcome, LiveDelivery, LiveFrame};
+pub use shed::{LiveSurface, ShedGovernor, ShedVerdict};
+
 use myelin_chat::glue::{chat_channel_scope, Te21LanguagePin, CHAT_FIREHOSE_STREAM_PREFIX};
 use myelin_chat::membership::permissions;
 // The chat subsystem's PUBLIC contract surface (the top-level re-exports — never the private
@@ -218,6 +224,12 @@ where
     /// connections off this. Liveness is never checked here (it is the orchestrator's restart input;
     /// a dependency outage flips READINESS, never liveness — no restart-storm).
     health: MetricsHealthSurface<H>,
+    /// **The per-tenant protected-human-lane shed governor (CHAT-P10; ADR-16 / OQ-K / contract
+    /// 1.11).** The connection-storm + agent-mention-storm budget chat OWNS: under storm pressure it
+    /// sheds speculative/presence first and the human message lane LAST (humans never queue behind
+    /// agent runs, VISION §3). Consulted by the live-delivery surface ([`Self::live_delivery`]) before
+    /// every firehose publish. Holds NO durable state.
+    shed: ShedGovernor,
 }
 
 impl<I, S, H> ChatGateway<I, S, H>
@@ -236,7 +248,39 @@ where
             store,
             firehose,
             health,
+            shed: ShedGovernor::new(),
         }
+    }
+
+    /// **The per-tenant protected-human-lane shed governor (read; CHAT-P10 / contract 1.11).** A drill
+    /// reads the in-flight depths / the under-pressure flag (the shed-count green artifact); the
+    /// connection-storm signal flips pressure via [`Self::shed_mut`].
+    pub fn shed(&self) -> &ShedGovernor {
+        &self.shed
+    }
+
+    /// The shed governor (mutable) — the connection-storm signal flips storm pressure here; a drill
+    /// drives the per-surface in-flight depths to prove the shed order holds.
+    pub fn shed_mut(&mut self) -> &mut ShedGovernor {
+        &mut self.shed
+    }
+
+    /// Replace the shed governor (the production form reads the OQ-K budgets from the thresholds file
+    /// via [`ShedGovernor::from_thresholds`]; a drill installs a small deterministic budget to drive
+    /// the storm boundary). The governor holds no durable state — swapping it is a config swap.
+    pub fn set_shed_governor(&mut self, shed: ShedGovernor) {
+        self.shed = shed;
+    }
+
+    /// **The firehose-ONLY live-delivery surface, shed-order-gated (CHAT-P10; arch §1.2 / §7;
+    /// contracts 3.5 / 1.11).** Borrows the firehose transport + the shed governor as a
+    /// [`LiveDelivery`]: every live frame (message/presence/typing/read-state/partial) is published on
+    /// the EPHEMERAL firehose (never the durable bus) AFTER the protected-human-lane shed order admits
+    /// it. The gateway has no emit path (arch §9) — this is the EPHEMERAL pointer fan-out, not a
+    /// durable write; the durable `chat.message.created` is the Message Service's outbox-co-committed
+    /// write.
+    pub fn live_delivery(&mut self) -> LiveDelivery<'_> {
+        LiveDelivery::new(&mut self.firehose, &mut self.shed)
     }
 
     /// The readiness verdict the gateway gates new connections on (contract 1.3). Exposed so a drill
