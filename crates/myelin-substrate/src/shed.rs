@@ -378,6 +378,18 @@ pub enum Surface {
     /// tenant's agent storm never sheds another's humans (the per-tenant bulkhead, §6.2). Human-facing
     /// (a human creating a reference interactively is shed last).
     RefsRefCreate,
+    /// **The Search QUERY surface** — the permission-filtered search query path at world-scale
+    /// (SRCH-D6, Search architecture §6.3). The 30× surge is agent/CI search (an agent fan-out + a CI
+    /// run-log query storm); a CI/agent query storm sheds (`429 + Retry-After`) BEFORE a human's
+    /// interactive search, which holds the protected lane (a human's interactive search latency stays
+    /// within budget while the machine lanes shed). Per-tenant in-flight caps keep one tenant's agent
+    /// query storm off another tenant's humans (the per-tenant bulkhead, §6.1/§6.2). This is the
+    /// surface the Search surge gate (SRCH-P25) admits queries against, per-tenant. Human-facing (a
+    /// human's interactive search is shed last). The shed is a pre-query admission decision (it refuses
+    /// an over-budget query cheaply BEFORE any `list_objects` resolution / index traversal runs), so a
+    /// shed query returns `429` and never a partial/leaked result — the permission pre-filter still
+    /// gates every query that IS admitted (the §4.2 zero-escape invariant is untouched under shed).
+    SearchQuery,
     /// The generic HTTP intake queue (§7.1) — every public surface's request intake.
     HttpIntake,
 }
@@ -400,6 +412,7 @@ impl Surface {
             | Surface::GitFrontDoor
             | Surface::RefsBacklinkRead
             | Surface::RefsRefCreate
+            | Surface::SearchQuery
             | Surface::HttpIntake => true,
         }
     }
@@ -492,6 +505,16 @@ impl ShedBudgetTable {
                 retry_after_secs: 5,
             },
         );
+        // Search query (SRCH-P25, SRCH-D6): a CI/agent search-query storm sheds before a human's
+        // interactive search — a reserved human fraction protects the human search lane.
+        rows.insert(
+            Surface::SearchQuery,
+            SurfaceBudget {
+                per_tenant_in_flight_cap: 160,
+                human_lane_reservation: 40,
+                retry_after_secs: 3,
+            },
+        );
         // The generic HTTP intake (§7.1): every public surface reserves a human fraction.
         rows.insert(
             Surface::HttpIntake,
@@ -536,6 +559,7 @@ impl ShedBudgetTable {
             Surface::GitFrontDoor,
             Surface::RefsBacklinkRead,
             Surface::RefsRefCreate,
+            Surface::SearchQuery,
             Surface::HttpIntake,
         ] {
             if let Some(b) = self.rows.get(&surface) {
@@ -954,6 +978,7 @@ mod tests {
             Surface::GitFrontDoor,
             Surface::RefsBacklinkRead,
             Surface::RefsRefCreate,
+            Surface::SearchQuery,
             Surface::HttpIntake,
         ] {
             let b = table.budget(surface);
@@ -989,6 +1014,8 @@ mod tests {
                 > 0
         );
         assert!(table.budget(Surface::RefsRefCreate).human_lane_reservation > 0);
+        // The Search query surface protects a human lane (a human's interactive search is shed last).
+        assert!(table.budget(Surface::SearchQuery).human_lane_reservation > 0);
     }
 
     // ---- P-S33: the tuned-budget human-lane floor (you cannot tune a human lane into starvation) ---
@@ -1011,6 +1038,7 @@ mod tests {
             Surface::GitFrontDoor,
             Surface::RefsBacklinkRead,
             Surface::RefsRefCreate,
+            Surface::SearchQuery,
             Surface::HttpIntake,
         ] {
             let b = table.budget(surface);
