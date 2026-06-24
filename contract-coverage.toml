@@ -575,6 +575,13 @@ cdc = [
   "crates/myelin-knowledge/tests/cdc_4_2_4_10_knowledge_per_op_authority.rs",
   "crates/myelin-issues/tests/drill_iss_p06_emit_iff_committed.rs",
   "crates/myelin-chat/tests/cdc_4_6_4_10_4_9_chat_membership.rs",
+  # CHAT-P13 / P-407 (M4-C4): the Chat Unfurl Service's per-viewer gate
+  # (`myelin_chat::unfurl::UnfurlService`) gates EVERY unfurl on `check(viewer, read, channel,
+  # Strong)` BEFORE the shared cache / the resolver is touched (fail-closed; a denied viewer's title is
+  # never fetched — the no-leak chokepoint). The CDC proves a member sees the projection, a non-member
+  # tombstones (0 title leak), and the chained revoke→tombstone (the standalone CHAT-D5 drill is
+  # drill_chat_d5_unfurl_no_leak.rs).
+  "crates/myelin-chat/tests/cdc_5_2_5_7_4_3_chat_unfurl.rs",
 ]
 
 [[contract]]
@@ -624,6 +631,14 @@ cdc = [
   "crates/myelin-knowledge/tests/cdc_4_3_knowledge_list_pushdown.rs",
   "crates/myelin-knowledge/tests/cdc_13_3_4_3_knowledge_rollup.rs",
   "crates/myelin-ci-controlplane/tests/cdc_4_3_ci_list_pushdown.rs",
+  # CHAT-P13 / P-407 (M4-C4) adds the CHAT consumer half: the unfurl service's
+  # membership-as-permission class precompute (`myelin_chat::unfurl::precompute_visibility_class`)
+  # lowers the returned `Filter{set_expr}` over chat's OWN `unfurl_candidate.object_id` column (§4.3 /
+  # §7.3 / OQ-E) into ONE leak-free JOIN (the `authz_visible` JOIN, no N+1, no post-filter) — one class
+  # decision for a channel full of refs, not N checks. The chat consumer CDC proves chat lowers the
+  # FROZEN SetExpr variants exactly + the leak-free / revoke-reflected candidate set against the REAL
+  # `ListObjects` producer; the in-memory `authz_visible` model is the SAME JOIN semantics + watermark.
+  "crates/myelin-chat/tests/cdc_5_2_5_7_4_3_chat_unfurl.rs",
 ]
 
 [[contract]]
@@ -960,6 +975,15 @@ cdc = [
     "crates/myelin-git/tests/cdc_5_1_5_2_5_6_git_project.rs",
     "crates/myelin-git/tests/cdc_5_2_7_3_7_1_git_humanise_resolve.rs",
     "crates/myelin-knowledge/tests/cdc_5_2_knowledge_sync_block.rs",
+    # CHAT-P13 / P-407 (M4-C4) adds the CHAT CONSUMER half of 5.2: the Unfurl Service
+    # (`myelin_chat::unfurl::UnfurlService`) calls the `resolve(ref, viewer, Display)` chokepoint over
+    # the [`RefsResolvePort`] on a cache miss, and runs the per-viewer gate FIRST so a denied viewer's
+    # title is NEVER fetched (the no-leak chokepoint). The 4-step ladder (live/gone/erased) maps to
+    # leak-free cards; the tombstone always carries the root. The CDC pins the consumer over the REAL
+    # `check`/`list_objects` engines (the synthetic resolver models the REF-P10 / CHAT-P15 resolver
+    # floor); the standalone CHAT-D5 no-leak drill (drill_chat_d5_unfurl_no_leak.rs) proves 0 title
+    # leak + the chained revoke→tombstone.
+    "crates/myelin-chat/tests/cdc_5_2_5_7_4_3_chat_unfurl.rs",
 ]
 
 [[contract]]
@@ -1147,6 +1171,11 @@ cdc = [
     # provider+consumer pair classifies every mint to its declared kind + strips it to the root, and
     # PROVES the 4-step ladder over the mints (a confidential viewer of a #sub gets a tombstone).
     "crates/myelin-issues/tests/cdc_5_4_5_5_5_6_5_7_5_3_6_3_issues_refs_glue.rs",
+    # CHAT-P13 / P-407 (M4-C4): the Chat Unfurl Service CONSUMES the 4-step tombstone ladder (5.7) —
+    # for a chat ref the producible outcomes are live/gone/erased (a message is content-addressed by a
+    # stable id, no moved/outdated), and the tombstone ALWAYS carries the root. The CDC proves the
+    # ladder outcomes map to leak-free cards.
+    "crates/myelin-chat/tests/cdc_5_2_5_7_4_3_chat_unfurl.rs",
 ]
 # CI-P25 / P-368 (M4) adds CI's owned `#sub` mints: `step-<n>` (jump-to-failure, resolves
 # `CheckStatus.details_ref`) + `check-<context>` + `L<a>-L<b>`, minted through the ONE refs codec
