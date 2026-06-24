@@ -608,6 +608,38 @@
 //! integration proofs are owned store-side: Storage STOR-D3/STOR-D4 at cell scale). The **world-scale
 //! 30× load** of the whole-cell SCHED drill is the one remaining real-fleet floor (VISION).
 
+//! ## P-GA-36 (→ P-452) — the outbound push-mirror residency gate (GA-11, deny extra-EU by default)
+//! [`outbound_mirror_gate`] ships the **GA-11 outbound push-mirror residency gate** (gdpr §5.3) —
+//! COMPLETING the `transfer_allowed` policy floor P-GA-23 named (the Git mirror SEAM proven at M5).
+//! The genuinely-new piece is the §5.3 **within-EU-acceleration-vs-extra-EU-replication distinction
+//! made first-class on the GDPR policy side**: [`outbound_mirror_gate::OutboundMirrorGate::decide`]
+//! over an [`outbound_mirror_gate::OutboundConfig`] (a [`outbound_mirror_gate::OutboundConfigKind::
+//! PushMirror`] replication vs a [`outbound_mirror_gate::OutboundConfigKind::CdnClone`] acceleration,
+//! the Storage 11.2 class) — a **PII-bearing extra-EU push-mirror is DENIED by default**, a
+//! **within-EU CDN clone is ALLOWED**, an extra-EU "CDN clone" is a disguised replication (denied),
+//! and an extra-EU push-mirror flips to allowed ONLY with a recorded `transfer_allowed` mechanism. It
+//! REUSES the EXISTING [`registries::TransferGate`] region-policy + [`registries::is_eea_region`]
+//! WHOLESALE (EI-01 §7 — no second `transfer_allowed`, no re-derived EU/EEA boundary; the
+//! control-plane enforcement gate `myelin_control_plane::MirrorGate` + the Storage flag
+//! `myelin_storage::PushMirrorClass` are reused, not duplicated). The green artifact is
+//! [`outbound_mirror_gate::OutboundMirrorGate::extra_eu_pii_transfers_blocked`] = the count blocked —
+//! **0 default extra-EU PII transfers** slip through. **GA-11** emits its dated green artifact in
+//! `tests/ga_11_outbound_mirror_residency_gate.rs`; the CDC pair for 10.5 (the control-plane
+//! enforcement gate reading this policy) is `tests/cdc_10_5_outbound_mirror_gate.rs`. **Floor named:**
+//! the **residual** — an independent off-platform clone a third party ALREADY HOLDS — is named, not
+//! pretended-solved (§1 / §5.3): the gate prevents NEW extra-EU PII replication, it cannot recall a
+//! copy already physically held elsewhere; the counsel-ratified `transfer_allowed` entries are
+//! **`[OPEN — LEGAL]`** (Schrems II / Art. 44–49), a parallel legal track. **No `--features
+//! integration` leg owed:** the gate is a pure decision over the already-shipped [`registries::
+//! TransferGate`] policy — it touches NO new DB / object-store / cache / bus contract (the
+//! control-plane enforcement landing is Tenancy's wire, proven by the CDC pair; the within-EU CDN
+//! clone blob class is Storage's, its own live-stack proof owned storage-side, P-255). **Mutation
+//! floor (P-GA-36 TESTS — the deny-by-default + the within-EU-vs-extra-EU distinction are
+//! mandatory-core):** [`outbound_mirror_gate::OutboundMirrorGate::decide`] (the four-branch decision),
+//! [`outbound_mirror_gate::OutboundConfig::pii_bearing`] (the PII-free allow + fail-closed default),
+//! and the [`outbound_mirror_gate::OutboundMirrorGate::extra_eu_pii_transfers_blocked`] count; the
+//! `cargo mutants` score is in the commit body.
+
 pub mod agent_trace_seam;
 pub mod audit;
 pub mod audit_proofs;
@@ -628,6 +660,7 @@ pub mod holders;
 pub mod issues_chat_instance;
 pub mod multi_cell;
 pub mod orchestration;
+pub mod outbound_mirror_gate;
 pub mod posture;
 pub mod producer_holders;
 pub mod registries;
@@ -728,6 +761,10 @@ pub use orchestration::{
     canonical_phase_of, holder_ids, CanonicalErasePhase, EraseChecklist, HolderReceipt,
     RegisteredHolder, SeamHolder, UpstreamHolderOrchestrator, CRYPTO_SHRED_LAG,
     ERASURE_FANOUT_COVERAGE,
+};
+pub use outbound_mirror_gate::{
+    OutboundAllowReason, OutboundConfig, OutboundConfigKind, OutboundDecision, OutboundDenyReason,
+    OutboundMirrorGate, OUTBOUND_MIRROR_PII_TRANSFERS_BLOCKED,
 };
 pub use posture::{
     reference_is_by_reference, restatement_markers, ErasurePosture, LegalStatus, StructuralLever,
