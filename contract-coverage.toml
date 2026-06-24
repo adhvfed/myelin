@@ -2243,9 +2243,14 @@ status = "covered"
 # hot-tier consumer (the partitioned `message` table), proven DB-free over the in-memory tier and —
 # behind the `integration` feature — against the LIVE dev-stack Postgres
 # (crates/myelin-chat/tests/integration_chat_p4_message_store.rs, the named live drill).
+# CHAT-P7 / P-401 adds the Chat Conversation/Membership CONSUMER leg: the Conversation entity + the
+# membership rows are OLTP-tier rows on the SAME `(tenant, region)` partition (the
+# `membership_by_principal` conversation-list index S1 is residency-pinned), proven DB-free over the
+# in-memory tier (crates/myelin-chat/tests/cdc_11_1_12_1_chat_conversation_consumer.rs).
 cdc = [
     "crates/myelin-storage/tests/cdc_11_1.rs",
     "crates/myelin-chat/tests/cdc_11_1_11_2_12_1_chat_store_consumer.rs",
+    "crates/myelin-chat/tests/cdc_11_1_12_1_chat_conversation_consumer.rs",
 ]
 
 [[contract]]
