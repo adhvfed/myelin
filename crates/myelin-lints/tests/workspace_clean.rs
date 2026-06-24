@@ -12,7 +12,7 @@
 //!   contain the forbidden tokens as DATA (the strings the scanner looks for). Scanning the lint
 //!   crate would flag its own pattern lists. Excluded and named.
 //! - `**/tests/**` and `**/fixtures/**` — test fixtures deliberately contain red samples.
-//! - `myelin-harness/src/bin/{sub-m0,id-m1,infra,m2}-scorecard.rs` — the band-boundary exit-gate
+//! - `myelin-harness/src/bin/{sub-m0,id-m1,infra,m2,m3,m4}-scorecard.rs` — the band-boundary exit-gate
 //!   runners (the SUB-M0 runner, P-S24 → P-039; the Identity M1→M2 runner, P-ID-21 → P-079; the
 //!   infra integration runner, Stage 4; the M2 reactive-layer runner, M2 → M3):
 //!   CI/test-support ORCHESTRATION tooling in the leaf test-support crate `myelin-harness` (NOT a
@@ -58,6 +58,7 @@ const EXCLUDED_SUBSTRINGS: &[&str] = &[
     "myelin-harness/src/bin/infra-scorecard.rs", // the infra integration exit-gate runner (Stage 4): same legitimate host-exec site (spawns `cargo test --features integration` per drill).
     "myelin-harness/src/bin/m2-scorecard.rs", // the M2 reactive-shared-layer exit-gate runner (M2→M3): same legitimate host-exec site (spawns `cargo test`/`cargo run` per drill; AG-D4 with MYELIN_REQUIRE_KVM=1 so a real microVM must boot).
     "myelin-harness/src/bin/m3-scorecard.rs", // the M3 producer-subsystems exit-gate runner (M3→M4): same legitimate host-exec site (spawns `cargo test`/`cargo run` per Git+Knowledge drill, incl. the GIT-D10/D11-int + KN-D5/D7/D9/D10 `--features integration` rows against the live stack).
+    "myelin-harness/src/bin/m4-scorecard.rs", // the M4 consumer-subsystems exit-gate runner (M4→M5): same legitimate host-exec site (spawns `cargo test`/`cargo run` per CI+Issues+Chat drill, incl. the AG-D4/CI-T1 prod-image re-confirm with MYELIN_REQUIRE_KVM=1 so a real microVM must boot + the STOR-D1/D2 restore-verify `--features integration` rows against the live stack).
     "myelin-ci-sandbox/src/firecracker.rs", // the Firecracker default backend (CI-P2 → P-237): the ONE legitimate VMM-spawn site — spawning `firecracker --no-api --config-file` IS how the unified-sandbox boundary is CREATED (the seam's enforcement mechanism), not a bypass of it. Exactly analogous to the relay's broker-publish site. NAMED, LOUD (see firecracker.rs); the routing split (mutation→EffectApi) is unweakened.
     "myelin-ci-sandbox/src/gvisor.rs", // the gVisor `runsc` named-second backend (CI-P2 → P-237): the ONE legitimate runtime-spawn site — same posture as firecracker.rs (the seam's mechanism, not a bypass). NAMED, LOUD.
     "myelin-lints/",                   // this crate: scanners + fixtures carry the tokens as data.
