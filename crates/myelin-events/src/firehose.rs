@@ -683,6 +683,16 @@ impl Firehose {
         Firehose::with_limits(RetentionWindow::DEFAULT_FRAMES, DEFAULT_INFLIGHT_CAP)
     }
 
+    /// A firehose sized for a [`crate::retention::StreamClass`] — the MEASURED per-class retention
+    /// window (EB-30 / P-439, D-10-measured, recorded in `thresholds.toml`) + the default in-flight
+    /// cap. This is the production constructor for a given stream class: it replaces the generous-but-
+    /// named [`RetentionWindow::DEFAULT_FRAMES`] placeholder with the class's measured window so a
+    /// routine reconnect backfills from the window rather than falling to the `resync_required` cold
+    /// path (§4.3 "the window must exceed the p99 reconnect gap").
+    pub fn for_stream_class(class: crate::retention::StreamClass) -> Firehose {
+        Firehose::with_limits(class.window_frames(), DEFAULT_INFLIGHT_CAP)
+    }
+
     /// A firehose with an explicit retention-window capacity + in-flight cap (the D-10 drill drives a
     /// SMALL window to force the out-of-window `resync_required` path deterministically).
     pub fn with_limits(window_capacity: usize, inflight_cap: usize) -> Firehose {

@@ -44,3 +44,7 @@ integration = ["dep:async-nats", "dep:tokio", "dep:myelin-config", "dep:futures"
 # continues to model the production crates only.
 [dev-dependencies]
 myelin-harness = { path = "../myelin-harness" }
+# CDC: the firehose-retention CDC test (EB-30 / P-439) parses the workspace `thresholds.toml`
+# `[firehose_retention]` rows and asserts they are byte-for-byte the `retention::StreamClass::tuning()`
+# measured numbers (the file is the versioned source of truth, kept in lock-step with the code).
+toml = { workspace = true }

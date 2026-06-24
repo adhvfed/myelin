@@ -337,6 +337,7 @@ pub mod firehose;
 /// dotted-name list (name + schema_ver lineage + payload shape) against the one grammar.
 pub mod harness;
 pub mod holder;
+pub mod retention;
 // Stage 2 / infra: the REAL durable bus behind the BusTransport trait — NATS JetStream via
 // async-nats. Compiled ONLY under `--features integration` (it pulls the real async-nats +
 // tokio clients); the default build keeps the in-process relay::InProcessBus floor. It
@@ -437,6 +438,14 @@ pub use relay::{
     TransportError, MAX_PUBLISH_ATTEMPTS,
 };
 pub use residency::{BusRegionReport, BusResidencySignal, BusStreamResidency, ResidencyError};
+/// The firehose retention-window TUNING per stream class (EB-30 / P-439, M5 — the named M2 floor
+/// MEASURED). [`retention::StreamClass`] is the three heaviest firehose producers (CI log / collab op
+/// / chat live, §2.9 item 6); each carries a MEASURED [`retention::RetentionTuning`] — the per-class
+/// retention window (frames) + the measured p99 reconnect gap, with the §4.3 invariant
+/// `window > p99_reconnect_gap` (with headroom) asserted from the measured data. The numbers are
+/// recorded in `thresholds.toml` (`[firehose_retention]`), the versioned source of truth, kept in
+/// lock-step by a CDC test. `Firehose::for_stream_class` opens a class's window at its measured size.
+pub use retention::{RetentionTuning, StreamClass};
 pub use taxonomy::{
     validate as validate_event_type, TaxonomyError, ARTIFACT_TYPE_TOKENS, SEED_EVENT_NAMES,
     SUBSYSTEM_TOKENS,
