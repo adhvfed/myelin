@@ -84,10 +84,15 @@
 //!   floor) rather than mis-honoured. The HTTP-date → instant conversion needs a clock +
 //!   date parser that lands with the **real transport** floor above (no network/HTTP stack in
 //!   M0); named here so the deferral is explicit.
-//! - **Per-target tuned values.** This crate ships ONE **default per-target value set**
-//!   ([`ResilientConfig::default`], the M0 floor). The per-target tuned numbers (the auth
-//!   hot path gets a tighter timeout than a batch indexer) are measured by the surge/latency
-//!   drills and written into the thresholds file in **M5 (P-S36)**.
+//! - **Per-target tuned values (M0 floor — CLOSED in M5).** This crate ships ONE **default
+//!   per-target value set** ([`ResilientConfig::default`], the M0 floor). The per-target tuned
+//!   numbers (the auth hot path gets a tighter timeout than a batch indexer) were measured by the
+//!   surge/latency drills (SUB-D3, P-S32/P-433) and written into the thresholds file in **M5
+//!   (P-S36 / P-437)** — the floor is now CLOSED. The tuned values live in `thresholds.toml`'s
+//!   `[[resilient_client]]` rows, loaded via `myelin_substrate::thresholds::Thresholds`
+//!   (`resilient_config(target) -> ResilientConfig`), and a load-time gate
+//!   (`validate_resilient_targets`) rejects any timeout tuned looser than its measured latency
+//!   budget. The SHAPE of [`ResilientConfig`] is unchanged; only the per-target NUMBERS are tuned.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

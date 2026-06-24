@@ -139,6 +139,15 @@ pub struct Thresholds {
     /// an older thresholds file (pre-P-CP-22) still parses (falls back to the conservative seeds).
     #[serde(default)]
     pub cell_sizing: CellSizing,
+    /// The MEASURED resilient-client per-target tuned values (contract 1.9, §6.3; P-S36 / P-437).
+    /// One row per logical downstream target the resilient client (`myelin-client`) calls — the auth
+    /// hot path gets a TIGHTER timeout than a batch indexer, each number measured by the surge/latency
+    /// drills (SUB-D3 P-S32/P-433, the per-surface tuning P-S33/P-434), NOT predicted (EI-01 §3).
+    /// `#[serde(default)]` so an older thresholds file (pre-P-437) still parses with no per-target
+    /// rows (the M0 default-per-target floor, `ResilientConfig::default`, still applies). The M0 floor
+    /// named in P-S16 / P-033 is CLOSED by this row set.
+    #[serde(default)]
+    pub resilient_client: Vec<ResilientTargetRow>,
     /// The scorecard: drills that came back red live here, never edited green (EI-01 §3).
     #[serde(default)]
     pub claimed_not_proven: Vec<ClaimedNotProven>,
@@ -527,6 +536,153 @@ pub struct ShedBudgetRow {
     pub retry_after_secs: u64,
 }
 
+/// A MEASURED resilient-client per-target tuned-value row (contract 1.9, §6.3; P-S36 / P-437).
+///
+/// One logical downstream target the resilient client calls, with its per-target value set tuned to
+/// the numbers MEASURED by the surge/latency drills — the auth hot path's timeout is tighter than a
+/// batch indexer's. The SHAPE and the on-by-default posture are unchanged from the M0 floor
+/// ([`myelin_client::ResilientConfig`]); only the per-target NUMBERS are tuned here.
+///
+/// `latency_budget_ms` is the MEASURED p99 latency budget for the target (the surge/latency drill
+/// number, headroom included). The gate ([`Thresholds::validate_resilient_targets`]) enforces that
+/// the tuned `timeout_ms` is **not looser** than this budget: a `timeout_ms > latency_budget_ms` is a
+/// value tuned looser than what the drill measured the target can take within budget — that is the
+/// regression this gate rejects (EI-01 §3 — never a softened bar). The timeout must also be no
+/// tighter than the measured budget would allow a legitimate call to complete; the budget IS the
+/// timeout's ceiling (a deadline beyond the budget means a slow call is admitted past the SLO it was
+/// measured against, the "looser-than-budget" failure mode).
+///
+/// NB: `Eq` is intentionally NOT derived — [`Self::breaker_failure_ratio`] is an `f64` (`PartialEq`
+/// but not `Eq`); `PartialEq` suffices for the round-trip + value tests.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResilientTargetRow {
+    /// The logical downstream target name — matches the [`myelin_client::Target`] string the
+    /// resilient client keys breaker/bulkhead on (e.g. `"identity-authz"`, `"search-index"`).
+    pub target: String,
+    /// `true` iff this is an interactive/auth HOT-PATH target (the auth-decision spine: the
+    /// highest-QPS, latency-critical downstream). The gate asserts at least one hot-path target's
+    /// `timeout_ms` is STRICTLY tighter than every non-hot-path (batch) target's — the
+    /// "auth-hot-path-tighter-than-batch-indexer" relation (§6.3, the P-S16 floor's stated tuning).
+    pub hot_path: bool,
+    /// The MEASURED p99 latency budget for this target, in **milliseconds** (the surge/latency drill
+    /// number, headroom included). The tuned `timeout_ms` MUST NOT exceed this (a looser deadline is
+    /// the regression the gate rejects).
+    pub latency_budget_ms: u64,
+    /// The tuned per-call deadline in **milliseconds** (§6.3). Tighter for the auth hot path than for
+    /// a batch indexer.
+    pub timeout_ms: u64,
+    /// The tuned full-jitter backoff base in **milliseconds** (§6.3).
+    pub backoff_base_ms: u64,
+    /// The tuned maximum number of attempts for an `Idempotent` call (1 = no retry).
+    pub max_attempts: u32,
+    /// The tuned breaker trip threshold: the rolling-window failure **ratio** in `[0.0, 1.0]`.
+    pub breaker_failure_ratio: f64,
+    /// The tuned breaker minimum request count.
+    pub breaker_min_requests: u32,
+    /// The tuned breaker rolling-window size.
+    pub breaker_window: u32,
+    /// The tuned breaker open duration in **milliseconds**.
+    pub breaker_open_ms: u64,
+    /// The tuned per-target bulkhead integer concurrency cap (§6.3).
+    pub bulkhead_max_concurrency: u32,
+}
+
+impl ResilientTargetRow {
+    /// Build the tuned [`myelin_client::ResilientConfig`] this row carries — the SHAPE is unchanged
+    /// from the M0 floor; only the per-target NUMBERS are the tuned values. This is the ONE place a
+    /// thresholds-file row becomes the config the resilient client runs with for the target.
+    pub fn to_config(&self) -> myelin_client::ResilientConfig {
+        myelin_client::ResilientConfig {
+            timeout_ms: self.timeout_ms,
+            max_attempts: self.max_attempts,
+            backoff_base_ms: self.backoff_base_ms,
+            breaker_failure_ratio: self.breaker_failure_ratio,
+            breaker_min_requests: self.breaker_min_requests,
+            breaker_window: self.breaker_window,
+            breaker_open_ms: self.breaker_open_ms,
+            bulkhead_max_concurrency: self.bulkhead_max_concurrency,
+        }
+    }
+}
+
+/// A resilient-client per-target tuning that violates the §6.3 measured-tuning discipline (P-S36).
+/// LOUD by construction — a row that tuned a value looser than its measured budget, or broke the
+/// auth-hot-path-tighter relation, fails at LOAD, never silently at runtime under surge (EI-01 §3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResilientTuningError {
+    /// A target's tuned `timeout_ms` is LOOSER (greater) than its MEASURED `latency_budget_ms` — the
+    /// regression the gate rejects (a deadline beyond the measured budget admits a call past its SLO).
+    TimeoutLooserThanBudget {
+        /// The offending target name.
+        target: String,
+        /// The tuned timeout (ms).
+        timeout_ms: u64,
+        /// The measured latency budget (ms) it exceeded.
+        latency_budget_ms: u64,
+    },
+    /// A degenerate per-target value (a zero deadline, a zero bulkhead, a zero window/attempt count,
+    /// or a ratio outside `[0.0, 1.0]`) — an unbounded/disabled primitive is a future cascade.
+    DegenerateValue {
+        /// The offending target name.
+        target: String,
+        /// Which field was degenerate.
+        field: String,
+    },
+    /// The auth-hot-path-tighter-than-batch-indexer relation is broken: a non-hot-path (batch) target
+    /// has a `timeout_ms` at-or-tighter-than the tightest hot-path target's. The auth hot path MUST be
+    /// strictly tighter than every batch target (§6.3, the P-S16 floor's stated tuning).
+    HotPathNotTighter {
+        /// The tightest hot-path timeout found (ms).
+        tightest_hot_path_ms: u64,
+        /// The offending batch target.
+        batch_target: String,
+        /// Its (too-tight) timeout (ms).
+        batch_timeout_ms: u64,
+    },
+    /// No hot-path target is declared at all — the tuned set must name the auth hot path so the
+    /// tighter-than relation is meaningful (an empty hot-path set is a silently-missing floor).
+    NoHotPathTarget,
+}
+
+impl std::fmt::Display for ResilientTuningError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResilientTuningError::TimeoutLooserThanBudget {
+                target,
+                timeout_ms,
+                latency_budget_ms,
+            } => write!(
+                f,
+                "resilient-client target `{target}`: tuned timeout {timeout_ms}ms is LOOSER than the \
+                 measured latency budget {latency_budget_ms}ms — a value tuned looser than the \
+                 measured budget fails the gate (EI-01 §3; never softened)"
+            ),
+            ResilientTuningError::DegenerateValue { target, field } => write!(
+                f,
+                "resilient-client target `{target}`: degenerate tuned value for `{field}` (a \
+                 zeroed/out-of-range primitive is a future cascade)"
+            ),
+            ResilientTuningError::HotPathNotTighter {
+                tightest_hot_path_ms,
+                batch_target,
+                batch_timeout_ms,
+            } => write!(
+                f,
+                "resilient-client tuning: batch target `{batch_target}` timeout {batch_timeout_ms}ms \
+                 is not looser than the auth hot path's {tightest_hot_path_ms}ms — the auth hot path \
+                 MUST be strictly tighter than every batch indexer (§6.3)"
+            ),
+            ResilientTuningError::NoHotPathTarget => write!(
+                f,
+                "resilient-client tuning: no hot-path target declared — the tuned set must name the \
+                 auth hot path so the tighter-than-batch relation holds"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ResilientTuningError {}
+
 /// A scorecard row: a drill that came back RED, recorded honestly, NEVER edited green (EI-01 §3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimedNotProven {
@@ -627,6 +783,93 @@ impl Thresholds {
         let map = self.shed_budget_table()?;
         Ok(ShedBudgetTable::from_rows(map))
     }
+
+    /// The tuned [`myelin_client::ResilientConfig`] for ONE target (contract 1.9, §6.3; P-S36). A
+    /// target with no tuned row is a loud [`ThresholdError::Missing`] — the resilient client does NOT
+    /// proceed against a guessed per-target value (it falls back to `ResilientConfig::default` only
+    /// where the CALLER explicitly opts into the M0 floor, never by silently swallowing a missing row).
+    pub fn resilient_config(
+        &self,
+        target: &str,
+    ) -> Result<myelin_client::ResilientConfig, ThresholdError> {
+        self.resilient_client
+            .iter()
+            .find(|r| r.target == target)
+            .map(ResilientTargetRow::to_config)
+            .ok_or_else(|| ThresholdError::Missing(format!("resilient_client.{target}")))
+    }
+
+    /// **Validate the file's TUNED resilient-client per-target values (P-S36, the §6.3 measured-tuning
+    /// discipline).** Each row must hold: every primitive bounded (no zeroed deadline/bulkhead/window/
+    /// attempt, ratio in `[0.0, 1.0]`); the tuned `timeout_ms` no LOOSER than its measured
+    /// `latency_budget_ms` (the looser-than-budget regression — the gate's headline); and the
+    /// auth-hot-path-tighter-than-batch-indexer relation (every batch target strictly looser than the
+    /// tightest hot-path target). A row that tuned a value looser than its measured budget — or that
+    /// broke the tighter-than relation — fails at LOAD, never silently under surge (EI-01 §3 — a red is
+    /// a dated `[[claimed_not_proven]]` row, never a softened bar). An EMPTY row set is vacuously valid
+    /// (the M0 default-per-target floor still applies); a NON-empty set must declare a hot-path target.
+    pub fn validate_resilient_targets(&self) -> Result<(), ResilientTuningError> {
+        if self.resilient_client.is_empty() {
+            return Ok(());
+        }
+        // (1) Per-row: bounded primitives + the looser-than-budget headline.
+        for row in &self.resilient_client {
+            let degenerate = |field: &str| ResilientTuningError::DegenerateValue {
+                target: row.target.clone(),
+                field: field.to_string(),
+            };
+            if row.timeout_ms == 0 {
+                return Err(degenerate("timeout_ms"));
+            }
+            if row.latency_budget_ms == 0 {
+                return Err(degenerate("latency_budget_ms"));
+            }
+            if row.bulkhead_max_concurrency == 0 {
+                return Err(degenerate("bulkhead_max_concurrency"));
+            }
+            if row.breaker_window == 0 {
+                return Err(degenerate("breaker_window"));
+            }
+            if row.breaker_min_requests == 0 {
+                return Err(degenerate("breaker_min_requests"));
+            }
+            if row.max_attempts == 0 {
+                return Err(degenerate("max_attempts"));
+            }
+            if !(0.0..=1.0).contains(&row.breaker_failure_ratio) {
+                return Err(degenerate("breaker_failure_ratio"));
+            }
+            // THE HEADLINE GATE: a timeout tuned LOOSER than the measured latency budget fails.
+            if row.timeout_ms > row.latency_budget_ms {
+                return Err(ResilientTuningError::TimeoutLooserThanBudget {
+                    target: row.target.clone(),
+                    timeout_ms: row.timeout_ms,
+                    latency_budget_ms: row.latency_budget_ms,
+                });
+            }
+        }
+        // (2) The auth-hot-path-tighter-than-batch-indexer relation. The tightest hot-path timeout
+        // must be STRICTLY tighter than every batch (non-hot-path) target's.
+        let tightest_hot_path = self
+            .resilient_client
+            .iter()
+            .filter(|r| r.hot_path)
+            .map(|r| r.timeout_ms)
+            .min();
+        let Some(tightest_hot_path_ms) = tightest_hot_path else {
+            return Err(ResilientTuningError::NoHotPathTarget);
+        };
+        for row in self.resilient_client.iter().filter(|r| !r.hot_path) {
+            if row.timeout_ms <= tightest_hot_path_ms {
+                return Err(ResilientTuningError::HotPathNotTighter {
+                    tightest_hot_path_ms,
+                    batch_target: row.target.clone(),
+                    batch_timeout_ms: row.timeout_ms,
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Map a `shed::Surface` variant NAME (as written in the file) to the enum. The match is exhaustive,
@@ -708,6 +951,11 @@ mod tests {
         assert_eq!(t.depth_ceilings.soft, 12);
         assert_eq!(t.depth_ceilings.hard, 16);
         assert_eq!(t.shed_budgets.len(), 6, "one row per shed::Surface");
+        assert_eq!(
+            t.resilient_client.len(),
+            4,
+            "the measured resilient-client per-target tuned rows (P-S36): authz/event-bus + 2 batch"
+        );
     }
 
     /// The shed-budget rows in the file match the `shed::ShedBudgetTable::v1_floor()` seed table
@@ -943,6 +1191,195 @@ mod tests {
         );
         assert_eq!(t.online_migration.lock_wait_p99_max_ms, 500);
         assert_eq!(t.online_migration.downtime_max_ms, 0);
+    }
+
+    // ───────────────────── P-S36 / P-437: resilient-client per-target tuning ─────────────────────
+
+    /// A minimal valid thresholds body with a tunable `[[resilient_client]]` set spliced in, so the
+    /// tuning tests are self-contained (no dependence on the canonical file's exact numbers).
+    fn thresholds_with_resilient(rows_toml: &str) -> Thresholds {
+        let body = format!(
+            r#"
+            version = 1
+            as_of = "2026-06-24"
+            [revocation]
+            sla_mins = 5
+            [surge]
+            multiplier = 30
+            [fail_static]
+            status = "OPEN — LEGAL"
+            owner = "DPO / Legal"
+            static_max_default_secs = 300
+            agent_token_ttl_secs = 60
+            constraint = "x"
+            [rpo_rto]
+            rpo_max_mins = 5
+            rto_tenant_max_mins = 60
+            rto_cell_max_mins = 240
+            [depth_ceilings]
+            soft = 12
+            hard = 16
+            {rows_toml}
+        "#
+        );
+        Thresholds::from_toml(&body).expect("the resilient-client test body parses")
+    }
+
+    /// A full valid tuned row for one target, parameterised so a test can perturb a single field.
+    fn resilient_row(target: &str, hot_path: bool, budget: u64, timeout: u64) -> String {
+        format!(
+            r#"
+            [[resilient_client]]
+            target = "{target}"
+            hot_path = {hot_path}
+            latency_budget_ms = {budget}
+            timeout_ms = {timeout}
+            backoff_base_ms = 20
+            max_attempts = 3
+            breaker_failure_ratio = 0.5
+            breaker_min_requests = 5
+            breaker_window = 20
+            breaker_open_ms = 2000
+            bulkhead_max_concurrency = 64
+        "#
+        )
+    }
+
+    /// **THE HEADLINE GATE (P-S36 DoD):** a per-target value tuned LOOSER than the measured latency
+    /// budget FAILS the gate — never edited green (EI-01 §3). A hot-path target whose `timeout_ms`
+    /// exceeds its measured `latency_budget_ms` is a loud `TimeoutLooserThanBudget`.
+    #[test]
+    fn a_timeout_looser_than_the_measured_budget_fails_the_gate() {
+        // budget 150 ms, timeout 200 ms — LOOSER than the measured budget.
+        let rows = resilient_row("identity-authz", true, 150, 200);
+        let t = thresholds_with_resilient(&rows);
+        assert!(
+            matches!(
+                t.validate_resilient_targets(),
+                Err(ResilientTuningError::TimeoutLooserThanBudget {
+                    timeout_ms: 200,
+                    latency_budget_ms: 150,
+                    ..
+                })
+            ),
+            "a timeout tuned looser than the measured latency budget MUST fail the gate (P-S36)"
+        );
+    }
+
+    /// The complementary green: a timeout tuned AT-OR-UNDER its measured budget validates (the
+    /// looser-than-budget gate does not reject a correctly-tightened value).
+    #[test]
+    fn a_timeout_within_the_measured_budget_validates() {
+        let mut rows = resilient_row("identity-authz", true, 150, 120); // hot, tight
+        rows.push_str(&resilient_row("search-index", false, 30000, 25000)); // batch, loose
+        let t = thresholds_with_resilient(&rows);
+        t.validate_resilient_targets()
+            .expect("a hot-path timeout within budget + a looser batch target must validate");
+    }
+
+    /// **The auth-hot-path-tighter-than-batch-indexer relation holds (P-S36 DoD).** A batch target
+    /// whose timeout is NOT strictly looser than the tightest hot-path target's fails the gate.
+    #[test]
+    fn the_auth_hot_path_must_be_tighter_than_the_batch_indexer() {
+        // hot path 120 ms; a "batch" target tuned to 100 ms — TIGHTER than the hot path (backwards).
+        let mut rows = resilient_row("identity-authz", true, 150, 120);
+        rows.push_str(&resilient_row("search-index", false, 30000, 100));
+        let t = thresholds_with_resilient(&rows);
+        assert!(
+            matches!(
+                t.validate_resilient_targets(),
+                Err(ResilientTuningError::HotPathNotTighter {
+                    tightest_hot_path_ms: 120,
+                    batch_timeout_ms: 100,
+                    ..
+                })
+            ),
+            "a batch target tighter-than-or-equal to the hot path must fail the relation gate (P-S36)"
+        );
+    }
+
+    /// A non-empty tuned set with NO hot-path target declared is a loud `NoHotPathTarget` (the
+    /// tighter-than relation is meaningless without naming the auth hot path).
+    #[test]
+    fn a_tuned_set_with_no_hot_path_target_fails() {
+        let rows = resilient_row("search-index", false, 30000, 25000); // batch only
+        let t = thresholds_with_resilient(&rows);
+        assert_eq!(
+            t.validate_resilient_targets(),
+            Err(ResilientTuningError::NoHotPathTarget),
+            "a non-empty tuned set must name the auth hot path (P-S36)"
+        );
+    }
+
+    /// A degenerate primitive (a zeroed deadline) is rejected — an unbounded/disabled primitive is a
+    /// future cascade, never silently accepted.
+    #[test]
+    fn a_zeroed_deadline_fails_the_gate() {
+        let rows = resilient_row("identity-authz", true, 150, 0);
+        let t = thresholds_with_resilient(&rows);
+        assert!(
+            matches!(
+                t.validate_resilient_targets(),
+                Err(ResilientTuningError::DegenerateValue { field, .. }) if field == "timeout_ms"
+            ),
+            "a zeroed per-call deadline must fail the gate (P-S36)"
+        );
+    }
+
+    /// An EMPTY tuned set is vacuously valid — the M0 default-per-target floor still applies (an
+    /// older pre-P-437 file with no rows still loads + validates).
+    #[test]
+    fn an_empty_tuned_set_is_vacuously_valid() {
+        let t = thresholds_with_resilient("");
+        assert!(t.resilient_client.is_empty());
+        t.validate_resilient_targets()
+            .expect("an empty tuned set is vacuously valid (the M0 floor applies)");
+    }
+
+    /// **The canonical file's tuned resilient-client values VALIDATE (the dated green artifact).** The
+    /// per-target numbers in `thresholds.toml` hold the looser-than-budget gate AND the
+    /// auth-hot-path-tighter-than-batch-indexer relation — the M0 default-per-target floor (P-S16) is
+    /// CLOSED with measured numbers.
+    #[test]
+    fn the_canonical_tuned_resilient_targets_validate() {
+        let t = Thresholds::load_canonical().expect("load");
+        assert!(
+            !t.resilient_client.is_empty(),
+            "the canonical file ships measured per-target rows (P-S36 closed the M0 floor)"
+        );
+        t.validate_resilient_targets()
+            .expect("the canonical tuned resilient-client values must validate (P-S36, EI-01 §3)");
+    }
+
+    /// **The auth-hot-path-tighter-than-batch-indexer relation holds in the CANONICAL file** (the
+    /// concrete P-S36 claim): `identity-authz` (hot) has a strictly tighter timeout than
+    /// `search-index` (the batch indexer).
+    #[test]
+    fn canonical_auth_hot_path_is_tighter_than_the_batch_indexer() {
+        let t = Thresholds::load_canonical().expect("load");
+        let authz = t
+            .resilient_config("identity-authz")
+            .expect("the auth hot-path target is tuned in the canonical file");
+        let indexer = t
+            .resilient_config("search-index")
+            .expect("the batch-indexer target is tuned in the canonical file");
+        assert!(
+            authz.timeout_ms < indexer.timeout_ms,
+            "the auth hot path ({}ms) must be tighter than the batch indexer ({}ms) (§6.3, P-S36)",
+            authz.timeout_ms,
+            indexer.timeout_ms
+        );
+    }
+
+    /// A missing per-target row is a LOUD `Missing` error — the resilient client does not proceed
+    /// against a guessed per-target value.
+    #[test]
+    fn an_unknown_resilient_target_is_a_loud_missing_error() {
+        let t = Thresholds::load_canonical().expect("load");
+        assert!(matches!(
+            t.resilient_config("no-such-target"),
+            Err(ThresholdError::Missing(_))
+        ));
     }
 
     /// The scorecard list is honest: empty at this commit (every shipped M0 drill is green at its

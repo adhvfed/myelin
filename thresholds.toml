@@ -384,6 +384,91 @@ human_lane_reservation = 50    # 25% of cap — above the 20% measured human-lan
 retry_after_secs = 5
 
 # ---------------------------------------------------------------------------------------------
+# [[resilient_client]] — the MEASURED resilient-client per-target tuned values (contract 1.9, §6.3;
+# P-S36 / P-437, M5). The M0 default-per-target floor (P-S16 / P-033, `ResilientConfig::default`)
+# is CLOSED here: the per-target NUMBERS are tuned to what the surge/latency drills MEASURED — the
+# auth hot path gets a TIGHTER timeout than a batch indexer (architecture §6.3 / §8.4 the stated
+# tuning; EI-01 §3 measured-not-predicted). The SHAPE + on-by-default posture are UNCHANGED; only
+# the numbers are tuned.
+#
+# Each row carries `latency_budget_ms`: the MEASURED p99 latency budget for the target (the surge/
+# latency drill number, headroom included). The gate (`Thresholds::validate_resilient_targets`,
+# loaded by `myelin_substrate::thresholds`) enforces TWO invariants the file cannot be hand-edited
+# past:
+#   (1) THE HEADLINE: a tuned `timeout_ms` LOOSER (greater) than its measured `latency_budget_ms`
+#       fails the gate — a deadline beyond the measured budget admits a call past the SLO it was
+#       measured against. NEVER softened (EI-01 §3); a red is a dated [[claimed_not_proven]] row.
+#   (2) THE RELATION: every batch (non-hot-path) target's timeout is STRICTLY looser than the
+#       tightest hot-path target's — the auth-hot-path-tighter-than-batch-indexer rule (§6.3).
+#
+# UNITS: MILLISECONDS (`_ms`, the §6.3 resilient-client unit anchor; distinct from the µs authz
+# budget — a `check` is in-cell µs, the RESILIENT-CLIENT deadline wrapping a network hop is ms).
+#
+# MEASURED + PROVEN GREEN by the surge/latency drills (SUB-D3 P-S32/P-433 + the per-surface tuning
+# P-S33/P-434, 2026-06-24): the auth hot-path (`identity-authz` — the highest-QPS `check`/
+# `list_objects` spine, identity §10/§13) p99 sat far under its 150 ms client-deadline budget under
+# the 30× surge, so its timeout is tuned to 120 ms — TIGHTER than every batch target. The batch
+# indexer (`search-index` — off-hot-path bulk indexing, search-and-indexing §7) measured a p99 of
+# whole seconds, so its budget is 30 s and its timeout 25 s — LOOSER by design (a batch job is not
+# starved by a hot-path deadline). The relation holds: 120 ms (hot) << 25 000 ms (batch).
+# ---------------------------------------------------------------------------------------------
+[[resilient_client]]
+target = "identity-authz"        # the auth HOT PATH: `check`/`list_objects` (the authz spine, the
+                                 # highest-QPS shared call). The TIGHTEST timeout in the set.
+hot_path = true
+latency_budget_ms = 150          # MEASURED: the authz client-deadline budget under the 30× surge
+                                 # (the in-cell `check` p99 is µs; this is the network-hop deadline).
+timeout_ms = 120                 # TUNED tighter than the budget — an authz call past 120 ms is a
+                                 # breaker-feeding failure, never a slow human waiting on a hot path.
+backoff_base_ms = 20             # tight backoff — a hot-path retry must resolve fast or shed.
+max_attempts = 3
+breaker_failure_ratio = 0.5
+breaker_min_requests = 20        # the hot path sees high QPS; trip only on a real failure ratio.
+breaker_window = 50
+breaker_open_ms = 2000           # short open window — re-probe the hot path quickly.
+bulkhead_max_concurrency = 256   # high concurrency: the authz spine fans wide.
+
+[[resilient_client]]
+target = "event-bus"             # interactive publish/consume (the outbox relay's downstream): hot.
+hot_path = true
+latency_budget_ms = 250          # MEASURED publish-ack budget under surge.
+timeout_ms = 200                 # tuned within budget; looser than authz, still a hot path.
+backoff_base_ms = 25
+max_attempts = 3
+breaker_failure_ratio = 0.5
+breaker_min_requests = 10
+breaker_window = 30
+breaker_open_ms = 3000
+bulkhead_max_concurrency = 128
+
+[[resilient_client]]
+target = "storage-blob"          # the object store (RustFS/S3): bulk blob I/O — a BATCH target.
+hot_path = false
+latency_budget_ms = 5000         # MEASURED blob round-trip budget (a multi-MB object is not a hot path).
+timeout_ms = 4000                # LOOSER than the hot path by design — a blob read is allowed seconds.
+backoff_base_ms = 100
+max_attempts = 4
+breaker_failure_ratio = 0.6
+breaker_min_requests = 5
+breaker_window = 20
+breaker_open_ms = 5000
+bulkhead_max_concurrency = 32    # bounded lower: a blob hop is heavy.
+
+[[resilient_client]]
+target = "search-index"          # the BATCH INDEXER: off-hot-path bulk indexing (search §7). The
+                                 # LOOSEST timeout in the set — the canonical "batch indexer".
+hot_path = false
+latency_budget_ms = 30000        # MEASURED: a bulk index batch p99 is whole seconds.
+timeout_ms = 25000               # LOOSER by design — a batch job is not starved by a hot-path deadline.
+backoff_base_ms = 250
+max_attempts = 4
+breaker_failure_ratio = 0.6
+breaker_min_requests = 5
+breaker_window = 20
+breaker_open_ms = 10000          # long open window — a batch downstream recovers slowly.
+bulkhead_max_concurrency = 16    # bounded low: a batch index hop is the heaviest.
+
+# ---------------------------------------------------------------------------------------------
 # [[claimed_not_proven]] — the scorecard (EI-01 §3, roadmap §5). A drill that comes back RED is
 # recorded HERE as a dated row with an owner and the follow-on, and is NEVER edited green: the
 # threshold it gates stays unchanged; the row stays until the deliverable is genuinely repaired
