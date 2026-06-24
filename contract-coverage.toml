@@ -200,6 +200,11 @@ status = "covered"
 # event via OutboxTx::emit on the SAME tx — emit-iff-committed: a LOST CAS commits neither the rank nor
 # the event (0 silent clobber), a WIN co-commits exactly one issue.reordered per accepted move. Proven in
 # drill_iss_d5_reorder_zero_clobber.rs (the reorder provider/consumer CDC pair + the ISS-D5 0-clobber drill).
+# CHAT-P5 (P-399, M4): the Chat message send (myelin_chat::store::MessageStore::append/revise/tombstone)
+# co-commits a real chat.message.created/edited/erased event via OutboxTx::emit on the SAME tx —
+# emit-iff-committed (CHAT-D13: an aborted send writes neither the message nor its event), idempotent on
+# client_nonce (CHAT-D14: a retried send co-commits exactly one message + one event). Proven DB-free in the
+# CDC pair + live against the dev-stack Postgres outbox in integration_chat_p5_co_commit.rs.
 cdc = [
     "crates/myelin-storage/tests/cdc_st_02_coloc.rs",
     "crates/myelin-knowledge/tests/cdc_2_2_2_3_2_4_2_9_kn_d7_outbox.rs",
@@ -207,6 +212,7 @@ cdc = [
     "crates/myelin-issues/tests/drill_iss_p06_emit_iff_committed.rs",
     "crates/myelin-issues/tests/integration_iss_p06_outbox.rs",
     "crates/myelin-issues/tests/drill_iss_d5_reorder_zero_clobber.rs",
+    "crates/myelin-chat/tests/cdc_2_2_2_3_chat_outbox_co_commit.rs",
 ]
 
 [[contract]]
@@ -218,11 +224,16 @@ status = "covered"
 # ISS-P06 (P-372, M4): the Issues write path stamps the aggregate = the issue (the issue is the
 # aggregate, UNIQUE(aggregate, seq)); chained create→update→transition events stay per-issue ordered
 # (monotonic, gap-free), proven in the write-path provider CDC.
+# CHAT-P5 (P-399, M4): the Chat send stamps aggregate = conversation_id, so per-conversation events stay
+# per-aggregate ordered (monotonic, gap-free seqs — the CHAT-D2 / D-9 total-order property). A burst from
+# many gateways yields the contiguous {0..N} seq set, proven DB-free in the CDC pair + live in
+# integration_chat_p5_co_commit.rs.
 cdc = [
     "crates/myelin-storage/tests/cdc_st_02_coloc.rs",
     "crates/myelin-knowledge/tests/cdc_2_2_2_3_2_4_2_9_kn_d7_outbox.rs",
     "crates/myelin-issues/tests/drill_iss_p06_emit_iff_committed.rs",
     "crates/myelin-issues/tests/integration_iss_p06_outbox.rs",
+    "crates/myelin-chat/tests/cdc_2_2_2_3_chat_outbox_co_commit.rs",
 ]
 
 [[contract]]

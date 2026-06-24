@@ -15,15 +15,31 @@
 //! pinned to a different region reads 0 of it (the partition/residency-pin GATE, enforced AT THE DB,
 //! not by app code).
 //!
+//! ## The outbox CO-COMMIT (CHAT-P5 / P-399, contract 2.2 / arch §9) — the real same-DB-tx emit
+//! [`PgMessageStore::append_co_commit`] inserts the message row AND the `chat.message.created`
+//! `outbox` row (the frozen [`myelin_events::OUTBOX_MIGRATION`] shape) in ONE `BEGIN … COMMIT`
+//! transaction: both commit or both roll back (emit-iff-committed, BUS-D4 / CHAT-D13). The
+//! per-aggregate `seq` (`aggregate = conversation_id`, contract 2.3) is allocated in SQL inside the
+//! transaction (`COALESCE(MAX(seq)+1, 0)`), guarded by the `UNIQUE(aggregate, seq)` constraint —
+//! the same construction `myelin_storage::PgRelay::enqueue_with_state` proves, here producing a real
+//! `chat.message.created` envelope. The plain [`PgMessageStore::append`] (no outbox) is retained for
+//! the CHAT-P4 cross-tier behaviour-equality leg; the co-commit is the production send path.
+//!
 //! ## Named floors
 //! - The hot engine is Postgres; **ScyllaDB is the named M5 promotion** (CHAT-P28 / P-502) behind
 //!   the SAME trait — a hot-tier swap, not a redesign.
 //! - The `body_inline` / `body_nodes` columns exist; their **per-subject-DEK encryption is CHAT-P6**.
-//! - The `chat.message.created` **outbox co-commit is CHAT-P5** — this tier persists the message
-//!   row + stages the state change; the same-tx event emit lands in CHAT-P5.
+//! - The relay that DRAINS the co-committed outbox row to the broker is the shared
+//!   `myelin_storage::PgRelay` (the ONE sanctioned publish site); the chat integration test drives
+//!   it to prove the co-committed `chat.message.created` reaches the bus (0 orphan / 0 phantom).
 
 use sqlx::postgres::PgPool;
-use sqlx::Row;
+use sqlx::{Acquire, Row};
+
+use myelin_events::{
+    derive_envelope, Actor, AggregateKey, DataRole, EmitContext, EventDraft, EventEnvelope,
+    EventId, EventType, Timestamp, Visibility,
+};
 
 use super::{
     AuthorKind, ConversationId, Message, MessageId, MessageState, NewMessage, RangeCursor,
@@ -194,6 +210,158 @@ impl PgMessageStore {
         .await
         .map_err(|e| StoreError::Cold(format!("insert: {e}")))?;
         Ok(message_id)
+    }
+
+    /// **append_co_commit (async) — the REAL outbox co-commit (CHAT-P5, contract 2.2 / arch §9).**
+    /// Persist the message row AND its `chat.message.created` `outbox` row in ONE DB transaction —
+    /// both commit or both roll back (emit-iff-committed, BUS-D4 / CHAT-D13). No dual-write: there
+    /// is no path that durably writes the message without its event.
+    ///
+    /// - **Idempotent send (CHAT-D14):** a retried `client_nonce` returns the EXISTING id and writes
+    ///   NEITHER a second message NOR a second event (the nonce check short-circuits before the tx).
+    /// - **Per-conversation total order (CHAT-D2):** the outbox `aggregate = conversation_id`; the
+    ///   per-aggregate `seq` is `COALESCE(MAX(seq)+1, 0)` allocated INSIDE the transaction and
+    ///   guarded by `UNIQUE(aggregate, seq)` — a racing committer collides and retries, so the
+    ///   committed seqs are contiguous + in true commit order.
+    /// - **References-not-payloads:** the `chat.message.created` envelope payload carries the
+    ///   message/conversation refs + the author principal id ONLY — never the body bytes (the body
+    ///   is per-subject-DEK-encrypted at rest, CHAT-P6; it never rides the bus).
+    ///
+    /// `event_id` is the caller-minted stable ULID (the broker-side dedup id); `actor` / `occurred`
+    /// / `recorded` are the ambient envelope fields. Returns the persisted `message_id`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn append_co_commit(
+        &self,
+        minter: &dyn super::UlidSource,
+        msg: NewMessage,
+        event_id: EventId,
+        actor: Actor,
+        occurred: Timestamp,
+        recorded: Timestamp,
+    ) -> Result<MessageId, StoreError> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| StoreError::Cold(format!("acquire: {e}")))?;
+        self.set_session_scope(&mut conn, &msg.conv.tenant, &msg.conv.region)
+            .await?;
+
+        // Idempotent-send (CHAT-D14): a retried nonce returns the existing id — no second message,
+        // no second event. The check is BEFORE the co-commit tx so the retry co-commits nothing.
+        if let Some(existing) = sqlx::query_scalar::<_, String>(&format!(
+            "SELECT message_id FROM {} WHERE tenant_id = $1 AND region = $2 \
+             AND conversation_id = $3 AND client_nonce = $4",
+            self.table
+        ))
+        .bind(&msg.conv.tenant)
+        .bind(&msg.conv.region)
+        .bind(&msg.conv.conversation_id)
+        .bind(&msg.client_nonce)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| StoreError::Cold(format!("nonce check: {e}")))?
+        {
+            return Ok(MessageId(existing));
+        }
+
+        let message_id = minter.mint();
+        // Build the references-only `chat.message.created` envelope (the SAME shape the in-memory
+        // tier emits via `emit_message_event`). The #sub anchor is the stable `message-<id>`.
+        let envelope =
+            self.message_created_envelope(&msg, &message_id, event_id, actor, occurred, recorded)?;
+
+        // ── the co-commit transaction: message row + outbox row, both or neither ────────────────
+        let mut dbtx = conn
+            .begin()
+            .await
+            .map_err(|e| StoreError::Cold(format!("begin co-commit tx: {e}")))?;
+
+        sqlx::query(&format!(
+            "INSERT INTO {} (tenant_id, region, conversation_id, message_id, thread_root_id, \
+             author, author_kind, body_inline, body_nodes, client_nonce, edited_seq, state) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, 0) \
+             ON CONFLICT DO NOTHING",
+            self.table
+        ))
+        .bind(&msg.conv.tenant)
+        .bind(&msg.conv.region)
+        .bind(&msg.conv.conversation_id)
+        .bind(message_id.as_str())
+        .bind(msg.thread_root_id.as_ref().map(|t| t.0.clone()))
+        .bind(&msg.author)
+        .bind(author_kind_code(msg.author_kind) as i16)
+        .bind(&msg.body_inline)
+        .bind(&msg.body_nodes)
+        .bind(&msg.client_nonce)
+        .execute(&mut *dbtx)
+        .await
+        .map_err(|e| StoreError::Cold(format!("co-commit message insert: {e}")))?;
+
+        // The outbox row, in the SAME transaction — delegated to the relay's ONE sanctioned
+        // outbox-write site (BUS-2: the relay owns the outbox table; the per-aggregate `seq` is
+        // allocated inside the tx, guarded by UNIQUE(aggregate, seq)). `aggregate = conversation_id`
+        // (contract 2.3). Threading the open `dbtx` keeps the message row + the outbox row in ONE
+        // transaction (emit-iff-committed).
+        myelin_storage::pgrelay::PgRelay::co_commit_in_tx(
+            &mut dbtx,
+            &msg.conv.conversation_id,
+            &envelope,
+        )
+        // `&mut dbtx` derefs to the open `&mut PgConnection` the relay writes the outbox row on.
+        .await
+        .map_err(|e| StoreError::Cold(format!("co-commit outbox insert: {e}")))?;
+
+        // BOTH or NEITHER: a failure before/at this commit rolls back the message row too.
+        dbtx.commit()
+            .await
+            .map_err(|e| StoreError::Cold(format!("co-commit: {e}")))?;
+        Ok(message_id)
+    }
+
+    /// Build the references-only `chat.message.created` envelope for the co-commit (the SAME draft
+    /// shape the in-memory tier's `emit_message_event` produces). The subject is the stable
+    /// `message-<id>` #sub anchor; the payload carries refs only (never the body bytes).
+    #[allow(clippy::too_many_arguments)]
+    fn message_created_envelope(
+        &self,
+        msg: &NewMessage,
+        message_id: &MessageId,
+        event_id: EventId,
+        actor: Actor,
+        occurred: Timestamp,
+        recorded: Timestamp,
+    ) -> Result<EventEnvelope, StoreError> {
+        let subject = crate::subs::mint_message(&msg.conv.tenant, message_id.as_str())
+            .map_err(|e| StoreError::Cold(format!("mint message #sub anchor: {e}")))?;
+        let draft = EventDraft {
+            type_: EventType(crate::events::CHAT_MESSAGE_CREATED.to_string()),
+            subject,
+            aggregate: AggregateKey(msg.conv.conversation_id.clone()),
+            payload: serde_json::json!({
+                "conversation_id": msg.conv.conversation_id,
+                "message_id": message_id.as_str(),
+                "author": msg.author,
+                "thread_root_id": msg.thread_root_id.as_ref().map(|t| t.as_str().to_string()),
+            }),
+            data_role: DataRole::Controller,
+            visibility: Visibility::Internal,
+            contains_personal_data: false,
+            pii_key_ref: None,
+        };
+        let ctx = EmitContext {
+            event_id,
+            tenant: myelin_tenancy::TenantId(msg.conv.tenant.clone()),
+            region: myelin_tenancy::Region(msg.conv.region.clone()),
+            actor,
+            schema_ver: 1,
+            occurred_at: occurred,
+            recorded_at: recorded,
+            caused_by: None,
+        };
+        // A root send (cause = None): the head of its own causal chain (a gateway-triggered reaction
+        // would pass the cause; that is CHAT-P9's concern).
+        Ok(derive_envelope(draft, ctx, None))
     }
 
     /// **range (async)** — the ordered range read (recent-N | scroll-back | resume-gap), scoped to

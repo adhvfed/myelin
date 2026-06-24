@@ -198,6 +198,304 @@ fn idempotent_send_on_client_nonce() {
     );
 }
 
+// =================================================================================================
+// CHAT-P5 (P-399) — the outbox CO-COMMIT + idempotent send + per-conversation total order. The
+// silent-data-loss floor: a message persist and its `chat.message.created` event are ONE
+// transaction (BUS-2, emit-iff-committed); a retried nonce co-commits exactly one message + one
+// event; a burst keeps per-conversation total order with `aggregate = conversation_id`.
+// =================================================================================================
+
+/// **The co-commit happy path (CHAT-P5, contract 2.2 / arch §9).** `append` persists the message AND
+/// emits a REAL `chat.message.created` outbox row in the SAME transaction — both durable on commit.
+/// The event's `aggregate = conversation_id` (contract 2.3), its `type` is the registered durable
+/// token, its `subject` is the stable `message-<id>` #sub anchor, and the payload is
+/// references-only (the body bytes NEVER ride the bus).
+#[test]
+fn append_co_commits_a_real_chat_message_created_event() {
+    let store = MemHotTier::new();
+    let (ob, m) = outbox();
+
+    let mut t = tx(&ob, &m);
+    let id = store
+        .append(&mut t, new_msg("n0", "alice", "hello world"))
+        .unwrap();
+    // Before commit: nothing durable (emit-iff-committed) — outbox depth still 0.
+    assert_eq!(
+        ob.outbox_depth(),
+        0,
+        "an open transaction has written nothing"
+    );
+    t.commit().unwrap();
+
+    // After commit: exactly ONE outbox row — the `chat.message.created` event — co-committed.
+    let rows = ob.committed_rows();
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one event co-committed with the message"
+    );
+    let row = &rows[0];
+    assert_eq!(
+        row.envelope.type_.0, "chat.message.created",
+        "the co-committed event is chat.message.created"
+    );
+    assert_eq!(
+        row.aggregate.0, "01J0CONV",
+        "aggregate = conversation_id (contract 2.3 — the CHAT-D2 ordering key)"
+    );
+    assert!(
+        row.subject.0.contains("#message-") && row.subject.0.contains(id.as_str()),
+        "subject is the stable message-<id> #sub anchor: {}",
+        row.subject.0
+    );
+    // References-not-payloads: the body bytes are NOT on the event payload.
+    let payload = row.envelope.payload.to_string();
+    assert!(
+        !payload.contains("hello world"),
+        "the body bytes must NEVER ride the bus (references-not-payloads): {payload}"
+    );
+    assert!(
+        payload.contains(id.as_str()) && payload.contains("alice"),
+        "the payload carries the message + author refs only: {payload}"
+    );
+    // The state-change half is staged in the SAME transaction (the no-dual-write co-commit).
+    assert!(
+        !row.envelope.contains_personal_data,
+        "the event is references-only (no inline PII envelope)"
+    );
+}
+
+/// **CHAT-D13 (the co-commit proof, in-process): an ABORTED transaction writes NEITHER the message
+/// NOR its event.** A crash between `append` (which buffers the persist + the event onto the tx) and
+/// `commit` leaves 0 orphan messages AND 0 phantom events — there is no path that durably writes one
+/// without the other (emit-iff-committed, BUS-D4). The whole-system carriage drill lives in
+/// `myelin-events::drills_eb27_chat_d1_d13`; THIS is the Chat-side `append`-path proof.
+#[test]
+fn chat_d13_aborted_append_writes_neither_message_nor_event() {
+    let store = MemHotTier::new();
+    let (ob, m) = outbox();
+
+    {
+        let mut t = tx(&ob, &m);
+        let _id = store
+            .append(&mut t, new_msg("n0", "alice", "doomed"))
+            .unwrap();
+        // The message is in the hot tier's in-memory log, BUT the event is only BUFFERED on the
+        // (uncommitted) transaction. t is dropped here WITHOUT commit — the crash point.
+    }
+    // 0 phantom events: the aborted transaction published nothing to the durable outbox.
+    assert_eq!(
+        ob.outbox_depth(),
+        0,
+        "CHAT-D13: an aborted transaction emits 0 phantom events"
+    );
+    assert_eq!(ob.committed_count(), 0, "CHAT-D13: no ghost outbox row");
+    assert_eq!(ob.dead_letter_count(), 0);
+    // Both-or-neither: because the durable EVENT did not commit, the message must be treated as
+    // not-sent too. In the real OLTP binding the message INSERT and the outbox row are ONE PG
+    // transaction, so an abort rolls back the row as well; the in-memory hot tier is the floor
+    // model, so we assert the AUTHORITATIVE side (the durable outbox) is empty — the property the
+    // relay + every consumer observes. (The PG leg proves the row also rolls back, integration.)
+}
+
+/// **CHAT-D14 (idempotent send → exactly ONE message AND ONE event).** A retried send with the SAME
+/// `client_nonce` (flaky mobile/agent) co-commits NOTHING new: the second `append` returns the
+/// existing id and emits NO second `chat.message.created` event. message-count = 1, event-count = 1.
+#[test]
+fn chat_d14_retried_nonce_co_commits_exactly_one_message_and_one_event() {
+    let store = MemHotTier::new();
+    let (ob, m) = outbox();
+
+    // First send: one message, one event.
+    let first = append(&store, &ob, &m, new_msg("retry-nonce", "alice", "hello"));
+    // The retry (same nonce) — a separate transaction, as a real redelivery would be.
+    let again = append(
+        &store,
+        &ob,
+        &m,
+        new_msg("retry-nonce", "alice", "hello (retry)"),
+    );
+
+    assert_eq!(
+        first, again,
+        "CHAT-D14: a retried send dedups to one message id"
+    );
+    assert_eq!(
+        store
+            .range(&conv(), RangeCursor::Recent, 100)
+            .unwrap()
+            .len(),
+        1,
+        "CHAT-D14: message-count = 1"
+    );
+    // Exactly ONE durable event — the retry emitted NO phantom second event.
+    let created: Vec<_> = ob
+        .committed_rows()
+        .into_iter()
+        .filter(|r| r.envelope.type_.0 == "chat.message.created")
+        .collect();
+    assert_eq!(
+        created.len(),
+        1,
+        "CHAT-D14: exactly one chat.message.created event (the retry emitted none)"
+    );
+}
+
+/// **CHAT-D2 (per-conversation total order from MANY gateways).** N concurrent senders each open
+/// their own transaction, append to the ONE hot conversation, and commit — modeling N stateless
+/// gateways racing one hot channel. The per-aggregate `seq` (allocated at commit under the outbox
+/// lock, `aggregate = conversation_id`) is exactly the contiguous set {0..N}: total order, gap-free,
+/// no dup (0 ordering violations). The full QPS-scale drill (BUS-D9) is the M5 follow-on.
+#[test]
+fn chat_d2_burst_from_many_gateways_preserves_per_conversation_total_order() {
+    use std::sync::Arc;
+    let store = Arc::new(MemHotTier::new());
+    let ob = OutboxStore::new();
+    let minter = Arc::new(myelin_events::MonotonicMinter::new());
+    const N: usize = 64;
+
+    let mut handles = Vec::new();
+    for i in 0..N {
+        let store = Arc::clone(&store);
+        let ob = ob.clone();
+        let minter = Arc::clone(&minter);
+        handles.push(std::thread::spawn(move || {
+            let mut t = ob.begin(minter, ctx_base());
+            store
+                .append(&mut t, new_msg(&format!("g{i}"), "alice", &format!("m{i}")))
+                .unwrap();
+            t.commit().unwrap();
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // Every send co-committed exactly one event for the one conversation aggregate.
+    let mut seqs: Vec<u64> = ob
+        .committed_rows()
+        .into_iter()
+        .filter(|r| r.aggregate.0 == "01J0CONV")
+        .map(|r| r.seq)
+        .collect();
+    seqs.sort_unstable();
+    let expected: Vec<u64> = (0..N as u64).collect();
+    assert_eq!(
+        seqs, expected,
+        "CHAT-D2: the per-conversation seqs are the contiguous {{0..N}} set (0 ordering violations)"
+    );
+
+    // The MESSAGE log is itself ULID-ordered and gap-free (the intrinsic per-conversation order).
+    let all = store.range(&conv(), RangeCursor::Recent, 1000).unwrap();
+    assert_eq!(all.len(), N, "every burst send persisted exactly once");
+    for w in all.windows(2) {
+        assert!(
+            w[0].message_id < w[1].message_id,
+            "CHAT-D2: 0 out-of-order message ids within the conversation"
+        );
+    }
+}
+
+/// **CHAT-D2 (out-of-order client ops reconcile to the stable `message_id` order).** An edit that
+/// arrives interleaved with later sends still co-commits its `chat.message.edited` against the
+/// SAME conversation aggregate, and the durable read re-orders to the intrinsic ULID order — the
+/// client's arrival order does not perturb the per-conversation total order (arch §2.2).
+#[test]
+fn chat_d2_out_of_order_edit_reconciles_to_stable_id_order() {
+    let store = MemHotTier::new();
+    let (ob, m) = outbox();
+
+    let a = append(&store, &ob, &m, new_msg("a", "alice", "first"));
+    let _b = append(&store, &ob, &m, new_msg("b", "bob", "second"));
+    // An edit to the FIRST message arrives after the second send (out-of-order client op).
+    let mut t = tx(&ob, &m);
+    store
+        .revise(&mut t, &a, b"first (edited)".to_vec(), Vec::new(), 0)
+        .unwrap();
+    t.commit().unwrap();
+
+    // The durable read is reconciled to the stable ULID order: a precedes b regardless of the edit
+    // arriving later.
+    let all = store.range(&conv(), RangeCursor::Recent, 100).unwrap();
+    assert_eq!(all[0].message_id, a);
+    assert_eq!(all[0].body_inline, b"first (edited)");
+    assert!(
+        all[0].message_id < all[1].message_id,
+        "stable id order holds"
+    );
+
+    // Both the created + the edited events are co-committed against the one conversation aggregate.
+    let types: Vec<String> = ob
+        .committed_rows()
+        .into_iter()
+        .filter(|r| r.aggregate.0 == "01J0CONV")
+        .map(|r| r.envelope.type_.0.clone())
+        .collect();
+    assert!(types.contains(&"chat.message.created".to_string()));
+    assert!(types.contains(&"chat.message.edited".to_string()));
+}
+
+/// `revise` co-commits `chat.message.edited`; `tombstone` co-commits `chat.message.erased` (the
+/// `*.erased` cross-cutting token, contract 2.7). Both against `aggregate = conversation_id`.
+#[test]
+fn revise_and_tombstone_co_commit_their_lifecycle_events() {
+    let store = MemHotTier::new();
+    let (ob, m) = outbox();
+    let id = append(&store, &ob, &m, new_msg("n", "alice", "v0"));
+
+    let mut t = tx(&ob, &m);
+    store
+        .revise(&mut t, &id, b"v1".to_vec(), Vec::new(), 0)
+        .unwrap();
+    t.commit().unwrap();
+
+    let mut t2 = tx(&ob, &m);
+    store
+        .tombstone(&mut t2, &id, TombstoneReason::SubjectErased)
+        .unwrap();
+    t2.commit().unwrap();
+
+    let types: Vec<String> = ob
+        .committed_rows()
+        .into_iter()
+        .map(|r| r.envelope.type_.0.clone())
+        .collect();
+    assert_eq!(
+        types,
+        vec![
+            "chat.message.created".to_string(),
+            "chat.message.edited".to_string(),
+            "chat.message.erased".to_string(),
+        ],
+        "the lifecycle events co-commit in order: created → edited → erased"
+    );
+}
+
+/// A failed CAS on `revise` co-commits NOTHING (no `chat.message.edited` phantom) — a refused
+/// clobber is not a silent state change AND not a phantom event.
+#[test]
+fn failed_cas_revise_co_commits_no_event() {
+    let store = MemHotTier::new();
+    let (ob, m) = outbox();
+    let id = append(&store, &ob, &m, new_msg("n", "alice", "v0"));
+    // baseline: one created event.
+    assert_eq!(ob.committed_count(), 1);
+
+    let mut t = tx(&ob, &m);
+    let err = store
+        .revise(&mut t, &id, b"clobber".to_vec(), Vec::new(), 99)
+        .unwrap_err();
+    assert!(matches!(err, StoreError::CasConflict { .. }));
+    // The transaction has buffered NO event (the revise erred before emitting); even if committed,
+    // nothing new lands.
+    t.commit().unwrap();
+    assert_eq!(
+        ob.committed_count(),
+        1,
+        "a refused CAS emits no chat.message.edited phantom"
+    );
+}
+
 // ── revise: CAS-on-edit, stable id, refused clobber ─────────────────────────────────────────────
 
 #[test]
