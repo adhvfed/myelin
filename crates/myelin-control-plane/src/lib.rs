@@ -185,10 +185,28 @@
 //!   go `Active` until it passes **restore-verify** (the storage [`myelin_storage::RestoreVerifyGate`],
 //!   contract 11.5) **+ readiness** (the cell's [`myelin_substrate::MetricsHealthSurface`]); a failing
 //!   cell stays `Provisioning` (0 traffic — the place path filters on `Active`). Tenant decommission
-//!   crypto-shreds the tenant KEK ([`myelin_storage::KmsEngine::destroy_kek`], 11.3). **FLOOR:**
-//!   provisioning is a SCRIPTED procedure on this M1 floor; the durable-workflow promotion (the same
-//!   gating under `myelin-flow`'s `DurableExecutor`, 9.1, M2) is **P-CP-22**'s re-confirmation. The
-//!   `cell_provisioning` log records each gating step.
+//!   crypto-shreds the tenant KEK ([`myelin_storage::KmsEngine::destroy_kek`], 11.3). **The
+//!   scripted-provisioning floor is now PROMOTED** (P-CP-22 / P-431, [`migration`]): provisioning runs
+//!   as a DURABLE workflow ([`LiveMigration::provision_cell_durably`] over `myelin-flow`'s
+//!   `DurableExecutor`, contract 9.1) — the SAME gating (restore-verify + readiness), now crash-safe +
+//!   resumable + idempotent. The `cell_provisioning` log records each gating step.
+//!
+//! ## What P-CP-22 / P-431 adds ([`migration`]) — live tenant migration + the floor promotions (M5)
+//! The avoid-migration-by-sizing floor (P-CP-05/P-CP-07) + the scripted-provisioning floor (P-CP-11)
+//! are **PROMOTED**: (1) **the online cell→cell move (SAME region)** ([`LiveMigration::migrate_tenant`])
+//! runs as a DURABLE workflow (contract 9.1) reusing **reindex-from-source + crypto-shred cut-over** —
+//! copy the source-of-truth to the target, reindex the target's DERIVED stores FROM SOURCE (never a
+//! derived backup, [`myelin_storage::ReindexFromSource`]), cut over [`Registry::place_tenant`] to the
+//! target ATOMICALLY (a cross-region target is REJECTED — the move lands IN-region), then crypto-shred
+//! the SOURCE ([`myelin_storage::KmsEngine::destroy_kek`]). **0 loss across-seam, source destroyed**
+//! (CP-D7). **Triggered by a MEASURED hot cell** ([`MigrationTrigger`]) that sealing cannot relieve
+//! (ADR-10). (2) **Repo relocation (C-1)** as the SAME durable workflow
+//! ([`LiveMigration::relocate_repo_durably`] over the P-CP-15 [`Registry::relocate_repo`] flip).
+//! (3) **Durable-workflow provisioning** ([`LiveMigration::provision_cell_durably`]) — the P-CP-11
+//! gating, now durable. (4) **The MEASURED sizing-band numbers** recorded in the thresholds-file
+//! `[cell_sizing]` row (the binding dimension MEASURED, never predicted, ADR-10;
+//! [`measured_hot_at`]). (5) **Restore-verify at cell scale (STOR-D2)** re-confirmed against the
+//! thresholds-file RPO/RTO bounds ([`restore_verify_at_cell_scale`]). No threshold weakened.
 
 pub mod cp_outage;
 pub mod cross_cell_bridge;
@@ -196,6 +214,7 @@ pub mod discover;
 pub mod four_layer;
 pub mod holder;
 pub mod isolation;
+pub mod migration;
 pub mod mirror_allowed;
 pub mod multi_cell;
 pub mod place;
@@ -225,6 +244,11 @@ pub use holder::{
     CONTROL_PLANE_STORE,
 };
 pub use isolation::{partition_key, IsolationTier, PartitionKey, PoolStore};
+pub use migration::{
+    measured_hot_at, restore_verify_at_cell_scale, CellTenantCopy, LiveMigration, MigrationError,
+    MigrationPlan, MigrationReceipt, MigrationTrigger, WF_DURABLE_PROVISION, WF_LIVE_MIGRATION,
+    WF_REPO_RELOCATION,
+};
 pub use mirror_allowed::{
     MirrorAllowReason, MirrorDecision, MirrorDenyReason, MirrorGate, MirrorTarget, TransferPolicy,
 };

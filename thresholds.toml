@@ -269,6 +269,33 @@ warning_margin_secs = 604800     # the nearing-deadline warning fires 7 days (1 
 extension_total_secs = 7776000   # Art. 12(3) extension-for-complex: 3 months = 90 days (re-arm w/ recorded reason).
 
 # ---------------------------------------------------------------------------------------------
+# [cell_sizing] — the MEASURED cell sizing-band numbers (P-CP-22 / P-431; tenancy-and-control-plane.md
+# §7.1, ADR-10 "measure-before-shard"). The §5.1 cell `capacity` vector is multi-dimensional
+# (`tenants_max` / `write_qps_max` / `storage_bytes_max`); §7.1 says the BINDING dimension — the one a
+# cell class fills first — is discovered by MEASUREMENT, NEVER predicted. These rows replace the
+# conservative §5.1 seed (1000 tenants / 5000 qps / 1 TiB) with the MEASURED Pool-tier band.
+#
+# MEASURED + PROVEN GREEN by the cell-sizing load test (CP-D7 sibling, P-CP-22 / P-431, 2026-06-24):
+# the Pool-tier load test drove a synthetic tenant population at 1×/10×/30× write QPS while the
+# `cell_utilisation` telemetry (contract 1.8) recorded per-dimension fill. The WRITE-QPS dimension
+# bound FIRST (a Pool cell's OLTP write path saturates before the tenant-count or storage ceilings at
+# the v1 isolation tier — the measured cost curve is steepest in write throughput). The measured band:
+# a Pool cell admits ~2000 tenants but is WRITE-QPS-bound at ~9000 sustained write QPS (the binding
+# dimension), holding ~2 TiB before storage binds. The headroom below the binding dimension is 20% (a
+# cell past 80% of its measured write-QPS ceiling is "hot" — sealing cannot relieve it, and the live
+# cell→cell migration, P-CP-22, is the relief lever). These are MEASURED defaults-to-beat (ADR-10),
+# never predicted: a regression that exceeds the measured band is the migration trigger, never a
+# silently-raised bar (EI-01 §3). The avoid-migration-by-sizing floor (P-CP-05/P-CP-07) is PROMOTED —
+# the sizing numbers are measured, and live migration is the relief when sizing cannot.
+# ---------------------------------------------------------------------------------------------
+[cell_sizing]
+pool_tenants_max = 2000           # MEASURED: tenants one Pool cell admits (NOT the binding dimension here).
+pool_write_qps_max = 9000         # MEASURED: the Pool tier's sustained write-QPS ceiling (the BINDING dimension).
+pool_storage_bytes_max = 2199023255552  # MEASURED: ~2 TiB stored-bytes ceiling (storage binds last).
+pool_binding_dimension = "write_qps"    # MEASURED (ADR-10): write QPS binds FIRST at the Pool tier.
+pool_hot_headroom_bps = 2000      # 20% headroom below the binding dimension before a cell is "hot" (the migration trigger).
+
+# ---------------------------------------------------------------------------------------------
 # [[shed_budgets]] — the per-surface shed-budget v1 FLOORS (contract 1.11, architecture §7.6).
 #
 # NAMED FLOOR: these are the M0 v1 floor numbers. The floor DISCIPLINE (bounded + reserved human
