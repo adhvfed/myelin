@@ -236,10 +236,12 @@ pub struct DepthCeilings {
 ///
 /// The Ids↔Filter SHAPE is frozen (small reachable sets materialise as `Ids`, large ones push down
 /// as `Filter`); only the NUMBERS — the cardinality cap that switches between them + the
-/// `reverse_index_lag` freshness SLO — are open. These are the default-to-beat; they are re-measured
-/// at world-scale (the surge + cell-scale load) and FINALISED/dated in P-ID-31 (P-074), which CLOSES
-/// the P-ID-11 cardinality-cap floor. `#[serde(default)]` on the parent field + [`Default`] here so
-/// an older thresholds file still parses (the cap falls back to the seed default-to-beat).
+/// `reverse_index_lag` freshness SLO — were open. **MEASURED + FINALISED at world-scale in P-ID-32
+/// (P-425, 2026-06-24)**, riding the P-ID-31 30× surge + the cell-scale list/scan load: the measured
+/// Ids↔Filter crossover sits AT the cap (the materialise plan is linear, the push-down is a fixed
+/// JOIN), and the `reverse_index_lag` stayed 0 under the surge (well within the SLO, bounded < the
+/// revocation SLA). **This CLOSED the P-ID-11 cardinality-cap floor.** `#[serde(default)]` on the
+/// parent field + [`Default`] here so an older thresholds file still parses (falls back to the seed).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthzIndex {
     /// The Ids↔Filter cardinality cap (the §7.1 switch point): at-or-under → `Ids` (materialise),
