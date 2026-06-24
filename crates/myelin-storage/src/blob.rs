@@ -52,10 +52,13 @@
 //!   default is the **identity wrap** (plaintext-at-rest) — the seam exists so P-ST-08 is a
 //!   localised swap, and no real tenant data is written before the M1 STOR-D1 restore-verify
 //!   gate. Recorded HERE in writing.
-//! - **The object-store (MinIO / Ceph RADOS) BlobStore is the M5 follow-on (P-ST-30, global
-//!   P-636)** — a one-line backing swap by the trait's design (trigger: the measured
-//!   single-node blob ceiling). The fs-backed store is the floor; the trait is the seam.
-//!   Recorded HERE in writing.
+//! - **The object-store (MinIO / Ceph RADOS / RustFS / Scaleway) BlobStore is SHIPPED (the M5
+//!   follow-on P-ST-30, global P-441).** [`crate::s3blob::S3BlobStore`] implements THIS unchanged
+//!   trait against an S3-compatible object store (a one-line backing swap, config-selected via
+//!   [`crate::backend`]); the STOR-D7 "recover from a replica" property the object tier adds is
+//!   [`crate::replicated_blob::ReplicatedBlobStore`] (backing-agnostic over the trait — the fs
+//!   floor in CI, the live S3 backing in the integration test). **The fs-BlobStore floor is now
+//!   promoted to its full answer** (the floor→follow-on pair is closed). Recorded HERE in writing.
 //! - **`PersonalDataHolder` DSR bodies** for the BlobStore (crypto-shred erase) are the GDPR
 //!   M1 deliverable (P-ST-09 ships the six-step crypto-shred algorithm); here the holder is
 //!   **registered** to its frozen shape (the [`crate::holder`] seam) so "we forgot the blob
@@ -439,8 +442,15 @@ impl BlobStore for FsBlobStore {
         let stored = self.wrap.wrap(tenant, bytes);
         let path = Self::key_path(tenant, &hash);
         let mut objects = self.objects.lock().expect("blob store mutex");
-        // Per-tenant dedup: putting identical bytes again is a no-op store (same key path).
-        objects.entry(path).or_insert(stored);
+        // Per-tenant dedup + content-addressed OVERWRITE: the key is the content address, so
+        // re-putting it with the SAME-addressed bytes is idempotent (dedup), and re-putting the
+        // CORRECT bytes over a CORRUPT object at that address is a valid HEAL (the address proves
+        // the bytes). We overwrite rather than `or_insert` so the replica-recovery heal path
+        // (P-ST-30) restores the primary — matching S3's overwrite-on-PUT semantics so the
+        // fs↔object swap behaves identically. (A re-put of correct bytes over correct bytes is a
+        // no-op write of equal content; the dedup property — one stored object per address —
+        // holds.)
+        objects.insert(path, stored);
         Ok(hash)
     }
 

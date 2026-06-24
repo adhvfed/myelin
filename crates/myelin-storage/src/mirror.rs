@@ -312,14 +312,20 @@ mod tests {
         // The address IS the BLAKE3 of the plaintext bytes (content-addressed like any T2 blob).
         assert_eq!(addr, ContentHash::blake3(pack));
 
-        // A tampered source blob is REFUSED (the content-address is the validity check — STOR-D7).
-        assert!(
-            store.corrupt_for_drill(&tenant(), &addr),
-            "source blob present to corrupt"
-        );
+        // Re-staging identical bytes is idempotent (per-tenant dedup → one content-addressed
+        // object). This is asserted BEFORE corruption: a re-put of correct bytes over correct
+        // bytes is a no-op store of equal content (the content address proves equality).
         assert!(
             mirror.stage_source(pack).is_ok(),
             "re-staging identical bytes is idempotent (per-tenant dedup)"
+        );
+        // A tampered source blob is REFUSED (the content-address is the validity check — STOR-D7).
+        // Corrupt AFTER the idempotent re-stage so the tamper is the LAST write at the address;
+        // a content-addressed put overwrites (heals) on a re-put of correct bytes (P-ST-30), so
+        // the corruption must be the final mutation for the refusal to be observed.
+        assert!(
+            store.corrupt_for_drill(&tenant(), &addr),
+            "source blob present to corrupt"
         );
         // Reading the corrupted blob fails the integrity check (never a silent wrong-bytes serve).
         assert!(
