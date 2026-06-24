@@ -1510,6 +1510,14 @@ cdc = [
     "crates/myelin-search/tests/cdc_tier3_valve_6_1.rs",
     "crates/myelin-issues/tests/cdc_6_1_issues_tier3_escalation.rs",
     "crates/myelin-chat/tests/cdc_6_1_chat_autocomplete.rs",
+    # CHAT-P20/P-415 (M4) adds the CHAT MESSAGE-SEARCH CONSUMER half: every chat message search routes
+    # through the ONE ACL-conjoining `myelin_search::query` surface (the chat-owned
+    # `myelin_chat::AclConjoinedSearchFeeder`), so a non-member of a channel gets 0 message results
+    # incl. count (CHAT-D11; the `read` permission over the `message` acl_object_type, resolved via
+    # `message.view = parent_channel->read`; one list_objects, no N+1). The chat consumer CDC proves
+    # the real Search surface satisfies the feeder + the conjoin keys on the SAME object type the
+    # IndexSpec declares — crates/myelin-chat/tests/cdc_6_3_6_1_chat_search_index.rs.
+    "crates/myelin-chat/tests/cdc_6_3_6_1_chat_search_index.rs",
 ]
 
 [[contract]]
@@ -1599,6 +1607,17 @@ cdc = [
     # rows indexed). The run-projection EMITTER REUSES project() (§7.2); the SCIP/LSIF find-usages
     # input (6.5) is the NAMED post-CI-M5 follow-on (arch 06 R-3). The CI-log doc spec is ci_log_projection.
     "crates/myelin-ci-controlplane/tests/cdc_6_3_2_6_7_3_ci_surfacing_index.rs",
+    # CHAT-P20 / P-415 (M4) adds the CHAT slice: Chat declares its OWNED `chat/message` IndexSpec
+    # (`myelin_chat::message_index_spec` — chat/message, SEMANTIC for the RAG/dedup embedding field
+    # [embeddings ARE personal data → erasure-aware], acl_object_type=message [the conjoin keys on
+    # message.id], the §7 columnar facets channel/author/thread_root/created_at/kind + the three
+    # cross-producer reference facets mention/artifact_ref/embed) and Search ADMITS it into a live
+    # indexer (the build-time registration; the semantic spec wires the embedding adapter). The
+    # index-time projection BUILDER (`message_search_projection`) walks the SAME structured-node array
+    # the chat edge producer uses (X-2). The HYOK structural skip (11.3) refuses a HYOK class
+    # (`admit_message_indexing` → SkipHyok → 0 indexed bodies). The full-replay-parity follow-on is
+    # CHAT-P21; the full multi-holder erasure receipt is CHAT-P22 (named floors).
+    "crates/myelin-chat/tests/cdc_6_3_6_1_chat_search_index.rs",
 ]
 
 [[contract]]

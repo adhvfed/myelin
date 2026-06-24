@@ -101,6 +101,21 @@ myelin-gdpr = { path = "../myelin-gdpr" }
 # ("the DSR fan-out forgot Chat" is structurally impossible). A LEAF→substrate-glue edge (myelin-issues
 # takes the identical edge); the §2.9 crate-graph models the library DAG, not this terminal consumer.
 myelin-substrate = { path = "../myelin-substrate" }
+# CHAT-P20 (P-415, M4-C7): the Search contract surface — chat is a PRODUCER of searchable artifacts
+# and OWNS its `declare_indexable(IndexSpec{ subsystem:"chat", type:"message", ..})` (contract 6.3,
+# arch §7). The chat-owned `search` module constructs the real `myelin_search::IndexSpec` + routes
+# every message search through the ONE ACL-conjoining `myelin_search::query` surface (6.1; the
+# search-as-non-member=0 guarantee, CHAT-D11). Promoted from dev-only to a real dependency because the
+# `declare_indexable` registration is a compile-time producer concern (the SAME sanctioned producer
+# edge `myelin-issues`/`myelin-git` take for their owned IndexSpecs) — `myelin-search` does NOT depend
+# back on `myelin-chat` (it models chat's tokens byte-identically precisely because it cannot import
+# chat), so the §2.9 DAG stays acyclic. The runtime PORT edges (composer autocomplete, HITL signal)
+# remain port-based; this is the producer-spec edge, not a runtime-engine edge.
+myelin-search = { path = "../myelin-search" }
+# CHAT-P20 (P-415): the frozen `FieldType`/`FieldValue`/`QueryAst` (contract 13.3) the chat message
+# IndexSpec's structured facets + the ACL-conjoined query AST are typed over. `myelin-query` sits in
+# the mid-tier of the §2.9 DAG; nothing depends back on `myelin-chat`, so the graph stays acyclic.
+myelin-query = { path = "../myelin-query" }
 # CHAT-P4 (P-398): the REAL Postgres hot-tier client (`store::pg::PgMessageStore`) + the async
 # runtime the integration test drives. OPTIONAL — pulled ONLY by the `integration` feature, so the
 # default `cargo build --workspace` compiles neither (the DB-free build floor, the binding policy).
@@ -122,20 +137,6 @@ integration = ["myelin-storage/integration", "dep:sqlx", "dep:tokio"]
 # ships is the names-only carrier `myelin_identity::NamespaceFragment`; the rich form is exercised
 # only by the CDC test), so the production DAG stays acyclic.
 myelin-identity-service = { path = "../myelin-identity-service" }
-# NOTIF-P22 (P-343): the Bus reactive/dispatch tier (contract 3.6 / §4.7) chat's explicit-first
-# boundary (8.6 / CHAT-1) is PROVEN through — the CHAT-D17 drill wires chat's `agent_dispatch_class`
-# decision into the REAL `myelin_query::DispatchTier` and asserts a casual @agent mention →
-# `Disposition::NotifiedOnly` (0 auto-spawn, 0 reservation). A DEV-only edge: `myelin-query` sits in
-# the mid-tier of the §2.9 DAG and NOTHING depends back on `myelin-chat`, so the graph stays acyclic.
-myelin-query = { path = "../myelin-query" }
-# CHAT-P12 (P-406, M4-C3): the Search ENGINE — the CDC for contract 6.1 (the `@`/`#` autocomplete) PROVES
-# the REAL `myelin_search::query` ACL-conjoining surface satisfies chat's `composer::AutocompletePort`
-# (Search-backed suggestions; 0 chat-private mention/artifact index — a suggestion the viewer cannot see
-# is excluded by the conjoined `list_objects` `Filter` BEFORE it reaches the composer). A DEV-only edge:
-# the runtime composer holds only the PORT (the gateway wires it to Search), so the production DAG stays
-# acyclic (the SAME posture the D17 dispatch CDC takes with `myelin-query`). `myelin-search` sits in the
-# mid-tier of the §2.9 DAG and NOTHING depends back on `myelin-chat`.
-myelin-search = { path = "../myelin-search" }
 # CHAT-P18 (P-413, M4-C6): the durable-workflow ENGINE — the CDC for contracts 9.1/9.4 posts chat's
 # HITL approval-card decision onto the REAL `myelin_flow::FlowExecutor::signal` (the per-effect
 # `idem_key` dedup — a double-click is ONE approval, a partial approval is well-defined) and ASSERTS
