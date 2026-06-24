@@ -30,7 +30,8 @@ use std::process::ExitCode;
 /// The `myelin-harness/src/bin/*-scorecard.rs` band-boundary exit-gate RUNNERS (the SUB-M0 runner
 /// `sub-m0-scorecard.rs`, P-S24 → P-039; the Identity M1→M2 runner `id-m1-scorecard.rs`, P-ID-21 →
 /// P-079; the infra integration runner `infra-scorecard.rs`, Stage 4; the M2 reactive-layer runner
-/// `m2-scorecard.rs`, M2 → M3) are CI/test-support
+/// `m2-scorecard.rs`, M2 → M3; the M3 producer runner `m3-scorecard.rs`, M3 → M4; the M4 consumer
+/// runner `m4-scorecard.rs`, M4 → M5) are CI/test-support
 /// ORCHESTRATION tooling (the leaf test-support crate `myelin-harness`,
 /// NOT a node in the production DAG, architecture §2.9) whose whole job is to spawn `cargo
 /// test`/`cargo run` for each per-feature drill and aggregate the result. Their
@@ -131,6 +132,13 @@ const EXCLUDED_SUBSTRINGS: &[&str] = &[
     // stack), the one legitimate host-exec site for a CI/test-support orchestration binary. NAMED,
     // LOUD exclusion of a single tool file; the lint stays fully live on every production crate.
     "myelin-harness/src/bin/m3-scorecard.rs",
+    // The M4 consumer-subsystems exit-gate runner (M4 → M5): same posture as the runners above —
+    // its `Command::new(env!("CARGO"))` spawns `cargo test`/`cargo run` per CI+Issues+Chat drill
+    // (incl. the AG-D4/CI-T1 prod-image re-confirm with `MYELIN_REQUIRE_KVM=1` so a real microVM
+    // must boot + the STOR-D1/D2 `--features integration` restore-verify against the live stack),
+    // the one legitimate host-exec site for a CI/test-support orchestration binary. NAMED, LOUD
+    // exclusion of a single tool file; the lint stays fully live on every production crate.
+    "myelin-harness/src/bin/m4-scorecard.rs",
     // The Firecracker + gVisor sandbox BACKENDS (CI-P2 → P-237): the ONE legitimate VMM/runtime
     // spawn sites. The `no-host-exec` rule forbids platform code SHELLING OUT to the host kernel so
     // that all execution goes through the unified sandbox seam (`SandboxBackend::launch`). These two

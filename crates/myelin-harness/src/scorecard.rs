@@ -133,6 +133,29 @@ pub enum Band {
     /// and the world-scale 30× LOAD surge (real fleet hardware, M5) — are named, dated deferrals in
     /// [`Scorecard::render_markdown`], not rows that red this gate.
     M3Producers,
+    /// The **M4 consumer-subsystems exit gate** (M4 → M5) — the consolidated go/no-go over the
+    /// three M4 consumer subsystems built on the reactive + producer layers: **CI** (CI-D9
+    /// ci-pipeline determinism, CI-D1 effectively-once, CI-D5 reserve/settle parity, CI-D8/GIT-D10
+    /// seam gate, CI-D11 live-tail, CI-D6 fork cache-poison, CI-D4 supply-chain fail-closed, CI-D7
+    /// fork-no-secrets, plus the AG-D4/CI-T1 prod-image re-confirm — the permanent real-kernel escape
+    /// gate, run `--features integration` with `MYELIN_REQUIRE_KVM=1` so a real Firecracker microVM
+    /// boots — and the STOR-D1/D2 restore-verify on the CI stores, the permanent restore gate),
+    /// **Issues** (ISS-P06 emit-iff-committed, ISS-D2 cost-bounding, ISS-D3 setexpr zero-leak, ISS-D4
+    /// create-storm, ISS-D5 reorder zero-clobber, ISS-D6 SLA business-calendar + escalation, ISS-D7
+    /// stateful trigger, ISS-D8 rollup + OLAP feed, ISS-D9 import, ISS-D11 erase-reaches-every-holder,
+    /// ISS-D13 board sync), and **Chat** (CHAT-D5 unfurl + humanise no-leak, CHAT-D6/D7/D18
+    /// invalidation, CHAT-D8 erasure cascade, CHAT-D9 HITL exactly-once, CHAT-D10 HITL per-effect,
+    /// CHAT-D11 search ACL, CHAT-D12 read-state, CHAT-D15 reindex parity, CHAT-D16 streaming, CHAT-D17
+    /// explicit-first), plus the contract-coverage scanner re-affirm. It WIRES (does not re-implement)
+    /// each per-feature drill (P-319..P-419). A single RED row blocks M5 (the master band gate
+    /// invariant, master-sequencing §2/§4, EI-01 §2). Two rows are permanent integration drills run
+    /// `--features integration` against the live docker-compose stack: the AG-D4/CI-T1 prod-image
+    /// re-confirm (a real microVM MUST boot — no vacuous green; its three residuals are printed by
+    /// [`Scorecard::render_markdown`]) and the STOR-D1/D2 restore-verify on the CI stores. The ONE true
+    /// remaining floor — the world-scale 30× LOAD / surge drills (FLOW-D8 / AG-D6 / the CHAT+Issues
+    /// surge) needs real fleet hardware — is a named, dated M5 deferral in `render_markdown`, NOT a row
+    /// here; gVisor as a second escape-drill backend (CI-P28) is a named run-when-available residual.
+    M4Consumers,
 }
 
 impl fmt::Display for Band {
@@ -143,6 +166,7 @@ impl fmt::Display for Band {
             Band::Infra => write!(f, "Infra (integration)"),
             Band::M2Reactive => write!(f, "M2 (reactive shared layer)"),
             Band::M3Producers => write!(f, "M3 (producer subsystems)"),
+            Band::M4Consumers => write!(f, "M4 (consumer subsystems)"),
         }
     }
 }
@@ -159,6 +183,7 @@ impl Band {
             Band::Infra => infra_required_rows(),
             Band::M2Reactive => m2_required_rows(),
             Band::M3Producers => m3_required_rows(),
+            Band::M4Consumers => m4_required_rows(),
         }
     }
 }
@@ -1175,6 +1200,258 @@ pub fn m3_required_rows() -> Vec<GateRow> {
     ]
 }
 
+/// The FROZEN required-row set for the **M4 consumer-subsystems exit gate** (M4 → M5). This is the
+/// build-layer realisation of the master band gate invariant (master-sequencing §2/§4, EI-01 §2):
+/// the three M4 consumer subsystems (CI + Issues + Chat) are *correct* before M5 is started. It
+/// WIRES the per-feature M4 drills (it does not re-implement them — each `proof_command` is the real
+/// `cargo test`/`cargo run` target that already lives with its feature prompt, P-319..P-419) across
+/// the three families:
+///
+/// - **CI (myelin-ci-controlplane unless noted):** CI-D9 (ci-pipeline determinism), CI-D1
+///   (effectively-once), CI-D5 (reserve/settle parity), CI-D8/GIT-D10 (seam gate), CI-D11 (live-tail),
+///   CI-D6 (fork cache-poison), CI-D4 (supply-chain fail-closed), CI-D7 (fork-no-secrets); plus the two
+///   PERMANENT integration gates re-confirmed at the M4 boundary: **AG-D4/CI-T1** (the prod-image
+///   re-confirm in `myelin-ci-sandbox`, run `--features integration` with `MYELIN_REQUIRE_KVM=1` so a
+///   real Firecracker microVM MUST boot — no vacuous green; its three residuals are printed by
+///   [`Scorecard::render_markdown`]) and **STOR-D1/D2** (restore-verify on the CI stores, `--features
+///   integration`, the shared Storage-owned restore gate re-run-forever).
+/// - **Issues (myelin-issues):** ISS-P06 (emit-iff-committed), ISS-D2 (cost-bounding), ISS-D3 (setexpr
+///   zero-leak), ISS-D4 (create-storm), ISS-D5 (reorder zero-clobber), ISS-D6 (SLA business-calendar +
+///   escalation, two drills), ISS-D7 (stateful trigger), ISS-D8 (rollup + OLAP feed, two drills), ISS-D9
+///   (import), ISS-D11 (erase-reaches-every-holder), ISS-D13 (board sync).
+/// - **Chat (myelin-chat):** CHAT-D5 (unfurl + humanise no-leak, two drills), CHAT-D6/D7/D18
+///   (invalidation), CHAT-D8 (erasure cascade), CHAT-D9 (HITL exactly-once), CHAT-D10 (HITL per-effect),
+///   CHAT-D11 (search ACL), CHAT-D12 (read-state), CHAT-D15 (reindex parity), CHAT-D16 (streaming),
+///   CHAT-D17 (explicit-first).
+/// - **contract-coverage:** the scanner re-affirm (no falsely-claimed / silently-dropped / un-named row).
+///
+/// Exactly two rows are `permanent` (re-run-forever): the AG-D4/CI-T1 prod-image escape re-confirm
+/// (EI-01 §2: RCE/sandbox-escape outranks every feature) and the STOR-D1/D2 restore-verify on the CI
+/// stores (the shared Storage-owned permanent restore gate; a backup never restored is not a backup,
+/// EI-01 §3). Both are the only `--features integration` rows — they FAIL without the live stack, and
+/// AG-D4 additionally hard-fails without /dev/kvm + firecracker under `MYELIN_REQUIRE_KVM=1`. The ONE
+/// true remaining floor — the world-scale 30× LOAD / surge drills (FLOW-D8 / AG-D6 / the CHAT+Issues
+/// surge) needs real fleet hardware — is a named, dated M5 deferral in `render_markdown`, NOT a row here
+/// (it would red the gate; M4 is *correct*, M5 is *load-hardened*); gVisor as a second escape-drill
+/// backend (CI-P28) is a named run-when-available residual.
+pub fn m4_required_rows() -> Vec<GateRow> {
+    fn row(id: &'static str, title: &'static str, cmd: &'static [&'static str]) -> GateRow {
+        GateRow {
+            id,
+            title,
+            proof_command: cmd,
+            permanent: false,
+            floor: None,
+        }
+    }
+    vec![
+        // ---- CI (myelin-ci-controlplane) ----
+        row(
+            "CI-D9",
+            "ci-pipeline determinism → a re-driven CI pipeline lands on the same deterministic plan/result (no nondeterministic step)",
+            &["test", "-p", "myelin-ci-controlplane", "--test", "drills_ci_p15_ci_pipeline"],
+        ),
+        row(
+            "CI-D1",
+            "effectively-once → a CI trigger fires its effect exactly once across replay/redelivery (no double-run, no lost run)",
+            &["test", "-p", "myelin-ci-controlplane", "--test", "drills_ci_p16_effectively_once"],
+        ),
+        row(
+            "CI-D5",
+            "reserve/settle parity → a reserved CI budget settles exactly once; a crash leaves no double-charge / no orphaned reservation",
+            &["test", "-p", "myelin-ci-controlplane", "--test", "drills_ci_p17_reserve_settle_parity"],
+        ),
+        row(
+            "CI-D8/GIT-D10",
+            "seam gate → the check_status producer/consumer seam dead-letters foreign/malformed, idempotent on dup, drops stale supersession",
+            &["test", "-p", "myelin-ci-controlplane", "--test", "drills_ci_p19_seam_gate"],
+        ),
+        row(
+            "CI-D11",
+            "live-tail → the CI log live-tail is a references-not-payloads firehose pointer; resume replays exactly, no lost/dup byte-range",
+            &["test", "-p", "myelin-ci-controlplane", "--test", "drills_ci_p21_live_tail"],
+        ),
+        row(
+            "CI-D6",
+            "fork cache-poison → a fork PR cannot poison the trusted build cache (cache key scoped, untrusted writes quarantined)",
+            &["test", "-p", "myelin-ci-controlplane", "--test", "drills_ci_p22_fork_cache_poison"],
+        ),
+        row(
+            "CI-D4",
+            "supply-chain fail-closed → an unverifiable/unsigned supply-chain artifact fails CLOSED (the build is denied, never admitted-by-default)",
+            &["test", "-p", "myelin-ci-controlplane", "--test", "drills_ci_p23_supply_chain_fail_closed"],
+        ),
+        row(
+            "CI-D7",
+            "fork-no-secrets → a fork-originated CI run reads 0 tenant secrets (the untrusted-fork secret boundary holds)",
+            &["test", "-p", "myelin-ci-controlplane", "--test", "drills_ci_p24_fork_no_secrets"],
+        ),
+        // AG-D4/CI-T1 — the prod-image re-confirm: PERMANENT, --features integration, KVM-gated.
+        // The runner sets MYELIN_REQUIRE_KVM=1 for this row so a real Firecracker microVM MUST boot.
+        GateRow {
+            id: "AG-D4/CI-T1",
+            title: "prod-image escape re-confirm → the COMMITTED prod CI runner image boots a real Firecracker microVM, runs the adversarial corpus, 0 escapes (proven-on-real-hardware)",
+            proof_command: &[
+                "test",
+                "-p",
+                "myelin-ci-sandbox",
+                "--features",
+                "integration",
+                "--test",
+                "escape_drill_ci_committed_gate_reconfirm_test",
+            ],
+            permanent: true,
+            floor: None,
+        },
+        // STOR-D1/D2 — restore-verify on the CI stores: PERMANENT, --features integration.
+        GateRow {
+            id: "STOR-D1/D2",
+            title: "restore-verify on the CI stores → cross-seam OLTP↔blob↔index↔offset restore to a consistent point; RPO/RTO within bound, 0 loss (real PG + RustFS)",
+            proof_command: &[
+                "test",
+                "-p",
+                "myelin-ci-controlplane",
+                "--features",
+                "integration",
+                "--test",
+                "integration_ci_p27_restore_verify_ci_stores",
+            ],
+            permanent: true,
+            floor: None,
+        },
+        // ---- Issues (myelin-issues) ----
+        row(
+            "ISS-P06",
+            "emit-iff-committed → an Issues write co-commits its outbox event in the same transaction; a rollback emits 0",
+            &["test", "-p", "myelin-issues", "--test", "drill_iss_p06_emit_iff_committed"],
+        ),
+        row(
+            "ISS-D2",
+            "cost-bounding → an adversarial Issues query/automation is cost-bounded and cannot run unbounded work (the resource ceiling holds)",
+            &["test", "-p", "myelin-issues", "--test", "drill_iss_d2_cost_bounding"],
+        ),
+        row(
+            "ISS-D3",
+            "setexpr zero-leak → an Issues list SetExpr push-down lowers the authz predicate into the query; 0 cross-tenant / unauthorized rows leak",
+            &["test", "-p", "myelin-issues", "--test", "drill_iss_d3_setexpr_zero_leak"],
+        ),
+        row(
+            "ISS-D4",
+            "create-storm → a burst of concurrent issue creates serializes without a lost write / duplicate key collision",
+            &["test", "-p", "myelin-issues", "--test", "drill_iss_d4_create_storm"],
+        ),
+        row(
+            "ISS-D5",
+            "reorder zero-clobber → concurrent rank/reorder ops converge without clobbering a sibling's position (no lost reorder)",
+            &["test", "-p", "myelin-issues", "--test", "drill_iss_d5_reorder_zero_clobber"],
+        ),
+        row(
+            "ISS-D6-calendar",
+            "SLA business-calendar → an SLA timer honours the business calendar (working hours/holidays) — fires at the correct deadline",
+            &["test", "-p", "myelin-issues", "--test", "drill_iss_d6_sla_business_calendar"],
+        ),
+        row(
+            "ISS-D6-escalation",
+            "SLA escalation → a breached SLA escalates up the ladder exactly once, without double-paging",
+            &["test", "-p", "myelin-issues", "--test", "drill_iss_d6_sla_escalation"],
+        ),
+        row(
+            "ISS-D7",
+            "stateful trigger → a stateful Issues automation trigger fires deterministically on the right state transition (no spurious / missed fire)",
+            &["test", "-p", "myelin-issues", "--test", "drill_iss_d7_stateful_trigger"],
+        ),
+        row(
+            "ISS-D8-rollup",
+            "rollup → a read-time Issues rollup is permission-filtered (conjoin); 0 leak across the aggregate",
+            &["test", "-p", "myelin-issues", "--test", "drill_iss_d8_rollup"],
+        ),
+        row(
+            "ISS-D8-olap",
+            "OLAP feed → the Issues OLAP feed is consistent with the OLTP projection; no resurrected/erased rows in the analytics feed",
+            &["test", "-p", "myelin-issues", "--test", "drill_iss_d8b_olap_feed"],
+        ),
+        row(
+            "ISS-D9",
+            "import → an Issues import round-trips deterministically; no dropped / duplicated / mis-mapped issue on re-import",
+            &["test", "-p", "myelin-issues", "--test", "drill_iss_d9_import"],
+        ),
+        row(
+            "ISS-D11",
+            "erase-reaches-every-holder → an Issues erase reaches every holder (issue + comments + attachments + projections); 0 recoverable residual",
+            &["test", "-p", "myelin-issues", "--test", "drill_iss_d11_erase_reaches_every_holder"],
+        ),
+        row(
+            "ISS-D13",
+            "board sync → the Issues board view stays consistent with the underlying issue state under concurrent moves (no lost/ghost card)",
+            &["test", "-p", "myelin-issues", "--test", "drill_iss_d13_board_sync"],
+        ),
+        // ---- Chat (myelin-chat) ----
+        row(
+            "CHAT-D5-unfurl",
+            "unfurl no-leak → a chat link unfurl never leaks content the viewer cannot see (the unfurl is authz-filtered, 0 cross-tenant leak)",
+            &["test", "-p", "myelin-chat", "--test", "drill_chat_d5_unfurl_no_leak"],
+        ),
+        row(
+            "CHAT-D5-humanise",
+            "humanise no-leak → message humanisation (key/name resolution) never leaks an unauthorized display name / identity",
+            &["test", "-p", "myelin-chat", "--test", "drill_chat_d5_humanise_leak"],
+        ),
+        row(
+            "CHAT-D6/D7/D18",
+            "invalidation → an unfurl/cache invalidation propagates correctly (a stale unfurl is invalidated on source change; no stale read)",
+            &["test", "-p", "myelin-chat", "--test", "drill_chat_d6_d7_d18_invalidation"],
+        ),
+        row(
+            "CHAT-D8",
+            "erasure cascade → a chat erase cascades to every holder (message body + DEK + mentions + index); 0 recoverable residual PII",
+            &["test", "-p", "myelin-chat", "--test", "drill_chat_d8_erasure_cascade"],
+        ),
+        row(
+            "CHAT-D9",
+            "HITL exactly-once → a chat agent's human-approved effect applies exactly once across replay (no double-apply)",
+            &["test", "-p", "myelin-chat", "--test", "drill_chat_d9_hitl_exactly_once"],
+        ),
+        row(
+            "CHAT-D10",
+            "HITL per-effect → each chat agent effect is gated by its own approval (per-effect HITL; an approval never blanket-approves a sibling)",
+            &["test", "-p", "myelin-chat", "--test", "drill_chat_d10_hitl_per_effect"],
+        ),
+        row(
+            "CHAT-D11",
+            "search ACL → a chat search reads 0 messages the viewer cannot see (the search ACL pre-filter holds; revoke reflected)",
+            &["test", "-p", "myelin-chat", "--test", "drill_chat_d11_search_acl"],
+        ),
+        row(
+            "CHAT-D12",
+            "read-state → chat read-state fan-out/dedup is consistent across surfaces (no lost/double read marker)",
+            &["test", "-p", "myelin-chat", "--test", "drill_chat_d12_read_state"],
+        ),
+        row(
+            "CHAT-D15",
+            "reindex parity → a cold chat re-index pass equals the live projection; no stale/dup/resurrected message rows",
+            &["test", "-p", "myelin-chat", "--test", "drill_chat_d15_reindex_parity"],
+        ),
+        row(
+            "CHAT-D16",
+            "streaming → the chat live-streaming path delivers ordered frames; resume after a drop replays exactly, no lost/dup frame",
+            &["test", "-p", "myelin-chat", "--test", "drill_chat_d16_streaming"],
+        ),
+        row(
+            "CHAT-D17",
+            "explicit-first → a chat agent's explicit (human-issued) instruction takes precedence over an inferred one (the explicit-first ordering holds)",
+            &["test", "-p", "myelin-chat", "--test", "drill_chat_d17_explicit_first"],
+        ),
+        // ---- contract-coverage re-affirm ----
+        GateRow {
+            id: "contract-coverage",
+            title: "the contract-coverage scanner re-affirms the M4 CDC rows — no falsely-claimed/dropped row",
+            proof_command: &["run", "-p", "myelin-lints", "--bin", "contract-coverage"],
+            permanent: false,
+            floor: None,
+        },
+    ]
+}
+
 /// The verdict of one recorded scorecard row. A `Pass` is only constructible WITH a non-empty
 /// proof line (the dated green artifact the proof command emitted) — a green must be earned, it
 /// cannot be flipped from nothing (the ratchet's "no green without proof" half).
@@ -1326,6 +1603,12 @@ impl Scorecard {
                 "GIT-D1/D2/D3/D7/D8/D9(+seam)/D10/D11(+int) + KN-D1/D3(floor)/D4/D5/D6/D7/D9/D10/D11/D12/D13 \
                  + contract-coverage",
                 "M4",
+            ),
+            Band::M4Consumers => (
+                "CI-D9/D1/D5/D8/D11/D6/D4/D7 + AG-D4/CI-T1 (prod-image re-confirm, real microVM) + \
+                 STOR-D1/D2 (restore-verify on CI stores) + ISS-P06/D2/D3/D4/D5/D6/D7/D8/D9/D11/D13 + \
+                 CHAT-D5/D6/D7/D18/D8/D9/D10/D11/D12/D15/D16/D17 + contract-coverage",
+                "M5",
             ),
         };
         let mut out = String::new();
@@ -1488,6 +1771,58 @@ impl Scorecard {
                      fan-out) needs real fleet hardware (a multi-node cluster), so it is deferred to \
                      **M5** — not run on a single dev box. Everything else in M3 is proven with a dated \
                      artifact above. The deferral is visible, never invisible (EI-01 §1).\n",
+                );
+            }
+            Band::M4Consumers => {
+                out.push_str(
+                    "**Two PERMANENT integration rows are RED-until-proven against the LIVE substrate.** \
+                     The AG-D4/CI-T1 prod-image re-confirm and the STOR-D1/D2 restore-verify on the CI \
+                     stores run `--features integration` against the live docker-compose stack (Postgres \
+                     / RustFS / Valkey / NATS JetStream); the AG-D4 row additionally needs a real \
+                     KVM-capable host. A DB-free (or non-KVM) run cannot flip them green — the proof \
+                     command FAILS. Every other CI / Issues / Chat row is a deterministic per-feature \
+                     drill / CDC pair that runs with no external backend. The two permanent rows are the \
+                     re-run-forever markers: AG-D4 (the real-kernel escape gate, EI-01 §2 — RCE/sandbox \
+                     escape outranks every feature) and STOR-D1/D2 (the shared Storage-owned restore \
+                     gate — a backup never restored is not a backup, EI-01 §3).\n\n",
+                );
+                out.push_str(
+                    "**AG-D4/CI-T1 is PROVEN-ON-REAL-HARDWARE, NOT vacuous.** The prod-image re-confirm \
+                     runs `--features integration` with `MYELIN_REQUIRE_KVM=1` set by the scorecard \
+                     runner: on a host without /dev/kvm or firecracker the drill HARD-FAILS (it does not \
+                     skip), so this row only goes green when the COMMITTED prod CI runner image actually \
+                     boots a real Firecracker microVM, runs the adversarial corpus, and attests 0 \
+                     escapes.\n\n",
+                );
+                out.push_str("**AG-D4/CI-T1 — three NAMED residuals (proven-on-real-hardware is not absence-of-all-escapes):**\n");
+                out.push_str(
+                    "- (a) **one green run proves THIS config against THIS battery on THIS kernel** — \
+                     continuous fuzzing + full CVE-corpus tracking + a pre-GA third-party pentest \
+                     remain ongoing; a single green is necessary, not sufficient-forever.\n",
+                );
+                out.push_str(
+                    "- (b) **production must run on KVM-capable Scaleway hardware** (Elastic Metal / \
+                     nested-virt) — an explicit infra requirement; on a non-KVM box this gate cannot \
+                     be greened (the row hard-fails, never fakes green).\n",
+                );
+                out.push_str(
+                    "- (c) **single-box ≠ fleet** — multi-tenant density / blast-radius at 30× load \
+                     still overlaps the unproven world-scale LOAD floor below.\n\n",
+                );
+                out.push_str(
+                    "**The ONE true remaining floor (named, dated deferral — NOT a row that reds this gate):** \
+                     the **world-scale 30× LOAD / surge drills** (FLOW-D8 / AG-D6 / the CHAT + Issues \
+                     surge under fleet-scale fan-out) need real fleet hardware (a multi-node cluster), so \
+                     they are deferred to **M5** — not run on a single dev box. Everything else in M4 is \
+                     proven with a dated artifact above. The deferral is visible, never invisible \
+                     (EI-01 §1).\n\n",
+                );
+                out.push_str(
+                    "**Named residual (not a floor, run-when-available):** gVisor (`runsc`) as a \
+                     SECOND escape-drill backend (CI-P28) — runsc is on PATH but running the corpus \
+                     under it needs an OCI bundle + root/userns privileges this host lacks; the \
+                     AG-D4 attestation records it as a NAMED parametrized residual, never faked \
+                     green. Firecracker (the production default) IS the exercised gate backend.\n",
                 );
             }
         }
@@ -2251,5 +2586,211 @@ mod tests {
         assert!(card
             .render_markdown("2026-06-22")
             .contains("RED — M4 is BLOCKED"));
+    }
+
+    // ---- M4 consumer-subsystems exit gate (M4 → M5) ----
+
+    /// The M4 required row set covers all three consumer families: CI (CI-D9/D1/D5/D8/D11/D6/D4/D7 +
+    /// the two permanent integration gates AG-D4/CI-T1 + STOR-D1/D2), Issues (ISS-P06/D2..D13), and
+    /// Chat (CHAT-D5..D17), plus the contract-coverage re-affirm. The frozen-row ratchet asserts a
+    /// future edit cannot silently shrink the proof set, and the band dispatch returns the same set.
+    #[test]
+    fn m4_required_rows_cover_the_consumer_families() {
+        let ids: Vec<&str> = m4_required_rows().iter().map(|r| r.id).collect();
+        for must in [
+            // CI
+            "CI-D9",
+            "CI-D1",
+            "CI-D5",
+            "CI-D8/GIT-D10",
+            "CI-D11",
+            "CI-D6",
+            "CI-D4",
+            "CI-D7",
+            "AG-D4/CI-T1",
+            "STOR-D1/D2",
+            // Issues
+            "ISS-P06",
+            "ISS-D2",
+            "ISS-D3",
+            "ISS-D4",
+            "ISS-D5",
+            "ISS-D6-calendar",
+            "ISS-D6-escalation",
+            "ISS-D7",
+            "ISS-D8-rollup",
+            "ISS-D8-olap",
+            "ISS-D9",
+            "ISS-D11",
+            "ISS-D13",
+            // Chat
+            "CHAT-D5-unfurl",
+            "CHAT-D5-humanise",
+            "CHAT-D6/D7/D18",
+            "CHAT-D8",
+            "CHAT-D9",
+            "CHAT-D10",
+            "CHAT-D11",
+            "CHAT-D12",
+            "CHAT-D15",
+            "CHAT-D16",
+            "CHAT-D17",
+            // coverage
+            "contract-coverage",
+        ] {
+            assert!(
+                ids.contains(&must),
+                "M4 gate is missing required row {must}"
+            );
+        }
+        // All three families present (not just one): a CI-*, an ISS-*, and a CHAT-* row each.
+        assert!(ids.iter().any(|id| id.starts_with("CI-")));
+        assert!(ids.iter().any(|id| id.starts_with("ISS-")));
+        assert!(ids.iter().any(|id| id.starts_with("CHAT-")));
+        // The band dispatch returns the same frozen set (the single dispatch point).
+        assert_eq!(
+            Band::M4Consumers
+                .required_rows()
+                .iter()
+                .map(|r| r.id)
+                .collect::<Vec<_>>(),
+            ids
+        );
+    }
+
+    /// EXACTLY the two permanent rows (AG-D4/CI-T1 + STOR-D1/D2) are the M4 permanent gates AND the
+    /// only `--features integration` rows. AG-D4/CI-T1 targets the prod-image re-confirm drill (the
+    /// real-kernel escape gate, EI-01 §2); STOR-D1/D2 targets the CI-store restore-verify drill.
+    #[test]
+    fn m4_permanent_rows_are_the_two_integration_gates() {
+        let perm: Vec<&str> = m4_required_rows()
+            .into_iter()
+            .filter(|r| r.permanent)
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(
+            perm,
+            vec!["AG-D4/CI-T1", "STOR-D1/D2"],
+            "the M4 permanent set is exactly the prod-image escape re-confirm + the CI-store restore-verify"
+        );
+        let integration: Vec<&str> = m4_required_rows()
+            .into_iter()
+            .filter(|r| {
+                r.proof_command.contains(&"--features") && r.proof_command.contains(&"integration")
+            })
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(
+            integration,
+            vec!["AG-D4/CI-T1", "STOR-D1/D2"],
+            "exactly the two permanent rows run --features integration (red-until-proven)"
+        );
+        let ag = m4_required_rows()
+            .into_iter()
+            .find(|r| r.id == "AG-D4/CI-T1")
+            .unwrap();
+        assert!(ag
+            .proof_command
+            .contains(&"escape_drill_ci_committed_gate_reconfirm_test"));
+    }
+
+    /// No M4 row carries a `floor` note — the one true remaining floor (the world-scale 30× LOAD /
+    /// surge) is a named deferral in the rendered artifact, NOT a smoke-floor row that reds the gate.
+    #[test]
+    fn m4_has_no_floor_rows() {
+        assert!(m4_required_rows().iter().all(|r| r.floor.is_none()));
+    }
+
+    /// A fully-proven M4 scorecard reads GREEN, renders the M5-may-start verdict, AG-D4/CI-T1's three
+    /// NAMED residuals + the non-vacuous KVM mechanism, and the ONE true remaining floor (the
+    /// world-scale 30× LOAD / surge drills, M5) + the gVisor CI-P28 residual as named, visible
+    /// deferrals that do NOT red the gate (EI-01 §1).
+    #[test]
+    fn m4_all_rows_proven_is_green_with_residuals_and_floor_named() {
+        let mut card = Scorecard::new(Band::M4Consumers);
+        for r in m4_required_rows() {
+            card.record(RowResult::pass(
+                r.id,
+                format!("[2026-06-24] PASS {}", r.id),
+                "2026-06-24",
+            ));
+        }
+        assert!(card.is_green(), "every M4 row proven ⇒ green");
+        assert!(card.missing_required().is_empty());
+        let md = card.render_markdown("2026-06-24");
+        assert!(md.contains("GREEN — M5 may start"));
+        // AG-D4/CI-T1 non-vacuous: MYELIN_REQUIRE_KVM + proven-on-real-hardware named.
+        assert!(
+            md.contains("MYELIN_REQUIRE_KVM"),
+            "AG-D4/CI-T1 non-vacuous mechanism must be named"
+        );
+        assert!(md.contains("PROVEN-ON-REAL-HARDWARE"));
+        // AG-D4/CI-T1's three residuals (a)/(b)/(c).
+        assert!(md.contains("THIS kernel"), "residual (a) must be named");
+        assert!(md.contains("Scaleway"), "residual (b) must be named");
+        assert!(
+            md.contains("single-box ≠ fleet"),
+            "residual (c) must be named"
+        );
+        // STOR-D1/D2 permanent restore gate named.
+        assert!(
+            md.contains("restore"),
+            "the STOR-D1/D2 permanent restore gate must be named"
+        );
+        // The one true floor + the gVisor named residual.
+        assert!(
+            md.contains("world-scale 30× LOAD"),
+            "the one true 30× / surge floor must be named"
+        );
+        assert!(md.contains("M5"), "the floor is deferred to M5");
+        assert!(
+            md.contains("CI-P28"),
+            "the gVisor second-backend residual must be named"
+        );
+    }
+
+    /// THE RATCHET on the M4 set: dropping ANY single row reds the M4→M5 gate (you cannot ship M5
+    /// over a missing consumer-subsystem drill).
+    #[test]
+    fn m4_dropping_any_row_reds_the_gate() {
+        for dropped in m4_required_rows() {
+            let mut card = Scorecard::new(Band::M4Consumers);
+            for r in m4_required_rows()
+                .into_iter()
+                .filter(|r| r.id != dropped.id)
+            {
+                card.record(RowResult::pass(r.id, "[2026-06-24] PASS", "2026-06-24"));
+            }
+            assert_eq!(card.missing_required(), vec![dropped.id]);
+            assert!(
+                !card.is_green(),
+                "dropping {} must RED the M4→M5 gate",
+                dropped.id
+            );
+        }
+    }
+
+    /// THE RATCHET on the M4 set: a claimed-not-proven row (e.g. the prod-image re-confirm that did
+    /// not really boot a microVM) keeps the gate RED — recorded honestly, never softened into a green
+    /// (EI-01 §3). The honest red blocks M5.
+    #[test]
+    fn m4_claimed_not_proven_row_reds_the_gate() {
+        let mut card = Scorecard::new(Band::M4Consumers);
+        for r in m4_required_rows() {
+            if r.id == "AG-D4/CI-T1" {
+                card.record(RowResult::claimed_not_proven(
+                    r.id,
+                    "MYELIN_REQUIRE_KVM=1 but no microVM booted — a vacuous green is refused, recorded RED",
+                    "2026-06-24",
+                ));
+            } else {
+                card.record(RowResult::pass(r.id, "[2026-06-24] PASS", "2026-06-24"));
+            }
+        }
+        assert!(!card.is_green(), "a claimed-not-proven M4 row blocks M5");
+        assert_eq!(card.not_proven().len(), 1);
+        assert!(card
+            .render_markdown("2026-06-24")
+            .contains("RED — M5 is BLOCKED"));
     }
 }
