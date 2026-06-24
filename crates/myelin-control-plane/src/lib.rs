@@ -76,11 +76,34 @@
 //! so it is OUTSIDE the eleven-crate library graph modelled by `myelin_substrate::crate_graph`
 //! (`substrate_is_root()` is preserved — a service is the graph's terminal consumer).
 //!
+//! ## What P-CP-19 / P-429 adds ([`cross_cell_bridge`]) — the `CrossCellPointer` bridge goes LIVE
+//! The frozen-not-live [`myelin_tenancy::CrossCellPointer`] frame gets its **resolution path**
+//! (architecture §6.2, always cell-local; contract 12.6 — now LIVE). [`CrossCellBridge::resolve`]
+//! dispatches a cross-cell resolve to the pointer's **home cell** through the [`CellLocalResolver`]
+//! seam (production: `myelin_refs_service::ResolveService`'s 5.2 `resolve(ref, viewer, mode)`); the
+//! resolve is **permission-checked IN the home cell** against ITS tuples, and **ONLY** the
+//! already-rendered, already-permission-filtered [`BridgeResolution`] (a [`BridgeProjection`] or a
+//! [`BridgeTombstone`]) crosses back — never raw rows, never PII that should stay in B. The bridge
+//! carries ONLY the four frozen frame fields across (`subject`/`type`/`correlation_id`/`home_cell`).
+//! [`CrossCellBridge::rollup`] lights up the **ISS cross-cell portfolio rollup** (aggregate
+//! projections, exclude tombstones); the per-pointer [`CrossCellBridge::resolve`] lights up **KN
+//! cross-cell collab + CHAT cross-org channels** (resolve membership/content in the home cell; an
+//! unauthorised viewer gets a tombstone). The CP-D8 zero — `cross_cell_raw_rows` — is pinned to 0 (the
+//! PII-free-bridge proof). **The single-cell-resolution floor (P-CP-05/P-CP-08) is PROMOTED.**
+//!
 //! ## Floors named (deferred bodies → filling prompt) — VISION §3 name-your-floors
-//! - **`member_cells` is single-element in v1.** The multi-element cross-cell fan-out + the
-//!   multi-cell `CrossCellPointer` resolution is the **M5 floor, P-CP-19 / P-CP-20** (bridge
-//!   resolution live + the fan-out). The schema field is a `Vec<CellId>` (so the shape is frozen)
-//!   but every v1 placement carries exactly one member cell (its home), asserted in tests.
+//! - **The bridge RESOLUTION is LIVE (P-CP-19 / P-429, [`cross_cell_bridge`]).** What still rides
+//!   **P-CP-20**: the multi-element `member_cells` FAN-OUT that *produces* the cross-cell pointer set
+//!   (`placement_of` returns a single-element set in v1; the rollup MECHANISM over a caller-supplied
+//!   set is live now), the cross-cell DSR fan-out, the cross-cell **zookie consistency** (the hardest
+//!   sub-problem), and multi-cell rebalancing. The schema `member_cells` field is a `Vec<CellId>` (so
+//!   the shape is frozen) but every v1 placement carries exactly one member cell (its home), asserted
+//!   in tests.
+//! - **`[OPEN — LEGAL]` the cross-cell bridge residency proof** (counsel sign-off that
+//!   `subject`/`type`/`correlation_id` are not personal data for a tenant) ships REGARDLESS of
+//!   ratification — the bridge is PII-free by construction (the four-field frozen frame + a filtered
+//!   projection/tombstone, never a raw row), so the engineering floor is met today; the legal sign-off
+//!   is a parallel residual, named here in writing (architecture §6 / EI-04 §1).
 //! - **`placement_of` + the gateway misroute-reject (layer 4, CP-D2) are LIVE (P-CP-08 / P-084,
 //!   [`placement_of`]).** [`Registry::placement_of`] returns the frozen routing tuple `{region,
 //!   home_cell, member_cells, isolation_tier, status}` (`member_cells` single-element in v1 — the
@@ -154,6 +177,7 @@
 //!   `cell_provisioning` log records each gating step.
 
 pub mod cp_outage;
+pub mod cross_cell_bridge;
 pub mod discover;
 pub mod four_layer;
 pub mod holder;
@@ -172,6 +196,10 @@ pub mod self_host;
 pub use cp_outage::{
     cp_outage_bound, ControlPlane, CpOutageReport, DataPlane, DegradeScope, ServeFailure, Served,
     SignupDegraded, SignupPlane,
+};
+pub use cross_cell_bridge::{
+    bridge_carried_fields, BridgeMode, BridgeProjection, BridgeResolution, BridgeTombstone,
+    BridgeTombstoneReason, CellLocalResolver, CellResolverRegistry, CrossCellBridge, ViewerId,
 };
 pub use discover::{DiscoverKey, DiscoveryCache, DiscoverySignals, RouteTuple};
 pub use four_layer::{
