@@ -27,6 +27,15 @@
 //!   gate joins against). The home cell is a settable VALUE (cross-org NON-FORECLOSURE; the single
 //!   home-cell is the M4 floor, federation rides CHAT-P30 / 12.6). Contracts 11.1 (OLTP tier) / 12.1
 //!   (partition key). The membership→`write_tuples`→zookie co-commit + new-enemy guard is CHAT-P8.
+//! - [`membership`] — **CHAT-P8 / P-402**: membership→`write_tuples`→zookie in ONE transaction + the
+//!   new-enemy guard + the send/membership `check` gate (contracts 4.6 / 4.10 / 4.9 / 4.2 / 2.2). A
+//!   membership change writes the frozen `channel.member`/`watcher` tuples (returning the zookie),
+//!   STAMPS the returned zookie on the conversation ([`conversation::Conversation::acl_zookie`]) in
+//!   the SAME tx as the membership row + the `chat.channel.member_*` event — so a just-revoked grant
+//!   cannot read stale (the new-enemy guard; a strong, stamped read denies post-revoke). The
+//!   send/membership gate ([`membership::MembershipGate`]) is `Id.check`-backed + fail-closed; the
+//!   channel lifecycle events (`created`/`archived`/`linked` → `refs.edge.created`) ride the outbox.
+//!   The cross-org / federated channels follow-on (M5-C-X1 / CHAT-P30 / P-504) rides the 12.6 bridge.
 //! - [`dek`] — **CHAT-P6 / P-400**: the per-subject-DEK encryption of the message bodies + drafts
 //!   (contract 11.4 / GD-4). The `body_inline` / `body_nodes` / composer `draft` are sealed under the
 //!   AUTHOR's per-subject DEK through the ONE shared `myelin_storage::encryption::ColumnCryptor` — the
@@ -104,6 +113,7 @@ pub mod dek;
 pub mod events;
 pub mod glue;
 pub mod holder;
+pub mod membership;
 pub mod rebac_fragment;
 pub mod replay;
 pub mod schema;
@@ -119,6 +129,7 @@ pub use holder::{
     chat_store_classifier, register_chat_holders, ChatHolder, ChatStoreClass, RestrictionFlag,
     CHAT_OLTP_STORE, CHAT_RESIDUAL_POSTURE_REF,
 };
+pub use membership::{MembershipError, MembershipGate, MembershipService, MembershipTupleWriter};
 pub use replay::{ChatReindexSource, ChatReplayKind};
 pub use store::{
     AuthorKind, ColdSegments, ConversationId, MemHotTier, Message, MessageId, MessageState,

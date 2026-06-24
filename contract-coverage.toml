@@ -538,10 +538,16 @@ status = "covered"
 # error (the transaction is dropped without commit → nothing written, emit-iff-committed). A transition
 # carries the transition-level CaveatContext (off the hot list_objects path, OQ-E). The drill proves a
 # denied write co-commits nothing (0 ghost).
+# CHAT-P8 / P-402 (M4-C1) adds the CHAT consumer half: the Chat send/membership gate
+# (myelin_chat::membership::MembershipGate) gates EVERY send + membership mutation on
+# `check(subject, post|manage, channel, Strong@acl_zookie)` and is fail-closed (Deny/Conditional/
+# Id-error all deny). The CDC proves a member sends/reads, a non-member denies, and the strong read at
+# the conversation's acl_zookie honours a just-revoked grant (the new-enemy guard).
 cdc = [
   "crates/myelin-identity-service/tests/cdc_4_2_check.rs",
   "crates/myelin-knowledge/tests/cdc_4_2_4_10_knowledge_per_op_authority.rs",
   "crates/myelin-issues/tests/drill_iss_p06_emit_iff_committed.rs",
+  "crates/myelin-chat/tests/cdc_4_6_4_10_4_9_chat_membership.rs",
 ]
 
 [[contract]]
@@ -637,7 +643,16 @@ title = "write_tuples -> zookie"
 # object) CDC pair ships here. The 4.10 write-half (monotone-advancing zookie) rides this pair;
 # the 4.10 read-half (S8 watermark) is the named floor → P-070 (P-ID-12).
 status = "covered"
-cdc = ["crates/myelin-identity-service/tests/cdc_4_6_write_tuples.rs"]
+# CHAT-P8 / P-402 (M4-C1) adds the CHAT CONSUMER half: a Chat membership change
+# (myelin_chat::membership::MembershipService::{add_member,remove_member}) writes the frozen
+# `channel.member`/`watcher` tuples through `write_tuples` over the REAL engine, STAMPS the returned
+# zookie on the conversation (conversation.acl_zookie) in the SAME tx as the membership row + the
+# `chat.channel.member_*` event — the new-enemy stamp. The consumer↔provider CDC (the channel.read
+# fragment resolves over the live write; the revoke advances the live zookie) ships here.
+cdc = [
+  "crates/myelin-identity-service/tests/cdc_4_6_write_tuples.rs",
+  "crates/myelin-chat/tests/cdc_4_6_4_10_4_9_chat_membership.rs",
+]
 
 [[contract]]
 row = "4.7"
@@ -808,6 +823,11 @@ cdc = [
     "crates/myelin-git/tests/cdc_4_9_git_codeowners.rs",
     "crates/myelin-issues/tests/cdc_4_9_issues_fragment.rs",
     "crates/myelin-chat/tests/cdc_4_9_chat_fragment.rs",
+    # CHAT-P8 / P-402 (M4-C1): the Chat fragment's RUNTIME membership writes — the membership service
+    # writes the `channel.member`/`watcher` tuples and the live engine resolves `channel.read = member
+    # + parent_project->read` over them (a member reads, a project-reader inherits a public channel, a
+    # non-member denies). Closes the CHAT-P2 "runtime membership tuple writes are the CHAT-P8 floor".
+    "crates/myelin-chat/tests/cdc_4_6_4_10_4_9_chat_membership.rs",
     "crates/myelin-ci-controlplane/tests/cdc_4_9_ci_rebac_fragment.rs",
     # CI-P10 (P-353, M4): the CI Trigger & Dispatch CONSUMER of the `read & !is_untrusted_fork` edge.
     # The trust-tier classifier reads the edge's verdict (`read_excludes_fork`) and stamps the SAME
@@ -830,9 +850,14 @@ status = "covered"
 # just-revoked editor's op is rejected (0 stale-grant writes). A stale client zookie cannot downgrade
 # the watermark (the read is at-or-after the page's CURRENT acl_zookie). The consumer CDC + drill ride
 # the 4.2 pair; this row cites the 4.10 read-your-writes half Knowledge consumes.
+# CHAT-P8 / P-402 (M4-C1) adds the CHAT read-your-writes / new-enemy consumer half: a membership
+# `remove_member` ADVANCES the live zookie and RESTAMPS conversation.acl_zookie; a strong read
+# at-or-after that watermark resolves against the post-revoke tuple set, so a just-revoked member is
+# denied (0 stale grants post-revoke). The consumer CDC (add→revoke→read, chained) ships here.
 cdc = [
   "crates/myelin-identity-service/tests/cdc_4_11_fail_static.rs",
   "crates/myelin-knowledge/tests/cdc_4_2_4_10_knowledge_per_op_authority.rs",
+  "crates/myelin-chat/tests/cdc_4_6_4_10_4_9_chat_membership.rs",
 ]
 
 [[contract]]

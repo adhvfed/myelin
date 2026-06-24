@@ -183,6 +183,16 @@ pub struct Conversation {
     pub archived: bool,
     /// The pseudonymous principal id of the creator (erasure-safe; arch §2 `created_by`).
     pub created_by: String,
+    /// **The new-enemy zookie stamp (CHAT-P8; contract 4.6/4.10).** The `Zookie` the LAST membership
+    /// `write_tuples` returned, stamped here in the SAME transaction as the membership row + the
+    /// `chat.channel.member_*` event (the membership module's atomic co-commit). Every
+    /// permission-sensitive read of this conversation (the unfurl/project gate, CHAT-P13) reads
+    /// AT-OR-AFTER this watermark with `ConsistencyMode::Strong`, so a just-revoked grant cannot read
+    /// stale (the new-enemy guard, §5): the read sees the post-revoke tuple set, never the pre-revoke
+    /// one. `None` until the first membership write stamps it (a freshly created channel with no
+    /// members yet has no acl watermark). The opaque token string is Identity's; chat only carries +
+    /// presents it on reads (it never parses the zookie — one consistency primitive, EI-01 §7).
+    pub acl_zookie: Option<String>,
 }
 
 impl Conversation {
@@ -320,6 +330,15 @@ pub trait ConversationStore {
     /// All members of a conversation (the forward direction — `list_subjects(channel, member)` the
     /// read-fanout uses, arch §2.1). Ordered by principal id (stable).
     fn members_of(&self, conv: &ConversationId) -> Result<Vec<Membership>>;
+
+    /// **Stamp the new-enemy zookie on the conversation (CHAT-P8; contract 4.6/4.10).** Persist the
+    /// `Zookie` the membership `write_tuples` just returned onto [`Conversation::acl_zookie`]. In the
+    /// real OLTP binding this is an `UPDATE conversation SET acl_zookie = $z` in the SAME PG
+    /// transaction as the membership row mutation + the `chat.channel.member_*` outbox row (the
+    /// atomic co-commit the membership module drives) — so a just-revoked grant can never read at a
+    /// pre-revoke watermark. A stamp on an absent conversation is a LOUD [`ConversationError::NotFound`]
+    /// (a phantom stamp is never silently dropped).
+    fn stamp_acl_zookie(&self, conv: &ConversationId, zookie: &str) -> Result<()>;
 }
 
 /// The DB-free, behaviour-identical Conversation/Membership OLTP tier model (the unit-test floor;
@@ -447,6 +466,17 @@ impl ConversationStore for MemConversationStore {
             .map(|m| m.values().cloned().collect())
             .unwrap_or_default())
     }
+
+    fn stamp_acl_zookie(&self, conv: &ConversationId, zookie: &str) -> Result<()> {
+        let mut inner = self.lock();
+        match inner.conversations.get_mut(conv) {
+            Some(c) => {
+                c.acl_zookie = Some(zookie.to_string());
+                Ok(())
+            }
+            None => Err(ConversationError::NotFound(conv.conversation_id.clone())),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -471,6 +501,7 @@ mod tests {
             retention_days: Some(90),
             archived: false,
             created_by: "psn:creator".into(),
+            acl_zookie: None,
         }
     }
 
@@ -605,6 +636,7 @@ mod tests {
                 retention_days: None,
                 archived: false,
                 created_by: "psn:c".into(),
+                acl_zookie: None,
             })
             .unwrap();
         store
@@ -620,6 +652,7 @@ mod tests {
                 retention_days: None,
                 archived: false,
                 created_by: "psn:c".into(),
+                acl_zookie: None,
             })
             .unwrap();
         store.join(Membership::member(fr.clone(), "alice")).unwrap();
