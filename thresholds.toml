@@ -442,6 +442,13 @@ human_lane_reservation = 24    # 25% of cap — above the 20% measured human-lan
 retry_after_secs = 5
 
 [[shed_budgets]]
+surface = "SearchQuery"       # the Search QUERY surface (SRCH-P25, SRCH-D6): a CI/agent search-query storm
+                              # sheds before a human's interactive search (the per-tenant bulkhead, §6.3).
+per_tenant_in_flight_cap = 160 # MEASURED: SRCH-D6 30× agent/CI search-query surge shed the machine lanes at this cap; the human search lane held within its interactive latency budget.
+human_lane_reservation = 40    # 25% of cap — above the 20% measured human-lane floor.
+retry_after_secs = 3
+
+[[shed_budgets]]
 surface = "HttpIntake"        # the generic public surface (§7.1): every surface reserves a human fraction.
 per_tenant_in_flight_cap = 200 # MEASURED: SUB-D3 (P-S32) + ID-D9 (P-424) held the human lane at this generic-intake cap.
 human_lane_reservation = 50    # 25% of cap — above the 20% measured human-lane floor.

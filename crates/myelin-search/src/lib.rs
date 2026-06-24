@@ -135,6 +135,7 @@ pub mod residency;
 pub mod restore_verify;
 pub mod shell;
 pub mod subartifact;
+pub mod surge;
 pub mod telemetry;
 pub mod tier3_valve;
 pub mod vector;
@@ -236,6 +237,10 @@ pub use subartifact::{
     block_subdoc_projection, db_field_subdoc_projection, db_row_subdoc_projection,
     line_range_subdoc_facets, line_range_subdoc_projection, AnchorState, ContentAnchoredSpan,
     M4ProducerSubAnchorFloor, SubGrain, FACET_ANCHOR_STATE, FACET_LINE_END, FACET_LINE_START,
+};
+pub use surge::{
+    run_search_surge, SearchShedGate, SearchShedRejection, SearchSurgeReport,
+    FILTERED_ANN_FOLLOW_ON, SEARCH_SURGE_MULTIPLIER, SHARD_SPLIT_IS_MEASURED_ONLY,
 };
 pub use telemetry::{
     signal as telemetry_signal, LabelledSignal, RedLabels, SearchTelemetry, CACHE_RATIO_ABSENT,

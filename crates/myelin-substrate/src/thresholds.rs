@@ -1089,6 +1089,7 @@ fn parse_surface(name: &str) -> Result<Surface, ThresholdError> {
         "GitFrontDoor" => Surface::GitFrontDoor,
         "RefsBacklinkRead" => Surface::RefsBacklinkRead,
         "RefsRefCreate" => Surface::RefsRefCreate,
+        "SearchQuery" => Surface::SearchQuery,
         other => {
             return Err(ThresholdError::Parse(format!(
                 "unknown shed-budget surface `{other}` (not a shed::Surface variant)"
@@ -1104,7 +1105,8 @@ fn parse_surface(name: &str) -> Result<Surface, ThresholdError> {
         | Surface::AgentMention
         | Surface::GitFrontDoor
         | Surface::RefsBacklinkRead
-        | Surface::RefsRefCreate => Ok(s),
+        | Surface::RefsRefCreate
+        | Surface::SearchQuery => Ok(s),
     }
 }
 
@@ -1188,7 +1190,7 @@ mod tests {
         );
         assert_eq!(t.depth_ceilings.soft, 12);
         assert_eq!(t.depth_ceilings.hard, 16);
-        assert_eq!(t.shed_budgets.len(), 8, "one row per shed::Surface");
+        assert_eq!(t.shed_budgets.len(), 9, "one row per shed::Surface");
         assert_eq!(
             t.resilient_client.len(),
             4,
