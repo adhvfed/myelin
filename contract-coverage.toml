@@ -1016,10 +1016,19 @@ status = "covered"
 # (`myelin_issues::refs_glue::emit_content_edges`). The CDC carries the provider (the emit shape + the
 # shared edge aggregate) + the consumer field reads (reference-class never aliases lifecycle), modelled
 # locally (myelin-issues is a producer LEAF).
+# CHAT-P11 / P-405 (M4-C3) adds the CHAT-OWNED producer half: the three structured content nodes
+# (`mention`/`artifact_ref`/`embed`) in a chat message body emit the byte-identical `refs.edge.created`
+# (reference-class) wire shape via the outbox, IN THE SAME TX as the `chat.message.*` content event
+# (`myelin_chat::content::{extract_body_edges, emit_body_edges}`; no standalone edge-write API). The CDC
+# carries the provider (the emit shape + the shared `edge:<source>-><target>` aggregate + the
+# deterministic edge_id) + the consumer field reads (reference-class never aliases lifecycle), modelled
+# locally (myelin-chat is a producer LEAF that cannot depend on the Refs SERVICE crate — the §2.9
+# one-directional edge, the SAME posture as myelin-git's body producer).
 cdc = [
     "crates/myelin-git/tests/cdc_5_4_13_1_git_content_edges.rs",
     "crates/myelin-knowledge/tests/cdc_5_4_5_5_5_6_5_7_knowledge_refs_glue.rs",
     "crates/myelin-issues/tests/cdc_5_4_5_5_5_6_5_7_5_3_6_3_issues_refs_glue.rs",
+    "crates/myelin-chat/tests/cdc_5_4_13_1_chat_content_edges.rs",
 ]
 
 [[contract]]
@@ -2837,11 +2846,21 @@ title = "myelin-content taxonomy (frozen)"
 # + the subset validator REJECTS a Knowledge-only node LOUDLY (never a silent drop). The Issues consumer
 # CDC (cdc_13_1_issues_content_subset.rs) pins the subset agreement; the ISS-D10 gate
 # (roundtrip_iss_d10.rs) is the 100%-round-trip body+comment corpus artifact.
+# CHAT-P11/P-405 adds CHAT as a CONSUMER of the frozen subset: the chat message body is a
+# `myelin-content` block SUBTREE (the consumed Chat SUBSET = the full block set MINUS the Knowledge-only
+# db_view/sync_block/toggle, X-2 — the IDENTICAL subset as Issues, CR-9), round-tripped
+# `render(parse(md)) === md` through the ONE WASM render path (read + send use the identical parser — no
+# second renderer). `myelin_chat::content` LINKS the frozen Block/Inline (never re-defines a node) + the
+# subset validator REJECTS a Knowledge-only node LOUDLY (never a silent drop). The Chat consumer CDC
+# (cdc_5_4_13_1_chat_content_edges.rs, the shared 5.4+13.1 file) pins the subset agreement + the
+# excluded-node reject; the chat instance of KN-D2 (roundtrip_chat_bodies.rs) is the 100%-round-trip
+# message corpus artifact (round-trip-mismatch signal = 0). The per-message CAS (edited_seq) is CHAT-P12.
 status = "covered"
 cdc = [
     "crates/myelin-content/tests/cdc_13_1_taxonomy.rs",
     "crates/myelin-git/tests/cdc_5_4_13_1_git_content_edges.rs",
     "crates/myelin-issues/tests/cdc_13_1_issues_content_subset.rs",
+    "crates/myelin-chat/tests/cdc_5_4_13_1_chat_content_edges.rs",
 ]
 
 [[contract]]

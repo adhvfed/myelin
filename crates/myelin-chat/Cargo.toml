@@ -38,6 +38,16 @@ myelin-identity = { path = "../myelin-identity" }
 # CHAT-P2 (P-244): the one Refs `#sub` grammar + the `mint`/`SubKindRegistration` codec chat
 # registers its `message-`/`thread-` mints with (contract 5.7). Refs owns the grammar; chat mints.
 myelin-refs = { path = "../myelin-refs" }
+# CHAT-P11 (P-405, M4-C3): the FROZEN `myelin-content` taxonomy + the ONE WASM render core (contract
+# 13.1, X-2). Chat CONSUMES a strict SUBSET (paragraph/heading(1..3)/bullet_list/ordered_list/
+# task_list/blockquote/code_block/callout/table/divider/image + the three inline ref nodes
+# mention/artifact_ref/embed; it EXCLUDES db_view/sync_block/toggle). Chat NEVER adds a node outside
+# the frozen subset (a needed change is a whole-workspace contract PR, X-2). `myelin-content` is a
+# mid-DAG shared crate (`-events (+ -refs, -content, -query)`, arch 00 §2.9); a leaf consumer
+# depending on it keeps the §2.9 graph acyclic (nothing depends back on `myelin-chat`) — the SAME
+# sanctioned edge `myelin-git` / `myelin-issues` take. The message body reuses the ONE render path
+# (`render(parse(md)) === md`); chat does NOT author a second renderer (EI-01 §7).
+myelin-content = { path = "../myelin-content" }
 # CHAT-P3 (P-245): the ONE Notif templating + notif-rule surface (contracts 7.3 / 7.6). Chat
 # REGISTERS its humanise template keys (card / agent-message / chat.message.mentioned strings — the
 # ONE templating surface, OQ-L) and its `define_notif_rule` reason set (mentioned / replied /
