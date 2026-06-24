@@ -91,14 +91,28 @@
 //! unauthorised viewer gets a tombstone). The CP-D8 zero — `cross_cell_raw_rows` — is pinned to 0 (the
 //! PII-free-bridge proof). **The single-cell-resolution floor (P-CP-05/P-CP-08) is PROMOTED.**
 //!
+//! ## What P-CP-20 / P-430 adds ([`multi_cell`]) — the deferred multi-cell sub-problems go live
+//! The §6.3 deferred sub-problems the M5 follow-on owed are now built, over the P-CP-19 bridge:
+//! (1) **the cross-cell DSR fan-out mechanism** ([`CrossCellDsrFanOut::fan_out`]) — iterate
+//! `member_cells ∪ home_cell` (contract 10.4) over the bridge transport, merging a COMPLETE
+//! [`MultiCellDsrReceiptSet`], **0 cells missed** (GA-D8); (2) **cross-cell zookie consistency** (the
+//! hardest sub-problem, named explicitly) — [`CrossCellZookieReader::read_through`] bounds a zookie
+//! minted in the home cell read in a member cell to the [`ZOOKIE_STALENESS_BUDGET_SECS`]
+//! bounded-staleness budget, REFUSING ([`ZookieStaleness::PastBound`]) a read past the bound (never a
+//! silent stale serve); (3) **multi-cell rebalancing** ([`Registry::rebalance_member_cell`]) — move a
+//! tenant's workload across member cells SAME region (a cross-region move is rejected by the placement
+//! invariant); (4) **`member_cells` PROMOTED to MULTI-ELEMENT** ([`Registry::add_member_cell`]) —
+//! `placement_of` now returns a multi-element `member_cells` set. **The single-cell `member_cells`
+//! floor (P-CP-08) is PROMOTED** (recorded). No NEW floor (the prompt's DELIVERABLE: "none new"); the
+//! `[OPEN — LEGAL]` bridge-residency proof is the P-CP-19 residual.
+//!
 //! ## Floors named (deferred bodies → filling prompt) — VISION §3 name-your-floors
-//! - **The bridge RESOLUTION is LIVE (P-CP-19 / P-429, [`cross_cell_bridge`]).** What still rides
-//!   **P-CP-20**: the multi-element `member_cells` FAN-OUT that *produces* the cross-cell pointer set
-//!   (`placement_of` returns a single-element set in v1; the rollup MECHANISM over a caller-supplied
-//!   set is live now), the cross-cell DSR fan-out, the cross-cell **zookie consistency** (the hardest
-//!   sub-problem), and multi-cell rebalancing. The schema `member_cells` field is a `Vec<CellId>` (so
-//!   the shape is frozen) but every v1 placement carries exactly one member cell (its home), asserted
-//!   in tests.
+//! - **The bridge RESOLUTION is LIVE (P-CP-19 / P-429, [`cross_cell_bridge`]); the multi-cell sub-
+//!   problems are LIVE (P-CP-20 / P-430, [`multi_cell`]).** The `member_cells` MULTI-ELEMENT floor is
+//!   PROMOTED: `placement_of` returns a multi-element set, the DSR fan-out iterates it, and rebalancing
+//!   edits it (all single-region by the invariant). The schema `member_cells` field is a `Vec<CellId>`
+//!   (the shape was always frozen); P-CP-20 promotes the *capability*. What rides later: the
+//!   world-scale 30× cell-bulkhead surge (P-CP-21) + live tenant migration / measured sizing (P-CP-22).
 //! - **`[OPEN — LEGAL]` the cross-cell bridge residency proof** (counsel sign-off that
 //!   `subject`/`type`/`correlation_id` are not personal data for a tenant) ships REGARDLESS of
 //!   ratification — the bridge is PII-free by construction (the four-field frozen frame + a filtered
@@ -183,6 +197,7 @@ pub mod four_layer;
 pub mod holder;
 pub mod isolation;
 pub mod mirror_allowed;
+pub mod multi_cell;
 pub mod place;
 pub mod placement_of;
 pub mod placement_of_repo;
@@ -212,6 +227,11 @@ pub use holder::{
 pub use isolation::{partition_key, IsolationTier, PartitionKey, PoolStore};
 pub use mirror_allowed::{
     MirrorAllowReason, MirrorDecision, MirrorDenyReason, MirrorGate, MirrorTarget, TransferPolicy,
+};
+pub use multi_cell::{
+    resolve_across_member_cells, CellDsrReceipt, CellLocalEraser, CrossCellDsrFanOut,
+    CrossCellZookieReader, MultiCellDsrReceiptSet, RebalanceReceipt, ZookieStaleness,
+    ZOOKIE_STALENESS_BUDGET_SECS,
 };
 pub use place::{
     CounterMinter, PlaceError, PlacementAnswer, PlacementService, PlacementSignals, TokenMinter,

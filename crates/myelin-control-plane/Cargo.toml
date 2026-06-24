@@ -34,6 +34,16 @@ myelin-substrate = { path = "../myelin-substrate" }
 # TenantId / Region / ResidencyTag / CellId — the (tenant, region) partition key the registry
 # stores (contract 12.1; the immutable Region the placement invariant pins).
 myelin-tenancy = { path = "../myelin-tenancy" }
+# The Zanzibar zookie consistency watermark (`Zookie`, contract 4.10) — REUSED for the cross-cell
+# zookie-consistency leg (P-CP-20 / §6.3: a zookie minted in the home cell read in a member cell,
+# bounded-staleness). There is ONE zookie type in the platform (coherence, EI-01 §7); the cross-cell
+# bounded read-through carries the Id-minted zookie rather than redefining it. `myelin-identity` is a
+# glue crate below the service layer; a service crate consuming it is established precedent
+# (myelin-identity-service / myelin-gdpr-service). No cycle (identity never depends on control-plane).
+myelin-identity = { path = "../myelin-identity" }
+# The `Timestamp` value type (the dated cross-cell DSR receipt-set / GA-D8 artifact). A glue value
+# crate below the service layer; no cycle.
+myelin-events = { path = "../myelin-events" }
 # The PersonalDataHolder trait + the five-tag classify enums + the #[personal_data] derive the
 # registry would carry IF it held PII (it does not — every column is opaque; the
 # control-plane-pii-free lint guards that). The control-plane store auto-registers as a holder
@@ -58,9 +68,6 @@ blake3 = { workspace = true }
 hex = { workspace = true }
 
 [dev-dependencies]
-# Principal/PrincipalId/PrincipalKind — used only to construct a `SubjectRef` in the DSR-surface
-# test (the control-plane holder's surface is empty by construction). DEV-only.
-myelin-identity = { path = "../myelin-identity" }
 # The GDPR/Audit SERVICE crate — DEV-only, for the contract-10.8 CDC pair + the STOR-D4/STOR-D3-GA-face
 # drills (P-GA-15 / P-115). The control-plane is the ONLY crate that sees BOTH the GDPR erasure ledger
 # (10.8, the PROVIDER — `myelin-gdpr-service`) and Storage's `post_restore_reerase` (11.5, the CONSUMER
