@@ -150,6 +150,7 @@ pub mod conversation;
 pub mod dek;
 pub mod erase;
 pub mod events;
+pub mod fanout;
 pub mod glue;
 pub mod holder;
 pub mod membership;
@@ -179,6 +180,11 @@ pub use dek::{decrypt_body, encrypt_body, plaintext_at_rest, subject_dek_erasure
 pub use erase::{
     aggregate_receipt, is_body_unrecoverable, ChatEraseReport, ChatErasureCascade, StoreReceipt,
     CHAT_ERASE_CASCADE_TOKEN,
+};
+pub use fanout::{
+    activity, activity_filter, ambient_post_inbox_writes, fanout_behaviour,
+    no_second_activity_store, resolve_watchers, write_fanout, AddressedRecipient, FanoutBehaviour,
+    Signal, SignalSink, WatcherDirectory, WriteFanoutReason, WATCHER_RELATION,
 };
 pub use holder::{
     chat_store_classifier, register_chat_holders, ChatHolder, ChatStoreClass, RestrictionFlag,

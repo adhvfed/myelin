@@ -678,7 +678,16 @@ title = "list_subjects + explain"
 # the lib unit `list_subjects_50k_member_density_within_budget`; the REAL-density proof (the watcher
 # relation + Chat channels) is the named floor → P-134 (P-ID-23) + M4.
 status = "covered"
-cdc = ["crates/myelin-identity-service/tests/cdc_4_4_list_subjects.rs"]
+# CHAT-P17 / P-412 (M4-C5): the CHAT read-fanout CONSUMER of 4.4 — chat's fanout-class boundary
+# resolves a channel's read-fanout audience via `list_subjects(channel, watcher)` against the REAL
+# `Expand::list_subjects` over the S3→relay→S8 reverse index (fed exactly as production feeds it).
+# This is the named M4 watcher-relation real-density leg for the read-fanout half (the `watcher`
+# userset on the Chat `channel` type); resolving the audience materialises 0 inbox items (the
+# celebrity-fanout mitigation). The fragment-admit slice stays cdc_4_9_chat_fragment.
+cdc = [
+    "crates/myelin-identity-service/tests/cdc_4_4_list_subjects.rs",
+    "crates/myelin-chat/tests/cdc_7_1_7_6_4_4_chat_fanout.rs",
+]
 
 [[contract]]
 row = "4.5"
@@ -1645,6 +1654,12 @@ cdc = [
     # through it) pair — the live trigger/SLA → Signal → inbox wiring that ISS-P04's 7.6 reason set
     # named as a follow-on.
     "crates/myelin-issues/tests/cdc_7_1_7_3_issues_my_work.rs",
+    # CHAT slice — Chat (CHAT-P17 / P-412, M4-C5) pins that its "Activity / Mentions" (S6) scoped view
+    # is a FILTER over the ONE inbox (`myelin_chat::activity_filter` = `InboxFilter::chat_activity`:
+    # subsystem∈{chat} ∧ reason∈{mentioned,replied,thread_watched,approval_requested}), a STRICT SUBSET
+    # (it adds no row), NEVER a second store (§5.3, C-9). `myelin_chat::activity` forwards to Notif's
+    # REAL list_inbox; the `no_second_activity_store` structural check pins 0 chat-private activity store.
+    "crates/myelin-chat/tests/cdc_7_1_7_6_4_4_chat_fanout.rs",
 ]
 
 # 7.2 COVERED at NOTIF-P6 (P-184): mark / snooze / mark_all_read — the ONE read-state truth. The
@@ -1786,6 +1801,12 @@ cdc = [
     # decision (arch §4: write-fanout the bounded high-signal `mention` producer vs read-fanout the
     # unbounded ambient set that never write-amplifies). Notif ADMITS + ROUTES it (zero Notif change).
     "crates/myelin-chat/tests/cdc_7_6_chat_notif_rules.rs",
+    # CHAT WIRING slice — chat (CHAT-P17 / P-412, M4-C5) WIRES the declared rules to behaviour: a
+    # write-fanout Signal (the bounded high-signal set) carries the registered rule key, and the four
+    # keys register into Notif's REAL NotifRuleRegistry (proven by `registry.rule(key).is_some()`). The
+    # static fanout-class decision (CHAT-P3) becomes per-event behaviour (one Signal per ADDRESSED
+    # recipient; 0 per-member writes on an ambient post — the celebrity-fanout mitigation).
+    "crates/myelin-chat/tests/cdc_7_1_7_6_4_4_chat_fanout.rs",
     # GIT slice — git (GIT-P19 / P-263, M3) declares its reason set (review_requested->direct /
     # mentioned->direct / watched->watching, each via the frozen `define_notif_rule` verb reconciled
     # against the §3.1 table) AND wires its REAL PR/repo watcher reverse index behind the frozen
