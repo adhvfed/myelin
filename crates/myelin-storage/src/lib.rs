@@ -574,6 +574,20 @@ pub mod olap_feed;
 // rollups OFF) + the C5 restriction gate REGARDLESS; the LEGAL ratification of which rollups are
 // eligible is the named follow-on. STOR-D1/STOR-D2 remain green (no restore/backup code touched).
 pub mod olap_restrict;
+// The E2E-3 storage half (P-ST-36 / P-447, M5, contract 11.6 the OLAP derived store + 2.6
+// reindex-from-source): cold-reindex == live for the derived stores (OLAP/Search/Refs rebuilt from
+// source) — wipe each derived store, reindex-from-source through the REAL outbox→relay→bus→consumer
+// path, assert the rebuilt projection BYTE-MATCHES live (0 drift), and assert the §7.1/§7.3
+// structural truth that NO derived store has a backup-restore path (derived stores are NOT backed up
+// — reindex-from-source is the only rebuild path). Seals a dated E2E-3 green artifact. REUSES the
+// existing OLAP feed (P-ST-18) + the `myelin_events` reindex/relay/bus seam (2.4/2.6) — never a
+// parallel reindex path (EI-01 §7); Search/Refs are modeled as DerivedStores fed by the SAME seam
+// (Storage cannot link them — they depend on Storage), and the agreement with their real SRCH-D5 /
+// REF-D4 parity is asserted in the dev-dependency CDC. STOR-D1/STOR-D2 remain green (no backup/
+// restore code touched — the derived stores were never in the backup-able set). FLOOR NAMED: the
+// generated projection-feeder index measured-trigger (designed, not built until the volume warrants
+// it, EI-04 §5) is named in the honesty register.
+pub mod e2e3_reindex_parity;
 pub mod oltp;
 pub mod reerase;
 // The reserve/settle cost gate mechanism + the durable per-tenant ledger (P-ST-16 / P-103,
@@ -662,6 +676,10 @@ pub use ci_log_index::{
     CI_LOG_STREAM,
 };
 pub use coloc::{ColocError, ColocatedOltp, ColocatedTx, COLOCATED_OUTBOX_MIGRATION};
+pub use e2e3_reindex_parity::{
+    run_e2e3_storage_half, DerivedReindexSource, DerivedStoreClass, DerivedStoreParity,
+    E2e3StorageArtifact,
+};
 pub use encryption::{
     key_class_for, ColumnCryptor, DekContentWrap, EncryptedColumn, KeyChoiceError, SubjectId,
 };

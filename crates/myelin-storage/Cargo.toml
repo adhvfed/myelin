@@ -121,3 +121,15 @@ myelin-control-plane = { path = "../myelin-control-plane" }
 # dev-dependency back is a CDC consumer reaching DOWN to its provider's test — no build cycle
 # (the same posture as the myelin-control-plane / myelin-lints / myelin-harness dev-deps above).
 myelin-gdpr-service = { path = "../myelin-gdpr-service" }
+# myelin-search + myelin-refs-service are DEV-dependencies ONLY: the E2E-3 reindex-parity CDC pair
+# (tests/cdc_e2e3_reindex_parity.rs, P-ST-36) confirms that storage's derived-store reindex-parity
+# contribution (the PROVIDER — `DerivedStoreClass::ALL` = OLAP/Search/Refs, all cold-reindex==live
+# with NO backup-restore path) AGREES with the REAL Search (`SearchReindexer` / SRCH-D5) and Refs
+# (`RefsReindexer` / REF-D4) cold==live byte-parity drills (the CONSUMERS). Both crates already
+# depend on `myelin-storage` (the normal DAG edge — they consume the KMS/holder substrate); a
+# dev-dependency BACK is the CDC reaching DOWN to corroborate the real reindexers — a dev-only edge
+# Cargo permits (it never enters the storage crate's production/runtime DAG, so no build cycle). The
+# two proofs MEET; neither re-derives the other (the SAME posture as the myelin-gdpr-service /
+# myelin-control-plane dev-deps above).
+myelin-search = { path = "../myelin-search" }
+myelin-refs-service = { path = "../myelin-refs-service" }
