@@ -108,6 +108,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod composer;
 pub mod content;
 pub mod conversation;
 pub mod dek;
@@ -121,6 +122,10 @@ pub mod schema;
 pub mod store;
 pub mod subs;
 
+pub use composer::{
+    detect_pasted_url, AutocompleteKind, AutocompletePort, Draft, DraftKey, DraftStore, EditCas,
+    EditOutcome, EditRequest, MemDraftStore, SlashCommand, SlashMenu, Suggestion, UnfurlIntent,
+};
 pub use content::{
     edge_aggregate_key, emit_body_edges, extract_body_edges, extract_message_edges, is_chat_block,
     paragraph_body, roundtrips_md, validate_subtree, BodyEdge, EdgeRel, MessageBody, SubsetError,

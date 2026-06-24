@@ -117,3 +117,11 @@ myelin-identity-service = { path = "../myelin-identity-service" }
 # `Disposition::NotifiedOnly` (0 auto-spawn, 0 reservation). A DEV-only edge: `myelin-query` sits in
 # the mid-tier of the §2.9 DAG and NOTHING depends back on `myelin-chat`, so the graph stays acyclic.
 myelin-query = { path = "../myelin-query" }
+# CHAT-P12 (P-406, M4-C3): the Search ENGINE — the CDC for contract 6.1 (the `@`/`#` autocomplete) PROVES
+# the REAL `myelin_search::query` ACL-conjoining surface satisfies chat's `composer::AutocompletePort`
+# (Search-backed suggestions; 0 chat-private mention/artifact index — a suggestion the viewer cannot see
+# is excluded by the conjoined `list_objects` `Filter` BEFORE it reaches the composer). A DEV-only edge:
+# the runtime composer holds only the PORT (the gateway wires it to Search), so the production DAG stays
+# acyclic (the SAME posture the D17 dispatch CDC takes with `myelin-query`). `myelin-search` sits in the
+# mid-tier of the §2.9 DAG and NOTHING depends back on `myelin-chat`.
+myelin-search = { path = "../myelin-search" }
