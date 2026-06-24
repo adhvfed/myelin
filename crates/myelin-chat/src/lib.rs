@@ -152,6 +152,7 @@ pub mod erase;
 pub mod events;
 pub mod fanout;
 pub mod glue;
+pub mod hitl;
 pub mod holder;
 pub mod membership;
 pub mod project;
@@ -185,6 +186,13 @@ pub use fanout::{
     activity, activity_filter, ambient_post_inbox_writes, fanout_behaviour,
     no_second_activity_store, resolve_watchers, write_fanout, AddressedRecipient, FanoutBehaviour,
     Signal, SignalSink, WatcherDirectory, WriteFanoutReason, WATCHER_RELATION,
+};
+pub use hitl::{
+    approval_signal_name, auto_deny_on_timeout, build_card_signal, per_effect_idem_key,
+    post_decision, render_card, run_object, CardClick, CardDecision, CardEffect, CardOutcome,
+    CardSignal, ChatApprovalCard, ClickDenied, ClickGate, PostDecisionError, RenderedCardEffect,
+    ResumeTokenMinter, SignalDelivery, SignalPort, SignalPostError, APPROVAL_SIGNAL_PREFIX,
+    APPROVE_PERMISSION, DECLINE_MARKER, TIMEOUT_REASON,
 };
 pub use holder::{
     chat_store_classifier, register_chat_holders, ChatHolder, ChatStoreClass, RestrictionFlag,

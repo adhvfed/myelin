@@ -125,3 +125,12 @@ myelin-query = { path = "../myelin-query" }
 # acyclic (the SAME posture the D17 dispatch CDC takes with `myelin-query`). `myelin-search` sits in the
 # mid-tier of the §2.9 DAG and NOTHING depends back on `myelin-chat`.
 myelin-search = { path = "../myelin-search" }
+# CHAT-P18 (P-413, M4-C6): the durable-workflow ENGINE — the CDC for contracts 9.1/9.4 posts chat's
+# HITL approval-card decision onto the REAL `myelin_flow::FlowExecutor::signal` (the per-effect
+# `idem_key` dedup — a double-click is ONE approval, a partial approval is well-defined) and ASSERTS
+# BYTE PARITY between chat's `per_effect_idem_key` and the engine's frozen `myelin_flow::
+# per_effect_idem_key` (ONE rule, not two, OQ-F). A DEV-only edge: the runtime card holds only the
+# `SignalPort` (the gateway wires it to the engine), so the production DAG stays acyclic — chat is a
+# leaf consumer, NOTHING depends back on `myelin-chat`. `myelin-flow` sits in the mid-tier of the
+# §2.9 DAG (the SAME posture the D17 dispatch CDC takes with `myelin-query`).
+myelin-flow = { path = "../myelin-flow" }
