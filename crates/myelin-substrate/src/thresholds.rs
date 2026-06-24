@@ -81,6 +81,13 @@ pub struct Thresholds {
     pub revocation: Revocation,
     /// The surge load-multiplier (SUB-D3 / the F6 family).
     pub surge: Surge,
+    /// The authz-surge (ID-D9) protected-human-lane latency budget — the p99 the human lane must
+    /// hold within under the 30× authz-hot-path surge (identity §13: authz is the highest-QPS shared
+    /// system; contract 1.8 `auth_decision_latency`). The SHAPE is frozen here (P-ID-31); the NUMBER
+    /// is the default-to-beat measured under the surge. `#[serde(default)]` so an older thresholds
+    /// file (pre-P-ID-31) still parses (falls back to the seed).
+    #[serde(default)]
+    pub authz_surge: AuthzSurge,
     /// W — the fail-static bounded-staleness window (`[OPEN — LEGAL]`, L-1).
     pub fail_static: FailStaticThreshold,
     /// The durability objectives (RPO / RTO), asserted by restore-verify (STOR-D1/D2, SUB-D6).
@@ -133,6 +140,36 @@ pub struct Revocation {
 pub struct Surge {
     /// The multiplier the surge family drives at (default-to-beat: 30×).
     pub multiplier: u32,
+}
+
+/// The authz-surge (ID-D9 / F6) protected-human-lane latency budget (identity §10/§13; contract 1.8
+/// `auth_decision_latency` / 4.11 the shed order on the authz surface).
+///
+/// ID-D9 drives a 30× agent surge on the authz hot path (`check`) — the highest-QPS shared system.
+/// The protected human lane must hold WITHIN this p99 budget while the agent lane sheds (429 +
+/// Retry-After) and cross-tenant impact stays 0. The SHAPE (a measured p99 budget on the human lane
+/// under surge) is frozen here (P-ID-31); the NUMBER is the default-to-beat measured by the ID-D9
+/// drill at 30×. A regression that pushes the human-lane p99 past it is a dated `[[claimed_not_proven]]`
+/// row, never a lowered bar (EI-01 §3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthzSurge {
+    /// The human-lane authz-decision p99 budget under the 30× surge, in MICROSECONDS (`_us`; the
+    /// §2.10 units anchor). A `check` is an in-cell, memo-bounded tuple resolution; the budget is
+    /// the ceiling the protected human lane's p99 stays under while the agent lane is shed. Default-
+    /// to-beat measured by ID-D9 (P-ID-31).
+    pub human_lane_p99_budget_us: u64,
+}
+
+impl Default for AuthzSurge {
+    /// The seed default-to-beat for the human-lane authz p99 under surge: 5 000 µs (= 5 ms). A `check`
+    /// resolved from the in-cell tuple store under the protected lane sits far under this; the surge
+    /// drill (ID-D9, P-ID-31) measures + dates the real number. Generous-but-real: a human-lane p99
+    /// over 5 ms under a 30× surge IS a regression worth a red.
+    fn default() -> Self {
+        AuthzSurge {
+            human_lane_p99_budget_us: 5_000,
+        }
+    }
 }
 
 /// W — the fail-static bounded-staleness window (contract 1.10 / 4.11; architecture §8.2).
@@ -485,6 +522,10 @@ mod tests {
         let t = Thresholds::load_canonical().expect("load");
         assert_eq!(t.revocation.sla_mins, 5, "N = 5 min revocation");
         assert_eq!(t.surge.multiplier, 30, "30× surge");
+        assert_eq!(
+            t.authz_surge.human_lane_p99_budget_us, 5000,
+            "ID-D9 human-lane authz p99 budget = 5 ms (5000 µs)"
+        );
         assert_eq!(t.rpo_rto.rpo_max_mins, 5, "RPO ≤ 5 min");
         assert_eq!(t.rpo_rto.rto_tenant_max_mins, 60, "RTO ≤ 1h/tenant");
         assert_eq!(t.rpo_rto.rto_cell_max_mins, 240, "RTO ≤ 4h/cell");
