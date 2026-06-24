@@ -2267,6 +2267,7 @@ dependencies = [
  "hex",
  "myelin-ci-sandbox",
  "myelin-events",
+ "myelin-flow",
  "myelin-gdpr",
  "myelin-gdpr-service",
  "myelin-harness",

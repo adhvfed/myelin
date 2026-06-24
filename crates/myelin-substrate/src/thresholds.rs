@@ -123,6 +123,14 @@ pub struct Thresholds {
     /// to the §4.1 / 6.3 seeds).
     #[serde(default)]
     pub flex_db: FlexDb,
+    /// The MEASURED cell sizing-band numbers (P-CP-22 / P-431; tenancy §7.1 / ADR-10). The per-cell-
+    /// class `tenants_max` + which capacity dimension BINDS FIRST, set from the load-test + the
+    /// `cell_utilisation` telemetry — replacing the conservative §5.1 defaults. The avoid-migration-
+    /// by-sizing floor (P-CP-05/P-CP-07) is promoted: these are the MEASURED defaults-to-beat (never
+    /// predicted, ADR-10 — the binding dimension is discovered by measurement). `#[serde(default)]` so
+    /// an older thresholds file (pre-P-CP-22) still parses (falls back to the conservative seeds).
+    #[serde(default)]
+    pub cell_sizing: CellSizing,
     /// The scorecard: drills that came back red live here, never edited green (EI-01 §3).
     #[serde(default)]
     pub claimed_not_proven: Vec<ClaimedNotProven>,
@@ -376,6 +384,63 @@ impl Default for FlexDb {
             page_row_cap: 500,
             facet_promotion_ratio: 0.05,
             rollup_read_p99_max_ms: 250,
+        }
+    }
+}
+
+/// **The MEASURED cell sizing-band numbers (P-CP-22 / P-431; tenancy-and-control-plane.md §7.1,
+/// ADR-10 measure-before-shard).**
+///
+/// The §5.1 cell `capacity` vector is multi-dimensional (`tenants_max` / `write_qps_max` /
+/// `storage_bytes_max`); §7.1 says the BINDING dimension — the one a cell class fills first — is
+/// discovered by MEASUREMENT, NEVER predicted. This row records the MEASURED Pool-tier sizing band:
+/// the per-cell `tenants_max` and which dimension bound first under the load test, set from the
+/// `cell_utilisation` telemetry (contract 1.8) — the avoid-migration-by-sizing floor
+/// (P-CP-05/P-CP-07) promoted to a measured default-to-beat. When a cell's MEASURED utilisation
+/// crosses the headroom this band reserves, sealing cannot relieve it, and the live cell→cell
+/// migration (P-CP-22 / [`crate`]'s control-plane `migration` module) is the relief lever.
+///
+/// **MEASURED, not predicted (ADR-10).** The numbers below are the load-test result fed back here as
+/// a dated default-to-beat (the §7.1 `[OPEN → P5, measured]` default-to-beat is now CLOSED — measured,
+/// not the conservative §5.1 seed). A regression that exceeds `tenants_max` headroom is the
+/// MEASURED-hot-cell migration trigger, never a silently-raised bar (EI-01 §3). `#[serde(default)]`
+/// on the parent field + [`Default`] here so an older thresholds file (pre-P-CP-22) still parses
+/// (falls back to the conservative §5.1 seed).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellSizing {
+    /// The MEASURED per-cell-class `tenants_max` for the Pool tier (the tenant-count dimension) — the
+    /// number of tenants one Pool cell admits before the sizing band's headroom is consumed. Measured
+    /// from the load test + the `cell_utilisation` telemetry, replacing the conservative §5.1 seed.
+    pub pool_tenants_max: u32,
+    /// The MEASURED sustained write-QPS ceiling for the Pool tier (the throughput dimension).
+    pub pool_write_qps_max: u32,
+    /// The MEASURED stored-bytes ceiling for the Pool tier (the storage dimension), in bytes.
+    pub pool_storage_bytes_max: u64,
+    /// **Which capacity dimension BINDS FIRST** for the Pool tier — the dimension a Pool cell fills
+    /// before the others, discovered by MEASUREMENT (ADR-10). One of `tenants` / `write_qps` /
+    /// `storage_bytes` — the sizing algorithm (§7.1) reads this to know which utilisation to watch for
+    /// the migration trigger. Measured, NEVER predicted.
+    pub pool_binding_dimension: String,
+    /// The headroom fraction (basis points, `0..10000`) a Pool cell reserves below its binding
+    /// dimension before it is considered "hot" — when MEASURED utilisation crosses
+    /// `binding_max * (1 - headroom)`, sealing cannot relieve it and the live migration (P-CP-22) is
+    /// the lever. Default-to-beat: 2000 bps (= 20% headroom). A cell past this is the migration trigger.
+    pub pool_hot_headroom_bps: u32,
+}
+
+impl Default for CellSizing {
+    /// The conservative §5.1 SEED (the pre-measurement default — the avoid-migration-by-sizing floor
+    /// before the load test lands the measured numbers). An older thresholds file falls back to this;
+    /// the canonical file carries the MEASURED P-CP-22 band. The binding dimension defaults to
+    /// `tenants` (the conservative assumption the tenant-count cap binds first); the measured band
+    /// records the ACTUAL binding dimension. Mirrors the §5.1 `Capacity` seed in the registry.
+    fn default() -> Self {
+        CellSizing {
+            pool_tenants_max: 1000,
+            pool_write_qps_max: 5000,
+            pool_storage_bytes_max: 1 << 40,
+            pool_binding_dimension: "tenants".into(),
+            pool_hot_headroom_bps: 2000,
         }
     }
 }

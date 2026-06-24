@@ -66,6 +66,17 @@ myelin-storage = { path = "../myelin-storage" }
 # the attestation is a pure aggregation + sign, so `cargo build --workspace` stays DB-free.
 blake3 = { workspace = true }
 hex = { workspace = true }
+# The durable-workflow engine (contract 9.1 — `DurableExecutor`/`FlowExecutor`/`StartSpec`), the M2
+# substrate now available (myelin-flow, P-FLOW-*). P-CP-22 (P-431) PROMOTES the scripted provisioning
+# (P-CP-11) + the live cell→cell migration onto the durable workflow: the migration/provisioning
+# procedure runs as a `DurableExecutor::start`-ed run (crash-safe + resumable + idempotent on the
+# per-effect idem_key), so a migration that crashes mid-move resumes instead of half-moving a tenant.
+# `myelin-flow` is a SERVICE-layer crate that does NOT depend on the control plane (no cycle — verified),
+# so this is a clean leaf→leaf consumer edge (a documented §2.9 DAG extension, exactly like the storage
+# / gdpr-service edges already declared above). cargo build stays DB-free: the executor is modeled
+# in-memory (the real engine's Postgres six-table model is the named myelin-flow floor); the control
+# plane consumes the engine-agnostic `DurableExecutor` TRAIT, never a concrete DB-bound engine.
+myelin-flow = { path = "../myelin-flow" }
 
 [dev-dependencies]
 # The GDPR/Audit SERVICE crate — DEV-only, for the contract-10.8 CDC pair + the STOR-D4/STOR-D3-GA-face
