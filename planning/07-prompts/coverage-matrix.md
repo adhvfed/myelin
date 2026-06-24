@@ -288,12 +288,45 @@ Roadmap: `../06-roadmaps/subsystems/chat.md`
 
 **Gaps:** none. **Orphans:** none.
 
+### Production Readiness & Security Hardening (M7, 25 prompts)
+
+Cross-cutting band (not a single Phase-6 roadmap system). Motivation + per-finding disposition:
+[`production-readiness-audit.md`](production-readiness-audit.md). Bodies:
+[`by-system/production-readiness.md`](by-system/production-readiness.md). Each prompt's "milestone" is the audit
+FINDING it fills (F1..F11), not a Phase-6 roadmap milestone — M7 is a post-M6 hardening band that closes the
+documented structural/durability/crypto/supply-chain/sandbox-exec floors the executed code (P-001..P-434) left open.
+
+| Audit finding (the floor M7 fills) | Prompt(s) |
+|---|---|
+| F6 Durable persistence (in-memory identity stores → live OLTP/cache) | P-522 (impl), P-523 (verify) |
+| F7 KMS & encryption (software-floor root → HSM-class; zeroization) | P-524 (impl), P-525 (verify) |
+| F2 Authentication (StructuralVerifier/Signer → real OIDC/SAML/WebAuthn/SSH + signed tokens/DPoP/attestation) | P-526 (impl), P-527 (impl), P-528 (verify) |
+| F3 Token & authz expiry (expired-grant-cannot-authorize proof) | P-528 (verify) |
+| F8 Backup & restore (modeled-WAL → real pg_basebackup/pg_restore/PITR; measured RPO/RTO) | P-529 (impl), P-530 (verify) |
+| F9 Tenant & residency isolation (SET LOCAL RLS, reset-on-release, mTLS) | P-531 (impl) |
+| F10 Secret handling (redacted Debug / zeroize / no-leak proof) | P-532 (impl), P-533 (verify) |
+| F11 Supply-chain & governance (pin / cargo-deny / SBOM / reproducible / SECURITY.md) | P-534, P-535, P-536, P-537, P-538 |
+| F1 Production runtime (OS-signal drain + OTel export + trace propagation) | P-539 (impl) |
+| F5 Gate & evidence integrity (fail-not-skip, mandatory mutation, immutable attestations, truth-up) | P-540 (impl), P-541 (verify) |
+| F4 Sandbox — job-exec path (neither backend runs `JobSpec.command` through production `launch()`: Firecracker `oneshot=true`/`init=/bin/true`; gVisor probes `runsc --version` only) → real microVM/runsc job runner | P-544 (impl), P-545 (verify) |
+| F4 Sandbox — independent external review + prod-image escape drill re-run | P-542 (record) |
+| F5/F11 Penetration test (external blocker, findings register) | P-543 (record) |
+| F1–F11 aggregate — the fail-closed production-release gate | P-546 (gate) |
+
+**Gaps:** none (every finding/sub-point in the audit maps to ≥1 M7 prompt; FIXED sub-points need no prompt and
+are recorded in the audit). **Orphans:** none (every M7 prompt fills a named audit finding). **Correction:**
+the F4 sandbox job-exec floor was reclassified from FIXED to PARTIAL/UNHANDLED on re-audit (the production
+`launch()` of neither committed backend executes `spec.command`) and is now filled by the new P-544 (impl) +
+P-545 (verify); the release gate moved from P-544 to P-546.
+
 ---
 
 ## 2. Verdict
 
 **COMPLETE.** Every roadmap milestone across all 16 systems maps to at least one prompt, and every one of the
-521 prompts maps to exactly one primary roadmap milestone (no orphan). The mapping was derived two ways and
+521 M0..M6 prompts maps to exactly one primary roadmap milestone (no orphan); the 25 M7 prompts (P-522..P-546)
+each map to exactly one audit finding (no orphan), bringing the total to **546**. The mapping was derived two
+ways and
 they agree: (a) bottom-up from each prompt's own ROADMAP MILESTONE field, and (b) top-down by enumerating every
 milestone heading in each Phase-6 roadmap and confirming it appears here. No milestone heading in any roadmap is
 left without a prompt.

@@ -68,7 +68,7 @@ agent**. The protocol, binding (VISION §8, EI-01 §2/§3/§5):
 
 ---
 
-## 2. The global execution order (P-001 … P-521)
+## 2. The global execution order (P-001 … P-546)
 
 This single ordered list, top-to-bottom, **is the Phase-8 run order**. It is built by the
 `00-ledger-overview.md` §3.2 procedure: primary sort by band (M0 → M6); within a band, topological order by the
@@ -91,6 +91,7 @@ by-system file appears here exactly once.
 | M4 | 101 | P-319 – P-419 | The consumer subsystems (CI + Issues + Chat) |
 | M5 | 86 | P-420 – P-505 | World-scale hardening + floor follow-ons + the whole-system E2E wedge |
 | M6 | 16 | P-506 – P-521 | Dogfooding: Myelin hosts itself |
+| M7 | 25 | P-522 – P-546 | Production readiness & security hardening (fill the structural/durability/crypto/sandbox-exec floors; fail-closed release gate) |
 
 | Global | System | Local id | Band | Title | Depends-on (global) |
 |---|---|---|---|---|---|
@@ -615,16 +616,46 @@ by-system file appears here exactly once.
 | P-519 | knowledge | KN-P34 | M6 | Dogfooding: Myelin's own docs in Knowledge + the switch test driven in a browser | P-484, P-488 |
 | P-520 | issues | ISS-P37 | M6 | Dogfood: Myelin tracks its own issues (the switch test) | P-497 |
 | P-521 | chat | CHAT-P32 | M6 | The switch test: drive the real Chat UI in a browser (the 13 screens + the responsive cases) | P-399, P-501, P-502, P-505 |
+| P-522 | production-readiness | PR-01 | M7 | Bind the live OLTP/cache pool under Identity's principal, tuple, and revocation stores (durable persistence) | P-507 |
+| P-523 | production-readiness | PR-02 | M7 | Verify durable persistence: crash/restart + multi-instance + no in-memory store in the production graph | P-522 |
+| P-524 | production-readiness | PR-03 | M7 | Back the KMS root with a durable HSM-class KMS: root/KEK lifecycle, rotation, recovery, destruction | P-522 |
+| P-525 | production-readiness | PR-04 | M7 | Verify KMS: zeroization, secret-memory handling, and backup-cannot-resurrect-destroyed-keys | P-524 |
+| P-526 | production-readiness | PR-05 | M7 | Real human/SSO credential cryptography: OIDC JWKS, SAML XML-DSig, WebAuthn, SSH challenge | P-522, P-524 |
+| P-527 | production-readiness | PR-06 | M7 | Real token cryptography: signed capability/machine tokens, DPoP proof, TPM attestation | P-522, P-524, P-526 |
+| P-528 | production-readiness | PR-07 | M7 | Verify authentication & authz expiry: no structural verifier in the prod graph; expired grants cannot authorize | P-526, P-527 |
+| P-529 | production-readiness | PR-08 | M7 | Real backup/restore drivers: WAL shipping, base backups, PITR, destructive clean-target restore | P-522, P-524 |
+| P-530 | production-readiness | PR-09 | M7 | Verify backup/restore: MEASURED RPO/RTO over real data at cell scale | P-529 |
+| P-531 | production-readiness | PR-10 | M7 | Production tenant-isolation hardening on the live pool: SET LOCAL RLS, reset-on-release, identifier validation, mTLS | P-522 |
+| P-532 | production-readiness | PR-11 | M7 | Secret-handling sweep: redacted Debug, secrecy/zeroize types, no Serialize on bearer credentials | P-524, P-527 |
+| P-533 | production-readiness | PR-12 | M7 | Verify secret handling: no credential/key reaches any log, trace, or error sink | P-532 |
+| P-534 | production-readiness | PR-13 | M7 | SHA-pin GitHub Actions + digest-pin container images + pin the Rust toolchain | P-507 |
+| P-535 | production-readiness | PR-14 | M7 | cargo-deny: advisory (RUSTSEC) + license + source policy as a committed gate | P-534 |
+| P-536 | production-readiness | PR-15 | M7 | SBOM generation + build provenance (SLSA-style attestation) on release artifacts | P-534, P-535 |
+| P-537 | production-readiness | PR-16 | M7 | Reproducible release builds (the artifact reproduces bit-for-bit from pinned inputs) | P-534, P-536 |
+| P-538 | production-readiness | PR-17 | M7 | SECURITY.md, vulnerability-response policy, and CODEOWNERS review policy | P-507 |
+| P-539 | production-readiness | PR-18 | M7 | Production service-runtime finalization: real OS-signal lifecycle + OpenTelemetry export + trace propagation | P-522 |
+| P-540 | production-readiness | PR-19 | M7 | Gate-integrity hardening: required KVM/sandbox jobs FAIL-not-skip; semantic CDC; mandatory mutation jobs | P-534, P-535 |
+| P-541 | production-readiness | PR-20 | M7 | The truth-up pass: re-run every claimed-green scorecard against the M7 production graph | P-523, P-525, P-528, P-530, P-531, P-533, P-540 |
+| P-542 | production-readiness | PR-21 | M7 | Independent cryptography + sandbox security reviews (external human blockers, recorded) | P-524, P-527, P-529 |
+| P-543 | production-readiness | PR-22 | M7 | Penetration test execution + findings register (external human blocker, recorded) | P-541, P-542 |
+| P-544 | production-readiness | PR-23 | M7 | Firecracker + gVisor production JobSpec.command execution: the real microVM/runsc job runner | P-522, P-524 |
+| P-545 | production-readiness | PR-24 | M7 | Verify production-path sandbox exec + AG-D4 escape corpus through the production path (both backends, 0 escapes) | P-544, P-529, P-542 |
+| P-546 | production-readiness | PR-25 | M7 | THE PRODUCTION-RELEASE GATE (fail-closed; cannot go green over any open floor, mock, scan, or human blocker) | P-522, P-523, P-524, P-525, P-526, P-527, P-528, P-529, P-530, P-531, P-532, P-533, P-534, P-535, P-536, P-537, P-538, P-539, P-540, P-541, P-542, P-543, P-544, P-545 |
 
 ---
 
 ## 3. Totals
 
-- **Total prompts: 521** (across all 16 systems; one clean-context, independently-committable unit each).
-- **Aggregate token size: ~645k tokens** of authored prompt content (the by-system prompt bodies sum to ~2.58 MB
-  of Markdown ≈ 645k tokens) — squarely inside the VISION §7 target band of **400k–700k tokens**. Per prompt
-  this averages ~1240 tokens of prompt body; each prompt then directs ~1500–4000 tokens of *executing-agent
-  work* (the bounded code + tests it asks for), per `00-ledger-overview.md` §4.
+- **Total prompts: 546** (P-001..P-521 across the original 16 systems, plus the M7 production-readiness band
+  P-522..P-546; one clean-context, independently-committable unit each). The original P-001..P-521 ids,
+  local-ids, rows, bands, and dependencies are PRESERVED EXACTLY — M7 is appended in global order, never
+  interleaved; M7's own ids were renumbered (the two new sandbox-exec prompts P-544/P-545 inserted before the
+  release gate, which moved to P-546) — no P-001..P-521 id changed.
+- **Aggregate token size: ~645k tokens** of authored prompt content for P-001..P-521; M7 (P-522..P-546) adds
+  ~31k tokens of authored prompt body. Per prompt this averages ~1240 tokens of prompt body; each prompt then
+  directs ~1500–4000 tokens of *executing-agent work* (the bounded code + tests it asks for), per
+  `00-ledger-overview.md` §4. (The M7 implementation prompts swap a real mechanism behind an already-frozen
+  seam, so the executing-agent work stays inside the band.)
 - **Per-band counts:**
 
 | Band | Prompt count |
@@ -636,7 +667,8 @@ by-system file appears here exactly once.
 | M4 | 101 |
 | M5 | 86 |
 | M6 | 16 |
-| **Total** | **521** |
+| M7 | 25 |
+| **Total** | **546** |
 
 - **Per-system counts:**
 
@@ -658,10 +690,31 @@ by-system file appears here exactly once.
 | ci | 35 |
 | issues | 37 |
 | chat | 32 |
-| **Total** | **521** |
+| production-readiness (M7, cross-cutting) | 25 |
+| **Total** | **546** |
 
 **Integrity.** The order is a total order with **0 dependency-precedence violations** (every resolved
-DEPENDS-ON id precedes its dependent) and the dependency graph is **acyclic**. **Coverage is COMPLETE** — every
-roadmap milestone across all 16 systems maps to ≥1 prompt and every prompt maps to exactly one primary
-milestone (see [`coverage-matrix.md`](coverage-matrix.md)); **no cross-system DEPENDS-ON points at a
-non-existent prompt.**
+DEPENDS-ON id precedes its dependent — including the M7 rows, whose DEPENDS-ON ids P-507/P-522..P-545 all
+precede their dependents) and the dependency graph is **acyclic**. **Coverage is COMPLETE** — every roadmap
+milestone across all 16 systems maps to ≥1 prompt and every prompt maps to exactly one primary milestone (see
+[`coverage-matrix.md`](coverage-matrix.md)); **no cross-system DEPENDS-ON points at a non-existent prompt.**
+
+**The M7 band (P-522..P-546 — production readiness & security hardening).** Appended in global order after M6,
+this band fills the production floors the audit
+([`production-readiness-audit.md`](production-readiness-audit.md)) verified were left open by the executed code
+(structural credential verifiers, in-memory identity stores, the software-floor KMS root, modeled-WAL restore,
+unpinned supply chain, AND — corrected on re-audit — a sandbox that never executes `JobSpec.command` in
+production: Firecracker hardcodes `oneshot=true` → `init=/bin/true`, gVisor only probes `runsc --version`) and
+unaddressed by any P-001..P-521 prompt. Its bodies live in the cross-cutting file
+[`by-system/production-readiness.md`](by-system/production-readiness.md) (the file header justifies the
+cross-cutting choice). M7 SEPARATES implementation prompts from their verification prompts (EI-01 §3 — a
+mechanism and its proof are different prompts; a drill on a special harness is not proof of the production exec
+path, so the sandbox impl **P-544** and its production-path escape verification **P-545** are separate prompts),
+names every external/human blocker (HSM keying ceremony, independent crypto/sandbox audits, third-party pentest,
+DPO ratification, staffed owners), and ends in a single FAIL-CLOSED production-release gate **P-546** that is RED
+by default and goes green only when all thirteen of its conditions emit dated green artifacts — no
+structural/mock impl in the production dependency graph, all durability/crypto/restore gates green, the sandbox
+production exec path runs the real command (no `init=/bin/true`-only launch) with the escape drill green through
+that path on both backends, current advisory + license scans pass, a destructive restore performed and measured,
+and 0 critical/high review/pentest findings open. M7 runs AFTER M6 (the dogfood loop is the cheapest load
+generator) and BEFORE any real customer tenant data is admitted.
