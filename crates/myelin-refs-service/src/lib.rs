@@ -383,6 +383,7 @@ pub mod reindex;
 pub mod reindex_at_scale;
 pub mod residency;
 pub mod resolve;
+pub mod restore_reerase;
 pub mod restrict;
 pub mod surge;
 pub mod traverse;
@@ -458,6 +459,11 @@ pub use resolve::{
     ProjectApi, ProjectApiError, ProjectOutcome, Projection, ProjectionCacheRead, ProjectionFlag,
     Resolution, ResolveMode, ResolveService, Tombstone, TombstoneReason,
     RESOLVE_CACHE_HIT_RATIO_SIGNAL, VIEW_PERMISSION,
+};
+pub use restore_reerase::{
+    build_backup_scale_corpus, re_erase_at_backup_scale, BackupScaleErasureCorpus,
+    BackupScaleReEraseReport, CorpusEdge, RefsErasedSubject, RefsErasureLedger,
+    REERASE_RECOVERABLE_PII_SIGNAL, WORLD_SCALE_BACKUP_FLEET_FLOOR,
 };
 pub use restrict::RestrictSet;
 pub use surge::{

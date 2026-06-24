@@ -144,6 +144,24 @@ impl RefsDekPin {
             .destroy_kek(&KekId::new(tenant.clone(), region.clone()))
     }
 
+    /// **Is the per-subject DEK backstop for `subject_id` STILL LIVE (resolvable)?** A READ-ONLY probe
+    /// (it does NOT reserve/resurrect the key — unlike [`Self::reserve_subject_backstop`]) — so a
+    /// post-restore re-erase drill (REF-P25) can assert "0 resurrected per-subject DEKs" WITHOUT itself
+    /// resurrecting the very key it is checking. Resolves the deterministic `kms://<tenant>/0/subject:<id>`
+    /// ref; `true` iff it resolves (the cached title sealed under it is still decryptable), `false` iff
+    /// it is crypto-shredded (LOUD `KmsError` → the title is unrecoverable). PII-free: an opaque id probe.
+    pub fn subject_backstop_is_live(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+        subject_id: &str,
+    ) -> bool {
+        // The per-subject DEK epoch is 0 by construction (ensure_dek mints at epoch 0; Refs never
+        // rotates a subject backstop). Build the deterministic ref WITHOUT reserving, then probe.
+        let key_ref = PiiKeyRef::new(tenant.clone(), 0, Self::subject_dek_class(subject_id));
+        self.kms.resolve_dek(&key_ref, region).is_ok()
+    }
+
     /// **Per-subject crypto-shred (destroy is callable on the per-subject backstop class).**
     /// Destroys ONE subject's backstop DEK ⇒ that subject's cached-title ciphertext is unrecoverable
     /// while the tenant DEK + every other subject is untouched (the GD-4 individual lever). Returns
