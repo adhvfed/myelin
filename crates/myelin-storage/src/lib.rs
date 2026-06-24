@@ -502,6 +502,12 @@ pub mod erase;
 // control plane's generic `CrossCellDsrFanOut` (global P-430). The full cross-HOLDER reach (E2E-4) is
 // the named follow-on P-ST-35 (P-446).
 pub mod firehose_archive;
+// The full DSAR / crypto-shred fan-out across ALL H1–H18 holders — the E2E-4 STORAGE SPINE (P-ST-35 /
+// P-446): every holder now exists, so the crypto-shred reach is COMPLETE (incl. vectors incl.
+// backups); 0 holders missed, 0 recoverable, residual == the one documented posture, certificate
+// sealed; post-restore re-erasure across the full holder set. Reuses `erase`/`reerase`. The E2E-3
+// reindex-parity half is the sibling P-ST-36 (P-447).
+pub mod holder_fanout;
 pub mod multi_cell_erase;
 // The T3 CI log tier (C2, P-ST-26 / P-328, M4, contract 11.8 the (job,step,byte-range) index +
 // consumed 5.9 the CheckStatus.details_ref #step-<n> resolution): the CI-keyed instance of the
@@ -678,6 +684,10 @@ pub use gitpack::{
     RepoGitPlacement, RepoId, RepoPlacementStatus, StorageGroup,
 };
 pub use holder::{register_holder, BlobStoreHolder, OltpHolderRegistration, OltpStoreHolder};
+pub use holder_fanout::{
+    holder_ids_not_covered, FullHolderFanOut, HolderClass, HolderCoverage,
+    HolderCoverageCertificate, HolderCoverageReceiptSet, HolderErasure, ResidualPosture,
+};
 pub use key_origin::{
     Byok, Dek, Hyok, HyokKeyService, HyokServiceDenied, IndexAdmission, KeyId, KeyOrigin,
     KeyOriginError, KeyOriginKind, KeyOriginTelemetry, PlatformManaged,
