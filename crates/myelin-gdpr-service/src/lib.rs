@@ -593,6 +593,7 @@ pub mod git_instance;
 pub mod history_rewrite;
 pub mod holders;
 pub mod issues_chat_instance;
+pub mod multi_cell;
 pub mod orchestration;
 pub mod posture;
 pub mod producer_holders;
@@ -682,6 +683,10 @@ pub use issues_chat_instance::{
     IssuesCascadeReceipt, IssuesChatCascadeDriver, IssuesStoreHolder, IssuesStoreModel, CHAT_DB,
     CHAT_INSTANCE, CHAT_SUBSYSTEM, ISSUES_DB, ISSUES_INSTANCE, ISSUES_SUBSYSTEM,
     WORKLOG_CLASSIFICATION_FOLLOW_ON,
+};
+pub use multi_cell::{
+    MemberCellSet, MultiCellCertificate, MultiCellCoverage, MultiCellFanOut, MultiCellGap,
+    PerCellReceipt,
 };
 pub use orchestration::{
     canonical_phase_of, holder_ids, CanonicalErasePhase, EraseChecklist, HolderReceipt,
