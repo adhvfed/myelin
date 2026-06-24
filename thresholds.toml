@@ -507,6 +507,32 @@ window_frames = 2048             # MEASURED: >= 4x the measured p99 gap (the sma
 p99_reconnect_gap_frames = 512   # MEASURED: the p99 frames a chat-live reconnect must backfill (D-10).
 
 # ---------------------------------------------------------------------------------------------
+# [column_store_seam] — the column-store / time-series promotion seam (BUS-6, event-bus §7.5;
+# P-440 / EB-31, M5). The MEASUREMENT GATE, not a build. The highest-volume durable streams keep a
+# seam for a ClickHouse-class column tier (aligning with the OLAP read store, ADR-10) BEHIND the
+# unchanged `BusTransport` trait (contract 2.1 — put/consume/ack/purge; the swap is a relay-target
+# change, never a consumer rewrite). The canonical posture (event-bus §7.5; EI-04 §5.2) is
+# SPECIFIED-NOT-BUILT: do not add the column tier before the volume is MEASURED.
+#
+# A durable stream is a promotion CANDIDATE iff its MEASURED sustained publish rate exceeds
+# `promote_events_per_sec_per_stream` AND, at that rate, the JetStream tier serves it at a
+# per-aggregate publish-latency p99 over `degraded_publish_latency_p99_ms` (volume alone never
+# promotes — the tier must be measurably DEGRADED at that volume). These are MEASURED-not-predicted
+# CRITERIA a real measurement is compared against, NOT values to tune toward (EI-04 §5.2).
+#
+# `promotion_owed = false` at this commit: NO production stream has been measured to cross both
+# criteria, so the seam stays NAMED — no build, no dated follow-on prompt is owed until a real
+# per-stream volume measurement flips this (EI-01 §3: a seam is not a floor-with-a-follow-on until a
+# measurement makes it one). The decision is `ColumnStoreSeam::promotion_owed_for(rate, p99)`.
+# ---------------------------------------------------------------------------------------------
+[column_store_seam]
+promote_events_per_sec_per_stream = 50000  # MEASURED criterion: a single-stream sustained rate above
+                                           # which a stream is a column-tier promotion candidate.
+degraded_publish_latency_p99_ms = 100      # MEASURED criterion: the per-aggregate publish-latency p99
+                                           # above which JetStream is judged degraded at that volume.
+promotion_owed = false                     # NO measured volume outgrows JetStream → seam stays NAMED.
+
+# ---------------------------------------------------------------------------------------------
 # [[claimed_not_proven]] — the scorecard (EI-01 §3, roadmap §5). A drill that comes back RED is
 # recorded HERE as a dated row with an owner and the follow-on, and is NEVER edited green: the
 # threshold it gates stays unchanged; the row stays until the deliverable is genuinely repaired
