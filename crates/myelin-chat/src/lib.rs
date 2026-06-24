@@ -63,6 +63,15 @@
 //!   the 1.7 harness shim). This CLOSES the M2-C0 contract surface. The rules are USED in
 //!   CHAT-P16/P18, the scope is IMPLEMENTED in CHAT-P9, the TE-21 hatch opens in CHAT-P26 (floors).
 //!
+//! - [`unfurl`] — **CHAT-P13 / P-407**: the Unfurl Service — the shared per-`ArtifactRef` projection
+//!   cache (ONE entry per ref, viewer-INDEPENDENT) gated by a per-viewer `check`/`list_objects` (the
+//!   no-leak floor, contracts 5.2 / 5.7 / 4.3 / 4.2). The gate runs BEFORE the cache/resolver is
+//!   touched, so a denied viewer's title is NEVER fetched (CHAT-D5, 0 title leak); the SetExpr→JOIN
+//!   class precompute lowers over the unfurl candidate id column (no N+1); the 4-step ladder
+//!   (live/gone/erased) maps to leak-free cards. The Refs `resolve` chokepoint (REF-P10 / CHAT-P15)
+//!   is the named floor; bus-invalidation + erasure-safe re-render is CHAT-P14; the canvas is an
+//!   embedded Knowledge page, NOT a chat editor (M4-C4 lean).
+//!
 //! **Owning architecture doc:**
 //! `planning/04-subsystem-architectures/chat/architecture/03-events-contracts-and-glue.md` §1 (the
 //! COMPLETE `chat.*` taxonomy under the Bus §6 grammar), §1.1 (the **durable** set via the OUTBOX —
@@ -121,6 +130,7 @@ pub mod replay;
 pub mod schema;
 pub mod store;
 pub mod subs;
+pub mod unfurl;
 
 pub use composer::{
     detect_pasted_url, AutocompleteKind, AutocompletePort, Draft, DraftKey, DraftStore, EditCas,
@@ -146,4 +156,9 @@ pub use store::{
     AuthorKind, ColdSegments, ConversationId, MemHotTier, Message, MessageId, MessageState,
     MessageStore, MonotonicUlidSource, NewMessage, OutboxTx, RangeCursor, StoreError,
     SystemUlidSource, TombstoneReason, UlidSource,
+};
+pub use unfurl::{
+    filter_candidates_by_class, precompute_visibility_class, AuthzVisibleIndex, Card,
+    LadderOutcome, LoweredFilter, Projection, RefsResolvePort, Tombstone as UnfurlTombstone,
+    TombstoneReason as UnfurlTombstoneReason, UnfurlCache, UnfurlCandidate, UnfurlService,
 };
