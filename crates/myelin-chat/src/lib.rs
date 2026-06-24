@@ -108,6 +108,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod content;
 pub mod conversation;
 pub mod dek;
 pub mod events;
@@ -120,6 +121,11 @@ pub mod schema;
 pub mod store;
 pub mod subs;
 
+pub use content::{
+    edge_aggregate_key, emit_body_edges, extract_body_edges, extract_message_edges, is_chat_block,
+    paragraph_body, roundtrips_md, validate_subtree, BodyEdge, EdgeRel, MessageBody, SubsetError,
+    CHAT_EXCLUDED_BLOCKS, REFS_EDGE_CREATED, REL_CLASS_REFERENCE,
+};
 pub use conversation::{
     Conversation, ConversationError, ConversationKind, ConversationStore, MemConversationStore,
     Membership, MembershipRole,
