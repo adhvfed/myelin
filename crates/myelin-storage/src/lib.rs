@@ -518,6 +518,12 @@ pub mod gd4;
 // one-line-swap Cache trait (in-memory floor + Valkey/Redis backing behind `integration`).
 pub mod bus_shred;
 pub mod cache;
+// The STORAGE half of the cross-cell PII-free pointer bridge + cell→cell migration (CP-D7, P-ST-32 /
+// P-443, M5): restore the source's §7.3 cross-seam consistency point INTO the target cell (0 loss) +
+// crypto-shred the SOURCE cell's key (source unrecoverable); the cross-cell pointer carries only an
+// opaque subject (resolution cell-local, no PII crosses). Composes restore.rs + kms.rs; the
+// control-plane half (durable workflow + atomic cut-over) is myelin_control_plane::migration.
+pub mod cell_migration;
 pub mod coloc;
 pub mod holder;
 pub mod key_origin;
@@ -625,6 +631,10 @@ pub use blob::{
 pub use bus_shred::KmsBusShredder;
 pub use cache::{Cache, CacheError, InMemoryCache};
 pub use cdn::{CdnCloneClass, CdnEdgePop, CdnEdgeSet};
+pub use cell_migration::{
+    is_cell_local, migrate_cell_to_cell, storage_resolves_locally, CellMigrationError,
+    CellMigrationReceipt, CellMigrationRequest, CellTenantTiers,
+};
 pub use ci_cache_scope::{
     CacheScope, CacheScopeError, CacheScopeTelemetry, CiCacheNamespace, TrustTier,
 };
