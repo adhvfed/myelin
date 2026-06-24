@@ -2404,6 +2404,16 @@ cdc = [
     # (chat_d8_restricted_subject_suppressed_at_every_read_path).
     "crates/myelin-chat/tests/cdc_4_8_10_1_chat_mention_shred_restrict.rs",
 ]
+# SRCH-P29 / P-422 (M5) HARDENS 10.1 erase to BACKUP SCALE for the Search holder (not a new CDC pair —
+# the holder seam is the SAME SearchEraseHolder purge+compact above): the BackupScaleEraseGate
+# (myelin_search::hyok_scale) drives the live purge (0 recoverable live, 0 orphan embedding) AND seals
+# the subject's index segments as backups under the per-tenant index DEK, then crypto-shreds that DEK
+# (+ the per-subject source backstop when in play) and proves EVERY backup segment is
+# plaintext-unrecoverable AFTER the shred (recoverable BEFORE → the proof is real) — 0 recoverable
+# incl. vectors incl. backups, the §7.5 backstop. Drill:
+# crates/myelin-search/tests/drill_srch_d10_hyok_and_backup_erasure.rs (SRCH-D4 at backup scale). The
+# JOINT cross-store assertion with Storage + Agent + the holder-coverage receipt is the M5 DSAR fan-out
+# E2E-4 (SRCH-P32 / P-465).
 
 # 10.2 — the classify-derive (five tags + subject_locator, P-GA-07) PLUS the OQ-H worklog extension
 # (P-GA-31 → P-334): the `data_role_default = Restricted` worklog tag is now STRUCTURAL (captured into
@@ -2732,6 +2742,13 @@ status = "covered"
 # through the engine. The SECOND half of this row — the KeyOrigin trait
 # (can_derive_plaintext_index()=false structural HYOK enforcement) — is the sibling P-ST-07
 # (global P-094); it adds the index-builder consumer to this same row.
+# SRCH-P29 / P-422 (M5) adds the Search CROSS-STORE HYOK assertion AT SCALE (the SRCH-D10 consumer of
+# can_derive_plaintext_index()=false): the HyokCrossStoreGate (myelin_search::hyok_scale) walks the
+# FULL derived-store set (index segments / vectors / caches / backups) and proves a HYOK class
+# (IndexAdmission::SkipHyok) is in 0 of them while a platform-managed control class IS present (the walk
+# is real) — 0 HYOK plaintext in ANY derived store, by construction (§4.8). Not a new CDC pair (the
+# verdict is the SAME frozen IndexAdmission::for_origin); the drill is
+# crates/myelin-search/tests/drill_srch_d10_hyok_and_backup_erasure.rs.
 cdc = ["crates/myelin-storage/tests/cdc_11_3_kms.rs"]
 
 [[contract]]

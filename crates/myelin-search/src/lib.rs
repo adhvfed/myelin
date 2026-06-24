@@ -123,6 +123,7 @@ pub mod erasure_posture;
 pub mod fusion;
 pub mod git_code_projection;
 pub mod holder;
+pub mod hyok_scale;
 pub mod indexer;
 pub mod issues_projection;
 pub mod kn_projection;
@@ -180,6 +181,12 @@ pub use git_code_projection::{
 pub use holder::{
     register_search_holder, search_index_holder, SearchHolderRegistration, SearchIndexHolder,
     SEARCH_INDEX_STORE,
+};
+pub use hyok_scale::{
+    backup_scale_page_spec, build_live_corpus, subject_matcher, BackupScaleEraseArtifact,
+    BackupScaleEraseFailure, BackupScaleEraseGate, BackupScaleEraseInputs, BackupScaleEraseVerdict,
+    DerivedStore, HyokCrossStoreArtifact, HyokCrossStoreFailure, HyokCrossStoreGate,
+    HyokCrossStoreInputs, HyokCrossStoreVerdict, MapFetcher, SealedBackupSegment,
 };
 pub use indexer::{
     EmbeddingAdapter, IncrementalIndexer, IndexEventError, IndexSpec, MockEmbeddingAdapter,
