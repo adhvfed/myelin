@@ -283,6 +283,7 @@ pub mod projection_feeder;
 pub mod pseudonym;
 pub mod query_coown;
 pub mod rebac_fragment;
+pub mod reflexes;
 pub mod refs_glue;
 pub mod reorder;
 pub mod replay;
@@ -563,6 +564,28 @@ pub use my_work::{
     issue_humanise_templates, list_my_work, list_my_work_default, my_work_filter,
     register_issue_humanise_templates, wire_issues_my_work, ISSUE_HUMANISE_TEMPLATES,
     TPL_APPROVAL_REQUESTED, TPL_SLA_AT_RISK, TPL_UNBLOCKED,
+};
+
+// ISS-P28 (P-395, M4-I7): the cross-subsystem reflexes (git/chat/identity/ci consumers). The
+// `ReflexConsumer` is the bus `EventHandler` (contract 2.4 consumed) over the `*`-free foreign-subject
+// whitelist (`REFLEX_SUBJECTS` — git.branch.created/pr.opened/pr.merged, ci.check.updated,
+// chat.message.created, identity.member.added/deactivated/erased); each reflex is a PURE planner that
+// reduces an incoming foreign event to a typed `ReflexEffect` the ISS-P06 write path drives (plan,
+// don't mutate — the ci_guard pattern). A `git.branch.created` links + auto-advances to In Progress; a
+// `git.pr.opened`/`merged` mints the `closes` edge and (on merge) auto-closes to Done IFF the CI-red
+// Done guard permits (5.9 consumed, read off the fact — never recompute trust); a `chat.message.created`
+// "create issue" mints an issue + a `relates` edge (5.4 consumed); an `identity.member.*` anonymises/
+// reassigns the actor across history (§7 erasure lever, 4.8). Each is idempotent on `event_id` (the
+// within-handler dedup on the runtime's `consumer_dedup` ledger) → 0 duplicate on replay (the gate).
+// Every auto-transition runs through the FSM interpreter (`Workflow::plan_transition`) — NEVER a
+// governance bypass (the 0-bypass gate; a CI-red merge surfaces a loud `TransitionBlocked`, never a
+// Done). FLOOR named: none new — auto-transitions are workflow-permitting only (noted in `reflexes`).
+pub use reflexes::{
+    linked_pr_from_payload, plan_branch_created, plan_chat_message_created, plan_check_updated,
+    plan_member_event, plan_pr_merged, plan_pr_opened, plan_reflex, reflex_subjects,
+    ReflexConsumer, ReflexEffect, AUTO_STATE_DONE, AUTO_STATE_IN_PROGRESS, CHAT_MESSAGE_CREATED,
+    CI_CHECK_UPDATED, GIT_BRANCH_CREATED, GIT_PR_MERGED, GIT_PR_OPENED, IDENTITY_MEMBER_ADDED,
+    IDENTITY_MEMBER_DEACTIVATED, IDENTITY_MEMBER_ERASED, REFLEX_SUBJECTS,
 };
 
 pub use refs_glue::{
