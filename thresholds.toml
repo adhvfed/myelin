@@ -402,6 +402,20 @@ human_lane_reservation = 32    # 25% of cap — above the 20% measured human-lan
 retry_after_secs = 5
 
 [[shed_budgets]]
+surface = "RefsBacklinkRead"  # the Refs backlink/traverse READ surface (REF-P22, REF-D10): a CI/agent
+                              # backlink-read storm sheds before a human's interactive backlink/traverse read.
+per_tenant_in_flight_cap = 192 # MEASURED: REF-D10 30× agent backlink-read surge shed the machine lane at this cap; human read held.
+human_lane_reservation = 48    # 25% of cap — above the 20% measured human-lane floor.
+retry_after_secs = 3
+
+[[shed_budgets]]
+surface = "RefsRefCreate"     # the Refs ref-CREATION surface (REF-P22, REF-D10): an agent ref-creation
+                              # storm sheds before a human's interactive ref-creation (the per-tenant bulkhead).
+per_tenant_in_flight_cap = 96  # MEASURED: REF-D10 30× agent ref-creation surge shed the machine lane at this cap; human create held.
+human_lane_reservation = 24    # 25% of cap — above the 20% measured human-lane floor.
+retry_after_secs = 5
+
+[[shed_budgets]]
 surface = "HttpIntake"        # the generic public surface (§7.1): every surface reserves a human fraction.
 per_tenant_in_flight_cap = 200 # MEASURED: SUB-D3 (P-S32) + ID-D9 (P-424) held the human lane at this generic-intake cap.
 human_lane_reservation = 50    # 25% of cap — above the 20% measured human-lane floor.

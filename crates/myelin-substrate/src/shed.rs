@@ -365,6 +365,19 @@ pub enum Surface {
     /// bundle-URI accelerated-clone (Git `02 §1.4`, Storage 11.2 C3) is the *complement* — it moves
     /// clone-storm read fan-out off serving compute so the budget is reached later.
     GitFrontDoor,
+    /// **The Refs backlink/traverse READ surface** — the permission-filtered backlink read +
+    /// recursive traverse (REF-P11/REF-P13, contract 5.3) at world-scale. The 30× surge (REF-D10) is
+    /// agent ref-creation + agent backlink-read; a CI/agent backlink-read storm sheds (`429 +
+    /// Retry-After`) BEFORE a human's interactive backlink/traverse read, which holds the protected
+    /// lane. This is the surface the Refs surge gate (REF-P22) admits backlink reads against,
+    /// per-tenant. Human-facing (a human's interactive read is shed last).
+    RefsBacklinkRead,
+    /// **The Refs ref-CREATION surface** — the `refs.edge.*` ingest / ref-creation path at
+    /// world-scale (REF-D10). An agent ref-creation storm (an agent fan-out writing references) sheds
+    /// BEFORE a human's interactive ref-creation, which holds the protected lane. Per-tenant so one
+    /// tenant's agent storm never sheds another's humans (the per-tenant bulkhead, §6.2). Human-facing
+    /// (a human creating a reference interactively is shed last).
+    RefsRefCreate,
     /// The generic HTTP intake queue (§7.1) — every public surface's request intake.
     HttpIntake,
 }
@@ -385,6 +398,8 @@ impl Surface {
             | Surface::ConnectionTier
             | Surface::AgentMention
             | Surface::GitFrontDoor
+            | Surface::RefsBacklinkRead
+            | Surface::RefsRefCreate
             | Surface::HttpIntake => true,
         }
     }
@@ -457,6 +472,26 @@ impl ShedBudgetTable {
                 retry_after_secs: 5,
             },
         );
+        // Refs backlink/traverse read (REF-P22, REF-D10): a CI/agent backlink-read storm sheds before
+        // a human's interactive backlink/traverse read — a reserved human fraction protects the read.
+        rows.insert(
+            Surface::RefsBacklinkRead,
+            SurfaceBudget {
+                per_tenant_in_flight_cap: 192,
+                human_lane_reservation: 48,
+                retry_after_secs: 3,
+            },
+        );
+        // Refs ref-creation (REF-P22, REF-D10): an agent ref-creation storm sheds before a human's
+        // interactive ref-creation — a reserved human fraction protects the human write.
+        rows.insert(
+            Surface::RefsRefCreate,
+            SurfaceBudget {
+                per_tenant_in_flight_cap: 96,
+                human_lane_reservation: 24,
+                retry_after_secs: 5,
+            },
+        );
         // The generic HTTP intake (§7.1): every public surface reserves a human fraction.
         rows.insert(
             Surface::HttpIntake,
@@ -499,6 +534,8 @@ impl ShedBudgetTable {
             Surface::ConnectionTier,
             Surface::AgentMention,
             Surface::GitFrontDoor,
+            Surface::RefsBacklinkRead,
+            Surface::RefsRefCreate,
             Surface::HttpIntake,
         ] {
             if let Some(b) = self.rows.get(&surface) {
@@ -915,6 +952,8 @@ mod tests {
             Surface::ConnectionTier,
             Surface::AgentMention,
             Surface::GitFrontDoor,
+            Surface::RefsBacklinkRead,
+            Surface::RefsRefCreate,
             Surface::HttpIntake,
         ] {
             let b = table.budget(surface);
@@ -942,6 +981,14 @@ mod tests {
         assert!(table.budget(Surface::AgentMention).human_lane_reservation > 0);
         // The Git front door protects a human lane (a human's interactive fetch is shed last).
         assert!(table.budget(Surface::GitFrontDoor).human_lane_reservation > 0);
+        // The Refs read + ref-create surfaces protect a human lane (REF-P22).
+        assert!(
+            table
+                .budget(Surface::RefsBacklinkRead)
+                .human_lane_reservation
+                > 0
+        );
+        assert!(table.budget(Surface::RefsRefCreate).human_lane_reservation > 0);
     }
 
     // ---- P-S33: the tuned-budget human-lane floor (you cannot tune a human lane into starvation) ---
@@ -962,6 +1009,8 @@ mod tests {
             Surface::ConnectionTier,
             Surface::AgentMention,
             Surface::GitFrontDoor,
+            Surface::RefsBacklinkRead,
+            Surface::RefsRefCreate,
             Surface::HttpIntake,
         ] {
             let b = table.budget(surface);

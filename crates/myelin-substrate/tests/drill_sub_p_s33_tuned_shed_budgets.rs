@@ -215,6 +215,8 @@ fn the_tuned_shed_budgets_in_the_file_validate() {
         Surface::ConnectionTier,
         Surface::AgentMention,
         Surface::GitFrontDoor,
+        Surface::RefsBacklinkRead,
+        Surface::RefsRefCreate,
         Surface::HttpIntake,
     ] {
         let b = t.shed_budget(surface).expect("present");
@@ -314,6 +316,8 @@ fn re_running_sub_d3_against_the_tuned_numbers_still_holds_the_human_lane() {
         Surface::AgentMention,
         Surface::CollabOpStream,
         Surface::GitFrontDoor,
+        Surface::RefsBacklinkRead,
+        Surface::RefsRefCreate,
     ] {
         let budget = table.budget(surface);
         re_run_sub_d3_against_tuned_budget(surface, budget, multiplier);
@@ -336,6 +340,8 @@ fn the_tuned_thresholds_file_round_trips() {
         Surface::ConnectionTier,
         Surface::AgentMention,
         Surface::GitFrontDoor,
+        Surface::RefsBacklinkRead,
+        Surface::RefsRefCreate,
         Surface::HttpIntake,
     ] {
         assert_eq!(
@@ -367,6 +373,8 @@ fn the_tuned_file_and_the_in_code_table_agree() {
         Surface::ConnectionTier,
         Surface::AgentMention,
         Surface::GitFrontDoor,
+        Surface::RefsBacklinkRead,
+        Surface::RefsRefCreate,
         Surface::HttpIntake,
     ] {
         assert_eq!(
