@@ -1653,6 +1653,16 @@ title = "mark / snooze / mark_all_read"
 status = "covered"
 cdc = [
     "crates/myelin-notif/tests/cdc_7_2_notif_read_state.rs",
+    # CHAT-P16 / P-410 (M4-C5): the CHAT CONSUMER of 7.2 — the Chat Read-state Service is the ONE
+    # read-state truth for a conversation (the per-(user × conversation) last-read marker; Valkey hot
+    # markers + batched PG flush, cache-NEVER-authoritative). PROVIDER: a flushed mark is the value a
+    # later read returns; the durable PG record is authoritative on a Valkey loss (CHAT-D12, 0 lost
+    # read-state). CONSUMER: unread recomputes as a bounded range read count(id > last_read) over the
+    # ONE truth — never a second store, never a cached number, never write-fanned-out (a 100k-member
+    # ambient post does 0 per-member unread writes). Chat's per-channel scroll-state is LINKED to
+    # Notif's per-item state at the MENTION (§5.3), never a third copy (the C-9 one-read-state-truth
+    # posture). The live REAL-Valkey + REAL-Postgres CHAT-D12 leg is integration_chat_p16_read_state.rs.
+    "crates/myelin-chat/tests/cdc_7_2_10_1_chat_read_state.rs",
 ]
 
 [[contract]]
@@ -2209,6 +2219,14 @@ cdc = [
     # tombstones; residual = the ONE posture 10.9/X-7, by reference). The provider+consumer pair (shared
     # with 11.4 below — the per-subject-DEK body lever the erase destroys).
     "crates/myelin-chat/tests/cdc_11_4_10_1_chat_body_dek_holder.rs",
+    # CHAT-P16 / P-410 (M4-C5) — the CHAT read-state side of 10.1: the Chat read-state durable record
+    # is its OWN store (chat_read_state) auto-registered through the substrate one door (1.4) +
+    # classified to H5 (0 orphans — the DSR fan-out reaches the per-(user × conversation) markers, a
+    # person's scroll-position footprint, D-C8). PROVIDER: the read-state store registers + classifies
+    # to H5. CONSUMER: erasure purges the principal's read-state markers (0 recoverable read-state for
+    # the erased subject; another principal's markers untouched). The live REAL-Postgres purge leg is
+    # integration_chat_p16_read_state.rs.
+    "crates/myelin-chat/tests/cdc_7_2_10_1_chat_read_state.rs",
 ]
 
 # 10.2 — the classify-derive (five tags + subject_locator, P-GA-07) PLUS the OQ-H worklog extension
