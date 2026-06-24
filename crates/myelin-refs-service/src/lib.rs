@@ -365,6 +365,7 @@ pub mod backlinks;
 pub mod cache;
 pub mod chat_producer;
 pub mod ci_producer;
+pub mod cross_cell;
 pub mod dek;
 pub mod edge_builder;
 pub mod emit;
@@ -399,6 +400,11 @@ pub use chat_producer::{
     ChatAnchorState, ChatEdgeProducer, ChatOwner, CHAT_CHANNEL_TYPE, CHAT_OWNER_TOKEN,
 };
 pub use ci_producer::{CiOwner, StepAnchorResolver, StepResolution, CI_OWNER_TOKEN};
+pub use cross_cell::{
+    cross_cell_backlink_pointer, cross_cell_erase_receipt, fanout_carried_fields,
+    migrate_home_cell, CellLocalBacklinkResolver, CrossCellEraseReceipt, CrossCellFanOut,
+    CROSS_CELL_RAW_ROWS_SIGNAL, CROSS_CELL_RESOLVES_SIGNAL,
+};
 pub use dek::{ref_p5_inherited_gates, InheritedGate, RefsDekPin};
 pub use edge_builder::{
     edge_id, EdgeProjection, EdgeRow, ProjectError, RefsEdgeBuilder, RelClass,
