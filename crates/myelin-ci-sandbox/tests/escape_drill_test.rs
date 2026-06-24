@@ -213,17 +213,19 @@ fn ag_d4_ci_t1_hard_escape_gate_zero_escapes_on_a_real_kernel() {
         residual_note: None,
     }];
     if runsc_present() {
-        // `runsc` is on PATH, but running the corpus under it requires creating an OCI bundle +
-        // root/userns privileges this host (no passwordless sudo) does not grant. We do NOT fabricate
-        // a gVisor green — it is recorded as a NAMED parametrized residual (CI-P28 re-runs THIS SAME
-        // drill on gVisor when the host grants the needed privileges).
+        // `runsc` is on PATH. THIS (Firecracker) drill proves the GATE on the production-default
+        // backend; the gVisor backend re-runs THE SAME corpus in its OWN dedicated drill
+        // (CI-P28 → P-423, `escape_drill_gvisor_test.rs`), which emits a SEPARATE green attestation
+        // with gVisor `exercised: true`. Here gVisor is recorded as a cross-reference (this FC drill
+        // does not boot a runsc sandbox — the gVisor re-green is its own test, by design).
         backends.push(BackendRun {
             backend: Backend::GvisorRunsc,
             exercised: false,
             residual_note: Some(
-                "runsc is on PATH but running the corpus under it needs an OCI bundle + \
-                 root/userns privileges this host lacks (no passwordless sudo); recorded as the \
-                 CI-P28 run-when-available residual, NOT faked."
+                "runsc is on PATH; the gVisor backend re-runs THE SAME corpus in its own drill \
+                 (CI-P28 → P-423, escape_drill_gvisor_test.rs) which emits a separate green \
+                 attestation with gvisor exercised:true. This FC drill is the production-default \
+                 gate; it does not boot a runsc sandbox by design."
                     .to_string(),
             ),
         });
