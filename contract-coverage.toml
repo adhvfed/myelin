@@ -3199,9 +3199,22 @@ status = "covered"
 # the staleness budget (the hardest sub-problem); rebalancing moves a workload across member cells
 # same-region (the placement invariant rejects a cross-region move). The cross-cell fan-out CDC is
 # registered under 10.4; the GA-D8 drill is ga_d8_cross_cell_dsr_fanout_drill.rs.
+#
+# EB-25/P-438 (M5): the Bus's EVENT-PROPAGATION half goes LIVE (event-bus.md §7.4 — the M1-frame
+# floor follow-on of EB-14). myelin-events::crosscell_propagation::CrossCellPropagator mints a
+# CrossCellPointer FROM an EventEnvelope (pointer_for_propagation — ONLY the four frozen PII-free
+# fields, never the payload) and fans it out to the tenant's OTHER member cells (CrossCellStream =
+# the §6.2 ISS portfolio rollup / KN collab / CHAT cross-org floor follow-ons; no self-hop to the
+# home cell). pii_fields_crossed is pinned to 0 by construction (the EB-25 zero). The control plane
+# CONSUMES the produced pointer and carries it (cross_cell_bridge, P-429); the member cell resolves
+# cell-local (P-429's resolution half). ONE frame, two reconciled §2.9-DAG legs (EI-01 §7). The EB-25
+# CDC pair (cdc_12_6_cross_cell_propagation.rs) pins the propagator-emitted four-field wire shape; the
+# EB-25 drill (drills_eb25_cross_cell_propagation.rs) is the dated green artifact (0 PII crosses the
+# cell boundary, gate proven RED+green; CP-D7 0-loss-on-migration cross-ref via propagation purity).
 cdc = [
     "crates/myelin-events/tests/cdc_12_6_crosscell.rs",
     "crates/myelin-control-plane/tests/cdc_12_6_bridge_resolution_live.rs",
+    "crates/myelin-events/tests/cdc_12_6_cross_cell_propagation.rs",
 ]
 
 # ──────────────── §13 The shared crates' refined shapes (myelin-content, myelin-query) ──────────

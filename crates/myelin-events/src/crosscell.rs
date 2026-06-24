@@ -35,15 +35,25 @@
 //!    row); the only constructor takes exactly the four PII-free fields. If the frame grew a
 //!    cell-bound or PII field, this stops compiling.
 //!
-//! ## FLOOR — single-home-cell is v1; the BUILD is EB-25 (named, with its follow-on)
-//! This is the **designed-not-built** frame. Single-home-cell propagation is v1; the cross-cell
-//! PII-free bridge BUILD — per-viewer **cell-local** resolution (cell A asks cell B to
-//! `resolve(ref, viewer, mode)` IN B, permission-checked in B, only the already-rendered
-//! projection crossing — §7.4/§6.2), the residency proof that **no PII crosses**, and the
-//! multi-cell fan-out — is the **M5 follow-on EB-25** (whose drills GA-D8 / CP-D7 / CP-D8 are owed
-//! THEN, when multi-cell ships). The Tenancy authority names the SAME build as its own follow-on
-//! P-CP-19; EB-25 is the Bus-side carriage of that build. **Do not add a `resolve()` here** — that
-//! would claim a green this band has not earned.
+//! ## FLOOR PROMOTED — the BUILD shipped (EB-25 / P-438, M5)
+//! This module pins the **frame** (re-exported from the tenancy authority). The cross-cell BUILD —
+//! the EB-25 M5 follow-on of this frame — is now **shipped across its two §2.9-DAG legs** (ONE
+//! frame, two reconciled legs, EI-01 §7):
+//! - the **RESOLUTION half** (per-viewer **cell-local** resolution — cell A asks cell B to
+//!   `resolve(ref, viewer, mode)` IN B, permission-checked in B, only the already-rendered
+//!   projection/tombstone crossing — §7.4/§6.2) lives in **`myelin-control-plane`**
+//!   (`cross_cell_bridge.rs`, P-CP-19 / P-429) + the multi-cell DSR fan-out / zookie / rebalancing
+//!   (`multi_cell.rs`, P-CP-20 / P-430);
+//! - the **EVENT-PROPAGATION half** (the Bus's leg — minting the PII-free [`CrossCellPointer`] from
+//!   an `EventEnvelope`, the multi-cell fan-out to the tenant's *other* cells, the residency proof
+//!   that **no PII crosses**) lives in [`crate::crosscell_propagation`] (EB-25 / P-438), whose
+//!   `CrossCellPropagator` produces the pointer-event the control plane carries.
+//!
+//! The drills GA-D8 / CP-D7 / CP-D8 (0 PII crosses; per-cell receipts; 0 migration loss) green
+//! across the two legs (CP-D8 in P-429; GA-D8 / CP-D7 in P-430; the Bus-side 0-PII-crosses leg in
+//! `crate::crosscell_propagation` + `tests/drills_eb25_cross_cell_propagation.rs`). **The
+//! `resolve()` lives in the control-plane bridge, NOT here** (the §2.9 DAG sites resolution in the
+//! control plane, the Bus owns only the propagation production).
 
 use crate::{ArtifactRef, CorrelationId};
 
