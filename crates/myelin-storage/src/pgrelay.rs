@@ -67,6 +67,41 @@ impl PgRelay {
         Ok(())
     }
 
+    /// **Co-commit the outbox row INTO an already-open transaction (BUS-D4 emit-iff-committed).**
+    /// A caller that owns a domain state-write transaction (e.g. the Chat Message Service writing the
+    /// `message` row in `myelin_chat::store::pg`) hands its open transaction here so the
+    /// `chat.message.created` outbox row lands in the SAME transaction — both commit, or both roll
+    /// back. The relay owns the `outbox` table (BUS-2: the outbox + its publish are the relay's), so
+    /// the INSERT lives HERE (the one sanctioned, lint-excluded outbox-write site) rather than being
+    /// hand-rolled in each tenant-store caller. The per-aggregate `seq` is allocated INSIDE the
+    /// transaction as `COALESCE(MAX(seq)+1, 0)` for the aggregate, guarded by the
+    /// `UNIQUE(aggregate, seq)` constraint (a racing committer collides + retries → contiguous,
+    /// gap-free, true-commit-order seqs — the per-conversation total-order property, contract 2.3).
+    /// The outbox is keyed by `(aggregate, seq)` and drained across aggregates by the relay, so it
+    /// correctly carries no per-row tenant predicate (the same relay-internal posture as
+    /// [`enqueue`](Self::enqueue) — this is a relay query, not a tenant-store query).
+    pub async fn co_commit_in_tx(
+        conn: &mut sqlx::PgConnection,
+        aggregate: &str,
+        envelope: &EventEnvelope,
+    ) -> Result<(), PgError> {
+        let payload = serde_json::to_value(envelope)
+            .map_err(|e| PgError::Query(format!("serialize envelope: {e}")))?;
+        sqlx::query(
+            "INSERT INTO outbox (event_id, aggregate, seq, subject, envelope) \
+             VALUES ($1, $2, COALESCE((SELECT MAX(seq) + 1 FROM outbox WHERE aggregate = $2), 0), \
+             $3, $4) ON CONFLICT (event_id) DO NOTHING",
+        )
+        .bind(&envelope.event_id.0)
+        .bind(aggregate)
+        .bind(&envelope.subject.0)
+        .bind(payload)
+        .execute(conn)
+        .await
+        .map_err(|e| PgError::Query(e.to_string()))?;
+        Ok(())
+    }
+
     /// **Same-tx co-commit (BUS-D4 emit-iff-committed):** insert a domain STATE row into
     /// `state_table` AND the outbox row in ONE transaction — both commit, or both roll back. This
     /// is the structural emit-iff-committed property the silent-data-loss floor rests on: a

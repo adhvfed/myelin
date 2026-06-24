@@ -36,11 +36,14 @@
 //!   riding the SAME promotion (CHAT-P28 / P-502). The cold tier here uses [`MemHotTier`]'s sibling
 //!   [`myelin_storage::FsBlobStore`] (the in-process fs floor); the object-store backing is a
 //!   one-line `BlobStore` swap.
-//! - **The outbox co-commit + `chat.message.created` emit is CHAT-P5** (P-399). [`MessageStore`]
-//!   threads the [`OutboxTx`] seam so the append's state change and its event commit in ONE
-//!   transaction (the BUS-2 emit-iff-committed property), but the `chat.message.created` event emit
-//!   itself lands in CHAT-P5 — here the seam exists and the state change is staged; the event is
-//!   the CHAT-P5 floor (named in [`MessageStore::append`]).
+//! - **The outbox co-commit + `chat.message.created` emit LANDED in CHAT-P5** (P-399). The
+//!   [`MessageStore`] threads the [`OutboxTx`] seam so the append's state change AND its
+//!   `chat.message.created` event commit in ONE transaction (BUS-2, emit-iff-committed): `append`
+//!   stages the state change AND emits the real `chat.message.created` envelope (references-only
+//!   payload, `aggregate = conversation_id`) through `tx`, so an aborted transaction writes NEITHER
+//!   the message NOR its event (CHAT-D13), a retried `client_nonce` co-commits exactly ONE message +
+//!   ONE event (CHAT-D14), and a burst from many gateways keeps per-conversation total order
+//!   (CHAT-D2). `revise` emits `chat.message.edited`; `tombstone` emits `chat.message.erased`.
 //! - **The per-subject-DEK encryption of `body_inline` / `body_nodes` is CHAT-P6** (the columns
 //!   exist here; the DEK round-trip is CHAT-P6's, arch §3 + the prompt's DELIVERABLE).
 
@@ -52,9 +55,14 @@ pub mod pg;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use myelin_events::OutboxTransaction;
+use myelin_events::{
+    AggregateKey, DataRole, EventDraft, EventType, OutboxTransaction, OutboxTx as OutboxTxTrait,
+    Visibility,
+};
 use myelin_storage::{BlobStore, ContentHash, FsBlobStore};
 use myelin_tenancy::TenantId;
+
+use crate::events::{CHAT_MESSAGE_CREATED, CHAT_MESSAGE_EDITED, CHAT_MESSAGE_ERASED};
 
 pub use ulid::{MessageId, MonotonicUlidSource, SystemUlidSource, UlidSource};
 
@@ -249,13 +257,67 @@ impl std::error::Error for StoreError {}
 /// The store result alias.
 pub type Result<T> = core::result::Result<T, StoreError>;
 
-/// The outbox co-commit seam (arch §3.1). `append` / `revise` / `tombstone` take the transaction so
-/// the state change and the event are ONE transaction — the trait makes the no-dual-write guarantee
-/// STRUCTURAL (BUS-2). The `chat.message.created` / `.edited` / `.tombstoned` event EMIT through
-/// this transaction is the CHAT-P5 floor (P-399); HERE the state change is staged onto the
-/// transaction (so the co-commit seam exists and an aborted transaction writes neither the message
-/// nor — when CHAT-P5 lands — its event).
+/// The outbox co-commit seam (arch §3.1 / §9; contract 2.2). `append` / `revise` / `tombstone` take
+/// the transaction so the state change AND its `chat.*` event are ONE transaction — the no-dual-write
+/// guarantee is STRUCTURAL (BUS-2). **CHAT-P5 (P-399):** the event EMIT through this transaction is
+/// real — `append` emits `chat.message.created`, `revise` emits `chat.message.edited`, `tombstone`
+/// emits `chat.message.erased` (`aggregate = conversation_id`), so an aborted transaction writes
+/// NEITHER the message NOR its event (emit-iff-committed, BUS-D4 / CHAT-D13).
 pub type OutboxTx = OutboxTransaction;
+
+/// **The `chat.message.*` co-commit emit (CHAT-P5, contract 2.2 / arch §9).** Build the
+/// references-only [`EventDraft`] for a message lifecycle event and emit it through the SAME
+/// transaction the state change is staged onto — the BUS-2 co-commit. `aggregate = conversation_id`
+/// (contract 2.3; the CHAT-D2 per-conversation total-order keying); `subject` is the stable
+/// `message-<id>` `#sub` anchor (contract 5.7, minted via [`crate::subs::mint_message`]); the
+/// payload is references-only (the message/conversation refs + the author principal id — NEVER the
+/// body bytes: references-not-payloads, the body is per-subject-DEK-encrypted at rest and is
+/// CHAT-P6's concern, never on the bus). The emit is a causal ROOT (`cause = None`): a user/agent
+/// send is the head of its own causal chain (a reaction to an inbound event would pass that cause,
+/// the gateway's concern in CHAT-P9).
+///
+/// Returns the minted `event_id` (the broker-side dedup key) so a caller/test can assert the
+/// co-committed event exists for this message.
+fn emit_message_event(
+    tx: &mut OutboxTx,
+    event_type: &str,
+    conv: &ConversationId,
+    message_id: &MessageId,
+    author: &str,
+    thread_root_id: Option<&MessageId>,
+) -> Result<()> {
+    // The stable `message-<id>` #sub anchor as the envelope subject (contract 5.7). It is
+    // grammatical by construction; a mint failure is a programming error (the message_id is a
+    // minted ULID), surfaced LOUDLY as a Cold-class store error rather than a silent drop.
+    let subject = crate::subs::mint_message(&conv.tenant, message_id.as_str())
+        .map_err(|e| StoreError::Cold(format!("mint message #sub anchor: {e}")))?;
+    let draft = EventDraft {
+        type_: EventType(event_type.to_string()),
+        subject,
+        // The per-conversation aggregate (contract 2.3) — every message event for one conversation
+        // is per-aggregate ordered, the CHAT-D2 / D-9 total-order property.
+        aggregate: AggregateKey(conv.conversation_id.clone()),
+        // References-not-payloads (arch §1.1 / §9): IDs + the author principal, NEVER the body.
+        payload: serde_json::json!({
+            "conversation_id": conv.conversation_id,
+            "message_id": message_id.as_str(),
+            "author": author,
+            "thread_root_id": thread_root_id.map(|t| t.as_str().to_string()),
+        }),
+        // Chat is the CONTROLLER of its message content (arch §9 / ADR-04.4).
+        data_role: DataRole::Controller,
+        visibility: Visibility::Internal,
+        // The body is NOT inline on the event (references-only); the per-subject-DEK PII lives at
+        // rest in the store, so no inline-PII envelope key is needed here (CHAT-P6 owns the DEK).
+        contains_personal_data: false,
+        pii_key_ref: None,
+    };
+    // The co-commit: emit derives the envelope + buffers the row into THIS transaction (durable iff
+    // the transaction commits — emit-iff-committed). A root send carries no `cause`.
+    tx.emit(draft, None)
+        .map_err(|e| StoreError::Cold(format!("outbox emit {event_type}: {e:?}")))?;
+    Ok(())
+}
 
 /// **The `MessageStore` trait — the hot-engine swap seam (arch §3.1).** The only interface the rest
 /// of Chat sees. PostgreSQL-partitioned is the v1 hot tier ([`pg::PgMessageStore`], `integration`);
@@ -423,6 +485,11 @@ impl MessageStore for MemHotTier {
             return Ok(existing);
         }
         let message_id = self.minter.mint();
+        // The conversation key (the aggregate) + author for the co-committed event — captured
+        // before `msg.conv` / `msg.author` move into the stored row.
+        let conv_key = msg.conv.clone();
+        let author = msg.author.clone();
+        let thread_root_id = msg.thread_root_id.clone();
         let stored = Message {
             message_id: message_id.clone(),
             conv: msg.conv,
@@ -436,9 +503,22 @@ impl MessageStore for MemHotTier {
             state: MessageState::Active,
         };
         log.insert(message_id.clone(), stored);
-        // The outbox co-commit SEAM: stage the state change onto the transaction. The
-        // `chat.message.created` event EMIT through `tx` is the CHAT-P5 floor (P-399).
+        // The outbox CO-COMMIT (CHAT-P5, BUS-2): the message persist (above, staged for durability)
+        // AND the `chat.message.created` event emit share THIS transaction. Stage the state change
+        // (the "state" half) and emit the real event (the "event" half) — both durable iff the
+        // transaction commits (emit-iff-committed; an abort writes NEITHER — CHAT-D13). Drop the
+        // partitions lock FIRST so the emit (which takes the outbox store lock) cannot deadlock
+        // against a concurrent committer.
+        drop(parts);
         tx.stage_state_change(format!("chat.message.created:{}", message_id.as_str()));
+        emit_message_event(
+            tx,
+            CHAT_MESSAGE_CREATED,
+            &conv_key,
+            &message_id,
+            &author,
+            thread_root_id.as_ref(),
+        )?;
         Ok(message_id)
     }
 
@@ -478,6 +558,7 @@ impl MessageStore for MemHotTier {
         expect_seq: i32,
     ) -> Result<()> {
         let mut parts = self.lock();
+        let mut found: Option<(ConversationId, String, Option<MessageId>)> = None;
         for log in parts.values_mut() {
             if let Some(msg) = log.get_mut(msg_id) {
                 // The per-message CAS (X-2): a stale `expect_seq` is a refused clobber, not a
@@ -493,11 +574,31 @@ impl MessageStore for MemHotTier {
                 msg.body_nodes = body_nodes;
                 msg.edited_seq += 1;
                 msg.state = MessageState::Edited;
-                tx.stage_state_change(format!("chat.message.edited:{}", msg_id.as_str()));
-                return Ok(());
+                found = Some((
+                    msg.conv.clone(),
+                    msg.author.clone(),
+                    msg.thread_root_id.clone(),
+                ));
+                break;
             }
         }
-        Err(StoreError::NotFound(msg_id.clone()))
+        let (conv, author, thread_root_id) = match found {
+            Some(f) => f,
+            None => return Err(StoreError::NotFound(msg_id.clone())),
+        };
+        // CO-COMMIT the `chat.message.edited` event (CHAT-P5). Drop the partitions lock first so the
+        // outbox-store lock the emit takes cannot deadlock a concurrent committer.
+        drop(parts);
+        tx.stage_state_change(format!("chat.message.edited:{}", msg_id.as_str()));
+        emit_message_event(
+            tx,
+            CHAT_MESSAGE_EDITED,
+            &conv,
+            msg_id,
+            &author,
+            thread_root_id.as_ref(),
+        )?;
+        Ok(())
     }
 
     fn tombstone(
@@ -507,6 +608,7 @@ impl MessageStore for MemHotTier {
         _reason: TombstoneReason,
     ) -> Result<()> {
         let mut parts = self.lock();
+        let mut found: Option<(ConversationId, String, Option<MessageId>)> = None;
         for log in parts.values_mut() {
             if let Some(msg) = log.get_mut(msg_id) {
                 msg.state = MessageState::Tombstoned;
@@ -515,11 +617,32 @@ impl MessageStore for MemHotTier {
                 // survives (order/causality intact for others).
                 msg.body_inline.clear();
                 msg.body_nodes.clear();
-                tx.stage_state_change(format!("chat.message.tombstoned:{}", msg_id.as_str()));
-                return Ok(());
+                found = Some((
+                    msg.conv.clone(),
+                    msg.author.clone(),
+                    msg.thread_root_id.clone(),
+                ));
+                break;
             }
         }
-        Err(StoreError::NotFound(msg_id.clone()))
+        let (conv, author, thread_root_id) = match found {
+            Some(f) => f,
+            None => return Err(StoreError::NotFound(msg_id.clone())),
+        };
+        // CO-COMMIT the `chat.message.erased` event (CHAT-P5, the `*.erased` cross-cutting token,
+        // contract 2.7 — the crypto-shred tombstone FACT that drives the Search/Refs/Notif erasure
+        // cascade). Drop the partitions lock first (deadlock-free emit).
+        drop(parts);
+        tx.stage_state_change(format!("chat.message.erased:{}", msg_id.as_str()));
+        emit_message_event(
+            tx,
+            CHAT_MESSAGE_ERASED,
+            &conv,
+            msg_id,
+            &author,
+            thread_root_id.as_ref(),
+        )?;
+        Ok(())
     }
 
     fn resync_from(&self, conv: &ConversationId, cursor: &MessageId) -> Result<Vec<Message>> {
