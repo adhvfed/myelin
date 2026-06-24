@@ -702,8 +702,11 @@ pub use git_instance::{
     section_references_posture, GIT_INSTANCE, GIT_SUBSYSTEM, HISTORY_REWRITE_FLOOR_PROMPT,
 };
 pub use history_rewrite::{
-    HistoryRewriteActivity, HistoryRewriteReceipt, HistoryRewriteRequest, PhaseReceipt,
-    RewritePhase, HISTORY_REWRITE_ACTION, HISTORY_REWRITE_FIRST_CLASS_PROMPT,
+    CacheEntryRef, CacheNamespaceInvalidator, FirstClassRewriteOp, GaTenCertificate,
+    HistoryRewriteActivity, HistoryRewriteReceipt, HistoryRewriteRequest, InMemoryCacheNamespaces,
+    InvalidationFanOut, PhaseReceipt, RewriteAudit, RewriteDenied, RewritePhase,
+    RewriteRateLimiter, RewriteWiring, HISTORY_REWRITE_ACTION, HISTORY_REWRITE_DENIED_ACTION,
+    HISTORY_REWRITE_FIRST_CLASS_PROMPT, HISTORY_REWRITE_OUTBOUND_GATE_PROMPT,
 };
 pub use holders::{
     gdpr_owned_holder_ids, AuditCarveOutHolder, CryptoShredKms, GdprOwnStoreHolder,
