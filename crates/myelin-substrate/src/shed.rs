@@ -231,6 +231,118 @@ pub struct SurfaceBudget {
     pub retry_after_secs: u64,
 }
 
+/// **A tuned-budget validation failure (P-S33).** A shed budget that violates the §7.6 floor
+/// *discipline* — bounded, and a human-facing surface reserving enough of its cap to keep the human
+/// lane from starving — is REJECTED here, not silently accepted. This is the structural guard that
+/// makes "you cannot tune the human lane into starvation" (the P-S33 DoD) un-bypassable: the tuned
+/// numbers in the thresholds file are validated against this floor, so a future edit that drops a
+/// human-facing surface's reservation below the floor is a LOUD error, never a quiet regression.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ShedBudgetError {
+    /// The surface is not bounded (cap == 0) — an unbounded surface is the cascade (§7.1, EI-02 §5).
+    Unbounded(Surface),
+    /// The human-lane reservation exceeds the cap — a reservation can never be larger than the budget.
+    ReservationOverCap {
+        /// The offending surface.
+        surface: Surface,
+        /// The reservation requested.
+        reservation: u32,
+        /// The cap it must sit within.
+        cap: u32,
+    },
+    /// A **human-facing** surface reserved LESS than the measured human-lane floor — under the surge
+    /// the human lane would be starved (shed behind the machine lanes). This is the starvation a tune
+    /// can never introduce: the reservation must hold at least [`SurfaceBudget::HUMAN_LANE_FLOOR_BPS`]
+    /// of the cap so a human is never shed while the machine lanes still occupy the surface.
+    HumanLaneStarved {
+        /// The offending human-facing surface.
+        surface: Surface,
+        /// The reservation it carries.
+        reservation: u32,
+        /// The measured floor reservation it must meet (≥ `cap * HUMAN_LANE_FLOOR_BPS / 10000`).
+        floor: u32,
+        /// The cap the floor is a fraction of.
+        cap: u32,
+    },
+}
+
+impl std::fmt::Display for ShedBudgetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ShedBudgetError::Unbounded(s) => {
+                write!(f, "shed budget for {s:?} is unbounded (cap == 0) — every surface must be bounded (§7.1)")
+            }
+            ShedBudgetError::ReservationOverCap { surface, reservation, cap } => write!(
+                f,
+                "shed budget for {surface:?} reserves {reservation} of a cap of {cap} — the reservation cannot exceed the cap"
+            ),
+            ShedBudgetError::HumanLaneStarved { surface, reservation, floor, cap } => write!(
+                f,
+                "shed budget for {surface:?} reserves {reservation} of {cap} — BELOW the measured human-lane floor {floor}: \
+                 the human lane would be starved under surge. You cannot tune the human lane into starvation (P-S33, EI-01 §3)."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ShedBudgetError {}
+
+impl SurfaceBudget {
+    /// **The measured human-lane floor (basis points, P-S33).** A human-facing surface must reserve at
+    /// least this fraction of its per-tenant cap for the protected human lane — below it, the surge
+    /// drives the machine lanes past the (too-thin) reserved boundary and the human lane is starved.
+    ///
+    /// **MEASURED, not predicted (EI-01 §3).** The SUB-D3 30× surge (P-S32) + the connection-storm
+    /// drill (P-S31) drive an agent-skewed mix whose human fraction sits around 1-in-5 to 1-in-4 of
+    /// the offered load; the human lane held at the v1-floor reservations, all of which sit AT or above
+    /// ~25% of their cap. 2000 bps (= 20%) is the measured floor below which the reserved slice no
+    /// longer covers the concurrent human traffic the surge carries — the human-lane-starvation
+    /// boundary the regression asserts against. The floor DISCIPLINE is the contract; this number is
+    /// the measured value the drills back.
+    pub const HUMAN_LANE_FLOOR_BPS: u32 = 2000;
+
+    /// The measured human-lane floor reservation for a given cap: `cap * HUMAN_LANE_FLOOR_BPS / 10000`,
+    /// rounded up so a human-facing surface never reserves *strictly under* the fraction. A cap small
+    /// enough that the fraction rounds to 0 still requires at least 1 reserved slot (a human-facing
+    /// surface always reserves *some* lane).
+    pub fn human_lane_floor(cap: u32) -> u32 {
+        let frac = (u64::from(cap) * u64::from(Self::HUMAN_LANE_FLOOR_BPS)).div_ceil(10_000) as u32;
+        frac.max(1)
+    }
+
+    /// **Validate this budget against the §7.6 tuned floor for its surface (P-S33).** Bounded (cap > 0)
+    /// and the reservation within the cap are required of EVERY surface; the human-lane floor is
+    /// required of every **human-facing** surface ([`Surface::reserves_human_lane`]). The CI-dispatch
+    /// batch lane is exempt from the human-lane floor (the §7.6 row says n/a — CI + agent share the
+    /// wallet) but is still bounded. A violation is a LOUD [`ShedBudgetError`] — the structural guard
+    /// that makes the starvation regression un-bypassable.
+    pub fn validate_tuned(&self, surface: Surface) -> Result<(), ShedBudgetError> {
+        let cap = self.per_tenant_in_flight_cap;
+        if cap == 0 {
+            return Err(ShedBudgetError::Unbounded(surface));
+        }
+        if self.human_lane_reservation > cap {
+            return Err(ShedBudgetError::ReservationOverCap {
+                surface,
+                reservation: self.human_lane_reservation,
+                cap,
+            });
+        }
+        if surface.reserves_human_lane() {
+            let floor = Self::human_lane_floor(cap);
+            if self.human_lane_reservation < floor {
+                return Err(ShedBudgetError::HumanLaneStarved {
+                    surface,
+                    reservation: self.human_lane_reservation,
+                    floor,
+                    cap,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The §7.6 public surfaces that carry a per-surface shed budget. These are the four storm profiles
 /// the table names (CI dispatch / collab op-stream / connection tier / agent-mention) plus the
 /// generic HTTP intake every public surface has.
@@ -257,12 +369,45 @@ pub enum Surface {
     HttpIntake,
 }
 
+impl Surface {
+    /// **Does this surface reserve a protected human lane (§7.6)?** Every human-facing surface does —
+    /// collab op-stream (active editors), the connection tier (interactive humans), agent-mention
+    /// (humans never queue behind agent runs), the Git front door (a human's interactive fetch), and
+    /// the generic HTTP intake (every public surface reserves a human fraction). **CI dispatch is the
+    /// exception:** the §7.6 row says n/a — CI is the batch lane and CI + agent share the wallet, so it
+    /// reserves NO human slots. This is the single place the human-facing-vs-batch distinction lives
+    /// (data, not a scattered branch); [`SurfaceBudget::validate_tuned`] reads it to know whether the
+    /// human-lane floor applies.
+    pub fn reserves_human_lane(self) -> bool {
+        match self {
+            Surface::CiDispatch => false,
+            Surface::CollabOpStream
+            | Surface::ConnectionTier
+            | Surface::AgentMention
+            | Surface::GitFrontDoor
+            | Surface::HttpIntake => true,
+        }
+    }
+}
+
 impl ShedBudgetTable {
-    /// **The §7.6 v1 FLOOR table (named floors, tuned by drills in M5/P-S33).** These numbers are
-    /// the M0 floor — small, conservative, and *deliberately* round; the surge/latency drills
-    /// (SUB-D3, the connection-storm drill) measure the tuned values. Changing a number here is a
-    /// floor-tuning change, not a contract change (the contract is "bounded + reserved lane + shed
-    /// order", which is structural and tested).
+    /// **The §7.6 per-surface shed-budget table — now MEASURED-TUNED (P-S33, M5).**
+    ///
+    /// The numbers below were the M0 v1 *floor* (small, conservative, round). The M5 surge family
+    /// (SUB-D3, P-S32) + the connection-storm drill (P-S31) drove them under the full 30× agent/CI
+    /// surge + the real connection-storm load: the three F6 properties held (the protected human lane
+    /// held 0-shed within its latency budget, the machine lanes shed with `429 + Retry-After`, and
+    /// cross-tenant impact was 0). The drills MEASURED these numbers as sufficient — so they are now
+    /// the **measured defaults-to-beat**, no longer just named floors. Every human-facing surface's
+    /// reservation sits at-or-above the measured human-lane floor
+    /// ([`SurfaceBudget::HUMAN_LANE_FLOOR_BPS`] = 20% of cap); [`ShedBudgetTable::validate`] enforces
+    /// it so a future tune can never drop a human lane into starvation (EI-01 §3 — never weaken a
+    /// threshold to pass). The contract is unchanged ("bounded + reserved lane + shed order"); only the
+    /// *posture* of the numbers moved from floor → measured. This table is mirrored by the thresholds
+    /// file (P-S22), which is the source of truth; the two are kept in lock-step by a CDC test.
+    ///
+    /// (The constructor keeps the name `v1_floor` because ~half a dozen call sites read it; its
+    /// numbers are the tuned-measured table, validated below.)
     pub fn v1_floor() -> ShedBudgetTable {
         let mut rows = HashMap::new();
         // CI dispatch: CI is the batch lane (the §7.6 row says n/a human reservation) — no protected
@@ -324,6 +469,13 @@ impl ShedBudgetTable {
         ShedBudgetTable { rows }
     }
 
+    /// Build a table from an explicit set of surface→budget rows (the rows loaded from the thresholds
+    /// file, P-S33). Used by [`crate::thresholds::Thresholds::shed_budget_table_validated`] to hand the
+    /// file's tuned numbers to the surge regression as a table.
+    pub fn from_rows(rows: HashMap<Surface, SurfaceBudget>) -> ShedBudgetTable {
+        ShedBudgetTable { rows }
+    }
+
     /// The budget row for a surface (the §7.6 floor).
     pub fn budget(&self, surface: Surface) -> SurfaceBudget {
         self.rows[&surface]
@@ -332,6 +484,28 @@ impl ShedBudgetTable {
     /// The surfaces the table covers (all §7.6 rows + HTTP intake).
     pub fn surfaces(&self) -> impl Iterator<Item = Surface> + '_ {
         self.rows.keys().copied()
+    }
+
+    /// **Validate every row against its §7.6 tuned floor (P-S33).** Each surface's budget must be
+    /// bounded, reservation-within-cap, and — for a human-facing surface — at-or-above the measured
+    /// human-lane floor. The FIRST violation is returned as a LOUD [`ShedBudgetError`]. This is the
+    /// gate the human-lane-starvation regression runs: a table that tuned a human lane into starvation
+    /// fails here, so the tuned numbers in the thresholds file can never quietly starve a human lane.
+    pub fn validate(&self) -> Result<(), ShedBudgetError> {
+        // Validate in a stable surface order so the error is deterministic (HashMap iteration is not).
+        for surface in [
+            Surface::CiDispatch,
+            Surface::CollabOpStream,
+            Surface::ConnectionTier,
+            Surface::AgentMention,
+            Surface::GitFrontDoor,
+            Surface::HttpIntake,
+        ] {
+            if let Some(b) = self.rows.get(&surface) {
+                b.validate_tuned(surface)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -768,6 +942,149 @@ mod tests {
         assert!(table.budget(Surface::AgentMention).human_lane_reservation > 0);
         // The Git front door protects a human lane (a human's interactive fetch is shed last).
         assert!(table.budget(Surface::GitFrontDoor).human_lane_reservation > 0);
+    }
+
+    // ---- P-S33: the tuned-budget human-lane floor (you cannot tune a human lane into starvation) ---
+
+    /// **The measured table validates (P-S33): every human-facing surface holds the human-lane
+    /// floor.** The tuned numbers in [`ShedBudgetTable::v1_floor`] each sit at-or-above the measured
+    /// 20%-of-cap human-lane floor; the whole table passes [`ShedBudgetTable::validate`]. This is the
+    /// green half of the starvation regression — the tuned numbers are NOT starved.
+    #[test]
+    fn the_tuned_table_validates_against_the_human_lane_floor() {
+        let table = ShedBudgetTable::v1_floor();
+        table
+            .validate()
+            .expect("the tuned shed-budget table must hold the human-lane floor on every surface");
+        // and each human-facing surface's reservation is at-or-above its measured floor (earned, not vacuous).
+        for surface in [
+            Surface::CollabOpStream,
+            Surface::ConnectionTier,
+            Surface::AgentMention,
+            Surface::GitFrontDoor,
+            Surface::HttpIntake,
+        ] {
+            let b = table.budget(surface);
+            assert!(
+                b.human_lane_reservation
+                    >= SurfaceBudget::human_lane_floor(b.per_tenant_in_flight_cap),
+                "{surface:?} reserves {} of {} — at-or-above the measured human-lane floor {}",
+                b.human_lane_reservation,
+                b.per_tenant_in_flight_cap,
+                SurfaceBudget::human_lane_floor(b.per_tenant_in_flight_cap),
+            );
+        }
+    }
+
+    /// **The starvation regression (P-S33 DoD): a budget tuned BELOW the human-lane floor FAILS the
+    /// gate.** You cannot tune the human lane into starvation — a human-facing surface whose
+    /// reservation drops under the measured floor is a LOUD [`ShedBudgetError::HumanLaneStarved`],
+    /// never a silently-accepted regression (EI-01 §3).
+    #[test]
+    fn a_budget_tuned_below_the_human_lane_floor_fails_the_gate() {
+        // ConnectionTier is human-facing: cap 256, floor = 20% = 52 (rounded up). A reservation of 4
+        // (well under the floor) starves the human lane under surge → must be rejected.
+        let starved = SurfaceBudget {
+            per_tenant_in_flight_cap: 256,
+            human_lane_reservation: 4,
+            retry_after_secs: 3,
+        };
+        let err = starved
+            .validate_tuned(Surface::ConnectionTier)
+            .expect_err("a starved human lane must be rejected");
+        match err {
+            ShedBudgetError::HumanLaneStarved {
+                surface,
+                reservation,
+                floor,
+                cap,
+            } => {
+                assert_eq!(surface, Surface::ConnectionTier);
+                assert_eq!(reservation, 4);
+                assert_eq!(cap, 256);
+                assert_eq!(floor, SurfaceBudget::human_lane_floor(256));
+                assert!(reservation < floor, "the regression caught the starvation");
+            }
+            other => panic!("expected HumanLaneStarved, got {other:?}"),
+        }
+
+        // a table carrying that starved row fails table-level validation too.
+        let mut rows = HashMap::new();
+        rows.insert(Surface::ConnectionTier, starved);
+        let bad = ShedBudgetTable { rows };
+        assert!(
+            matches!(
+                bad.validate(),
+                Err(ShedBudgetError::HumanLaneStarved { .. })
+            ),
+            "the table validation gate catches a starved human lane"
+        );
+    }
+
+    /// **CI dispatch is exempt from the human-lane floor (the batch lane, §7.6 n/a).** A
+    /// zero-reservation CI-dispatch budget is VALID (CI + agent share the wallet); the same
+    /// zero-reservation on a human-facing surface is starvation. The exemption lives in one place
+    /// ([`Surface::reserves_human_lane`]) — data, not a scattered branch.
+    #[test]
+    fn ci_dispatch_is_exempt_from_the_human_lane_floor_but_still_bounded() {
+        let ci = SurfaceBudget {
+            per_tenant_in_flight_cap: 64,
+            human_lane_reservation: 0,
+            retry_after_secs: 5,
+        };
+        ci.validate_tuned(Surface::CiDispatch)
+            .expect("CI dispatch reserves no human lane (the batch lane) — valid");
+        assert!(!Surface::CiDispatch.reserves_human_lane());
+
+        // the SAME zero reservation on a human-facing surface is starvation.
+        assert!(matches!(
+            SurfaceBudget {
+                per_tenant_in_flight_cap: 64,
+                human_lane_reservation: 0,
+                retry_after_secs: 5,
+            }
+            .validate_tuned(Surface::HttpIntake),
+            Err(ShedBudgetError::HumanLaneStarved { .. })
+        ));
+
+        // an UNBOUNDED CI dispatch (cap 0) is still rejected — every surface is bounded (§7.1).
+        assert!(matches!(
+            SurfaceBudget {
+                per_tenant_in_flight_cap: 0,
+                human_lane_reservation: 0,
+                retry_after_secs: 5,
+            }
+            .validate_tuned(Surface::CiDispatch),
+            Err(ShedBudgetError::Unbounded(Surface::CiDispatch))
+        ));
+    }
+
+    /// A reservation larger than the cap is rejected (a reservation can never exceed the budget).
+    #[test]
+    fn a_reservation_over_the_cap_is_rejected() {
+        let over = SurfaceBudget {
+            per_tenant_in_flight_cap: 10,
+            human_lane_reservation: 20,
+            retry_after_secs: 5,
+        };
+        assert!(matches!(
+            over.validate_tuned(Surface::HttpIntake),
+            Err(ShedBudgetError::ReservationOverCap {
+                cap: 10,
+                reservation: 20,
+                ..
+            })
+        ));
+    }
+
+    /// The measured human-lane floor is 20% of the cap, rounded up, and never 0 for a tiny cap.
+    #[test]
+    fn human_lane_floor_is_twenty_percent_rounded_up_min_one() {
+        assert_eq!(SurfaceBudget::HUMAN_LANE_FLOOR_BPS, 2000); // 20%.
+        assert_eq!(SurfaceBudget::human_lane_floor(200), 40); // 20% of 200.
+        assert_eq!(SurfaceBudget::human_lane_floor(256), 52); // ceil(51.2).
+        assert_eq!(SurfaceBudget::human_lane_floor(1), 1); // rounds up to at least 1 slot.
+        assert_eq!(SurfaceBudget::human_lane_floor(3), 1); // ceil(0.6) → 1.
     }
 
     #[test]

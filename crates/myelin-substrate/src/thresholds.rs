@@ -24,7 +24,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::shed::{Surface, SurfaceBudget};
+use crate::shed::{ShedBudgetError, ShedBudgetTable, Surface, SurfaceBudget};
 
 /// The canonical filename, at the workspace root. The single thresholds file (P-S22).
 pub const THRESHOLDS_FILENAME: &str = "thresholds.toml";
@@ -556,6 +556,34 @@ impl Thresholds {
             .remove(&surface)
             .ok_or_else(|| ThresholdError::Missing(format!("shed_budgets.{surface:?}")))
     }
+
+    /// **Validate the file's TUNED shed budgets against the §7.6 floor discipline (P-S33).** Each row
+    /// loaded from the file must hold: bounded (cap > 0), reservation-within-cap, and — for a
+    /// human-facing surface — at-or-above the measured human-lane floor
+    /// ([`SurfaceBudget::HUMAN_LANE_FLOOR_BPS`]). A row that tuned a human lane into starvation is a
+    /// LOUD [`ShedBudgetError`], NOT a silently-accepted regression: this is the gate that makes "you
+    /// cannot tune the human lane into starvation" un-bypassable from the thresholds file itself, so a
+    /// future hand-edit that drops a reservation below the floor fails at load, never at runtime under
+    /// surge. Each row in the file MUST validate (the tuned numbers are measured, not weakened).
+    pub fn validate_shed_budgets(&self) -> Result<(), ShedBudgetError> {
+        let table_map = self
+            .shed_budget_table()
+            .map_err(|_| ShedBudgetError::Unbounded(Surface::HttpIntake))?;
+        for (surface, budget) in &table_map {
+            budget.validate_tuned(*surface)?;
+        }
+        Ok(())
+    }
+
+    /// The file's tuned shed budgets as a validated [`ShedBudgetTable`]. Every row must be present and
+    /// each must hold the §7.6 floor; otherwise a loud error. The table the surge drill re-runs
+    /// against the tuned numbers (P-S33).
+    pub fn shed_budget_table_validated(&self) -> Result<ShedBudgetTable, ThresholdError> {
+        self.validate_shed_budgets()
+            .map_err(|e| ThresholdError::Parse(e.to_string()))?;
+        let map = self.shed_budget_table()?;
+        Ok(ShedBudgetTable::from_rows(map))
+    }
 }
 
 /// Map a `shed::Surface` variant NAME (as written in the file) to the enum. The match is exhaustive,
@@ -651,6 +679,59 @@ mod tests {
                 "shed budget for {surface:?} must match the v1 floor table"
             );
         }
+    }
+
+    /// **P-S33: the canonical file's TUNED shed budgets validate against the §7.6 human-lane floor.**
+    /// Every row is bounded, reservation-within-cap, and (human-facing) at-or-above the measured 20%
+    /// floor — the load-time gate that makes "you cannot tune the human lane into starvation" hold.
+    #[test]
+    fn the_canonical_tuned_shed_budgets_validate() {
+        let t = Thresholds::load_canonical().expect("load");
+        t.validate_shed_budgets()
+            .expect("the tuned shed budgets in the canonical file must validate (P-S33)");
+        // the validated table is buildable from the file.
+        t.shed_budget_table_validated()
+            .expect("the validated tuned table builds from the file");
+    }
+
+    /// **P-S33: a thresholds file that starves a human lane FAILS the validation gate** (not edited
+    /// green). A ConnectionTier reservation under the measured floor is a loud `HumanLaneStarved`.
+    #[test]
+    fn a_starved_human_lane_in_the_file_fails_validation() {
+        let starved = r#"
+            version = 1
+            as_of = "2026-06-24"
+            [revocation]
+            sla_mins = 5
+            [surge]
+            multiplier = 30
+            [fail_static]
+            status = "OPEN — LEGAL"
+            owner = "DPO / Legal"
+            static_max_default_secs = 300
+            agent_token_ttl_secs = 60
+            constraint = "x"
+            [rpo_rto]
+            rpo_max_mins = 5
+            rto_tenant_max_mins = 60
+            rto_cell_max_mins = 240
+            [depth_ceilings]
+            soft = 12
+            hard = 16
+            [[shed_budgets]]
+            surface = "HttpIntake"
+            per_tenant_in_flight_cap = 200
+            human_lane_reservation = 3
+            retry_after_secs = 5
+        "#;
+        let t = Thresholds::from_toml(starved).expect("parses");
+        assert!(
+            matches!(
+                t.validate_shed_budgets(),
+                Err(ShedBudgetError::HumanLaneStarved { .. })
+            ),
+            "a human lane tuned under the measured floor must fail the gate (P-S33, EI-01 §3)"
+        );
     }
 
     /// The file round-trips: parse → serialize → parse yields the identical structure.
