@@ -73,6 +73,20 @@
 //!   [`replay::reindex_parity_hash`] (cold == live). The full multi-holder erasure RECEIPT remains the
 //!   CHAT-P22 floor.
 //!
+//! - [`dispatch`] — **CHAT-P25 / P-419**: the second committable unit of M4-C9 (presence + streaming
+//!   is CHAT-P24 [`presence`]) — **explicit-first agent dispatch** (no auto-spawn on mention;
+//!   reserve-gated) + the **agent provenance popover** (S12). REUSES the explicit-first CLASS decision
+//!   ([`glue::agent_dispatch_class`], NOTIF-P22) and wires it into the dispatch ORCHESTRATION: a casual
+//!   `@agent` mention → [`dispatch::Disposition::NotifiedInbox`] (0 run, 0 reserve, contract 8.6 /
+//!   CHAT-1); only an explicit action → [`dispatch::dispatch_explicit`] which reserves (11.7 — no
+//!   balance → no run), mints a per-run token (4.7), and routes the run's chat output through
+//!   [`myelin_agent::EffectApi`] (8.2 — the routing split). The structural
+//!   [`dispatch::no_auto_spawn_path_is_wired`] proves 0 mention→run edges (CHAT-D17). The
+//!   [`dispatch::agent_provenance`] popover answers "why did this agent post?" from `actor.on_behalf_of`
+//!   / `causation_id` / `correlation_id` / `caused_by` (§7.5, the agent badge always set). FLOORS:
+//!   the no-auto-spawn path is a DELIBERATE counsel-gated L-3 absence ([`dispatch::L3_AUTO_SPAWN_ABSENCE`],
+//!   recon §6); the dispatched brain is the mock (--use-mock, the real `LlmAgentRuntime` post-M5). This
+//!   COMPLETES the M4 chat surface.
 //! - [`glue`] — **CHAT-P3 / P-245**: the M2-C0 humanise/notif/fanout-class + firehose-scope + TE-21
 //!   slice (contracts 7.3 / 7.6 / 3.5 / 1.7). Chat REGISTERS its humanise template keys (card /
 //!   agent-message / `chat.message.mentioned` — the ONE templating surface, OQ-L) + its
@@ -161,6 +175,7 @@ pub mod composer;
 pub mod content;
 pub mod conversation;
 pub mod dek;
+pub mod dispatch;
 pub mod erase;
 pub mod events;
 pub mod fanout;
@@ -195,6 +210,11 @@ pub use conversation::{
     Membership, MembershipRole,
 };
 pub use dek::{decrypt_body, encrypt_body, plaintext_at_rest, subject_dek_erasure, ChatFreeText};
+pub use dispatch::{
+    agent_provenance, dispatch_disposition_class, dispatch_explicit, mention_is_always_notify_only,
+    no_auto_spawn_path_is_wired, reserve_gate, AgentProvenance, DispatchOutcome, Disposition,
+    L3_AUTO_SPAWN_ABSENCE, PROVENANCE_AUDIT_LINK_KIND,
+};
 pub use erase::{
     aggregate_receipt, is_body_unrecoverable, ChatEraseReport, ChatErasureCascade, StoreReceipt,
     CHAT_ERASE_CASCADE_TOKEN,
