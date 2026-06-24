@@ -367,6 +367,7 @@ pub mod chat_producer;
 pub mod ci_producer;
 pub mod cross_cell;
 pub mod dek;
+pub mod e2e_wedge;
 pub mod edge_builder;
 pub mod emit;
 pub mod erasure_posture;
@@ -406,6 +407,10 @@ pub use cross_cell::{
     CROSS_CELL_RAW_ROWS_SIGNAL, CROSS_CELL_RESOLVES_SIGNAL,
 };
 pub use dek::{ref_p5_inherited_gates, InheritedGate, RefsDekPin};
+pub use e2e_wedge::{
+    run_e2e_1_pr_pane, run_e2e_3_spec_to_ship, run_e2e_4_dsar_fanout, run_refs_e2e_wedge,
+    E2eArtifact, E2E_SCENARIOS,
+};
 pub use edge_builder::{
     edge_id, EdgeProjection, EdgeRow, ProjectError, RefsEdgeBuilder, RelClass,
     EDGE_BUILDER_CONSUMER, EDGE_BUILDER_SUBJECTS, EDGE_BUILDER_SUBJECT_PREFIXES,
