@@ -113,3 +113,11 @@ toml.workspace = true
 # dev-only edge Cargo permits (it never enters the storage crate's production/runtime DAG, so no
 # build cycle). This is the SAME posture as the myelin-lints / myelin-harness dev-deps above.
 myelin-control-plane = { path = "../myelin-control-plane" }
+# myelin-gdpr-service is a DEV-dependency ONLY: the E2E-4 holder-coverage CDC pair
+# (tests/cdc_e2e4_holder_coverage.rs, P-ST-35) pins that storage's H1–H18 `HolderClass::ALL`
+# catalogue (the PROVIDER of the storage-side crypto-shred reach) covers the orchestrator's
+# storage-owned `orchestration::holder_ids` (the CONSUMER that drives the data-map fan-out). The
+# two coverage proofs MUST agree. `myelin-gdpr-service` does NOT depend on `myelin-storage`, so a
+# dev-dependency back is a CDC consumer reaching DOWN to its provider's test — no build cycle
+# (the same posture as the myelin-control-plane / myelin-lints / myelin-harness dev-deps above).
+myelin-gdpr-service = { path = "../myelin-gdpr-service" }
