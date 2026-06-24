@@ -1938,6 +1938,16 @@ cdc = [
     # AG-D5 (the governed transition/close HITL withhold: 0 pre-approval mutation, exactly-once
     # post-approval) + AG-D9 (the MOCK forecast/triage agents replay byte-identically) + AG-D4 green.
     "crates/myelin-agent-service/tests/drills_iss_p23_issues_tools_and_agents.rs",
+    # CHAT-P19 / P-414 (M4-C6): the CHAT X-6 slice — chat OWNS its agent ToolDef set (arch 03 §8, a
+    # frozen X-6 value): `myelin_chat::tools` ships the COMPLETE chat agent-tool set (post/reply_in_thread/
+    # react/start_dm = NOT gated; create_channel/invite/archive_channel = gated) with the frozen §8
+    # requires_approval + effect_kind=Mutate (the routing split — every side-effecting chat tool routes
+    # through EffectApi, NEVER ToolHands::exec) + the 4.9 required_caps (channel.post / channel.manage from
+    # the frozen Chat ReBAC fragment), and `register_chat_tools` registers them into the ONE ToolSurface
+    # (a side-effecting Compute/External chat def — which would route to ToolHands::exec — is structurally
+    # REJECTED). The CDC pins the registration (resolve-by-name carries every frozen field) + the routing
+    # split. ToolHands::exec is ABSENT (the sandbox is the M2 Agent primitive, X-6).
+    "crates/myelin-chat/tests/cdc_8_1_8_2_8_7_11_7_chat_tools.rs",
 ]
 
 [[contract]]
@@ -1961,6 +1971,11 @@ status = "covered"
 cdc = [
     "crates/myelin-agent/tests/cdc_8_2_effect_api.rs",
     "crates/myelin-knowledge/tests/cdc_8_2_knowledge_agent_governance.rs",
+    # CHAT-P19 / P-414 (M4-C6): the CHAT CONSUMER leg — every chat MUTATION routes through the REAL
+    # `myelin_agent::EffectApi` (`myelin_chat::tools::route_chat_effect_through_effect_api`): a reversible
+    # post APPLIES; a consequential invite is WITHHELD (`Gated`, 0 mutation, AG-8). Chat does NOT
+    # re-implement the eight-step pipeline (the fabric owns it) — the routing split is the safety boundary.
+    "crates/myelin-chat/tests/cdc_8_1_8_2_8_7_11_7_chat_tools.rs",
 ]
 
 [[contract]]
@@ -2078,7 +2093,13 @@ row = "8.7"
 # not a pair gap; the 8.7 signature pair carries both sides NOW.
 title = "run --dry-run -> Vec<ProposedEffect>"
 status = "covered"
-cdc = ["crates/myelin-agent/tests/cdc_8_7_dry_run.rs"]
+cdc = [
+    "crates/myelin-agent/tests/cdc_8_7_dry_run.rs",
+    # CHAT-P19 / P-414 (M4-C6): the CHAT PROVIDER leg — `myelin_chat::tools::ChatDryRun` satisfies the
+    # frozen `DryRun::dry_run(InboxEvent) -> Vec<ProposedEffect>` over the chat tool set: the plan is
+    # returned, NOTHING applies (0 mutation), each effect carrying its frozen would-gate verdict.
+    "crates/myelin-chat/tests/cdc_8_1_8_2_8_7_11_7_chat_tools.rs",
+]
 
 [[contract]]
 row = "8.8"
@@ -2849,11 +2870,21 @@ status = "covered"
 # (OQ-F: card_id single / card_id:<effect_idx> multi) is stated Issues-side (per_effect_idem_key),
 # byte-identical to the agent-fabric derivation. The CDC pair + the chained-mutation e2e (dispatch →
 # reserve → complete → settle → assert balanced) is cdc_11_7_issues_reserve_settle.rs.
+#
+# CHAT-P19 / P-414 (M4-C6): the CHAT CONSUMER HALF — reserve/settle fronts every spend-bearing agent
+# post (arch chat 03 §9). Chat does NOT own the wallet — it CONSUMES the SAME Storage-owned CostLedger
+# CI/Issues draw from (the shared wallet, 11.7). `myelin_chat::tools::reserve_spend_bearing_post`
+# fronts the post's cost ESTIMATE (chat surfaces the cost — the HITL card's live estimate — but never
+# holds the wallet, §9): reserve at dispatch (no balance → no post) → settle on completion ≤ the
+# reserve (never interrupt in-flight; inflight_interrupt_count == 0). The CDC is in
+# cdc_8_1_8_2_8_7_11_7_chat_tools.rs (the chat tool slice). FLOOR named: none new — the ledger is the
+# M1 Storage primitive; chat MUST NOT re-implement a budget.
 cdc = [
     "crates/myelin-storage/tests/cdc_11_7_reserve_settle.rs",
     "crates/myelin-storage/tests/ag_d6_d11_reserve_refusal_drill.rs",
     "crates/myelin-ci-controlplane/tests/drills_ci_p17_reserve_settle_parity.rs",
     "crates/myelin-issues/tests/cdc_11_7_issues_reserve_settle.rs",
+    "crates/myelin-chat/tests/cdc_8_1_8_2_8_7_11_7_chat_tools.rs",
 ]
 
 [[contract]]

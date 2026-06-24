@@ -2133,6 +2133,7 @@ dependencies = [
 name = "myelin-chat"
 version = "0.0.0"
 dependencies = [
+ "myelin-agent",
  "myelin-content",
  "myelin-events",
  "myelin-flow",
