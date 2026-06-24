@@ -589,6 +589,13 @@ pub mod residency;
 pub mod restore;
 pub mod restore_verify;
 pub mod rls;
+// The F6 surge family on the STORAGE lanes (P-ST-34 / P-444, M5): the storage-tier face of the 30×
+// surge — a CI artifact storm by one tenant does not starve another (the per-tenant storage-lane
+// budget + the shed order: human holds, agent/CI sheds with 429+Retry-After; cross-tenant impact 0).
+// Storage owns its OWN lane-fairness primitive (it cannot depend on the substrate's `ShedLane` /
+// control-plane's cell bulkhead without inverting the crate DAG); the F6 storage drill cross-validates
+// the shed order against the substrate's `RunClass` so the two agree (coherence, EI-01 §7).
+pub mod storage_surge;
 
 // ---- Stage 2 / infra: the REAL backends behind the existing traits (config-selected) ----
 // These modules are compiled ONLY under `--features integration` (they pull the real sqlx /
@@ -723,6 +730,10 @@ pub use restore_verify::{
     RestoreVerifyGate, RestoredObject,
 };
 pub use rls::{RlsError, TenantQuery, TenantScope, TenantTable};
+pub use storage_surge::{
+    run_storage_lane_surge, StorageAdmission, StorageLaneBudget, StorageLaneClass, StorageLaneGate,
+    StorageSurgeReport, STORAGE_SURGE_MULTIPLIER,
+};
 
 // The race-safe live migration driver (the P-S12 floor) — re-exported behind `integration`, along
 // with the live `PgStore` + its typed `PgError` the driver returns.
