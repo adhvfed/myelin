@@ -331,6 +331,12 @@ cdc = [
     # drill_iss_d8b_olap_feed.rs + the chained-mutation e2e is e2e_iss_p20_olap.rs (consumer drills,
     # not pair-evidence — registered under 11.6's landing).
     "crates/myelin-issues/tests/cdc_11_6_issues_olap_feed.rs",
+    # CHAT-P9 / P-403 (M4-C2): the Chat GATEWAY's consumer leg — when a reconnect's last_seq is older
+    # than the firehose retention window the Bus raises resync_required, and the gateway falls back to
+    # the REAL `MessageStore::resync_from(conversation, cursor)` snapshot (the gap-free, ordered
+    # clustering-range read — 0 lost), then resumes live. The fallback names the FROZEN chat
+    # channel/message/thread *.snapshot tokens. The PROVIDER is myelin_chat::store::MemHotTier.
+    "crates/myelin-chat-gateway/tests/cdc_3_5_2_6_chat_gateway.rs",
 ]
 
 [[contract]]
@@ -460,6 +466,14 @@ cdc = [
     # `Channel` selector, never `*`; the `resync_required -> *.snapshot` fallback names chat's
     # durable channel/message/thread snapshots). No transport here (the live subscribe is CHAT-P9).
     "crates/myelin-chat/tests/cdc_3_5_chat_firehose_scope.rs",
+    # CONSUMER leg — the Chat GATEWAY (CHAT-P9 / P-403) IMPLEMENTS the live subscribe/resume tier the
+    # CHAT-P3 scope-shape validation foreshadowed: it opens a per-view subscription on the BOUNDED
+    # `channel:<id>` scope through the Bus's `*`-rejecting chokepoint (0 unbounded subscriptions), and
+    # a reconnect `resume(stream, scope, last_seq)` backfills (last_seq, now] over the REAL
+    # `myelin_events::Firehose` (0 lost) -> an over-window cursor yields resync_required (NAMED) which
+    # the gateway turns into the 2.6 *.snapshot fallback. The CHAT-D1 drill
+    # (drill_chat_d1_resume.rs) proves 0 lost / 0 dup across a real sever+resume on BOTH legs.
+    "crates/myelin-chat-gateway/tests/cdc_3_5_2_6_chat_gateway.rs",
     # OWNED-SEAM leg — Knowledge (KN-P07 / P-297) owns the resume-cursor + idempotent-apply
     # DISCIPLINE over the Bus transport seam: SEND_OP assigns the per-doc monotone op_seq (== the
     # firehose seq), PERSISTs idempotent on UNIQUE(op_id) (a re-delivered op is a no-op), and

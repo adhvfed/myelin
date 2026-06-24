@@ -148,6 +148,15 @@ members = [
     # durable set's emit behaviour begins in CHAT-P5, the firehose set's in CHAT-P10. See the
     # crate-level note in crates/myelin-chat/src/lib.rs.
     "crates/myelin-chat",
+    # The Chat CONNECTION-TIER gateway (CHAT-P9 / P-403, M4-C2). The stateless Rust gateway:
+    # subscribe/resume/resync_required — the zero-loss-across-reconnect backbone. It COMPOSES the
+    # frozen pieces (the firehose resume-cursor protocol 3.5, the MessageStore::resync_from snapshot
+    # fallback 2.6, the membership read gate 4.2, authenticate 4.1, the liveness!=readiness gate 1.3,
+    # the TE-21 1.7 no-op) and owns NO durable store + NO outbox (the gateway has no emit path — it
+    # calls the Message Service). A leaf consumer ABOVE the glue crates; nothing in the production DAG
+    # depends back on it (substrate_is_root()/identity_is_sink() preserved). The firehose-only LIVE
+    # delivery body + the shed order is CHAT-P10 (P-404).
+    "crates/myelin-chat-gateway",
     # The CI SANDBOX crate (CI-P1 → P-129, M2). The runner/backend home: the JobSpec struct
     # (the "one struct, two kinds" seam, kind ∈ {Ci, Agent}), the SandboxBackend / FleetProvider
     # trait SHAPES (no backend impl — Firecracker is CI-P2/P-237, gVisor is CI-P28), and the

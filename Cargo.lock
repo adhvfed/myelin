@@ -2150,6 +2150,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "myelin-chat-gateway"
+version = "0.0.0"
+dependencies = [
+ "myelin-chat",
+ "myelin-events",
+ "myelin-identity",
+ "myelin-substrate",
+ "myelin-tenancy",
+]
+
+[[package]]
 name = "myelin-ci-controlplane"
 version = "0.0.0"
 dependencies = [
