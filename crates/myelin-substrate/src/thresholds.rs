@@ -162,6 +162,15 @@ pub struct Thresholds {
     /// thresholds file (pre-P-440) still parses against the §7.5 seed.
     #[serde(default)]
     pub column_store_seam: ColumnStoreSeam,
+    /// The Search freshness budget MEASURED under the 1×/10×/30× load generator (SRCH-D7 full-scale;
+    /// SRCH-P24 / P-459, M5; search-and-indexing §4.10 / contract 1.8 the `index_lag` + freshness-p99
+    /// telemetry). The seconds-grade event→searchable p99 the indexer holds UNDER LOAD + the
+    /// index-lag alarm margin that fires BEFORE user-visible staleness. The M2 CI floor (SRCH-P06)
+    /// measured the synchronous-pipeline variant; THIS is the full-scale-under-load measure that
+    /// writes the real p99 here. `#[serde(default)]` so an older thresholds file (pre-P-459) still
+    /// parses against the §4.10 seed. Mirrors `myelin_search::freshness::FRESHNESS_P99_SEED_MS`.
+    #[serde(default)]
+    pub search_freshness: SearchFreshness,
     /// The scorecard: drills that came back red live here, never edited green (EI-01 §3).
     #[serde(default)]
     pub claimed_not_proven: Vec<ClaimedNotProven>,
@@ -535,6 +544,75 @@ impl Default for RefsHotArtifact {
     fn default() -> Self {
         RefsHotArtifact {
             read_budget_fanout: 1000,
+        }
+    }
+}
+
+/// The Search freshness budget MEASURED under load (SRCH-D7 full-scale; SRCH-P24 / P-459, M5;
+/// search-and-indexing §4.10 / contract 1.8).
+///
+/// §4.10 names a "seconds-grade p99 freshness budget (D7)": a domain event must become searchable
+/// within this p99 UNDER LOAD, and the `index_lag` alarm must fire BEFORE the staleness is
+/// user-visible ("I can't find what I just wrote"). The M2 CI floor (SRCH-P06) measured the
+/// synchronous-pipeline variant of this; SRCH-P24 measures it at full scale under the 1×/10×/30×
+/// load generator and writes the real number here.
+///
+/// Two numbers, both MEASURED-not-predicted (EI-01 §3): `freshness_p99_ms` is the event→searchable
+/// p99 ceiling the indexer holds under the 30× surge; `index_lag_alarm_margin_ms` is how far BELOW
+/// the budget the index-lag alarm fires — the alarm trips while there is still margin, so staleness
+/// is caught BEFORE it becomes user-visible (never a budget-then-alarm race). The alarm threshold is
+/// therefore `freshness_p99_ms − index_lag_alarm_margin_ms` (the margin must be < the budget — the
+/// gate rejects a margin ≥ budget as a mis-specified alarm). `#[serde(default)]` + [`Default`] so an
+/// older thresholds file (pre-P-459) parses against the §4.10 seed. Mirrors
+/// `myelin_search::freshness::FRESHNESS_P99_SEED_MS` (the seed constant); this file is its source of
+/// truth.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchFreshness {
+    /// The seconds-grade event→searchable p99 budget, in milliseconds, MEASURED under the 30× surge
+    /// (SRCH-D7 full-scale). A regression that pushes the p99 past it is a dated
+    /// `[[claimed_not_proven]]` row, never a lowered bar (EI-01 §3).
+    pub freshness_p99_ms: u64,
+    /// How far BELOW the budget the `index_lag` alarm fires, in milliseconds — the alarm trips at
+    /// `freshness_p99_ms − index_lag_alarm_margin_ms`, so a building lag is caught while there is
+    /// still headroom (the alarm fires BEFORE user-visible staleness, §4.10). MUST be `< freshness_p99_ms`.
+    pub index_lag_alarm_margin_ms: u64,
+}
+
+impl SearchFreshness {
+    /// The seconds-grade seed budget: 2000 ms event→searchable p99 (the §4.1 near-real-time SLO the
+    /// SRCH-P06 CI floor used). SRCH-P24 measures the real number under the 30× surge and dates it
+    /// here. Generous-but-real: an event that is not searchable within 2 s under load IS the
+    /// "I can't find what I just wrote" failure worth a red.
+    pub const FRESHNESS_P99_SEED_MS: u64 = 2000;
+    /// The seed alarm margin: 500 ms below the budget — the index-lag alarm fires at 1500 ms while a
+    /// lag is still 500 ms shy of user-visible staleness.
+    pub const ALARM_MARGIN_SEED_MS: u64 = 500;
+
+    /// The alarm threshold, in milliseconds: `freshness_p99_ms − index_lag_alarm_margin_ms`. This is
+    /// the index-lag level the alarm fires at — strictly below the budget, so the alarm precedes
+    /// user-visible staleness. Saturates at 0 (a margin ≥ budget is rejected at construction; this is
+    /// total for safety).
+    pub fn alarm_threshold_ms(&self) -> u64 {
+        self.freshness_p99_ms
+            .saturating_sub(self.index_lag_alarm_margin_ms)
+    }
+
+    /// Whether the alarm is well-formed: the margin sits strictly below the budget (the alarm fires
+    /// BEFORE the budget is breached, not at/after it). A margin ≥ budget would let staleness become
+    /// user-visible before the alarm — a mis-specified alarm (a `[[claimed_not_proven]]` row).
+    pub fn alarm_fires_before_staleness(&self) -> bool {
+        self.index_lag_alarm_margin_ms < self.freshness_p99_ms
+    }
+}
+
+impl Default for SearchFreshness {
+    /// The §4.10 seed default-to-beat: a 2000 ms freshness p99 with a 500 ms alarm margin (the alarm
+    /// fires at 1500 ms). SRCH-P24 (P-459) measures the real p99 under the 30× surge and dates it. An
+    /// older thresholds file (pre-P-459) falls back here.
+    fn default() -> Self {
+        SearchFreshness {
+            freshness_p99_ms: Self::FRESHNESS_P99_SEED_MS,
+            index_lag_alarm_margin_ms: Self::ALARM_MARGIN_SEED_MS,
         }
     }
 }
@@ -1051,6 +1129,36 @@ mod tests {
         let v1 = DepthCeiling::v1_floor();
         assert_eq!(from_file.soft(), v1.soft());
         assert_eq!(from_file.hard(), v1.hard());
+    }
+
+    /// The canonical file carries the Search freshness budget MEASURED under load (SRCH-D7 full-scale,
+    /// SRCH-P24 / P-459): the §4.10 seconds-grade event→searchable p99 budget + the index-lag alarm
+    /// margin, with the alarm well-formed (it fires BEFORE user-visible staleness). The actual
+    /// measured 30× p99 (~20 ms) is proven achievable by the search-side drill; this asserts the
+    /// recorded budget + alarm shape.
+    #[test]
+    fn canonical_file_holds_the_measured_search_freshness_budget() {
+        let t = Thresholds::load_canonical().expect("load");
+        assert_eq!(
+            t.search_freshness.freshness_p99_ms,
+            SearchFreshness::FRESHNESS_P99_SEED_MS,
+            "the §4.10 seconds-grade freshness p99 budget (held under the 30× surge with ~100× headroom)"
+        );
+        assert_eq!(
+            t.search_freshness.index_lag_alarm_margin_ms,
+            SearchFreshness::ALARM_MARGIN_SEED_MS,
+            "the index-lag alarm margin"
+        );
+        // The alarm fires BELOW the budget — staleness is caught before it is user-visible (§4.10).
+        assert!(
+            t.search_freshness.alarm_fires_before_staleness(),
+            "the alarm margin must sit strictly below the budget (the alarm fires FIRST)"
+        );
+        assert_eq!(
+            t.search_freshness.alarm_threshold_ms(),
+            1500,
+            "the alarm fires at budget − margin = 2000 − 500 = 1500 ms"
+        );
     }
 
     /// The canonical file carries every Q32 default-to-beat at its documented value.

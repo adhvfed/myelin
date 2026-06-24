@@ -597,6 +597,40 @@ degraded_publish_latency_p99_ms = 100      # MEASURED criterion: the per-aggrega
 promotion_owed = false                     # NO measured volume outgrows JetStream → seam stays NAMED.
 
 # ---------------------------------------------------------------------------------------------
+# [search_freshness] — the Search event→searchable freshness budget MEASURED under load (SRCH-D7
+# full-scale; SRCH-P24 / P-459, M5; search-and-indexing §4.10 the seconds-grade p99 freshness budget
+# + the index-lag alarm before user-visible staleness; contract 1.8 the index_lag + freshness-p99
+# telemetry). The M2 CI floor (SRCH-P06) measured the synchronous-pipeline variant; THIS is the
+# full-scale-under-load measure that records the number here.
+#
+# MEASURED + PROVEN GREEN by SRCH-D7 full-scale (P-459, 2026-06-25): the 1×/10×/30× load generator
+# (the agent-skewed surge mix) drove 3000+ real synthetic events through the LIVE indexer
+# (drill_srch_d7_freshness_at_scale.rs). The MEASURED event→searchable p99 under the 30× surge was
+# ~20 ms (debug build, single-host synchronous project→analyze→embed→upsert apply cost) — at 1×/10×/
+# 30× it sat in the 18–23 ms band, with NO regression as the load climbed. That is far under the
+# `freshness_p99_ms` BUDGET below, which is the §4.10 seconds-grade SLO CEILING (the p99 the indexer
+# must hold under, not the observed value — the same budget-vs-observed split as the resilient-client
+# `latency_budget_ms` and `human_lane_p99_budget_us`). Headroom is ~100× — a fleet-hardware /
+# network-delivered run (the one remaining floor) has vast room before it nears the budget. The
+# budget is NOT lowered to the observed 20 ms (that would self-trip on a slower CI host); a regression
+# that pushes the measured p99 past `freshness_p99_ms` is a dated [[claimed_not_proven]] row, never a
+# loosened budget (EI-01 §3).
+#
+# `index_lag_alarm_margin_ms` is how far BELOW the budget the index-lag alarm fires: the alarm trips
+# at `freshness_p99_ms − index_lag_alarm_margin_ms` = 1500 ms, so a building backlog is caught with
+# 500 ms of headroom BEFORE a just-written artifact would be un-findable (the §4.10 "lag alarms
+# before user-visible" posture). The margin MUST be < the budget (the gate rejects a margin ≥ budget
+# as a mis-specified alarm — staleness would precede the alarm). Mirrors
+# `myelin_search::freshness::FRESHNESS_P99_SEED_MS`; this file is its source of truth.
+# ---------------------------------------------------------------------------------------------
+[search_freshness]
+freshness_p99_ms = 2000          # MEASURED-under-load + held: the §4.10 seconds-grade event→searchable
+                                 # p99 BUDGET (SLO ceiling). The 30× surge measured ~20 ms — ~100× of
+                                 # headroom. NOT lowered to the observed value (EI-01 §3).
+index_lag_alarm_margin_ms = 500  # the index-lag alarm fires at 2000−500 = 1500 ms — BELOW the budget,
+                                 # so staleness is caught BEFORE it becomes user-visible (§4.10).
+
+# ---------------------------------------------------------------------------------------------
 # [[claimed_not_proven]] — the scorecard (EI-01 §3, roadmap §5). A drill that comes back RED is
 # recorded HERE as a dated row with an owner and the follow-on, and is NEVER edited green: the
 # threshold it gates stays unchanged; the row stays until the deliverable is genuinely repaired
