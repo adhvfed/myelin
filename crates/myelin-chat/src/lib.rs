@@ -56,9 +56,14 @@
 //!   CHAT-D8. The mention pseudonym-shred (→ `[erased user]`) + the Art. 18 restriction-flag
 //!   suppression at every read path + the LEGAL free-text residual are the named CHAT-P23 / P-417
 //!   floor; the residual is the ONE platform posture (10.9 / X-7), BY REFERENCE.
-//! - [`replay`] — **EB-27 / P-327** (skeleton confirmed at CHAT-P6): chat's `replay(scope, since)`
-//!   re-emits `chat.{channel,message,thread}.snapshot` through the OUTBOX (contract 2.6); full
-//!   Search/Refs/Notif replay PARITY is the CHAT-P21 floor.
+//! - [`replay`] — **EB-27 / P-327** (skeleton at CHAT-P6) + **CHAT-P21 / P-416** (full parity): chat's
+//!   `replay(scope, since)` re-emits `chat.{channel,message,thread}.snapshot` through the OUTBOX
+//!   (contract 2.6), and the three Chat-fed read-models (Search/Refs/Notif) REBUILD from that re-emit
+//!   through the SAME live consumer step ([`replay::ChatReadModelConsumer::ingest`] — steady-state and
+//!   recovery share ONE path, 0 recovery-only code paths; the rebuild stays ACL-correct via the
+//!   channel-keyed Filter conjoin; an erased subject emits a tombstone, X-7). CHAT-D15 greens on the
+//!   [`replay::reindex_parity_hash`] (cold == live). The full multi-holder erasure RECEIPT remains the
+//!   CHAT-P22 floor.
 //!
 //! - [`glue`] — **CHAT-P3 / P-245**: the M2-C0 humanise/notif/fanout-class + firehose-scope + TE-21
 //!   slice (contracts 7.3 / 7.6 / 3.5 / 1.7). Chat REGISTERS its humanise template keys (card /
@@ -210,7 +215,10 @@ pub use read_state::{
     ReadMarker, ReadStatePush, ReadStateRecord, ReadStateService, CHAT_READ_STATE_STORE,
     DEFAULT_FLUSH_CADENCE, HOT_MARKER_TTL, READ_STATE_UPDATED,
 };
-pub use replay::{ChatReindexSource, ChatReplayKind};
+pub use replay::{
+    reindex_parity_hash, ChatReadModelConsumer, ChatReindexSource, ChatReplayKind,
+    MessageProjectFetcher, MessageProjection, NOTIF_REASON_MENTIONED,
+};
 pub use search::{
     admit_message_indexing, may_index_messages, message_doc_ref, message_index_spec,
     message_index_specs, message_search_acl_anchor, message_search_projection, non_member_filter,
