@@ -496,7 +496,13 @@ pub mod mirror;
 // NAMED: the CI `(job,step,byte-range)` index (C2) is P-ST-26 (M4); the per-subject CI-log DEK (C1)
 // is P-ST-27 (M4) — a key-class swap on the same DekContentWrap seam.
 pub mod erase;
+// The storage-side MULTI-CELL DSR erase fan-out (P-ST-33 / P-445, the FLOOR drill GA-D8): iterate
+// `member_cells ∪ home_cell`, run each cell's own crypto-shred `erase` (each cell owns its keys), and
+// merge a complete per-cell receipt set with 0 cells missed (idempotent). The storage leg behind the
+// control plane's generic `CrossCellDsrFanOut` (global P-430). The full cross-HOLDER reach (E2E-4) is
+// the named follow-on P-ST-35 (P-446).
 pub mod firehose_archive;
+pub mod multi_cell_erase;
 // The T3 CI log tier (C2, P-ST-26 / P-328, M4, contract 11.8 the (job,step,byte-range) index +
 // consumed 5.9 the CheckStatus.details_ref #step-<n> resolution): the CI-keyed instance of the
 // P-ST-20 FirehoseArchiver (the SEALING + per-tenant-DEK mechanism — REUSED wholesale, never a
@@ -692,6 +698,9 @@ pub use migration_under_load::{
     MigrationLoadVerdict, MigrationUnderLoad, StepLockMeasure, WriteLoad,
 };
 pub use mirror::{MirrorTelemetry, PushMirrorClass, PushMirrorTarget};
+pub use multi_cell_erase::{
+    CellEraseContext, CellEraseReceipt, MultiCellEraseFanOut, MultiCellEraseReceiptSet,
+};
 pub use object_packs::{
     cdn_over_object_backing, object_backed_pack_tier, place_repo_object_backed,
     served_from_object_tier, CloneStormLoad, GitD4Ceiling, GitD4Report, ObjectBackedServe,
