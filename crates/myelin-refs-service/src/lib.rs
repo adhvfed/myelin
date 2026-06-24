@@ -356,6 +356,7 @@ pub mod reindex;
 pub mod residency;
 pub mod resolve;
 pub mod restrict;
+pub mod surge;
 pub mod traverse;
 
 pub use backlinks::{
@@ -426,6 +427,10 @@ pub use resolve::{
     RESOLVE_CACHE_HIT_RATIO_SIGNAL, VIEW_PERMISSION,
 };
 pub use restrict::RestrictSet;
+pub use surge::{
+    run_refs_surge, RefsShedGate, RefsShedRejection, RefsSurgeReport, R4_REACH_INDEX_FOLLOW_ON,
+    REFS_SURGE_MULTIPLIER, SHARD_SPLIT_IS_MEASURED_ONLY,
+};
 pub use traverse::{
     apply_post_filter, depth_ceiling_from_thresholds, max_nodes_from_thresholds, Traverse,
     TraverseFilter, TraverseNode, TraverseResult, TRAVERSE_DEPTH_CEILING, TRAVERSE_MAX_NODES,

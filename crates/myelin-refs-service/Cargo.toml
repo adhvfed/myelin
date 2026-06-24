@@ -123,6 +123,13 @@ hex = { workspace = true }
 sqlx = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 
+# REF-P22 / P-453 (M5): the REF-D10 30× surge drill (tests/ref_d10_surge_drill.rs) drives the REAL
+# P-S02 load generator (`myelin_harness::LoadGenerator`) at the surge multiplier to DERIVE the
+# storm-op count (never a hand-typed number). `myelin-harness` does NOT depend on `myelin-refs-service`,
+# so this dev-dep is acyclic; it is a TEST-only dep (the default build stays DB-free + harness-free).
+[dev-dependencies]
+myelin-harness = { path = "../myelin-harness" }
+
 [features]
 default = []
 # REF-P12 / P-161: the R2 cache integration test (tests/integration_ref_p12_r2_cache.rs) drives the
