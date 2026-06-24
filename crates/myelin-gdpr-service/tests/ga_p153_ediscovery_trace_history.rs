@@ -150,15 +150,20 @@ fn gate_history_rewrite_skeleton_is_a_resumable_idempotent_activity() {
         "phase 2 re-ran once"
     );
 
-    // The invalidation fan-out is the NAMED M5 floor; the residual is named, not pretended-solved.
+    // P-451 (P-GA-35) PROMOTED the invalidation fan-out from the M5 floor to a live mechanism — no
+    // phase is a deferred floor on the first-class op; the residual is still named, not pretended-
+    // solved, and now names the outbound push-mirror residency gate (GA-11, P-GA-36).
     let invalidate = first
         .phase_receipts
         .iter()
         .find(|r| r.phase == RewritePhase::InvalidateCaches)
         .unwrap();
-    assert!(invalidate.deferred_floor, "invalidation is the M5 floor");
     assert!(
-        first.residual_named.contains("P-GA-35"),
-        "the residual names its follow-on"
+        !invalidate.deferred_floor,
+        "the invalidation fan-out is LIVE on the M5 first-class op (no longer a floor)"
+    );
+    assert!(
+        first.residual_named.contains("P-GA-36"),
+        "the residual names the outbound push-mirror residency gate follow-on"
     );
 }
