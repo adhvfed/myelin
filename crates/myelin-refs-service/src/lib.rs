@@ -380,6 +380,7 @@ pub mod migration;
 pub mod mirror;
 pub mod reach_index;
 pub mod reindex;
+pub mod reindex_at_scale;
 pub mod residency;
 pub mod resolve;
 pub mod restrict;
@@ -446,6 +447,10 @@ pub use reach_index::{R4ReachIndex, R4Verdict, R4_READ_BUDGET_FANOUT};
 pub use reindex::{
     RefsReindexSource, RefsReindexer, ReindexError, ReindexReceipt, SourceEdge,
     REFS_EDGE_SNAPSHOT_TYPE, REFS_OWNER_TOKEN,
+};
+pub use reindex_at_scale::{
+    build_full_scale_corpus, run_full_scale_reindex_parity, FiveProducerCorpus,
+    FullScaleParityReport, FIVE_PRODUCERS, WORLD_SCALE_FLEET_LOAD_FLOOR,
 };
 pub use residency::{refs_store_descriptors, RefsStoreDescriptor};
 pub use resolve::{
