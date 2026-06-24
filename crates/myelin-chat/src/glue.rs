@@ -126,6 +126,26 @@ pub const TPL_CHAT_AGENT_MESSAGE: &str = "chat.agent_message";
 /// event family.
 pub const TPL_CHAT_MENTIONED: &str = "chat.message.mentioned";
 
+/// The humanise template key for the **`project(ref, viewer)` CHANNEL title** (contract 5.6 / 7.3 —
+/// arch 03 §3 `chat/channel → title: name|"#"+topic`). `{0}` is the PII-free channel name-or-topic
+/// label (the cross-DB projection title other subsystems render in a card; resolved through the ONE
+/// templating surface so a tenant brands/localises the chip, never a chat-local `format!`). Consumed
+/// by [`crate::project::Projector`]. The label is already permission-gated (the projection is built
+/// ONLY after the per-viewer `check` passes), so the slot is safe to bind.
+pub const TPL_CHAT_PROJECT_CHANNEL: &str = "chat.project.channel";
+
+/// The humanise template key for the **`project(ref, viewer)` MESSAGE title** (contract 5.6 / 7.3 —
+/// arch 03 §3 `chat/message → title: humanised one-line preview`). `{0}` is the one-line body preview
+/// (already permission-gated). The title is humanised through the ONE templating surface (7.3 — the
+/// "humanised one-line preview" the architecture names), NOT a chat-local string.
+pub const TPL_CHAT_PROJECT_MESSAGE: &str = "chat.project.message";
+
+/// The humanise template key for the **`project(ref, viewer)` THREAD title** (contract 5.6 / 7.3 —
+/// arch 03 §3 `chat/thread → title: root preview + reply-count`). `{0}` is the root one-line preview,
+/// `{1}` is the integer reply-count (rendered through the ICU `{1, plural, …}` subset so "1 reply" /
+/// "N replies" pluralises in the ONE formatter, never a chat-local branch). Already permission-gated.
+pub const TPL_CHAT_PROJECT_THREAD: &str = "chat.project.thread";
+
 /// Build chat's **humanise template rows (contract 7.3)** — the deliverable of CHAT-P3. Each is a
 /// NULL-tenant ([`PLATFORM_DEFAULT_TENANT`]) `en` platform-default row in the ONE
 /// [`TemplateStore`]; a tenant brands / localises by registering its own `(tenant, key, locale)`
@@ -159,6 +179,19 @@ pub fn chat_humanise_templates() -> Vec<HumaniseTemplate> {
         row(TPL_CHAT_AGENT_MESSAGE, "An agent posted in {0}", "agent"),
         // The chat.message.mentioned notify string (the write-fanout producer's inbox string).
         row(TPL_CHAT_MENTIONED, "You were mentioned in {0}", "mention"),
+        // The project(ref, viewer) projection-title surfaces (contract 5.6 / 7.3, CHAT-P15). Each is a
+        // PII-free, already-permission-gated label routed through the ONE templating surface so the
+        // title other subsystems render is brandable/localisable, never a chat-local `format!`.
+        // chat/channel → name|"#"+topic (arch §3).
+        row(TPL_CHAT_PROJECT_CHANNEL, "{0}", "channel"),
+        // chat/message → the humanised one-line preview (arch §3).
+        row(TPL_CHAT_PROJECT_MESSAGE, "{0}", "message"),
+        // chat/thread → root preview + reply-count, pluralised in the ICU subset (arch §3).
+        row(
+            TPL_CHAT_PROJECT_THREAD,
+            "{0} ({1, plural, one {# reply} other {# replies}})",
+            "thread",
+        ),
     ]
 }
 

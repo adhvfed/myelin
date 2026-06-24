@@ -1070,6 +1070,12 @@ cdc = [
     "crates/myelin-knowledge/tests/cdc_5_4_5_5_5_6_5_7_knowledge_refs_glue.rs",
     "crates/myelin-issues/tests/cdc_5_4_5_5_5_6_5_7_5_3_6_3_issues_refs_glue.rs",
     "crates/myelin-chat/tests/cdc_5_4_13_1_chat_content_edges.rs",
+    # CHAT-P15 / P-409 (M4-C4): chat the DENSEST `refs.edge.created` producer — the UNIFORMITY witness
+    # (`myelin_chat::project::densest_edge_producer`): over a fixture corpus, chat produces one edge for
+    # EVERY structured content node with 0 missing edges (N nodes → N edges; a prose `@x`/URL is not an
+    # edge — structured, never a regex). The edge-emit machinery itself ships in CHAT-P11 (content nodes)
+    # + CHAT-P8 (`chat.channel.linked`); this row's density measure is asserted alongside the 5.6 pair.
+    "crates/myelin-chat/tests/cdc_5_6_5_4_chat_project.rs",
 ]
 
 [[contract]]
@@ -1160,6 +1166,18 @@ cdc = [
     "crates/myelin-knowledge/tests/cdc_5_4_5_5_5_6_5_7_knowledge_refs_glue.rs",
     "crates/myelin-ci-controlplane/tests/cdc_5_1_5_6_5_7_ci_surfacing.rs",
     "crates/myelin-issues/tests/cdc_5_4_5_5_5_6_5_7_5_3_6_3_issues_refs_glue.rs",
+    # CHAT-P15 / P-409 (M4-C4) adds the CHAT-OWNED `project(ref, viewer)` half
+    # (`myelin_chat::project::Projector::project`) — the ONLY way Refs/Search/Notif read a chat artifact
+    # (no cross-DB) for chat/{channel,message,thread}, per-viewer permission-checked on the channel the
+    # artifact lives in (a message/thread is never more visible than its channel): a non-member viewer
+    # gets a content-free `Denied` tombstone carrying the ROOT, never the title/body (the project-leak
+    # counter = 0). The frozen `{title,state,icon,render_hint,sub_anchor?}` shape with the per-type
+    # render hint (ChannelChip/MessageChip/ThreadChip); the title humanised via the ONE templating
+    # surface (7.3, the `chat.project.*` keys). The provider+consumer pair (a downstream card renderer
+    # reading ONLY the projection fields — the no-body invariant is structural) proves the shape + the
+    # tombstone-on-deny + the erasure-safe degradation. Mandatory-core (a project leak IS the failure),
+    # mutation floor: the never-the-body property (the gate decision + the projection build).
+    "crates/myelin-chat/tests/cdc_5_6_5_4_chat_project.rs",
 ]
 
 [[contract]]

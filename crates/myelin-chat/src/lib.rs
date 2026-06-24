@@ -79,6 +79,18 @@
 //!     degrades to a root tombstone, never dangles) — CHAT-D18. The cache-TTL backstop is a
 //!     measured-not-predicted tunable (R-C4), never a separate milestone.
 //!
+//! - [`project`] — **CHAT-P15 / P-409**: the producer half of `project(ref, viewer)` (contract 5.6) for
+//!   chat/{channel,message,thread} — the ONLY way another subsystem reads about a chat artifact (no
+//!   cross-DB). The Refs `resolve` chokepoint (the seam [`unfurl::RefsResolvePort`] CONSUMES) calls back
+//!   into THIS `project()` for a per-viewer, pre-permission-checked `Projection | Tombstone` — NEVER the
+//!   body (the frozen `{title, state, icon, render_hint, sub_anchor?}` shape; the title humanised via
+//!   `humanise`, 7.3; per-type `render_hint` = ChannelChip/MessageChip/ThreadChip). Permission FIRST
+//!   (a non-member viewer gets a `Denied` tombstone, 0 title leak), then erased/restricted, then the
+//!   live-store root resolve. Resolution is ALWAYS cell-local (OQ-I — `project()` never reaches across
+//!   cells; the cross-org follow-on CHAT-P30/12.6 consumes the bridge, not `project()`). Also asserts
+//!   **chat the densest `refs.edge.created` producer** ([`project::densest_edge_producer`]) over the
+//!   ALREADY-built edge machinery ([`content`] structured nodes + [`membership`] `chat.channel.linked`).
+//!
 //! **Owning architecture doc:**
 //! `planning/04-subsystem-architectures/chat/architecture/03-events-contracts-and-glue.md` §1 (the
 //! COMPLETE `chat.*` taxonomy under the Bus §6 grammar), §1.1 (the **durable** set via the OUTBOX —
@@ -132,6 +144,7 @@ pub mod events;
 pub mod glue;
 pub mod holder;
 pub mod membership;
+pub mod project;
 pub mod rebac_fragment;
 pub mod replay;
 pub mod schema;
@@ -158,6 +171,11 @@ pub use holder::{
     CHAT_OLTP_STORE, CHAT_RESIDUAL_POSTURE_REF,
 };
 pub use membership::{MembershipError, MembershipGate, MembershipService, MembershipTupleWriter};
+pub use project::{
+    densest_edge_producer, ChannelMeta, ChatProjectionSource, MessageMeta, ProjectError, Projected,
+    Projection as ChatProjection, Projector, RenderHint, ThreadMeta, Tombstone as ProjectTombstone,
+    TombstoneReason as ProjectTombstoneReason,
+};
 pub use replay::{ChatReindexSource, ChatReplayKind};
 pub use store::{
     AuthorKind, ColdSegments, ConversationId, MemHotTier, Message, MessageId, MessageState,
