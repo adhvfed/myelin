@@ -236,4 +236,99 @@ mod tests {
     fn owner_token_is_chat() {
         assert_eq!(source().owner_token(), "chat");
     }
+
+    // ── CHAT-P6 (P-400): the replay-SKELETON snapshot emission THROUGH THE OUTBOX ─────────────────
+    //
+    // The CHAT-P6 GATE: the replay skeleton re-emits `chat.*.snapshot` through the OUTBOX (the SAME
+    // outbox→bus→live-consumer path durable writes take, contract 2.6 / Bus §4.9), for a sub-artifact
+    // scope — 0 snapshots emitted OFF the outbox. The Bus's `reindex(...)` driver dispatches the scope
+    // to chat's `ChatReindexSource::replay` and emits each draft through the outbox at its
+    // DETERMINISTIC `snapshot_event_id` (cold == live, idempotent re-run). This is the SKELETON; the
+    // full Search/Refs/Notif replay PARITY is CHAT-P21 (the named floor).
+
+    use myelin_events::{
+        reindex, Actor, EmitContextBase, OutboxStore, Region as EvRegion, TenantId as EvTenantId,
+        Timestamp,
+    };
+    use myelin_identity::{Principal, PrincipalId, PrincipalKind};
+
+    fn ctx_base() -> EmitContextBase {
+        EmitContextBase {
+            tenant: EvTenantId("acme".into()),
+            region: EvRegion("fr-par".into()),
+            actor: Actor(Principal::stub(
+                PrincipalId("platform".into()),
+                PrincipalKind::Service,
+                EvTenantId("acme".into()),
+            )),
+            schema_ver: 1,
+            occurred_at: Timestamp("2026-06-21T00:00:00Z".into()),
+            recorded_at: Timestamp("2026-06-21T00:00:00Z".into()),
+            caused_by: None,
+        }
+    }
+
+    /// **The replay skeleton emits `chat.message.snapshot` THROUGH THE OUTBOX for a replayed scope
+    /// (the CHAT-P6 GATE; contract 2.6).** Drive the Bus `reindex` over a `message:m1` scope: chat's
+    /// source replays the snapshot draft and the driver emits it into the outbox — the snapshot row is
+    /// present at its deterministic id (0 snapshots emitted off the outbox), and a re-run emits 0 new
+    /// (cold == live, idempotent).
+    #[test]
+    fn replay_skeleton_emits_chat_snapshot_through_the_outbox() {
+        let src = source();
+        let sources: &[&dyn ReindexSource] = &[&src];
+        let scope = SnapshotScope::new("chat", "message:m1");
+        let mut outbox = OutboxStore::new();
+
+        // The drafts the skeleton would emit (to read their deterministic ids back off the outbox).
+        let drafts = src.replay(&scope, None);
+        assert_eq!(
+            drafts.len(),
+            1,
+            "the message:m1 scope replays exactly one message snapshot"
+        );
+        assert_eq!(drafts[0].type_.0, "chat.message.snapshot");
+
+        // Drive the reindex THROUGH the outbox — the snapshot must land on the outbox, never off it.
+        let receipt = reindex(&scope, None, sources, &mut outbox, ctx_base())
+            .expect("reindex through outbox");
+        assert_eq!(
+            receipt.snapshots_emitted, 1,
+            "one chat.message.snapshot emitted through the outbox"
+        );
+        // 0 snapshots emitted off the outbox: the row is present at its deterministic id.
+        let row = outbox
+            .row(&drafts[0].event_id())
+            .expect("the chat.message.snapshot row is on the outbox (never off it)");
+        assert_eq!(row.envelope.type_.0, "chat.message.snapshot");
+
+        // A re-run is idempotent (cold == live, BUS-D5): 0 new snapshots emitted (the deterministic id
+        // is already on the outbox → ON CONFLICT DO NOTHING).
+        let again = reindex(&scope, None, sources, &mut outbox, ctx_base()).expect("re-reindex");
+        assert_eq!(
+            again.snapshots_emitted, 0,
+            "a re-run emits 0 new (idempotent skeleton)"
+        );
+        assert_eq!(
+            again.snapshots_skipped_duplicate, 1,
+            "the snapshot is skipped as a duplicate"
+        );
+    }
+
+    /// **An unknown-owner reindex is a LOUD error, never a silent empty emit (the skeleton fails
+    /// loud).** Driving `reindex` for a scope chat does not own yields `NoSourceForOwner` — 0 snapshots
+    /// emitted off ANY path.
+    #[test]
+    fn reindex_for_a_non_chat_owner_is_loud_not_a_silent_empty_emit() {
+        let src = source();
+        let sources: &[&dyn ReindexSource] = &[&src];
+        let scope = SnapshotScope::new("git", "commit:all");
+        let mut outbox = OutboxStore::new();
+        let err = reindex(&scope, None, sources, &mut outbox, ctx_base())
+            .expect_err("chat does not own the git scope — a loud error, not a silent empty emit");
+        assert!(matches!(
+            err,
+            myelin_events::ReindexError::NoSourceForOwner(_)
+        ));
+    }
 }

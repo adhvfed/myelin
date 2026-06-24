@@ -67,6 +67,19 @@ myelin-storage = { path = "../myelin-storage" }
 # 12.1/12.4) the residency-pinned message partition keys on. Re-exported via myelin-events too, but
 # named directly here for the store's `ConversationId` construction.
 myelin-tenancy = { path = "../myelin-tenancy" }
+# CHAT-P6 (P-400, M4-C1): the FROZEN GDPR contract surface — the `PersonalDataHolder` trait + the
+# DSR types (`SubjectRef`/`EraseScope`/`Receipt`/`*Receipt`) + the `#[derive(PersonalData)]`
+# classify-derive + the `ErasureMethod::CryptoShred(subject_dek)` tag (contracts 10.1 / 10.2 / 11.4).
+# Chat is the MOST PII-dense holder (the message body IS the PII, arch 05 §5): it tags its body /
+# draft schema with `#[personal_data(... erasure = CryptoShred(subject_dek))]` and registers an H5
+# `PersonalDataHolder` over its stores. A consumer LEAF depending on the gdpr GLUE crate keeps the
+# §2.9 DAG acyclic (nothing depends back on myelin-chat — the same sanctioned edge myelin-issues uses).
+myelin-gdpr = { path = "../myelin-gdpr" }
+# CHAT-P6 (P-400): the harness auto-registration ONE door (`HolderRegistry`/`StoreClassifier`/`Holder`,
+# contract 1.4) chat opens its stores through so the H5 Chat holder is registered by construction
+# ("the DSR fan-out forgot Chat" is structurally impossible). A LEAF→substrate-glue edge (myelin-issues
+# takes the identical edge); the §2.9 crate-graph models the library DAG, not this terminal consumer.
+myelin-substrate = { path = "../myelin-substrate" }
 # CHAT-P4 (P-398): the REAL Postgres hot-tier client (`store::pg::PgMessageStore`) + the async
 # runtime the integration test drives. OPTIONAL — pulled ONLY by the `integration` feature, so the
 # default `cargo build --workspace` compiles neither (the DB-free build floor, the binding policy).

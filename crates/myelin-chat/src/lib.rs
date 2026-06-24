@@ -17,7 +17,24 @@
 //!   CHAT-P8 floor.
 //! - [`subs`] — **CHAT-P2 / P-244**: chat's `#sub` mints registered with Refs (contract 5.7) — the
 //!   frozen `message-`/`thread-` grammar + the grammatical mint codecs. The runtime mint SITE
-//!   (co-committed with the outbox event) is the CHAT-P6 floor.
+//!   (co-committed with the outbox event) is wired in [`store`] at CHAT-P5 (the `message-<id>` subject
+//!   on every `chat.message.*` event); the mint codecs are exercised live there.
+//!
+//! - [`dek`] — **CHAT-P6 / P-400**: the per-subject-DEK encryption of the message bodies + drafts
+//!   (contract 11.4 / GD-4). The `body_inline` / `body_nodes` / composer `draft` are sealed under the
+//!   AUTHOR's per-subject DEK through the ONE shared `myelin_storage::encryption::ColumnCryptor` — the
+//!   body IS the PII (arch 05 §5), and the per-subject DEK never bakes erasable plaintext into the
+//!   immutable log (external-insights/04 §1). The crypto-shred erase BODY is the CHAT-P22 floor.
+//! - [`schema`] — **CHAT-P6 / P-400**: the Chat OLTP row tag-carriers (`#[derive(PersonalData)]` +
+//!   `#[personal_data(...)]`, contract 10.2) so the `no-untagged-personal-data` lint is green (0
+//!   untagged PII fields) — the body fields are `Content`/`CryptoShred(subject_dek)`, the author is a
+//!   pseudonymous `Identifier`/`Pseudonymise`.
+//! - [`holder`] — **CHAT-P6 / P-400**: the Chat `PersonalDataHolder` (H5; contract 10.1 / 1.4),
+//!   auto-registered over the Chat store through the harness ONE door; `locate`/`export` typed,
+//!   `restrict` wired, `erase` stubbed to crypto-shred naming its CHAT-P22 fan-out.
+//! - [`replay`] — **EB-27 / P-327** (skeleton confirmed at CHAT-P6): chat's `replay(scope, since)`
+//!   re-emits `chat.{channel,message,thread}.snapshot` through the OUTBOX (contract 2.6); full
+//!   Search/Refs/Notif replay PARITY is the CHAT-P21 floor.
 //!
 //! - [`glue`] — **CHAT-P3 / P-245**: the M2-C0 humanise/notif/fanout-class + firehose-scope + TE-21
 //!   slice (contracts 7.3 / 7.6 / 3.5 / 1.7). Chat REGISTERS its humanise template keys (card /
@@ -75,13 +92,21 @@
 
 #![forbid(unsafe_code)]
 
+pub mod dek;
 pub mod events;
 pub mod glue;
+pub mod holder;
 pub mod rebac_fragment;
 pub mod replay;
+pub mod schema;
 pub mod store;
 pub mod subs;
 
+pub use dek::{decrypt_body, encrypt_body, plaintext_at_rest, subject_dek_erasure, ChatFreeText};
+pub use holder::{
+    chat_store_classifier, register_chat_holders, ChatHolder, ChatStoreClass, RestrictionFlag,
+    CHAT_OLTP_STORE, CHAT_RESIDUAL_POSTURE_REF,
+};
 pub use replay::{ChatReindexSource, ChatReplayKind};
 pub use store::{
     AuthorKind, ColdSegments, ConversationId, MemHotTier, Message, MessageId, MessageState,
