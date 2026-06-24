@@ -130,6 +130,7 @@ pub mod layout;
 pub mod pipeline;
 pub mod reindex;
 pub mod residency;
+pub mod restore_verify;
 pub mod shell;
 pub mod subartifact;
 pub mod telemetry;
@@ -212,6 +213,10 @@ pub use reindex::{
     DEFAULT_BATCH_CAP, DEFAULT_MAX_IN_FLIGHT_PER_TENANT,
 };
 pub use residency::{search_store_descriptors, SearchStoreDescriptor};
+pub use restore_verify::{
+    ErasedSubjectEntry, SearchErasureLedger, SearchRestoreArtifact, SearchRestoreFailure,
+    SearchRestoreInputs, SearchRestoreVerdict, SearchRestoreVerifyGate,
+};
 pub use shell::{
     boot_search, run_search, search_app_spec, SEARCH_INDEX_DIR_MIGRATION, SERVICE_NAME,
 };

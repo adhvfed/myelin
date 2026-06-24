@@ -1675,6 +1675,13 @@ cdc = [
     "crates/myelin-chat/tests/cdc_2_6_6_4_chat_reindex_parity.rs",
     "crates/myelin-chat/tests/drill_chat_d15_reindex_parity.rs",
 ]
+# SRCH-P28 / P-421 (M5) HARDENS 6.4 reindex POST-RESTORE via the SRCH-D9 restore-verify permanent gate
+# (not a new CDC pair — the seam is the SAME SearchReindexer::reindex provider+consumer above): the gate
+# restores Search's derived store to a consistent point via reindex-from-source, then RE-ERASES from the
+# PII-free erasure ledger (10.8) through the live erase, proving 0 resurrected erased docs + 0
+# row↔doc↔vector mismatch + 0 orphan embedding (drill crates/myelin-search/tests/drill_srch_d9_restore_reerase.rs).
+# The full-scale variant (E2E-3/E2E-4) remains SRCH-P32 (P-465); HYOK+backup-scale erasure SRCH-P29
+# (P-422); object-store backstop SRCH-P30 (P-463).
 
 [[contract]]
 row = "6.5"

@@ -396,6 +396,25 @@ impl SearchReindexer {
         &self.cursors
     }
 
+    /// The live doc count in the `(tenant, region)` index the reindexer rebuilds (the restore-verify
+    /// gate's row↔doc↔vector parity leg reads this — SRCH-P28). Delegates to the SAME live indexer the
+    /// reindex re-drives; there is no second index.
+    pub fn indexer_live_count(&self, tenant: &TenantId, region: &Region) -> u64 {
+        self.indexer.live_count(tenant, region)
+    }
+
+    /// The live (non-tombstoned) vector count in the `(tenant, region)` index (the restore-verify gate's
+    /// doc↔vector parity leg reads this — SRCH-P28).
+    pub fn indexer_live_vector_count(&self, tenant: &TenantId, region: &Region) -> usize {
+        self.indexer.live_vector_count(tenant, region)
+    }
+
+    /// Whether the `(tenant, region)` index holds any orphan (tombstoned-until-compact) embedding (the
+    /// restore-verify gate's 0-orphan leg reads this — SRCH-P28 / §3.3).
+    pub fn indexer_has_orphan_embedding(&self, tenant: &TenantId, region: &Region) -> bool {
+        self.indexer.has_orphan_embedding(tenant, region)
+    }
+
     /// **`reindex(scope, since) → job` (contract 6.4; §4.9) — the ONLY rebuild path (SEARCH-1).** Drives
     /// the bus re-emit ([`myelin_events::reindex`], 2.6 CONSUMED) → `*.snapshot` rows through the outbox
     /// → the live indexer's `index()` step, idempotent on the deterministic snapshot `event_id`. There is
