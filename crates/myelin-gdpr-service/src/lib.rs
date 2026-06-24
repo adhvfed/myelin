@@ -575,6 +575,39 @@
 //! default), and [`worklog::RollupEnablement::enable`]'s trigger emission; the `cargo mutants` score
 //! is in the commit body.
 
+//! ## P-GA-34 (→ P-450) — E2E-4: the DSAR fan-out flagship (the whole-system GDPR-by-construction proof)
+//! The **master M5 → M6 GDPR exit flagship** — the whole-system *chained* DSAR (EI-01 §4: E2E-4 is the
+//! whole-system chained DSAR, NOT a single-handler test). There is **NO new core module** — the
+//! flagship CONSUMES the M5 floors and proves they COMPOSE end-to-end (the thing each leg's own drill
+//! could not prove alone). The drill `tests/e2e_4_dsar_fanout_flagship.rs` (the dated green artifact,
+//! 2026-06-24) chains, in ONE `dsr_submit`: the **H1–H18 completeness leg** ([`full_fanout`], GA-D1,
+//! 0 holders missed, `erasure_fanout_coverage == 1.0`); the **multi-cell merge leg** ([`multi_cell`],
+//! GA-D8, 0 cells missed over `member_cells ∪ home_cell`, cell-local PII-free resolution over the
+//! [`myelin_tenancy::CrossCellPointer`] bridge); the **reliable-erase leg** ([`structural_floor`]
+//! crypto-shred → [`structural_floor::StoredContent::Unrecoverable`] live AND in backups, §7.5;
+//! [`derivative_erasure::SearchIndexModel`] embeddings purged-not-hidden → `reidentify_hits == 0`,
+//! GA-D2 — incl. the **mock-agent H11 agent-memory + H17 trace** embeddings, EI-02 §2); the
+//! **post-restore re-erasure leg** ([`erasure_ledger::ErasureLedger::post_pit_records_after`], GD-14 /
+//! 10.8 — a restore of an OLDER backup resurrects nothing); the **residual leg** — the residual is
+//! EXACTLY the ONE documented platform posture ([`posture::CANONICAL_POSTURE`], X-7, never re-described)
+//! — nothing more; and the **certificate-seal leg** ([`audit_proofs::AuditAuthority::seal_dsr_certificate`],
+//! P-GA-20) — the merged content-address seals a [`dsr::MerkleProvenBundle`] into the per-tenant audit
+//! Merkle tree (the inclusion proof is the green artifact). The gate is **load-bearing** (three RED
+//! faces: a dropped holder ⇒ the GA-D1 certificate refuses to seal; a dropped cell ⇒ the GA-D8
+//! certificate refuses to seal; a HIDDEN embedding ⇒ `reidentify_hits == 1`). **Measured (2026-06-24):**
+//! `holders_missed=0 cells_missed=0 cells_total=5 recoverable_pii=0 vectors_recoverable=0
+//! backups_recoverable=0 post_restore_reerased=1 residual=THE_ONE_POSTURE certificate=SEALED`.
+//! **Floors named:** none new — the flagship consumes the M5 floors; the **history-rewrite audited op**
+//! (GA-10) → **P-GA-35**; the **outbound push-mirror residency gate** (GA-11) → **P-GA-36** (the
+//! remaining M5 GDPR gates, neither part of the DSAR fan-out flagship); the cross-cell
+//! ordering/atomicity remains the **control-plane floor** (Tenancy §4.3). **No new mutation floor** (no
+//! new core module — the flagship exercises the P-GA-32/P-GA-33 floors, named; their `cargo mutants`
+//! scores stand). **No `--features integration` leg owed:** the flagship proves the whole-system
+//! completeness + reliability PROPERTIES over the generated map + the PII-free carrier — load- and
+//! transport-independent — touching NO new DB/object-store/cache/bus contract (the per-store live
+//! integration proofs are owned store-side: Storage STOR-D3/STOR-D4 at cell scale). The **world-scale
+//! 30× load** of the whole-cell SCHED drill is the one remaining real-fleet floor (VISION).
+
 pub mod agent_trace_seam;
 pub mod audit;
 pub mod audit_proofs;
