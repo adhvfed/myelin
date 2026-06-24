@@ -2489,6 +2489,16 @@ cdc = [
     # stores (0 backdoor erasure paths). PROVIDER: the cascade publishes the tombstones. CONSUMER: a
     # derivative-facing reader sees exactly those events on the bus (the only cross-subsystem effect).
     "crates/myelin-chat/tests/cdc_10_1_11_4_10_4_chat_erase_cascade.rs",
+    # P-CP-20 / P-430 (CP-M5) — the CROSS-CELL DSR FAN-OUT leg of 10.4: the DSR orchestrator iterates
+    # `member_cells ∪ home_cell` over the P-CP-19 bridge transport (tenancy §6.2), merging a COMPLETE
+    # per-cell receipt set (0 cells missed, GA-D8). PROVIDER: the control plane's `CrossCellDsrFanOut`
+    # drives the erase across a tenant's member cells. CONSUMER: a stand-in GDPR DSR orchestrator folds
+    # the merged set into the DSR + asserts the multi-cell completeness invariant (an incomplete fan-out
+    # BLOCKS verify — a missed cell is stop-the-bleeding). The control plane owns the cross-cell fan-out
+    # MECHANISM; GDPR owns the DSR state machine + the certificate (one fan-out rule, consumed across the
+    # seam, EI-01 §7). The GA-D8 drill (ga_d8_cross_cell_dsr_fanout_drill.rs) is the dated green artifact
+    # (0 cells missed + the cross-cell zookie-consistency leg, both proven RED+green).
+    "crates/myelin-control-plane/tests/cdc_10_4_cross_cell_dsr_fanout.rs",
 ]
 
 # 10.5 — the retention engine + consent + sub-processor + legal-hold + the transfer gate. The
@@ -3181,7 +3191,14 @@ status = "covered"
 # unauthorised viewer gets a tombstone. The bridge CDC (cdc_12_6_bridge_resolution_live.rs) pins the
 # ISS rollup / KN collab / CHAT cross-org consumers; the CP-D8 drill (cp_d8_cross_cell_bridge_drill.rs)
 # is the dated green artifact (0 PII across the bridge, unauthorised -> tombstone, gate proven RED+green).
-# FLOOR (P-CP-20): the multi-element member_cells fan-out + DSR + zookie consistency + rebalancing.
+#
+# P-CP-20/P-430: the FLOOR is now FILLED — the multi-element member_cells fan-out + cross-cell DSR +
+# cross-cell zookie consistency + multi-cell rebalancing go LIVE (src/multi_cell.rs). `placement_of`
+# returns a multi-element member_cells set; the DSR fan-out iterates `member_cells ∪ home_cell` over the
+# bridge (GA-D8, 0 cells missed); a zookie minted in the home cell read in a member cell is bounded to
+# the staleness budget (the hardest sub-problem); rebalancing moves a workload across member cells
+# same-region (the placement invariant rejects a cross-region move). The cross-cell fan-out CDC is
+# registered under 10.4; the GA-D8 drill is ga_d8_cross_cell_dsr_fanout_drill.rs.
 cdc = [
     "crates/myelin-events/tests/cdc_12_6_crosscell.rs",
     "crates/myelin-control-plane/tests/cdc_12_6_bridge_resolution_live.rs",

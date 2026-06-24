@@ -2266,6 +2266,7 @@ dependencies = [
  "blake3",
  "hex",
  "myelin-ci-sandbox",
+ "myelin-events",
  "myelin-gdpr",
  "myelin-gdpr-service",
  "myelin-harness",
