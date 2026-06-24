@@ -223,6 +223,32 @@ depth_ceiling = 16
 max_nodes = 10000
 
 # ---------------------------------------------------------------------------------------------
+# [refs_hot_artifact] — the Refs hot-artifact backlink-read budget that triggers the R4 reach-index
+# promotion (REF-P23 / P-454, M5; contract 5.3 at scale / 1.8 the hot_artifact_fanout telemetry;
+# reference-graph.md §6.3 — the hot-artifact backlink scale "viral PR / referenced-by-50,000" case).
+#
+# The BUILT floor (REF-P11) is the read-time CTE + list_objects filter + pagination + replica: you
+# never materialise 50,000 backlinks, you PAGE them. The FOLLOW-ON (this prompt) is the Leopard-style
+# flattened reach index R4 — derived/rebuildable from R1, incrementally maintained from refs.edge.*,
+# gated by the SAME list_objects filter — promoted ONLY when MEASURED hot-fanout exceeds the read
+# budget (R5), NOT predicted (architecture §6.3; EI-04 §7; ADR-10 measure-before-shard).
+#
+# `read_budget_fanout` is R5: the inbound-fanout (the count of LIVE inbound edges to a target_root)
+# above which the read-time CTE scan is MEASURED to fall over its p99 budget, so R4 is promoted to
+# serve that target. STRICTLY greater-than (a target AT the budget still serves from the CTE floor —
+# the frozen >budget wording, mirroring the §6.3 "exceeding the read budget"). This is a
+# MEASURED-not-predicted criterion (the hot_artifact_fanout telemetry measures the real fanout; R4 is
+# promoted only when a real target crosses it), never a value tuned toward. The number is a v1
+# default-to-beat seeded at the synthetic REF-D3 corpus scale (the "referenced-by-50,000" case, drill
+# ~348); the WORLD-SCALE fleet-hardware re-measure of the real crossover is the named M5 floor. A
+# regression that needs a HIGHER budget than measured is a dated [[claimed_not_proven]] row, never a
+# silently-raised bar (EI-01 §3). Mirrors `myelin_refs_service::reach_index::R4_READ_BUDGET_FANOUT`
+# (the seed constant); this file is its source of truth.
+# ---------------------------------------------------------------------------------------------
+[refs_hot_artifact]
+read_budget_fanout = 1000     # R5: inbound fanout above which the CTE read falls over budget → R4 promotes (>budget).
+
+# ---------------------------------------------------------------------------------------------
 # [flex_db] — the Knowledge flexible-database read budgets + the FROZEN >5% facet-promotion
 # threshold (KN-P17 / P-307; KN-D9; contract 6.3 / OQ-C, knowledge-platform architecture 01 §1.2 /
 # 02 §4.1). The flexible DB is JSONB property-bag rows (source of truth) + a GIN `jsonb_path_ops`

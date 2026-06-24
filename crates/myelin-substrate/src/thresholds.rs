@@ -131,6 +131,14 @@ pub struct Thresholds {
     /// to the §4.1 / 6.3 seeds).
     #[serde(default)]
     pub flex_db: FlexDb,
+    /// The Refs hot-artifact backlink-read budget that triggers the R4 reach-index promotion (REF-P23
+    /// / P-454; contract 5.3 at scale / 1.8 `hot_artifact_fanout`; reference-graph.md §6.3). The
+    /// inbound-fanout (the count of live inbound edges to a `target_root`) above which the read-time
+    /// CTE scan is MEASURED to fall over its p99 budget, so the Leopard-style flattened reach index R4
+    /// is promoted to serve that hot target (R5 — measured-trigger, never predicted). `#[serde(default)]`
+    /// so an older thresholds file (pre-P-454) still parses against the §6.3 seed.
+    #[serde(default)]
+    pub refs_hot_artifact: RefsHotArtifact,
     /// The MEASURED cell sizing-band numbers (P-CP-22 / P-431; tenancy §7.1 / ADR-10). The per-cell-
     /// class `tenants_max` + which capacity dimension BINDS FIRST, set from the load-test + the
     /// `cell_utilisation` telemetry — replacing the conservative §5.1 defaults. The avoid-migration-
@@ -491,6 +499,42 @@ impl Default for RefsTraverse {
         RefsTraverse {
             depth_ceiling: 16,
             max_nodes: 10_000,
+        }
+    }
+}
+
+/// The Refs hot-artifact backlink-read budget that triggers the R4 reach-index promotion (REF-P23 /
+/// P-454; contract 5.3 at scale / 1.8 `hot_artifact_fanout`; architecture §6.3).
+///
+/// The §6.3 hot-artifact backlink scale (the "viral PR / referenced-by-50,000" case): the BUILT floor
+/// (REF-P11) is the read-time CTE + `list_objects` filter + pagination + replica — you never
+/// materialise 50,000 backlinks, you PAGE them. The FOLLOW-ON (REF-P23) is the Leopard-style flattened
+/// reach index R4, **promoted ONLY when MEASURED hot-fanout exceeds the read budget (R5), not
+/// predicted** (ADR-10 measure-before-shard). `read_budget_fanout` is R5: the inbound-fanout above
+/// which the CTE scan is measured to fall over its p99 budget, so R4 is promoted to serve that hot
+/// target. The trigger is STRICTLY greater-than (a target AT the budget still serves from the CTE
+/// floor — the §6.3 "exceeding the read budget" wording). `#[serde(default)]` + [`Default`] so an
+/// older thresholds file (pre-P-454) parses against the §6.3 seed. Mirrors
+/// `myelin_refs_service::reach_index::R4_READ_BUDGET_FANOUT` (the seed constant); this file is its
+/// source of truth.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefsHotArtifact {
+    /// R5 — the inbound-fanout (the count of live inbound edges to a `target_root`) above which the
+    /// read-time CTE scan is MEASURED to fall over its p99 budget, so the R4 reach index is promoted
+    /// to serve that hot target. STRICTLY greater-than (a target AT the budget still serves from the
+    /// CTE floor). MEASURED-not-predicted (the `hot_artifact_fanout` telemetry measures the real
+    /// fanout; promotion is acted on only when a real target crosses this).
+    pub read_budget_fanout: u64,
+}
+
+impl Default for RefsHotArtifact {
+    /// The §6.3 seed default-to-beat: a read-budget fanout of 1000 — a target with more than 1000 live
+    /// inbound edges is a hot artifact the read-time CTE scan is measured to fall over its p99 budget
+    /// for, so R4 is promoted to serve it. The world-scale fleet-hardware re-measure of the real
+    /// crossover is the named M5 floor (REF-P23). An older thresholds file (pre-P-454) falls back here.
+    fn default() -> Self {
+        RefsHotArtifact {
+            read_budget_fanout: 1000,
         }
     }
 }
@@ -1277,6 +1321,60 @@ mod tests {
         );
         assert_eq!(t.online_migration.lock_wait_p99_max_ms, 500);
         assert_eq!(t.online_migration.downtime_max_ms, 0);
+    }
+
+    // ───────────────────── REF-P23 / P-454: the Refs hot-artifact R4 read budget ─────────────────────
+
+    /// **REF-P23 (P-454): the Refs hot-artifact read budget (R5) is read through the typed
+    /// [`Thresholds`] loader, not by re-parsing the TOML.** The canonical file carries the
+    /// `[refs_hot_artifact]` section; this types it so the R4 reach-index promotion gate reads it via
+    /// the SAME loader every other Refs drill uses (the single source of truth, EI-01 §3 — never a
+    /// hardcoded number). The §6.3 seed default-to-beat is 1000.
+    #[test]
+    fn refs_hot_artifact_budget_reads_through_the_typed_loader() {
+        let t = Thresholds::load_canonical().expect("load");
+        assert_eq!(
+            t.refs_hot_artifact.read_budget_fanout, 1000,
+            "the §6.3 R5 read-budget fanout seed (R4 promotes above this)"
+        );
+        assert!(
+            t.refs_hot_artifact.read_budget_fanout > 0,
+            "the read budget must be a positive fanout (a 0 budget would promote R4 vacuously)"
+        );
+    }
+
+    /// An older thresholds file WITHOUT the `[refs_hot_artifact]` section still parses (the field is
+    /// `#[serde(default)]`) and falls back to the §6.3 seed — so a pre-P-454 file is not a parse error.
+    #[test]
+    fn an_older_file_without_refs_hot_artifact_falls_back_to_the_seed() {
+        let pre_p454 = r#"
+            version = 1
+            as_of = "2026-06-19"
+            [revocation]
+            sla_mins = 5
+            [surge]
+            multiplier = 30
+            [fail_static]
+            status = "OPEN — LEGAL"
+            owner = "DPO / Legal"
+            static_max_default_secs = 300
+            agent_token_ttl_secs = 60
+            constraint = "x"
+            [rpo_rto]
+            rpo_max_mins = 5
+            rto_tenant_max_mins = 60
+            rto_cell_max_mins = 240
+            [depth_ceilings]
+            soft = 12
+            hard = 16
+        "#;
+        let t = Thresholds::from_toml(pre_p454).expect("a pre-P-454 file parses");
+        assert_eq!(
+            t.refs_hot_artifact,
+            RefsHotArtifact::default(),
+            "an absent [refs_hot_artifact] falls back to the §6.3 seed"
+        );
+        assert_eq!(t.refs_hot_artifact.read_budget_fanout, 1000);
     }
 
     // ───────────────────── P-S36 / P-437: resilient-client per-target tuning ─────────────────────

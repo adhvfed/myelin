@@ -299,6 +299,32 @@
 //! `check-`/`step-` PRODUCER half is **R-M4 (REF-P19)** (Refs resolves the sub-anchor here, awaiting
 //! CI's emitter). No Refs threshold weakened; no engine type re-defined; no second ladder minted.
 //!
+//! **REF-P23 (P-454) ships:** the [`reach_index`] module — the **hot-artifact Leopard-style flattened
+//! reach index R4** (contract 5.3 at scale / the R4 path; consumed 4.3 R4 gated by the same filter;
+//! 1.8 `hot_artifact_fanout`; §6.3). [`reach_index::R4ReachIndex`] is the FOLLOW-ON whose floor REF-P11
+//! NAMED: the read-time CTE + filter + pagination ([`backlinks`]) is the BUILT floor; R4 is the
+//! Leopard-style flattened reach index — **derived/rebuildable from R1**
+//! ([`reach_index::R4ReachIndex::rebuild_from_r1`] over [`edge_builder::EdgeProjection`]),
+//! **incrementally maintained from `refs.edge.*`** ([`reach_index::R4ReachIndex::on_edge_upsert`]/
+//! [`reach_index::R4ReachIndex::on_edge_tombstone`], in lock-step with R1), **gated by the SAME
+//! `list_objects` filter** (it reuses the FROZEN [`backlinks::set_expr_admits`] over the shared
+//! [`backlinks::AuthzVisibleIndex`] — ONE permission algebra, so the REF-P11 leak invariant cannot
+//! regress on the R4 path), and **promoted ONLY on a MEASURED trigger** — R4 serves a target iff its
+//! MEASURED inbound fanout EXCEEDS the read budget R5 ([`reach_index::R4_READ_BUDGET_FANOUT`], read from
+//! the thresholds file `[refs_hot_artifact]`), STRICTLY greater-than, never predicted (§6.3 / ADR-10).
+//! The `refs.hot_artifact_fanout` telemetry ([`reach_index::R4ReachIndex::HOT_ARTIFACT_FANOUT_SIGNAL`],
+//! 1.8) is LIVE. **REF-D3** (the "referenced-by-50,000" hot artifact under concurrent permission-filtered
+//! reads → paginated p99 within budget, the hot-fanout telemetry fires, R4 serves post-promotion) +
+//! **R4↔CTE parity** (once promoted R4 returns the IDENTICAL leak-free paginated result set as the CTE
+//! floor — 0 SECRET referrer leaks through the flattened path) are greened in unit + drill tests
+//! (`tests/ref_d3_hot_artifact_drill.rs`). The R4 follow-on is LINKED to its REF-P11 floor (the floor was
+//! NAMED in `backlinks.rs`; this module RESOLVES it). **FLOORS named:** the WORLD-SCALE fleet-hardware
+//! re-measure of the real R5 crossover (where the CTE p99 falls over its budget) is the master M5 30×
+//! load floor; the flattened reach set is MODELLED in-memory ([`reach_index::R4ReachIndex`]) — the REAL
+//! per-tenant-DEK-encrypted materialised reach table on the read replica replaces it when the OLTP store
+//! is wired into `serve` (the seam shape — derive-from-R1, the same-filter conjoin, the measured-promotion
+//! gate — does not change). No threshold weakened; no second permission algebra minted.
+//!
 //! **Does NOT ship (floors named):**
 //! - **The GIT producer HAS LANDED (REF-P17 / P-258).** REF-P8 exercised the seam with a TEST content
 //!   writer; the first REAL producer — Git (PR/commit bodies, content-anchored line-range +
@@ -352,6 +378,7 @@ pub mod ladder;
 pub mod loop_guard;
 pub mod migration;
 pub mod mirror;
+pub mod reach_index;
 pub mod reindex;
 pub mod residency;
 pub mod resolve;
@@ -415,6 +442,7 @@ pub use mirror::{
     mirror_edges, project_typed_event, reconverge, Inverse, LifecycleRel, MirrorError,
     SyntheticTypedEvent,
 };
+pub use reach_index::{R4ReachIndex, R4Verdict, R4_READ_BUDGET_FANOUT};
 pub use reindex::{
     RefsReindexSource, RefsReindexer, ReindexError, ReindexReceipt, SourceEdge,
     REFS_EDGE_SNAPSHOT_TYPE, REFS_OWNER_TOKEN,
