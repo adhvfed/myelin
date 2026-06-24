@@ -17,7 +17,8 @@
 
 use myelin_chat::glue::{
     chat_humanise_templates, register_chat_humanise_templates, TPL_CHAT_AGENT_MESSAGE,
-    TPL_CHAT_CARD, TPL_CHAT_CARD_FACETS, TPL_CHAT_MENTIONED,
+    TPL_CHAT_CARD, TPL_CHAT_CARD_FACETS, TPL_CHAT_MENTIONED, TPL_CHAT_PROJECT_CHANNEL,
+    TPL_CHAT_PROJECT_MESSAGE, TPL_CHAT_PROJECT_THREAD,
 };
 use myelin_notif::{
     render_message, HumaniseTemplate, TemplateStore, DEFAULT_LOCALE, PLATFORM_DEFAULT_TENANT,
@@ -50,8 +51,8 @@ fn cdc_7_3_chat_provider_registers_keys_consumer_admits_and_serves() {
     let rows = provider_chat_humanise_rows();
     assert_eq!(
         rows.len(),
-        4,
-        "chat registers exactly the four humanise surfaces (card subject + card facets + agent-message + mentioned)"
+        7,
+        "chat registers exactly the seven humanise surfaces (card subject + card facets + agent-message + mentioned + the three project(ref,viewer) title surfaces)"
     );
 
     let store = consumer_admits_and_serves(&rows);
@@ -60,6 +61,9 @@ fn cdc_7_3_chat_provider_registers_keys_consumer_admits_and_serves() {
         TPL_CHAT_CARD_FACETS,
         TPL_CHAT_AGENT_MESSAGE,
         TPL_CHAT_MENTIONED,
+        TPL_CHAT_PROJECT_CHANNEL,
+        TPL_CHAT_PROJECT_MESSAGE,
+        TPL_CHAT_PROJECT_THREAD,
     ] {
         let served = store
             .lookup(PLATFORM_DEFAULT_TENANT, key, DEFAULT_LOCALE)

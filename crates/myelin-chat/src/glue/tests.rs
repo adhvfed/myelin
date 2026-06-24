@@ -17,13 +17,14 @@ fn subject() -> ArtifactRef {
 // §1 — the humanise template keys (contract 7.3) — the ONE templating surface (OQ-L)
 // ---------------------------------------------------------------------------------------------
 
-/// **Chat registers exactly its three humanise keys into the ONE templating surface (contract
-/// 7.3).** The card / agent-message / `chat.message.mentioned` strings — each a NULL-tenant `en`
-/// platform-default row, NO chat-private string map (OQ-L). A rename/drop here is a contract change.
+/// **Chat registers exactly its humanise keys into the ONE templating surface (contract 7.3).** The
+/// card / card-facets / agent-message / `chat.message.mentioned` strings + the three `project(ref,
+/// viewer)` title surfaces (channel/message/thread, CHAT-P15) — each a NULL-tenant `en` platform-default
+/// row, NO chat-private string map (OQ-L). A rename/drop here is a contract change.
 #[test]
 fn chat_humanise_keys_are_registered_into_the_one_templating_surface() {
     let rows = chat_humanise_templates();
-    assert_eq!(rows.len(), 4, "exactly the four chat humanise surfaces");
+    assert_eq!(rows.len(), 7, "exactly the seven chat humanise surfaces");
 
     let by_key: BTreeMap<&str, &HumaniseTemplate> =
         rows.iter().map(|r| (r.template_key.as_str(), r)).collect();
@@ -32,6 +33,9 @@ fn chat_humanise_keys_are_registered_into_the_one_templating_surface() {
         TPL_CHAT_CARD_FACETS,
         TPL_CHAT_AGENT_MESSAGE,
         TPL_CHAT_MENTIONED,
+        TPL_CHAT_PROJECT_CHANNEL,
+        TPL_CHAT_PROJECT_MESSAGE,
+        TPL_CHAT_PROJECT_THREAD,
     ] {
         let row = by_key
             .get(key)
@@ -43,7 +47,8 @@ fn chat_humanise_keys_are_registered_into_the_one_templating_surface() {
         );
         assert_eq!(row.locale, myelin_notif::DEFAULT_LOCALE);
         // the body binds a `{0}` slot (the subject ref for the per-viewer surfaces; the first facet
-        // for the facets surface) — resolved per-viewer (title|tombstone) or formatter-bound.
+        // for the facets surface; the title label for the project surfaces) — resolved per-viewer
+        // (title|tombstone) or formatter-bound.
         assert!(
             row.body.contains("{0}"),
             "`{key}` body must bind the {{0}} slot"
