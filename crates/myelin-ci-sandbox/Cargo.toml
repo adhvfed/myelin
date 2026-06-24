@@ -80,6 +80,12 @@ serde_json.workspace = true
 #     the parsed guest console, and emits the dated green escape attestation (the form AG-P17/P-229
 #     consumes). Gated to SKIP gracefully without /dev/kvm or `firecracker`. NEVER claims green over
 #     a red drill. Run: cargo test -p myelin-ci-sandbox --features integration --test escape_drill_test -- --nocapture.
+#   - tests/escape_drill_gvisor_test.rs (CI-P28 → P-423) RE-RUNS the SAME adversarial corpus inside
+#     a REAL runsc (gVisor) sandbox via a hardened OCI bundle (the second backend behind the same
+#     trait), asserts ZERO escapes from the parsed console, and emits a dated green attestation with
+#     gVisor EXERCISED — contract 8.4 re-greened on the second backend (the permanent gate re-runs
+#     per backend). Gated to SKIP gracefully without `runsc` or the staged minimal rootfs. Run:
+#     cargo test -p myelin-ci-sandbox --features integration --test escape_drill_gvisor_test -- --nocapture.
 #   - tests/integration_runner_lease.rs (CI-P3 → P-238) proves the runner-side lease handshake
 #     against REAL Postgres: claim (`FOR UPDATE SKIP LOCKED`) + heartbeat-renew + the exactly-once
 #     terminal report (`job.done` ON CONFLICT DO NOTHING → double-deliver buffers once). The

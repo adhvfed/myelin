@@ -2126,6 +2126,23 @@ title = "ToolHands::exec (unified sandbox)"
 # declared as a committed CI job in `myelin_ci_controlplane::permanent_gates::m4_boundary_permanent_
 # gates` (an uncommitted re-run is no gate, EI-01 §5) — the COMMITTED-GATE WIRING half (no new drill
 # logic). No floor (a PERMANENT GATE); gVisor re-runs it at CI-P28.
+#
+# CI-P28 SECOND-BACKEND RE-GREEN at CI-P28 (-> P-423): the SAME seven-family adversarial corpus
+# (the CI-P5 / P-239 catalogue + the SAME host-side parser + the SAME EscapeAttestation type --
+# REUSED, not forked) is RE-RUN inside a REAL `runsc` (gVisor) userspace-kernel sandbox via a
+# hardened OCI bundle (read-only root, all caps dropped, no-new-privs, pids ceiling, no network
+# namespace => --network=none leaves only loopback -- the SAME backend-independent HardeningProfile,
+# enforced through the OCI spec instead of the microVM config). The drill is
+# `myelin-ci-sandbox/tests/escape_drill_gvisor_test.rs` (integration-gated; runs the corpus in a real
+# rootless gVisor sandbox on this host, ZERO escapes, dated attestation `<date>-gvisor.json` with
+# Backend::GvisorRunsc EXERCISED -- not the run-when-available residual the FC drill recorded). The
+# raw-device family (K2/K3) is probed as mknod-denial -- the faithful gVisor expression of the SAME
+# contained property (the privileged node is absent + creating one is denied; documented deviation,
+# EI-01 s1). The promotion is justified by the binding DEV-REAL policy (this host has KVM + gVisor =>
+# the sandbox-escape gate is a REAL drill on BOTH backends); the formal density/latency-economics
+# trigger (CI-P30 / P-490) is downstream and has not fired -- proving the gate on the second backend
+# NOW is strictly safer (a real green, never a weakened threshold). The permanent gate re-runs per
+# backend; this re-greens it on the second.
 status = "covered"
 cdc = [
     "crates/myelin-ci-sandbox/tests/cdc_8_4_unified_sandbox.rs",

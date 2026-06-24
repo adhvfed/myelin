@@ -95,6 +95,14 @@ pub use snapshot_pool::{
     AcquirePath, ModeledRestore, PoolStats, SnapshotPool, SnapshotRestore, WarmSandbox,
 };
 
+// CI-P28 (P-423): the gVisor escape-drill bundle builders (the corpus RE-RUNS on the gVisor backend
+// — the permanent gate, contract 8.4). Exercised by tests/escape_drill_gvisor_test.rs against a real
+// `runsc` sandbox; the host-side parser + attestation format are SHARED with the Firecracker drill.
+pub use gvisor::{
+    build_gvisor_corpus_script, gvisor_drill_config_json, resolved_gvisor_rootfs,
+    GVISOR_CORPUS_SCRIPT,
+};
+
 pub use runner::{
     CountingFirehose, EngineTerminalReporter, FirehoseSink, JobLeaseStore, QueuedJob, RunOutcome,
     RunnerAgent, RunnerError, TerminalReport, TerminalReporter,
