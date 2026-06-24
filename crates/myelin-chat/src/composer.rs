@@ -368,6 +368,13 @@ pub trait DraftStore {
 
     /// Clear the author's draft for a conversation (on send / explicit discard).
     fn clear(&self, key: &DraftKey);
+
+    /// **Purge EVERY draft authored by a principal (the GDPR erase fan-out, CHAT-P22 / CHAT-D8).**
+    /// An author's Art. 17 erasure destroys their per-subject draft DEK (the bytes are unrecoverable
+    /// ciphertext at rest); this drops the draft ROWS so the subject's unsent-draft footprint is 0
+    /// across every conversation. Returns the count purged. The default walks the store; a real
+    /// PG-backed store does it with a `DELETE … WHERE author = $1` (the same observable property).
+    fn purge_author(&self, author_pseudonym: &str) -> usize;
 }
 
 /// The DB-free in-memory draft store (the unit-test floor; the per-subject-DEK PG-backed store is the
@@ -405,6 +412,13 @@ impl DraftStore for MemDraftStore {
 
     fn clear(&self, key: &DraftKey) {
         self.lock().remove(key);
+    }
+
+    fn purge_author(&self, author_pseudonym: &str) -> usize {
+        let mut drafts = self.lock();
+        let before = drafts.len();
+        drafts.retain(|k, _| k.author_pseudonym != author_pseudonym);
+        before - drafts.len()
     }
 }
 
