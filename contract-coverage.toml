@@ -605,6 +605,13 @@ cdc = [
   # tombstones (0 title leak), and the chained revoke→tombstone (the standalone CHAT-D5 drill is
   # drill_chat_d5_unfurl_no_leak.rs).
   "crates/myelin-chat/tests/cdc_5_2_5_7_4_3_chat_unfurl.rs",
+  # CHAT-P18 / P-413 (M4-C6): the Chat HITL approval-card CLICK gate
+  # (`myelin_chat::hitl::ClickGate`) gates EVERY Approve/Reject click on `check(human, approve, run,
+  # Strong)` BEFORE the decision signal is posted (fail-closed; Deny/Conditional/Id-error all deny — a
+  # denied click posts NO signal, the gated tool stays withheld; Strong consistency honours a
+  # just-revoked approver — the new-enemy guard on the approval gate). The CDC drives the gate against
+  # the real check shape (permission `approve`, the `run:<id>` object, Strong@zookie).
+  "crates/myelin-chat/tests/cdc_9_1_9_4_4_2_4_7_chat_hitl.rs",
 ]
 
 [[contract]]
@@ -2107,9 +2114,18 @@ status = "covered"
 # input: [snapshot_ref], idem_key } and hands it to DurableExecutor::start (9.1) — a re-delivered
 # trigger is ONE run (idempotent on idem_key), started on the references-not-payloads CAS snapshot
 # ref. The prior `deferred → P-203` marker was stale (P-203 had shipped the provider + its CDC).
+# CHAT-P18 / P-413 (M4-C6) adds the CHAT HITL-card CONSUMER half of the per-effect `idem_key` rule:
+# the in-chat approval card (myelin_chat::hitl) posts DurableExecutor::signal per gated decision under
+# the FROZEN per-effect key (single card_id / multi card_id:<idx>, OQ-F) through the SignalPort seam —
+# a double-click re-posts the SAME key → the engine dedups (Duplicate) → ONE approval; a partial
+# approval is three INDEPENDENT keys (well-defined); a declined effect carries the DECLINE_MARKER → the
+# engine WITHHOLDS it (AG-8, 0 mutation). The CDC asserts BYTE PARITY between chat's per_effect_idem_key
+# and myelin_flow::per_effect_idem_key (ONE rule, not two) and drives the REAL FlowExecutor::signal.
+# The CHAT-D9 (kill→approve→exactly-once) + CHAT-D10 (2-of-3 per-effect) drills ride here.
 cdc = [
     "crates/myelin-flow/tests/cdc_9_1_executor.rs",
     "crates/myelin-ci-dispatch/tests/cdc_ci_p11_resolve_dispatch.rs",
+    "crates/myelin-chat/tests/cdc_9_1_9_4_4_2_4_7_chat_hitl.rs",
 ]
 
 [[contract]]
