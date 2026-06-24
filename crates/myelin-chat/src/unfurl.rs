@@ -79,6 +79,12 @@ use myelin_tenancy::{Region, TenantId};
 use crate::membership::{channel_object, permissions};
 
 pub mod gate;
+pub mod invalidation;
+
+pub use invalidation::{
+    erasure_safe_rerender, invalidates_card, CardUpdatePush, LiveUnfurlInvalidator,
+    UnfurlInvalidator, DEFAULT_CACHE_TTL_SECONDS, UNFURL_INVALIDATION_SUBJECTS,
+};
 
 pub use gate::{
     lower_over_unfurl_candidate, unfurl_candidate_colref, AuthzJoin, AuthzVisibleIndex, BoundParam,
@@ -345,6 +351,12 @@ impl<I: IdentityService, R: RefsResolvePort> UnfurlService<I, R> {
     /// busts the shared entry — never a second cache).
     pub fn cache(&self) -> &UnfurlCache {
         &self.cache
+    }
+
+    /// The Refs resolve chokepoint (so a CHAT-P14 erasure/live-update drill can drive the resolver's
+    /// outcome and assert a LIVE re-resolve after a bus-bust — never a stale cache read).
+    pub fn resolver(&self) -> &R {
+        &self.resolver
     }
 
     /// **Resolve ONE ref for a viewer — the gate-then-cache-then-ladder path (the no-leak core).** The
