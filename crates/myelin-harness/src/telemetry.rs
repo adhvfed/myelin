@@ -157,12 +157,30 @@ pub enum SignalName {
     /// stops collapsing (every Signal opens its own row → ratio 0) fails LOUDLY. Labelled by
     /// `{consumer}` (the router pool the ratio is measured on). Scaled basis points.
     DedupCollapseRatio,
+    /// **Online-migration lock-wait p99** — the p99 lock-wait, in MILLISECONDS, an
+    /// expand→backfill→contract migration's steps imposed on concurrent writers when run on a
+    /// restored prod-scale copy UNDER LOAD (§9.1/§9.2 — the lock-time-against-a-restore rule; SUB-D10 /
+    /// STOR-D8; contract 1.5). A SHORT metadata/catalog lock reads well under the budget; a blocking
+    /// table-rewrite lock at write QPS blows it. The SUB-D10 drill asserts `<= online_migration.
+    /// lock_wait_p99_max_ms` (read from the thresholds file, never hardcoded). Scalar.
+    MigrationLockWaitP99Ms,
+    /// **Online-migration errored writes** — the number of concurrent writes that ERRORED (were
+    /// rejected / failed) during the online migration on the restored copy under load (SUB-D10 drill
+    /// row: "0 errored writes"). An online migration takes only short metadata locks, so concurrent
+    /// writers proceed — `0` is the invariant the drill asserts. A blocking lock would stall + error
+    /// writers (`> 0`). Scalar.
+    MigrationErroredWrites,
+    /// **Online-migration downtime** — the wall-clock time, in MILLISECONDS, the table was OFFLINE
+    /// during the migration (SUB-D10 / STOR-D8 drill row: "0 downtime"). An online migration NEVER
+    /// takes the table offline, so the drill asserts `<= online_migration.downtime_max_ms` (`0`).
+    /// Scalar.
+    MigrationDowntimeMs,
 }
 
 impl SignalName {
     /// Every contract-1.8 signal name (for the "the library covers the §10.2 set" test —
     /// observability is part of the pass condition, so the set must be exhaustive).
-    pub const ALL: [SignalName; 22] = [
+    pub const ALL: [SignalName; 25] = [
         SignalName::RequestRate,
         SignalName::RequestErrors,
         SignalName::RequestDuration,
@@ -185,6 +203,9 @@ impl SignalName {
         SignalName::RestoreRpoSecs,
         SignalName::RestoreRtoSecs,
         SignalName::DedupCollapseRatio,
+        SignalName::MigrationLockWaitP99Ms,
+        SignalName::MigrationErroredWrites,
+        SignalName::MigrationDowntimeMs,
     ];
 }
 
@@ -693,8 +714,10 @@ mod tests {
         uniq.dedup();
         assert_eq!(uniq.len(), n, "every contract-1.8 signal name is distinct");
         assert_eq!(
-            n, 22,
-            "the §10.2 set + the restore-verify triplet + the Notif dedup-collapse-ratio (1.8) is covered exhaustively"
+            n, 25,
+            "the §10.2 set + the restore-verify triplet + the Notif dedup-collapse-ratio + the \
+             online-migration-under-load triplet (lock-wait p99 + errored-writes + downtime, SUB-D10 / \
+             contract 1.5) is covered exhaustively"
         );
     }
 }
