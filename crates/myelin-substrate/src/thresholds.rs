@@ -171,6 +171,18 @@ pub struct Thresholds {
     /// parses against the §4.10 seed. Mirrors `myelin_search::freshness::FRESHNESS_P99_SEED_MS`.
     #[serde(default)]
     pub search_freshness: SearchFreshness,
+    /// The tuned filtered-ANN strategy numbers MEASURED at scale (SRCH-D8; SRCH-P26 / P-461, M5;
+    /// search-and-indexing §4.2.2 the filter-during-traversal recall@k + the brute-force-fallback
+    /// threshold, §3.3 the HNSW↔IVF-PQ promotion point; contract 6.2 the filtered-ANN traversal, 1.8
+    /// the recall + zero-escape telemetry). The recall@k floor a selective ACL/structured filter must
+    /// meet against brute-force ground truth (0 leak), the visible-fraction at/below which the graph
+    /// walk under-fills so Search falls back to brute-force over the small visible set, and the live
+    /// per-cell vector count at which HNSW promotes to the IVF-PQ memory-pressure shape. The SRCH-P11
+    /// property (k visible neighbours, no leak) is fixed; THIS writes the tuned STRATEGY numbers.
+    /// `#[serde(default)]` so an older thresholds file (pre-P-461) still parses against the §4.2.2
+    /// seeds. Mirrors `myelin_search::filtered_ann::FilteredAnnStrategy` seed constants.
+    #[serde(default)]
+    pub filtered_ann: FilteredAnn,
     /// The scorecard: drills that came back red live here, never edited green (EI-01 §3).
     #[serde(default)]
     pub claimed_not_proven: Vec<ClaimedNotProven>,
@@ -613,6 +625,107 @@ impl Default for SearchFreshness {
         SearchFreshness {
             freshness_p99_ms: Self::FRESHNESS_P99_SEED_MS,
             index_lag_alarm_margin_ms: Self::ALARM_MARGIN_SEED_MS,
+        }
+    }
+}
+
+/// The tuned filtered-ANN strategy numbers — the SRCH-D8 (SRCH-P26 / P-461) measured tail of the
+/// SRCH-P11 filter-during-traversal property (search-and-indexing §4.2.2 / §3.3, contract 6.2 / 1.8).
+///
+/// Three numbers, all MEASURED-not-predicted (EI-01 §3):
+///   - `recall_at_k_bps` — the recall@k FLOOR (in basis points of 10 000 = 100.00 %) the filtered-ANN
+///     traversal must meet against brute-force ground truth under a SELECTIVE filter, with **0 leak**.
+///     `10000` bps = exact recall (every k-nearest VISIBLE neighbour recovered). The brute-force
+///     fallback makes this achievable at 100.00 % under a selective filter; a measured recall BELOW
+///     this floor is a dated `[[claimed_not_proven]]` row, never a lowered bar.
+///   - `brute_force_fallback_visible_bps` — the visible-fraction (basis points) AT OR BELOW which the
+///     ANN graph walk is presumed to under-fill, so Search falls back to brute-force over the small
+///     visible set (§4.2.2). This is the TUNED trigger: a filter that leaves ≤ this fraction of the
+///     index visible is "very selective". Cost knob only — correctness holds either side (the graph
+///     walk is independently leak-safe; the brute pass is independently exact).
+///   - `ivf_pq_promotion_live_vectors` — the live per-cell vector count at which the HNSW shape is
+///     promoted to the IVF-PQ (coarse-quantise + product-quantise) memory-pressure shape (§3.3). A
+///     MEASURED promotion point: below it HNSW keeps full `f32` vectors in RAM; at/above it the
+///     per-cell memory budget triggers compression. Promotion changes COST (RAM), never correctness
+///     (the recall floor still binds).
+///
+/// `#[serde(default)]` + [`Default`] so an older thresholds file (pre-P-461) parses against the seeds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilteredAnn {
+    /// The recall@k FLOOR in basis points (10 000 = 100.00 %) the filtered-ANN traversal must meet
+    /// against brute-force ground truth under a selective filter, with 0 leak. MUST be `> 0`.
+    pub recall_at_k_bps: u32,
+    /// The visible-fraction (basis points, 10 000 = 100 %) at/below which Search falls back to
+    /// brute-force over the small visible set (§4.2.2 — "very selective"). MUST be in `(0, 10000]`.
+    pub brute_force_fallback_visible_bps: u32,
+    /// The live per-cell vector count at which HNSW promotes to IVF-PQ (§3.3 memory-pressure upgrade).
+    /// MUST be `> 0` (a promotion at 0 vectors is mis-specified).
+    pub ivf_pq_promotion_live_vectors: u64,
+}
+
+impl FilteredAnn {
+    /// The recall@k floor seed: **10 000 bps = exact recall (100.00 %)**. Under a selective filter the
+    /// brute-force fallback recovers the genuine k-nearest VISIBLE neighbours, so the filtered-ANN
+    /// strategy meets EXACT recall with 0 leak — the recall floor is not a soft 95 %, it is "no visible
+    /// nearest neighbour is ever DROPPED" (the §4.2.2 recall-correctness property). A measured recall
+    /// below this is a dated `[[claimed_not_proven]]` row, never a softened bar.
+    pub const RECALL_AT_K_BPS_SEED: u32 = 10_000;
+    /// The brute-force-fallback visible-fraction seed: **2 000 bps = 20 %**. A filter that leaves ≤ 20 %
+    /// of the index visible is "very selective" — at or below it the ANN graph walk is presumed to
+    /// under-fill, so Search falls back to brute-force over the small visible set. MEASURED as the
+    /// selectivity at which the graph walk begins to miss visible neighbours on the SRCH-D8 corpus.
+    pub const BRUTE_FORCE_FALLBACK_VISIBLE_BPS_SEED: u32 = 2_000;
+    /// The HNSW→IVF-PQ promotion-point seed: **1 000 000 live vectors per cell**. Below a million
+    /// per-cell `f32` vectors the in-RAM HNSW v1 shape holds within the per-cell memory budget; at/above
+    /// it the budget triggers the IVF-PQ compression promotion (§3.3). The real per-cell number is
+    /// finalised by the world-scale fleet drill (the one remaining floor); the cell-class memory budget
+    /// sets this seed.
+    pub const IVF_PQ_PROMOTION_LIVE_VECTORS_SEED: u64 = 1_000_000;
+
+    /// The recall@k floor as a fraction in `[0, 1]` (bps / 10 000) — the comparison form a measured
+    /// recall is checked against.
+    pub fn recall_floor_fraction(&self) -> f64 {
+        self.recall_at_k_bps as f64 / 10_000.0
+    }
+
+    /// Whether a filter leaving `visible` of `total` indexed vectors visible is "very selective" — i.e.
+    /// the visible fraction is AT OR BELOW the tuned fallback threshold, so Search should fall back to
+    /// brute-force over the small visible set (§4.2.2). `total == 0` is not selective (nothing to walk).
+    pub fn is_very_selective(&self, visible: u64, total: u64) -> bool {
+        if total == 0 {
+            return false;
+        }
+        // visible/total <= bps/10000  ⇔  visible*10000 <= bps*total  (integer, no float rounding).
+        (visible as u128) * 10_000
+            <= (self.brute_force_fallback_visible_bps as u128) * (total as u128)
+    }
+
+    /// Whether a cell holding `live_vectors` live vectors has crossed the HNSW→IVF-PQ promotion point
+    /// (§3.3) — at/above the threshold the per-cell memory budget triggers the IVF-PQ compression.
+    pub fn should_promote_to_ivf_pq(&self, live_vectors: u64) -> bool {
+        live_vectors >= self.ivf_pq_promotion_live_vectors
+    }
+
+    /// Whether the strategy numbers are well-formed: a positive recall floor, a fallback threshold in
+    /// `(0, 100 %]`, and a positive promotion point. A mis-specified strategy (e.g. a 0 recall floor —
+    /// "no recall required") is rejected so a green can never be manufactured by a vacuous bar.
+    pub fn is_well_formed(&self) -> bool {
+        self.recall_at_k_bps > 0
+            && self.brute_force_fallback_visible_bps > 0
+            && self.brute_force_fallback_visible_bps <= 10_000
+            && self.ivf_pq_promotion_live_vectors > 0
+    }
+}
+
+impl Default for FilteredAnn {
+    /// The §4.2.2 / §3.3 seed default-to-beat: exact recall (100.00 %), a 20 % very-selective fallback
+    /// trigger, and a 1 000 000-live-vector IVF-PQ promotion point. SRCH-P26 (P-461) measures the real
+    /// numbers at scale and dates them. An older thresholds file (pre-P-461) falls back here.
+    fn default() -> Self {
+        FilteredAnn {
+            recall_at_k_bps: Self::RECALL_AT_K_BPS_SEED,
+            brute_force_fallback_visible_bps: Self::BRUTE_FORCE_FALLBACK_VISIBLE_BPS_SEED,
+            ivf_pq_promotion_live_vectors: Self::IVF_PQ_PROMOTION_LIVE_VECTORS_SEED,
         }
     }
 }
@@ -1161,6 +1274,48 @@ mod tests {
             1500,
             "the alarm fires at budget − margin = 2000 − 500 = 1500 ms"
         );
+    }
+
+    /// The canonical file carries the tuned filtered-ANN strategy numbers MEASURED at scale (SRCH-D8,
+    /// SRCH-P26 / P-461): the exact recall@k floor, the very-selective brute-force-fallback trigger,
+    /// and the HNSW↔IVF-PQ promotion point — all well-formed (no vacuous bar).
+    #[test]
+    fn canonical_file_holds_the_tuned_filtered_ann_strategy() {
+        let t = Thresholds::load_canonical().expect("load");
+        let f = &t.filtered_ann;
+        assert_eq!(
+            f.recall_at_k_bps,
+            FilteredAnn::RECALL_AT_K_BPS_SEED,
+            "the §4.2.2 filtered-ANN recall floor: exact recall (100.00 %) under a selective filter"
+        );
+        assert_eq!(
+            f.brute_force_fallback_visible_bps,
+            FilteredAnn::BRUTE_FORCE_FALLBACK_VISIBLE_BPS_SEED,
+            "the brute-force-fallback very-selective trigger (≤ 20 % visible)"
+        );
+        assert_eq!(
+            f.ivf_pq_promotion_live_vectors,
+            FilteredAnn::IVF_PQ_PROMOTION_LIVE_VECTORS_SEED,
+            "the §3.3 HNSW→IVF-PQ promotion point (per-cell live vectors)"
+        );
+        assert!(
+            f.is_well_formed(),
+            "the strategy numbers must be well-formed (a 0 recall floor / 0 promotion point is rejected)"
+        );
+        assert_eq!(
+            f.recall_floor_fraction(),
+            1.0,
+            "the recall floor is exact (1.0) — no visible nearest neighbour is ever dropped"
+        );
+        // A filter leaving 5 of 100 vectors visible (5 %) is very selective; 50 of 100 (50 %) is not.
+        assert!(f.is_very_selective(5, 100), "5 % visible is very selective");
+        assert!(
+            !f.is_very_selective(50, 100),
+            "50 % visible is not selective"
+        );
+        // The promotion point binds at/above 1 000 000 live vectors, not below.
+        assert!(f.should_promote_to_ivf_pq(1_000_000));
+        assert!(!f.should_promote_to_ivf_pq(999_999));
     }
 
     /// The canonical file carries every Q32 default-to-beat at its documented value.

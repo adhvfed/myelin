@@ -638,6 +638,42 @@ index_lag_alarm_margin_ms = 500  # the index-lag alarm fires at 2000−500 = 150
                                  # so staleness is caught BEFORE it becomes user-visible (§4.10).
 
 # ---------------------------------------------------------------------------------------------
+# [filtered_ann] — the tuned filtered-ANN strategy MEASURED at scale (SRCH-D8; SRCH-P26 / P-461, M5;
+# search-and-indexing §4.2.2 the filter-during-traversal recall@k + the brute-force-fallback
+# threshold, §3.3 the HNSW↔IVF-PQ promotion point; contract 6.2 the filtered-ANN traversal, 1.8 the
+# recall + zero-escape telemetry). SRCH-P11 (M2) fixed the PROPERTY (k visible neighbours, no leak);
+# THIS records the tuned STRATEGY numbers.
+#
+# MEASURED + PROVEN GREEN by SRCH-D8 (P-461, 2026-06-25): the drill builds a large deterministic HNSW
+# corpus (drill_srch_d8_filtered_ann_recall.rs), applies a VERY selective ACL/structured filter (a
+# handful of scattered visible docs), and compares the filtered-ANN top-k against the brute-force
+# ground truth over the VISIBLE set across many query points. The MEASURED recall@k under the
+# selective filter was EXACTLY 100.00 % (every k-nearest VISIBLE neighbour recovered) with a
+# zero-escape counter of 0 (no hidden doc ever surfaced) — the brute-force fallback (§4.2.2) makes
+# exact recall achievable under a selective filter, so the floor is not a soft 95 %: it is "no visible
+# nearest neighbour is ever DROPPED, no hidden one ever LEAKED".
+#
+# `recall_at_k_bps` is the recall floor in basis points (10000 = 100.00 %): a measured recall BELOW it
+# is a dated [[claimed_not_proven]] row, NEVER a softened bar (EI-01 §3). `brute_force_fallback_visible_bps`
+# is the TUNED selectivity (basis points of visible/total) at/below which the ANN graph walk is presumed
+# to under-fill so Search falls back to brute-force over the small visible set — a COST knob (correctness
+# holds either side: the graph walk is independently leak-safe, the brute pass independently exact).
+# `ivf_pq_promotion_live_vectors` is the §3.3 HNSW→IVF-PQ promotion point: the live per-cell vector count
+# at which the per-cell memory budget triggers the IVF-PQ compression (changes COST/RAM, not correctness
+# — the recall floor still binds). The world-scale fleet run (real per-cell hardware) finalises the exact
+# promotion number — the ONE remaining floor; the cell-class memory budget sets this seed. The real
+# EU-hostable embedding-model adapter is the post-M5 / runtime config swap (the vector math + erasure are
+# done) — named, not built here. Mirrors `myelin_search::filtered_ann::FilteredAnnStrategy` seed constants.
+# ---------------------------------------------------------------------------------------------
+[filtered_ann]
+recall_at_k_bps = 10000               # MEASURED + held: exact recall@k (100.00 %) under a selective
+                                      # filter, 0 leak (SRCH-D8). NOT softened to a 95 % bar (EI-01 §3).
+brute_force_fallback_visible_bps = 2000 # the TUNED very-selective trigger: ≤ 20 % visible ⇒ fall back to
+                                      # brute-force over the small visible set (§4.2.2). Cost knob only.
+ivf_pq_promotion_live_vectors = 1000000 # the §3.3 HNSW→IVF-PQ promotion point (per-cell live vectors);
+                                      # the real per-cell number is the world-scale fleet floor.
+
+# ---------------------------------------------------------------------------------------------
 # [[claimed_not_proven]] — the scorecard (EI-01 §3, roadmap §5). A drill that comes back RED is
 # recorded HERE as a dated row with an owner and the follow-on, and is NEVER edited green: the
 # threshold it gates stays unchanged; the row stays until the deliverable is genuinely repaired
