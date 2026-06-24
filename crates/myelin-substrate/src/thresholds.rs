@@ -92,6 +92,14 @@ pub struct Thresholds {
     pub fail_static: FailStaticThreshold,
     /// The durability objectives (RPO / RTO), asserted by restore-verify (STOR-D1/D2, SUB-D6).
     pub rpo_rto: RpoRto,
+    /// The online-migration-under-load lock budget (contract 1.5; SUB-D10 / STOR-D8). The lock-wait
+    /// p99 budget an expand→backfill→contract step may impose on concurrent writers + the 0-downtime
+    /// invariant — read by the SUB-D10 drill (P-S34) + the STOR-D8 drill (P-126). The SHAPE (a
+    /// measured lock-wait p99 ceiling under load + a 0-downtime invariant) is frozen; the NUMBER is the
+    /// default-to-beat measured under load. `#[serde(default)]` so an older thresholds file (pre-P-126)
+    /// still parses against the §9 seed.
+    #[serde(default)]
+    pub online_migration: OnlineMigration,
     /// The causal-depth ceilings the agent-loop guard halts a loop at (SUB-D8).
     pub depth_ceilings: DepthCeilings,
     /// The S8 authz-reverse-index measured tunables (the Ids↔Filter cardinality cap + the
@@ -255,6 +263,41 @@ pub struct RpoRto {
     pub rto_tenant_max_mins: u64,
     /// Recovery-time objective per cell, in minutes (default-to-beat: ≤ 240).
     pub rto_cell_max_mins: u64,
+}
+
+/// The online-migration-under-load lock budget (contract 1.5; architecture §9.1/§9.2 — the lock-time-
+/// against-a-restore rule). The SUB-D10 (P-S34) + STOR-D8 (P-126) drills read these: an
+/// expand→backfill→contract step's p99 lock-wait must stay within `lock_wait_p99_max_ms` (a SHORT
+/// metadata/catalog lock, never a table-rewrite lock at write QPS) and the migration must cause 0
+/// downtime (`downtime_max_ms == 0` — an online migration NEVER takes the table offline). The SHAPE is
+/// frozen; the NUMBER is the default-to-beat measured under load (re-confirmed at cell scale in the M5
+/// world-scale follow-on). Never weaken either to pass (EI-01 §3) — a red is a dated
+/// `[[claimed_not_proven]]` row.
+///
+/// This is the substrate-side TYPED accessor for the `[online_migration]` section the thresholds file
+/// carries (P-126 wrote the section; this types it so the SUB-D10 drill reads it through the SAME
+/// [`Thresholds`] loader every other substrate drill uses, not by re-parsing the TOML). The
+/// storage-tier `myelin_storage::LockBudget` is constructed from these two numbers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnlineMigration {
+    /// The maximum p99 lock-wait, in MILLISECONDS, an online migration step may impose on concurrent
+    /// writers. A step over this is a blocking lock at write QPS, not the online idiom — the drill FAILs.
+    pub lock_wait_p99_max_ms: u64,
+    /// The maximum downtime, in MILLISECONDS, the migration may cause. `0` is the 0-downtime invariant:
+    /// an online migration NEVER takes the table offline (drill rows SUB-D10 / STOR-D8).
+    pub downtime_max_ms: u64,
+}
+
+impl Default for OnlineMigration {
+    /// The §9 seed default-to-beat: a 500 ms lock-wait p99 ceiling (a SHORT metadata/catalog lock) and
+    /// the 0-downtime invariant. Mirrors the `[online_migration]` row in the canonical file; an older
+    /// thresholds file (pre-P-126) falls back to this.
+    fn default() -> Self {
+        OnlineMigration {
+            lock_wait_p99_max_ms: 500,
+            downtime_max_ms: 0,
+        }
+    }
 }
 
 /// The causal-depth ceilings the agent-loop guard halts a loop at (SUB-D8, contract 1.11).
@@ -654,6 +697,14 @@ mod tests {
         assert_eq!(t.rpo_rto.rpo_max_mins, 5, "RPO ≤ 5 min");
         assert_eq!(t.rpo_rto.rto_tenant_max_mins, 60, "RTO ≤ 1h/tenant");
         assert_eq!(t.rpo_rto.rto_cell_max_mins, 240, "RTO ≤ 4h/cell");
+        assert_eq!(
+            t.online_migration.lock_wait_p99_max_ms, 500,
+            "SUB-D10/STOR-D8: online-migration lock-wait p99 budget = 500 ms"
+        );
+        assert_eq!(
+            t.online_migration.downtime_max_ms, 0,
+            "SUB-D10/STOR-D8: the 0-downtime invariant is structural"
+        );
         assert_eq!(t.depth_ceilings.soft, 12);
         assert_eq!(t.depth_ceilings.hard, 16);
         assert_eq!(t.shed_budgets.len(), 6, "one row per shed::Surface");
@@ -846,6 +897,52 @@ mod tests {
             t2.fail_static.ratified_static_max_secs().expect("ratified"),
             180
         );
+    }
+
+    /// **SUB-D10 (P-S34): the online-migration lock budget is read through the typed [`Thresholds`]
+    /// loader, not by re-parsing the TOML.** The canonical file carries the `[online_migration]`
+    /// section (P-126 wrote it); this types it so the SUB-D10 drill reads it via the SAME loader every
+    /// other substrate drill uses (the single source of truth, EI-01 §3 — never a hardcoded number).
+    #[test]
+    fn online_migration_budget_reads_through_the_typed_loader() {
+        let t = Thresholds::load_canonical().expect("load");
+        assert_eq!(t.online_migration.lock_wait_p99_max_ms, 500);
+        assert_eq!(t.online_migration.downtime_max_ms, 0);
+    }
+
+    /// An older thresholds file WITHOUT the `[online_migration]` section still parses (the field is
+    /// `#[serde(default)]`) and falls back to the §9 seed — so a pre-P-126 file is not a parse error.
+    #[test]
+    fn an_older_file_without_online_migration_falls_back_to_the_seed() {
+        let pre_p126 = r#"
+            version = 1
+            as_of = "2026-06-19"
+            [revocation]
+            sla_mins = 5
+            [surge]
+            multiplier = 30
+            [fail_static]
+            status = "OPEN — LEGAL"
+            owner = "DPO / Legal"
+            static_max_default_secs = 300
+            agent_token_ttl_secs = 60
+            constraint = "x"
+            [rpo_rto]
+            rpo_max_mins = 5
+            rto_tenant_max_mins = 60
+            rto_cell_max_mins = 240
+            [depth_ceilings]
+            soft = 12
+            hard = 16
+        "#;
+        let t = Thresholds::from_toml(pre_p126).expect("a pre-P-126 file parses");
+        assert_eq!(
+            t.online_migration,
+            OnlineMigration::default(),
+            "an absent [online_migration] falls back to the §9 seed"
+        );
+        assert_eq!(t.online_migration.lock_wait_p99_max_ms, 500);
+        assert_eq!(t.online_migration.downtime_max_ms, 0);
     }
 
     /// The scorecard list is honest: empty at this commit (every shipped M0 drill is green at its

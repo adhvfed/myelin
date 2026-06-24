@@ -154,6 +154,19 @@ rto_cell_max_mins = 240      # recovery-time objective, per cell: ≤ 4 hours.
 # migration NEVER takes the table offline. Weakening either number to pass is forbidden (EI-01
 # §3) — a red is a dated `[[claimed_not_proven]]` scorecard row, never a lowered bar. Keyed on
 # contract 1.5 (the migration runner) + 11.5 (the restored copy STOR-D8 rehearses against).
+#
+# PROVEN GREEN at the substrate level by SUB-D10 (P-S34 / P-435, M5, 2026-06-24): the substrate's
+# online-migration-under-load chain — the migration runner (1.5) tied to the P-S26 restore-verify
+# machinery (the migration runs on a RESTORED prod-scale copy, §9.2's lock-time-against-a-restore
+# rule) under the P-S02 load generator's concurrent write traffic (the in-flight writers DERIVED from
+# a real 30× generator run) — held this budget: an expand→backfill→contract migration on the restored
+# 50M-row copy had its lock-wait p99 WITHIN budget, 0 errored writes (the online idiom takes only
+# short metadata/catalog/row-level locks, so the concurrent writers proceeded), and 0 downtime, and
+# the restored copy stayed cross-seam consistent across the migration. The blocking-ALTER counter-case
+# BLEW the budget (the dynamic proof the static gate cannot make). The lock-cost MODEL is the storage
+# tier's (STOR-D8, migration_under_load.rs) — REUSED, not duplicated; SUB-D10 adds the substrate-level
+# restore+load+telemetry wiring. CELL-scale re-confirm under WORLD-SCALE load is the M5 follow-on
+# P-S35 / P-436.
 # ---------------------------------------------------------------------------------------------
 [online_migration]
 lock_wait_p99_max_ms = 500   # STOR-D8: an online step's p99 lock-wait must stay ≤ 500 ms (a short
