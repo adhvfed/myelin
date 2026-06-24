@@ -148,6 +148,32 @@ pub struct Revocation {
 pub struct Surge {
     /// The multiplier the surge family drives at (default-to-beat: 30×).
     pub multiplier: u32,
+    /// **The substrate-level protected-human-lane p99 latency budget under the 30× surge, in
+    /// MICROSECONDS** (`_us`; the §2.10 units anchor). This is the SUB-D3 (P-S32) ceiling: across a
+    /// 30× agent/CI surge on one tenant the substrate's protected human lane (the §7.2 reserved lane
+    /// at the public surface) must still complete a human request within this p99. Distinct from
+    /// [`AuthzSurge::human_lane_p99_budget_us`] (the authz hot-path `check` budget, ID-D9): this is
+    /// the GENERIC public-surface human-lane budget the substrate's shed lane protects. A human
+    /// request that is admitted (never queued behind a machine lane) is served at its normal latency;
+    /// a human that were SHED would blow this budget (a 429 is not "within budget"). The SHAPE (a
+    /// measured human-lane p99 ceiling under surge) is frozen here; the NUMBER is the default-to-beat
+    /// the SUB-D3 drill measures + the M5 budget-tuning follow-on (P-S33) re-confirms. A regression
+    /// that pushes the human-lane p99 past it is a dated `[[claimed_not_proven]]` row, never a lowered
+    /// bar (EI-01 §3). `#[serde(default)]` so an older file without the field still parses against the
+    /// seed default-to-beat.
+    #[serde(default = "Surge::default_human_lane_p99_budget_us")]
+    pub human_lane_p99_budget_us: u64,
+}
+
+impl Surge {
+    /// The seed default-to-beat for the substrate's protected human-lane p99 under the 30× surge:
+    /// 10 000 µs (= 10 ms). A human request admitted into the reserved lane (never queued behind a
+    /// machine lane) completes well under this; the SUB-D3 drill (P-S32) measures + dates the real
+    /// number and the M5 budget-tuning follow-on (P-S33) re-confirms it. Generous-but-real: a
+    /// human-lane p99 over 10 ms at the public surface under a 30× surge IS a regression worth a red.
+    pub fn default_human_lane_p99_budget_us() -> u64 {
+        10_000
+    }
 }
 
 /// The authz-surge (ID-D9 / F6) protected-human-lane latency budget (identity §10/§13; contract 1.8
@@ -589,6 +615,10 @@ mod tests {
         let t = Thresholds::load_canonical().expect("load");
         assert_eq!(t.revocation.sla_mins, 5, "N = 5 min revocation");
         assert_eq!(t.surge.multiplier, 30, "30× surge");
+        assert_eq!(
+            t.surge.human_lane_p99_budget_us, 10_000,
+            "SUB-D3 substrate human-lane p99 budget = 10 ms (10000 µs)"
+        );
         assert_eq!(
             t.authz_surge.human_lane_p99_budget_us, 5000,
             "ID-D9 human-lane authz p99 budget = 5 ms (5000 µs)"
