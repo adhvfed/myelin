@@ -2143,6 +2143,8 @@ dependencies = [
  "myelin-tenancy",
  "serde",
  "serde_json",
+ "sqlx",
+ "tokio",
 ]
 
 [[package]]

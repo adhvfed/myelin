@@ -1,0 +1,733 @@
+//! # `store` — the Chat message store (CHAT-P4 / P-398, M4-C1): the `MessageStore` trait + the
+//! partitioned hot tier + the fs-backed cold-segment tier (the swap seam).
+//!
+//! This is the **storage-tier slice** of M4-C1 (the durable message store), conformed to the
+//! frozen data model in
+//! [`01-tech-and-data-model.md`](../../../../planning/04-subsystem-architectures/chat/architecture/01-tech-and-data-model.md)
+//! §3 (the message log) + §3.1 (the `MessageStore` trait) and the tiering lifecycle in
+//! [`02-internals-and-algorithms.md`](../../../../planning/04-subsystem-architectures/chat/architecture/02-internals-and-algorithms.md)
+//! §2. It ships:
+//!
+//! - **[`MessageStore`]** — the only interface the rest of Chat sees: `append` / `range` /
+//!   `revise` / `tombstone` / `resync_from`. The trait is the **hot-engine swap seam** (arch §3.1):
+//!   PostgreSQL-partitioned is the v1 hot tier, ScyllaDB is the named measured promotion (the M5
+//!   floor, CHAT-P28 / P-502). The cold tier + the trait are identical under either hot engine, so
+//!   the promotion is a swap, not a redesign.
+//! - **[`MemHotTier`]** — the DB-free, behaviour-identical hot tier model (partitioned by
+//!   `(tenant, region)` + conversation, residency-pinned), the unit-test floor. The PostgreSQL hot
+//!   tier ([`pg::PgMessageStore`]) implements the SAME trait against real Postgres behind the
+//!   `integration` feature, and the unit + integration suites assert **0 behavioural divergence**
+//!   on the trait's surface.
+//! - **[`ColdSegments`]** — the fs-backed cold-segment tier: an archived `(conversation, range)`
+//!   seals to a content-addressed [`myelin_storage::BlobStore`] segment (the 11.2 fs floor), still
+//!   range-readable. `range` / `resync_from` fetch the hot partition or the cold segment behind the
+//!   SAME interface (transparent cold reads, arch §2.1).
+//!
+//! ## The ULID message id — intrinsic per-conversation order
+//! [`MessageId`] is a k-sortable ULID ([`ulid`]): per-conversation order is INTRINSIC to the id,
+//! never wall-clock-derived at read time. The aggregate is `conversation_id` — the keying the
+//! CHAT-P5 outbox `UNIQUE(aggregate, seq)` and the CHAT-D2 total-order property build on.
+//!
+//! ## Named floors (VISION §3 name-your-floors)
+//! - **The hot tier is Postgres-partitioned; the ScyllaDB hot tier is the named M5 follow-on**
+//!   (M5-C-S2 / CHAT-P28 / P-502), triggered by measured per-cell write/partition volume. The
+//!   [`MessageStore`] trait makes it a SWAP; the cold tier + trait are identical either way.
+//! - **The fs-backed `BlobStore` → object-store swap (contract 11.2)** is the named M5 follow-on
+//!   riding the SAME promotion (CHAT-P28 / P-502). The cold tier here uses [`MemHotTier`]'s sibling
+//!   [`myelin_storage::FsBlobStore`] (the in-process fs floor); the object-store backing is a
+//!   one-line `BlobStore` swap.
+//! - **The outbox co-commit + `chat.message.created` emit is CHAT-P5** (P-399). [`MessageStore`]
+//!   threads the [`OutboxTx`] seam so the append's state change and its event commit in ONE
+//!   transaction (the BUS-2 emit-iff-committed property), but the `chat.message.created` event emit
+//!   itself lands in CHAT-P5 — here the seam exists and the state change is staged; the event is
+//!   the CHAT-P5 floor (named in [`MessageStore::append`]).
+//! - **The per-subject-DEK encryption of `body_inline` / `body_nodes` is CHAT-P6** (the columns
+//!   exist here; the DEK round-trip is CHAT-P6's, arch §3 + the prompt's DELIVERABLE).
+
+pub mod ulid;
+
+#[cfg(feature = "integration")]
+pub mod pg;
+
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+
+use myelin_events::OutboxTransaction;
+use myelin_storage::{BlobStore, ContentHash, FsBlobStore};
+use myelin_tenancy::TenantId;
+
+pub use ulid::{MessageId, MonotonicUlidSource, SystemUlidSource, UlidSource};
+
+/// The `(tenant, region)` partition + conversation key — the residency-pinned shard key every
+/// message row carries (arch §3; contract 12.1/12.4). `region` is in the key, so a write lands in
+/// its region's partition (0 cross-region rows; the residency-pin holds structurally — the hot
+/// tier indexes by this key and the integration PG tier RLS-policies on `(tenant, region)`).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ConversationId {
+    /// The partition + residency key (ADR-11) — first-class, never optional.
+    pub tenant: String,
+    /// The residency pin: `== cell.region` (the residency-pin lint, arch §3).
+    pub region: String,
+    /// The conversation this message log belongs to (the aggregate, ULID-ordered within it).
+    pub conversation_id: String,
+}
+
+impl ConversationId {
+    /// Construct a conversation key from its three components.
+    pub fn new(
+        tenant: impl Into<String>,
+        region: impl Into<String>,
+        conversation_id: impl Into<String>,
+    ) -> ConversationId {
+        ConversationId {
+            tenant: tenant.into(),
+            region: region.into(),
+            conversation_id: conversation_id.into(),
+        }
+    }
+}
+
+/// The kind of actor that authored a message (arch §3 `author_kind`) — provenance + agent
+/// treatment. Aligned to the frozen envelope actor kind `{human | agent | service}`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthorKind {
+    /// A human principal.
+    Human,
+    /// An agent principal (provenance popover; explicit-first dispatch, CHAT-1).
+    Agent,
+    /// A service principal.
+    Service,
+}
+
+/// The lifecycle state of a message (arch §3 `msg_state`). `Tombstoned` is the erasure end-state:
+/// the RECORD survives (conversation structure/order/causality intact for others) while the body is
+/// crypto-shredded ("delete the content, keep the fact"; the 4-step ladder's `erased` outcome,
+/// contract 5.7 — the crypto-shred itself is the GDPR holder's job, wired in CHAT-P6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MessageState {
+    /// The message is live.
+    Active,
+    /// The message was edited (a new version under CAS; `edited_seq` bumped, id stable).
+    Edited,
+    /// The message was soft-deleted by its author (still visible-as-deleted, body present).
+    Deleted,
+    /// The record survives, the body is crypto-shredded (the erasure end-state).
+    Tombstoned,
+}
+
+/// Why a message was tombstoned (arch §3.1 `TombstoneReason`). Carried so the audit fact records
+/// the cause; the body crypto-shred is the GDPR holder's job (CHAT-P6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TombstoneReason {
+    /// A GDPR erasure of the author subject reached this body (crypto-shred the per-subject DEK).
+    SubjectErased,
+    /// A per-channel retention purge reached this message.
+    RetentionPurge,
+    /// A moderation / admin removal.
+    Moderation,
+}
+
+/// A new message to append (arch §3 `NewMessage`). The body is the PII (`body_inline` +
+/// `body_nodes`, the `myelin-content` split, arch §1.4); the per-subject-DEK encryption of these
+/// bytes is wired in CHAT-P6 — HERE the columns exist and carry the bytes verbatim (the DEK
+/// round-trip is CHAT-P6's, the prompt's DELIVERABLE).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewMessage {
+    /// The conversation (aggregate) this message appends to.
+    pub conv: ConversationId,
+    /// `None` = top-level; else the thread this reply belongs to (arch §3 `thread_root_id`).
+    pub thread_root_id: Option<MessageId>,
+    /// The pseudonymous author principal id (erasure-safe; arch §3 `author`).
+    pub author: String,
+    /// The author kind (human | agent | service) — provenance + agent treatment.
+    pub author_kind: AuthorKind,
+    /// The markdown-subset body string (the `myelin-content` Chat subset, arch §1.4). The DEK
+    /// envelope-encryption of these bytes is CHAT-P6; here the column carries them.
+    pub body_inline: Vec<u8>,
+    /// The structured `mention` / `artifact_ref` / `embed` nodes, kept OUT of the markdown string
+    /// so reference-extraction is reliable (the `refs.edge.created` producer, contract 5.4). DEK
+    /// encryption is CHAT-P6.
+    pub body_nodes: Vec<u8>,
+    /// The idempotency nonce — a retried send (flaky mobile/agent) dedups to ONE message (arch §3
+    /// `UNIQUE(tenant, conversation_id, client_nonce)`). The idempotent-send GATE lands in CHAT-P5;
+    /// here the column + the per-conversation uniqueness invariant exist.
+    pub client_nonce: String,
+}
+
+/// A stored message (arch §3 `message` row). The body bytes round-trip verbatim through the store
+/// (the per-subject-DEK encryption is CHAT-P6; here the store is body-opaque).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Message {
+    /// The k-sortable ULID — intrinsic per-conversation order; the stable id behind the `#sub`
+    /// anchor `message-<message_id>` (stable across edits).
+    pub message_id: MessageId,
+    /// The conversation (aggregate) this message belongs to.
+    pub conv: ConversationId,
+    /// `None` = top-level; else the thread root.
+    pub thread_root_id: Option<MessageId>,
+    /// The pseudonymous author.
+    pub author: String,
+    /// The author kind.
+    pub author_kind: AuthorKind,
+    /// The (CHAT-P6-encrypted) markdown-subset body string.
+    pub body_inline: Vec<u8>,
+    /// The (CHAT-P6-encrypted) structured nodes.
+    pub body_nodes: Vec<u8>,
+    /// The idempotency nonce.
+    pub client_nonce: String,
+    /// The per-message CAS-on-edit counter (arch §3; bumped by [`MessageStore::revise`], id stable).
+    pub edited_seq: i32,
+    /// The lifecycle state.
+    pub state: MessageState,
+}
+
+/// A range-read cursor (arch §3.1 `RangeCursor`). A read is either the recent tail (open a channel),
+/// a scroll-back page (paginate before a cursor), or the resume-gap read (everything after a
+/// cursor) — [`MessageStore::resync_from`] is the dedicated resume-gap form.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RangeCursor {
+    /// The recent-N tail (most recent `limit` messages, ascending). Open-a-channel.
+    Recent,
+    /// Scroll-back: the page of `limit` messages strictly BEFORE this id (ascending). Paginate.
+    Before(MessageId),
+    /// The resume gap: everything strictly AFTER this id (ascending). The resume-cursor backbone.
+    After(MessageId),
+}
+
+/// A store error — a typed, loud surface (a store failure is a value, never a silent fallthrough).
+#[derive(Debug, PartialEq, Eq)]
+pub enum StoreError {
+    /// The CAS `expect_seq` did not match the stored `edited_seq` (a concurrent edit; arch §3 X-2).
+    CasConflict {
+        /// The id whose CAS failed.
+        message_id: MessageId,
+        /// The `edited_seq` the caller expected.
+        expected: i32,
+        /// The `edited_seq` actually stored.
+        actual: i32,
+    },
+    /// A message id was referenced that the store does not hold.
+    NotFound(MessageId),
+    /// A duplicate `client_nonce` within a conversation (the idempotent-send invariant). The full
+    /// idempotent-send GATE is CHAT-P5; the store surfaces the conflict here.
+    DuplicateNonce {
+        /// The conversation the duplicate landed in.
+        conversation_id: String,
+        /// The nonce that already exists.
+        client_nonce: String,
+    },
+    /// The cold-segment tier (`BlobStore`) failed.
+    Cold(String),
+}
+
+impl core::fmt::Display for StoreError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            StoreError::CasConflict {
+                message_id,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "CAS conflict on {message_id:?}: expected edited_seq {expected}, found {actual}"
+            ),
+            StoreError::NotFound(id) => write!(f, "message {id:?} not found"),
+            StoreError::DuplicateNonce {
+                conversation_id,
+                client_nonce,
+            } => write!(
+                f,
+                "duplicate client_nonce {client_nonce} in conversation {conversation_id}"
+            ),
+            StoreError::Cold(e) => write!(f, "cold-segment tier error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for StoreError {}
+
+/// The store result alias.
+pub type Result<T> = core::result::Result<T, StoreError>;
+
+/// The outbox co-commit seam (arch §3.1). `append` / `revise` / `tombstone` take the transaction so
+/// the state change and the event are ONE transaction — the trait makes the no-dual-write guarantee
+/// STRUCTURAL (BUS-2). The `chat.message.created` / `.edited` / `.tombstoned` event EMIT through
+/// this transaction is the CHAT-P5 floor (P-399); HERE the state change is staged onto the
+/// transaction (so the co-commit seam exists and an aborted transaction writes neither the message
+/// nor — when CHAT-P5 lands — its event).
+pub type OutboxTx = OutboxTransaction;
+
+/// **The `MessageStore` trait — the hot-engine swap seam (arch §3.1).** The only interface the rest
+/// of Chat sees. PostgreSQL-partitioned is the v1 hot tier ([`pg::PgMessageStore`], `integration`);
+/// the in-memory [`MemHotTier`] is the DB-free behaviour-identical floor; ScyllaDB is the named
+/// measured promotion (CHAT-P28 / P-502). Cold reads are transparent — `range` / `resync_from`
+/// fetch the hot partition or the cold object segment behind THIS interface.
+///
+/// The trait is sync over an in-memory model here (the PG impl wraps its async store on the
+/// harness runtime, the same posture other subsystems take); behaviour across the two tiers is
+/// asserted identical by the unit + integration suites (0 divergence on this surface — the GATE).
+pub trait MessageStore {
+    /// Persist a message (and, in CHAT-P5, its `chat.message.created` outbox row) in ONE
+    /// transaction (BUS-2). The store assigns a k-sortable [`MessageId`] (intrinsic
+    /// per-conversation order). Idempotent on `client_nonce` within a conversation — a retried send
+    /// returns the EXISTING id (the idempotent-send invariant; the full GATE is CHAT-P5). The state
+    /// change is staged onto `tx`; the `chat.message.created` EMIT is the CHAT-P5 floor.
+    fn append(&self, tx: &mut OutboxTx, msg: NewMessage) -> Result<MessageId>;
+
+    /// Ordered range read (arch §3.1): recent-N (open a channel) | scroll-back (paginate) |
+    /// resume-gap ("after cursor X"). Always ascending by `message_id` (per-conversation total
+    /// order). Cold reads are transparent (the hot partition or a cold segment, same interface).
+    fn range(&self, conv: &ConversationId, cursor: RangeCursor, limit: u32)
+        -> Result<Vec<Message>>;
+
+    /// Edit-as-new-version under CAS (arch §3.1, X-2): the `message_id` is STABLE, `edited_seq`
+    /// bumps from `expect_seq`. A CAS mismatch is a [`StoreError::CasConflict`] (a concurrent edit
+    /// clobber is refused, never silent). The `chat.message.edited` emit is CHAT-P5.
+    fn revise(
+        &self,
+        tx: &mut OutboxTx,
+        msg_id: &MessageId,
+        body_inline: Vec<u8>,
+        body_nodes: Vec<u8>,
+        expect_seq: i32,
+    ) -> Result<()>;
+
+    /// Tombstone the record (keep the fact; arch §3.1): the row survives, `state` → `Tombstoned`.
+    /// The body crypto-shred is the GDPR holder's job (CHAT-P6); this records the erasure FACT. The
+    /// `chat.message.tombstoned` emit is CHAT-P5.
+    fn tombstone(
+        &self,
+        tx: &mut OutboxTx,
+        msg_id: &MessageId,
+        reason: TombstoneReason,
+    ) -> Result<()>;
+
+    /// **The resume correctness backbone (arch §1.3 / §3.1; contract 3.5):** everything in `conv`
+    /// strictly after `cursor`, gap-free, ordered. This is what the gateway's frozen
+    /// `resume(stream, scope, last_seq)` backfills from when the firehose retention window is
+    /// exceeded (`resync_required`). A clustering-range read (cold reads transparent).
+    fn resync_from(&self, conv: &ConversationId, cursor: &MessageId) -> Result<Vec<Message>>;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The in-memory hot tier — the DB-free, behaviour-identical floor (the unit-test tier).
+// ---------------------------------------------------------------------------------------------
+
+/// The in-memory hot tier: partitioned by `(tenant, region)` + conversation, residency-pinned, the
+/// per-conversation log a `BTreeMap<MessageId, _>` so the keys (ULIDs) are kept in intrinsic order.
+/// This is the DB-free behaviour-identical floor — the [`MessageStore`] surface here and the PG
+/// surface ([`pg::PgMessageStore`]) are asserted to round-trip IDENTICALLY (the 0-divergence GATE).
+///
+/// The store is residency-pinned STRUCTURALLY: the partition key includes `region`, so a write for
+/// `(tenant, region)` lands ONLY in that region's partition — a read for a different region sees 0
+/// rows (the partition/residency-pin GATE; the PG tier enforces the same at the DB via RLS).
+pub struct MemHotTier {
+    /// The minter for k-sortable message ids (the ordering source — monotone).
+    minter: Box<dyn UlidSource>,
+    /// The partitioned log: `(tenant, region, conversation)` → ordered `message_id` → row.
+    partitions: Mutex<BTreeMap<ConversationId, BTreeMap<MessageId, Message>>>,
+    /// The fs-backed cold-segment tier (the 11.2 fs floor); sealed archived ranges live here.
+    cold: ColdSegments,
+}
+
+impl MemHotTier {
+    /// A fresh hot tier with the deterministic monotone ULID source (the test/floor source) and a
+    /// fresh fs-backed cold tier.
+    pub fn new() -> MemHotTier {
+        MemHotTier::with_source(Box::new(MonotonicUlidSource::new()))
+    }
+
+    /// A fresh hot tier with an explicit ULID source (e.g. the wall-clock [`SystemUlidSource`] in
+    /// production, or a `starting_at` source so two conversations get disjoint ordered id ranges).
+    pub fn with_source(minter: Box<dyn UlidSource>) -> MemHotTier {
+        MemHotTier {
+            minter,
+            partitions: Mutex::new(BTreeMap::new()),
+            cold: ColdSegments::new(),
+        }
+    }
+
+    /// The cold-segment tier (for the seal/restore lifecycle the detach job drives, arch §2.1).
+    pub fn cold(&self) -> &ColdSegments {
+        &self.cold
+    }
+
+    /// **Seal an old `(conversation, range)` to the cold tier (the detach job, arch §2.1).** Every
+    /// message in `conv` strictly BEFORE `up_to` (exclusive) is moved from the hot partition to a
+    /// content-addressed cold segment. Subsequent `range` / `resync_from` reads fetch it back
+    /// transparently — the trait surface is IDENTICAL whether a message is hot or cold (the cold
+    /// transparency property, arch §2.1). Returns the count sealed.
+    pub fn seal_before(&self, conv: &ConversationId, up_to: &MessageId) -> Result<usize> {
+        let mut parts = self.lock();
+        let log = match parts.get_mut(conv) {
+            Some(log) => log,
+            None => return Ok(0),
+        };
+        let to_seal: Vec<MessageId> = log
+            .range(..up_to.clone())
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut sealed = Vec::with_capacity(to_seal.len());
+        for id in &to_seal {
+            if let Some(msg) = log.remove(id) {
+                sealed.push(msg);
+            }
+        }
+        if sealed.is_empty() {
+            return Ok(0);
+        }
+        let n = sealed.len();
+        self.cold.seal(conv, sealed)?;
+        Ok(n)
+    }
+
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, BTreeMap<ConversationId, BTreeMap<MessageId, Message>>> {
+        self.partitions.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The merged, ordered view of a conversation: cold segments (older) followed by the hot tail.
+    /// This is the transparent-cold-read primitive `range` / `resync_from` read against.
+    fn merged_log(&self, conv: &ConversationId) -> Result<Vec<Message>> {
+        let mut out = self.cold.read(conv)?;
+        let parts = self.lock();
+        if let Some(log) = parts.get(conv) {
+            out.extend(log.values().cloned());
+        }
+        // cold is strictly older than hot (the seal moves a prefix), and each tier is already
+        // ULID-ordered, so the concatenation is globally ordered. Re-sort defensively (cheap) so
+        // the total-order invariant holds even if a caller seals out of order.
+        out.sort_by(|a, b| a.message_id.cmp(&b.message_id));
+        Ok(out)
+    }
+}
+
+impl Default for MemHotTier {
+    fn default() -> Self {
+        MemHotTier::new()
+    }
+}
+
+impl MessageStore for MemHotTier {
+    fn append(&self, tx: &mut OutboxTx, msg: NewMessage) -> Result<MessageId> {
+        let mut parts = self.lock();
+        let log = parts.entry(msg.conv.clone()).or_default();
+        // Idempotent-send: a retried send (same nonce in the same conversation) returns the
+        // EXISTING id — a no-op, not a second row (arch §3; the full GATE is CHAT-P5).
+        if let Some(existing) = log
+            .values()
+            .find(|m| m.client_nonce == msg.client_nonce)
+            .map(|m| m.message_id.clone())
+        {
+            return Ok(existing);
+        }
+        let message_id = self.minter.mint();
+        let stored = Message {
+            message_id: message_id.clone(),
+            conv: msg.conv,
+            thread_root_id: msg.thread_root_id,
+            author: msg.author,
+            author_kind: msg.author_kind,
+            body_inline: msg.body_inline,
+            body_nodes: msg.body_nodes,
+            client_nonce: msg.client_nonce,
+            edited_seq: 0,
+            state: MessageState::Active,
+        };
+        log.insert(message_id.clone(), stored);
+        // The outbox co-commit SEAM: stage the state change onto the transaction. The
+        // `chat.message.created` event EMIT through `tx` is the CHAT-P5 floor (P-399).
+        tx.stage_state_change(format!("chat.message.created:{}", message_id.as_str()));
+        Ok(message_id)
+    }
+
+    fn range(
+        &self,
+        conv: &ConversationId,
+        cursor: RangeCursor,
+        limit: u32,
+    ) -> Result<Vec<Message>> {
+        let all = self.merged_log(conv)?;
+        let limit = limit as usize;
+        let out = match cursor {
+            RangeCursor::Recent => {
+                let start = all.len().saturating_sub(limit);
+                all[start..].to_vec()
+            }
+            RangeCursor::Before(id) => {
+                let before: Vec<Message> = all.into_iter().filter(|m| m.message_id < id).collect();
+                let start = before.len().saturating_sub(limit);
+                before[start..].to_vec()
+            }
+            RangeCursor::After(id) => all
+                .into_iter()
+                .filter(|m| m.message_id > id)
+                .take(limit)
+                .collect(),
+        };
+        Ok(out)
+    }
+
+    fn revise(
+        &self,
+        tx: &mut OutboxTx,
+        msg_id: &MessageId,
+        body_inline: Vec<u8>,
+        body_nodes: Vec<u8>,
+        expect_seq: i32,
+    ) -> Result<()> {
+        let mut parts = self.lock();
+        for log in parts.values_mut() {
+            if let Some(msg) = log.get_mut(msg_id) {
+                // The per-message CAS (X-2): a stale `expect_seq` is a refused clobber, not a
+                // silent overwrite.
+                if msg.edited_seq != expect_seq {
+                    return Err(StoreError::CasConflict {
+                        message_id: msg_id.clone(),
+                        expected: expect_seq,
+                        actual: msg.edited_seq,
+                    });
+                }
+                msg.body_inline = body_inline;
+                msg.body_nodes = body_nodes;
+                msg.edited_seq += 1;
+                msg.state = MessageState::Edited;
+                tx.stage_state_change(format!("chat.message.edited:{}", msg_id.as_str()));
+                return Ok(());
+            }
+        }
+        Err(StoreError::NotFound(msg_id.clone()))
+    }
+
+    fn tombstone(
+        &self,
+        tx: &mut OutboxTx,
+        msg_id: &MessageId,
+        _reason: TombstoneReason,
+    ) -> Result<()> {
+        let mut parts = self.lock();
+        for log in parts.values_mut() {
+            if let Some(msg) = log.get_mut(msg_id) {
+                msg.state = MessageState::Tombstoned;
+                // Keep the fact, drop the body. The crypto-shred of the per-subject DEK is the
+                // GDPR holder's job (CHAT-P6); here the body bytes are cleared and the record
+                // survives (order/causality intact for others).
+                msg.body_inline.clear();
+                msg.body_nodes.clear();
+                tx.stage_state_change(format!("chat.message.tombstoned:{}", msg_id.as_str()));
+                return Ok(());
+            }
+        }
+        Err(StoreError::NotFound(msg_id.clone()))
+    }
+
+    fn resync_from(&self, conv: &ConversationId, cursor: &MessageId) -> Result<Vec<Message>> {
+        // The resume-gap read: everything strictly after `cursor`, gap-free, ordered. A clustering
+        // range read across the merged (cold + hot) log.
+        let all = self.merged_log(conv)?;
+        Ok(all.into_iter().filter(|m| &m.message_id > cursor).collect())
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The fs-backed cold-segment tier (contract 11.2 — the BlobStore fs floor).
+// ---------------------------------------------------------------------------------------------
+
+/// **The cold-segment tier (arch §2.1; contract 11.2).** A sealed archived `(conversation, range)`
+/// serialises to a content-addressed [`myelin_storage::BlobStore`] segment (the fs floor); a cold
+/// read = segment fetch + decode. Still range-readable, still crypto-shreddable (destroy the
+/// per-tenant/per-subject DEK — the holder's job). The fs-backed `BlobStore` → object-store swap is
+/// the named M5 follow-on (CHAT-P28 / P-502); the trait makes it a one-line backing swap.
+///
+/// The store keeps the segment hashes per conversation (the PG `(conversation, range → segment)`
+/// index the arch describes) so a cold read fetches the right segments; here that index is an
+/// in-process map (the fs floor models the layout, not a shortcut).
+pub struct ColdSegments {
+    blob: FsBlobStore,
+    /// `conversation` → the content addresses of its sealed segments, oldest-first (the
+    /// `(conversation, range → segment)` index, arch §2.1).
+    index: Mutex<BTreeMap<ConversationId, Vec<ContentHash>>>,
+}
+
+impl ColdSegments {
+    /// A fresh cold tier over a new fs-backed `BlobStore`.
+    pub fn new() -> ColdSegments {
+        ColdSegments {
+            blob: FsBlobStore::new(),
+            index: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Seal a batch of messages (already ULID-ordered) to a content-addressed cold segment. The
+    /// segment is stored in the conversation's tenant keyspace (the per-tenant isolation, §3.2) and
+    /// its address recorded in the cold index. The bytes are the message rows serialised — still
+    /// range-readable on a cold read.
+    fn seal(&self, conv: &ConversationId, messages: Vec<Message>) -> Result<()> {
+        let bytes = encode_segment(&messages);
+        let tenant = TenantId(conv.tenant.clone());
+        let hash = self
+            .blob
+            .put(&tenant, &bytes)
+            .map_err(|e| StoreError::Cold(e.to_string()))?;
+        self.index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(conv.clone())
+            .or_default()
+            .push(hash);
+        Ok(())
+    }
+
+    /// Read all of a conversation's cold segments back, decoded and ULID-ordered (the transparent
+    /// cold read, arch §2.1). Re-hash-on-read integrity is the `BlobStore`'s (a corrupt segment is
+    /// refused, never silently served).
+    fn read(&self, conv: &ConversationId) -> Result<Vec<Message>> {
+        let hashes = {
+            let index = self.index.lock().unwrap_or_else(|e| e.into_inner());
+            match index.get(conv) {
+                Some(h) => h.clone(),
+                None => return Ok(Vec::new()),
+            }
+        };
+        let tenant = TenantId(conv.tenant.clone());
+        let mut out = Vec::new();
+        for hash in &hashes {
+            let bytes = self
+                .blob
+                .get(&tenant, hash)
+                .map_err(|e| StoreError::Cold(e.to_string()))?;
+            out.extend(decode_segment(&bytes)?);
+        }
+        out.sort_by(|a, b| a.message_id.cmp(&b.message_id));
+        Ok(out)
+    }
+}
+
+impl Default for ColdSegments {
+    fn default() -> Self {
+        ColdSegments::new()
+    }
+}
+
+/// Serialise a cold segment: a length-prefixed line-delimited JSON encoding of the message rows.
+/// The content address the `BlobStore` computes is over THESE bytes (plaintext-addressed; the DEK
+/// wrap is CHAT-P6 / P-ST-08, transparent to the address).
+fn encode_segment(messages: &[Message]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    for m in messages {
+        let line = serde_json::to_string(&SegmentRow::from(m)).expect("segment row serialises");
+        buf.extend_from_slice(line.as_bytes());
+        buf.push(b'\n');
+    }
+    buf
+}
+
+/// Decode a cold segment back to message rows.
+fn decode_segment(bytes: &[u8]) -> Result<Vec<Message>> {
+    let mut out = Vec::new();
+    for line in bytes.split(|b| *b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let row: SegmentRow = serde_json::from_slice(line)
+            .map_err(|e| StoreError::Cold(format!("decode segment row: {e}")))?;
+        out.push(row.into());
+    }
+    Ok(out)
+}
+
+// A serde mirror of `Message` for the cold-segment encoding (the domain types deliberately do NOT
+// derive serde — the store is body-opaque; the segment format is the cold tier's private wire).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SegmentRow {
+    message_id: String,
+    tenant: String,
+    region: String,
+    conversation_id: String,
+    thread_root_id: Option<String>,
+    author: String,
+    author_kind: u8,
+    body_inline: Vec<u8>,
+    body_nodes: Vec<u8>,
+    client_nonce: String,
+    edited_seq: i32,
+    state: u8,
+}
+
+impl SegmentRow {
+    fn from(m: &Message) -> SegmentRow {
+        SegmentRow {
+            message_id: m.message_id.0.clone(),
+            tenant: m.conv.tenant.clone(),
+            region: m.conv.region.clone(),
+            conversation_id: m.conv.conversation_id.clone(),
+            thread_root_id: m.thread_root_id.as_ref().map(|t| t.0.clone()),
+            author: m.author.clone(),
+            author_kind: author_kind_code(m.author_kind),
+            body_inline: m.body_inline.clone(),
+            body_nodes: m.body_nodes.clone(),
+            client_nonce: m.client_nonce.clone(),
+            edited_seq: m.edited_seq,
+            state: state_code(m.state),
+        }
+    }
+}
+
+impl From<SegmentRow> for Message {
+    fn from(r: SegmentRow) -> Message {
+        Message {
+            message_id: MessageId(r.message_id),
+            conv: ConversationId {
+                tenant: r.tenant,
+                region: r.region,
+                conversation_id: r.conversation_id,
+            },
+            thread_root_id: r.thread_root_id.map(MessageId),
+            author: r.author,
+            author_kind: author_kind_from_code(r.author_kind),
+            body_inline: r.body_inline,
+            body_nodes: r.body_nodes,
+            client_nonce: r.client_nonce,
+            edited_seq: r.edited_seq,
+            state: state_from_code(r.state),
+        }
+    }
+}
+
+fn author_kind_code(k: AuthorKind) -> u8 {
+    match k {
+        AuthorKind::Human => 0,
+        AuthorKind::Agent => 1,
+        AuthorKind::Service => 2,
+    }
+}
+
+fn author_kind_from_code(c: u8) -> AuthorKind {
+    match c {
+        1 => AuthorKind::Agent,
+        2 => AuthorKind::Service,
+        _ => AuthorKind::Human,
+    }
+}
+
+fn state_code(s: MessageState) -> u8 {
+    match s {
+        MessageState::Active => 0,
+        MessageState::Edited => 1,
+        MessageState::Deleted => 2,
+        MessageState::Tombstoned => 3,
+    }
+}
+
+fn state_from_code(c: u8) -> MessageState {
+    match c {
+        1 => MessageState::Edited,
+        2 => MessageState::Deleted,
+        3 => MessageState::Tombstoned,
+        _ => MessageState::Active,
+    }
+}
+
+#[cfg(test)]
+mod tests;

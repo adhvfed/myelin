@@ -79,6 +79,12 @@ pub mod events;
 pub mod glue;
 pub mod rebac_fragment;
 pub mod replay;
+pub mod store;
 pub mod subs;
 
 pub use replay::{ChatReindexSource, ChatReplayKind};
+pub use store::{
+    AuthorKind, ColdSegments, ConversationId, MemHotTier, Message, MessageId, MessageState,
+    MessageStore, MonotonicUlidSource, NewMessage, OutboxTx, RangeCursor, StoreError,
+    SystemUlidSource, TombstoneReason, UlidSource,
+};

@@ -51,7 +51,35 @@ myelin-notif = { path = "../myelin-notif" }
 serde.workspace = true
 # CHAT replay (EB-27 / P-327, M4): the `ChatReindexSource` snapshot payload is the references-only
 # `serde_json::Value` the Bus's `SnapshotDraft` carries (the durable channel/message/thread re-emit).
+# CHAT-P4 (P-398) ALSO uses serde_json to encode/decode the fs-backed cold-segment wire (the
+# `(conversation, range)` segment the detach job seals to a content-addressed BlobStore object).
 serde_json.workspace = true
+# CHAT-P4 (P-398): the message store's TIERS. The hot tier is partitioned by (tenant, region) +
+# conversation behind the `MessageStore` trait (the swap seam; ScyllaDB is the named M5 promotion,
+# CHAT-P28). The COLD tier seals archived ranges to the content-addressed `FsBlobStore` (contract
+# 11.2 fs floor) — a DB-FREE in-process store, so `cargo build --workspace` stays DB-free. The
+# `TenantId` partition-key newtype + the `BlobStore`/`ContentHash` cold-segment primitives come from
+# here. A consumer LEAF depending on the storage GLUE crate keeps the §2.9 DAG acyclic (nothing
+# depends back on myelin-chat). The REAL Postgres hot tier (`store::pg::PgMessageStore`) is gated
+# behind the `integration` feature below.
+myelin-storage = { path = "../myelin-storage" }
+# CHAT-P4 (P-398): the `(tenant, region)` partition-key types (`TenantId`/`Region`, contract
+# 12.1/12.4) the residency-pinned message partition keys on. Re-exported via myelin-events too, but
+# named directly here for the store's `ConversationId` construction.
+myelin-tenancy = { path = "../myelin-tenancy" }
+# CHAT-P4 (P-398): the REAL Postgres hot-tier client (`store::pg::PgMessageStore`) + the async
+# runtime the integration test drives. OPTIONAL — pulled ONLY by the `integration` feature, so the
+# default `cargo build --workspace` compiles neither (the DB-free build floor, the binding policy).
+sqlx = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+
+[features]
+default = []
+# CHAT-P4 (P-398): pull the REAL Postgres hot tier (`store::pg::PgMessageStore`) + compile the
+# live-backend integration test. Turns on the storage crate's `integration` feature (the real
+# PgStore/BlobStore clients) and the sqlx/tokio clients the integration test drives. The default
+# `cargo build --workspace` compiles NONE of this — the DB-free build floor (the binding policy).
+integration = ["myelin-storage/integration", "dep:sqlx", "dep:tokio"]
 
 [dev-dependencies]
 # The Identity namespace ENGINE — the CDC for contract 4.9 admits chat's RICH fragment (the
@@ -60,8 +88,6 @@ serde_json.workspace = true
 # ships is the names-only carrier `myelin_identity::NamespaceFragment`; the rich form is exercised
 # only by the CDC test), so the production DAG stays acyclic.
 myelin-identity-service = { path = "../myelin-identity-service" }
-myelin-storage = { path = "../myelin-storage" }
-myelin-tenancy = { path = "../myelin-tenancy" }
 # NOTIF-P22 (P-343): the Bus reactive/dispatch tier (contract 3.6 / §4.7) chat's explicit-first
 # boundary (8.6 / CHAT-1) is PROVEN through — the CHAT-D17 drill wires chat's `agent_dispatch_class`
 # decision into the REAL `myelin_query::DispatchTier` and asserts a casual @agent mention →
