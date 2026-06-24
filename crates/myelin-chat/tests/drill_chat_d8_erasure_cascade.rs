@@ -22,23 +22,29 @@
 //! is the CHAT-D8 red drill this forecloses.
 //!
 //! The mention → `[erased user]` half + the restriction-flag suppression at every read path are
-//! asserted in CHAT-D8 via **CHAT-P23 / P-417** (named floor); this drill ships the
-//! 0-recoverable-PII core + the holder-receipt completeness.
+//! the **CHAT-P23 / P-417** unit of CHAT-D8 (the second committable unit of M4-C8). The crypto-shred
+//! core + holder-receipt completeness ship at CHAT-P22; the mention-half + the Art. 18 suppression
+//! are asserted in [`chat_d8_mention_half_renders_erased_user`] +
+//! [`chat_d8_restricted_subject_suppressed_at_every_read_path`] below, within the SAME CHAT-D8 erase
+//! scenario.
 
 use myelin_chat::{
-    encrypt_body, is_body_unrecoverable, AuthorKind, ChatErasureCascade, ChatFreeText,
-    ConversationId, Draft, DraftKey, DraftStore, MemDraftStore, MemHotTier, MessageId,
-    MessageState, MessageStore, NewMessage, RangeCursor, ReadMarker, ReadStateRecord,
-    TombstoneReason, UnfurlCache, CHAT_ERASE_CASCADE_TOKEN,
+    agent_may_read, analytics_eligible, encrypt_body, index_projection_if_allowed,
+    is_body_unrecoverable, notif_may_route, paragraph_body, render_mention, AuthorKind,
+    ChatErasureCascade, ChatFreeText, ChatHolder, ConversationId, Draft, DraftKey, DraftStore,
+    MemDraftStore, MemHotTier, MentionRender, MentionResolver, MessageId, MessageState,
+    MessageStore, NewMessage, RangeCursor, ReadMarker, ReadStateRecord, RestrictionGate,
+    TombstoneReason, UnfurlCache, CHAT_ERASE_CASCADE_TOKEN, ERASED_USER,
 };
 use myelin_events::{
     Actor, CausedBy, EmitContextBase, MonotonicMinter, OutboxStore, OutboxTransaction, Timestamp,
 };
-use myelin_gdpr::{EraseScope, SubjectRef, TenantId as GdprTenantId};
+use myelin_gdpr::{EraseScope, PersonalDataHolder, SubjectRef, TenantId as GdprTenantId};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_storage::encryption::{EncryptedColumn, SubjectId};
 use myelin_storage::kms::{DekId, KeyClass, KmsEngine};
 use myelin_tenancy::{Region, TenantId};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 const SUBJECT: &str = "psn:ada";
@@ -290,6 +296,105 @@ fn chat_d8_cascade_is_bus_only_no_backdoor() {
         outbox.committed_count() - before,
         1,
         "exactly one chat.message.erased on the bus — no backdoor write into Search/Refs/Notif"
+    );
+}
+
+/// The CHAT-D8 pseudonym-map (the 4.8 `resolve_pseudonym` consumer): a live subject id → a display
+/// name; `erase` REMOVES the entry (the crypto-shred), so a resolve of an erased subject yields
+/// `None` — the mention shreds to `[erased user]`.
+struct D8PseudonymMap {
+    live: BTreeSet<String>,
+}
+impl D8PseudonymMap {
+    fn with(ids: &[&str]) -> D8PseudonymMap {
+        D8PseudonymMap {
+            live: ids.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+    fn erase(&mut self, id: &str) {
+        self.live.remove(id);
+    }
+}
+impl MentionResolver for D8PseudonymMap {
+    fn resolve_display_name(&self, mentioned: &Principal) -> Option<String> {
+        self.live
+            .contains(&mentioned.principal_id.0)
+            .then(|| format!("@{}", mentioned.principal_id.0))
+    }
+}
+
+/// **CHAT-D8 (the mention half, CHAT-P23): erasing a MENTIONED subject renders `[erased user]` on
+/// the next render — 0 recoverable mentioned-PII, FREE (the message is never rewritten, 4.8 / arch 05
+/// §5).** A message authored by someone ELSE mentions the subject; the subject's per-subject DEK
+/// shred does NOT touch that message body (it is the author's), but the structured `mention(Principal)`
+/// points at the subject's pseudonymous id → the pseudonym-map shred renders `[erased user]`. This is
+/// the mention half of CHAT-D8 the crypto-shred core (above) does not cover.
+#[test]
+fn chat_d8_mention_half_renders_erased_user() {
+    // The subject is mentioned by another author. Before the erase, the mention resolves a name.
+    let subject_p = Principal::stub(
+        PrincipalId(SUBJECT.into()),
+        PrincipalKind::Human,
+        TenantId("acme".into()),
+    );
+    let mut map = D8PseudonymMap::with(&[SUBJECT, "psn:other"]);
+    assert_eq!(
+        render_mention(&subject_p, &map),
+        MentionRender::Live(format!("@{SUBJECT}")),
+        "before erase: the mention resolves the subject's per-viewer name"
+    );
+
+    // The DSR erase crypto-shreds the subject's pseudonym-map entry (4.8) — the SAME node is not
+    // touched.
+    map.erase(SUBJECT);
+
+    // On the NEXT render the mention shreds to `[erased user]` — 0 recoverable mentioned-PII.
+    let after = render_mention(&subject_p, &map);
+    assert_eq!(after, MentionRender::Erased);
+    assert_eq!(after.display(), ERASED_USER);
+    // A co-mentioned, un-erased subject is UNAFFECTED (per-subject pseudonym shred).
+    let other = Principal::stub(
+        PrincipalId("psn:other".into()),
+        PrincipalKind::Human,
+        TenantId("acme".into()),
+    );
+    assert_eq!(
+        render_mention(&other, &map),
+        MentionRender::Live("@psn:other".into())
+    );
+}
+
+/// **CHAT-D8 (the restriction half, CHAT-P23): a RESTRICTED subject is suppressed at EVERY read path
+/// — 0 processings on a restricted subject (Art. 18, a distinct state from erasure).** The holder's
+/// `restrict` flips the flag the gate reads; indexing / agent-use / notif-routing / analytics all
+/// suppress the subject. The message remains STORED (recoverable by the subject themselves) — this is
+/// restriction, not erasure.
+#[test]
+fn chat_d8_restricted_subject_suppressed_at_every_read_path() {
+    let holder = ChatHolder::new();
+    let gate = RestrictionGate::new(holder.restriction().clone());
+    let body = paragraph_body("a message the restricted subject authored", vec![]);
+
+    // Before restrict: every read path processes the subject's message.
+    assert!(index_projection_if_allowed(&gate, SUBJECT, &body, None).is_some());
+    assert!(agent_may_read(&gate, SUBJECT));
+    assert!(notif_may_route(&gate, SUBJECT));
+    assert!(analytics_eligible(&gate, SUBJECT));
+
+    // Art. 18 restrict — the holder flips the flag.
+    holder.restrict(&subject(), true).expect("restrict on");
+
+    // 0 processings on the restricted subject across EVERY read path.
+    assert!(
+        index_projection_if_allowed(&gate, SUBJECT, &body, None).is_none(),
+        "indexing suppressed (incl. embeddings — the projection is the embedding's source)"
+    );
+    assert!(!agent_may_read(&gate, SUBJECT), "agent-use suppressed");
+    assert!(!notif_may_route(&gate, SUBJECT), "notif-routing suppressed");
+    assert!(!analytics_eligible(&gate, SUBJECT), "analytics suppressed");
+    assert!(
+        gate.suppressed_everywhere(SUBJECT),
+        "the restricted subject is suppressed across ALL read paths (Art. 18 totality)"
     );
 }
 

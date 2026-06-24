@@ -796,6 +796,18 @@ landing = "P-078"
 # pseudonym; consumer: the column parses back through the frozen grammar — 0 raw id) and the
 # live-Postgres at-rest proof crates/myelin-issues/tests/integration_iss_p07_subject_dek.rs (the stored
 # reporter column is a pseudonym, never the raw principal id).
+# P-417 (CHAT-P23, M4-C8): the CHAT CONSUMER half of 4.8 — the mention pseudonym-shred. A structured
+# `mention(Principal)` node carries only the pseudonymous opaque id (never a name, crate::content); the
+# mention RENDER (`myelin_chat::render_mention` over the `MentionResolver` 4.8 `resolve_pseudonym`
+# consumer) resolves it THROUGH the pseudonym map. When the mentioned subject is erased (Identity
+# `erase` crypto-shreds the map entry, 4.8), the SAME (unchanged) node renders `[erased user]` on the
+# next render — FREE (the message body is never rewritten), 0 recoverable mentioned-PII (arch chat
+# 05 §5, the ADR-05 structured-pseudonym payoff). The row stays `deferred` because the
+# `resolve_pseudonym`/`erase` BODY is Identity's P-078; Chat is a CONSUMER of the frozen 4.8 surface.
+# CDC: crates/myelin-chat/tests/cdc_4_8_10_1_chat_mention_shred_restrict.rs (provider: the mention
+# resolves through the map; consumer: after the erase the SAME node renders `[erased user]`). The
+# CHAT-D8 mention-half drill is crates/myelin-chat/tests/drill_chat_d8_erasure_cascade.rs
+# (chat_d8_mention_half_renders_erased_user).
 
 [[contract]]
 row = "4.9"
@@ -2341,6 +2353,17 @@ cdc = [
     # (the chat.message.erased cascade via the bus, never a backdoor). The CHAT-D8 chained
     # 0-recoverable-PII drill is drill_chat_d8_erasure_cascade.rs.
     "crates/myelin-chat/tests/cdc_10_1_11_4_10_4_chat_erase_cascade.rs",
+    # CHAT-P23 / P-417 (M4-C8, the second committable unit) — the CHAT restriction-flag side of 10.1:
+    # the Art. 18 `restrict` flag is now honoured at EVERY Chat read path. PROVIDER:
+    # `myelin_chat::ChatHolder::restrict` flips the per-subject flag; the `myelin_chat::RestrictionGate`
+    # reads the SAME flag. CONSUMER: every Chat read path (indexing / agent-use / notif-routing /
+    # analytics) routes through the ONE `may_process` predicate — a restricted subject is suppressed
+    # across ALL of them (0 processings on a restricted subject, a distinct state from erasure: the
+    # message stays stored). The third-party free-text residual = the ONE posture 10.9/X-7, BY
+    # REFERENCE (myelin_chat::LEGAL_RESIDUAL_FLOOR — never a fifth chat-specific statement). The CHAT-D8
+    # restriction-half drill is drill_chat_d8_erasure_cascade.rs
+    # (chat_d8_restricted_subject_suppressed_at_every_read_path).
+    "crates/myelin-chat/tests/cdc_4_8_10_1_chat_mention_shred_restrict.rs",
 ]
 
 # 10.2 — the classify-derive (five tags + subject_locator, P-GA-07) PLUS the OQ-H worklog extension
