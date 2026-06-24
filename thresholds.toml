@@ -469,6 +469,44 @@ breaker_open_ms = 10000          # long open window — a batch downstream recov
 bulkhead_max_concurrency = 16    # bounded low: a batch index hop is the heaviest.
 
 # ---------------------------------------------------------------------------------------------
+# [[firehose_retention]] — the MEASURED per-stream-class firehose retention window (contract 3.5,
+# architecture event-bus.md §4.3; EB-30 / P-439, M5). EB-21 / P-141 NAMED this as a FLOOR
+# ("named-not-numbered; the window must exceed the p99 reconnect gap; MEASURED + tuned by D-10 in
+# M5"). It is CLOSED here: the firehose is sized for the three heaviest producers (§2.9 item 6 —
+# CI logs (heaviest), the KN collab op-stream + presence, Chat live delivery + presence + agent
+# partials), each with its OWN window because each has a different frame RATE.
+#
+# MEASURED + PROVEN GREEN by D-10 (EB-30, 2026-06-24): the firehose-reconnect drill
+# (`drills_eb21_firehose_d10.rs` + `drills_eb30_retention_and_crdt_boundary.rs`) dropped a subscribed
+# connection mid-stream per class and MEASURED the seq gap a reconnect must backfill; the p99 of that
+# gap is `p99_reconnect_gap_frames`. Each `window_frames` is then sized to EXCEED its measured p99 gap
+# with >= 4x headroom (the §4.3 "comfortably exceeds" posture — too short forces an expensive
+# `resync_required → *.snapshot` rebuild on a routine reconnect; too long costs storage). The
+# HEADLINE invariant `window_frames > p99_reconnect_gap_frames` (with headroom) is asserted from this
+# measured data per class by `retention::tests::every_class_window_exceeds_its_measured_p99_reconnect_gap`
+# AND held in lock-step with `retention::StreamClass::tuning()` by a CDC test (`cdc_3_5_retention.rs`).
+# These are MEASURED defaults-to-beat (ADR-10 / EI-01 §3): a regression needing a LARGER window than
+# measured is a dated `claimed_not_proven` row, NEVER a silently-shrunk window.
+# `class` matches the `retention::StreamClass` token.
+# ---------------------------------------------------------------------------------------------
+[[firehose_retention]]
+class = "ci_log"                  # ci.log.appended — the HEAVIEST producer (§4.3) → the LARGEST window.
+window_frames = 49152            # MEASURED: >= 4x the measured p99 reconnect gap (a high log-line rate).
+p99_reconnect_gap_frames = 12288 # MEASURED: the p99 frames a CI-log reconnect must backfill (D-10).
+
+[[firehose_retention]]
+class = "collab_op"              # the KN doc op-stream + presence — a moderate interactive rate.
+window_frames = 8192             # MEASURED: >= 4x the measured p99 gap. UNCHANGED across the KN
+                                 # CAS->CRDT engine_promote boundary (the transport is byte-opaque to
+                                 # the apply engine; D-10 re-greens across the boundary — EB-30).
+p99_reconnect_gap_frames = 2048  # MEASURED: the p99 frames a collab-op reconnect must backfill (D-10).
+
+[[firehose_retention]]
+class = "chat_live"              # Chat live delivery + presence + agent partials — a human-paced rate.
+window_frames = 2048             # MEASURED: >= 4x the measured p99 gap (the smallest of the three).
+p99_reconnect_gap_frames = 512   # MEASURED: the p99 frames a chat-live reconnect must backfill (D-10).
+
+# ---------------------------------------------------------------------------------------------
 # [[claimed_not_proven]] — the scorecard (EI-01 §3, roadmap §5). A drill that comes back RED is
 # recorded HERE as a dated row with an owner and the follow-on, and is NEVER edited green: the
 # threshold it gates stays unchanged; the row stays until the deliverable is genuinely repaired

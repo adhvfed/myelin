@@ -554,6 +554,14 @@ cdc = [
     # the resume answer + the firehose PORTs (`PresencePush`/`PartialPush`). The CHAT-D16 drill
     # (drill_chat_d16_streaming.rs) proves 0 half-messages on reconnect (driven against `--use-mock`).
     "crates/myelin-chat/tests/cdc_8_3_3_5_chat_presence_streaming.rs",
+    # OWNED-SEAM HARDENING leg — the firehose RETENTION-WINDOW tuning (EB-30 / P-439, M5): EB-21 named
+    # the per-stream-class retention window as a FLOOR; EB-30 CLOSES it with the MEASURED numbers. The
+    # CDC asserts the `thresholds.toml` `[firehose_retention]` rows (the versioned source of truth) are
+    # byte-for-byte the `retention::StreamClass::tuning()` measured numbers, and re-asserts the §4.3
+    # invariant (window > p99 reconnect gap, with headroom) from the recorded file. The D-10 re-green
+    # across the KN CAS->CRDT engine_promote boundary (drills_eb30_retention_and_crdt_boundary.rs)
+    # proves the resume-cursor transport survives the CRDT promotion (0 ops lost).
+    "crates/myelin-events/tests/cdc_3_5_retention.rs",
 ]
 
 # 3.6 reactive/dispatch tier (EB-23 / P-143). OWNED by the Bus; built in myelin-query (the
