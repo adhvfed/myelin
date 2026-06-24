@@ -458,6 +458,20 @@ pub mod ci_cache_scope;
 // clone/bundle class (C3) → sibling P-ST-23.
 pub mod git_shred;
 pub mod gitpack;
+// Object-backed git packs — the local-disk-packs follow-on (P-ST-31 / P-442, contract 11.2, EI-04
+// §3): authoritative git bytes move from node-local disk (P-ST-22 `gitpack`) onto the OBJECT tier
+// (P-ST-30 `replicated_blob` over the object store). Because git packs are addressed THROUGH the
+// `BlobStore` trait (the §3.5 seam DECIDED at M3), the move is a backing SWAP, not a rewrite — the
+// consumer (`GitPackTier`) is byte-for-byte untouched. This module makes the transition a NAMED,
+// testable thing: `object_backed_pack_tier` builds a `GitPackTier<ReplicatedBlobStore<B>>`; the C3
+// CDN clone class (P-ST-23) is wired against the object backing; the GIT-D4 ceiling gate measures
+// the single-node clone-serve ceiling crossing (the trigger, §8 measure-before-shard) + proves the
+// object-backed packs serve clone p99 within budget; STOR-D7 stays green (re-hash-on-read + recover-
+// from-replica carry to the object-backed packs). REUSES gitpack + replicated_blob + cdn — never a
+// parallel store or a second tier (EI-01 §7). FLOOR PROMOTED: the local-disk-packs floor is now its
+// full answer. NAMED-not-built: the object-backed pack-ALGORITHM impl (chunking/delta-base/smart-
+// transport) is co-owned with the Git subsystem M5 deliverable (GIT-P33).
+pub mod object_packs;
 // The outbound push-mirror residency gate SEAM (C6, P-ST-25 / P-255, contract 10.5 consumed + 12.4):
 // Storage FLAGS the residency-boundary crossing of a Git push-mirror — it (a) keeps mirror-source
 // blobs content-addressed + encrypted (REUSES blob + DekContentWrap — never a new store), and (b)
@@ -661,6 +675,11 @@ pub use migration_under_load::{
     MigrationLoadVerdict, MigrationUnderLoad, StepLockMeasure, WriteLoad,
 };
 pub use mirror::{MirrorTelemetry, PushMirrorClass, PushMirrorTarget};
+pub use object_packs::{
+    cdn_over_object_backing, object_backed_pack_tier, place_repo_object_backed,
+    served_from_object_tier, CloneStormLoad, GitD4Ceiling, GitD4Report, ObjectBackedServe,
+    SingleNodeServe,
+};
 pub use olap::{
     OlapApply, OlapDoc, OlapEvent, OlapFrameSignal, OlapIngestError, OlapReadStore, OlapStoreHolder,
 };

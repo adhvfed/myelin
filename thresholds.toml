@@ -174,6 +174,30 @@ lock_wait_p99_max_ms = 500   # STOR-D8: an online step's p99 lock-wait must stay
 downtime_max_ms = 0          # STOR-D8: 0 downtime — an online migration NEVER takes the table offline.
 
 # ---------------------------------------------------------------------------------------------
+# [git_pack_ceiling] — the GIT-D4 clone-serve p99 budget the object-backed-git-packs drill
+# (P-ST-31 / P-442, with Git) asserts against. Drill catalogue row GIT-D4: "Grow a synthetic
+# monorepo until partial-clone/sparse/bitmaps degrade → documented v1 ceiling (GF-4); clone/fetch
+# p99 held below it." (storage.md §3.5 the git object-backing seam STOR-5 — authoritative git bytes
+# move from node-local disk to the object tier; §8 measure-before-shard — the swap is triggered by
+# the MEASURED single-node ceiling, not predicted; EI-04 §3 the explicit sequenced transition.)
+#
+# This is the PROPOSED DEFAULT-TO-BEAT. The clone-serve p99 ceiling is the SINGLE number both halves
+# of the gate are checked against: a SINGLE NODE serving the whole clone storm off one local-disk
+# pack tier CROSSES this p99 as the clone-storm read fan-out grows (the documented single-node
+# ceiling GF-4, the trigger), while the OBJECT-BACKED tier — fanning the same read load across the
+# object tier's serving nodes + the within-EU CDN clone class (content-addressed bundles) — HOLDS the
+# p99 within it (the green half). A clone-serve p99 past this budget on the object-backed packs is a
+# dated `[[claimed_not_proven]]` scorecard row, never a lowered bar (EI-01 §3). Keyed on contract
+# 11.2 (the object-backed pack/delta seam). The object-backed pack-ALGORITHM impl (chunking/delta-
+# base/smart-transport) is co-owned with the Git subsystem M5 deliverable (GIT-P33); CELL-scale
+# re-confirm under WORLD-SCALE clone surge is the M5 F6 surge family (P-ST-35, GIT-D6).
+# ---------------------------------------------------------------------------------------------
+[git_pack_ceiling]
+clone_serve_p99_max_ms = 50  # GIT-D4: the object-backed packs' clone-serve p99 must stay ≤ 50 ms;
+                             # a single node serving the whole storm off local disk CROSSES this as
+                             # the read fan-out grows (the measured trigger for the object-backed swap).
+
+# ---------------------------------------------------------------------------------------------
 # [depth_ceilings] — the causal-depth ceilings the agent-loop guard halts a loop at (SUB-D8).
 # Roadmap §2 item 5: "depth ceilings 12/16". The soft ceiling flags a deepening loop early; the
 # hard ceiling structurally halts it (reads EventEnvelope.depth). These ARE the seed constants in

@@ -127,6 +127,29 @@ impl<B: BlobStore> ReplicatedBlobStore<B> {
     }
 }
 
+impl ReplicatedBlobStore<crate::blob::FsBlobStore> {
+    /// **Drill-only: corrupt ONLY the PRIMARY object node's copy at `hash`** (object-tier bit-rot on
+    /// the primary), leaving the replica copies intact — so the STOR-D7-on-object-backed-packs drill
+    /// can prove a corrupt primary is detected on read and RECOVERED from a verifying replica.
+    /// Returns `true` iff the primary held the object. Not part of the production surface.
+    #[doc(hidden)]
+    pub fn corrupt_primary_for_drill(&self, tenant: &TenantId, hash: &ContentHash) -> bool {
+        self.primary.corrupt_for_drill(tenant, hash)
+    }
+
+    /// **Drill-only: corrupt EVERY copy (primary + all replicas) at `hash`** — so the drill can prove
+    /// the all-copies-corrupt read is REFUSED (0 silent serve), never a silent wrong-bytes serve.
+    /// Returns `true` iff at least one copy held the object to corrupt.
+    #[doc(hidden)]
+    pub fn corrupt_all_for_drill(&self, tenant: &TenantId, hash: &ContentHash) -> bool {
+        let mut any = self.primary.corrupt_for_drill(tenant, hash);
+        for replica in &self.replicas {
+            any |= replica.corrupt_for_drill(tenant, hash);
+        }
+        any
+    }
+}
+
 impl<B: BlobStore> BlobStore for ReplicatedBlobStore<B> {
     fn put(&self, tenant: &TenantId, bytes: &[u8]) -> Result<ContentHash> {
         // Write the SAME content-addressed bytes to the primary AND every replica. The address

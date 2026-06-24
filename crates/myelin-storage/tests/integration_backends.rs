@@ -468,6 +468,155 @@ async fn replicated_object_store_recovers_corrupt_primary_from_replica() {
         .await;
 }
 
+/// **P-ST-31 (P-442) LIVE integration: object-backed git packs against the REAL object store
+/// (RustFS) — the local-disk-packs follow-on, the explicit sequenced transition (EI-04 §3).**
+///
+/// Authoritative git bytes move from node-local disk onto the OBJECT tier: a
+/// `GitPackTier<ReplicatedBlobStore<S3BlobStore>>` puts/serves git objects through the UNCHANGED
+/// `BlobStore` trait, with a PRIMARY object bucket + a REPLICA object bucket underneath — a backing
+/// SWAP, the consumer (`GitPackTier`) untouched. This proves STOR-D7 stays green on the
+/// object-backed packs against the live RustFS dev stack (the binding policy: an object-store
+/// contract ships a real integration test green against the live stack — NOT a mock):
+///  1. a git object is put + got THROUGH the trait against the real object backing (content round-trip);
+///  2. the PRIMARY object bucket's copy is corrupted OUT-OF-BAND (overwritten via the raw client) →
+///     the git-object read re-hashes, detects the mismatch, RECOVERS the correct bytes from the
+///     REPLICA object bucket (0 silent serve), and `blob_recovered_from_replica` fires.
+#[tokio::test]
+async fn object_backed_git_packs_over_real_object_store_recover_corrupt_primary() {
+    use myelin_storage::s3blob::S3BlobStore;
+    use myelin_storage::{
+        object_backed_pack_tier, place_repo_object_backed, GitObjectKind, RepoGitPlacement, RepoId,
+        RepoPlacementStatus, StorageGroup,
+    };
+    use myelin_tenancy::{Region, TenantId};
+
+    let cfg = MyelinConfig::dev();
+    let handle = tokio::runtime::Handle::current();
+
+    let primary_bucket = cfg.s3.bucket.clone();
+    let replica_bucket = format!("{}-replica", cfg.s3.bucket);
+
+    let raw = {
+        let creds = aws_sdk_s3::config::Credentials::new(
+            &cfg.s3.access_key,
+            &cfg.s3.secret_key,
+            None,
+            None,
+            "myelin-dev",
+        );
+        let conf = aws_sdk_s3::config::Builder::new()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new(cfg.s3.region.clone()))
+            .endpoint_url(&cfg.s3.endpoint)
+            .force_path_style(cfg.s3.force_path_style)
+            .credentials_provider(creds)
+            .build();
+        aws_sdk_s3::Client::from_conf(conf)
+    };
+    // Idempotent replica-bucket create (ignore AlreadyOwned/AlreadyExists).
+    let _ = raw.create_bucket().bucket(&replica_bucket).send().await;
+
+    let tenant = TenantId(format!("itest-objpack-{}", std::process::id()));
+    let repo = RepoId::from_token("monorepo");
+    let content =
+        b"fn main() { println!(\"object-backed git packs over real object store\"); }\n".to_vec();
+
+    let primary_s3 = cfg.s3.clone();
+    let mut replica_s3 = cfg.s3.clone();
+    replica_s3.bucket = replica_bucket.clone();
+
+    let (recovered_ok, native_key) = {
+        let handle = handle.clone();
+        let tenant = tenant.clone();
+        let repo = repo.clone();
+        let content = content.clone();
+        let primary_bucket = primary_bucket.clone();
+        let raw = raw.clone();
+        tokio::task::spawn_blocking(move || {
+            // The OBJECT-BACKED pack tier: GitPackTier over a ReplicatedBlobStore fronting primary +
+            // replica S3 object buckets, all behind the UNCHANGED trait — the fs→object swap is the
+            // inner backing, the consumer code is unchanged.
+            let tier = object_backed_pack_tier(
+                tenant.clone(),
+                S3BlobStore::connect(&primary_s3, handle.clone()),
+                vec![S3BlobStore::connect(&replica_s3, handle.clone())],
+            );
+            place_repo_object_backed(
+                &tier,
+                repo.clone(),
+                RepoGitPlacement {
+                    group: StorageGroup::from_token("pack-0"),
+                    region: Region::new(&primary_s3.region),
+                    status: RepoPlacementStatus::Active,
+                },
+            );
+
+            // (1) put + get THROUGH the trait against the REAL object backing (content round-trip).
+            let address = tier
+                .put_object(&repo, GitObjectKind::Blob, &content)
+                .expect("put object through the object tier");
+            assert_eq!(
+                tier.get_object(&repo, &address).expect("clean get"),
+                content,
+                "git object round-trips through the real object-backed tier"
+            );
+
+            // The native (BLAKE3) key the framed object is stored under (same key in both buckets —
+            // content-addressed); reconstruct its S3 key to corrupt it out-of-band.
+            let native = tier
+                .native_addr_for_test(&repo, &address)
+                .expect("native addr");
+            let dh = &native.digest_hex;
+            let (fan, rest) = dh.split_at(2);
+            let native_key = format!("{}/{}/{}/{}", tenant.0, native.algo.tag(), fan, rest);
+
+            // (2) Corrupt ONLY the PRIMARY object bucket's copy out-of-band (the raw client).
+            handle.block_on(async {
+                raw.put_object()
+                    .bucket(&primary_bucket)
+                    .key(&native_key)
+                    .body(aws_sdk_s3::primitives::ByteStream::from(
+                        b"CORRUPTED-PRIMARY-PACK-BYTES".to_vec(),
+                    ))
+                    .send()
+                    .await
+                    .expect("overwrite the primary object with corrupt bytes");
+            });
+
+            // The git-object read RECOVERS the correct bytes from the replica bucket (0 silent serve).
+            let recovered = tier
+                .get_object(&repo, &address)
+                .expect("recovered from the replica object bucket");
+            let recovered_ok =
+                recovered == content && tier.blobs().telemetry().blob_recovered_from_replica() == 1;
+
+            (recovered_ok, native_key)
+        })
+        .await
+        .expect("blocking object-backed git pack task")
+    };
+
+    assert!(
+        recovered_ok,
+        "STOR-D7 on object-backed packs over the REAL object store: a corrupt primary object MUST be \
+         recovered from the replica bucket (0 silent serve), with blob_recovered_from_replica == 1"
+    );
+
+    // Clean up the probe objects in both buckets.
+    let _ = raw
+        .delete_object()
+        .bucket(&primary_bucket)
+        .key(&native_key)
+        .send()
+        .await;
+    let _ = raw
+        .delete_object()
+        .bucket(&replica_bucket)
+        .key(&native_key)
+        .send()
+        .await;
+}
+
 /// **P-ST-28 (P-330) LIVE integration: the C4 trust-scoped CI cache namespaces against the REAL
 /// object store (RustFS).**
 ///
