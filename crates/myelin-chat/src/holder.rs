@@ -343,8 +343,13 @@ impl PersonalDataHolder for ChatHolder {
     /// ([`CHAT_RESIDUAL_POSTURE_REF`], 10.9 / X-7 — never restated Chat-local).
     ///
     /// THIS trait method has no `KmsEngine` / Identity surface in its frozen 10.1 signature, so it
-    /// returns the typed aggregate receipt the live binding (the CHAT-P22 fan-out, which DOES hold
-    /// those dependencies) backs. It is NEVER a panic / `todo!()`.
+    /// returns the typed aggregate receipt the live binding backs. **As of CHAT-P22 / P-411 the
+    /// fan-out BODY is REAL** ([`crate::erase::ChatErasureCascade`] — the per-subject-DEK crypto-shred
+    /// across hot/cold/backups + the `chat.message.erased` cascade + the read-state/drafts/unfurl
+    /// purge + the complete holder-receipt set); the live boot binding holds the `KmsEngine` + the
+    /// stores + the outbox the cascade needs and produces THIS aggregate receipt via
+    /// [`crate::erase::aggregate_receipt`]. This trait-surface method (no deps in its signature)
+    /// remains the typed receipt the DSR orchestrator drives through; it is NEVER a panic / `todo!()`.
     fn erase(&self, scope: EraseScope) -> DsrResult<EraseReceipt> {
         let (subject_id, tenant) = match &scope {
             EraseScope::Subject { subject, tenant } => {

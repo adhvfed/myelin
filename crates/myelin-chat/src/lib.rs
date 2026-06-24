@@ -47,7 +47,15 @@
 //!   pseudonymous `Identifier`/`Pseudonymise`.
 //! - [`holder`] — **CHAT-P6 / P-400**: the Chat `PersonalDataHolder` (H5; contract 10.1 / 1.4),
 //!   auto-registered over the Chat store through the harness ONE door; `locate`/`export` typed,
-//!   `restrict` wired, `erase` stubbed to crypto-shred naming its CHAT-P22 fan-out.
+//!   `restrict` wired. The `erase` fan-out BODY is **CHAT-P22 / P-411** ([`erase`]).
+//! - [`erase`] — **CHAT-P22 / P-411**: the Chat GDPR erase fan-out (the holder's erase BODY) — the
+//!   author per-subject-DEK crypto-shred across hot/cold/backups (contract 11.4; 0 recoverable PII),
+//!   the `chat.message.erased` tombstone cascade via the OUTBOX (2.7 / the DSR fan-out 10.4, never a
+//!   backdoor), the read-state/drafts/unfurl-cache purge, the COMPLETE per-store holder-receipt set
+//!   (10.1; 0 holders missed), and the destroyed-key epoch driving post-restore re-erasure (10.8) —
+//!   CHAT-D8. The mention pseudonym-shred (→ `[erased user]`) + the Art. 18 restriction-flag
+//!   suppression at every read path + the LEGAL free-text residual are the named CHAT-P23 / P-417
+//!   floor; the residual is the ONE platform posture (10.9 / X-7), BY REFERENCE.
 //! - [`replay`] — **EB-27 / P-327** (skeleton confirmed at CHAT-P6): chat's `replay(scope, since)`
 //!   re-emits `chat.{channel,message,thread}.snapshot` through the OUTBOX (contract 2.6); full
 //!   Search/Refs/Notif replay PARITY is the CHAT-P21 floor.
@@ -140,6 +148,7 @@ pub mod composer;
 pub mod content;
 pub mod conversation;
 pub mod dek;
+pub mod erase;
 pub mod events;
 pub mod glue;
 pub mod holder;
@@ -167,6 +176,10 @@ pub use conversation::{
     Membership, MembershipRole,
 };
 pub use dek::{decrypt_body, encrypt_body, plaintext_at_rest, subject_dek_erasure, ChatFreeText};
+pub use erase::{
+    aggregate_receipt, is_body_unrecoverable, ChatEraseReport, ChatErasureCascade, StoreReceipt,
+    CHAT_ERASE_CASCADE_TOKEN,
+};
 pub use holder::{
     chat_store_classifier, register_chat_holders, ChatHolder, ChatStoreClass, RestrictionFlag,
     CHAT_OLTP_STORE, CHAT_RESIDUAL_POSTURE_REF,
@@ -183,9 +196,9 @@ pub use read_state::{
 };
 pub use replay::{ChatReindexSource, ChatReplayKind};
 pub use store::{
-    AuthorKind, ColdSegments, ConversationId, MemHotTier, Message, MessageId, MessageState,
-    MessageStore, MonotonicUlidSource, NewMessage, OutboxTx, RangeCursor, StoreError,
-    SystemUlidSource, TombstoneReason, UlidSource,
+    emit_erased_tombstone, AuthorKind, ColdSegments, ConversationId, MemHotTier, Message,
+    MessageId, MessageState, MessageStore, MonotonicUlidSource, NewMessage, OutboxTx, RangeCursor,
+    StoreError, SystemUlidSource, TombstoneReason, UlidSource,
 };
 pub use unfurl::{
     filter_candidates_by_class, precompute_visibility_class, AuthzVisibleIndex, Card,

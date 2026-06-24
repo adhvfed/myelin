@@ -287,6 +287,19 @@ impl UnfurlCache {
     pub fn contains(&self, ref_: &ArtifactRef) -> bool {
         self.entries.lock().unwrap().contains_key(&ref_.0)
     }
+
+    /// **Clear EVERY entry (the GDPR erase-fan-out purge, CHAT-P22 / CHAT-D8).** A subject's erasure
+    /// busts the whole short-TTL projection cache so the next render re-resolves LIVE — the cache
+    /// holds no durable PII snapshot (each entry is a viewer-independent, content-addressed
+    /// projection re-fetched from source), so clearing it is the correct, fail-safe purge (the
+    /// erasure-safe re-render, CHAT-D6: the next render gets a tombstone, never stale PII). Returns
+    /// the count cleared.
+    pub fn clear(&self) -> usize {
+        let mut entries = self.entries.lock().unwrap();
+        let n = entries.len();
+        entries.clear();
+        n
+    }
 }
 
 // ───────────────────────────── the Unfurl Service (the orchestration; §4) ────────────────────────

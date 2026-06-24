@@ -365,6 +365,12 @@ status = "covered"
 cdc = [
     "crates/myelin-events/tests/cdc_2_7_bus_holder.rs",
     "crates/myelin-chat/tests/cdc_5_9_2_7_chat_unfurl_invalidation.rs",
+    # CHAT-P22 / P-411 (M4-C8): the Chat erase fan-out PRODUCER of the chat.message.erased *.erased
+    # tombstone — the cascade emits one per record the erased subject authored through the OUTBOX (the
+    # cross-cutting erasure tombstone that drives the Search/Refs/Notif DSR cascade). PROVIDER: the
+    # cascade puts the tombstones on the bus. CONSUMER: a derivative-facing reader counts exactly those
+    # *.erased events (the no-backdoor reach).
+    "crates/myelin-chat/tests/cdc_10_1_11_4_10_4_chat_erase_cascade.rs",
 ]
 
 [[contract]]
@@ -2227,6 +2233,15 @@ cdc = [
     # the erased subject; another principal's markers untouched). The live REAL-Postgres purge leg is
     # integration_chat_p16_read_state.rs.
     "crates/myelin-chat/tests/cdc_7_2_10_1_chat_read_state.rs",
+    # CHAT-P22 / P-411 (M4-C8) — the CHAT erase BODY of 10.1: the Chat erase fan-out
+    # (myelin_chat::ChatErasureCascade) is now REAL (the CHAT-P6 stub's named floor, filled). PROVIDER:
+    # the fan-out produces a COMPLETE per-store holder-receipt set (one per registered Chat store, 0
+    # missed) + the aggregate EraseReceipt the frozen 10.1 erase(scope) returns, content-addressed.
+    # CONSUMER: the DSR-orchestrator asserts the set is complete + the aggregate folds the destroyed-key
+    # epoch (the 10.8 post-restore re-erase trail). Pairs 10.1 + 11.4 (the per-subject-DEK shred) + 10.4
+    # (the chat.message.erased cascade via the bus, never a backdoor). The CHAT-D8 chained
+    # 0-recoverable-PII drill is drill_chat_d8_erasure_cascade.rs.
+    "crates/myelin-chat/tests/cdc_10_1_11_4_10_4_chat_erase_cascade.rs",
 ]
 
 # 10.2 — the classify-derive (five tags + subject_locator, P-GA-07) PLUS the OQ-H worklog extension
@@ -2280,6 +2295,12 @@ cdc = [
     # backups + search + refs + bus + cache/CDN + erasure ledger) — GIT-D2 complete. The same CDC file
     # pins the per-holder fan-out drive shape the orchestrator takes for H1.
     "crates/myelin-git/tests/cdc_10_1_10_4_git_holder.rs",
+    # CHAT-P22 / P-411 (M4-C8) — the CHAT side of 10.4: the Chat erase fan-out emits a
+    # chat.message.erased tombstone per authored record through the OUTBOX (the bus + DSR path);
+    # Search (incl. embeddings) / Refs / Notif consume those tombstones — Chat NEVER writes their
+    # stores (0 backdoor erasure paths). PROVIDER: the cascade publishes the tombstones. CONSUMER: a
+    # derivative-facing reader sees exactly those events on the bus (the only cross-subsystem effect).
+    "crates/myelin-chat/tests/cdc_10_1_11_4_10_4_chat_erase_cascade.rs",
 ]
 
 # 10.5 — the retention engine + consent + sub-processor + legal-hold + the transfer gate. The
@@ -2588,6 +2609,13 @@ cdc = [
     "crates/myelin-ci-controlplane/tests/cdc_11_2_11_4_ci_artifact_cache.rs",
     "crates/myelin-issues/tests/cdc_4_8_11_4_issues_pseudonym_dek.rs",
     "crates/myelin-chat/tests/cdc_11_4_10_1_chat_body_dek_holder.rs",
+    # CHAT-P22 / P-411 (M4-C8): the CHAT erase-fan-out consumer of 11.4 — the Chat erase fan-out
+    # (myelin_chat::ChatErasureCascade) destroys the erased subject's per-subject body/draft DEK over
+    # the ONE KmsEngine so every body they authored is unrecoverable ciphertext in hot + cold +
+    # backups (the GD-4 individual lever — another subject's distinct DEK untouched), the shredded DEK
+    # excluded from the backup snapshot (§7.5). PROVIDER: the cascade destroys the DEK. CONSUMER: a
+    # read-side finds 0 recoverable for the erased subject, the other subject recoverable.
+    "crates/myelin-chat/tests/cdc_10_1_11_4_10_4_chat_erase_cascade.rs",
 ]
 # P-365 (CI-P22, M4): the CI CONTROL-PLANE consumer of the per-subject-vs-per-tenant DEK selection
 # (11.4) for isolable inline log PII (Storage C1). `select_log_segment_dek` composes the FROZEN

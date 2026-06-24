@@ -319,6 +319,24 @@ fn emit_message_event(
     Ok(())
 }
 
+/// **Emit a `chat.message.erased` tombstone for a record the GDPR erase fan-out reached (CHAT-P22 /
+/// P-411, contract 2.7 / 10.4).** The cascade ([`crate::erase::ChatErasureCascade`]) calls this to put
+/// the cross-cutting `*.erased` tombstone on the OUTBOX for EVERY record the erased subject authored —
+/// the bus + DSR cascade Search/Refs/Notif consume. This is decoupled from the hot-tier
+/// [`MessageStore::tombstone`] record-mutation so the cascade reaches records that have already been
+/// sealed to a COLD segment too (the body is already crypto-shredded by the per-subject-DEK destroy
+/// regardless of tier; the tombstone records the FACT + drives the derivative cascade). The author is
+/// the erased subject's pseudonym (references-only — never the body, which is shredded).
+pub fn emit_erased_tombstone(
+    tx: &mut OutboxTx,
+    conv: &ConversationId,
+    message_id: &MessageId,
+    author: &str,
+) -> Result<()> {
+    tx.stage_state_change(format!("chat.message.erased:{}", message_id.as_str()));
+    emit_message_event(tx, CHAT_MESSAGE_ERASED, conv, message_id, author, None)
+}
+
 /// **The `MessageStore` trait — the hot-engine swap seam (arch §3.1).** The only interface the rest
 /// of Chat sees. PostgreSQL-partitioned is the v1 hot tier ([`pg::PgMessageStore`], `integration`);
 /// the in-memory [`MemHotTier`] is the DB-free behaviour-identical floor; ScyllaDB is the named
