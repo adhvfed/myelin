@@ -421,6 +421,10 @@
 
 pub mod backup;
 pub mod blob;
+// The object-store BlobStore's replica-recovery read path (P-ST-30 / global P-441): the STOR-D7
+// "recover from a replica" property added at the object tier, backing-agnostic over the
+// unchanged BlobStore trait (the fs floor in CI, the live S3BlobStore in the integration test).
+pub mod replicated_blob;
 // The within-EU CDN clone/bundle blob class (C3, P-ST-23 / P-254, contract 11.2-C3 + 12.4): a
 // content-addressed blob CLASS over the UNCHANGED `BlobStore` trait (a tag + an eligible-edge-set
 // policy, NOT a new store — EI-01 §7) for hot-repo/clone-storm acceleration. The content-address
@@ -672,6 +676,7 @@ pub use reerase::{
     CellKillRestore, CellKillRtoReport, ErasureRecord, InMemoryPostPitLedger,
     PostRestoreErasureLedger, ReErasePass, ReEraseReport, ReErasedSubject, RtoGrain,
 };
+pub use replicated_blob::{ReplicaTelemetry, ReplicatedBlobStore};
 pub use reserve_settle::{
     CostEvent, CostLedger, MeteredUnit, MinorUnits, Reservation, ReservationState, ReserveError,
     ReserveSettleSignal, RunId, SettleError, SettleOutcome,

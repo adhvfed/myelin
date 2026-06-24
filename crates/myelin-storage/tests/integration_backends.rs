@@ -335,6 +335,139 @@ async fn git_pack_tier_over_real_object_store_roundtrips_and_detects_corruption(
         .await;
 }
 
+/// **P-ST-30 (P-441) LIVE integration: the object-store BlobStore replica recovery against the
+/// REAL object store (RustFS).**
+///
+/// The fs→object swap is a BACKING change: [`ReplicatedBlobStore`] fronts a PRIMARY
+/// [`S3BlobStore`] with a REPLICA [`S3BlobStore`] (a second RustFS bucket), all behind the
+/// UNCHANGED `BlobStore` trait. This proves the STOR-D7 "recover from a replica" property on the
+/// REAL object store (the binding policy: an object-store contract ships a real integration test
+/// green against the live stack — NOT a mock):
+///  1. a put writes the SAME content-addressed bytes to the primary AND replica buckets;
+///  2. a clean get round-trips through the trait against the real buckets;
+///  3. the PRIMARY object is corrupted OUT-OF-BAND (overwritten with wrong bytes via the raw
+///     client) → the get re-hashes, detects the mismatch, RECOVERS the correct bytes from the
+///     REPLICA bucket (0 silent serve), heals the primary, and `blob_recovered_from_replica`
+///     fires;
+///  4. a second get serves cleanly from the HEALED primary (no further recovery).
+#[tokio::test]
+async fn replicated_object_store_recovers_corrupt_primary_from_replica() {
+    use myelin_storage::s3blob::S3BlobStore;
+    use myelin_storage::{BlobStore, ReplicatedBlobStore};
+    use myelin_tenancy::TenantId;
+
+    let cfg = MyelinConfig::dev();
+    let handle = tokio::runtime::Handle::current();
+
+    // The replica lives in a SECOND bucket on the same RustFS (a distinct backing). Create it if
+    // absent (idempotent). The primary bucket is the dev default (already created by the stack).
+    let primary_bucket = cfg.s3.bucket.clone();
+    let replica_bucket = format!("{}-replica", cfg.s3.bucket);
+
+    let raw = {
+        let creds = aws_sdk_s3::config::Credentials::new(
+            &cfg.s3.access_key,
+            &cfg.s3.secret_key,
+            None,
+            None,
+            "myelin-dev",
+        );
+        let conf = aws_sdk_s3::config::Builder::new()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new(cfg.s3.region.clone()))
+            .endpoint_url(&cfg.s3.endpoint)
+            .force_path_style(cfg.s3.force_path_style)
+            .credentials_provider(creds)
+            .build();
+        aws_sdk_s3::Client::from_conf(conf)
+    };
+    // Idempotent replica-bucket create (ignore AlreadyOwned/AlreadyExists).
+    let _ = raw.create_bucket().bucket(&replica_bucket).send().await;
+
+    let tenant = TenantId(format!("itest-repl-{}", std::process::id()));
+    let content = b"replicated-object-store-trustworthy-bytes".to_vec();
+
+    let primary_s3 = cfg.s3.clone();
+    let mut replica_s3 = cfg.s3.clone();
+    replica_s3.bucket = replica_bucket.clone();
+
+    let (recovered_ok, healed_ok, native_key) = {
+        let handle = handle.clone();
+        let tenant = tenant.clone();
+        let content = content.clone();
+        let primary_bucket = primary_bucket.clone();
+        let raw = raw.clone();
+        tokio::task::spawn_blocking(move || {
+            // Primary + replica S3 backings behind the UNCHANGED trait, fronted by the replicated
+            // store — the fs→object swap is the inner backing, the recovery code is unchanged.
+            let store = ReplicatedBlobStore::new(
+                S3BlobStore::connect(&primary_s3, handle.clone()),
+                vec![S3BlobStore::connect(&replica_s3, handle.clone())],
+            );
+
+            // (1)+(2) put writes both buckets; a clean get round-trips through the trait.
+            let h = store.put(&tenant, &content).expect("replicated put");
+            assert_eq!(store.get(&tenant, &h).expect("clean get"), content);
+
+            // The S3 key the bytes are stored under (same key in both buckets — content-addressed).
+            let dh = &h.digest_hex;
+            let (fan, rest) = dh.split_at(2);
+            let native_key = format!("{}/{}/{}/{}", tenant.0, h.algo.tag(), fan, rest);
+
+            // (3) Corrupt ONLY the PRIMARY bucket's object out-of-band (the raw client).
+            handle.block_on(async {
+                raw.put_object()
+                    .bucket(&primary_bucket)
+                    .key(&native_key)
+                    .body(aws_sdk_s3::primitives::ByteStream::from(
+                        b"CORRUPTED-PRIMARY-BYTES".to_vec(),
+                    ))
+                    .send()
+                    .await
+                    .expect("overwrite the primary object with corrupt bytes");
+            });
+
+            // The get RECOVERS the correct bytes from the replica bucket (0 silent serve).
+            let recovered = store.get(&tenant, &h).expect("recovered from replica");
+            let recovered_ok =
+                recovered == content && store.telemetry().blob_recovered_from_replica() == 1;
+
+            // (4) The primary was HEALED: a second get serves cleanly, no further recovery.
+            let healed = store.get(&tenant, &h).expect("healed primary read");
+            let healed_ok =
+                healed == content && store.telemetry().blob_recovered_from_replica() == 1;
+
+            (recovered_ok, healed_ok, native_key)
+        })
+        .await
+        .expect("blocking replicated S3 task")
+    };
+
+    assert!(
+        recovered_ok,
+        "STOR-D7 on the REAL object store: a corrupt primary MUST be recovered from the replica \
+         bucket (0 silent serve), with blob_recovered_from_replica == 1"
+    );
+    assert!(
+        healed_ok,
+        "the primary MUST be healed from the replica (a second read serves without re-recovery)"
+    );
+
+    // Clean up the probe objects in both buckets.
+    let _ = raw
+        .delete_object()
+        .bucket(&primary_bucket)
+        .key(&native_key)
+        .send()
+        .await;
+    let _ = raw
+        .delete_object()
+        .bucket(&replica_bucket)
+        .key(&native_key)
+        .send()
+        .await;
+}
+
 /// **P-ST-28 (P-330) LIVE integration: the C4 trust-scoped CI cache namespaces against the REAL
 /// object store (RustFS).**
 ///
