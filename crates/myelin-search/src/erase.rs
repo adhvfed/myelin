@@ -171,6 +171,17 @@ impl SearchEraseHolder {
         )
     }
 
+    /// **How many live docs does `subject` currently reference in the `(tenant, region)` index?** Uses
+    /// the SAME [`SubjectMatcher`] (one matcher, no drift, §4.8) the locate/erase ops share — so the
+    /// restore-verify gate's resurrected-doc probe (SRCH-P28) reads exactly the set `erase_subject` would
+    /// purge. 0 = the subject references no live doc (already erased / never present). PII-free.
+    pub fn locate_doc_count(&self, subject: &SubjectRef, tenant: &TenantId) -> usize {
+        let matcher = Self::matcher(subject, tenant);
+        self.indexer
+            .locate_subject(tenant, &self.region, &matcher)
+            .len()
+    }
+
     /// **Is `subject` restricted in `tenant` (§4.8 `restrict`)?** The query/RAG path consults this — a
     /// restricted subject is not surfaced. PII-free (opaque ids).
     pub fn is_restricted(&self, tenant: &TenantId, subject_id: &str) -> bool {

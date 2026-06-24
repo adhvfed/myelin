@@ -448,6 +448,20 @@ impl IndexRegistry {
             None => false,
         }
     }
+
+    /// The LIVE (non-tombstoned) vector count in the `(tenant, region)` index — the doc↔vector parity
+    /// half of the restore-verify gate (SRCH-D9) reads this. An absent partition has none.
+    fn live_vector_count(&self, tenant: &TenantId, region: &Region) -> usize {
+        let pk = PartKey {
+            tenant: tenant.clone(),
+            region: region.clone(),
+        };
+        let guard = self.indices.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.get(&pk) {
+            Some(be) => be.vectors().live_len(),
+            None => 0,
+        }
+    }
 }
 
 /// Why the indexer could not project an event into the index. A `Malformed` event (a missing
@@ -633,6 +647,15 @@ impl IncrementalIndexer {
     /// 0-orphan-after-compact GATE reads this (SRCH-D4: 0 recoverable incl. vectors). Tenant-first.
     pub fn has_orphan_embedding(&self, tenant: &TenantId, region: &Region) -> bool {
         self.registry.has_orphan_embedding(tenant, region)
+    }
+
+    /// **The LIVE (non-tombstoned) vector count in the `(tenant, region)` index.** The doc↔vector parity
+    /// leg of the SRCH-D9 restore-verify gate reads this: after a restore + reindex-from-source, the live
+    /// semantic-doc count and the live vector count must AGREE (no row↔doc↔vector mismatch — an indexed
+    /// doc whose vector is missing, or a vector with no live doc, is the corruption the gate catches).
+    /// Tenant-first.
+    pub fn live_vector_count(&self, tenant: &TenantId, region: &Region) -> usize {
+        self.registry.live_vector_count(tenant, region)
     }
 
     /// **Wipe the `(tenant, region)` index (the cold-rebuild precondition — §4.9 / SRCH-D5).** Destroys
