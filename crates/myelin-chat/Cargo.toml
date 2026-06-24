@@ -35,6 +35,17 @@ myelin-events = { path = "../myelin-events" }
 # 4.9). A consumer LEAF depending on the identity GLUE crate (NOT the service) keeps the §2.9 DAG
 # acyclic — `substrate_is_root()` / `identity_is_sink()` are unaffected.
 myelin-identity = { path = "../myelin-identity" }
+# CHAT-P19 (P-414, M4-C6): the FROZEN agent-fabric trait/value crate — `ToolDef`/`ToolName`/
+# `EffectKind`/`ToolSurface`/`EffectApi`/`DryRun`/`ProposedEffect`/`EffectResult`/`RunCtx` (contracts
+# 8.1/8.2/8.7). Chat's agent ToolDef set is data over these frozen types; the routing-split safety
+# boundary is enforced by `effect_kind = Mutate` (route via `EffectApi`, never `ToolHands::exec`).
+# `myelin-agent` is a LEAF trait crate (the signature-only half, AG-P1); a consumer LEAF depending on
+# it keeps the §2.9 DAG acyclic (nothing depends back on `myelin-chat`). Chat does NOT depend on
+# `myelin-agent-service` (the engine) — that crate depends on `myelin-chat` for the ReBAC fragment, so
+# depending back would invert the DAG; the chat tool DEFINITIONS + the routing split live HERE on the
+# trait crate, the plan-then-apply ENGINE stays in the fabric (X-6: chat owns the tool defs, not a
+# second sandbox/budget).
+myelin-agent = { path = "../myelin-agent" }
 # CHAT-P2 (P-244): the one Refs `#sub` grammar + the `mint`/`SubKindRegistration` codec chat
 # registers its `message-`/`thread-` mints with (contract 5.7). Refs owns the grammar; chat mints.
 myelin-refs = { path = "../myelin-refs" }

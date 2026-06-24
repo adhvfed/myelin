@@ -162,6 +162,7 @@ pub mod replay;
 pub mod schema;
 pub mod store;
 pub mod subs;
+pub mod tools;
 pub mod unfurl;
 
 pub use composer::{
