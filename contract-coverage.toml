@@ -1394,12 +1394,21 @@ title = "query(ast, viewer, zookie?, page) -> RankedResults"
 # `escalate_to_search`. The Issues-side CDC proves the cost-bounder's escalation conjoins the SAME
 # filter over the LIVE engine (SECRET absent, one conjoin) — crates/myelin-issues/tests/
 # cdc_6_1_issues_tier3_escalation.rs.
+# CHAT-P12/P-406 (M4) adds the CHAT COMPOSER CONSUMER half: the `@`/`#` autocomplete
+# (`myelin_chat::composer::AutocompletePort`) is Search-backed — there is 0 chat-private mention/
+# artifact index. The chat-side adapter routes EVERY autocomplete query through the ACL-conjoining
+# `myelin_search::query` surface, so a `#`-suggestion for a confidential artifact never reaches the
+# composer (excluded by the conjoined `list_objects` `Filter` BEFORE the picker — not in the rows, not
+# in the count; one list_objects, no N+1). The chat consumer CDC proves the real Search surface
+# satisfies the port (leak-free, then a grant makes the artifact appear) — crates/myelin-chat/tests/
+# cdc_6_1_chat_autocomplete.rs.
 status = "covered"
 cdc = [
     "crates/myelin-search/tests/cdc_query_pipeline_6_1.rs",
     "crates/myelin-knowledge/tests/cdc_6_3_6_1_6_2_knowledge_search_feed.rs",
     "crates/myelin-search/tests/cdc_tier3_valve_6_1.rs",
     "crates/myelin-issues/tests/cdc_6_1_issues_tier3_escalation.rs",
+    "crates/myelin-chat/tests/cdc_6_1_chat_autocomplete.rs",
 ]
 
 [[contract]]
