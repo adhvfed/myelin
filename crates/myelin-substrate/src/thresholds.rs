@@ -148,6 +148,12 @@ pub struct Thresholds {
     /// named in P-S16 / P-033 is CLOSED by this row set.
     #[serde(default)]
     pub resilient_client: Vec<ResilientTargetRow>,
+    /// The column-store / time-series promotion seam (BUS-6; event-bus §7.5; P-440 / EB-31, M5). The
+    /// MEASUREMENT GATE — not a build — that promotes a durable stream to a ClickHouse-class column
+    /// tier (behind the unchanged `BusTransport` trait, contract 2.1). `#[serde(default)]` so an older
+    /// thresholds file (pre-P-440) still parses against the §7.5 seed.
+    #[serde(default)]
+    pub column_store_seam: ColumnStoreSeam,
     /// The scorecard: drills that came back red live here, never edited green (EI-01 §3).
     #[serde(default)]
     pub claimed_not_proven: Vec<ClaimedNotProven>,
@@ -306,6 +312,82 @@ impl Default for OnlineMigration {
             lock_wait_p99_max_ms: 500,
             downtime_max_ms: 0,
         }
+    }
+}
+
+/// The column-store / time-series promotion seam (BUS-6; event-bus §7.5; P-440 / EB-31, M5).
+///
+/// The highest-volume durable streams keep a seam for a column-store / time-series engine
+/// (ClickHouse-class, aligning with the OLAP read store, ADR-10) **behind the unchanged
+/// `BusTransport` trait** (contract 2.1 — `put`/`consume`/`ack`/`purge`, so the swap is a relay-target
+/// change, never a consumer rewrite). The canonical posture (event-bus §7.5, EI-04 §5.2) is
+/// **specified-not-built**: *do not add the column tier before the volume is MEASURED.* Until a
+/// per-stream volume is measured to outgrow the JetStream tier at degraded latency, the 90-day-hot log
+/// + the OLAP long-term holder suffice.
+///
+/// This struct records the **measurement gate**, not a build: the per-stream throughput threshold +
+/// the degraded-latency criterion that, IF a real stream is MEASURED to cross BOTH, owes a promotion
+/// follow-on prompt (post-M5, measured-not-predicted). The SHAPE is frozen here (P-440); the NUMBERS
+/// are the §7.5 promotion-criterion seeds — a stream is a promotion CANDIDATE iff its measured sustained
+/// publish rate exceeds `promote_events_per_sec_per_stream` AND, at that rate, the JetStream tier serves
+/// it at a per-aggregate publish-latency p99 over `degraded_publish_latency_p99_ms` (degraded). Neither
+/// is a value to "beat": it is the threshold that, once a real measurement crosses it, FLIPS the seam
+/// from named-not-built to owed-a-build (the gate is the promotion trigger, EI-04 §5.2).
+///
+/// `promotion_owed` records whether any production stream has been MEASURED to cross both criteria. It
+/// is `false` at this commit — **no production volume has been measured to outgrow JetStream**, so the
+/// seam stays NAMED, no build is owed (the honest state, EI-01 §3: a seam is not a floor with a dated
+/// follow-on until a measurement makes it one).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnStoreSeam {
+    /// The measured sustained per-stream publish rate (events/sec on a SINGLE durable stream) above
+    /// which a stream becomes a column-tier promotion CANDIDATE. A stream below this stays on the
+    /// JetStream tier (§7.5: the hot log + OLAP holder suffice). MEASURED-not-predicted: this is the
+    /// criterion a real measurement is compared against, never a value the platform tunes toward.
+    pub promote_events_per_sec_per_stream: u64,
+    /// The per-aggregate publish-latency p99, in MILLISECONDS, above which the JetStream tier is judged
+    /// DEGRADED at the candidate stream's volume — the SECOND half of the promotion trigger. A candidate
+    /// stream is promoted ONLY if, at its measured rate, the tier's measured publish-latency p99 crosses
+    /// this (volume alone is not enough — the tier must be measurably degraded, EI-04 §5.2).
+    pub degraded_publish_latency_p99_ms: u64,
+    /// Whether a production stream has been MEASURED to cross BOTH criteria (volume AND degraded
+    /// latency) → a build is owed. `false` at this commit: no measured volume outgrows JetStream, so the
+    /// seam stays specified-not-built (no dated follow-on prompt is owed until a measurement flips this).
+    pub promotion_owed: bool,
+}
+
+impl Default for ColumnStoreSeam {
+    /// The §7.5 promotion-criterion seeds. A durable JetStream stream sustaining over 50 000 events/sec
+    /// AND served at a per-aggregate publish-latency p99 over 100 ms at that rate is a promotion
+    /// candidate (the column tier is then owed, behind the unchanged `BusTransport`). Neither number is
+    /// "beaten" — they are the thresholds a real measurement is compared against. `promotion_owed` is
+    /// `false`: no production volume has been measured to cross them, so the seam stays NAMED (no build).
+    /// An older thresholds file (pre-P-440) falls back to this.
+    fn default() -> Self {
+        ColumnStoreSeam {
+            promote_events_per_sec_per_stream: 50_000,
+            degraded_publish_latency_p99_ms: 100,
+            promotion_owed: false,
+        }
+    }
+}
+
+impl ColumnStoreSeam {
+    /// **The promotion-gate decision (the measurement gate, not a build).** Given a stream's MEASURED
+    /// sustained publish rate (events/sec) and its MEASURED per-aggregate publish-latency p99 (ms) at
+    /// that rate, decide whether the column-store tier is owed for it. Promotion is owed **iff BOTH**
+    /// criteria are crossed: the rate exceeds [`Self::promote_events_per_sec_per_stream`] AND the
+    /// latency p99 exceeds [`Self::degraded_publish_latency_p99_ms`] (volume alone never promotes — the
+    /// tier must be measurably DEGRADED at that volume, §7.5 / EI-04 §5.2). A stream below either stays
+    /// on JetStream (named-not-built). This is the single decision the seam exposes: it never builds the
+    /// tier, it only reads a measurement and reports whether a build is owed.
+    pub fn promotion_owed_for(
+        &self,
+        measured_events_per_sec: u64,
+        measured_publish_latency_p99_ms: u64,
+    ) -> bool {
+        measured_events_per_sec > self.promote_events_per_sec_per_stream
+            && measured_publish_latency_p99_ms > self.degraded_publish_latency_p99_ms
     }
 }
 
@@ -1391,5 +1473,41 @@ mod tests {
             t.claimed_not_proven.is_empty(),
             "every shipped M0 drill is green at its threshold; a red one would add a row"
         );
+    }
+
+    /// **BUS-6 column-store seam (P-440): the measurement gate is RECORDED, not a build.** The
+    /// canonical file carries the promotion criteria, and at this commit NO production volume has been
+    /// measured to outgrow JetStream → `promotion_owed == false` (the seam stays NAMED, no build owed).
+    #[test]
+    fn column_store_seam_is_named_not_built_at_this_commit() {
+        let t = Thresholds::load_canonical().expect("load");
+        assert!(
+            !t.column_store_seam.promotion_owed,
+            "BUS-6: no measured volume outgrows JetStream → the seam stays specified-not-built (§7.5)"
+        );
+        assert!(
+            t.column_store_seam.promote_events_per_sec_per_stream > 0
+                && t.column_store_seam.degraded_publish_latency_p99_ms > 0,
+            "BUS-6: the promotion criteria are recorded (a measurement is compared against them)"
+        );
+    }
+
+    /// **BUS-6 promotion gate is REAL, not vacuous (the measurement decision).** A stream measured
+    /// BELOW either criterion stays on JetStream; only a stream that crosses BOTH (volume AND degraded
+    /// latency) owes the column tier (§7.5 / EI-04 §5.2 — volume alone never promotes).
+    #[test]
+    fn column_store_promotion_owed_only_when_both_criteria_cross() {
+        let seam = ColumnStoreSeam::default(); // 50_000 ev/s, 100 ms p99.
+                                               // Below the rate (whatever the latency) → JetStream suffices, no build owed.
+        assert!(!seam.promotion_owed_for(10_000, 500));
+        // Above the rate but NOT degraded (p99 within budget) → still no build (the tier is fine).
+        assert!(!seam.promotion_owed_for(80_000, 50));
+        // Degraded latency but below the rate → not a candidate (volume too small).
+        assert!(!seam.promotion_owed_for(40_000, 500));
+        // BOTH crossed → the column tier is owed (the gate flips to a build, behind BusTransport).
+        assert!(seam.promotion_owed_for(80_000, 200));
+        // Exactly at a criterion does NOT cross (strict `>` — the threshold is a floor to exceed).
+        assert!(!seam.promotion_owed_for(50_000, 200));
+        assert!(!seam.promotion_owed_for(80_000, 100));
     }
 }
