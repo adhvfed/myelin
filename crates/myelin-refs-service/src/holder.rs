@@ -33,7 +33,8 @@
 //! over the live [`crate::edge_builder::EdgeProjection`] + the REF-P12 [`crate::cache::R2ProjectionCache`].
 //! So there is ONE Refs holder type per store (no parallel second holder); the body is the real one
 //! the moment the store is wired. The world-scale 0-recoverable shred drill (REF-D5 at backup scale)
-//! is REF-P25 (named).
+//! is DELIVERED by REF-P25 ([`crate::restore_reerase`] — the erase → restore-pre-erase-backup →
+//! re-erase-from-the-10.8-ledger → 0-recoverable cross-seam, which RIDES this very §4.6 erase body).
 //!
 //! ## Mutation-score floor (mandatory-core, EI-01 §3 / VISION §4 prove-it)
 //! The erase holder is 0-recoverable-PII critical (REF-D5). Floor: **≥ 80% of viable mutants caught**
