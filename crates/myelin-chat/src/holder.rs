@@ -73,6 +73,14 @@ use std::sync::{Arc, Mutex};
 /// store. PII-free: a store identifier, never personal data.
 pub const CHAT_OLTP_STORE: &str = "chat_oltp";
 
+/// The stable, PII-free name of the Chat **read-state store** (the `(user × conversation)` last-read
+/// markers, [`crate::read_state`]). Its OWN store (its own durable table/keyspace, distinct from the
+/// OLTP message log) so the DSR cascade reaches it SPECIFICALLY (D-C8: read-state purged). Registered
+/// as holder **H5 (`H5Chat`)** at CHAT-P16 so a person's read-state footprint is a holder by
+/// construction. PII-free: a store identifier. Re-exported from [`crate::read_state`] so there is ONE
+/// name (EI-01 §7); aliased here for the holder registration.
+pub const CHAT_READ_STATE_STORE: &str = crate::read_state::CHAT_READ_STATE_STORE;
+
 /// The Chat store CLASSES the holder spans — `locate / export / rectify / restrict / erase` over
 /// **messages, drafts, author pseudonyms**. A closed enum: a new Chat data class cannot be added
 /// without appearing here (the holder coverage is total — proven by the unit test over
@@ -88,6 +96,10 @@ pub enum ChatStoreClass {
     /// Author identity — the pseudonymous `author` columns (4.8); erased by deleting the Identity
     /// pseudonym map ("Former user 8a2f" without rewriting messages others own). OLTP (H5).
     AuthorIdentity,
+    /// Read-state — the per-`(user × conversation)` last-read markers ([`crate::read_state`], the
+    /// CHAT-P16 durable record). A person's scroll-position footprint; purged on erasure (D-C8). OLTP
+    /// (H5).
+    ReadState,
 }
 
 impl ChatStoreClass {
@@ -97,16 +109,18 @@ impl ChatStoreClass {
             ChatStoreClass::Messages => "messages",
             ChatStoreClass::Drafts => "drafts",
             ChatStoreClass::AuthorIdentity => "author-identity",
+            ChatStoreClass::ReadState => "read-state",
         }
     }
 
     /// **The full set of Chat store classes the holder spans.** `locate`/`export`/`erase` reach every
     /// member; a missed class is a hole. Closed + total — a new Chat data class cannot be added
     /// without appearing here (proven by the unit tests).
-    pub const ALL: [ChatStoreClass; 3] = [
+    pub const ALL: [ChatStoreClass; 4] = [
         ChatStoreClass::Messages,
         ChatStoreClass::Drafts,
         ChatStoreClass::AuthorIdentity,
+        ChatStoreClass::ReadState,
     ];
 }
 
@@ -130,11 +144,12 @@ pub type ChatHolderRegistration = HolderRegistration;
 /// [`HolderRegistry`] against this classifier: every opened Chat store must map to an H-holder, or it
 /// is an orphan (contract 1.4 + gdpr §3.2).
 pub fn chat_store_classifier() -> StoreClassifier {
-    StoreClassifier::of([myelin_substrate::StoreHolder::new(
-        StoreKind::Oltp,
-        CHAT_OLTP_STORE,
-        Holder::H5Chat,
-    )])
+    StoreClassifier::of([
+        myelin_substrate::StoreHolder::new(StoreKind::Oltp, CHAT_OLTP_STORE, Holder::H5Chat),
+        // CHAT-P16 (P-410): the read-state durable record is its OWN Chat store, classified to the
+        // SAME H5 holder — so the DSR cascade reaches the per-(user × conversation) markers (D-C8).
+        myelin_substrate::StoreHolder::new(StoreKind::Oltp, CHAT_READ_STATE_STORE, Holder::H5Chat),
+    ])
 }
 
 /// **Register the Chat OLTP store as a `PersonalDataHolder` through the harness auto-registration
@@ -146,6 +161,10 @@ pub fn chat_store_classifier() -> StoreClassifier {
 pub fn register_chat_holders() -> HolderRegistry {
     let mut registry = HolderRegistry::new();
     registry.open(StoreKind::Oltp, CHAT_OLTP_STORE);
+    // CHAT-P16 (P-410): the read-state durable record opens through the SAME one door, so the
+    // read-state markers are a registered H5 holder by construction (the DSR fan-out cannot miss
+    // read-state — D-C8).
+    registry.open(StoreKind::Oltp, CHAT_READ_STATE_STORE);
     registry
 }
 
@@ -377,11 +396,12 @@ mod tests {
     /// appearing here).
     #[test]
     fn the_chat_store_class_set_is_the_holder_coverage() {
-        assert_eq!(ChatStoreClass::ALL.len(), 3);
+        assert_eq!(ChatStoreClass::ALL.len(), 4);
         for c in [
             ChatStoreClass::Messages,
             ChatStoreClass::Drafts,
             ChatStoreClass::AuthorIdentity,
+            ChatStoreClass::ReadState,
         ] {
             assert!(
                 ChatStoreClass::ALL.contains(&c),
@@ -399,12 +419,23 @@ mod tests {
     fn chat_store_registers_and_classifies_to_h5_no_orphan() {
         let registry = register_chat_holders();
         assert!(registry.is_registered(StoreKind::Oltp, CHAT_OLTP_STORE));
-        assert_eq!(registry.len(), 1, "exactly the Chat OLTP store registered");
+        // CHAT-P16: the read-state durable record is its own registered Chat store (D-C8).
+        assert!(registry.is_registered(StoreKind::Oltp, CHAT_READ_STATE_STORE));
+        assert_eq!(
+            registry.len(),
+            2,
+            "the Chat OLTP + read-state stores registered"
+        );
         let classifier = chat_store_classifier();
         assert_eq!(
             classify_store(StoreKind::Oltp, CHAT_OLTP_STORE, &classifier),
             Some(Holder::H5Chat),
             "the Chat OLTP store is holder H5 (Chat subsystem DB)"
+        );
+        assert_eq!(
+            classify_store(StoreKind::Oltp, CHAT_READ_STATE_STORE, &classifier),
+            Some(Holder::H5Chat),
+            "the Chat read-state store is holder H5 (the per-user markers, D-C8)"
         );
         assert_eq!(
             assert_holder_completeness(registry.registrations(), &classifier),

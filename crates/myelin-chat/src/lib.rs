@@ -145,6 +145,7 @@ pub mod glue;
 pub mod holder;
 pub mod membership;
 pub mod project;
+pub mod read_state;
 pub mod rebac_fragment;
 pub mod replay;
 pub mod schema;
@@ -175,6 +176,10 @@ pub use project::{
     densest_edge_producer, ChannelMeta, ChatProjectionSource, MessageMeta, ProjectError, Projected,
     Projection as ChatProjection, Projector, RenderHint, ThreadMeta, Tombstone as ProjectTombstone,
     TombstoneReason as ProjectTombstoneReason,
+};
+pub use read_state::{
+    ReadMarker, ReadStatePush, ReadStateRecord, ReadStateService, CHAT_READ_STATE_STORE,
+    DEFAULT_FLUSH_CADENCE, HOT_MARKER_TTL, READ_STATE_UPDATED,
 };
 pub use replay::{ChatReindexSource, ChatReplayKind};
 pub use store::{
