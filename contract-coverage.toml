@@ -2038,6 +2038,11 @@ cdc = [
     # post APPLIES; a consequential invite is WITHHELD (`Gated`, 0 mutation, AG-8). Chat does NOT
     # re-implement the eight-step pipeline (the fabric owns it) — the routing split is the safety boundary.
     "crates/myelin-chat/tests/cdc_8_1_8_2_8_7_11_7_chat_tools.rs",
+    # CHAT-P25 / P-419 (M4-C9): the CHAT DISPATCH CONSUMER leg — an explicit agent run's chat output
+    # routes through the REAL `myelin_agent::EffectApi` (`myelin_chat::dispatch::dispatch_explicit`)
+    # under the minted run token's RunCtx (4.7 → 8.2 threaded). A casual mention NEVER reaches EffectApi
+    # (notify-only). Chat does NOT mutate directly — the routing split is the safety boundary.
+    "crates/myelin-chat/tests/cdc_8_6_11_7_4_7_8_2_chat_dispatch.rs",
 ]
 
 [[contract]]
@@ -2151,9 +2156,17 @@ row = "8.6"
 # reserve gate bites even the explicit run. ZERO Notif/Bus code change (the inverse-signal).
 title = "EventInbox::deliver"
 status = "covered"
+# CHAT-P25 / P-419 (M4-C9): the chat-MODULE dispatch ORCHESTRATION CONSUMER leg —
+# `myelin_chat::dispatch` assembles explicit-first (8.6) with reserve (11.7) + mint (4.7) + EffectApi
+# (8.2): a casual @agent mention → `Disposition::NotifiedInbox` (0 run, 0 reserve, 0 mint), only an
+# explicit action → `dispatch_explicit` (reserve → mint_run_token → EffectApi). The structural
+# `no_auto_spawn_path_is_wired` proves 0 mention→run edges; the L-3 absence is named. The CHAT-D17
+# dispatch-side drill (drill_chat_p25_explicit_first_dispatch.rs) proves 0 auto-spawn + the reserve
+# gate bites even the explicit run, against the --use-mock runtime, with AG-D4 re-confirmed green.
 cdc = [
     "crates/myelin-agent/tests/cdc_8_6_event_inbox.rs",
     "crates/myelin-chat/tests/cdc_8_6_chat_explicit_first.rs",
+    "crates/myelin-chat/tests/cdc_8_6_11_7_4_7_8_2_chat_dispatch.rs",
 ]
 
 [[contract]]
@@ -2962,12 +2975,19 @@ status = "covered"
 # reserve (never interrupt in-flight; inflight_interrupt_count == 0). The CDC is in
 # cdc_8_1_8_2_8_7_11_7_chat_tools.rs (the chat tool slice). FLOOR named: none new — the ledger is the
 # M1 Storage primitive; chat MUST NOT re-implement a budget.
+#
+# CHAT-P25 / P-419 (M4-C9): the CHAT DISPATCH CONSUMER leg — the reserve gate fronts EVEN the explicit
+# agent run (`myelin_chat::dispatch::reserve_gate` / `dispatch_explicit`): an explicit action reserves
+# at dispatch (no balance → no run → nothing minted, nothing applied); a casual mention NEVER touches
+# reserve/settle (notify is free). The CDC + the CHAT-D17 dispatch-side drill prove the gate bites the
+# explicit run (NoBalanceRefused) and admits the funded one (reserved exactly once). No new ledger.
 cdc = [
     "crates/myelin-storage/tests/cdc_11_7_reserve_settle.rs",
     "crates/myelin-storage/tests/ag_d6_d11_reserve_refusal_drill.rs",
     "crates/myelin-ci-controlplane/tests/drills_ci_p17_reserve_settle_parity.rs",
     "crates/myelin-issues/tests/cdc_11_7_issues_reserve_settle.rs",
     "crates/myelin-chat/tests/cdc_8_1_8_2_8_7_11_7_chat_tools.rs",
+    "crates/myelin-chat/tests/cdc_8_6_11_7_4_7_8_2_chat_dispatch.rs",
 ]
 
 [[contract]]
