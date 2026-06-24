@@ -545,6 +545,15 @@ cdc = [
     # (`myelin_chat::unfurl::invalidation::LiveUnfurlInvalidator`) busts + pushes on the bounded scope.
     # The CHAT-D7 live-bust drill is drill_chat_d6_d7_d18_invalidation.rs.
     "crates/myelin-chat/tests/cdc_5_9_2_7_chat_unfurl_invalidation.rs",
+    # CONSUMER leg — Chat AGENT PRESENCE + STREAMING PARTIALS (CHAT-P24 / P-418, M4-C9, CHAT-D16):
+    # the agent-presence class (`available`/`busy`/`rate-limited`/`offline`, arch §7.2) + the streaming
+    # `agent.message.partial` frames (arch §7.3) ride this SAME frozen protocol on the BOUNDED
+    # `channel:<id>` scope (never `*`); the FINAL durable `chat.message.created` REPLACES the partial,
+    # and a mid-stream reconnect resumes the FINAL via the resume cursor — NEVER a half-message. No
+    # transport here (the live socket is the CHAT-P9 gateway); chat owns the presence/partial LOGIC +
+    # the resume answer + the firehose PORTs (`PresencePush`/`PartialPush`). The CHAT-D16 drill
+    # (drill_chat_d16_streaming.rs) proves 0 half-messages on reconnect (driven against `--use-mock`).
+    "crates/myelin-chat/tests/cdc_8_3_3_5_chat_presence_streaming.rs",
 ]
 
 # 3.6 reactive/dispatch tier (EB-23 / P-143). OWNED by the Bus; built in myelin-query (the
@@ -2041,7 +2050,17 @@ row = "8.3"
 # — IMPL follow-ons, not a pair gap; the 8.3 signature pair carries both sides NOW.
 title = "AgentRuntime::step"
 status = "covered"
-cdc = ["crates/myelin-agent/tests/cdc_8_3_agent_runtime.rs"]
+# CONSUMER leg — Chat STREAMING PARTIALS (CHAT-P24 / P-418, M4-C9): chat drives a `--use-mock`
+# streaming runtime (`myelin_chat::MockStreamRuntime`) that is a real `myelin_agent::AgentRuntime` —
+# `step` is a pure, deterministic function of the conversation that SUBMITS the scripted answer with
+# NO LLM SDK, and the partial stream's terminal cumulative text equals the submission (final replaces
+# partial, exactly). The real `LlmAgentRuntime` swaps into this SAME seam post-M5 (the named FLOOR,
+# AG-P25); the streaming UX is proven WITHOUT a real LLM. The CHAT-D16 drill
+# (drill_chat_d16_streaming.rs) drives it end-to-end.
+cdc = [
+    "crates/myelin-agent/tests/cdc_8_3_agent_runtime.rs",
+    "crates/myelin-chat/tests/cdc_8_3_3_5_chat_presence_streaming.rs",
+]
 
 [[contract]]
 row = "8.4"
