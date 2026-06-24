@@ -191,6 +191,23 @@
 //!   `DurableExecutor`, contract 9.1) — the SAME gating (restore-verify + readiness), now crash-safe +
 //!   resumable + idempotent. The `cell_provisioning` log records each gating step.
 //!
+//! ## What P-CP-21 / P-432 adds ([`bulkhead`]) — the cell bulkhead under 30× surge (CP-D5)
+//! The world-scale hardening of the single-cell topology already built: **the cell is the unit of
+//! bulkhead** (architecture §1/§8). [`bulkhead::CellBulkhead`] models one cell as an INDEPENDENT
+//! bulkhead — its own bounded per-lane capacity envelope ([`myelin_substrate::BoundedQueue`] per
+//! [`myelin_substrate::RunClass`] lane, §7.1) + its own health switch
+//! ([`bulkhead::CellBulkhead::inject_fatal_fault`]). Cells share NOTHING on the hot path (§3/§8 — the
+//! only shared thing is the PII-free, off-hot-path, client-cached control plane), so a fatal fault /
+//! 30× surge in one cell ([`bulkhead::CellFleet::run_surge`]) is contained: the surged cell absorbs it
+//! by shedding its AGENT lane while its protected HUMAN lane HOLDS, and the OTHER cells are
+//! UNAFFECTED — **cross-cell impact 0** ([`bulkhead::CellFleetReport::is_cp_d5_win`]), a noisy tenant
+//! contained to its cell. The zero is a real tripwire: [`bulkhead::CellFleet::shared_queue_impact`]
+//! (the shared-hot-path-queue anti-pattern the architecture forbids) shows a NON-zero cross-cell
+//! impact (RED). **No new floor** — the per-cell isolation is already built; the measured sizing
+//! numbers that BOUND "30×" ride P-CP-22; the only legitimate remaining floor is the world-scale 30×
+//! load drill on real fleet hardware (named, not claimed-green). The E2E-1..E2E-4 wedge (Tenancy the
+//! partition under all four) runs green for the band (the per-system spines + the GA-D8 DSAR fan-out).
+//!
 //! ## What P-CP-22 / P-431 adds ([`migration`]) — live tenant migration + the floor promotions (M5)
 //! The avoid-migration-by-sizing floor (P-CP-05/P-CP-07) + the scripted-provisioning floor (P-CP-11)
 //! are **PROMOTED**: (1) **the online cell→cell move (SAME region)** ([`LiveMigration::migrate_tenant`])
@@ -208,6 +225,7 @@
 //! [`measured_hot_at`]). (5) **Restore-verify at cell scale (STOR-D2)** re-confirmed against the
 //! thresholds-file RPO/RTO bounds ([`restore_verify_at_cell_scale`]). No threshold weakened.
 
+pub mod bulkhead;
 pub mod cp_outage;
 pub mod cross_cell_bridge;
 pub mod discover;
@@ -227,6 +245,7 @@ pub mod runner_claim_pin;
 pub mod schema;
 pub mod self_host;
 
+pub use bulkhead::{CellAdmission, CellBulkhead, CellFleet, CellFleetReport, SURGE_MULTIPLIER};
 pub use cp_outage::{
     cp_outage_bound, ControlPlane, CpOutageReport, DataPlane, DegradeScope, ServeFailure, Served,
     SignupDegraded, SignupPlane,
