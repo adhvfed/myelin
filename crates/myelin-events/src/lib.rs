@@ -328,6 +328,7 @@
 pub mod check_seam;
 pub mod consumer;
 pub mod crosscell;
+pub mod crosscell_propagation;
 pub mod dedup;
 pub mod envelope;
 pub mod firehose;
@@ -384,6 +385,21 @@ pub use consumer::{
 pub use crosscell::{
     assert_cell_agnostic, pointer_correlation, ArtifactType, CellId, CrossCellPointer,
     OpaqueSubjectId,
+};
+/// The Bus's cross-cell EVENT-PROPAGATION half (contract 12.6 — built LIVE, EB-25 / P-438, M5; the
+/// M1-frame floor follow-on of EB-14). When a cross-cell-relevant event ([`CrossCellStream`] — the
+/// §6.2 ISS portfolio rollup / KN collab / CHAT cross-org floor follow-ons) occurs in a tenant's
+/// home cell, [`CrossCellPropagator::fan_out`] mints a [`CrossCellPointer`] carrying ONLY the four
+/// frozen PII-free fields ([`pointer_for_propagation`]) and produces one [`PropagatedPointer`] per
+/// *other* member cell — never the payload, never any PII (`pii_fields_crossed` pinned to 0 by
+/// construction, the CP-D8 / GA-D8 zero). The control plane CONSUMES the produced pointer and carries
+/// it between the tenant's cells (`myelin_control_plane::cross_cell_bridge`, P-429); the member cell
+/// resolves cell-local (P-429's resolution half) when a viewer there renders it. ONE frame, ONE
+/// residency rule, two reconciled DAG legs (EI-01 §7). FLOOR: the cell→cell transport wire is the
+/// control plane's bridge + resilient client; this produces the pointer-event it carries.
+pub use crosscell_propagation::{
+    pointer_for_propagation, propagated_carried_fields, CrossCellPropagator, CrossCellStream,
+    PropagatedPointer,
 };
 pub use dedup::{DedupLedger, CONSUMER_DEDUP_MIGRATION};
 /// The firehose resume-cursor subscription protocol (contract 3.5, the Bus-owned zero-loss-replay
