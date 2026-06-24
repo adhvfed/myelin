@@ -588,6 +588,7 @@ pub mod dsr_timer;
 pub mod ediscovery;
 pub mod erasure_ledger;
 pub mod fanout;
+pub mod full_fanout;
 pub mod git_instance;
 pub mod history_rewrite;
 pub mod holders;
@@ -656,6 +657,10 @@ pub use erasure_ledger::{
 pub use fanout::{
     DsrCompletionReceipt, FanOutDriver, FanOutOutcome, HoldScope, HoldVerdict, LegalHoldRegistry,
     LEGAL_HOLD_ACTIVE_COUNT,
+};
+pub use full_fanout::{
+    FullFanOutCoverage, GaD1Certificate, GaD1Gap, Holder, HolderErasure, HolderReach,
+    ERASURE_FANOUT_COVERAGE as FULL_FANOUT_ERASURE_COVERAGE,
 };
 pub use git_instance::{
     git_residual, git_residual_is_the_one_posture, git_section_references_posture,
