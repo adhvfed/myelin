@@ -146,3 +146,14 @@ myelin-identity-service = { path = "../myelin-identity-service" }
 # leaf consumer, NOTHING depends back on `myelin-chat`. `myelin-flow` sits in the mid-tier of the
 # §2.9 DAG (the SAME posture the D17 dispatch CDC takes with `myelin-query`).
 myelin-flow = { path = "../myelin-flow" }
+# CHAT-P24 (P-418, M4-C9): the AG-D4 / CI-T1 green-escape ATTESTATION artifact
+# (`myelin_ci_sandbox::EscapeAttestation`, contract 8.4 — the permanent sandbox gate, X-6 #4). The
+# CHAT-D16 streaming drill ASSERTS chat refuses to stream agent compute output over a RED AG-D4 and
+# admits over a GREEN one, proven against the REAL attestation type (not a chat-local fake). Chat's
+# RUNTIME gate predicate (`presence::ag_d4_attestation_is_green`) is generic over the frozen
+# attestation FIELDS (artifact-tag / drill-id / total_escapes) so the PRODUCTION crate does NOT
+# depend on `myelin-ci-sandbox`; this DEV-only edge exists solely to feed the real artifact into the
+# CDC/drill — the SAME dev-only posture the 9.1/9.4 CDC takes with `myelin-flow`. The drill is
+# UPSTREAM (M2 / AG-P17 → P-229 / CI-P5 → P-239); chat consumes its green artifact, it does NOT
+# re-run the drill nor fork the attestation type (EI-01 §7 — one drill, one type).
+myelin-ci-sandbox = { path = "../myelin-ci-sandbox" }

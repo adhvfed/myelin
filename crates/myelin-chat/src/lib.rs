@@ -168,6 +168,7 @@ pub mod glue;
 pub mod hitl;
 pub mod holder;
 pub mod membership;
+pub mod presence;
 pub mod project;
 pub mod read_state;
 pub mod rebac_fragment;
@@ -215,6 +216,12 @@ pub use holder::{
     CHAT_OLTP_STORE, CHAT_RESIDUAL_POSTURE_REF,
 };
 pub use membership::{MembershipError, MembershipGate, MembershipService, MembershipTupleWriter};
+pub use presence::{
+    ag_d4_attestation_is_green, presence_and_partials_are_firehose_only, resume_view, run_streamed,
+    AgD4Attestation, AgentPresence, FabricHealth, MockStreamRuntime, PartialFrame, PartialPush,
+    PresencePush, ResumeView, StreamSession, StreamSessions, StreamState, AGENT_MESSAGE_PARTIAL,
+    AGENT_STATUS_CHANGED,
+};
 pub use project::{
     densest_edge_producer, ChannelMeta, ChatProjectionSource, MessageMeta, ProjectError, Projected,
     Projection as ChatProjection, Projector, RenderHint, ThreadMeta, Tombstone as ProjectTombstone,
