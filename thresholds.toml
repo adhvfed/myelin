@@ -58,6 +58,28 @@ sla_mins = 5
 multiplier = 30
 
 # ---------------------------------------------------------------------------------------------
+# [authz_surge] — the ID-D9 (F6) protected-human-lane authz-decision p99 budget under the 30× authz
+# hot-path surge (identity §10/§13: authz is the highest-QPS shared system; contract 1.8
+# `auth_decision_latency` / 4.11 the shed order on the authz surface).
+#
+# ID-D9 (P-ID-31 / P-424) drives a 30× agent-skewed surge of `check` calls on the authz hot path. The
+# protected human lane must HOLD within this p99 budget while the agent lane SHEDS (429 + Retry-After,
+# the §7.2 shed order) and cross-tenant impact stays 0. The SHAPE (a measured human-lane p99 ceiling
+# under surge) is FROZEN; the NUMBER is the default-to-beat. A regression that pushes the human-lane
+# p99 past it is a dated [[claimed_not_proven]] row, never a lowered bar (EI-01 §3).
+#
+# UNITS: MICROSECONDS (`_us`, the §2.10 names/units anchor). A `check` is an in-cell, memo-bounded
+# tuple resolution; the human-lane p99 sits far under this ceiling even under the surge.
+#
+# MEASURED + PROVEN GREEN under the 30× surge by ID-D9 (P-ID-31 / P-424, 2026-06-24): the authz
+# hot-path shed lane on the HttpIntake authz surface held the protected human lane (0 human sheds,
+# human-lane check p99 within budget), the agent lane SHED with 429 + Retry-After (shed-count > 0),
+# and a second tenant was UNAFFECTED (cross-tenant impact 0) under the full 30× agent-skewed surge.
+# ---------------------------------------------------------------------------------------------
+[authz_surge]
+human_lane_p99_budget_us = 5000  # ID-D9: the protected human lane's authz-decision p99 ceiling under 30×.
+
+# ---------------------------------------------------------------------------------------------
 # [fail_static] — W, the bounded-staleness window for FailStatic<T> (contract 1.10 / 4.11).
 #
 # The MECHANISM and the constraint `static_max ≤ revocation-SLA` AND `static_max ≥ agent-token-TTL`
