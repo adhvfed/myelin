@@ -80,6 +80,7 @@ pub mod list_objects;
 pub mod lowering;
 pub mod machine_auth;
 pub mod mint;
+pub mod multi_cell;
 pub mod namespace;
 pub mod principal_store;
 pub mod pseudonym_erase;
@@ -148,6 +149,10 @@ pub use mint::{
     expires_at_of, run_token_jti, MintError, RevocationProof, RunTokenMinter,
     StructuralTokenSigner, TokenSigner, RUN_GRANT_RELATION, SELFHOSTED_GRANT_PREFIX,
 };
+pub use multi_cell::{
+    CellPartition, CrossCellAudit, CrossCellGrant, CrossCellResolution, MigrationReceipt,
+    MultiCellAuthority, MultiCellDsrReceiptSet,
+};
 pub use principal_store::{
     PrincipalError, PrincipalProfile, PrincipalRow, PrincipalStore, ProfileRef, S1_HOLDER, S1_TABLE,
 };
@@ -164,7 +169,7 @@ pub use tuple_store::{run_grant_expiry, StoredTuple, TupleStore, WriteError, S3_
 
 use myelin_identity::{
     AuthzError, CaveatContext, Consistency, Decision, IdentityService, ListObjectsResult,
-    ObjectType, Permission, Principal,
+    ObjectType, Permission, Principal, Zookie,
 };
 use myelin_substrate::{
     boot, AppSpec, Authorizer, Config, CriticalDependencies, InternalRpc, Migration, Migrations,
@@ -778,6 +783,14 @@ impl StoreBackedCheck {
     /// bus consumer over the SAME index).
     pub fn index(&self) -> &ReverseIndex {
         &self.index
+    }
+
+    /// **This cell's CURRENT authz snapshot zookie (the S3 store revision).** The home cell stamps a
+    /// cross-cell read-through at THIS snapshot so the read is consistency-bounded exactly like a
+    /// cell-local read (contract-index rows 4.3/4.10; multi-cell P-ID-35). A caller resolving over
+    /// the bridge reads the home cell's current zookie to bound the verdict it returns.
+    pub fn current_zookie(&self) -> Zookie {
+        self.tuples.current_zookie()
     }
 
     /// **The shared S5 authz read-replica (P-ID-16) this slot routes default-consistency reads to.**
