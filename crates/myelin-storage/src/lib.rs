@@ -498,6 +498,7 @@ pub mod ci_log_index;
 pub mod gd4;
 // The minimal cache seam (Stage 1 / infra — NEW). No cache trait existed before; this is the
 // one-line-swap Cache trait (in-memory floor + Valkey/Redis backing behind `integration`).
+pub mod bus_shred;
 pub mod cache;
 pub mod coloc;
 pub mod holder;
@@ -603,6 +604,7 @@ pub use blob::{
     BlobError, BlobMeta, BlobStore, BlobTelemetry, ContentHash, ContentWrap, FsBlobStore, HashAlgo,
     IdentityWrap,
 };
+pub use bus_shred::KmsBusShredder;
 pub use cache::{Cache, CacheError, InMemoryCache};
 pub use cdn::{CdnCloneClass, CdnEdgePop, CdnEdgeSet};
 pub use ci_cache_scope::{

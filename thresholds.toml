@@ -32,7 +32,7 @@
 version = 1
 # The date this file's current row set was last asserted against its drills (ISO-8601). Bump
 # (with a [[claimed_not_proven]] or a drill-dated note) on every threshold change.
-as_of = "2026-06-20"
+as_of = "2026-06-24"
 
 # ---------------------------------------------------------------------------------------------
 # [revocation] — N, the deprovision / revocation SLA (the disabled-user blast-radius bound).
@@ -48,6 +48,11 @@ sla_mins = 5
 # Roadmap §2 item 5: "30× surge". The 1×/10×/30× load generator (P-S02) reads its top multiplier
 # here; SUB-D3 asserts the human lane holds, the agent lane sheds, cross-tenant impact is 0 at this
 # multiplier. Keyed on contract 1.11.
+# MEASURED + PROVEN GREEN at 30× by BUS-D7 (EB-29 / P-420, 2026-06-24): the Bus's reactive/dispatch
+# tier shed lanes on the AgentMention surface — the protected human lane HELD (0 human sheds), the
+# agent lane SHED with 429 + Retry-After, and a second tenant was UNAFFECTED (cross-tenant shed 0)
+# under the full 30× agent-skewed surge. The agent-mention shed budget below is no longer just a
+# named floor — it is asserted green at the surge multiplier here.
 # ---------------------------------------------------------------------------------------------
 [surge]
 multiplier = 30
