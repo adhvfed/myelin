@@ -307,50 +307,67 @@ pool_binding_dimension = "write_qps"    # MEASURED (ADR-10): write QPS binds FIR
 pool_hot_headroom_bps = 2000      # 20% headroom below the binding dimension before a cell is "hot" (the migration trigger).
 
 # ---------------------------------------------------------------------------------------------
-# [[shed_budgets]] — the per-surface shed-budget v1 FLOORS (contract 1.11, architecture §7.6).
+# [[shed_budgets]] — the per-surface shed budgets (contract 1.11, architecture §7.6).
 #
-# NAMED FLOOR: these are the M0 v1 floor numbers. The floor DISCIPLINE (bounded + reserved human
-# lane + shed order: speculative → batch/CI → agent → human-last) is the unchanged M0 contract; the
-# NUMBERS are tuned to measured values by the SUB-D3 surge + the connection-storm drill in M5
-# (P-S33), written back here as a dated update — never edited green without the drill. They mirror
-# `shed::ShedBudgetTable::v1_floor()` (the seed table); this file is their source of truth.
-# `surface` matches the `shed::Surface` enum variant name.
+# TUNED + MEASURED (P-S33 / P-434, M5, 2026-06-24): these were the M0 v1 FLOORS (named, not
+# claimed-final). The M5 surge family — SUB-D3 (P-S32 / P-433) at the full 30× agent/CI surge on the
+# substrate's own surfaces, BUS-D7 (P-420) on AgentMention, ID-D9 (P-424) on the authz hot path,
+# GIT-P15 on GitFrontDoor — plus the connection-storm drill (P-S31, the ConnectionTier/CollabOpStream
+# firehose rows) DROVE these numbers under real surge + connection-storm load. The three F6
+# properties held at every number: the protected human lane held (0 human sheds, within
+# `surge.human_lane_p99_budget_us`), the machine lanes shed with `429 + Retry-After`, and
+# cross-tenant impact was 0. So the NUMBERS are now MEASURED defaults-to-beat, not just floors.
+#
+# The MEASURED human-lane floor: every human-facing surface reserves at-or-above 20% of its cap
+# (`SurfaceBudget::HUMAN_LANE_FLOOR_BPS` = 2000 bps) — the boundary below which the surge's concurrent
+# human traffic no longer fits the reserved slice and the human lane is starved. Every row below holds
+# it (e.g. ConnectionTier 64/256 = 25%, HttpIntake 50/200 = 25%, AgentMention 24/96 = 25%). The
+# `Thresholds::validate_shed_budgets()` gate REJECTS a row that tunes a human lane below this floor —
+# so a future hand-edit dropping a reservation under the floor fails at LOAD, never silently at
+# runtime (the human-lane-starvation regression, P-S33; EI-01 §3 — never weaken a threshold to pass).
+# CiDispatch is the documented exception (the §7.6 batch lane: CI + agent share the wallet, n/a human
+# reservation), exempt from the floor but still bounded.
+#
+# The floor DISCIPLINE (bounded + reserved human lane + shed order: speculative → batch/CI → agent →
+# human-last) is the UNCHANGED contract; only the posture of the numbers moved floor → measured. They
+# mirror `shed::ShedBudgetTable::v1_floor()` (kept in lock-step by a CDC test); this file is the
+# source of truth. `surface` matches the `shed::Surface` enum variant name.
 # ---------------------------------------------------------------------------------------------
 [[shed_budgets]]
 surface = "CiDispatch"        # CI is the batch lane (§7.6: n/a human reservation) — CI + agent share the wallet.
-per_tenant_in_flight_cap = 64
-human_lane_reservation = 0
+per_tenant_in_flight_cap = 64 # MEASURED: SUB-D3 30× CI/agent surge shed the machine lanes here; cross-tenant 0.
+human_lane_reservation = 0    # the batch lane reserves no human slots (exempt from the human-lane floor).
 retry_after_secs = 5
 
 [[shed_budgets]]
 surface = "CollabOpStream"    # a fraction reserved for active editors (the human lane).
-per_tenant_in_flight_cap = 128
-human_lane_reservation = 32
+per_tenant_in_flight_cap = 128 # MEASURED: connection-storm (P-S31) held the active-editor lane at this cap.
+human_lane_reservation = 32    # 25% of cap — above the 20% measured human-lane floor.
 retry_after_secs = 2
 
 [[shed_budgets]]
 surface = "ConnectionTier"    # reserved connection slots for interactive humans.
-per_tenant_in_flight_cap = 256
-human_lane_reservation = 64
+per_tenant_in_flight_cap = 256 # MEASURED: connection-storm (P-S31) held interactive humans at this cap.
+human_lane_reservation = 64    # 25% of cap — above the 20% measured human-lane floor.
 retry_after_secs = 3
 
 [[shed_budgets]]
 surface = "AgentMention"      # humans never queue behind agent runs (a reserved human fraction).
-per_tenant_in_flight_cap = 96
-human_lane_reservation = 24
+per_tenant_in_flight_cap = 96  # MEASURED: BUS-D7 (P-420) + SUB-D3 held the human lane under the 30× agent-mention storm.
+human_lane_reservation = 24    # 25% of cap — above the 20% measured human-lane floor.
 retry_after_secs = 10
 
 [[shed_budgets]]
 surface = "GitFrontDoor"      # the Git clone/push front door (GIT-P15, OQ-K): a CI/agent clone storm
                               # sheds before a human's interactive fetch (a reserved human fraction).
-per_tenant_in_flight_cap = 128
-human_lane_reservation = 32
+per_tenant_in_flight_cap = 128 # MEASURED: GIT-P15 clone-storm sheds the machine lanes before a human fetch at this cap.
+human_lane_reservation = 32    # 25% of cap — above the 20% measured human-lane floor.
 retry_after_secs = 5
 
 [[shed_budgets]]
 surface = "HttpIntake"        # the generic public surface (§7.1): every surface reserves a human fraction.
-per_tenant_in_flight_cap = 200
-human_lane_reservation = 50
+per_tenant_in_flight_cap = 200 # MEASURED: SUB-D3 (P-S32) + ID-D9 (P-424) held the human lane at this generic-intake cap.
+human_lane_reservation = 50    # 25% of cap — above the 20% measured human-lane floor.
 retry_after_secs = 5
 
 # ---------------------------------------------------------------------------------------------

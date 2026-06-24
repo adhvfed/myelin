@@ -312,8 +312,8 @@ pub use serve::{
     PublicRoutes, ServeHandle, Surface, Telemetry,
 };
 pub use shed::{
-    BoundedQueue, RunClass, RunClassHeader, ShedBudgetTable, ShedDecision, ShedLane,
-    Surface as ShedSurface, SurfaceBudget,
+    BoundedQueue, RunClass, RunClassHeader, ShedBudgetError, ShedBudgetTable, ShedDecision,
+    ShedLane, Surface as ShedSurface, SurfaceBudget,
 };
 pub use thresholds::{
     CellSizing, ClaimedNotProven, DepthCeilings, DsrDeadline, FailStaticThreshold, FlexDb,
