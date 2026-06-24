@@ -53,9 +53,20 @@ sla_mins = 5
 # agent lane SHED with 429 + Retry-After, and a second tenant was UNAFFECTED (cross-tenant shed 0)
 # under the full 30× agent-skewed surge. The agent-mention shed budget below is no longer just a
 # named floor — it is asserted green at the surge multiplier here.
+#
+# MEASURED + PROVEN GREEN at 30× by SUB-D3 (P-S32 / P-433, 2026-06-24): the substrate's own
+# principal-aware shed lane (shed::ShedLane) was driven by the P-S02 load generator at the full 30×
+# agent/CI-skewed mix on ONE tenant against the substrate's public surfaces (HttpIntake + CiDispatch).
+# The protected human lane HELD (0 human sheds; the human-lane p99 stayed within `human_lane_p99_budget_us`
+# — a human is admitted into the reserved lane, never queued behind a machine lane), the agent + CI
+# lanes SHED with 429 + Retry-After (shed-count > 0, every shed carrying the surface's Retry-After),
+# and a SECOND tenant trickling baseline traffic was UNAFFECTED (cross-tenant shed 0). This is the
+# substrate's slice of the F6 surge family (sibling to BUS-D7 / ID-D9); the per-surface shed-budget
+# NUMBERS the surge measured against are tuned to measured values in the M5 follow-on (P-S33).
 # ---------------------------------------------------------------------------------------------
 [surge]
 multiplier = 30
+human_lane_p99_budget_us = 10000  # SUB-D3: the substrate's protected-human-lane p99 ceiling under 30× (P-S33 re-confirms).
 
 # ---------------------------------------------------------------------------------------------
 # [authz_surge] — the ID-D9 (F6) protected-human-lane authz-decision p99 budget under the 30× authz
