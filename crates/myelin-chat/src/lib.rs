@@ -20,6 +20,13 @@
 //!   (co-committed with the outbox event) is wired in [`store`] at CHAT-P5 (the `message-<id>` subject
 //!   on every `chat.message.*` event); the mint codecs are exercised live there.
 //!
+//! - [`conversation`] — **CHAT-P7 / P-401**: the Conversation/Membership entity (one entity, many
+//!   kinds — `channel`/`dm`/`group_dm`/`artifact_linked`/`announcement`, with `retention_days` +
+//!   `linked_ref`) + the membership table + the `membership_by_principal` conversation-list index
+//!   (S1 — the leak-free, no-N+1 "my conversations" candidate set the CHAT-P8/P13 `list_objects`
+//!   gate joins against). The home cell is a settable VALUE (cross-org NON-FORECLOSURE; the single
+//!   home-cell is the M4 floor, federation rides CHAT-P30 / 12.6). Contracts 11.1 (OLTP tier) / 12.1
+//!   (partition key). The membership→`write_tuples`→zookie co-commit + new-enemy guard is CHAT-P8.
 //! - [`dek`] — **CHAT-P6 / P-400**: the per-subject-DEK encryption of the message bodies + drafts
 //!   (contract 11.4 / GD-4). The `body_inline` / `body_nodes` / composer `draft` are sealed under the
 //!   AUTHOR's per-subject DEK through the ONE shared `myelin_storage::encryption::ColumnCryptor` — the
@@ -92,6 +99,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod conversation;
 pub mod dek;
 pub mod events;
 pub mod glue;
@@ -102,6 +110,10 @@ pub mod schema;
 pub mod store;
 pub mod subs;
 
+pub use conversation::{
+    Conversation, ConversationError, ConversationKind, ConversationStore, MemConversationStore,
+    Membership, MembershipRole,
+};
 pub use dek::{decrypt_body, encrypt_body, plaintext_at_rest, subject_dek_erasure, ChatFreeText};
 pub use holder::{
     chat_store_classifier, register_chat_holders, ChatHolder, ChatStoreClass, RestrictionFlag,
