@@ -2050,6 +2050,16 @@ cdc = [
     # crypto-shredded over the ONE KmsEngine ISS-P07 sealed through; 0 PII keys resurrected post-restore.
     # The third-party residual = the ONE posture 10.9/X-7, by reference. The provider+consumer pair.
     "crates/myelin-issues/tests/cdc_10_1_issues_holder_erase.rs",
+    # CHAT-P6 / P-400 (M4-C1) — the CHAT side of 10.1: the Chat OLTP store auto-registers as holder
+    # H5 (H5Chat) through the substrate one door (1.4) + classifies to H5 (0 orphans — the DSR fan-out
+    # cannot silently miss the most PII-dense holder). The ChatHolder responds to the frozen dyn
+    # PersonalDataHolder surface: locate/export TYPED (empty-but-correct content-addressed receipts);
+    # restrict flips a REAL per-subject flag the Chat index/agent/analytics/notif seams read (Art.
+    # 18/21); erase is STUBBED to crypto-shred — a typed no-op naming its CHAT-P22 / P-411 fan-out (the
+    # per-subject-DEK destroy across hot/cold/backups + pseudonym shred + the chat.message.erased
+    # tombstones; residual = the ONE posture 10.9/X-7, by reference). The provider+consumer pair (shared
+    # with 11.4 below — the per-subject-DEK body lever the erase destroys).
+    "crates/myelin-chat/tests/cdc_11_4_10_1_chat_body_dek_holder.rs",
 ]
 
 # 10.2 — the classify-derive (five tags + subject_locator, P-GA-07) PLUS the OQ-H worklog extension
@@ -2405,6 +2415,7 @@ cdc = [
     "crates/myelin-storage/tests/cdc_11_2_11_4_git_crypto_shred_reach.rs",
     "crates/myelin-ci-controlplane/tests/cdc_11_2_11_4_ci_artifact_cache.rs",
     "crates/myelin-issues/tests/cdc_4_8_11_4_issues_pseudonym_dek.rs",
+    "crates/myelin-chat/tests/cdc_11_4_10_1_chat_body_dek_holder.rs",
 ]
 # P-365 (CI-P22, M4): the CI CONTROL-PLANE consumer of the per-subject-vs-per-tenant DEK selection
 # (11.4) for isolable inline log PII (Storage C1). `select_log_segment_dek` composes the FROZEN
@@ -2427,6 +2438,20 @@ cdc = [
 # plaintext at rest); the live-Postgres at-rest artifact:
 # crates/myelin-issues/tests/integration_iss_p07_subject_dek.rs (0 plaintext free-text in the real
 # Postgres bytea column).
+# P-400 (CHAT-P6, M4-C1): the CHAT CONSUMER of the per-subject-DEK message bodies (11.4 / GD-4 — chat
+# is the MOST PII-dense holder, the message body IS the PII, arch 05 §5). `myelin_chat::{encrypt_body,
+# decrypt_body, ChatFreeText}` seals the free-text `body_inline`/`body_nodes` + the composer `draft`
+# under the AUTHOR's per-subject DEK through the ONE shared `myelin_storage::encryption::ColumnCryptor`
+# over the P-058 KmsEngine (NO second cryptor, NO parallel key store — EI-01 §7): ciphertext + the
+# `kms://<tenant>/<epoch>/subject:<id>` pii_key_ref at rest, 0 plaintext body bytes in the immutable
+# log (the per-subject DEK never bakes erasable plaintext into the append-only log, external-insights/04
+# §1). The crypto-shred lever is proven: a destroyed per-subject DEK → the body is unrecoverable, never
+# plaintext. The erase BODY (the destroy across hot/cold/backups + the DSR cascade) is the named
+# CHAT-P22 / P-411 follow-on. Provider/consumer CDC: cdc_11_4_10_1_chat_body_dek_holder.rs (seal under
+# the per-subject DEK → decrypt-while-the-key-lives + crypto-shred-makes-unrecoverable, 0 plaintext;
+# shared with row 10.1 — the holder the erase fans out through). The live-Postgres at-rest artifact:
+# crates/myelin-chat/tests/integration_chat_p6_subject_dek.rs (0 plaintext body bytes in the real
+# Postgres bytea column + decrypt-while-key-lives + crypto-shred-makes-unrecoverable AT REST).
 
 [[contract]]
 row = "11.5"

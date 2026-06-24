@@ -2134,12 +2134,14 @@ name = "myelin-chat"
 version = "0.0.0"
 dependencies = [
  "myelin-events",
+ "myelin-gdpr",
  "myelin-identity",
  "myelin-identity-service",
  "myelin-notif",
  "myelin-query",
  "myelin-refs",
  "myelin-storage",
+ "myelin-substrate",
  "myelin-tenancy",
  "serde",
  "serde_json",
