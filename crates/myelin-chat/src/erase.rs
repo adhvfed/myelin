@@ -39,13 +39,15 @@
 //! ([`crate::holder::CHAT_RESIDUAL_POSTURE_REF`], 10.9 / X-7) — cited, never re-authored Chat-local.
 //! The structural floor (per-subject DEK shred + restrict suppression) ships regardless.
 //!
-//! ## Floor named (VISION §3) — CHAT-P23 (M4-C8's second unit)
+//! ## The second unit of M4-C8 — CHAT-P23 / P-417 (now SHIPPED, [`crate::restriction`])
 //! The **mention pseudonym-shred** (the structured `mention(Principal)` → `[erased user]` on next
 //! render via the pseudonym-map shred), the **Art. 18 restriction-flag suppression at every read
-//! path**, and the **LEGAL free-text residual** are **CHAT-P23 / P-417**. This prompt ships the
-//! holder surface + the author crypto-shred + the cascade (the 0-recoverable-PII core). The
-//! `restrict` flag the seams read is ALREADY wired ([`crate::holder::RestrictionFlag`]); CHAT-P23
-//! wires the per-read-path suppression and the mention-shred.
+//! path**, and the **LEGAL free-text residual** are CHAT-P23 / P-417 — now SHIPPED in
+//! [`crate::restriction`] ([`crate::render_mention`] + [`crate::RestrictionGate`] +
+//! [`crate::LEGAL_RESIDUAL_FLOOR`]). This prompt (CHAT-P22) ships the holder surface + the author
+//! crypto-shred + the cascade (the 0-recoverable-PII core). The `restrict` flag the seams read is
+//! wired here ([`crate::holder::RestrictionFlag`]); CHAT-P23 CONSUMES it at every read path and adds
+//! the mention-shred render.
 //!
 //! ## Mutation-score floor (mandatory-core — the 0-recoverable-PII property)
 //! This module is the chat crypto-shred erasure core, so it is a **mandatory-core mutation target
@@ -301,8 +303,9 @@ impl<'a, S: MessageStore> ChatErasureCascade<'a, S> {
             .iter()
             .map(|class| {
                 // The body/draft classes are crypto-shredded under the per-subject DEK; the receipt
-                // names the destroyed epoch. The author-pseudonym is pseudonym-shredded (CHAT-P23
-                // wires the `[erased user]` render); read-state is purged. Each gets a distinct,
+                // names the destroyed epoch. The author-pseudonym is pseudonym-shredded (the
+                // `[erased user]` render is CHAT-P23, crate::restriction); read-state is purged. Each
+                // gets a distinct,
                 // content-addressed receipt so the set is provably complete + non-colliding.
                 let key_epoch = match class {
                     ChatStoreClass::Messages | ChatStoreClass::Drafts => destroyed_key_epoch,
@@ -351,7 +354,8 @@ fn class_outcome(class: ChatStoreClass) -> &'static str {
         }
         ChatStoreClass::Drafts => "crypto-shred the per-subject draft DEK + purge the draft rows",
         ChatStoreClass::AuthorIdentity => {
-            "pseudonym-shred the author identity ([erased user]; the render is CHAT-P23)"
+            "pseudonym-shred the author identity ([erased user]; the render is CHAT-P23, \
+             crate::restriction::render_mention)"
         }
         ChatStoreClass::ReadState => "purge the per-(user × conversation) read-state markers",
     }

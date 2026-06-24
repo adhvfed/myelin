@@ -54,8 +54,16 @@
 //!   backdoor), the read-state/drafts/unfurl-cache purge, the COMPLETE per-store holder-receipt set
 //!   (10.1; 0 holders missed), and the destroyed-key epoch driving post-restore re-erasure (10.8) —
 //!   CHAT-D8. The mention pseudonym-shred (→ `[erased user]`) + the Art. 18 restriction-flag
-//!   suppression at every read path + the LEGAL free-text residual are the named CHAT-P23 / P-417
-//!   floor; the residual is the ONE platform posture (10.9 / X-7), BY REFERENCE.
+//!   suppression at every read path + the LEGAL free-text residual are CHAT-P23 / P-417 ([`restriction`]).
+//! - [`restriction`] — **CHAT-P23 / P-417**: the second committable unit of M4-C8 — the mention
+//!   pseudonym-shred ([`restriction::render_mention`] → `[erased user]` on next render via the 4.8
+//!   pseudonym-map shred, FREE because the node is structured + pseudonymous, 0 recoverable
+//!   mentioned-PII), the Art. 18 restriction flag honoured at EVERY read path
+//!   ([`restriction::RestrictionGate`] — indexing / agent-use / notif-routing / analytics suppressed
+//!   for a restricted subject, 0 processings, a distinct state from erasure, contract 10.1), and the
+//!   LEGAL free-text residual ([`restriction::LEGAL_RESIDUAL_FLOOR`] — the `[OPEN — LEGAL]` floor BY
+//!   REFERENCE to the ONE platform posture 10.9 / X-7, never a fifth chat-specific statement; the
+//!   structural floor ships regardless). The named CHAT-P22 floor, filled.
 //! - [`replay`] — **EB-27 / P-327** (skeleton at CHAT-P6) + **CHAT-P21 / P-416** (full parity): chat's
 //!   `replay(scope, since)` re-emits `chat.{channel,message,thread}.snapshot` through the OUTBOX
 //!   (contract 2.6), and the three Chat-fed read-models (Search/Refs/Notif) REBUILD from that re-emit
@@ -164,6 +172,7 @@ pub mod project;
 pub mod read_state;
 pub mod rebac_fragment;
 pub mod replay;
+pub mod restriction;
 pub mod schema;
 pub mod search;
 pub mod store;
@@ -218,6 +227,11 @@ pub use read_state::{
 pub use replay::{
     reindex_parity_hash, ChatReadModelConsumer, ChatReindexSource, ChatReplayKind,
     MessageProjectFetcher, MessageProjection, NOTIF_REASON_MENTIONED,
+};
+pub use restriction::{
+    agent_may_read, analytics_eligible, index_projection_if_allowed, notif_may_route,
+    render_body_mentions, render_mention, MentionRender, MentionResolver, ReadPath,
+    RestrictionGate, ERASED_USER, LEGAL_RESIDUAL_FLOOR,
 };
 pub use search::{
     admit_message_indexing, may_index_messages, message_doc_ref, message_index_spec,
