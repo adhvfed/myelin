@@ -60,11 +60,16 @@ use std::collections::BTreeSet;
 
 /// **The Ids↔Filter cardinality cap default-to-beat (§7.1; a measured tunable).** When the
 /// materialised reachable set is at-or-under this size, `list_objects` returns `Ids` (the S4
-/// materialise); above it, `Filter` (the S8 push-down). The SHAPE is frozen here; this NUMBER is the
-/// **default-to-beat written to `thresholds.toml`** ([`authz_index.ids_cardinality_cap`]) and
-/// **re-measured + finalised at world-scale in P-ID-31 (P-074)** — that prompt CLOSES this floor.
-/// 1000 is the seed: small enough that materialising + inlining `WHERE id IN (...)` is cheaper than a
-/// JOIN, large enough that ordinary lists (a user's repos/channels/boards) materialise.
+/// materialise); above it, `Filter` (the S8 push-down). The SHAPE is frozen here; this NUMBER is
+/// written to `thresholds.toml` ([`authz_index.ids_cardinality_cap`]) — its single source of truth.
+/// 1000 is the value: small enough that materialising + inlining `WHERE id IN (...)` is cheaper than
+/// a JOIN, large enough that ordinary lists (a user's repos/channels/boards) materialise.
+///
+/// **MEASURED + FINALISED at world-scale by P-ID-32 (P-425):** the Ids-materialise plan's cost is
+/// linear in the reachable-set size, the Filter push-down is a fixed single JOIN, and the measured
+/// crossover sits AT this cap — so 1000 is the genuinely-cheaper-plan boundary, not a prediction.
+/// **This CLOSES the P-ID-11 cardinality-cap floor** (the SHAPE was always frozen; the NUMBER is now
+/// measured under load, dated in the thresholds file).
 pub const DEFAULT_IDS_CARDINALITY_CAP: usize = 1000;
 
 /// **`list_objects` — the return-shape dispatch + the S4 Ids materialise (contract 4.3).**
