@@ -350,6 +350,19 @@ cdc = [
     # clustering-range read — 0 lost), then resumes live. The fallback names the FROZEN chat
     # channel/message/thread *.snapshot tokens. The PROVIDER is myelin_chat::store::MemHotTier.
     "crates/myelin-chat-gateway/tests/cdc_3_5_2_6_chat_gateway.rs",
+    # CHAT-P21 / P-416 (M4-C7): Chat replay(scope, since) FULL PARITY — the second committable unit of
+    # M4-C7 completing the CHAT-P6 skeleton. The three Chat-fed read-models (Search row / Refs edge /
+    # Notif reason) REBUILD from the chat.message.snapshot re-emit through the SAME live consumer step
+    # (`myelin_chat::replay::ChatReadModelConsumer::ingest`) they ingest steady-state — 0 recovery-only
+    # code paths, so steady-state and recovery cannot drift (the reindex_parity_hash of a cold rebuild
+    # == the live one). The rebuild stays ACL-correct (the channel-keyed list_objects Filter conjoin,
+    # OQ-E — a non-member sees 0 rebuilt rows, CHAT-D11 over the cold index); an erased subject emits a
+    # tombstone (the ChatReindexSource::erase skip, X-7 — 0 resurrected PII). CHAT-D15 GREENED end-to-end
+    # against the REAL Search engine (drill_chat_d15_reindex_parity.rs): the cold Search index byte-matches
+    # live (no cross-DB — the only doc-entry path is the owner's project(ref)). The full multi-holder
+    # erasure RECEIPT remains the CHAT-P22 floor. The provider+consumer pair is cdc_2_6_6_4_chat_reindex_parity.rs.
+    "crates/myelin-chat/tests/cdc_2_6_6_4_chat_reindex_parity.rs",
+    "crates/myelin-chat/tests/drill_chat_d15_reindex_parity.rs",
 ]
 
 [[contract]]
@@ -1631,7 +1644,16 @@ status = "covered"
 # no-cross-db lint holds). FLOOR named: the per-owner real `replay` bodies are EB-26/per-owner M3/M4;
 # the full-scale reindex-parity (SRCH-D5 at scale, E2E-3) is SRCH-P32 (M5) — this row is the CI-variant
 # seam pair (provider: the reindex job; consumer: the live indexer; cold == live).
-cdc = ["crates/myelin-search/tests/cdc_6_4_reindex.rs"]
+cdc = [
+    "crates/myelin-search/tests/cdc_6_4_reindex.rs",
+    # CHAT-P21 / P-416 (M4-C7): the Chat CONSUMER of 6.4 — the chat message Search index is rebuilt the
+    # §4.9 ONLY way (the Bus re-emit of 2.6 drives the SAME live IncrementalIndexer::index() / Search
+    # Reindexer::reindex step). CHAT-D15 proves the cold Search index byte-matches live + a non-member
+    # sees 0 rebuilt rows (the ACL Filter conjoin holds on the rebuild, CHAT-D11) + an erased message is
+    # unsearchable after reindex (X-7) — all against the REAL Search engine.
+    "crates/myelin-chat/tests/cdc_2_6_6_4_chat_reindex_parity.rs",
+    "crates/myelin-chat/tests/drill_chat_d15_reindex_parity.rs",
+]
 
 [[contract]]
 row = "6.5"
