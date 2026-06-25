@@ -91,6 +91,57 @@ fn the_graph_carries_the_substrate_ratchet_and_drives_the_drills() {
 }
 
 #[test]
+fn the_graph_runs_the_tenancy_dogfood_band() {
+    // P-508 / P-CP-23 → CP-M6: the two Tenancy lints run as Myelin CI jobs on the platform's own
+    // commit, and the harness drives the dogfood drill (self-host + residency_verify on own data +
+    // the truth-up pass). The dogfood loop for Tenancy is part of the self-hosting CI graph.
+    let jobs = self_hosting_jobs();
+
+    // The two Tenancy-OWNED lints (residency-pin + control-plane-pii-free) bite on a fixture commit.
+    assert!(
+        jobs.iter()
+            .any(|j| j.id == "tenancy-lints" && j.kind == JobKind::Lints),
+        "the self-hosting graph MUST run the two Tenancy lints as Myelin CI jobs on the platform's \
+         own commit (P-CP-23 — the ratchet bites on a PII column / out-of-region write)"
+    );
+
+    // The dogfood drill: Myelin self-hosts as one cell + residency_verify GREEN on own data + the
+    // truth-up pass (no later-band CP gate red).
+    assert!(
+        jobs.iter()
+            .any(|j| j.id == "CP-D23-dogfood" && j.kind == JobKind::Drill),
+        "the harness MUST drive the Tenancy dogfood drill (self-host + residency_verify on own data \
+         + truth-up) as part of the self-hosting CI graph"
+    );
+}
+
+#[test]
+fn a_red_tenancy_lint_commit_is_rejected() {
+    // A Tenancy lint regression (a PII column / out-of-region write slipping in) reds the graph —
+    // the ratchet rejects on Myelin's own work, exactly as for the substrate lints.
+    let jobs = self_hosting_jobs();
+    let run = run_graph(&jobs, &reds_one("tenancy-lints"));
+    assert!(
+        !run.is_green(),
+        "a Tenancy lint regression on Myelin's own commit MUST be rejected (EI-01 §5)"
+    );
+    assert_eq!(run.red_jobs(), vec!["tenancy-lints"]);
+}
+
+#[test]
+fn a_red_tenancy_dogfood_drill_rejects_the_commit() {
+    // The dogfood drill is part of the gate: a red truth-up pass / residency mismatch reds the graph.
+    let jobs = self_hosting_jobs();
+    let run = run_graph(&jobs, &reds_one("CP-D23-dogfood"));
+    assert!(
+        !run.is_green(),
+        "a red Tenancy dogfood drill (residency mismatch / claimed-not-proven row) MUST reject the \
+         commit — the truth-up pass is part of the self-hosting CI gate"
+    );
+    assert_eq!(run.red_jobs(), vec!["CP-D23-dogfood"]);
+}
+
+#[test]
 fn a_clean_commit_reads_green() {
     let jobs = self_hosting_jobs();
     let run = run_graph(&jobs, &all_green);

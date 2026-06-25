@@ -229,6 +229,7 @@ pub mod bulkhead;
 pub mod cp_outage;
 pub mod cross_cell_bridge;
 pub mod discover;
+pub mod dogfood;
 pub mod four_layer;
 pub mod holder;
 pub mod isolation;
@@ -255,6 +256,10 @@ pub use cross_cell_bridge::{
     BridgeTombstoneReason, CellLocalResolver, CellResolverRegistry, CrossCellBridge, ViewerId,
 };
 pub use discover::{DiscoverKey, DiscoveryCache, DiscoverySignals, RouteTuple};
+pub use dogfood::{
+    proven_tenancy_rows, MyelinSelfHost, ProvenTenancyRow, TenancyTruthUpPass, TenancyTruthUpRed,
+    TenancyTruthUpVerdict,
+};
 pub use four_layer::{
     CrossRegionPathError, FourLayerEnforcement, ResidencyWriteBoundary, ResidencyWriteRejected,
 };
