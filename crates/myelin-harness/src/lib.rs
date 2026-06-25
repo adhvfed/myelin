@@ -127,9 +127,25 @@
 //! `myelin-chat`, keeping the production harness dep set tiny). When Chat diverges (CHAT-P26)
 //! the suite binds: the BEAM tier's probe implements [`DivergentTierProbe`] and the tier
 //! cannot ship unless all seven clauses are green.
+//!
+//! ## What P-S38 ships (this prompt → global P-510, SUB-M6 — the substrate dogfood done-bar)
+//! The **substrate dogfood** ([`dogfood`]) — the last substrate prompt: (a) the
+//! **every-incident-adds-a-drill loop on Myelin's OWN tracker** ([`dogfood::SubstrateIncidentLoop`])
+//! — a simulated substrate incident files a Myelin issue ref AND registers a reproducing
+//! [`drills::DrillScenario`] into the substrate's real [`drills::DrillRegistry`] via the P-S04
+//! `register_drill` hook; the loop is *live* (the repro re-runs forever and reads green), and an
+//! incident missing either leg is a LOUD gap. (b) the **substrate truth-up pass**
+//! ([`dogfood::SubstrateTruthUpPass`]) — enumerates every substrate PROVEN row
+//! ([`dogfood::proven_substrate_rows`], SUB-D1..D11 + BUS-D4/D7 + the twelve lints + the
+//! contract-coverage scanner + the harness self-test + the M5 world-scale/tuning legs) and asserts
+//! each rests on a DATED green artifact; a claimed-not-proven row is a LOUD
+//! [`dogfood::SubstrateTruthUpVerdict::Red`] (code-wins-over-docs, EI-01 §1). The gate invariant
+//! holds end-to-end (no earlier substrate gate is red). The ONE legitimate remaining floor — the
+//! world-scale 30× FLEET-hardware load drill — is named in the rendered scorecard, never claimed.
 
 pub mod cross_language_shim;
 pub mod dependency_break;
+pub mod dogfood;
 pub mod drills;
 pub mod load_generator;
 pub mod restore;
@@ -141,6 +157,10 @@ pub use cross_language_shim::{
     DivergentTierProbe, Nonnegotiable, ShimConformance, ShimEnforcement,
 };
 pub use dependency_break::{BreakOutcome, Dependency, DependencyBreaker, Scope};
+pub use dogfood::{
+    outbox_relay_stall_repro, proven_substrate_rows, ProvenSubstrateRow, SubstrateIncident,
+    SubstrateIncidentLoop, SubstrateTruthUpPass, SubstrateTruthUpRed, SubstrateTruthUpVerdict,
+};
 pub use drills::{DrillContext, DrillRegistry, DrillResult, DrillScenario};
 pub use load_generator::{
     LoadGenerator, LoadPrincipalKind, Multiplier, PrincipalMix, RecordingSink, Request, RunClass,
