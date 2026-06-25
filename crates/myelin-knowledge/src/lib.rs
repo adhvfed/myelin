@@ -94,6 +94,7 @@ pub mod export;
 /// structural floor, KN-D4) is the named KN-P26 follow-on.
 pub mod gdpr;
 pub mod list_filter;
+pub mod materialise;
 pub mod merge;
 pub mod notif_resolve;
 pub mod rebac_fragment;
@@ -149,6 +150,12 @@ pub use list_filter::{
     lower_over_db_row_id, lower_over_page_id, page_id_colref, AuthzJoin, AuthzVisibleIndex,
     BoundParam, ComposedQuery, FilterMode, LoweredFilter, AUTHZ_VISIBLE_TABLE, PAGE_ID_COLUMN,
     PAGE_TABLE,
+};
+pub use materialise::{
+    materialise_blob_store_parity, promote_facet, promote_facet_pii_cleared, read_time_recompute,
+    target_numeric_value, BlobParityVerdict, FacetPromotionError, FacetPromotionPlan,
+    FacetPromotionStep, MaterialisedRollup, MaterialisedValue, RowUpdatedDelta,
+    DB_ROW_TABLE as MATERIALISE_DB_ROW_TABLE,
 };
 pub use merge::{
     cas_update_sql, BlockState, CasError, CasOutcome, CasStore, ConflictMeter, OfflineQueue,
