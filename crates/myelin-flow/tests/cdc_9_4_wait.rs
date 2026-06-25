@@ -131,6 +131,8 @@ fn drive_once(
         None,
         Some(ex.signals().clone()),
         now_secs,
+        None,
+        None,
     )
 }
 
@@ -326,6 +328,8 @@ fn the_cancel_wait_rides_the_same_consume_once_mechanism() {
         None,
         Some(ex.signals().clone()),
         1_000,
+        None,
+        None,
     );
     assert_eq!(o1, DriveOutcome::Waiting, "the cancel wait parks");
 
@@ -356,6 +360,8 @@ fn the_cancel_wait_rides_the_same_consume_once_mechanism() {
         None,
         Some(ex.signals().clone()),
         2_000,
+        None,
+        None,
     );
     assert!(
         matches!(o2, DriveOutcome::Completed(_)),

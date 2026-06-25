@@ -176,6 +176,8 @@ fn drive(
         None,
         Some(ex.signals().clone()),
         now_secs,
+        None,
+        None,
     )
 }
 
