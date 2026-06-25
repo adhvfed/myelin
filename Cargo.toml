@@ -268,6 +268,19 @@ proc-macro2 = "1"
 # network backend — unlike the `integration`-gated Postgres/S3/NATS clients above).
 tantivy = "0.26"
 
+# Yrs (y-crdt) — the Rust-native Yjs CRDT engine (KN-P29 / knowledge-platform 02 §3.3). The named
+# M5 Layer-3 merge promotion over the unchanged resume-cursor transport: a per-block content CRDT
+# (`Y.Text`/`Y.XmlFragment`) for inline runs + a tree/move CRDT for block structure (the hybrid
+# granularity). Being Rust-native keeps the server an in-process "dumb relay + persistence +
+# authority" (no separate CRDT process). It is the cited proven structure (Yjs/Yrs; the CRDT-
+# after-CAS named floor, external-insights/04 §2 — VISION §4 "cite proven structures, do not
+# hand-roll a CRDT"). The op-log carries Yrs UPDATE BYTES; the transport, op_seq cursor and
+# idempotent apply are unchanged — the CRDT is a payload-only swap. An in-process pure-Rust
+# library (like tantivy / git2), part of the default DB-free `cargo build --workspace` — it is NOT
+# a network backend, so it does NOT ride the `integration` feature. Referenced ONLY by
+# `myelin-knowledge`'s collab/merge module.
+yrs = "0.27"
+
 # git2 (libgit2 bindings) — the in-process READ backend of the GitCore layered seam (GIT-P8 /
 # P-269, architecture git-hosting 01 §2.2). The architecture PREFERS gix (gitoxide) in-process and
 # names libgit2 as the FALLBACK "where gix lacks a read capability"; at GIT-P8 the current gix
