@@ -51,6 +51,12 @@
 //! - **The runtime workers are stateless** — a crashed worker's run resumes from the durable
 //!   workflow + the trace (architecture §3.1). Nothing in this crate holds run state.
 
+/// The post-M5 Fabric seam doc (AG-P25 → global P-481): the three named floors (`LlmAgentRuntime`,
+/// the external MCP endpoint, long-term memory/RAG) + the three `[OPEN -> LEGAL]` items, each with
+/// its trigger + follow-on band, machine-checked by the `seam_floors_gap_report` test (0 invisible
+/// gaps). Designed-not-built — NO engine code, NO model/SDK/prompt string. See [`seam`].
+pub mod seam;
+
 use serde::{Deserialize, Serialize};
 
 // ───────────────────────── §2.1 the brain — value types (the conversation) ─────────────────────
