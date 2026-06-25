@@ -102,6 +102,13 @@ pub mod eu_provider;
 // EVENT (`notif.escalation.acked` via the outbox) the signal-wait resolves on; on-call cannot be
 // silenced. NOTIF-D7 (exactly-once page across a kill mid-ack_window) + NOTIF-D8 (critical pierces).
 pub mod escalation;
+// The erasure residual instanced — the X-7 posture for Notif (NOTIF-P27 / P-469 — contract 7.7
+// erase/restrict completed; 10.9 BY REFERENCE; 11.4 per-subject DEK crypto-shred of inline-PII
+// delivery columns; 10.8 the erasure ledger; 10.1 restrict). Composes the four legs:
+// references-not-payloads tombstone-for-free (holder, NOTIF-P4) + per-subject DEK crypto-shred +
+// restrict suppression + the provider-side erasure request (NOTIF-P26 hook) + the erase receipt
+// sealed into the ledger. NOTIF-D6 (erase a user → 0 recoverable PII). See [`erasure_residual`].
+pub mod erasure_residual;
 pub mod holder;
 // The ONE platform templating surface (NOTIF-P9 / P-187 — contract 7.3): `humanise` + the
 // `humanise_template` store + the per-viewer resolve seam + the ONE myelin-content render path +
@@ -190,6 +197,11 @@ pub use define_rule::{
 pub use delivery::{
     build_idem_key, channel_from_token, effective_delivery_count, is_eu_region, redact_for_offcell,
     DeliveryError, DeliveryFabric, DeliveryLedger, DeliveryOutcome, DeliveryRecord, MockAdapter,
+};
+pub use erasure_residual::{
+    erase_residual, DeliveryShredError, ErasedNotifSubject, InMemoryDeliveryShredder,
+    InlineDeliveryShredder, NotifErasureLedger, OffCellResidual, ResidualEraseError,
+    ResidualEraseReceipt, ERASURE_RESIDUAL_PROMPT,
 };
 pub use escalation::{
     notify_for, oncall_now, render_oncall, render_page, DurableWheel, EscalationEngine,
