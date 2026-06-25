@@ -46,13 +46,17 @@
 //! references-not-payloads + crypto-shred + tombstone triad the bus uses (§4.8, "by reference"). This
 //! is a documented coherence reconcile, not an invented holder.
 //!
-//! ## FLOORS named (VISION §3 / EI-01 §1 name-your-floors)
+//! ## FLOORS named (VISION §3 / EI-01 §1 name-your-floors) — the crypto-shred reach now CLOSED
 //! - **The crypto-shred reach** — the per-subject-DEK destruction into the inline-PII `result_key_ref`
-//!   / `payload_key_ref` history rows + backups — is the NAMED M5 follow-on **P-FLOW-24**. This prompt
-//!   ships the STRUCTURAL erase (the references-not-payloads tombstone + the restrict suppression);
-//!   the per-subject key destruction lands at P-FLOW-24. So `erase` here destroys NO key at the flow
-//!   surface (`key_epoch_destroyed = None`) — the references-not-payloads tombstone needs no key
-//!   destroyed for the refs-stored rows; the inline-PII DEK shred is the P-FLOW-24 reach.
+//!   / `payload_key_ref` history rows plus backups — was the NAMED M5 follow-on **P-FLOW-24**, now
+//!   **CLOSED** (FLOW-D9). This module ships the STRUCTURAL erase (the references-not-payloads tombstone
+//!   with the restrict suppression); the per-subject-DEK destruction is COMPLETED in
+//!   [`crate::crypto_shred`] and wired into [`WfHistoryHolder::with_crypto_shred`] /
+//!   [`FlowBacking::with_crypto_shred`]. So `erase` over the structural-only backing destroys NO key
+//!   (`key_epoch_destroyed = None` — the refs-stored rows tombstone for free); `erase` over a
+//!   crypto-shred-wired backing DESTROYS the erased subject's per-subject DEK so the inline-PII rows
+//!   are unrecoverable incl. backups (the receipt's `key_epoch_destroyed` carries the destroyed
+//!   epoch). The §4.8 triad is complete.
 //! - **The `replay` half of 9.6** (`replay(scope, since)` — the run rebuilt by deterministic replay
 //!   from the journal, the only recovery path) is **P-FLOW-05** (FLOW-D1). This module is the holder
 //!   half only; the two together complete contract 9.6.
@@ -75,11 +79,14 @@ use myelin_gdpr::{
     EraseReceipt, EraseScope, LocateReport, Patch, PersonalDataHolder, PortableBundle, Receipt,
     RectifyReceipt, RestrictReceipt, Result as DsrResult, SubjectRef, TenantId as GdprTenantId,
 };
+use myelin_storage::kms::KmsEngine;
 use myelin_substrate::{
     Holder, HolderRegistration, HolderRegistry, StoreClassifier, StoreHolder, StoreKind,
 };
-use myelin_tenancy::TenantId;
+use myelin_tenancy::{Region, TenantId};
 
+use crate::crypto_shred::{history_row_has_inline_pii, WfCryptoShred};
+use crate::engine::FlowTelemetry;
 use crate::wfctx::WfJournal;
 
 /// The stable, PII-free name of the myelin-flow **OLTP store** (the six-table data model, P-FLOW-01 —
@@ -167,22 +174,64 @@ pub struct FlowBacking {
     /// The restrict-suppression set (Art. 18/21) — `restrict(subject, true)` records the subject so
     /// the replay/lease loop keeps its NEW dispatch suppressed (§4.8).
     restrict: RestrictSet,
+    /// **The crypto-shred lever (P-FLOW-24, contract 11.4) — the ONE [`KmsEngine`] + the cell's
+    /// residency region + the telemetry sink.** `Some` = the COMPLETE erase path: `erase` destroys the
+    /// per-subject DEK so the inline-PII `result_key_ref`/`payload_key_ref` rows become unrecoverable
+    /// incl. backups (the FLOW-D9 reach). `None` = the P-FLOW-03 structural-only erase (the refs-stored
+    /// rows tombstone for free; the inline-PII shred is not wired — pre-M5 / a test of the structural
+    /// surface). An `Arc` so the holder stays `Clone` (the registry holds it behind `dyn`).
+    shred: Option<ShredWiring>,
+}
+
+/// The crypto-shred wiring the holder's `erase` drives (P-FLOW-24): the ONE [`KmsEngine`] (shared
+/// `Arc` so the holder is `Clone`), the cell's residency [`Region`], and the [`FlowTelemetry`] sink
+/// the crypto-shred-lag signal lands on. Cloneable.
+#[derive(Clone)]
+pub struct ShredWiring {
+    kms: std::sync::Arc<KmsEngine>,
+    region: Region,
+    telemetry: FlowTelemetry,
 }
 
 impl FlowBacking {
     /// Wire the holder over a live workflow journal (the P-FLOW-03 real body). The restrict set is
-    /// fresh (empty) — `restrict(subject, true)` adds to it.
+    /// fresh (empty) — `restrict(subject, true)` adds to it. No crypto-shred lever (the structural-only
+    /// erase; the inline-PII shred wiring is added by [`Self::with_crypto_shred`], P-FLOW-24).
     pub fn new(journal: WfJournal) -> FlowBacking {
         FlowBacking {
             journal,
             restrict: RestrictSet::new(),
+            shred: None,
         }
     }
 
     /// Wire the holder over a live journal AND a shared restrict-suppression set (so the suppression a
     /// holder records is the SAME set the replay/lease loop consults).
     pub fn with_restrict(journal: WfJournal, restrict: RestrictSet) -> FlowBacking {
-        FlowBacking { journal, restrict }
+        FlowBacking {
+            journal,
+            restrict,
+            shred: None,
+        }
+    }
+
+    /// **Wire the COMPLETE P-FLOW-24 erase path: the per-subject-DEK crypto-shred lever.** Adds the ONE
+    /// [`KmsEngine`] + the cell's residency `region` + the `telemetry` sink so `erase` destroys the
+    /// erased subject's per-subject DEK (the inline-PII `result_key_ref`/`payload_key_ref` rows become
+    /// unrecoverable incl. backups, FLOW-D9). The boot path supplies the live cell KMS/region; a test
+    /// supplies an in-memory engine.
+    pub fn with_crypto_shred(
+        mut self,
+        kms: std::sync::Arc<KmsEngine>,
+        region: Region,
+        telemetry: FlowTelemetry,
+    ) -> FlowBacking {
+        self.shred = Some(ShredWiring {
+            kms,
+            region,
+            telemetry,
+        });
+        self
     }
 
     /// The shared restrict-suppression set (the replay/lease loop reads it to suppress a restricted
@@ -219,6 +268,22 @@ impl WfHistoryHolder {
     pub fn with_backing(backing: FlowBacking) -> WfHistoryHolder {
         WfHistoryHolder {
             backing: Some(backing),
+        }
+    }
+
+    /// **The COMPLETE P-FLOW-24 holder: the live journal + the crypto-shred lever.** `erase` now
+    /// destroys the erased subject's per-subject DEK over `kms` (the inline-PII `result_key_ref`/
+    /// `payload_key_ref` rows become unrecoverable incl. backups, FLOW-D9), records the crypto-shred-lag
+    /// on `telemetry`, and preserves the journal structure (replay still works, the PII is a
+    /// tombstone). `region` is the cell's residency region (the DEK/KEK live in it).
+    pub fn with_crypto_shred(
+        journal: WfJournal,
+        kms: std::sync::Arc<KmsEngine>,
+        region: Region,
+        telemetry: FlowTelemetry,
+    ) -> WfHistoryHolder {
+        WfHistoryHolder {
+            backing: Some(FlowBacking::new(journal).with_crypto_shred(kms, region, telemetry)),
         }
     }
 
@@ -279,6 +344,23 @@ impl WfHistoryHolder {
             .history_in_tenant(&t)
             .iter()
             .filter(|row| Self::row_references_subject(row, subject_id))
+            .count()
+    }
+
+    /// Count the INLINE-PII `wf_history` rows naming the subject (the crypto-shred reach surface —
+    /// the rows whose `result_key_ref` names the subject's per-subject DEK, P-FLOW-24). A subset of
+    /// [`Self::count_appearances`] (which also counts the refs-stored, tombstone-for-free rows). This
+    /// is the count the crypto-shred receipt records (the rows the per-subject-DEK shred makes
+    /// unrecoverable). Returns 0 when unbacked.
+    fn count_inline_pii_rows(&self, tenant: &GdprTenantId, subject_id: &str) -> usize {
+        let Some(b) = &self.backing else {
+            return 0;
+        };
+        let t = TenantId(tenant.0.clone());
+        b.journal
+            .history_in_tenant(&t)
+            .iter()
+            .filter(|row| history_row_has_inline_pii(row, subject_id))
             .count()
     }
 }
@@ -385,38 +467,55 @@ impl PersonalDataHolder for WfHistoryHolder {
     }
 
     fn erase(&self, scope: EraseScope) -> DsrResult<EraseReceipt> {
-        // STRUCTURAL §5.5/§4.8 erase: the engine's erasure surface is SMALL + STRUCTURAL (references-
-        // not-payloads). A wf_history/workflow_run/wf_signal row stores the subject ONLY as the opaque
-        // actor/run pseudonym + structured refs (+ the rare inline-PII envelope key ref); the
-        // appearance TOMBSTONES FOR FREE — Identity's pseudonym-map shred (§4.8) makes the opaque id
-        // unresolvable, and the refs re-resolve to a tombstone at read time. So the holder erase needs
-        // NO PII-column mutation on the refs-stored rows (the structural property the gate pins): it
-        // reports the surface covered + relies on the platform posture.
-        //
-        // NAMED FLOOR (P-FLOW-24, M5): the per-subject-DEK crypto-shred reach into the inline-PII
-        // result_key_ref / payload_key_ref history rows + backups is NOT performed here. So this erase
-        // destroys NO key at the flow surface (key_epoch_destroyed = None) — the references-not-
-        // payloads tombstone needs no key destroyed for the refs-stored rows; the inline-PII DEK shred
-        // is the P-FLOW-24 follow-on. No erasure backdoor: the row stays; the person becomes
-        // unresolvable.
-        let (sid, tenant) = match &scope {
-            EraseScope::Subject { subject, tenant } => {
-                (Self::subject_id(subject), tenant.0.clone())
+        // §5.5/§4.8 erase — the §4.8 TRIAD: references-not-payloads (structural) + crypto-shred + tomb-
+        // stone. Most wf_history/wf_signal rows store the subject ONLY as the opaque actor/run pseudonym
+        // + structured refs; those appearances TOMBSTONE FOR FREE — Identity's §4.8 pseudonym-shred
+        // makes the opaque id unresolvable, the refs re-resolve to a tombstone at read time, 0 PII
+        // columns mutated. The RARE inline-PII rows (a result/payload that genuinely carries personal
+        // data, named by result_key_ref/payload_key_ref) are CRYPTO-SHREDDED — P-FLOW-24 destroys the
+        // subject's per-subject DEK so that ciphertext is unrecoverable INCL. backups, WITHOUT touching
+        // the row (structure preserved — replay still works, the PII is a tombstone). No erasure
+        // backdoor: the row stays; the person becomes unresolvable + their inline PII unrecoverable.
+        let sid = match &scope {
+            EraseScope::Subject { subject, .. } => Self::subject_id(subject),
+            EraseScope::Tenant(_) => String::new(),
+        };
+
+        // The COMPLETE P-FLOW-24 path: when the crypto-shred lever is wired, drive the cascade — it
+        // destroys the per-subject DEK (the inline-PII rows become unrecoverable incl. backups) and
+        // records the crypto-shred-lag (FLOW-D9 / contract 1.8). The receipt carries the destroyed
+        // epoch (P-FLOW-03's None is now filled when inline-PII rows were present).
+        if let Some(b) = &self.backing {
+            if let Some(w) = &b.shred {
+                let inline_pii_rows = match &scope {
+                    EraseScope::Subject { tenant, .. } => self.count_inline_pii_rows(tenant, &sid),
+                    EraseScope::Tenant(_) => 0,
+                };
+                let cascade = WfCryptoShred::with_telemetry(&w.kms, w.region.clone(), &w.telemetry);
+                // requested_at == now on the synchronous in-erase shred (the lag is the time the shred
+                // itself took; a real async erase passes the request clock). 0 lag on the sync path.
+                let report = cascade.shred_subject(&scope, inline_pii_rows, 0, 0);
+                return Ok(crate::crypto_shred::aggregate_receipt(&report, &scope));
             }
-            EraseScope::Tenant(t) => (String::new(), t.0.clone()),
+        }
+
+        // The structural-only path (no crypto-shred lever wired — the P-FLOW-03 surface): the refs-
+        // stored rows tombstone for free; the inline-PII DEK shred is not performed here. key_epoch_
+        // destroyed = None.
+        let tenant = match &scope {
+            EraseScope::Subject { tenant, .. } => tenant.0.clone(),
+            EraseScope::Tenant(t) => t.0.clone(),
         };
         let count = match &scope {
             EraseScope::Subject { tenant, .. } => self.count_appearances(tenant, &sid),
-            // A tenant erase is the crypto-shred (destroy the per-tenant DEK) — the tenant-decommission
-            // lever (11.3/11.4), not a per-row scan here.
             EraseScope::Tenant(_) => 0,
         };
         let outcome = match &scope {
             EraseScope::Subject { .. } => format!(
                 "structural erase: {count} wf_history appearances tombstone for free (refs-not-\
                  payloads; Identity §4.8 pseudonym-shred makes the opaque id unresolvable) — 0 PII \
-                 columns mutated; inline-PII result_key_ref/payload_key_ref per-subject-DEK \
-                 crypto-shred = P-FLOW-24 (M5); replay P-FLOW-05"
+                 columns mutated; the inline-PII per-subject-DEK crypto-shred reach is wired via \
+                 WfHistoryHolder::with_crypto_shred (P-FLOW-24); replay P-FLOW-05"
             ),
             EraseScope::Tenant(_) => {
                 "tenant crypto-shred: destroy the per-tenant DEK (11.3/11.4) — \
@@ -425,8 +524,6 @@ impl PersonalDataHolder for WfHistoryHolder {
             }
         };
         Ok(EraseReceipt {
-            // No KEY destroyed at the flow holder (the refs-stored rows tombstone for free; the inline-
-            // PII DEK crypto-shred is the P-FLOW-24 reach). key_epoch_destroyed = None.
             receipt: Receipt::content_addressed(
                 "erase",
                 FLOW_OLTP_STORE,

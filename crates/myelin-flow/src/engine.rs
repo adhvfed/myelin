@@ -608,6 +608,18 @@ struct TelemetryInner {
     /// of parking is exactly what the mutation floor must catch). There is no code path that increments
     /// this; it is the structural assertion that the gate has no fork branch.
     fork_count: u64,
+    /// **the crypto-shred-LAG gauge (the FLOW-D9 green artifact, §1.8 / contract 1.8 — crypto-shred
+    /// reaching history, P-FLOW-24).** The lag, in seconds, between a subject-erase request and the
+    /// per-subject-DEK destroy that renders their inline-PII `result_key_ref`/`payload_key_ref` history/
+    /// signal rows unrecoverable (including in backups). Set from the [`crate::crypto_shred`] cascade as
+    /// each erase completes — the gauge the FLOW-D9 drill reads as its dated green signal (the lag the
+    /// erasure took to reach history). 0 on a healthy fleet (the shred runs synchronously in the erase);
+    /// a growing value is the "an Art. 17 crypto-shred is lagging" health signal.
+    crypto_shred_lag_secs: u64,
+    /// **the crypto-shred COUNT counter (the FLOW-D9 / §1.8 audit leg — P-FLOW-24).** Total per-subject
+    /// DEKs the crypto-shred cascade destroyed (one per erased subject who had inline-PII rows).
+    /// Monotonic `+=`. Each `+=` is one subject's inline-PII history/signal rows made unrecoverable.
+    crypto_shreds_count: u64,
 }
 
 impl FlowTelemetry {
@@ -800,6 +812,31 @@ impl FlowTelemetry {
     /// Total settle-on-completion calls the bookend made (the §5.4 telemetry).
     pub fn settled(&self) -> u64 {
         self.lock().settled
+    }
+
+    /// **Record one completed crypto-shred (the FLOW-D9 green artifact, §1.8 / contract 1.8 — P-FLOW-24).**
+    /// Called by the [`crate::crypto_shred`] cascade once per erased subject whose inline-PII history/
+    /// signal rows were made unrecoverable by destroying their per-subject DEK. `lag_secs` is the lag
+    /// between the erase request and the shred completing (the crypto-shred-lag signal the FLOW-D9 drill
+    /// reads). Sets the lag gauge to the observed value and bumps the monotonic shred counter.
+    pub fn record_crypto_shred(&self, lag_secs: u64) {
+        let mut t = self.lock();
+        t.crypto_shred_lag_secs = lag_secs;
+        t.crypto_shreds_count += 1;
+    }
+
+    /// The crypto-shred-lag gauge (the FLOW-D9 green artifact, §1.8 / contract 1.8) — the lag in seconds
+    /// of the most recent per-subject-DEK shred reaching history. 0 on a healthy fleet (the shred runs
+    /// synchronously in the erase); a growing value is the "an Art. 17 crypto-shred is lagging" signal.
+    pub fn crypto_shred_lag_secs(&self) -> u64 {
+        self.lock().crypto_shred_lag_secs
+    }
+
+    /// The crypto-shred counter (the FLOW-D9 / §1.8 audit leg) — total per-subject DEKs the cascade
+    /// destroyed (one per erased subject who had inline-PII rows). Each `+=` is one subject's inline-PII
+    /// history/signal rows made unrecoverable including in backups.
+    pub fn crypto_shreds_count(&self) -> u64 {
+        self.lock().crypto_shreds_count
     }
 
     /// **The reserve/settle REJECT RATE in basis points (`0..=10000` — the §5.4 telemetry the
