@@ -68,6 +68,16 @@ use serde::{Deserialize, Serialize};
 // lint-fixture proof (the three schema gates bite) lives in `tests/lint_fixtures.rs` over RED/GREEN
 // fixtures under `tests/fixtures/` (which the lint-gate excludes by the `/fixtures/` convention).
 pub mod cli;
+// Cross-cell inbox aggregation — the multi-cell floor's follow-on (NOTIF-P24 / P-466 — §5.4, contract
+// 12.6/5.2/10.4 consumed). A multi-cell recipient's unified inbox aggregates across every cell they
+// belong to via the frozen `CrossCellPointer{subject(opaque), type, correlation_id, home_cell}` — the
+// control plane carries ONLY the pointer, NEVER name/email/body; resolution is ALWAYS cell-local (cell
+// A asks cell B to humanise IN B, permission-checked in B, only the rendered projection/tombstone
+// crossing — 0 PII crosses cells, ADR-11). The DSR orchestrator iterates member_cells over the same
+// bridge for the cross-cell erasure leg (GA-D8). cell→cell migration loses 0 inbox items (CP-D7). The
+// single-home-cell path stays the default (complete since NOTIF-P2 — the cell-agnostic §4 contracts
+// made this an EXTENSION, not a rewrite). See [`cross_cell`].
+pub mod cross_cell;
 pub mod define_rule;
 // The delivery fabric (NOTIF-P16 / P-194 — §3.6, contract 7.8): the BODY behind the carrier trait.
 // The idempotent [`DeliveryFabric`] (at-least-once + idempotent on `UNIQUE(tenant, idem_key)`), the
@@ -148,6 +158,12 @@ pub mod watch;
 pub use cli::{
     inbox_list, inbox_read, inbox_show, inbox_snooze, inbox_watch, notify_prefs, notify_prefs_set,
     notify_test, render_prefs, render_watch, CliView, InboxShow, WatchView,
+};
+pub use cross_cell::{
+    aggregation_carried_fields, cross_cell_inbox_pointer, erase_inbox_pointers_in_cell,
+    migrate_item_home_cell, CellLocalInboxResolver, CrossCellInbox, InboxEraseReceipt,
+    InboxProjectionSlice, InboxResolution, InboxTombstone, InboxTombstoneReason,
+    CROSS_CELL_RAW_ROWS_SIGNAL, CROSS_CELL_RESOLVES_SIGNAL,
 };
 pub use define_rule::{
     define_notif_rule, platform_default_reason, platform_default_rules, Classification, DedupTpl,
