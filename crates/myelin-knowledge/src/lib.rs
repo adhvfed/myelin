@@ -77,6 +77,16 @@ pub mod collab;
 pub mod comments;
 pub mod compaction;
 pub mod database;
+/// Knowledge's legs of the whole-system E2E wedge (KN-P33 / P-488, M5): **E2E-1** (the PR context pane
+/// — a Knowledge design-doc embed resolves per-viewer through the SAME [`refs_glue::Projector`] ladder,
+/// 0 title leak to the unauthorized viewer, the tombstone carrying ONLY the root) and **E2E-3** (the
+/// spec-to-ship lineage — a Knowledge spec doc → initiative → issues traceability over TE-7 typed
+/// edges, cold-reindex == live via the SAME [`replay::KnowledgeReindexSource`], and audit tamper
+/// detected via a hash-chained lineage seal built from the frozen
+/// [`myelin_storage::blob::ContentHash::blake3`] primitive). Each leg drives the whole flow end-to-end
+/// (chaining mutations mid-flight, EI-01 §4) over the UNCHANGED production-hardened engine and emits a
+/// named green artifact ([`e2e_wedge::E2eArtifact`]). No new contract; no weakened gate.
+pub mod e2e_wedge;
 pub mod editor;
 pub mod emit;
 /// The Export/Import service (KN-P24 / P-314, M3): the Art. 20 lossless JSON portable bundle (the
@@ -131,6 +141,10 @@ pub use database::{
     DbRow, FacetIndexHint, FacetPath, FacetTelemetry, FieldDef, FieldSchema, LoweredViewFilter,
     PageBound, PropertyBag, RelationEdgeEvent, RelationKind, RelationStore, SchemaError, ViewError,
     ViewQuery, FACET_PROMOTION_THRESHOLD,
+};
+pub use e2e_wedge::{
+    run_e2e1_pr_context_pane, run_e2e3_spec_to_ship_lineage, run_knowledge_e2e_legs, E2eArtifact,
+    E2E_SCENARIOS as KNOWLEDGE_E2E_SCENARIOS,
 };
 pub use editor::{Document, EditOp, Editor, EditorBlock, SecondViewer, BROWSER_DRIVE_EVIDENCE};
 pub use emit::{
