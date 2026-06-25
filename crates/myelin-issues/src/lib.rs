@@ -271,6 +271,7 @@ pub mod cost_bounder;
 pub mod cross_cell_rollup;
 pub mod declares;
 pub mod dek;
+pub mod e2e_wedge;
 pub mod events;
 pub mod floor_triggers;
 pub mod governance;
@@ -670,6 +671,18 @@ pub use refs_glue::{
 pub use agent_spend::{
     per_effect_idem_key, spend_bearing_run, BalancedRunSignal, DispatchedRun, IssueRunKind,
     IssueSpendGate, SpendError,
+};
+
+// ISS-P34 (P-497, M5-I9): the whole-system E2E-1 wedge — the PR context pane, the Issues side. Issues'
+// `project()` resolves the linked issue PER-VIEWER with 0 leak (an outsider gets a tombstone carrying
+// the root, never the title), the mid-flight `ci.check.updated` re-reads the linked PR's CURRENT
+// CheckStatus off the fact (5.9) within the freshness budget (merge gate blocked), and the chained
+// scenario emits its named green artifact. EXERCISES the frozen contracts (5.6 project / 5.9
+// CheckStatus) end-to-end over the SAME `Projector`/`LinkedPrCheck` — no new contract, no second
+// resolver, no new leak-decision logic (EI-01 §7). Runs under the MOCK agent runtime (real-LLM is the
+// post-M5 swap, R-10). FLOOR named: none new (the world-scale 30x load is ISS-P33's named floor).
+pub use e2e_wedge::{
+    run_e2e_1_pr_pane, run_issues_e2e_wedge, IssuesE2eArtifact, E2E_SCENARIO, FRESHNESS_BUDGET_SECS,
 };
 
 // ISS-P25 (P-392, M4-I6): the stateful Trigger flagship ("Remind me when unblocked") — exactly-once
