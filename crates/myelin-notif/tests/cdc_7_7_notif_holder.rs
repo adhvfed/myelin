@@ -181,3 +181,81 @@ fn notif_holder_export_is_empty_but_correct() {
     assert_eq!(bundle.receipt.operation, "export");
     assert!(bundle.receipt.content_hash.starts_with("blake3:"));
 }
+
+/// **CDC 7.7 erase/restrict COMPLETED — the residual instanced (X-7 / 10.9 by reference, NOTIF-P27).**
+/// The holder-half structural erase tombstones the inbox appearance for free; the residual completes
+/// 7.7 erase/restrict by reaching the ONE inline-PII case (an already-sent off-cell redacted summary):
+/// the per-subject DEK is crypto-shredded (11.4) → 0 recoverable, a provider-side erasure-request is
+/// issued (the named sub-processor obligation), and restrict suppresses NEW routing (10.1). Notif
+/// restates NO platform posture — it instances the 10.9 residual by reference. This CDC pins that the
+/// erase/restrict half is now COMPLETE (the residual reached), not merely the structural tombstone.
+#[test]
+fn cdc_7_7_erase_restrict_completed_via_the_residual_instanced() {
+    use myelin_notif::{
+        build_idem_key, erase_residual, redact_for_offcell, EuSovereignAdapter, HumanisedString,
+        InMemoryDeliveryShredder, InlineDeliveryShredder, NotifErasureLedger, OffCellResidual,
+        RecordingEuTransport, RestrictSet,
+    };
+    use std::sync::Arc;
+
+    let transport = RecordingEuTransport::new("eu-mailer");
+    let provider = EuSovereignAdapter::new(
+        myelin_notif::prefs::Channel::Email,
+        Region::new("fr-par"),
+        Arc::new(transport.clone()),
+    );
+    let shredder = InMemoryDeliveryShredder::new();
+    let restrict = RestrictSet::new();
+    let ledger = NotifErasureLedger::new();
+
+    // An off-cell redacted summary was sent for the subject (the one inline-PII case).
+    let idem = build_idem_key("itm-1", myelin_notif::prefs::Channel::Email);
+    let summary = HumanisedString {
+        text: "you were mentioned".into(),
+        links: vec!["myelin://acme/issues/issue/PROJ-1".into()],
+        icon: "mention".into(),
+    };
+    provider
+        .try_send(&redact_for_offcell(summary, Class::Direct), &idem)
+        .expect("off-cell delivery accepted (EU region)");
+    let provider_ref = provider.provider_ref_for(&idem).expect("provider_ref");
+    let dek = myelin_events::PiiKeyRef("kms://acme/0/subject:u-erase".into());
+    shredder.seal(&dek);
+
+    // The residual erase COMPLETES 7.7 erase/restrict (the X-7 / 10.9 instancing).
+    let receipt = erase_residual(
+        "u-erase",
+        &TenancyTenantId::from_token("acme"),
+        &[OffCellResidual {
+            idem_key: idem,
+            inline_pii_key: Some(dek.clone()),
+        }],
+        &shredder,
+        &restrict,
+        &provider,
+        &ledger,
+        myelin_events::Timestamp("2026-06-25T00:00:00Z".into()),
+    )
+    .expect("the residual erase succeeds");
+
+    assert!(
+        receipt.is_green(),
+        "0 recoverable PII + restrict applied (7.7 erase complete)"
+    );
+    assert!(
+        !shredder.is_live(&dek),
+        "the inline-PII DEK is crypto-shredded (11.4)"
+    );
+    assert!(
+        transport.was_erased(&provider_ref),
+        "the off-cell copy was erasure-requested"
+    );
+    assert!(
+        restrict.is_restricted("u-erase"),
+        "restrict suppresses new routing (10.1)"
+    );
+    assert!(
+        ledger.is_erased("u-erase"),
+        "the erase receipt is in the ledger (10.8)"
+    );
+}
