@@ -183,6 +183,11 @@ pub mod commit;
 /// tier) build on. See the module docs for the TE-8 position, the no-host-exec discipline, and the
 /// OQ-1 gix-ward floor (GIT-P33).
 pub mod core;
+/// **Cross-cell / multi-region git replication** (GF-2 → GIT-P33, M5): the single-cell primary+quorum
+/// floor lifts to cross-cell active replica sets within-EU, riding the OQ-I [`myelin_tenancy::
+/// CrossCellPointer`] bridge ([`cross_cell::CrossCellReplicaSet`]). `update_seq` is the fence; resolution
+/// is always cell-local; the bridge frame is PII-free.
+pub mod cross_cell;
 pub mod events;
 /// The **fork / trust-tier endorsement gate** (GIT-P22 / P-284, M3-G4 — the poisoned-pipeline defence).
 /// Closes the [`merge_gate`] floor by shipping the two halves the merge gate consumed as explicit
@@ -306,6 +311,17 @@ pub mod merge_gate;
 /// [`myelin_flow::MockCiResultProducer`]).
 pub mod merge_queue;
 pub mod notif_rules;
+/// **The SHA-256 default flip** (GF-2b → OQ-9, GIT-P33 / P-482, M5): the new-repo default object format
+/// flips from SHA-1+`sha1dc` to SHA-256, hash-AGNOSTIC — a default-CHANGE, not a migration. The flip is
+/// GATED on the stock-tooling interop bar ([`object_format::flip_default_to_sha256`]); existing repos
+/// are untouched (their [`object_format::ObjectFormat`] is immutable).
+pub mod object_format;
+/// **Git-side OBJECT-BACKED packs** (GF-1 → R-1/OQ-4, GIT-P33 / P-482, M5): the [`pack_tier::
+/// PackObjectDb`] promoted from the local-NVMe floor onto the storage OBJECT tier
+/// ([`myelin_storage::object_backed_pack_tier`]) — a type-parameter SWAP, not a rewrite. Adds the OQ-4
+/// quorum-ack property ([`object_packs::object_backed_migration_acks_on_quorum`]) and the
+/// smart-transport byte-parity GATE ([`object_packs::smart_transport_parity`]).
+pub mod object_packs;
 /// The git **PACK TIER on the local-NVMe `BlobStore` floor** (GIT-P11 / P-272, M3-G1): the git-side
 /// object-DB migration THROUGH the [`myelin_storage::GitPackTier`] (closing the receive-pack
 /// `QuarantineMigration` floor), the commit-graph/reachability-bitmap/MIDX maintenance artifacts +
@@ -313,6 +329,11 @@ pub mod notif_rules;
 /// and the residency-pin lint (repos relocatable, never node-pinned — STOR-5). Floors GF-1 (object-
 /// backed packs) / GF-2 (cross-cell) / GF-2b (SHA-256 flip) / GF-4 (Mononoke-class) all → GIT-P33.
 pub mod pack_tier;
+/// **Patch-id-chain anchor carry-over** (GF-5 → R-6, GIT-P33, M5): a content-anchored inline thread
+/// ([`anchor`]) follows a rebased hunk through a MULTI-commit rebase by matching `git patch-id` across
+/// the pre/post-rebase commit sequence ([`patch_id_chain::carry_anchor_through_rebase`]) — so it
+/// resolves `Moved`, not degraded to `Outdated`, when an intermediate commit perturbs context.
+pub mod patch_id_chain;
 /// **`project(ref, viewer)` for git artifacts + the `ArtifactRef` id grammar** (GIT-P18 / P-279,
 /// M3-G3 — the projection half): the [`project::Projector::project`] is the ONLY way Refs/Search/Notif
 /// read a git artifact (no cross-DB), **per-viewer permission-checked** — a viewer without access gets
@@ -333,6 +354,11 @@ pub mod rebac_fragment;
 pub mod receive_pack;
 pub mod replay;
 pub mod schema;
+/// **SCIP/LSIF "find usages"** (GF-3 → R-3, GIT-P33, M5): AST-aware code intelligence fed by
+/// CI-produced SCIP indices ([`scip::ScipIndex`]). Git OWNS the find-usages projection (contract 6.5);
+/// Search owns the index. The lexical trigram floor ([`code_projection`]) stays; this adds the
+/// symbol-occurrence "find usages"/"go to definition" layer on top.
+pub mod scip;
 pub mod search_projection;
 /// The **protected-human-lane shed order + the CDN bundle-URI accelerated-clone** (GIT-P15 / P-276,
 /// M3-G2): the [`shed_clone::GitFrontDoorShed`] wires the substrate's shed lane
@@ -344,6 +370,11 @@ pub mod search_projection;
 /// class (`myelin_storage::cdn::CdnCloneClass`, 11.2 C3) — a content-address-verified accelerated
 /// clone (the full within-EU CDN class hardens in GIT-P33).
 pub mod shed_clone;
+/// **The speculative/parallel merge queue** (GF-8 → OQ-5, GIT-P33, M5): the single-lane serialised
+/// queue promotes to speculative batching once the promotion trigger is MEASURED
+/// ([`speculative_queue::PromotionTrigger`]). A speculative batch builds on optimistic tips; a base
+/// movement bisects + rebases the survivors — linearizable on the protected `base_ref` (GIT-D5).
+pub mod speculative_queue;
 pub mod subs;
 /// The **typed-edge mirror: PR-link / commit-trailer lifecycle edges into the Refs projection**
 /// (GIT-P19 / P-280, M3-G3 — the typed-edge-mirror half). As the PR lifecycle advances, a Git PR emits
