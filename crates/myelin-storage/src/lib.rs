@@ -537,6 +537,10 @@ pub mod cache;
 // control-plane half (durable workflow + atomic cut-over) is myelin_control_plane::migration.
 pub mod cell_migration;
 pub mod coloc;
+// The dogfood loop (P-ST-37 / P-506, M6): the restore-verify gate runs on Myelin's OWN stores +
+// the every-incident-adds-a-drill loop + the truth-up pass. WIRES the restore-verify gate
+// (`restore_verify`, 11.5) onto the platform's own data; defines no new gate.
+pub mod dogfood;
 pub mod holder;
 pub mod key_origin;
 pub mod kms;
@@ -676,6 +680,11 @@ pub use ci_log_index::{
     CI_LOG_STREAM,
 };
 pub use coloc::{ColocError, ColocatedOltp, ColocatedTx, COLOCATED_OUTBOX_MIGRATION};
+pub use dogfood::{
+    proven_storage_rows, run_restore_verify_on_dogfood, DogfoodCorpus, DogfoodGreenArtifact,
+    DogfoodRecord, DogfoodStore, IncidentDrillTicket, IncidentIssueDraft, ProvenRow,
+    StorageIncident, TruthUpPass, TruthUpRed, TruthUpVerdict,
+};
 pub use e2e3_reindex_parity::{
     run_e2e3_storage_half, DerivedReindexSource, DerivedStoreClass, DerivedStoreParity,
     E2e3StorageArtifact,
