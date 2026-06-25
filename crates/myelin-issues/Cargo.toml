@@ -112,6 +112,16 @@ myelin-storage = { path = "../myelin-storage" }
 myelin-refs = { path = "../myelin-refs" }
 serde.workspace = true
 serde_json.workspace = true
+# ISS-P32 (P-495, M5): the move-CRDT measured floor follow-on (R-3 / arch 05 §5 "Floor → follow-on").
+# The Yrs CRDT is the CITED convergent structure (VISION §4 — never a hand-rolled merge) the move-CRDT
+# promotion of the ISS-P09 server-arbitrated-CAS ranking floor slots into, reusing the BYTE-IDENTICAL
+# `order_key` (the promotion swaps the conflict-resolution ENGINE, not the data model — arch §5). This
+# is the SAME `yrs` crate Knowledge's `yrs_engine` (KN-P29 / P-484) uses for its block move-CRDT — the
+# cited structure is shared, NOT the `myelin-knowledge` subsystem crate (a subsystem→subsystem edge
+# would break the §2.9 leaf-consumer DAG). Issues links the `yrs` external crate directly, mirroring
+# Knowledge's pattern over the shared cited type. Promoted ONLY on a MEASURED concurrent-reorder
+# trigger (`move_crdt::ReorderPressure`) — the CAS floor stands until the measurement fires.
+yrs = { workspace = true }
 
 # ------------------------------------------------------------------------------------------
 # ISS-P05 (P-371): REAL live-stack schema apply behind the `integration` feature. The complete

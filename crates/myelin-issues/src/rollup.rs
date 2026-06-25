@@ -146,7 +146,7 @@ impl LeafFact {
 /// done/total counts, and the `input_hash` that drives the no-op suppression. The aggregate carries
 /// NO migration table (the edge truth is `issue_relation`; this is rebuilt off it by `replay`). The
 /// `input_hash` is the fingerprint of the INPUTS — a recompute producing the same hash emits NO event.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RollupAggregate {
     /// The number of leaf descendants counted into this rollup (the live total — excludes `cancelled`).
     pub total: u64,

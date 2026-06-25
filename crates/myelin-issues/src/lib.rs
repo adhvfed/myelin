@@ -268,9 +268,11 @@ pub mod board_sync;
 pub mod ci_guard;
 pub mod content;
 pub mod cost_bounder;
+pub mod cross_cell_rollup;
 pub mod declares;
 pub mod dek;
 pub mod events;
+pub mod floor_triggers;
 pub mod governance;
 pub mod holder;
 pub mod holder_erase;
@@ -278,6 +280,7 @@ pub mod holder_intent;
 pub mod import;
 pub mod keys;
 pub mod migrations;
+pub mod move_crdt;
 pub mod my_work;
 pub mod olap_feed;
 pub mod planner;
@@ -373,6 +376,39 @@ pub use write_path::create_issue;
 pub use reorder::{
     cmp_ranked, rebalance, reorder, same_displayed_sequence, BoardRanking, RankedIssue,
     ReorderError, ReorderOutcome, ReorderRequest,
+};
+
+// ISS-P32 (P-495, M5): the MEASURED move-CRDT promotion of the CAS reorder floor (R-3, arch §5
+// "Floor → follow-on"). `MoveCrdtBoard` is the convergent Yrs-list engine over the BYTE-IDENTICAL
+// order_key (the data model is unchanged across the engine swap — `derived_order_keys` recomputes the
+// frozen codec from the convergent list order); `ReorderPressure` is the MEASURED concurrent-reorder
+// trigger that promotes a board off the CAS floor only on a measured re-base rate (VISION §3 — the
+// floor stands until the signal fires). The move-CRDT re-greens ISS-D5 across the engine-promote
+// boundary (0 clobber holds, now stronger — two concurrent distinct-issue moves both survive). Reuses
+// the cited `yrs` structure (VISION §4 — the SAME crate Knowledge's yrs_engine uses), never a second
+// frame.
+pub use move_crdt::{MoveCrdtBoard, MoveCrdtError, MoveCrdtFloors, ReorderPressure};
+
+// ISS-P32 (P-495, M5): the cross-cell portfolio rollup over the PII-free CrossCellPointer bridge
+// (R-7 / OQ-I, arch §7 "Floor → follow-on": single-cell rollup → cross-cell). `CrossCellPortfolioRollup`
+// fans a remote portfolio child out as a PII-free pointer homed in the child's cell; resolution is
+// ALWAYS cell-local (`resolve_cell_local` → only the `RollupAggregate` numbers cross back, never a leaf
+// row). `CrossCellDsrFanout` is the DSR fan-out iterating member_cells (GA-D1 / CP-D7 / CP-D8 — 0 cell
+// missed, per-cell receipt, 0 PII crosses). Consumes the frozen contract 12.6/10.4, never a second
+// bridge frame (EI-01 §7 — the Issues twin of Knowledge's collab::CrossCellCollab).
+pub use cross_cell_rollup::{
+    CellLocalRollupResolver, CrossCellDsrFanout, CrossCellPortfolioRollup, CrossCellRollupFloors,
+    CrossCellRollupPointer, DsrCellReceipt, PortfolioProjection,
+};
+
+// ISS-P32 (P-495, M5): the MEASURED promotion triggers for the four remaining floor follow-ons that
+// ship the measurement seam, NOT the migration (VISION §3 — promote only on a measured signal):
+// materialised-rollup-on-measured-large (R-4), distributed-SQL-on-shard-outgrows-PG (R-6),
+// Monte-Carlo-on-measured-variance (R-5), column-store-on-measured-volume (EI-04 §5). `Iss32FloorRegister`
+// is the executable floor register naming every follow-on WITH its trigger + the post-M5 R-10.
+pub use floor_triggers::{
+    ColumnStoreTrigger, DistributedSqlTrigger, Iss32FloorRegister, MaterialisedRollupTrigger,
+    MonteCarloForecastTrigger,
 };
 
 // ISS-P10 (P-376, M4): the issue body + comments as a `myelin-content` block subtree (the consumed
