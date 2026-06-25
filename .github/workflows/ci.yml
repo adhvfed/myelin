@@ -123,6 +123,36 @@ jobs:
       - name: The Id-M1 scorecard ratchet meta-test (dropping a drill OR green-without-proof reds the gate)
         run: cargo test -p myelin-harness --test id_m1_scorecard_ratchet
 
+  self-hosting-ci:
+    # The Myelin SELF-HOSTING CI graph — the DOGFOOD loop (P-507 / P-S37 → M6, SUB-M6). LOUD:
+    # the gate is the `self-hosting-ci` binary's exit code. It runs the substrate ratchet AS
+    # Myelin CI jobs on Myelin's OWN commit — the twelve architecture lints + the contract-coverage
+    # scanner + the mandatory-core cargo-mutants mutation gate (the `.cargo/mutants.toml` surface:
+    # outbox/relay/consumer/dedup + ResilientClient + FailStatic + the shed lane) — and the harness
+    # DRIVES the substrate's surge/restore/migration drills (SUB-D3/D6/D10). It writes
+    # testing/scorecards/self-hosting-ci.md and EXITS NON-ZERO if ANY job is red (a deliberately-
+    # violating commit — a lint red, a surviving mutant, a red drill — is rejected; the ratchet
+    # rejects on Myelin's own work, EI-01 §5). There is deliberately NO `|| true` / `continue-on-
+    # error`. The dogfood meta-test proves the graph carries the ratchet AND that a violating commit
+    # reds the gate.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Reclaim ~25GB on the runner (dotnet/android/ghc) so the workspace link does not run out of
+      # disk — see the env: note above. Loud-but-non-fatal so a tooling hiccup never fails the gate.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          large-packages: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-mutants (the mandatory-core mutation gate tool)
+        run: cargo install cargo-mutants --locked
+      - name: The dogfood meta-test (the graph carries the ratchet; a violating commit reds the gate)
+        run: cargo test -p myelin-harness --test self_hosting_ci_dogfood
+      - name: The self-hosting CI graph on Myelin's own commit (lints + scanner + mutation gate + SUB-D3/D6/D10; non-zero on any red)
+        run: cargo run -p myelin-harness --bin self-hosting-ci
+
   build-test-clippy:
     runs-on: ubuntu-latest
     steps:

@@ -1224,4 +1224,193 @@ mod tests {
         let h = RunClass::derive(&PrincipalKind::Human, None);
         assert_eq!(lane.admit(&t, h), ShedDecision::Admit);
     }
+
+    // ---- P-507 mutation gate: pin the boundary comparisons + the small accessors ----------------
+
+    /// `ShedDecision::is_admitted` is `true` ONLY for `Admit` (a `Shed` is not admitted). Pins the
+    /// accessor (a constant-`true`/`false` mutant would mis-report shed as admitted, or vice versa).
+    #[test]
+    fn is_admitted_is_true_only_for_admit() {
+        assert!(ShedDecision::Admit.is_admitted(), "Admit is admitted");
+        assert!(
+            !ShedDecision::Shed {
+                retry_after_secs: 5
+            }
+            .is_admitted(),
+            "Shed is NOT admitted"
+        );
+    }
+
+    /// `validate_tuned` rejects reservation STRICTLY over cap — a reservation EXACTLY at the cap is
+    /// VALID (the whole budget reserved for the human lane is allowed). Pins the `reservation > cap`
+    /// strict comparison (a `>=` mutant would wrongly reject the at-cap budget).
+    #[test]
+    fn validate_tuned_admits_reservation_equal_to_cap_rejects_strictly_over() {
+        // reservation == cap → VALID (HttpIntake reserves a human lane; floor(10)=2 ≤ 10).
+        let at_cap = SurfaceBudget {
+            per_tenant_in_flight_cap: 10,
+            human_lane_reservation: 10,
+            retry_after_secs: 5,
+        };
+        assert!(
+            at_cap.validate_tuned(Surface::HttpIntake).is_ok(),
+            "reservation == cap is valid (not over) — strict `>`"
+        );
+        // reservation == cap + 1 → REJECTED (strictly over).
+        let over = SurfaceBudget {
+            per_tenant_in_flight_cap: 10,
+            human_lane_reservation: 11,
+            retry_after_secs: 5,
+        };
+        assert!(
+            matches!(
+                over.validate_tuned(Surface::HttpIntake),
+                Err(ShedBudgetError::ReservationOverCap { .. })
+            ),
+            "reservation strictly over cap is rejected"
+        );
+    }
+
+    /// `validate_tuned` starves a human lane only when the reservation is STRICTLY below the floor —
+    /// a reservation EXACTLY at the floor is VALID. Pins the `reservation < floor` strict comparison
+    /// (a `<=` mutant would wrongly reject the exactly-at-floor budget). For cap 10 the floor is 2.
+    #[test]
+    fn validate_tuned_admits_reservation_exactly_at_the_human_lane_floor() {
+        assert_eq!(
+            SurfaceBudget::human_lane_floor(10),
+            2,
+            "floor(10) == 2 (20%)"
+        );
+        // reservation == floor → VALID.
+        let at_floor = SurfaceBudget {
+            per_tenant_in_flight_cap: 10,
+            human_lane_reservation: 2,
+            retry_after_secs: 5,
+        };
+        assert!(
+            at_floor.validate_tuned(Surface::HttpIntake).is_ok(),
+            "reservation == floor is valid (not starved) — strict `<`"
+        );
+        // reservation == floor - 1 → STARVED.
+        let below = SurfaceBudget {
+            per_tenant_in_flight_cap: 10,
+            human_lane_reservation: 1,
+            retry_after_secs: 5,
+        };
+        assert!(
+            matches!(
+                below.validate_tuned(Surface::HttpIntake),
+                Err(ShedBudgetError::HumanLaneStarved { floor: 2, .. })
+            ),
+            "reservation strictly below the floor starves the human lane"
+        );
+    }
+
+    /// `ShedLane::in_flight` reports the per-tenant total admitted-not-released, and the graded
+    /// non-human ceiling uses `step` as a MULTIPLIED offset (`2 * step` for speculative) with a
+    /// STRICT `<` admit comparison. Pins `in_flight` (a constant-`0` mutant would hide the blast
+    /// radius), the `2 * step` arithmetic (cap 24 ⇒ step 3 ⇒ `2*3=6` ≠ `2+3=5`, so a `+`/`/` mutant
+    /// of the `*` moves the ceiling and is caught), AND the `cur.non_human < ceiling` strict bound
+    /// (a `<=` mutant would admit one too many). (P-507 mutation gate.)
+    #[test]
+    fn in_flight_tracks_admits_and_the_graded_speculative_ceiling_uses_two_steps() {
+        // cap 24, reserved 0 → non_human_budget 24, step = 24/8 = 3.
+        //   speculative ceiling = 24 - 2*3 = 18  (`2*3=6`; a `+` mutant gives `2+3=5` → ceiling 19,
+        //   a `/` mutant gives `2/3=0` → ceiling 24 — both move the shed point, so both are caught).
+        let budget = SurfaceBudget {
+            per_tenant_in_flight_cap: 24,
+            human_lane_reservation: 0,
+            retry_after_secs: 5,
+        };
+        let mut lane = ShedLane::with_budget(Surface::AgentMention, budget);
+        let t = tenant("acme");
+
+        // admit EXACTLY 18 speculative runs — the 19th sheds (ceiling == 18, strict `<`: a `<=`
+        // mutant would admit a 19th before shedding).
+        for i in 0..18 {
+            assert_eq!(
+                lane.admit(&t, RunClass::Speculative),
+                ShedDecision::Admit,
+                "speculative admit #{i} is under the 18-ceiling"
+            );
+        }
+        assert_eq!(
+            lane.in_flight(&t),
+            18,
+            "in_flight reports the 18 admitted (not 0) — the blast-radius signal"
+        );
+        assert!(
+            matches!(
+                lane.admit(&t, RunClass::Speculative),
+                ShedDecision::Shed { .. }
+            ),
+            "the 19th speculative run sheds at the 2*step ceiling (18) — strict `<`"
+        );
+
+        // releasing one frees exactly one slot (in_flight back to 17; the next admit fits).
+        lane.release(&t, RunClass::Speculative);
+        assert_eq!(
+            lane.in_flight(&t),
+            17,
+            "release decremented in_flight by one"
+        );
+        assert_eq!(
+            lane.admit(&t, RunClass::Speculative),
+            ShedDecision::Admit,
+            "with a freed slot the speculative run is admitted again"
+        );
+    }
+
+    /// **The TOTAL in-flight is STRICTLY bounded by the cap — `cur.total() < cap` is the binding
+    /// guard when humans have already filled part of the budget.** With cap 8, reserved 0 (agent
+    /// ceiling == cap == 8): admit 3 HUMANS (total 3) then AGENT runs. The agent guard is
+    /// `non_human < 8 && total < 8`; at non_human 5 the total hits 8 (3 humans + 5 agents) so
+    /// `total < cap` FAILS while `non_human < ceiling` is still TRUE (5 < 8) — the `total < cap`
+    /// clause is the BINDING constraint here. A `<=` mutant (`total <= cap`) would admit a 9th run
+    /// (total 9 > cap) — the bounded-everything invariant breach (contract 1.11). Pins the strict
+    /// `<`. (P-507 mutation gate.)
+    #[test]
+    fn total_in_flight_is_strictly_bounded_by_cap_even_with_humans_present() {
+        let cap = 8u32;
+        let budget = SurfaceBudget {
+            per_tenant_in_flight_cap: cap,
+            human_lane_reservation: 0, // agent ceiling == cap; `total < cap` becomes the binding guard.
+            retry_after_secs: 5,
+        };
+        let mut lane = ShedLane::with_budget(Surface::AgentMention, budget);
+        let t = tenant("acme");
+
+        // 3 humans fill part of the budget (the human lane admits while total < cap).
+        for i in 0..3 {
+            assert_eq!(
+                lane.admit(&t, RunClass::Human),
+                ShedDecision::Admit,
+                "human admit #{i} fits"
+            );
+        }
+        // 5 agents bring total to 8 (== cap); non_human (5) is STILL below the ceiling (8).
+        for i in 0..5 {
+            assert_eq!(
+                lane.admit(&t, RunClass::Agent),
+                ShedDecision::Admit,
+                "agent admit #{i} fits while total < cap and non_human < ceiling"
+            );
+        }
+        assert_eq!(
+            lane.in_flight(&t),
+            cap,
+            "total in-flight is exactly the cap (8)"
+        );
+        // the 6th agent: non_human 5 < ceiling 8 (TRUE) but total 8 < 8 (FALSE) → shed. The
+        // `total < cap` clause binds. A `<=` mutant would admit it (total 9 > cap — breach).
+        assert!(
+            matches!(lane.admit(&t, RunClass::Agent), ShedDecision::Shed { .. }),
+            "the run that would push total OVER the cap sheds — `cur.total() < cap` is strict"
+        );
+        assert_eq!(
+            lane.in_flight(&t),
+            cap,
+            "in_flight never exceeds the cap (bounded-everything, contract 1.11)"
+        );
+    }
 }
