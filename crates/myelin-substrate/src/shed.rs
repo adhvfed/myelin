@@ -390,6 +390,17 @@ pub enum Surface {
     /// shed query returns `429` and never a partial/leaked result — the permission pre-filter still
     /// gates every query that IS admitted (the §4.2 zero-escape invariant is untouched under shed).
     SearchQuery,
+    /// **The durable-workflow START surface** — the workflow-initiation path at world-scale (FLOW-D8,
+    /// durable-workflow.md §7.6). The 30× surge is an **agent-mention storm** (an agent fan-out
+    /// initiating workflows); an agent-initiated-workflow storm sheds (`429 + Retry-After`) BEFORE a
+    /// **human-initiated workflow**, which holds the protected lane (F-8). Per-tenant in-flight caps
+    /// keep one tenant's agent-workflow storm off another tenant's humans (the per-tenant bulkhead,
+    /// §7.1/§7.6). This is the surface the Flow surge gate (P-FLOW-27) admits workflow starts against,
+    /// per-tenant. Human-facing (a human-initiated workflow is shed last). The shed is a pre-start
+    /// admission decision (it refuses an over-budget start cheaply BEFORE any run is journaled), so a
+    /// shed start returns `429` and never a half-created run — the reserve/settle budget gate
+    /// (contract 11.7, P-FLOW-16) still bookends every start that IS admitted.
+    WorkflowAgentLane,
     /// The generic HTTP intake queue (§7.1) — every public surface's request intake.
     HttpIntake,
 }
@@ -413,6 +424,7 @@ impl Surface {
             | Surface::RefsBacklinkRead
             | Surface::RefsRefCreate
             | Surface::SearchQuery
+            | Surface::WorkflowAgentLane
             | Surface::HttpIntake => true,
         }
     }
@@ -515,6 +527,18 @@ impl ShedBudgetTable {
                 retry_after_secs: 3,
             },
         );
+        // Durable-workflow start (P-FLOW-27, FLOW-D8): an agent-initiated-workflow storm sheds before
+        // a human-initiated workflow — a reserved human fraction protects the human-initiated lane (the
+        // F-8 protected lane). The retry-after is generous (a workflow start is not latency-critical —
+        // an agent fan-out backs off and re-initiates).
+        rows.insert(
+            Surface::WorkflowAgentLane,
+            SurfaceBudget {
+                per_tenant_in_flight_cap: 96,
+                human_lane_reservation: 24,
+                retry_after_secs: 10,
+            },
+        );
         // The generic HTTP intake (§7.1): every public surface reserves a human fraction.
         rows.insert(
             Surface::HttpIntake,
@@ -560,6 +584,7 @@ impl ShedBudgetTable {
             Surface::RefsBacklinkRead,
             Surface::RefsRefCreate,
             Surface::SearchQuery,
+            Surface::WorkflowAgentLane,
             Surface::HttpIntake,
         ] {
             if let Some(b) = self.rows.get(&surface) {
@@ -979,6 +1004,7 @@ mod tests {
             Surface::RefsBacklinkRead,
             Surface::RefsRefCreate,
             Surface::SearchQuery,
+            Surface::WorkflowAgentLane,
             Surface::HttpIntake,
         ] {
             let b = table.budget(surface);
@@ -1016,6 +1042,14 @@ mod tests {
         assert!(table.budget(Surface::RefsRefCreate).human_lane_reservation > 0);
         // The Search query surface protects a human lane (a human's interactive search is shed last).
         assert!(table.budget(Surface::SearchQuery).human_lane_reservation > 0);
+        // The durable-workflow start surface protects a human lane (a human-initiated workflow is shed
+        // last; an agent-initiated-workflow storm sheds first — F-8).
+        assert!(
+            table
+                .budget(Surface::WorkflowAgentLane)
+                .human_lane_reservation
+                > 0
+        );
     }
 
     // ---- P-S33: the tuned-budget human-lane floor (you cannot tune a human lane into starvation) ---
@@ -1039,6 +1073,7 @@ mod tests {
             Surface::RefsBacklinkRead,
             Surface::RefsRefCreate,
             Surface::SearchQuery,
+            Surface::WorkflowAgentLane,
             Surface::HttpIntake,
         ] {
             let b = table.budget(surface);

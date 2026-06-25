@@ -225,6 +225,7 @@ pub mod remint;
 pub mod restore_verify;
 pub mod schema;
 pub mod signal_consumer;
+pub mod surge;
 pub mod timer;
 pub mod wfctx;
 
@@ -285,6 +286,10 @@ pub use restore_verify::{
     RestoredFlow, WfRestore, WfRestoreVerify,
 };
 pub use signal_consumer::{FlowSignalConsumer, SIGNAL_EVENT_TYPE};
+pub use surge::{
+    run_flow_surge, FlowShedGate, FlowShedRejection, FlowSurgeReport,
+    CROSS_CELL_SPANNING_IS_A_FLOOR, FLOW_SURGE_MULTIPLIER,
+};
 pub use timer::sla::{sla_timer_id, trigger_stale_timer_id, SlaTimerCall};
 pub use timer::{
     epoch_minute, ArmOutcome, DisarmOutcome, FireOutcome, ReArmOutcome, TimerRow, TimerStore,
