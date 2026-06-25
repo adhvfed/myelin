@@ -121,14 +121,26 @@ myelin-query = { path = "../myelin-query" }
 # default `cargo build --workspace` compiles neither (the DB-free build floor, the binding policy).
 sqlx = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
+# CHAT-P28 (P-502, M5): the dev<->prod CONFIG SWAP seam supplying the object-store (S3) endpoint the
+# cold-segment swap parity proof (`tests/integration_chat_p28_blob_swap.rs`) connects the live
+# `S3BlobStore` to. OPTIONAL — pulled ONLY by `--features integration`; the default DB-free build
+# never sees it (the binding policy). The live `S3BlobStore` itself comes from
+# `myelin-storage/integration` (the real object-store backing the cold tier swaps to).
+myelin-config = { path = "../myelin-config", optional = true }
 
 [features]
 default = []
 # CHAT-P4 (P-398): pull the REAL Postgres hot tier (`store::pg::PgMessageStore`) + compile the
 # live-backend integration test. Turns on the storage crate's `integration` feature (the real
-# PgStore/BlobStore clients) and the sqlx/tokio clients the integration test drives. The default
-# `cargo build --workspace` compiles NONE of this — the DB-free build floor (the binding policy).
-integration = ["myelin-storage/integration", "dep:sqlx", "dep:tokio"]
+# PgStore/BlobStore clients) and the sqlx/tokio clients the integration test drives. CHAT-P28
+# (P-502) ALSO pulls `myelin-config` (the S3 endpoint for the cold-segment object-store swap proof).
+# The default `cargo build --workspace` compiles NONE of this — the DB-free build floor.
+integration = [
+    "myelin-storage/integration",
+    "dep:sqlx",
+    "dep:tokio",
+    "dep:myelin-config",
+]
 
 [dev-dependencies]
 # The Identity namespace ENGINE — the CDC for contract 4.9 admits chat's RICH fragment (the

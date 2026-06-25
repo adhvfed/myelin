@@ -28,14 +28,25 @@
 //! never wall-clock-derived at read time. The aggregate is `conversation_id` — the keying the
 //! CHAT-P5 outbox `UNIQUE(aggregate, seq)` and the CHAT-D2 total-order property build on.
 //!
-//! ## Named floors (VISION §3 name-your-floors)
-//! - **The hot tier is Postgres-partitioned; the ScyllaDB hot tier is the named M5 follow-on**
-//!   (M5-C-S2 / CHAT-P28 / P-502), triggered by measured per-cell write/partition volume. The
-//!   [`MessageStore`] trait makes it a SWAP; the cold tier + trait are identical either way.
-//! - **The fs-backed `BlobStore` → object-store swap (contract 11.2)** is the named M5 follow-on
-//!   riding the SAME promotion (CHAT-P28 / P-502). The cold tier here uses [`MemHotTier`]'s sibling
-//!   [`myelin_storage::FsBlobStore`] (the in-process fs floor); the object-store backing is a
-//!   one-line `BlobStore` swap.
+//! ## Named floors (VISION §3 name-your-floors) — the CHAT-P28 / P-502 promotion split
+//! This prompt (CHAT-P28 / P-502) is a TRIGGERED M5 promotion. One leg is built (the object-store
+//! swap is a one-line, behaviour-preserving backing change provable now); the other stays a named
+//! floor because its measured trigger has NOT fired (EI-04 §4 — the gap is VISIBLE, in code):
+//! - **The fs-backed `BlobStore` → object-store swap (contract 11.2) is RESOLVED for the cold
+//!   segments (CHAT-P28 / P-502).** [`ColdSegments`] is now generic over `B: BlobStore` (defaulting
+//!   to the DB-free [`myelin_storage::FsBlobStore`] floor so the build stays DB-free); production
+//!   seals to the object-store [`myelin_storage::s3blob::S3BlobStore`] via
+//!   [`ColdSegments::with_blob_store`] — a CONSTRUCTION-TIME backing change, NOT a code change.
+//!   [`chat_cold_blob_store_parity`] proves the seal/read is byte-identical fs↔object (the CI proof
+//!   runs fs↔fs; the `--features integration` proof runs fs↔S3 against the live dev-stack RustFS).
+//! - **The ScyllaDB hot tier remains a NAMED FLOOR — the trigger has NOT fired**
+//!   ([`SCYLLA_HOT_TIER_PROMOTED`]` == false`; M5-C-S2 / CHAT-P28 / P-502). It is taken ONLY on
+//!   [`SCYLLA_PROMOTION_TRIGGER`] (measured per-cell write/partition volume crossing the hot-tier
+//!   budget, R-C6/R-5); the CHAT-P26/P-500 surge family measured the gateway SHED budgets, not the
+//!   message-store write/partition volume, so the v1 Postgres-partitioned hot tier is RETAINED
+//!   (measure-before-shard, ADR-10). The [`MessageStore`] trait makes the eventual promotion a SWAP
+//!   (the cold tier + trait identical either way; residency-pinned + crypto-shred-capable per cell),
+//!   and CHAT-D2 + CHAT-D8 re-run across it; landing at [`SCYLLA_PROMOTION_LANDING`].
 //! - **The outbox co-commit + `chat.message.created` emit LANDED in CHAT-P5** (P-399). The
 //!   [`MessageStore`] threads the [`OutboxTx`] seam so the append's state change AND its
 //!   `chat.message.created` event commit in ONE transaction (BUS-2, emit-iff-committed): `append`
@@ -684,18 +695,39 @@ impl MessageStore for MemHotTier {
 /// The store keeps the segment hashes per conversation (the PG `(conversation, range → segment)`
 /// index the arch describes) so a cold read fetches the right segments; here that index is an
 /// in-process map (the fs floor models the layout, not a shortcut).
-pub struct ColdSegments {
-    blob: FsBlobStore,
+///
+/// **Generic over `B: BlobStore` — the object-store swap seam (contract 11.2, CHAT-P28 / P-502).**
+/// The backing defaults to the fs floor [`FsBlobStore`] (the DB-free unit-test tier, so
+/// [`MemHotTier`] and `cargo build --workspace` stay DB-free) but is ANY [`BlobStore`]: in
+/// production the cold segments seal to the object-store [`myelin_storage::s3blob::S3BlobStore`]
+/// (RustFS in dev, Scaleway Object Storage in prod). Because the content address is BLAKE3 of the
+/// PLAINTEXT (backing-independent), the swap is a CONSTRUCTION-TIME backing change, NOT a code
+/// change — the seal/read logic here is identical under either backing, and
+/// [`chat_cold_blob_store_parity`] proves the put/get is byte-identical fs↔object. The residency
+/// pin holds because the BlobStore is per-tenant-keyed (`<tenant>/…`); the crypto-shred-for-erasure
+/// is the per-tenant/per-subject DEK destroy (the GDPR holder's job, CHAT-P6), which operates at the
+/// key layer and is therefore preserved across the backing swap.
+pub struct ColdSegments<B: BlobStore = FsBlobStore> {
+    blob: B,
     /// `conversation` → the content addresses of its sealed segments, oldest-first (the
     /// `(conversation, range → segment)` index, arch §2.1).
     index: Mutex<BTreeMap<ConversationId, Vec<ContentHash>>>,
 }
 
-impl ColdSegments {
-    /// A fresh cold tier over a new fs-backed `BlobStore`.
-    pub fn new() -> ColdSegments {
+impl ColdSegments<FsBlobStore> {
+    /// A fresh cold tier over a new fs-backed `BlobStore` (the DB-free floor backing).
+    pub fn new() -> ColdSegments<FsBlobStore> {
+        ColdSegments::with_blob_store(FsBlobStore::new())
+    }
+}
+
+impl<B: BlobStore> ColdSegments<B> {
+    /// A fresh cold tier over an EXPLICIT [`BlobStore`] backing — the object-store swap entry point
+    /// (contract 11.2, CHAT-P28 / P-502). Pass [`myelin_storage::s3blob::S3BlobStore`] to seal cold
+    /// segments to the real object store (a one-line backing change; the seal/read code is unchanged).
+    pub fn with_blob_store(blob: B) -> ColdSegments<B> {
         ColdSegments {
-            blob: FsBlobStore::new(),
+            blob,
             index: Mutex::new(BTreeMap::new()),
         }
     }
@@ -745,11 +777,117 @@ impl ColdSegments {
     }
 }
 
-impl Default for ColdSegments {
+impl Default for ColdSegments<FsBlobStore> {
     fn default() -> Self {
         ColdSegments::new()
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// The object-store BlobStore swap parity (contract 11.2; CHAT-P28 / P-502) — the cold-segment
+// backing swap is behaviour-preserving.
+// ---------------------------------------------------------------------------------------------
+
+/// The verdict of [`chat_cold_blob_store_parity`] — whether the cold-segment object-store swap is
+/// byte-identical to the fs floor (contract 11.2). Carried (not just a `bool`) so a test/log row can
+/// assert the content address matched AND name the two addresses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColdBlobParityVerdict {
+    /// The content address the fs floor assigned the sealed cold segment.
+    pub fs_address: ContentHash,
+    /// The content address the object store assigned the SAME segment bytes (must equal `fs_address`
+    /// — BLAKE3-of-plaintext is backing-independent).
+    pub object_address: ContentHash,
+    /// `true` iff the address matched AND both backings round-tripped the EXACT segment bytes (the
+    /// swap preserved both the content address AND the bytes — STOR-D7 0-silent-serve).
+    pub byte_identical: bool,
+}
+
+/// **Prove the cold-segment object-store BlobStore swap is behaviour-preserving (contract 11.2;
+/// CHAT-P28 / P-502 — the fs floor for chat cold segments RESOLVED).** Seals the SAME batch of
+/// `messages` under the SAME `tenant` keyspace to BOTH the fs floor and the object store and
+/// asserts: (1) the content address is IDENTICAL (BLAKE3-of-the-encoded-segment is
+/// backing-independent), and (2) the bytes read back from BOTH stores decode to the SAME message
+/// rows the input encodes (re-hash-on-read integrity holds in both — STOR-D7 0-silent-serve). This
+/// is the behaviour-preserving check the one-line backing swap rests on; [`ColdSegments`] is already
+/// generic over `B: BlobStore`, so the swap is a CONSTRUCTION-TIME backing change, NOT a code change
+/// to the cold tier (EI-01 §7 — one cold-tier encoder, two backings).
+///
+/// Generic over two [`BlobStore`]s so the CI parity proof runs fs↔fs (deterministic, DB-free) and
+/// the `--features integration` proof runs fs↔[`myelin_storage::s3blob::S3BlobStore`] against the
+/// LIVE object store (the real artifact that flips the gate green — the cold tier seals exactly
+/// these bytes either way).
+pub fn chat_cold_blob_store_parity<F, O>(
+    fs: &F,
+    object: &O,
+    tenant: &TenantId,
+    messages: &[Message],
+) -> Result<ColdBlobParityVerdict>
+where
+    F: BlobStore,
+    O: BlobStore,
+{
+    // The cold tier's private wire — encoded ONCE, sealed to both backings (the segment a real seal
+    // would write). BLAKE3 of these exact bytes is the content address either backing computes.
+    let bytes = encode_segment(messages);
+    let fs_address = fs
+        .put(tenant, &bytes)
+        .map_err(|e| StoreError::Cold(e.to_string()))?;
+    let object_address = object
+        .put(tenant, &bytes)
+        .map_err(|e| StoreError::Cold(e.to_string()))?;
+    let fs_back = fs
+        .get(tenant, &fs_address)
+        .map_err(|e| StoreError::Cold(e.to_string()))?;
+    let object_back = object
+        .get(tenant, &object_address)
+        .map_err(|e| StoreError::Cold(e.to_string()))?;
+    // Decode each backing's read-back so the parity is asserted on the DOMAIN rows (a cold read is a
+    // decode), not just the wire bytes — the cold tier is range-readable identically either way.
+    let fs_rows = decode_segment(&fs_back)?;
+    let object_rows = decode_segment(&object_back)?;
+    let address_identical = fs_address == object_address;
+    let fs_roundtrip_ok = fs_rows == messages;
+    let object_roundtrip_ok = object_rows == messages;
+    let byte_identical = address_identical && fs_roundtrip_ok && object_roundtrip_ok;
+    Ok(ColdBlobParityVerdict {
+        fs_address,
+        object_address,
+        byte_identical,
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// The ScyllaDB hot-tier promotion — a NAMED FLOOR (the trigger has NOT fired). VISION §3 /
+// EI-04 §4: the gap must be VISIBLE, with its measured trigger signal + landing prompt.
+// ---------------------------------------------------------------------------------------------
+
+/// **The ScyllaDB hot-tier promotion is a NAMED FLOOR — the trigger has NOT fired (M5-C-S2 /
+/// CHAT-P28 / P-502; the named M4-C1 floor, R-C6/R-5).**
+///
+/// The promotion is **TRIGGERED, not unconditional** (architecture 05 §2 "ScyllaDB the named
+/// measured promotion"; roadmap chat §5; the measure-before-shard mandate ADR-10): it is taken ONLY
+/// when [`SCYLLA_PROMOTION_TRIGGER`] fires — measured per-cell write/partition volume crossing the
+/// hot-tier budget. No such signal has been measured (the CHAT-P26 / P-500 surge family measured the
+/// gateway SHED budgets, never the message-store hot-tier write/partition volume crossing a budget),
+/// so the v1 Postgres-partitioned hot tier ([`pg::PgMessageStore`]) is RETAINED. This constant is
+/// `false` so the gap is VISIBLE in code, not implied. When the trigger fires, the promotion is a
+/// [`MessageStore`]-trait SWAP (the cold tier + trait are identical under either hot engine —
+/// residency-pinned + crypto-shred-capable per cell), and CHAT-D2 (per-conversation total order) +
+/// CHAT-D8 (0 recoverable PII) re-run across the swap (they were written to survive it).
+pub const SCYLLA_HOT_TIER_PROMOTED: bool = false;
+
+/// **The measured trigger that would fire the ScyllaDB hot-tier promotion** (R-C6/R-5; the honest
+/// named-floor signal, EI-04 §4). Recorded so the floor is not a silent gap: the promotion lands at
+/// CHAT-P28 / P-502 the moment a cell's measured message-store write/partition volume crosses the
+/// hot-tier budget. Until then the Postgres-partitioned hot tier is correct (the cell bounds the
+/// scale — a cell is one region's tenants, ADR-11, not the planet).
+pub const SCYLLA_PROMOTION_TRIGGER: &str =
+    "measured per-cell message-store write/partition volume crossing the hot-tier budget (R-C6/R-5)";
+
+/// **Where the ScyllaDB hot-tier promotion lands when [`SCYLLA_PROMOTION_TRIGGER`] fires** — the
+/// landing prompt id, so the named floor points at its filler (the gap is traceable, EI-04 §4).
+pub const SCYLLA_PROMOTION_LANDING: &str = "CHAT-P28 / P-502";
 
 /// Serialise a cold segment: a length-prefixed line-delimited JSON encoding of the message rows.
 /// The content address the `BlobStore` computes is over THESE bytes (plaintext-addressed; the DEK
