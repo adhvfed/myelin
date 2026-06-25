@@ -171,6 +171,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod comment_consolidation;
 pub mod composer;
 pub mod content;
 pub mod conversation;
@@ -199,6 +200,10 @@ pub mod subs;
 pub mod tools;
 pub mod unfurl;
 
+pub use comment_consolidation::{
+    comment_consolidation_gap_report, AnchoredCommentPresenceDemand, PresenceDemandBudget,
+    COMMENT_CONSOLIDATION_FLOOR, COMMENT_CONSOLIDATION_FLOORS,
+};
 pub use composer::{
     detect_pasted_url, AutocompleteKind, AutocompletePort, Draft, DraftKey, DraftStore, EditCas,
     EditOutcome, EditRequest, MemDraftStore, SlashCommand, SlashMenu, Suggestion, UnfurlIntent,
