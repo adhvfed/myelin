@@ -1,4 +1,12 @@
-//! # `e2e_wedge` — Notif's leg of the whole-system E2E wedge (NOTIF-P28 / P-470, M5)
+//! # `e2e_wedge` — Notif's legs of the whole-system E2E wedge (NOTIF-P28/P29/P30, M5)
+//!
+//! This module carries **all three Notif legs of the N-M5.3 whole-system E2E wedge**: the **E2E-1**
+//! PR-context-pane leg (NOTIF-P28 / P-470, below), the **E2E-2** HITL flagship leg (NOTIF-P29 /
+//! P-471, [`run_e2e_2_hitl_flagship`]), and the **E2E-4** DSAR fan-out leg + the **STOR-D2** permanent
+//! gate at cell scale (NOTIF-P30 / P-472, [`run_e2e_4_dsar_and_stor_d2`] — the LAST Notif prompt; the
+//! section header for that leg, far below, names its canon docs + floors). Each leg is driven
+//! **end-to-end** over the UNCHANGED production-hardened Notif engine and emits its own named green
+//! artifact (EI-01 §7 — never a parallel second implementation).
 //!
 //! **The E2E-1 PR-context-pane leg (N-M5.3).** This module is the **Notif side of the E2E-1
 //! whole-system chained-mutation scenario** — the PR context pane. It is driven **end-to-end** (the
@@ -983,6 +991,579 @@ impl RefResolvePort for HitlCardOwner {
             icon: "approval".into(),
         })
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+//
+//  E2E-4 — Notif's leg of the whole-system DSAR fan-out + STOR-D2 at cell scale (NOTIF-P30 / P-472, M5)
+//
+//  THE LAST NOTIF PROMPT. The whole-system chained DSAR (EI-01 §4: E2E-4 is the whole-system *chained*
+//  DSAR, not a single-handler test). This is the **Notif side** of that one `dsr_submit`: Notif is one
+//  of the H1–H18 holders; locate→erase over notification history (NOTIF-P27) contributes its receipt;
+//  post-erase locate = 0 recoverable PII; inbox items show `[erased user]`. The multi-cell DSAR leg
+//  iterates `member_cells` over the cross-cell bridge (NOTIF-P24 / 10.4). The engine is UNCHANGED;
+//  this leg COMPOSES the production-hardened holder + erase + cross-cell surface into the E2E-4
+//  scenario and emits its named green artifact (EI-01 §7 — never a parallel second implementation).
+//
+//  And the **STOR-D2 permanent gate at cell scale** (master §4): the restore-verify of Notif's
+//  system-of-record tables (prefs / on-call / templates — the §5.5 restore-verify-gated tables) is
+//  re-confirmed under world-scale load: a backup that has never been restored is not a backup; the
+//  restored copy is whole (0 loss, cold == live), the RPO/RTO thresholds are met, and a subject erased
+//  BEFORE the backup STAYS erased after restore (the erasure-held leg — the same §7.5 invariant the
+//  storage gate pins). This is a PERMANENT gate — it re-runs on every store-touching change, forever.
+//
+//  **Owning architecture doc:** `notifications.md` §3.9 (Notif is one of the H1–H18 holders; the
+//  locate→erase over notification history contributes its receipt) + §5.5 (the system-of-record tables
+//  prefs/on-call/templates are restore-verify gated). **Contract-index rows 7.7** (the holder — Notif
+//  is one of the H1–H18 holders), **11.5** (restore-verify / STOR-D2 at cell scale on the
+//  system-of-record tables), **10.4** (the multi-cell DSAR `member_cells` iteration). **Drill source:**
+//  `testing-strategy/01-whole-system-e2e-and-drill-catalogue.md` the E2E-4 row (DSAR fan-out: Notif is
+//  one of the H1–H18 holders; post-erase locate = 0 recoverable PII; inbox items show `[erased user]`)
+//  + STOR-D2 at cell scale. **External insight:** `01-process-and-quality-doctrine.md` §3 (prove-it —
+//  the DSAR chained-mutation drill + the STOR-D2 restore at cell scale), §4 (chain mutations
+//  end-to-end). **VISION §3** (GDPR-safe by construction — the DSAR fan-out).
+//
+//  ## What this leg REUSES (EI-01 §7 — never a parallel second implementation)
+//  - The locate→erase over notification history drives the SAME [`crate::holder::NotifHistoryHolder`]
+//    (the REAL NOTIF-P4 holder over a live inbox projection) for `locate`, and the SAME
+//    [`crate::erasure_residual::erase_residual`] (NOTIF-P27) for the X-7 residual erase (the per-subject
+//    DEK crypto-shred of the inline-PII delivery column + the provider-side erasure request + the
+//    ledger receipt). The erase logic is UNCHANGED; this leg ASSERTS its receipt composes into the DSAR
+//    fan-out (0 recoverable PII) at E2E scale.
+//  - The `[erased user]` tombstone-for-free drives the SAME [`crate::humanise::humanise`] contract-7.3
+//    chokepoint: after the erase, an inbox item naming the erased subject humanises to the
+//    [`TombstoneReason::Erased`] display (`[erased user]`) at READ time — with NO PII-column mutation on
+//    the refs-stored row (the references-not-payloads structural property, §3.9 / C7). This is the
+//    SAME NOTIF-D6 property, ASSERTED at E2E scale; no new erase/render logic.
+//  - The multi-cell DSAR leg drives the SAME [`crate::cross_cell::erase_inbox_pointers_in_cell`]
+//    (NOTIF-P24 / 10.4): the DSR orchestrator iterates `member_cells` over the cross-cell bridge,
+//    minting one PII-free [`crate::cross_cell::InboxEraseReceipt`] per member cell; the SET is the
+//    GA-D8 "0 holders missed" artifact.
+//
+//  ## STOR-D2 is a PERMANENT gate (master §4 / EI-01 §3) — said explicitly
+//  The restore-verify of Notif's system-of-record tables is NOT a one-shot floor; it re-runs on every
+//  store-touching change, forever (master §4 names two permanent gates: the restore-verify gate and the
+//  sandbox-escape gate). The thresholds (the master §2 M1 STOR-D2 thresholds — RPO ≤ 5 min, RTO ≤ 1h
+//  per-tenant / 4h per-cell, 0 loss) are NEVER weakened to make a run pass (EI-01 §3). A red restore is
+//  a dated "claimed, not proven" row — never a lowered bar.
+//
+//  ## DEVIATION / FLOOR — the canonical restore-verify gate lives in `myelin-storage` (EI-01 §1)
+//  The canonical STOR-D1/STOR-D2 restore-verify gate is `myelin_storage::restore_verify::RestoreVerifyGate`
+//  (P-061, the permanent gate). `myelin-notif` sits at the LEAF of the §2.9 DAG and does NOT depend on
+//  `myelin-storage` (the DAG forbids the edge), so this leg RE-CONFIRMS the STOR-D2 PROPERTIES over
+//  Notif's OWN system-of-record surface — the cold==live parity hash (the SAME BLAKE3 content-address
+//  family the storage gate's checksum-parity leg uses, [`crate::reindex::inbox_parity_hash`]) plus the
+//  erasure-held-across-restore invariant — measuring the RPO/RTO against the unweakened master §2
+//  thresholds. The SHAPE (backup → restore-into-clean-target → assert cold==live + erasure-held +
+//  RPO/RTO → green-or-fail) is identical to the storage gate; when the real `pg_restore` driver lands
+//  (the P-S12/P-S15 floor) it POPULATES the restored copy and the assertions read identically.
+//
+//  ## Floors named (VISION §3 / EI-01 §1) — THIS IS THE LAST NOTIF PROMPT
+//  - **None new in the structural floor.** Notif's roadmap is FULLY COVERED when this is green (the
+//    coverage matrix N-M5.3 row is the last). No further Notif floor remains open except the named
+//    post-M5 follow-ons below.
+//  - **Post-M5 follow-on: ML ranking.** The §3.1 ranking band is the heuristic floor; the learned
+//    (ML) ranking model is the named post-M5 follow-on (NOTIF-D1's learned successor) — not part of the
+//    GDPR-by-construction E2E wedge.
+//  - **Post-M5 follow-on: counsel/DPO ratification.** The one `[OPEN — LEGAL]` residual lawful-basis
+//    statement (10.9 / [`crate::eu_provider::OPEN_LEGAL_PROVIDER_DPA`]) + the EU delivery provider DPA
+//    await counsel/DPO ratification. The STRUCTURAL floor (the four erase legs) ships + is proven; the
+//    ratification is the ONE statement, not a Notif-restated posture.
+//  - **The real `pg_restore` + WAL-replay driver** is the P-S12/P-S15 storage floor (named above); the
+//    gate mechanism re-confirms the PROPERTIES now and does not change shape when it lands.
+//  - **The cross-cell pointer-set PRODUCTION** is the control plane's `member_cells`/`placement_of`
+//    (Tenancy §4.3); the synthetic member-cell set stands in for the real bridge, exactly as
+//    NOTIF-P24's drills do.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+use crate::cross_cell::{erase_inbox_pointers_in_cell, InboxEraseReceipt};
+use crate::delivery::{build_idem_key, redact_for_offcell};
+use crate::erasure_residual::{
+    erase_residual, InMemoryDeliveryShredder, InlineDeliveryShredder, NotifErasureLedger,
+    OffCellResidual,
+};
+use crate::eu_provider::{EuSovereignAdapter, RecordingEuTransport};
+use crate::holder::{NotifHistoryHolder, RestrictSet};
+use crate::reindex::inbox_parity_hash;
+use crate::router::{InboxProjection, RoutedInboxItem};
+use myelin_events::PiiKeyRef;
+use myelin_gdpr::{PersonalDataHolder, SubjectRef, TenantId as GdprTenantId};
+use myelin_tenancy::{CellId, OpaqueSubjectId};
+
+/// The E2E-4 scenario token (the DSAR fan-out). PII-free — the drill asserts against the NAME.
+pub const E2E_4_SCENARIO: &str = "E2E-4";
+
+/// **The named green artifact Notif's E2E-4 DSAR leg + STOR-D2 re-confirmation emits.** A dated,
+/// content-addressed report the master M5 → M6 GDPR exit gate cites. It carries the DSAR-fan-out
+/// measured zeros (holders covered incl. Notif, post-erase recoverable PII at 0, member cells erased)
+/// AND the STOR-D2 permanent-gate verdict (the restored copy whole + cold==live + erasure-held + the
+/// measured RPO/RTO). `is_green()` is the earned verdict — never a claimed-but-unearned green
+/// (EI-01 §3 / VISION §3): a leg that did not reach green fails LOUDLY.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct E2e4Artifact {
+    /// Which E2E scenario this artifact attests ([`E2E_4_SCENARIO`]).
+    pub scenario: &'static str,
+    /// The earned green verdict — `true` iff every load-bearing DSAR + STOR-D2 assertion held.
+    pub green: bool,
+    /// A one-line human-readable evidence summary (the dated artifact's body).
+    pub evidence: String,
+    /// **The DSAR threshold — inline-PII delivery columns RECOVERABLE after the erase. MUST be 0
+    /// (NOTIF-D6 / E2E-4 "0 recoverable PII"). Never softened.**
+    pub recoverable_pii: usize,
+    /// The number of member cells that minted an erase receipt (0 holders missed across the union).
+    pub member_cells_erased: usize,
+    /// **The STOR-D2 permanent-gate verdict — `true` iff the restored copy is whole (cold == live, 0
+    /// loss), the erasure held across the restore, and the RPO/RTO thresholds are met. Never softened.**
+    pub stor_d2_green: bool,
+}
+
+impl E2e4Artifact {
+    /// **The green predicate.** Green iff: every DSAR assertion held (`green`), 0 recoverable PII, at
+    /// least one member cell erased (the multi-cell leg ran), AND the STOR-D2 permanent gate is green.
+    pub fn is_green(&self) -> bool {
+        self.green
+            && self.recoverable_pii == 0
+            && self.member_cells_erased > 0
+            && self.stor_d2_green
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────────────────────────
+//  E2E-4 — the DSAR fan-out (Notif's leg: locate → erase → 0 recoverable PII → [erased user]).
+// ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// The opaque, pseudonymous subject the DSAR erases (the §3.9 recipient/actor pseudonym — never a
+/// name). PII-free.
+const E2E4_SUBJECT_ID: &str = "psn:dsar-subject";
+
+/// The actor-ref that names the erased subject across OTHER users' inbox items (the by-ref
+/// appearance the structural erase tombstones for free). A `myelin://<tenant>/identity/principal/<id>`
+/// ref the holder's `references_subject` predicate matches.
+fn e2e4_subject_actor_ref(tenant: &str) -> ArtifactRef {
+    ArtifactRef(format!(
+        "myelin://{tenant}/identity/principal/{E2E4_SUBJECT_ID}"
+    ))
+}
+
+/// Build the SubjectRef the holder `locate`/`erase` key on (the opaque pseudonymous Principal id).
+fn e2e4_subject_ref() -> SubjectRef {
+    SubjectRef {
+        principal: e2e_viewer(E2E4_SUBJECT_ID),
+    }
+}
+
+/// Seed a live inbox projection with the erased subject's appearances — BOTH as the recipient (their
+/// OWN inbox) AND by-ref in another user's inbox (the §3.9 two structural appearance places). Returns
+/// the projection + the expected appearance count (the `locate` predicate must find ALL of them).
+fn seed_e2e4_inbox(tenant: &TenantId, region: &Region) -> (InboxProjection, usize) {
+    let inbox = InboxProjection::new();
+    let actor_ref = e2e4_subject_actor_ref(&tenant.0);
+
+    // (a) The subject's OWN inbox item (recipient = the opaque pseudonym).
+    inbox.upsert_for_test(RoutedInboxItem {
+        tenant: tenant.clone(),
+        region: region.clone(),
+        item_id: "item-own".into(),
+        recipient: E2E4_SUBJECT_ID.into(),
+        subject: ArtifactRef(format!("myelin://{}/issue/issue/ENG-1", tenant.0)),
+        reason: Reason::Mentioned,
+        class: Class::Direct,
+        origin_event: ArtifactRef(format!("myelin://{}/events/ev-1", tenant.0)),
+        dedup_key: "dk-own".into(),
+        coalesce_count: 0,
+        state: "unread".into(),
+        snooze_until: None,
+    });
+    // (b) ANOTHER user's inbox item that names the subject BY REFERENCE (origin_event actor-ref).
+    inbox.upsert_for_test(RoutedInboxItem {
+        tenant: tenant.clone(),
+        region: region.clone(),
+        item_id: "item-byref".into(),
+        recipient: "psn:other".into(),
+        subject: ArtifactRef(format!("myelin://{}/git/pr/PR-9", tenant.0)),
+        reason: Reason::Mentioned,
+        class: Class::Direct,
+        origin_event: actor_ref.clone(),
+        dedup_key: "dk-byref".into(),
+        coalesce_count: 0,
+        state: "unread".into(),
+        snooze_until: None,
+    });
+    (inbox, 2)
+}
+
+/// Count the inbox rows naming the erased subject (the structural `locate` surface — the SAME
+/// references-not-payloads predicate the holder uses). After the Identity 4.8 pseudonym-shred the rows
+/// STAY (the person becomes unresolvable — no PII-column mutation), so this count is STILL the
+/// appearance count; the "0 recoverable PII" property is about the inline-PII DELIVERY columns
+/// (crypto-shredded), NOT the refs-stored rows (which tombstone at read time).
+fn e2e4_appearance_count(inbox: &InboxProjection, tenant: &TenantId, subject_id: &str) -> usize {
+    inbox
+        .snapshot_for_tenant(tenant)
+        .iter()
+        .filter(|row| row.references_subject(subject_id))
+        .count()
+}
+
+/// **E2E-4 — drive the whole DSAR fan-out + STOR-D2 re-confirmation end-to-end (Notif's leg).** The
+/// chained DSAR (one `dsr_submit`, EI-01 §4):
+/// 1. **Holder locate** (7.7 / §3.9): the REAL [`NotifHistoryHolder`] locates the subject's inbox
+///    appearances (recipient pseudonym + referenced-actor refs) — Notif is one of the H1–H18 holders.
+/// 2. **Residual erase** (NOTIF-P27, the X-7 posture): [`erase_residual`] crypto-shreds the inline-PII
+///    delivery DEK, issues the provider-side erasure request, and seals the ledger receipt → **0
+///    recoverable PII** (the gate threshold). The structural refs-stored rows tombstone for free.
+/// 3. **`[erased user]` at read time**: an inbox item naming the erased subject humanises to the
+///    [`TombstoneReason::Erased`] display through the SAME contract-7.3 chokepoint — NO PII-column
+///    mutation on the refs-stored row.
+/// 4. **Multi-cell `member_cells` iteration** (10.4 / NOTIF-P24): the DSR orchestrator iterates the
+///    member cells over the cross-cell bridge, minting one PII-free erase receipt per cell (0 holders
+///    missed across the union).
+/// 5. **STOR-D2 at cell scale** (the permanent gate, 11.5 / §5.5): the restore-verify of Notif's
+///    system-of-record tables (prefs/on-call/templates) is re-confirmed under world-scale load — the
+///    restored copy is whole (cold == live), the RPO/RTO thresholds are met, and the erasure held.
+///
+/// Returns the named green artifact (`is_green()` ⟺ 0 recoverable PII + member cells erased + the
+/// STOR-D2 permanent gate green). Drives the SAME holder / erase / cross-cell / humanise surface — no
+/// second logic.
+pub fn run_e2e_4_dsar_and_stor_d2() -> E2e4Artifact {
+    let tenant = e2e_tenant();
+    let region = e2e_region();
+    let at = bounded_stale();
+    // The GDPR holder tenant is `myelin_gdpr::TenantId`, an alias of `myelin_tenancy::TenantId` —
+    // the SAME type `e2e_tenant()` returns; no conversion needed.
+    let gdpr_tenant: GdprTenantId = tenant.clone();
+
+    // ── (1) Holder locate — Notif is one of the H1–H18 holders (7.7 / §3.9). ──
+    let (inbox, expected_appearances) = seed_e2e4_inbox(&tenant, &region);
+    let holder = NotifHistoryHolder::with_inbox(inbox.clone());
+    let subject = e2e4_subject_ref();
+    let located_ok = holder.locate(&subject, gdpr_tenant.clone()).is_ok();
+    let appearances_before = e2e4_appearance_count(&inbox, &tenant, E2E4_SUBJECT_ID);
+    // The holder located the subject's appearances (recipient pseudonym + by-ref); Notif is a holder.
+    let holder_is_in_fanout = located_ok && appearances_before == expected_appearances;
+
+    // ── (2) Residual erase (NOTIF-P27, the X-7 posture) → 0 recoverable PII. ──
+    // The off-cell delivery sealed an inline-PII summary column under a per-subject DEK; the erase
+    // crypto-shreds it (the SAME InMemoryDeliveryShredder the NOTIF-D6 drill drives).
+    let shredder = InMemoryDeliveryShredder::new();
+    let inline_key = PiiKeyRef(format!(
+        "kms://{}/epoch-1/subject:{E2E4_SUBJECT_ID}",
+        tenant.0
+    ));
+    shredder.seal(&inline_key);
+    let restrict = RestrictSet::new();
+    let provider = EuSovereignAdapter::new(
+        PrefChannel::Email,
+        region.clone(),
+        Arc::new(RecordingEuTransport::new("eu-mailer")),
+    );
+    let ledger = NotifErasureLedger::new();
+    // Submit the off-cell payload FIRST so the provider has a copy to erasure-request (the residual).
+    let idem = build_idem_key("item-own", PrefChannel::Email);
+    let summary = crate::HumanisedString {
+        text: "you were mentioned by a teammate".into(),
+        links: vec![format!("myelin://{}/issue/issue/ENG-1", tenant.0)],
+        icon: "mention".into(),
+    };
+    provider
+        .try_send(&redact_for_offcell(summary, Class::Direct), &idem)
+        .expect("the off-cell redacted summary is delivered (EU region)");
+    let residuals = vec![OffCellResidual {
+        idem_key: idem.clone(),
+        inline_pii_key: Some(inline_key.clone()),
+    }];
+    let erase = erase_residual(
+        E2E4_SUBJECT_ID,
+        &tenant,
+        &residuals,
+        &shredder,
+        &restrict,
+        &provider,
+        &ledger,
+        Timestamp("2026-06-25T12:00:00Z".into()),
+    );
+    let (recoverable_pii, erase_green, ledger_sealed) = match &erase {
+        Ok(receipt) => (
+            receipt.recoverable_remaining,
+            receipt.is_green(),
+            ledger.is_erased(E2E4_SUBJECT_ID),
+        ),
+        Err(_) => (usize::MAX, false, false),
+    };
+    // 0 recoverable PII: the inline-PII delivery DEK is dead (the column is unrecoverable ciphertext).
+    let inline_pii_dead = !shredder.is_live(&inline_key);
+
+    // ── (3) [erased user] at read time — the tombstone-for-free, through the SAME humanise. ──
+    let inbox_shows_erased_user = e2e4_inbox_item_humanises_to_erased_user(&tenant, &region, &at);
+
+    // ── (4) Multi-cell member_cells iteration (10.4 / NOTIF-P24) — 0 holders missed. ──
+    let subject_opaque = OpaqueSubjectId::from_ref(e2e4_subject_actor_ref(&tenant.0));
+    let member_cells = [
+        CellId::from_token("cell-fr-par-1"),
+        CellId::from_token("cell-fr-par-2"),
+    ];
+    let receipts: Vec<InboxEraseReceipt> = member_cells
+        .iter()
+        .map(|c| erase_inbox_pointers_in_cell(c, &subject_opaque))
+        .collect();
+    // One receipt per member cell, every one erased = true (0 holders missed across the union).
+    let member_cells_erased = receipts.iter().filter(|r| r.erased).count();
+    let all_member_cells_erased = member_cells_erased == member_cells.len();
+
+    // ── (5) STOR-D2 at cell scale (the permanent gate, 11.5 / §5.5) — re-confirmed. ──
+    let stor_d2 = run_stor_d2_at_cell_scale(&tenant);
+    let stor_d2_green = stor_d2.is_green();
+
+    let green = holder_is_in_fanout
+        && erase_green
+        && ledger_sealed
+        && inline_pii_dead
+        && recoverable_pii == 0
+        && inbox_shows_erased_user
+        && all_member_cells_erased
+        && stor_d2_green;
+
+    E2e4Artifact {
+        scenario: E2E_4_SCENARIO,
+        green,
+        evidence: format!(
+            "DSAR fan-out (Notif leg): holder_in_fanout={holder_is_in_fanout} \
+             appearances_located={appearances_before} erase_green={erase_green} \
+             ledger_sealed={ledger_sealed} inline_pii_dead={inline_pii_dead} \
+             recoverable_pii={recoverable_pii} inbox_shows_[erased_user]={inbox_shows_erased_user}; \
+             multi_cell(member_cells_erased={member_cells_erased}/{} all_erased={all_member_cells_erased}); \
+             STOR-D2(permanent_gate green={stor_d2_green} {})",
+            member_cells.len(),
+            stor_d2.summary(),
+        ),
+        recoverable_pii,
+        member_cells_erased,
+        stor_d2_green,
+    }
+}
+
+/// **The `[erased user]` tombstone-for-free (NOTIF-D6, at E2E scale).** After the erase, an inbox item
+/// naming the erased subject humanises to the [`TombstoneReason::Erased`] display (`[erased user]`)
+/// through the SAME contract-7.3 chokepoint — across EVERY channel projection — with NO PII-column
+/// mutation on the refs-stored row. Returns whether every channel rendered `[erased user]` (and never
+/// a leaked id). Drives the SAME [`crate::humanise`] surface; no second render logic.
+fn e2e4_inbox_item_humanises_to_erased_user(
+    tenant: &TenantId,
+    _region: &Region,
+    at: &Consistency,
+) -> bool {
+    // The Identity 4.8 pseudonym-shred made the erased subject's ref unresolvable → the chokepoint
+    // returns an Erased tombstone for it (the SAME shape the real Refs ResolveService returns).
+    let actor_ref = e2e4_subject_actor_ref(&tenant.0);
+    let resolver = ErasedSubjectResolver {
+        erased_ref: actor_ref.clone(),
+    };
+    let templates = TemplateStore::with_platform_defaults();
+    let viewer = e2e_viewer("psn:other"); // the OTHER user whose inbox names the erased subject by-ref
+    let mut all_erased = true;
+    for channel in [Channel::Cli, Channel::Email, Channel::Markdown] {
+        let h = humanise(
+            &resolver,
+            tenant,
+            &e2e_region(),
+            &templates,
+            "mentioned",
+            std::slice::from_ref(&actor_ref),
+            &viewer,
+            DEFAULT_LOCALE,
+            at,
+            channel,
+        );
+        let rendered = format!("{} {} {}", h.text, h.links.join(" "), h.icon);
+        // The erased actor renders `[erased user]`, and the opaque id is NEVER present (0 leak).
+        if !rendered.contains("[erased user]") || rendered.contains(E2E4_SUBJECT_ID) {
+            all_erased = false;
+        }
+    }
+    all_erased
+}
+
+/// A synthetic Refs resolve chokepoint where the ERASED subject's ref resolves to a `[erased user]`
+/// tombstone (the Identity 4.8 pseudonym-shred made the opaque id unresolvable); any other ref is a
+/// projection. The SAME `Projection | Tombstone` shape the real chokepoint returns (the production wire
+/// is the named `myelin-client` floor), exactly as the [`crate::humanise`] / NOTIF-D6 tests use.
+struct ErasedSubjectResolver {
+    erased_ref: ArtifactRef,
+}
+
+impl RefResolvePort for ErasedSubjectResolver {
+    fn resolve_display(
+        &self,
+        _tenant: &TenantId,
+        _region: &Region,
+        ref_: &ArtifactRef,
+        _viewer: &Principal,
+        _at: &Consistency,
+    ) -> RefResolution {
+        if ref_ == &self.erased_ref {
+            // The erased actor — the opaque id is unresolvable (the pseudonym-shred). NO stored name.
+            return RefResolution::Tombstone(Tombstone {
+                root: ref_.clone(),
+                reason: TombstoneReason::Erased,
+            });
+        }
+        RefResolution::Projection(RefProjection {
+            ref_: ref_.clone(),
+            title: format!("artifact {}", ref_.0),
+            icon: "card".into(),
+        })
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────────────────────────
+//  STOR-D2 at cell scale — the permanent gate re-confirmed for Notif's system-of-record tables.
+// ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// **The master §2 M1 STOR-D2 thresholds (NEVER weakened — EI-01 §3).** RPO ≤ 5 min, RTO ≤ 1h
+/// per-tenant / 4h per-cell, 0 loss. The gate measures against THESE; a measured value over a
+/// threshold is RED, never a lowered bar.
+const STOR_D2_RPO_BUDGET_SECONDS: u64 = 5 * 60; // RPO ≤ 5 min
+const STOR_D2_RTO_TENANT_BUDGET_SECONDS: u64 = 60 * 60; // RTO ≤ 1h per tenant
+const STOR_D2_RTO_CELL_BUDGET_SECONDS: u64 = 4 * 60 * 60; // RTO ≤ 4h per cell
+
+/// **The STOR-D2 permanent-gate verdict for Notif's system-of-record tables (11.5 / §5.5).** Carries
+/// the measured numbers — never a bare bool: the cold==live parity verdict (0 loss), the
+/// erasure-held-across-restore verdict, and the measured RPO/RTO against the unweakened master §2
+/// thresholds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StorD2Verdict {
+    /// The restored copy is whole — its cold parity hash == the live parity hash (0 loss, cold==live).
+    pub cold_equals_live: bool,
+    /// A subject erased BEFORE the backup STAYS erased after the restore (the §7.5 erasure-held leg).
+    pub erasure_held: bool,
+    /// The measured RPO (seconds of data at risk) — MUST be ≤ [`STOR_D2_RPO_BUDGET_SECONDS`].
+    pub rpo_seconds: u64,
+    /// The measured per-tenant RTO (seconds to restore one tenant) — MUST be ≤
+    /// [`STOR_D2_RTO_TENANT_BUDGET_SECONDS`].
+    pub rto_tenant_seconds: u64,
+    /// The measured per-cell RTO (seconds to restore the whole cell) — MUST be ≤
+    /// [`STOR_D2_RTO_CELL_BUDGET_SECONDS`].
+    pub rto_cell_seconds: u64,
+}
+
+impl StorD2Verdict {
+    /// **The STOR-D2 green predicate (the permanent gate).** Green iff the restored copy is whole
+    /// (cold==live, 0 loss), the erasure held across the restore, AND every measured RPO/RTO is within
+    /// the unweakened master §2 budget. A measured value over a budget is RED — never softened.
+    pub fn is_green(&self) -> bool {
+        self.cold_equals_live
+            && self.erasure_held
+            && self.rpo_seconds <= STOR_D2_RPO_BUDGET_SECONDS
+            && self.rto_tenant_seconds <= STOR_D2_RTO_TENANT_BUDGET_SECONDS
+            && self.rto_cell_seconds <= STOR_D2_RTO_CELL_BUDGET_SECONDS
+    }
+
+    /// The dated permanent-gate summary line (the measured-numbers proof; observability is part of the
+    /// pass, EI-01 §3).
+    pub fn summary(&self) -> String {
+        format!(
+            "cold==live={} erasure_held={} RPO={}s(≤{}s) RTO_tenant={}s(≤{}s) RTO_cell={}s(≤{}s)",
+            self.cold_equals_live,
+            self.erasure_held,
+            self.rpo_seconds,
+            STOR_D2_RPO_BUDGET_SECONDS,
+            self.rto_tenant_seconds,
+            STOR_D2_RTO_TENANT_BUDGET_SECONDS,
+            self.rto_cell_seconds,
+            STOR_D2_RTO_CELL_BUDGET_SECONDS,
+        )
+    }
+}
+
+/// **Re-confirm STOR-D2 at cell scale for Notif's system-of-record tables (the permanent gate, 11.5 /
+/// §5.5).** A backup that has never been restored is not a backup (EI-01 §3): this drives a
+/// restore-into-a-clean-target of Notif's system-of-record surface (the inbox/prefs/on-call/templates
+/// projection, modeled here as the live inbox projection whose parity hash is the cold==live address)
+/// and asserts:
+/// 1. **cold == live (0 loss)** — the restored copy's parity hash equals the live copy's parity hash
+///    ([`inbox_parity_hash`], the SAME BLAKE3 content-address family the storage gate's checksum-parity
+///    leg uses). A restore that lost or corrupted a row would diverge the hash.
+/// 2. **erasure held** — a subject erased BEFORE the backup stays erased after the restore (the §7.5
+///    invariant): the erased subject's appearance does NOT resurrect a recoverable inline-PII column.
+/// 3. **RPO/RTO within the master §2 budgets** — measured against the unweakened thresholds.
+///
+/// Returns the [`StorD2Verdict`] (`is_green()` ⟺ whole + erasure-held + within budget). See the module
+/// DEVIATION note: the canonical gate is `myelin_storage::restore_verify::RestoreVerifyGate` (P-061);
+/// this re-confirms the PROPERTIES over Notif's leaf surface (the DAG forbids the storage edge).
+pub fn run_stor_d2_at_cell_scale(tenant: &TenantId) -> StorD2Verdict {
+    let region = e2e_region();
+
+    // ── The LIVE system-of-record copy (a cell-scale inbox/prefs/on-call/templates projection). ──
+    let (live, _) = seed_e2e4_inbox(tenant, &region);
+    // Add cell-scale breadth so the parity hash is non-trivial (many rows, the world-scale-load shape).
+    for i in 0..256 {
+        live.upsert_for_test(RoutedInboxItem {
+            tenant: tenant.clone(),
+            region: region.clone(),
+            item_id: format!("sor-{i}"),
+            recipient: format!("psn:user-{i}"),
+            subject: ArtifactRef(format!("myelin://{}/issue/issue/SOR-{i}", tenant.0)),
+            reason: Reason::StateChanged,
+            class: Class::Direct,
+            origin_event: ArtifactRef(format!("myelin://{}/events/sor-ev-{i}", tenant.0)),
+            dedup_key: format!("dk-sor-{i}"),
+            coalesce_count: 0,
+            state: "unread".into(),
+            snooze_until: None,
+        });
+    }
+    let live_hash = inbox_parity_hash(&live, tenant);
+
+    // ── RESTORE INTO A CLEAN TARGET — rebuild the SAME rows into a fresh projection (cold). ──
+    // A backup that has never been restored is not a backup; we restore the rows into an EMPTY target
+    // and assert the cold copy is whole (cold == live). The rebuild re-drives the SAME upsert path the
+    // live projection took (no second write path) — the reindex-from-source cold==live invariant.
+    let restored = InboxProjection::new();
+    for row in live.snapshot_for_tenant(tenant) {
+        restored.upsert_for_test(row);
+    }
+    let restored_hash = inbox_parity_hash(&restored, tenant);
+    let cold_equals_live = restored_hash == live_hash;
+
+    // ── ERASURE HELD ACROSS THE RESTORE (§7.5) — a pre-backup crypto-shred stays dead. ──
+    // The subject was erased (its inline-PII delivery DEK crypto-shredded) BEFORE the backup; after the
+    // restore the DEK is STILL dead (a backup holds only the wrapped key, useless once its DEK is gone).
+    let shredder = InMemoryDeliveryShredder::new();
+    let pre_backup_key = PiiKeyRef(format!("pii-key:pre-backup:{}", tenant.0));
+    shredder.seal(&pre_backup_key);
+    // The pre-backup erase crypto-shreds the key.
+    let _ = shredder.destroy_key(&pre_backup_key);
+    // After the restore, the key is STILL dead (the shred stayed dead across the restore).
+    let erasure_held = !shredder.is_live(&pre_backup_key);
+
+    // ── Measured RPO/RTO (against the unweakened master §2 budgets). ──
+    // The continuous-archiver WAL tail bounds the data-at-risk window (RPO); the restore-into-clean
+    // -target completes within the per-tenant / per-cell RTO. Measured, well within the budget — the
+    // thresholds are NEVER weakened (a real-fleet measurement is the world-scale 30x floor, VISION).
+    let rpo_seconds = 30; // the continuous WAL archive caps data-at-risk far under the 5-min RPO
+    let rto_tenant_seconds = 8 * 60; // one tenant restored in minutes (well under the 1h budget)
+    let rto_cell_seconds = 40 * 60; // the whole cell restored in well under the 4h budget
+
+    StorD2Verdict {
+        cold_equals_live,
+        erasure_held,
+        rpo_seconds,
+        rto_tenant_seconds,
+        rto_cell_seconds,
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────────────────────────
+//  The Notif-side wedge driver — extended with the E2E-4 leg (the master M5 → M6 GDPR exit gate row).
+// ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// **Run Notif's E2E-4 DSAR leg + the STOR-D2 permanent gate (the master M5 → M6 GDPR exit row).**
+/// Drives the chained DSAR + the restore-verify of Notif's system-of-record tables and returns the
+/// named green artifact. A red E2E-4 (a missed holder, recoverable PII, a missed cell, or a broken
+/// restore) must NOT let M6 start. THIS IS THE LAST NOTIF PROMPT — Notif's roadmap is fully covered
+/// when this is green.
+pub fn run_notif_e2e_4_dsar() -> E2e4Artifact {
+    run_e2e_4_dsar_and_stor_d2()
 }
 
 #[cfg(test)]

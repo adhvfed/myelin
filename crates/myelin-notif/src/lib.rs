@@ -206,8 +206,9 @@ pub use delivery::{
     DeliveryError, DeliveryFabric, DeliveryLedger, DeliveryOutcome, DeliveryRecord, MockAdapter,
 };
 pub use e2e_wedge::{
-    e2e_live_frame_draft, run_e2e_1_pr_pane, run_e2e_2_hitl_flagship, run_notif_e2e_wedge,
-    E2eArtifact, E2E_2_SCENARIO, E2E_SCENARIO,
+    e2e_live_frame_draft, run_e2e_1_pr_pane, run_e2e_2_hitl_flagship, run_e2e_4_dsar_and_stor_d2,
+    run_notif_e2e_4_dsar, run_notif_e2e_wedge, run_stor_d2_at_cell_scale, E2e4Artifact,
+    E2eArtifact, StorD2Verdict, E2E_2_SCENARIO, E2E_4_SCENARIO, E2E_SCENARIO,
 };
 pub use erasure_residual::{
     erase_residual, DeliveryShredError, ErasedNotifSubject, InMemoryDeliveryShredder,
