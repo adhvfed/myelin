@@ -93,6 +93,13 @@ pub mod delivery;
 // sub-processor obligation NOTIF-P27 consumes). The concrete vendor + DPA is `[OPEN — LEGAL]`
 // (`OPEN_LEGAL_PROVIDER_DPA`, dated) — the engineering posture ships, counsel/DPO ratifies the vendor.
 pub mod eu_provider;
+// Notif's leg of the whole-system E2E wedge (NOTIF-P28 / P-470 — N-M5.3, the E2E-1 PR-context-pane
+// leg): the per-viewer humanise pane render (NOTIF-P9, contract 7.3) + the live firehose checks-panel
+// update (NOTIF-P15, contract 3.5) driven end-to-end as one chained-mutation scenario (a ref change →
+// firehose live frame → shared per-ref cache bust → live pane re-humanise → per-viewer re-resolve;
+// 0 title leak to the unauthorized viewer). FLOORS named: the E2E-2 HITL flagship leg is NOTIF-P29;
+// the E2E-4 DSAR leg + STOR-D2 is NOTIF-P30. See [`e2e_wedge`].
+pub mod e2e_wedge;
 // Escalation on the durable wheel (NOTIF-P14 / P-192 — §2.4/§3.7, contract 7.5): `page(target,
 // reason)` starts an escalation DURABLE WORKFLOW walking the FROZEN chain shape (page →
 // oncall_now → notify(class=critical, pierces quiet-hours) → escalate-after-timer(ack_window) →
@@ -197,6 +204,9 @@ pub use define_rule::{
 pub use delivery::{
     build_idem_key, channel_from_token, effective_delivery_count, is_eu_region, redact_for_offcell,
     DeliveryError, DeliveryFabric, DeliveryLedger, DeliveryOutcome, DeliveryRecord, MockAdapter,
+};
+pub use e2e_wedge::{
+    e2e_live_frame_draft, run_e2e_1_pr_pane, run_notif_e2e_wedge, E2eArtifact, E2E_SCENARIO,
 };
 pub use erasure_residual::{
     erase_residual, DeliveryShredError, ErasedNotifSubject, InMemoryDeliveryShredder,
