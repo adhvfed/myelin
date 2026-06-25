@@ -654,12 +654,15 @@
 //! [`datamap::ropa`] projection rendered as the team's own space pages); (4) the
 //! every-incident-adds-a-drill loop ([`dogfood::GdprIncident`] — a PII-free issue draft + a
 //! reproducing-drill ticket); and (5) the truth-up pass ([`dogfood::TruthUpPass`] /
-//! [`dogfood::proven_gdpr_rows`] — every PROVEN §9.2 GDPR row (GA-D1..GA-D8 / GA-10 / GA-11 / E2E-3 /
-//! E2E-4) rests on a DATED green artifact; a claimed-not-proven row is a loud RED). It REUSES
-//! [`full_fanout`] + [`multi_cell`] + [`audit_proofs`] + [`datamap`] WHOLESALE (EI-01 §7 — no second
-//! fan-out, no second certificate path, no hand-written RoPA). **Floors named:** the FULL row-by-row
-//! truth-up enumeration across 10.1–10.9 (the closing honesty pass) → **P-GA-38 → P-512**
-//! ([`dogfood::TRUTH_UP_FULL_PASS_PROMPT`]); the live OLTP `audit_entry`/`dsr_request` tables + the
+//! [`dogfood::proven_gdpr_rows`] / [`dogfood::run_truth_up_scorecard`] — **P-512 widens this to the
+//! FULL §10.1–10.9 enumeration**: every PROVEN GDPR row (GA-D1..GA-D8 / GA-D5 / GA-10 / GA-11 / CI-D3
+//! / GIT-D2 / the STOR-D3/D4-GA erasure-ledger faces / E2E-3 / E2E-4) rests on a DATED green artifact
+//! whose proof SOURCE exists on disk; a claimed-not-proven row is a loud RED surfaced in the rendered
+//! [`dogfood::TruthUpScorecard`]). It REUSES [`full_fanout`] + [`multi_cell`] + [`audit_proofs`] +
+//! [`datamap`] WHOLESALE (EI-01 §7 — no second fan-out, no second certificate path, no hand-written
+//! RoPA). **Floors named:** the FULL row-by-row truth-up enumeration across §10.1–10.9 (the closing
+//! honesty pass) is **DELIVERED by P-GA-38 → P-512** ([`dogfood::TRUTH_UP_FULL_PASS_PROMPT`]) — no
+//! remaining floor; the live OLTP `audit_entry`/`dsr_request` tables + the
 //! real KMS signing key + a real RFC-3161 TSA witness + the live self-hosting JetStream subscription
 //! are the same DB/KMS/bus floor every M0/M1 store carries (P-007 / P-S12 — a config swap at boot, not
 //! a code change). **No new mutation floor** (the machinery's floors were set in P-GA-05..P-GA-36 — it
@@ -736,10 +739,10 @@ pub use diffgate::{
 };
 pub use dogfood::{
     myelin_team_holder_schemas, proven_gdpr_rows, run_audit_consumer_on_dogfood,
-    run_self_served_dsr_on_dogfood, AuditDogfoodArtifact, DogfoodAction, DsrDogfoodArtifact,
-    GdprIncident, IncidentDrillTicket, IncidentIssueDraft, KnowledgeSpacePage, ProvenGdprRow,
-    RopaKnowledgeSpace, TruthUpPass, TruthUpRed, TruthUpVerdict, MYELIN_SELF_TENANT,
-    TRUTH_UP_FULL_PASS_PROMPT,
+    run_self_served_dsr_on_dogfood, run_truth_up_scorecard, AuditDogfoodArtifact, DogfoodAction,
+    DsrDogfoodArtifact, GdprIncident, IncidentDrillTicket, IncidentIssueDraft, KnowledgeSpacePage,
+    ProvenGdprRow, RopaKnowledgeSpace, RowStatus, ScorecardEntry, TruthUpPass, TruthUpRed,
+    TruthUpScorecard, TruthUpVerdict, MYELIN_SELF_TENANT, TRUTH_UP_FULL_PASS_PROMPT,
 };
 pub use dsr::{
     resolve_checklist_from_map, ChecklistItem, Dsr, DsrError, DsrId, DsrKind, DsrOrchestrator,
