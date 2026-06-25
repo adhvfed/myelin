@@ -297,6 +297,7 @@ pub mod schema;
 pub mod schemes;
 pub mod sla_calendar;
 pub mod sla_escalation;
+pub mod surge;
 pub mod time_axis;
 pub mod trigger;
 pub mod views;
@@ -304,6 +305,10 @@ pub mod workflow;
 pub mod write_path;
 
 pub use replay::{IssueReindexSource, IssueReplayKind};
+pub use surge::{
+    open_surge_gate_from_thresholds, run_iss_d2_cell_scale, run_issues_owner_surge,
+    IssD2CellScaleReport, IssuesOwnerShed, IssuesOwnerSurgeReport, ISSUES_SURGE_MULTIPLIER,
+};
 
 // ISS-P05 (P-371, M4): the bootable service shell + the complete issue-spine data model + the H3
 // holder. The `serve(AppSpec)` shell (contract 1.1), the forward-only migrations (1.5/11.1/12.1), and
