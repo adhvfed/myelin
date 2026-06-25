@@ -114,6 +114,14 @@ myelin-gdpr = { path = "../myelin-gdpr" }
 # every crate uses; not a parallel serializer.
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Yrs (y-crdt) — KN-P29 / P-484 (M5): the Rust-native Yjs CRDT engine the Layer-3 merge promotes to
+# over the UNCHANGED resume-cursor transport (knowledge-platform 02 §3.3/§3.4). `crate::yrs_engine`
+# seeds a `yrs::Doc` deterministically from a quiesce-lite snapshot (block tree → move-CRDT list;
+# each block's inline string → `Y.Text`); after the `engine_promote` cutover the `doc_op.payload`
+# carries Yrs UPDATE BYTES (the transport, op_seq cursor and idempotent apply are unchanged — the
+# CRDT is a payload-only swap). In-process pure-Rust (like tantivy/git2); part of the default
+# DB-free build — NOT an `integration`-gated network backend.
+yrs = { workspace = true }
 # KN-P06: the REAL Postgres outbox co-commit proof behind the `integration` feature
 # (tests/integration_kn_d7_outbox.rs). The OPTIONAL sqlx + tokio deps are pulled ONLY by
 # `--features integration`; the default `cargo build --workspace` / `cargo test --workspace` stay

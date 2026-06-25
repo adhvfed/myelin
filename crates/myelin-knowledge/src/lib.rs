@@ -104,6 +104,7 @@ pub mod store;
 pub mod subs;
 pub mod sync_block;
 pub mod transport;
+pub mod yrs_engine;
 
 pub use authority::{
     field_caveat, AclZookieTable, AuthZookie, CollectionSchema, ErasureLedger, IncomingOp,
