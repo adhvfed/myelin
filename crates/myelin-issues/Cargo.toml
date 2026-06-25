@@ -154,6 +154,16 @@ myelin-identity-service = { path = "../myelin-identity-service" }
 # DEV-only: a test-support edge (the durable wheel is a CONSUMED seam, not a runtime DAG node — the
 # acyclic posture, EI-02 §3).
 myelin-flow = { path = "../myelin-flow" }
+# ISS-P36 (P-499, M5): the E2E-3 spec-to-ship traceability (Issues' slice) drives the audit-tamper leg
+# (GA-D3) against the REAL GDPR tamper-evident audit hash-chain — `AuditAuthority` (the per-tenant
+# BLAKE3 hash-chain + the Merkle STH, P-GA-19/20) + `audit::verify_entries_for_test` (the chain-
+# integrity verifier). The Issues lineage anchor (`lineage_audit_anchor` — the PII-free initiative ref)
+# is bound into a real audit entry's `subject`; a retroactive edit BREAKS the chain (tamper detected).
+# DEV-only: a test-support edge proving Issues' lineage anchor rides the ONE tamper-evidence frame, NOT a
+# second one (EI-01 §7). `myelin-gdpr-service` is a LEAF SERVICE (nothing in the production DAG depends
+# back on it); it carries `myelin-issues` only as its OWN dev-dependency (the GA-D7 worklog drill), so
+# both edges are dev-only — the NORMAL dependency graph stays acyclic (the §2.9 posture).
+myelin-gdpr-service = { path = "../myelin-gdpr-service" }
 # ISS-P30 (P-397, M4): the §10.2 firehose survival-signal assertion library
 # (`SignalSource`/`Predicate`/`SignalName::{FirehoseFrameLag, ResyncRequiredCount}`) the ISS-D13
 # board-sync drill (drill_iss_d13_board_sync.rs) asserts its 0-ops-lost + resync-fired green artifact
