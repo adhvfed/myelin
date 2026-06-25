@@ -61,9 +61,15 @@
 
 pub mod delivery;
 pub mod shed;
+pub mod surge;
 
 pub use delivery::{DeliveryOutcome, LiveDelivery, LiveFrame};
 pub use shed::{LiveSurface, ShedGovernor, ShedVerdict};
+pub use surge::{
+    run_chat_surge, surge_governor_from_thresholds, ChatSurgeReport, CHAT_SHED_BUDGETS_TUNED,
+    CHAT_SURGE_MULTIPLIER, COMMENT_CONSOLIDATION_FOLLOW_ON, CROSS_ORG_FOLLOW_ON,
+    HOME_NODE_FOLLOW_ON, SCYLLA_HOT_TIER_FOLLOW_ON,
+};
 
 use myelin_chat::glue::{chat_channel_scope, Te21LanguagePin, CHAT_FIREHOSE_STREAM_PREFIX};
 use myelin_chat::membership::permissions;

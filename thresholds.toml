@@ -475,7 +475,16 @@ retry_after_secs = 2
 
 [[shed_budgets]]
 surface = "ConnectionTier"    # reserved connection slots for interactive humans.
-per_tenant_in_flight_cap = 256 # MEASURED: connection-storm (P-S31) held interactive humans at this cap.
+# TUNED + CONFIRMED on the CHAT surface by CHAT-D3/D4 (CHAT-P26 / P-500, M5, 2026-06-25): the chat
+# surge gate (myelin_chat_gateway::run_chat_surge over the ShedGovernor) was driven by the P-S02
+# LoadGenerator at the full 30× agent message/connection storm on ONE tenant against this surface (the
+# presence/typing/read-state + live human-message lanes). The protected human live-message lane HELD
+# (0 human shed, every human frame delivered — humans never queue behind agent runs), the presence/
+# speculative lane SHED first, a SECOND tenant was UNAFFECTED (cross-tenant shed 0), and the deploy-herd
+# (CHAT-D4 fleet roll in waves) completed resume for ALL with 0 message loss. This PROMOTES the chat-side
+# CHAT-P10 floor (OQ-K / R-C2 / Q-C5) to a CONFIRMED default-to-beat at this cap — the number is the same
+# one the connection-storm (P-S31) measured; CHAT-D3/D4 confirm it sufficient on the chat connection tier.
+per_tenant_in_flight_cap = 256 # MEASURED: connection-storm (P-S31) + CHAT-D3/D4 (P-500) held interactive humans at this cap.
 human_lane_reservation = 64    # 25% of cap — above the 20% measured human-lane floor.
 retry_after_secs = 3
 

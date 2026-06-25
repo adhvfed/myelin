@@ -2207,6 +2207,7 @@ version = "0.0.0"
 dependencies = [
  "myelin-chat",
  "myelin-events",
+ "myelin-harness",
  "myelin-identity",
  "myelin-substrate",
  "myelin-tenancy",

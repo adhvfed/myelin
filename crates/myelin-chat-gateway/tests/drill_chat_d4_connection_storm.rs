@@ -11,9 +11,11 @@
 //! The drill drives the REAL composition: real `MemHotTier` durable store + real
 //! `myelin_events::Firehose` transport + the real `ChatGateway` + the real `ShedGovernor` — no mock
 //! of the data layer (the in-process firehose is the unit/drill transport; the broker binding is
-//! P-S12). FLOOR named: the per-surface shed budgets are NAMED v1 floors (tuned by CHAT-D3/D4 in
-//! CHAT-P26); this drill asserts the FLOOR PROPERTY (bounded + reserved human lane + shed order
-//! applied), not a tuned number.
+//! P-S12). The per-surface shed budgets are now TUNED (P-500 / CHAT-P26 promoted the CHAT-P10 floor —
+//! the `ConnectionTier`/`AgentMention` rows in `thresholds.toml` carry the MEASURED defaults-to-beat);
+//! this drill asserts the SHED-ORDER PROPERTY (bounded + reserved human lane + shed order applied),
+//! while `chat_d4_at_scale_deploy_herd_*` re-runs the fleet roll at world scale (the deploy-herd) and
+//! `drill_chat_d3_agent_surge.rs` proves the tuned numbers green under the 30× surge.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -443,5 +445,110 @@ fn chat_d4_shed_order_holds_human_lane_zero_drops() {
     assert_eq!(
         human_delivered, storm,
         "CHAT-D4: every human message was delivered (the human lane is last to shed)"
+    );
+}
+
+/// **CHAT-D4-AT-SCALE — the DEPLOY-HERD: roll the gateway fleet in WAVES under a connection storm →
+/// bounded reconnect, resume completes for ALL, 0 message loss (CHAT-P26 / P-500, M5).** The M4-C2
+/// CHAT-D4 connection-storm drill RE-RUN at world scale: a deploy-herd rolls the fleet in
+/// `WAVES` cohorts (a rolling deploy / gateway-fleet roll), each cohort severed + reconnected while
+/// messages keep flowing, so EVERY cohort's resume backfills its own gap. The bounded-reconnect
+/// signal: every reconnect completes IN-WINDOW (no resync needed — the window covers the herd gap),
+/// 0 lost across the whole roll. This is the deploy-herd half of the F6 surge family (sibling to
+/// SUB-D11 connection-storm / the CHAT-D3 surge).
+#[test]
+fn chat_d4_at_scale_deploy_herd_reconnect_completes_for_all_zero_loss() {
+    const FLEET: usize = 256; // world-scale fleet (8× the M4-C2 FLEET); the real-fleet 30× is the named floor.
+    const WAVES: usize = 8; // the rolling-deploy cohort count (the herd reconnects in waves).
+    let members: Vec<String> = (0..FLEET).map(|i| format!("u{i}")).collect();
+    let member_refs: Vec<&str> = members.iter().map(|s| s.as_str()).collect();
+
+    let store = MemHotTier::new();
+    let mut gw = gateway(store, 16384, &member_refs);
+
+    // every member connects + subscribes (the full fleet up before the roll).
+    let mut conns = Vec::new();
+    let mut subs = Vec::new();
+    for m in &members {
+        let c = gw.connect(&cred(m)).expect("connect");
+        let sub = gw.subscribe(&c, &conv(), None, None).expect("subscribe");
+        conns.push(c);
+        subs.push(sub);
+    }
+    let stream = conns[0].stream.clone();
+    let scope = chat_channel_scope(CHANNEL).unwrap();
+
+    // a prefix of frames is delivered + consumed by the whole fleet (all at last_seq = 2).
+    for body in ["m1", "m2"] {
+        gw.firehose_mut()
+            .publish(&stream, &scope, myelin_events::FrameDraft::new(body));
+    }
+    for sub in &subs {
+        let seen: Vec<u64> = sub.drain_ready().iter().map(|f| f.seq).collect();
+        assert_eq!(
+            seen,
+            vec![1, 2],
+            "every client saw the prefix before the roll"
+        );
+    }
+
+    // THE DEPLOY HERD: roll the fleet in WAVES. Each cohort is severed (its node rolls — drop its
+    // subscription handles), messages keep flowing during the gap, then the cohort reconnects +
+    // resumes — bounded reconnect, 0 loss. Sever the ENTIRE fleet up front (the rolling deploy
+    // detaches every node's live socket); each wave reconnects its cohort while traffic flows.
+    subs.clear();
+    let cursor = myelin_chat::MessageId("00000000000000000000000000".into());
+    let cohort = FLEET / WAVES;
+    let mut next_seq = 3u64; // m1,m2 already published.
+    let mut resumed = 0usize;
+
+    for wave in 0..WAVES {
+        let lo = wave * cohort;
+        let hi = lo + cohort;
+
+        // frames flow DURING this wave's roll (the gap each reconnecting cohort member must backfill).
+        let gap_lo = next_seq;
+        for k in 0..3 {
+            gw.firehose_mut().publish(
+                &stream,
+                &scope,
+                myelin_events::FrameDraft::new(format!("w{wave}f{k}")),
+            );
+            next_seq += 1;
+        }
+        let gap_hi = next_seq - 1;
+        let expected_gap: Vec<u64> = (gap_lo..=gap_hi).collect();
+
+        // RECONNECT this cohort — each resume must complete in-window (bounded), 0 loss. The cohort
+        // resumes from the seq just before this wave's gap (the herd reconnects after the roll).
+        for c in &conns[lo..hi] {
+            let outcome = gw
+                .resume(c, &conv(), None, gap_lo - 1, &cursor)
+                .expect("resume completes");
+            match outcome {
+                ResumeOutcome::Live { backfill, .. } => {
+                    let got: Vec<u64> = backfill.iter().map(|f| f.seq).collect();
+                    assert_eq!(
+                        got, expected_gap,
+                        "0 lost — wave {wave} cohort recovered its full roll gap"
+                    );
+                    resumed += 1;
+                }
+                ResumeOutcome::Resync { .. } => panic!(
+                    "the window covers the deploy-herd gap — no resync for an in-window cursor (wave {wave})"
+                ),
+            }
+        }
+    }
+
+    // the dated green artifact (bounded-reconnect signal): resume completed for ALL across the roll.
+    assert_eq!(
+        resumed, FLEET,
+        "CHAT-D4-at-scale: resume completes for ALL {FLEET} reconnecting connections across the \
+         {WAVES}-wave deploy herd (0 loss)"
+    );
+    println!(
+        "[P-500 CHAT-D4-at-scale GREEN 2026-06-25] deploy-herd: {FLEET} connections rolled in \
+         {WAVES} waves, resume completed for all, 0 message loss (bounded reconnect)"
     );
 }
