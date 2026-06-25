@@ -271,6 +271,71 @@ pub fn self_hosting_jobs() -> Vec<SelfHostJob> {
                 "cp_d23_dogfood_self_host_drill",
             ],
         },
+        // (6) the CI dogfood band (P-509 / CI-P35 → CI-M6): the done-bar. The Myelin build/test/lint/
+        //     mutation pipeline runs AS a Myelin `ci.pipeline` — the `ci.pipeline` body's determinism
+        //     (CI-D9) + crash-recovery (CI-D1) + the Git↔CI check seam (CI-D8) run as Myelin CI jobs on
+        //     the platform's own commit; CI's whole-system E2E flagship (E2E-2) is driven; and the
+        //     CI-P35 dogfood drill (the switch test driven against the real `myelin ci` run/log/deploy
+        //     surface + the CI truth-up pass + the self-hosted every-incident-adds-a-drill loop) is the
+        //     done-bar gate. These WIRE the existing CI drills (EI-01 §7 — never re-implemented here).
+        SelfHostJob {
+            id: "ci-pipeline-determinism",
+            title: "the ci.pipeline body's bit-identical replay (CI-D9) + crash-recovery (CI-D1) run \
+                    as Myelin CI — the durable workflow hosting the Myelin build",
+            kind: JobKind::Drill,
+            tool: JobTool::Cargo,
+            argv: &[
+                "test",
+                "-p",
+                "myelin-ci-controlplane",
+                "--test",
+                "drills_ci_p15_ci_pipeline",
+                "--test",
+                "drills_ci_p16_effectively_once",
+            ],
+        },
+        SelfHostJob {
+            id: "ci-check-seam",
+            title: "the Git↔CI check seam on Myelin's own commits (5.9 / CI-D8 — ci.result rollup → \
+                    merge-queue wake, exactly-once)",
+            kind: JobKind::Drill,
+            tool: JobTool::Cargo,
+            argv: &[
+                "test",
+                "-p",
+                "myelin-ci-controlplane",
+                "--test",
+                "drills_ci_p19_seam_gate",
+            ],
+        },
+        SelfHostJob {
+            id: "ci-e2e-flagship",
+            title: "CI's slice of the agent-native E2E flagship (E2E-2) — CI-fail → triage agent → \
+                    issue → chat → fix-PR — driven as a Myelin CI job",
+            kind: JobKind::Drill,
+            tool: JobTool::Cargo,
+            argv: &[
+                "test",
+                "-p",
+                "myelin-ci-controlplane",
+                "--test",
+                "drill_ci_p34_e2e2_flagship",
+            ],
+        },
+        SelfHostJob {
+            id: "CI-P35-dogfood",
+            title: "the CI switch test (driven against the real `myelin ci` run/log/deploy surface vs \
+                    the GitHub Actions anchor, measured) + the CI truth-up pass (0 red earlier CI gate)",
+            kind: JobKind::Drill,
+            tool: JobTool::Cargo,
+            argv: &[
+                "test",
+                "-p",
+                "myelin-ci-controlplane",
+                "--test",
+                "ci_p35_dogfood_switch_test_drill",
+            ],
+        },
     ]
 }
 

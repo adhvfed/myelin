@@ -56,6 +56,14 @@ pub mod ci_pipeline;
 pub mod ci_result_signal;
 pub mod crypto_shred_erase;
 pub mod deployment;
+/// The CI dogfood done-bar (CI-P35 / P-509, M6): the CI **switch test** ([`dogfood::CiSwitchTest`] —
+/// the Git OQ-12 / CI switch test, driven against the real `myelin ci` run/log/deploy views vs the
+/// GitHub Actions anchor, measured latency, EI-01 §4), the CI **truth-up pass**
+/// ([`dogfood::CiTruthUpPass`] — every PROVEN CI row rests on a dated green artifact, EI-01 §1), and
+/// the self-hosted **every-incident-adds-a-drill** loop ([`dogfood::IncidentDrillLoop`]). The
+/// build/test/lint/mutation pipeline running AS a Myelin `ci.pipeline` is wired in the self-hosting CI
+/// graph (`myelin-harness/src/self_hosting_ci.rs`). This is the platform done-bar (no follow-on).
+pub mod dogfood;
 /// CI's slice of the whole-system E2E-2 agent-native FLAGSHIP (CI-P34 / P-494, M5): CI-fail → triage
 /// agent → issue → chat → fix-PR. Drives CI's side of the joint flagship end-to-end — the structured
 /// `ci.run.failed` triage hook (which stage/step/test/log-excerpt ref), the AG-D4-gated runner the
@@ -175,6 +183,14 @@ pub use deployment::{
     deployment_requested_draft, deployment_rolled_back_draft, deployment_started_draft,
     deployment_succeeded_draft, resolve_approvers, DeployGate, DeployGateOutcome, DeployState,
     ENVIRONMENT_APPROVE_PERMISSION,
+};
+
+// CI-P35 (P-509, M6): the CI dogfood done-bar — the switch test + the truth-up pass + the self-hosted
+// every-incident-adds-a-drill loop (the Git OQ-12 / CI switch test; continuous-integration §3 CI-M6).
+pub use dogfood::{
+    proven_ci_rows, switch_capability_matrix, CiIncident, CiSwitchTest, CiTruthUpPass,
+    CiTruthUpRed, CiTruthUpVerdict, IncidentDrillLoop, ProvenCiRow, SwitchCapability,
+    SwitchVerdict,
 };
 
 // CI-P16 (P-359): the `SCHEDULE_AND_RUN_JOB` dispatch handshake into CI's `job_queue` + the

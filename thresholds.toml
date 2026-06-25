@@ -113,6 +113,17 @@ prewarm_buffer_per_arrival_rate_bps = 1000  # MEASURED (07#2 / §5.4): 10% of th
 prewarm_max_buffer = 16                     # the warm-buffer ceiling — bin-packing under the per-VM memory floor (never past the zone's headroom).
 
 # ---------------------------------------------------------------------------------------------
+# [ci_switch_test] — the CI SWITCH-TEST interactive run/log render-latency budget (CI-P35 / P-509,
+# M6; the Git OQ-12 / CI switch test; continuous-integration §3 CI-M6; arch 04 §2 the run/log/deploy
+# views the switch test drives). The microsecond ceiling the representative `myelin ci` run/log view
+# render must stay WITHIN for a GitHub-Actions user to move without hitting a UX wall the old tool
+# didn't have. MEASURED by the switch test (driven against the real surface, EI-01 §4), never
+# hardcoded in the test and never weakened to pass.
+# ---------------------------------------------------------------------------------------------
+[ci_switch_test]
+render_budget_us = 50000                    # MEASURED-GATE: the interactive run/log view render p-latency budget; a render slower than the GitHub Actions anchor's interactive grade is a UX wall.
+
+# ---------------------------------------------------------------------------------------------
 # [authz_surge] — the ID-D9 (F6) protected-human-lane authz-decision p99 budget under the 30× authz
 # hot-path surge (identity §10/§13: authz is the highest-QPS shared system; contract 1.8
 # `auth_decision_latency` / 4.11 the shed order on the authz surface).
