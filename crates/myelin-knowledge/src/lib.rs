@@ -73,6 +73,7 @@
 pub mod agent;
 pub mod authority;
 pub mod block_tree;
+pub mod collab;
 pub mod comments;
 pub mod compaction;
 pub mod database;
