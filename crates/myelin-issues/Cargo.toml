@@ -144,6 +144,16 @@ tokio = { workspace = true, optional = true }
 # frozen engine, never re-define it.
 [dev-dependencies]
 myelin-identity-service = { path = "../myelin-identity-service" }
+# ISS-P35 (P-498, M5): the E2E-2 agent-native flagship (Issues' slice) drives the
+# exactly-once-approval-ACROSS-A-KILL leg against the REAL `myelin-flow` durable HITL substrate —
+# `SignalStore` (the `wf_signal` ON-CONFLICT-DO-NOTHING dedup, 9.4) + `approval::{ApprovalCard,
+# apply_approved_effects, per_effect_idem_key}` (the per-effect gated apply, OQ-F). The Issues lib
+# carries the SAME per-effect `idem_key` rule (`agent_spend::per_effect_idem_key`); this dev-dep PROVES
+# the Issues-side derivation is byte-identical to the agent-fabric/flow derivation and that the durable
+# signal applies the governed transition EXACTLY ONCE across the kill + the at-least-once double-click.
+# DEV-only: a test-support edge (the durable wheel is a CONSUMED seam, not a runtime DAG node — the
+# acyclic posture, EI-02 §3).
+myelin-flow = { path = "../myelin-flow" }
 # ISS-P30 (P-397, M4): the §10.2 firehose survival-signal assertion library
 # (`SignalSource`/`Predicate`/`SignalName::{FirehoseFrameLag, ResyncRequiredCount}`) the ISS-D13
 # board-sync drill (drill_iss_d13_board_sync.rs) asserts its 0-ops-lost + resync-fired green artifact

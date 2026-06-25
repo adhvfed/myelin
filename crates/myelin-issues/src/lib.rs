@@ -271,6 +271,7 @@ pub mod cost_bounder;
 pub mod cross_cell_rollup;
 pub mod declares;
 pub mod dek;
+pub mod e2e_flagship;
 pub mod e2e_wedge;
 pub mod events;
 pub mod floor_triggers;
@@ -684,6 +685,19 @@ pub use agent_spend::{
 pub use e2e_wedge::{
     run_e2e_1_pr_pane, run_issues_e2e_wedge, IssuesE2eArtifact, E2E_SCENARIO, FRESHNESS_BUDGET_SECS,
 };
+
+// ISS-P35 (P-498, M5): the E2E-2 agent-native FLAGSHIP — Issues' slice (CI-fail → triage agent →
+// issue → chat → fix-PR). Issues is the node where the triaged failure becomes a tracked, GOVERNED
+// work item. `run_e2e_2_issues_flagship` drives the four E2E-2 invariants end-to-end across a kill: 0
+// effect outside the `∩` (the agent can only drive a DECLARED FSM edge, gated by the CI-red guard 5.9),
+// 0 mutation before approval (the governed close is HITL-gated/WITHHELD, AG-8), exactly-once approval +
+// the governed transition ACROSS A KILL (the durable per-effect `approval` signal — the `wf_signal` PK
+// absorbs the duplicate, 9.4/OQ-F), reserve/settle balanced (11.7 — the spend-bearing run conserves the
+// ONE wallet, no balance → no start). EXERCISES the frozen contracts (8.2/9.4/5.9/11.7) end-to-end over
+// the SAME `plan_agent_ci_gated_transition`/`LinkedPrCheck`/`spend_bearing_run`/`per_effect_idem_key` —
+// no new contract, no second governance/cost engine (EI-01 §7). Runs under the MOCK agent runtime
+// (real-LLM is the post-M5 swap, R-10). FLOOR named: none new (the world-scale 30x load is ISS-P33's).
+pub use e2e_flagship::{run_e2e_2_issues_flagship, CLOSE_CARD_ID, E2E_FLAGSHIP_SCENARIO};
 
 // ISS-P25 (P-392, M4-I6): the stateful Trigger flagship ("Remind me when unblocked") — exactly-once
 // across a restart, stale-once. `IssueTriggerEngine` is the Issues-side stateful Trigger over the
