@@ -193,6 +193,92 @@ pub enum RunVerdict {
     Parked,
 }
 
+/// **The STRUCTURED `ci.run.failed` triage hook (arch §4 / §3.1 — the deliberate agent-native input).**
+///
+/// A failing run's `ci.run.failed` does NOT carry a bare "it failed" — it carries the structured,
+/// PII-free triage signal an agent reads to know *what* to do without re-deriving it from raw logs:
+/// **which stage** failed (always present — the body's deterministic verdict), and, when the job result
+/// surfaced them, **which step** (the `#step-<n>` jump-to-failure anchor), **which test** (the failing
+/// test id — a machine token, never free-text body), and a **log-excerpt reference** (an `ArtifactRef`
+/// into CI's log tier — references-not-payloads, never inline log bytes). This is the E2E-2 flagship's
+/// load-bearing input: the (mock) triage agent reads THIS struct off the bus to file a precise issue
+/// ("test `<id>` failed at step `<n>` in stage `<stage>`; see `<log_excerpt_ref>`"), NOT the firehose.
+///
+/// **references-not-payloads / PII-free.** Every field is a machine token or an `ArtifactRef`; the log
+/// excerpt is a POINTER into the log tier (resolved per-viewer, ACL-checked), never the bytes — so the
+/// failure fact stays a small, leak-free bus event (ADR-04.5; the durable bus never carries log bytes).
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct StructuredFailure {
+    /// The failed stage's name (always present — the body's journaled verdict). The coarsest triage key.
+    pub failed_stage: String,
+    /// The failing step index (the `#step-<n>` jump-to-failure anchor) iff the job result surfaced it.
+    pub failed_step: Option<u32>,
+    /// The failing test id (a machine token, e.g. `crate::module::test_name`) iff the job result named
+    /// it — NEVER a free-text test body (references-not-payloads; the body is in the log tier).
+    pub failed_test: Option<String>,
+    /// An `ArtifactRef` into CI's log tier at the failing excerpt (resolved per-viewer, ACL-checked) —
+    /// the agent's RAG/triage read target, NEVER inline log bytes on the bus event.
+    pub log_excerpt_ref: Option<String>,
+}
+
+impl StructuredFailure {
+    /// The triage hook from a bare stage verdict (the body's always-available signal — no step/test/log
+    /// detail surfaced). The richer constructor is [`structured_failure`].
+    pub fn for_stage(stage: impl Into<String>) -> StructuredFailure {
+        StructuredFailure {
+            failed_stage: stage.into(),
+            ..StructuredFailure::default()
+        }
+    }
+
+    /// Render the triage hook as the FROZEN PII-free `ci.run.failed.structured_failure` payload object
+    /// (arch §3.1). `failed_stage` is always present; the optional triage detail is included ONLY when
+    /// the job result surfaced it (a `null`-free object — absent detail is an absent key, so a replay
+    /// re-builds a byte-identical payload, CI-D9). The agent reads these keys directly.
+    pub fn to_payload(&self) -> serde_json::Value {
+        let mut obj = serde_json::Map::new();
+        obj.insert(
+            "failed_stage".to_string(),
+            serde_json::Value::String(self.failed_stage.clone()),
+        );
+        if let Some(step) = self.failed_step {
+            obj.insert("failed_step".to_string(), serde_json::json!(step));
+        }
+        if let Some(test) = &self.failed_test {
+            obj.insert(
+                "failed_test".to_string(),
+                serde_json::Value::String(test.clone()),
+            );
+        }
+        if let Some(log_ref) = &self.log_excerpt_ref {
+            obj.insert(
+                "log_excerpt_ref".to_string(),
+                serde_json::Value::String(log_ref.clone()),
+            );
+        }
+        serde_json::Value::Object(obj)
+    }
+}
+
+/// **Build the structured `ci.run.failed` triage hook (arch §4 — "which step, which test, log
+/// excerpt").** A pure function of the failed stage + the (optional) job-result triage detail. The
+/// stage is always present; the step/test/log-excerpt are threaded through ONLY when a job result
+/// surfaced them. PII-free (machine tokens + an `ArtifactRef`); never inline log bytes (the log lives
+/// in the T3 log tier, referenced not carried).
+pub fn structured_failure(
+    failed_stage: &str,
+    failed_step: Option<u32>,
+    failed_test: Option<&str>,
+    log_excerpt_ref: Option<&str>,
+) -> StructuredFailure {
+    StructuredFailure {
+        failed_stage: failed_stage.to_string(),
+        failed_step,
+        failed_test: failed_test.map(str::to_string),
+        log_excerpt_ref: log_excerpt_ref.map(str::to_string),
+    }
+}
+
 /// Build the FROZEN 5.9 `CheckStatus`-shaped opaque payload value for a terminal `ci.check.updated`
 /// fact (X-1, §4) — **assembled THROUGH the [`crate::check_emitter`] producer (CI-P18, P-361), the
 /// ONE producer shape (no divergence, EI-01 §7 reconcile-in-place).** The Bus carries the CI-owned
@@ -419,8 +505,12 @@ fn emit_run_terminal(
         "commit_oid": facts.commit_oid,
     });
     if let Some(stage) = failed_stage {
-        // structured_failure (§3.1): which stage failed — the agent-native triage hook.
-        payload["structured_failure"] = serde_json::json!({ "failed_stage": stage });
+        // structured_failure (§3.1 / §4): the agent-native triage hook — which stage failed (always),
+        // plus which step / which test / a log-excerpt ref when the job result surfaced them. The body
+        // here knows the stage (its journaled verdict); the richer step/test/log detail is threaded by
+        // the runner's job result (the E2E-2 flagship reads the full struct). Byte-identical to the
+        // prior shape when only the stage is known (the `failed_stage` key is unchanged, CI-D9).
+        payload["structured_failure"] = StructuredFailure::for_stage(stage).to_payload();
     }
     let draft = run_aggregate_draft(type_, &facts.run_ref, payload);
     ctx.emit(draft, None)?;

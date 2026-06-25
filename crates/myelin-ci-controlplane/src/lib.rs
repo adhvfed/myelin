@@ -56,6 +56,14 @@ pub mod ci_pipeline;
 pub mod ci_result_signal;
 pub mod crypto_shred_erase;
 pub mod deployment;
+/// CI's slice of the whole-system E2E-2 agent-native FLAGSHIP (CI-P34 / P-494, M5): CI-fail → triage
+/// agent → issue → chat → fix-PR. Drives CI's side of the joint flagship end-to-end — the structured
+/// `ci.run.failed` triage hook (which stage/step/test/log-excerpt ref), the AG-D4-gated runner the
+/// triage agent's compute runs on (`kind=Agent`, 8.4 / X-6), the fix-PR check seam (5.9), the
+/// `ci.result` merge wake EXACTLY ONCE (9.4 → merge-count == 1), and the balanced reserve/settle
+/// (11.7) — over the UNCHANGED producer seams, emitting its named green ([`e2e_wedge::E2eArtifact`]).
+/// The Agent-Fabric leg is AG-P24/P-480; the durable park/resume spine is `myelin-flow`'s P-477.
+pub mod e2e_flagship;
 /// CI's slices of the whole-system E2E wedge (CI-P33 / P-493, M5): E2E-1 (the PR context pane —
 /// CI's check rows resolve per-viewer, 0 leak, `#step-<n>` anchor) + E2E-3 (spec-to-ship
 /// traceability — HITL-gated deploy ships, cold-reindex == live, audit tamper detected). Each leg
