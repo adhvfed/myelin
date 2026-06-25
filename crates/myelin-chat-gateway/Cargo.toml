@@ -39,3 +39,6 @@ myelin-substrate = { path = "../myelin-substrate" }
 # The Chat outbox/event primitives the drill harness drives a real send through (the chained
 # subscribe -> deliver -> sever -> resume -> assert 0 lost/0 dup scenario).
 myelin-events = { path = "../myelin-events" }
+# The P-S02 1×/10×/30× load generator (the F6 surge family spine): the CHAT-D3 surge drill DERIVES
+# its storm-frame count from a real generator run at the surge multiplier (never a hand-typed number).
+myelin-harness = { path = "../myelin-harness" }
